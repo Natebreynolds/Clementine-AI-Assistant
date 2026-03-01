@@ -63,15 +63,17 @@ The result: Clementine gets better the more you talk to it.
 ## Quick start
 
 ```bash
-rm -rf clementine && git clone https://github.com/Natebreynolds/Clementine-AI-Assistant.git clementine && cd clementine && npm install && npm run build && npm install -g .
+git clone https://github.com/Natebreynolds/Clementine-AI-Assistant.git clementine
+cd clementine
+npm install && npm run build && npm install -g .
 ```
 
 Then configure and launch:
 
 ```bash
-clementine config setup
-clementine launch
-clementine status
+clementine config setup   # interactive wizard
+clementine launch         # start as background daemon
+clementine status         # verify it's running
 ```
 
 That's it. Clementine is now running, connected to your configured channels, and learning.
