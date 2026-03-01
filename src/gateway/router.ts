@@ -131,6 +131,10 @@ export class Gateway {
           effectiveSessionKey,
           { onText, model: effectiveModel, securityAnnotation },
         );
+
+        // Re-baseline integrity checksums after chat (auto-memory may write to vault)
+        scanner.refreshIntegrity();
+
         return response || '*(no response)*';
       } catch (err) {
         logger.error({ err, sessionKey }, `Error handling message from ${sessionKey}`);
@@ -153,6 +157,10 @@ export class Gateway {
         changesSummary,
         timeContext,
       );
+
+      // Re-baseline integrity checksums after heartbeat (may write to vault)
+      scanner.refreshIntegrity();
+
       return response;
     } catch (err) {
       logger.error({ err }, 'Heartbeat error');
@@ -169,6 +177,10 @@ export class Gateway {
     logger.info(`Running cron job: ${jobName}`);
     try {
       const response = await this.assistant.runCronJob(jobName, jobPrompt, tier, maxTurns);
+
+      // Re-baseline integrity checksums after cron job (may write to vault)
+      scanner.refreshIntegrity();
+
       return response;
     } catch (err) {
       logger.error({ err, jobName }, `Cron job error: ${jobName}`);
