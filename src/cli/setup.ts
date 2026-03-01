@@ -1,48 +1,232 @@
 /**
  * Interactive configuration wizard.
  *
- * Prompts for assistant identity, channel tokens, and optional features,
- * then writes results to .env.
+ * Uses @inquirer/prompts for arrow-key selection, password masking,
+ * and checkbox multi-select. Replaces the old readline-based flow.
  */
 
-import { createInterface, type Interface } from 'node:readline';
+import { input, select, checkbox, password, confirm } from '@inquirer/prompts';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { BASE_DIR } from '../config.js';
 
-// ── Helpers ──────────────────────────────────────────────────────────
+// ── ANSI helpers ─────────────────────────────────────────────────────
 
-function createRL(): Interface {
-  return createInterface({ input: process.stdin, output: process.stdout });
+const DIM = '\x1b[0;90m';
+const BOLD = '\x1b[1m';
+const ORANGE = '\x1b[38;5;208m';
+const GREEN = '\x1b[32m';
+const CYAN = '\x1b[0;36m';
+const RESET = '\x1b[0m';
+
+const BANNER = `
+${ORANGE} ██████╗██╗     ███████╗███╗   ███╗███████╗███╗   ██╗████████╗██╗███╗   ██╗███████╗
+██╔════╝██║     ██╔════╝████╗ ████║██╔════╝████╗  ██║╚══██╔══╝██║████╗  ██║██╔════╝
+██║     ██║     █████╗  ██╔████╔██║█████╗  ██╔██╗ ██║   ██║   ██║██╔██╗ ██║█████╗
+██║     ██║     ██╔══╝  ██║╚██╔╝██║██╔══╝  ██║╚██╗██║   ██║   ██║██║╚██╗██║██╔══╝
+╚██████╗███████╗███████╗██║ ╚═╝ ██║███████╗██║ ╚████║   ██║   ██║██║ ╚████║███████╗
+ ╚═════╝╚══════╝╚══════╝╚═╝     ╚═╝╚══════╝╚═╝  ╚═══╝   ╚═╝   ╚═╝╚═╝  ╚═══╝╚══════╝${RESET}
+`;
+
+function sectionHeader(title: string): void {
+  console.log();
+  console.log(`  ${ORANGE}${BOLD}── ${title} ${'─'.repeat(Math.max(0, 50 - title.length))}${RESET}`);
+  console.log();
 }
 
-function ask(rl: Interface, question: string, defaultValue = ''): Promise<string> {
-  const suffix = defaultValue ? ` [${defaultValue}]` : '';
-  return new Promise((resolve) => {
-    rl.question(`  ${question}${suffix}: `, (answer) => {
-      resolve(answer.trim() || defaultValue);
-    });
-  });
+// ── Channel / feature definitions ────────────────────────────────────
+
+interface ChannelDef {
+  value: string;
+  name: string;
+  credentials: CredentialDef[];
 }
 
-function askYesNo(rl: Interface, question: string, defaultYes = false): Promise<boolean> {
-  const hint = defaultYes ? '[Y/n]' : '[y/N]';
-  return new Promise((resolve) => {
-    rl.question(`  ${question} ${hint}: `, (answer) => {
-      const val = answer.trim().toLowerCase();
-      if (!val) {
-        resolve(defaultYes);
-      } else {
-        resolve(val === 'y' || val === 'yes');
-      }
-    });
-  });
+interface CredentialDef {
+  key: string;
+  label: string;
+  help?: string;
+  masked?: boolean;
+  defaultValue?: string;
+}
+
+const CHANNELS: ChannelDef[] = [
+  {
+    value: 'discord',
+    name: 'Discord',
+    credentials: [
+      {
+        key: 'DISCORD_TOKEN',
+        label: 'Discord bot token',
+        help: `Get your bot token at ${CYAN}https://discord.com/developers/applications${DIM}\n  Create an app > Bot > Reset Token > copy it`,
+        masked: true,
+      },
+      {
+        key: 'DISCORD_OWNER_ID',
+        label: 'Discord owner user ID',
+        help: `Right-click your name in Discord > Copy User ID (enable Developer Mode in settings)`,
+      },
+    ],
+  },
+  {
+    value: 'slack',
+    name: 'Slack',
+    credentials: [
+      {
+        key: 'SLACK_BOT_TOKEN',
+        label: 'Slack bot token (xoxb-...)',
+        help: `Create a Slack app at ${CYAN}https://api.slack.com/apps${DIM}\n  OAuth & Permissions > Bot User OAuth Token`,
+        masked: true,
+      },
+      {
+        key: 'SLACK_APP_TOKEN',
+        label: 'Slack app token (xapp-...)',
+        help: `Basic Information > App-Level Tokens > Generate`,
+        masked: true,
+      },
+      {
+        key: 'SLACK_OWNER_USER_ID',
+        label: 'Slack owner user ID',
+      },
+    ],
+  },
+  {
+    value: 'telegram',
+    name: 'Telegram',
+    credentials: [
+      {
+        key: 'TELEGRAM_BOT_TOKEN',
+        label: 'Telegram bot token',
+        help: `Message ${CYAN}@BotFather${DIM} on Telegram > /newbot > follow prompts > copy token`,
+        masked: true,
+      },
+      {
+        key: 'TELEGRAM_OWNER_ID',
+        label: 'Telegram owner user ID',
+        help: `Send /chatid to your bot after first launch to get your ID`,
+      },
+    ],
+  },
+  {
+    value: 'whatsapp',
+    name: 'WhatsApp (Twilio)',
+    credentials: [
+      {
+        key: 'TWILIO_ACCOUNT_SID',
+        label: 'Twilio Account SID',
+        help: `Get credentials at ${CYAN}https://console.twilio.com${DIM}`,
+      },
+      {
+        key: 'TWILIO_AUTH_TOKEN',
+        label: 'Twilio Auth Token',
+        masked: true,
+      },
+      {
+        key: 'WHATSAPP_OWNER_PHONE',
+        label: 'Owner phone (+1...)',
+      },
+      {
+        key: 'WHATSAPP_FROM_PHONE',
+        label: 'WhatsApp from phone',
+      },
+      {
+        key: 'WHATSAPP_WEBHOOK_PORT',
+        label: 'Webhook port',
+        defaultValue: '8421',
+      },
+    ],
+  },
+  {
+    value: 'webhook',
+    name: 'Webhook API',
+    credentials: [
+      {
+        key: 'WEBHOOK_PORT',
+        label: 'Webhook port',
+        defaultValue: '8420',
+      },
+      {
+        key: 'WEBHOOK_SECRET',
+        label: 'Webhook secret',
+        masked: true,
+      },
+    ],
+  },
+];
+
+interface FeatureDef {
+  value: string;
+  name: string;
+  credentials: CredentialDef[];
+}
+
+const FEATURES: FeatureDef[] = [
+  {
+    value: 'voice',
+    name: 'Voice (STT via Groq + TTS via ElevenLabs)',
+    credentials: [
+      {
+        key: 'GROQ_API_KEY',
+        label: 'Groq API key (for Whisper STT)',
+        help: `Free tier: ${CYAN}https://console.groq.com${DIM}`,
+        masked: true,
+      },
+      {
+        key: 'ELEVENLABS_API_KEY',
+        label: 'ElevenLabs API key (for TTS)',
+        help: `Free tier: ${CYAN}https://elevenlabs.io${DIM}`,
+        masked: true,
+      },
+      {
+        key: 'ELEVENLABS_VOICE_ID',
+        label: 'ElevenLabs voice ID',
+      },
+    ],
+  },
+  {
+    value: 'video',
+    name: 'Video analysis (Google Gemini)',
+    credentials: [
+      {
+        key: 'GOOGLE_API_KEY',
+        label: 'Google API key',
+        help: `Get a free key at ${CYAN}https://aistudio.google.com${DIM}`,
+        masked: true,
+      },
+    ],
+  },
+];
+
+// ── Credential collection helper ─────────────────────────────────────
+
+async function collectCredentials(
+  creds: CredentialDef[],
+  entries: Record<string, string>,
+): Promise<void> {
+  for (const cred of creds) {
+    if (cred.help) {
+      console.log(`  ${DIM}${cred.help}${RESET}`);
+    }
+    const existing = entries[cred.key] || cred.defaultValue || '';
+    if (cred.masked) {
+      const hint = existing ? ` ${DIM}(leave blank to keep current)${RESET}` : '';
+      const val = await password({
+        message: `${cred.label}${hint}`,
+        mask: '*',
+      });
+      entries[cred.key] = val || existing;
+    } else {
+      entries[cred.key] = await input({
+        message: cred.label,
+        default: existing,
+      });
+    }
+  }
 }
 
 // ── Main ─────────────────────────────────────────────────────────────
 
 export async function runSetup(): Promise<void> {
-  const rl = createRL();
   const envPath = path.join(BASE_DIR, '.env');
   const entries: Record<string, string> = {};
 
@@ -57,101 +241,100 @@ export async function runSetup(): Promise<void> {
     }
   }
 
-  const DIM = '\x1b[0;90m';
-  const BOLD = '\x1b[1m';
-  const ORANGE = '\x1b[38;5;208m';
-  const CYAN = '\x1b[0;36m';
-  const RESET = '\x1b[0m';
+  // ── Banner ───────────────────────────────────────────────────────
+  console.log(BANNER);
+  console.log(`  ${BOLD}Setup Wizard${RESET}`);
+  console.log(`  ${DIM}Use arrow keys to navigate, space to toggle, enter to confirm.${RESET}`);
+  console.log(`  ${DIM}Existing values are preserved as defaults.${RESET}`);
 
-  console.log();
-  console.log(`  ${ORANGE}${BOLD}Clementine Setup Wizard${RESET}`);
-  console.log(`  ${DIM}${'─'.repeat(40)}${RESET}`);
-  console.log(`  ${DIM}Configure your assistant. Press Enter to accept defaults.${RESET}`);
-  console.log(`  ${DIM}Existing values are preserved — leave blank to keep them.${RESET}`);
-  console.log();
+  // ── Step 1: Identity ─────────────────────────────────────────────
+  sectionHeader('Step 1: Identity');
 
-  // ── Identity ─────────────────────────────────────────────────────
-  console.log(`  ${BOLD}Assistant Identity${RESET}`);
-  entries['ASSISTANT_NAME'] = await ask(rl, 'Assistant name', entries['ASSISTANT_NAME'] || 'Clementine');
-  entries['ASSISTANT_NICKNAME'] = await ask(rl, 'Nickname', entries['ASSISTANT_NICKNAME'] || 'Clemmy');
-  entries['OWNER_NAME'] = await ask(rl, 'Your name', entries['OWNER_NAME'] || '');
-  entries['DEFAULT_MODEL_TIER'] = await ask(rl, 'Model tier (haiku/sonnet/opus)', entries['DEFAULT_MODEL_TIER'] || 'sonnet');
-  console.log();
+  entries['ASSISTANT_NAME'] = await input({
+    message: 'Assistant name',
+    default: entries['ASSISTANT_NAME'] || 'Clementine',
+  });
 
-  // ── Discord ──────────────────────────────────────────────────────
-  if (await askYesNo(rl, 'Configure Discord?')) {
-    console.log(`  ${DIM}  Get your bot token at ${CYAN}https://discord.com/developers/applications${RESET}`);
-    console.log(`  ${DIM}  Create an app > Bot > Reset Token > copy it${RESET}`);
-    entries['DISCORD_TOKEN'] = await ask(rl, 'Discord bot token', entries['DISCORD_TOKEN'] || '');
-    console.log(`  ${DIM}  Right-click your name in Discord > Copy User ID (enable Developer Mode in settings)${RESET}`);
-    entries['DISCORD_OWNER_ID'] = await ask(rl, 'Discord owner user ID', entries['DISCORD_OWNER_ID'] || '');
+  entries['ASSISTANT_NICKNAME'] = await input({
+    message: 'Nickname',
+    default: entries['ASSISTANT_NICKNAME'] || 'Clemmy',
+  });
+
+  entries['OWNER_NAME'] = await input({
+    message: 'Your name',
+    default: entries['OWNER_NAME'] || undefined,
+  });
+
+  // ── Step 2: Model ────────────────────────────────────────────────
+  sectionHeader('Step 2: Model');
+
+  entries['DEFAULT_MODEL_TIER'] = await select({
+    message: 'Default model tier',
+    default: entries['DEFAULT_MODEL_TIER'] || 'sonnet',
+    choices: [
+      { value: 'sonnet', name: 'sonnet  — Balanced (recommended)' },
+      { value: 'haiku', name: 'haiku   — Fast and affordable' },
+      { value: 'opus', name: 'opus    — Most capable' },
+    ],
+  });
+
+  // ── Step 3: Channels ─────────────────────────────────────────────
+  sectionHeader('Step 3: Channels');
+
+  const selectedChannels = await checkbox({
+    message: 'Which channels do you want to connect?',
+    choices: CHANNELS.map((ch) => ({
+      value: ch.value,
+      name: ch.name,
+      checked: ch.credentials.some((c) => !!entries[c.key]),
+    })),
+  });
+
+  for (const channelValue of selectedChannels) {
+    const channel = CHANNELS.find((c) => c.value === channelValue);
+    if (!channel) continue;
+
+    console.log();
+    console.log(`  ${BOLD}${channel.name}${RESET}`);
+    await collectCredentials(channel.credentials, entries);
+
+    // Set webhook enabled flag
+    if (channelValue === 'webhook') {
+      entries['WEBHOOK_ENABLED'] = 'true';
+    }
   }
-  console.log();
 
-  // ── Slack ────────────────────────────────────────────────────────
-  if (await askYesNo(rl, 'Configure Slack?')) {
-    console.log(`  ${DIM}  Create a Slack app at ${CYAN}https://api.slack.com/apps${RESET}`);
-    console.log(`  ${DIM}  Bot token: OAuth & Permissions > Bot User OAuth Token (xoxb-...)${RESET}`);
-    entries['SLACK_BOT_TOKEN'] = await ask(rl, 'Slack bot token (xoxb-...)', entries['SLACK_BOT_TOKEN'] || '');
-    console.log(`  ${DIM}  App token: Basic Information > App-Level Tokens > Generate (xapp-...)${RESET}`);
-    entries['SLACK_APP_TOKEN'] = await ask(rl, 'Slack app token (xapp-...)', entries['SLACK_APP_TOKEN'] || '');
-    entries['SLACK_OWNER_USER_ID'] = await ask(rl, 'Slack owner user ID', entries['SLACK_OWNER_USER_ID'] || '');
+  // ── Step 4: Optional features ────────────────────────────────────
+  sectionHeader('Step 4: Optional Features');
+
+  const selectedFeatures = await checkbox({
+    message: 'Optional features to enable',
+    choices: FEATURES.map((f) => ({
+      value: f.value,
+      name: f.name,
+      checked: f.credentials.some((c) => !!entries[c.key]),
+    })),
+  });
+
+  for (const featureValue of selectedFeatures) {
+    const feature = FEATURES.find((f) => f.value === featureValue);
+    if (!feature) continue;
+
+    console.log();
+    console.log(`  ${BOLD}${feature.name}${RESET}`);
+    await collectCredentials(feature.credentials, entries);
   }
-  console.log();
 
-  // ── Telegram ─────────────────────────────────────────────────────
-  if (await askYesNo(rl, 'Configure Telegram?')) {
-    console.log(`  ${DIM}  Message ${CYAN}@BotFather${DIM} on Telegram > /newbot > follow prompts > copy token${RESET}`);
-    entries['TELEGRAM_BOT_TOKEN'] = await ask(rl, 'Telegram bot token', entries['TELEGRAM_BOT_TOKEN'] || '');
-    console.log(`  ${DIM}  Send /chatid to your bot after first launch to get your ID${RESET}`);
-    entries['TELEGRAM_OWNER_ID'] = await ask(rl, 'Telegram owner user ID', entries['TELEGRAM_OWNER_ID'] || '');
-  }
-  console.log();
+  // ── Step 5: Security ─────────────────────────────────────────────
+  sectionHeader('Step 5: Security');
 
-  // ── WhatsApp ─────────────────────────────────────────────────────
-  if (await askYesNo(rl, 'Configure WhatsApp (Twilio)?')) {
-    console.log(`  ${DIM}  Get credentials at ${CYAN}https://console.twilio.com${RESET}`);
-    entries['TWILIO_ACCOUNT_SID'] = await ask(rl, 'Twilio Account SID', entries['TWILIO_ACCOUNT_SID'] || '');
-    entries['TWILIO_AUTH_TOKEN'] = await ask(rl, 'Twilio Auth Token', entries['TWILIO_AUTH_TOKEN'] || '');
-    entries['WHATSAPP_OWNER_PHONE'] = await ask(rl, 'Owner phone (+1...)', entries['WHATSAPP_OWNER_PHONE'] || '');
-    entries['WHATSAPP_FROM_PHONE'] = await ask(rl, 'WhatsApp from phone', entries['WHATSAPP_FROM_PHONE'] || '');
-    entries['WHATSAPP_WEBHOOK_PORT'] = await ask(rl, 'Webhook port', entries['WHATSAPP_WEBHOOK_PORT'] || '8421');
-  }
-  console.log();
-
-  // ── Webhook ──────────────────────────────────────────────────────
-  if (await askYesNo(rl, 'Configure Webhook API?')) {
-    entries['WEBHOOK_ENABLED'] = 'true';
-    entries['WEBHOOK_PORT'] = await ask(rl, 'Webhook port', entries['WEBHOOK_PORT'] || '8420');
-    entries['WEBHOOK_SECRET'] = await ask(rl, 'Webhook secret', entries['WEBHOOK_SECRET'] || '');
-  }
-  console.log();
-
-  // ── Voice ────────────────────────────────────────────────────────
-  if (await askYesNo(rl, 'Configure voice (STT/TTS)?')) {
-    console.log(`  ${DIM}  Groq (free): ${CYAN}https://console.groq.com${RESET}`);
-    entries['GROQ_API_KEY'] = await ask(rl, 'Groq API key (for Whisper STT)', entries['GROQ_API_KEY'] || '');
-    console.log(`  ${DIM}  ElevenLabs (free tier): ${CYAN}https://elevenlabs.io${RESET}`);
-    entries['ELEVENLABS_API_KEY'] = await ask(rl, 'ElevenLabs API key (for TTS)', entries['ELEVENLABS_API_KEY'] || '');
-    entries['ELEVENLABS_VOICE_ID'] = await ask(rl, 'ElevenLabs voice ID', entries['ELEVENLABS_VOICE_ID'] || '');
-  }
-  console.log();
-
-  // ── Video ────────────────────────────────────────────────────────
-  if (await askYesNo(rl, 'Configure video analysis (Gemini)?')) {
-    console.log(`  ${DIM}  Get a free key at ${CYAN}https://aistudio.google.com${RESET}`);
-    entries['GOOGLE_API_KEY'] = await ask(rl, 'Google API key', entries['GOOGLE_API_KEY'] || '');
-  }
-  console.log();
-
-  // ── Security ─────────────────────────────────────────────────────
-  const allowAll = await askYesNo(rl, 'Allow all users (no owner check)?');
+  const allowAll = await confirm({
+    message: 'Allow all users (no owner check)?',
+    default: entries['ALLOW_ALL_USERS'] === 'true',
+  });
   entries['ALLOW_ALL_USERS'] = allowAll ? 'true' : 'false';
-  console.log();
 
-  rl.close();
-
-  // ── Write .env ───────────────────────────────────────────────────
+  // ── Write .env ─────────────────────────────────────────────────
   const sections = [
     { header: 'Assistant Identity', keys: ['ASSISTANT_NAME', 'ASSISTANT_NICKNAME', 'OWNER_NAME'] },
     { header: 'Model', keys: ['DEFAULT_MODEL_TIER'] },
@@ -167,17 +350,36 @@ export async function runSetup(): Promise<void> {
 
   const lines: string[] = [];
   for (const section of sections) {
+    const hasValues = section.keys.some((k) => entries[k]);
+    if (!hasValues) continue;
     lines.push(`# ${section.header}`);
     for (const key of section.keys) {
-      lines.push(`${key}=${entries[key] ?? ''}`);
+      if (entries[key] !== undefined) {
+        lines.push(`${key}=${entries[key]}`);
+      }
     }
     lines.push('');
   }
 
   writeFileSync(envPath, lines.join('\n'));
-  console.log(`  ${BOLD}Configuration written to ${envPath}${RESET}`);
+
+  // ── Summary ────────────────────────────────────────────────────
   console.log();
-  console.log(`  ${DIM}Next steps:${RESET}`);
+  console.log(`  ${GREEN}${BOLD}✔ Configuration written to ${envPath}${RESET}`);
+  console.log();
+
+  console.log(`  ${BOLD}Summary${RESET}`);
+  console.log(`  ${DIM}${'─'.repeat(50)}${RESET}`);
+  console.log(`  Assistant:  ${entries['ASSISTANT_NAME']} (${entries['ASSISTANT_NICKNAME']})`);
+  console.log(`  Owner:      ${entries['OWNER_NAME'] || '(not set)'}`);
+  console.log(`  Model:      ${entries['DEFAULT_MODEL_TIER']}`);
+  console.log(`  Channels:   ${selectedChannels.length > 0 ? selectedChannels.join(', ') : 'none'}`);
+  console.log(`  Features:   ${selectedFeatures.length > 0 ? selectedFeatures.join(', ') : 'none'}`);
+  console.log(`  All users:  ${allowAll ? 'yes' : 'no (owner only)'}`);
+  console.log();
+
+  console.log(`  ${BOLD}Next steps${RESET}`);
+  console.log(`  ${DIM}${'─'.repeat(50)}${RESET}`);
   console.log(`    ${BOLD}clementine launch${RESET}            Start as background daemon`);
   console.log(`    ${BOLD}clementine launch -f${RESET}         Start in foreground (debug)`);
   console.log(`    ${BOLD}clementine launch --install${RESET}  Install as login service (survives reboots)`);
