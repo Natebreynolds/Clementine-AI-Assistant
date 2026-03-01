@@ -9,7 +9,15 @@
  */
 
 import { createHash } from 'node:crypto';
-import { existsSync, readFileSync, writeFileSync, statSync, readdirSync } from 'node:fs';
+import {
+  appendFileSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs';
 import path from 'node:path';
 import cron from 'node-cron';
 import matter from 'gray-matter';
@@ -26,7 +34,7 @@ import {
   HEARTBEAT_ACTIVE_END,
   BASE_DIR,
 } from '../config.js';
-import type { CronJobDefinition, HeartbeatState } from '../types.js';
+import type { CronJobDefinition, CronRunEntry, HeartbeatState } from '../types.js';
 import type { NotificationDispatcher } from './notifications.js';
 import type { Gateway } from './router.js';
 
@@ -310,6 +318,147 @@ export class HeartbeatScheduler {
   }
 }
 
+// ── Shared CRON.md parser ────────────────────────────────────────────
+
+/**
+ * Parse cron job definitions from vault/00-System/CRON.md frontmatter.
+ * Used by both the in-process CronScheduler and the standalone CLI runner.
+ */
+export function parseCronJobs(): CronJobDefinition[] {
+  if (!existsSync(CRON_FILE)) return [];
+
+  const raw = readFileSync(CRON_FILE, 'utf-8');
+  const parsed = matter(raw);
+  const jobDefs = (parsed.data.jobs ?? []) as Array<Record<string, unknown>>;
+  const jobs: CronJobDefinition[] = [];
+
+  for (const job of jobDefs) {
+    const name = String(job.name ?? '');
+    const schedule = String(job.schedule ?? '');
+    const prompt = String(job.prompt ?? '');
+    const enabled = job.enabled !== false;
+    const tier = Number(job.tier ?? 1);
+    const maxTurns = job.max_turns != null ? Number(job.max_turns) : undefined;
+
+    if (!name || !schedule || !prompt) {
+      logger.warn({ job }, 'Skipping malformed cron job');
+      continue;
+    }
+
+    jobs.push({ name, schedule, prompt, enabled, tier, maxTurns });
+  }
+
+  return jobs;
+}
+
+// ── Retry / backoff ──────────────────────────────────────────────────
+
+/** Exponential backoff schedule in ms: 30s, 1m, 5m, 15m, 60m */
+const BACKOFF_MS = [30_000, 60_000, 300_000, 900_000, 3_600_000];
+
+/** Patterns that indicate a transient (retryable) error. */
+const TRANSIENT_PATTERNS = [
+  /rate.?limit/i,
+  /429/,
+  /timeout/i,
+  /ECONNRESET/i,
+  /ECONNREFUSED/i,
+  /ETIMEDOUT/i,
+  /socket hang up/i,
+  /5\d\d/,
+  /overloaded/i,
+  /temporarily unavailable/i,
+];
+
+export function classifyError(err: unknown): 'transient' | 'permanent' {
+  const msg = String(err);
+  return TRANSIENT_PATTERNS.some((re) => re.test(msg)) ? 'transient' : 'permanent';
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// ── Run history logging ──────────────────────────────────────────────
+
+/**
+ * JSONL-based per-job run log.  Auto-prunes to keep files under 2 MB
+ * and 2000 lines (whichever limit hits first).
+ */
+export class CronRunLog {
+  private readonly dir: string;
+  private static readonly MAX_BYTES = 2_000_000;
+  private static readonly MAX_LINES = 2000;
+
+  constructor(baseDir?: string) {
+    this.dir = path.join(baseDir ?? BASE_DIR, 'cron', 'runs');
+    if (!existsSync(this.dir)) {
+      mkdirSync(this.dir, { recursive: true });
+    }
+  }
+
+  private logPath(jobName: string): string {
+    // Sanitize job name for filesystem
+    const safe = jobName.replace(/[^a-zA-Z0-9_-]/g, '_');
+    return path.join(this.dir, `${safe}.jsonl`);
+  }
+
+  append(entry: CronRunEntry): void {
+    const filePath = this.logPath(entry.jobName);
+    const line = JSON.stringify(entry) + '\n';
+    try {
+      appendFileSync(filePath, line);
+      this.maybePrune(filePath);
+    } catch (err) {
+      logger.warn({ err, job: entry.jobName }, 'Failed to write run log');
+    }
+  }
+
+  readRecent(jobName: string, count = 20): CronRunEntry[] {
+    const filePath = this.logPath(jobName);
+    if (!existsSync(filePath)) return [];
+
+    try {
+      const lines = readFileSync(filePath, 'utf-8')
+        .trim()
+        .split('\n')
+        .filter(Boolean);
+      return lines
+        .slice(-count)
+        .map((l) => JSON.parse(l) as CronRunEntry)
+        .reverse(); // newest first
+    } catch {
+      return [];
+    }
+  }
+
+  consecutiveErrors(jobName: string): number {
+    const recent = this.readRecent(jobName, 10);
+    let count = 0;
+    for (const entry of recent) {
+      if (entry.status === 'ok') break;
+      count++;
+    }
+    return count;
+  }
+
+  private maybePrune(filePath: string): void {
+    try {
+      const { size } = statSync(filePath);
+      if (size <= CronRunLog.MAX_BYTES) return;
+
+      const lines = readFileSync(filePath, 'utf-8').trim().split('\n');
+      if (lines.length <= CronRunLog.MAX_LINES) return;
+
+      // Keep the most recent MAX_LINES entries
+      const trimmed = lines.slice(-CronRunLog.MAX_LINES);
+      writeFileSync(filePath, trimmed.join('\n') + '\n');
+    } catch {
+      // non-critical
+    }
+  }
+}
+
 // ── CronScheduler ─────────────────────────────────────────────────────
 
 export class CronScheduler {
@@ -318,10 +467,12 @@ export class CronScheduler {
   private jobs: CronJobDefinition[] = [];
   private disabledJobs = new Set<string>();
   private scheduledTasks = new Map<string, cron.ScheduledTask>();
+  readonly runLog: CronRunLog;
 
   constructor(gateway: Gateway, dispatcher: NotificationDispatcher) {
     this.gateway = gateway;
     this.dispatcher = dispatcher;
+    this.runLog = new CronRunLog();
   }
 
   start(): void {
@@ -342,46 +493,27 @@ export class CronScheduler {
     // Stop existing tasks
     this.stop();
 
-    this.jobs = [];
+    this.jobs = parseCronJobs();
 
-    if (!existsSync(CRON_FILE)) {
-      logger.info('No CRON.md found — no cron jobs loaded');
+    if (this.jobs.length === 0) {
+      logger.info('No CRON.md found or no jobs defined');
       return;
     }
 
-    const raw = readFileSync(CRON_FILE, 'utf-8');
-    const parsed = matter(raw);
-    const jobDefs = (parsed.data.jobs ?? []) as Array<Record<string, unknown>>;
-
-    for (const job of jobDefs) {
-      const name = String(job.name ?? '');
-      const schedule = String(job.schedule ?? '');
-      const prompt = String(job.prompt ?? '');
-      const enabled = job.enabled !== false;
-      const tier = Number(job.tier ?? 1);
-      const maxTurns = job.max_turns != null ? Number(job.max_turns) : undefined;
-
-      if (!name || !schedule || !prompt) {
-        logger.warn({ job }, 'Skipping malformed cron job');
-        continue;
-      }
-
-      const def: CronJobDefinition = { name, schedule, prompt, enabled, tier, maxTurns };
-      this.jobs.push(def);
-
-      if (enabled && !this.disabledJobs.has(name)) {
-        if (!cron.validate(schedule)) {
-          logger.error(`Invalid cron schedule for '${name}': ${schedule}`);
+    for (const def of this.jobs) {
+      if (def.enabled && !this.disabledJobs.has(def.name)) {
+        if (!cron.validate(def.schedule)) {
+          logger.error(`Invalid cron schedule for '${def.name}': ${def.schedule}`);
           continue;
         }
 
-        const task = cron.schedule(schedule, () => {
+        const task = cron.schedule(def.schedule, () => {
           this.runJob(def).catch((err) => {
-            logger.error({ err, job: name }, `Cron job '${name}' failed`);
+            logger.error({ err, job: def.name }, `Cron job '${def.name}' failed`);
           });
         });
-        this.scheduledTasks.set(name, task);
-        logger.info(`Cron job '${name}' scheduled: ${schedule}`);
+        this.scheduledTasks.set(def.name, task);
+        logger.info(`Cron job '${def.name}' scheduled: ${def.schedule}`);
       }
     }
   }
@@ -391,19 +523,71 @@ export class CronScheduler {
     const timeStr = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
     logger.info(`Running cron job: ${job.name}`);
 
-    try {
-      const response = await this.gateway.handleCronJob(
-        job.name,
-        job.prompt,
-        job.tier,
-        job.maxTurns,
-      );
-      if (response) {
-        await this.dispatcher.send(`**[Cron: ${job.name} — ${timeStr}]**\n\n${response}`);
+    // Determine retry ceiling from consecutive error history
+    const priorErrors = this.runLog.consecutiveErrors(job.name);
+    const maxAttempts = 1 + Math.min(priorErrors, BACKOFF_MS.length);
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      const startedAt = new Date();
+      try {
+        const response = await this.gateway.handleCronJob(
+          job.name,
+          job.prompt,
+          job.tier,
+          job.maxTurns,
+        );
+
+        // Success — log and dispatch
+        const finishedAt = new Date();
+        this.runLog.append({
+          jobName: job.name,
+          startedAt: startedAt.toISOString(),
+          finishedAt: finishedAt.toISOString(),
+          status: 'ok',
+          durationMs: finishedAt.getTime() - startedAt.getTime(),
+          attempt,
+          outputPreview: response ? response.slice(0, 200) : undefined,
+        });
+
+        if (response) {
+          await this.dispatcher.send(`**[Cron: ${job.name} — ${timeStr}]**\n\n${response}`);
+        }
+        return; // done
+      } catch (err) {
+        const finishedAt = new Date();
+        const errorType = classifyError(err);
+
+        this.runLog.append({
+          jobName: job.name,
+          startedAt: startedAt.toISOString(),
+          finishedAt: finishedAt.toISOString(),
+          status: attempt < maxAttempts && errorType === 'transient' ? 'retried' : 'error',
+          durationMs: finishedAt.getTime() - startedAt.getTime(),
+          error: String(err).slice(0, 500),
+          errorType,
+          attempt,
+        });
+
+        // Permanent error — stop immediately
+        if (errorType === 'permanent') {
+          logger.error({ err, job: job.name }, `Cron job '${job.name}' permanent error — not retrying`);
+          await this.dispatcher.send(`**[Cron: ${job.name} — FAILED]**\n\n${err}`);
+          return;
+        }
+
+        // Transient — retry with backoff if attempts remain
+        if (attempt < maxAttempts) {
+          const backoffMs = BACKOFF_MS[Math.min(attempt - 1, BACKOFF_MS.length - 1)];
+          logger.warn(
+            { job: job.name, attempt, backoffMs },
+            `Cron job '${job.name}' transient error — retrying in ${backoffMs / 1000}s`,
+          );
+          await sleep(backoffMs);
+        } else {
+          logger.error({ err, job: job.name }, `Cron job '${job.name}' failed after ${attempt} attempt(s)`);
+          await this.dispatcher.send(`**[Cron: ${job.name} — FAILED]**\n\n${err}`);
+        }
       }
-    } catch (err) {
-      logger.error({ err, job: job.name }, `Cron job '${job.name}' failed`);
-      await this.dispatcher.send(`**[Cron: ${job.name} — FAILED]**\n\n${err}`);
     }
   }
 

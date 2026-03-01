@@ -23,6 +23,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { runSetup } from './setup.js';
+import { cmdCronList, cmdCronRun, cmdCronRunDue, cmdCronRuns, cmdHeartbeat } from './cron.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -153,6 +154,15 @@ function cmdLaunch(options: { foreground?: boolean; install?: boolean; uninstall
     const plistDir = path.dirname(plistPath);
     if (!existsSync(plistDir)) {
       mkdirSync(plistDir, { recursive: true });
+    }
+
+    // Unload existing plist if already installed (idempotent reinstall)
+    if (existsSync(plistPath)) {
+      try {
+        execSync(`launchctl unload "${plistPath}"`, { stdio: 'ignore' });
+      } catch {
+        // not loaded — fine
+      }
     }
 
     const nodePath = process.execPath;
@@ -536,6 +546,18 @@ program
   .description('Run health checks')
   .action(cmdDoctor);
 
+program
+  .command('update')
+  .description('Pull latest code, rebuild, and reinstall (preserves config)')
+  .option('--restart', 'Restart daemon after update')
+  .option('--dry-run', 'Preview what would happen without making changes')
+  .action((options: { restart?: boolean; dryRun?: boolean }) => {
+    cmdUpdate(options).catch((err: unknown) => {
+      console.error('Update failed:', err);
+      process.exit(1);
+    });
+  });
+
 const configCmd = program
   .command('config')
   .description('Manage configuration');
@@ -565,5 +587,424 @@ configCmd
   .command('list')
   .description('List all config values')
   .action(cmdConfigList);
+
+// ── Update command ──────────────────────────────────────────────────
+
+async function cmdUpdate(options: { restart?: boolean; dryRun?: boolean }): Promise<void> {
+  const DIM = '\x1b[0;90m';
+  const GREEN = '\x1b[0;32m';
+  const YELLOW = '\x1b[1;33m';
+  const RED = '\x1b[0;31m';
+  const RESET = '\x1b[0m';
+
+  console.log();
+  console.log(`  ${DIM}Updating ${getAssistantName()}...${RESET}`);
+  console.log();
+
+  // 1. Check we're in a git repo
+  if (!existsSync(path.join(PACKAGE_ROOT, '.git'))) {
+    console.error(`  ${RED}FAIL${RESET}  Package root is not a git repository: ${PACKAGE_ROOT}`);
+    console.error('  Update requires a git-cloned installation.');
+    process.exit(1);
+  }
+
+  // 2. Check for clean worktree (warn but continue)
+  try {
+    const status = execSync('git status --porcelain', { cwd: PACKAGE_ROOT, encoding: 'utf-8' }).trim();
+    if (status) {
+      console.log(`  ${YELLOW}WARN${RESET}  Uncommitted changes in package directory:`);
+      for (const line of status.split('\n').slice(0, 5)) {
+        console.log(`    ${DIM}${line}${RESET}`);
+      }
+      console.log();
+    }
+  } catch {
+    // not fatal
+  }
+
+  // 3. Back up user config
+  const backupDir = path.join(BASE_DIR, 'backups', `pre-update-${new Date().toISOString().slice(0, 19).replace(/[T:]/g, '-')}`);
+  console.log(`  ${DIM}Backing up config to ${backupDir}${RESET}`);
+
+  if (!options.dryRun) {
+    mkdirSync(backupDir, { recursive: true });
+
+    // .env
+    if (existsSync(ENV_PATH)) {
+      const envContent = readFileSync(ENV_PATH, 'utf-8');
+      writeFileSync(path.join(backupDir, '.env'), envContent);
+    }
+
+    // Cron state
+    const cronStateFile = path.join(BASE_DIR, '.cron_last_run.json');
+    if (existsSync(cronStateFile)) {
+      writeFileSync(
+        path.join(backupDir, '.cron_last_run.json'),
+        readFileSync(cronStateFile, 'utf-8'),
+      );
+    }
+
+    // Heartbeat state
+    const hbStateFile = path.join(BASE_DIR, '.heartbeat_state.json');
+    if (existsSync(hbStateFile)) {
+      writeFileSync(
+        path.join(backupDir, '.heartbeat_state.json'),
+        readFileSync(hbStateFile, 'utf-8'),
+      );
+    }
+
+    // Sessions
+    const sessionsFile = path.join(BASE_DIR, '.sessions.json');
+    if (existsSync(sessionsFile)) {
+      writeFileSync(
+        path.join(backupDir, '.sessions.json'),
+        readFileSync(sessionsFile, 'utf-8'),
+      );
+    }
+
+    console.log(`  ${GREEN}OK${RESET}  Config backed up`);
+  } else {
+    console.log(`  ${DIM}(dry run — skipping backup)${RESET}`);
+  }
+
+  // 4. Stop running daemon
+  const pid = readPid();
+  const wasRunning = pid && isProcessAlive(pid);
+  if (wasRunning) {
+    console.log(`  Stopping daemon (PID ${pid})...`);
+    if (!options.dryRun) {
+      killPid(pid!);
+      try { unlinkSync(getPidFilePath()); } catch { /* ignore */ }
+    }
+    console.log(`  ${GREEN}OK${RESET}  Daemon stopped`);
+  }
+
+  if (options.dryRun) {
+    console.log();
+    console.log(`  ${DIM}Dry run — would execute:${RESET}`);
+    console.log(`    git -C "${PACKAGE_ROOT}" pull --ff-only`);
+    console.log(`    npm install --loglevel=error --no-audit  (in ${PACKAGE_ROOT})`);
+    console.log(`    npm run build`);
+    console.log(`    npm install -g . --loglevel=error --no-audit`);
+    console.log(`    clementine doctor`);
+    if (options.restart || wasRunning) {
+      console.log('    clementine launch');
+    }
+    console.log();
+    return;
+  }
+
+  // 5. Git pull
+  console.log(`  Pulling latest...`);
+  try {
+    const pullOutput = execSync('git pull --ff-only', {
+      cwd: PACKAGE_ROOT,
+      encoding: 'utf-8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+    }).trim();
+
+    if (pullOutput.includes('Already up to date')) {
+      console.log(`  ${GREEN}OK${RESET}  Already up to date`);
+    } else {
+      console.log(`  ${GREEN}OK${RESET}  Pulled updates`);
+    }
+  } catch (err) {
+    const errStr = String(err);
+    if (errStr.includes('Not possible to fast-forward')) {
+      console.error(`  ${RED}FAIL${RESET}  Cannot fast-forward. Local changes conflict with upstream.`);
+      console.error('  Resolve manually with: git -C "' + PACKAGE_ROOT + '" pull --rebase');
+    } else {
+      console.error(`  ${RED}FAIL${RESET}  git pull failed: ${errStr.slice(0, 200)}`);
+    }
+    console.log();
+    console.log(`  ${DIM}Config backup is at: ${backupDir}${RESET}`);
+    process.exit(1);
+  }
+
+  // 6. npm install
+  console.log('  Installing dependencies...');
+  try {
+    execSync('npm install --loglevel=error --no-audit', {
+      cwd: PACKAGE_ROOT,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    console.log(`  ${GREEN}OK${RESET}  Dependencies installed`);
+  } catch (err) {
+    console.error(`  ${RED}FAIL${RESET}  npm install failed: ${String(err).slice(0, 200)}`);
+    console.log(`  ${DIM}Config backup is at: ${backupDir}${RESET}`);
+    process.exit(1);
+  }
+
+  // 7. Build
+  console.log('  Building...');
+  try {
+    execSync('npm run build', {
+      cwd: PACKAGE_ROOT,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    console.log(`  ${GREEN}OK${RESET}  Build succeeded`);
+  } catch (err) {
+    console.error(`  ${RED}FAIL${RESET}  Build failed: ${String(err).slice(0, 200)}`);
+    console.log(`  ${DIM}Config backup is at: ${backupDir}${RESET}`);
+    process.exit(1);
+  }
+
+  // 8. Reinstall globally
+  console.log('  Reinstalling CLI globally...');
+  try {
+    execSync('npm install -g . --loglevel=error --no-audit', {
+      cwd: PACKAGE_ROOT,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    console.log(`  ${GREEN}OK${RESET}  CLI reinstalled`);
+  } catch (err) {
+    console.error(`  ${YELLOW}WARN${RESET}  Global reinstall failed (may need sudo): ${String(err).slice(0, 200)}`);
+    // Non-fatal — local dist is already updated
+  }
+
+  // 9. Doctor check
+  console.log();
+  console.log(`  ${DIM}Running health check...${RESET}`);
+  cmdDoctor();
+
+  // 10. Restart if requested or was running
+  if (options.restart || wasRunning) {
+    console.log('  Restarting daemon...');
+    cmdLaunch({});
+  }
+
+  // 11. Show current version
+  try {
+    const hash = execSync('git rev-parse --short HEAD', {
+      cwd: PACKAGE_ROOT,
+      encoding: 'utf-8',
+    }).trim();
+    const date = execSync('git log -1 --format=%ci HEAD', {
+      cwd: PACKAGE_ROOT,
+      encoding: 'utf-8',
+    }).trim().slice(0, 10);
+    console.log();
+    console.log(`  ${GREEN}Updated to ${hash} (${date})${RESET}`);
+  } catch {
+    console.log(`  ${GREEN}Update complete.${RESET}`);
+  }
+
+  console.log(`  ${DIM}Config backup: ${backupDir}${RESET}`);
+  console.log();
+}
+
+// ── Cron commands ───────────────────────────────────────────────────
+
+const cronCmd = program
+  .command('cron')
+  .description('Manage and run cron jobs');
+
+cronCmd
+  .command('list')
+  .description('List all cron jobs from CRON.md')
+  .action(() => {
+    cmdCronList().catch((err: unknown) => {
+      console.error('Error:', err);
+      process.exit(1);
+    });
+  });
+
+cronCmd
+  .command('run <jobName>')
+  .description('Run a specific cron job')
+  .action((jobName: string) => {
+    cmdCronRun(jobName).catch((err: unknown) => {
+      console.error('Error:', err);
+      process.exit(1);
+    });
+  });
+
+cronCmd
+  .command('run-due')
+  .description('Run all jobs that are due now (for OS scheduler)')
+  .action(() => {
+    cmdCronRunDue().catch((err: unknown) => {
+      console.error('Error:', err);
+      process.exit(1);
+    });
+  });
+
+cronCmd
+  .command('runs [jobName]')
+  .description('View run history (all jobs or a specific job)')
+  .action((jobName?: string) => {
+    cmdCronRuns(jobName).catch((err: unknown) => {
+      console.error('Error:', err);
+      process.exit(1);
+    });
+  });
+
+cronCmd
+  .command('install')
+  .description('Install OS-level scheduler (launchd on macOS, crontab on Linux)')
+  .action(cmdCronInstall);
+
+cronCmd
+  .command('uninstall')
+  .description('Remove OS-level cron scheduler')
+  .action(cmdCronUninstall);
+
+// ── Heartbeat command ───────────────────────────────────────────────
+
+program
+  .command('heartbeat')
+  .description('Run a one-shot heartbeat check')
+  .action(() => {
+    cmdHeartbeat().catch((err: unknown) => {
+      console.error('Error:', err);
+      process.exit(1);
+    });
+  });
+
+// ── OS scheduler install/uninstall ──────────────────────────────────
+
+const CRON_LAUNCHD_LABEL = `com.${getAssistantName().toLowerCase()}.cron`;
+
+function getCronPlistPath(): string {
+  const home = process.env.HOME ?? '';
+  return path.join(home, 'Library', 'LaunchAgents', `${CRON_LAUNCHD_LABEL}.plist`);
+}
+
+function cmdCronInstall(): void {
+  const cliEntry = path.join(PACKAGE_ROOT, 'dist', 'cli', 'index.js');
+  const nodePath = process.execPath;
+  const logDir = path.join(BASE_DIR, 'logs');
+  if (!existsSync(logDir)) {
+    mkdirSync(logDir, { recursive: true });
+  }
+  const cronLog = path.join(logDir, 'cron.log');
+
+  if (process.platform === 'darwin') {
+    // macOS: launchd plist
+    const plistPath = getCronPlistPath();
+    const plistDir = path.dirname(plistPath);
+    if (!existsSync(plistDir)) {
+      mkdirSync(plistDir, { recursive: true });
+    }
+
+    // Unload existing plist if already installed (idempotent reinstall)
+    if (existsSync(plistPath)) {
+      try {
+        execSync(`launchctl unload "${plistPath}"`, { stdio: 'ignore' });
+      } catch {
+        // not loaded — fine
+      }
+    }
+
+    const plist = `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>${CRON_LAUNCHD_LABEL}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>${nodePath}</string>
+    <string>${cliEntry}</string>
+    <string>cron</string>
+    <string>run-due</string>
+  </array>
+  <key>StartInterval</key>
+  <integer>300</integer>
+  <key>StandardOutPath</key>
+  <string>${cronLog}</string>
+  <key>StandardErrorPath</key>
+  <string>${cronLog}</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
+    <key>CLEMENTINE_HOME</key>
+    <string>${BASE_DIR}</string>
+  </dict>
+</dict>
+</plist>`;
+
+    writeFileSync(plistPath, plist);
+    try {
+      execSync(`launchctl load "${plistPath}"`);
+      console.log(`  Installed cron scheduler: ${CRON_LAUNCHD_LABEL}`);
+      console.log(`  Runs every 5 minutes via launchd`);
+      console.log(`  Plist: ${plistPath}`);
+      console.log(`  Logs:  ${cronLog}`);
+    } catch (err) {
+      console.error(`  Failed to load LaunchAgent: ${err}`);
+    }
+  } else {
+    // Linux: crontab entry
+    const marker = `# clementine-cron-runner`;
+    const entry = `*/5 * * * * ${nodePath} ${cliEntry} cron run-due >> ${cronLog} 2>&1 ${marker}`;
+
+    let existing = '';
+    try {
+      existing = execSync('crontab -l 2>/dev/null', { encoding: 'utf-8' });
+    } catch {
+      // no existing crontab
+    }
+
+    if (existing.includes(marker)) {
+      // Replace existing entry
+      const lines = existing.split('\n').filter((l) => !l.includes(marker));
+      lines.push(entry);
+      const tempFile = path.join(os.tmpdir(), 'clementine-crontab.tmp');
+      writeFileSync(tempFile, lines.join('\n') + '\n');
+      execSync(`crontab "${tempFile}"`);
+      unlinkSync(tempFile);
+      console.log('  Updated existing crontab entry.');
+    } else {
+      const tempFile = path.join(os.tmpdir(), 'clementine-crontab.tmp');
+      writeFileSync(tempFile, existing.trimEnd() + '\n' + entry + '\n');
+      execSync(`crontab "${tempFile}"`);
+      unlinkSync(tempFile);
+      console.log('  Installed crontab entry.');
+    }
+
+    console.log(`  Runs every 5 minutes`);
+    console.log(`  Logs: ${cronLog}`);
+  }
+}
+
+function cmdCronUninstall(): void {
+  if (process.platform === 'darwin') {
+    const plistPath = getCronPlistPath();
+    if (existsSync(plistPath)) {
+      try {
+        execSync(`launchctl unload "${plistPath}"`, { stdio: 'ignore' });
+      } catch {
+        // not loaded
+      }
+      unlinkSync(plistPath);
+      console.log(`  Uninstalled cron scheduler: ${CRON_LAUNCHD_LABEL}`);
+    } else {
+      console.log('  Cron scheduler not installed.');
+    }
+  } else {
+    const marker = `# clementine-cron-runner`;
+    let existing = '';
+    try {
+      existing = execSync('crontab -l 2>/dev/null', { encoding: 'utf-8' });
+    } catch {
+      console.log('  No crontab found.');
+      return;
+    }
+
+    if (!existing.includes(marker)) {
+      console.log('  Cron scheduler not installed in crontab.');
+      return;
+    }
+
+    const lines = existing.split('\n').filter((l) => !l.includes(marker));
+    const tempFile = path.join(os.tmpdir(), 'clementine-crontab.tmp');
+    writeFileSync(tempFile, lines.join('\n'));
+    execSync(`crontab "${tempFile}"`);
+    unlinkSync(tempFile);
+    console.log('  Removed crontab entry.');
+  }
+}
 
 program.parse();

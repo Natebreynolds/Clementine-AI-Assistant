@@ -63,9 +63,13 @@ The result: Clementine gets better the more you talk to it.
 ## Quick start
 
 ```bash
-git clone https://github.com/Natebreynolds/Clementine-AI-Assistant.git clementine
-cd clementine
-npm install --loglevel=error --no-audit && npm run build && npm install -g . --loglevel=error --no-audit
+git clone https://github.com/Natebreynolds/Clementine-AI-Assistant.git clementine && cd clementine && npm install --loglevel=error --no-audit && npm run build && npm install -g . --loglevel=error --no-audit
+```
+
+Already have it? Update in place:
+
+```bash
+clementine update
 ```
 
 Then configure and launch:
@@ -225,10 +229,19 @@ clementine launch --install    Install as macOS login service (survives reboots)
 clementine stop                Stop the daemon
 clementine restart             Stop + relaunch
 clementine status              Show PID, uptime, active channels
+clementine update              Pull latest, rebuild, reinstall (preserves config)
+clementine update --dry-run    Preview update without making changes
 clementine doctor              Verify configuration and vault health
 clementine config setup        Interactive configuration wizard
 clementine config set KEY VAL  Set a single config value
 clementine config get KEY      Read a config value
+clementine cron list           List all cron jobs and last run status
+clementine cron run <job>      Run a specific cron job
+clementine cron run-due        Run all due jobs (for OS scheduler)
+clementine cron runs [job]     View run history (with retry/error details)
+clementine cron install        Install OS-level scheduler (launchd/crontab)
+clementine cron uninstall      Remove OS-level scheduler
+clementine heartbeat           Run a one-shot heartbeat check
 clementine --help              Show all commands
 ```
 

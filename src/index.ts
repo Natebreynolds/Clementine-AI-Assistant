@@ -360,13 +360,22 @@ async function asyncMain(): Promise<void> {
 
   logger.info(`${config.ASSISTANT_NAME} is online`);
 
-  // ── Run channels concurrently ────────────────────────────────────
-  try {
-    await Promise.all(channelTasks);
-  } finally {
-    heartbeat.stop();
-    cronScheduler.stop();
-  }
+  // ── Initialize all channels ─────────────────────────────────────
+  await Promise.all(channelTasks);
+
+  // ── Keep alive until shutdown signal ───────────────────────────
+  // The event loop stays active via Discord's websocket, node-cron
+  // timers, and heartbeat setInterval.  We just need to gate on
+  // SIGTERM / SIGINT so cleanup runs before exit.
+  await new Promise<void>((resolve) => {
+    process.once('SIGTERM', resolve);
+    process.once('SIGINT', resolve);
+  });
+
+  // ── Graceful cleanup ──────────────────────────────────────────
+  logger.info('Shutdown signal received — cleaning up');
+  heartbeat.stop();
+  cronScheduler.stop();
 }
 
 // ── Main ─────────────────────────────────────────────────────────────
@@ -408,22 +417,17 @@ function main(): void {
   // Ensure vault directories
   ensureVaultDirs();
 
-  // Graceful shutdown
-  const shutdown = (signal: string) => {
-    logger.info({ signal }, 'Shutting down');
-    cleanupPid();
-    process.exit(0);
-  };
-
-  process.on('SIGINT', () => shutdown('SIGINT'));
-  process.on('SIGTERM', () => shutdown('SIGTERM'));
-
-  // Run
-  asyncMain().catch((err: unknown) => {
-    logger.error({ err }, 'Fatal error');
-    cleanupPid();
-    process.exit(1);
-  });
+  // Run — SIGINT/SIGTERM are handled inside asyncMain (shutdown-signal gate).
+  // When asyncMain resolves, cleanup has already run; just clean up the PID.
+  asyncMain()
+    .then(() => {
+      cleanupPid();
+    })
+    .catch((err: unknown) => {
+      logger.error({ err }, 'Fatal error');
+      cleanupPid();
+      process.exit(1);
+    });
 }
 
 // ── Export for CLI and direct usage ──────────────────────────────────

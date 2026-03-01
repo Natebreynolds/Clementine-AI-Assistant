@@ -94,6 +94,18 @@ export interface CronJobDefinition {
   maxTurns?: number;
 }
 
+export interface CronRunEntry {
+  jobName: string;
+  startedAt: string;
+  finishedAt: string;
+  status: 'ok' | 'error' | 'retried';
+  durationMs: number;
+  error?: string;
+  errorType?: 'transient' | 'permanent';
+  attempt: number;
+  outputPreview?: string;
+}
+
 // ── Config ───────────────────────────────────────────────────────────
 
 export interface Models {
