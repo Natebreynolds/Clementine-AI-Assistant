@@ -1,0 +1,1029 @@
+/**
+ * Clementine TypeScript — Core assistant (Agent Layer).
+ *
+ * Uses @anthropic-ai/claude-code query() with built-in tools + external MCP stdio server.
+ * Features:
+ *   - canUseTool: SDK-level security enforcement (blocks dangerous operations)
+ *   - Auto-memory: background Haiku pass extracts facts after every exchange
+ *   - Session rotation: auto-clears sessions before hitting context limits
+ *   - Session expiry: sessions expire after 4 hours of inactivity
+ *   - Env isolation: Claude subprocess doesn't see credential env vars
+ */
+
+import fs from 'node:fs';
+import path from 'node:path';
+import {
+  query,
+  type Options as SDKOptions,
+  type SDKMessage,
+  type SDKAssistantMessage,
+  type SDKResultMessage,
+} from '@anthropic-ai/claude-code';
+import matter from 'gray-matter';
+import pino from 'pino';
+
+import {
+  BASE_DIR,
+  PKG_DIR,
+  VAULT_DIR,
+  DAILY_NOTES_DIR,
+  SOUL_FILE,
+  AGENTS_FILE,
+  MEMORY_FILE,
+  PROFILES_DIR,
+  ASSISTANT_NAME,
+  OWNER_NAME,
+  MODEL,
+  MODELS,
+  HEARTBEAT_MAX_TURNS,
+  SEARCH_CONTEXT_LIMIT,
+  SEARCH_RECENCY_LIMIT,
+  SYSTEM_PROMPT_MAX_CONTEXT_CHARS,
+  SESSION_EXCHANGE_HISTORY_SIZE,
+  SESSION_EXCHANGE_MAX_CHARS,
+} from '../config.js';
+import type { AgentProfile, OnTextCallback, SessionData } from '../types.js';
+import {
+  enforceToolPermissions,
+  getSecurityPrompt,
+  getHeartbeatSecurityPrompt,
+  getCronSecurityPrompt,
+  getHeartbeatDisallowedTools,
+  logToolUse,
+  setProfileTier,
+} from './hooks.js';
+import { ProfileManager } from './profiles.js';
+
+// ── Constants ────────────────────────────────────────────────────────
+
+const logger = pino({ name: 'clementine.assistant' });
+
+const SESSIONS_FILE = path.join(BASE_DIR, '.sessions.json');
+const MAX_SESSION_EXCHANGES = 40;
+const SESSION_EXPIRY_MS = 4 * 60 * 60 * 1000;
+const AUTO_MEMORY_MIN_LENGTH = 80;
+const AUTO_MEMORY_MODEL = MODELS.haiku;
+const OWNER = OWNER_NAME || 'the user';
+const MCP_SERVER_SCRIPT = path.join(PKG_DIR, 'src', 'tools', 'mcp-server.ts');
+const TOOLS_SERVER = `${ASSISTANT_NAME.toLowerCase()}-tools`;
+
+function mcpTool(name: string): string {
+  return `mcp__${TOOLS_SERVER}__${name}`;
+}
+
+const SAFE_ENV: Record<string, string> = {
+  PATH: process.env.PATH ?? '',
+  HOME: process.env.HOME ?? '',
+  LANG: process.env.LANG ?? 'en_US.UTF-8',
+  TERM: process.env.TERM ?? 'xterm-256color',
+  USER: process.env.USER ?? '',
+  SHELL: process.env.SHELL ?? '',
+  CLEMENTINE_HOME: BASE_DIR,
+};
+
+const AUTO_MEMORY_PROMPT = `You are a memory extraction agent. Your ONLY job is to read the exchange below and save anything worth remembering to the Obsidian vault.
+
+## Current Memory (already saved — DO NOT re-save)
+
+{current_memory}
+
+## What to extract:
+- **Facts about ${OWNER}** — preferences, opinions, decisions, personal details → update_memory in "About ${OWNER}" section
+- **People mentioned** — names, relationships, context → create or update person notes in 02-People/
+- **Projects/work** — project names, status updates, decisions → update relevant project notes
+- **Tasks** — anything ${OWNER} asked to be done later → task_add
+- **Preferences** — tools, workflows, foods, styles, etc. → update_memory in "Preferences" section
+- **Dates/events** — meetings, deadlines, appointments → note in daily log or task with due date
+
+## What to skip:
+- Greetings, small talk, "thanks", "ok"
+- Questions that were fully answered (no durable fact)
+- **Things already present in the Current Memory section above — do NOT re-save them**
+- Technical back-and-forth that isn't a decision
+
+## Rules:
+- Only save genuinely NEW facts not already present in the Current Memory above.
+- If updating an existing topic, use memory_write(action="update_memory") to REPLACE the section, not append duplicates.
+- If there's nothing new to save, respond "No new facts." and exit — do NOT call any tools.
+- Use the MCP tools (memory_write, note_create, task_add, note_take).
+- NEVER respond to ${OWNER}. You are invisible. Just save facts and exit.
+
+---
+
+## Exchange to analyze:
+
+**${OWNER} said:** {user_message}
+
+**${ASSISTANT_NAME} replied:** {assistant_response}
+`;
+
+// ── SDK Message Helpers ─────────────────────────────────────────────
+
+interface ContentBlock {
+  type: string;
+  text?: string;
+  name?: string;
+  input?: Record<string, unknown>;
+}
+
+/** Extract content blocks from an SDKAssistantMessage safely. */
+function getContentBlocks(msg: SDKAssistantMessage): ContentBlock[] {
+  // SDKAssistantMessage.message is an APIAssistantMessage (BetaMessage)
+  // which has a .content array of BetaContentBlock[]
+  const apiMsg = msg.message as { content?: unknown[] };
+  if (!apiMsg?.content || !Array.isArray(apiMsg.content)) return [];
+  return apiMsg.content as ContentBlock[];
+}
+
+/** Extract text from content blocks. */
+function extractText(blocks: ContentBlock[]): string {
+  return blocks
+    .filter((b) => b.type === 'text' && b.text)
+    .map((b) => b.text!)
+    .join('');
+}
+
+// ── Date Helpers ────────────────────────────────────────────────────
+
+function formatDate(d: Date): string {
+  return d.toLocaleDateString('en-US', {
+    weekday: 'long', year: 'numeric', month: 'long', day: 'numeric',
+  });
+}
+
+function formatTime(d: Date): string {
+  return d.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true });
+}
+
+function todayISO(): string {
+  return new Date().toISOString().slice(0, 10);
+}
+
+function yesterdayISO(): string {
+  const d = new Date();
+  d.setDate(d.getDate() - 1);
+  return d.toISOString().slice(0, 10);
+}
+
+// ── PersonalAssistant ───────────────────────────────────────────────
+
+export class PersonalAssistant {
+  static readonly MAX_SESSION_EXCHANGES = MAX_SESSION_EXCHANGES;
+
+  private sessions = new Map<string, string>();
+  private exchangeCounts = new Map<string, number>();
+  private sessionTimestamps = new Map<string, Date>();
+  private lastExchanges = new Map<string, Array<{ user: string; assistant: string }>>();
+  private profileManager: ProfileManager;
+  private memoryStore: any = null; // Typed as any — MemoryStore may not be available yet
+
+  constructor() {
+    this.profileManager = new ProfileManager(PROFILES_DIR);
+    this.loadSessions();
+    this.initMemoryStore();
+  }
+
+  private async initMemoryStore(): Promise<void> {
+    try {
+      const { MemoryStore } = await import('../memory/store.js');
+      const { MEMORY_DB_PATH } = await import('../config.js');
+      this.memoryStore = new MemoryStore(MEMORY_DB_PATH, VAULT_DIR);
+      this.memoryStore.initialize();
+    } catch {
+      // Memory store init failed — falling back to static prompts
+    }
+  }
+
+  // ── Session Persistence ───────────────────────────────────────────
+
+  private loadSessions(): void {
+    if (!fs.existsSync(SESSIONS_FILE)) return;
+    try {
+      const data: Record<string, SessionData> = JSON.parse(
+        fs.readFileSync(SESSIONS_FILE, 'utf-8'),
+      );
+      const now = Date.now();
+      for (const [key, entry] of Object.entries(data)) {
+        const ts = new Date(entry.timestamp);
+        if (now - ts.getTime() > SESSION_EXPIRY_MS) continue;
+        this.sessions.set(key, entry.sessionId);
+        this.exchangeCounts.set(key, entry.exchanges ?? 0);
+        this.sessionTimestamps.set(key, ts);
+        this.lastExchanges.set(
+          key,
+          (entry.exchangeHistory ?? []).map((ex) => ({
+            user: ex.user,
+            assistant: ex.assistant,
+          })),
+        );
+      }
+    } catch {
+      // Starting fresh
+    }
+  }
+
+  private saveSessions(): void {
+    try {
+      const data: Record<string, SessionData> = {};
+      for (const [key, sessionId] of this.sessions) {
+        const ts = this.sessionTimestamps.get(key) ?? new Date();
+        data[key] = {
+          sessionId,
+          exchanges: this.exchangeCounts.get(key) ?? 0,
+          timestamp: ts.toISOString(),
+          exchangeHistory: (this.lastExchanges.get(key) ?? []).map((ex) => ({
+            user: ex.user.slice(0, SESSION_EXCHANGE_MAX_CHARS),
+            assistant: ex.assistant.slice(0, SESSION_EXCHANGE_MAX_CHARS),
+          })),
+        };
+      }
+      fs.writeFileSync(SESSIONS_FILE, JSON.stringify(data, null, 2));
+    } catch {
+      // Non-fatal
+    }
+  }
+
+  // ── System Prompt Builder ─────────────────────────────────────────
+
+  private buildSystemPrompt(opts: {
+    isHeartbeat?: boolean;
+    cronTier?: number | null;
+    retrievalContext?: string;
+    profile?: AgentProfile | null;
+  } = {}): string {
+    const { isHeartbeat = false, cronTier = null, retrievalContext = '', profile = null } = opts;
+    const parts: string[] = [];
+    const owner = OWNER;
+    const vault = VAULT_DIR;
+
+    if (fs.existsSync(SOUL_FILE)) {
+      const { content } = matter(fs.readFileSync(SOUL_FILE, 'utf-8'));
+      parts.push(content);
+    }
+
+    if (profile?.systemPromptBody) {
+      parts.push(profile.systemPromptBody);
+    }
+
+    if (fs.existsSync(AGENTS_FILE)) {
+      const { content } = matter(fs.readFileSync(AGENTS_FILE, 'utf-8'));
+      parts.push(content);
+    }
+
+    if (retrievalContext) {
+      parts.push(`## Relevant Context (retrieved)\n\n${retrievalContext}`);
+    } else if (fs.existsSync(MEMORY_FILE)) {
+      const { content } = matter(fs.readFileSync(MEMORY_FILE, 'utf-8'));
+      parts.push(`## Current Memory\n\n${content}`);
+    }
+
+    const todayPath = path.join(DAILY_NOTES_DIR, `${todayISO()}.md`);
+    if (fs.existsSync(todayPath)) {
+      const { content } = matter(fs.readFileSync(todayPath, 'utf-8'));
+      parts.push(`## Today's Notes (${todayISO()})\n\n${content}`);
+    }
+
+    if (!retrievalContext) {
+      const yPath = path.join(DAILY_NOTES_DIR, `${yesterdayISO()}.md`);
+      if (fs.existsSync(yPath)) {
+        const { content } = matter(fs.readFileSync(yPath, 'utf-8'));
+        if (content.includes('## Summary')) {
+          const summary = content.slice(content.indexOf('## Summary'));
+          parts.push(`## Yesterday's Summary (${yesterdayISO()})\n\n${summary}`);
+        }
+      }
+    }
+
+    if (this.memoryStore) {
+      try {
+        const recent = this.memoryStore.getRecentSummaries(3);
+        if (recent?.length > 0) {
+          const lines = recent.map(
+            (s: { createdAt?: string; summary: string }) => {
+              const ts = (s.createdAt ?? 'unknown').slice(0, 16);
+              return `### ${ts}\n${s.summary}`;
+            },
+          );
+          parts.push('## Recent Conversations\n\n' + lines.join('\n\n'));
+        }
+      } catch {
+        // Non-fatal
+      }
+    }
+
+    const now = new Date();
+    parts.push(`## Current Context
+
+- **Date:** ${formatDate(now)}
+- **Time:** ${formatTime(now)}
+- **Vault:** ${vault}
+
+## Vault Structure & Tool Instructions
+
+Your memory lives in an Obsidian vault at \`${vault}\`. You have multiple ways to interact with it:
+
+### MCP Memory/Task Tools (preferred for common operations):
+- **memory_read** — Read notes by name or shortcut ("today", "yesterday", "memory", "tasks")
+- **memory_write** — Append to daily log, update MEMORY.md sections, or write notes
+- **memory_search** — Search across all vault Markdown files
+- **memory_connections** — Query the wikilink graph to find connected notes
+- **memory_timeline** — Chronological view of a subject's mentions across daily notes
+- **note_create** — Create new notes (person, project, topic, task, inbox)
+- **vault_stats** — Quick dashboard of vault health and activity
+- **task_list** — List tasks with filtering by status, project, priority, and due date range
+- **task_add** — Add tasks with auto-generated {T-NNN} IDs, subtasks, projects, recurrence
+- **task_update** — Update tasks by ID ({T-NNN}) or text match; supports status, priority, due date changes
+- **note_take** — Quick timestamped capture to daily log
+
+**Task ID format:** Tasks have IDs like \`{T-001}\`. Subtasks are \`{T-001.1}\`. Always prefer task IDs over text matching.
+**Recurring tasks:** When a recurring task is completed, a new copy auto-creates with the next due date.
+
+### Built-in File Tools (for anything else):
+- **Read, Write, Edit** — Direct file access for complex edits
+- **Glob, Grep** — Find files and search content
+
+All notes use YAML frontmatter, [[wikilinks]], and #tags.
+
+**Folders:**
+- \`${vault}/00-System/\` — SOUL.md, AGENTS.md, MEMORY.md, HEARTBEAT.md, CRON.md
+- \`${vault}/01-Daily-Notes/\` — Daily logs as YYYY-MM-DD.md
+- \`${vault}/02-People/\` — Person notes
+- \`${vault}/03-Projects/\` — Project notes
+- \`${vault}/04-Topics/\` — Knowledge topics
+- \`${vault}/05-Tasks/TASKS.md\` — Master task list
+- \`${vault}/06-Templates/\` — _Daily-Template.md, _People-Template.md
+- \`${vault}/07-Inbox/\` — Quick captures
+
+**Key files:**
+- Long-term memory: \`${vault}/00-System/MEMORY.md\`
+- Today's daily note: \`${vault}/01-Daily-Notes/${todayISO()}.md\`
+- Task list: \`${vault}/05-Tasks/TASKS.md\`
+
+**How to remember things:**
+- Durable facts → use memory_write(action="update_memory") or Edit MEMORY.md
+- Daily context → use memory_write(action="append_daily") or note_take
+- New person → use note_create(note_type="person")
+- New task → use task_add
+
+When ${owner} tells you something worth remembering, write it to memory immediately.
+When ${owner} asks you to do something non-immediate, add it to TASKS.md.
+Log significant interactions to today's daily note.
+
+NOTE: A background memory agent also runs after each exchange to catch anything you
+might miss. You don't need to worry about being perfect — but do save obviously
+important facts in real-time rather than relying on the background pass.
+`);
+
+    if (profile) {
+      parts.push(`You are currently operating as **${profile.name}** (${profile.description}).`);
+    }
+
+    const feedbackFile = path.join(VAULT_DIR, '00-System', 'FEEDBACK.md');
+    if (fs.existsSync(feedbackFile)) {
+      try {
+        const { data: fbMeta } = matter(fs.readFileSync(feedbackFile, 'utf-8'));
+        if (fbMeta.patterns_summary) {
+          parts.push(`## Communication Preferences\n\n${fbMeta.patterns_summary}`);
+        }
+      } catch {
+        // Non-fatal
+      }
+    }
+
+    parts.push(getSecurityPrompt());
+    if (cronTier !== null && cronTier !== undefined) {
+      parts.push(getCronSecurityPrompt(cronTier));
+    } else if (isHeartbeat) {
+      parts.push(getHeartbeatSecurityPrompt());
+    }
+
+    return parts.join('\n\n---\n\n');
+  }
+
+  // ── Build SDK Options ─────────────────────────────────────────────
+
+  private buildOptions(opts: {
+    isHeartbeat?: boolean;
+    cronTier?: number | null;
+    maxTurns?: number | null;
+    model?: string | null;
+    enableTeams?: boolean;
+    retrievalContext?: string;
+    profile?: AgentProfile | null;
+  } = {}): SDKOptions {
+    const {
+      isHeartbeat = false,
+      cronTier = null,
+      maxTurns = null,
+      model = null,
+      enableTeams = true,
+      retrievalContext = '',
+      profile = null,
+    } = opts;
+
+    const allowedTools = [
+      'Read', 'Write', 'Edit', 'Bash', 'Glob', 'Grep',
+      'WebSearch', 'WebFetch',
+      mcpTool('memory_read'),
+      mcpTool('memory_write'),
+      mcpTool('memory_search'),
+      mcpTool('memory_recall'),
+      mcpTool('note_create'),
+      mcpTool('task_list'),
+      mcpTool('task_add'),
+      mcpTool('task_update'),
+      mcpTool('note_take'),
+      mcpTool('memory_connections'),
+      mcpTool('memory_timeline'),
+      mcpTool('transcript_search'),
+      mcpTool('vault_stats'),
+      mcpTool('daily_note'),
+      mcpTool('rss_fetch'),
+      mcpTool('github_prs'),
+      mcpTool('browser_screenshot'),
+    ];
+
+    if (enableTeams) {
+      allowedTools.push('Task', 'Agent');
+    }
+
+    const disallowed = isHeartbeat ? getHeartbeatDisallowedTools() : [];
+    const effectiveMaxTurns = maxTurns ?? (isHeartbeat ? HEARTBEAT_MAX_TURNS : undefined);
+
+    return {
+      customSystemPrompt: this.buildSystemPrompt({
+        isHeartbeat, cronTier, retrievalContext, profile,
+      }),
+      model: model ?? MODEL,
+      permissionMode: 'bypassPermissions',
+      allowedTools,
+      disallowedTools: disallowed,
+      mcpServers: {
+        [TOOLS_SERVER]: {
+          type: 'stdio',
+          command: 'node',
+          args: ['--import', 'tsx', MCP_SERVER_SCRIPT],
+          env: { CLEMENTINE_HOME: BASE_DIR },
+        },
+      },
+      maxTurns: effectiveMaxTurns,
+      cwd: BASE_DIR,
+      env: SAFE_ENV,
+      canUseTool: async (toolName, toolInput) => {
+        const result = await enforceToolPermissions(toolName, toolInput);
+        if (result.behavior === 'deny') {
+          return { behavior: 'deny' as const, message: result.message ?? 'Denied.' };
+        }
+        return { behavior: 'allow' as const, updatedInput: toolInput };
+      },
+    };
+  }
+
+  // ── Context Retrieval ─────────────────────────────────────────────
+
+  private async retrieveContext(userMessage: string, sessionKey?: string | null): Promise<string> {
+    if (!this.memoryStore) return '';
+
+    try {
+      const queryParts = [userMessage];
+      if (sessionKey) {
+        const exchanges = this.lastExchanges.get(sessionKey) ?? [];
+        if (exchanges.length >= 1) {
+          const prevMessages = exchanges.slice(0, -1).map((ex) => ex.user);
+          if (prevMessages.length > 0) {
+            queryParts.push(...prevMessages.slice(-1));
+          }
+        }
+      }
+
+      let enrichedQuery = queryParts.join(' ');
+      if (enrichedQuery.length > 1000) {
+        enrichedQuery = enrichedQuery.slice(0, 1000);
+      }
+
+      const results = this.memoryStore.searchContext(
+        enrichedQuery, SEARCH_CONTEXT_LIMIT, SEARCH_RECENCY_LIMIT,
+      );
+
+      if (results?.length > 0) {
+        const accessedIds = results
+          .map((r: { chunkId?: number }) => r.chunkId)
+          .filter((id: number | undefined): id is number => id !== undefined && id !== 0);
+        if (accessedIds.length > 0) {
+          try {
+            this.memoryStore.recordAccess(accessedIds, 'retrieval');
+          } catch {
+            // Non-fatal
+          }
+        }
+      }
+
+      const { formatResultsForPrompt } = await import('../memory/search.js');
+      return formatResultsForPrompt(results, SYSTEM_PROMPT_MAX_CONTEXT_CHARS);
+    } catch {
+      return '';
+    }
+  }
+
+  // ── Chat ──────────────────────────────────────────────────────────
+
+  async chat(
+    text: string,
+    sessionKey?: string | null,
+    options?: {
+      onText?: OnTextCallback;
+      model?: string;
+      profile?: AgentProfile;
+    },
+  ): Promise<[string, string]> {
+    const onText = options?.onText;
+    const model = options?.model;
+    const profile = options?.profile;
+    const key = sessionKey ?? undefined;
+    let sessionRotated = false;
+
+    // Expire old sessions (4 hours)
+    if (key && this.sessionTimestamps.has(key)) {
+      const elapsed = Date.now() - this.sessionTimestamps.get(key)!.getTime();
+      if (elapsed > SESSION_EXPIRY_MS) {
+        await this.preRotationFlush(key);
+        this.sessions.delete(key);
+        this.exchangeCounts.set(key, 0);
+        sessionRotated = true;
+      }
+    }
+
+    // Auto-rotate on exchange limit
+    if (key && (this.exchangeCounts.get(key) ?? 0) >= MAX_SESSION_EXCHANGES) {
+      await this.preRotationFlush(key);
+      this.sessions.delete(key);
+      this.exchangeCounts.set(key, 0);
+      sessionRotated = true;
+    }
+
+    let effectivePrompt = text;
+
+    // If session rotated, prepend a structured summary
+    if (sessionRotated && key) {
+      const summary = await this.summarizeSession(key);
+      if (summary) {
+        effectivePrompt =
+          `[Context: This is a continued conversation. The session was refreshed. ` +
+          `Here is a summary of the previous conversation:\n${summary}]\n\n${text}`;
+      }
+    }
+
+    // Resilience: inject exchange history if no session_id stored
+    if (key && !this.sessions.has(key) && !sessionRotated) {
+      const exchanges = this.lastExchanges.get(key) ?? [];
+      if (exchanges.length > 0) {
+        const historyLines: string[] = [];
+        for (const ex of exchanges.slice(-3)) {
+          historyLines.push(`You said: ${ex.user.slice(0, 500)}`);
+          historyLines.push(`I replied: ${ex.assistant.slice(0, 500)}`);
+        }
+        effectivePrompt =
+          `[Conversation context (our recent messages):\n${historyLines.join('\n')}]\n\n${effectivePrompt}`;
+      }
+    }
+
+    let [responseText, sessionId] = await this.runQuery(
+      effectivePrompt, key, onText, model, profile,
+    );
+
+    // If we got a context-length error, retry with a fresh session
+    if (key && responseText.startsWith('Error:') && responseText.toLowerCase().includes('context')) {
+      this.sessions.delete(key);
+      this.exchangeCounts.set(key, 0);
+      let retryPrompt = text;
+      const summary = await this.summarizeSession(key);
+      if (summary) {
+        retryPrompt =
+          `[Context: This is a continued conversation. The session was refreshed. ` +
+          `Here is a summary of the previous conversation:\n${summary}]\n\n${text}`;
+      }
+      [responseText, sessionId] = await this.runQuery(retryPrompt, key, onText, model, profile);
+    }
+
+    // Track exchange count, timestamp, and last exchange
+    if (key) {
+      this.exchangeCounts.set(key, (this.exchangeCounts.get(key) ?? 0) + 1);
+      this.sessionTimestamps.set(key, new Date());
+      const history = this.lastExchanges.get(key) ?? [];
+      history.push({ user: text, assistant: responseText });
+      if (history.length > SESSION_EXCHANGE_HISTORY_SIZE) {
+        this.lastExchanges.set(key, history.slice(-SESSION_EXCHANGE_HISTORY_SIZE));
+      } else {
+        this.lastExchanges.set(key, history);
+      }
+      this.saveSessions();
+    }
+
+    // Save transcript turns
+    if (key && this.memoryStore) {
+      try {
+        this.memoryStore.saveTurn(key, 'user', text);
+        this.memoryStore.saveTurn(key, 'assistant', responseText, model ?? MODEL);
+      } catch {
+        // Non-fatal
+      }
+    }
+
+    // Fire background memory extraction (non-blocking)
+    if (
+      text.length >= AUTO_MEMORY_MIN_LENGTH &&
+      responseText &&
+      !responseText.startsWith('Error:') &&
+      this.worthExtracting(text, responseText)
+    ) {
+      this.spawnMemoryExtraction(text, responseText).catch(() => {});
+    }
+
+    return [responseText, sessionId];
+  }
+
+  // ── Run Query ─────────────────────────────────────────────────────
+
+  private static readonly RATE_LIMIT_MAX_RETRIES = 3;
+  private static readonly RATE_LIMIT_BACKOFF = [5000, 15000, 30000];
+
+  private async runQuery(
+    prompt: string,
+    sessionKey?: string,
+    onText?: OnTextCallback,
+    model?: string,
+    profile?: AgentProfile,
+  ): Promise<[string, string]> {
+    const retrievalContext = await this.retrieveContext(prompt, sessionKey);
+    setProfileTier(profile?.tier ?? null);
+
+    try {
+      for (let attempt = 0; attempt <= PersonalAssistant.RATE_LIMIT_MAX_RETRIES; attempt++) {
+        const sdkOptions = this.buildOptions({ model, retrievalContext, profile });
+
+        // Set resume session if available
+        if (sessionKey && this.sessions.has(sessionKey)) {
+          sdkOptions.resume = this.sessions.get(sessionKey);
+        }
+
+        let responseText = '';
+        let sessionId = '';
+        let hitRateLimit = false;
+
+        try {
+          const stream = query({ prompt, options: sdkOptions });
+
+          for await (const message of stream) {
+            if (message.type === 'assistant') {
+              const blocks = getContentBlocks(message as SDKAssistantMessage);
+              for (const block of blocks) {
+                if (block.type === 'text' && block.text) {
+                  responseText += block.text;
+                  if (onText) await onText(responseText);
+                } else if (block.type === 'tool_use' && block.name) {
+                  logToolUse(block.name, (block.input ?? {}) as Record<string, unknown>);
+                }
+              }
+            } else if (message.type === 'result') {
+              const result = message as SDKResultMessage;
+              sessionId = result.session_id ?? '';
+              if (result.is_error) {
+                const resultText = (result as { result?: string }).result;
+                if (resultText) {
+                  const lower = resultText.toLowerCase();
+                  if (lower.includes('rate') && lower.includes('limit')) {
+                    hitRateLimit = true;
+                  } else {
+                    responseText = responseText || `Error: ${resultText}`;
+                  }
+                }
+              }
+            } else {
+              logger.debug({ type: message.type }, 'Unknown SDK message type');
+            }
+          }
+        } catch (e: unknown) {
+          const errStr = String(e).toLowerCase();
+          if (errStr.includes('rate') && (errStr.includes('limit') || errStr.includes('rate_limit'))) {
+            hitRateLimit = true;
+          } else if (!responseText) {
+            responseText = 'Sorry, I hit a temporary issue. Please try again.';
+          }
+        }
+
+        if (hitRateLimit && attempt < PersonalAssistant.RATE_LIMIT_MAX_RETRIES) {
+          const wait = PersonalAssistant.RATE_LIMIT_BACKOFF[
+            Math.min(attempt, PersonalAssistant.RATE_LIMIT_BACKOFF.length - 1)
+          ];
+          await new Promise((r) => setTimeout(r, wait));
+          continue;
+        }
+
+        if (hitRateLimit && !responseText) {
+          responseText = "I'm being rate limited right now. Give me a minute and try again.";
+        }
+
+        if (sessionKey && sessionId) {
+          this.sessions.set(sessionKey, sessionId);
+        }
+
+        return [responseText, sessionId];
+      }
+
+      return ['Sorry, I hit a temporary issue. Please try again.', ''];
+    } finally {
+      setProfileTier(null);
+    }
+  }
+
+  // ── Session Summarization ─────────────────────────────────────────
+
+  private async summarizeSession(sessionKey: string): Promise<string> {
+    const exchanges = this.lastExchanges.get(sessionKey) ?? [];
+    if (exchanges.length === 0) return '';
+
+    const parts = exchanges.map((ex, i) => {
+      const u = ex.user.slice(0, SESSION_EXCHANGE_MAX_CHARS);
+      const a = ex.assistant.slice(0, SESSION_EXCHANGE_MAX_CHARS);
+      return `Exchange ${i + 1}:\nUser: ${u}\nAssistant: ${a}`;
+    });
+
+    const conversation = parts.join('\n---\n');
+    const summarizePrompt =
+      `Summarize this conversation in 3-5 bullet points. ` +
+      `Focus on: topics discussed, decisions made, action items, ` +
+      `and any important context for continuing the conversation.\n\n` +
+      `${conversation}\n\nRespond with ONLY the bullet points, no preamble.`;
+
+    try {
+      let summaryText = '';
+      const stream = query({
+        prompt: summarizePrompt,
+        options: {
+          customSystemPrompt: 'You are a conversation summarizer. Output only bullet points.',
+          model: AUTO_MEMORY_MODEL,
+          permissionMode: 'bypassPermissions',
+          maxTurns: 1,
+          cwd: BASE_DIR,
+          env: SAFE_ENV,
+        },
+      });
+
+      for await (const message of stream) {
+        if (message.type === 'assistant') {
+          const blocks = getContentBlocks(message as SDKAssistantMessage);
+          summaryText += extractText(blocks);
+        }
+      }
+
+      if (summaryText.trim()) {
+        if (this.memoryStore) {
+          try {
+            this.memoryStore.saveSessionSummary(sessionKey, summaryText.trim(), exchanges.length);
+          } catch { /* non-fatal */ }
+          try {
+            this.memoryStore.indexEpisodicChunk(sessionKey, summaryText.trim());
+          } catch { /* non-fatal */ }
+        }
+        return summaryText.trim();
+      }
+    } catch {
+      // Summarization failed — using fallback
+    }
+
+    const last = exchanges[exchanges.length - 1];
+    return `- Last discussed: ${last.user.slice(0, 200)}\n- Response: ${last.assistant.slice(0, 300)}`;
+  }
+
+  // ── Pre-Rotation Memory Flush ─────────────────────────────────────
+
+  private async preRotationFlush(sessionKey: string): Promise<void> {
+    const exchanges = this.lastExchanges.get(sessionKey) ?? [];
+    if (exchanges.length === 0) return;
+
+    let currentMemory = '';
+    try {
+      if (fs.existsSync(MEMORY_FILE)) {
+        const content = fs.readFileSync(MEMORY_FILE, 'utf-8');
+        currentMemory = content.slice(0, 4000);
+        if (content.length > 4000) currentMemory += '\n...(truncated)';
+      }
+    } catch { /* non-fatal */ }
+
+    const combinedParts = exchanges.map((ex, i) => {
+      const u = ex.user.slice(0, SESSION_EXCHANGE_MAX_CHARS);
+      const a = ex.assistant.slice(0, SESSION_EXCHANGE_MAX_CHARS);
+      return `Exchange ${i + 1}:\nUser: ${u}\nAssistant: ${a}`;
+    });
+
+    const combinedUser = combinedParts.join('\n---\n');
+    const combinedAssistant =
+      `[Session ending — ${exchanges.length} exchanges above. ` +
+      `Extract decisions, preferences, facts about ${OWNER}, ` +
+      `project updates, people mentioned, tasks discussed.]`;
+
+    try {
+      await this.extractMemory(combinedUser, combinedAssistant, currentMemory);
+    } catch { /* non-fatal */ }
+  }
+
+  // ── Auto-Memory Extraction ────────────────────────────────────────
+
+  private worthExtracting(prompt: string, response: string): boolean {
+    if (response.length < 100) return false;
+
+    const greetingPatterns = [
+      'hello', 'hi ', 'hey ', 'good morning', 'good afternoon',
+      'good evening', 'good night', 'thanks', 'thank you',
+      'ok', 'okay', 'sure', 'got it', 'sounds good',
+    ];
+    const lower = prompt.toLowerCase().trim();
+    if (greetingPatterns.some((g) => lower.startsWith(g) || lower === g.trim())) {
+      if (prompt.length < 50) return false;
+    }
+    return true;
+  }
+
+  private async spawnMemoryExtraction(
+    userMessage: string,
+    assistantResponse: string,
+  ): Promise<void> {
+    let currentMemory = '';
+    try {
+      if (fs.existsSync(MEMORY_FILE)) {
+        const content = fs.readFileSync(MEMORY_FILE, 'utf-8');
+        currentMemory = content.slice(0, 4000);
+        if (content.length > 4000) currentMemory += '\n...(truncated)';
+      }
+    } catch { /* non-fatal */ }
+
+    await this.extractMemory(userMessage, assistantResponse, currentMemory);
+  }
+
+  private async extractMemory(
+    userMessage: string,
+    assistantResponse: string,
+    currentMemory = '',
+  ): Promise<void> {
+    try {
+      let truncatedResponse = assistantResponse;
+      if (assistantResponse.length > 3000) {
+        truncatedResponse =
+          assistantResponse.slice(0, 1500) +
+          '\n\n...(middle omitted)...\n\n' +
+          assistantResponse.slice(-1500);
+      }
+
+      const memPrompt = AUTO_MEMORY_PROMPT
+        .replace('{user_message}', userMessage)
+        .replace('{assistant_response}', truncatedResponse)
+        .replace('{current_memory}', currentMemory || '(empty — no existing memory yet)');
+
+      const stream = query({
+        prompt: memPrompt,
+        options: {
+          customSystemPrompt: 'You are a silent memory extraction agent. Save facts to the vault and exit.',
+          model: AUTO_MEMORY_MODEL,
+          permissionMode: 'bypassPermissions',
+          allowedTools: [
+            mcpTool('memory_write'),
+            mcpTool('memory_search'),
+            mcpTool('note_create'),
+            mcpTool('task_add'),
+            mcpTool('note_take'),
+            mcpTool('memory_read'),
+          ],
+          mcpServers: {
+            [TOOLS_SERVER]: {
+              type: 'stdio',
+              command: 'node',
+              args: ['--import', 'tsx', MCP_SERVER_SCRIPT],
+              env: { CLEMENTINE_HOME: BASE_DIR },
+            },
+          },
+          maxTurns: 3,
+          cwd: BASE_DIR,
+          env: SAFE_ENV,
+        },
+      });
+
+      for await (const message of stream) {
+        if (message.type === 'assistant') {
+          const blocks = getContentBlocks(message as SDKAssistantMessage);
+          for (const block of blocks) {
+            if (block.type === 'tool_use' && block.name) {
+              logToolUse(`[auto-memory] ${block.name}`, (block.input ?? {}) as Record<string, unknown>);
+            }
+          }
+        }
+      }
+    } catch {
+      // Auto-memory extraction failed — non-fatal
+    }
+  }
+
+  // ── Heartbeat / Cron ──────────────────────────────────────────────
+
+  async heartbeat(
+    standingInstructions: string,
+    changesSummary = '',
+    timeContext = '',
+  ): Promise<string> {
+    const sdkOptions = this.buildOptions({ isHeartbeat: true, enableTeams: false });
+    const now = new Date();
+    const timestamp = now.toISOString().slice(0, 16).replace('T', ' ');
+    const owner = OWNER;
+
+    const promptParts = [
+      `[HEARTBEAT — ${timestamp}]\n`,
+      'This is an autonomous heartbeat check. Follow the standing instructions below.',
+    ];
+    if (timeContext) {
+      promptParts.push(`\n**Time context:** ${timeContext}`);
+    }
+    if (changesSummary) {
+      promptParts.push(
+        `\n**Changes since last heartbeat:** ${changesSummary}\n` +
+        'Focus on the changes above. Only log an entry to the daily note if you ' +
+        "took an action or found something new. Do NOT log 'all clear' entries.",
+      );
+    }
+    promptParts.push(
+      `\nIf something needs ${owner}'s attention, say so clearly.\n\n` +
+      `Standing Instructions:\n${standingInstructions}`,
+    );
+
+    let responseText = '';
+    const stream = query({ prompt: promptParts.join('\n'), options: sdkOptions });
+
+    for await (const message of stream) {
+      if (message.type === 'assistant') {
+        const blocks = getContentBlocks(message as SDKAssistantMessage);
+        for (const block of blocks) {
+          if (block.type === 'text' && block.text) {
+            responseText += block.text;
+          } else if (block.type === 'tool_use' && block.name) {
+            logToolUse(block.name, (block.input ?? {}) as Record<string, unknown>);
+          }
+        }
+      }
+    }
+
+    return responseText;
+  }
+
+  async runCronJob(
+    jobName: string,
+    jobPrompt: string,
+    tier = 1,
+    maxTurns?: number,
+  ): Promise<string> {
+    const sdkOptions = this.buildOptions({
+      isHeartbeat: true,
+      cronTier: tier,
+      maxTurns: maxTurns ?? HEARTBEAT_MAX_TURNS,
+      enableTeams: false,
+    });
+
+    const now = new Date();
+    const timestamp = now.toISOString().slice(0, 16).replace('T', ' ');
+
+    const prompt =
+      `[CRON JOB: ${jobName} — ${timestamp}]\n\n` +
+      `This is a scheduled cron job. Execute the following task:\n\n` +
+      `${jobPrompt}\n\n` +
+      `Report your results clearly. If there's nothing notable, keep it brief.`;
+
+    let responseText = '';
+    const stream = query({ prompt, options: sdkOptions });
+
+    for await (const message of stream) {
+      if (message.type === 'assistant') {
+        const blocks = getContentBlocks(message as SDKAssistantMessage);
+        for (const block of blocks) {
+          if (block.type === 'text' && block.text) {
+            responseText += block.text;
+          } else if (block.type === 'tool_use' && block.name) {
+            logToolUse(block.name, (block.input ?? {}) as Record<string, unknown>);
+          }
+        }
+      }
+    }
+
+    return responseText;
+  }
+
+  // ── Session Management ────────────────────────────────────────────
+
+  clearSession(sessionKey: string): void {
+    this.sessions.delete(sessionKey);
+    this.exchangeCounts.delete(sessionKey);
+    this.sessionTimestamps.delete(sessionKey);
+    this.lastExchanges.delete(sessionKey);
+    this.saveSessions();
+  }
+
+  getProfileManager(): ProfileManager {
+    return this.profileManager;
+  }
+}

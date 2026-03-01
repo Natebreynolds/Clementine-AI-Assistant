@@ -1,0 +1,45 @@
+{
+  "name": "clemmy-ts",
+  "version": "1.0.0",
+  "description": "Clementine — Personal AI Assistant (TypeScript)",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "clementine": "dist/cli/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "prepare": "tsc",
+    "dev": "tsx src/index.ts",
+    "start": "node dist/index.js",
+    "mcp": "tsx src/tools/mcp-server.ts",
+    "cli": "tsx src/cli/index.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-code": "^1.0.0",
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "@slack/bolt": "^4.2.0",
+    "better-sqlite3": "^11.7.0",
+    "commander": "^13.1.0",
+    "discord.js": "^14.18.0",
+    "express": "^4.21.0",
+    "grammy": "^1.35.0",
+    "gray-matter": "^4.0.3",
+    "node-cron": "^3.0.3",
+    "pino": "^9.6.0",
+    "twilio": "^5.5.0",
+    "zod": "^3.24.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/express": "^5.0.0",
+    "@types/node": "^22.12.0",
+    "@types/node-cron": "^3.0.11",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
