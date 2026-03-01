@@ -48,6 +48,7 @@ interface CredentialDef {
   help?: string;
   masked?: boolean;
   defaultValue?: string;
+  validate?: (value: string) => string | true;
 }
 
 const CHANNELS: ChannelDef[] = [
@@ -65,6 +66,7 @@ const CHANNELS: ChannelDef[] = [
         key: 'DISCORD_OWNER_ID',
         label: 'Discord owner user ID',
         help: `Right-click your name in Discord > Copy User ID (enable Developer Mode in settings)`,
+        validate: (v) => /^\d{17,20}$/.test(v) || 'Must be a numeric Discord user ID (17-20 digits)',
       },
     ],
   },
@@ -87,6 +89,7 @@ const CHANNELS: ChannelDef[] = [
       {
         key: 'SLACK_OWNER_USER_ID',
         label: 'Slack owner user ID',
+        validate: (v) => /^[UW][A-Z0-9]+$/.test(v) || 'Must be a Slack user ID (starts with U or W)',
       },
     ],
   },
@@ -104,6 +107,7 @@ const CHANNELS: ChannelDef[] = [
         key: 'TELEGRAM_OWNER_ID',
         label: 'Telegram owner user ID',
         help: `Send /chatid to your bot after first launch to get your ID`,
+        validate: (v) => /^\d+$/.test(v) || 'Must be a numeric Telegram user ID',
       },
     ],
   },
@@ -219,6 +223,7 @@ async function collectCredentials(
       entries[cred.key] = await input({
         message: cred.label,
         default: existing,
+        validate: cred.validate,
       });
     }
   }
