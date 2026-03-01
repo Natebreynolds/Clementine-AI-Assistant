@@ -63,17 +63,14 @@ The result: Clementine gets better the more you talk to it.
 ## Quick start
 
 ```bash
-# Clone and install globally
-git clone <repo-url> clementine && cd clementine
-npm install -g .
+git clone https://github.com/Natebreynolds/Clementine-AI-Assistant.git clementine && cd clementine && npm install -g .
+```
 
-# Configure (interactive wizard)
+Then configure and launch:
+
+```bash
 clementine config setup
-
-# Launch as background daemon
 clementine launch
-
-# Check status
 clementine status
 ```
 
