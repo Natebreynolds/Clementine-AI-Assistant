@@ -152,9 +152,9 @@ export async function cmdCronRunDue(): Promise<void> {
   const { gateway } = await initGateway();
   const runLog = new CronRunLog(BASE_DIR);
 
-  // Also init dispatcher for sending notifications
-  const { NotificationDispatcher } = await import('../gateway/notifications.js');
-  const dispatcher = new NotificationDispatcher();
+  // Note: the standalone runner doesn't deliver notifications to channels.
+  // The daemon's CronScheduler handles delivery via NotificationDispatcher.
+  // This runner is a fallback for when the daemon is down.
 
   for (const job of dueJobs) {
     const timeStr = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
@@ -183,9 +183,7 @@ export async function cmdCronRunDue(): Promise<void> {
 
         if (response) {
           console.log(`[${job.name}] ${response}`);
-          await dispatcher.send(`**[Cron: ${job.name} — ${timeStr}]**\n\n${response}`).catch(() => {
-            // No senders registered in headless mode — expected
-          });
+          // Output logged to run history; daemon handles channel delivery
         }
         succeeded = true;
         break;

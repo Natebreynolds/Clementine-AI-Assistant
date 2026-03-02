@@ -16,6 +16,8 @@ import {
   readFileSync,
   readdirSync,
   statSync,
+  watchFile,
+  unwatchFile,
   writeFileSync,
 } from 'node:fs';
 import path from 'node:path';
@@ -37,6 +39,7 @@ import {
 import type { CronJobDefinition, CronRunEntry, HeartbeatState } from '../types.js';
 import type { NotificationDispatcher } from './notifications.js';
 import type { Gateway } from './router.js';
+import { scanner } from '../security/scanner.js';
 
 const logger = pino({ name: 'clementine.heartbeat' });
 
@@ -467,6 +470,7 @@ export class CronScheduler {
   private jobs: CronJobDefinition[] = [];
   private disabledJobs = new Set<string>();
   private scheduledTasks = new Map<string, cron.ScheduledTask>();
+  private watching = false;
   readonly runLog: CronRunLog;
 
   constructor(gateway: Gateway, dispatcher: NotificationDispatcher) {
@@ -477,6 +481,7 @@ export class CronScheduler {
 
   start(): void {
     this.reloadJobs();
+    this.watchCronFile();
     logger.info(`Cron scheduler started with ${this.jobs.length} jobs`);
   }
 
@@ -486,7 +491,30 @@ export class CronScheduler {
       logger.debug(`Stopped cron task: ${name}`);
     }
     this.scheduledTasks.clear();
+    this.unwatchCronFile();
     logger.info('Cron scheduler stopped');
+  }
+
+  /** Watch CRON.md for changes and auto-reload jobs. */
+  private watchCronFile(): void {
+    if (this.watching) return;
+    if (!existsSync(CRON_FILE)) return;
+
+    watchFile(CRON_FILE, { interval: 2000 }, () => {
+      logger.info('CRON.md changed — reloading jobs');
+      this.reloadJobs();
+      scanner.refreshIntegrity(); // CRON.md change is legitimate
+      logger.info(`Cron scheduler reloaded: ${this.jobs.length} jobs`);
+    });
+    this.watching = true;
+  }
+
+  private unwatchCronFile(): void {
+    if (!this.watching) return;
+    try {
+      unwatchFile(CRON_FILE);
+    } catch { /* ignore */ }
+    this.watching = false;
   }
 
   reloadJobs(): void {
