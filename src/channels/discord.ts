@@ -8,11 +8,15 @@
 
 import { Client, Events, GatewayIntentBits, Partials, Message } from 'discord.js';
 import pino from 'pino';
+import { existsSync, readFileSync } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import {
   DISCORD_TOKEN,
   DISCORD_OWNER_ID,
   MODELS,
   ASSISTANT_NAME,
+  PKG_DIR,
 } from '../config.js';
 import type { HeartbeatScheduler, CronScheduler } from '../gateway/heartbeat.js';
 import type { NotificationDispatcher } from '../gateway/notifications.js';
@@ -149,6 +153,54 @@ function isOwnerDm(message: Message): boolean {
   return true;
 }
 
+// ── Tools listing ─────────────────────────────────────────────────────
+
+function formatToolsList(): string {
+  const lines: string[] = ['**Available Tools**\n'];
+
+  // MCP tools (parse from source)
+  const mcpSrc = path.join(PKG_DIR, 'src', 'tools', 'mcp-server.ts');
+  if (existsSync(mcpSrc)) {
+    const src = readFileSync(mcpSrc, 'utf-8');
+    const toolPattern = /server\.tool\(\s*'([^']+)',\s*(['"])(.+?)\2/gs;
+    const tools: Array<{ name: string; desc: string }> = [];
+    let match;
+    while ((match = toolPattern.exec(src)) !== null) {
+      tools.push({ name: match[1], desc: match[3] });
+    }
+    if (tools.length > 0) {
+      lines.push(`**MCP Tools** (${tools.length})`);
+      for (const t of tools) {
+        lines.push(`\`${t.name}\` — ${t.desc.slice(0, 80)}${t.desc.length > 80 ? '...' : ''}`);
+      }
+      lines.push('');
+    }
+  }
+
+  // SDK tools
+  lines.push('**SDK Built-in Tools** (8)');
+  lines.push('`Read` `Write` `Edit` `Bash` `Glob` `Grep` `WebSearch` `WebFetch`');
+  lines.push('');
+
+  // Claude Code plugins
+  const settingsPath = path.join(os.homedir(), '.claude', 'settings.json');
+  if (existsSync(settingsPath)) {
+    try {
+      const settings = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+      const plugins = Object.entries(settings.enabledPlugins ?? {})
+        .filter(([, v]) => v)
+        .map(([id]) => id.split('@')[0]);
+      if (plugins.length > 0) {
+        lines.push(`**Claude Code Plugins** (${plugins.length})`);
+        lines.push(plugins.map((p) => `\`${p}\``).join(' '));
+        lines.push('');
+      }
+    } catch { /* ignore */ }
+  }
+
+  return lines.join('\n');
+}
+
 // ── Entry point ───────────────────────────────────────────────────────
 
 export async function startDiscord(
@@ -206,6 +258,11 @@ export async function startDiscord(
           `Current model: \`${current}\`\nOptions: \`!model haiku\`, \`!model sonnet\`, \`!model opus\``,
         );
       }
+      return;
+    }
+
+    if (text === '!tools') {
+      await message.reply(formatToolsList());
       return;
     }
 
