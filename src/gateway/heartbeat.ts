@@ -518,8 +518,12 @@ export class CronScheduler {
   }
 
   reloadJobs(): void {
-    // Stop existing tasks
-    this.stop();
+    // Stop existing scheduled tasks (but NOT the file watcher)
+    for (const [name, task] of this.scheduledTasks) {
+      task.stop();
+      logger.debug(`Stopped cron task: ${name}`);
+    }
+    this.scheduledTasks.clear();
 
     this.jobs = parseCronJobs();
 
