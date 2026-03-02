@@ -512,6 +512,136 @@ function cmdConfigList(): void {
   console.log();
 }
 
+// ── Tools command ───────────────────────────────────────────────────
+
+function cmdTools(): void {
+  const DIM = '\x1b[0;90m';
+  const GREEN = '\x1b[0;32m';
+  const YELLOW = '\x1b[1;33m';
+  const CYAN = '\x1b[0;36m';
+  const BOLD = '\x1b[1m';
+  const RESET = '\x1b[0m';
+
+  console.log();
+
+  // ── 1. Clementine MCP tools (parse from source) ──────────────────
+  const mcpServerSrc = path.join(PACKAGE_ROOT, 'src', 'tools', 'mcp-server.ts');
+  const mcpTools: Array<{ name: string; description: string }> = [];
+
+  if (existsSync(mcpServerSrc)) {
+    const src = readFileSync(mcpServerSrc, 'utf-8');
+    // Match: server.tool(\n  'name',\n  'description' or "description",
+    const toolPattern = /server\.tool\(\s*'([^']+)',\s*(['"])(.+?)\2/gs;
+    let match;
+    while ((match = toolPattern.exec(src)) !== null) {
+      mcpTools.push({ name: match[1], description: match[3] });
+    }
+  }
+
+  if (mcpTools.length > 0) {
+    console.log(`  ${BOLD}Clementine MCP Tools${RESET} ${DIM}(${mcpTools.length} tools)${RESET}`);
+    console.log();
+    const maxName = Math.max(...mcpTools.map((t) => t.name.length));
+    for (const tool of mcpTools) {
+      console.log(`    ${CYAN}${tool.name.padEnd(maxName)}${RESET}  ${DIM}${tool.description}${RESET}`);
+    }
+    console.log();
+  }
+
+  // ── 2. SDK built-in tools ────────────────────────────────────────
+  const sdkTools = [
+    { name: 'Read', description: 'Read files from the filesystem' },
+    { name: 'Write', description: 'Write/create files' },
+    { name: 'Edit', description: 'Edit files with string replacements' },
+    { name: 'Bash', description: 'Execute shell commands' },
+    { name: 'Glob', description: 'Find files by pattern' },
+    { name: 'Grep', description: 'Search file contents' },
+    { name: 'WebSearch', description: 'Search the web' },
+    { name: 'WebFetch', description: 'Fetch and process web pages' },
+    { name: 'Agent', description: 'Spawn sub-agents for complex tasks' },
+    { name: 'Task', description: 'Multi-agent task coordination' },
+  ];
+
+  console.log(`  ${BOLD}SDK Built-in Tools${RESET} ${DIM}(${sdkTools.length} tools)${RESET}`);
+  console.log();
+  const maxSdk = Math.max(...sdkTools.map((t) => t.name.length));
+  for (const tool of sdkTools) {
+    console.log(`    ${CYAN}${tool.name.padEnd(maxSdk)}${RESET}  ${DIM}${tool.description}${RESET}`);
+  }
+  console.log();
+
+  // ── 3. Claude Code plugins ───────────────────────────────────────
+  const home = process.env.HOME ?? '';
+  const settingsPath = path.join(home, '.claude', 'settings.json');
+  const plugins: Array<{ name: string; source: string }> = [];
+
+  if (existsSync(settingsPath)) {
+    try {
+      const settings = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+      const enabledPlugins = settings.enabledPlugins ?? {};
+      for (const [pluginId, enabled] of Object.entries(enabledPlugins)) {
+        if (enabled) {
+          const [name, source] = pluginId.split('@');
+          plugins.push({ name, source: source ?? 'unknown' });
+        }
+      }
+    } catch { /* ignore */ }
+  }
+
+  if (plugins.length > 0) {
+    console.log(`  ${BOLD}Claude Code Plugins${RESET} ${DIM}(global)${RESET}`);
+    console.log();
+    const maxPlugin = Math.max(...plugins.map((p) => p.name.length));
+    for (const plugin of plugins) {
+      console.log(`    ${GREEN}${plugin.name.padEnd(maxPlugin)}${RESET}  ${DIM}${plugin.source}${RESET}`);
+    }
+    console.log();
+  }
+
+  // ── 4. Project MCP servers ───────────────────────────────────────
+  const projectSettingsPath = path.join(PACKAGE_ROOT, '.claude', 'settings.json');
+  const projectMcpServers: string[] = [];
+
+  if (existsSync(projectSettingsPath)) {
+    try {
+      const projSettings = JSON.parse(readFileSync(projectSettingsPath, 'utf-8'));
+      const servers = projSettings.mcpServers ?? {};
+      for (const serverName of Object.keys(servers)) {
+        projectMcpServers.push(serverName);
+      }
+    } catch { /* ignore */ }
+  }
+
+  if (projectMcpServers.length > 0) {
+    console.log(`  ${BOLD}Project MCP Servers${RESET} ${DIM}(from .claude/settings.json)${RESET}`);
+    console.log();
+    for (const name of projectMcpServers) {
+      console.log(`    ${YELLOW}${name}${RESET}`);
+    }
+    console.log();
+  }
+
+  // ── 5. Active channels ──────────────────────────────────────────
+  const channels: string[] = [];
+  if (existsSync(ENV_PATH)) {
+    const envContent = readFileSync(ENV_PATH, 'utf-8');
+    if (/^DISCORD_TOKEN=.+$/m.test(envContent)) channels.push('Discord');
+    if (/^SLACK_BOT_TOKEN=.+$/m.test(envContent) && /^SLACK_APP_TOKEN=.+$/m.test(envContent)) channels.push('Slack');
+    if (/^TELEGRAM_BOT_TOKEN=.+$/m.test(envContent)) channels.push('Telegram');
+    if (/^TWILIO_ACCOUNT_SID=.+$/m.test(envContent)) channels.push('WhatsApp');
+    if (/^WEBHOOK_ENABLED=true$/m.test(envContent)) channels.push('Webhook');
+  }
+
+  if (channels.length > 0) {
+    console.log(`  ${BOLD}Active Channels${RESET}`);
+    console.log();
+    for (const ch of channels) {
+      console.log(`    ${GREEN}${ch}${RESET}`);
+    }
+    console.log();
+  }
+}
+
 // ── Program ──────────────────────────────────────────────────────────
 
 const program = new Command();
@@ -549,6 +679,11 @@ program
   .command('doctor')
   .description('Run health checks')
   .action(cmdDoctor);
+
+program
+  .command('tools')
+  .description('List available MCP tools, plugins, and channels')
+  .action(cmdTools);
 
 program
   .command('update')
