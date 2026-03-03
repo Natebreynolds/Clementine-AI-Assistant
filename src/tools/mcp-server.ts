@@ -1656,6 +1656,119 @@ server.tool(
 
 // ── Workspace Tools ─────────────────────────────────────────────────────
 
+/** Re-read WORKSPACE_DIRS from .env on every call so runtime edits are picked up. */
+function getWorkspaceDirs(): string[] {
+  const fresh = readEnvFile();
+  return (fresh['WORKSPACE_DIRS'] ?? '')
+    .split(',').map(s => s.trim()).filter(Boolean)
+    .map(d => d.startsWith('~') ? d.replace('~', os.homedir()) : d);
+}
+
+/** Update a single key in the .env file, preserving all other content. */
+function updateEnvKey(key: string, value: string): void {
+  const envPath = path.join(BASE_DIR, '.env');
+  let lines: string[] = [];
+  if (existsSync(envPath)) {
+    lines = readFileSync(envPath, 'utf-8').split('\n');
+  }
+
+  let found = false;
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i].startsWith(`${key}=`)) {
+      lines[i] = `${key}=${value}`;
+      found = true;
+      break;
+    }
+  }
+
+  if (!found) {
+    // Find or create the Workspace section
+    let insertIdx = lines.length;
+    for (let i = 0; i < lines.length; i++) {
+      if (lines[i].trim() === '# Workspace') {
+        insertIdx = i + 1;
+        break;
+      }
+    }
+    if (insertIdx === lines.length) {
+      lines.push('', '# Workspace');
+      insertIdx = lines.length;
+    }
+    lines.splice(insertIdx, 0, `${key}=${value}`);
+  }
+
+  writeFileSync(envPath, lines.join('\n'));
+}
+
+server.tool(
+  'workspace_config',
+  'View or modify workspace directories. Add/remove parent directories that contain your projects. Changes take effect immediately.',
+  {
+    action: z.enum(['list', 'add', 'remove']).describe('"list" to show current dirs, "add" to add a directory, "remove" to remove one'),
+    directory: z.string().optional().describe('Directory path to add or remove (required for add/remove)'),
+  },
+  async ({ action, directory }) => {
+    const currentDirs = getWorkspaceDirs();
+
+    if (action === 'list') {
+      if (currentDirs.length === 0) {
+        return textResult('No workspace directories configured. Use action "add" to add one.');
+      }
+      const lines = currentDirs.map((d, i) => `${i + 1}. \`${d}\``);
+      return textResult(`Workspace directories:\n\n${lines.join('\n')}`);
+    }
+
+    if (!directory) {
+      throw new Error('directory is required for add/remove actions');
+    }
+
+    const resolved = path.resolve(
+      directory.startsWith('~') ? directory.replace('~', os.homedir()) : directory,
+    );
+
+    if (action === 'add') {
+      if (!existsSync(resolved) || !statSync(resolved).isDirectory()) {
+        throw new Error(`Not a directory: ${resolved}`);
+      }
+      // Store with ~ for portability
+      const display = resolved.startsWith(os.homedir())
+        ? resolved.replace(os.homedir(), '~')
+        : resolved;
+
+      // Check for duplicates
+      const currentRaw = (readEnvFile()['WORKSPACE_DIRS'] ?? '').split(',').map(s => s.trim()).filter(Boolean);
+      if (currentRaw.includes(display) || currentRaw.includes(resolved)) {
+        return textResult(`\`${display}\` is already in workspace directories.`);
+      }
+
+      const updated = [...currentRaw, display].join(',');
+      updateEnvKey('WORKSPACE_DIRS', updated);
+      return textResult(`Added \`${display}\` to workspace directories. ${currentRaw.length + 1} total.`);
+    }
+
+    if (action === 'remove') {
+      const currentRaw = (readEnvFile()['WORKSPACE_DIRS'] ?? '').split(',').map(s => s.trim()).filter(Boolean);
+      const display = resolved.startsWith(os.homedir())
+        ? resolved.replace(os.homedir(), '~')
+        : resolved;
+
+      const filtered = currentRaw.filter(d => {
+        const dResolved = path.resolve(d.startsWith('~') ? d.replace('~', os.homedir()) : d);
+        return dResolved !== resolved;
+      });
+
+      if (filtered.length === currentRaw.length) {
+        return textResult(`\`${display}\` was not found in workspace directories.`);
+      }
+
+      updateEnvKey('WORKSPACE_DIRS', filtered.join(','));
+      return textResult(`Removed \`${display}\` from workspace directories. ${filtered.length} remaining.`);
+    }
+
+    throw new Error(`Unknown action: ${action}`);
+  },
+);
+
 const PROJECT_MARKERS = [
   '.git', 'package.json', 'pyproject.toml', 'Cargo.toml',
   'go.mod', 'Makefile', 'CMakeLists.txt', 'build.gradle',
@@ -1715,14 +1828,12 @@ server.tool(
     filter: z.string().optional().describe('Filter project names (case-insensitive substring match)'),
   },
   async ({ filter }) => {
-    const workspaceDirs = (env['WORKSPACE_DIRS'] ?? '')
-      .split(',').map(s => s.trim()).filter(Boolean)
-      .map(d => d.startsWith('~') ? d.replace('~', os.homedir()) : d);
+    const workspaceDirs = getWorkspaceDirs();
 
     if (workspaceDirs.length === 0) {
       return textResult(
-        'No workspace directories configured. Set WORKSPACE_DIRS in .env ' +
-        '(comma-separated parent directories, e.g. ~/projects,~/work).',
+        'No workspace directories configured. Use workspace_config to add one, ' +
+        'or set WORKSPACE_DIRS in .env (comma-separated parent directories, e.g. ~/projects,~/work).',
       );
     }
 
