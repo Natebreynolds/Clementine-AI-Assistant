@@ -22,7 +22,7 @@ Clementine is three layers stacked on a shared memory store:
                     ┌─────────────────────────────────────────┐
                     │            Channel Layer                 │
                     │  Discord · Slack · Telegram · WhatsApp   │
-                    │              Webhook API                 │
+                    │  Webhook API · Discord Guild Channels     │
                     └────────────────┬────────────────────────┘
                                      │
                     ┌────────────────▼────────────────────────┐
@@ -40,8 +40,8 @@ Clementine is three layers stacked on a shared memory store:
                                      │
                     ┌────────────────▼────────────────────────┐
                     │          MCP Tool Server                 │
-                    │  17 tools over stdio transport           │
-                    │  Memory · Tasks · Vault · Search · RSS   │
+                    │  27 tools over stdio transport           │
+                    │  Memory · Tasks · Vault · Workspace      │
                     └────────────────┬────────────────────────┘
                                      │
               ┌──────────────────────▼──────────────────────┐
@@ -127,7 +127,7 @@ src/                               ← Package code (wherever npm installed it)
 │   ├── search.ts                  ← Temporal decay, dedup, formatting
 │   └── chunker.ts                 ← Vault file parser (## headers, frontmatter)
 ├── tools/
-│   └── mcp-server.ts             ← 17-tool MCP stdio server
+│   └── mcp-server.ts             ← 27-tool MCP stdio server
 ├── cli/
 │   ├── index.ts                   ← CLI commands (launch, stop, status, config, doctor)
 │   └── setup.ts                   ← Interactive configuration wizard
@@ -196,7 +196,7 @@ User message
 - **Temporal decay** — Applied on every startup; stale memories naturally sink
 - **Pruning** — Episodic chunks >90 days with salience <0.01 are removed; old transcripts and access logs trimmed
 
-### MCP tools (17 total)
+### MCP tools (27 total)
 
 | Tool | Description |
 |------|-------------|
@@ -217,6 +217,16 @@ User message
 | `rss_fetch` | Fetch and parse RSS/Atom feeds |
 | `github_prs` | Check GitHub PRs (review-requested + authored) |
 | `browser_screenshot` | Take screenshots via Kernel cloud browser |
+| `set_timer` | Set short-term reminders (notifies via active channels) |
+| `outlook_inbox` | Read recent emails from Outlook inbox |
+| `outlook_search` | Search Outlook emails by query |
+| `outlook_calendar` | View upcoming calendar events |
+| `outlook_draft` | Create an email draft in Outlook |
+| `outlook_send` | Send an email from Outlook (Tier 3, requires approval) |
+| `discord_channel_send` | Post messages to any Discord text channel by ID |
+| `workspace_config` | Add, remove, or list workspace directories at runtime |
+| `workspace_list` | Scan workspace directories for local project roots |
+| `workspace_info` | Read a project's README, CLAUDE.md, manifest, and directory tree |
 
 ---
 
@@ -271,6 +281,7 @@ DEFAULT_MODEL_TIER=sonnet
 # Channels — configure one or more
 DISCORD_TOKEN=...
 DISCORD_OWNER_ID=...
+DISCORD_WATCHED_CHANNELS=...   # optional, comma-separated channel IDs
 SLACK_BOT_TOKEN=...
 SLACK_APP_TOKEN=...
 TELEGRAM_BOT_TOKEN=...
@@ -282,6 +293,9 @@ ELEVENLABS_API_KEY=...     # TTS
 
 # Video analysis (optional)
 GOOGLE_API_KEY=...         # Gemini
+
+# Workspace (optional)
+WORKSPACE_DIRS=~/projects,~/work
 
 # Security
 ALLOW_ALL_USERS=false      # true = skip owner checks
@@ -309,11 +323,43 @@ Enable channels by providing their tokens in `.env`. Clementine auto-detects whi
 
 | Channel | Requires | Notes |
 |---------|----------|-------|
-| **Discord** | `DISCORD_TOKEN` + `DISCORD_OWNER_ID` | Full bot with slash commands, reactions, voice (with Groq/ElevenLabs) |
+| **Discord** | `DISCORD_TOKEN` + `DISCORD_OWNER_ID` | DMs + optional guild channels |
 | **Slack** | `SLACK_BOT_TOKEN` + `SLACK_APP_TOKEN` | Socket Mode (no public URL needed) |
 | **Telegram** | `TELEGRAM_BOT_TOKEN` | Long polling, owner-only by default |
 | **WhatsApp** | `TWILIO_ACCOUNT_SID` + `TWILIO_AUTH_TOKEN` + `WHATSAPP_OWNER_PHONE` | Twilio bridge, requires webhook URL |
 | **Webhook** | `WEBHOOK_ENABLED=true` + `WEBHOOK_SECRET` | HTTP API for custom integrations |
+
+#### Discord guild channels
+
+By default, Discord is DM-only. To let Clementine listen and respond in server text channels, set `DISCORD_WATCHED_CHANNELS` to a comma-separated list of channel IDs:
+
+```bash
+DISCORD_WATCHED_CHANNELS=1234567890,9876543210
+```
+
+Each watched channel gets its own session (separate from DM conversations). Replying to a bot message in a watched channel automatically includes the referenced message as context. Bot commands (`!clear`, `!model`, etc.) only work in DMs.
+
+The `discord_channel_send` tool lets Clementine post to any channel by ID, useful for cron jobs that send digests or alerts to specific channels.
+
+---
+
+## Workspace discovery
+
+Clementine can discover and work with your local projects. Point her at parent directories that contain project folders:
+
+```bash
+WORKSPACE_DIRS=~/projects,~/work
+```
+
+Or let her manage it at runtime — just say "add ~/projects to my workspace" and she'll use the `workspace_config` tool to update the config without a restart.
+
+Three tools power this:
+
+- **`workspace_config`** — Add, remove, or list workspace directories. Writes directly to `.env` and takes effect immediately (no restart needed).
+- **`workspace_list`** — Scans configured directories for project roots by detecting markers (`.git`, `package.json`, `pyproject.toml`, `Cargo.toml`, `go.mod`, etc.). Returns name, type, path, description, and whether the project has a `CLAUDE.md`.
+- **`workspace_info`** — Deep-reads a project: `README.md`, `.claude/CLAUDE.md`, `package.json`/`pyproject.toml`, and a directory tree (depth 2).
+
+Clementine can then use her built-in file tools (`Read`, `Glob`, `Grep`, `Edit`, `Bash`) to work directly in any discovered project.
 
 ---
 
