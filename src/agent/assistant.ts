@@ -387,6 +387,33 @@ Log significant interactions to today's daily note.
 NOTE: A background memory agent also runs after each exchange to catch anything you
 might miss. You don't need to worry about being perfect — but do save obviously
 important facts in real-time rather than relying on the background pass.
+
+## Context Window Management — IMPORTANT
+
+You have a finite context window. Some tools return very large responses (SEO data,
+API results, backlink profiles, keyword rankings, etc.). Calling many of these in a
+single conversation WILL overflow your context and crash the session.
+
+**Rule: Delegate data-heavy work to sub-agents using the Agent tool.**
+
+When a task involves:
+- Pulling data for **multiple domains, URLs, or entities**
+- Calling data-rich APIs (SEO tools, analytics, bulk lookups) more than 2-3 times
+- Any operation where you expect large JSON/data responses
+
+**Do this instead of calling the tools directly:**
+1. Use the **Agent** tool to spawn a sub-agent with a focused task
+   (e.g., "Pull ranked keywords, backlinks, and SERP data for example.com. Summarize the top 20 keywords by traffic, top 10 referring domains, and any ranking opportunities.")
+2. The sub-agent runs the tool calls in its own context window
+3. It returns a concise summary back to you
+4. Your context stays clean for the full conversation
+
+**For multi-entity work**, spawn one agent per entity or batch:
+- "Analyze SEO for domain1.com — keywords, backlinks, top pages. Summarize findings."
+- "Analyze SEO for domain2.com — same analysis. Summarize findings."
+- Then synthesize the summaries yourself.
+
+**Never** pull bulk data for 3+ domains in your main context. Always delegate.
 `);
 
     if (profile) {
@@ -633,16 +660,26 @@ important facts in real-time rather than relying on the background pass.
       effectivePrompt, key, onText, model, profile, securityAnnotation,
     );
 
-    // If we got a context-length error, retry with a fresh session
-    if (key && responseText.startsWith('Error:') && responseText.toLowerCase().includes('context')) {
+    // If we got a context-length / prompt-too-long error, retry with a fresh session
+    const errLower = responseText.toLowerCase();
+    const isContextOverflow =
+      errLower.includes('prompt is too long') ||
+      errLower.includes('prompt too long') ||
+      errLower.includes('context_length') ||
+      (errLower.startsWith('error:') && errLower.includes('context'));
+    if (key && isContextOverflow) {
+      logger.warn({ sessionKey: key }, 'Context overflow detected — rotating session');
       this.sessions.delete(key);
       this.exchangeCounts.set(key, 0);
       let retryPrompt = text;
       const summary = await this.summarizeSession(key);
       if (summary) {
         retryPrompt =
-          `[Context: This is a continued conversation. The session was refreshed. ` +
-          `Here is a summary of the previous conversation:\n${summary}]\n\n${text}`;
+          `[Context: This is a continued conversation. The previous session hit its context limit. ` +
+          `Here is a summary of what we were discussing:\n${summary}]\n\n` +
+          `IMPORTANT: The previous attempt overflowed the context window, likely from large tool responses. ` +
+          `If this task involves pulling data for multiple entities, delegate each to a sub-agent using the Agent tool ` +
+          `instead of calling data-heavy tools directly.\n\n${text}`;
       }
       [responseText, sessionId] = await this.runQuery(retryPrompt, key, onText, model, profile, securityAnnotation);
     }
@@ -752,6 +789,8 @@ important facts in real-time rather than relying on the background pass.
           const errStr = String(e).toLowerCase();
           if (errStr.includes('rate') && (errStr.includes('limit') || errStr.includes('rate_limit'))) {
             hitRateLimit = true;
+          } else if (errStr.includes('prompt is too long') || errStr.includes('prompt too long') || errStr.includes('context_length')) {
+            responseText = responseText || 'Error: prompt is too long — context window overflow from large tool responses.';
           } else if (!responseText) {
             responseText = 'Sorry, I hit a temporary issue. Please try again.';
           }
