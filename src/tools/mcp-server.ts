@@ -1654,6 +1654,246 @@ server.tool(
   },
 );
 
+// ── Workspace Tools ─────────────────────────────────────────────────────
+
+const PROJECT_MARKERS = [
+  '.git', 'package.json', 'pyproject.toml', 'Cargo.toml',
+  'go.mod', 'Makefile', 'CMakeLists.txt', 'build.gradle',
+  'pom.xml', 'Gemfile', 'mix.exs', '.claude/CLAUDE.md',
+];
+
+function detectProjectType(entries: string[]): string {
+  if (entries.includes('package.json')) return 'node';
+  if (entries.includes('pyproject.toml') || entries.includes('setup.py')) return 'python';
+  if (entries.includes('Cargo.toml')) return 'rust';
+  if (entries.includes('go.mod')) return 'go';
+  if (entries.includes('build.gradle') || entries.includes('pom.xml')) return 'java';
+  if (entries.includes('Gemfile')) return 'ruby';
+  if (entries.includes('mix.exs')) return 'elixir';
+  if (entries.includes('CMakeLists.txt')) return 'c/c++';
+  if (entries.includes('Makefile')) return 'make';
+  return 'unknown';
+}
+
+function extractDescription(dirPath: string, entries: string[]): string {
+  // Try package.json
+  if (entries.includes('package.json')) {
+    try {
+      const pkg = JSON.parse(readFileSync(path.join(dirPath, 'package.json'), 'utf-8'));
+      if (pkg.description) return pkg.description;
+    } catch { /* ignore */ }
+  }
+  // Try pyproject.toml (basic parse)
+  if (entries.includes('pyproject.toml')) {
+    try {
+      const toml = readFileSync(path.join(dirPath, 'pyproject.toml'), 'utf-8');
+      const match = toml.match(/description\s*=\s*"([^"]+)"/);
+      if (match) return match[1];
+    } catch { /* ignore */ }
+  }
+  // Try first non-heading line of README
+  for (const readme of ['README.md', 'readme.md', 'README.rst', 'README']) {
+    if (entries.includes(readme)) {
+      try {
+        const lines = readFileSync(path.join(dirPath, readme), 'utf-8').split('\n');
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (trimmed && !trimmed.startsWith('#') && !trimmed.startsWith('=')) {
+            return trimmed.slice(0, 200);
+          }
+        }
+      } catch { /* ignore */ }
+    }
+  }
+  return '';
+}
+
+server.tool(
+  'workspace_list',
+  'List local projects found in configured workspace directories. Scans WORKSPACE_DIRS for project roots.',
+  {
+    filter: z.string().optional().describe('Filter project names (case-insensitive substring match)'),
+  },
+  async ({ filter }) => {
+    const workspaceDirs = (env['WORKSPACE_DIRS'] ?? '')
+      .split(',').map(s => s.trim()).filter(Boolean)
+      .map(d => d.startsWith('~') ? d.replace('~', os.homedir()) : d);
+
+    if (workspaceDirs.length === 0) {
+      return textResult(
+        'No workspace directories configured. Set WORKSPACE_DIRS in .env ' +
+        '(comma-separated parent directories, e.g. ~/projects,~/work).',
+      );
+    }
+
+    interface ProjectEntry {
+      name: string;
+      path: string;
+      type: string;
+      description: string;
+      hasClaude: boolean;
+    }
+
+    const projects: ProjectEntry[] = [];
+
+    for (const wsDir of workspaceDirs) {
+      const resolved = path.resolve(wsDir);
+      if (!existsSync(resolved)) continue;
+
+      let entries: string[];
+      try {
+        entries = readdirSync(resolved);
+      } catch { continue; }
+
+      for (const entry of entries) {
+        if (entry.startsWith('.')) continue;
+        const fullPath = path.join(resolved, entry);
+        try {
+          if (!statSync(fullPath).isDirectory()) continue;
+        } catch { continue; }
+
+        let subEntries: string[];
+        try {
+          subEntries = readdirSync(fullPath);
+        } catch { continue; }
+
+        const isProject = PROJECT_MARKERS.some(marker => {
+          if (marker.includes('/')) {
+            return existsSync(path.join(fullPath, marker));
+          }
+          return subEntries.includes(marker);
+        });
+
+        if (!isProject) continue;
+
+        if (filter && !entry.toLowerCase().includes(filter.toLowerCase())) continue;
+
+        projects.push({
+          name: entry,
+          path: fullPath,
+          type: detectProjectType(subEntries),
+          description: extractDescription(fullPath, subEntries),
+          hasClaude: existsSync(path.join(fullPath, '.claude', 'CLAUDE.md')),
+        });
+      }
+    }
+
+    if (projects.length === 0) {
+      return textResult(
+        filter
+          ? `No projects matching "${filter}" found in workspace directories.`
+          : 'No projects found in workspace directories.',
+      );
+    }
+
+    const lines = projects.map(p => {
+      const parts = [`**${p.name}** (${p.type})`];
+      if (p.description) parts.push(`  ${p.description}`);
+      parts.push(`  Path: \`${p.path}\``);
+      if (p.hasClaude) parts.push('  Has `.claude/CLAUDE.md`');
+      return parts.join('\n');
+    });
+
+    return textResult(`Found ${projects.length} project(s):\n\n${lines.join('\n\n')}`);
+  },
+);
+
+server.tool(
+  'workspace_info',
+  'Get detailed info about a local project: README, CLAUDE.md, manifest, structure.',
+  {
+    project_path: z.string().describe('Absolute path to the project root'),
+    include_tree: z.boolean().optional().describe('Include directory tree (default true, depth 2)'),
+  },
+  async ({ project_path, include_tree }) => {
+    const resolved = path.resolve(
+      project_path.startsWith('~') ? project_path.replace('~', os.homedir()) : project_path,
+    );
+
+    if (!existsSync(resolved) || !statSync(resolved).isDirectory()) {
+      throw new Error(`Not a directory: ${resolved}`);
+    }
+
+    const sections: string[] = [`# ${path.basename(resolved)}\n\nPath: \`${resolved}\``];
+
+    // CLAUDE.md
+    const claudeMd = path.join(resolved, '.claude', 'CLAUDE.md');
+    if (existsSync(claudeMd)) {
+      const content = readFileSync(claudeMd, 'utf-8').slice(0, 3000);
+      sections.push(`## CLAUDE.md\n\n${content}`);
+    }
+
+    // README
+    for (const readme of ['README.md', 'readme.md', 'README.rst', 'README']) {
+      const readmePath = path.join(resolved, readme);
+      if (existsSync(readmePath)) {
+        const content = readFileSync(readmePath, 'utf-8').slice(0, 3000);
+        sections.push(`## ${readme}\n\n${content}`);
+        break;
+      }
+    }
+
+    // package.json summary
+    const pkgPath = path.join(resolved, 'package.json');
+    if (existsSync(pkgPath)) {
+      try {
+        const pkg = JSON.parse(readFileSync(pkgPath, 'utf-8'));
+        const info: string[] = [];
+        if (pkg.name) info.push(`Name: ${pkg.name}`);
+        if (pkg.version) info.push(`Version: ${pkg.version}`);
+        if (pkg.description) info.push(`Description: ${pkg.description}`);
+        if (pkg.scripts) info.push(`Scripts: ${Object.keys(pkg.scripts).join(', ')}`);
+        if (pkg.dependencies) info.push(`Dependencies: ${Object.keys(pkg.dependencies).length}`);
+        if (pkg.devDependencies) info.push(`Dev dependencies: ${Object.keys(pkg.devDependencies).length}`);
+        sections.push(`## package.json\n\n${info.join('\n')}`);
+      } catch { /* ignore */ }
+    }
+
+    // pyproject.toml summary
+    const pyprojectPath = path.join(resolved, 'pyproject.toml');
+    if (existsSync(pyprojectPath)) {
+      const content = readFileSync(pyprojectPath, 'utf-8').slice(0, 2000);
+      sections.push(`## pyproject.toml\n\n${content}`);
+    }
+
+    // Directory tree (depth 2)
+    if (include_tree !== false) {
+      const tree: string[] = [];
+      try {
+        const topEntries = readdirSync(resolved).filter(e => !e.startsWith('.')).sort();
+        for (const entry of topEntries) {
+          const fullPath = path.join(resolved, entry);
+          try {
+            if (statSync(fullPath).isDirectory()) {
+              tree.push(`${entry}/`);
+              const subEntries = readdirSync(fullPath)
+                .filter(e => !e.startsWith('.') && e !== 'node_modules' && e !== '__pycache__' && e !== '.git')
+                .sort()
+                .slice(0, 20);
+              for (const sub of subEntries) {
+                tree.push(`  ${sub}${statSync(path.join(fullPath, sub)).isDirectory() ? '/' : ''}`);
+              }
+              if (readdirSync(fullPath).filter(e => !e.startsWith('.')).length > 20) {
+                tree.push('  ...');
+              }
+            } else {
+              tree.push(entry);
+            }
+          } catch {
+            tree.push(entry);
+          }
+        }
+      } catch { /* ignore */ }
+
+      if (tree.length > 0) {
+        sections.push(`## Directory Structure\n\n\`\`\`\n${tree.join('\n')}\n\`\`\``);
+      }
+    }
+
+    return textResult(sections.join('\n\n---\n\n'));
+  },
+);
+
 // ── Discord Channel Send ────────────────────────────────────────────────
 
 server.tool(

@@ -362,8 +362,20 @@ export async function runSetup(): Promise<void> {
     await collectCredentials(feature.credentials, entries);
   }
 
-  // ── Step 5: Security ─────────────────────────────────────────────
-  sectionHeader('Step 5: Security');
+  // ── Step 5: Workspace ──────────────────────────────────────────────
+  sectionHeader('Step 5: Workspace');
+
+  console.log(`  ${DIM}Point Clementine at parent directories containing your projects.${RESET}`);
+  console.log(`  ${DIM}She'll auto-discover project roots (git repos, npm packages, etc.)${RESET}`);
+  console.log();
+
+  entries['WORKSPACE_DIRS'] = await input({
+    message: 'Workspace directories (comma-separated, optional)',
+    default: entries['WORKSPACE_DIRS'] || '',
+  });
+
+  // ── Step 6: Security ─────────────────────────────────────────────
+  sectionHeader('Step 6: Security');
 
   const allowAll = await confirm({
     message: 'Allow all users (no owner check)?',
@@ -383,6 +395,7 @@ export async function runSetup(): Promise<void> {
     { header: 'Voice', keys: ['GROQ_API_KEY', 'ELEVENLABS_API_KEY', 'ELEVENLABS_VOICE_ID'] },
     { header: 'Video', keys: ['GOOGLE_API_KEY'] },
     { header: 'Outlook (Microsoft Graph)', keys: ['MS_TENANT_ID', 'MS_CLIENT_ID', 'MS_CLIENT_SECRET', 'MS_USER_EMAIL'] },
+    { header: 'Workspace', keys: ['WORKSPACE_DIRS'] },
     { header: 'Security', keys: ['ALLOW_ALL_USERS'] },
   ];
 

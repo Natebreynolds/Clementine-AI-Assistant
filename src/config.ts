@@ -175,6 +175,13 @@ export const HEARTBEAT_ACTIVE_START = 8;
 export const HEARTBEAT_ACTIVE_END = 22;
 export const HEARTBEAT_MAX_TURNS = 5;
 
+// ── Workspace ───────────────────────────────────────────────────────
+
+export const WORKSPACE_DIRS: string[] = getEnv('WORKSPACE_DIRS')
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean);
+
 // ── Channel availability flags ───────────────────────────────────────
 
 export const CHANNEL_DISCORD = Boolean(DISCORD_TOKEN);

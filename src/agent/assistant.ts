@@ -463,6 +463,8 @@ important facts in real-time rather than relying on the background pass.
       mcpTool('outlook_draft'),
       mcpTool('outlook_send'),
       mcpTool('discord_channel_send'),
+      mcpTool('workspace_list'),
+      mcpTool('workspace_info'),
     ];
 
     if (enableTeams) {
