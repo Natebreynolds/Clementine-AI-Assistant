@@ -15,6 +15,7 @@ import { fileURLToPath } from 'node:url';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import pino from 'pino';
+import Anthropic from '@anthropic-ai/sdk';
 import { z } from 'zod';
 
 // ── Resolve paths ──────────────────────────────────────────────────────
@@ -2205,6 +2206,136 @@ server.tool(
     }
     const channel = (await res.json()) as { id: string; name: string };
     return textResult(`Created channel #${channel.name} (ID: ${channel.id}) in guild ${guild_id}`);
+  },
+);
+
+// ── Add Cron Job ────────────────────────────────────────────────────────
+
+server.tool(
+  'add_cron_job',
+  'Add a new scheduled cron job. Validates the schedule expression and writes to CRON.md. The daemon auto-reloads on file change.',
+  {
+    name: z.string().describe('Job name (unique identifier)'),
+    schedule: z.string().describe('Cron expression (e.g., "0 9 * * 1" for Monday 9 AM)'),
+    prompt: z.string().describe('The prompt/instruction for the assistant to execute'),
+    tier: z.number().optional().default(1).describe('Security tier (1=auto, 2=logged, 3=approval)'),
+    enabled: z.boolean().optional().default(true).describe('Whether the job is enabled'),
+  },
+  async ({ name: jobName, schedule, prompt, tier, enabled }) => {
+    // Validate cron expression
+    const cronMod = await import('node-cron');
+    if (!cronMod.default.validate(schedule)) {
+      return textResult(`Invalid cron expression: "${schedule}". Examples: "0 9 * * 1" (Mon 9 AM), "*/30 * * * *" (every 30 min).`);
+    }
+
+    // Read existing CRON.md or create empty structure
+    const matterMod = await import('gray-matter');
+    let parsed: ReturnType<typeof matterMod.default>;
+    if (existsSync(CRON_FILE)) {
+      const raw = readFileSync(CRON_FILE, 'utf-8');
+      parsed = matterMod.default(raw);
+    } else {
+      const dir = path.dirname(CRON_FILE);
+      if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+      parsed = matterMod.default('');
+      parsed.data = {};
+    }
+
+    const jobs = (parsed.data.jobs ?? []) as Array<Record<string, unknown>>;
+
+    // Check for duplicate name
+    const duplicate = jobs.find(
+      (j) => String(j.name ?? '').toLowerCase() === jobName.toLowerCase(),
+    );
+    if (duplicate) {
+      return textResult(`A job named "${jobName}" already exists. Use a different name or remove the existing job first.`);
+    }
+
+    // Create and append the new job
+    const newJob = {
+      name: jobName,
+      schedule,
+      prompt,
+      enabled,
+      tier,
+    };
+
+    jobs.push(newJob);
+    parsed.data.jobs = jobs;
+
+    // Write back preserving body content
+    const output = matterMod.default.stringify(parsed.content, parsed.data);
+    writeFileSync(CRON_FILE, output);
+
+    logger.info({ jobName, schedule, tier }, 'Added cron job via MCP tool');
+
+    return textResult(
+      `Added cron job "${jobName}":\n` +
+      `  Schedule: ${schedule}\n` +
+      `  Prompt: ${prompt.slice(0, 100)}${prompt.length > 100 ? '...' : ''}\n` +
+      `  Tier: ${tier}\n` +
+      `  Enabled: ${enabled}\n\n` +
+      `The daemon will auto-reload CRON.md on file change.`,
+    );
+  },
+);
+
+// ── Analyze Image ───────────────────────────────────────────────────────
+
+server.tool(
+  'analyze_image',
+  'Analyze an image by URL. Fetches the image, converts to base64, and uses Claude vision to describe it. Works with any image URL — channel attachments, email attachments, web images.',
+  {
+    url: z.string().describe('URL of the image to analyze'),
+    question: z.string().optional().default('Describe this image in detail.').describe('Specific question about the image'),
+  },
+  async ({ url, question }) => {
+    try {
+      // Fetch the image (include auth headers for Slack URLs)
+      const headers: Record<string, string> = {};
+      if (url.includes('slack.com') || url.includes('slack-files.com')) {
+        const slackToken = env['SLACK_BOT_TOKEN'] ?? '';
+        if (slackToken) {
+          headers['Authorization'] = `Bearer ${slackToken}`;
+        }
+      }
+
+      const response = await fetch(url, { headers });
+      if (!response.ok) throw new Error(`Failed to fetch image: ${response.status}`);
+
+      const buffer = await response.arrayBuffer();
+      const base64 = Buffer.from(buffer).toString('base64');
+      const contentType = response.headers.get('content-type') || 'image/jpeg';
+
+      // Validate it's an image
+      if (!contentType.startsWith('image/')) {
+        return textResult(`URL does not point to an image (content-type: ${contentType})`);
+      }
+
+      // Call Anthropic Messages API with vision
+      const anthropic = new Anthropic({
+        apiKey: env['ANTHROPIC_API_KEY'] || process.env.ANTHROPIC_API_KEY,
+      });
+      const result = await anthropic.messages.create({
+        model: 'claude-haiku-4-5-20251001',
+        max_tokens: 1024,
+        messages: [{
+          role: 'user',
+          content: [
+            {
+              type: 'image',
+              source: { type: 'base64', media_type: contentType as 'image/jpeg' | 'image/png' | 'image/gif' | 'image/webp', data: base64 },
+            },
+            { type: 'text', text: question },
+          ],
+        }],
+      });
+
+      const description = result.content.map(b => b.type === 'text' ? b.text : '').join('');
+      return textResult(description);
+    } catch (err: any) {
+      return textResult(`Image analysis failed: ${err.message}`);
+    }
   },
 );
 

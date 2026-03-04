@@ -225,6 +225,119 @@ export async function cmdCronRunDue(): Promise<void> {
   saveLastRuns(lastRuns);
 }
 
+export async function cmdCronAdd(
+  name: string,
+  schedule: string,
+  prompt: string,
+  options: { tier?: string },
+): Promise<void> {
+  process.env.CLEMENTINE_HOME = BASE_DIR;
+
+  // Validate cron expression
+  if (!cron.validate(schedule)) {
+    console.error(`Invalid cron expression: ${schedule}`);
+    console.error('Examples: "0 9 * * 1" (Mon 9 AM), "*/30 * * * *" (every 30 min)');
+    process.exit(1);
+  }
+
+  // Resolve CRON.md path
+  const cronFile = path.join(BASE_DIR, 'vault', '00-System', 'CRON.md');
+
+  // Read existing CRON.md or create empty structure
+  let parsed: matter.GrayMatterFile<string>;
+  if (existsSync(cronFile)) {
+    const raw = readFileSync(cronFile, 'utf-8');
+    parsed = matter(raw);
+  } else {
+    // Create directory if needed
+    const dir = path.dirname(cronFile);
+    if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+    parsed = matter('');
+    parsed.data = {};
+  }
+
+  const jobs = (parsed.data.jobs ?? []) as Array<Record<string, unknown>>;
+
+  // Check for duplicate name
+  const duplicate = jobs.find(
+    (j) => String(j.name ?? '').toLowerCase() === name.toLowerCase(),
+  );
+  if (duplicate) {
+    console.error(`A job named "${name}" already exists.`);
+    process.exit(1);
+  }
+
+  // Create new job entry
+  const tier = parseInt(options.tier ?? '1', 10);
+  const newJob = {
+    name,
+    schedule,
+    prompt,
+    enabled: true,
+    tier: isNaN(tier) ? 1 : tier,
+  };
+
+  jobs.push(newJob);
+  parsed.data.jobs = jobs;
+
+  // Write back preserving body content
+  const output = matter.stringify(parsed.content, parsed.data);
+  writeFileSync(cronFile, output);
+
+  console.log(`Added cron job: ${name}`);
+  console.log(`  Schedule: ${schedule}`);
+  console.log(`  Prompt:   ${prompt.slice(0, 100)}`);
+  console.log(`  Tier:     ${newJob.tier}`);
+  console.log(`  Enabled:  true`);
+  console.log();
+  console.log('The daemon will auto-reload CRON.md on file change.');
+}
+
+export async function cmdCronTest(jobNameOrIndex: string): Promise<void> {
+  process.env.CLEMENTINE_HOME = BASE_DIR;
+
+  const jobs = parseCronJobs();
+  if (jobs.length === 0) {
+    console.error('No cron jobs defined. Edit vault/00-System/CRON.md to add jobs.');
+    process.exit(1);
+  }
+
+  // Find job by name (case-insensitive) or by numeric index
+  let job: CronJobDefinition | undefined;
+  const index = parseInt(jobNameOrIndex, 10);
+
+  if (!isNaN(index) && index >= 0 && index < jobs.length) {
+    job = jobs[index];
+  } else {
+    job = jobs.find(
+      (j) => j.name.toLowerCase() === jobNameOrIndex.toLowerCase(),
+    );
+  }
+
+  if (!job) {
+    console.error(`Job not found: ${jobNameOrIndex}`);
+    console.error(`Available jobs: ${jobs.map((j) => j.name).join(', ') || '(none)'}`);
+    process.exit(1);
+  }
+
+  console.log(`Dry-running cron job: ${job.name}`);
+  console.log(`  Schedule: ${job.schedule}`);
+  console.log(`  Prompt:   ${job.prompt.slice(0, 100)}`);
+  console.log(`  Tier:     ${job.tier}`);
+  console.log();
+
+  const { gateway } = await initGateway();
+
+  try {
+    const response = await gateway.handleCronJob(job.name, job.prompt, job.tier, job.maxTurns);
+    console.log('--- Output ---');
+    console.log(response || '(no output)');
+  } catch (err) {
+    console.error(`Error: ${err}`);
+    process.exit(1);
+  }
+}
+
 export async function cmdCronRuns(jobName?: string): Promise<void> {
   process.env.CLEMENTINE_HOME = BASE_DIR;
 

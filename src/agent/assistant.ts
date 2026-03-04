@@ -507,6 +507,7 @@ When a task involves:
       mcpTool('workspace_list'),
       mcpTool('workspace_info'),
       mcpTool('self_restart'),
+      mcpTool('add_cron_job'),
     ];
 
     if (enableTeams) {

@@ -23,7 +23,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { runSetup } from './setup.js';
-import { cmdCronList, cmdCronRun, cmdCronRunDue, cmdCronRuns, cmdHeartbeat } from './cron.js';
+import { cmdCronList, cmdCronRun, cmdCronRunDue, cmdCronRuns, cmdCronAdd, cmdCronTest, cmdHeartbeat } from './cron.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -973,6 +973,27 @@ cronCmd
   .description('View run history (all jobs or a specific job)')
   .action((jobName?: string) => {
     cmdCronRuns(jobName).catch((err: unknown) => {
+      console.error('Error:', err);
+      process.exit(1);
+    });
+  });
+
+cronCmd
+  .command('add <name> <schedule> <prompt>')
+  .description('Add a new cron job to CRON.md')
+  .option('--tier <n>', 'Security tier (1-3)', '1')
+  .action(async (name: string, schedule: string, prompt: string, opts: { tier?: string }) => {
+    await cmdCronAdd(name, schedule, prompt, opts).catch((err: unknown) => {
+      console.error('Error:', err);
+      process.exit(1);
+    });
+  });
+
+cronCmd
+  .command('test <job>')
+  .description('Dry-run a cron job immediately (does not log to history)')
+  .action(async (job: string) => {
+    await cmdCronTest(job).catch((err: unknown) => {
       console.error('Error:', err);
       process.exit(1);
     });
