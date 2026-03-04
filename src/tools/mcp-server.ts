@@ -2088,6 +2088,123 @@ server.tool(
   },
 );
 
+// ── Discord Channel Send with Buttons ──────────────────────────────────
+
+server.tool(
+  'discord_channel_send_buttons',
+  'Send a message to a Discord channel with approve/deny action buttons. Returns the message ID for tracking.',
+  {
+    channel_id: z.string().describe('Discord channel ID to post to'),
+    message: z.string().describe('Message content (Discord markdown)'),
+    approve_label: z.string().optional().describe('Label for approve button (default: Approve)'),
+    deny_label: z.string().optional().describe('Label for deny button (default: Deny)'),
+    custom_id_prefix: z.string().optional().describe('Prefix for button custom IDs (default: audit). Buttons will be {prefix}_approve and {prefix}_deny'),
+  },
+  async ({ channel_id, message, approve_label, deny_label, custom_id_prefix }) => {
+    const token = env['DISCORD_TOKEN'] ?? '';
+    if (!token) throw new Error('DISCORD_TOKEN not configured');
+    if (!channel_id) throw new Error('channel_id is required');
+
+    const prefix = custom_id_prefix ?? 'audit';
+
+    const payload = {
+      content: message.slice(0, 2000),
+      components: [
+        {
+          type: 1, // ACTION_ROW
+          components: [
+            {
+              type: 2, // BUTTON
+              style: 3, // SUCCESS (green)
+              label: approve_label ?? '✅ Approve',
+              custom_id: `${prefix}_approve`,
+            },
+            {
+              type: 2, // BUTTON
+              style: 4, // DANGER (red)
+              label: deny_label ?? '❌ Deny',
+              custom_id: `${prefix}_deny`,
+            },
+          ],
+        },
+      ],
+    };
+
+    const res = await fetch(`https://discord.com/api/v10/channels/${channel_id}/messages`, {
+      method: 'POST',
+      headers: { Authorization: `Bot ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) {
+      const errText = await res.text();
+      throw new Error(`Discord API ${res.status}: ${errText}`);
+    }
+    const msg = (await res.json()) as { id: string };
+    return textResult(`Message with buttons posted to channel ${channel_id} (message ID: ${msg.id})`);
+  },
+);
+
+// ── Discord Channel Create ─────────────────────────────────────────────
+
+server.tool(
+  'discord_channel_create',
+  'Create a new Discord text channel in a guild/server. Requires Manage Channels permission.',
+  {
+    guild_id: z.string().describe('Discord guild/server ID'),
+    channel_name: z.string().describe('Name for the new channel (lowercase, hyphens)'),
+    topic: z.string().optional().describe('Optional channel topic/description'),
+    category_id: z.string().optional().describe('Optional category ID to place the channel under'),
+  },
+  async ({ guild_id, channel_name, topic, category_id }) => {
+    const token = env['DISCORD_TOKEN'] ?? '';
+    if (!token) throw new Error('DISCORD_TOKEN not configured');
+
+    const payload: Record<string, unknown> = {
+      name: channel_name,
+      type: 0, // GUILD_TEXT
+    };
+    if (topic) payload.topic = topic;
+    if (category_id) payload.parent_id = category_id;
+
+    const res = await fetch(`https://discord.com/api/v10/guilds/${guild_id}/channels`, {
+      method: 'POST',
+      headers: { Authorization: `Bot ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) {
+      const errText = await res.text();
+      throw new Error(`Discord API ${res.status}: ${errText}`);
+    }
+    const channel = (await res.json()) as { id: string; name: string };
+    return textResult(`Created channel #${channel.name} (ID: ${channel.id}) in guild ${guild_id}`);
+  },
+);
+
+// ── Self-Restart ────────────────────────────────────────────────────────
+
+server.tool(
+  'self_restart',
+  'Restart the Clementine daemon to pick up code changes. Sends SIGUSR1 to the running process, which triggers a graceful restart.',
+  {},
+  async () => {
+    const pidFile = path.join(BASE_DIR, `.${(env['ASSISTANT_NAME'] ?? 'clementine').toLowerCase()}.pid`);
+    if (!existsSync(pidFile)) {
+      return textResult('No PID file found — daemon may not be running.');
+    }
+    const pid = parseInt(readFileSync(pidFile, 'utf-8').trim(), 10);
+    if (isNaN(pid)) {
+      return textResult('Invalid PID file.');
+    }
+    try {
+      process.kill(pid, 0); // check if alive
+    } catch {
+      return textResult(`Process ${pid} is not running.`);
+    }
+    process.kill(pid, 'SIGUSR1');
+    return textResult(`Restart signal (SIGUSR1) sent to PID ${pid}. Daemon will restart momentarily.`);
+  },
+);
+
 // ── Main ───────────────────────────────────────────────────────────────
 
 async function main() {

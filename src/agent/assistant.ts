@@ -493,6 +493,7 @@ When a task involves:
       mcpTool('workspace_config'),
       mcpTool('workspace_list'),
       mcpTool('workspace_info'),
+      mcpTool('self_restart'),
     ];
 
     if (enableTeams) {

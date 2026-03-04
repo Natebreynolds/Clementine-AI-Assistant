@@ -407,20 +407,43 @@ async function asyncMain(): Promise<void> {
   // ── Initialize all channels ─────────────────────────────────────
   await Promise.all(channelTasks);
 
-  // ── Keep alive until shutdown signal ───────────────────────────
+  // ── Keep alive until shutdown or restart signal ─────────────────
   // The event loop stays active via Discord's websocket, node-cron
   // timers, and heartbeat setInterval.  We just need to gate on
   // SIGTERM / SIGINT so cleanup runs before exit.
+  // SIGUSR1 triggers a self-restart: cleanup then spawn a new instance.
+  let restartRequested = false;
+
   await new Promise<void>((resolve) => {
     process.once('SIGTERM', resolve);
     process.once('SIGINT', resolve);
+    process.once('SIGUSR1', () => {
+      restartRequested = true;
+      resolve();
+    });
   });
 
   // ── Graceful cleanup ──────────────────────────────────────────
-  logger.info('Shutdown signal received — cleaning up');
+  logger.info(restartRequested ? 'Restart signal received — restarting' : 'Shutdown signal received — cleaning up');
   clearInterval(timerInterval);
   heartbeat.stop();
   cronScheduler.stop();
+
+  // ── Self-restart ──────────────────────────────────────────────
+  if (restartRequested) {
+    // Spawn a new detached instance before exiting
+    const { spawn } = await import('node:child_process');
+    const entry = process.argv[1];
+    const args = process.argv.slice(2);
+    logger.info({ entry, args }, 'Spawning new instance');
+    const child = spawn(process.execPath, [entry, ...args], {
+      detached: true,
+      stdio: 'ignore',
+      cwd: process.cwd(),
+      env: process.env,
+    });
+    child.unref();
+  }
 }
 
 // ── Main ─────────────────────────────────────────────────────────────
