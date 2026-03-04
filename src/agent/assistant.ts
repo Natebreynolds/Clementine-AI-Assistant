@@ -502,12 +502,18 @@ When a task involves:
       mcpTool('outlook_calendar'),
       mcpTool('outlook_draft'),
       mcpTool('outlook_send'),
+      mcpTool('outlook_read_email'),
+      mcpTool('analyze_image'),
       mcpTool('discord_channel_send'),
       mcpTool('workspace_config'),
       mcpTool('workspace_list'),
       mcpTool('workspace_info'),
       mcpTool('self_restart'),
       mcpTool('add_cron_job'),
+      mcpTool('memory_report'),
+      mcpTool('memory_correct'),
+      mcpTool('feedback_log'),
+      mcpTool('feedback_report'),
     ];
 
     if (enableTeams) {

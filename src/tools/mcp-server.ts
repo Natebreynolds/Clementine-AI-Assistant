@@ -88,6 +88,25 @@ type MemoryStoreType = {
     maxAgeDays?: number; salienceThreshold?: number;
     accessLogRetentionDays?: number; transcriptRetentionDays?: number;
   }): { episodicPruned: number; accessLogPruned: number; transcriptsPruned: number };
+  logExtraction(extraction: {
+    sessionKey: string; userMessage: string; toolName: string;
+    toolInput: string; extractedAt: string; status: string;
+  }): void;
+  getRecentExtractions(limit?: number, status?: string): Array<{
+    id: number; sessionKey: string; userMessage: string; toolName: string;
+    toolInput: string; extractedAt: string; status: string; correction?: string;
+  }>;
+  correctExtraction(id: number, correction: string): void;
+  dismissExtraction(id: number): void;
+  logFeedback(feedback: {
+    sessionKey?: string; channel: string; messageSnippet?: string;
+    responseSnippet?: string; rating: string; comment?: string;
+  }): void;
+  getRecentFeedback(limit?: number): Array<{
+    id: number; sessionKey?: string; channel: string; messageSnippet?: string;
+    responseSnippet?: string; rating: string; comment?: string; createdAt: string;
+  }>;
+  getFeedbackStats(): { positive: number; negative: number; mixed: number; total: number };
   db: unknown;
 };
 
@@ -1547,7 +1566,7 @@ server.tool(
     const limit = Math.min(count, 25);
     const filter = unread_only ? '&$filter=isRead eq false' : '';
     const data = await graphGet(
-      `/users/${userEmail}/mailFolders/inbox/messages?$top=${limit}&$select=from,subject,receivedDateTime,bodyPreview,isRead&$orderby=receivedDateTime desc${filter}`
+      `/users/${userEmail}/mailFolders/inbox/messages?$top=${limit}&$select=from,subject,receivedDateTime,bodyPreview,isRead,hasAttachments&$orderby=receivedDateTime desc${filter}`
     );
     const emails = (data.value ?? []).map((m: any) => ({
       id: m.id,
@@ -1557,6 +1576,7 @@ server.tool(
       date: m.receivedDateTime,
       preview: (m.bodyPreview ?? '').slice(0, 200),
       unread: !m.isRead,
+      hasAttachments: m.hasAttachments ?? false,
     }));
     return externalResult(JSON.stringify(emails, null, 2));
   },
@@ -1575,7 +1595,7 @@ server.tool(
     const userEmail = env['MS_USER_EMAIL'] ?? '';
     const limit = Math.min(count, 25);
     const data = await graphGet(
-      `/users/${userEmail}/messages?$search="${encodeURIComponent(query)}"&$top=${limit}&$select=from,subject,receivedDateTime,bodyPreview&$orderby=receivedDateTime desc`
+      `/users/${userEmail}/messages?$search="${encodeURIComponent(query)}"&$top=${limit}&$select=from,subject,receivedDateTime,bodyPreview,hasAttachments&$orderby=receivedDateTime desc`
     );
     const emails = (data.value ?? []).map((m: any) => ({
       id: m.id,
@@ -1584,6 +1604,7 @@ server.tool(
       subject: m.subject ?? '(no subject)',
       date: m.receivedDateTime,
       preview: (m.bodyPreview ?? '').slice(0, 200),
+      hasAttachments: m.hasAttachments ?? false,
     }));
     return externalResult(JSON.stringify(emails, null, 2));
   },
@@ -1680,6 +1701,47 @@ server.tool(
     }
     await graphPost(`/users/${userEmail}/sendMail`, { message, saveToSentItems: true });
     return textResult(`Email sent to ${to}: "${subject}"`);
+  },
+);
+
+// ── 22. outlook_read_email ───────────────────────────────────────────────
+
+server.tool(
+  'outlook_read_email',
+  'Read a full email by ID, including body and attachment list. Use this to inspect email attachments after finding emails with outlook_inbox or outlook_search.',
+  {
+    messageId: z.string().describe('The email message ID (from outlook_inbox or outlook_search)'),
+  },
+  async ({ messageId }) => {
+    const userEmail = env['MS_USER_EMAIL'] ?? '';
+    const data = await graphGet(
+      `/users/${userEmail}/messages/${messageId}?$expand=attachments&$select=subject,from,body,receivedDateTime,hasAttachments`
+    );
+
+    // Format attachment info
+    const attachments = (data.attachments ?? []).map((att: any) => ({
+      name: att.name,
+      contentType: att.contentType,
+      size: att.size,
+      isImage: att.contentType?.startsWith('image/') ?? false,
+    }));
+
+    // Strip HTML tags from body
+    const bodyText = (data.body?.content ?? '(no body)').replace(/<[^>]*>/g, '');
+
+    const result = {
+      subject: data.subject ?? '(no subject)',
+      from: data.from?.emailAddress?.address ?? 'unknown',
+      receivedAt: data.receivedDateTime,
+      body: bodyText.slice(0, 3000),
+      attachments: attachments.length > 0
+        ? attachments.map((a: any) =>
+            `- ${a.name} (${a.contentType}, ${Math.round(a.size / 1024)}KB)${a.isImage ? ' [image — use analyze_image to view]' : ''}`
+          ).join('\n')
+        : '(none)',
+    };
+
+    return externalResult(JSON.stringify(result, null, 2));
   },
 );
 
@@ -2336,6 +2398,97 @@ server.tool(
     } catch (err: any) {
       return textResult(`Image analysis failed: ${err.message}`);
     }
+  },
+);
+
+// ── Memory Transparency: memory_report ──────────────────────────────────
+
+server.tool(
+  'memory_report',
+  'Show recent memory extractions — what was learned, when, and from which message. Helps the owner verify what the assistant has been learning.',
+  {
+    limit: z.number().optional().default(10).describe('Number of recent extractions to show'),
+    status: z.enum(['active', 'corrected', 'dismissed', 'all']).optional().default('all').describe('Filter by status'),
+  },
+  async ({ limit, status }) => {
+    const store = await getStore();
+    const filter = status === 'all' ? undefined : status;
+    const extractions = store.getRecentExtractions(limit, filter);
+    if (extractions.length === 0) {
+      return textResult('No memory extractions found.');
+    }
+    const report = extractions.map((e, i) =>
+      `${i + 1}. [${e.status}] ${e.extractedAt}\n   From: "${e.userMessage.slice(0, 100)}${e.userMessage.length > 100 ? '...' : ''}"\n   Tool: ${e.toolName}\n   Input: ${e.toolInput.slice(0, 200)}${e.correction ? `\n   Correction: ${e.correction}` : ''}`
+    ).join('\n\n');
+    return textResult(report);
+  },
+);
+
+// ── Memory Transparency: memory_correct ─────────────────────────────────
+
+server.tool(
+  'memory_correct',
+  'Correct or dismiss a memory extraction. Use when the owner says something learned was wrong.',
+  {
+    id: z.number().describe('Extraction ID from memory_report'),
+    action: z.enum(['correct', 'dismiss']).describe('Whether to correct (replace with accurate fact) or dismiss (mark as invalid)'),
+    correction: z.string().optional().describe('The corrected fact (required if action is "correct")'),
+  },
+  async ({ id, action, correction }) => {
+    const store = await getStore();
+    if (action === 'correct') {
+      if (!correction) return textResult('Correction text required when action is "correct".');
+      store.correctExtraction(id, correction);
+      return textResult(`Extraction #${id} corrected. Updated fact: ${correction}`);
+    } else {
+      store.dismissExtraction(id);
+      return textResult(`Extraction #${id} dismissed.`);
+    }
+  },
+);
+
+// ── Feedback: feedback_log ──────────────────────────────────────────────
+
+server.tool(
+  'feedback_log',
+  'Record verbal feedback from the owner about a response quality.',
+  {
+    rating: z.enum(['positive', 'negative', 'mixed']).describe('Feedback rating'),
+    comment: z.string().optional().describe('Additional context about the feedback'),
+    messageContext: z.string().optional().describe('What the feedback is about'),
+  },
+  async ({ rating, comment, messageContext }) => {
+    const store = await getStore();
+    store.logFeedback({
+      channel: 'verbal',
+      rating,
+      comment: comment ?? undefined,
+      messageSnippet: messageContext ?? undefined,
+    });
+    return textResult(`Feedback recorded: ${rating}${comment ? ` — ${comment}` : ''}`);
+  },
+);
+
+// ── Feedback: feedback_report ───────────────────────────────────────────
+
+server.tool(
+  'feedback_report',
+  'Show feedback statistics and recent entries.',
+  {
+    limit: z.number().optional().default(10).describe('Number of recent entries'),
+  },
+  async ({ limit }) => {
+    const store = await getStore();
+    const stats = store.getFeedbackStats();
+    const recent = store.getRecentFeedback(limit);
+    const statsLine = `Stats: ${stats.positive} positive, ${stats.negative} negative, ${stats.mixed} mixed (${stats.total} total)`;
+    if (recent.length === 0) {
+      return textResult(`${statsLine}\n\nNo feedback entries yet.`);
+    }
+    const entries = recent.map((f, i) =>
+      `${i + 1}. [${f.rating}] ${f.createdAt} via ${f.channel}${f.comment ? `: ${f.comment}` : ''}${f.responseSnippet ? `\n   Response: "${f.responseSnippet.slice(0, 100)}"` : ''}`
+    ).join('\n');
+    return textResult(`${statsLine}\n\nRecent:\n${entries}`);
   },
 );
 

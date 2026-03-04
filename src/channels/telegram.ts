@@ -163,6 +163,76 @@ export async function startTelegram(
     }
   });
 
+  // Photo message handler — extracts image URL and forwards to gateway
+  bot.on('message:photo', async (ctx) => {
+    const userId = ctx.from?.id;
+    if (!userId) return;
+    if (TELEGRAM_OWNER_ID && userId !== ownerIdNum) return;
+
+    // Get the largest photo size (last in the array)
+    const photo = ctx.message.photo[ctx.message.photo.length - 1];
+    const file = await ctx.api.getFile(photo.file_id);
+    const fileUrl = `https://api.telegram.org/file/bot${TELEGRAM_BOT_TOKEN}/${file.file_path}`;
+
+    const caption = ctx.message.caption || '';
+    const text = `[Image attached: photo (${fileUrl})]\n${caption}`.trim();
+
+    const chatId = ctx.chat.id;
+    const sessionKey = `telegram:user:${userId}`;
+
+    const streamer = new TelegramStreamingMessage(bot, chatId);
+    await streamer.start();
+
+    try {
+      const response = await gateway.handleMessage(
+        sessionKey,
+        text,
+        (t) => streamer.update(t),
+      );
+      await streamer.finalize(response);
+    } catch (err) {
+      logger.error({ err }, 'Error processing Telegram photo');
+      await streamer.finalize(`Something went wrong: ${err}`);
+    }
+  });
+
+  // Document message handler — extracts file URL and forwards to gateway
+  bot.on('message:document', async (ctx) => {
+    const userId = ctx.from?.id;
+    if (!userId) return;
+    if (TELEGRAM_OWNER_ID && userId !== ownerIdNum) return;
+
+    const doc = ctx.message.document;
+    const file = await ctx.api.getFile(doc.file_id);
+    const fileUrl = `https://api.telegram.org/file/bot${TELEGRAM_BOT_TOKEN}/${file.file_path}`;
+
+    const caption = ctx.message.caption || '';
+    const isImage = doc.mime_type?.startsWith('image/');
+    const prefix = isImage
+      ? `[Image attached: ${doc.file_name} (${fileUrl})]`
+      : `[File attached: ${doc.file_name}, ${doc.mime_type || 'unknown type'}, ${fileUrl}]`;
+
+    const text = `${prefix}\n${caption}`.trim();
+
+    const chatId = ctx.chat.id;
+    const sessionKey = `telegram:user:${userId}`;
+
+    const streamer = new TelegramStreamingMessage(bot, chatId);
+    await streamer.start();
+
+    try {
+      const response = await gateway.handleMessage(
+        sessionKey,
+        text,
+        (t) => streamer.update(t),
+      );
+      await streamer.finalize(response);
+    } catch (err) {
+      logger.error({ err }, 'Error processing Telegram document');
+      await streamer.finalize(`Something went wrong: ${err}`);
+    }
+  });
+
   // Voice message handler (placeholder — note for future STT integration)
   bot.on('message:voice', async (ctx) => {
     const userId = ctx.from?.id;

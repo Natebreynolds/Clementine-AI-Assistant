@@ -150,7 +150,20 @@ export async function startSlack(
       return;
     }
 
-    const text = message.text ?? '';
+    let text = message.text ?? '';
+
+    // Extract file attachments (images and files)
+    const msgFiles = 'files' in message ? (message as any).files : undefined;
+    if (msgFiles && Array.isArray(msgFiles) && msgFiles.length > 0) {
+      const fileLines = msgFiles.map((file: any) => {
+        if (file.mimetype?.startsWith('image/')) {
+          return `[Image attached: ${file.name} (${file.url_private})]`;
+        }
+        return `[File attached: ${file.name}, ${file.mimetype || 'unknown type'}, ${file.url_private}]`;
+      });
+      text = fileLines.join('\n') + (text ? '\n' + text : '');
+    }
+
     if (!text) return;
 
     const channel = message.channel;
