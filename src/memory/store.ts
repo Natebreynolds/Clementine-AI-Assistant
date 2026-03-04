@@ -16,6 +16,8 @@ import path from 'node:path';
 import Database from 'better-sqlite3';
 import type {
   Chunk,
+  Feedback,
+  MemoryExtraction,
   SearchResult,
   SessionSummary,
   SyncStats,
@@ -156,6 +158,38 @@ export class MemoryStore {
         accessed_at TEXT DEFAULT (datetime('now'))
       );
       CREATE INDEX IF NOT EXISTS idx_access_log_chunk ON access_log(chunk_id);
+    `);
+
+    // Memory extractions table for transparency
+    this.conn.exec(`
+      CREATE TABLE IF NOT EXISTS memory_extractions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_key TEXT NOT NULL,
+        user_message TEXT NOT NULL,
+        tool_name TEXT NOT NULL,
+        tool_input TEXT NOT NULL,
+        extracted_at TEXT NOT NULL DEFAULT (datetime('now')),
+        status TEXT NOT NULL DEFAULT 'active',
+        correction TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_extractions_session ON memory_extractions(session_key);
+      CREATE INDEX IF NOT EXISTS idx_extractions_status ON memory_extractions(status);
+    `);
+
+    // Feedback table for response quality tracking
+    this.conn.exec(`
+      CREATE TABLE IF NOT EXISTS feedback (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_key TEXT,
+        channel TEXT NOT NULL,
+        message_snippet TEXT,
+        response_snippet TEXT,
+        rating TEXT NOT NULL CHECK(rating IN ('positive', 'negative', 'mixed')),
+        comment TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_feedback_rating ON feedback(rating);
+      CREATE INDEX IF NOT EXISTS idx_feedback_created ON feedback(created_at);
     `);
   }
 
@@ -873,6 +907,185 @@ export class MemoryStore {
          VALUES (?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(sourceFile, 'session-summary', summaryText, 'episodic', '', hash, 'episodic');
+  }
+
+  // ── Memory Extractions ──────────────────────────────────────────
+
+  /**
+   * Log a memory extraction event for transparency tracking.
+   */
+  logExtraction(extraction: Omit<MemoryExtraction, 'id'>): void {
+    this.conn
+      .prepare(
+        `INSERT INTO memory_extractions
+         (session_key, user_message, tool_name, tool_input, extracted_at, status)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        extraction.sessionKey,
+        extraction.userMessage,
+        extraction.toolName,
+        extraction.toolInput,
+        extraction.extractedAt,
+        extraction.status,
+      );
+  }
+
+  /**
+   * Get recent memory extractions, optionally filtered by status.
+   */
+  getRecentExtractions(limit: number = 10, status?: string): MemoryExtraction[] {
+    let rows: Array<{
+      id: number;
+      session_key: string;
+      user_message: string;
+      tool_name: string;
+      tool_input: string;
+      extracted_at: string;
+      status: string;
+      correction: string | null;
+    }>;
+
+    if (status) {
+      rows = this.conn
+        .prepare(
+          `SELECT id, session_key, user_message, tool_name, tool_input,
+                  extracted_at, status, correction
+           FROM memory_extractions
+           WHERE status = ?
+           ORDER BY extracted_at DESC LIMIT ?`,
+        )
+        .all(status, limit) as typeof rows;
+    } else {
+      rows = this.conn
+        .prepare(
+          `SELECT id, session_key, user_message, tool_name, tool_input,
+                  extracted_at, status, correction
+           FROM memory_extractions
+           ORDER BY extracted_at DESC LIMIT ?`,
+        )
+        .all(limit) as typeof rows;
+    }
+
+    return rows.map((row) => ({
+      id: row.id,
+      sessionKey: row.session_key,
+      userMessage: row.user_message,
+      toolName: row.tool_name,
+      toolInput: row.tool_input,
+      extractedAt: row.extracted_at,
+      status: row.status as MemoryExtraction['status'],
+      correction: row.correction ?? undefined,
+    }));
+  }
+
+  /**
+   * Mark an extraction as corrected with a replacement fact.
+   */
+  correctExtraction(id: number, correction: string): void {
+    this.conn
+      .prepare(
+        `UPDATE memory_extractions
+         SET status = 'corrected', correction = ?
+         WHERE id = ?`,
+      )
+      .run(correction, id);
+  }
+
+  /**
+   * Dismiss an extraction (mark as invalid).
+   */
+  dismissExtraction(id: number): void {
+    this.conn
+      .prepare(
+        `UPDATE memory_extractions
+         SET status = 'dismissed'
+         WHERE id = ?`,
+      )
+      .run(id);
+  }
+
+  // ── Feedback ───────────────────────────────────────────────────────
+
+  /**
+   * Log feedback about response quality.
+   */
+  logFeedback(feedback: {
+    sessionKey?: string;
+    channel: string;
+    messageSnippet?: string;
+    responseSnippet?: string;
+    rating: 'positive' | 'negative' | 'mixed';
+    comment?: string;
+  }): void {
+    this.conn
+      .prepare(
+        `INSERT INTO feedback
+         (session_key, channel, message_snippet, response_snippet, rating, comment)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        feedback.sessionKey ?? null,
+        feedback.channel,
+        feedback.messageSnippet ?? null,
+        feedback.responseSnippet ?? null,
+        feedback.rating,
+        feedback.comment ?? null,
+      );
+  }
+
+  /**
+   * Get recent feedback entries.
+   */
+  getRecentFeedback(limit: number = 10): Feedback[] {
+    const rows = this.conn
+      .prepare(
+        `SELECT id, session_key, channel, message_snippet, response_snippet,
+                rating, comment, created_at
+         FROM feedback
+         ORDER BY created_at DESC LIMIT ?`,
+      )
+      .all(limit) as Array<{
+      id: number;
+      session_key: string | null;
+      channel: string;
+      message_snippet: string | null;
+      response_snippet: string | null;
+      rating: string;
+      comment: string | null;
+      created_at: string;
+    }>;
+
+    return rows.map((row) => ({
+      id: row.id,
+      sessionKey: row.session_key ?? undefined,
+      channel: row.channel,
+      messageSnippet: row.message_snippet ?? undefined,
+      responseSnippet: row.response_snippet ?? undefined,
+      rating: row.rating as Feedback['rating'],
+      comment: row.comment ?? undefined,
+      createdAt: row.created_at,
+    }));
+  }
+
+  /**
+   * Get aggregate feedback statistics.
+   */
+  getFeedbackStats(): { positive: number; negative: number; mixed: number; total: number } {
+    const rows = this.conn
+      .prepare(
+        'SELECT rating, COUNT(*) as cnt FROM feedback GROUP BY rating',
+      )
+      .all() as Array<{ rating: string; cnt: number }>;
+
+    const stats = { positive: 0, negative: 0, mixed: 0, total: 0 };
+    for (const row of rows) {
+      if (row.rating === 'positive') stats.positive = row.cnt;
+      else if (row.rating === 'negative') stats.negative = row.cnt;
+      else if (row.rating === 'mixed') stats.mixed = row.cnt;
+      stats.total += row.cnt;
+    }
+    return stats;
   }
 
   // ── Helpers ───────────────────────────────────────────────────────

@@ -736,7 +736,7 @@ When a task involves:
       !responseText.startsWith('Error:') &&
       this.worthExtracting(text, responseText)
     ) {
-      this.spawnMemoryExtraction(text, responseText).catch(() => {});
+      this.spawnMemoryExtraction(text, responseText, key).catch(() => {});
     }
 
     return [responseText, sessionId];
@@ -931,7 +931,7 @@ When a task involves:
       `project updates, people mentioned, tasks discussed.]`;
 
     try {
-      await this.extractMemory(combinedUser, combinedAssistant, currentMemory);
+      await this.extractMemory(combinedUser, combinedAssistant, currentMemory, sessionKey);
     } catch { /* non-fatal */ }
   }
 
@@ -955,6 +955,7 @@ When a task involves:
   private async spawnMemoryExtraction(
     userMessage: string,
     assistantResponse: string,
+    sessionKey?: string,
   ): Promise<void> {
     // Guard: skip memory extraction if the user message looks like injection
     const memScan = scanner.scan(userMessage);
@@ -972,13 +973,18 @@ When a task involves:
       }
     } catch { /* non-fatal */ }
 
-    await this.extractMemory(userMessage, assistantResponse, currentMemory);
+    await this.extractMemory(userMessage, assistantResponse, currentMemory, sessionKey);
   }
+
+  private static readonly MEMORY_TOOL_NAMES = new Set([
+    'memory_write', 'note_create', 'task_add', 'note_take',
+  ]);
 
   private async extractMemory(
     userMessage: string,
     assistantResponse: string,
     currentMemory = '',
+    sessionKey?: string,
   ): Promise<void> {
     try {
       let truncatedResponse = assistantResponse;
@@ -993,6 +999,8 @@ When a task involves:
         .replace('{user_message}', userMessage)
         .replace('{assistant_response}', truncatedResponse)
         .replace('{current_memory}', currentMemory || '(empty — no existing memory yet)');
+
+      const userMessageSnippet = userMessage.slice(0, 500);
 
       const stream = query({
         prompt: memPrompt,
@@ -1028,6 +1036,23 @@ When a task involves:
           for (const block of blocks) {
             if (block.type === 'tool_use' && block.name) {
               logToolUse(`[auto-memory] ${block.name}`, (block.input ?? {}) as Record<string, unknown>);
+
+              // Log extraction provenance for transparency
+              const toolBaseName = block.name.replace(/^mcp__[^_]+__/, '');
+              if (PersonalAssistant.MEMORY_TOOL_NAMES.has(toolBaseName) && this.memoryStore) {
+                try {
+                  this.memoryStore.logExtraction({
+                    sessionKey: sessionKey ?? 'unknown',
+                    userMessage: userMessageSnippet,
+                    toolName: toolBaseName,
+                    toolInput: JSON.stringify(block.input ?? {}),
+                    extractedAt: new Date().toISOString(),
+                    status: 'active',
+                  });
+                } catch {
+                  // Non-fatal — extraction logging should never block memory writes
+                }
+              }
             }
           }
         }

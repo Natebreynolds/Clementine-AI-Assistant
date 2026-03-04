@@ -12,6 +12,10 @@ import {
   GatewayIntentBits,
   Partials,
   Message,
+  type MessageReaction,
+  type PartialMessageReaction,
+  type User,
+  type PartialUser,
   type Interaction,
   type ButtonInteraction,
 } from 'discord.js';
@@ -26,6 +30,7 @@ import {
   MODELS,
   ASSISTANT_NAME,
   PKG_DIR,
+  VAULT_DIR,
 } from '../config.js';
 import type { HeartbeatScheduler, CronScheduler } from '../gateway/heartbeat.js';
 import type { NotificationDispatcher } from '../gateway/notifications.js';
@@ -36,6 +41,54 @@ const logger = pino({ name: 'clementine.discord' });
 const STREAM_EDIT_INTERVAL = 1500; // ms
 const THINKING_INDICATOR = '\u2728 *thinking...*';
 const DISCORD_MSG_LIMIT = 2000;
+const BOT_MESSAGE_TRACKING_LIMIT = 100;
+
+// ── Bot message tracking for feedback reactions ─────────────────────────
+
+interface BotMessageContext {
+  sessionKey: string;
+  userMessage: string;
+  botResponse: string;
+}
+
+const botMessageMap = new Map<string, BotMessageContext>();
+
+function trackBotMessage(messageId: string, context: BotMessageContext): void {
+  botMessageMap.set(messageId, context);
+  // Evict oldest entries to prevent memory leak
+  if (botMessageMap.size > BOT_MESSAGE_TRACKING_LIMIT) {
+    const firstKey = botMessageMap.keys().next().value;
+    if (firstKey) botMessageMap.delete(firstKey);
+  }
+}
+
+// ── Lazy memory store for feedback logging ──────────────────────────────
+
+let _feedbackStore: any = null;
+
+async function getFeedbackStore(): Promise<any> {
+  if (_feedbackStore) return _feedbackStore;
+  try {
+    const { MemoryStore } = await import('../memory/store.js');
+    const { MEMORY_DB_PATH } = await import('../config.js');
+    const store = new MemoryStore(MEMORY_DB_PATH, VAULT_DIR);
+    store.initialize();
+    _feedbackStore = store;
+    return _feedbackStore;
+  } catch {
+    return null;
+  }
+}
+
+// ── Emoji to feedback rating mapping ────────────────────────────────────
+
+function emojiToRating(emoji: string): 'positive' | 'negative' | null {
+  const positiveEmoji = ['\u{1F44D}', 'thumbsup', '\u{2764}\ufe0f', 'heart', '\u{2B50}', 'star'];
+  const negativeEmoji = ['\u{1F44E}', 'thumbsdown'];
+  if (positiveEmoji.includes(emoji)) return 'positive';
+  if (negativeEmoji.includes(emoji)) return 'negative';
+  return null;
+}
 
 // ── Credential sanitisation ───────────────────────────────────────────
 
@@ -103,6 +156,9 @@ class DiscordStreamingMessage {
   private isFinal = false;
   private channel: Message['channel'];
 
+  /** The message ID of the final bot response (available after finalize). */
+  messageId: string | null = null;
+
   constructor(channel: Message['channel']) {
     this.channel = channel;
   }
@@ -128,9 +184,11 @@ class DiscordStreamingMessage {
     if (this.message) {
       if (text.length <= 1900) {
         await this.message.edit(text);
+        this.messageId = this.message.id;
       } else {
         await this.message.delete().catch(() => {});
         await sendChunked(this.channel, text);
+        // messageId not tracked for chunked responses
       }
     } else {
       await sendChunked(this.channel, text);
@@ -225,9 +283,11 @@ export async function startDiscord(
       GatewayIntentBits.Guilds,
       GatewayIntentBits.DirectMessages,
       GatewayIntentBits.MessageContent,
+      GatewayIntentBits.GuildMessageReactions,
+      GatewayIntentBits.DirectMessageReactions,
       ...(watchedChannels.size > 0 ? [GatewayIntentBits.GuildMessages] : []),
     ],
-    partials: [Partials.Channel],
+    partials: [Partials.Channel, Partials.Reaction, Partials.Message],
   });
 
   client.once(Events.ClientReady, (readyClient) => {
@@ -381,6 +441,15 @@ export async function startDiscord(
         oneOffModel,
       );
       await streamer.finalize(response);
+
+      // Track bot message for feedback reactions
+      if (streamer.messageId) {
+        trackBotMessage(streamer.messageId, {
+          sessionKey,
+          userMessage: effectiveText.slice(0, 500),
+          botResponse: response.slice(0, 500),
+        });
+      }
     } catch (err) {
       logger.error({ err }, 'Error processing Discord message');
       await streamer.finalize(`Something went wrong: ${err}`);
@@ -458,6 +527,55 @@ export async function startDiscord(
     } catch (err) {
       logger.error({ err }, 'Error processing button interaction');
       await streamer.finalize(`Something went wrong processing the ${action}: ${err}`);
+    }
+  });
+
+  // ── Reaction-based feedback handler ─────────────────────────────────
+
+  client.on(Events.MessageReactionAdd, async (
+    reaction: MessageReaction | PartialMessageReaction,
+    user: User | PartialUser,
+  ) => {
+    // Ignore bot's own reactions
+    if (user.id === client.user?.id) return;
+
+    // Owner-only
+    if (DISCORD_OWNER_ID && user.id !== DISCORD_OWNER_ID) return;
+
+    // Fetch partial reaction if needed
+    if (reaction.partial) {
+      try {
+        await reaction.fetch();
+      } catch {
+        return; // Message may have been deleted
+      }
+    }
+
+    // Check if this is a tracked bot message
+    const messageId = reaction.message.id;
+    const context = botMessageMap.get(messageId);
+    if (!context) return;
+
+    // Map emoji to rating
+    const emojiName = reaction.emoji.name ?? '';
+    const rating = emojiToRating(emojiName);
+    if (!rating) return;
+
+    // Log feedback
+    try {
+      const store = await getFeedbackStore();
+      if (store) {
+        store.logFeedback({
+          sessionKey: context.sessionKey,
+          channel: 'discord',
+          messageSnippet: context.userMessage,
+          responseSnippet: context.botResponse,
+          rating,
+        });
+        logger.info({ rating, messageId }, 'Feedback logged via Discord reaction');
+      }
+    } catch (err) {
+      logger.warn({ err }, 'Failed to log reaction feedback');
     }
   });
 

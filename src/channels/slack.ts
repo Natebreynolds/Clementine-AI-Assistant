@@ -11,6 +11,7 @@ import {
   SLACK_BOT_TOKEN,
   SLACK_APP_TOKEN,
   SLACK_OWNER_USER_ID,
+  VAULT_DIR,
 } from '../config.js';
 import type { NotificationDispatcher } from '../gateway/notifications.js';
 import type { Gateway } from '../gateway/router.js';
@@ -19,6 +20,55 @@ const logger = pino({ name: 'clementine.slack' });
 
 const STREAM_UPDATE_INTERVAL = 1500; // ms
 const SLACK_MSG_LIMIT = 3900;
+const BOT_MESSAGE_TRACKING_LIMIT = 100;
+
+// ── Bot message tracking for feedback reactions ─────────────────────────
+
+interface SlackBotMessageContext {
+  sessionKey: string;
+  userMessage: string;
+  botResponse: string;
+  channel: string;
+}
+
+/** Map of bot message ts -> context for reaction feedback. */
+const slackBotMessageMap = new Map<string, SlackBotMessageContext>();
+
+function trackSlackBotMessage(ts: string, context: SlackBotMessageContext): void {
+  slackBotMessageMap.set(ts, context);
+  if (slackBotMessageMap.size > BOT_MESSAGE_TRACKING_LIMIT) {
+    const firstKey = slackBotMessageMap.keys().next().value;
+    if (firstKey) slackBotMessageMap.delete(firstKey);
+  }
+}
+
+// ── Lazy memory store for feedback logging ──────────────────────────────
+
+let _slackFeedbackStore: any = null;
+
+async function getSlackFeedbackStore(): Promise<any> {
+  if (_slackFeedbackStore) return _slackFeedbackStore;
+  try {
+    const { MemoryStore } = await import('../memory/store.js');
+    const { MEMORY_DB_PATH } = await import('../config.js');
+    const store = new MemoryStore(MEMORY_DB_PATH, VAULT_DIR);
+    store.initialize();
+    _slackFeedbackStore = store;
+    return _slackFeedbackStore;
+  } catch {
+    return null;
+  }
+}
+
+// ── Slack reaction to rating mapping ────────────────────────────────────
+
+function slackReactionToRating(reaction: string): 'positive' | 'negative' | null {
+  const positive = ['+1', 'thumbsup', 'heart', 'star', 'tada', 'raised_hands', 'white_check_mark'];
+  const negative = ['-1', 'thumbsdown'];
+  if (positive.includes(reaction)) return 'positive';
+  if (negative.includes(reaction)) return 'negative';
+  return null;
+}
 
 // ── Markdown to Slack mrkdwn ──────────────────────────────────────────
 
@@ -58,6 +108,9 @@ class SlackStreamingMessage {
   private lastEdit = 0;
   private pendingText = '';
   private isFinal = false;
+
+  /** The message timestamp (available after start). Used for reaction tracking. */
+  get messageTs(): string | null { return this.ts; }
 
   constructor(client: App['client'], channel: string, threadTs?: string) {
     this.client = client;
@@ -180,9 +233,54 @@ export async function startSlack(
         (t) => streamer.update(t),
       );
       await streamer.finalize(response);
+
+      // Track bot message for feedback reactions
+      if (streamer.messageTs) {
+        trackSlackBotMessage(streamer.messageTs, {
+          sessionKey,
+          userMessage: text.slice(0, 500),
+          botResponse: response.slice(0, 500),
+          channel,
+        });
+      }
     } catch (err) {
       logger.error({ err }, 'Error processing Slack message');
       await streamer.finalize(`Something went wrong: ${err}`);
+    }
+  });
+
+  // ── Reaction-based feedback handler ─────────────────────────────────
+
+  app.event('reaction_added', async ({ event }) => {
+    // Owner-only
+    if (SLACK_OWNER_USER_ID && event.user !== SLACK_OWNER_USER_ID) return;
+
+    // Check if reaction is on a tracked bot message
+    const itemTs = 'ts' in event.item ? (event.item as any).ts : undefined;
+    if (!itemTs) return;
+
+    const context = slackBotMessageMap.get(itemTs);
+    if (!context) return;
+
+    // Map reaction to rating
+    const rating = slackReactionToRating(event.reaction);
+    if (!rating) return;
+
+    // Log feedback
+    try {
+      const store = await getSlackFeedbackStore();
+      if (store) {
+        store.logFeedback({
+          sessionKey: context.sessionKey,
+          channel: 'slack',
+          messageSnippet: context.userMessage,
+          responseSnippet: context.botResponse,
+          rating,
+        });
+        logger.info({ rating, ts: itemTs }, 'Feedback logged via Slack reaction');
+      }
+    } catch (err) {
+      logger.warn({ err }, 'Failed to log Slack reaction feedback');
     }
   });
 

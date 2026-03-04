@@ -137,6 +137,32 @@ export interface WikilinkConnection {
   context: string;
 }
 
+// ── Memory Transparency ─────────────────────────────────────────────
+
+export interface MemoryExtraction {
+  id?: number;
+  sessionKey: string;
+  userMessage: string;        // snippet of the user message that triggered extraction
+  toolName: string;           // e.g., 'memory_write', 'note_create'
+  toolInput: string;          // JSON stringified tool input
+  extractedAt: string;        // ISO timestamp
+  status: 'active' | 'corrected' | 'dismissed';
+  correction?: string;        // replacement fact if corrected
+}
+
+// ── Feedback ────────────────────────────────────────────────────────
+
+export interface Feedback {
+  id?: number;
+  sessionKey?: string;
+  channel: string;
+  messageSnippet?: string;
+  responseSnippet?: string;
+  rating: 'positive' | 'negative' | 'mixed';
+  comment?: string;
+  createdAt?: string;
+}
+
 // ── Utility types ────────────────────────────────────────────────────
 
 type float = number;
