@@ -51,6 +51,7 @@ import {
   getHeartbeatDisallowedTools,
   logToolUse,
   setProfileTier,
+  setInteractionSource,
 } from './hooks.js';
 import { scanner } from '../security/scanner.js';
 import { ProfileManager } from './profiles.js';
@@ -70,6 +71,18 @@ const TOOLS_SERVER = `${ASSISTANT_NAME.toLowerCase()}-tools`;
 
 function mcpTool(name: string): string {
   return `mcp__${TOOLS_SERVER}__${name}`;
+}
+
+/** Derive interaction source from session key naming convention. */
+function inferInteractionSource(
+  sessionKey?: string | null,
+): 'owner-dm' | 'owner-channel' | 'autonomous' {
+  if (!sessionKey) return 'autonomous';
+  // Guild channel sessions: discord:channel:{channelId}:{userId}
+  if (sessionKey.startsWith('discord:channel:')) return 'owner-channel';
+  // All other named sessions are owner DMs (discord:user:*, slack:*, telegram:*, etc.)
+  if (sessionKey.includes(':')) return 'owner-dm';
+  return 'autonomous';
 }
 
 const SAFE_ENV: Record<string, string> = {
@@ -740,6 +753,7 @@ When a task involves:
       ? `${securityAnnotation}\n\n${rawContext}`
       : rawContext;
     setProfileTier(profile?.tier ?? null);
+    setInteractionSource(inferInteractionSource(sessionKey));
 
     try {
       for (let attempt = 0; attempt <= PersonalAssistant.RATE_LIMIT_MAX_RETRIES; attempt++) {
@@ -819,6 +833,7 @@ When a task involves:
       return ['Sorry, I hit a temporary issue. Please try again.', ''];
     } finally {
       setProfileTier(null);
+      setInteractionSource('autonomous');
     }
   }
 
@@ -1022,6 +1037,7 @@ When a task involves:
     changesSummary = '',
     timeContext = '',
   ): Promise<string> {
+    setInteractionSource('autonomous');
     const sdkOptions = this.buildOptions({ isHeartbeat: true, enableTeams: false });
     const now = new Date();
     const timestamp = now.toISOString().slice(0, 16).replace('T', ' ');
@@ -1071,6 +1087,7 @@ When a task involves:
     tier = 1,
     maxTurns?: number,
   ): Promise<string> {
+    setInteractionSource('autonomous');
     const sdkOptions = this.buildOptions({
       isHeartbeat: true,
       cronTier: tier,

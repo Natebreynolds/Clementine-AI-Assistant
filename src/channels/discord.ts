@@ -6,7 +6,15 @@
  * heartbeat/cron commands, and autonomous notifications.
  */
 
-import { Client, Events, GatewayIntentBits, Partials, Message } from 'discord.js';
+import {
+  Client,
+  Events,
+  GatewayIntentBits,
+  Partials,
+  Message,
+  type Interaction,
+  type ButtonInteraction,
+} from 'discord.js';
 import pino from 'pino';
 import { existsSync, readFileSync } from 'node:fs';
 import os from 'node:os';
@@ -365,6 +373,80 @@ export async function startDiscord(
     } catch (err) {
       logger.error({ err }, 'Error processing Discord message');
       await streamer.finalize(`Something went wrong: ${err}`);
+    }
+  });
+
+  // ── Button interaction handler ────────────────────────────────────
+
+  client.on(Events.InteractionCreate, async (interaction: Interaction) => {
+    if (!interaction.isButton()) return;
+
+    const button = interaction as ButtonInteraction;
+
+    // Owner-only
+    if (DISCORD_OWNER_ID && button.user.id !== DISCORD_OWNER_ID) {
+      await button.reply({ content: 'Only the owner can use these buttons.', ephemeral: true });
+      return;
+    }
+
+    const customId = button.customId; // e.g. "audit_approve" or "audit_deny"
+    const isApprove = customId.endsWith('_approve');
+    const isDeny = customId.endsWith('_deny');
+
+    if (!isApprove && !isDeny) return;
+
+    const action = isApprove ? 'approved' : 'denied';
+    const emoji = isApprove ? '✅' : '❌';
+
+    // Acknowledge immediately — Discord requires response within 3 seconds
+    await button.deferUpdate();
+
+    // Update the original message: disable buttons and show decision
+    try {
+      const originalContent = button.message.content ?? '';
+      const updatedContent = originalContent + `\n\n${emoji} **${action.toUpperCase()}** by ${button.user.username}`;
+
+      // Disable buttons via raw API data — avoids discord.js component type issues
+      const rawComponents = (button.message.components as any[]).map((row: any) => ({
+        type: 1,
+        components: (row.components ?? []).map((comp: any) => ({
+          type: comp.type ?? 2,
+          style: comp.style,
+          label: comp.label,
+          custom_id: comp.customId ?? comp.custom_id,
+          disabled: true,
+        })),
+      }));
+
+      await button.editReply({
+        content: updatedContent.slice(0, 2000),
+        components: rawComponents as any,
+      });
+    } catch (err) {
+      logger.error({ err }, 'Failed to update button message');
+    }
+
+    // Route the decision to the agent as a message in the channel's session
+    const sessionKey = `discord:channel:${button.channelId}:${button.user.id}`;
+    const originalContent = button.message.content ?? '';
+
+    // Build context message for the agent
+    const agentMessage = `[Button clicked: ${action}]\n\nOriginal request:\n${originalContent}\n\nNate ${action} this request. ${isApprove ? 'Proceed with building the audit brief, deploying to Netlify, and drafting the response email.' : 'Skip this request and log that it was denied.'}`;
+
+    // Process through gateway
+    const streamer = new DiscordStreamingMessage(button.channel!);
+    await streamer.start();
+
+    try {
+      const response = await gateway.handleMessage(
+        sessionKey,
+        agentMessage,
+        (t) => streamer.update(t),
+      );
+      await streamer.finalize(response);
+    } catch (err) {
+      logger.error({ err }, 'Error processing button interaction');
+      await streamer.finalize(`Something went wrong processing the ${action}: ${err}`);
     }
   });
 
