@@ -285,8 +285,10 @@ export class PersonalAssistant {
     cronTier?: number | null;
     retrievalContext?: string;
     profile?: AgentProfile | null;
+    sessionKey?: string | null;
+    model?: string | null;
   } = {}): string {
-    const { isHeartbeat = false, cronTier = null, retrievalContext = '', profile = null } = opts;
+    const { isHeartbeat = false, cronTier = null, retrievalContext = '', profile = null, sessionKey = null, model = null } = opts;
     const isAutonomous = isHeartbeat || cronTier !== null;
     const parts: string[] = [];
     const owner = OWNER;
@@ -363,11 +365,31 @@ export class PersonalAssistant {
     }
 
     const now = new Date();
+
+    // Derive channel label from session key
+    let channel = 'unknown';
+    if (isAutonomous) {
+      channel = cronTier !== null ? 'cron' : 'heartbeat';
+    } else if (sessionKey) {
+      if (sessionKey.startsWith('discord:user:')) channel = 'Discord DM';
+      else if (sessionKey.startsWith('discord:channel:')) channel = 'Discord channel';
+      else if (sessionKey.startsWith('slack:')) channel = 'Slack';
+      else if (sessionKey.startsWith('telegram:')) channel = 'Telegram';
+      else if (sessionKey.startsWith('whatsapp:')) channel = 'WhatsApp';
+      else if (sessionKey.startsWith('webhook:')) channel = 'webhook';
+      else channel = 'direct';
+    }
+
+    const resolvedModel = resolveModel(model) ?? MODEL;
+    const modelLabel = Object.entries(MODELS).find(([, v]) => v === resolvedModel)?.[0] ?? resolvedModel;
+
     parts.push(`## Current Context
 
 - **Date:** ${formatDate(now)}
 - **Time:** ${formatTime(now)}
 - **Timezone:** ${Intl.DateTimeFormat().resolvedOptions().timeZone}
+- **Channel:** ${channel}
+- **Model:** ${modelLabel} (${resolvedModel})
 - **Vault:** ${vault}
 `);
 
@@ -435,6 +457,7 @@ Delegate data-heavy work (SEO, analytics, bulk API calls for 3+ entities) to sub
     enableTeams?: boolean;
     retrievalContext?: string;
     profile?: AgentProfile | null;
+    sessionKey?: string | null;
   } = {}): SDKOptions {
     const {
       isHeartbeat = false,
@@ -444,6 +467,7 @@ Delegate data-heavy work (SEO, analytics, bulk API calls for 3+ entities) to sub
       enableTeams = true,
       retrievalContext = '',
       profile = null,
+      sessionKey = null,
     } = opts;
 
     const allowedTools = [
@@ -495,7 +519,7 @@ Delegate data-heavy work (SEO, analytics, bulk API calls for 3+ entities) to sub
 
     return {
       customSystemPrompt: this.buildSystemPrompt({
-        isHeartbeat, cronTier, retrievalContext, profile,
+        isHeartbeat, cronTier, retrievalContext, profile, sessionKey, model,
       }),
       model: resolveModel(model) ?? MODEL,
       permissionMode: 'bypassPermissions',
@@ -735,7 +759,7 @@ Delegate data-heavy work (SEO, analytics, bulk API calls for 3+ entities) to sub
 
     try {
       for (let attempt = 0; attempt <= PersonalAssistant.RATE_LIMIT_MAX_RETRIES; attempt++) {
-        const sdkOptions = this.buildOptions({ model, retrievalContext, profile });
+        const sdkOptions = this.buildOptions({ model, retrievalContext, profile, sessionKey });
 
         // Set resume session if available
         if (sessionKey && this.sessions.has(sessionKey)) {
