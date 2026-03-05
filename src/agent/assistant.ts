@@ -73,6 +73,13 @@ function mcpTool(name: string): string {
   return `mcp__${TOOLS_SERVER}__${name}`;
 }
 
+/** Resolve model alias ("haiku", "sonnet", "opus") to full model ID. */
+function resolveModel(model: string | null | undefined): string | null {
+  if (!model) return null;
+  const key = model.toLowerCase() as keyof typeof MODELS;
+  return MODELS[key] ?? model; // Pass through if already a full ID
+}
+
 /** Derive interaction source from session key naming convention. */
 function inferInteractionSource(
   sessionKey?: string | null,
@@ -490,7 +497,7 @@ Delegate data-heavy work (SEO, analytics, bulk API calls for 3+ entities) to sub
       customSystemPrompt: this.buildSystemPrompt({
         isHeartbeat, cronTier, retrievalContext, profile,
       }),
-      model: model ?? MODEL,
+      model: resolveModel(model) ?? MODEL,
       permissionMode: 'bypassPermissions',
       allowedTools,
       disallowedTools: disallowed,
