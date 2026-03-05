@@ -1153,9 +1153,11 @@ Delegate data-heavy work (SEO, analytics, bulk API calls for 3+ entities) to sub
       `[CRON JOB: ${jobName} — ${timestamp}]\n\n` +
       `This is a scheduled cron job. Execute the following task:\n\n` +
       `${jobPrompt}\n\n` +
-      `Report your results clearly. If there's nothing notable, keep it brief.`;
+      `IMPORTANT: Your text output will be sent as a notification. Only output text if you have something meaningful to report. If there is nothing to report, output nothing — do not narrate your steps or say "nothing found".`;
 
-    let responseText = '';
+    // For cron jobs, only keep the final text block — intermediate narration
+    // (e.g. "Let me check the inbox...") should not be dispatched as notifications.
+    let lastTextBlock = '';
     const stream = query({ prompt, options: sdkOptions });
 
     for await (const message of stream) {
@@ -1163,7 +1165,7 @@ Delegate data-heavy work (SEO, analytics, bulk API calls for 3+ entities) to sub
         const blocks = getContentBlocks(message as SDKAssistantMessage);
         for (const block of blocks) {
           if (block.type === 'text' && block.text) {
-            responseText += block.text;
+            lastTextBlock = block.text;
           } else if (block.type === 'tool_use' && block.name) {
             logToolUse(block.name, (block.input ?? {}) as Record<string, unknown>);
           }
@@ -1171,7 +1173,7 @@ Delegate data-heavy work (SEO, analytics, bulk API calls for 3+ entities) to sub
       }
     }
 
-    return responseText;
+    return lastTextBlock.trim();
   }
 
   // ── Session Management ────────────────────────────────────────────
