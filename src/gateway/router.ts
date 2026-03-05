@@ -175,10 +175,11 @@ export class Gateway {
     jobPrompt: string,
     tier = 1,
     maxTurns?: number,
+    model?: string,
   ): Promise<string> {
     logger.info(`Running cron job: ${jobName}`);
     try {
-      const response = await this.assistant.runCronJob(jobName, jobPrompt, tier, maxTurns);
+      const response = await this.assistant.runCronJob(jobName, jobPrompt, tier, maxTurns, model);
 
       // Re-baseline integrity checksums after cron job (may write to vault)
       scanner.refreshIntegrity();

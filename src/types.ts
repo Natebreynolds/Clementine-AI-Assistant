@@ -92,6 +92,7 @@ export interface CronJobDefinition {
   enabled: boolean;
   tier: number;
   maxTurns?: number;
+  model?: string;
 }
 
 export interface CronRunEntry {

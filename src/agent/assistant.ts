@@ -63,7 +63,7 @@ const logger = pino({ name: 'clementine.assistant' });
 const SESSIONS_FILE = path.join(BASE_DIR, '.sessions.json');
 const MAX_SESSION_EXCHANGES = 40;
 const SESSION_EXPIRY_MS = 24 * 60 * 60 * 1000;
-const AUTO_MEMORY_MIN_LENGTH = 80;
+const AUTO_MEMORY_MIN_LENGTH = 120;
 const AUTO_MEMORY_MODEL = MODELS.haiku;
 const OWNER = OWNER_NAME || 'the user';
 const MCP_SERVER_SCRIPT = path.join(PKG_DIR, 'dist', 'tools', 'mcp-server.js');
@@ -201,6 +201,7 @@ export class PersonalAssistant {
   private restoredSessions = new Set<string>();
   private profileManager: ProfileManager;
   private memoryStore: any = null; // Typed as any — MemoryStore may not be available yet
+  private _lastUserMessage?: string;
 
   constructor() {
     this.profileManager = new ProfileManager(PROFILES_DIR);
@@ -279,20 +280,23 @@ export class PersonalAssistant {
     profile?: AgentProfile | null;
   } = {}): string {
     const { isHeartbeat = false, cronTier = null, retrievalContext = '', profile = null } = opts;
+    const isAutonomous = isHeartbeat || cronTier !== null;
     const parts: string[] = [];
     const owner = OWNER;
     const vault = VAULT_DIR;
 
     if (fs.existsSync(SOUL_FILE)) {
       const { content } = matter(fs.readFileSync(SOUL_FILE, 'utf-8'));
-      parts.push(content);
+      // Autonomous runs only need identity, not full personality guidance
+      parts.push(isAutonomous ? content.slice(0, 500) : content);
     }
 
     if (profile?.systemPromptBody) {
       parts.push(profile.systemPromptBody);
     }
 
-    if (fs.existsSync(AGENTS_FILE)) {
+    // Skip AGENTS.md for autonomous runs — not relevant for heartbeats/cron
+    if (!isAutonomous && fs.existsSync(AGENTS_FILE)) {
       const { content } = matter(fs.readFileSync(AGENTS_FILE, 'utf-8'));
       parts.push(content);
     }
@@ -301,7 +305,13 @@ export class PersonalAssistant {
       parts.push(`## Relevant Context (retrieved)\n\n${retrievalContext}`);
     } else if (fs.existsSync(MEMORY_FILE)) {
       const { content } = matter(fs.readFileSync(MEMORY_FILE, 'utf-8'));
-      parts.push(`## Current Memory\n\n${content}`);
+      // Autonomous runs get truncated memory — just enough for context
+      if (isAutonomous) {
+        const truncated = content.slice(0, 2000);
+        parts.push(`## Current Memory\n\n${truncated}${content.length > 2000 ? '\n...(truncated)' : ''}`);
+      } else {
+        parts.push(`## Current Memory\n\n${content}`);
+      }
     }
 
     const todayPath = path.join(DAILY_NOTES_DIR, `${todayISO()}.md`);
@@ -310,31 +320,38 @@ export class PersonalAssistant {
       parts.push(`## Today's Notes (${todayISO()})\n\n${content}`);
     }
 
-    if (!retrievalContext) {
-      const yPath = path.join(DAILY_NOTES_DIR, `${yesterdayISO()}.md`);
-      if (fs.existsSync(yPath)) {
-        const { content } = matter(fs.readFileSync(yPath, 'utf-8'));
-        if (content.includes('## Summary')) {
-          const summary = content.slice(content.indexOf('## Summary'));
-          parts.push(`## Yesterday's Summary (${yesterdayISO()})\n\n${summary}`);
+    // Skip yesterday's notes and recent conversation summaries for autonomous runs
+    if (!isAutonomous) {
+      if (!retrievalContext) {
+        const hour = new Date().getHours();
+        const mentionsYesterday = this._lastUserMessage?.toLowerCase().includes('yesterday');
+        if (hour < 12 || mentionsYesterday) {
+          const yPath = path.join(DAILY_NOTES_DIR, `${yesterdayISO()}.md`);
+          if (fs.existsSync(yPath)) {
+            const { content } = matter(fs.readFileSync(yPath, 'utf-8'));
+            if (content.includes('## Summary')) {
+              const summary = content.slice(content.indexOf('## Summary'));
+              parts.push(`## Yesterday's Summary (${yesterdayISO()})\n\n${summary}`);
+            }
+          }
         }
       }
-    }
 
-    if (this.memoryStore) {
-      try {
-        const recent = this.memoryStore.getRecentSummaries(3);
-        if (recent?.length > 0) {
-          const lines = recent.map(
-            (s: { createdAt?: string; summary: string }) => {
-              const ts = (s.createdAt ?? 'unknown').slice(0, 16);
-              return `### ${ts}\n${s.summary}`;
-            },
-          );
-          parts.push('## Recent Conversations\n\n' + lines.join('\n\n'));
+      if (this.memoryStore) {
+        try {
+          const recent = this.memoryStore.getRecentSummaries(2);
+          if (recent?.length > 0) {
+            const lines = recent.map(
+              (s: { createdAt?: string; summary: string }) => {
+                const ts = (s.createdAt ?? 'unknown').slice(0, 16);
+                return `### ${ts}\n${s.summary}`;
+              },
+            );
+            parts.push('## Recent Conversations\n\n' + lines.join('\n\n'));
+          }
+        } catch {
+          // Non-fatal
         }
-      } catch {
-        // Non-fatal
       }
     }
 
@@ -345,103 +362,49 @@ export class PersonalAssistant {
 - **Time:** ${formatTime(now)}
 - **Timezone:** ${Intl.DateTimeFormat().resolvedOptions().timeZone}
 - **Vault:** ${vault}
-
-## Vault Structure & Tool Instructions
-
-Your memory lives in an Obsidian vault at \`${vault}\`. You have multiple ways to interact with it:
-
-### MCP Memory/Task Tools (preferred for common operations):
-- **memory_read** — Read notes by name or shortcut ("today", "yesterday", "memory", "tasks")
-- **memory_write** — Append to daily log, update MEMORY.md sections, or write notes
-- **memory_search** — Search across all vault Markdown files
-- **memory_connections** — Query the wikilink graph to find connected notes
-- **memory_timeline** — Chronological view of a subject's mentions across daily notes
-- **note_create** — Create new notes (person, project, topic, task, inbox)
-- **vault_stats** — Quick dashboard of vault health and activity
-- **task_list** — List tasks with filtering by status, project, priority, and due date range
-- **task_add** — Add tasks with auto-generated {T-NNN} IDs, subtasks, projects, recurrence
-- **task_update** — Update tasks by ID ({T-NNN}) or text match; supports status, priority, due date changes
-- **note_take** — Quick timestamped capture to daily log
-
-**Task ID format:** Tasks have IDs like \`{T-001}\`. Subtasks are \`{T-001.1}\`. Always prefer task IDs over text matching.
-**Recurring tasks:** When a recurring task is completed, a new copy auto-creates with the next due date.
-
-### Built-in File Tools (for anything else):
-- **Read, Write, Edit** — Direct file access for complex edits
-- **Glob, Grep** — Find files and search content
-
-All notes use YAML frontmatter, [[wikilinks]], and #tags.
-
-**Folders:**
-- \`${vault}/00-System/\` — SOUL.md, AGENTS.md, MEMORY.md, HEARTBEAT.md, CRON.md
-- \`${vault}/01-Daily-Notes/\` — Daily logs as YYYY-MM-DD.md
-- \`${vault}/02-People/\` — Person notes
-- \`${vault}/03-Projects/\` — Project notes
-- \`${vault}/04-Topics/\` — Knowledge topics
-- \`${vault}/05-Tasks/TASKS.md\` — Master task list
-- \`${vault}/06-Templates/\` — _Daily-Template.md, _People-Template.md
-- \`${vault}/07-Inbox/\` — Quick captures
-
-**Key files:**
-- Long-term memory: \`${vault}/00-System/MEMORY.md\`
-- Today's daily note: \`${vault}/01-Daily-Notes/${todayISO()}.md\`
-- Task list: \`${vault}/05-Tasks/TASKS.md\`
-
-**How to remember things:**
-- Durable facts → use memory_write(action="update_memory") or Edit MEMORY.md
-- Daily context → use memory_write(action="append_daily") or note_take
-- New person → use note_create(note_type="person")
-- New task → use task_add
-
-When ${owner} tells you something worth remembering, write it to memory immediately.
-When ${owner} asks you to do something non-immediate, add it to TASKS.md.
-Log significant interactions to today's daily note.
-
-NOTE: A background memory agent also runs after each exchange to catch anything you
-might miss. You don't need to worry about being perfect — but do save obviously
-important facts in real-time rather than relying on the background pass.
-
-## Context Window Management — IMPORTANT
-
-You have a finite context window. Some tools return very large responses (SEO data,
-API results, backlink profiles, keyword rankings, etc.). Calling many of these in a
-single conversation WILL overflow your context and crash the session.
-
-**Rule: Delegate data-heavy work to sub-agents using the Agent tool.**
-
-When a task involves:
-- Pulling data for **multiple domains, URLs, or entities**
-- Calling data-rich APIs (SEO tools, analytics, bulk lookups) more than 2-3 times
-- Any operation where you expect large JSON/data responses
-
-**Do this instead of calling the tools directly:**
-1. Use the **Agent** tool to spawn a sub-agent with a focused task
-   (e.g., "Pull ranked keywords, backlinks, and SERP data for example.com. Summarize the top 20 keywords by traffic, top 10 referring domains, and any ranking opportunities.")
-2. The sub-agent runs the tool calls in its own context window
-3. It returns a concise summary back to you
-4. Your context stays clean for the full conversation
-
-**For multi-entity work**, spawn one agent per entity or batch:
-- "Analyze SEO for domain1.com — keywords, backlinks, top pages. Summarize findings."
-- "Analyze SEO for domain2.com — same analysis. Summarize findings."
-- Then synthesize the summaries yourself.
-
-**Never** pull bulk data for 3+ domains in your main context. Always delegate.
 `);
+
+    if (isAutonomous) {
+      // Minimal vault reference for heartbeats/cron — they know their tools
+      parts.push(`Vault: \`${vault}\`. Key files: MEMORY.md, ${todayISO()}.md (today), TASKS.md. Use MCP tools (memory_read/write, task_list/add/update, note_take).`);
+    } else {
+      parts.push(`## Vault (\`${vault}\`)
+
+Obsidian vault with YAML frontmatter, [[wikilinks]], #tags.
+
+**MCP tools (preferred):** memory_read, memory_write, memory_search, memory_connections, memory_timeline, note_create, vault_stats, task_list, task_add, task_update, note_take.
+**File tools:** Read, Write, Edit, Glob, Grep for direct access.
+
+**Folders:** 00-System (SOUL/MEMORY/AGENTS.md), 01-Daily-Notes (YYYY-MM-DD.md), 02-People, 03-Projects, 04-Topics, 05-Tasks/TASKS.md, 06-Templates, 07-Inbox.
+**Key files:** MEMORY.md (long-term), ${todayISO()}.md (today), TASKS.md (tasks).
+
+**Task IDs:** \`{T-001}\`, subtasks \`{T-001.1}\`. Recurring tasks auto-create next copy on completion.
+
+**Remembering:** Durable facts → memory_write(action="update_memory"). Daily context → note_take / memory_write(action="append_daily"). New person → note_create. New task → task_add.
+Save important facts immediately; a background agent also extracts after each exchange.
+
+## Context Window Management
+
+Delegate data-heavy work (SEO, analytics, bulk API calls for 3+ entities) to sub-agents via the Agent tool. They run in their own context and return summaries. Never pull bulk data directly.
+`);
+    }
 
     if (profile) {
       parts.push(`You are currently operating as **${profile.name}** (${profile.description}).`);
     }
 
-    const feedbackFile = path.join(VAULT_DIR, '00-System', 'FEEDBACK.md');
-    if (fs.existsSync(feedbackFile)) {
-      try {
-        const { data: fbMeta } = matter(fs.readFileSync(feedbackFile, 'utf-8'));
-        if (fbMeta.patterns_summary) {
-          parts.push(`## Communication Preferences\n\n${fbMeta.patterns_summary}`);
+    // Skip communication preferences for autonomous runs
+    if (!isAutonomous) {
+      const feedbackFile = path.join(VAULT_DIR, '00-System', 'FEEDBACK.md');
+      if (fs.existsSync(feedbackFile)) {
+        try {
+          const { data: fbMeta } = matter(fs.readFileSync(feedbackFile, 'utf-8'));
+          if (fbMeta.patterns_summary) {
+            parts.push(`## Communication Preferences\n\n${fbMeta.patterns_summary}`);
+          }
+        } catch {
+          // Non-fatal
         }
-      } catch {
-        // Non-fatal
       }
     }
 
@@ -521,7 +484,7 @@ When a task involves:
     }
 
     const disallowed = isHeartbeat ? getHeartbeatDisallowedTools() : [];
-    const effectiveMaxTurns = maxTurns ?? (isHeartbeat ? HEARTBEAT_MAX_TURNS : undefined);
+    const effectiveMaxTurns = maxTurns ?? (isHeartbeat ? HEARTBEAT_MAX_TURNS : 15);
 
     return {
       customSystemPrompt: this.buildSystemPrompt({
@@ -615,6 +578,7 @@ When a task involves:
     const profile = options?.profile;
     const securityAnnotation = options?.securityAnnotation;
     const key = sessionKey ?? undefined;
+    this._lastUserMessage = text;
     let sessionRotated = false;
 
     // Expire old sessions (4 hours)
@@ -937,18 +901,36 @@ When a task involves:
 
   // ── Auto-Memory Extraction ────────────────────────────────────────
 
+  private lastExtractionTime = 0;
+
   private worthExtracting(prompt: string, response: string): boolean {
     if (response.length < 100) return false;
+
+    // Skip short acknowledgment responses
+    if (response.length < 200) return false;
+
+    // Skip trivial single-sentence user messages with no substance
+    if (prompt.length < 100 && !prompt.includes(' ') === false && (prompt.match(/[.!?]/g) ?? []).length <= 1) {
+      // Single short sentence — check for entities (names, URLs, numbers, etc.)
+      if (!/[A-Z][a-z]{2,}|https?:|@|\d{3,}/.test(prompt)) return false;
+    }
 
     const greetingPatterns = [
       'hello', 'hi ', 'hey ', 'good morning', 'good afternoon',
       'good evening', 'good night', 'thanks', 'thank you',
       'ok', 'okay', 'sure', 'got it', 'sounds good',
+      'nice', 'cool', 'great', 'awesome', 'perfect', 'yep', 'yup', 'nope',
     ];
     const lower = prompt.toLowerCase().trim();
     if (greetingPatterns.some((g) => lower.startsWith(g) || lower === g.trim())) {
-      if (prompt.length < 50) return false;
+      if (prompt.length < 80) return false;
     }
+
+    // Rate limit: max 1 extraction per 2 minutes per session
+    const now = Date.now();
+    if (now - this.lastExtractionTime < 120_000) return false;
+    this.lastExtractionTime = now;
+
     return true;
   }
 
@@ -968,8 +950,8 @@ When a task involves:
     try {
       if (fs.existsSync(MEMORY_FILE)) {
         const content = fs.readFileSync(MEMORY_FILE, 'utf-8');
-        currentMemory = content.slice(0, 4000);
-        if (content.length > 4000) currentMemory += '\n...(truncated)';
+        currentMemory = content.slice(0, 2000);
+        if (content.length > 2000) currentMemory += '\n...(truncated)';
       }
     } catch { /* non-fatal */ }
 
@@ -1070,7 +1052,11 @@ When a task involves:
     timeContext = '',
   ): Promise<string> {
     setInteractionSource('autonomous');
-    const sdkOptions = this.buildOptions({ isHeartbeat: true, enableTeams: false });
+    const sdkOptions = this.buildOptions({
+      isHeartbeat: true,
+      enableTeams: false,
+      model: MODELS.haiku,
+    });
     const now = new Date();
     const timestamp = now.toISOString().slice(0, 16).replace('T', ' ');
     const owner = OWNER;
@@ -1118,12 +1104,14 @@ When a task involves:
     jobPrompt: string,
     tier = 1,
     maxTurns?: number,
+    model?: string,
   ): Promise<string> {
     setInteractionSource('autonomous');
     const sdkOptions = this.buildOptions({
       isHeartbeat: true,
       cronTier: tier,
       maxTurns: maxTurns ?? HEARTBEAT_MAX_TURNS,
+      model: model ?? null,
       enableTeams: false,
     });
 

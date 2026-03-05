@@ -100,7 +100,7 @@ export async function cmdCronRun(jobName: string): Promise<void> {
   const startedAt = new Date();
 
   try {
-    const response = await gateway.handleCronJob(job.name, job.prompt, job.tier, job.maxTurns);
+    const response = await gateway.handleCronJob(job.name, job.prompt, job.tier, job.maxTurns, job.model);
     const finishedAt = new Date();
 
     runLog.append({
@@ -168,7 +168,7 @@ export async function cmdCronRunDue(): Promise<void> {
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       const startedAt = new Date();
       try {
-        const response = await gateway.handleCronJob(job.name, job.prompt, job.tier, job.maxTurns);
+        const response = await gateway.handleCronJob(job.name, job.prompt, job.tier, job.maxTurns, job.model);
         const finishedAt = new Date();
 
         runLog.append({
@@ -329,7 +329,7 @@ export async function cmdCronTest(jobNameOrIndex: string): Promise<void> {
   const { gateway } = await initGateway();
 
   try {
-    const response = await gateway.handleCronJob(job.name, job.prompt, job.tier, job.maxTurns);
+    const response = await gateway.handleCronJob(job.name, job.prompt, job.tier, job.maxTurns, job.model);
     console.log('--- Output ---');
     console.log(response || '(no output)');
   } catch (err) {

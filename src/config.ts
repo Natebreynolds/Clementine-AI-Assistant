@@ -105,9 +105,9 @@ function getSecret(envKey: string, keychainService?: string): string {
 // ── Models ───────────────────────────────────────────────────────────
 
 export const MODELS: Models = {
-  haiku: 'haiku',
-  sonnet: 'sonnet',
-  opus: 'opus',
+  haiku: 'claude-haiku-4-5-20251001',
+  sonnet: 'claude-sonnet-4-6',
+  opus: 'claude-opus-4-6',
 };
 
 export const DEFAULT_MODEL_TIER = (getEnv('DEFAULT_MODEL_TIER', 'sonnet')) as keyof Models;
@@ -195,7 +195,7 @@ export const CHANNEL_OUTLOOK = Boolean(MS_TENANT_ID && MS_CLIENT_ID && MS_CLIENT
 
 export const MEMORY_DB_PATH = path.join(VAULT_DIR, '.memory.db');
 export const SEARCH_CONTEXT_LIMIT = 3;
-export const SEARCH_RECENCY_LIMIT = 5;
+export const SEARCH_RECENCY_LIMIT = 3;
 export const SYSTEM_PROMPT_MAX_CONTEXT_CHARS = 12000;
 
 // ── Session Persistence ──────────────────────────────────────────────
