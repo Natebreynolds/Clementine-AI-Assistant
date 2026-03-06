@@ -115,66 +115,20 @@ function killPid(pid: number): void {
   }
 }
 
-/**
- * Find all running Clementine node processes by scanning `ps`.
- * Returns PIDs that are NOT the current process.
- */
-function findRunningInstances(): number[] {
-  try {
-    const output = execSync('ps -eo pid,command', { encoding: 'utf-8' });
-    const pids: number[] = [];
-    const myPid = process.pid;
-    for (const line of output.split('\n')) {
-      if (line.includes(DIST_ENTRY) && !line.includes('grep')) {
-        const pid = parseInt(line.trim(), 10);
-        if (!isNaN(pid) && pid !== myPid) {
-          pids.push(pid);
-        }
+/** Stop the daemon safely: unload LaunchAgent first (prevents respawn), then kill the process. */
+function stopDaemon(pid: number): void {
+  // Unload LaunchAgent BEFORE killing — otherwise launchd respawns it immediately
+  if (process.platform === 'darwin') {
+    const plist = getLaunchdPlistPath();
+    if (existsSync(plist)) {
+      try {
+        execSync(`launchctl unload "${plist}"`, { stdio: 'pipe' });
+      } catch {
+        // not loaded — that's fine
       }
     }
-    return pids;
-  } catch {
-    return [];
   }
-}
-
-/** Stop launchd-managed instance if running (prevents KeepAlive respawn conflicts). */
-function stopLaunchdIfRunning(): void {
-  const plistPath = getLaunchdPlistPath();
-  if (!existsSync(plistPath)) return;
-
-  try {
-    execSync(`launchctl list ${getLaunchdLabel()}`, { stdio: 'pipe' });
-  } catch {
-    return; // not loaded
-  }
-
-  console.log('  Stopping LaunchAgent-managed instance...');
-  try {
-    execSync(`launchctl unload "${plistPath}"`, { stdio: 'ignore' });
-  } catch { /* ignore */ }
-
-  // Give launchd a moment to actually stop the process
-  const waitUntil = Date.now() + 2000;
-  while (Date.now() < waitUntil) { /* busy-wait */ }
-}
-
-/** Stop all running Clementine instances (PID file + process scan). */
-function stopAllInstances(): void {
-  // 1. PID file
-  const existingPid = readPid();
-  if (existingPid && isProcessAlive(existingPid)) {
-    console.log(`  Stopping existing instance (PID ${existingPid})...`);
-    killPid(existingPid);
-  }
-
-  // 2. Process scan — catch orphans the PID file missed
-  const orphans = findRunningInstances();
-  for (const pid of orphans) {
-    if (!isProcessAlive(pid)) continue;
-    console.log(`  Stopping orphan instance (PID ${pid})...`);
-    killPid(pid);
-  }
+  killPid(pid);
 }
 
 /** Bootstrap ~/.clementine/ on first run — create data dir and copy vault templates. */
@@ -292,21 +246,12 @@ function cmdLaunch(options: { foreground?: boolean; install?: boolean; uninstall
     return;
   }
 
-  // Auto-install LaunchAgent if setup wizard requested it
-  const launchAgentFlag = path.join(BASE_DIR, '.install-launchagent');
-  if (existsSync(launchAgentFlag)) {
-    try { unlinkSync(launchAgentFlag); } catch { /* ignore */ }
-    console.log('  Installing login service (auto-start on boot)...');
-    cmdLaunch({ install: true });
-    return;
+  // Stop any existing instance first (unload LaunchAgent to prevent respawn)
+  const existingPid = readPid();
+  if (existingPid && isProcessAlive(existingPid)) {
+    console.log(`  Stopping existing instance (PID ${existingPid})...`);
+    stopDaemon(existingPid);
   }
-
-  // If LaunchAgent is installed, warn and unload it for manual launch
-  // (prevents duplicate instances — LaunchAgent has KeepAlive)
-  stopLaunchdIfRunning();
-
-  // Stop ALL running instances (PID file + process scan)
-  stopAllInstances();
 
   if (options.foreground) {
     // Foreground mode: import and run the entry point directly
@@ -345,33 +290,27 @@ function cmdLaunch(options: { foreground?: boolean; install?: boolean; uninstall
 }
 
 function cmdStop(): void {
-  // Stop LaunchAgent if active
-  stopLaunchdIfRunning();
-
-  // Stop all instances (PID file + orphan scan)
   const pid = readPid();
-  const orphans = findRunningInstances();
-  const allPids = new Set<number>();
-
-  if (pid && isProcessAlive(pid)) allPids.add(pid);
-  for (const p of orphans) {
-    if (isProcessAlive(p)) allPids.add(p);
+  if (!pid) {
+    console.log('  No running instance found.');
+    return;
   }
 
-  if (allPids.size === 0) {
-    console.log('  No running instance found.');
-    // Clean up stale PID file
+  if (!isProcessAlive(pid)) {
+    console.log(`  PID ${pid} is not running. Cleaning up PID file.`);
     try { unlinkSync(getPidFilePath()); } catch { /* ignore */ }
     return;
   }
 
-  for (const p of allPids) {
-    console.log(`  Stopping ${getAssistantName()} (PID ${p})...`);
-    killPid(p);
-  }
+  console.log(`  Stopping ${getAssistantName()} (PID ${pid})...`);
+  stopDaemon(pid);
 
-  console.log('  Stopped.');
-  try { unlinkSync(getPidFilePath()); } catch { /* ignore */ }
+  if (isProcessAlive(pid)) {
+    console.log('  Process did not exit cleanly.');
+  } else {
+    console.log('  Stopped.');
+    try { unlinkSync(getPidFilePath()); } catch { /* ignore */ }
+  }
 }
 
 function cmdRestart(options: { foreground?: boolean }): void {
@@ -889,7 +828,7 @@ async function cmdUpdate(options: { restart?: boolean; dryRun?: boolean }): Prom
   if (wasRunning) {
     console.log(`  Stopping daemon (PID ${pid})...`);
     if (!options.dryRun) {
-      killPid(pid!);
+      stopDaemon(pid!);
       try { unlinkSync(getPidFilePath()); } catch { /* ignore */ }
     }
     console.log(`  ${GREEN}OK${RESET}  Daemon stopped`);
