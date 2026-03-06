@@ -94,20 +94,37 @@ export class Gateway {
       logger.info(`Message from ${sessionKey}: ${text.slice(0, 100)}...`);
 
       // ── Pre-flight injection scan ───────────────────────────────
+      // Re-baseline integrity before scanning — auto-memory, crons, and heartbeats
+      // legitimately modify vault files between messages.
+      scanner.refreshIntegrity();
       const scan = scanner.scan(text);
 
-      if (scan.verdict === 'block') {
+      // Owner DMs are trusted — only block on high-confidence injection patterns,
+      // not integrity changes (which are usually caused by Clementine's own writes).
+      const isOwnerDm = sessionKey.startsWith('discord:user:') ||
+        sessionKey.startsWith('slack:dm:') ||
+        sessionKey.startsWith('telegram:');
+      const shouldBlock = scan.verdict === 'block' && !isOwnerDm;
+
+      if (shouldBlock) {
         logger.warn(
           { sessionKey, verdict: scan.verdict, reasons: scan.reasons, score: scan.score },
           'Message blocked by injection scanner',
         );
-        // Re-baseline so legitimate vault changes don't cascade-block all future messages
-        scanner.refreshIntegrity();
         return "I can't process that message. It was flagged by my security system.";
       }
 
       let securityAnnotation = '';
-      if (scan.verdict === 'warn') {
+      // Owner DM blocks are downgraded to warnings — still flag but don't reject
+      if (scan.verdict === 'block' && isOwnerDm) {
+        logger.info(
+          { sessionKey, verdict: 'warn (downgraded)', reasons: scan.reasons, score: scan.score },
+          'Owner DM block downgraded to warning',
+        );
+        securityAnnotation =
+          `[Security advisory: This message scored ${scan.score.toFixed(2)} on injection detection (${scan.reasons.join('; ')}). ` +
+          `Owner DM — proceeding with caution.]`;
+      } else if (scan.verdict === 'warn') {
         logger.info(
           { sessionKey, verdict: scan.verdict, reasons: scan.reasons, score: scan.score },
           'Message flagged by injection scanner',
