@@ -54,7 +54,7 @@ Clementine is three layers stacked on a shared memory store:
 
 ### The memory loop
 
-Every conversation triggers a background extraction pass (Haiku) that saves facts, preferences, people, and tasks to the Obsidian vault. The vault is indexed into SQLite FTS5 with automatic triggers. Retrieved memories get salience boosts. Stale memories decay over time. Old data is pruned on startup.
+Every conversation triggers a background extraction pass (Sonnet) that saves facts, preferences, people, and tasks to the Obsidian vault. The vault is indexed into SQLite FTS5 with automatic triggers. Retrieved memories get salience boosts. Stale memories decay over time. Old data is pruned on startup.
 
 The result: Clementine gets better the more you talk to it.
 
@@ -130,7 +130,9 @@ src/                               ← Package code (wherever npm installed it)
 │   └── mcp-server.ts             ← 27-tool MCP stdio server
 ├── cli/
 │   ├── index.ts                   ← CLI commands (launch, stop, status, config, doctor)
-│   └── setup.ts                   ← Interactive configuration wizard
+│   ├── setup.ts                   ← Interactive configuration wizard
+│   ├── dashboard.ts               ← Local web dashboard (command center)
+│   └── cron.ts                    ← Cron job runner and scheduler
 ├── config.ts                      ← Paths, secrets, models (never pollutes process.env)
 ├── types.ts                       ← Shared TypeScript interfaces
 └── index.ts                       ← Main entry point (multi-channel startup)
@@ -173,7 +175,7 @@ User message
     ▼
 ┌──────────────┐     ┌────────────────────┐
 │ Assistant     │────▶│ Auto-memory pass   │──▶ Vault writes
-│ responds     │     │ (background Haiku)  │    (MEMORY.md, people, tasks)
+│ responds     │     │ (background Sonnet) │    (MEMORY.md, people, tasks)
 └──────────────┘     └────────────────────┘
     │
     ▼
@@ -242,6 +244,7 @@ clementine status              Show PID, uptime, active channels
 clementine update              Pull latest, rebuild, reinstall (preserves config)
 clementine update --dry-run    Preview update without making changes
 clementine doctor              Verify configuration and vault health
+clementine dashboard           Open the local web command center (localhost:3030)
 clementine config setup        Interactive configuration wizard
 clementine config set KEY VAL  Set a single config value
 clementine config get KEY      Read a config value
@@ -262,6 +265,18 @@ clementine --help              Show all commands
 - **PID lock** — `~/.clementine/.clementine.pid` prevents duplicate instances
 - **LaunchAgent** — `--install` creates a macOS plist with `KeepAlive` + `ThrottleInterval`
 - **Graceful shutdown** — Handles SIGTERM/SIGINT, cleans up PID file, checkpoints SQLite WAL
+
+### Dashboard
+
+Run `clementine dashboard` to open a local web command center at `http://localhost:3030`. The dashboard provides:
+
+- **Metrics** — Time saved estimates, session counts, cron job stats, memory size
+- **Chat** — Talk to your assistant directly from the browser
+- **Memory search** — Full-text search across all vault notes (FTS5)
+- **Scheduled tasks** — Create, edit, toggle, and delete cron jobs with a visual editor
+- **Live status** — Daemon health, LaunchAgent status, active channels
+
+No extra dependencies — the dashboard uses Express, which is already installed.
 
 ---
 
@@ -309,8 +324,8 @@ Secrets can also be stored in macOS Keychain (`security find-generic-password`) 
 
 | Tier | Model Alias | Use case |
 |------|-------------|----------|
-| `haiku` | `haiku` (latest Haiku) | Auto-memory extraction (background, fast, cheap) |
-| `sonnet` | `sonnet` (latest Sonnet) | Default conversation model (1M context) |
+| `haiku` | `haiku` (latest Haiku) | Lightweight tasks, cron noise filtering |
+| `sonnet` | `sonnet` (latest Sonnet) | Default conversation + auto-memory extraction |
 | `opus` | `opus` (latest Opus) | Available via config or agent profiles |
 
 Model aliases always resolve to the latest version via the Claude Code SDK. To pin a specific version, set `DEFAULT_MODEL_TIER` to a full model name (e.g. `claude-sonnet-4-6`).
@@ -410,6 +425,48 @@ npm run build
 
 # Run MCP server standalone (for testing tools)
 npm run mcp
+```
+
+---
+
+## Troubleshooting
+
+### `clementine update` fails with "local changes"
+
+Clementine auto-stashes local customizations during updates. If you're on an older version that doesn't have this yet, run manually:
+
+```bash
+cd ~/clementine   # or wherever you cloned it
+git stash
+clementine update
+git stash pop      # restore your customizations
+```
+
+Future updates will handle this automatically.
+
+### `better-sqlite3` won't load (NODE_MODULE_VERSION mismatch)
+
+This happens when you upgrade Node.js after installing. The native SQLite module needs to be recompiled:
+
+```bash
+cd ~/clementine
+npm rebuild better-sqlite3
+```
+
+Run `clementine doctor` to verify the fix. This check is now built-in — doctor will catch it early.
+
+### Memory search returns empty results
+
+1. Run `clementine doctor` — check the `better-sqlite3` line
+2. Verify the database exists: `ls ~/.clementine/.memory.db`
+3. If the DB is missing, restart the daemon — it creates the DB and indexes the vault on startup
+
+### Daemon won't start / duplicate instances
+
+```bash
+clementine stop           # stop any running instance
+rm ~/.clementine/.clementine.pid   # clear stale PID if needed
+clementine launch
 ```
 
 ---
