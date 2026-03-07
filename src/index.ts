@@ -122,6 +122,15 @@ function cleanupPid(): void {
 function verifySetup(): string[] {
   const errors: string[] = [];
 
+  // Check Node version range (20–24 LTS)
+  const major = parseInt(process.version.slice(1), 10);
+  if (major < 20 || major > 24) {
+    errors.push(
+      `Node.js v${major} detected. The Claude Code SDK requires Node 20–24 LTS.\n` +
+      '  Install Node 22: `nvm install 22`',
+    );
+  }
+
   // Check claude CLI
   try {
     execSync('which claude', { stdio: 'pipe' });
@@ -130,6 +139,29 @@ function verifySetup(): string[] {
       'claude CLI not found. Install it: npm install -g @anthropic-ai/claude-code\n' +
       '  See: https://docs.anthropic.com/en/docs/agents-and-tools/claude-code/overview',
     );
+  }
+
+  // Pre-flight: verify Claude CLI can actually execute in sandboxed env
+  if (errors.length === 0) {
+    try {
+      execSync('claude --version', {
+        stdio: 'pipe',
+        env: {
+          PATH: process.env.PATH ?? '',
+          HOME: process.env.HOME ?? '',
+          LANG: process.env.LANG ?? 'en_US.UTF-8',
+          USER: process.env.USER ?? '',
+          SHELL: process.env.SHELL ?? '',
+        },
+        timeout: 10000,
+      });
+    } catch (e) {
+      errors.push(
+        `Claude CLI failed to run in sandboxed env: ${e}\n` +
+        '  This usually means a Node version incompatibility.\n' +
+        '  Run: clementine doctor',
+      );
+    }
   }
 
   // Check vault system files

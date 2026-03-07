@@ -808,8 +808,11 @@ Delegate data-heavy work (SEO, analytics, bulk API calls for 3+ entities) to sub
             hitRateLimit = true;
           } else if (errStr.includes('prompt is too long') || errStr.includes('prompt too long') || errStr.includes('context_length')) {
             responseText = responseText || 'Error: prompt is too long — context window overflow from large tool responses.';
-          } else if (!responseText) {
-            responseText = 'Sorry, I hit a temporary issue. Please try again.';
+          } else {
+            logger.error({ err: e, sessionKey }, 'SDK query failed');
+            if (!responseText) {
+              responseText = 'Sorry, I hit a temporary issue. Please try again.';
+            }
           }
         }
 

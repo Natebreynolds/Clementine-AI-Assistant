@@ -374,11 +374,15 @@ function cmdDoctor(): void {
 
   let issues = 0;
 
-  // Node version
+  // Node version (require 20–24 LTS)
   const nodeVersion = process.version;
   const major = parseInt(nodeVersion.slice(1), 10);
-  if (major >= 20) {
+  if (major >= 20 && major <= 24) {
     console.log(`  ${GREEN}OK${RESET}  Node.js ${nodeVersion}`);
+  } else if (major > 24) {
+    console.log(`  ${RED}FAIL${RESET}  Node.js ${nodeVersion} — SDK requires Node 20–24 LTS`);
+    console.log(`       Install Node 22: nvm install 22`);
+    issues++;
   } else {
     console.log(`  ${RED}FAIL${RESET}  Node.js ${nodeVersion} (need >= 20)`);
     issues++;
@@ -391,6 +395,16 @@ function cmdDoctor(): void {
   } catch {
     console.log(`  ${RED}FAIL${RESET}  claude CLI not found`);
     console.log(`       Install: npm install -g @anthropic-ai/claude-code`);
+    issues++;
+  }
+
+  // SDK smoke test — verify claude CLI can actually execute
+  try {
+    execSync('claude --version', { stdio: 'pipe', timeout: 10000 });
+    console.log(`  ${GREEN}OK${RESET}  claude CLI executes successfully`);
+  } catch {
+    console.log(`  ${RED}FAIL${RESET}  claude CLI found but failed to execute`);
+    console.log(`       Check Node version compatibility and run: npm install -g @anthropic-ai/claude-code`);
     issues++;
   }
 
@@ -444,6 +458,24 @@ function cmdDoctor(): void {
     }
     if (!anyChannel) {
       console.log(`  ${YELLOW}WARN${RESET}  No channel tokens configured`);
+      issues++;
+    }
+  }
+
+  // LaunchAgent health check (macOS only)
+  if (process.platform === 'darwin') {
+    const plistPath = getLaunchdPlistPath();
+    if (existsSync(plistPath)) {
+      try {
+        execSync(`launchctl list ${getLaunchdLabel()}`, { stdio: 'pipe' });
+        console.log(`  ${GREEN}OK${RESET}  LaunchAgent installed and loaded`);
+      } catch {
+        console.log(`  ${YELLOW}WARN${RESET}  LaunchAgent installed but not loaded`);
+        console.log(`       Load it: launchctl load "${plistPath}"`);
+        issues++;
+      }
+    } else {
+      console.log(`  ${YELLOW}WARN${RESET}  LaunchAgent not installed (run: clementine launch --install)`);
       issues++;
     }
   }
