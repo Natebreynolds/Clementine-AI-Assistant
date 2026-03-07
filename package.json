@@ -14,7 +14,8 @@
     "start": "node dist/index.js",
     "mcp": "tsx src/tools/mcp-server.ts",
     "cli": "tsx src/cli/index.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "postinstall": "npm rebuild better-sqlite3 --quiet 2>/dev/null || true"
   },
   "dependencies": {
     "@anthropic-ai/claude-code": "^1.0.128",

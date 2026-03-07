@@ -409,6 +409,20 @@ function cmdDoctor(): void {
     issues++;
   }
 
+  // better-sqlite3 native module
+  try {
+    execSync('node -e "require(\'better-sqlite3\')"', {
+      cwd: PACKAGE_ROOT,
+      stdio: 'pipe',
+      timeout: 10000,
+    });
+    console.log(`  ${GREEN}OK${RESET}  better-sqlite3 native module loads`);
+  } catch {
+    console.log(`  ${RED}FAIL${RESET}  better-sqlite3 native module broken (Node version mismatch)`);
+    console.log(`       Fix: cd ${PACKAGE_ROOT} && npm rebuild better-sqlite3`);
+    issues++;
+  }
+
   // Data home
   if (existsSync(BASE_DIR)) {
     console.log(`  ${GREEN}OK${RESET}  Data home exists (${BASE_DIR})`);
@@ -932,6 +946,17 @@ async function cmdUpdate(options: { restart?: boolean; dryRun?: boolean }): Prom
     console.error(`  ${RED}FAIL${RESET}  npm install failed: ${String(err).slice(0, 200)}`);
     console.log(`  ${DIM}Config backup is at: ${backupDir}${RESET}`);
     process.exit(1);
+  }
+
+  // 6b. Rebuild native modules (better-sqlite3) for current Node version
+  try {
+    execSync('npm rebuild better-sqlite3', {
+      cwd: PACKAGE_ROOT,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    console.log(`  ${GREEN}OK${RESET}  Native modules rebuilt`);
+  } catch {
+    console.error(`  ${YELLOW}WARN${RESET}  Native module rebuild failed — memory search may not work`);
   }
 
   // 7. Build
