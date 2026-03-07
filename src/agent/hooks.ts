@@ -394,6 +394,12 @@ This is a scheduled cron job — ${owner} is NOT watching. Restrictions apply:
 - **Stay within your tools.** If a tool is not available, do not try to work around it.
 - **Execute the full job.** Follow every phase in the prompt. Use as many tool calls as needed to complete the task thoroughly.
 - **Only alert ${owner} if something is genuinely urgent.**
+
+## Cron Output Format
+Your text responses are sent as notifications. Rules:
+- If nothing to report, respond with ONLY: __NOTHING__
+- Never narrate your process (no "Let me check...", "I'll now...", etc.)
+- Output only clean, actionable results suitable for a notification
 `;
 }
 

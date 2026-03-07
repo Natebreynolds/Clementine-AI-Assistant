@@ -199,6 +199,31 @@ function yesterdayISO(): string {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 }
 
+// ── Cron Output Extraction ──────────────────────────────────────────
+
+const NARRATION_RE = /^(I'll|I'm going|I need|Let me|Now I|I found|I see|I can see|Checking|Scanning|Searching|Reading|Looking at|Reviewing)/i;
+
+function isNarration(text: string): boolean {
+  const trimmed = text.trim();
+  return trimmed.length < 500 && NARRATION_RE.test(trimmed);
+}
+
+/** Walk text blocks from end to start, returning the best deliverable. */
+function extractDeliverable(blocks: string[]): string {
+  if (blocks.length === 0) return '';
+  const last = blocks[blocks.length - 1].trim();
+  if (last === '__NOTHING__') return '';
+
+  // Walk from end, skip narration
+  for (let i = blocks.length - 1; i >= 0; i--) {
+    const text = blocks[i].trim();
+    if (text === '__NOTHING__') return '';
+    if (!isNarration(text)) return text;
+  }
+  // All blocks were narration
+  return '';
+}
+
 // ── PersonalAssistant ───────────────────────────────────────────────
 
 export class PersonalAssistant {
@@ -1164,11 +1189,16 @@ Delegate data-heavy work (SEO, analytics, bulk API calls for 3+ entities) to sub
       `[CRON JOB: ${jobName} — ${timestamp}]\n\n` +
       `This is a scheduled cron job. Execute the following task:\n\n` +
       `${jobPrompt}\n\n` +
-      `IMPORTANT: Your text output will be sent as a notification. Only output text if you have something meaningful to report. If there is nothing to report, output nothing — do not narrate your steps or say "nothing found".`;
+      `## OUTPUT RULES (MANDATORY)\n` +
+      `Your text output is sent directly as a Discord notification. Follow strictly:\n` +
+      `1. Do NOT narrate your process. No "Let me...", "I'll now...", "I found...", "Now I need to..."\n` +
+      `2. If nothing to report, output ONLY: __NOTHING__\n` +
+      `3. Output ONLY the clean, actionable result — as if composing a concise notification.\n` +
+      `4. Your FINAL text response is the only thing delivered. All prior text is discarded.`;
 
-    // For cron jobs, only keep the final text block — intermediate narration
-    // (e.g. "Let me check the inbox...") should not be dispatched as notifications.
-    let lastTextBlock = '';
+    // Collect all text blocks so we can extract the best deliverable,
+    // skipping agent narration that shouldn't be sent as notifications.
+    const allTextBlocks: string[] = [];
     const stream = query({ prompt, options: sdkOptions });
 
     for await (const message of stream) {
@@ -1176,7 +1206,7 @@ Delegate data-heavy work (SEO, analytics, bulk API calls for 3+ entities) to sub
         const blocks = getContentBlocks(message as SDKAssistantMessage);
         for (const block of blocks) {
           if (block.type === 'text' && block.text) {
-            lastTextBlock = block.text;
+            allTextBlocks.push(block.text);
           } else if (block.type === 'tool_use' && block.name) {
             logToolUse(block.name, (block.input ?? {}) as Record<string, unknown>);
           }
@@ -1184,7 +1214,7 @@ Delegate data-heavy work (SEO, analytics, bulk API calls for 3+ entities) to sub
       }
     }
 
-    return lastTextBlock.trim();
+    return extractDeliverable(allTextBlocks);
   }
 
   // ── Unleashed Mode (Long-Running Autonomous Tasks) ─────────────────

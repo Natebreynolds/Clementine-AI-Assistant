@@ -212,7 +212,7 @@ export class Gateway {
       return response;
     } catch (err) {
       logger.error({ err, jobName }, `Cron job error: ${jobName}`);
-      return `Cron job '${jobName}' error: ${err}`;
+      throw err;
     }
   }
 

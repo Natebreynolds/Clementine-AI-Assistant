@@ -650,7 +650,7 @@ export class CronScheduler {
             await sleep(backoffMs);
           } else {
             logger.error({ err, job: job.name }, `Cron job '${job.name}' failed after ${attempt} attempt(s)`);
-            await this.dispatcher.send(`**[Cron: ${job.name} — FAILED]**\n\n${err}`);
+            await this.dispatcher.send(CronScheduler.formatCronError(job.name, err));
           }
         }
       }
@@ -683,7 +683,7 @@ export class CronScheduler {
       );
       return response || `*(cron job '${jobName}' completed — no output)*`;
     } catch (err) {
-      return `Cron job '${jobName}' error: ${err}`;
+      return CronScheduler.formatCronError(jobName, err);
     } finally {
       this.runningJobs.delete(jobName);
     }
@@ -691,7 +691,12 @@ export class CronScheduler {
 
   /** Filter out cron responses that are just narration, not actionable output. */
   private static isCronNoise(response: string): boolean {
-    const lower = response.toLowerCase().trim();
+    const trimmed = response.trim();
+
+    // Sentinel from agent output rules
+    if (trimmed === '__NOTHING__') return true;
+
+    const lower = trimmed.toLowerCase();
     const noisePatterns = [
       'nothing to report',
       'nothing new',
@@ -715,8 +720,29 @@ export class CronScheduler {
       'let me retry',
       'let me fix',
     ];
-    // If the response starts with narration or says nothing meaningful, filter it
-    return noisePatterns.some((p) => lower.includes(p));
+    if (noisePatterns.some((p) => lower.includes(p))) return true;
+
+    // Short responses that start with narration phrases
+    if (trimmed.length < 200 && /^(I'll|I'm|I need|I found|Let me|Now I|Checking|Scanning|Searching|Reading|Reviewing|Looking)/i.test(trimmed)) {
+      return true;
+    }
+
+    return false;
+  }
+
+  /** Format cron error messages for clean notifications. */
+  private static formatCronError(jobName: string, err: unknown): string {
+    let msg = String(err);
+    // Strip "Error: " prefix
+    msg = msg.replace(/^Error:\s*/i, '');
+    // Strip stack traces
+    const stackIdx = msg.indexOf('\n    at ');
+    if (stackIdx > 0) msg = msg.slice(0, stackIdx);
+    // Replace exit code messages
+    msg = msg.replace(/Claude Code process exited with code \d+/i, 'Task could not complete');
+    // Truncate
+    if (msg.length > 300) msg = msg.slice(0, 297) + '...';
+    return `**[Cron: ${jobName} — Failed]**\n\n${msg.trim()}`;
   }
 
   listJobs(): string {
