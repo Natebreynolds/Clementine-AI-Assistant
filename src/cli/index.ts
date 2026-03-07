@@ -821,18 +821,20 @@ async function cmdUpdate(options: { restart?: boolean; dryRun?: boolean }): Prom
     process.exit(1);
   }
 
-  // 2. Check for clean worktree (warn but continue)
+  // 2. Stash any local customizations so pull succeeds
+  let didStash = false;
   try {
     const status = execSync('git status --porcelain', { cwd: PACKAGE_ROOT, encoding: 'utf-8' }).trim();
     if (status) {
-      console.log(`  ${YELLOW}WARN${RESET}  Uncommitted changes in package directory:`);
-      for (const line of status.split('\n').slice(0, 5)) {
-        console.log(`    ${DIM}${line}${RESET}`);
+      console.log(`  ${DIM}Local customizations detected — stashing...${RESET}`);
+      const stashOut = execSync('git stash', { cwd: PACKAGE_ROOT, encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] }).trim();
+      didStash = !stashOut.includes('No local changes');
+      if (didStash) {
+        console.log(`  ${GREEN}OK${RESET}  Stashed local customizations`);
       }
-      console.log();
     }
   } catch {
-    // not fatal
+    // not fatal — pull may still succeed if changes don't conflict
   }
 
   // 3. Back up user config
@@ -907,22 +909,7 @@ async function cmdUpdate(options: { restart?: boolean; dryRun?: boolean }): Prom
     return;
   }
 
-  // 5. Stash local changes, pull, then reapply
-  let didStash = false;
-  try {
-    const stashOutput = execSync('git stash', {
-      cwd: PACKAGE_ROOT,
-      encoding: 'utf-8',
-      stdio: ['pipe', 'pipe', 'pipe'],
-    }).trim();
-    didStash = !stashOutput.includes('No local changes');
-    if (didStash) {
-      console.log(`  ${GREEN}OK${RESET}  Stashed local customizations`);
-    }
-  } catch {
-    // No changes to stash — continue
-  }
-
+  // 5. Git pull
   console.log(`  Pulling latest...`);
   try {
     const pullOutput = execSync('git pull --ff-only', {
