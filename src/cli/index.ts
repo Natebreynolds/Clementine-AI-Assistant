@@ -925,9 +925,23 @@ async function cmdUpdate(options: { restart?: boolean; dryRun?: boolean }): Prom
     }
   } catch (err) {
     const errStr = String(err);
-    if (errStr.includes('Not possible to fast-forward')) {
-      console.error(`  ${RED}FAIL${RESET}  Cannot fast-forward. Local changes conflict with upstream.`);
-      console.error('  Resolve manually with: git -C "' + PACKAGE_ROOT + '" pull --rebase');
+    if (errStr.includes('local changes') || errStr.includes('overwritten by merge')) {
+      console.error(`  ${RED}FAIL${RESET}  Local file changes conflict with the update.`);
+      console.error();
+      console.error(`  Fix — run these commands, then retry:`);
+      console.error(`    cd ${PACKAGE_ROOT}`);
+      console.error(`    git stash`);
+      console.error(`    clementine update`);
+      console.error();
+      console.error(`  ${DIM}Your local changes will be saved. Restore after update with: git stash pop${RESET}`);
+    } else if (errStr.includes('Not possible to fast-forward')) {
+      console.error(`  ${RED}FAIL${RESET}  Cannot fast-forward. Local commits conflict with upstream.`);
+      console.error();
+      console.error(`  Fix — run these commands, then retry:`);
+      console.error(`    cd ${PACKAGE_ROOT}`);
+      console.error(`    git stash`);
+      console.error(`    git pull --rebase`);
+      console.error(`    git stash pop`);
     } else {
       console.error(`  ${RED}FAIL${RESET}  git pull failed: ${errStr.slice(0, 200)}`);
     }
