@@ -63,8 +63,8 @@ const logger = pino({ name: 'clementine.assistant' });
 const SESSIONS_FILE = path.join(BASE_DIR, '.sessions.json');
 const MAX_SESSION_EXCHANGES = 40;
 const SESSION_EXPIRY_MS = 24 * 60 * 60 * 1000;
-const AUTO_MEMORY_MIN_LENGTH = 120;
-const AUTO_MEMORY_MODEL = MODELS.haiku;
+const AUTO_MEMORY_MIN_LENGTH = 80;
+const AUTO_MEMORY_MODEL = MODELS.sonnet;
 const OWNER = OWNER_NAME || 'the user';
 const MCP_SERVER_SCRIPT = path.join(PKG_DIR, 'dist', 'tools', 'mcp-server.js');
 const TOOLS_SERVER = `${ASSISTANT_NAME.toLowerCase()}-tools`;
@@ -940,29 +940,23 @@ Delegate data-heavy work (SEO, analytics, bulk API calls for 3+ entities) to sub
   private worthExtracting(prompt: string, response: string): boolean {
     if (response.length < 100) return false;
 
-    // Skip short acknowledgment responses
-    if (response.length < 200) return false;
+    // Skip very short acknowledgment responses
+    if (response.length < 100) return false;
 
-    // Skip trivial single-sentence user messages with no substance
-    if (prompt.length < 100 && !prompt.includes(' ') === false && (prompt.match(/[.!?]/g) ?? []).length <= 1) {
-      // Single short sentence — check for entities (names, URLs, numbers, etc.)
-      if (!/[A-Z][a-z]{2,}|https?:|@|\d{3,}/.test(prompt)) return false;
-    }
-
-    const greetingPatterns = [
-      'hello', 'hi ', 'hey ', 'good morning', 'good afternoon',
-      'good evening', 'good night', 'thanks', 'thank you',
+    // Only skip pure greetings with no substance at all
+    const pureGreetings = [
+      'hello', 'hi', 'hey', 'thanks', 'thank you',
       'ok', 'okay', 'sure', 'got it', 'sounds good',
       'nice', 'cool', 'great', 'awesome', 'perfect', 'yep', 'yup', 'nope',
     ];
     const lower = prompt.toLowerCase().trim();
-    if (greetingPatterns.some((g) => lower.startsWith(g) || lower === g.trim())) {
-      if (prompt.length < 80) return false;
+    if (pureGreetings.some((g) => lower === g || lower === g + '!' || lower === g + '.')) {
+      return false;
     }
 
-    // Rate limit: max 1 extraction per 2 minutes per session
+    // Rate limit: max 1 extraction per 45 seconds per session
     const now = Date.now();
-    if (now - this.lastExtractionTime < 120_000) return false;
+    if (now - this.lastExtractionTime < 45_000) return false;
     this.lastExtractionTime = now;
 
     return true;
@@ -984,8 +978,8 @@ Delegate data-heavy work (SEO, analytics, bulk API calls for 3+ entities) to sub
     try {
       if (fs.existsSync(MEMORY_FILE)) {
         const content = fs.readFileSync(MEMORY_FILE, 'utf-8');
-        currentMemory = content.slice(0, 2000);
-        if (content.length > 2000) currentMemory += '\n...(truncated)';
+        currentMemory = content.slice(0, 4000);
+        if (content.length > 4000) currentMemory += '\n...(truncated)';
       }
     } catch { /* non-fatal */ }
 
@@ -1040,7 +1034,7 @@ Delegate data-heavy work (SEO, analytics, bulk API calls for 3+ entities) to sub
               env: { CLEMENTINE_HOME: BASE_DIR },
             },
           },
-          maxTurns: 3,
+          maxTurns: 5,
           cwd: BASE_DIR,
           env: SAFE_ENV,
         },

@@ -515,18 +515,16 @@ server.tool(
         const existingLines = existingContent.split('\n').map(l => l.trim()).filter(Boolean);
         const newLines = content.split('\n').map(l => l.trim()).filter(Boolean);
 
-        // Simple dedup: skip lines that are very similar to existing ones
+        // Dedup: skip lines that are exact or near-exact duplicates
         const filtered: string[] = [];
-        const skipped: string[] = [];
         for (const newLine of newLines) {
           const isDup = existingLines.some(ex => {
-            const a = newLine.toLowerCase();
-            const b = ex.toLowerCase();
-            return a === b || (a.length > 10 && b.includes(a.slice(0, Math.floor(a.length * 0.8))));
+            const a = newLine.toLowerCase().trim();
+            const b = ex.toLowerCase().trim();
+            // Only skip exact matches (case-insensitive)
+            return a === b;
           });
-          if (isDup) {
-            skipped.push(newLine);
-          } else {
+          if (!isDup) {
             filtered.push(newLine);
           }
         }
