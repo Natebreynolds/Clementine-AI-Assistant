@@ -2442,9 +2442,10 @@ async function refreshProjects() {
       const userDescHtml = p.userDescription
         ? '<div style="color:var(--accent);margin-bottom:4px;font-size:12px">' + esc(p.userDescription) + '</div>'
         : '';
+      const idx = projectsData.indexOf(p);
       const linkBtn = p.linked
-        ? '<button class="btn btn-sm" style="font-size:11px" onclick="openProjectEditor(\'' + esc(p.path).replace(/'/g, "\\'") + '\')">Edit</button> <button class="btn btn-sm btn-danger" style="font-size:11px" onclick="unlinkProject(\'' + esc(p.path).replace(/'/g, "\\'") + '\')">Unlink</button>'
-        : '<button class="btn btn-sm btn-primary" style="font-size:11px" onclick="openProjectEditor(\'' + esc(p.path).replace(/'/g, "\\'") + '\')">Link</button>';
+        ? '<button class="btn btn-sm" style="font-size:11px" onclick="openProjectEditorByIdx(' + idx + ')">Edit</button> <button class="btn btn-sm btn-danger" style="font-size:11px" onclick="unlinkProjectByIdx(' + idx + ')">Unlink</button>'
+        : '<button class="btn btn-sm btn-primary" style="font-size:11px" onclick="openProjectEditorByIdx(' + idx + ')">Link</button>';
       html += '<div class="card" style="cursor:default">'
         + '<div class="card-header" style="display:flex;align-items:center;justify-content:space-between">'
         + '<strong>' + esc(p.name) + '</strong>'
@@ -2462,6 +2463,18 @@ async function refreshProjects() {
     html += '</div>';
     document.getElementById('panel-projects').innerHTML = html;
   } catch(e) { }
+}
+
+function openProjectEditorByIdx(idx) {
+  const p = projectsData[idx];
+  if (!p) return;
+  openProjectEditor(p.path);
+}
+
+function unlinkProjectByIdx(idx) {
+  const p = projectsData[idx];
+  if (!p) return;
+  unlinkProject(p.path);
 }
 
 function openProjectEditor(projPath) {
