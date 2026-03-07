@@ -28,19 +28,20 @@ Clementine is three layers stacked on a shared memory store:
                     ┌────────────────▼────────────────────────┐
                     │           Gateway Layer                  │
                     │  Router · Session Manager · Heartbeat    │
-                    │  Cron Scheduler · Notification Dispatch  │
+                    │  Cron Scheduler · Unleashed Engine       │
+                    │  Notification Dispatch                   │
                     └────────────────┬────────────────────────┘
                                      │
                     ┌────────────────▼────────────────────────┐
                     │            Agent Layer                   │
                     │  Claude Code SDK · Security Hooks        │
                     │  Auto-Memory · Session Rotation          │
-                    │  Agent Profiles · Team Spawning          │
+                    │  Agent Profiles · Sub-Agent Teams        │
                     └────────────────┬────────────────────────┘
                                      │
                     ┌────────────────▼────────────────────────┐
                     │          MCP Tool Server                 │
-                    │  27 tools over stdio transport           │
+                    │  30+ tools over stdio transport          │
                     │  Memory · Tasks · Vault · Workspace      │
                     └────────────────┬────────────────────────┘
                                      │
@@ -97,6 +98,11 @@ That's it. Clementine is now running, connected to your configured channels, and
 ├── logs/
 │   ├── clementine.log             ← Daemon stdout/stderr
 │   └── audit.log                  ← Security audit trail
+├── cron/runs/                     ← Per-job JSONL run logs
+├── unleashed/                     ← Unleashed task progress & checkpoints
+│   └── <task>/
+│       ├── status.json            ← Current status, phase, timing
+│       └── progress.jsonl         ← Phase-by-phase event log
 └── vault/                         ← Obsidian-compatible vault
     ├── 00-System/                 ← SOUL.md, MEMORY.md, HEARTBEAT.md, CRON.md
     ├── 01-Daily-Notes/            ← Auto-generated daily logs (YYYY-MM-DD.md)
@@ -157,7 +163,8 @@ Three-tier enforcement via the SDK `canUseTool` callback:
 | **2** | Logged | External writes, git commit, bash dev commands |
 | **3** | Blocked in autonomous mode | Push, delete, credentials, form submit |
 
-Heartbeats run Tier 1 only. Cron jobs respect per-job tier settings in `CRON.md`.
+Heartbeats run Tier 1 only. Cron jobs respect per-job tier settings in `CRON.md`. Unleashed tasks inherit their job's tier.
+All autonomous tasks (cron jobs, heartbeats, unleashed) can spawn sub-agents for parallel work — sub-agents inherit the parent's tier constraints.
 Secrets never reach the Claude subprocess — `SAFE_ENV` filters credentials from `process.env`, and `.env` is parsed locally without polluting the environment.
 
 ### Memory architecture
@@ -198,7 +205,7 @@ User message
 - **Temporal decay** — Applied on every startup; stale memories naturally sink
 - **Pruning** — Episodic chunks >90 days with salience <0.01 are removed; old transcripts and access logs trimmed
 
-### MCP tools (27 total)
+### MCP tools (30+)
 
 | Tool | Description |
 |------|-------------|
@@ -229,6 +236,13 @@ User message
 | `workspace_config` | Add, remove, or list workspace directories at runtime |
 | `workspace_list` | Scan workspace directories for local project roots |
 | `workspace_info` | Read a project's README, CLAUDE.md, manifest, and directory tree |
+| `add_cron_job` | Create scheduled tasks (supports standard and unleashed mode, project context) |
+| `self_restart` | Restart the daemon (for self-updates and config changes) |
+| `analyze_image` | Analyze images with vision capabilities |
+| `memory_report` | Generate a transparency report of all memory extractions |
+| `memory_correct` | Correct or dismiss a previously extracted memory |
+| `feedback_log` | Log user feedback on responses |
+| `feedback_report` | View feedback history and patterns |
 
 ---
 
@@ -273,8 +287,12 @@ Run `clementine dashboard` to open a local web command center at `http://localho
 - **Metrics** — Time saved estimates, session counts, cron job stats, memory size
 - **Chat** — Talk to your assistant directly from the browser
 - **Memory search** — Full-text search across all vault notes (FTS5)
-- **Scheduled tasks** — Create, edit, toggle, and delete cron jobs with a visual editor
+- **Scheduled tasks** — Create, edit, run, toggle, and delete cron jobs with a visual schedule builder
+- **Project-aware cron** — Assign cron jobs to specific project directories
+- **Unleashed mode** — Create long-running autonomous tasks, monitor phase progress, cancel running tasks
+- **Projects** — Browse all discovered workspace projects with type, description, and tool badges
 - **Live status** — Daemon health, LaunchAgent status, active channels
+- **Sessions** — View and manage active conversation sessions
 
 No extra dependencies — the dashboard uses Express, which is already installed.
 
@@ -383,6 +401,92 @@ Three tools power this:
 - **`workspace_info`** — Deep-reads a project: `README.md`, `.claude/CLAUDE.md`, `package.json`/`pyproject.toml`, and a directory tree (depth 2).
 
 Clementine can then use her built-in file tools (`Read`, `Glob`, `Grep`, `Edit`, `Bash`) to work directly in any discovered project.
+
+---
+
+## Scheduled tasks & cron jobs
+
+Define scheduled tasks in `vault/00-System/CRON.md` using YAML frontmatter, or create them from the dashboard or any chat channel.
+
+```yaml
+---
+jobs:
+  - name: Morning Digest
+    schedule: "0 9 * * 1-5"
+    prompt: "Check my inbox, calendar, and overdue tasks. Send a morning summary."
+    tier: 2
+    enabled: true
+
+  - name: Codebase Audit
+    schedule: "0 2 * * 0"
+    prompt: "Audit the main repo for dead code, missing tests, and security issues."
+    tier: 2
+    work_dir: ~/projects/my-app
+    mode: unleashed
+    max_hours: 4
+---
+```
+
+All cron jobs have **sub-agent support** — they can use the Agent and Task tools to spawn parallel workers, delegate sub-tasks, and coordinate multi-step workflows.
+
+### Project-aware cron jobs
+
+Set `work_dir` on any job to run it inside a specific project directory. The agent gets access to that project's `CLAUDE.md`, MCP servers, tools, and file tree — exactly like running Claude Code inside the project locally.
+
+### Visual schedule builder
+
+The dashboard provides a visual schedule builder with dropdowns for frequency (daily, weekdays, weekly, every N hours/minutes), day picker, and time picker — no cron syntax required. Advanced users can still enter raw cron expressions.
+
+---
+
+## Unleashed mode
+
+For tasks that take hours — codebase refactors, research projects, content generation pipelines — unleashed mode runs autonomously with phased execution and checkpointing.
+
+```
+Phase 1 (75 turns) ──▶ Checkpoint ──▶ Phase 2 (75 turns) ──▶ Checkpoint ──▶ ...
+     │                      │                │                      │
+     └─ Session resume ─────┘                └─ Session resume ─────┘
+```
+
+### How it works
+
+1. The task runs in phases (default 75 turns per phase)
+2. Between phases, the SDK session is **resumed** — the agent keeps its full conversation history
+3. Progress is saved to `~/.clementine/unleashed/<task>/` (JSONL log + status file)
+4. The agent can spawn sub-agents for parallel work streams
+5. Cancel anytime via the dashboard or by touching a `CANCEL` file
+
+### Safety guardrails
+
+| Guard | Behavior |
+|-------|----------|
+| **Max hours** | Configurable deadline (default 6h, up to 24h) |
+| **Max phases** | Hard cap at 50 phases |
+| **Consecutive errors** | Aborts after 3 consecutive phase failures |
+| **Concurrency** | Same job can't run twice simultaneously |
+| **Cancellation** | Checked between every phase |
+| **Error recovery** | Failed phases reset the session and re-inject the original task |
+
+### Triggering unleashed tasks
+
+| Method | How |
+|--------|-----|
+| **Dashboard** | Create a cron job with mode "Unleashed", set max hours, click Run |
+| **Discord** | `!cron run <task>` — fires in background, sends completion notification |
+| **CLI** | `clementine cron run <task>` — runs in foreground (for manual runs) |
+| **Cron schedule** | Set `mode: unleashed` in CRON.md — fires on schedule automatically |
+| **Chat** | Ask Clementine to create an unleashed task — she'll use the `add_cron_job` tool |
+
+### Monitoring
+
+The dashboard shows a live **Unleashed Tasks** panel below scheduled tasks with:
+- Current phase number and elapsed time
+- Status badges (running / completed / cancelled / timeout / error)
+- Output preview from the last completed phase
+- Cancel button for running tasks
+
+Progress is also logged to `~/.clementine/unleashed/<task>/progress.jsonl` for debugging.
 
 ---
 
