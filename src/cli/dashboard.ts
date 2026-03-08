@@ -96,6 +96,23 @@ async function searchMemory(query: string, limit = 20): Promise<{ results: Array
 
 // ── Project scanning (mirrors workspace_list from MCP server) ────────
 
+function cronFieldMatch(field: string, value: number): boolean {
+  if (field === '*') return true;
+  if (field.startsWith('*/')) {
+    const step = parseInt(field.slice(2), 10);
+    return !isNaN(step) && step > 0 && value % step === 0;
+  }
+  for (const part of field.split(',')) {
+    if (part.includes('-')) {
+      const [a, b] = part.split('-').map(Number);
+      if (!isNaN(a) && !isNaN(b) && value >= a && value <= b) return true;
+    } else {
+      if (parseInt(part, 10) === value) return true;
+    }
+  }
+  return false;
+}
+
 const PROJECT_MARKERS = [
   '.git', 'package.json', 'pyproject.toml', 'Cargo.toml',
   'go.mod', 'Makefile', 'CMakeLists.txt', 'build.gradle',
@@ -587,18 +604,51 @@ function getStatus(): Record<string, unknown> {
     }
   }
 
-  // Next task name from CRON.md
+  // Next task: find the chronologically next enabled cron job
+  let nextTaskTime = '';
   if (existsSync(CRON_FILE)) {
     try {
       const raw = readFileSync(CRON_FILE, 'utf-8');
       const parsed = matter(raw);
       const jobs = (parsed.data.jobs ?? []) as Array<Record<string, unknown>>;
-      const enabled = jobs.find(j => j.enabled !== false);
-      if (enabled) nextTaskName = String(enabled.name || '');
+      const now = new Date();
+      let soonestOffset = Infinity;
+
+      for (const job of jobs) {
+        if (job.enabled === false) continue;
+        const schedule = String(job.schedule ?? '');
+        const parts = schedule.trim().split(/\s+/);
+        if (parts.length < 5) continue;
+        const [minF, hourF, domF, monF, dowF] = parts;
+
+        // Find next match in the next 48h
+        for (let offset = 1; offset <= 2880; offset++) {
+          const t = new Date(now.getTime() + offset * 60_000);
+          const matches =
+            cronFieldMatch(minF, t.getMinutes()) &&
+            cronFieldMatch(hourF, t.getHours()) &&
+            cronFieldMatch(domF, t.getDate()) &&
+            cronFieldMatch(monF, t.getMonth() + 1) &&
+            cronFieldMatch(dowF, t.getDay());
+          if (matches) {
+            if (offset < soonestOffset) {
+              soonestOffset = offset;
+              nextTaskName = String(job.name || '');
+              const h = t.getHours();
+              const m = t.getMinutes();
+              const ampm = h >= 12 ? 'PM' : 'AM';
+              const h12 = h === 0 ? 12 : h > 12 ? h - 12 : h;
+              const today = t.toDateString() === now.toDateString();
+              nextTaskTime = (today ? '' : 'tmrw ') + `${h12}:${String(m).padStart(2, '0')} ${ampm}`;
+            }
+            break;
+          }
+        }
+      }
     } catch { /* ignore */ }
   }
 
-  return { name, pid, alive, uptime, channels, launchAgent, currentActivity, runsToday, nextTaskName };
+  return { name, pid, alive, uptime, channels, launchAgent, currentActivity, runsToday, nextTaskName, nextTaskTime };
 }
 
 function getSessions(): Record<string, unknown> {
@@ -3274,12 +3324,13 @@ async function refreshStatus() {
         var runsToday = d.runsToday || 0;
         var totalExchanges = md.sessions ? md.sessions.totalExchanges || 0 : 0;
         var nextTask = d.nextTaskName || '—';
+        var nextTime = d.nextTaskTime || '';
 
         var cards = document.getElementById('summary-cards');
         cards.innerHTML = summaryCard('sc-green', '&#9200;', runsToday, 'Tasks Today', d.alive ? 'Agent running' : 'Agent offline')
           + summaryCard('sc-blue', '&#9201;', timeDisplay, 'Time Saved', hours >= 1 ? Math.round(mins) + ' total min' : '')
           + summaryCard('sc-purple', '&#128172;', totalExchanges, 'Messages', md.sessions ? md.sessions.activeSessions + ' sessions' : '')
-          + summaryCard('sc-yellow', '&#9654;', nextTask, 'Next Task', 'First enabled job');
+          + summaryCard('sc-yellow', '&#9654;', nextTask, 'NEXT TASK', nextTime || 'No upcoming jobs');
       } catch(me) { /* metrics optional */ }
     }
 
