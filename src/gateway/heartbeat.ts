@@ -43,6 +43,9 @@ import { scanner } from '../security/scanner.js';
 
 const logger = pino({ name: 'clementine.heartbeat' });
 
+/** Default timeout for standard cron jobs (10 minutes). */
+const CRON_STANDARD_TIMEOUT_MS = 10 * 60 * 1000;
+
 // ── HeartbeatScheduler ────────────────────────────────────────────────
 
 export class HeartbeatScheduler {
@@ -382,13 +385,20 @@ const TRANSIENT_PATTERNS = [
   /rate.?limit/i,
   /429/,
   /timeout/i,
+  /timed out/i,
   /ECONNRESET/i,
   /ECONNREFUSED/i,
   /ETIMEDOUT/i,
+  /ENOTFOUND/i,
   /socket hang up/i,
   /5\d\d/,
   /overloaded/i,
   /temporarily unavailable/i,
+  /quota.?exceeded/i,
+  /too many requests/i,
+  /service.?unavailable/i,
+  /capacity/i,
+  /try again/i,
 ];
 
 export function classifyError(err: unknown): 'transient' | 'permanent' {
@@ -429,7 +439,8 @@ export class CronRunLog {
     const line = JSON.stringify(entry) + '\n';
     try {
       appendFileSync(filePath, line);
-      this.maybePrune(filePath);
+      // Schedule pruning asynchronously so it doesn't block the caller
+      setImmediate(() => this.maybePrune(filePath));
     } catch (err) {
       logger.warn({ err, job: entry.jobName }, 'Failed to write run log');
     }
@@ -578,8 +589,6 @@ export class CronScheduler {
     this.runningJobs.add(job.name);
 
     try {
-      const now = new Date();
-      const timeStr = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
       logger.info(`Running cron job: ${job.name}`);
 
       // Unleashed tasks handle their own retries/phases internally — never retry the whole task
@@ -591,7 +600,8 @@ export class CronScheduler {
       for (let attempt = 1; attempt <= maxAttempts; attempt++) {
         const startedAt = new Date();
         try {
-          const response = await this.gateway.handleCronJob(
+          // Standard cron jobs get a 10-minute timeout to prevent hanging
+          const cronPromise = this.gateway.handleCronJob(
             job.name,
             job.prompt,
             job.tier,
@@ -602,9 +612,22 @@ export class CronScheduler {
             job.maxHours,
           );
 
+          let response: string;
+          if (job.mode !== 'unleashed') {
+            const timeoutMs = CRON_STANDARD_TIMEOUT_MS;
+            response = await Promise.race([
+              cronPromise,
+              sleep(timeoutMs).then(() => {
+                throw new Error(`Cron job '${job.name}' timed out after ${timeoutMs / 60_000} minutes`);
+              }),
+            ]);
+          } else {
+            response = await cronPromise;
+          }
+
           // Success — log and dispatch
           const finishedAt = new Date();
-          this.runLog.append({
+          const entry: CronRunEntry = {
             jobName: job.name,
             startedAt: startedAt.toISOString(),
             finishedAt: finishedAt.toISOString(),
@@ -612,11 +635,18 @@ export class CronScheduler {
             durationMs: finishedAt.getTime() - startedAt.getTime(),
             attempt,
             outputPreview: response ? response.slice(0, 200) : undefined,
-          });
+          };
 
           if (response && !CronScheduler.isCronNoise(response)) {
-            await this.dispatcher.send(`**[Cron: ${job.name} — ${timeStr}]**\n\n${response}`);
+            const result = await this.dispatcher.send(response);
+            if (!result.delivered) {
+              entry.deliveryFailed = true;
+              entry.deliveryError = Object.values(result.channelErrors).join('; ').slice(0, 300);
+              logger.warn({ job: job.name, errors: result.channelErrors }, 'Cron output not delivered to any channel');
+            }
           }
+
+          this.runLog.append(entry);
           return; // done
         } catch (err) {
           const finishedAt = new Date();
@@ -636,7 +666,7 @@ export class CronScheduler {
           // Permanent error — stop immediately
           if (errorType === 'permanent') {
             logger.error({ err, job: job.name }, `Cron job '${job.name}' permanent error — not retrying`);
-            await this.dispatcher.send(`**[Cron: ${job.name} — FAILED]**\n\n${err}`);
+            await this.dispatcher.send(`${job.name} failed: ${err}`);
             return;
           }
 
@@ -689,43 +719,20 @@ export class CronScheduler {
     }
   }
 
-  /** Filter out cron responses that are just narration, not actionable output. */
+  /** Filter out cron responses that are truly empty or nothing-to-report. */
   private static isCronNoise(response: string): boolean {
     const trimmed = response.trim();
-
-    // Sentinel from agent output rules
     if (trimmed === '__NOTHING__') return true;
 
     const lower = trimmed.toLowerCase();
     const noisePatterns = [
       'nothing to report',
-      'nothing new',
-      'nothing meaningful',
-      'nothing notable',
-      'no new',
-      'no updates',
-      'no unread',
+      'nothing new to report',
       'all clear',
-      'completing the cleanup silently',
+      'no updates',
       'completing silently',
-      'cleanup silently',
-      'let me check',
-      'let me read',
-      'let me search',
-      'let me start',
-      'let me use',
-      "i'll check",
-      "i'll execute",
-      "i'll scan",
-      'let me retry',
-      'let me fix',
     ];
-    if (noisePatterns.some((p) => lower.includes(p))) return true;
-
-    // Short responses that start with narration phrases
-    if (trimmed.length < 200 && /^(I'll|I'm|I need|I found|Let me|Now I|Checking|Scanning|Searching|Reading|Reviewing|Looking)/i.test(trimmed)) {
-      return true;
-    }
+    if (noisePatterns.some((p) => lower.startsWith(p) || lower === p)) return true;
 
     return false;
   }
@@ -742,7 +749,7 @@ export class CronScheduler {
     msg = msg.replace(/Claude Code process exited with code \d+/i, 'Task could not complete');
     // Truncate
     if (msg.length > 300) msg = msg.slice(0, 297) + '...';
-    return `**[Cron: ${jobName} — Failed]**\n\n${msg.trim()}`;
+    return `${jobName} failed: ${msg.trim()}`;
   }
 
   listJobs(): string {

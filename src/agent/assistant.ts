@@ -202,26 +202,14 @@ function yesterdayISO(): string {
 
 // ── Cron Output Extraction ──────────────────────────────────────────
 
-const NARRATION_RE = /^(I'll|I'm going|I need|Let me|Now I|I found|I see|I can see|Checking|Scanning|Searching|Reading|Looking at|Reviewing)/i;
-
-function isNarration(text: string): boolean {
-  const trimmed = text.trim();
-  return trimmed.length < 500 && NARRATION_RE.test(trimmed);
-}
-
-/** Walk text blocks from end to start, returning the best deliverable. */
+/** Return the last non-empty text block, or '' if nothing/sentinel. */
 function extractDeliverable(blocks: string[]): string {
   if (blocks.length === 0) return '';
-  const last = blocks[blocks.length - 1].trim();
-  if (last === '__NOTHING__') return '';
-
-  // Walk from end, skip narration
   for (let i = blocks.length - 1; i >= 0; i--) {
     const text = blocks[i].trim();
     if (text === '__NOTHING__') return '';
-    if (!isNarration(text)) return text;
+    if (text.length > 0) return text;
   }
-  // All blocks were narration
   return '';
 }
 
@@ -388,7 +376,7 @@ export class PersonalAssistant {
     if (fs.existsSync(SOUL_FILE)) {
       const { content } = matter(fs.readFileSync(SOUL_FILE, 'utf-8'));
       // Autonomous runs only need identity, not full personality guidance
-      parts.push(isAutonomous ? content.slice(0, 500) : content);
+      parts.push(isAutonomous ? content.slice(0, 1500) : content);
     }
 
     if (profile?.systemPromptBody) {
@@ -1261,22 +1249,15 @@ Delegate data-heavy work (SEO, analytics, bulk API calls for 3+ entities) to sub
       sdkOptions.cwd = workDir;
     }
 
-    const now = new Date();
-    const timestamp = now.toISOString().slice(0, 16).replace('T', ' ');
-
+    const ownerName = OWNER;
     const prompt =
-      `[CRON JOB: ${jobName} — ${timestamp}]\n\n` +
-      `This is a scheduled cron job. Execute the following task:\n\n` +
+      `[Scheduled task: ${jobName}]\n\n` +
       `${jobPrompt}\n\n` +
-      `## OUTPUT RULES (MANDATORY)\n` +
-      `Your text output is sent directly as a Discord notification. Follow strictly:\n` +
-      `1. Do NOT narrate your process. No "Let me...", "I'll now...", "I found...", "Now I need to..."\n` +
-      `2. If nothing to report, output ONLY: __NOTHING__\n` +
-      `3. Output ONLY the clean, actionable result — as if composing a concise notification.\n` +
-      `4. Your FINAL text response is the only thing delivered. All prior text is discarded.`;
+      `## How to respond\n` +
+      `You're sending this directly to ${ownerName} as a DM. Write like you're texting them — casual, concise, no headers or section dividers unless the info genuinely needs structure. Skip narrating your process. If there's nothing worth reporting, output ONLY: __NOTHING__\n` +
+      `Your final text response is the only thing delivered.`;
 
-    // Collect all text blocks so we can extract the best deliverable,
-    // skipping agent narration that shouldn't be sent as notifications.
+    // Collect all text blocks — last non-empty block becomes the deliverable.
     const allTextBlocks: string[] = [];
     const stream = query({ prompt, options: sdkOptions });
 

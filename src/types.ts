@@ -108,6 +108,8 @@ export interface CronRunEntry {
   errorType?: 'transient' | 'permanent';
   attempt: number;
   outputPreview?: string;
+  deliveryFailed?: boolean;
+  deliveryError?: string;
 }
 
 // ── Config ───────────────────────────────────────────────────────────

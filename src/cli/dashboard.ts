@@ -433,7 +433,90 @@ function getStatus(): Record<string, unknown> {
     }
   }
 
-  return { name, pid, alive, uptime, channels, launchAgent };
+  // Current activity detection
+  let currentActivity = 'Idle';
+  let runsToday = 0;
+  let nextTaskName = '';
+
+  // Scan cron runs for in-progress jobs + today's count
+  const runsDir = path.join(BASE_DIR, 'cron', 'runs');
+  const todayPrefix = new Date().toISOString().slice(0, 10);
+  if (existsSync(runsDir)) {
+    try {
+      const runFiles = readdirSync(runsDir).filter(f => f.endsWith('.jsonl'));
+      for (const file of runFiles) {
+        const filePath = path.join(runsDir, file);
+        const lines = readFileSync(filePath, 'utf-8').trim().split('\n').filter(Boolean);
+        for (const line of lines) {
+          try {
+            const entry = JSON.parse(line);
+            if (entry.startedAt && entry.startedAt.startsWith(todayPrefix)) runsToday++;
+          } catch { /* skip */ }
+        }
+        // Check last line for running job
+        if (lines.length > 0) {
+          try {
+            const last = JSON.parse(lines[lines.length - 1]);
+            if (last.startedAt && !last.finishedAt) {
+              currentActivity = 'Running: ' + (last.jobName || file.replace('.jsonl', ''));
+            }
+          } catch { /* skip */ }
+        }
+      }
+    } catch { /* ignore */ }
+  }
+
+  // Check sessions for recent chat activity
+  if (currentActivity === 'Idle') {
+    const sessionsFile = path.join(BASE_DIR, '.sessions.json');
+    if (existsSync(sessionsFile)) {
+      try {
+        const sessions = JSON.parse(readFileSync(sessionsFile, 'utf-8'));
+        for (const [key, val] of Object.entries(sessions)) {
+          const s = val as Record<string, unknown>;
+          if (s.timestamp && (Date.now() - new Date(String(s.timestamp)).getTime()) < 60000) {
+            const channel = key.split(':')[0];
+            currentActivity = 'Chatting on ' + channel.charAt(0).toUpperCase() + channel.slice(1);
+            break;
+          }
+        }
+      } catch { /* ignore */ }
+    }
+  }
+
+  // Check unleashed tasks
+  if (currentActivity === 'Idle') {
+    const unleashedDir = path.join(BASE_DIR, 'unleashed');
+    if (existsSync(unleashedDir)) {
+      try {
+        for (const dir of readdirSync(unleashedDir)) {
+          const statusFile = path.join(unleashedDir, dir, 'status.json');
+          if (existsSync(statusFile)) {
+            try {
+              const st = JSON.parse(readFileSync(statusFile, 'utf-8'));
+              if (st.status === 'running') {
+                currentActivity = 'Deep work: ' + (st.jobName || dir);
+                break;
+              }
+            } catch { /* skip */ }
+          }
+        }
+      } catch { /* ignore */ }
+    }
+  }
+
+  // Next task name from CRON.md
+  if (existsSync(CRON_FILE)) {
+    try {
+      const raw = readFileSync(CRON_FILE, 'utf-8');
+      const parsed = matter(raw);
+      const jobs = (parsed.data.jobs ?? []) as Array<Record<string, unknown>>;
+      const enabled = jobs.find(j => j.enabled !== false);
+      if (enabled) nextTaskName = String(enabled.name || '');
+    } catch { /* ignore */ }
+  }
+
+  return { name, pid, alive, uptime, channels, launchAgent, currentActivity, runsToday, nextTaskName };
 }
 
 function getSessions(): Record<string, unknown> {
@@ -563,10 +646,17 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
   app.use(express.json());
 
   // Compute build version hash at startup for cache busting / auto-reload
+  // Use dist file mtime so updates are detected even without git
+  const distDashboard = path.join(PACKAGE_ROOT, 'dist', 'cli', 'dashboard.js');
   let buildHash = String(Date.now());
   try {
-    buildHash = execSync('git rev-parse --short HEAD', { cwd: PACKAGE_ROOT, encoding: 'utf-8' }).trim();
+    const distMtime = statSync(distDashboard).mtimeMs;
+    buildHash = String(Math.floor(distMtime));
   } catch { /* fallback to timestamp */ }
+  try {
+    const gitHash = execSync('git rev-parse --short HEAD', { cwd: PACKAGE_ROOT, encoding: 'utf-8' }).trim();
+    buildHash = gitHash + '-' + buildHash;
+  } catch { /* git not available */ }
 
   // ── GET routes ───────────────────────────────────────────────────
 
@@ -575,11 +665,19 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
   });
 
   app.get('/api/version', (_req, res) => {
+    // Re-check dist mtime to detect rebuilds while dashboard is running
     let currentHash = buildHash;
     try {
-      currentHash = execSync('git rev-parse --short HEAD', { cwd: PACKAGE_ROOT, encoding: 'utf-8' }).trim();
-    } catch { /* use cached */ }
-    res.json({ hash: currentHash, started: buildHash });
+      const currentMtime = String(Math.floor(statSync(distDashboard).mtimeMs));
+      const gitHash = execSync('git rev-parse --short HEAD', { cwd: PACKAGE_ROOT, encoding: 'utf-8' }).trim();
+      currentHash = gitHash + '-' + currentMtime;
+    } catch {
+      try {
+        currentHash = String(Math.floor(statSync(distDashboard).mtimeMs));
+      } catch { /* use cached */ }
+    }
+    const needsRestart = currentHash !== buildHash;
+    res.json({ hash: currentHash, started: buildHash, needsRestart });
   });
 
   app.get('/api/status', (_req, res) => {
@@ -681,10 +779,27 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
     try {
       const child = spawn('node', [DIST_ENTRY, 'cron', 'run', jobName], {
         detached: true,
-        stdio: 'ignore',
+        stdio: ['ignore', 'pipe', 'pipe'],
         cwd: BASE_DIR,
         env: { ...process.env, CLEMENTINE_HOME: BASE_DIR },
       });
+
+      // Capture stderr for error reporting
+      let stderr = '';
+      child.stderr?.on('data', (chunk: Buffer) => {
+        stderr += chunk.toString().slice(0, 500);
+      });
+
+      child.on('error', (err) => {
+        console.error(`[cron-run] Failed to start '${jobName}': ${err}`);
+      });
+
+      child.on('exit', (code) => {
+        if (code && code !== 0) {
+          console.error(`[cron-run] '${jobName}' exited with code ${code}: ${stderr.slice(0, 200)}`);
+        }
+      });
+
       child.unref();
       res.json({ ok: true, message: `Triggered cron job: ${jobName}` });
     } catch (err) {
@@ -1146,7 +1261,7 @@ function getDashboardHTML(): string {
   :root {
     --bg-primary: #0a0e14;
     --bg-secondary: #11161d;
-    --bg-card: #151b24;
+    --bg-card: rgba(21,27,36,0.8);
     --bg-hover: #1a2230;
     --bg-input: #0d1219;
     --border: #1e2a3a;
@@ -1156,6 +1271,12 @@ function getDashboardHTML(): string {
     --text-muted: #5a6a7e;
     --accent: #4d9eff;
     --accent-glow: rgba(77, 158, 255, 0.15);
+    --purple: #7c3aed;
+    --orange: #f0883e;
+    --clementine: #ff8c21;
+    --clementine-dark: #e67a10;
+    --clementine-glow: rgba(255, 140, 33, 0.15);
+    --clementine-bg: rgba(255, 140, 33, 0.08);
     --green: #2ea043;
     --green-bg: rgba(46, 160, 67, 0.12);
     --red: #e5534b;
@@ -1165,7 +1286,7 @@ function getDashboardHTML(): string {
     --orange: #f0883e;
     --sidebar-w: 220px;
     --header-h: 56px;
-    --radius: 8px;
+    --radius: 10px;
     --radius-sm: 5px;
   }
   * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -1204,7 +1325,7 @@ function getDashboardHTML(): string {
   .logo {
     width: 28px; height: 28px;
     border-radius: 50%;
-    background: linear-gradient(135deg, var(--accent), #7c3aed);
+    background: linear-gradient(135deg, var(--clementine), #ff6b00);
     display: flex;
     align-items: center;
     justify-content: center;
@@ -1213,13 +1334,47 @@ function getDashboardHTML(): string {
     color: #fff;
     flex-shrink: 0;
   }
+  .logo.online {
+    animation: logoBreathOrange 3s ease-in-out infinite;
+  }
+  @keyframes logoBreathOrange {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(255,140,33,0); }
+    50% { box-shadow: 0 0 0 6px rgba(255,140,33,0.25); }
+  }
+  .block-wordmark {
+    display: flex;
+    flex-direction: column;
+    gap: 0;
+    line-height: 1;
+  }
+  .block-wordmark-row {
+    display: flex;
+    gap: 1px;
+    height: 3px;
+  }
+  .block-wordmark-row span {
+    display: inline-block;
+    width: 2px;
+    height: 3px;
+    background: var(--clementine);
+    border-radius: 0.5px;
+  }
+  .block-wordmark-row span.off {
+    background: transparent;
+  }
   header h1 {
     font-size: 15px;
     font-weight: 600;
     color: var(--text-primary);
     letter-spacing: -0.01em;
   }
-  header h1 span { color: var(--accent); }
+  header h1 span { color: var(--clementine); }
+  .header-subtitle {
+    font-size: 10px;
+    color: var(--text-muted);
+    font-weight: 400;
+    letter-spacing: 0.04em;
+  }
   .header-right {
     display: flex;
     align-items: center;
@@ -1263,10 +1418,10 @@ function getDashboardHTML(): string {
     margin-bottom: 20px;
   }
   .nav-section-title {
-    font-size: 10px;
+    font-size: 9px;
     font-weight: 600;
     text-transform: uppercase;
-    letter-spacing: 0.08em;
+    letter-spacing: 0.1em;
     color: var(--text-muted);
     padding: 0 12px;
     margin-bottom: 6px;
@@ -1288,8 +1443,8 @@ function getDashboardHTML(): string {
     color: var(--text-primary);
   }
   .nav-item.active {
-    background: var(--accent-glow);
-    color: var(--accent);
+    background: var(--clementine-glow);
+    color: var(--clementine);
   }
   .nav-icon {
     width: 18px;
@@ -1309,31 +1464,34 @@ function getDashboardHTML(): string {
     text-align: center;
   }
   .nav-item.active .nav-badge {
-    background: var(--accent-glow);
-    color: var(--accent);
+    background: var(--clementine-glow);
+    color: var(--clementine);
   }
 
   /* ── Content ────────────────────────────── */
   .content {
     overflow-y: auto;
-    padding: 24px;
+    padding: 28px;
   }
   .page { display: none; }
   .page.active { display: block; }
   .page-title {
-    font-size: 20px;
+    font-size: 24px;
     font-weight: 600;
     margin-bottom: 20px;
     color: var(--text-primary);
+    letter-spacing: -0.02em;
   }
 
   /* ── Cards ──────────────────────────────── */
   .card {
     background: var(--bg-card);
+    backdrop-filter: blur(8px);
     border: 1px solid var(--border);
     border-radius: var(--radius);
     margin-bottom: 16px;
     overflow: hidden;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.15);
   }
   .card-header {
     padding: 14px 18px;
@@ -1353,7 +1511,7 @@ function getDashboardHTML(): string {
   .grid-2 {
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
-    gap: 16px;
+    gap: 20px;
   }
 
   /* ── KV rows ────────────────────────────── */
@@ -1572,7 +1730,7 @@ function getDashboardHTML(): string {
     max-width: 90vw;
     max-height: 90vh;
     overflow-y: auto;
-    box-shadow: 0 20px 60px rgba(0,0,0,0.5);
+    box-shadow: 0 24px 80px rgba(0,0,0,0.6);
   }
   .modal-header {
     padding: 18px 22px;
@@ -1905,6 +2063,435 @@ function getDashboardHTML(): string {
     border-radius: 4px;
     transition: width 0.5s ease;
   }
+
+  /* ── Agent Hero Banner ──────────────────── */
+  .agent-hero {
+    background: linear-gradient(135deg, var(--clementine-bg), rgba(124,58,237,0.06));
+    border-radius: 16px;
+    padding: 32px;
+    margin-bottom: 24px;
+    position: relative;
+    overflow: hidden;
+    border: 1px solid var(--border);
+  }
+  .agent-hero::before {
+    content: '';
+    position: absolute;
+    inset: 0;
+    background: radial-gradient(ellipse at 30% 50%, rgba(255,140,33,0.06), transparent 70%);
+    animation: heroShimmer 8s ease-in-out infinite alternate;
+    pointer-events: none;
+  }
+  @keyframes heroShimmer {
+    0% { transform: translateX(-10%) scale(1); opacity: 0.5; }
+    100% { transform: translateX(10%) scale(1.1); opacity: 1; }
+  }
+  .agent-hero-top {
+    display: flex;
+    align-items: center;
+    gap: 20px;
+    position: relative;
+    z-index: 1;
+  }
+  .agent-avatar {
+    width: 72px;
+    height: 72px;
+    border-radius: 50%;
+    background: linear-gradient(135deg, var(--clementine), #ff6b00);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 28px;
+    font-weight: 800;
+    color: #fff;
+    flex-shrink: 0;
+    position: relative;
+  }
+  .agent-avatar::after {
+    content: '';
+    position: absolute;
+    inset: -4px;
+    border-radius: 50%;
+    border: 2.5px solid var(--red);
+    opacity: 0.6;
+  }
+  .agent-avatar.online::after {
+    border-color: var(--green);
+    animation: breathe 3s ease-in-out infinite;
+  }
+  @keyframes breathe {
+    0%, 100% { transform: scale(1); opacity: 0.4; }
+    50% { transform: scale(1.05); opacity: 1; }
+  }
+  .agent-info { flex: 1; }
+  .agent-name {
+    font-size: 26px;
+    font-weight: 700;
+    letter-spacing: -0.02em;
+    margin-bottom: 4px;
+    color: var(--clementine);
+  }
+  .hero-wordmark {
+    font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
+    font-size: 8px;
+    line-height: 1.1;
+    color: var(--clementine);
+    white-space: pre;
+    letter-spacing: 0;
+    margin-bottom: 8px;
+    opacity: 0.9;
+  }
+  .agent-activity {
+    font-size: 14px;
+    color: var(--text-muted);
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .agent-activity.active { color: var(--green); }
+  .agent-activity-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: currentColor;
+    animation: pulse 2s infinite;
+  }
+  .agent-channels {
+    display: flex;
+    gap: 6px;
+    margin-top: 10px;
+  }
+  .agent-channel-icon {
+    width: 28px;
+    height: 28px;
+    border-radius: 6px;
+    background: var(--bg-hover);
+    border: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 13px;
+  }
+  .agent-controls {
+    display: flex;
+    gap: 8px;
+    position: relative;
+    z-index: 1;
+  }
+  .agent-meta {
+    font-size: 12px;
+    color: var(--text-muted);
+    margin-top: 4px;
+  }
+
+  /* ── Summary Cards ──────────────────────── */
+  .summary-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 20px;
+    margin-bottom: 24px;
+  }
+  .summary-card {
+    background: var(--bg-card);
+    backdrop-filter: blur(8px);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 20px;
+    display: flex;
+    align-items: flex-start;
+    gap: 14px;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.15);
+    position: relative;
+    overflow: hidden;
+  }
+  .summary-card::before {
+    content: '';
+    position: absolute;
+    left: 0;
+    top: 0;
+    bottom: 0;
+    width: 3px;
+  }
+  .summary-card.sc-green::before { background: var(--green); }
+  .summary-card.sc-blue::before { background: var(--accent); }
+  .summary-card.sc-purple::before { background: var(--purple); }
+  .summary-card.sc-yellow::before { background: var(--yellow); }
+  .summary-card-icon {
+    width: 40px;
+    height: 40px;
+    border-radius: 10px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 18px;
+    flex-shrink: 0;
+  }
+  .sc-green .summary-card-icon { background: var(--green-bg); }
+  .sc-blue .summary-card-icon { background: var(--accent-glow); }
+  .sc-purple .summary-card-icon { background: rgba(124,58,237,0.12); }
+  .sc-yellow .summary-card-icon { background: var(--yellow-bg); }
+  .summary-card-value {
+    font-size: 28px;
+    font-weight: 700;
+    line-height: 1;
+    margin-bottom: 2px;
+  }
+  .summary-card-label {
+    font-size: 12px;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+  .summary-card-sub {
+    font-size: 11px;
+    color: var(--text-muted);
+    margin-top: 4px;
+  }
+
+  /* ── Timeline ───────────────────────────── */
+  .timeline {
+    position: relative;
+    padding-left: 24px;
+  }
+  .timeline::before {
+    content: '';
+    position: absolute;
+    left: 7px;
+    top: 4px;
+    bottom: 4px;
+    width: 2px;
+    background: var(--border);
+  }
+  .timeline-item {
+    position: relative;
+    padding: 8px 0;
+    font-size: 12px;
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+  }
+  .timeline-item::before {
+    content: '';
+    position: absolute;
+    left: -20px;
+    top: 14px;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--text-muted);
+    border: 2px solid var(--bg-primary);
+    z-index: 1;
+  }
+  .timeline-item.ok::before { background: var(--green); }
+  .timeline-item.error::before { background: var(--red); }
+  .timeline-msg { flex: 1; color: var(--text-primary); line-height: 1.4; }
+  .timeline-time { flex-shrink: 0; color: var(--text-muted); font-size: 11px; }
+
+  /* ── Task Cards ─────────────────────────── */
+  .task-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+    gap: 16px;
+  }
+  .task-card {
+    background: var(--bg-card);
+    backdrop-filter: blur(8px);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 20px;
+    border-left: 3px solid var(--green);
+    box-shadow: 0 2px 8px rgba(0,0,0,0.15);
+    transition: border-color 0.2s, opacity 0.2s;
+  }
+  .task-card.disabled {
+    opacity: 0.5;
+    border-left-color: var(--text-muted);
+  }
+  .task-card.disabled:hover { opacity: 0.75; }
+  .task-card.running {
+    border-left-color: var(--accent);
+    animation: taskPulse 2s ease-in-out infinite;
+  }
+  @keyframes taskPulse {
+    0%, 100% { box-shadow: 0 2px 8px rgba(0,0,0,0.15); }
+    50% { box-shadow: 0 2px 16px rgba(77,158,255,0.2); }
+  }
+  .task-card-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 12px;
+  }
+  .task-card-header strong {
+    font-size: 14px;
+    font-weight: 600;
+  }
+  .task-card-schedule {
+    font-size: 12px;
+    color: var(--text-secondary);
+    margin-bottom: 8px;
+  }
+  .task-card-schedule code {
+    font-size: 10px;
+    color: var(--text-muted);
+  }
+  .task-card-prompt {
+    font-size: 11px;
+    color: var(--text-muted);
+    margin-bottom: 12px;
+    line-height: 1.4;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+  }
+  .task-card-status {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 14px;
+    font-size: 12px;
+  }
+  .task-card-badges {
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+    margin-bottom: 14px;
+  }
+  .task-card-actions {
+    display: flex;
+    gap: 8px;
+    border-top: 1px solid var(--border);
+    padding-top: 12px;
+  }
+  .task-card-add {
+    background: transparent;
+    border: 2px dashed var(--border-light);
+    border-radius: var(--radius);
+    padding: 40px 20px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    color: var(--text-muted);
+    font-size: 14px;
+    transition: border-color 0.2s, color 0.2s;
+  }
+  .task-card-add:hover {
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+
+  /* ── Session Cards ──────────────────────── */
+  .session-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+    gap: 16px;
+  }
+  .session-card {
+    background: var(--bg-card);
+    backdrop-filter: blur(8px);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 18px;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.15);
+  }
+  .session-card-header {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 10px;
+  }
+  .session-card-icon {
+    font-size: 20px;
+  }
+  .session-card-name {
+    font-size: 14px;
+    font-weight: 600;
+    flex: 1;
+  }
+  .session-card-exchanges {
+    font-size: 28px;
+    font-weight: 700;
+    color: var(--accent);
+  }
+  .session-card-meta {
+    font-size: 11px;
+    color: var(--text-muted);
+    margin-top: 6px;
+  }
+  .session-card-actions {
+    margin-top: 10px;
+    text-align: right;
+  }
+
+  /* ── Header activity text ───────────────── */
+  .header-activity {
+    font-size: 12px;
+    color: var(--text-muted);
+    max-width: 300px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .header-activity.active { color: var(--clementine); }
+
+  /* logoBreath moved to header .logo.online above */
+
+  /* ── Sidebar active gradient bar ────────── */
+  .nav-item.active {
+    position: relative;
+  }
+  .nav-item.active::before {
+    content: '';
+    position: absolute;
+    left: -12px;
+    top: 4px;
+    bottom: 4px;
+    width: 3px;
+    border-radius: 2px;
+    background: linear-gradient(180deg, var(--clementine), var(--clementine-dark));
+  }
+
+  /* ── Chat polish ────────────────────────── */
+  @keyframes msgFadeIn {
+    from { opacity: 0; transform: translateY(8px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+  .chat-bubble { animation: msgFadeIn 0.3s ease; }
+  .chat-assistant-row {
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+  }
+  .chat-avatar-sm {
+    width: 28px;
+    height: 28px;
+    border-radius: 50%;
+    background: linear-gradient(135deg, var(--clementine), #ff6b00);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 12px;
+    font-weight: 700;
+    color: #fff;
+    flex-shrink: 0;
+    margin-top: 2px;
+  }
+  #page-chat.active {
+    display: flex !important;
+    flex-direction: column;
+    height: calc(100vh - var(--header-h));
+  }
+  .quick-pill {
+    border-radius: 20px !important;
+    padding: 6px 16px !important;
+  }
+  .quick-pill:hover {
+    background: var(--accent) !important;
+    color: #fff !important;
+    border-color: var(--accent) !important;
+  }
 </style>
 </head>
 <body>
@@ -1912,15 +2499,18 @@ function getDashboardHTML(): string {
   <!-- Header -->
   <header>
     <div class="header-left">
-      <div class="logo">${name.charAt(0).toUpperCase()}</div>
-      <h1><span>${name}</span> Command Center</h1>
+      <div class="logo" id="header-logo">${name.charAt(0).toUpperCase()}</div>
+      <div>
+        <h1><span>${name}</span> Command Center</h1>
+        <div class="header-subtitle">Personal AI Assistant</div>
+      </div>
+      <span class="header-activity" id="header-activity"></span>
     </div>
     <div class="header-right">
       <div class="status-pill" id="header-status">
         <div class="pulse-dot"></div>
         <span>Loading...</span>
       </div>
-      <div class="header-meta" id="last-update"></div>
     </div>
   </header>
 
@@ -1982,16 +2572,31 @@ function getDashboardHTML(): string {
 
     <!-- ═══ Overview Page ═══ -->
     <div class="page active" id="page-overview">
-      <div class="page-title">Dashboard</div>
-      <div class="stat-grid" id="stat-tiles"></div>
+      <div class="agent-hero" id="agent-hero">
+        <div class="agent-hero-top">
+          <div class="agent-avatar" id="agent-avatar">${name.charAt(0).toUpperCase()}</div>
+          <div class="agent-info">
+            <div class="hero-wordmark" id="hero-wordmark"></div>
+            <div class="agent-name">${name}</div>
+            <div class="agent-activity" id="agent-activity">
+              <span class="agent-activity-dot"></span>
+              <span>Loading...</span>
+            </div>
+            <div class="agent-meta" id="agent-meta"></div>
+            <div class="agent-channels" id="agent-channels"></div>
+          </div>
+          <div class="agent-controls" id="hero-controls"></div>
+        </div>
+      </div>
+      <div class="summary-grid" id="summary-cards"></div>
       <div class="grid-2">
         <div class="card">
-          <div class="card-header">Daemon Status</div>
-          <div class="card-body" id="panel-status"><div class="empty-state">Loading...</div></div>
+          <div class="card-header">Live Activity</div>
+          <div class="card-body" id="panel-activity"><div class="empty-state">Loading...</div></div>
         </div>
         <div class="card">
-          <div class="card-header">Recent Activity</div>
-          <div class="card-body" id="panel-activity"><div class="empty-state">Loading...</div></div>
+          <div class="card-header">Quick Controls</div>
+          <div class="card-body" id="panel-controls"><div class="empty-state">Loading...</div></div>
         </div>
       </div>
     </div>
@@ -2007,11 +2612,8 @@ function getDashboardHTML(): string {
     <div class="page" id="page-cron">
       <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:20px">
         <div class="page-title" style="margin-bottom:0">Scheduled Tasks</div>
-        <button class="btn-primary" onclick="openCreateCronModal()">+ New Task</button>
       </div>
-      <div class="card">
-        <div class="card-body" id="panel-cron" style="padding:0"><div class="empty-state">Loading...</div></div>
-      </div>
+      <div id="panel-cron"><div class="empty-state">Loading...</div></div>
     </div>
 
     <!-- ═══ Timers Page ═══ -->
@@ -2025,9 +2627,7 @@ function getDashboardHTML(): string {
     <!-- ═══ Sessions Page ═══ -->
     <div class="page" id="page-sessions">
       <div class="page-title">Active Sessions</div>
-      <div class="card">
-        <div class="card-body" id="panel-sessions"><div class="empty-state">Loading...</div></div>
-      </div>
+      <div id="panel-sessions"><div class="empty-state">Loading...</div></div>
     </div>
 
     <!-- ═══ Memory Page ═══ -->
@@ -2062,23 +2662,20 @@ function getDashboardHTML(): string {
 
     <!-- ═══ Chat Page ═══ -->
     <div class="page" id="page-chat">
-      <div class="page-title">Chat with ${name}</div>
-      <div class="card" style="height:calc(100vh - 180px);display:flex;flex-direction:column">
-        <div class="card-body" id="chat-messages" style="flex:1;overflow-y:auto;padding:16px">
-          <div class="empty-state">
-            <p style="margin-bottom:14px;color:var(--text-muted)">Send a message to start a conversation.</p>
-            <div style="display:flex;flex-wrap:wrap;gap:8px;justify-content:center">
-              <button class="btn btn-sm" onclick="quickChat('What\\'s on my schedule?')">What's on my schedule?</button>
-              <button class="btn btn-sm" onclick="quickChat('Check my email')">Check my email</button>
-              <button class="btn btn-sm" onclick="quickChat('Run morning briefing')">Run morning briefing</button>
-              <button class="btn btn-sm" onclick="quickChat('What did you do today?')">What did you do today?</button>
-            </div>
+      <div id="chat-messages" style="flex:1;overflow-y:auto;padding:16px">
+        <div class="empty-state">
+          <p style="margin-bottom:14px;color:var(--text-muted)">Send a message to start a conversation.</p>
+          <div style="display:flex;flex-wrap:wrap;gap:8px;justify-content:center">
+            <button class="btn btn-sm quick-pill" onclick="quickChat('What\\'s on my schedule?')">What's on my schedule?</button>
+            <button class="btn btn-sm quick-pill" onclick="quickChat('Check my email')">Check my email</button>
+            <button class="btn btn-sm quick-pill" onclick="quickChat('Run morning briefing')">Run morning briefing</button>
+            <button class="btn btn-sm quick-pill" onclick="quickChat('What did you do today?')">What did you do today?</button>
           </div>
         </div>
-        <div style="border-top:1px solid var(--border);padding:14px;display:flex;gap:10px">
-          <input type="text" id="chat-input" placeholder="Type a message..." style="flex:1" onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendChat()}">
-          <button class="btn-primary" id="chat-send-btn" onclick="sendChat()">Send</button>
-        </div>
+      </div>
+      <div style="border-top:1px solid var(--border);padding:14px;display:flex;gap:10px">
+        <input type="text" id="chat-input" placeholder="Type a message..." style="flex:1" onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendChat()}">
+        <button class="btn-primary" id="chat-send-btn" onclick="sendChat()">Send</button>
       </div>
     </div>
 
@@ -2291,6 +2888,33 @@ function getDashboardHTML(): string {
 <div class="toast-container" id="toasts"></div>
 
 <script>
+// ── Block-letter wordmark (matches terminal banner) ──
+(function() {
+  var FONT = {
+    C: [' ####','##   ','##   ','##   ',' ####'],
+    L: ['##   ','##   ','##   ','##   ','#####'],
+    E: ['#####','##   ','#### ','##   ','#####'],
+    M: ['##   ##','### ###','## # ##','##   ##','##   ##'],
+    N: ['##  ##','### ##','######','## ###','##  ##'],
+    T: ['######','  ##  ','  ##  ','  ##  ','  ##  '],
+    I: ['##','##','##','##','##']
+  };
+  var word = 'CLEMENTINE';
+  var rows = [];
+  for (var r = 0; r < 5; r++) {
+    var line = '';
+    for (var ci = 0; ci < word.length; ci++) {
+      var ch = word[ci];
+      if (line) line += ' ';
+      var glyphs = FONT[ch];
+      line += glyphs ? glyphs[r] : ch;
+    }
+    rows.push(line);
+  }
+  var el = document.getElementById('hero-wordmark');
+  if (el) el.textContent = rows.join(String.fromCharCode(10));
+})();
+
 // ── Utilities ─────────────────────────────
 function esc(s) {
   const d = document.createElement('div');
@@ -2381,38 +3005,117 @@ async function refreshStatus() {
     pill.className = 'status-pill ' + (d.alive ? 'online' : 'offline');
     pill.innerHTML = '<div class="pulse-dot"></div><span>' + (d.alive ? 'Online' : 'Offline') + '</span>';
 
-    // Stat tiles with colored left borders
-    const tiles = document.getElementById('stat-tiles');
-    tiles.innerHTML =
-      statTile(d.alive ? '<span style="color:var(--green)">Online</span>' : '<span style="color:var(--red)">Offline</span>', 'Daemon', 'var(--green)')
-      + statTile(esc(d.uptime || '--'), 'Uptime', 'var(--accent)')
-      + statTile((d.channels ? d.channels.length : 0), 'Channels', 'var(--green)')
-      + '<div class="stat-tile" style="border-left:3px solid var(--yellow)"><div class="stat-value" id="stat-cron-count">--</div><div class="stat-label">Scheduled Tasks</div></div>';
+    // Header logo breathing
+    const logo = document.getElementById('header-logo');
+    if (d.alive) logo.classList.add('online');
+    else logo.classList.remove('online');
 
-    // Status card with controls and LaunchAgent merged in
-    let html = '';
-    html += kv('Status', '<span class="badge ' + (d.alive ? 'badge-green' : 'badge-red') + '"><span class="badge-dot"></span>' + (d.alive ? 'Running' : 'Stopped') + '</span>');
-    if (d.pid) html += kv('PID', d.pid);
-    if (d.uptime) html += kv('Uptime', d.uptime);
+    // Header activity text
+    var actName = d.name || 'Clementine';
+    var actText = d.currentActivity || 'Idle';
+    var headerAct = document.getElementById('header-activity');
+    if (actText !== 'Idle') {
+      headerAct.textContent = actName + ' is ' + actText.toLowerCase() + '...';
+      headerAct.className = 'header-activity active';
+    } else {
+      headerAct.textContent = actName + ' is idle';
+      headerAct.className = 'header-activity';
+    }
+
+    // Agent hero avatar
+    var avatar = document.getElementById('agent-avatar');
+    if (d.alive) avatar.classList.add('online');
+    else avatar.classList.remove('online');
+
+    // Agent activity
+    var agentAct = document.getElementById('agent-activity');
+    if (actText !== 'Idle') {
+      agentAct.className = 'agent-activity active';
+      agentAct.innerHTML = '<span class="agent-activity-dot"></span><span>' + esc(actText) + '</span>';
+    } else {
+      agentAct.className = 'agent-activity';
+      agentAct.innerHTML = '<span>' + (d.alive ? 'Online — standing by' : 'Offline') + '</span>';
+    }
+
+    // Agent meta (uptime)
+    var meta = document.getElementById('agent-meta');
+    var metaParts = [];
+    if (d.uptime) metaParts.push('Uptime: ' + d.uptime);
+    if (d.pid) metaParts.push('PID ' + d.pid);
+    if (d.launchAgent) metaParts.push('LaunchAgent: ' + d.launchAgent);
+    meta.textContent = metaParts.join(' · ');
+
+    // Channel icons
+    var channelIcons = { Discord: '&#128172;', Slack: '&#128488;', Telegram: '&#9992;', WhatsApp: '&#128241;', Webhook: '&#128279;' };
+    var channelsEl = document.getElementById('agent-channels');
     if (d.channels && d.channels.length > 0) {
-      html += kv('Channels', d.channels.map(c => '<span class="badge badge-accent">' + esc(c) + '</span> ').join(''));
+      channelsEl.innerHTML = d.channels.map(function(c) {
+        return '<div class="agent-channel-icon" title="' + esc(c) + '">' + (channelIcons[c] || '&#128279;') + '</div>';
+      }).join('');
+    } else {
+      channelsEl.innerHTML = '';
     }
-    // Merge LaunchAgent info into status card
-    if (d.launchAgent) {
-      const laBadge = d.launchAgent === 'loaded' ? 'badge-green' : d.launchAgent === 'installed' ? 'badge-yellow' : 'badge-gray';
-      html += kv('LaunchAgent', '<span class="badge ' + laBadge + '">' + esc(d.launchAgent) + '</span>');
-    }
-    // Daemon controls inside the status card
-    html += '<div style="margin-top:12px;display:flex;gap:8px">';
+
+    // Hero controls
+    var controls = document.getElementById('hero-controls');
     if (d.alive) {
-      html += '<button class="btn-success btn-sm" onclick="apiPost(\\'/api/restart\\')">Restart</button>'
+      controls.innerHTML = '<button class="btn-success btn-sm" onclick="apiPost(\\'/api/restart\\')">Restart</button>'
         + '<button class="btn-danger btn-sm" onclick="apiPost(\\'/api/stop\\')">Stop</button>';
     } else {
-      html += '<button class="btn-primary btn-sm" onclick="apiPost(\\'/api/launch\\')">Start Daemon</button>';
+      controls.innerHTML = '<button class="btn-primary btn-sm" onclick="apiPost(\\'/api/launch\\')">Start Daemon</button>';
     }
-    html += '</div>';
-    document.getElementById('panel-status').innerHTML = html;
+
+    // Summary cards — fetch metrics when on overview
+    if (currentPage === 'overview') {
+      try {
+        var mr = await fetch('/api/metrics');
+        var md = await mr.json();
+        var hours = md.timeSaved ? md.timeSaved.estimatedHours || 0 : 0;
+        var mins = md.timeSaved ? md.timeSaved.estimatedMinutes || 0 : 0;
+        var timeDisplay = hours >= 1 ? hours + 'h' : mins + 'm';
+        var runsToday = d.runsToday || 0;
+        var totalExchanges = md.sessions ? md.sessions.totalExchanges || 0 : 0;
+        var nextTask = d.nextTaskName || '—';
+
+        var cards = document.getElementById('summary-cards');
+        cards.innerHTML = summaryCard('sc-green', '&#9200;', runsToday, 'Tasks Today', d.alive ? 'Agent running' : 'Agent offline')
+          + summaryCard('sc-blue', '&#9201;', timeDisplay, 'Time Saved', hours >= 1 ? Math.round(mins) + ' total min' : '')
+          + summaryCard('sc-purple', '&#128172;', totalExchanges, 'Messages', md.sessions ? md.sessions.activeSessions + ' sessions' : '')
+          + summaryCard('sc-yellow', '&#9654;', nextTask, 'Next Task', 'First enabled job');
+      } catch(me) { /* metrics optional */ }
+    }
+
+    // Quick controls panel
+    var controlHtml = '';
+    controlHtml += kv('Status', '<span class="badge ' + (d.alive ? 'badge-green' : 'badge-red') + '"><span class="badge-dot"></span>' + (d.alive ? 'Running' : 'Stopped') + '</span>');
+    if (d.channels && d.channels.length > 0) {
+      controlHtml += kv('Channels', d.channels.map(function(c) { return '<span class="badge badge-accent">' + esc(c) + '</span> '; }).join(''));
+    }
+    if (d.launchAgent) {
+      var laBadge = d.launchAgent === 'loaded' ? 'badge-green' : d.launchAgent === 'installed' ? 'badge-yellow' : 'badge-gray';
+      controlHtml += kv('LaunchAgent', '<span class="badge ' + laBadge + '">' + esc(d.launchAgent) + '</span>');
+    }
+    if (d.runsToday != null) controlHtml += kv('Runs Today', d.runsToday);
+    controlHtml += '<div style="margin-top:12px;display:flex;gap:8px">';
+    if (d.alive) {
+      controlHtml += '<button class="btn-success btn-sm" onclick="apiPost(\\'/api/restart\\')">Restart</button>'
+        + '<button class="btn-danger btn-sm" onclick="apiPost(\\'/api/stop\\')">Stop</button>';
+    } else {
+      controlHtml += '<button class="btn-primary btn-sm" onclick="apiPost(\\'/api/launch\\')">Start Daemon</button>';
+    }
+    controlHtml += '</div>';
+    var controlsPanel = document.getElementById('panel-controls');
+    if (controlsPanel) controlsPanel.innerHTML = controlHtml;
   } catch(e) { }
+}
+
+function summaryCard(cls, icon, value, label, sub) {
+  return '<div class="summary-card ' + cls + '">'
+    + '<div class="summary-card-icon">' + icon + '</div>'
+    + '<div><div class="summary-card-value">' + esc(String(value)) + '</div>'
+    + '<div class="summary-card-label">' + esc(label) + '</div>'
+    + (sub ? '<div class="summary-card-sub">' + esc(sub) + '</div>' : '')
+    + '</div></div>';
 }
 
 function kv(key, val) {
@@ -2430,16 +3133,24 @@ async function refreshSessions() {
       document.getElementById('panel-sessions').innerHTML = '<div class="empty-state">No active sessions</div>';
       return;
     }
-    let html = '<table><tr><th>Session</th><th>Exchanges</th><th>Last Active</th><th style="width:80px"></th></tr>';
+    let html = '<div class="session-grid">';
     for (const key of keys) {
-      const s = d[key];
-      const friendly = friendlySession(key);
-      html += '<tr><td>' + friendly.icon + ' ' + esc(friendly.label) + '<br><code style="font-size:10px;color:var(--text-muted)">' + esc(key) + '</code></td>'
-        + '<td>' + esc(s.exchanges || 0) + '</td>'
-        + '<td>' + esc(timeAgo(s.timestamp)) + '</td>'
-        + '<td><button class="btn-danger btn-sm" onclick="if(confirm(\\'Clear session ' + esc(key).replace(/'/g, '') + '?\\'))apiPost(\\'/api/sessions/' + encodeURIComponent(key) + '/clear\\')">Clear</button></td></tr>';
+      var s = d[key];
+      var friendly = friendlySession(key);
+      var safeKey = esc(key).replace(/'/g, '');
+      html += '<div class="session-card">'
+        + '<div class="session-card-header">'
+        + '<span class="session-card-icon">' + friendly.icon + '</span>'
+        + '<span class="session-card-name">' + esc(friendly.label) + '</span>'
+        + '<span class="session-card-exchanges">' + (s.exchanges || 0) + '</span>'
+        + '</div>'
+        + '<div class="session-card-meta">Last active: ' + timeAgo(s.timestamp) + '</div>'
+        + '<div class="session-card-meta" style="font-family:monospace;font-size:10px">' + esc(key) + '</div>'
+        + '<div class="session-card-actions">'
+        + '<button class="btn-danger btn-sm" onclick="if(confirm(\\'Clear session ' + safeKey + '?\\'))apiPost(\\'/api/sessions/' + encodeURIComponent(key) + '/clear\\')">Clear</button>'
+        + '</div></div>';
     }
-    html += '</table>';
+    html += '</div>';
     document.getElementById('panel-sessions').innerHTML = html;
   } catch(e) { }
 }
@@ -2452,70 +3163,78 @@ async function refreshCron() {
     const d = await r.json();
     cronJobsData = d.jobs || [];
     document.getElementById('nav-cron-count').textContent = cronJobsData.length;
-    const statEl = document.getElementById('stat-cron-count');
-    if (statEl) statEl.textContent = cronJobsData.length;
 
     if (cronJobsData.length === 0) {
-      document.getElementById('panel-cron').innerHTML = '<div class="empty-state" style="padding:40px">No scheduled tasks yet. Click "+ New Task" to create one.</div>';
+      document.getElementById('panel-cron').innerHTML = '<div class="task-grid"><div class="task-card-add" onclick="openCreateCronModal()">+ New Task</div></div>';
       return;
     }
-    let html = '<table><tr><th>Task</th><th>Schedule</th><th>Project</th><th>Status</th><th>Last Run</th><th style="width:180px">Actions</th></tr>';
+    let html = '<div class="task-grid">';
     for (const job of cronJobsData) {
-      const enabled = job.enabled !== false;
-      const statusBadge = enabled
-        ? '<span class="badge badge-green"><span class="badge-dot"></span>Enabled</span>'
-        : '<span class="badge badge-gray"><span class="badge-dot"></span>Disabled</span>';
-      let lastRun = '<span style="color:var(--text-muted)">never</span>';
-      if (job.recentRuns && job.recentRuns.length > 0) {
-        const lr = job.recentRuns[0];
-        const statusCls = lr.status === 'ok' ? 'badge-green' : 'badge-red';
-        lastRun = esc(timeAgo(lr.finishedAt)) + ' <span class="badge ' + statusCls + '">' + esc(lr.status) + '</span>';
+      var enabled = job.enabled !== false;
+      var cardCls = 'task-card' + (enabled ? '' : ' disabled');
+      // Check if running
+      if (job.recentRuns && job.recentRuns.length > 0 && job.recentRuns[0].startedAt && !job.recentRuns[0].finishedAt) {
+        cardCls += ' running';
       }
-      const projectName = job.work_dir ? job.work_dir.split('/').pop() : '';
-      const projectBadge = projectName
-        ? '<span class="badge badge-blue">' + esc(projectName) + '</span>'
-        : '<span style="color:var(--text-muted)">—</span>';
-      const modeBadge = job.mode === 'unleashed'
-        ? ' <span class="badge badge-purple">unleashed</span>'
-        : '';
-      const desc = describeCron(job.schedule || '');
-      const schedHtml = desc
-        ? esc(desc) + '<br><code style="font-size:10px;color:var(--text-muted)">' + esc(job.schedule) + '</code>'
+      var desc = describeCron(job.schedule || '');
+      var schedHtml = desc
+        ? esc(desc) + ' <code>' + esc(job.schedule) + '</code>'
         : '<code style="color:var(--accent)">' + esc(job.schedule) + '</code>';
-      html += '<tr' + (enabled ? '' : ' class="row-disabled"') + '>'
-        + '<td><strong>' + esc(job.name) + '</strong>' + modeBadge + '<br><span style="font-size:11px;color:var(--text-muted)">' + esc((job.prompt || '').slice(0, 60)) + (job.prompt && job.prompt.length > 60 ? '...' : '') + '</span></td>'
-        + '<td>' + schedHtml + '</td>'
-        + '<td>' + projectBadge + '</td>'
-        + '<td>' + statusBadge + '</td>'
-        + '<td>' + lastRun + '</td>'
-        + '<td><div class="btn-group">'
-        + '<button class="btn-sm btn-success" onclick="apiPost(\\'/api/cron/run/' + encodeURIComponent(job.name) + '\\')">Run</button>'
-        + '<button class="btn-sm" onclick="openEditCronModal(\\'' + esc(job.name) + '\\')">Edit</button>'
-        + '<button class="btn-sm" onclick="apiPost(\\'/api/cron/' + encodeURIComponent(job.name) + '/toggle\\')">' + (enabled ? 'Disable' : 'Enable') + '</button>'
-        + '<button class="btn-sm btn-danger" onclick="confirmDeleteCron(\\'' + esc(job.name) + '\\')">Del</button>'
-        + '</div></td></tr>';
+
+      var lastRunHtml = '<span style="color:var(--text-muted)">Never run</span>';
+      if (job.recentRuns && job.recentRuns.length > 0) {
+        var lr = job.recentRuns[0];
+        var statusIcon = lr.status === 'ok' ? '<span style="color:var(--green)">&#10003;</span>' : '<span style="color:var(--red)">&#10007;</span>';
+        lastRunHtml = statusIcon + ' ' + esc(lr.status) + ' · ' + timeAgo(lr.finishedAt || lr.startedAt);
+      }
+
+      var badgesHtml = '';
+      var projectName = job.work_dir ? job.work_dir.split('/').pop() : '';
+      if (projectName) badgesHtml += '<span class="badge badge-blue">' + esc(projectName) + '</span>';
+      if (job.mode === 'unleashed') badgesHtml += '<span class="badge badge-purple">unleashed</span>';
+      badgesHtml += '<span class="badge ' + (enabled ? 'badge-green' : 'badge-gray') + '">' + (enabled ? 'Enabled' : 'Disabled') + '</span>';
+
+      var safeName = esc(job.name).replace(/'/g, '');
+
+      html += '<div class="' + cardCls + '">'
+        + '<div class="task-card-header">'
+        + '<strong>' + esc(job.name) + '</strong>'
+        + '<div class="toggle' + (enabled ? ' on' : '') + '" onclick="apiPost(\\'/api/cron/' + encodeURIComponent(job.name) + '/toggle\\')"></div>'
+        + '</div>'
+        + '<div class="task-card-schedule">' + schedHtml + '</div>'
+        + '<div class="task-card-prompt">' + esc(job.prompt || '') + '</div>'
+        + '<div class="task-card-status">' + lastRunHtml + '</div>'
+        + '<div class="task-card-badges">' + badgesHtml + '</div>'
+        + '<div class="task-card-actions">'
+        + '<button class="btn-sm btn-success" onclick="apiPost(\\'/api/cron/run/' + encodeURIComponent(job.name) + '\\')">Run Now</button>'
+        + '<button class="btn-sm" onclick="openEditCronModal(\\'' + safeName + '\\')">Edit</button>'
+        + '<button class="btn-sm btn-danger" onclick="confirmDeleteCron(\\'' + safeName + '\\')">Del</button>'
+        + '</div></div>';
     }
-    html += '</table>';
+    // Add "new task" card
+    html += '<div class="task-card-add" onclick="openCreateCronModal()">+ New Task</div>';
+    html += '</div>';
 
     // Fetch unleashed task status and append if any exist
     try {
-      const ur = await fetch('/api/unleashed');
-      const ud = await ur.json();
-      const tasks = ud.tasks || [];
+      var ur = await fetch('/api/unleashed');
+      var ud = await ur.json();
+      var tasks = ud.tasks || [];
       if (tasks.length > 0) {
         html += '<h3 style="margin:24px 0 12px;font-size:14px;color:var(--text-secondary)">Unleashed Tasks</h3>';
         html += '<table><tr><th>Task</th><th>Status</th><th>Phase</th><th>Duration</th><th style="width:80px"></th></tr>';
-        for (const t of tasks) {
-          const statusColors = { running: 'badge-blue', completed: 'badge-green', cancelled: 'badge-gray', timeout: 'badge-yellow', error: 'badge-red', max_phases: 'badge-yellow' };
-          const cls = statusColors[t.status] || 'badge-gray';
-          const badge = '<span class="badge ' + cls + '">' + esc(t.status) + '</span>';
-          let duration = '';
+        for (var ti = 0; ti < tasks.length; ti++) {
+          var t = tasks[ti];
+          var statusColors = { running: 'badge-blue', completed: 'badge-green', cancelled: 'badge-gray', timeout: 'badge-yellow', error: 'badge-red', max_phases: 'badge-yellow' };
+          var cls = statusColors[t.status] || 'badge-gray';
+          var badge = '<span class="badge ' + cls + '">' + esc(t.status) + '</span>';
+          var duration = '';
           if (t.startedAt) {
-            const endTime = t.finishedAt ? new Date(t.finishedAt).getTime() : Date.now();
-            const mins = Math.round((endTime - new Date(t.startedAt).getTime()) / 60000);
+            var endTime = t.finishedAt ? new Date(t.finishedAt).getTime() : Date.now();
+            var mins = Math.round((endTime - new Date(t.startedAt).getTime()) / 60000);
             duration = mins < 60 ? mins + 'm' : Math.floor(mins/60) + 'h ' + (mins%60) + 'm';
           }
-          const cancelBtn = t.status === 'running'
+          var cancelBtn = t.status === 'running'
             ? '<button class="btn-sm btn-danger" onclick="cancelUnleashed(\\'' + esc(t.jobName) + '\\')">Cancel</button>'
             : '';
           html += '<tr>'
@@ -2530,7 +3249,7 @@ async function refreshCron() {
         }
         html += '</table>';
       }
-    } catch(e) { /* unleashed status is optional */ }
+    } catch(ue) { /* unleashed status is optional */ }
 
     document.getElementById('panel-cron').innerHTML = html;
   } catch(e) { }
@@ -2991,19 +3710,15 @@ async function refreshActivity() {
       document.getElementById('panel-activity').innerHTML = '<div class="empty-state">No recent activity</div>';
       return;
     }
-    const icons = { cron: '&#9200;', chat: '&#128172;', system: '&#9881;' };
-    let html = '';
+    let html = '<div class="timeline">';
     for (const a of activities) {
-      const icon = icons[a.type] || '&#9679;';
-      const statusDot = a.status === 'ok' ? '<span style="color:var(--green)">&#9679;</span> '
-        : a.status === 'error' ? '<span style="color:var(--red)">&#9679;</span> '
-        : '';
-      html += '<div class="activity-item">'
-        + '<span class="activity-icon">' + icon + '</span>'
-        + '<span class="activity-msg">' + statusDot + esc(a.message) + '</span>'
-        + '<span class="activity-time">' + timeAgo(a.time) + '</span>'
+      var statusCls = a.status === 'ok' ? 'ok' : a.status === 'error' ? 'error' : '';
+      html += '<div class="timeline-item ' + statusCls + '">'
+        + '<span class="timeline-msg">' + esc(a.message) + '</span>'
+        + '<span class="timeline-time">' + timeAgo(a.time) + '</span>'
         + '</div>';
     }
+    html += '</div>';
     document.getElementById('panel-activity').innerHTML = html;
   } catch(e) { }
 }
@@ -3199,14 +3914,21 @@ async function sendChat() {
 
     typing.remove();
 
-    const asstBubble = document.createElement('div');
+    var asstRow = document.createElement('div');
+    asstRow.className = 'chat-assistant-row';
+    var chatAv = document.createElement('div');
+    chatAv.className = 'chat-avatar-sm';
+    chatAv.innerHTML = (lastStatusData.name || 'C').charAt(0).toUpperCase();
+    asstRow.appendChild(chatAv);
+    var asstBubble = document.createElement('div');
     asstBubble.className = 'chat-bubble assistant';
     asstBubble.innerHTML = renderMd(d.response || d.error || 'No response');
-    const asstMeta = document.createElement('div');
+    var asstMeta = document.createElement('div');
     asstMeta.className = 'chat-meta';
     asstMeta.textContent = new Date().toLocaleTimeString();
     asstBubble.appendChild(asstMeta);
-    container.appendChild(asstBubble);
+    asstRow.appendChild(asstBubble);
+    container.appendChild(asstRow);
   } catch(e) {
     typing.remove();
     const errBubble = document.createElement('div');
@@ -3344,14 +4066,24 @@ function formatMs(ms) {
 
 // ── Version check for auto-reload ─────────
 let _loadedHash = null;
+let _restartBannerShown = false;
 async function checkVersion() {
   try {
-    const r = await fetch('/api/version');
-    const d = await r.json();
-    if (!_loadedHash) { _loadedHash = d.hash; return; }
-    if (d.hash !== _loadedHash) {
+    var r = await fetch('/api/version');
+    var d = await r.json();
+    if (!_loadedHash) { _loadedHash = d.started; return; }
+    // If the server detects its own code is stale, show a persistent banner
+    if (d.needsRestart && !_restartBannerShown) {
+      _restartBannerShown = true;
+      var banner = document.createElement('div');
+      banner.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:999;background:var(--clementine);color:#fff;text-align:center;padding:8px 16px;font-size:13px;font-weight:600;';
+      banner.innerHTML = 'A new version is available. Restart the dashboard to apply updates: <code style="background:rgba(0,0,0,0.2);padding:2px 8px;border-radius:4px;margin-left:8px">clementine dashboard</code>';
+      document.body.appendChild(banner);
+    }
+    // Also handle live-reload for same-process changes (e.g. git pull without rebuild)
+    if (d.hash !== _loadedHash && !d.needsRestart) {
       toast('Dashboard updated — reloading...', 'success');
-      setTimeout(() => location.reload(), 2000);
+      setTimeout(function() { location.reload(); }, 2000);
     }
   } catch { /* ignore */ }
 }
@@ -3368,7 +4100,6 @@ function refreshAll() {
   if (currentPage === 'logs') refreshLogs();
   if (currentPage === 'metrics') refreshMetrics();
   checkVersion();
-  document.getElementById('last-update').textContent = new Date().toLocaleTimeString();
 }
 
 refreshAll();

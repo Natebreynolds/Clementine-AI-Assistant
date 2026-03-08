@@ -114,6 +114,9 @@ export async function cmdCronRun(jobName: string): Promise<void> {
     });
 
     console.log(response || '(no output)');
+    if (response && response !== '__NOTHING__') {
+      console.log('\n(Note: Standalone runner — output not delivered to channels. Use the daemon for channel delivery.)');
+    }
   } catch (err) {
     const finishedAt = new Date();
     runLog.append({
