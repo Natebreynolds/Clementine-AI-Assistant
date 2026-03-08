@@ -3464,23 +3464,36 @@ async function cancelUnleashed(jobName) {
 // ── Projects ──────────────────────────────
 let projectsData = [];
 
+var workspaceDirsList = [];
+
 async function refreshWorkspaceDirs() {
   try {
     const r = await fetch('/api/workspace-dirs');
     const d = await r.json();
-    const dirs = d.dirs || [];
+    workspaceDirsList = d.dirs || [];
     const el = document.getElementById('workspace-dirs-list');
     if (!el) return;
-    if (dirs.length === 0) {
+    if (workspaceDirsList.length === 0) {
       el.innerHTML = '<span style="color:var(--text-muted)">No custom directories configured. Projects are scanned from ~/Desktop, ~/Documents, ~/Developer, etc. by default.</span>';
+      el.onclick = null;
       return;
     }
-    el.innerHTML = dirs.map(function(dir) {
+    el.innerHTML = workspaceDirsList.map(function(dir, idx) {
       return '<div style="display:flex;align-items:center;justify-content:space-between;padding:4px 0;border-bottom:1px solid var(--border)">'
         + '<code style="font-size:12px">' + esc(dir) + '</code>'
-        + '<button class="btn-sm btn-danger" style="font-size:10px;padding:2px 8px" onclick="removeWorkspaceDir(\\'' + esc(dir).replace(/'/g, "\\\\'") + '\\')">Remove</button>'
+        + '<button class="btn-sm btn-danger" style="font-size:10px;padding:2px 8px" data-remove-ws-idx="' + idx + '">Remove</button>'
         + '</div>';
     }).join('');
+    el.onclick = function(ev) {
+      var target = ev.target;
+      while (target && target !== el) {
+        if (target.dataset && target.dataset.removeWsIdx !== undefined) {
+          removeWorkspaceDir(workspaceDirsList[parseInt(target.dataset.removeWsIdx)]);
+          return;
+        }
+        target = target.parentElement;
+      }
+    };
   } catch(e) { }
 }
 
@@ -3497,12 +3510,15 @@ function closeBrowseModal() {
   document.getElementById('browse-dir-modal').classList.remove('active');
 }
 
+var browseEntries = [];
+
 function browseDir(dirPath) {
   var url = '/api/browse-dir' + (dirPath ? '?path=' + encodeURIComponent(dirPath) : '');
   fetch(url).then(function(r) { return r.json(); }).then(function(d) {
     if (d.error) { showToast(d.error, 'error'); return; }
     browseCurrent = d.current;
     browseParent = d.parent;
+    browseEntries = d.entries;
     document.getElementById('browse-current-path').textContent = d.current;
     document.getElementById('browse-up-btn').disabled = !d.parent;
     var el = document.getElementById('browse-entries');
@@ -3510,18 +3526,35 @@ function browseDir(dirPath) {
       el.innerHTML = '<div style="padding:16px;color:var(--text-muted);text-align:center">No subdirectories</div>';
       return;
     }
-    el.innerHTML = d.entries.map(function(e) {
-      var icon = e.isProject ? '\\u{1F4C1}' : '\\u{1F4C2}';
+    el.innerHTML = d.entries.map(function(e, idx) {
+      var icon = e.isProject ? '\u{1F4C1}' : '\u{1F4C2}';
       var projectBadge = e.isProject ? ' <span class="badge badge-blue" style="font-size:10px">project</span>' : '';
-      return '<div style="padding:8px 16px;cursor:pointer;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--border)" '
-        + 'onmouseenter="this.style.background=\\'var(--surface-hover)\\'" onmouseleave="this.style.background=\\'\\'">'
-        + '<div onclick="browseDir(\\'' + esc(e.path).replace(/'/g, "\\\\'") + '\\')" style="flex:1;display:flex;align-items:center;gap:8px">'
+      return '<div style="padding:8px 16px;cursor:pointer;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--border)">'
+        + '<div data-browse-idx="' + idx + '" style="flex:1;display:flex;align-items:center;gap:8px">'
         + '<span>' + icon + '</span>'
         + '<span>' + esc(e.name) + projectBadge + '</span>'
         + '</div>'
-        + '<button class="btn-sm btn-primary" style="font-size:10px;padding:2px 8px;flex-shrink:0" onclick="event.stopPropagation();addBrowsedDir(\\'' + esc(e.path).replace(/'/g, "\\\\'") + '\\')">Add</button>'
+        + '<button class="btn-sm btn-primary" style="font-size:10px;padding:2px 8px;flex-shrink:0" data-add-idx="' + idx + '">Add</button>'
         + '</div>';
     }).join('');
+
+    // Attach click handlers via delegation
+    el.onclick = function(ev) {
+      var target = ev.target;
+      // Walk up to find data attribute
+      while (target && target !== el) {
+        if (target.dataset && target.dataset.addIdx !== undefined) {
+          ev.stopPropagation();
+          addBrowsedDir(browseEntries[parseInt(target.dataset.addIdx)].path);
+          return;
+        }
+        if (target.dataset && target.dataset.browseIdx !== undefined) {
+          browseDir(browseEntries[parseInt(target.dataset.browseIdx)].path);
+          return;
+        }
+        target = target.parentElement;
+      }
+    };
   });
 }
 
@@ -3555,6 +3588,7 @@ function addManualPath() {
 
 function removeWorkspaceDir(dir) {
   if (!confirm('Remove workspace directory?\\n' + dir)) return;
+
   fetch('/api/workspace-dirs', {
     method: 'DELETE',
     headers: { 'Content-Type': 'application/json' },
