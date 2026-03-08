@@ -939,6 +939,44 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
     }
   });
 
+  // ── Cron trace viewer ──────────────────────────────────────────
+
+  app.get('/api/cron/traces/:job', (req, res) => {
+    try {
+      const jobName = req.params.job;
+      const safeName = jobName.replace(/[^a-zA-Z0-9_-]/g, '_');
+      const traceDir = path.join(BASE_DIR, 'cron', 'traces');
+      if (!existsSync(traceDir)) {
+        res.json({ traces: [] });
+        return;
+      }
+      const files = readdirSync(traceDir)
+        .filter(f => f.startsWith(safeName + '_') && f.endsWith('.json'))
+        .sort()
+        .reverse()
+        .slice(0, 10); // Last 10 traces
+
+      const traces = files.map(f => {
+        try {
+          const data = JSON.parse(readFileSync(path.join(traceDir, f), 'utf-8'));
+          return {
+            file: f,
+            jobName: data.jobName,
+            startedAt: data.startedAt,
+            steps: (data.trace || []).length,
+            trace: data.trace || [],
+          };
+        } catch {
+          return null;
+        }
+      }).filter(Boolean);
+
+      res.json({ traces });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
   app.post('/api/restart', (_req, res) => {
     const pid = readPid();
     if (!pid || !isProcessAlive(pid)) {
@@ -3133,6 +3171,22 @@ function getDashboardHTML(): string {
   </div>
 </div>
 
+<div class="modal-overlay" id="trace-modal">
+  <div class="modal" style="width:720px;max-height:85vh">
+    <div class="modal-header">
+      <h3 id="trace-modal-title">Execution Trace</h3>
+      <button class="btn-ghost btn-sm" onclick="document.getElementById('trace-modal').classList.remove('show')">&times;</button>
+    </div>
+    <div class="modal-body" style="padding:0;overflow-y:auto;max-height:65vh">
+      <div id="trace-content" style="font-size:12px"></div>
+    </div>
+    <div class="modal-footer">
+      <div id="trace-run-selector" style="flex:1"></div>
+      <button onclick="document.getElementById('trace-modal').classList.remove('show')">Close</button>
+    </div>
+  </div>
+</div>
+
 <div class="toast-container" id="toasts"></div>
 
 <script>
@@ -3456,6 +3510,7 @@ async function refreshCron() {
         + '<div class="task-card-badges">' + badgesHtml + '</div>'
         + '<div class="task-card-actions">'
         + '<button class="btn-sm btn-success" onclick="apiPost(\\'/api/cron/run/' + encodeURIComponent(job.name) + '\\')">Run Now</button>'
+        + '<button class="btn-sm" data-trace-job="' + esc(job.name) + '">Trace</button>'
         + '<button class="btn-sm" onclick="openEditCronModal(\\'' + safeName + '\\')">Edit</button>'
         + '<button class="btn-sm btn-danger" onclick="confirmDeleteCron(\\'' + safeName + '\\')">Del</button>'
         + '</div></div>';
@@ -3501,7 +3556,87 @@ async function refreshCron() {
     } catch(ue) { /* unleashed status is optional */ }
 
     document.getElementById('panel-cron').innerHTML = html;
+
+    // Attach trace button handlers via delegation
+    document.getElementById('panel-cron').onclick = function(ev) {
+      var target = ev.target;
+      while (target && target.id !== 'panel-cron') {
+        if (target.dataset && target.dataset.traceJob) {
+          openTraceViewer(target.dataset.traceJob);
+          return;
+        }
+        target = target.parentElement;
+      }
+    };
   } catch(e) { }
+}
+
+var traceData = [];
+
+async function openTraceViewer(jobName) {
+  document.getElementById('trace-modal-title').textContent = 'Trace: ' + jobName;
+  document.getElementById('trace-content').innerHTML = '<div style="padding:20px;color:var(--text-muted)">Loading...</div>';
+  document.getElementById('trace-modal').classList.add('show');
+
+  try {
+    var r = await fetch('/api/cron/traces/' + encodeURIComponent(jobName));
+    var d = await r.json();
+    traceData = d.traces || [];
+
+    if (traceData.length === 0) {
+      document.getElementById('trace-content').innerHTML = '<div style="padding:20px;color:var(--text-muted)">No traces recorded yet. Traces are captured on the next run.</div>';
+      document.getElementById('trace-run-selector').innerHTML = '';
+      return;
+    }
+
+    // Build run selector
+    var selHtml = '<select id="trace-run-select" onchange="renderTrace(this.value)" style="font-size:12px">';
+    for (var i = 0; i < traceData.length; i++) {
+      var t = traceData[i];
+      var ts = t.startedAt ? new Date(t.startedAt).toLocaleString() : 'Unknown';
+      selHtml += '<option value="' + i + '">' + ts + ' (' + t.steps + ' steps)</option>';
+    }
+    selHtml += '</select>';
+    document.getElementById('trace-run-selector').innerHTML = selHtml;
+
+    renderTrace(0);
+  } catch(e) {
+    document.getElementById('trace-content').innerHTML = '<div style="padding:20px;color:var(--red)">Failed to load traces: ' + esc(String(e)) + '</div>';
+  }
+}
+
+function renderTrace(idx) {
+  var trace = traceData[idx];
+  if (!trace || !trace.trace) return;
+
+  var html = '';
+  for (var i = 0; i < trace.trace.length; i++) {
+    var step = trace.trace[i];
+    var time = step.timestamp ? new Date(step.timestamp).toLocaleTimeString() : '';
+    var typeColor = step.type === 'tool_call' ? 'var(--accent)'
+      : step.type === 'tool_result' ? '#22c55e'
+      : 'var(--text-secondary)';
+    var typeLabel = step.type === 'tool_call' ? 'TOOL'
+      : step.type === 'tool_result' ? 'RESULT'
+      : 'TEXT';
+    var contentHtml = esc(step.content || '');
+    // Wrap long content
+    if (contentHtml.length > 200) {
+      var preview = contentHtml.slice(0, 200);
+      var rest = contentHtml.slice(200);
+      contentHtml = preview + '<span class="trace-expand" data-expanded="false" onclick="var r=this.nextElementSibling;var show=r.style.display===\\'none\\';r.style.display=show?\\'inline\\':\\'none\\';this.textContent=show?\\'  [collapse]\\':  \\'... [expand]\\'"> ... [expand]</span><span style="display:none">' + rest + '</span>';
+    }
+
+    html += '<div style="padding:8px 16px;border-bottom:1px solid var(--border);font-family:monospace">'
+      + '<div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">'
+      + '<span style="font-size:10px;font-weight:bold;color:' + typeColor + ';text-transform:uppercase;min-width:45px">' + typeLabel + '</span>'
+      + '<span style="font-size:10px;color:var(--text-muted)">' + time + '</span>'
+      + '</div>'
+      + '<div style="white-space:pre-wrap;word-break:break-word;font-size:11px;line-height:1.5;color:var(--text-primary)">' + contentHtml + '</div>'
+      + '</div>';
+  }
+
+  document.getElementById('trace-content').innerHTML = html || '<div style="padding:20px;color:var(--text-muted)">Empty trace</div>';
 }
 
 async function cancelUnleashed(jobName) {

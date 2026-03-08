@@ -213,6 +213,38 @@ function extractDeliverable(blocks: string[]): string {
   return '';
 }
 
+// ── Cron Trace Persistence ──────────────────────────────────────────
+
+interface TraceEntry {
+  type: string;
+  timestamp: string;
+  content: string;
+}
+
+function saveCronTrace(jobName: string, trace: TraceEntry[]): void {
+  if (trace.length === 0) return;
+  try {
+    const traceDir = path.join(BASE_DIR, 'cron', 'traces');
+    fs.mkdirSync(traceDir, { recursive: true });
+    const safeName = jobName.replace(/[^a-zA-Z0-9_-]/g, '_');
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const traceFile = path.join(traceDir, `${safeName}_${timestamp}.json`);
+    fs.writeFileSync(traceFile, JSON.stringify({ jobName, startedAt: trace[0]?.timestamp, trace }, null, 2));
+
+    // Keep only last 20 traces per job to avoid disk bloat
+    const files = fs.readdirSync(traceDir)
+      .filter(f => f.startsWith(safeName + '_') && f.endsWith('.json'))
+      .sort();
+    if (files.length > 20) {
+      for (const old of files.slice(0, files.length - 20)) {
+        try { fs.unlinkSync(path.join(traceDir, old)); } catch { /* ignore */ }
+      }
+    }
+  } catch {
+    // Non-critical — don't fail the job
+  }
+}
+
 // ── Project Matching ────────────────────────────────────────────────
 
 interface ProjectMeta {
@@ -1258,8 +1290,9 @@ Delegate data-heavy work (SEO, analytics, bulk API calls for 3+ entities) to sub
       `You're sending this directly to ${ownerName} as a DM. Write like you're texting them — casual, concise, no headers or section dividers unless the info genuinely needs structure. Skip narrating your process. If there's nothing worth reporting, output ONLY: __NOTHING__\n` +
       `Your final text response is the only thing delivered.`;
 
-    // Collect all text blocks — last non-empty block becomes the deliverable.
+    // Collect all text blocks and execution trace
     const allTextBlocks: string[] = [];
+    const trace: Array<{ type: string; timestamp: string; content: string }> = [];
     const stream = query({ prompt, options: sdkOptions });
 
     for await (const message of stream) {
@@ -1268,12 +1301,21 @@ Delegate data-heavy work (SEO, analytics, bulk API calls for 3+ entities) to sub
         for (const block of blocks) {
           if (block.type === 'text' && block.text) {
             allTextBlocks.push(block.text);
+            trace.push({ type: 'text', timestamp: new Date().toISOString(), content: block.text });
           } else if (block.type === 'tool_use' && block.name) {
             logToolUse(block.name, (block.input ?? {}) as Record<string, unknown>);
+            trace.push({
+              type: 'tool_call',
+              timestamp: new Date().toISOString(),
+              content: `${block.name}(${JSON.stringify(block.input ?? {}).slice(0, 500)})`,
+            });
           }
         }
       }
     }
+
+    // Save execution trace
+    saveCronTrace(jobName, trace);
 
     return extractDeliverable(allTextBlocks);
   }
