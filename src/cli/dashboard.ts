@@ -611,6 +611,68 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
     res.json({ content: getLogs(lines) });
   });
 
+  app.get('/api/activity', (_req, res) => {
+    const activities: Array<{ type: string; message: string; time: string; status?: string }> = [];
+
+    // Scan cron runs for recent activity
+    const runsDir = path.join(BASE_DIR, 'cron', 'runs');
+    if (existsSync(runsDir)) {
+      try {
+        const files = readdirSync(runsDir).filter(f => f.endsWith('.jsonl'));
+        for (const file of files) {
+          const filePath = path.join(runsDir, file);
+          const lines = readFileSync(filePath, 'utf-8').trim().split('\n').filter(Boolean);
+          const recent = lines.slice(-5);
+          for (const line of recent) {
+            try {
+              const entry = JSON.parse(line);
+              activities.push({
+                type: 'cron',
+                message: (entry.jobName || file.replace('.jsonl', '')) + (entry.status === 'ok' ? ' completed' : ' failed'),
+                time: entry.finishedAt || entry.startedAt || '',
+                status: entry.status,
+              });
+            } catch { /* skip bad lines */ }
+          }
+        }
+      } catch { /* ignore */ }
+    }
+
+    // Scan recent log lines for chat messages and heartbeat events
+    const logFile = path.join(BASE_DIR, 'logs', 'clementine.log');
+    if (existsSync(logFile)) {
+      try {
+        const content = readFileSync(logFile, 'utf-8');
+        const logLines = content.split('\n').filter(Boolean).slice(-200);
+        for (const line of logLines) {
+          try {
+            const entry = JSON.parse(line);
+            const msg = entry.msg || '';
+            if (msg.includes('chat') || msg.includes('message') || msg.includes('gateway')) {
+              activities.push({
+                type: 'chat',
+                message: msg,
+                time: entry.time || '',
+                status: 'ok',
+              });
+            } else if (msg.includes('heartbeat') || msg.includes('cron')) {
+              activities.push({
+                type: 'system',
+                message: msg,
+                time: entry.time || '',
+                status: 'ok',
+              });
+            }
+          } catch { /* skip non-JSON lines */ }
+        }
+      } catch { /* ignore */ }
+    }
+
+    // Sort newest-first, limit to 15
+    activities.sort((a, b) => (b.time || '').localeCompare(a.time || ''));
+    res.json({ activities: activities.slice(0, 15) });
+  });
+
   // ── POST routes (actions) ──────────────────────────────────────
 
   app.post('/api/cron/run/:job', (req, res) => {
@@ -1539,11 +1601,52 @@ function getDashboardHTML(): string {
     font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', 'JetBrains Mono', monospace;
     font-size: 11px;
     line-height: 1.7;
-    white-space: pre-wrap;
-    word-break: break-all;
     color: var(--text-secondary);
     max-height: calc(100vh - 240px);
     overflow-y: auto;
+  }
+  .log-entry {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    padding: 3px 0;
+    border-bottom: 1px solid rgba(30,42,58,0.2);
+  }
+  .log-entry:last-child { border-bottom: none; }
+  .log-time {
+    color: var(--text-muted);
+    font-size: 10px;
+    flex-shrink: 0;
+    min-width: 70px;
+  }
+  .log-level {
+    font-size: 10px;
+    font-weight: 700;
+    padding: 1px 6px;
+    border-radius: 3px;
+    flex-shrink: 0;
+    min-width: 42px;
+    text-align: center;
+    text-transform: uppercase;
+  }
+  .log-level-info { background: rgba(56,139,253,0.15); color: #58a6ff; }
+  .log-level-warn { background: var(--yellow-bg); color: var(--yellow); }
+  .log-level-error { background: var(--red-bg); color: var(--red); }
+  .log-level-fatal { background: var(--red); color: #fff; }
+  .log-level-debug { background: rgba(90,106,126,0.15); color: var(--text-muted); }
+  .log-level-trace { background: rgba(90,106,126,0.1); color: var(--text-muted); }
+  .log-source {
+    color: var(--accent);
+    font-size: 10px;
+    flex-shrink: 0;
+    max-width: 100px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .log-msg {
+    color: var(--text-primary);
+    word-break: break-word;
+    flex: 1;
   }
   .log-toolbar {
     display: flex;
@@ -1565,6 +1668,29 @@ function getDashboardHTML(): string {
     outline: none;
     border-color: var(--accent);
   }
+
+  /* ── Disabled cron rows ──────────────────── */
+  tr.row-disabled td { opacity: 0.45; }
+  tr.row-disabled:hover td { opacity: 0.7; }
+
+  /* ── Activity feed ───────────────────────── */
+  .activity-item {
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+    padding: 8px 0;
+    border-bottom: 1px solid rgba(30,42,58,0.5);
+    font-size: 12px;
+  }
+  .activity-item:last-child { border-bottom: none; }
+  .activity-icon {
+    flex-shrink: 0;
+    width: 20px;
+    text-align: center;
+    font-size: 13px;
+  }
+  .activity-msg { flex: 1; color: var(--text-primary); line-height: 1.4; }
+  .activity-time { flex-shrink: 0; color: var(--text-muted); font-size: 11px; }
 
   /* ── Memory ─────────────────────────────── */
   .memory-preview {
@@ -1647,13 +1773,6 @@ function getDashboardHTML(): string {
     letter-spacing: 0.06em;
   }
 
-  /* ── Overview specific ──────────────────── */
-  .overview-actions {
-    display: flex;
-    gap: 8px;
-    margin-bottom: 20px;
-  }
-
   /* ── Scrollbar ──────────────────────────── */
   ::-webkit-scrollbar { width: 6px; }
   ::-webkit-scrollbar-track { background: transparent; }
@@ -1681,6 +1800,7 @@ function getDashboardHTML(): string {
     background: var(--bg-hover);
     color: var(--text-primary);
     border-bottom-left-radius: 4px;
+    white-space: normal;
   }
   .chat-bubble .chat-meta {
     font-size: 10px;
@@ -1863,19 +1983,14 @@ function getDashboardHTML(): string {
     <div class="page active" id="page-overview">
       <div class="page-title">Dashboard</div>
       <div class="stat-grid" id="stat-tiles"></div>
-      <div class="overview-actions" id="daemon-controls"></div>
       <div class="grid-2">
         <div class="card">
           <div class="card-header">Daemon Status</div>
           <div class="card-body" id="panel-status"><div class="empty-state">Loading...</div></div>
         </div>
         <div class="card">
-          <div class="card-header">Heartbeat</div>
-          <div class="card-body" id="panel-heartbeat"><div class="empty-state">Loading...</div></div>
-        </div>
-        <div class="card" id="card-launchagent" style="display:none">
-          <div class="card-header">LaunchAgent (macOS)</div>
-          <div class="card-body" id="panel-launchagent"><div class="empty-state">Loading...</div></div>
+          <div class="card-header">Recent Activity</div>
+          <div class="card-body" id="panel-activity"><div class="empty-state">Loading...</div></div>
         </div>
       </div>
     </div>
@@ -1929,6 +2044,13 @@ function getDashboardHTML(): string {
       <div class="page-title">Logs</div>
       <div class="log-toolbar">
         <input type="text" class="log-filter" id="log-filter" placeholder="Filter logs...">
+        <select id="log-level-filter" style="background:var(--bg-input);border:1px solid var(--border);border-radius:var(--radius-sm);padding:6px 10px;font-size:12px;color:var(--text-primary);font-family:inherit;cursor:pointer" onchange="applyLogFilter()">
+          <option value="">All Levels</option>
+          <option value="error">Error+</option>
+          <option value="warn">Warn+</option>
+          <option value="info">Info+</option>
+          <option value="debug">Debug+</option>
+        </select>
         <button onclick="refreshLogs()">Refresh</button>
         <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--text-secondary);cursor:pointer">
           <input type="checkbox" id="log-autoscroll" checked> Auto-scroll
@@ -1942,7 +2064,15 @@ function getDashboardHTML(): string {
       <div class="page-title">Chat with ${name}</div>
       <div class="card" style="height:calc(100vh - 180px);display:flex;flex-direction:column">
         <div class="card-body" id="chat-messages" style="flex:1;overflow-y:auto;padding:16px">
-          <div class="empty-state">Send a message to start a conversation.</div>
+          <div class="empty-state">
+            <p style="margin-bottom:14px;color:var(--text-muted)">Send a message to start a conversation.</p>
+            <div style="display:flex;flex-wrap:wrap;gap:8px;justify-content:center">
+              <button class="btn btn-sm" onclick="quickChat('What\\'s on my schedule?')">What's on my schedule?</button>
+              <button class="btn btn-sm" onclick="quickChat('Check my email')">Check my email</button>
+              <button class="btn btn-sm" onclick="quickChat('Run morning briefing')">Run morning briefing</button>
+              <button class="btn btn-sm" onclick="quickChat('What did you do today?')">What did you do today?</button>
+            </div>
+          </div>
         </div>
         <div style="border-top:1px solid var(--border);padding:14px;display:flex;gap:10px">
           <input type="text" id="chat-input" placeholder="Type a message..." style="flex:1" onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendChat()}">
@@ -2250,24 +2380,15 @@ async function refreshStatus() {
     pill.className = 'status-pill ' + (d.alive ? 'online' : 'offline');
     pill.innerHTML = '<div class="pulse-dot"></div><span>' + (d.alive ? 'Online' : 'Offline') + '</span>';
 
-    // Stat tiles
+    // Stat tiles with colored left borders
     const tiles = document.getElementById('stat-tiles');
     tiles.innerHTML =
-      '<div class="stat-tile"><div class="stat-value">' + (d.alive ? '<span style="color:var(--green)">Online</span>' : '<span style="color:var(--red)">Offline</span>') + '</div><div class="stat-label">Daemon</div></div>'
-      + '<div class="stat-tile"><div class="stat-value">' + esc(d.uptime || '--') + '</div><div class="stat-label">Uptime</div></div>'
-      + '<div class="stat-tile"><div class="stat-value">' + (d.channels ? d.channels.length : 0) + '</div><div class="stat-label">Channels</div></div>'
-      + '<div class="stat-tile"><div class="stat-value" id="stat-cron-count">--</div><div class="stat-label">Scheduled Tasks</div></div>';
+      statTile(d.alive ? '<span style="color:var(--green)">Online</span>' : '<span style="color:var(--red)">Offline</span>', 'Daemon', 'var(--green)')
+      + statTile(esc(d.uptime || '--'), 'Uptime', 'var(--accent)')
+      + statTile((d.channels ? d.channels.length : 0), 'Channels', 'var(--green)')
+      + '<div class="stat-tile" style="border-left:3px solid var(--yellow)"><div class="stat-value" id="stat-cron-count">--</div><div class="stat-label">Scheduled Tasks</div></div>';
 
-    // Daemon controls
-    const controls = document.getElementById('daemon-controls');
-    if (d.alive) {
-      controls.innerHTML = '<button class="btn-success" onclick="apiPost(\\'/api/restart\\')">Restart Daemon</button>'
-        + '<button class="btn-danger" onclick="apiPost(\\'/api/stop\\')">Stop Daemon</button>';
-    } else {
-      controls.innerHTML = '<button class="btn-primary" onclick="apiPost(\\'/api/launch\\')">Start Daemon</button>';
-    }
-
-    // Status card
+    // Status card with controls and LaunchAgent merged in
     let html = '';
     html += kv('Status', '<span class="badge ' + (d.alive ? 'badge-green' : 'badge-red') + '"><span class="badge-dot"></span>' + (d.alive ? 'Running' : 'Stopped') + '</span>');
     if (d.pid) html += kv('PID', d.pid);
@@ -2275,14 +2396,21 @@ async function refreshStatus() {
     if (d.channels && d.channels.length > 0) {
       html += kv('Channels', d.channels.map(c => '<span class="badge badge-accent">' + esc(c) + '</span> ').join(''));
     }
-    document.getElementById('panel-status').innerHTML = html;
-
-    // LaunchAgent
+    // Merge LaunchAgent info into status card
     if (d.launchAgent) {
-      document.getElementById('card-launchagent').style.display = '';
       const laBadge = d.launchAgent === 'loaded' ? 'badge-green' : d.launchAgent === 'installed' ? 'badge-yellow' : 'badge-gray';
-      document.getElementById('panel-launchagent').innerHTML = kv('Status', '<span class="badge ' + laBadge + '">' + esc(d.launchAgent) + '</span>');
+      html += kv('LaunchAgent', '<span class="badge ' + laBadge + '">' + esc(d.launchAgent) + '</span>');
     }
+    // Daemon controls inside the status card
+    html += '<div style="margin-top:12px;display:flex;gap:8px">';
+    if (d.alive) {
+      html += '<button class="btn-success btn-sm" onclick="apiPost(\\'/api/restart\\')">Restart</button>'
+        + '<button class="btn-danger btn-sm" onclick="apiPost(\\'/api/stop\\')">Stop</button>';
+    } else {
+      html += '<button class="btn-primary btn-sm" onclick="apiPost(\\'/api/launch\\')">Start Daemon</button>';
+    }
+    html += '</div>';
+    document.getElementById('panel-status').innerHTML = html;
   } catch(e) { }
 }
 
@@ -2304,10 +2432,11 @@ async function refreshSessions() {
     let html = '<table><tr><th>Session</th><th>Exchanges</th><th>Last Active</th><th style="width:80px"></th></tr>';
     for (const key of keys) {
       const s = d[key];
-      html += '<tr><td><code>' + esc(key) + '</code></td>'
+      const friendly = friendlySession(key);
+      html += '<tr><td>' + friendly.icon + ' ' + esc(friendly.label) + '<br><code style="font-size:10px;color:var(--text-muted)">' + esc(key) + '</code></td>'
         + '<td>' + esc(s.exchanges || 0) + '</td>'
         + '<td>' + esc(timeAgo(s.timestamp)) + '</td>'
-        + '<td><button class="btn-danger btn-sm" onclick="apiPost(\\'/api/sessions/' + encodeURIComponent(key) + '/clear\\')">Clear</button></td></tr>';
+        + '<td><button class="btn-danger btn-sm" onclick="if(confirm(\\'Clear session ' + esc(key).replace(/'/g, '') + '?\\'))apiPost(\\'/api/sessions/' + encodeURIComponent(key) + '/clear\\')">Clear</button></td></tr>';
     }
     html += '</table>';
     document.getElementById('panel-sessions').innerHTML = html;
@@ -2348,9 +2477,13 @@ async function refreshCron() {
       const modeBadge = job.mode === 'unleashed'
         ? ' <span class="badge badge-purple">unleashed</span>'
         : '';
-      html += '<tr>'
+      const desc = describeCron(job.schedule || '');
+      const schedHtml = desc
+        ? esc(desc) + '<br><code style="font-size:10px;color:var(--text-muted)">' + esc(job.schedule) + '</code>'
+        : '<code style="color:var(--accent)">' + esc(job.schedule) + '</code>';
+      html += '<tr' + (enabled ? '' : ' class="row-disabled"') + '>'
         + '<td><strong>' + esc(job.name) + '</strong>' + modeBadge + '<br><span style="font-size:11px;color:var(--text-muted)">' + esc((job.prompt || '').slice(0, 60)) + (job.prompt && job.prompt.length > 60 ? '...' : '') + '</span></td>'
-        + '<td>' + (describeCron(job.schedule || '') || '<code style="color:var(--accent)">' + esc(job.schedule) + '</code>') + '<br><span style="font-size:10px;color:var(--text-muted)">' + esc(job.schedule) + '</span></td>'
+        + '<td>' + schedHtml + '</td>'
         + '<td>' + projectBadge + '</td>'
         + '<td>' + statusBadge + '</td>'
         + '<td>' + lastRun + '</td>'
@@ -2847,24 +2980,45 @@ async function refreshTimers() {
   } catch(e) { }
 }
 
-// ── Heartbeat ─────────────────────────────
-async function refreshHeartbeat() {
+// ── Activity Feed ─────────────────────────
+async function refreshActivity() {
   try {
-    const r = await fetch('/api/heartbeat');
+    const r = await fetch('/api/activity');
     const d = await r.json();
-    if (!d.timestamp) {
-      document.getElementById('panel-heartbeat').innerHTML = '<div class="empty-state">No heartbeat data</div>';
+    const activities = d.activities || [];
+    if (activities.length === 0) {
+      document.getElementById('panel-activity').innerHTML = '<div class="empty-state">No recent activity</div>';
       return;
     }
-    let html = kv('Last Beat', timeAgo(d.timestamp));
-    html += kv('Fingerprint', '<code>' + esc((d.fingerprint||'').slice(0,16)) + '</code>');
-    if (d.details) {
-      for (const [k,v] of Object.entries(d.details)) {
-        html += kv(k, esc(v));
-      }
+    const icons = { cron: '&#9200;', chat: '&#128172;', system: '&#9881;' };
+    let html = '';
+    for (const a of activities) {
+      const icon = icons[a.type] || '&#9679;';
+      const statusDot = a.status === 'ok' ? '<span style="color:var(--green)">&#9679;</span> '
+        : a.status === 'error' ? '<span style="color:var(--red)">&#9679;</span> '
+        : '';
+      html += '<div class="activity-item">'
+        + '<span class="activity-icon">' + icon + '</span>'
+        + '<span class="activity-msg">' + statusDot + esc(a.message) + '</span>'
+        + '<span class="activity-time">' + timeAgo(a.time) + '</span>'
+        + '</div>';
     }
-    document.getElementById('panel-heartbeat').innerHTML = html;
+    document.getElementById('panel-activity').innerHTML = html;
   } catch(e) { }
+}
+
+// ── Session helpers ───────────────────────
+function friendlySession(key) {
+  const parts = key.split(':');
+  const channelIcons = { discord: '&#128172;', slack: '&#128172;', telegram: '&#9992;', whatsapp: '&#128241;', dashboard: '&#127760;', webhook: '&#128279;' };
+  if (parts.length >= 2) {
+    const channel = parts[0];
+    const icon = channelIcons[channel] || '&#128488;';
+    const rest = parts.slice(1).join(':');
+    const label = channel.charAt(0).toUpperCase() + channel.slice(1) + (rest ? ' — ' + rest : '');
+    return { icon, label };
+  }
+  return { icon: '&#128488;', label: key };
 }
 
 // ── Memory ────────────────────────────────
@@ -2900,19 +3054,71 @@ async function refreshLogs() {
     applyLogFilter();
   } catch(e) { }
 }
+function stripAnsi(s) {
+  return s.replace(/\\x1b\\[[0-9;]*m/g, '').replace(/\\u001b\\[[0-9;]*m/g, '').replace(/\\x1B\\[[0-9;]*m/g, '');
+}
+
+const PINO_LEVELS = { 10: 'trace', 20: 'debug', 30: 'info', 40: 'warn', 50: 'error', 60: 'fatal' };
+const LEVEL_PRIORITY = { trace: 0, debug: 1, info: 2, warn: 3, error: 4, fatal: 5 };
+
+function pinoLevelName(n) {
+  return PINO_LEVELS[n] || 'info';
+}
+
+function renderLogLine(line) {
+  const trimmed = line.trim();
+  if (!trimmed) return '';
+  // Skip decorative/banner lines
+  if (/^[=\\-~]{3,}/.test(trimmed) || /^\\s*$/.test(trimmed)) return '';
+  try {
+    const obj = JSON.parse(trimmed);
+    const level = pinoLevelName(obj.level);
+    const time = obj.time ? new Date(obj.time).toLocaleTimeString() : '';
+    const source = obj.name || obj.module || obj.component || '';
+    let msg = stripAnsi(obj.msg || '');
+    // Include extra fields if msg is sparse
+    if (!msg && obj.err) msg = obj.err.message || String(obj.err);
+    return '<div class="log-entry">'
+      + '<span class="log-time">' + esc(time) + '</span>'
+      + '<span class="log-level log-level-' + level + '">' + level + '</span>'
+      + (source ? '<span class="log-source">' + esc(source) + '</span>' : '')
+      + '<span class="log-msg">' + esc(msg) + '</span>'
+      + '</div>';
+  } catch {
+    // Not JSON — render as plain text with ANSI stripped
+    const clean = stripAnsi(trimmed);
+    if (!clean || /^[\\s=\\-~*]+$/.test(clean)) return '';
+    return '<div class="log-entry"><span class="log-msg" style="color:var(--text-secondary)">' + esc(clean) + '</span></div>';
+  }
+}
+
 function applyLogFilter() {
   const filter = (document.getElementById('log-filter').value || '').toLowerCase();
+  const levelFilter = (document.getElementById('log-level-filter').value || '').toLowerCase();
+  const levelMin = LEVEL_PRIORITY[levelFilter] ?? 0;
   const el = document.getElementById('panel-logs');
   if (!fullLogContent) {
     el.innerHTML = '<div class="empty-state">No log file found</div>';
     return;
   }
-  if (filter) {
-    const lines = fullLogContent.split('\\n').filter(l => l.toLowerCase().includes(filter));
-    el.textContent = lines.join('\\n') || '(no matching lines)';
-  } else {
-    el.textContent = fullLogContent;
+  const lines = fullLogContent.split('\\n');
+  let rendered = '';
+  for (const line of lines) {
+    // Level filter — check before rendering
+    if (levelFilter) {
+      try {
+        const obj = JSON.parse(line.trim());
+        const lvl = pinoLevelName(obj.level);
+        if ((LEVEL_PRIORITY[lvl] ?? 0) < levelMin) continue;
+      } catch {
+        // Non-JSON lines pass level filter
+      }
+    }
+    // Text filter
+    if (filter && !stripAnsi(line).toLowerCase().includes(filter)) continue;
+    rendered += renderLogLine(line);
   }
+  el.innerHTML = rendered || '<div class="empty-state">(no matching lines)</div>';
   if (document.getElementById('log-autoscroll').checked) {
     el.scrollTop = el.scrollHeight;
   }
@@ -2920,6 +3126,30 @@ function applyLogFilter() {
 document.getElementById('log-filter').addEventListener('input', applyLogFilter);
 
 // ── Chat ──────────────────────────────────
+function quickChat(msg) {
+  document.getElementById('chat-input').value = msg;
+  sendChat();
+}
+
+function renderMd(text) {
+  let s = esc(text);
+  // Code blocks: \`\`\`...
+  s = s.replace(/\`\`\`([\\s\\S]*?)\`\`\`/g, '<pre style="background:var(--bg-input);padding:10px;border-radius:6px;overflow-x:auto;margin:6px 0;font-size:11px">$1</pre>');
+  // Inline code
+  s = s.replace(/\`([^\`]+)\`/g, '<code style="background:var(--bg-input);padding:1px 5px;border-radius:3px;font-size:11px">$1</code>');
+  // Bold
+  s = s.replace(/\\*\\*(.+?)\\*\\*/g, '<strong>$1</strong>');
+  // Italic
+  s = s.replace(/\\*(.+?)\\*/g, '<em>$1</em>');
+  // Unordered lists
+  s = s.replace(/^- (.+)$/gm, '<li style="margin-left:16px">$1</li>');
+  // Ordered lists
+  s = s.replace(/^\\d+\\. (.+)$/gm, '<li style="margin-left:16px">$1</li>');
+  // Line breaks
+  s = s.replace(/\\n/g, '<br>');
+  return s;
+}
+
 let chatHistory = [];
 async function sendChat() {
   const input = document.getElementById('chat-input');
@@ -2968,7 +3198,7 @@ async function sendChat() {
 
     const asstBubble = document.createElement('div');
     asstBubble.className = 'chat-bubble assistant';
-    asstBubble.textContent = d.response || d.error || 'No response';
+    asstBubble.innerHTML = renderMd(d.response || d.error || 'No response');
     const asstMeta = document.createElement('div');
     asstMeta.className = 'chat-meta';
     asstMeta.textContent = new Date().toLocaleTimeString();
@@ -3097,8 +3327,9 @@ async function refreshMetrics() {
   }
 }
 
-function statTile(value, label) {
-  return '<div class="stat-tile"><div class="stat-value">' + esc(value) + '</div><div class="stat-label">' + esc(label) + '</div></div>';
+function statTile(value, label, color) {
+  const border = color ? ' style="border-left:3px solid ' + color + '"' : '';
+  return '<div class="stat-tile"' + border + '><div class="stat-value">' + value + '</div><div class="stat-label">' + esc(label) + '</div></div>';
 }
 
 function formatMs(ms) {
@@ -3128,7 +3359,7 @@ function refreshAll() {
   refreshSessions();
   refreshCron();
   refreshTimers();
-  refreshHeartbeat();
+  refreshActivity();
   refreshProjects(); // Always refresh — keeps nav badge + cron dropdown in sync
   if (currentPage === 'memory') refreshMemory();
   if (currentPage === 'logs') refreshLogs();
