@@ -1979,6 +1979,26 @@ server.tool(
     }
 
     const projects: ProjectEntry[] = [];
+    const seenProjects = new Set<string>();
+
+    const addProject = (fullPath: string, name: string) => {
+      const resolvedProject = path.resolve(fullPath);
+      if (seenProjects.has(resolvedProject)) return;
+      seenProjects.add(resolvedProject);
+
+      if (filter && !name.toLowerCase().includes(filter.toLowerCase())) return;
+
+      let subEntries: string[];
+      try { subEntries = readdirSync(fullPath); } catch { return; }
+
+      projects.push({
+        name,
+        path: fullPath,
+        type: detectProjectType(subEntries),
+        description: extractDescription(fullPath, subEntries),
+        hasClaude: existsSync(path.join(fullPath, '.claude', 'CLAUDE.md')),
+      });
+    };
 
     for (const wsDir of workspaceDirs) {
       const resolved = path.resolve(wsDir);
@@ -1989,6 +2009,16 @@ server.tool(
         entries = readdirSync(resolved);
       } catch { continue; }
 
+      // Check if the workspace dir itself is a project
+      const wsDirIsProject = PROJECT_MARKERS.some(marker => {
+        if (marker.includes('/')) return existsSync(path.join(resolved, marker));
+        return entries.includes(marker);
+      });
+      if (wsDirIsProject) {
+        addProject(resolved, path.basename(resolved));
+      }
+
+      // Scan subdirectories for projects
       for (const entry of entries) {
         if (entry.startsWith('.')) continue;
         const fullPath = path.join(resolved, entry);
@@ -2010,15 +2040,7 @@ server.tool(
 
         if (!isProject) continue;
 
-        if (filter && !entry.toLowerCase().includes(filter.toLowerCase())) continue;
-
-        projects.push({
-          name: entry,
-          path: fullPath,
-          type: detectProjectType(subEntries),
-          description: extractDescription(fullPath, subEntries),
-          hasClaude: existsSync(path.join(fullPath, '.claude', 'CLAUDE.md')),
-        });
+        addProject(fullPath, entry);
       }
     }
 

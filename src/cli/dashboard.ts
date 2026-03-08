@@ -251,10 +251,40 @@ function scanProjects(): ProjectInfo[] {
   }
 
   const projects: ProjectInfo[] = [];
+
+  const addProject = (fullPath: string, name: string) => {
+    const resolvedProject = path.resolve(fullPath);
+    if (seen.has('proj:' + resolvedProject)) return;
+    seen.add('proj:' + resolvedProject);
+
+    let subEntries: string[];
+    try { subEntries = readdirSync(fullPath); } catch { return; }
+
+    projects.push({
+      name,
+      path: fullPath,
+      type: detectProjectType(subEntries),
+      description: getProjectDescription(fullPath, subEntries),
+      hasClaude: existsSync(path.join(fullPath, '.claude', 'CLAUDE.md')),
+      scripts: getProjectScripts(fullPath, subEntries),
+      hasMcp: existsSync(path.join(fullPath, '.mcp.json')) || existsSync(path.join(fullPath, '.claude', 'mcp.json')),
+    });
+  };
+
   for (const wsDir of dirs) {
     let entries: string[];
     try { entries = readdirSync(wsDir); } catch { continue; }
 
+    // Check if the workspace dir itself is a project
+    const wsDirIsProject = PROJECT_MARKERS.some(marker => {
+      if (marker.includes('/')) return existsSync(path.join(wsDir, marker));
+      return entries.includes(marker);
+    });
+    if (wsDirIsProject) {
+      addProject(wsDir, path.basename(wsDir));
+    }
+
+    // Scan subdirectories for projects
     for (const entry of entries) {
       if (entry.startsWith('.')) continue;
       const fullPath = path.join(wsDir, entry);
@@ -269,20 +299,7 @@ function scanProjects(): ProjectInfo[] {
       });
       if (!isProject) continue;
 
-      // Dedup by resolved path
-      const resolvedProject = path.resolve(fullPath);
-      if (seen.has('proj:' + resolvedProject)) continue;
-      seen.add('proj:' + resolvedProject);
-
-      projects.push({
-        name: entry,
-        path: fullPath,
-        type: detectProjectType(subEntries),
-        description: getProjectDescription(fullPath, subEntries),
-        hasClaude: existsSync(path.join(fullPath, '.claude', 'CLAUDE.md')),
-        scripts: getProjectScripts(fullPath, subEntries),
-        hasMcp: existsSync(path.join(fullPath, '.mcp.json')) || existsSync(path.join(fullPath, '.claude', 'mcp.json')),
-      });
+      addProject(fullPath, entry);
     }
   }
 
