@@ -648,18 +648,19 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
           try {
             const entry = JSON.parse(line);
             const msg = entry.msg || '';
+            const logTime = typeof entry.time === 'number' ? new Date(entry.time).toISOString() : String(entry.time || '');
             if (msg.includes('chat') || msg.includes('message') || msg.includes('gateway')) {
               activities.push({
                 type: 'chat',
                 message: msg,
-                time: entry.time || '',
+                time: logTime,
                 status: 'ok',
               });
             } else if (msg.includes('heartbeat') || msg.includes('cron')) {
               activities.push({
                 type: 'system',
                 message: msg,
-                time: entry.time || '',
+                time: logTime,
                 status: 'ok',
               });
             }
@@ -669,7 +670,7 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
     }
 
     // Sort newest-first, limit to 15
-    activities.sort((a, b) => (b.time || '').localeCompare(a.time || ''));
+    activities.sort((a, b) => String(b.time || '').localeCompare(String(a.time || '')));
     res.json({ activities: activities.slice(0, 15) });
   });
 
@@ -3133,10 +3134,12 @@ function quickChat(msg) {
 
 function renderMd(text) {
   let s = esc(text);
-  // Code blocks: \`\`\`...
-  s = s.replace(/\`\`\`([\\s\\S]*?)\`\`\`/g, '<pre style="background:var(--bg-input);padding:10px;border-radius:6px;overflow-x:auto;margin:6px 0;font-size:11px">$1</pre>');
+  var BT = String.fromCharCode(96);
+  var BT3 = BT+BT+BT;
+  // Code blocks
+  s = s.replace(new RegExp(BT3+'([\\\\s\\\\S]*?)'+BT3, 'g'), '<pre style="background:var(--bg-input);padding:10px;border-radius:6px;overflow-x:auto;margin:6px 0;font-size:11px">$1</pre>');
   // Inline code
-  s = s.replace(/\`([^\`]+)\`/g, '<code style="background:var(--bg-input);padding:1px 5px;border-radius:3px;font-size:11px">$1</code>');
+  s = s.replace(new RegExp(BT+'([^'+BT+']+)'+BT, 'g'), '<code style="background:var(--bg-input);padding:1px 5px;border-radius:3px;font-size:11px">$1</code>');
   // Bold
   s = s.replace(/\\*\\*(.+?)\\*\\*/g, '<strong>$1</strong>');
   // Italic
