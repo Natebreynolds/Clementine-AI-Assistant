@@ -39,6 +39,7 @@ export interface SessionData {
   exchanges: number;
   timestamp: string;
   exchangeHistory: Array<{ user: string; assistant: string }>;
+  pendingContext?: Array<{ user: string; assistant: string }>;
 }
 
 // ── Channel Messages ─────────────────────────────────────────────────

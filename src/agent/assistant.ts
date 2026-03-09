@@ -380,6 +380,10 @@ export class PersonalAssistant {
             assistant: ex.assistant,
           })),
         );
+        // Restore pending context queue (survives daemon restart)
+        if (entry.pendingContext?.length) {
+          this.pendingContext.set(key, entry.pendingContext);
+        }
         // Mark as restored so first post-restart message injects context
         this.restoredSessions.add(key);
       }
@@ -391,16 +395,23 @@ export class PersonalAssistant {
   private saveSessions(): void {
     try {
       const data: Record<string, SessionData> = {};
-      for (const [key, sessionId] of this.sessions) {
+      // Collect all keys that have any state worth saving
+      const allKeys = new Set([
+        ...this.sessions.keys(),
+        ...this.pendingContext.keys(),
+      ]);
+      for (const key of allKeys) {
         const ts = this.sessionTimestamps.get(key) ?? new Date();
+        const pending = this.pendingContext.get(key);
         data[key] = {
-          sessionId,
+          sessionId: this.sessions.get(key) ?? '',
           exchanges: this.exchangeCounts.get(key) ?? 0,
           timestamp: ts.toISOString(),
           exchangeHistory: (this.lastExchanges.get(key) ?? []).map((ex) => ({
             user: ex.user.slice(0, SESSION_EXCHANGE_MAX_CHARS),
             assistant: ex.assistant.slice(0, SESSION_EXCHANGE_MAX_CHARS),
           })),
+          ...(pending?.length ? { pendingContext: pending } : {}),
         };
       }
       fs.writeFileSync(SESSIONS_FILE, JSON.stringify(data, null, 2));
@@ -821,17 +832,27 @@ Delegate data-heavy work (SEO, analytics, bulk API calls for 3+ entities) to sub
     }
 
     // Drain any pending context from cron/heartbeat injections so the
-    // active SDK session knows about work that happened outside of chat
-    if (key && this.pendingContext.has(key)) {
-      const pending = this.pendingContext.get(key)!;
-      if (pending.length > 0) {
+    // active SDK session knows about work that happened outside of chat.
+    // injectContext uses the base session key (e.g. discord:user:123) but
+    // chat may use a profile-suffixed key (discord:user:123:sales-agent),
+    // so also check any pending key that the current key starts with.
+    if (key) {
+      const allPending: Array<{ user: string; assistant: string }> = [];
+
+      for (const [pendingKey, pending] of this.pendingContext) {
+        if (key === pendingKey || key.startsWith(pendingKey + ':')) {
+          allPending.push(...pending);
+          this.pendingContext.delete(pendingKey);
+        }
+      }
+
+      if (allPending.length > 0) {
         const contextLines: string[] = [];
-        for (const ctx of pending) {
+        for (const ctx of allPending) {
           contextLines.push(`[${ctx.user}]\n${ctx.assistant}`);
         }
         effectivePrompt =
           `[Background activity since your last message — you did this work via cron/scheduled tasks:\n${contextLines.join('\n\n')}]\n\n${effectivePrompt}`;
-        this.pendingContext.delete(key);
       }
     }
 
