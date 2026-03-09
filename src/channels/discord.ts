@@ -153,8 +153,10 @@ class DiscordStreamingMessage {
   private message: Message | null = null;
   private lastEdit = 0;
   private pendingText = '';
+  private lastFlushedText = '';
   private isFinal = false;
   private channel: Message['channel'];
+  private flushTimer: ReturnType<typeof setTimeout> | null = null;
 
   /** The message ID of the final bot response (available after finalize). */
   messageId: string | null = null;
@@ -171,13 +173,25 @@ class DiscordStreamingMessage {
 
   async update(text: string): Promise<void> {
     this.pendingText = text;
-    if (Date.now() - this.lastEdit >= STREAM_EDIT_INTERVAL) {
+    const elapsed = Date.now() - this.lastEdit;
+    if (elapsed >= STREAM_EDIT_INTERVAL) {
       await this.flush();
+    } else if (!this.flushTimer) {
+      // Schedule a flush so buffered text always gets pushed out,
+      // even if no new tokens arrive for a while (e.g. during tool use)
+      this.flushTimer = setTimeout(() => {
+        this.flushTimer = null;
+        this.flush().catch(() => {});
+      }, STREAM_EDIT_INTERVAL - elapsed);
     }
   }
 
   async finalize(text: string): Promise<void> {
     this.isFinal = true;
+    if (this.flushTimer) {
+      clearTimeout(this.flushTimer);
+      this.flushTimer = null;
+    }
     if (!text) text = '*(no response)*';
     text = sanitizeResponse(text);
 
@@ -197,6 +211,8 @@ class DiscordStreamingMessage {
 
   private async flush(): Promise<void> {
     if (!this.message || !this.pendingText || this.isFinal) return;
+    // Skip edit if text hasn't changed since last flush
+    if (this.pendingText === this.lastFlushedText) return;
     let display = this.pendingText;
     if (display.length > 1900) {
       display = display.slice(0, 1900) + '\n\n*...streaming...*';
@@ -205,6 +221,7 @@ class DiscordStreamingMessage {
     }
     try {
       await this.message.edit(display);
+      this.lastFlushedText = this.pendingText;
       this.lastEdit = Date.now();
     } catch {
       // Discord rate limit or message deleted — ignore
