@@ -42,6 +42,7 @@ import {
   SYSTEM_PROMPT_MAX_CONTEXT_CHARS,
   SESSION_EXCHANGE_HISTORY_SIZE,
   SESSION_EXCHANGE_MAX_CHARS,
+  INJECTED_CONTEXT_MAX_CHARS,
   UNLEASHED_PHASE_TURNS,
   UNLEASHED_DEFAULT_MAX_HOURS,
   UNLEASHED_MAX_PHASES,
@@ -582,6 +583,7 @@ Delegate data-heavy work (SEO, analytics, bulk API calls for 3+ entities) to sub
     retrievalContext?: string;
     profile?: AgentProfile | null;
     sessionKey?: string | null;
+    streaming?: boolean;
   } = {}): SDKOptions {
     const {
       isHeartbeat = false,
@@ -592,6 +594,7 @@ Delegate data-heavy work (SEO, analytics, bulk API calls for 3+ entities) to sub
       retrievalContext = '',
       profile = null,
       sessionKey = null,
+      streaming = false,
     } = opts;
 
     const allowedTools = [
@@ -668,7 +671,7 @@ Delegate data-heavy work (SEO, analytics, bulk API calls for 3+ entities) to sub
       permissionMode: 'bypassPermissions',
       allowedTools,
       disallowedTools: disallowed,
-      includePartialMessages: true,
+      ...(streaming ? { includePartialMessages: true } : {}),
       mcpServers: {
         [TOOLS_SERVER]: {
           type: 'stdio',
@@ -914,7 +917,7 @@ Delegate data-heavy work (SEO, analytics, bulk API calls for 3+ entities) to sub
 
     try {
       for (let attempt = 0; attempt <= PersonalAssistant.RATE_LIMIT_MAX_RETRIES; attempt++) {
-        const sdkOptions = this.buildOptions({ model, retrievalContext, profile, sessionKey });
+        const sdkOptions = this.buildOptions({ model, retrievalContext, profile, sessionKey, streaming: !!onText });
 
         // If a project matched, switch cwd so the agent gets its tools/CLAUDE.md
         if (matchedProject) {
@@ -1644,9 +1647,12 @@ Delegate data-heavy work (SEO, analytics, bulk API calls for 3+ entities) to sub
    * so follow-up conversation has context.
    */
   injectContext(sessionKey: string, userText: string, assistantText: string): void {
-    // Add to in-memory exchange history
+    // Add to in-memory exchange history (use larger limit for injected context)
     const history = this.lastExchanges.get(sessionKey) ?? [];
-    history.push({ user: userText, assistant: assistantText });
+    history.push({
+      user: userText.slice(0, INJECTED_CONTEXT_MAX_CHARS),
+      assistant: assistantText.slice(0, INJECTED_CONTEXT_MAX_CHARS),
+    });
     if (history.length > SESSION_EXCHANGE_HISTORY_SIZE) {
       this.lastExchanges.set(sessionKey, history.slice(-SESSION_EXCHANGE_HISTORY_SIZE));
     } else {

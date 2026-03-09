@@ -211,7 +211,8 @@ export const SYSTEM_PROMPT_MAX_CONTEXT_CHARS = 12000;
 // ── Session Persistence ──────────────────────────────────────────────
 
 export const SESSION_EXCHANGE_HISTORY_SIZE = 10;
-export const SESSION_EXCHANGE_MAX_CHARS = 6000;
+export const SESSION_EXCHANGE_MAX_CHARS = 2000;
+export const INJECTED_CONTEXT_MAX_CHARS = 6000;
 
 // ── Search Ranking ───────────────────────────────────────────────────
 

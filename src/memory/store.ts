@@ -659,7 +659,7 @@ export class MemoryStore {
     return rows.map((row) => ({
       sessionKey: row.session_key,
       role: row.role,
-      content: row.content.slice(0, 4000), // Truncate for readability
+      content: row.content.slice(0, 2000), // Truncate for readability
       model: row.model,
       createdAt: row.created_at,
     }));
