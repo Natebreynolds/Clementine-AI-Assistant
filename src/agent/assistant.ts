@@ -1666,6 +1666,20 @@ Delegate data-heavy work (SEO, analytics, bulk API calls for 3+ entities) to sub
     }
   }
 
+  getRecentActivity(sinceIso: string): Array<{
+    sessionKey: string;
+    role: string;
+    content: string;
+    createdAt: string;
+  }> {
+    if (!this.memoryStore) return [];
+    try {
+      return this.memoryStore.getRecentActivity(sinceIso);
+    } catch {
+      return [];
+    }
+  }
+
   clearSession(sessionKey: string): void {
     this.sessions.delete(sessionKey);
     this.exchangeCounts.delete(sessionKey);

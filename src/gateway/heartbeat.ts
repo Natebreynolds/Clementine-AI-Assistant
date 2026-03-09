@@ -91,10 +91,14 @@ export class HeartbeatScheduler {
     const standingInstructions = this.readHeartbeatConfig();
     const now = new Date();
     const [, currentDetails] = this.computeStateFingerprint();
-    const changesSummary = this.computeChangesSummary(
+    let changesSummary = this.computeChangesSummary(
       this.lastState.details ?? {},
       currentDetails,
     );
+    const activitySummary = this.getRecentActivitySummary();
+    if (activitySummary) {
+      changesSummary += `\n\nRecent activity:\n${activitySummary}`;
+    }
     const timeContext = HeartbeatScheduler.getTimeContext(now.getHours());
 
     try {
@@ -143,10 +147,16 @@ export class HeartbeatScheduler {
     }
 
     // Something changed — compute a summary of what
-    const changesSummary = this.computeChangesSummary(
+    let changesSummary = this.computeChangesSummary(
       this.lastState.details ?? {},
       currentDetails,
     );
+
+    // Include recent chat/cron activity so the heartbeat knows what happened
+    const activitySummary = this.getRecentActivitySummary();
+    if (activitySummary) {
+      changesSummary += `\n\nRecent activity:\n${activitySummary}`;
+    }
 
     // Persist new state
     this.lastState = {
@@ -312,6 +322,39 @@ export class HeartbeatScheduler {
     }
 
     return changes.join('; ');
+  }
+
+  /**
+   * Summarise recent chat/cron activity from transcripts so the heartbeat
+   * agent knows what happened since the last beat.
+   */
+  private getRecentActivitySummary(): string {
+    const sinceIso = this.lastState.timestamp || new Date(Date.now() - 4 * 60 * 60 * 1000).toISOString();
+    const entries = this.gateway.getRecentActivity(sinceIso);
+    if (entries.length === 0) return '';
+
+    // Group by session and summarise
+    const sessions = new Map<string, { count: number; snippets: string[] }>();
+    for (const e of entries) {
+      if (e.role === 'system') continue; // skip tool-call audit entries
+      const info = sessions.get(e.sessionKey) ?? { count: 0, snippets: [] };
+      info.count++;
+      if (info.snippets.length < 2) {
+        const label = e.role === 'user' ? 'User' : 'Bot';
+        info.snippets.push(`${label}: ${e.content.slice(0, 150)}`);
+      }
+      sessions.set(e.sessionKey, info);
+    }
+
+    const lines: string[] = [];
+    for (const [key, info] of sessions) {
+      const channel = key.split(':').slice(0, 2).join(':');
+      lines.push(`- ${channel}: ${info.count} messages`);
+      for (const s of info.snippets) {
+        lines.push(`  ${s}`);
+      }
+    }
+    return lines.join('\n');
   }
 
   static getTimeContext(hour: number): string {

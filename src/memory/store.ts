@@ -587,6 +587,39 @@ export class MemoryStore {
   }
 
   /**
+   * Get recent transcript activity across all sessions since a given timestamp.
+   * Returns a compact summary of what happened (sessions, message counts, snippets).
+   */
+  getRecentActivity(sinceIso: string, maxEntries = 10): Array<{
+    sessionKey: string;
+    role: string;
+    content: string;
+    createdAt: string;
+  }> {
+    const rows = this.conn
+      .prepare(
+        `SELECT session_key, role, content, created_at
+         FROM transcripts
+         WHERE created_at > ? AND role IN ('user', 'assistant', 'system')
+         ORDER BY created_at DESC
+         LIMIT ?`,
+      )
+      .all(sinceIso, maxEntries) as Array<{
+      session_key: string;
+      role: string;
+      content: string;
+      created_at: string;
+    }>;
+
+    return rows.map((row) => ({
+      sessionKey: row.session_key,
+      role: row.role,
+      content: row.content.slice(0, 300),
+      createdAt: row.created_at,
+    }));
+  }
+
+  /**
    * Search transcripts by keyword. Returns matching turns with context.
    */
   searchTranscripts(

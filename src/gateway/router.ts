@@ -225,6 +225,19 @@ export class Gateway {
     this.assistant.injectContext(sessionKey, userText, assistantText);
   }
 
+  /**
+   * Get recent transcript activity across all sessions.
+   * Used by heartbeat to know what happened since the last check.
+   */
+  getRecentActivity(sinceIso: string): Array<{
+    sessionKey: string;
+    role: string;
+    content: string;
+    createdAt: string;
+  }> {
+    return this.assistant.getRecentActivity(sinceIso);
+  }
+
   // ── Approval system ─────────────────────────────────────────────────
 
   async requestApproval(description: string): Promise<boolean> {
