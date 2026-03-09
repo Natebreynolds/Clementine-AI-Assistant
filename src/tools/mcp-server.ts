@@ -2514,6 +2514,20 @@ server.tool(
 
     logger.info({ jobName, schedule, tier, mode, work_dir }, 'Added cron job via MCP tool');
 
+    // Read-back verification: confirm the job was persisted correctly
+    let verified = false;
+    try {
+      const verifyRaw = readFileSync(CRON_FILE, 'utf-8');
+      const verifyParsed = matterMod.default(verifyRaw);
+      const verifyJobs = (verifyParsed.data.jobs ?? []) as Array<Record<string, unknown>>;
+      const found = verifyJobs.find(
+        (j) => String(j.name ?? '').toLowerCase() === jobName.toLowerCase(),
+      );
+      verified = !!found && String(found.schedule ?? '') === schedule;
+    } catch {
+      // Verification failed but file was written
+    }
+
     const details = [
       `  Schedule: ${schedule}`,
       `  Prompt: ${prompt.slice(0, 100)}${prompt.length > 100 ? '...' : ''}`,
@@ -2523,9 +2537,12 @@ server.tool(
     if (work_dir) details.push(`  Project: ${work_dir}`);
     if (mode === 'unleashed') details.push(`  Mode: unleashed (max ${max_hours ?? 6} hours)`);
 
+    const verifyMsg = verified
+      ? 'Verified: job persisted to CRON.md and will be picked up by the daemon.'
+      : 'WARNING: Could not verify the job was written correctly. Check CRON.md manually.';
+
     return textResult(
-      `Added cron job "${jobName}":\n${details.join('\n')}\n\n` +
-      `The daemon will auto-reload CRON.md on file change.`,
+      `Added cron job "${jobName}":\n${details.join('\n')}\n\n${verifyMsg}`,
     );
   },
 );

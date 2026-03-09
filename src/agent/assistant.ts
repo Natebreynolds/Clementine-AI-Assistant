@@ -929,6 +929,7 @@ Delegate data-heavy work (SEO, analytics, bulk API calls for 3+ entities) to sub
         let responseText = '';
         let sessionId = '';
         let hitRateLimit = false;
+        const toolCalls: string[] = []; // Track tool calls for audit trail
 
         try {
           const stream = query({ prompt, options: sdkOptions });
@@ -946,6 +947,7 @@ Delegate data-heavy work (SEO, analytics, bulk API calls for 3+ entities) to sub
                   if (onText) await onText(responseText);
                 } else if (block.type === 'tool_use' && block.name) {
                   logToolUse(block.name, (block.input ?? {}) as Record<string, unknown>);
+                  toolCalls.push(`${block.name}(${JSON.stringify(block.input ?? {}).slice(0, 200)})`);
                 }
               }
             } else if (message.type === 'stream_event') {
@@ -1013,6 +1015,19 @@ Delegate data-heavy work (SEO, analytics, bulk API calls for 3+ entities) to sub
 
         if (sessionKey && sessionId) {
           this.sessions.set(sessionKey, sessionId);
+        }
+
+        // Log tool calls to transcript for audit trail
+        if (sessionKey && toolCalls.length > 0 && this.memoryStore) {
+          try {
+            this.memoryStore.saveTurn(
+              sessionKey,
+              'system',
+              `[Tool calls: ${toolCalls.join(' → ')}]`,
+            );
+          } catch {
+            // Non-fatal
+          }
         }
 
         return [responseText, sessionId];
@@ -1622,6 +1637,34 @@ Delegate data-heavy work (SEO, analytics, bulk API calls for 3+ entities) to sub
   }
 
   // ── Session Management ────────────────────────────────────────────
+
+  /**
+   * Inject a user/assistant exchange into a session's context without running
+   * a query.  Used to give the DM session visibility of cron/heartbeat outputs
+   * so follow-up conversation has context.
+   */
+  injectContext(sessionKey: string, userText: string, assistantText: string): void {
+    // Add to in-memory exchange history
+    const history = this.lastExchanges.get(sessionKey) ?? [];
+    history.push({ user: userText, assistant: assistantText });
+    if (history.length > SESSION_EXCHANGE_HISTORY_SIZE) {
+      this.lastExchanges.set(sessionKey, history.slice(-SESSION_EXCHANGE_HISTORY_SIZE));
+    } else {
+      this.lastExchanges.set(sessionKey, history);
+    }
+    this.sessionTimestamps.set(sessionKey, new Date());
+    this.saveSessions();
+
+    // Persist to transcript store
+    if (this.memoryStore) {
+      try {
+        this.memoryStore.saveTurn(sessionKey, 'user', userText);
+        this.memoryStore.saveTurn(sessionKey, 'assistant', assistantText, 'cron');
+      } catch {
+        // Non-fatal
+      }
+    }
+  }
 
   clearSession(sessionKey: string): void {
     this.sessions.delete(sessionKey);

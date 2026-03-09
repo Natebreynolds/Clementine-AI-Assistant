@@ -375,6 +375,8 @@ export async function startDiscord(
       await streamer.start();
       const response = await heartbeat.runManual();
       await streamer.finalize(response);
+      // Inject into DM session so follow-up conversation has context
+      gateway.injectContext(sessionKey, '!heartbeat', response);
       return;
     }
 
@@ -396,6 +398,7 @@ export async function startDiscord(
           await message.reply(`Unleashed task "${jobName}" started in background (max ${job.maxHours ?? 6}h). Check the dashboard for progress.`);
           cronScheduler.runManual(jobName).then((result) => {
             message.reply(`**[Unleashed: ${jobName} — done]**\n\n${result.slice(0, 1800)}`).catch(() => {});
+            gateway.injectContext(sessionKey, `!cron run ${jobName}`, result);
           }).catch((err) => {
             message.reply(`**[Unleashed: ${jobName} — error]**\n\n${err}`).catch(() => {});
           });
@@ -404,6 +407,8 @@ export async function startDiscord(
           await streamer.start();
           const response = await cronScheduler.runManual(jobName);
           await streamer.finalize(response);
+          // Inject into DM session so follow-up conversation has context
+          gateway.injectContext(sessionKey, `!cron run ${jobName}`, response);
         }
       } else if (subCmd === 'disable' && jobName) {
         await message.reply(cronScheduler.disableJob(jobName));

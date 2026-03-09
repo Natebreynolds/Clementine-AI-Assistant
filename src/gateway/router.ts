@@ -217,6 +217,14 @@ export class Gateway {
     }
   }
 
+  /**
+   * Inject a command/response exchange into a session so follow-up
+   * conversation has context (e.g. cron output shown in DM).
+   */
+  injectContext(sessionKey: string, userText: string, assistantText: string): void {
+    this.assistant.injectContext(sessionKey, userText, assistantText);
+  }
+
   // ── Approval system ─────────────────────────────────────────────────
 
   async requestApproval(description: string): Promise<boolean> {

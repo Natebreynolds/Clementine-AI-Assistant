@@ -35,6 +35,7 @@ import {
   HEARTBEAT_ACTIVE_START,
   HEARTBEAT_ACTIVE_END,
   BASE_DIR,
+  DISCORD_OWNER_ID,
 } from '../config.js';
 import type { CronJobDefinition, CronRunEntry, HeartbeatState } from '../types.js';
 import type { NotificationDispatcher } from './notifications.js';
@@ -631,6 +632,14 @@ export class CronScheduler {
               entry.deliveryFailed = true;
               entry.deliveryError = Object.values(result.channelErrors).join('; ').slice(0, 300);
               logger.warn({ job: job.name, errors: result.channelErrors }, 'Cron output not delivered to any channel');
+            }
+            // Inject into owner's DM session so follow-up conversation has context
+            if (DISCORD_OWNER_ID && DISCORD_OWNER_ID !== '0') {
+              this.gateway.injectContext(
+                `discord:user:${DISCORD_OWNER_ID}`,
+                `[Scheduled cron: ${job.name}]`,
+                response,
+              );
             }
           }
 
