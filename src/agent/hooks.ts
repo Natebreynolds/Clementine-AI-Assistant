@@ -241,6 +241,24 @@ export async function enforceToolPermissions(
       };
     }
 
+    // Outbound email via shell scripts — same approval gate as MCP outlook_send.
+    // Prevents prompt injection from bypassing MCP-level hooks via Bash.
+    if (/\b(?:sf-send-email|send-email|sendmail|mutt|mail\s+-s)\b/i.test(cmd)) {
+      if (heartbeatActive) {
+        return {
+          behavior: 'deny',
+          message: 'Sending email via shell is forbidden during autonomous execution.',
+        };
+      }
+      if (approvalCallback) {
+        const approved = await approvalCallback(`Send email via Bash: ${cmd.slice(0, 120)}`);
+        if (!approved) {
+          return { behavior: 'deny', message: 'Email send denied by user.' };
+        }
+      }
+      appendAuditFile(`[${isOwnerDm ? 'OWNER-DM' : 'CHANNEL'}] Bash email send approved: ${cmd.slice(0, 120)}`);
+    }
+
     // Destructive commands: owner DMs = allow (they're asking for it),
     // autonomous = block, channel = block
     if (matchesAny(cmd, DESTRUCTIVE_PATTERNS)) {
@@ -271,7 +289,9 @@ export async function enforceToolPermissions(
     };
   }
 
-  if (isOutboundSend && !isOwnerDm) {
+  // ALL outbound sends require approval — including owner DMs.
+  // This prevents the model from sending when asked to "draft".
+  if (isOutboundSend) {
     if (approvalCallback) {
       const desc = toolName.includes('outlook_send')
         ? `Send email to ${toolInput.to ?? '?'}: "${toolInput.subject ?? '?'}"`
@@ -281,14 +301,11 @@ export async function enforceToolPermissions(
         return { behavior: 'deny', message: 'Send denied by user.' };
       }
     }
-  }
-
-  // In owner DMs, outbound sends are allowed but audit-logged prominently
-  if (isOutboundSend && isOwnerDm) {
+    // Audit-log all approved sends
     const target = toolName.includes('outlook_send')
       ? `email to ${toolInput.to ?? '?'}`
       : `discord channel ${toolInput.channel_id ?? '?'}`;
-    appendAuditFile(`[OWNER-DM] Outbound send: ${target}`);
+    appendAuditFile(`[${isOwnerDm ? 'OWNER-DM' : 'CHANNEL'}] Outbound send approved: ${target}`);
   }
 
   // ── SSRF protection (always — protects against prompt injection) ─

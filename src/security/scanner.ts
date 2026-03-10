@@ -215,14 +215,17 @@ export class InjectionScanner {
     if (!l4Triggered) {
       for (const phrase of BLACKLIST_PHRASES) {
         const phraseLen = phrase.length;
-        const windowMin = Math.max(0, phraseLen - 3);
-        const windowMax = phraseLen + 3;
+        // Scale fuzzy tolerance by phrase length — short phrases get tighter matching
+        // to avoid false positives like "you are always" ≈ "you are dan"
+        const maxDist = phraseLen >= 20 ? BLACKLIST_FUZZY_DISTANCE : 1;
+        const windowMin = Math.max(0, phraseLen - maxDist);
+        const windowMax = phraseLen + maxDist;
 
         // Slide a window across the normalized text
         for (let start = 0; start <= normalized.length - windowMin; start++) {
           for (let end = start + windowMin; end <= Math.min(start + windowMax, normalized.length); end++) {
             const substring = normalized.slice(start, end);
-            if (levenshtein(substring, phrase) <= BLACKLIST_FUZZY_DISTANCE) {
+            if (levenshtein(substring, phrase) <= maxDist) {
               l4Triggered = true;
               score += 0.2;
               l4Details.push(`fuzzy: "${phrase}"`);

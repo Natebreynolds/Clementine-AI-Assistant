@@ -1036,7 +1036,9 @@ Delegate data-heavy work (SEO, analytics, bulk API calls for 3+ entities) to sub
           } else {
             logger.error({ err: e, sessionKey }, 'SDK query failed');
             if (!responseText) {
-              responseText = 'Sorry, I hit a temporary issue. Please try again.';
+              // Surface a concise error description instead of a generic message
+              const shortErr = String(e).replace(/\n.*$/s, '').slice(0, 200);
+              responseText = `Hit an error: ${shortErr}. Try again or \`!clear\` to reset the session.`;
             }
           }
         }
