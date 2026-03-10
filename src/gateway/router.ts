@@ -7,7 +7,7 @@
 
 import pino from 'pino';
 import type { PersonalAssistant } from '../agent/assistant.js';
-import type { OnTextCallback } from '../types.js';
+import type { OnTextCallback, PlanProgressUpdate } from '../types.js';
 import { scanner } from '../security/scanner.js';
 import { lanes } from './lanes.js';
 
@@ -231,6 +231,61 @@ export class Gateway {
       } catch (err) {
         logger.error({ err, jobName }, `Cron job error: ${jobName}`);
         throw err;
+      }
+    } finally {
+      releaseLane();
+    }
+  }
+
+  // ── Plan orchestration ──────────────────────────────────────────────
+
+  async handlePlan(
+    sessionKey: string,
+    taskDescription: string,
+    onProgress?: (updates: PlanProgressUpdate[]) => Promise<void>,
+  ): Promise<string> {
+    const releaseLane = await lanes.acquire('chat');
+    try {
+      const release = await this.acquireSessionLock(sessionKey);
+      try {
+        // Pre-flight injection scan (same as handleMessage)
+        scanner.refreshIntegrity();
+        const scan = scanner.scan(taskDescription);
+
+        const isOwnerDm = sessionKey.startsWith('discord:user:') ||
+          sessionKey.startsWith('slack:dm:') ||
+          sessionKey.startsWith('telegram:');
+        const shouldBlock = scan.verdict === 'block' && !isOwnerDm;
+
+        if (shouldBlock) {
+          logger.warn(
+            { sessionKey, verdict: scan.verdict, reasons: scan.reasons, score: scan.score },
+            'Plan blocked by injection scanner',
+          );
+          return "I can't process that plan. It was flagged by my security system.";
+        }
+
+        if (scan.verdict === 'block' && isOwnerDm) {
+          logger.info(
+            { sessionKey, verdict: 'warn (downgraded)', reasons: scan.reasons },
+            'Owner DM plan block downgraded to warning',
+          );
+        } else if (scan.verdict === 'warn') {
+          logger.info(
+            { sessionKey, verdict: scan.verdict, reasons: scan.reasons },
+            'Plan flagged by injection scanner',
+          );
+        }
+
+        const { PlanOrchestrator } = await import('../agent/orchestrator.js');
+        const orchestrator = new PlanOrchestrator(this.assistant);
+        const result = await orchestrator.run(taskDescription, onProgress);
+
+        scanner.refreshIntegrity();
+        this.assistant.injectContext(sessionKey, `[Plan: ${taskDescription}]`, result);
+        return result;
+      } finally {
+        release();
       }
     } finally {
       releaseLane();

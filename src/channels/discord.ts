@@ -420,6 +420,62 @@ export async function startDiscord(
       return;
     }
 
+    // ── Plan orchestration (DM only) ─────────────────────────────────
+
+    if (isDm && text.startsWith('!plan ')) {
+      const taskDescription = text.slice(6).trim();
+      if (!taskDescription) {
+        await message.reply('Usage: `!plan <task description>`');
+        return;
+      }
+
+      const streamer = new DiscordStreamingMessage(message.channel);
+      await streamer.start();
+      await streamer.update('Planning...');
+
+      let progressTimer: ReturnType<typeof setInterval> | null = null;
+      try {
+        const result = await gateway.handlePlan(
+          sessionKey,
+          taskDescription,
+          async (updates) => {
+            // Build progress display (truncate descriptions to fit Discord limit)
+            const lines = [
+              `**Plan:** ${taskDescription.slice(0, 100)}`,
+              '',
+              ...updates.map((u, i) => {
+                const num = `[${i + 1}/${updates.length}]`;
+                const desc = u.description.slice(0, 60);
+                switch (u.status) {
+                  case 'done': return `${num} ${desc} \u2713 (${Math.round((u.durationMs ?? 0) / 1000)}s)`;
+                  case 'running': return `${num} ${desc} \u23f3 running...`;
+                  case 'failed': return `${num} ${desc} \u2717 failed`;
+                  default: return `${num} ${desc} \u25cb waiting`;
+                }
+              }),
+            ];
+            await streamer.update(lines.join('\n').slice(0, 1800));
+
+            // Start progress timer on first running step
+            if (!progressTimer && updates.some(u => u.status === 'running')) {
+              progressTimer = setInterval(async () => {
+                // Re-render with live elapsed times (static snapshot — no orchestrator ref needed)
+                await streamer.update(lines.join('\n').slice(0, 1800));
+              }, 5000);
+            }
+          },
+        );
+
+        await streamer.finalize(result);
+      } catch (err) {
+        logger.error({ err }, 'Plan execution failed');
+        await streamer.finalize(`Plan failed: ${err}`);
+      } finally {
+        if (progressTimer) clearInterval(progressTimer);
+      }
+      return;
+    }
+
     // ── Approval responses (DM only) ────────────────────────────────
 
     if (isDm) {

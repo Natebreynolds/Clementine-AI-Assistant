@@ -192,6 +192,7 @@ function matchesAny(text: string, patterns: RegExp[]): boolean {
 export async function enforceToolPermissions(
   toolName: string,
   toolInput: Record<string, unknown>,
+  sourceOverride?: 'owner-dm' | 'owner-channel' | 'autonomous',
 ): Promise<{ behavior: 'allow' | 'deny'; message?: string }> {
   // ── Heartbeat restrictions ─────────────────────────────────────
   if (heartbeatActive) {
@@ -214,7 +215,8 @@ export async function enforceToolPermissions(
     }
   }
 
-  const isOwnerDm = interactionSource === 'owner-dm';
+  const effectiveSource = sourceOverride ?? interactionSource;
+  const isOwnerDm = effectiveSource === 'owner-dm';
 
   // ── Credential file read blocking ──────────────────────────────
   // Owner DMs: allow (sanitizeResponse strips secrets from channel output)

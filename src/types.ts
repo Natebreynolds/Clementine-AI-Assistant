@@ -170,6 +170,32 @@ export interface Feedback {
   createdAt?: string;
 }
 
+// ── Plan Orchestration ───────────────────────────────────────────────
+
+export interface PlanStep {
+  id: string;              // "step-1", "step-2"
+  description: string;     // Human-readable
+  prompt: string;          // Full prompt for the sub-agent
+  dependsOn: string[];     // Step IDs this depends on (empty = parallel)
+  maxTurns: number;        // Turns budget for this step (default 15, up to 50 for complex)
+  tier: number;            // Security tier (default 2)
+  model?: string;          // Optional model override (e.g., "haiku" for simple lookups)
+}
+
+export interface ExecutionPlan {
+  goal: string;
+  steps: PlanStep[];
+  synthesisPrompt: string;
+}
+
+export interface PlanProgressUpdate {
+  stepId: string;
+  status: 'waiting' | 'running' | 'done' | 'failed';
+  description: string;
+  durationMs?: number;
+  resultPreview?: string;
+}
+
 // ── Utility types ────────────────────────────────────────────────────
 
 type float = number;

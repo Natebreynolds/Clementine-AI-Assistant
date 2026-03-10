@@ -61,7 +61,7 @@ import {
 } from './hooks.js';
 import { scanner } from '../security/scanner.js';
 import { ProfileManager } from './profiles.js';
-import { toolLoopDetector } from './tool-loop-detector.js';
+import { toolLoopDetector, ToolLoopDetector } from './tool-loop-detector.js';
 
 // ── Token estimation & context window guard ─────────────────────────
 
@@ -627,6 +627,9 @@ Delegate data-heavy work (SEO, analytics, bulk API calls for 3+ entities) to sub
     profile?: AgentProfile | null;
     sessionKey?: string | null;
     streaming?: boolean;
+    isPlanStep?: boolean;
+    sourceOverride?: 'owner-dm' | 'owner-channel' | 'autonomous';
+    disableAllTools?: boolean;
   } = {}): SDKOptions {
     const {
       isHeartbeat = false,
@@ -638,6 +641,9 @@ Delegate data-heavy work (SEO, analytics, bulk API calls for 3+ entities) to sub
       profile = null,
       sessionKey = null,
       streaming = false,
+      isPlanStep = false,
+      sourceOverride,
+      disableAllTools = false,
     } = opts;
 
     const allowedTools = [
@@ -694,25 +700,31 @@ Delegate data-heavy work (SEO, analytics, bulk API calls for 3+ entities) to sub
     const effectiveMaxTurns = maxTurns ?? (isHeartbeat ? HEARTBEAT_MAX_TURNS : 15);
 
     // Determine security prompt for appendSystemPrompt
-    const securityPrompt = cronTier !== null && cronTier !== undefined
-      ? getCronSecurityPrompt(cronTier)
-      : isHeartbeat
-        ? getHeartbeatSecurityPrompt()
-        : getSecurityPrompt();
+    // Plan steps are user-initiated — use the interactive security prompt, not cron
+    const securityPrompt = isPlanStep
+      ? getSecurityPrompt()
+      : cronTier !== null && cronTier !== undefined
+        ? getCronSecurityPrompt(cronTier)
+        : isHeartbeat
+          ? getHeartbeatSecurityPrompt()
+          : getSecurityPrompt();
 
     // Fallback model: auto-fallback on rate limits (avoid self-referencing)
     const resolvedModel = resolveModel(model) ?? MODEL;
     const fallback = resolvedModel !== MODELS.sonnet ? MODELS.sonnet : undefined;
 
+    // Capture source at build time so concurrent queries don't race on the global
+    const capturedSource = sourceOverride;
+
     return {
       customSystemPrompt: this.buildSystemPrompt({
-        isHeartbeat, cronTier, retrievalContext, profile, sessionKey, model,
+        isHeartbeat, cronTier: isPlanStep ? null : cronTier, retrievalContext, profile, sessionKey, model,
       }),
       appendSystemPrompt: securityPrompt,
       model: resolvedModel,
       ...(fallback ? { fallbackModel: fallback } : {}),
       permissionMode: 'bypassPermissions',
-      allowedTools,
+      allowedTools: disableAllTools ? [] : allowedTools,
       disallowedTools: disallowed,
       ...(streaming ? { includePartialMessages: true } : {}),
       mcpServers: {
@@ -727,7 +739,7 @@ Delegate data-heavy work (SEO, analytics, bulk API calls for 3+ entities) to sub
       cwd: BASE_DIR,
       env: SAFE_ENV,
       canUseTool: async (toolName, toolInput, _options) => {
-        const result = await enforceToolPermissions(toolName, toolInput);
+        const result = await enforceToolPermissions(toolName, toolInput, capturedSource);
         if (result.behavior === 'deny') {
           return { behavior: 'deny' as const, message: result.message ?? 'Denied.' };
         }
@@ -1448,6 +1460,66 @@ Delegate data-heavy work (SEO, analytics, bulk API calls for 3+ entities) to sub
     }
 
     return responseText;
+  }
+
+  // ── Plan Step Execution ───────────────────────────────────────────
+
+  async runPlanStep(
+    stepId: string,
+    prompt: string,
+    opts: { tier?: number; maxTurns?: number; model?: string; disableTools?: boolean } = {},
+  ): Promise<string> {
+    const { tier = 2, maxTurns = 15, model, disableTools = false } = opts;
+
+    // Don't mutate the global — pass source through the closure instead
+    const sdkOptions = this.buildOptions({
+      isHeartbeat: false,
+      cronTier: tier,
+      maxTurns,
+      model: model ?? null,
+      enableTeams: false,
+      isPlanStep: true,
+      sourceOverride: 'owner-dm',
+      disableAllTools: disableTools,
+    });
+
+    // Per-step detector so concurrent steps don't cross-contaminate
+    const stepLoopDetector = new ToolLoopDetector();
+    const trace: TraceEntry[] = [];
+    const stream = query({ prompt, options: sdkOptions });
+
+    for await (const message of stream) {
+      if (message.type === 'assistant') {
+        const blocks = getContentBlocks(message as SDKAssistantMessage);
+        for (const block of blocks) {
+          if (block.type === 'text' && block.text) {
+            trace.push({ type: 'text', timestamp: new Date().toISOString(), content: block.text });
+          } else if (block.type === 'tool_use' && block.name) {
+            const loopCheck = stepLoopDetector.recordCall(block.name, (block.input ?? {}) as Record<string, unknown>);
+            if (loopCheck.verdict === 'block') {
+              logger.warn({ tool: block.name, stepId, ...loopCheck }, 'Tool loop detected in plan step');
+            }
+            trace.push({
+              type: 'tool_call',
+              timestamp: new Date().toISOString(),
+              content: `${block.name}(${JSON.stringify(block.input ?? {}).slice(0, 500)})`,
+            });
+          }
+        }
+      } else if (message.type === 'result') {
+        if ('total_cost_usd' in message) {
+          logger.info({
+            stepId,
+            cost_usd: (message as any).total_cost_usd,
+            num_turns: (message as any).num_turns,
+            duration_ms: (message as any).duration_ms,
+          }, 'Plan step query completed');
+        }
+      }
+    }
+
+    return extractDeliverable(trace) ||
+      trace.filter(t => t.type === 'text').map(t => t.content).join('').trim();
   }
 
   async runCronJob(
