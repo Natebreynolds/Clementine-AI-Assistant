@@ -61,6 +61,32 @@ import {
 } from './hooks.js';
 import { scanner } from '../security/scanner.js';
 import { ProfileManager } from './profiles.js';
+import { toolLoopDetector } from './tool-loop-detector.js';
+
+// ── Token estimation & context window guard ─────────────────────────
+
+/** Rough token estimate: ~4 chars per token for English text. */
+function estimateTokens(text: string): number {
+  return Math.ceil(text.length / 4);
+}
+
+/** Minimum tokens needed for the model to generate a useful response. */
+const CONTEXT_GUARD_MIN_TOKENS = 16_000;
+/** Warn threshold — context is getting tight. */
+const CONTEXT_GUARD_WARN_TOKENS = 32_000;
+/** Approximate context window sizes by model family. */
+const MODEL_CONTEXT_WINDOWS: Record<string, number> = {
+  'haiku': 200_000,
+  'sonnet': 200_000,
+  'opus': 200_000,
+};
+
+function getContextWindow(model: string): number {
+  for (const [family, size] of Object.entries(MODEL_CONTEXT_WINDOWS)) {
+    if (model.includes(family)) return size;
+  }
+  return 200_000; // safe default
+}
 
 // ── Constants ────────────────────────────────────────────────────────
 
@@ -340,11 +366,16 @@ export class PersonalAssistant {
   private profileManager: ProfileManager;
   private memoryStore: any = null; // Typed as any — MemoryStore may not be available yet
   private _lastUserMessage?: string;
+  private onUnleashedComplete: ((jobName: string, result: string) => void) | null = null;
 
   constructor() {
     this.profileManager = new ProfileManager(PROFILES_DIR);
     this.loadSessions();
     this.initMemoryStore();
+  }
+
+  setUnleashedCompleteCallback(cb: (jobName: string, result: string) => void): void {
+    this.onUnleashedComplete = cb;
   }
 
   private async initMemoryStore(): Promise<void> {
@@ -778,6 +809,7 @@ Delegate data-heavy work (SEO, analytics, bulk API calls for 3+ entities) to sub
         await this.preRotationFlush(key);
         this.sessions.delete(key);
         this.exchangeCounts.set(key, 0);
+        toolLoopDetector.reset();
         sessionRotated = true;
       }
     }
@@ -787,6 +819,7 @@ Delegate data-heavy work (SEO, analytics, bulk API calls for 3+ entities) to sub
       await this.preRotationFlush(key);
       this.sessions.delete(key);
       this.exchangeCounts.set(key, 0);
+      toolLoopDetector.reset();
       sessionRotated = true;
     }
 
@@ -871,6 +904,7 @@ Delegate data-heavy work (SEO, analytics, bulk API calls for 3+ entities) to sub
       logger.warn({ sessionKey: key }, 'Context overflow detected — rotating session');
       this.sessions.delete(key);
       this.exchangeCounts.set(key, 0);
+      toolLoopDetector.reset();
       let retryPrompt = text;
       const summary = await this.summarizeSession(key);
       if (summary) {
@@ -966,6 +1000,37 @@ Delegate data-heavy work (SEO, analytics, bulk API calls for 3+ entities) to sub
           sdkOptions.resume = this.sessions.get(sessionKey);
         }
 
+        // Context window guard: estimate token usage and bail if too tight
+        const systemPromptTokens = estimateTokens(sdkOptions.customSystemPrompt ?? '');
+        const appendPromptTokens = estimateTokens(sdkOptions.appendSystemPrompt ?? '');
+        const promptTokens = estimateTokens(prompt);
+        const totalEstimate = systemPromptTokens + appendPromptTokens + promptTokens;
+        const contextWindow = getContextWindow(sdkOptions.model ?? MODEL);
+        const remainingTokens = contextWindow - totalEstimate;
+
+        if (remainingTokens < CONTEXT_GUARD_MIN_TOKENS) {
+          logger.warn({
+            sessionKey,
+            estimatedTokens: totalEstimate,
+            contextWindow,
+            remaining: remainingTokens,
+          }, 'Context window guard: insufficient space — rotating session');
+          // Force session rotation
+          if (sessionKey) {
+            this.sessions.delete(sessionKey);
+            this.exchangeCounts.set(sessionKey, 0);
+          }
+          return ['Your conversation context got too large. I\'ve reset the session — please try your message again.', ''];
+        }
+
+        if (remainingTokens < CONTEXT_GUARD_WARN_TOKENS) {
+          logger.info({
+            sessionKey,
+            estimatedTokens: totalEstimate,
+            remaining: remainingTokens,
+          }, 'Context window guard: context getting tight');
+        }
+
         let responseText = '';
         let sessionId = '';
         let hitRateLimit = false;
@@ -987,6 +1052,10 @@ Delegate data-heavy work (SEO, analytics, bulk API calls for 3+ entities) to sub
                   if (onText) await onText(responseText);
                 } else if (block.type === 'tool_use' && block.name) {
                   logToolUse(block.name, (block.input ?? {}) as Record<string, unknown>);
+                  const loopCheck = toolLoopDetector.recordCall(block.name, (block.input ?? {}) as Record<string, unknown>);
+                  if (loopCheck.verdict === 'block') {
+                    logger.warn({ tool: block.name, ...loopCheck }, 'Tool loop detected — blocking');
+                  }
                   toolCalls.push(`${block.name}(${JSON.stringify(block.input ?? {}).slice(0, 200)})`);
                 }
               }
@@ -1099,6 +1168,10 @@ Delegate data-heavy work (SEO, analytics, bulk API calls for 3+ entities) to sub
       `Summarize this conversation in 3-5 bullet points. ` +
       `Focus on: topics discussed, decisions made, action items, ` +
       `and any important context for continuing the conversation.\n\n` +
+      `**CRITICAL: Preserve all identifiers exactly as they appear** — ` +
+      `UUIDs, task IDs (T-001), URLs, file paths, email addresses, ` +
+      `phone numbers, dates, branch names, PR numbers, and any other ` +
+      `opaque identifiers. These cannot be reconstructed if lost.\n\n` +
       `${conversation}\n\nRespond with ONLY the bullet points, no preamble.`;
 
     try {
@@ -1432,6 +1505,10 @@ Delegate data-heavy work (SEO, analytics, bulk API calls for 3+ entities) to sub
               trace.push({ type: 'text', timestamp: new Date().toISOString(), content: block.text });
             } else if (block.type === 'tool_use' && block.name) {
               logToolUse(block.name, (block.input ?? {}) as Record<string, unknown>);
+              const loopCheck = toolLoopDetector.recordCall(block.name, (block.input ?? {}) as Record<string, unknown>);
+              if (loopCheck.verdict === 'block') {
+                logger.warn({ tool: block.name, ...loopCheck }, 'Tool loop detected — blocking');
+              }
               trace.push({
                 type: 'tool_call',
                 timestamp: new Date().toISOString(),
@@ -1514,7 +1591,11 @@ Delegate data-heavy work (SEO, analytics, bulk API calls for 3+ entities) to sub
         appendProgress({ event: 'cancelled', phase });
         writeStatus({ jobName, status: 'cancelled', phase, startedAt, finishedAt: new Date().toISOString() });
         logger.info(`Unleashed task ${jobName} cancelled at phase ${phase}`);
-        return lastOutput || `Task "${jobName}" was cancelled at phase ${phase}.`;
+        const cancelResult = lastOutput || `Task "${jobName}" was cancelled at phase ${phase}.`;
+        if (this.onUnleashedComplete) {
+          try { this.onUnleashedComplete(jobName, cancelResult); } catch { /* non-fatal */ }
+        }
+        return cancelResult;
       }
 
       // Check deadline
@@ -1522,7 +1603,11 @@ Delegate data-heavy work (SEO, analytics, bulk API calls for 3+ entities) to sub
         appendProgress({ event: 'timeout', phase, maxHours: effectiveMaxHours });
         writeStatus({ jobName, status: 'timeout', phase, startedAt, finishedAt: new Date().toISOString() });
         logger.info(`Unleashed task ${jobName} timed out after ${effectiveMaxHours}h at phase ${phase}`);
-        return lastOutput || `Task "${jobName}" timed out after ${effectiveMaxHours} hours (phase ${phase}).`;
+        const timeoutResult = lastOutput || `Task "${jobName}" timed out after ${effectiveMaxHours} hours (phase ${phase}).`;
+        if (this.onUnleashedComplete) {
+          try { this.onUnleashedComplete(jobName, timeoutResult); } catch { /* non-fatal */ }
+        }
+        return timeoutResult;
       }
 
       phase++;
@@ -1602,6 +1687,10 @@ Delegate data-heavy work (SEO, analytics, bulk API calls for 3+ entities) to sub
                 phaseOutput += block.text;
               } else if (block.type === 'tool_use' && block.name) {
                 logToolUse(block.name, (block.input ?? {}) as Record<string, unknown>);
+                const loopCheck = toolLoopDetector.recordCall(block.name, (block.input ?? {}) as Record<string, unknown>);
+                if (loopCheck.verdict === 'block') {
+                  logger.warn({ tool: block.name, ...loopCheck }, 'Tool loop detected — blocking');
+                }
               }
             }
           } else if (message.type === 'result') {
@@ -1629,7 +1718,11 @@ Delegate data-heavy work (SEO, analytics, bulk API calls for 3+ entities) to sub
           appendProgress({ event: 'aborted', phase, reason: `${MAX_CONSECUTIVE_ERRORS} consecutive phase errors` });
           writeStatus({ jobName, status: 'error', phase, startedAt, finishedAt: new Date().toISOString() });
           logger.error(`Unleashed task ${jobName} aborted after ${MAX_CONSECUTIVE_ERRORS} consecutive errors`);
-          return lastOutput || `Task "${jobName}" aborted after ${MAX_CONSECUTIVE_ERRORS} consecutive phase errors.`;
+          const errorResult = lastOutput || `Task "${jobName}" aborted after ${MAX_CONSECUTIVE_ERRORS} consecutive phase errors.`;
+          if (this.onUnleashedComplete) {
+            try { this.onUnleashedComplete(jobName, errorResult); } catch { /* non-fatal */ }
+          }
+          return errorResult;
         }
 
         // On error, try to continue with a fresh session
@@ -1667,6 +1760,9 @@ Delegate data-heavy work (SEO, analytics, bulk API calls for 3+ entities) to sub
         appendProgress({ event: 'completed', phase });
         writeStatus({ jobName, status: 'completed', phase, startedAt, finishedAt: new Date().toISOString() });
         logger.info(`Unleashed task ${jobName} completed at phase ${phase}`);
+        if (this.onUnleashedComplete) {
+          try { this.onUnleashedComplete(jobName, lastOutput); } catch { /* non-fatal */ }
+        }
         return lastOutput;
       }
     }
@@ -1675,7 +1771,11 @@ Delegate data-heavy work (SEO, analytics, bulk API calls for 3+ entities) to sub
     appendProgress({ event: 'max_phases', phase });
     writeStatus({ jobName, status: 'max_phases', phase, startedAt, finishedAt: new Date().toISOString() });
     logger.warn(`Unleashed task ${jobName} hit max phases (${UNLEASHED_MAX_PHASES})`);
-    return lastOutput || `Task "${jobName}" reached maximum phase limit (${UNLEASHED_MAX_PHASES}).`;
+    const maxPhasesResult = lastOutput || `Task "${jobName}" reached maximum phase limit (${UNLEASHED_MAX_PHASES}).`;
+    if (this.onUnleashedComplete) {
+      try { this.onUnleashedComplete(jobName, maxPhasesResult); } catch { /* non-fatal */ }
+    }
+    return maxPhasesResult;
   }
 
   // ── Session Management ────────────────────────────────────────────
@@ -1740,6 +1840,7 @@ Delegate data-heavy work (SEO, analytics, bulk API calls for 3+ entities) to sub
     this.exchangeCounts.delete(sessionKey);
     this.sessionTimestamps.delete(sessionKey);
     this.lastExchanges.delete(sessionKey);
+    toolLoopDetector.reset();
     this.saveSessions();
   }
 

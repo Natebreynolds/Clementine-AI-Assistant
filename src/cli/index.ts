@@ -1,4 +1,13 @@
 #!/usr/bin/env node
+
+// Enable Node.js module compile cache for faster startup
+import { enableCompileCache } from 'node:module';
+try {
+  enableCompileCache?.();
+} catch {
+  // Not available in older Node.js versions — ignore
+}
+
 /**
  * Clementine CLI — launch, stop, restart, status, doctor, config.
  *

@@ -556,6 +556,14 @@ export class CronScheduler {
   start(): void {
     this.reloadJobs();
     this.watchCronFile();
+
+    // Wire up push notifications for unleashed task completions
+    this.gateway.setUnleashedCompleteCallback((jobName, result) => {
+      if (result && result !== '__NOTHING__') {
+        this.dispatcher.send(`✅ Unleashed task **${jobName}** completed:\n\n${result.slice(0, 1500)}`).catch(() => {});
+      }
+    });
+
     logger.info(`Cron scheduler started with ${this.jobs.length} jobs`);
   }
 

@@ -7,6 +7,8 @@
 
 import type { SearchResult } from '../types.js';
 
+export { mmrRerank } from './mmr.js';
+
 /**
  * Exponential decay multiplier based on age.
  *

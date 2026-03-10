@@ -25,6 +25,7 @@ import type {
   WikilinkConnection,
 } from '../types.js';
 import { chunkFile } from './chunker.js';
+import { mmrRerank } from './mmr.js';
 import { deduplicateResults } from './search.js';
 
 const WIKILINK_RE = /\[\[([^\]|]+)(?:\|[^\]]+)?\]\]/g;
@@ -500,7 +501,7 @@ export class MemoryStore {
 
     // 3. Merge and deduplicate (FTS results first, so they win on ties)
     const merged = [...ftsResults, ...recentResults];
-    return deduplicateResults(merged);
+    return mmrRerank(deduplicateResults(merged), 0.7, limit + recencyLimit);
   }
 
   // ── Wikilink Graph ────────────────────────────────────────────────
