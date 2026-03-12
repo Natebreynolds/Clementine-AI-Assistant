@@ -2393,7 +2393,12 @@ server.tool(
 
     const matterMod = await import('gray-matter');
     const raw = readFileSync(CRON_FILE, 'utf-8');
-    const parsed = matterMod.default(raw);
+    let parsed;
+    try {
+      parsed = matterMod.default(raw);
+    } catch (err) {
+      return textResult(`CRON.md has a YAML syntax error — fix the file before listing jobs.\nError: ${err instanceof Error ? err.message : err}`);
+    }
     const jobDefs = (parsed.data.jobs ?? []) as Array<Record<string, unknown>>;
 
     if (jobDefs.length === 0) {
@@ -2508,8 +2513,14 @@ server.tool(
     jobs.push(newJob);
     parsed.data.jobs = jobs;
 
-    // Write back preserving body content
+    // Write back preserving body content — validate first to prevent daemon crash
     const output = matterMod.default.stringify(parsed.content, parsed.data);
+    const { validateCronYaml } = await import('../gateway/heartbeat.js');
+    const yamlErr = validateCronYaml(output);
+    if (yamlErr) {
+      logger.error({ yamlErr, jobName }, 'Generated CRON.md has invalid YAML — aborting write');
+      return textResult(`Failed to add job "${jobName}": generated YAML is invalid. Error: ${yamlErr}`);
+    }
     writeFileSync(CRON_FILE, output);
 
     logger.info({ jobName, schedule, tier, mode, work_dir }, 'Added cron job via MCP tool');

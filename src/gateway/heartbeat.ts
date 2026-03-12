@@ -435,7 +435,13 @@ export function parseCronJobs(): CronJobDefinition[] {
   if (!existsSync(CRON_FILE)) return [];
 
   const raw = readFileSync(CRON_FILE, 'utf-8');
-  const parsed = matter(raw);
+  let parsed;
+  try {
+    parsed = matter(raw);
+  } catch (err) {
+    logger.error({ err }, 'CRON.md YAML parse error — keeping previous jobs. Fix the file manually.');
+    return [];
+  }
   const jobDefs = (parsed.data.jobs ?? []) as Array<Record<string, unknown>>;
   const jobs: CronJobDefinition[] = [];
 
@@ -460,6 +466,20 @@ export function parseCronJobs(): CronJobDefinition[] {
   }
 
   return jobs;
+}
+
+/**
+ * Validate that a CRON.md string parses without YAML errors.
+ * Call this before writing to prevent corrupted files from crashing the daemon.
+ * Returns null on success, or the error message on failure.
+ */
+export function validateCronYaml(content: string): string | null {
+  try {
+    matter(content);
+    return null;
+  } catch (err: unknown) {
+    return err instanceof Error ? err.message : String(err);
+  }
 }
 
 // ── Retry / backoff ──────────────────────────────────────────────────
@@ -627,9 +647,13 @@ export class CronScheduler {
 
     watchFile(CRON_FILE, { interval: 2000 }, () => {
       logger.info('CRON.md changed — reloading jobs');
-      this.reloadJobs();
-      scanner.refreshIntegrity(); // CRON.md change is legitimate
-      logger.info(`Cron scheduler reloaded: ${this.jobs.length} jobs`);
+      try {
+        this.reloadJobs();
+        scanner.refreshIntegrity(); // CRON.md change is legitimate
+        logger.info(`Cron scheduler reloaded: ${this.jobs.length} jobs`);
+      } catch (err) {
+        logger.error({ err }, 'Failed to reload CRON.md — keeping previous schedule');
+      }
     });
     this.watching = true;
   }

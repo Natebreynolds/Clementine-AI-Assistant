@@ -311,8 +311,14 @@ export async function cmdCronAdd(
   jobs.push(newJob);
   parsed.data.jobs = jobs;
 
-  // Write back preserving body content
+  // Write back preserving body content — validate first to prevent daemon crash
   const output = matter.stringify(parsed.content, parsed.data);
+  try {
+    matter(output);
+  } catch (err) {
+    console.error(`Generated CRON.md has invalid YAML: ${err instanceof Error ? err.message : err}`);
+    process.exit(1);
+  }
   writeFileSync(cronFile, output);
 
   console.log(`Added cron job: ${name}`);

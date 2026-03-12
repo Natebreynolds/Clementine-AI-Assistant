@@ -767,6 +767,12 @@ function readCronFile(): { parsed: matter.GrayMatterFile<string>; jobs: Array<Re
 function writeCronFile(parsed: matter.GrayMatterFile<string>, jobs: Array<Record<string, unknown>>): void {
   parsed.data.jobs = jobs;
   const output = matter.stringify(parsed.content, parsed.data);
+  // Validate before writing to prevent daemon crash from malformed YAML
+  try {
+    matter(output);
+  } catch (err) {
+    throw new Error(`Generated CRON.md has invalid YAML: ${err instanceof Error ? err.message : err}`);
+  }
   writeFileSync(CRON_FILE, output);
 }
 
