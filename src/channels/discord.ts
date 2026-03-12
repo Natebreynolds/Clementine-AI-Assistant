@@ -394,6 +394,11 @@ export async function startDiscord(
     partials: [Partials.Channel, Partials.Reaction, Partials.Message],
   });
 
+  // Prevent unhandled 'error' events from crashing the process
+  client.on(Events.Error, (err) => {
+    logger.error({ err }, 'Discord client error — will attempt to reconnect');
+  });
+
   client.once(Events.ClientReady, async (readyClient) => {
     logger.info(`${ASSISTANT_NAME} online as ${readyClient.user.tag}`);
 
