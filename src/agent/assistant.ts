@@ -308,7 +308,7 @@ function saveCronTrace(jobName: string, trace: TraceEntry[]): void {
 
 // ── Project Matching ────────────────────────────────────────────────
 
-interface ProjectMeta {
+export interface ProjectMeta {
   path: string;
   description?: string;
   keywords?: string[];
@@ -375,6 +375,24 @@ function matchProject(message: string): ProjectMeta | null {
 
   // Require at least a keyword-level match to activate
   return bestScore >= 5 ? best : null;
+}
+
+/** Find a linked project by name (case-insensitive, supports partial match). */
+export function findProjectByName(query: string): ProjectMeta | null {
+  const projects = loadProjectsMeta();
+  if (projects.length === 0) return null;
+  const q = query.toLowerCase().trim();
+  // Exact basename match first
+  const exact = projects.find(p => path.basename(p.path).toLowerCase() === q);
+  if (exact) return exact;
+  // Partial match (basename contains query)
+  const partial = projects.find(p => path.basename(p.path).toLowerCase().includes(q));
+  return partial ?? null;
+}
+
+/** Get all linked projects. */
+export function getLinkedProjects(): ProjectMeta[] {
+  return loadProjectsMeta();
 }
 
 // ── PersonalAssistant ───────────────────────────────────────────────
@@ -845,6 +863,7 @@ Delegate data-heavy work (SEO, analytics, bulk API calls for 3+ entities) to sub
       maxTurns?: number;
       profile?: AgentProfile;
       securityAnnotation?: string;
+      projectOverride?: ProjectMeta;
     },
   ): Promise<[string, string]> {
     const onText = options?.onText;
@@ -852,6 +871,7 @@ Delegate data-heavy work (SEO, analytics, bulk API calls for 3+ entities) to sub
     const maxTurns = options?.maxTurns;
     const profile = options?.profile;
     const securityAnnotation = options?.securityAnnotation;
+    const projectOverride = options?.projectOverride;
     const key = sessionKey ?? undefined;
     this._lastUserMessage = text;
     let sessionRotated = false;
@@ -948,7 +968,7 @@ Delegate data-heavy work (SEO, analytics, bulk API calls for 3+ entities) to sub
     }
 
     let [responseText, sessionId] = await this.runQuery(
-      effectivePrompt, key, onText, model, profile, securityAnnotation, maxTurns,
+      effectivePrompt, key, onText, model, profile, securityAnnotation, maxTurns, projectOverride,
     );
 
     // If we got a context-length / prompt-too-long error, retry with a fresh session
@@ -1026,13 +1046,16 @@ Delegate data-heavy work (SEO, analytics, bulk API calls for 3+ entities) to sub
     profile?: AgentProfile,
     securityAnnotation?: string,
     maxTurnsOverride?: number,
+    projectOverride?: ProjectMeta,
   ): Promise<[string, string]> {
     // Parallelize context retrieval and project matching — they're independent
+    // If a project override is set, skip auto-matching entirely
     const hasActiveSession = !!(sessionKey && this.sessions.has(sessionKey));
-    const [rawContext, matchedProject] = await Promise.all([
+    const [rawContext, autoMatchedProject] = await Promise.all([
       this.retrieveContext(prompt, sessionKey),
-      Promise.resolve(hasActiveSession ? null : matchProject(prompt)),
+      Promise.resolve(projectOverride || hasActiveSession ? null : matchProject(prompt)),
     ]);
+    const matchedProject = projectOverride ?? autoMatchedProject;
     let retrievalContext = securityAnnotation
       ? `${securityAnnotation}\n\n${rawContext}`
       : rawContext;

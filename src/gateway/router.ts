@@ -6,7 +6,7 @@
  */
 
 import pino from 'pino';
-import type { PersonalAssistant } from '../agent/assistant.js';
+import type { PersonalAssistant, ProjectMeta } from '../agent/assistant.js';
 import type { OnTextCallback, PlanProgressUpdate, SessionProvenance } from '../types.js';
 import { scanner } from '../security/scanner.js';
 import { lanes } from './lanes.js';
@@ -187,6 +187,22 @@ export class Gateway {
     return this.sessionModels.get(sessionKey);
   }
 
+  // ── Session project overrides ──────────────────────────────────────
+
+  private sessionProjects = new Map<string, ProjectMeta>();
+
+  setSessionProject(sessionKey: string, project: ProjectMeta): void {
+    this.sessionProjects.set(sessionKey, project);
+  }
+
+  getSessionProject(sessionKey: string): ProjectMeta | undefined {
+    return this.sessionProjects.get(sessionKey);
+  }
+
+  clearSessionProject(sessionKey: string): void {
+    this.sessionProjects.delete(sessionKey);
+  }
+
   // ── Session profile overrides ───────────────────────────────────────
 
   setSessionProfile(sessionKey: string, slug: string): void {
@@ -301,11 +317,14 @@ export class Gateway {
           effectiveSessionKey = `${sessionKey}:${profileSlug}`;
         }
 
+        // Resolve active project override
+        const projectOverride = this.sessionProjects.get(sessionKey);
+
         try {
           const [response] = await this.assistant.chat(
             text,
             effectiveSessionKey,
-            { onText, model: effectiveModel, maxTurns, securityAnnotation },
+            { onText, model: effectiveModel, maxTurns, securityAnnotation, projectOverride },
           );
 
           // Re-baseline integrity checksums after chat (auto-memory may write to vault)
@@ -534,6 +553,7 @@ export class Gateway {
     }
     this.assistant.clearSession(sessionKey);
     this.sessionProfiles.delete(sessionKey);
+    this.sessionProjects.delete(sessionKey);
     this.sessionLocks.delete(sessionKey);
     this.sessionProvenance.delete(sessionKey);
   }

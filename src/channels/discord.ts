@@ -39,6 +39,7 @@ import {
 import type { HeartbeatScheduler, CronScheduler } from '../gateway/heartbeat.js';
 import type { NotificationDispatcher } from '../gateway/notifications.js';
 import type { Gateway } from '../gateway/router.js';
+import { findProjectByName, getLinkedProjects } from '../agent/assistant.js';
 
 const logger = pino({ name: 'clementine.discord' });
 
@@ -76,6 +77,15 @@ const slashCommands = [
     .addStringOption(o => o.setName('job').setDescription('Job name (for run/enable/disable)')),
   new SlashCommandBuilder().setName('heartbeat').setDescription('Run heartbeat check manually'),
   new SlashCommandBuilder().setName('tools').setDescription('List available MCP tools'),
+  new SlashCommandBuilder().setName('project').setDescription('Set active project context')
+    .addStringOption(o => o.setName('action').setDescription('Action').setRequired(true)
+      .addChoices(
+        { name: 'List projects', value: 'list' },
+        { name: 'Set active project', value: 'set' },
+        { name: 'Clear active project', value: 'clear' },
+        { name: 'Show current', value: 'status' },
+      ))
+    .addStringOption(o => o.setName('name').setDescription('Project name (for set)')),
   new SlashCommandBuilder().setName('clear').setDescription('Reset conversation session'),
   new SlashCommandBuilder().setName('help').setDescription('Show all available commands'),
 ];
@@ -331,6 +341,7 @@ function handleHelp(): string {
     '`!deep <msg>` \u2014 Extended mode (100 turns)',
     '`!q <msg>` \u2014 Quick reply (Haiku) \u00b7 `!d <msg>` \u2014 Deep reply (Opus)',
     '`!model [haiku|sonnet|opus]` \u2014 Switch default model',
+    '`!project <name>` \u2014 Set active project \u00b7 `!project list|clear|status`',
     '`!cron list|run|enable|disable` \u2014 Manage scheduled tasks',
     '`!heartbeat` \u2014 Run heartbeat \u00b7 `!tools` \u2014 List tools \u00b7 `!clear` \u2014 Reset',
     '`!help` \u2014 This message',
@@ -349,6 +360,61 @@ function handleModelSwitch(
   }
   const current = gateway.getSessionModel(sessionKey) ?? 'default';
   return `Current model: \`${current}\`\nOptions: \`!model haiku\`, \`!model sonnet\`, \`!model opus\``;
+}
+
+function handleProjectCommand(
+  gateway: Gateway,
+  sessionKey: string,
+  action: string | undefined,
+  projectName: string | undefined,
+): string {
+  if (action === 'list' || !action) {
+    const projects = getLinkedProjects();
+    if (projects.length === 0) return 'No linked projects. Link projects from the dashboard.';
+    const current = gateway.getSessionProject(sessionKey);
+    const lines = projects.map(p => {
+      const name = path.basename(p.path);
+      const desc = p.description ? ` — ${p.description}` : '';
+      const active = current && p.path === current.path ? ' **(active)**' : '';
+      return `\`${name}\`${desc}${active}`;
+    });
+    return `**Linked Projects**\n${lines.join('\n')}`;
+  }
+
+  if (action === 'clear') {
+    gateway.clearSessionProject(sessionKey);
+    return 'Project context cleared. Auto-matching is back on.';
+  }
+
+  if (action === 'status') {
+    const current = gateway.getSessionProject(sessionKey);
+    if (!current) return 'No active project. Using auto-matching.';
+    const name = path.basename(current.path);
+    const desc = current.description ? ` — ${current.description}` : '';
+    return `Active project: **${name}**${desc}\n\`${current.path}\``;
+  }
+
+  // action === 'set'
+  if (!projectName) {
+    const projects = getLinkedProjects();
+    if (projects.length === 0) return 'No linked projects. Link projects from the dashboard.';
+    const names = projects.map(p => `\`${path.basename(p.path)}\``).join(', ');
+    return `Usage: \`!project <name>\`\nAvailable: ${names}`;
+  }
+
+  const project = findProjectByName(projectName);
+  if (!project) {
+    const projects = getLinkedProjects();
+    const names = projects.map(p => `\`${path.basename(p.path)}\``).join(', ');
+    return `Project "${projectName}" not found.\nAvailable: ${names}`;
+  }
+
+  // Clear the session so it starts fresh with the project's cwd/tools, then set the project
+  gateway.clearSession(sessionKey);
+  gateway.setSessionProject(sessionKey, project);
+  const name = path.basename(project.path);
+  const desc = project.description ? ` — ${project.description}` : '';
+  return `Switched to **${name}**${desc}\nWorking in \`${project.path}\`. Session cleared for fresh context.`;
 }
 
 function handleCronCommand(
@@ -478,6 +544,19 @@ export async function startDiscord(
       await streamer.finalize(response);
       // Inject into DM session so follow-up conversation has context
       gateway.injectContext(sessionKey, '!heartbeat', response);
+      return;
+    }
+
+    if (isDm && text.startsWith('!project')) {
+      const parts = text.split(/\s+/);
+      const subCmd = parts[1]?.toLowerCase();
+      if (subCmd === 'list' || subCmd === 'clear' || subCmd === 'status') {
+        await message.reply(handleProjectCommand(gateway, sessionKey, subCmd, undefined));
+      } else {
+        // !project <name> → set project
+        const projectName = parts.slice(1).join(' ');
+        await message.reply(handleProjectCommand(gateway, sessionKey, 'set', projectName || undefined));
+      }
       return;
     }
 
@@ -648,6 +727,12 @@ export async function startDiscord(
       if (name === 'model') {
         const tier = cmd.options.getString('tier', true);
         await cmd.reply(handleModelSwitch(gateway, sessionKey, tier));
+        return;
+      }
+      if (name === 'project') {
+        const action = cmd.options.getString('action', true);
+        const projName = cmd.options.getString('name') ?? undefined;
+        await cmd.reply(handleProjectCommand(gateway, sessionKey, action, projName));
         return;
       }
 
