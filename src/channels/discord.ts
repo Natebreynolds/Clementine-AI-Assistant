@@ -86,7 +86,7 @@ const slashCommands = [
         { name: 'Clear active project', value: 'clear' },
         { name: 'Show current', value: 'status' },
       ))
-    .addStringOption(o => o.setName('name').setDescription('Project name (for set)')),
+    .addStringOption(o => o.setName('name').setDescription('Project name (for set)').setAutocomplete(true)),
   new SlashCommandBuilder().setName('clear').setDescription('Reset conversation session'),
   new SlashCommandBuilder().setName('help').setDescription('Show all available commands'),
 ];
@@ -716,6 +716,21 @@ export async function startDiscord(
   // ── Slash command + button interaction handler ──────────────────────
 
   client.on(Events.InteractionCreate, async (interaction: Interaction) => {
+    // ── Autocomplete ────────────────────────────────────────────────
+    if (interaction.isAutocomplete()) {
+      if (interaction.commandName === 'project') {
+        const focused = interaction.options.getFocused().toLowerCase();
+        const projects = getLinkedProjects().map(p => path.basename(p.path));
+        const filtered = projects
+          .filter(name => name.toLowerCase().includes(focused))
+          .slice(0, 25);
+        await interaction.respond(
+          filtered.map(name => ({ name, value: name })),
+        );
+      }
+      return;
+    }
+
     // ── Slash commands ───────────────────────────────────────────────
     if (interaction.isChatInputCommand()) {
       const cmd = interaction as ChatInputCommandInteraction;
