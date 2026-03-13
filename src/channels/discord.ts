@@ -25,7 +25,7 @@ import {
   type ButtonInteraction,
 } from 'discord.js';
 import pino from 'pino';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {
@@ -36,6 +36,7 @@ import {
   ASSISTANT_NAME,
   PKG_DIR,
   VAULT_DIR,
+  BASE_DIR,
 } from '../config.js';
 import type { HeartbeatScheduler, CronScheduler } from '../gateway/heartbeat.js';
 import type { NotificationDispatcher } from '../gateway/notifications.js';
@@ -87,6 +88,8 @@ const slashCommands = [
         { name: 'Show current', value: 'status' },
       ))
     .addStringOption(o => o.setName('name').setDescription('Project name (for set)').setAutocomplete(true)),
+  new SlashCommandBuilder().setName('status').setDescription('Check unleashed task progress')
+    .addStringOption(o => o.setName('job').setDescription('Job name (omit for all)')),
   new SlashCommandBuilder().setName('clear').setDescription('Reset conversation session'),
   new SlashCommandBuilder().setName('help').setDescription('Show all available commands'),
 ];
@@ -333,6 +336,70 @@ function formatToolsList(): string {
   return lines.join('\n');
 }
 
+// ── Unleashed status helper ───────────────────────────────────────────
+
+function handleUnleashedStatus(jobName?: string): string {
+  const unleashedDir = path.join(BASE_DIR, 'unleashed');
+  if (!existsSync(unleashedDir)) {
+    return 'No unleashed tasks found.';
+  }
+
+  const dirs = readdirSync(unleashedDir).filter(d => {
+    try { return statSync(path.join(unleashedDir, d)).isDirectory(); } catch { return false; }
+  });
+
+  if (dirs.length === 0) return 'No unleashed tasks found.';
+
+  // If a specific job is requested, show detailed status
+  if (jobName) {
+    const safeName = jobName.replace(/[^a-zA-Z0-9_-]/g, '_');
+    const statusFile = path.join(unleashedDir, safeName, 'status.json');
+    if (!existsSync(statusFile)) {
+      return `No status found for unleashed task "${jobName}".`;
+    }
+    try {
+      const status = JSON.parse(readFileSync(statusFile, 'utf-8'));
+      const elapsed = status.startedAt
+        ? Math.round((Date.now() - new Date(status.startedAt).getTime()) / 60000)
+        : 0;
+      const elapsedStr = elapsed < 60 ? `${elapsed}m` : `${Math.floor(elapsed / 60)}h ${elapsed % 60}m`;
+      const remaining = status.maxHours && status.startedAt
+        ? Math.max(0, Math.round(status.maxHours * 60 - elapsed))
+        : null;
+      const remainStr = remaining != null ? (remaining < 60 ? `${remaining}m` : `${Math.floor(remaining / 60)}h ${remaining % 60}m`) : 'unknown';
+
+      const lines = [
+        `**Unleashed: ${status.jobName ?? jobName}**`,
+        `Status: **${status.status ?? 'unknown'}**`,
+        `Phase: ${status.phase ?? 0}`,
+        `Elapsed: ${elapsedStr}`,
+        ...(status.status === 'running' ? [`Remaining: ~${remainStr}`] : []),
+        ...(status.lastPhaseOutputPreview ? [`Last output: _${status.lastPhaseOutputPreview.slice(0, 200)}_`] : []),
+      ];
+      return lines.join('\n');
+    } catch {
+      return `Failed to read status for "${jobName}".`;
+    }
+  }
+
+  // List all unleashed tasks
+  const lines = ['**Unleashed Tasks:**\n'];
+  for (const dir of dirs) {
+    const statusFile = path.join(unleashedDir, dir, 'status.json');
+    if (!existsSync(statusFile)) continue;
+    try {
+      const status = JSON.parse(readFileSync(statusFile, 'utf-8'));
+      const elapsed = status.startedAt
+        ? Math.round((Date.now() - new Date(status.startedAt).getTime()) / 60000)
+        : 0;
+      const elapsedStr = elapsed < 60 ? `${elapsed}m` : `${Math.floor(elapsed / 60)}h ${elapsed % 60}m`;
+      const statusEmoji = status.status === 'running' ? '\u{1F535}' : status.status === 'completed' ? '\u2705' : '\u26A0\uFE0F';
+      lines.push(`${statusEmoji} **${status.jobName ?? dir}** — ${status.status ?? 'unknown'} · phase ${status.phase ?? 0} · ${elapsedStr}`);
+    } catch { /* skip corrupt */ }
+  }
+  return lines.length === 1 ? 'No unleashed tasks found.' : lines.join('\n');
+}
+
 // ── Shared command helpers ────────────────────────────────────────────
 
 function handleHelp(): string {
@@ -344,6 +411,7 @@ function handleHelp(): string {
     '`!model [haiku|sonnet|opus]` \u2014 Switch default model',
     '`!project <name>` \u2014 Set active project \u00b7 `!project list|clear|status`',
     '`!cron list|run|enable|disable` \u2014 Manage scheduled tasks',
+    '`!status [job]` \u2014 Check unleashed task progress',
     '`!heartbeat` \u2014 Run heartbeat \u00b7 `!tools` \u2014 List tools \u00b7 `!clear` \u2014 Reset',
     '`!help` \u2014 This message',
   ].join('\n');
@@ -570,6 +638,13 @@ export async function startDiscord(
       return;
     }
 
+    if (isDm && text.startsWith('!status')) {
+      const parts = text.split(/\s+/);
+      const jobName = parts.slice(1).join(' ') || undefined;
+      await message.reply(handleUnleashedStatus(jobName));
+      return;
+    }
+
     if (isDm && text.startsWith('!project')) {
       const parts = text.split(/\s+/);
       const subCmd = parts[1]?.toLowerCase();
@@ -763,6 +838,11 @@ export async function startDiscord(
       }
       if (name === 'tools') {
         await cmd.reply(formatToolsList());
+        return;
+      }
+      if (name === 'status') {
+        const jobArg = cmd.options.getString('job') ?? undefined;
+        await cmd.reply(handleUnleashedStatus(jobArg));
         return;
       }
       if (name === 'model') {

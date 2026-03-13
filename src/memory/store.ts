@@ -953,6 +953,96 @@ export class MemoryStore {
       .run(sourceFile, 'session-summary', summaryText, 'episodic', '', hash, 'episodic');
   }
 
+  // ── Deduplication ──────────────────────────────────────────────
+
+  /**
+   * Check if content is a duplicate of something already stored.
+   * Returns match info or null if content is unique.
+   *
+   * Strategy:
+   * 1. Exact match via content_hash (fast)
+   * 2. Near-duplicate via FTS5 BM25 + word overlap (conservative)
+   */
+  checkDuplicate(content: string, sourceFile?: string): {
+    isDuplicate: boolean;
+    matchType: 'exact' | 'near' | null;
+    matchId?: number;
+  } {
+    // Skip dedup for very short content
+    if (content.length < 20) {
+      return { isDuplicate: false, matchType: null };
+    }
+
+    // 1. Exact hash match
+    const hash = createHash('sha256').update(content).digest('hex').slice(0, 16);
+    try {
+      const exactMatch = this.conn
+        .prepare(
+          `SELECT id FROM chunks WHERE content_hash = ?${sourceFile ? ' AND source_file = ?' : ''} LIMIT 1`,
+        )
+        .get(...(sourceFile ? [hash, sourceFile] : [hash])) as { id: number } | undefined;
+
+      if (exactMatch) {
+        return { isDuplicate: true, matchType: 'exact', matchId: exactMatch.id };
+      }
+    } catch {
+      // Fall through to near-duplicate check
+    }
+
+    // 2. Near-duplicate via FTS5 BM25 + word overlap
+    try {
+      // Extract significant words (>3 chars, no stop words)
+      const stopWords = new Set(['the', 'and', 'for', 'that', 'this', 'with', 'from', 'have', 'been', 'will', 'would', 'could', 'should']);
+      const words = content
+        .toLowerCase()
+        .split(/\s+/)
+        .map(w => w.replace(/[^a-z0-9]/g, ''))
+        .filter(w => w.length > 3 && !stopWords.has(w));
+
+      if (words.length < 3) {
+        return { isDuplicate: false, matchType: null };
+      }
+
+      // Take top 8 most significant words for the FTS query
+      const queryWords = [...new Set(words)].slice(0, 8);
+      const ftsQuery = queryWords.map(w => `"${w}"`).join(' OR ');
+
+      const rows = this.conn
+        .prepare(
+          `SELECT c.id, c.content, bm25(chunks_fts) as score
+           FROM chunks_fts f
+           JOIN chunks c ON c.id = f.rowid
+           WHERE chunks_fts MATCH ?
+           ORDER BY bm25(chunks_fts)
+           LIMIT 5`,
+        )
+        .all(ftsQuery) as Array<{ id: number; content: string; score: number }>;
+
+      // Check word overlap with top results
+      const contentWordsSet = new Set(words);
+      for (const row of rows) {
+        const matchWords = row.content
+          .toLowerCase()
+          .split(/\s+/)
+          .map(w => w.replace(/[^a-z0-9]/g, ''))
+          .filter(w => w.length > 3 && !stopWords.has(w));
+
+        const matchWordsSet = new Set(matchWords);
+        const overlap = [...contentWordsSet].filter(w => matchWordsSet.has(w)).length;
+        const overlapRatio = overlap / Math.max(contentWordsSet.size, 1);
+
+        // Conservative threshold: >70% word overlap AND good BM25 score
+        if (overlapRatio > 0.7 && -row.score > 5) {
+          return { isDuplicate: true, matchType: 'near', matchId: row.id };
+        }
+      }
+    } catch {
+      // FTS5 query failed — fall through (exact-hash-only is fine)
+    }
+
+    return { isDuplicate: false, matchType: null };
+  }
+
   // ── Memory Extractions ──────────────────────────────────────────
 
   /**

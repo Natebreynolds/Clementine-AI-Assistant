@@ -22,6 +22,7 @@ import {
   existsSync,
   openSync,
   closeSync,
+  readSync,
   readFileSync,
   writeFileSync,
   unlinkSync,
@@ -34,6 +35,7 @@ import { fileURLToPath } from 'node:url';
 import { runSetup } from './setup.js';
 import { cmdCronList, cmdCronRun, cmdCronRunDue, cmdCronRuns, cmdCronAdd, cmdCronTest, cmdHeartbeat } from './cron.js';
 import { cmdDashboard } from './dashboard.js';
+import { cmdChat } from './chat.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -769,6 +771,19 @@ program
   });
 
 program
+  .command('chat')
+  .description('Interactive REPL chat session')
+  .option('-m, --model <tier>', 'Model tier (haiku, sonnet, opus)')
+  .option('--project <name>', 'Set active project context')
+  .option('--profile <slug>', 'Set agent profile')
+  .action((opts: { model?: string; project?: string; profile?: string }) => {
+    cmdChat(opts).catch((err: unknown) => {
+      console.error('Chat error:', err);
+      process.exit(1);
+    });
+  });
+
+program
   .command('update')
   .description('Pull latest code, rebuild, and reinstall (preserves config)')
   .option('--restart', 'Restart daemon after update')
@@ -1383,5 +1398,130 @@ function cmdCronUninstall(): void {
     console.log('  Removed crontab entry.');
   }
 }
+
+// ── Logs command ────────────────────────────────────────────────────
+
+function formatLogLine(line: string): string {
+  try {
+    const entry = JSON.parse(line);
+    const ts = typeof entry.time === 'number'
+      ? new Date(entry.time).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', second: '2-digit' })
+      : String(entry.time ?? '').slice(11, 19);
+
+    const level = entry.level ?? 30;
+    const levelName = level <= 20 ? 'DEBUG' : level <= 30 ? 'INFO' : level <= 40 ? 'WARN' : 'ERROR';
+    const levelColors: Record<string, string> = {
+      DEBUG: '\x1b[0;90m', INFO: '\x1b[0;32m', WARN: '\x1b[1;33m', ERROR: '\x1b[0;31m',
+    };
+    const color = levelColors[levelName] ?? '';
+    const RESET = '\x1b[0m';
+    const DIM = '\x1b[0;90m';
+    const component = entry.name ? entry.name.replace('clementine.', '') : '';
+    const msg = entry.msg ?? '';
+    return `${DIM}${ts}${RESET} ${color}${levelName.padEnd(5)}${RESET} ${DIM}[${component}]${RESET} ${msg}`;
+  } catch {
+    return line;
+  }
+}
+
+function cmdLogs(opts: { follow?: boolean; lines?: string; filter?: string; cron?: boolean; json?: boolean }): void {
+  const logDir = path.join(BASE_DIR, 'logs');
+  const logFile = opts.cron
+    ? path.join(logDir, 'cron.log')
+    : path.join(logDir, 'clementine.log');
+
+  if (!existsSync(logFile)) {
+    console.error(`Log file not found: ${logFile}`);
+    process.exit(1);
+  }
+
+  const numLines = parseInt(opts.lines ?? '50', 10) || 50;
+  const filter = opts.filter?.toLowerCase();
+
+  // Read last N lines
+  const content = readFileSync(logFile, 'utf-8');
+  let lines = content.split('\n').filter(Boolean);
+  lines = lines.slice(-numLines);
+
+  // Apply component filter
+  if (filter) {
+    lines = lines.filter(line => {
+      try {
+        const entry = JSON.parse(line);
+        const name = String(entry.name ?? '').toLowerCase();
+        return name.includes(filter);
+      } catch {
+        return line.toLowerCase().includes(filter);
+      }
+    });
+  }
+
+  // Output
+  for (const line of lines) {
+    if (opts.json) {
+      console.log(line);
+    } else {
+      console.log(formatLogLine(line));
+    }
+  }
+
+  // Follow mode
+  if (opts.follow) {
+    let lastSize = statSync(logFile).size;
+
+    const poll = setInterval(() => {
+      try {
+        const currentSize = statSync(logFile).size;
+        if (currentSize < lastSize) {
+          // Log rotation — reset
+          lastSize = 0;
+        }
+        if (currentSize === lastSize) return;
+
+        // Read new bytes
+        const fd = openSync(logFile, 'r');
+        const buf = Buffer.alloc(currentSize - lastSize);
+        readSync(fd, buf, 0, buf.length, lastSize);
+        closeSync(fd);
+        lastSize = currentSize;
+
+        const newLines = buf.toString('utf-8').split('\n').filter(Boolean);
+        for (const line of newLines) {
+          if (filter) {
+            try {
+              const entry = JSON.parse(line);
+              const name = String(entry.name ?? '').toLowerCase();
+              if (!name.includes(filter)) continue;
+            } catch {
+              if (!line.toLowerCase().includes(filter)) continue;
+            }
+          }
+          if (opts.json) {
+            console.log(line);
+          } else {
+            console.log(formatLogLine(line));
+          }
+        }
+      } catch {
+        // File may be temporarily unavailable during rotation
+      }
+    }, 500);
+
+    process.on('SIGINT', () => {
+      clearInterval(poll);
+      process.exit(0);
+    });
+  }
+}
+
+program
+  .command('logs')
+  .description('Tail and filter daemon logs')
+  .option('-f, --follow', 'Follow mode (tail -f)')
+  .option('-n, --lines <n>', 'Number of lines (default 50)', '50')
+  .option('--filter <component>', 'Filter by component (e.g. discord, cron, gateway)')
+  .option('--cron', 'Show cron log instead of daemon log')
+  .option('--json', 'Raw JSON output')
+  .action(cmdLogs);
 
 program.parse();

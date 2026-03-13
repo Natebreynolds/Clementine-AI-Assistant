@@ -119,6 +119,8 @@ export interface CronJobDefinition {
   workDir?: string;
   mode?: 'standard' | 'unleashed';
   maxHours?: number;
+  maxRetries?: number;
+  after?: string;
 }
 
 export interface CronRunEntry {
@@ -175,7 +177,7 @@ export interface MemoryExtraction {
   toolName: string;           // e.g., 'memory_write', 'note_create'
   toolInput: string;          // JSON stringified tool input
   extractedAt: string;        // ISO timestamp
-  status: 'active' | 'corrected' | 'dismissed';
+  status: 'active' | 'corrected' | 'dismissed' | 'dedup_skipped';
   correction?: string;        // replacement fact if corrected
 }
 

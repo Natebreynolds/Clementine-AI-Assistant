@@ -1232,7 +1232,7 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
 
   app.post('/api/cron', (req, res) => {
     try {
-      const { name, schedule, prompt, tier, enabled, work_dir, mode, max_hours } = req.body;
+      const { name, schedule, prompt, tier, enabled, work_dir, mode, max_hours, max_retries, after } = req.body;
       if (!name || !schedule || !prompt) {
         res.status(400).json({ error: 'name, schedule, and prompt are required' });
         return;
@@ -1262,6 +1262,8 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
         job.mode = 'unleashed';
         if (max_hours) job.max_hours = Number(max_hours);
       }
+      if (max_retries != null && max_retries !== '') job.max_retries = Number(max_retries);
+      if (after) job.after = String(after);
       jobs.push(job);
       writeCronFile(parsed, jobs);
       res.json({ ok: true, message: `Created cron job: ${name}` });
@@ -1308,6 +1310,20 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
         } else {
           delete jobs[idx].mode;
           delete jobs[idx].max_hours;
+        }
+      }
+      if (updates.max_retries !== undefined) {
+        if (updates.max_retries != null && updates.max_retries !== '') {
+          jobs[idx].max_retries = Number(updates.max_retries);
+        } else {
+          delete jobs[idx].max_retries;
+        }
+      }
+      if (updates.after !== undefined) {
+        if (updates.after) {
+          jobs[idx].after = String(updates.after);
+        } else {
+          delete jobs[idx].after;
         }
       }
       if (updates.name !== undefined && updates.name !== jobName) {
@@ -1406,6 +1422,89 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
     try {
       writeFileSync(cancelFile, new Date().toISOString());
       res.json({ ok: true, message: `Cancel signal sent to "${req.params.name}"` });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  // ── Unleashed detail route ──────────────────────────────────────────
+
+  app.get('/api/unleashed/:name/status', (req, res) => {
+    const taskName = req.params.name.replace(/[^a-zA-Z0-9_-]/g, '_');
+    const statusFile = path.join(BASE_DIR, 'unleashed', taskName, 'status.json');
+    if (!existsSync(statusFile)) {
+      res.status(404).json({ error: 'Unleashed task not found' });
+      return;
+    }
+    try {
+      const status = JSON.parse(readFileSync(statusFile, 'utf-8'));
+
+      // Read recent progress entries
+      const progressFile = path.join(BASE_DIR, 'unleashed', taskName, 'progress.jsonl');
+      const progressEntries: Array<Record<string, unknown>> = [];
+      if (existsSync(progressFile)) {
+        const lines = readFileSync(progressFile, 'utf-8').trim().split('\n').filter(Boolean);
+        for (const line of lines.slice(-20)) {
+          try { progressEntries.push(JSON.parse(line)); } catch { /* skip */ }
+        }
+      }
+
+      // Compute elapsed and remaining
+      const elapsed = status.startedAt
+        ? Math.round((Date.now() - new Date(status.startedAt).getTime()) / 60000)
+        : 0;
+      const remaining = status.maxHours && status.startedAt
+        ? Math.max(0, Math.round(status.maxHours * 60 - elapsed))
+        : null;
+
+      res.json({ ...status, elapsed, remaining, progress: progressEntries });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  // ── Profile routes ─────────────────────────────────────────────────
+
+  app.get('/api/profiles', async (_req, res) => {
+    try {
+      const profilesDir = path.join(VAULT_DIR, '00-System', 'profiles');
+      if (!existsSync(profilesDir)) {
+        res.json({ profiles: [], active: null });
+        return;
+      }
+
+      const gateway = await getGateway();
+      const { ProfileManager } = await import('../agent/profiles.js');
+      const pm = new ProfileManager(profilesDir);
+      const profiles = pm.listAll().map(p => ({
+        slug: p.slug,
+        name: p.name,
+        description: p.description,
+      }));
+
+      const activeSlug = gateway.getSessionProfile('dashboard:web') ?? null;
+      res.json({ profiles, active: activeSlug });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  app.post('/api/profiles/switch', async (req, res) => {
+    try {
+      const { slug } = req.body;
+      const gateway = await getGateway();
+
+      // Clear existing session so profile change takes effect cleanly
+      gateway.clearSession('dashboard:web');
+
+      if (slug) {
+        gateway.setSessionProfile('dashboard:web', slug);
+        res.json({ ok: true, message: `Switched to profile: ${slug}` });
+      } else {
+        // Clear profile (back to default)
+        gateway.setSessionProfile('dashboard:web', '');
+        res.json({ ok: true, message: 'Profile cleared — using default personality' });
+      }
     } catch (err) {
       res.status(500).json({ error: String(err) });
     }
@@ -2941,6 +3040,12 @@ function getDashboardHTML(): string {
           </div>
         </div>
       </div>
+      <div style="border-top:1px solid var(--border);padding:8px 14px 0;display:flex;align-items:center;gap:8px" id="chat-profile-bar">
+        <span style="font-size:11px;color:var(--text-muted)">Profile:</span>
+        <select id="chat-profile-select" onchange="switchProfile(this.value)" style="font-size:11px;padding:2px 6px;border:1px solid var(--border);border-radius:4px;background:var(--bg-secondary);color:var(--text-primary)">
+          <option value="">Default</option>
+        </select>
+      </div>
       <div style="border-top:1px solid var(--border);padding:14px;display:flex;gap:10px">
         <input type="text" id="chat-input" placeholder="Type a message..." style="flex:1" onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendChat()}">
         <button class="btn-primary" id="chat-send-btn" onclick="sendChat()">Send</button>
@@ -3095,6 +3200,27 @@ function getDashboardHTML(): string {
             <option value="12">12 hours</option>
             <option value="24">24 hours</option>
           </select>
+        </div>
+      </div>
+      <div class="form-row">
+        <div class="form-group">
+          <label class="form-label">Max Retries <span style="color:var(--text-muted);font-weight:normal">(optional)</span></label>
+          <select id="cron-max-retries">
+            <option value="">Auto (based on error history)</option>
+            <option value="0">0 — No retries</option>
+            <option value="1">1</option>
+            <option value="2">2</option>
+            <option value="3">3</option>
+            <option value="5">5</option>
+          </select>
+          <div class="form-hint">Override automatic retry count for transient errors.</div>
+        </div>
+        <div class="form-group">
+          <label class="form-label">After Job <span style="color:var(--text-muted);font-weight:normal">(chain)</span></label>
+          <select id="cron-after">
+            <option value="">None — runs on schedule</option>
+          </select>
+          <div class="form-hint">Trigger this job after another succeeds (ignores schedule).</div>
         </div>
       </div>
       <div class="form-group">
@@ -3262,7 +3388,7 @@ document.querySelectorAll('.nav-item').forEach(item => {
     if (page === 'logs') refreshLogs();
     if (page === 'memory') refreshMemory();
     if (page === 'metrics') refreshMetrics();
-    if (page === 'chat') document.getElementById('chat-input').focus();
+    if (page === 'chat') { loadProfiles(); document.getElementById('chat-input').focus(); }
   });
 });
 
@@ -3501,6 +3627,8 @@ async function refreshCron() {
       var projectName = job.work_dir ? job.work_dir.split('/').pop() : '';
       if (projectName) badgesHtml += '<span class="badge badge-blue">' + esc(projectName) + '</span>';
       if (job.mode === 'unleashed') badgesHtml += '<span class="badge badge-purple">unleashed</span>';
+      if (job.after) badgesHtml += '<span class="badge badge-yellow" title="Triggered after ' + esc(job.after) + '">\\u2192 ' + esc(job.after) + '</span>';
+      if (job.max_retries != null) badgesHtml += '<span class="badge badge-gray">' + job.max_retries + ' retries</span>';
       badgesHtml += '<span class="badge ' + (enabled ? 'badge-green' : 'badge-gray') + '">' + (enabled ? 'Enabled' : 'Disabled') + '</span>';
 
       var safeName = esc(job.name).replace(/'/g, '');
@@ -3545,8 +3673,9 @@ async function refreshCron() {
             duration = mins < 60 ? mins + 'm' : Math.floor(mins/60) + 'h ' + (mins%60) + 'm';
           }
           var cancelBtn = t.status === 'running'
-            ? '<button class="btn-sm btn-danger" onclick="cancelUnleashed(\\'' + esc(t.jobName) + '\\')">Cancel</button>'
+            ? '<button class="btn-sm btn-danger" onclick="cancelUnleashed(\\'' + esc(t.jobName) + '\\')">Cancel</button> '
             : '';
+          var detailBtn = '<button class="btn-sm" onclick="toggleUnleashedDetail(\\'' + esc(t.jobName) + '\\', this)">Details</button>';
           html += '<tr>'
             + '<td><strong>' + esc(t.jobName) + '</strong>'
             + (t.lastPhaseOutputPreview ? '<br><span style="font-size:11px;color:var(--text-muted)">' + esc(t.lastPhaseOutputPreview.slice(0,80)) + '...</span>' : '')
@@ -3554,8 +3683,9 @@ async function refreshCron() {
             + '<td>' + badge + '</td>'
             + '<td>' + (t.phase || 0) + '</td>'
             + '<td>' + esc(duration) + (t.maxHours ? ' / ' + t.maxHours + 'h max' : '') + '</td>'
-            + '<td>' + cancelBtn + '</td>'
-            + '</tr>';
+            + '<td>' + cancelBtn + detailBtn + '</td>'
+            + '</tr>'
+            + '<tr class="unleashed-detail-row" id="unleashed-detail-' + esc(t.jobName).replace(/[^a-zA-Z0-9_-]/g,'_') + '" style="display:none"><td colspan="5"></td></tr>';
         }
         html += '</table>';
       }
@@ -3651,6 +3781,63 @@ async function cancelUnleashed(jobName) {
     await apiPost('/api/unleashed/' + encodeURIComponent(jobName) + '/cancel');
     setTimeout(refreshCron, 1000);
   } catch(e) { toast('Failed to cancel: ' + e, 'error'); }
+}
+
+var unleashedDetailTimers = {};
+async function toggleUnleashedDetail(jobName, btn) {
+  var safeName = jobName.replace(/[^a-zA-Z0-9_-]/g, '_');
+  var row = document.getElementById('unleashed-detail-' + safeName);
+  if (!row) return;
+
+  if (row.style.display !== 'none') {
+    row.style.display = 'none';
+    if (unleashedDetailTimers[safeName]) { clearInterval(unleashedDetailTimers[safeName]); delete unleashedDetailTimers[safeName]; }
+    return;
+  }
+  row.style.display = '';
+  await loadUnleashedDetail(jobName, safeName);
+
+  // Auto-refresh every 10s for running tasks
+  unleashedDetailTimers[safeName] = setInterval(function() { loadUnleashedDetail(jobName, safeName); }, 10000);
+}
+
+async function loadUnleashedDetail(jobName, safeName) {
+  var row = document.getElementById('unleashed-detail-' + safeName);
+  if (!row) return;
+  var cell = row.querySelector('td');
+  try {
+    var r = await fetch('/api/unleashed/' + encodeURIComponent(jobName) + '/status');
+    var d = await r.json();
+    var elapsedStr = d.elapsed < 60 ? d.elapsed + 'm' : Math.floor(d.elapsed/60) + 'h ' + (d.elapsed%60) + 'm';
+    var remainStr = d.remaining != null ? (d.remaining < 60 ? d.remaining + 'm' : Math.floor(d.remaining/60) + 'h ' + (d.remaining%60) + 'm') : '—';
+    var html = '<div style="padding:12px;background:var(--bg-secondary);border-radius:6px;font-size:12px">'
+      + '<div style="display:flex;gap:24px;margin-bottom:8px">'
+      + '<div><strong>Elapsed:</strong> ' + esc(elapsedStr) + '</div>'
+      + '<div><strong>Remaining:</strong> ' + esc(remainStr) + '</div>'
+      + '<div><strong>Phase:</strong> ' + (d.phase || 0) + '</div>'
+      + '<div><strong>Max Hours:</strong> ' + (d.maxHours || '—') + '</div>'
+      + '</div>';
+    if (d.progress && d.progress.length > 0) {
+      html += '<div style="max-height:200px;overflow-y:auto;border-top:1px solid var(--border);padding-top:8px">';
+      for (var i = d.progress.length - 1; i >= Math.max(0, d.progress.length - 10); i--) {
+        var p = d.progress[i];
+        html += '<div style="margin-bottom:4px"><span style="color:var(--text-muted)">' + (p.timestamp || '').slice(11,19) + '</span> '
+          + '<strong>' + esc(p.event || '') + '</strong> '
+          + (p.phase != null ? 'phase ' + p.phase + ' ' : '')
+          + '</div>';
+      }
+      html += '</div>';
+    }
+    html += '</div>';
+    cell.innerHTML = html;
+
+    // Stop auto-refresh if task is done
+    if (d.status && d.status !== 'running') {
+      if (unleashedDetailTimers[safeName]) { clearInterval(unleashedDetailTimers[safeName]); delete unleashedDetailTimers[safeName]; }
+    }
+  } catch(e) {
+    cell.innerHTML = '<div style="color:var(--red);padding:8px">Failed to load details</div>';
+  }
 }
 
 // ── Projects ──────────────────────────────
@@ -3922,6 +4109,19 @@ async function unlinkProject(projPath) {
 // ── Cron Modal ────────────────────────────
 let editingCronJob = null;
 
+function populateAfterJobDropdown(selectedAfter, excludeName) {
+  var sel = document.getElementById('cron-after');
+  sel.innerHTML = '<option value="">None — runs on schedule</option>';
+  for (var j of cronJobsData) {
+    if (excludeName && j.name === excludeName) continue;
+    var opt = document.createElement('option');
+    opt.value = j.name;
+    opt.textContent = j.name;
+    if (j.name === selectedAfter) opt.selected = true;
+    sel.appendChild(opt);
+  }
+}
+
 function toggleUnleashedOptions() {
   const mode = document.getElementById('cron-mode').value;
   document.getElementById('cron-maxhours-group').style.display = mode === 'unleashed' ? '' : 'none';
@@ -3942,6 +4142,8 @@ function openCreateCronModal() {
   document.getElementById('cron-workdir').value = '';
   document.getElementById('cron-mode').value = 'standard';
   document.getElementById('cron-maxhours').value = '6';
+  document.getElementById('cron-max-retries').value = '';
+  populateAfterJobDropdown('');
   toggleUnleashedOptions();
   document.getElementById('cron-prompt').value = '';
   document.getElementById('cron-modal').classList.add('show');
@@ -3960,6 +4162,8 @@ function openEditCronModal(jobName) {
   document.getElementById('cron-workdir').value = job.work_dir || '';
   document.getElementById('cron-mode').value = job.mode || 'standard';
   document.getElementById('cron-maxhours').value = String(job.max_hours || 6);
+  document.getElementById('cron-max-retries').value = job.max_retries != null ? String(job.max_retries) : '';
+  populateAfterJobDropdown(job.after || '', jobName);
   toggleUnleashedOptions();
   document.getElementById('cron-prompt').value = job.prompt || '';
   document.getElementById('cron-modal').classList.add('show');
@@ -3978,13 +4182,16 @@ async function saveCronJob() {
   const mode = document.getElementById('cron-mode').value;
   const max_hours = mode === 'unleashed' ? parseInt(document.getElementById('cron-maxhours').value) : undefined;
   const prompt = document.getElementById('cron-prompt').value.trim();
+  const max_retries_val = document.getElementById('cron-max-retries').value;
+  const max_retries = max_retries_val !== '' ? parseInt(max_retries_val) : undefined;
+  const after = document.getElementById('cron-after').value || undefined;
 
   if (!name || !schedule || !prompt) {
     toast('Please fill in all fields', 'error');
     return;
   }
 
-  const body = { name, schedule, tier, prompt, enabled: true, work_dir: work_dir || undefined, mode, max_hours };
+  const body = { name, schedule, tier, prompt, enabled: true, work_dir: work_dir || undefined, mode, max_hours, max_retries, after };
 
   if (editingCronJob) {
     await apiJson('PUT', '/api/cron/' + encodeURIComponent(editingCronJob), body);
@@ -4473,6 +4680,33 @@ async function sendChat() {
   sendBtn.textContent = 'Send';
   input.focus();
   container.scrollTop = container.scrollHeight;
+}
+
+// ── Profile Switching ─────────────────────
+async function loadProfiles() {
+  try {
+    var r = await fetch('/api/profiles');
+    var d = await r.json();
+    var sel = document.getElementById('chat-profile-select');
+    sel.innerHTML = '<option value="">Default</option>';
+    for (var p of (d.profiles || [])) {
+      var opt = document.createElement('option');
+      opt.value = p.slug;
+      opt.textContent = p.name + (p.description ? ' — ' + p.description : '');
+      if (p.slug === d.active) opt.selected = true;
+      sel.appendChild(opt);
+    }
+  } catch(e) { /* profiles are optional */ }
+}
+
+async function switchProfile(slug) {
+  try {
+    await apiJson('POST', '/api/profiles/switch', { slug: slug || null });
+    // Clear chat display since session was reset
+    var container = document.getElementById('chat-messages');
+    container.innerHTML = '<div class="empty-state"><p style="margin-bottom:14px;color:var(--text-muted)">Profile switched' + (slug ? ' to <strong>' + esc(slug) + '</strong>' : '') + '. Session cleared.</p></div>';
+    toast(slug ? 'Switched to ' + slug : 'Profile cleared', 'success');
+  } catch(e) { toast('Failed to switch profile: ' + e, 'error'); }
 }
 
 // ── Memory Search ─────────────────────────

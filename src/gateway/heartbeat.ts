@@ -456,13 +456,15 @@ export function parseCronJobs(): CronJobDefinition[] {
     const workDir = job.work_dir != null ? String(job.work_dir) : undefined;
     const mode = job.mode === 'unleashed' ? 'unleashed' as const : 'standard' as const;
     const maxHours = job.max_hours != null ? Number(job.max_hours) : undefined;
+    const maxRetries = job.max_retries != null ? Number(job.max_retries) : undefined;
+    const after = job.after != null ? String(job.after) : undefined;
 
     if (!name || !schedule || !prompt) {
       logger.warn({ job }, 'Skipping malformed cron job');
       continue;
     }
 
-    jobs.push({ name, schedule, prompt, enabled, tier, maxTurns, model, workDir, mode, maxHours });
+    jobs.push({ name, schedule, prompt, enabled, tier, maxTurns, model, workDir, mode, maxHours, maxRetries, after });
   }
 
   return jobs;
@@ -681,8 +683,54 @@ export class CronScheduler {
       return;
     }
 
+    // ── Cycle detection for `after` chains (DFS) ──────────────────────
+    const jobNames = new Set(this.jobs.map(j => j.name));
+    const afterMap = new Map<string, string>(); // child → parent
+    for (const def of this.jobs) {
+      if (def.after) {
+        if (!jobNames.has(def.after)) {
+          logger.warn(`Job '${def.name}' references missing parent '${def.after}' — ignoring chain`);
+          def.after = undefined;
+        } else {
+          afterMap.set(def.name, def.after);
+        }
+      }
+    }
+
+    // DFS cycle detection
+    const cycledJobs = new Set<string>();
+    for (const startName of afterMap.keys()) {
+      const visited = new Set<string>();
+      let current: string | undefined = startName;
+      while (current && afterMap.has(current)) {
+        if (visited.has(current)) {
+          // Cycle found — disable all jobs in the cycle
+          for (const name of visited) cycledJobs.add(name);
+          logger.error({ cycle: [...visited] }, `Circular dependency detected — disabling cycled jobs`);
+          break;
+        }
+        visited.add(current);
+        current = afterMap.get(current);
+      }
+    }
+
+    for (const name of cycledJobs) {
+      const job = this.jobs.find(j => j.name === name);
+      if (job) {
+        job.enabled = false;
+        job.after = undefined;
+        logger.error(`Disabled '${name}' due to circular chain dependency`);
+      }
+    }
+
     for (const def of this.jobs) {
       if (def.enabled && !this.disabledJobs.has(def.name)) {
+        // Jobs with `after` are triggered by their parent — skip cron scheduling
+        if (def.after) {
+          logger.info(`Cron job '${def.name}' chained after '${def.after}' — skipping cron schedule`);
+          continue;
+        }
+
         if (!cron.validate(def.schedule)) {
           logger.error(`Invalid cron schedule for '${def.name}': ${def.schedule}`);
           continue;
@@ -714,7 +762,7 @@ export class CronScheduler {
       const priorErrors = this.runLog.consecutiveErrors(job.name);
       const maxAttempts = job.mode === 'unleashed'
         ? 1
-        : 1 + Math.min(priorErrors, BACKOFF_MS.length);
+        : 1 + (job.maxRetries ?? Math.min(priorErrors, BACKOFF_MS.length));
 
       for (let attempt = 1; attempt <= maxAttempts; attempt++) {
         const startedAt = new Date();
@@ -774,6 +822,15 @@ export class CronScheduler {
           const preview = response ? response.slice(0, 100).replace(/\n/g, ' ') : 'no output';
           logToDailyNote(`**${job.name}** (${durationSec}s): ${preview}`);
 
+          // Fire dependent chained jobs (async, non-blocking)
+          const dependents = this.jobs.filter(j => j.after === job.name && j.enabled && !this.disabledJobs.has(j.name));
+          for (const dep of dependents) {
+            logger.info(`Chain: '${job.name}' succeeded — triggering '${dep.name}'`);
+            this.runJob(dep).catch((err) => {
+              logger.error({ err, job: dep.name }, `Chained job '${dep.name}' failed`);
+            });
+          }
+
           return; // done
         } catch (err) {
           const finishedAt = new Date();
@@ -825,24 +882,12 @@ export class CronScheduler {
     if (this.runningJobs.has(jobName)) {
       return `Cron job '${jobName}' is already running.`;
     }
-    this.runningJobs.add(jobName);
 
     try {
-      const response = await this.gateway.handleCronJob(
-        jobName,
-        job.prompt,
-        job.tier,
-        job.maxTurns,
-        job.model,
-        job.workDir,
-        job.mode,
-        job.maxHours,
-      );
-      return response || `*(cron job '${jobName}' completed — no output)*`;
+      await this.runJob(job);
+      return `*(cron job '${jobName}' completed)*`;
     } catch (err) {
       return CronScheduler.formatCronError(jobName, err);
-    } finally {
-      this.runningJobs.delete(jobName);
     }
   }
 
@@ -897,7 +942,9 @@ export class CronScheduler {
       const enabled = job.enabled && !this.disabledJobs.has(job.name);
       const status = enabled ? 'enabled' : 'disabled';
       const modeTag = job.mode === 'unleashed' ? ' [unleashed]' : '';
-      lines.push(`- **${job.name}** (\`${job.schedule}\`) — ${status}${modeTag}`);
+      const chainTag = job.after ? ` → after "${job.after}"` : '';
+      const retryTag = job.maxRetries != null ? ` [max ${job.maxRetries} retries]` : '';
+      lines.push(`- **${job.name}** (\`${job.schedule}\`) — ${status}${modeTag}${chainTag}${retryTag}`);
       lines.push(`  _${job.prompt.slice(0, 80)}_`);
     }
     return lines.join('\n');

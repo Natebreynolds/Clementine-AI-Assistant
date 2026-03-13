@@ -88,6 +88,9 @@ type MemoryStoreType = {
     maxAgeDays?: number; salienceThreshold?: number;
     accessLogRetentionDays?: number; transcriptRetentionDays?: number;
   }): { episodicPruned: number; accessLogPruned: number; transcriptsPruned: number };
+  checkDuplicate(content: string, sourceFile?: string): {
+    isDuplicate: boolean; matchType: 'exact' | 'near' | null; matchId?: number;
+  };
   logExtraction(extraction: {
     sessionKey: string; userMessage: string; toolName: string;
     toolInput: string; extractedAt: string; status: string;
@@ -505,6 +508,20 @@ server.tool(
       const sec = section ?? '';
       if (!sec) return textResult("Error: 'section' required for update_memory");
 
+      // Dedup check against indexed memory
+      try {
+        const store = await getStore();
+        const dup = store.checkDuplicate(content, path.relative(VAULT_DIR, MEMORY_FILE));
+        if (dup.isDuplicate) {
+          store.logExtraction({
+            sessionKey: 'mcp', userMessage: content.slice(0, 200),
+            toolName: 'memory_write', toolInput: JSON.stringify({ action, section: sec }),
+            extractedAt: new Date().toISOString(), status: 'dedup_skipped',
+          });
+          return textResult(`Skipped: ${dup.matchType} duplicate already in memory (chunk #${dup.matchId})`);
+        }
+      } catch { /* dedup failure is non-fatal — proceed with write */ }
+
       let body = readFileSync(MEMORY_FILE, 'utf-8');
 
       const pattern = new RegExp(`(## ${sec.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\n)(.*?)(\\n## |$)`, 's');
@@ -675,6 +692,22 @@ server.tool(
       return textResult(`Already exists: ${relPath}`);
     }
 
+    // Dedup check for note content
+    if (content && content.length >= 20) {
+      try {
+        const store = await getStore();
+        const dup = store.checkDuplicate(content);
+        if (dup.isDuplicate) {
+          store.logExtraction({
+            sessionKey: 'mcp', userMessage: `note_create: ${title}`,
+            toolName: 'note_create', toolInput: JSON.stringify({ note_type, title }),
+            extractedAt: new Date().toISOString(), status: 'dedup_skipped',
+          });
+          return textResult(`Skipped: ${dup.matchType} duplicate content already exists (chunk #${dup.matchId})`);
+        }
+      } catch { /* dedup failure is non-fatal */ }
+    }
+
     const body = content ?? `# ${title}\n`;
     const noteContent = `---
 type: ${note_type}
@@ -746,6 +779,22 @@ server.tool(
     project: z.string().optional().describe('Project name'),
   },
   async ({ description, priority, due_date, project }) => {
+    // Dedup check for task descriptions
+    if (description.length >= 20) {
+      try {
+        const store = await getStore();
+        const dup = store.checkDuplicate(description);
+        if (dup.isDuplicate) {
+          store.logExtraction({
+            sessionKey: 'mcp', userMessage: description.slice(0, 200),
+            toolName: 'task_add', toolInput: JSON.stringify({ description, project }),
+            extractedAt: new Date().toISOString(), status: 'dedup_skipped',
+          });
+          return textResult(`Skipped: ${dup.matchType} duplicate task already exists (chunk #${dup.matchId})`);
+        }
+      } catch { /* dedup failure is non-fatal */ }
+    }
+
     if (!existsSync(TASKS_FILE)) {
       mkdirSync(TASKS_DIR, { recursive: true });
       writeFileSync(TASKS_FILE, `---

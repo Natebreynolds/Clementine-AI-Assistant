@@ -130,6 +130,13 @@ export class Gateway {
         controlScope: 'children', createdAt: now,
       };
     }
+    if (sessionKey.startsWith('cli:')) {
+      return {
+        channel: 'cli', userId: 'owner',
+        source: 'owner-dm', spawnDepth: 0, role: 'primary',
+        controlScope: 'children', createdAt: now,
+      };
+    }
     // Cron, heartbeat, and other autonomous sessions
     return {
       channel: 'system', userId: 'system',
