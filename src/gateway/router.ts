@@ -252,8 +252,8 @@ export class Gateway {
 
         // ── Pre-flight injection scan ───────────────────────────────
         // Re-baseline integrity before scanning — auto-memory, crons, and heartbeats
-        // legitimately modify vault files between messages.
-        scanner.refreshIntegrity();
+        // legitimately modify vault files between messages. Skip if refreshed within 5s.
+        scanner.refreshIfStale(5000);
         const scan = scanner.scan(text);
 
         // Owner DMs are trusted — only block on high-confidence injection patterns,
@@ -399,7 +399,7 @@ export class Gateway {
       const release = await this.acquireSessionLock(sessionKey);
       try {
         // Pre-flight injection scan (same as handleMessage)
-        scanner.refreshIntegrity();
+        scanner.refreshIfStale(5000);
         const scan = scanner.scan(taskDescription);
 
         const isOwnerDm = sessionKey.startsWith('discord:user:') ||

@@ -39,6 +39,7 @@ function hashFile(filePath: string): string {
 
 export class IntegrityMonitor {
   private checksums = new Map<string, string>();
+  private lastRefreshTime = 0;
 
   constructor() {
     this.refresh();
@@ -49,6 +50,13 @@ export class IntegrityMonitor {
     for (const file of CRITICAL_FILES) {
       this.checksums.set(file, hashFile(file));
     }
+    this.lastRefreshTime = Date.now();
+  }
+
+  /** Skip refresh if already refreshed within maxAgeMs. */
+  refreshIfStale(maxAgeMs = 5000): void {
+    if (Date.now() - this.lastRefreshTime < maxAgeMs) return;
+    this.refresh();
   }
 
   /** Check all critical files against stored checksums. */

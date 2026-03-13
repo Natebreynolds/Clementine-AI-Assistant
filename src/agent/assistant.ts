@@ -62,6 +62,8 @@ import {
 import { scanner } from '../security/scanner.js';
 import { ProfileManager } from './profiles.js';
 import { toolLoopDetector, ToolLoopDetector } from './tool-loop-detector.js';
+import { formatResultsForPrompt } from '../memory/search.js';
+import { PromptCache } from './prompt-cache.js';
 
 // ── Token estimation & context window guard ─────────────────────────
 
@@ -312,14 +314,23 @@ interface ProjectMeta {
   keywords?: string[];
 }
 
+let _projectsMetaCache: ProjectMeta[] = [];
+let _projectsMetaCacheTime = 0;
+const PROJECTS_META_CACHE_TTL = 30_000; // 30 seconds
+
 function loadProjectsMeta(): ProjectMeta[] {
+  if (Date.now() - _projectsMetaCacheTime < PROJECTS_META_CACHE_TTL) return _projectsMetaCache;
   try {
-    if (!fs.existsSync(PROJECTS_META_FILE)) return [];
-    const raw = JSON.parse(fs.readFileSync(PROJECTS_META_FILE, 'utf-8'));
-    return Array.isArray(raw) ? raw : [];
+    if (!fs.existsSync(PROJECTS_META_FILE)) { _projectsMetaCache = []; }
+    else {
+      const raw = JSON.parse(fs.readFileSync(PROJECTS_META_FILE, 'utf-8'));
+      _projectsMetaCache = Array.isArray(raw) ? raw : [];
+    }
   } catch {
-    return [];
+    _projectsMetaCache = [];
   }
+  _projectsMetaCacheTime = Date.now();
+  return _projectsMetaCache;
 }
 
 /**
@@ -378,14 +389,30 @@ export class PersonalAssistant {
   private pendingContext = new Map<string, Array<{ user: string; assistant: string }>>();
   private restoredSessions = new Set<string>();
   private profileManager: ProfileManager;
+  private promptCache: PromptCache;
+  private _lastDailyNotePath: string | null = null;
   private memoryStore: any = null; // Typed as any — MemoryStore may not be available yet
   private _lastUserMessage?: string;
   private onUnleashedComplete: ((jobName: string, result: string) => void) | null = null;
 
   constructor() {
     this.profileManager = new ProfileManager(PROFILES_DIR);
+    this.promptCache = new PromptCache();
+    this.initPromptWatchers();
     this.loadSessions();
     this.initMemoryStore();
+  }
+
+  private initPromptWatchers(): void {
+    this.promptCache.watch(SOUL_FILE);
+    this.promptCache.watch(AGENTS_FILE);
+    this.promptCache.watch(MEMORY_FILE);
+    const feedbackFile = path.join(VAULT_DIR, '00-System', 'FEEDBACK.md');
+    this.promptCache.watch(feedbackFile);
+    // Watch today's daily note
+    const todayPath = path.join(DAILY_NOTES_DIR, `${todayISO()}.md`);
+    this.promptCache.watch(todayPath);
+    this._lastDailyNotePath = todayPath;
   }
 
   setUnleashedCompleteCallback(cb: (jobName: string, result: string) => void): void {
@@ -481,10 +508,17 @@ export class PersonalAssistant {
     const owner = OWNER;
     const vault = VAULT_DIR;
 
-    if (fs.existsSync(SOUL_FILE)) {
-      const { content } = matter(fs.readFileSync(SOUL_FILE, 'utf-8'));
+    // Swap daily note watcher if date changed
+    const todayPath = path.join(DAILY_NOTES_DIR, `${todayISO()}.md`);
+    if (this._lastDailyNotePath && this._lastDailyNotePath !== todayPath) {
+      this.promptCache.swapWatch(this._lastDailyNotePath, todayPath);
+      this._lastDailyNotePath = todayPath;
+    }
+
+    const soulEntry = this.promptCache.get(SOUL_FILE);
+    if (soulEntry) {
       // Autonomous runs only need identity, not full personality guidance
-      parts.push(isAutonomous ? content.slice(0, 1500) : content);
+      parts.push(isAutonomous ? soulEntry.content.slice(0, 1500) : soulEntry.content);
     }
 
     if (profile?.systemPromptBody) {
@@ -492,28 +526,29 @@ export class PersonalAssistant {
     }
 
     // Skip AGENTS.md for autonomous runs — not relevant for heartbeats/cron
-    if (!isAutonomous && fs.existsSync(AGENTS_FILE)) {
-      const { content } = matter(fs.readFileSync(AGENTS_FILE, 'utf-8'));
-      parts.push(content);
+    if (!isAutonomous) {
+      const agentsEntry = this.promptCache.get(AGENTS_FILE);
+      if (agentsEntry) parts.push(agentsEntry.content);
     }
 
     if (retrievalContext) {
       parts.push(`## Relevant Context (retrieved)\n\n${retrievalContext}`);
-    } else if (fs.existsSync(MEMORY_FILE)) {
-      const { content } = matter(fs.readFileSync(MEMORY_FILE, 'utf-8'));
-      // Autonomous runs get truncated memory — just enough for context
-      if (isAutonomous) {
-        const truncated = content.slice(0, 2000);
-        parts.push(`## Current Memory\n\n${truncated}${content.length > 2000 ? '\n...(truncated)' : ''}`);
-      } else {
-        parts.push(`## Current Memory\n\n${content}`);
+    } else {
+      const memoryEntry = this.promptCache.get(MEMORY_FILE);
+      if (memoryEntry) {
+        // Autonomous runs get truncated memory — just enough for context
+        if (isAutonomous) {
+          const truncated = memoryEntry.content.slice(0, 2000);
+          parts.push(`## Current Memory\n\n${truncated}${memoryEntry.content.length > 2000 ? '\n...(truncated)' : ''}`);
+        } else {
+          parts.push(`## Current Memory\n\n${memoryEntry.content}`);
+        }
       }
     }
 
-    const todayPath = path.join(DAILY_NOTES_DIR, `${todayISO()}.md`);
-    if (fs.existsSync(todayPath)) {
-      const { content } = matter(fs.readFileSync(todayPath, 'utf-8'));
-      parts.push(`## Today's Notes (${todayISO()})\n\n${content}`);
+    const todayEntry = this.promptCache.get(todayPath);
+    if (todayEntry) {
+      parts.push(`## Today's Notes (${todayISO()})\n\n${todayEntry.content}`);
     }
 
     // Skip yesterday's notes and recent conversation summaries for autonomous runs
@@ -523,12 +558,10 @@ export class PersonalAssistant {
         const mentionsYesterday = this._lastUserMessage?.toLowerCase().includes('yesterday');
         if (hour < 12 || mentionsYesterday) {
           const yPath = path.join(DAILY_NOTES_DIR, `${yesterdayISO()}.md`);
-          if (fs.existsSync(yPath)) {
-            const { content } = matter(fs.readFileSync(yPath, 'utf-8'));
-            if (content.includes('## Summary')) {
-              const summary = content.slice(content.indexOf('## Summary'));
-              parts.push(`## Yesterday's Summary (${yesterdayISO()})\n\n${summary}`);
-            }
+          const yEntry = this.promptCache.get(yPath);
+          if (yEntry && yEntry.content.includes('## Summary')) {
+            const summary = yEntry.content.slice(yEntry.content.indexOf('## Summary'));
+            parts.push(`## Yesterday's Summary (${yesterdayISO()})\n\n${summary}`);
           }
         }
       }
@@ -612,15 +645,9 @@ Delegate data-heavy work (SEO, analytics, bulk API calls for 3+ entities) to sub
     // Skip communication preferences for autonomous runs
     if (!isAutonomous) {
       const feedbackFile = path.join(VAULT_DIR, '00-System', 'FEEDBACK.md');
-      if (fs.existsSync(feedbackFile)) {
-        try {
-          const { data: fbMeta } = matter(fs.readFileSync(feedbackFile, 'utf-8'));
-          if (fbMeta.patterns_summary) {
-            parts.push(`## Communication Preferences\n\n${fbMeta.patterns_summary}`);
-          }
-        } catch {
-          // Non-fatal
-        }
+      const fbEntry = this.promptCache.get(feedbackFile);
+      if (fbEntry?.data?.patterns_summary) {
+        parts.push(`## Communication Preferences\n\n${fbEntry.data.patterns_summary}`);
       }
     }
 
@@ -801,7 +828,6 @@ Delegate data-heavy work (SEO, analytics, bulk API calls for 3+ entities) to sub
         }
       }
 
-      const { formatResultsForPrompt } = await import('../memory/search.js');
       return formatResultsForPrompt(results, SYSTEM_PROMPT_MAX_CONTEXT_CHARS);
     } catch {
       return '';
@@ -834,7 +860,8 @@ Delegate data-heavy work (SEO, analytics, bulk API calls for 3+ entities) to sub
     if (key && this.sessionTimestamps.has(key)) {
       const elapsed = Date.now() - this.sessionTimestamps.get(key)!.getTime();
       if (elapsed > SESSION_EXPIRY_MS) {
-        await this.preRotationFlush(key);
+        // Fire-and-forget: memory extraction is a write-only side effect
+        this.preRotationFlush(key).catch(() => {});
         this.sessions.delete(key);
         this.exchangeCounts.set(key, 0);
         toolLoopDetector.reset();
@@ -844,7 +871,8 @@ Delegate data-heavy work (SEO, analytics, bulk API calls for 3+ entities) to sub
 
     // Auto-rotate on exchange limit
     if (key && (this.exchangeCounts.get(key) ?? 0) >= MAX_SESSION_EXCHANGES) {
-      await this.preRotationFlush(key);
+      // Fire-and-forget: memory extraction is a write-only side effect
+      this.preRotationFlush(key).catch(() => {});
       this.sessions.delete(key);
       this.exchangeCounts.set(key, 0);
       toolLoopDetector.reset();
@@ -853,14 +881,16 @@ Delegate data-heavy work (SEO, analytics, bulk API calls for 3+ entities) to sub
 
     let effectivePrompt = text;
 
-    // If session rotated, prepend a structured summary
+    // If session rotated, use instant local summary + kick off LLM summary in background
     if (sessionRotated && key) {
-      const summary = await this.summarizeSession(key);
+      const summary = this.buildLocalSummary(key);
       if (summary) {
         effectivePrompt =
           `[Context: This is a continued conversation. The session was refreshed. ` +
           `Here is a summary of the previous conversation:\n${summary}]\n\n${text}`;
       }
+      // Fire background LLM summary for storage/future retrieval
+      this.summarizeSessionAsync(key).catch(() => {});
     }
 
     // Resilience: inject exchange history if no session_id stored
@@ -997,17 +1027,17 @@ Delegate data-heavy work (SEO, analytics, bulk API calls for 3+ entities) to sub
     securityAnnotation?: string,
     maxTurnsOverride?: number,
   ): Promise<[string, string]> {
-    const rawContext = await this.retrieveContext(prompt, sessionKey);
+    // Parallelize context retrieval and project matching — they're independent
+    const hasActiveSession = !!(sessionKey && this.sessions.has(sessionKey));
+    const [rawContext, matchedProject] = await Promise.all([
+      this.retrieveContext(prompt, sessionKey),
+      Promise.resolve(hasActiveSession ? null : matchProject(prompt)),
+    ]);
     let retrievalContext = securityAnnotation
       ? `${securityAnnotation}\n\n${rawContext}`
       : rawContext;
     setProfileTier(profile?.tier ?? null);
     setInteractionSource(inferInteractionSource(sessionKey));
-
-    // Auto-match a linked project based on message content (only on fresh conversations —
-    // switching cwd mid-session with a resume would confuse the agent)
-    const hasActiveSession = !!(sessionKey && this.sessions.has(sessionKey));
-    const matchedProject = hasActiveSession ? null : matchProject(prompt);
     if (matchedProject) {
       logger.info({ project: matchedProject.path }, 'Auto-matched project from message');
       const projName = path.basename(matchedProject.path);
@@ -1181,6 +1211,39 @@ Delegate data-heavy work (SEO, analytics, bulk API calls for 3+ entities) to sub
   }
 
   // ── Session Summarization ─────────────────────────────────────────
+
+  /**
+   * Build an instant local summary from in-memory exchange history.
+   * No LLM call — returns immediately. Used during session rotation
+   * to avoid blocking the user's query.
+   */
+  private buildLocalSummary(sessionKey: string): string {
+    const exchanges = this.lastExchanges.get(sessionKey) ?? [];
+    if (exchanges.length === 0) return '';
+
+    const recent = exchanges.slice(-5);
+    const lines = recent.map((ex, i) => {
+      const userSnippet = ex.user.slice(0, 200).replace(/\n/g, ' ');
+      const assistantSnippet = ex.assistant.slice(0, 300).replace(/\n/g, ' ');
+      return `- Exchange ${exchanges.length - recent.length + i + 1}: User asked about "${userSnippet}" / I responded "${assistantSnippet}"`;
+    });
+    return lines.join('\n');
+  }
+
+  /**
+   * Run an LLM summary in the background and save to memoryStore.
+   * Does not block the caller — for future retrieval context only.
+   */
+  private async summarizeSessionAsync(sessionKey: string): Promise<void> {
+    try {
+      const summary = await this.summarizeSession(sessionKey);
+      if (summary) {
+        logger.info({ sessionKey, len: summary.length }, 'Background session summary complete');
+      }
+    } catch {
+      // Non-fatal — background task
+    }
+  }
 
   private async summarizeSession(sessionKey: string): Promise<string> {
     const exchanges = this.lastExchanges.get(sessionKey) ?? [];

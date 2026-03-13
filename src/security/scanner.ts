@@ -102,6 +102,11 @@ export class InjectionScanner {
     this.integrity.refresh();
   }
 
+  /** Refresh integrity baselines only if stale (skip if refreshed within maxAgeMs). */
+  refreshIfStale(maxAgeMs = 5000): void {
+    this.integrity.refreshIfStale(maxAgeMs);
+  }
+
   /** Run all 5 layers and return a composite verdict. */
   scan(text: string): ScanResult {
     const reasons: string[] = [];
