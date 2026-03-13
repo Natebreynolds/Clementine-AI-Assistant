@@ -510,6 +510,19 @@ export class PersonalAssistant {
     }
   }
 
+  // ── Public getters for presence/status ────────────────────────────
+
+  getExchangeCount(sessionKey: string): number {
+    return this.exchangeCounts.get(sessionKey) ?? 0;
+  }
+
+  getMemoryChunkCount(): number {
+    if (!this.memoryStore) return 0;
+    try {
+      return this.memoryStore.getChunkCount() as number;
+    } catch { return 0; }
+  }
+
   // ── System Prompt Builder ─────────────────────────────────────────
 
   private buildSystemPrompt(opts: {

@@ -212,6 +212,16 @@ export class MemoryStore {
     return this.db!;
   }
 
+  /** Return the total number of indexed chunks. */
+  getChunkCount(): number {
+    try {
+      const row = this.conn
+        .prepare('SELECT COUNT(*) as cnt FROM chunks')
+        .get() as { cnt: number } | undefined;
+      return row?.cnt ?? 0;
+    } catch { return 0; }
+  }
+
   // ── Full Sync ──────────────────────────────────────────────────────
 
   /**

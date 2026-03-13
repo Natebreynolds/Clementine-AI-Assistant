@@ -7,6 +7,7 @@
  */
 
 import {
+  ActivityType,
   Client,
   Events,
   GatewayIntentBits,
@@ -460,6 +461,24 @@ export async function startDiscord(
     partials: [Partials.Channel, Partials.Reaction, Partials.Message],
   });
 
+  // ── Presence updater ─────────────────────────────────────────────
+  function updatePresence(sessionKey?: string): void {
+    if (!client.user) return;
+    const info = gateway.getPresenceInfo(
+      sessionKey ?? `discord:user:${DISCORD_OWNER_ID}`,
+    );
+    const parts = [
+      info.model,
+      info.project ?? 'No project',
+      `${info.exchanges}/${info.maxExchanges}`,
+      `${info.memoryCount}m`,
+    ];
+    client.user.setPresence({
+      activities: [{ name: parts.join(' · '), type: ActivityType.Custom, state: parts.join(' · ') }],
+      status: 'online',
+    });
+  }
+
   // Prevent unhandled 'error' events from crashing the process
   client.on(Events.Error, (err) => {
     logger.error({ err }, 'Discord client error — will attempt to reconnect');
@@ -477,6 +496,8 @@ export async function startDiscord(
     } catch (err) {
       logger.error({ err }, 'Failed to register slash commands');
     }
+
+    updatePresence();
   });
 
   client.on(Events.MessageCreate, async (message: Message) => {
@@ -518,6 +539,7 @@ export async function startDiscord(
     if (isDm && text === '!clear') {
       gateway.clearSession(sessionKey);
       await message.reply('Session cleared.');
+      updatePresence(sessionKey);
       return;
     }
 
@@ -529,6 +551,7 @@ export async function startDiscord(
     if (isDm && text.startsWith('!model')) {
       const parts = text.split(/\s+/);
       await message.reply(handleModelSwitch(gateway, sessionKey, parts[1]));
+      updatePresence(sessionKey);
       return;
     }
 
@@ -557,6 +580,7 @@ export async function startDiscord(
         const projectName = parts.slice(1).join(' ');
         await message.reply(handleProjectCommand(gateway, sessionKey, 'set', projectName || undefined));
       }
+      updatePresence(sessionKey);
       return;
     }
 
@@ -673,6 +697,7 @@ export async function startDiscord(
         oneOffMaxTurns,
       );
       await streamer.finalize(response);
+      updatePresence(sessionKey);
 
       // Track bot message for feedback reactions
       if (streamer.messageId) {

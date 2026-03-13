@@ -5,9 +5,11 @@
  * Manages per-user/channel sessions for conversation continuity.
  */
 
+import path from 'node:path';
 import pino from 'pino';
-import type { PersonalAssistant, ProjectMeta } from '../agent/assistant.js';
+import { PersonalAssistant, type ProjectMeta } from '../agent/assistant.js';
 import type { OnTextCallback, PlanProgressUpdate, SessionProvenance } from '../types.js';
+import { MODELS } from '../config.js';
 import { scanner } from '../security/scanner.js';
 import { lanes } from './lanes.js';
 
@@ -542,6 +544,29 @@ export class Gateway {
 
   getLaneStatus() {
     return lanes.status();
+  }
+
+  // ── Presence info ───────────────────────────────────────────────────
+
+  getPresenceInfo(sessionKey: string): {
+    model: string;
+    project: string | null;
+    exchanges: number;
+    maxExchanges: number;
+    memoryCount: number;
+  } {
+    const modelId = this.sessionModels.get(sessionKey);
+    const modelName = modelId
+      ? Object.entries(MODELS).find(([, v]) => v === modelId)?.[0] ?? 'sonnet'
+      : 'sonnet';
+    const project = this.sessionProjects.get(sessionKey);
+    return {
+      model: modelName.charAt(0).toUpperCase() + modelName.slice(1),
+      project: project ? path.basename(project.path) : null,
+      exchanges: this.assistant.getExchangeCount(sessionKey),
+      maxExchanges: PersonalAssistant.MAX_SESSION_EXCHANGES,
+      memoryCount: this.assistant.getMemoryChunkCount(),
+    };
   }
 
   // ── Session management ──────────────────────────────────────────────
