@@ -38,11 +38,12 @@ import {
   BASE_DIR,
   DISCORD_OWNER_ID,
 } from '../config.js';
-import type { CronJobDefinition, CronRunEntry, HeartbeatState, WorkflowDefinition } from '../types.js';
+import type { CronJobDefinition, CronRunEntry, HeartbeatState, SelfImproveConfig, SelfImproveExperiment, SelfImproveState, WorkflowDefinition } from '../types.js';
 import type { NotificationDispatcher } from './notifications.js';
 import type { Gateway } from './router.js';
 import { scanner } from '../security/scanner.js';
 import { parseAllWorkflows as parseAllWorkflowsSync } from '../agent/workflow-runner.js';
+import { SelfImproveLoop } from '../agent/self-improve.js';
 
 const logger = pino({ name: 'clementine.heartbeat' });
 
@@ -1136,5 +1137,41 @@ export class CronScheduler {
       lines.push(`  Steps: ${wf.steps.map(s => s.id).join(' → ')}`);
     }
     return lines.join('\n');
+  }
+
+  // ── Self-Improvement ─────────────────────────────────────────────
+
+  async runSelfImproveLoop(
+    config?: Partial<SelfImproveConfig>,
+    onProposal?: (experiment: SelfImproveExperiment) => Promise<void>,
+  ): Promise<SelfImproveState> {
+    const loop = new SelfImproveLoop(this.gateway.assistant, config);
+    return loop.run(onProposal);
+  }
+
+  async applySelfImproveChange(experimentId: string): Promise<string> {
+    const loop = new SelfImproveLoop(this.gateway.assistant);
+    return loop.applyApprovedChange(experimentId);
+  }
+
+  denySelfImproveChange(experimentId: string): string {
+    const loop = new SelfImproveLoop(this.gateway.assistant);
+    return loop.denyChange(experimentId);
+  }
+
+  getSelfImproveStatus(): SelfImproveState {
+    const loop = new SelfImproveLoop(this.gateway.assistant);
+    return loop.loadState();
+  }
+
+  getSelfImproveHistory(limit = 10): SelfImproveExperiment[] {
+    const loop = new SelfImproveLoop(this.gateway.assistant);
+    const log = loop.loadExperimentLog();
+    return log.slice(-limit).reverse();
+  }
+
+  getSelfImprovePending(): Array<SelfImproveExperiment & { before: string }> {
+    const loop = new SelfImproveLoop(this.gateway.assistant);
+    return loop.getPendingChanges();
   }
 }

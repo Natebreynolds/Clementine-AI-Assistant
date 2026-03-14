@@ -98,6 +98,11 @@ const slashCommands = [
     .addStringOption(o => o.setName('inputs').setDescription('Input overrides (key=val key=val)')),
   new SlashCommandBuilder().setName('status').setDescription('Check unleashed task progress')
     .addStringOption(o => o.setName('job').setDescription('Job name (omit for all)')),
+  new SlashCommandBuilder().setName('self-improve').setDescription('Manage Clementine self-improvement')
+    .addSubcommand(sub => sub.setName('run').setDescription('Trigger self-improvement cycle'))
+    .addSubcommand(sub => sub.setName('status').setDescription('Show self-improvement status'))
+    .addSubcommand(sub => sub.setName('history').setDescription('Show experiment history'))
+    .addSubcommand(sub => sub.setName('pending').setDescription('List pending proposals')),
   new SlashCommandBuilder().setName('clear').setDescription('Reset conversation session'),
   new SlashCommandBuilder().setName('help').setDescription('Show all available commands'),
 ];
@@ -791,6 +796,88 @@ export async function startDiscord(
       return;
     }
 
+    // ── Self-Improvement command (DM only) ────────────────────────────
+
+    if (isDm && text.startsWith('!self-improve')) {
+      const parts = text.split(/\s+/);
+      const subCmd = parts[1]?.toLowerCase();
+
+      if (subCmd === 'status' || !subCmd) {
+        const result = await gateway.handleSelfImprove('status');
+        await message.reply(result);
+        return;
+      }
+
+      if (subCmd === 'history') {
+        const result = await gateway.handleSelfImprove('history');
+        await message.reply(result || 'No experiment history yet.');
+        return;
+      }
+
+      if (subCmd === 'pending') {
+        const result = await gateway.handleSelfImprove('pending');
+        await message.reply(result);
+        return;
+      }
+
+      if (subCmd === 'apply') {
+        const expId = parts[2];
+        if (!expId) {
+          await message.reply('Usage: `!self-improve apply <experiment-id>`');
+          return;
+        }
+        const result = await gateway.handleSelfImprove('apply', { experimentId: expId });
+        await message.reply(result);
+        return;
+      }
+
+      if (subCmd === 'deny') {
+        const expId = parts[2];
+        if (!expId) {
+          await message.reply('Usage: `!self-improve deny <experiment-id>`');
+          return;
+        }
+        const result = await gateway.handleSelfImprove('deny', { experimentId: expId });
+        await message.reply(result);
+        return;
+      }
+
+      if (subCmd === 'run') {
+        const streamer = new DiscordStreamingMessage(message.channel);
+        await streamer.start();
+        const result = await gateway.handleSelfImprove('run', {}, async (experiment) => {
+          // Send proposal embed for each accepted experiment
+          const proposalText =
+            `**Self-Improvement Proposal #${experiment.iteration}**\n\n` +
+            `**Area:** ${experiment.area}\n` +
+            `**Target:** ${experiment.target}\n` +
+            `**Score:** ${(experiment.score * 10).toFixed(1)}/10\n\n` +
+            `**Hypothesis:** ${experiment.hypothesis}\n\n` +
+            `**Proposed Change:**\n\`\`\`\n${experiment.proposedChange.slice(0, 800)}\n\`\`\``;
+
+          await sendApprovalButtons(
+            message.channel,
+            proposalText.slice(0, 1900),
+            'si',
+            experiment.id,
+          );
+        });
+        await streamer.finalize(result);
+        return;
+      }
+
+      await message.reply(
+        '**Self-Improvement Commands:**\n' +
+        '`!self-improve run` — trigger a self-improvement cycle\n' +
+        '`!self-improve status` — show current state and baseline metrics\n' +
+        '`!self-improve history [n]` — show last N experiments (default 10)\n' +
+        '`!self-improve pending` — list pending approval proposals\n' +
+        '`!self-improve apply <id>` — approve a pending change\n' +
+        '`!self-improve deny <id>` — deny a pending change',
+      );
+      return;
+    }
+
     // ── Plan orchestration (DM only) ─────────────────────────────────
 
     if (isDm && text.startsWith('!plan ')) {
@@ -1082,6 +1169,55 @@ export async function startDiscord(
         return;
       }
 
+      // Self-improve command
+      if (name === 'self-improve') {
+        const subCmd = cmd.options.getSubcommand();
+
+        if (subCmd === 'status') {
+          const result = await gateway.handleSelfImprove('status');
+          await cmd.reply({ content: result, ephemeral: true });
+          return;
+        }
+        if (subCmd === 'history') {
+          const result = await gateway.handleSelfImprove('history');
+          await cmd.reply({ content: result || 'No history yet.', ephemeral: true });
+          return;
+        }
+        if (subCmd === 'pending') {
+          const result = await gateway.handleSelfImprove('pending');
+          await cmd.reply({ content: result, ephemeral: true });
+          return;
+        }
+        if (subCmd === 'run') {
+          await cmd.deferReply();
+          const result = await gateway.handleSelfImprove('run', {}, async (experiment) => {
+            const proposalText =
+              `**Self-Improvement Proposal #${experiment.iteration}**\n\n` +
+              `**Area:** ${experiment.area}\n` +
+              `**Target:** ${experiment.target}\n` +
+              `**Score:** ${(experiment.score * 10).toFixed(1)}/10\n\n` +
+              `**Hypothesis:** ${experiment.hypothesis}\n\n` +
+              `**Proposed Change:**\n\`\`\`\n${experiment.proposedChange.slice(0, 800)}\n\`\`\``;
+
+            if (cmd.channel) {
+              await sendApprovalButtons(
+                cmd.channel,
+                proposalText.slice(0, 1900),
+                'si',
+                experiment.id,
+              );
+            }
+          });
+          const chunks = chunkText(result, 1900);
+          await cmd.editReply(chunks[0]);
+          for (let i = 1; i < chunks.length; i++) {
+            await cmd.followUp(chunks[i]);
+          }
+          return;
+        }
+        return;
+      }
+
       // Heartbeat command
       if (name === 'heartbeat') {
         await cmd.deferReply();
@@ -1225,6 +1361,21 @@ export async function startDiscord(
       // Remove prefix (plan/deep) and suffix (approve/deny), join middle parts
       const requestId = parts.slice(1, -1).join('_');
       gateway.resolveApproval(requestId, isApprove);
+      return;
+    }
+
+    // ── Self-improvement approval buttons
+    if (customId.startsWith('si_')) {
+      const parts = customId.split('_');
+      const experimentId = parts.slice(1, -1).join('_');
+      try {
+        const result = isApprove
+          ? await gateway.handleSelfImprove('apply', { experimentId })
+          : await gateway.handleSelfImprove('deny', { experimentId });
+        await button.followUp({ content: result, ephemeral: true });
+      } catch (err) {
+        await button.followUp({ content: `Error: ${err}`, ephemeral: true });
+      }
       return;
     }
 

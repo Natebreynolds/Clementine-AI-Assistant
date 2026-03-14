@@ -267,6 +267,48 @@ export interface WorkflowRunEntry {
   error?: string;
 }
 
+// ── Self-Improvement ────────────────────────────────────────────────
+
+export interface SelfImproveExperiment {
+  id: string;                          // 8-char hex prefix
+  iteration: number;                   // Sequential (1, 2, 3...)
+  startedAt: string;                   // ISO
+  finishedAt: string;                  // ISO
+  durationMs: number;
+  area: 'soul' | 'cron' | 'workflow' | 'memory';
+  target: string;                      // e.g., "SOUL.md personality section"
+  hypothesis: string;                  // What the LLM decided to try
+  proposedChange: string;              // The actual modification
+  baselineScore: number;               // Score before (0-1)
+  score: number;                       // Evaluation score (0-1)
+  accepted: boolean;                   // Did it pass evaluation threshold?
+  approvalStatus: 'pending' | 'approved' | 'denied' | 'expired';
+  reason: string;                      // Why accepted/rejected
+  error?: string;
+}
+
+export interface SelfImproveState {
+  status: 'idle' | 'running' | 'completed' | 'failed';
+  lastRunAt: string;                   // ISO
+  currentIteration: number;
+  totalExperiments: number;
+  baselineMetrics: {
+    feedbackPositiveRatio: number;     // positive / total
+    cronSuccessRate: number;           // ok / total
+    avgResponseQuality: number;        // LLM judge score (0-1)
+  };
+  pendingApprovals: number;
+}
+
+export interface SelfImproveConfig {
+  maxIterations: number;               // Default: 10
+  iterationBudgetMs: number;           // Default: 300_000 (5 min)
+  maxDurationMs: number;               // Default: 3_600_000 (1 hour)
+  acceptThreshold: number;             // Default: 0.6 (score must beat this)
+  plateauLimit: number;                // Default: 3 consecutive low-score stops loop
+  areas: ('soul' | 'cron' | 'workflow' | 'memory')[];
+}
+
 // ── Utility types ────────────────────────────────────────────────────
 
 type float = number;

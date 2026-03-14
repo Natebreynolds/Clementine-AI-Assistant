@@ -276,6 +276,10 @@ export const INJECTED_CONTEXT_MAX_CHARS = 6000;
 export const TEMPORAL_DECAY_HALF_LIFE_DAYS = 30;
 export const EPISODIC_DECAY_HALF_LIFE_DAYS = 7;
 
+// ── Self-Improvement ─────────────────────────────────────────────────
+
+export const SELF_IMPROVE_DIR = path.join(BASE_DIR, 'self-improve');
+
 // ── API ──────────────────────────────────────────────────────────────
 
 export const ANTHROPIC_API_KEY = getSecret('ANTHROPIC_API_KEY');

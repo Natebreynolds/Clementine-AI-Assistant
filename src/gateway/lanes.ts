@@ -9,25 +9,28 @@ import pino from 'pino';
 
 const logger = pino({ name: 'clementine.lanes' });
 
-export type Lane = 'chat' | 'cron' | 'heartbeat';
+export type Lane = 'chat' | 'cron' | 'heartbeat' | 'self-improve';
 
 class LaneController {
   private limits: Record<Lane, number> = {
-    chat: 3,      // Up to 3 concurrent chat sessions
-    cron: 2,      // Up to 2 concurrent cron jobs
-    heartbeat: 1, // Only 1 heartbeat at a time
+    chat: 3,            // Up to 3 concurrent chat sessions
+    cron: 2,            // Up to 2 concurrent cron jobs
+    heartbeat: 1,       // Only 1 heartbeat at a time
+    'self-improve': 1,  // Only 1 self-improvement cycle at a time
   };
 
   private active: Record<Lane, number> = {
     chat: 0,
     cron: 0,
     heartbeat: 0,
+    'self-improve': 0,
   };
 
   private waiters: Record<Lane, Array<() => void>> = {
     chat: [],
     cron: [],
     heartbeat: [],
+    'self-improve': [],
   };
 
   /** Acquire a slot in a lane. Resolves when a slot is available. */
@@ -58,6 +61,7 @@ class LaneController {
       chat: { active: this.active.chat, limit: this.limits.chat, queued: this.waiters.chat.length },
       cron: { active: this.active.cron, limit: this.limits.cron, queued: this.waiters.cron.length },
       heartbeat: { active: this.active.heartbeat, limit: this.limits.heartbeat, queued: this.waiters.heartbeat.length },
+      'self-improve': { active: this.active['self-improve'], limit: this.limits['self-improve'], queued: this.waiters['self-improve'].length },
     };
   }
 

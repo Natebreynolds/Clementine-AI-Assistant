@@ -1767,6 +1767,59 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
     res.json(computeMetrics());
   });
 
+  // ── Self-Improvement API ─────────────────────────────────────────
+
+  app.get('/api/self-improve', (_req, res) => {
+    const siDir = path.join(BASE_DIR, 'self-improve');
+    const stateFile = path.join(siDir, 'state.json');
+    const logFile = path.join(siDir, 'experiment-log.jsonl');
+    const pendingDir = path.join(siDir, 'pending-changes');
+
+    let state = null;
+    if (existsSync(stateFile)) {
+      try { state = JSON.parse(readFileSync(stateFile, 'utf-8')); } catch { /* ignore */ }
+    }
+
+    let experiments: unknown[] = [];
+    if (existsSync(logFile)) {
+      try {
+        experiments = readFileSync(logFile, 'utf-8').trim().split('\n').filter(Boolean)
+          .map(l => JSON.parse(l));
+      } catch { /* ignore */ }
+    }
+
+    let pending: unknown[] = [];
+    if (existsSync(pendingDir)) {
+      try {
+        pending = readdirSync(pendingDir).filter(f => f.endsWith('.json'))
+          .map(f => { try { return JSON.parse(readFileSync(path.join(pendingDir, f), 'utf-8')); } catch { return null; } })
+          .filter(Boolean);
+      } catch { /* ignore */ }
+    }
+
+    res.json({ state, experiments, pending });
+  });
+
+  app.post('/api/self-improve/apply/:id', async (req, res) => {
+    try {
+      const gw = await getGateway();
+      const result = await gw.handleSelfImprove('apply', { experimentId: req.params.id });
+      res.json({ ok: true, message: result });
+    } catch (err) {
+      res.json({ ok: false, message: String(err) });
+    }
+  });
+
+  app.post('/api/self-improve/deny/:id', async (req, res) => {
+    try {
+      const gw = await getGateway();
+      const result = await gw.handleSelfImprove('deny', { experimentId: req.params.id });
+      res.json({ ok: true, message: result });
+    } catch (err) {
+      res.json({ ok: false, message: String(err) });
+    }
+  });
+
   // ── Start server (auto-increment port if taken) ──────────────────
 
   const maxAttempts = 10;
@@ -3127,6 +3180,10 @@ function getDashboardHTML(): string {
         <span class="nav-icon">&#9203;</span> Timers
         <span class="nav-badge" id="nav-timer-count">0</span>
       </div>
+      <div class="nav-item" data-page="self-improve">
+        <span class="nav-icon">&#128300;</span> Self-Improve
+        <span class="nav-badge" id="nav-si-pending">0</span>
+      </div>
     </div>
     <div class="nav-section">
       <div class="nav-section-title">System</div>
@@ -3225,6 +3282,20 @@ function getDashboardHTML(): string {
       <div class="card">
         <div class="card-header">MEMORY.md</div>
         <div class="card-body" id="panel-memory"><div class="empty-state">Loading...</div></div>
+      </div>
+    </div>
+
+    <!-- ═══ Self-Improvement Page ═══ -->
+    <div class="page" id="page-self-improve">
+      <div class="page-title">Self-Improvement</div>
+      <div class="grid-2" id="si-status-cards"></div>
+      <div class="card" style="margin-top:16px">
+        <div class="card-header">Pending Proposals</div>
+        <div class="card-body" id="si-pending-list"><div class="empty-state">No pending proposals</div></div>
+      </div>
+      <div class="card" style="margin-top:16px">
+        <div class="card-header">Experiment History</div>
+        <div class="card-body" id="si-history-list"><div class="empty-state">No experiments yet</div></div>
       </div>
     </div>
 
@@ -3618,6 +3689,7 @@ document.querySelectorAll('.nav-item').forEach(item => {
     if (page === 'metrics') refreshMetrics();
     if (page === 'chat') { loadProfiles(); document.getElementById('chat-input').focus(); }
     if (page === 'settings') refreshSettings();
+    if (page === 'self-improve') refreshSelfImprove();
   });
 });
 
@@ -5231,7 +5303,109 @@ function refreshAll() {
   if (currentPage === 'memory') refreshMemory();
   if (currentPage === 'logs') refreshLogs();
   if (currentPage === 'metrics') refreshMetrics();
+  if (currentPage === 'self-improve') refreshSelfImprove();
   checkVersion();
+}
+
+// ── Self-Improvement ──────────────────────
+async function refreshSelfImprove() {
+  try {
+    const r = await fetch('/api/self-improve');
+    const d = await r.json();
+    const state = d.state;
+    const experiments = d.experiments || [];
+    const pending = d.pending || [];
+
+    // Update nav badge
+    const badge = document.getElementById('nav-si-pending');
+    if (badge) badge.textContent = pending.length || '0';
+
+    // Status cards
+    const cards = document.getElementById('si-status-cards');
+    if (cards && state) {
+      const m = state.baselineMetrics || {};
+      cards.innerHTML =
+        '<div class="stat-card"><div class="stat-value">' + (state.status || 'idle') + '</div><div class="stat-label">Status</div></div>' +
+        '<div class="stat-card"><div class="stat-value">' + (state.totalExperiments || 0) + '</div><div class="stat-label">Total Experiments</div></div>' +
+        '<div class="stat-card"><div class="stat-value">' + (pending.length || 0) + '</div><div class="stat-label">Pending Approvals</div></div>' +
+        '<div class="stat-card"><div class="stat-value">' + (state.lastRunAt ? new Date(state.lastRunAt).toLocaleDateString() : 'Never') + '</div><div class="stat-label">Last Run</div></div>' +
+        '<div class="stat-card"><div class="stat-value">' + ((m.feedbackPositiveRatio || 0) * 100).toFixed(0) + '%</div><div class="stat-label">Feedback Positive</div></div>' +
+        '<div class="stat-card"><div class="stat-value">' + ((m.cronSuccessRate || 0) * 100).toFixed(0) + '%</div><div class="stat-label">Cron Success</div></div>';
+    } else if (cards) {
+      cards.innerHTML = '<div class="stat-card"><div class="stat-value">idle</div><div class="stat-label">Status</div></div>' +
+        '<div class="stat-card"><div class="stat-value">0</div><div class="stat-label">Total Experiments</div></div>';
+    }
+
+    // Pending proposals
+    const pendingEl = document.getElementById('si-pending-list');
+    if (pendingEl) {
+      if (pending.length === 0) {
+        pendingEl.innerHTML = '<div class="empty-state">No pending proposals</div>';
+      } else {
+        pendingEl.innerHTML = pending.map(function(p) {
+          return '<div style="padding:12px;border-bottom:1px solid var(--border)">' +
+            '<div style="display:flex;justify-content:space-between;align-items:center">' +
+            '<div><strong>' + p.area + '</strong> &rarr; ' + (p.target || '').substring(0, 40) +
+            ' <span style="color:var(--text-muted);font-size:12px">(' + ((p.score || 0) * 10).toFixed(1) + '/10)</span></div>' +
+            '<div style="display:flex;gap:6px">' +
+            '<button onclick="siApply(\'' + p.id + '\')" style="background:var(--success);color:#fff;border:none;padding:4px 10px;border-radius:4px;cursor:pointer;font-size:12px">Approve</button>' +
+            '<button onclick="siDeny(\'' + p.id + '\')" style="background:var(--danger);color:#fff;border:none;padding:4px 10px;border-radius:4px;cursor:pointer;font-size:12px">Deny</button>' +
+            '</div></div>' +
+            '<div style="margin-top:6px;font-size:13px;color:var(--text-secondary)">' + (p.hypothesis || '').substring(0, 120) + '</div>' +
+            '<details style="margin-top:6px"><summary style="font-size:12px;color:var(--text-muted);cursor:pointer">View proposed change</summary>' +
+            '<pre style="margin-top:4px;font-size:11px;max-height:200px;overflow:auto;background:var(--bg-input);padding:8px;border-radius:4px;white-space:pre-wrap">' +
+            (p.proposedChange || '').substring(0, 1000).replace(/</g, '&lt;') + '</pre></details>' +
+            '</div>';
+        }).join('');
+      }
+    }
+
+    // Experiment history (most recent first)
+    const historyEl = document.getElementById('si-history-list');
+    if (historyEl) {
+      const recent = experiments.slice(-20).reverse();
+      if (recent.length === 0) {
+        historyEl.innerHTML = '<div class="empty-state">No experiments yet</div>';
+      } else {
+        historyEl.innerHTML = '<table style="width:100%;font-size:13px;border-collapse:collapse">' +
+          '<thead><tr style="text-align:left;color:var(--text-muted);font-size:11px;text-transform:uppercase">' +
+          '<th style="padding:8px">#</th><th style="padding:8px">Area</th><th style="padding:8px">Hypothesis</th>' +
+          '<th style="padding:8px">Score</th><th style="padding:8px">Status</th></tr></thead><tbody>' +
+          recent.map(function(e) {
+            var statusIcon = e.accepted ? (e.approvalStatus === 'approved' ? '&#9989;' : '&#9203;') : '&#10060;';
+            return '<tr style="border-top:1px solid var(--border)">' +
+              '<td style="padding:8px;color:var(--text-muted)">' + (e.iteration || '') + '</td>' +
+              '<td style="padding:8px"><span style="background:var(--bg-input);padding:2px 6px;border-radius:4px;font-size:11px">' + (e.area || '') + '</span></td>' +
+              '<td style="padding:8px">' + (e.hypothesis || '').substring(0, 60) + '</td>' +
+              '<td style="padding:8px">' + ((e.score || 0) * 10).toFixed(1) + '/10</td>' +
+              '<td style="padding:8px">' + statusIcon + ' ' + (e.approvalStatus || '') + '</td></tr>';
+          }).join('') +
+          '</tbody></table>';
+      }
+    }
+  } catch (err) {
+    console.error('Failed to refresh self-improve:', err);
+  }
+}
+
+async function siApply(id) {
+  try {
+    const r = await fetch('/api/self-improve/apply/' + id, { method: 'POST' });
+    const d = await r.json();
+    if (d.ok) toast(d.message, 'success');
+    else toast(d.message || 'Failed', 'error');
+    refreshSelfImprove();
+  } catch (err) { toast('Error: ' + err, 'error'); }
+}
+
+async function siDeny(id) {
+  try {
+    const r = await fetch('/api/self-improve/deny/' + id, { method: 'POST' });
+    const d = await r.json();
+    if (d.ok) toast(d.message, 'success');
+    else toast(d.message || 'Failed', 'error');
+    refreshSelfImprove();
+  } catch (err) { toast('Error: ' + err, 'error'); }
 }
 
 refreshAll();

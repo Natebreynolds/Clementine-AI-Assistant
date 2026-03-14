@@ -37,6 +37,7 @@ Clementine is three layers stacked on a shared memory store:
                     │  Claude Code SDK · Security Hooks        │
                     │  Auto-Memory · Session Rotation          │
                     │  Agent Profiles · Sub-Agent Teams        │
+                    │  Self-Improvement Loop                   │
                     └────────────────┬────────────────────────┘
                                      │
                     ┌────────────────▼────────────────────────┐
@@ -103,6 +104,11 @@ That's it. Clementine is now running, connected to your configured channels, and
 │   └── <task>/
 │       ├── status.json            ← Current status, phase, timing
 │       └── progress.jsonl         ← Phase-by-phase event log
+├── self-improve/                  ← Self-improvement state
+│   ├── experiment-log.jsonl       ← Append-only experiment history
+│   ├── state.json                 ← Loop status, baseline metrics
+│   └── pending-changes/           ← Proposed diffs awaiting approval
+│       └── {experiment-id}.json
 └── vault/                         ← Obsidian-compatible vault
     ├── 00-System/                 ← SOUL.md, MEMORY.md, HEARTBEAT.md, CRON.md
     ├── 01-Daily-Notes/            ← Auto-generated daily logs (YYYY-MM-DD.md)
@@ -117,7 +123,8 @@ src/                               ← Package code (wherever npm installed it)
 ├── agent/
 │   ├── assistant.ts               ← PersonalAssistant — the brain
 │   ├── hooks.ts                   ← Security enforcement (3-tier model)
-│   └── profiles.ts                ← Agent profile switching
+│   ├── profiles.ts                ← Agent profile switching
+│   └── self-improve.ts            ← Nightly self-improvement loop engine
 ├── channels/
 │   ├── discord.ts                 ← Discord.js adapter
 │   ├── slack.ts                   ← Slack Socket Mode adapter
@@ -243,6 +250,8 @@ User message
 | `memory_correct` | Correct or dismiss a previously extracted memory |
 | `feedback_log` | Log user feedback on responses |
 | `feedback_report` | View feedback history and patterns |
+| `self_improve_status` | Check self-improvement state, pending approvals, experiment history |
+| `self_improve_run` | Trigger a self-improvement analysis cycle |
 
 ---
 
@@ -269,6 +278,10 @@ clementine cron runs [job]     View run history (with retry/error details)
 clementine cron install        Install OS-level scheduler (launchd/crontab)
 clementine cron uninstall      Remove OS-level scheduler
 clementine heartbeat           Run a one-shot heartbeat check
+clementine self-improve status Show self-improvement state and baseline metrics
+clementine self-improve run    Trigger a self-improvement cycle
+clementine self-improve history Show experiment history
+clementine self-improve apply <id>  Approve and apply a pending change
 clementine --help              Show all commands
 ```
 
@@ -293,6 +306,7 @@ Run `clementine dashboard` to open a local web command center at `http://localho
 - **Projects** — Browse all discovered workspace projects with type, description, and tool badges
 - **Live status** — Daemon health, LaunchAgent status, active channels
 - **Sessions** — View and manage active conversation sessions
+- **Self-Improvement** — View experiment history, approve/deny pending proposals, monitor baseline metrics
 
 No extra dependencies — the dashboard uses Express, which is already installed.
 
@@ -487,6 +501,84 @@ The dashboard shows a live **Unleashed Tasks** panel below scheduled tasks with:
 - Cancel button for running tasks
 
 Progress is also logged to `~/.clementine/unleashed/<task>/progress.jsonl` for debugging.
+
+---
+
+## Self-improvement
+
+Clementine can autonomously improve herself using an iterative loop inspired by Karpathy's autoresearch pattern: **gather data, diagnose weaknesses, hypothesize a fix, evaluate the fix, and propose the change for approval**.
+
+```
+  ┌──────────┐    ┌──────────┐    ┌─────────────┐    ┌──────────┐    ┌──────────┐
+  │  Gather  │───▶│ Diagnose │───▶│ Hypothesize │───▶│ Evaluate │───▶│   Gate   │
+  │ feedback │    │ weakness │    │  a change   │    │ LLM judge│    │ approve? │
+  │ cron logs│    │ patterns │    │  (minimal)  │    │  0-10    │    │          │
+  └──────────┘    └──────────┘    └─────────────┘    └──────────┘    └──────────┘
+       │                                                                   │
+       │              ┌──────────────────────────────────────┐             │
+       └──────────────│  Repeat until plateau or time limit  │◀────────────┘
+                      └──────────────────────────────────────┘
+```
+
+### What it targets
+
+| Area | Target file | Examples |
+|------|-------------|---------|
+| **Soul** | `SOUL.md` | Personality tweaks, tone adjustments, new behavioral instructions |
+| **Cron** | `CRON.md` | Prompt improvements for scheduled tasks, missing instructions |
+| **Workflows** | `workflows/*.md` | Step refinements, better prompts, missing error handling |
+| **Memory** | Configuration | Retrieval tuning, salience thresholds |
+
+### How it works
+
+1. **Gathers** recent feedback (positive/negative reactions), cron job success/error rates, and transcript patterns from the last 7 days
+2. **Diagnoses** the single highest-impact weakness using an LLM analysis pass
+3. **Proposes** a specific, minimal change — informed by experiment history to avoid repeating failed approaches
+4. **Evaluates** the proposal with an LLM judge scoring clarity, safety, impact, risk, and minimality (0-10)
+5. **Gates** proposals that score above the threshold (default 6/10) — saves to pending and sends a Discord approval embed with Approve/Deny buttons
+6. **Logs** every experiment to an append-only JSONL file for full history
+7. **Stops** on plateau detection (3 consecutive low scores), time limits (1 hour max), or iteration caps (10 per cycle)
+
+After the loop completes, memory maintenance runs automatically (temporal decay + stale data pruning).
+
+### Safety guardrails
+
+- **Nothing is applied without approval** — every change requires explicit Approve via Discord buttons, CLI, or dashboard
+- **Changes are reversible** — the original file content is saved alongside each proposal
+- **LLM judge evaluation** — proposals must pass a multi-criteria quality check before even being submitted for approval
+- **Experiment history prevents loops** — the LLM sees all prior attempts and avoids repeating failed strategies
+- **Plateau detection** — the loop stops automatically when consecutive iterations yield no improvements
+- **Own concurrency lane** — runs independently without blocking cron jobs or chat
+
+### Triggering
+
+| Method | How |
+|--------|-----|
+| **Nightly cron** | Add `nightly-self-improve` job to `CRON.md` with schedule `0 2 * * *` |
+| **Discord** | `!self-improve run` or `/self-improve run` |
+| **CLI** | `clementine self-improve run` |
+| **Dashboard** | View status and manage proposals from the Self-Improve page |
+
+### Discord commands
+
+```
+!self-improve run              Trigger a self-improvement cycle
+!self-improve status           Show current state and baseline metrics
+!self-improve history [n]      Show last N experiments (default 10)
+!self-improve pending          List pending approval proposals
+!self-improve apply <id>       Approve a pending change
+!self-improve deny <id>        Deny a pending change
+```
+
+### Data storage
+
+```
+~/.clementine/self-improve/
+├── experiment-log.jsonl       Append-only history of all experiments
+├── state.json                 Current status, iteration count, baseline metrics
+└── pending-changes/
+    └── {8-char-hex}.json      Proposal with before/after content, score, hypothesis
+```
 
 ---
 

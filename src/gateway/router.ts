@@ -8,7 +8,8 @@
 import path from 'node:path';
 import pino from 'pino';
 import { PersonalAssistant, type ProjectMeta } from '../agent/assistant.js';
-import type { OnTextCallback, PlanProgressUpdate, PlanStep, SessionProvenance, WorkflowDefinition } from '../types.js';
+import type { OnTextCallback, PlanProgressUpdate, PlanStep, SelfImproveConfig, SelfImproveExperiment, SelfImproveState, SessionProvenance, WorkflowDefinition } from '../types.js';
+import { SelfImproveLoop } from '../agent/self-improve.js';
 import { MODELS } from '../config.js';
 import { scanner } from '../security/scanner.js';
 import { lanes } from './lanes.js';
@@ -620,5 +621,69 @@ export class Gateway {
   /** Get all active session provenance entries (for dashboard/monitoring). */
   getAllProvenance(): Map<string, SessionProvenance> {
     return new Map(this.sessionProvenance);
+  }
+
+  // ── Self-Improvement ─────────────────────────────────────────────────
+
+  async handleSelfImprove(
+    action: string,
+    args?: { experimentId?: string; config?: Partial<SelfImproveConfig> },
+    onProposal?: (experiment: SelfImproveExperiment) => Promise<void>,
+  ): Promise<string> {
+    const releaseLane = await lanes.acquire('self-improve');
+    try {
+      const loop = new SelfImproveLoop(this.assistant, args?.config);
+
+      switch (action) {
+        case 'run': {
+          logger.info('Starting self-improvement cycle');
+          const state = await loop.run(onProposal);
+          return `Self-improvement cycle ${state.status}. ` +
+            `Iterations: ${state.currentIteration}, ` +
+            `Pending approvals: ${state.pendingApprovals}`;
+        }
+        case 'status': {
+          const state = loop.loadState();
+          const m = state.baselineMetrics;
+          return `**Self-Improvement Status**\n` +
+            `Status: ${state.status}\n` +
+            `Last run: ${state.lastRunAt || 'never'}\n` +
+            `Total experiments: ${state.totalExperiments}\n` +
+            `Pending approvals: ${state.pendingApprovals}\n` +
+            `Baseline — Feedback: ${(m.feedbackPositiveRatio * 100).toFixed(0)}% positive, ` +
+            `Cron: ${(m.cronSuccessRate * 100).toFixed(0)}% success, ` +
+            `Quality: ${m.avgResponseQuality.toFixed(2)}`;
+        }
+        case 'history': {
+          const log = loop.loadExperimentLog().slice(-10).reverse();
+          if (log.length === 0) return 'No experiment history yet.';
+          return log.map(e =>
+            `#${e.iteration} | ${e.area} | "${e.hypothesis.slice(0, 50)}" | ` +
+            `${(e.score * 10).toFixed(1)}/10 ${e.accepted ? (e.approvalStatus === 'approved' ? '✅' : '⏳') : '❌'}`
+          ).join('\n');
+        }
+        case 'pending': {
+          const pending = loop.getPendingChanges();
+          if (pending.length === 0) return 'No pending proposals.';
+          return pending.map(p =>
+            `**${p.id}** | ${p.area} → ${p.target}\n` +
+            `  Hypothesis: ${p.hypothesis.slice(0, 100)}\n` +
+            `  Score: ${(p.score * 10).toFixed(1)}/10`
+          ).join('\n\n');
+        }
+        case 'apply': {
+          if (!args?.experimentId) return 'Missing experiment ID.';
+          return loop.applyApprovedChange(args.experimentId);
+        }
+        case 'deny': {
+          if (!args?.experimentId) return 'Missing experiment ID.';
+          return loop.denyChange(args.experimentId);
+        }
+        default:
+          return `Unknown self-improve action: ${action}`;
+      }
+    } finally {
+      releaseLane();
+    }
   }
 }

@@ -1293,6 +1293,103 @@ workflowCmd
     }
   });
 
+// ── Self-Improvement commands ────────────────────────────────────────
+
+const siCmd = program
+  .command('self-improve')
+  .description('Manage Clementine self-improvement');
+
+siCmd
+  .command('status')
+  .description('Show self-improvement state and baseline metrics')
+  .action(async () => {
+    try {
+      const { SelfImproveLoop } = await import('../agent/self-improve.js');
+      const { PersonalAssistant } = await import('../agent/assistant.js');
+      const assistant = new PersonalAssistant();
+      const loop = new SelfImproveLoop(assistant);
+      const state = loop.loadState();
+      const m = state.baselineMetrics;
+      console.log(`Status: ${state.status}`);
+      console.log(`Last run: ${state.lastRunAt || 'never'}`);
+      console.log(`Total experiments: ${state.totalExperiments}`);
+      console.log(`Pending approvals: ${state.pendingApprovals}`);
+      console.log(`Baseline — Feedback: ${(m.feedbackPositiveRatio * 100).toFixed(0)}% positive, Cron: ${(m.cronSuccessRate * 100).toFixed(0)}% success, Quality: ${m.avgResponseQuality.toFixed(2)}`);
+    } catch (err) {
+      console.error('Error:', err);
+      process.exit(1);
+    }
+  });
+
+siCmd
+  .command('run')
+  .description('Trigger a self-improvement cycle')
+  .action(async () => {
+    try {
+      const { SelfImproveLoop } = await import('../agent/self-improve.js');
+      const { PersonalAssistant } = await import('../agent/assistant.js');
+      const assistant = new PersonalAssistant();
+      const loop = new SelfImproveLoop(assistant);
+
+      console.log('Starting self-improvement cycle...');
+      const state = await loop.run(async (experiment) => {
+        console.log(`  Proposal: ${experiment.area} | "${experiment.hypothesis.slice(0, 60)}" | ${(experiment.score * 10).toFixed(1)}/10`);
+      });
+      console.log(`\nCompleted: ${state.status}, ${state.currentIteration} iterations, ${state.pendingApprovals} pending approvals`);
+    } catch (err) {
+      console.error('Error:', err);
+      process.exit(1);
+    }
+  });
+
+siCmd
+  .command('history')
+  .description('Show experiment history')
+  .option('-n, --limit <n>', 'Number of entries to show', '10')
+  .action(async (opts: { limit: string }) => {
+    try {
+      const { SelfImproveLoop } = await import('../agent/self-improve.js');
+      const { PersonalAssistant } = await import('../agent/assistant.js');
+      const assistant = new PersonalAssistant();
+      const loop = new SelfImproveLoop(assistant);
+      const limit = parseInt(opts.limit, 10) || 10;
+      const log = loop.loadExperimentLog().slice(-limit).reverse();
+
+      if (log.length === 0) {
+        console.log('No experiment history yet.');
+        return;
+      }
+
+      for (const e of log) {
+        const status = e.accepted
+          ? (e.approvalStatus === 'approved' ? '✅ approved' : '⏳ pending')
+          : '❌ rejected';
+        console.log(`#${e.iteration} | ${e.area} | ${(e.score * 10).toFixed(1)}/10 | ${status}`);
+        console.log(`  ${e.hypothesis.slice(0, 80)}`);
+      }
+    } catch (err) {
+      console.error('Error:', err);
+      process.exit(1);
+    }
+  });
+
+siCmd
+  .command('apply <id>')
+  .description('Approve and apply a pending change')
+  .action(async (id: string) => {
+    try {
+      const { SelfImproveLoop } = await import('../agent/self-improve.js');
+      const { PersonalAssistant } = await import('../agent/assistant.js');
+      const assistant = new PersonalAssistant();
+      const loop = new SelfImproveLoop(assistant);
+      const result = await loop.applyApprovedChange(id);
+      console.log(result);
+    } catch (err) {
+      console.error('Error:', err);
+      process.exit(1);
+    }
+  });
+
 // ── Heartbeat command ───────────────────────────────────────────────
 
 program

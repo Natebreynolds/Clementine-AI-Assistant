@@ -2967,6 +2967,72 @@ server.tool(
   },
 );
 
+// ── Self-Improvement Tools ───────────────────────────────────────────
+
+server.tool(
+  'self_improve_status',
+  'Check the self-improvement system status: current state, pending approvals, baseline metrics, and recent experiment history.',
+  {},
+  async () => {
+    const siDir = path.join(BASE_DIR, 'self-improve');
+    const stateFile = path.join(siDir, 'state.json');
+    const logFile = path.join(siDir, 'experiment-log.jsonl');
+    const pendingDir = path.join(siDir, 'pending-changes');
+
+    let status = 'No self-improvement data found.';
+
+    if (existsSync(stateFile)) {
+      const state = JSON.parse(readFileSync(stateFile, 'utf-8'));
+      const m = state.baselineMetrics ?? {};
+      status = `**Self-Improvement Status**\n` +
+        `Status: ${state.status}\n` +
+        `Last run: ${state.lastRunAt || 'never'}\n` +
+        `Total experiments: ${state.totalExperiments}\n` +
+        `Pending approvals: ${state.pendingApprovals}\n` +
+        `Baseline — Feedback: ${((m.feedbackPositiveRatio ?? 0) * 100).toFixed(0)}% positive, ` +
+        `Cron: ${((m.cronSuccessRate ?? 0) * 100).toFixed(0)}% success`;
+    }
+
+    if (existsSync(logFile)) {
+      const lines = readFileSync(logFile, 'utf-8').trim().split('\n').filter(Boolean);
+      const recent = lines.slice(-5).reverse().map(l => {
+        const e = JSON.parse(l);
+        return `#${e.iteration} | ${e.area} | "${(e.hypothesis ?? '').slice(0, 40)}" | ` +
+          `${((e.score ?? 0) * 10).toFixed(1)}/10 ${e.accepted ? '✅' : '❌'}`;
+      });
+      if (recent.length > 0) {
+        status += `\n\n**Recent Experiments:**\n${recent.join('\n')}`;
+      }
+    }
+
+    if (existsSync(pendingDir)) {
+      const pending = readdirSync(pendingDir).filter(f => f.endsWith('.json'));
+      if (pending.length > 0) {
+        const details = pending.map(f => {
+          const p = JSON.parse(readFileSync(path.join(pendingDir, f), 'utf-8'));
+          return `- **${p.id}** | ${p.area} → ${p.target}: ${(p.hypothesis ?? '').slice(0, 80)}`;
+        });
+        status += `\n\n**Pending Proposals:**\n${details.join('\n')}`;
+      }
+    }
+
+    return textResult(status);
+  },
+);
+
+server.tool(
+  'self_improve_run',
+  'Trigger a self-improvement analysis cycle. This evaluates recent performance data and proposes improvements to system prompts, cron jobs, and workflows. Normally runs nightly via cron.',
+  {},
+  async () => {
+    return textResult(
+      'Self-improvement cycle should be triggered via the CLI (`clementine self-improve run`) ' +
+      'or Discord (`!self-improve run` / `/self-improve run`). ' +
+      'The MCP server cannot directly run the loop as it requires the full assistant context.',
+    );
+  },
+);
+
 // ── Main ───────────────────────────────────────────────────────────────
 
 async function main() {
