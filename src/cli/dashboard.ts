@@ -1427,6 +1427,161 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
     }
   });
 
+  // ── Settings / env config routes ────────────────────────────────────
+
+  const SENSITIVE_PATTERNS = ['TOKEN', 'SECRET', 'API_KEY', 'AUTH_TOKEN', 'SID', 'PASSWORD'];
+
+  function maskValue(key: string, value: string): string {
+    const isSensitive = SENSITIVE_PATTERNS.some(p => key.toUpperCase().includes(p));
+    if (!isSensitive || value.length <= 8) return value;
+    return value.slice(0, 4) + '*'.repeat(Math.min(value.length - 8, 20)) + value.slice(-4);
+  }
+
+  const CONFIG_GROUPS: Array<{ label: string; keys: Array<{ key: string; label: string; hint?: string; type?: string }> }> = [
+    {
+      label: 'Assistant Identity',
+      keys: [
+        { key: 'ASSISTANT_NAME', label: 'Name', hint: 'Display name for the assistant' },
+        { key: 'ASSISTANT_NICKNAME', label: 'Nickname', hint: 'Short name / alias' },
+        { key: 'OWNER_NAME', label: 'Owner Name', hint: 'Your name (used in prompts)' },
+      ],
+    },
+    {
+      label: 'Model',
+      keys: [
+        { key: 'DEFAULT_MODEL_TIER', label: 'Default Tier', hint: 'haiku, sonnet, or opus', type: 'select:haiku,sonnet,opus' },
+      ],
+    },
+    {
+      label: 'Discord',
+      keys: [
+        { key: 'DISCORD_TOKEN', label: 'Bot Token', hint: 'From Discord Developer Portal', type: 'password' },
+        { key: 'DISCORD_OWNER_ID', label: 'Owner User ID', hint: 'Your Discord user ID' },
+        { key: 'DISCORD_WATCHED_CHANNELS', label: 'Watched Channels', hint: 'Comma-separated channel IDs for guild monitoring' },
+      ],
+    },
+    {
+      label: 'Slack',
+      keys: [
+        { key: 'SLACK_BOT_TOKEN', label: 'Bot Token', hint: 'xoxb-... token', type: 'password' },
+        { key: 'SLACK_APP_TOKEN', label: 'App Token', hint: 'xapp-... token for Socket Mode', type: 'password' },
+        { key: 'SLACK_OWNER_USER_ID', label: 'Owner User ID', hint: 'Your Slack user ID' },
+      ],
+    },
+    {
+      label: 'Telegram',
+      keys: [
+        { key: 'TELEGRAM_BOT_TOKEN', label: 'Bot Token', hint: 'From @BotFather', type: 'password' },
+        { key: 'TELEGRAM_OWNER_ID', label: 'Owner Chat ID', hint: 'Your Telegram user/chat ID' },
+      ],
+    },
+    {
+      label: 'WhatsApp (Twilio)',
+      keys: [
+        { key: 'TWILIO_ACCOUNT_SID', label: 'Account SID', type: 'password' },
+        { key: 'TWILIO_AUTH_TOKEN', label: 'Auth Token', type: 'password' },
+        { key: 'WHATSAPP_OWNER_PHONE', label: 'Owner Phone', hint: '+1234567890' },
+        { key: 'WHATSAPP_FROM_PHONE', label: 'Twilio Phone', hint: 'Twilio WhatsApp sender number' },
+      ],
+    },
+    {
+      label: 'Heartbeat',
+      keys: [
+        { key: 'HEARTBEAT_INTERVAL_MINUTES', label: 'Interval (min)', hint: 'Minutes between heartbeat checks (default 30)' },
+        { key: 'HEARTBEAT_ACTIVE_START', label: 'Active Start Hour', hint: '0-23 (default 8)' },
+        { key: 'HEARTBEAT_ACTIVE_END', label: 'Active End Hour', hint: '0-23 (default 22)' },
+      ],
+    },
+  ];
+
+  function parseEnvFile(): Record<string, string> {
+    if (!existsSync(ENV_PATH)) return {};
+    const result: Record<string, string> = {};
+    for (const line of readFileSync(ENV_PATH, 'utf-8').split('\n')) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith('#')) continue;
+      const eqIdx = trimmed.indexOf('=');
+      if (eqIdx === -1) continue;
+      const key = trimmed.slice(0, eqIdx);
+      let val = trimmed.slice(eqIdx + 1);
+      if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
+        val = val.slice(1, -1);
+      }
+      result[key] = val;
+    }
+    return result;
+  }
+
+  function writeEnvValue(key: string, value: string): void {
+    let content = existsSync(ENV_PATH) ? readFileSync(ENV_PATH, 'utf-8') : '';
+    const re = new RegExp(`^${key}=.*$`, 'm');
+    if (re.test(content)) {
+      content = content.replace(re, `${key}=${value}`);
+    } else {
+      content = content.trimEnd() + `\n${key}=${value}\n`;
+    }
+    writeFileSync(ENV_PATH, content);
+  }
+
+  app.get('/api/settings', (_req, res) => {
+    try {
+      const env = parseEnvFile();
+      const groups = CONFIG_GROUPS.map(g => ({
+        label: g.label,
+        fields: g.keys.map(k => ({
+          key: k.key,
+          label: k.label,
+          hint: k.hint,
+          type: k.type ?? 'text',
+          value: env[k.key] ?? '',
+          masked: maskValue(k.key, env[k.key] ?? ''),
+          isSet: k.key in env && env[k.key] !== '',
+        })),
+      }));
+      res.json({ groups });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  app.put('/api/settings/:key', (req, res) => {
+    try {
+      const { key } = req.params;
+      const { value } = req.body;
+      if (typeof value !== 'string') {
+        res.status(400).json({ error: 'value must be a string' });
+        return;
+      }
+      // Validate key exists in our known groups
+      const allKeys = CONFIG_GROUPS.flatMap(g => g.keys.map(k => k.key));
+      if (!allKeys.includes(key)) {
+        res.status(400).json({ error: `Unknown config key: ${key}` });
+        return;
+      }
+      writeEnvValue(key, value);
+      res.json({ ok: true, message: `Updated ${key}` });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  app.delete('/api/settings/:key', (req, res) => {
+    try {
+      const { key } = req.params;
+      if (!existsSync(ENV_PATH)) {
+        res.status(404).json({ error: '.env file not found' });
+        return;
+      }
+      let content = readFileSync(ENV_PATH, 'utf-8');
+      const re = new RegExp(`^${key}=.*\n?`, 'm');
+      content = content.replace(re, '');
+      writeFileSync(ENV_PATH, content);
+      res.json({ ok: true, message: `Removed ${key}` });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
   // ── Unleashed detail route ──────────────────────────────────────────
 
   app.get('/api/unleashed/:name/status', (req, res) => {
@@ -2922,6 +3077,9 @@ function getDashboardHTML(): string {
       <div class="nav-item" data-page="logs">
         <span class="nav-icon">&#128220;</span> Logs
       </div>
+      <div class="nav-item" data-page="settings">
+        <span class="nav-icon">&#9881;</span> Settings
+      </div>
     </div>
   </nav>
 
@@ -3066,6 +3224,13 @@ function getDashboardHTML(): string {
     <div class="page" id="page-metrics">
       <div class="page-title">Metrics & Analytics</div>
       <div id="metrics-content"><div class="empty-state">Loading metrics...</div></div>
+    </div>
+
+    <!-- ═══ Settings Page ═══ -->
+    <div class="page" id="page-settings">
+      <div class="page-title">Settings</div>
+      <p style="color:var(--text-muted);margin-bottom:16px">Manage API keys and configuration. Changes are saved to <code>~/.clementine/.env</code> and take effect on daemon restart.</p>
+      <div id="settings-content"><div class="empty-state">Loading settings...</div></div>
     </div>
 
   </div><!-- /content -->
@@ -3389,6 +3554,7 @@ document.querySelectorAll('.nav-item').forEach(item => {
     if (page === 'memory') refreshMemory();
     if (page === 'metrics') refreshMetrics();
     if (page === 'chat') { loadProfiles(); document.getElementById('chat-input').focus(); }
+    if (page === 'settings') refreshSettings();
   });
 });
 
@@ -4507,6 +4673,116 @@ async function refreshLogs() {
     applyLogFilter();
   } catch(e) { }
 }
+async function refreshSettings() {
+  var container = document.getElementById('settings-content');
+  try {
+    var r = await fetch('/api/settings');
+    var d = await r.json();
+    var groups = d.groups || [];
+    var html = '';
+    for (var g of groups) {
+      var anySet = g.fields.some(function(f) { return f.isSet; });
+      html += '<div class="card" style="margin-bottom:16px">'
+        + '<div class="card-header" style="display:flex;align-items:center;gap:8px">'
+        + '<span>' + esc(g.label) + '</span>'
+        + (anySet ? '<span class="badge badge-green" style="font-size:10px">Configured</span>' : '<span class="badge badge-gray" style="font-size:10px">Not configured</span>')
+        + '</div><div class="card-body" style="padding:16px">';
+      for (var f of g.fields) {
+        var inputId = 'setting-' + f.key;
+        var inputHtml = '';
+        if (f.type && f.type.startsWith('select:')) {
+          var options = f.type.slice(7).split(',');
+          inputHtml = '<select id="' + inputId + '" style="width:100%;padding:6px 10px;border:1px solid var(--border);border-radius:4px;background:var(--bg-secondary);color:var(--text-primary);font-size:13px">';
+          inputHtml += '<option value=""' + (!f.value ? ' selected' : '') + '>—</option>';
+          for (var opt of options) {
+            inputHtml += '<option value="' + esc(opt) + '"' + (f.value === opt ? ' selected' : '') + '>' + esc(opt) + '</option>';
+          }
+          inputHtml += '</select>';
+        } else {
+          var displayValue = f.type === 'password' ? f.masked : f.value;
+          inputHtml = '<input type="text" id="' + inputId + '" value="' + esc(displayValue) + '" placeholder="Not set"'
+            + ' data-original="' + esc(displayValue) + '" data-key="' + f.key + '" data-is-password="' + (f.type === 'password' ? '1' : '0') + '"'
+            + ' style="width:100%;padding:6px 10px;border:1px solid var(--border);border-radius:4px;background:var(--bg-secondary);color:var(--text-primary);font-size:13px"'
+            + ' onfocus="settingFocus(this)" onblur="settingSave(this)">';
+        }
+        html += '<div style="display:flex;align-items:center;gap:12px;margin-bottom:12px">'
+          + '<div style="min-width:160px"><label style="font-weight:600;font-size:12px;color:var(--text-secondary)">' + esc(f.label) + '</label>'
+          + (f.hint ? '<div style="font-size:11px;color:var(--text-muted);margin-top:2px">' + esc(f.hint) + '</div>' : '')
+          + '</div>'
+          + '<div style="flex:1">' + inputHtml + '</div>'
+          + '<div style="min-width:70px;text-align:right">'
+          + (f.isSet ? '<button class="btn-sm btn-danger" onclick="removeSetting(\\'' + f.key + '\\')">Remove</button>' : '')
+          + '<span id="' + inputId + '-status" style="font-size:11px"></span>'
+          + '</div></div>';
+      }
+      html += '</div></div>';
+    }
+    html += '<div style="padding:12px;color:var(--text-muted);font-size:12px">'
+      + '<strong>Note:</strong> Changes to API keys require a daemon restart to take effect. '
+      + 'Use <code>clementine restart</code> after updating channel tokens.'
+      + '</div>';
+    container.innerHTML = html;
+
+    // Attach change handlers for select elements
+    for (var g2 of groups) {
+      for (var f2 of g2.fields) {
+        if (f2.type && f2.type.startsWith('select:')) {
+          (function(key) {
+            var sel = document.getElementById('setting-' + key);
+            if (sel) sel.onchange = function() { saveSettingValue(key, sel.value); };
+          })(f2.key);
+        }
+      }
+    }
+  } catch(e) {
+    container.innerHTML = '<div class="empty-state" style="color:var(--red)">Failed to load settings: ' + esc(String(e)) + '</div>';
+  }
+}
+
+function settingFocus(input) {
+  // If this is a masked password field, clear it for editing
+  if (input.dataset.isPassword === '1' && input.value === input.dataset.original && input.value.includes('*')) {
+    input.value = '';
+    input.type = 'text';
+    input.placeholder = 'Enter new value...';
+  }
+}
+
+async function settingSave(input) {
+  var key = input.dataset.key;
+  var value = input.value.trim();
+  var original = input.dataset.original;
+  // If unchanged or cleared back to masked value, skip
+  if (value === original || (!value && input.dataset.isPassword === '1')) {
+    if (!value && input.dataset.isPassword === '1') {
+      input.value = original;
+    }
+    return;
+  }
+  if (!value) return;
+  await saveSettingValue(key, value);
+  input.dataset.original = input.dataset.isPassword === '1' ? value.slice(0, 4) + '****' + value.slice(-4) : value;
+}
+
+async function saveSettingValue(key, value) {
+  var statusEl = document.getElementById('setting-' + key + '-status');
+  try {
+    await apiJson('PUT', '/api/settings/' + encodeURIComponent(key), { value: value });
+    if (statusEl) { statusEl.textContent = 'Saved'; statusEl.style.color = 'var(--green)'; setTimeout(function(){ statusEl.textContent = ''; }, 2000); }
+  } catch(e) {
+    if (statusEl) { statusEl.textContent = 'Error'; statusEl.style.color = 'var(--red)'; }
+  }
+}
+
+async function removeSetting(key) {
+  if (!confirm('Remove ' + key + ' from .env?')) return;
+  try {
+    await apiDelete('/api/settings/' + encodeURIComponent(key));
+    toast(key + ' removed', 'success');
+    refreshSettings();
+  } catch(e) { toast('Failed: ' + e, 'error'); }
+}
+
 function stripAnsi(s) {
   return s.replace(/\\x1b\\[[0-9;]*m/g, '').replace(/\\u001b\\[[0-9;]*m/g, '').replace(/\\x1B\\[[0-9;]*m/g, '');
 }
