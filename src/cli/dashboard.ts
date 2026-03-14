@@ -1485,6 +1485,48 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
       ],
     },
     {
+      label: 'Anthropic',
+      keys: [
+        { key: 'ANTHROPIC_API_KEY', label: 'API Key', hint: 'Claude API key — required for agent execution', type: 'password' },
+      ],
+    },
+    {
+      label: 'Groq',
+      keys: [
+        { key: 'GROQ_API_KEY', label: 'API Key', hint: 'For Whisper voice transcription', type: 'password' },
+      ],
+    },
+    {
+      label: 'ElevenLabs',
+      keys: [
+        { key: 'ELEVENLABS_API_KEY', label: 'API Key', hint: 'Text-to-speech for voice replies', type: 'password' },
+        { key: 'ELEVENLABS_VOICE_ID', label: 'Voice ID', hint: 'Specific voice to use (from ElevenLabs dashboard)' },
+      ],
+    },
+    {
+      label: 'Google',
+      keys: [
+        { key: 'GOOGLE_API_KEY', label: 'API Key', hint: 'Google Vision / video analysis', type: 'password' },
+      ],
+    },
+    {
+      label: 'Microsoft Graph (Outlook)',
+      keys: [
+        { key: 'MS_TENANT_ID', label: 'Tenant ID', hint: 'Azure AD tenant ID' },
+        { key: 'MS_CLIENT_ID', label: 'Client ID', hint: 'Azure app registration client ID' },
+        { key: 'MS_CLIENT_SECRET', label: 'Client Secret', hint: 'Azure app registration secret', type: 'password' },
+        { key: 'MS_USER_EMAIL', label: 'User Email', hint: 'Email address for mail/calendar access' },
+      ],
+    },
+    {
+      label: 'Webhook',
+      keys: [
+        { key: 'WEBHOOK_ENABLED', label: 'Enabled', hint: 'Set to "true" to enable', type: 'select:true,false' },
+        { key: 'WEBHOOK_PORT', label: 'Port', hint: 'Webhook listener port (default 8420)' },
+        { key: 'WEBHOOK_SECRET', label: 'Secret', hint: 'Bearer token for webhook auth', type: 'password' },
+      ],
+    },
+    {
       label: 'Heartbeat',
       keys: [
         { key: 'HEARTBEAT_INTERVAL_MINUTES', label: 'Interval (min)', hint: 'Minutes between heartbeat checks (default 30)' },
