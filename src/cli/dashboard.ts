@@ -1580,6 +1580,28 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
           isSet: k.key in env && env[k.key] !== '',
         })),
       }));
+
+      // Discover custom env vars not covered by CONFIG_GROUPS
+      const knownKeys = new Set(CONFIG_GROUPS.flatMap(g => g.keys.map(k => k.key)));
+      const customKeys = Object.keys(env).filter(k => !knownKeys.has(k));
+      if (customKeys.length > 0) {
+        groups.push({
+          label: 'Custom / Other',
+          fields: customKeys.map(k => {
+            const isSensitive = SENSITIVE_PATTERNS.some(p => k.toUpperCase().includes(p));
+            return {
+              key: k,
+              label: k,
+              hint: 'Custom environment variable',
+              type: isSensitive ? 'password' : 'text',
+              value: env[k],
+              masked: maskValue(k, env[k]),
+              isSet: true,
+            };
+          }),
+        });
+      }
+
       res.json({ groups });
     } catch (err) {
       res.status(500).json({ error: String(err) });
@@ -1594,10 +1616,9 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
         res.status(400).json({ error: 'value must be a string' });
         return;
       }
-      // Validate key exists in our known groups
-      const allKeys = CONFIG_GROUPS.flatMap(g => g.keys.map(k => k.key));
-      if (!allKeys.includes(key)) {
-        res.status(400).json({ error: `Unknown config key: ${key}` });
+      // Allow known keys + any valid env var name (A-Z, 0-9, _)
+      if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) {
+        res.status(400).json({ error: `Invalid key format: ${key}` });
         return;
       }
       writeEnvValue(key, value);
@@ -4759,6 +4780,19 @@ async function refreshSettings() {
       }
       html += '</div></div>';
     }
+    html += '<div class="card" style="margin-bottom:16px">'
+      + '<div class="card-header">Add Custom Variable</div>'
+      + '<div class="card-body" style="padding:16px">'
+      + '<div style="display:flex;gap:8px;align-items:flex-end">'
+      + '<div style="flex:1"><label style="font-size:12px;color:var(--text-secondary);font-weight:600">Key</label>'
+      + '<input type="text" id="custom-env-key" placeholder="MY_API_KEY" style="width:100%;padding:6px 10px;border:1px solid var(--border);border-radius:4px;background:var(--bg-secondary);color:var(--text-primary);font-size:13px;text-transform:uppercase"></div>'
+      + '<div style="flex:2"><label style="font-size:12px;color:var(--text-secondary);font-weight:600">Value</label>'
+      + '<input type="text" id="custom-env-value" placeholder="Value" style="width:100%;padding:6px 10px;border:1px solid var(--border);border-radius:4px;background:var(--bg-secondary);color:var(--text-primary);font-size:13px"></div>'
+      + '<button class="btn-sm btn-primary" onclick="addCustomEnv()">Add</button>'
+      + '</div>'
+      + '<div style="font-size:11px;color:var(--text-muted);margin-top:6px">Any env variable added here will be available to Clementine. Use UPPER_SNAKE_CASE for key names.</div>'
+      + '</div></div>';
+
     html += '<div style="padding:12px;color:var(--text-muted);font-size:12px">'
       + '<strong>Note:</strong> Changes to API keys require a daemon restart to take effect. '
       + 'Use <code>clementine restart</code> after updating channel tokens.'
@@ -4821,6 +4855,22 @@ async function removeSetting(key) {
   try {
     await apiDelete('/api/settings/' + encodeURIComponent(key));
     toast(key + ' removed', 'success');
+    refreshSettings();
+  } catch(e) { toast('Failed: ' + e, 'error'); }
+}
+
+async function addCustomEnv() {
+  var keyInput = document.getElementById('custom-env-key');
+  var valInput = document.getElementById('custom-env-value');
+  var key = (keyInput.value || '').trim().toUpperCase().replace(/[^A-Z0-9_]/g, '_');
+  var value = (valInput.value || '').trim();
+  if (!key || !value) { toast('Both key and value are required', 'error'); return; }
+  if (!/^[A-Z_][A-Z0-9_]*$/.test(key)) { toast('Invalid key format — use UPPER_SNAKE_CASE', 'error'); return; }
+  try {
+    await apiJson('PUT', '/api/settings/' + encodeURIComponent(key), { value: value });
+    toast(key + ' added', 'success');
+    keyInput.value = '';
+    valInput.value = '';
     refreshSettings();
   } catch(e) { toast('Failed: ' + e, 'error'); }
 }
