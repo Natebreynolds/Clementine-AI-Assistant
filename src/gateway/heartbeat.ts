@@ -621,10 +621,24 @@ export class CronScheduler {
   private runningWorkflows = new Set<string>();
   private watchingWorkflows = false;
 
+  // Event-driven status change listeners (used by Discord status embed)
+  private statusChangeListeners: Array<() => void> = [];
+
   constructor(gateway: Gateway, dispatcher: NotificationDispatcher) {
     this.gateway = gateway;
     this.dispatcher = dispatcher;
     this.runLog = new CronRunLog();
+  }
+
+  /** Register a listener that fires when system state changes (job start/finish, self-improve, etc). */
+  onStatusChange(cb: () => void): void {
+    this.statusChangeListeners.push(cb);
+  }
+
+  private emitStatusChange(): void {
+    for (const cb of this.statusChangeListeners) {
+      try { cb(); } catch { /* ignore listener errors */ }
+    }
   }
 
   start(): void {
@@ -771,6 +785,7 @@ export class CronScheduler {
       return;
     }
     this.runningJobs.add(job.name);
+    this.emitStatusChange();
 
     try {
       logger.info(`Running cron job: ${job.name}`);
@@ -887,6 +902,7 @@ export class CronScheduler {
       }
     } finally {
       this.runningJobs.delete(job.name);
+      this.emitStatusChange();
     }
   }
 
@@ -1083,6 +1099,7 @@ export class CronScheduler {
     }
 
     this.runningWorkflows.add(name);
+    this.emitStatusChange();
     const startedAt = new Date();
     try {
       logger.info({ workflow: name, inputs }, `Running workflow: ${name}`);
@@ -1111,6 +1128,7 @@ export class CronScheduler {
       return errMsg;
     } finally {
       this.runningWorkflows.delete(name);
+      this.emitStatusChange();
     }
   }
 
@@ -1154,17 +1172,26 @@ export class CronScheduler {
     onProposal?: (experiment: SelfImproveExperiment) => Promise<void>,
   ): Promise<SelfImproveState> {
     const loop = new SelfImproveLoop(this.gateway.assistant, config);
-    return loop.run(onProposal);
+    this.emitStatusChange();
+    try {
+      return await loop.run(onProposal);
+    } finally {
+      this.emitStatusChange();
+    }
   }
 
   async applySelfImproveChange(experimentId: string): Promise<string> {
     const loop = new SelfImproveLoop(this.gateway.assistant);
-    return loop.applyApprovedChange(experimentId);
+    const result = loop.applyApprovedChange(experimentId);
+    this.emitStatusChange();
+    return result;
   }
 
   denySelfImproveChange(experimentId: string): string {
     const loop = new SelfImproveLoop(this.gateway.assistant);
-    return loop.denyChange(experimentId);
+    const result = loop.denyChange(experimentId);
+    this.emitStatusChange();
+    return result;
   }
 
   getSelfImproveStatus(): SelfImproveState {

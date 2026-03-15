@@ -464,7 +464,7 @@ function handleHelp(): string {
     '`!workflow list|run <name>` \u2014 Manage multi-step workflows',
     '`!self-improve run|status|history|pending|apply|deny` \u2014 Self-improvement',
     '`!status [job]` \u2014 Check unleashed task progress',
-    '`!dashboard` \u2014 Live system status embed (auto-refreshes)',
+    '`!dashboard` \u2014 Send a fresh system status embed',
     '`!heartbeat` \u2014 Run heartbeat \u00b7 `!tools` \u2014 List tools \u00b7 `!clear` \u2014 Reset',
     '`!help` \u2014 This message',
   ].join('\n');
@@ -600,9 +600,9 @@ export async function startDiscord(
     });
   }
 
-  // ── Live status embed ────────────────────────────────────────────
+  // ── Live status embed (event-driven) ────────────────────────────
   let statusEmbedMessage: Message | null = null;
-  let statusEmbedTimer: ReturnType<typeof setInterval> | null = null;
+  let statusEmbedDebounce: ReturnType<typeof setTimeout> | null = null;
 
   function buildStatusEmbed(): EmbedBuilder {
     const now = new Date();
@@ -610,7 +610,7 @@ export async function startDiscord(
       .setTitle(`${ASSISTANT_NAME} System Status`)
       .setColor(0x6C5CE7)
       .setTimestamp(now)
-      .setFooter({ text: 'Auto-refreshes every 30s \u00b7 !dashboard to re-pin' });
+      .setFooter({ text: 'Updates on state changes \u00b7 !dashboard to refresh' });
 
     // ── Lanes
     const lanes = gateway.getLaneStatus();
@@ -696,11 +696,11 @@ export async function startDiscord(
     return embed;
   }
 
-  async function sendOrUpdateStatusEmbed(channel: Message['channel']): Promise<void> {
+  async function sendOrUpdateStatusEmbed(channel?: Message['channel']): Promise<void> {
     try {
       const embed = buildStatusEmbed();
       if (statusEmbedMessage) {
-        // Edit existing message
+        // Edit existing message in-place
         try {
           await statusEmbedMessage.edit({ embeds: [embed] });
           return;
@@ -709,21 +709,25 @@ export async function startDiscord(
           statusEmbedMessage = null;
         }
       }
-      if ('send' in channel) {
-        statusEmbedMessage = await (channel as any).send({ embeds: [embed] });
+      const target = channel ?? cachedDmChannel;
+      if (target && 'send' in target) {
+        statusEmbedMessage = await (target as any).send({ embeds: [embed] });
       }
     } catch (err) {
       logger.error({ err }, 'Failed to update status embed');
     }
   }
 
-  function startStatusEmbedRefresh(channel: Message['channel']): void {
-    // Clear any existing timer
-    if (statusEmbedTimer) clearInterval(statusEmbedTimer);
-    // Refresh every 30 seconds
-    statusEmbedTimer = setInterval(() => {
-      sendOrUpdateStatusEmbed(channel).catch(() => {});
-    }, 30_000);
+  /** Send a fresh embed as a new message (does not edit the previous one). */
+  async function sendFreshStatusEmbed(channel: Message['channel']): Promise<void> {
+    try {
+      const embed = buildStatusEmbed();
+      if ('send' in channel) {
+        statusEmbedMessage = await (channel as any).send({ embeds: [embed] });
+      }
+    } catch (err) {
+      logger.error({ err }, 'Failed to send fresh status embed');
+    }
   }
 
   // Prevent unhandled 'error' events from crashing the process
@@ -745,6 +749,25 @@ export async function startDiscord(
     }
 
     updatePresence();
+
+    // Auto-send status embed to owner's DMs on startup
+    try {
+      const owner = await client.users.fetch(DISCORD_OWNER_ID, { force: true });
+      const dmChannel = await owner.createDM();
+      cachedDmChannel = dmChannel;
+      await sendOrUpdateStatusEmbed(dmChannel);
+      logger.info('Sent startup status embed to owner DMs');
+    } catch (err) {
+      logger.error({ err }, 'Failed to send startup status embed');
+    }
+
+    // Event-driven embed updates — debounced to avoid API spam
+    cronScheduler.onStatusChange(() => {
+      if (statusEmbedDebounce) clearTimeout(statusEmbedDebounce);
+      statusEmbedDebounce = setTimeout(() => {
+        sendOrUpdateStatusEmbed().catch(() => {});
+      }, 2000);
+    });
   });
 
   client.on(Events.MessageCreate, async (message: Message) => {
@@ -929,8 +952,7 @@ export async function startDiscord(
     // ── Live status embed (DM only) ────────────────────────────────────
 
     if (isDm && text === '!dashboard') {
-      await sendOrUpdateStatusEmbed(message.channel);
-      startStatusEmbedRefresh(message.channel);
+      await sendFreshStatusEmbed(message.channel);
       return;
     }
 
@@ -1356,12 +1378,11 @@ export async function startDiscord(
         return;
       }
 
-      // Dashboard — live status embed
+      // Dashboard — fresh status embed
       if (name === 'dashboard') {
         if (cmd.channel) {
-          await cmd.reply({ content: 'Pinning live status...', ephemeral: true });
-          await sendOrUpdateStatusEmbed(cmd.channel);
-          startStatusEmbedRefresh(cmd.channel);
+          await cmd.reply({ content: 'Refreshing status...', ephemeral: true });
+          await sendFreshStatusEmbed(cmd.channel);
         } else {
           await cmd.reply({ content: 'Could not access channel.', ephemeral: true });
         }
