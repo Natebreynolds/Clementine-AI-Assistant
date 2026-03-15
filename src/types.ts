@@ -14,6 +14,7 @@ export interface SearchResult {
   lastUpdated: string;
   chunkId: number;
   salience: number;
+  agentSlug?: string | null;
 }
 
 export interface Chunk {
@@ -201,6 +202,7 @@ export interface MemoryExtraction {
   extractedAt: string;        // ISO timestamp
   status: 'active' | 'corrected' | 'dismissed' | 'dedup_skipped';
   correction?: string;        // replacement fact if corrected
+  agentSlug?: string;         // agent that triggered this extraction (null = default/global)
 }
 
 // ── Feedback ────────────────────────────────────────────────────────

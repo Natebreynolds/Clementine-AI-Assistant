@@ -4860,7 +4860,7 @@ function updateScheduleHint() {
 const monthNames = ['','Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
 
 function describeCron(expr) {
-  const parts = expr.split(/\s+/);
+  const parts = expr.split(/\\s+/);
   if (parts.length !== 5) return '';
   const [min, hour, dom, month, dow] = parts;
 
@@ -4899,7 +4899,7 @@ function describeCron(expr) {
 
 function setScheduleFromCron(expr) {
   // Try to reverse-map a cron expression back to the builder
-  const parts = expr.split(/\s+/);
+  const parts = expr.split(/\\s+/);
   if (parts.length !== 5) {
     document.getElementById('sched-freq').value = 'custom';
     updateScheduleBuilder();
@@ -5593,8 +5593,8 @@ async function refreshTeam() {
           if (a.hasOwnCron) badges.push('<span class="badge" style="background:var(--purple)">cron</span>');
           if (a.hasOwnWorkflows) badges.push('<span class="badge" style="background:var(--purple)">workflows</span>');
           var editBtn = a.agentDir
-            ? '<button class="btn btn-sm" onclick="editAgent(\'' + a.slug + '\')" style="font-size:11px;padding:2px 8px">Edit</button> ' +
-              '<button class="btn btn-sm" onclick="deleteAgent(\'' + a.slug + '\')" style="font-size:11px;padding:2px 8px;color:var(--red)">Delete</button>'
+            ? '<button class="btn btn-sm" onclick="editAgent(\\'' + a.slug + '\\')" style="font-size:11px;padding:2px 8px">Edit</button> ' +
+              '<button class="btn btn-sm" onclick="deleteAgent(\\'' + a.slug + '\\')" style="font-size:11px;padding:2px 8px;color:var(--red)">Delete</button>'
             : '<span style="font-size:11px;color:var(--text-muted)">legacy profile</span>';
           return '<div style="padding:12px;border-bottom:1px solid var(--border)">' +
             '<div style="display:flex;justify-content:space-between;align-items:center">' +
@@ -5801,8 +5801,8 @@ async function refreshSelfImprove() {
             '<div><strong>' + p.area + '</strong> &rarr; ' + (p.target || '').substring(0, 40) +
             ' <span style="color:var(--text-muted);font-size:12px">(' + ((p.score || 0) * 10).toFixed(1) + '/10)</span></div>' +
             '<div style="display:flex;gap:6px">' +
-            '<button onclick="siApply(\'' + p.id + '\')" style="background:var(--success);color:#fff;border:none;padding:4px 10px;border-radius:4px;cursor:pointer;font-size:12px">Approve</button>' +
-            '<button onclick="siDeny(\'' + p.id + '\')" style="background:var(--danger);color:#fff;border:none;padding:4px 10px;border-radius:4px;cursor:pointer;font-size:12px">Deny</button>' +
+            '<button onclick="siApply(\\'' + p.id + '\\')" style="background:var(--success);color:#fff;border:none;padding:4px 10px;border-radius:4px;cursor:pointer;font-size:12px">Approve</button>' +
+            '<button onclick="siDeny(\\'' + p.id + '\\')" style="background:var(--danger);color:#fff;border:none;padding:4px 10px;border-radius:4px;cursor:pointer;font-size:12px">Deny</button>' +
             '</div></div>' +
             '<div style="margin-top:6px;font-size:13px;color:var(--text-secondary)">' + (p.hypothesis || '').substring(0, 120) + '</div>' +
             '<details style="margin-top:6px"><summary style="font-size:12px;color:var(--text-muted);cursor:pointer">View proposed change</summary>' +

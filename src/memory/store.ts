@@ -150,6 +150,20 @@ export class MemoryStore {
       // Column already exists
     }
 
+    // Add agent_slug column to chunks (for agent-scoped memory)
+    try {
+      this.conn.exec('ALTER TABLE chunks ADD COLUMN agent_slug TEXT DEFAULT NULL');
+    } catch {
+      // Column already exists
+    }
+
+    // Index for agent-scoped queries
+    try {
+      this.conn.exec('CREATE INDEX idx_chunks_agent ON chunks(agent_slug)');
+    } catch {
+      // Index already exists
+    }
+
     // Access log table for salience tracking
     this.conn.exec(`
       CREATE TABLE IF NOT EXISTS access_log (
@@ -176,6 +190,13 @@ export class MemoryStore {
       CREATE INDEX IF NOT EXISTS idx_extractions_session ON memory_extractions(session_key);
       CREATE INDEX IF NOT EXISTS idx_extractions_status ON memory_extractions(status);
     `);
+
+    // Add agent_slug column to memory_extractions
+    try {
+      this.conn.exec('ALTER TABLE memory_extractions ADD COLUMN agent_slug TEXT DEFAULT NULL');
+    } catch {
+      // Column already exists
+    }
 
     // Feedback table for response quality tracking
     this.conn.exec(`
@@ -340,7 +361,7 @@ export class MemoryStore {
   /**
    * Re-index a single file after a write operation.
    */
-  updateFile(relPath: string): void {
+  updateFile(relPath: string, agentSlug?: string): void {
     const fullPath = path.join(this.vaultDir, relPath);
 
     if (!existsSync(fullPath)) {
@@ -358,8 +379,8 @@ export class MemoryStore {
     // Insert new chunks
     const insertStmt = this.conn.prepare(
       `INSERT INTO chunks
-       (source_file, section, content, chunk_type, frontmatter_json, content_hash)
-       VALUES (?, ?, ?, ?, ?, ?)`,
+       (source_file, section, content, chunk_type, frontmatter_json, content_hash, agent_slug)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
     );
     for (const chunk of chunks) {
       insertStmt.run(
@@ -369,6 +390,7 @@ export class MemoryStore {
         chunk.chunkType,
         chunk.frontmatterJson,
         chunk.contentHash,
+        agentSlug ?? null,
       );
     }
 
@@ -399,7 +421,7 @@ export class MemoryStore {
       const rows = this.conn
         .prepare(
           `SELECT c.id, c.source_file, c.section, c.content, c.chunk_type,
-                  c.updated_at, c.salience,
+                  c.updated_at, c.salience, c.agent_slug,
                   bm25(chunks_fts) as score
            FROM chunks_fts f
            JOIN chunks c ON c.id = f.rowid
@@ -415,6 +437,7 @@ export class MemoryStore {
         chunk_type: string;
         updated_at: string | null;
         salience: number | null;
+        agent_slug: string | null;
         score: number;
       }>;
 
@@ -428,6 +451,7 @@ export class MemoryStore {
         lastUpdated: row.updated_at ?? '',
         chunkId: row.id,
         salience: row.salience ?? 0,
+        agentSlug: row.agent_slug ?? null,
       }));
     } catch {
       return [];
@@ -439,16 +463,8 @@ export class MemoryStore {
   /**
    * Get the most recently updated chunks.
    */
-  getRecentChunks(limit: number = 5): SearchResult[] {
-    const rows = this.conn
-      .prepare(
-        `SELECT id, source_file, section, content, chunk_type,
-                updated_at, salience
-         FROM chunks
-         ORDER BY updated_at DESC
-         LIMIT ?`,
-      )
-      .all(limit) as Array<{
+  getRecentChunks(limit: number = 5, agentSlug?: string): SearchResult[] {
+    type ChunkRow = {
       id: number;
       source_file: string;
       section: string;
@@ -456,9 +472,10 @@ export class MemoryStore {
       chunk_type: string;
       updated_at: string | null;
       salience: number | null;
-    }>;
+      agent_slug: string | null;
+    };
 
-    return rows.map((row) => ({
+    const mapRow = (row: ChunkRow): SearchResult => ({
       sourceFile: row.source_file,
       section: row.section,
       content: row.content,
@@ -468,7 +485,39 @@ export class MemoryStore {
       lastUpdated: row.updated_at ?? '',
       chunkId: row.id,
       salience: row.salience ?? 0,
-    }));
+      agentSlug: row.agent_slug ?? null,
+    });
+
+    // If agent specified, get a mix: mostly agent-specific, some global
+    if (agentSlug) {
+      const agentRows = this.conn.prepare(
+        `SELECT id, source_file, section, content, chunk_type,
+                updated_at, salience, agent_slug
+         FROM chunks WHERE agent_slug = ?
+         ORDER BY updated_at DESC LIMIT ?`,
+      ).all(agentSlug, Math.ceil(limit * 0.6)) as ChunkRow[];
+
+      const globalRows = this.conn.prepare(
+        `SELECT id, source_file, section, content, chunk_type,
+                updated_at, salience, agent_slug
+         FROM chunks WHERE agent_slug IS NULL
+         ORDER BY updated_at DESC LIMIT ?`,
+      ).all(Math.ceil(limit * 0.4)) as ChunkRow[];
+
+      return [...agentRows, ...globalRows].slice(0, limit).map(mapRow);
+    }
+
+    const rows = this.conn
+      .prepare(
+        `SELECT id, source_file, section, content, chunk_type,
+                updated_at, salience, agent_slug
+         FROM chunks
+         ORDER BY updated_at DESC
+         LIMIT ?`,
+      )
+      .all(limit) as ChunkRow[];
+
+    return rows.map(mapRow);
   }
 
   // ── Search: Context (Layer 3) ─────────────────────────────────────
@@ -484,20 +533,22 @@ export class MemoryStore {
    */
   searchContext(
     query: string,
-    limitOrOpts: number | { limit?: number; recencyLimit?: number } = 3,
+    limitOrOpts: number | { limit?: number; recencyLimit?: number; agentSlug?: string } = 3,
     recencyLimitArg: number = 5,
   ): SearchResult[] {
     let limit: number;
     let recencyLimit: number;
+    let agentSlug: string | undefined;
     if (typeof limitOrOpts === 'object') {
       limit = limitOrOpts.limit ?? 3;
       recencyLimit = limitOrOpts.recencyLimit ?? 5;
+      agentSlug = limitOrOpts.agentSlug;
     } else {
       limit = limitOrOpts;
       recencyLimit = recencyLimitArg;
     }
-    // 1. FTS5 relevance
-    const ftsResults = this.searchFts(query, limit);
+    // 1. FTS5 relevance (fetch extra to allow re-ranking after boost)
+    const ftsResults = this.searchFts(query, agentSlug ? limit * 2 : limit);
 
     // Apply salience boost to FTS results
     for (const r of ftsResults) {
@@ -506,8 +557,17 @@ export class MemoryStore {
       }
     }
 
+    // Apply agent affinity boost — own-agent results get 1.4× score
+    if (agentSlug) {
+      for (const r of ftsResults) {
+        if (r.agentSlug === agentSlug) {
+          r.score *= 1.4;
+        }
+      }
+    }
+
     // 2. Recency
-    const recentResults = this.getRecentChunks(recencyLimit);
+    const recentResults = this.getRecentChunks(recencyLimit, agentSlug);
 
     // 3. Merge and deduplicate (FTS results first, so they win on ties)
     const merged = [...ftsResults, ...recentResults];
@@ -1052,8 +1112,8 @@ export class MemoryStore {
     this.conn
       .prepare(
         `INSERT INTO memory_extractions
-         (session_key, user_message, tool_name, tool_input, extracted_at, status)
-         VALUES (?, ?, ?, ?, ?, ?)`,
+         (session_key, user_message, tool_name, tool_input, extracted_at, status, agent_slug)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         extraction.sessionKey,
@@ -1062,6 +1122,7 @@ export class MemoryStore {
         extraction.toolInput,
         extraction.extractedAt,
         extraction.status,
+        extraction.agentSlug ?? null,
       );
   }
 

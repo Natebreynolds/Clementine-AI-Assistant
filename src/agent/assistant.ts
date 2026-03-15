@@ -579,6 +579,17 @@ export class PersonalAssistant {
       }
     }
 
+    // Load agent-specific MEMORY.md if running as a team agent
+    if (profile?.agentDir) {
+      const agentMemPath = path.join(profile.agentDir, 'MEMORY.md');
+      // Start watching if not already watched
+      this.promptCache.watch(agentMemPath);
+      const agentMemEntry = this.promptCache.get(agentMemPath);
+      if (agentMemEntry) {
+        parts.push(`## Agent Memory (${profile.slug})\n\n${agentMemEntry.content}`);
+      }
+    }
+
     const todayEntry = this.promptCache.get(todayPath);
     if (todayEntry) {
       parts.push(`## Today's Notes (${todayISO()})\n\n${todayEntry.content}`);
@@ -843,7 +854,11 @@ Delegate data-heavy work (SEO, analytics, bulk API calls for 3+ entities) to sub
 
   // ── Context Retrieval ─────────────────────────────────────────────
 
-  private async retrieveContext(userMessage: string, sessionKey?: string | null): Promise<string> {
+  private async retrieveContext(
+    userMessage: string,
+    sessionKey?: string | null,
+    agentSlug?: string,
+  ): Promise<string> {
     if (!this.memoryStore) return '';
 
     try {
@@ -864,7 +879,8 @@ Delegate data-heavy work (SEO, analytics, bulk API calls for 3+ entities) to sub
       }
 
       const results = this.memoryStore.searchContext(
-        enrichedQuery, SEARCH_CONTEXT_LIMIT, SEARCH_RECENCY_LIMIT,
+        enrichedQuery,
+        { limit: SEARCH_CONTEXT_LIMIT, recencyLimit: SEARCH_RECENCY_LIMIT, agentSlug },
       );
 
       if (results?.length > 0) {
@@ -1061,7 +1077,7 @@ Delegate data-heavy work (SEO, analytics, bulk API calls for 3+ entities) to sub
       !responseText.startsWith('Error:') &&
       this.worthExtracting(text, responseText)
     ) {
-      this.spawnMemoryExtraction(text, responseText, key).catch(() => {});
+      this.spawnMemoryExtraction(text, responseText, key, profile).catch(() => {});
     }
 
     return [responseText, sessionId];
@@ -1086,7 +1102,7 @@ Delegate data-heavy work (SEO, analytics, bulk API calls for 3+ entities) to sub
     // If a project override is set, skip auto-matching entirely
     const hasActiveSession = !!(sessionKey && this.sessions.has(sessionKey));
     const [rawContext, autoMatchedProject] = await Promise.all([
-      this.retrieveContext(prompt, sessionKey),
+      this.retrieveContext(prompt, sessionKey, profile?.slug),
       Promise.resolve(projectOverride || hasActiveSession ? null : matchProject(prompt)),
     ]);
     // Resolve project: explicit override > auto-match > profile binding
@@ -1433,6 +1449,7 @@ Delegate data-heavy work (SEO, analytics, bulk API calls for 3+ entities) to sub
     userMessage: string,
     assistantResponse: string,
     sessionKey?: string,
+    profile?: AgentProfile,
   ): Promise<void> {
     // Guard: skip memory extraction if the user message looks like injection
     const memScan = scanner.scan(userMessage);
@@ -1443,14 +1460,19 @@ Delegate data-heavy work (SEO, analytics, bulk API calls for 3+ entities) to sub
 
     let currentMemory = '';
     try {
-      if (fs.existsSync(MEMORY_FILE)) {
-        const content = fs.readFileSync(MEMORY_FILE, 'utf-8');
+      // Load agent-specific MEMORY.md if available, otherwise global
+      const memFile = profile?.agentDir
+        ? path.join(profile.agentDir, 'MEMORY.md')
+        : MEMORY_FILE;
+      const targetFile = fs.existsSync(memFile) ? memFile : MEMORY_FILE;
+      if (fs.existsSync(targetFile)) {
+        const content = fs.readFileSync(targetFile, 'utf-8');
         currentMemory = content.slice(0, 4000);
         if (content.length > 4000) currentMemory += '\n...(truncated)';
       }
     } catch { /* non-fatal */ }
 
-    await this.extractMemory(userMessage, assistantResponse, currentMemory, sessionKey);
+    await this.extractMemory(userMessage, assistantResponse, currentMemory, sessionKey, profile);
   }
 
   private static readonly MEMORY_TOOL_NAMES = new Set([
@@ -1462,6 +1484,7 @@ Delegate data-heavy work (SEO, analytics, bulk API calls for 3+ entities) to sub
     assistantResponse: string,
     currentMemory = '',
     sessionKey?: string,
+    profile?: AgentProfile,
   ): Promise<void> {
     try {
       let truncatedResponse = assistantResponse;
@@ -1498,7 +1521,10 @@ Delegate data-heavy work (SEO, analytics, bulk API calls for 3+ entities) to sub
               type: 'stdio',
               command: 'node',
               args: [MCP_SERVER_SCRIPT],
-              env: { CLEMENTINE_HOME: BASE_DIR },
+              env: {
+                CLEMENTINE_HOME: BASE_DIR,
+                ...(profile?.slug ? { CLEMENTINE_TEAM_AGENT: profile.slug } : {}),
+              },
             },
           },
           maxTurns: 5,
@@ -1525,6 +1551,7 @@ Delegate data-heavy work (SEO, analytics, bulk API calls for 3+ entities) to sub
                     toolInput: JSON.stringify(block.input ?? {}),
                     extractedAt: new Date().toISOString(),
                     status: 'active',
+                    agentSlug: profile?.slug,
                   });
                 } catch {
                   // Non-fatal — extraction logging should never block memory writes

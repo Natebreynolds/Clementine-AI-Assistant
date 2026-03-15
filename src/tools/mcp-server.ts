@@ -73,16 +73,20 @@ const logger = pino(
 
 // Dynamic import to avoid circular dependency / init issues
 type MemoryStoreType = {
-  searchFts(query: string, limit: number): unknown[];
-  getRecentChunks(limit: number): unknown[];
-  searchContext(query: string, limit?: number, recencyLimit?: number): unknown[];
+  searchFts(query: string, limit: number): Array<{
+    sourceFile: string; section: string; content: string; score: number;
+    chunkType: string; matchType: string; lastUpdated: string; chunkId: number;
+    salience: number; agentSlug?: string | null;
+  }>;
+  getRecentChunks(limit: number, agentSlug?: string): unknown[];
+  searchContext(query: string, limitOrOpts?: number | { limit?: number; recencyLimit?: number; agentSlug?: string }, recencyLimit?: number): unknown[];
   getConnections(noteName: string): Array<{ direction: string; file: string; context: string }>;
   getTimeline(startDate: string, endDate: string, limit?: number): unknown[];
   searchTranscripts(query: string, limit?: number, sessionKey?: string): Array<{
     sessionKey: string; role: string; content: string; model: string; createdAt: string;
   }>;
   fullSync(): { filesScanned: number; filesUpdated: number; filesDeleted: number; chunksTotal: number };
-  updateFile(relPath: string): void;
+  updateFile(relPath: string, agentSlug?: string): void;
   recordAccess(chunkIds: number[]): void;
   decaySalience(halfLifeDays?: number): number;
   pruneStaleData(opts?: {
@@ -94,7 +98,7 @@ type MemoryStoreType = {
   };
   logExtraction(extraction: {
     sessionKey: string; userMessage: string; toolName: string;
-    toolInput: string; extractedAt: string; status: string;
+    toolInput: string; extractedAt: string; status: string; agentSlug?: string;
   }): void;
   getRecentExtractions(limit?: number, status?: string): Array<{
     id: number; sessionKey: string; userMessage: string; toolName: string;
@@ -124,6 +128,9 @@ async function getStore(): Promise<MemoryStoreType> {
   _store = store as unknown as MemoryStoreType;
   return _store;
 }
+
+// ── Active Agent Slug (set when running as a team agent) ──────────────
+const ACTIVE_AGENT_SLUG: string | null = process.env.CLEMENTINE_TEAM_AGENT || null;
 
 // ── Helpers ────────────────────────────────────────────────────────────
 
@@ -258,10 +265,10 @@ function validateVaultPath(relPath: string): string {
 }
 
 /** Incremental re-index after a write. Non-fatal on failure. */
-async function incrementalSync(relPath: string): Promise<void> {
+async function incrementalSync(relPath: string, agentSlug?: string): Promise<void> {
   try {
     const store = await getStore();
-    store.updateFile(relPath);
+    store.updateFile(relPath, agentSlug ?? undefined);
   } catch (err) {
     logger.warn({ err, relPath }, 'Incremental sync failed');
   }
@@ -501,7 +508,7 @@ server.tool(
 
       writeFileSync(dailyPath, body, 'utf-8');
       const rel = path.relative(VAULT_DIR, dailyPath);
-      await incrementalSync(rel);
+      await incrementalSync(rel, ACTIVE_AGENT_SLUG ?? undefined);
       return textResult(`Appended to ${path.basename(dailyPath)} > ${sec}`);
     }
 
@@ -509,21 +516,33 @@ server.tool(
       const sec = section ?? '';
       if (!sec) return textResult("Error: 'section' required for update_memory");
 
+      // Resolve target MEMORY.md: agent-specific if running as team agent, else global
+      let targetMemFile = MEMORY_FILE;
+      if (ACTIVE_AGENT_SLUG) {
+        const agentMemDir = path.join(SYSTEM_DIR, 'agents', ACTIVE_AGENT_SLUG);
+        mkdirSync(agentMemDir, { recursive: true });
+        targetMemFile = path.join(agentMemDir, 'MEMORY.md');
+        if (!existsSync(targetMemFile)) {
+          writeFileSync(targetMemFile, `# ${ACTIVE_AGENT_SLUG} Memory\n\n`, 'utf-8');
+        }
+      }
+
       // Dedup check against indexed memory
       try {
         const store = await getStore();
-        const dup = store.checkDuplicate(content, path.relative(VAULT_DIR, MEMORY_FILE));
+        const dup = store.checkDuplicate(content, path.relative(VAULT_DIR, targetMemFile));
         if (dup.isDuplicate) {
           store.logExtraction({
             sessionKey: 'mcp', userMessage: content.slice(0, 200),
             toolName: 'memory_write', toolInput: JSON.stringify({ action, section: sec }),
             extractedAt: new Date().toISOString(), status: 'dedup_skipped',
+            agentSlug: ACTIVE_AGENT_SLUG ?? undefined,
           });
           return textResult(`Skipped: ${dup.matchType} duplicate already in memory (chunk #${dup.matchId})`);
         }
       } catch { /* dedup failure is non-fatal — proceed with write */ }
 
-      let body = readFileSync(MEMORY_FILE, 'utf-8');
+      let body = readFileSync(targetMemFile, 'utf-8');
 
       const pattern = new RegExp(`(## ${sec.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\n)(.*?)(\\n## |$)`, 's');
       const match = pattern.exec(body);
@@ -557,10 +576,11 @@ server.tool(
         body += `\n\n## ${sec}\n\n${content}\n`;
       }
 
-      writeFileSync(MEMORY_FILE, body, 'utf-8');
-      const rel = path.relative(VAULT_DIR, MEMORY_FILE);
-      await incrementalSync(rel);
-      return textResult(`Updated MEMORY.md > ${sec}`);
+      writeFileSync(targetMemFile, body, 'utf-8');
+      const rel = path.relative(VAULT_DIR, targetMemFile);
+      await incrementalSync(rel, ACTIVE_AGENT_SLUG ?? undefined);
+      const label = ACTIVE_AGENT_SLUG ? `${ACTIVE_AGENT_SLUG}/MEMORY.md` : 'MEMORY.md';
+      return textResult(`Updated ${label} > ${sec}`);
     }
 
     if (action === 'write_note') {
@@ -570,7 +590,7 @@ server.tool(
       const full = validateVaultPath(relPath);
       mkdirSync(path.dirname(full), { recursive: true });
       writeFileSync(full, content, 'utf-8');
-      await incrementalSync(relPath);
+      await incrementalSync(relPath, ACTIVE_AGENT_SLUG ?? undefined);
       return textResult(`Wrote: ${relPath}`);
     }
 
@@ -592,9 +612,15 @@ server.tool(
 
     try {
       const store = await getStore();
-      const results = (store.searchFts(query, maxResults) as Array<{
-        sourceFile: string; section: string; content: string; score: number;
-      }>);
+      const results = store.searchFts(query, maxResults);
+
+      // Apply agent affinity boost
+      if (ACTIVE_AGENT_SLUG && results.length > 0) {
+        for (const r of results) {
+          if (r.agentSlug === ACTIVE_AGENT_SLUG) r.score *= 1.4;
+        }
+        results.sort((a, b) => b.score - a.score);
+      }
 
       if (results.length > 0) {
         const lines = results.map(r => {
@@ -646,7 +672,10 @@ server.tool(
   },
   async ({ query }) => {
     const store = await getStore();
-    const results = store.searchContext(query) as Array<{
+    const results = store.searchContext(
+      query,
+      { agentSlug: ACTIVE_AGENT_SLUG ?? undefined },
+    ) as Array<{
       sourceFile: string; section: string; content: string; score: number;
       matchType: string; chunkId: number;
     }>;
