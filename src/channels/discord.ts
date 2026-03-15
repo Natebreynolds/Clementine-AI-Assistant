@@ -9,6 +9,7 @@
 import {
   ActivityType,
   Client,
+  EmbedBuilder,
   Events,
   GatewayIntentBits,
   Partials,
@@ -103,6 +104,7 @@ const slashCommands = [
     .addSubcommand(sub => sub.setName('status').setDescription('Show self-improvement status'))
     .addSubcommand(sub => sub.setName('history').setDescription('Show experiment history'))
     .addSubcommand(sub => sub.setName('pending').setDescription('List pending proposals')),
+  new SlashCommandBuilder().setName('dashboard').setDescription('Live system status embed (auto-refreshes)'),
   new SlashCommandBuilder().setName('clear').setDescription('Reset conversation session'),
   new SlashCommandBuilder().setName('help').setDescription('Show all available commands'),
 ];
@@ -460,7 +462,9 @@ function handleHelp(): string {
     '`!project <name>` \u2014 Set active project \u00b7 `!project list|clear|status`',
     '`!cron list|run|enable|disable` \u2014 Manage scheduled tasks',
     '`!workflow list|run <name>` \u2014 Manage multi-step workflows',
+    '`!self-improve run|status|history|pending|apply|deny` \u2014 Self-improvement',
     '`!status [job]` \u2014 Check unleashed task progress',
+    '`!dashboard` \u2014 Live system status embed (auto-refreshes)',
     '`!heartbeat` \u2014 Run heartbeat \u00b7 `!tools` \u2014 List tools \u00b7 `!clear` \u2014 Reset',
     '`!help` \u2014 This message',
   ].join('\n');
@@ -594,6 +598,132 @@ export async function startDiscord(
       activities: [{ name: parts.join(' · '), type: ActivityType.Watching }],
       status: 'online',
     });
+  }
+
+  // ── Live status embed ────────────────────────────────────────────
+  let statusEmbedMessage: Message | null = null;
+  let statusEmbedTimer: ReturnType<typeof setInterval> | null = null;
+
+  function buildStatusEmbed(): EmbedBuilder {
+    const now = new Date();
+    const embed = new EmbedBuilder()
+      .setTitle(`${ASSISTANT_NAME} System Status`)
+      .setColor(0x6C5CE7)
+      .setTimestamp(now)
+      .setFooter({ text: 'Auto-refreshes every 30s \u00b7 !dashboard to re-pin' });
+
+    // ── Lanes
+    const lanes = gateway.getLaneStatus();
+    const laneLines = Object.entries(lanes).map(([name, l]) => {
+      const bar = '\u2588'.repeat(l.active) + '\u2591'.repeat(l.limit - l.active);
+      const queued = l.queued > 0 ? ` (+${l.queued} queued)` : '';
+      return `\`${bar}\` ${name} ${l.active}/${l.limit}${queued}`;
+    });
+    embed.addFields({ name: '\u{1F6A6} Lanes', value: laneLines.join('\n') || 'All idle', inline: false });
+
+    // ── Running cron jobs
+    const runningJobs = cronScheduler.getRunningJobs();
+    const runningWorkflows = cronScheduler.getRunningWorkflowNames();
+    const runningItems: string[] = [];
+    for (const j of runningJobs) runningItems.push(`\u23F3 ${j}`);
+    for (const w of runningWorkflows) runningItems.push(`\u{1F504} ${w} (workflow)`);
+    embed.addFields({
+      name: `\u2699\uFE0F Active Jobs (${runningItems.length})`,
+      value: runningItems.length > 0 ? runningItems.join('\n') : '\u2705 All quiet',
+      inline: true,
+    });
+
+    // ── Unleashed tasks
+    const unleashedDir = path.join(BASE_DIR, 'unleashed');
+    const unleashedLines: string[] = [];
+    if (existsSync(unleashedDir)) {
+      const dirs = readdirSync(unleashedDir).filter(d => {
+        try { return statSync(path.join(unleashedDir, d)).isDirectory(); } catch { return false; }
+      });
+      for (const dir of dirs) {
+        const sf = path.join(unleashedDir, dir, 'status.json');
+        if (!existsSync(sf)) continue;
+        try {
+          const s = JSON.parse(readFileSync(sf, 'utf-8'));
+          if (s.status !== 'running') continue;
+          const elapsed = s.startedAt
+            ? Math.round((Date.now() - new Date(s.startedAt).getTime()) / 60000)
+            : 0;
+          const elStr = elapsed < 60 ? `${elapsed}m` : `${Math.floor(elapsed / 60)}h${elapsed % 60}m`;
+          unleashedLines.push(`\u{1F535} ${s.jobName ?? dir} \u00b7 phase ${s.phase ?? 0} \u00b7 ${elStr}`);
+        } catch { /* skip */ }
+      }
+    }
+    if (unleashedLines.length > 0) {
+      embed.addFields({ name: '\u{1F680} Unleashed', value: unleashedLines.join('\n'), inline: true });
+    }
+
+    // ── Self-improvement
+    const siState = cronScheduler.getSelfImproveStatus();
+    const siPending = cronScheduler.getSelfImprovePending();
+    const m = siState.baselineMetrics;
+    const siLines = [
+      `Status: **${siState.status}**`,
+      `Last run: ${siState.lastRunAt ? new Date(siState.lastRunAt).toLocaleDateString() : 'never'}`,
+      `Experiments: ${siState.totalExperiments}`,
+    ];
+    if (m.feedbackPositiveRatio > 0 || m.cronSuccessRate > 0) {
+      siLines.push(`Feedback: ${(m.feedbackPositiveRatio * 100).toFixed(0)}% \u2705 \u00b7 Cron: ${(m.cronSuccessRate * 100).toFixed(0)}% \u2705`);
+    }
+    if (siPending.length > 0) {
+      siLines.push(`**${siPending.length} pending approval${siPending.length > 1 ? 's' : ''}** \u2014 use \`!self-improve pending\``);
+    }
+    embed.addFields({ name: '\u{1F52C} Self-Improvement', value: siLines.join('\n'), inline: false });
+
+    // ── Sessions
+    const provenance = gateway.getAllProvenance();
+    const sessionCount = provenance.size;
+    embed.addFields({
+      name: '\u{1F4AC} Sessions',
+      value: `${sessionCount} active`,
+      inline: true,
+    });
+
+    // ── Cron summary
+    const jobNames = cronScheduler.getJobNames();
+    const enabledCount = jobNames.length;
+    embed.addFields({
+      name: '\u{1F4CB} Scheduled',
+      value: `${enabledCount} jobs configured`,
+      inline: true,
+    });
+
+    return embed;
+  }
+
+  async function sendOrUpdateStatusEmbed(channel: Message['channel']): Promise<void> {
+    try {
+      const embed = buildStatusEmbed();
+      if (statusEmbedMessage) {
+        // Edit existing message
+        try {
+          await statusEmbedMessage.edit({ embeds: [embed] });
+          return;
+        } catch {
+          // Message might have been deleted — send a new one
+          statusEmbedMessage = null;
+        }
+      }
+      if ('send' in channel) {
+        statusEmbedMessage = await (channel as any).send({ embeds: [embed] });
+      }
+    } catch (err) {
+      logger.error({ err }, 'Failed to update status embed');
+    }
+  }
+
+  function startStatusEmbedRefresh(channel: Message['channel']): void {
+    // Clear any existing timer
+    if (statusEmbedTimer) clearInterval(statusEmbedTimer);
+    // Refresh every 30 seconds
+    statusEmbedTimer = setInterval(() => {
+      sendOrUpdateStatusEmbed(channel).catch(() => {});
+    }, 30_000);
   }
 
   // Prevent unhandled 'error' events from crashing the process
@@ -793,6 +923,14 @@ export async function startDiscord(
       }
 
       await message.reply('Usage: `!workflow list` or `!workflow run <name> [key=val ...]`');
+      return;
+    }
+
+    // ── Live status embed (DM only) ────────────────────────────────────
+
+    if (isDm && text === '!dashboard') {
+      await sendOrUpdateStatusEmbed(message.channel);
+      startStatusEmbedRefresh(message.channel);
       return;
     }
 
@@ -1214,6 +1352,18 @@ export async function startDiscord(
             await cmd.followUp(chunks[i]);
           }
           return;
+        }
+        return;
+      }
+
+      // Dashboard — live status embed
+      if (name === 'dashboard') {
+        if (cmd.channel) {
+          await cmd.reply({ content: 'Pinning live status...', ephemeral: true });
+          await sendOrUpdateStatusEmbed(cmd.channel);
+          startStatusEmbedRefresh(cmd.channel);
+        } else {
+          await cmd.reply({ content: 'Could not access channel.', ephemeral: true });
         }
         return;
       }

@@ -979,6 +979,14 @@ export class CronScheduler {
     return this.runningJobs.has(jobName);
   }
 
+  getRunningJobs(): string[] {
+    return [...this.runningJobs];
+  }
+
+  getRunningWorkflowNames(): string[] {
+    return [...this.runningWorkflows];
+  }
+
   disableJob(jobName: string): string {
     const job = this.jobs.find((j) => j.name === jobName);
     if (!job) return `Job not found: ${jobName}`;
