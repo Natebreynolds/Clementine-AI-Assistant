@@ -1855,22 +1855,47 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
       const mgr = gw.getAgentManager();
       const all = mgr.listAll();
       const bindings = gw.getTeamRouter().getBindings();
-      res.json(all.map(a => ({
-        slug: a.slug,
-        name: a.name,
-        description: a.description,
-        tier: a.tier,
-        model: a.model ?? null,
-        channelName: a.team?.channelName ?? null,
-        channelId: bindings.channels[a.slug] ?? null,
-        provisioned: Boolean(bindings.channels[a.slug]),
-        canMessage: a.team?.canMessage ?? [],
-        allowedTools: a.team?.allowedTools ?? null,
-        project: a.project ?? null,
-        agentDir: a.agentDir ?? null,
-        hasOwnCron: mgr.hasOwnCron(a.slug),
-        hasOwnWorkflows: mgr.hasOwnWorkflows(a.slug),
-      })));
+      // Read bot status from disk (written by BotManager in daemon)
+      let botStatuses: Record<string, { status: string; botTag?: string; error?: string }> = {};
+      try {
+        const statusPath = path.join(BASE_DIR, '.bot-status.json');
+        if (existsSync(statusPath)) {
+          botStatuses = JSON.parse(readFileSync(statusPath, 'utf-8'));
+        }
+      } catch { /* ignore */ }
+      res.json(all.map(a => {
+        // Derive invite URL from token (first segment is base64-encoded bot user ID)
+        let botInviteUrl: string | null = null;
+        if (a.discordToken) {
+          try {
+            const appId = Buffer.from(a.discordToken.split('.')[0], 'base64').toString();
+            if (/^\d{17,20}$/.test(appId)) {
+              botInviteUrl = `https://discord.com/oauth2/authorize?client_id=${appId}&scope=bot&permissions=68608`;
+            }
+          } catch { /* ignore */ }
+        }
+        return {
+          slug: a.slug,
+          name: a.name,
+          description: a.description,
+          tier: a.tier,
+          model: a.model ?? null,
+          channelName: a.team?.channelName ?? null,
+          channelId: bindings.channels[a.slug] ?? null,
+          provisioned: Boolean(bindings.channels[a.slug]),
+          canMessage: a.team?.canMessage ?? [],
+          allowedTools: a.team?.allowedTools ?? null,
+          project: a.project ?? null,
+          agentDir: a.agentDir ?? null,
+          hasOwnCron: mgr.hasOwnCron(a.slug),
+          hasOwnWorkflows: mgr.hasOwnWorkflows(a.slug),
+          hasDiscordToken: Boolean(a.discordToken),
+          discordChannelId: a.discordChannelId ?? null,
+          botStatus: botStatuses[a.slug]?.status ?? null,
+          botTag: botStatuses[a.slug]?.botTag ?? null,
+          botInviteUrl,
+        };
+      }));
     } catch (err) {
       res.json([]);
     }
@@ -1880,7 +1905,7 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
     try {
       const gw = await getGateway();
       const mgr = gw.getAgentManager();
-      const { name, description, personality, tier, model, channelName, canMessage, allowedTools, project } = req.body;
+      const { name, description, personality, tier, model, channelName, canMessage, allowedTools, project, discordToken, discordChannelId } = req.body;
       if (!name || !description) {
         res.status(400).json({ error: 'name and description are required' });
         return;
@@ -1893,6 +1918,8 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
         canMessage: canMessage || undefined,
         allowedTools: allowedTools || undefined,
         project: project || undefined,
+        discordToken: discordToken || undefined,
+        discordChannelId: discordChannelId || undefined,
       });
       res.json({ ok: true, agent: { slug: agent.slug, name: agent.name } });
     } catch (err) {
@@ -1918,6 +1945,34 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
       const mgr = gw.getAgentManager();
       mgr.deleteAgent(req.params.slug);
       res.json({ ok: true });
+    } catch (err) {
+      res.status(400).json({ error: String(err) });
+    }
+  });
+
+  // ── Bot token helper endpoints ──────────────────────────────────────
+
+  /** Derive invite URL from a raw token (no save needed). */
+  app.post('/api/bot/derive-invite', (req, res) => {
+    try {
+      const { token } = req.body;
+      if (!token || typeof token !== 'string') {
+        res.status(400).json({ error: 'token required' });
+        return;
+      }
+      const parts = token.split('.');
+      if (parts.length !== 3) {
+        res.status(400).json({ error: 'Invalid token format — should have 3 dot-separated segments' });
+        return;
+      }
+      const appId = Buffer.from(parts[0], 'base64').toString();
+      if (!/^\d{17,20}$/.test(appId)) {
+        res.status(400).json({ error: 'Could not decode a valid application ID from token' });
+        return;
+      }
+      // Permission 68608 = VIEW_CHANNEL | SEND_MESSAGES | READ_MESSAGE_HISTORY
+      const inviteUrl = `https://discord.com/oauth2/authorize?client_id=${appId}&scope=bot&permissions=68608`;
+      res.json({ ok: true, appId, inviteUrl });
     } catch (err) {
       res.status(400).json({ error: String(err) });
     }
@@ -3581,9 +3636,25 @@ function getDashboardHTML(): string {
             <label style="display:block;color:var(--text-muted);font-size:12px;margin-bottom:4px">Can Message (comma-separated slugs)</label>
             <input id="agent-canmessage" style="width:100%;padding:8px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text)" placeholder="analyst-agent, writer-agent">
           </div>
-          <div style="margin-bottom:16px">
+          <div style="margin-bottom:12px">
             <label style="display:block;color:var(--text-muted);font-size:12px;margin-bottom:4px">Allowed Tools (comma-separated, blank = all)</label>
             <input id="agent-tools" style="width:100%;padding:8px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text)" placeholder="WebSearch, WebFetch, memory_search">
+          </div>
+          <div style="margin-bottom:16px">
+            <label style="display:block;color:var(--text-muted);font-size:12px;margin-bottom:4px">Discord Bot Token <span style="opacity:0.6">(gives agent its own bot presence)</span></label>
+            <input id="agent-discord-token" type="password" autocomplete="off" style="width:100%;padding:8px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text)" placeholder="Paste bot token or leave blank for webhook identity" oninput="onTokenInput(this.value)">
+            <div style="margin-top:6px">
+              <label style="display:block;color:var(--text-muted);font-size:12px;margin-bottom:4px">Channel ID <span style="opacity:0.6">(right-click channel &gt; Copy Channel ID &mdash; auto-discovers from channel name if blank)</span></label>
+              <input id="agent-discord-channel-id" style="width:100%;padding:8px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text)" placeholder="e.g. 1478311884212932740">
+            </div>
+            <div id="agent-token-hint" style="display:none;font-size:11px;color:var(--green);margin-top:4px">(token configured &mdash; leave blank to keep, enter new to replace)</div>
+            <div id="agent-token-setup" style="display:none;margin-top:8px;padding:10px;background:rgba(59,130,246,0.08);border:1px solid rgba(59,130,246,0.25);border-radius:8px;font-size:12px">
+              <div style="font-weight:600;color:var(--blue);margin-bottom:6px">Bot Setup Checklist</div>
+              <div style="margin-bottom:4px">1. <a id="token-invite-link" href="#" target="_blank" style="color:var(--blue)">Invite bot to your server</a></div>
+              <div style="margin-bottom:4px;color:var(--text-muted)">2. Enable <strong>Message Content Intent</strong> in <a href="https://discord.com/developers/applications" target="_blank" style="color:var(--blue)">Developer Portal</a> &gt; Bot &gt; Privileged Intents</div>
+              <div style="margin-bottom:4px;color:var(--text-muted)">3. Save this form, then provision channels + restart daemon</div>
+              <div style="margin-top:6px;font-size:11px;color:var(--text-muted)">App ID: <code id="token-app-id"></code></div>
+            </div>
           </div>
           <div style="display:flex;gap:8px;justify-content:flex-end">
             <button type="button" class="btn" onclick="hideAgentModal()">Cancel</button>
@@ -5592,21 +5663,54 @@ async function refreshTeam() {
           if (a.allowedTools) badges.push('<span class="badge" style="background:var(--yellow);color:#000">' + a.allowedTools.length + ' tools</span>');
           if (a.hasOwnCron) badges.push('<span class="badge" style="background:var(--purple)">cron</span>');
           if (a.hasOwnWorkflows) badges.push('<span class="badge" style="background:var(--purple)">workflows</span>');
+
+          // Bot presence indicator
+          var botBadge = '';
+          if (a.botStatus === 'online') {
+            botBadge = '<span class="badge" style="background:#22c55e;color:#000">&#9679; bot online' + (a.botTag ? ' (' + a.botTag + ')' : '') + '</span>';
+          } else if (a.botStatus === 'connecting') {
+            botBadge = '<span class="badge" style="background:var(--yellow);color:#000">&#9679; connecting...</span>';
+          } else if (a.botStatus === 'error') {
+            botBadge = '<span class="badge" style="background:var(--red)">&#9679; bot error</span>';
+          } else if (a.hasDiscordToken) {
+            botBadge = '<span class="badge" style="background:var(--text-muted)">&#9675; bot offline</span>';
+          }
+          if (botBadge) badges.push(botBadge);
+
           var editBtn = a.agentDir
             ? '<button class="btn btn-sm" onclick="editAgent(\\'' + a.slug + '\\')" style="font-size:11px;padding:2px 8px">Edit</button> ' +
               '<button class="btn btn-sm" onclick="deleteAgent(\\'' + a.slug + '\\')" style="font-size:11px;padding:2px 8px;color:var(--red)">Delete</button>'
             : '<span style="font-size:11px;color:var(--text-muted)">legacy profile</span>';
+
+          // Bot setup guidance row
+          var botRow = '';
+          if (a.hasDiscordToken && a.botInviteUrl && !a.botStatus) {
+            botRow = '<div style="margin-top:6px;padding:6px 8px;background:rgba(234,179,8,0.1);border:1px solid rgba(234,179,8,0.3);border-radius:6px;font-size:11px">' +
+              '<strong style="color:var(--yellow)">Bot not yet active</strong> &mdash; ' +
+              '<a href="' + a.botInviteUrl + '" target="_blank" style="color:var(--blue)">Invite to server</a>, then restart the daemon.' +
+              '</div>';
+          } else if (a.hasDiscordToken && a.botInviteUrl && a.botStatus === 'error') {
+            botRow = '<div style="margin-top:6px;padding:6px 8px;background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);border-radius:6px;font-size:11px">' +
+              '<strong style="color:var(--red)">Bot error</strong> &mdash; Check the token is valid and the bot has been ' +
+              '<a href="' + a.botInviteUrl + '" target="_blank" style="color:var(--blue)">invited to the server</a>.' +
+              '</div>';
+          } else if (!a.hasDiscordToken && a.channelName) {
+            botRow = '<div style="margin-top:6px;font-size:11px;color:var(--text-muted)">' +
+              'Using webhook identity. <a href="#" onclick="editAgent(\\'' + a.slug + '\\');return false" style="color:var(--blue)">Add a bot token</a> for dedicated bot presence.' +
+              '</div>';
+          }
+
           return '<div style="padding:12px;border-bottom:1px solid var(--border)">' +
             '<div style="display:flex;justify-content:space-between;align-items:center">' +
             '<div>' + statusDot + ' <strong>' + a.name + '</strong> <span style="color:var(--text-muted);font-size:12px">(' + a.slug + ')</span></div>' +
-            '<div style="display:flex;gap:4px;align-items:center">' + badges.join('') + ' ' + editBtn + '</div>' +
+            '<div style="display:flex;gap:4px;align-items:center;flex-wrap:wrap">' + badges.join('') + ' ' + editBtn + '</div>' +
             '</div>' +
             '<div style="font-size:12px;color:var(--text-secondary);margin-top:4px">' + (a.description || 'No description') + '</div>' +
             '<div style="font-size:11px;color:var(--text-muted);margin-top:4px">' +
             'Channel: ' + channelInfo +
             ' &middot; Tier: ' + (a.tier || 1) +
             ' &middot; Can message: ' + ((a.canMessage || []).join(', ') || 'none') +
-            '</div></div>';
+            '</div>' + botRow + '</div>';
         }).join('');
       }
     }
@@ -5678,6 +5782,8 @@ function showAgentCreateModal() {
   document.getElementById('agent-submit-btn').textContent = 'Create';
   document.getElementById('agent-edit-slug').value = '';
   document.getElementById('agent-form').reset();
+  document.getElementById('agent-token-hint').style.display = 'none';
+  document.getElementById('agent-token-setup').style.display = 'none';
 }
 
 async function editAgent(slug) {
@@ -5699,11 +5805,60 @@ async function editAgent(slug) {
     document.getElementById('agent-tier').value = String(a.tier || 2);
     document.getElementById('agent-canmessage').value = (a.canMessage || []).join(', ');
     document.getElementById('agent-tools').value = (a.allowedTools || []).join(', ');
+    document.getElementById('agent-discord-token').value = '';
+    document.getElementById('agent-discord-channel-id').value = a.discordChannelId || '';
+    document.getElementById('agent-token-setup').style.display = 'none';
+    var tokenHint = document.getElementById('agent-token-hint');
+    if (a.hasDiscordToken) {
+      tokenHint.style.display = 'block';
+      // Show invite URL if available (already configured)
+      if (a.botInviteUrl) {
+        var setupEl = document.getElementById('agent-token-setup');
+        var appIdMatch = a.botInviteUrl.match(/client_id=(\d+)/);
+        if (appIdMatch) {
+          document.getElementById('token-invite-link').href = a.botInviteUrl;
+          document.getElementById('token-app-id').textContent = appIdMatch[1];
+          setupEl.style.display = 'block';
+        }
+      }
+    } else {
+      tokenHint.style.display = 'none';
+    }
   } catch(e) { toast(String(e), 'error'); }
 }
 
 function hideAgentModal() {
   document.getElementById('agent-modal').style.display = 'none';
+}
+
+var tokenInputDebounce = null;
+function onTokenInput(token) {
+  clearTimeout(tokenInputDebounce);
+  var setupEl = document.getElementById('agent-token-setup');
+  if (!token || token.length < 20) {
+    setupEl.style.display = 'none';
+    return;
+  }
+  tokenInputDebounce = setTimeout(async function() {
+    try {
+      var r = await fetch('/api/bot/derive-invite', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token: token }),
+      });
+      var d = await r.json();
+      if (d.ok) {
+        document.getElementById('token-invite-link').href = d.inviteUrl;
+        document.getElementById('token-app-id').textContent = d.appId;
+        setupEl.style.display = 'block';
+      } else {
+        setupEl.style.display = 'none';
+        toast(d.error || 'Invalid token format', 'error');
+      }
+    } catch(e) {
+      setupEl.style.display = 'none';
+    }
+  }, 400);
 }
 
 async function submitAgentForm(e) {
@@ -5726,6 +5881,12 @@ async function submitAgentForm(e) {
 
   var tools = document.getElementById('agent-tools').value.trim();
   if (tools) payload.allowedTools = tools.split(',').map(function(s) { return s.trim(); }).filter(Boolean);
+
+  var discordToken = document.getElementById('agent-discord-token').value.trim();
+  if (discordToken) payload.discordToken = discordToken;
+
+  var discordChannelId = document.getElementById('agent-discord-channel-id').value.trim();
+  if (discordChannelId) payload.discordChannelId = discordChannelId;
 
   try {
     var url = isEdit ? '/api/agents/' + editSlug : '/api/agents';

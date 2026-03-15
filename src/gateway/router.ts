@@ -378,6 +378,9 @@ export class Gateway {
         if (profileSlug) {
           effectiveSessionKey = `${sessionKey}:${profileSlug}`;
         }
+        const resolvedProfile = profileSlug
+          ? this.getAgentManager().get(profileSlug) ?? undefined
+          : undefined;
 
         // Resolve active project override
         const projectOverride = this.sessionProjects.get(sessionKey);
@@ -386,7 +389,7 @@ export class Gateway {
           const [response] = await this.assistant.chat(
             text,
             effectiveSessionKey,
-            { onText, model: effectiveModel, maxTurns, securityAnnotation, projectOverride },
+            { onText, model: effectiveModel, maxTurns, securityAnnotation, projectOverride, profile: resolvedProfile },
           );
 
           // Re-baseline integrity checksums after chat (auto-memory may write to vault)

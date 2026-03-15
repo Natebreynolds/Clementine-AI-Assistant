@@ -30,6 +30,8 @@ export interface AgentCreateConfig {
   canMessage?: string[];
   allowedTools?: string[];
   project?: string;
+  discordToken?: string;           // Dedicated Discord bot token
+  discordChannelId?: string;       // Channel ID for bot to listen in
 }
 
 export class AgentManager {
@@ -118,6 +120,8 @@ export class AgentManager {
       team,
       project: meta.project ? String(meta.project) : undefined,
       agentDir: path.dirname(filePath),
+      discordToken: meta.discordToken ? String(meta.discordToken) : undefined,
+      discordChannelId: meta.discordChannelId ? String(meta.discordChannelId) : undefined,
     };
   }
 
@@ -194,6 +198,8 @@ export class AgentManager {
     if (config.canMessage?.length) frontmatter.canMessage = config.canMessage;
     if (config.allowedTools?.length) frontmatter.allowedTools = config.allowedTools;
     if (config.project) frontmatter.project = config.project;
+    if (config.discordToken) frontmatter.discordToken = config.discordToken;
+    if (config.discordChannelId) frontmatter.discordChannelId = config.discordChannelId;
 
     const body = config.personality || `You are ${config.name}. ${config.description}`;
     const content = matter.stringify(body, frontmatter);
@@ -226,6 +232,8 @@ export class AgentManager {
     if (changes.canMessage !== undefined) meta.canMessage = changes.canMessage;
     if (changes.allowedTools !== undefined) meta.allowedTools = changes.allowedTools;
     if (changes.project !== undefined) meta.project = changes.project;
+    if (changes.discordToken !== undefined) meta.discordToken = changes.discordToken || undefined;
+    if (changes.discordChannelId !== undefined) meta.discordChannelId = changes.discordChannelId || undefined;
 
     const newBody = changes.personality ?? body;
     const updated = matter.stringify(newBody, meta);

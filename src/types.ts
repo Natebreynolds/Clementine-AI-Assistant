@@ -118,6 +118,8 @@ export interface AgentProfile {
   team?: TeamAgentConfig;          // Present if agent has channel bindings
   project?: string;                // Bind agent to a project from projects.json
   agentDir?: string;               // Path to agent's directory (agents/{slug}/)
+  discordToken?: string;           // Dedicated Discord bot token (gives agent its own bot presence)
+  discordChannelId?: string;       // Channel ID for the agent bot to listen in (auto-discovered from channelName if omitted)
 }
 
 // ── Heartbeat ────────────────────────────────────────────────────────

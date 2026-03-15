@@ -417,7 +417,25 @@ async function asyncMain(): Promise<void> {
 
   if (config.CHANNEL_DISCORD) {
     const { startDiscord } = await import('./channels/discord.js');
-    channelTasks.push(startDiscord(gateway, heartbeat, cronScheduler, dispatcher));
+
+    let botManager: import('./channels/discord-bot-manager.js').BotManager | undefined;
+    try {
+      const { BotManager } = await import('./channels/discord-bot-manager.js');
+      botManager = new BotManager({
+        gateway,
+        ownerId: config.DISCORD_OWNER_ID,
+      });
+      logger.info('BotManager: starting all agent bots...');
+      const botOwnedChannels = await botManager.startAll();
+      if (botOwnedChannels.length > 0) {
+        logger.info({ channels: botOwnedChannels }, `Started ${botOwnedChannels.length} agent bot(s)`);
+      }
+    } catch (err) {
+      logger.error({ err }, 'BotManager startup failed — continuing without agent bots');
+    }
+
+    channelTasks.push(startDiscord(gateway, heartbeat, cronScheduler, dispatcher, botManager));
+    if (botManager) botManager.startPolling(60_000);
     activeChannels.push('Discord');
   }
 
