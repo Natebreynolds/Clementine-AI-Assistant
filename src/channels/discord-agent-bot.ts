@@ -122,10 +122,11 @@ export class AgentBotClient {
     logger.info({ slug: this.config.slug }, 'Agent bot stopped');
   }
 
-  getStatus(): { status: AgentBotStatus; botTag?: string; error?: string } {
+  getStatus(): { status: AgentBotStatus; botTag?: string; avatarUrl?: string; error?: string } {
     return {
       status: this.status,
       botTag: this.client.user?.tag,
+      avatarUrl: this.client.user?.displayAvatarURL({ size: 128, extension: 'png' }),
       error: this.errorMessage,
     };
   }

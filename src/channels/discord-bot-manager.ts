@@ -26,6 +26,7 @@ export interface BotStatus {
   slug: string;
   status: AgentBotStatus;
   botTag?: string;
+  avatarUrl?: string;
   channelIds: string[];
   error?: string;
 }
@@ -137,6 +138,7 @@ export class BotManager {
         slug,
         status: s.status,
         botTag: s.botTag,
+        avatarUrl: s.avatarUrl,
         channelIds: bot.getChannelIds(),
         error: s.error,
       });

@@ -1856,7 +1856,7 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
       const all = mgr.listAll();
       const bindings = gw.getTeamRouter().getBindings();
       // Read bot status from disk (written by BotManager in daemon)
-      let botStatuses: Record<string, { status: string; botTag?: string; error?: string }> = {};
+      let botStatuses: Record<string, { status: string; botTag?: string; avatarUrl?: string; error?: string }> = {};
       try {
         const statusPath = path.join(BASE_DIR, '.bot-status.json');
         if (existsSync(statusPath)) {
@@ -1894,6 +1894,7 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
           discordChannelId: a.discordChannelId ?? null,
           botStatus: botStatuses[a.slug]?.status ?? null,
           botTag: botStatuses[a.slug]?.botTag ?? null,
+          botAvatarUrl: botStatuses[a.slug]?.avatarUrl ?? null,
           botInviteUrl,
         };
       }));
@@ -6017,9 +6018,10 @@ async function refreshTeam() {
 
           var channelDisplay = a.channelName ? '#' + a.channelName : 'no desk';
 
-          // Avatar: use image URL or fallback to initial
-          var avatarContent = a.avatar
-            ? '<img src="' + a.avatar + '" onerror="this.style.display=\\'none\\';this.parentElement.textContent=\\'' + a.name.charAt(0).toUpperCase() + '\\';">'
+          // Avatar: use manual URL, then Discord bot avatar, then initial
+          var avatarSrc = a.avatar || a.botAvatarUrl;
+          var avatarContent = avatarSrc
+            ? '<img src="' + avatarSrc + '" onerror="this.style.display=\\'none\\';this.parentElement.textContent=\\'' + a.name.charAt(0).toUpperCase() + '\\';">'
             : a.name.charAt(0).toUpperCase();
 
           // Badges
