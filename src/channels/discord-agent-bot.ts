@@ -585,7 +585,7 @@ export class AgentBotClient {
 
   /**
    * Check if this agent is being addressed in a team chat message.
-   * Matches: @mention, agent name, agent slug (case-insensitive).
+   * Matches: @mention, agent name, agent slug, or broadcast keywords.
    */
   private isAddressedInTeamChat(message: Message): boolean {
     // Direct @mention of this bot
@@ -593,12 +593,27 @@ export class AgentBotClient {
       return true;
     }
 
+    // @everyone and @here Discord mentions address all agents
+    if (message.mentions.everyone) {
+      return true;
+    }
+
     const content = message.content.toLowerCase();
+
+    // Broadcast keywords — address all agents at once
+    const broadcastPatterns = [
+      /\b@?team\b/,
+      /\beveryone\b/,
+      /\ball\s+agents?\b/,
+      /\bthe\s+team\b/,
+    ];
+    if (broadcastPatterns.some(p => p.test(content))) {
+      return true;
+    }
+
+    // Individual agent name or slug at word boundaries
     const name = this.config.profile.name.toLowerCase();
     const slug = this.config.slug.toLowerCase();
-
-    // Check for name or slug at word boundaries
-    // e.g., "sasha, what do you think?" or "@sasha-the-cmo analyze this"
     const namePattern = new RegExp(`\\b${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
     const slugPattern = new RegExp(`\\b${slug.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
 
