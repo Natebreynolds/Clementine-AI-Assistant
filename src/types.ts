@@ -93,11 +93,12 @@ export type NotificationSender = (text: string) => Promise<void>;
 // ── Agent Profiles ───────────────────────────────────────────────────
 
 export interface TeamAgentConfig {
-  channelName: string;             // Discord channel name (e.g., "research") — auto-discovered by bot
+  channelName: string | string[];  // Discord channel name(s) (e.g., "research" or ["research", "general"])
   channels: string[];              // Resolved runtime channel keys (populated by bot on connect)
   canMessage: string[];            // Agent slugs this agent can directly message
   allowedTools?: string[];         // Tool whitelist (omit = all tools)
   teamChat?: boolean;              // If true, this is a shared team channel — multiple agents respond when @mentioned
+  respondToAll?: boolean;          // If true, agent responds to all messages (not just @mentions) even in team chat
 }
 
 export interface TeamMessage {
@@ -124,6 +125,9 @@ export interface AgentProfile {
   agentDir?: string;               // Path to agent's directory (agents/{slug}/)
   discordToken?: string;           // Dedicated Discord bot token (gives agent its own bot presence)
   discordChannelId?: string;       // Channel ID for the agent bot to listen in (auto-discovered from channelName if omitted)
+  slackBotToken?: string;          // Slack bot token (xoxb-...) for agent's own Slack presence
+  slackAppToken?: string;          // Slack app token (xapp-...) required for Socket Mode
+  slackChannelId?: string;         // Explicit Slack channel ID override
 }
 
 // ── Heartbeat ────────────────────────────────────────────────────────

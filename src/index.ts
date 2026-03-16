@@ -497,7 +497,27 @@ async function asyncMain(): Promise<void> {
 
   if (config.CHANNEL_SLACK) {
     const { startSlack } = await import('./channels/slack.js');
-    channelTasks.push(startSlack(gateway, dispatcher));
+
+    let slackBotManager: import('./channels/slack-bot-manager.js').SlackBotManager | undefined;
+    try {
+      const { SlackBotManager } = await import('./channels/slack-bot-manager.js');
+      slackBotManager = new SlackBotManager({
+        gateway,
+        ownerId: config.SLACK_OWNER_USER_ID,
+      });
+      logger.info('SlackBotManager: starting all Slack agent bots...');
+      const slackBotChannels = await slackBotManager.startAll();
+      if (slackBotChannels.length > 0) {
+        logger.info({ channels: slackBotChannels }, `Started ${slackBotChannels.length} Slack agent bot(s)`);
+      }
+    } catch (err) {
+      logger.error({ err }, 'SlackBotManager startup failed — continuing without Slack agent bots');
+    }
+
+    if (slackBotManager) gateway.setSlackBotManager(slackBotManager);
+
+    channelTasks.push(startSlack(gateway, dispatcher, slackBotManager));
+    if (slackBotManager) slackBotManager.startPolling(60_000);
     activeChannels.push('Slack');
   }
 

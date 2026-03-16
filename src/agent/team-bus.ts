@@ -32,17 +32,24 @@ export class TeamBus {
   private cooldowns = new Map<string, number>();
   private statusChangeListeners: Array<() => void> = [];
   private botManager?: import('../channels/discord-bot-manager.js').BotManager;
+  private slackBotManager?: import('../channels/slack-bot-manager.js').SlackBotManager;
 
   constructor(
     gateway: Gateway,
     teamRouter: TeamRouter,
-    options: { commsChannelId?: string; logFile: string; botManager?: import('../channels/discord-bot-manager.js').BotManager },
+    options: {
+      commsChannelId?: string;
+      logFile: string;
+      botManager?: import('../channels/discord-bot-manager.js').BotManager;
+      slackBotManager?: import('../channels/slack-bot-manager.js').SlackBotManager;
+    },
   ) {
     this.gateway = gateway;
     this.teamRouter = teamRouter;
     this.commsChannelId = options.commsChannelId || undefined;
     this.logFile = options.logFile;
     this.botManager = options.botManager;
+    this.slackBotManager = options.slackBotManager;
 
     // Ensure log directory exists
     const dir = path.dirname(this.logFile);
@@ -56,15 +63,29 @@ export class TeamBus {
     this.botManager = botManager;
   }
 
+  /** Update the SlackBotManager reference (called if set after construction). */
+  setSlackBotManager(slackBotManager: import('../channels/slack-bot-manager.js').SlackBotManager): void {
+    this.slackBotManager = slackBotManager;
+  }
+
   /**
-   * Resolve a session key for the target agent via BotManager.
+   * Resolve a session key for the target agent via BotManager or SlackBotManager.
    */
   private resolveSessionKey(toSlug: string): string | null {
+    // Try Discord first
     if (this.botManager) {
       const channelId = this.botManager.getChannelForAgent(toSlug);
       if (channelId) {
         const ownerId = this.botManager.getOwnerId();
         return `discord:channel:${channelId}:${ownerId}`;
+      }
+    }
+    // Try Slack
+    if (this.slackBotManager) {
+      const channelId = this.slackBotManager.getChannelForAgent(toSlug);
+      if (channelId) {
+        const ownerId = this.slackBotManager.getOwnerId();
+        return `slack:channel:${channelId}:${toSlug}:${ownerId}`;
       }
     }
     return null;
@@ -75,13 +96,18 @@ export class TeamBus {
    * Returns null for primary/owner sessions (no agent slug).
    */
   private deriveSlugFromSession(sessionKey: string): string | null {
-    if (!this.botManager) return null;
-    // Reverse-lookup: which agent owns the channel in this session key?
-    // Session keys look like "discord:channel:{channelId}:{ownerId}"
     const parts = sessionKey.split(':');
-    if (parts[0] === 'discord' && parts[1] === 'channel' && parts[2]) {
+
+    // Discord: "discord:channel:{channelId}:{ownerId}"
+    if (this.botManager && parts[0] === 'discord' && parts[1] === 'channel' && parts[2]) {
       return this.botManager.getAgentForChannel(parts[2]) ?? null;
     }
+
+    // Slack: "slack:channel:{channelId}:{slug}:{ownerId}" or "slack:channel:{channelId}:{ownerId}"
+    if (this.slackBotManager && parts[0] === 'slack' && parts[1] === 'channel' && parts[2]) {
+      return this.slackBotManager.getAgentForChannel(parts[2]) ?? null;
+    }
+
     return null;
   }
 
@@ -157,12 +183,21 @@ export class TeamBus {
     // Deliver to target agent — prefer active bot delivery, fall back to session injection
     const senderName = fromProfile?.name ?? fromSlug;
 
+    // Try Discord bot delivery first
     if (this.botManager?.hasBot(toSlug)) {
-      // Active delivery: post in bot's channel and trigger the agent to respond
       const botResponse = await this.botManager.deliverTeamMessage(toSlug, senderName, fromSlug, content);
       if (botResponse !== null) {
         message.delivered = true;
         message.response = botResponse;
+      }
+    }
+
+    // Try Slack bot delivery
+    if (!message.delivered && this.slackBotManager?.hasBot(toSlug)) {
+      const slackResponse = await this.slackBotManager.deliverTeamMessage(toSlug, senderName, fromSlug, content);
+      if (slackResponse !== null) {
+        message.delivered = true;
+        message.response = slackResponse;
       }
     }
 
@@ -277,12 +312,23 @@ export class TeamBus {
         try {
           const msg = JSON.parse(line) as TeamMessage;
           if (!msg.delivered) {
-            // Try active bot delivery first, then passive injection
+            // Try Discord bot delivery first
             if (this.botManager?.hasBot(msg.toAgent)) {
               const botDelivered = await this.botManager.deliverTeamMessage(
                 msg.toAgent, msg.fromAgent, msg.fromAgent, msg.content,
               );
               if (botDelivered) {
+                msg.delivered = true;
+                delivered++;
+              }
+            }
+
+            // Try Slack bot delivery
+            if (!msg.delivered && this.slackBotManager?.hasBot(msg.toAgent)) {
+              const slackDelivered = await this.slackBotManager.deliverTeamMessage(
+                msg.toAgent, msg.fromAgent, msg.fromAgent, msg.content,
+              );
+              if (slackDelivered) {
                 msg.delivered = true;
                 delivered++;
               }

@@ -1992,6 +1992,14 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
           botStatuses = JSON.parse(readFileSync(statusPath, 'utf-8'));
         }
       } catch { /* ignore */ }
+      // Read Slack bot status from disk (written by SlackBotManager in daemon)
+      let slackBotStatuses: Record<string, { status: string; botUserId?: string; error?: string }> = {};
+      try {
+        const slackStatusPath = path.join(BASE_DIR, '.slack-bot-status.json');
+        if (existsSync(slackStatusPath)) {
+          slackBotStatuses = JSON.parse(readFileSync(slackStatusPath, 'utf-8'));
+        }
+      } catch { /* ignore */ }
       res.json(all.map(a => {
         // Derive invite URL from token (first segment is base64-encoded bot user ID)
         let botInviteUrl: string | null = null;
@@ -2012,6 +2020,7 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
           model: a.model ?? null,
           channelName: a.team?.channelName ?? null,
           teamChat: a.team?.teamChat ?? false,
+          respondToAll: a.team?.respondToAll ?? false,
           canMessage: a.team?.canMessage ?? [],
           allowedTools: a.team?.allowedTools ?? null,
           project: a.project ?? null,
@@ -2024,6 +2033,10 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
           botTag: botStatuses[a.slug]?.botTag ?? null,
           botAvatarUrl: botStatuses[a.slug]?.avatarUrl ?? null,
           botInviteUrl,
+          hasSlackToken: Boolean(a.slackBotToken && a.slackAppToken),
+          slackChannelId: a.slackChannelId ?? null,
+          slackBotStatus: slackBotStatuses[a.slug]?.status ?? null,
+          slackBotUserId: slackBotStatuses[a.slug]?.botUserId ?? null,
         };
       }));
     } catch (err) {
@@ -2035,7 +2048,7 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
     try {
       const gw = await getGateway();
       const mgr = gw.getAgentManager();
-      const { name, description, personality, tier, model, channelName, teamChat, canMessage, allowedTools, project, discordToken, discordChannelId, avatar } = req.body;
+      const { name, description, personality, tier, model, channelName, teamChat, respondToAll, canMessage, allowedTools, project, discordToken, discordChannelId, avatar, slackBotToken, slackAppToken, slackChannelId } = req.body;
       if (!name || !description) {
         res.status(400).json({ error: 'name and description are required' });
         return;
@@ -2046,12 +2059,16 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
         model: model || undefined,
         channelName: channelName || undefined,
         teamChat: teamChat ?? undefined,
+        respondToAll: respondToAll ?? undefined,
         canMessage: canMessage || undefined,
         allowedTools: allowedTools || undefined,
         project: project || undefined,
         discordToken: discordToken || undefined,
         discordChannelId: discordChannelId || undefined,
         avatar: avatar || undefined,
+        slackBotToken: slackBotToken || undefined,
+        slackAppToken: slackAppToken || undefined,
+        slackChannelId: slackChannelId || undefined,
       });
       res.json({ ok: true, agent: { slug: agent.slug, name: agent.name } });
     } catch (err) {
@@ -2136,6 +2153,56 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
           }
         } catch { /* skip guild */ }
       }
+
+      res.json({ ok: true, channels: allChannels });
+    } catch (err) {
+      res.json({ ok: false, error: String(err), channels: [] });
+    }
+  });
+
+  // ── Slack channel discovery ────────────────────────────────────────
+
+  /** Fetch all channels the main Slack bot can see, via conversations.list. */
+  app.get('/api/slack/channels', async (_req, res) => {
+    try {
+      const env = parseEnvFile();
+      let botToken = env['SLACK_BOT_TOKEN'] ?? '';
+      if (!botToken) {
+        const name = getAssistantName().toLowerCase();
+        try {
+          botToken = execSync(
+            `security find-generic-password -s "${name}" -a "SLACK_BOT_TOKEN" -w`,
+            { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] },
+          ).trim();
+        } catch { /* no token */ }
+      }
+      if (!botToken) {
+        res.json({ ok: false, error: 'No Slack bot token configured', channels: [] });
+        return;
+      }
+
+      // Use fetch to call Slack's conversations.list API (paginate)
+      const allChannels: Array<{ id: string; name: string; is_member: boolean }> = [];
+      let cursor = '';
+      do {
+        const url = `https://slack.com/api/conversations.list?types=public_channel,private_channel&exclude_archived=true&limit=200${cursor ? '&cursor=' + cursor : ''}`;
+        const resp = await fetch(url, {
+          headers: { Authorization: `Bearer ${botToken}` },
+        });
+        const data = await resp.json() as any;
+        if (!data.ok) {
+          res.json({ ok: false, error: data.error || 'Slack API error', channels: [] });
+          return;
+        }
+        for (const ch of data.channels ?? []) {
+          allChannels.push({
+            id: ch.id,
+            name: ch.name,
+            is_member: ch.is_member ?? false,
+          });
+        }
+        cursor = data.response_metadata?.next_cursor || '';
+      } while (cursor);
 
       res.json({ ok: true, channels: allChannels });
     } catch (err) {
@@ -4151,12 +4218,16 @@ function getDashboardHTML(token: string): string {
           <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px">
             <div>
               <label style="display:block;color:var(--text-muted);font-size:12px;margin-bottom:4px">Channel</label>
-              <select id="agent-channel" style="width:100%;padding:8px;background:var(--bg-input);border:1px solid var(--border);border-radius:6px;color:var(--text-primary)">
-                <option value="">None (DM only)</option>
-              </select>
+              <div id="agent-channel-list" style="max-height:140px;overflow-y:auto;border:1px solid var(--border);border-radius:6px;padding:6px 8px;background:var(--bg-input)">
+                <div style="color:var(--text-muted);font-size:12px">Loading channels...</div>
+              </div>
               <label style="display:flex;align-items:center;gap:6px;margin-top:6px;color:var(--text-muted);font-size:12px;cursor:pointer">
                 <input type="checkbox" id="agent-team-chat" style="accent-color:var(--blue)">
                 Shared team chat <span style="opacity:0.6">(responds when @mentioned)</span>
+              </label>
+              <label style="display:flex;align-items:center;gap:6px;margin-top:4px;color:var(--text-muted);font-size:12px;cursor:pointer">
+                <input type="checkbox" id="agent-respond-all" style="accent-color:var(--blue)">
+                Respond to all messages <span style="opacity:0.6">(not just @mentions)</span>
               </label>
             </div>
             <div>
@@ -4195,20 +4266,52 @@ function getDashboardHTML(token: string): string {
             </div>
           </div>
           <div style="margin-bottom:16px">
-            <label style="display:block;color:var(--text-muted);font-size:12px;margin-bottom:4px">Discord Bot Token <span style="opacity:0.6">(gives agent its own bot presence)</span></label>
-            <input id="agent-discord-token" type="password" autocomplete="off" style="width:100%;padding:8px;background:var(--bg-input);border:1px solid var(--border);border-radius:6px;color:var(--text-primary)" placeholder="Paste Discord bot token" oninput="onTokenInput(this.value)">
-            <div style="margin-top:6px">
-              <label style="display:block;color:var(--text-muted);font-size:12px;margin-bottom:4px">Channel ID <span style="opacity:0.6">(right-click channel &gt; Copy Channel ID &mdash; auto-discovers from channel name if blank)</span></label>
-              <input id="agent-discord-channel-id" style="width:100%;padding:8px;background:var(--bg-input);border:1px solid var(--border);border-radius:6px;color:var(--text-primary)" placeholder="e.g. 1478311884212932740">
-            </div>
-            <div id="agent-token-hint" style="display:none;font-size:11px;color:var(--green);margin-top:4px">(token configured &mdash; leave blank to keep, enter new to replace)</div>
-            <div id="agent-token-setup" style="display:none;margin-top:8px;padding:10px;background:rgba(59,130,246,0.08);border:1px solid rgba(59,130,246,0.25);border-radius:8px;font-size:12px">
-              <div style="font-weight:600;color:var(--blue);margin-bottom:6px">Bot Setup Checklist</div>
-              <div style="margin-bottom:4px">1. <a id="token-invite-link" href="#" target="_blank" style="color:var(--blue)">Invite bot to your server</a></div>
-              <div style="margin-bottom:4px;color:var(--text-muted)">2. Enable <strong>Message Content Intent</strong> in <a href="https://discord.com/developers/applications" target="_blank" style="color:var(--blue)">Developer Portal</a> &gt; Bot &gt; Privileged Intents</div>
-              <div style="margin-bottom:4px;color:var(--text-muted)">3. Save this form, then restart the daemon</div>
-              <div style="margin-top:6px;font-size:11px;color:var(--text-muted)">App ID: <code id="token-app-id"></code></div>
-            </div>
+            <div style="font-weight:600;font-size:13px;color:var(--text-primary);margin-bottom:8px;border-top:1px solid var(--border);padding-top:12px">Platform Connections</div>
+
+            <details id="discord-section" style="margin-bottom:10px">
+              <summary style="cursor:pointer;color:var(--text-muted);font-size:12px;font-weight:600;margin-bottom:6px">Discord Bot <span id="discord-status-dot" style="display:none;width:8px;height:8px;border-radius:50%;display:inline-block;margin-left:4px"></span></summary>
+              <div style="padding-left:8px">
+                <label style="display:block;color:var(--text-muted);font-size:12px;margin-bottom:4px">Bot Token <span style="opacity:0.6">(gives agent its own Discord presence)</span></label>
+                <input id="agent-discord-token" type="password" autocomplete="off" style="width:100%;padding:8px;background:var(--bg-input);border:1px solid var(--border);border-radius:6px;color:var(--text-primary)" placeholder="Paste Discord bot token" oninput="onTokenInput(this.value)">
+                <div style="margin-top:6px">
+                  <label style="display:block;color:var(--text-muted);font-size:12px;margin-bottom:4px">Channel ID <span style="opacity:0.6">(right-click channel &gt; Copy Channel ID)</span></label>
+                  <input id="agent-discord-channel-id" style="width:100%;padding:8px;background:var(--bg-input);border:1px solid var(--border);border-radius:6px;color:var(--text-primary)" placeholder="e.g. 1478311884212932740">
+                </div>
+                <div id="agent-token-hint" style="display:none;font-size:11px;color:var(--green);margin-top:4px">(token configured &mdash; leave blank to keep, enter new to replace)</div>
+                <div id="agent-token-setup" style="display:none;margin-top:8px;padding:10px;background:rgba(59,130,246,0.08);border:1px solid rgba(59,130,246,0.25);border-radius:8px;font-size:12px">
+                  <div style="font-weight:600;color:var(--blue);margin-bottom:6px">Bot Setup Checklist</div>
+                  <div style="margin-bottom:4px">1. <a id="token-invite-link" href="#" target="_blank" style="color:var(--blue)">Invite bot to your server</a></div>
+                  <div style="margin-bottom:4px;color:var(--text-muted)">2. Enable <strong>Message Content Intent</strong> in <a href="https://discord.com/developers/applications" target="_blank" style="color:var(--blue)">Developer Portal</a> &gt; Bot &gt; Privileged Intents</div>
+                  <div style="margin-bottom:4px;color:var(--text-muted)">3. Save this form, then restart the daemon</div>
+                  <div style="margin-top:6px;font-size:11px;color:var(--text-muted)">App ID: <code id="token-app-id"></code></div>
+                </div>
+              </div>
+            </details>
+
+            <details id="slack-section" style="margin-bottom:10px">
+              <summary style="cursor:pointer;color:var(--text-muted);font-size:12px;font-weight:600;margin-bottom:6px">Slack Bot <span id="slack-status-dot" style="display:none;width:8px;height:8px;border-radius:50%;display:inline-block;margin-left:4px"></span></summary>
+              <div style="padding-left:8px">
+                <label style="display:block;color:var(--text-muted);font-size:12px;margin-bottom:4px">Bot Token <span style="opacity:0.6">(xoxb-...)</span></label>
+                <input id="agent-slack-bot-token" type="password" autocomplete="off" style="width:100%;padding:8px;background:var(--bg-input);border:1px solid var(--border);border-radius:6px;color:var(--text-primary)" placeholder="xoxb-...">
+                <div style="margin-top:6px">
+                  <label style="display:block;color:var(--text-muted);font-size:12px;margin-bottom:4px">App Token <span style="opacity:0.6">(xapp-... for Socket Mode)</span></label>
+                  <input id="agent-slack-app-token" type="password" autocomplete="off" style="width:100%;padding:8px;background:var(--bg-input);border:1px solid var(--border);border-radius:6px;color:var(--text-primary)" placeholder="xapp-...">
+                </div>
+                <div style="margin-top:6px">
+                  <label style="display:block;color:var(--text-muted);font-size:12px;margin-bottom:4px">Channel ID <span style="opacity:0.6">(optional override)</span></label>
+                  <input id="agent-slack-channel-id" style="width:100%;padding:8px;background:var(--bg-input);border:1px solid var(--border);border-radius:6px;color:var(--text-primary)" placeholder="e.g. C0123456789">
+                </div>
+                <div id="agent-slack-token-hint" style="display:none;font-size:11px;color:var(--green);margin-top:4px">(tokens configured &mdash; leave blank to keep, enter new to replace)</div>
+                <div id="agent-slack-setup" style="display:none;margin-top:8px;padding:10px;background:rgba(59,130,246,0.08);border:1px solid rgba(59,130,246,0.25);border-radius:8px;font-size:12px">
+                  <div style="font-weight:600;color:var(--blue);margin-bottom:6px">Slack Bot Setup</div>
+                  <div style="margin-bottom:4px;color:var(--text-muted)">1. Create app at <a href="https://api.slack.com/apps" target="_blank" style="color:var(--blue)">api.slack.com</a></div>
+                  <div style="margin-bottom:4px;color:var(--text-muted)">2. Enable <strong>Socket Mode</strong> &rarr; generate App Token (xapp-...)</div>
+                  <div style="margin-bottom:4px;color:var(--text-muted)">3. Add bot scopes: <code>chat:write</code>, <code>channels:history</code>, <code>channels:read</code>, <code>im:history</code>, <code>im:read</code></div>
+                  <div style="margin-bottom:4px;color:var(--text-muted)">4. Install to workspace &rarr; copy Bot Token (xoxb-...)</div>
+                  <div style="color:var(--text-muted)">5. Invite bot to desired channel(s)</div>
+                </div>
+              </div>
+            </details>
           </div>
           <div style="display:flex;gap:8px;justify-content:flex-end">
             <button type="button" class="btn" onclick="hideAgentModal()">Cancel</button>
@@ -6264,7 +6367,7 @@ async function refreshTeam() {
     // Summary cards
     var summaryEl = document.getElementById('team-summary-cards');
     if (summaryEl) {
-      var onlineCount = allAgents.filter(function(a) { return a.botStatus === 'online'; }).length;
+      var onlineCount = allAgents.filter(function(a) { return a.botStatus === 'online' || a.slackBotStatus === 'online'; }).length;
       summaryEl.innerHTML =
         '<div class="stat-card"><div class="stat-value">' + agents.length + '</div><div class="stat-label">Agents</div></div>' +
         '<div class="stat-card"><div class="stat-value">' + onlineCount + '/' + agents.length + '</div><div class="stat-label">Online</div></div>' +
@@ -6280,14 +6383,19 @@ async function refreshTeam() {
           '<div class="desk-hire-inner"><div class="hire-icon">+</div><div class="hire-label">Hire a New Employee</div></div></div>';
       } else {
         var cards = allAgents.map(function(a) {
-          // Determine status class
+          // Determine status class (online if either platform is online)
           var statusClass = 'status-offline';
           var statusLabel = 'Offline';
-          if (a.botStatus === 'online') { statusClass = 'status-online'; statusLabel = 'Online'; }
-          else if (a.botStatus === 'connecting') { statusClass = 'status-connecting'; statusLabel = 'Connecting'; }
-          else if (a.botStatus === 'error') { statusClass = 'status-error'; statusLabel = 'Error'; }
+          var anyOnline = a.botStatus === 'online' || a.slackBotStatus === 'online';
+          var anyConnecting = a.botStatus === 'connecting' || a.slackBotStatus === 'connecting';
+          var anyError = a.botStatus === 'error' || a.slackBotStatus === 'error';
+          if (anyOnline) { statusClass = 'status-online'; statusLabel = 'Online'; }
+          else if (anyConnecting) { statusClass = 'status-connecting'; statusLabel = 'Connecting'; }
+          else if (anyError) { statusClass = 'status-error'; statusLabel = 'Error'; }
 
-          var channelDisplay = a.channelName ? '#' + a.channelName : 'no desk';
+          var channelDisplay = a.channelName
+            ? (Array.isArray(a.channelName) ? a.channelName.map(function(c) { return '#' + c; }).join(', ') : '#' + a.channelName)
+            : 'no desk';
 
           // Avatar: use manual URL, then Discord bot avatar, then initial
           var avatarSrc = a.avatar || a.botAvatarUrl;
@@ -6300,6 +6408,16 @@ async function refreshTeam() {
           if (a.model) badges.push('<span class="badge">' + a.model + '</span>');
           if (a.project) badges.push('<span class="badge" style="background:var(--purple);color:#fff">' + a.project + '</span>');
           if (a.allowedTools) badges.push('<span class="badge" style="background:var(--yellow);color:#000">' + a.allowedTools.length + ' tools</span>');
+
+          // Platform indicators
+          if (a.hasDiscordToken) {
+            var discordColor = a.botStatus === 'online' ? 'var(--green)' : 'var(--text-muted)';
+            badges.push('<span class="badge" style="background:rgba(88,101,242,0.15);color:' + discordColor + ';font-size:10px">Discord</span>');
+          }
+          if (a.hasSlackToken) {
+            var slackColor = a.slackBotStatus === 'online' ? 'var(--green)' : 'var(--text-muted)';
+            badges.push('<span class="badge" style="background:rgba(74,21,75,0.15);color:' + slackColor + ';font-size:10px">Slack</span>');
+          }
 
           // Actions
           var actions = a.agentDir
@@ -6452,8 +6570,11 @@ function getSelectedTools() {
 }
 
 var _discordChannelsCache = null;
-async function loadDiscordChannels(selectedValue) {
-  var sel = document.getElementById('agent-channel');
+async function loadDiscordChannels(selectedValues) {
+  // Normalize to array
+  if (!selectedValues) selectedValues = [];
+  if (typeof selectedValues === 'string') selectedValues = selectedValues ? [selectedValues] : [];
+  var container = document.getElementById('agent-channel-list');
   if (!_discordChannelsCache) {
     try {
       var r = await apiFetch('/api/discord/channels');
@@ -6462,23 +6583,28 @@ async function loadDiscordChannels(selectedValue) {
       else _discordChannelsCache = [];
     } catch { _discordChannelsCache = []; }
   }
-  sel.innerHTML = '<option value="">None (DM only)</option>';
-  (_discordChannelsCache || []).forEach(function(ch) {
-    var opt = document.createElement('option');
-    opt.value = ch.name;
-    opt.textContent = '#' + ch.name + (ch.guildName ? ' (' + ch.guildName + ')' : '');
-    opt.dataset.channelId = ch.id;
-    if (ch.name === selectedValue) opt.selected = true;
-    sel.appendChild(opt);
-  });
-  // If the saved value doesn't match any known channel, add it as a custom option
-  if (selectedValue && !sel.value) {
-    var opt = document.createElement('option');
-    opt.value = selectedValue;
-    opt.textContent = '#' + selectedValue + ' (custom)';
-    opt.selected = true;
-    sel.appendChild(opt);
+  var html = '';
+  var channels = _discordChannelsCache || [];
+  if (channels.length === 0) {
+    html = '<div style="color:var(--text-muted);font-size:12px">No channels found</div>';
   }
+  channels.forEach(function(ch) {
+    var checked = selectedValues.includes(ch.name) ? ' checked' : '';
+    html += '<label style="display:flex;align-items:center;gap:6px;padding:3px 0;color:var(--text-primary);font-size:13px;cursor:pointer">'
+      + '<input type="checkbox" class="agent-channel-cb" value="' + esc(ch.name) + '" data-channel-id="' + esc(ch.id) + '"' + checked + ' style="accent-color:var(--blue)">'
+      + '#' + esc(ch.name) + (ch.guildName ? ' <span style="color:var(--text-muted);font-size:11px">(' + esc(ch.guildName) + ')</span>' : '')
+      + '</label>';
+  });
+  // Add custom values that don't match any known channel
+  selectedValues.forEach(function(v) {
+    if (v && !channels.some(function(ch) { return ch.name === v; })) {
+      html += '<label style="display:flex;align-items:center;gap:6px;padding:3px 0;color:var(--text-primary);font-size:13px;cursor:pointer">'
+        + '<input type="checkbox" class="agent-channel-cb" value="' + esc(v) + '" checked style="accent-color:var(--blue)">'
+        + '#' + esc(v) + ' <span style="color:var(--text-muted);font-size:11px">(custom)</span>'
+        + '</label>';
+    }
+  });
+  container.innerHTML = html;
 }
 
 function showAgentCreateModal() {
@@ -6489,9 +6615,11 @@ function showAgentCreateModal() {
   document.getElementById('agent-form').reset();
   document.getElementById('agent-token-hint').style.display = 'none';
   document.getElementById('agent-token-setup').style.display = 'none';
+  document.getElementById('agent-slack-token-hint').style.display = 'none';
+  document.getElementById('agent-slack-setup').style.display = 'none';
   loadAgentProjectOptions();
   loadAgentToolOptions();
-  loadDiscordChannels('');
+  loadDiscordChannels([]);
 }
 
 async function editAgent(slug) {
@@ -6508,8 +6636,9 @@ async function editAgent(slug) {
     document.getElementById('agent-name').value = a.name || '';
     document.getElementById('agent-description').value = a.description || '';
     document.getElementById('agent-avatar-url').value = a.avatar || '';
-    loadDiscordChannels(a.channelName || '');
+    loadDiscordChannels(a.channelName || []);
     document.getElementById('agent-team-chat').checked = a.teamChat || false;
+    document.getElementById('agent-respond-all').checked = a.respondToAll || false;
     document.getElementById('agent-model').value = a.model || '';
     document.getElementById('agent-tier').value = String(a.tier || 2);
     document.getElementById('agent-canmessage').value = (a.canMessage || []).join(', ');
@@ -6521,7 +6650,7 @@ async function editAgent(slug) {
     var tokenHint = document.getElementById('agent-token-hint');
     if (a.hasDiscordToken) {
       tokenHint.style.display = 'block';
-      // Show invite URL if available (already configured)
+      document.getElementById('discord-section').open = true;
       if (a.botInviteUrl) {
         var setupEl = document.getElementById('agent-token-setup');
         var appIdMatch = a.botInviteUrl.match(/client_id=(\d+)/);
@@ -6533,6 +6662,19 @@ async function editAgent(slug) {
       }
     } else {
       tokenHint.style.display = 'none';
+    }
+
+    // Slack fields
+    document.getElementById('agent-slack-bot-token').value = '';
+    document.getElementById('agent-slack-app-token').value = '';
+    document.getElementById('agent-slack-channel-id').value = a.slackChannelId || '';
+    document.getElementById('agent-slack-setup').style.display = 'none';
+    var slackTokenHint = document.getElementById('agent-slack-token-hint');
+    if (a.hasSlackToken) {
+      slackTokenHint.style.display = 'block';
+      document.getElementById('slack-section').open = true;
+    } else {
+      slackTokenHint.style.display = 'none';
     }
   } catch(e) { toast(String(e), 'error'); }
 }
@@ -6576,14 +6718,17 @@ async function submitAgentForm(e) {
   var editSlug = document.getElementById('agent-edit-slug').value;
   var isEdit = Boolean(editSlug);
 
-  var channelName = document.getElementById('agent-channel').value.trim() || undefined;
+  var selectedChannels = Array.from(document.querySelectorAll('.agent-channel-cb:checked')).map(function(cb) { return cb.value; });
+  var channelName = selectedChannels.length === 0 ? undefined : selectedChannels.length === 1 ? selectedChannels[0] : selectedChannels;
   var teamChat = document.getElementById('agent-team-chat').checked;
+  var respondToAll = document.getElementById('agent-respond-all').checked;
   var payload = {
     name: document.getElementById('agent-name').value.trim(),
     description: document.getElementById('agent-description').value.trim(),
     personality: document.getElementById('agent-personality').value.trim() || undefined,
     channelName: channelName,
     teamChat: channelName ? teamChat : undefined,
+    respondToAll: channelName ? respondToAll : undefined,
     model: document.getElementById('agent-model').value || undefined,
     project: document.getElementById('agent-project').value || undefined,
     tier: parseInt(document.getElementById('agent-tier').value) || 2,
@@ -6601,6 +6746,15 @@ async function submitAgentForm(e) {
 
   var discordChannelId = document.getElementById('agent-discord-channel-id').value.trim();
   if (discordChannelId) payload.discordChannelId = discordChannelId;
+
+  var slackBotToken = document.getElementById('agent-slack-bot-token').value.trim();
+  if (slackBotToken) payload.slackBotToken = slackBotToken;
+
+  var slackAppToken = document.getElementById('agent-slack-app-token').value.trim();
+  if (slackAppToken) payload.slackAppToken = slackAppToken;
+
+  var slackChannelId = document.getElementById('agent-slack-channel-id').value.trim();
+  if (slackChannelId) payload.slackChannelId = slackChannelId;
 
   try {
     var url = isEdit ? '/api/agents/' + editSlug : '/api/agents';

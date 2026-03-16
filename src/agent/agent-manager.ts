@@ -56,13 +56,17 @@ export interface AgentCreateConfig {
   tier?: number;
   model?: string;
   avatar?: string;
-  channelName?: string;
+  channelName?: string | string[];  // Single channel name or array of channel names
   teamChat?: boolean;              // If true, shared team channel — agents respond when @mentioned
+  respondToAll?: boolean;          // If true, agent responds to all messages even in team chat
   canMessage?: string[];
   allowedTools?: string[];
   project?: string;
   discordToken?: string;           // Dedicated Discord bot token
   discordChannelId?: string;       // Channel ID for bot to listen in
+  slackBotToken?: string;          // Slack bot token (xoxb-...)
+  slackAppToken?: string;          // Slack app token (xapp-...)
+  slackChannelId?: string;         // Explicit Slack channel ID override
 }
 
 export class AgentManager {
@@ -128,7 +132,9 @@ export class AgentManager {
 
     // Parse team-specific frontmatter
     let team: TeamAgentConfig | undefined;
-    const channelName = meta.channelName ? String(meta.channelName) : undefined;
+    const channelName: string | string[] | undefined = Array.isArray(meta.channelName)
+      ? meta.channelName.map(String).filter(Boolean)
+      : meta.channelName ? String(meta.channelName) : undefined;
     const canMessage = Array.isArray(meta.canMessage)
       ? meta.canMessage.map(String).filter(Boolean)
       : [];
@@ -136,9 +142,10 @@ export class AgentManager {
       ? meta.allowedTools.map(String).filter(Boolean)
       : undefined;
 
-    if (channelName) {
+    if (channelName && (typeof channelName === 'string' || channelName.length > 0)) {
       const teamChat = meta.teamChat === true || meta.teamChat === 'true';
-      team = { channelName, channels: [], canMessage, allowedTools, teamChat };
+      const respondToAll = meta.respondToAll === true || meta.respondToAll === 'true';
+      team = { channelName, channels: [], canMessage, allowedTools, teamChat, respondToAll: respondToAll || undefined };
     }
 
     // Resolve Discord token — migrate plaintext to Keychain if needed
@@ -159,6 +166,39 @@ export class AgentManager {
       }
     }
 
+    // Resolve Slack tokens — same keychain migration pattern as Discord
+    let slackBotToken: string | undefined;
+    if (meta.slackBotToken) {
+      const rawSlack = String(meta.slackBotToken);
+      if (rawSlack === 'keychain') {
+        slackBotToken = getAgentSecret(slug, 'SLACK_BOT_TOKEN') || undefined;
+      } else {
+        slackBotToken = rawSlack;
+        try {
+          storeAgentSecret(slug, 'SLACK_BOT_TOKEN', rawSlack);
+          meta.slackBotToken = 'keychain';
+          const updated = matter.stringify(content, meta);
+          fs.writeFileSync(filePath, updated);
+        } catch { /* migration failed — continue with plaintext */ }
+      }
+    }
+
+    let slackAppToken: string | undefined;
+    if (meta.slackAppToken) {
+      const rawApp = String(meta.slackAppToken);
+      if (rawApp === 'keychain') {
+        slackAppToken = getAgentSecret(slug, 'SLACK_APP_TOKEN') || undefined;
+      } else {
+        slackAppToken = rawApp;
+        try {
+          storeAgentSecret(slug, 'SLACK_APP_TOKEN', rawApp);
+          meta.slackAppToken = 'keychain';
+          const updated = matter.stringify(content, meta);
+          fs.writeFileSync(filePath, updated);
+        } catch { /* migration failed — continue with plaintext */ }
+      }
+    }
+
     return {
       slug,
       name: String(meta.name ?? slug.replace(/-/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase())),
@@ -172,6 +212,9 @@ export class AgentManager {
       agentDir: path.dirname(filePath),
       discordToken,
       discordChannelId: meta.discordChannelId ? String(meta.discordChannelId) : undefined,
+      slackBotToken,
+      slackAppToken,
+      slackChannelId: meta.slackChannelId ? String(meta.slackChannelId) : undefined,
     };
   }
 
@@ -246,6 +289,7 @@ export class AgentManager {
     if (config.avatar) frontmatter.avatar = config.avatar;
     if (config.channelName) frontmatter.channelName = config.channelName;
     if (config.teamChat) frontmatter.teamChat = config.teamChat;
+    if (config.respondToAll) frontmatter.respondToAll = config.respondToAll;
     if (config.canMessage?.length) frontmatter.canMessage = config.canMessage;
     if (config.allowedTools?.length) frontmatter.allowedTools = config.allowedTools;
     if (config.project) frontmatter.project = config.project;
@@ -254,6 +298,15 @@ export class AgentManager {
       frontmatter.discordToken = 'keychain';
     }
     if (config.discordChannelId) frontmatter.discordChannelId = config.discordChannelId;
+    if (config.slackBotToken) {
+      storeAgentSecret(slug, 'SLACK_BOT_TOKEN', config.slackBotToken);
+      frontmatter.slackBotToken = 'keychain';
+    }
+    if (config.slackAppToken) {
+      storeAgentSecret(slug, 'SLACK_APP_TOKEN', config.slackAppToken);
+      frontmatter.slackAppToken = 'keychain';
+    }
+    if (config.slackChannelId) frontmatter.slackChannelId = config.slackChannelId;
 
     const body = config.personality || `You are ${config.name}. ${config.description}`;
     const content = matter.stringify(body, frontmatter);
@@ -284,6 +337,7 @@ export class AgentManager {
     if (changes.avatar !== undefined) meta.avatar = changes.avatar;
     if (changes.channelName !== undefined) meta.channelName = changes.channelName;
     if (changes.teamChat !== undefined) meta.teamChat = changes.teamChat;
+    if (changes.respondToAll !== undefined) meta.respondToAll = changes.respondToAll;
     if (changes.canMessage !== undefined) meta.canMessage = changes.canMessage;
     if (changes.allowedTools !== undefined) meta.allowedTools = changes.allowedTools;
     if (changes.project !== undefined) meta.project = changes.project;
@@ -297,6 +351,25 @@ export class AgentManager {
       }
     }
     if (changes.discordChannelId !== undefined) meta.discordChannelId = changes.discordChannelId || undefined;
+    if (changes.slackBotToken !== undefined) {
+      if (changes.slackBotToken) {
+        storeAgentSecret(slug, 'SLACK_BOT_TOKEN', changes.slackBotToken);
+        meta.slackBotToken = 'keychain';
+      } else {
+        deleteAgentSecret(slug, 'SLACK_BOT_TOKEN');
+        meta.slackBotToken = undefined;
+      }
+    }
+    if (changes.slackAppToken !== undefined) {
+      if (changes.slackAppToken) {
+        storeAgentSecret(slug, 'SLACK_APP_TOKEN', changes.slackAppToken);
+        meta.slackAppToken = 'keychain';
+      } else {
+        deleteAgentSecret(slug, 'SLACK_APP_TOKEN');
+        meta.slackAppToken = undefined;
+      }
+    }
+    if (changes.slackChannelId !== undefined) meta.slackChannelId = changes.slackChannelId || undefined;
 
     const newBody = changes.personality ?? body;
     const updated = matter.stringify(newBody, meta);
@@ -317,6 +390,8 @@ export class AgentManager {
 
     // Clean up Keychain secrets
     deleteAgentSecret(slug, 'DISCORD_TOKEN');
+    deleteAgentSecret(slug, 'SLACK_BOT_TOKEN');
+    deleteAgentSecret(slug, 'SLACK_APP_TOKEN');
 
     // Remove directory recursively
     fs.rmSync(agentDir, { recursive: true, force: true });

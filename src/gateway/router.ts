@@ -37,6 +37,7 @@ export class Gateway {
   private _teamRouter?: TeamRouter;
   private _teamBus?: TeamBus;
   private _botManager?: import('../channels/discord-bot-manager.js').BotManager;
+  private _slackBotManager?: import('../channels/slack-bot-manager.js').SlackBotManager;
 
   constructor(assistant: PersonalAssistant) {
     this.assistant = assistant;
@@ -65,6 +66,7 @@ export class Gateway {
         commsChannelId: router.getCommsChannelId(),
         logFile: TEAM_COMMS_LOG,
         botManager: this._botManager,
+        slackBotManager: this._slackBotManager,
       });
       this._teamBus.loadFromLog();
     }
@@ -77,6 +79,14 @@ export class Gateway {
     // If TeamBus already exists, update its reference
     if (this._teamBus) {
       this._teamBus.setBotManager(botManager);
+    }
+  }
+
+  /** Register the SlackBotManager so TeamBus can resolve Slack agent channels for delivery. */
+  setSlackBotManager(slackBotManager: import('../channels/slack-bot-manager.js').SlackBotManager): void {
+    this._slackBotManager = slackBotManager;
+    if (this._teamBus) {
+      this._teamBus.setSlackBotManager(slackBotManager);
     }
   }
 
