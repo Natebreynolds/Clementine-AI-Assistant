@@ -2011,6 +2011,7 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
           tier: a.tier,
           model: a.model ?? null,
           channelName: a.team?.channelName ?? null,
+          teamChat: a.team?.teamChat ?? false,
           canMessage: a.team?.canMessage ?? [],
           allowedTools: a.team?.allowedTools ?? null,
           project: a.project ?? null,
@@ -2034,7 +2035,7 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
     try {
       const gw = await getGateway();
       const mgr = gw.getAgentManager();
-      const { name, description, personality, tier, model, channelName, canMessage, allowedTools, project, discordToken, discordChannelId, avatar } = req.body;
+      const { name, description, personality, tier, model, channelName, teamChat, canMessage, allowedTools, project, discordToken, discordChannelId, avatar } = req.body;
       if (!name || !description) {
         res.status(400).json({ error: 'name and description are required' });
         return;
@@ -2044,6 +2045,7 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
         tier: tier ?? 2,
         model: model || undefined,
         channelName: channelName || undefined,
+        teamChat: teamChat ?? undefined,
         canMessage: canMessage || undefined,
         allowedTools: allowedTools || undefined,
         project: project || undefined,
@@ -4087,8 +4089,12 @@ function getDashboardHTML(token: string): string {
           </div>
           <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px">
             <div>
-              <label style="display:block;color:var(--text-muted);font-size:12px;margin-bottom:4px">Office / Desk Location</label>
-              <input id="agent-channel" style="width:100%;padding:8px;background:var(--bg-input);border:1px solid var(--border);border-radius:6px;color:var(--text-primary)" placeholder="research">
+              <label style="display:block;color:var(--text-muted);font-size:12px;margin-bottom:4px">Channel</label>
+              <input id="agent-channel" style="width:100%;padding:8px;background:var(--bg-input);border:1px solid var(--border);border-radius:6px;color:var(--text-primary)" placeholder="team">
+              <label style="display:flex;align-items:center;gap:6px;margin-top:6px;color:var(--text-muted);font-size:12px;cursor:pointer">
+                <input type="checkbox" id="agent-team-chat" style="accent-color:var(--blue)">
+                Shared team chat <span style="opacity:0.6">(responds when @mentioned)</span>
+              </label>
             </div>
             <div>
               <label style="display:block;color:var(--text-muted);font-size:12px;margin-bottom:4px">Model</label>
@@ -6409,6 +6415,7 @@ async function editAgent(slug) {
     document.getElementById('agent-description').value = a.description || '';
     document.getElementById('agent-avatar-url').value = a.avatar || '';
     document.getElementById('agent-channel').value = a.channelName || '';
+    document.getElementById('agent-team-chat').checked = a.teamChat || false;
     document.getElementById('agent-model').value = a.model || '';
     document.getElementById('agent-tier').value = String(a.tier || 2);
     document.getElementById('agent-canmessage').value = (a.canMessage || []).join(', ');
@@ -6475,11 +6482,14 @@ async function submitAgentForm(e) {
   var editSlug = document.getElementById('agent-edit-slug').value;
   var isEdit = Boolean(editSlug);
 
+  var channelName = document.getElementById('agent-channel').value.trim() || undefined;
+  var teamChat = document.getElementById('agent-team-chat').checked;
   var payload = {
     name: document.getElementById('agent-name').value.trim(),
     description: document.getElementById('agent-description').value.trim(),
     personality: document.getElementById('agent-personality').value.trim() || undefined,
-    channelName: document.getElementById('agent-channel').value.trim() || undefined,
+    channelName: channelName,
+    teamChat: channelName ? teamChat : undefined,
     model: document.getElementById('agent-model').value || undefined,
     project: document.getElementById('agent-project').value || undefined,
     tier: parseInt(document.getElementById('agent-tier').value) || 2,
