@@ -3206,10 +3206,17 @@ server.tool(
 
     // Try synchronous delivery via daemon HTTP API (returns the agent's response)
     const dashboardPort = env['DASHBOARD_PORT'] ?? '3030';
+    let dashboardToken = '';
+    try {
+      dashboardToken = readFileSync(path.join(BASE_DIR, '.dashboard-token'), 'utf-8').trim();
+    } catch { /* token file not found */ }
     try {
       const res = await fetch(`http://127.0.0.1:${dashboardPort}/api/team/message`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          ...(dashboardToken ? { 'Authorization': `Bearer ${dashboardToken}` } : {}),
+        },
         body: JSON.stringify({ from_agent: callerSlug, to_agent, message, depth: msgDepth }),
         signal: AbortSignal.timeout(120_000), // 2 min timeout for agent processing
       });
@@ -3259,6 +3266,21 @@ server.tool(
   },
 );
 
+// ── Agent CRUD Authorization ──────────────────────────────────────────────
+
+/**
+ * Only the primary agent (CLEMENTINE_TEAM_AGENT unset or 'clementine') can
+ * create, update, or delete agents. Team agents must not modify each other.
+ */
+function assertAgentCrudAllowed(action: string): void {
+  if (ACTIVE_AGENT_SLUG) {
+    throw new Error(
+      `Only the primary agent or owner can ${action}. ` +
+      `Current agent '${ACTIVE_AGENT_SLUG}' is not authorized.`,
+    );
+  }
+}
+
 // ── Agent CRUD Tools ─────────────────────────────────────────────────────
 
 server.tool(
@@ -3277,6 +3299,8 @@ server.tool(
     tier: z.number().optional().describe('Security tier (1 = read-only, 2 = read-write). Default: 2.'),
   },
   async ({ name, description, personality, channel_name, project, tools, model, can_message, tier }) => {
+    assertAgentCrudAllowed('create agents');
+
     const slug = name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
     const agentDir = path.join(AGENTS_DIR, slug);
 
@@ -3288,7 +3312,7 @@ server.tool(
     mkdirSync(agentDir, { recursive: true });
 
     // Build frontmatter
-    const frontmatter: Record<string, unknown> = { name, description, tier: tier ?? 2 };
+    const frontmatter: Record<string, unknown> = { name, description, tier: Math.min(tier ?? 2, 2) };
     if (model) frontmatter.model = model;
     if (channel_name) frontmatter.channelName = channel_name;
     if (can_message?.length) frontmatter.canMessage = can_message;
@@ -3326,6 +3350,8 @@ server.tool(
     tier: z.number().optional().describe('New security tier'),
   },
   async ({ slug, name, description, personality, channel_name, project, tools, model, can_message, tier }) => {
+    assertAgentCrudAllowed('update agents');
+
     const agentFile = path.join(AGENTS_DIR, slug, 'agent.md');
     if (!existsSync(agentFile)) {
       return textResult(`Error: Agent '${slug}' not found in agents directory.`);
@@ -3338,7 +3364,7 @@ server.tool(
     // Merge changes
     if (name !== undefined) meta.name = name;
     if (description !== undefined) meta.description = description;
-    if (tier !== undefined) meta.tier = tier;
+    if (tier !== undefined) meta.tier = Math.min(tier, 2);
     if (model !== undefined) meta.model = model;
     if (channel_name !== undefined) meta.channelName = channel_name;
     if (can_message !== undefined) meta.canMessage = can_message;
@@ -3371,6 +3397,8 @@ server.tool(
     confirm: z.boolean().describe('Must be true to confirm deletion'),
   },
   async ({ slug, confirm }) => {
+    assertAgentCrudAllowed('delete agents');
+
     if (!confirm) {
       return textResult('Deletion cancelled — set confirm=true to proceed.');
     }

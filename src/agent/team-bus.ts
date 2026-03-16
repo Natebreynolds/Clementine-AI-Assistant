@@ -70,13 +70,39 @@ export class TeamBus {
     return null;
   }
 
+  /**
+   * Derive the agent slug that owns a given session key.
+   * Returns null for primary/owner sessions (no agent slug).
+   */
+  private deriveSlugFromSession(sessionKey: string): string | null {
+    if (!this.botManager) return null;
+    // Reverse-lookup: which agent owns the channel in this session key?
+    // Session keys look like "discord:channel:{channelId}:{ownerId}"
+    const parts = sessionKey.split(':');
+    if (parts[0] === 'discord' && parts[1] === 'channel' && parts[2]) {
+      return this.botManager.getAgentForChannel(parts[2]) ?? null;
+    }
+    return null;
+  }
+
   /** Agent A sends a direct message to Agent B. */
   async send(
     fromSlug: string,
     toSlug: string,
     content: string,
     depth = 0,
+    sessionKey?: string,
   ): Promise<TeamMessage> {
+    // Verify fromSlug matches the session's actual agent identity
+    if (sessionKey) {
+      const expectedSlug = this.deriveSlugFromSession(sessionKey);
+      if (expectedSlug && expectedSlug !== fromSlug) {
+        throw new Error(
+          `Identity mismatch: session belongs to '${expectedSlug}' but fromSlug is '${fromSlug}'`,
+        );
+      }
+    }
+
     // Validate sender — team agents need canMessage permission, primary agent can message anyone
     const fromProfile = this.teamRouter.listTeamAgents().find((a) => a.slug === fromSlug);
 

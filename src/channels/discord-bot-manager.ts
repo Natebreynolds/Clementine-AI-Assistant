@@ -162,6 +162,14 @@ export class BotManager {
     return channels[0] ?? null;
   }
 
+  /** Reverse lookup: which agent slug owns a given channel ID? */
+  getAgentForChannel(channelId: string): string | null {
+    for (const [slug, bot] of this.bots) {
+      if (bot.getChannelIds().includes(channelId)) return slug;
+    }
+    return null;
+  }
+
   /** Get the owner ID (used for building session keys). */
   getOwnerId(): string {
     return this.ownerId;

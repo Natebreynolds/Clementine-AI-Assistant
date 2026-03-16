@@ -11,11 +11,41 @@
  * Provides CRUD operations for creating/updating/deleting agents.
  */
 
+import { execSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import matter from 'gray-matter';
 import type { AgentProfile, TeamAgentConfig } from '../types.js';
 import { ProfileManager } from './profiles.js';
+
+// ── Keychain helpers for agent secrets ────────────────────────────────
+
+function storeAgentSecret(slug: string, key: string, value: string): void {
+  execSync(
+    `security add-generic-password -U -s "clementine" -a "AGENT_${slug.toUpperCase()}_${key}" -w "${value}"`,
+    { stdio: 'pipe' },
+  );
+}
+
+function getAgentSecret(slug: string, key: string): string {
+  try {
+    return execSync(
+      `security find-generic-password -s "clementine" -a "AGENT_${slug.toUpperCase()}_${key}" -w`,
+      { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] },
+    ).trim();
+  } catch {
+    return '';
+  }
+}
+
+function deleteAgentSecret(slug: string, key: string): void {
+  try {
+    execSync(
+      `security delete-generic-password -s "clementine" -a "AGENT_${slug.toUpperCase()}_${key}"`,
+      { stdio: 'pipe' },
+    );
+  } catch { /* not found — ok */ }
+}
 
 const CACHE_TTL_MS = 60_000;
 
@@ -109,6 +139,24 @@ export class AgentManager {
       team = { channelName, channels: [], canMessage, allowedTools };
     }
 
+    // Resolve Discord token — migrate plaintext to Keychain if needed
+    let discordToken: string | undefined;
+    if (meta.discordToken) {
+      const raw = String(meta.discordToken);
+      if (raw === 'keychain') {
+        discordToken = getAgentSecret(slug, 'DISCORD_TOKEN') || undefined;
+      } else {
+        // Plaintext token in frontmatter — migrate to Keychain
+        discordToken = raw;
+        try {
+          storeAgentSecret(slug, 'DISCORD_TOKEN', raw);
+          meta.discordToken = 'keychain';
+          const updated = matter.stringify(content, meta);
+          fs.writeFileSync(filePath, updated);
+        } catch { /* migration failed — continue with plaintext */ }
+      }
+    }
+
     return {
       slug,
       name: String(meta.name ?? slug.replace(/-/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase())),
@@ -120,7 +168,7 @@ export class AgentManager {
       team,
       project: meta.project ? String(meta.project) : undefined,
       agentDir: path.dirname(filePath),
-      discordToken: meta.discordToken ? String(meta.discordToken) : undefined,
+      discordToken,
       discordChannelId: meta.discordChannelId ? String(meta.discordChannelId) : undefined,
     };
   }
@@ -190,7 +238,7 @@ export class AgentManager {
     const frontmatter: Record<string, unknown> = {
       name: config.name,
       description: config.description,
-      tier: config.tier ?? 2,
+      tier: Math.min(config.tier ?? 2, 2),
     };
     if (config.model) frontmatter.model = config.model;
     if (config.avatar) frontmatter.avatar = config.avatar;
@@ -198,7 +246,10 @@ export class AgentManager {
     if (config.canMessage?.length) frontmatter.canMessage = config.canMessage;
     if (config.allowedTools?.length) frontmatter.allowedTools = config.allowedTools;
     if (config.project) frontmatter.project = config.project;
-    if (config.discordToken) frontmatter.discordToken = config.discordToken;
+    if (config.discordToken) {
+      storeAgentSecret(slug, 'DISCORD_TOKEN', config.discordToken);
+      frontmatter.discordToken = 'keychain';
+    }
     if (config.discordChannelId) frontmatter.discordChannelId = config.discordChannelId;
 
     const body = config.personality || `You are ${config.name}. ${config.description}`;
@@ -225,14 +276,22 @@ export class AgentManager {
     // Merge changes into frontmatter
     if (changes.name !== undefined) meta.name = changes.name;
     if (changes.description !== undefined) meta.description = changes.description;
-    if (changes.tier !== undefined) meta.tier = changes.tier;
+    if (changes.tier !== undefined) meta.tier = Math.min(changes.tier, 2);
     if (changes.model !== undefined) meta.model = changes.model;
     if (changes.avatar !== undefined) meta.avatar = changes.avatar;
     if (changes.channelName !== undefined) meta.channelName = changes.channelName;
     if (changes.canMessage !== undefined) meta.canMessage = changes.canMessage;
     if (changes.allowedTools !== undefined) meta.allowedTools = changes.allowedTools;
     if (changes.project !== undefined) meta.project = changes.project;
-    if (changes.discordToken !== undefined) meta.discordToken = changes.discordToken || undefined;
+    if (changes.discordToken !== undefined) {
+      if (changes.discordToken) {
+        storeAgentSecret(slug, 'DISCORD_TOKEN', changes.discordToken);
+        meta.discordToken = 'keychain';
+      } else {
+        deleteAgentSecret(slug, 'DISCORD_TOKEN');
+        meta.discordToken = undefined;
+      }
+    }
     if (changes.discordChannelId !== undefined) meta.discordChannelId = changes.discordChannelId || undefined;
 
     const newBody = changes.personality ?? body;
@@ -251,6 +310,9 @@ export class AgentManager {
     if (!fs.existsSync(agentDir)) {
       throw new Error(`Agent '${slug}' not found.`);
     }
+
+    // Clean up Keychain secrets
+    deleteAgentSecret(slug, 'DISCORD_TOKEN');
 
     // Remove directory recursively
     fs.rmSync(agentDir, { recursive: true, force: true });

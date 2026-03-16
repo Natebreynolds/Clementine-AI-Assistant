@@ -6,6 +6,7 @@
  */
 
 import express from 'express';
+import { randomBytes } from 'node:crypto';
 import { spawn, execSync } from 'node:child_process';
 import {
   existsSync,
@@ -783,6 +784,21 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
   const app = express();
   app.use(express.json());
 
+  // ── Dashboard authentication ────────────────────────────────────────
+  const dashboardToken = randomBytes(24).toString('hex');
+  const tokenPath = path.join(BASE_DIR, '.dashboard-token');
+  writeFileSync(tokenPath, dashboardToken, { mode: 0o600 });
+
+  // Protect /api routes with bearer token (GET / serves the SPA with token injected)
+  app.use('/api', (req, res, next) => {
+    const auth = req.headers.authorization;
+    if (auth !== `Bearer ${dashboardToken}`) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+    next();
+  });
+
   // Compute build version hash at startup for cache busting / auto-reload
   // Use dist file mtime so updates are detected even without git
   const distDashboard = path.join(PACKAGE_ROOT, 'dist', 'cli', 'dashboard.js');
@@ -799,7 +815,7 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
   // ── GET routes ───────────────────────────────────────────────────
 
   app.get('/', (_req, res) => {
-    res.type('html').send(getDashboardHTML());
+    res.type('html').send(getDashboardHTML(dashboardToken));
   });
 
   app.get('/api/version', (_req, res) => {
@@ -2037,6 +2053,7 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
           if (actualPort !== port) {
             console.log(`  (port ${port} was in use)`);
           }
+          console.log(`  Token: ${dashboardToken.slice(0, 8)}...`);
           console.log();
           console.log('  Press Ctrl+C to stop');
           console.log();
@@ -2078,13 +2095,14 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
 
 // ── Inline HTML Dashboard ────────────────────────────────────────────
 
-function getDashboardHTML(): string {
+function getDashboardHTML(token: string): string {
   const name = getAssistantName();
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="dashboard-token" content="${token}">
 <title>${name} Command Center</title>
 <style>
   :root {
@@ -4316,6 +4334,14 @@ function toast(msg, type) {
   setTimeout(() => el.remove(), 4000);
 }
 
+// ── Authenticated fetch helper ────────────
+var _dashToken = document.querySelector('meta[name="dashboard-token"]')?.getAttribute('content') || '';
+function apiFetch(url, opts) {
+  opts = opts || {};
+  opts.headers = Object.assign({ 'Authorization': 'Bearer ' + _dashToken }, opts.headers || {});
+  return fetch(url, opts);
+}
+
 // ── Navigation ────────────────────────────
 let currentPage = 'overview';
 document.querySelectorAll('.nav-item').forEach(item => {
@@ -4343,7 +4369,7 @@ document.querySelectorAll('.nav-item').forEach(item => {
 // ── API helpers ───────────────────────────
 async function apiPost(url) {
   try {
-    const r = await fetch(url, { method: 'POST' });
+    const r = await apiFetch(url, { method: 'POST' });
     const d = await r.json();
     if (d.ok) toast(d.message, 'success');
     else toast(d.error || 'Error', 'error');
@@ -4352,7 +4378,7 @@ async function apiPost(url) {
 }
 async function apiJson(method, url, body) {
   try {
-    const r = await fetch(url, {
+    const r = await apiFetch(url, {
       method,
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
@@ -4366,7 +4392,7 @@ async function apiJson(method, url, body) {
 }
 async function apiDelete(url) {
   try {
-    const r = await fetch(url, { method: 'DELETE' });
+    const r = await apiFetch(url, { method: 'DELETE' });
     const d = await r.json();
     if (d.ok) toast(d.message, 'success');
     else toast(d.error || 'Error', 'error');
@@ -4378,7 +4404,7 @@ async function apiDelete(url) {
 let lastStatusData = {};
 async function refreshStatus() {
   try {
-    const r = await fetch('/api/status');
+    const r = await apiFetch('/api/status');
     const d = await r.json();
     lastStatusData = d;
 
@@ -4450,7 +4476,7 @@ async function refreshStatus() {
     // Summary cards — fetch metrics when on overview
     if (currentPage === 'overview') {
       try {
-        var mr = await fetch('/api/metrics');
+        var mr = await apiFetch('/api/metrics');
         var md = await mr.json();
         var hours = md.timeSaved ? md.timeSaved.estimatedHours || 0 : 0;
         var mins = md.timeSaved ? md.timeSaved.estimatedMinutes || 0 : 0;
@@ -4508,7 +4534,7 @@ function kv(key, val) {
 // ── Sessions ──────────────────────────────
 async function refreshSessions() {
   try {
-    const r = await fetch('/api/sessions');
+    const r = await apiFetch('/api/sessions');
     const d = await r.json();
     const keys = Object.keys(d);
     document.getElementById('nav-session-count').textContent = keys.length;
@@ -4542,7 +4568,7 @@ async function refreshSessions() {
 let cronJobsData = [];
 async function refreshCron() {
   try {
-    const r = await fetch('/api/cron');
+    const r = await apiFetch('/api/cron');
     const d = await r.json();
     cronJobsData = d.jobs || [];
     document.getElementById('nav-cron-count').textContent = cronJobsData.length;
@@ -4603,7 +4629,7 @@ async function refreshCron() {
 
     // Fetch unleashed task status and append if any exist
     try {
-      var ur = await fetch('/api/unleashed');
+      var ur = await apiFetch('/api/unleashed');
       var ud = await ur.json();
       var tasks = ud.tasks || [];
       if (tasks.length > 0) {
@@ -4663,7 +4689,7 @@ async function openTraceViewer(jobName) {
   document.getElementById('trace-modal').classList.add('show');
 
   try {
-    var r = await fetch('/api/cron/traces/' + encodeURIComponent(jobName));
+    var r = await apiFetch('/api/cron/traces/' + encodeURIComponent(jobName));
     var d = await r.json();
     traceData = d.traces || [];
 
@@ -4754,7 +4780,7 @@ async function loadUnleashedDetail(jobName, safeName) {
   if (!row) return;
   var cell = row.querySelector('td');
   try {
-    var r = await fetch('/api/unleashed/' + encodeURIComponent(jobName) + '/status');
+    var r = await apiFetch('/api/unleashed/' + encodeURIComponent(jobName) + '/status');
     var d = await r.json();
     var elapsedStr = d.elapsed < 60 ? d.elapsed + 'm' : Math.floor(d.elapsed/60) + 'h ' + (d.elapsed%60) + 'm';
     var remainStr = d.remaining != null ? (d.remaining < 60 ? d.remaining + 'm' : Math.floor(d.remaining/60) + 'h ' + (d.remaining%60) + 'm') : '—';
@@ -4795,7 +4821,7 @@ var workspaceDirsList = [];
 
 async function refreshWorkspaceDirs() {
   try {
-    const r = await fetch('/api/workspace-dirs');
+    const r = await apiFetch('/api/workspace-dirs');
     const d = await r.json();
     workspaceDirsList = d.dirs || [];
     const el = document.getElementById('workspace-dirs-list');
@@ -4841,7 +4867,7 @@ var browseEntries = [];
 
 function browseDir(dirPath) {
   var url = '/api/browse-dir' + (dirPath ? '?path=' + encodeURIComponent(dirPath) : '');
-  fetch(url).then(function(r) { return r.json(); }).then(function(d) {
+  apiFetch(url).then(function(r) { return r.json(); }).then(function(d) {
     if (d.error) { showToast(d.error, 'error'); return; }
     browseCurrent = d.current;
     browseParent = d.parent;
@@ -4890,7 +4916,7 @@ function browseUp() {
 }
 
 function addBrowsedDir(dir) {
-  fetch('/api/workspace-dirs', {
+  apiFetch('/api/workspace-dirs', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ dir: dir })
@@ -4916,7 +4942,7 @@ function addManualPath() {
 function removeWorkspaceDir(dir) {
   if (!confirm('Remove workspace directory?\\n' + dir)) return;
 
-  fetch('/api/workspace-dirs', {
+  apiFetch('/api/workspace-dirs', {
     method: 'DELETE',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ dir: dir })
@@ -4929,7 +4955,7 @@ function removeWorkspaceDir(dir) {
 async function refreshProjects() {
   refreshWorkspaceDirs();
   try {
-    const r = await fetch('/api/projects');
+    const r = await apiFetch('/api/projects');
     const d = await r.json();
     projectsData = d.projects || [];
     const linkedCount = projectsData.filter(p => p.linked).length;
@@ -5029,7 +5055,7 @@ async function saveProjectLink() {
   const keywords = document.getElementById('project-keywords').value
     .split(',').map(k => k.trim()).filter(Boolean);
   try {
-    const r = await fetch('/api/projects/link', {
+    const r = await apiFetch('/api/projects/link', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ path: projPath, description, keywords }),
@@ -5043,7 +5069,7 @@ async function saveProjectLink() {
 
 async function unlinkProject(projPath) {
   try {
-    const r = await fetch('/api/projects/unlink', {
+    const r = await apiFetch('/api/projects/unlink', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ path: projPath }),
@@ -5365,7 +5391,7 @@ updateScheduleFromBuilder();
 // ── Timers ────────────────────────────────
 async function refreshTimers() {
   try {
-    const r = await fetch('/api/timers');
+    const r = await apiFetch('/api/timers');
     const d = await r.json();
     const count = Array.isArray(d) ? d.length : 0;
     document.getElementById('nav-timer-count').textContent = count;
@@ -5388,7 +5414,7 @@ async function refreshTimers() {
 // ── Activity Feed ─────────────────────────
 async function refreshActivity() {
   try {
-    const r = await fetch('/api/activity');
+    const r = await apiFetch('/api/activity');
     const d = await r.json();
     const activities = d.activities || [];
     if (activities.length === 0) {
@@ -5425,7 +5451,7 @@ function friendlySession(key) {
 // ── Memory ────────────────────────────────
 async function refreshMemory() {
   try {
-    const r = await fetch('/api/memory');
+    const r = await apiFetch('/api/memory');
     const d = await r.json();
     let statsHtml = '';
     if (d.dbStats && d.dbStats.chunks != null) {
@@ -5449,7 +5475,7 @@ async function refreshMemory() {
 let fullLogContent = '';
 async function refreshLogs() {
   try {
-    const r = await fetch('/api/logs?lines=500');
+    const r = await apiFetch('/api/logs?lines=500');
     const d = await r.json();
     fullLogContent = d.content || '';
     applyLogFilter();
@@ -5458,7 +5484,7 @@ async function refreshLogs() {
 async function refreshSettings() {
   var container = document.getElementById('settings-content');
   try {
-    var r = await fetch('/api/settings');
+    var r = await apiFetch('/api/settings');
     var d = await r.json();
     var groups = d.groups || [];
     var html = '';
@@ -5729,7 +5755,7 @@ async function sendChat() {
   sendBtn.textContent = 'Thinking...';
 
   try {
-    const r = await fetch('/api/chat', {
+    const r = await apiFetch('/api/chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ message: msg }),
@@ -5772,7 +5798,7 @@ async function sendChat() {
 // ── Profile Switching ─────────────────────
 async function loadProfiles() {
   try {
-    var r = await fetch('/api/profiles');
+    var r = await apiFetch('/api/profiles');
     var d = await r.json();
     var sel = document.getElementById('chat-profile-select');
     sel.innerHTML = '<option value="">Default</option>';
@@ -5806,7 +5832,7 @@ async function runMemorySearch() {
   container.innerHTML = '<div class="empty-state">Searching...</div>';
 
   try {
-    const r = await fetch('/api/memory/search?q=' + encodeURIComponent(q));
+    const r = await apiFetch('/api/memory/search?q=' + encodeURIComponent(q));
     const d = await r.json();
 
     if (d.error) {
@@ -5843,7 +5869,7 @@ async function runMemorySearch() {
 // ── Metrics ───────────────────────────────
 async function refreshMetrics() {
   try {
-    const r = await fetch('/api/metrics');
+    const r = await apiFetch('/api/metrics');
     const d = await r.json();
     const container = document.getElementById('metrics-content');
 
@@ -5920,7 +5946,7 @@ let _loadedHash = null;
 let _restartBannerShown = false;
 async function checkVersion() {
   try {
-    var r = await fetch('/api/version');
+    var r = await apiFetch('/api/version');
     var d = await r.json();
     if (!_loadedHash) { _loadedHash = d.started; return; }
     // If the server detects its own code is stale, show a persistent banner
@@ -5959,9 +5985,9 @@ function refreshAll() {
 async function refreshTeam() {
   try {
     const [agentsRes, messagesRes, topoRes] = await Promise.all([
-      fetch('/api/team/agents'),
-      fetch('/api/team/messages?limit=50'),
-      fetch('/api/team/topology'),
+      apiFetch('/api/team/agents'),
+      apiFetch('/api/team/messages?limit=50'),
+      apiFetch('/api/team/topology'),
     ]);
     const agents = await agentsRes.json();
     const messages = await messagesRes.json();
@@ -5972,7 +5998,7 @@ async function refreshTeam() {
     if (badge) badge.textContent = agents.length || '0';
 
     // Fetch full agent details (with bot status)
-    var allRes = await fetch('/api/agents');
+    var allRes = await apiFetch('/api/agents');
     var allAgents = await allRes.json();
 
     // Summary cards
@@ -6113,7 +6139,7 @@ function showAgentCreateModal() {
 
 async function editAgent(slug) {
   try {
-    var r = await fetch('/api/agents');
+    var r = await apiFetch('/api/agents');
     var agents = await r.json();
     var a = agents.find(function(x) { return x.slug === slug; });
     if (!a) { toast('Agent not found', 'error'); return; }
@@ -6167,7 +6193,7 @@ function onTokenInput(token) {
   }
   tokenInputDebounce = setTimeout(async function() {
     try {
-      var r = await fetch('/api/bot/derive-invite', {
+      var r = await apiFetch('/api/bot/derive-invite', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ token: token }),
@@ -6218,7 +6244,7 @@ async function submitAgentForm(e) {
   try {
     var url = isEdit ? '/api/agents/' + editSlug : '/api/agents';
     var method = isEdit ? 'PUT' : 'POST';
-    var r = await fetch(url, {
+    var r = await apiFetch(url, {
       method: method,
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
@@ -6237,7 +6263,7 @@ async function submitAgentForm(e) {
 async function deleteAgent(slug) {
   if (!confirm('Let go of "' + slug + '"? This removes the entire agent directory.')) return;
   try {
-    var r = await fetch('/api/agents/' + slug, { method: 'DELETE' });
+    var r = await apiFetch('/api/agents/' + slug, { method: 'DELETE' });
     var d = await r.json();
     if (d.ok) {
       toast('Deleted agent: ' + slug, 'success');
@@ -6251,7 +6277,7 @@ async function deleteAgent(slug) {
 // ── Self-Improvement ──────────────────────
 async function refreshSelfImprove() {
   try {
-    const r = await fetch('/api/self-improve');
+    const r = await apiFetch('/api/self-improve');
     const d = await r.json();
     const state = d.state;
     const experiments = d.experiments || [];
@@ -6331,7 +6357,7 @@ async function refreshSelfImprove() {
 
 async function siApply(id) {
   try {
-    const r = await fetch('/api/self-improve/apply/' + id, { method: 'POST' });
+    const r = await apiFetch('/api/self-improve/apply/' + id, { method: 'POST' });
     const d = await r.json();
     if (d.ok) toast(d.message, 'success');
     else toast(d.message || 'Failed', 'error');
@@ -6341,7 +6367,7 @@ async function siApply(id) {
 
 async function siDeny(id) {
   try {
-    const r = await fetch('/api/self-improve/deny/' + id, { method: 'POST' });
+    const r = await apiFetch('/api/self-improve/deny/' + id, { method: 'POST' });
     const d = await r.json();
     if (d.ok) toast(d.message, 'success');
     else toast(d.message || 'Failed', 'error');
