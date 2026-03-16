@@ -3994,7 +3994,7 @@ function getDashboardHTML(): string {
               <div style="font-weight:600;color:var(--blue);margin-bottom:6px">Bot Setup Checklist</div>
               <div style="margin-bottom:4px">1. <a id="token-invite-link" href="#" target="_blank" style="color:var(--blue)">Invite bot to your server</a></div>
               <div style="margin-bottom:4px;color:var(--text-muted)">2. Enable <strong>Message Content Intent</strong> in <a href="https://discord.com/developers/applications" target="_blank" style="color:var(--blue)">Developer Portal</a> &gt; Bot &gt; Privileged Intents</div>
-              <div style="margin-bottom:4px;color:var(--text-muted)">3. Save this form, then provision channels + restart daemon</div>
+              <div style="margin-bottom:4px;color:var(--text-muted)">3. Save this form, then restart the daemon</div>
               <div style="margin-top:6px;font-size:11px;color:var(--text-muted)">App ID: <code id="token-app-id"></code></div>
             </div>
           </div>

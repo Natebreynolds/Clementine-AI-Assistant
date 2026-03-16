@@ -3,9 +3,8 @@
  *
  * Orchestrates the lifecycle of agent bot clients. Agents with a
  * `discordToken` in their profile get their own dedicated discord.js Client.
- *
- * No dependency on team-bindings or channel provisioning — bots discover
- * their channels on connect (by name, explicit ID, or fallback to all visible).
+ * Bots discover their channels on connect (by name, explicit ID, or fallback
+ * to all visible).
  */
 
 import { writeFileSync } from 'node:fs';

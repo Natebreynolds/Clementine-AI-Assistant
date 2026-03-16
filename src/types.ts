@@ -91,8 +91,8 @@ export type NotificationSender = (text: string) => Promise<void>;
 // ── Agent Profiles ───────────────────────────────────────────────────
 
 export interface TeamAgentConfig {
-  channelName: string;             // Desired Discord channel name (e.g., "research") — auto-provisioned
-  channels: string[];              // Resolved runtime bindings: "discord:CHANNEL_ID" (populated from bindings file)
+  channelName: string;             // Discord channel name (e.g., "research") — auto-discovered by bot
+  channels: string[];              // Resolved runtime channel keys (populated by bot on connect)
   canMessage: string[];            // Agent slugs this agent can directly message
   allowedTools?: string[];         // Tool whitelist (omit = all tools)
 }
@@ -115,8 +115,8 @@ export interface AgentProfile {
   description: string;
   systemPromptBody: string;
   model?: string;
-  avatar?: string;                 // URL for agent avatar (used in Discord webhooks)
-  team?: TeamAgentConfig;          // Present if agent has channel bindings
+  avatar?: string;                 // URL for agent avatar
+  team?: TeamAgentConfig;          // Present if agent has a channel assignment
   project?: string;                // Bind agent to a project from projects.json
   agentDir?: string;               // Path to agent's directory (agents/{slug}/)
   discordToken?: string;           // Dedicated Discord bot token (gives agent its own bot presence)

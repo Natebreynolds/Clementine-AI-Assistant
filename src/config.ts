@@ -261,11 +261,8 @@ export function validateSecrets(): string[] {
 
 // ── Team ────────────────────────────────────────────────────────────
 
-export const DISCORD_GUILD_ID = getEnv('DISCORD_GUILD_ID');
-export const TEAM_CATEGORY_ID = getEnv('TEAM_CATEGORY_ID');
 export const TEAM_COMMS_CHANNEL = getEnv('TEAM_COMMS_CHANNEL');
 export const TEAM_COMMS_LOG = path.join(BASE_DIR, 'logs', 'team-comms.jsonl');
-export const TEAM_BINDINGS_FILE = path.join(BASE_DIR, 'team-bindings.json');
 
 // ── Memory / Search ──────────────────────────────────────────────────
 
