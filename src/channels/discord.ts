@@ -34,7 +34,6 @@ import {
   chunkText,
   sendChunked,
   DiscordStreamingMessage,
-  WebhookStreamingMessage,
   STREAM_EDIT_INTERVAL,
   THINKING_INDICATOR,
   DISCORD_MSG_LIMIT,
@@ -114,7 +113,6 @@ const slashCommands = [
   new SlashCommandBuilder().setName('team').setDescription('Manage agent team')
     .addStringOption(o => o.setName('action').setDescription('Action').setRequired(true)
       .addChoices(
-        { name: 'Setup channels', value: 'setup' },
         { name: 'List agents', value: 'list' },
         { name: 'Agent status', value: 'status' },
         { name: 'Recent messages', value: 'messages' },
@@ -456,11 +454,7 @@ export async function startDiscord(
     }
   }
 
-  // Add team agent channels to watched set (from bindings)
   const teamRouter = gateway.getTeamRouter();
-  for (const channelId of teamRouter.getProvisionedChannelIds()) {
-    watchedChannels.add(channelId);
-  }
 
   const client = new Client({
     intents: [
@@ -469,7 +463,6 @@ export async function startDiscord(
       GatewayIntentBits.MessageContent,
       GatewayIntentBits.GuildMessageReactions,
       GatewayIntentBits.DirectMessageReactions,
-      // Always include GuildMessages — team agents may be provisioned later
       GatewayIntentBits.GuildMessages,
     ],
     partials: [Partials.Channel, Partials.Reaction, Partials.Message],
@@ -662,44 +655,6 @@ export async function startDiscord(
       }, 2000);
     });
 
-    // Auto-provision team agent channels + webhooks on startup
-    const botOwnedChannels = new Set(botManager?.getOwnedChannelIds() ?? []);
-    const teamAgents = teamRouter.listTeamAgents();
-    if (teamAgents.length > 0 && DISCORD_TOKEN) {
-      try {
-        const results = await teamRouter.provision(DISCORD_TOKEN);
-        for (const channelId of teamRouter.getProvisionedChannelIds()) {
-          if (!botOwnedChannels.has(channelId)) {
-            watchedChannels.add(channelId);
-          }
-        }
-        logger.info({ results }, 'Auto-provisioned team channels on startup');
-      } catch (err) {
-        logger.warn({ err }, 'Team auto-provisioning failed — run !team setup manually');
-      }
-    }
-
-    // Periodic check for new unprovisioned agents (handles MCP tools, dashboard, manual file creation)
-    if (DISCORD_TOKEN) {
-      setInterval(async () => {
-        const unprovisioned = teamRouter.getUnprovisionedSlugs();
-        if (unprovisioned.length === 0) return;
-
-        // Refresh bot-owned channels (may have changed via polling)
-        const currentBotOwned = new Set(botManager?.getOwnedChannelIds() ?? []);
-        try {
-          const results = await teamRouter.provision(DISCORD_TOKEN);
-          for (const channelId of teamRouter.getProvisionedChannelIds()) {
-            if (!currentBotOwned.has(channelId)) {
-              watchedChannels.add(channelId);
-            }
-          }
-          logger.info({ results, newAgents: unprovisioned }, 'Auto-provisioned new team agents');
-        } catch (err) {
-          logger.warn({ err }, 'Periodic team provisioning failed');
-        }
-      }, 60_000);
-    }
   });
 
   client.on(Events.MessageCreate, async (message: Message) => {
@@ -735,15 +690,6 @@ export async function startDiscord(
     const sessionKey = isWatchedChannel
       ? `discord:channel:${message.channelId}:${message.author.id}`
       : `discord:user:${message.author.id}`;
-
-    // ── Team agent auto-routing for watched channels ────────────────
-    if (isWatchedChannel) {
-      const teamRouter = gateway.getTeamRouter();
-      const agentSlug = teamRouter.getAgentForChannel(`discord:${message.channelId}`);
-      if (agentSlug) {
-        gateway.setSessionProfile(sessionKey, agentSlug);
-      }
-    }
 
     // ── Commands (DM only) ──────────────────────────────────────────
 
@@ -985,33 +931,21 @@ export async function startDiscord(
       const parts = text.split(/\s+/);
       const subCmd = parts[1]?.toLowerCase();
 
-      if (subCmd === 'setup') {
-        await message.reply('Provisioning team channels...');
-        const router = gateway.getTeamRouter();
-        const results = await router.provision(DISCORD_TOKEN);
-        // Add newly provisioned channels to the watched set
-        for (const channelId of router.getProvisionedChannelIds()) {
-          watchedChannels.add(channelId);
-        }
-        await message.reply(`**Team Setup Results:**\n${results.map(r => `- ${r}`).join('\n')}`);
-        return;
-      }
-
       if (subCmd === 'list' || !subCmd) {
         const router = gateway.getTeamRouter();
         const agents = router.listTeamAgents();
         if (agents.length === 0) {
-          await message.reply('No team agents configured. Add `channelName:` to a profile in `vault/00-System/profiles/`.');
+          await message.reply('No team agents configured. Hire one from the dashboard or add a profile to `vault/00-System/agents/`.');
         } else {
-          const bindings = router.getBindings();
+          const statuses = botManager?.getStatuses() ?? new Map();
           const lines = ['**Team Agents:**\n'];
           for (const a of agents) {
-            const channelId = bindings.channels[a.slug];
-            const channelStatus = channelId ? `<#${channelId}>` : '*not provisioned* — run `!team setup`';
+            const bs = statuses.get(a.slug);
+            const statusIcon = bs?.status === 'online' ? '\u{1F7E2}' : bs?.status === 'connecting' ? '\u{1F7E1}' : bs?.status === 'error' ? '\u{1F534}' : '\u26AB';
+            const statusText = bs?.status ?? 'offline';
             const targets = a.team?.canMessage.join(', ') || 'none';
-            lines.push(`- **${a.name}** (\`${a.slug}\`)`);
-            lines.push(`  Channel: ${channelStatus}`);
-            lines.push(`  Can message: ${targets}`);
+            lines.push(`- ${statusIcon} **${a.name}** (\`${a.slug}\`) — ${statusText}`);
+            lines.push(`  Channel: #${a.team?.channelName || 'none'} · Can message: ${targets}`);
           }
           await message.reply(lines.join('\n'));
         }
@@ -1021,13 +955,15 @@ export async function startDiscord(
       if (subCmd === 'status') {
         const router = gateway.getTeamRouter();
         const agents = router.listTeamAgents();
-        const provisioned = router.listProvisionedAgents();
+        const statuses = botManager?.getStatuses() ?? new Map();
+        const onlineCount = Array.from(statuses.values()).filter(s => s.status === 'online').length;
         const msgs = gateway.getTeamBus().getRecentMessages(10);
-        const lines = [`**Team Status** — ${agents.length} agent(s), ${provisioned.length} provisioned\n`];
+        const lines = [`**Team Status** — ${agents.length} agent(s), ${onlineCount} online\n`];
         for (const a of agents) {
+          const bs = statuses.get(a.slug);
+          const icon = bs?.status === 'online' ? '\u2705' : '\u274c';
           const agentMsgs = msgs.filter(m => m.fromAgent === a.slug || m.toAgent === a.slug);
-          const bound = router.getBindings().channels[a.slug] ? '\u2705' : '\u274c';
-          lines.push(`${bound} **${a.name}**: ${agentMsgs.length} recent message(s)`);
+          lines.push(`${icon} **${a.name}**: ${bs?.status ?? 'offline'} · ${agentMsgs.length} recent message(s)`);
         }
         await message.reply(lines.join('\n') || 'No team agents configured.');
         return;
@@ -1155,21 +1091,7 @@ export async function startDiscord(
 
     // ── Stream response ─────────────────────────────────────────────
 
-    // Use webhook-based streaming for team agent channels (distinct identity)
-    const teamRouter = gateway.getTeamRouter();
-    const boundAgent = isWatchedChannel
-      ? teamRouter.getAgentForChannel(`discord:${message.channelId}`)
-      : null;
-    const webhookUrl = boundAgent ? teamRouter.getWebhookUrl(boundAgent) : undefined;
-    const agentProfile = boundAgent
-      ? teamRouter.listTeamAgents().find(a => a.slug === boundAgent)
-      : undefined;
-
-    const useWebhook = !!(webhookUrl && agentProfile);
-
-    const streamer = useWebhook
-      ? new WebhookStreamingMessage(webhookUrl, agentProfile.name, agentProfile.avatar)
-      : new DiscordStreamingMessage(message.channel);
+    const streamer = new DiscordStreamingMessage(message.channel);
     await streamer.start();
 
     try {
@@ -1184,11 +1106,8 @@ export async function startDiscord(
       updatePresence(sessionKey);
 
       // Track bot message for feedback reactions
-      const msgId = useWebhook
-        ? (streamer as WebhookStreamingMessage).finalMessageId
-        : (streamer as DiscordStreamingMessage).messageId;
-      if (msgId) {
-        trackBotMessage(msgId, {
+      if (streamer.messageId) {
+        trackBotMessage(streamer.messageId, {
           sessionKey,
           userMessage: effectiveText.slice(0, 500),
           botResponse: response.slice(0, 500),
@@ -1292,27 +1211,17 @@ export async function startDiscord(
       // Team command
       if (name === 'team') {
         const action = cmd.options.getString('action', true);
-        if (action === 'setup') {
-          await cmd.deferReply();
-          const router = gateway.getTeamRouter();
-          const results = await router.provision(DISCORD_TOKEN);
-          for (const channelId of router.getProvisionedChannelIds()) {
-            watchedChannels.add(channelId);
-          }
-          await cmd.editReply(`**Team Setup:**\n${results.map(r => `- ${r}`).join('\n')}`);
-          return;
-        }
         if (action === 'list') {
           const router = gateway.getTeamRouter();
           const agents = router.listTeamAgents();
           if (agents.length === 0) {
             await cmd.reply({ content: 'No team agents configured.', ephemeral: true });
           } else {
-            const bindings = router.getBindings();
+            const statuses = botManager?.getStatuses() ?? new Map();
             const lines = agents.map(a => {
-              const chId = bindings.channels[a.slug];
-              const ch = chId ? `<#${chId}>` : '*not provisioned*';
-              return `**${a.name}** (\`${a.slug}\`) \u2192 ${ch}`;
+              const bs = statuses.get(a.slug);
+              const icon = bs?.status === 'online' ? '\u{1F7E2}' : bs?.status === 'connecting' ? '\u{1F7E1}' : bs?.status === 'error' ? '\u{1F534}' : '\u26AB';
+              return `${icon} **${a.name}** (\`${a.slug}\`) \u2014 ${bs?.status ?? 'offline'}`;
             });
             await cmd.reply({ content: `**Team Agents:**\n${lines.join('\n')}`, ephemeral: true });
           }
@@ -1321,12 +1230,15 @@ export async function startDiscord(
         if (action === 'status') {
           const router = gateway.getTeamRouter();
           const agents = router.listTeamAgents();
+          const statuses = botManager?.getStatuses() ?? new Map();
+          const onlineCount = Array.from(statuses.values()).filter(s => s.status === 'online').length;
           const msgs = gateway.getTeamBus().getRecentMessages(10);
-          const lines = [`**Team Status** \u2014 ${agents.length} agent(s)\n`];
+          const lines = [`**Team Status** \u2014 ${agents.length} agent(s), ${onlineCount} online\n`];
           for (const a of agents) {
+            const bs = statuses.get(a.slug);
+            const icon = bs?.status === 'online' ? '\u2705' : '\u274c';
             const agentMsgs = msgs.filter(m => m.fromAgent === a.slug || m.toAgent === a.slug);
-            const bound = router.getBindings().channels[a.slug] ? '\u2705' : '\u274c';
-            lines.push(`${bound} **${a.name}**: ${agentMsgs.length} recent message(s)`);
+            lines.push(`${icon} **${a.name}**: ${bs?.status ?? 'offline'} \u00b7 ${agentMsgs.length} recent message(s)`);
           }
           await cmd.reply({ content: lines.join('\n'), ephemeral: true });
           return;

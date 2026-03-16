@@ -57,18 +57,9 @@ export class TeamBus {
   }
 
   /**
-   * Resolve a session key for the target agent.
-   * Priority: 1) team-bindings channel, 2) BotManager auto-discovered channel.
+   * Resolve a session key for the target agent via BotManager.
    */
   private resolveSessionKey(toSlug: string): string | null {
-    // 1. Try team-bindings (legacy provisioning)
-    const teamChannel = this.teamRouter.getPrimaryChannelForAgent(toSlug);
-    if (teamChannel) {
-      const parts = teamChannel.split(':');
-      return `${parts[0]}:channel:${parts[1]}:system`;
-    }
-
-    // 2. Try BotManager (agent has its own Discord bot with auto-discovered channels)
     if (this.botManager) {
       const channelId = this.botManager.getChannelForAgent(toSlug);
       if (channelId) {
@@ -76,7 +67,6 @@ export class TeamBus {
         return `discord:channel:${channelId}:${ownerId}`;
       }
     }
-
     return null;
   }
 

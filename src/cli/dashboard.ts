@@ -1828,14 +1828,11 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
       const gw = await getGateway();
       const router = gw.getTeamRouter();
       const agents = router.listTeamAgents();
-      const bindings = router.getBindings();
       res.json(agents.map(a => ({
         slug: a.slug,
         name: a.name,
         description: a.description,
         channelName: a.team?.channelName ?? '',
-        channelId: bindings.channels[a.slug] ?? null,
-        provisioned: Boolean(bindings.channels[a.slug]),
         canMessage: a.team?.canMessage ?? [],
         allowedTools: a.team?.allowedTools ?? null,
         model: a.model,
@@ -1854,7 +1851,6 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
       const gw = await getGateway();
       const mgr = gw.getAgentManager();
       const all = mgr.listAll();
-      const bindings = gw.getTeamRouter().getBindings();
       // Read bot status from disk (written by BotManager in daemon)
       let botStatuses: Record<string, { status: string; botTag?: string; avatarUrl?: string; error?: string }> = {};
       try {
@@ -1882,8 +1878,6 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
           tier: a.tier,
           model: a.model ?? null,
           channelName: a.team?.channelName ?? null,
-          channelId: bindings.channels[a.slug] ?? null,
-          provisioned: Boolean(bindings.channels[a.slug]),
           canMessage: a.team?.canMessage ?? [],
           allowedTools: a.team?.allowedTools ?? null,
           project: a.project ?? null,
@@ -1989,16 +1983,6 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
       res.json(messages);
     } catch (err) {
       res.json([]);
-    }
-  });
-
-  app.post('/api/team/provision', async (_req, res) => {
-    try {
-      const gw = await getGateway();
-      const results = await gw.getTeamRouter().provision();
-      res.json({ ok: true, results });
-    } catch (err) {
-      res.json({ ok: false, error: String(err) });
     }
   });
 
@@ -3919,7 +3903,6 @@ function getDashboardHTML(): string {
         <div class="page-title" style="margin-bottom:0">The Office</div>
         <div style="display:flex;gap:8px;align-items:center">
           <button class="btn" onclick="showAgentCreateModal()" style="background:var(--green);color:#000;font-weight:600">Hire a New Employee</button>
-          <button class="btn" onclick="provisionTeam()">Provision</button>
         </div>
       </div>
       <div class="summary-grid" id="team-summary-cards"></div>
@@ -4001,7 +3984,7 @@ function getDashboardHTML(): string {
           </div>
           <div style="margin-bottom:16px">
             <label style="display:block;color:var(--text-muted);font-size:12px;margin-bottom:4px">Discord Bot Token <span style="opacity:0.6">(gives agent its own bot presence)</span></label>
-            <input id="agent-discord-token" type="password" autocomplete="off" style="width:100%;padding:8px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text)" placeholder="Paste bot token or leave blank for webhook identity" oninput="onTokenInput(this.value)">
+            <input id="agent-discord-token" type="password" autocomplete="off" style="width:100%;padding:8px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text)" placeholder="Paste Discord bot token" oninput="onTokenInput(this.value)">
             <div style="margin-top:6px">
               <label style="display:block;color:var(--text-muted);font-size:12px;margin-bottom:4px">Channel ID <span style="opacity:0.6">(right-click channel &gt; Copy Channel ID &mdash; auto-discovers from channel name if blank)</span></label>
               <input id="agent-discord-channel-id" style="width:100%;padding:8px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text)" placeholder="e.g. 1478311884212932740">
@@ -5988,13 +5971,17 @@ async function refreshTeam() {
     var badge = document.getElementById('nav-team-count');
     if (badge) badge.textContent = agents.length || '0';
 
+    // Fetch full agent details (with bot status)
+    var allRes = await fetch('/api/agents');
+    var allAgents = await allRes.json();
+
     // Summary cards
-    var provisionedCount = agents.filter(function(a) { return a.provisioned; }).length;
-    var cards = document.getElementById('team-summary-cards');
-    if (cards) {
-      cards.innerHTML =
+    var summaryEl = document.getElementById('team-summary-cards');
+    if (summaryEl) {
+      var onlineCount = allAgents.filter(function(a) { return a.botStatus === 'online'; }).length;
+      summaryEl.innerHTML =
         '<div class="stat-card"><div class="stat-value">' + agents.length + '</div><div class="stat-label">Agents</div></div>' +
-        '<div class="stat-card"><div class="stat-value">' + provisionedCount + '/' + agents.length + '</div><div class="stat-label">Provisioned</div></div>' +
+        '<div class="stat-card"><div class="stat-value">' + onlineCount + '/' + agents.length + '</div><div class="stat-label">Online</div></div>' +
         '<div class="stat-card"><div class="stat-value">' + (topology.edges || []).length + '</div><div class="stat-label">Connections</div></div>' +
         '<div class="stat-card"><div class="stat-value">' + messages.length + '</div><div class="stat-label">Recent Messages</div></div>';
     }
@@ -6002,8 +5989,6 @@ async function refreshTeam() {
     // Agent grid — desk station cards
     var grid = document.getElementById('team-agent-grid');
     if (grid) {
-      var allRes = await fetch('/api/agents');
-      var allAgents = await allRes.json();
       if (allAgents.length === 0) {
         grid.innerHTML = '<div class="desk-station desk-hire" onclick="showAgentCreateModal()">' +
           '<div class="desk-hire-inner"><div class="hire-icon">+</div><div class="hire-label">Hire a New Employee</div></div></div>';
@@ -6112,20 +6097,6 @@ async function refreshTeam() {
   } catch(e) {
     console.error('Team refresh error:', e);
   }
-}
-
-async function provisionTeam() {
-  try {
-    toast('Provisioning team channels...', 'info');
-    var r = await fetch('/api/team/provision', { method: 'POST' });
-    var d = await r.json();
-    if (d.ok) {
-      toast('Team channels provisioned', 'success');
-      refreshTeam();
-    } else {
-      toast(d.error || 'Provisioning failed', 'error');
-    }
-  } catch(e) { toast(String(e), 'error'); }
 }
 
 // ── Agent CRUD Modal ──────────────────────

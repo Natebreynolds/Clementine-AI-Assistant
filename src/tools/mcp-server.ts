@@ -3070,7 +3070,6 @@ server.tool(
 const PROFILES_DIR = path.join(SYSTEM_DIR, 'profiles');
 const AGENTS_DIR = path.join(SYSTEM_DIR, 'agents');
 const TEAM_COMMS_LOG = path.join(BASE_DIR, 'logs', 'team-comms.jsonl');
-const TEAM_BINDINGS_FILE = path.join(BASE_DIR, 'team-bindings.json');
 
 interface TeamAgentInfo {
   slug: string;
@@ -3138,16 +3137,6 @@ async function loadTeamAgents(): Promise<TeamAgentInfo[]> {
   return agents;
 }
 
-/** Load team bindings (slug → channelId mapping). */
-function loadTeamBindings(): Record<string, string> {
-  if (!existsSync(TEAM_BINDINGS_FILE)) return {};
-  try {
-    const data = JSON.parse(readFileSync(TEAM_BINDINGS_FILE, 'utf-8'));
-    return data.channels ?? {};
-  } catch {
-    return {};
-  }
-}
 
 server.tool(
   'team_list',
@@ -3160,13 +3149,10 @@ server.tool(
     if (agents.length === 0) {
       return textResult('No team agents configured. Add `channelName:` frontmatter to a profile in vault/00-System/profiles/.');
     }
-    const bindings = loadTeamBindings();
     const callerSlug = process.env.CLEMENTINE_TEAM_AGENT ?? '';
     const isPrimary = !agents.find(a => a.slug === callerSlug);
     const lines = agents.map(a => {
-      const channelId = bindings[a.slug];
-      const status = channelId ? `bound to #${a.channelName} (${channelId})` : 'auto-discovered';
-      return `- ${a.name} (${a.slug}): ${status}, canMessage=[${a.canMessage.join(', ')}]`;
+      return `- ${a.name} (${a.slug}): #${a.channelName}, canMessage=[${a.canMessage.join(', ')}]`;
     });
     const header = isPrimary
       ? 'Team Agents (you are the primary agent — you can message any agent below):'
@@ -3283,7 +3269,7 @@ server.tool(
     name: z.string().describe('Display name for the agent (e.g., "Research Agent")'),
     description: z.string().describe('Short description of what this agent does'),
     personality: z.string().optional().describe('Full system prompt body (personality/instructions). If omitted, a default is generated.'),
-    channel_name: z.string().optional().describe('Discord channel name to provision (e.g., "research")'),
+    channel_name: z.string().optional().describe('Discord channel name for this agent (e.g., "research")'),
     project: z.string().optional().describe('Project name to bind this agent to (from projects.json)'),
     tools: z.array(z.string()).optional().describe('Tool whitelist — only these tools are allowed. Omit for all tools.'),
     model: z.string().optional().describe('Model tier: "haiku", "sonnet", or "opus"'),
@@ -3317,7 +3303,7 @@ server.tool(
     return textResult(
       `Created agent '${name}' (${slug}).\n` +
       `Directory: vault/00-System/agents/${slug}/\n` +
-      (channel_name ? `Channel: #${channel_name} (run !team provision to create)\n` : '') +
+      (channel_name ? `Channel: #${channel_name}\n` : '') +
       (project ? `Project: ${project}\n` : '') +
       (tools?.length ? `Tools: ${tools.join(', ')}\n` : 'Tools: all\n'),
     );
@@ -3397,19 +3383,7 @@ server.tool(
     const { rmSync } = await import('node:fs');
     rmSync(agentDir, { recursive: true, force: true });
 
-    // Clean up team bindings if present
-    if (existsSync(TEAM_BINDINGS_FILE)) {
-      try {
-        const bindings = JSON.parse(readFileSync(TEAM_BINDINGS_FILE, 'utf-8'));
-        if (bindings.channels?.[slug]) {
-          delete bindings.channels[slug];
-          delete bindings.webhooks?.[slug];
-          writeFileSync(TEAM_BINDINGS_FILE, JSON.stringify(bindings, null, 2));
-        }
-      } catch { /* non-fatal */ }
-    }
-
-    return textResult(`Deleted agent '${slug}' and cleaned up bindings.`);
+    return textResult(`Deleted agent '${slug}'.`);
   },
 );
 

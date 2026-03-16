@@ -75,7 +75,7 @@ export class ProfileManager {
       : undefined;
 
     if (channelName) {
-      // channels[] is populated at runtime from team-bindings.json via TeamRouter
+      // channels[] populated at runtime by the agent's own bot
       team = { channelName, channels: [], canMessage, allowedTools };
     }
 

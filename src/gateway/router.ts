@@ -52,7 +52,6 @@ export class Gateway {
   getTeamRouter(): TeamRouter {
     if (!this._teamRouter) {
       this._teamRouter = new TeamRouter(this.getAgentManager());
-      this._teamRouter.refresh();
     }
     return this._teamRouter;
   }
