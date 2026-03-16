@@ -557,10 +557,20 @@ async function asyncMain(): Promise<void> {
     });
     child.unref();
 
+    // Wait briefly to confirm the child didn't crash immediately
+    const childAlive = await new Promise<boolean>((resolve) => {
+      child.once('exit', () => resolve(false));
+      setTimeout(() => resolve(true), 3000);
+    });
+
+    if (!childAlive) {
+      logger.error('Restart failed — new process exited immediately. Run `clementine doctor` to diagnose.');
+    }
+
     // Force exit — the Discord websocket and other event loop handles
     // will keep this process alive indefinitely if we just return.
     cleanupPid();
-    process.exit(0);
+    process.exit(childAlive ? 0 : 1);
   }
 }
 

@@ -1,9 +1,9 @@
 /**
  * Clementine TypeScript — Discord agent bot client.
  *
- * A lightweight discord.js Client wrapper for a single agent.
+ * A discord.js Client wrapper for a single agent.
  * Handles: DMs + guild channel messages → gateway → stream response.
- * No slash commands, no approval flows, no cron notifications.
+ * Slash commands: /plan, /deep, /quick, /opus, /model, /clear, /help.
  *
  * Channel discovery (in priority order):
  *   1. Explicit `discordChannelId` from agent config
@@ -14,21 +14,53 @@
  */
 
 import {
+  ActionRowBuilder,
   ActivityType,
   ChannelType,
   Client,
   EmbedBuilder,
   Events,
   GatewayIntentBits,
+  ModalBuilder,
   Partials,
+  REST,
+  Routes,
+  SlashCommandBuilder,
+  TextInputBuilder,
+  TextInputStyle,
+  type ChatInputCommandInteraction,
+  type Interaction,
   type Message,
 } from 'discord.js';
 import pino from 'pino';
 import type { AgentProfile } from '../types.js';
 import type { Gateway } from '../gateway/router.js';
-import { DiscordStreamingMessage, friendlyToolName, sanitizeResponse } from './discord-utils.js';
+import { chunkText, DiscordStreamingMessage, friendlyToolName, sanitizeResponse } from './discord-utils.js';
+import { MODELS } from '../config.js';
 
 const logger = pino({ name: 'clementine.agent-bot' });
+
+// ── Slash commands shared by all agent bots ──────────────────────────
+
+const agentSlashCommands = [
+  new SlashCommandBuilder().setName('plan').setDescription('Break a task into parallel steps')
+    .addStringOption(o => o.setName('task').setDescription('What to plan').setRequired(true)),
+  new SlashCommandBuilder().setName('deep').setDescription('Extended mode (100 turns) for heavy tasks')
+    .addStringOption(o => o.setName('message').setDescription('Your message').setRequired(true)),
+  new SlashCommandBuilder().setName('quick').setDescription('Quick reply using Haiku model')
+    .addStringOption(o => o.setName('message').setDescription('Your message').setRequired(true)),
+  new SlashCommandBuilder().setName('opus').setDescription('Deep reply using Opus model')
+    .addStringOption(o => o.setName('message').setDescription('Your message').setRequired(true)),
+  new SlashCommandBuilder().setName('model').setDescription('Switch default model')
+    .addStringOption(o => o.setName('tier').setDescription('Model tier').setRequired(true)
+      .addChoices(
+        { name: 'Haiku', value: 'haiku' },
+        { name: 'Sonnet', value: 'sonnet' },
+        { name: 'Opus', value: 'opus' },
+      )),
+  new SlashCommandBuilder().setName('clear').setDescription('Reset conversation session'),
+  new SlashCommandBuilder().setName('help').setDescription('Show all available commands'),
+];
 
 export interface AgentBotConfig {
   slug: string;
@@ -74,6 +106,20 @@ export class AgentBotClient {
       // Resolve channels
       this.resolvedChannelIds = this.discoverChannels();
 
+      // Register slash commands for this bot
+      try {
+        const rest = new REST().setToken(this.config.token);
+        await rest.put(Routes.applicationCommands(readyClient.user.id), {
+          body: agentSlashCommands.map(c => c.toJSON()),
+        });
+        logger.info(
+          { slug: this.config.slug, count: agentSlashCommands.length },
+          `Registered ${agentSlashCommands.length} slash commands`,
+        );
+      } catch (err) {
+        logger.error({ err, slug: this.config.slug }, 'Failed to register slash commands');
+      }
+
       logger.info(
         { slug: this.config.slug, botTag: readyClient.user.tag, channels: this.resolvedChannelIds },
         `Agent bot online: ${this.config.profile.name}`,
@@ -90,6 +136,10 @@ export class AgentBotClient {
 
       // Send startup status to owner's DMs
       await this.sendStartupStatus();
+    });
+
+    this.client.on(Events.InteractionCreate, async (interaction: Interaction) => {
+      await this.handleInteraction(interaction);
     });
 
     this.client.on(Events.MessageCreate, async (message: Message) => {
@@ -278,6 +328,253 @@ export class AgentBotClient {
       const errMsg = `Something went wrong processing a team message: ${sanitizeResponse(String(err))}`;
       await streamer.finalize(errMsg);
       return errMsg;
+    }
+  }
+
+  // ── Slash command + button interaction handler ──────────────────────
+
+  private async handleInteraction(interaction: Interaction): Promise<void> {
+    // ── Slash commands ──────────────────────────────────────────
+    if (interaction.isChatInputCommand()) {
+      const cmd = interaction as ChatInputCommandInteraction;
+
+      // Owner-only guard
+      if (this.config.ownerId && cmd.user.id !== this.config.ownerId) {
+        await cmd.reply({ content: 'Owner only.', ephemeral: true });
+        return;
+      }
+
+      const sessionKey = cmd.channel?.isDMBased()
+        ? `discord:agent:${this.config.slug}:${cmd.user.id}`
+        : `discord:channel:${cmd.channelId}:${cmd.user.id}`;
+
+      // Set agent profile for this session
+      this.gateway.setSessionProfile(sessionKey, this.config.slug);
+
+      const name = cmd.commandName;
+
+      // /help
+      if (name === 'help') {
+        const agentName = this.config.profile.name;
+        await cmd.reply([
+          `**${agentName} Commands**`,
+          '`/plan <task>` — Break a task into parallel steps',
+          '`/deep <msg>` — Extended mode (100 turns)',
+          '`/quick <msg>` — Quick reply (Haiku) · `/opus <msg>` — Deep reply (Opus)',
+          '`/model [haiku|sonnet|opus]` — Switch default model',
+          '`/clear` — Reset conversation · `/help` — This message',
+        ].join('\n'));
+        return;
+      }
+
+      // /clear
+      if (name === 'clear') {
+        this.gateway.clearSession(sessionKey);
+        await cmd.reply('Session cleared.');
+        return;
+      }
+
+      // /model
+      if (name === 'model') {
+        const tier = cmd.options.getString('tier', true);
+        const t = tier.toLowerCase() as keyof typeof MODELS;
+        if (t in MODELS) {
+          this.gateway.setSessionModel(sessionKey, MODELS[t]);
+          await cmd.reply(`Model switched to **${t}** (\`${MODELS[t]}\`).`);
+        } else {
+          const current = this.gateway.getSessionModel(sessionKey) ?? 'default';
+          await cmd.reply(`Current model: \`${current}\`\nOptions: /model haiku, /model sonnet, /model opus`);
+        }
+        return;
+      }
+
+      // /plan — with approval buttons
+      if (name === 'plan') {
+        const task = cmd.options.getString('task', true);
+        await cmd.deferReply();
+        await cmd.editReply(`Planning: _${task.slice(0, 100)}_...`);
+
+        if (!cmd.channel) {
+          await cmd.editReply('Could not access channel for plan.');
+          return;
+        }
+
+        const streamer = new DiscordStreamingMessage(cmd.channel);
+        await streamer.start();
+        await streamer.update('Planning...');
+
+        try {
+          const result = await this.gateway.handlePlan(
+            sessionKey,
+            task,
+            async (updates) => {
+              const lines = [
+                `**Plan:** ${task.slice(0, 100)}`,
+                '',
+                ...updates.map((u, i) => {
+                  const num = `[${i + 1}/${updates.length}]`;
+                  const desc = u.description.slice(0, 60);
+                  switch (u.status) {
+                    case 'done': return `${num} ${desc} \u2713 (${Math.round((u.durationMs ?? 0) / 1000)}s)`;
+                    case 'running': return `${num} ${desc} \u23f3 running...`;
+                    case 'failed': return `${num} ${desc} \u2717 failed`;
+                    default: return `${num} ${desc} \u25cb waiting`;
+                  }
+                }),
+              ];
+              await streamer.update(lines.join('\n').slice(0, 1800));
+            },
+            async (planSummary, steps) => {
+              const planPreview = `**Plan:** ${task.slice(0, 100)}\n\n` +
+                steps.map((s, i) => `${i + 1}. **${s.id}** — ${s.description.slice(0, 60)}`).join('\n');
+              if ('send' in cmd.channel!) {
+                await cmd.channel!.send(planPreview.slice(0, 2000));
+              }
+
+              // Send approval buttons
+              const requestId = `plan-${Date.now()}`;
+              const buttons = [
+                { type: 2, style: 3, label: 'Approve', custom_id: `plan_${requestId}_approve` },
+                { type: 2, style: 1, label: 'Revise', custom_id: `plan_${requestId}_revise` },
+                { type: 2, style: 4, label: 'Cancel', custom_id: `plan_${requestId}_deny` },
+              ];
+              if ('send' in cmd.channel!) {
+                await cmd.channel!.send({
+                  content: 'Approve this plan?',
+                  components: [{ type: 1, components: buttons }] as any,
+                });
+              }
+
+              const approvalResult = await this.gateway.requestApproval('Pending approval', requestId);
+              if (typeof approvalResult === 'string') {
+                if ('send' in cmd.channel!) {
+                  await cmd.channel!.send('\u2728 *Revising plan...*');
+                }
+                return approvalResult;
+              }
+              if (approvalResult) {
+                const newStreamer = new DiscordStreamingMessage(cmd.channel!);
+                await newStreamer.start();
+                await newStreamer.update('Executing plan...');
+                Object.assign(streamer, {
+                  message: (newStreamer as any).message,
+                  lastEdit: (newStreamer as any).lastEdit,
+                  pendingText: '',
+                  lastFlushedText: '',
+                  isFinal: false,
+                });
+              }
+              return approvalResult;
+            },
+          );
+
+          await streamer.finalize(result);
+        } catch (err) {
+          logger.error({ err, slug: this.config.slug }, '/plan command failed');
+          await streamer.finalize(`Plan failed: ${err}`);
+        }
+        return;
+      }
+
+      // /deep, /quick, /opus — chat with model override
+      if (name === 'deep' || name === 'quick' || name === 'opus') {
+        const msg = cmd.options.getString('message', true);
+        const oneOffModel = name === 'quick' ? MODELS.haiku : name === 'opus' ? MODELS.opus : undefined;
+        const oneOffMaxTurns = name === 'deep' ? 100 : undefined;
+
+        await cmd.deferReply();
+
+        try {
+          const response = await this.gateway.handleMessage(
+            sessionKey,
+            msg,
+            async () => {},
+            oneOffModel,
+            oneOffMaxTurns,
+          );
+          const chunks = chunkText(response || '*(no response)*', 1900);
+          await cmd.editReply(chunks[0]);
+          for (let i = 1; i < chunks.length; i++) {
+            await cmd.followUp(chunks[i]);
+          }
+        } catch (err) {
+          logger.error({ err, slug: this.config.slug }, `/${name} command failed`);
+          await cmd.editReply(`Something went wrong: ${err}`);
+        }
+        return;
+      }
+
+      return;
+    }
+
+    // ── Button interactions (plan approve/deny/revise) ──────────
+    if (interaction.isButton()) {
+      const button = interaction;
+      const customId = button.customId;
+
+      // Owner-only guard
+      if (this.config.ownerId && button.user.id !== this.config.ownerId) {
+        await button.reply({ content: 'Owner only.', ephemeral: true });
+        return;
+      }
+
+      // Plan approval buttons: plan_{requestId}_{action}
+      const planMatch = customId.match(/^plan_(.+)_(approve|deny|revise)$/);
+      if (planMatch) {
+        const [, requestId, action] = planMatch;
+
+        if (action === 'approve') {
+          await button.deferUpdate();
+          this.gateway.resolveApproval(requestId, true);
+        } else if (action === 'deny') {
+          await button.deferUpdate();
+          this.gateway.resolveApproval(requestId, false);
+        } else if (action === 'revise') {
+          // Show modal for revision feedback
+          const modal = new ModalBuilder()
+            .setCustomId(`revise_modal_${requestId}`)
+            .setTitle('Revise Plan');
+          const input = new TextInputBuilder()
+            .setCustomId('revision_feedback')
+            .setLabel('What should be changed?')
+            .setStyle(TextInputStyle.Paragraph)
+            .setRequired(true);
+          modal.addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(input));
+          await button.showModal(modal);
+        }
+
+        // Disable buttons after click
+        try {
+          if (button.message) {
+            const rawComponents = (button.message.components as any[]).map((row: any) => ({
+              type: 1,
+              components: (row.components ?? []).map((comp: any) => ({
+                type: comp.type ?? 2,
+                style: comp.style,
+                label: comp.label,
+                custom_id: comp.customId ?? comp.custom_id,
+                disabled: true,
+              })),
+            }));
+            await button.editReply({
+              content: button.message.content + `\n\n${action === 'approve' ? '\u2705 Approved' : action === 'deny' ? '\u274c Cancelled' : '\u270f\ufe0f Revising'}`,
+              components: rawComponents as any,
+            });
+          }
+        } catch { /* non-fatal */ }
+        return;
+      }
+    }
+
+    // ── Modal submissions (revision feedback) ────────────────────
+    if (interaction.isModalSubmit()) {
+      const modal = interaction;
+      if (modal.customId.startsWith('revise_modal_')) {
+        const requestId = modal.customId.replace('revise_modal_', '');
+        const feedback = modal.fields.getTextInputValue('revision_feedback');
+        await modal.deferUpdate();
+        this.gateway.resolveApproval(requestId, feedback);
+      }
     }
   }
 
