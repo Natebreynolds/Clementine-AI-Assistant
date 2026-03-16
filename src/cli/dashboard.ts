@@ -1104,6 +1104,41 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
     }
   });
 
+  // ── Available Tools ──────────────────────────────────────────
+
+  app.get('/api/available-tools', (_req, res) => {
+    try {
+      const categories: Record<string, string[]> = {
+        'Core': ['Bash', 'Read', 'Write', 'Edit', 'Glob', 'Grep'],
+        'Web': ['WebSearch', 'WebFetch'],
+        'Memory': ['memory_read', 'memory_write', 'memory_search', 'memory_recall',
+                    'memory_connections', 'memory_timeline', 'memory_report', 'memory_correct'],
+        'Notes & Tasks': ['note_create', 'note_take', 'daily_note', 'task_list', 'task_add', 'task_update'],
+        'Communication': ['outlook_inbox', 'outlook_search', 'outlook_calendar', 'outlook_draft',
+                          'outlook_send', 'outlook_read_email', 'discord_channel_send'],
+        'Research': ['rss_fetch', 'github_prs', 'browser_screenshot', 'analyze_image', 'transcript_search'],
+        'Team': ['team_list', 'team_message'],
+        'System': ['workspace_config', 'workspace_list', 'workspace_info',
+                   'self_restart', 'vault_stats', 'set_timer', 'feedback_log', 'feedback_report'],
+      };
+
+      // Discover MCP servers from linked projects
+      const projects = scanProjects();
+      for (const p of projects) {
+        if (p.mcpServers.length) {
+          for (const server of p.mcpServers) {
+            if (!categories[server]) categories[server] = [];
+            categories[server].push(`mcp__${server} (all tools)`);
+          }
+        }
+      }
+
+      res.json({ categories });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
   // ── CRON CRUD routes ──────────────────────────────────────────
 
   app.get('/api/projects', (_req, res) => {
@@ -3919,7 +3954,8 @@ function getDashboardHTML(token: string): string {
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
         <div class="page-title" style="margin-bottom:0">The Office</div>
         <div style="display:flex;gap:8px;align-items:center">
-          <button class="btn" onclick="showAgentCreateModal()" style="background:var(--green);color:#000;font-weight:600">Hire a New Employee</button>
+          <button class="btn" onclick="startHiringInterview()" style="background:var(--green);color:#000;font-weight:600">Hire a New Employee</button>
+          <button class="btn btn-sm" onclick="showAgentCreateModal()" style="color:var(--text-muted)">Manual Setup</button>
         </div>
       </div>
       <div class="summary-grid" id="team-summary-cards"></div>
@@ -3982,7 +4018,9 @@ function getDashboardHTML(token: string): string {
           <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px">
             <div>
               <label style="display:block;color:var(--text-muted);font-size:12px;margin-bottom:4px">Project Binding</label>
-              <input id="agent-project" style="width:100%;padding:8px;background:var(--bg-input);border:1px solid var(--border);border-radius:6px;color:var(--text-primary)" placeholder="data-pipeline">
+              <select id="agent-project" style="width:100%;padding:8px;background:var(--bg-input);border:1px solid var(--border);border-radius:6px;color:var(--text-primary)">
+                <option value="">None</option>
+              </select>
             </div>
             <div>
               <label style="display:block;color:var(--text-muted);font-size:12px;margin-bottom:4px">Security Clearance</label>
@@ -3997,8 +4035,10 @@ function getDashboardHTML(token: string): string {
             <input id="agent-canmessage" style="width:100%;padding:8px;background:var(--bg-input);border:1px solid var(--border);border-radius:6px;color:var(--text-primary)" placeholder="analyst-agent, writer-agent">
           </div>
           <div style="margin-bottom:12px">
-            <label style="display:block;color:var(--text-muted);font-size:12px;margin-bottom:4px">Equipment & Access (comma-separated, blank = all)</label>
-            <input id="agent-tools" style="width:100%;padding:8px;background:var(--bg-input);border:1px solid var(--border);border-radius:6px;color:var(--text-primary)" placeholder="WebSearch, WebFetch, memory_search">
+            <label style="display:block;color:var(--text-muted);font-size:12px;margin-bottom:4px">Equipment & Access <span style="opacity:0.6">(click category to toggle all)</span></label>
+            <div id="agent-tools-panel" style="max-height:200px;overflow-y:auto;border:1px solid var(--border);border-radius:6px;padding:8px;background:var(--bg-input)">
+              <div style="color:var(--text-muted);font-size:12px">Loading tools...</div>
+            </div>
           </div>
           <div style="margin-bottom:16px">
             <label style="display:block;color:var(--text-muted);font-size:12px;margin-bottom:4px">Discord Bot Token <span style="opacity:0.6">(gives agent its own bot presence)</span></label>
@@ -4345,6 +4385,7 @@ function apiFetch(url, opts) {
 
 // ── Navigation ────────────────────────────
 let currentPage = 'overview';
+var prevAgentSlugs = null;
 document.querySelectorAll('.nav-item').forEach(item => {
   item.addEventListener('click', () => {
     const page = item.dataset.page;
@@ -6001,6 +6042,14 @@ async function refreshTeam() {
     var allRes = await apiFetch('/api/agents');
     var allAgents = await allRes.json();
 
+    // Auto-restart on roster change
+    var currentSlugs = allAgents.map(function(a) { return a.slug; }).sort().join(',');
+    if (prevAgentSlugs !== null && currentSlugs !== prevAgentSlugs) {
+      toast('Team roster changed — restarting...', 'success');
+      apiFetch('/api/restart', { method: 'POST' });
+    }
+    prevAgentSlugs = currentSlugs;
+
     // Summary cards
     var summaryEl = document.getElementById('team-summary-cards');
     if (summaryEl) {
@@ -6016,7 +6065,7 @@ async function refreshTeam() {
     var grid = document.getElementById('team-agent-grid');
     if (grid) {
       if (allAgents.length === 0) {
-        grid.innerHTML = '<div class="desk-station desk-hire" onclick="showAgentCreateModal()">' +
+        grid.innerHTML = '<div class="desk-station desk-hire" onclick="startHiringInterview()">' +
           '<div class="desk-hire-inner"><div class="hire-icon">+</div><div class="hire-label">Hire a New Employee</div></div></div>';
       } else {
         var cards = allAgents.map(function(a) {
@@ -6072,7 +6121,7 @@ async function refreshTeam() {
 
         // Add the "Hire" empty desk at the end
         cards.push(
-          '<div class="desk-station desk-hire" onclick="showAgentCreateModal()">' +
+          '<div class="desk-station desk-hire" onclick="startHiringInterview()">' +
           '<div class="desk-hire-inner"><div class="hire-icon">+</div><div class="hire-label">Hire a New Employee</div></div></div>'
         );
 
@@ -6127,6 +6176,70 @@ async function refreshTeam() {
 
 // ── Agent CRUD Modal ──────────────────────
 
+var HIRING_PROMPT = "I'd like to hire a new team member. Please interview me to set them up.\\n\\nWalk me through it — ask me about their name, what they'll do, what tools or capabilities they need, which project they should be attached to, and who they should be able to talk to on the team. Keep it conversational — 3 to 5 questions max, one at a time.\\n\\nOnce you have enough info, show me a summary of the proposed config, and when I approve, use create_agent to set them up. Include a detailed system prompt in the personality field that defines their expertise, communication style, and working context.";
+
+function navigateTo(page) {
+  var nav = document.querySelector('.nav-item[data-page="' + page + '"]');
+  if (nav) nav.click();
+}
+
+function startHiringInterview() {
+  navigateTo('chat');
+  setTimeout(function() {
+    document.getElementById('chat-input').value = HIRING_PROMPT;
+    sendChat();
+  }, 100);
+}
+
+async function loadAgentProjectOptions(selected) {
+  try {
+    var r = await apiFetch('/api/projects');
+    var d = await r.json();
+    var sel = document.getElementById('agent-project');
+    sel.innerHTML = '<option value="">None</option>';
+    (d.projects || []).forEach(function(p) {
+      var opt = document.createElement('option');
+      opt.value = p.name;
+      opt.textContent = p.name + (p.description ? ' — ' + p.description : '');
+      if (selected && p.name === selected) opt.selected = true;
+      sel.appendChild(opt);
+    });
+  } catch(e) { /* projects are optional */ }
+}
+
+async function loadAgentToolOptions(selectedTools) {
+  try {
+    var r = await apiFetch('/api/available-tools');
+    var d = await r.json();
+    var panel = document.getElementById('agent-tools-panel');
+    panel.innerHTML = '';
+    var selected = selectedTools || [];
+    for (var cat in d.categories) {
+      var header = document.createElement('div');
+      header.style.cssText = 'font-weight:600;font-size:11px;color:var(--text-muted);margin:8px 0 4px;cursor:pointer;user-select:none';
+      header.textContent = '▸ ' + cat;
+      header.dataset.category = cat;
+      header.onclick = (function(catName, hdr) { return function() {
+        var cbs = panel.querySelectorAll('.agent-tool-cb[data-cat="' + catName + '"]');
+        var allChecked = Array.from(cbs).every(function(cb) { return cb.checked; });
+        cbs.forEach(function(cb) { cb.checked = !allChecked; });
+      }; })(cat, header);
+      panel.appendChild(header);
+      d.categories[cat].forEach(function(tool) {
+        var label = document.createElement('label');
+        label.style.cssText = 'display:block;font-size:12px;padding:2px 0 2px 8px;cursor:pointer';
+        var checked = selected.indexOf(tool) >= 0 ? ' checked' : '';
+        label.innerHTML = '<input type="checkbox" class="agent-tool-cb" data-cat="' + cat + '" value="' + tool + '"' + checked + ' style="margin-right:6px">' + tool;
+        panel.appendChild(label);
+      });
+    }
+  } catch(e) { /* fallback — panel stays empty */ }
+}
+
+function getSelectedTools() {
+  return Array.from(document.querySelectorAll('.agent-tool-cb:checked')).map(function(cb) { return cb.value; });
+}
+
 function showAgentCreateModal() {
   document.getElementById('agent-modal').classList.add('show');
   document.getElementById('agent-modal-title').textContent = 'Hire a New Team Member';
@@ -6135,6 +6248,8 @@ function showAgentCreateModal() {
   document.getElementById('agent-form').reset();
   document.getElementById('agent-token-hint').style.display = 'none';
   document.getElementById('agent-token-setup').style.display = 'none';
+  loadAgentProjectOptions();
+  loadAgentToolOptions();
 }
 
 async function editAgent(slug) {
@@ -6153,10 +6268,10 @@ async function editAgent(slug) {
     document.getElementById('agent-avatar-url').value = a.avatar || '';
     document.getElementById('agent-channel').value = a.channelName || '';
     document.getElementById('agent-model').value = a.model || '';
-    document.getElementById('agent-project').value = a.project || '';
     document.getElementById('agent-tier').value = String(a.tier || 2);
     document.getElementById('agent-canmessage').value = (a.canMessage || []).join(', ');
-    document.getElementById('agent-tools').value = (a.allowedTools || []).join(', ');
+    loadAgentProjectOptions(a.project || '');
+    loadAgentToolOptions(a.allowedTools || []);
     document.getElementById('agent-discord-token').value = '';
     document.getElementById('agent-discord-channel-id').value = a.discordChannelId || '';
     document.getElementById('agent-token-setup').style.display = 'none';
@@ -6224,7 +6339,7 @@ async function submitAgentForm(e) {
     personality: document.getElementById('agent-personality').value.trim() || undefined,
     channelName: document.getElementById('agent-channel').value.trim() || undefined,
     model: document.getElementById('agent-model').value || undefined,
-    project: document.getElementById('agent-project').value.trim() || undefined,
+    project: document.getElementById('agent-project').value || undefined,
     tier: parseInt(document.getElementById('agent-tier').value) || 2,
     avatar: document.getElementById('agent-avatar-url').value.trim() || undefined,
   };
@@ -6232,8 +6347,8 @@ async function submitAgentForm(e) {
   var cm = document.getElementById('agent-canmessage').value.trim();
   if (cm) payload.canMessage = cm.split(',').map(function(s) { return s.trim(); }).filter(Boolean);
 
-  var tools = document.getElementById('agent-tools').value.trim();
-  if (tools) payload.allowedTools = tools.split(',').map(function(s) { return s.trim(); }).filter(Boolean);
+  var tools = getSelectedTools();
+  if (tools.length) payload.allowedTools = tools;
 
   var discordToken = document.getElementById('agent-discord-token').value.trim();
   if (discordToken) payload.discordToken = discordToken;

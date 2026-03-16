@@ -250,6 +250,9 @@ User message
 | `memory_correct` | Correct or dismiss a previously extracted memory |
 | `feedback_log` | Log user feedback on responses |
 | `feedback_report` | View feedback history and patterns |
+| `team_list` | List all team agents with status, channel, and capabilities |
+| `team_message` | Send a message to another agent (permission-scoped, synchronous) |
+| `create_agent` | Create a new agent with name, role, tools, project, and team connections |
 | `self_improve_status` | Check self-improvement state, pending approvals, experiment history |
 | `self_improve_run` | Trigger a self-improvement analysis cycle |
 
@@ -306,6 +309,10 @@ Run `clementine dashboard` to open a local web command center at `http://localho
 - **Projects** — Browse all discovered workspace projects with type, description, and tool badges
 - **Live status** — Daemon health, LaunchAgent status, active channels
 - **Sessions** — View and manage active conversation sessions
+- **The Office** — Visual agent management with desk-station cards showing status, avatars, channels, and tools
+- **Hiring Interview** — Click "Hire a New Employee" and Clementine interviews you to build the agent config conversationally
+- **Manual Agent Setup** — Form modal with project dropdown (auto-populated from discovered projects) and categorized tool browser with checkboxes
+- **Auto-restart** — Daemon restarts automatically when the agent roster changes (from either the interview or manual path)
 - **Self-Improvement** — View experiment history, approve/deny pending proposals, monitor baseline metrics
 
 No extra dependencies — the dashboard uses Express, which is already installed.
@@ -415,6 +422,54 @@ Three tools power this:
 - **`workspace_info`** — Deep-reads a project: `README.md`, `.claude/CLAUDE.md`, `package.json`/`pyproject.toml`, and a directory tree (depth 2).
 
 Clementine can then use her built-in file tools (`Read`, `Glob`, `Grep`, `Edit`, `Bash`) to work directly in any discovered project.
+
+---
+
+## Agents & Teams
+
+Clementine supports multi-agent teams — each agent gets its own Discord bot, channel, project binding, tool allowlist, and personality. Agents can message each other via `team_message` with permission-scoped routing.
+
+### Creating agents
+
+Two paths to create a new agent:
+
+| Method | How |
+|--------|-----|
+| **Hiring interview** | Click "Hire a New Employee" in the dashboard (or an empty desk card). Clementine asks 3–5 questions about the agent's name, role, tools, project, and team connections, then calls `create_agent` automatically. |
+| **Manual setup** | Click "Manual Setup" to open a form with project dropdown, categorized tool browser, model selector, and team connection fields. |
+
+Both paths trigger an automatic daemon restart when the new agent is detected.
+
+### Agent configuration
+
+Each agent is defined by a YAML frontmatter file in `~/.clementine/agents/<slug>/agent.md`:
+
+| Field | Description |
+|-------|-------------|
+| `name` | Display name |
+| `description` | Role description shown on desk card |
+| `personality` | System prompt defining expertise and communication style |
+| `channelName` | Discord channel the agent monitors |
+| `model` | Model tier (haiku, sonnet, opus) |
+| `project` | Bound project directory for workspace context |
+| `tier` | Security tier (1 = read-only, 2 = read/write) |
+| `allowedTools` | Tool allowlist (blank = all available) |
+| `canMessage` | List of agent slugs this agent can message |
+| `discordToken` | Dedicated Discord bot token for independent presence |
+
+### Inter-agent communication
+
+Agents communicate via the `team_message` tool. Messages are permission-scoped — an agent can only message slugs listed in its `canMessage` field. The primary agent can message anyone.
+
+Messages are delivered synchronously: the sender waits for the recipient's response. Conversation depth is tracked to prevent infinite loops.
+
+### The Office (dashboard)
+
+The dashboard's "The Office" page shows each agent as an animated desk station with:
+- Live status indicator (online / connecting / error / offline)
+- Discord bot avatar (auto-pulled) or initial
+- Channel assignment, model badge, project badge, tool count
+- Edit and "Let Go" (delete) actions
 
 ---
 
