@@ -434,6 +434,9 @@ async function asyncMain(): Promise<void> {
       logger.error({ err }, 'BotManager startup failed — continuing without agent bots');
     }
 
+    // Register BotManager with gateway so TeamBus can resolve agent bot channels
+    if (botManager) gateway.setBotManager(botManager);
+
     channelTasks.push(startDiscord(gateway, heartbeat, cronScheduler, dispatcher, botManager));
     if (botManager) botManager.startPolling(60_000);
     activeChannels.push('Discord');
@@ -473,6 +476,11 @@ async function asyncMain(): Promise<void> {
   cronScheduler.start();
   const timerInterval = startTimerChecker(dispatcher);
 
+  // Deliver pending team messages every 15s (picks up MCP-written messages)
+  const teamDeliveryInterval = setInterval(() => {
+    try { gateway.getTeamBus().deliverPending(); } catch { /* non-fatal */ }
+  }, 15_000);
+
   // ── Banner ───────────────────────────────────────────────────────
   const profileCount = 0; // ProfileManager can be loaded later if needed
   const cronCount = 0; // Jobs loaded internally by CronScheduler.start()
@@ -503,6 +511,7 @@ async function asyncMain(): Promise<void> {
   // ── Graceful cleanup ──────────────────────────────────────────
   logger.info(restartRequested ? 'Restart signal received — restarting' : 'Shutdown signal received — cleaning up');
   clearInterval(timerInterval);
+  clearInterval(teamDeliveryInterval);
   heartbeat.stop();
   cronScheduler.stop();
 

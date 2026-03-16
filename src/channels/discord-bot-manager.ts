@@ -153,6 +153,24 @@ export class BotManager {
     return ids;
   }
 
+  /** Get the primary channel ID for a specific agent bot (for team message delivery). */
+  getChannelForAgent(slug: string): string | null {
+    const bot = this.bots.get(slug);
+    if (!bot) return null;
+    const channels = bot.getChannelIds();
+    return channels[0] ?? null;
+  }
+
+  /** Get the owner ID (used for building session keys). */
+  getOwnerId(): string {
+    return this.ownerId;
+  }
+
+  /** Check if an agent has a running bot. */
+  hasBot(slug: string): boolean {
+    return this.bots.has(slug);
+  }
+
   /**
    * Poll for new/removed agents with discordToken at the given interval.
    */

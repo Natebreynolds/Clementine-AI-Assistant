@@ -31,22 +31,53 @@ export class TeamBus {
   /** "from:to" → last send timestamp (for cooldown). */
   private cooldowns = new Map<string, number>();
   private statusChangeListeners: Array<() => void> = [];
+  private botManager?: import('../channels/discord-bot-manager.js').BotManager;
 
   constructor(
     gateway: Gateway,
     teamRouter: TeamRouter,
-    options: { commsChannelId?: string; logFile: string },
+    options: { commsChannelId?: string; logFile: string; botManager?: import('../channels/discord-bot-manager.js').BotManager },
   ) {
     this.gateway = gateway;
     this.teamRouter = teamRouter;
     this.commsChannelId = options.commsChannelId || undefined;
     this.logFile = options.logFile;
+    this.botManager = options.botManager;
 
     // Ensure log directory exists
     const dir = path.dirname(this.logFile);
     if (!existsSync(dir)) {
       mkdirSync(dir, { recursive: true });
     }
+  }
+
+  /** Update the BotManager reference (called if set after construction). */
+  setBotManager(botManager: import('../channels/discord-bot-manager.js').BotManager): void {
+    this.botManager = botManager;
+  }
+
+  /**
+   * Resolve a session key for the target agent.
+   * Priority: 1) team-bindings channel, 2) BotManager auto-discovered channel.
+   */
+  private resolveSessionKey(toSlug: string): string | null {
+    // 1. Try team-bindings (legacy provisioning)
+    const teamChannel = this.teamRouter.getPrimaryChannelForAgent(toSlug);
+    if (teamChannel) {
+      const parts = teamChannel.split(':');
+      return `${parts[0]}:channel:${parts[1]}:system`;
+    }
+
+    // 2. Try BotManager (agent has its own Discord bot with auto-discovered channels)
+    if (this.botManager) {
+      const channelId = this.botManager.getChannelForAgent(toSlug);
+      if (channelId) {
+        const ownerId = this.botManager.getOwnerId();
+        return `discord:channel:${channelId}:${ownerId}`;
+      }
+    }
+
+    return null;
   }
 
   /** Agent A sends a direct message to Agent B. */
@@ -107,25 +138,18 @@ export class TeamBus {
       depth,
     };
 
-    // Resolve target agent's session key from channel bindings
-    const targetChannel = this.teamRouter.getPrimaryChannelForAgent(toSlug);
-    if (targetChannel) {
-      // Channel key format: "discord:CHANNEL_ID" -> session key: "discord:channel:CHANNEL_ID:system"
-      const parts = targetChannel.split(':');
-      const platform = parts[0]; // "discord", "slack", etc.
-      const channelId = parts[1];
-      const sessionKey = `${platform}:channel:${channelId}:system`;
-
-      // Set the agent profile for the target session
+    // Resolve target agent's session key — try team-bindings first, then BotManager
+    const sessionKey = this.resolveSessionKey(toSlug);
+    if (sessionKey) {
       this.gateway.setSessionProfile(sessionKey, toSlug);
-
-      // Inject the message as context
       this.gateway.injectContext(
         sessionKey,
         `[Team message from ${fromProfile?.name ?? fromSlug} (${fromSlug}), depth=${depth}]`,
         content,
       );
       message.delivered = true;
+    } else {
+      logger.warn({ toSlug }, 'No channel found for target agent — message queued for later delivery');
     }
 
     // Persist to JSONL log
@@ -223,14 +247,9 @@ export class TeamBus {
         try {
           const msg = JSON.parse(line) as TeamMessage;
           if (!msg.delivered) {
-            // Try to deliver
-            const targetChannel = this.teamRouter.getPrimaryChannelForAgent(msg.toAgent);
-            if (targetChannel) {
-              const parts = targetChannel.split(':');
-              const platform = parts[0];
-              const channelId = parts[1];
-              const sessionKey = `${platform}:channel:${channelId}:system`;
-
+            // Try to deliver via team-bindings or BotManager
+            const sessionKey = this.resolveSessionKey(msg.toAgent);
+            if (sessionKey) {
               this.gateway.setSessionProfile(sessionKey, msg.toAgent);
               this.gateway.injectContext(
                 sessionKey,

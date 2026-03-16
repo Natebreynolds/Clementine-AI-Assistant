@@ -34,6 +34,7 @@ export class Gateway {
   private _agentManager?: AgentManager;
   private _teamRouter?: TeamRouter;
   private _teamBus?: TeamBus;
+  private _botManager?: import('../channels/discord-bot-manager.js').BotManager;
 
   constructor(assistant: PersonalAssistant) {
     this.assistant = assistant;
@@ -62,10 +63,20 @@ export class Gateway {
       this._teamBus = new TeamBus(this, router, {
         commsChannelId: router.getCommsChannelId(),
         logFile: TEAM_COMMS_LOG,
+        botManager: this._botManager,
       });
       this._teamBus.loadFromLog();
     }
     return this._teamBus;
+  }
+
+  /** Register the BotManager so TeamBus can resolve agent bot channels for delivery. */
+  setBotManager(botManager: import('../channels/discord-bot-manager.js').BotManager): void {
+    this._botManager = botManager;
+    // If TeamBus already exists, update its reference
+    if (this._teamBus) {
+      this._teamBus.setBotManager(botManager);
+    }
   }
 
   /** Route an inter-agent message through the team bus. */
