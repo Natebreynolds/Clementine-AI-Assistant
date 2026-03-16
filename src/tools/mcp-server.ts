@@ -3151,7 +3151,9 @@ function loadTeamBindings(): Record<string, string> {
 
 server.tool(
   'team_list',
-  'List all team agents — their names, channel bindings, and who they can message. Use this to discover teammates.',
+  'List all team agents — their names, channel bindings, and messaging permissions. ' +
+  'NOTE: As the primary agent, you can message ANY team agent using team_message regardless of canMessage settings. ' +
+  'The canMessage field only restricts which agents *that agent* can message.',
   {},
   async () => {
     const agents = await loadTeamAgents();
@@ -3159,19 +3161,25 @@ server.tool(
       return textResult('No team agents configured. Add `channelName:` frontmatter to a profile in vault/00-System/profiles/.');
     }
     const bindings = loadTeamBindings();
+    const callerSlug = process.env.CLEMENTINE_TEAM_AGENT ?? '';
+    const isPrimary = !agents.find(a => a.slug === callerSlug);
     const lines = agents.map(a => {
       const channelId = bindings[a.slug];
-      const status = channelId ? `bound to #${a.channelName} (${channelId})` : 'not provisioned';
+      const status = channelId ? `bound to #${a.channelName} (${channelId})` : 'auto-discovered';
       return `- ${a.name} (${a.slug}): ${status}, canMessage=[${a.canMessage.join(', ')}]`;
     });
-    return textResult(`Team Agents:\n${lines.join('\n')}`);
+    const header = isPrimary
+      ? 'Team Agents (you are the primary agent — you can message any agent below):'
+      : 'Team Agents:';
+    return textResult(`${header}\n${lines.join('\n')}`);
   },
 );
 
 server.tool(
   'team_message',
-  'Send a message to another team agent. The message will be delivered to the target agent\'s session. ' +
-  'Validates canMessage permissions and enforces depth limits (max 3) to prevent infinite loops.',
+  'Send a message to another team agent. The message will be delivered to the target agent\'s channel and they will respond. ' +
+  'The primary agent (you) can message ANY team agent. Team agents are restricted by their canMessage list. ' +
+  'Enforces depth limits (max 3) to prevent infinite loops.',
   {
     to_agent: z.string().describe('Slug of the target agent (e.g., "analyst-agent")'),
     message: z.string().describe('Message content to send'),
