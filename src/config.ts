@@ -287,6 +287,10 @@ export const EPISODIC_DECAY_HALF_LIFE_DAYS = 7;
 
 export const SELF_IMPROVE_DIR = path.join(BASE_DIR, 'self-improve');
 
+// ── Source Self-Edit Staging ─────────────────────────────────────────
+
+export const STAGING_DIR = path.join(BASE_DIR, 'staging');
+
 // ── API ──────────────────────────────────────────────────────────────
 
 export const ANTHROPIC_API_KEY = getSecret('ANTHROPIC_API_KEY');

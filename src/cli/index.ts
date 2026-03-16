@@ -886,6 +886,23 @@ async function cmdUpdate(options: { restart?: boolean; dryRun?: boolean }): Prom
   let step = 0;
   const S = () => `[${++step}]`;
 
+  // 1b. Detect self/edits branch
+  let wasOnSelfEdits = false;
+  try {
+    const currentBranch = execSync('git rev-parse --abbrev-ref HEAD', {
+      cwd: PACKAGE_ROOT,
+      encoding: 'utf-8',
+    }).trim();
+    wasOnSelfEdits = currentBranch === 'self/edits';
+    if (wasOnSelfEdits) {
+      console.log(`  ${S()} Detected self/edits branch — switching to main for update...`);
+      if (!options.dryRun) {
+        execSync('git checkout main', { cwd: PACKAGE_ROOT, stdio: 'pipe' });
+        console.log(`  ${GREEN}OK${RESET}  Switched to main`);
+      }
+    }
+  } catch { /* not on self/edits or git error — continue */ }
+
   // 2. Stash any local customizations so pull succeeds
   let didStash = false;
   try {
@@ -1149,6 +1166,23 @@ async function cmdUpdate(options: { restart?: boolean; dryRun?: boolean }): Prom
       console.error(`  ${YELLOW}WARN${RESET}  Could not auto-restore local changes (conflict)`);
       console.log(`       Your changes are saved in: git -C "${PACKAGE_ROOT}" stash list`);
       console.log(`       Restore manually with: git -C "${PACKAGE_ROOT}" stash pop`);
+    }
+  }
+
+  // 9b. Rebase self/edits onto updated main
+  if (wasOnSelfEdits) {
+    console.log(`  ${S()} Rebasing self/edits onto updated main...`);
+    try {
+      execSync('git rebase main self/edits', { cwd: PACKAGE_ROOT, stdio: 'pipe' });
+      execSync('git checkout self/edits', { cwd: PACKAGE_ROOT, stdio: 'pipe' });
+      // Rebuild from self/edits branch
+      execSync('npm run build', { cwd: PACKAGE_ROOT, stdio: ['pipe', 'pipe', 'pipe'] });
+      console.log(`  ${GREEN}OK${RESET}  Self-edits rebased and rebuilt`);
+    } catch {
+      // Rebase failed — abort and stay on main
+      try { execSync('git rebase --abort', { cwd: PACKAGE_ROOT, stdio: 'pipe' }); } catch { /* best effort */ }
+      console.error(`  ${YELLOW}WARN${RESET}  Could not rebase self-edits onto updated main — staying on main`);
+      console.log(`       Self-edits are preserved on branch 'self/edits'. Resolve conflicts manually.`);
     }
   }
 

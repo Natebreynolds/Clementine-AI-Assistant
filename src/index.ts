@@ -9,9 +9,12 @@ import { existsSync, readFileSync, writeFileSync, unlinkSync, mkdirSync, statSyn
 import { execSync } from 'node:child_process';
 import path from 'node:path';
 import * as config from './config.js';
+import type { RestartSentinel } from './types.js';
 
 // Clear nested session guard so the SDK can spawn Claude CLI subprocesses
 delete process.env['CLAUDECODE'];
+
+import { lanes } from './gateway/lanes.js';
 
 // ── Logging ──────────────────────────────────────────────────────────
 
@@ -383,7 +386,52 @@ function startTimerChecker(dispatcher: import('./gateway/notifications.js').Noti
 
 // ── Async main ───────────────────────────────────────────────────────
 
+// ── Restart sentinel ─────────────────────────────────────────────────
+
+const SENTINEL_PATH = path.join(config.BASE_DIR, '.restart-sentinel.json');
+
+function readAndClearSentinel(): RestartSentinel | null {
+  if (!existsSync(SENTINEL_PATH)) return null;
+  try {
+    const sentinel = JSON.parse(readFileSync(SENTINEL_PATH, 'utf-8')) as RestartSentinel;
+    unlinkSync(SENTINEL_PATH);
+    return sentinel;
+  } catch {
+    try { unlinkSync(SENTINEL_PATH); } catch { /* ignore */ }
+    return null;
+  }
+}
+
+// ── Drain helper ─────────────────────────────────────────────────────
+
+async function drainActiveSessions(
+  gateway: import('./gateway/router.js').Gateway,
+  timeoutMs = 60_000,
+): Promise<void> {
+  gateway.setDraining(true);
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const status = lanes.status();
+    let active = 0;
+    for (const s of Object.values(status)) {
+      active += s.active;
+    }
+    if (active === 0) break;
+    logger.info({ totalActive: active }, 'Draining active sessions...');
+    await new Promise(r => setTimeout(r, 500));
+  }
+}
+
 async function asyncMain(): Promise<void> {
+  // ── Read restart sentinel (from a previous self-edit / update) ───
+  const sentinel = readAndClearSentinel();
+  if (sentinel) {
+    logger.info(
+      { reason: sentinel.reason, previousPid: sentinel.previousPid, changedFiles: sentinel.changedFiles },
+      'Restart sentinel detected — this process is a post-restart instance',
+    );
+  }
+
   // ── Validate secrets (fail closed on misconfiguration) ──────────
   const secretWarnings = config.validateSecrets();
   for (const warning of secretWarnings) {
@@ -505,6 +553,52 @@ async function asyncMain(): Promise<void> {
     try { gateway.getTeamBus().deliverPending(); } catch { /* non-fatal */ }
   }, 15_000);
 
+  // Watch for pending source edits from MCP tools (every 10s)
+  const PENDING_SOURCE_SIGNAL = path.join(config.BASE_DIR, '.pending-source-edit');
+  const PENDING_UPDATE_SIGNAL = path.join(config.BASE_DIR, '.pending-update');
+  const PENDING_SOURCE_DIR = path.join(config.SELF_IMPROVE_DIR, 'pending-source-changes');
+
+  const sourceEditInterval = setInterval(async () => {
+    try {
+      // Check for pending source edits
+      if (existsSync(PENDING_SOURCE_SIGNAL)) {
+        const signal = JSON.parse(readFileSync(PENDING_SOURCE_SIGNAL, 'utf-8'));
+        unlinkSync(PENDING_SOURCE_SIGNAL);
+
+        const pendingFile = path.join(PENDING_SOURCE_DIR, `${signal.id}.json`);
+        if (existsSync(pendingFile)) {
+          const pending = JSON.parse(readFileSync(pendingFile, 'utf-8'));
+          unlinkSync(pendingFile);
+
+          logger.info({ id: signal.id, file: pending.file }, 'Processing pending source edit from MCP');
+          const { safeSourceEdit } = await import('./agent/safe-restart.js');
+          const result = await safeSourceEdit(config.PKG_DIR, [
+            { relativePath: pending.file, content: pending.content },
+          ], { reason: pending.reason });
+
+          if (!result.success) {
+            logger.error({ error: result.error, preflightErrors: result.preflightErrors }, 'Pending source edit failed');
+            dispatcher.send(`Source edit failed: ${result.error}`).catch(() => {});
+          }
+        }
+      }
+
+      // Check for pending updates
+      if (existsSync(PENDING_UPDATE_SIGNAL)) {
+        unlinkSync(PENDING_UPDATE_SIGNAL);
+        logger.info('Processing pending update from MCP');
+        const { applyUpdate } = await import('./agent/auto-update.js');
+        const result = await applyUpdate(config.PKG_DIR);
+        if (!result.success) {
+          logger.error({ error: result.error }, 'Pending update failed');
+          dispatcher.send(`Update failed: ${result.error}`).catch(() => {});
+        }
+      }
+    } catch (err) {
+      logger.error({ err }, 'Source edit/update watcher error');
+    }
+  }, 10_000);
+
   // ── Banner ───────────────────────────────────────────────────────
   const profileCount = 0; // ProfileManager can be loaded later if needed
   const cronCount = 0; // Jobs loaded internally by CronScheduler.start()
@@ -515,6 +609,22 @@ async function asyncMain(): Promise<void> {
 
   // ── Initialize all channels ─────────────────────────────────────
   await Promise.all(channelTasks);
+
+  // ── Deliver restart sentinel notification ──────────────────────
+  if (sentinel) {
+    const msg = sentinel.reason === 'source-edit'
+      ? `Restart complete. Source change applied${sentinel.changedFiles ? ` (${sentinel.changedFiles.join(', ')})` : ''}.`
+      : sentinel.reason === 'update'
+        ? 'Restart complete. Update applied successfully.'
+        : 'Restart complete.';
+    dispatcher.send(msg).catch((err) => {
+      logger.warn({ err }, 'Failed to deliver restart notification');
+    });
+    // Also inject context into the originating session if known
+    if (sentinel.sessionKey) {
+      gateway.injectContext(sentinel.sessionKey, '[System: restart triggered]', msg);
+    }
+  }
 
   // ── Keep alive until shutdown or restart signal ─────────────────
   // The event loop stays active via Discord's websocket, node-cron
@@ -536,15 +646,19 @@ async function asyncMain(): Promise<void> {
   logger.info(restartRequested ? 'Restart signal received — restarting' : 'Shutdown signal received — cleaning up');
   clearInterval(timerInterval);
   clearInterval(teamDeliveryInterval);
+  clearInterval(sourceEditInterval);
   heartbeat.stop();
   cronScheduler.stop();
   if (graphStore) {
     try { await graphStore.close(); } catch { /* non-fatal */ }
   }
 
-  // ── Self-restart ──────────────────────────────────────────────
+  // ── Self-restart (enhanced with drain + health check + rollback) ──
   if (restartRequested) {
-    // Spawn a new detached instance before exiting
+    // 1. Drain active sessions
+    await drainActiveSessions(gateway);
+
+    // 2. Spawn a new detached instance
     const { spawn } = await import('node:child_process');
     const entry = process.argv[1];
     const args = process.argv.slice(2);
@@ -557,14 +671,62 @@ async function asyncMain(): Promise<void> {
     });
     child.unref();
 
-    // Wait briefly to confirm the child didn't crash immediately
+    // 3. Health check — wait up to 10s for the child to write a new PID
     const childAlive = await new Promise<boolean>((resolve) => {
       child.once('exit', () => resolve(false));
-      setTimeout(() => resolve(true), 3000);
+      const checkInterval = setInterval(() => {
+        try {
+          if (existsSync(PID_FILE)) {
+            const newPid = parseInt(readFileSync(PID_FILE, 'utf-8').trim(), 10);
+            if (!isNaN(newPid) && newPid !== process.pid) {
+              clearInterval(checkInterval);
+              resolve(true);
+            }
+          }
+        } catch { /* ignore read errors */ }
+      }, 500);
+      setTimeout(() => {
+        clearInterval(checkInterval);
+        resolve(true); // Assume alive after 10s if no exit event
+      }, 10_000);
     });
 
+    // 4. Rollback on crash — if child died and sentinel exists with changedFiles
     if (!childAlive) {
-      logger.error('Restart failed — new process exited immediately. Run `clementine doctor` to diagnose.');
+      logger.error('Restart failed — new process exited immediately');
+      const crashSentinel = readAndClearSentinel();
+      if (crashSentinel?.changedFiles && crashSentinel.changedFiles.length > 0) {
+        logger.info({ changedFiles: crashSentinel.changedFiles }, 'Rolling back source edit...');
+        try {
+          execSync('git revert --no-edit HEAD', { cwd: config.PKG_DIR, stdio: 'pipe' });
+          execSync('npm run build', { cwd: config.PKG_DIR, stdio: 'pipe', timeout: 120_000 });
+          logger.info('Rollback successful — spawning clean instance');
+
+          // Spawn again with the reverted code
+          const retryChild = spawn(process.execPath, [entry, ...args], {
+            detached: true,
+            stdio: 'ignore',
+            cwd: process.cwd(),
+            env: process.env,
+          });
+          retryChild.unref();
+
+          const retryAlive = await new Promise<boolean>((resolve) => {
+            retryChild.once('exit', () => resolve(false));
+            setTimeout(() => resolve(true), 5000);
+          });
+
+          if (!retryAlive) {
+            logger.error('Rollback spawn also failed — exiting. launchd/systemd will respawn.');
+          }
+
+          cleanupPid();
+          process.exit(retryAlive ? 0 : 1);
+        } catch (revertErr) {
+          logger.error({ revertErr }, 'Rollback failed — exiting');
+        }
+      }
+      logger.error('Run `clementine doctor` to diagnose.');
     }
 
     // Force exit — the Discord websocket and other event loop handles

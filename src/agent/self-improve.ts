@@ -31,6 +31,7 @@ import {
   VAULT_DIR,
   MEMORY_DB_PATH,
   AGENTS_DIR,
+  PKG_DIR,
 } from '../config.js';
 import type {
   CronRunEntry,
@@ -51,7 +52,7 @@ const DEFAULT_CONFIG: SelfImproveConfig = {
   maxDurationMs: 3_600_000,         // 1 hour
   acceptThreshold: 0.6,
   plateauLimit: 3,
-  areas: ['soul', 'cron', 'workflow', 'memory', 'agent'],
+  areas: ['soul', 'cron', 'workflow', 'memory', 'agent', 'source'],
 };
 
 // ── Paths ────────────────────────────────────────────────────────────
@@ -393,6 +394,10 @@ export class SelfImproveLoop {
         const agentFile = path.join(AGENTS_DIR, target, 'agent.md');
         return existsSync(agentFile) ? readFileSync(agentFile, 'utf-8') : '';
       }
+      case 'source': {
+        const srcFile = path.join(PKG_DIR, 'src', target);
+        return existsSync(srcFile) ? readFileSync(srcFile, 'utf-8') : '';
+      }
       case 'memory':
         return `(memory configuration — target: ${target})`;
       default:
@@ -461,7 +466,27 @@ export class SelfImproveLoop {
       return `Cannot resolve target path for area=${pending.area}, target=${pending.target}`;
     }
 
-    // Write the change
+    // Route source changes through the safe pipeline
+    if (pending.area === 'source') {
+      const { safeSourceEdit } = await import('./safe-restart.js');
+      const result = await safeSourceEdit(PKG_DIR, [
+        { relativePath: `src/${pending.target}`, content: pending.proposedChange },
+      ], { experimentId, reason: `self-improve: ${pending.hypothesis.slice(0, 60)}` });
+
+      if (!result.success) {
+        return `Source edit failed: ${result.error}${result.preflightErrors ? '\n' + result.preflightErrors.join('\n') : ''}`;
+      }
+
+      // Update experiment log — mark as approved
+      this.updateExperimentStatus(experimentId, 'approved');
+      try { unlinkSync(pendingFile); } catch { /* ignore */ }
+      const state = this.loadState();
+      state.pendingApprovals = Math.max(0, state.pendingApprovals - 1);
+      this.saveState(state);
+      return `Applied source change to ${pending.target} — restart triggered.`;
+    }
+
+    // Write the change (non-source areas)
     writeFileSync(targetPath, pending.proposedChange);
     logger.info({ id: experimentId, area: pending.area, target: pending.target }, 'Applied approved change');
 
@@ -616,6 +641,9 @@ export class SelfImproveLoop {
       }
       case 'agent': {
         return path.join(AGENTS_DIR, target, 'agent.md');
+      }
+      case 'source': {
+        return path.join(PKG_DIR, 'src', target);
       }
       default:
         return null;

@@ -30,6 +30,7 @@ export class Gateway {
   private sessionLocks = new Map<string, Promise<void>>();
   private sessionProvenance = new Map<string, SessionProvenance>();
   private auditLog: string[] = [];
+  private draining = false;
 
   // Team system (lazy-initialized)
   private _agentManager?: AgentManager;
@@ -246,6 +247,11 @@ export class Gateway {
     return child;
   }
 
+  // ── Drain control ───────────────────────────────────────────────────
+
+  setDraining(value: boolean): void { this.draining = value; }
+  isDraining(): boolean { return this.draining; }
+
   setUnleashedCompleteCallback(cb: (jobName: string, result: string) => void): void {
     this.assistant.setUnleashedCompleteCallback(cb);
   }
@@ -330,6 +336,9 @@ export class Gateway {
     maxTurns?: number,
     onToolActivity?: OnToolActivityCallback,
   ): Promise<string> {
+    if (this.draining) {
+      return "I'm restarting momentarily — your message will be processed after I'm back online.";
+    }
     const releaseLane = await lanes.acquire('chat');
     try {
       const release = await this.acquireSessionLock(sessionKey);

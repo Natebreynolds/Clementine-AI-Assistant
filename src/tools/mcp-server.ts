@@ -3495,6 +3495,103 @@ server.tool(
   },
 );
 
+// ── Source Self-Edit Tools ──────────────────────────────────────────────
+
+const SELF_IMPROVE_DIR = path.join(BASE_DIR, 'self-improve');
+const PENDING_SOURCE_DIR = path.join(SELF_IMPROVE_DIR, 'pending-source-changes');
+
+server.tool(
+  'self_edit_source',
+  'Edit Clementine source code safely. Validates in a staging worktree, commits, builds, and triggers restart only if compilation succeeds. The daemon picks up the pending change and executes it.',
+  {
+    file: z.string().describe('Path relative to src/ (e.g., "channels/discord-agent-bot.ts")'),
+    content: z.string().describe('Complete new file content'),
+    reason: z.string().describe('Why this change is being made'),
+  },
+  async ({ file, content, reason }) => {
+    // Security blocklist
+    const BLOCKLIST = ['config.ts', 'gateway/security-scanner.ts', 'security/scanner.ts'];
+    if (BLOCKLIST.some(b => file === b || file.startsWith(b))) {
+      return textResult(`Blocked: ${file} is on the security blocklist and cannot be self-edited.`);
+    }
+
+    // Write pending change for the daemon to pick up
+    if (!existsSync(PENDING_SOURCE_DIR)) {
+      mkdirSync(PENDING_SOURCE_DIR, { recursive: true });
+    }
+
+    const id = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+    const pending = {
+      id,
+      file: `src/${file}`,
+      content,
+      reason,
+      createdAt: new Date().toISOString(),
+    };
+    writeFileSync(
+      path.join(PENDING_SOURCE_DIR, `${id}.json`),
+      JSON.stringify(pending, null, 2),
+    );
+
+    // Also signal the daemon via a file it watches
+    const signalFile = path.join(BASE_DIR, '.pending-source-edit');
+    writeFileSync(signalFile, JSON.stringify({ id, file: `src/${file}`, reason }));
+
+    return textResult(
+      `Source edit queued (id: ${id}).\n` +
+      `File: src/${file}\n` +
+      `Reason: ${reason}\n\n` +
+      `The daemon will validate in a staging worktree, then commit + build + restart if compilation succeeds.`,
+    );
+  },
+);
+
+server.tool(
+  'update_self',
+  'Check for and apply upstream code updates. Can check without applying, or check and apply in one step.',
+  {
+    action: z.enum(['check', 'apply']).describe('"check" to see if updates are available, "apply" to pull and restart'),
+  },
+  async ({ action }) => {
+    const __mcp_dirname = path.dirname(fileURLToPath(import.meta.url));
+    const pkgDir = path.resolve(__mcp_dirname, '..', '..');
+
+    if (action === 'check') {
+      try {
+        execSync('git fetch origin main --quiet', { cwd: pkgDir, stdio: 'pipe', timeout: 30_000 });
+        const countStr = execSync('git rev-list HEAD..origin/main --count', {
+          cwd: pkgDir, encoding: 'utf-8',
+        }).trim();
+        const count = parseInt(countStr, 10) || 0;
+
+        if (count === 0) {
+          return textResult('Already up to date. No new commits on origin/main.');
+        }
+
+        const summary = execSync('git log HEAD..origin/main --oneline', {
+          cwd: pkgDir, encoding: 'utf-8',
+        }).trim();
+
+        return textResult(`${count} update(s) available:\n${summary}\n\nUse update_self with action="apply" to install.`);
+      } catch (err) {
+        return textResult(`Update check failed: ${String(err)}`);
+      }
+    }
+
+    // action === 'apply' — write a signal file for the daemon
+    const signalFile = path.join(BASE_DIR, '.pending-update');
+    writeFileSync(signalFile, JSON.stringify({ requestedAt: new Date().toISOString() }));
+
+    return textResult(
+      'Update requested. The daemon will:\n' +
+      '1. Fetch and pull origin/main\n' +
+      '2. Rebase self-edits if any\n' +
+      '3. Rebuild and restart\n\n' +
+      'You will be notified when the restart completes.',
+    );
+  },
+);
+
 // ── Main ───────────────────────────────────────────────────────────────
 
 async function main() {
