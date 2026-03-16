@@ -434,7 +434,32 @@ function cmdDoctor(): void {
     issues++;
   }
 
-  // FalkorDB graph engine
+  // FalkorDB graph engine — system dependencies
+  try {
+    execSync('which redis-server', { stdio: 'pipe' });
+    console.log(`  ${GREEN}OK${RESET}  redis-server found`);
+  } catch {
+    console.log(`  ${RED}FAIL${RESET}  redis-server not found (required for knowledge graph)`);
+    console.log(`       Fix: brew install redis (macOS) or sudo apt install redis-server (Linux)`);
+    issues++;
+  }
+
+  try {
+    const libompPath = process.platform === 'darwin'
+      ? '/opt/homebrew/opt/libomp/lib/libomp.dylib'
+      : '/usr/lib/libomp.so';
+    if (existsSync(libompPath)) {
+      console.log(`  ${GREEN}OK${RESET}  libomp (OpenMP runtime) found`);
+    } else {
+      throw new Error('not found');
+    }
+  } catch {
+    console.log(`  ${RED}FAIL${RESET}  libomp (OpenMP runtime) not found (required for knowledge graph)`);
+    console.log(`       Fix: brew install libomp (macOS) or sudo apt install libomp-dev (Linux)`);
+    issues++;
+  }
+
+  // FalkorDB graph engine — module binaries
   try {
     const result = execSync(
       `node -e "const{BinaryManager}=require('falkordblite/dist/binary-manager.js');new BinaryManager().ensureBinaries().then(p=>{console.log(JSON.stringify(p));process.exit(0)}).catch(e=>{console.error(e.message);process.exit(1)})"`,
@@ -1035,14 +1060,34 @@ async function cmdUpdate(options: { restart?: boolean; dryRun?: boolean }): Prom
     console.error(`  ${YELLOW}WARN${RESET}  Native module rebuild failed — memory search may not work`);
   }
 
-  // 6c. Verify FalkorDB graph engine binaries
+  // 6c. Verify graph engine system dependencies + binaries
   console.log(`  ${S()} Verifying graph engine...`);
+  const missingDeps: string[] = [];
+  try { execSync('which redis-server', { stdio: 'pipe' }); } catch { missingDeps.push('redis-server'); }
+  const libompPath = process.platform === 'darwin'
+    ? '/opt/homebrew/opt/libomp/lib/libomp.dylib'
+    : '/usr/lib/libomp.so';
+  if (!existsSync(libompPath)) missingDeps.push('libomp');
+
+  if (missingDeps.length > 0) {
+    console.error(`  ${YELLOW}WARN${RESET}  Knowledge graph dependencies missing: ${missingDeps.join(', ')}`);
+    if (process.platform === 'darwin') {
+      console.error(`       Fix: brew install ${missingDeps.map(d => d === 'redis-server' ? 'redis' : d).join(' ')}`);
+    } else {
+      console.error(`       Fix: sudo apt install ${missingDeps.map(d => d === 'redis-server' ? 'redis-server' : 'libomp-dev').join(' ')}`);
+    }
+  }
+
   try {
     execSync(
       `node -e "const{BinaryManager}=require('falkordblite/dist/binary-manager.js');new BinaryManager().ensureBinaries().then(()=>process.exit(0)).catch(()=>process.exit(1))"`,
       { cwd: PACKAGE_ROOT, stdio: ['pipe', 'pipe', 'pipe'], timeout: 60000 },
     );
-    console.log(`  ${GREEN}OK${RESET}  FalkorDB graph engine ready`);
+    if (missingDeps.length === 0) {
+      console.log(`  ${GREEN}OK${RESET}  FalkorDB graph engine ready`);
+    } else {
+      console.log(`  ${GREEN}OK${RESET}  FalkorDB binaries ready (install system deps above for full graph support)`);
+    }
   } catch {
     console.error(`  ${YELLOW}WARN${RESET}  FalkorDB graph engine setup failed — knowledge graph features will be disabled`);
     console.error(`       Run: cd ${PACKAGE_ROOT} && node node_modules/falkordblite/scripts/postinstall.js`);

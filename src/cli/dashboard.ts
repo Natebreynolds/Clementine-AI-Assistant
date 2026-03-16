@@ -745,9 +745,9 @@ async function getMemory(): Promise<Record<string, unknown>> {
       const labelCounts = await gs.query('MATCH (n) RETURN labels(n)[0] AS label, count(n) AS c ORDER BY c DESC');
       graphStats = {
         available: true,
-        nodes: nodeCount[0]?.[0] ?? 0,
-        edges: edgeCount[0]?.[0] ?? 0,
-        labels: (labelCounts ?? []).map((r: any[]) => ({ label: r[0], count: r[1] })),
+        nodes: nodeCount[0]?.c ?? 0,
+        edges: edgeCount[0]?.c ?? 0,
+        labels: (labelCounts ?? []).map((r: any) => ({ label: r.label, count: r.c })),
       };
     }
   } catch { /* graph unavailable */ }
@@ -1309,15 +1309,16 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
         res.json({ nodes: [], edges: [], available: false });
         return;
       }
-      const nodes = await gs.query(
-        'MATCH (n) RETURN n.id AS id, labels(n)[0] AS label, properties(n) AS props LIMIT 200',
-      );
+      const nodes = await gs.query('MATCH (n) RETURN n LIMIT 200');
       const edges = await gs.query(
-        'MATCH (a)-[r]->(b) RETURN a.id AS from, b.id AS to, type(r) AS rel LIMIT 500',
+        'MATCH (a)-[r]->(b) RETURN a.id AS fromId, type(r) AS rel, b.id AS toId LIMIT 500',
       );
       res.json({
-        nodes: nodes.map((r: any[]) => ({ id: r[0], label: r[1], props: r[2] ?? {} })),
-        edges: edges.map((r: any[]) => ({ from: r[0], to: r[1], rel: r[2] })),
+        nodes: nodes.map((r: any) => {
+          const n = r.n ?? r;
+          return { id: n.properties?.id ?? '', label: (n.labels ?? [])[0] ?? '', props: n.properties ?? {} };
+        }),
+        edges: edges.map((r: any) => ({ from: r.fromId ?? '', to: r.toId ?? '', rel: r.rel ?? '' })),
         available: true,
       });
     } catch (err) {

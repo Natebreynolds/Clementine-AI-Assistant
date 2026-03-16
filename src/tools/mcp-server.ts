@@ -3444,7 +3444,9 @@ server.tool(
     }
     const results = await gs.query(query);
     if (results.length === 0) return textResult('No results.');
-    const formatted = results.map((row: any[]) => row.join(' | ')).join('\n');
+    const formatted = results.map((row: any) =>
+      typeof row === 'object' ? Object.values(row).map(v => typeof v === 'object' ? JSON.stringify(v) : String(v)).join(' | ') : String(row)
+    ).join('\n');
     return textResult(formatted);
   },
 );

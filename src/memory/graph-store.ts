@@ -161,8 +161,9 @@ export class GraphStore {
         { params: { id } },
       );
       if (result.data && result.data.length > 0) {
-        const node = result.data[0][0];
-        return { label: safeLabel, id, properties: node?.properties ?? node ?? {} };
+        const row = result.data[0];
+        const node = row.n ?? row;
+        return { label: safeLabel, id, properties: node?.properties ?? {} };
       }
     } catch { /* not found */ }
     return null;
@@ -226,10 +227,10 @@ export class GraphStore {
         if (res.data) {
           for (const row of res.data) {
             results.push({
-              from: row[0],
-              to: row[1],
-              type: row[2],
-              properties: row[3] ?? {},
+              from: row.from,
+              to: row.to,
+              type: row.rel,
+              properties: row.props ?? {},
             });
           }
         }
@@ -260,13 +261,13 @@ export class GraphStore {
       const seen = new Set<string>();
       const results: TraversalResult[] = [];
       for (const row of res.data) {
-        const eid = row[0];
+        const eid = row.id;
         if (seen.has(eid)) continue;
         seen.add(eid);
         results.push({
-          entity: { label: row[1] ?? 'Unknown', id: eid, properties: row[2] ?? {} },
-          depth: row[3],
-          path: row[4] ?? [],
+          entity: { label: row.label ?? 'Unknown', id: eid, properties: row.props ?? {} },
+          depth: row.depth,
+          path: row.rels ?? [],
         });
       }
       return results;
@@ -285,12 +286,12 @@ export class GraphStore {
       const res = await this.graph.query(cypher, { params: { from: fromId, to: toId } });
       if (!res.data || res.data.length === 0) return null;
       const row = res.data[0];
-      const nodes: EntityNode[] = (row[0] ?? []).map((n: any) => ({
+      const nodes: EntityNode[] = (row.nodes ?? []).map((n: any) => ({
         label: n.label ?? 'Unknown',
         id: n.id,
         properties: n.props ?? {},
       }));
-      const relationships: string[] = row[1] ?? [];
+      const relationships: string[] = row.rels ?? [];
       return { nodes, relationships, length: relationships.length };
     } catch {
       return null;
@@ -308,8 +309,8 @@ export class GraphStore {
       if (!res.data) return [];
       return res.data.map((row: any) => ({
         label: safeLabel,
-        id: row[0],
-        properties: row[1] ?? {},
+        id: row.id,
+        properties: row.props ?? {},
       }));
     } catch {
       return [];
@@ -338,7 +339,7 @@ export class GraphStore {
     // Check if graph already has data (skip full sync if so)
     try {
       const countRes = await this.graph.query('MATCH (n) RETURN count(n) AS c');
-      const count = countRes.data?.[0]?.[0] ?? 0;
+      const count = countRes.data?.[0]?.c ?? 0;
       if (count > 0) {
         logger.info({ existingNodes: count }, 'Graph already populated — skipping full sync');
         return { nodesCreated: 0, relationshipsCreated: 0, duration: Date.now() - start };
