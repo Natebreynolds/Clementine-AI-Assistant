@@ -51,6 +51,10 @@ const logger = pino({ name: 'clementine.heartbeat' });
 /** Default timeout for standard cron jobs (10 minutes). */
 const CRON_STANDARD_TIMEOUT_MS = 10 * 60 * 1000;
 
+/** System timezone for cron scheduling — ensures jobs fire at local time
+ *  regardless of how the daemon is launched (launchd, pm2, etc.). */
+const SYSTEM_TIMEZONE = Intl.DateTimeFormat().resolvedOptions().timeZone;
+
 // ── Daily Note Activity Logger ───────────────────────────────────────
 
 /** Local-time YYYY-MM-DD for daily note path. */
@@ -877,9 +881,9 @@ export class CronScheduler {
           this.runJob(def).catch((err) => {
             logger.error({ err, job: def.name }, `Cron job '${def.name}' failed`);
           });
-        });
+        }, { timezone: SYSTEM_TIMEZONE });
         this.scheduledTasks.set(def.name, task);
-        logger.info(`Cron job '${def.name}' scheduled: ${def.schedule}`);
+        logger.info(`Cron job '${def.name}' scheduled: ${def.schedule} (${SYSTEM_TIMEZONE})`);
       }
     }
   }
@@ -1192,9 +1196,9 @@ export class CronScheduler {
         this.runWorkflow(wf.name).catch(err => {
           logger.error({ err, workflow: wf.name }, `Scheduled workflow '${wf.name}' failed`);
         });
-      });
+      }, { timezone: SYSTEM_TIMEZONE });
       this.workflowTasks.set(wf.name, task);
-      logger.info(`Workflow '${wf.name}' scheduled: ${wf.trigger.schedule}`);
+      logger.info(`Workflow '${wf.name}' scheduled: ${wf.trigger.schedule} (${SYSTEM_TIMEZONE})`);
     }
 
     logger.info(`Loaded ${this.workflowDefs.length} workflow(s), ${this.workflowTasks.size} scheduled`);
