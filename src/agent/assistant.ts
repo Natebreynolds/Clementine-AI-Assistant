@@ -742,6 +742,7 @@ Delegate data-heavy work (SEO, analytics, bulk API calls for 3+ entities) to sub
     sourceOverride?: 'owner-dm' | 'owner-channel' | 'autonomous';
     disableAllTools?: boolean;
     verboseLevel?: VerboseLevel;
+    abortController?: AbortController;
   } = {}): SDKOptions {
     const {
       isHeartbeat = false,
@@ -757,6 +758,7 @@ Delegate data-heavy work (SEO, analytics, bulk API calls for 3+ entities) to sub
       sourceOverride,
       disableAllTools = false,
       verboseLevel,
+      abortController,
     } = opts;
 
     let allowedTools = [
@@ -867,6 +869,7 @@ Delegate data-heavy work (SEO, analytics, bulk API calls for 3+ entities) to sub
           },
         },
       },
+      ...(abortController ? { abortController } : {}),
       maxTurns: effectiveMaxTurns,
       cwd: BASE_DIR,
       env: SAFE_ENV,
@@ -989,6 +992,7 @@ Delegate data-heavy work (SEO, analytics, bulk API calls for 3+ entities) to sub
       securityAnnotation?: string;
       projectOverride?: ProjectMeta;
       verboseLevel?: VerboseLevel;
+      abortController?: AbortController;
     },
   ): Promise<[string, string]> {
     const onText = options?.onText;
@@ -999,6 +1003,7 @@ Delegate data-heavy work (SEO, analytics, bulk API calls for 3+ entities) to sub
     const securityAnnotation = options?.securityAnnotation;
     const projectOverride = options?.projectOverride;
     const verboseLevel = options?.verboseLevel;
+    const abortController = options?.abortController;
     const key = sessionKey ?? undefined;
     this._lastUserMessage = text;
     let sessionRotated = false;
@@ -1095,7 +1100,7 @@ Delegate data-heavy work (SEO, analytics, bulk API calls for 3+ entities) to sub
     }
 
     let [responseText, sessionId] = await this.runQuery(
-      effectivePrompt, key, onText, model, profile, securityAnnotation, maxTurns, projectOverride, onToolActivity, verboseLevel,
+      effectivePrompt, key, onText, model, profile, securityAnnotation, maxTurns, projectOverride, onToolActivity, verboseLevel, abortController,
     );
 
     // If we got a context-length / prompt-too-long error, retry with a fresh session
@@ -1120,7 +1125,7 @@ Delegate data-heavy work (SEO, analytics, bulk API calls for 3+ entities) to sub
           `If this task involves pulling data for multiple entities, delegate each to a sub-agent using the Agent tool ` +
           `instead of calling data-heavy tools directly.\n\n${text}`;
       }
-      [responseText, sessionId] = await this.runQuery(retryPrompt, key, onText, model, profile, securityAnnotation, maxTurns, undefined, onToolActivity, verboseLevel);
+      [responseText, sessionId] = await this.runQuery(retryPrompt, key, onText, model, profile, securityAnnotation, maxTurns, undefined, onToolActivity, verboseLevel, abortController);
     }
 
     // Track exchange count, timestamp, and last exchange
@@ -1176,6 +1181,7 @@ Delegate data-heavy work (SEO, analytics, bulk API calls for 3+ entities) to sub
     projectOverride?: ProjectMeta,
     onToolActivity?: OnToolActivityCallback,
     verboseLevel?: VerboseLevel,
+    abortController?: AbortController,
   ): Promise<[string, string]> {
     // Parallelize context retrieval and project matching — they're independent
     // If a project override is set, skip auto-matching entirely
@@ -1204,7 +1210,7 @@ Delegate data-heavy work (SEO, analytics, bulk API calls for 3+ entities) to sub
 
     try {
       for (let attempt = 0; attempt <= PersonalAssistant.RATE_LIMIT_MAX_RETRIES; attempt++) {
-        const sdkOptions = this.buildOptions({ model, maxTurns: maxTurnsOverride ?? null, retrievalContext, profile, sessionKey, streaming: !!onText, verboseLevel });
+        const sdkOptions = this.buildOptions({ model, maxTurns: maxTurnsOverride ?? null, retrievalContext, profile, sessionKey, streaming: !!onText, verboseLevel, abortController });
 
         // If a project matched, switch cwd so the agent gets its tools/CLAUDE.md
         if (matchedProject) {
