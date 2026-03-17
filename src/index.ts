@@ -773,6 +773,14 @@ function main(): void {
   ensureSingleton();
   process.on('exit', cleanupPid);
 
+  // Global safety net — log unhandled errors instead of crashing the daemon
+  process.on('uncaughtException', (err) => {
+    logger.error({ err }, 'Uncaught exception — daemon staying alive');
+  });
+  process.on('unhandledRejection', (err) => {
+    logger.error({ err }, 'Unhandled promise rejection — daemon staying alive');
+  });
+
   // First-run auto-setup
   const envFile = path.join(config.BASE_DIR, '.env');
   if (!existsSync(envFile)) {

@@ -47,7 +47,10 @@ export class SlackStreamingMessage {
   private ts: string | null = null;
   private lastEdit = 0;
   private pendingText = '';
+  private lastFlushedText = '';
   private isFinal = false;
+  private toolStatus = '';
+  private flushTimer: ReturnType<typeof setTimeout> | null = null;
 
   /** The message timestamp (available after start). Used for reaction tracking. */
   get messageTs(): string | null { return this.ts; }
@@ -68,15 +71,40 @@ export class SlackStreamingMessage {
     this.lastEdit = Date.now();
   }
 
+  /** Update the tool activity status line shown during streaming. */
+  setToolStatus(status: string): void {
+    this.toolStatus = status;
+    // Trigger a flush so the status is displayed during long tool chains
+    const elapsed = Date.now() - this.lastEdit;
+    if (elapsed >= STREAM_UPDATE_INTERVAL) {
+      this.flush().catch(() => {});
+    } else if (!this.flushTimer) {
+      this.flushTimer = setTimeout(() => {
+        this.flushTimer = null;
+        this.flush().catch(() => {});
+      }, STREAM_UPDATE_INTERVAL - elapsed);
+    }
+  }
+
   async update(text: string): Promise<void> {
     this.pendingText = text;
-    if (Date.now() - this.lastEdit >= STREAM_UPDATE_INTERVAL) {
+    const elapsed = Date.now() - this.lastEdit;
+    if (elapsed >= STREAM_UPDATE_INTERVAL) {
       await this.flush();
+    } else if (!this.flushTimer) {
+      this.flushTimer = setTimeout(() => {
+        this.flushTimer = null;
+        this.flush().catch(() => {});
+      }, STREAM_UPDATE_INTERVAL - elapsed);
     }
   }
 
   async finalize(text: string): Promise<void> {
     this.isFinal = true;
+    if (this.flushTimer) {
+      clearTimeout(this.flushTimer);
+      this.flushTimer = null;
+    }
     if (!text) text = '_(no response)_';
     text = mdToSlack(text);
 
@@ -97,12 +125,18 @@ export class SlackStreamingMessage {
   }
 
   private async flush(): Promise<void> {
-    if (!this.ts || !this.pendingText || this.isFinal) return;
+    if (!this.ts || this.isFinal) return;
+    if (!this.pendingText && !this.toolStatus) return;
+    if (this.pendingText === this.lastFlushedText && !this.toolStatus) return;
     let display = mdToSlack(this.pendingText);
+    const statusLine = this.toolStatus ? `\n\n_${this.toolStatus}_` : '\n\n:writing_hand: _typing..._';
     if (display.length > SLACK_MSG_LIMIT) {
       display = display.slice(0, SLACK_MSG_LIMIT) + '\n\n_...streaming..._';
+    } else if (display) {
+      display = display + statusLine;
     } else {
-      display = display + '\n\n:writing_hand: _typing..._';
+      // No text yet — show tool status as the main content
+      display = this.toolStatus ? `:sparkles: _${this.toolStatus}_` : ':sparkles: _thinking..._';
     }
     try {
       await this.client.chat.update({
@@ -110,6 +144,7 @@ export class SlackStreamingMessage {
         ts: this.ts,
         text: display,
       });
+      this.lastFlushedText = this.pendingText;
       this.lastEdit = Date.now();
     } catch {
       // Rate limit or message deleted — ignore
