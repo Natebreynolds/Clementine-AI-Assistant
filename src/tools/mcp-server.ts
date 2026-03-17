@@ -2639,6 +2639,45 @@ server.tool(
   },
 );
 
+// ── Trigger Cron Job ────────────────────────────────────────────────────
+
+const TRIGGER_DIR = path.join(BASE_DIR, 'cron', 'triggers');
+
+server.tool(
+  'trigger_cron_job',
+  'Trigger an existing cron job to run immediately in the background. The daemon picks up the trigger and runs the job asynchronously — results are delivered via notifications. Use this when committing to background work (audits, research, etc.) instead of trying to do it all in the current chat turn.',
+  {
+    job_name: z.string().describe('Exact name of the cron job to trigger (use list_cron_jobs to see available jobs)'),
+  },
+  async ({ job_name }) => {
+    // Verify the job exists in CRON.md
+    const cronPath = path.join(SYSTEM_DIR, 'CRON.md');
+    if (!existsSync(cronPath)) {
+      return textResult('No CRON.md found. Create cron jobs first with add_cron_job.');
+    }
+
+    const raw = readFileSync(cronPath, 'utf-8');
+    const matterMod = await import('gray-matter');
+    const { data } = matterMod.default(raw);
+    const jobs = Array.isArray(data?.jobs) ? data.jobs : [];
+    const job = jobs.find((j: any) => String(j.name ?? '') === job_name);
+    if (!job) {
+      const available = jobs.map((j: any) => String(j.name ?? '')).filter(Boolean).join(', ');
+      return textResult(`Job "${job_name}" not found. Available: ${available || 'none'}`);
+    }
+
+    // Write trigger file for the daemon to pick up
+    mkdirSync(TRIGGER_DIR, { recursive: true });
+    const triggerFile = path.join(TRIGGER_DIR, `${Date.now()}-${job_name.replace(/[^a-zA-Z0-9_-]/g, '_')}.trigger`);
+    writeFileSync(triggerFile, job_name, 'utf-8');
+
+    return textResult(
+      `Triggered "${job_name}" — the daemon will pick it up within a few seconds and run it in the background. ` +
+      `Results will be delivered via notifications when complete.`,
+    );
+  },
+);
+
 // ── Workflow Tools ──────────────────────────────────────────────────────
 
 const WORKFLOWS_DIR = path.join(SYSTEM_DIR, 'workflows');

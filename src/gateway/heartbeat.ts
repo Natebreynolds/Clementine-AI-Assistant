@@ -16,6 +16,7 @@ import {
   readFileSync,
   readdirSync,
   statSync,
+  unlinkSync,
   watchFile,
   unwatchFile,
   writeFileSync,
@@ -688,6 +689,10 @@ export class CronScheduler {
   private runningWorkflows = new Set<string>();
   private watchingWorkflows = false;
 
+  // Trigger directory for MCP-initiated job runs
+  private triggerDir = path.join(BASE_DIR, 'cron', 'triggers');
+  private triggerTimer: ReturnType<typeof setInterval> | null = null;
+
   // Event-driven status change listeners (used by Discord status embed)
   private statusChangeListeners: Array<() => void> = [];
 
@@ -714,6 +719,8 @@ export class CronScheduler {
     this.watchCronFile();
     this.watchAgentsDir();
     this.watchWorkflowDir();
+
+    this.watchTriggers();
 
     // Wire up push notifications for unleashed task completions
     this.gateway.setUnleashedCompleteCallback((jobName, result) => {
@@ -745,6 +752,10 @@ export class CronScheduler {
     this.unwatchCronFile();
     this.unwatchAgentsDir();
     this.unwatchWorkflowDir();
+    if (this.triggerTimer) {
+      clearInterval(this.triggerTimer);
+      this.triggerTimer = null;
+    }
     logger.info('Cron scheduler stopped');
   }
 
@@ -1226,6 +1237,40 @@ export class CronScheduler {
       unwatchFile(WORKFLOWS_DIR);
     } catch { /* ignore */ }
     this.watchingWorkflows = false;
+  }
+
+  /** Watch the triggers directory for MCP-initiated job runs. */
+  private watchTriggers(): void {
+    mkdirSync(this.triggerDir, { recursive: true });
+    this.triggerTimer = setInterval(() => this.processTriggers(), 3000);
+  }
+
+  /** Process any pending trigger files and run the corresponding jobs. */
+  private processTriggers(): void {
+    if (!existsSync(this.triggerDir)) return;
+    let files: string[];
+    try {
+      files = readdirSync(this.triggerDir).filter(f => f.endsWith('.trigger'));
+    } catch { return; }
+    for (const file of files) {
+      const filePath = path.join(this.triggerDir, file);
+      try {
+        const jobName = readFileSync(filePath, 'utf-8').trim();
+        unlinkSync(filePath);
+        if (!jobName) continue;
+        logger.info({ jobName }, 'Processing MCP trigger for cron job');
+        this.runManual(jobName).then((result) => {
+          if (result && !result.includes('not found')) {
+            this.dispatcher.send(`🔧 **${jobName}** (triggered):\n\n${result.slice(0, 1500)}`).catch(() => {});
+          }
+        }).catch((err) => {
+          logger.error({ err, jobName }, 'Trigger-initiated job failed');
+        });
+      } catch (err) {
+        logger.warn({ err, file }, 'Failed to process trigger file');
+        try { unlinkSync(filePath); } catch { /* ignore */ }
+      }
+    }
   }
 
   async runWorkflow(name: string, inputs?: Record<string, string>): Promise<string> {
