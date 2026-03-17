@@ -718,6 +718,12 @@ export class CronScheduler {
       }
     });
 
+    // Wire up phase progress notifications for unleashed tasks
+    this.gateway.setPhaseCompleteCallback((jobName, phase, _total, output) => {
+      const preview = output.slice(0, 500);
+      this.dispatcher.send(`⏳ **${jobName}** — phase ${phase} complete:\n${preview}`).catch(() => {});
+    });
+
     logger.info(`Cron scheduler started with ${this.jobs.length} jobs`);
   }
 

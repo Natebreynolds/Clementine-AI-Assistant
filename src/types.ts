@@ -310,7 +310,7 @@ export interface SelfImproveExperiment {
   startedAt: string;                   // ISO
   finishedAt: string;                  // ISO
   durationMs: number;
-  area: 'soul' | 'cron' | 'workflow' | 'memory' | 'agent' | 'source';
+  area: 'soul' | 'cron' | 'workflow' | 'memory' | 'agent' | 'source' | 'communication';
   target: string;                      // e.g., "SOUL.md personality section"
   hypothesis: string;                  // What the LLM decided to try
   proposedChange: string;              // The actual modification
@@ -341,7 +341,7 @@ export interface SelfImproveConfig {
   maxDurationMs: number;               // Default: 3_600_000 (1 hour)
   acceptThreshold: number;             // Default: 0.6 (score must beat this)
   plateauLimit: number;                // Default: 3 consecutive low-score stops loop
-  areas: ('soul' | 'cron' | 'workflow' | 'memory' | 'agent' | 'source')[];
+  areas: ('soul' | 'cron' | 'workflow' | 'memory' | 'agent' | 'source' | 'communication')[];
 }
 
 // ── Restart Sentinel ────────────────────────────────────────────────
@@ -392,6 +392,10 @@ export interface GraphSyncStats {
   relationshipsCreated: number;
   duration: number;
 }
+
+// ── Verbose Level ───────────────────────────────────────────────────
+
+export type VerboseLevel = 'quiet' | 'normal' | 'detailed';
 
 // ── Utility types ────────────────────────────────────────────────────
 

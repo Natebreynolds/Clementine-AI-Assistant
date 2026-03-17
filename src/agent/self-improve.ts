@@ -26,6 +26,7 @@ import {
   BASE_DIR,
   SELF_IMPROVE_DIR,
   SOUL_FILE,
+  AGENTS_FILE,
   CRON_FILE,
   WORKFLOWS_DIR,
   VAULT_DIR,
@@ -52,7 +53,7 @@ const DEFAULT_CONFIG: SelfImproveConfig = {
   maxDurationMs: 3_600_000,         // 1 hour
   acceptThreshold: 0.6,
   plateauLimit: 3,
-  areas: ['soul', 'cron', 'workflow', 'memory', 'agent', 'source'],
+  areas: ['soul', 'cron', 'workflow', 'memory', 'agent', 'source', 'communication'],
 };
 
 // ── Paths ────────────────────────────────────────────────────────────
@@ -297,6 +298,7 @@ export class SelfImproveLoop {
   ): Promise<{ area: SelfImproveExperiment['area']; target: string; hypothesis: string; proposedChange: string } | null> {
     // Read current configuration files
     const soulContent = existsSync(SOUL_FILE) ? readFileSync(SOUL_FILE, 'utf-8').slice(0, 3000) : '(not found)';
+    const agentsContent = existsSync(AGENTS_FILE) ? readFileSync(AGENTS_FILE, 'utf-8').slice(0, 2000) : '(not found)';
     const cronContent = existsSync(CRON_FILE) ? readFileSync(CRON_FILE, 'utf-8').slice(0, 2000) : '(not found)';
 
     let workflowSummaries = '(none)';
@@ -347,9 +349,14 @@ export class SelfImproveLoop {
       `- Feedback: ${metrics.feedbackStats.positive} positive, ${metrics.feedbackStats.negative} negative, ${metrics.feedbackStats.mixed} mixed (${metrics.feedbackStats.total} total)\n` +
       `- Cron success rate: ${(metrics.cronSuccessRate * 100).toFixed(1)}%\n\n` +
       `### Negative feedback examples:\n${negativeFeedbackText}\n\n` +
+      `### Communication signals in feedback:\n` +
+      `- "silent", "no update", "how's it going" → agent didn't report progress\n` +
+      `- "too verbose", "just do it" → over-communication\n` +
+      `- "confused", "what happened" → unclear status\n\n` +
       `### Cron job errors:\n${cronErrorsText}\n\n` +
       `## Current Configuration\n` +
       `### SOUL.md (personality/behavior):\n${soulContent}\n\n` +
+      `### AGENTS.md (operating instructions):\n${agentsContent}\n\n` +
       `### CRON.md (scheduled jobs):\n${cronContent}\n\n` +
       `### Workflows:\n${workflowSummaries}\n\n` +
       `### Agent configs (team members with their own personality/tools):\n${agentSummaries}\n\n` +
@@ -362,7 +369,7 @@ export class SelfImproveLoop {
       `- IMPORTANT: "proposedChange" must be the COMPLETE updated file content (not just the diff or changed section), because it will replace the entire file\n` +
       `- If there's no clear improvement needed, output: { "area": null }\n\n` +
       `Output ONLY a JSON object with this structure (no markdown, no explanation):\n` +
-      `{ "area": "soul"|"cron"|"workflow"|"memory"|"agent", "target": "file name or section (for agent, use the slug e.g. 'sasha-the-cmo')", "hypothesis": "what will improve and why", "proposedChange": "the complete updated file content with your minimal change applied" }`;
+      `{ "area": "soul"|"cron"|"workflow"|"memory"|"agent"|"communication", "target": "file name or section (for agent, use the slug; for communication, use 'AGENTS.md')", "hypothesis": "what will improve and why", "proposedChange": "the complete updated file content with your minimal change applied" }`;
 
     const result = await this.assistant.runPlanStep('si-hypothesize', prompt, {
       tier: 2,
@@ -398,6 +405,8 @@ export class SelfImproveLoop {
         const srcFile = path.join(PKG_DIR, 'src', target);
         return existsSync(srcFile) ? readFileSync(srcFile, 'utf-8') : '';
       }
+      case 'communication':
+        return existsSync(AGENTS_FILE) ? readFileSync(AGENTS_FILE, 'utf-8') : '';
       case 'memory':
         return `(memory configuration — target: ${target})`;
       default:
@@ -645,6 +654,8 @@ export class SelfImproveLoop {
       case 'source': {
         return path.join(PKG_DIR, 'src', target);
       }
+      case 'communication':
+        return AGENTS_FILE;
       default:
         return null;
     }

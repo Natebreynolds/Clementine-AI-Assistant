@@ -127,6 +127,20 @@ export async function startSlack(
     const threadTs = ('thread_ts' in message ? message.thread_ts : undefined) ?? message.ts;
     const sessionKey = `slack:user:${userId}`;
 
+    // ── !verbose command intercept ─────────────────────────────────
+    if (text.startsWith('!verbose')) {
+      const parts = text.split(/\s+/);
+      const level = parts[1]?.toLowerCase();
+      if (level === 'quiet' || level === 'normal' || level === 'detailed') {
+        gateway.setSessionVerboseLevel(sessionKey, level);
+        await client.chat.postMessage({ channel, thread_ts: threadTs, text: `Verbose level set to *${level}*.` });
+      } else {
+        const current = gateway.getSessionVerboseLevel(sessionKey) ?? 'normal';
+        await client.chat.postMessage({ channel, thread_ts: threadTs, text: `Current verbose level: *${current}*\nOptions: \`!verbose quiet\`, \`!verbose normal\`, \`!verbose detailed\`` });
+      }
+      return;
+    }
+
     const streamer = new SlackStreamingMessage(client, channel, threadTs);
     await streamer.start();
 

@@ -49,7 +49,7 @@ import {
   UNLEASHED_MAX_PHASES,
   PROJECTS_META_FILE,
 } from '../config.js';
-import type { AgentProfile, OnTextCallback, OnToolActivityCallback, SessionData } from '../types.js';
+import type { AgentProfile, OnTextCallback, OnToolActivityCallback, SessionData, VerboseLevel } from '../types.js';
 import {
   enforceToolPermissions,
   getSecurityPrompt,
@@ -427,6 +427,7 @@ export class PersonalAssistant {
   private memoryStore: any = null; // Typed as any — MemoryStore may not be available yet
   private _lastUserMessage?: string;
   private onUnleashedComplete: ((jobName: string, result: string) => void) | null = null;
+  private onPhaseComplete: ((jobName: string, phase: number, totalPhases: number, output: string) => void) | null = null;
 
   constructor() {
     this.profileManager = new AgentManager(AGENTS_DIR, PROFILES_DIR);
@@ -450,6 +451,10 @@ export class PersonalAssistant {
 
   setUnleashedCompleteCallback(cb: (jobName: string, result: string) => void): void {
     this.onUnleashedComplete = cb;
+  }
+
+  setPhaseCompleteCallback(cb: (jobName: string, phase: number, totalPhases: number, output: string) => void): void {
+    this.onPhaseComplete = cb;
   }
 
   private async initMemoryStore(): Promise<void> {
@@ -547,8 +552,9 @@ export class PersonalAssistant {
     profile?: AgentProfile | null;
     sessionKey?: string | null;
     model?: string | null;
+    verboseLevel?: VerboseLevel;
   } = {}): string {
-    const { isHeartbeat = false, cronTier = null, retrievalContext = '', profile = null, sessionKey = null, model = null } = opts;
+    const { isHeartbeat = false, cronTier = null, retrievalContext = '', profile = null, sessionKey = null, model = null, verboseLevel } = opts;
     const isAutonomous = isHeartbeat || cronTier !== null;
     const parts: string[] = [];
     const owner = OWNER;
@@ -706,6 +712,13 @@ Delegate data-heavy work (SEO, analytics, bulk API calls for 3+ entities) to sub
       if (fbEntry?.data?.patterns_summary) {
         parts.push(`## Communication Preferences\n\n${fbEntry.data.patterns_summary}`);
       }
+
+      // Verbose level overrides
+      if (verboseLevel === 'quiet') {
+        parts.push(`## Verbosity: Quiet\n\nGive results directly. Skip reasoning and progress updates unless asked.`);
+      } else if (verboseLevel === 'detailed') {
+        parts.push(`## Verbosity: Detailed\n\nExplain your reasoning, share intermediate findings, think out loud.`);
+      }
     }
 
     // Security rules are now passed via appendSystemPrompt in buildOptions()
@@ -728,6 +741,7 @@ Delegate data-heavy work (SEO, analytics, bulk API calls for 3+ entities) to sub
     isPlanStep?: boolean;
     sourceOverride?: 'owner-dm' | 'owner-channel' | 'autonomous';
     disableAllTools?: boolean;
+    verboseLevel?: VerboseLevel;
   } = {}): SDKOptions {
     const {
       isHeartbeat = false,
@@ -742,6 +756,7 @@ Delegate data-heavy work (SEO, analytics, bulk API calls for 3+ entities) to sub
       isPlanStep = false,
       sourceOverride,
       disableAllTools = false,
+      verboseLevel,
     } = opts;
 
     let allowedTools = [
@@ -832,7 +847,7 @@ Delegate data-heavy work (SEO, analytics, bulk API calls for 3+ entities) to sub
 
     return {
       customSystemPrompt: this.buildSystemPrompt({
-        isHeartbeat, cronTier: isPlanStep ? null : cronTier, retrievalContext, profile, sessionKey, model,
+        isHeartbeat, cronTier: isPlanStep ? null : cronTier, retrievalContext, profile, sessionKey, model, verboseLevel,
       }),
       appendSystemPrompt: securityPrompt,
       model: resolvedModel,
@@ -973,6 +988,7 @@ Delegate data-heavy work (SEO, analytics, bulk API calls for 3+ entities) to sub
       profile?: AgentProfile;
       securityAnnotation?: string;
       projectOverride?: ProjectMeta;
+      verboseLevel?: VerboseLevel;
     },
   ): Promise<[string, string]> {
     const onText = options?.onText;
@@ -982,6 +998,7 @@ Delegate data-heavy work (SEO, analytics, bulk API calls for 3+ entities) to sub
     const profile = options?.profile;
     const securityAnnotation = options?.securityAnnotation;
     const projectOverride = options?.projectOverride;
+    const verboseLevel = options?.verboseLevel;
     const key = sessionKey ?? undefined;
     this._lastUserMessage = text;
     let sessionRotated = false;
@@ -1078,7 +1095,7 @@ Delegate data-heavy work (SEO, analytics, bulk API calls for 3+ entities) to sub
     }
 
     let [responseText, sessionId] = await this.runQuery(
-      effectivePrompt, key, onText, model, profile, securityAnnotation, maxTurns, projectOverride, onToolActivity,
+      effectivePrompt, key, onText, model, profile, securityAnnotation, maxTurns, projectOverride, onToolActivity, verboseLevel,
     );
 
     // If we got a context-length / prompt-too-long error, retry with a fresh session
@@ -1103,7 +1120,7 @@ Delegate data-heavy work (SEO, analytics, bulk API calls for 3+ entities) to sub
           `If this task involves pulling data for multiple entities, delegate each to a sub-agent using the Agent tool ` +
           `instead of calling data-heavy tools directly.\n\n${text}`;
       }
-      [responseText, sessionId] = await this.runQuery(retryPrompt, key, onText, model, profile, securityAnnotation, maxTurns, undefined, onToolActivity);
+      [responseText, sessionId] = await this.runQuery(retryPrompt, key, onText, model, profile, securityAnnotation, maxTurns, undefined, onToolActivity, verboseLevel);
     }
 
     // Track exchange count, timestamp, and last exchange
@@ -1158,6 +1175,7 @@ Delegate data-heavy work (SEO, analytics, bulk API calls for 3+ entities) to sub
     maxTurnsOverride?: number,
     projectOverride?: ProjectMeta,
     onToolActivity?: OnToolActivityCallback,
+    verboseLevel?: VerboseLevel,
   ): Promise<[string, string]> {
     // Parallelize context retrieval and project matching — they're independent
     // If a project override is set, skip auto-matching entirely
@@ -1186,7 +1204,7 @@ Delegate data-heavy work (SEO, analytics, bulk API calls for 3+ entities) to sub
 
     try {
       for (let attempt = 0; attempt <= PersonalAssistant.RATE_LIMIT_MAX_RETRIES; attempt++) {
-        const sdkOptions = this.buildOptions({ model, maxTurns: maxTurnsOverride ?? null, retrievalContext, profile, sessionKey, streaming: !!onText });
+        const sdkOptions = this.buildOptions({ model, maxTurns: maxTurnsOverride ?? null, retrievalContext, profile, sessionKey, streaming: !!onText, verboseLevel });
 
         // If a project matched, switch cwd so the agent gets its tools/CLAUDE.md
         if (matchedProject) {
@@ -2090,6 +2108,11 @@ Delegate data-heavy work (SEO, analytics, bulk API calls for 3+ entities) to sub
       });
 
       logger.info(`Unleashed task ${jobName}: phase ${phase} complete (${(phaseDurationMs / 1000).toFixed(0)}s)`);
+
+      // Notify phase progress callback
+      if (this.onPhaseComplete) {
+        try { this.onPhaseComplete(jobName, phase, UNLEASHED_MAX_PHASES, lastOutput); } catch { /* non-fatal */ }
+      }
 
       // Check if the agent signaled completion
       if (lastOutput.includes('TASK_COMPLETE:')) {
