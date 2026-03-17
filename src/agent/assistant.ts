@@ -2030,6 +2030,17 @@ Delegate data-heavy work (SEO, analytics, bulk API calls for 3+ entities) to sub
       let phaseOutput = '';
       let phaseSessionId = '';
 
+      // Per-phase timeout: abort if overall deadline is reached during a phase.
+      // Without this, a stuck SDK query hangs the entire unleashed task indefinitely
+      // because the deadline check only runs between phases.
+      const phaseTimeoutMs = Math.max(deadline - Date.now(), 0);
+      const phaseAc = new AbortController();
+      const phaseTimer = setTimeout(() => {
+        phaseAc.abort();
+        logger.warn({ job: jobName, phase }, `Unleashed phase ${phase} aborted — deadline reached during execution`);
+      }, phaseTimeoutMs);
+      sdkOptions.abortController = phaseAc;
+
       try {
         const stream = query({ prompt, options: sdkOptions });
 
@@ -2064,6 +2075,7 @@ Delegate data-heavy work (SEO, analytics, bulk API calls for 3+ entities) to sub
           }
         }
       } catch (err) {
+        clearTimeout(phaseTimer);
         logger.error({ err, jobName, phase }, `Unleashed task phase ${phase} error`);
         appendProgress({ event: 'phase_error', phase, error: String(err) });
         consecutiveErrors++;
@@ -2084,6 +2096,7 @@ Delegate data-heavy work (SEO, analytics, bulk API calls for 3+ entities) to sub
         continue;
       }
 
+      clearTimeout(phaseTimer);
       const phaseDurationMs = Date.now() - phaseStart;
       sessionId = phaseSessionId;
       lastOutput = phaseOutput.trim();
