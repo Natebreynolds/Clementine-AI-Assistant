@@ -8,7 +8,7 @@
 import path from 'node:path';
 import pino from 'pino';
 import { PersonalAssistant, type ProjectMeta } from '../agent/assistant.js';
-import type { OnTextCallback, OnToolActivityCallback, PlanProgressUpdate, PlanStep, SelfImproveConfig, SelfImproveExperiment, SelfImproveState, SessionProvenance, TeamMessage, WorkflowDefinition } from '../types.js';
+import type { OnTextCallback, OnToolActivityCallback, PlanProgressUpdate, PlanStep, SelfImproveConfig, SelfImproveExperiment, SelfImproveState, SessionProvenance, TeamMessage, VerboseLevel, WorkflowDefinition } from '../types.js';
 import { SelfImproveLoop } from '../agent/self-improve.js';
 import { MODELS, PROFILES_DIR, AGENTS_DIR, TEAM_COMMS_CHANNEL, TEAM_COMMS_LOG } from '../config.js';
 import { scanner } from '../security/scanner.js';
@@ -26,6 +26,7 @@ export class Gateway {
   private approvalResolvers = new Map<string, (result: boolean | string) => void>();
   private approvalCounter = 0;
   private sessionModels = new Map<string, string>();
+  private sessionVerboseLevels = new Map<string, VerboseLevel>();
   private sessionProfiles = new Map<string, string>();
   private sessionLocks = new Map<string, Promise<void>>();
   private sessionProvenance = new Map<string, SessionProvenance>();
@@ -266,6 +267,20 @@ export class Gateway {
     this.assistant.setUnleashedCompleteCallback(cb);
   }
 
+  setPhaseCompleteCallback(cb: (jobName: string, phase: number, totalPhases: number, output: string) => void): void {
+    this.assistant.setPhaseCompleteCallback(cb);
+  }
+
+  // ── Session verbose level ──────────────────────────────────────────
+
+  setSessionVerboseLevel(sessionKey: string, level: VerboseLevel): void {
+    this.sessionVerboseLevels.set(sessionKey, level);
+  }
+
+  getSessionVerboseLevel(sessionKey: string): VerboseLevel | undefined {
+    return this.sessionVerboseLevels.get(sessionKey);
+  }
+
   // ── Session model overrides ─────────────────────────────────────────
 
   setSessionModel(sessionKey: string, modelId: string): void {
@@ -416,11 +431,14 @@ export class Gateway {
         // Resolve active project override
         const projectOverride = this.sessionProjects.get(sessionKey);
 
+        // Resolve verbose level for this session
+        const verboseLevel = this.sessionVerboseLevels.get(sessionKey);
+
         try {
           const [response] = await this.assistant.chat(
             text,
             effectiveSessionKey,
-            { onText, onToolActivity, model: effectiveModel, maxTurns, securityAnnotation, projectOverride, profile: resolvedProfile },
+            { onText, onToolActivity, model: effectiveModel, maxTurns, securityAnnotation, projectOverride, profile: resolvedProfile, verboseLevel },
           );
 
           // Re-baseline integrity checksums after chat (auto-memory may write to vault)
@@ -700,6 +718,7 @@ export class Gateway {
     this.assistant.clearSession(sessionKey);
     this.sessionProfiles.delete(sessionKey);
     this.sessionProjects.delete(sessionKey);
+    this.sessionVerboseLevels.delete(sessionKey);
     this.sessionLocks.delete(sessionKey);
     this.sessionProvenance.delete(sessionKey);
   }

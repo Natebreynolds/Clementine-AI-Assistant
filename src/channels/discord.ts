@@ -120,6 +120,13 @@ const slashCommands = [
         { name: 'Topology', value: 'topology' },
       )),
   new SlashCommandBuilder().setName('dashboard').setDescription('Live system status embed (auto-refreshes)'),
+  new SlashCommandBuilder().setName('verbose').setDescription('Set response verbosity level')
+    .addStringOption(o => o.setName('level').setDescription('Verbosity level').setRequired(true)
+      .addChoices(
+        { name: 'Quiet', value: 'quiet' },
+        { name: 'Normal', value: 'normal' },
+        { name: 'Detailed', value: 'detailed' },
+      )),
   new SlashCommandBuilder().setName('clear').setDescription('Reset conversation session'),
   new SlashCommandBuilder().setName('help').setDescription('Show all available commands'),
 ];
@@ -345,6 +352,7 @@ function handleHelp(): string {
     '`!deep <msg>` \u2014 Extended mode (100 turns)',
     '`!q <msg>` \u2014 Quick reply (Haiku) \u00b7 `!d <msg>` \u2014 Deep reply (Opus)',
     '`!model [haiku|sonnet|opus]` \u2014 Switch default model',
+    '`!verbose [quiet|normal|detailed]` \u2014 Set response verbosity',
     '`!project <name>` \u2014 Set active project \u00b7 `!project list|clear|status`',
     '`!cron list|run|enable|disable` \u2014 Manage scheduled tasks',
     '`!workflow list|run <name>` \u2014 Manage multi-step workflows',
@@ -721,6 +729,19 @@ export async function startDiscord(
       const parts = text.split(/\s+/);
       await message.reply(handleModelSwitch(gateway, sessionKey, parts[1]));
       updatePresence(sessionKey);
+      return;
+    }
+
+    if (isDm && text.startsWith('!verbose')) {
+      const parts = text.split(/\s+/);
+      const level = parts[1]?.toLowerCase();
+      if (level === 'quiet' || level === 'normal' || level === 'detailed') {
+        gateway.setSessionVerboseLevel(sessionKey, level);
+        await message.reply(`Verbose level set to **${level}**.`);
+      } else {
+        const current = gateway.getSessionVerboseLevel(sessionKey) ?? 'normal';
+        await message.reply(`Current verbose level: **${current}**\nOptions: \`!verbose quiet\`, \`!verbose normal\`, \`!verbose detailed\``);
+      }
       return;
     }
 
@@ -1217,6 +1238,12 @@ export async function startDiscord(
         const tier = cmd.options.getString('tier', true);
         await cmd.reply(handleModelSwitch(gateway, sessionKey, tier));
         updatePresence(sessionKey);
+        return;
+      }
+      if (name === 'verbose') {
+        const level = cmd.options.getString('level', true) as 'quiet' | 'normal' | 'detailed';
+        gateway.setSessionVerboseLevel(sessionKey, level);
+        await cmd.reply({ content: `Verbose level set to **${level}**.`, ephemeral: true });
         return;
       }
       if (name === 'project') {
