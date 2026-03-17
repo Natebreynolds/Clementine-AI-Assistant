@@ -139,6 +139,12 @@ export class GraphStore {
       // Clean up socket file
       try { unlinkSync(this.socketFilePath); } catch { /* ignore */ }
       try { await this.db.close(); } catch { /* ignore */ }
+      // Unregister from FalkorDBLite's cleanup module — its uncaughtException
+      // handler re-throws errors, which crashes the daemon on socket drops.
+      try {
+        const { unregisterServer } = await import('falkordblite/dist/cleanup.js');
+        unregisterServer(this.db);
+      } catch { /* cleanup module may not be accessible */ }
       this.db = null;
     } else if (this.client) {
       try { await this.client.close(); } catch { /* ignore */ }

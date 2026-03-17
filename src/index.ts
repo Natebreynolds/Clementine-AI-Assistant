@@ -671,18 +671,24 @@ async function asyncMain(): Promise<void> {
   clearInterval(teamDeliveryInterval);
   clearInterval(sourceEditInterval);
 
-  // Drain active sessions BEFORE tearing down infrastructure —
-  // active sessions may need heartbeat, cron, graph, etc.
+  // Close graph store FIRST — FalkorDBLite's cleanup.js registers an
+  // uncaughtException handler that re-throws errors.  If a Redis socket
+  // drops during the drain wait, that handler crashes the process.
+  // Closing (and unregistering) before draining prevents this.
+  if (graphStore) {
+    try { await graphStore.close(); } catch { /* non-fatal */ }
+    graphStore = null;
+  }
+
+  // Drain active sessions BEFORE tearing down heartbeat/cron —
+  // active sessions may still need those services.
   if (restartRequested) {
     await drainActiveSessions(gateway);
   }
 
-  // Now safe to tear down infrastructure
+  // Now safe to tear down remaining infrastructure
   heartbeat.stop();
   cronScheduler.stop();
-  if (graphStore) {
-    try { await graphStore.close(); } catch { /* non-fatal */ }
-  }
 
   // ── Self-restart (enhanced with health check + rollback) ────────
   if (restartRequested) {
