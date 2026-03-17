@@ -203,27 +203,28 @@ export class AgentBotClient {
       return this.config.channelIds;
     }
 
-    // 2. Match by channelName
-    const channelName = this.config.profile.team?.channelName;
-    if (channelName) {
+    // 2. Match by channelName (supports single string or array of names)
+    const channelNameConfig = this.config.profile.team?.channelName;
+    if (channelNameConfig) {
+      const channelNames = Array.isArray(channelNameConfig) ? channelNameConfig : [channelNameConfig];
       const matched: string[] = [];
       for (const guild of this.client.guilds.cache.values()) {
         for (const channel of guild.channels.cache.values()) {
-          if (channel.type === ChannelType.GuildText && channel.name === channelName) {
+          if (channel.type === ChannelType.GuildText && channelNames.includes(channel.name)) {
             matched.push(channel.id);
           }
         }
       }
       if (matched.length > 0) {
         logger.info(
-          { slug: this.config.slug, channelName, matched },
+          { slug: this.config.slug, channelNames, matched },
           'Auto-discovered channels by name',
         );
         return matched;
       }
       logger.warn(
-        { slug: this.config.slug, channelName },
-        'No channels found matching channelName — falling back to all visible text channels',
+        { slug: this.config.slug, channelNames },
+        'No channels found matching channelName(s) — falling back to all visible text channels',
       );
     }
 
@@ -672,8 +673,9 @@ export class AgentBotClient {
       return;
     }
 
-    // In team chat: only respond when explicitly addressed
-    if (isTeamChatChannel && !this.isAddressedInTeamChat(message)) {
+    // In team chat: respond to all if respondToAll is set, otherwise only when addressed
+    const respondToAll = this.config.profile.team?.respondToAll === true;
+    if (isTeamChatChannel && !respondToAll && !this.isAddressedInTeamChat(message)) {
       return;
     }
 
