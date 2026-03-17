@@ -45,5 +45,31 @@
   },
   "engines": {
     "node": ">=20.0.0"
-  }
+  },
+  "author": "Nathan Reynolds",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Natebreynolds/Clementine-AI-Assistant.git"
+  },
+  "homepage": "https://github.com/Natebreynolds/Clementine-AI-Assistant",
+  "bugs": {
+    "url": "https://github.com/Natebreynolds/Clementine-AI-Assistant/issues"
+  },
+  "keywords": [
+    "ai-assistant",
+    "claude",
+    "discord-bot",
+    "slack-bot",
+    "personal-assistant",
+    "obsidian",
+    "memory",
+    "agent"
+  ],
+  "files": [
+    "dist/",
+    "vault/",
+    "README.md",
+    ".env.example"
+  ]
 }

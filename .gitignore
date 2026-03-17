@@ -26,3 +26,10 @@ logs/
 # IDE
 .vscode/
 .idea/
+
+# Playwright MCP artifacts
+.playwright-mcp/
+
+# Bot status files (runtime state)
+.bot-status.json
+.slack-bot-status.json
