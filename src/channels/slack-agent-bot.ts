@@ -18,6 +18,7 @@ import pino from 'pino';
 import type { AgentProfile } from '../types.js';
 import type { Gateway } from '../gateway/router.js';
 import { mdToSlack, sendChunkedSlack, SlackStreamingMessage } from './slack-utils.js';
+import { friendlyToolName } from './discord-utils.js';
 
 const logger = pino({ name: 'clementine.slack-agent-bot' });
 
@@ -275,6 +276,9 @@ export class SlackAgentBotClient {
         async (token: string) => {
           await streamer.update(token);
         },
+        undefined, // model
+        undefined, // maxTurns
+        async (toolName, toolInput) => { streamer.setToolStatus(friendlyToolName(toolName, toolInput)); },
       );
       await streamer.finalize(response);
       logger.info({ slug: this.config.slug, from: fromSlug }, 'Processed Slack team message');
@@ -374,6 +378,9 @@ export class SlackAgentBotClient {
         async (token: string) => {
           await streamer.update(token);
         },
+        undefined, // model
+        undefined, // maxTurns
+        async (toolName, toolInput) => { streamer.setToolStatus(friendlyToolName(toolName, toolInput)); },
       );
       await streamer.finalize(response);
     } catch (err) {

@@ -133,6 +133,17 @@ export class DiscordStreamingMessage {
   /** Update the tool activity status line shown during streaming. */
   setToolStatus(status: string): void {
     this.toolStatus = status;
+    // Trigger a flush so the status is actually displayed during long tool chains
+    // where no text tokens are being emitted
+    const elapsed = Date.now() - this.lastEdit;
+    if (elapsed >= STREAM_EDIT_INTERVAL) {
+      this.flush().catch(() => {});
+    } else if (!this.flushTimer) {
+      this.flushTimer = setTimeout(() => {
+        this.flushTimer = null;
+        this.flush().catch(() => {});
+      }, STREAM_EDIT_INTERVAL - elapsed);
+    }
   }
 
   async update(text: string): Promise<void> {

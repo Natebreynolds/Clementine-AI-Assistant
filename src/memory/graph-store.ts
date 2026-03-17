@@ -71,6 +71,12 @@ export class GraphStore {
       this.available = true;
       this.ownsServer = true;
 
+      // Catch connection-level errors so they don't crash the process
+      this.db.on?.('error', (err: Error) => {
+        logger.error({ err }, 'FalkorDB server error — disabling graph features');
+        this.available = false;
+      });
+
       // Write socket path so MCP/dashboard/assistant can connect
       writeFileSync(this.socketFilePath, this.db.socketPath, 'utf-8');
 
@@ -110,6 +116,13 @@ export class GraphStore {
       this.graph = this.client.selectGraph(GRAPH_NAME);
       this.available = true;
       this.ownsServer = false;
+
+      // Catch connection-level errors so they don't crash the process
+      this.client.on?.('error', (err: Error) => {
+        logger.error({ err }, 'FalkorDB client connection lost — disabling graph features');
+        this.available = false;
+      });
+
       return true;
     } catch {
       this.available = false;

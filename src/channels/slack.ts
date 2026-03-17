@@ -17,6 +17,7 @@ import type { NotificationDispatcher } from '../gateway/notifications.js';
 import type { Gateway } from '../gateway/router.js';
 import type { SlackBotManager } from './slack-bot-manager.js';
 import { mdToSlack, sendChunkedSlack, SlackStreamingMessage } from './slack-utils.js';
+import { friendlyToolName } from './discord-utils.js';
 
 const logger = pino({ name: 'clementine.slack' });
 
@@ -128,6 +129,9 @@ export async function startSlack(
         sessionKey,
         text,
         (t) => streamer.update(t),
+        undefined, // model
+        undefined, // maxTurns
+        async (toolName, toolInput) => { streamer.setToolStatus(friendlyToolName(toolName, toolInput)); },
       );
       await streamer.finalize(response);
 
