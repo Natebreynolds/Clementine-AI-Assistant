@@ -84,7 +84,13 @@ export async function startSlack(
     socketMode: true,
   });
 
+  // Catch Socket Mode errors so they don't crash the daemon
+  app.error(async (error) => {
+    logger.error({ err: error }, 'Slack app error — continuing');
+  });
+
   app.message(async ({ message, client }) => {
+    try {
     // Type guard: only handle regular user messages
     if (!('user' in message) || !('text' in message)) return;
     if ('bot_id' in message && message.bot_id) return;
@@ -147,6 +153,9 @@ export async function startSlack(
     } catch (err) {
       logger.error({ err }, 'Error processing Slack message');
       await streamer.finalize(`Something went wrong: ${err}`);
+    }
+    } catch (err) {
+      logger.error({ err }, 'Unhandled error in Slack message handler');
     }
   });
 

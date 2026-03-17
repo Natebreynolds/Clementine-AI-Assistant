@@ -131,6 +131,11 @@ export async function startTelegram(
   const bot = new Bot(TELEGRAM_BOT_TOKEN);
   const ownerIdNum = Number(TELEGRAM_OWNER_ID);
 
+  // Catch errors from Grammy so they don't crash the daemon
+  bot.catch((err) => {
+    logger.error({ err: err.error, ctx: err.ctx?.update?.update_id }, 'Telegram bot error — continuing');
+  });
+
   bot.on('message:text', async (ctx) => {
     const userId = ctx.from?.id;
     if (!userId) return;

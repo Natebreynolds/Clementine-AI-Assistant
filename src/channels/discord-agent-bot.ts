@@ -139,11 +139,19 @@ export class AgentBotClient {
     });
 
     this.client.on(Events.InteractionCreate, async (interaction: Interaction) => {
-      await this.handleInteraction(interaction);
+      try {
+        await this.handleInteraction(interaction);
+      } catch (err) {
+        logger.error({ err, slug: this.config.slug }, 'Unhandled error in agent bot interaction handler');
+      }
     });
 
     this.client.on(Events.MessageCreate, async (message: Message) => {
-      await this.handleMessage(message);
+      try {
+        await this.handleMessage(message);
+      } catch (err) {
+        logger.error({ err, slug: this.config.slug }, 'Unhandled error in agent bot message handler');
+      }
     });
 
     this.client.on(Events.Error, (err) => {

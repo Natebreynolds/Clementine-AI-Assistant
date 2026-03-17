@@ -53,6 +53,13 @@ export class SlackAgentBotClient {
       appToken: config.appToken,
       socketMode: true,
     });
+
+    // Catch Socket Mode errors so they don't crash the daemon
+    this.app.error(async (error) => {
+      this.status = 'error';
+      this.errorMessage = String(error);
+      logger.error({ err: error, slug: config.slug }, 'Slack agent bot error — continuing');
+    });
   }
 
   async start(): Promise<void> {
@@ -68,7 +75,11 @@ export class SlackAgentBotClient {
 
       // Register message handler
       this.app.message(async ({ message, client }) => {
-        await this.handleMessage(message as any, client);
+        try {
+          await this.handleMessage(message as any, client);
+        } catch (err) {
+          logger.error({ err, slug: this.config.slug }, 'Unhandled error in Slack agent bot message handler');
+        }
       });
 
       await this.app.start();

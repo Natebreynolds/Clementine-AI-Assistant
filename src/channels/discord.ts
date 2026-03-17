@@ -669,6 +669,7 @@ export async function startDiscord(
   });
 
   client.on(Events.MessageCreate, async (message: Message) => {
+    try {
     // Ignore own messages
     if (message.author.id === client.user?.id) return;
 
@@ -1131,11 +1132,15 @@ export async function startDiscord(
       logger.error({ err }, 'Error processing Discord message');
       await streamer.finalize(`Something went wrong: ${err}`);
     }
+    } catch (err) {
+      logger.error({ err }, 'Unhandled error in Discord message handler');
+    }
   });
 
   // ── Slash command + button interaction handler ──────────────────────
 
   client.on(Events.InteractionCreate, async (interaction: Interaction) => {
+    try {
     // ── Autocomplete ────────────────────────────────────────────────
     if (interaction.isAutocomplete()) {
       if (interaction.commandName === 'project') {
@@ -1685,6 +1690,9 @@ export async function startDiscord(
       logger.error({ err }, 'Error processing button interaction');
       await streamer.finalize(`Something went wrong processing the ${action}: ${err}`);
     }
+    } catch (err) {
+      logger.error({ err }, 'Unhandled error in Discord interaction handler');
+    }
   });
 
   // ── Reaction-based feedback handler ─────────────────────────────────
@@ -1693,6 +1701,7 @@ export async function startDiscord(
     reaction: MessageReaction | PartialMessageReaction,
     user: User | PartialUser,
   ) => {
+    try {
     // Ignore bot's own reactions
     if (user.id === client.user?.id) return;
 
@@ -1733,6 +1742,9 @@ export async function startDiscord(
       }
     } catch (err) {
       logger.warn({ err }, 'Failed to log reaction feedback');
+    }
+    } catch (err) {
+      logger.error({ err }, 'Unhandled error in Discord reaction handler');
     }
   });
 
