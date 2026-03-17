@@ -361,6 +361,7 @@ function handleHelp(): string {
     '`!status [job]` \u2014 Check unleashed task progress',
     '`!dashboard` \u2014 Send a fresh system status embed',
     '`!heartbeat` \u2014 Run heartbeat \u00b7 `!tools` \u2014 List tools \u00b7 `!clear` \u2014 Reset',
+    '`!stop` \u2014 Interrupt current response',
     '`!help` \u2014 This message',
   ].join('\n');
 }
@@ -1116,6 +1117,14 @@ export async function startDiscord(
           effectiveText = `[Replying to bot message:\n${refContent}]\n\n${effectiveText}`;
         }
       } catch { /* referenced message may be deleted */ }
+    }
+
+    // ── !stop — abort active query (bypasses session lock) ────────────
+
+    if (isDm && (text === '!stop' || text === '/stop')) {
+      const stopped = gateway.stopSession(sessionKey);
+      await message.reply(stopped ? 'Stopping...' : 'Nothing running to stop.');
+      return;
     }
 
     // ── Show queued indicator if session is busy ─────────────────────

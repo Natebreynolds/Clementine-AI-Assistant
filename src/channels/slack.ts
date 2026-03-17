@@ -127,6 +127,13 @@ export async function startSlack(
     const threadTs = ('thread_ts' in message ? message.thread_ts : undefined) ?? message.ts;
     const sessionKey = `slack:user:${userId}`;
 
+    // ── !stop — abort active query (bypasses session lock) ────────────
+    if (text === '!stop' || text === '/stop') {
+      const stopped = gateway.stopSession(sessionKey);
+      await client.chat.postMessage({ channel, thread_ts: threadTs, text: stopped ? 'Stopping...' : 'Nothing running to stop.' });
+      return;
+    }
+
     // ── !verbose command intercept ─────────────────────────────────
     if (text.startsWith('!verbose')) {
       const parts = text.split(/\s+/);

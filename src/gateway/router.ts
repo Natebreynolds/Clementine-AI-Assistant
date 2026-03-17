@@ -33,6 +33,7 @@ export class Gateway {
   private sessionVerboseLevels = new Map<string, VerboseLevel>();
   private sessionProfiles = new Map<string, string>();
   private sessionLocks = new Map<string, Promise<void>>();
+  private sessionAbortControllers = new Map<string, AbortController>();
   private sessionProvenance = new Map<string, SessionProvenance>();
   private auditLog: string[] = [];
   private draining = false;
@@ -332,6 +333,20 @@ export class Gateway {
   }
 
   /**
+   * Abort an in-progress chat query for a session.
+   * Returns true if there was an active query to abort.
+   */
+  stopSession(sessionKey: string): boolean {
+    const ac = this.sessionAbortControllers.get(sessionKey);
+    if (ac && !ac.signal.aborted) {
+      ac.abort();
+      logger.info({ sessionKey }, 'Session stopped by user');
+      return true;
+    }
+    return false;
+  }
+
+  /**
    * Serialize access to a session. Returns a function to call when done,
    * or waits for the current holder to finish first.
    */
@@ -440,6 +455,7 @@ export class Gateway {
 
         // Wall-clock timeout prevents a stuck SDK query from leaving the user waiting
         const chatAc = new AbortController();
+        this.sessionAbortControllers.set(sessionKey, chatAc);
         const chatTimer = setTimeout(() => {
           chatAc.abort();
           logger.warn({ sessionKey }, `Chat timed out after ${CHAT_TIMEOUT_MS / 1000}s — aborting`);
@@ -453,6 +469,7 @@ export class Gateway {
           );
 
           clearTimeout(chatTimer);
+          this.sessionAbortControllers.delete(sessionKey);
 
           // Re-baseline integrity checksums after chat (auto-memory may write to vault)
           scanner.refreshIntegrity();
@@ -460,9 +477,10 @@ export class Gateway {
           return response || '*(no response)*';
         } catch (err) {
           clearTimeout(chatTimer);
-          // If aborted by our timeout, return a friendly message instead of an error
+          this.sessionAbortControllers.delete(sessionKey);
+          // If aborted by user (!stop) or our timeout, return a friendly message
           if (chatAc.signal.aborted) {
-            return "That took longer than expected and I had to stop. Try breaking it into smaller steps, or use `!deep` for complex tasks.";
+            return "Stopped. What would you like to do instead?";
           }
           logger.error({ err, sessionKey }, `Error handling message from ${sessionKey}`);
           return `Something went wrong: ${err}`;
