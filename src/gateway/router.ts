@@ -19,6 +19,10 @@ import { TeamBus } from '../agent/team-bus.js';
 
 const logger = pino({ name: 'clementine.gateway' });
 
+/** Wall-clock timeout for interactive chat messages (5 minutes).
+ *  Prevents a stuck SDK query from leaving the user waiting forever. */
+const CHAT_TIMEOUT_MS = 5 * 60 * 1000;
+
 export class Gateway {
   public readonly assistant: PersonalAssistant;
 
@@ -434,18 +438,32 @@ export class Gateway {
         // Resolve verbose level for this session
         const verboseLevel = this.sessionVerboseLevels.get(sessionKey);
 
+        // Wall-clock timeout prevents a stuck SDK query from leaving the user waiting
+        const chatAc = new AbortController();
+        const chatTimer = setTimeout(() => {
+          chatAc.abort();
+          logger.warn({ sessionKey }, `Chat timed out after ${CHAT_TIMEOUT_MS / 1000}s — aborting`);
+        }, CHAT_TIMEOUT_MS);
+
         try {
           const [response] = await this.assistant.chat(
             text,
             effectiveSessionKey,
-            { onText, onToolActivity, model: effectiveModel, maxTurns, securityAnnotation, projectOverride, profile: resolvedProfile, verboseLevel },
+            { onText, onToolActivity, model: effectiveModel, maxTurns, securityAnnotation, projectOverride, profile: resolvedProfile, verboseLevel, abortController: chatAc },
           );
+
+          clearTimeout(chatTimer);
 
           // Re-baseline integrity checksums after chat (auto-memory may write to vault)
           scanner.refreshIntegrity();
 
           return response || '*(no response)*';
         } catch (err) {
+          clearTimeout(chatTimer);
+          // If aborted by our timeout, return a friendly message instead of an error
+          if (chatAc.signal.aborted) {
+            return "That took longer than expected and I had to stop. Try breaking it into smaller steps, or use `!deep` for complex tasks.";
+          }
           logger.error({ err, sessionKey }, `Error handling message from ${sessionKey}`);
           return `Something went wrong: ${err}`;
         }
