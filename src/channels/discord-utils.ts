@@ -115,7 +115,11 @@ export class DiscordStreamingMessage {
   private isFinal = false;
   private channel: Message['channel'];
   private flushTimer: ReturnType<typeof setTimeout> | null = null;
+  private progressTimer: ReturnType<typeof setInterval> | null = null;
   private toolStatus = '';
+  private startTime = Date.now();
+  private toolCallCount = 0;
+  private lastTextTime = 0;
 
   /** The message ID of the final bot response (available after finalize). */
   messageId: string | null = null;
@@ -128,11 +132,16 @@ export class DiscordStreamingMessage {
     if (!('send' in this.channel)) return;
     this.message = await this.channel.send(THINKING_INDICATOR);
     this.lastEdit = Date.now();
+    // Periodic refresh keeps elapsed time display current during long silent stretches
+    this.progressTimer = setInterval(() => {
+      if (!this.isFinal && this.toolCallCount > 3) this.flush().catch(() => {});
+    }, 30_000);
   }
 
   /** Update the tool activity status line shown during streaming. */
   setToolStatus(status: string): void {
     this.toolStatus = status;
+    this.toolCallCount++;
     // Trigger a flush so the status is actually displayed during long tool chains
     // where no text tokens are being emitted
     const elapsed = Date.now() - this.lastEdit;
@@ -148,6 +157,7 @@ export class DiscordStreamingMessage {
 
   async update(text: string): Promise<void> {
     this.pendingText = text;
+    this.lastTextTime = Date.now();
     const elapsed = Date.now() - this.lastEdit;
     if (elapsed >= STREAM_EDIT_INTERVAL) {
       await this.flush();
@@ -165,6 +175,10 @@ export class DiscordStreamingMessage {
       clearTimeout(this.flushTimer);
       this.flushTimer = null;
     }
+    if (this.progressTimer) {
+      clearInterval(this.progressTimer);
+      this.progressTimer = null;
+    }
     if (!text) text = '*(no response)*';
     text = sanitizeResponse(text);
 
@@ -181,20 +195,50 @@ export class DiscordStreamingMessage {
     }
   }
 
+  /** Format elapsed milliseconds as human-readable duration. */
+  private formatElapsed(ms: number): string {
+    const s = Math.floor(ms / 1000);
+    if (s < 60) return `${s}s`;
+    const m = Math.floor(s / 60);
+    const rem = s % 60;
+    return rem > 0 ? `${m}m ${rem}s` : `${m}m`;
+  }
+
   private async flush(): Promise<void> {
     if (!this.message || this.isFinal) return;
-    // Allow flush even with empty pendingText if we have a tool status to show
-    if (!this.pendingText && !this.toolStatus) return;
-    if (this.pendingText === this.lastFlushedText && !this.toolStatus) return;
+
+    // Enhanced status when tools have been running 60s+ with no text output
+    const silenceDuration = Date.now() - (this.lastTextTime || this.startTime);
+    const showProgress = this.toolCallCount > 3 && silenceDuration > 60_000;
+
+    // Skip flush if nothing changed — but always allow when showing progress (elapsed time updates)
+    if (!showProgress) {
+      if (!this.pendingText && !this.toolStatus) return;
+      if (this.pendingText === this.lastFlushedText && !this.toolStatus) return;
+    }
     let display = this.pendingText;
-    const statusLine = this.toolStatus ? `\n\n*${this.toolStatus}*` : '\n\n\u270d\ufe0f *typing...*';
+    let statusLine: string;
+    if (showProgress) {
+      const elapsed = this.formatElapsed(Date.now() - this.startTime);
+      const current = this.toolStatus ? ` \u2014 ${this.toolStatus}` : '';
+      statusLine = `\n\n*\ud83d\udd27 Working... (${this.toolCallCount} steps, ${elapsed})${current}*`;
+    } else {
+      statusLine = this.toolStatus ? `\n\n*${this.toolStatus}*` : '\n\n\u270d\ufe0f *typing...*';
+    }
+
     if (display.length > 1900) {
       display = display.slice(0, 1900) + '\n\n*...streaming...*';
     } else if (display) {
       display = display + statusLine;
     } else {
-      // No text yet — show tool status as the main content
-      display = this.toolStatus ? `\u2728 *${this.toolStatus}*` : THINKING_INDICATOR;
+      // No text yet — show tool status or progress as the main content
+      if (showProgress) {
+        const elapsed = this.formatElapsed(Date.now() - this.startTime);
+        const current = this.toolStatus ? ` \u2014 ${this.toolStatus}` : '';
+        display = `\u2728 *Working... (${this.toolCallCount} steps, ${elapsed})${current}*`;
+      } else {
+        display = this.toolStatus ? `\u2728 *${this.toolStatus}*` : THINKING_INDICATOR;
+      }
     }
     try {
       await this.message.edit(display);
