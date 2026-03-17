@@ -66,7 +66,9 @@ export class ProfileManager {
 
     // Parse team-specific frontmatter
     let team: TeamAgentConfig | undefined;
-    const channelName = meta.channelName ? String(meta.channelName) : undefined;
+    const channelName: string | string[] | undefined = Array.isArray(meta.channelName)
+      ? meta.channelName.map(String).filter(Boolean)
+      : meta.channelName ? String(meta.channelName) : undefined;
     const canMessage = Array.isArray(meta.canMessage)
       ? meta.canMessage.map(String).filter(Boolean)
       : [];
@@ -74,10 +76,11 @@ export class ProfileManager {
       ? meta.allowedTools.map(String).filter(Boolean)
       : undefined;
 
-    if (channelName) {
+    if (channelName && (typeof channelName === 'string' || channelName.length > 0)) {
       // channels[] populated at runtime by the agent's own bot
       const teamChat = meta.teamChat === true || meta.teamChat === 'true';
-      team = { channelName, channels: [], canMessage, allowedTools, teamChat };
+      const respondToAll = meta.respondToAll === true || meta.respondToAll === 'true';
+      team = { channelName, channels: [], canMessage, allowedTools, teamChat, respondToAll: respondToAll || undefined };
     }
 
     return {

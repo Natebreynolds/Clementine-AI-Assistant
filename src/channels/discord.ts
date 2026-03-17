@@ -956,7 +956,9 @@ export async function startDiscord(
             const statusText = bs?.status ?? 'offline';
             const targets = a.team?.canMessage.join(', ') || 'none';
             lines.push(`- ${statusIcon} **${a.name}** (\`${a.slug}\`) — ${statusText}`);
-            lines.push(`  Channel: #${a.team?.channelName || 'none'} · Can message: ${targets}`);
+            const chName = a.team?.channelName;
+            const chDisplay = chName ? (Array.isArray(chName) ? chName.map(c => '#' + c).join(', ') : '#' + chName) : 'none';
+            lines.push(`  Channel: ${chDisplay} · Can message: ${targets}`);
           }
           await message.reply(lines.join('\n'));
         }
