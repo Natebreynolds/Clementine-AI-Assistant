@@ -18,7 +18,7 @@ const logger = pino({ name: 'clementine.team-bus' });
 /** Max inter-agent message depth before rejection (anti-loop). */
 const MAX_DEPTH = 3;
 /** Minimum interval between same sender->recipient pair (ms). */
-const COOLDOWN_MS = 30_000;
+const COOLDOWN_MS = 60_000;
 /** Window for content dedup — reject identical messages within this period (ms). */
 const CONTENT_DEDUP_MS = 300_000; // 5 minutes
 /** Max recent messages to keep in memory. */

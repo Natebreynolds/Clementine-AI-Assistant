@@ -291,6 +291,9 @@ export class AgentBotClient {
    * Receive an inter-agent team message. Posts an embed showing the incoming
    * message, then triggers the agent to process and respond in-channel.
    */
+  /** Track recent team message content hashes to prevent duplicate embeds. */
+  private recentTeamMessageHashes = new Map<string, number>();
+
   async receiveTeamMessage(fromName: string, fromSlug: string, content: string): Promise<string> {
     if (this.resolvedChannelIds.length === 0) {
       logger.warn({ slug: this.config.slug }, 'No channels to deliver team message to');
@@ -302,6 +305,23 @@ export class AgentBotClient {
     if (!channel || channel.type !== ChannelType.GuildText) {
       logger.warn({ slug: this.config.slug, channelId }, 'Channel not found for team message delivery');
       return '(channel not found)';
+    }
+
+    // Dedup: reject identical messages within 5 minutes (prevents embed spam)
+    const { createHash } = await import('node:crypto');
+    const contentHash = createHash('sha256').update(`${fromSlug}:${content.trim()}`).digest('hex').slice(0, 12);
+    const now = Date.now();
+    const lastSeen = this.recentTeamMessageHashes.get(contentHash) ?? 0;
+    if (now - lastSeen < 300_000) {
+      logger.info({ slug: this.config.slug, from: fromSlug }, 'Duplicate team message suppressed (already posted)');
+      return '(duplicate message suppressed — already delivered recently)';
+    }
+    this.recentTeamMessageHashes.set(contentHash, now);
+    // Prune old entries
+    if (this.recentTeamMessageHashes.size > 50) {
+      for (const [key, ts] of this.recentTeamMessageHashes) {
+        if (now - ts > 300_000) this.recentTeamMessageHashes.delete(key);
+      }
     }
 
     // Post the incoming message as an embed so it's visible in the channel
