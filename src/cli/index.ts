@@ -1119,8 +1119,18 @@ async function cmdUpdate(options: { restart?: boolean; dryRun?: boolean }): Prom
     });
     console.log(`  ${GREEN}OK${RESET}  Build succeeded`);
   } catch (err) {
-    console.error(`  ${RED}FAIL${RESET}  Build failed: ${String(err).slice(0, 200)}`);
-    failAndRestart(backupDir);
+    // Build failed — retry with fresh npm install (handles missing typescript after pull)
+    console.error(`  ${YELLOW}WARN${RESET}  Build failed — retrying with fresh dependency install...`);
+    try {
+      execSync('npm install --loglevel=error --no-audit && npm run build', {
+        cwd: PACKAGE_ROOT,
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+      console.log(`  ${GREEN}OK${RESET}  Build succeeded (after reinstall)`);
+    } catch (retryErr) {
+      console.error(`  ${RED}FAIL${RESET}  Build failed after update: ${String(retryErr).slice(0, 200)}`);
+      failAndRestart(backupDir);
+    }
   }
 
   // 7b. Verify build output is fresh
