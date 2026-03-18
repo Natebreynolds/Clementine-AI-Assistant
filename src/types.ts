@@ -154,6 +154,7 @@ export interface CronJobDefinition {
   maxRetries?: number;
   after?: string;
   agentSlug?: string;              // Agent that owns this cron job (scoped execution)
+  successCriteria?: string[];      // Verifiable acceptance criteria for goal-backward reflection
 }
 
 export interface CronRunEntry {
@@ -391,6 +392,51 @@ export interface GraphSyncStats {
   nodesCreated: number;
   relationshipsCreated: number;
   duration: number;
+}
+
+// ── Persistent Goals ────────────────────────────────────────────────
+
+export interface PersistentGoal {
+  id: string;
+  title: string;
+  description: string;
+  status: 'active' | 'paused' | 'completed' | 'blocked';
+  owner: string;              // agent slug or 'clementine'
+  priority: 'high' | 'medium' | 'low';
+  createdAt: string;
+  updatedAt: string;
+  targetDate?: string;
+  progressNotes: string[];    // appended by agent after each work session
+  nextActions: string[];      // what to do next time
+  blockers?: string[];
+  reviewFrequency: 'daily' | 'weekly' | 'on-demand';
+  linkedCronJobs?: string[];  // cron jobs that contribute to this goal
+}
+
+// ── Cron Progress Continuity ────────────────────────────────────────
+
+export interface CronProgress {
+  jobName: string;
+  lastRunAt: string;
+  runCount: number;
+  state: Record<string, unknown>;  // job-specific state (agent writes what it needs)
+  completedItems: string[];        // e.g., "researched account X", "drafted email for Y"
+  pendingItems: string[];          // what's left to do
+  notes: string;                   // free-form observations from last run
+}
+
+// ── Delegated Tasks ─────────────────────────────────────────────────
+
+export interface DelegatedTask {
+  id: string;
+  fromAgent: string;           // who delegated
+  toAgent: string;             // who should do it
+  task: string;                // task description
+  expectedOutput: string;      // what the result should look like
+  status: 'pending' | 'in_progress' | 'completed';
+  createdAt: string;
+  updatedAt: string;
+  result?: string;             // the deliverable once completed
 }
 
 // ── Verbose Level ───────────────────────────────────────────────────

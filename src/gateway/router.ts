@@ -474,6 +474,27 @@ export class Gateway {
           // Re-baseline integrity checksums after chat (auto-memory may write to vault)
           scanner.refreshIntegrity();
 
+          // ── Auto-plan detection ──────────────────────────────────────
+          // If the agent signals a complex task, auto-route to the orchestrator
+          const planMatch = response?.match(/^\[PLAN_NEEDED:\s*(.+?)\]\s*/);
+          if (planMatch) {
+            const taskDesc = planMatch[1].trim() || text;
+            logger.info({ sessionKey, task: taskDesc }, 'Auto-plan triggered by agent');
+            try {
+              const planResult = await this.handlePlan(
+                sessionKey,
+                `${taskDesc}\n\nOriginal request: ${text}`,
+                undefined, // no progress callback for auto-triggered plans
+                undefined, // no approval gate for auto-triggered plans
+              );
+              return planResult;
+            } catch (err) {
+              logger.warn({ err, sessionKey }, 'Auto-plan failed — returning original response');
+              // Strip the [PLAN_NEEDED] tag and return the rest of the response
+              return response.replace(/^\[PLAN_NEEDED:[^\]]*\]\s*/, '').trim() || '*(no response)*';
+            }
+          }
+
           return response || '*(no response)*';
         } catch (err) {
           clearTimeout(chatTimer);
@@ -531,6 +552,7 @@ export class Gateway {
     mode: 'standard' | 'unleashed' = 'standard',
     maxHours?: number,
     timeoutMs?: number,
+    successCriteria?: string[],
   ): Promise<string> {
     const releaseLane = await lanes.acquire('cron');
     try {
@@ -540,7 +562,7 @@ export class Gateway {
         if (mode === 'unleashed') {
           response = await this.assistant.runUnleashedTask(jobName, jobPrompt, tier, maxTurns, model, workDir, maxHours);
         } else {
-          response = await this.assistant.runCronJob(jobName, jobPrompt, tier, maxTurns, model, workDir, timeoutMs);
+          response = await this.assistant.runCronJob(jobName, jobPrompt, tier, maxTurns, model, workDir, timeoutMs, successCriteria);
         }
 
         // Re-baseline integrity checksums after cron job (may write to vault)

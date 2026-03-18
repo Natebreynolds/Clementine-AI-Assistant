@@ -2633,8 +2633,10 @@ server.tool(
       ? 'Verified: job persisted to CRON.md and will be picked up by the daemon.'
       : 'WARNING: Could not verify the job was written correctly. Check CRON.md manually.';
 
+    const goalHint = `\n\n💡 **Goal tracking:** What goal does this cron job serve? Consider creating a persistent goal (\`goal_create\`) and linking it (\`goal_update\` with \`linkedCronJobs: ["${jobName}"]\`) so self-improvement can optimize this job against measurable outcomes.`;
+
     return textResult(
-      `Added cron job "${jobName}":\n${details.join('\n')}\n\n${verifyMsg}`,
+      `Added cron job "${jobName}":\n${details.join('\n')}\n\n${verifyMsg}${goalHint}`,
     );
   },
 );
@@ -2811,12 +2813,15 @@ server.tool(
 
     logger.info({ name, steps: steps.length }, 'Created workflow via MCP tool');
 
+    const goalHint = `\n\n💡 **Goal tracking:** What goal does this workflow serve? Consider creating a persistent goal (\`goal_create\`) and linking related cron jobs so self-improvement can optimize this workflow against measurable outcomes.`;
+
     return textResult(
       `Created workflow "${name}" with ${steps.length} steps.\n` +
       `File: vault/00-System/workflows/${safeName}.md\n` +
       `Steps: ${steps.map(s => s.id).join(' → ')}\n` +
       (trigger_schedule ? `Schedule: ${trigger_schedule}\n` : 'Trigger: manual\n') +
-      'The daemon will auto-detect it via file watcher.',
+      'The daemon will auto-detect it via file watcher.' +
+      goalHint,
     );
   },
 );
@@ -3628,6 +3633,462 @@ server.tool(
       '3. Rebuild and restart\n\n' +
       'You will be notified when the restart completes.',
     );
+  },
+);
+
+// ── Persistent Goals ────────────────────────────────────────────────────
+
+const GOALS_DIR = path.join(BASE_DIR, 'goals');
+
+function ensureGoalsDir(): void {
+  if (!existsSync(GOALS_DIR)) mkdirSync(GOALS_DIR, { recursive: true });
+}
+
+server.tool(
+  'goal_create',
+  'Create a new persistent goal that survives across sessions. Goals drive proactive agent behavior and can be linked to cron jobs.',
+  {
+    title: z.string().describe('Short goal title'),
+    description: z.string().describe('Detailed description of what this goal aims to achieve'),
+    owner: z.string().optional().describe('Agent slug that owns this goal (default: "clementine")'),
+    priority: z.enum(['high', 'medium', 'low']).optional().describe('Priority level (default: "medium")'),
+    targetDate: z.string().optional().describe('Target completion date (YYYY-MM-DD)'),
+    nextActions: z.array(z.string()).optional().describe('Initial next actions to take'),
+    reviewFrequency: z.enum(['daily', 'weekly', 'on-demand']).optional().describe('How often to review (default: "weekly")'),
+    linkedCronJobs: z.array(z.string()).optional().describe('Cron job names that contribute to this goal'),
+  },
+  async ({ title, description, owner, priority, targetDate, nextActions, reviewFrequency, linkedCronJobs }) => {
+    ensureGoalsDir();
+    const id = randomBytes(4).toString('hex');
+    const now = new Date().toISOString();
+    const goal = {
+      id,
+      title,
+      description,
+      status: 'active' as const,
+      owner: owner || 'clementine',
+      priority: priority || 'medium',
+      createdAt: now,
+      updatedAt: now,
+      targetDate,
+      progressNotes: [],
+      nextActions: nextActions || [],
+      blockers: [],
+      reviewFrequency: reviewFrequency || 'weekly',
+      linkedCronJobs: linkedCronJobs || [],
+    };
+    writeFileSync(path.join(GOALS_DIR, `${id}.json`), JSON.stringify(goal, null, 2));
+    logger.info({ goalId: id, title }, 'Goal created');
+    return textResult(`Goal created: "${title}" (ID: ${id})`);
+  },
+);
+
+server.tool(
+  'goal_update',
+  'Update an existing persistent goal — add progress notes, change status, update next actions, or add blockers.',
+  {
+    id: z.string().describe('Goal ID'),
+    status: z.enum(['active', 'paused', 'completed', 'blocked']).optional().describe('New status'),
+    progressNote: z.string().optional().describe('Progress note to append (what was accomplished)'),
+    nextActions: z.array(z.string()).optional().describe('Replace next actions list'),
+    blockers: z.array(z.string()).optional().describe('Replace blockers list'),
+    linkedCronJobs: z.array(z.string()).optional().describe('Replace linked cron jobs'),
+    priority: z.enum(['high', 'medium', 'low']).optional().describe('Change priority'),
+  },
+  async ({ id, status, progressNote, nextActions, blockers, linkedCronJobs, priority }) => {
+    const filePath = path.join(GOALS_DIR, `${id}.json`);
+    if (!existsSync(filePath)) {
+      return textResult(`Goal not found: ${id}`);
+    }
+    const goal = JSON.parse(readFileSync(filePath, 'utf-8'));
+    if (status) goal.status = status;
+    if (progressNote) goal.progressNotes.push(`[${new Date().toISOString().slice(0, 16)}] ${progressNote}`);
+    if (nextActions) goal.nextActions = nextActions;
+    if (blockers) goal.blockers = blockers;
+    if (linkedCronJobs) goal.linkedCronJobs = linkedCronJobs;
+    if (priority) goal.priority = priority;
+    goal.updatedAt = new Date().toISOString();
+    writeFileSync(filePath, JSON.stringify(goal, null, 2));
+    logger.info({ goalId: id, status: goal.status }, 'Goal updated');
+    return textResult(`Goal "${goal.title}" updated (status: ${goal.status})`);
+  },
+);
+
+server.tool(
+  'goal_list',
+  'List persistent goals, optionally filtered by owner or status.',
+  {
+    owner: z.string().optional().describe('Filter by owner agent slug'),
+    status: z.enum(['active', 'paused', 'completed', 'blocked']).optional().describe('Filter by status'),
+  },
+  async ({ owner, status }) => {
+    ensureGoalsDir();
+    const files = readdirSync(GOALS_DIR).filter(f => f.endsWith('.json'));
+    let goals = files.map(f => {
+      try { return JSON.parse(readFileSync(path.join(GOALS_DIR, f), 'utf-8')); }
+      catch { return null; }
+    }).filter(Boolean);
+
+    if (owner) goals = goals.filter((g: any) => g.owner === owner);
+    if (status) goals = goals.filter((g: any) => g.status === status);
+
+    if (goals.length === 0) {
+      return textResult('No goals found matching the criteria.');
+    }
+
+    const lines = goals.map((g: any) => {
+      const nextAct = g.nextActions?.length > 0 ? ` | Next: ${g.nextActions[0]}` : '';
+      const linked = g.linkedCronJobs?.length > 0 ? ` | Crons: ${g.linkedCronJobs.join(', ')}` : '';
+      return `- [${g.status.toUpperCase()}] **${g.title}** (${g.id}) — ${g.priority} priority, owner: ${g.owner}${nextAct}${linked}`;
+    });
+    return textResult(`Goals (${goals.length}):\n${lines.join('\n')}`);
+  },
+);
+
+server.tool(
+  'goal_get',
+  'Get a single persistent goal with full history — progress notes, next actions, blockers, and linked cron jobs.',
+  {
+    id: z.string().describe('Goal ID'),
+  },
+  async ({ id }) => {
+    const filePath = path.join(GOALS_DIR, `${id}.json`);
+    if (!existsSync(filePath)) {
+      return textResult(`Goal not found: ${id}`);
+    }
+    const goal = JSON.parse(readFileSync(filePath, 'utf-8'));
+    const sections = [
+      `# ${goal.title}`,
+      `**ID:** ${goal.id} | **Status:** ${goal.status} | **Priority:** ${goal.priority} | **Owner:** ${goal.owner}`,
+      `**Created:** ${goal.createdAt} | **Updated:** ${goal.updatedAt}${goal.targetDate ? ` | **Target:** ${goal.targetDate}` : ''}`,
+      `**Review:** ${goal.reviewFrequency}`,
+      `\n## Description\n${goal.description}`,
+    ];
+    if (goal.progressNotes?.length > 0) {
+      sections.push(`\n## Progress Notes\n${goal.progressNotes.map((n: string) => `- ${n}`).join('\n')}`);
+    }
+    if (goal.nextActions?.length > 0) {
+      sections.push(`\n## Next Actions\n${goal.nextActions.map((a: string) => `- [ ] ${a}`).join('\n')}`);
+    }
+    if (goal.blockers?.length > 0) {
+      sections.push(`\n## Blockers\n${goal.blockers.map((b: string) => `- ${b}`).join('\n')}`);
+    }
+    if (goal.linkedCronJobs?.length > 0) {
+      sections.push(`\n## Linked Cron Jobs\n${goal.linkedCronJobs.map((c: string) => `- ${c}`).join('\n')}`);
+    }
+    return textResult(sections.join('\n'));
+  },
+);
+
+// ── Goal Work (Autonomous Goal Sessions) ────────────────────────────────
+
+const GOAL_TRIGGER_DIR = path.join(BASE_DIR, 'cron', 'goal-triggers');
+
+server.tool(
+  'goal_work',
+  'Spawn a focused background work session on a specific goal. The daemon picks up the trigger and runs a goal-directed session asynchronously — results are delivered via notifications. Use this during heartbeat or proactively when a goal needs attention.',
+  {
+    goal_id: z.string().describe('ID of the goal to work on'),
+    focus: z.string().optional().describe('Specific aspect to focus on (e.g., "research phase", "draft email"). Defaults to the goal\'s first nextAction.'),
+    max_turns: z.number().optional().default(15).describe('Max agent turns for this work session'),
+  },
+  async ({ goal_id, focus, max_turns }) => {
+    // Verify the goal exists and is active
+    ensureGoalsDir();
+    const goalPath = path.join(GOALS_DIR, `${goal_id}.json`);
+    if (!existsSync(goalPath)) {
+      return textResult(`Goal not found: ${goal_id}. Use goal_list to see available goals.`);
+    }
+    const goal = JSON.parse(readFileSync(goalPath, 'utf-8'));
+    if (goal.status !== 'active') {
+      return textResult(`Goal "${goal.title}" is ${goal.status} — only active goals can be worked on.`);
+    }
+
+    // Write trigger file for the daemon to pick up
+    mkdirSync(GOAL_TRIGGER_DIR, { recursive: true });
+    const trigger = {
+      goalId: goal_id,
+      focus: focus || goal.nextActions?.[0] || goal.description,
+      maxTurns: max_turns,
+      triggeredAt: new Date().toISOString(),
+    };
+    const triggerFile = path.join(GOAL_TRIGGER_DIR, `${Date.now()}-${goal_id}.trigger.json`);
+    writeFileSync(triggerFile, JSON.stringify(trigger, null, 2));
+
+    logger.info({ goalId: goal_id, focus: trigger.focus }, 'Goal work session triggered');
+    return textResult(
+      `Triggered goal work session for "${goal.title}" (${goal_id}).\n` +
+      `Focus: ${trigger.focus}\n` +
+      `The daemon will pick it up within a few seconds. Results delivered via notifications.`,
+    );
+  },
+);
+
+// ── Cron Progress Continuity ────────────────────────────────────────────
+
+const CRON_PROGRESS_DIR = path.join(BASE_DIR, 'cron', 'progress');
+
+function ensureCronProgressDir(): void {
+  if (!existsSync(CRON_PROGRESS_DIR)) mkdirSync(CRON_PROGRESS_DIR, { recursive: true });
+}
+
+function safeJobName(name: string): string {
+  return name.replace(/[^a-zA-Z0-9_-]/g, '_');
+}
+
+server.tool(
+  'cron_progress_read',
+  'Read progress state from a previous cron job run. Returns what was completed, what is pending, and free-form notes from the last run.',
+  {
+    job_name: z.string().describe('Cron job name'),
+  },
+  async ({ job_name }) => {
+    ensureCronProgressDir();
+    const filePath = path.join(CRON_PROGRESS_DIR, `${safeJobName(job_name)}.json`);
+    if (!existsSync(filePath)) {
+      return textResult(`No previous progress found for job "${job_name}". This is a fresh run.`);
+    }
+    try {
+      const progress = JSON.parse(readFileSync(filePath, 'utf-8'));
+      const lines = [
+        `## Progress for "${job_name}"`,
+        `**Last run:** ${progress.lastRunAt} | **Run count:** ${progress.runCount}`,
+      ];
+      if (progress.completedItems?.length > 0) {
+        lines.push(`\n### Completed\n${progress.completedItems.map((i: string) => `- ${i}`).join('\n')}`);
+      }
+      if (progress.pendingItems?.length > 0) {
+        lines.push(`\n### Pending\n${progress.pendingItems.map((i: string) => `- [ ] ${i}`).join('\n')}`);
+      }
+      if (progress.notes) {
+        lines.push(`\n### Notes\n${progress.notes}`);
+      }
+      if (progress.state && Object.keys(progress.state).length > 0) {
+        lines.push(`\n### Custom State\n\`\`\`json\n${JSON.stringify(progress.state, null, 2)}\n\`\`\``);
+      }
+      return textResult(lines.join('\n'));
+    } catch {
+      return textResult(`Error reading progress for "${job_name}".`);
+    }
+  },
+);
+
+server.tool(
+  'cron_progress_write',
+  'Save progress state for a cron job so the next run can continue where this one left off. Call this at the end of a cron job run.',
+  {
+    job_name: z.string().describe('Cron job name'),
+    completedItems: z.array(z.string()).optional().describe('Items completed in this run'),
+    pendingItems: z.array(z.string()).optional().describe('Items still pending for next run'),
+    notes: z.string().optional().describe('Free-form observations or notes'),
+    state: z.record(z.unknown()).optional().describe('Custom key-value state to persist'),
+  },
+  async ({ job_name, completedItems, pendingItems, notes, state }) => {
+    ensureCronProgressDir();
+    const filePath = path.join(CRON_PROGRESS_DIR, `${safeJobName(job_name)}.json`);
+
+    // Merge with existing progress
+    let existing: any = { jobName: job_name, lastRunAt: '', runCount: 0, state: {}, completedItems: [], pendingItems: [], notes: '' };
+    if (existsSync(filePath)) {
+      try { existing = JSON.parse(readFileSync(filePath, 'utf-8')); } catch { /* start fresh */ }
+    }
+
+    const updated = {
+      jobName: job_name,
+      lastRunAt: new Date().toISOString(),
+      runCount: (existing.runCount || 0) + 1,
+      state: state ?? existing.state ?? {},
+      completedItems: completedItems
+        ? [...(existing.completedItems || []), ...completedItems]
+        : existing.completedItems || [],
+      pendingItems: pendingItems ?? existing.pendingItems ?? [],
+      notes: notes ?? existing.notes ?? '',
+    };
+
+    writeFileSync(filePath, JSON.stringify(updated, null, 2));
+    logger.info({ jobName: job_name, runCount: updated.runCount }, 'Cron progress saved');
+    return textResult(`Progress saved for "${job_name}" (run #${updated.runCount}). ${(completedItems?.length ?? 0)} items completed, ${(updated.pendingItems?.length ?? 0)} pending.`);
+  },
+);
+
+// ── Autonomous Delegation ───────────────────────────────────────────────
+
+const DELEGATIONS_BASE = path.join(VAULT_DIR, '00-System', 'agents');
+
+server.tool(
+  'delegate_task',
+  'Delegate a task to a team agent. Creates a structured task in their queue that their next cron run will pick up. Returns a tracking ID.',
+  {
+    to_agent: z.string().describe('Slug of the target agent (e.g., "ross", "sasha")'),
+    task: z.string().describe('What needs to be done'),
+    expected_output: z.string().describe('What the result should look like'),
+  },
+  async ({ to_agent, task, expected_output }) => {
+    const tasksDir = path.join(DELEGATIONS_BASE, to_agent, 'tasks');
+    if (!existsSync(tasksDir)) mkdirSync(tasksDir, { recursive: true });
+
+    const id = randomBytes(4).toString('hex');
+    const callerSlug = process.env.CLEMENTINE_TEAM_AGENT || 'clementine';
+    const delegation = {
+      id,
+      fromAgent: callerSlug,
+      toAgent: to_agent,
+      task,
+      expectedOutput: expected_output,
+      status: 'pending' as const,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+
+    writeFileSync(path.join(tasksDir, `${id}.json`), JSON.stringify(delegation, null, 2));
+    logger.info({ delegationId: id, from: callerSlug, to: to_agent }, 'Task delegated');
+    return textResult(`Task delegated to ${to_agent} (ID: ${id}). They'll pick it up on their next cron run.\nTask: ${task.slice(0, 100)}`);
+  },
+);
+
+server.tool(
+  'check_delegation',
+  'Check the status of a delegated task or list all delegated tasks for an agent.',
+  {
+    id: z.string().optional().describe('Specific delegation ID to check'),
+    agent: z.string().optional().describe('Agent slug to list all delegations for'),
+  },
+  async ({ id, agent }) => {
+    if (id) {
+      // Search all agent task dirs for this ID
+      if (!existsSync(DELEGATIONS_BASE)) return textResult('No delegations found.');
+      const agents = readdirSync(DELEGATIONS_BASE, { withFileTypes: true })
+        .filter(d => d.isDirectory())
+        .map(d => d.name);
+      for (const slug of agents) {
+        const taskFile = path.join(DELEGATIONS_BASE, slug, 'tasks', `${id}.json`);
+        if (existsSync(taskFile)) {
+          const delegation = JSON.parse(readFileSync(taskFile, 'utf-8'));
+          const lines = [
+            `**Delegation ${id}**`,
+            `From: ${delegation.fromAgent} → To: ${delegation.toAgent}`,
+            `Status: ${delegation.status}`,
+            `Task: ${delegation.task}`,
+            `Expected: ${delegation.expectedOutput}`,
+            `Created: ${delegation.createdAt}`,
+          ];
+          if (delegation.result) lines.push(`Result: ${delegation.result}`);
+          return textResult(lines.join('\n'));
+        }
+      }
+      return textResult(`Delegation ${id} not found.`);
+    }
+
+    if (agent) {
+      const tasksDir = path.join(DELEGATIONS_BASE, agent, 'tasks');
+      if (!existsSync(tasksDir)) return textResult(`No delegations for ${agent}.`);
+      const files = readdirSync(tasksDir).filter(f => f.endsWith('.json'));
+      if (files.length === 0) return textResult(`No delegations for ${agent}.`);
+
+      const delegations = files.map(f => {
+        try { return JSON.parse(readFileSync(path.join(tasksDir, f), 'utf-8')); }
+        catch { return null; }
+      }).filter(Boolean);
+
+      const lines = delegations.map((d: any) =>
+        `- [${d.status.toUpperCase()}] ${d.id}: "${d.task.slice(0, 80)}" (from ${d.fromAgent})`
+      );
+      return textResult(`Delegations for ${agent} (${delegations.length}):\n${lines.join('\n')}`);
+    }
+
+    return textResult('Provide either an "id" to check a specific delegation or "agent" to list all delegations for an agent.');
+  },
+);
+
+// ── Session Continuity (Handoffs) ────────────────────────────────────────
+
+const HANDOFFS_DIR = path.join(BASE_DIR, 'handoffs');
+
+function ensureHandoffsDir(): void {
+  if (!existsSync(HANDOFFS_DIR)) mkdirSync(HANDOFFS_DIR, { recursive: true });
+}
+
+function safeSessionName(key: string): string {
+  return key.replace(/[^a-zA-Z0-9_-]/g, '_');
+}
+
+server.tool(
+  'session_pause',
+  'Save a structured handoff file for the current session so work can be resumed later — even after context reset. ' +
+  'Captures: what was accomplished, what remains, key decisions, blockers, and mental context. ' +
+  'Use this before ending a complex multi-turn conversation, or when you sense context is getting large.',
+  {
+    session_key: z.string().describe('Session key (e.g., "discord:user:123")'),
+    completed: z.array(z.string()).describe('What was accomplished in this session'),
+    remaining: z.array(z.string()).describe('What still needs to be done'),
+    decisions: z.array(z.string()).optional().describe('Key decisions made during this session'),
+    blockers: z.array(z.string()).optional().describe('Current blockers or open questions'),
+    context: z.string().optional().describe('Mental context — anything the resuming agent needs to know that is not captured above'),
+  },
+  async ({ session_key, completed, remaining, decisions, blockers, context }) => {
+    ensureHandoffsDir();
+    const handoff = {
+      sessionKey: session_key,
+      pausedAt: new Date().toISOString(),
+      completed,
+      remaining,
+      decisions: decisions || [],
+      blockers: blockers || [],
+      context: context || '',
+    };
+
+    const fileName = `${safeSessionName(session_key)}.json`;
+    writeFileSync(path.join(HANDOFFS_DIR, fileName), JSON.stringify(handoff, null, 2));
+    logger.info({ sessionKey: session_key, completed: completed.length, remaining: remaining.length }, 'Session handoff saved');
+    return textResult(
+      `Handoff saved. ${completed.length} items completed, ${remaining.length} remaining.\n` +
+      `Resume with session_resume when you're ready to continue.`
+    );
+  },
+);
+
+server.tool(
+  'session_resume',
+  'Load a previously saved session handoff to restore context from a paused conversation. ' +
+  'Returns what was accomplished, what remains, decisions, blockers, and mental context.',
+  {
+    session_key: z.string().describe('Session key to resume (e.g., "discord:user:123")'),
+  },
+  async ({ session_key }) => {
+    ensureHandoffsDir();
+    const fileName = `${safeSessionName(session_key)}.json`;
+    const filePath = path.join(HANDOFFS_DIR, fileName);
+
+    if (!existsSync(filePath)) {
+      return textResult(`No handoff found for session "${session_key}". Starting fresh.`);
+    }
+
+    try {
+      const handoff = JSON.parse(readFileSync(filePath, 'utf-8'));
+      const sections = [
+        `## Session Handoff (paused at ${handoff.pausedAt})`,
+      ];
+
+      if (handoff.completed?.length > 0) {
+        sections.push(`### Completed\n${handoff.completed.map((c: string) => `- ✓ ${c}`).join('\n')}`);
+      }
+      if (handoff.remaining?.length > 0) {
+        sections.push(`### Remaining\n${handoff.remaining.map((r: string) => `- [ ] ${r}`).join('\n')}`);
+      }
+      if (handoff.decisions?.length > 0) {
+        sections.push(`### Decisions Made\n${handoff.decisions.map((d: string) => `- ${d}`).join('\n')}`);
+      }
+      if (handoff.blockers?.length > 0) {
+        sections.push(`### Blockers\n${handoff.blockers.map((b: string) => `- ⚠ ${b}`).join('\n')}`);
+      }
+      if (handoff.context) {
+        sections.push(`### Context\n${handoff.context}`);
+      }
+
+      return textResult(sections.join('\n\n'));
+    } catch {
+      return textResult(`Error reading handoff for "${session_key}".`);
+    }
   },
 );
 

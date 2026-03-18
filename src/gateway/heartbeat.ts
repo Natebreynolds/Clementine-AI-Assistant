@@ -39,6 +39,7 @@ import {
   HEARTBEAT_ACTIVE_END,
   BASE_DIR,
   DISCORD_OWNER_ID,
+  GOALS_DIR,
 } from '../config.js';
 import type { CronJobDefinition, CronRunEntry, HeartbeatState, SelfImproveConfig, SelfImproveExperiment, SelfImproveState, WorkflowDefinition } from '../types.js';
 import type { NotificationDispatcher } from './notifications.js';
@@ -150,6 +151,10 @@ export class HeartbeatScheduler {
     if (activitySummary) {
       changesSummary += `\n\nRecent activity:\n${activitySummary}`;
     }
+    const goalSummary = HeartbeatScheduler.loadGoalSummary();
+    if (goalSummary) {
+      changesSummary += `\n\n${goalSummary}`;
+    }
     const timeContext = HeartbeatScheduler.getTimeContext(now.getHours());
 
     try {
@@ -207,6 +212,12 @@ export class HeartbeatScheduler {
     const activitySummary = this.getRecentActivitySummary();
     if (activitySummary) {
       changesSummary += `\n\nRecent activity:\n${activitySummary}`;
+    }
+
+    // Inject active goal summaries so the heartbeat can flag goals needing attention
+    const goalSummary = HeartbeatScheduler.loadGoalSummary();
+    if (goalSummary) {
+      changesSummary += `\n\n${goalSummary}`;
     }
 
     // Persist new state
@@ -409,6 +420,56 @@ export class HeartbeatScheduler {
     return lines.join('\n');
   }
 
+  /**
+   * Load active goal summaries for injection into heartbeat prompts.
+   * Returns null if no active goals exist.
+   */
+  static loadGoalSummary(): string | null {
+    try {
+      if (!existsSync(GOALS_DIR)) return null;
+      const files = readdirSync(GOALS_DIR).filter(f => f.endsWith('.json'));
+      if (files.length === 0) return null;
+
+      const activeGoals = files
+        .map(f => { try { return JSON.parse(readFileSync(path.join(GOALS_DIR, f), 'utf-8')); } catch { return null; } })
+        .filter((g: any) => g && g.status === 'active');
+
+      if (activeGoals.length === 0) return null;
+
+      const now = Date.now();
+      const DAY_MS = 86_400_000;
+      const lines = activeGoals.map((g: any) => {
+        const nextAct = g.nextActions?.length > 0 ? ` | Next: ${g.nextActions[0]}` : '';
+        const blockers = g.blockers?.length > 0 ? ` | BLOCKED: ${g.blockers[0]}` : '';
+        // Flag stale goals that haven't been updated recently
+        const lastUpdate = g.updatedAt ? new Date(g.updatedAt).getTime() : 0;
+        const daysSinceUpdate = Math.floor((now - lastUpdate) / DAY_MS);
+        const staleThreshold = g.reviewFrequency === 'daily' ? 1 : g.reviewFrequency === 'weekly' ? 7 : 30;
+        const staleTag = daysSinceUpdate > staleThreshold ? ` | ⚠ STALE (${daysSinceUpdate}d since update)` : '';
+        return `- [${g.priority.toUpperCase()}] ${g.title} (${g.id}, owner: ${g.owner})${nextAct}${blockers}${staleTag}`;
+      });
+
+      // Count goals needing work
+      const staleCount = activeGoals.filter((g: any) => {
+        const lastUpdate = g.updatedAt ? new Date(g.updatedAt).getTime() : 0;
+        const daysSince = Math.floor((now - lastUpdate) / DAY_MS);
+        const threshold = g.reviewFrequency === 'daily' ? 1 : g.reviewFrequency === 'weekly' ? 7 : 30;
+        return daysSince > threshold;
+      }).length;
+
+      let header = `Active goals (${activeGoals.length}):`;
+      if (staleCount > 0) {
+        header += ` ${staleCount} goal(s) are STALE and need attention. Use \`goal_work\` to spawn focused work sessions on stale or high-priority goals.`;
+      } else {
+        header += ' Review if any need attention.';
+      }
+
+      return `${header}\n${lines.join('\n')}`;
+    } catch {
+      return null;
+    }
+  }
+
   static getTimeContext(hour: number): string {
     if (hour >= 8 && hour < 10) {
       return 'Morning — Focus on task review and daily setup.';
@@ -467,13 +528,16 @@ export function parseCronJobs(): CronJobDefinition[] {
     const maxHours = job.max_hours != null ? Number(job.max_hours) : undefined;
     const maxRetries = job.max_retries != null ? Number(job.max_retries) : undefined;
     const after = job.after != null ? String(job.after) : undefined;
+    const successCriteria = Array.isArray(job.success_criteria)
+      ? (job.success_criteria as unknown[]).map(c => String(c))
+      : undefined;
 
     if (!name || !schedule || !prompt) {
       logger.warn({ job }, 'Skipping malformed cron job');
       continue;
     }
 
-    jobs.push({ name, schedule, prompt, enabled, tier, maxTurns, model, workDir, mode, maxHours, maxRetries, after });
+    jobs.push({ name, schedule, prompt, enabled, tier, maxTurns, model, workDir, mode, maxHours, maxRetries, after, successCriteria });
   }
 
   return jobs;
@@ -519,6 +583,9 @@ export function parseAgentCronJobs(agentsDir: string): CronJobDefinition[] {
         const maxHours = job.max_hours != null ? Number(job.max_hours) : undefined;
         const maxRetries = job.max_retries != null ? Number(job.max_retries) : undefined;
         const after = job.after != null ? String(job.after) : undefined;
+        const successCriteria = Array.isArray(job.success_criteria)
+          ? (job.success_criteria as unknown[]).map(c => String(c))
+          : undefined;
 
         if (!name || !schedule || !prompt) {
           logger.warn({ job, agent: slug }, 'Skipping malformed agent cron job');
@@ -529,7 +596,7 @@ export function parseAgentCronJobs(agentsDir: string): CronJobDefinition[] {
         allJobs.push({
           name: `${slug}:${name}`,
           schedule, prompt, enabled, tier, maxTurns, model, workDir,
-          mode, maxHours, maxRetries, after,
+          mode, maxHours, maxRetries, after, successCriteria,
           agentSlug: slug,
         });
       }
@@ -691,6 +758,7 @@ export class CronScheduler {
 
   // Trigger directory for MCP-initiated job runs
   private triggerDir = path.join(BASE_DIR, 'cron', 'triggers');
+  private goalTriggerDir = path.join(BASE_DIR, 'cron', 'goal-triggers');
   private triggerTimer: ReturnType<typeof setInterval> | null = null;
 
   // Event-driven status change listeners (used by Discord status embed)
@@ -937,6 +1005,7 @@ export class CronScheduler {
             job.mode,
             job.maxHours,
             job.mode !== 'unleashed' ? CRON_STANDARD_TIMEOUT_MS : undefined,
+            job.successCriteria,
           );
 
           // Success — log and dispatch
@@ -1239,10 +1308,14 @@ export class CronScheduler {
     this.watchingWorkflows = false;
   }
 
-  /** Watch the triggers directory for MCP-initiated job runs. */
+  /** Watch the triggers directory for MCP-initiated job runs and goal work sessions. */
   private watchTriggers(): void {
     mkdirSync(this.triggerDir, { recursive: true });
-    this.triggerTimer = setInterval(() => this.processTriggers(), 3000);
+    mkdirSync(this.goalTriggerDir, { recursive: true });
+    this.triggerTimer = setInterval(() => {
+      this.processTriggers();
+      this.processGoalTriggers();
+    }, 3000);
   }
 
   /** Process any pending trigger files and run the corresponding jobs. */
@@ -1268,6 +1341,71 @@ export class CronScheduler {
         });
       } catch (err) {
         logger.warn({ err, file }, 'Failed to process trigger file');
+        try { unlinkSync(filePath); } catch { /* ignore */ }
+      }
+    }
+  }
+
+  /** Process any pending goal work trigger files. */
+  private processGoalTriggers(): void {
+    if (!existsSync(this.goalTriggerDir)) return;
+    let files: string[];
+    try {
+      files = readdirSync(this.goalTriggerDir).filter(f => f.endsWith('.trigger.json'));
+    } catch { return; }
+    for (const file of files) {
+      const filePath = path.join(this.goalTriggerDir, file);
+      try {
+        const trigger = JSON.parse(readFileSync(filePath, 'utf-8'));
+        unlinkSync(filePath);
+        if (!trigger.goalId) continue;
+
+        const goalPath = path.join(GOALS_DIR, `${trigger.goalId}.json`);
+        if (!existsSync(goalPath)) {
+          logger.warn({ goalId: trigger.goalId }, 'Goal trigger references missing goal — skipping');
+          continue;
+        }
+        const goal = JSON.parse(readFileSync(goalPath, 'utf-8'));
+        if (goal.status !== 'active') continue;
+
+        logger.info({ goalId: trigger.goalId, title: goal.title, focus: trigger.focus }, 'Processing goal work trigger');
+
+        // Build a cron-like prompt that focuses on the goal
+        const prompt =
+          `You are working on a focused goal session.\n\n` +
+          `## Goal: ${goal.title}\n${goal.description}\n\n` +
+          `## Focus for this session\n${trigger.focus}\n\n` +
+          (goal.progressNotes?.length > 0
+            ? `## Prior progress\n${goal.progressNotes.slice(-5).map((n: string) => `- ${n}`).join('\n')}\n\n`
+            : '') +
+          (goal.nextActions?.length > 0
+            ? `## Planned next actions\n${goal.nextActions.map((a: string) => `- ${a}`).join('\n')}\n\n`
+            : '') +
+          (goal.blockers?.length > 0
+            ? `## Current blockers\n${goal.blockers.map((b: string) => `- ${b}`).join('\n')}\n\n`
+            : '') +
+          `## Instructions\n` +
+          `1. Work on the focus area above. Use tools as needed.\n` +
+          `2. When done, use \`goal_update\` to record progress notes, update next actions, and clear resolved blockers.\n` +
+          `3. If blocked, add blockers and change status to "blocked".\n` +
+          `4. Keep your output concise — summarize what you accomplished.`;
+
+        const jobName = `goal:${goal.title.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 40)}`;
+        this.gateway.handleCronJob(
+          jobName,
+          prompt,
+          2, // tier 2 — logged
+          trigger.maxTurns ?? 15,
+        ).then((result) => {
+          if (result && !CronScheduler.isCronNoise(result)) {
+            this.dispatcher.send(`🎯 **Goal work: ${goal.title}**\n\n${result.slice(0, 1500)}`).catch(() => {});
+          }
+          logToDailyNote(`**Goal work: ${goal.title}** — ${(result || 'completed').slice(0, 100).replace(/\n/g, ' ')}`);
+        }).catch((err) => {
+          logger.error({ err, goalId: trigger.goalId }, 'Goal work session failed');
+        });
+      } catch (err) {
+        logger.warn({ err, file }, 'Failed to process goal trigger file');
         try { unlinkSync(filePath); } catch { /* ignore */ }
       }
     }

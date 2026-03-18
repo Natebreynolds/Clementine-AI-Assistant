@@ -33,6 +33,8 @@ import {
   MEMORY_DB_PATH,
   AGENTS_DIR,
   PKG_DIR,
+  CRON_REFLECTIONS_DIR,
+  GOALS_DIR,
 } from '../config.js';
 import type {
   CronRunEntry,
@@ -64,11 +66,33 @@ const PENDING_DIR = path.join(SELF_IMPROVE_DIR, 'pending-changes');
 
 // ── Internal types ───────────────────────────────────────────────────
 
+interface CronReflectionEntry {
+  jobName: string;
+  timestamp: string;
+  quality: number;
+  notes: string;
+}
+
+interface GoalHealthEntry {
+  id: string;
+  title: string;
+  status: string;
+  owner: string;
+  priority: string;
+  daysSinceUpdate: number;
+  reviewFrequency: string;
+  isStale: boolean;
+  linkedCronJobs: string[];
+  progressCount: number;
+}
+
 interface PerformanceSnapshot {
   feedbackStats: { positive: number; negative: number; mixed: number; total: number };
   negativeFeedback: Feedback[];
   cronErrors: CronRunEntry[];
   cronSuccessRate: number;
+  cronReflections: CronReflectionEntry[];
+  goalHealth: GoalHealthEntry[];
 }
 
 // ── SelfImproveLoop ──────────────────────────────────────────────────
@@ -282,11 +306,58 @@ export class SelfImproveLoop {
       }
     }
 
+    // Gather cron reflections (quality ratings from post-cron reflection passes)
+    const cronReflections: CronReflectionEntry[] = [];
+    try {
+      if (existsSync(CRON_REFLECTIONS_DIR)) {
+        const reflFiles = readdirSync(CRON_REFLECTIONS_DIR).filter(f => f.endsWith('.jsonl'));
+        for (const file of reflFiles) {
+          const lines = readFileSync(path.join(CRON_REFLECTIONS_DIR, file), 'utf-8').trim().split('\n');
+          // Take the most recent 5 reflections per job
+          for (const line of lines.slice(-5)) {
+            try { cronReflections.push(JSON.parse(line)); } catch { /* skip malformed */ }
+          }
+        }
+      }
+    } catch { /* non-fatal */ }
+
+    // Gather goal health data
+    const goalHealth: GoalHealthEntry[] = [];
+    try {
+      if (existsSync(GOALS_DIR)) {
+        const goalFiles = readdirSync(GOALS_DIR).filter(f => f.endsWith('.json'));
+        const now = Date.now();
+        const DAY_MS = 86_400_000;
+        for (const file of goalFiles) {
+          try {
+            const goal = JSON.parse(readFileSync(path.join(GOALS_DIR, file), 'utf-8'));
+            const lastUpdate = goal.updatedAt ? new Date(goal.updatedAt).getTime() : 0;
+            const daysSinceUpdate = Math.floor((now - lastUpdate) / DAY_MS);
+            const staleThreshold = goal.reviewFrequency === 'daily' ? 1 : goal.reviewFrequency === 'weekly' ? 7 : 30;
+            goalHealth.push({
+              id: goal.id,
+              title: goal.title,
+              status: goal.status,
+              owner: goal.owner,
+              priority: goal.priority,
+              daysSinceUpdate,
+              reviewFrequency: goal.reviewFrequency,
+              isStale: goal.status === 'active' && daysSinceUpdate > staleThreshold,
+              linkedCronJobs: goal.linkedCronJobs || [],
+              progressCount: goal.progressNotes?.length ?? 0,
+            });
+          } catch { /* skip malformed */ }
+        }
+      }
+    } catch { /* non-fatal */ }
+
     return {
       feedbackStats,
       negativeFeedback,
       cronErrors: cronErrors.slice(0, 10),
       cronSuccessRate: cronTotal > 0 ? cronOk / cronTotal : 1,
+      cronReflections: cronReflections.slice(-20),
+      goalHealth,
     };
   }
 
@@ -341,6 +412,20 @@ export class SelfImproveLoop {
       `- Job: ${e.jobName} | Error: ${(e.error ?? 'unknown').slice(0, 200)} | At: ${e.startedAt}`
     ).join('\n') || '(no cron errors)';
 
+    // Format cron reflections (quality ratings from automated reflection passes)
+    const cronReflectionsText = metrics.cronReflections.slice(-10).map(r =>
+      `- Job: ${r.jobName} | Quality: ${r.quality}/5 | Notes: "${r.notes?.slice(0, 100) ?? ''}" | At: ${r.timestamp}`
+    ).join('\n') || '(no cron reflections yet)';
+
+    // Format goal health data
+    const goalHealthText = metrics.goalHealth.length > 0
+      ? metrics.goalHealth.map(g => {
+          const staleTag = g.isStale ? ' ⚠ STALE' : '';
+          const linkedTag = g.linkedCronJobs.length > 0 ? ` | Linked crons: ${g.linkedCronJobs.join(', ')}` : ' | No linked crons';
+          return `- [${g.status.toUpperCase()}] ${g.title} (${g.priority}) — owner: ${g.owner} | ${g.daysSinceUpdate}d since update | ${g.progressCount} progress notes${linkedTag}${staleTag}`;
+        }).join('\n')
+      : '(no goals defined)';
+
     const areas = this.config.areas.map(a => `'${a}'`).join(', ');
 
     const prompt =
@@ -349,10 +434,16 @@ export class SelfImproveLoop {
       `- Feedback: ${metrics.feedbackStats.positive} positive, ${metrics.feedbackStats.negative} negative, ${metrics.feedbackStats.mixed} mixed (${metrics.feedbackStats.total} total)\n` +
       `- Cron success rate: ${(metrics.cronSuccessRate * 100).toFixed(1)}%\n\n` +
       `### Negative feedback examples:\n${negativeFeedbackText}\n\n` +
+      `### Cron job quality reflections (automated self-evaluation):\n${cronReflectionsText}\n\n` +
       `### Communication signals in feedback:\n` +
       `- "silent", "no update", "how's it going" → agent didn't report progress\n` +
       `- "too verbose", "just do it" → over-communication\n` +
       `- "confused", "what happened" → unclear status\n\n` +
+      `### Goal health:\n${goalHealthText}\n\n` +
+      `### Goal health signals:\n` +
+      `- STALE goals → cron prompts aren't making progress, or goals aren't linked to crons\n` +
+      `- Goals with 0 progress notes → agents never started working on them\n` +
+      `- Goals with no linked crons → no automated work loop driving progress\n\n` +
       `### Cron job errors:\n${cronErrorsText}\n\n` +
       `## Current Configuration\n` +
       `### SOUL.md (personality/behavior):\n${soulContent}\n\n` +

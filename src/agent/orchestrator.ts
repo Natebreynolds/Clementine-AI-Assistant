@@ -289,6 +289,18 @@ export class PlanOrchestrator {
       }
       await safeProgress(this.getAllUpdates());
 
+      // Inter-wave spot-check: verify claimed artifacts exist before proceeding
+      // This prevents downstream waves from building on phantom results
+      const spotCheckIssues = this.spotCheckWaveResults(wave, results);
+      if (spotCheckIssues.length > 0) {
+        logger.warn({ issues: spotCheckIssues }, 'Spot-check found issues in wave results');
+        // Annotate results so the synthesis step knows about verification failures
+        for (const issue of spotCheckIssues) {
+          const existing = results.get(issue.stepId) ?? '';
+          results.set(issue.stepId, existing + `\n\n[SPOT-CHECK WARNING: ${issue.issue}]`);
+        }
+      }
+
       // Long-running warning
       if (!longPlanWarned && Date.now() - this.startTime > LONG_PLAN_WARNING_MS) {
         logger.warn({ elapsed: Date.now() - this.startTime }, 'Plan has been running for 30+ minutes');
@@ -334,7 +346,67 @@ export class PlanOrchestrator {
     const totalMs = Date.now() - this.startTime;
     logger.info({ totalMs, steps: plan.steps.length }, 'Plan execution complete');
 
+    // 6. Post-synthesis reflection (async, non-blocking)
+    this.runReflection(taskDescription, finalResult).catch(err => {
+      logger.debug({ err }, 'Post-plan reflection failed (non-fatal)');
+    });
+
     return finalResult;
+  }
+
+  /**
+   * Goal-backward verification pass using Haiku after plan synthesis.
+   * Verifies outcomes rather than just rating quality:
+   * - Did each step produce a real result?
+   * - Is the synthesized output substantive (not restating the question)?
+   * - Are there gaps between request and output?
+   */
+  private async runReflection(taskDescription: string, output: string): Promise<void> {
+    if (!output || output.length < 50) return;
+
+    // Build a step results summary for the verifier
+    const stepSummary = [...this.stepStatuses.entries()]
+      .filter(([id]) => id !== '__synthesis__')
+      .map(([id, s]) => `- ${s.description}: ${s.status}${s.status === 'failed' ? ' FAILED' : ''}`)
+      .join('\n');
+
+    const reflectionPrompt =
+      `Verify the outcome of this orchestrated plan using goal-backward verification.\n\n` +
+      `**Original request:** ${taskDescription.slice(0, 400)}\n\n` +
+      `**Step results:**\n${stepSummary}\n\n` +
+      `**Final output (first 1000 chars):** ${output.slice(0, 1000)}\n\n` +
+      `Verify:\n` +
+      `1. COMPLETENESS: Does the output address ALL parts of the original request? (not just the easy parts)\n` +
+      `2. SUBSTANCE: Is each claim backed by data/evidence? (not vague summaries or restating the question)\n` +
+      `3. WIRED: Are the step results actually connected in the synthesis? (not just concatenated)\n` +
+      `4. GAPS: What specific parts of the request were missed or under-addressed?\n\n` +
+      `Respond with ONLY a JSON object (no markdown):\n` +
+      `{"completeness": true/false, "substance": true/false, "wired": true/false, ` +
+      `"quality": 1-10, "gaps": "specific gaps or 'none'", "improvement": "one concrete thing to do differently"}`;
+
+    try {
+      const result = await this.assistant.runPlanStep('plan-reflection', reflectionPrompt, {
+        tier: 1,
+        maxTurns: 1,
+        model: 'haiku',
+        disableTools: true,
+      });
+
+      const jsonMatch = result.match(/\{[\s\S]*?\}/);
+      if (jsonMatch) {
+        const reflection = JSON.parse(jsonMatch[0]);
+        logger.info({
+          quality: reflection.quality,
+          completeness: reflection.completeness,
+          substance: reflection.substance,
+          wired: reflection.wired,
+          gaps: reflection.gaps?.slice(0, 100),
+          improvement: reflection.improvement?.slice(0, 100),
+        }, 'Plan reflection completed');
+      }
+    } catch {
+      // Non-fatal — reflection is best-effort
+    }
   }
 
   /**
@@ -368,6 +440,51 @@ export class PlanOrchestrator {
       }
     }
     return lines;
+  }
+
+  /**
+   * Inter-wave spot-check: verify that step results contain substance.
+   * Catches empty outputs, error-only results, and placeholder/stub responses
+   * before downstream waves try to build on them.
+   */
+  private spotCheckWaveResults(
+    wave: PlanStep[],
+    results: Map<string, string>,
+  ): Array<{ stepId: string; issue: string }> {
+    const issues: Array<{ stepId: string; issue: string }> = [];
+
+    for (const step of wave) {
+      const result = results.get(step.id) ?? '';
+      const status = this.stepStatuses.get(step.id);
+
+      // Skip already-failed steps
+      if (status?.status === 'failed') continue;
+
+      // Check 1: Empty or near-empty output
+      if (result.length < 20) {
+        issues.push({ stepId: step.id, issue: `Output is empty or trivial (${result.length} chars)` });
+        continue;
+      }
+
+      // Check 2: Output is just an error message
+      if (result.startsWith('[FAILED:') || result.startsWith('Error:') || result.startsWith('Something went wrong')) {
+        issues.push({ stepId: step.id, issue: 'Output appears to be an error, not a result' });
+        continue;
+      }
+
+      // Check 3: Stub detection — output that restates the task without answering
+      const stubPatterns = [
+        /^I('ll| will) (start|begin|look into|investigate|check)/i,
+        /^Let me (start|begin|look into|investigate|check)/i,
+        /^(Sure|OK|Alright),? (I'll|let me)/i,
+      ];
+      const firstLine = result.split('\n')[0];
+      if (stubPatterns.some(p => p.test(firstLine)) && result.length < 200) {
+        issues.push({ stepId: step.id, issue: 'Output appears to be a stub/placeholder (restates intent without delivering results)' });
+      }
+    }
+
+    return issues;
   }
 
   // ── Private helpers ──────────────────────────────────────────────────
