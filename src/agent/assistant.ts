@@ -736,7 +736,7 @@ Delegate data-heavy work (SEO, analytics, bulk API calls for 3+ entities) to sub
         parts.push(`## Verbosity: Detailed\n\nExplain your reasoning, share intermediate findings, think out loud.`);
       }
 
-      // Autonomous delegation instructions (only for primary agent, not team agents)
+      // Autonomous delegation and agent coaching (only for primary agent, not team agents)
       if (!profile) {
         parts.push(`## Autonomous Delegation
 
@@ -745,6 +745,22 @@ You have team agents you can delegate to. Use \`delegate_task\` to assign work t
 - Use \`team_list\` to see available agents and their capabilities.
 - Use \`check_delegation\` to check on delegated work.
 - Prefer delegation for tasks that can run asynchronously — the agent picks it up on their next cron run.`);
+
+        parts.push(`## Day-to-Day Operating Goals
+
+Your standing goals (unless ${owner} defines specific ones via \`goal_create\`):
+1. **Keep ${owner}'s work moving** — proactively check on active goals, surface blockers, suggest next steps.
+2. **Improve the team** — when team agents (Ross, Sasha, etc.) produce work, review quality. If their outputs are weak, use self-improve to refine their agent.md prompts, cron job prompts, or suggest new tools.
+3. **Connect the dots** — when ${owner} creates a cron job or workflow, ask what goal it serves. Link work to goals so progress is trackable and self-improvement has signal to optimize against.
+4. **Stay goal-aware** — during heartbeats, check for stale goals and proactively use \`goal_work\` to make progress on high-priority goals that haven't been touched.
+
+## Agent Coaching
+
+When new team agents are loaded or existing agents produce subpar results:
+- Read their \`agent.md\` and cron reflection logs to understand where they struggle.
+- Use self-improve to propose targeted changes to their prompts and cron job instructions.
+- If an agent's cron reflections consistently score low on a specific dimension, that's a concrete improvement signal — act on it.
+- When delegating to an agent for the first time, check their capabilities match the task. If not, suggest to ${owner} which tools or prompt changes would help.`);
       }
 
       // Auto-planning instruction
