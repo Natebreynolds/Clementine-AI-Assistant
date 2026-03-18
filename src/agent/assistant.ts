@@ -48,6 +48,10 @@ import {
   UNLEASHED_DEFAULT_MAX_HOURS,
   UNLEASHED_MAX_PHASES,
   PROJECTS_META_FILE,
+  GOALS_DIR,
+  CRON_PROGRESS_DIR,
+  CRON_REFLECTIONS_DIR,
+  HANDOFFS_DIR,
 } from '../config.js';
 import type { AgentProfile, OnTextCallback, OnToolActivityCallback, SessionData, VerboseLevel } from '../types.js';
 import {
@@ -679,6 +683,18 @@ export class PersonalAssistant {
     if (isAutonomous) {
       // Minimal vault reference for heartbeats/cron — they know their tools
       parts.push(`Vault: \`${vault}\`. Key files: MEMORY.md, ${todayISO()}.md (today), TASKS.md. Use MCP tools (memory_read/write, task_list/add/update, note_take).`);
+
+      // Deviation rules — tiered autonomy for handling unexpected work during cron/heartbeat
+      parts.push(`## Deviation Rules (Tiered Autonomy)
+
+When you encounter unexpected issues during execution, follow these rules in order:
+
+**Rule 1 — Auto-fix bugs:** If you discover broken behavior while working, fix it inline without asking. Note what you fixed.
+**Rule 2 — Auto-add critical missing pieces:** Missing error handling, broken references, incomplete data — fix these automatically. They're correctness requirements, not features.
+**Rule 3 — Auto-fix blockers:** Missing dependencies, wrong paths, broken imports — resolve whatever is blocking the current task from completing.
+**Rule 4 — Stop on scope changes:** New features, architectural changes, anything that changes WHAT the task does (not HOW) — do NOT proceed. Note the issue and flag it in your output for ${owner}'s review.
+
+After 3 auto-fix attempts on a single issue, stop working on it. Document what you tried, note remaining issues, and move on.`);
     } else {
       parts.push(`## Vault (\`${vault}\`)
 
@@ -705,7 +721,7 @@ Delegate data-heavy work (SEO, analytics, bulk API calls for 3+ entities) to sub
       parts.push(`You are currently operating as **${profile.name}** (${profile.description}).`);
     }
 
-    // Skip communication preferences for autonomous runs
+    // Skip communication preferences and agentic instructions for autonomous runs
     if (!isAutonomous) {
       const feedbackFile = path.join(VAULT_DIR, '00-System', 'FEEDBACK.md');
       const fbEntry = this.promptCache.get(feedbackFile);
@@ -719,6 +735,27 @@ Delegate data-heavy work (SEO, analytics, bulk API calls for 3+ entities) to sub
       } else if (verboseLevel === 'detailed') {
         parts.push(`## Verbosity: Detailed\n\nExplain your reasoning, share intermediate findings, think out loud.`);
       }
+
+      // Autonomous delegation instructions (only for primary agent, not team agents)
+      if (!profile) {
+        parts.push(`## Autonomous Delegation
+
+You have team agents you can delegate to. Use \`delegate_task\` to assign work that falls in their domain:
+- When a task is clearly in a team agent's specialty, delegate it instead of doing it yourself.
+- Use \`team_list\` to see available agents and their capabilities.
+- Use \`check_delegation\` to check on delegated work.
+- Prefer delegation for tasks that can run asynchronously — the agent picks it up on their next cron run.`);
+      }
+
+      // Auto-planning instruction
+      parts.push(`## Complex Task Decomposition
+
+For complex tasks (audits, research across multiple sources, multi-step analysis, anything requiring 5+ tool calls across different domains), output \`[PLAN_NEEDED: brief description]\` as the FIRST line of your response. The system will automatically decompose the task into parallel sub-steps via the orchestrator. Do NOT try to do everything sequentially in a single turn when parallel execution would be faster.`);
+
+      // Analysis paralysis guard
+      parts.push(`## Execution Guard
+
+If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search, memory_read) without any action (Write, Edit, Bash, note_create, task_add, memory_write, delegate_task, or any tool that changes state): STOP. State in one sentence why you haven't taken action yet, then either act or tell ${owner} what you need to proceed.`);
     }
 
     // Security rules are now passed via appendSystemPrompt in buildOptions()
@@ -805,6 +842,17 @@ Delegate data-heavy work (SEO, analytics, bulk API calls for 3+ entities) to sub
       mcpTool('create_agent'),
       mcpTool('update_agent'),
       mcpTool('delete_agent'),
+      mcpTool('goal_create'),
+      mcpTool('goal_update'),
+      mcpTool('goal_list'),
+      mcpTool('goal_get'),
+      mcpTool('goal_work'),
+      mcpTool('cron_progress_read'),
+      mcpTool('cron_progress_write'),
+      mcpTool('delegate_task'),
+      mcpTool('check_delegation'),
+      mcpTool('session_pause'),
+      mcpTool('session_resume'),
     ];
 
     if (enableTeams) {
@@ -1025,6 +1073,8 @@ Delegate data-heavy work (SEO, analytics, bulk API calls for 3+ entities) to sub
     if (key && (this.exchangeCounts.get(key) ?? 0) >= MAX_SESSION_EXCHANGES) {
       // Fire-and-forget: memory extraction is a write-only side effect
       this.preRotationFlush(key).catch(() => {});
+      // Auto-save handoff so the resumed session has context
+      this.saveAutoHandoff(key);
       this.sessions.delete(key);
       this.exchangeCounts.set(key, 0);
       toolLoopDetector.reset();
@@ -1033,13 +1083,21 @@ Delegate data-heavy work (SEO, analytics, bulk API calls for 3+ entities) to sub
 
     let effectivePrompt = text;
 
-    // If session rotated, use instant local summary + kick off LLM summary in background
+    // If session rotated, use instant local summary + handoff + kick off LLM summary in background
     if (sessionRotated && key) {
       const summary = this.buildLocalSummary(key);
+      const handoff = this.loadHandoff(key);
+      const contextParts: string[] = [];
       if (summary) {
+        contextParts.push(`Previous conversation summary:\n${summary}`);
+      }
+      if (handoff) {
+        contextParts.push(`Session handoff:\n${handoff}`);
+      }
+      if (contextParts.length > 0) {
         effectivePrompt =
-          `[Context: This is a continued conversation. The session was refreshed. ` +
-          `Here is a summary of the previous conversation:\n${summary}]\n\n${text}`;
+          `[Context: This is a continued conversation. The session was refreshed.\n` +
+          `${contextParts.join('\n\n')}]\n\n${text}`;
       }
       // Fire background LLM summary for storage/future retrieval
       this.summarizeSessionAsync(key).catch(() => {});
@@ -1394,6 +1452,75 @@ Delegate data-heavy work (SEO, analytics, bulk API calls for 3+ entities) to sub
       return `- Exchange ${exchanges.length - recent.length + i + 1}: User asked about "${userSnippet}" / I responded "${assistantSnippet}"`;
     });
     return lines.join('\n');
+  }
+
+  /**
+   * Auto-save a lightweight handoff file when a session rotates.
+   * Uses in-memory exchange history — no LLM call.
+   */
+  private saveAutoHandoff(sessionKey: string): void {
+    try {
+      const exchanges = this.lastExchanges.get(sessionKey) ?? [];
+      if (exchanges.length === 0) return;
+
+      if (!fs.existsSync(HANDOFFS_DIR)) fs.mkdirSync(HANDOFFS_DIR, { recursive: true });
+
+      // Extract topics from recent exchanges as completed/remaining work
+      const recent = exchanges.slice(-5);
+      const completed = recent.map(ex => ex.user.slice(0, 150).replace(/\n/g, ' '));
+
+      const handoff = {
+        sessionKey,
+        pausedAt: new Date().toISOString(),
+        autoGenerated: true,
+        completed,
+        remaining: [],
+        decisions: [],
+        blockers: [],
+        context: `Auto-saved on session rotation after ${exchanges.length} exchanges.`,
+      };
+
+      const safeName = sessionKey.replace(/[^a-zA-Z0-9_-]/g, '_');
+      fs.writeFileSync(path.join(HANDOFFS_DIR, `${safeName}.json`), JSON.stringify(handoff, null, 2));
+      logger.debug({ sessionKey }, 'Auto-handoff saved on rotation');
+    } catch {
+      // Non-fatal
+    }
+  }
+
+  /**
+   * Load a handoff file for a session if one exists.
+   * Returns formatted context string or empty string.
+   */
+  private loadHandoff(sessionKey: string): string {
+    try {
+      const safeName = sessionKey.replace(/[^a-zA-Z0-9_-]/g, '_');
+      const filePath = path.join(HANDOFFS_DIR, `${safeName}.json`);
+      if (!fs.existsSync(filePath)) return '';
+
+      const handoff = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+      const parts: string[] = [];
+
+      if (handoff.completed?.length > 0) {
+        parts.push(`Completed: ${handoff.completed.map((c: string) => c.slice(0, 100)).join('; ')}`);
+      }
+      if (handoff.remaining?.length > 0) {
+        parts.push(`Remaining: ${handoff.remaining.join('; ')}`);
+      }
+      if (handoff.decisions?.length > 0) {
+        parts.push(`Decisions: ${handoff.decisions.join('; ')}`);
+      }
+      if (handoff.blockers?.length > 0) {
+        parts.push(`Blockers: ${handoff.blockers.join('; ')}`);
+      }
+      if (handoff.context && !handoff.autoGenerated) {
+        parts.push(`Context: ${handoff.context}`);
+      }
+
+      return parts.join('\n');
+    } catch {
+      return '';
+    }
   }
 
   /**
@@ -1810,6 +1937,7 @@ Delegate data-heavy work (SEO, analytics, bulk API calls for 3+ entities) to sub
     model?: string,
     workDir?: string,
     timeoutMs?: number,
+    successCriteria?: string[],
   ): Promise<string> {
     setInteractionSource('autonomous');
     const sdkOptions = this.buildOptions({
@@ -1837,8 +1965,88 @@ Delegate data-heavy work (SEO, analytics, bulk API calls for 3+ entities) to sub
     }
 
     const ownerName = OWNER;
+
+    // ── Cron progress continuity: inject previous progress ──────────
+    let progressContext = '';
+    try {
+      const safeJob = jobName.replace(/[^a-zA-Z0-9_-]/g, '_');
+      const progressFile = path.join(CRON_PROGRESS_DIR, `${safeJob}.json`);
+      if (fs.existsSync(progressFile)) {
+        const progress = JSON.parse(fs.readFileSync(progressFile, 'utf-8'));
+        const parts: string[] = [`## Previous Progress (run #${progress.runCount}, ${progress.lastRunAt})`];
+        if (progress.completedItems?.length > 0) {
+          parts.push(`Completed: ${progress.completedItems.slice(-10).join(', ')}`);
+        }
+        if (progress.pendingItems?.length > 0) {
+          parts.push(`Pending: ${progress.pendingItems.join(', ')}`);
+        }
+        if (progress.notes) {
+          parts.push(`Notes: ${progress.notes}`);
+        }
+        progressContext = parts.join('\n') + '\n\n' +
+          'Continue from where you left off. Use `cron_progress_write` at the end to save what you completed and what\'s pending.\n\n';
+      }
+    } catch { /* non-fatal — run without progress context */ }
+
+    // ── Goal context: inject linked goal info ───────────────────────
+    let goalContext = '';
+    try {
+      if (fs.existsSync(GOALS_DIR)) {
+        const goalFiles = fs.readdirSync(GOALS_DIR).filter(f => f.endsWith('.json'));
+        const linkedGoals = goalFiles
+          .map(f => { try { return JSON.parse(fs.readFileSync(path.join(GOALS_DIR, f), 'utf-8')); } catch { return null; } })
+          .filter(g => g && g.status === 'active' && g.linkedCronJobs?.includes(jobName));
+
+        if (linkedGoals.length > 0) {
+          const goalLines = linkedGoals.map((g: any) => {
+            const nextAct = g.nextActions?.length > 0 ? ` Next: ${g.nextActions[0]}` : '';
+            const recentProgress = g.progressNotes?.length > 0
+              ? ` Last progress: ${g.progressNotes[g.progressNotes.length - 1]}`
+              : '';
+            return `- **${g.title}** (${g.id}): ${g.description.slice(0, 100)}${nextAct}${recentProgress}`;
+          });
+          goalContext = `## Active Goals Linked to This Job\n${goalLines.join('\n')}\n\n` +
+            'After completing your work, update goal progress with `goal_update` if you made meaningful progress.\n\n';
+        }
+      }
+    } catch { /* non-fatal */ }
+
+    // ── Delegated tasks: inject pending tasks for this agent ─────────
+    let delegationContext = '';
+    try {
+      const agentSlug = sdkOptions.env?.CLEMENTINE_TEAM_AGENT;
+      const slug = agentSlug || 'clementine';
+      const tasksDir = path.join(VAULT_DIR, '00-System', 'agents', slug, 'tasks');
+      if (fs.existsSync(tasksDir)) {
+        const taskFiles = fs.readdirSync(tasksDir).filter(f => f.endsWith('.json'));
+        const pendingTasks = taskFiles
+          .map(f => { try { return JSON.parse(fs.readFileSync(path.join(tasksDir, f), 'utf-8')); } catch { return null; } })
+          .filter((t: any) => t && t.status === 'pending');
+
+        if (pendingTasks.length > 0) {
+          const taskLines = pendingTasks.map((t: any) =>
+            `- [${t.id}] From ${t.fromAgent}: ${t.task.slice(0, 150)} (expected: ${t.expectedOutput.slice(0, 80)})`
+          );
+          delegationContext = `## Delegated Tasks Waiting\n${taskLines.join('\n')}\n\n` +
+            'Work on these delegated tasks in addition to your scheduled task. ' +
+            'Mark them in_progress/completed by editing the task JSON when done.\n\n';
+        }
+      }
+    } catch { /* non-fatal */ }
+
+    // ── Success criteria: inject verifiable acceptance criteria ────
+    let criteriaContext = '';
+    if (successCriteria?.length) {
+      criteriaContext = `## Success Criteria\nYour output will be verified against these criteria:\n` +
+        successCriteria.map(c => `- ${c}`).join('\n') + '\n\n';
+    }
+
     const prompt =
       `[Scheduled task: ${jobName}]\n\n` +
+      progressContext +
+      goalContext +
+      delegationContext +
+      criteriaContext +
       `${jobPrompt}\n\n` +
       `## How to respond\n` +
       `You're sending this directly to ${ownerName} as a DM. ` +
@@ -1893,9 +2101,80 @@ Delegate data-heavy work (SEO, analytics, bulk API calls for 3+ entities) to sub
       // Save execution trace
       saveCronTrace(jobName, trace);
 
-      return extractDeliverable(trace);
+      const deliverable = extractDeliverable(trace);
+
+      // ── Post-cron reflection (async, non-blocking) ──────────────
+      this.runCronReflection(jobName, jobPrompt, deliverable, successCriteria).catch(err => {
+        logger.debug({ err, job: jobName }, 'Cron reflection failed (non-fatal)');
+      });
+
+      return deliverable;
     } finally {
       if (timeoutHandle) clearTimeout(timeoutHandle);
+    }
+  }
+
+  /**
+   * Goal-backward verification pass using Haiku after cron job execution.
+   * Instead of vague quality ratings, verifies actual outcomes:
+   * 1. Did the output address the task? (existence)
+   * 2. Is it substantive, not a stub/placeholder? (substance)
+   * 3. Does it connect to the goal / produce actionable results? (wired)
+   */
+  private async runCronReflection(jobName: string, jobPrompt: string, deliverable: string, successCriteria?: string[]): Promise<void> {
+    if (!deliverable || deliverable === '__NOTHING__') return;
+
+    const criteriaBlock = successCriteria?.length
+      ? `\n**Success criteria to verify:**\n${successCriteria.map(c => `- ${c}`).join('\n')}\n`
+      : '';
+
+    const reflectionPrompt =
+      `Verify the outcome of this scheduled task using goal-backward verification.\n\n` +
+      `**Task:** ${jobPrompt.slice(0, 400)}\n` +
+      criteriaBlock +
+      `\n**Output produced:** ${deliverable.slice(0, 1200)}\n\n` +
+      `Check three things:\n` +
+      `1. EXISTENCE: Did it produce a real response addressing the task? (not just "nothing to report")\n` +
+      `2. SUBSTANCE: Is the output substantive with actual data/analysis? (not vague, not a placeholder, not restating the task)\n` +
+      `3. ACTIONABLE: Does it give the owner something useful — information, a decision, a deliverable?\n` +
+      (successCriteria?.length ? `4. CRITERIA: Were the success criteria met?\n` : '') +
+      `\nRespond with ONLY a JSON object (no markdown):\n` +
+      `{"existence": true/false, "substance": true/false, "actionable": true/false, ` +
+      `${successCriteria?.length ? '"criteria_met": true/false, ' : ''}` +
+      `"quality": 1-5, "gap": "one sentence on what's missing or could improve, or 'none'"}`;
+
+    try {
+      const result = await this.runPlanStep('cron-reflection', reflectionPrompt, {
+        tier: 1,
+        maxTurns: 1,
+        model: 'haiku',
+        disableTools: true,
+      });
+
+      // Parse and log the reflection
+      const jsonMatch = result.match(/\{[\s\S]*?\}/);
+      if (jsonMatch) {
+        const reflection = JSON.parse(jsonMatch[0]);
+        const entry = {
+          jobName,
+          timestamp: new Date().toISOString(),
+          existence: reflection.existence ?? false,
+          substance: reflection.substance ?? false,
+          actionable: reflection.actionable ?? false,
+          criteriaMet: reflection.criteria_met ?? null,
+          quality: reflection.quality ?? 0,
+          gap: reflection.gap ?? '',
+        };
+        if (!fs.existsSync(CRON_REFLECTIONS_DIR)) fs.mkdirSync(CRON_REFLECTIONS_DIR, { recursive: true });
+        const logFile = path.join(CRON_REFLECTIONS_DIR, `${jobName.replace(/[^a-zA-Z0-9_-]/g, '_')}.jsonl`);
+        fs.appendFileSync(logFile, JSON.stringify(entry) + '\n');
+        logger.debug({
+          job: jobName, quality: entry.quality,
+          existence: entry.existence, substance: entry.substance, actionable: entry.actionable,
+        }, 'Cron reflection logged');
+      }
+    } catch {
+      // Non-fatal — reflection is best-effort
     }
   }
 

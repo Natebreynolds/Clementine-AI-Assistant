@@ -287,6 +287,14 @@ export const EPISODIC_DECAY_HALF_LIFE_DAYS = 7;
 
 export const SELF_IMPROVE_DIR = path.join(BASE_DIR, 'self-improve');
 
+// ── Goals & Cron Progress ───────────────────────────────────────────
+
+export const GOALS_DIR = path.join(BASE_DIR, 'goals');
+export const CRON_PROGRESS_DIR = path.join(BASE_DIR, 'cron', 'progress');
+export const CRON_REFLECTIONS_DIR = path.join(BASE_DIR, 'cron', 'reflections');
+export const DELEGATIONS_DIR = path.join(VAULT_DIR, '00-System', 'agents');
+export const HANDOFFS_DIR = path.join(BASE_DIR, 'handoffs');
+
 // ── Source Self-Edit Staging ─────────────────────────────────────────
 
 export const STAGING_DIR = path.join(BASE_DIR, 'staging');
