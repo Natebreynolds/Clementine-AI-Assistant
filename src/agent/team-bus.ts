@@ -5,7 +5,7 @@
  * Logs to JSONL and optionally mirrors to a Discord channel.
  */
 
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import pino from 'pino';
@@ -19,6 +19,8 @@ const logger = pino({ name: 'clementine.team-bus' });
 const MAX_DEPTH = 3;
 /** Minimum interval between same sender->recipient pair (ms). */
 const COOLDOWN_MS = 30_000;
+/** Window for content dedup — reject identical messages within this period (ms). */
+const CONTENT_DEDUP_MS = 300_000; // 5 minutes
 /** Max recent messages to keep in memory. */
 const RECENT_BUFFER_SIZE = 500;
 
@@ -30,6 +32,8 @@ export class TeamBus {
   private recentMessages: TeamMessage[] = [];
   /** "from:to" → last send timestamp (for cooldown). */
   private cooldowns = new Map<string, number>();
+  /** "from:to:contentHash" → timestamp (for content dedup). */
+  private contentHashes = new Map<string, number>();
   private statusChangeListeners: Array<() => void> = [];
   private botManager?: import('../channels/discord-bot-manager.js').BotManager;
   private slackBotManager?: import('../channels/slack-bot-manager.js').SlackBotManager;
@@ -168,6 +172,25 @@ export class TeamBus {
       );
     }
     this.cooldowns.set(cooldownKey, now);
+
+    // Anti-loop: content dedup — reject identical messages within the dedup window
+    const contentHash = createHash('sha256').update(content.trim()).digest('hex').slice(0, 12);
+    const dedupKey = `${fromSlug}:${toSlug}:${contentHash}`;
+    const lastSame = this.contentHashes.get(dedupKey) ?? 0;
+    if (now - lastSame < CONTENT_DEDUP_MS) {
+      throw new Error(
+        `Duplicate message: ${fromSlug} already sent this exact content to ${toSlug} recently. ` +
+        `Rephrase or wait before resending.`,
+      );
+    }
+    this.contentHashes.set(dedupKey, now);
+
+    // Prune old dedup entries periodically
+    if (this.contentHashes.size > 200) {
+      for (const [key, ts] of this.contentHashes) {
+        if (now - ts > CONTENT_DEDUP_MS) this.contentHashes.delete(key);
+      }
+    }
 
     // Create the message record
     const message: TeamMessage = {
