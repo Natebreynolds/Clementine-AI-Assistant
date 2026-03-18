@@ -286,6 +286,7 @@ export const EPISODIC_DECAY_HALF_LIFE_DAYS = 7;
 // ── Self-Improvement ─────────────────────────────────────────────────
 
 export const SELF_IMPROVE_DIR = path.join(BASE_DIR, 'self-improve');
+export const SOURCE_MODS_DIR = path.join(SELF_IMPROVE_DIR, 'source-mods');
 
 // ── Goals & Cron Progress ───────────────────────────────────────────
 

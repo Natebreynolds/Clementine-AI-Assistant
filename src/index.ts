@@ -594,7 +594,7 @@ async function asyncMain(): Promise<void> {
           const { safeSourceEdit } = await import('./agent/safe-restart.js');
           const result = await safeSourceEdit(config.PKG_DIR, [
             { relativePath: pending.file, content: pending.content },
-          ], { reason: pending.reason });
+          ], { reason: pending.reason, description: pending.reason });
 
           if (!result.success) {
             logger.error({ error: result.error, preflightErrors: result.preflightErrors }, 'Pending source edit failed');
@@ -632,11 +632,45 @@ async function asyncMain(): Promise<void> {
 
   // ── Deliver restart sentinel notification ──────────────────────
   if (sentinel) {
-    const msg = sentinel.reason === 'source-edit'
-      ? `Restart complete. Source change applied${sentinel.changedFiles ? ` (${sentinel.changedFiles.join(', ')})` : ''}.`
-      : sentinel.reason === 'update'
-        ? 'Restart complete. Update applied successfully.'
-        : 'Restart complete.';
+    let msg: string;
+    if (sentinel.reason === 'source-edit') {
+      msg = `Restart complete. Source change applied${sentinel.changedFiles ? ` (${sentinel.changedFiles.join(', ')})` : ''}.`;
+    } else if (sentinel.reason === 'update' && sentinel.updateDetails) {
+      const d = sentinel.updateDetails;
+      const parts: string[] = [];
+
+      // Version info
+      if (d.commitHash) {
+        parts.push(`Updated to ${d.commitHash}${d.commitDate ? ` (${d.commitDate})` : ''}`);
+      } else {
+        parts.push('Update applied');
+      }
+
+      // What changed upstream
+      if (d.commitsBehind && d.commitsBehind > 0) {
+        parts.push(`${d.commitsBehind} new commit${d.commitsBehind > 1 ? 's' : ''} pulled`);
+      }
+      if (d.summary) {
+        parts.push(`Changes: ${d.summary}`);
+      }
+
+      // Source mod reconciliation
+      const modParts: string[] = [];
+      if (d.modsReapplied && d.modsReapplied > 0) modParts.push(`${d.modsReapplied} re-applied`);
+      if (d.modsSuperseded && d.modsSuperseded > 0) modParts.push(`${d.modsSuperseded} already in upstream`);
+      if (d.modsNeedReconciliation && d.modsNeedReconciliation > 0) modParts.push(`${d.modsNeedReconciliation} need my attention`);
+      if (d.modsFailed && d.modsFailed > 0) modParts.push(`${d.modsFailed} failed`);
+      if (modParts.length > 0) {
+        parts.push(`Source mods: ${modParts.join(', ')}`);
+      }
+
+      msg = parts.join('. ') + '.';
+    } else if (sentinel.reason === 'update') {
+      msg = 'Restart complete. Update applied successfully.';
+    } else {
+      msg = 'Restart complete.';
+    }
+
     dispatcher.send(msg).catch((err) => {
       logger.warn({ err }, 'Failed to deliver restart notification');
     });
@@ -735,7 +769,14 @@ async function asyncMain(): Promise<void> {
       if (crashSentinel?.changedFiles && crashSentinel.changedFiles.length > 0) {
         logger.info({ changedFiles: crashSentinel.changedFiles }, 'Rolling back source edit...');
         try {
-          execSync('git revert --no-edit HEAD', { cwd: config.PKG_DIR, stdio: 'pipe' });
+          // Roll back via source-mods registry (restores "before" snapshots)
+          if (crashSentinel.sourceChangeId) {
+            const { rollbackSourceMod } = await import('./agent/source-mods.js');
+            rollbackSourceMod(crashSentinel.sourceChangeId, config.PKG_DIR);
+          } else {
+            // Fallback: reset src/ to git HEAD
+            execSync('git checkout -- src/', { cwd: config.PKG_DIR, stdio: 'pipe' });
+          }
           // Use tsc directly — `npm run build` does `rm -rf dist` which would
           // nuke the running process's code. tsc alone overwrites only changed .js files.
           execSync('npx tsc', { cwd: config.PKG_DIR, stdio: 'pipe', timeout: 120_000 });

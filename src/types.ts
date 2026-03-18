@@ -354,6 +354,17 @@ export interface RestartSentinel {
   sourceChangeId?: string;     // experiment ID
   sessionKey?: string;         // which session triggered it
   changedFiles?: string[];     // for rollback if child crashes
+  // Update details (populated by `clementine update` and auto-update)
+  updateDetails?: {
+    commitHash?: string;
+    commitDate?: string;
+    commitsBehind?: number;     // how many commits were pulled
+    summary?: string;           // one-line upstream change summary
+    modsReapplied?: number;
+    modsSuperseded?: number;
+    modsNeedReconciliation?: number;
+    modsFailed?: number;
+  };
 }
 
 // ── Graph Memory ────────────────────────────────────────────────────
