@@ -578,6 +578,34 @@ export class Gateway {
     }
   }
 
+  // ── Team task execution (unleashed for team messages) ──────────────
+
+  /**
+   * Process a team message as an autonomous task — same multi-phase execution
+   * as cron unleashed jobs, so agents can work until done instead of being
+   * killed by the 5-minute interactive chat timeout.
+   */
+  async handleTeamTask(
+    fromName: string,
+    fromSlug: string,
+    content: string,
+    profile: import('../types.js').AgentProfile,
+    onText?: (token: string) => void,
+  ): Promise<string> {
+    const releaseLane = await lanes.acquire('cron');
+    try {
+      logger.info({ fromSlug, toSlug: profile.slug }, 'Running team message as autonomous task');
+      const response = await this.assistant.runTeamTask(fromName, fromSlug, content, profile, onText);
+      scanner.refreshIntegrity();
+      return response;
+    } catch (err) {
+      logger.error({ err, fromSlug, toSlug: profile.slug }, 'Team task error');
+      throw err;
+    } finally {
+      releaseLane();
+    }
+  }
+
   // ── Plan orchestration ──────────────────────────────────────────────
 
   async handlePlan(

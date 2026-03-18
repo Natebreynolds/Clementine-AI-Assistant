@@ -333,18 +333,17 @@ export class AgentBotClient {
 
     await channel.send({ embeds: [embed] });
 
-    // Now trigger the agent to process the message and respond
-    const sessionKey = `discord:channel:${channelId}:${this.config.ownerId}`;
-    this.gateway.setSessionProfile(sessionKey, this.config.slug);
-
+    // Run the task through the unleashed pipeline — gives the agent full
+    // multi-phase autonomous execution instead of the 5-minute chat timeout.
     const streamer = new DiscordStreamingMessage(channel);
     await streamer.start();
 
     try {
-      const wrappedContent = `[Team message from ${fromName} (${fromSlug})]: ${content}`;
-      const response = await this.gateway.handleMessage(
-        sessionKey,
-        wrappedContent,
+      const response = await this.gateway.handleTeamTask(
+        fromName,
+        fromSlug,
+        content,
+        this.config.profile,
         async (token: string) => {
           await streamer.update(token);
         },

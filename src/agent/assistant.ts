@@ -2451,6 +2451,165 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
     return maxPhasesResult;
   }
 
+  // ── Team Task Execution (Unleashed for Team Messages) ────────────
+
+  /**
+   * Run a team message as an unleashed-style autonomous task.
+   * Gives team agents the same multi-phase execution as cron jobs,
+   * instead of being killed by the 5-minute interactive chat timeout.
+   *
+   * @param onText  Streaming callback for real-time progress updates
+   */
+  async runTeamTask(
+    fromName: string,
+    fromSlug: string,
+    content: string,
+    profile: AgentProfile,
+    onText?: (token: string) => void,
+  ): Promise<string> {
+    setInteractionSource('autonomous');
+
+    const taskName = `team-msg:${fromSlug}-to-${profile.slug}`;
+    const maxHours = 1; // Team messages get 1 hour max (not 6 like cron unleashed)
+    const turnsPerPhase = UNLEASHED_PHASE_TURNS;
+    const deadline = Date.now() + maxHours * 60 * 60 * 1000;
+    const maxPhases = 10; // Reasonable cap for a single message task
+
+    let sessionId = '';
+    let phase = 0;
+    let lastOutput = '';
+    let consecutiveErrors = 0;
+
+    while (phase < maxPhases) {
+      if (Date.now() >= deadline) {
+        logger.info({ taskName, phase }, 'Team task timed out');
+        return lastOutput || `Team task timed out after ${maxHours}h at phase ${phase}.`;
+      }
+
+      phase++;
+      logger.info({ taskName, phase }, `Team task: starting phase ${phase}`);
+      setInteractionSource('autonomous');
+
+      const sdkOptions = this.buildOptions({
+        isHeartbeat: true,
+        cronTier: 2, // Give full tool access (Bash, Write, Edit)
+        maxTurns: turnsPerPhase,
+        model: null,
+        enableTeams: true,
+        profile,
+      });
+
+      if (profile.project) {
+        const project = findProjectByName(profile.project);
+        if (project) sdkOptions.cwd = project.path;
+      }
+
+      if (sessionId) {
+        sdkOptions.resume = sessionId;
+      }
+
+      const now = new Date();
+      const timestamp = now.toISOString().slice(0, 16).replace('T', ' ');
+      const remainingMin = Math.round((deadline - Date.now()) / 60_000);
+
+      let prompt: string;
+      if (phase === 1) {
+        prompt =
+          `[TEAM MESSAGE from ${fromName} (${fromSlug}) — ${timestamp}]\n\n` +
+          `You received a direct message from a teammate. Process it fully and autonomously.\n` +
+          `You have up to ${remainingMin} minutes and ${turnsPerPhase} turns per phase.\n` +
+          `If you need more turns, your session will be resumed with fresh context.\n\n` +
+          `MESSAGE:\n${content}\n\n` +
+          `IMPORTANT:\n` +
+          `- Complete the full task described in the message\n` +
+          `- Use all tools available to you — Salesforce, DataForSEO, Discord, etc.\n` +
+          `- Post results to Discord channels as instructed\n` +
+          `- When finished, output "TASK_COMPLETE:" followed by a brief summary of what you did\n` +
+          `- If you can't finish this phase, output a STATUS SUMMARY of progress so far`;
+      } else if (sessionId) {
+        prompt =
+          `[TEAM TASK continued — Phase ${phase} — ${timestamp}]\n\n` +
+          `Continuing work on the team message from ${fromName}.\n` +
+          `Time remaining: ${remainingMin} minutes. Turns this phase: ${turnsPerPhase}.\n\n` +
+          `Continue where you left off. Complete the task.\n` +
+          `When finished, output "TASK_COMPLETE:" followed by a brief summary.\n` +
+          `If not done yet, output a STATUS SUMMARY.`;
+      } else {
+        prompt =
+          `[TEAM TASK recovery — Phase ${phase} — ${timestamp}]\n\n` +
+          `You are continuing a team task from ${fromName} after an error.\n` +
+          `Time remaining: ${remainingMin} minutes.\n\n` +
+          `ORIGINAL MESSAGE:\n${content}\n\n` +
+          `Check any files or Discord posts from prior phases, then continue.\n` +
+          `When finished, output "TASK_COMPLETE:" followed by a summary.`;
+      }
+
+      let phaseOutput = '';
+      let phaseSessionId = '';
+
+      const phaseAc = new AbortController();
+      const phaseTimer = setTimeout(() => {
+        phaseAc.abort();
+        logger.warn({ taskName, phase }, `Team task phase ${phase} aborted — deadline reached`);
+      }, Math.max(deadline - Date.now(), 0));
+      sdkOptions.abortController = phaseAc;
+
+      try {
+        const stream = query({ prompt, options: sdkOptions });
+
+        for await (const message of stream) {
+          if (message.type === 'assistant') {
+            const blocks = getContentBlocks(message as SDKAssistantMessage);
+            for (const block of blocks) {
+              if (block.type === 'text' && block.text) {
+                phaseOutput += block.text;
+                if (onText) onText(block.text);
+              } else if (block.type === 'tool_use' && block.name) {
+                logToolUse(block.name, (block.input ?? {}) as Record<string, unknown>);
+                const toolLabel = block.name.replace(/^mcp__clementine-tools__/, '').replace(/_/g, ' ');
+                if (onText) onText(`\n[using ${toolLabel}...]\n`);
+              }
+            }
+          } else if (message.type === 'result') {
+            const result = message as SDKResultMessage;
+            phaseSessionId = result.session_id ?? '';
+            if ('total_cost_usd' in result) {
+              logger.info({
+                taskName,
+                phase,
+                cost_usd: (result as any).total_cost_usd,
+                num_turns: (result as any).num_turns,
+                duration_ms: (result as any).duration_ms,
+              }, 'Team task phase completed');
+            }
+          }
+        }
+      } catch (err) {
+        clearTimeout(phaseTimer);
+        logger.error({ err, taskName, phase }, 'Team task phase error');
+        consecutiveErrors++;
+        if (consecutiveErrors >= 3) {
+          return lastOutput || `Team task failed after 3 consecutive errors (phase ${phase}).`;
+        }
+        sessionId = '';
+        continue;
+      }
+
+      clearTimeout(phaseTimer);
+      sessionId = phaseSessionId;
+      lastOutput = phaseOutput.trim();
+      consecutiveErrors = 0;
+
+      logger.info({ taskName, phase }, `Team task: phase ${phase} complete`);
+
+      if (lastOutput.includes('TASK_COMPLETE:')) {
+        return lastOutput;
+      }
+    }
+
+    return lastOutput || `Team task reached max phases (${maxPhases}).`;
+  }
+
   // ── Session Management ────────────────────────────────────────────
 
   /**

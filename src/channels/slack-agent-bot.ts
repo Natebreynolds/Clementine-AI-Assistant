@@ -272,24 +272,20 @@ export class SlackAgentBotClient {
       text: `*${fromName}* via team message:\n${content.slice(0, 3000)}`,
     });
 
-    // Trigger the agent to process and respond
-    const sessionKey = `slack:channel:${channelId}:${this.config.slug}:${this.config.ownerId}`;
-    this.gateway.setSessionProfile(sessionKey, this.config.slug);
-
+    // Run the task through the unleashed pipeline — gives the agent full
+    // multi-phase autonomous execution instead of the 5-minute chat timeout.
     const streamer = new SlackStreamingMessage(this.app.client, channelId);
     await streamer.start();
 
     try {
-      const wrappedContent = `[Team message from ${fromName} (${fromSlug})]: ${content}`;
-      const response = await this.gateway.handleMessage(
-        sessionKey,
-        wrappedContent,
+      const response = await this.gateway.handleTeamTask(
+        fromName,
+        fromSlug,
+        content,
+        this.config.profile,
         async (token: string) => {
           await streamer.update(token);
         },
-        undefined, // model
-        undefined, // maxTurns
-        async (toolName, toolInput) => { streamer.setToolStatus(friendlyToolName(toolName, toolInput)); },
       );
       await streamer.finalize(response);
       logger.info({ slug: this.config.slug, from: fromSlug }, 'Processed Slack team message');
