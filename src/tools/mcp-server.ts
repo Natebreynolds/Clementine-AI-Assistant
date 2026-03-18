@@ -2241,6 +2241,68 @@ server.tool(
   },
 );
 
+// ── Discord Channel Read ────────────────────────────────────────────────
+
+server.tool(
+  'discord_channel_read',
+  'Read recent messages from a Discord text channel. Use to monitor agent output, review drafts, or audit channel activity.',
+  {
+    channel_id: z.string().describe('Discord channel ID to read from'),
+    limit: z.number().min(1).max(100).optional().describe('Number of messages to fetch (default: 20, max: 100)'),
+    before: z.string().optional().describe('Fetch messages before this message ID (for pagination)'),
+  },
+  async ({ channel_id, limit, before }) => {
+    const token = env['DISCORD_TOKEN'] ?? '';
+    if (!token) throw new Error('DISCORD_TOKEN not configured');
+    if (!channel_id) throw new Error('channel_id is required');
+
+    const params = new URLSearchParams();
+    params.set('limit', String(limit ?? 20));
+    if (before) params.set('before', before);
+
+    const res = await fetch(
+      `https://discord.com/api/v10/channels/${channel_id}/messages?${params}`,
+      { headers: { Authorization: `Bot ${token}` } },
+    );
+    if (!res.ok) {
+      const errText = await res.text();
+      throw new Error(`Discord API ${res.status}: ${errText}`);
+    }
+
+    const messages = (await res.json()) as Array<{
+      id: string;
+      author: { username: string; bot?: boolean };
+      content: string;
+      timestamp: string;
+      embeds?: Array<{ title?: string; description?: string }>;
+    }>;
+
+    if (messages.length === 0) {
+      return textResult('No messages found in this channel.');
+    }
+
+    // Format messages newest-first → reverse to chronological order
+    const formatted = messages.reverse().map((m) => {
+      const time = new Date(m.timestamp).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
+      const tag = m.author.bot ? ` [BOT]` : '';
+      let text = `[${time}] ${m.author.username}${tag}: ${m.content}`;
+      // Include embed content (team messages, rich content)
+      if (m.embeds?.length) {
+        for (const embed of m.embeds) {
+          if (embed.title) text += `\n  Embed: ${embed.title}`;
+          if (embed.description) text += `\n  ${embed.description.slice(0, 500)}`;
+        }
+      }
+      return text;
+    });
+
+    return textResult(
+      `Channel messages (${messages.length}):\n\n${formatted.join('\n\n')}` +
+      (messages.length === (limit ?? 20) ? `\n\n(Use before: "${messages[0].id}" to load older messages)` : ''),
+    );
+  },
+);
+
 // ── Discord Channel Send ────────────────────────────────────────────────
 
 server.tool(
