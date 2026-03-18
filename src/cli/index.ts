@@ -824,9 +824,11 @@ program
 program
   .command('update')
   .description('Pull latest code, rebuild, and reinstall (preserves config)')
+  .argument('[action]', 'Optional: "restart" to restart daemon after update')
   .option('--restart', 'Restart daemon after update')
   .option('--dry-run', 'Preview what would happen without making changes')
-  .action((options: { restart?: boolean; dryRun?: boolean }) => {
+  .action((action: string | undefined, options: { restart?: boolean; dryRun?: boolean }) => {
+    if (action === 'restart') options.restart = true;
     cmdUpdate(options).catch((err: unknown) => {
       console.error('Update failed:', err);
       process.exit(1);
