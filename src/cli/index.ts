@@ -886,33 +886,37 @@ async function cmdUpdate(options: { restart?: boolean; dryRun?: boolean }): Prom
   let step = 0;
   const S = () => `[${++step}]`;
 
-  // 1b. Detect self/edits branch
-  let wasOnSelfEdits = false;
-  try {
-    const currentBranch = execSync('git rev-parse --abbrev-ref HEAD', {
-      cwd: PACKAGE_ROOT,
-      encoding: 'utf-8',
-    }).trim();
-    wasOnSelfEdits = currentBranch === 'self/edits';
-    if (wasOnSelfEdits) {
-      console.log(`  ${S()} Detected self/edits branch — switching to main for update...`);
-      if (!options.dryRun) {
+  // 2. Ensure we're on main and reset any local src/ changes.
+  //    Source modifications are tracked in ~/.clementine/ (not git),
+  //    so resetting the working tree is safe — mods get re-applied after pull.
+  if (!options.dryRun) {
+    try {
+      const currentBranch = execSync('git rev-parse --abbrev-ref HEAD', {
+        cwd: PACKAGE_ROOT,
+        encoding: 'utf-8',
+      }).trim();
+      if (currentBranch !== 'main') {
+        console.log(`  ${S()} Switching to main branch...`);
         execSync('git checkout main', { cwd: PACKAGE_ROOT, stdio: 'pipe' });
         console.log(`  ${GREEN}OK${RESET}  Switched to main`);
       }
-    }
-  } catch { /* not on self/edits or git error — continue */ }
+    } catch { /* best effort */ }
 
-  // 2. Stash any local customizations so pull succeeds
+    try {
+      execSync('git checkout -- src/', { cwd: PACKAGE_ROOT, stdio: 'pipe' });
+    } catch { /* no local src/ changes to reset */ }
+  }
+
+  // 3. Stash any remaining local changes (package-lock.json, etc.)
   let didStash = false;
   try {
     const status = execSync('git status --porcelain', { cwd: PACKAGE_ROOT, encoding: 'utf-8' }).trim();
     if (status) {
-      console.log(`  ${S()} Stashing local customizations...`);
+      console.log(`  ${S()} Stashing local changes...`);
       const stashOut = execSync('git stash', { cwd: PACKAGE_ROOT, encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] }).trim();
       didStash = !stashOut.includes('No local changes');
       if (didStash) {
-        console.log(`  ${GREEN}OK${RESET}  Stashed local customizations`);
+        console.log(`  ${GREEN}OK${RESET}  Stashed local changes`);
       }
     }
   } catch {
@@ -996,12 +1000,14 @@ async function cmdUpdate(options: { restart?: boolean; dryRun?: boolean }): Prom
   if (options.dryRun) {
     console.log();
     console.log(`  ${DIM}Dry run — would execute:${RESET}`);
+    console.log(`    ${S()} Reset local src/ (mods tracked in ~/.clementine/)`);
     console.log(`    ${S()} Pull latest (git pull --ff-only)`);
     console.log(`    ${S()} Install dependencies (npm install)`);
-    console.log(`    ${S()} Build (clean) (rm -rf dist && npm run build)`);
+    console.log(`    ${S()} Build (clean)`);
     console.log(`    ${S()} Verify build output`);
     console.log(`    ${S()} Reinstall CLI globally`);
-    console.log(`    ${S()} Restore local customizations`);
+    console.log(`    ${S()} Restore local changes`);
+    console.log(`    ${S()} Reconcile source modifications`);
     console.log(`    ${S()} Run health check (clementine doctor)`);
     if (options.restart || wasRunning) {
       console.log(`    ${S()} Restart daemon`);
@@ -1012,7 +1018,23 @@ async function cmdUpdate(options: { restart?: boolean; dryRun?: boolean }): Prom
 
   // 5. Git pull
   console.log(`  ${S()} Pulling latest...`);
+  let commitsPulled = 0;
+  let pullSummary = '';
   try {
+    // Count how many commits we're behind before pulling
+    try {
+      execSync('git fetch origin main --quiet', { cwd: PACKAGE_ROOT, stdio: 'pipe', timeout: 30_000 });
+      const countStr = execSync('git rev-list HEAD..origin/main --count', {
+        cwd: PACKAGE_ROOT, encoding: 'utf-8',
+      }).trim();
+      commitsPulled = parseInt(countStr, 10) || 0;
+      if (commitsPulled > 0) {
+        pullSummary = execSync('git log HEAD..origin/main --oneline --no-decorate', {
+          cwd: PACKAGE_ROOT, encoding: 'utf-8',
+        }).trim();
+      }
+    } catch { /* non-fatal — we'll still pull */ }
+
     const pullOutput = execSync('git pull --ff-only', {
       cwd: PACKAGE_ROOT,
       encoding: 'utf-8',
@@ -1163,37 +1185,62 @@ async function cmdUpdate(options: { restart?: boolean; dryRun?: boolean }): Prom
     // Non-fatal — local dist is already updated
   }
 
-  // 9. Restore stashed local customizations
+  // 9. Restore stashed local changes
   if (didStash) {
-    console.log(`  ${S()} Restoring local customizations...`);
+    console.log(`  ${S()} Restoring local changes...`);
     try {
       execSync('git stash pop', {
         cwd: PACKAGE_ROOT,
         stdio: ['pipe', 'pipe', 'pipe'],
       });
-      console.log(`  ${GREEN}OK${RESET}  Local customizations restored`);
+      console.log(`  ${GREEN}OK${RESET}  Local changes restored`);
     } catch {
-      console.error(`  ${YELLOW}WARN${RESET}  Could not auto-restore local changes (conflict)`);
+      console.error(`  ${YELLOW}WARN${RESET}  Could not auto-restore stashed changes`);
       console.log(`       Your changes are saved in: git -C "${PACKAGE_ROOT}" stash list`);
-      console.log(`       Restore manually with: git -C "${PACKAGE_ROOT}" stash pop`);
     }
   }
 
-  // 9b. Rebase self/edits onto updated main
-  if (wasOnSelfEdits) {
-    console.log(`  ${S()} Rebasing self/edits onto updated main...`);
-    try {
-      execSync('git rebase main self/edits', { cwd: PACKAGE_ROOT, stdio: 'pipe' });
-      execSync('git checkout self/edits', { cwd: PACKAGE_ROOT, stdio: 'pipe' });
-      // Rebuild from self/edits branch
-      execSync('npm run build', { cwd: PACKAGE_ROOT, stdio: ['pipe', 'pipe', 'pipe'] });
-      console.log(`  ${GREEN}OK${RESET}  Self-edits rebased and rebuilt`);
-    } catch {
-      // Rebase failed — abort and stay on main
-      try { execSync('git rebase --abort', { cwd: PACKAGE_ROOT, stdio: 'pipe' }); } catch { /* best effort */ }
-      console.error(`  ${YELLOW}WARN${RESET}  Could not rebase self-edits onto updated main — staying on main`);
-      console.log(`       Self-edits are preserved on branch 'self/edits'. Resolve conflicts manually.`);
+  // 10. Reconcile source modifications from self-improve
+  //     Source mods are tracked in ~/.clementine/self-improve/source-mods/
+  //     After pulling new code, we check each active mod and re-apply if needed.
+  console.log(`  ${S()} Reconciling source modifications...`);
+  let reconcileResult: { reapplied: string[]; superseded: string[]; needsReconciliation: string[]; failed: string[] } | null = null;
+  try {
+    const { reconcileSourceMods } = await import('../agent/source-mods.js');
+    const result = reconcileSourceMods(PACKAGE_ROOT);
+    reconcileResult = result;
+
+    const total = result.reapplied.length + result.superseded.length +
+      result.needsReconciliation.length + result.failed.length;
+
+    if (total === 0) {
+      console.log(`  ${GREEN}OK${RESET}  No source modifications to reconcile`);
+    } else {
+      if (result.superseded.length > 0) {
+        console.log(`  ${GREEN}OK${RESET}  ${result.superseded.length} mod(s) already in upstream — marked superseded`);
+      }
+      if (result.reapplied.length > 0) {
+        console.log(`  ${GREEN}OK${RESET}  ${result.reapplied.length} mod(s) re-applied successfully`);
+        // Rebuild with re-applied mods
+        console.log(`  ${S()} Rebuilding with re-applied modifications...`);
+        try {
+          execSync('npm run build', { cwd: PACKAGE_ROOT, stdio: ['pipe', 'pipe', 'pipe'] });
+          console.log(`  ${GREEN}OK${RESET}  Rebuild succeeded`);
+        } catch {
+          console.error(`  ${YELLOW}WARN${RESET}  Rebuild failed — continuing with base build`);
+          try { execSync('git checkout -- src/', { cwd: PACKAGE_ROOT, stdio: 'pipe' }); } catch { /* best effort */ }
+        }
+      }
+      if (result.needsReconciliation.length > 0) {
+        console.log(`  ${YELLOW}NOTE${RESET}  ${result.needsReconciliation.length} mod(s) need reconciliation`);
+        console.log(`       ${getAssistantName()} will re-apply these intelligently on next startup.`);
+      }
+      if (result.failed.length > 0) {
+        console.error(`  ${YELLOW}WARN${RESET}  ${result.failed.length} mod(s) failed typecheck — reverted`);
+      }
     }
+  } catch (err) {
+    console.error(`  ${YELLOW}WARN${RESET}  Source mod reconciliation failed: ${String(err).slice(0, 150)}`);
   }
 
   // 10. Doctor check
@@ -1215,8 +1262,37 @@ async function cmdUpdate(options: { restart?: boolean; dryRun?: boolean }): Prom
     }
   } catch { /* no dashboard running */ }
 
-  // 12. Restart daemon if requested or was running
+  // 12. Write update sentinel so the daemon can report what happened
+  let commitHash = '';
+  let commitDate = '';
+  try {
+    commitHash = execSync('git rev-parse --short HEAD', {
+      cwd: PACKAGE_ROOT, encoding: 'utf-8',
+    }).trim();
+    commitDate = execSync('git log -1 --format=%ci HEAD', {
+      cwd: PACKAGE_ROOT, encoding: 'utf-8',
+    }).trim().slice(0, 10);
+  } catch { /* best effort */ }
+
   if (options.restart || wasRunning) {
+    const sentinelPath = path.join(BASE_DIR, '.restart-sentinel.json');
+    const sentinel: import('../types.js').RestartSentinel = {
+      previousPid: process.pid,
+      restartedAt: new Date().toISOString(),
+      reason: 'update',
+      updateDetails: {
+        commitHash,
+        commitDate,
+        commitsBehind: commitsPulled,
+        summary: pullSummary.split('\n').slice(0, 5).join('; '),
+        modsReapplied: reconcileResult?.reapplied.length ?? 0,
+        modsSuperseded: reconcileResult?.superseded.length ?? 0,
+        modsNeedReconciliation: reconcileResult?.needsReconciliation.length ?? 0,
+        modsFailed: reconcileResult?.failed.length ?? 0,
+      },
+    };
+    writeFileSync(sentinelPath, JSON.stringify(sentinel, null, 2));
+
     // Ensure build output is fully flushed before spawning new process
     execSync('sync', { stdio: 'pipe' });
     console.log(`  ${S()} Restarting daemon...`);
@@ -1224,18 +1300,10 @@ async function cmdUpdate(options: { restart?: boolean; dryRun?: boolean }): Prom
   }
 
   // 13. Show current version
-  try {
-    const hash = execSync('git rev-parse --short HEAD', {
-      cwd: PACKAGE_ROOT,
-      encoding: 'utf-8',
-    }).trim();
-    const date = execSync('git log -1 --format=%ci HEAD', {
-      cwd: PACKAGE_ROOT,
-      encoding: 'utf-8',
-    }).trim().slice(0, 10);
-    console.log();
-    console.log(`  ${GREEN}Updated to ${hash} (${date})${RESET}`);
-  } catch {
+  console.log();
+  if (commitHash) {
+    console.log(`  ${GREEN}Updated to ${commitHash} (${commitDate})${RESET}`);
+  } else {
     console.log(`  ${GREEN}Update complete.${RESET}`);
   }
 

@@ -68,9 +68,14 @@ const PENDING_DIR = path.join(SELF_IMPROVE_DIR, 'pending-changes');
 
 interface CronReflectionEntry {
   jobName: string;
+  agentSlug?: string;
   timestamp: string;
+  existence?: boolean;
+  substance?: boolean;
+  actionable?: boolean;
+  criteriaMet?: boolean | null;
   quality: number;
-  notes: string;
+  gap?: string;
 }
 
 interface GoalHealthEntry {
@@ -414,8 +419,33 @@ export class SelfImproveLoop {
 
     // Format cron reflections (quality ratings from automated reflection passes)
     const cronReflectionsText = metrics.cronReflections.slice(-10).map(r =>
-      `- Job: ${r.jobName} | Quality: ${r.quality}/5 | Notes: "${r.notes?.slice(0, 100) ?? ''}" | At: ${r.timestamp}`
+      `- Job: ${r.jobName}${r.agentSlug ? ` (${r.agentSlug})` : ''} | Quality: ${r.quality}/5 | ` +
+      `Exist: ${r.existence ?? '?'} Substance: ${r.substance ?? '?'} Actionable: ${r.actionable ?? '?'} | ` +
+      `Gap: "${r.gap?.slice(0, 80) ?? ''}" | At: ${r.timestamp}`
     ).join('\n') || '(no cron reflections yet)';
+
+    // Compute per-agent metrics from reflections
+    const agentMetrics = new Map<string, { total: number; qualitySum: number; emptyCount: number; gaps: string[] }>();
+    for (const r of metrics.cronReflections) {
+      const slug = r.agentSlug || 'clementine';
+      if (!agentMetrics.has(slug)) {
+        agentMetrics.set(slug, { total: 0, qualitySum: 0, emptyCount: 0, gaps: [] });
+      }
+      const m = agentMetrics.get(slug)!;
+      m.total++;
+      m.qualitySum += r.quality ?? 0;
+      if (r.existence === false || r.substance === false) m.emptyCount++;
+      if (r.gap && r.gap !== 'none') m.gaps.push(r.gap);
+    }
+
+    const perAgentText = agentMetrics.size > 0
+      ? Array.from(agentMetrics.entries()).map(([slug, m]) => {
+          const avgQ = (m.qualitySum / m.total).toFixed(1);
+          const emptyPct = ((m.emptyCount / m.total) * 100).toFixed(0);
+          const topGaps = m.gaps.slice(-3).map(g => g.slice(0, 60)).join('; ') || 'none';
+          return `- ${slug}: avg quality ${avgQ}/5, ${emptyPct}% empty outputs, common gaps: "${topGaps}"`;
+        }).join('\n')
+      : '(no per-agent data yet)';
 
     // Format goal health data
     const goalHealthText = metrics.goalHealth.length > 0
@@ -435,6 +465,7 @@ export class SelfImproveLoop {
       `- Cron success rate: ${(metrics.cronSuccessRate * 100).toFixed(1)}%\n\n` +
       `### Negative feedback examples:\n${negativeFeedbackText}\n\n` +
       `### Cron job quality reflections (automated self-evaluation):\n${cronReflectionsText}\n\n` +
+      `### Per-agent cron performance:\n${perAgentText}\n\n` +
       `### Communication signals in feedback:\n` +
       `- "silent", "no update", "how's it going" → agent didn't report progress\n` +
       `- "too verbose", "just do it" → over-communication\n` +
@@ -455,6 +486,7 @@ export class SelfImproveLoop {
       `## Instructions\n` +
       `- Focus on areas: ${areas}\n` +
       `- Identify the SINGLE highest-impact improvement area\n` +
+      `- When an agent's average quality is below 3.0 or their empty output rate exceeds 10%, consider improving their agent.md instructions or cron job prompts (area: "agent", target: the slug)\n` +
       `- Propose a SPECIFIC, MINIMAL change (not a full rewrite)\n` +
       `- Explain WHY this change should improve the metric\n` +
       `- IMPORTANT: "proposedChange" must be the COMPLETE updated file content (not just the diff or changed section), because it will replace the entire file\n` +
@@ -571,7 +603,7 @@ export class SelfImproveLoop {
       const { safeSourceEdit } = await import('./safe-restart.js');
       const result = await safeSourceEdit(PKG_DIR, [
         { relativePath: `src/${pending.target}`, content: pending.proposedChange },
-      ], { experimentId, reason: `self-improve: ${pending.hypothesis.slice(0, 60)}` });
+      ], { experimentId, reason: `self-improve: ${pending.hypothesis.slice(0, 60)}`, description: pending.hypothesis });
 
       if (!result.success) {
         return `Source edit failed: ${result.error}${result.preflightErrors ? '\n' + result.preflightErrors.join('\n') : ''}`;

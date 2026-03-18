@@ -3,18 +3,22 @@
  *
  * Central coordinator for source self-editing. Replaces bare SIGUSR1-based
  * source editing with a validated pipeline:
- *   preflight → apply → commit → build → sentinel → restart
+ *   preflight → apply → record → build → sentinel → restart
  *
- * All self-edits live on a local `self/edits` branch that never gets pushed.
+ * Source modifications are recorded in ~/.clementine/self-improve/source-mods/
+ * (not in git). This keeps the repo clean so `git pull` always works, and
+ * modifications are re-applied intelligently after updates.
  */
 
 import { execSync } from 'node:child_process';
-import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { randomBytes } from 'node:crypto';
 import path from 'node:path';
 import pino from 'pino';
 
-import { BASE_DIR, PKG_DIR } from '../config.js';
+import { BASE_DIR } from '../config.js';
 import { preflightSourceChange } from './source-preflight.js';
+import { recordSourceMod } from './source-mods.js';
 import type { RestartSentinel } from '../types.js';
 
 const logger = pino({ name: 'clementine.safe-restart' });
@@ -32,21 +36,23 @@ export interface SafeEditResult {
   success: boolean;
   error?: string;
   preflightErrors?: string[];
+  sourceModId?: string;
 }
 
 /**
  * Safely edit Clementine's own source code:
  *   1. Preflight — validate in a staging worktree
- *   2. Apply — write validated .ts files to the real src/
- *   3. Commit — on `self/edits` branch
- *   4. Build — run `npm run build`; revert if it fails
- *   5. Write sentinel — context for the new process
- *   6. Signal restart — SIGUSR1
+ *   2. Snapshot — capture "before" content for rollback
+ *   3. Apply — write validated .ts files to the real src/
+ *   4. Record — save modification to ~/.clementine/ registry
+ *   5. Build — run tsc; revert if it fails
+ *   6. Write sentinel — context for the new process
+ *   7. Signal restart — SIGUSR1
  */
 export async function safeSourceEdit(
   pkgDir: string,
   changes: Array<{ relativePath: string; content: string }>,
-  opts?: { experimentId?: string; reason?: string; sessionKey?: string },
+  opts?: { experimentId?: string; reason?: string; sessionKey?: string; description?: string },
 ): Promise<SafeEditResult> {
   const reason = opts?.reason ?? 'source self-edit';
 
@@ -73,14 +79,18 @@ export async function safeSourceEdit(
     };
   }
 
-  // Ensure we're on the self/edits branch
-  try {
-    ensureSelfEditsBranch(pkgDir);
-  } catch (err) {
-    return { success: false, error: `Branch setup failed: ${String(err)}` };
-  }
+  // 2. Snapshot "before" content for each file
+  const filesWithSnapshots = changes.map(change => {
+    const targetFile = path.join(pkgDir, change.relativePath);
+    const beforeContent = existsSync(targetFile) ? readFileSync(targetFile, 'utf-8') : '';
+    return {
+      relativePath: change.relativePath,
+      beforeContent,
+      afterContent: change.content,
+    };
+  });
 
-  // 2. Apply — write validated files to the real tree
+  // 3. Apply — write validated files to the real tree
   const changedFiles: string[] = [];
   for (const change of changes) {
     const targetFile = path.join(pkgDir, change.relativePath);
@@ -92,28 +102,19 @@ export async function safeSourceEdit(
     changedFiles.push(change.relativePath);
   }
 
-  // 3. Commit on self/edits
-  //    Use writeFileSync for the commit message to prevent shell injection
-  //    through the `reason` string (which may contain user input).
+  // 4. Record source modification in the registry
+  const modId = opts?.experimentId ?? randomBytes(4).toString('hex');
   try {
-    const commitMsgFile = path.join(pkgDir, '.git', 'SELF_EDIT_MSG');
-    const sanitizedReason = reason.replace(/[^\x20-\x7E]/g, '').slice(0, 200);
-    writeFileSync(commitMsgFile, `self-edit: ${sanitizedReason}`);
-    execSync(`git add ${changedFiles.map(f => `"${f}"`).join(' ')}`, {
-      cwd: pkgDir,
-      stdio: 'pipe',
+    recordSourceMod(modId, filesWithSnapshots, {
+      reason,
+      description: opts?.description ?? reason,
+      experimentId: opts?.experimentId,
     });
-    execSync(`git commit -F .git/SELF_EDIT_MSG`, {
-      cwd: pkgDir,
-      stdio: 'pipe',
-    });
-    logger.info({ changedFiles, reason: sanitizedReason }, 'Committed source edit on self/edits');
   } catch (err) {
-    logger.error({ err }, 'Git commit failed');
-    return { success: false, error: `Git commit failed: ${String(err)}` };
+    logger.warn({ err }, 'Failed to record source mod (non-fatal)');
   }
 
-  // 4. Build — use `tsc` directly instead of `npm run build` because
+  // 5. Build — use `tsc` directly instead of `npm run build` because
   //    the build script does `rm -rf dist` which would nuke the currently
   //    running process's loaded modules. tsc alone overwrites only changed .js files.
   try {
@@ -127,7 +128,10 @@ export async function safeSourceEdit(
     // Build failed (shouldn't happen since preflight passed) — revert
     logger.error({ err }, 'Build failed after source edit — reverting');
     try {
-      execSync('git revert --no-edit HEAD', { cwd: pkgDir, stdio: 'pipe' });
+      // Restore "before" content
+      for (const file of filesWithSnapshots) {
+        writeFileSync(path.join(pkgDir, file.relativePath), file.beforeContent);
+      }
       execSync('npx tsc', { cwd: pkgDir, stdio: 'pipe', timeout: 120_000 });
     } catch (revertErr) {
       logger.error({ revertErr }, 'Revert + rebuild also failed');
@@ -135,48 +139,22 @@ export async function safeSourceEdit(
     return { success: false, error: `Build failed after applying changes: ${String(err)}` };
   }
 
-  // 5. Write sentinel
+  // 6. Write sentinel
   const sentinel: RestartSentinel = {
     previousPid: process.pid,
     restartedAt: new Date().toISOString(),
     reason: 'source-edit',
-    sourceChangeId: opts?.experimentId,
+    sourceChangeId: modId,
     sessionKey: opts?.sessionKey,
     changedFiles,
   };
   writeFileSync(SENTINEL_PATH, JSON.stringify(sentinel, null, 2));
   logger.info({ sentinel }, 'Restart sentinel written');
 
-  // 6. Signal restart
+  // 7. Signal restart
   process.kill(process.pid, 'SIGUSR1');
 
-  return { success: true };
-}
-
-/**
- * Ensure the `self/edits` branch exists and we're on it.
- * If we're on main, create self/edits from HEAD.
- * If self/edits already exists and we're not on it, switch to it.
- */
-function ensureSelfEditsBranch(pkgDir: string): void {
-  const currentBranch = execSync('git rev-parse --abbrev-ref HEAD', {
-    cwd: pkgDir,
-    encoding: 'utf-8',
-  }).trim();
-
-  if (currentBranch === 'self/edits') return;
-
-  // Check if self/edits exists
-  try {
-    execSync('git rev-parse --verify self/edits', { cwd: pkgDir, stdio: 'pipe' });
-    // Branch exists — switch to it
-    execSync('git checkout self/edits', { cwd: pkgDir, stdio: 'pipe' });
-    logger.info('Switched to existing self/edits branch');
-  } catch {
-    // Branch doesn't exist — create it from current HEAD
-    execSync('git checkout -b self/edits', { cwd: pkgDir, stdio: 'pipe' });
-    logger.info('Created self/edits branch from HEAD');
-  }
+  return { success: true, sourceModId: modId };
 }
 
 /**

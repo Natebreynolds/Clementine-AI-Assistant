@@ -2,8 +2,8 @@
  * Clementine TypeScript — Daemon-Driven Auto-Update.
  *
  * Checks for and applies upstream changes without requiring `clementine update`.
- * Self-edits live on `self/edits` branch; upstream updates go to `main`.
- * After pulling main, self-edits are rebased on top.
+ * Source modifications from self-improve are tracked in ~/.clementine/ (not git),
+ * so git pull is always clean. After pulling, source mods are reconciled.
  */
 
 import { execSync } from 'node:child_process';
@@ -12,6 +12,7 @@ import path from 'node:path';
 import pino from 'pino';
 
 import { BASE_DIR } from '../config.js';
+import { reconcileSourceMods } from './source-mods.js';
 import type { RestartSentinel } from '../types.js';
 
 const logger = pino({ name: 'clementine.auto-update' });
@@ -27,7 +28,7 @@ export interface UpdateCheckResult {
 export interface UpdateApplyResult {
   success: boolean;
   error?: string;
-  selfEditsConflict?: boolean;  // true if self-edits couldn't be rebased
+  reconcileResult?: import('./source-mods.js').ReconcileResult;
 }
 
 /**
@@ -64,40 +65,33 @@ export async function checkForUpdates(pkgDir: string): Promise<UpdateCheckResult
 }
 
 /**
- * Apply upstream updates. Handles branch awareness:
- * - If on `self/edits`: checkout main → pull → rebase self-edits → build
- * - If on `main`: pull → build
- *
- * Writes a restart sentinel and sends SIGUSR1 on success.
+ * Apply upstream updates:
+ *   1. Reset any uncommitted src/ changes (mods are tracked in ~/.clementine/)
+ *   2. Pull latest from origin/main
+ *   3. Install deps + build
+ *   4. Reconcile source modifications
+ *   5. Rebuild if mods were re-applied
+ *   6. Write sentinel + restart
  */
 export async function applyUpdate(pkgDir: string): Promise<UpdateApplyResult> {
-  let wasOnSelfEdits = false;
-  let didStash = false;
-
   try {
-    // 1. Detect current branch
-    const currentBranch = execSync('git rev-parse --abbrev-ref HEAD', {
-      cwd: pkgDir,
-      encoding: 'utf-8',
-    }).trim();
-    wasOnSelfEdits = currentBranch === 'self/edits';
-
-    // 2. Stash any uncommitted work
+    // 1. Ensure we're on main and clean
     try {
-      const stashOut = execSync('git stash', {
+      const currentBranch = execSync('git rev-parse --abbrev-ref HEAD', {
         cwd: pkgDir,
         encoding: 'utf-8',
-        stdio: ['pipe', 'pipe', 'pipe'],
       }).trim();
-      didStash = !stashOut.includes('No local changes');
-    } catch { /* nothing to stash */ }
+      if (currentBranch !== 'main') {
+        execSync('git checkout main', { cwd: pkgDir, stdio: 'pipe' });
+      }
+    } catch { /* best effort */ }
 
-    // 3. If on self/edits, switch to main
-    if (wasOnSelfEdits) {
-      execSync('git checkout main', { cwd: pkgDir, stdio: 'pipe' });
-    }
+    // Reset any local src/ changes (source mods are tracked in registry, not git)
+    try {
+      execSync('git checkout -- src/', { cwd: pkgDir, stdio: 'pipe' });
+    } catch { /* no changes to reset */ }
 
-    // 4. Pull from origin
+    // 2. Pull from origin
     try {
       execSync('git pull --ff-only origin main', {
         cwd: pkgDir,
@@ -107,17 +101,10 @@ export async function applyUpdate(pkgDir: string): Promise<UpdateApplyResult> {
       logger.info('Pulled latest from origin/main');
     } catch (err) {
       logger.error({ err }, 'git pull --ff-only failed');
-      // Restore previous state
-      if (wasOnSelfEdits) {
-        try { execSync('git checkout self/edits', { cwd: pkgDir, stdio: 'pipe' }); } catch { /* best effort */ }
-      }
-      if (didStash) {
-        try { execSync('git stash pop', { cwd: pkgDir, stdio: 'pipe' }); } catch { /* best effort */ }
-      }
       return { success: false, error: `git pull failed: ${String(err)}` };
     }
 
-    // 5. Install dependencies (in case they changed)
+    // 3. Install dependencies (in case they changed)
     try {
       execSync('npm install --omit=dev', {
         cwd: pkgDir,
@@ -129,28 +116,8 @@ export async function applyUpdate(pkgDir: string): Promise<UpdateApplyResult> {
       // Non-fatal — build may still work
     }
 
-    // 6. Rebase self-edits if they existed
-    let selfEditsConflict = false;
-    if (wasOnSelfEdits) {
-      try {
-        execSync('git rebase main self/edits', {
-          cwd: pkgDir,
-          stdio: 'pipe',
-        });
-        execSync('git checkout self/edits', { cwd: pkgDir, stdio: 'pipe' });
-        logger.info('Rebased self/edits onto updated main');
-      } catch {
-        // Rebase conflict — abort and stay on main
-        try { execSync('git rebase --abort', { cwd: pkgDir, stdio: 'pipe' }); } catch { /* best effort */ }
-        selfEditsConflict = true;
-        logger.warn('Rebase of self/edits failed — staying on main. Self-edits preserved on branch.');
-      }
-    }
-
-    // 7. Build
+    // 4. Build
     try {
-      // Use tsc directly — `npm run build` does `rm -rf dist` which would
-      // nuke the running process's loaded modules during the handoff window.
       execSync('npx tsc', {
         cwd: pkgDir,
         stdio: 'pipe',
@@ -159,35 +126,59 @@ export async function applyUpdate(pkgDir: string): Promise<UpdateApplyResult> {
       logger.info('Build succeeded after update');
     } catch (err) {
       logger.error({ err }, 'Build failed after update');
-      if (didStash) {
-        try { execSync('git stash pop', { cwd: pkgDir, stdio: 'pipe' }); } catch { /* best effort */ }
-      }
       return { success: false, error: `Build failed after update: ${String(err)}` };
     }
 
-    // 8. Restore stashed work
-    if (didStash) {
-      try { execSync('git stash pop', { cwd: pkgDir, stdio: 'pipe' }); } catch { /* best effort */ }
+    // 5. Reconcile source modifications
+    const reconcileResult = reconcileSourceMods(pkgDir);
+    logger.info({
+      reapplied: reconcileResult.reapplied.length,
+      superseded: reconcileResult.superseded.length,
+      needsReconciliation: reconcileResult.needsReconciliation.length,
+      failed: reconcileResult.failed.length,
+    }, 'Source mod reconciliation complete');
+
+    // 6. Rebuild if any mods were re-applied
+    if (reconcileResult.reapplied.length > 0) {
+      try {
+        execSync('npx tsc', { cwd: pkgDir, stdio: 'pipe', timeout: 120_000 });
+        logger.info('Rebuild succeeded after re-applying source mods');
+      } catch (err) {
+        logger.warn({ err }, 'Rebuild failed after re-applying source mods');
+      }
     }
 
-    // 9. Write sentinel
+    // 7. Get version info and write sentinel + restart
+    let commitHash = '';
+    let commitDate = '';
+    let commitsBehind = 0;
+    let summary = '';
+    try {
+      commitHash = execSync('git rev-parse --short HEAD', { cwd: pkgDir, encoding: 'utf-8' }).trim();
+      commitDate = execSync('git log -1 --format=%ci HEAD', { cwd: pkgDir, encoding: 'utf-8' }).trim().slice(0, 10);
+      // Count would have been calculated pre-pull; approximate from reconcile context
+    } catch { /* best effort */ }
+
     const sentinel: RestartSentinel = {
       previousPid: process.pid,
       restartedAt: new Date().toISOString(),
       reason: 'update',
+      updateDetails: {
+        commitHash,
+        commitDate,
+        modsReapplied: reconcileResult.reapplied.length,
+        modsSuperseded: reconcileResult.superseded.length,
+        modsNeedReconciliation: reconcileResult.needsReconciliation.length,
+        modsFailed: reconcileResult.failed.length,
+      },
     };
     writeFileSync(SENTINEL_PATH, JSON.stringify(sentinel, null, 2));
 
-    // 10. Signal restart
     process.kill(process.pid, 'SIGUSR1');
 
-    return { success: true, selfEditsConflict };
+    return { success: true, reconcileResult };
   } catch (err) {
     logger.error({ err }, 'Update apply failed');
-    // Try to restore state
-    if (didStash) {
-      try { execSync('git stash pop', { cwd: pkgDir, stdio: 'pipe' }); } catch { /* best effort */ }
-    }
     return { success: false, error: String(err) };
   }
 }
