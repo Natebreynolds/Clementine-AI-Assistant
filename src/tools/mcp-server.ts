@@ -3267,9 +3267,13 @@ server.tool(
   },
 );
 
+/** Per-session tracker: once a team_message succeeds to a recipient, block further sends. */
+const teamMessageDelivered = new Map<string, { at: number; content: string }>();
+
 server.tool(
   'team_message',
   'Send a message to another team agent. The message will be delivered to the target agent\'s channel and they will respond. ' +
+  'IMPORTANT: You may only send ONE message per recipient per conversation. After sending, do NOT resend or retry — the message is delivered. ' +
   'The primary agent (you) can message ANY team agent. Team agents are restricted by their canMessage list. ' +
   'Enforces depth limits (max 3) to prevent infinite loops.',
   {
@@ -3278,6 +3282,15 @@ server.tool(
     depth: z.number().optional().describe('Message depth counter (auto-incremented, starts at 0). Do not set manually.'),
   },
   async ({ to_agent, message, depth }) => {
+    // Hard block: if we already delivered to this recipient in this session, refuse immediately
+    const priorDelivery = teamMessageDelivered.get(to_agent);
+    if (priorDelivery) {
+      return textResult(
+        `ALREADY DELIVERED: Your message to ${to_agent} was successfully delivered at ${new Date(priorDelivery.at).toLocaleTimeString()}. ` +
+        `They received it and are processing it. Do NOT resend. Move on to your next task or wait for their response.`,
+      );
+    }
+
     const agents = await loadTeamAgents();
 
     const callerSlug = process.env.CLEMENTINE_TEAM_AGENT ?? '';
@@ -3328,6 +3341,7 @@ server.tool(
       });
       const data = await res.json() as { ok: boolean; id?: string; delivered?: boolean; response?: string | null; error?: string };
       if (data.ok && data.delivered) {
+        teamMessageDelivered.set(to_agent, { at: Date.now(), content: message });
         if (data.response) {
           return textResult(
             `${target.name} responded:\n\n${data.response}`,
@@ -3338,6 +3352,7 @@ server.tool(
         );
       }
       if (data.ok && !data.delivered) {
+        teamMessageDelivered.set(to_agent, { at: Date.now(), content: message });
         return textResult(
           `Message queued for ${target.name} (${to_agent}) — they'll see it on their next interaction.`,
         );
@@ -3365,6 +3380,7 @@ server.tool(
     if (!existsSync(logDir)) mkdirSync(logDir, { recursive: true });
     appendFileSync(TEAM_COMMS_LOG, JSON.stringify(record) + '\n');
 
+    teamMessageDelivered.set(to_agent, { at: Date.now(), content: message });
     return textResult(
       `Message queued for ${target.name} (${to_agent}). ID: ${msgId}. ` +
       `The daemon will deliver it when available.`,
