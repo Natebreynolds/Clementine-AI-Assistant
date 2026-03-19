@@ -355,7 +355,10 @@ interface TimerEntry {
 const TIMERS_FILE = path.join(config.BASE_DIR, '.timers.json');
 const TIMER_CHECK_INTERVAL = 30_000; // 30 seconds
 
-function startTimerChecker(dispatcher: import('./gateway/notifications.js').NotificationDispatcher): ReturnType<typeof setInterval> {
+function startTimerChecker(
+  dispatcher: import('./gateway/notifications.js').NotificationDispatcher,
+  gateway?: import('./gateway/router.js').Gateway,
+): ReturnType<typeof setInterval> {
   return setInterval(() => {
     try {
       if (!existsSync(TIMERS_FILE)) return;
@@ -371,12 +374,22 @@ function startTimerChecker(dispatcher: import('./gateway/notifications.js').Noti
       // Update file first (remove fired timers)
       writeFileSync(TIMERS_FILE, JSON.stringify(remaining, null, 2));
 
-      // Dispatch notifications
+      // Dispatch notifications and inject context so replies have reminder context
       for (const timer of due) {
         logger.info({ id: timer.id, message: timer.message }, 'Timer fired');
-        dispatcher.send(`⏰ **Reminder:** ${timer.message}`).catch((err) => {
+        const reminderText = `⏰ **Reminder:** ${timer.message}`;
+        dispatcher.send(reminderText).catch((err) => {
           logger.error({ err, id: timer.id }, 'Failed to dispatch timer notification');
         });
+
+        // Inject into owner's session so their reply has context about the reminder
+        if (gateway && config.DISCORD_OWNER_ID) {
+          gateway.injectContext(
+            `discord:user:${config.DISCORD_OWNER_ID}`,
+            `[Timer fired: ${timer.message}]`,
+            reminderText,
+          );
+        }
       }
     } catch {
       // Non-fatal — will retry next interval
@@ -566,7 +579,7 @@ async function asyncMain(): Promise<void> {
   // Start heartbeat + cron + timers
   heartbeat.start();
   cronScheduler.start();
-  const timerInterval = startTimerChecker(dispatcher);
+  const timerInterval = startTimerChecker(dispatcher, gateway);
 
   // Deliver pending team messages every 15s (picks up MCP-written messages)
   const teamDeliveryInterval = setInterval(() => {
