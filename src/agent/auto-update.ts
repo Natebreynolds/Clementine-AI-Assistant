@@ -148,6 +148,19 @@ export async function applyUpdate(pkgDir: string): Promise<UpdateApplyResult> {
       }
     }
 
+    // 6b. Run vault migrations
+    try {
+      const { runVaultMigrations } = await import('../vault-migrations/runner.js');
+      const migResult = await runVaultMigrations(path.join(BASE_DIR, 'vault'));
+      logger.info({
+        applied: migResult.applied.length,
+        skipped: migResult.skipped.length,
+        failed: migResult.failed.length,
+      }, 'Vault migrations complete');
+    } catch (err) {
+      logger.warn({ err }, 'Vault migration failed (non-fatal)');
+    }
+
     // 7. Get version info and write sentinel + restart
     let commitHash = '';
     let commitDate = '';

@@ -1010,6 +1010,7 @@ async function cmdUpdate(options: { restart?: boolean; dryRun?: boolean }): Prom
     console.log(`    ${S()} Reinstall CLI globally`);
     console.log(`    ${S()} Restore local changes`);
     console.log(`    ${S()} Reconcile source modifications`);
+    console.log(`    ${S()} Run vault migrations`);
     console.log(`    ${S()} Run health check (clementine doctor)`);
     if (options.restart || wasRunning) {
       console.log(`    ${S()} Restart daemon`);
@@ -1245,7 +1246,39 @@ async function cmdUpdate(options: { restart?: boolean; dryRun?: boolean }): Prom
     console.error(`  ${YELLOW}WARN${RESET}  Source mod reconciliation failed: ${String(err).slice(0, 150)}`);
   }
 
-  // 10. Doctor check
+  // 10b. Run vault migrations (structural updates to user vault files)
+  console.log(`  ${S()} Running vault migrations...`);
+  try {
+    const { runVaultMigrations } = await import('../vault-migrations/runner.js');
+    const migResult = await runVaultMigrations(
+      path.join(BASE_DIR, 'vault'),
+      backupDir,
+    );
+
+    const migApplied = migResult.applied.length;
+    const migSkipped = migResult.skipped.length;
+    const migFailed = migResult.failed.length;
+
+    if (migApplied > 0) {
+      console.log(`  ${GREEN}OK${RESET}  Applied ${migApplied} vault migration(s): ${migResult.applied.join(', ')}`);
+    }
+    if (migSkipped > 0) {
+      console.log(`  ${GREEN}OK${RESET}  ${migSkipped} migration(s) already present — skipped`);
+    }
+    if (migFailed > 0) {
+      console.error(`  ${YELLOW}WARN${RESET}  ${migFailed} migration(s) failed — will retry on next update`);
+      for (const e of migResult.errors) {
+        console.error(`       ${e.id}: ${e.error}`);
+      }
+    }
+    if (migApplied === 0 && migSkipped === 0 && migFailed === 0) {
+      console.log(`  ${GREEN}OK${RESET}  No new vault migrations`);
+    }
+  } catch (err) {
+    console.error(`  ${YELLOW}WARN${RESET}  Vault migration failed: ${String(err).slice(0, 150)}`);
+  }
+
+  // 11. Doctor check
   console.log();
   console.log(`  ${S()} Running health check...`);
   cmdDoctor();
