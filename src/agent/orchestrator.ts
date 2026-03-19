@@ -5,9 +5,11 @@
  * via concurrent query() calls, then synthesizes a final response.
  */
 
+import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync } from 'node:fs';
 import pino from 'pino';
 import type { PersonalAssistant } from './assistant.js';
 import type { PlanStep, ExecutionPlan, PlanProgressUpdate } from '../types.js';
+import { PLAN_STATE_DIR } from '../config.js';
 
 const logger = pino({ name: 'clementine.orchestrator' });
 
@@ -17,7 +19,14 @@ const RESULT_TRUNCATE_CHARS = 4000;
 const LONG_PLAN_WARNING_MS = 30 * 60 * 1000; // 30 minutes
 const ALLOWED_MODELS = ['haiku', 'sonnet'];
 
-const PLANNER_PROMPT = `You are a task planner for an AI assistant. Decompose the following request into executable steps that can be run by independent sub-agents.
+const PLANNER_PROMPT = `You are a task planner for an AI assistant. Decompose the following request into executable steps.
+
+**Planning Principles:**
+- Each step runs in a FRESH CONTEXT (separate sub-agent) — no context rot, peak quality
+- Steps should be ATOMIC — completable in one focused session, not vague or open-ended
+- MAXIMIZE PARALLELISM — independent steps run concurrently in separate contexts
+- Follow Research → Execute → Verify — research steps feed into execution steps, verification confirms delivery
+- Size for quality: each step should complete within 15-50 tool calls, not sprawl indefinitely
 
 Output ONLY valid JSON matching this schema (no markdown fences, no prose):
 
@@ -26,7 +35,7 @@ Output ONLY valid JSON matching this schema (no markdown fences, no prose):
     {
       "id": "step-1",
       "description": "Short human-readable label",
-      "prompt": "Detailed instructions for the sub-agent. Be specific — the agent has no context beyond this prompt. Include tool names to use.",
+      "prompt": "Detailed, self-contained instructions for the sub-agent. Be specific — the agent has no prior conversation context. Include tool names to use, what to look for, and what output to produce. End with a clear deliverable: 'Deliver: ...'",
       "dependsOn": [],
       "maxTurns": 15,
       "model": "sonnet"
@@ -38,9 +47,11 @@ Output ONLY valid JSON matching this schema (no markdown fences, no prose):
 Rules:
 - MAXIMIZE PARALLELISM: if steps don't need each other's output, give them no dependencies
 - Each step prompt must be SELF-CONTAINED — the sub-agent has memory/vault access but no prior conversation context
+- Each step must end with a clear deliverable statement ("Deliver: the list of...", "Deliver: a draft email...")
 - Set maxTurns based on complexity: simple lookup = 5, moderate task = 15, complex work = 30-50
 - Set model based on step complexity: "haiku" for simple lookups/formatting, "sonnet" for reasoning/writing/analysis
 - Keep step count between 2-8. Simple tasks = fewer steps. Complex tasks = more.
+- If the task has a verification component, include it as a final dependent step
 - The synthesis step combines everything — it should produce a coherent final message for the user
 
 Available tools for sub-agents: Outlook (inbox, search, draft, send, calendar), memory (read/write/search), vault (notes, tasks), Bash, WebSearch, WebFetch, discord_channel_send, github_prs, rss_fetch, browser_screenshot, and file tools.
@@ -121,14 +132,63 @@ export async function settledWithLimit<T>(
   return results;
 }
 
+/** Persistent state for a plan execution — survives interruptions. */
+interface PlanState {
+  id: string;
+  goal: string;
+  status: 'planning' | 'executing' | 'synthesizing' | 'complete' | 'failed';
+  startedAt: string;
+  updatedAt: string;
+  plan?: ExecutionPlan;
+  totalWaves: number;
+  wavesCompleted: number;
+  results: Record<string, string>;
+  errors: Array<{ stepId: string; error: string }>;
+}
+
 export class PlanOrchestrator {
   private assistant: PersonalAssistant;
   private stepStatuses = new Map<string, PlanProgressUpdate>();
   private stepStartTimes = new Map<string, number>();
   private startTime = 0;
+  private stateId: string;
 
   constructor(assistant: PersonalAssistant) {
     this.assistant = assistant;
+    this.stateId = `plan-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+  }
+
+  // ── State persistence ────────────────────────────────────────────────
+
+  private saveState(state: PlanState): void {
+    try {
+      if (!existsSync(PLAN_STATE_DIR)) mkdirSync(PLAN_STATE_DIR, { recursive: true });
+      state.updatedAt = new Date().toISOString();
+      writeFileSync(
+        `${PLAN_STATE_DIR}/${state.id}.json`,
+        JSON.stringify(state, null, 2),
+      );
+    } catch (err) {
+      logger.debug({ err }, 'Failed to save plan state (non-fatal)');
+    }
+  }
+
+  private cleanupState(): void {
+    try {
+      const filePath = `${PLAN_STATE_DIR}/${this.stateId}.json`;
+      if (existsSync(filePath)) unlinkSync(filePath);
+    } catch { /* non-fatal */ }
+  }
+
+  /** Load a previously interrupted plan state (for future resumability). */
+  static loadState(stateId: string): PlanState | null {
+    try {
+      const filePath = `${PLAN_STATE_DIR}/${stateId}.json`;
+      if (!existsSync(filePath)) return null;
+      return JSON.parse(readFileSync(filePath, 'utf-8'));
+    } catch {
+      return null;
+    }
   }
 
   /**
@@ -225,9 +285,23 @@ export class PlanOrchestrator {
       break; // Approved — proceed to execution
     }
 
-    // 4. Execute waves
+    // 4. Execute waves — with state persistence for resumability
     const results = new Map<string, string>();
     let longPlanWarned = false;
+
+    const state: PlanState = {
+      id: this.stateId,
+      goal: taskDescription,
+      status: 'executing',
+      startedAt: new Date(this.startTime).toISOString(),
+      updatedAt: new Date().toISOString(),
+      plan: plan!,
+      totalWaves: waves!.length,
+      wavesCompleted: 0,
+      results: {},
+      errors: [],
+    };
+    this.saveState(state);
 
     for (const wave of waves) {
       // Mark running
@@ -301,6 +375,17 @@ export class PlanOrchestrator {
         }
       }
 
+      // Persist state after each wave for resumability
+      state.wavesCompleted++;
+      state.results = Object.fromEntries(results);
+      for (const step of wave) {
+        const s = this.stepStatuses.get(step.id);
+        if (s?.status === 'failed') {
+          state.errors.push({ stepId: step.id, error: s.resultPreview ?? 'unknown' });
+        }
+      }
+      this.saveState(state);
+
       // Long-running warning
       if (!longPlanWarned && Date.now() - this.startTime > LONG_PLAN_WARNING_MS) {
         logger.warn({ elapsed: Date.now() - this.startTime }, 'Plan has been running for 30+ minutes');
@@ -345,6 +430,12 @@ export class PlanOrchestrator {
 
     const totalMs = Date.now() - this.startTime;
     logger.info({ totalMs, steps: plan.steps.length }, 'Plan execution complete');
+
+    // Mark state as complete and clean up
+    state.status = 'complete';
+    this.saveState(state);
+    // Clean up state file on successful completion (it served its purpose)
+    this.cleanupState();
 
     // 6. Post-synthesis reflection (async, non-blocking)
     this.runReflection(taskDescription, finalResult).catch(err => {

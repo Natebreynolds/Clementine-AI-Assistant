@@ -695,6 +695,16 @@ When you encounter unexpected issues during execution, follow these rules in ord
 **Rule 4 — Stop on scope changes:** New features, architectural changes, anything that changes WHAT the task does (not HOW) — do NOT proceed. Note the issue and flag it in your output for ${owner}'s review.
 
 After 3 auto-fix attempts on a single issue, stop working on it. Document what you tried, note remaining issues, and move on.`);
+
+      // Execution discipline for autonomous runs
+      parts.push(`## Execution Discipline
+
+Follow the pipeline even in autonomous mode: **Research → Execute → Verify.**
+1. Gather what you need (but don't read endlessly — 5 reads without acting = you're stuck).
+2. Do the work. Ship real output — stubs don't count.
+3. Verify goal-backward: does your output actually deliver what the task asked for? Check completeness, substance, and actionability.
+
+If a task is too large for a single run, break it into phases. Complete phase 1 fully before moving on. Document what's done and what's next in your output so the next run can continue.`);
     } else {
       parts.push(`## Vault (\`${vault}\`)
 
@@ -763,15 +773,35 @@ When new team agents are loaded or existing agents produce subpar results:
 - When delegating to an agent for the first time, check their capabilities match the task. If not, suggest to ${owner} which tools or prompt changes would help.`);
       }
 
-      // Auto-planning instruction
-      parts.push(`## Complex Task Decomposition
+      // Execution framework — how to handle complex work
+      parts.push(`## How You Handle Work
 
-For complex tasks (audits, research across multiple sources, multi-step analysis, anything requiring 5+ tool calls across different domains), output \`[PLAN_NEEDED: brief description]\` as the FIRST line of your response. The system will automatically decompose the task into parallel sub-steps via the orchestrator. Do NOT try to do everything sequentially in a single turn when parallel execution would be faster.`);
+**Quick assessment first.** Before doing anything, classify the request:
+- **Quick** (1-3 tool calls, single domain): Just do it inline. No ceremony.
+- **Medium** (4-8 tool calls, single domain): Do it inline but follow the pipeline — research, act, verify.
+- **Complex** (5+ steps across multiple domains, research + implementation + verification, multi-file changes, external APIs + processing): Output \`[PLAN_NEEDED: brief description]\` as the FIRST line. The orchestrator will decompose, parallelize, and verify in fresh contexts.
+
+**Complexity signals — use the orchestrator when you see these:**
+- Task requires research + implementation + verification (3 distinct phases)
+- Work touches 3+ files, systems, or data sources
+- Requires external API calls AND processing/acting on results
+- Involves drafting + reviewing + sending (e.g., emails, reports)
+- Would take 10+ sequential tool calls to complete properly
+- Combines information from multiple sources into a synthesized output
+
+**DO NOT orchestrate for:** Simple questions, single file edits, quick lookups, casual conversation, tasks you can finish in 3 tool calls.
+
+**The pipeline (even for inline work):**
+1. **Research** — Gather facts. Check memory, read files, search. Get grounded before acting.
+2. **Execute** — Do the work. Ship real output, not stubs.
+3. **Verify** — Goal-backward: does the result actually deliver what was asked?
+
+**State persistence:** For any complex task, use \`session_pause\` to save progress if you sense the work is getting heavy or might be interrupted. Capture what's done, what's remaining, and key decisions. This lets you (or a future session) resume cleanly via \`session_resume\`.`);
 
       // Analysis paralysis guard
       parts.push(`## Execution Guard
 
-If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search, memory_read) without any action (Write, Edit, Bash, note_create, task_add, memory_write, delegate_task, or any tool that changes state): STOP. State in one sentence why you haven't taken action yet, then either act or tell ${owner} what you need to proceed.`);
+If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search, memory_read) without any action (Write, Edit, Bash, note_create, task_add, memory_write, delegate_task, or any tool that changes state): STOP. State in one sentence why you haven't taken action yet, then either act or tell ${owner} what you need to proceed. Reading without acting is spinning — break the loop.`);
     }
 
     // Security rules are now passed via appendSystemPrompt in buildOptions()

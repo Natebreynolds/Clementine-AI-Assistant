@@ -747,6 +747,7 @@ export class CronScheduler {
   private disabledJobs = new Set<string>();
   private scheduledTasks = new Map<string, cron.ScheduledTask>();
   private runningJobs = new Set<string>();
+  private completedJobs = new Map<string, number>(); // jobName → completion timestamp
   private watching = false;
   readonly runLog: CronRunLog;
 
@@ -792,6 +793,7 @@ export class CronScheduler {
 
     // Wire up push notifications for unleashed task completions
     this.gateway.setUnleashedCompleteCallback((jobName, result) => {
+      this.completedJobs.set(jobName, Date.now());
       if (result && result !== '__NOTHING__') {
         this.dispatcher.send(`✅ Unleashed task **${jobName}** completed:\n\n${result.slice(0, 1500)}`).catch(() => {});
       }
@@ -973,6 +975,18 @@ export class CronScheduler {
       logger.info(`Cron job '${job.name}' is already running — skipping this trigger`);
       return;
     }
+
+    // Cooldown for unleashed jobs that completed recently
+    const completedAt = this.completedJobs.get(job.name);
+    if (completedAt) {
+      const cooldownMs = (job.maxHours ?? 6) * 60 * 60 * 1000;
+      if (Date.now() - completedAt < cooldownMs) {
+        logger.info(`Cron job '${job.name}' completed recently — cooling down, skipping`);
+        return;
+      }
+      this.completedJobs.delete(job.name);
+    }
+
     this.runningJobs.add(job.name);
     this.emitStatusChange();
 
@@ -1214,6 +1228,7 @@ export class CronScheduler {
 
   enableJob(jobName: string): string {
     this.disabledJobs.delete(jobName);
+    this.completedJobs.delete(jobName);
     this.reloadJobs();
     return `Enabled cron job: ${jobName}`;
   }

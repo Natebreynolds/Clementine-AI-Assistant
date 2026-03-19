@@ -2,8 +2,7 @@
  * Clementine TypeScript — Worktree Preflight Validator.
  *
  * Validates proposed source changes in an isolated git worktree before
- * they touch the live repo. Follows the Paperclip pattern of
- * `realizeExecutionWorkspace` + `provisionCommand` for safe isolation.
+ * they touch the live repo. Uses worktree isolation for safe validation.
  */
 
 import { execSync } from 'node:child_process';

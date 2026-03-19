@@ -295,6 +295,7 @@ export const CRON_PROGRESS_DIR = path.join(BASE_DIR, 'cron', 'progress');
 export const CRON_REFLECTIONS_DIR = path.join(BASE_DIR, 'cron', 'reflections');
 export const DELEGATIONS_DIR = path.join(VAULT_DIR, '00-System', 'agents');
 export const HANDOFFS_DIR = path.join(BASE_DIR, 'handoffs');
+export const PLAN_STATE_DIR = path.join(BASE_DIR, 'plan-state');
 
 // ── Source Self-Edit Staging ─────────────────────────────────────────
 

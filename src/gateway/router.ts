@@ -19,9 +19,13 @@ import { TeamBus } from '../agent/team-bus.js';
 
 const logger = pino({ name: 'clementine.gateway' });
 
-/** Wall-clock timeout for interactive chat messages (5 minutes).
- *  Prevents a stuck SDK query from leaving the user waiting forever. */
+/** Idle timeout for interactive chat messages (5 minutes).
+ *  Resets on agent activity (text/tool calls). Only kills if truly stuck. */
 const CHAT_TIMEOUT_MS = 5 * 60 * 1000;
+
+/** Absolute wall-clock cap for interactive chat (30 minutes).
+ *  Safety net so no session runs forever, even if active. */
+const CHAT_MAX_WALL_MS = 30 * 60 * 1000;
 
 export class Gateway {
   public readonly assistant: PersonalAssistant;
@@ -453,19 +457,44 @@ export class Gateway {
         // Resolve verbose level for this session
         const verboseLevel = this.sessionVerboseLevels.get(sessionKey);
 
-        // Wall-clock timeout prevents a stuck SDK query from leaving the user waiting
+        // Activity-based idle timeout: resets on agent output/tool calls.
+        // Only kills if the agent goes silent for CHAT_TIMEOUT_MS.
+        // Hard cap at CHAT_MAX_WALL_MS prevents truly runaway sessions.
         const chatAc = new AbortController();
         this.sessionAbortControllers.set(sessionKey, chatAc);
-        const chatTimer = setTimeout(() => {
+        const chatStarted = Date.now();
+
+        let chatTimer = setTimeout(() => {
           chatAc.abort();
-          logger.warn({ sessionKey }, `Chat timed out after ${CHAT_TIMEOUT_MS / 1000}s — aborting`);
+          logger.warn({ sessionKey }, `Chat idle timeout after ${CHAT_TIMEOUT_MS / 1000}s — aborting`);
         }, CHAT_TIMEOUT_MS);
+
+        const resetIdleTimer = () => {
+          clearTimeout(chatTimer);
+          if (Date.now() - chatStarted >= CHAT_MAX_WALL_MS) {
+            chatAc.abort();
+            logger.warn({ sessionKey }, `Chat hit max wall time (${CHAT_MAX_WALL_MS / 60000}min) — aborting`);
+            return;
+          }
+          chatTimer = setTimeout(() => {
+            chatAc.abort();
+            logger.warn({ sessionKey }, `Chat idle timeout after ${CHAT_TIMEOUT_MS / 1000}s — aborting`);
+          }, CHAT_TIMEOUT_MS);
+        };
+
+        // Wrap callbacks to reset idle timer on agent activity
+        const wrappedOnText = onText
+          ? async (token: string) => { resetIdleTimer(); return onText(token); }
+          : undefined;
+        const wrappedOnToolActivity = onToolActivity
+          ? async (name: string, input: Record<string, unknown>) => { resetIdleTimer(); return onToolActivity(name, input); }
+          : undefined;
 
         try {
           const [response] = await this.assistant.chat(
             text,
             effectiveSessionKey,
-            { onText, onToolActivity, model: effectiveModel, maxTurns, securityAnnotation, projectOverride, profile: resolvedProfile, verboseLevel, abortController: chatAc },
+            { onText: wrappedOnText, onToolActivity: wrappedOnToolActivity, model: effectiveModel, maxTurns, securityAnnotation, projectOverride, profile: resolvedProfile, verboseLevel, abortController: chatAc },
           );
 
           clearTimeout(chatTimer);
