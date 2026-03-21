@@ -619,6 +619,16 @@ export class HeartbeatScheduler {
           const content = readFileSync(filePath, 'utf-8');
           const title = file.replace(/\.md$/, '');
 
+          // Move file before processing to prevent duplicate triage on next tick
+          const destPath = path.join(processedDir, file);
+          try {
+            writeFileSync(destPath, content);
+            unlinkSync(filePath);
+          } catch {
+            // If move fails, skip — will retry next tick
+            continue;
+          }
+
           // Build a prompt for the agent to triage this inbox item
           const prompt =
             `Triage this inbox item and take appropriate action.\n\n` +
@@ -637,20 +647,17 @@ export class HeartbeatScheduler {
           this.gateway
             .handleCronJob(`inbox:${title}`, prompt, 1, 5)
             .then((result) => {
-              // Move processed file
-              try {
-                const destPath = path.join(processedDir, file);
-                writeFileSync(destPath, content);
-                unlinkSync(filePath);
-              } catch {
-                // If move fails, leave in inbox — will retry next tick
-              }
               if (result) {
                 logToDailyNote(`**Inbox processed: ${title}** — ${result.slice(0, 100).replace(/\n/g, ' ')}`);
               }
               logger.info({ file: title }, 'Inbox item processed');
             })
             .catch((err) => {
+              // Restore file to inbox on failure so it retries
+              try {
+                writeFileSync(filePath, content);
+                unlinkSync(destPath);
+              } catch { /* best-effort restore */ }
               logger.warn({ err, file: title }, 'Failed to process inbox item');
             });
         } catch (err) {
