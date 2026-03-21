@@ -531,13 +531,14 @@ export function parseCronJobs(): CronJobDefinition[] {
     const successCriteria = Array.isArray(job.success_criteria)
       ? (job.success_criteria as unknown[]).map(c => String(c))
       : undefined;
+    const alwaysDeliver = job.always_deliver === true ? true : undefined;
 
     if (!name || !schedule || !prompt) {
       logger.warn({ job }, 'Skipping malformed cron job');
       continue;
     }
 
-    jobs.push({ name, schedule, prompt, enabled, tier, maxTurns, model, workDir, mode, maxHours, maxRetries, after, successCriteria });
+    jobs.push({ name, schedule, prompt, enabled, tier, maxTurns, model, workDir, mode, maxHours, maxRetries, after, successCriteria, alwaysDeliver });
   }
 
   return jobs;
@@ -1009,7 +1010,7 @@ export class CronScheduler {
         const startedAt = new Date();
         try {
           // Standard cron jobs get a 10-minute timeout via SDK AbortController
-          const response = await this.gateway.handleCronJob(
+          let response = await this.gateway.handleCronJob(
             job.name,
             job.prompt,
             job.tier,
@@ -1021,6 +1022,34 @@ export class CronScheduler {
             job.mode !== 'unleashed' ? CRON_STANDARD_TIMEOUT_MS : undefined,
             job.successCriteria,
           );
+
+          // alwaysDeliver: retry once if the response is empty/noise
+          if (job.alwaysDeliver && (!response || CronScheduler.isCronNoise(response))) {
+            logger.info({ job: job.name }, 'alwaysDeliver: empty/noise response — retrying once');
+            try {
+              const retryResponse = await this.gateway.handleCronJob(
+                job.name,
+                job.prompt + '\n\nYou MUST produce a brief status update. Do NOT return __NOTHING__.',
+                job.tier,
+                job.maxTurns,
+                job.model,
+                job.workDir,
+                job.mode,
+                job.maxHours,
+                job.mode !== 'unleashed' ? CRON_STANDARD_TIMEOUT_MS : undefined,
+                job.successCriteria,
+              );
+              if (retryResponse && !CronScheduler.isCronNoise(retryResponse)) {
+                response = retryResponse;
+              } else {
+                // Fallback: minimal check-in message
+                response = `${job.name}: Checked in, nothing notable today.`;
+              }
+            } catch (retryErr) {
+              logger.warn({ err: retryErr, job: job.name }, 'alwaysDeliver retry failed — using fallback');
+              response = `${job.name}: Checked in, nothing notable today.`;
+            }
+          }
 
           // Success — log and dispatch
           const finishedAt = new Date();
@@ -1084,7 +1113,7 @@ export class CronScheduler {
             finishedAt: finishedAt.toISOString(),
             status: attempt < maxAttempts && errorType === 'transient' ? 'retried' : 'error',
             durationMs: finishedAt.getTime() - startedAt.getTime(),
-            error: String(err).slice(0, 500),
+            error: String(err).slice(0, 1500),
             errorType,
             attempt,
           });

@@ -35,7 +35,7 @@ import {
 import pino from 'pino';
 import type { AgentProfile } from '../types.js';
 import type { Gateway } from '../gateway/router.js';
-import { chunkText, DiscordStreamingMessage, friendlyToolName, sanitizeResponse } from './discord-utils.js';
+import { chunkText, sendChunked, DiscordStreamingMessage, friendlyToolName, sanitizeResponse } from './discord-utils.js';
 import { MODELS } from '../config.js';
 
 const logger = pino({ name: 'clementine.agent-bot' });
@@ -456,7 +456,7 @@ export class AgentBotClient {
               const planPreview = `**Plan:** ${task.slice(0, 100)}\n\n` +
                 steps.map((s, i) => `${i + 1}. **${s.id}** — ${s.description.slice(0, 60)}`).join('\n');
               if ('send' in cmd.channel!) {
-                await cmd.channel!.send(planPreview.slice(0, 2000));
+                await sendChunked(cmd.channel!, planPreview);
               }
 
               // Send approval buttons

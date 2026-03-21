@@ -46,9 +46,10 @@ export function chunkText(text: string, maxLen = 1900): string[] {
       break;
     }
     let splitAt = remaining.lastIndexOf('\n', maxLen);
+    if (splitAt === -1) splitAt = remaining.lastIndexOf(' ', maxLen);
     if (splitAt === -1) splitAt = maxLen;
     chunks.push(remaining.slice(0, splitAt));
-    remaining = remaining.slice(splitAt).replace(/^\n+/, '');
+    remaining = remaining.slice(splitAt).replace(/^[\n ]+/, '');
   }
   return chunks;
 }
