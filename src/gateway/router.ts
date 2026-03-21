@@ -742,6 +742,19 @@ export class Gateway {
     return this.assistant.getRecentActivity(sinceIso);
   }
 
+  /**
+   * Search memory (FTS5) for context relevant to a query.
+   * Used by heartbeat to enrich goal summaries with recent memory.
+   */
+  searchMemory(query: string, limit: number = 3): Array<{
+    sourceFile: string;
+    section: string;
+    content: string;
+    score: number;
+  }> {
+    return this.assistant.searchMemory(query, limit);
+  }
+
   // ── Approval system ─────────────────────────────────────────────────
 
   async requestApproval(descriptionOrId: string, explicitId?: string): Promise<boolean | string> {

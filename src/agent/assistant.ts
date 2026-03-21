@@ -1075,6 +1075,67 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
     }
   }
 
+  // ── Goal Matching ─────────────────────────────────────────────────
+
+  /**
+   * Match a user message against active goals by keyword overlap.
+   * Returns formatted goal status block for injection into system prompt,
+   * or empty string if no goals match.
+   */
+  private matchGoals(userMessage: string): string {
+    try {
+      if (!fs.existsSync(GOALS_DIR)) return '';
+      const files = fs.readdirSync(GOALS_DIR).filter(f => f.endsWith('.json'));
+      if (files.length === 0) return '';
+
+      const lower = userMessage.toLowerCase();
+      const matches: Array<{ goal: any; hits: number }> = [];
+
+      for (const f of files) {
+        try {
+          const goal = JSON.parse(fs.readFileSync(path.join(GOALS_DIR, f), 'utf-8'));
+          if (goal.status !== 'active') continue;
+
+          // Split title into keywords (>3 chars) and count matches
+          const titleWords = (goal.title || '').toLowerCase().split(/\s+/).filter((w: string) => w.length > 3);
+          let hits = 0;
+          for (const w of titleWords) {
+            if (lower.includes(w)) hits++;
+          }
+
+          // High-priority goals have a lower threshold (1 hit), others need 2+
+          const threshold = goal.priority === 'high' ? 1 : 2;
+          if (hits >= threshold) {
+            matches.push({ goal, hits });
+          }
+        } catch { continue; }
+      }
+
+      if (matches.length === 0) return '';
+
+      // Sort by hits descending
+      matches.sort((a, b) => b.hits - a.hits);
+
+      const lines = matches.map(({ goal }) => {
+        const parts = [`**${goal.title}** [${goal.priority}]`];
+        if (goal.progressNotes?.length > 0) {
+          parts.push(`Latest: ${goal.progressNotes[goal.progressNotes.length - 1]}`);
+        }
+        if (goal.nextActions?.length > 0) {
+          parts.push(`Next: ${goal.nextActions[0]}`);
+        }
+        if (goal.blockers?.length > 0) {
+          parts.push(`Blocked: ${goal.blockers[0]}`);
+        }
+        return `- ${parts.join(' | ')}`;
+      });
+
+      return `\n\n## Relevant Goals\n${lines.join('\n')}\n`;
+    } catch {
+      return '';
+    }
+  }
+
   // ── Chat ──────────────────────────────────────────────────────────
 
   async chat(
@@ -1334,6 +1395,12 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
       const projName = path.basename(matchedProject.path);
       const projDesc = matchedProject.description ? ` — ${matchedProject.description}` : '';
       retrievalContext = `## Active Project: ${projName}${projDesc}\n\nYou are operating in the context of the **${projName}** project at \`${matchedProject.path}\`. You have access to this project's tools, MCP servers, and configuration.\n\n${retrievalContext}`;
+    }
+
+    // Inject matching goal context so the agent is goal-aware without tool calls
+    const goalContext = this.matchGoals(prompt);
+    if (goalContext) {
+      retrievalContext += goalContext;
     }
 
     try {
@@ -2754,6 +2821,20 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
     if (!this.memoryStore) return [];
     try {
       return this.memoryStore.getRecentActivity(sinceIso);
+    } catch {
+      return [];
+    }
+  }
+
+  searchMemory(query: string, limit: number = 3): Array<{
+    sourceFile: string;
+    section: string;
+    content: string;
+    score: number;
+  }> {
+    if (!this.memoryStore) return [];
+    try {
+      return this.memoryStore.searchContext(query, { limit });
     } catch {
       return [];
     }
