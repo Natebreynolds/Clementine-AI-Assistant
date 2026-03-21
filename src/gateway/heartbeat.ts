@@ -220,6 +220,12 @@ export class HeartbeatScheduler {
       changesSummary += `\n\n${goalSummary}`;
     }
 
+    // Enrich active goals with relevant memory snippets
+    const goalMemoryContext = this.enrichGoalsWithMemory();
+    if (goalMemoryContext) {
+      changesSummary += `\n\n${goalMemoryContext}`;
+    }
+
     // Persist new state
     this.lastState = {
       fingerprint: currentFingerprint,
@@ -252,6 +258,9 @@ export class HeartbeatScheduler {
     } catch (err) {
       logger.error({ err }, 'Heartbeat tick failed');
     }
+
+    // Fire-and-forget: nudge stale goals by writing trigger files
+    this.nudgeStaleGoals();
   }
 
   private readHeartbeatConfig(): string {
@@ -467,6 +476,114 @@ export class HeartbeatScheduler {
       return `${header}\n${lines.join('\n')}`;
     } catch {
       return null;
+    }
+  }
+
+  /**
+   * Enrich top active goals with relevant memory snippets.
+   * Searches FTS5 memory for each goal's title+description to surface
+   * recent conversations and facts the heartbeat agent can act on.
+   */
+  private enrichGoalsWithMemory(): string | null {
+    try {
+      if (!existsSync(GOALS_DIR)) return null;
+      const files = readdirSync(GOALS_DIR).filter(f => f.endsWith('.json'));
+      if (files.length === 0) return null;
+
+      const goals = files
+        .map(f => { try { return JSON.parse(readFileSync(path.join(GOALS_DIR, f), 'utf-8')); } catch { return null; } })
+        .filter((g: any) => g && g.status === 'active' && g.priority !== 'low');
+
+      if (goals.length === 0) return null;
+
+      // Sort by priority (high first) and take top 3
+      const priorityOrder: Record<string, number> = { high: 0, medium: 1 };
+      goals.sort((a: any, b: any) => (priorityOrder[a.priority] ?? 2) - (priorityOrder[b.priority] ?? 2));
+      const topGoals = goals.slice(0, 3);
+
+      const sections: string[] = [];
+      for (const goal of topGoals) {
+        const query = `${goal.title} ${goal.description || ''}`.trim();
+        const results = this.gateway.searchMemory(query, 2);
+        if (results.length === 0) continue;
+
+        const snippets = results.map((r: any) => {
+          const source = r.sourceFile ? path.basename(r.sourceFile, path.extname(r.sourceFile)) : r.section;
+          const content = (r.content || '').slice(0, 150).replace(/\n/g, ' ').trim();
+          return `  [${source}] ${content}`;
+        });
+        sections.push(`- ${goal.title}:\n${snippets.join('\n')}`);
+      }
+
+      if (sections.length === 0) return null;
+      return `Memory insights for active goals (act on these if relevant):\n${sections.join('\n')}`;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Nudge the most urgent stale goal by writing a trigger file.
+   * Conservative: only nudges ONE goal per heartbeat tick, and skips
+   * if any trigger files are already pending (prevents double-triggering).
+   */
+  private nudgeStaleGoals(): void {
+    try {
+      const goalTriggerDir = path.join(BASE_DIR, 'cron', 'goal-triggers');
+      mkdirSync(goalTriggerDir, { recursive: true });
+
+      // Guard: don't double-trigger if files are already pending
+      const pending = readdirSync(goalTriggerDir).filter(f => f.endsWith('.trigger.json'));
+      if (pending.length > 0) return;
+
+      if (!existsSync(GOALS_DIR)) return;
+      const files = readdirSync(GOALS_DIR).filter(f => f.endsWith('.json'));
+      if (files.length === 0) return;
+
+      const now = Date.now();
+      const DAY_MS = 86_400_000;
+
+      // Find stale goals sorted by urgency (priority + days overdue)
+      const staleGoals: Array<{ goal: any; urgency: number }> = [];
+      for (const f of files) {
+        try {
+          const goal = JSON.parse(readFileSync(path.join(GOALS_DIR, f), 'utf-8'));
+          if (goal.status !== 'active') continue;
+
+          const lastUpdate = goal.updatedAt ? new Date(goal.updatedAt).getTime() : 0;
+          const daysSinceUpdate = Math.floor((now - lastUpdate) / DAY_MS);
+          const staleThreshold = goal.reviewFrequency === 'daily' ? 1 : goal.reviewFrequency === 'weekly' ? 7 : 30;
+          if (daysSinceUpdate <= staleThreshold) continue;
+
+          // Urgency: high priority gets +10, days overdue adds to score
+          const priorityBoost = goal.priority === 'high' ? 10 : goal.priority === 'medium' ? 5 : 0;
+          staleGoals.push({ goal, urgency: priorityBoost + (daysSinceUpdate - staleThreshold) });
+        } catch { continue; }
+      }
+
+      if (staleGoals.length === 0) return;
+
+      // Pick the most urgent
+      staleGoals.sort((a, b) => b.urgency - a.urgency);
+      const { goal } = staleGoals[0];
+
+      const focus = goal.nextActions?.length > 0
+        ? goal.nextActions[0]
+        : `Review and update progress on "${goal.title}"`;
+
+      const trigger = {
+        goalId: goal.id,
+        focus,
+        maxTurns: 10,
+        triggeredAt: new Date().toISOString(),
+        source: 'heartbeat-nudge',
+      };
+
+      const triggerPath = path.join(goalTriggerDir, `${goal.id}.trigger.json`);
+      writeFileSync(triggerPath, JSON.stringify(trigger, null, 2));
+      logger.info({ goalId: goal.id, title: goal.title, focus }, 'Nudged stale goal via trigger file');
+    } catch (err) {
+      logger.warn({ err }, 'Failed to nudge stale goals');
     }
   }
 
