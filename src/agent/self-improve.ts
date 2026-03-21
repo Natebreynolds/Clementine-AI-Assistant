@@ -19,6 +19,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from 'node:fs';
+import matter from 'gray-matter';
 import path from 'node:path';
 import pino from 'pino';
 
@@ -73,9 +74,11 @@ interface CronReflectionEntry {
   existence?: boolean;
   substance?: boolean;
   actionable?: boolean;
+  communication?: boolean;
   criteriaMet?: boolean | null;
   quality: number;
   gap?: string;
+  commNote?: string;
 }
 
 interface GoalHealthEntry {
@@ -140,6 +143,9 @@ export class SelfImproveLoop {
         cronSuccessRate: metrics.cronSuccessRate,
         avgResponseQuality: 0, // Updated as we evaluate
       };
+
+      // Synthesize feedback patterns before experiment loop
+      await this.synthesizeFeedbackPatterns();
 
       for (let i = 1; i <= this.config.maxIterations; i++) {
         // Check time budget
@@ -420,8 +426,9 @@ export class SelfImproveLoop {
     // Format cron reflections (quality ratings from automated reflection passes)
     const cronReflectionsText = metrics.cronReflections.slice(-10).map(r =>
       `- Job: ${r.jobName}${r.agentSlug ? ` (${r.agentSlug})` : ''} | Quality: ${r.quality}/5 | ` +
-      `Exist: ${r.existence ?? '?'} Substance: ${r.substance ?? '?'} Actionable: ${r.actionable ?? '?'} | ` +
-      `Gap: "${r.gap?.slice(0, 80) ?? ''}" | At: ${r.timestamp}`
+      `Exist: ${r.existence ?? '?'} Substance: ${r.substance ?? '?'} Actionable: ${r.actionable ?? '?'} ` +
+      `Comm: ${r.communication ?? '?'} | ` +
+      `Gap: "${r.gap?.slice(0, 80) ?? ''}"${r.commNote ? ` | CommNote: "${r.commNote.slice(0, 80)}"` : ''} | At: ${r.timestamp}`
     ).join('\n') || '(no cron reflections yet)';
 
     // Compute per-agent metrics from reflections
@@ -678,6 +685,82 @@ export class SelfImproveLoop {
       logger.info('Memory cleanup complete');
     } catch (err) {
       logger.error({ err }, 'Memory cleanup failed');
+    }
+  }
+
+  // ── Feedback synthesis ───────────────────────────────────────────
+
+  private async synthesizeFeedbackPatterns(): Promise<void> {
+    try {
+      const { MemoryStore } = await import('../memory/store.js');
+      const store = new MemoryStore(MEMORY_DB_PATH, VAULT_DIR);
+      store.initialize();
+
+      const recentFeedback = store.getRecentFeedback(50);
+      store.close();
+
+      if (recentFeedback.length < 3) {
+        logger.info({ count: recentFeedback.length }, 'Not enough feedback to synthesize (need 3+)');
+        return;
+      }
+
+      // Group by rating for the synthesis prompt
+      const grouped: Record<string, typeof recentFeedback> = {};
+      for (const f of recentFeedback) {
+        (grouped[f.rating] ??= []).push(f);
+      }
+
+      const feedbackLines: string[] = [];
+      for (const [rating, items] of Object.entries(grouped)) {
+        feedbackLines.push(`### ${rating.toUpperCase()} (${items.length})`);
+        for (const f of items.slice(0, 15)) {
+          const snippet = f.messageSnippet ? ` | Message: "${f.messageSnippet.slice(0, 100)}"` : '';
+          const resp = f.responseSnippet ? ` | Response: "${f.responseSnippet.slice(0, 100)}"` : '';
+          const comment = f.comment ? ` | Comment: "${f.comment}"` : '';
+          feedbackLines.push(`- ${f.channel}${snippet}${resp}${comment}`);
+        }
+      }
+
+      const prompt =
+        `Analyze this user feedback about an AI assistant's communication and distill 3-8 concise ` +
+        `communication preference bullets. Focus on HOW the user wants to be communicated with — ` +
+        `tone, format, length, proactivity, what to avoid.\n\n` +
+        `## Feedback Data (${recentFeedback.length} entries)\n${feedbackLines.join('\n')}\n\n` +
+        `Output ONLY a YAML-style bulleted list (each line starts with "- "). No preamble, no explanation.\n` +
+        `Example format:\n- Prefers concise answers unless elaboration is requested\n- Appreciates proactive blocker identification`;
+
+      const result = await this.assistant.runPlanStep('si-feedback-synthesis', prompt, {
+        tier: 2,
+        maxTurns: 1,
+        disableTools: true,
+      });
+
+      // Extract bullet lines from response
+      const bullets = result
+        .split('\n')
+        .map(l => l.trim())
+        .filter(l => l.startsWith('- '));
+
+      if (bullets.length === 0) {
+        logger.warn('Feedback synthesis returned no bullets');
+        return;
+      }
+
+      const patternsSummary = bullets.join('\n');
+      const feedbackDir = path.join(VAULT_DIR, '00-System');
+      if (!existsSync(feedbackDir)) mkdirSync(feedbackDir, { recursive: true });
+
+      const feedbackFile = path.join(feedbackDir, 'FEEDBACK.md');
+      const content = matter.stringify('', {
+        patterns_summary: patternsSummary,
+        last_synthesized: new Date().toISOString(),
+        feedback_count: recentFeedback.length,
+      });
+      writeFileSync(feedbackFile, content);
+
+      logger.info({ bullets: bullets.length, feedbackCount: recentFeedback.length }, 'Feedback patterns synthesized to FEEDBACK.md');
+    } catch (err) {
+      logger.error({ err }, 'Feedback synthesis failed');
     }
   }
 
