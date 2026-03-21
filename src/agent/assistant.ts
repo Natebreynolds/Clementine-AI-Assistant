@@ -186,6 +186,11 @@ const AUTO_MEMORY_PROMPT = `You are a memory extraction agent. Your ONLY job is 
 - Questions that were fully answered (no durable fact)
 - **Things already present in the Current Memory section above — do NOT re-save them**
 - Technical back-and-forth that isn't a decision
+- **Facts that were previously corrected or dismissed — see the Corrections section below**
+
+## Recent Corrections (DO NOT re-extract these wrong facts)
+
+{recent_corrections}
 
 ## Rules:
 - Only save genuinely NEW facts not already present in the Current Memory above.
@@ -1869,10 +1874,32 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
           assistantResponse.slice(-1500);
       }
 
+      // Fetch recent corrections to include as negative examples
+      let correctionsText = '(none)';
+      if (this.memoryStore) {
+        try {
+          const corrections = this.memoryStore.getRecentCorrections(10);
+          if (corrections.length > 0) {
+            correctionsText = corrections.map((c: { toolInput: string; correction: string }) => {
+              try {
+                const input = JSON.parse(c.toolInput);
+                const original = input.content ?? input.text ?? JSON.stringify(input).slice(0, 100);
+                return `- WRONG: "${original.slice(0, 100)}" → CORRECTED: "${c.correction.slice(0, 100)}"`;
+              } catch {
+                return `- Corrected: "${c.correction.slice(0, 100)}"`;
+              }
+            }).join('\n');
+          }
+        } catch {
+          // Non-fatal — proceed without corrections
+        }
+      }
+
       const memPrompt = AUTO_MEMORY_PROMPT
         .replace('{user_message}', userMessage)
         .replace('{assistant_response}', truncatedResponse)
-        .replace('{current_memory}', currentMemory || '(empty — no existing memory yet)');
+        .replace('{current_memory}', currentMemory || '(empty — no existing memory yet)')
+        .replace('{recent_corrections}', correctionsText);
 
       const userMessageSnippet = userMessage.slice(0, 500);
 

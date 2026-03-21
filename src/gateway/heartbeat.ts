@@ -40,6 +40,7 @@ import {
   BASE_DIR,
   DISCORD_OWNER_ID,
   GOALS_DIR,
+  CRON_REFLECTIONS_DIR,
 } from '../config.js';
 import type { CronJobDefinition, CronRunEntry, HeartbeatState, SelfImproveConfig, SelfImproveExperiment, SelfImproveState, WorkflowDefinition } from '../types.js';
 import type { NotificationDispatcher } from './notifications.js';
@@ -261,6 +262,9 @@ export class HeartbeatScheduler {
 
     // Fire-and-forget: nudge stale goals by writing trigger files
     this.nudgeStaleGoals();
+
+    // Fire-and-forget: process inbox items
+    this.processInbox();
   }
 
   private readHeartbeatConfig(): string {
@@ -584,6 +588,77 @@ export class HeartbeatScheduler {
       logger.info({ goalId: goal.id, title: goal.title, focus }, 'Nudged stale goal via trigger file');
     } catch (err) {
       logger.warn({ err }, 'Failed to nudge stale goals');
+    }
+  }
+
+  /**
+   * Process pending inbox items. For each .md file in INBOX_DIR:
+   * - Routes to the gateway as a cron-style task for the agent to triage
+   * - The agent determines the intent (task, reference, reminder) and acts
+   * - Processed files are moved to a _processed subfolder
+   *
+   * Conservative: processes at most 3 items per heartbeat tick.
+   */
+  private processInbox(): void {
+    try {
+      if (!existsSync(INBOX_DIR)) return;
+
+      const files = readdirSync(INBOX_DIR).filter(
+        (f) => f.endsWith('.md') && !f.startsWith('_'),
+      );
+      if (files.length === 0) return;
+
+      // Process at most 3 items per tick to avoid overloading
+      const batch = files.slice(0, 3);
+      const processedDir = path.join(INBOX_DIR, '_processed');
+      mkdirSync(processedDir, { recursive: true });
+
+      for (const file of batch) {
+        const filePath = path.join(INBOX_DIR, file);
+        try {
+          const content = readFileSync(filePath, 'utf-8');
+          const title = file.replace(/\.md$/, '');
+
+          // Build a prompt for the agent to triage this inbox item
+          const prompt =
+            `Triage this inbox item and take appropriate action.\n\n` +
+            `**Title:** ${title}\n` +
+            `**Content:**\n${content.slice(0, 2000)}\n\n` +
+            `## Instructions:\n` +
+            `1. Determine the intent: Is this a task, a reference/note, a reminder, or something else?\n` +
+            `2. Take the appropriate action:\n` +
+            `   - **Task**: Use \`task_add\` to create a task with the right priority and due date.\n` +
+            `   - **Reference**: Use \`note_create\` or \`memory_write\` to file it in the vault.\n` +
+            `   - **Reminder**: Add to today's daily note with \`memory_write(action="append_daily")\`.\n` +
+            `   - **Project update**: Update the relevant project note.\n` +
+            `3. Respond with a one-line summary of what you did.`;
+
+          // Fire-and-forget — run as a lightweight cron job
+          this.gateway
+            .handleCronJob(`inbox:${title}`, prompt, 1, 5)
+            .then((result) => {
+              // Move processed file
+              try {
+                const destPath = path.join(processedDir, file);
+                writeFileSync(destPath, content);
+                unlinkSync(filePath);
+              } catch {
+                // If move fails, leave in inbox — will retry next tick
+              }
+              if (result) {
+                logToDailyNote(`**Inbox processed: ${title}** — ${result.slice(0, 100).replace(/\n/g, ' ')}`);
+              }
+              logger.info({ file: title }, 'Inbox item processed');
+            })
+            .catch((err) => {
+              logger.warn({ err, file: title }, 'Failed to process inbox item');
+            });
+        } catch (err) {
+          logger.warn({ err, file }, 'Failed to read inbox item');
+        }
+      }
+    } catch (err) {
+      logger.warn({ err }, 'Failed to process inbox');
     }
   }
 
@@ -1259,6 +1334,96 @@ export class CronScheduler {
     } finally {
       this.runningJobs.delete(job.name);
       this.emitStatusChange();
+
+      // Fire-and-forget: check if this agent's profile needs self-learning update
+      if (job.agentSlug) {
+        this.checkAgentLearning(job.agentSlug, job.name).catch(() => {});
+      }
+    }
+  }
+
+  /**
+   * Check if an agent's recent cron reflections show consistently low quality.
+   * If the last N runs average below the threshold, auto-append a "lessons learned"
+   * section to the agent's profile. This is additive (not destructive) — it
+   * only appends insights, never overwrites the core agent prompt.
+   */
+  private async checkAgentLearning(agentSlug: string, jobName: string): Promise<void> {
+    const MIN_RUNS = 5;
+    const QUALITY_THRESHOLD = 3.0;
+
+    try {
+      // Read the agent's reflection log
+      const safeJobName = jobName.replace(/[^a-zA-Z0-9_-]/g, '_');
+      const logFile = path.join(CRON_REFLECTIONS_DIR, `${safeJobName}.jsonl`);
+      if (!existsSync(logFile)) return;
+
+      const lines = readFileSync(logFile, 'utf-8').trim().split('\n').filter(Boolean);
+      if (lines.length < MIN_RUNS) return;
+
+      // Parse the last N reflections
+      const recent = lines.slice(-MIN_RUNS).map((l) => {
+        try { return JSON.parse(l); } catch { return null; }
+      }).filter(Boolean);
+
+      if (recent.length < MIN_RUNS) return;
+
+      const avgQuality = recent.reduce((sum: number, r: any) => sum + (r.quality ?? 0), 0) / recent.length;
+      if (avgQuality >= QUALITY_THRESHOLD) return;
+
+      // Quality is consistently low — extract lessons from gaps
+      const gaps = recent
+        .map((r: any) => r.gap)
+        .filter((g: string) => g && g !== 'none' && g.length > 5);
+
+      if (gaps.length === 0) return;
+
+      // Check if we've already added lessons recently (prevent spam)
+      const profilePath = path.join(AGENTS_DIR, agentSlug, 'agent.md');
+      if (!existsSync(profilePath)) return;
+
+      const profile = readFileSync(profilePath, 'utf-8');
+      const lessonsMarker = '## Lessons Learned (auto-generated)';
+
+      // Only update at most once per week
+      const lastLessonMatch = profile.match(/<!-- lessons-updated: (\d{4}-\d{2}-\d{2}) -->/);
+      if (lastLessonMatch) {
+        const lastUpdate = new Date(lastLessonMatch[1]);
+        const daysSince = (Date.now() - lastUpdate.getTime()) / 86_400_000;
+        if (daysSince < 7) return;
+      }
+
+      // Deduplicate and summarize gaps
+      const uniqueGaps = [...new Set(gaps)].slice(0, 5);
+      const lessonsBlock =
+        `\n\n${lessonsMarker}\n` +
+        `<!-- lessons-updated: ${todayISO()} -->\n` +
+        `_Based on ${MIN_RUNS} recent runs (avg quality: ${avgQuality.toFixed(1)}/5):_\n\n` +
+        uniqueGaps.map((g) => `- ${g}`).join('\n') + '\n';
+
+      // Append or replace the lessons section
+      let updatedProfile: string;
+      const existingIdx = profile.indexOf(lessonsMarker);
+      if (existingIdx >= 0) {
+        // Replace existing lessons section (everything from marker to end or next ##)
+        const afterMarker = profile.slice(existingIdx);
+        const nextSection = afterMarker.indexOf('\n## ', lessonsMarker.length);
+        if (nextSection >= 0) {
+          updatedProfile = profile.slice(0, existingIdx) + lessonsBlock + afterMarker.slice(nextSection);
+        } else {
+          updatedProfile = profile.slice(0, existingIdx) + lessonsBlock;
+        }
+      } else {
+        updatedProfile = profile + lessonsBlock;
+      }
+
+      writeFileSync(profilePath, updatedProfile);
+      logger.info(
+        { agent: agentSlug, avgQuality: avgQuality.toFixed(1), gaps: uniqueGaps.length },
+        `Auto-appended ${uniqueGaps.length} lessons to ${agentSlug}/agent.md (avg quality: ${avgQuality.toFixed(1)})`,
+      );
+    } catch (err) {
+      logger.debug({ err, agent: agentSlug }, 'Agent learning check failed (non-fatal)');
     }
   }
 
