@@ -164,6 +164,13 @@ export class MemoryStore {
       // Index already exists
     }
 
+    // Add consolidated flag to chunks (for memory consolidation)
+    try {
+      this.conn.exec('ALTER TABLE chunks ADD COLUMN consolidated INTEGER DEFAULT 0');
+    } catch {
+      // Column already exists
+    }
+
     // Access log table for salience tracking
     this.conn.exec(`
       CREATE TABLE IF NOT EXISTS access_log (
@@ -1103,6 +1110,22 @@ export class MemoryStore {
     return { isDuplicate: false, matchType: null };
   }
 
+  /**
+   * Bump a chunk's salience and update its timestamp when a duplicate is detected.
+   * Instead of discarding duplicate mentions, this reinforces the existing chunk
+   * so frequently-mentioned facts surface higher in search results.
+   */
+  bumpChunkSalience(chunkId: number, boost: number = 0.1): void {
+    this.conn
+      .prepare(
+        `UPDATE chunks
+         SET salience = MIN(salience + ?, 1.0),
+             updated_at = datetime('now')
+         WHERE id = ?`,
+      )
+      .run(boost, chunkId);
+  }
+
   // ── Memory Extractions ──────────────────────────────────────────
 
   /**
@@ -1176,8 +1199,10 @@ export class MemoryStore {
 
   /**
    * Mark an extraction as corrected with a replacement fact.
+   * Also removes the wrong content from the search index so it stops surfacing.
    */
   correctExtraction(id: number, correction: string): void {
+    // Mark the extraction record
     this.conn
       .prepare(
         `UPDATE memory_extractions
@@ -1185,12 +1210,42 @@ export class MemoryStore {
          WHERE id = ?`,
       )
       .run(correction, id);
+
+    // Find the original extraction to identify what was written
+    const extraction = this.conn
+      .prepare('SELECT tool_name, tool_input FROM memory_extractions WHERE id = ?')
+      .get(id) as { tool_name: string; tool_input: string } | undefined;
+
+    if (!extraction) return;
+
+    // Try to find and remove the wrong content from the chunks index.
+    // Parse the tool_input to extract the content that was originally written.
+    try {
+      const input = JSON.parse(extraction.tool_input);
+      const content = input.content ?? input.text ?? '';
+      if (content && content.length > 10) {
+        // Find chunks that match the wrong content via FTS5
+        const dup = this.checkDuplicate(content);
+        if (dup.isDuplicate && dup.matchId) {
+          // Delete the wrong chunk from the search index
+          this.conn.prepare('DELETE FROM chunks WHERE id = ?').run(dup.matchId);
+        }
+      }
+    } catch {
+      // Non-fatal — the extraction record is still corrected even if we can't find the chunk
+    }
   }
 
   /**
    * Dismiss an extraction (mark as invalid).
+   * Also removes the content from the search index.
    */
   dismissExtraction(id: number): void {
+    // Find the original extraction before dismissing
+    const extraction = this.conn
+      .prepare('SELECT tool_name, tool_input FROM memory_extractions WHERE id = ?')
+      .get(id) as { tool_name: string; tool_input: string } | undefined;
+
     this.conn
       .prepare(
         `UPDATE memory_extractions
@@ -1198,6 +1253,48 @@ export class MemoryStore {
          WHERE id = ?`,
       )
       .run(id);
+
+    // Remove wrong content from chunks index
+    if (extraction) {
+      try {
+        const input = JSON.parse(extraction.tool_input);
+        const content = input.content ?? input.text ?? '';
+        if (content && content.length > 10) {
+          const dup = this.checkDuplicate(content);
+          if (dup.isDuplicate && dup.matchId) {
+            this.conn.prepare('DELETE FROM chunks WHERE id = ?').run(dup.matchId);
+          }
+        }
+      } catch {
+        // Non-fatal
+      }
+    }
+  }
+
+  /**
+   * Get recent corrections to use as negative examples in auto-memory extraction.
+   * Returns corrections from the last 30 days so the extraction prompt knows
+   * what facts have been corrected and shouldn't be re-extracted.
+   */
+  getRecentCorrections(limit: number = 20): Array<{
+    toolInput: string;
+    correction: string;
+  }> {
+    const rows = this.conn
+      .prepare(
+        `SELECT tool_input, correction
+         FROM memory_extractions
+         WHERE status IN ('corrected', 'dismissed')
+           AND extracted_at >= datetime('now', '-30 days')
+         ORDER BY extracted_at DESC
+         LIMIT ?`,
+      )
+      .all(limit) as Array<{ tool_input: string; correction: string | null }>;
+
+    return rows.map((row) => ({
+      toolInput: row.tool_input,
+      correction: row.correction ?? '(dismissed — this was wrong)',
+    }));
   }
 
   // ── Feedback ───────────────────────────────────────────────────────
@@ -1281,6 +1378,95 @@ export class MemoryStore {
       stats.total += row.cnt;
     }
     return stats;
+  }
+
+  // ── Memory Consolidation ──────────────────────────────────────────
+
+  /**
+   * Get chunks that are candidates for consolidation:
+   * - Older than `minAgeDays`
+   * - Not already consolidated
+   * - Grouped by source file prefix (topic area)
+   *
+   * Returns groups with 3+ chunks that can be synthesized into summaries.
+   */
+  getConsolidationCandidates(minAgeDays: number = 30): Array<{
+    topic: string;
+    chunkIds: number[];
+    contents: string[];
+    totalChars: number;
+  }> {
+    const rows = this.conn
+      .prepare(
+        `SELECT id, source_file, section, content
+         FROM chunks
+         WHERE consolidated = 0
+           AND sector = 'semantic'
+           AND updated_at <= datetime('now', ? || ' days')
+           AND chunk_type != 'frontmatter'
+         ORDER BY source_file, section`,
+      )
+      .all(`-${minAgeDays}`) as Array<{
+      id: number;
+      source_file: string;
+      section: string;
+      content: string;
+    }>;
+
+    // Group by top-level topic (first path segment, e.g., "03-Projects", "04-Topics")
+    const groups = new Map<string, { chunkIds: number[]; contents: string[]; totalChars: number }>();
+    for (const row of rows) {
+      // Use source_file directory as the grouping key
+      const topic = row.source_file.split('/').slice(0, 2).join('/') || row.source_file;
+      const group = groups.get(topic) ?? { chunkIds: [], contents: [], totalChars: 0 };
+      group.chunkIds.push(row.id);
+      group.contents.push(`[${row.section}] ${row.content}`);
+      group.totalChars += row.content.length;
+      groups.set(topic, group);
+    }
+
+    // Only return groups with 3+ chunks (worth consolidating)
+    return [...groups.entries()]
+      .filter(([, g]) => g.chunkIds.length >= 3)
+      .map(([topic, g]) => ({ topic, ...g }))
+      .sort((a, b) => b.chunkIds.length - a.chunkIds.length);
+  }
+
+  /**
+   * Mark chunks as consolidated after they've been synthesized into a summary.
+   * Reduces salience so they appear lower in search results (but aren't deleted).
+   */
+  markConsolidated(chunkIds: number[]): void {
+    if (chunkIds.length === 0) return;
+
+    const placeholders = chunkIds.map(() => '?').join(',');
+    this.conn
+      .prepare(
+        `UPDATE chunks
+         SET consolidated = 1, salience = MAX(salience - 0.3, 0.0)
+         WHERE id IN (${placeholders})`,
+      )
+      .run(...chunkIds);
+  }
+
+  /**
+   * Get consolidation stats for monitoring.
+   */
+  getConsolidationStats(): { totalChunks: number; consolidated: number; unconsolidated: number } {
+    const row = this.conn
+      .prepare(
+        `SELECT
+           COUNT(*) as total,
+           SUM(CASE WHEN consolidated = 1 THEN 1 ELSE 0 END) as consolidated
+         FROM chunks`,
+      )
+      .get() as { total: number; consolidated: number };
+
+    return {
+      totalChunks: row.total,
+      consolidated: row.consolidated,
+      unconsolidated: row.total - row.consolidated,
+    };
   }
 
   // ── Helpers ───────────────────────────────────────────────────────

@@ -106,6 +106,13 @@ type MemoryStoreType = {
   }>;
   correctExtraction(id: number, correction: string): void;
   dismissExtraction(id: number): void;
+  bumpChunkSalience(chunkId: number, boost?: number): void;
+  getRecentCorrections(limit?: number): Array<{ toolInput: string; correction: string }>;
+  getConsolidationCandidates(minAgeDays?: number): Array<{
+    topic: string; chunkIds: number[]; contents: string[]; totalChars: number;
+  }>;
+  markConsolidated(chunkIds: number[]): void;
+  getConsolidationStats(): { totalChunks: number; consolidated: number; unconsolidated: number };
   logFeedback(feedback: {
     sessionKey?: string; channel: string; messageSnippet?: string;
     responseSnippet?: string; rating: string; comment?: string;
@@ -529,18 +536,20 @@ server.tool(
         }
       }
 
-      // Dedup check against indexed memory
+      // Dedup check against indexed memory — bump salience instead of discarding
       try {
         const store = await getStore();
         const dup = store.checkDuplicate(content, path.relative(VAULT_DIR, targetMemFile));
-        if (dup.isDuplicate) {
+        if (dup.isDuplicate && dup.matchId) {
+          // Reinforce the existing chunk — the fact was mentioned again, so it's important
+          store.bumpChunkSalience(dup.matchId, 0.1);
           store.logExtraction({
             sessionKey: 'mcp', userMessage: content.slice(0, 200),
             toolName: 'memory_write', toolInput: JSON.stringify({ action, section: sec }),
             extractedAt: new Date().toISOString(), status: 'dedup_skipped',
             agentSlug: ACTIVE_AGENT_SLUG ?? undefined,
           });
-          return textResult(`Skipped: ${dup.matchType} duplicate already in memory (chunk #${dup.matchId})`);
+          return textResult(`Reinforced existing memory (chunk #${dup.matchId}, salience bumped). No duplicate written.`);
         }
       } catch { /* dedup failure is non-fatal — proceed with write */ }
 
@@ -724,18 +733,19 @@ server.tool(
       return textResult(`Already exists: ${relPath}`);
     }
 
-    // Dedup check for note content
+    // Dedup check for note content — bump salience instead of discarding
     if (content && content.length >= 20) {
       try {
         const store = await getStore();
         const dup = store.checkDuplicate(content);
-        if (dup.isDuplicate) {
+        if (dup.isDuplicate && dup.matchId) {
+          store.bumpChunkSalience(dup.matchId, 0.1);
           store.logExtraction({
             sessionKey: 'mcp', userMessage: `note_create: ${title}`,
             toolName: 'note_create', toolInput: JSON.stringify({ note_type, title }),
             extractedAt: new Date().toISOString(), status: 'dedup_skipped',
           });
-          return textResult(`Skipped: ${dup.matchType} duplicate content already exists (chunk #${dup.matchId})`);
+          return textResult(`Reinforced existing memory (chunk #${dup.matchId}, salience bumped). No duplicate note created.`);
         }
       } catch { /* dedup failure is non-fatal */ }
     }
@@ -3026,12 +3036,62 @@ server.tool(
     const store = await getStore();
     if (action === 'correct') {
       if (!correction) return textResult('Correction text required when action is "correct".');
+      // correctExtraction now also removes the wrong content from the search index
       store.correctExtraction(id, correction);
-      return textResult(`Extraction #${id} corrected. Updated fact: ${correction}`);
+      return textResult(`Extraction #${id} corrected and removed from search index. Corrected fact: ${correction}`);
     } else {
+      // dismissExtraction now also removes the content from the search index
       store.dismissExtraction(id);
-      return textResult(`Extraction #${id} dismissed.`);
+      return textResult(`Extraction #${id} dismissed and removed from search index.`);
     }
+  },
+);
+
+// ── Memory Consolidation: memory_consolidate ────────────────────────────
+
+server.tool(
+  'memory_consolidate',
+  'Get memory chunks that are candidates for consolidation, or mark chunks as consolidated after synthesis. Use this in weekly memory maintenance.',
+  {
+    action: z.enum(['candidates', 'mark_consolidated']).describe(
+      '"candidates" returns groups of old chunks to consolidate. "mark_consolidated" marks chunks as archived after you\'ve written a summary.'
+    ),
+    min_age_days: z.number().optional().describe('Minimum age in days for consolidation candidates (default: 30)'),
+    chunk_ids: z.array(z.number()).optional().describe('Chunk IDs to mark as consolidated (required for mark_consolidated)'),
+  },
+  async ({ action, min_age_days, chunk_ids }) => {
+    const store = await getStore();
+
+    if (action === 'candidates') {
+      const groups = store.getConsolidationCandidates(min_age_days ?? 30);
+      if (groups.length === 0) {
+        const stats = store.getConsolidationStats();
+        return textResult(`No consolidation candidates found (${stats.totalChunks} total chunks, ${stats.consolidated} already consolidated).`);
+      }
+
+      const report = groups.slice(0, 10).map((g) => {
+        const preview = g.contents.slice(0, 3).map(c => `  - ${c.slice(0, 120)}`).join('\n');
+        return `**${g.topic}** (${g.chunkIds.length} chunks, ${g.totalChars} chars)\n${preview}${g.contents.length > 3 ? `\n  ... and ${g.contents.length - 3} more` : ''}`;
+      }).join('\n\n');
+
+      const stats = store.getConsolidationStats();
+      return textResult(
+        `Found ${groups.length} topic group(s) ready for consolidation.\n` +
+        `Stats: ${stats.totalChunks} total, ${stats.consolidated} consolidated, ${stats.unconsolidated} unconsolidated.\n\n` +
+        `${report}\n\n` +
+        `To consolidate: read the chunks, write a summary note, then call memory_consolidate(action="mark_consolidated", chunk_ids=[...]) with the original chunk IDs.`
+      );
+    }
+
+    if (action === 'mark_consolidated') {
+      if (!chunk_ids || chunk_ids.length === 0) {
+        return textResult('Error: chunk_ids required for mark_consolidated action.');
+      }
+      store.markConsolidated(chunk_ids);
+      return textResult(`Marked ${chunk_ids.length} chunk(s) as consolidated (salience reduced).`);
+    }
+
+    return textResult('Unknown action.');
   },
 );
 
