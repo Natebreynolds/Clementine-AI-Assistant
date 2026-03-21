@@ -729,6 +729,12 @@ async function getMemory(): Promise<Record<string, unknown>> {
       const fileCount = (db.prepare('SELECT COUNT(DISTINCT source_file) as count FROM chunks').get() as { count: number }).count;
       const { size } = statSync(dbPath);
       dbStats = { chunks: chunkCount, files: fileCount, sizeBytes: size };
+      // Consolidation stats (column may not exist on older DBs)
+      try {
+        const consolidated = (db.prepare('SELECT COUNT(*) as count FROM chunks WHERE consolidated = 1').get() as { count: number }).count;
+        (dbStats as Record<string, unknown>).consolidated = consolidated;
+        (dbStats as Record<string, unknown>).unconsolidated = chunkCount - consolidated;
+      } catch { /* consolidated column doesn't exist yet */ }
       db.close();
     } catch { /* ignore */ }
   }
@@ -1131,7 +1137,8 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
         'Core': ['Bash', 'Read', 'Write', 'Edit', 'Glob', 'Grep'],
         'Web': ['WebSearch', 'WebFetch'],
         'Memory': ['memory_read', 'memory_write', 'memory_search', 'memory_recall',
-                    'memory_connections', 'memory_timeline', 'memory_report', 'memory_correct'],
+                    'memory_connections', 'memory_timeline', 'memory_report', 'memory_correct',
+                    'memory_consolidate'],
         'Notes & Tasks': ['note_create', 'note_take', 'daily_note', 'task_list', 'task_add', 'task_update'],
         'Communication': ['outlook_inbox', 'outlook_search', 'outlook_calendar', 'outlook_draft',
                           'outlook_send', 'outlook_read_email', 'discord_channel_send'],
@@ -5777,6 +5784,10 @@ async function refreshMemory() {
         + '<div class="stat-tile"><div class="stat-value">' + esc(d.dbStats.chunks) + '</div><div class="stat-label">DB Chunks</div></div>'
         + '<div class="stat-tile"><div class="stat-value">' + esc(d.dbStats.files) + '</div><div class="stat-label">Indexed Files</div></div>'
         + '<div class="stat-tile"><div class="stat-value">' + esc(Math.round((d.dbStats.sizeBytes||0)/1024) + ' KB') + '</div><div class="stat-label">DB Size</div></div>';
+      if (d.dbStats.consolidated != null) {
+        statsHtml += '<div class="stat-tile"><div class="stat-value">' + esc(d.dbStats.unconsolidated) + '</div><div class="stat-label">Active Chunks</div></div>'
+          + '<div class="stat-tile"><div class="stat-value">' + esc(d.dbStats.consolidated) + '</div><div class="stat-label">Consolidated</div></div>';
+      }
       if (d.graphStats && d.graphStats.available) {
         statsHtml += '<div class="stat-tile"><div class="stat-value">' + esc(d.graphStats.nodes) + '</div><div class="stat-label">Graph Nodes</div></div>'
           + '<div class="stat-tile"><div class="stat-value">' + esc(d.graphStats.edges) + '</div><div class="stat-label">Graph Edges</div></div>';
