@@ -78,6 +78,17 @@ function estimateTokens(text: string): number {
   return Math.ceil(text.length / 4);
 }
 
+/** Format a millisecond duration as a human-friendly "X ago" string. */
+function formatTimeAgo(ms: number): string {
+  const minutes = Math.floor(ms / 60_000);
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.floor(hours / 24);
+  if (days === 1) return 'yesterday';
+  return `${days} days ago`;
+}
+
 /** Minimum tokens needed for the model to generate a useful response. */
 const CONTEXT_GUARD_MIN_TOKENS = 16_000;
 /** Warn threshold — context is getting tight. */
@@ -1170,6 +1181,27 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
       this.restoredSessions.delete(key); // Only inject once per restored session
     }
 
+    // Fresh session with no history — inject last conversation context
+    if (key && !sessionRotated && !this.restoredSessions.has(key)) {
+      const exchanges = this.lastExchanges.get(key) ?? [];
+      if (exchanges.length === 0 && this.memoryStore) {
+        try {
+          const recentSummaries = this.memoryStore.getRecentSummaries(1);
+          if (recentSummaries.length > 0) {
+            const last = recentSummaries[0];
+            const ageMs = Date.now() - new Date(last.createdAt).getTime();
+            if (ageMs < 7 * 24 * 60 * 60 * 1000) { // within 7 days
+              const ago = formatTimeAgo(ageMs);
+              effectivePrompt =
+                `[Last conversation (${ago}):\n${last.summary.slice(0, 600)}]\n\n` +
+                `[You may briefly acknowledge what was discussed if relevant to the current message. ` +
+                `Do NOT force a reference if the user is starting a new topic.]\n\n${effectivePrompt}`;
+            }
+          }
+        } catch { /* non-fatal */ }
+      }
+    }
+
     // Drain any pending context from cron/heartbeat injections so the
     // active SDK session knows about work that happened outside of chat.
     // injectContext uses the base session key (e.g. discord:user:123) but
@@ -1595,7 +1627,13 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
       `UUIDs, task IDs (T-001), URLs, file paths, email addresses, ` +
       `phone numbers, dates, branch names, PR numbers, and any other ` +
       `opaque identifiers. These cannot be reconstructed if lost.\n\n` +
-      `${conversation}\n\nRespond with ONLY the bullet points, no preamble.`;
+      `After the bullet points, add:\n\n` +
+      `## Communication Notes (1-2 bullets, only if notable)\n` +
+      `- Did the user redirect or correct the approach?\n` +
+      `- Did they express format/length preferences?\n` +
+      `- Did they seem frustrated, rushed, or particularly pleased?\n` +
+      `If nothing notable, write "No notable patterns."\n\n` +
+      `${conversation}\n\nRespond with ONLY the bullet points and communication notes, no preamble.`;
 
     try {
       let summaryText = '';
@@ -1625,6 +1663,22 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
           } catch { /* non-fatal */ }
           try {
             this.memoryStore.indexEpisodicChunk(sessionKey, summaryText.trim());
+          } catch { /* non-fatal */ }
+
+          // Auto-log communication notes as feedback for synthesis
+          try {
+            const commMatch = summaryText.match(/## Communication Notes[\s\S]*?\n([\s\S]*?)(?:\n##|$)/i);
+            if (commMatch) {
+              const notes = commMatch[1].trim();
+              if (notes && !notes.toLowerCase().includes('no notable patterns')) {
+                this.memoryStore.logFeedback({
+                  sessionKey,
+                  channel: 'auto-reflection',
+                  rating: 'mixed',
+                  comment: notes,
+                });
+              }
+            }
           } catch { /* non-fatal */ }
         }
         return summaryText.trim();
@@ -2183,13 +2237,15 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
       `**Task:** ${jobPrompt.slice(0, 400)}\n` +
       criteriaBlock +
       `\n**Output produced:** ${deliverable.slice(0, 1200)}\n\n` +
-      `Check three things:\n` +
+      `Check four things:\n` +
       `1. EXISTENCE: Did it produce a real response addressing the task? (not just "nothing to report")\n` +
       `2. SUBSTANCE: Is the output substantive with actual data/analysis? (not vague, not a placeholder, not restating the task)\n` +
       `3. ACTIONABLE: Does it give the owner something useful — information, a decision, a deliverable?\n` +
-      (successCriteria?.length ? `4. CRITERIA: Were the success criteria met?\n` : '') +
+      `4. COMMUNICATION: Is the output well-structured for the reader? Does it lead with the key takeaway, use appropriate formatting, and avoid unnecessary preamble?\n` +
+      (successCriteria?.length ? `5. CRITERIA: Were the success criteria met?\n` : '') +
       `\nRespond with ONLY a JSON object (no markdown):\n` +
-      `{"existence": true/false, "substance": true/false, "actionable": true/false, ` +
+      `{"existence": true/false, "substance": true/false, "actionable": true/false, "communication": true/false, ` +
+      `"comm_note": "one sentence on communication quality, or 'none'", ` +
       `${successCriteria?.length ? '"criteria_met": true/false, ' : ''}` +
       `"quality": 1-5, "gap": "one sentence on what's missing or could improve, or 'none'"}`;
 
@@ -2211,9 +2267,11 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
           existence: reflection.existence ?? false,
           substance: reflection.substance ?? false,
           actionable: reflection.actionable ?? false,
+          communication: reflection.communication ?? false,
           criteriaMet: reflection.criteria_met ?? null,
           quality: reflection.quality ?? 0,
           gap: reflection.gap ?? '',
+          commNote: reflection.comm_note ?? '',
         };
         if (!fs.existsSync(CRON_REFLECTIONS_DIR)) fs.mkdirSync(CRON_REFLECTIONS_DIR, { recursive: true });
         const logFile = path.join(CRON_REFLECTIONS_DIR, `${jobName.replace(/[^a-zA-Z0-9_-]/g, '_')}.jsonl`);
