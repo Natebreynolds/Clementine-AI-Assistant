@@ -1807,7 +1807,12 @@ export async function startDiscord(
 
     try {
       for (const chunk of chunkText(text, 1900)) {
-        await (channel as any).send(chunk);
+        const sentMsg = await (channel as any).send(chunk);
+        trackBotMessage(sentMsg.id, {
+          sessionKey: 'cron:notification',
+          userMessage: '(scheduled notification)',
+          botResponse: chunk.slice(0, 500),
+        });
       }
     } catch (err) {
       // Channel might be stale — clear cache, wait briefly, retry once
@@ -1819,7 +1824,12 @@ export async function startDiscord(
         channel = await user.createDM();
         cachedDmChannel = channel;
         for (const chunk of chunkText(text, 1900)) {
-          await (channel as any).send(chunk);
+          const sentMsg = await (channel as any).send(chunk);
+          trackBotMessage(sentMsg.id, {
+            sessionKey: 'cron:notification',
+            userMessage: '(scheduled notification)',
+            botResponse: chunk.slice(0, 500),
+          });
         }
       } catch (retryErr) {
         logger.error({ err: retryErr }, 'Discord notification retry failed');
@@ -1887,7 +1897,7 @@ async function handlePlanCommand(
         const planPreview = `**Plan:** ${taskDescription.slice(0, 100)}\n\n` +
           steps.map((s, i) => `${i + 1}. **${s.id}** — ${s.description.slice(0, 60)}`).join('\n');
         if ('send' in channel) {
-          await channel.send(planPreview.slice(0, 2000));
+          await sendChunked(channel, planPreview);
         }
 
         // Send approval buttons

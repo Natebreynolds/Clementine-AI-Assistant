@@ -5,7 +5,7 @@
  * and runs them concurrently.
  */
 
-import { existsSync, readFileSync, writeFileSync, unlinkSync, mkdirSync, statSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync, unlinkSync, mkdirSync, statSync, renameSync } from 'node:fs';
 import { execSync } from 'node:child_process';
 import path from 'node:path';
 import * as config from './config.js';
@@ -397,6 +397,34 @@ function startTimerChecker(
   }, TIMER_CHECK_INTERVAL);
 }
 
+// ── Log rotation ─────────────────────────────────────────────────────
+
+const LOG_MAX_BYTES = 2 * 1024 * 1024; // 2 MB
+const LOG_MAX_BACKUPS = 7;
+
+function rotateLogIfNeeded(): void {
+  const logFile = path.join(config.BASE_DIR, 'logs', 'clementine.log');
+  try {
+    if (!existsSync(logFile)) return;
+    const size = statSync(logFile).size;
+    if (size < LOG_MAX_BYTES) return;
+
+    // Rotate: delete .log.7, shift .log.6→.log.7, ... .log→.log.1
+    const oldest = `${logFile}.${LOG_MAX_BACKUPS}`;
+    if (existsSync(oldest)) unlinkSync(oldest);
+
+    for (let i = LOG_MAX_BACKUPS - 1; i >= 1; i--) {
+      const src = `${logFile}.${i}`;
+      if (existsSync(src)) renameSync(src, `${logFile}.${i + 1}`);
+    }
+
+    renameSync(logFile, `${logFile}.1`);
+    writeFileSync(logFile, '');
+  } catch {
+    // Non-fatal — log rotation failure shouldn't prevent startup
+  }
+}
+
 // ── Async main ───────────────────────────────────────────────────────
 
 // ── Restart sentinel ─────────────────────────────────────────────────
@@ -436,6 +464,9 @@ async function drainActiveSessions(
 }
 
 async function asyncMain(): Promise<void> {
+  // ── Rotate log if over size limit ───────────────────────────────
+  rotateLogIfNeeded();
+
   // ── Read restart sentinel (from a previous self-edit / update) ───
   const sentinel = readAndClearSentinel();
   if (sentinel) {

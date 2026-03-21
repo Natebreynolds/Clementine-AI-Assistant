@@ -734,6 +734,11 @@ Delegate data-heavy work (SEO, analytics, bulk API calls for 3+ entities) to sub
         parts.push(`## Communication Preferences\n\n${fbEntry.data.patterns_summary}`);
       }
 
+      // Proactive feedback capture
+      parts.push(`## Feedback Capture
+
+When ${owner} expresses satisfaction ("nice", "perfect", "great job", "thanks") or dissatisfaction ("no", "wrong", "that's not right", "ugh"), call \`feedback_log\` with an appropriate rating ('positive' or 'negative') and a brief comment summarizing the context. This helps me learn from interactions.`);
+
       // Verbose level overrides
       if (verboseLevel === 'quiet') {
         parts.push(`## Verbosity: Quiet\n\nGive results directly. Skip reasoning and progress updates unless asked.`);
@@ -2098,37 +2103,49 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
       const trace: TraceEntry[] = [];
       const stream = query({ prompt, options: sdkOptions });
 
-      for await (const message of stream) {
-        if (message.type === 'assistant') {
-          const blocks = getContentBlocks(message as SDKAssistantMessage);
-          for (const block of blocks) {
-            if (block.type === 'text' && block.text) {
-              trace.push({ type: 'text', timestamp: new Date().toISOString(), content: block.text });
-            } else if (block.type === 'tool_use' && block.name) {
-              logToolUse(block.name, (block.input ?? {}) as Record<string, unknown>);
-              const loopCheck = toolLoopDetector.recordCall(block.name, (block.input ?? {}) as Record<string, unknown>);
-              if (loopCheck.verdict === 'block') {
-                logger.warn({ tool: block.name, ...loopCheck }, 'Tool loop detected — blocking');
+      try {
+        for await (const message of stream) {
+          if (message.type === 'assistant') {
+            const blocks = getContentBlocks(message as SDKAssistantMessage);
+            for (const block of blocks) {
+              if (block.type === 'text' && block.text) {
+                trace.push({ type: 'text', timestamp: new Date().toISOString(), content: block.text });
+              } else if (block.type === 'tool_use' && block.name) {
+                logToolUse(block.name, (block.input ?? {}) as Record<string, unknown>);
+                const loopCheck = toolLoopDetector.recordCall(block.name, (block.input ?? {}) as Record<string, unknown>);
+                if (loopCheck.verdict === 'block') {
+                  logger.warn({ tool: block.name, ...loopCheck }, 'Tool loop detected — blocking');
+                }
+                trace.push({
+                  type: 'tool_call',
+                  timestamp: new Date().toISOString(),
+                  content: `${block.name}(${JSON.stringify(block.input ?? {}).slice(0, 500)})`,
+                });
               }
-              trace.push({
-                type: 'tool_call',
-                timestamp: new Date().toISOString(),
-                content: `${block.name}(${JSON.stringify(block.input ?? {}).slice(0, 500)})`,
-              });
             }
+          } else if (message.type === 'result') {
+            if ('total_cost_usd' in message) {
+              logger.info({
+                job: jobName,
+                cost_usd: (message as any).total_cost_usd,
+                num_turns: (message as any).num_turns,
+                duration_ms: (message as any).duration_ms,
+              }, 'Cron job query completed');
+            }
+          } else if (message.type === 'system' || message.type === 'stream_event') {
+            // Init / streaming messages — no action needed
           }
-        } else if (message.type === 'result') {
-          if ('total_cost_usd' in message) {
-            logger.info({
-              job: jobName,
-              cost_usd: (message as any).total_cost_usd,
-              num_turns: (message as any).num_turns,
-              duration_ms: (message as any).duration_ms,
-            }, 'Cron job query completed');
-          }
-        } else if (message.type === 'system' || message.type === 'stream_event') {
-          // Init / streaming messages — no action needed
         }
+      } catch (streamErr) {
+        // Save partial trace so we know what happened before the crash
+        saveCronTrace(jobName, trace);
+
+        const lastSteps = trace.slice(-5).map(t =>
+          `  [${t.type}] ${t.content.slice(0, 150)}`
+        ).join('\n');
+        throw new Error(
+          `${String(streamErr)}\n\nLast trace before crash:\n${lastSteps || '(no trace captured)'}`,
+        );
       }
 
       // Save execution trace

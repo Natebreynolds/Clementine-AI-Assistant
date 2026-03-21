@@ -155,6 +155,7 @@ export interface CronJobDefinition {
   after?: string;
   agentSlug?: string;              // Agent that owns this cron job (scoped execution)
   successCriteria?: string[];      // Verifiable acceptance criteria for goal-backward reflection
+  alwaysDeliver?: boolean;         // If true, retry once with explicit prompt when response is empty/noise
 }
 
 export interface CronRunEntry {
