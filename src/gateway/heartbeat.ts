@@ -995,14 +995,16 @@ export class CronScheduler {
     this.gateway.setUnleashedCompleteCallback((jobName, result) => {
       this.completedJobs.set(jobName, Date.now());
       if (result && result !== '__NOTHING__') {
-        this.dispatcher.send(`✅ Unleashed task **${jobName}** completed:\n\n${result.slice(0, 1500)}`).catch(() => {});
+        const slug = jobName.includes(':') ? jobName.split(':')[0] : undefined;
+        this.dispatcher.send(`✅ Unleashed task **${jobName}** completed:\n\n${result.slice(0, 1500)}`, { agentSlug: slug }).catch(() => {});
       }
     });
 
     // Wire up phase progress notifications for unleashed tasks
     this.gateway.setPhaseCompleteCallback((jobName, phase, _total, output) => {
       const preview = output.slice(0, 500);
-      this.dispatcher.send(`⏳ **${jobName}** — phase ${phase} complete:\n${preview}`).catch(() => {});
+      const slug = jobName.includes(':') ? jobName.split(':')[0] : undefined;
+      this.dispatcher.send(`⏳ **${jobName}** — phase ${phase} complete:\n${preview}`, { agentSlug: slug }).catch(() => {});
     });
 
     logger.info(`Cron scheduler started with ${this.jobs.length} jobs`);
@@ -1262,8 +1264,8 @@ export class CronScheduler {
             outputPreview: response ? response.slice(0, 200) : undefined,
           };
 
-          if (response && !CronScheduler.isCronNoise(response)) {
-            const result = await this.dispatcher.send(response);
+          if (response && !CronScheduler.isCronNoise(response) && job.mode !== 'unleashed') {
+            const result = await this.dispatcher.send(response, { agentSlug: job.agentSlug });
             if (!result.delivered) {
               entry.deliveryFailed = true;
               entry.deliveryError = Object.values(result.channelErrors).join('; ').slice(0, 300);
@@ -1320,7 +1322,7 @@ export class CronScheduler {
           // Permanent error — stop immediately
           if (errorType === 'permanent') {
             logger.error({ err, job: job.name }, `Cron job '${job.name}' permanent error — not retrying`);
-            await this.dispatcher.send(`${job.name} failed: ${err}`);
+            await this.dispatcher.send(`${job.name} failed: ${err}`, { agentSlug: job.agentSlug });
             return;
           }
 
@@ -1334,7 +1336,7 @@ export class CronScheduler {
             await sleep(backoffMs);
           } else {
             logger.error({ err, job: job.name }, `Cron job '${job.name}' failed after ${attempt} attempt(s)`);
-            await this.dispatcher.send(CronScheduler.formatCronError(job.name, err));
+            await this.dispatcher.send(CronScheduler.formatCronError(job.name, err), { agentSlug: job.agentSlug });
           }
         }
       }

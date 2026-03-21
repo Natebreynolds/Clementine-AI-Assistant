@@ -5,7 +5,7 @@
  * chunking, and sanitization without importing the monolith.
  */
 
-import type { Message } from 'discord.js';
+import { EmbedBuilder, type Message } from 'discord.js';
 
 export const STREAM_EDIT_INTERVAL = 400;
 export const THINKING_INDICATOR = '\u2728 *thinking...*';
@@ -249,5 +249,64 @@ export class DiscordStreamingMessage {
       // Discord rate limit or message deleted — ignore
     }
   }
+}
+
+// ── Cron embed formatting ─────────────────────────────────────────────
+
+const CRON_PREFIX_RE = /^(✅|⏳|❌)\s/;
+
+export type CronEmbedType = 'success' | 'progress' | 'error';
+
+/**
+ * Detect whether a notification message looks like a cron result.
+ * Returns the embed type if so, or null for non-cron messages.
+ */
+export function detectCronType(text: string): CronEmbedType | null {
+  if (text.startsWith('✅')) return 'success';
+  if (text.startsWith('⏳')) return 'progress';
+  if (text.includes('failed:') || text.startsWith('❌')) return 'error';
+  return null;
+}
+
+const EMBED_COLORS: Record<CronEmbedType, number> = {
+  success: 0x2ecc71,  // green
+  progress: 0x3498db, // blue
+  error: 0xe74c3c,    // red
+};
+
+/**
+ * Format a cron notification as a Discord embed.
+ * Returns null if the text doesn't look like a cron message.
+ */
+export function formatCronEmbed(text: string): EmbedBuilder | null {
+  const type = detectCronType(text);
+  if (!type) return null;
+
+  // Extract job name from patterns like "✅ Unleashed task **jobName** completed:"
+  // or "⏳ **jobName** — phase N complete:" or "jobName failed: ..."
+  let title = 'Cron Result';
+  const boldMatch = text.match(/\*\*([^*]+)\*\*/);
+  if (boldMatch) {
+    title = boldMatch[1];
+  } else {
+    // "jobName failed: ..." pattern
+    const failMatch = text.match(/^(.+?)\s+failed:/);
+    if (failMatch) title = failMatch[1];
+  }
+
+  // Strip the emoji prefix and job name prefix for the description body
+  let description = text.replace(CRON_PREFIX_RE, '').trim();
+  // Truncate to Discord embed limit
+  if (description.length > 4096) {
+    description = description.slice(0, 4080) + '\n\n_(truncated)_';
+  }
+
+  const embed = new EmbedBuilder()
+    .setTitle(title)
+    .setDescription(description)
+    .setColor(EMBED_COLORS[type])
+    .setTimestamp();
+
+  return embed;
 }
 

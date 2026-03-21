@@ -7,7 +7,7 @@
  */
 
 import pino from 'pino';
-import type { NotificationSender } from '../types.js';
+import type { NotificationSender, NotificationContext } from '../types.js';
 
 const logger = pino({ name: 'clementine.notifications' });
 
@@ -36,7 +36,7 @@ export class NotificationDispatcher {
     return this.senders.size > 0;
   }
 
-  async send(text: string): Promise<SendResult> {
+  async send(text: string, context?: NotificationContext): Promise<SendResult> {
     if (this.senders.size === 0) {
       logger.warn('No notification senders registered — message dropped');
       return { delivered: false, channelErrors: { _: 'no channels registered' } };
@@ -52,7 +52,7 @@ export class NotificationDispatcher {
 
     for (const [name, sender] of this.senders) {
       try {
-        await sender(capped);
+        await sender(capped, context);
         anySuccess = true;
       } catch (err) {
         const errMsg = String(err).slice(0, 200);

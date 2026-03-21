@@ -252,6 +252,25 @@ export class AgentBotClient {
     return all;
   }
 
+  /**
+   * Send a notification to the owner's DMs on behalf of this agent bot.
+   * Used by BotManager.sendAsAgent() for cron result routing.
+   */
+  async sendNotification(text: string, embed?: EmbedBuilder): Promise<void> {
+    if (this.status !== 'online') throw new Error(`Bot ${this.config.slug} is not online`);
+    const owner = await this.client.users.fetch(this.config.ownerId, { force: true });
+    const dmChannel = await owner.createDM();
+
+    if (embed) {
+      await dmChannel.send({ embeds: [embed] });
+    } else {
+      const { chunkText } = await import('./discord-utils.js');
+      for (const chunk of chunkText(text, 1900)) {
+        await dmChannel.send(chunk);
+      }
+    }
+  }
+
   /** Send a startup status embed to the owner's DMs. */
   private async sendStartupStatus(): Promise<void> {
     if (!this.config.ownerId) return;

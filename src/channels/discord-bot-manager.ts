@@ -12,6 +12,7 @@ import path from 'node:path';
 import pino from 'pino';
 import type { Gateway } from '../gateway/router.js';
 import { AgentBotClient, type AgentBotStatus } from './discord-agent-bot.js';
+import { chunkText, formatCronEmbed } from './discord-utils.js';
 
 const logger = pino({ name: 'clementine.bot-manager' });
 
@@ -193,6 +194,22 @@ export class BotManager {
   /** Check if an agent has a running bot. */
   hasBot(slug: string): boolean {
     return this.bots.has(slug);
+  }
+
+  /**
+   * Send a notification through an agent's bot (DM to owner).
+   * Uses embed formatting for cron-style messages, plain text for others.
+   * Throws if the bot is unavailable — callers should fall back to main bot.
+   */
+  async sendAsAgent(slug: string, text: string): Promise<void> {
+    const bot = this.bots.get(slug);
+    if (!bot) throw new Error(`No bot for agent '${slug}'`);
+
+    const status = bot.getStatus();
+    if (status.status !== 'online') throw new Error(`Bot '${slug}' is ${status.status}`);
+
+    const embed = formatCronEmbed(text);
+    await bot.sendNotification(text, embed ?? undefined);
   }
 
   /**

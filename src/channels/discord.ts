@@ -35,10 +35,12 @@ import {
   sendChunked,
   DiscordStreamingMessage,
   friendlyToolName,
+  formatCronEmbed,
   STREAM_EDIT_INTERVAL,
   THINKING_INDICATOR,
   DISCORD_MSG_LIMIT,
 } from './discord-utils.js';
+import type { NotificationContext } from '../types.js';
 import {
   DISCORD_TOKEN,
   DISCORD_OWNER_ID,
@@ -1790,11 +1792,21 @@ export async function startDiscord(
   // cron/heartbeat notifications don't depend on a fresh API fetch.
   let cachedDmChannel: Message['channel'] | null = null;
 
-  async function discordNotify(text: string): Promise<void> {
-    // Try cached channel first (populated on every owner DM interaction)
+  async function discordNotify(text: string, context?: NotificationContext): Promise<void> {
+    // Route to agent bot if available
+    if (context?.agentSlug && botManager?.hasBot(context.agentSlug)) {
+      try {
+        await botManager.sendAsAgent(context.agentSlug, text);
+        logger.info({ agent: context.agentSlug }, 'Notification sent via agent bot');
+        return;
+      } catch (err) {
+        logger.warn({ err, agent: context.agentSlug }, 'Agent bot send failed — falling back to main bot');
+      }
+    }
+
+    // Main bot: try cached DM channel first
     let channel = cachedDmChannel;
     if (!channel || !('send' in channel)) {
-      // Fallback: fetch from API with force flag
       try {
         const user = await client.users.fetch(DISCORD_OWNER_ID, { force: true });
         channel = await user.createDM();
@@ -1805,15 +1817,36 @@ export async function startDiscord(
       }
     }
 
-    try {
-      for (const chunk of chunkText(text, 1900)) {
-        const sentMsg = await (channel as any).send(chunk);
+    // Send as embed for cron messages, plain text for others
+    const embed = formatCronEmbed(text);
+
+    const sendContent = async (ch: any) => {
+      if (embed) {
+        const sentMsg = await ch.send({ embeds: [embed] });
         trackBotMessage(sentMsg.id, {
           sessionKey: 'cron:notification',
           userMessage: '(scheduled notification)',
-          botResponse: chunk.slice(0, 500),
+          botResponse: text.slice(0, 500),
         });
+      } else {
+        const chunks = chunkText(text, 1900);
+        let sentCount = 0;
+        for (const chunk of chunks) {
+          const sentMsg = await ch.send(chunk);
+          trackBotMessage(sentMsg.id, {
+            sessionKey: 'cron:notification',
+            userMessage: '(scheduled notification)',
+            botResponse: chunk.slice(0, 500),
+          });
+          sentCount++;
+        }
+        return sentCount;
       }
+      return 1;
+    };
+
+    try {
+      await sendContent(channel);
     } catch (err) {
       // Channel might be stale — clear cache, wait briefly, retry once
       cachedDmChannel = null;
@@ -1823,14 +1856,7 @@ export async function startDiscord(
         const user = await client.users.fetch(DISCORD_OWNER_ID, { force: true });
         channel = await user.createDM();
         cachedDmChannel = channel;
-        for (const chunk of chunkText(text, 1900)) {
-          const sentMsg = await (channel as any).send(chunk);
-          trackBotMessage(sentMsg.id, {
-            sessionKey: 'cron:notification',
-            userMessage: '(scheduled notification)',
-            botResponse: chunk.slice(0, 500),
-          });
-        }
+        await sendContent(channel);
       } catch (retryErr) {
         logger.error({ err: retryErr }, 'Discord notification retry failed');
         throw retryErr;
