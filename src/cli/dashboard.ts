@@ -6935,6 +6935,9 @@ async function refreshGraph() {
       if (searchTerm && !n.id.toLowerCase().includes(searchTerm)) return false;
       return true;
     });
+    // Deduplicate nodes by id (API may return the same entity under multiple labels)
+    var seenIds = {};
+    filteredNodes = filteredNodes.filter(function(n) { if (seenIds[n.id]) return false; seenIds[n.id] = true; return true; });
     var nodeIds = new Set(filteredNodes.map(function(n) { return n.id; }));
     var filteredEdges = d.edges.filter(function(e) { return nodeIds.has(e.from) && nodeIds.has(e.to); });
     var colorMap = { Person: '#4a9eff', Project: '#34d399', Topic: '#a78bfa', Agent: '#fb923c', Task: '#fbbf24', Note: '#94a3b8' };
