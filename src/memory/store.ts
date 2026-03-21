@@ -1457,7 +1457,7 @@ export class MemoryStore {
       .prepare(
         `SELECT
            COUNT(*) as total,
-           SUM(CASE WHEN consolidated = 1 THEN 1 ELSE 0 END) as consolidated
+           COALESCE(SUM(CASE WHEN consolidated = 1 THEN 1 ELSE 0 END), 0) as consolidated
          FROM chunks`,
       )
       .get() as { total: number; consolidated: number };
