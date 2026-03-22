@@ -220,6 +220,26 @@ export class MemoryStore {
       CREATE INDEX IF NOT EXISTS idx_feedback_rating ON feedback(rating);
       CREATE INDEX IF NOT EXISTS idx_feedback_created ON feedback(created_at);
     `);
+
+    // Usage log table for token tracking
+    this.conn.exec(`
+      CREATE TABLE IF NOT EXISTS usage_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_key TEXT NOT NULL,
+        source TEXT NOT NULL DEFAULT 'chat',
+        model TEXT NOT NULL,
+        input_tokens INTEGER NOT NULL DEFAULT 0,
+        output_tokens INTEGER NOT NULL DEFAULT 0,
+        cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+        cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+        num_turns INTEGER NOT NULL DEFAULT 0,
+        duration_ms INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_usage_session ON usage_log(session_key);
+      CREATE INDEX IF NOT EXISTS idx_usage_source ON usage_log(source);
+      CREATE INDEX IF NOT EXISTS idx_usage_created ON usage_log(created_at);
+    `);
   }
 
   /**
@@ -1378,6 +1398,115 @@ export class MemoryStore {
       stats.total += row.cnt;
     }
     return stats;
+  }
+
+  // ── Usage Tracking ────────────────────────────────────────────────
+
+  /**
+   * Log token usage from an SDK query result.
+   * Iterates modelUsage record and inserts one row per model.
+   */
+  logUsage(entry: {
+    sessionKey: string;
+    source: string;
+    modelUsage: Record<string, { inputTokens: number; outputTokens: number; cacheReadInputTokens: number; cacheCreationInputTokens: number }>;
+    numTurns: number;
+    durationMs: number;
+  }): void {
+    const stmt = this.conn.prepare(
+      `INSERT INTO usage_log (session_key, source, model, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, num_turns, duration_ms)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    );
+    for (const [model, usage] of Object.entries(entry.modelUsage)) {
+      stmt.run(
+        entry.sessionKey,
+        entry.source,
+        model,
+        usage.inputTokens ?? 0,
+        usage.outputTokens ?? 0,
+        usage.cacheReadInputTokens ?? 0,
+        usage.cacheCreationInputTokens ?? 0,
+        entry.numTurns ?? 0,
+        entry.durationMs ?? 0,
+      );
+    }
+  }
+
+  /**
+   * Get aggregated usage summary, optionally filtered by time.
+   */
+  getUsageSummary(sinceIso?: string): {
+    totalInput: number;
+    totalOutput: number;
+    totalCacheRead: number;
+    totalCacheCreation: number;
+    totalTokens: number;
+    byModel: Array<{ model: string; input: number; output: number; cacheRead: number }>;
+    bySource: Array<{ source: string; input: number; output: number }>;
+    byDay: Array<{ day: string; input: number; output: number }>;
+  } {
+    const where = sinceIso ? `WHERE created_at >= ?` : '';
+    const params = sinceIso ? [sinceIso] : [];
+
+    // Totals
+    const totals = this.conn.prepare(
+      `SELECT COALESCE(SUM(input_tokens), 0) as ti, COALESCE(SUM(output_tokens), 0) as to_,
+              COALESCE(SUM(cache_read_tokens), 0) as tcr, COALESCE(SUM(cache_creation_tokens), 0) as tcc
+       FROM usage_log ${where}`,
+    ).get(...params) as { ti: number; to_: number; tcr: number; tcc: number };
+
+    // By model
+    const byModel = this.conn.prepare(
+      `SELECT model, SUM(input_tokens) as input, SUM(output_tokens) as output, SUM(cache_read_tokens) as cacheRead
+       FROM usage_log ${where} GROUP BY model ORDER BY input DESC`,
+    ).all(...params) as Array<{ model: string; input: number; output: number; cacheRead: number }>;
+
+    // By source
+    const bySource = this.conn.prepare(
+      `SELECT source, SUM(input_tokens) as input, SUM(output_tokens) as output
+       FROM usage_log ${where} GROUP BY source ORDER BY input DESC`,
+    ).all(...params) as Array<{ source: string; input: number; output: number }>;
+
+    // By day (last 7 days)
+    const byDay = this.conn.prepare(
+      `SELECT date(created_at) as day, SUM(input_tokens) as input, SUM(output_tokens) as output
+       FROM usage_log ${where ? where + ' AND' : 'WHERE'} created_at >= date('now', '-7 days')
+       GROUP BY date(created_at) ORDER BY day`,
+    ).all(...params) as Array<{ day: string; input: number; output: number }>;
+
+    return {
+      totalInput: totals.ti,
+      totalOutput: totals.to_,
+      totalCacheRead: totals.tcr,
+      totalCacheCreation: totals.tcc,
+      totalTokens: totals.ti + totals.to_,
+      byModel,
+      bySource,
+      byDay,
+    };
+  }
+
+  /**
+   * Get usage summary for a specific session.
+   */
+  getSessionUsage(sessionKey: string): {
+    totalInput: number;
+    totalOutput: number;
+    totalTokens: number;
+    numQueries: number;
+  } {
+    const row = this.conn.prepare(
+      `SELECT COALESCE(SUM(input_tokens), 0) as ti, COALESCE(SUM(output_tokens), 0) as to_,
+              COUNT(*) as cnt
+       FROM usage_log WHERE session_key = ?`,
+    ).get(sessionKey) as { ti: number; to_: number; cnt: number };
+
+    return {
+      totalInput: row.ti,
+      totalOutput: row.to_,
+      totalTokens: row.ti + row.to_,
+      numQueries: row.cnt,
+    };
   }
 
   // ── Memory Consolidation ──────────────────────────────────────────
