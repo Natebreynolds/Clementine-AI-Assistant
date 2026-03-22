@@ -6,6 +6,7 @@
  * Designed to be called by OS scheduler and exit.
  */
 
+import { execSync } from 'node:child_process';
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -85,7 +86,7 @@ export async function cmdCronList(): Promise<void> {
 export async function cmdCronRun(jobName: string): Promise<void> {
   process.env.CLEMENTINE_HOME = BASE_DIR;
   const jobs = parseCronJobs();
-  const job = jobs.find((j) => j.name === jobName);
+  let job = jobs.find((j) => j.name === jobName);
 
   if (!job) {
     console.error(`Job not found: ${jobName}`);
@@ -95,6 +96,36 @@ export async function cmdCronRun(jobName: string): Promise<void> {
 
   const { gateway } = await initGateway();
   const runLog = new CronRunLog(BASE_DIR);
+
+  // ── Pre-check gate ──
+  if (job.preCheck) {
+    console.log(`Running pre-check for ${job.name}...`);
+    try {
+      const stdout = execSync(job.preCheck, {
+        timeout: 30_000,
+        encoding: 'utf-8',
+        stdio: ['pipe', 'pipe', 'pipe'],
+        cwd: job.workDir || undefined,
+      }).trim();
+      console.log(`Pre-check passed${stdout ? ` (${stdout.split('\n').length} lines of context)` : ''}`);
+      if (stdout.length > 0) {
+        job = { ...job, prompt: `Pre-check data (already fetched — use this, do not re-query):\n\`\`\`\n${stdout.slice(0, 4000)}\n\`\`\`\n\n${job.prompt}` };
+      }
+    } catch (preCheckErr: unknown) {
+      const exitCode = (preCheckErr as { status?: number }).status ?? 1;
+      console.log(`Pre-check exit ${exitCode} — no work to do, skipping job`);
+      runLog.append({
+        jobName: job.name,
+        startedAt: new Date().toISOString(),
+        finishedAt: new Date().toISOString(),
+        status: 'skipped',
+        durationMs: 0,
+        attempt: 0,
+        outputPreview: `Pre-check exit ${exitCode} — no work`,
+      });
+      return;
+    }
+  }
 
   console.log(`Running cron job: ${job.name}`);
   const startedAt = new Date();
@@ -187,9 +218,38 @@ export async function cmdCronRunDue(): Promise<void> {
   // The daemon's CronScheduler handles delivery via NotificationDispatcher.
   // This runner is a fallback for when the daemon is down.
 
-  for (const job of dueJobs) {
+  for (let job of dueJobs) {
     const timeStr = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
     console.log(`[${new Date().toISOString()}] Running due job: ${job.name}`);
+
+    // ── Pre-check gate ──
+    if (job.preCheck) {
+      try {
+        const stdout = execSync(job.preCheck, {
+          timeout: 30_000,
+          encoding: 'utf-8',
+          stdio: ['pipe', 'pipe', 'pipe'],
+          cwd: job.workDir || undefined,
+        }).trim();
+        if (stdout.length > 0) {
+          job = { ...job, prompt: `Pre-check data (already fetched — use this, do not re-query):\n\`\`\`\n${stdout.slice(0, 4000)}\n\`\`\`\n\n${job.prompt}` };
+        }
+      } catch (preCheckErr: unknown) {
+        const exitCode = (preCheckErr as { status?: number }).status ?? 1;
+        console.log(`  Pre-check exit ${exitCode} — skipping ${job.name}`);
+        runLog.append({
+          jobName: job.name,
+          startedAt: new Date().toISOString(),
+          finishedAt: new Date().toISOString(),
+          status: 'skipped',
+          durationMs: 0,
+          attempt: 0,
+          outputPreview: `Pre-check exit ${exitCode} — no work`,
+        });
+        lastRuns[job.name] = now.toISOString();
+        continue;
+      }
+    }
 
     // Determine retry ceiling from error history
     const priorErrors = runLog.consecutiveErrors(job.name);
