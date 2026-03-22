@@ -2199,6 +2199,229 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
     }
   });
 
+  // ── Office API — per-agent command center data ─────────────────────
+
+  app.get('/api/office', async (_req, res) => {
+    try {
+      const gw = await getGateway();
+      const mgr = gw.getAgentManager();
+      const allAgents = mgr.listAll();
+      const { AGENTS_DIR: agDir } = await import('../config.js');
+
+      // ── Bot statuses ──
+      let botStatuses: Record<string, { status: string; botTag?: string; avatarUrl?: string }> = {};
+      try {
+        const p = path.join(BASE_DIR, '.bot-status.json');
+        if (existsSync(p)) botStatuses = JSON.parse(readFileSync(p, 'utf-8'));
+      } catch { /* ignore */ }
+      let slackStatuses: Record<string, { status: string; botUserId?: string }> = {};
+      try {
+        const p = path.join(BASE_DIR, '.slack-bot-status.json');
+        if (existsSync(p)) slackStatuses = JSON.parse(readFileSync(p, 'utf-8'));
+      } catch { /* ignore */ }
+
+      // ── Cron run stats per agent ──
+      const runsDir = path.join(BASE_DIR, 'cron', 'runs');
+      const now = new Date();
+      const localMidnight = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+      const todayIso = localMidnight.toISOString();
+
+      // Map: agentSlug -> { runsToday, totalRuns, successRate, lastRun, jobs[] }
+      type CronAgg = { runsToday: number; totalRuns: number; successes: number; lastRun: string; jobs: Array<{ name: string; runsToday: number; totalRuns: number; successes: number; lastRun: string; schedule?: string }> };
+      const cronByAgent: Record<string, CronAgg> = {};
+      const initCron = (): CronAgg => ({ runsToday: 0, totalRuns: 0, successes: 0, lastRun: '', jobs: [] });
+
+      if (existsSync(runsDir)) {
+        try {
+          const files = readdirSync(runsDir).filter(f => f.endsWith('.jsonl'));
+          for (const file of files) {
+            const jobName = file.replace('.jsonl', '');
+            // Determine agent: "slug:jobName" -> agent slug, else Clementine
+            const colonIdx = jobName.indexOf(':');
+            const agentSlug = colonIdx > 0 ? jobName.substring(0, colonIdx) : '__clementine__';
+            const displayName = colonIdx > 0 ? jobName.substring(colonIdx + 1) : jobName;
+
+            if (!cronByAgent[agentSlug]) cronByAgent[agentSlug] = initCron();
+            const agg = cronByAgent[agentSlug];
+
+            const filePath = path.join(runsDir, file);
+            const lines = readFileSync(filePath, 'utf-8').trim().split('\n').filter(Boolean);
+            let jobRuns = 0, jobSuccesses = 0, jobRunsToday = 0, jobLastRun = '';
+            for (const line of lines) {
+              try {
+                const entry = JSON.parse(line);
+                jobRuns++;
+                agg.totalRuns++;
+                if (entry.status === 'ok') { jobSuccesses++; agg.successes++; }
+                if (entry.startedAt > jobLastRun) jobLastRun = entry.startedAt;
+                if (entry.startedAt > agg.lastRun) agg.lastRun = entry.startedAt;
+                if (entry.startedAt && entry.startedAt >= todayIso) { jobRunsToday++; agg.runsToday++; }
+              } catch { /* skip */ }
+            }
+            agg.jobs.push({ name: displayName, runsToday: jobRunsToday, totalRuns: jobRuns, successes: jobSuccesses, lastRun: jobLastRun });
+          }
+        } catch { /* ignore */ }
+      }
+
+      // ── Cron job definitions (schedules) ──
+      // Clementine's CRON.md
+      const scheduleMap: Record<string, string> = {};
+      if (existsSync(CRON_FILE)) {
+        try {
+          const parsed = matter(readFileSync(CRON_FILE, 'utf-8'));
+          for (const j of (parsed.data.jobs ?? []) as Array<{ name?: string; schedule?: string }>) {
+            if (j.name && j.schedule) scheduleMap[j.name] = j.schedule;
+          }
+        } catch { /* ignore */ }
+      }
+      // Agent CRON.md files
+      if (existsSync(agDir)) {
+        try {
+          const dirs = readdirSync(agDir, { withFileTypes: true }).filter(d => d.isDirectory()).map(d => d.name);
+          for (const slug of dirs) {
+            const cf = path.join(agDir, slug, 'CRON.md');
+            if (!existsSync(cf)) continue;
+            try {
+              const parsed = matter(readFileSync(cf, 'utf-8'));
+              for (const j of (parsed.data.jobs ?? []) as Array<{ name?: string; schedule?: string }>) {
+                if (j.name && j.schedule) scheduleMap[`${slug}:${j.name}`] = j.schedule;
+              }
+            } catch { /* ignore */ }
+          }
+        } catch { /* ignore */ }
+      }
+      // Attach schedules to cron job entries
+      for (const [agSlug, agg] of Object.entries(cronByAgent)) {
+        for (const job of agg.jobs) {
+          const key = agSlug === '__clementine__' ? job.name : `${agSlug}:${job.name}`;
+          if (scheduleMap[key]) job.schedule = scheduleMap[key];
+        }
+      }
+
+      // ── Sessions per agent ──
+      const sessions = getSessions();
+      type SessAgg = { active: number; totalExchanges: number };
+      const sessByAgent: Record<string, SessAgg> = {};
+      const agentSlugs = new Set(allAgents.map(a => a.slug));
+
+      for (const [key, sess] of Object.entries(sessions)) {
+        const s = sess as Record<string, unknown>;
+        let slug = '__clementine__';
+        // Match agent-scoped session keys
+        for (const as of agentSlugs) {
+          if (key.startsWith(`discord:agent:${as}:`) || key.startsWith(`cron:${as}:`) || key.startsWith(`agent:${as}:`)) {
+            slug = as;
+            break;
+          }
+        }
+        if (!sessByAgent[slug]) sessByAgent[slug] = { active: 0, totalExchanges: 0 };
+        sessByAgent[slug].active++;
+        sessByAgent[slug].totalExchanges += Number(s.exchanges ?? 0);
+      }
+
+      // ── Token usage per agent ──
+      type TokenAgg = { input: number; output: number };
+      const tokensByAgent: Record<string, TokenAgg> = {};
+      if (existsSync(MEMORY_DB_PATH)) {
+        try {
+          const Database = (await import('better-sqlite3')).default;
+          const db = new Database(MEMORY_DB_PATH, { readonly: true });
+          const tableExists = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='usage_log'").get();
+          if (tableExists) {
+            // Per-agent usage (session_key patterns like "cron:slug:*" or "agent:slug:*")
+            for (const as of agentSlugs) {
+              const row = db.prepare(
+                `SELECT COALESCE(SUM(input_tokens), 0) as ti, COALESCE(SUM(output_tokens), 0) as to_
+                 FROM usage_log WHERE session_key LIKE ? OR session_key LIKE ? OR session_key LIKE ?`,
+              ).get(`cron:${as}:%`, `agent:${as}:%`, `discord:agent:${as}:%`) as { ti: number; to_: number };
+              if (row.ti > 0 || row.to_ > 0) tokensByAgent[as] = { input: row.ti, output: row.to_ };
+            }
+            // Clementine = everything minus agent-scoped
+            const agentPrefixes = [...agentSlugs].flatMap(s => [`cron:${s}:%`, `agent:${s}:%`, `discord:agent:${s}:%`]);
+            let whereNot = '';
+            const params: string[] = [];
+            if (agentPrefixes.length > 0) {
+              whereNot = ' WHERE ' + agentPrefixes.map(() => 'session_key NOT LIKE ?').join(' AND ');
+              params.push(...agentPrefixes);
+            }
+            const clemRow = db.prepare(
+              `SELECT COALESCE(SUM(input_tokens), 0) as ti, COALESCE(SUM(output_tokens), 0) as to_ FROM usage_log${whereNot}`,
+            ).get(...params) as { ti: number; to_: number };
+            tokensByAgent['__clementine__'] = { input: clemRow.ti, output: clemRow.to_ };
+          }
+          db.close();
+        } catch { /* ignore */ }
+      }
+
+      // ── Status / uptime ──
+      const status = getStatus();
+
+      // ── Build Clementine response ──
+      const clemCron = cronByAgent['__clementine__'] || initCron();
+      const clemSess = sessByAgent['__clementine__'] || { active: 0, totalExchanges: 0 };
+      const clemTokens = tokensByAgent['__clementine__'] || { input: 0, output: 0 };
+
+      const clementineData = {
+        name: status.name,
+        status: status.alive ? 'online' : 'offline',
+        uptime: status.uptime || '',
+        currentActivity: status.currentActivity || 'Idle',
+        channels: status.channels || [],
+        sessions: clemSess,
+        crons: {
+          total: clemCron.jobs.length,
+          runsToday: clemCron.runsToday,
+          successRate: clemCron.totalRuns > 0 ? Math.round((clemCron.successes / clemCron.totalRuns) * 100) : 100,
+          jobs: clemCron.jobs,
+        },
+        tokens: clemTokens,
+      };
+
+      // ── Build agents response ──
+      const agentsData = allAgents.map(a => {
+        const aCron = cronByAgent[a.slug] || initCron();
+        const aSess = sessByAgent[a.slug] || { active: 0, totalExchanges: 0 };
+        const aTokens = tokensByAgent[a.slug] || { input: 0, output: 0 };
+
+        const platforms: string[] = [];
+        if (a.discordToken) platforms.push('discord');
+        if (a.slackBotToken && a.slackAppToken) platforms.push('slack');
+
+        return {
+          slug: a.slug,
+          name: a.name,
+          description: a.description,
+          avatar: a.avatar ?? null,
+          model: a.model ?? null,
+          project: a.project ?? null,
+          agentDir: a.agentDir ?? null,
+          channelName: a.team?.channelName ?? null,
+          canMessage: a.team?.canMessage ?? [],
+          allowedTools: a.team?.allowedTools ?? null,
+          botStatus: botStatuses[a.slug]?.status ?? null,
+          botTag: botStatuses[a.slug]?.botTag ?? null,
+          botAvatarUrl: botStatuses[a.slug]?.avatarUrl ?? null,
+          slackBotStatus: slackStatuses[a.slug]?.status ?? null,
+          hasDiscordToken: Boolean(a.discordToken),
+          hasSlackToken: Boolean(a.slackBotToken && a.slackAppToken),
+          platforms,
+          sessions: aSess,
+          crons: {
+            total: aCron.jobs.length,
+            runsToday: aCron.runsToday,
+            successRate: aCron.totalRuns > 0 ? Math.round((aCron.successes / aCron.totalRuns) * 100) : 100,
+            jobs: aCron.jobs,
+          },
+          tokens: aTokens,
+        };
+      });
+
+      res.json({ clementine: clementineData, agents: agentsData });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
   app.post('/api/agents', async (req, res) => {
     try {
       const gw = await getGateway();
@@ -3702,6 +3925,183 @@ function getDashboardHTML(token: string): string {
     font-weight: 600;
   }
 
+  /* ── Office Hero — Clementine ─────────── */
+  .office-hero {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-image: linear-gradient(135deg, var(--clementine), #ff6b00, var(--yellow)) 1;
+    border-radius: var(--radius);
+    padding: 24px 28px;
+    margin-bottom: 20px;
+    display: flex;
+    align-items: center;
+    gap: 24px;
+  }
+  .office-hero-left {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    flex-shrink: 0;
+  }
+  .office-hero-avatar {
+    width: 64px;
+    height: 64px;
+    border-radius: 50%;
+    background: linear-gradient(135deg, var(--clementine), #ff6b00);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 28px;
+    font-weight: 800;
+    color: #fff;
+    flex-shrink: 0;
+  }
+  .office-hero-avatar.online {
+    box-shadow: 0 0 0 3px var(--bg-card), 0 0 0 5px var(--green);
+  }
+  .office-hero-info {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+  .office-hero-name {
+    font-size: 22px;
+    font-weight: 700;
+    color: var(--text-primary);
+  }
+  .office-hero-meta {
+    font-size: 12px;
+    color: var(--text-muted);
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  .office-hero-meta .status-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 2px 8px;
+    border-radius: 12px;
+    font-size: 11px;
+    font-weight: 600;
+  }
+  .office-hero-meta .status-pill.online {
+    background: rgba(46,160,67,0.12);
+    color: var(--green);
+  }
+  .office-hero-meta .status-pill.offline {
+    background: rgba(125,133,144,0.12);
+    color: var(--text-muted);
+  }
+  .office-hero-meta .status-pill .dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: currentColor;
+  }
+  .office-hero-stats {
+    display: flex;
+    gap: 12px;
+    margin-left: auto;
+    flex-wrap: wrap;
+  }
+  .office-hero-stat {
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 10px 16px;
+    text-align: center;
+    min-width: 90px;
+  }
+  .office-hero-stat .stat-val {
+    font-size: 20px;
+    font-weight: 700;
+    color: var(--text-primary);
+  }
+  .office-hero-stat .stat-lbl {
+    font-size: 10px;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    margin-top: 2px;
+  }
+
+  /* ── Desk Stats Strip ─────────────────── */
+  .desk-stats-strip {
+    display: flex;
+    justify-content: center;
+    gap: 12px;
+    padding: 8px 12px;
+    border-top: 1px solid var(--border);
+    background: var(--bg-secondary);
+    font-size: 11px;
+    color: var(--text-secondary);
+  }
+  .desk-stats-strip .dss-item {
+    display: flex;
+    align-items: center;
+    gap: 3px;
+    white-space: nowrap;
+  }
+  .desk-stats-strip .dss-icon {
+    font-size: 12px;
+    opacity: 0.7;
+  }
+  .desk-stats-strip .dss-val {
+    font-weight: 700;
+    color: var(--text-primary);
+  }
+
+  /* ── Desk Cron Details ────────────────── */
+  .desk-cron-details {
+    border-top: 1px solid var(--border);
+    font-size: 12px;
+  }
+  .desk-cron-details summary {
+    padding: 6px 12px;
+    cursor: pointer;
+    color: var(--text-muted);
+    font-size: 11px;
+    font-weight: 600;
+    user-select: none;
+  }
+  .desk-cron-details summary:hover {
+    color: var(--text-primary);
+  }
+  .desk-cron-job {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 5px 12px;
+    border-top: 1px solid var(--border);
+  }
+  .desk-cron-job .cron-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    flex-shrink: 0;
+  }
+  .desk-cron-job .cron-dot.ok { background: var(--green); }
+  .desk-cron-job .cron-dot.fail { background: var(--red); }
+  .desk-cron-job .cron-dot.none { background: var(--text-muted); opacity: 0.4; }
+  .desk-cron-job .cron-name {
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--text-primary);
+  }
+  .desk-cron-job .cron-schedule {
+    color: var(--text-muted);
+    font-size: 10px;
+    font-family: monospace;
+  }
+  .desk-cron-job .cron-last {
+    color: var(--text-muted);
+    font-size: 10px;
+    white-space: nowrap;
+  }
+
   .agent-info { flex: 1; }
   .agent-name {
     font-size: 26px;
@@ -4329,20 +4729,23 @@ function getDashboardHTML(token: string): string {
           <button class="btn btn-sm" onclick="showAgentCreateModal()" style="color:var(--text-muted)">Manual Setup</button>
         </div>
       </div>
-      <div class="summary-grid" id="team-summary-cards"></div>
+      <div id="office-hero-section"></div>
       <div class="office-floor" id="team-agent-grid">
         <div class="empty-state">No agents configured</div>
       </div>
-      <div class="grid-2" style="margin-top:16px">
-        <div class="card">
-          <div class="card-header">Communication Topology</div>
-          <div class="card-body" id="team-topology"><div class="empty-state">No agents</div></div>
+      <details style="margin-top:16px" id="team-comms-section">
+        <summary style="cursor:pointer;font-weight:600;color:var(--text-secondary);font-size:13px;padding:8px 0;user-select:none">Communication Topology & Messages</summary>
+        <div class="grid-2" style="margin-top:8px">
+          <div class="card">
+            <div class="card-header">Communication Topology</div>
+            <div class="card-body" id="team-topology"><div class="empty-state">No agents</div></div>
+          </div>
+          <div class="card">
+            <div class="card-header">Inter-Agent Messages</div>
+            <div class="card-body" id="team-messages-log"><div class="empty-state">No messages yet</div></div>
+          </div>
         </div>
-        <div class="card">
-          <div class="card-header">Inter-Agent Messages</div>
-          <div class="card-body" id="team-messages-log"><div class="empty-state">No messages yet</div></div>
-        </div>
-      </div>
+      </details>
     </div>
 
     <!-- Agent Create/Edit Modal -->
@@ -6664,53 +7067,78 @@ function refreshAll() {
 }
 
 // ── Team ──────────────────────────────────
+
+function fmtTokens(n) {
+  if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M';
+  if (n >= 1000) return (n / 1000).toFixed(1) + 'k';
+  return String(n);
+}
+
+function fmtTimeAgo(iso) {
+  if (!iso) return '';
+  var diff = Date.now() - new Date(iso).getTime();
+  if (diff < 60000) return 'just now';
+  if (diff < 3600000) return Math.floor(diff / 60000) + 'm ago';
+  if (diff < 86400000) return Math.floor(diff / 3600000) + 'h ago';
+  return Math.floor(diff / 86400000) + 'd ago';
+}
+
 async function refreshTeam() {
   try {
-    const [agentsRes, messagesRes, topoRes] = await Promise.all([
-      apiFetch('/api/team/agents'),
-      apiFetch('/api/team/messages?limit=50'),
-      apiFetch('/api/team/topology'),
-    ]);
-    const agents = await agentsRes.json();
-    const messages = await messagesRes.json();
-    const topology = await topoRes.json();
+    var officeRes = await apiFetch('/api/office');
+    var data = await officeRes.json();
+    var clem = data.clementine || {};
+    var agents = data.agents || [];
 
     // Update nav badge
     var badge = document.getElementById('nav-team-count');
     if (badge) badge.textContent = agents.length || '0';
 
-    // Fetch full agent details (with bot status)
-    var allRes = await apiFetch('/api/agents');
-    var allAgents = await allRes.json();
-
     // Auto-restart on roster change
-    var currentSlugs = allAgents.map(function(a) { return a.slug; }).sort().join(',');
+    var currentSlugs = agents.map(function(a) { return a.slug; }).sort().join(',');
     if (prevAgentSlugs !== null && currentSlugs !== prevAgentSlugs) {
       toast('Team roster changed — restarting...', 'success');
       apiFetch('/api/restart', { method: 'POST' });
     }
     prevAgentSlugs = currentSlugs;
 
-    // Summary cards
-    var summaryEl = document.getElementById('team-summary-cards');
-    if (summaryEl) {
-      var onlineCount = allAgents.filter(function(a) { return a.botStatus === 'online' || a.slackBotStatus === 'online'; }).length;
-      summaryEl.innerHTML =
-        '<div class="stat-card"><div class="stat-value">' + agents.length + '</div><div class="stat-label">Agents</div></div>' +
-        '<div class="stat-card"><div class="stat-value">' + onlineCount + '/' + agents.length + '</div><div class="stat-label">Online</div></div>' +
-        '<div class="stat-card"><div class="stat-value">' + (topology.edges || []).length + '</div><div class="stat-label">Connections</div></div>' +
-        '<div class="stat-card"><div class="stat-value">' + messages.length + '</div><div class="stat-label">Recent Messages</div></div>';
+    // ── Clementine Hero Section ──
+    var heroEl = document.getElementById('office-hero-section');
+    if (heroEl) {
+      var isOnline = clem.status === 'online';
+      var statusPill = '<span class="status-pill ' + (isOnline ? 'online' : 'offline') + '">' +
+        '<span class="dot"></span>' + (isOnline ? 'Online' : 'Offline') + '</span>';
+      var uptimeStr = clem.uptime ? '<span>Uptime: ' + clem.uptime + '</span>' : '';
+      var activityStr = clem.currentActivity && clem.currentActivity !== 'Idle'
+        ? '<span>' + clem.currentActivity + '</span>' : '';
+      var clemTokenTotal = (clem.tokens ? clem.tokens.input + clem.tokens.output : 0);
+
+      heroEl.innerHTML =
+        '<div class="office-hero">' +
+          '<div class="office-hero-left">' +
+            '<div class="office-hero-avatar' + (isOnline ? ' online' : '') + '">C</div>' +
+            '<div class="office-hero-info">' +
+              '<div class="office-hero-name">' + (clem.name || 'Clementine') + '</div>' +
+              '<div class="office-hero-meta">' + statusPill + uptimeStr + activityStr + '</div>' +
+            '</div>' +
+          '</div>' +
+          '<div class="office-hero-stats">' +
+            '<div class="office-hero-stat"><div class="stat-val">' + (clem.sessions ? clem.sessions.active : 0) + '</div><div class="stat-lbl">Sessions</div></div>' +
+            '<div class="office-hero-stat"><div class="stat-val">' + (clem.crons ? clem.crons.runsToday : 0) + '</div><div class="stat-lbl">Runs Today</div></div>' +
+            '<div class="office-hero-stat"><div class="stat-val">' + fmtTokens(clemTokenTotal) + '</div><div class="stat-lbl">Tokens</div></div>' +
+            '<div class="office-hero-stat"><div class="stat-val">' + (clem.crons ? clem.crons.total : 0) + '</div><div class="stat-lbl">Cron Jobs</div></div>' +
+          '</div>' +
+        '</div>';
     }
 
-    // Agent grid — desk station cards
+    // ── Agent desk cards ──
     var grid = document.getElementById('team-agent-grid');
     if (grid) {
-      if (allAgents.length === 0) {
+      if (agents.length === 0) {
         grid.innerHTML = '<div class="desk-station desk-hire" onclick="startHiringInterview()">' +
           '<div class="desk-hire-inner"><div class="hire-icon">+</div><div class="hire-label">Hire a New Employee</div></div></div>';
       } else {
-        var cards = allAgents.map(function(a) {
-          // Determine status class (online if either platform is online)
+        var cards = agents.map(function(a) {
           var statusClass = 'status-offline';
           var statusLabel = 'Offline';
           var anyOnline = a.botStatus === 'online' || a.slackBotStatus === 'online';
@@ -6724,7 +7152,6 @@ async function refreshTeam() {
             ? (Array.isArray(a.channelName) ? a.channelName.map(function(c) { return '#' + c; }).join(', ') : '#' + a.channelName)
             : 'no desk';
 
-          // Avatar: use manual URL, then Discord bot avatar, then initial
           var avatarSrc = a.avatar || a.botAvatarUrl;
           var avatarContent = avatarSrc
             ? '<img src="' + avatarSrc + '" onerror="this.style.display=\\'none\\';this.parentElement.textContent=\\'' + a.name.charAt(0).toUpperCase() + '\\';">'
@@ -6735,8 +7162,6 @@ async function refreshTeam() {
           if (a.model) badges.push('<span class="badge">' + a.model + '</span>');
           if (a.project) badges.push('<span class="badge" style="background:var(--purple);color:#fff">' + a.project + '</span>');
           if (a.allowedTools) badges.push('<span class="badge" style="background:var(--yellow);color:#000">' + a.allowedTools.length + ' tools</span>');
-
-          // Platform indicators
           if (a.hasDiscordToken) {
             var discordColor = a.botStatus === 'online' ? 'var(--green)' : 'var(--text-muted)';
             badges.push('<span class="badge" style="background:rgba(88,101,242,0.15);color:' + discordColor + ';font-size:10px">Discord</span>');
@@ -6751,6 +7176,33 @@ async function refreshTeam() {
             ? '<button class="btn btn-sm" onclick="event.stopPropagation();editAgent(\\'' + a.slug + '\\')">Edit</button>' +
               '<button class="btn btn-sm" onclick="event.stopPropagation();deleteAgent(\\'' + a.slug + '\\')" style="color:var(--red)">Let Go</button>'
             : '';
+
+          // Stats strip
+          var aTokenTotal = a.tokens ? a.tokens.input + a.tokens.output : 0;
+          var statsStrip =
+            '<div class="desk-stats-strip">' +
+              '<span class="dss-item"><span class="dss-icon">&#9654;</span> <span class="dss-val">' + (a.crons ? a.crons.runsToday : 0) + '</span> runs</span>' +
+              '<span class="dss-item"><span class="dss-icon">&#128172;</span> <span class="dss-val">' + (a.sessions ? a.sessions.active : 0) + '</span> sess</span>' +
+              '<span class="dss-item"><span class="dss-icon">&#9677;</span> <span class="dss-val">' + fmtTokens(aTokenTotal) + '</span> tok</span>' +
+            '</div>';
+
+          // Cron details (expandable)
+          var cronDetails = '';
+          if (a.crons && a.crons.jobs && a.crons.jobs.length > 0) {
+            var cronRows = a.crons.jobs.map(function(j) {
+              var dotClass = j.totalRuns === 0 ? 'none' : (j.successes === j.totalRuns ? 'ok' : 'fail');
+              return '<div class="desk-cron-job">' +
+                '<span class="cron-dot ' + dotClass + '"></span>' +
+                '<span class="cron-name">' + j.name + '</span>' +
+                (j.schedule ? '<span class="cron-schedule">' + j.schedule + '</span>' : '') +
+                '<span class="cron-last">' + fmtTimeAgo(j.lastRun) + '</span>' +
+              '</div>';
+            }).join('');
+            cronDetails = '<details class="desk-cron-details">' +
+              '<summary>' + a.crons.jobs.length + ' cron job' + (a.crons.jobs.length === 1 ? '' : 's') + '</summary>' +
+              cronRows +
+            '</details>';
+          }
 
           return '<div class="desk-station ' + statusClass + '">' +
             '<div class="desk-surface">' +
@@ -6772,6 +7224,8 @@ async function refreshTeam() {
               (badges.length ? '<div class="desk-badges">' + badges.join('') + '</div>' : '') +
               (actions ? '<div class="desk-actions">' + actions + '</div>' : '') +
             '</div>' +
+            statsStrip +
+            cronDetails +
           '</div>';
         });
 
@@ -6785,44 +7239,53 @@ async function refreshTeam() {
       }
     }
 
-    // Topology
-    var topoEl = document.getElementById('team-topology');
-    if (topoEl) {
-      var nodes = topology.nodes || [];
-      var edges = topology.edges || [];
-      if (nodes.length === 0) {
-        topoEl.innerHTML = '<div class="empty-state">No agents</div>';
-      } else {
-        var lines = nodes.map(function(n) {
-          var outgoing = edges.filter(function(e) { return e.from === n.slug; }).map(function(e) { return e.to; });
-          var incoming = edges.filter(function(e) { return e.to === n.slug; }).map(function(e) { return e.from; });
-          return '<div style="padding:8px 12px;border-bottom:1px solid var(--border)">' +
-            '<strong>' + n.name + '</strong>' +
-            '<div style="font-size:11px;color:var(--text-muted);margin-top:2px">' +
-            (outgoing.length > 0 ? '&rarr; ' + outgoing.join(', ') : '<span style="opacity:0.5">no outgoing</span>') +
-            ' &middot; ' +
-            (incoming.length > 0 ? '&larr; ' + incoming.join(', ') : '<span style="opacity:0.5">no incoming</span>') +
-            '</div></div>';
-        });
-        topoEl.innerHTML = lines.join('');
-      }
-    }
+    // ── Communication (loaded on demand when details is open) ──
+    var commsSection = document.getElementById('team-comms-section');
+    if (commsSection && commsSection.open) {
+      var [topoRes, messagesRes] = await Promise.all([
+        apiFetch('/api/team/topology'),
+        apiFetch('/api/team/messages?limit=50'),
+      ]);
+      var topology = await topoRes.json();
+      var messages = await messagesRes.json();
 
-    // Messages log
-    var msgLog = document.getElementById('team-messages-log');
-    if (msgLog) {
-      if (messages.length === 0) {
-        msgLog.innerHTML = '<div class="empty-state">No inter-agent messages yet</div>';
-      } else {
-        msgLog.innerHTML = messages.map(function(m) {
-          var time = m.timestamp ? new Date(m.timestamp).toLocaleTimeString() : '';
-          return '<div style="padding:8px 12px;border-bottom:1px solid var(--border);font-size:13px">' +
-            '<span style="color:var(--text-muted);font-size:11px">' + time + '</span> ' +
-            '<strong>' + m.fromAgent + '</strong> &rarr; <strong>' + m.toAgent + '</strong>' +
-            (m.depth > 0 ? ' <span style="font-size:10px;color:var(--text-muted)">(depth ' + m.depth + ')</span>' : '') +
-            '<div style="margin-top:2px;color:var(--text-secondary)">' + (m.content || '').substring(0, 200) + '</div>' +
-            '</div>';
-        }).join('');
+      var topoEl = document.getElementById('team-topology');
+      if (topoEl) {
+        var nodes = topology.nodes || [];
+        var edges = topology.edges || [];
+        if (nodes.length === 0) {
+          topoEl.innerHTML = '<div class="empty-state">No agents</div>';
+        } else {
+          var lines = nodes.map(function(n) {
+            var outgoing = edges.filter(function(e) { return e.from === n.slug; }).map(function(e) { return e.to; });
+            var incoming = edges.filter(function(e) { return e.to === n.slug; }).map(function(e) { return e.from; });
+            return '<div style="padding:8px 12px;border-bottom:1px solid var(--border)">' +
+              '<strong>' + n.name + '</strong>' +
+              '<div style="font-size:11px;color:var(--text-muted);margin-top:2px">' +
+              (outgoing.length > 0 ? '&rarr; ' + outgoing.join(', ') : '<span style="opacity:0.5">no outgoing</span>') +
+              ' &middot; ' +
+              (incoming.length > 0 ? '&larr; ' + incoming.join(', ') : '<span style="opacity:0.5">no incoming</span>') +
+              '</div></div>';
+          });
+          topoEl.innerHTML = lines.join('');
+        }
+      }
+
+      var msgLog = document.getElementById('team-messages-log');
+      if (msgLog) {
+        if (messages.length === 0) {
+          msgLog.innerHTML = '<div class="empty-state">No inter-agent messages yet</div>';
+        } else {
+          msgLog.innerHTML = messages.map(function(m) {
+            var time = m.timestamp ? new Date(m.timestamp).toLocaleTimeString() : '';
+            return '<div style="padding:8px 12px;border-bottom:1px solid var(--border);font-size:13px">' +
+              '<span style="color:var(--text-muted);font-size:11px">' + time + '</span> ' +
+              '<strong>' + m.fromAgent + '</strong> &rarr; <strong>' + m.toAgent + '</strong>' +
+              (m.depth > 0 ? ' <span style="font-size:10px;color:var(--text-muted)">(depth ' + m.depth + ')</span>' : '') +
+              '<div style="margin-top:2px;color:var(--text-secondary)">' + (m.content || '').substring(0, 200) + '</div>' +
+              '</div>';
+          }).join('');
+        }
       }
     }
   } catch(e) {
