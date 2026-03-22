@@ -357,8 +357,11 @@ function computeMetrics(): Record<string, unknown> {
   let totalDurationMs = 0;
   let runsToday = 0;
   let runsThisWeek = 0;
-  const todayStr = new Date().toISOString().slice(0, 10);
-  const weekAgo = new Date(Date.now() - 7 * 86400000).toISOString();
+  // Use local midnight boundaries so runs at e.g. 9 PM PDT (next day in UTC) still count as "today"
+  const now = new Date();
+  const localMidnight = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const todayStartIso = localMidnight.toISOString();
+  const weekAgo = new Date(localMidnight.getTime() - 7 * 86400000).toISOString();
   const jobStats: Array<{ name: string; runs: number; successes: number; avgDurationMs: number; lastRun: string }> = [];
 
   if (existsSync(runsDir)) {
@@ -380,7 +383,7 @@ function computeMetrics(): Record<string, unknown> {
             else if (entry.status === 'error') { errorRuns++; }
             if (entry.durationMs) { totalDurationMs += entry.durationMs; jobDurationMs += entry.durationMs; }
             if (entry.startedAt > lastRun) lastRun = entry.startedAt;
-            if (entry.startedAt && entry.startedAt.startsWith(todayStr)) runsToday++;
+            if (entry.startedAt && entry.startedAt >= todayStartIso) runsToday++;
             if (entry.startedAt && entry.startedAt >= weekAgo) runsThisWeek++;
           } catch { /* skip bad lines */ }
         }
@@ -540,7 +543,9 @@ function getStatus(): Record<string, unknown> {
 
   // Scan cron runs for in-progress jobs + today's count
   const runsDir = path.join(BASE_DIR, 'cron', 'runs');
-  const todayPrefix = new Date().toISOString().slice(0, 10);
+  const statusNow = new Date();
+  const localMidnightStatus = new Date(statusNow.getFullYear(), statusNow.getMonth(), statusNow.getDate());
+  const todayStartIsoStatus = localMidnightStatus.toISOString();
   if (existsSync(runsDir)) {
     try {
       const runFiles = readdirSync(runsDir).filter(f => f.endsWith('.jsonl'));
@@ -550,7 +555,7 @@ function getStatus(): Record<string, unknown> {
         for (const line of lines) {
           try {
             const entry = JSON.parse(line);
-            if (entry.startedAt && entry.startedAt.startsWith(todayPrefix)) runsToday++;
+            if (entry.startedAt && entry.startedAt >= todayStartIsoStatus) runsToday++;
           } catch { /* skip */ }
         }
         // Check last line for running job
