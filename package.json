@@ -18,7 +18,7 @@
     "postinstall": "npm rebuild better-sqlite3 --quiet 2>/dev/null || true"
   },
   "dependencies": {
-    "@anthropic-ai/claude-code": "^1.0.128",
+    "@anthropic-ai/claude-agent-sdk": "^0.2.81",
     "@anthropic-ai/sdk": "^0.78.0",
     "@inquirer/prompts": "^7.0.0",
     "@modelcontextprotocol/sdk": "^1.12.0",
@@ -33,7 +33,7 @@
     "node-cron": "^3.0.3",
     "pino": "^9.6.0",
     "twilio": "^5.5.0",
-    "zod": "^3.24.0"
+    "zod": "^4.3.6"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.13",
