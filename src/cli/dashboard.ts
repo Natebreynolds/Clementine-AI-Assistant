@@ -4344,7 +4344,8 @@ function getDashboardHTML(token: string): string {
         </select>
         <button class="btn" onclick="refreshGraph()" style="font-size:14px">Refresh</button>
       </div>
-      <div id="graph-canvas" style="height:500px;border:1px solid var(--border);border-radius:8px;background:var(--bg-input);position:relative"></div>
+      <div id="graph-canvas" style="height:500px;border:1px solid var(--border);border-radius:8px;background:#1e1e2e;position:relative"></div>
+      <div id="graph-legend" style="display:flex;gap:16px;margin-top:8px;flex-wrap:wrap"></div>
       <div id="graph-detail-panel" style="margin-top:12px"></div>
     </div>
 
@@ -6941,11 +6942,19 @@ async function refreshGraph() {
     var nodeIds = new Set(filteredNodes.map(function(n) { return n.id; }));
     var filteredEdges = d.edges.filter(function(e) { return nodeIds.has(e.from) && nodeIds.has(e.to); });
     var colorMap = { Person: '#4a9eff', Project: '#34d399', Topic: '#a78bfa', Agent: '#fb923c', Task: '#fbbf24', Note: '#94a3b8' };
+    // Render legend
+    var legendEl = document.getElementById('graph-legend');
+    var usedLabels = {};
+    filteredNodes.forEach(function(n) { usedLabels[n.label] = true; });
+    legendEl.innerHTML = Object.keys(usedLabels).map(function(lbl) {
+      var c = colorMap[lbl] || '#94a3b8';
+      return '<span style="display:inline-flex;align-items:center;gap:4px;font-size:12px;color:var(--text-muted)"><span style="width:10px;height:10px;border-radius:50%;background:' + c + ';display:inline-block"></span>' + lbl + '</span>';
+    }).join('');
     var nodes = new vis.DataSet(filteredNodes.map(function(n) {
-      return { id: n.id, label: n.id.replace(/-/g, ' '), group: n.label, title: n.label + ': ' + n.id, color: colorMap[n.label] || '#94a3b8', font: { color: '#e2e8f0' } };
+      return { id: n.id, label: n.id.replace(/-/g, ' '), group: n.label, title: n.label + ': ' + n.id, color: { background: colorMap[n.label] || '#94a3b8', border: colorMap[n.label] || '#94a3b8', highlight: { background: '#fff', border: colorMap[n.label] || '#94a3b8' } }, font: { color: '#e2e8f0', size: 12 } };
     }));
     var edges = new vis.DataSet(filteredEdges.map(function(e, i) {
-      return { id: i, from: e.from, to: e.to, label: e.rel, arrows: 'to', color: { color: '#64748b', highlight: '#94a3b8' }, font: { color: '#94a3b8', size: 10 } };
+      return { id: i, from: e.from, to: e.to, label: e.rel, arrows: 'to', color: { color: '#8892a8', highlight: '#c8d0e0' }, font: { color: '#a0aec0', size: 10, strokeWidth: 2, strokeColor: '#1e1e2e' } };
     }));
     canvas.innerHTML = '';
     graphNetwork = new vis.Network(canvas, { nodes: nodes, edges: edges }, {
