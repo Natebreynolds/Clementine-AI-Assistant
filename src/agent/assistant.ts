@@ -1,7 +1,7 @@
 /**
  * Clementine TypeScript — Core assistant (Agent Layer).
  *
- * Uses @anthropic-ai/claude-code query() with built-in tools + external MCP stdio server.
+ * Uses @anthropic-ai/claude-agent-sdk query() with built-in tools + external MCP stdio server.
  * Features:
  *   - canUseTool: SDK-level security enforcement (blocks dangerous operations)
  *   - Auto-memory: background Haiku pass extracts facts after every exchange
@@ -19,7 +19,7 @@ import {
   type SDKAssistantMessage,
   type SDKResultMessage,
   type SDKPartialAssistantMessage,
-} from '@anthropic-ai/claude-code';
+} from '@anthropic-ai/claude-agent-sdk';
 import matter from 'gray-matter';
 import pino from 'pino';
 
@@ -812,7 +812,7 @@ When a task is complex, output \`[PLAN_NEEDED: brief description]\` as the FIRST
 If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search, memory_read) without any action (Write, Edit, Bash, note_create, task_add, memory_write, delegate_task, or any tool that changes state): STOP. Either act or tell ${owner} what you need to proceed.`);
     }
 
-    // Security rules are now passed via appendSystemPrompt in buildOptions()
+    // Security rules are now appended to systemPrompt in buildOptions()
 
     return parts.join('\n\n---\n\n');
   }
@@ -932,7 +932,7 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
       : [];
     const effectiveMaxTurns = maxTurns ?? (isHeartbeat ? HEARTBEAT_MAX_TURNS : 30);
 
-    // Determine security prompt for appendSystemPrompt
+    // Determine security prompt to append to systemPrompt
     // Plan steps are user-initiated — use the interactive security prompt, not cron
     const securityPrompt = isPlanStep
       ? getSecurityPrompt()
@@ -949,15 +949,19 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
     // Capture source at build time so concurrent queries don't race on the global
     const capturedSource = sourceOverride;
 
+    // Build combined system prompt (custom + security rules)
+    const customPrompt = this.buildSystemPrompt({
+      isHeartbeat, cronTier: isPlanStep ? null : cronTier, retrievalContext, profile, sessionKey, model, verboseLevel,
+    });
+    const fullSystemPrompt = customPrompt + '\n\n' + securityPrompt;
+
     return {
-      customSystemPrompt: this.buildSystemPrompt({
-        isHeartbeat, cronTier: isPlanStep ? null : cronTier, retrievalContext, profile, sessionKey, model, verboseLevel,
-      }),
-      appendSystemPrompt: securityPrompt,
+      systemPrompt: fullSystemPrompt,
       model: resolvedModel,
       ...(fallback ? { fallbackModel: fallback } : {}),
       permissionMode: 'bypassPermissions',
-      allowedTools: disableAllTools ? [] : allowedTools,
+      allowDangerouslySkipPermissions: true,
+      tools: disableAllTools ? [] : allowedTools,
       disallowedTools: disallowed,
       ...(streaming ? { includePartialMessages: true } : {}),
       mcpServers: {
@@ -975,7 +979,7 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
       maxTurns: effectiveMaxTurns,
       cwd: BASE_DIR,
       env: SAFE_ENV,
-      canUseTool: async (toolName, toolInput, _options) => {
+      canUseTool: async (toolName: string, toolInput: Record<string, unknown>, _options: { signal: AbortSignal; toolUseID: string }) => {
         const result = await enforceToolPermissions(toolName, toolInput, capturedSource);
         if (result.behavior === 'deny') {
           return { behavior: 'deny' as const, message: result.message ?? 'Denied.' };
@@ -1423,10 +1427,10 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
         }
 
         // Context window guard: estimate token usage and bail if too tight
-        const systemPromptTokens = estimateTokens(sdkOptions.customSystemPrompt ?? '');
-        const appendPromptTokens = estimateTokens(sdkOptions.appendSystemPrompt ?? '');
+        const systemPromptText = typeof sdkOptions.systemPrompt === 'string' ? sdkOptions.systemPrompt : '';
+        const systemPromptTokens = estimateTokens(systemPromptText);
         const promptTokens = estimateTokens(prompt);
-        const totalEstimate = systemPromptTokens + appendPromptTokens + promptTokens;
+        const totalEstimate = systemPromptTokens + promptTokens;
         const contextWindow = getContextWindow(sdkOptions.model ?? MODEL);
         const remainingTokens = contextWindow - totalEstimate;
 
@@ -1495,23 +1499,24 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
               }
             } else if (message.type === 'result') {
               const result = message as SDKResultMessage;
-              sessionId = result.session_id ?? '';
+              sessionId = result.session_id;
               // Capture cost/usage metrics
               if ('total_cost_usd' in result) {
                 logger.info({
-                  cost_usd: (result as any).total_cost_usd,
-                  num_turns: (result as any).num_turns,
-                  duration_ms: (result as any).duration_ms,
+                  cost_usd: result.total_cost_usd,
+                  num_turns: result.num_turns,
+                  duration_ms: result.duration_ms,
                 }, 'SDK query completed');
               }
               if (result.is_error) {
-                const resultText = (result as { result?: string }).result;
-                if (resultText) {
-                  const lower = resultText.toLowerCase();
+                // Error subtypes have `errors` array; success subtype has `result` string
+                const errorText = 'errors' in result ? result.errors.join('; ') : ('result' in result ? result.result : '');
+                if (errorText) {
+                  const lower = errorText.toLowerCase();
                   if (lower.includes('rate') && lower.includes('limit')) {
                     hitRateLimit = true;
                   } else {
-                    responseText = responseText || `Error: ${resultText}`;
+                    responseText = responseText || `Error: ${errorText}`;
                   }
                 }
               }
@@ -1712,9 +1717,10 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
       const stream = query({
         prompt: summarizePrompt,
         options: {
-          customSystemPrompt: 'You are a conversation summarizer. Output only bullet points.',
+          systemPrompt: 'You are a conversation summarizer. Output only bullet points.',
           model: AUTO_MEMORY_MODEL,
           permissionMode: 'bypassPermissions',
+          allowDangerouslySkipPermissions: true,
           maxTurns: 1,
           cwd: BASE_DIR,
           env: SAFE_ENV,
@@ -1906,10 +1912,11 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
       const stream = query({
         prompt: memPrompt,
         options: {
-          customSystemPrompt: 'You are a silent memory extraction agent. Save facts to the vault and exit.',
+          systemPrompt: 'You are a silent memory extraction agent. Save facts to the vault and exit.',
           model: AUTO_MEMORY_MODEL,
           permissionMode: 'bypassPermissions',
-          allowedTools: [
+          allowDangerouslySkipPermissions: true,
+          tools: [
             mcpTool('memory_write'),
             mcpTool('memory_search'),
             mcpTool('note_create'),
@@ -2042,9 +2049,9 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
       } else if (message.type === 'result') {
         if ('total_cost_usd' in message) {
           logger.info({
-            cost_usd: (message as any).total_cost_usd,
-            num_turns: (message as any).num_turns,
-            duration_ms: (message as any).duration_ms,
+            cost_usd: (message as SDKResultMessage).total_cost_usd,
+            num_turns: (message as SDKResultMessage).num_turns,
+            duration_ms: (message as SDKResultMessage).duration_ms,
           }, 'Heartbeat query completed');
         }
       } else if (message.type === 'system' || message.type === 'stream_event') {
@@ -2103,9 +2110,9 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
         if ('total_cost_usd' in message) {
           logger.info({
             stepId,
-            cost_usd: (message as any).total_cost_usd,
-            num_turns: (message as any).num_turns,
-            duration_ms: (message as any).duration_ms,
+            cost_usd: (message as SDKResultMessage).total_cost_usd,
+            num_turns: (message as SDKResultMessage).num_turns,
+            duration_ms: (message as SDKResultMessage).duration_ms,
           }, 'Plan step query completed');
         }
       }
@@ -2547,14 +2554,14 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
             }
           } else if (message.type === 'result') {
             const result = message as SDKResultMessage;
-            phaseSessionId = result.session_id ?? '';
+            phaseSessionId = result.session_id;
             if ('total_cost_usd' in result) {
               logger.info({
                 job: jobName,
                 phase,
-                cost_usd: (result as any).total_cost_usd,
-                num_turns: (result as any).num_turns,
-                duration_ms: (result as any).duration_ms,
+                cost_usd: result.total_cost_usd,
+                num_turns: result.num_turns,
+                duration_ms: result.duration_ms,
               }, 'Unleashed phase completed');
             }
           } else if (message.type === 'system' || message.type === 'stream_event') {
@@ -2758,14 +2765,14 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
             }
           } else if (message.type === 'result') {
             const result = message as SDKResultMessage;
-            phaseSessionId = result.session_id ?? '';
+            phaseSessionId = result.session_id;
             if ('total_cost_usd' in result) {
               logger.info({
                 taskName,
                 phase,
-                cost_usd: (result as any).total_cost_usd,
-                num_turns: (result as any).num_turns,
-                duration_ms: (result as any).duration_ms,
+                cost_usd: result.total_cost_usd,
+                num_turns: result.num_turns,
+                duration_ms: result.duration_ms,
               }, 'Team task phase completed');
             }
           }
