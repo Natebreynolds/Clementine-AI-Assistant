@@ -815,6 +815,10 @@ export class Gateway {
 
   // ── Presence info ───────────────────────────────────────────────────
 
+  getMcpStatus(): { servers: Array<{ name: string; status: string }>; updatedAt: string } {
+    return this.assistant.getMcpStatus();
+  }
+
   getPresenceInfo(sessionKey: string): {
     model: string;
     project: string | null;

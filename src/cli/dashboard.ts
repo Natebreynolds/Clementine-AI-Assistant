@@ -1908,6 +1908,149 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
     res.json(computeMetrics());
   });
 
+  // ── Token Usage API ──────────────────────────────────────────────
+
+  app.get('/api/metrics/usage', async (_req, res) => {
+    if (!existsSync(MEMORY_DB_PATH)) {
+      res.json({ error: 'No DB', totalTokens: 0, byModel: [], bySource: [], byDay: [] });
+      return;
+    }
+    const Database = (await import('better-sqlite3')).default;
+    const db = new Database(MEMORY_DB_PATH, { readonly: true });
+    try {
+      // Check if table exists
+      const tableExists = db.prepare(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='usage_log'",
+      ).get();
+      if (!tableExists) {
+        res.json({ totalTokens: 0, totalInput: 0, totalOutput: 0, byModel: [], bySource: [], byDay: [] });
+        return;
+      }
+
+      const totals = db.prepare(
+        `SELECT COALESCE(SUM(input_tokens), 0) as ti, COALESCE(SUM(output_tokens), 0) as to_,
+                COALESCE(SUM(cache_read_tokens), 0) as tcr, COALESCE(SUM(cache_creation_tokens), 0) as tcc
+         FROM usage_log`,
+      ).get() as { ti: number; to_: number; tcr: number; tcc: number };
+
+      const byModel = db.prepare(
+        `SELECT model, SUM(input_tokens) as input, SUM(output_tokens) as output, SUM(cache_read_tokens) as cacheRead
+         FROM usage_log GROUP BY model ORDER BY input DESC`,
+      ).all();
+
+      const bySource = db.prepare(
+        `SELECT source, SUM(input_tokens) as input, SUM(output_tokens) as output
+         FROM usage_log GROUP BY source ORDER BY input DESC`,
+      ).all();
+
+      const byDay = db.prepare(
+        `SELECT date(created_at) as day, SUM(input_tokens) as input, SUM(output_tokens) as output
+         FROM usage_log WHERE created_at >= date('now', '-7 days')
+         GROUP BY date(created_at) ORDER BY day`,
+      ).all();
+
+      res.json({
+        totalInput: totals.ti,
+        totalOutput: totals.to_,
+        totalCacheRead: totals.tcr,
+        totalCacheCreation: totals.tcc,
+        totalTokens: totals.ti + totals.to_,
+        byModel,
+        bySource,
+        byDay,
+      });
+    } catch (err) {
+      res.json({ error: String(err), totalTokens: 0, byModel: [], bySource: [], byDay: [] });
+    } finally {
+      db.close();
+    }
+  });
+
+  // ── Session Detail API ───────────────────────────────────────────
+
+  app.get('/api/sessions/:key/messages', async (req, res) => {
+    const sessionKey = req.params.key;
+    if (!existsSync(MEMORY_DB_PATH)) {
+      res.json({ messages: [], source: 'none' });
+      return;
+    }
+    const Database = (await import('better-sqlite3')).default;
+    const db = new Database(MEMORY_DB_PATH, { readonly: true });
+    try {
+      const tableExists = db.prepare(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='transcripts'",
+      ).get();
+      if (!tableExists) {
+        res.json({ messages: [], source: 'none' });
+        return;
+      }
+      const rows = db.prepare(
+        `SELECT session_key, role, content, model, created_at
+         FROM transcripts WHERE session_key = ? ORDER BY id LIMIT 200`,
+      ).all(sessionKey) as Array<{
+        session_key: string; role: string; content: string; model: string; created_at: string;
+      }>;
+      res.json({
+        messages: rows.map(r => ({
+          role: r.role,
+          content: r.content,
+          model: r.model,
+          createdAt: r.created_at,
+        })),
+        source: 'transcripts',
+      });
+    } catch (err) {
+      res.json({ messages: [], source: 'error', error: String(err) });
+    } finally {
+      db.close();
+    }
+  });
+
+  app.get('/api/sessions/:key/usage', async (req, res) => {
+    const sessionKey = req.params.key;
+    if (!existsSync(MEMORY_DB_PATH)) {
+      res.json({ totalTokens: 0, totalInput: 0, totalOutput: 0, numQueries: 0 });
+      return;
+    }
+    const Database = (await import('better-sqlite3')).default;
+    const db = new Database(MEMORY_DB_PATH, { readonly: true });
+    try {
+      const tableExists = db.prepare(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='usage_log'",
+      ).get();
+      if (!tableExists) {
+        res.json({ totalTokens: 0, totalInput: 0, totalOutput: 0, numQueries: 0 });
+        return;
+      }
+      const row = db.prepare(
+        `SELECT COALESCE(SUM(input_tokens), 0) as ti, COALESCE(SUM(output_tokens), 0) as to_,
+                COUNT(*) as cnt
+         FROM usage_log WHERE session_key = ?`,
+      ).get(sessionKey) as { ti: number; to_: number; cnt: number };
+      res.json({
+        totalInput: row.ti,
+        totalOutput: row.to_,
+        totalTokens: row.ti + row.to_,
+        numQueries: row.cnt,
+      });
+    } catch {
+      res.json({ totalTokens: 0, totalInput: 0, totalOutput: 0, numQueries: 0 });
+    } finally {
+      db.close();
+    }
+  });
+
+  // ── MCP Status API ───────────────────────────────────────────────
+
+  app.get('/api/mcp-status', async (_req, res) => {
+    try {
+      const gw = await getGateway();
+      res.json(gw.getMcpStatus());
+    } catch {
+      res.json({ servers: [], updatedAt: '' });
+    }
+  });
+
   // ── Self-Improvement API ─────────────────────────────────────────
 
   app.get('/api/self-improve', (_req, res) => {
@@ -4046,6 +4189,7 @@ function getDashboardHTML(token: string): string {
           <div class="card-body" id="panel-controls"><div class="empty-state">Loading...</div></div>
         </div>
       </div>
+      <div class="card" id="mcp-status-widget" style="display:none;margin-top:16px"></div>
     </div>
 
     <!-- ═══ Projects Page ═══ -->
@@ -4818,6 +4962,30 @@ async function refreshStatus() {
           + summaryCard('sc-purple', '&#128172;', totalExchanges, 'Messages', md.sessions ? md.sessions.activeSessions + ' sessions' : '')
           + summaryCard('sc-yellow', '&#9654;', nextTask, 'NEXT TASK', nextTime || 'No upcoming jobs');
       } catch(me) { /* metrics optional */ }
+
+      // MCP Server Status widget
+      try {
+        var mcpRes = await apiFetch('/api/mcp-status');
+        var mcpData = await mcpRes.json();
+        var mcpEl = document.getElementById('mcp-status-widget');
+        if (mcpData.servers && mcpData.servers.length > 0 && mcpEl) {
+          var mcpHtml = '<div class="card-header">MCP Servers</div><div class="card-body">';
+          for (var srv of mcpData.servers) {
+            var dotColor = srv.status === 'connected' ? 'var(--green)' : srv.status === 'failed' ? 'var(--red)' : 'var(--yellow)';
+            var statusLabel = srv.status || 'unknown';
+            mcpHtml += '<div class="kv-row">'
+              + '<span class="kv-key" style="display:flex;align-items:center;gap:6px">'
+              + '<span style="width:8px;height:8px;border-radius:50%;background:' + dotColor + ';display:inline-block"></span>'
+              + esc(srv.name) + '</span>'
+              + '<span class="kv-val" style="font-size:11px">' + esc(statusLabel) + '</span></div>';
+          }
+          mcpHtml += '</div>';
+          mcpEl.innerHTML = mcpHtml;
+          mcpEl.style.display = 'block';
+        } else if (mcpEl) {
+          mcpEl.style.display = 'none';
+        }
+      } catch { /* MCP status optional */ }
     }
 
     // Quick controls panel
@@ -4868,12 +5036,12 @@ async function refreshSessions() {
       document.getElementById('panel-sessions').innerHTML = '<div class="empty-state">No active sessions</div>';
       return;
     }
-    let html = '<div class="session-grid">';
+    let html = '<div class="session-grid" id="session-grid">';
     for (const key of keys) {
       var s = d[key];
       var friendly = friendlySession(key);
       var safeKey = esc(key).replace(/'/g, '');
-      html += '<div class="session-card">'
+      html += '<div class="session-card" style="cursor:pointer" onclick="viewSession(\\'' + encodeURIComponent(key) + '\\')">'
         + '<div class="session-card-header">'
         + '<span class="session-card-icon">' + friendly.icon + '</span>'
         + '<span class="session-card-name">' + esc(friendly.label) + '</span>'
@@ -4882,12 +5050,77 @@ async function refreshSessions() {
         + '<div class="session-card-meta">Last active: ' + timeAgo(s.timestamp) + '</div>'
         + '<div class="session-card-meta" style="font-family:monospace;font-size:10px">' + esc(key) + '</div>'
         + '<div class="session-card-actions">'
-        + '<button class="btn-danger btn-sm" onclick="if(confirm(\\'Clear session ' + safeKey + '?\\'))apiPost(\\'/api/sessions/' + encodeURIComponent(key) + '/clear\\')">Clear</button>'
+        + '<button class="btn-danger btn-sm" onclick="event.stopPropagation();if(confirm(\\'Clear session ' + safeKey + '?\\'))apiPost(\\'/api/sessions/' + encodeURIComponent(key) + '/clear\\')">Clear</button>'
         + '</div></div>';
     }
     html += '</div>';
     document.getElementById('panel-sessions').innerHTML = html;
   } catch(e) { }
+}
+
+async function viewSession(encodedKey) {
+  var key = decodeURIComponent(encodedKey);
+  var panel = document.getElementById('panel-sessions');
+  panel.innerHTML = '<div class="empty-state">Loading session...</div>';
+
+  try {
+    var [msgRes, usageRes] = await Promise.all([
+      apiFetch('/api/sessions/' + encodedKey + '/messages'),
+      apiFetch('/api/sessions/' + encodedKey + '/usage'),
+    ]);
+    var msgData = await msgRes.json();
+    var usageData = await usageRes.json();
+    var friendly = friendlySession(key);
+
+    var html = '<div style="margin-bottom:16px">'
+      + '<button class="btn-primary btn-sm" onclick="refreshSessions()" style="margin-bottom:12px">&larr; Back</button>'
+      + '<div style="display:flex;align-items:center;gap:10px;margin-bottom:8px">'
+      + '<span style="font-size:24px">' + friendly.icon + '</span>'
+      + '<span style="font-size:18px;font-weight:600">' + esc(friendly.label) + '</span>'
+      + '</div>'
+      + '<div style="font-family:monospace;font-size:11px;color:var(--text-muted);margin-bottom:8px">' + esc(key) + '</div>';
+
+    // Usage stats
+    if (usageData.totalTokens > 0) {
+      html += '<div class="stat-grid" style="margin-bottom:12px">'
+        + statTile(formatTokens(usageData.totalTokens), 'Total Tokens')
+        + statTile(formatTokens(usageData.totalInput || 0), 'Input')
+        + statTile(formatTokens(usageData.totalOutput || 0), 'Output')
+        + statTile(usageData.numQueries || 0, 'Queries')
+        + '</div>';
+    }
+    html += '</div>';
+
+    // Messages
+    var messages = msgData.messages || [];
+    if (messages.length === 0) {
+      html += '<div class="empty-state">No conversation history available</div>';
+    } else {
+      html += '<div style="max-height:600px;overflow-y:auto;border:1px solid var(--border);border-radius:8px;padding:12px">';
+      for (var msg of messages) {
+        if (msg.role === 'system') continue;
+        var isUser = msg.role === 'user';
+        var bubbleStyle = isUser
+          ? 'background:var(--blue);color:#fff;margin-left:40px;border-radius:12px 12px 4px 12px'
+          : 'background:var(--bg-secondary);border:1px solid var(--border);margin-right:40px;border-radius:12px 12px 12px 4px';
+        var label = isUser ? 'You' : 'Assistant';
+        var content = msg.content || '';
+        if (content.length > 1000) content = content.slice(0, 1000) + '...';
+        html += '<div style="margin-bottom:10px">'
+          + '<div style="font-size:10px;color:var(--text-muted);margin-bottom:2px;' + (isUser ? 'text-align:right' : '') + '">'
+          + esc(label) + (msg.createdAt ? ' &middot; ' + timeAgo(msg.createdAt) : '') + '</div>'
+          + '<div style="padding:10px 14px;font-size:13px;line-height:1.5;white-space:pre-wrap;word-break:break-word;' + bubbleStyle + '">'
+          + esc(content)
+          + '</div></div>';
+      }
+      html += '</div>';
+    }
+
+    panel.innerHTML = html;
+  } catch(e) {
+    panel.innerHTML = '<div class="empty-state" style="color:var(--red)">Error loading session: ' + esc(String(e)) + '</div>'
+      + '<button class="btn-primary btn-sm" onclick="refreshSessions()">&larr; Back</button>';
+  }
 }
 
 // ── Cron Jobs ─────────────────────────────
@@ -6234,25 +6467,48 @@ async function runMemorySearch() {
 }
 
 // ── Metrics ───────────────────────────────
+function formatTokens(n) {
+  if (!n || n === 0) return '0';
+  if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M';
+  if (n >= 1000) return (n / 1000).toFixed(1) + 'K';
+  return String(n);
+}
+
 async function refreshMetrics() {
   try {
-    const r = await apiFetch('/api/metrics');
+    const [r, ur] = await Promise.all([apiFetch('/api/metrics'), apiFetch('/api/metrics/usage')]);
     const d = await r.json();
+    const u = await ur.json();
     const container = document.getElementById('metrics-content');
 
     let html = '';
+
+    // Hero row: Time Saved + Total Tokens
+    html += '<div style="display:flex;gap:16px;flex-wrap:wrap;margin-bottom:20px">';
 
     // Time saved hero
     const hours = d.timeSaved?.estimatedHours || 0;
     const mins = d.timeSaved?.estimatedMinutes || 0;
     const display = hours >= 1 ? hours + 'h' : mins + 'm';
-    html += '<div class="metric-hero">'
+    html += '<div class="metric-hero" style="flex:1;min-width:200px">'
       + '<div class="metric-hero-value">' + esc(display) + '</div>'
       + '<div class="metric-hero-label">Estimated Time Saved</div>'
       + '<div class="metric-hero-sub">'
-      + esc((d.timeSaved?.breakdown?.cronMinutes || 0)) + ' min from automated tasks &middot; '
-      + esc((d.timeSaved?.breakdown?.chatMinutes || 0)) + ' min from chat interactions'
+      + esc((d.timeSaved?.breakdown?.cronMinutes || 0)) + ' min from tasks &middot; '
+      + esc((d.timeSaved?.breakdown?.chatMinutes || 0)) + ' min from chat'
       + '</div></div>';
+
+    // Total Tokens hero
+    var totalTok = u.totalTokens || 0;
+    html += '<div class="metric-hero" style="flex:1;min-width:200px">'
+      + '<div class="metric-hero-value">' + formatTokens(totalTok) + '</div>'
+      + '<div class="metric-hero-label">Total Tokens</div>'
+      + '<div class="metric-hero-sub">'
+      + formatTokens(u.totalInput || 0) + ' input &middot; '
+      + formatTokens(u.totalOutput || 0) + ' output'
+      + '</div></div>';
+
+    html += '</div>';
 
     // Stat grid
     html += '<div class="stat-grid">';
@@ -6262,9 +6518,63 @@ async function refreshMetrics() {
     html += statTile(d.cron?.runsThisWeek || 0, 'Runs This Week');
     html += statTile(d.sessions?.totalExchanges || 0, 'Chat Exchanges');
     html += statTile(d.sessions?.activeSessions || 0, 'Active Sessions');
+    // Cache efficiency
+    var cacheEff = u.totalInput > 0 ? Math.round(((u.totalCacheRead || 0) / u.totalInput) * 100) : 0;
+    html += statTile(cacheEff + '%', 'Cache Hit Rate', cacheEff >= 50 ? 'var(--green)' : cacheEff >= 20 ? 'var(--yellow)' : 'var(--text-muted)');
     html += '</div>';
 
-    // Success rate bar
+    // Tokens by Model
+    if (u.byModel && u.byModel.length > 0) {
+      html += '<div class="card"><div class="card-header">Tokens by Model</div><div class="card-body">';
+      var maxModelTok = Math.max(...u.byModel.map(function(m) { return (m.input || 0) + (m.output || 0); }));
+      for (var m of u.byModel) {
+        var mTotal = (m.input || 0) + (m.output || 0);
+        var pct = maxModelTok > 0 ? Math.round((mTotal / maxModelTok) * 100) : 0;
+        var shortName = m.model.replace(/^claude-/, '').replace(/-\d{8}$/, '');
+        html += '<div style="margin-bottom:8px">'
+          + '<div class="kv-row"><span class="kv-key">' + esc(shortName) + '</span><span class="kv-val">' + formatTokens(mTotal) + '</span></div>'
+          + '<div class="metric-bar-track"><div class="metric-bar-fill" style="width:' + pct + '%;background:var(--blue)"></div></div>'
+          + '</div>';
+      }
+      html += '</div></div>';
+    }
+
+    // Tokens by Source
+    if (u.bySource && u.bySource.length > 0) {
+      html += '<div class="card"><div class="card-header">Tokens by Source</div><div class="card-body">';
+      var maxSrcTok = Math.max(...u.bySource.map(function(s) { return (s.input || 0) + (s.output || 0); }));
+      for (var s of u.bySource) {
+        var sTotal = (s.input || 0) + (s.output || 0);
+        var sPct = maxSrcTok > 0 ? Math.round((sTotal / maxSrcTok) * 100) : 0;
+        var srcColors = { chat: 'var(--blue)', cron: 'var(--green)', heartbeat: 'var(--yellow)', unleashed: 'var(--purple)', plan_step: 'var(--clementine)', team_task: 'var(--red)' };
+        var srcColor = srcColors[s.source] || 'var(--text-muted)';
+        html += '<div style="margin-bottom:8px">'
+          + '<div class="kv-row"><span class="kv-key">' + esc(s.source) + '</span><span class="kv-val">' + formatTokens(sTotal) + '</span></div>'
+          + '<div class="metric-bar-track"><div class="metric-bar-fill" style="width:' + sPct + '%;background:' + srcColor + '"></div></div>'
+          + '</div>';
+      }
+      html += '</div></div>';
+    }
+
+    // Usage by Day (last 7 days)
+    if (u.byDay && u.byDay.length > 0) {
+      html += '<div class="card"><div class="card-header">Usage by Day (Last 7 Days)</div><div class="card-body">';
+      var maxDayTok = Math.max(...u.byDay.map(function(dd) { return (dd.input || 0) + (dd.output || 0); }));
+      html += '<div style="display:flex;align-items:flex-end;gap:8px;height:120px">';
+      for (var dd of u.byDay) {
+        var dayTotal = (dd.input || 0) + (dd.output || 0);
+        var barH = maxDayTok > 0 ? Math.max(4, Math.round((dayTotal / maxDayTok) * 100)) : 4;
+        var dayLabel = dd.day ? dd.day.slice(5) : '';
+        html += '<div style="flex:1;text-align:center;display:flex;flex-direction:column;align-items:center;justify-content:flex-end;height:100%">'
+          + '<div style="font-size:10px;color:var(--text-muted);margin-bottom:2px">' + formatTokens(dayTotal) + '</div>'
+          + '<div style="width:100%;max-width:40px;height:' + barH + '%;background:var(--blue);border-radius:4px 4px 0 0;min-height:4px"></div>'
+          + '<div style="font-size:10px;color:var(--text-muted);margin-top:4px">' + esc(dayLabel) + '</div>'
+          + '</div>';
+      }
+      html += '</div></div></div>';
+    }
+
+    // Task reliability bar
     const rate = d.cron?.successRate || 0;
     const barColor = rate >= 90 ? 'var(--green)' : rate >= 70 ? 'var(--yellow)' : 'var(--red)';
     html += '<div class="card"><div class="card-header">Task Reliability</div><div class="card-body">'

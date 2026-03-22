@@ -448,6 +448,8 @@ export class PersonalAssistant {
   private _lastUserMessage?: string;
   private onUnleashedComplete: ((jobName: string, result: string) => void) | null = null;
   private onPhaseComplete: ((jobName: string, phase: number, totalPhases: number, output: string) => void) | null = null;
+  private _lastMcpStatus: Array<{ name: string; status: string }> = [];
+  private _lastMcpStatusTime: string = '';
 
   constructor() {
     this.profileManager = new AgentManager(AGENTS_DIR, PROFILES_DIR);
@@ -475,6 +477,10 @@ export class PersonalAssistant {
 
   setPhaseCompleteCallback(cb: (jobName: string, phase: number, totalPhases: number, output: string) => void): void {
     this.onPhaseComplete = cb;
+  }
+
+  getMcpStatus(): { servers: Array<{ name: string; status: string }>; updatedAt: string } {
+    return { servers: this._lastMcpStatus, updatedAt: this._lastMcpStatusTime };
   }
 
   private async initMemoryStore(): Promise<void> {
@@ -1508,6 +1514,18 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
                   duration_ms: result.duration_ms,
                 }, 'SDK query completed');
               }
+              // Log token usage
+              if (this.memoryStore && result.modelUsage) {
+                try {
+                  this.memoryStore.logUsage({
+                    sessionKey: sessionKey ?? 'unknown',
+                    source: 'chat',
+                    modelUsage: result.modelUsage,
+                    numTurns: result.num_turns,
+                    durationMs: result.duration_ms,
+                  });
+                } catch { /* non-fatal */ }
+              }
               if (result.is_error) {
                 // Error subtypes have `errors` array; success subtype has `result` string
                 const errorText = 'errors' in result ? result.errors.join('; ') : ('result' in result ? result.result : '');
@@ -1521,7 +1539,12 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
                 }
               }
             } else if (message.type === 'system') {
-              // Init message with tools/MCP status — no action needed
+              // Capture MCP server status from init message
+              const sysMsg = message as any;
+              if (sysMsg.subtype === 'init' && sysMsg.mcp_servers) {
+                this._lastMcpStatus = sysMsg.mcp_servers;
+                this._lastMcpStatusTime = new Date().toISOString();
+              }
             } else {
               logger.debug({ type: message.type }, 'Unknown SDK message type');
             }
@@ -2047,15 +2070,33 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
           }
         }
       } else if (message.type === 'result') {
-        if ('total_cost_usd' in message) {
+        const result = message as SDKResultMessage;
+        if ('total_cost_usd' in result) {
           logger.info({
-            cost_usd: (message as SDKResultMessage).total_cost_usd,
-            num_turns: (message as SDKResultMessage).num_turns,
-            duration_ms: (message as SDKResultMessage).duration_ms,
+            cost_usd: result.total_cost_usd,
+            num_turns: result.num_turns,
+            duration_ms: result.duration_ms,
           }, 'Heartbeat query completed');
         }
-      } else if (message.type === 'system' || message.type === 'stream_event') {
-        // Init / streaming messages — no action needed
+        if (this.memoryStore && result.modelUsage) {
+          try {
+            this.memoryStore.logUsage({
+              sessionKey: 'heartbeat',
+              source: 'heartbeat',
+              modelUsage: result.modelUsage,
+              numTurns: result.num_turns,
+              durationMs: result.duration_ms,
+            });
+          } catch { /* non-fatal */ }
+        }
+      } else if (message.type === 'system') {
+        const sysMsg = message as any;
+        if (sysMsg.subtype === 'init' && sysMsg.mcp_servers) {
+          this._lastMcpStatus = sysMsg.mcp_servers;
+          this._lastMcpStatusTime = new Date().toISOString();
+        }
+      } else if (message.type === 'stream_event') {
+        // Streaming tokens — no action needed
       }
     }
 
@@ -2107,13 +2148,25 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
           }
         }
       } else if (message.type === 'result') {
-        if ('total_cost_usd' in message) {
+        const result = message as SDKResultMessage;
+        if ('total_cost_usd' in result) {
           logger.info({
             stepId,
-            cost_usd: (message as SDKResultMessage).total_cost_usd,
-            num_turns: (message as SDKResultMessage).num_turns,
-            duration_ms: (message as SDKResultMessage).duration_ms,
+            cost_usd: result.total_cost_usd,
+            num_turns: result.num_turns,
+            duration_ms: result.duration_ms,
           }, 'Plan step query completed');
+        }
+        if (this.memoryStore && result.modelUsage) {
+          try {
+            this.memoryStore.logUsage({
+              sessionKey: `plan:${stepId}`,
+              source: 'plan_step',
+              modelUsage: result.modelUsage,
+              numTurns: result.num_turns,
+              durationMs: result.duration_ms,
+            });
+          } catch { /* non-fatal */ }
         }
       }
     }
@@ -2279,16 +2332,34 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
               }
             }
           } else if (message.type === 'result') {
-            if ('total_cost_usd' in message) {
+            const result = message as SDKResultMessage;
+            if ('total_cost_usd' in result) {
               logger.info({
                 job: jobName,
-                cost_usd: (message as any).total_cost_usd,
-                num_turns: (message as any).num_turns,
-                duration_ms: (message as any).duration_ms,
+                cost_usd: result.total_cost_usd,
+                num_turns: result.num_turns,
+                duration_ms: result.duration_ms,
               }, 'Cron job query completed');
             }
-          } else if (message.type === 'system' || message.type === 'stream_event') {
-            // Init / streaming messages — no action needed
+            if (this.memoryStore && result.modelUsage) {
+              try {
+                this.memoryStore.logUsage({
+                  sessionKey: `cron:${jobName}`,
+                  source: 'cron',
+                  modelUsage: result.modelUsage,
+                  numTurns: result.num_turns,
+                  durationMs: result.duration_ms,
+                });
+              } catch { /* non-fatal */ }
+            }
+          } else if (message.type === 'system') {
+            const sysMsg = message as any;
+            if (sysMsg.subtype === 'init' && sysMsg.mcp_servers) {
+              this._lastMcpStatus = sysMsg.mcp_servers;
+              this._lastMcpStatusTime = new Date().toISOString();
+            }
+          } else if (message.type === 'stream_event') {
+            // Streaming tokens — no action needed
           }
         }
       } catch (streamErr) {
@@ -2564,6 +2635,17 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
                 duration_ms: result.duration_ms,
               }, 'Unleashed phase completed');
             }
+            if (this.memoryStore && result.modelUsage) {
+              try {
+                this.memoryStore.logUsage({
+                  sessionKey: `unleashed:${jobName}`,
+                  source: 'unleashed',
+                  modelUsage: result.modelUsage,
+                  numTurns: result.num_turns,
+                  durationMs: result.duration_ms,
+                });
+              } catch { /* non-fatal */ }
+            }
           } else if (message.type === 'system' || message.type === 'stream_event') {
             // Init / streaming messages — no action needed
           }
@@ -2774,6 +2856,17 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
                 num_turns: result.num_turns,
                 duration_ms: result.duration_ms,
               }, 'Team task phase completed');
+            }
+            if (this.memoryStore && result.modelUsage) {
+              try {
+                this.memoryStore.logUsage({
+                  sessionKey: `team:${taskName}`,
+                  source: 'team_task',
+                  modelUsage: result.modelUsage,
+                  numTurns: result.num_turns,
+                  durationMs: result.duration_ms,
+                });
+              } catch { /* non-fatal */ }
             }
           }
         }
