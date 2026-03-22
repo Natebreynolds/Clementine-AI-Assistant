@@ -183,27 +183,10 @@ export class HeartbeatScheduler {
       return;
     }
 
-    // Compute current state and compare to last
+    // Compute current state for context (always run — heartbeats keep the agent alive)
     const [currentFingerprint, currentDetails] = this.computeStateFingerprint();
-    const lastFingerprint = this.lastState.fingerprint ?? '';
 
-    // Even if nothing changed, fire at least once every 4 hours during active hours
-    // to ensure daily notes get created, proactive checks run, etc.
-    const MAX_SILENT_MS = 4 * 60 * 60 * 1000;
-    const lastTimestamp = this.lastState.timestamp ? new Date(this.lastState.timestamp).getTime() : 0;
-    const msSinceLast = Date.now() - lastTimestamp;
-    const stale = msSinceLast >= MAX_SILENT_MS;
-
-    if (currentFingerprint === lastFingerprint && !stale) {
-      logger.debug('Heartbeat: no changes since last check — skipping agent call');
-      return;
-    }
-
-    if (stale && currentFingerprint === lastFingerprint) {
-      logger.info(`Heartbeat: no changes but ${(msSinceLast / 3_600_000).toFixed(1)}h since last beat — running proactive check`);
-    }
-
-    // Something changed — compute a summary of what
+    // Build change summary — tells the agent what's different since last tick
     let changesSummary = this.computeChangesSummary(
       this.lastState.details ?? {},
       currentDetails,
