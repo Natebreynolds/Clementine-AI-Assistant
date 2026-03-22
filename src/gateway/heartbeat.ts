@@ -8,6 +8,7 @@
  * the NotificationDispatcher, which fans out to all active channels.
  */
 
+import { execSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import {
   appendFileSync,
@@ -714,13 +715,14 @@ export function parseCronJobs(): CronJobDefinition[] {
       ? (job.success_criteria as unknown[]).map(c => String(c))
       : undefined;
     const alwaysDeliver = job.always_deliver === true ? true : undefined;
+    const preCheck = job.pre_check != null ? String(job.pre_check) : undefined;
 
     if (!name || !schedule || !prompt) {
       logger.warn({ job }, 'Skipping malformed cron job');
       continue;
     }
 
-    jobs.push({ name, schedule, prompt, enabled, tier, maxTurns, model, workDir, mode, maxHours, maxRetries, after, successCriteria, alwaysDeliver });
+    jobs.push({ name, schedule, prompt, enabled, tier, maxTurns, model, workDir, mode, maxHours, maxRetries, after, successCriteria, alwaysDeliver, preCheck });
   }
 
   return jobs;
@@ -769,6 +771,7 @@ export function parseAgentCronJobs(agentsDir: string): CronJobDefinition[] {
         const successCriteria = Array.isArray(job.success_criteria)
           ? (job.success_criteria as unknown[]).map(c => String(c))
           : undefined;
+        const preCheck = job.pre_check != null ? String(job.pre_check) : undefined;
 
         if (!name || !schedule || !prompt) {
           logger.warn({ job, agent: slug }, 'Skipping malformed agent cron job');
@@ -779,7 +782,7 @@ export function parseAgentCronJobs(agentsDir: string): CronJobDefinition[] {
         allJobs.push({
           name: `${slug}:${name}`,
           schedule, prompt, enabled, tier, maxTurns, model, workDir,
-          mode, maxHours, maxRetries, after, successCriteria,
+          mode, maxHours, maxRetries, after, successCriteria, preCheck,
           agentSlug: slug,
         });
       }
@@ -1170,6 +1173,40 @@ export class CronScheduler {
         return;
       }
       this.completedJobs.delete(job.name);
+    }
+
+    // ── Pre-check gate: run shell command, skip job if exit non-zero ──
+    if (job.preCheck) {
+      try {
+        const preCheckStart = Date.now();
+        const stdout = execSync(job.preCheck, {
+          timeout: 30_000,
+          encoding: 'utf-8',
+          stdio: ['pipe', 'pipe', 'pipe'],
+          cwd: job.workDir || undefined,
+        }).trim();
+        const preCheckMs = Date.now() - preCheckStart;
+        logger.info({ job: job.name, preCheckMs, hasOutput: stdout.length > 0 }, 'Pre-check passed');
+
+        // Inject pre-check output as context so the agent doesn't re-query
+        if (stdout.length > 0) {
+          job = { ...job, prompt: `Pre-check data (already fetched — use this, do not re-query):\n\`\`\`\n${stdout.slice(0, 4000)}\n\`\`\`\n\n${job.prompt}` };
+        }
+      } catch (preCheckErr: unknown) {
+        // Non-zero exit or timeout → skip the job
+        const exitCode = (preCheckErr as { status?: number }).status ?? 1;
+        logger.info({ job: job.name, exitCode }, 'Pre-check failed — skipping job (no work to do)');
+        this.runLog.append({
+          jobName: job.name,
+          startedAt: new Date().toISOString(),
+          finishedAt: new Date().toISOString(),
+          status: 'skipped',
+          durationMs: 0,
+          attempt: 0,
+          outputPreview: `Pre-check exit ${exitCode} — no work`,
+        });
+        return;
+      }
     }
 
     this.runningJobs.add(job.name);

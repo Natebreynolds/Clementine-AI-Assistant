@@ -160,13 +160,14 @@ export interface CronJobDefinition {
   agentSlug?: string;              // Agent that owns this cron job (scoped execution)
   successCriteria?: string[];      // Verifiable acceptance criteria for goal-backward reflection
   alwaysDeliver?: boolean;         // If true, retry once with explicit prompt when response is empty/noise
+  preCheck?: string;               // Shell command gate — exit 0 = run, non-zero = skip. Stdout injected as context.
 }
 
 export interface CronRunEntry {
   jobName: string;
   startedAt: string;
   finishedAt: string;
-  status: 'ok' | 'error' | 'retried';
+  status: 'ok' | 'error' | 'retried' | 'skipped';
   durationMs: number;
   error?: string;
   errorType?: 'transient' | 'permanent';
