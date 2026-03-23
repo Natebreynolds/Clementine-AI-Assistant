@@ -531,14 +531,16 @@ export async function startDiscord(
       .setTimestamp(now)
       .setFooter({ text: 'Auto-updates on state changes \u00b7 !dashboard to refresh' });
 
-    // ── Lanes ──────────────────────────────────────────────────────
+    // ── Lanes (only show if something is active or queued) ────────
     const lanes = gateway.getLaneStatus();
-    const laneLines = Object.entries(lanes).map(([name, l]) => {
-      const bar = '\u2588'.repeat(l.active) + '\u2591'.repeat(l.limit - l.active);
-      const queued = l.queued > 0 ? ` (+${l.queued} queued)` : '';
-      return `\`${bar}\` ${name} ${l.active}/${l.limit}${queued}`;
-    });
-    embed.addFields({ name: '\u{1F6A6} Lanes', value: laneLines.join('\n') || 'All idle', inline: false });
+    const busyLanes = Object.entries(lanes).filter(([, l]) => l.active > 0 || l.queued > 0);
+    if (busyLanes.length > 0) {
+      const laneLines = busyLanes.map(([name, l]) => {
+        const queued = l.queued > 0 ? ` (+${l.queued} queued)` : '';
+        return `${name} **${l.active}**/${l.limit}${queued}`;
+      });
+      embed.addFields({ name: '\u{1F6A6} Lanes', value: laneLines.join(' \u00b7 '), inline: false });
+    }
 
     // ── Active work ───────────────────────────────────────────────
     const runningItems: string[] = [];
@@ -561,25 +563,25 @@ export async function startDiscord(
             const elapsed = s.startedAt
               ? Math.round((Date.now() - new Date(s.startedAt).getTime()) / 60000)
               : 0;
-            const elStr = elapsed < 60 ? `${elapsed}m` : `${Math.floor(elapsed / 60)}h${elapsed % 60}m`;
-            runningItems.push(`\u{1F680} ${s.jobName ?? dir} \u00b7 phase ${s.phase ?? 0} \u00b7 ${elStr}`);
+            runningItems.push(`\u{1F680} ${s.jobName ?? dir} \u00b7 phase ${s.phase ?? 0} \u00b7 ${formatDuration(elapsed)}`);
           } catch { /* skip */ }
         }
       } catch { /* skip */ }
     }
 
-    embed.addFields({
-      name: `\u2699\uFE0F Active (${runningItems.length})`,
-      value: runningItems.length > 0 ? runningItems.join('\n') : '\u2705 All quiet',
-      inline: false,
-    });
+    if (runningItems.length > 0) {
+      embed.addFields({
+        name: `\u2699\uFE0F Active (${runningItems.length})`,
+        value: runningItems.join('\n'),
+        inline: false,
+      });
+    }
 
     // ── Today's stats ─────────────────────────────────────────────
-    const statsLine = `\u2705 ${todayStats.ok}` +
-      (todayStats.errors > 0 ? ` \u00b7 \u274C ${todayStats.errors}` : '') +
-      (todayStats.skipped > 0 ? ` \u00b7 \u23ED ${todayStats.skipped}` : '') +
-      ` \u00b7 ${todayStats.total} total`;
-    embed.addFields({ name: '\u{1F4CA} Today', value: statsLine, inline: true });
+    const statsLine = `\u2705 ${todayStats.ok} passed` +
+      (todayStats.errors > 0 ? ` \u00b7 \u274C ${todayStats.errors} failed` : '') +
+      (todayStats.skipped > 0 ? ` \u00b7 \u23ED ${todayStats.skipped} skipped` : '');
+    embed.addFields({ name: `\u{1F4CA} Today (${todayStats.total} runs)`, value: statsLine, inline: true });
 
     // ── Sessions ──────────────────────────────────────────────────
     const provenance = gateway.getAllProvenance();
@@ -605,11 +607,13 @@ export async function startDiscord(
       const nextLines = upcoming.slice(0, 6).map(u => {
         const diffMs = u.nextMs - now.getTime();
         const diffMin = Math.round(diffMs / 60000);
-        const timeStr = diffMin < 1 ? 'now'
-          : diffMin < 60 ? `${diffMin}m`
-          : `${Math.floor(diffMin / 60)}h${diffMin % 60}m`;
-        const agentTag = u.agent ? ` \`${u.agent}\`` : '';
-        return `\`${timeStr.padStart(5)}\` ${u.name}${agentTag}`;
+        const timeStr = formatDuration(diffMin);
+        // Strip agent slug prefix from job name if it matches (avoid "ross-the-sdr:task ross-the-sdr")
+        const displayName = u.agent && u.name.startsWith(`${u.agent}:`)
+          ? u.name.slice(u.agent.length + 1)
+          : u.name;
+        const agentTag = u.agent ? ` _${u.agent}_` : '';
+        return `\`${timeStr.padStart(4)}\` ${displayName}${agentTag}`;
       });
       if (upcoming.length > 6) nextLines.push(`_+${upcoming.length - 6} more_`);
       embed.addFields({ name: '\u{1F4C5} Next Runs', value: nextLines.join('\n'), inline: false });
@@ -626,9 +630,9 @@ export async function startDiscord(
       }
       const agentLines = agents.map(a => {
         const jobCount = agentJobCounts.get(a.slug) ?? 0;
-        const modelTag = a.model ? ` \u00b7 ${a.model}` : '';
-        const jobTag = jobCount > 0 ? ` \u00b7 ${jobCount} job${jobCount > 1 ? 's' : ''}` : '';
-        return `**${a.name}** (\`${a.slug}\`)${modelTag}${jobTag}`;
+        const model = a.model || 'sonnet';
+        const jobTag = jobCount > 0 ? `${jobCount} job${jobCount > 1 ? 's' : ''}` : 'no jobs';
+        return `**${a.name}** \u2014 ${model} \u00b7 ${jobTag}`;
       });
       embed.addFields({ name: `\u{1F916} Agents (${agents.length})`, value: agentLines.join('\n'), inline: false });
     }
@@ -637,16 +641,16 @@ export async function startDiscord(
     const siState = cronScheduler.getSelfImproveStatus();
     const siPending = cronScheduler.getSelfImprovePending();
     const m = siState.baselineMetrics;
-    const siLines = [
-      `Status: **${siState.status}** \u00b7 Experiments: ${siState.totalExperiments}`,
-    ];
+    const siLines: string[] = [];
     if (m.feedbackPositiveRatio > 0 || m.cronSuccessRate > 0) {
-      siLines.push(`Feedback: ${(m.feedbackPositiveRatio * 100).toFixed(0)}% \u2705 \u00b7 Cron: ${(m.cronSuccessRate * 100).toFixed(0)}% \u2705`);
+      siLines.push(`Feedback: ${(m.feedbackPositiveRatio * 100).toFixed(0)}% \u00b7 Cron: ${(m.cronSuccessRate * 100).toFixed(0)}% \u00b7 ${siState.totalExperiments} experiments`);
+    } else {
+      siLines.push(`${siState.totalExperiments} experiments`);
     }
     if (siPending.length > 0) {
-      siLines.push(`**${siPending.length} pending** \u2014 \`!self-improve pending\``);
+      siLines.push(`**${siPending.length} pending approval${siPending.length > 1 ? 's' : ''}** \u2014 \`!self-improve pending\``);
     }
-    embed.addFields({ name: '\u{1F52C} Self-Improvement', value: siLines.join('\n'), inline: false });
+    embed.addFields({ name: `\u{1F52C} Self-Improvement (${siState.status})`, value: siLines.join('\n'), inline: false });
 
     // ── Scheduled jobs summary ────────────────────────────────────
     const enabledCount = jobDefs.filter(j => j.active).length;
@@ -655,6 +659,20 @@ export async function startDiscord(
     embed.addFields({ name: '\u{1F4CB} Scheduled', value: schedSummary, inline: true });
 
     return embed;
+  }
+
+  /** Format a duration in minutes to a compact human string. */
+  function formatDuration(minutes: number): string {
+    if (minutes < 1) return '<1m';
+    if (minutes < 60) return `${minutes}m`;
+    if (minutes < 1440) {
+      const h = Math.floor(minutes / 60);
+      const m = minutes % 60;
+      return m > 0 ? `${h}h${m}m` : `${h}h`;
+    }
+    const d = Math.floor(minutes / 1440);
+    const h = Math.floor((minutes % 1440) / 60);
+    return h > 0 ? `${d}d${h}h` : `${d}d`;
   }
 
   /** Parse a cron expression and return the next run Date. */
