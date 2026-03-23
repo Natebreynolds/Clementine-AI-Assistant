@@ -52,6 +52,7 @@ import {
   CRON_PROGRESS_DIR,
   CRON_REFLECTIONS_DIR,
   HANDOFFS_DIR,
+  BUDGET,
 } from '../config.js';
 import type { AgentProfile, OnTextCallback, OnToolActivityCallback, SessionData, VerboseLevel } from '../types.js';
 import {
@@ -448,6 +449,7 @@ export class PersonalAssistant {
   private _lastUserMessage?: string;
   private onUnleashedComplete: ((jobName: string, result: string) => void) | null = null;
   private onPhaseComplete: ((jobName: string, phase: number, totalPhases: number, output: string) => void) | null = null;
+  private onPhaseProgress: ((jobName: string, phase: number, summary: string) => void) | null = null;
   private _lastMcpStatus: Array<{ name: string; status: string }> = [];
   private _lastMcpStatusTime: string = '';
 
@@ -477,6 +479,10 @@ export class PersonalAssistant {
 
   setPhaseCompleteCallback(cb: (jobName: string, phase: number, totalPhases: number, output: string) => void): void {
     this.onPhaseComplete = cb;
+  }
+
+  setPhaseProgressCallback(cb: (jobName: string, phase: number, summary: string) => void): void {
+    this.onPhaseProgress = cb;
   }
 
   getMcpStatus(): { servers: Array<{ name: string; status: string }>; updatedAt: string } {
@@ -836,10 +842,14 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
     sessionKey?: string | null;
     streaming?: boolean;
     isPlanStep?: boolean;
+    isUnleashed?: boolean;
     sourceOverride?: 'owner-dm' | 'owner-channel' | 'autonomous';
     disableAllTools?: boolean;
     verboseLevel?: VerboseLevel;
     abortController?: AbortController;
+    effort?: 'low' | 'medium' | 'high';
+    maxBudgetUsd?: number;
+    thinking?: { type: 'adaptive' };
   } = {}): SDKOptions {
     const {
       isHeartbeat = false,
@@ -852,10 +862,14 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
       sessionKey = null,
       streaming = false,
       isPlanStep = false,
+      isUnleashed = false,
       sourceOverride,
       disableAllTools = false,
       verboseLevel,
       abortController,
+      effort,
+      maxBudgetUsd,
+      thinking,
     } = opts;
 
     let allowedTools = [
@@ -961,6 +975,30 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
     });
     const fullSystemPrompt = customPrompt + '\n\n' + securityPrompt;
 
+    // ── Compute effort level ──────────────────────────────────────
+    const computedEffort: 'low' | 'medium' | 'high' | undefined = effort ?? (
+      isHeartbeat && !isCron ? 'low'
+      : isCron && (cronTier ?? 0) < 2 ? 'low'
+      : isCron && !isUnleashed ? 'medium'
+      : isPlanStep || isUnleashed ? 'high'
+      : undefined
+    );
+
+    // ── Compute budget cap ────────────────────────────────────────
+    const computedBudget: number | undefined = maxBudgetUsd ?? (
+      isHeartbeat && !isCron ? BUDGET.heartbeat
+      : isCron && (cronTier ?? 0) < 2 ? BUDGET.cronT1
+      : isCron ? BUDGET.cronT2
+      : BUDGET.chat
+    );
+
+    // ── Compute adaptive thinking ─────────────────────────────────
+    const supportsThinking = !resolvedModel.includes('haiku');
+    const needsThinking = !isHeartbeat && (isPlanStep || isUnleashed || !isCron);
+    const computedThinking = thinking ?? (
+      supportsThinking && needsThinking ? { type: 'adaptive' as const } : undefined
+    );
+
     return {
       systemPrompt: fullSystemPrompt,
       model: resolvedModel,
@@ -985,6 +1023,9 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
       maxTurns: effectiveMaxTurns,
       cwd: BASE_DIR,
       env: SAFE_ENV,
+      ...(computedEffort ? { effort: computedEffort } : {}),
+      ...(computedBudget !== undefined ? { maxBudgetUsd: computedBudget } : {}),
+      ...(computedThinking ? { thinking: computedThinking } : {}),
       canUseTool: async (toolName: string, toolInput: Record<string, unknown>, _options: { signal: AbortSignal; toolUseID: string }) => {
         const result = await enforceToolPermissions(toolName, toolInput, capturedSource);
         if (result.behavior === 'deny') {
@@ -1531,7 +1572,10 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
                 const errorText = 'errors' in result ? result.errors.join('; ') : ('result' in result ? result.result : '');
                 if (errorText) {
                   const lower = errorText.toLowerCase();
-                  if (lower.includes('rate') && lower.includes('limit')) {
+                  if (lower.includes('max_budget_usd') || lower.includes('budget')) {
+                    logger.warn({ sessionKey }, 'Chat query hit budget cap');
+                    responseText = responseText || 'I hit the cost limit for this query. Try breaking it into smaller requests.';
+                  } else if (lower.includes('rate') && lower.includes('limit')) {
                     hitRateLimit = true;
                   } else {
                     responseText = responseText || `Error: ${errorText}`;
@@ -1747,6 +1791,8 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
           maxTurns: 1,
           cwd: BASE_DIR,
           env: SAFE_ENV,
+          effort: 'low',
+          maxBudgetUsd: BUDGET.summarization,
         },
       });
 
@@ -1961,6 +2007,8 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
           maxTurns: 5,
           cwd: BASE_DIR,
           env: SAFE_ENV,
+          effort: 'low',
+          maxBudgetUsd: BUDGET.memoryExtraction,
         },
       });
 
@@ -2343,6 +2391,14 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
                 duration_ms: result.duration_ms,
               }, 'Cron job query completed');
             }
+            // Detect budget exceeded — treat as permanent error so cron doesn't retry
+            if (result.is_error && 'result' in result) {
+              const exitText = String((result as any).result ?? '');
+              if (exitText.includes('max_budget_usd') || exitText.includes('budget')) {
+                logger.warn({ job: jobName }, 'Cron job hit budget cap — treating as permanent error');
+                throw new Error(`Budget exceeded for cron job '${jobName}'`);
+              }
+            }
             if (this.memoryStore && result.modelUsage) {
               try {
                 this.memoryStore.logUsage({
@@ -2417,24 +2473,51 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
       `3. ACTIONABLE: Does it give the owner something useful — information, a decision, a deliverable?\n` +
       `4. COMMUNICATION: Is the output well-structured for the reader? Does it lead with the key takeaway, use appropriate formatting, and avoid unnecessary preamble?\n` +
       (successCriteria?.length ? `5. CRITERIA: Were the success criteria met?\n` : '') +
-      `\nRespond with ONLY a JSON object (no markdown):\n` +
-      `{"existence": true/false, "substance": true/false, "actionable": true/false, "communication": true/false, ` +
-      `"comm_note": "one sentence on communication quality, or 'none'", ` +
-      `${successCriteria?.length ? '"criteria_met": true/false, ' : ''}` +
-      `"quality": 1-5, "gap": "one sentence on what's missing or could improve, or 'none'"}`;
+      `\nRespond with the structured JSON assessment.`;
 
     try {
-      const result = await this.runPlanStep('cron-reflection', reflectionPrompt, {
-        tier: 1,
-        maxTurns: 1,
-        model: 'haiku',
-        disableTools: true,
+      let responseText = '';
+      const stream = query({
+        prompt: reflectionPrompt,
+        options: {
+          systemPrompt: 'You are a task output verifier. Assess the output quality.',
+          model: MODELS.haiku,
+          permissionMode: 'bypassPermissions',
+          allowDangerouslySkipPermissions: true,
+          maxTurns: 1,
+          cwd: BASE_DIR,
+          env: SAFE_ENV,
+          effort: 'low',
+          maxBudgetUsd: BUDGET.reflection,
+          outputFormat: {
+            type: 'json_schema',
+            schema: {
+              type: 'object',
+              properties: {
+                existence: { type: 'boolean' },
+                substance: { type: 'boolean' },
+                actionable: { type: 'boolean' },
+                communication: { type: 'boolean' },
+                comm_note: { type: 'string' },
+                criteria_met: { type: 'boolean' },
+                quality: { type: 'integer' },
+                gap: { type: 'string' },
+              },
+              required: ['existence', 'substance', 'actionable', 'communication', 'quality', 'gap'],
+            },
+          },
+        },
       });
 
-      // Parse and log the reflection
-      const jsonMatch = result.match(/\{[\s\S]*?\}/);
-      if (jsonMatch) {
-        const reflection = JSON.parse(jsonMatch[0]);
+      for await (const message of stream) {
+        if (message.type === 'assistant') {
+          const blocks = getContentBlocks(message as SDKAssistantMessage);
+          responseText += extractText(blocks);
+        }
+      }
+
+      if (responseText.trim()) {
+        const reflection = JSON.parse(responseText.trim());
         const entry = {
           jobName,
           timestamp: new Date().toISOString(),
@@ -2544,7 +2627,12 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
         maxTurns: turnsPerPhase,
         model: model ?? null,
         enableTeams: true,
+        isUnleashed: true,
+        maxBudgetUsd: BUDGET.unleashedPhase,
       });
+
+      // Enable progress summaries for real-time status updates
+      (sdkOptions as any).agentProgressSummaries = true;
 
       if (workDir) {
         sdkOptions.cwd = workDir;
@@ -2637,6 +2725,14 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
                 duration_ms: result.duration_ms,
               }, 'Unleashed phase completed');
             }
+            // Detect budget exceeded
+            if (result.is_error && 'result' in result) {
+              const exitText = String((result as any).result ?? '');
+              if (exitText.includes('max_budget_usd') || exitText.includes('budget')) {
+                logger.warn({ job: jobName, phase }, 'Unleashed phase hit budget cap');
+                appendProgress({ event: 'budget_exceeded', phase });
+              }
+            }
             if (this.memoryStore && result.modelUsage) {
               try {
                 this.memoryStore.logUsage({
@@ -2647,6 +2743,12 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
                   durationMs: result.duration_ms,
                 });
               } catch { /* non-fatal */ }
+            }
+          } else if ((message as any).type === 'task_progress') {
+            // Agent progress summary from SDK
+            const progress = (message as any).summary || '';
+            if (progress && this.onPhaseProgress) {
+              try { this.onPhaseProgress(jobName, phase, progress); } catch { /* non-fatal */ }
             }
           } else if (message.type === 'system' || message.type === 'stream_event') {
             // Init / streaming messages — no action needed

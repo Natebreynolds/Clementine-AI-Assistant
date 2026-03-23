@@ -280,6 +280,10 @@ export class Gateway {
     this.assistant.setPhaseCompleteCallback(cb);
   }
 
+  setPhaseProgressCallback(cb: (jobName: string, phase: number, summary: string) => void): void {
+    this.assistant.setPhaseProgressCallback(cb);
+  }
+
   // ── Session verbose level ──────────────────────────────────────────
 
   setSessionVerboseLevel(sessionKey: string, level: VerboseLevel): void {
