@@ -521,6 +521,7 @@ async function asyncMain(): Promise<void> {
       botManager = new BotManager({
         gateway,
         ownerId: config.DISCORD_OWNER_ID,
+        cronScheduler,
       });
       logger.info('BotManager: starting all agent bots...');
       const botOwnedChannels = await botManager.startAll();
