@@ -42,6 +42,20 @@ import * as cronParser from 'cron-parser';
 
 const logger = pino({ name: 'clementine.agent-bot' });
 
+/** Format a duration in minutes to a compact human string. */
+function formatAgentDuration(minutes: number): string {
+  if (minutes < 1) return '<1m';
+  if (minutes < 60) return `${minutes}m`;
+  if (minutes < 1440) {
+    const h = Math.floor(minutes / 60);
+    const m = minutes % 60;
+    return m > 0 ? `${h}h${m}m` : `${h}h`;
+  }
+  const d = Math.floor(minutes / 1440);
+  const h = Math.floor((minutes % 1440) / 60);
+  return h > 0 ? `${d}d${h}h` : `${d}d`;
+}
+
 // ── Slash commands shared by all agent bots ──────────────────────────
 
 const agentSlashCommands = [
@@ -299,25 +313,19 @@ export class AgentBotClient {
       const owner = await this.client.users.fetch(this.config.ownerId, { force: true });
       const dmChannel = await owner.createDM();
 
-      const channelList = this.resolvedChannelIds.length > 0
-        ? this.resolvedChannelIds.map(id => `<#${id}>`).join(', ')
-        : 'none (DMs only)';
-
-      const embed = new EmbedBuilder()
-        .setColor(0x22c55e)
-        .setTitle(`${this.config.profile.name} is online`)
-        .setDescription(this.config.profile.description)
-        .addFields(
-          { name: 'Channels', value: channelList, inline: true },
-          { name: 'Model', value: this.config.profile.model || 'sonnet', inline: true },
-          { name: 'Tier', value: String(this.config.profile.tier), inline: true },
-        )
-        .setFooter({ text: `Agent bot \u00b7 ${this.client.user?.tag ?? 'unknown'}` })
-        .setTimestamp();
-
-      if (this.config.profile.avatar) {
-        embed.setThumbnail(this.config.profile.avatar);
-      }
+      // Use the rich agent status embed if cronScheduler is available
+      const embed = this.config.cronScheduler
+        ? this.buildAgentStatusEmbed()
+        : new EmbedBuilder()
+            .setColor(0x22c55e)
+            .setTitle(`${this.config.profile.name} is online`)
+            .setDescription(this.config.profile.description)
+            .addFields(
+              { name: 'Model', value: this.config.profile.model || 'sonnet', inline: true },
+              { name: 'Tier', value: String(this.config.profile.tier), inline: true },
+            )
+            .setFooter({ text: `Agent bot \u00b7 ${this.client.user?.tag ?? 'unknown'}` })
+            .setTimestamp();
 
       await dmChannel.send({ embeds: [embed] });
       logger.info({ slug: this.config.slug }, 'Sent startup status embed to owner DMs');
@@ -339,8 +347,6 @@ export class AgentBotClient {
     const myJobs = allJobs.filter(j => j.agentSlug === slug);
     const activeJobs = myJobs.filter(j => j.active);
 
-    // Today's stats scoped to this agent's jobs
-    const todayStats = cs?.getTodayStats() ?? { total: 0, ok: 0, errors: 0, skipped: 0 };
     // Agent-scoped today stats from run log
     let myOk = 0, myErrors = 0, mySkipped = 0, myTotal = 0;
     if (cs) {
@@ -380,19 +386,44 @@ export class AgentBotClient {
     }
 
     // ── Active work
-    const runningItems = myRunning.map(j => `\u23F3 ${j}`);
-    embed.addFields({
-      name: `\u2699\uFE0F Active (${runningItems.length})`,
-      value: runningItems.length > 0 ? runningItems.join('\n') : '\u2705 All quiet',
-      inline: true,
-    });
+    if (myRunning.length > 0) {
+      const runningItems = myRunning.map(j => {
+        // Strip agent slug prefix from job name
+        const display = j.startsWith(`${slug}:`) ? j.slice(slug.length + 1) : j;
+        return `\u23F3 ${display}`;
+      });
+      embed.addFields({
+        name: `\u2699\uFE0F Active (${runningItems.length})`,
+        value: runningItems.join('\n'),
+        inline: false,
+      });
+    }
 
     // ── Today's stats
-    const statsLine = `\u2705 ${myOk}` +
-      (myErrors > 0 ? ` \u00b7 \u274C ${myErrors}` : '') +
-      (mySkipped > 0 ? ` \u00b7 \u23ED ${mySkipped}` : '') +
-      ` \u00b7 ${myTotal} total`;
-    embed.addFields({ name: '\u{1F4CA} Today', value: statsLine, inline: true });
+    const statsLine = `\u2705 ${myOk} passed` +
+      (myErrors > 0 ? ` \u00b7 \u274C ${myErrors} failed` : '') +
+      (mySkipped > 0 ? ` \u00b7 \u23ED ${mySkipped} skipped` : '');
+    embed.addFields({ name: `\u{1F4CA} Today (${myTotal} runs)`, value: statsLine, inline: false });
+
+    // ── Last run results per job
+    if (cs && myJobs.length > 0) {
+      const lastRunLines: string[] = [];
+      for (const job of activeJobs) {
+        const recent = cs.runLog.readRecent(job.name, 1);
+        const display = job.name.startsWith(`${slug}:`) ? job.name.slice(slug.length + 1) : job.name;
+        if (recent.length > 0) {
+          const r = recent[0];
+          const icon = r.status === 'ok' ? '\u2705' : r.status === 'error' ? '\u274C' : '\u23ED';
+          const ago = Math.round((Date.now() - new Date(r.finishedAt).getTime()) / 60000);
+          lastRunLines.push(`${icon} ${display} \u2014 ${formatAgentDuration(ago)} ago`);
+        } else {
+          lastRunLines.push(`\u2B1C ${display} \u2014 never run`);
+        }
+      }
+      if (lastRunLines.length > 0) {
+        embed.addFields({ name: '\u{1F4DD} Last Runs', value: lastRunLines.join('\n'), inline: false });
+      }
+    }
 
     // ── Next runs for this agent
     const upcoming: Array<{ name: string; nextMs: number }> = [];
@@ -411,29 +442,25 @@ export class AgentBotClient {
       const nextLines = upcoming.slice(0, 5).map(u => {
         const diffMs = u.nextMs - now.getTime();
         const diffMin = Math.round(diffMs / 60000);
-        const timeStr = diffMin < 1 ? 'now'
-          : diffMin < 60 ? `${diffMin}m`
-          : `${Math.floor(diffMin / 60)}h${diffMin % 60}m`;
-        return `\`${timeStr.padStart(5)}\` ${u.name}`;
+        const display = u.name.startsWith(`${slug}:`) ? u.name.slice(slug.length + 1) : u.name;
+        return `\`${formatAgentDuration(diffMin).padStart(4)}\` ${display}`;
       });
       if (upcoming.length > 5) nextLines.push(`_+${upcoming.length - 5} more_`);
       embed.addFields({ name: '\u{1F4C5} Next Runs', value: nextLines.join('\n'), inline: false });
     }
 
-    // ── Scheduled summary
+    // ── Config + Schedule summary
     const disabledCount = myJobs.length - activeJobs.length;
-    const schedSummary = `${activeJobs.length} active` + (disabledCount > 0 ? ` \u00b7 ${disabledCount} disabled` : '');
-    embed.addFields({ name: '\u{1F4CB} Scheduled', value: schedSummary, inline: true });
-
-    // ── Config
-    embed.addFields({
-      name: '\u{1F527} Config',
-      value: `Model: ${profile.model || 'sonnet'} \u00b7 Tier: ${profile.tier}`,
-      inline: true,
-    });
+    const configParts = [
+      `Model: ${profile.model || 'sonnet'}`,
+      `Tier: ${profile.tier}`,
+      `Jobs: ${activeJobs.length} active` + (disabledCount > 0 ? `, ${disabledCount} disabled` : ''),
+    ];
+    embed.addFields({ name: '\u{1F527} Config', value: configParts.join(' \u00b7 '), inline: false });
 
     return embed;
   }
+
 
   private async sendOrUpdateStatusEmbed(): Promise<void> {
     try {
