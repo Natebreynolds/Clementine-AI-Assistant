@@ -957,6 +957,19 @@ export class CronScheduler {
     this.gateway = gateway;
     this.dispatcher = dispatcher;
     this.runLog = new CronRunLog();
+    // Eagerly load job definitions (without scheduling) so they're
+    // available for queries before start() is called — agent bots
+    // query jobs on connect which happens before start().
+    this.loadJobDefinitions();
+  }
+
+  /** Load job definitions from CRON.md and agent dirs without scheduling tasks. */
+  private loadJobDefinitions(): void {
+    this.jobs = parseCronJobs();
+    const agentJobs = parseAgentCronJobs(AGENTS_DIR);
+    if (agentJobs.length > 0) {
+      this.jobs.push(...agentJobs);
+    }
   }
 
   /** Register a listener that fires when system state changes (job start/finish, self-improve, etc). */
