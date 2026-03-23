@@ -232,10 +232,12 @@ export class HeartbeatScheduler {
         timeContext,
       );
 
-      const timeStr = `${String(hour).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
+      const h12 = hour === 0 ? 12 : hour > 12 ? hour - 12 : hour;
+      const ampm = hour >= 12 ? 'PM' : 'AM';
+      const timeStr = `${h12}:${String(now.getMinutes()).padStart(2, '0')} ${ampm}`;
       if (response && !HeartbeatScheduler.isSilent(response)) {
-        await this.dispatcher.send(`**[Heartbeat — ${timeStr}]**\n\n${response}`);
-        logToDailyNote(`**Heartbeat ${timeStr}**: ${response.slice(0, 100).replace(/\n/g, ' ')}`);
+        await this.dispatcher.send(`**[${timeStr} check-in]**\n\n${response}`);
+        logToDailyNote(`**${timeStr}**: ${response.slice(0, 100).replace(/\n/g, ' ')}`);
       } else {
         logger.info(`Heartbeat silent at ${timeStr}`);
         // Don't log "all clear" heartbeats to daily notes — they create noise
