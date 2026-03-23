@@ -113,6 +113,19 @@ export const MODELS: Models = {
   opus: 'claude-opus-4-6',
 };
 
+// ── Budget caps (USD per query) ──────────────────────────────────────
+
+export const BUDGET = {
+  heartbeat: 0.03,
+  cronT1: 0.10,
+  cronT2: 0.50,
+  chat: 2.00,
+  unleashedPhase: 5.00,
+  memoryExtraction: 0.05,
+  summarization: 0.02,
+  reflection: 0.02,
+} as const;
+
 export const DEFAULT_MODEL_TIER = (getEnv('DEFAULT_MODEL_TIER', 'sonnet')) as keyof Models;
 export const MODEL = MODELS[DEFAULT_MODEL_TIER] ?? MODELS.sonnet;
 
