@@ -35,8 +35,10 @@ import {
 import pino from 'pino';
 import type { AgentProfile } from '../types.js';
 import type { Gateway } from '../gateway/router.js';
+import type { CronScheduler } from '../gateway/heartbeat.js';
 import { chunkText, sendChunked, DiscordStreamingMessage, friendlyToolName, sanitizeResponse } from './discord-utils.js';
 import { MODELS } from '../config.js';
+import * as cronParser from 'cron-parser';
 
 const logger = pino({ name: 'clementine.agent-bot' });
 
@@ -69,6 +71,8 @@ export interface AgentBotConfig {
   profile: AgentProfile;
   /** Explicit channel IDs to listen in. If empty, auto-discovered on connect. */
   channelIds?: string[];
+  /** CronScheduler for building agent-scoped status embeds. */
+  cronScheduler?: CronScheduler;
 }
 
 export type AgentBotStatus = 'offline' | 'connecting' | 'online' | 'error';
@@ -81,6 +85,9 @@ export class AgentBotClient {
   private errorMessage?: string;
   /** Resolved channel IDs (set on ready, after auto-discovery). */
   private resolvedChannelIds: string[] = [];
+  /** Pinned status embed message (edited in-place on state changes). */
+  private statusEmbedMessage: Message | null = null;
+  private statusEmbedDebounce: ReturnType<typeof setTimeout> | null = null;
 
   constructor(config: AgentBotConfig, gateway: Gateway) {
     this.config = config;
@@ -136,6 +143,19 @@ export class AgentBotClient {
 
       // Send startup status to owner's DMs
       await this.sendStartupStatus();
+
+      // Send status embed to the agent's primary channel (if available)
+      if (this.config.cronScheduler && this.resolvedChannelIds.length > 0) {
+        await this.sendOrUpdateStatusEmbed();
+
+        // Auto-update status embed on state changes (debounced)
+        this.config.cronScheduler.onStatusChange(() => {
+          if (this.statusEmbedDebounce) clearTimeout(this.statusEmbedDebounce);
+          this.statusEmbedDebounce = setTimeout(() => {
+            this.sendOrUpdateStatusEmbed().catch(() => {});
+          }, 2000);
+        });
+      }
     });
 
     this.client.on(Events.InteractionCreate, async (interaction: Interaction) => {
@@ -303,6 +323,140 @@ export class AgentBotClient {
       logger.info({ slug: this.config.slug }, 'Sent startup status embed to owner DMs');
     } catch (err) {
       logger.error({ err, slug: this.config.slug }, 'Failed to send startup status embed');
+    }
+  }
+
+  // ── Agent-scoped status embed ──────────────────────────────────────
+
+  private buildAgentStatusEmbed(): EmbedBuilder {
+    const now = new Date();
+    const slug = this.config.slug;
+    const profile = this.config.profile;
+    const cs = this.config.cronScheduler;
+
+    // Get agent-scoped job definitions
+    const allJobs = cs?.getJobDefinitions() ?? [];
+    const myJobs = allJobs.filter(j => j.agentSlug === slug);
+    const activeJobs = myJobs.filter(j => j.active);
+
+    // Today's stats scoped to this agent's jobs
+    const todayStats = cs?.getTodayStats() ?? { total: 0, ok: 0, errors: 0, skipped: 0 };
+    // Agent-scoped today stats from run log
+    let myOk = 0, myErrors = 0, mySkipped = 0, myTotal = 0;
+    if (cs) {
+      const midnight = new Date();
+      midnight.setHours(0, 0, 0, 0);
+      const midnightISO = midnight.toISOString();
+      for (const job of myJobs) {
+        const entries = cs.runLog.readRecent(job.name, 50);
+        for (const e of entries) {
+          if (e.startedAt < midnightISO) break;
+          myTotal++;
+          if (e.status === 'ok') myOk++;
+          else if (e.status === 'error') myErrors++;
+          else if (e.status === 'skipped') mySkipped++;
+        }
+      }
+    }
+
+    // Running jobs for this agent
+    const runningJobs = cs?.getRunningJobs() ?? [];
+    const myRunning = runningJobs.filter(j => myJobs.some(mj => mj.name === j));
+
+    // Health color
+    const healthColor = myErrors > 0 ? 0xE74C3C
+      : myRunning.length > 0 ? 0xF39C12
+      : 0x2ECC71;
+
+    const embed = new EmbedBuilder()
+      .setTitle(`${profile.name} Status`)
+      .setDescription(profile.description)
+      .setColor(healthColor)
+      .setTimestamp(now)
+      .setFooter({ text: `Auto-updates \u00b7 !dashboard to refresh \u00b7 ${slug}` });
+
+    if (profile.avatar) {
+      embed.setThumbnail(profile.avatar);
+    }
+
+    // ── Active work
+    const runningItems = myRunning.map(j => `\u23F3 ${j}`);
+    embed.addFields({
+      name: `\u2699\uFE0F Active (${runningItems.length})`,
+      value: runningItems.length > 0 ? runningItems.join('\n') : '\u2705 All quiet',
+      inline: true,
+    });
+
+    // ── Today's stats
+    const statsLine = `\u2705 ${myOk}` +
+      (myErrors > 0 ? ` \u00b7 \u274C ${myErrors}` : '') +
+      (mySkipped > 0 ? ` \u00b7 \u23ED ${mySkipped}` : '') +
+      ` \u00b7 ${myTotal} total`;
+    embed.addFields({ name: '\u{1F4CA} Today', value: statsLine, inline: true });
+
+    // ── Next runs for this agent
+    const upcoming: Array<{ name: string; nextMs: number }> = [];
+    for (const job of activeJobs) {
+      try {
+        const fields = job.schedule.trim().split(/\s+/);
+        const expr = fields.length === 6 ? fields.slice(1).join(' ') : job.schedule;
+        const interval = cronParser.CronExpressionParser.parse(expr);
+        const next = interval.next().toDate();
+        upcoming.push({ name: job.name, nextMs: next.getTime() });
+      } catch { /* skip */ }
+    }
+    upcoming.sort((a, b) => a.nextMs - b.nextMs);
+
+    if (upcoming.length > 0) {
+      const nextLines = upcoming.slice(0, 5).map(u => {
+        const diffMs = u.nextMs - now.getTime();
+        const diffMin = Math.round(diffMs / 60000);
+        const timeStr = diffMin < 1 ? 'now'
+          : diffMin < 60 ? `${diffMin}m`
+          : `${Math.floor(diffMin / 60)}h${diffMin % 60}m`;
+        return `\`${timeStr.padStart(5)}\` ${u.name}`;
+      });
+      if (upcoming.length > 5) nextLines.push(`_+${upcoming.length - 5} more_`);
+      embed.addFields({ name: '\u{1F4C5} Next Runs', value: nextLines.join('\n'), inline: false });
+    }
+
+    // ── Scheduled summary
+    const disabledCount = myJobs.length - activeJobs.length;
+    const schedSummary = `${activeJobs.length} active` + (disabledCount > 0 ? ` \u00b7 ${disabledCount} disabled` : '');
+    embed.addFields({ name: '\u{1F4CB} Scheduled', value: schedSummary, inline: true });
+
+    // ── Config
+    embed.addFields({
+      name: '\u{1F527} Config',
+      value: `Model: ${profile.model || 'sonnet'} \u00b7 Tier: ${profile.tier}`,
+      inline: true,
+    });
+
+    return embed;
+  }
+
+  private async sendOrUpdateStatusEmbed(): Promise<void> {
+    try {
+      const embed = this.buildAgentStatusEmbed();
+      if (this.statusEmbedMessage) {
+        try {
+          await this.statusEmbedMessage.edit({ embeds: [embed] });
+          return;
+        } catch {
+          this.statusEmbedMessage = null;
+        }
+      }
+      // Send to the agent's primary channel
+      if (this.resolvedChannelIds.length > 0) {
+        const channelId = this.resolvedChannelIds[0];
+        const channel = this.client.channels.cache.get(channelId);
+        if (channel && 'send' in channel) {
+          this.statusEmbedMessage = await (channel as any).send({ embeds: [embed] });
+          try { await this.statusEmbedMessage!.pin(); } catch { /* may lack perms */ }
+        }
+      }
+    } catch (err) {
+      logger.error({ err, slug: this.config.slug }, 'Failed to update agent status embed');
     }
   }
 
@@ -738,6 +892,24 @@ export class AgentBotClient {
     }
 
     if (!text) return;
+
+    // !dashboard command — show agent-scoped status embed
+    if (text === '!dashboard') {
+      if (this.config.cronScheduler) {
+        // Unpin old, send fresh, pin new
+        if (this.statusEmbedMessage) {
+          try { await this.statusEmbedMessage.unpin(); } catch { /* non-fatal */ }
+        }
+        const embed = this.buildAgentStatusEmbed();
+        if ('send' in message.channel) {
+          this.statusEmbedMessage = await (message.channel as any).send({ embeds: [embed] });
+          try { await this.statusEmbedMessage!.pin(); } catch { /* non-fatal */ }
+        }
+      } else {
+        await message.reply('Status dashboard unavailable (no scheduler connected).');
+      }
+      return;
+    }
 
     // !clear command
     if (text === '!clear') {

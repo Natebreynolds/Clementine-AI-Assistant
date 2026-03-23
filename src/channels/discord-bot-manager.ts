@@ -11,6 +11,7 @@ import { writeFileSync } from 'node:fs';
 import path from 'node:path';
 import pino from 'pino';
 import type { Gateway } from '../gateway/router.js';
+import type { CronScheduler } from '../gateway/heartbeat.js';
 import { AgentBotClient, type AgentBotStatus } from './discord-agent-bot.js';
 import { chunkText, formatCronEmbed } from './discord-utils.js';
 
@@ -19,6 +20,7 @@ const logger = pino({ name: 'clementine.bot-manager' });
 export interface BotManagerConfig {
   gateway: Gateway;
   ownerId: string;
+  cronScheduler?: CronScheduler;
   statusFilePath?: string;
 }
 
@@ -35,6 +37,7 @@ export class BotManager {
   private bots = new Map<string, AgentBotClient>();
   private gateway: Gateway;
   private ownerId: string;
+  private cronScheduler?: CronScheduler;
   private statusFilePath: string;
   private pollInterval?: ReturnType<typeof setInterval>;
   private statusInterval?: ReturnType<typeof setInterval>;
@@ -42,6 +45,7 @@ export class BotManager {
   constructor(config: BotManagerConfig) {
     this.gateway = config.gateway;
     this.ownerId = config.ownerId;
+    this.cronScheduler = config.cronScheduler;
     this.statusFilePath = config.statusFilePath ??
       path.join(process.env.CLEMENTINE_HOME || path.join(process.env.HOME || '', '.clementine'), '.bot-status.json');
   }
@@ -101,6 +105,7 @@ export class BotManager {
         ownerId: this.ownerId,
         profile,
         channelIds: explicitChannelIds,
+        cronScheduler: this.cronScheduler,
       },
       this.gateway,
     );
