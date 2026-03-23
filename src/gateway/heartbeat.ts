@@ -1566,6 +1566,33 @@ export class CronScheduler {
     return [...this.runningWorkflows];
   }
 
+  /** Return all job definitions with enabled/disabled state for the status embed. */
+  getJobDefinitions(): Array<CronJobDefinition & { active: boolean }> {
+    return this.jobs.map(j => ({
+      ...j,
+      active: j.enabled && !this.disabledJobs.has(j.name),
+    }));
+  }
+
+  /** Get today's run stats: total runs, successes, failures (since local midnight). */
+  getTodayStats(): { total: number; ok: number; errors: number; skipped: number } {
+    const midnight = new Date();
+    midnight.setHours(0, 0, 0, 0);
+    const midnightISO = midnight.toISOString();
+    let total = 0, ok = 0, errors = 0, skipped = 0;
+    for (const job of this.jobs) {
+      const entries = this.runLog.readRecent(job.name, 50);
+      for (const e of entries) {
+        if (e.startedAt < midnightISO) break;
+        total++;
+        if (e.status === 'ok') ok++;
+        else if (e.status === 'error') errors++;
+        else if (e.status === 'skipped') skipped++;
+      }
+    }
+    return { total, ok, errors, skipped };
+  }
+
   disableJob(jobName: string): string {
     const job = this.jobs.find((j) => j.name === jobName);
     if (!job) return `Job not found: ${jobName}`;
