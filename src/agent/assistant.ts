@@ -2034,21 +2034,23 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
       model: MODELS.haiku,
     });
     const now = new Date();
-    const timestamp = now.toISOString().slice(0, 16).replace('T', ' ');
+    const localTime = formatTime(now);
+    const localDate = formatDate(now);
+    const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
     const owner = OWNER;
 
     const promptParts = [
-      `[HEARTBEAT — ${timestamp}]\n`,
-      'This is an autonomous heartbeat check. Follow the standing instructions below.',
+      `[Heartbeat — ${localTime}, ${localDate} (${tz})]\n`,
+      `You are checking in as ${owner}'s personal assistant. Write naturally — like a brief status update to a colleague, not a system report. No bullet-point checklists, no checkmarks, no "all systems nominal" language. If there is nothing noteworthy, just say so in a sentence or two. If something needs attention, lead with that.`,
     ];
     if (timeContext) {
-      promptParts.push(`\n**Time context:** ${timeContext}`);
+      promptParts.push(`\nTime context: ${timeContext}`);
     }
     if (changesSummary) {
       promptParts.push(
-        `\n**Changes since last heartbeat:** ${changesSummary}\n` +
-        'Focus on the changes above. Only log an entry to the daily note if you ' +
-        "took an action or found something new. Do NOT log 'all clear' entries.",
+        `\nWhat changed since last check-in: ${changesSummary}\n` +
+        'Focus on what changed. Only log to the daily note if you took an action ' +
+        "or found something new — don't log routine check-ins.",
       );
     }
     promptParts.push(
