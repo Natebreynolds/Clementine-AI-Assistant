@@ -148,7 +148,7 @@ const DESTRUCTIVE_PATTERNS = [
   /\bdrop\s+database\b/i,
 ];
 
-const PRIVATE_URL_PATTERNS = [
+export const PRIVATE_URL_PATTERNS = [
   /localhost/i,
   /127\.0\.0\.1/,
   /0\.0\.0\.0/,
@@ -499,6 +499,9 @@ function summarizeToolCall(toolName: string, toolInput: Record<string, unknown>)
   }
   if (toolName.includes('memory_recall')) {
     return `recalled: ${toolInput.query ?? '?'}`;
+  }
+  if (toolName.includes('web_search')) {
+    return `searched web: ${toolInput.query ?? '?'}`;
   }
   if (toolName.includes('task_add')) {
     return `added task: ${toolInput.description ?? '?'}`;

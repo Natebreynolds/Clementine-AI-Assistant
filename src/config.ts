@@ -277,6 +277,11 @@ export function validateSecrets(): string[] {
 export const TEAM_COMMS_CHANNEL = getEnv('TEAM_COMMS_CHANNEL');
 export const TEAM_COMMS_LOG = path.join(BASE_DIR, 'logs', 'team-comms.jsonl');
 
+// ── Link Extraction ──────────────────────────────────────────────────
+
+export const LINK_EXTRACT_MAX_URLS = 3;
+export const LINK_EXTRACT_MAX_CHARS = 4000;
+
 // ── Memory / Search ──────────────────────────────────────────────────
 
 export const MEMORY_DB_PATH = path.join(VAULT_DIR, '.memory.db');

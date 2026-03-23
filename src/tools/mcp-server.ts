@@ -1413,7 +1413,74 @@ function extractAttr(xml: string, tag: string, attr: string): string {
   return m ? m[1] : '';
 }
 
-// ── 14. github_prs ─────────────────────────────────────────────────────
+// ── 14. web_search ──────────────────────────────────────────────────────
+
+server.tool(
+  'web_search',
+  'Search the web via DuckDuckGo. Returns titles, URLs, and snippets. No API key required.',
+  {
+    query: z.string().describe('Search query'),
+    max_results: z.number().optional().default(5).describe('Max results (1-10)'),
+  },
+  async ({ query, max_results }) => {
+    const encoded = encodeURIComponent(query);
+    const url = `https://html.duckduckgo.com/html/?q=${encoded}`;
+    const response = await fetch(url, {
+      headers: { 'User-Agent': 'Clementine/1.0' },
+      signal: AbortSignal.timeout(15000),
+    });
+    const html = await response.text();
+    const results = parseDdgResults(html, Math.min(max_results ?? 5, 10));
+    if (!results.length) return textResult(`No results found for: ${query}`);
+    const formatted = results
+      .map((r, i) => `${i + 1}. **${r.title}**\n   ${r.url}\n   ${r.snippet}`)
+      .join('\n\n');
+    return externalResult(`Search results for "${query}":\n\n${formatted}`);
+  },
+);
+
+/** Parse DuckDuckGo HTML search results. */
+function parseDdgResults(
+  html: string,
+  max: number,
+): Array<{ title: string; url: string; snippet: string }> {
+  const results: Array<{ title: string; url: string; snippet: string }> = [];
+
+  // DDG wraps each result in a <div class="result ..."> with:
+  //   <a class="result__a" href="...">Title</a>
+  //   <a class="result__snippet" ...>Snippet text</a>
+  const resultBlockRe = /<div[^>]*class="[^"]*result\b[^"]*"[^>]*>([\s\S]*?)<\/div>\s*(?=<div[^>]*class="[^"]*result\b|$)/gi;
+  const titleRe = /<a[^>]*class="result__a"[^>]*href="([^"]*)"[^>]*>([\s\S]*?)<\/a>/i;
+  const snippetRe = /<(?:a|span)[^>]*class="result__snippet"[^>]*>([\s\S]*?)<\/(?:a|span)>/i;
+
+  let blockMatch: RegExpExecArray | null;
+  while ((blockMatch = resultBlockRe.exec(html)) !== null && results.length < max) {
+    const block = blockMatch[1];
+    const titleMatch = titleRe.exec(block);
+    if (!titleMatch) continue;
+
+    let href = titleMatch[1];
+    // DDG proxies URLs through //duckduckgo.com/l/?uddg=<encoded_url>
+    if (href.includes('uddg=')) {
+      const uddg = new URL(href, 'https://duckduckgo.com').searchParams.get('uddg');
+      if (uddg) href = uddg;
+    }
+    const title = titleMatch[2].replace(/<[^>]+>/g, '').trim();
+
+    const snippetMatch = snippetRe.exec(block);
+    const snippet = snippetMatch
+      ? snippetMatch[1].replace(/<[^>]+>/g, '').trim()
+      : '';
+
+    if (title && href) {
+      results.push({ title, url: href, snippet });
+    }
+  }
+
+  return results;
+}
+
+// ── 15. github_prs ─────────────────────────────────────────────────────
 
 server.tool(
   'github_prs',
