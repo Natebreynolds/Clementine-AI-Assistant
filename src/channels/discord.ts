@@ -55,6 +55,7 @@ import type { HeartbeatScheduler, CronScheduler } from '../gateway/heartbeat.js'
 import type { NotificationDispatcher } from '../gateway/notifications.js';
 import type { Gateway } from '../gateway/router.js';
 import { findProjectByName, getLinkedProjects } from '../agent/assistant.js';
+import * as cronParser from 'cron-parser';
 
 const logger = pino({ name: 'clementine.discord' });
 
@@ -514,13 +515,23 @@ export async function startDiscord(
 
   function buildStatusEmbed(): EmbedBuilder {
     const now = new Date();
+
+    // ── Determine overall health color ─────────────────────────────
+    const todayStats = cronScheduler.getTodayStats();
+    const runningJobs = cronScheduler.getRunningJobs();
+    const runningWorkflows = cronScheduler.getRunningWorkflowNames();
+    const activeCount = runningJobs.length + runningWorkflows.length;
+    const healthColor = todayStats.errors > 0 ? 0xE74C3C  // red — errors today
+      : activeCount > 0 ? 0xF39C12                        // amber — work in progress
+      : 0x2ECC71;                                          // green — all clear
+
     const embed = new EmbedBuilder()
       .setTitle(`${ASSISTANT_NAME} System Status`)
-      .setColor(0x6C5CE7)
+      .setColor(healthColor)
       .setTimestamp(now)
-      .setFooter({ text: 'Updates on state changes \u00b7 !dashboard to refresh' });
+      .setFooter({ text: 'Auto-updates on state changes \u00b7 !dashboard to refresh' });
 
-    // ── Lanes
+    // ── Lanes ──────────────────────────────────────────────────────
     const lanes = gateway.getLaneStatus();
     const laneLines = Object.entries(lanes).map(([name, l]) => {
       const bar = '\u2588'.repeat(l.active) + '\u2591'.repeat(l.limit - l.active);
@@ -529,79 +540,135 @@ export async function startDiscord(
     });
     embed.addFields({ name: '\u{1F6A6} Lanes', value: laneLines.join('\n') || 'All idle', inline: false });
 
-    // ── Running cron jobs
-    const runningJobs = cronScheduler.getRunningJobs();
-    const runningWorkflows = cronScheduler.getRunningWorkflowNames();
+    // ── Active work ───────────────────────────────────────────────
     const runningItems: string[] = [];
     for (const j of runningJobs) runningItems.push(`\u23F3 ${j}`);
     for (const w of runningWorkflows) runningItems.push(`\u{1F504} ${w} (workflow)`);
+
+    // Unleashed tasks
+    const unleashedDir = path.join(BASE_DIR, 'unleashed');
+    if (existsSync(unleashedDir)) {
+      try {
+        const dirs = readdirSync(unleashedDir).filter(d => {
+          try { return statSync(path.join(unleashedDir, d)).isDirectory(); } catch { return false; }
+        });
+        for (const dir of dirs) {
+          const sf = path.join(unleashedDir, dir, 'status.json');
+          if (!existsSync(sf)) continue;
+          try {
+            const s = JSON.parse(readFileSync(sf, 'utf-8'));
+            if (s.status !== 'running') continue;
+            const elapsed = s.startedAt
+              ? Math.round((Date.now() - new Date(s.startedAt).getTime()) / 60000)
+              : 0;
+            const elStr = elapsed < 60 ? `${elapsed}m` : `${Math.floor(elapsed / 60)}h${elapsed % 60}m`;
+            runningItems.push(`\u{1F680} ${s.jobName ?? dir} \u00b7 phase ${s.phase ?? 0} \u00b7 ${elStr}`);
+          } catch { /* skip */ }
+        }
+      } catch { /* skip */ }
+    }
+
     embed.addFields({
-      name: `\u2699\uFE0F Active Jobs (${runningItems.length})`,
+      name: `\u2699\uFE0F Active (${runningItems.length})`,
       value: runningItems.length > 0 ? runningItems.join('\n') : '\u2705 All quiet',
+      inline: false,
+    });
+
+    // ── Today's stats ─────────────────────────────────────────────
+    const statsLine = `\u2705 ${todayStats.ok}` +
+      (todayStats.errors > 0 ? ` \u00b7 \u274C ${todayStats.errors}` : '') +
+      (todayStats.skipped > 0 ? ` \u00b7 \u23ED ${todayStats.skipped}` : '') +
+      ` \u00b7 ${todayStats.total} total`;
+    embed.addFields({ name: '\u{1F4CA} Today', value: statsLine, inline: true });
+
+    // ── Sessions ──────────────────────────────────────────────────
+    const provenance = gateway.getAllProvenance();
+    embed.addFields({
+      name: '\u{1F4AC} Sessions',
+      value: `${provenance.size} active`,
       inline: true,
     });
 
-    // ── Unleashed tasks
-    const unleashedDir = path.join(BASE_DIR, 'unleashed');
-    const unleashedLines: string[] = [];
-    if (existsSync(unleashedDir)) {
-      const dirs = readdirSync(unleashedDir).filter(d => {
-        try { return statSync(path.join(unleashedDir, d)).isDirectory(); } catch { return false; }
-      });
-      for (const dir of dirs) {
-        const sf = path.join(unleashedDir, dir, 'status.json');
-        if (!existsSync(sf)) continue;
-        try {
-          const s = JSON.parse(readFileSync(sf, 'utf-8'));
-          if (s.status !== 'running') continue;
-          const elapsed = s.startedAt
-            ? Math.round((Date.now() - new Date(s.startedAt).getTime()) / 60000)
-            : 0;
-          const elStr = elapsed < 60 ? `${elapsed}m` : `${Math.floor(elapsed / 60)}h${elapsed % 60}m`;
-          unleashedLines.push(`\u{1F535} ${s.jobName ?? dir} \u00b7 phase ${s.phase ?? 0} \u00b7 ${elStr}`);
-        } catch { /* skip */ }
-      }
+    // ── Next scheduled runs ───────────────────────────────────────
+    const jobDefs = cronScheduler.getJobDefinitions();
+    const upcoming: Array<{ name: string; nextMs: number; agent?: string }> = [];
+    for (const job of jobDefs) {
+      if (!job.active) continue;
+      try {
+        const next = getNextCronRun(job.schedule);
+        if (next) upcoming.push({ name: job.name, nextMs: next.getTime(), agent: job.agentSlug });
+      } catch { /* skip unparseable */ }
     }
-    if (unleashedLines.length > 0) {
-      embed.addFields({ name: '\u{1F680} Unleashed', value: unleashedLines.join('\n'), inline: true });
+    upcoming.sort((a, b) => a.nextMs - b.nextMs);
+
+    if (upcoming.length > 0) {
+      const nextLines = upcoming.slice(0, 6).map(u => {
+        const diffMs = u.nextMs - now.getTime();
+        const diffMin = Math.round(diffMs / 60000);
+        const timeStr = diffMin < 1 ? 'now'
+          : diffMin < 60 ? `${diffMin}m`
+          : `${Math.floor(diffMin / 60)}h${diffMin % 60}m`;
+        const agentTag = u.agent ? ` \`${u.agent}\`` : '';
+        return `\`${timeStr.padStart(5)}\` ${u.name}${agentTag}`;
+      });
+      if (upcoming.length > 6) nextLines.push(`_+${upcoming.length - 6} more_`);
+      embed.addFields({ name: '\u{1F4C5} Next Runs', value: nextLines.join('\n'), inline: false });
     }
 
-    // ── Self-improvement
+    // ── Agents ────────────────────────────────────────────────────
+    const agents = gateway.getAgentManager().listAll();
+    if (agents.length > 0) {
+      const agentJobCounts = new Map<string, number>();
+      for (const job of jobDefs) {
+        if (job.agentSlug && job.active) {
+          agentJobCounts.set(job.agentSlug, (agentJobCounts.get(job.agentSlug) ?? 0) + 1);
+        }
+      }
+      const agentLines = agents.map(a => {
+        const jobCount = agentJobCounts.get(a.slug) ?? 0;
+        const modelTag = a.model ? ` \u00b7 ${a.model}` : '';
+        const jobTag = jobCount > 0 ? ` \u00b7 ${jobCount} job${jobCount > 1 ? 's' : ''}` : '';
+        return `**${a.name}** (\`${a.slug}\`)${modelTag}${jobTag}`;
+      });
+      embed.addFields({ name: `\u{1F916} Agents (${agents.length})`, value: agentLines.join('\n'), inline: false });
+    }
+
+    // ── Self-improvement ──────────────────────────────────────────
     const siState = cronScheduler.getSelfImproveStatus();
     const siPending = cronScheduler.getSelfImprovePending();
     const m = siState.baselineMetrics;
     const siLines = [
-      `Status: **${siState.status}**`,
-      `Last run: ${siState.lastRunAt ? new Date(siState.lastRunAt).toLocaleDateString() : 'never'}`,
-      `Experiments: ${siState.totalExperiments}`,
+      `Status: **${siState.status}** \u00b7 Experiments: ${siState.totalExperiments}`,
     ];
     if (m.feedbackPositiveRatio > 0 || m.cronSuccessRate > 0) {
       siLines.push(`Feedback: ${(m.feedbackPositiveRatio * 100).toFixed(0)}% \u2705 \u00b7 Cron: ${(m.cronSuccessRate * 100).toFixed(0)}% \u2705`);
     }
     if (siPending.length > 0) {
-      siLines.push(`**${siPending.length} pending approval${siPending.length > 1 ? 's' : ''}** \u2014 use \`!self-improve pending\``);
+      siLines.push(`**${siPending.length} pending** \u2014 \`!self-improve pending\``);
     }
     embed.addFields({ name: '\u{1F52C} Self-Improvement', value: siLines.join('\n'), inline: false });
 
-    // ── Sessions
-    const provenance = gateway.getAllProvenance();
-    const sessionCount = provenance.size;
-    embed.addFields({
-      name: '\u{1F4AC} Sessions',
-      value: `${sessionCount} active`,
-      inline: true,
-    });
-
-    // ── Cron summary
-    const jobNames = cronScheduler.getJobNames();
-    const enabledCount = jobNames.length;
-    embed.addFields({
-      name: '\u{1F4CB} Scheduled',
-      value: `${enabledCount} jobs configured`,
-      inline: true,
-    });
+    // ── Scheduled jobs summary ────────────────────────────────────
+    const enabledCount = jobDefs.filter(j => j.active).length;
+    const disabledCount = jobDefs.length - enabledCount;
+    const schedSummary = `${enabledCount} active` + (disabledCount > 0 ? ` \u00b7 ${disabledCount} disabled` : '');
+    embed.addFields({ name: '\u{1F4CB} Scheduled', value: schedSummary, inline: true });
 
     return embed;
+  }
+
+  /** Parse a cron expression and return the next run Date. */
+  function getNextCronRun(schedule: string): Date | null {
+    try {
+      // node-cron uses 6-field (with seconds) or 5-field; cron-parser expects 5-field
+      const fields = schedule.trim().split(/\s+/);
+      // If 6 fields, drop the leading seconds field
+      const expr = fields.length === 6 ? fields.slice(1).join(' ') : schedule;
+      const interval = cronParser.CronExpressionParser.parse(expr);
+      return interval.next().toDate();
+    } catch {
+      return null;
+    }
   }
 
   async function sendOrUpdateStatusEmbed(channel?: Message['channel']): Promise<void> {
@@ -620,6 +687,8 @@ export async function startDiscord(
       const target = channel ?? cachedDmChannel;
       if (target && 'send' in target) {
         statusEmbedMessage = await (target as any).send({ embeds: [embed] });
+        // Pin the status message so it's easy to find
+        try { await statusEmbedMessage!.pin(); } catch { /* may already be pinned or lack perms */ }
       }
     } catch (err) {
       logger.error({ err }, 'Failed to update status embed');
@@ -631,7 +700,12 @@ export async function startDiscord(
     try {
       const embed = buildStatusEmbed();
       if ('send' in channel) {
+        // Unpin old status message if it exists
+        if (statusEmbedMessage) {
+          try { await statusEmbedMessage.unpin(); } catch { /* non-fatal */ }
+        }
         statusEmbedMessage = await (channel as any).send({ embeds: [embed] });
+        try { await statusEmbedMessage!.pin(); } catch { /* non-fatal */ }
       }
     } catch (err) {
       logger.error({ err }, 'Failed to send fresh status embed');
