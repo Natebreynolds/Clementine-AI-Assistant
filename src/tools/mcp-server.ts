@@ -2675,7 +2675,7 @@ server.tool(
 
 server.tool(
   'add_cron_job',
-  'Add a new scheduled cron job. Validates the schedule expression and writes to CRON.md. The daemon auto-reloads on file change. Use mode "unleashed" for long-running tasks (hours) with phased execution and checkpointing.',
+  'Add a new scheduled cron job. Validates the schedule expression and writes to CRON.md. The daemon auto-reloads on file change. Use mode "unleashed" for multi-step tasks (browser automation, batch processing, multi-contact workflows) — they need more turns than standard mode provides. Auto-escalates to unleashed when complex patterns are detected.',
   {
     name: z.string().describe('Job name (unique identifier)'),
     schedule: z.string().describe('Cron expression (e.g., "0 9 * * 1" for Monday 9 AM)'),
@@ -2686,11 +2686,38 @@ server.tool(
     mode: z.enum(['standard', 'unleashed']).optional().default('standard').describe('standard = normal cron, unleashed = long-running phased execution with checkpointing'),
     max_hours: z.number().optional().describe('Max hours for unleashed mode (default 6). Ignored for standard mode.'),
   },
-  async ({ name: jobName, schedule, prompt, tier, enabled, work_dir, mode, max_hours }) => {
+  async ({ name: jobName, schedule, prompt, tier, enabled, work_dir, mode: rawMode, max_hours: rawMaxHours }) => {
+    let mode = rawMode;
+    let max_hours = rawMaxHours;
     // Validate cron expression
     const cronMod = await import('node-cron');
     if (!cronMod.default.validate(schedule)) {
       return textResult(`Invalid cron expression: "${schedule}". Examples: "0 9 * * 1" (Mon 9 AM), "*/30 * * * *" (every 30 min).`);
+    }
+
+    // Auto-escalate to unleashed when the job clearly needs it.
+    // Tier 2 jobs with complex prompts (browser automation, multi-contact workflows,
+    // multi-step sequences) will exhaust standard turn limits silently.
+    if (mode !== 'unleashed' && tier >= 2) {
+      const promptLower = prompt.toLowerCase();
+      const complexSignals = [
+        /\bfor each\b.*\bcontact\b/i,
+        /\bfor each\b.*\bprospect\b/i,
+        /\bfor each\b.*\baccount\b/i,
+        /\bfor each\b.*\blead\b/i,
+        /\bfor each\b.*\bprofile\b/i,
+        /\bplaywright\b/i,
+        /\bkernel\s+browsers?\b/i,
+        /\bbrowser\b.*\bautomati/i,
+        /\bstep\s+\d+\b.*\bstep\s+\d+\b/is,
+      ];
+      const isComplex = complexSignals.some(p => p.test(prompt))
+        || prompt.length > 2000;
+      if (isComplex) {
+        mode = 'unleashed';
+        if (!max_hours) max_hours = 1;
+        logger.info({ jobName }, 'Auto-escalated to unleashed mode (complex prompt detected)');
+      }
     }
 
     // Read existing CRON.md or create empty structure
@@ -2766,7 +2793,10 @@ server.tool(
       `  Enabled: ${enabled}`,
     ];
     if (work_dir) details.push(`  Project: ${work_dir}`);
-    if (mode === 'unleashed') details.push(`  Mode: unleashed (max ${max_hours ?? 6} hours)`);
+    if (mode === 'unleashed') {
+      const escalated = rawMode !== 'unleashed' ? ' (auto-escalated — complex prompt detected)' : '';
+      details.push(`  Mode: unleashed (max ${max_hours ?? 6} hours)${escalated}`);
+    }
 
     const verifyMsg = verified
       ? 'Verified: job persisted to CRON.md and will be picked up by the daemon.'
