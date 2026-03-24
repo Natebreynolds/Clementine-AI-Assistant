@@ -2253,7 +2253,7 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
     const sdkOptions = this.buildOptions({
       isHeartbeat: true,
       cronTier: tier,
-      maxTurns: maxTurns ?? HEARTBEAT_MAX_TURNS,
+      maxTurns: maxTurns ?? (tier >= 2 ? 30 : HEARTBEAT_MAX_TURNS),
       model: model ?? null,
       enableTeams: true,
     });
