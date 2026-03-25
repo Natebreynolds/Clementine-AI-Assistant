@@ -5126,12 +5126,15 @@ function getDashboardHTML(token: string): string {
     border-color: var(--accent) !important;
   }
 
-  /* ── Mobile hamburger (hidden on desktop) ── */
+  /* ── Mobile hamburger + overlay (hidden on desktop) ── */
   .menu-toggle {
     display: none;
     background: none; border: none; cursor: pointer;
     padding: 8px; margin-right: 4px; color: var(--text-primary);
     font-size: 20px; line-height: 1;
+  }
+  .sidebar-overlay {
+    display: none;
   }
 
   /* ── Mobile Responsive ─────────────────────── */
@@ -5165,7 +5168,6 @@ function getDashboardHTML(token: string): string {
 
     /* Overlay behind sidebar */
     .sidebar-overlay {
-      display: none;
       position: fixed;
       inset: 0;
       top: var(--header-h);
