@@ -122,13 +122,14 @@ function saveRemoteConfig(config: RemoteAccessConfig): void {
 
 /** Send tunnel URL to Discord via REST API (lightweight, no client library needed). */
 async function notifyTunnelUrl(url: string): Promise<void> {
+  console.log('  [tunnel] Posting URL to Discord...');
   const envPath = path.join(BASE_DIR, '.env');
-  if (!existsSync(envPath)) return;
+  if (!existsSync(envPath)) { console.log('  [tunnel] No .env — skipping'); return; }
   const envContent = readFileSync(envPath, 'utf-8');
 
   const tokenMatch = envContent.match(/^DISCORD_TOKEN=(.+)$/m);
   const channelMatch = envContent.match(/^DISCORD_WATCHED_CHANNELS=(.+)$/m);
-  if (!tokenMatch || !channelMatch) return;
+  if (!tokenMatch || !channelMatch) { console.log('  [tunnel] Missing DISCORD_TOKEN or DISCORD_WATCHED_CHANNELS'); return; }
 
   let token = tokenMatch[1].trim();
   if ((token.startsWith('"') && token.endsWith('"')) || (token.startsWith("'") && token.endsWith("'"))) {
@@ -138,7 +139,7 @@ async function notifyTunnelUrl(url: string): Promise<void> {
   if (!token || !channelId) return;
 
   try {
-    await fetch(`https://discord.com/api/v10/channels/${channelId}/messages`, {
+    const resp = await fetch(`https://discord.com/api/v10/channels/${channelId}/messages`, {
       method: 'POST',
       headers: {
         'Authorization': `Bot ${token}`,
@@ -148,7 +149,14 @@ async function notifyTunnelUrl(url: string): Promise<void> {
         content: `**Remote Dashboard Online**\n\nAccess your dashboard from anywhere:\n${url}\n\nLog in with your access token from \`Settings > Remote Access\`.`,
       }),
     });
-  } catch { /* best-effort notification */ }
+    if (resp.ok) {
+      console.log('  [tunnel] Discord notification sent');
+    } else {
+      console.error(`  [tunnel] Discord API error ${resp.status}: ${await resp.text().catch(() => '')}`);
+    }
+  } catch (err) {
+    console.error(`  [tunnel] Discord notification failed: ${err}`);
+  }
 }
 
 // ── Project scanning (mirrors workspace_list from MCP server) ────────
@@ -3239,11 +3247,15 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
       if (!tunnelManager || !tunnelManager.isRunning()) {
         tunnelManager = new TunnelManager(actualPort);
         tunnelManager.on('url', async (url: string) => {
+          console.log(`  [tunnel] URL received: ${url}`);
           config = loadRemoteConfig();
           config.tunnelUrl = url;
           saveRemoteConfig(config);
+          console.log(`  [tunnel] autoPost=${config.autoPost}`);
           if (config.autoPost) {
-            notifyTunnelUrl(url).catch(() => {});
+            notifyTunnelUrl(url).catch((err) => {
+              console.error('  [tunnel] notifyTunnelUrl error:', err);
+            });
           }
         });
         const url = await tunnelManager.start();
@@ -3362,11 +3374,15 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
     try {
       tunnelManager = new TunnelManager(actualPort);
       tunnelManager.on('url', async (url: string) => {
+        console.log(`  [tunnel] Auto-start URL received: ${url}`);
         const cfg = loadRemoteConfig();
         cfg.tunnelUrl = url;
         saveRemoteConfig(cfg);
+        console.log(`  [tunnel] autoPost=${cfg.autoPost}`);
         if (cfg.autoPost) {
-          notifyTunnelUrl(url).catch(() => {});
+          notifyTunnelUrl(url).catch((err) => {
+            console.error('  [tunnel] notifyTunnelUrl error:', err);
+          });
         }
       });
       const url = await tunnelManager.start();
