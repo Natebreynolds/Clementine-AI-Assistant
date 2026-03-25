@@ -378,6 +378,29 @@ export class SelfImproveLoop {
     metrics: PerformanceSnapshot,
     history: SelfImproveExperiment[],
   ): Promise<{ area: SelfImproveExperiment['area']; target: string; hypothesis: string; proposedChange: string } | null> {
+    // Read targeted triggers (written by cron scheduler when jobs fail repeatedly)
+    let targetedTriggers = '';
+    const triggersDir = path.join(SELF_IMPROVE_DIR, 'triggers');
+    if (existsSync(triggersDir)) {
+      const triggerFiles = readdirSync(triggersDir).filter(f => f.endsWith('.json'));
+      if (triggerFiles.length > 0) {
+        const triggers = triggerFiles.slice(0, 3).map(f => {
+          try {
+            const t = JSON.parse(readFileSync(path.join(triggersDir, f), 'utf-8'));
+            // Clean up trigger after reading
+            unlinkSync(path.join(triggersDir, f));
+            return t;
+          } catch { return null; }
+        }).filter(Boolean);
+        if (triggers.length > 0) {
+          targetedTriggers = `\n\n## PRIORITY: Failing Jobs Needing Attention\n` +
+            `These jobs have been failing repeatedly and need prompt/config fixes:\n` +
+            triggers.map((t: any) => `- **${t.jobName}**: ${t.consecutiveErrors} consecutive errors. Recent: ${(t.recentErrors ?? []).join('; ')}`).join('\n') +
+            `\n\nFocus your improvement hypothesis on fixing these jobs first.\n`;
+        }
+      }
+    }
+
     // Read current configuration files
     const soulContent = existsSync(SOUL_FILE) ? readFileSync(SOUL_FILE, 'utf-8').slice(0, 3000) : '(not found)';
     const agentsContent = existsSync(AGENTS_FILE) ? readFileSync(AGENTS_FILE, 'utf-8').slice(0, 2000) : '(not found)';
@@ -483,6 +506,7 @@ export class SelfImproveLoop {
       `- Goals with 0 progress notes → agents never started working on them\n` +
       `- Goals with no linked crons → no automated work loop driving progress\n\n` +
       `### Cron job errors:\n${cronErrorsText}\n\n` +
+      targetedTriggers +
       `## Current Configuration\n` +
       `### SOUL.md (personality/behavior):\n${soulContent}\n\n` +
       `### AGENTS.md (operating instructions):\n${agentsContent}\n\n` +

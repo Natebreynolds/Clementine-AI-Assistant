@@ -2661,6 +2661,37 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
     }
   });
 
+  // ── Team pending requests API ────────────────────────────────────
+  app.get('/api/team/pending-requests', async (req, res) => {
+    try {
+      const gw = await getGateway();
+      const agentSlug = req.query.agent as string;
+      if (!agentSlug) {
+        res.json({ ok: false, error: 'agent parameter required' });
+        return;
+      }
+      const bus = gw.getTeamBus();
+      const pending = bus.getPendingRequests(agentSlug);
+      res.json({ ok: true, requests: pending });
+    } catch (err) {
+      res.json({ ok: false, error: String(err) });
+    }
+  });
+
+  // ── Structured team request with response ──────────────────────
+  app.post('/api/team/request', async (req, res) => {
+    try {
+      const gw = await getGateway();
+      const { from_agent, to_agent, content, timeout_ms } = req.body;
+      const bus = gw.getTeamBus();
+      const response = await bus.request(from_agent, to_agent, content, timeout_ms ?? 300_000);
+      res.json({ ok: true, response: response.content, id: response.id });
+    } catch (err) {
+      const isTimeout = String(err).includes('timed out');
+      res.json({ ok: false, error: String(err), timed_out: isTimeout });
+    }
+  });
+
   // ── Start server (auto-increment port if taken) ──────────────────
 
   const maxAttempts = 10;
@@ -4735,6 +4766,7 @@ function getDashboardHTML(token: string): string {
       </div>
       <details style="margin-top:16px" id="team-comms-section">
         <summary style="cursor:pointer;font-weight:600;color:var(--text-secondary);font-size:13px;padding:8px 0;user-select:none">Communication Topology & Messages</summary>
+        <div id="team-pending-requests" style="margin-bottom:12px"></div>
         <div class="grid-2" style="margin-top:8px">
           <div class="card">
             <div class="card-header">Communication Topology</div>
@@ -7238,6 +7270,39 @@ async function refreshTeam() {
         grid.innerHTML = cards.join('');
       }
     }
+
+    // ── Pending Requests (shown above comms section) ──
+    try {
+      var allPending = [];
+      for (var ai = 0; ai < agents.length; ai++) {
+        try {
+          var prRes = await apiFetch('/api/team/pending-requests?agent=' + agents[ai].slug);
+          var prData = await prRes.json();
+          if (prData.ok && prData.requests && prData.requests.length > 0) {
+            for (var pi = 0; pi < prData.requests.length; pi++) {
+              prData.requests[pi]._forAgent = agents[ai].name;
+            }
+            allPending = allPending.concat(prData.requests);
+          }
+        } catch(pe) {}
+      }
+      var prEl = document.getElementById('team-pending-requests');
+      if (prEl) {
+        if (allPending.length > 0) {
+          prEl.innerHTML = '<div style="background:var(--bg-hover);border-radius:8px;padding:12px;margin-bottom:8px">' +
+            '<strong style="color:var(--accent)">Pending Requests (' + allPending.length + ')</strong>' +
+            allPending.map(function(r) {
+              return '<div style="margin-top:8px;padding:8px;background:var(--bg);border-radius:6px">' +
+                '<span style="color:var(--text-muted);font-size:12px">From ' + r.fromAgent + ' \\u2192 ' + r._forAgent + '</span>' +
+                '<div style="margin-top:4px">' + (r.content || '').slice(0, 150) + '</div>' +
+                '</div>';
+            }).join('') +
+            '</div>';
+        } else {
+          prEl.innerHTML = '';
+        }
+      }
+    } catch(pe) {}
 
     // ── Communication (loaded on demand when details is open) ──
     var commsSection = document.getElementById('team-comms-section');

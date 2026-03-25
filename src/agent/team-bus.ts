@@ -6,7 +6,8 @@
  */
 
 import { createHash, randomBytes } from 'node:crypto';
-import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import pino from 'pino';
 import type { AgentProfile, TeamMessage } from '../types.js';
@@ -35,6 +36,12 @@ export class TeamBus {
   /** "from:to:contentHash" → timestamp (for content dedup). */
   private contentHashes = new Map<string, number>();
   private statusChangeListeners: Array<() => void> = [];
+  private pendingRequests = new Map<string, {
+    message: TeamMessage;
+    resolve: (response: TeamMessage) => void;
+    reject: (err: Error) => void;
+    timer: ReturnType<typeof setTimeout>;
+  }>();
   private botManager?: import('../channels/discord-bot-manager.js').BotManager;
   private slackBotManager?: import('../channels/slack-bot-manager.js').SlackBotManager;
 
@@ -115,7 +122,7 @@ export class TeamBus {
     return null;
   }
 
-  /** Agent A sends a direct message to Agent B. */
+  /** Agent A sends a direct message to Agent B (fire-and-forget with cooldown/dedup). */
   async send(
     fromSlug: string,
     toSlug: string,
@@ -203,12 +210,222 @@ export class TeamBus {
       depth,
     };
 
-    // Deliver to target agent — prefer active bot delivery, fall back to session injection
+    await this.deliverMessage(message, fromSlug, toSlug);
+
+    return message;
+  }
+
+  /**
+   * Send a structured request and wait for the target agent's response.
+   * Bypasses cooldown — structured requests are explicitly tracked.
+   */
+  async request(
+    fromSlug: string,
+    toSlug: string,
+    content: string,
+    timeoutMs = 300_000,
+    sessionKey?: string,
+  ): Promise<TeamMessage> {
+    if (sessionKey) {
+      const expectedSlug = this.deriveSlugFromSession(sessionKey);
+      if (expectedSlug && expectedSlug !== fromSlug) {
+        throw new Error(
+          `Identity mismatch: session belongs to '${expectedSlug}' but fromSlug is '${fromSlug}'`,
+        );
+      }
+    }
+
+    // Validate sender permissions (same as send — team agents need canMessage)
+    const fromProfile = this.teamRouter.listTeamAgents().find((a) => a.slug === fromSlug);
+    if (fromProfile) {
+      if (!fromProfile.team?.canMessage.includes(toSlug)) {
+        throw new Error(
+          `Agent '${fromSlug}' is not authorized to message '${toSlug}'. ` +
+          `Allowed targets: ${fromProfile.team?.canMessage.join(', ') || 'none'}`,
+        );
+      }
+    }
+
+    const toProfile = this.teamRouter.listTeamAgents().find((a) => a.slug === toSlug);
+    if (!toProfile) {
+      throw new Error(`Target agent '${toSlug}' is not a team agent`);
+    }
+
+    const requestId = randomBytes(6).toString('hex');
+
+    const message: TeamMessage = {
+      id: randomBytes(4).toString('hex'),
+      fromAgent: fromSlug,
+      toAgent: toSlug,
+      content,
+      timestamp: new Date().toISOString(),
+      delivered: false,
+      depth: 0,
+      protocol: 'request',
+      requestId,
+      expectedBy: new Date(Date.now() + timeoutMs).toISOString(),
+    };
+
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.pendingRequests.delete(requestId);
+        reject(new Error(`Request to ${toSlug} timed out after ${timeoutMs}ms`));
+      }, timeoutMs);
+
+      this.pendingRequests.set(requestId, { message, resolve, reject, timer });
+
+      this.deliverMessage(message, fromSlug, toSlug).catch(err => {
+        this.pendingRequests.delete(requestId);
+        clearTimeout(timer);
+        reject(err);
+      });
+    });
+  }
+
+  /** Deliver a response to a pending structured request. */
+  async respond(
+    toRequestId: string,
+    fromSlug: string,
+    content: string,
+    _sessionKey?: string,
+  ): Promise<TeamMessage> {
+    const pending = this.pendingRequests.get(toRequestId);
+    if (!pending) {
+      throw new Error(`No pending request found with ID: ${toRequestId}`);
+    }
+
+    const responseMessage: TeamMessage = {
+      id: randomBytes(4).toString('hex'),
+      fromAgent: fromSlug,
+      toAgent: pending.message.fromAgent,
+      content,
+      timestamp: new Date().toISOString(),
+      delivered: true,
+      depth: 0,
+      protocol: 'response',
+      replyTo: toRequestId,
+    };
+
+    try {
+      appendFileSync(this.logFile, JSON.stringify(responseMessage) + '\n');
+    } catch { /* non-fatal */ }
+
+    clearTimeout(pending.timer);
+    this.pendingRequests.delete(toRequestId);
+    pending.resolve(responseMessage);
+
+    this.recentMessages.push(responseMessage);
+    if (this.recentMessages.length > RECENT_BUFFER_SIZE) {
+      this.recentMessages = this.recentMessages.slice(-RECENT_BUFFER_SIZE);
+    }
+
+    for (const cb of this.statusChangeListeners) {
+      try { cb(); } catch { /* ignore */ }
+    }
+
+    return responseMessage;
+  }
+
+  /** Broadcast a message to all team agents (optionally scoped to a goal). */
+  async broadcast(
+    fromSlug: string,
+    content: string,
+    goalId: string,
+    _sessionKey?: string,
+  ): Promise<TeamMessage[]> {
+    const goalsDir = path.join(
+      process.env.CLEMENTINE_HOME || path.join(os.homedir(), '.clementine'),
+      'goals',
+    );
+
+    let targetSlugs: string[] = [];
+    if (existsSync(goalsDir)) {
+      for (const f of readdirSync(goalsDir).filter(f => f.endsWith('.json'))) {
+        try {
+          const goal = JSON.parse(readFileSync(path.join(goalsDir, f), 'utf-8'));
+          if (goal.id === goalId && goal.owner && goal.owner !== fromSlug) {
+            targetSlugs.push(goal.owner);
+          }
+        } catch { continue; }
+      }
+    }
+
+    const allAgents = this.teamRouter.listTeamAgents();
+    for (const agent of allAgents) {
+      if (agent.slug !== fromSlug && !targetSlugs.includes(agent.slug)) {
+        targetSlugs.push(agent.slug);
+      }
+    }
+
+    targetSlugs = [...new Set(targetSlugs)].filter(s => s !== fromSlug);
+
+    const results: TeamMessage[] = [];
+    for (const toSlug of targetSlugs) {
+      try {
+        const msg: TeamMessage = {
+          id: randomBytes(4).toString('hex'),
+          fromAgent: fromSlug,
+          toAgent: toSlug,
+          content: `[Broadcast re: goal ${goalId}] ${content}`,
+          timestamp: new Date().toISOString(),
+          delivered: false,
+          depth: 0,
+          protocol: 'broadcast',
+        };
+        await this.deliverMessage(msg, fromSlug, toSlug);
+        results.push(msg);
+      } catch (err) {
+        logger.debug({ err, to: toSlug }, 'Broadcast delivery failed for agent');
+      }
+    }
+
+    return results;
+  }
+
+  /** Get pending structured requests addressed to an agent. */
+  getPendingRequests(agentSlug: string): Array<{
+    requestId: string;
+    fromAgent: string;
+    content: string;
+    timestamp: string;
+    expectedBy?: string;
+  }> {
+    const pending: Array<{
+      requestId: string;
+      fromAgent: string;
+      content: string;
+      timestamp: string;
+      expectedBy?: string;
+    }> = [];
+
+    for (const [requestId, entry] of this.pendingRequests) {
+      if (entry.message.toAgent === agentSlug) {
+        pending.push({
+          requestId,
+          fromAgent: entry.message.fromAgent,
+          content: entry.message.content,
+          timestamp: entry.message.timestamp,
+          expectedBy: entry.message.expectedBy,
+        });
+      }
+    }
+
+    return pending;
+  }
+
+  /** Core delivery logic — sends a message via bot or session injection. */
+  private async deliverMessage(
+    message: TeamMessage,
+    fromSlug: string,
+    toSlug: string,
+  ): Promise<void> {
+    const fromProfile = this.teamRouter.listTeamAgents().find((a) => a.slug === fromSlug);
+    const toProfile = this.teamRouter.listTeamAgents().find((a) => a.slug === toSlug);
     const senderName = fromProfile?.name ?? fromSlug;
 
     // Try Discord bot delivery first
     if (this.botManager?.hasBot(toSlug)) {
-      const botResponse = await this.botManager.deliverTeamMessage(toSlug, senderName, fromSlug, content);
+      const botResponse = await this.botManager.deliverTeamMessage(toSlug, senderName, fromSlug, message.content);
       if (botResponse !== null) {
         message.delivered = true;
         message.response = botResponse;
@@ -217,7 +434,7 @@ export class TeamBus {
 
     // Try Slack bot delivery
     if (!message.delivered && this.slackBotManager?.hasBot(toSlug)) {
-      const slackResponse = await this.slackBotManager.deliverTeamMessage(toSlug, senderName, fromSlug, content);
+      const slackResponse = await this.slackBotManager.deliverTeamMessage(toSlug, senderName, fromSlug, message.content);
       if (slackResponse !== null) {
         message.delivered = true;
         message.response = slackResponse;
@@ -225,14 +442,13 @@ export class TeamBus {
     }
 
     if (!message.delivered) {
-      // Fallback: passive context injection (agent sees it on next interaction)
-      const sessionKey = this.resolveSessionKey(toSlug);
-      if (sessionKey) {
-        this.gateway.setSessionProfile(sessionKey, toSlug);
+      const resolvedKey = this.resolveSessionKey(toSlug);
+      if (resolvedKey) {
+        this.gateway.setSessionProfile(resolvedKey, toSlug);
         this.gateway.injectContext(
-          sessionKey,
-          `[Team message from ${senderName} (${fromSlug}), depth=${depth}]`,
-          content,
+          resolvedKey,
+          `[Team message from ${senderName} (${fromSlug}), depth=${message.depth}]`,
+          message.content,
         );
         message.delivered = true;
       } else {
@@ -268,7 +484,7 @@ export class TeamBus {
     }
 
     logger.info(
-      { from: fromSlug, to: toSlug, id: message.id, depth, delivered: message.delivered },
+      { from: fromSlug, to: toSlug, id: message.id, depth: message.depth, delivered: message.delivered },
       'Team message sent',
     );
 
@@ -276,8 +492,6 @@ export class TeamBus {
     for (const cb of this.statusChangeListeners) {
       try { cb(); } catch { /* ignore */ }
     }
-
-    return message;
   }
 
   /** Register a listener that fires when team state changes. */
