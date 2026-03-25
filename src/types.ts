@@ -523,6 +523,16 @@ export interface DailyPlan {
   summary: string;
 }
 
+// ── Remote Access ──────────────────────────────────────────────────
+
+export interface RemoteAccessConfig {
+  enabled: boolean;
+  authToken: string;
+  tunnelUrl?: string;
+  autoPost: boolean;
+  lastStarted?: string;
+}
+
 // ── Utility types ────────────────────────────────────────────────────
 
 type float = number;

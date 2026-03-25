@@ -23,6 +23,8 @@ import { fileURLToPath } from 'node:url';
 import matter from 'gray-matter';
 import cron from 'node-cron';
 import type { Gateway } from '../gateway/router.js';
+import { TunnelManager } from './tunnel.js';
+import type { RemoteAccessConfig } from '../types.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -93,6 +95,59 @@ async function searchMemory(query: string, limit = 20): Promise<{ results: Array
   } finally {
     db.close();
   }
+}
+
+// ── Remote access config ────────────────────────────────────────────
+
+const REMOTE_CONFIG_PATH = path.join(BASE_DIR, 'remote-access.json');
+
+function generateAccessToken(): string {
+  const raw = randomBytes(12).toString('base64url').slice(0, 12);
+  return `clem_${raw.slice(0, 4)}-${raw.slice(4, 8)}-${raw.slice(8, 12)}`;
+}
+
+function loadRemoteConfig(): RemoteAccessConfig {
+  try {
+    if (existsSync(REMOTE_CONFIG_PATH)) {
+      return JSON.parse(readFileSync(REMOTE_CONFIG_PATH, 'utf-8'));
+    }
+  } catch { /* ignore */ }
+  return { enabled: false, authToken: '', autoPost: true };
+}
+
+function saveRemoteConfig(config: RemoteAccessConfig): void {
+  writeFileSync(REMOTE_CONFIG_PATH, JSON.stringify(config, null, 2), { mode: 0o600 });
+}
+
+/** Send tunnel URL to Discord via REST API (lightweight, no client library needed). */
+async function notifyTunnelUrl(url: string): Promise<void> {
+  const envPath = path.join(BASE_DIR, '.env');
+  if (!existsSync(envPath)) return;
+  const envContent = readFileSync(envPath, 'utf-8');
+
+  const tokenMatch = envContent.match(/^DISCORD_TOKEN=(.+)$/m);
+  const channelMatch = envContent.match(/^DISCORD_WATCHED_CHANNELS=(.+)$/m);
+  if (!tokenMatch || !channelMatch) return;
+
+  let token = tokenMatch[1].trim();
+  if ((token.startsWith('"') && token.endsWith('"')) || (token.startsWith("'") && token.endsWith("'"))) {
+    token = token.slice(1, -1);
+  }
+  const channelId = channelMatch[1].split(',')[0].trim();
+  if (!token || !channelId) return;
+
+  try {
+    await fetch(`https://discord.com/api/v10/channels/${channelId}/messages`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bot ${token}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        content: `**Remote Dashboard Online**\n\nAccess your dashboard from anywhere:\n${url}\n\nLog in with your access token from \`Settings > Remote Access\`.`,
+      }),
+    });
+  } catch { /* best-effort notification */ }
 }
 
 // ── Project scanning (mirrors workspace_list from MCP server) ────────
@@ -819,6 +874,50 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
   const tokenPath = path.join(BASE_DIR, '.dashboard-token');
   writeFileSync(tokenPath, dashboardToken, { mode: 0o600 });
 
+  // ── Remote access + session management ─────────────────────────────
+  const remoteConfig = loadRemoteConfig();
+  const sessions = new Map<string, number>(); // sessionId → expiresAt
+  let tunnelManager: TunnelManager | null = null;
+  const SESSION_MAX_AGE = 24 * 60 * 60 * 1000; // 24 hours
+  const loginRateLimit = { count: 0, resetAt: Date.now() + 15 * 60 * 1000 };
+
+  function isRemoteRequest(req: express.Request): boolean {
+    // cloudflared sets CF-Connecting-IP for tunneled traffic
+    return Boolean(req.headers['cf-connecting-ip']);
+  }
+
+  function hasValidSession(req: express.Request): boolean {
+    const cookie = req.headers.cookie ?? '';
+    const match = cookie.match(/__clem_session=([a-f0-9]+)/);
+    if (!match) return false;
+    const sessionId = match[1];
+    const expiresAt = sessions.get(sessionId);
+    if (!expiresAt || Date.now() > expiresAt) {
+      sessions.delete(sessionId);
+      return false;
+    }
+    return true;
+  }
+
+  function createSession(res: express.Response): void {
+    const sessionId = randomBytes(32).toString('hex');
+    sessions.set(sessionId, Date.now() + SESSION_MAX_AGE);
+    res.cookie('__clem_session', sessionId, {
+      httpOnly: true,
+      sameSite: 'lax',
+      maxAge: SESSION_MAX_AGE,
+      path: '/',
+    });
+  }
+
+  // Clean expired sessions every 10 minutes
+  setInterval(() => {
+    const now = Date.now();
+    for (const [id, exp] of sessions) {
+      if (now > exp) sessions.delete(id);
+    }
+  }, 10 * 60 * 1000);
+
   // Protect /api routes with bearer token (GET / serves the SPA with token injected)
   app.use('/api', (req, res, next) => {
     const auth = req.headers.authorization;
@@ -842,9 +941,56 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
     buildHash = gitHash + '-' + buildHash;
   } catch { /* git not available */ }
 
+  // ── Auth routes (no bearer token required) ─────────────────────────
+
+  app.post('/auth/login', (req, res) => {
+    // Rate limit: max 10 attempts per 15 minutes
+    const now = Date.now();
+    if (now > loginRateLimit.resetAt) {
+      loginRateLimit.count = 0;
+      loginRateLimit.resetAt = now + 15 * 60 * 1000;
+    }
+    loginRateLimit.count++;
+    if (loginRateLimit.count > 10) {
+      res.status(429).json({ error: 'Too many login attempts. Try again later.' });
+      return;
+    }
+
+    const { token } = req.body ?? {};
+    if (!token || typeof token !== 'string') {
+      res.status(400).json({ error: 'Token is required' });
+      return;
+    }
+
+    const config = loadRemoteConfig();
+    if (!config.enabled || !config.authToken) {
+      res.status(403).json({ error: 'Remote access is not enabled' });
+      return;
+    }
+
+    if (token !== config.authToken) {
+      res.status(401).json({ error: 'Invalid access token' });
+      return;
+    }
+
+    createSession(res);
+    res.json({ ok: true });
+  });
+
+  app.get('/auth/logout', (_req, res) => {
+    res.clearCookie('__clem_session', { path: '/' });
+    res.redirect('/');
+  });
+
   // ── GET routes ───────────────────────────────────────────────────
 
-  app.get('/', (_req, res) => {
+  app.get('/', (req, res) => {
+    // If remote access enabled and request comes through tunnel, enforce session auth
+    const config = loadRemoteConfig();
+    if (config.enabled && isRemoteRequest(req) && !hasValidSession(req)) {
+      res.type('html').send(getLoginPageHTML());
+      return;
+    }
     res.type('html').send(getDashboardHTML(dashboardToken));
   });
 
@@ -3056,6 +3202,97 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
     } catch { res.json({ byType: {}, totalOutcomes: 0 }); }
   });
 
+  // ── Remote access API ────────────────────────────────────────────
+
+  app.get('/api/remote-access', (_req, res) => {
+    const config = loadRemoteConfig();
+    res.json({
+      enabled: config.enabled,
+      autoPost: config.autoPost,
+      tunnelRunning: tunnelManager?.isRunning() ?? false,
+      tunnelUrl: tunnelManager?.getUrl() ?? config.tunnelUrl ?? null,
+      authToken: config.authToken || null,
+      cloudflaredInstalled: TunnelManager.isInstalled(),
+      installInstructions: TunnelManager.getInstallInstructions(),
+    });
+  });
+
+  app.post('/api/remote-access/enable', async (req, res) => {
+    try {
+      if (!TunnelManager.isInstalled()) {
+        res.status(400).json({
+          error: `cloudflared is not installed. Run: ${TunnelManager.getInstallInstructions()}`,
+        });
+        return;
+      }
+
+      let config = loadRemoteConfig();
+      if (!config.authToken) {
+        config.authToken = generateAccessToken();
+      }
+      config.enabled = true;
+      config.lastStarted = new Date().toISOString();
+      saveRemoteConfig(config);
+
+      // Start tunnel if not already running
+      if (!tunnelManager || !tunnelManager.isRunning()) {
+        tunnelManager = new TunnelManager(actualPort);
+        tunnelManager.on('url', async (url: string) => {
+          config = loadRemoteConfig();
+          config.tunnelUrl = url;
+          saveRemoteConfig(config);
+          if (config.autoPost) {
+            notifyTunnelUrl(url).catch(() => {});
+          }
+        });
+        const url = await tunnelManager.start();
+        config.tunnelUrl = url;
+        saveRemoteConfig(config);
+      }
+
+      res.json({
+        ok: true,
+        authToken: config.authToken,
+        tunnelUrl: tunnelManager.getUrl(),
+      });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  app.post('/api/remote-access/disable', (_req, res) => {
+    const config = loadRemoteConfig();
+    config.enabled = false;
+    config.tunnelUrl = undefined;
+    saveRemoteConfig(config);
+
+    if (tunnelManager) {
+      tunnelManager.stop();
+      tunnelManager = null;
+    }
+
+    // Clear all remote sessions
+    sessions.clear();
+
+    res.json({ ok: true });
+  });
+
+  app.post('/api/remote-access/regenerate-token', (_req, res) => {
+    const config = loadRemoteConfig();
+    config.authToken = generateAccessToken();
+    saveRemoteConfig(config);
+    // Invalidate all existing sessions
+    sessions.clear();
+    res.json({ ok: true, authToken: config.authToken });
+  });
+
+  app.post('/api/remote-access/toggle-auto-post', (_req, res) => {
+    const config = loadRemoteConfig();
+    config.autoPost = !config.autoPost;
+    saveRemoteConfig(config);
+    res.json({ ok: true, autoPost: config.autoPost });
+  });
+
   // ── Start server (auto-increment port if taken) ──────────────────
 
   const maxAttempts = 10;
@@ -3108,6 +3345,28 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
       execSync(`open http://localhost:${actualPort}`, { stdio: 'ignore' });
     }
   } catch { /* ignore */ }
+
+  // Auto-start tunnel if remote access is enabled
+  if (remoteConfig.enabled && TunnelManager.isInstalled()) {
+    try {
+      tunnelManager = new TunnelManager(actualPort);
+      tunnelManager.on('url', async (url: string) => {
+        const cfg = loadRemoteConfig();
+        cfg.tunnelUrl = url;
+        saveRemoteConfig(cfg);
+        if (cfg.autoPost) {
+          notifyTunnelUrl(url).catch(() => {});
+        }
+      });
+      const url = await tunnelManager.start();
+      console.log(`  Remote: ${url}`);
+      console.log(`  Token:  ${remoteConfig.authToken}`);
+      console.log();
+    } catch (err) {
+      console.log(`  Remote access: tunnel failed to start (${String(err)})`);
+      console.log();
+    }
+  }
 
   // Keep alive
   await new Promise<void>(() => {});
@@ -4866,6 +5125,195 @@ function getDashboardHTML(token: string): string {
     color: #fff !important;
     border-color: var(--accent) !important;
   }
+
+  /* ── Mobile hamburger (hidden on desktop) ── */
+  .menu-toggle {
+    display: none;
+    background: none; border: none; cursor: pointer;
+    padding: 8px; margin-right: 4px; color: var(--text-primary);
+    font-size: 20px; line-height: 1;
+  }
+
+  /* ── Mobile Responsive ─────────────────────── */
+  @media (max-width: 768px) {
+    :root {
+      --sidebar-w: 260px;
+    }
+
+    .menu-toggle { display: block; }
+
+    .layout {
+      grid-template-columns: 1fr;
+    }
+
+    /* Sidebar: off-canvas drawer */
+    .sidebar {
+      position: fixed;
+      top: var(--header-h);
+      left: 0;
+      bottom: 0;
+      width: var(--sidebar-w);
+      z-index: 50;
+      transform: translateX(-100%);
+      transition: transform 0.25s ease;
+      box-shadow: none;
+    }
+    .sidebar.open {
+      transform: translateX(0);
+      box-shadow: 4px 0 24px rgba(0,0,0,0.3);
+    }
+
+    /* Overlay behind sidebar */
+    .sidebar-overlay {
+      display: none;
+      position: fixed;
+      inset: 0;
+      top: var(--header-h);
+      background: rgba(0,0,0,0.4);
+      z-index: 49;
+    }
+    .sidebar-overlay.show { display: block; }
+
+    /* Nav items: bigger touch targets */
+    .nav-item {
+      padding: 12px 14px;
+      font-size: 14px;
+    }
+
+    /* Content: full width, less padding */
+    .content {
+      padding: 16px;
+      grid-column: 1;
+    }
+
+    .page-title {
+      font-size: 20px;
+      margin-bottom: 16px;
+    }
+
+    /* Header compact */
+    header { padding: 0 12px; }
+    header h1 { font-size: 14px; }
+    .header-subtitle { display: none; }
+    .header-left { gap: 8px; }
+
+    /* Cards: stack, smaller padding */
+    .grid-2 {
+      grid-template-columns: 1fr;
+      gap: 12px;
+    }
+
+    .card-body { padding: 12px; }
+    .card-header { padding: 10px 14px; font-size: 12px; }
+
+    /* Form rows: stack on mobile */
+    .form-row {
+      grid-template-columns: 1fr;
+      gap: 8px;
+    }
+
+    /* Modals: near full screen */
+    .modal {
+      width: 95vw;
+      max-height: 85vh;
+      border-radius: 8px;
+    }
+    .modal-header { padding: 14px 16px; }
+    .modal-body { padding: 16px; }
+    .modal-footer { padding: 12px 16px; }
+
+    /* KV rows: stack on narrow screens */
+    .kv-row {
+      flex-wrap: wrap;
+      gap: 2px;
+    }
+
+    /* Status pill: compact */
+    .status-pill { padding: 4px 10px; font-size: 11px; }
+
+    /* Hero section: stack */
+    .agent-hero-top {
+      flex-direction: column;
+      align-items: flex-start;
+      gap: 12px;
+    }
+    .agent-controls { width: 100%; }
+    .agent-controls button { width: 100%; }
+
+    /* Summary grid: 2-col on mobile */
+    .summary-grid {
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+      margin-bottom: 16px;
+    }
+
+    /* Stat tiles: 2-col on mobile instead of auto-fit */
+    .stat-grid {
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+    }
+    .stat-tile { padding: 12px; }
+    .stat-value { font-size: 20px; }
+    .stat-label { font-size: 10px; }
+
+    /* Chat: full height + mobile-friendly input */
+    #page-chat.active {
+      height: calc(100vh - var(--header-h));
+    }
+    #chat-input {
+      font-size: 16px; /* prevents iOS zoom on focus */
+      min-height: 40px;
+      padding: 10px;
+    }
+    #chat-send-btn {
+      min-width: 60px;
+      padding: 8px 12px;
+    }
+
+    /* Tables: horizontal scroll */
+    .table-wrap {
+      overflow-x: auto;
+      -webkit-overflow-scrolling: touch;
+    }
+
+    /* Activity dots: smaller */
+    .activity-dot { width: 8px; height: 8px; }
+
+    /* Header meta row: hide on mobile */
+    .header-meta { display: none; }
+
+    /* Buttons: larger touch targets */
+    .btn-sm { padding: 8px 14px; font-size: 12px; }
+    button, .btn-primary, .btn-danger, .btn-ghost {
+      min-height: 36px;
+    }
+
+    /* Settings: stack fields */
+    #settings-content .card-body > div {
+      flex-wrap: wrap;
+    }
+
+    /* Remote access: responsive */
+    #ra-content code {
+      font-size: 12px;
+      word-break: break-all;
+    }
+
+    /* Wordmark: hide on mobile to save space */
+    .block-wordmark { display: none; }
+    .hero-wordmark { font-size: 10px !important; }
+
+    /* Agent hero avatar: smaller */
+    .agent-avatar { width: 56px; height: 56px; font-size: 22px; }
+  }
+
+  /* Small phones */
+  @media (max-width: 400px) {
+    .content { padding: 10px; }
+    .page-title { font-size: 18px; }
+    .stat-grid { grid-template-columns: 1fr; }
+    .modal { width: 100vw; max-height: 90vh; border-radius: 0; }
+  }
 </style>
 </head>
 <body>
@@ -4873,6 +5321,7 @@ function getDashboardHTML(token: string): string {
   <!-- Header -->
   <header>
     <div class="header-left">
+      <button class="menu-toggle" id="menu-toggle" onclick="toggleSidebar()">&#9776;</button>
       <div class="logo" id="header-logo">${name.charAt(0).toUpperCase()}</div>
       <div>
         <h1>Command Center</h1>
@@ -4966,6 +5415,7 @@ function getDashboardHTML(token: string): string {
       </div>
     </div>
   </nav>
+  <div class="sidebar-overlay" id="sidebar-overlay" onclick="toggleSidebar()"></div>
 
   <!-- Content -->
   <div class="content">
@@ -5338,6 +5788,18 @@ function getDashboardHTML(token: string): string {
     <!-- ═══ Settings Page ═══ -->
     <div class="page" id="page-settings">
       <div class="page-title">Settings</div>
+
+      <!-- Remote Access Section -->
+      <div class="card" style="margin-bottom:20px">
+        <div class="card-header" style="display:flex;align-items:center;gap:8px">
+          <span>Remote Access</span>
+          <span class="badge" id="ra-status-badge" style="font-size:10px">Loading...</span>
+        </div>
+        <div class="card-body" style="padding:16px" id="ra-content">
+          <div class="empty-state">Loading...</div>
+        </div>
+      </div>
+
       <p style="color:var(--text-muted);margin-bottom:16px">Manage API keys and configuration. Changes are saved to <code>~/.clementine/.env</code> and take effect on daemon restart.</p>
       <div id="settings-content"><div class="empty-state">Loading settings...</div></div>
     </div>
@@ -5672,15 +6134,26 @@ document.querySelectorAll('.nav-item').forEach(item => {
     if (page === 'memory') refreshMemory();
     if (page === 'metrics') refreshMetrics();
     if (page === 'chat') { loadProfiles(); document.getElementById('chat-input').focus(); }
-    if (page === 'settings') refreshSettings();
+    if (page === 'settings') { refreshSettings(); refreshRemoteAccess(); }
     if (page === 'self-improve') refreshSelfImprove();
     if (page === 'team') refreshTeam();
     if (page === 'graph') refreshGraph();
     if (page === 'daily-plan') refreshDailyPlan();
     if (page === 'advisor') refreshAdvisorAnalytics();
     if (page === 'goals') refreshGoalsProgress();
+    // Close sidebar on mobile after nav
+    closeSidebar();
   });
 });
+
+function toggleSidebar() {
+  document.querySelector('.sidebar').classList.toggle('open');
+  document.getElementById('sidebar-overlay').classList.toggle('show');
+}
+function closeSidebar() {
+  document.querySelector('.sidebar').classList.remove('open');
+  document.getElementById('sidebar-overlay').classList.remove('show');
+}
 
 // ── API helpers ───────────────────────────
 async function apiPost(url) {
@@ -7487,6 +7960,149 @@ async function checkVersion() {
   } catch { /* ignore */ }
 }
 
+// ── Remote access management ──────────────────
+async function refreshRemoteAccess() {
+  var container = document.getElementById('ra-content');
+  var badge = document.getElementById('ra-status-badge');
+  try {
+    var r = await apiFetch('/api/remote-access');
+    var d = await r.json();
+
+    if (!d.cloudflaredInstalled) {
+      badge.textContent = 'Not Available';
+      badge.className = 'badge badge-gray';
+      badge.style.fontSize = '10px';
+      container.innerHTML = '<div style="padding:8px 0">'
+        + '<p style="color:var(--text-muted);margin-bottom:12px"><code>cloudflared</code> is required for remote access. It creates a secure tunnel to your dashboard — no account needed, no ports opened.</p>'
+        + '<div class="card" style="background:var(--bg-primary);padding:12px;border-radius:6px">'
+        + '<div style="font-size:12px;font-weight:600;margin-bottom:6px">Install cloudflared:</div>'
+        + '<code style="font-size:13px;color:var(--accent)">' + esc(d.installInstructions) + '</code>'
+        + '</div>'
+        + '<p style="color:var(--text-muted);margin-top:12px;font-size:12px">After installing, refresh this page.</p>'
+        + '</div>';
+      return;
+    }
+
+    if (d.enabled && d.tunnelRunning) {
+      badge.textContent = 'Active';
+      badge.className = 'badge badge-green';
+      badge.style.fontSize = '10px';
+      container.innerHTML = '<div style="padding:8px 0">'
+        + '<div style="display:flex;align-items:center;gap:8px;margin-bottom:16px">'
+        + '<div class="pulse-dot" style="background:var(--green)"></div>'
+        + '<span style="font-weight:600;color:var(--green)">Tunnel is running</span>'
+        + '</div>'
+        + '<div style="margin-bottom:16px">'
+        + '<label style="font-size:12px;font-weight:600;color:var(--text-secondary);display:block;margin-bottom:4px">Public URL</label>'
+        + '<div style="display:flex;gap:8px;align-items:center">'
+        + '<code style="flex:1;padding:8px 12px;background:var(--bg-primary);border:1px solid var(--border);border-radius:6px;font-size:13px;word-break:break-all">' + esc(d.tunnelUrl) + '</code>'
+        + '<button class="btn-sm btn-primary" onclick="copyToClipboard(\'' + esc(d.tunnelUrl) + '\')">Copy</button>'
+        + '</div>'
+        + '</div>'
+        + '<div style="margin-bottom:16px">'
+        + '<label style="font-size:12px;font-weight:600;color:var(--text-secondary);display:block;margin-bottom:4px">Access Token</label>'
+        + '<div style="display:flex;gap:8px;align-items:center">'
+        + '<code id="ra-token-display" style="flex:1;padding:8px 12px;background:var(--bg-primary);border:1px solid var(--border);border-radius:6px;font-size:13px;letter-spacing:1px">' + esc(d.authToken) + '</code>'
+        + '<button class="btn-sm" onclick="copyToClipboard(\'' + esc(d.authToken) + '\')">Copy</button>'
+        + '<button class="btn-sm" onclick="regenerateToken()">Regenerate</button>'
+        + '</div>'
+        + '<div style="font-size:11px;color:var(--text-muted);margin-top:4px">Share this token (securely) to grant remote access. Regenerating invalidates all sessions.</div>'
+        + '</div>'
+        + '<div style="display:flex;gap:8px;align-items:center;margin-bottom:16px">'
+        + '<label style="font-size:12px;color:var(--text-secondary)">'
+        + '<input type="checkbox" ' + (d.autoPost ? 'checked' : '') + ' onchange="toggleAutoPost()"> Auto-post URL to Discord when tunnel starts'
+        + '</label>'
+        + '</div>'
+        + '<div style="display:flex;gap:8px">'
+        + '<button class="btn-sm btn-danger" onclick="disableRemoteAccess()">Disable Remote Access</button>'
+        + '</div>'
+        + '</div>';
+    } else if (d.enabled && !d.tunnelRunning) {
+      badge.textContent = 'Enabled (Tunnel Down)';
+      badge.className = 'badge badge-yellow';
+      badge.style.fontSize = '10px';
+      container.innerHTML = '<div style="padding:8px 0">'
+        + '<p style="color:var(--yellow);margin-bottom:12px">Remote access is enabled but the tunnel is not running.</p>'
+        + '<div style="display:flex;gap:8px">'
+        + '<button class="btn-sm btn-primary" onclick="enableRemoteAccess()">Restart Tunnel</button>'
+        + '<button class="btn-sm btn-danger" onclick="disableRemoteAccess()">Disable</button>'
+        + '</div>'
+        + '</div>';
+    } else {
+      badge.textContent = 'Disabled';
+      badge.className = 'badge badge-gray';
+      badge.style.fontSize = '10px';
+      container.innerHTML = '<div style="padding:8px 0">'
+        + '<p style="color:var(--text-muted);margin-bottom:12px">Access your dashboard from anywhere via a secure Cloudflare tunnel. No account required, no ports opened on your firewall.</p>'
+        + '<p style="color:var(--text-muted);margin-bottom:12px;font-size:12px"><strong>Security:</strong> Three layers — unguessable tunnel URL, access token authentication, rate-limited login.</p>'
+        + '<button class="btn-sm btn-primary" onclick="enableRemoteAccess()">Enable Remote Access</button>'
+        + '</div>';
+    }
+  } catch (e) {
+    container.innerHTML = '<div class="empty-state">Failed to load: ' + esc(String(e)) + '</div>';
+  }
+}
+
+async function enableRemoteAccess() {
+  var container = document.getElementById('ra-content');
+  container.innerHTML = '<div class="empty-state">Starting tunnel...</div>';
+  try {
+    var r = await apiFetch('/api/remote-access/enable', { method: 'POST' });
+    var d = await r.json();
+    if (d.error) {
+      container.innerHTML = '<div class="empty-state" style="color:var(--red)">' + esc(d.error) + '</div>';
+      return;
+    }
+    refreshRemoteAccess();
+  } catch (e) {
+    container.innerHTML = '<div class="empty-state" style="color:var(--red)">Failed: ' + esc(String(e)) + '</div>';
+  }
+}
+
+async function disableRemoteAccess() {
+  try {
+    await apiFetch('/api/remote-access/disable', { method: 'POST' });
+    refreshRemoteAccess();
+  } catch (e) {
+    alert('Failed: ' + String(e));
+  }
+}
+
+async function regenerateToken() {
+  if (!confirm('Regenerate token? All existing sessions will be invalidated.')) return;
+  try {
+    var r = await apiFetch('/api/remote-access/regenerate-token', { method: 'POST' });
+    var d = await r.json();
+    if (d.authToken) {
+      refreshRemoteAccess();
+    }
+  } catch (e) {
+    alert('Failed: ' + String(e));
+  }
+}
+
+async function toggleAutoPost() {
+  try {
+    await apiFetch('/api/remote-access/toggle-auto-post', { method: 'POST' });
+  } catch (e) {
+    alert('Failed: ' + String(e));
+  }
+}
+
+function copyToClipboard(text) {
+  navigator.clipboard.writeText(text).then(function() {
+    // Brief visual feedback could go here
+  }).catch(function() {
+    // Fallback: select text
+    var ta = document.createElement('textarea');
+    ta.value = text;
+    document.body.appendChild(ta);
+    ta.select();
+    document.execCommand('copy');
+    document.body.removeChild(ta);
+  });
+}
+
 // ── Refresh orchestrator ──────────────────
 function refreshAll() {
   refreshStatus();
@@ -8681,6 +9297,130 @@ async function refreshGoalsProgress() {
 refreshAll();
 setInterval(refreshAll, 5000);
 </script>
+</body>
+</html>`;
+}
+
+function getLoginPageHTML(): string {
+  const name = getAssistantName();
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${name} — Remote Access</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: #0a0a0f;
+    color: #e2e8f0;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    min-height: 100vh;
+  }
+  .login-card {
+    background: #12121a;
+    border: 1px solid #1e1e2e;
+    border-radius: 12px;
+    padding: 40px;
+    max-width: 400px;
+    width: 100%;
+    margin: 20px;
+    box-shadow: 0 8px 32px rgba(0,0,0,0.4);
+  }
+  .login-avatar {
+    width: 48px; height: 48px;
+    background: linear-gradient(135deg, #f97316, #ea580c);
+    border-radius: 50%;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 22px; font-weight: 700; color: white;
+    margin-bottom: 20px;
+  }
+  .login-title { font-size: 22px; font-weight: 700; margin-bottom: 6px; }
+  .login-subtitle { color: #64748b; font-size: 14px; margin-bottom: 28px; }
+  .form-group { margin-bottom: 20px; }
+  .form-label {
+    display: block; font-size: 13px; font-weight: 600;
+    color: #94a3b8; margin-bottom: 6px;
+  }
+  .form-input {
+    width: 100%; padding: 10px 14px;
+    border: 1px solid #1e1e2e; border-radius: 8px;
+    background: #0a0a0f; color: #e2e8f0;
+    font-size: 14px; font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace;
+    letter-spacing: 1px; transition: border-color 0.2s;
+  }
+  .form-input:focus { outline: none; border-color: #f97316; }
+  .btn-login {
+    width: 100%; padding: 10px; border: none; border-radius: 8px;
+    background: #f97316; color: white;
+    font-size: 14px; font-weight: 600; cursor: pointer;
+    transition: background 0.2s;
+  }
+  .btn-login:hover { background: #ea580c; }
+  .btn-login:disabled { opacity: 0.5; cursor: not-allowed; }
+  .error-msg {
+    color: #ef4444; font-size: 13px; margin-top: 12px;
+    display: none; text-align: center;
+  }
+  .footer {
+    margin-top: 24px; font-size: 12px;
+    color: #475569; text-align: center; line-height: 1.5;
+  }
+</style>
+</head>
+<body>
+  <div class="login-card">
+    <div class="login-avatar">${name.charAt(0).toUpperCase()}</div>
+    <div class="login-title">${name}</div>
+    <div class="login-subtitle">Enter your access token to continue</div>
+    <form onsubmit="doLogin(event)">
+      <div class="form-group">
+        <label class="form-label">Access Token</label>
+        <input type="password" class="form-input" id="token-input"
+          placeholder="clem_XXXX-XXXX-XXXX" autocomplete="off" autofocus>
+      </div>
+      <button type="submit" class="btn-login" id="login-btn">Sign In</button>
+      <div class="error-msg" id="error-msg"></div>
+    </form>
+    <div class="footer">
+      Find your token in the dashboard<br>
+      <strong>Settings &rarr; Remote Access</strong>
+    </div>
+  </div>
+  <script>
+    async function doLogin(e) {
+      e.preventDefault();
+      var btn = document.getElementById('login-btn');
+      var err = document.getElementById('error-msg');
+      var token = document.getElementById('token-input').value.trim();
+      if (!token) return;
+      btn.disabled = true;
+      btn.textContent = 'Signing in...';
+      err.style.display = 'none';
+      try {
+        var r = await fetch('/auth/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ token: token })
+        });
+        var d = await r.json();
+        if (d.ok) {
+          window.location.href = '/';
+        } else {
+          err.textContent = d.error || 'Invalid token';
+          err.style.display = 'block';
+        }
+      } catch (ex) {
+        err.textContent = 'Connection error';
+        err.style.display = 'block';
+      }
+      btn.disabled = false;
+      btn.textContent = 'Sign In';
+    }
+  </script>
 </body>
 </html>`;
 }

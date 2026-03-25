@@ -324,6 +324,10 @@ export const PLANS_DIR = path.join(BASE_DIR, 'plans');
 
 export const ADVISOR_LOG_PATH = path.join(BASE_DIR, 'cron', 'advisor-decisions.jsonl');
 
+// ── Remote Access ──────────────────────────────────────────────────
+
+export const REMOTE_ACCESS_CONFIG = path.join(BASE_DIR, 'remote-access.json');
+
 // ── Source Self-Edit Staging ─────────────────────────────────────────
 
 export const STAGING_DIR = path.join(BASE_DIR, 'staging');
