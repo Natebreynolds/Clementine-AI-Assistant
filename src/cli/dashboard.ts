@@ -746,11 +746,32 @@ function getSessions(): Record<string, unknown> {
 function getCronJobs(): Record<string, unknown> {
   let jobs: Array<Record<string, unknown>> = [];
 
+  // Load main CRON.md
   if (existsSync(CRON_FILE)) {
     try {
       const raw = readFileSync(CRON_FILE, 'utf-8');
       const parsed = matter(raw);
-      jobs = (parsed.data.jobs ?? []) as Array<Record<string, unknown>>;
+      const mainJobs = (parsed.data.jobs ?? []) as Array<Record<string, unknown>>;
+      jobs.push(...mainJobs);
+    } catch { /* ignore */ }
+  }
+
+  // Load agent-scoped CRON.md files
+  const agentsDir = path.join(VAULT_DIR, '00-System', 'agents');
+  if (existsSync(agentsDir)) {
+    try {
+      for (const slug of readdirSync(agentsDir)) {
+        const agentCronFile = path.join(agentsDir, slug, 'CRON.md');
+        if (!existsSync(agentCronFile)) continue;
+        try {
+          const raw = readFileSync(agentCronFile, 'utf-8');
+          const parsed = matter(raw);
+          const agentJobs = (parsed.data.jobs ?? []) as Array<Record<string, unknown>>;
+          for (const job of agentJobs) {
+            jobs.push({ ...job, agent: slug, name: `${slug}:${job.name}` });
+          }
+        } catch { /* ignore individual agent parse errors */ }
+      }
     } catch { /* ignore */ }
   }
 
@@ -869,6 +890,47 @@ function readCronFile(): { parsed: matter.GrayMatterFile<string>; jobs: Array<Re
   }
   const jobs = (parsed.data.jobs ?? []) as Array<Record<string, unknown>>;
   return { parsed, jobs };
+}
+
+/**
+ * Resolve a job name to the correct CRON.md file.
+ * Agent jobs use "agent-slug:job-name" format.
+ */
+function resolveJobCronFile(jobName: string): { cronFile: string; bareJobName: string } {
+  const colonIdx = jobName.indexOf(':');
+  if (colonIdx > 0) {
+    const agentSlug = jobName.slice(0, colonIdx);
+    const bareJobName = jobName.slice(colonIdx + 1);
+    const agentCronFile = path.join(VAULT_DIR, '00-System', 'agents', agentSlug, 'CRON.md');
+    if (existsSync(agentCronFile)) {
+      return { cronFile: agentCronFile, bareJobName };
+    }
+  }
+  return { cronFile: CRON_FILE, bareJobName: jobName };
+}
+
+function readCronFileAt(cronFile: string): { parsed: matter.GrayMatterFile<string>; jobs: Array<Record<string, unknown>> } {
+  let parsed: matter.GrayMatterFile<string>;
+  if (existsSync(cronFile)) {
+    const raw = readFileSync(cronFile, 'utf-8');
+    parsed = matter(raw);
+  } else {
+    const dir = path.dirname(cronFile);
+    if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+    parsed = matter('');
+    parsed.data = {};
+  }
+  const jobs = (parsed.data.jobs ?? []) as Array<Record<string, unknown>>;
+  return { parsed, jobs };
+}
+
+function writeCronFileAt(cronFile: string, parsed: matter.GrayMatterFile<string>, jobs: Array<Record<string, unknown>>): void {
+  parsed.data.jobs = jobs;
+  const output = matter.stringify(parsed.content, parsed.data);
+  try { matter(output); } catch (err) {
+    throw new Error(`Generated CRON.md has invalid YAML: ${err instanceof Error ? err.message : err}`);
+  }
+  writeFileSync(cronFile, output);
 }
 
 function writeCronFile(parsed: matter.GrayMatterFile<string>, jobs: Array<Record<string, unknown>>): void {
@@ -1624,16 +1686,17 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
   app.post('/api/cron/:name/toggle', (req, res) => {
     try {
       const jobName = req.params.name;
-      const { parsed, jobs } = readCronFile();
+      const { cronFile, bareJobName } = resolveJobCronFile(jobName);
+      const { parsed, jobs } = readCronFileAt(cronFile);
       const idx = jobs.findIndex(
-        (j) => String(j.name ?? '').toLowerCase() === jobName.toLowerCase(),
+        (j) => String(j.name ?? '').toLowerCase() === bareJobName.toLowerCase(),
       );
       if (idx === -1) {
         res.status(404).json({ error: `Job "${jobName}" not found` });
         return;
       }
       jobs[idx].enabled = !jobs[idx].enabled;
-      writeCronFile(parsed, jobs);
+      writeCronFileAt(cronFile, parsed, jobs);
       const state = jobs[idx].enabled ? 'enabled' : 'disabled';
       res.json({ ok: true, message: `${jobName} is now ${state}` });
     } catch (err) {
@@ -1644,16 +1707,17 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
   app.delete('/api/cron/:name', (req, res) => {
     try {
       const jobName = req.params.name;
-      const { parsed, jobs } = readCronFile();
+      const { cronFile, bareJobName } = resolveJobCronFile(jobName);
+      const { parsed, jobs } = readCronFileAt(cronFile);
       const idx = jobs.findIndex(
-        (j) => String(j.name ?? '').toLowerCase() === jobName.toLowerCase(),
+        (j) => String(j.name ?? '').toLowerCase() === bareJobName.toLowerCase(),
       );
       if (idx === -1) {
         res.status(404).json({ error: `Job "${jobName}" not found` });
         return;
       }
       jobs.splice(idx, 1);
-      writeCronFile(parsed, jobs);
+      writeCronFileAt(cronFile, parsed, jobs);
       res.json({ ok: true, message: `Deleted cron job: ${jobName}` });
     } catch (err) {
       res.status(500).json({ error: String(err) });
@@ -3707,6 +3771,7 @@ function getDashboardHTML(token: string): string {
   .badge-gray { background: rgba(90,106,126,0.15); color: var(--text-muted); }
   .badge-blue { background: rgba(56,139,253,0.15); color: #58a6ff; }
   .badge-purple { background: rgba(163,113,247,0.15); color: #a371f7; }
+  .badge-orange { background: rgba(240,136,62,0.15); color: #f0883e; }
   .badge-accent { background: var(--accent-glow); color: var(--accent); }
   .badge-dot {
     width: 6px; height: 6px;
@@ -6495,55 +6560,88 @@ async function refreshCron() {
       document.getElementById('panel-cron').innerHTML = '<div class="task-grid"><div class="task-card-add" onclick="openCreateCronModal()">+ New Task</div></div>';
       return;
     }
-    let html = '<div class="task-grid">';
+
+    // Group jobs: main (no agent) first, then by agent slug
+    var groups = {};
     for (const job of cronJobsData) {
-      var enabled = job.enabled !== false;
-      var cardCls = 'task-card' + (enabled ? '' : ' disabled');
-      // Check if running
-      if (job.recentRuns && job.recentRuns.length > 0 && job.recentRuns[0].startedAt && !job.recentRuns[0].finishedAt) {
-        cardCls += ' running';
-      }
-      var desc = describeCron(job.schedule || '');
-      var schedHtml = desc
-        ? esc(desc) + ' <code>' + esc(job.schedule) + '</code>'
-        : '<code style="color:var(--accent)">' + esc(job.schedule) + '</code>';
-
-      var lastRunHtml = '<span style="color:var(--text-muted)">Never run</span>';
-      if (job.recentRuns && job.recentRuns.length > 0) {
-        var lr = job.recentRuns[0];
-        var statusIcon = lr.status === 'ok' ? '<span style="color:var(--green)">&#10003;</span>' : '<span style="color:var(--red)">&#10007;</span>';
-        lastRunHtml = statusIcon + ' ' + esc(lr.status) + ' · ' + timeAgo(lr.finishedAt || lr.startedAt);
-      }
-
-      var badgesHtml = '';
-      var projectName = job.work_dir ? job.work_dir.split('/').pop() : '';
-      if (projectName) badgesHtml += '<span class="badge badge-blue">' + esc(projectName) + '</span>';
-      if (job.mode === 'unleashed') badgesHtml += '<span class="badge badge-purple">unleashed</span>';
-      if (job.after) badgesHtml += '<span class="badge badge-yellow" title="Triggered after ' + esc(job.after) + '">\\u2192 ' + esc(job.after) + '</span>';
-      if (job.max_retries != null) badgesHtml += '<span class="badge badge-gray">' + job.max_retries + ' retries</span>';
-      badgesHtml += '<span class="badge ' + (enabled ? 'badge-green' : 'badge-gray') + '">' + (enabled ? 'Enabled' : 'Disabled') + '</span>';
-
-      var safeName = esc(job.name).replace(/'/g, '');
-
-      html += '<div class="' + cardCls + '">'
-        + '<div class="task-card-header">'
-        + '<strong>' + esc(job.name) + '</strong>'
-        + '<div class="toggle' + (enabled ? ' on' : '') + '" onclick="apiPost(\\'/api/cron/' + encodeURIComponent(job.name) + '/toggle\\')"></div>'
-        + '</div>'
-        + '<div class="task-card-schedule">' + schedHtml + '</div>'
-        + '<div class="task-card-prompt">' + esc(job.prompt || '') + '</div>'
-        + '<div class="task-card-status">' + lastRunHtml + '</div>'
-        + '<div class="task-card-badges">' + badgesHtml + '</div>'
-        + '<div class="task-card-actions">'
-        + '<button class="btn-sm btn-success" onclick="apiPost(\\'/api/cron/run/' + encodeURIComponent(job.name) + '\\')">Run Now</button>'
-        + '<button class="btn-sm" data-trace-job="' + esc(job.name) + '">Trace</button>'
-        + '<button class="btn-sm" onclick="openEditCronModal(\\'' + safeName + '\\')">Edit</button>'
-        + '<button class="btn-sm btn-danger" onclick="confirmDeleteCron(\\'' + safeName + '\\')">Del</button>'
-        + '</div></div>';
+      var g = job.agent || '_main';
+      if (!groups[g]) groups[g] = [];
+      groups[g].push(job);
     }
-    // Add "new task" card
-    html += '<div class="task-card-add" onclick="openCreateCronModal()">+ New Task</div>';
-    html += '</div>';
+    var groupOrder = Object.keys(groups).sort(function(a, b) {
+      if (a === '_main') return -1;
+      if (b === '_main') return 1;
+      return a.localeCompare(b);
+    });
+
+    let html = '';
+    for (var gi = 0; gi < groupOrder.length; gi++) {
+      var groupKey = groupOrder[gi];
+      var groupJobs = groups[groupKey];
+      var groupLabel = groupKey === '_main' ? 'Clementine' : groupKey.replace(/-/g, ' ').replace(/\\b\\w/g, function(c) { return c.toUpperCase(); });
+
+      if (groupOrder.length > 1) {
+        var enabledCount = groupJobs.filter(function(j) { return j.enabled !== false; }).length;
+        html += '<div style="display:flex;align-items:center;gap:10px;margin:' + (gi > 0 ? '28px' : '0') + ' 0 12px">'
+          + '<h3 style="font-size:15px;font-weight:600;color:var(--text-primary);margin:0">' + esc(groupLabel) + '</h3>'
+          + '<span style="font-size:12px;color:var(--text-muted)">' + enabledCount + ' of ' + groupJobs.length + ' active</span>'
+          + '</div>';
+      }
+
+      html += '<div class="task-grid">';
+      for (const job of groupJobs) {
+        var enabled = job.enabled !== false;
+        var cardCls = 'task-card' + (enabled ? '' : ' disabled');
+        if (job.recentRuns && job.recentRuns.length > 0 && job.recentRuns[0].startedAt && !job.recentRuns[0].finishedAt) {
+          cardCls += ' running';
+        }
+        var desc = describeCron(job.schedule || '');
+        var schedHtml = desc
+          ? esc(desc) + ' <code>' + esc(job.schedule) + '</code>'
+          : '<code style="color:var(--accent)">' + esc(job.schedule) + '</code>';
+
+        var lastRunHtml = '<span style="color:var(--text-muted)">Never run</span>';
+        if (job.recentRuns && job.recentRuns.length > 0) {
+          var lr = job.recentRuns[0];
+          var statusIcon = lr.status === 'ok' ? '<span style="color:var(--green)">&#10003;</span>' : '<span style="color:var(--red)">&#10007;</span>';
+          lastRunHtml = statusIcon + ' ' + esc(lr.status) + ' · ' + timeAgo(lr.finishedAt || lr.startedAt);
+        }
+
+        var badgesHtml = '';
+        var projectName = job.work_dir ? job.work_dir.split('/').pop() : '';
+        if (projectName) badgesHtml += '<span class="badge badge-blue">' + esc(projectName) + '</span>';
+        if (job.agent) badgesHtml += '<span class="badge badge-orange">' + esc(job.agent) + '</span>';
+        if (job.mode === 'unleashed') badgesHtml += '<span class="badge badge-purple">unleashed</span>';
+        if (job.after) badgesHtml += '<span class="badge badge-yellow" title="Triggered after ' + esc(job.after) + '">\\u2192 ' + esc(job.after) + '</span>';
+        if (job.max_retries != null) badgesHtml += '<span class="badge badge-gray">' + job.max_retries + ' retries</span>';
+        badgesHtml += '<span class="badge ' + (enabled ? 'badge-green' : 'badge-gray') + '">' + (enabled ? 'Enabled' : 'Disabled') + '</span>';
+
+        var safeName = esc(job.name).replace(/'/g, '');
+        // Display name without agent prefix for cleaner cards
+        var displayName = job.agent ? job.name.replace(job.agent + ':', '') : job.name;
+
+        html += '<div class="' + cardCls + '">'
+          + '<div class="task-card-header">'
+          + '<strong>' + esc(displayName) + '</strong>'
+          + '<div class="toggle' + (enabled ? ' on' : '') + '" onclick="apiPost(\\'/api/cron/' + encodeURIComponent(job.name) + '/toggle\\')"></div>'
+          + '</div>'
+          + '<div class="task-card-schedule">' + schedHtml + '</div>'
+          + '<div class="task-card-prompt">' + esc(job.prompt || '') + '</div>'
+          + '<div class="task-card-status">' + lastRunHtml + '</div>'
+          + '<div class="task-card-badges">' + badgesHtml + '</div>'
+          + '<div class="task-card-actions">'
+          + '<button class="btn-sm btn-success" onclick="apiPost(\\'/api/cron/run/' + encodeURIComponent(job.name) + '\\')">Run Now</button>'
+          + '<button class="btn-sm" data-trace-job="' + esc(job.name) + '">Trace</button>'
+          + '<button class="btn-sm" onclick="openEditCronModal(\\'' + safeName + '\\')">Edit</button>'
+          + '<button class="btn-sm btn-danger" onclick="confirmDeleteCron(\\'' + safeName + '\\')">Del</button>'
+          + '</div></div>';
+      }
+      // Add "new task" card only to the main group
+      if (groupKey === '_main') {
+        html += '<div class="task-card-add" onclick="openCreateCronModal()">+ New Task</div>';
+      }
+      html += '</div>';
+    }
 
     // Fetch unleashed task status and append if any exist
     try {
