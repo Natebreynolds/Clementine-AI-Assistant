@@ -615,6 +615,8 @@ function getStatus(): Record<string, unknown> {
   // Current activity detection
   let currentActivity = 'Idle';
   let runsToday = 0;
+  let runsOk = 0;
+  let runsFailed = 0;
   let nextTaskName = '';
 
   // Scan cron runs for in-progress jobs + today's count
@@ -631,7 +633,11 @@ function getStatus(): Record<string, unknown> {
         for (const line of lines) {
           try {
             const entry = JSON.parse(line);
-            if (entry.startedAt && entry.startedAt >= todayStartIsoStatus) runsToday++;
+            if (entry.startedAt && entry.startedAt >= todayStartIsoStatus) {
+              runsToday++;
+              if (entry.status === 'ok') runsOk++;
+              else if (entry.status === 'error') runsFailed++;
+            }
           } catch { /* skip */ }
         }
         // Check last line for running job
@@ -686,51 +692,92 @@ function getStatus(): Record<string, unknown> {
     }
   }
 
-  // Next task: find the chronologically next enabled cron job
-  let nextTaskTime = '';
+  // Collect all cron jobs (main + agent) for next-task + scheduledToday
+  const allCronJobs: Array<{ name: string; schedule: string; enabled: boolean; agent?: string }> = [];
   if (existsSync(CRON_FILE)) {
     try {
       const raw = readFileSync(CRON_FILE, 'utf-8');
       const parsed = matter(raw);
-      const jobs = (parsed.data.jobs ?? []) as Array<Record<string, unknown>>;
-      const now = new Date();
-      let soonestOffset = Infinity;
-
-      for (const job of jobs) {
-        if (job.enabled === false) continue;
-        const schedule = String(job.schedule ?? '');
-        const parts = schedule.trim().split(/\s+/);
-        if (parts.length < 5) continue;
-        const [minF, hourF, domF, monF, dowF] = parts;
-
-        // Find next match in the next 48h
-        for (let offset = 1; offset <= 2880; offset++) {
-          const t = new Date(now.getTime() + offset * 60_000);
-          const matches =
-            cronFieldMatch(minF, t.getMinutes()) &&
-            cronFieldMatch(hourF, t.getHours()) &&
-            cronFieldMatch(domF, t.getDate()) &&
-            cronFieldMatch(monF, t.getMonth() + 1) &&
-            cronFieldMatch(dowF, t.getDay());
-          if (matches) {
-            if (offset < soonestOffset) {
-              soonestOffset = offset;
-              nextTaskName = String(job.name || '');
-              const h = t.getHours();
-              const m = t.getMinutes();
-              const ampm = h >= 12 ? 'PM' : 'AM';
-              const h12 = h === 0 ? 12 : h > 12 ? h - 12 : h;
-              const today = t.toDateString() === now.toDateString();
-              nextTaskTime = (today ? '' : 'tmrw ') + `${h12}:${String(m).padStart(2, '0')} ${ampm}`;
-            }
-            break;
+      for (const j of (parsed.data.jobs ?? []) as Array<Record<string, unknown>>) {
+        allCronJobs.push({ name: String(j.name ?? ''), schedule: String(j.schedule ?? ''), enabled: j.enabled !== false });
+      }
+    } catch { /* ignore */ }
+  }
+  const agentsDirStatus = path.join(VAULT_DIR, '00-System', 'agents');
+  const activeAgentSlugs = new Set<string>();
+  if (existsSync(agentsDirStatus)) {
+    try {
+      for (const slug of readdirSync(agentsDirStatus)) {
+        const agentCron = path.join(agentsDirStatus, slug, 'CRON.md');
+        if (!existsSync(agentCron)) continue;
+        try {
+          const raw = readFileSync(agentCron, 'utf-8');
+          const parsed = matter(raw);
+          for (const j of (parsed.data.jobs ?? []) as Array<Record<string, unknown>>) {
+            const enabled = j.enabled !== false;
+            allCronJobs.push({ name: `${slug}:${j.name}`, schedule: String(j.schedule ?? ''), enabled, agent: slug });
+            if (enabled) activeAgentSlugs.add(slug);
           }
-        }
+        } catch { /* ignore */ }
       }
     } catch { /* ignore */ }
   }
 
-  return { name, pid, alive, uptime, channels, launchAgent, currentActivity, runsToday, nextTaskName, nextTaskTime };
+  // Count scheduled runs for today + find next task
+  let scheduledToday = 0;
+  let nextTaskTime = '';
+  const now = new Date();
+  let soonestOffset = Infinity;
+
+  for (const job of allCronJobs) {
+    if (!job.enabled) continue;
+    const parts = job.schedule.trim().split(/\s+/);
+    if (parts.length < 5) continue;
+    const [minF, hourF, domF, monF, dowF] = parts;
+
+    // Count today's scheduled runs for this job
+    if (cronFieldMatch(domF, now.getDate()) && cronFieldMatch(monF, now.getMonth() + 1) && cronFieldMatch(dowF, now.getDay())) {
+      for (let h = 0; h < 24; h++) {
+        if (!cronFieldMatch(hourF, h)) continue;
+        for (let m = 0; m < 60; m++) {
+          if (cronFieldMatch(minF, m)) scheduledToday++;
+        }
+      }
+    }
+
+    // Find next match in the next 48h
+    for (let offset = 1; offset <= 2880; offset++) {
+      const t = new Date(now.getTime() + offset * 60_000);
+      const matches =
+        cronFieldMatch(minF, t.getMinutes()) &&
+        cronFieldMatch(hourF, t.getHours()) &&
+        cronFieldMatch(domF, t.getDate()) &&
+        cronFieldMatch(monF, t.getMonth() + 1) &&
+        cronFieldMatch(dowF, t.getDay());
+      if (matches) {
+        if (offset < soonestOffset) {
+          soonestOffset = offset;
+          nextTaskName = job.name;
+          const h = t.getHours();
+          const m = t.getMinutes();
+          const ampm = h >= 12 ? 'PM' : 'AM';
+          const h12 = h === 0 ? 12 : h > 12 ? h - 12 : h;
+          const today = t.toDateString() === now.toDateString();
+          nextTaskTime = (today ? '' : 'tmrw ') + `${h12}:${String(m).padStart(2, '0')} ${ampm}`;
+        }
+        break;
+      }
+    }
+  }
+
+  const activeAgents = activeAgentSlugs.size;
+  const successRate = runsToday > 0 ? Math.round((runsOk / runsToday) * 100) : null;
+
+  return {
+    name, pid, alive, uptime, channels, launchAgent, currentActivity,
+    runsToday, scheduledToday, runsOk, runsFailed, successRate,
+    activeAgents, nextTaskName, nextTaskTime,
+  };
 }
 
 function getSessions(): Record<string, unknown> {
@@ -6376,15 +6423,23 @@ async function refreshStatus() {
         var mins = md.timeSaved ? md.timeSaved.estimatedMinutes || 0 : 0;
         var timeDisplay = hours >= 1 ? hours + 'h' : mins + 'm';
         var runsToday = d.runsToday || 0;
+        var scheduled = d.scheduledToday || 0;
         var totalExchanges = md.sessions ? md.sessions.totalExchanges || 0 : 0;
         var nextTask = d.nextTaskName || '—';
         var nextTime = d.nextTaskTime || '';
+        // Strip agent prefix from next task display
+        var nextDisplay = nextTask.indexOf(':') > 0 ? nextTask.split(':').slice(1).join(':') : nextTask;
+        var agentCount = d.activeAgents || 0;
+        var runsSub = runsToday + ' of ' + scheduled + ' completed';
+        if (d.runsFailed > 0) runsSub += ' · ' + d.runsFailed + ' failed';
+        var successSub = d.successRate != null ? d.successRate + '% success' : '';
+        var agentLabel = agentCount > 0 ? (agentCount + 1) + ' agents' : '1 agent';
 
         var cards = document.getElementById('summary-cards');
-        cards.innerHTML = summaryCard('sc-green', '&#9200;', runsToday, 'Tasks Today', d.alive ? 'Agent running' : 'Agent offline')
-          + summaryCard('sc-blue', '&#9201;', timeDisplay, 'Time Saved', hours >= 1 ? Math.round(mins) + ' total min' : '')
+        cards.innerHTML = summaryCard('sc-green', '&#128202;', scheduled, 'Runs Today', runsSub)
+          + summaryCard('sc-blue', '&#129302;', agentLabel, 'Fleet', (d.alive ? 'Online' : 'Offline') + (successSub ? ' · ' + successSub : ''))
           + summaryCard('sc-purple', '&#128172;', totalExchanges, 'Messages', md.sessions ? md.sessions.activeSessions + ' sessions' : '')
-          + summaryCard('sc-yellow', '&#9654;', nextTask, 'NEXT TASK', nextTime || 'No upcoming jobs');
+          + summaryCard('sc-yellow', '&#9654;', nextDisplay, 'Next Up', nextTime || 'No upcoming jobs');
       } catch(me) { /* metrics optional */ }
 
       // MCP Server Status widget
