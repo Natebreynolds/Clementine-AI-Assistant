@@ -37,6 +37,7 @@ const VAULT_DIR = path.join(BASE_DIR, 'vault');
 const CRON_FILE = path.join(VAULT_DIR, '00-System', 'CRON.md');
 const MEMORY_DB_PATH = path.join(VAULT_DIR, '.memory.db');
 const PROJECTS_META_FILE = path.join(BASE_DIR, 'projects.json');
+const DASHBOARD_PID_FILE = path.join(BASE_DIR, '.dashboard.pid');
 
 // ── Lazy gateway for chat ────────────────────────────────────────────
 
@@ -3314,6 +3315,16 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
           console.log();
           console.log('  Press Ctrl+C to stop');
           console.log();
+
+          // Write PID file so `clementine update` can reliably find us
+          writeFileSync(DASHBOARD_PID_FILE, String(process.pid));
+          const cleanupPid = () => {
+            try { unlinkSync(DASHBOARD_PID_FILE); } catch { /* ignore */ }
+          };
+          process.on('exit', cleanupPid);
+          process.on('SIGINT', () => { cleanupPid(); process.exit(0); });
+          process.on('SIGTERM', () => { cleanupPid(); process.exit(0); });
+
           resolve();
         });
         server.once('error', (err: NodeJS.ErrnoException) => {
@@ -7998,14 +8009,14 @@ async function refreshRemoteAccess() {
         + '<label style="font-size:12px;font-weight:600;color:var(--text-secondary);display:block;margin-bottom:4px">Public URL</label>'
         + '<div style="display:flex;gap:8px;align-items:center">'
         + '<code style="flex:1;padding:8px 12px;background:var(--bg-primary);border:1px solid var(--border);border-radius:6px;font-size:13px;word-break:break-all">' + esc(d.tunnelUrl) + '</code>'
-        + '<button class="btn-sm btn-primary" onclick="copyToClipboard(\'' + esc(d.tunnelUrl) + '\')">Copy</button>'
+        + '<button class="btn-sm btn-primary" onclick="copyToClipboard(\\'' + esc(d.tunnelUrl) + '\\')">Copy</button>'
         + '</div>'
         + '</div>'
         + '<div style="margin-bottom:16px">'
         + '<label style="font-size:12px;font-weight:600;color:var(--text-secondary);display:block;margin-bottom:4px">Access Token</label>'
         + '<div style="display:flex;gap:8px;align-items:center">'
         + '<code id="ra-token-display" style="flex:1;padding:8px 12px;background:var(--bg-primary);border:1px solid var(--border);border-radius:6px;font-size:13px;letter-spacing:1px">' + esc(d.authToken) + '</code>'
-        + '<button class="btn-sm" onclick="copyToClipboard(\'' + esc(d.authToken) + '\')">Copy</button>'
+        + '<button class="btn-sm" onclick="copyToClipboard(\\'' + esc(d.authToken) + '\\')">Copy</button>'
         + '<button class="btn-sm" onclick="regenerateToken()">Regenerate</button>'
         + '</div>'
         + '<div style="font-size:11px;color:var(--text-muted);margin-top:4px">Share this token (securely) to grant remote access. Regenerating invalidates all sessions.</div>'
@@ -8906,7 +8917,7 @@ async function refreshDailyPlan() {
         html += '<span style="font-weight:600;color:var(--text-primary);min-width:140px">' + esc(c.job) + '</span>';
         html += '<span style="background:' + changeColor + ';color:#000;font-size:11px;font-weight:600;padding:2px 8px;border-radius:6px">' + esc(c.change) + '</span>';
         html += '<span style="color:var(--text-secondary);flex:1;font-size:13px">' + esc(c.reason) + '</span>';
-        html += '<button class="btn btn-sm" onclick="applyPlanSuggestion(\'' + esc(c.job) + '\',\'' + esc(c.change) + '\',\'' + esc(c.reason) + '\')" style="background:var(--blue);color:#fff;font-size:11px">Apply</button>';
+        html += '<button class="btn btn-sm" onclick="applyPlanSuggestion(\\'' + esc(c.job) + '\\',\\'' + esc(c.change) + '\\',\\'' + esc(c.reason) + '\\')" style="background:var(--blue);color:#fff;font-size:11px">Apply</button>';
         html += '</div>';
       }
       html += '</div></div>';
@@ -8936,7 +8947,7 @@ async function refreshDailyPlan() {
     const histEl = document.getElementById('plan-history-list');
     if (hd.plans?.length) {
       histEl.innerHTML = hd.plans.map(p =>
-        '<div style="display:flex;align-items:center;gap:12px;padding:6px 0;border-bottom:1px solid var(--border);cursor:pointer" onclick="loadPlanForDate(\'' + p.date + '\')">' +
+        '<div style="display:flex;align-items:center;gap:12px;padding:6px 0;border-bottom:1px solid var(--border);cursor:pointer" onclick="loadPlanForDate(\\'' + p.date + '\\')">' +
         '<span style="font-weight:600;color:var(--blue);min-width:100px">' + p.date + '</span>' +
         '<span style="color:var(--text-muted);font-size:12px">' + p.priorityCount + ' priorities</span>' +
         '<span style="color:var(--text-secondary);flex:1;font-size:13px">' + esc(p.summary || '').slice(0, 120) + '</span>' +

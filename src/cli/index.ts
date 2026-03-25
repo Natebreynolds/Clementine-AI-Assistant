@@ -1135,6 +1135,26 @@ async function cmdUpdate(options: { restart?: boolean; dryRun?: boolean }): Prom
     console.error(`       Run: cd ${PACKAGE_ROOT} && node node_modules/falkordblite/scripts/postinstall.js`);
   }
 
+  // 6d. Ensure cloudflared is installed (for remote dashboard access)
+  try {
+    execSync('which cloudflared', { stdio: 'pipe' });
+    console.log(`  ${GREEN}OK${RESET}  cloudflared available`);
+  } catch {
+    if (process.platform === 'darwin') {
+      console.log(`  ${S()} Installing cloudflared (remote dashboard access)...`);
+      try {
+        execSync('brew install cloudflared', { stdio: ['pipe', 'pipe', 'pipe'], timeout: 120_000 });
+        console.log(`  ${GREEN}OK${RESET}  cloudflared installed`);
+      } catch {
+        console.error(`  ${YELLOW}WARN${RESET}  Could not install cloudflared — remote access won't be available`);
+        console.error(`       Fix: brew install cloudflared`);
+      }
+    } else {
+      console.error(`  ${YELLOW}WARN${RESET}  cloudflared not installed — remote dashboard access won't be available`);
+      console.error(`       See: https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/`);
+    }
+  }
+
   // 7. Build (clean)
   console.log(`  ${S()} Building (clean)...`);
   try {
@@ -1284,16 +1304,18 @@ async function cmdUpdate(options: { restart?: boolean; dryRun?: boolean }): Prom
   cmdDoctor();
 
   // 11. Kill any running dashboard process so it picks up new code on next start
+  //     Uses PID file — pgrep pattern can't match because process shows as "node dist/cli/index.js dashboard"
   try {
-    const dashPids = execSync("pgrep -f 'clementine.*dashboard' || true", { encoding: 'utf-8' }).trim();
-    if (dashPids) {
-      for (const dp of dashPids.split('\n').filter(Boolean)) {
-        const dpid = parseInt(dp, 10);
-        if (!isNaN(dpid) && dpid !== process.pid) {
-          try { process.kill(dpid, 'SIGTERM'); } catch { /* ignore */ }
-        }
+    const dashPidFile = path.join(BASE_DIR, '.dashboard.pid');
+    if (existsSync(dashPidFile)) {
+      const dpid = parseInt(readFileSync(dashPidFile, 'utf-8').trim(), 10);
+      if (!isNaN(dpid) && dpid !== process.pid) {
+        try {
+          process.kill(dpid, 'SIGTERM');
+          console.log(`  ${GREEN}OK${RESET}  Stopped dashboard process (restart with: clementine dashboard)`);
+        } catch { /* already dead */ }
+        try { unlinkSync(dashPidFile); } catch { /* ignore */ }
       }
-      console.log(`  ${GREEN}OK${RESET}  Stopped dashboard process (restart with: clementine dashboard)`);
     }
   } catch { /* no dashboard running */ }
 
