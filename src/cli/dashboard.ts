@@ -122,40 +122,52 @@ function saveRemoteConfig(config: RemoteAccessConfig): void {
 
 /** Send tunnel URL to Discord via REST API (lightweight, no client library needed). */
 async function notifyTunnelUrl(url: string): Promise<void> {
-  console.log('  [tunnel] Posting URL to Discord...');
+  console.log('  [tunnel] Sending remote access URL via DM...');
   const envPath = path.join(BASE_DIR, '.env');
   if (!existsSync(envPath)) { console.log('  [tunnel] No .env — skipping'); return; }
   const envContent = readFileSync(envPath, 'utf-8');
 
   const tokenMatch = envContent.match(/^DISCORD_TOKEN=(.+)$/m);
-  const channelMatch = envContent.match(/^DISCORD_WATCHED_CHANNELS=(.+)$/m);
-  if (!tokenMatch || !channelMatch) { console.log('  [tunnel] Missing DISCORD_TOKEN or DISCORD_WATCHED_CHANNELS'); return; }
+  const ownerMatch = envContent.match(/^DISCORD_OWNER_ID=(.+)$/m);
+  if (!tokenMatch || !ownerMatch) { console.log('  [tunnel] Missing DISCORD_TOKEN or DISCORD_OWNER_ID'); return; }
 
   let token = tokenMatch[1].trim();
   if ((token.startsWith('"') && token.endsWith('"')) || (token.startsWith("'") && token.endsWith("'"))) {
     token = token.slice(1, -1);
   }
-  const channelId = channelMatch[1].split(',')[0].trim();
-  if (!token || !channelId) return;
+  const ownerId = ownerMatch[1].trim();
+  if (!token || !ownerId) return;
+
+  const headers = { 'Authorization': `Bot ${token}`, 'Content-Type': 'application/json' };
 
   try {
-    const resp = await fetch(`https://discord.com/api/v10/channels/${channelId}/messages`, {
+    // Open DM channel with owner
+    const dmResp = await fetch('https://discord.com/api/v10/users/@me/channels', {
       method: 'POST',
-      headers: {
-        'Authorization': `Bot ${token}`,
-        'Content-Type': 'application/json',
-      },
+      headers,
+      body: JSON.stringify({ recipient_id: ownerId }),
+    });
+    if (!dmResp.ok) {
+      console.error(`  [tunnel] Failed to open DM channel: ${dmResp.status}`);
+      return;
+    }
+    const dm = await dmResp.json() as { id: string };
+
+    // Send the URL as a DM
+    const msgResp = await fetch(`https://discord.com/api/v10/channels/${dm.id}/messages`, {
+      method: 'POST',
+      headers,
       body: JSON.stringify({
-        content: `**Remote Dashboard Online**\n\nAccess your dashboard from anywhere:\n${url}\n\nLog in with your access token from \`Settings > Remote Access\`.`,
+        content: `**Remote Dashboard Online** 🌐\n\n${url}\n\nLog in with your access token from **Settings > Remote Access**.`,
       }),
     });
-    if (resp.ok) {
-      console.log('  [tunnel] Discord notification sent');
+    if (msgResp.ok) {
+      console.log('  [tunnel] DM sent to owner');
     } else {
-      console.error(`  [tunnel] Discord API error ${resp.status}: ${await resp.text().catch(() => '')}`);
+      console.error(`  [tunnel] Discord API error ${msgResp.status}: ${await msgResp.text().catch(() => '')}`);
     }
   } catch (err) {
-    console.error(`  [tunnel] Discord notification failed: ${err}`);
+    console.error(`  [tunnel] Discord DM failed: ${err}`);
   }
 }
 
