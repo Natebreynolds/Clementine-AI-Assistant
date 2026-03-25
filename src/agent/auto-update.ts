@@ -105,8 +105,9 @@ export async function applyUpdate(pkgDir: string): Promise<UpdateApplyResult> {
     }
 
     // 3. Install dependencies (in case they changed)
+    // Include devDependencies — typescript is needed for the build step
     try {
-      execSync('npm install --omit=dev', {
+      execSync('npm install', {
         cwd: pkgDir,
         stdio: 'pipe',
         timeout: 120_000,
@@ -116,9 +117,9 @@ export async function applyUpdate(pkgDir: string): Promise<UpdateApplyResult> {
       // Non-fatal — build may still work
     }
 
-    // 4. Build
+    // 4. Build — use local tsc binary directly (npx can fail if typescript isn't cached)
     try {
-      execSync('npx tsc', {
+      execSync('./node_modules/.bin/tsc', {
         cwd: pkgDir,
         stdio: 'pipe',
         timeout: 120_000,
@@ -141,7 +142,7 @@ export async function applyUpdate(pkgDir: string): Promise<UpdateApplyResult> {
     // 6. Rebuild if any mods were re-applied
     if (reconcileResult.reapplied.length > 0) {
       try {
-        execSync('npx tsc', { cwd: pkgDir, stdio: 'pipe', timeout: 120_000 });
+        execSync('./node_modules/.bin/tsc', { cwd: pkgDir, stdio: 'pipe', timeout: 120_000 });
         logger.info('Rebuild succeeded after re-applying source mods');
       } catch (err) {
         logger.warn({ err }, 'Rebuild failed after re-applying source mods');

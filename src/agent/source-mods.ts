@@ -252,7 +252,7 @@ export function reconcileSourceMods(pkgDir: string): ReconcileResult {
   if (result.reapplied.length > 0) {
     try {
       const { execSync } = require('node:child_process');
-      execSync('npx tsc --noEmit', { cwd: pkgDir, stdio: 'pipe', timeout: 120_000 });
+      execSync('./node_modules/.bin/tsc --noEmit', { cwd: pkgDir, stdio: 'pipe', timeout: 120_000 });
       logger.info({ count: result.reapplied.length }, 'Typecheck passed after re-applying source mods');
     } catch {
       // Typecheck failed — revert all re-applied mods
