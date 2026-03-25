@@ -25,7 +25,7 @@ export interface PreflightResult {
  * 1. Create a detached worktree from HEAD
  * 2. Symlink node_modules from the real tree
  * 3. Write the changed .ts files into the worktree
- * 4. Run `npx tsc --noEmit` to type-check
+ * 4. Run `./node_modules/.bin/tsc --noEmit` to type-check
  * 5. Return success/failure with compiler errors
  * 6. Always clean up the worktree
  */
@@ -74,7 +74,7 @@ export async function preflightSourceChange(
 
     // 4. Run tsc --noEmit to type-check
     try {
-      execSync('npx tsc --noEmit', {
+      execSync('./node_modules/.bin/tsc --noEmit', {
         cwd: worktreePath,
         stdio: 'pipe',
         timeout: 60_000,

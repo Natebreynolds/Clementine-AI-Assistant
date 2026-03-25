@@ -118,7 +118,7 @@ export async function safeSourceEdit(
   //    the build script does `rm -rf dist` which would nuke the currently
   //    running process's loaded modules. tsc alone overwrites only changed .js files.
   try {
-    execSync('npx tsc', {
+    execSync('./node_modules/.bin/tsc', {
       cwd: pkgDir,
       stdio: 'pipe',
       timeout: 120_000,
@@ -132,7 +132,7 @@ export async function safeSourceEdit(
       for (const file of filesWithSnapshots) {
         writeFileSync(path.join(pkgDir, file.relativePath), file.beforeContent);
       }
-      execSync('npx tsc', { cwd: pkgDir, stdio: 'pipe', timeout: 120_000 });
+      execSync('./node_modules/.bin/tsc', { cwd: pkgDir, stdio: 'pipe', timeout: 120_000 });
     } catch (revertErr) {
       logger.error({ revertErr }, 'Revert + rebuild also failed');
     }

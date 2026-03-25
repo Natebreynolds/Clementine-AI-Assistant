@@ -824,7 +824,7 @@ async function asyncMain(): Promise<void> {
           }
           // Use tsc directly — `npm run build` does `rm -rf dist` which would
           // nuke the running process's code. tsc alone overwrites only changed .js files.
-          execSync('npx tsc', { cwd: config.PKG_DIR, stdio: 'pipe', timeout: 120_000 });
+          execSync('./node_modules/.bin/tsc', { cwd: config.PKG_DIR, stdio: 'pipe', timeout: 120_000 });
           logger.info('Rollback successful — spawning clean instance');
 
           const retryChild = spawn(process.execPath, [entry, ...args], {
