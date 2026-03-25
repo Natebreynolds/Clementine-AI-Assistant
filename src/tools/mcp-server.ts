@@ -2380,6 +2380,71 @@ server.tool(
   },
 );
 
+// ── Cron Run History ──────────────────────────────────────────────────
+
+server.tool(
+  'cron_run_history',
+  'Query your own cron job execution history — statuses, durations, errors, and reflection scores. ' +
+  'Use this to understand your past performance and identify patterns.',
+  {
+    job_name: z.string().describe('Name of the cron job to query history for'),
+    limit: z.number().optional().describe('Number of recent runs to return (default: 10, max: 50)'),
+  },
+  async ({ job_name, limit }) => {
+    const count = Math.min(limit ?? 10, 50);
+
+    // Read run log
+    const runDir = path.join(BASE_DIR, 'cron', 'runs');
+    const safeJob = job_name.replace(/[^a-zA-Z0-9_-]/g, '_');
+    const runLogPath = path.join(runDir, `${safeJob}.jsonl`);
+
+    let runs: any[] = [];
+    if (existsSync(runLogPath)) {
+      const lines = readFileSync(runLogPath, 'utf-8').trim().split('\n').filter(Boolean);
+      runs = lines.slice(-count).map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean).reverse();
+    }
+
+    // Read reflections
+    const reflectionsDir = path.join(BASE_DIR, 'cron', 'reflections');
+    const reflPath = path.join(reflectionsDir, `${safeJob}.jsonl`);
+    let reflections: any[] = [];
+    if (existsSync(reflPath)) {
+      const lines = readFileSync(reflPath, 'utf-8').trim().split('\n').filter(Boolean);
+      reflections = lines.slice(-count).map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean).reverse();
+    }
+
+    if (runs.length === 0 && reflections.length === 0) {
+      return textResult(`No execution history found for job '${job_name}'.`);
+    }
+
+    const parts: string[] = [`## Run History: ${job_name} (last ${count})`];
+
+    if (runs.length > 0) {
+      parts.push('\n### Executions');
+      for (const r of runs) {
+        const dur = r.durationMs ? `${(r.durationMs / 1000).toFixed(1)}s` : '?';
+        const err = r.error ? ` | Error: ${r.error.slice(0, 100)}` : '';
+        parts.push(`- [${r.status}] ${r.startedAt} (${dur})${err}`);
+      }
+    }
+
+    if (reflections.length > 0) {
+      parts.push('\n### Quality Reflections');
+      for (const r of reflections) {
+        const flags = [
+          r.existence ? 'exists' : 'MISSING',
+          r.substance ? 'substantive' : 'EMPTY',
+          r.actionable ? 'actionable' : 'NOT-ACTIONABLE',
+        ].join(', ');
+        const gap = r.gap && r.gap !== 'none' ? ` | Gap: ${r.gap.slice(0, 100)}` : '';
+        parts.push(`- Quality: ${r.quality}/5 (${flags})${gap} — ${r.timestamp}`);
+      }
+    }
+
+    return textResult(parts.join('\n'));
+  },
+);
+
 // ── Discord Channel Send ────────────────────────────────────────────────
 
 server.tool(
@@ -3545,6 +3610,127 @@ server.tool(
   },
 );
 
+// ── Team Request/Response ──────────────────────────────────────────────
+
+server.tool(
+  'team_request',
+  'Send a structured request to another team agent and wait for their response. ' +
+  'Unlike team_message (fire-and-forget), this blocks until the target responds (up to 5 min timeout). ' +
+  'Use for questions that need an answer before you can proceed.',
+  {
+    to_agent: z.string().describe('Slug of the target agent'),
+    request: z.string().describe('The question or request content'),
+    timeout_seconds: z.number().optional().describe('Timeout in seconds (default: 300, max: 600)'),
+  },
+  async ({ to_agent, request, timeout_seconds }) => {
+    const callerSlug = process.env.CLEMENTINE_TEAM_AGENT ?? '';
+    if (!callerSlug) {
+      return textResult('Error: Cannot determine calling agent. This tool must be called from a team agent session.');
+    }
+
+    const timeoutMs = Math.min((timeout_seconds ?? 300) * 1000, 600_000);
+
+    const dashboardPort = env['DASHBOARD_PORT'] ?? '3030';
+    let dashboardToken = '';
+    try {
+      dashboardToken = readFileSync(path.join(BASE_DIR, '.dashboard-token'), 'utf-8').trim();
+    } catch { /* token file not found */ }
+
+    try {
+      const res = await fetch(`http://127.0.0.1:${dashboardPort}/api/team/request`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(dashboardToken ? { 'Authorization': `Bearer ${dashboardToken}` } : {}),
+        },
+        body: JSON.stringify({
+          from_agent: callerSlug,
+          to_agent,
+          content: request,
+          timeout_ms: timeoutMs,
+        }),
+        signal: AbortSignal.timeout(timeoutMs + 10_000),
+      });
+
+      const data = await res.json() as { ok: boolean; response?: string; error?: string; timed_out?: boolean };
+      if (data.ok && data.response) {
+        return textResult(`Response from ${to_agent}:\n\n${data.response}`);
+      }
+      if (data.timed_out) {
+        return textResult(`Request to ${to_agent} timed out after ${timeout_seconds ?? 300}s. They may respond later.`);
+      }
+      return textResult(`Error: ${data.error ?? 'Unknown error sending request'}`);
+    } catch (err) {
+      return textResult(`Error sending request: ${String(err)}`);
+    }
+  },
+);
+
+server.tool(
+  'team_pending_requests',
+  'Check for pending requests from other team agents that need your response. ' +
+  'Call this at the start of your work session to see if anyone is waiting for you.',
+  {},
+  async () => {
+    const callerSlug = process.env.CLEMENTINE_TEAM_AGENT ?? '';
+    if (!callerSlug) {
+      return textResult('Error: Cannot determine calling agent.');
+    }
+
+    const dashboardPort = env['DASHBOARD_PORT'] ?? '3030';
+    let dashboardToken = '';
+    try {
+      dashboardToken = readFileSync(path.join(BASE_DIR, '.dashboard-token'), 'utf-8').trim();
+    } catch { /* token file not found */ }
+
+    try {
+      const res = await fetch(`http://127.0.0.1:${dashboardPort}/api/team/pending-requests?agent=${callerSlug}`, {
+        headers: dashboardToken ? { 'Authorization': `Bearer ${dashboardToken}` } : {},
+        signal: AbortSignal.timeout(10_000),
+      });
+
+      const data = await res.json() as { ok: boolean; requests?: any[]; error?: string };
+      if (!data.ok) {
+        return textResult(`Error: ${data.error ?? 'Failed to fetch pending requests'}`);
+      }
+
+      const requests = data.requests ?? [];
+      if (requests.length === 0) {
+        return textResult('No pending requests. You can proceed with your main task.');
+      }
+
+      const lines = requests.map((r: any) =>
+        `- **[REPLY NEEDED]** From ${r.fromAgent} (${r.requestId}): ${r.content.slice(0, 200)}` +
+        (r.expectedBy ? ` — expected by ${r.expectedBy}` : '')
+      );
+
+      return textResult(`## Pending Requests (${requests.length})\n${lines.join('\n')}\n\nUse team_message to respond, referencing the request content.`);
+    } catch {
+      if (existsSync(TEAM_COMMS_LOG)) {
+        try {
+          const logLines = readFileSync(TEAM_COMMS_LOG, 'utf-8').trim().split('\n').filter(Boolean);
+          const pendingReqs = logLines
+            .slice(-100)
+            .map(l => { try { return JSON.parse(l); } catch { return null; } })
+            .filter((m: any) => m && m.protocol === 'request' && m.toAgent === callerSlug && !m.response);
+
+          if (pendingReqs.length === 0) {
+            return textResult('No pending requests found.');
+          }
+
+          const formatted = pendingReqs.map((r: any) =>
+            `- **[REPLY NEEDED]** From ${r.fromAgent}: ${r.content.slice(0, 200)}`
+          );
+          return textResult(`## Pending Requests (${pendingReqs.length})\n${formatted.join('\n')}`);
+        } catch {
+          return textResult('No pending requests found.');
+        }
+      }
+      return textResult('No pending requests found (daemon unreachable for live data).');
+    }
+  },
+);
+
 // ── Agent CRUD Authorization ──────────────────────────────────────────────
 
 /**
@@ -4324,6 +4510,106 @@ server.tool(
     } catch {
       return textResult(`Error reading handoff for "${session_key}".`);
     }
+  },
+);
+
+// ── Discover Work ──────────────────────────────────────────────────────
+
+server.tool(
+  'discover_work',
+  'Scan goals, tasks, inbox, and recent failures to find prioritized work items. ' +
+  'Call this to discover what needs attention and prioritize your effort.',
+  {
+    agent_slug: z.string().optional().describe('Filter work items for a specific agent (omit for all)'),
+    limit: z.number().optional().describe('Max items to return (default: 10)'),
+  },
+  async ({ agent_slug, limit }) => {
+    const maxItems = Math.min(limit ?? 10, 30);
+    const items: Array<{ type: string; urgency: number; description: string }> = [];
+
+    // 1. Stale goals
+    const goalsDir = path.join(BASE_DIR, 'goals');
+    if (existsSync(goalsDir)) {
+      for (const f of readdirSync(goalsDir).filter(f => f.endsWith('.json'))) {
+        try {
+          const goal = JSON.parse(readFileSync(path.join(goalsDir, f), 'utf-8'));
+          if (goal.status !== 'active') continue;
+          if (agent_slug && goal.owner !== agent_slug) continue;
+
+          const daysSinceUpdate = Math.floor((Date.now() - new Date(goal.updatedAt).getTime()) / 86400000);
+          const staleThreshold = goal.reviewFrequency === 'daily' ? 1 : goal.reviewFrequency === 'weekly' ? 7 : 30;
+          if (daysSinceUpdate > staleThreshold) {
+            const urgency = Math.min(5, Math.floor(daysSinceUpdate / staleThreshold) + (goal.priority === 'high' ? 2 : goal.priority === 'medium' ? 1 : 0));
+            items.push({ type: 'stale-goal', urgency, description: `Goal "${goal.title}" stale for ${daysSinceUpdate}d (${goal.priority} priority)` });
+          }
+        } catch { continue; }
+      }
+    }
+
+    // 2. Failing cron jobs
+    const runDir = path.join(BASE_DIR, 'cron', 'runs');
+    if (existsSync(runDir)) {
+      for (const f of readdirSync(runDir).filter(f => f.endsWith('.jsonl'))) {
+        try {
+          const lines = readFileSync(path.join(runDir, f), 'utf-8').trim().split('\n').filter(Boolean);
+          const recent = lines.slice(-5).map(l => JSON.parse(l));
+          const consecutiveErrors = recent.reverse().findIndex(r => r.status === 'ok');
+          const errCount = consecutiveErrors === -1 ? recent.length : consecutiveErrors;
+          if (errCount >= 2) {
+            const jobName = recent[0]?.jobName ?? f.replace('.jsonl', '');
+            items.push({ type: 'cron-failure', urgency: Math.min(5, errCount), description: `Job "${jobName}" has ${errCount} consecutive failures` });
+          }
+        } catch { continue; }
+      }
+    }
+
+    // 3. Pending tasks
+    if (existsSync(TASKS_FILE)) {
+      const content = readFileSync(TASKS_FILE, 'utf-8');
+      const today = todayStr();
+      const overdue = (content.match(/- \[ \].*?📅\s*(\d{4}-\d{2}-\d{2})/g) ?? [])
+        .filter(line => {
+          const dateMatch = line.match(/📅\s*(\d{4}-\d{2}-\d{2})/);
+          return dateMatch && dateMatch[1] < today;
+        });
+      if (overdue.length > 0) {
+        items.push({ type: 'overdue-tasks', urgency: 4, description: `${overdue.length} overdue task(s) in TASKS.md` });
+      }
+    }
+
+    // 4. Inbox items
+    if (existsSync(INBOX_DIR)) {
+      const inboxFiles = readdirSync(INBOX_DIR).filter(f => f.endsWith('.md') && !f.startsWith('_'));
+      if (inboxFiles.length > 0) {
+        items.push({ type: 'inbox', urgency: 2, description: `${inboxFiles.length} unprocessed inbox item(s)` });
+      }
+    }
+
+    // 5. Daily plan priorities (if a plan exists for today)
+    const plansDir = path.join(BASE_DIR, 'plans', 'daily');
+    const planFile = path.join(plansDir, `${todayStr()}.json`);
+    if (existsSync(planFile)) {
+      try {
+        const plan = JSON.parse(readFileSync(planFile, 'utf-8'));
+        for (const p of (plan.priorities ?? []).slice(0, 5)) {
+          const alreadyListed = items.some(i => i.description.includes(p.id) || i.description.includes(p.action?.slice(0, 20)));
+          if (!alreadyListed) {
+            items.push({ type: `plan-${p.type}`, urgency: p.urgency ?? 3, description: `[From daily plan] ${p.action}` });
+          }
+        }
+      } catch { /* non-fatal */ }
+    }
+
+    // Sort by urgency desc, limit
+    items.sort((a, b) => b.urgency - a.urgency);
+    const topItems = items.slice(0, maxItems);
+
+    if (topItems.length === 0) {
+      return textResult('No work items discovered. All goals on track, no failures, inbox clear.');
+    }
+
+    const lines = topItems.map(i => `- [${i.type}] Urgency ${i.urgency}/5: ${i.description}`);
+    return textResult(`## Discovered Work Items (${topItems.length})\n${lines.join('\n')}`);
   },
 );
 

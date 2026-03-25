@@ -316,6 +316,10 @@ export const HANDOFFS_DIR = path.join(BASE_DIR, 'handoffs');
 export const PLAN_STATE_DIR = path.join(BASE_DIR, 'plan-state');
 export const VAULT_MIGRATIONS_STATE = path.join(BASE_DIR, '.vault-migrations.json');
 
+// ── Daily Plans ─────────────────────────────────────────────────────
+
+export const PLANS_DIR = path.join(BASE_DIR, 'plans');
+
 // ── Source Self-Edit Staging ─────────────────────────────────────────
 
 export const STAGING_DIR = path.join(BASE_DIR, 'staging');

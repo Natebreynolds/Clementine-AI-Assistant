@@ -2344,6 +2344,48 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
       }
     } catch { /* non-fatal */ }
 
+    // ── Team context: inject recent messages and pending requests ────
+    let teamContext = '';
+    try {
+      const teamLogPath = path.join(BASE_DIR, 'logs', 'team-comms.jsonl');
+      const agentSlug = sdkOptions.env?.CLEMENTINE_TEAM_AGENT;
+      if (agentSlug && fs.existsSync(teamLogPath)) {
+        const teamLines = fs.readFileSync(teamLogPath, 'utf-8').trim().split('\n').filter(Boolean);
+        const recentForAgent = teamLines
+          .slice(-50)
+          .map(l => { try { return JSON.parse(l); } catch { return null; } })
+          .filter((m: any) => m && (m.toAgent === agentSlug || m.fromAgent === agentSlug))
+          .slice(-5);
+
+        const pendingRequests = recentForAgent.filter(
+          (m: any) => m.protocol === 'request' && m.toAgent === agentSlug && !m.response
+        );
+
+        if (pendingRequests.length > 0 || recentForAgent.length > 0) {
+          const parts: string[] = ['## Team Context'];
+
+          if (pendingRequests.length > 0) {
+            parts.push('### REPLY NEEDED — Pending Requests');
+            for (const r of pendingRequests) {
+              parts.push(`- From ${r.fromAgent}: ${r.content.slice(0, 200)}`);
+            }
+            parts.push('Address these requests before your main task.');
+          }
+
+          if (recentForAgent.length > 0) {
+            parts.push('### Recent Team Messages');
+            for (const m of recentForAgent) {
+              const dir = m.fromAgent === agentSlug ? 'sent to' : 'from';
+              const other = m.fromAgent === agentSlug ? m.toAgent : m.fromAgent;
+              parts.push(`- ${dir} ${other}: ${m.content.slice(0, 100)}`);
+            }
+          }
+
+          teamContext = parts.join('\n') + '\n\n';
+        }
+      }
+    } catch { /* non-fatal */ }
+
     // ── Success criteria: inject verifiable acceptance criteria ────
     let criteriaContext = '';
     if (successCriteria?.length) {
@@ -2356,6 +2398,7 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
       progressContext +
       goalContext +
       delegationContext +
+      teamContext +
       criteriaContext +
       `${jobPrompt}\n\n` +
       `## How to respond\n` +
@@ -2551,6 +2594,24 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
           job: jobName, quality: entry.quality,
           existence: entry.existence, substance: entry.substance, actionable: entry.actionable,
         }, 'Cron reflection logged');
+
+        // Bridge: update cron progress with last reflection data
+        try {
+          const safeJob = jobName.replace(/[^a-zA-Z0-9_-]/g, '_');
+          const progressFile = path.join(CRON_PROGRESS_DIR, `${safeJob}.json`);
+          if (fs.existsSync(progressFile)) {
+            const progress = JSON.parse(fs.readFileSync(progressFile, 'utf-8'));
+            progress.state = {
+              ...progress.state,
+              lastReflection: {
+                quality: entry.quality,
+                gap: entry.gap,
+                timestamp: entry.timestamp,
+              },
+            };
+            fs.writeFileSync(progressFile, JSON.stringify(progress, null, 2));
+          }
+        } catch { /* non-fatal */ }
       }
     } catch {
       // Non-fatal — reflection is best-effort

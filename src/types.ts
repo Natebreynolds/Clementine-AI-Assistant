@@ -114,6 +114,21 @@ export interface TeamMessage {
   delivered: boolean;              // Was it injected into target session?
   depth: number;                   // Depth counter for anti-loop (0 = original)
   response?: string;               // Agent's response (populated by active bot delivery)
+  protocol?: 'fire-and-forget' | 'request' | 'response' | 'broadcast';
+  requestId?: string;              // Links request/response pairs
+  replyTo?: string;                // requestId this is replying to
+  expectedBy?: string;             // ISO timestamp — when requester needs reply
+}
+
+export interface PendingRequest {
+  requestId: string;
+  fromAgent: string;
+  toAgent: string;
+  content: string;
+  timestamp: string;
+  expectedBy?: string;
+  status: 'pending' | 'responded' | 'expired';
+  responseMessageId?: string;
 }
 
 export interface AgentProfile {
@@ -459,6 +474,37 @@ export interface DelegatedTask {
 // ── Verbose Level ───────────────────────────────────────────────────
 
 export type VerboseLevel = 'quiet' | 'normal' | 'detailed';
+
+// ── Adaptive Execution ──────────────────────────────────────────────
+
+export interface ExecutionAdvice {
+  adjustedMaxTurns: number | null;
+  adjustedModel: string | null;
+  adjustedTimeoutMs: number | null;
+  promptEnrichment: string;
+  shouldEscalate: boolean;
+  escalationReason?: string;
+  shouldSkip: boolean;
+  skipReason?: string;
+}
+
+// ── Daily Planning ──────────────────────────────────────────────────
+
+export interface DailyPlanPriority {
+  type: 'goal' | 'task' | 'cron-fix' | 'inbox';
+  id: string;
+  action: string;
+  urgency: number;
+}
+
+export interface DailyPlan {
+  date: string;
+  createdAt: string;
+  priorities: DailyPlanPriority[];
+  suggestedCronChanges: Array<{ job: string; change: string; reason: string }>;
+  newWork: Array<{ description: string; goalId?: string; suggestedSchedule?: string }>;
+  summary: string;
+}
 
 // ── Utility types ────────────────────────────────────────────────────
 

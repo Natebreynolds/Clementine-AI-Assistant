@@ -184,6 +184,41 @@ export class HeartbeatScheduler {
       return;
     }
 
+    // ── Daily planning session: first tick of the day ──
+    let dailyPlanner: import('../agent/daily-planner.js').DailyPlanner | null = null;
+    try {
+      const { DailyPlanner } = await import('../agent/daily-planner.js');
+      dailyPlanner = new DailyPlanner();
+      if (!dailyPlanner.hasPlanForToday()) {
+        logger.info('First active-hours tick — generating daily plan');
+        const plan = await dailyPlanner.plan();
+        if (plan.priorities.length > 0) {
+          const highUrgency = plan.priorities.filter(p => p.urgency >= 4);
+          if (highUrgency.length > 0) {
+            const goalTriggerDir = path.join(BASE_DIR, 'cron', 'goal-triggers');
+            mkdirSync(goalTriggerDir, { recursive: true });
+            for (const item of highUrgency) {
+              if (item.type === 'goal') {
+                const triggerPath = path.join(goalTriggerDir, `${item.id}.trigger.json`);
+                if (!existsSync(triggerPath)) {
+                  writeFileSync(triggerPath, JSON.stringify({
+                    goalId: item.id,
+                    focus: item.action,
+                    maxTurns: 10,
+                    triggeredAt: new Date().toISOString(),
+                    source: 'daily-plan',
+                  }, null, 2));
+                }
+              }
+            }
+          }
+          logger.info({ priorities: plan.priorities.length, urgent: plan.priorities.filter(p => p.urgency >= 4).length }, 'Daily plan generated');
+        }
+      }
+    } catch (err) {
+      logger.warn({ err }, 'Daily planning failed (non-fatal)');
+    }
+
     // Compute current state for context (always run — heartbeats keep the agent alive)
     const [currentFingerprint, currentDetails] = this.computeStateFingerprint();
 
@@ -210,6 +245,14 @@ export class HeartbeatScheduler {
     if (goalMemoryContext) {
       changesSummary += `\n\n${goalMemoryContext}`;
     }
+
+    // Inject daily plan summary if available
+    try {
+      const todayPlan = dailyPlanner?.getPlan();
+      if (todayPlan) {
+        changesSummary += `\n\n## Today's Plan\n${todayPlan.summary}\nTop priorities: ${todayPlan.priorities.slice(0, 3).map(p => p.action).join('; ')}`;
+      }
+    } catch { /* non-fatal */ }
 
     // Persist new state
     this.lastState = {
@@ -572,6 +615,52 @@ export class HeartbeatScheduler {
       const triggerPath = path.join(goalTriggerDir, `${goal.id}.trigger.json`);
       writeFileSync(triggerPath, JSON.stringify(trigger, null, 2));
       logger.info({ goalId: goal.id, title: goal.title, focus }, 'Nudged stale goal via trigger file');
+
+      // Goal-driven task generation: find goals with nextActions but no matching tasks
+      try {
+        const tasksContent = existsSync(TASKS_FILE) ? readFileSync(TASKS_FILE, 'utf-8') : '';
+
+        for (const { goal: g } of staleGoals.slice(0, 3)) {
+          if (!g.nextActions?.length) continue;
+
+          const hasMatchingTask = g.nextActions.some((action: string) =>
+            tasksContent.toLowerCase().includes(action.toLowerCase().slice(0, 30))
+          );
+          if (hasMatchingTask) continue;
+
+          const taskTriggerPath = path.join(goalTriggerDir, `${g.id}-tasks.trigger.json`);
+          if (!existsSync(taskTriggerPath)) {
+            writeFileSync(taskTriggerPath, JSON.stringify({
+              goalId: g.id,
+              focus: `Create tasks for goal "${g.title}": ${g.nextActions.slice(0, 3).join('; ')}`,
+              maxTurns: 5,
+              triggeredAt: new Date().toISOString(),
+              source: 'goal-task-gen',
+            }, null, 2));
+            logger.info({ goalId: g.id }, 'Generated task trigger for goal with untracked nextActions');
+          }
+        }
+
+        // Check goals with linked crons but no recent progress
+        for (const { goal: g } of staleGoals) {
+          if (!g.linkedCronJobs?.length) continue;
+
+          const recentProgress = g.progressNotes?.length > 0;
+          if (recentProgress) continue;
+
+          const runLog = new CronRunLog();
+          const allFailing = g.linkedCronJobs.every((cronName: string) => {
+            const recent = runLog.readRecent(cronName, 3);
+            return recent.length > 0 && recent.every((r: CronRunEntry) => r.status !== 'ok');
+          });
+
+          if (allFailing) {
+            logger.info({ goalId: g.id, crons: g.linkedCronJobs }, 'Goal has failing linked crons — needs attention');
+          }
+        }
+      } catch (err) {
+        logger.debug({ err }, 'Goal-driven task generation failed (non-fatal)');
+      }
     } catch (err) {
       logger.warn({ err }, 'Failed to nudge stale goals');
     }
@@ -1235,6 +1324,45 @@ export class CronScheduler {
       }
     }
 
+    // ── Adaptive execution: consult advisor before running ──
+    const { getExecutionAdvice } = await import('../agent/execution-advisor.js');
+    const advice = getExecutionAdvice(job.name, job);
+
+    if (advice.shouldSkip) {
+      logger.info({ job: job.name, reason: advice.skipReason }, 'Execution advisor: circuit breaker — skipping job');
+      this.runLog.append({
+        jobName: job.name,
+        startedAt: new Date().toISOString(),
+        finishedAt: new Date().toISOString(),
+        status: 'skipped',
+        durationMs: 0,
+        attempt: 0,
+        outputPreview: `Circuit breaker: ${advice.skipReason}`,
+      });
+      return;
+    }
+
+    // Apply advisor overrides to a mutable copy
+    if (advice.adjustedMaxTurns || advice.adjustedModel || advice.adjustedTimeoutMs || advice.promptEnrichment || advice.shouldEscalate) {
+      job = { ...job };
+      if (advice.adjustedMaxTurns) job.maxTurns = advice.adjustedMaxTurns;
+      if (advice.adjustedModel) job.model = advice.adjustedModel;
+      if (advice.shouldEscalate && job.mode !== 'unleashed') {
+        job.mode = 'unleashed';
+        logger.info({ job: job.name, reason: advice.escalationReason }, 'Execution advisor: escalating to unleashed mode');
+      }
+      if (advice.promptEnrichment) {
+        job.prompt = `## Lessons from Previous Runs\n${advice.promptEnrichment}\n\n${job.prompt}`;
+      }
+      logger.info({
+        job: job.name,
+        maxTurns: advice.adjustedMaxTurns,
+        model: advice.adjustedModel,
+        escalate: advice.shouldEscalate,
+        enriched: !!advice.promptEnrichment,
+      }, 'Execution advisor applied overrides');
+    }
+
     this.runningJobs.add(job.name);
     this.emitStatusChange();
 
@@ -1393,6 +1521,23 @@ export class CronScheduler {
       // Fire-and-forget: check if this agent's profile needs self-learning update
       if (job.agentSlug) {
         this.checkAgentLearning(job.agentSlug, job.name).catch(() => {});
+      }
+
+      // Write targeted self-improvement trigger when consecutive errors are high
+      const consErrors = this.runLog.consecutiveErrors(job.name);
+      if (consErrors >= 3) {
+        try {
+          const triggerDir = path.join(BASE_DIR, 'self-improve', 'triggers');
+          mkdirSync(triggerDir, { recursive: true });
+          const triggerPath = path.join(triggerDir, `${job.name.replace(/[^a-zA-Z0-9_-]/g, '_')}.json`);
+          writeFileSync(triggerPath, JSON.stringify({
+            jobName: job.name,
+            consecutiveErrors: consErrors,
+            recentErrors: this.runLog.readRecent(job.name, 3).map(e => e.error?.slice(0, 200)),
+            triggeredAt: new Date().toISOString(),
+          }, null, 2));
+          logger.info({ job: job.name, consErrors }, 'Wrote self-improvement trigger for failing job');
+        } catch { /* non-fatal */ }
       }
     }
   }
