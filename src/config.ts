@@ -320,6 +320,10 @@ export const VAULT_MIGRATIONS_STATE = path.join(BASE_DIR, '.vault-migrations.jso
 
 export const PLANS_DIR = path.join(BASE_DIR, 'plans');
 
+// ── Advisor Decision Log ────────────────────────────────────────────
+
+export const ADVISOR_LOG_PATH = path.join(BASE_DIR, 'cron', 'advisor-decisions.jsonl');
+
 // ── Source Self-Edit Staging ─────────────────────────────────────────
 
 export const STAGING_DIR = path.join(BASE_DIR, 'staging');

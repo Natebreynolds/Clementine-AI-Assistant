@@ -10,7 +10,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import pino from 'pino';
 
-import { CRON_REFLECTIONS_DIR } from '../config.js';
+import { CRON_REFLECTIONS_DIR, ADVISOR_LOG_PATH } from '../config.js';
 import { CronRunLog } from '../gateway/heartbeat.js';
 import { evolvePrompt } from './prompt-evolver.js';
 import type { CronJobDefinition, ExecutionAdvice } from '../types.js';
@@ -26,6 +26,7 @@ const TIER_MAX_TURNS: Record<number, number> = {
 
 const DEFAULT_TIMEOUT_MS = 600_000;       // 10 minutes
 const MAX_TIMEOUT_MS = 20 * 60 * 1000;    // 20 minutes
+const CIRCUIT_BREAKER_COOLDOWN_MS = 60 * 60 * 1000; // 1 hour between retry probes
 
 // ── Reflection entry shape (from JSONL) ─────────────────────────────
 
@@ -61,21 +62,55 @@ export function getExecutionAdvice(jobName: string, job: CronJobDefinition): Exe
     const consecutiveErrors = runLog.consecutiveErrors(jobName);
 
     // ── Rule 1: Circuit breaker — 5+ consecutive errors ──────────
+    // Allow a recovery probe once per hour so the breaker can self-heal.
     if (consecutiveErrors >= 5) {
-      advice.shouldSkip = true;
-      advice.skipReason = `${consecutiveErrors} consecutive errors — circuit breaker engaged`;
-      logger.debug({ job: jobName, consecutiveErrors }, 'Circuit breaker triggered');
-      return advice;
+      const lastRun = recentRuns[0];
+      // If no runs exist (shouldn't happen with 5+ errors, but be safe), skip immediately
+      if (!lastRun) {
+        advice.shouldSkip = true;
+        advice.skipReason = `${consecutiveErrors} consecutive errors — circuit breaker engaged`;
+        return advice;
+      }
+      const lastRunTime = new Date(lastRun.finishedAt).getTime();
+      const elapsed = Date.now() - lastRunTime;
+
+      if (elapsed < CIRCUIT_BREAKER_COOLDOWN_MS) {
+        advice.shouldSkip = true;
+        advice.skipReason = `${consecutiveErrors} consecutive errors — circuit breaker engaged (next probe in ${Math.ceil((CIRCUIT_BREAKER_COOLDOWN_MS - elapsed) / 60_000)}m)`;
+        logger.debug({ job: jobName, consecutiveErrors, nextProbeMin: Math.ceil((CIRCUIT_BREAKER_COOLDOWN_MS - elapsed) / 60_000) }, 'Circuit breaker — cooling down');
+        return advice;
+      }
+
+      // Cooldown elapsed — allow a recovery probe
+      logger.info({ job: jobName, consecutiveErrors }, 'Circuit breaker — allowing recovery probe after cooldown');
     }
+
+    // ── Learn from past outcomes ────────────────────────────────
+    const outcomeStats = getInterventionStats(jobName);
 
     // ── Rule 2: Turn-limit hits → increase maxTurns ──────────────
     checkTurnLimitHits(recentRuns, job, advice);
+    // Suppress if turn adjustments have proven ineffective
+    if (advice.adjustedMaxTurns && outcomeStats.turnAdjustSuccessRate !== null && outcomeStats.turnAdjustSuccessRate < 0.2) {
+      logger.info({ job: jobName, rate: outcomeStats.turnAdjustSuccessRate }, 'Suppressing turn adjustment — historically ineffective');
+      advice.adjustedMaxTurns = null;
+    }
 
     // ── Rule 3: Low reflection quality → prompt enrichment ───────
     checkReflectionQuality(reflections, job, advice);
+    // Suppress if enrichment has proven ineffective
+    if (advice.promptEnrichment && outcomeStats.enrichmentSuccessRate !== null && outcomeStats.enrichmentSuccessRate < 0.2) {
+      logger.info({ job: jobName, rate: outcomeStats.enrichmentSuccessRate }, 'Suppressing prompt enrichment — historically ineffective');
+      advice.promptEnrichment = '';
+    }
 
     // ── Rule 4: Repeated failures on haiku → upgrade to sonnet ───
     checkModelUpgrade(recentRuns, job, advice);
+    // Suppress if model upgrades have proven ineffective
+    if (advice.adjustedModel && outcomeStats.modelUpgradeSuccessRate !== null && outcomeStats.modelUpgradeSuccessRate < 0.2) {
+      logger.info({ job: jobName, rate: outcomeStats.modelUpgradeSuccessRate }, 'Suppressing model upgrade — historically ineffective');
+      advice.adjustedModel = null;
+    }
 
     // ── Rule 5: Timeout hits → increase timeout ─────────────────
     checkTimeoutHits(recentRuns, job, advice);
@@ -194,6 +229,64 @@ function checkEscalation(
       : `${lowQualityReflections.length} low-quality reflections despite sonnet-tier model`;
     logger.debug({ job: job.name, reason: advice.escalationReason }, 'Recommending escalation to unleashed');
   }
+}
+
+// ── Outcome learning ─────────────────────────────────────────────────
+
+interface InterventionStats {
+  modelUpgradeSuccessRate: number | null;
+  turnAdjustSuccessRate: number | null;
+  enrichmentSuccessRate: number | null;
+  sampleSize: number;
+}
+
+/**
+ * Read past advisor outcomes to learn which interventions actually work
+ * for a given job. Returns null rates when insufficient data exists.
+ */
+function getInterventionStats(jobName: string): InterventionStats {
+  const stats: InterventionStats = {
+    modelUpgradeSuccessRate: null,
+    turnAdjustSuccessRate: null,
+    enrichmentSuccessRate: null,
+    sampleSize: 0,
+  };
+
+  if (!existsSync(ADVISOR_LOG_PATH)) return stats;
+
+  try {
+    const lines = readFileSync(ADVISOR_LOG_PATH, 'utf-8').trim().split('\n').filter(Boolean);
+    // Only scan recent entries to avoid expensive parsing on large logs
+    const outcomes = lines.slice(-200)
+      .map(l => { try { return JSON.parse(l); } catch { return null; } })
+      .filter((d): d is any => d !== null && d.type === 'outcome' && d.jobName === jobName);
+
+    if (outcomes.length < 3) return stats;
+    stats.sampleSize = outcomes.length;
+
+    // Model upgrade effectiveness
+    const modelOuts = outcomes.filter(o => o.interventions?.adjustedModel);
+    if (modelOuts.length >= 2) {
+      const successes = modelOuts.filter(o => o.outcome === 'ok').length;
+      stats.modelUpgradeSuccessRate = successes / modelOuts.length;
+    }
+
+    // Turn adjustment effectiveness
+    const turnOuts = outcomes.filter(o => o.interventions?.adjustedMaxTurns);
+    if (turnOuts.length >= 2) {
+      const successes = turnOuts.filter(o => o.outcome === 'ok').length;
+      stats.turnAdjustSuccessRate = successes / turnOuts.length;
+    }
+
+    // Enrichment effectiveness
+    const enrichOuts = outcomes.filter(o => o.interventions?.enriched);
+    if (enrichOuts.length >= 2) {
+      const successes = enrichOuts.filter(o => o.outcome === 'ok').length;
+      stats.enrichmentSuccessRate = successes / enrichOuts.length;
+    }
+  } catch { /* ignore */ }
+
+  return stats;
 }
 
 // ── Reflection file reader ──────────────────────────────────────────

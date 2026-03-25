@@ -2692,6 +2692,370 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
     }
   });
 
+  // ── Daily Plans API ─────────────────────────────────────────────
+
+  const PLANS_DIR = path.join(BASE_DIR, 'plans', 'daily');
+
+  app.get('/api/plans/today', (_req, res) => {
+    const today = new Date();
+    const dateStr = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}`;
+    const planPath = path.join(PLANS_DIR, `${dateStr}.json`);
+    if (!existsSync(planPath)) {
+      res.json({ ok: false, plan: null });
+      return;
+    }
+    try {
+      res.json({ ok: true, plan: JSON.parse(readFileSync(planPath, 'utf-8')) });
+    } catch { res.json({ ok: false, plan: null }); }
+  });
+
+  app.get('/api/plans/:date', (req, res) => {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(req.params.date)) {
+      res.json({ ok: false, plan: null, error: 'Invalid date format' });
+      return;
+    }
+    const planPath = path.join(PLANS_DIR, `${req.params.date}.json`);
+    if (!existsSync(planPath)) {
+      res.json({ ok: false, plan: null });
+      return;
+    }
+    try {
+      res.json({ ok: true, plan: JSON.parse(readFileSync(planPath, 'utf-8')) });
+    } catch { res.json({ ok: false, plan: null }); }
+  });
+
+  app.get('/api/plans', (_req, res) => {
+    if (!existsSync(PLANS_DIR)) { res.json({ plans: [] }); return; }
+    try {
+      const files = readdirSync(PLANS_DIR).filter(f => f.endsWith('.json')).sort().reverse();
+      const plans = files.slice(0, 30).map(f => {
+        try {
+          const plan = JSON.parse(readFileSync(path.join(PLANS_DIR, f), 'utf-8'));
+          return { date: plan.date, summary: plan.summary, priorityCount: plan.priorities?.length ?? 0, createdAt: plan.createdAt };
+        } catch { return null; }
+      }).filter(Boolean);
+      res.json({ plans });
+    } catch { res.json({ plans: [] }); }
+  });
+
+  app.post('/api/plans/apply', (req, res) => {
+    const { job, change, reason } = req.body;
+    if (!job || !change) {
+      res.json({ ok: false, error: 'job and change required' });
+      return;
+    }
+    const validChanges = ['disable', 'adjust-schedule', 'adjust-prompt'];
+    if (!validChanges.includes(change)) {
+      res.json({ ok: false, error: `Invalid change type. Must be: ${validChanges.join(', ')}` });
+      return;
+    }
+    try {
+      const cronFile = path.join(VAULT_DIR, '00-System', 'CRON.md');
+      if (!existsSync(cronFile)) {
+        res.json({ ok: false, error: 'CRON.md not found' });
+        return;
+      }
+      const raw = readFileSync(cronFile, 'utf-8');
+      const parsed = matter(raw);
+      const jobs = parsed.data.jobs || [];
+      const idx = jobs.findIndex((j: any) => j.name === job);
+      if (idx === -1) {
+        res.json({ ok: false, error: `Job "${job}" not found in CRON.md` });
+        return;
+      }
+      if (change === 'disable') {
+        jobs[idx].enabled = false;
+      } else if (change === 'adjust-schedule' && req.body.newSchedule) {
+        jobs[idx].schedule = req.body.newSchedule;
+      } else if (change === 'adjust-prompt' && req.body.newPrompt) {
+        jobs[idx].prompt = req.body.newPrompt;
+      }
+      parsed.data.jobs = jobs;
+      writeFileSync(cronFile, matter.stringify(parsed.content, parsed.data));
+      res.json({ ok: true, applied: { job, change, reason } });
+    } catch (err) {
+      res.json({ ok: false, error: String(err) });
+    }
+  });
+
+  // ── Advisor Decision Analytics API ─────────────────────────────
+
+  const ADVISOR_LOG = path.join(BASE_DIR, 'cron', 'advisor-decisions.jsonl');
+
+  app.get('/api/advisor/decisions', (req, res) => {
+    const limit = parseInt(String(req.query.limit ?? '100'), 10);
+    if (!existsSync(ADVISOR_LOG)) { res.json({ decisions: [] }); return; }
+    try {
+      const lines = readFileSync(ADVISOR_LOG, 'utf-8').trim().split('\n').filter(Boolean);
+      const decisions = lines.slice(-limit).map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean).reverse();
+      res.json({ decisions });
+    } catch { res.json({ decisions: [] }); }
+  });
+
+  app.get('/api/advisor/analytics', (_req, res) => {
+    // Build analytics from run logs + advisor decisions
+    const runsDir = path.join(BASE_DIR, 'cron', 'runs');
+    const analytics: {
+      totalInterventions: number;
+      circuitBreakers: number;
+      modelUpgrades: number;
+      turnAdjustments: number;
+      timeoutAdjustments: number;
+      escalations: number;
+      enrichments: number;
+      successAfterIntervention: number;
+      failureAfterIntervention: number;
+      byJob: Record<string, { interventions: number; successRate: number; totalRuns: number }>;
+      recentDecisions: any[];
+    } = {
+      totalInterventions: 0,
+      circuitBreakers: 0,
+      modelUpgrades: 0,
+      turnAdjustments: 0,
+      timeoutAdjustments: 0,
+      escalations: 0,
+      enrichments: 0,
+      successAfterIntervention: 0,
+      failureAfterIntervention: 0,
+      byJob: {},
+      recentDecisions: [],
+    };
+
+    // Read advisor decisions log
+    if (existsSync(ADVISOR_LOG)) {
+      try {
+        const lines = readFileSync(ADVISOR_LOG, 'utf-8').trim().split('\n').filter(Boolean);
+        const decisions = lines.map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+        analytics.recentDecisions = decisions.slice(-20).reverse();
+
+        for (const d of decisions) {
+          analytics.totalInterventions++;
+          if (d.advice?.adjustedModel) analytics.modelUpgrades++;
+          if (d.advice?.adjustedMaxTurns) analytics.turnAdjustments++;
+          if (d.advice?.adjustedTimeoutMs) analytics.timeoutAdjustments++;
+          if (d.advice?.shouldEscalate) analytics.escalations++;
+          if (d.advice?.promptEnrichment) analytics.enrichments++;
+        }
+      } catch { /* ignore */ }
+    }
+
+    // Scan run logs for circuit breakers, success/failure after intervention
+    if (existsSync(runsDir)) {
+      try {
+        for (const f of readdirSync(runsDir).filter(f => f.endsWith('.jsonl'))) {
+          const jobName = f.replace('.jsonl', '');
+          const lines = readFileSync(path.join(runsDir, f), 'utf-8').trim().split('\n').filter(Boolean);
+          let totalRuns = 0;
+          let okRuns = 0;
+          let interventionOk = 0;
+          let interventionFail = 0;
+
+          for (const line of lines.slice(-50)) {
+            try {
+              const entry = JSON.parse(line);
+              totalRuns++;
+              if (entry.status === 'ok') okRuns++;
+              if (entry.status === 'skipped') analytics.circuitBreakers++;
+              if (entry.advisorApplied) {
+                if (entry.status === 'ok') interventionOk++;
+                else interventionFail++;
+              }
+            } catch { continue; }
+          }
+
+          analytics.successAfterIntervention += interventionOk;
+          analytics.failureAfterIntervention += interventionFail;
+
+          if (totalRuns > 0) {
+            analytics.byJob[jobName] = {
+              interventions: interventionOk + interventionFail,
+              successRate: totalRuns > 0 ? Math.round((okRuns / totalRuns) * 100) : 0,
+              totalRuns,
+            };
+          }
+        }
+      } catch { /* ignore */ }
+    }
+
+    res.json(analytics);
+  });
+
+  // ── Goals Progress API ─────────────────────────────────────────
+
+  const GOALS_DIR = path.join(BASE_DIR, 'goals');
+  const CRON_RUNS_DIR = path.join(BASE_DIR, 'cron', 'runs');
+
+  app.get('/api/goals/progress', (_req, res) => {
+    if (!existsSync(GOALS_DIR)) { res.json({ goals: [] }); return; }
+    try {
+      const files = readdirSync(GOALS_DIR).filter(f => f.endsWith('.json'));
+      const goals = files.map(f => {
+        try {
+          const goal = JSON.parse(readFileSync(path.join(GOALS_DIR, f), 'utf-8'));
+
+          // Find agent contributions: scan cron runs for jobs linked to this goal
+          const agentContributions: Record<string, { runs: number; successes: number; lastRun?: string }> = {};
+          if (goal.linkedCronJobs?.length && existsSync(CRON_RUNS_DIR)) {
+            for (const jobName of goal.linkedCronJobs) {
+              const safe = jobName.replace(/[^a-zA-Z0-9_-]/g, '_');
+              const logFile = path.join(CRON_RUNS_DIR, `${safe}.jsonl`);
+              if (!existsSync(logFile)) continue;
+              const lines = readFileSync(logFile, 'utf-8').trim().split('\n').filter(Boolean);
+              for (const line of lines.slice(-20)) {
+                try {
+                  const entry = JSON.parse(line);
+                  const agent = entry.agentSlug || jobName;
+                  if (!agentContributions[agent]) agentContributions[agent] = { runs: 0, successes: 0 };
+                  agentContributions[agent].runs++;
+                  if (entry.status === 'ok') agentContributions[agent].successes++;
+                  agentContributions[agent].lastRun = entry.finishedAt;
+                } catch { continue; }
+              }
+            }
+          }
+
+          // Scan delegated tasks for this goal
+          const delegationsDir = path.join(VAULT_DIR, '00-System', 'agents');
+          const delegations: Array<{ agent: string; task: string; status: string }> = [];
+          if (existsSync(delegationsDir)) {
+            try {
+              for (const agentDir of readdirSync(delegationsDir)) {
+                const tasksDir = path.join(delegationsDir, agentDir, 'delegations');
+                if (!existsSync(tasksDir)) continue;
+                for (const tf of readdirSync(tasksDir).filter(tf => tf.endsWith('.json'))) {
+                  try {
+                    const task = JSON.parse(readFileSync(path.join(tasksDir, tf), 'utf-8'));
+                    if (task.goalId === goal.id) {
+                      delegations.push({ agent: task.toAgent || agentDir, task: task.task || tf, status: task.status || 'pending' });
+                    }
+                  } catch { continue; }
+                }
+              }
+            } catch { /* ignore */ }
+          }
+
+          return {
+            ...goal,
+            agentContributions,
+            delegations,
+          };
+        } catch { return null; }
+      }).filter(Boolean);
+
+      res.json({ goals });
+    } catch { res.json({ goals: [] }); }
+  });
+
+  // ── Reflection Quality Trends API ──────────────────────────────
+
+  const CRON_REFLECTIONS_DIR = path.join(BASE_DIR, 'cron', 'reflections');
+
+  app.get('/api/advisor/reflection-trends', (_req, res) => {
+    if (!existsSync(CRON_REFLECTIONS_DIR)) { res.json({ trends: {} }); return; }
+    try {
+      const trends: Record<string, Array<{ date: string; quality: number }>> = {};
+      for (const f of readdirSync(CRON_REFLECTIONS_DIR).filter(f => f.endsWith('.jsonl'))) {
+        const jobName = f.replace('.jsonl', '');
+        const lines = readFileSync(path.join(CRON_REFLECTIONS_DIR, f), 'utf-8').trim().split('\n').filter(Boolean);
+        trends[jobName] = lines.slice(-20).map(l => {
+          try {
+            const entry = JSON.parse(l);
+            return { date: entry.timestamp?.slice(0, 10) ?? '', quality: entry.quality ?? 0 };
+          } catch { return null; }
+        }).filter((e): e is { date: string; quality: number } => e !== null);
+      }
+      res.json({ trends });
+    } catch { res.json({ trends: {} }); }
+  });
+
+  // ── Plan Diff API ─────────────────────────────────────────────
+
+  app.get('/api/plans/diff', (req, res) => {
+    const date1 = req.query.from as string;
+    const date2 = req.query.to as string;
+    const dateRe = /^\d{4}-\d{2}-\d{2}$/;
+    if (!date1 || !date2 || !dateRe.test(date1) || !dateRe.test(date2)) {
+      res.json({ ok: false, error: 'Valid YYYY-MM-DD from and to params required' });
+      return;
+    }
+    try {
+      const path1 = path.join(PLANS_DIR, `${date1}.json`);
+      const path2 = path.join(PLANS_DIR, `${date2}.json`);
+      const plan1 = existsSync(path1) ? JSON.parse(readFileSync(path1, 'utf-8')) : null;
+      const plan2 = existsSync(path2) ? JSON.parse(readFileSync(path2, 'utf-8')) : null;
+
+      if (!plan1 || !plan2) {
+        res.json({ ok: false, error: 'One or both plans not found' });
+        return;
+      }
+
+      // Compute diff: what was added, removed, carried over
+      const actions1 = new Set((plan1.priorities || []).map((p: any) => p.action));
+      const actions2 = new Set((plan2.priorities || []).map((p: any) => p.action));
+
+      const carried = (plan2.priorities || []).filter((p: any) => actions1.has(p.action));
+      const added = (plan2.priorities || []).filter((p: any) => !actions1.has(p.action));
+      const resolved = (plan1.priorities || []).filter((p: any) => !actions2.has(p.action));
+
+      res.json({
+        ok: true,
+        from: { date: plan1.date, summary: plan1.summary, count: plan1.priorities?.length ?? 0 },
+        to: { date: plan2.date, summary: plan2.summary, count: plan2.priorities?.length ?? 0 },
+        carried,
+        added,
+        resolved,
+      });
+    } catch (err) { res.json({ ok: false, error: String(err) }); }
+  });
+
+  // ── Advisor Events API (circuit breakers, escalations, recoveries) ──
+
+  app.get('/api/advisor/events', (req, res) => {
+    const limit = parseInt(String(req.query.limit ?? '50'), 10);
+    const eventsPath = path.join(BASE_DIR, 'cron', 'advisor-events.jsonl');
+    if (!existsSync(eventsPath)) { res.json({ events: [] }); return; }
+    try {
+      const lines = readFileSync(eventsPath, 'utf-8').trim().split('\n').filter(Boolean);
+      const events = lines.slice(-limit).map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean).reverse();
+      res.json({ events });
+    } catch { res.json({ events: [] }); }
+  });
+
+  // ── Advisor Outcome Effectiveness API ─────────────────────────
+
+  app.get('/api/advisor/effectiveness', (_req, res) => {
+    if (!existsSync(ADVISOR_LOG)) { res.json({ byType: {} }); return; }
+    try {
+      const lines = readFileSync(ADVISOR_LOG, 'utf-8').trim().split('\n').filter(Boolean);
+      const outcomes = lines
+        .map(l => { try { return JSON.parse(l); } catch { return null; } })
+        .filter((d): d is any => d !== null && d.type === 'outcome');
+
+      const byType: Record<string, { total: number; success: number; rate: number }> = {};
+
+      const track = (key: string, success: boolean) => {
+        if (!byType[key]) byType[key] = { total: 0, success: 0, rate: 0 };
+        byType[key].total++;
+        if (success) byType[key].success++;
+      };
+
+      for (const o of outcomes) {
+        const ok = o.outcome === 'ok';
+        if (o.interventions?.adjustedModel) track('model-upgrade', ok);
+        if (o.interventions?.adjustedMaxTurns) track('turn-adjustment', ok);
+        if (o.interventions?.adjustedTimeoutMs) track('timeout-adjustment', ok);
+        if (o.interventions?.enriched) track('prompt-enrichment', ok);
+        if (o.interventions?.escalated) track('escalation', ok);
+      }
+
+      for (const v of Object.values(byType)) {
+        v.rate = v.total > 0 ? Math.round((v.success / v.total) * 100) : 0;
+      }
+
+      res.json({ byType, totalOutcomes: outcomes.length });
+    } catch { res.json({ byType: {}, totalOutcomes: 0 }); }
+  });
+
   // ── Start server (auto-increment port if taken) ──────────────────
 
   const maxAttempts = 10;
@@ -4534,6 +4898,9 @@ function getDashboardHTML(token: string): string {
       <div class="nav-item" data-page="metrics">
         <span class="nav-icon">&#128200;</span> Metrics
       </div>
+      <div class="nav-item" data-page="daily-plan">
+        <span class="nav-icon">&#128197;</span> Daily Plan
+      </div>
     </div>
     <div class="nav-section">
       <div class="nav-section-title">Interact</div>
@@ -4553,6 +4920,9 @@ function getDashboardHTML(token: string): string {
         <span class="nav-icon">&#128193;</span> Projects
         <span class="nav-badge" id="nav-project-count">0</span>
       </div>
+      <div class="nav-item" data-page="goals">
+        <span class="nav-icon">&#127919;</span> Goals
+      </div>
     </div>
     <div class="nav-section">
       <div class="nav-section-title">Automation</div>
@@ -4567,6 +4937,9 @@ function getDashboardHTML(token: string): string {
       <div class="nav-item" data-page="self-improve">
         <span class="nav-icon">&#128300;</span> Self-Improve
         <span class="nav-badge" id="nav-si-pending">0</span>
+      </div>
+      <div class="nav-item" data-page="advisor">
+        <span class="nav-icon">&#9889;</span> Exec Analytics
       </div>
     </div>
     <div class="nav-section">
@@ -4749,6 +5122,35 @@ function getDashboardHTML(token: string): string {
     <div class="page" id="page-metrics">
       <div class="page-title">Metrics & Analytics</div>
       <div id="metrics-content"><div class="empty-state">Loading metrics...</div></div>
+    </div>
+
+    <!-- ═══ Daily Plan Page ═══ -->
+    <div class="page" id="page-daily-plan">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:20px">
+        <div class="page-title" style="margin-bottom:0">Daily Plan</div>
+        <div style="display:flex;gap:8px;align-items:center">
+          <input type="date" id="plan-date-picker" style="padding:6px 10px;background:var(--bg-input);border:1px solid var(--border);border-radius:6px;color:var(--text-primary)">
+          <button class="btn btn-sm" onclick="loadPlanForDate(document.getElementById('plan-date-picker').value)">Load</button>
+        </div>
+      </div>
+      <div id="daily-plan-content"><div class="empty-state">Loading plan...</div></div>
+      <div id="plan-diff-content" style="margin-top:16px"></div>
+      <details style="margin-top:16px">
+        <summary style="cursor:pointer;font-weight:600;color:var(--text-secondary);font-size:13px;padding:8px 0;user-select:none">Plan History</summary>
+        <div id="plan-history-list" style="margin-top:8px"><div class="empty-state">Loading...</div></div>
+      </details>
+    </div>
+
+    <!-- ═══ Execution Analytics Page ═══ -->
+    <div class="page" id="page-advisor">
+      <div class="page-title">Execution Analytics</div>
+      <div id="advisor-analytics-content"><div class="empty-state">Loading analytics...</div></div>
+    </div>
+
+    <!-- ═══ Goals Progress Page ═══ -->
+    <div class="page" id="page-goals">
+      <div class="page-title">Goal Progress</div>
+      <div id="goals-progress-content"><div class="empty-state">Loading goals...</div></div>
     </div>
 
     <!-- ═══ Team Page — The Office ═══ -->
@@ -5274,6 +5676,9 @@ document.querySelectorAll('.nav-item').forEach(item => {
     if (page === 'self-improve') refreshSelfImprove();
     if (page === 'team') refreshTeam();
     if (page === 'graph') refreshGraph();
+    if (page === 'daily-plan') refreshDailyPlan();
+    if (page === 'advisor') refreshAdvisorAnalytics();
+    if (page === 'goals') refreshGoalsProgress();
   });
 });
 
@@ -7095,6 +7500,9 @@ function refreshAll() {
   if (currentPage === 'metrics') refreshMetrics();
   if (currentPage === 'self-improve') refreshSelfImprove();
   if (currentPage === 'team') refreshTeam();
+  if (currentPage === 'daily-plan') refreshDailyPlan();
+  if (currentPage === 'advisor') refreshAdvisorAnalytics();
+  if (currentPage === 'goals') refreshGoalsProgress();
   checkVersion();
 }
 
@@ -7840,6 +8248,435 @@ function showGraphDetail(node, data) {
 
 document.getElementById('graph-filter-label').addEventListener('change', function() { refreshGraph(); });
 document.getElementById('graph-search').addEventListener('input', function() { clearTimeout(this._t); this._t = setTimeout(refreshGraph, 300); });
+
+// ── Daily Plan ────────────────────────────
+async function refreshDailyPlan() {
+  try {
+    const r = await apiFetch('/api/plans/today');
+    const d = await r.json();
+    const container = document.getElementById('daily-plan-content');
+    if (!d.ok || !d.plan) {
+      container.innerHTML = '<div class="empty-state">No plan generated for today yet. Plans are created on the first morning heartbeat tick.</div>';
+      return;
+    }
+    const plan = d.plan;
+    const urgencyColor = u => u >= 4 ? 'var(--red)' : u >= 3 ? 'var(--orange)' : u >= 2 ? 'var(--yellow)' : 'var(--text-muted)';
+    const urgencyLabel = u => u >= 5 ? 'CRITICAL' : u >= 4 ? 'HIGH' : u >= 3 ? 'MEDIUM' : u >= 2 ? 'LOW' : 'NICE';
+
+    let html = '<div class="card" style="margin-bottom:16px"><div class="card-header">Summary</div><div class="card-body">';
+    html += '<p style="color:var(--text-secondary);margin:0">' + esc(plan.summary) + '</p>';
+    html += '<div style="margin-top:8px;font-size:12px;color:var(--text-muted)">Generated: ' + new Date(plan.createdAt).toLocaleString() + '</div>';
+    html += '</div></div>';
+
+    if (plan.priorities?.length) {
+      html += '<div class="card" style="margin-bottom:16px"><div class="card-header">Priorities (' + plan.priorities.length + ')</div><div class="card-body">';
+      for (const p of plan.priorities) {
+        html += '<div style="display:flex;align-items:center;gap:10px;padding:8px 0;border-bottom:1px solid var(--border)">';
+        html += '<span style="background:' + urgencyColor(p.urgency) + ';color:#000;font-size:11px;font-weight:700;padding:2px 8px;border-radius:10px;min-width:60px;text-align:center">' + urgencyLabel(p.urgency) + '</span>';
+        html += '<span style="background:var(--bg-tertiary);color:var(--text-muted);font-size:11px;padding:2px 8px;border-radius:6px">' + esc(p.type) + '</span>';
+        html += '<span style="color:var(--text-primary);flex:1">' + esc(p.action) + '</span>';
+        html += '</div>';
+      }
+      html += '</div></div>';
+    }
+
+    if (plan.suggestedCronChanges?.length) {
+      html += '<div class="card" style="margin-bottom:16px"><div class="card-header">Suggested Cron Changes</div><div class="card-body">';
+      for (const c of plan.suggestedCronChanges) {
+        const changeColor = c.change === 'disable' ? 'var(--red)' : 'var(--orange)';
+        html += '<div style="display:flex;align-items:center;gap:10px;padding:8px 0;border-bottom:1px solid var(--border)">';
+        html += '<span style="font-weight:600;color:var(--text-primary);min-width:140px">' + esc(c.job) + '</span>';
+        html += '<span style="background:' + changeColor + ';color:#000;font-size:11px;font-weight:600;padding:2px 8px;border-radius:6px">' + esc(c.change) + '</span>';
+        html += '<span style="color:var(--text-secondary);flex:1;font-size:13px">' + esc(c.reason) + '</span>';
+        html += '<button class="btn btn-sm" onclick="applyPlanSuggestion(\'' + esc(c.job) + '\',\'' + esc(c.change) + '\',\'' + esc(c.reason) + '\')" style="background:var(--blue);color:#fff;font-size:11px">Apply</button>';
+        html += '</div>';
+      }
+      html += '</div></div>';
+    }
+
+    if (plan.newWork?.length) {
+      html += '<div class="card"><div class="card-header">New Work Suggestions</div><div class="card-body">';
+      for (const w of plan.newWork) {
+        html += '<div style="padding:8px 0;border-bottom:1px solid var(--border)">';
+        html += '<div style="color:var(--text-primary)">' + esc(w.description) + '</div>';
+        if (w.goalId) html += '<span style="font-size:12px;color:var(--text-muted)">Goal: ' + esc(w.goalId) + '</span> ';
+        if (w.suggestedSchedule) html += '<span style="font-size:12px;color:var(--text-muted)">Schedule: ' + esc(w.suggestedSchedule) + '</span>';
+        html += '</div>';
+      }
+      html += '</div></div>';
+    }
+
+    container.innerHTML = html;
+
+    // Set date picker to today
+    const now = new Date();
+    document.getElementById('plan-date-picker').value = now.getFullYear() + '-' + String(now.getMonth()+1).padStart(2,'0') + '-' + String(now.getDate()).padStart(2,'0');
+
+    // Load plan history
+    const hr = await apiFetch('/api/plans');
+    const hd = await hr.json();
+    const histEl = document.getElementById('plan-history-list');
+    if (hd.plans?.length) {
+      histEl.innerHTML = hd.plans.map(p =>
+        '<div style="display:flex;align-items:center;gap:12px;padding:6px 0;border-bottom:1px solid var(--border);cursor:pointer" onclick="loadPlanForDate(\'' + p.date + '\')">' +
+        '<span style="font-weight:600;color:var(--blue);min-width:100px">' + p.date + '</span>' +
+        '<span style="color:var(--text-muted);font-size:12px">' + p.priorityCount + ' priorities</span>' +
+        '<span style="color:var(--text-secondary);flex:1;font-size:13px">' + esc(p.summary || '').slice(0, 120) + '</span>' +
+        '</div>'
+      ).join('');
+    } else {
+      histEl.innerHTML = '<div class="empty-state">No plan history</div>';
+    }
+
+    // Load plan diff (today vs yesterday)
+    if (hd.plans?.length >= 2) {
+      try {
+        const today = hd.plans[0].date;
+        const yesterday = hd.plans[1].date;
+        const diffRes = await apiFetch('/api/plans/diff?from=' + yesterday + '&to=' + today);
+        const diffData = await diffRes.json();
+        const diffEl = document.getElementById('plan-diff-content');
+        if (diffData.ok) {
+          let dhtml = '<div class="card"><div class="card-header">Plan Changes: ' + yesterday + ' \\u2192 ' + today + '</div><div class="card-body">';
+          if (diffData.resolved?.length) {
+            dhtml += '<div style="margin-bottom:12px"><div style="font-size:12px;font-weight:600;color:var(--green);margin-bottom:4px">Resolved (' + diffData.resolved.length + ')</div>';
+            for (const p of diffData.resolved) {
+              dhtml += '<div style="padding:3px 0;color:var(--text-secondary);font-size:13px;text-decoration:line-through;opacity:0.7">\\u2714 ' + esc(p.action) + '</div>';
+            }
+            dhtml += '</div>';
+          }
+          if (diffData.carried?.length) {
+            dhtml += '<div style="margin-bottom:12px"><div style="font-size:12px;font-weight:600;color:var(--orange);margin-bottom:4px">Carried Over (' + diffData.carried.length + ')</div>';
+            for (const p of diffData.carried) {
+              dhtml += '<div style="padding:3px 0;color:var(--text-secondary);font-size:13px">\\u21BB ' + esc(p.action) + '</div>';
+            }
+            dhtml += '</div>';
+          }
+          if (diffData.added?.length) {
+            dhtml += '<div><div style="font-size:12px;font-weight:600;color:var(--blue);margin-bottom:4px">New Today (' + diffData.added.length + ')</div>';
+            for (const p of diffData.added) {
+              dhtml += '<div style="padding:3px 0;color:var(--text-secondary);font-size:13px">\\u2795 ' + esc(p.action) + '</div>';
+            }
+            dhtml += '</div>';
+          }
+          if (!diffData.resolved?.length && !diffData.carried?.length && !diffData.added?.length) {
+            dhtml += '<div style="color:var(--text-muted);font-size:13px">Plans are identical.</div>';
+          }
+          dhtml += '</div></div>';
+          diffEl.innerHTML = dhtml;
+        } else {
+          diffEl.innerHTML = '';
+        }
+      } catch { /* non-fatal */ }
+    }
+  } catch (err) {
+    document.getElementById('daily-plan-content').innerHTML = '<div class="empty-state">Failed to load plan: ' + esc(String(err)) + '</div>';
+  }
+}
+
+async function loadPlanForDate(date) {
+  if (!date) return;
+  try {
+    const r = await apiFetch('/api/plans/' + date);
+    const d = await r.json();
+    if (!d.ok || !d.plan) { toast('No plan found for ' + date, 'error'); return; }
+    // Re-render with loaded plan — swap today's API response
+    const container = document.getElementById('daily-plan-content');
+    // Re-use refreshDailyPlan rendering by temporarily overriding
+    const plan = d.plan;
+    const urgencyColor = u => u >= 4 ? 'var(--red)' : u >= 3 ? 'var(--orange)' : u >= 2 ? 'var(--yellow)' : 'var(--text-muted)';
+    const urgencyLabel = u => u >= 5 ? 'CRITICAL' : u >= 4 ? 'HIGH' : u >= 3 ? 'MEDIUM' : u >= 2 ? 'LOW' : 'NICE';
+    let html = '<div class="card" style="margin-bottom:16px"><div class="card-header">Plan for ' + plan.date + '</div><div class="card-body">';
+    html += '<p style="color:var(--text-secondary);margin:0">' + esc(plan.summary) + '</p></div></div>';
+    if (plan.priorities?.length) {
+      html += '<div class="card"><div class="card-header">Priorities</div><div class="card-body">';
+      for (const p of plan.priorities) {
+        html += '<div style="display:flex;align-items:center;gap:10px;padding:8px 0;border-bottom:1px solid var(--border)">';
+        html += '<span style="background:' + urgencyColor(p.urgency) + ';color:#000;font-size:11px;font-weight:700;padding:2px 8px;border-radius:10px;min-width:60px;text-align:center">' + urgencyLabel(p.urgency) + '</span>';
+        html += '<span style="background:var(--bg-tertiary);color:var(--text-muted);font-size:11px;padding:2px 8px;border-radius:6px">' + esc(p.type) + '</span>';
+        html += '<span style="color:var(--text-primary);flex:1">' + esc(p.action) + '</span>';
+        html += '</div>';
+      }
+      html += '</div></div>';
+    }
+    container.innerHTML = html;
+    document.getElementById('plan-date-picker').value = date;
+  } catch (err) { toast('Error loading plan: ' + err, 'error'); }
+}
+
+async function applyPlanSuggestion(job, change, reason) {
+  if (!confirm('Apply "' + change + '" to job "' + job + '"?\\n\\nReason: ' + reason)) return;
+  try {
+    const r = await apiFetch('/api/plans/apply', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ job, change, reason })
+    });
+    const d = await r.json();
+    if (d.ok) { toast('Applied: ' + change + ' to ' + job, 'success'); refreshDailyPlan(); }
+    else toast(d.error || 'Failed', 'error');
+  } catch (err) { toast('Error: ' + err, 'error'); }
+}
+
+// ── Execution Analytics ───────────────────
+async function refreshAdvisorAnalytics() {
+  try {
+    const r = await apiFetch('/api/advisor/analytics');
+    const data = await r.json();
+    const container = document.getElementById('advisor-analytics-content');
+
+    let html = '';
+
+    // Summary cards row
+    html += '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:20px">';
+    const stats = [
+      { label: 'Interventions', value: data.totalInterventions, color: 'var(--blue)' },
+      { label: 'Circuit Breakers', value: data.circuitBreakers, color: 'var(--red)' },
+      { label: 'Model Upgrades', value: data.modelUpgrades, color: 'var(--orange)' },
+      { label: 'Turn Adjustments', value: data.turnAdjustments, color: 'var(--yellow)' },
+      { label: 'Timeout Adjustments', value: data.timeoutAdjustments, color: 'var(--purple)' },
+      { label: 'Escalations', value: data.escalations, color: 'var(--red)' },
+      { label: 'Enrichments', value: data.enrichments, color: 'var(--green)' },
+    ];
+    for (const s of stats) {
+      html += '<div class="card" style="text-align:center;padding:16px">';
+      html += '<div style="font-size:28px;font-weight:700;color:' + s.color + '">' + s.value + '</div>';
+      html += '<div style="font-size:12px;color:var(--text-muted);margin-top:4px">' + s.label + '</div>';
+      html += '</div>';
+    }
+    html += '</div>';
+
+    // Intervention effectiveness
+    const totalInterv = data.successAfterIntervention + data.failureAfterIntervention;
+    if (totalInterv > 0) {
+      const successPct = Math.round((data.successAfterIntervention / totalInterv) * 100);
+      html += '<div class="card" style="margin-bottom:16px"><div class="card-header">Intervention Effectiveness</div><div class="card-body">';
+      html += '<div style="display:flex;align-items:center;gap:16px">';
+      html += '<div style="flex:1;background:var(--bg-tertiary);border-radius:8px;height:24px;overflow:hidden">';
+      html += '<div style="width:' + successPct + '%;height:100%;background:var(--green);transition:width 0.3s"></div></div>';
+      html += '<span style="font-weight:600;color:var(--green)">' + successPct + '% success</span>';
+      html += '<span style="color:var(--text-muted);font-size:12px">(' + data.successAfterIntervention + '/' + totalInterv + ' runs)</span>';
+      html += '</div></div></div>';
+    }
+
+    // Per-job breakdown
+    const jobEntries = Object.entries(data.byJob || {}).sort((a, b) => b[1].interventions - a[1].interventions);
+    if (jobEntries.length > 0) {
+      html += '<div class="card" style="margin-bottom:16px"><div class="card-header">Per-Job Health</div><div class="card-body">';
+      html += '<div style="display:grid;grid-template-columns:1fr 100px 100px 120px;gap:8px;font-size:12px;color:var(--text-muted);font-weight:600;padding-bottom:8px;border-bottom:1px solid var(--border)">';
+      html += '<span>Job</span><span>Runs</span><span>Success</span><span>Interventions</span></div>';
+      for (const [name, info] of jobEntries) {
+        const rateColor = info.successRate >= 80 ? 'var(--green)' : info.successRate >= 50 ? 'var(--orange)' : 'var(--red)';
+        html += '<div style="display:grid;grid-template-columns:1fr 100px 100px 120px;gap:8px;padding:6px 0;border-bottom:1px solid var(--border);align-items:center">';
+        html += '<span style="color:var(--text-primary);font-weight:500">' + esc(name) + '</span>';
+        html += '<span style="color:var(--text-muted)">' + info.totalRuns + '</span>';
+        html += '<span style="color:' + rateColor + ';font-weight:600">' + info.successRate + '%</span>';
+        html += '<span style="color:var(--text-muted)">' + info.interventions + '</span>';
+        html += '</div>';
+      }
+      html += '</div></div>';
+    }
+
+    // Recent decisions
+    if (data.recentDecisions?.length) {
+      html += '<div class="card"><div class="card-header">Recent Advisor Decisions</div><div class="card-body" style="max-height:400px;overflow-y:auto">';
+      for (const d of data.recentDecisions) {
+        const actions = [];
+        if (d.advice?.adjustedModel) actions.push('model: ' + d.originalModel + ' \\u2192 ' + d.advice.adjustedModel);
+        if (d.advice?.adjustedMaxTurns) actions.push('turns: ' + (d.originalMaxTurns || '?') + ' \\u2192 ' + d.advice.adjustedMaxTurns);
+        if (d.advice?.adjustedTimeoutMs) actions.push('timeout: ' + Math.round(d.advice.adjustedTimeoutMs / 1000) + 's');
+        if (d.advice?.shouldEscalate) actions.push('ESCALATED');
+        if (d.advice?.promptEnrichment) actions.push('enriched prompt');
+        html += '<div style="padding:8px 0;border-bottom:1px solid var(--border)">';
+        html += '<div style="display:flex;justify-content:space-between;align-items:center">';
+        html += '<span style="font-weight:600;color:var(--text-primary)">' + esc(d.jobName) + '</span>';
+        html += '<span style="font-size:12px;color:var(--text-muted)">' + new Date(d.timestamp).toLocaleString() + '</span>';
+        html += '</div>';
+        html += '<div style="font-size:13px;color:var(--text-secondary);margin-top:4px">' + actions.join(' | ') + '</div>';
+        html += '</div>';
+      }
+      html += '</div></div>';
+    }
+
+    // Intervention effectiveness by type
+    try {
+      const effRes = await apiFetch('/api/advisor/effectiveness');
+      const effData = await effRes.json();
+      const types = Object.entries(effData.byType || {});
+      if (types.length > 0) {
+        html += '<div class="card" style="margin-bottom:16px"><div class="card-header">Intervention Effectiveness by Type</div><div class="card-body">';
+        for (const [type, info] of types) {
+          const barColor = info.rate >= 60 ? 'var(--green)' : info.rate >= 30 ? 'var(--orange)' : 'var(--red)';
+          const label = type.replace(/-/g, ' ').replace(/\\b\\w/g, c => c.toUpperCase());
+          html += '<div style="display:flex;align-items:center;gap:12px;padding:6px 0">';
+          html += '<span style="min-width:160px;font-weight:500;color:var(--text-primary)">' + label + '</span>';
+          html += '<div style="flex:1;background:var(--bg-tertiary);border-radius:6px;height:18px;overflow:hidden;position:relative">';
+          html += '<div style="width:' + info.rate + '%;height:100%;background:' + barColor + ';transition:width 0.3s"></div>';
+          html += '<span style="position:absolute;top:0;left:8px;line-height:18px;font-size:11px;color:#fff;font-weight:600">' + info.rate + '%</span>';
+          html += '</div>';
+          html += '<span style="min-width:60px;font-size:12px;color:var(--text-muted);text-align:right">' + info.success + '/' + info.total + '</span>';
+          html += '</div>';
+        }
+        html += '</div></div>';
+      }
+    } catch { /* non-fatal */ }
+
+    // Reflection quality trends
+    try {
+      const trendRes = await apiFetch('/api/advisor/reflection-trends');
+      const trendData = await trendRes.json();
+      const jobs = Object.entries(trendData.trends || {}).filter(([, pts]) => pts.length > 0);
+      if (jobs.length > 0) {
+        html += '<div class="card" style="margin-bottom:16px"><div class="card-header">Reflection Quality Trends</div><div class="card-body">';
+        for (const [jobName, points] of jobs) {
+          const avg = points.reduce((s, p) => s + p.quality, 0) / points.length;
+          const avgColor = avg >= 3.5 ? 'var(--green)' : avg >= 2.5 ? 'var(--orange)' : 'var(--red)';
+          // Draw sparkline as inline SVG
+          const w = 200, h = 24, maxQ = 5;
+          const step = w / Math.max(points.length - 1, 1);
+          const svgPoints = points.map((p, i) => (i * step).toFixed(1) + ',' + (h - (p.quality / maxQ) * h).toFixed(1)).join(' ');
+          html += '<div style="display:flex;align-items:center;gap:12px;padding:4px 0">';
+          html += '<span style="min-width:160px;font-weight:500;color:var(--text-primary);font-size:13px">' + esc(jobName) + '</span>';
+          html += '<svg width="' + w + '" height="' + h + '" style="flex-shrink:0"><polyline points="' + svgPoints + '" fill="none" stroke="' + avgColor + '" stroke-width="2"/></svg>';
+          html += '<span style="font-size:12px;color:' + avgColor + ';font-weight:600;min-width:40px">avg ' + avg.toFixed(1) + '</span>';
+          html += '</div>';
+        }
+        html += '</div></div>';
+      }
+    } catch { /* non-fatal */ }
+
+    // Advisor events feed (circuit breakers, escalations, recoveries)
+    try {
+      const evtRes = await apiFetch('/api/advisor/events?limit=20');
+      const evtData = await evtRes.json();
+      if (evtData.events?.length > 0) {
+        html += '<div class="card" style="margin-bottom:16px"><div class="card-header">Advisor Events</div><div class="card-body" style="max-height:300px;overflow-y:auto">';
+        for (const evt of evtData.events) {
+          const icon = evt.type === 'circuit-breaker' ? '\\u26A1' : evt.type === 'circuit-recovery' ? '\\u2705' : evt.type === 'escalation' ? '\\u2B06' : '\\u2139';
+          const typeColor = evt.type === 'circuit-breaker' ? 'var(--red)' : evt.type === 'circuit-recovery' ? 'var(--green)' : evt.type === 'escalation' ? 'var(--orange)' : 'var(--blue)';
+          html += '<div style="display:flex;align-items:center;gap:10px;padding:6px 0;border-bottom:1px solid var(--border)">';
+          html += '<span style="font-size:16px">' + icon + '</span>';
+          html += '<span style="background:' + typeColor + ';color:#000;font-size:10px;font-weight:700;padding:2px 8px;border-radius:6px;min-width:100px;text-align:center">' + esc(evt.type) + '</span>';
+          html += '<span style="font-weight:500;color:var(--text-primary)">' + esc(evt.jobName) + '</span>';
+          html += '<span style="flex:1;color:var(--text-secondary);font-size:13px">' + esc(evt.detail) + '</span>';
+          html += '<span style="font-size:12px;color:var(--text-muted);white-space:nowrap">' + new Date(evt.timestamp).toLocaleString() + '</span>';
+          html += '</div>';
+        }
+        html += '</div></div>';
+      }
+    } catch { /* non-fatal */ }
+
+    if (!html) html = '<div class="empty-state">No advisor data yet. The execution advisor activates when cron jobs run.</div>';
+    container.innerHTML = html;
+  } catch (err) {
+    document.getElementById('advisor-analytics-content').innerHTML = '<div class="empty-state">Failed to load: ' + esc(String(err)) + '</div>';
+  }
+}
+
+// ── Goals Progress ────────────────────────
+async function refreshGoalsProgress() {
+  try {
+    const r = await apiFetch('/api/goals/progress');
+    const data = await r.json();
+    const container = document.getElementById('goals-progress-content');
+
+    if (!data.goals?.length) {
+      container.innerHTML = '<div class="empty-state">No goals found. Create goals using the goal_create tool.</div>';
+      return;
+    }
+
+    let html = '';
+    const priorityColor = p => p === 'high' ? 'var(--red)' : p === 'medium' ? 'var(--orange)' : 'var(--green)';
+    const statusIcon = s => s === 'active' ? '\\u25CF' : s === 'completed' ? '\\u2714' : '\\u25CB';
+
+    for (const goal of data.goals) {
+      html += '<div class="card" style="margin-bottom:16px">';
+      html += '<div class="card-header" style="display:flex;align-items:center;gap:10px">';
+      html += '<span style="color:' + (goal.status === 'active' ? 'var(--green)' : 'var(--text-muted)') + '">' + statusIcon(goal.status) + '</span>';
+      html += '<span style="flex:1">' + esc(goal.title) + '</span>';
+      html += '<span style="background:' + priorityColor(goal.priority) + ';color:#000;font-size:11px;font-weight:700;padding:2px 10px;border-radius:10px">' + esc(goal.priority) + '</span>';
+      if (goal.owner) html += '<span style="font-size:12px;color:var(--text-muted)">Owner: ' + esc(goal.owner) + '</span>';
+      html += '</div>';
+      html += '<div class="card-body">';
+
+      // Target date
+      if (goal.targetDate) {
+        const daysLeft = Math.floor((new Date(goal.targetDate).getTime() - Date.now()) / 86400000);
+        const dateColor = daysLeft < 0 ? 'var(--red)' : daysLeft <= 7 ? 'var(--orange)' : 'var(--text-muted)';
+        const dateLabel = daysLeft < 0 ? Math.abs(daysLeft) + 'd overdue' : daysLeft === 0 ? 'Due today' : daysLeft + 'd remaining';
+        html += '<div style="margin-bottom:12px;font-size:13px"><span style="color:var(--text-muted)">Target: </span><span style="color:' + dateColor + ';font-weight:600">' + goal.targetDate + ' (' + dateLabel + ')</span></div>';
+      }
+
+      // Next actions
+      if (goal.nextActions?.length) {
+        html += '<div style="margin-bottom:12px"><div style="font-size:12px;font-weight:600;color:var(--text-muted);margin-bottom:4px">Next Actions</div>';
+        for (const a of goal.nextActions) {
+          html += '<div style="padding:3px 0;color:var(--text-secondary);font-size:13px">\\u2022 ' + esc(a) + '</div>';
+        }
+        html += '</div>';
+      }
+
+      // Blockers
+      if (goal.blockers?.length) {
+        html += '<div style="margin-bottom:12px"><div style="font-size:12px;font-weight:600;color:var(--red);margin-bottom:4px">Blockers</div>';
+        for (const b of goal.blockers) {
+          html += '<div style="padding:3px 0;color:var(--text-secondary);font-size:13px">\\u26A0 ' + esc(b) + '</div>';
+        }
+        html += '</div>';
+      }
+
+      // Agent contributions
+      const agents = Object.entries(goal.agentContributions || {});
+      if (agents.length > 0) {
+        html += '<div style="margin-bottom:12px"><div style="font-size:12px;font-weight:600;color:var(--text-muted);margin-bottom:8px">Agent Contributions</div>';
+        html += '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:8px">';
+        for (const [agent, info] of agents) {
+          const pct = info.runs > 0 ? Math.round((info.successes / info.runs) * 100) : 0;
+          const barColor = pct >= 80 ? 'var(--green)' : pct >= 50 ? 'var(--orange)' : 'var(--red)';
+          html += '<div style="background:var(--bg-tertiary);border-radius:8px;padding:10px">';
+          html += '<div style="font-weight:600;font-size:13px;color:var(--text-primary);margin-bottom:4px">' + esc(agent) + '</div>';
+          html += '<div style="display:flex;align-items:center;gap:8px">';
+          html += '<div style="flex:1;background:var(--bg-secondary);border-radius:4px;height:8px;overflow:hidden"><div style="width:' + pct + '%;height:100%;background:' + barColor + '"></div></div>';
+          html += '<span style="font-size:12px;color:var(--text-muted)">' + pct + '% (' + info.runs + ' runs)</span>';
+          html += '</div>';
+          if (info.lastRun) html += '<div style="font-size:11px;color:var(--text-muted);margin-top:4px">Last: ' + new Date(info.lastRun).toLocaleString() + '</div>';
+          html += '</div>';
+        }
+        html += '</div></div>';
+      }
+
+      // Delegations
+      if (goal.delegations?.length) {
+        html += '<div><div style="font-size:12px;font-weight:600;color:var(--text-muted);margin-bottom:4px">Delegated Tasks</div>';
+        for (const d of goal.delegations) {
+          const statusColor = d.status === 'completed' ? 'var(--green)' : d.status === 'in-progress' ? 'var(--blue)' : 'var(--text-muted)';
+          html += '<div style="display:flex;align-items:center;gap:8px;padding:4px 0">';
+          html += '<span style="color:' + statusColor + ';font-size:11px;font-weight:600;padding:1px 6px;border:1px solid ' + statusColor + ';border-radius:4px">' + esc(d.status) + '</span>';
+          html += '<span style="color:var(--text-secondary);font-size:13px;flex:1">' + esc(d.task) + '</span>';
+          html += '<span style="font-size:12px;color:var(--text-muted)">\\u2192 ' + esc(d.agent) + '</span>';
+          html += '</div>';
+        }
+        html += '</div>';
+      }
+
+      // Progress notes
+      if (goal.progressNotes?.length) {
+        html += '<details style="margin-top:8px"><summary style="cursor:pointer;font-size:12px;color:var(--text-muted);font-weight:600">Progress Notes (' + goal.progressNotes.length + ')</summary>';
+        html += '<div style="margin-top:4px;max-height:200px;overflow-y:auto">';
+        for (const note of goal.progressNotes.slice(-10).reverse()) {
+          html += '<div style="padding:4px 0;font-size:13px;color:var(--text-secondary);border-bottom:1px solid var(--border)">\\u2022 ' + esc(note) + '</div>';
+        }
+        html += '</div></details>';
+      }
+
+      html += '</div></div>';
+    }
+
+    container.innerHTML = html;
+  } catch (err) {
+    document.getElementById('goals-progress-content').innerHTML = '<div class="empty-state">Failed to load: ' + esc(String(err)) + '</div>';
+  }
+}
 
 refreshAll();
 setInterval(refreshAll, 5000);

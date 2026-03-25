@@ -42,6 +42,7 @@ import {
   DISCORD_OWNER_ID,
   GOALS_DIR,
   CRON_REFLECTIONS_DIR,
+  ADVISOR_LOG_PATH,
 } from '../config.js';
 import type { CronJobDefinition, CronRunEntry, HeartbeatState, SelfImproveConfig, SelfImproveExperiment, SelfImproveState, WorkflowDefinition } from '../types.js';
 import type { NotificationDispatcher } from './notifications.js';
@@ -1325,6 +1326,7 @@ export class CronScheduler {
     }
 
     // ── Adaptive execution: consult advisor before running ──
+    const originalJob = job; // snapshot before mutation
     const { getExecutionAdvice } = await import('../agent/execution-advisor.js');
     const advice = getExecutionAdvice(job.name, job);
 
@@ -1343,6 +1345,7 @@ export class CronScheduler {
     }
 
     // Apply advisor overrides to a mutable copy
+    let advisorApplied: CronRunEntry['advisorApplied'] | undefined;
     if (advice.adjustedMaxTurns || advice.adjustedModel || advice.adjustedTimeoutMs || advice.promptEnrichment || advice.shouldEscalate) {
       job = { ...job };
       if (advice.adjustedMaxTurns) job.maxTurns = advice.adjustedMaxTurns;
@@ -1354,13 +1357,36 @@ export class CronScheduler {
       if (advice.promptEnrichment) {
         job.prompt = `## Lessons from Previous Runs\n${advice.promptEnrichment}\n\n${job.prompt}`;
       }
+      advisorApplied = {
+        adjustedMaxTurns: advice.adjustedMaxTurns ?? undefined,
+        adjustedModel: advice.adjustedModel ?? undefined,
+        adjustedTimeoutMs: advice.adjustedTimeoutMs ?? undefined,
+        enriched: !!advice.promptEnrichment,
+        escalated: advice.shouldEscalate,
+      };
       logger.info({
         job: job.name,
-        maxTurns: advice.adjustedMaxTurns,
-        model: advice.adjustedModel,
-        escalate: advice.shouldEscalate,
-        enriched: !!advice.promptEnrichment,
+        ...advisorApplied,
       }, 'Execution advisor applied overrides');
+    }
+
+    // Compute effective timeout: advisor override > standard default
+    const effectiveTimeoutMs = job.mode !== 'unleashed'
+      ? (advice.adjustedTimeoutMs ?? CRON_STANDARD_TIMEOUT_MS)
+      : undefined;
+
+    // Persist advisor decision for analytics
+    if (advisorApplied) {
+      try {
+        mkdirSync(path.dirname(ADVISOR_LOG_PATH), { recursive: true });
+        appendFileSync(ADVISOR_LOG_PATH, JSON.stringify({
+          jobName: job.name,
+          timestamp: new Date().toISOString(),
+          advice,
+          originalModel: originalJob.model,
+          originalMaxTurns: originalJob.maxTurns,
+        }) + '\n');
+      } catch { /* non-fatal */ }
     }
 
     this.runningJobs.add(job.name);
@@ -1384,7 +1410,7 @@ export class CronScheduler {
       for (let attempt = 1; attempt <= maxAttempts; attempt++) {
         const startedAt = new Date();
         try {
-          // Standard cron jobs get a 10-minute timeout via SDK AbortController
+          // Standard cron jobs get a timeout via SDK AbortController (advisor may override)
           let response = await this.gateway.handleCronJob(
             job.name,
             job.prompt,
@@ -1394,7 +1420,7 @@ export class CronScheduler {
             job.workDir,
             job.mode,
             job.maxHours,
-            job.mode !== 'unleashed' ? CRON_STANDARD_TIMEOUT_MS : undefined,
+            effectiveTimeoutMs,
             job.successCriteria,
           );
 
@@ -1411,7 +1437,7 @@ export class CronScheduler {
                 job.workDir,
                 job.mode,
                 job.maxHours,
-                job.mode !== 'unleashed' ? CRON_STANDARD_TIMEOUT_MS : undefined,
+                effectiveTimeoutMs,
                 job.successCriteria,
               );
               if (retryResponse && !CronScheduler.isCronNoise(retryResponse)) {
@@ -1436,6 +1462,7 @@ export class CronScheduler {
             durationMs: finishedAt.getTime() - startedAt.getTime(),
             attempt,
             outputPreview: response ? response.slice(0, 200) : undefined,
+            advisorApplied,
           };
 
           if (response && !CronScheduler.isCronNoise(response) && job.mode !== 'unleashed') {
@@ -1491,6 +1518,7 @@ export class CronScheduler {
             error: String(err).slice(0, 1500),
             errorType,
             attempt,
+            advisorApplied,
           });
 
           // Permanent error — stop immediately
@@ -1523,8 +1551,43 @@ export class CronScheduler {
         this.checkAgentLearning(job.agentSlug, job.name).catch(() => {});
       }
 
-      // Write targeted self-improvement trigger when consecutive errors are high
+      // Close the feedback loop: append outcome to advisor decision log
+      if (advisorApplied) {
+        try {
+          const lastRun = this.runLog.readRecent(job.name, 1)[0];
+          if (lastRun) {
+            appendFileSync(ADVISOR_LOG_PATH, JSON.stringify({
+              jobName: job.name,
+              timestamp: new Date().toISOString(),
+              type: 'outcome',
+              interventions: advisorApplied,
+              outcome: lastRun.status,
+              durationMs: lastRun.durationMs,
+            }) + '\n');
+          }
+        } catch { /* non-fatal */ }
+      }
+
+      // Notify on circuit breaker and escalation events
       const consErrors = this.runLog.consecutiveErrors(job.name);
+      if (consErrors === 5) {
+        // Circuit breaker just engaged — notify
+        this.logAdvisorEvent('circuit-breaker', job.name, `Circuit breaker engaged after ${consErrors} consecutive errors`);
+        this.dispatcher.send(`⚡ **Circuit breaker engaged** for \`${job.name}\` — ${consErrors} consecutive errors. Will retry in 1 hour.`, { agentSlug: job.agentSlug }).catch(() => {});
+      } else if (consErrors >= 5) {
+        // Check if recovery probe just succeeded
+        const lastRun = this.runLog.readRecent(job.name, 1)[0];
+        if (lastRun?.status === 'ok') {
+          this.logAdvisorEvent('circuit-recovery', job.name, `Circuit breaker recovered after ${consErrors} errors`);
+          this.dispatcher.send(`✅ **Circuit breaker recovered** — \`${job.name}\` succeeded after ${consErrors} prior errors.`, { agentSlug: job.agentSlug }).catch(() => {});
+        }
+      }
+
+      if (advice.shouldEscalate) {
+        this.logAdvisorEvent('escalation', job.name, advice.escalationReason ?? 'Escalated to unleashed');
+      }
+
+      // Write targeted self-improvement trigger when consecutive errors are high
       if (consErrors >= 3) {
         try {
           const triggerDir = path.join(BASE_DIR, 'self-improve', 'triggers');
@@ -1540,6 +1603,22 @@ export class CronScheduler {
         } catch { /* non-fatal */ }
       }
     }
+  }
+
+  /**
+   * Log an advisor event to the events JSONL file for dashboard surfacing.
+   */
+  private logAdvisorEvent(type: string, jobName: string, detail: string): void {
+    try {
+      const eventsPath = path.join(BASE_DIR, 'cron', 'advisor-events.jsonl');
+      mkdirSync(path.dirname(eventsPath), { recursive: true });
+      appendFileSync(eventsPath, JSON.stringify({
+        type,
+        jobName,
+        detail,
+        timestamp: new Date().toISOString(),
+      }) + '\n');
+    } catch { /* non-fatal */ }
   }
 
   /**

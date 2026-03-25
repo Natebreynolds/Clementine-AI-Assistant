@@ -190,6 +190,13 @@ export interface CronRunEntry {
   outputPreview?: string;
   deliveryFailed?: boolean;
   deliveryError?: string;
+  advisorApplied?: {
+    adjustedMaxTurns?: number;
+    adjustedModel?: string;
+    adjustedTimeoutMs?: number;
+    enriched?: boolean;
+    escalated?: boolean;
+  };
 }
 
 // ── Config ───────────────────────────────────────────────────────────
@@ -486,6 +493,16 @@ export interface ExecutionAdvice {
   escalationReason?: string;
   shouldSkip: boolean;
   skipReason?: string;
+}
+
+export interface AdvisorDecision {
+  jobName: string;
+  timestamp: string;
+  advice: ExecutionAdvice;
+  originalModel?: string;
+  originalMaxTurns?: number;
+  runOutcome?: 'ok' | 'error' | 'skipped';
+  runDurationMs?: number;
 }
 
 // ── Daily Planning ──────────────────────────────────────────────────
