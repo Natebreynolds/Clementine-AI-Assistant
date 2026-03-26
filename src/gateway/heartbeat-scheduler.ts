@@ -46,6 +46,16 @@ export class HeartbeatScheduler {
   private lastState: HeartbeatState;
   private timer: ReturnType<typeof setInterval> | null = null;
   private running = false;
+  private lastSelfImproveDate = '';
+  private lastAgentSiRuns = new Map<string, string>();
+
+  private getLastAgentSiRun(slug: string): string | undefined {
+    return this.lastAgentSiRuns.get(slug);
+  }
+
+  private setLastAgentSiRun(slug: string): void {
+    this.lastAgentSiRuns.set(slug, new Date().toISOString());
+  }
 
   constructor(gateway: Gateway, dispatcher: NotificationDispatcher) {
     this.gateway = gateway;
@@ -233,6 +243,42 @@ export class HeartbeatScheduler {
 
     // Fire-and-forget: process inbox items
     this.processInbox();
+
+    // Nightly self-improvement: run once per day at 2 AM
+    if (hour === 2 && this.lastSelfImproveDate !== new Date().toISOString().slice(0, 10)) {
+      this.lastSelfImproveDate = new Date().toISOString().slice(0, 10);
+      logger.info('Triggering nightly self-improvement cycle');
+      this.gateway.handleSelfImprove('run-nightly').catch(err => {
+        logger.error({ err }, 'Nightly self-improvement failed');
+      });
+    }
+
+    // Weekly per-agent improvement: one agent per day, cycling through
+    if (hour === 3) {
+      try {
+        const agentMgr = this.gateway.getAgentManager();
+        const agents = agentMgr.listAll().filter(a => a.slug !== 'clementine');
+        if (agents.length > 0) {
+          const dayOfYear = Math.floor((Date.now() - new Date(now.getFullYear(), 0, 0).getTime()) / 86400000);
+          const agentIndex = dayOfYear % agents.length;
+          const targetAgent = agents[agentIndex];
+
+          // Only run weekly (check if 7 days since last run for this agent)
+          const lastRun = this.getLastAgentSiRun(targetAgent.slug);
+          const daysSinceLastRun = lastRun ? (Date.now() - new Date(lastRun).getTime()) / 86400000 : Infinity;
+
+          if (daysSinceLastRun >= 7) {
+            logger.info({ agentSlug: targetAgent.slug }, 'Triggering weekly per-agent self-improvement');
+            this.gateway.handleSelfImprove('run-agent', { experimentId: targetAgent.slug }).catch(err => {
+              logger.error({ err, agentSlug: targetAgent.slug }, 'Per-agent self-improvement failed');
+            });
+            this.setLastAgentSiRun(targetAgent.slug);
+          }
+        }
+      } catch (err) {
+        logger.warn({ err }, 'Per-agent self-improvement scheduling error');
+      }
+    }
   }
 
   private readHeartbeatConfig(): string {
