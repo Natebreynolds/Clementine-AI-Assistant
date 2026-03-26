@@ -64,6 +64,8 @@ const DEFAULT_CONFIG: SelfImproveConfig = {
 const EXPERIMENT_LOG = path.join(SELF_IMPROVE_DIR, 'experiment-log.jsonl');
 const STATE_FILE = path.join(SELF_IMPROVE_DIR, 'state.json');
 const PENDING_DIR = path.join(SELF_IMPROVE_DIR, 'pending-changes');
+const APPROVAL_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+const IMPACT_CHECKS_FILE = path.join(SELF_IMPROVE_DIR, 'impact-checks.jsonl');
 
 // ── Internal types ───────────────────────────────────────────────────
 
@@ -101,6 +103,7 @@ interface PerformanceSnapshot {
   cronSuccessRate: number;
   cronReflections: CronReflectionEntry[];
   goalHealth: GoalHealthEntry[];
+  advisorInsights: string[];
 }
 
 // ── SelfImproveLoop ──────────────────────────────────────────────────
@@ -123,6 +126,9 @@ export class SelfImproveLoop {
   async run(
     onProposal?: (experiment: SelfImproveExperiment) => Promise<void>,
   ): Promise<SelfImproveState> {
+    this.reconcileState();
+    this.expireStaleProposals();
+    await this.checkAppliedImpact();
     const state = this.loadState();
     state.status = 'running';
     state.lastRunAt = new Date().toISOString();
@@ -179,6 +185,25 @@ export class SelfImproveLoop {
             continue;
           }
 
+          // Diversity safety net: skip if hypothesis targets an over-represented area:target
+          const proposalKey = `${proposal.area}:${proposal.target}`;
+          const proposalCount = history.filter(e => `${e.area}:${e.target}` === proposalKey).length
+            + this.getPendingChanges().filter(p => `${p.area}:${p.target}` === proposalKey).length;
+          if (proposalCount >= 3) {
+            logger.warn({ area: proposal.area, target: proposal.target, count: proposalCount },
+              'Hypothesis over-targeted — skipping');
+            consecutiveLow++;
+            continue;
+          }
+
+          const validation = this.validateProposal(proposal.area, proposal.target, proposal.proposedChange);
+          if (!validation.valid) {
+            logger.warn({ area: proposal.area, target: proposal.target, error: validation.error },
+              'Proposed change failed validation — skipping');
+            consecutiveLow++;
+            continue;
+          }
+
           // Step 4: Read current state
           const before = await this.readCurrentState(proposal.area, proposal.target);
 
@@ -192,6 +217,13 @@ export class SelfImproveLoop {
           const normalizedScore = score / 10; // Convert 0-10 to 0-1
           const accepted = normalizedScore >= this.config.acceptThreshold;
 
+          const priorScores = history
+            .filter(e => e.area === proposal.area && e.target === proposal.target && e.score > 0)
+            .map(e => e.score);
+          const baselineScore = priorScores.length > 0
+            ? priorScores.reduce((a, b) => a + b, 0) / priorScores.length
+            : 0.5;
+
           const experiment: SelfImproveExperiment = {
             id,
             iteration: i,
@@ -202,7 +234,7 @@ export class SelfImproveLoop {
             target: proposal.target,
             hypothesis: proposal.hypothesis,
             proposedChange: proposal.proposedChange,
-            baselineScore: normalizedScore,
+            baselineScore,
             score: normalizedScore,
             accepted,
             approvalStatus: accepted ? 'pending' : 'denied',
@@ -262,6 +294,12 @@ export class SelfImproveLoop {
         }
 
         this.saveState(state);
+      }
+
+      // Update avgResponseQuality from this run's scores
+      const runScores = history.filter(e => e.iteration >= 1 && e.score > 0).map(e => e.score);
+      if (runScores.length > 0) {
+        state.baselineMetrics.avgResponseQuality = runScores.reduce((a, b) => a + b, 0) / runScores.length;
       }
 
       state.status = 'completed';
@@ -362,6 +400,40 @@ export class SelfImproveLoop {
       }
     } catch { /* non-fatal */ }
 
+    // Gather execution advisor insights (if available)
+    const advisorInsights: string[] = [];
+    try {
+      const advisorLog = path.join(BASE_DIR, 'cron', 'advisor-decisions.jsonl');
+      if (existsSync(advisorLog)) {
+        const advisorLines = readFileSync(advisorLog, 'utf-8').trim().split('\n').filter(Boolean);
+        const outcomes = advisorLines.slice(-100)
+          .map(l => { try { return JSON.parse(l); } catch { return null; } })
+          .filter((d): d is any => d?.type === 'outcome');
+
+        // Summarize per-job intervention effectiveness
+        const byJob = new Map<string, { interventions: Map<string, { ok: number; total: number }> }>();
+        for (const o of outcomes) {
+          if (!byJob.has(o.jobName)) byJob.set(o.jobName, { interventions: new Map() });
+          const jm = byJob.get(o.jobName)!;
+          for (const [key, val] of Object.entries(o.interventions ?? {})) {
+            if (!val) continue;
+            if (!jm.interventions.has(key)) jm.interventions.set(key, { ok: 0, total: 0 });
+            const stats = jm.interventions.get(key)!;
+            stats.total++;
+            if (o.outcome === 'ok') stats.ok++;
+          }
+        }
+
+        for (const [job, data] of byJob) {
+          for (const [intervention, stats] of data.interventions) {
+            if (stats.total >= 2) {
+              advisorInsights.push(`${job}: ${intervention} — ${((stats.ok / stats.total) * 100).toFixed(0)}% success (n=${stats.total})`);
+            }
+          }
+        }
+      }
+    } catch { /* non-fatal */ }
+
     return {
       feedbackStats,
       negativeFeedback,
@@ -369,6 +441,7 @@ export class SelfImproveLoop {
       cronSuccessRate: cronTotal > 0 ? cronOk / cronTotal : 1,
       cronReflections: cronReflections.slice(-20),
       goalHealth,
+      advisorInsights,
     };
   }
 
@@ -436,6 +509,28 @@ export class SelfImproveLoop {
       `#${e.iteration} | ${e.area} | "${e.hypothesis.slice(0, 60)}" | ${(e.score * 10).toFixed(1)}/10 ${e.accepted ? '✅' : '❌'}`
     ).join('\n') || '(no prior experiments)';
 
+    // Enforce diversity: count recent proposals per area:target
+    const recentTargets = new Map<string, number>();
+    for (const e of history.slice(-15)) {
+      const key = `${e.area}:${e.target}`;
+      recentTargets.set(key, (recentTargets.get(key) ?? 0) + 1);
+    }
+    for (const p of this.getPendingChanges()) {
+      const key = `${p.area}:${p.target}`;
+      recentTargets.set(key, (recentTargets.get(key) ?? 0) + 1);
+    }
+    const overTargeted = [...recentTargets.entries()]
+      .filter(([, count]) => count >= 2)
+      .map(([key]) => key);
+
+    const diversityConstraint = overTargeted.length > 0
+      ? `\n\n## DIVERSITY CONSTRAINT\nThese targets have been proposed recently and MUST NOT be targeted again:\n` +
+        overTargeted.map(t => `- ${t}`).join('\n') +
+        `\nChoose a DIFFERENT area/target. If no other improvement is needed, output { "area": null }.\n`
+      : '';
+
+    const patternAnalysis = this.analyzeExperimentPatterns(history);
+
     // Format negative feedback
     const negativeFeedbackText = metrics.negativeFeedback.slice(0, 5).map(f =>
       `- Rating: ${f.rating} | Message: "${(f.messageSnippet ?? '').slice(0, 100)}" | Response: "${(f.responseSnippet ?? '').slice(0, 100)}"${f.comment ? ` | Comment: "${f.comment}"` : ''}`
@@ -486,6 +581,10 @@ export class SelfImproveLoop {
         }).join('\n')
       : '(no goals defined)';
 
+    const advisorText = metrics.advisorInsights.length > 0
+      ? metrics.advisorInsights.map(a => `- ${a}`).join('\n')
+      : '(no advisor data yet)';
+
     const areas = this.config.areas.map(a => `'${a}'`).join(', ');
 
     const prompt =
@@ -505,6 +604,8 @@ export class SelfImproveLoop {
       `- STALE goals → cron prompts aren't making progress, or goals aren't linked to crons\n` +
       `- Goals with 0 progress notes → agents never started working on them\n` +
       `- Goals with no linked crons → no automated work loop driving progress\n\n` +
+      `### Execution advisor intervention outcomes:\n${advisorText}\n` +
+      `(If an intervention has low success, the job may need a prompt rewrite rather than parameter tuning.)\n\n` +
       `### Cron job errors:\n${cronErrorsText}\n\n` +
       targetedTriggers +
       `## Current Configuration\n` +
@@ -514,10 +615,14 @@ export class SelfImproveLoop {
       `### Workflows:\n${workflowSummaries}\n\n` +
       `### Agent configs (team members with their own personality/tools):\n${agentSummaries}\n\n` +
       `## Experiment History (avoid repeating failed approaches):\n${historyText}\n\n` +
+      (patternAnalysis ? `\n\n${patternAnalysis}\n` : '') +
+      diversityConstraint +
       `## Instructions\n` +
       `- Focus on areas: ${areas}\n` +
       `- Identify the SINGLE highest-impact improvement area\n` +
-      `- When an agent's average quality is below 3.0 or their empty output rate exceeds 10%, consider improving their agent.md instructions or cron job prompts (area: "agent", target: the slug)\n` +
+      `- When an agent's average quality is below 3.0 or empty output rate exceeds 10%, prioritize improving their agent.md system prompt or cron job prompts (area: "agent", target: the agent slug)\n` +
+      `- Cross-reference per-agent performance with advisor intervention data: if an agent's jobs have low intervention success AND low quality, the agent's instructions likely need rewriting\n` +
+      `- For agents with high empty output rates, check if their cron prompts are too vague or success criteria are missing\n` +
       `- Propose a SPECIFIC, MINIMAL change (not a full rewrite)\n` +
       `- Explain WHY this change should improve the metric\n` +
       `- IMPORTANT: "proposedChange" must be the COMPLETE updated file content (not just the diff or changed section), because it will replace the entire file\n` +
@@ -561,8 +666,10 @@ export class SelfImproveLoop {
       }
       case 'communication':
         return existsSync(AGENTS_FILE) ? readFileSync(AGENTS_FILE, 'utf-8') : '';
-      case 'memory':
-        return `(memory configuration — target: ${target})`;
+      case 'memory': {
+        const memoryFile = path.join(VAULT_DIR, '00-System', 'MEMORY.md');
+        return existsSync(memoryFile) ? readFileSync(memoryFile, 'utf-8') : '';
+      }
       default:
         return '';
     }
@@ -609,6 +716,7 @@ export class SelfImproveLoop {
     const pending = {
       ...experiment,
       before,
+      createdAt: new Date().toISOString(),
     };
     writeFileSync(filePath, JSON.stringify(pending, null, 2));
     logger.info({ id: experiment.id, area: experiment.area }, 'Saved pending change');
@@ -646,7 +754,25 @@ export class SelfImproveLoop {
       const state = this.loadState();
       state.pendingApprovals = Math.max(0, state.pendingApprovals - 1);
       this.saveState(state);
+      // Schedule impact measurement for 24h later
+      try {
+        appendFileSync(IMPACT_CHECKS_FILE, JSON.stringify({
+          experimentId,
+          area: pending.area,
+          target: pending.target,
+          appliedAt: new Date().toISOString(),
+          checkAfterMs: 24 * 60 * 60 * 1000,
+        }) + '\n');
+      } catch (err) {
+        logger.warn({ err }, 'Failed to schedule impact check');
+      }
       return `Applied source change to ${pending.target} — restart triggered.`;
+    }
+
+    // Final validation before writing
+    const validation = this.validateProposal(pending.area, pending.target, pending.proposedChange);
+    if (!validation.valid) {
+      return `Cannot apply change — validation failed: ${validation.error}`;
     }
 
     // Write the change (non-source areas)
@@ -665,6 +791,19 @@ export class SelfImproveLoop {
     const state = this.loadState();
     state.pendingApprovals = Math.max(0, state.pendingApprovals - 1);
     this.saveState(state);
+
+    // Schedule impact measurement for 24h later
+    try {
+      appendFileSync(IMPACT_CHECKS_FILE, JSON.stringify({
+        experimentId,
+        area: pending.area,
+        target: pending.target,
+        appliedAt: new Date().toISOString(),
+        checkAfterMs: 24 * 60 * 60 * 1000,
+      }) + '\n');
+    } catch (err) {
+      logger.warn({ err }, 'Failed to schedule impact check');
+    }
 
     return `Applied change to ${pending.area}/${pending.target}`;
   }
@@ -844,6 +983,87 @@ export class SelfImproveLoop {
     };
   }
 
+  /** Reconcile pendingApprovals counter with actual pending-changes/ directory. */
+  reconcileState(): SelfImproveState {
+    const state = this.loadState();
+    const actualPending = this.getPendingChanges().length;
+    if (state.pendingApprovals !== actualPending) {
+      logger.warn(
+        { stored: state.pendingApprovals, actual: actualPending },
+        'Pending approvals counter drift — reconciling',
+      );
+      state.pendingApprovals = actualPending;
+      this.saveState(state);
+    }
+    return state;
+  }
+
+  /** Expire pending proposals older than APPROVAL_TTL_MS. */
+  expireStaleProposals(): number {
+    const pending = this.getPendingChanges();
+    let expired = 0;
+    const now = Date.now();
+    for (const p of pending) {
+      const createdAt = (p as any).createdAt
+        ? new Date((p as any).createdAt).getTime()
+        : new Date(p.finishedAt).getTime();
+      if (now - createdAt > APPROVAL_TTL_MS) {
+        this.updateExperimentStatus(p.id, 'expired');
+        try { unlinkSync(path.join(PENDING_DIR, `${p.id}.json`)); } catch { /* ignore */ }
+        expired++;
+        logger.info({ id: p.id, area: p.area, target: p.target }, 'Expired stale proposal');
+      }
+    }
+    if (expired > 0) {
+      const state = this.loadState();
+      state.pendingApprovals = Math.max(0, state.pendingApprovals - expired);
+      this.saveState(state);
+    }
+    return expired;
+  }
+
+  /** Check impact of previously applied changes. Runs at start of each self-improve cycle. */
+  private async checkAppliedImpact(): Promise<void> {
+    if (!existsSync(IMPACT_CHECKS_FILE)) return;
+    try {
+      const lines = readFileSync(IMPACT_CHECKS_FILE, 'utf-8').trim().split('\n').filter(Boolean);
+      const remaining: string[] = [];
+      const now = Date.now();
+
+      for (const line of lines) {
+        try {
+          const check = JSON.parse(line);
+          const appliedAt = new Date(check.appliedAt).getTime();
+          if (now - appliedAt < check.checkAfterMs) {
+            remaining.push(line);
+            continue;
+          }
+
+          // Measure current state for this area
+          const metrics = await this.gatherMetrics();
+          const impact = {
+            type: 'impact',
+            experimentId: check.experimentId,
+            area: check.area,
+            target: check.target,
+            measuredAt: new Date().toISOString(),
+            cronSuccessRate: metrics.cronSuccessRate,
+            feedbackPositiveRatio: metrics.feedbackStats.total > 0
+              ? metrics.feedbackStats.positive / metrics.feedbackStats.total : 1,
+          };
+          appendFileSync(EXPERIMENT_LOG, JSON.stringify(impact) + '\n');
+          logger.info({ ...impact }, 'Impact measurement recorded');
+        } catch {
+          remaining.push(line);
+        }
+      }
+
+      writeFileSync(IMPACT_CHECKS_FILE, remaining.length > 0 ? remaining.join('\n') + '\n' : '');
+    } catch (err) {
+      logger.warn({ err }, 'Impact check failed');
+    }
+  }
+
   private saveState(state: SelfImproveState): void {
     ensureDirs();
     writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
@@ -868,6 +1088,63 @@ export class SelfImproveLoop {
 
   // ── Helpers ──────────────────────────────────────────────────────
 
+  /** Analyze experiment history for success patterns and failed approaches. */
+  private analyzeExperimentPatterns(history: SelfImproveExperiment[]): string {
+    if (history.length < 3) return '';
+
+    const byArea = new Map<string, { total: number; accepted: number; scoreSum: number }>();
+    for (const e of history) {
+      if ((e as any).type === 'impact') continue; // skip impact records
+      const entry = byArea.get(e.area) ?? { total: 0, accepted: 0, scoreSum: 0 };
+      entry.total++;
+      if (e.accepted) entry.accepted++;
+      entry.scoreSum += e.score;
+      byArea.set(e.area, entry);
+    }
+
+    const lines: string[] = ['## Experiment Pattern Analysis'];
+    for (const [area, stats] of byArea) {
+      const avg = (stats.scoreSum / stats.total * 10).toFixed(1);
+      const rate = ((stats.accepted / stats.total) * 100).toFixed(0);
+      lines.push(`- ${area}: ${stats.total} experiments, ${rate}% acceptance, avg ${avg}/10`);
+    }
+
+    // Read impact records from experiment log
+    try {
+      if (existsSync(EXPERIMENT_LOG)) {
+        const allLines = readFileSync(EXPERIMENT_LOG, 'utf-8').trim().split('\n').filter(Boolean);
+        const impacts = allLines
+          .map(l => { try { return JSON.parse(l); } catch { return null; } })
+          .filter((r): r is any => r?.type === 'impact')
+          .slice(-5);
+        if (impacts.length > 0) {
+          lines.push('\n### Measured Impact of Past Applied Changes');
+          for (const ir of impacts) {
+            lines.push(`- ${ir.area}/${ir.target}: cron ${(ir.cronSuccessRate * 100).toFixed(0)}%, feedback ${(ir.feedbackPositiveRatio * 100).toFixed(0)}% positive (measured ${ir.measuredAt})`);
+          }
+        }
+      }
+    } catch { /* non-fatal */ }
+
+    // Identify consistently failed approaches
+    const failedHypotheses = history
+      .filter(e => !e.accepted && e.score < 0.3 && !(e as any).type)
+      .map(e => e.hypothesis.slice(0, 80));
+    if (failedHypotheses.length > 0) {
+      lines.push('\n### Approaches That Scored Poorly (avoid these)');
+      for (const h of [...new Set(failedHypotheses)].slice(0, 5)) {
+        lines.push(`- "${h}"`);
+      }
+    }
+
+    return lines.join('\n');
+  }
+
+  /** Validate that a proposed change has valid syntax for its target area. */
+  private validateProposal(area: string, target: string, proposedChange: string): { valid: boolean; error?: string } {
+    return validateProposal(area, target, proposedChange);
+  }
+
   private resolveTargetPath(area: string, target: string): string | null {
     switch (area) {
       case 'soul':
@@ -886,6 +1163,8 @@ export class SelfImproveLoop {
       }
       case 'communication':
         return AGENTS_FILE;
+      case 'memory':
+        return path.join(VAULT_DIR, '00-System', 'MEMORY.md');
       default:
         return null;
     }
@@ -924,6 +1203,38 @@ export class SelfImproveLoop {
 }
 
 // ── Utility ──────────────────────────────────────────────────────────
+
+/** Validate that a proposed change has valid syntax for its target area. */
+export function validateProposal(area: string, _target: string, proposedChange: string): { valid: boolean; error?: string } {
+  if (!proposedChange.trim()) {
+    return { valid: false, error: 'Proposed change is empty' };
+  }
+  if (['soul', 'cron', 'workflow', 'agent', 'communication'].includes(area)) {
+    try {
+      matter(proposedChange);
+    } catch (err) {
+      return { valid: false, error: `YAML frontmatter parse error: ${err instanceof Error ? err.message : String(err)}` };
+    }
+  }
+  if (area === 'cron') {
+    try {
+      const parsed = matter(proposedChange);
+      if (parsed.data?.jobs && !Array.isArray(parsed.data.jobs)) {
+        return { valid: false, error: 'CRON.md jobs field must be an array' };
+      }
+      if (Array.isArray(parsed.data?.jobs)) {
+        for (const job of parsed.data.jobs) {
+          if (!job.name || !job.schedule || !job.prompt) {
+            return { valid: false, error: `Cron job missing required fields (name/schedule/prompt): ${JSON.stringify(job).slice(0, 100)}` };
+          }
+        }
+      }
+    } catch (err) {
+      return { valid: false, error: `CRON.md validation failed: ${err}` };
+    }
+  }
+  return { valid: true };
+}
 
 function ensureDirs(): void {
   for (const dir of [SELF_IMPROVE_DIR, PENDING_DIR]) {

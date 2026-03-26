@@ -8,6 +8,7 @@ import { shellEscape } from '../src/config.js';
 import { classifyError } from '../src/gateway/cron-scheduler.js';
 import { classifyChatError } from '../src/gateway/router.js';
 import { estimateTokens } from '../src/agent/assistant.js';
+import { validateProposal } from '../src/agent/self-improve.js';
 
 // ── shellEscape ─────────────────────────────────────────────────────
 
@@ -124,5 +125,55 @@ describe('estimateTokens', () => {
     const text = 'line 1\nline 2\nline 3\nline 4';
     const estimate = estimateTokens(text);
     expect(estimate).toBeGreaterThan(5);
+  });
+});
+
+// ── validateProposal ────────────────────────────────────────────────
+
+describe('validateProposal', () => {
+  it('rejects empty proposals', () => {
+    const result = validateProposal('soul', 'SOUL.md', '   ');
+    expect(result.valid).toBe(false);
+    expect(result.error).toContain('empty');
+  });
+
+  it('accepts valid markdown without frontmatter', () => {
+    const result = validateProposal('soul', 'SOUL.md', '# Soul\n\nBe helpful.');
+    expect(result.valid).toBe(true);
+  });
+
+  it('accepts valid YAML frontmatter', () => {
+    const content = '---\ntitle: Test\n---\n\n# Content';
+    const result = validateProposal('soul', 'SOUL.md', content);
+    expect(result.valid).toBe(true);
+  });
+
+  it('rejects invalid YAML frontmatter', () => {
+    const content = '---\ntitle: [invalid yaml\n---\n\n# Content';
+    const result = validateProposal('cron', 'CRON.md', content);
+    expect(result.valid).toBe(false);
+    expect(result.error).toContain('YAML');
+  });
+
+  it('validates cron jobs have required fields', () => {
+    const valid = '---\njobs:\n  - name: test\n    schedule: "0 8 * * *"\n    prompt: Do something\n---\n';
+    expect(validateProposal('cron', 'CRON.md', valid).valid).toBe(true);
+
+    const missing = '---\njobs:\n  - name: test\n    schedule: "0 8 * * *"\n---\n';
+    const result = validateProposal('cron', 'CRON.md', missing);
+    expect(result.valid).toBe(false);
+    expect(result.error).toContain('missing required fields');
+  });
+
+  it('rejects cron jobs field that is not an array', () => {
+    const content = '---\njobs: not-an-array\n---\n';
+    const result = validateProposal('cron', 'CRON.md', content);
+    expect(result.valid).toBe(false);
+    expect(result.error).toContain('must be an array');
+  });
+
+  it('passes non-markdown areas without frontmatter validation', () => {
+    const result = validateProposal('source', 'index.ts', 'const x = 1;');
+    expect(result.valid).toBe(true);
   });
 });
