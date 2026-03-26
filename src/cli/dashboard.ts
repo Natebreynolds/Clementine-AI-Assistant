@@ -781,10 +781,12 @@ function getStatus(): Record<string, unknown> {
   const activeAgents = activeAgentSlugs.size;
   const successRate = runsToday > 0 ? Math.round((runsOk / runsToday) * 100) : null;
 
+  const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+
   return {
     name, pid, alive, uptime, channels, launchAgent, currentActivity,
     runsToday, scheduledToday, runsOk, runsFailed, successRate,
-    activeAgents, nextTaskName, nextTaskTime,
+    activeAgents, nextTaskName, nextTaskTime, timezone,
   };
 }
 
@@ -1923,8 +1925,9 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
       ],
     },
     {
-      label: 'Heartbeat',
+      label: 'Heartbeat & Scheduling',
       keys: [
+        { key: 'TIMEZONE', label: 'Timezone', hint: 'IANA timezone (e.g. America/Los_Angeles). Auto-detected if not set.' },
         { key: 'HEARTBEAT_INTERVAL_MINUTES', label: 'Interval (min)', hint: 'Minutes between heartbeat checks (default 30)' },
         { key: 'HEARTBEAT_ACTIVE_START', label: 'Active Start Hour', hint: '0-23 (default 8)' },
         { key: 'HEARTBEAT_ACTIVE_END', label: 'Active End Hour', hint: '0-23 (default 22)' },
@@ -6394,10 +6397,11 @@ async function refreshStatus() {
       agentAct.innerHTML = '<span>' + (d.alive ? 'Online — standing by' : 'Offline') + '</span>';
     }
 
-    // Agent meta (uptime)
+    // Agent meta (uptime + timezone)
     var meta = document.getElementById('agent-meta');
     var metaParts = [];
     if (d.uptime) metaParts.push('Uptime: ' + d.uptime);
+    if (d.timezone) metaParts.push(d.timezone);
     if (d.pid) metaParts.push('PID ' + d.pid);
     if (d.launchAgent) metaParts.push('LaunchAgent: ' + d.launchAgent);
     meta.textContent = metaParts.join(' · ');

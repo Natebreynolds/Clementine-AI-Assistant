@@ -188,11 +188,16 @@ export const MS_USER_EMAIL = getEnv('MS_USER_EMAIL');
 
 export const ALLOW_ALL_USERS = getEnv('ALLOW_ALL_USERS', 'false').toLowerCase() === 'true';
 
+// ── Timezone ─────────────────────────────────────────────────────────
+
+/** User-configurable timezone. Falls back to system-detected timezone. */
+export const TIMEZONE = getEnv('TIMEZONE') || Intl.DateTimeFormat().resolvedOptions().timeZone;
+
 // ── Heartbeat ────────────────────────────────────────────────────────
 
-export const HEARTBEAT_INTERVAL_MINUTES = 30;
-export const HEARTBEAT_ACTIVE_START = 8;
-export const HEARTBEAT_ACTIVE_END = 22;
+export const HEARTBEAT_INTERVAL_MINUTES = parseInt(getEnv('HEARTBEAT_INTERVAL_MINUTES', '30'), 10) || 30;
+export const HEARTBEAT_ACTIVE_START = parseInt(getEnv('HEARTBEAT_ACTIVE_START', '8'), 10);
+export const HEARTBEAT_ACTIVE_END = parseInt(getEnv('HEARTBEAT_ACTIVE_END', '22'), 10);
 export const HEARTBEAT_MAX_TURNS = 5;
 
 // ── Unleashed mode ──────────────────────────────────────────────────
