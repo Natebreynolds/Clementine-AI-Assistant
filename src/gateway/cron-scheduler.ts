@@ -34,6 +34,7 @@ import {
   GOALS_DIR,
   CRON_REFLECTIONS_DIR,
   ADVISOR_LOG_PATH,
+  TIMEZONE,
 } from '../config.js';
 import type { CronJobDefinition, CronRunEntry, SelfImproveConfig, SelfImproveExperiment, SelfImproveState, WorkflowDefinition } from '../types.js';
 import type { NotificationDispatcher } from './notifications.js';
@@ -47,9 +48,8 @@ const logger = pino({ name: 'clementine.cron' });
 /** Default timeout for standard cron jobs (10 minutes). */
 const CRON_STANDARD_TIMEOUT_MS = 10 * 60 * 1000;
 
-/** System timezone for cron scheduling — ensures jobs fire at local time
- *  regardless of how the daemon is launched (launchd, pm2, etc.). */
-const SYSTEM_TIMEZONE = Intl.DateTimeFormat().resolvedOptions().timeZone;
+/** Timezone for cron scheduling — uses config (user-overridable) or system-detected. */
+const SYSTEM_TIMEZONE = TIMEZONE;
 
 // ── Daily Note Activity Logger ───────────────────────────────────────
 
