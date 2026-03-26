@@ -6,7 +6,7 @@
  */
 
 import express from 'express';
-import { randomBytes } from 'node:crypto';
+import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { spawn, execSync } from 'node:child_process';
 import {
   existsSync,
@@ -105,6 +105,14 @@ const REMOTE_CONFIG_PATH = path.join(BASE_DIR, 'remote-access.json');
 function generateAccessToken(): string {
   const raw = randomBytes(12).toString('base64url').slice(0, 12);
   return `clem_${raw.slice(0, 4)}-${raw.slice(4, 8)}-${raw.slice(8, 12)}`;
+}
+
+/** Constant-time string comparison to prevent timing attacks on tokens. */
+function safeTokenEquals(a: string, b: string): boolean {
+  const bufA = Buffer.from(a, 'utf-8');
+  const bufB = Buffer.from(b, 'utf-8');
+  if (bufA.length !== bufB.length) return false;
+  return timingSafeEqual(bufA, bufB);
 }
 
 function loadRemoteConfig(): RemoteAccessConfig {
@@ -1051,7 +1059,7 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
   // Protect /api routes with bearer token (GET / serves the SPA with token injected)
   app.use('/api', (req, res, next) => {
     const auth = req.headers.authorization;
-    if (auth !== `Bearer ${dashboardToken}`) {
+    if (!auth || !safeTokenEquals(auth, `Bearer ${dashboardToken}`)) {
       res.status(401).json({ error: 'Unauthorized' });
       return;
     }
@@ -1098,7 +1106,7 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
       return;
     }
 
-    if (token !== config.authToken) {
+    if (!safeTokenEquals(token, config.authToken)) {
       res.status(401).json({ error: 'Invalid access token' });
       return;
     }
@@ -3349,7 +3357,7 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
     });
   });
 
-  app.post('/api/remote-access/enable', async (req, res) => {
+  app.post('/api/remote-access/enable', async (_req, res) => {
     try {
       if (!TunnelManager.isInstalled()) {
         res.status(400).json({

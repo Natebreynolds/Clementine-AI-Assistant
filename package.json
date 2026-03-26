@@ -15,6 +15,8 @@
     "mcp": "tsx src/tools/mcp-server.ts",
     "cli": "tsx src/cli/index.ts",
     "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
     "postinstall": "npm rebuild better-sqlite3 --quiet 2>/dev/null || true"
   },
   "dependencies": {
@@ -42,7 +44,8 @@
     "@types/node": "^22.12.0",
     "@types/node-cron": "^3.0.11",
     "tsx": "^4.19.0",
-    "typescript": "^5.7.0"
+    "typescript": "^5.7.0",
+    "vitest": "^4.1.1"
   },
   "engines": {
     "node": ">=20.0.0"

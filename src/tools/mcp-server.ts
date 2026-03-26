@@ -21,8 +21,6 @@ import { z } from 'zod';
 
 // ── Resolve paths ──────────────────────────────────────────────────────
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
 const BASE_DIR = process.env.CLEMENTINE_HOME || path.join(os.homedir(), '.clementine');
 
 // Read .env locally — never pollute process.env with secrets
@@ -386,16 +384,6 @@ function nextTaskId(body: string): string {
     }
   }
   return `T-${String(maxId + 1).padStart(3, '0')}`;
-}
-
-function nextSubtaskId(body: string, parentId: string): string {
-  let maxSub = 0;
-  const re = new RegExp(`\\{T-${parentId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\.(\\d+)\\}`, 'g');
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(body)) !== null) {
-    maxSub = Math.max(maxSub, parseInt(m[1], 10));
-  }
-  return `T-${parentId}.${maxSub + 1}`;
 }
 
 function nextDueDate(currentDue: string, recurrence: string): string {
@@ -897,7 +885,7 @@ server.tool(
     priority: z.string().optional().describe('New priority'),
     due_date: z.string().optional().describe('New due date (YYYY-MM-DD)'),
   },
-  async ({ task_id, status, description: newDesc, priority: newPriority, due_date: newDue }) => {
+  async ({ task_id, status, description: _newDesc, priority: newPriority, due_date: newDue }) => {
     if (!existsSync(TASKS_FILE)) {
       return textResult('No task list found.');
     }
@@ -2764,7 +2752,6 @@ server.tool(
     // Tier 2 jobs with complex prompts (browser automation, multi-contact workflows,
     // multi-step sequences) will exhaust standard turn limits silently.
     if (mode !== 'unleashed' && tier >= 2) {
-      const promptLower = prompt.toLowerCase();
       const complexSignals = [
         /\bfor each\b.*\bcontact\b/i,
         /\bfor each\b.*\bprospect\b/i,

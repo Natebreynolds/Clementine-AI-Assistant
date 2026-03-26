@@ -19,7 +19,7 @@ import {
   MODELS,
 } from '../config.js';
 import type { PersistentGoal, DailyPlan, DailyPlanPriority } from '../types.js';
-import { CronRunLog } from '../gateway/heartbeat.js';
+
 
 const logger = pino({ name: 'clementine.daily-planner' });
 

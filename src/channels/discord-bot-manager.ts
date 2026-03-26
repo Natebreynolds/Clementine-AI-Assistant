@@ -13,7 +13,7 @@ import pino from 'pino';
 import type { Gateway } from '../gateway/router.js';
 import type { CronScheduler } from '../gateway/heartbeat.js';
 import { AgentBotClient, type AgentBotStatus } from './discord-agent-bot.js';
-import { chunkText, formatCronEmbed } from './discord-utils.js';
+import { formatCronEmbed } from './discord-utils.js';
 
 const logger = pino({ name: 'clementine.bot-manager' });
 

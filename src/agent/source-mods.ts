@@ -21,7 +21,7 @@ import {
 import path from 'node:path';
 import pino from 'pino';
 
-import { SOURCE_MODS_DIR, PKG_DIR } from '../config.js';
+import { SOURCE_MODS_DIR } from '../config.js';
 
 const logger = pino({ name: 'clementine.source-mods' });
 

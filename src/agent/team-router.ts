@@ -5,12 +5,9 @@
  * Bot-based agents manage their own Discord channels via AgentBotClient/BotManager.
  */
 
-import pino from 'pino';
 import type { AgentProfile } from '../types.js';
 import type { AgentManager } from './agent-manager.js';
 import { TEAM_COMMS_CHANNEL } from '../config.js';
-
-const logger = pino({ name: 'clementine.team-router' });
 
 export class TeamRouter {
   private profileManager: AgentManager;

@@ -165,8 +165,6 @@ export async function applyUpdate(pkgDir: string): Promise<UpdateApplyResult> {
     // 7. Get version info and write sentinel + restart
     let commitHash = '';
     let commitDate = '';
-    let commitsBehind = 0;
-    let summary = '';
     try {
       commitHash = execSync('git rev-parse --short HEAD', { cwd: pkgDir, encoding: 'utf-8' }).trim();
       commitDate = execSync('git log -1 --format=%ci HEAD', { cwd: pkgDir, encoding: 'utf-8' }).trim().slice(0, 10);

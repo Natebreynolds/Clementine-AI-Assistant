@@ -17,7 +17,7 @@ import { App } from '@slack/bolt';
 import pino from 'pino';
 import type { AgentProfile } from '../types.js';
 import type { Gateway } from '../gateway/router.js';
-import { mdToSlack, sendChunkedSlack, SlackStreamingMessage } from './slack-utils.js';
+import { SlackStreamingMessage } from './slack-utils.js';
 import { friendlyToolName } from './discord-utils.js';
 
 const logger = pino({ name: 'clementine.slack-agent-bot' });

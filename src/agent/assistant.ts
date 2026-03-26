@@ -15,12 +15,10 @@ import path from 'node:path';
 import {
   query,
   type Options as SDKOptions,
-  type SDKMessage,
   type SDKAssistantMessage,
   type SDKResultMessage,
   type SDKPartialAssistantMessage,
 } from '@anthropic-ai/claude-agent-sdk';
-import matter from 'gray-matter';
 import pino from 'pino';
 
 import {
@@ -75,9 +73,20 @@ import { PromptCache } from './prompt-cache.js';
 
 // ── Token estimation & context window guard ─────────────────────────
 
-/** Rough token estimate: ~4 chars per token for English text. */
-function estimateTokens(text: string): number {
-  return Math.ceil(text.length / 4);
+/**
+ * Estimate token count using a weighted heuristic.
+ * BPE tokenizers average ~4 chars/token for prose, but code, punctuation,
+ * and whitespace-heavy content tokenize differently.
+ */
+export function estimateTokens(text: string): number {
+  if (!text) return 0;
+  // Count words (sequences of alphanumeric chars) — average ~1.3 tokens per word
+  const words = text.match(/\b\w+\b/g)?.length ?? 0;
+  // Count non-word tokens: punctuation, brackets, operators (each is ~1 token)
+  const punctuation = text.match(/[^\w\s]/g)?.length ?? 0;
+  // Newlines and indentation: roughly 1 token per line
+  const lines = text.split('\n').length;
+  return Math.ceil(words * 1.3 + punctuation * 0.8 + lines * 0.5);
 }
 
 /** Format a millisecond duration as a human-friendly "X ago" string. */
@@ -474,6 +483,42 @@ export class PersonalAssistant {
     this._lastDailyNotePath = todayPath;
   }
 
+  // ── Shared stream helpers ──────────────────────────────────────────
+
+  /** Log SDK result metrics and store usage. Shared across all query methods. */
+  private logQueryResult(result: SDKResultMessage, source: string, sessionKey: string, label?: string): void {
+    if ('total_cost_usd' in result) {
+      logger.info({
+        ...(label ? { job: label } : {}),
+        cost_usd: result.total_cost_usd,
+        num_turns: result.num_turns,
+        duration_ms: result.duration_ms,
+      }, `${source} query completed`);
+    }
+    if (this.memoryStore && result.modelUsage) {
+      try {
+        this.memoryStore.logUsage({
+          sessionKey,
+          source,
+          modelUsage: result.modelUsage,
+          numTurns: result.num_turns,
+          durationMs: result.duration_ms,
+        });
+      } catch (err) {
+        logger.warn({ err }, 'Usage logging failed');
+      }
+    }
+  }
+
+  /** Capture MCP server status from system init messages. */
+  private captureMcpStatus(message: unknown): void {
+    const sysMsg = message as any;
+    if (sysMsg.subtype === 'init' && sysMsg.mcp_servers) {
+      this._lastMcpStatus = sysMsg.mcp_servers;
+      this._lastMcpStatusTime = new Date().toISOString();
+    }
+  }
+
   setUnleashedCompleteCallback(cb: (jobName: string, result: string) => void): void {
     this.onUnleashedComplete = cb;
   }
@@ -496,8 +541,8 @@ export class PersonalAssistant {
       const { MEMORY_DB_PATH } = await import('../config.js');
       this.memoryStore = new MemoryStore(MEMORY_DB_PATH, VAULT_DIR);
       this.memoryStore.initialize();
-    } catch {
-      // Memory store init failed — falling back to static prompts
+    } catch (err) {
+      logger.warn({ err }, 'Memory store init failed — falling back to static prompts');
     }
   }
 
@@ -530,8 +575,8 @@ export class PersonalAssistant {
         // Mark as restored so first post-restart message injects context
         this.restoredSessions.add(key);
       }
-    } catch {
-      // Starting fresh
+    } catch (err) {
+      logger.warn({ err }, 'Session restore failed — starting fresh');
     }
   }
 
@@ -558,8 +603,8 @@ export class PersonalAssistant {
         };
       }
       fs.writeFileSync(SESSIONS_FILE, JSON.stringify(data, null, 2));
-    } catch {
-      // Non-fatal
+    } catch (err) {
+      logger.warn({ err }, 'Session persist failed');
     }
   }
 
@@ -1394,8 +1439,8 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
       try {
         this.memoryStore.saveTurn(key, 'user', text);
         this.memoryStore.saveTurn(key, 'assistant', responseText, model ?? MODEL);
-      } catch {
-        // Non-fatal
+      } catch (err) {
+        logger.warn({ err, sessionKey: key }, 'Transcript save failed');
       }
     }
 
@@ -1561,26 +1606,7 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
             } else if (message.type === 'result') {
               const result = message as SDKResultMessage;
               sessionId = result.session_id;
-              // Capture cost/usage metrics
-              if ('total_cost_usd' in result) {
-                logger.info({
-                  cost_usd: result.total_cost_usd,
-                  num_turns: result.num_turns,
-                  duration_ms: result.duration_ms,
-                }, 'SDK query completed');
-              }
-              // Log token usage
-              if (this.memoryStore && result.modelUsage) {
-                try {
-                  this.memoryStore.logUsage({
-                    sessionKey: sessionKey ?? 'unknown',
-                    source: 'chat',
-                    modelUsage: result.modelUsage,
-                    numTurns: result.num_turns,
-                    durationMs: result.duration_ms,
-                  });
-                } catch { /* non-fatal */ }
-              }
+              this.logQueryResult(result, 'chat', sessionKey ?? 'unknown');
               if (result.is_error) {
                 // Error subtypes have `errors` array; success subtype has `result` string
                 const errorText = 'errors' in result ? result.errors.join('; ') : ('result' in result ? result.result : '');
@@ -1597,12 +1623,7 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
                 }
               }
             } else if (message.type === 'system') {
-              // Capture MCP server status from init message
-              const sysMsg = message as any;
-              if (sysMsg.subtype === 'init' && sysMsg.mcp_servers) {
-                this._lastMcpStatus = sysMsg.mcp_servers;
-                this._lastMcpStatusTime = new Date().toISOString();
-              }
+              this.captureMcpStatus(message);
             } else {
               logger.debug({ type: message.type }, 'Unknown SDK message type');
             }
@@ -2134,31 +2155,9 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
           }
         }
       } else if (message.type === 'result') {
-        const result = message as SDKResultMessage;
-        if ('total_cost_usd' in result) {
-          logger.info({
-            cost_usd: result.total_cost_usd,
-            num_turns: result.num_turns,
-            duration_ms: result.duration_ms,
-          }, 'Heartbeat query completed');
-        }
-        if (this.memoryStore && result.modelUsage) {
-          try {
-            this.memoryStore.logUsage({
-              sessionKey: 'heartbeat',
-              source: 'heartbeat',
-              modelUsage: result.modelUsage,
-              numTurns: result.num_turns,
-              durationMs: result.duration_ms,
-            });
-          } catch { /* non-fatal */ }
-        }
+        this.logQueryResult(message as SDKResultMessage, 'heartbeat', 'heartbeat');
       } else if (message.type === 'system') {
-        const sysMsg = message as any;
-        if (sysMsg.subtype === 'init' && sysMsg.mcp_servers) {
-          this._lastMcpStatus = sysMsg.mcp_servers;
-          this._lastMcpStatusTime = new Date().toISOString();
-        }
+        this.captureMcpStatus(message);
       } else if (message.type === 'stream_event') {
         // Streaming tokens — no action needed
       }
@@ -2212,26 +2211,7 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
           }
         }
       } else if (message.type === 'result') {
-        const result = message as SDKResultMessage;
-        if ('total_cost_usd' in result) {
-          logger.info({
-            stepId,
-            cost_usd: result.total_cost_usd,
-            num_turns: result.num_turns,
-            duration_ms: result.duration_ms,
-          }, 'Plan step query completed');
-        }
-        if (this.memoryStore && result.modelUsage) {
-          try {
-            this.memoryStore.logUsage({
-              sessionKey: `plan:${stepId}`,
-              source: 'plan_step',
-              modelUsage: result.modelUsage,
-              numTurns: result.num_turns,
-              durationMs: result.duration_ms,
-            });
-          } catch { /* non-fatal */ }
-        }
+        this.logQueryResult(message as SDKResultMessage, 'plan_step', `plan:${stepId}`, stepId);
       }
     }
 
@@ -2440,14 +2420,6 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
             }
           } else if (message.type === 'result') {
             const result = message as SDKResultMessage;
-            if ('total_cost_usd' in result) {
-              logger.info({
-                job: jobName,
-                cost_usd: result.total_cost_usd,
-                num_turns: result.num_turns,
-                duration_ms: result.duration_ms,
-              }, 'Cron job query completed');
-            }
             // Detect budget exceeded — treat as permanent error so cron doesn't retry
             if (result.is_error && 'result' in result) {
               const exitText = String((result as any).result ?? '');
@@ -2456,23 +2428,9 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
                 throw new Error(`Budget exceeded for cron job '${jobName}'`);
               }
             }
-            if (this.memoryStore && result.modelUsage) {
-              try {
-                this.memoryStore.logUsage({
-                  sessionKey: `cron:${jobName}`,
-                  source: 'cron',
-                  modelUsage: result.modelUsage,
-                  numTurns: result.num_turns,
-                  durationMs: result.duration_ms,
-                });
-              } catch { /* non-fatal */ }
-            }
+            this.logQueryResult(result, 'cron', `cron:${jobName}`, jobName);
           } else if (message.type === 'system') {
-            const sysMsg = message as any;
-            if (sysMsg.subtype === 'init' && sysMsg.mcp_servers) {
-              this._lastMcpStatus = sysMsg.mcp_servers;
-              this._lastMcpStatusTime = new Date().toISOString();
-            }
+            this.captureMcpStatus(message);
           } else if (message.type === 'stream_event') {
             // Streaming tokens — no action needed
           }
@@ -2791,15 +2749,7 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
           } else if (message.type === 'result') {
             const result = message as SDKResultMessage;
             phaseSessionId = result.session_id;
-            if ('total_cost_usd' in result) {
-              logger.info({
-                job: jobName,
-                phase,
-                cost_usd: result.total_cost_usd,
-                num_turns: result.num_turns,
-                duration_ms: result.duration_ms,
-              }, 'Unleashed phase completed');
-            }
+            this.logQueryResult(result, 'unleashed', `unleashed:${jobName}`, jobName);
             // Detect budget exceeded
             if (result.is_error && 'result' in result) {
               const exitText = String((result as any).result ?? '');
@@ -2807,17 +2757,6 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
                 logger.warn({ job: jobName, phase }, 'Unleashed phase hit budget cap');
                 appendProgress({ event: 'budget_exceeded', phase });
               }
-            }
-            if (this.memoryStore && result.modelUsage) {
-              try {
-                this.memoryStore.logUsage({
-                  sessionKey: `unleashed:${jobName}`,
-                  source: 'unleashed',
-                  modelUsage: result.modelUsage,
-                  numTurns: result.num_turns,
-                  durationMs: result.duration_ms,
-                });
-              } catch { /* non-fatal */ }
             }
           } else if ((message as any).type === 'task_progress') {
             // Agent progress summary from SDK

@@ -8,6 +8,7 @@
 import { existsSync, readFileSync, writeFileSync, unlinkSync, mkdirSync, statSync, renameSync } from 'node:fs';
 import { execSync } from 'node:child_process';
 import path from 'node:path';
+import { z } from 'zod';
 import * as config from './config.js';
 import type { RestartSentinel } from './types.js';
 
@@ -234,7 +235,6 @@ function verifySetup(): string[] {
 // ── Banner ───────────────────────────────────────────────────────────
 
 function printBanner(channels: string[], profiles: number, cronJobs: number, graphEnabled = false): void {
-  const BOLD = '\x1b[1m';
   const DIM = '\x1b[0;90m';
   const GREEN = '\x1b[0;32m';
   const CYAN = '\x1b[0;36m';
@@ -345,12 +345,12 @@ function ensureVaultDirs(): void {
 
 // ── Timer checker ─────────────────────────────────────────────────────
 
-interface TimerEntry {
-  id: string;
-  message: string;
-  fireAt: number;
-  createdAt: number;
-}
+const TimerEntrySchema = z.object({
+  id: z.string(),
+  message: z.string(),
+  fireAt: z.number(),
+  createdAt: z.number(),
+});
 
 const TIMERS_FILE = path.join(config.BASE_DIR, '.timers.json');
 const TIMER_CHECK_INTERVAL = 30_000; // 30 seconds
@@ -362,7 +362,13 @@ function startTimerChecker(
   return setInterval(() => {
     try {
       if (!existsSync(TIMERS_FILE)) return;
-      const timers: TimerEntry[] = JSON.parse(readFileSync(TIMERS_FILE, 'utf-8'));
+      const raw = JSON.parse(readFileSync(TIMERS_FILE, 'utf-8'));
+      const parsed = z.array(TimerEntrySchema).safeParse(raw);
+      if (!parsed.success) {
+        logger.warn({ error: parsed.error.message }, 'Invalid timers file — skipping');
+        return;
+      }
+      const timers = parsed.data;
       if (timers.length === 0) return;
 
       const now = Date.now();
@@ -391,8 +397,8 @@ function startTimerChecker(
           );
         }
       }
-    } catch {
-      // Non-fatal — will retry next interval
+    } catch (err) {
+      logger.warn({ err }, 'Timer checker error — will retry next interval');
     }
   }, TIMER_CHECK_INTERVAL);
 }
@@ -420,8 +426,8 @@ function rotateLogIfNeeded(): void {
 
     renameSync(logFile, `${logFile}.1`);
     writeFileSync(logFile, '');
-  } catch {
-    // Non-fatal — log rotation failure shouldn't prevent startup
+  } catch (err) {
+    logger.warn({ err }, 'Log rotation failed — continuing startup');
   }
 }
 
@@ -434,7 +440,16 @@ const SENTINEL_PATH = path.join(config.BASE_DIR, '.restart-sentinel.json');
 function readAndClearSentinel(): RestartSentinel | null {
   if (!existsSync(SENTINEL_PATH)) return null;
   try {
-    const sentinel = JSON.parse(readFileSync(SENTINEL_PATH, 'utf-8')) as RestartSentinel;
+    const raw = JSON.parse(readFileSync(SENTINEL_PATH, 'utf-8'));
+    const sentinel: RestartSentinel = {
+      previousPid: Number(raw.previousPid) || 0,
+      restartedAt: String(raw.restartedAt ?? ''),
+      reason: raw.reason,
+      sourceChangeId: raw.sourceChangeId,
+      sessionKey: raw.sessionKey,
+      changedFiles: raw.changedFiles,
+      updateDetails: raw.updateDetails,
+    };
     unlinkSync(SENTINEL_PATH);
     return sentinel;
   } catch {
@@ -615,7 +630,7 @@ async function asyncMain(): Promise<void> {
 
   // Deliver pending team messages every 15s (picks up MCP-written messages)
   const teamDeliveryInterval = setInterval(() => {
-    try { gateway.getTeamBus().deliverPending(); } catch { /* non-fatal */ }
+    try { gateway.getTeamBus().deliverPending(); } catch (err) { logger.warn({ err }, 'Team delivery error'); }
   }, 15_000);
 
   // Watch for pending source edits from MCP tools (every 10s)
@@ -627,23 +642,38 @@ async function asyncMain(): Promise<void> {
     try {
       // Check for pending source edits
       if (existsSync(PENDING_SOURCE_SIGNAL)) {
-        const signal = JSON.parse(readFileSync(PENDING_SOURCE_SIGNAL, 'utf-8'));
+        const signalRaw = JSON.parse(readFileSync(PENDING_SOURCE_SIGNAL, 'utf-8'));
+        const signalParsed = z.object({ id: z.string() }).safeParse(signalRaw);
         unlinkSync(PENDING_SOURCE_SIGNAL);
+        if (!signalParsed.success) {
+          logger.warn({ error: signalParsed.error.message }, 'Invalid source-edit signal file');
+        } else {
+          const signal = signalParsed.data;
+          const pendingFile = path.join(PENDING_SOURCE_DIR, `${signal.id}.json`);
+          if (existsSync(pendingFile)) {
+            const pendingRaw = JSON.parse(readFileSync(pendingFile, 'utf-8'));
+            const pendingParsed = z.object({
+              file: z.string(),
+              content: z.string(),
+              reason: z.string(),
+            }).safeParse(pendingRaw);
+            unlinkSync(pendingFile);
 
-        const pendingFile = path.join(PENDING_SOURCE_DIR, `${signal.id}.json`);
-        if (existsSync(pendingFile)) {
-          const pending = JSON.parse(readFileSync(pendingFile, 'utf-8'));
-          unlinkSync(pendingFile);
+            if (!pendingParsed.success) {
+              logger.warn({ error: pendingParsed.error.message }, 'Invalid pending source-edit file');
+            } else {
+              const pending = pendingParsed.data;
+              logger.info({ id: signal.id, file: pending.file }, 'Processing pending source edit from MCP');
+              const { safeSourceEdit } = await import('./agent/safe-restart.js');
+              const result = await safeSourceEdit(config.PKG_DIR, [
+                { relativePath: pending.file, content: pending.content },
+              ], { reason: pending.reason, description: pending.reason });
 
-          logger.info({ id: signal.id, file: pending.file }, 'Processing pending source edit from MCP');
-          const { safeSourceEdit } = await import('./agent/safe-restart.js');
-          const result = await safeSourceEdit(config.PKG_DIR, [
-            { relativePath: pending.file, content: pending.content },
-          ], { reason: pending.reason, description: pending.reason });
-
-          if (!result.success) {
-            logger.error({ error: result.error, preflightErrors: result.preflightErrors }, 'Pending source edit failed');
-            dispatcher.send(`Source edit failed: ${result.error}`).catch(() => {});
+              if (!result.success) {
+                logger.error({ error: result.error, preflightErrors: result.preflightErrors }, 'Pending source edit failed');
+                dispatcher.send(`Source edit failed: ${result.error}`).catch(() => {});
+              }
+            }
           }
         }
       }
@@ -755,7 +785,7 @@ async function asyncMain(): Promise<void> {
   // drops during the drain wait, that handler crashes the process.
   // Closing (and unregistering) before draining prevents this.
   if (graphStore) {
-    try { await graphStore.close(); } catch { /* non-fatal */ }
+    try { await graphStore.close(); } catch (err) { logger.warn({ err }, 'Graph store close error'); }
     graphStore = null;
   }
 

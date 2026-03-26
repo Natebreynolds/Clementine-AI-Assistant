@@ -89,6 +89,10 @@ export const OWNER_NAME = getEnv('OWNER_NAME');
 
 // ── Secrets (with macOS Keychain fallback) ───────────────────────────
 
+export function shellEscape(s: string): string {
+  return `'${s.replace(/'/g, "'\\''")}'`;
+}
+
 function getSecret(envKey: string, keychainService?: string): string {
   const value = env[envKey] ?? '';
   if (value) return value;
@@ -96,7 +100,7 @@ function getSecret(envKey: string, keychainService?: string): string {
   const service = keychainService ?? ASSISTANT_NAME.toLowerCase();
   try {
     const result = execSync(
-      `security find-generic-password -s "${service}" -a "${envKey}" -w`,
+      `security find-generic-password -s ${shellEscape(service)} -a ${shellEscape(envKey)} -w`,
       { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] },
     );
     return result.trim();
