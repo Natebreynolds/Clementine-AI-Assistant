@@ -219,7 +219,6 @@ export async function cmdCronRunDue(): Promise<void> {
   // This runner is a fallback for when the daemon is down.
 
   for (let job of dueJobs) {
-    const timeStr = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
     console.log(`[${new Date().toISOString()}] Running due job: ${job.name}`);
 
     // ── Pre-check gate ──

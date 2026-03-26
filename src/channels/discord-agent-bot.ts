@@ -652,7 +652,7 @@ export class AgentBotClient {
               ];
               await streamer.update(lines.join('\n').slice(0, 1800));
             },
-            async (planSummary, steps) => {
+            async (_planSummary, steps) => {
               const planPreview = `**Plan:** ${task.slice(0, 100)}\n\n` +
                 steps.map((s, i) => `${i + 1}. **${s.id}** — ${s.description.slice(0, 60)}`).join('\n');
               if ('send' in cmd.channel!) {

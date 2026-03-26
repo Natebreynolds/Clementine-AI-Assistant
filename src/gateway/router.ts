@@ -8,9 +8,9 @@
 import path from 'node:path';
 import pino from 'pino';
 import { PersonalAssistant, type ProjectMeta } from '../agent/assistant.js';
-import type { OnTextCallback, OnToolActivityCallback, PlanProgressUpdate, PlanStep, SelfImproveConfig, SelfImproveExperiment, SelfImproveState, SessionProvenance, TeamMessage, VerboseLevel, WorkflowDefinition } from '../types.js';
+import type { OnTextCallback, OnToolActivityCallback, PlanProgressUpdate, PlanStep, SelfImproveConfig, SelfImproveExperiment, SessionProvenance, TeamMessage, VerboseLevel, WorkflowDefinition } from '../types.js';
 import { SelfImproveLoop } from '../agent/self-improve.js';
-import { MODELS, PROFILES_DIR, AGENTS_DIR, TEAM_COMMS_CHANNEL, TEAM_COMMS_LOG } from '../config.js';
+import { MODELS, PROFILES_DIR, AGENTS_DIR, TEAM_COMMS_LOG } from '../config.js';
 import { scanner } from '../security/scanner.js';
 import { lanes } from './lanes.js';
 import { AgentManager } from '../agent/agent-manager.js';
@@ -27,18 +27,36 @@ const CHAT_TIMEOUT_MS = 5 * 60 * 1000;
  *  Safety net so no session runs forever, even if active. */
 const CHAT_MAX_WALL_MS = 30 * 60 * 1000;
 
+export type ChatErrorKind = 'rate_limit' | 'context_overflow' | 'auth' | 'transient' | 'unknown';
+
+export function classifyChatError(err: unknown): ChatErrorKind {
+  const msg = String(err);
+  if (/rate.?limit|\b429\b|too many requests|quota.?exceeded/i.test(msg)) return 'rate_limit';
+  if (/context.?length|token.?limit|maximum.?context|prompt.?too.?long/i.test(msg)) return 'context_overflow';
+  if (/\b401\b|\b403\b|auth|forbidden|invalid.?api.?key|permission/i.test(msg)) return 'auth';
+  if (/timeout|ECONNRESET|ECONNREFUSED|ETIMEDOUT|\b5\d\d\b|overloaded|service.?unavailable/i.test(msg)) return 'transient';
+  return 'unknown';
+}
+
+/** Per-session state consolidated into a single structure. */
+interface SessionState {
+  model?: string;
+  verboseLevel?: VerboseLevel;
+  profile?: string;
+  project?: ProjectMeta;
+  lock?: Promise<void>;
+  abortController?: AbortController;
+  provenance?: SessionProvenance;
+  lastAccessedAt: number;
+}
+
 export class Gateway {
   public readonly assistant: PersonalAssistant;
 
   /** Resolvers for pending approvals. `true` = approved, `false` = denied, `string` = revision feedback. */
   private approvalResolvers = new Map<string, (result: boolean | string) => void>();
   private approvalCounter = 0;
-  private sessionModels = new Map<string, string>();
-  private sessionVerboseLevels = new Map<string, VerboseLevel>();
-  private sessionProfiles = new Map<string, string>();
-  private sessionLocks = new Map<string, Promise<void>>();
-  private sessionAbortControllers = new Map<string, AbortController>();
-  private sessionProvenance = new Map<string, SessionProvenance>();
+  private sessions = new Map<string, SessionState>();
   private auditLog: string[] = [];
   private draining = false;
 
@@ -51,6 +69,18 @@ export class Gateway {
 
   constructor(assistant: PersonalAssistant) {
     this.assistant = assistant;
+  }
+
+  /** Get or create a session state entry. */
+  private getSession(sessionKey: string): SessionState {
+    let s = this.sessions.get(sessionKey);
+    if (!s) {
+      s = { lastAccessedAt: Date.now() };
+      this.sessions.set(sessionKey, s);
+    } else {
+      s.lastAccessedAt = Date.now();
+    }
+    return s;
   }
 
   // ── Team system accessors ──────────────────────────────────────────
@@ -123,25 +153,25 @@ export class Gateway {
    * or privilege escalation).
    */
   setProvenance(sessionKey: string, provenance: SessionProvenance): void {
-    const existing = this.sessionProvenance.get(sessionKey);
-    if (existing) {
+    const s = this.getSession(sessionKey);
+    if (s.provenance) {
       // Lineage fields are immutable — only allow updating mutable fields
-      if (existing.spawnedBy !== provenance.spawnedBy ||
-          existing.spawnDepth !== provenance.spawnDepth ||
-          existing.role !== provenance.role ||
-          existing.controlScope !== provenance.controlScope) {
+      if (s.provenance.spawnedBy !== provenance.spawnedBy ||
+          s.provenance.spawnDepth !== provenance.spawnDepth ||
+          s.provenance.role !== provenance.role ||
+          s.provenance.controlScope !== provenance.controlScope) {
         logger.warn(
-          { sessionKey, existing, attempted: provenance },
+          { sessionKey, existing: s.provenance, attempted: provenance },
           'Attempted to modify immutable provenance fields — denied',
         );
         return;
       }
     }
-    this.sessionProvenance.set(sessionKey, provenance);
+    s.provenance = provenance;
   }
 
   getProvenance(sessionKey: string): SessionProvenance | undefined {
-    return this.sessionProvenance.get(sessionKey);
+    return this.sessions.get(sessionKey)?.provenance;
   }
 
   /**
@@ -149,11 +179,11 @@ export class Gateway {
    * Called automatically on first message if no provenance exists.
    */
   private ensureProvenance(sessionKey: string): SessionProvenance {
-    const existing = this.sessionProvenance.get(sessionKey);
-    if (existing) return existing;
+    const s = this.getSession(sessionKey);
+    if (s.provenance) return s.provenance;
 
     const provenance = Gateway.inferProvenance(sessionKey);
-    this.sessionProvenance.set(sessionKey, provenance);
+    s.provenance = provenance;
     return provenance;
   }
 
@@ -162,10 +192,10 @@ export class Gateway {
    * A session can only control sessions it directly spawned.
    */
   canControl(controllerKey: string, targetKey: string): boolean {
-    const targetProv = this.sessionProvenance.get(targetKey);
+    const targetProv = this.sessions.get(targetKey)?.provenance;
     if (!targetProv) return false; // can't control unknown sessions
 
-    const controllerProv = this.sessionProvenance.get(controllerKey);
+    const controllerProv = this.sessions.get(controllerKey)?.provenance;
     if (!controllerProv) return false;
 
     // Workers (controlScope: 'none') can never control anything
@@ -263,7 +293,7 @@ export class Gateway {
       createdAt: new Date().toISOString(),
     };
 
-    this.sessionProvenance.set(childKey, child);
+    this.getSession(childKey).provenance = child;
     return child;
   }
 
@@ -287,57 +317,57 @@ export class Gateway {
   // ── Session verbose level ──────────────────────────────────────────
 
   setSessionVerboseLevel(sessionKey: string, level: VerboseLevel): void {
-    this.sessionVerboseLevels.set(sessionKey, level);
+    this.getSession(sessionKey).verboseLevel = level;
   }
 
   getSessionVerboseLevel(sessionKey: string): VerboseLevel | undefined {
-    return this.sessionVerboseLevels.get(sessionKey);
+    return this.sessions.get(sessionKey)?.verboseLevel;
   }
 
   // ── Session model overrides ─────────────────────────────────────────
 
   setSessionModel(sessionKey: string, modelId: string): void {
-    this.sessionModels.set(sessionKey, modelId);
+    this.getSession(sessionKey).model = modelId;
   }
 
   getSessionModel(sessionKey: string): string | undefined {
-    return this.sessionModels.get(sessionKey);
+    return this.sessions.get(sessionKey)?.model;
   }
 
   // ── Session project overrides ──────────────────────────────────────
 
-  private sessionProjects = new Map<string, ProjectMeta>();
-
   setSessionProject(sessionKey: string, project: ProjectMeta): void {
-    this.sessionProjects.set(sessionKey, project);
+    this.getSession(sessionKey).project = project;
   }
 
   getSessionProject(sessionKey: string): ProjectMeta | undefined {
-    return this.sessionProjects.get(sessionKey);
+    return this.sessions.get(sessionKey)?.project;
   }
 
   clearSessionProject(sessionKey: string): void {
-    this.sessionProjects.delete(sessionKey);
+    const s = this.sessions.get(sessionKey);
+    if (s) delete s.project;
   }
 
   // ── Session profile overrides ───────────────────────────────────────
 
   setSessionProfile(sessionKey: string, slug: string): void {
-    this.sessionProfiles.set(sessionKey, slug);
+    this.getSession(sessionKey).profile = slug;
   }
 
   getSessionProfile(sessionKey: string): string | undefined {
-    return this.sessionProfiles.get(sessionKey);
+    return this.sessions.get(sessionKey)?.profile;
   }
 
   clearSessionProfile(sessionKey: string): void {
-    this.sessionProfiles.delete(sessionKey);
+    const s = this.sessions.get(sessionKey);
+    if (s) delete s.profile;
   }
 
   // ── Per-session locking ─────────────────────────────────────────────
 
   isSessionBusy(sessionKey: string): boolean {
-    return this.sessionLocks.has(sessionKey);
+    return this.sessions.get(sessionKey)?.lock !== undefined;
   }
 
   /**
@@ -345,7 +375,7 @@ export class Gateway {
    * Returns true if there was an active query to abort.
    */
   stopSession(sessionKey: string): boolean {
-    const ac = this.sessionAbortControllers.get(sessionKey);
+    const ac = this.sessions.get(sessionKey)?.abortController;
     if (ac && !ac.signal.aborted) {
       ac.abort();
       logger.info({ sessionKey }, 'Session stopped by user');
@@ -360,9 +390,11 @@ export class Gateway {
    */
   private async acquireSessionLock(sessionKey: string): Promise<() => void> {
     // Wait for any existing lock to resolve
-    while (this.sessionLocks.has(sessionKey)) {
+    let s = this.getSession(sessionKey);
+    while (s.lock) {
       logger.info(`Session ${sessionKey} is busy — queuing message`);
-      await this.sessionLocks.get(sessionKey);
+      await s.lock;
+      s = this.getSession(sessionKey);
     }
 
     // Create a new lock (a promise + its resolver)
@@ -370,10 +402,11 @@ export class Gateway {
     const lockPromise = new Promise<void>((resolve) => {
       releaseFn = resolve;
     });
-    this.sessionLocks.set(sessionKey, lockPromise);
+    s.lock = lockPromise;
 
     return () => {
-      this.sessionLocks.delete(sessionKey);
+      const current = this.sessions.get(sessionKey);
+      if (current) delete current.lock;
       releaseFn();
     };
   }
@@ -443,11 +476,12 @@ export class Gateway {
         }
 
         // Use per-message override, then session default, then global default
-        const effectiveModel = model ?? this.sessionModels.get(sessionKey);
+        const sess = this.sessions.get(sessionKey);
+        const effectiveModel = model ?? sess?.model;
 
         // Resolve active profile
         let effectiveSessionKey = sessionKey;
-        const profileSlug = this.sessionProfiles.get(sessionKey);
+        const profileSlug = sess?.profile;
         if (profileSlug) {
           effectiveSessionKey = `${sessionKey}:${profileSlug}`;
         }
@@ -456,16 +490,16 @@ export class Gateway {
           : undefined;
 
         // Resolve active project override
-        const projectOverride = this.sessionProjects.get(sessionKey);
+        const projectOverride = sess?.project;
 
         // Resolve verbose level for this session
-        const verboseLevel = this.sessionVerboseLevels.get(sessionKey);
+        const verboseLevel = sess?.verboseLevel;
 
         // Activity-based idle timeout: resets on agent output/tool calls.
         // Only kills if the agent goes silent for CHAT_TIMEOUT_MS.
         // Hard cap at CHAT_MAX_WALL_MS prevents truly runaway sessions.
         const chatAc = new AbortController();
-        this.sessionAbortControllers.set(sessionKey, chatAc);
+        this.getSession(sessionKey).abortController = chatAc;
         const chatStarted = Date.now();
 
         let chatTimer = setTimeout(() => {
@@ -502,7 +536,7 @@ export class Gateway {
           );
 
           clearTimeout(chatTimer);
-          this.sessionAbortControllers.delete(sessionKey);
+          { const cs = this.sessions.get(sessionKey); if (cs) delete cs.abortController; }
 
           // Re-baseline integrity checksums after chat (auto-memory may write to vault)
           scanner.refreshIntegrity();
@@ -531,13 +565,29 @@ export class Gateway {
           return response || '*(no response)*';
         } catch (err) {
           clearTimeout(chatTimer);
-          this.sessionAbortControllers.delete(sessionKey);
+          { const cs = this.sessions.get(sessionKey); if (cs) delete cs.abortController; }
           // If aborted by user (!stop) or our timeout, return a friendly message
           if (chatAc.signal.aborted) {
             return "Stopped. What would you like to do instead?";
           }
-          logger.error({ err, sessionKey }, `Error handling message from ${sessionKey}`);
-          return `Something went wrong: ${err}`;
+
+          const errKind = classifyChatError(err);
+          logger.error({ err, sessionKey, errKind }, `Chat error (${errKind}) from ${sessionKey}`);
+
+          switch (errKind) {
+            case 'rate_limit':
+              return "I'm being rate-limited by the API right now. Please wait a minute and try again.";
+            case 'context_overflow':
+              logger.info({ sessionKey }, 'Context overflow — rotating session');
+              this.assistant.clearSession(effectiveSessionKey);
+              return "That conversation got too long — I've started a fresh session. Please resend your message.";
+            case 'auth':
+              return "There's an authentication issue with my API access. Please check the API key configuration.";
+            case 'transient':
+              return "I hit a temporary connection issue. Please try again in a moment.";
+            default:
+              return `Something went wrong: ${err}`;
+          }
         }
       } finally {
         release();
@@ -830,11 +880,11 @@ export class Gateway {
     maxExchanges: number;
     memoryCount: number;
   } {
-    const modelId = this.sessionModels.get(sessionKey);
-    const modelName = modelId
-      ? Object.entries(MODELS).find(([, v]) => v === modelId)?.[0] ?? 'sonnet'
+    const sess = this.sessions.get(sessionKey);
+    const modelName = sess?.model
+      ? Object.entries(MODELS).find(([, v]) => v === sess.model)?.[0] ?? 'sonnet'
       : 'sonnet';
-    const project = this.sessionProjects.get(sessionKey);
+    const project = sess?.project;
     return {
       model: modelName.charAt(0).toUpperCase() + modelName.slice(1),
       project: project ? path.basename(project.path) : null,
@@ -847,21 +897,37 @@ export class Gateway {
   // ── Session management ──────────────────────────────────────────────
 
   clearSession(sessionKey: string): void {
-    const profileSlug = this.sessionProfiles.get(sessionKey);
-    if (profileSlug) {
-      this.assistant.clearSession(`${sessionKey}:${profileSlug}`);
+    const s = this.sessions.get(sessionKey);
+    if (s?.profile) {
+      this.assistant.clearSession(`${sessionKey}:${s.profile}`);
     }
     this.assistant.clearSession(sessionKey);
-    this.sessionProfiles.delete(sessionKey);
-    this.sessionProjects.delete(sessionKey);
-    this.sessionVerboseLevels.delete(sessionKey);
-    this.sessionLocks.delete(sessionKey);
-    this.sessionProvenance.delete(sessionKey);
+    this.sessions.delete(sessionKey);
+  }
+
+  /** Evict stale session entries (no activity in 48h, no active lock). */
+  evictStaleSessions(): number {
+    const cutoff = Date.now() - 48 * 60 * 60 * 1000;
+    let evicted = 0;
+    for (const [key, s] of this.sessions) {
+      if (s.lastAccessedAt < cutoff && !s.lock && !s.abortController) {
+        this.clearSession(key);
+        evicted++;
+      }
+    }
+    if (evicted > 0) {
+      logger.info({ evicted, remaining: this.sessions.size }, 'Evicted stale sessions');
+    }
+    return evicted;
   }
 
   /** Get all active session provenance entries (for dashboard/monitoring). */
   getAllProvenance(): Map<string, SessionProvenance> {
-    return new Map(this.sessionProvenance);
+    const result = new Map<string, SessionProvenance>();
+    for (const [key, s] of this.sessions) {
+      if (s.provenance) result.set(key, s.provenance);
+    }
+    return result;
   }
 
   // ── Self-Improvement ─────────────────────────────────────────────────

@@ -458,7 +458,7 @@ export class PlanOrchestrator {
     // Build a step results summary for the verifier
     const stepSummary = [...this.stepStatuses.entries()]
       .filter(([id]) => id !== '__synthesis__')
-      .map(([id, s]) => `- ${s.description}: ${s.status}${s.status === 'failed' ? ' FAILED' : ''}`)
+      .map(([_id, s]) => `- ${s.description}: ${s.status}${s.status === 'failed' ? ' FAILED' : ''}`)
       .join('\n');
 
     const reflectionPrompt =

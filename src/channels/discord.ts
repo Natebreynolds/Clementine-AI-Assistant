@@ -30,15 +30,11 @@ import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {
-  sanitizeResponse,
   chunkText,
   sendChunked,
   DiscordStreamingMessage,
   friendlyToolName,
   formatCronEmbed,
-  STREAM_EDIT_INTERVAL,
-  THINKING_INDICATOR,
-  DISCORD_MSG_LIMIT,
 } from './discord-utils.js';
 import type { NotificationContext } from '../types.js';
 import {
@@ -224,14 +220,6 @@ async function sendApprovalButtons(
   const components = [{ type: 1 as const, components: buttons }];
 
   return channel.send({ content: content.slice(0, 2000), components: components as any });
-}
-
-// ── Owner check ───────────────────────────────────────────────────────
-
-function isOwnerDm(message: Message): boolean {
-  if (!message.channel.isDMBased()) return false;
-  if (DISCORD_OWNER_ID && message.author.id !== DISCORD_OWNER_ID) return false;
-  return true;
 }
 
 // ── Tools listing ─────────────────────────────────────────────────────
@@ -476,8 +464,6 @@ export async function startDiscord(
       watchedChannels.delete(id);
     }
   }
-
-  const teamRouter = gateway.getTeamRouter();
 
   const client = new Client({
     intents: [
@@ -1978,7 +1964,6 @@ async function handlePlanCommand(
   await streamer.update('Planning...');
 
   let progressTimer: ReturnType<typeof setInterval> | null = null;
-  let approvalMsg: Message | null = null;
   try {
     const result = await gateway.handlePlan(
       sessionKey,
@@ -2010,7 +1995,7 @@ async function handlePlanCommand(
         }
       },
       // Approval gate — show plan and wait for user confirmation
-      async (planSummary, steps) => {
+      async (_planSummary, steps) => {
         // Show plan preview as a new message (previous streamer may be finalized from a revision round)
         const planPreview = `**Plan:** ${taskDescription.slice(0, 100)}\n\n` +
           steps.map((s, i) => `${i + 1}. **${s.id}** — ${s.description.slice(0, 60)}`).join('\n');
@@ -2020,7 +2005,7 @@ async function handlePlanCommand(
 
         // Send approval buttons
         const requestId = `plan-${Date.now()}`;
-        approvalMsg = await sendApprovalButtons(
+        await sendApprovalButtons(
           channel,
           'Approve this plan?',
           'plan',

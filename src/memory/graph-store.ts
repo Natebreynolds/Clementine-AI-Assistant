@@ -160,7 +160,7 @@ export class GraphStore {
     if (!this.available) return;
     const safeLabel = label.replace(/[^A-Za-z]/g, '');
     const propsStr = Object.entries(props)
-      .map(([k, v]) => `n.${k} = $${k}`)
+      .map(([k, _v]) => `n.${k} = $${k}`)
       .join(', ');
     const params: Record<string, any> = { id, ...props };
     const cypher = `MERGE (n:${safeLabel} {id: $id}) SET ${propsStr || 'n.id = $id'}`;
@@ -201,7 +201,7 @@ export class GraphStore {
     const toLabel = to.label.replace(/[^A-Za-z]/g, '');
     const relType = type.replace(/[^A-Za-z_]/g, '');
     const propsStr = props
-      ? ', ' + Object.entries(props).map(([k, v]) => `r.${k} = $r_${k}`).join(', ')
+      ? ', ' + Object.entries(props).map(([k, _v]) => `r.${k} = $r_${k}`).join(', ')
       : '';
     const params: Record<string, any> = { fromId: from.id, toId: to.id };
     if (props) {
@@ -523,7 +523,7 @@ export class GraphStore {
 
   // ── Graph-enhanced Context Enrichment ────────────────────────────────
 
-  async enrichWithGraphContext(entityIds: string[], maxHops: number = 1): Promise<string> {
+  async enrichWithGraphContext(entityIds: string[], _maxHops: number = 1): Promise<string> {
     if (!this.available || entityIds.length === 0) return '';
     const lines: string[] = [];
     const seen = new Set<string>();

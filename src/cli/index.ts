@@ -461,7 +461,7 @@ function cmdDoctor(): void {
 
   // FalkorDB graph engine — module binaries
   try {
-    const result = execSync(
+    execSync(
       `node -e "const{BinaryManager}=require('falkordblite/dist/binary-manager.js');new BinaryManager().ensureBinaries().then(p=>{console.log(JSON.stringify(p));process.exit(0)}).catch(e=>{console.error(e.message);process.exit(1)})"`,
       { cwd: PACKAGE_ROOT, stdio: 'pipe', timeout: 30000 },
     );
@@ -495,7 +495,7 @@ function cmdDoctor(): void {
     ['00-System/AGENTS.md', 'AGENTS.md'],
   ] as const;
 
-  for (const [filePath, label] of requiredVaultFiles) {
+  for (const [filePath, _label] of requiredVaultFiles) {
     if (existsSync(path.join(vaultDir, filePath))) {
       console.log(`  ${GREEN}OK${RESET}  vault/${filePath}`);
     } else {

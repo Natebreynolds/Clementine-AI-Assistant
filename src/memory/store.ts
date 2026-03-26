@@ -15,7 +15,6 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, statSync } from 'node
 import path from 'node:path';
 import Database from 'better-sqlite3';
 import type {
-  Chunk,
   Feedback,
   MemoryExtraction,
   SearchResult,
@@ -34,6 +33,11 @@ export class MemoryStore {
   private dbPath: string;
   private vaultDir: string;
   private db: Database.Database | null = null;
+
+  // Cached prepared statements for hot-path queries
+  private _stmtChunkCount: Database.Statement | null = null;
+  private _stmtInsertTranscript: Database.Statement | null = null;
+  private _stmtInsertUsage: Database.Statement | null = null;
 
   constructor(dbPath: string, vaultDir: string) {
     this.dbPath = dbPath;
@@ -263,9 +267,10 @@ export class MemoryStore {
   /** Return the total number of indexed chunks. */
   getChunkCount(): number {
     try {
-      const row = this.conn
-        .prepare('SELECT COUNT(*) as cnt FROM chunks')
-        .get() as { cnt: number } | undefined;
+      if (!this._stmtChunkCount) {
+        this._stmtChunkCount = this.conn.prepare('SELECT COUNT(*) as cnt FROM chunks');
+      }
+      const row = this._stmtChunkCount.get() as { cnt: number } | undefined;
       return row?.cnt ?? 0;
     } catch { return 0; }
   }
@@ -651,11 +656,12 @@ export class MemoryStore {
     content: string,
     model: string = '',
   ): void {
-    this.conn
-      .prepare(
+    if (!this._stmtInsertTranscript) {
+      this._stmtInsertTranscript = this.conn.prepare(
         'INSERT INTO transcripts (session_key, role, content, model) VALUES (?, ?, ?, ?)',
-      )
-      .run(sessionKey, role, content, model);
+      );
+    }
+    this._stmtInsertTranscript.run(sessionKey, role, content, model);
   }
 
   /**
@@ -1413,12 +1419,14 @@ export class MemoryStore {
     numTurns: number;
     durationMs: number;
   }): void {
-    const stmt = this.conn.prepare(
-      `INSERT INTO usage_log (session_key, source, model, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, num_turns, duration_ms)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    );
+    if (!this._stmtInsertUsage) {
+      this._stmtInsertUsage = this.conn.prepare(
+        `INSERT INTO usage_log (session_key, source, model, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, num_turns, duration_ms)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      );
+    }
     for (const [model, usage] of Object.entries(entry.modelUsage)) {
-      stmt.run(
+      this._stmtInsertUsage.run(
         entry.sessionKey,
         entry.source,
         model,

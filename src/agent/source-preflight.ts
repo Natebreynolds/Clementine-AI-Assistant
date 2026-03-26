@@ -10,7 +10,7 @@ import { existsSync, mkdirSync, symlinkSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import pino from 'pino';
 
-import { PKG_DIR, STAGING_DIR } from '../config.js';
+import { STAGING_DIR } from '../config.js';
 
 const logger = pino({ name: 'clementine.source-preflight' });
 
