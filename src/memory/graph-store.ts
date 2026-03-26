@@ -71,10 +71,14 @@ export class GraphStore {
       this.available = true;
       this.ownsServer = true;
 
-      // Catch connection-level errors so they don't crash the process
+      // Catch connection-level errors: log once, disable gracefully
+      let serverErrorLogged = false;
       this.db.on?.('error', (err: Error) => {
-        logger.error({ err }, 'FalkorDB server error — disabling graph features');
-        this.available = false;
+        if (!serverErrorLogged) {
+          serverErrorLogged = true;
+          logger.warn({ err: err.message }, 'FalkorDB server error — disabling graph features');
+          this.available = false;
+        }
       });
 
       // Write socket path so MCP/dashboard/assistant can connect
@@ -117,10 +121,16 @@ export class GraphStore {
       this.available = true;
       this.ownsServer = false;
 
-      // Catch connection-level errors so they don't crash the process
+      // Catch connection-level errors: disable on first error, disconnect to stop retry storm
+      let errorLogged = false;
       this.client.on?.('error', (err: Error) => {
-        logger.error({ err }, 'FalkorDB client connection lost — disabling graph features');
-        this.available = false;
+        if (!errorLogged) {
+          errorLogged = true;
+          logger.warn({ err: err.message }, 'FalkorDB client connection lost — disabling graph features');
+          this.available = false;
+          // Disconnect to stop the auto-reconnect retry loop
+          try { this.client?.disconnect?.(); } catch { /* ignore */ }
+        }
       });
 
       return true;
