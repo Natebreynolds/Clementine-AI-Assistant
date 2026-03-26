@@ -950,7 +950,8 @@ export class Gateway {
             `Pending approvals: ${state.pendingApprovals}`;
         }
         case 'status': {
-          const state = loop.loadState();
+          loop.expireStaleProposals();
+          const state = loop.reconcileState();
           const m = state.baselineMetrics;
           return `**Self-Improvement Status**\n` +
             `Status: ${state.status}\n` +
@@ -970,6 +971,8 @@ export class Gateway {
           ).join('\n');
         }
         case 'pending': {
+          loop.expireStaleProposals();
+          loop.reconcileState();
           const pending = loop.getPendingChanges();
           if (pending.length === 0) return 'No pending proposals.';
           return pending.map(p =>
