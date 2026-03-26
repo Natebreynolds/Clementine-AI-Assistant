@@ -989,6 +989,27 @@ export class Gateway {
           if (!args?.experimentId) return 'Missing experiment ID.';
           return loop.denyChange(args.experimentId);
         }
+        case 'run-agent': {
+          const slug = args?.experimentId; // Reuse experimentId field for agent slug
+          if (!slug) return 'Missing agent slug.';
+          logger.info({ agentSlug: slug }, 'Starting per-agent self-improvement cycle');
+          const agentLoop = new SelfImproveLoop(this.assistant, args?.config);
+          const state = await agentLoop.runForAgent(slug, onProposal);
+          return `Agent self-improvement cycle for ${slug}: ${state.status}. ` +
+            `Iterations: ${state.currentIteration}, ` +
+            `Changes applied: ${state.totalExperiments - state.pendingApprovals}`;
+        }
+        case 'run-nightly': {
+          logger.info('Starting nightly autonomous self-improvement cycle');
+          const nightlyLoop = new SelfImproveLoop(this.assistant, {
+            ...args?.config,
+            autoApply: true,
+          });
+          const state = await nightlyLoop.run(onProposal);
+          return `Nightly self-improvement: ${state.status}. ` +
+            `Iterations: ${state.currentIteration}, ` +
+            `Pending approvals: ${state.pendingApprovals}`;
+        }
         default:
           return `Unknown self-improve action: ${action}`;
       }

@@ -371,6 +371,10 @@ export interface SelfImproveConfig {
   acceptThreshold: number;             // Default: 0.6 (score must beat this)
   plateauLimit: number;                // Default: 3 consecutive low-score stops loop
   areas: ('soul' | 'cron' | 'workflow' | 'memory' | 'agent' | 'source' | 'communication')[];
+  /** Enable tiered auto-apply: low-risk changes apply without approval. Default: false. */
+  autoApply?: boolean;
+  /** Target a specific agent slug (for per-agent improvement cycles). */
+  agentSlug?: string;
 }
 
 // ── Restart Sentinel ────────────────────────────────────────────────

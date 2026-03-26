@@ -57,6 +57,7 @@ const DEFAULT_CONFIG: SelfImproveConfig = {
   acceptThreshold: 0.6,
   plateauLimit: 3,
   areas: ['soul', 'cron', 'workflow', 'memory', 'agent', 'source', 'communication'],
+  autoApply: false,
 };
 
 // ── Paths ────────────────────────────────────────────────────────────
@@ -66,6 +67,29 @@ const STATE_FILE = path.join(SELF_IMPROVE_DIR, 'state.json');
 const PENDING_DIR = path.join(SELF_IMPROVE_DIR, 'pending-changes');
 const APPROVAL_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 const IMPACT_CHECKS_FILE = path.join(SELF_IMPROVE_DIR, 'impact-checks.jsonl');
+
+// ── Risk classification ──────────────────────────────────────────────
+
+/** Risk tiers for self-improvement proposals. */
+type RiskTier = 'low' | 'medium' | 'high';
+
+/** Classify the risk level of a proposed change.
+ * - low: agent prompts, individual cron job prompts — auto-apply safe
+ * - medium: SOUL.md, AGENTS.md, MEMORY.md — needs owner approval
+ * - high: source code — stays blocked
+ */
+function classifyRisk(area: string): RiskTier {
+  switch (area) {
+    case 'agent':     return 'low';    // Agent-scoped, easily reversible
+    case 'cron':      return 'low';    // Cron prompt tweaks, low blast radius
+    case 'workflow':  return 'low';    // Workflow definitions, scoped
+    case 'soul':      return 'medium'; // Core personality — needs approval
+    case 'communication': return 'medium'; // Global operating instructions
+    case 'memory':    return 'medium'; // Memory config
+    case 'source':    return 'high';   // Code changes — always blocked in auto mode
+    default:          return 'high';
+  }
+}
 
 // ── Internal types ───────────────────────────────────────────────────
 
@@ -248,12 +272,53 @@ export class SelfImproveLoop {
           history.push(experiment);
           state.totalExperiments++;
 
-          // Step 6: Gate — save pending change + notify
+          // Step 6: Gate — save pending change + notify (tiered by risk)
           if (accepted) {
-            await this.savePendingChange(experiment, before);
-            state.pendingApprovals++;
-            if (onProposal) {
-              await onProposal(experiment);
+            const risk = classifyRisk(proposal.area);
+
+            if (this.config.autoApply && risk === 'low') {
+              // Low-risk + auto-apply enabled: apply immediately without approval
+              const targetPath = this.resolveTargetPath(proposal.area, proposal.target);
+              if (targetPath) {
+                // Validate before auto-applying
+                const autoValidation = this.validateProposal(proposal.area, proposal.target, proposal.proposedChange);
+                if (autoValidation.valid) {
+                  writeFileSync(targetPath, proposal.proposedChange);
+                  experiment.approvalStatus = 'approved';
+                  this.updateExperimentStatus(id, 'approved');
+                  // Schedule impact check
+                  try {
+                    appendFileSync(IMPACT_CHECKS_FILE, JSON.stringify({
+                      experimentId: id,
+                      area: proposal.area,
+                      target: proposal.target,
+                      appliedAt: new Date().toISOString(),
+                      checkAfterMs: 24 * 60 * 60 * 1000,
+                    }) + '\n');
+                  } catch { /* non-fatal */ }
+                  logger.info({ id, area: proposal.area, target: proposal.target, risk },
+                    'Auto-applied low-risk change');
+                } else {
+                  logger.warn({ id, error: autoValidation.error }, 'Auto-apply blocked by validation');
+                  await this.savePendingChange(experiment, before);
+                  state.pendingApprovals++;
+                }
+              } else {
+                await this.savePendingChange(experiment, before);
+                state.pendingApprovals++;
+              }
+            } else if (this.config.autoApply && risk === 'high') {
+              // High-risk: skip entirely in auto mode (don't even save as pending)
+              logger.info({ id, area: proposal.area, risk }, 'Skipped high-risk proposal in auto mode');
+              experiment.approvalStatus = 'denied';
+              experiment.reason = 'High-risk area blocked in autonomous mode';
+            } else {
+              // Medium-risk or manual mode: save as pending for approval
+              await this.savePendingChange(experiment, before);
+              state.pendingApprovals++;
+              if (onProposal) {
+                await onProposal(experiment);
+              }
             }
             consecutiveLow = 0;
           } else {
@@ -314,6 +379,25 @@ export class SelfImproveLoop {
     await this.runMemoryCleanup();
 
     return state;
+  }
+
+  // ── Per-agent focused cycle ────────────────────────────────────────
+
+  /** Run a focused self-improvement cycle for a specific agent. */
+  async runForAgent(
+    agentSlug: string,
+    onProposal?: (experiment: SelfImproveExperiment) => Promise<void>,
+  ): Promise<SelfImproveState> {
+    // Override config for agent-focused run
+    this.config = {
+      ...this.config,
+      maxIterations: 5,              // Fewer iterations for focused run
+      maxDurationMs: 600_000,        // 10 min max
+      areas: ['agent', 'cron'],      // Only agent-scoped areas
+      autoApply: true,               // Auto-apply for agent changes
+      agentSlug,
+    };
+    return this.run(onProposal);
   }
 
   // ── Step 1: Gather performance data ──────────────────────────────
@@ -434,12 +518,20 @@ export class SelfImproveLoop {
       }
     } catch { /* non-fatal */ }
 
+    // Filter to target agent if running per-agent cycle
+    let filteredReflections = cronReflections;
+    let filteredErrors = cronErrors;
+    if (this.config.agentSlug) {
+      filteredReflections = cronReflections.filter(r => r.agentSlug === this.config.agentSlug);
+      filteredErrors = cronErrors.filter(e => (e as any).agentSlug === this.config.agentSlug);
+    }
+
     return {
       feedbackStats,
       negativeFeedback,
-      cronErrors: cronErrors.slice(0, 10),
+      cronErrors: filteredErrors.slice(0, 10),
       cronSuccessRate: cronTotal > 0 ? cronOk / cronTotal : 1,
-      cronReflections: cronReflections.slice(-20),
+      cronReflections: filteredReflections.slice(-20),
       goalHealth,
       advisorInsights,
     };
@@ -587,6 +679,13 @@ export class SelfImproveLoop {
 
     const areas = this.config.areas.map(a => `'${a}'`).join(', ');
 
+    const agentFocusText = this.config.agentSlug
+      ? `\n\n## AGENT FOCUS: ${this.config.agentSlug}\nThis is a focused improvement cycle for agent "${this.config.agentSlug}" ONLY.\n` +
+        `- You MUST target area "agent" with target "${this.config.agentSlug}", OR area "cron" targeting a cron job that this agent runs.\n` +
+        `- Do NOT propose changes to SOUL.md, AGENTS.md, source code, or other agents.\n` +
+        `- Focus on improving this agent's personality, instructions, and task execution quality.\n`
+      : '';
+
     const prompt =
       `You are Clementine's self-improvement strategist. Analyze performance data and propose ONE specific improvement.\n\n` +
       `## Recent Performance Data (last 7 days)\n` +
@@ -617,6 +716,7 @@ export class SelfImproveLoop {
       `## Experiment History (avoid repeating failed approaches):\n${historyText}\n\n` +
       (patternAnalysis ? `\n\n${patternAnalysis}\n` : '') +
       diversityConstraint +
+      agentFocusText +
       `## Instructions\n` +
       `- Focus on areas: ${areas}\n` +
       `- Identify the SINGLE highest-impact improvement area\n` +
