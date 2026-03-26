@@ -219,7 +219,7 @@ export async function cmdCronRunDue(): Promise<void> {
   // This runner is a fallback for when the daemon is down.
 
   for (let job of dueJobs) {
-    console.log(`[${new Date().toISOString()}] Running due job: ${job.name}`);
+    console.log(`[${new Date().toLocaleString()}] Running due job: ${job.name}`);
 
     // ── Pre-check gate ──
     if (job.preCheck) {

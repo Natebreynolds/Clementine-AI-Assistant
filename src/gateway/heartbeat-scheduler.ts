@@ -33,7 +33,7 @@ import type { HeartbeatState } from '../types.js';
 import type { CronRunEntry } from '../types.js';
 import type { NotificationDispatcher } from './notifications.js';
 import type { Gateway } from './router.js';
-import { logToDailyNote, CronRunLog } from './cron-scheduler.js';
+import { logToDailyNote, CronRunLog, todayISO } from './cron-scheduler.js';
 
 const logger = pino({ name: 'clementine.heartbeat' });
 
@@ -245,8 +245,8 @@ export class HeartbeatScheduler {
     this.processInbox();
 
     // Nightly self-improvement: run once per day at 2 AM
-    if (hour === 2 && this.lastSelfImproveDate !== new Date().toISOString().slice(0, 10)) {
-      this.lastSelfImproveDate = new Date().toISOString().slice(0, 10);
+    if (hour === 2 && this.lastSelfImproveDate !== todayISO()) {
+      this.lastSelfImproveDate = todayISO();
       logger.info('Triggering nightly self-improvement cycle');
       this.gateway.handleSelfImprove('run-nightly').catch(err => {
         logger.error({ err }, 'Nightly self-improvement failed');
@@ -311,7 +311,7 @@ export class HeartbeatScheduler {
 
   private computeStateFingerprint(): [string, Record<string, number | string>] {
     const details: Record<string, number | string> = {};
-    const todayStr = new Date().toISOString().slice(0, 10);
+    const todayStr = todayISO();
 
     // Count tasks by status from TASKS.md
     if (existsSync(TASKS_FILE)) {
