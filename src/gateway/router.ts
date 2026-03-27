@@ -216,10 +216,28 @@ export class Gateway {
         controlScope: 'children', createdAt: now,
       };
     }
+    if (sessionKey.startsWith('discord:member-dm:')) {
+      // discord:member-dm:{slug}:{userId}
+      return {
+        channel: 'discord', userId: sessionKey.split(':')[3],
+        source: 'member-channel', spawnDepth: 0, role: 'primary',
+        controlScope: 'children', createdAt: now,
+      };
+    }
+    if (sessionKey.startsWith('discord:member:')) {
+      const parts = sessionKey.split(':');
+      // discord:member:{channelId}:{userId} or discord:member:{channelId}:{slug}:{userId}
+      return {
+        channel: 'discord', userId: parts[parts.length - 1],
+        source: 'member-channel', spawnDepth: 0, role: 'primary',
+        controlScope: 'children', createdAt: now,
+      };
+    }
     if (sessionKey.startsWith('discord:channel:')) {
       const parts = sessionKey.split(':');
+      // discord:channel:{channelId}:{userId} or discord:channel:{channelId}:{slug}:{userId}
       return {
-        channel: 'discord', userId: parts[3],
+        channel: 'discord', userId: parts[parts.length - 1],
         source: 'owner-channel', spawnDepth: 0, role: 'primary',
         controlScope: 'children', createdAt: now,
       };

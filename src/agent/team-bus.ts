@@ -109,8 +109,8 @@ export class TeamBus {
   private deriveSlugFromSession(sessionKey: string): string | null {
     const parts = sessionKey.split(':');
 
-    // Discord: "discord:channel:{channelId}:{ownerId}"
-    if (this.botManager && parts[0] === 'discord' && parts[1] === 'channel' && parts[2]) {
+    // Discord: "discord:channel:{channelId}:{ownerId}" or "discord:member:{channelId}:{userId}"
+    if (this.botManager && parts[0] === 'discord' && (parts[1] === 'channel' || parts[1] === 'member') && parts[2]) {
       return this.botManager.getAgentForChannel(parts[2]) ?? null;
     }
 

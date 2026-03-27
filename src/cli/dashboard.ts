@@ -2412,6 +2412,7 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
         channelName: a.team?.channelName ?? '',
         canMessage: a.team?.canMessage ?? [],
         allowedTools: a.team?.allowedTools ?? null,
+        allowedUsers: a.team?.allowedUsers ?? null,
         model: a.model,
         project: a.project ?? null,
         agentDir: a.agentDir ?? null,
@@ -2467,6 +2468,7 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
           respondToAll: a.team?.respondToAll ?? false,
           canMessage: a.team?.canMessage ?? [],
           allowedTools: a.team?.allowedTools ?? null,
+          allowedUsers: a.team?.allowedUsers ?? null,
           project: a.project ?? null,
           agentDir: a.agentDir ?? null,
           hasOwnCron: mgr.hasOwnCron(a.slug),
@@ -2687,6 +2689,7 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
           channelName: a.team?.channelName ?? null,
           canMessage: a.team?.canMessage ?? [],
           allowedTools: a.team?.allowedTools ?? null,
+          allowedUsers: a.team?.allowedUsers ?? null,
           botStatus: botStatuses[a.slug]?.status ?? null,
           botTag: botStatuses[a.slug]?.botTag ?? null,
           botAvatarUrl: botStatuses[a.slug]?.avatarUrl ?? null,
@@ -2715,7 +2718,7 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
     try {
       const gw = await getGateway();
       const mgr = gw.getAgentManager();
-      const { name, description, personality, tier, model, channelName, teamChat, respondToAll, canMessage, allowedTools, project, discordToken, discordChannelId, avatar, slackBotToken, slackAppToken, slackChannelId } = req.body;
+      const { name, description, personality, tier, model, channelName, teamChat, respondToAll, canMessage, allowedTools, allowedUsers, project, discordToken, discordChannelId, avatar, slackBotToken, slackAppToken, slackChannelId } = req.body;
       if (!name || !description) {
         res.status(400).json({ error: 'name and description are required' });
         return;
@@ -2729,6 +2732,7 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
         respondToAll: respondToAll ?? undefined,
         canMessage: canMessage || undefined,
         allowedTools: allowedTools || undefined,
+        allowedUsers: allowedUsers || undefined,
         project: project || undefined,
         discordToken: discordToken || undefined,
         discordChannelId: discordChannelId || undefined,
@@ -5872,6 +5876,10 @@ function getDashboardHTML(token: string): string {
               <div style="color:var(--text-muted);font-size:12px">Loading tools...</div>
             </div>
           </div>
+          <div style="margin-bottom:12px">
+            <label style="display:block;color:var(--text-muted);font-size:12px;margin-bottom:4px">Allowed Users <span style="opacity:0.6">(Discord user IDs, comma-separated)</span></label>
+            <input id="agent-allowed-users" style="width:100%;padding:8px;background:var(--bg-input);border:1px solid var(--border);border-radius:6px;color:var(--text-primary)" placeholder="123456789012345678, 987654321098765432">
+          </div>
           <div style="margin-bottom:16px">
             <div style="font-weight:600;font-size:13px;color:var(--text-primary);margin-bottom:8px;border-top:1px solid var(--border);padding-top:12px">Platform Connections</div>
 
@@ -8424,6 +8432,7 @@ async function refreshTeam() {
           if (a.model) badges.push('<span class="badge">' + a.model + '</span>');
           if (a.project) badges.push('<span class="badge" style="background:var(--purple);color:#fff">' + a.project + '</span>');
           if (a.allowedTools) badges.push('<span class="badge" style="background:var(--yellow);color:#000">' + a.allowedTools.length + ' tools</span>');
+          if (a.allowedUsers && a.allowedUsers.length) badges.push('<span class="badge" style="background:var(--blue);color:#fff">' + a.allowedUsers.length + ' user' + (a.allowedUsers.length > 1 ? 's' : '') + '</span>');
           if (a.hasDiscordToken) {
             var discordColor = a.botStatus === 'online' ? 'var(--green)' : 'var(--text-muted)';
             badges.push('<span class="badge" style="background:rgba(88,101,242,0.15);color:' + discordColor + ';font-size:10px">Discord</span>');
@@ -8729,6 +8738,7 @@ async function editAgent(slug) {
     document.getElementById('agent-canmessage').value = (a.canMessage || []).join(', ');
     loadAgentProjectOptions(a.project || '');
     loadAgentToolOptions(a.allowedTools || []);
+    document.getElementById('agent-allowed-users').value = (a.allowedUsers || []).join(', ');
     document.getElementById('agent-discord-token').value = '';
     document.getElementById('agent-discord-channel-id').value = a.discordChannelId || '';
     document.getElementById('agent-token-setup').style.display = 'none';
@@ -8825,6 +8835,9 @@ async function submitAgentForm(e) {
 
   var tools = getSelectedTools();
   if (tools.length) payload.allowedTools = tools;
+
+  var au = document.getElementById('agent-allowed-users').value.trim();
+  payload.allowedUsers = au ? au.split(',').map(function(s) { return s.trim(); }).filter(Boolean) : [];
 
   var discordToken = document.getElementById('agent-discord-token').value.trim();
   if (discordToken) payload.discordToken = discordToken;
