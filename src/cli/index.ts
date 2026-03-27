@@ -372,19 +372,41 @@ function cmdStatus(): void {
   }
 }
 
-function cmdDoctor(): void {
+function cmdDoctor(opts: { fix?: boolean } = {}): void {
   const DIM = '\x1b[0;90m';
   const GREEN = '\x1b[0;32m';
   const RED = '\x1b[0;31m';
   const YELLOW = '\x1b[1;33m';
+  const CYAN = '\x1b[0;36m';
   const RESET = '\x1b[0m';
+  const fix = opts.fix ?? false;
 
   console.log();
   console.log(`  ${DIM}Data home: ${BASE_DIR}${RESET}`);
-  console.log(`  ${DIM}Running health checks...${RESET}`);
+  console.log(`  ${DIM}Running health checks...${fix ? ` (auto-fix enabled)` : ''}${RESET}`);
   console.log();
 
   let issues = 0;
+  let fixed = 0;
+  const isMac = process.platform === 'darwin';
+  const isLinux = process.platform === 'linux';
+  const hasBrew = isMac && (() => { try { execSync('which brew', { stdio: 'pipe' }); return true; } catch { return false; } })();
+  const hasApt = isLinux && (() => { try { execSync('which apt-get', { stdio: 'pipe' }); return true; } catch { return false; } })();
+
+  /** Attempt a fix command, return true on success. */
+  function tryFix(label: string, cmd: string, opts?: { cwd?: string; timeout?: number }): boolean {
+    if (!fix) return false;
+    console.log(`       ${CYAN}Fixing:${RESET} ${cmd}`);
+    try {
+      execSync(cmd, { stdio: 'inherit', timeout: opts?.timeout ?? 120000, cwd: opts?.cwd });
+      console.log(`       ${GREEN}Fixed!${RESET}  ${label}`);
+      fixed++;
+      return true;
+    } catch {
+      console.log(`       ${RED}Fix failed.${RESET} Run manually: ${cmd}`);
+      return false;
+    }
+  }
 
   // Node version (require 20–24 LTS)
   const nodeVersion = process.version;
@@ -406,8 +428,10 @@ function cmdDoctor(): void {
     console.log(`  ${GREEN}OK${RESET}  claude CLI found`);
   } catch {
     console.log(`  ${RED}FAIL${RESET}  claude CLI not found`);
-    console.log(`       Install: npm install -g @anthropic-ai/claude-code`);
-    issues++;
+    if (!tryFix('claude CLI', 'npm install -g @anthropic-ai/claude-code')) {
+      console.log(`       Install: npm install -g @anthropic-ai/claude-code`);
+      issues++;
+    }
   }
 
   // SDK smoke test — verify claude CLI can actually execute
@@ -430,33 +454,53 @@ function cmdDoctor(): void {
     console.log(`  ${GREEN}OK${RESET}  better-sqlite3 native module loads`);
   } catch {
     console.log(`  ${RED}FAIL${RESET}  better-sqlite3 native module broken (Node version mismatch)`);
-    console.log(`       Fix: cd ${PACKAGE_ROOT} && npm rebuild better-sqlite3`);
-    issues++;
+    if (!tryFix('better-sqlite3', 'npm rebuild better-sqlite3', { cwd: PACKAGE_ROOT })) {
+      console.log(`       Fix: cd ${PACKAGE_ROOT} && npm rebuild better-sqlite3`);
+      issues++;
+    }
   }
 
-  // FalkorDB graph engine — system dependencies
+  // FalkorDB graph engine — system dependencies: redis
   try {
     execSync('which redis-server', { stdio: 'pipe' });
     console.log(`  ${GREEN}OK${RESET}  redis-server found`);
   } catch {
     console.log(`  ${RED}FAIL${RESET}  redis-server not found (required for knowledge graph)`);
-    console.log(`       Fix: brew install redis (macOS) or sudo apt install redis-server (Linux)`);
-    issues++;
+    const fixCmd = hasBrew ? 'brew install redis' : hasApt ? 'sudo apt-get install -y redis-server' : null;
+    if (fixCmd && tryFix('redis-server', fixCmd)) {
+      // fixed
+    } else if (!fixCmd && fix) {
+      console.log(`       ${YELLOW}Cannot auto-fix:${RESET} no supported package manager found`);
+      console.log(`       Install redis-server manually`);
+      issues++;
+    } else {
+      console.log(`       Fix: brew install redis (macOS) or sudo apt install redis-server (Linux)`);
+      issues++;
+    }
   }
 
+  // FalkorDB graph engine — system dependencies: libomp
   try {
-    const libompPath = process.platform === 'darwin'
-      ? '/opt/homebrew/opt/libomp/lib/libomp.dylib'
-      : '/usr/lib/libomp.so';
-    if (existsSync(libompPath)) {
-      console.log(`  ${GREEN}OK${RESET}  libomp (OpenMP runtime) found`);
-    } else {
+    const libompPaths = process.platform === 'darwin'
+      ? ['/opt/homebrew/opt/libomp/lib/libomp.dylib', '/usr/local/opt/libomp/lib/libomp.dylib']
+      : ['/usr/lib/libomp.so', '/usr/lib/x86_64-linux-gnu/libomp.so'];
+    if (!libompPaths.some(p => existsSync(p))) {
       throw new Error('not found');
     }
+    console.log(`  ${GREEN}OK${RESET}  libomp (OpenMP runtime) found`);
   } catch {
     console.log(`  ${RED}FAIL${RESET}  libomp (OpenMP runtime) not found (required for knowledge graph)`);
-    console.log(`       Fix: brew install libomp (macOS) or sudo apt install libomp-dev (Linux)`);
-    issues++;
+    const fixCmd = hasBrew ? 'brew install libomp' : hasApt ? 'sudo apt-get install -y libomp-dev' : null;
+    if (fixCmd && tryFix('libomp', fixCmd)) {
+      // fixed
+    } else if (!fixCmd && fix) {
+      console.log(`       ${YELLOW}Cannot auto-fix:${RESET} no supported package manager found`);
+      console.log(`       Install libomp manually`);
+      issues++;
+    } else {
+      console.log(`       Fix: brew install libomp (macOS) or sudo apt install libomp-dev (Linux)`);
+      issues++;
+    }
   }
 
   // FalkorDB graph engine — module binaries
@@ -468,8 +512,10 @@ function cmdDoctor(): void {
     console.log(`  ${GREEN}OK${RESET}  FalkorDB graph engine binaries installed`);
   } catch {
     console.log(`  ${RED}FAIL${RESET}  FalkorDB graph engine binaries not available`);
-    console.log(`       Fix: cd ${PACKAGE_ROOT} && node node_modules/falkordblite/scripts/postinstall.js`);
-    issues++;
+    if (!tryFix('FalkorDB binaries', `node node_modules/falkordblite/scripts/postinstall.js`, { cwd: PACKAGE_ROOT, timeout: 180000 })) {
+      console.log(`       Fix: cd ${PACKAGE_ROOT} && node node_modules/falkordblite/scripts/postinstall.js`);
+      issues++;
+    }
   }
 
   // Data home
@@ -545,10 +591,14 @@ function cmdDoctor(): void {
   }
 
   console.log();
-  if (issues === 0) {
+  if (issues === 0 && fixed === 0) {
     console.log(`  ${GREEN}All checks passed.${RESET}`);
+  } else if (issues === 0 && fixed > 0) {
+    console.log(`  ${GREEN}All issues fixed!${RESET} (${fixed} auto-fixed)`);
+  } else if (fixed > 0) {
+    console.log(`  ${YELLOW}${issues} issue(s) remaining${RESET} (${fixed} auto-fixed)`);
   } else {
-    console.log(`  ${YELLOW}${issues} issue(s) found.${RESET}`);
+    console.log(`  ${YELLOW}${issues} issue(s) found.${RESET}${!fix ? ` Run ${CYAN}clementine doctor --fix${RESET} to auto-install dependencies.` : ''}`);
   }
   console.log();
 }
@@ -790,7 +840,8 @@ program
 program
   .command('doctor')
   .description('Run health checks')
-  .action(cmdDoctor);
+  .option('--fix', 'Auto-install missing dependencies')
+  .action((opts) => cmdDoctor(opts));
 
 program
   .command('tools')
@@ -1298,10 +1349,10 @@ async function cmdUpdate(options: { restart?: boolean; dryRun?: boolean }): Prom
     console.error(`  ${YELLOW}WARN${RESET}  Vault migration failed: ${String(err).slice(0, 150)}`);
   }
 
-  // 11. Doctor check
+  // 11. Doctor check (auto-fix during updates)
   console.log();
   console.log(`  ${S()} Running health check...`);
-  cmdDoctor();
+  cmdDoctor({ fix: true });
 
   // 11. Kill any running dashboard process so it picks up new code on next start
   //     Uses PID file — pgrep pattern can't match because process shows as "node dist/cli/index.js dashboard"
