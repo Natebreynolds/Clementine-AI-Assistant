@@ -398,7 +398,12 @@ function cmdDoctor(opts: { fix?: boolean } = {}): void {
     if (!fix) return false;
     console.log(`       ${CYAN}Fixing:${RESET} ${cmd}`);
     try {
-      execSync(cmd, { stdio: 'inherit', timeout: opts?.timeout ?? 120000, cwd: opts?.cwd });
+      execSync(cmd, {
+        stdio: ['pipe', 'inherit', 'inherit'],  // No stdin — prevent interactive prompts
+        timeout: opts?.timeout ?? 120000,
+        cwd: opts?.cwd,
+        env: { ...process.env, NONINTERACTIVE: '1', HOMEBREW_NO_AUTO_UPDATE: '1' },
+      });
       console.log(`       ${GREEN}Fixed!${RESET}  ${label}`);
       fixed++;
       return true;
