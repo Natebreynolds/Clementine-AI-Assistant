@@ -145,8 +145,10 @@ function resolveModel(model: string | null | undefined): string | null {
 /** Derive interaction source from session key naming convention. */
 function inferInteractionSource(
   sessionKey?: string | null,
-): 'owner-dm' | 'owner-channel' | 'autonomous' {
+): 'owner-dm' | 'owner-channel' | 'member-channel' | 'autonomous' {
   if (!sessionKey) return 'autonomous';
+  // Member sessions: discord:member:{channelId}:{userId} or discord:member-dm:{slug}:{userId}
+  if (sessionKey.startsWith('discord:member')) return 'member-channel';
   // Guild channel sessions: discord:channel:{channelId}:{userId}
   if (sessionKey.startsWith('discord:channel:')) return 'owner-channel';
   // All other named sessions are owner DMs (discord:user:*, slack:*, telegram:*, etc.)
@@ -889,7 +891,7 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
     streaming?: boolean;
     isPlanStep?: boolean;
     isUnleashed?: boolean;
-    sourceOverride?: 'owner-dm' | 'owner-channel' | 'autonomous';
+    sourceOverride?: 'owner-dm' | 'owner-channel' | 'member-channel' | 'autonomous';
     disableAllTools?: boolean;
     verboseLevel?: VerboseLevel;
     abortController?: AbortController;

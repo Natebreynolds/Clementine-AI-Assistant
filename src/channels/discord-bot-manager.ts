@@ -106,6 +106,7 @@ export class BotManager {
         profile,
         channelIds: explicitChannelIds,
         cronScheduler: this.cronScheduler,
+        allowedUsers: profile.team?.allowedUsers,
       },
       this.gateway,
     );

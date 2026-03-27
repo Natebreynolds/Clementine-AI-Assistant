@@ -52,7 +52,7 @@ export interface SessionProvenance {
   /** User ID within the channel (e.g., Discord user ID), or 'system' for autonomous. */
   userId: string;
   /** Interaction source determines trust level. */
-  source: 'owner-dm' | 'owner-channel' | 'autonomous';
+  source: 'owner-dm' | 'owner-channel' | 'member-channel' | 'autonomous';
   /** Parent session key if spawned by another session (e.g., !plan sub-tasks). */
   spawnedBy?: string;
   /** Depth in the spawn hierarchy: 0 = top-level, 1 = sub-task, etc. */
@@ -101,6 +101,7 @@ export interface TeamAgentConfig {
   channels: string[];              // Resolved runtime channel keys (populated by bot on connect)
   canMessage: string[];            // Agent slugs this agent can directly message
   allowedTools?: string[];         // Tool whitelist (omit = all tools)
+  allowedUsers?: string[];         // Discord/Slack user IDs allowed to interact (omit = owner only)
   teamChat?: boolean;              // If true, this is a shared team channel — multiple agents respond when @mentioned
   respondToAll?: boolean;          // If true, agent responds to all messages (not just @mentions) even in team chat
 }

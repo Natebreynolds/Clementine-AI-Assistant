@@ -28,7 +28,7 @@ const auditLog: string[] = [];
  * - 'owner-channel': Verified owner in a guild channel — moderate trust
  * - 'autonomous': Heartbeat/cron — restricted
  */
-let interactionSource: 'owner-dm' | 'owner-channel' | 'autonomous' = 'autonomous';
+let interactionSource: 'owner-dm' | 'owner-channel' | 'member-channel' | 'autonomous' = 'autonomous';
 
 // ── Persistent audit logger ───────────────────────────────────────────
 
@@ -74,11 +74,11 @@ export function setProfileAllowedTools(tools: string[] | null): void {
   activeProfileAllowedTools = tools;
 }
 
-export function setInteractionSource(source: 'owner-dm' | 'owner-channel' | 'autonomous'): void {
+export function setInteractionSource(source: 'owner-dm' | 'owner-channel' | 'member-channel' | 'autonomous'): void {
   interactionSource = source;
 }
 
-export function getInteractionSource(): 'owner-dm' | 'owner-channel' | 'autonomous' {
+export function getInteractionSource(): 'owner-dm' | 'owner-channel' | 'member-channel' | 'autonomous' {
   return interactionSource;
 }
 
@@ -197,7 +197,7 @@ function matchesAny(text: string, patterns: RegExp[]): boolean {
 export async function enforceToolPermissions(
   toolName: string,
   toolInput: Record<string, unknown>,
-  sourceOverride?: 'owner-dm' | 'owner-channel' | 'autonomous',
+  sourceOverride?: 'owner-dm' | 'owner-channel' | 'member-channel' | 'autonomous',
 ): Promise<{ behavior: 'allow' | 'deny'; message?: string }> {
   // ── Heartbeat restrictions ─────────────────────────────────────
   if (heartbeatActive) {

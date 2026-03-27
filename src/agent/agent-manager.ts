@@ -61,6 +61,7 @@ export interface AgentCreateConfig {
   respondToAll?: boolean;          // If true, agent responds to all messages even in team chat
   canMessage?: string[];
   allowedTools?: string[];
+  allowedUsers?: string[];           // Discord/Slack user IDs that can interact with this agent
   project?: string;
   discordToken?: string;           // Dedicated Discord bot token
   discordChannelId?: string;       // Channel ID for bot to listen in
@@ -141,11 +142,16 @@ export class AgentManager {
     const allowedTools = Array.isArray(meta.allowedTools)
       ? meta.allowedTools.map(String).filter(Boolean)
       : undefined;
+    const allowedUsers = Array.isArray(meta.allowedUsers)
+      ? meta.allowedUsers.map(String).filter(Boolean)
+      : typeof meta.allowedUsers === 'string'
+        ? meta.allowedUsers.split(',').map((s: string) => s.trim()).filter(Boolean)
+        : undefined;
 
     if (channelName && (typeof channelName === 'string' || channelName.length > 0)) {
       const teamChat = meta.teamChat === true || meta.teamChat === 'true';
       const respondToAll = meta.respondToAll === true || meta.respondToAll === 'true';
-      team = { channelName, channels: [], canMessage, allowedTools, teamChat, respondToAll: respondToAll || undefined };
+      team = { channelName, channels: [], canMessage, allowedTools, allowedUsers, teamChat, respondToAll: respondToAll || undefined };
     }
 
     // Resolve Discord token — migrate plaintext to Keychain if needed
@@ -292,6 +298,7 @@ export class AgentManager {
     if (config.respondToAll) frontmatter.respondToAll = config.respondToAll;
     if (config.canMessage?.length) frontmatter.canMessage = config.canMessage;
     if (config.allowedTools?.length) frontmatter.allowedTools = config.allowedTools;
+    if (config.allowedUsers?.length) frontmatter.allowedUsers = config.allowedUsers;
     if (config.project) frontmatter.project = config.project;
     if (config.discordToken) {
       storeAgentSecret(slug, 'DISCORD_TOKEN', config.discordToken);
@@ -340,6 +347,7 @@ export class AgentManager {
     if (changes.respondToAll !== undefined) meta.respondToAll = changes.respondToAll;
     if (changes.canMessage !== undefined) meta.canMessage = changes.canMessage;
     if (changes.allowedTools !== undefined) meta.allowedTools = changes.allowedTools;
+    if (changes.allowedUsers !== undefined) meta.allowedUsers = changes.allowedUsers;
     if (changes.project !== undefined) meta.project = changes.project;
     if (changes.discordToken !== undefined) {
       if (changes.discordToken) {

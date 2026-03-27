@@ -87,6 +87,8 @@ export interface AgentBotConfig {
   channelIds?: string[];
   /** CronScheduler for building agent-scoped status embeds. */
   cronScheduler?: CronScheduler;
+  /** Discord user IDs allowed to interact (in addition to owner). Empty = owner only. */
+  allowedUsers?: string[];
 }
 
 export type AgentBotStatus = 'offline' | 'connecting' | 'online' | 'error';
@@ -102,6 +104,28 @@ export class AgentBotClient {
   /** Pinned status embed message (edited in-place on state changes). */
   private statusEmbedMessage: Message | null = null;
   private statusEmbedDebounce: ReturnType<typeof setTimeout> | null = null;
+
+  /** Check if a user is authorized to interact with this agent bot. */
+  private isAuthorized(userId: string): boolean {
+    if (this.config.ownerId && userId === this.config.ownerId) return true;
+    if (this.config.allowedUsers?.includes(userId)) return true;
+    return false;
+  }
+
+  /** Check if a user is the owner (not just an allowed member). */
+  private isOwner(userId: string): boolean {
+    return !!(this.config.ownerId && userId === this.config.ownerId);
+  }
+
+  /** Return the session key prefix for channel sessions based on user role. */
+  private channelPrefix(userId: string): 'discord:channel' | 'discord:member' {
+    return this.isOwner(userId) ? 'discord:channel' : 'discord:member';
+  }
+
+  /** Return the session key prefix for DM sessions based on user role. */
+  private dmPrefix(userId: string): 'discord:agent' | 'discord:member-dm' {
+    return this.isOwner(userId) ? 'discord:agent' : 'discord:member-dm';
+  }
 
   constructor(config: AgentBotConfig, gateway: Gateway) {
     this.config = config;
@@ -566,15 +590,17 @@ export class AgentBotClient {
     if (interaction.isChatInputCommand()) {
       const cmd = interaction as ChatInputCommandInteraction;
 
-      // Owner-only guard
-      if (this.config.ownerId && cmd.user.id !== this.config.ownerId) {
-        await cmd.reply({ content: 'Owner only.', ephemeral: true });
+      // Access control: owner + allowedUsers
+      if (!this.isAuthorized(cmd.user.id)) {
+        await cmd.reply({ content: 'You don\'t have access to this agent.', ephemeral: true });
         return;
       }
 
+      const cmdPrefix = this.channelPrefix(cmd.user.id);
+      const cmdDmPrefix = this.dmPrefix(cmd.user.id);
       const sessionKey = cmd.channel?.isDMBased()
-        ? `discord:agent:${this.config.slug}:${cmd.user.id}`
-        : `discord:channel:${cmd.channelId}:${cmd.user.id}`;
+        ? `${cmdDmPrefix}:${this.config.slug}:${cmd.user.id}`
+        : `${cmdPrefix}:${cmd.channelId}:${cmd.user.id}`;
 
       // Set agent profile for this session
       this.gateway.setSessionProfile(sessionKey, this.config.slug);
@@ -740,9 +766,9 @@ export class AgentBotClient {
       const button = interaction;
       const customId = button.customId;
 
-      // Owner-only guard
-      if (this.config.ownerId && button.user.id !== this.config.ownerId) {
-        await button.reply({ content: 'Owner only.', ephemeral: true });
+      // Access control: owner + allowedUsers
+      if (!this.isAuthorized(button.user.id)) {
+        await button.reply({ content: 'You don\'t have access to this agent.', ephemeral: true });
         return;
       }
 
@@ -891,11 +917,11 @@ export class AgentBotClient {
     // In solo channels: ignore all bot messages (original behavior).
     if (message.author.bot) return;
 
-    // Owner-only check
-    if (this.config.ownerId && message.author.id !== this.config.ownerId) {
-      logger.warn(
+    // Access control: owner + allowedUsers
+    if (!this.isAuthorized(message.author.id)) {
+      logger.debug(
         { slug: this.config.slug, author: message.author.tag },
-        'Ignored message from non-owner',
+        'Ignored message from unauthorized user',
       );
       return;
     }
@@ -940,9 +966,11 @@ export class AgentBotClient {
 
     // !clear command
     if (text === '!clear') {
+      const prefix = this.channelPrefix(message.author.id);
+      const dmPfx = this.dmPrefix(message.author.id);
       const sessionKey = isDm
-        ? `discord:agent:${this.config.slug}:${message.author.id}`
-        : `discord:channel:${message.channelId}:${message.author.id}`;
+        ? `${dmPfx}:${this.config.slug}:${message.author.id}`
+        : `${prefix}:${message.channelId}:${message.author.id}`;
       this.gateway.clearSession(sessionKey);
       await message.reply('Session cleared.');
       return;
@@ -950,11 +978,13 @@ export class AgentBotClient {
 
     // In team chat, use agent-scoped session key so each agent has its own
     // conversation memory in the shared channel
+    const prefix = this.channelPrefix(message.author.id);
+    const dmPfx = this.dmPrefix(message.author.id);
     const sessionKey = isDm
-      ? `discord:agent:${this.config.slug}:${message.author.id}`
+      ? `${dmPfx}:${this.config.slug}:${message.author.id}`
       : isTeamChatChannel
-        ? `discord:channel:${message.channelId}:${this.config.slug}:${message.author.id}`
-        : `discord:channel:${message.channelId}:${message.author.id}`;
+        ? `${prefix}:${message.channelId}:${this.config.slug}:${message.author.id}`
+        : `${prefix}:${message.channelId}:${message.author.id}`;
 
     // Set the agent profile for this session
     this.gateway.setSessionProfile(sessionKey, this.config.slug);
