@@ -1350,9 +1350,19 @@ async function cmdUpdate(options: { restart?: boolean; dryRun?: boolean }): Prom
   }
 
   // 11. Doctor check (auto-fix during updates)
+  // Shell out to the newly built dist/ so the latest doctor code runs, not the old in-memory version.
   console.log();
   console.log(`  ${S()} Running health check...`);
-  cmdDoctor({ fix: true });
+  try {
+    execSync(`node "${path.join(PACKAGE_ROOT, 'dist', 'cli', 'index.js')}" doctor --fix`, {
+      cwd: PACKAGE_ROOT,
+      stdio: 'inherit',
+      timeout: 300000,
+    });
+  } catch {
+    // Doctor exits cleanly even with issues; a throw here means something unexpected.
+    cmdDoctor({ fix: true }); // Fallback to in-memory version
+  }
 
   // 11. Kill any running dashboard process so it picks up new code on next start
   //     Uses PID file — pgrep pattern can't match because process shows as "node dist/cli/index.js dashboard"
