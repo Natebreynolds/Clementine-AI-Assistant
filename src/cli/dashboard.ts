@@ -2483,6 +2483,9 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
           slackChannelId: a.slackChannelId ?? null,
           slackBotStatus: slackBotStatuses[a.slug]?.status ?? null,
           slackBotUserId: slackBotStatuses[a.slug]?.botUserId ?? null,
+          sendPolicy: a.sendPolicy ?? null,
+          agentStatus: a.status ?? 'active',
+          budgetMonthlyCents: a.budgetMonthlyCents ?? 0,
         };
       }));
     } catch (err) {
@@ -2718,7 +2721,7 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
     try {
       const gw = await getGateway();
       const mgr = gw.getAgentManager();
-      const { name, description, personality, tier, model, channelName, teamChat, respondToAll, canMessage, allowedTools, allowedUsers, project, discordToken, discordChannelId, avatar, slackBotToken, slackAppToken, slackChannelId } = req.body;
+      const { name, description, personality, tier, model, channelName, teamChat, respondToAll, canMessage, allowedTools, allowedUsers, project, discordToken, discordChannelId, avatar, slackBotToken, slackAppToken, slackChannelId, sendPolicy, role } = req.body;
       if (!name || !description) {
         res.status(400).json({ error: 'name and description are required' });
         return;
@@ -2740,6 +2743,8 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
         slackBotToken: slackBotToken || undefined,
         slackAppToken: slackAppToken || undefined,
         slackChannelId: slackChannelId || undefined,
+        sendPolicy: sendPolicy || undefined,
+        role: role || undefined,
       });
       res.json({ ok: true, agent: { slug: agent.slug, name: agent.name } });
     } catch (err) {
@@ -2767,6 +2772,376 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
       res.json({ ok: true });
     } catch (err) {
       res.status(400).json({ error: String(err) });
+    }
+  });
+
+  // ── SDR Operational Endpoints ─────────────────────────────────────────
+
+  /** Helper: open a read-only connection to the memory DB for SDR queries. */
+  function withSdrDb<T>(fn: (db: import('better-sqlite3').Database) => T): T | null {
+    if (!existsSync(MEMORY_DB_PATH)) return null;
+    const Database = require('better-sqlite3');
+    const db = new Database(MEMORY_DB_PATH, { readonly: true });
+    try { return fn(db); } catch { return null; } finally { db.close(); }
+  }
+
+  /** Per-agent activity log — merges activities + send_log tables. */
+  app.get('/api/agents/:slug/activity', (req, res) => {
+    const slug = req.params.slug;
+    const limit = Math.min(Number(req.query.limit) || 50, 200);
+    const sinceIso = String(req.query.since || new Date(Date.now() - 24 * 3600000).toISOString());
+    const result = withSdrDb((db) => {
+      const activities = db.prepare(
+        `SELECT a.*, l.name as lead_name, l.email as lead_email FROM activities a
+         LEFT JOIN leads l ON l.id = a.lead_id
+         WHERE a.agent_slug = ? AND a.performed_at >= ?
+         ORDER BY a.performed_at DESC LIMIT ?`
+      ).all(slug, sinceIso, limit);
+      const sends = db.prepare(
+        `SELECT * FROM send_log WHERE agent_slug = ? AND sent_at >= ?
+         ORDER BY sent_at DESC LIMIT ?`
+      ).all(slug, sinceIso, limit);
+      return { activities, sends };
+    });
+    res.json(result ?? { activities: [], sends: [] });
+  });
+
+  /** Per-agent KPI scorecards. */
+  app.get('/api/agents/:slug/kpis', (req, res) => {
+    const slug = req.params.slug;
+    const days = Math.min(Number(req.query.days) || 7, 90);
+    const sinceIso = new Date(Date.now() - days * 86400000).toISOString();
+    const result = withSdrDb((db) => {
+      const q = (sql: string, ...args: unknown[]) => (db.prepare(sql).get(...args) as { cnt: number })?.cnt ?? 0;
+      const emailsSent = q(`SELECT COUNT(*) as cnt FROM activities WHERE agent_slug = ? AND type = 'email_sent' AND performed_at >= ?`, slug, sinceIso);
+      const emailsReceived = q(`SELECT COUNT(*) as cnt FROM activities WHERE agent_slug = ? AND type = 'email_received' AND performed_at >= ?`, slug, sinceIso);
+      const meetingsBooked = q(`SELECT COUNT(*) as cnt FROM activities WHERE agent_slug = ? AND type = 'meeting_booked' AND performed_at >= ?`, slug, sinceIso);
+      const leadsCreated = q(`SELECT COUNT(*) as cnt FROM leads WHERE agent_slug = ? AND created_at >= ?`, slug, sinceIso);
+      const leadsContacted = q(`SELECT COUNT(DISTINCT lead_id) as cnt FROM activities WHERE agent_slug = ? AND type = 'email_sent' AND performed_at >= ?`, slug, sinceIso);
+      const sequencesActive = q(`SELECT COUNT(*) as cnt FROM sequence_enrollments se JOIN leads l ON l.id = se.lead_id WHERE l.agent_slug = ? AND se.status = 'active'`, slug);
+      const sequencesCompleted = q(`SELECT COUNT(*) as cnt FROM sequence_enrollments se JOIN leads l ON l.id = se.lead_id WHERE l.agent_slug = ? AND se.status = 'completed' AND se.updated_at >= ?`, slug, sinceIso);
+      const replyRate = emailsSent > 0 ? Math.round((emailsReceived / emailsSent) * 1000) / 10 : 0;
+
+      // Today's numbers for the desk card strip
+      const todayIso = new Date().toISOString().slice(0, 10);
+      const emailsSentToday = q(`SELECT COUNT(*) as cnt FROM activities WHERE agent_slug = ? AND type = 'email_sent' AND performed_at >= ?`, slug, todayIso);
+      const repliesReceivedToday = q(`SELECT COUNT(*) as cnt FROM activities WHERE agent_slug = ? AND type = 'email_received' AND performed_at >= ?`, slug, todayIso);
+      const meetingsToday = q(`SELECT COUNT(*) as cnt FROM activities WHERE agent_slug = ? AND type = 'meeting_booked' AND performed_at >= ?`, slug, todayIso);
+
+      return {
+        period: { days, since: sinceIso },
+        emailsSent, emailsReceived, replyRate, meetingsBooked,
+        leadsCreated, leadsContacted, sequencesActive, sequencesCompleted,
+        today: { emailsSent: emailsSentToday, replies: repliesReceivedToday, meetings: meetingsToday },
+      };
+    });
+    res.json(result ?? { period: { days, since: sinceIso }, emailsSent: 0, emailsReceived: 0, replyRate: 0, meetingsBooked: 0, leadsCreated: 0, leadsContacted: 0, sequencesActive: 0, sequencesCompleted: 0, today: { emailsSent: 0, replies: 0, meetings: 0 } });
+  });
+
+  /** Approval queue — list pending / all. */
+  app.get('/api/approvals', (req, res) => {
+    const status = String(req.query.status || 'pending');
+    const slug = req.query.agent ? String(req.query.agent) : undefined;
+    const result = withSdrDb((db) => {
+      const where = ['status = ?'];
+      const vals: unknown[] = [status];
+      if (slug) { where.push('agent_slug = ?'); vals.push(slug); }
+      return db.prepare(`SELECT * FROM approval_queue WHERE ${where.join(' AND ')} ORDER BY requested_at DESC LIMIT 100`).all(...vals);
+    });
+    res.json(result ?? []);
+  });
+
+  /** Approve or reject a pending approval. */
+  app.post('/api/approvals/:id/:action', async (req, res) => {
+    const id = Number(req.params.id);
+    const action = req.params.action as 'approve' | 'reject';
+    if (!['approve', 'reject'].includes(action)) {
+      return res.status(400).json({ error: 'Action must be "approve" or "reject"' });
+    }
+    if (!existsSync(MEMORY_DB_PATH)) return res.status(500).json({ error: 'Database not found' });
+    try {
+      const Database = require('better-sqlite3');
+      const db = new Database(MEMORY_DB_PATH);
+      const approval = db.prepare('SELECT * FROM approval_queue WHERE id = ?').get(id) as Record<string, unknown> | undefined;
+      if (!approval) { db.close(); return res.status(404).json({ error: 'Approval not found' }); }
+      if (approval.status !== 'pending') { db.close(); return res.status(400).json({ error: 'Already resolved' }); }
+      db.prepare(`UPDATE approval_queue SET status = ?, resolved_at = datetime('now'), resolved_by = 'dashboard' WHERE id = ?`)
+        .run(action === 'approve' ? 'approved' : 'rejected', id);
+
+      // Execute the approved action
+      let executionResult: string | null = null;
+      if (action === 'approve' && approval.action_type === 'email_send') {
+        try {
+          const detail = JSON.parse(String(approval.detail || '{}'));
+          if (detail.to && detail.subject && detail.body) {
+            // Get Graph API token and send the email
+            const env = parseEnvFile();
+            const tenantId = env['MS_TENANT_ID'] ?? '';
+            const clientId = env['MS_CLIENT_ID'] ?? '';
+            const clientSecret = env['MS_CLIENT_SECRET'] ?? '';
+            const userEmail = env['MS_USER_EMAIL'] ?? '';
+            if (tenantId && clientId && clientSecret && userEmail) {
+              const tokenRes = await fetch(`https://login.microsoftonline.com/${tenantId}/oauth2/v2.0/token`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                body: new URLSearchParams({
+                  client_id: clientId, client_secret: clientSecret,
+                  scope: 'https://graph.microsoft.com/.default', grant_type: 'client_credentials',
+                }),
+              });
+              const tokenData = await tokenRes.json() as { access_token?: string };
+              if (tokenData.access_token) {
+                const message: any = {
+                  subject: detail.subject,
+                  body: { contentType: 'Text', content: detail.body },
+                  toRecipients: [{ emailAddress: { address: detail.to } }],
+                };
+                if (detail.cc) message.ccRecipients = [{ emailAddress: { address: detail.cc } }];
+                await fetch(`https://graph.microsoft.com/v1.0/users/${userEmail}/sendMail`, {
+                  method: 'POST',
+                  headers: { Authorization: `Bearer ${tokenData.access_token}`, 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ message, saveToSentItems: true }),
+                });
+                executionResult = `Email sent to ${detail.to}`;
+                // Log the send
+                db.prepare(`INSERT INTO send_log (agent_slug, recipient, subject, policy_ref) VALUES (?, ?, ?, 'approval')`)
+                  .run(approval.agent_slug, detail.to, detail.subject);
+                db.prepare(`INSERT INTO activities (lead_id, agent_slug, type, subject, detail) VALUES (?, ?, 'email_sent', ?, 'Sent via approval queue')`)
+                  .run(detail.leadId ?? null, approval.agent_slug, detail.subject);
+              }
+            }
+          }
+        } catch (execErr) {
+          executionResult = `Approved but execution failed: ${String(execErr)}`;
+        }
+      }
+
+      db.close();
+      res.json({ ok: true, status: action === 'approve' ? 'approved' : 'rejected', executionResult });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  /** Per-agent transcript list. */
+  app.get('/api/agents/:slug/transcripts', (req, res) => {
+    const slug = req.params.slug;
+    const limit = Math.min(Number(req.query.limit) || 20, 100);
+    const result = withSdrDb((db) => {
+      // Find sessions associated with this agent by matching session key patterns
+      // Agent sessions use keys like: discord:channel:{id}:{userId} or cron:{jobName}
+      return db.prepare(
+        `SELECT session_key, COUNT(*) as turns, MIN(created_at) as started_at, MAX(created_at) as last_at,
+                GROUP_CONCAT(CASE WHEN role='user' THEN substr(content, 1, 100) END) as user_preview
+         FROM transcripts
+         WHERE session_key LIKE ? OR session_key LIKE ?
+         GROUP BY session_key
+         ORDER BY last_at DESC LIMIT ?`
+      ).all(`%${slug}%`, `cron:${slug}%`, limit);
+    });
+    res.json(result ?? []);
+  });
+
+  /** Agent health indicators. */
+  app.get('/api/agents/:slug/health', (req, res) => {
+    const slug = req.params.slug;
+    const cronRunsDir = path.join(BASE_DIR, 'cron', 'runs');
+    let cronHealth = 'healthy';
+    let activityHealth = 'healthy';
+
+    // Check cron health — look for recent failures
+    if (existsSync(cronRunsDir)) {
+      try {
+        const files = readdirSync(cronRunsDir).filter(f => f.endsWith('.jsonl'));
+        let recentErrors = 0;
+        let totalRecent = 0;
+        for (const file of files) {
+          const lines = readFileSync(path.join(cronRunsDir, file), 'utf-8').trim().split('\n').filter(Boolean);
+          const recent = lines.slice(-5).map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+          for (const run of recent) {
+            if (run.jobName?.includes(slug) || slug === 'all') {
+              totalRecent++;
+              if (run.status === 'error') recentErrors++;
+            }
+          }
+        }
+        if (recentErrors >= 3) cronHealth = 'critical';
+        else if (recentErrors >= 1) cronHealth = 'warning';
+      } catch { /* ignore */ }
+    }
+
+    // Check activity health — any emails sent in last 24h if sequences are active?
+    const activityResult = withSdrDb((db) => {
+      const activeSeqs = (db.prepare(
+        `SELECT COUNT(*) as cnt FROM sequence_enrollments se JOIN leads l ON l.id = se.lead_id WHERE l.agent_slug = ? AND se.status = 'active'`
+      ).get(slug) as { cnt: number })?.cnt ?? 0;
+      const recentSends = (db.prepare(
+        `SELECT COUNT(*) as cnt FROM send_log WHERE agent_slug = ? AND sent_at >= datetime('now', '-24 hours')`
+      ).get(slug) as { cnt: number })?.cnt ?? 0;
+      return { activeSeqs, recentSends };
+    });
+    if (activityResult && activityResult.activeSeqs > 0 && activityResult.recentSends === 0) {
+      activityHealth = 'warning';
+    }
+
+    const overall = cronHealth === 'critical' || activityHealth === 'critical' ? 'critical'
+      : cronHealth === 'warning' || activityHealth === 'warning' ? 'warning' : 'healthy';
+
+    res.json({ overall, cronHealth, activityHealth });
+  });
+
+  /** Pipeline breakdown for an agent (lead status counts). */
+  app.get('/api/agents/:slug/pipeline', (req, res) => {
+    const slug = req.params.slug;
+    const result = withSdrDb((db) => {
+      return db.prepare(
+        `SELECT status, COUNT(*) as count FROM leads WHERE agent_slug = ? GROUP BY status ORDER BY
+         CASE status
+           WHEN 'new' THEN 1 WHEN 'contacted' THEN 2 WHEN 'replied' THEN 3
+           WHEN 'qualified' THEN 4 WHEN 'meeting_booked' THEN 5 WHEN 'won' THEN 6
+           WHEN 'lost' THEN 7 WHEN 'opted_out' THEN 8 ELSE 9 END`
+      ).all(slug);
+    });
+    res.json(result ?? []);
+  });
+
+  /** Agent status control — pause, resume, terminate. */
+  app.post('/api/agents/:slug/status', async (req, res) => {
+    const { status } = req.body;
+    if (!['active', 'paused', 'error', 'terminated'].includes(status)) {
+      return res.status(400).json({ error: 'Status must be active, paused, error, or terminated' });
+    }
+    try {
+      const gw = await getGateway();
+      const mgr = gw.getAgentManager();
+      mgr.setStatus(req.params.slug, status);
+      res.json({ ok: true, status });
+    } catch (err) {
+      res.status(400).json({ error: String(err) });
+    }
+  });
+
+  /** Agent budget + spend info. */
+  app.get('/api/agents/:slug/budget', (req, res) => {
+    const slug = req.params.slug;
+    const result = withSdrDb((db) => {
+      try {
+        const row = db.prepare(
+          `SELECT COALESCE(SUM(input_tokens), 0) as inp, COALESCE(SUM(output_tokens), 0) as out
+           FROM usage_log WHERE session_key LIKE ? AND created_at >= date('now', 'start of month')`
+        ).get(`%${slug}%`) as { inp: number; out: number };
+        const inputCents = (row.inp / 1000) * 0.3;
+        const outputCents = (row.out / 1000) * 1.5;
+        return { spentCents: Math.round(inputCents + outputCents), inputTokens: row.inp, outputTokens: row.out };
+      } catch { return { spentCents: 0, inputTokens: 0, outputTokens: 0 }; }
+    });
+    res.json(result ?? { spentCents: 0, inputTokens: 0, outputTokens: 0 });
+  });
+
+  /** Config revision history for an agent. */
+  app.get('/api/agents/:slug/revisions', (req, res) => {
+    const slug = req.params.slug;
+    const fileName = req.query.file ? String(req.query.file) : undefined;
+    const result = withSdrDb((db) => {
+      try {
+        if (fileName) {
+          return db.prepare(
+            `SELECT id, agent_slug, file_name, length(content) as size_bytes, changed_by, created_at
+             FROM config_revisions WHERE agent_slug = ? AND file_name = ? ORDER BY created_at DESC LIMIT 20`
+          ).all(slug, fileName);
+        }
+        return db.prepare(
+          `SELECT id, agent_slug, file_name, length(content) as size_bytes, changed_by, created_at
+           FROM config_revisions WHERE agent_slug = ? ORDER BY created_at DESC LIMIT 20`
+        ).all(slug);
+      } catch { return []; }
+    });
+    res.json(result ?? []);
+  });
+
+  /** Restore a config revision. */
+  app.post('/api/agents/:slug/revisions/:id/restore', async (req, res) => {
+    const revId = Number(req.params.id);
+    if (!existsSync(MEMORY_DB_PATH)) return res.status(500).json({ error: 'Database not found' });
+    try {
+      const Database = require('better-sqlite3');
+      const db = new Database(MEMORY_DB_PATH);
+      const rev = db.prepare('SELECT * FROM config_revisions WHERE id = ?').get(revId) as Record<string, unknown> | undefined;
+      if (!rev || rev.agent_slug !== req.params.slug) { db.close(); return res.status(404).json({ error: 'Revision not found' }); }
+
+      // Snapshot current file before restoring
+      const gw = await getGateway();
+      const mgr = gw.getAgentManager();
+      const agentDir = mgr.getAgentDir(req.params.slug);
+      if (!agentDir) { db.close(); return res.status(404).json({ error: 'Agent directory not found' }); }
+
+      const filePath = path.join(agentDir, String(rev.file_name));
+      if (existsSync(filePath)) {
+        const currentContent = readFileSync(filePath, 'utf-8');
+        db.prepare(`INSERT INTO config_revisions (agent_slug, file_name, content, changed_by) VALUES (?, ?, ?, 'pre-restore')`)
+          .run(rev.agent_slug, rev.file_name, currentContent);
+      }
+
+      // Restore the revision
+      const { mkdirSync, writeFileSync } = require('node:fs');
+      mkdirSync(path.dirname(filePath), { recursive: true });
+      writeFileSync(filePath, String(rev.content));
+      db.close();
+
+      // Invalidate agent cache
+      mgr.get(req.params.slug); // triggers refresh on next access
+      (mgr as any).cacheTime = 0;
+
+      res.json({ ok: true, restored: rev.file_name, revisionId: revId });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  /** Bulk lead import — accepts CSV data, creates leads, optionally enrolls in sequence. */
+  app.post('/api/leads/import', async (req, res) => {
+    const { data, agentSlug, source, sequenceName } = req.body;
+    if (!data || !agentSlug) return res.status(400).json({ error: 'data and agentSlug are required' });
+    if (!existsSync(MEMORY_DB_PATH)) return res.status(500).json({ error: 'Database not found' });
+
+    try {
+      const Database = require('better-sqlite3');
+      const db = new Database(MEMORY_DB_PATH);
+
+      const lines = String(data).trim().split('\n').filter(Boolean);
+      const firstLine = lines[0].toLowerCase();
+      const startIdx = (firstLine.includes('name') && firstLine.includes('email')) ? 1 : 0;
+
+      let created = 0, skipped = 0, enrolled = 0;
+      const errors: string[] = [];
+
+      for (let i = startIdx; i < lines.length; i++) {
+        const parts = lines[i].split(',').map((s: string) => s.trim().replace(/^"|"$/g, ''));
+        if (parts.length < 2) { errors.push(`Line ${i + 1}: not enough fields`); continue; }
+        const [name, email, company, title] = parts;
+        if (!name || !email || !email.includes('@')) { errors.push(`Line ${i + 1}: invalid`); continue; }
+
+        const existing = db.prepare('SELECT id FROM leads WHERE email = ?').get(email);
+        if (existing) { skipped++; continue; }
+
+        const result = db.prepare(
+          `INSERT INTO leads (agent_slug, email, name, company, title, status, source) VALUES (?, ?, ?, ?, ?, 'new', ?)`
+        ).run(agentSlug, email, name, company || null, title || null, source || 'import');
+        created++;
+
+        if (sequenceName) {
+          const nextDue = new Date(Date.now() + 60000).toISOString();
+          db.prepare(
+            `INSERT INTO sequence_enrollments (lead_id, sequence_name, current_step, status, next_step_due_at) VALUES (?, ?, 0, 'active', ?)`
+          ).run(Number(result.lastInsertRowid), sequenceName, nextDue);
+          enrolled++;
+        }
+      }
+
+      db.close();
+      res.json({ ok: true, created, skipped, enrolled, errors: errors.slice(0, 20) });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
     }
   });
 
@@ -4647,6 +5022,18 @@ function getDashboardHTML(token: string): string {
     opacity: 0.6;
     filter: grayscale(30%);
   }
+  .desk-station.status-paused .desk-avatar {
+    border-color: var(--yellow);
+    opacity: 0.7;
+    filter: grayscale(20%);
+  }
+  .desk-station.status-paused .desk-surface { opacity: 0.5; }
+  .desk-station.status-terminated .desk-avatar {
+    border-color: var(--red);
+    opacity: 0.4;
+    filter: grayscale(80%);
+  }
+  .desk-station.status-terminated .desk-surface { opacity: 0.3; }
   @keyframes avatarBob {
     0%, 100% { transform: translateY(0); }
     50% { transform: translateY(-3px); }
@@ -4870,6 +5257,54 @@ function getDashboardHTML(token: string): string {
   .desk-stats-strip .dss-val {
     font-weight: 700;
     color: var(--text-primary);
+  }
+
+  /* ── Desk KPI Strip (SDR metrics) ───── */
+  .desk-kpi-strip {
+    display: flex;
+    justify-content: center;
+    gap: 10px;
+    padding: 4px 12px;
+    font-size: 11px;
+    color: var(--text-secondary);
+    min-height: 0;
+  }
+  .desk-kpi-strip:empty { display: none; }
+  .desk-kpi-strip .dss-item {
+    display: flex;
+    align-items: center;
+    gap: 3px;
+    white-space: nowrap;
+  }
+  .desk-kpi-strip .dss-icon { font-size: 12px; opacity: 0.7; }
+  .desk-kpi-strip .dss-val { font-weight: 700; color: var(--accent); }
+
+  /* ── Health Badge ──────────────────── */
+  .desk-health-badge {
+    display: none;
+    position: absolute;
+    top: -2px; right: -2px;
+    width: 18px; height: 18px;
+    border-radius: 50%;
+    font-size: 11px;
+    font-weight: 800;
+    text-align: center;
+    line-height: 18px;
+    color: #fff;
+    z-index: 3;
+  }
+  .desk-health-badge.warning {
+    display: block;
+    background: #f59e0b;
+  }
+  .desk-health-badge.critical {
+    display: block;
+    background: #ef4444;
+    animation: health-pulse 1.5s ease-in-out infinite;
+  }
+  @keyframes health-pulse {
+    0%, 100% { transform: scale(1); }
+    50% { transform: scale(1.15); }
   }
 
   /* ── Desk Cron Details ────────────────── */
@@ -5777,6 +6212,8 @@ function getDashboardHTML(token: string): string {
         <div class="page-title" style="margin-bottom:0">The Office</div>
         <div style="display:flex;gap:8px;align-items:center">
           <button class="btn" onclick="startHiringInterview()" style="background:var(--green);color:#000;font-weight:600">Hire a New Employee</button>
+          <button class="btn btn-sm" onclick="applyRoleTemplate('sdr')" style="color:var(--accent)" title="Pre-filled SDR role template">+ SDR</button>
+          <button class="btn btn-sm" onclick="applyRoleTemplate('researcher')" style="color:var(--text-muted)" title="Pre-filled researcher role template">+ Researcher</button>
           <button class="btn btn-sm" onclick="showAgentCreateModal()" style="color:var(--text-muted)">Manual Setup</button>
         </div>
       </div>
@@ -5865,7 +6302,35 @@ function getDashboardHTML(token: string): string {
                 <option value="1">Tier 1 (Read-only)</option>
               </select>
             </div>
+            <div>
+              <label style="display:block;color:var(--text-muted);font-size:12px;margin-bottom:4px">Monthly Budget <span style="opacity:0.6">(cents, 0 = unlimited)</span></label>
+              <input id="agent-budget" type="number" value="0" min="0" style="width:100%;padding:8px;background:var(--bg-input);border:1px solid var(--border);border-radius:6px;color:var(--text-primary)"
+                placeholder="e.g. 5000 = $50/month">
+            </div>
           </div>
+          <details style="margin-bottom:12px;border:1px solid var(--border);border-radius:6px;padding:8px">
+            <summary style="cursor:pointer;color:var(--text-muted);font-size:12px;font-weight:600">Autonomous Sending Policy <span style="opacity:0.6">(for email-capable agents)</span></summary>
+            <div style="padding:8px 0 0;display:grid;grid-template-columns:1fr 1fr;gap:8px">
+              <div>
+                <label style="display:block;color:var(--text-muted);font-size:11px;margin-bottom:3px">Max Emails / Day</label>
+                <input id="agent-send-max-daily" type="number" value="50" min="0" max="500" style="width:100%;padding:6px;background:var(--bg-input);border:1px solid var(--border);border-radius:4px;color:var(--text-primary);font-size:12px">
+              </div>
+              <div>
+                <label style="display:block;color:var(--text-muted);font-size:11px;margin-bottom:3px">Approval Mode</label>
+                <select id="agent-send-approval" style="width:100%;padding:6px;background:var(--bg-input);border:1px solid var(--border);border-radius:4px;color:var(--text-primary);font-size:12px">
+                  <option value="">Disabled (no autonomous sending)</option>
+                  <option value="none">None (fully autonomous)</option>
+                  <option value="first-in-sequence">First in sequence (approve first email per lead)</option>
+                  <option value="all">All (approve every send)</option>
+                </select>
+              </div>
+              <div style="grid-column:span 2">
+                <label style="display:flex;align-items:center;gap:6px;color:var(--text-muted);font-size:12px;cursor:pointer">
+                  <input id="agent-send-biz-hours" type="checkbox"> Restrict to business hours (8am–6pm)
+                </label>
+              </div>
+            </div>
+          </details>
           <div style="margin-bottom:12px">
             <label style="display:block;color:var(--text-muted);font-size:12px;margin-bottom:4px">Team Connections (comma-separated slugs)</label>
             <input id="agent-canmessage" style="width:100%;padding:8px;background:var(--bg-input);border:1px solid var(--border);border-radius:6px;color:var(--text-primary)" placeholder="analyst-agent, writer-agent">
@@ -8411,12 +8876,18 @@ async function refreshTeam() {
         var cards = agents.map(function(a) {
           var statusClass = 'status-offline';
           var statusLabel = 'Offline';
-          var anyOnline = a.botStatus === 'online' || a.slackBotStatus === 'online';
-          var anyConnecting = a.botStatus === 'connecting' || a.slackBotStatus === 'connecting';
-          var anyError = a.botStatus === 'error' || a.slackBotStatus === 'error';
-          if (anyOnline) { statusClass = 'status-online'; statusLabel = 'Online'; }
-          else if (anyConnecting) { statusClass = 'status-connecting'; statusLabel = 'Connecting'; }
-          else if (anyError) { statusClass = 'status-error'; statusLabel = 'Error'; }
+          // Agent-level status overrides bot connection status
+          if (a.agentStatus === 'paused') { statusClass = 'status-paused'; statusLabel = 'Paused'; }
+          else if (a.agentStatus === 'terminated') { statusClass = 'status-terminated'; statusLabel = 'Terminated'; }
+          else if (a.agentStatus === 'error') { statusClass = 'status-error'; statusLabel = 'Error'; }
+          else {
+            var anyOnline = a.botStatus === 'online' || a.slackBotStatus === 'online';
+            var anyConnecting = a.botStatus === 'connecting' || a.slackBotStatus === 'connecting';
+            var anyError = a.botStatus === 'error' || a.slackBotStatus === 'error';
+            if (anyOnline) { statusClass = 'status-online'; statusLabel = 'Online'; }
+            else if (anyConnecting) { statusClass = 'status-connecting'; statusLabel = 'Connecting'; }
+            else if (anyError) { statusClass = 'status-error'; statusLabel = 'Error'; }
+          }
 
           var channelDisplay = a.channelName
             ? (Array.isArray(a.channelName) ? a.channelName.map(function(c) { return '#' + c; }).join(', ') : '#' + a.channelName)
@@ -8443,8 +8914,14 @@ async function refreshTeam() {
           }
 
           // Actions
+          var isPaused = a.agentStatus === 'paused';
+          var isTerminated = a.agentStatus === 'terminated';
+          var pauseBtn = isPaused
+            ? '<button class="btn btn-sm" onclick="event.stopPropagation();setAgentStatus(\\'' + a.slug + '\\',\\'active\\')" style="color:var(--green)">Resume</button>'
+            : '<button class="btn btn-sm" onclick="event.stopPropagation();setAgentStatus(\\'' + a.slug + '\\',\\'paused\\')" style="color:var(--yellow)">Pause</button>';
           var actions = a.agentDir
-            ? '<button class="btn btn-sm" onclick="event.stopPropagation();editAgent(\\'' + a.slug + '\\')">Edit</button>' +
+            ? (isTerminated ? '' : pauseBtn) +
+              '<button class="btn btn-sm" onclick="event.stopPropagation();editAgent(\\'' + a.slug + '\\')">Edit</button>' +
               '<button class="btn btn-sm" onclick="event.stopPropagation();deleteAgent(\\'' + a.slug + '\\')" style="color:var(--red)">Let Go</button>'
             : '';
 
@@ -8475,7 +8952,13 @@ async function refreshTeam() {
             '</details>';
           }
 
-          return '<div class="desk-station ' + statusClass + '">' +
+          // SDR KPI strip (fetched async, populated by data attribute)
+          var kpiStrip = '<div class="desk-kpi-strip" id="kpi-' + a.slug + '"></div>';
+
+          // Health indicator placeholder
+          var healthBadge = '<span class="desk-health-badge" id="health-' + a.slug + '"></span>';
+
+          return '<div class="desk-station ' + statusClass + '" data-agent-slug="' + a.slug + '">' +
             '<div class="desk-surface">' +
               '<div class="desk-monitor">' +
                 '<div class="monitor-channel">' + channelDisplay + '</div>' +
@@ -8488,7 +8971,7 @@ async function refreshTeam() {
               '<div class="desk-plant"></div>' +
             '</div>' +
             '<div class="desk-agent">' +
-              '<div class="desk-avatar">' + avatarContent + '</div>' +
+              '<div class="desk-avatar">' + avatarContent + healthBadge + '</div>' +
               '<div class="desk-status"><span class="desk-status-dot"></span> ' + statusLabel + '</div>' +
               '<div class="desk-name">' + a.name + '</div>' +
               '<div class="desk-role">' + (a.description || 'No role assigned') + '</div>' +
@@ -8496,6 +8979,7 @@ async function refreshTeam() {
               (actions ? '<div class="desk-actions">' + actions + '</div>' : '') +
             '</div>' +
             statsStrip +
+            kpiStrip +
             cronDetails +
           '</div>';
         });
@@ -8507,6 +8991,30 @@ async function refreshTeam() {
         );
 
         grid.innerHTML = cards.join('');
+
+        // Async-fetch KPIs and health for each agent
+        agents.forEach(function(a) {
+          // KPI strip
+          apiFetch('/api/agents/' + a.slug + '/kpis?days=1').then(function(kpi) {
+            var el = document.getElementById('kpi-' + a.slug);
+            if (el && kpi && (kpi.today.emailsSent > 0 || kpi.today.replies > 0 || kpi.today.meetings > 0 || kpi.sequencesActive > 0)) {
+              el.innerHTML =
+                '<span class="dss-item" title="Emails sent today"><span class="dss-icon">&#9993;</span> <span class="dss-val">' + kpi.today.emailsSent + '</span></span>' +
+                '<span class="dss-item" title="Replies today"><span class="dss-icon">&#8617;</span> <span class="dss-val">' + kpi.today.replies + '</span></span>' +
+                '<span class="dss-item" title="Meetings booked today"><span class="dss-icon">&#128197;</span> <span class="dss-val">' + kpi.today.meetings + '</span></span>' +
+                '<span class="dss-item" title="Active sequences"><span class="dss-icon">&#9654;</span> <span class="dss-val">' + kpi.sequencesActive + '</span> seq</span>';
+            }
+          }).catch(function() {});
+          // Health badge
+          apiFetch('/api/agents/' + a.slug + '/health').then(function(h) {
+            var el = document.getElementById('health-' + a.slug);
+            if (el && h && h.overall !== 'healthy') {
+              el.className = 'desk-health-badge ' + h.overall;
+              el.title = h.overall === 'critical' ? 'Agent has critical issues' : 'Agent needs attention';
+              el.innerHTML = h.overall === 'critical' ? '!' : '?';
+            }
+          }).catch(function() {});
+        });
       }
     }
 
@@ -8701,7 +9209,38 @@ async function loadDiscordChannels(selectedValues) {
   container.innerHTML = html;
 }
 
+// ── Role Templates ──────────────────────────────────────────────────
+var ROLE_TEMPLATES = {
+  sdr: {
+    description: 'Sales Development Representative — outbound prospecting, email sequences, meeting booking',
+    tier: 2,
+    personality: 'You are an AI Sales Development Representative. Your job is to prospect, send personalized outbound emails, follow up on sequences, handle replies, and book meetings for the sales team.\\n\\nGuidelines:\\n- Always check the suppression list before sending any email\\n- Log every activity (email_sent, email_received, meeting_booked) using the activity_log tool\\n- Use lead_search to check existing leads before creating duplicates\\n- Advance sequences after each step using sequence_advance\\n- When a prospect replies positively, update their status to replied and pause the sequence\\n- Escalate complex objections or pricing questions to the team via Discord',
+    allowedTools: ['outlook_inbox', 'outlook_search', 'outlook_draft', 'outlook_send', 'outlook_read_email', 'outlook_calendar', 'outlook_create_event', 'outlook_find_availability', 'lead_upsert', 'lead_search', 'lead_import', 'sequence_enroll', 'sequence_advance', 'sequence_due', 'activity_log', 'activity_history', 'suppression_check', 'suppression_add', 'approval_queue_add', 'memory_read', 'memory_write', 'memory_search', 'note_create', 'daily_note', 'discord_channel_send', 'web_search'],
+  },
+  researcher: {
+    description: 'Research analyst — web research, data gathering, and report generation',
+    tier: 1,
+    personality: 'You are a research analyst. Your job is to gather information, analyze data, and produce clear, well-sourced reports.',
+    allowedTools: ['memory_read', 'memory_write', 'memory_search', 'memory_recall', 'note_create', 'daily_note', 'web_search', 'rss_fetch', 'vault_stats'],
+  },
+};
+
+var _activeRoleTemplate = null;
+
+function applyRoleTemplate(role) {
+  var tmpl = ROLE_TEMPLATES[role];
+  if (!tmpl) return;
+  _activeRoleTemplate = role;
+  showAgentCreateModal();
+  document.getElementById('agent-description').value = tmpl.description;
+  document.getElementById('agent-tier').value = String(tmpl.tier);
+  document.getElementById('agent-personality').value = tmpl.personality.replace(/\\n/g, '\n');
+  // Pre-select tools after they load
+  setTimeout(function() { loadAgentToolOptions(tmpl.allowedTools); }, 300);
+}
+
 function showAgentCreateModal() {
+  if (!_activeRoleTemplate) _activeRoleTemplate = null; // reset if opened via Manual Setup
   document.getElementById('agent-modal').classList.add('show');
   document.getElementById('agent-modal-title').textContent = 'Hire a New Team Member';
   document.getElementById('agent-submit-btn').textContent = 'Complete Hiring';
@@ -8739,6 +9278,18 @@ async function editAgent(slug) {
     loadAgentProjectOptions(a.project || '');
     loadAgentToolOptions(a.allowedTools || []);
     document.getElementById('agent-allowed-users').value = (a.allowedUsers || []).join(', ');
+    // Budget
+    document.getElementById('agent-budget').value = String(a.budgetMonthlyCents || 0);
+    // Send policy
+    if (a.sendPolicy) {
+      document.getElementById('agent-send-max-daily').value = String(a.sendPolicy.maxDailyEmails || 50);
+      document.getElementById('agent-send-approval').value = a.sendPolicy.requiresApproval || '';
+      document.getElementById('agent-send-biz-hours').checked = a.sendPolicy.businessHoursOnly || false;
+    } else {
+      document.getElementById('agent-send-max-daily').value = '50';
+      document.getElementById('agent-send-approval').value = '';
+      document.getElementById('agent-send-biz-hours').checked = false;
+    }
     document.getElementById('agent-discord-token').value = '';
     document.getElementById('agent-discord-channel-id').value = a.discordChannelId || '';
     document.getElementById('agent-token-setup').style.display = 'none';
@@ -8854,6 +9405,26 @@ async function submitAgentForm(e) {
   var slackChannelId = document.getElementById('agent-slack-channel-id').value.trim();
   if (slackChannelId) payload.slackChannelId = slackChannelId;
 
+  // Send policy
+  var sendApproval = document.getElementById('agent-send-approval').value;
+  if (sendApproval) {
+    payload.sendPolicy = {
+      maxDailyEmails: parseInt(document.getElementById('agent-send-max-daily').value) || 50,
+      requiresApproval: sendApproval,
+      businessHoursOnly: document.getElementById('agent-send-biz-hours').checked,
+    };
+  }
+
+  // Budget
+  var budgetVal = parseInt(document.getElementById('agent-budget').value) || 0;
+  if (budgetVal > 0) payload.budgetMonthlyCents = budgetVal;
+
+  // Role template — triggers scaffolding on the backend
+  if (_activeRoleTemplate && !isEdit) {
+    payload.role = _activeRoleTemplate;
+  }
+  _activeRoleTemplate = null;
+
   try {
     var url = isEdit ? '/api/agents/' + editSlug : '/api/agents';
     var method = isEdit ? 'PUT' : 'POST';
@@ -8880,6 +9451,25 @@ async function deleteAgent(slug) {
     var d = await r.json();
     if (d.ok) {
       toast('Deleted agent: ' + slug, 'success');
+      refreshTeam();
+    } else {
+      toast(d.error || 'Failed', 'error');
+    }
+  } catch(e) { toast(String(e), 'error'); }
+}
+
+async function setAgentStatus(slug, status) {
+  var label = status === 'paused' ? 'Pause' : status === 'active' ? 'Resume' : status;
+  if (status === 'terminated' && !confirm('Terminate "' + slug + '"? This cannot be undone.')) return;
+  try {
+    var r = await apiFetch('/api/agents/' + slug + '/status', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ status: status }),
+    });
+    var d = await r.json();
+    if (d.ok) {
+      toast(slug + ' → ' + status, 'success');
       refreshTeam();
     } else {
       toast(d.error || 'Failed', 'error');

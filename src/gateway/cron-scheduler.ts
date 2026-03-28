@@ -607,6 +607,38 @@ export class CronScheduler {
   }
 
   private async runJob(job: CronJobDefinition): Promise<void> {
+    // Agent status check — skip if agent is paused/terminated
+    if (job.agentSlug) {
+      const agentMgr = this.gateway?.getAgentManager?.();
+      if (agentMgr && !agentMgr.isRunnable(job.agentSlug)) {
+        const agent = agentMgr.get(job.agentSlug);
+        logger.info({ job: job.name, status: agent?.status }, `Agent '${job.agentSlug}' is ${agent?.status ?? 'unknown'} — skipping cron job`);
+        return;
+      }
+      // Budget check — skip if over monthly budget
+      if (agentMgr) {
+        const agent = agentMgr.get(job.agentSlug);
+        if (agent?.budgetMonthlyCents && agent.budgetMonthlyCents > 0) {
+          try {
+            const { MemoryStore } = await import('../memory/store.js');
+            const { MEMORY_DB_PATH, VAULT_DIR } = await import('../config.js');
+            const { existsSync } = await import('node:fs');
+            if (existsSync(MEMORY_DB_PATH)) {
+              const store = new MemoryStore(MEMORY_DB_PATH, VAULT_DIR);
+              store.initialize();
+              if (store.isOverBudget(job.agentSlug, agent.budgetMonthlyCents)) {
+                logger.warn({ job: job.name, agentSlug: job.agentSlug, budget: agent.budgetMonthlyCents },
+                  `Agent '${job.agentSlug}' is over monthly budget — skipping cron job`);
+                store.close();
+                return;
+              }
+              store.close();
+            }
+          } catch { /* budget check failed — allow job to run */ }
+        }
+      }
+    }
+
     // Prevent concurrent runs of the same job
     if (this.runningJobs.has(job.name)) {
       logger.info(`Cron job '${job.name}' is already running — skipping this trigger`);

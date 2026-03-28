@@ -62,6 +62,7 @@ import {
   logToolUse,
   setProfileTier,
   setProfileAllowedTools,
+  setSendPolicy,
   setInteractionSource,
 } from './hooks.js';
 import { scanner } from '../security/scanner.js';
@@ -1506,6 +1507,7 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
 
     setProfileTier(profile?.tier ?? null);
     setProfileAllowedTools(profile?.team?.allowedTools ?? null);
+    setSendPolicy(profile?.sendPolicy ?? null, profile?.slug ?? null);
     setInteractionSource(inferInteractionSource(sessionKey));
     if (matchedProject) {
       logger.info({ project: matchedProject.path }, 'Auto-matched project from message');
@@ -1681,6 +1683,7 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
       return ['Sorry, I hit a temporary issue. Please try again.', ''];
     } finally {
       setProfileTier(null);
+      setSendPolicy(null, null);
       setInteractionSource('autonomous');
     }
   }
