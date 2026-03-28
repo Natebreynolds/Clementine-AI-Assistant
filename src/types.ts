@@ -176,6 +176,7 @@ export interface HeartbeatReportedTopic {
   topic: string;
   summary: string;
   reportedAt: string;
+  agentSlug?: string;
 }
 
 export interface HeartbeatState {
@@ -200,6 +201,7 @@ export interface HeartbeatWorkItem {
   completedAt?: string;
   result?: string;
   error?: string;
+  agentSlug?: string;
 }
 
 // ── Cron Jobs ────────────────────────────────────────────────────────
