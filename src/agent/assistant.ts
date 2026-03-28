@@ -2128,6 +2128,7 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
     standingInstructions: string,
     changesSummary = '',
     timeContext = '',
+    dedupContext = '',
   ): Promise<string> {
     setInteractionSource('autonomous');
     const sdkOptions = this.buildOptions({
@@ -2143,20 +2144,28 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
 
     const promptParts = [
       `[Heartbeat — ${localTime}, ${localDate} (${tz})]\n`,
-      `You are checking in as ${owner}'s personal assistant. Write naturally — like a brief status update to a trusted colleague. Reference recent conversations if relevant ("you mentioned X earlier..."). Match your energy to the time of day. If there is nothing noteworthy, just say so in a sentence or two. If something needs attention, lead with that. No bullet-point checklists, no checkmarks, no "all systems nominal" language. During check-ins, you may take 1-2 small proactive actions if useful: update goal progress, promote daily note facts to long-term memory, or flag interesting findings.`,
+      `You are checking in as ${owner}'s personal assistant. Write naturally — like a brief status update to a trusted colleague. Reference recent conversations if relevant. Match your energy to the time of day.`,
     ];
+    if (dedupContext) {
+      promptParts.push(`\n${dedupContext}\n\nIf all of the above items are unchanged, respond with exactly: __NOTHING__`);
+    }
     if (timeContext) {
       promptParts.push(`\nTime context: ${timeContext}`);
     }
     if (changesSummary) {
       promptParts.push(
         `\nWhat changed since last check-in: ${changesSummary}\n` +
-        'Focus on what changed. Only log to the daily note if you took an action ' +
-        "or found something new — don't log routine check-ins.",
+        'Focus only on what genuinely changed or work you completed. ' +
+        "Don't log routine check-ins to the daily note.",
       );
     }
     promptParts.push(
-      `\nIf something needs ${owner}'s attention, say so clearly.\n\n` +
+      `\nRESPONSE RULES:\n` +
+      `- If you completed work, briefly summarize the outcome.\n` +
+      `- If something genuinely new needs ${owner}'s attention, say it clearly.\n` +
+      `- If everything you'd say was already reported and nothing changed, respond with exactly: __NOTHING__\n` +
+      `- Tag each distinct topic you mention with [topic: short-key] so I can track what was reported.\n` +
+      `- No bullet-point checklists. Write naturally.\n\n` +
       `Standing Instructions:\n${standingInstructions}`,
     );
 

@@ -1000,6 +1000,49 @@ server.tool(
   },
 );
 
+// ── 8b. heartbeat_queue_work ──────────────────────────────────────────
+
+const HEARTBEAT_WORK_QUEUE_FILE = path.join(BASE_DIR, 'heartbeat', 'work-queue.json');
+
+server.tool(
+  'heartbeat_queue_work',
+  'Queue a background task for the next heartbeat cycle to execute. Use for approved work that should happen asynchronously during the next check-in.',
+  {
+    description: z.string().describe('Short human-readable description of the work'),
+    prompt: z.string().describe('Detailed prompt for the agent executing this work'),
+    priority: z.enum(['high', 'normal']).optional().default('normal').describe('high = next tick, normal = when convenient'),
+    max_turns: z.number().optional().default(3).describe('Max conversation turns for this work (1-5)'),
+    tier: z.number().optional().default(1).describe('Security tier: 1 = vault-only, 2 = bash/git allowed'),
+  },
+  async ({ description, prompt, priority, max_turns, tier }) => {
+    const queueDir = path.dirname(HEARTBEAT_WORK_QUEUE_FILE);
+    mkdirSync(queueDir, { recursive: true });
+
+    let queue: Array<Record<string, unknown>> = [];
+    try {
+      if (existsSync(HEARTBEAT_WORK_QUEUE_FILE)) {
+        queue = JSON.parse(readFileSync(HEARTBEAT_WORK_QUEUE_FILE, 'utf-8'));
+      }
+    } catch { /* start fresh */ }
+
+    const id = randomBytes(4).toString('hex');
+    queue.push({
+      id,
+      description,
+      prompt,
+      source: 'mcp-tool',
+      priority,
+      queuedAt: new Date().toISOString(),
+      maxTurns: Math.min(max_turns, 5),
+      tier: Math.min(tier, 2),
+      status: 'pending',
+    });
+
+    writeFileSync(HEARTBEAT_WORK_QUEUE_FILE, JSON.stringify(queue, null, 2));
+    return textResult(`Queued work item ${id}: "${description}" (priority: ${priority}, next heartbeat will pick it up)`);
+  },
+);
+
 // ── 9. vault_stats ─────────────────────────────────────────────────────
 
 server.tool(

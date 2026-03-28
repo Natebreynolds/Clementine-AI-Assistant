@@ -208,6 +208,7 @@ export const HEARTBEAT_INTERVAL_MINUTES = parseInt(getEnv('HEARTBEAT_INTERVAL_MI
 export const HEARTBEAT_ACTIVE_START = parseInt(getEnv('HEARTBEAT_ACTIVE_START', '8'), 10);
 export const HEARTBEAT_ACTIVE_END = parseInt(getEnv('HEARTBEAT_ACTIVE_END', '22'), 10);
 export const HEARTBEAT_MAX_TURNS = 5;
+export const HEARTBEAT_WORK_QUEUE_FILE = path.join(BASE_DIR, 'heartbeat', 'work-queue.json');
 
 // ── Unleashed mode ──────────────────────────────────────────────────
 

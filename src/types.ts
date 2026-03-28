@@ -172,10 +172,34 @@ export type AgentStatus = 'active' | 'paused' | 'error' | 'terminated';
 
 // ── Heartbeat ────────────────────────────────────────────────────────
 
+export interface HeartbeatReportedTopic {
+  topic: string;
+  summary: string;
+  reportedAt: string;
+}
+
 export interface HeartbeatState {
   fingerprint: string;
   details: Record<string, number | string>;
   timestamp: string;
+  reportedTopics?: HeartbeatReportedTopic[];
+  consecutiveSilentBeats?: number;
+  lastDiscordMessageAt?: string;
+}
+
+export interface HeartbeatWorkItem {
+  id: string;
+  description: string;
+  prompt: string;
+  source: string;
+  priority: 'high' | 'normal';
+  queuedAt: string;
+  maxTurns: number;
+  tier: number;
+  status: 'pending' | 'running' | 'completed' | 'failed';
+  completedAt?: string;
+  result?: string;
+  error?: string;
 }
 
 // ── Cron Jobs ────────────────────────────────────────────────────────

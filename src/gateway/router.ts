@@ -619,6 +619,7 @@ export class Gateway {
     standingInstructions: string,
     changesSummary = '',
     timeContext = '',
+    dedupContext = '',
   ): Promise<string> {
     const releaseLane = await lanes.acquire('heartbeat');
     try {
@@ -628,6 +629,7 @@ export class Gateway {
           standingInstructions,
           changesSummary,
           timeContext,
+          dedupContext,
         );
 
         // Re-baseline integrity checksums after heartbeat (may write to vault)
