@@ -3858,6 +3858,67 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
     } catch { res.json({ goals: [] }); }
   });
 
+  // Create goal
+  app.post('/api/goals', express.json(), (req, res) => {
+    try {
+      if (!existsSync(GOALS_DIR)) mkdirSync(GOALS_DIR, { recursive: true });
+      const id = Math.random().toString(16).slice(2, 10);
+      const { title, description, owner, priority, status, targetDate, linkedCronJobs, nextActions, blockers, reviewFrequency } = req.body;
+      if (!title) { res.status(400).json({ ok: false, error: 'Title is required' }); return; }
+      const goal = {
+        id,
+        title,
+        description: description || '',
+        status: status || 'active',
+        owner: owner || 'clementine',
+        priority: priority || 'medium',
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        progressNotes: [],
+        nextActions: nextActions || [],
+        blockers: blockers || [],
+        reviewFrequency: reviewFrequency || 'weekly',
+        linkedCronJobs: linkedCronJobs || [],
+        targetDate: targetDate || undefined,
+      };
+      writeFileSync(path.join(GOALS_DIR, `${id}.json`), JSON.stringify(goal, null, 2));
+      res.json({ ok: true, goal });
+    } catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
+  });
+
+  // Update goal
+  app.put('/api/goals/:id', express.json(), (req, res) => {
+    try {
+      const goalPath = path.join(GOALS_DIR, `${req.params.id}.json`);
+      if (!existsSync(goalPath)) { res.status(404).json({ ok: false, error: 'Goal not found' }); return; }
+      const existing = JSON.parse(readFileSync(goalPath, 'utf-8'));
+      const { title, description, owner, priority, status, targetDate, linkedCronJobs, nextActions, blockers, reviewFrequency } = req.body;
+      if (title !== undefined) existing.title = title;
+      if (description !== undefined) existing.description = description;
+      if (owner !== undefined) existing.owner = owner;
+      if (priority !== undefined) existing.priority = priority;
+      if (status !== undefined) existing.status = status;
+      if (targetDate !== undefined) existing.targetDate = targetDate;
+      if (linkedCronJobs !== undefined) existing.linkedCronJobs = linkedCronJobs;
+      if (nextActions !== undefined) existing.nextActions = nextActions;
+      if (blockers !== undefined) existing.blockers = blockers;
+      if (reviewFrequency !== undefined) existing.reviewFrequency = reviewFrequency;
+      existing.updatedAt = new Date().toISOString();
+      writeFileSync(goalPath, JSON.stringify(existing, null, 2));
+      res.json({ ok: true, goal: existing });
+    } catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
+  });
+
+  // Delete goal
+  app.delete('/api/goals/:id', (_req, res) => {
+    try {
+      const goalPath = path.join(GOALS_DIR, `${_req.params.id}.json`);
+      if (!existsSync(goalPath)) { res.status(404).json({ ok: false, error: 'Goal not found' }); return; }
+      unlinkSync(goalPath);
+      res.json({ ok: true });
+    } catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
+  });
+
   // ── Reflection Quality Trends API ──────────────────────────────
 
   const CRON_REFLECTIONS_DIR = path.join(BASE_DIR, 'cron', 'reflections');
@@ -4174,6 +4235,7 @@ function getDashboardHTML(token: string): string {
     --bg-card: rgba(255,255,255,0.95);
     --bg-hover: #eef1f5;
     --bg-input: #f0f2f5;
+    --bg-tertiary: #ebedf0;
     --border: #d8dde5;
     --border-light: #c5ccd6;
     --text-primary: #1a1a2e;
@@ -4194,10 +4256,41 @@ function getDashboardHTML(token: string): string {
     --yellow: #d4a72c;
     --yellow-bg: rgba(212, 167, 44, 0.12);
     --orange: #f0883e;
+    --shadow-sm: 0 2px 8px rgba(0,0,0,0.06);
+    --shadow-md: 0 8px 24px rgba(0,0,0,0.12);
     --sidebar-w: 220px;
     --header-h: 56px;
     --radius: 10px;
     --radius-sm: 5px;
+  }
+  [data-theme="dark"] {
+    --bg-primary: #0d1117;
+    --bg-secondary: #161b22;
+    --bg-card: rgba(22,27,34,0.95);
+    --bg-hover: #1c2129;
+    --bg-input: #21262d;
+    --bg-tertiary: #1c2129;
+    --border: #30363d;
+    --border-light: #3d444d;
+    --text-primary: #e6edf3;
+    --text-secondary: #9dacba;
+    --text-muted: #7d8590;
+    --accent: #58a6ff;
+    --accent-glow: rgba(88, 166, 255, 0.12);
+    --purple: #a371f7;
+    --clementine: #ffa54f;
+    --clementine-dark: #ff8c21;
+    --clementine-glow: rgba(255, 165, 79, 0.12);
+    --clementine-bg: rgba(255, 165, 79, 0.08);
+    --green: #3fb950;
+    --green-bg: rgba(63, 185, 80, 0.15);
+    --red: #f85149;
+    --red-bg: rgba(248, 81, 73, 0.15);
+    --yellow: #d29922;
+    --yellow-bg: rgba(210, 153, 34, 0.15);
+    --orange: #f0883e;
+    --shadow-sm: 0 2px 8px rgba(0,0,0,0.3);
+    --shadow-md: 0 8px 24px rgba(0,0,0,0.5);
   }
   * { margin: 0; padding: 0; box-sizing: border-box; }
   body {
@@ -4848,6 +4941,101 @@ function getDashboardHTML(token: string): string {
   ::-webkit-scrollbar-track { background: transparent; }
   ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
   ::-webkit-scrollbar-thumb:hover { background: var(--border-light); }
+
+  /* ── Theme toggle ──────────────────────── */
+  .theme-toggle {
+    background: none;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    width: 34px;
+    height: 34px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    font-size: 16px;
+    color: var(--text-muted);
+    transition: color 0.2s, border-color 0.2s, background 0.2s;
+    flex-shrink: 0;
+  }
+  .theme-toggle:hover {
+    color: var(--clementine);
+    border-color: var(--clementine);
+    background: var(--clementine-bg);
+  }
+
+  /* ── Inline edit fields ────────────────── */
+  .inline-field {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 0;
+    border-bottom: 1px solid var(--border);
+    min-height: 34px;
+  }
+  .inline-field-label {
+    width: 110px;
+    flex-shrink: 0;
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--text-muted);
+  }
+  .inline-field-value {
+    flex: 1;
+    font-size: 13px;
+    color: var(--text-primary);
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .inline-field-edit {
+    background: none;
+    border: none;
+    cursor: pointer;
+    font-size: 13px;
+    color: var(--text-muted);
+    padding: 2px 4px;
+    border-radius: 4px;
+    flex-shrink: 0;
+    transition: color 0.15s, background 0.15s;
+  }
+  .inline-field-edit:hover {
+    color: var(--accent);
+    background: var(--accent-glow);
+  }
+  .inline-field input,
+  .inline-field select,
+  .inline-field textarea {
+    flex: 1;
+    font-size: 13px;
+    padding: 4px 8px;
+    border: 1px solid var(--accent);
+    border-radius: var(--radius-sm);
+    background: var(--bg-input);
+    color: var(--text-primary);
+    font-family: inherit;
+    outline: none;
+  }
+  .inline-field textarea { min-height: 60px; resize: vertical; }
+  .inline-field .inline-save {
+    background: var(--accent);
+    color: #fff;
+    border: none;
+    padding: 4px 10px;
+    border-radius: var(--radius-sm);
+    font-size: 11px;
+    cursor: pointer;
+    font-weight: 600;
+  }
+  .inline-field .inline-cancel {
+    background: none;
+    border: 1px solid var(--border);
+    padding: 4px 10px;
+    border-radius: var(--radius-sm);
+    font-size: 11px;
+    cursor: pointer;
+    color: var(--text-muted);
+  }
 
   /* ── Chat ───────────────────────────────── */
   .chat-bubble {
@@ -6376,6 +6564,7 @@ function getDashboardHTML(token: string): string {
       <span class="header-activity" id="header-activity"></span>
     </div>
     <div class="header-right">
+      <button class="theme-toggle" id="theme-toggle" onclick="toggleTheme()" title="Toggle dark mode">&#9790;</button>
       <div class="status-pill" id="header-status">
         <div class="pulse-dot"></div>
         <span>Loading...</span>
@@ -7130,6 +7319,69 @@ function getDashboardHTML(token: string): string {
   </div>
 </div>
 
+<!-- ═══ Goal Modal ═══ -->
+<div class="modal-overlay" id="goal-modal">
+  <div class="modal" style="width:520px">
+    <div class="modal-header">
+      <h3 id="goal-modal-title">New Goal</h3>
+      <button class="btn-ghost btn-sm" onclick="closeGoalModal()">&times;</button>
+    </div>
+    <div class="modal-body">
+      <input type="hidden" id="goal-edit-id" value="">
+      <div class="form-row">
+        <label>Title *</label>
+        <input type="text" id="goal-title" placeholder="e.g. Book 3 Appointments Per Week">
+      </div>
+      <div class="form-row">
+        <label>Description</label>
+        <textarea id="goal-description" rows="3" placeholder="What does success look like?"></textarea>
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px">
+        <div class="form-row">
+          <label>Owner</label>
+          <select id="goal-owner"><option value="clementine">Clementine</option></select>
+        </div>
+        <div class="form-row">
+          <label>Priority</label>
+          <select id="goal-priority">
+            <option value="high">High</option>
+            <option value="medium" selected>Medium</option>
+            <option value="low">Low</option>
+          </select>
+        </div>
+        <div class="form-row">
+          <label>Status</label>
+          <select id="goal-status">
+            <option value="active">Active</option>
+            <option value="blocked">Blocked</option>
+            <option value="completed">Completed</option>
+          </select>
+        </div>
+      </div>
+      <div class="form-row">
+        <label>Target Date</label>
+        <input type="date" id="goal-target-date">
+      </div>
+      <div class="form-row">
+        <label>Next Actions <span style="font-weight:400;color:var(--text-muted)">(one per line)</span></label>
+        <textarea id="goal-next-actions" rows="3" placeholder="Tune SF query filter&#10;Review 2-week outreach data"></textarea>
+      </div>
+      <div class="form-row">
+        <label>Blockers <span style="font-weight:400;color:var(--text-muted)">(one per line)</span></label>
+        <textarea id="goal-blockers" rows="2" placeholder="Agent crons stopped running"></textarea>
+      </div>
+      <div class="form-row">
+        <label>Linked Cron Jobs <span style="font-weight:400;color:var(--text-muted)">(comma-separated)</span></label>
+        <input type="text" id="goal-linked-crons" placeholder="e.g. ross-heartbeat, sasha-deal-support-scan">
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button onclick="closeGoalModal()">Cancel</button>
+      <button class="btn-primary" id="goal-modal-save" onclick="saveGoal()">Create Goal</button>
+    </div>
+  </div>
+</div>
+
 <!-- ═══ Confirm Delete Modal ═══ -->
 <div class="modal-overlay" id="confirm-modal">
   <div class="modal" style="width:380px">
@@ -7514,7 +7766,7 @@ async function loadAgentDetailTab(tab, slug, isPrimary) {
       html += '</div></div>';
     } catch(e) { html += '<div class="empty-state">Failed to load tasks</div>'; }
 
-    // Goals (if available)
+    // Goals
     try {
       var goalsRes = await apiFetch('/api/goals/progress');
       var goalsData = await goalsRes.json();
@@ -7522,15 +7774,21 @@ async function loadAgentDetailTab(tab, slug, isPrimary) {
         if (isPrimary) return true;
         return g.owner === slug || (g.agentContributions && g.agentContributions[slug]);
       });
-      if (goals.length > 0) {
-        html += '<div class="card"><div class="card-header">Goals (' + goals.length + ')</div><div class="card-body">';
+      html += '<div class="card"><div class="card-header" style="display:flex;justify-content:space-between;align-items:center"><span>Goals (' + goals.length + ')</span>';
+      html += '<button class="btn btn-sm btn-primary" onclick="openGoalModal(\\x27' + esc(slug || '') + '\\x27)" style="font-size:11px">+ New Goal</button></div><div class="card-body">';
+      if (goals.length === 0) {
+        html += '<div class="empty-state" style="padding:24px">No goals yet</div>';
+      } else {
         goals.forEach(function(g) {
           var pColor = g.status === 'completed' ? 'var(--green)' : g.status === 'blocked' ? 'var(--red)' : 'var(--accent)';
-          html += '<div style="padding:8px 0;border-bottom:1px solid var(--border)">';
+          var priColor = g.priority === 'high' ? 'var(--red)' : g.priority === 'low' ? 'var(--green)' : 'var(--orange)';
+          html += '<div style="padding:10px 0;border-bottom:1px solid var(--border)">';
           html += '<div style="display:flex;align-items:center;gap:8px">';
-          html += '<span style="font-weight:500;color:var(--text-primary)">' + esc(g.title) + '</span>';
+          html += '<span style="font-weight:500;color:var(--text-primary);flex:1">' + esc(g.title) + '</span>';
           html += '<span class="badge" style="background:' + pColor + '20;color:' + pColor + ';font-size:10px">' + esc(g.status || 'active') + '</span>';
-          if (g.priority) html += '<span class="badge" style="font-size:10px">' + esc(g.priority) + '</span>';
+          if (g.priority) html += '<span class="badge" style="background:' + priColor + '20;color:' + priColor + ';font-size:10px">' + esc(g.priority) + '</span>';
+          html += '<button class="btn btn-sm" onclick="editGoal(\\x27' + esc(g.id) + '\\x27)" style="font-size:10px;padding:2px 8px">Edit</button>';
+          html += '<button class="btn btn-sm" onclick="deleteGoal(\\x27' + esc(g.id) + '\\x27,\\x27' + esc(g.title).replace(/'/g, '') + '\\x27)" style="font-size:10px;padding:2px 8px;color:var(--red)">Del</button>';
           html += '</div>';
           if (g.nextActions && g.nextActions.length) {
             html += '<div style="margin-top:4px;padding-left:8px">';
@@ -7541,8 +7799,8 @@ async function loadAgentDetailTab(tab, slug, isPrimary) {
           }
           html += '</div>';
         });
-        html += '</div></div>';
       }
+      html += '</div></div>';
     } catch(e) { /* goals optional */ }
     container.innerHTML = html;
 
@@ -7601,24 +7859,32 @@ async function loadAgentDetailTab(tab, slug, isPrimary) {
 
   } else if (tab === 'tools') {
     var html = '';
-    // Available tools
+    var agentAllowed = (a && a.allowedTools) ? a.allowedTools : [];
+    var hasWhitelist = agentAllowed.length > 0;
+    // Available tools with toggles
     try {
       var toolsRes = await apiFetch('/api/available-tools');
       var toolsData = await toolsRes.json();
       var categories = toolsData.categories || toolsData || {};
       if (typeof categories === 'object' && !Array.isArray(categories)) {
-        html += '<div class="card" style="margin-bottom:16px"><div class="card-header">MCP Tools</div><div class="card-body">';
+        html += '<div class="card" style="margin-bottom:16px"><div class="card-header" style="display:flex;justify-content:space-between;align-items:center"><span>MCP Tools</span>';
+        if (!isPrimary) html += '<span style="font-size:11px;color:var(--text-muted)">' + (hasWhitelist ? agentAllowed.length + ' enabled' : 'All tools enabled (no whitelist)') + '</span>';
+        html += '</div><div class="card-body">';
         Object.keys(categories).forEach(function(cat) {
-          html += '<div style="margin-bottom:12px">';
+          html += '<div style="margin-bottom:14px">';
           html += '<div style="font-weight:600;font-size:12px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.05em;margin-bottom:6px">' + esc(cat) + '</div>';
           var tools = categories[cat];
           if (Array.isArray(tools)) {
             tools.forEach(function(t) {
               var toolName = typeof t === 'string' ? t : t.name || '';
               var toolDesc = typeof t === 'object' ? (t.description || '') : '';
-              html += '<div style="display:flex;align-items:center;gap:8px;padding:4px 0">';
+              var isEnabled = !hasWhitelist || agentAllowed.indexOf(toolName) >= 0;
+              html += '<div style="display:flex;align-items:center;gap:8px;padding:5px 0;border-bottom:1px solid var(--border)">';
               html += '<span style="font-size:13px;color:var(--text-primary);flex:1">' + esc(toolName) + '</span>';
-              if (toolDesc) html += '<span style="font-size:11px;color:var(--text-muted);max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(toolDesc) + '</span>';
+              if (toolDesc) html += '<span style="font-size:11px;color:var(--text-muted);max-width:250px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(toolDesc) + '</span>';
+              if (!isPrimary) {
+                html += '<label class="toggle-switch"><input type="checkbox"' + (isEnabled ? ' checked' : '') + ' onchange="toggleAgentTool(\\x27' + esc(slug) + '\\x27,\\x27' + esc(toolName) + '\\x27, this.checked)"><span class="toggle-slider"></span></label>';
+              }
               html += '</div>';
             });
           }
@@ -7646,30 +7912,78 @@ async function loadAgentDetailTab(tab, slug, isPrimary) {
   } else if (tab === 'config') {
     var html = '';
     if (a) {
-      html += '<div class="card" style="margin-bottom:16px"><div class="card-header">Agent Profile</div><div class="card-body">';
-      html += '<div style="display:grid;grid-template-columns:120px 1fr;gap:8px;font-size:13px">';
-      html += '<div style="color:var(--text-muted);font-weight:500">Name</div><div>' + esc(a.name || '') + '</div>';
-      html += '<div style="color:var(--text-muted);font-weight:500">Description</div><div>' + esc(a.description || '') + '</div>';
-      html += '<div style="color:var(--text-muted);font-weight:500">Model</div><div>' + esc(a.model || 'default') + '</div>';
-      html += '<div style="color:var(--text-muted);font-weight:500">Status</div><div>' + esc(a.status || a.agentStatus || 'unknown') + '</div>';
-      if (a.project) { html += '<div style="color:var(--text-muted);font-weight:500">Project</div><div>' + esc(a.project) + '</div>'; }
-      html += '</div></div></div>';
+      var canEdit = !isPrimary;
+      var pencil = '&#9998;';
+      html += '<div class="card" style="margin-bottom:16px"><div class="card-header">Agent Profile</div><div class="card-body" style="padding:12px 18px">';
+
+      // Name field
+      html += '<div class="inline-field" id="if-name">';
+      html += '<span class="inline-field-label">Name</span>';
+      html += '<span class="inline-field-value">' + esc(a.name || '') + '</span>';
+      if (canEdit) html += '<button class="inline-field-edit" onclick="inlineEdit(\\x27' + esc(slug) + '\\x27,\\x27name\\x27,\\x27' + esc(a.name || '').replace(/'/g, '') + '\\x27)" title="Edit">' + pencil + '</button>';
+      html += '</div>';
+
+      // Description field
+      html += '<div class="inline-field" id="if-description">';
+      html += '<span class="inline-field-label">Description</span>';
+      html += '<span class="inline-field-value">' + esc(a.description || '') + '</span>';
+      if (canEdit) html += '<button class="inline-field-edit" onclick="inlineEdit(\\x27' + esc(slug) + '\\x27,\\x27description\\x27,\\x27' + esc(a.description || '').replace(/'/g, '') + '\\x27)" title="Edit">' + pencil + '</button>';
+      html += '</div>';
+
+      // Model field
+      html += '<div class="inline-field" id="if-model">';
+      html += '<span class="inline-field-label">Model</span>';
+      html += '<span class="inline-field-value">' + esc(a.model || 'default') + '</span>';
+      if (canEdit) html += '<button class="inline-field-edit" onclick="inlineEditSelect(\\x27' + esc(slug) + '\\x27,\\x27model\\x27,\\x27' + esc(a.model || '') + '\\x27)" title="Edit">' + pencil + '</button>';
+      html += '</div>';
+
+      // Status field
+      html += '<div class="inline-field">';
+      html += '<span class="inline-field-label">Status</span>';
+      var statusVal = a.status || a.agentStatus || 'unknown';
+      var sColor = statusVal === 'active' ? 'var(--green)' : statusVal === 'paused' ? 'var(--yellow)' : statusVal === 'error' ? 'var(--red)' : 'var(--text-muted)';
+      html += '<span class="inline-field-value" style="color:' + sColor + ';font-weight:500">' + esc(statusVal) + '</span>';
+      html += '</div>';
+
+      // Project field
+      if (a.project) {
+        html += '<div class="inline-field">';
+        html += '<span class="inline-field-label">Project</span>';
+        html += '<span class="inline-field-value">' + esc(a.project) + '</span>';
+        html += '</div>';
+      }
+
+      // Tier
+      if (canEdit) {
+        html += '<div class="inline-field" id="if-tier">';
+        html += '<span class="inline-field-label">Tier</span>';
+        html += '<span class="inline-field-value">' + esc(String(a.tier || 2)) + '</span>';
+        html += '<button class="inline-field-edit" onclick="inlineEditSelect(\\x27' + esc(slug) + '\\x27,\\x27tier\\x27,\\x27' + (a.tier || 2) + '\\x27)" title="Edit">' + pencil + '</button>';
+        html += '</div>';
+      }
+
+      html += '</div></div>';
 
       // Budget
       if (!isPrimary) {
+        html += '<div class="card" style="margin-bottom:16px"><div class="card-header">Monthly Budget</div><div class="card-body" style="padding:12px 18px">';
+        html += '<div class="inline-field" id="if-budgetMonthlyCents">';
+        html += '<span class="inline-field-label">Limit</span>';
+        var budgetVal = a.budgetMonthlyCents || 0;
+        html += '<span class="inline-field-value">$' + (budgetVal / 100).toFixed(2) + '</span>';
+        html += '<button class="inline-field-edit" onclick="inlineEdit(\\x27' + esc(slug) + '\\x27,\\x27budgetMonthlyCents\\x27,\\x27' + budgetVal + '\\x27)" title="Edit">' + pencil + '</button>';
+        html += '</div>';
         try {
           var budgetRes = await apiFetch('/api/agents/' + slug + '/budget');
           var budget = await budgetRes.json();
-          if (budget && a.budgetMonthlyCents > 0) {
-            var pct = Math.min(100, Math.round((budget.spentCents / a.budgetMonthlyCents) * 100));
+          if (budget && budgetVal > 0) {
+            var pct = Math.min(100, Math.round((budget.spentCents / budgetVal) * 100));
             var bColor = pct > 90 ? 'var(--red)' : pct > 70 ? 'var(--yellow)' : 'var(--green)';
-            html += '<div class="card" style="margin-bottom:16px"><div class="card-header">Monthly Budget</div><div class="card-body">';
-            html += '<div style="display:flex;justify-content:space-between;font-size:12px;color:var(--text-muted);margin-bottom:4px"><span>$' + (budget.spentCents / 100).toFixed(2) + ' spent</span><span>$' + (a.budgetMonthlyCents / 100).toFixed(2) + ' limit</span></div>';
-            html += '<div style="height:8px;background:var(--bg-input);border-radius:4px;overflow:hidden"><div style="width:' + pct + '%;height:100%;background:' + bColor + '"></div></div>';
-            html += '<div style="text-align:right;font-size:11px;color:' + bColor + ';margin-top:4px">' + pct + '% used</div>';
-            html += '</div></div>';
+            html += '<div style="margin-top:8px"><div style="display:flex;justify-content:space-between;font-size:12px;color:var(--text-muted);margin-bottom:4px"><span>$' + (budget.spentCents / 100).toFixed(2) + ' spent</span><span>' + pct + '% used</span></div>';
+            html += '<div style="height:8px;background:var(--bg-input);border-radius:4px;overflow:hidden"><div style="width:' + pct + '%;height:100%;background:' + bColor + '"></div></div></div>';
           }
         } catch(e) { /* skip */ }
+        html += '</div></div>';
 
         // Revision history
         try {
@@ -7689,7 +8003,7 @@ async function loadAgentDetailTab(tab, slug, isPrimary) {
 
       if (!isPrimary) {
         html += '<div style="margin-top:16px;display:flex;gap:8px">';
-        html += '<button class="btn" onclick="editAgent(\\x27' + esc(slug) + '\\x27)">Edit Agent</button>';
+        html += '<button class="btn" onclick="editAgent(\\x27' + esc(slug) + '\\x27)">Full Edit</button>';
         html += '<button class="btn btn-danger btn-sm" onclick="confirmDeleteAgent(\\x27' + esc(slug) + '\\x27,\\x27' + esc(a.name || slug) + '\\x27)">Delete Agent</button>';
         html += '</div>';
       }
@@ -7704,6 +8018,24 @@ async function toggleCronJob(name) {
     toast('Toggled ' + name, 'success');
   } catch(e) { toast('Failed to toggle: ' + e, 'error'); }
 }
+
+// ── Theme ─────────────────────────────────
+function toggleTheme() {
+  var isDark = document.documentElement.getAttribute('data-theme') === 'dark';
+  var next = isDark ? 'light' : 'dark';
+  document.documentElement.setAttribute('data-theme', next);
+  localStorage.setItem('clem-theme', next);
+  document.getElementById('theme-toggle').innerHTML = next === 'dark' ? '\\u2600' : '\\u263E';
+}
+(function initTheme() {
+  var saved = localStorage.getItem('clem-theme');
+  var prefer = saved || (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+  if (prefer === 'dark') {
+    document.documentElement.setAttribute('data-theme', 'dark');
+    var btn = document.getElementById('theme-toggle');
+    if (btn) btn.innerHTML = '\\u2600';
+  }
+})();
 
 function toggleSidebar() {
   document.querySelector('.sidebar').classList.toggle('open');
@@ -8556,6 +8888,116 @@ async function unlinkProject(projPath) {
     toast('Project unlinked');
     refreshProjects();
   } catch(e) { toast('Failed: ' + e, 'error'); }
+}
+
+// ── Goal Modal ────────────────────────────
+function openGoalModal(agentSlug) {
+  document.getElementById('goal-edit-id').value = '';
+  document.getElementById('goal-title').value = '';
+  document.getElementById('goal-description').value = '';
+  document.getElementById('goal-priority').value = 'medium';
+  document.getElementById('goal-status').value = 'active';
+  document.getElementById('goal-target-date').value = '';
+  document.getElementById('goal-next-actions').value = '';
+  document.getElementById('goal-blockers').value = '';
+  document.getElementById('goal-linked-crons').value = '';
+  document.getElementById('goal-modal-title').textContent = 'New Goal';
+  document.getElementById('goal-modal-save').textContent = 'Create Goal';
+  populateGoalOwnerDropdown(agentSlug || 'clementine');
+  document.getElementById('goal-modal').classList.add('show');
+}
+
+async function editGoal(goalId) {
+  try {
+    var r = await apiFetch('/api/goals/progress');
+    var data = await r.json();
+    var goal = (data.goals || []).find(function(g) { return g.id === goalId; });
+    if (!goal) { toast('Goal not found', 'error'); return; }
+    document.getElementById('goal-edit-id').value = goal.id;
+    document.getElementById('goal-title').value = goal.title || '';
+    document.getElementById('goal-description').value = goal.description || '';
+    document.getElementById('goal-priority').value = goal.priority || 'medium';
+    document.getElementById('goal-status').value = goal.status || 'active';
+    document.getElementById('goal-target-date').value = goal.targetDate || '';
+    document.getElementById('goal-next-actions').value = (goal.nextActions || []).join('\\n');
+    document.getElementById('goal-blockers').value = (goal.blockers || []).join('\\n');
+    document.getElementById('goal-linked-crons').value = (goal.linkedCronJobs || []).join(', ');
+    document.getElementById('goal-modal-title').textContent = 'Edit Goal';
+    document.getElementById('goal-modal-save').textContent = 'Save Changes';
+    populateGoalOwnerDropdown(goal.owner || 'clementine');
+    document.getElementById('goal-modal').classList.add('show');
+  } catch(e) { toast(String(e), 'error'); }
+}
+
+async function populateGoalOwnerDropdown(selectedOwner) {
+  var sel = document.getElementById('goal-owner');
+  sel.innerHTML = '<option value="clementine">Clementine</option>';
+  try {
+    var r = await apiFetch('/api/agents');
+    var agents = await r.json();
+    (agents || []).forEach(function(a) {
+      var opt = document.createElement('option');
+      opt.value = a.slug;
+      opt.textContent = a.name || a.slug;
+      if (a.slug === selectedOwner) opt.selected = true;
+      sel.appendChild(opt);
+    });
+    if (selectedOwner === 'clementine') sel.value = 'clementine';
+  } catch { /* keep just clementine */ }
+}
+
+function closeGoalModal() {
+  document.getElementById('goal-modal').classList.remove('show');
+}
+
+async function saveGoal() {
+  var editId = document.getElementById('goal-edit-id').value;
+  var isEdit = Boolean(editId);
+  var title = document.getElementById('goal-title').value.trim();
+  if (!title) { toast('Title is required', 'error'); return; }
+  var payload = {
+    title: title,
+    description: document.getElementById('goal-description').value.trim(),
+    owner: document.getElementById('goal-owner').value,
+    priority: document.getElementById('goal-priority').value,
+    status: document.getElementById('goal-status').value,
+    targetDate: document.getElementById('goal-target-date').value || undefined,
+    nextActions: document.getElementById('goal-next-actions').value.split('\\n').map(function(s) { return s.trim(); }).filter(Boolean),
+    blockers: document.getElementById('goal-blockers').value.split('\\n').map(function(s) { return s.trim(); }).filter(Boolean),
+    linkedCronJobs: document.getElementById('goal-linked-crons').value.split(',').map(function(s) { return s.trim(); }).filter(Boolean),
+  };
+  try {
+    var url = isEdit ? '/api/goals/' + editId : '/api/goals';
+    var method = isEdit ? 'PUT' : 'POST';
+    var r = await apiFetch(url, {
+      method: method,
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    var d = await r.json();
+    if (d.ok) {
+      toast(isEdit ? 'Goal updated' : 'Goal created');
+      closeGoalModal();
+      // Refresh the current view
+      if (typeof refreshGoalsProgress === 'function') refreshGoalsProgress();
+      if (currentAgentSlug !== undefined) renderAgentDetail(currentAgentSlug);
+    } else {
+      toast(d.error || 'Failed', 'error');
+    }
+  } catch(e) { toast(String(e), 'error'); }
+}
+
+async function deleteGoal(goalId, goalTitle) {
+  if (!confirm('Delete goal "' + goalTitle + '"? This cannot be undone.')) return;
+  try {
+    var r = await apiFetch('/api/goals/' + goalId, { method: 'DELETE' });
+    var d = await r.json();
+    if (d.ok) {
+      toast('Goal deleted');
+      if (typeof refreshGoalsProgress === 'function') refreshGoalsProgress();
+      if (currentAgentSlug !== undefined) renderAgentDetail(currentAgentSlug);
+    } else { toast(d.error || 'Failed', 'error'); }
+  } catch(e) { toast(String(e), 'error'); }
 }
 
 // ── Cron Modal ────────────────────────────
@@ -10507,6 +10949,96 @@ async function setAgentStatus(slug, status) {
   } catch(e) { toast(String(e), 'error'); }
 }
 
+// ── Inline editing ───────────────────────
+function inlineEdit(slug, field, currentVal) {
+  var row = document.getElementById('if-' + field);
+  if (!row) return;
+  var isBudget = field === 'budgetMonthlyCents';
+  var inputType = isBudget ? 'number' : 'text';
+  var displayVal = isBudget ? currentVal : currentVal;
+  row.innerHTML = '<span class="inline-field-label">' + (field === 'budgetMonthlyCents' ? 'Limit' : field.charAt(0).toUpperCase() + field.slice(1)) + '</span>'
+    + '<input type="' + inputType + '" value="' + esc(String(displayVal)) + '" id="ie-' + field + '" style="flex:1" onkeydown="if(event.key===\\x27Enter\\x27)inlineSave(\\x27' + esc(slug) + '\\x27,\\x27' + field + '\\x27)">'
+    + '<button class="inline-save" onclick="inlineSave(\\x27' + esc(slug) + '\\x27,\\x27' + field + '\\x27)">Save</button>'
+    + '<button class="inline-cancel" onclick="renderAgentDetail(currentAgentSlug)">Cancel</button>';
+  document.getElementById('ie-' + field).focus();
+}
+
+function inlineEditSelect(slug, field, currentVal) {
+  var row = document.getElementById('if-' + field);
+  if (!row) return;
+  var options = [];
+  if (field === 'model') options = [{v:'',l:'Default'},{v:'haiku',l:'Haiku'},{v:'sonnet',l:'Sonnet'},{v:'opus',l:'Opus'}];
+  else if (field === 'tier') options = [{v:'1',l:'Tier 1'},{v:'2',l:'Tier 2'}];
+  var label = field.charAt(0).toUpperCase() + field.slice(1);
+  var selectHtml = '<select id="ie-' + field + '" style="flex:1" onchange="inlineSave(\\x27' + esc(slug) + '\\x27,\\x27' + field + '\\x27)">';
+  options.forEach(function(o) {
+    selectHtml += '<option value="' + o.v + '"' + (String(currentVal) === o.v ? ' selected' : '') + '>' + o.l + '</option>';
+  });
+  selectHtml += '</select>';
+  row.innerHTML = '<span class="inline-field-label">' + label + '</span>'
+    + selectHtml
+    + '<button class="inline-cancel" onclick="renderAgentDetail(currentAgentSlug)">Cancel</button>';
+}
+
+async function inlineSave(slug, field) {
+  var input = document.getElementById('ie-' + field);
+  if (!input) return;
+  var val = input.value;
+  var payload = {};
+  if (field === 'tier' || field === 'budgetMonthlyCents') {
+    payload[field] = parseInt(val) || 0;
+  } else {
+    payload[field] = val;
+  }
+  try {
+    var r = await apiFetch('/api/agents/' + slug, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    var d = await r.json();
+    if (d.ok) {
+      toast(field + ' updated');
+      renderAgentDetail(currentAgentSlug);
+      if (field === 'name') refreshTeamNav();
+    } else {
+      toast(d.error || 'Failed', 'error');
+    }
+  } catch(e) { toast(String(e), 'error'); }
+}
+
+async function toggleAgentTool(slug, toolName, enabled) {
+  try {
+    // Fetch current agent to get existing allowedTools
+    var r = await apiFetch('/api/agents');
+    var agents = await r.json();
+    var agent = (agents || []).find(function(a) { return a.slug === slug; });
+    if (!agent) { toast('Agent not found', 'error'); return; }
+    var current = agent.allowedTools || [];
+    var updated;
+    if (enabled) {
+      // Add tool if not present
+      updated = current.indexOf(toolName) >= 0 ? current : current.concat([toolName]);
+    } else {
+      // Remove tool
+      updated = current.filter(function(t) { return t !== toolName; });
+    }
+    var r2 = await apiFetch('/api/agents/' + slug, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ allowedTools: updated }),
+    });
+    var d = await r2.json();
+    if (d.ok) {
+      toast(toolName + (enabled ? ' enabled' : ' disabled'));
+      // Update local cache
+      if (_agentDetailData) _agentDetailData.allowedTools = updated;
+    } else {
+      toast(d.error || 'Failed to update', 'error');
+    }
+  } catch(e) { toast(String(e), 'error'); }
+}
+
 // ── Agent Detail Drawer ──────────────────
 var drawerSlug = '';
 var drawerTab = 'overview';
@@ -11478,12 +12010,13 @@ async function refreshGoalsProgress() {
     const data = await r.json();
     const container = document.getElementById('goals-progress-content');
 
+    let html = '<div style="display:flex;justify-content:flex-end;margin-bottom:12px"><button class="btn btn-sm btn-primary" onclick="openGoalModal()" style="font-size:12px">+ New Goal</button></div>';
+
     if (!data.goals?.length) {
-      container.innerHTML = '<div class="empty-state">No goals found. Create goals using the goal_create tool.</div>';
+      container.innerHTML = html + '<div class="empty-state">No goals yet. Click "+ New Goal" to create one.</div>';
       return;
     }
 
-    let html = '';
     const priorityColor = p => p === 'high' ? 'var(--red)' : p === 'medium' ? 'var(--orange)' : 'var(--green)';
     const statusIcon = s => s === 'active' ? '\\u25CF' : s === 'completed' ? '\\u2714' : '\\u25CB';
 
@@ -11494,6 +12027,8 @@ async function refreshGoalsProgress() {
       html += '<span style="flex:1">' + esc(goal.title) + '</span>';
       html += '<span style="background:' + priorityColor(goal.priority) + ';color:#000;font-size:11px;font-weight:700;padding:2px 10px;border-radius:10px">' + esc(goal.priority) + '</span>';
       if (goal.owner) html += '<span style="font-size:12px;color:var(--text-muted)">Owner: ' + esc(goal.owner) + '</span>';
+      html += '<button class="btn btn-sm" onclick="editGoal(\\x27' + esc(goal.id) + '\\x27)" style="font-size:10px;padding:2px 8px">Edit</button>';
+      html += '<button class="btn btn-sm" onclick="deleteGoal(\\x27' + esc(goal.id) + '\\x27,\\x27' + esc(goal.title).replace(/'/g, '') + '\\x27)" style="font-size:10px;padding:2px 8px;color:var(--red)">Del</button>';
       html += '</div>';
       html += '<div class="card-body">';
 
