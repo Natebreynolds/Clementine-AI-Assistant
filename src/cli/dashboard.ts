@@ -4214,6 +4214,311 @@ Respond ONLY with valid JSON:
     } catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
   });
 
+  // ── Digest Preferences API ─────────────────────────────────────
+
+  const DIGEST_PREFS_FILE = path.join(BASE_DIR, 'digest-preferences.json');
+  const VOICE_CACHE_DIR = path.join(BASE_DIR, 'cache', 'voice');
+
+  function getDigestPrefs(): Record<string, unknown> {
+    const defaults = {
+      enabled: false,
+      schedule: '0 8 * * 1-5',
+      channels: { email: true, discord: true, slack: false, voice: false },
+      emailRecipient: '',
+      sections: { summary: true, goals: true, crons: true, activity: true, metrics: true, approvals: true },
+      quietHours: { start: 22, end: 8 },
+    };
+    if (!existsSync(DIGEST_PREFS_FILE)) return defaults;
+    try { return { ...defaults, ...JSON.parse(readFileSync(DIGEST_PREFS_FILE, 'utf-8')) }; }
+    catch { return defaults; }
+  }
+
+  app.get('/api/digest/preferences', (_req, res) => {
+    res.json({ ok: true, preferences: getDigestPrefs() });
+  });
+
+  app.put('/api/digest/preferences', express.json(), (req, res) => {
+    try {
+      const current = getDigestPrefs();
+      const updated = { ...current, ...req.body };
+      writeFileSync(DIGEST_PREFS_FILE, JSON.stringify(updated, null, 2));
+      res.json({ ok: true, preferences: updated });
+    } catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
+  });
+
+  // ── Digest Composer + Delivery ─────────────────────────────────
+
+  // Helper: Microsoft Graph API for sending HTML email
+  let _graphTokenCache: { accessToken: string; expiresAt: number } | null = null;
+
+  async function getGraphTokenDash(): Promise<string> {
+    if (_graphTokenCache && Date.now() < _graphTokenCache.expiresAt - 300_000) return _graphTokenCache.accessToken;
+    const env = parseEnvFile();
+    const tenantId = env['MS_TENANT_ID'] || '';
+    const clientId = env['MS_CLIENT_ID'] || '';
+    const clientSecret = env['MS_CLIENT_SECRET'] || '';
+    if (!tenantId || !clientId || !clientSecret) throw new Error('Outlook not configured');
+    const tokenUrl = `https://login.microsoftonline.com/${tenantId}/oauth2/v2.0/token`;
+    const body = new URLSearchParams({ client_id: clientId, client_secret: clientSecret, scope: 'https://graph.microsoft.com/.default', grant_type: 'client_credentials' });
+    const res = await fetch(tokenUrl, { method: 'POST', body });
+    if (!res.ok) throw new Error(`Graph token failed: ${res.status}`);
+    const data = await res.json() as { access_token: string; expires_in: number };
+    _graphTokenCache = { accessToken: data.access_token, expiresAt: Date.now() + data.expires_in * 1000 };
+    return data.access_token;
+  }
+
+  async function sendDigestEmail(to: string, subject: string, htmlBody: string): Promise<void> {
+    const env = parseEnvFile();
+    const userEmail = env['MS_USER_EMAIL'] || '';
+    if (!userEmail) throw new Error('MS_USER_EMAIL not configured');
+    const token = await getGraphTokenDash();
+    const message = {
+      subject,
+      body: { contentType: 'HTML', content: htmlBody },
+      toRecipients: [{ emailAddress: { address: to } }],
+    };
+    const res = await fetch(`https://graph.microsoft.com/v1.0/users/${userEmail}/sendMail`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message, saveToSentItems: true }),
+    });
+    if (!res.ok) { const text = await res.text(); throw new Error(`Graph sendMail ${res.status}: ${text}`); }
+  }
+
+  // Compose digest from multiple data sources
+  async function composeDigest(): Promise<{ subject: string; html: string; text: string; sections: Record<string, string> }> {
+    const prefs = getDigestPrefs();
+    const secs = (prefs.sections || {}) as Record<string, boolean>;
+    const now = new Date();
+    const dateStr = now.toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
+    const sections: Record<string, string> = {};
+    let text = '';
+
+    // Office status
+    let officeSummary = '';
+    try {
+      const officeData = cached('digest-office', 30_000, () => {
+        const agentsDir = path.join(VAULT_DIR, '00-System', 'agents');
+        const agents: Array<Record<string, unknown>> = [];
+        if (existsSync(agentsDir)) {
+          for (const slug of readdirSync(agentsDir).filter(d => !d.startsWith('_'))) {
+            const agentFile = path.join(agentsDir, slug, 'agent.md');
+            if (!existsSync(agentFile)) continue;
+            const { data } = matter(readFileSync(agentFile, 'utf-8'));
+            agents.push({ slug, name: data.name || slug, status: data.status || 'active' });
+          }
+        }
+        return { agents };
+      });
+      const activeCount = officeData.agents.filter((a: Record<string, unknown>) => a.status === 'active').length;
+      officeSummary = `${officeData.agents.length} agent(s), ${activeCount} active`;
+    } catch { officeSummary = 'Could not load'; }
+
+    // Goals
+    if (secs.goals !== false) {
+      try {
+        if (existsSync(GOALS_DIR)) {
+          const files = readdirSync(GOALS_DIR).filter(f => f.endsWith('.json'));
+          const goals = files.map(f => { try { return JSON.parse(readFileSync(path.join(GOALS_DIR, f), 'utf-8')); } catch { return null; } }).filter(Boolean);
+          const active = goals.filter((g: Record<string, unknown>) => g.status === 'active');
+          const blocked = goals.filter((g: Record<string, unknown>) => g.status === 'blocked');
+          let goalText = `${active.length} active, ${blocked.length} blocked\n`;
+          active.slice(0, 5).forEach((g: Record<string, unknown>) => {
+            goalText += `  - ${g.title} [${g.priority}]`;
+            const na = g.nextActions as string[] | undefined;
+            if (na && na.length > 0) goalText += ` → ${na[0]}`;
+            goalText += '\n';
+          });
+          sections.goals = goalText;
+        }
+      } catch { /* skip */ }
+    }
+
+    // Cron run summary
+    if (secs.crons !== false) {
+      try {
+        const runsDir = path.join(BASE_DIR, 'cron', 'runs');
+        if (existsSync(runsDir)) {
+          let totalOk = 0, totalErr = 0, jobCount = 0;
+          for (const f of readdirSync(runsDir).filter(f => f.endsWith('.jsonl'))) {
+            const lines = readFileSync(path.join(runsDir, f), 'utf-8').trim().split('\n').filter(Boolean);
+            const today = now.toISOString().slice(0, 10);
+            const todayRuns = lines.filter(l => l.includes(today));
+            if (todayRuns.length > 0) jobCount++;
+            for (const l of todayRuns) {
+              try { const e = JSON.parse(l); if (e.status === 'ok') totalOk++; else totalErr++; } catch { /* skip */ }
+            }
+          }
+          sections.crons = `${jobCount} job(s) ran today: ${totalOk} succeeded, ${totalErr} failed`;
+        }
+      } catch { /* skip */ }
+    }
+
+    // Pending approvals
+    if (secs.approvals !== false) {
+      try {
+        if (existsSync(MEMORY_DB_PATH)) {
+          const Database = (await import('better-sqlite3')).default;
+          const db = new Database(MEMORY_DB_PATH, { readonly: true });
+          try {
+            const row = db.prepare("SELECT COUNT(*) as cnt FROM approval_queue WHERE status = 'pending'").get() as { cnt: number } | undefined;
+            if (row && row.cnt > 0) sections.approvals = `${row.cnt} pending approval(s)`;
+          } catch { /* table may not exist */ }
+          db.close();
+        }
+      } catch { /* skip */ }
+    }
+
+    // Build text + HTML
+    text = `Daily Digest — ${dateStr}\n${'='.repeat(40)}\n\nTeam: ${officeSummary}\n`;
+    if (sections.goals) text += `\nGoals:\n${sections.goals}`;
+    if (sections.crons) text += `\nCron Jobs: ${sections.crons}\n`;
+    if (sections.approvals) text += `\nApprovals: ${sections.approvals}\n`;
+
+    const html = `<!DOCTYPE html><html><body style="font-family:-apple-system,BlinkMacSystemFont,sans-serif;max-width:600px;margin:0 auto;color:#1a1a2e;padding:20px">
+<div style="border-bottom:3px solid #ff8c21;padding-bottom:12px;margin-bottom:20px">
+  <h1 style="margin:0;font-size:22px;color:#1a1a2e">Daily Digest</h1>
+  <div style="color:#8a92a0;font-size:13px;margin-top:4px">${dateStr} &middot; ${officeSummary}</div>
+</div>
+${sections.goals ? `<div style="margin-bottom:20px"><h3 style="margin:0 0 8px;font-size:15px;color:#ff8c21">Goals</h3><pre style="margin:0;font-size:13px;color:#5a6070;white-space:pre-wrap">${sections.goals.replace(/</g, '&lt;')}</pre></div>` : ''}
+${sections.crons ? `<div style="margin-bottom:20px"><h3 style="margin:0 0 8px;font-size:15px;color:#ff8c21">Cron Jobs</h3><p style="margin:0;font-size:13px;color:#5a6070">${sections.crons.replace(/</g, '&lt;')}</p></div>` : ''}
+${sections.approvals ? `<div style="margin-bottom:20px"><h3 style="margin:0 0 8px;font-size:15px;color:#ff8c21">Approvals</h3><p style="margin:0;font-size:13px;color:#e5534b;font-weight:600">${sections.approvals}</p></div>` : ''}
+<div style="margin-top:24px;padding-top:12px;border-top:1px solid #d8dde5;font-size:11px;color:#8a92a0">Sent by Clementine Command Center</div>
+</body></html>`;
+
+    return { subject: `Clementine Digest — ${dateStr}`, html, text, sections };
+  }
+
+  app.get('/api/digest/preview', async (_req, res) => {
+    try {
+      const digest = await composeDigest();
+      res.json({ ok: true, ...digest });
+    } catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
+  });
+
+  app.post('/api/digest/send', async (_req, res) => {
+    try {
+      const prefs = getDigestPrefs();
+      const channels = (prefs.channels || {}) as Record<string, boolean>;
+      const digest = await composeDigest();
+      const results: Record<string, string> = {};
+
+      // Email
+      if (channels.email) {
+        const recipient = (prefs.emailRecipient as string) || parseEnvFile()['MS_USER_EMAIL'] || '';
+        if (recipient) {
+          try { await sendDigestEmail(recipient, digest.subject, digest.html); results.email = 'sent'; }
+          catch (e) { results.email = 'error: ' + String(e); }
+        } else { results.email = 'skipped: no recipient'; }
+      }
+
+      // Discord/Slack via dispatcher
+      if (channels.discord || channels.slack) {
+        try {
+          const gw = await getGateway();
+          const dispatcher = (gw as any).dispatcher || (gw as any).notificationDispatcher;
+          if (dispatcher && typeof dispatcher.send === 'function') {
+            await dispatcher.send(`**${digest.subject}**\n\n${digest.text}`);
+            results.channels = 'sent';
+          } else { results.channels = 'skipped: no dispatcher'; }
+        } catch (e) { results.channels = 'error: ' + String(e); }
+      }
+
+      // Voice
+      if (channels.voice) {
+        try {
+          const env = parseEnvFile();
+          const apiKey = env['ELEVENLABS_API_KEY'] || '';
+          const voiceId = env['ELEVENLABS_VOICE_ID'] || '';
+          if (apiKey && voiceId) {
+            const hash = randomBytes(8).toString('hex');
+            if (!existsSync(VOICE_CACHE_DIR)) mkdirSync(VOICE_CACHE_DIR, { recursive: true });
+            const audioPath = path.join(VOICE_CACHE_DIR, `${hash}.mp3`);
+            const ttsRes = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`, {
+              method: 'POST',
+              headers: { 'xi-api-key': apiKey, 'Content-Type': 'application/json' },
+              body: JSON.stringify({ text: digest.text.slice(0, 4000), model_id: 'eleven_multilingual_v2' }),
+            });
+            if (ttsRes.ok) {
+              const buffer = Buffer.from(await ttsRes.arrayBuffer());
+              writeFileSync(audioPath, buffer);
+              results.voice = hash;
+            } else { results.voice = 'error: ElevenLabs ' + ttsRes.status; }
+          } else { results.voice = 'skipped: ElevenLabs not configured'; }
+        } catch (e) { results.voice = 'error: ' + String(e); }
+      }
+
+      res.json({ ok: true, results });
+    } catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
+  });
+
+  app.post('/api/digest/test', async (_req, res) => {
+    try {
+      const digest = await composeDigest();
+      const prefs = getDigestPrefs();
+      const channels = (prefs.channels || {}) as Record<string, boolean>;
+      const results: Record<string, string> = {};
+
+      // Always try email for test
+      const recipient = (prefs.emailRecipient as string) || parseEnvFile()['MS_USER_EMAIL'] || '';
+      if (recipient && channels.email) {
+        try { await sendDigestEmail(recipient, '[TEST] ' + digest.subject, digest.html); results.email = 'sent'; }
+        catch (e) { results.email = 'error: ' + String(e); }
+      }
+
+      // Always try channels for test
+      if (channels.discord || channels.slack) {
+        try {
+          const gw = await getGateway();
+          const dispatcher = (gw as any).dispatcher || (gw as any).notificationDispatcher;
+          if (dispatcher && typeof dispatcher.send === 'function') {
+            await dispatcher.send(`**[TEST] ${digest.subject}**\n\n${digest.text}`);
+            results.channels = 'sent';
+          }
+        } catch (e) { results.channels = 'error: ' + String(e); }
+      }
+
+      res.json({ ok: true, results, preview: { subject: digest.subject, text: digest.text } });
+    } catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
+  });
+
+  // ── Voice Synthesis API ───────────────────────────────────────
+
+  app.post('/api/voice/synthesize', express.json(), async (req, res) => {
+    try {
+      const text = (req.body.text || '').slice(0, 5000);
+      if (!text) { res.status(400).json({ ok: false, error: 'text is required' }); return; }
+      const env = parseEnvFile();
+      const apiKey = env['ELEVENLABS_API_KEY'] || '';
+      const voiceId = env['ELEVENLABS_VOICE_ID'] || '';
+      if (!apiKey || !voiceId) { res.status(400).json({ ok: false, error: 'ElevenLabs not configured. Set ELEVENLABS_API_KEY and ELEVENLABS_VOICE_ID in Settings.' }); return; }
+
+      const hash = randomBytes(8).toString('hex');
+      if (!existsSync(VOICE_CACHE_DIR)) mkdirSync(VOICE_CACHE_DIR, { recursive: true });
+      const audioPath = path.join(VOICE_CACHE_DIR, `${hash}.mp3`);
+
+      const ttsRes = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`, {
+        method: 'POST',
+        headers: { 'xi-api-key': apiKey, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text, model_id: 'eleven_multilingual_v2' }),
+      });
+      if (!ttsRes.ok) { res.status(502).json({ ok: false, error: 'ElevenLabs error: ' + ttsRes.status }); return; }
+
+      const buffer = Buffer.from(await ttsRes.arrayBuffer());
+      writeFileSync(audioPath, buffer);
+      res.json({ ok: true, url: `/api/voice/audio/${hash}`, hash });
+    } catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
+  });
+
+  app.get('/api/voice/audio/:hash', (req, res) => {
+    const hash = req.params.hash.replace(/[^a-f0-9]/g, '');
+    const audioPath = path.join(VOICE_CACHE_DIR, `${hash}.mp3`);
+    if (!existsSync(audioPath)) { res.status(404).json({ error: 'Audio not found' }); return; }
+    res.setHeader('Content-Type', 'audio/mpeg');
+    res.setHeader('Cache-Control', 'public, max-age=3600');
+    res.send(readFileSync(audioPath));
+  });
+
   // ── Reflection Quality Trends API ──────────────────────────────
 
   const CRON_REFLECTIONS_DIR = path.join(BASE_DIR, 'cron', 'reflections');
@@ -7379,6 +7684,7 @@ function getDashboardHTML(token: string): string {
         <button class="active" onclick="switchTab('settings','general')">General</button>
         <button onclick="switchTab('settings','remote')">Remote Access</button>
         <button onclick="switchTab('settings','integrations')">Integrations</button>
+        <button onclick="switchTab('settings','notifications')">Notifications</button>
         <button onclick="switchTab('settings','projects')">Projects</button>
       </div>
       <div id="settings-tab-content">
@@ -7433,6 +7739,9 @@ function getDashboardHTML(token: string): string {
               </table>
             </div>
           </div>
+        </div>
+        <div class="tab-pane" id="tab-settings-notifications">
+          <div id="digest-settings-content"><div class="empty-state">Loading...</div></div>
         </div>
         <div class="tab-pane" id="tab-settings-projects">
           <p style="color:var(--text-muted);margin-bottom:16px">Link projects to give Clementine automatic access to their tools and MCP servers. When you mention a linked project's keywords in chat, Clementine switches into that project's context automatically.</p>
@@ -7952,6 +8261,7 @@ function switchTab(group, tab) {
     if (tab === 'integrations') refreshSalesforce();
     if (tab === 'projects') refreshProjects();
     if (tab === 'remote') refreshRemoteAccess();
+    if (tab === 'notifications') refreshDigestSettings();
   }
 }
 
@@ -10052,6 +10362,186 @@ async function refreshLogs() {
     applyLogFilter();
   } catch(e) { }
 }
+// ── Digest / Notification Settings ───────
+var _digestPrefs = null;
+
+async function refreshDigestSettings() {
+  var container = document.getElementById('digest-settings-content');
+  if (!container) return;
+  try {
+    var r = await apiFetch('/api/digest/preferences');
+    var d = await r.json();
+    _digestPrefs = d.preferences || {};
+    var p = _digestPrefs;
+    var ch = p.channels || {};
+    var sec = p.sections || {};
+    var qh = p.quietHours || {};
+
+    var html = '<p style="color:var(--text-muted);margin-bottom:16px">Configure daily digests, delivery channels, and voice synthesis.</p>';
+
+    // Digest schedule card
+    html += '<div class="card" style="margin-bottom:16px"><div class="card-header">Daily Digest</div><div class="card-body" style="padding:16px">';
+    html += '<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">';
+    // Enable toggle
+    html += '<div class="form-row"><label>Enabled</label><label class="toggle-switch"><input type="checkbox" id="digest-enabled"' + (p.enabled ? ' checked' : '') + ' onchange="saveDigestPrefs()"><span class="toggle-slider"></span></label></div>';
+    // Schedule
+    html += '<div class="form-row"><label>Schedule</label><select id="digest-schedule" onchange="saveDigestPrefs()" style="width:100%;padding:6px 10px;background:var(--bg-input);border:1px solid var(--border);border-radius:var(--radius-sm);color:var(--text-primary);font-size:13px">';
+    var schedOpts = [
+      { v: '0 8 * * 1-5', l: 'Weekdays 8am' },
+      { v: '0 8 * * *', l: 'Daily 8am' },
+      { v: '0 7 * * 1-5', l: 'Weekdays 7am' },
+      { v: '0 9 * * *', l: 'Daily 9am' },
+      { v: '0 18 * * 5', l: 'Friday 6pm (weekly)' },
+    ];
+    schedOpts.forEach(function(o) {
+      html += '<option value="' + o.v + '"' + (p.schedule === o.v ? ' selected' : '') + '>' + o.l + '</option>';
+    });
+    html += '</select></div>';
+    html += '</div>';
+
+    // Email recipient
+    html += '<div class="form-row" style="margin-top:12px"><label>Email Recipient</label>';
+    html += '<input type="email" id="digest-email" value="' + esc(p.emailRecipient || '') + '" placeholder="Defaults to MS_USER_EMAIL from .env" onchange="saveDigestPrefs()" style="width:100%;padding:6px 10px;background:var(--bg-input);border:1px solid var(--border);border-radius:var(--radius-sm);color:var(--text-primary);font-size:13px">';
+    html += '</div>';
+    html += '</div></div>';
+
+    // Channels card
+    html += '<div class="card" style="margin-bottom:16px"><div class="card-header">Delivery Channels</div><div class="card-body" style="padding:16px">';
+    html += '<div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">';
+    var chOpts = [
+      { k: 'email', l: 'Email', icon: '&#9993;' },
+      { k: 'discord', l: 'Discord DM', icon: '&#128172;' },
+      { k: 'slack', l: 'Slack', icon: '&#128488;' },
+      { k: 'voice', l: 'Voice (TTS)', icon: '&#127908;' },
+    ];
+    chOpts.forEach(function(o) {
+      html += '<label style="display:flex;align-items:center;gap:8px;padding:8px 12px;border:1px solid var(--border);border-radius:var(--radius);cursor:pointer;font-size:13px">';
+      html += '<input type="checkbox" class="digest-channel-cb" data-channel="' + o.k + '"' + (ch[o.k] ? ' checked' : '') + ' onchange="saveDigestPrefs()">';
+      html += '<span>' + o.icon + '</span><span>' + o.l + '</span></label>';
+    });
+    html += '</div></div></div>';
+
+    // Content sections card
+    html += '<div class="card" style="margin-bottom:16px"><div class="card-header">Digest Content</div><div class="card-body" style="padding:16px">';
+    html += '<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px">';
+    var secOpts = [
+      { k: 'goals', l: 'Goals' },
+      { k: 'crons', l: 'Cron Jobs' },
+      { k: 'activity', l: 'Activity' },
+      { k: 'metrics', l: 'Metrics' },
+      { k: 'approvals', l: 'Approvals' },
+    ];
+    secOpts.forEach(function(o) {
+      html += '<label style="display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer">';
+      html += '<input type="checkbox" class="digest-section-cb" data-section="' + o.k + '"' + (sec[o.k] !== false ? ' checked' : '') + ' onchange="saveDigestPrefs()">';
+      html += o.l + '</label>';
+    });
+    html += '</div></div></div>';
+
+    // Quiet hours
+    html += '<div class="card" style="margin-bottom:16px"><div class="card-header">Quiet Hours</div><div class="card-body" style="padding:16px">';
+    html += '<div style="display:flex;align-items:center;gap:12px;font-size:13px">';
+    html += '<span style="color:var(--text-muted)">No notifications between</span>';
+    html += '<select id="digest-quiet-start" onchange="saveDigestPrefs()" style="padding:4px 8px;background:var(--bg-input);border:1px solid var(--border);border-radius:var(--radius-sm);color:var(--text-primary);font-size:13px">';
+    for (var h = 0; h < 24; h++) { html += '<option value="' + h + '"' + ((qh.start || 22) === h ? ' selected' : '') + '>' + (h === 0 ? '12am' : h < 12 ? h + 'am' : h === 12 ? '12pm' : (h-12) + 'pm') + '</option>'; }
+    html += '</select><span style="color:var(--text-muted)">and</span>';
+    html += '<select id="digest-quiet-end" onchange="saveDigestPrefs()" style="padding:4px 8px;background:var(--bg-input);border:1px solid var(--border);border-radius:var(--radius-sm);color:var(--text-primary);font-size:13px">';
+    for (var h = 0; h < 24; h++) { html += '<option value="' + h + '"' + ((qh.end || 8) === h ? ' selected' : '') + '>' + (h === 0 ? '12am' : h < 12 ? h + 'am' : h === 12 ? '12pm' : (h-12) + 'pm') + '</option>'; }
+    html += '</select></div></div></div>';
+
+    // Action buttons
+    html += '<div style="display:flex;gap:8px;flex-wrap:wrap">';
+    html += '<button class="btn btn-primary" onclick="previewDigest()">Preview Digest</button>';
+    html += '<button class="btn" onclick="sendTestDigest()">Send Test</button>';
+    html += '<button class="btn" onclick="listenToDigest()">Listen</button>';
+    html += '</div>';
+
+    // Preview area
+    html += '<div id="digest-preview-area" style="margin-top:16px;display:none"></div>';
+    // Audio player
+    html += '<audio id="digest-audio-player" style="display:none;margin-top:12px;width:100%" controls></audio>';
+
+    container.innerHTML = html;
+  } catch(e) {
+    container.innerHTML = '<div class="empty-state">Failed to load: ' + esc(String(e)) + '</div>';
+  }
+}
+
+async function saveDigestPrefs() {
+  var payload = {
+    enabled: document.getElementById('digest-enabled') ? document.getElementById('digest-enabled').checked : false,
+    schedule: document.getElementById('digest-schedule') ? document.getElementById('digest-schedule').value : '0 8 * * 1-5',
+    emailRecipient: document.getElementById('digest-email') ? document.getElementById('digest-email').value.trim() : '',
+    channels: {},
+    sections: {},
+    quietHours: {
+      start: parseInt(document.getElementById('digest-quiet-start') ? document.getElementById('digest-quiet-start').value : '22') || 22,
+      end: parseInt(document.getElementById('digest-quiet-end') ? document.getElementById('digest-quiet-end').value : '8') || 8,
+    },
+  };
+  document.querySelectorAll('.digest-channel-cb').forEach(function(cb) { payload.channels[cb.dataset.channel] = cb.checked; });
+  document.querySelectorAll('.digest-section-cb').forEach(function(cb) { payload.sections[cb.dataset.section] = cb.checked; });
+  try {
+    await apiFetch('/api/digest/preferences', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+  } catch { /* silent save */ }
+}
+
+async function previewDigest() {
+  var area = document.getElementById('digest-preview-area');
+  if (!area) return;
+  area.style.display = 'block';
+  area.innerHTML = '<div class="empty-state" style="padding:16px">Generating digest preview...</div>';
+  try {
+    var r = await apiFetch('/api/digest/preview');
+    var d = await r.json();
+    if (!d.ok) { area.innerHTML = '<div class="empty-state" style="color:var(--red)">Failed: ' + esc(d.error || '') + '</div>'; return; }
+    area.innerHTML = '<div class="card"><div class="card-header">' + esc(d.subject) + '</div><div class="card-body" style="padding:16px">' + d.html + '</div></div>';
+  } catch(e) { area.innerHTML = '<div class="empty-state" style="color:var(--red)">Error: ' + esc(String(e)) + '</div>'; }
+}
+
+async function sendTestDigest() {
+  toast('Sending test digest...');
+  try {
+    var r = await apiFetch('/api/digest/test', { method: 'POST' });
+    var d = await r.json();
+    if (d.ok) {
+      var msgs = [];
+      for (var ch in (d.results || {})) msgs.push(ch + ': ' + d.results[ch]);
+      toast('Test sent! ' + msgs.join(', '));
+    } else { toast(d.error || 'Failed', 'error'); }
+  } catch(e) { toast(String(e), 'error'); }
+}
+
+async function listenToDigest() {
+  var player = document.getElementById('digest-audio-player');
+  if (!player) return;
+  player.style.display = 'none';
+  toast('Generating audio...');
+  try {
+    // Get digest text first
+    var r = await apiFetch('/api/digest/preview');
+    var d = await r.json();
+    if (!d.ok) { toast('Failed to generate digest', 'error'); return; }
+    // Synthesize
+    var r2 = await apiFetch('/api/voice/synthesize', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text: d.text }),
+    });
+    var d2 = await r2.json();
+    if (d2.ok && d2.url) {
+      player.src = d2.url;
+      player.style.display = 'block';
+      player.play();
+      toast('Playing audio digest');
+    } else { toast(d2.error || 'Voice synthesis failed', 'error'); }
+  } catch(e) { toast(String(e), 'error'); }
+}
+
 async function refreshSettings() {
   var container = document.getElementById('settings-content');
   try {
