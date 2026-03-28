@@ -244,6 +244,123 @@ export class MemoryStore {
       CREATE INDEX IF NOT EXISTS idx_usage_source ON usage_log(source);
       CREATE INDEX IF NOT EXISTS idx_usage_created ON usage_log(created_at);
     `);
+
+    // ── SDR Operational Tables ───────────────────────────────────────
+
+    // Leads — structured prospect records for SDR workflows
+    this.conn.exec(`
+      CREATE TABLE IF NOT EXISTS leads (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        agent_slug TEXT,
+        email TEXT NOT NULL UNIQUE,
+        name TEXT NOT NULL,
+        company TEXT,
+        title TEXT,
+        status TEXT NOT NULL DEFAULT 'new',
+        source TEXT,
+        sf_id TEXT,
+        metadata JSON DEFAULT '{}',
+        created_at TEXT DEFAULT (datetime('now')),
+        updated_at TEXT DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_leads_agent ON leads(agent_slug);
+      CREATE INDEX IF NOT EXISTS idx_leads_status ON leads(status);
+      CREATE INDEX IF NOT EXISTS idx_leads_company ON leads(company);
+      CREATE INDEX IF NOT EXISTS idx_leads_email ON leads(email);
+    `);
+
+    // Sequence enrollments — tracks each lead's position in an outbound cadence
+    this.conn.exec(`
+      CREATE TABLE IF NOT EXISTS sequence_enrollments (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        lead_id INTEGER NOT NULL REFERENCES leads(id),
+        sequence_name TEXT NOT NULL,
+        current_step INTEGER NOT NULL DEFAULT 0,
+        status TEXT NOT NULL DEFAULT 'active',
+        next_step_due_at TEXT,
+        started_at TEXT DEFAULT (datetime('now')),
+        updated_at TEXT DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_seq_lead ON sequence_enrollments(lead_id);
+      CREATE INDEX IF NOT EXISTS idx_seq_status ON sequence_enrollments(status);
+      CREATE INDEX IF NOT EXISTS idx_seq_due ON sequence_enrollments(next_step_due_at);
+    `);
+
+    // Activities — log of all SDR actions (emails sent, meetings booked, etc.)
+    this.conn.exec(`
+      CREATE TABLE IF NOT EXISTS activities (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        lead_id INTEGER REFERENCES leads(id),
+        agent_slug TEXT,
+        type TEXT NOT NULL,
+        subject TEXT,
+        detail TEXT,
+        template_used TEXT,
+        performed_at TEXT DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_activities_lead ON activities(lead_id);
+      CREATE INDEX IF NOT EXISTS idx_activities_agent ON activities(agent_slug);
+      CREATE INDEX IF NOT EXISTS idx_activities_type ON activities(type);
+      CREATE INDEX IF NOT EXISTS idx_activities_performed ON activities(performed_at);
+    `);
+
+    // Suppression list — emails that must never be contacted (opt-out, bounce, complaint)
+    this.conn.exec(`
+      CREATE TABLE IF NOT EXISTS suppression_list (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        email TEXT NOT NULL UNIQUE,
+        reason TEXT NOT NULL,
+        added_at TEXT DEFAULT (datetime('now')),
+        added_by TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_suppression_email ON suppression_list(email);
+    `);
+
+    // Send log — tracks every outbound email for daily cap enforcement and audit
+    this.conn.exec(`
+      CREATE TABLE IF NOT EXISTS send_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        agent_slug TEXT,
+        recipient TEXT NOT NULL,
+        subject TEXT,
+        template_used TEXT,
+        sent_at TEXT DEFAULT (datetime('now')),
+        policy_ref TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_sendlog_agent ON send_log(agent_slug);
+      CREATE INDEX IF NOT EXISTS idx_sendlog_sent ON send_log(sent_at);
+    `);
+
+    // Approval queue — pending actions awaiting human review
+    this.conn.exec(`
+      CREATE TABLE IF NOT EXISTS approval_queue (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        agent_slug TEXT,
+        action_type TEXT NOT NULL,
+        summary TEXT NOT NULL,
+        detail JSON DEFAULT '{}',
+        status TEXT NOT NULL DEFAULT 'pending',
+        requested_at TEXT DEFAULT (datetime('now')),
+        resolved_at TEXT,
+        resolved_by TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_approval_agent ON approval_queue(agent_slug);
+      CREATE INDEX IF NOT EXISTS idx_approval_status ON approval_queue(status);
+    `);
+
+    // Config revisions — versioned snapshots of agent config files
+    this.conn.exec(`
+      CREATE TABLE IF NOT EXISTS config_revisions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        agent_slug TEXT NOT NULL,
+        file_name TEXT NOT NULL,
+        content TEXT NOT NULL,
+        changed_by TEXT,
+        created_at TEXT DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_configrev_agent ON config_revisions(agent_slug);
+      CREATE INDEX IF NOT EXISTS idx_configrev_file ON config_revisions(agent_slug, file_name);
+    `);
   }
 
   /**
@@ -1604,6 +1721,315 @@ export class MemoryStore {
       consolidated: row.consolidated,
       unconsolidated: row.total - row.consolidated,
     };
+  }
+
+  // ── SDR Operational Data ─────────────────────────────────────────
+
+  // -- Leads --
+
+  upsertLead(lead: {
+    agentSlug: string; email: string; name: string;
+    company?: string; title?: string; status?: string;
+    source?: string; sfId?: string; metadata?: Record<string, unknown>;
+  }): { id: number; created: boolean } {
+    const existing = this.conn.prepare('SELECT id FROM leads WHERE email = ?').get(lead.email) as { id: number } | undefined;
+    if (existing) {
+      const sets: string[] = ['updated_at = datetime(\'now\')'];
+      const vals: unknown[] = [];
+      if (lead.name) { sets.push('name = ?'); vals.push(lead.name); }
+      if (lead.company !== undefined) { sets.push('company = ?'); vals.push(lead.company); }
+      if (lead.title !== undefined) { sets.push('title = ?'); vals.push(lead.title); }
+      if (lead.status) { sets.push('status = ?'); vals.push(lead.status); }
+      if (lead.source !== undefined) { sets.push('source = ?'); vals.push(lead.source); }
+      if (lead.sfId !== undefined) { sets.push('sf_id = ?'); vals.push(lead.sfId); }
+      if (lead.metadata) { sets.push('metadata = ?'); vals.push(JSON.stringify(lead.metadata)); }
+      vals.push(existing.id);
+      this.conn.prepare(`UPDATE leads SET ${sets.join(', ')} WHERE id = ?`).run(...vals);
+      return { id: existing.id, created: false };
+    }
+    const result = this.conn.prepare(
+      `INSERT INTO leads (agent_slug, email, name, company, title, status, source, sf_id, metadata)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      lead.agentSlug, lead.email, lead.name, lead.company ?? null, lead.title ?? null,
+      lead.status ?? 'new', lead.source ?? null, lead.sfId ?? null,
+      JSON.stringify(lead.metadata ?? {}),
+    );
+    return { id: Number(result.lastInsertRowid), created: true };
+  }
+
+  searchLeads(filters: {
+    agentSlug?: string; status?: string; company?: string;
+    query?: string; limit?: number;
+  }): Array<Record<string, unknown>> {
+    const where: string[] = [];
+    const vals: unknown[] = [];
+    if (filters.agentSlug) { where.push('agent_slug = ?'); vals.push(filters.agentSlug); }
+    if (filters.status) { where.push('status = ?'); vals.push(filters.status); }
+    if (filters.company) { where.push('company LIKE ?'); vals.push(`%${filters.company}%`); }
+    if (filters.query) { where.push('(name LIKE ? OR email LIKE ? OR company LIKE ?)'); vals.push(`%${filters.query}%`, `%${filters.query}%`, `%${filters.query}%`); }
+    const clause = where.length > 0 ? `WHERE ${where.join(' AND ')}` : '';
+    const limit = Math.min(filters.limit ?? 50, 200);
+    return this.conn.prepare(`SELECT * FROM leads ${clause} ORDER BY updated_at DESC LIMIT ?`).all(...vals, limit) as Array<Record<string, unknown>>;
+  }
+
+  getLeadByEmail(email: string): Record<string, unknown> | undefined {
+    return this.conn.prepare('SELECT * FROM leads WHERE email = ?').get(email) as Record<string, unknown> | undefined;
+  }
+
+  getLeadById(id: number): Record<string, unknown> | undefined {
+    return this.conn.prepare('SELECT * FROM leads WHERE id = ?').get(id) as Record<string, unknown> | undefined;
+  }
+
+  // -- Sequence Enrollments --
+
+  enrollSequence(enrollment: {
+    leadId: number; sequenceName: string; nextStepDueAt?: string;
+  }): number {
+    const result = this.conn.prepare(
+      `INSERT INTO sequence_enrollments (lead_id, sequence_name, current_step, status, next_step_due_at)
+       VALUES (?, ?, 0, 'active', ?)`
+    ).run(enrollment.leadId, enrollment.sequenceName, enrollment.nextStepDueAt ?? null);
+    return Number(result.lastInsertRowid);
+  }
+
+  advanceSequence(id: number, updates: {
+    currentStep?: number; status?: string; nextStepDueAt?: string | null;
+  }): void {
+    const sets: string[] = ['updated_at = datetime(\'now\')'];
+    const vals: unknown[] = [];
+    if (updates.currentStep !== undefined) { sets.push('current_step = ?'); vals.push(updates.currentStep); }
+    if (updates.status) { sets.push('status = ?'); vals.push(updates.status); }
+    if (updates.nextStepDueAt !== undefined) { sets.push('next_step_due_at = ?'); vals.push(updates.nextStepDueAt); }
+    vals.push(id);
+    this.conn.prepare(`UPDATE sequence_enrollments SET ${sets.join(', ')} WHERE id = ?`).run(...vals);
+  }
+
+  getDueSequences(agentSlug?: string): Array<Record<string, unknown>> {
+    const base = `SELECT se.*, l.email, l.name, l.company FROM sequence_enrollments se
+      JOIN leads l ON l.id = se.lead_id
+      WHERE se.status = 'active' AND se.next_step_due_at <= datetime('now')`;
+    const clause = agentSlug ? ` AND l.agent_slug = ?` : '';
+    return this.conn.prepare(`${base}${clause} ORDER BY se.next_step_due_at ASC`).all(
+      ...(agentSlug ? [agentSlug] : [])
+    ) as Array<Record<string, unknown>>;
+  }
+
+  getSequencesByLead(leadId: number): Array<Record<string, unknown>> {
+    return this.conn.prepare('SELECT * FROM sequence_enrollments WHERE lead_id = ? ORDER BY started_at DESC').all(leadId) as Array<Record<string, unknown>>;
+  }
+
+  // -- Activities --
+
+  logActivity(activity: {
+    leadId?: number; agentSlug: string; type: string;
+    subject?: string; detail?: string; templateUsed?: string;
+  }): number {
+    const result = this.conn.prepare(
+      `INSERT INTO activities (lead_id, agent_slug, type, subject, detail, template_used)
+       VALUES (?, ?, ?, ?, ?, ?)`
+    ).run(
+      activity.leadId ?? null, activity.agentSlug, activity.type,
+      activity.subject ?? null, activity.detail ?? null, activity.templateUsed ?? null,
+    );
+    return Number(result.lastInsertRowid);
+  }
+
+  getActivities(filters: {
+    leadId?: number; agentSlug?: string; type?: string; limit?: number; sinceIso?: string;
+  }): Array<Record<string, unknown>> {
+    const where: string[] = [];
+    const vals: unknown[] = [];
+    if (filters.leadId) { where.push('lead_id = ?'); vals.push(filters.leadId); }
+    if (filters.agentSlug) { where.push('agent_slug = ?'); vals.push(filters.agentSlug); }
+    if (filters.type) { where.push('type = ?'); vals.push(filters.type); }
+    if (filters.sinceIso) { where.push('performed_at >= ?'); vals.push(filters.sinceIso); }
+    const clause = where.length > 0 ? `WHERE ${where.join(' AND ')}` : '';
+    const limit = Math.min(filters.limit ?? 50, 500);
+    return this.conn.prepare(`SELECT * FROM activities ${clause} ORDER BY performed_at DESC LIMIT ?`).all(...vals, limit) as Array<Record<string, unknown>>;
+  }
+
+  // -- Suppression List --
+
+  addSuppression(email: string, reason: string, addedBy?: string): void {
+    this.conn.prepare(
+      `INSERT OR IGNORE INTO suppression_list (email, reason, added_by) VALUES (?, ?, ?)`
+    ).run(email.toLowerCase(), reason, addedBy ?? null);
+  }
+
+  isSuppressed(email: string): boolean {
+    const row = this.conn.prepare('SELECT 1 FROM suppression_list WHERE email = ?').get(email.toLowerCase());
+    return !!row;
+  }
+
+  getSuppressionList(limit: number = 100): Array<Record<string, unknown>> {
+    return this.conn.prepare('SELECT * FROM suppression_list ORDER BY added_at DESC LIMIT ?').all(limit) as Array<Record<string, unknown>>;
+  }
+
+  // -- Send Log --
+
+  logSend(entry: {
+    agentSlug: string; recipient: string; subject?: string;
+    templateUsed?: string; policyRef?: string;
+  }): void {
+    this.conn.prepare(
+      `INSERT INTO send_log (agent_slug, recipient, subject, template_used, policy_ref) VALUES (?, ?, ?, ?, ?)`
+    ).run(entry.agentSlug, entry.recipient, entry.subject ?? null, entry.templateUsed ?? null, entry.policyRef ?? null);
+  }
+
+  getDailySendCount(agentSlug: string): number {
+    const row = this.conn.prepare(
+      `SELECT COUNT(*) as cnt FROM send_log WHERE agent_slug = ? AND sent_at >= date('now')`
+    ).get(agentSlug) as { cnt: number };
+    return row.cnt;
+  }
+
+  getSendLog(filters: {
+    agentSlug?: string; limit?: number; sinceIso?: string;
+  }): Array<Record<string, unknown>> {
+    const where: string[] = [];
+    const vals: unknown[] = [];
+    if (filters.agentSlug) { where.push('agent_slug = ?'); vals.push(filters.agentSlug); }
+    if (filters.sinceIso) { where.push('sent_at >= ?'); vals.push(filters.sinceIso); }
+    const clause = where.length > 0 ? `WHERE ${where.join(' AND ')}` : '';
+    const limit = Math.min(filters.limit ?? 50, 500);
+    return this.conn.prepare(`SELECT * FROM send_log ${clause} ORDER BY sent_at DESC LIMIT ?`).all(...vals, limit) as Array<Record<string, unknown>>;
+  }
+
+  // -- Approval Queue --
+
+  addApproval(entry: {
+    agentSlug: string; actionType: string; summary: string;
+    detail?: Record<string, unknown>;
+  }): number {
+    const result = this.conn.prepare(
+      `INSERT INTO approval_queue (agent_slug, action_type, summary, detail) VALUES (?, ?, ?, ?)`
+    ).run(entry.agentSlug, entry.actionType, entry.summary, JSON.stringify(entry.detail ?? {}));
+    return Number(result.lastInsertRowid);
+  }
+
+  resolveApproval(id: number, status: 'approved' | 'rejected', resolvedBy?: string): void {
+    this.conn.prepare(
+      `UPDATE approval_queue SET status = ?, resolved_at = datetime('now'), resolved_by = ? WHERE id = ?`
+    ).run(status, resolvedBy ?? null, id);
+  }
+
+  getPendingApprovals(agentSlug?: string): Array<Record<string, unknown>> {
+    if (agentSlug) {
+      return this.conn.prepare(
+        `SELECT * FROM approval_queue WHERE status = 'pending' AND agent_slug = ? ORDER BY requested_at DESC`
+      ).all(agentSlug) as Array<Record<string, unknown>>;
+    }
+    return this.conn.prepare(
+      `SELECT * FROM approval_queue WHERE status = 'pending' ORDER BY requested_at DESC`
+    ).all() as Array<Record<string, unknown>>;
+  }
+
+  getApprovalById(id: number): Record<string, unknown> | undefined {
+    return this.conn.prepare('SELECT * FROM approval_queue WHERE id = ?').get(id) as Record<string, unknown> | undefined;
+  }
+
+  // -- Agent KPIs --
+
+  getAgentKpis(agentSlug: string, sinceIso?: string): Record<string, number> {
+    const since = sinceIso ?? new Date(Date.now() - 7 * 86400000).toISOString();
+
+    const emailsSent = (this.conn.prepare(
+      `SELECT COUNT(*) as cnt FROM activities WHERE agent_slug = ? AND type = 'email_sent' AND performed_at >= ?`
+    ).get(agentSlug, since) as { cnt: number }).cnt;
+
+    const emailsReceived = (this.conn.prepare(
+      `SELECT COUNT(*) as cnt FROM activities WHERE agent_slug = ? AND type = 'email_received' AND performed_at >= ?`
+    ).get(agentSlug, since) as { cnt: number }).cnt;
+
+    const meetingsBooked = (this.conn.prepare(
+      `SELECT COUNT(*) as cnt FROM activities WHERE agent_slug = ? AND type = 'meeting_booked' AND performed_at >= ?`
+    ).get(agentSlug, since) as { cnt: number }).cnt;
+
+    const leadsCreated = (this.conn.prepare(
+      `SELECT COUNT(*) as cnt FROM leads WHERE agent_slug = ? AND created_at >= ?`
+    ).get(agentSlug, since) as { cnt: number }).cnt;
+
+    const leadsContacted = (this.conn.prepare(
+      `SELECT COUNT(DISTINCT lead_id) as cnt FROM activities WHERE agent_slug = ? AND type = 'email_sent' AND performed_at >= ?`
+    ).get(agentSlug, since) as { cnt: number }).cnt;
+
+    const sequencesActive = (this.conn.prepare(
+      `SELECT COUNT(*) as cnt FROM sequence_enrollments se JOIN leads l ON l.id = se.lead_id
+       WHERE l.agent_slug = ? AND se.status = 'active'`
+    ).get(agentSlug) as { cnt: number }).cnt;
+
+    const sequencesCompleted = (this.conn.prepare(
+      `SELECT COUNT(*) as cnt FROM sequence_enrollments se JOIN leads l ON l.id = se.lead_id
+       WHERE l.agent_slug = ? AND se.status = 'completed' AND se.updated_at >= ?`
+    ).get(agentSlug, since) as { cnt: number }).cnt;
+
+    const replyRate = emailsSent > 0 ? Math.round((emailsReceived / emailsSent) * 1000) / 10 : 0;
+
+    return {
+      emailsSent, emailsReceived, replyRate, meetingsBooked,
+      leadsCreated, leadsContacted, sequencesActive, sequencesCompleted,
+    };
+  }
+
+  // -- Agent Budget --
+
+  /** Get current month's token spend for an agent (in cents, estimated from token counts). */
+  getAgentMonthlySpend(agentSlug: string): number {
+    // Estimate cost from tokens: ~$3/M input, ~$15/M output for Sonnet-class
+    // This is a rough estimate — can be refined with actual pricing
+    const row = this.conn.prepare(
+      `SELECT
+        COALESCE(SUM(input_tokens), 0) as inp,
+        COALESCE(SUM(output_tokens), 0) as out
+       FROM usage_log
+       WHERE session_key LIKE ? AND created_at >= date('now', 'start of month')`
+    ).get(`%${agentSlug}%`) as { inp: number; out: number };
+    // Rough pricing: $3/M input = 0.3 cents/1K, $15/M output = 1.5 cents/1K
+    const inputCents = (row.inp / 1000) * 0.3;
+    const outputCents = (row.out / 1000) * 1.5;
+    return Math.round(inputCents + outputCents);
+  }
+
+  /** Check if an agent has exceeded its monthly budget. */
+  isOverBudget(agentSlug: string, budgetCents: number): boolean {
+    if (!budgetCents || budgetCents <= 0) return false;
+    return this.getAgentMonthlySpend(agentSlug) >= budgetCents;
+  }
+
+  // -- Config Revisions --
+
+  /** Snapshot a config file before writing changes. */
+  snapshotConfig(agentSlug: string, fileName: string, content: string, changedBy?: string): void {
+    this.conn.prepare(
+      `INSERT INTO config_revisions (agent_slug, file_name, content, changed_by) VALUES (?, ?, ?, ?)`
+    ).run(agentSlug, fileName, content, changedBy ?? null);
+    // Keep max 20 revisions per file
+    this.conn.prepare(
+      `DELETE FROM config_revisions WHERE agent_slug = ? AND file_name = ? AND id NOT IN (
+        SELECT id FROM config_revisions WHERE agent_slug = ? AND file_name = ? ORDER BY created_at DESC LIMIT 20
+      )`
+    ).run(agentSlug, fileName, agentSlug, fileName);
+  }
+
+  /** Get revision history for an agent's config files. */
+  getConfigRevisions(agentSlug: string, fileName?: string, limit: number = 10): Array<Record<string, unknown>> {
+    if (fileName) {
+      return this.conn.prepare(
+        `SELECT id, agent_slug, file_name, length(content) as size_bytes, changed_by, created_at
+         FROM config_revisions WHERE agent_slug = ? AND file_name = ? ORDER BY created_at DESC LIMIT ?`
+      ).all(agentSlug, fileName, limit) as Array<Record<string, unknown>>;
+    }
+    return this.conn.prepare(
+      `SELECT id, agent_slug, file_name, length(content) as size_bytes, changed_by, created_at
+       FROM config_revisions WHERE agent_slug = ? ORDER BY created_at DESC LIMIT ?`
+    ).all(agentSlug, limit) as Array<Record<string, unknown>>;
+  }
+
+  /** Get a specific config revision's content. */
+  getConfigRevisionContent(id: number): string | null {
+    const row = this.conn.prepare('SELECT content FROM config_revisions WHERE id = ?').get(id) as { content: string } | undefined;
+    return row?.content ?? null;
   }
 
   // ── Helpers ───────────────────────────────────────────────────────

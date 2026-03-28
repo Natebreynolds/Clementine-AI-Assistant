@@ -15,8 +15,9 @@ import { execSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import matter from 'gray-matter';
-import type { AgentProfile, TeamAgentConfig } from '../types.js';
+import type { AgentProfile, AgentStatus, SendPolicy, TeamAgentConfig } from '../types.js';
 import { ProfileManager } from './profiles.js';
+import { getScaffoldForRole } from './role-scaffolds.js';
 
 // ── Keychain helpers for agent secrets ────────────────────────────────
 
@@ -68,6 +69,10 @@ export interface AgentCreateConfig {
   slackBotToken?: string;          // Slack bot token (xoxb-...)
   slackAppToken?: string;          // Slack app token (xapp-...)
   slackChannelId?: string;         // Explicit Slack channel ID override
+  sendPolicy?: SendPolicy;         // Autonomous outbound email policy
+  role?: string;                   // Role template (e.g., 'sdr', 'researcher') — auto-scaffolds working directory
+  status?: AgentStatus;            // Initial status (default: active)
+  budgetMonthlyCents?: number;     // Monthly token budget in cents (0 = unlimited)
 }
 
 export class AgentManager {
@@ -205,6 +210,23 @@ export class AgentManager {
       }
     }
 
+    // Parse sendPolicy from frontmatter
+    let sendPolicy: SendPolicy | undefined;
+    if (meta.sendPolicy && typeof meta.sendPolicy === 'object') {
+      const sp = meta.sendPolicy;
+      const requiresApproval = ['none', 'first-in-sequence', 'all'].includes(sp.requiresApproval)
+        ? sp.requiresApproval as SendPolicy['requiresApproval']
+        : 'all';
+      sendPolicy = {
+        maxDailyEmails: Number(sp.maxDailyEmails ?? 50),
+        requiresApproval,
+        businessHoursOnly: sp.businessHoursOnly === true || sp.businessHoursOnly === 'true',
+      };
+      if (Array.isArray(sp.allowedTemplates) && sp.allowedTemplates.length > 0) {
+        sendPolicy.allowedTemplates = sp.allowedTemplates.map(String);
+      }
+    }
+
     return {
       slug,
       name: String(meta.name ?? slug.replace(/-/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase())),
@@ -221,6 +243,9 @@ export class AgentManager {
       slackBotToken,
       slackAppToken,
       slackChannelId: meta.slackChannelId ? String(meta.slackChannelId) : undefined,
+      sendPolicy,
+      status: (['active', 'paused', 'error', 'terminated'].includes(meta.status) ? meta.status : 'active') as AgentStatus,
+      budgetMonthlyCents: meta.budgetMonthlyCents ? Number(meta.budgetMonthlyCents) : undefined,
     };
   }
 
@@ -314,10 +339,33 @@ export class AgentManager {
       frontmatter.slackAppToken = 'keychain';
     }
     if (config.slackChannelId) frontmatter.slackChannelId = config.slackChannelId;
+    if (config.sendPolicy) frontmatter.sendPolicy = config.sendPolicy;
+    if (config.status) frontmatter.status = config.status;
+    if (config.budgetMonthlyCents) frontmatter.budgetMonthlyCents = config.budgetMonthlyCents;
 
     const body = config.personality || `You are ${config.name}. ${config.description}`;
     const content = matter.stringify(body, frontmatter);
     fs.writeFileSync(path.join(agentDir, 'agent.md'), content);
+
+    // Scaffold role-specific working directory (CRON.md, playbook, sequences)
+    if (config.role) {
+      const scaffolder = getScaffoldForRole(config.role);
+      if (scaffolder) {
+        const scaffold = scaffolder(config.name, slug);
+        // Write CRON.md — the autonomous job definitions
+        if (scaffold.cronMd) {
+          fs.writeFileSync(path.join(agentDir, 'CRON.md'), scaffold.cronMd);
+        }
+        // Write playbook — ICP, email rules, escalation criteria
+        if (scaffold.playbook) {
+          fs.writeFileSync(path.join(agentDir, 'PLAYBOOK.md'), scaffold.playbook);
+        }
+        // Write sequence definitions
+        if (scaffold.sequences) {
+          fs.writeFileSync(path.join(agentDir, 'SEQUENCES.md'), scaffold.sequences);
+        }
+      }
+    }
 
     // Invalidate cache
     this.cacheTime = 0;
@@ -378,6 +426,9 @@ export class AgentManager {
       }
     }
     if (changes.slackChannelId !== undefined) meta.slackChannelId = changes.slackChannelId || undefined;
+    if (changes.sendPolicy !== undefined) meta.sendPolicy = changes.sendPolicy || undefined;
+    if (changes.status !== undefined) meta.status = changes.status;
+    if (changes.budgetMonthlyCents !== undefined) meta.budgetMonthlyCents = changes.budgetMonthlyCents || undefined;
 
     const newBody = changes.personality ?? body;
     const updated = matter.stringify(newBody, meta);
@@ -387,6 +438,18 @@ export class AgentManager {
     this.cacheTime = 0;
 
     return this.get(slug)!;
+  }
+
+  /** Quick status update without touching other config. */
+  setStatus(slug: string, status: AgentStatus): void {
+    this.updateAgent(slug, { status } as Partial<AgentCreateConfig>);
+  }
+
+  /** Check if an agent is runnable (active status). */
+  isRunnable(slug: string): boolean {
+    const agent = this.get(slug);
+    if (!agent) return false;
+    return !agent.status || agent.status === 'active';
   }
 
   deleteAgent(slug: string): void {

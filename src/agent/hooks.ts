@@ -11,7 +11,8 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
-import { OWNER_NAME, BASE_DIR } from '../config.js';
+import { OWNER_NAME, BASE_DIR, TIMEZONE } from '../config.js';
+import type { SendPolicy } from '../types.js';
 
 // ── Shared state ───────────────────────────────────────────────────────
 
@@ -20,6 +21,10 @@ let heartbeatTier2Allowed = false;
 let activeProfileTier: number | null = null;
 let activeProfileAllowedTools: string[] | null = null;
 let approvalCallback: ((desc: string) => Promise<boolean>) | null = null;
+let activeSendPolicy: SendPolicy | null = null;
+let activeAgentSlug: string | null = null;
+/** Injected by gateway — returns daily send count and suppression check for an agent. */
+let sendPolicyChecker: ((agentSlug: string, recipientEmail: string) => { dailyCount: number; suppressed: boolean }) | null = null;
 const auditLog: string[] = [];
 
 /**
@@ -72,6 +77,15 @@ export function setProfileTier(tier: number | null): void {
 
 export function setProfileAllowedTools(tools: string[] | null): void {
   activeProfileAllowedTools = tools;
+}
+
+export function setSendPolicy(policy: SendPolicy | null, agentSlug: string | null): void {
+  activeSendPolicy = policy;
+  activeAgentSlug = agentSlug;
+}
+
+export function setSendPolicyChecker(checker: ((agentSlug: string, recipientEmail: string) => { dailyCount: number; suppressed: boolean }) | null): void {
+  sendPolicyChecker = checker;
 }
 
 export function setInteractionSource(source: 'owner-dm' | 'owner-channel' | 'member-channel' | 'autonomous'): void {
@@ -192,6 +206,48 @@ function matchesAny(text: string, patterns: RegExp[]): boolean {
   return patterns.some((p) => p.test(text));
 }
 
+// ── Send policy evaluation ──────────────────────────────────────────
+
+function evaluateSendPolicy(
+  policy: SendPolicy,
+  agentSlug: string,
+  recipientEmail: string,
+): { allowed: boolean; reason: string; policyRef: string } {
+  // 1. Suppression check (always enforced)
+  if (sendPolicyChecker) {
+    const { suppressed, dailyCount } = sendPolicyChecker(agentSlug, recipientEmail);
+    if (suppressed) {
+      return { allowed: false, reason: `Recipient ${recipientEmail} is on the suppression list.`, policyRef: 'suppression' };
+    }
+
+    // 2. Daily cap check
+    if (dailyCount >= policy.maxDailyEmails) {
+      return { allowed: false, reason: `Daily send limit reached (${dailyCount}/${policy.maxDailyEmails}).`, policyRef: 'daily_cap' };
+    }
+  }
+
+  // 3. Business hours check
+  if (policy.businessHoursOnly) {
+    const now = new Date();
+    // Use system timezone (from config) for business hours check
+    const formatter = new Intl.DateTimeFormat('en-US', {
+      hour: 'numeric', hour12: false, timeZone: TIMEZONE || undefined,
+    });
+    const hour = parseInt(formatter.format(now), 10);
+    if (hour < 8 || hour >= 18) {
+      return { allowed: false, reason: `Outside business hours (8am–6pm ${TIMEZONE || 'local'}).`, policyRef: 'business_hours' };
+    }
+  }
+
+  // 4. Approval mode check
+  if (policy.requiresApproval === 'all') {
+    return { allowed: false, reason: 'Send policy requires approval for all sends.', policyRef: 'requires_approval' };
+  }
+
+  // 'none' = fully autonomous, 'first-in-sequence' handled at the MCP tool level
+  return { allowed: true, reason: 'Policy check passed.', policyRef: `policy:${agentSlug}:max${policy.maxDailyEmails}` };
+}
+
 // ── SDK-level permission enforcement ────────────────────────────────
 
 export async function enforceToolPermissions(
@@ -293,24 +349,39 @@ export async function enforceToolPermissions(
     }
   }
 
-  // ── Outbound communication — always gated (injection defense) ──
-  // Even in owner DMs, outbound sends require approval. This protects against
-  // prompt injection in external content (emails, web pages, RSS) tricking
-  // the model into sending messages on behalf of the user.
+  // ── Outbound communication — gated with send policy support ────
+  // Agents with a sendPolicy can send email autonomously within policy bounds.
+  // All other agents (and Discord sends) require approval as before.
   const isOutboundSend = toolName.includes('outlook_send') || toolName.includes('discord_channel_send');
+  const isOutboundEmail = toolName.includes('outlook_send');
 
-  if (isOutboundSend && heartbeatActive) {
-    return {
-      behavior: 'deny',
-      message: 'Sending messages is forbidden during autonomous execution.',
-    };
-  }
-
-  // ALL outbound sends require approval — including owner DMs.
-  // This prevents the model from sending when asked to "draft".
   if (isOutboundSend) {
+    // Send policy path: agent with sendPolicy can send email autonomously during cron/heartbeat
+    if (isOutboundEmail && activeSendPolicy && activeAgentSlug && (heartbeatActive || effectiveSource === 'autonomous')) {
+      const recipient = String(toolInput.to ?? '');
+      const policyResult = evaluateSendPolicy(activeSendPolicy, activeAgentSlug, recipient);
+      if (!policyResult.allowed) {
+        appendAuditFile(`[SEND-POLICY] DENIED for ${activeAgentSlug}: ${policyResult.reason} — to ${recipient}`);
+        return { behavior: 'deny', message: policyResult.reason };
+      }
+      // Policy approved — log and allow
+      appendAuditFile(`[SEND-POLICY] APPROVED for ${activeAgentSlug}: email to ${recipient} (${policyResult.policyRef})`);
+      logToolUse(toolName, toolInput);
+      return { behavior: 'allow' };
+    }
+
+    // Default path: block autonomous sends for agents without sendPolicy
+    if (heartbeatActive) {
+      return {
+        behavior: 'deny',
+        message: 'Sending messages is forbidden during autonomous execution. Configure a sendPolicy on the agent profile to enable autonomous sending.',
+      };
+    }
+
+    // Interactive sends require approval — including owner DMs.
+    // This prevents prompt injection from tricking the model into sending.
     if (approvalCallback) {
-      const desc = toolName.includes('outlook_send')
+      const desc = isOutboundEmail
         ? `Send email to ${toolInput.to ?? '?'}: "${toolInput.subject ?? '?'}"`
         : `Send Discord message to channel ${toolInput.channel_id ?? '?'}`;
       const approved = await approvalCallback(desc);
@@ -319,7 +390,7 @@ export async function enforceToolPermissions(
       }
     }
     // Audit-log all approved sends
-    const target = toolName.includes('outlook_send')
+    const target = isOutboundEmail
       ? `email to ${toolInput.to ?? '?'}`
       : `discord channel ${toolInput.channel_id ?? '?'}`;
     appendAuditFile(`[${isOwnerDm ? 'OWNER-DM' : 'CHANNEL'}] Outbound send approved: ${target}`);

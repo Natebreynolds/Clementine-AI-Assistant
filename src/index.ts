@@ -508,11 +508,34 @@ async function asyncMain(): Promise<void> {
   const gateway = new Gateway(assistant);
 
   // Wire approval callback
-  const { setApprovalCallback } = await import('./agent/hooks.js');
+  const { setApprovalCallback, setSendPolicyChecker } = await import('./agent/hooks.js');
   setApprovalCallback(async (desc: string) => {
     const result = await gateway.requestApproval(desc);
     return result === true;
   });
+
+  // Wire send policy checker — lightweight read-only DB access for suppression + daily cap
+  {
+    const Database = (await import('better-sqlite3')).default;
+    const { MEMORY_DB_PATH } = await import('./config.js');
+    const { existsSync } = await import('node:fs');
+    if (existsSync(MEMORY_DB_PATH)) {
+      const policyDb = new Database(MEMORY_DB_PATH, { readonly: true });
+      policyDb.pragma('journal_mode = WAL');
+      setSendPolicyChecker((agentSlug: string, recipientEmail: string) => {
+        try {
+          const suppRow = policyDb.prepare('SELECT 1 FROM suppression_list WHERE email = ?').get(recipientEmail.toLowerCase());
+          const countRow = policyDb.prepare(
+            `SELECT COUNT(*) as cnt FROM send_log WHERE agent_slug = ? AND sent_at >= date('now')`
+          ).get(agentSlug) as { cnt: number };
+          return { suppressed: !!suppRow, dailyCount: countRow?.cnt ?? 0 };
+        } catch {
+          // Tables may not exist yet (first run before MCP server initializes store)
+          return { suppressed: false, dailyCount: 0 };
+        }
+      });
+    }
+  }
 
   // Notification dispatcher
   const { NotificationDispatcher } = await import('./gateway/notifications.js');

@@ -1781,6 +1781,96 @@ server.tool(
   },
 );
 
+// ── 19b. outlook_create_event ────────────────────────────────────────────
+
+server.tool(
+  'outlook_create_event',
+  'Create a calendar event and send invitations to attendees. REQUIRES owner approval (Tier 3).',
+  {
+    subject: z.string().describe('Event title'),
+    startDateTime: z.string().describe('Start time in ISO 8601 format (e.g., 2026-03-28T10:00:00)'),
+    endDateTime: z.string().describe('End time in ISO 8601 format (e.g., 2026-03-28T10:30:00)'),
+    attendees: z.array(z.string()).describe('List of attendee email addresses'),
+    body: z.string().optional().describe('Event description/agenda (plain text)'),
+    location: z.string().optional().describe('Event location (room name or address)'),
+    isOnlineMeeting: z.boolean().optional().default(false).describe('If true, creates a Teams meeting link'),
+    timeZone: z.string().optional().describe('IANA timezone for start/end times (default: account timezone)'),
+  },
+  async ({ subject, startDateTime, endDateTime, attendees, body, location, isOnlineMeeting, timeZone }) => {
+    const userEmail = env['MS_USER_EMAIL'] ?? '';
+    const tz = timeZone || Intl.DateTimeFormat().resolvedOptions().timeZone;
+    const event: any = {
+      subject,
+      start: { dateTime: startDateTime, timeZone: tz },
+      end: { dateTime: endDateTime, timeZone: tz },
+      attendees: attendees.map((email: string) => ({
+        emailAddress: { address: email },
+        type: 'required',
+      })),
+      isOnlineMeeting: isOnlineMeeting ?? false,
+    };
+    if (body) {
+      event.body = { contentType: 'Text', content: body };
+    }
+    if (location) {
+      event.location = { displayName: location };
+    }
+    if (isOnlineMeeting) {
+      event.onlineMeetingProvider = 'teamsForBusiness';
+    }
+    const created = await graphPost(`/users/${userEmail}/events`, event);
+    const teamsLink = created.onlineMeeting?.joinUrl ?? null;
+    return textResult(
+      `Event created: "${subject}" on ${startDateTime} — ${endDateTime}\n` +
+      `Attendees: ${attendees.join(', ')}\n` +
+      (teamsLink ? `Teams link: ${teamsLink}\n` : '') +
+      `Event ID: ${(created.id ?? '').slice(0, 20)}...`
+    );
+  },
+);
+
+// ── 19c. outlook_find_availability ──────────────────────────────────────
+
+server.tool(
+  'outlook_find_availability',
+  'Check free/busy availability for the user\'s calendar. Useful for finding open slots to propose meeting times.',
+  {
+    startDateTime: z.string().describe('Start of availability window (ISO 8601)'),
+    endDateTime: z.string().describe('End of availability window (ISO 8601)'),
+    intervalMinutes: z.number().optional().default(30).describe('Slot duration in minutes (default: 30)'),
+  },
+  async ({ startDateTime, endDateTime, intervalMinutes }) => {
+    const userEmail = env['MS_USER_EMAIL'] ?? '';
+    const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    const data = await graphPost(`/users/${userEmail}/calendar/getSchedule`, {
+      schedules: [userEmail],
+      startTime: { dateTime: startDateTime, timeZone: tz },
+      endTime: { dateTime: endDateTime, timeZone: tz },
+      availabilityViewInterval: intervalMinutes,
+    });
+
+    const schedule = data.value?.[0];
+    if (!schedule) return textResult('Could not retrieve availability.');
+
+    // Parse the availability view string: 0=free, 1=tentative, 2=busy, 3=oof, 4=working elsewhere
+    const view = schedule.availabilityView ?? '';
+    const slotStart = new Date(startDateTime);
+    const slots: string[] = [];
+    for (let i = 0; i < view.length; i++) {
+      const status = view[i];
+      const start = new Date(slotStart.getTime() + i * intervalMinutes * 60000);
+      const end = new Date(start.getTime() + intervalMinutes * 60000);
+      const label = status === '0' ? 'FREE' : status === '1' ? 'TENTATIVE' : status === '2' ? 'BUSY' : status === '3' ? 'OOF' : 'BUSY';
+      if (label === 'FREE' || label === 'TENTATIVE') {
+        slots.push(`${start.toISOString().slice(11, 16)}–${end.toISOString().slice(11, 16)} ${label}`);
+      }
+    }
+
+    if (slots.length === 0) return textResult('No available slots in the requested window.');
+    return textResult(`Available slots (${tz}):\n${slots.join('\n')}`);
+  },
+);
+
 // ── 20. outlook_draft ───────────────────────────────────────────────────
 
 server.tool(
@@ -1794,6 +1884,12 @@ server.tool(
     reply_to_message_id: z.string().optional().describe('Message ID to reply to. If provided, creates a threaded reply draft instead of a new email. The To and Subject are auto-filled from the original message.'),
   },
   async ({ to, subject, body, cc, reply_to_message_id }) => {
+    // Suppression check — prevent drafting emails to opted-out recipients
+    const store = await getStore();
+    if ((store as any).isSuppressed(to)) {
+      return textResult(`⛔ Cannot draft email to ${to} — address is on the suppression list.`);
+    }
+
     const userEmail = env['MS_USER_EMAIL'] ?? '';
 
     if (reply_to_message_id) {
@@ -1834,6 +1930,12 @@ server.tool(
     cc: z.string().optional().describe('CC email address (optional)'),
   },
   async ({ to, subject, body, cc }) => {
+    // Suppression check — prevent sending to opted-out recipients
+    const store = await getStore();
+    if ((store as any).isSuppressed(to)) {
+      return textResult(`⛔ Cannot send email to ${to} — address is on the suppression list.`);
+    }
+
     const userEmail = env['MS_USER_EMAIL'] ?? '';
     const message: any = {
       subject,
@@ -1844,6 +1946,11 @@ server.tool(
       message.ccRecipients = [{ emailAddress: { address: cc } }];
     }
     await graphPost(`/users/${userEmail}/sendMail`, { message, saveToSentItems: true });
+
+    // Log the send for daily cap tracking and audit
+    const agentSlug = ACTIVE_AGENT_SLUG ?? 'clementine';
+    (store as any).logSend({ agentSlug, recipient: to, subject });
+
     return textResult(`Email sent to ${to}: "${subject}"`);
   },
 );
@@ -3377,6 +3484,244 @@ server.tool(
       'or Discord (`!self-improve run` / `/self-improve run`). ' +
       'The MCP server cannot directly run the loop as it requires the full assistant context.',
     );
+  },
+);
+
+// ── SDR Operational Tools ────────────────────────────────────────────────
+
+server.tool(
+  'lead_upsert',
+  'Create or update a lead/prospect record. Updates existing if email matches.',
+  {
+    email: z.string().describe('Lead email address (unique identifier)'),
+    name: z.string().describe('Lead full name'),
+    company: z.string().optional().describe('Company name'),
+    title: z.string().optional().describe('Job title'),
+    status: z.enum(['new', 'contacted', 'replied', 'qualified', 'meeting_booked', 'won', 'lost', 'opted_out']).optional().describe('Lead status'),
+    source: z.string().optional().describe('Lead source (e.g., inbound, outreach, referral)'),
+    sfId: z.string().optional().describe('Salesforce lead/contact ID'),
+    metadata: z.record(z.string(), z.unknown()).optional().describe('Additional metadata as key-value pairs'),
+  },
+  async ({ email, name, company, title, status, source, sfId, metadata }) => {
+    const store = await getStore();
+    const agentSlug = ACTIVE_AGENT_SLUG ?? 'clementine';
+    const result = (store as any).upsertLead({
+      agentSlug, email, name, company, title, status, source, sfId, metadata,
+    });
+    return textResult(result.created
+      ? `Lead created: ${name} <${email}> (ID: ${result.id})`
+      : `Lead updated: ${name} <${email}> (ID: ${result.id})`);
+  },
+);
+
+server.tool(
+  'lead_search',
+  'Search leads/prospects by status, company, or keyword. Returns structured lead records.',
+  {
+    status: z.enum(['new', 'contacted', 'replied', 'qualified', 'meeting_booked', 'won', 'lost', 'opted_out']).optional().describe('Filter by lead status'),
+    company: z.string().optional().describe('Filter by company name (partial match)'),
+    query: z.string().optional().describe('Search across name, email, company'),
+    limit: z.number().optional().default(20).describe('Max results (default 20)'),
+  },
+  async ({ status, company, query, limit }) => {
+    const store = await getStore();
+    const agentSlug = ACTIVE_AGENT_SLUG ?? undefined;
+    const results = (store as any).searchLeads({ agentSlug, status, company, query, limit });
+    if (results.length === 0) return textResult('No leads found matching criteria.');
+    return textResult(JSON.stringify(results, null, 2));
+  },
+);
+
+server.tool(
+  'sequence_enroll',
+  'Enroll a lead in an outbound email sequence/cadence.',
+  {
+    leadId: z.number().describe('Lead ID to enroll'),
+    sequenceName: z.string().describe('Name of the sequence (e.g., "intro-5step")'),
+    nextStepDueAt: z.string().optional().describe('ISO datetime for first step (default: now)'),
+  },
+  async ({ leadId, sequenceName, nextStepDueAt }) => {
+    const store = await getStore();
+    const lead = (store as any).getLeadById(leadId);
+    if (!lead) return textResult(`Error: Lead ID ${leadId} not found.`);
+    const id = (store as any).enrollSequence({ leadId, sequenceName, nextStepDueAt });
+    return textResult(`Enrolled lead ${lead.name} (${lead.email}) in sequence "${sequenceName}" (enrollment ID: ${id})`);
+  },
+);
+
+server.tool(
+  'sequence_advance',
+  'Advance a sequence enrollment to the next step or update its status.',
+  {
+    enrollmentId: z.number().describe('Sequence enrollment ID'),
+    currentStep: z.number().optional().describe('Set current step number'),
+    status: z.enum(['active', 'paused', 'replied', 'completed', 'opted_out']).optional().describe('Update enrollment status'),
+    nextStepDueAt: z.string().optional().describe('ISO datetime for next step (null to clear)'),
+  },
+  async ({ enrollmentId, currentStep, status, nextStepDueAt }) => {
+    const store = await getStore();
+    (store as any).advanceSequence(enrollmentId, {
+      currentStep, status, nextStepDueAt: nextStepDueAt ?? undefined,
+    });
+    const updates = [
+      currentStep !== undefined ? `step → ${currentStep}` : null,
+      status ? `status → ${status}` : null,
+      nextStepDueAt ? `next due → ${nextStepDueAt}` : null,
+    ].filter(Boolean).join(', ');
+    return textResult(`Enrollment ${enrollmentId} updated: ${updates}`);
+  },
+);
+
+server.tool(
+  'sequence_due',
+  'Get all sequence enrollments with steps due now (for cron processing).',
+  {},
+  async () => {
+    const store = await getStore();
+    const agentSlug = ACTIVE_AGENT_SLUG ?? undefined;
+    const due = (store as any).getDueSequences(agentSlug);
+    if (due.length === 0) return textResult('No sequence steps due right now.');
+    return textResult(`${due.length} due sequence step(s):\n` + JSON.stringify(due, null, 2));
+  },
+);
+
+server.tool(
+  'activity_log',
+  'Record an SDR activity (email sent, meeting booked, call, note, etc.).',
+  {
+    type: z.enum(['email_sent', 'email_received', 'meeting_booked', 'call', 'note', 'status_change']).describe('Activity type'),
+    leadId: z.number().optional().describe('Lead ID this activity relates to'),
+    subject: z.string().optional().describe('Activity subject/title'),
+    detail: z.string().optional().describe('Activity details or notes'),
+    templateUsed: z.string().optional().describe('Email template used (if applicable)'),
+  },
+  async ({ type, leadId, subject, detail, templateUsed }) => {
+    const store = await getStore();
+    const agentSlug = ACTIVE_AGENT_SLUG ?? 'clementine';
+    const id = (store as any).logActivity({ leadId, agentSlug, type, subject, detail, templateUsed });
+    return textResult(`Activity logged: ${type}${subject ? ` — "${subject}"` : ''} (ID: ${id})`);
+  },
+);
+
+server.tool(
+  'activity_history',
+  'Get activity history for a lead or agent.',
+  {
+    leadId: z.number().optional().describe('Filter by lead ID'),
+    type: z.enum(['email_sent', 'email_received', 'meeting_booked', 'call', 'note', 'status_change']).optional().describe('Filter by activity type'),
+    limit: z.number().optional().default(20).describe('Max results'),
+  },
+  async ({ leadId, type, limit }) => {
+    const store = await getStore();
+    const agentSlug = ACTIVE_AGENT_SLUG ?? undefined;
+    const results = (store as any).getActivities({ leadId, agentSlug, type, limit });
+    if (results.length === 0) return textResult('No activities found.');
+    return textResult(JSON.stringify(results, null, 2));
+  },
+);
+
+server.tool(
+  'suppression_check',
+  'Check if an email address is on the suppression (do-not-contact) list.',
+  {
+    email: z.string().describe('Email address to check'),
+  },
+  async ({ email }) => {
+    const store = await getStore();
+    const suppressed = (store as any).isSuppressed(email);
+    return textResult(suppressed
+      ? `⛔ ${email} is SUPPRESSED — do not contact.`
+      : `✓ ${email} is not on the suppression list.`);
+  },
+);
+
+server.tool(
+  'suppression_add',
+  'Add an email to the suppression (do-not-contact) list.',
+  {
+    email: z.string().describe('Email address to suppress'),
+    reason: z.enum(['unsubscribe', 'bounce', 'manual', 'complaint']).describe('Reason for suppression'),
+  },
+  async ({ email, reason }) => {
+    const store = await getStore();
+    const agentSlug = ACTIVE_AGENT_SLUG ?? 'manual';
+    (store as any).addSuppression(email, reason, agentSlug);
+    return textResult(`Added ${email} to suppression list (reason: ${reason}).`);
+  },
+);
+
+server.tool(
+  'lead_import',
+  'Bulk import leads from CSV-style data. Each line: name,email,company,title. Skips duplicates by email.',
+  {
+    data: z.string().describe('CSV data — one lead per line: name,email,company,title. First line can be a header (auto-detected).'),
+    source: z.string().optional().default('import').describe('Lead source tag (e.g., "csv-import", "list-purchase")'),
+    sequenceName: z.string().optional().describe('If provided, auto-enroll each imported lead in this sequence'),
+  },
+  async ({ data, source, sequenceName }) => {
+    const store = await getStore();
+    const agentSlug = ACTIVE_AGENT_SLUG ?? 'clementine';
+    const lines = data.trim().split('\n').filter(Boolean);
+    if (lines.length === 0) return textResult('No data to import.');
+
+    // Detect and skip header row
+    const firstLine = lines[0].toLowerCase();
+    const startIdx = (firstLine.includes('name') && firstLine.includes('email')) ? 1 : 0;
+
+    let created = 0;
+    let skipped = 0;
+    let enrolled = 0;
+    const errors: string[] = [];
+
+    for (let i = startIdx; i < lines.length; i++) {
+      const parts = lines[i].split(',').map(s => s.trim().replace(/^"|"$/g, ''));
+      if (parts.length < 2) { errors.push(`Line ${i + 1}: not enough fields`); continue; }
+
+      const [name, email, company, title] = parts;
+      if (!name || !email || !email.includes('@')) { errors.push(`Line ${i + 1}: invalid name or email`); continue; }
+
+      try {
+        const result = (store as any).upsertLead({
+          agentSlug, email, name, company: company || undefined, title: title || undefined,
+          source, status: 'new',
+        });
+
+        if (result.created) {
+          created++;
+          // Auto-enroll in sequence if specified
+          if (sequenceName) {
+            const nextDue = new Date(Date.now() + 60000).toISOString(); // due in 1 min
+            (store as any).enrollSequence({ leadId: result.id, sequenceName, nextStepDueAt: nextDue });
+            enrolled++;
+          }
+        } else {
+          skipped++;
+        }
+      } catch (e) {
+        errors.push(`Line ${i + 1}: ${String(e)}`);
+      }
+    }
+
+    let report = `Import complete: ${created} created, ${skipped} skipped (duplicate)`;
+    if (enrolled > 0) report += `, ${enrolled} enrolled in "${sequenceName}"`;
+    if (errors.length > 0) report += `\n\nErrors (${errors.length}):\n${errors.slice(0, 10).join('\n')}`;
+    return textResult(report);
+  },
+);
+
+server.tool(
+  'approval_queue_add',
+  'Queue an action for human approval via the dashboard. Use this when your send policy requires approval, or when you want a human to review before executing.',
+  {
+    actionType: z.enum(['email_send', 'sequence_start', 'escalation']).describe('Type of action being queued'),
+    summary: z.string().describe('Brief description shown in the approval queue (e.g., "Send intro email to jane@acme.com")'),
+    detail: z.record(z.string(), z.unknown()).optional().describe('Full action payload — for email_send: {to, subject, body, cc?, leadId?}'),
+  },
+  async ({ actionType, summary, detail }) => {
+    const store = await getStore();
+    const agentSlug = ACTIVE_AGENT_SLUG ?? 'clementine';
+    const id = (store as any).addApproval({ agentSlug, actionType, summary, detail });
+    return textResult(`Queued for approval (ID: ${id}): ${summary}\nA human can approve or reject this via the dashboard.`);
   },
 );
 

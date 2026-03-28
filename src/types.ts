@@ -94,6 +94,20 @@ export interface NotificationContext {
 
 export type NotificationSender = (text: string, context?: NotificationContext) => Promise<void>;
 
+// ── Send Policy (SDR / Autonomous Email) ────────────────────────────
+
+/** Policy governing autonomous outbound email sending for an agent. */
+export interface SendPolicy {
+  /** Maximum emails this agent can send per calendar day. */
+  maxDailyEmails: number;
+  /** Glob patterns for allowed email templates (e.g., ['intro-*', 'followup-*']). Omit to allow any. */
+  allowedTemplates?: string[];
+  /** When human approval is required: 'none' = fully autonomous, 'first-in-sequence' = approve first email per lead, 'all' = approve every send. */
+  requiresApproval: 'none' | 'first-in-sequence' | 'all';
+  /** If true, restrict sends to 8am–6pm in the system timezone. */
+  businessHoursOnly?: boolean;
+}
+
 // ── Agent Profiles ───────────────────────────────────────────────────
 
 export interface TeamAgentConfig {
@@ -148,7 +162,13 @@ export interface AgentProfile {
   slackBotToken?: string;          // Slack bot token (xoxb-...) for agent's own Slack presence
   slackAppToken?: string;          // Slack app token (xapp-...) required for Socket Mode
   slackChannelId?: string;         // Explicit Slack channel ID override
+  sendPolicy?: SendPolicy;         // Autonomous outbound email policy (SDR agents)
+  status?: AgentStatus;            // Persistent agent status (default: active)
+  budgetMonthlyCents?: number;     // Monthly token budget in cents (0 = unlimited)
+  spentMonthlyCents?: number;      // Current month's spend (computed from usage_log)
 }
+
+export type AgentStatus = 'active' | 'paused' | 'error' | 'terminated';
 
 // ── Heartbeat ────────────────────────────────────────────────────────
 
@@ -536,6 +556,76 @@ export interface RemoteAccessConfig {
   tunnelUrl?: string;
   autoPost: boolean;
   lastStarted?: string;
+}
+
+// ── Agent Config Revisions ──────────────────────────────────────────
+
+export interface ConfigRevision {
+  id?: number;
+  agentSlug: string;
+  fileName: string;              // e.g., 'agent.md', 'CRON.md', 'PLAYBOOK.md'
+  content: string;               // Full file content at this revision
+  changedBy?: string;            // 'dashboard', 'self-improve', agent slug
+  createdAt?: string;
+}
+
+// ── SDR Operational Data ────────────────────────────────────────────
+
+export interface Lead {
+  id?: number;
+  agentSlug: string;
+  email: string;
+  name: string;
+  company?: string;
+  title?: string;
+  status: 'new' | 'contacted' | 'replied' | 'qualified' | 'meeting_booked' | 'won' | 'lost' | 'opted_out';
+  source?: string;
+  sfId?: string;                    // Salesforce lead/contact ID
+  metadata?: Record<string, unknown>;
+  createdAt?: string;
+  updatedAt?: string;
+}
+
+export interface SequenceEnrollment {
+  id?: number;
+  leadId: number;
+  sequenceName: string;
+  currentStep: number;
+  status: 'active' | 'paused' | 'replied' | 'completed' | 'opted_out';
+  nextStepDueAt?: string;
+  startedAt?: string;
+  updatedAt?: string;
+}
+
+export interface Activity {
+  id?: number;
+  leadId?: number;
+  agentSlug: string;
+  type: 'email_sent' | 'email_received' | 'meeting_booked' | 'call' | 'note' | 'status_change';
+  subject?: string;
+  detail?: string;
+  templateUsed?: string;
+  performedAt?: string;
+}
+
+export interface SuppressionEntry {
+  id?: number;
+  email: string;
+  reason: 'unsubscribe' | 'bounce' | 'manual' | 'complaint';
+  addedAt?: string;
+  addedBy?: string;                 // agent_slug or 'manual'
+}
+
+export interface ApprovalRequest {
+  id?: number;
+  agentSlug: string;
+  actionType: 'email_send' | 'sequence_start' | 'escalation';
+  summary: string;
+  detail?: Record<string, unknown>;
+  status: 'pending' | 'approved' | 'rejected';
+  requestedAt?: string;
+  resolvedAt?: string;
+  resolvedBy?: string;
 }
 
 // ── Utility types ────────────────────────────────────────────────────
