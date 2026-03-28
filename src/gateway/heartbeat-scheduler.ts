@@ -5,7 +5,7 @@
  * Channel-agnostic — sends notifications via the NotificationDispatcher.
  */
 
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import {
   existsSync,
   mkdirSync,
@@ -28,8 +28,9 @@ import {
   HEARTBEAT_ACTIVE_END,
   BASE_DIR,
   GOALS_DIR,
+  HEARTBEAT_WORK_QUEUE_FILE,
 } from '../config.js';
-import type { HeartbeatState } from '../types.js';
+import type { HeartbeatState, HeartbeatReportedTopic, HeartbeatWorkItem } from '../types.js';
 import type { CronRunEntry } from '../types.js';
 import type { NotificationDispatcher } from './notifications.js';
 import type { Gateway } from './router.js';
@@ -92,10 +93,11 @@ export class HeartbeatScheduler {
     const standingInstructions = this.readHeartbeatConfig();
     const now = new Date();
     const [, currentDetails] = this.computeStateFingerprint();
-    let changesSummary = this.computeChangesSummary(
+    const { summary } = this.computeChangesSummary(
       this.lastState.details ?? {},
       currentDetails,
     );
+    let changesSummary = summary;
     const activitySummary = this.getRecentActivitySummary();
     if (activitySummary) {
       changesSummary += `\n\nRecent activity:\n${activitySummary}`;
@@ -104,6 +106,7 @@ export class HeartbeatScheduler {
     if (goalSummary) {
       changesSummary += `\n\n${goalSummary}`;
     }
+    const dedupContext = this.buildDedupContext();
     const timeContext = HeartbeatScheduler.getTimeContext(now.getHours());
 
     try {
@@ -111,6 +114,7 @@ export class HeartbeatScheduler {
         standingInstructions,
         changesSummary,
         timeContext,
+        dedupContext,
       );
       return response || '*(heartbeat completed — nothing to report)*';
     } catch (err) {
@@ -173,10 +177,12 @@ export class HeartbeatScheduler {
     const [currentFingerprint, currentDetails] = this.computeStateFingerprint();
 
     // Build change summary — tells the agent what's different since last tick
-    let changesSummary = this.computeChangesSummary(
+    const { summary: rawSummary, hasRealChanges } = this.computeChangesSummary(
       this.lastState.details ?? {},
       currentDetails,
     );
+
+    let changesSummary = rawSummary;
 
     // Include recent chat/cron activity so the heartbeat knows what happened
     const activitySummary = this.getRecentActivitySummary();
@@ -204,11 +210,71 @@ export class HeartbeatScheduler {
       }
     } catch (err) { logger.warn({ err }, 'Daily plan enrichment failed'); }
 
-    // Persist new state
+    // ── Drain work queue (max 2 items per tick) ──
+    const completedWork: Array<{ description: string; result: string }> = [];
+    for (let i = 0; i < 2; i++) {
+      const item = this.claimNextItem();
+      if (!item) break;
+
+      logger.info({ id: item.id, description: item.description }, 'Executing heartbeat work item');
+      try {
+        const result = await this.gateway.handleCronJob(
+          `heartbeat-work:${item.id}`,
+          item.prompt,
+          item.tier,
+          item.maxTurns,
+        );
+        this.completeItem(item.id, result || 'completed');
+        completedWork.push({ description: item.description, result: result || 'completed' });
+        logToDailyNote(`**Heartbeat work: ${item.description}** — ${(result || 'completed').slice(0, 100).replace(/\n/g, ' ')}`);
+      } catch (err) {
+        this.failItem(item.id, String(err));
+        logger.warn({ err, id: item.id }, 'Heartbeat work item failed');
+      }
+    }
+
+    // ── Decide whether to invoke the LLM ──
+    this.pruneReportedTopics();
+
+    if (!this.shouldInvokeAgent(hasRealChanges, completedWork, currentDetails)) {
+      // Silent tick — no LLM call, just housekeeping
+      this.lastState = {
+        ...this.lastState,
+        fingerprint: currentFingerprint,
+        details: currentDetails,
+        timestamp: now.toISOString(),
+        consecutiveSilentBeats: (this.lastState.consecutiveSilentBeats ?? 0) + 1,
+      };
+      this.saveState();
+      logger.info({ silentBeats: this.lastState.consecutiveSilentBeats }, 'Heartbeat silent — nothing new');
+
+      // Still run housekeeping
+      this.nudgeStaleGoals();
+      this.processInbox();
+      // Fall through to nightly tasks below — don't return early
+    } else {
+
+    // Build dedup context from previously reported topics
+    const dedupContext = this.buildDedupContext();
+
+    // Build work summary for completed items
+    let workSummary = '';
+    if (completedWork.length > 0) {
+      workSummary = '## Work Completed This Tick\n' + completedWork.map(
+        (w) => `- **${w.description}**: ${w.result.slice(0, 200)}`,
+      ).join('\n');
+    }
+    if (workSummary) {
+      changesSummary = workSummary + '\n\n' + changesSummary;
+    }
+
+    // Persist new state (reset silent counter since we're invoking)
     this.lastState = {
+      ...this.lastState,
       fingerprint: currentFingerprint,
       details: currentDetails,
       timestamp: now.toISOString(),
+      consecutiveSilentBeats: 0,
     };
     this.saveState();
 
@@ -223,17 +289,34 @@ export class HeartbeatScheduler {
         standingInstructions,
         changesSummary,
         timeContext,
+        dedupContext,
       );
 
       const h12 = hour === 0 ? 12 : hour > 12 ? hour - 12 : hour;
       const ampm = hour >= 12 ? 'PM' : 'AM';
       const timeStr = `${h12}:${String(now.getMinutes()).padStart(2, '0')} ${ampm}`;
-      if (response && !HeartbeatScheduler.isSilent(response)) {
-        await this.dispatcher.send(`**[${timeStr} check-in]**\n\n${response}`);
-        logToDailyNote(`**${timeStr}**: ${response.slice(0, 100).replace(/\n/g, ' ')}`);
+      if (response && !HeartbeatScheduler.shouldSuppressMessage(response)) {
+        // Extract topic tags for dedup, then strip before sending
+        const newTopics = HeartbeatScheduler.extractReportedTopics(response);
+        const cleanResponse = HeartbeatScheduler.stripTopicTags(response);
+
+        await this.dispatcher.send(`**[${timeStr} check-in]**\n\n${cleanResponse}`);
+        logToDailyNote(`**${timeStr}**: ${cleanResponse.slice(0, 100).replace(/\n/g, ' ')}`);
+
+        // Update dedup ledger
+        if (newTopics.length > 0) {
+          this.lastState.reportedTopics = [
+            ...(this.lastState.reportedTopics ?? []),
+            ...newTopics,
+          ];
+        }
+        this.lastState.lastDiscordMessageAt = now.toISOString();
+        this.lastState.consecutiveSilentBeats = 0;
+        this.saveState();
       } else {
-        logger.info(`Heartbeat silent at ${timeStr}`);
-        // Don't log "all clear" heartbeats to daily notes — they create noise
+        logger.info(`Heartbeat suppressed at ${timeStr}`);
+        this.lastState.consecutiveSilentBeats = (this.lastState.consecutiveSilentBeats ?? 0) + 1;
+        this.saveState();
       }
     } catch (err) {
       logger.error({ err }, 'Heartbeat tick failed');
@@ -244,6 +327,7 @@ export class HeartbeatScheduler {
 
     // Fire-and-forget: process inbox items
     this.processInbox();
+    } // end of shouldInvokeAgent else-block
 
     // Nightly self-improvement: run once per day at 2 AM
     if (hour === 2 && this.lastSelfImproveDate !== todayISO()) {
@@ -304,11 +388,9 @@ export class HeartbeatScheduler {
 
   private readHeartbeatConfig(): string {
     if (!existsSync(HEARTBEAT_FILE)) {
-      return 'Check in naturally. Look for overdue tasks, items due today, and new inbox items. ' +
-        'Ensure today\'s daily note exists. If something needs attention, lead with it. ' +
-        'If everything is fine, say so briefly and move on. ' +
-        'You may take 1-2 small proactive actions per check-in: promote daily note facts to long-term memory, ' +
-        'update goal progress based on recent cron outputs, or flag interesting findings.';
+      return 'Work-first heartbeat. Execute any queued work items first, then check for genuinely NEW issues only. ' +
+        'If overdue tasks exist, alert. If nothing changed since last report, respond with exactly: __NOTHING__ ' +
+        'Tag each topic: [topic: short-key]. No bullet checklists. Write naturally.';
     }
     const raw = readFileSync(HEARTBEAT_FILE, 'utf-8');
     const parsed = matter(raw);
@@ -391,7 +473,7 @@ export class HeartbeatScheduler {
   private computeChangesSummary(
     oldDetails: Record<string, number | string>,
     newDetails: Record<string, number | string>,
-  ): string {
+  ): { summary: string; hasRealChanges: boolean } {
     const changes: string[] = [];
 
     const oldOverdue = Number(oldDetails.tasks_overdue ?? 0);
@@ -424,19 +506,24 @@ export class HeartbeatScheduler {
       changes.push(`${newInbox - oldInbox} new inbox item(s)`);
     }
 
+    // Track daily note changes for context but don't count as "real" —
+    // these are usually self-caused by heartbeat logging
     const oldSize = Number(oldDetails.daily_note_size ?? 0);
     const newSize = Number(newDetails.daily_note_size ?? 0);
+    const noteInfo: string[] = [];
     if (newSize > oldSize && oldSize > 0) {
-      changes.push('Daily note has new entries');
+      noteInfo.push('Daily note has new entries');
     } else if (newSize > 0 && oldSize === 0) {
-      changes.push('Daily note was created');
+      noteInfo.push('Daily note was created');
     }
 
-    if (changes.length === 0) {
-      changes.push('State fingerprint changed (minor updates)');
-    }
+    const hasRealChanges = changes.length > 0;
+    const allChanges = [...changes, ...noteInfo];
 
-    return changes.join('; ');
+    return {
+      summary: allChanges.length > 0 ? allChanges.join('; ') : '',
+      hasRealChanges,
+    };
   }
 
   /**
@@ -770,16 +857,185 @@ export class HeartbeatScheduler {
     return '';
   }
 
-  private static isSilent(response: string): boolean {
-    const indicators = [
-      'all clear',
-      'nothing to report',
-      'no updates',
-      'everything looks good',
-      'no urgent',
-      'quiet heartbeat',
+  private static shouldSuppressMessage(response: string): boolean {
+    const trimmed = response.trim();
+    if (trimmed === '__NOTHING__') return true;
+
+    if (trimmed.length > 80) return false;
+
+    const lower = trimmed.toLowerCase();
+    const noisePatterns = [
+      'all clear', 'nothing to report', 'nothing new',
+      'no updates', 'everything looks good', 'no urgent',
+      'quiet heartbeat', 'all quiet', 'nothing noteworthy',
+      'no changes', 'same as before',
     ];
-    const lower = response.toLowerCase();
-    return indicators.some((ind) => lower.includes(ind));
+    return noisePatterns.some((p) => lower.includes(p));
+  }
+
+  // ── Dedup Ledger ──────────────────────────────────────────────────
+
+  private pruneReportedTopics(): void {
+    const topics = this.lastState.reportedTopics ?? [];
+    const fourHoursAgo = Date.now() - 4 * 60 * 60 * 1000;
+    this.lastState.reportedTopics = topics
+      .filter((t) => new Date(t.reportedAt).getTime() > fourHoursAgo)
+      .slice(-20);
+  }
+
+  private buildDedupContext(): string {
+    const topics = this.lastState.reportedTopics ?? [];
+    if (topics.length === 0) return '';
+
+    const lines = topics.map((t) => {
+      const time = new Date(t.reportedAt).toLocaleTimeString('en-US', {
+        hour: 'numeric', minute: '2-digit', hour12: true,
+      });
+      return `- ${time}: ${t.summary} [topic: ${t.topic}]`;
+    });
+    return `## Already Reported (do NOT repeat unless status changed)\n${lines.join('\n')}`;
+  }
+
+  private static extractReportedTopics(response: string): HeartbeatReportedTopic[] {
+    const topics: HeartbeatReportedTopic[] = [];
+    const tagRegex = /\[topic:\s*([^\]]+)\]/g;
+    let match;
+    while ((match = tagRegex.exec(response)) !== null) {
+      const topic = match[1].trim();
+      const lineStart = response.lastIndexOf('\n', match.index) + 1;
+      const lineEnd = response.indexOf('\n', match.index + match[0].length);
+      const line = response.slice(lineStart, lineEnd === -1 ? undefined : lineEnd).trim();
+      const summary = line.replace(/\[topic:[^\]]+\]/g, '').trim();
+
+      topics.push({
+        topic,
+        summary,
+        reportedAt: new Date().toISOString(),
+      });
+    }
+    return topics;
+  }
+
+  private static stripTopicTags(response: string): string {
+    return response.replace(/\s*\[topic:[^\]]+\]/g, '').trim();
+  }
+
+  // ── Work Queue ────────────────────────────────────────────────────
+
+  static loadWorkQueue(): HeartbeatWorkItem[] {
+    try {
+      if (!existsSync(HEARTBEAT_WORK_QUEUE_FILE)) return [];
+      return JSON.parse(readFileSync(HEARTBEAT_WORK_QUEUE_FILE, 'utf-8'));
+    } catch {
+      return [];
+    }
+  }
+
+  private static saveWorkQueue(items: HeartbeatWorkItem[]): void {
+    const dir = path.dirname(HEARTBEAT_WORK_QUEUE_FILE);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(HEARTBEAT_WORK_QUEUE_FILE, JSON.stringify(items, null, 2));
+  }
+
+  private claimNextItem(): HeartbeatWorkItem | null {
+    const queue = HeartbeatScheduler.loadWorkQueue();
+    // Auto-cleanup: remove items older than 24 hours
+    const dayAgo = Date.now() - 24 * 60 * 60 * 1000;
+    const cleaned = queue.filter((item) =>
+      new Date(item.queuedAt).getTime() > dayAgo || item.status === 'running',
+    );
+
+    // Find highest-priority pending item
+    const pending = cleaned.filter((item) => item.status === 'pending');
+    pending.sort((a, b) => {
+      if (a.priority === 'high' && b.priority !== 'high') return -1;
+      if (b.priority === 'high' && a.priority !== 'high') return 1;
+      return new Date(a.queuedAt).getTime() - new Date(b.queuedAt).getTime();
+    });
+
+    const next = pending[0];
+    if (!next) {
+      if (cleaned.length !== queue.length) HeartbeatScheduler.saveWorkQueue(cleaned);
+      return null;
+    }
+
+    next.status = 'running';
+    HeartbeatScheduler.saveWorkQueue(cleaned);
+    return next;
+  }
+
+  private completeItem(id: string, result: string): void {
+    const queue = HeartbeatScheduler.loadWorkQueue();
+    const item = queue.find((i) => i.id === id);
+    if (item) {
+      item.status = 'completed';
+      item.completedAt = new Date().toISOString();
+      item.result = result.slice(0, 500);
+      HeartbeatScheduler.saveWorkQueue(queue);
+    }
+  }
+
+  private failItem(id: string, error: string): void {
+    const queue = HeartbeatScheduler.loadWorkQueue();
+    const item = queue.find((i) => i.id === id);
+    if (item) {
+      item.status = 'failed';
+      item.completedAt = new Date().toISOString();
+      item.error = error.slice(0, 500);
+      HeartbeatScheduler.saveWorkQueue(queue);
+    }
+  }
+
+  static enqueueWork(opts: {
+    description: string;
+    prompt: string;
+    source: string;
+    priority?: 'high' | 'normal';
+    maxTurns?: number;
+    tier?: number;
+  }): string {
+    const queue = HeartbeatScheduler.loadWorkQueue();
+    const id = randomBytes(4).toString('hex');
+    const item: HeartbeatWorkItem = {
+      id,
+      description: opts.description,
+      prompt: opts.prompt,
+      source: opts.source,
+      priority: opts.priority ?? 'normal',
+      queuedAt: new Date().toISOString(),
+      maxTurns: opts.maxTurns ?? 3,
+      tier: opts.tier ?? 1,
+      status: 'pending',
+    };
+    queue.push(item);
+    HeartbeatScheduler.saveWorkQueue(queue);
+    logger.info({ id, description: opts.description }, 'Work item enqueued for heartbeat');
+    return id;
+  }
+
+  // ── Decision Logic ────────────────────────────────────────────────
+
+  private shouldInvokeAgent(
+    hasRealChanges: boolean,
+    workCompleted: Array<{ description: string; result: string }>,
+    currentDetails: Record<string, number | string>,
+  ): boolean {
+    if (workCompleted.length > 0) return true;
+
+    const newOverdue = Number(currentDetails.tasks_overdue ?? 0);
+    if (newOverdue > 0) {
+      const lastReported = (this.lastState.reportedTopics ?? [])
+        .find((t) => t.topic === 'overdue-tasks');
+      if (!lastReported) return true;
+      const hoursSince = (Date.now() - new Date(lastReported.reportedAt).getTime()) / (60 * 60 * 1000);
+      if (hoursSince >= 1) return true;
+    }
+
+    if (hasRealChanges) return true;
+
+    const silentBeats = this.lastState.consecutiveSilentBeats ?? 0;
+    if (silentBeats >= 6) return true;
+
+    return false;
   }
 }

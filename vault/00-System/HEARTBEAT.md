@@ -12,30 +12,43 @@ tags:
 
 # Heartbeat Standing Instructions
 
-Every **{{interval}} minutes** during active hours ({{active_hours}}), I run an autonomous check. Here's what I do:
+Every **{{interval}} minutes** during active hours ({{active_hours}}), I run an autonomous check. Here's the priority order:
 
-## Checklist
+## 1. Execute Queued Work
 
-1. **Overdue tasks** — Check [[05-Tasks/TASKS|task list]] for tasks with due dates that have passed. If ANY task is overdue, DM the owner immediately with the task details and how overdue it is.
-2. **Due today** — Flag any tasks due today that haven't been started yet.
-3. **Daily note** — Ensure today's daily note exists. If not, create it from the template.
-4. **Inbox** — Check [[07-Inbox|Inbox]] for unsorted items. If there are any, try to sort them to the right folder.
-5. **Memory hygiene** — If there are facts in today's daily note that should be durable, promote them to [[MEMORY]] or the right topic/person note.
+If work items were queued for this heartbeat cycle, execute them and briefly summarize the outcome.
 
-## When to Alert
+## 2. Flag Genuinely NEW Issues
 
-- **A task is overdue** (ALWAYS alert for this)
-- A task is due today and not started
-- Something I was monitoring has changed
-- I found something during research that needs input
-- A scheduled job produced results worth reporting
+- **Overdue tasks** — Check [[05-Tasks/TASKS|task list]] for tasks with due dates that have passed. If a task just BECAME overdue (wasn't overdue at last check), alert immediately.
+- **Due today** — Flag tasks due today that haven't been started, but only if this is the first mention.
+- **Blocked goals** — If something is blocked and needs human input, surface it.
+- **New inbox items** — If new items appeared in [[07-Inbox|Inbox]], triage them.
 
-## When to Stay Quiet
+## 3. Stay Silent When Nothing Changed
 
-- Everything is on track
-- No overdue tasks
-- Nothing new to report
-- Just log a brief "heartbeat — all clear" to today's daily note
+If all of the above have already been reported and nothing changed:
+- Respond with exactly: `__NOTHING__`
+- Do NOT repeat previously reported information just to fill space.
+
+## Dedup Rules
+
+- You will be told what you already reported. Do NOT repeat those items unless their STATUS CHANGED.
+- Tag every distinct topic you mention: `[topic: short-key]`
+  - Examples: `[topic: task:T-005]`, `[topic: ross-appointments]`, `[topic: sf-query-noise]`
+
+## When to Alert (even if previously mentioned)
+
+- A task just BECAME overdue (not one that was already overdue last check)
+- Something is BLOCKED and needs human input
+- A work item failed and needs attention
+
+## Proactive Actions
+
+You may take 1-2 small proactive actions per check-in if useful:
+- Promote durable facts from daily note to [[MEMORY]] or topic notes
+- Update goal progress based on recent cron outputs
+- Ensure today's daily note exists
 
 ## Limits
 
