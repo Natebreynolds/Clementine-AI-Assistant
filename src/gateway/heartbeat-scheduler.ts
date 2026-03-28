@@ -304,7 +304,11 @@ export class HeartbeatScheduler {
 
   private readHeartbeatConfig(): string {
     if (!existsSync(HEARTBEAT_FILE)) {
-      return 'Check for overdue tasks. Ensure today\'s daily note exists.';
+      return 'Check in naturally. Look for overdue tasks, items due today, and new inbox items. ' +
+        'Ensure today\'s daily note exists. If something needs attention, lead with it. ' +
+        'If everything is fine, say so briefly and move on. ' +
+        'You may take 1-2 small proactive actions per check-in: promote daily note facts to long-term memory, ' +
+        'update goal progress based on recent cron outputs, or flag interesting findings.';
     }
     const raw = readFileSync(HEARTBEAT_FILE, 'utf-8');
     const parsed = matter(raw);

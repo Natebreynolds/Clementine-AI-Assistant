@@ -341,6 +341,68 @@ function ensureVaultDirs(): void {
   if (!existsSync(logDir)) {
     mkdirSync(logDir, { recursive: true });
   }
+
+  // Seed HEARTBEAT.md if it doesn't exist (new installs)
+  if (!existsSync(config.HEARTBEAT_FILE)) {
+    writeFileSync(config.HEARTBEAT_FILE, [
+      '---',
+      'type: core-system',
+      'role: heartbeat-config',
+      'interval: 30',
+      'active_hours: "08:00-22:00"',
+      'allow_tier2: false',
+      'web_allowed: true',
+      'tags:',
+      '  - system',
+      '  - heartbeat',
+      '---',
+      '',
+      '# Heartbeat Standing Instructions',
+      '',
+      'Every **{{interval}} minutes** during active hours ({{active_hours}}), I run an autonomous check-in.',
+      '',
+      '## What I Do',
+      '',
+      'Check in like a colleague would — naturally and briefly. Lead with anything that needs attention. If everything is fine, say so in a sentence or two and move on.',
+      '',
+      '**Look for:**',
+      '- Overdue tasks — check the task list for tasks past their due date. If any are overdue, flag them immediately.',
+      '- Tasks due today that haven\'t been started yet.',
+      '- New items in the Inbox — try to sort them to the right folder.',
+      '- Recent cron/scheduled task outputs that are worth mentioning.',
+      '- Goal progress — if a recent cron output advances a goal, update the goal\'s notes.',
+      '',
+      '## Proactive Actions',
+      '',
+      'During check-ins, I may take 1-2 small proactive actions per heartbeat (up to 6 per day):',
+      '- Promote durable facts from today\'s daily note to MEMORY or topic/person notes',
+      '- Update goal progress notes based on recent cron outputs',
+      '- Flag interesting (not just urgent) findings for the owner',
+      '- Create or update today\'s daily note if it doesn\'t exist',
+      '',
+      '## When to Alert',
+      '',
+      '- A task is overdue (always alert)',
+      '- A task is due today and not started',
+      '- Something I was monitoring has changed',
+      '- A scheduled job produced results worth reporting',
+      '- I found something interesting during a proactive check',
+      '',
+      '## When to Stay Quiet',
+      '',
+      '- Everything is on track',
+      '- No overdue tasks, nothing new',
+      '- Just log a brief note to today\'s daily log and move on',
+      '',
+      '## Limits',
+      '',
+      '- **Max turns:** 5 per heartbeat',
+      '- **Tier 1 actions only** by default (read, write to vault, search)',
+      '- **Tier 2** allowed if `allow_tier2: true` above (write outside vault, git commit, bash)',
+      '- **Tier 3 never** — no pushing, no external comms, no deletions',
+      '',
+    ].join('\n'), 'utf-8');
+  }
 }
 
 // ── Timer checker ─────────────────────────────────────────────────────
