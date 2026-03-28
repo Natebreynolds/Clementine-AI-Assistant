@@ -47,6 +47,7 @@ export class HeartbeatScheduler {
   private timer: ReturnType<typeof setInterval> | null = null;
   private running = false;
   private lastSelfImproveDate = '';
+  private lastConsolidationDate = '';
   private lastAgentSiRuns = new Map<string, string>();
 
   private getLastAgentSiRun(slug: string): string | undefined {
@@ -250,6 +251,26 @@ export class HeartbeatScheduler {
       logger.info('Triggering nightly self-improvement cycle');
       this.gateway.handleSelfImprove('run-nightly').catch(err => {
         logger.error({ err }, 'Nightly self-improvement failed');
+      });
+    }
+
+    // Evening memory consolidation: once per day between 7-9 PM
+    if (hour >= 19 && hour < 21 && this.lastConsolidationDate !== todayISO()) {
+      this.lastConsolidationDate = todayISO();
+      logger.info('Triggering evening memory consolidation');
+      // Run as a lightweight cron-style task — reviews today's notes and
+      // promotes durable facts to long-term memory
+      this.gateway.handleCronJob(
+        'memory-consolidation',
+        'Review today\'s daily note and recent conversations. Promote any durable facts ' +
+        '(preferences, decisions, people info, project updates) to long-term memory using ' +
+        'memory_write. Skip anything already in MEMORY.md. Be selective — only save facts ' +
+        'that will be useful in future conversations. Do not create duplicate entries.',
+        1, // tier 1 (vault-only)
+        3, // max 3 turns
+        'haiku',
+      ).catch(err => {
+        logger.error({ err }, 'Evening memory consolidation failed');
       });
     }
 
@@ -732,12 +753,15 @@ export class HeartbeatScheduler {
   }
 
   static getTimeContext(hour: number): string {
+    const day = new Date().toLocaleDateString('en-US', { weekday: 'long' });
     if (hour >= 8 && hour < 10) {
-      return 'Morning — Focus on task review and daily setup.';
-    } else if (hour >= 10 && hour < 18) {
-      return 'Working hours — Check for overdue tasks and inbox items.';
+      return `${day} morning — Be forward-looking. Mention today's plan priorities, flag anything due today, set the tone for the day.`;
+    } else if (hour >= 10 && hour < 14) {
+      return `${day} midday — Quick progress check. Reference anything discussed earlier today. Flag stuck or overdue items briefly.`;
+    } else if (hour >= 14 && hour < 18) {
+      return `${day} afternoon — Focus on what's been accomplished and what's still open. Be brief unless something needs attention.`;
     } else if (hour >= 18 && hour < 22) {
-      return 'Evening — Focus on daily summary and memory consolidation.';
+      return `${day} evening — Reflective wrap-up. Summarize what got done, note anything carrying over to tomorrow. Good time to consolidate memory and promote durable facts.`;
     }
     return '';
   }
