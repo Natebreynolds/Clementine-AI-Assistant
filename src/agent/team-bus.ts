@@ -33,6 +33,8 @@ export class TeamBus {
   private recentMessages: TeamMessage[] = [];
   /** "from:to" → last send timestamp (for cooldown). */
   private cooldowns = new Map<string, number>();
+  /** "slug" → context shares sent today (resets at midnight). */
+  private contextShareCounts = new Map<string, { count: number; date: string }>();
   /** "from:to:contentHash" → timestamp (for content dedup). */
   private contentHashes = new Map<string, number>();
   private statusChangeListeners: Array<() => void> = [];
@@ -657,6 +659,51 @@ export class TeamBus {
     if (!res.ok) {
       const errText = await res.text();
       logger.warn({ status: res.status, body: errText }, 'Discord mirror failed');
+    }
+  }
+
+  /**
+   * Share context between agents — lightweight, rate-limited updates.
+   * Longer cooldown (4 hours) and daily cap (2 per agent) vs regular messages.
+   * Used for proactive context sharing, not task delegation.
+   */
+  async shareContext(
+    fromSlug: string,
+    toSlug: string,
+    content: string,
+  ): Promise<TeamMessage | null> {
+    const today = new Date().toISOString().slice(0, 10);
+
+    // Daily cap: max 2 context shares per sender per day
+    const tracker = this.contextShareCounts.get(fromSlug);
+    if (tracker && tracker.date === today && tracker.count >= 2) {
+      logger.debug({ fromSlug }, 'Context share daily cap reached');
+      return null;
+    }
+
+    // Longer cooldown: 4 hours between context shares for the same pair
+    const cooldownKey = `ctx:${fromSlug}:${toSlug}`;
+    const lastShare = this.cooldowns.get(cooldownKey) ?? 0;
+    const now = Date.now();
+    if (now - lastShare < 4 * 3_600_000) {
+      logger.debug({ fromSlug, toSlug }, 'Context share cooldown active');
+      return null;
+    }
+
+    try {
+      const message = await this.send(fromSlug, toSlug, content, 0);
+      // Track the share
+      this.cooldowns.set(cooldownKey, now);
+      const current = this.contextShareCounts.get(fromSlug);
+      if (current && current.date === today) {
+        current.count++;
+      } else {
+        this.contextShareCounts.set(fromSlug, { count: 1, date: today });
+      }
+      return message;
+    } catch (err) {
+      logger.debug({ err, fromSlug, toSlug }, 'Context share send failed');
+      return null;
     }
   }
 }

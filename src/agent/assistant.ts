@@ -665,7 +665,12 @@ export class PersonalAssistant {
     }
 
     if (retrievalContext) {
-      parts.push(`## Relevant Context (retrieved)\n\n${retrievalContext}`);
+      parts.push(
+        `## Relevant Context (retrieved)\n\n${retrievalContext}\n\n` +
+        `*When retrieved context contains information from previous conversations relevant to the current topic, naturally reference it. ` +
+        `If the user mentions a person and memory shows their last known status or project, weave that in conversationally. ` +
+        `Only reference if genuinely relevant — do not force callbacks to old context.*`,
+      );
     } else {
       const memoryEntry = this.promptCache.get(MEMORY_FILE);
       if (memoryEntry) {
@@ -1369,6 +1374,15 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
       }
     }
 
+    // Time-gap awareness: let the agent know how long it's been
+    if (key && this.sessionTimestamps.has(key)) {
+      const gapMs = Date.now() - this.sessionTimestamps.get(key)!.getTime();
+      const gapHours = Math.round(gapMs / 3_600_000);
+      if (gapHours >= 8) {
+        effectivePrompt = `[It's been about ${gapHours} hours since your last message in this session — adjust your greeting naturally.]\n${effectivePrompt}`;
+      }
+    }
+
     // Drain any pending context from cron/heartbeat injections so the
     // active SDK session knows about work that happened outside of chat.
     // injectContext uses the base session key (e.g. discord:user:123) but
@@ -1390,7 +1404,7 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
           contextLines.push(`[${ctx.user}]\n${ctx.assistant}`);
         }
         effectivePrompt =
-          `[Background activity since your last message — you did this work via cron/scheduled tasks:\n${contextLines.join('\n\n')}]\n\n${effectivePrompt}`;
+          `[Since we last talked, you did some background work. Naturally mention what happened — lead with anything that needs attention, briefly note routine completions. Don't dump raw tool calls or list job names. Be conversational.\nBackground:\n${contextLines.join('\n\n')}]\n\n${effectivePrompt}`;
       }
     }
 
@@ -2129,7 +2143,7 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
 
     const promptParts = [
       `[Heartbeat — ${localTime}, ${localDate} (${tz})]\n`,
-      `You are checking in as ${owner}'s personal assistant. Write naturally — like a brief status update to a colleague, not a system report. No bullet-point checklists, no checkmarks, no "all systems nominal" language. If there is nothing noteworthy, just say so in a sentence or two. If something needs attention, lead with that.`,
+      `You are checking in as ${owner}'s personal assistant. Write naturally — like a brief status update to a trusted colleague. Reference recent conversations if relevant ("you mentioned X earlier..."). Match your energy to the time of day. If there is nothing noteworthy, just say so in a sentence or two. If something needs attention, lead with that. No bullet-point checklists, no checkmarks, no "all systems nominal" language. During check-ins, you may take 1-2 small proactive actions if useful: update goal progress, promote daily note facts to long-term memory, or flag interesting findings.`,
     ];
     if (timeContext) {
       promptParts.push(`\nTime context: ${timeContext}`);

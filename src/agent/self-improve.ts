@@ -57,7 +57,7 @@ const DEFAULT_CONFIG: SelfImproveConfig = {
   acceptThreshold: 0.6,
   plateauLimit: 3,
   areas: ['soul', 'cron', 'workflow', 'memory', 'agent', 'source', 'communication'],
-  autoApply: false,
+  autoApply: true,
 };
 
 // ── Paths ────────────────────────────────────────────────────────────

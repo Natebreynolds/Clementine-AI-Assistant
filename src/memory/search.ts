@@ -50,7 +50,17 @@ export function formatResultsForPrompt(
   let total = 0;
 
   for (const r of results) {
-    const entry = `### ${r.sourceFile} > ${r.section}\n${r.content}\n`;
+    // Add relative time annotation so the agent can reference recency naturally
+    let timeHint = '';
+    if (r.lastUpdated) {
+      const daysAgo = Math.floor((Date.now() - new Date(r.lastUpdated).getTime()) / 86_400_000);
+      if (daysAgo === 0) timeHint = ' (today)';
+      else if (daysAgo === 1) timeHint = ' (yesterday)';
+      else if (daysAgo < 7) timeHint = ` (${daysAgo} days ago)`;
+      else if (daysAgo < 30) timeHint = ` (${Math.floor(daysAgo / 7)} weeks ago)`;
+      else if (daysAgo < 365) timeHint = ` (${Math.floor(daysAgo / 30)} months ago)`;
+    }
+    const entry = `### ${r.sourceFile} > ${r.section}${timeHint}\n${r.content}\n`;
     if (total + entry.length > maxChars) break;
     parts.push(entry);
     total += entry.length;
