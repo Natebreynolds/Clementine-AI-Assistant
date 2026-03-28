@@ -361,6 +361,24 @@ export class MemoryStore {
       CREATE INDEX IF NOT EXISTS idx_configrev_agent ON config_revisions(agent_slug);
       CREATE INDEX IF NOT EXISTS idx_configrev_file ON config_revisions(agent_slug, file_name);
     `);
+
+    // Salesforce sync log — audit trail for CRM sync operations
+    this.conn.exec(`
+      CREATE TABLE IF NOT EXISTS sf_sync_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        local_table TEXT NOT NULL,
+        local_id INTEGER NOT NULL,
+        sf_object_type TEXT NOT NULL,
+        sf_id TEXT NOT NULL,
+        sync_direction TEXT NOT NULL,
+        synced_at TEXT DEFAULT (datetime('now')),
+        sync_status TEXT NOT NULL DEFAULT 'success',
+        error_message TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_sf_sync_local ON sf_sync_log(local_table, local_id);
+      CREATE INDEX IF NOT EXISTS idx_sf_sync_sfid ON sf_sync_log(sf_id);
+      CREATE INDEX IF NOT EXISTS idx_sf_sync_status ON sf_sync_log(sync_status);
+    `);
   }
 
   /**
@@ -2030,6 +2048,56 @@ export class MemoryStore {
   getConfigRevisionContent(id: number): string | null {
     const row = this.conn.prepare('SELECT content FROM config_revisions WHERE id = ?').get(id) as { content: string } | undefined;
     return row?.content ?? null;
+  }
+
+  // ── Salesforce Sync ──────────────────────────────────────────────
+
+  logSfSync(record: {
+    localTable: string; localId: number; sfObjectType: string;
+    sfId: string; syncDirection: string; syncStatus?: string; errorMessage?: string;
+  }): number {
+    const result = this.conn.prepare(
+      `INSERT INTO sf_sync_log (local_table, local_id, sf_object_type, sf_id, sync_direction, sync_status, error_message)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      record.localTable, record.localId, record.sfObjectType, record.sfId,
+      record.syncDirection, record.syncStatus ?? 'success', record.errorMessage ?? null,
+    );
+    return Number(result.lastInsertRowid);
+  }
+
+  getSfSyncHistory(opts: {
+    limit?: number; sfObjectType?: string; syncStatus?: string;
+  } = {}): Array<Record<string, unknown>> {
+    const where: string[] = [];
+    const vals: unknown[] = [];
+    if (opts.sfObjectType) { where.push('sf_object_type = ?'); vals.push(opts.sfObjectType); }
+    if (opts.syncStatus) { where.push('sync_status = ?'); vals.push(opts.syncStatus); }
+    const clause = where.length > 0 ? `WHERE ${where.join(' AND ')}` : '';
+    const limit = Math.min(opts.limit ?? 50, 500);
+    return this.conn.prepare(
+      `SELECT * FROM sf_sync_log ${clause} ORDER BY synced_at DESC LIMIT ?`
+    ).all(...vals, limit) as Array<Record<string, unknown>>;
+  }
+
+  getLeadBySfId(sfId: string): Record<string, unknown> | undefined {
+    return this.conn.prepare('SELECT * FROM leads WHERE sf_id = ?').get(sfId) as Record<string, unknown> | undefined;
+  }
+
+  getUnsyncedLeads(agentSlug?: string): Array<Record<string, unknown>> {
+    const base = `SELECT * FROM leads WHERE sf_id IS NULL AND status != 'opted_out'`;
+    const clause = agentSlug ? ` AND agent_slug = ?` : '';
+    return this.conn.prepare(`${base}${clause} ORDER BY created_at ASC`).all(
+      ...(agentSlug ? [agentSlug] : [])
+    ) as Array<Record<string, unknown>>;
+  }
+
+  getLeadsModifiedSince(since: string, agentSlug?: string): Array<Record<string, unknown>> {
+    const base = `SELECT * FROM leads WHERE updated_at >= ?`;
+    const clause = agentSlug ? ` AND agent_slug = ?` : '';
+    return this.conn.prepare(`${base}${clause} ORDER BY updated_at ASC`).all(
+      since, ...(agentSlug ? [agentSlug] : [])
+    ) as Array<Record<string, unknown>>;
   }
 
   // ── Helpers ───────────────────────────────────────────────────────

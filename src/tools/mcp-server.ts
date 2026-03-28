@@ -3725,6 +3725,543 @@ server.tool(
   },
 );
 
+// ── Salesforce REST API ──────────────────────────────────────────────────
+
+let sfToken: { accessToken: string; instanceUrl: string; expiresAt: number } | null = null;
+
+function sfConfigured(): boolean {
+  return Boolean(env['SF_INSTANCE_URL'] && env['SF_CLIENT_ID'] && env['SF_CLIENT_SECRET']);
+}
+
+async function getSfToken(): Promise<{ accessToken: string; instanceUrl: string }> {
+  const instanceUrl = env['SF_INSTANCE_URL'] ?? '';
+  const clientId = env['SF_CLIENT_ID'] ?? '';
+  const clientSecret = env['SF_CLIENT_SECRET'] ?? '';
+  const username = env['SF_USERNAME'] ?? '';
+  const password = env['SF_PASSWORD'] ?? '';
+
+  if (!instanceUrl || !clientId || !clientSecret) {
+    throw new Error('Salesforce not configured — set SF_INSTANCE_URL, SF_CLIENT_ID, SF_CLIENT_SECRET, SF_USERNAME, SF_PASSWORD in .env');
+  }
+
+  if (sfToken && Date.now() < sfToken.expiresAt - 300_000) {
+    return { accessToken: sfToken.accessToken, instanceUrl: sfToken.instanceUrl };
+  }
+
+  // Sandbox detection
+  const loginHost = instanceUrl.includes('.sandbox.') || instanceUrl.includes('--')
+    ? 'https://test.salesforce.com' : 'https://login.salesforce.com';
+
+  const body = new URLSearchParams({
+    grant_type: 'password',
+    client_id: clientId,
+    client_secret: clientSecret,
+    username,
+    password,
+  });
+
+  const res = await fetch(`${loginHost}/services/oauth2/token`, { method: 'POST', body });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Salesforce token request failed (${res.status}): ${text}`);
+  }
+  const data = (await res.json()) as { access_token: string; instance_url: string };
+  sfToken = {
+    accessToken: data.access_token,
+    instanceUrl: data.instance_url,
+    expiresAt: Date.now() + 7200_000, // SF tokens typically valid ~2 hours
+  };
+  return { accessToken: sfToken.accessToken, instanceUrl: sfToken.instanceUrl };
+}
+
+const SF_API_VERSION = env['SF_API_VERSION'] || 'v62.0';
+
+async function sfRequest(method: string, endpoint: string, body?: unknown, retry = true): Promise<any> {
+  const { accessToken, instanceUrl } = await getSfToken();
+  const url = `${instanceUrl}/services/data/${SF_API_VERSION}${endpoint}`;
+  const headers: Record<string, string> = { Authorization: `Bearer ${accessToken}` };
+  const opts: RequestInit = { method, headers };
+  if (body) {
+    headers['Content-Type'] = 'application/json';
+    opts.body = JSON.stringify(body);
+  }
+  const res = await fetch(url, opts);
+
+  // Parse API usage from Sforce-Limit-Info header
+  const limitInfo = res.headers.get('Sforce-Limit-Info');
+  if (limitInfo) {
+    const match = limitInfo.match(/api-usage=(\d+)\/(\d+)/);
+    if (match) {
+      const [, used, total] = match;
+      const pct = (Number(used) / Number(total)) * 100;
+      if (pct >= 80) logger.warn(`Salesforce API usage at ${pct.toFixed(0)}% (${used}/${total})`);
+    }
+  }
+
+  // Retry on 401 (expired token)
+  if (res.status === 401 && retry) {
+    sfToken = null;
+    return sfRequest(method, endpoint, body, false);
+  }
+
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Salesforce ${method} ${endpoint} failed (${res.status}): ${text}`);
+  }
+
+  // 204 No Content (PATCH success)
+  if (res.status === 204) return { success: true };
+  return res.json();
+}
+
+async function sfGet(endpoint: string): Promise<any> { return sfRequest('GET', endpoint); }
+async function sfPost(endpoint: string, body: unknown): Promise<any> { return sfRequest('POST', endpoint, body); }
+async function sfPatch(endpoint: string, body: unknown): Promise<any> { return sfRequest('PATCH', endpoint, body); }
+
+async function sfQuery(soql: string): Promise<any> {
+  return sfGet(`/query?q=${encodeURIComponent(soql)}`);
+}
+
+// Status mapping: local → Salesforce
+const LOCAL_TO_SF_STATUS: Record<string, string> = {
+  'new': 'Open - Not Contacted',
+  'contacted': 'Working - Contacted',
+  'replied': 'Working - Contacted',
+  'qualified': 'Qualified',
+  'meeting_booked': 'Qualified',
+  'won': 'Closed - Converted',
+  'lost': 'Closed - Not Converted',
+  'opted_out': 'Closed - Not Converted',
+};
+
+// Status mapping: Salesforce → local
+const SF_TO_LOCAL_STATUS: Record<string, string> = {
+  'Open - Not Contacted': 'new',
+  'Working - Contacted': 'contacted',
+  'Qualified': 'qualified',
+  'Closed - Converted': 'won',
+  'Closed - Not Converted': 'lost',
+};
+
+function splitName(fullName: string): { FirstName: string; LastName: string } {
+  const parts = fullName.trim().split(/\s+/);
+  if (parts.length === 1) return { FirstName: '', LastName: parts[0] };
+  const LastName = parts.pop()!;
+  return { FirstName: parts.join(' '), LastName };
+}
+
+function joinName(first?: string, last?: string): string {
+  return [first, last].filter(Boolean).join(' ') || 'Unknown';
+}
+
+// ── sf_lead_push ─────────────────────────────────────────────────────────
+
+server.tool(
+  'sf_lead_push',
+  'Push a local lead to Salesforce. Creates a new SF Lead or updates existing if the lead already has a Salesforce ID.',
+  {
+    leadId: z.number().describe('Local lead ID to push to Salesforce'),
+  },
+  async ({ leadId }) => {
+    if (!sfConfigured()) return textResult('Salesforce not configured — set SF_INSTANCE_URL, SF_CLIENT_ID, SF_CLIENT_SECRET, SF_USERNAME, SF_PASSWORD in .env');
+    const store = await getStore();
+    const lead = (store as any).getLeadById(leadId) as Record<string, unknown> | undefined;
+    if (!lead) return textResult(`Lead ID ${leadId} not found`);
+
+    const { FirstName, LastName } = splitName(String(lead.name ?? ''));
+    const sfData: Record<string, unknown> = {
+      FirstName,
+      LastName,
+      Email: lead.email,
+      Company: lead.company || '[Unknown]',
+      Title: lead.title || undefined,
+      Status: LOCAL_TO_SF_STATUS[String(lead.status ?? 'new')] || 'Open - Not Contacted',
+      LeadSource: lead.source || undefined,
+    };
+    // Remove undefined values
+    for (const k of Object.keys(sfData)) { if (sfData[k] === undefined) delete sfData[k]; }
+
+    try {
+      if (lead.sf_id) {
+        await sfPatch(`/sobjects/Lead/${lead.sf_id}`, sfData);
+        (store as any).logSfSync({ localTable: 'leads', localId: leadId, sfObjectType: 'Lead', sfId: String(lead.sf_id), syncDirection: 'push' });
+        return textResult(`Updated Salesforce Lead ${lead.sf_id} for ${lead.name} <${lead.email}>`);
+      } else {
+        const result = await sfPost('/sobjects/Lead', sfData);
+        const sfId = result.id;
+        (store as any).upsertLead({ agentSlug: String(lead.agent_slug), email: String(lead.email), name: String(lead.name), sfId });
+        (store as any).logSfSync({ localTable: 'leads', localId: leadId, sfObjectType: 'Lead', sfId, syncDirection: 'push' });
+        return textResult(`Created Salesforce Lead ${sfId} for ${lead.name} <${lead.email}>`);
+      }
+    } catch (err) {
+      (store as any).logSfSync({ localTable: 'leads', localId: leadId, sfObjectType: 'Lead', sfId: String(lead.sf_id ?? ''), syncDirection: 'push', syncStatus: 'error', errorMessage: String(err) });
+      return textResult(`Error pushing lead to Salesforce: ${err}`);
+    }
+  },
+);
+
+// ── sf_lead_pull ─────────────────────────────────────────────────────────
+
+server.tool(
+  'sf_lead_pull',
+  'Pull a Salesforce Lead or Contact into the local lead database by Salesforce ID or email address.',
+  {
+    sfId: z.string().optional().describe('Salesforce Lead/Contact ID'),
+    email: z.string().optional().describe('Email address to search in Salesforce'),
+  },
+  async ({ sfId, email }) => {
+    if (!sfConfigured()) return textResult('Salesforce not configured — set SF_INSTANCE_URL, SF_CLIENT_ID, SF_CLIENT_SECRET, SF_USERNAME, SF_PASSWORD in .env');
+    if (!sfId && !email) return textResult('Provide either sfId or email');
+
+    try {
+      let record: Record<string, unknown> | null = null;
+      let objectType = 'Lead';
+
+      if (sfId) {
+        // Try Lead first, then Contact
+        try {
+          record = await sfGet(`/sobjects/Lead/${sfId}`);
+        } catch {
+          record = await sfGet(`/sobjects/Contact/${sfId}`);
+          objectType = 'Contact';
+        }
+      } else if (email) {
+        const soql = `SELECT Id, FirstName, LastName, Email, Company, Title, Status, LeadSource FROM Lead WHERE Email = '${email.replace(/'/g, "\\'")}'  LIMIT 1`;
+        const result = await sfQuery(soql);
+        if (result.records?.length > 0) {
+          record = result.records[0];
+        } else {
+          const contactSoql = `SELECT Id, FirstName, LastName, Email, Account.Name, Title FROM Contact WHERE Email = '${email.replace(/'/g, "\\'")}'  LIMIT 1`;
+          const contactResult = await sfQuery(contactSoql);
+          if (contactResult.records?.length > 0) {
+            record = contactResult.records[0];
+            objectType = 'Contact';
+          }
+        }
+      }
+
+      if (!record) return textResult(`No Salesforce Lead or Contact found for ${sfId || email}`);
+
+      const store = await getStore();
+      const agentSlug = ACTIVE_AGENT_SLUG ?? 'clementine';
+      const name = joinName(record.FirstName as string, record.LastName as string);
+      const company = objectType === 'Contact'
+        ? (record.Account as Record<string, unknown>)?.Name as string ?? ''
+        : (record.Company as string) ?? '';
+      const localStatus = SF_TO_LOCAL_STATUS[String(record.Status ?? '')] || 'new';
+
+      const upsertResult = (store as any).upsertLead({
+        agentSlug,
+        email: String(record.Email ?? email ?? ''),
+        name,
+        company,
+        title: record.Title as string,
+        status: localStatus,
+        source: record.LeadSource as string,
+        sfId: String(record.Id),
+      });
+
+      (store as any).logSfSync({
+        localTable: 'leads', localId: upsertResult.id,
+        sfObjectType: objectType, sfId: String(record.Id), syncDirection: 'pull',
+      });
+
+      return textResult(
+        `${upsertResult.created ? 'Created' : 'Updated'} local lead from Salesforce ${objectType} ${record.Id}:\n` +
+        `  Name: ${name}\n  Email: ${record.Email}\n  Company: ${company}\n  Status: ${localStatus}`
+      );
+    } catch (err) {
+      return textResult(`Error pulling from Salesforce: ${err}`);
+    }
+  },
+);
+
+// ── sf_contact_search ────────────────────────────────────────────────────
+
+server.tool(
+  'sf_contact_search',
+  'Search Salesforce Leads and/or Contacts by name, email, or company.',
+  {
+    query: z.string().describe('Search keyword (name, email, or company)'),
+    objectType: z.enum(['Lead', 'Contact', 'Both']).optional().default('Both').describe('Which SF object type to search'),
+    limit: z.number().optional().default(10).describe('Max results to return'),
+  },
+  async ({ query, objectType, limit }) => {
+    if (!sfConfigured()) return textResult('Salesforce not configured — set SF_INSTANCE_URL, SF_CLIENT_ID, SF_CLIENT_SECRET, SF_USERNAME, SF_PASSWORD in .env');
+
+    try {
+      const safeQuery = query.replace(/'/g, "\\'");
+      const results: string[] = [];
+      const maxResults = Math.min(limit, 50);
+
+      if (objectType === 'Lead' || objectType === 'Both') {
+        const soql = `SELECT Id, FirstName, LastName, Email, Company, Title, Status, LeadSource FROM Lead WHERE Name LIKE '%${safeQuery}%' OR Email LIKE '%${safeQuery}%' OR Company LIKE '%${safeQuery}%' LIMIT ${maxResults}`;
+        const data = await sfQuery(soql);
+        for (const r of data.records ?? []) {
+          results.push(`[Lead] ${joinName(r.FirstName, r.LastName)} <${r.Email ?? 'no email'}> | ${r.Company ?? ''} | ${r.Title ?? ''} | Status: ${r.Status ?? ''} | ID: ${r.Id}`);
+        }
+      }
+
+      if (objectType === 'Contact' || objectType === 'Both') {
+        const soql = `SELECT Id, FirstName, LastName, Email, Account.Name, Title FROM Contact WHERE Name LIKE '%${safeQuery}%' OR Email LIKE '%${safeQuery}%' OR Account.Name LIKE '%${safeQuery}%' LIMIT ${maxResults}`;
+        const data = await sfQuery(soql);
+        for (const r of data.records ?? []) {
+          const acct = (r.Account as Record<string, unknown>)?.Name ?? '';
+          results.push(`[Contact] ${joinName(r.FirstName, r.LastName)} <${r.Email ?? 'no email'}> | ${acct} | ${r.Title ?? ''} | ID: ${r.Id}`);
+        }
+      }
+
+      if (results.length === 0) return textResult(`No Salesforce records found matching "${query}"`);
+      return textResult(`${EXTERNAL_CONTENT_TAG}\n\nSalesforce search results for "${query}" (${results.length} found):\n\n${results.join('\n')}`);
+    } catch (err) {
+      return textResult(`Error searching Salesforce: ${err}`);
+    }
+  },
+);
+
+// ── sf_opportunity_create ────────────────────────────────────────────────
+
+server.tool(
+  'sf_opportunity_create',
+  'Create a new Opportunity in Salesforce, optionally linked to an Account or Contact.',
+  {
+    name: z.string().describe('Opportunity name'),
+    stageName: z.string().describe('Sales stage (e.g., "Prospecting", "Qualification", "Closed Won")'),
+    closeDate: z.string().describe('Expected close date (YYYY-MM-DD)'),
+    amount: z.number().optional().describe('Deal amount in dollars'),
+    accountId: z.string().optional().describe('Salesforce Account ID to link'),
+    contactId: z.string().optional().describe('Salesforce Contact ID to add as Contact Role'),
+  },
+  async ({ name, stageName, closeDate, amount, accountId, contactId }) => {
+    if (!sfConfigured()) return textResult('Salesforce not configured — set SF_INSTANCE_URL, SF_CLIENT_ID, SF_CLIENT_SECRET, SF_USERNAME, SF_PASSWORD in .env');
+
+    try {
+      const oppData: Record<string, unknown> = { Name: name, StageName: stageName, CloseDate: closeDate };
+      if (amount !== undefined) oppData.Amount = amount;
+      if (accountId) oppData.AccountId = accountId;
+
+      const result = await sfPost('/sobjects/Opportunity', oppData);
+      const oppId = result.id;
+      let contactRoleMsg = '';
+
+      // Link contact role if provided
+      if (contactId) {
+        try {
+          await sfPost('/sobjects/OpportunityContactRole', {
+            OpportunityId: oppId,
+            ContactId: contactId,
+            Role: 'Decision Maker',
+          });
+          contactRoleMsg = `\nLinked Contact ${contactId} as Decision Maker`;
+        } catch (err) {
+          contactRoleMsg = `\nWarning: Could not link Contact Role: ${err}`;
+        }
+      }
+
+      return textResult(`Created Opportunity ${oppId}: "${name}" (${stageName}, close: ${closeDate}${amount ? `, $${amount}` : ''})${contactRoleMsg}`);
+    } catch (err) {
+      return textResult(`Error creating Opportunity: ${err}`);
+    }
+  },
+);
+
+// ── sf_opportunity_update ────────────────────────────────────────────────
+
+server.tool(
+  'sf_opportunity_update',
+  'Update an existing Salesforce Opportunity (stage, amount, close date, etc.).',
+  {
+    sfId: z.string().describe('Salesforce Opportunity ID'),
+    stageName: z.string().optional().describe('New sales stage'),
+    amount: z.number().optional().describe('Updated deal amount'),
+    closeDate: z.string().optional().describe('Updated close date (YYYY-MM-DD)'),
+    description: z.string().optional().describe('Opportunity description/notes'),
+  },
+  async ({ sfId, stageName, amount, closeDate, description }) => {
+    if (!sfConfigured()) return textResult('Salesforce not configured — set SF_INSTANCE_URL, SF_CLIENT_ID, SF_CLIENT_SECRET, SF_USERNAME, SF_PASSWORD in .env');
+
+    try {
+      const updates: Record<string, unknown> = {};
+      if (stageName) updates.StageName = stageName;
+      if (amount !== undefined) updates.Amount = amount;
+      if (closeDate) updates.CloseDate = closeDate;
+      if (description) updates.Description = description;
+
+      if (Object.keys(updates).length === 0) return textResult('No fields to update');
+
+      await sfPatch(`/sobjects/Opportunity/${sfId}`, updates);
+      const fields = Object.entries(updates).map(([k, v]) => `${k}: ${v}`).join(', ');
+      return textResult(`Updated Opportunity ${sfId}: ${fields}`);
+    } catch (err) {
+      return textResult(`Error updating Opportunity: ${err}`);
+    }
+  },
+);
+
+// ── sf_activity_log ──────────────────────────────────────────────────────
+
+server.tool(
+  'sf_activity_log',
+  'Log an activity (Task) to Salesforce linked to a Lead or Contact. Use this to record calls, emails, meetings, etc.',
+  {
+    sfWhoId: z.string().describe('Salesforce Lead or Contact ID to link the activity to'),
+    subject: z.string().describe('Activity subject line'),
+    description: z.string().optional().describe('Activity description/notes'),
+    type: z.enum(['Call', 'Email', 'Meeting', 'Other']).optional().default('Other').describe('Activity type'),
+    status: z.enum(['Completed', 'Not Started', 'In Progress']).optional().default('Completed').describe('Task status'),
+    activityDate: z.string().optional().describe('Activity date (YYYY-MM-DD, defaults to today)'),
+  },
+  async ({ sfWhoId, subject, description, type, status, activityDate }) => {
+    if (!sfConfigured()) return textResult('Salesforce not configured — set SF_INSTANCE_URL, SF_CLIENT_ID, SF_CLIENT_SECRET, SF_USERNAME, SF_PASSWORD in .env');
+
+    try {
+      const taskData: Record<string, unknown> = {
+        WhoId: sfWhoId,
+        Subject: subject,
+        Status: status,
+        Type: type,
+        ActivityDate: activityDate || new Date().toISOString().slice(0, 10),
+      };
+      if (description) taskData.Description = description;
+
+      const result = await sfPost('/sobjects/Task', taskData);
+      return textResult(`Logged ${type} activity to Salesforce (Task ID: ${result.id}): "${subject}" for ${sfWhoId}`);
+    } catch (err) {
+      return textResult(`Error logging activity to Salesforce: ${err}`);
+    }
+  },
+);
+
+// ── sf_sync ──────────────────────────────────────────────────────────────
+
+server.tool(
+  'sf_sync',
+  'Run a bidirectional sync between local leads and Salesforce. Pushes unsynced/modified local leads to SF and pulls recently modified SF leads into the local database.',
+  {
+    direction: z.enum(['push', 'pull', 'both']).optional().default('both').describe('Sync direction'),
+    agentSlug: z.string().optional().describe('Only sync leads for this agent'),
+    dryRun: z.boolean().optional().default(false).describe('Preview sync without making changes'),
+  },
+  async ({ direction, agentSlug, dryRun }) => {
+    if (!sfConfigured()) return textResult('Salesforce not configured — set SF_INSTANCE_URL, SF_CLIENT_ID, SF_CLIENT_SECRET, SF_USERNAME, SF_PASSWORD in .env');
+
+    const store = await getStore();
+    const slug = agentSlug ?? ACTIVE_AGENT_SLUG ?? undefined;
+    const summary = { pushed: 0, pulled: 0, errors: 0, details: [] as string[] };
+
+    try {
+      // ── Push phase ──
+      if (direction === 'push' || direction === 'both') {
+        // Get unsynced leads
+        const unsynced = (store as any).getUnsyncedLeads(slug) as Array<Record<string, unknown>>;
+        // Get recently modified leads that have sfId (need re-push)
+        const lastSync = (store as any).getSfSyncHistory({ limit: 1 }) as Array<Record<string, unknown>>;
+        const since = lastSync.length > 0 ? String(lastSync[0].synced_at) : '1970-01-01T00:00:00Z';
+        const modified = ((store as any).getLeadsModifiedSince(since, slug) as Array<Record<string, unknown>>)
+          .filter((l: Record<string, unknown>) => l.sf_id);
+
+        const toPush = [...unsynced, ...modified].slice(0, 200); // Batch limit
+
+        for (const lead of toPush) {
+          const leadId = Number(lead.id);
+          const { FirstName, LastName } = splitName(String(lead.name ?? ''));
+          const sfData: Record<string, unknown> = {
+            FirstName, LastName,
+            Email: lead.email,
+            Company: lead.company || '[Unknown]',
+            Title: lead.title || undefined,
+            Status: LOCAL_TO_SF_STATUS[String(lead.status ?? 'new')] || 'Open - Not Contacted',
+            LeadSource: lead.source || undefined,
+          };
+          for (const k of Object.keys(sfData)) { if (sfData[k] === undefined) delete sfData[k]; }
+
+          if (dryRun) {
+            summary.pushed++;
+            summary.details.push(`[DRY RUN] Would push ${lead.name} <${lead.email}> (${lead.sf_id ? 'update' : 'create'})`);
+            continue;
+          }
+
+          try {
+            if (lead.sf_id) {
+              await sfPatch(`/sobjects/Lead/${lead.sf_id}`, sfData);
+              (store as any).logSfSync({ localTable: 'leads', localId: leadId, sfObjectType: 'Lead', sfId: String(lead.sf_id), syncDirection: 'push' });
+            } else {
+              const result = await sfPost('/sobjects/Lead', sfData);
+              (store as any).upsertLead({ agentSlug: String(lead.agent_slug), email: String(lead.email), name: String(lead.name), sfId: result.id });
+              (store as any).logSfSync({ localTable: 'leads', localId: leadId, sfObjectType: 'Lead', sfId: result.id, syncDirection: 'push' });
+            }
+            summary.pushed++;
+            summary.details.push(`Pushed ${lead.name} <${lead.email}>`);
+          } catch (err) {
+            summary.errors++;
+            summary.details.push(`Error pushing ${lead.email}: ${err}`);
+            (store as any).logSfSync({ localTable: 'leads', localId: leadId, sfObjectType: 'Lead', sfId: String(lead.sf_id ?? ''), syncDirection: 'push', syncStatus: 'error', errorMessage: String(err) });
+          }
+        }
+      }
+
+      // ── Pull phase ──
+      if (direction === 'pull' || direction === 'both') {
+        const lastSync = (store as any).getSfSyncHistory({ limit: 1 }) as Array<Record<string, unknown>>;
+        const since = lastSync.length > 0 ? String(lastSync[0].synced_at) : '1970-01-01T00:00:00Z';
+        const sinceFormatted = since.replace('T', 'T').replace(' ', 'T');
+
+        const soql = `SELECT Id, FirstName, LastName, Email, Company, Title, Status, LeadSource, SystemModstamp FROM Lead WHERE SystemModstamp > ${sinceFormatted} AND Email != null ORDER BY SystemModstamp ASC LIMIT 200`;
+
+        try {
+          const data = await sfQuery(soql);
+          const pullSlug = slug ?? 'clementine';
+
+          for (const record of data.records ?? []) {
+            const name = joinName(record.FirstName, record.LastName);
+            const localStatus = SF_TO_LOCAL_STATUS[String(record.Status ?? '')] || 'new';
+
+            if (dryRun) {
+              summary.pulled++;
+              summary.details.push(`[DRY RUN] Would pull ${name} <${record.Email}> (SF ID: ${record.Id})`);
+              continue;
+            }
+
+            try {
+              const upsertResult = (store as any).upsertLead({
+                agentSlug: pullSlug,
+                email: String(record.Email),
+                name,
+                company: record.Company ?? '',
+                title: record.Title,
+                status: localStatus,
+                source: record.LeadSource,
+                sfId: String(record.Id),
+              });
+              (store as any).logSfSync({
+                localTable: 'leads', localId: upsertResult.id,
+                sfObjectType: 'Lead', sfId: String(record.Id), syncDirection: 'pull',
+              });
+              summary.pulled++;
+              summary.details.push(`Pulled ${name} <${record.Email}>`);
+            } catch (err) {
+              summary.errors++;
+              summary.details.push(`Error pulling ${record.Email}: ${err}`);
+            }
+          }
+        } catch (err) {
+          summary.errors++;
+          summary.details.push(`Error querying Salesforce: ${err}`);
+        }
+      }
+
+      const prefix = dryRun ? '[DRY RUN] ' : '';
+      return textResult(
+        `${prefix}Salesforce sync complete:\n` +
+        `  Pushed: ${summary.pushed}\n  Pulled: ${summary.pulled}\n  Errors: ${summary.errors}\n\n` +
+        (summary.details.length > 0 ? `Details:\n${summary.details.map(d => `  • ${d}`).join('\n')}` : 'No records to sync.')
+      );
+    } catch (err) {
+      return textResult(`Salesforce sync failed: ${err}`);
+    }
+  },
+);
+
 // ── Team Tools ──────────────────────────────────────────────────────────
 
 const PROFILES_DIR = path.join(SYSTEM_DIR, 'profiles');

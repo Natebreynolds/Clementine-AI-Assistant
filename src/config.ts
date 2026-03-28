@@ -184,6 +184,15 @@ export const MS_CLIENT_ID = getEnv('MS_CLIENT_ID');
 export const MS_CLIENT_SECRET = getSecret('MS_CLIENT_SECRET');
 export const MS_USER_EMAIL = getEnv('MS_USER_EMAIL');
 
+// ── Salesforce CRM ─────────────────────────────────────────────────
+
+export const SF_INSTANCE_URL = getEnv('SF_INSTANCE_URL');
+export const SF_CLIENT_ID = getEnv('SF_CLIENT_ID');
+export const SF_CLIENT_SECRET = getSecret('SF_CLIENT_SECRET');
+export const SF_USERNAME = getEnv('SF_USERNAME');
+export const SF_PASSWORD = getSecret('SF_PASSWORD');
+export const SF_API_VERSION = getEnv('SF_API_VERSION', 'v62.0');
+
 // ── Security ─────────────────────────────────────────────────────────
 
 export const ALLOW_ALL_USERS = getEnv('ALLOW_ALL_USERS', 'false').toLowerCase() === 'true';
@@ -224,6 +233,7 @@ export const CHANNEL_TELEGRAM = Boolean(TELEGRAM_BOT_TOKEN);
 export const CHANNEL_WHATSAPP = Boolean(TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN && WHATSAPP_OWNER_PHONE);
 export const CHANNEL_WEBHOOK = WEBHOOK_ENABLED && Boolean(WEBHOOK_SECRET);
 export const CHANNEL_OUTLOOK = Boolean(MS_TENANT_ID && MS_CLIENT_ID && MS_CLIENT_SECRET && MS_USER_EMAIL);
+export const CHANNEL_SALESFORCE = Boolean(SF_INSTANCE_URL && SF_CLIENT_ID && SF_CLIENT_SECRET);
 
 // ── Fail-closed secret validation ───────────────────────────────────
 //
@@ -244,6 +254,7 @@ const SECRET_VALIDATIONS: SecretValidation[] = [
   { key: 'TELEGRAM_BOT_TOKEN', channel: 'Telegram' },
   { key: 'TWILIO_ACCOUNT_SID', channel: 'WhatsApp', requiredWith: ['TWILIO_AUTH_TOKEN', 'WHATSAPP_OWNER_PHONE'] },
   { key: 'ANTHROPIC_API_KEY', channel: 'API' },
+  { key: 'SF_CLIENT_SECRET', channel: 'Salesforce', requiredWith: ['SF_CLIENT_ID', 'SF_INSTANCE_URL'] },
 ];
 
 /**
