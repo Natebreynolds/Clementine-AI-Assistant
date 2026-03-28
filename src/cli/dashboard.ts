@@ -372,6 +372,133 @@ function setWorkspaceDirs(dirs: string[]): void {
   writeFileSync(ENV_PATH, lines.join('\n'));
 }
 
+// ── CLI tool discovery ──────────────────────────────────────────────
+
+interface ToolEntry { name: string; description: string; type: string; installed?: boolean; api?: string; connected?: boolean; }
+
+const CLI_TOOL_PROBES = [
+  { cmd: 'git', description: 'Version control' },
+  { cmd: 'gh', description: 'GitHub CLI' },
+  { cmd: 'node', description: 'Node.js runtime' },
+  { cmd: 'npx', description: 'Node package executor' },
+  { cmd: 'python3', description: 'Python 3 runtime' },
+  { cmd: 'docker', description: 'Container runtime' },
+  { cmd: 'kubectl', description: 'Kubernetes CLI' },
+  { cmd: 'terraform', description: 'Infrastructure as code' },
+  { cmd: 'aws', description: 'AWS CLI' },
+  { cmd: 'gcloud', description: 'Google Cloud CLI' },
+  { cmd: 'az', description: 'Azure CLI' },
+  { cmd: 'curl', description: 'HTTP client' },
+  { cmd: 'jq', description: 'JSON processor' },
+  { cmd: 'ffmpeg', description: 'Media processing' },
+  { cmd: 'kernel', description: 'Kernel browser automation' },
+  { cmd: 'claude', description: 'Claude Code CLI' },
+  { cmd: 'brew', description: 'Homebrew package manager' },
+  { cmd: 'cargo', description: 'Rust package manager' },
+  { cmd: 'go', description: 'Go toolchain' },
+  { cmd: 'ruby', description: 'Ruby runtime' },
+  { cmd: 'sf', description: 'Salesforce CLI' },
+];
+
+function discoverCliTools(): ToolEntry[] {
+  return CLI_TOOL_PROBES.map(t => {
+    let installed = false;
+    try { execSync(`which ${t.cmd}`, { stdio: 'pipe' }); installed = true; } catch { /* not found */ }
+    return { name: t.cmd, description: t.description, type: 'cli', installed };
+  });
+}
+
+function getApiConnectionStatus(): Record<string, boolean> {
+  const envPath = path.join(BASE_DIR, '.env');
+  let env: Record<string, string> = {};
+  try {
+    if (existsSync(envPath)) {
+      const content = readFileSync(envPath, 'utf-8');
+      for (const line of content.split('\n')) {
+        const m = line.match(/^([A-Z_]+)=(.*)$/);
+        if (m) env[m[1]] = m[2].trim();
+      }
+    }
+  } catch { /* ignore */ }
+  return {
+    'Microsoft Graph': !!(env.MS_CLIENT_ID && env.MS_CLIENT_SECRET),
+    'GitHub': true,
+    'Discord': !!env.DISCORD_TOKEN,
+    'Salesforce': !!(env.SF_INSTANCE_URL || env.SF_CLIENT_ID),
+    'RSS': true,
+    'Web Search': true,
+  };
+}
+
+const MCP_SERVER_DESCRIPTIONS: Record<string, string> = {
+  'dataforseo': 'SEO data, keyword research, SERP analysis',
+  'supabase': 'Supabase database and auth',
+  'Bright Data': 'Web scraping and data collection',
+  'browsermcp': 'Browser automation via MCP',
+  'ElevenLabs': 'Voice synthesis, text-to-speech, audio AI',
+  'apify': 'Web scraping actors and automation',
+  'vapi': 'Voice AI phone calls and assistants',
+  'kernel': 'Kernel browser automation',
+  'playwright': 'Browser testing and automation',
+  'context7': 'Library documentation lookup',
+  'firecrawl': 'Web crawling and scraping',
+  'exa': 'Neural web search',
+  'linear': 'Linear issue tracking',
+  'discord': 'Discord bot integration',
+  'gitlab': 'GitLab repository management',
+  'greptile': 'Codebase search and understanding',
+  'serena': 'Code-aware AI assistant',
+  'terraform': 'Infrastructure as code management',
+};
+
+function discoverGlobalMcpServers(): ToolEntry[] {
+  const servers: ToolEntry[] = [];
+  const seen = new Set<string>();
+
+  // 1. Claude Desktop config
+  const desktopConfig = path.join(os.homedir(), 'Library', 'Application Support', 'Claude', 'claude_desktop_config.json');
+  try {
+    if (existsSync(desktopConfig)) {
+      const data = JSON.parse(readFileSync(desktopConfig, 'utf-8'));
+      for (const name of Object.keys(data.mcpServers ?? {})) {
+        if (seen.has(name.toLowerCase())) continue;
+        seen.add(name.toLowerCase());
+        servers.push({
+          name,
+          description: MCP_SERVER_DESCRIPTIONS[name] ?? `${name} MCP server`,
+          type: 'global-mcp',
+          connected: true,
+        });
+      }
+    }
+  } catch { /* ignore */ }
+
+  // 2. Claude Code enabled plugins (from settings.json)
+  try {
+    const settingsFile = path.join(os.homedir(), '.claude', 'settings.json');
+    if (existsSync(settingsFile)) {
+      const settings = JSON.parse(readFileSync(settingsFile, 'utf-8'));
+      const plugins = settings.enabledPlugins ?? {};
+      for (const [key, enabled] of Object.entries(plugins)) {
+        if (!enabled) continue;
+        const pluginName = key.split('@')[0];
+        if (seen.has(pluginName.toLowerCase())) continue;
+        seen.add(pluginName.toLowerCase());
+        servers.push({
+          name: pluginName,
+          description: MCP_SERVER_DESCRIPTIONS[pluginName] ?? `${pluginName} plugin`,
+          type: 'global-mcp',
+          connected: true,
+        });
+      }
+    }
+  } catch { /* ignore */ }
+
+  return servers;
+}
+
+// ── Project scanning ────────────────────────────────────────────────
+
 function scanProjects(): ProjectInfo[] {
   const home = os.homedir();
   const seen = new Set<string>();
@@ -1646,33 +1773,114 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
 
   app.get('/api/available-tools', (_req, res) => {
     try {
-      const categories: Record<string, string[]> = {
-        'Core': ['Bash', 'Read', 'Write', 'Edit', 'Glob', 'Grep'],
-        'Web': ['WebSearch', 'WebFetch'],
-        'Memory': ['memory_read', 'memory_write', 'memory_search', 'memory_recall',
-                    'memory_connections', 'memory_timeline', 'memory_report', 'memory_correct',
-                    'memory_consolidate'],
-        'Notes & Tasks': ['note_create', 'note_take', 'daily_note', 'task_list', 'task_add', 'task_update'],
-        'Communication': ['outlook_inbox', 'outlook_search', 'outlook_calendar', 'outlook_draft',
-                          'outlook_send', 'outlook_read_email', 'discord_channel_send'],
-        'Research': ['rss_fetch', 'github_prs', 'browser_screenshot', 'analyze_image', 'transcript_search'],
-        'Team': ['team_list', 'team_message'],
-        'System': ['workspace_config', 'workspace_list', 'workspace_info',
-                   'self_restart', 'vault_stats', 'set_timer', 'feedback_log', 'feedback_report'],
-      };
+      const data = cached('available-tools', 30_000, () => {
+        const apiStatus = getApiConnectionStatus();
 
-      // Discover MCP servers from linked projects
-      const projects = scanProjects();
-      for (const p of projects) {
-        if (p.mcpServers.length) {
-          for (const server of p.mcpServers) {
-            if (!categories[server]) categories[server] = [];
-            categories[server].push(`mcp__${server} (all tools)`);
+        const categories: Record<string, ToolEntry[]> = {
+          'CLI Tools': discoverCliTools(),
+          'Core SDK': [
+            { name: 'Bash', description: 'Execute shell commands', type: 'sdk' },
+            { name: 'Read', description: 'Read files', type: 'sdk' },
+            { name: 'Write', description: 'Write files', type: 'sdk' },
+            { name: 'Edit', description: 'Edit files', type: 'sdk' },
+            { name: 'Glob', description: 'Find files by pattern', type: 'sdk' },
+            { name: 'Grep', description: 'Search file contents', type: 'sdk' },
+            { name: 'WebSearch', description: 'Search the web', type: 'sdk' },
+            { name: 'WebFetch', description: 'Fetch web pages', type: 'sdk' },
+          ],
+          'Memory & Vault': [
+            { name: 'memory_read', description: 'Read vault notes', type: 'mcp' },
+            { name: 'memory_write', description: 'Write or append to vault notes', type: 'mcp' },
+            { name: 'memory_search', description: 'FTS5 search across vault', type: 'mcp' },
+            { name: 'memory_recall', description: 'Context retrieval (relevance + recency)', type: 'mcp' },
+            { name: 'memory_connections', description: 'Find related notes by link graph', type: 'mcp' },
+            { name: 'memory_timeline', description: 'Chronological note history', type: 'mcp' },
+            { name: 'memory_report', description: 'Show recent memory extractions', type: 'mcp' },
+            { name: 'memory_correct', description: 'Correct a stored memory', type: 'mcp' },
+            { name: 'memory_consolidate', description: 'Merge duplicate memories', type: 'mcp' },
+            { name: 'transcript_search', description: 'Search conversation transcripts', type: 'mcp' },
+            { name: 'vault_stats', description: 'Vault health dashboard', type: 'mcp' },
+          ],
+          'Notes & Tasks': [
+            { name: 'note_create', description: 'Create a new vault note', type: 'mcp' },
+            { name: 'note_take', description: 'Quick note capture', type: 'mcp' },
+            { name: 'daily_note', description: 'Read/write today\'s daily note', type: 'mcp' },
+            { name: 'task_list', description: 'List tasks from master list', type: 'mcp' },
+            { name: 'task_add', description: 'Add a new task', type: 'mcp' },
+            { name: 'task_update', description: 'Update task status', type: 'mcp' },
+          ],
+          'API Integrations': [
+            { name: 'outlook_inbox', description: 'Read Outlook inbox', type: 'api', api: 'Microsoft Graph', connected: apiStatus['Microsoft Graph'] },
+            { name: 'outlook_search', description: 'Search Outlook emails', type: 'api', api: 'Microsoft Graph', connected: apiStatus['Microsoft Graph'] },
+            { name: 'outlook_calendar', description: 'Read calendar events', type: 'api', api: 'Microsoft Graph', connected: apiStatus['Microsoft Graph'] },
+            { name: 'outlook_draft', description: 'Draft an email', type: 'api', api: 'Microsoft Graph', connected: apiStatus['Microsoft Graph'] },
+            { name: 'outlook_send', description: 'Send an email', type: 'api', api: 'Microsoft Graph', connected: apiStatus['Microsoft Graph'] },
+            { name: 'outlook_read_email', description: 'Read a specific email', type: 'api', api: 'Microsoft Graph', connected: apiStatus['Microsoft Graph'] },
+            { name: 'discord_channel_send', description: 'Send Discord message', type: 'api', api: 'Discord', connected: apiStatus['Discord'] },
+            { name: 'github_prs', description: 'List GitHub pull requests', type: 'api', api: 'GitHub', connected: apiStatus['GitHub'] },
+            { name: 'rss_fetch', description: 'Fetch RSS/Atom feeds', type: 'api', api: 'RSS', connected: true },
+            { name: 'web_search', description: 'DuckDuckGo web search', type: 'api', api: 'Web Search', connected: true },
+            { name: 'browser_screenshot', description: 'Screenshot a URL', type: 'api', api: 'Kernel', connected: false },
+            { name: 'analyze_image', description: 'Analyze an image with vision', type: 'api', api: 'Claude', connected: true },
+          ],
+          'Goals & Workflows': [
+            { name: 'goal_create', description: 'Create a persistent goal', type: 'mcp' },
+            { name: 'goal_update', description: 'Update goal progress', type: 'mcp' },
+            { name: 'goal_list', description: 'List all goals', type: 'mcp' },
+            { name: 'goal_get', description: 'Get goal details', type: 'mcp' },
+            { name: 'goal_work', description: 'Spawn focused goal work session', type: 'mcp' },
+            { name: 'heartbeat_queue_work', description: 'Queue background work for heartbeat', type: 'mcp' },
+            { name: 'delegate_task', description: 'Delegate task to another agent', type: 'mcp' },
+            { name: 'check_delegation', description: 'Check delegation status', type: 'mcp' },
+          ],
+          'Agent Management': [
+            { name: 'create_agent', description: 'Create a new agent', type: 'mcp' },
+            { name: 'update_agent', description: 'Update agent config', type: 'mcp' },
+            { name: 'delete_agent', description: 'Delete an agent', type: 'mcp' },
+            { name: 'add_cron_job', description: 'Add scheduled task', type: 'mcp' },
+            { name: 'cron_list', description: 'List scheduled tasks', type: 'mcp' },
+            { name: 'cron_progress_read', description: 'Read cron progress state', type: 'mcp' },
+            { name: 'cron_progress_write', description: 'Write cron progress state', type: 'mcp' },
+          ],
+          'Team': [
+            { name: 'team_list', description: 'List team agents', type: 'mcp' },
+            { name: 'team_message', description: 'Send message to team agent', type: 'mcp' },
+            { name: 'session_pause', description: 'Pause a chat session', type: 'mcp' },
+            { name: 'session_resume', description: 'Resume a paused session', type: 'mcp' },
+          ],
+          'System': [
+            { name: 'workspace_config', description: 'Read/write workspace config', type: 'mcp' },
+            { name: 'workspace_list', description: 'List workspace projects', type: 'mcp' },
+            { name: 'workspace_info', description: 'Project info and scripts', type: 'mcp' },
+            { name: 'self_restart', description: 'Restart the daemon', type: 'mcp' },
+            { name: 'set_timer', description: 'Set a reminder timer', type: 'mcp' },
+            { name: 'feedback_log', description: 'Log user feedback', type: 'mcp' },
+            { name: 'feedback_report', description: 'View feedback history', type: 'mcp' },
+          ],
+        };
+
+        // Discover global MCP servers (Claude Desktop + plugins)
+        const globalMcp = discoverGlobalMcpServers();
+        if (globalMcp.length > 0) {
+          categories['Global MCP Servers'] = globalMcp;
+        }
+
+        // Discover project-scoped MCP servers
+        const projectMcp: Record<string, ToolEntry[]> = {};
+        const projects = scanProjects();
+        for (const p of projects) {
+          if (p.mcpServers.length) {
+            for (const server of p.mcpServers) {
+              if (!projectMcp[server]) projectMcp[server] = [];
+              projectMcp[server].push({ name: `mcp__${server} (all tools)`, description: `Project MCP: ${p.name}`, type: 'project-mcp' });
+            }
           }
         }
-      }
 
-      res.json({ categories });
+        return { categories, projectMcp };
+      });
+
+      res.json(data);
     } catch (err) {
       res.status(500).json({ error: String(err) });
     }
@@ -8087,45 +8295,117 @@ async function loadAgentDetailTab(tab, slug, isPrimary) {
     var html = '';
     var agentAllowed = (a && a.allowedTools) ? a.allowedTools : [];
     var hasWhitelist = agentAllowed.length > 0;
-    // Available tools with toggles
     try {
       var toolsRes = await apiFetch('/api/available-tools');
       var toolsData = await toolsRes.json();
-      var categories = toolsData.categories || toolsData || {};
-      if (typeof categories === 'object' && !Array.isArray(categories)) {
-        html += '<div class="card" style="margin-bottom:16px"><div class="card-header" style="display:flex;justify-content:space-between;align-items:center"><span>MCP Tools</span>';
-        if (!isPrimary) html += '<span style="font-size:11px;color:var(--text-muted)">' + (hasWhitelist ? agentAllowed.length + ' enabled' : 'All tools enabled (no whitelist)') + '</span>';
-        html += '</div><div class="card-body">';
-        Object.keys(categories).forEach(function(cat) {
-          html += '<div style="margin-bottom:14px">';
-          html += '<div style="font-weight:600;font-size:12px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.05em;margin-bottom:6px">' + esc(cat) + '</div>';
-          var tools = categories[cat];
-          if (Array.isArray(tools)) {
-            tools.forEach(function(t) {
-              var toolName = typeof t === 'string' ? t : t.name || '';
-              var toolDesc = typeof t === 'object' ? (t.description || '') : '';
-              var isEnabled = !hasWhitelist || agentAllowed.indexOf(toolName) >= 0;
-              html += '<div style="display:flex;align-items:center;gap:8px;padding:5px 0;border-bottom:1px solid var(--border)">';
-              html += '<span style="font-size:13px;color:var(--text-primary);flex:1">' + esc(toolName) + '</span>';
-              if (toolDesc) html += '<span style="font-size:11px;color:var(--text-muted);max-width:250px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(toolDesc) + '</span>';
-              if (!isPrimary) {
-                html += '<label class="toggle-switch"><input type="checkbox"' + (isEnabled ? ' checked' : '') + ' onchange="toggleAgentTool(\\x27' + esc(slug) + '\\x27,\\x27' + esc(toolName) + '\\x27, this.checked)"><span class="toggle-slider"></span></label>';
-              }
-              html += '</div>';
-            });
+      var categories = toolsData.categories || {};
+      var projectMcp = toolsData.projectMcp || {};
+
+      // Summary strip
+      if (!isPrimary) {
+        var totalMcp = 0;
+        Object.keys(categories).forEach(function(cat) { if (cat !== 'CLI Tools') totalMcp += (categories[cat] || []).length; });
+        html += '<div style="padding:10px 16px;margin-bottom:16px;background:var(--bg-secondary);border:1px solid var(--border);border-radius:var(--radius);font-size:12px;color:var(--text-muted)">';
+        html += hasWhitelist ? '<span style="color:var(--accent);font-weight:600">' + agentAllowed.length + '</span> tools enabled (whitelist active)' : 'All <span style="color:var(--green);font-weight:600">' + totalMcp + '</span> tools enabled (no whitelist)';
+        html += '</div>';
+      }
+
+      Object.keys(categories).forEach(function(cat) {
+        var tools = categories[cat] || [];
+        if (tools.length === 0) return;
+        var isCli = cat === 'CLI Tools';
+        var isApi = cat === 'API Integrations';
+        var isGlobalMcp = cat === 'Global MCP Servers';
+        var installedCount = isCli ? tools.filter(function(t) { return t.installed; }).length : 0;
+
+        html += '<div class="card" style="margin-bottom:12px"><div class="card-header" style="display:flex;justify-content:space-between;align-items:center">';
+        html += '<span>' + esc(cat) + ' (' + tools.length + ')</span>';
+        if (isCli) html += '<span style="font-size:11px;color:var(--text-muted)">' + installedCount + ' installed</span>';
+        html += '</div><div class="card-body" style="padding:0">';
+
+        tools.forEach(function(t) {
+          var toolName = t.name || '';
+          var toolDesc = t.description || '';
+          var isEnabled = !hasWhitelist || agentAllowed.indexOf(toolName) >= 0;
+          var dimmed = (isCli && !t.installed) ? ';opacity:0.4' : '';
+
+          html += '<div style="display:flex;align-items:center;gap:8px;padding:6px 12px;border-bottom:1px solid var(--border)' + dimmed + '">';
+
+          // Status indicator
+          if (isCli) {
+            if (t.installed) {
+              html += '<span style="color:var(--green);font-size:12px;min-width:16px" title="Installed">&#10003;</span>';
+            } else {
+              html += '<span style="color:var(--text-muted);font-size:12px;min-width:16px" title="Not found">&#10007;</span>';
+            }
           }
+
+          // Tool name
+          html += '<span style="font-size:13px;color:var(--text-primary);font-weight:500;min-width:140px">' + esc(toolName) + '</span>';
+
+          // Description
+          html += '<span style="flex:1;font-size:11px;color:var(--text-muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(toolDesc) + '</span>';
+
+          // API badge with connection status
+          if (isApi && t.api) {
+            var connColor = t.connected ? 'var(--green)' : 'var(--text-muted)';
+            html += '<span style="display:inline-flex;align-items:center;gap:4px;font-size:10px;padding:2px 8px;border-radius:10px;background:' + connColor + '15;color:' + connColor + ';white-space:nowrap">';
+            html += '<span style="width:6px;height:6px;border-radius:50%;background:' + connColor + '"></span>' + esc(t.api) + '</span>';
+          }
+
+          // Global MCP server badge
+          if (isGlobalMcp) {
+            html += '<span style="display:inline-flex;align-items:center;gap:4px;font-size:10px;padding:2px 8px;border-radius:10px;background:var(--green)15;color:var(--green);white-space:nowrap">';
+            html += '<span style="width:6px;height:6px;border-radius:50%;background:var(--green)"></span>Active</span>';
+          }
+
+          // Type badge for non-CLI, non-API, non-global-MCP
+          if (!isCli && !isApi && !isGlobalMcp) {
+            var typeBadge = t.type === 'sdk' ? 'SDK' : 'MCP';
+            html += '<span class="badge badge-gray" style="font-size:9px">' + typeBadge + '</span>';
+          }
+
+          // Toggle (only for non-CLI, non-primary agents)
+          if (!isCli && !isPrimary) {
+            html += '<label class="toggle-switch" style="margin-left:4px"><input type="checkbox"' + (isEnabled ? ' checked' : '') + ' onchange="toggleAgentTool(\\x27' + esc(slug) + '\\x27,\\x27' + esc(toolName) + '\\x27, this.checked)"><span class="toggle-slider"></span></label>';
+          }
+
           html += '</div>';
         });
         html += '</div></div>';
+      });
+
+      // Project-scoped MCP servers
+      var projectKeys = Object.keys(projectMcp);
+      if (projectKeys.length > 0) {
+        html += '<div class="card" style="margin-bottom:12px;opacity:0.7"><div class="card-header" style="display:flex;justify-content:space-between;align-items:center">';
+        html += '<span>Project MCP Servers</span>';
+        html += '<span class="badge badge-gray" style="font-size:10px">Project-scoped</span>';
+        html += '</div><div class="card-body" style="padding:0">';
+        projectKeys.forEach(function(server) {
+          var items = projectMcp[server] || [];
+          items.forEach(function(t) {
+            html += '<div style="display:flex;align-items:center;gap:8px;padding:6px 12px;border-bottom:1px solid var(--border)">';
+            html += '<span style="font-size:13px;color:var(--text-primary);font-weight:500;flex:1">' + esc(server) + '</span>';
+            html += '<span style="font-size:11px;color:var(--text-muted)">' + esc(t.description || '') + '</span>';
+            if (!isPrimary) {
+              var isEnabled = !hasWhitelist || agentAllowed.indexOf(t.name) >= 0;
+              html += '<label class="toggle-switch"><input type="checkbox"' + (isEnabled ? ' checked' : '') + ' onchange="toggleAgentTool(\\x27' + esc(slug) + '\\x27,\\x27' + esc(t.name || '') + '\\x27, this.checked)"><span class="toggle-slider"></span></label>';
+            }
+            html += '</div>';
+          });
+        });
+        html += '</div></div>';
       }
+
     } catch(e) { html += '<div class="empty-state">Failed to load tools</div>'; }
 
     // Communication channels
     if (a && a.channels && a.channels.length > 0) {
-      html += '<div class="card" style="margin-bottom:16px"><div class="card-header">Communication Channels</div><div class="card-body">';
+      html += '<div class="card" style="margin-bottom:12px"><div class="card-header">Communication Channels</div><div class="card-body" style="padding:0">';
       a.channels.forEach(function(ch) {
         var chIcon = ch === 'Discord' ? '&#128172;' : ch === 'Slack' ? '&#128488;' : ch === 'Telegram' ? '&#9992;' : '&#128279;';
-        html += '<div style="display:flex;align-items:center;gap:10px;padding:6px 0;border-bottom:1px solid var(--border)">';
+        html += '<div style="display:flex;align-items:center;gap:10px;padding:6px 12px;border-bottom:1px solid var(--border)">';
         html += '<span style="font-size:16px">' + chIcon + '</span>';
         html += '<span style="flex:1;font-size:13px;font-weight:500">' + esc(ch) + '</span>';
         html += '<span class="badge badge-green" style="font-size:10px">Connected</span>';
