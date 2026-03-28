@@ -24,7 +24,11 @@ import matter from 'gray-matter';
 import cron from 'node-cron';
 import type { Gateway } from '../gateway/router.js';
 import { TunnelManager } from './tunnel.js';
-import type { RemoteAccessConfig, DelegatedTask } from '../types.js';
+import type { RemoteAccessConfig } from '../types.js';
+import { goalsRouter } from './routes/goals.js';
+import { delegationsRouter } from './routes/delegations.js';
+import { workflowsRouter } from './routes/workflows.js';
+import { digestRouter } from './routes/digest.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -3792,732 +3796,41 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
     res.json(analytics);
   });
 
-  // ── Goals Progress API ─────────────────────────────────────────
+  // ── Goals, Delegations, Workflows, Digest — extracted routers ──
 
   const GOALS_DIR = path.join(BASE_DIR, 'goals');
   const CRON_RUNS_DIR = path.join(BASE_DIR, 'cron', 'runs');
-
-  app.get('/api/goals/progress', (_req, res) => {
-    if (!existsSync(GOALS_DIR)) { res.json({ goals: [] }); return; }
-    try {
-      const files = readdirSync(GOALS_DIR).filter(f => f.endsWith('.json'));
-      const goals = files.map(f => {
-        try {
-          const goal = JSON.parse(readFileSync(path.join(GOALS_DIR, f), 'utf-8'));
-
-          // Find agent contributions: scan cron runs for jobs linked to this goal
-          const agentContributions: Record<string, { runs: number; successes: number; lastRun?: string }> = {};
-          if (goal.linkedCronJobs?.length && existsSync(CRON_RUNS_DIR)) {
-            for (const jobName of goal.linkedCronJobs) {
-              const safe = jobName.replace(/[^a-zA-Z0-9_-]/g, '_');
-              const logFile = path.join(CRON_RUNS_DIR, `${safe}.jsonl`);
-              if (!existsSync(logFile)) continue;
-              const lines = readFileSync(logFile, 'utf-8').trim().split('\n').filter(Boolean);
-              for (const line of lines.slice(-20)) {
-                try {
-                  const entry = JSON.parse(line);
-                  const agent = entry.agentSlug || jobName;
-                  if (!agentContributions[agent]) agentContributions[agent] = { runs: 0, successes: 0 };
-                  agentContributions[agent].runs++;
-                  if (entry.status === 'ok') agentContributions[agent].successes++;
-                  agentContributions[agent].lastRun = entry.finishedAt;
-                } catch { continue; }
-              }
-            }
-          }
-
-          // Scan delegated tasks for this goal
-          const delegationsDir = path.join(VAULT_DIR, '00-System', 'agents');
-          const delegations: Array<{ agent: string; task: string; status: string }> = [];
-          if (existsSync(delegationsDir)) {
-            try {
-              for (const agentDir of readdirSync(delegationsDir)) {
-                const tasksDir = path.join(delegationsDir, agentDir, 'delegations');
-                if (!existsSync(tasksDir)) continue;
-                for (const tf of readdirSync(tasksDir).filter(tf => tf.endsWith('.json'))) {
-                  try {
-                    const task = JSON.parse(readFileSync(path.join(tasksDir, tf), 'utf-8'));
-                    if (task.goalId === goal.id) {
-                      delegations.push({ agent: task.toAgent || agentDir, task: task.task || tf, status: task.status || 'pending' });
-                    }
-                  } catch { continue; }
-                }
-              }
-            } catch { /* ignore */ }
-          }
-
-          return {
-            ...goal,
-            agentContributions,
-            delegations,
-          };
-        } catch { return null; }
-      }).filter(Boolean);
-
-      res.json({ goals });
-    } catch { res.json({ goals: [] }); }
-  });
-
-  // Create goal
-  app.post('/api/goals', express.json(), (req, res) => {
-    try {
-      if (!existsSync(GOALS_DIR)) mkdirSync(GOALS_DIR, { recursive: true });
-      const id = Math.random().toString(16).slice(2, 10);
-      const { title, description, owner, priority, status, targetDate, linkedCronJobs, nextActions, blockers, reviewFrequency } = req.body;
-      if (!title) { res.status(400).json({ ok: false, error: 'Title is required' }); return; }
-      const goal = {
-        id,
-        title,
-        description: description || '',
-        status: status || 'active',
-        owner: owner || 'clementine',
-        priority: priority || 'medium',
-        createdAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString(),
-        progressNotes: [],
-        nextActions: nextActions || [],
-        blockers: blockers || [],
-        reviewFrequency: reviewFrequency || 'weekly',
-        linkedCronJobs: linkedCronJobs || [],
-        targetDate: targetDate || undefined,
-      };
-      writeFileSync(path.join(GOALS_DIR, `${id}.json`), JSON.stringify(goal, null, 2));
-      res.json({ ok: true, goal });
-    } catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
-  });
-
-  // Update goal
-  app.put('/api/goals/:id', express.json(), (req, res) => {
-    try {
-      const goalPath = path.join(GOALS_DIR, `${req.params.id}.json`);
-      if (!existsSync(goalPath)) { res.status(404).json({ ok: false, error: 'Goal not found' }); return; }
-      const existing = JSON.parse(readFileSync(goalPath, 'utf-8'));
-      const { title, description, owner, priority, status, targetDate, linkedCronJobs, nextActions, blockers, reviewFrequency } = req.body;
-      if (title !== undefined) existing.title = title;
-      if (description !== undefined) existing.description = description;
-      if (owner !== undefined) existing.owner = owner;
-      if (priority !== undefined) existing.priority = priority;
-      if (status !== undefined) existing.status = status;
-      if (targetDate !== undefined) existing.targetDate = targetDate;
-      if (linkedCronJobs !== undefined) existing.linkedCronJobs = linkedCronJobs;
-      if (nextActions !== undefined) existing.nextActions = nextActions;
-      if (blockers !== undefined) existing.blockers = blockers;
-      if (reviewFrequency !== undefined) existing.reviewFrequency = reviewFrequency;
-      existing.updatedAt = new Date().toISOString();
-      writeFileSync(goalPath, JSON.stringify(existing, null, 2));
-      res.json({ ok: true, goal: existing });
-    } catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
-  });
-
-  // Delete goal
-  app.delete('/api/goals/:id', (_req, res) => {
-    try {
-      const goalPath = path.join(GOALS_DIR, `${_req.params.id}.json`);
-      if (!existsSync(goalPath)) { res.status(404).json({ ok: false, error: 'Goal not found' }); return; }
-      unlinkSync(goalPath);
-      res.json({ ok: true });
-    } catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
-  });
-
-  // ── Delegation API ────────────────────────────────────────────
-
   const AGENTS_BASE = path.join(VAULT_DIR, '00-System', 'agents');
-
-  function readAllDelegations(): (DelegatedTask & { _agentDir: string })[] {
-    const all: (DelegatedTask & { _agentDir: string })[] = [];
-    if (!existsSync(AGENTS_BASE)) return all;
-    for (const slug of readdirSync(AGENTS_BASE).filter(d => !d.startsWith('_') && statSync(path.join(AGENTS_BASE, d)).isDirectory())) {
-      const delDir = path.join(AGENTS_BASE, slug, 'delegations');
-      if (!existsSync(delDir)) continue;
-      for (const f of readdirSync(delDir).filter(f => f.endsWith('.json'))) {
-        try {
-          const task = JSON.parse(readFileSync(path.join(delDir, f), 'utf-8')) as DelegatedTask;
-          all.push({ ...task, _agentDir: slug });
-        } catch { continue; }
-      }
-    }
-    return all;
-  }
-
-  // List delegations
-  app.get('/api/delegations', (_req, res) => {
-    try {
-      let delegations = readAllDelegations();
-      const agent = _req.query.agent as string | undefined;
-      const status = _req.query.status as string | undefined;
-      const goalId = _req.query.goalId as string | undefined;
-      if (agent) delegations = delegations.filter(d => d.toAgent === agent || d.fromAgent === agent);
-      if (status) delegations = delegations.filter(d => d.status === status);
-      if (goalId) delegations = delegations.filter(d => d.goalId === goalId);
-      res.json({ ok: true, delegations });
-    } catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
-  });
-
-  // Create delegation
-  app.post('/api/delegations', express.json(), (req, res) => {
-    try {
-      const { fromAgent, toAgent, task, expectedOutput, goalId } = req.body;
-      if (!toAgent || !task) { res.status(400).json({ ok: false, error: 'toAgent and task are required' }); return; }
-      const id = Math.random().toString(16).slice(2, 10);
-      const delDir = path.join(AGENTS_BASE, toAgent, 'delegations');
-      if (!existsSync(delDir)) mkdirSync(delDir, { recursive: true });
-      const delegation: DelegatedTask = {
-        id,
-        fromAgent: fromAgent || 'clementine',
-        toAgent,
-        task,
-        expectedOutput: expectedOutput || '',
-        status: 'pending',
-        createdAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString(),
-        goalId: goalId || undefined,
-      };
-      writeFileSync(path.join(delDir, `${id}.json`), JSON.stringify(delegation, null, 2));
-      res.json({ ok: true, delegation });
-    } catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
-  });
-
-  // Update delegation
-  app.put('/api/delegations/:id', express.json(), (req, res) => {
-    try {
-      const all = readAllDelegations();
-      const found = all.find(d => d.id === req.params.id);
-      if (!found) { res.status(404).json({ ok: false, error: 'Delegation not found' }); return; }
-      const filePath = path.join(AGENTS_BASE, found._agentDir, 'delegations', `${found.id}.json`);
-      const { status, result, task, expectedOutput } = req.body;
-      if (status !== undefined) found.status = status;
-      if (result !== undefined) found.result = result;
-      if (task !== undefined) found.task = task;
-      if (expectedOutput !== undefined) found.expectedOutput = expectedOutput;
-      found.updatedAt = new Date().toISOString();
-      const { _agentDir, ...clean } = found;
-      writeFileSync(filePath, JSON.stringify(clean, null, 2));
-      res.json({ ok: true, delegation: clean });
-    } catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
-  });
-
-  // Delete delegation
-  app.delete('/api/delegations/:id', (_req, res) => {
-    try {
-      const all = readAllDelegations();
-      const found = all.find(d => d.id === _req.params.id);
-      if (!found) { res.status(404).json({ ok: false, error: 'Delegation not found' }); return; }
-      unlinkSync(path.join(AGENTS_BASE, found._agentDir, 'delegations', `${found.id}.json`));
-      res.json({ ok: true });
-    } catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
-  });
-
-  // Execute delegation (fire-and-forget)
-  app.post('/api/delegations/:id/execute', async (req, res) => {
-    try {
-      const all = readAllDelegations();
-      const found = all.find(d => d.id === req.params.id);
-      if (!found) { res.status(404).json({ ok: false, error: 'Delegation not found' }); return; }
-      if (found.status === 'in_progress') { res.json({ ok: false, error: 'Already executing' }); return; }
-
-      // Update to in_progress
-      const filePath = path.join(AGENTS_BASE, found._agentDir, 'delegations', `${found.id}.json`);
-      const { _agentDir, ...clean } = found;
-      clean.status = 'in_progress';
-      clean.updatedAt = new Date().toISOString();
-      writeFileSync(filePath, JSON.stringify(clean, null, 2));
-
-      res.json({ ok: true, message: 'Delegation execution started' });
-      broadcastEvent({ type: 'delegation_started', data: { id: found.id, toAgent: found.toAgent } });
-
-      // Fire-and-forget execution
-      const prompt = `You have been delegated the following task:\n\n## Task\n${found.task}\n\n## Expected Output\n${found.expectedOutput || 'Complete the task to the best of your ability.'}\n\nComplete this task now.`;
-      getGateway().then(gw =>
-        gw.handleCronJob(`delegation:${found.id}`, prompt, 2, 15)
-      ).then(result => {
-        clean.status = 'completed';
-        clean.result = result;
-        clean.updatedAt = new Date().toISOString();
-        writeFileSync(filePath, JSON.stringify(clean, null, 2));
-        broadcastEvent({ type: 'delegation_complete', data: { id: found.id, toAgent: found.toAgent, status: 'completed' } });
-      }).catch(err => {
-        clean.status = 'pending';
-        clean.updatedAt = new Date().toISOString();
-        writeFileSync(filePath, JSON.stringify(clean, null, 2));
-        broadcastEvent({ type: 'delegation_complete', data: { id: found.id, toAgent: found.toAgent, status: 'error', error: String(err) } });
-      });
-    } catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
-  });
-
-  // ── Goal-Driven Cron Generation ────────────────────────────────
-
-  app.post('/api/goals/:id/generate-crons', async (req, res) => {
-    try {
-      const goalPath = path.join(GOALS_DIR, `${req.params.id}.json`);
-      if (!existsSync(goalPath)) { res.status(404).json({ ok: false, error: 'Goal not found' }); return; }
-      const goal = JSON.parse(readFileSync(goalPath, 'utf-8'));
-
-      const prompt = `You are analyzing a goal and proposing automated scheduled tasks (cron jobs) to make progress on it.
-
-## Goal: ${goal.title}
-${goal.description || ''}
-
-## Current Status: ${goal.status || 'active'}
-## Priority: ${goal.priority || 'medium'}
-## Owner: ${goal.owner || 'clementine'}
-${goal.nextActions?.length ? `## Next Actions:\n${goal.nextActions.map((a: string) => `- ${a}`).join('\n')}` : ''}
-${goal.blockers?.length ? `## Blockers:\n${goal.blockers.map((b: string) => `- ${b}`).join('\n')}` : ''}
-${goal.linkedCronJobs?.length ? `## Already Linked Cron Jobs:\n${goal.linkedCronJobs.map((j: string) => `- ${j}`).join('\n')}` : ''}
-
-## Instructions
-Propose 1-3 NEW cron jobs that would make automated progress on this goal. For each job, provide:
-- name: A short slug (lowercase, hyphens, no spaces)
-- schedule: A cron expression (e.g., "0 9 * * 1-5" for weekdays 9am)
-- prompt: The detailed task prompt the agent should execute when this job runs
-- tier: 1 (quick, under 10 min) or 2 (thorough, can take longer)
-- rationale: Why this job helps the goal
-
-Respond ONLY with valid JSON:
-{"proposals":[{"name":"...","schedule":"...","prompt":"...","tier":1,"rationale":"..."}]}`;
-
-      const gw = await getGateway();
-      const response = await gw.handleMessage('dashboard:cron-gen', prompt);
-
-      // Parse JSON from response (may be in code fence)
-      let proposals: unknown[] = [];
-      try {
-        const jsonMatch = response.match(/\{[\s\S]*"proposals"[\s\S]*\}/);
-        if (jsonMatch) {
-          const parsed = JSON.parse(jsonMatch[0]);
-          proposals = parsed.proposals || [];
-        }
-      } catch {
-        res.json({ ok: false, error: 'Could not parse LLM response', raw: response.slice(0, 1000) });
-        return;
-      }
-
-      res.json({ ok: true, proposals, goalId: goal.id, goalTitle: goal.title });
-    } catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
-  });
-
-  app.post('/api/goals/:id/approve-crons', express.json(), (req, res) => {
-    try {
-      const goalPath = path.join(GOALS_DIR, `${req.params.id}.json`);
-      if (!existsSync(goalPath)) { res.status(404).json({ ok: false, error: 'Goal not found' }); return; }
-      const goal = JSON.parse(readFileSync(goalPath, 'utf-8'));
-
-      const crons: Array<{ name: string; schedule: string; prompt: string; tier: number }> = req.body.crons || [];
-      if (crons.length === 0) { res.status(400).json({ ok: false, error: 'No crons to approve' }); return; }
-
-      // Read current CRON.md
-      const cronRaw = existsSync(CRON_FILE) ? readFileSync(CRON_FILE, 'utf-8') : '---\njobs: []\n---\n';
-      const parsed = matter(cronRaw);
-      const jobs: Array<Record<string, unknown>> = parsed.data.jobs || [];
-      const existingNames = new Set(jobs.map(j => j.name));
-
-      const added: string[] = [];
-      for (const c of crons) {
-        if (existingNames.has(c.name)) continue;
-        jobs.push({
-          name: c.name,
-          schedule: c.schedule,
-          prompt: c.prompt,
-          enabled: true,
-          tier: c.tier || 1,
-        });
-        added.push(c.name);
-      }
-
-      if (added.length > 0) {
-        parsed.data.jobs = jobs;
-        writeFileSync(CRON_FILE, matter.stringify(parsed.content, parsed.data));
-
-        // Update goal's linkedCronJobs
-        if (!goal.linkedCronJobs) goal.linkedCronJobs = [];
-        for (const name of added) {
-          if (!goal.linkedCronJobs.includes(name)) goal.linkedCronJobs.push(name);
-        }
-        goal.updatedAt = new Date().toISOString();
-        writeFileSync(goalPath, JSON.stringify(goal, null, 2));
-      }
-
-      res.json({ ok: true, added, skipped: crons.length - added.length });
-    } catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
-  });
-
-  // ── Workflow API ───────────────────────────────────────────────
-
   const WORKFLOWS_DIR = path.join(VAULT_DIR, '00-System', 'workflows');
   const WORKFLOW_RUNS_DIR = path.join(BASE_DIR, 'workflows', 'runs');
 
-  app.get('/api/workflows', async (_req, res) => {
-    try {
-      const workflows = await cachedAsync('workflows', 10_000, async () => {
-        const { parseAllWorkflows } = await import('../agent/workflow-runner.js');
-        const wfs: Array<Record<string, unknown>> = [];
-        // Global workflows
-        if (existsSync(WORKFLOWS_DIR)) {
-          for (const wf of parseAllWorkflows(WORKFLOWS_DIR)) {
-            wfs.push({ ...wf, scope: 'global' });
-          }
-        }
-        // Agent-scoped workflows
-        if (existsSync(AGENTS_BASE)) {
-          for (const slug of readdirSync(AGENTS_BASE).filter(d => !d.startsWith('_'))) {
-            const wfDir = path.join(AGENTS_BASE, slug, 'workflows');
-            if (!existsSync(wfDir)) continue;
-            for (const wf of parseAllWorkflows(wfDir)) {
-              wfs.push({ ...wf, agentSlug: slug, scope: slug });
-            }
-          }
-        }
-        return wfs;
-      });
-      res.json({ ok: true, workflows });
-    } catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
-  });
+  app.use('/api/goals', goalsRouter({ goalsDir: GOALS_DIR, cronRunsDir: CRON_RUNS_DIR, vaultDir: VAULT_DIR, cronFile: CRON_FILE, getGateway }));
+  app.use('/api/delegations', delegationsRouter({ agentsBase: AGENTS_BASE, getGateway, broadcastEvent }));
+  app.use('/api/workflows', workflowsRouter({ workflowsDir: WORKFLOWS_DIR, workflowRunsDir: WORKFLOW_RUNS_DIR, agentsBase: AGENTS_BASE, getGateway, broadcastEvent, cachedAsync }));
+  app.use('/api/digest', digestRouter({ baseDir: BASE_DIR, vaultDir: VAULT_DIR, goalsDir: GOALS_DIR, memoryDbPath: MEMORY_DB_PATH, parseEnvFile, getGateway, cached }));
 
-  app.post('/api/workflows/:name/run', express.json(), async (req, res) => {
-    try {
-      const name = decodeURIComponent(req.params.name);
-      const { parseAllWorkflows } = await import('../agent/workflow-runner.js');
-      const allWfs = [];
-      if (existsSync(WORKFLOWS_DIR)) allWfs.push(...parseAllWorkflows(WORKFLOWS_DIR));
-      if (existsSync(AGENTS_BASE)) {
-        for (const slug of readdirSync(AGENTS_BASE).filter(d => !d.startsWith('_'))) {
-          const wfDir = path.join(AGENTS_BASE, slug, 'workflows');
-          if (existsSync(wfDir)) allWfs.push(...parseAllWorkflows(wfDir));
-        }
-      }
-      const wf = allWfs.find(w => w.name === name);
-      if (!wf) { res.status(404).json({ ok: false, error: 'Workflow not found: ' + name }); return; }
-
-      const inputs = req.body.inputs || {};
-      res.json({ ok: true, message: `Workflow '${name}' triggered` });
-      broadcastEvent({ type: 'workflow_triggered', data: { name } });
-
-      // Fire-and-forget execution
-      getGateway().then(gw => gw.handleWorkflow(wf, inputs)).then(result => {
-        broadcastEvent({ type: 'workflow_complete', data: { name, status: 'ok', preview: (result || '').slice(0, 300) } });
-      }).catch(err => {
-        broadcastEvent({ type: 'workflow_complete', data: { name, status: 'error', error: String(err) } });
-      });
-    } catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
-  });
-
-  app.get('/api/workflows/:name/runs', (_req, res) => {
-    try {
-      const name = decodeURIComponent(_req.params.name);
-      const safe = name.replace(/[^a-zA-Z0-9_-]/g, '_');
-      const logFile = path.join(WORKFLOW_RUNS_DIR, `${safe}.jsonl`);
-      if (!existsSync(logFile)) { res.json({ ok: true, runs: [] }); return; }
-      const lines = readFileSync(logFile, 'utf-8').trim().split('\n').filter(Boolean);
-      const runs = lines.slice(-20).reverse().map(l => {
-        try { return JSON.parse(l); } catch { return null; }
-      }).filter(Boolean);
-      res.json({ ok: true, runs });
-    } catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
-  });
-
-  // ── Digest Preferences API ─────────────────────────────────────
-
-  const DIGEST_PREFS_FILE = path.join(BASE_DIR, 'digest-preferences.json');
-  const VOICE_CACHE_DIR = path.join(BASE_DIR, 'cache', 'voice');
-
-  function getDigestPrefs(): Record<string, unknown> {
-    const defaults = {
-      enabled: false,
-      schedule: '0 8 * * 1-5',
-      channels: { email: true, discord: true, slack: false, voice: false },
-      emailRecipient: '',
-      sections: { summary: true, goals: true, crons: true, activity: true, metrics: true, approvals: true },
-      quietHours: { start: 22, end: 8 },
-    };
-    if (!existsSync(DIGEST_PREFS_FILE)) return defaults;
-    try { return { ...defaults, ...JSON.parse(readFileSync(DIGEST_PREFS_FILE, 'utf-8')) }; }
-    catch { return defaults; }
-  }
-
-  app.get('/api/digest/preferences', (_req, res) => {
-    res.json({ ok: true, preferences: getDigestPrefs() });
-  });
-
-  app.put('/api/digest/preferences', express.json(), (req, res) => {
-    try {
-      const current = getDigestPrefs();
-      const updated = { ...current, ...req.body };
-      writeFileSync(DIGEST_PREFS_FILE, JSON.stringify(updated, null, 2));
-      res.json({ ok: true, preferences: updated });
-    } catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
-  });
-
-  // ── Digest Composer + Delivery ─────────────────────────────────
-
-  // Helper: Microsoft Graph API for sending HTML email
-  let _graphTokenCache: { accessToken: string; expiresAt: number } | null = null;
-
-  async function getGraphTokenDash(): Promise<string> {
-    if (_graphTokenCache && Date.now() < _graphTokenCache.expiresAt - 300_000) return _graphTokenCache.accessToken;
-    const env = parseEnvFile();
-    const tenantId = env['MS_TENANT_ID'] || '';
-    const clientId = env['MS_CLIENT_ID'] || '';
-    const clientSecret = env['MS_CLIENT_SECRET'] || '';
-    if (!tenantId || !clientId || !clientSecret) throw new Error('Outlook not configured');
-    const tokenUrl = `https://login.microsoftonline.com/${tenantId}/oauth2/v2.0/token`;
-    const body = new URLSearchParams({ client_id: clientId, client_secret: clientSecret, scope: 'https://graph.microsoft.com/.default', grant_type: 'client_credentials' });
-    const res = await fetch(tokenUrl, { method: 'POST', body });
-    if (!res.ok) throw new Error(`Graph token failed: ${res.status}`);
-    const data = await res.json() as { access_token: string; expires_in: number };
-    _graphTokenCache = { accessToken: data.access_token, expiresAt: Date.now() + data.expires_in * 1000 };
-    return data.access_token;
-  }
-
-  async function sendDigestEmail(to: string, subject: string, htmlBody: string): Promise<void> {
-    const env = parseEnvFile();
-    const userEmail = env['MS_USER_EMAIL'] || '';
-    if (!userEmail) throw new Error('MS_USER_EMAIL not configured');
-    const token = await getGraphTokenDash();
-    const message = {
-      subject,
-      body: { contentType: 'HTML', content: htmlBody },
-      toRecipients: [{ emailAddress: { address: to } }],
-    };
-    const res = await fetch(`https://graph.microsoft.com/v1.0/users/${userEmail}/sendMail`, {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ message, saveToSentItems: true }),
-    });
-    if (!res.ok) { const text = await res.text(); throw new Error(`Graph sendMail ${res.status}: ${text}`); }
-  }
-
-  // Compose digest from multiple data sources
-  async function composeDigest(): Promise<{ subject: string; html: string; text: string; sections: Record<string, string> }> {
-    const prefs = getDigestPrefs();
-    const secs = (prefs.sections || {}) as Record<string, boolean>;
-    const now = new Date();
-    const dateStr = now.toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
-    const sections: Record<string, string> = {};
-    let text = '';
-
-    // Office status
-    let officeSummary = '';
-    try {
-      const officeData = cached('digest-office', 30_000, () => {
-        const agentsDir = path.join(VAULT_DIR, '00-System', 'agents');
-        const agents: Array<Record<string, unknown>> = [];
-        if (existsSync(agentsDir)) {
-          for (const slug of readdirSync(agentsDir).filter(d => !d.startsWith('_'))) {
-            const agentFile = path.join(agentsDir, slug, 'agent.md');
-            if (!existsSync(agentFile)) continue;
-            const { data } = matter(readFileSync(agentFile, 'utf-8'));
-            agents.push({ slug, name: data.name || slug, status: data.status || 'active' });
-          }
-        }
-        return { agents };
-      });
-      const activeCount = officeData.agents.filter((a: Record<string, unknown>) => a.status === 'active').length;
-      officeSummary = `${officeData.agents.length} agent(s), ${activeCount} active`;
-    } catch { officeSummary = 'Could not load'; }
-
-    // Goals
-    if (secs.goals !== false) {
-      try {
-        if (existsSync(GOALS_DIR)) {
-          const files = readdirSync(GOALS_DIR).filter(f => f.endsWith('.json'));
-          const goals = files.map(f => { try { return JSON.parse(readFileSync(path.join(GOALS_DIR, f), 'utf-8')); } catch { return null; } }).filter(Boolean);
-          const active = goals.filter((g: Record<string, unknown>) => g.status === 'active');
-          const blocked = goals.filter((g: Record<string, unknown>) => g.status === 'blocked');
-          let goalText = `${active.length} active, ${blocked.length} blocked\n`;
-          active.slice(0, 5).forEach((g: Record<string, unknown>) => {
-            goalText += `  - ${g.title} [${g.priority}]`;
-            const na = g.nextActions as string[] | undefined;
-            if (na && na.length > 0) goalText += ` → ${na[0]}`;
-            goalText += '\n';
-          });
-          sections.goals = goalText;
-        }
-      } catch { /* skip */ }
-    }
-
-    // Cron run summary
-    if (secs.crons !== false) {
-      try {
-        const runsDir = path.join(BASE_DIR, 'cron', 'runs');
-        if (existsSync(runsDir)) {
-          let totalOk = 0, totalErr = 0, jobCount = 0;
-          for (const f of readdirSync(runsDir).filter(f => f.endsWith('.jsonl'))) {
-            const lines = readFileSync(path.join(runsDir, f), 'utf-8').trim().split('\n').filter(Boolean);
-            const today = now.toISOString().slice(0, 10);
-            const todayRuns = lines.filter(l => l.includes(today));
-            if (todayRuns.length > 0) jobCount++;
-            for (const l of todayRuns) {
-              try { const e = JSON.parse(l); if (e.status === 'ok') totalOk++; else totalErr++; } catch { /* skip */ }
-            }
-          }
-          sections.crons = `${jobCount} job(s) ran today: ${totalOk} succeeded, ${totalErr} failed`;
-        }
-      } catch { /* skip */ }
-    }
-
-    // Pending approvals
-    if (secs.approvals !== false) {
-      try {
-        if (existsSync(MEMORY_DB_PATH)) {
-          const Database = (await import('better-sqlite3')).default;
-          const db = new Database(MEMORY_DB_PATH, { readonly: true });
-          try {
-            const row = db.prepare("SELECT COUNT(*) as cnt FROM approval_queue WHERE status = 'pending'").get() as { cnt: number } | undefined;
-            if (row && row.cnt > 0) sections.approvals = `${row.cnt} pending approval(s)`;
-          } catch { /* table may not exist */ }
-          db.close();
-        }
-      } catch { /* skip */ }
-    }
-
-    // Build text + HTML
-    text = `Daily Digest — ${dateStr}\n${'='.repeat(40)}\n\nTeam: ${officeSummary}\n`;
-    if (sections.goals) text += `\nGoals:\n${sections.goals}`;
-    if (sections.crons) text += `\nCron Jobs: ${sections.crons}\n`;
-    if (sections.approvals) text += `\nApprovals: ${sections.approvals}\n`;
-
-    const html = `<!DOCTYPE html><html><body style="font-family:-apple-system,BlinkMacSystemFont,sans-serif;max-width:600px;margin:0 auto;color:#1a1a2e;padding:20px">
-<div style="border-bottom:3px solid #ff8c21;padding-bottom:12px;margin-bottom:20px">
-  <h1 style="margin:0;font-size:22px;color:#1a1a2e">Daily Digest</h1>
-  <div style="color:#8a92a0;font-size:13px;margin-top:4px">${dateStr} &middot; ${officeSummary}</div>
-</div>
-${sections.goals ? `<div style="margin-bottom:20px"><h3 style="margin:0 0 8px;font-size:15px;color:#ff8c21">Goals</h3><pre style="margin:0;font-size:13px;color:#5a6070;white-space:pre-wrap">${sections.goals.replace(/</g, '&lt;')}</pre></div>` : ''}
-${sections.crons ? `<div style="margin-bottom:20px"><h3 style="margin:0 0 8px;font-size:15px;color:#ff8c21">Cron Jobs</h3><p style="margin:0;font-size:13px;color:#5a6070">${sections.crons.replace(/</g, '&lt;')}</p></div>` : ''}
-${sections.approvals ? `<div style="margin-bottom:20px"><h3 style="margin:0 0 8px;font-size:15px;color:#ff8c21">Approvals</h3><p style="margin:0;font-size:13px;color:#e5534b;font-weight:600">${sections.approvals}</p></div>` : ''}
-<div style="margin-top:24px;padding-top:12px;border-top:1px solid #d8dde5;font-size:11px;color:#8a92a0">Sent by Clementine Command Center</div>
-</body></html>`;
-
-    return { subject: `Clementine Digest — ${dateStr}`, html, text, sections };
-  }
-
-  app.get('/api/digest/preview', async (_req, res) => {
-    try {
-      const digest = await composeDigest();
-      res.json({ ok: true, ...digest });
-    } catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
-  });
-
-  app.post('/api/digest/send', async (_req, res) => {
-    try {
-      const prefs = getDigestPrefs();
-      const channels = (prefs.channels || {}) as Record<string, boolean>;
-      const digest = await composeDigest();
-      const results: Record<string, string> = {};
-
-      // Email
-      if (channels.email) {
-        const recipient = (prefs.emailRecipient as string) || parseEnvFile()['MS_USER_EMAIL'] || '';
-        if (recipient) {
-          try { await sendDigestEmail(recipient, digest.subject, digest.html); results.email = 'sent'; }
-          catch (e) { results.email = 'error: ' + String(e); }
-        } else { results.email = 'skipped: no recipient'; }
-      }
-
-      // Discord/Slack via dispatcher
-      if (channels.discord || channels.slack) {
-        try {
-          const gw = await getGateway();
-          const dispatcher = (gw as any).dispatcher || (gw as any).notificationDispatcher;
-          if (dispatcher && typeof dispatcher.send === 'function') {
-            await dispatcher.send(`**${digest.subject}**\n\n${digest.text}`);
-            results.channels = 'sent';
-          } else { results.channels = 'skipped: no dispatcher'; }
-        } catch (e) { results.channels = 'error: ' + String(e); }
-      }
-
-      // Voice
-      if (channels.voice) {
-        try {
-          const env = parseEnvFile();
-          const apiKey = env['ELEVENLABS_API_KEY'] || '';
-          const voiceId = env['ELEVENLABS_VOICE_ID'] || '';
-          if (apiKey && voiceId) {
-            const hash = randomBytes(8).toString('hex');
-            if (!existsSync(VOICE_CACHE_DIR)) mkdirSync(VOICE_CACHE_DIR, { recursive: true });
-            const audioPath = path.join(VOICE_CACHE_DIR, `${hash}.mp3`);
-            const ttsRes = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`, {
-              method: 'POST',
-              headers: { 'xi-api-key': apiKey, 'Content-Type': 'application/json' },
-              body: JSON.stringify({ text: digest.text.slice(0, 4000), model_id: 'eleven_multilingual_v2' }),
-            });
-            if (ttsRes.ok) {
-              const buffer = Buffer.from(await ttsRes.arrayBuffer());
-              writeFileSync(audioPath, buffer);
-              results.voice = hash;
-            } else { results.voice = 'error: ElevenLabs ' + ttsRes.status; }
-          } else { results.voice = 'skipped: ElevenLabs not configured'; }
-        } catch (e) { results.voice = 'error: ' + String(e); }
-      }
-
-      res.json({ ok: true, results });
-    } catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
-  });
-
-  app.post('/api/digest/test', async (_req, res) => {
-    try {
-      const digest = await composeDigest();
-      const prefs = getDigestPrefs();
-      const channels = (prefs.channels || {}) as Record<string, boolean>;
-      const results: Record<string, string> = {};
-
-      // Always try email for test
-      const recipient = (prefs.emailRecipient as string) || parseEnvFile()['MS_USER_EMAIL'] || '';
-      if (recipient && channels.email) {
-        try { await sendDigestEmail(recipient, '[TEST] ' + digest.subject, digest.html); results.email = 'sent'; }
-        catch (e) { results.email = 'error: ' + String(e); }
-      }
-
-      // Always try channels for test
-      if (channels.discord || channels.slack) {
-        try {
-          const gw = await getGateway();
-          const dispatcher = (gw as any).dispatcher || (gw as any).notificationDispatcher;
-          if (dispatcher && typeof dispatcher.send === 'function') {
-            await dispatcher.send(`**[TEST] ${digest.subject}**\n\n${digest.text}`);
-            results.channels = 'sent';
-          }
-        } catch (e) { results.channels = 'error: ' + String(e); }
-      }
-
-      res.json({ ok: true, results, preview: { subject: digest.subject, text: digest.text } });
-    } catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
-  });
-
-  // ── Voice Synthesis API ───────────────────────────────────────
-
-  app.post('/api/voice/synthesize', express.json(), async (req, res) => {
-    try {
-      const text = (req.body.text || '').slice(0, 5000);
-      if (!text) { res.status(400).json({ ok: false, error: 'text is required' }); return; }
-      const env = parseEnvFile();
-      const apiKey = env['ELEVENLABS_API_KEY'] || '';
-      const voiceId = env['ELEVENLABS_VOICE_ID'] || '';
-      if (!apiKey || !voiceId) { res.status(400).json({ ok: false, error: 'ElevenLabs not configured. Set ELEVENLABS_API_KEY and ELEVENLABS_VOICE_ID in Settings.' }); return; }
-
-      const hash = randomBytes(8).toString('hex');
-      if (!existsSync(VOICE_CACHE_DIR)) mkdirSync(VOICE_CACHE_DIR, { recursive: true });
-      const audioPath = path.join(VOICE_CACHE_DIR, `${hash}.mp3`);
-
-      const ttsRes = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`, {
-        method: 'POST',
-        headers: { 'xi-api-key': apiKey, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text, model_id: 'eleven_multilingual_v2' }),
-      });
-      if (!ttsRes.ok) { res.status(502).json({ ok: false, error: 'ElevenLabs error: ' + ttsRes.status }); return; }
-
-      const buffer = Buffer.from(await ttsRes.arrayBuffer());
-      writeFileSync(audioPath, buffer);
-      res.json({ ok: true, url: `/api/voice/audio/${hash}`, hash });
-    } catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
-  });
-
+  // Voice audio route (served from digest router but needs top-level mount for /api/voice/ path)
   app.get('/api/voice/audio/:hash', (req, res) => {
     const hash = req.params.hash.replace(/[^a-f0-9]/g, '');
-    const audioPath = path.join(VOICE_CACHE_DIR, `${hash}.mp3`);
+    const audioPath = path.join(BASE_DIR, 'cache', 'voice', `${hash}.mp3`);
     if (!existsSync(audioPath)) { res.status(404).json({ error: 'Audio not found' }); return; }
     res.setHeader('Content-Type', 'audio/mpeg');
     res.setHeader('Cache-Control', 'public, max-age=3600');
     res.send(readFileSync(audioPath));
   });
+
+  // (Delegations, Workflows, Digest, Voice routes now in src/cli/routes/*)
+  // The following route groups have been extracted to src/cli/routes/:
+  // - goals.ts (Goals CRUD + cron generation)
+  // - delegations.ts (Delegation CRUD + execute)
+  // - workflows.ts (Workflow list/run/history)
+  // - digest.ts (Digest preferences/preview/send + voice synthesis)
+
+  // REMOVED: ~600 lines of inline route handlers — now in route modules above
+
+  // Dummy reference to prevent unused-variable errors from constants used by routes
+  void AGENTS_BASE; void WORKFLOWS_DIR; void WORKFLOW_RUNS_DIR;
+
 
   // ── Reflection Quality Trends API ──────────────────────────────
 
@@ -4724,6 +4037,42 @@ ${sections.approvals ? `<div style="margin-bottom:20px"><h3 style="margin:0 0 8p
     res.json({ ok: true, autoPost: config.autoPost });
   });
 
+  // ── PWA: manifest, service worker, icon ────────────────────────
+
+  app.get('/manifest.json', (_req, res) => {
+    res.setHeader('Content-Type', 'application/manifest+json');
+    res.json({
+      name: 'Clementine Command Center',
+      short_name: 'Clementine',
+      start_url: '/',
+      display: 'standalone',
+      background_color: '#0d1117',
+      theme_color: '#ff8c21',
+      icons: [{ src: '/icon.svg', sizes: 'any', type: 'image/svg+xml' }],
+    });
+  });
+
+  app.get('/icon.svg', (_req, res) => {
+    res.setHeader('Content-Type', 'image/svg+xml');
+    res.send(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">
+<circle cx="50" cy="50" r="48" fill="#ff8c21"/>
+<text x="50" y="68" text-anchor="middle" font-family="-apple-system,sans-serif" font-size="55" font-weight="700" fill="#fff">C</text>
+</svg>`);
+  });
+
+  app.get('/sw.js', (_req, res) => {
+    res.setHeader('Content-Type', 'application/javascript');
+    res.send(`const CACHE = 'clem-v1';
+const SHELL = ['/', '/manifest.json', '/icon.svg'];
+self.addEventListener('install', e => e.waitUntil(caches.open(CACHE).then(c => c.addAll(SHELL)).then(() => self.skipWaiting())));
+self.addEventListener('activate', e => e.waitUntil(caches.keys().then(ks => Promise.all(ks.filter(k => k !== CACHE).map(k => caches.delete(k)))).then(() => self.clients.claim())));
+self.addEventListener('fetch', e => {
+  if (e.request.method !== 'GET') return;
+  if (e.request.url.includes('/api/')) return;
+  e.respondWith(caches.match(e.request).then(r => r || fetch(e.request)));
+});`);
+  });
+
   // ── Start server (auto-increment port if taken) ──────────────────
 
   const maxAttempts = 10;
@@ -4827,6 +4176,11 @@ function getDashboardHTML(token: string): string {
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="dashboard-token" content="${token}">
+<meta name="theme-color" content="#ff8c21">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<link rel="manifest" href="/manifest.json">
+<link rel="icon" href="/icon.svg" type="image/svg+xml">
 <title>${name} Command Center</title>
 <style>
   :root {
@@ -13318,6 +12672,11 @@ populateActivityAgentFilter();
 // ── SSE live updates (with 30s fallback poll) ──
 var sseConnected = false;
 try {
+  // Register service worker for PWA
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.register('/sw.js').catch(function() {});
+  }
+
   var evtSource = new EventSource('/api/events');
   evtSource.onopen = function() { sseConnected = true; };
   evtSource.onerror = function() { sseConnected = false; };
