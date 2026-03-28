@@ -6458,7 +6458,7 @@ function getDashboardHTML(token: string): string {
         <div class="empty-state">
           <p style="margin-bottom:14px;color:var(--text-muted)">Send a message to start a conversation.</p>
           <div style="display:flex;flex-wrap:wrap;gap:8px;justify-content:center">
-            <button class="btn btn-sm quick-pill" onclick="quickChat('What\\'s on my schedule?')">What's on my schedule?</button>
+            <button class="btn btn-sm quick-pill" onclick="quickChat(&quot;What&apos;s on my schedule?&quot;)">What's on my schedule?</button>
             <button class="btn btn-sm quick-pill" onclick="quickChat('Check my email')">Check my email</button>
             <button class="btn btn-sm quick-pill" onclick="quickChat('Run morning briefing')">Run morning briefing</button>
             <button class="btn btn-sm quick-pill" onclick="quickChat('What did you do today?')">What did you do today?</button>
@@ -7274,10 +7274,10 @@ async function refreshStatus() {
     // Hero controls
     var controls = document.getElementById('hero-controls');
     if (d.alive) {
-      controls.innerHTML = '<button class="btn-success btn-sm" onclick="apiPost(\\'/api/restart\\')">Restart</button>'
-        + '<button class="btn-danger btn-sm" onclick="apiPost(\\'/api/stop\\')">Stop</button>';
+      controls.innerHTML = '<button class="btn-success btn-sm" onclick="apiPost(\\x27/api/restart\\x27)">Restart</button>'
+        + '<button class="btn-danger btn-sm" onclick="apiPost(\\x27/api/stop\\x27)">Stop</button>';
     } else {
-      controls.innerHTML = '<button class="btn-primary btn-sm" onclick="apiPost(\\'/api/launch\\')">Start Daemon</button>';
+      controls.innerHTML = '<button class="btn-primary btn-sm" onclick="apiPost(\\x27/api/launch\\x27)">Start Daemon</button>';
     }
 
     // Summary cards — fetch metrics when on overview
@@ -7346,10 +7346,10 @@ async function refreshStatus() {
     if (d.runsToday != null) controlHtml += kv('Runs Today', d.runsToday);
     controlHtml += '<div style="margin-top:12px;display:flex;gap:8px">';
     if (d.alive) {
-      controlHtml += '<button class="btn-success btn-sm" onclick="apiPost(\\'/api/restart\\')">Restart</button>'
-        + '<button class="btn-danger btn-sm" onclick="apiPost(\\'/api/stop\\')">Stop</button>';
+      controlHtml += '<button class="btn-success btn-sm" onclick="apiPost(\\x27/api/restart\\x27)">Restart</button>'
+        + '<button class="btn-danger btn-sm" onclick="apiPost(\\x27/api/stop\\x27)">Stop</button>';
     } else {
-      controlHtml += '<button class="btn-primary btn-sm" onclick="apiPost(\\'/api/launch\\')">Start Daemon</button>';
+      controlHtml += '<button class="btn-primary btn-sm" onclick="apiPost(\\x27/api/launch\\x27)">Start Daemon</button>';
     }
     controlHtml += '</div>';
     var controlsPanel = document.getElementById('panel-controls');
@@ -7386,7 +7386,7 @@ async function refreshSessions() {
       var s = d[key];
       var friendly = friendlySession(key);
       var safeKey = esc(key).replace(/'/g, '');
-      html += '<div class="session-card" style="cursor:pointer" onclick="viewSession(\\'' + encodeURIComponent(key) + '\\')">'
+      html += '<div class="session-card" style="cursor:pointer" onclick="viewSession(\\x27' + encodeURIComponent(key) + '\\x27)">'
         + '<div class="session-card-header">'
         + '<span class="session-card-icon">' + friendly.icon + '</span>'
         + '<span class="session-card-name">' + esc(friendly.label) + '</span>'
@@ -7395,7 +7395,7 @@ async function refreshSessions() {
         + '<div class="session-card-meta">Last active: ' + timeAgo(s.timestamp) + '</div>'
         + '<div class="session-card-meta" style="font-family:monospace;font-size:10px">' + esc(key) + '</div>'
         + '<div class="session-card-actions">'
-        + '<button class="btn-danger btn-sm" onclick="event.stopPropagation();if(confirm(\\'Clear session ' + safeKey + '?\\'))apiPost(\\'/api/sessions/' + encodeURIComponent(key) + '/clear\\')">Clear</button>'
+        + '<button class="btn-danger btn-sm" onclick="event.stopPropagation();if(confirm(\\x27Clear session ' + safeKey + '?\\x27))apiPost(\\x27/api/sessions/' + encodeURIComponent(key) + '/clear\\x27)">Clear</button>'
         + '</div></div>';
     }
     html += '</div>';
@@ -7544,17 +7544,17 @@ async function refreshCron() {
         html += '<div class="' + cardCls + '">'
           + '<div class="task-card-header">'
           + '<strong>' + esc(displayName) + '</strong>'
-          + '<div class="toggle' + (enabled ? ' on' : '') + '" onclick="apiPost(\\'/api/cron/' + encodeURIComponent(job.name) + '/toggle\\')"></div>'
+          + '<div class="toggle' + (enabled ? ' on' : '') + '" onclick="apiPost(\\x27/api/cron/' + encodeURIComponent(job.name) + '/toggle\\x27)"></div>'
           + '</div>'
           + '<div class="task-card-schedule">' + schedHtml + '</div>'
           + '<div class="task-card-prompt">' + esc(job.prompt || '') + '</div>'
           + '<div class="task-card-status">' + lastRunHtml + '</div>'
           + '<div class="task-card-badges">' + badgesHtml + '</div>'
           + '<div class="task-card-actions">'
-          + '<button class="btn-sm btn-success" onclick="apiPost(\\'/api/cron/run/' + encodeURIComponent(job.name) + '\\')">Run Now</button>'
+          + '<button class="btn-sm btn-success" onclick="apiPost(\\x27/api/cron/run/' + encodeURIComponent(job.name) + '\\x27)">Run Now</button>'
           + '<button class="btn-sm" data-trace-job="' + esc(job.name) + '">Trace</button>'
-          + '<button class="btn-sm" onclick="openEditCronModal(\\'' + safeName + '\\')">Edit</button>'
-          + '<button class="btn-sm btn-danger" onclick="confirmDeleteCron(\\'' + safeName + '\\')">Del</button>'
+          + '<button class="btn-sm" onclick="openEditCronModal(\\x27' + safeName + '\\x27)">Edit</button>'
+          + '<button class="btn-sm btn-danger" onclick="confirmDeleteCron(\\x27' + safeName + '\\x27)">Del</button>'
           + '</div></div>';
       }
       // Add "new task" card only to the main group
@@ -7584,9 +7584,9 @@ async function refreshCron() {
             duration = mins < 60 ? mins + 'm' : Math.floor(mins/60) + 'h ' + (mins%60) + 'm';
           }
           var cancelBtn = t.status === 'running'
-            ? '<button class="btn-sm btn-danger" onclick="cancelUnleashed(\\'' + esc(t.jobName) + '\\')">Cancel</button> '
+            ? '<button class="btn-sm btn-danger" onclick="cancelUnleashed(\\x27' + esc(t.jobName) + '\\x27)">Cancel</button> '
             : '';
-          var detailBtn = '<button class="btn-sm" onclick="toggleUnleashedDetail(\\'' + esc(t.jobName) + '\\', this)">Details</button>';
+          var detailBtn = '<button class="btn-sm" onclick="toggleUnleashedDetail(\\x27' + esc(t.jobName) + '\\x27, this)">Details</button>';
           html += '<tr>'
             + '<td><strong>' + esc(t.jobName) + '</strong>'
             + (t.lastPhaseOutputPreview ? '<br><span style="font-size:11px;color:var(--text-muted)">' + esc(t.lastPhaseOutputPreview.slice(0,80)) + '...</span>' : '')
@@ -7671,7 +7671,7 @@ function renderTrace(idx) {
     if (contentHtml.length > 200) {
       var preview = contentHtml.slice(0, 200);
       var rest = contentHtml.slice(200);
-      contentHtml = preview + '<span class="trace-expand" data-expanded="false" onclick="var r=this.nextElementSibling;var show=r.style.display===\\'none\\';r.style.display=show?\\'inline\\':\\'none\\';this.textContent=show?\\'  [collapse]\\':  \\'... [expand]\\'"> ... [expand]</span><span style="display:none">' + rest + '</span>';
+      contentHtml = preview + '<span class="trace-expand" data-expanded="false" onclick="var r=this.nextElementSibling;var show=r.style.display===\\x27none\\x27;r.style.display=show?\\x27inline\\x27:\\x27none\\x27;this.textContent=show?\\x27  [collapse]\\x27:  \\x27... [expand]\\x27"> ... [expand]</span><span style="display:none">' + rest + '</span>';
     }
 
     html += '<div style="padding:8px 16px;border-bottom:1px solid var(--border);font-family:monospace">'
@@ -8341,7 +8341,7 @@ async function refreshTimers() {
       html += '<tr><td><code>' + esc(t.id || '?') + '</code></td>'
         + '<td>' + esc(t.fireAt || t.fire_at || t.time || '') + '</td>'
         + '<td>' + esc((t.message || t.prompt || '').slice(0, 100)) + '</td>'
-        + '<td><button class="btn-danger btn-sm" onclick="apiPost(\\'/api/timers/' + encodeURIComponent(t.id) + '/cancel\\')">Cancel</button></td></tr>';
+        + '<td><button class="btn-danger btn-sm" onclick="apiPost(\\x27/api/timers/' + encodeURIComponent(t.id) + '/cancel\\x27)">Cancel</button></td></tr>';
     }
     html += '</table>';
     document.getElementById('panel-timers').innerHTML = html;
@@ -8559,7 +8559,7 @@ async function refreshSettings() {
           + '</div>'
           + '<div style="flex:1">' + inputHtml + '</div>'
           + '<div style="min-width:70px;text-align:right">'
-          + (f.isSet ? '<button class="btn-sm btn-danger" onclick="removeSetting(\\'' + f.key + '\\')">Remove</button>' : '')
+          + (f.isSet ? '<button class="btn-sm btn-danger" onclick="removeSetting(\\x27' + f.key + '\\x27)">Remove</button>' : '')
           + '<span id="' + inputId + '-status" style="font-size:11px"></span>'
           + '</div></div>';
       }
@@ -9132,14 +9132,14 @@ async function refreshRemoteAccess() {
         + '<label style="font-size:12px;font-weight:600;color:var(--text-secondary);display:block;margin-bottom:4px">Public URL</label>'
         + '<div style="display:flex;gap:8px;align-items:center">'
         + '<code style="flex:1;padding:8px 12px;background:var(--bg-primary);border:1px solid var(--border);border-radius:6px;font-size:13px;word-break:break-all">' + esc(d.tunnelUrl) + '</code>'
-        + '<button class="btn-sm btn-primary" onclick="copyToClipboard(\\'' + esc(d.tunnelUrl) + '\\')">Copy</button>'
+        + '<button class="btn-sm btn-primary" onclick="copyToClipboard(\\x27' + esc(d.tunnelUrl) + '\\x27)">Copy</button>'
         + '</div>'
         + '</div>'
         + '<div style="margin-bottom:16px">'
         + '<label style="font-size:12px;font-weight:600;color:var(--text-secondary);display:block;margin-bottom:4px">Access Token</label>'
         + '<div style="display:flex;gap:8px;align-items:center">'
         + '<code id="ra-token-display" style="flex:1;padding:8px 12px;background:var(--bg-primary);border:1px solid var(--border);border-radius:6px;font-size:13px;letter-spacing:1px">' + esc(d.authToken) + '</code>'
-        + '<button class="btn-sm" onclick="copyToClipboard(\\'' + esc(d.authToken) + '\\')">Copy</button>'
+        + '<button class="btn-sm" onclick="copyToClipboard(\\x27' + esc(d.authToken) + '\\x27)">Copy</button>'
         + '<button class="btn-sm" onclick="regenerateToken()">Regenerate</button>'
         + '</div>'
         + '<div style="font-size:11px;color:var(--text-muted);margin-top:4px">Share this token (securely) to grant remote access. Regenerating invalidates all sessions.</div>'
@@ -9352,7 +9352,7 @@ async function refreshTeam() {
 
           var avatarSrc = a.avatar || a.botAvatarUrl;
           var avatarContent = avatarSrc
-            ? '<img src="' + avatarSrc + '" onerror="this.style.display=\\'none\\';this.parentElement.textContent=\\'' + a.name.charAt(0).toUpperCase() + '\\';">'
+            ? '<img src="' + avatarSrc + '" onerror="this.style.display=\\x27none\\x27;this.parentElement.textContent=\\x27' + a.name.charAt(0).toUpperCase() + '\\x27;">'
             : a.name.charAt(0).toUpperCase();
 
           // Badges
@@ -9374,12 +9374,12 @@ async function refreshTeam() {
           var isPaused = a.agentStatus === 'paused';
           var isTerminated = a.agentStatus === 'terminated';
           var pauseBtn = isPaused
-            ? '<button class="btn btn-sm" onclick="event.stopPropagation();setAgentStatus(\\'' + a.slug + '\\',\\'active\\')" style="color:var(--green)">Resume</button>'
-            : '<button class="btn btn-sm" onclick="event.stopPropagation();setAgentStatus(\\'' + a.slug + '\\',\\'paused\\')" style="color:var(--yellow)">Pause</button>';
+            ? '<button class="btn btn-sm" onclick="event.stopPropagation();setAgentStatus(\\x27' + a.slug + '\\x27,\\x27active\\x27)" style="color:var(--green)">Resume</button>'
+            : '<button class="btn btn-sm" onclick="event.stopPropagation();setAgentStatus(\\x27' + a.slug + '\\x27,\\x27paused\\x27)" style="color:var(--yellow)">Pause</button>';
           var actions = a.agentDir
             ? (isTerminated ? '' : pauseBtn) +
-              '<button class="btn btn-sm" onclick="event.stopPropagation();editAgent(\\'' + a.slug + '\\')">Edit</button>' +
-              '<button class="btn btn-sm" onclick="event.stopPropagation();deleteAgent(\\'' + a.slug + '\\')" style="color:var(--red)">Let Go</button>'
+              '<button class="btn btn-sm" onclick="event.stopPropagation();editAgent(\\x27' + a.slug + '\\x27)">Edit</button>' +
+              '<button class="btn btn-sm" onclick="event.stopPropagation();deleteAgent(\\x27' + a.slug + '\\x27)" style="color:var(--red)">Let Go</button>'
             : '';
 
           // Stats strip
@@ -9415,7 +9415,7 @@ async function refreshTeam() {
           // Health indicator placeholder
           var healthBadge = '<span class="desk-health-badge" id="health-' + a.slug + '"></span>';
 
-          return '<div class="desk-station ' + statusClass + '" data-agent-slug="' + a.slug + '" onclick="openAgentDrawer(\\'' + a.slug + '\\')" style="cursor:pointer">' +
+          return '<div class="desk-station ' + statusClass + '" data-agent-slug="' + a.slug + '" onclick="openAgentDrawer(\\x27' + a.slug + '\\x27)" style="cursor:pointer">' +
             '<div class="desk-surface">' +
               '<div class="desk-monitor">' +
                 '<div class="monitor-channel">' + channelDisplay + '</div>' +
@@ -9713,7 +9713,7 @@ function applyRoleTemplate(role) {
   showAgentCreateModal();
   document.getElementById('agent-description').value = tmpl.description;
   document.getElementById('agent-tier').value = String(tmpl.tier);
-  document.getElementById('agent-personality').value = tmpl.personality.replace(/\\n/g, '\n');
+  document.getElementById('agent-personality').value = tmpl.personality.replace(/\\n/g, '\\n');
   // Pre-select tools after they load
   setTimeout(function() { loadAgentToolOptions(tmpl.allowedTools); }, 300);
 }
@@ -10155,7 +10155,7 @@ async function loadDrawerSessions(el) {
       var key = keys[i];
       var sess = d[key];
       var info = friendlySession(key);
-      html += '<div class="card" style="margin-bottom:8px;cursor:pointer" onclick="toggleDrawerTranscript(this, \\'' + key.replace(/'/g, "\\\\'") + '\\')">';
+      html += '<div class="card" style="margin-bottom:8px;cursor:pointer" onclick="toggleDrawerTranscript(this, \\x27' + key.replace(/'/g, "\\\\x27") + '\\x27)">';
       html += '<div class="card-header" style="display:flex;justify-content:space-between;font-size:12px">';
       html += '<span>' + info.icon + ' ' + esc(info.label) + '</span>';
       html += '<span style="color:var(--text-muted)">' + (sess.exchanges || 0) + ' exchanges &middot; ' + fmtTimeAgo(sess.timestamp) + '</span>';
@@ -10218,7 +10218,7 @@ async function loadDrawerConfig(el) {
       html += '<span style="color:var(--text-muted);margin-left:8px">' + (rev.size_bytes ? Math.round(rev.size_bytes / 1024) + ' KB' : '') + '</span></div>';
       html += '<div style="display:flex;align-items:center;gap:8px">';
       html += '<span style="color:var(--text-muted)">' + fmtTimeAgo(rev.created_at) + '</span>';
-      html += '<button class="btn btn-sm" onclick="restoreRevision(\\'' + drawerSlug + '\\', ' + rev.id + ')">Restore</button>';
+      html += '<button class="btn btn-sm" onclick="restoreRevision(\\x27' + drawerSlug + '\\x27, ' + rev.id + ')">Restore</button>';
       html += '</div></div>';
     }
     html += '</div>';
@@ -10279,8 +10279,8 @@ async function refreshSelfImprove() {
             '<div><strong>' + p.area + '</strong> &rarr; ' + (p.target || '').substring(0, 40) +
             ' <span style="color:var(--text-muted);font-size:12px">(' + ((p.score || 0) * 10).toFixed(1) + '/10)</span></div>' +
             '<div style="display:flex;gap:6px">' +
-            '<button onclick="siApply(\\'' + p.id + '\\')" style="background:var(--success);color:#fff;border:none;padding:4px 10px;border-radius:4px;cursor:pointer;font-size:12px">Approve</button>' +
-            '<button onclick="siDeny(\\'' + p.id + '\\')" style="background:var(--danger);color:#fff;border:none;padding:4px 10px;border-radius:4px;cursor:pointer;font-size:12px">Deny</button>' +
+            '<button onclick="siApply(\\x27' + p.id + '\\x27)" style="background:var(--success);color:#fff;border:none;padding:4px 10px;border-radius:4px;cursor:pointer;font-size:12px">Approve</button>' +
+            '<button onclick="siDeny(\\x27' + p.id + '\\x27)" style="background:var(--danger);color:#fff;border:none;padding:4px 10px;border-radius:4px;cursor:pointer;font-size:12px">Deny</button>' +
             '</div></div>' +
             '<div style="margin-top:6px;font-size:13px;color:var(--text-secondary)">' + (p.hypothesis || '').substring(0, 120) + '</div>' +
             '<details style="margin-top:6px"><summary style="font-size:12px;color:var(--text-muted);cursor:pointer">View proposed change</summary>' +
@@ -10474,7 +10474,7 @@ async function refreshDailyPlan() {
         html += '<span style="font-weight:600;color:var(--text-primary);min-width:140px">' + esc(c.job) + '</span>';
         html += '<span style="background:' + changeColor + ';color:#000;font-size:11px;font-weight:600;padding:2px 8px;border-radius:6px">' + esc(c.change) + '</span>';
         html += '<span style="color:var(--text-secondary);flex:1;font-size:13px">' + esc(c.reason) + '</span>';
-        html += '<button class="btn btn-sm" onclick="applyPlanSuggestion(\\'' + esc(c.job) + '\\',\\'' + esc(c.change) + '\\',\\'' + esc(c.reason) + '\\')" style="background:var(--blue);color:#fff;font-size:11px">Apply</button>';
+        html += '<button class="btn btn-sm" onclick="applyPlanSuggestion(\\x27' + esc(c.job) + '\\x27,\\x27' + esc(c.change) + '\\x27,\\x27' + esc(c.reason) + '\\x27)" style="background:var(--blue);color:#fff;font-size:11px">Apply</button>';
         html += '</div>';
       }
       html += '</div></div>';
@@ -10504,7 +10504,7 @@ async function refreshDailyPlan() {
     const histEl = document.getElementById('plan-history-list');
     if (hd.plans?.length) {
       histEl.innerHTML = hd.plans.map(p =>
-        '<div style="display:flex;align-items:center;gap:12px;padding:6px 0;border-bottom:1px solid var(--border);cursor:pointer" onclick="loadPlanForDate(\\'' + p.date + '\\')">' +
+        '<div style="display:flex;align-items:center;gap:12px;padding:6px 0;border-bottom:1px solid var(--border);cursor:pointer" onclick="loadPlanForDate(\\x27' + p.date + '\\x27)">' +
         '<span style="font-weight:600;color:var(--blue);min-width:100px">' + p.date + '</span>' +
         '<span style="color:var(--text-muted);font-size:12px">' + p.priorityCount + ' priorities</span>' +
         '<span style="color:var(--text-secondary);flex:1;font-size:13px">' + esc(p.summary || '').slice(0, 120) + '</span>' +
@@ -10888,7 +10888,7 @@ async function refreshSalesforce() {
       badge.style.background = 'var(--red)';
       badge.style.color = '#fff';
       content.innerHTML = '<div style="color:var(--text-muted)">' + esc(d.error || 'Not configured') + '</div>'
-        + '<div style="margin-top:8px"><a href="#" onclick="navigateTo(\'settings\');return false" style="color:var(--accent)">Configure in Settings</a></div>';
+        + '<div style="margin-top:8px"><a href="#" onclick="navigateTo(\\x27settings\\x27);return false" style="color:var(--accent)">Configure in Settings</a></div>';
     }
   } catch (err) {
     document.getElementById('sf-status-content').innerHTML = '<div class="empty-state">Failed to load: ' + esc(String(err)) + '</div>';
