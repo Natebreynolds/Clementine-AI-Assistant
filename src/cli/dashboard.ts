@@ -7288,7 +7288,7 @@ function navigateTo(page, opts) {
   // Activate the right nav item
   var navEl = document.querySelector('.nav-item[data-page="' + page + '"]');
   if (navEl) navEl.classList.add('active');
-  if (opts.agentSlug) {
+  if (opts.agentSlug != null) {
     var teamEl = document.querySelector('.team-nav-item[data-slug="' + opts.agentSlug + '"]');
     if (teamEl) teamEl.classList.add('active');
   }
@@ -7302,7 +7302,7 @@ function navigateTo(page, opts) {
   if (page === 'intelligence') { refreshMemory(); }
   if (page === 'settings') { refreshSettings(); refreshRemoteAccess(); refreshProjects(); refreshSalesforce(); }
   if (page === 'logs') refreshLogs();
-  if (page === 'agent-detail' && opts.agentSlug) {
+  if (page === 'agent-detail' && opts.agentSlug != null) {
     currentAgentSlug = opts.agentSlug;
     renderAgentDetail(opts.agentSlug);
   }
@@ -7477,8 +7477,8 @@ async function loadAgentDetailTab(tab, slug, isPrimary) {
       var cronRes = await apiFetch('/api/cron');
       var cronData = await cronRes.json();
       var jobs = (cronData.jobs || []).filter(function(j) {
-        if (isPrimary) return !j.agentSlug;
-        return j.agentSlug === slug;
+        if (isPrimary) return !j.agent;
+        return j.agent === slug;
       });
       html += '<div class="card" style="margin-bottom:16px"><div class="card-header" style="display:flex;justify-content:space-between;align-items:center"><span>Scheduled Tasks (' + jobs.length + ')</span>';
       html += '<button class="btn btn-sm btn-primary" onclick="openCronModal()" style="font-size:11px">+ Add Task</button></div><div class="card-body" style="padding:0">';
