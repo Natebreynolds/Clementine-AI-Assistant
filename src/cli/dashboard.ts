@@ -6094,6 +6094,12 @@ function getDashboardHTML(token: string): string {
       margin-bottom: 16px;
     }
 
+    /* Home plan+pulse: stack on mobile */
+    [style*="grid-template-columns:3fr 2fr"],
+    [style*="grid-template-columns:repeat(4,1fr)"] {
+      grid-template-columns: 1fr 1fr !important;
+    }
+
     /* Stat tiles: 2-col on mobile instead of auto-fit */
     .stat-grid {
       grid-template-columns: 1fr 1fr;
@@ -6212,6 +6218,148 @@ function getDashboardHTML(token: string): string {
   @media (max-width: 600px) {
     .agent-drawer { width: 100vw; }
   }
+
+  /* ── Toggle Switch (iOS-style) ─────────── */
+  .toggle-switch {
+    position: relative;
+    display: inline-block;
+    width: 36px;
+    height: 20px;
+    flex-shrink: 0;
+  }
+  .toggle-switch input { display: none; }
+  .toggle-slider {
+    position: absolute;
+    inset: 0;
+    background: var(--border);
+    border-radius: 20px;
+    transition: background 0.2s;
+    cursor: pointer;
+  }
+  .toggle-slider::before {
+    content: '';
+    position: absolute;
+    width: 16px;
+    height: 16px;
+    left: 2px;
+    bottom: 2px;
+    background: white;
+    border-radius: 50%;
+    transition: transform 0.2s;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.15);
+  }
+  .toggle-switch input:checked + .toggle-slider { background: var(--green); }
+  .toggle-switch input:checked + .toggle-slider::before { transform: translateX(16px); }
+
+  /* ── Tab Bar ────────────────────────────── */
+  .tab-bar {
+    display: flex;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 20px;
+    gap: 0;
+    overflow-x: auto;
+  }
+  .tab-bar button {
+    background: none;
+    border: none;
+    padding: 10px 18px;
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--text-muted);
+    cursor: pointer;
+    border-bottom: 2px solid transparent;
+    font-family: inherit;
+    transition: color 0.15s, border-color 0.15s;
+    white-space: nowrap;
+    position: relative;
+  }
+  .tab-bar button:hover { color: var(--text-primary); }
+  .tab-bar button.active {
+    color: var(--accent);
+    border-bottom-color: var(--accent);
+  }
+  .tab-bar .tab-badge {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 16px;
+    height: 16px;
+    padding: 0 5px;
+    border-radius: 8px;
+    background: var(--red);
+    color: #fff;
+    font-size: 10px;
+    font-weight: 600;
+    margin-left: 6px;
+    line-height: 1;
+  }
+  .tab-pane { display: none; }
+  .tab-pane.active { display: block; }
+
+  /* ── Dynamic Team Nav ───────────────────── */
+  .team-nav-item {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 7px 12px;
+    margin: 1px 0;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 13px;
+    color: var(--text-secondary);
+    transition: background 0.15s, color 0.15s;
+  }
+  .team-nav-item:hover { background: var(--bg-hover); color: var(--text-primary); }
+  .team-nav-item.active { background: var(--bg-hover); color: var(--text-primary); font-weight: 500; }
+  .team-nav-item.active::before {
+    content: '';
+    position: absolute;
+    left: 0;
+    top: 4px;
+    bottom: 4px;
+    width: 3px;
+    border-radius: 2px;
+    background: linear-gradient(180deg, var(--clementine), var(--clementine-dark));
+  }
+  .team-nav-item { position: relative; }
+  .team-nav-avatar {
+    width: 22px;
+    height: 22px;
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 10px;
+    font-weight: 700;
+    color: #fff;
+    flex-shrink: 0;
+    background: linear-gradient(135deg, var(--accent), var(--purple));
+  }
+  .team-nav-avatar.primary { background: linear-gradient(135deg, var(--clementine), #ff6b00); }
+  .team-nav-status {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    flex-shrink: 0;
+    margin-left: auto;
+  }
+  .team-nav-status.online { background: var(--green); }
+  .team-nav-status.paused { background: var(--yellow); }
+  .team-nav-status.offline { background: var(--text-muted); }
+  .team-nav-status.error { background: var(--red); }
+  .team-hire-btn {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 12px;
+    margin-top: 4px;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 12px;
+    color: var(--text-muted);
+    transition: background 0.15s, color 0.15s;
+  }
+  .team-hire-btn:hover { background: var(--bg-hover); color: var(--green); }
 </style>
 </head>
 <body>
@@ -6238,84 +6386,38 @@ function getDashboardHTML(token: string): string {
   <!-- Sidebar -->
   <nav class="sidebar">
     <div class="nav-section">
-      <div class="nav-section-title">Overview</div>
-      <div class="nav-item active" data-page="overview">
-        <span class="nav-icon">&#9679;</span> Dashboard
+      <div class="nav-section-title">Command Center</div>
+      <div class="nav-item active" data-page="home">
+        <span class="nav-icon">&#9679;</span> Home
       </div>
-      <div class="nav-item" data-page="metrics">
-        <span class="nav-icon">&#128200;</span> Metrics
-      </div>
-      <div class="nav-item" data-page="daily-plan">
-        <span class="nav-icon">&#128197;</span> Daily Plan
-      </div>
-    </div>
-    <div class="nav-section">
-      <div class="nav-section-title">Interact</div>
       <div class="nav-item" data-page="chat">
         <span class="nav-icon">&#128172;</span> Chat
       </div>
-      <div class="nav-item" data-page="search">
-        <span class="nav-icon">&#128269;</span> Search Memory
-      </div>
-      <div class="nav-item" data-page="graph">
-        <span class="nav-icon">&#128348;</span> Knowledge Graph
+    </div>
+    <div class="nav-section">
+      <div class="nav-section-title">Team</div>
+      <div id="team-nav"></div>
+      <div class="team-hire-btn" onclick="showAgentCreateModal()">
+        <span style="font-size:14px">+</span> Hire Agent
       </div>
     </div>
     <div class="nav-section">
-      <div class="nav-section-title">Workspace</div>
-      <div class="nav-item" data-page="projects">
-        <span class="nav-icon">&#128193;</span> Projects
-        <span class="nav-badge" id="nav-project-count">0</span>
-      </div>
-      <div class="nav-item" data-page="goals">
-        <span class="nav-icon">&#127919;</span> Goals
-      </div>
-    </div>
-    <div class="nav-section">
-      <div class="nav-section-title">Automation</div>
-      <div class="nav-item" data-page="cron">
-        <span class="nav-icon">&#9200;</span> Scheduled Tasks
+      <div class="nav-section-title">Operations</div>
+      <div class="nav-item" data-page="automations">
+        <span class="nav-icon">&#9200;</span> Automations
         <span class="nav-badge" id="nav-cron-count">0</span>
       </div>
-      <div class="nav-item" data-page="timers">
-        <span class="nav-icon">&#9203;</span> Timers
-        <span class="nav-badge" id="nav-timer-count">0</span>
-      </div>
-      <div class="nav-item" data-page="self-improve">
-        <span class="nav-icon">&#128300;</span> Self-Improve
-        <span class="nav-badge" id="nav-si-pending">0</span>
-      </div>
-      <div class="nav-item" data-page="advisor">
-        <span class="nav-icon">&#9889;</span> Exec Analytics
-      </div>
-    </div>
-    <div class="nav-section">
-      <div class="nav-section-title">Agents</div>
-      <div class="nav-item" data-page="team">
-        <span class="nav-icon">&#129302;</span> The Office
-        <span class="nav-badge" id="nav-team-count">0</span>
-      </div>
-    </div>
-    <div class="nav-section">
-      <div class="nav-section-title">Integrations</div>
-      <div class="nav-item" data-page="salesforce">
-        <span class="nav-icon">&#9729;</span> Salesforce
+      <div class="nav-item" data-page="intelligence">
+        <span class="nav-icon">&#129504;</span> Intelligence
       </div>
     </div>
     <div class="nav-section">
       <div class="nav-section-title">System</div>
-      <div class="nav-item" data-page="sessions">
-        <span class="nav-icon">&#128488;</span> Sessions
-        <span class="nav-badge" id="nav-session-count">0</span>
-      </div>
-      <div class="nav-item" data-page="memory">
-        <span class="nav-icon">&#129504;</span> Memory
+      <div class="nav-item" data-page="settings">
+        <span class="nav-icon">&#9881;</span> Settings
       </div>
       <div class="nav-item" data-page="logs">
         <span class="nav-icon">&#128220;</span> Logs
-      </div>
-      <div class="nav-item" data-page="settings">
-        <span class="nav-icon">&#9881;</span> Settings
       </div>
     </div>
   </nav>
@@ -6324,8 +6426,8 @@ function getDashboardHTML(token: string): string {
   <!-- Content -->
   <div class="content">
 
-    <!-- ═══ Overview Page ═══ -->
-    <div class="page active" id="page-overview">
+    <!-- ═══ Home Page ═══ -->
+    <div class="page active" id="page-home">
       <div class="agent-hero" id="agent-hero">
         <div class="agent-hero-top">
           <div class="agent-avatar" id="agent-avatar">${name.charAt(0).toUpperCase()}</div>
@@ -6342,94 +6444,155 @@ function getDashboardHTML(token: string): string {
         </div>
       </div>
       <div class="summary-grid" id="summary-cards"></div>
-      <div class="grid-2">
+
+      <!-- Today's Plan + Team Pulse -->
+      <div style="display:grid;grid-template-columns:3fr 2fr;gap:16px;margin-bottom:16px">
         <div class="card">
           <div class="card-header" style="display:flex;justify-content:space-between;align-items:center">
-            <span>Live Activity</span>
-            <div style="display:flex;gap:6px;align-items:center">
-              <select id="activity-source-filter" onchange="refreshActivity()" style="font-size:11px;padding:2px 6px;border:1px solid var(--border);border-radius:4px;background:var(--bg-secondary);color:var(--text-primary)">
-                <option value="">All Sources</option>
-                <option value="cron">Cron</option>
-                <option value="activity">Activities</option>
-                <option value="send">Emails</option>
-                <option value="approval">Approvals</option>
-                <option value="memory">Memory</option>
-              </select>
-              <select id="activity-agent-filter" onchange="refreshActivity()" style="font-size:11px;padding:2px 6px;border:1px solid var(--border);border-radius:4px;background:var(--bg-secondary);color:var(--text-primary)">
-                <option value="">All Agents</option>
-              </select>
+            <span>Today's Plan</span>
+            <div style="display:flex;gap:8px;align-items:center">
+              <input type="date" id="plan-date-picker" style="padding:4px 8px;font-size:11px;background:var(--bg-input);border:1px solid var(--border);border-radius:4px;color:var(--text-primary)">
+              <button class="btn btn-sm" onclick="loadPlanForDate(document.getElementById('plan-date-picker').value)" style="font-size:11px">Load</button>
             </div>
           </div>
-          <div class="card-body" id="panel-activity"><div class="empty-state">Loading...</div></div>
+          <div class="card-body" id="home-plan-content" style="max-height:320px;overflow-y:auto"><div class="empty-state">Loading plan...</div></div>
         </div>
         <div class="card">
-          <div class="card-header">Quick Controls</div>
-          <div class="card-body" id="panel-controls"><div class="empty-state">Loading...</div></div>
+          <div class="card-header" style="display:flex;justify-content:space-between;align-items:center">
+            <span>Team Pulse</span>
+            <span style="font-size:11px;color:var(--text-muted)" id="team-pulse-count"></span>
+          </div>
+          <div class="card-body" id="home-team-pulse" style="max-height:320px;overflow-y:auto"><div class="empty-state">Loading team...</div></div>
         </div>
       </div>
+
+      <!-- Home Tabs: Activity | Metrics | Sessions -->
+      <div class="tab-bar" id="home-tabs">
+        <button class="active" onclick="switchTab('home','activity')">Activity</button>
+        <button onclick="switchTab('home','metrics')">Metrics</button>
+        <button onclick="switchTab('home','sessions')">Sessions</button>
+      </div>
+      <div id="home-tab-content">
+        <div class="tab-pane active" id="tab-home-activity">
+          <div class="card">
+            <div class="card-header" style="display:flex;justify-content:space-between;align-items:center">
+              <span>Live Activity</span>
+              <div style="display:flex;gap:6px;align-items:center">
+                <select id="activity-source-filter" onchange="refreshActivity()" style="font-size:11px;padding:2px 6px;border:1px solid var(--border);border-radius:4px;background:var(--bg-secondary);color:var(--text-primary)">
+                  <option value="">All Sources</option>
+                  <option value="cron">Cron</option>
+                  <option value="activity">Activities</option>
+                  <option value="send">Emails</option>
+                  <option value="approval">Approvals</option>
+                  <option value="memory">Memory</option>
+                </select>
+                <select id="activity-agent-filter" onchange="refreshActivity()" style="font-size:11px;padding:2px 6px;border:1px solid var(--border);border-radius:4px;background:var(--bg-secondary);color:var(--text-primary)">
+                  <option value="">All Agents</option>
+                </select>
+              </div>
+            </div>
+            <div class="card-body" id="panel-activity"><div class="empty-state">Loading...</div></div>
+          </div>
+        </div>
+        <div class="tab-pane" id="tab-home-metrics">
+          <div id="metrics-content-home"><div class="empty-state">Loading metrics...</div></div>
+        </div>
+        <div class="tab-pane" id="tab-home-sessions">
+          <div id="panel-sessions-home"><div class="empty-state">Loading sessions...</div></div>
+        </div>
+      </div>
+
       <div class="card" id="mcp-status-widget" style="display:none;margin-top:16px"></div>
+      <!-- Hidden: Quick controls data target (kept for refreshStatus compat) -->
+      <div id="panel-controls" style="display:none"></div>
     </div>
 
-    <!-- ═══ Projects Page ═══ -->
-    <div class="page" id="page-projects">
-      <div class="page-title">Projects</div>
-      <p style="color:var(--text-muted);margin-bottom:16px">Link projects to give Clementine automatic access to their tools and MCP servers. When you mention a linked project's keywords in chat, Clementine switches into that project's context automatically.</p>
-      <div class="card" style="margin-bottom:20px">
-        <div class="card-header" style="display:flex;align-items:center;justify-content:space-between">
-          <span>Workspace Directories</span>
-          <button class="btn btn-sm btn-primary" onclick="promptAddWorkspaceDir()" style="font-size:11px">+ Add Path</button>
+    <!-- ═══ Agent Detail Page (full-screen management console) ═══ -->
+    <div class="page" id="page-agent-detail">
+      <div id="agent-detail-content"><div class="empty-state">Select an agent from the sidebar</div></div>
+    </div>
+
+    <!-- ═══ Automations Page (merged: Cron + Timers + Self-Improve + Advisor) ═══ -->
+    <div class="page" id="page-automations">
+      <div class="page-title">Automations</div>
+      <div class="tab-bar" id="automations-tabs">
+        <button class="active" onclick="switchTab('automations','scheduled')">Scheduled Tasks</button>
+        <button onclick="switchTab('automations','timers')">Timers <span class="tab-badge" id="tab-timer-count" style="display:none">0</span></button>
+        <button onclick="switchTab('automations','self-improve')">Self-Improve <span class="tab-badge" id="tab-si-pending" style="display:none">0</span></button>
+        <button onclick="switchTab('automations','analytics')">Execution Analytics</button>
+      </div>
+      <div id="automations-tab-content">
+        <div class="tab-pane active" id="tab-automations-scheduled">
+          <div id="panel-cron"><div class="empty-state">Loading...</div></div>
         </div>
-        <div class="card-body" id="workspace-dirs-list" style="font-size:13px">
-          <div class="empty-state">Loading...</div>
+        <div class="tab-pane" id="tab-automations-timers">
+          <div class="card">
+            <div class="card-body" id="panel-timers"><div class="empty-state">Loading...</div></div>
+          </div>
+        </div>
+        <div class="tab-pane" id="tab-automations-self-improve">
+          <div class="grid-2" id="si-status-cards"></div>
+          <div class="card" style="margin-top:16px">
+            <div class="card-header">Pending Proposals</div>
+            <div class="card-body" id="si-pending-list"><div class="empty-state">No pending proposals</div></div>
+          </div>
+          <div class="card" style="margin-top:16px">
+            <div class="card-header">Experiment History</div>
+            <div class="card-body" id="si-history-list"><div class="empty-state">No experiments yet</div></div>
+          </div>
+        </div>
+        <div class="tab-pane" id="tab-automations-analytics">
+          <div id="advisor-analytics-content"><div class="empty-state">Loading analytics...</div></div>
         </div>
       </div>
-      <div id="panel-projects"><div class="empty-state">Loading...</div></div>
     </div>
 
-    <!-- ═══ Cron / Scheduled Tasks Page ═══ -->
-    <div class="page" id="page-cron">
-      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:20px">
-        <div class="page-title" style="margin-bottom:0">Scheduled Tasks</div>
+    <!-- ═══ Intelligence Page (merged: Search + Knowledge Graph + Memory) ═══ -->
+    <div class="page" id="page-intelligence">
+      <div class="page-title">Intelligence</div>
+      <div style="display:flex;gap:10px;margin-bottom:16px">
+        <input type="text" id="memory-search-input" placeholder="Search vault, notes, memory..." style="flex:1" onkeydown="if(event.key==='Enter')runMemorySearch()">
+        <button class="btn-primary" onclick="runMemorySearch()">Search</button>
       </div>
-      <div id="panel-cron"><div class="empty-state">Loading...</div></div>
-    </div>
-
-    <!-- ═══ Timers Page ═══ -->
-    <div class="page" id="page-timers">
-      <div class="page-title">Pending Timers</div>
-      <div class="card">
-        <div class="card-body" id="panel-timers"><div class="empty-state">Loading...</div></div>
+      <div class="tab-bar" id="intelligence-tabs">
+        <button class="active" onclick="switchTab('intelligence','search')">Search Results</button>
+        <button onclick="switchTab('intelligence','graph')">Knowledge Graph</button>
+        <button onclick="switchTab('intelligence','memory')">Memory Stats</button>
+      </div>
+      <div id="intelligence-tab-content">
+        <div class="tab-pane active" id="tab-intelligence-search">
+          <div id="memory-search-results"></div>
+        </div>
+        <div class="tab-pane" id="tab-intelligence-graph">
+          <div style="display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap">
+            <input id="graph-search" placeholder="Search entities..." style="flex:1;min-width:200px;padding:8px 12px;border:1px solid var(--border);border-radius:6px;background:var(--bg-input);color:var(--text);font-size:14px">
+            <select id="graph-filter-label" style="padding:8px 12px;border:1px solid var(--border);border-radius:6px;background:var(--bg-input);color:var(--text);font-size:14px">
+              <option value="">All Types</option>
+              <option value="Person">People</option>
+              <option value="Project">Projects</option>
+              <option value="Topic">Topics</option>
+              <option value="Agent">Agents</option>
+              <option value="Task">Tasks</option>
+            </select>
+            <button class="btn" onclick="refreshGraph()" style="font-size:14px">Refresh</button>
+          </div>
+          <div id="graph-canvas" style="height:500px;border:1px solid var(--border);border-radius:8px;background:#1e1e2e;position:relative"></div>
+          <div id="graph-legend" style="display:flex;gap:16px;margin-top:8px;flex-wrap:wrap"></div>
+          <div id="graph-detail-panel" style="margin-top:12px"></div>
+        </div>
+        <div class="tab-pane" id="tab-intelligence-memory">
+          <div class="grid-2" id="memory-stats"></div>
+          <div class="card">
+            <div class="card-header">MEMORY.md</div>
+            <div class="card-body" id="panel-memory"><div class="empty-state">Loading...</div></div>
+          </div>
+        </div>
       </div>
     </div>
 
-    <!-- ═══ Sessions Page ═══ -->
-    <div class="page" id="page-sessions">
-      <div class="page-title">Active Sessions</div>
+    <!-- Hidden: Sessions (shown in Home tabs in Phase 2) -->
+    <div class="page" id="page-sessions" style="display:none">
       <div id="panel-sessions"><div class="empty-state">Loading...</div></div>
-    </div>
-
-    <!-- ═══ Memory Page ═══ -->
-    <div class="page" id="page-memory">
-      <div class="page-title">Memory</div>
-      <div class="grid-2" id="memory-stats"></div>
-      <div class="card">
-        <div class="card-header">MEMORY.md</div>
-        <div class="card-body" id="panel-memory"><div class="empty-state">Loading...</div></div>
-      </div>
-    </div>
-
-    <!-- ═══ Self-Improvement Page ═══ -->
-    <div class="page" id="page-self-improve">
-      <div class="page-title">Self-Improvement</div>
-      <div class="grid-2" id="si-status-cards"></div>
-      <div class="card" style="margin-top:16px">
-        <div class="card-header">Pending Proposals</div>
-        <div class="card-body" id="si-pending-list"><div class="empty-state">No pending proposals</div></div>
-      </div>
-      <div class="card" style="margin-top:16px">
-        <div class="card-header">Experiment History</div>
-        <div class="card-body" id="si-history-list"><div class="empty-state">No experiments yet</div></div>
-      </div>
     </div>
 
     <!-- ═══ Logs Page ═══ -->
@@ -6477,19 +6640,8 @@ function getDashboardHTML(token: string): string {
       </div>
     </div>
 
-    <!-- ═══ Search Memory Page ═══ -->
-    <div class="page" id="page-search">
-      <div class="page-title">Search Memory</div>
-      <div style="display:flex;gap:10px;margin-bottom:16px">
-        <input type="text" id="memory-search-input" placeholder="Search vault, notes, memory..." style="flex:1" onkeydown="if(event.key==='Enter')runMemorySearch()">
-        <button class="btn-primary" onclick="runMemorySearch()">Search</button>
-      </div>
-      <div id="memory-search-results"></div>
-    </div>
-
-    <!-- ═══ Metrics Page ═══ -->
-    <div class="page" id="page-metrics">
-      <div class="page-title">Metrics & Analytics</div>
+    <!-- Hidden: Metrics (shown in Home tabs in Phase 2) -->
+    <div class="page" id="page-metrics" style="display:none">
       <div id="metrics-content"><div class="empty-state">Loading metrics...</div></div>
     </div>
 
@@ -6510,15 +6662,8 @@ function getDashboardHTML(token: string): string {
       </details>
     </div>
 
-    <!-- ═══ Execution Analytics Page ═══ -->
-    <div class="page" id="page-advisor">
-      <div class="page-title">Execution Analytics</div>
-      <div id="advisor-analytics-content"><div class="empty-state">Loading analytics...</div></div>
-    </div>
-
-    <!-- ═══ Goals Progress Page ═══ -->
-    <div class="page" id="page-goals">
-      <div class="page-title">Goal Progress</div>
+    <!-- Hidden: Goals (moved to Agent Detail in Phase 3) -->
+    <div class="page" id="page-goals" style="display:none">
       <div id="goals-progress-content"><div class="empty-state">Loading goals...</div></div>
     </div>
 
@@ -6739,86 +6884,82 @@ function getDashboardHTML(token: string): string {
       </div>
     </div>
 
-    <!-- ═══ Knowledge Graph Page ═══ -->
-    <div class="page" id="page-graph">
-      <div class="page-title">Knowledge Graph</div>
-      <div style="display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap">
-        <input id="graph-search" placeholder="Search entities..." style="flex:1;min-width:200px;padding:8px 12px;border:1px solid var(--border);border-radius:6px;background:var(--bg-input);color:var(--text);font-size:14px">
-        <select id="graph-filter-label" style="padding:8px 12px;border:1px solid var(--border);border-radius:6px;background:var(--bg-input);color:var(--text);font-size:14px">
-          <option value="">All Types</option>
-          <option value="Person">People</option>
-          <option value="Project">Projects</option>
-          <option value="Topic">Topics</option>
-          <option value="Agent">Agents</option>
-          <option value="Task">Tasks</option>
-        </select>
-        <button class="btn" onclick="refreshGraph()" style="font-size:14px">Refresh</button>
-      </div>
-      <div id="graph-canvas" style="height:500px;border:1px solid var(--border);border-radius:8px;background:#1e1e2e;position:relative"></div>
-      <div id="graph-legend" style="display:flex;gap:16px;margin-top:8px;flex-wrap:wrap"></div>
-      <div id="graph-detail-panel" style="margin-top:12px"></div>
-    </div>
-
-    <!-- ═══ Salesforce Page ═══ -->
-    <div class="page" id="page-salesforce">
-      <div class="page-title">Salesforce CRM</div>
-
-      <div class="card" style="margin-bottom:20px">
-        <div class="card-header" style="display:flex;align-items:center;gap:8px">
-          <span>Connection Status</span>
-          <span class="badge" id="sf-status-badge" style="font-size:10px">Checking...</span>
-        </div>
-        <div class="card-body" style="padding:16px" id="sf-status-content">
-          <div class="empty-state">Loading...</div>
-        </div>
-      </div>
-
-      <div class="card" style="margin-bottom:20px">
-        <div class="card-header">Sync History</div>
-        <div class="card-body" style="padding:0" id="sf-sync-history">
-          <div class="empty-state" style="padding:24px">Loading...</div>
-        </div>
-      </div>
-
-      <div class="card">
-        <div class="card-header">Field Mapping (Lead)</div>
-        <div class="card-body" style="padding:0">
-          <table style="width:100%;border-collapse:collapse">
-            <thead><tr style="border-bottom:1px solid var(--border)">
-              <th style="padding:8px 12px;text-align:left;color:var(--text-muted);font-size:12px">Local Field</th>
-              <th style="padding:8px 12px;text-align:left;color:var(--text-muted);font-size:12px">SF Lead Field</th>
-              <th style="padding:8px 12px;text-align:left;color:var(--text-muted);font-size:12px">Notes</th>
-            </tr></thead>
-            <tbody style="font-size:13px">
-              <tr style="border-bottom:1px solid var(--border)"><td style="padding:8px 12px">name</td><td style="padding:8px 12px">FirstName + LastName</td><td style="padding:8px 12px;color:var(--text-muted)">Split on last space</td></tr>
-              <tr style="border-bottom:1px solid var(--border)"><td style="padding:8px 12px">email</td><td style="padding:8px 12px">Email</td><td style="padding:8px 12px;color:var(--text-muted)">Unique identifier</td></tr>
-              <tr style="border-bottom:1px solid var(--border)"><td style="padding:8px 12px">company</td><td style="padding:8px 12px">Company</td><td style="padding:8px 12px;color:var(--text-muted)">Required in SF (defaults to [Unknown])</td></tr>
-              <tr style="border-bottom:1px solid var(--border)"><td style="padding:8px 12px">title</td><td style="padding:8px 12px">Title</td><td style="padding:8px 12px;color:var(--text-muted)"></td></tr>
-              <tr style="border-bottom:1px solid var(--border)"><td style="padding:8px 12px">status</td><td style="padding:8px 12px">Status</td><td style="padding:8px 12px;color:var(--text-muted)">Mapped via lookup table</td></tr>
-              <tr><td style="padding:8px 12px">source</td><td style="padding:8px 12px">LeadSource</td><td style="padding:8px 12px;color:var(--text-muted)"></td></tr>
-            </tbody>
-          </table>
-        </div>
-      </div>
-    </div>
-
-    <!-- ═══ Settings Page ═══ -->
+    <!-- ═══ Settings Page (merged: General + Remote + Integrations + Projects) ═══ -->
     <div class="page" id="page-settings">
       <div class="page-title">Settings</div>
-
-      <!-- Remote Access Section -->
-      <div class="card" style="margin-bottom:20px">
-        <div class="card-header" style="display:flex;align-items:center;gap:8px">
-          <span>Remote Access</span>
-          <span class="badge" id="ra-status-badge" style="font-size:10px">Loading...</span>
+      <div class="tab-bar" id="settings-tabs">
+        <button class="active" onclick="switchTab('settings','general')">General</button>
+        <button onclick="switchTab('settings','remote')">Remote Access</button>
+        <button onclick="switchTab('settings','integrations')">Integrations</button>
+        <button onclick="switchTab('settings','projects')">Projects</button>
+      </div>
+      <div id="settings-tab-content">
+        <div class="tab-pane active" id="tab-settings-general">
+          <p style="color:var(--text-muted);margin-bottom:16px">Manage API keys and configuration. Changes are saved to <code>~/.clementine/.env</code> and take effect on daemon restart.</p>
+          <div id="settings-content"><div class="empty-state">Loading settings...</div></div>
         </div>
-        <div class="card-body" style="padding:16px" id="ra-content">
-          <div class="empty-state">Loading...</div>
+        <div class="tab-pane" id="tab-settings-remote">
+          <div class="card">
+            <div class="card-header" style="display:flex;align-items:center;gap:8px">
+              <span>Remote Access</span>
+              <span class="badge" id="ra-status-badge" style="font-size:10px">Loading...</span>
+            </div>
+            <div class="card-body" style="padding:16px" id="ra-content">
+              <div class="empty-state">Loading...</div>
+            </div>
+          </div>
+        </div>
+        <div class="tab-pane" id="tab-settings-integrations">
+          <div class="card" style="margin-bottom:20px">
+            <div class="card-header" style="display:flex;align-items:center;gap:8px">
+              <span>Salesforce Connection</span>
+              <span class="badge" id="sf-status-badge" style="font-size:10px">Checking...</span>
+            </div>
+            <div class="card-body" style="padding:16px" id="sf-status-content">
+              <div class="empty-state">Loading...</div>
+            </div>
+          </div>
+          <div class="card" style="margin-bottom:20px">
+            <div class="card-header">Sync History</div>
+            <div class="card-body" style="padding:0" id="sf-sync-history">
+              <div class="empty-state" style="padding:24px">Loading...</div>
+            </div>
+          </div>
+          <div class="card">
+            <div class="card-header">Field Mapping (Lead)</div>
+            <div class="card-body" style="padding:0">
+              <table style="width:100%;border-collapse:collapse">
+                <thead><tr style="border-bottom:1px solid var(--border)">
+                  <th style="padding:8px 12px;text-align:left;color:var(--text-muted);font-size:12px">Local Field</th>
+                  <th style="padding:8px 12px;text-align:left;color:var(--text-muted);font-size:12px">SF Lead Field</th>
+                  <th style="padding:8px 12px;text-align:left;color:var(--text-muted);font-size:12px">Notes</th>
+                </tr></thead>
+                <tbody style="font-size:13px">
+                  <tr style="border-bottom:1px solid var(--border)"><td style="padding:8px 12px">name</td><td style="padding:8px 12px">FirstName + LastName</td><td style="padding:8px 12px;color:var(--text-muted)">Split on last space</td></tr>
+                  <tr style="border-bottom:1px solid var(--border)"><td style="padding:8px 12px">email</td><td style="padding:8px 12px">Email</td><td style="padding:8px 12px;color:var(--text-muted)">Unique identifier</td></tr>
+                  <tr style="border-bottom:1px solid var(--border)"><td style="padding:8px 12px">company</td><td style="padding:8px 12px">Company</td><td style="padding:8px 12px;color:var(--text-muted)">Required in SF (defaults to [Unknown])</td></tr>
+                  <tr style="border-bottom:1px solid var(--border)"><td style="padding:8px 12px">title</td><td style="padding:8px 12px">Title</td><td style="padding:8px 12px;color:var(--text-muted)"></td></tr>
+                  <tr style="border-bottom:1px solid var(--border)"><td style="padding:8px 12px">status</td><td style="padding:8px 12px">Status</td><td style="padding:8px 12px;color:var(--text-muted)">Mapped via lookup table</td></tr>
+                  <tr><td style="padding:8px 12px">source</td><td style="padding:8px 12px">LeadSource</td><td style="padding:8px 12px;color:var(--text-muted)"></td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+        <div class="tab-pane" id="tab-settings-projects">
+          <p style="color:var(--text-muted);margin-bottom:16px">Link projects to give Clementine automatic access to their tools and MCP servers. When you mention a linked project's keywords in chat, Clementine switches into that project's context automatically.</p>
+          <div class="card" style="margin-bottom:20px">
+            <div class="card-header" style="display:flex;align-items:center;justify-content:space-between">
+              <span>Workspace Directories</span>
+              <button class="btn btn-sm btn-primary" onclick="promptAddWorkspaceDir()" style="font-size:11px">+ Add Path</button>
+            </div>
+            <div class="card-body" id="workspace-dirs-list" style="font-size:13px">
+              <div class="empty-state">Loading...</div>
+            </div>
+          </div>
+          <div id="panel-projects"><div class="empty-state">Loading...</div></div>
         </div>
       </div>
-
-      <p style="color:var(--text-muted);margin-bottom:16px">Manage API keys and configuration. Changes are saved to <code>~/.clementine/.env</code> and take effect on daemon restart.</p>
-      <div id="settings-content"><div class="empty-state">Loading settings...</div></div>
     </div>
 
   </div><!-- /content -->
@@ -7133,36 +7274,427 @@ function apiFetch(url, opts) {
 }
 
 // ── Navigation ────────────────────────────
-let currentPage = 'overview';
+let currentPage = 'home';
+var currentAgentSlug = null;
 var prevAgentSlugs = null;
+
+function navigateTo(page, opts) {
+  opts = opts || {};
+  currentPage = page;
+  // Clear all active states
+  document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
+  document.querySelectorAll('.team-nav-item').forEach(n => n.classList.remove('active'));
+  document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+  // Activate the right nav item
+  var navEl = document.querySelector('.nav-item[data-page="' + page + '"]');
+  if (navEl) navEl.classList.add('active');
+  if (opts.agentSlug) {
+    var teamEl = document.querySelector('.team-nav-item[data-slug="' + opts.agentSlug + '"]');
+    if (teamEl) teamEl.classList.add('active');
+  }
+  // Show the page
+  var el = document.getElementById('page-' + page);
+  if (el) { el.style.display = ''; el.classList.add('active'); }
+  // Page-specific refresh
+  if (page === 'home') { refreshStatus(); refreshActivity(); refreshHomePlan(); refreshTeamPulse(); }
+  if (page === 'chat') { loadProfiles(); document.getElementById('chat-input').focus(); }
+  if (page === 'automations') { refreshCron(); refreshTimers(); refreshSelfImprove(); }
+  if (page === 'intelligence') { refreshMemory(); }
+  if (page === 'settings') { refreshSettings(); refreshRemoteAccess(); refreshProjects(); refreshSalesforce(); }
+  if (page === 'logs') refreshLogs();
+  if (page === 'agent-detail' && opts.agentSlug) {
+    currentAgentSlug = opts.agentSlug;
+    renderAgentDetail(opts.agentSlug);
+  }
+  closeSidebar();
+}
+
+// Bind static nav items
 document.querySelectorAll('.nav-item').forEach(item => {
   item.addEventListener('click', () => {
     const page = item.dataset.page;
-    if (!page) return;
-    currentPage = page;
-    document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
-    item.classList.add('active');
-    document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
-    const el = document.getElementById('page-' + page);
-    if (el) el.classList.add('active');
-    // Refresh relevant data
-    if (page === 'projects') refreshProjects();
-    if (page === 'logs') refreshLogs();
-    if (page === 'memory') refreshMemory();
-    if (page === 'metrics') refreshMetrics();
-    if (page === 'chat') { loadProfiles(); document.getElementById('chat-input').focus(); }
-    if (page === 'settings') { refreshSettings(); refreshRemoteAccess(); }
-    if (page === 'self-improve') refreshSelfImprove();
-    if (page === 'team') refreshTeam();
-    if (page === 'graph') refreshGraph();
-    if (page === 'daily-plan') refreshDailyPlan();
-    if (page === 'advisor') refreshAdvisorAnalytics();
-    if (page === 'goals') refreshGoalsProgress();
-    if (page === 'salesforce') refreshSalesforce();
-    // Close sidebar on mobile after nav
-    closeSidebar();
+    if (page) navigateTo(page);
   });
 });
+
+// ── Tab Switching ────────────────────────
+function switchTab(group, tab) {
+  var bar = document.getElementById(group + '-tabs');
+  if (bar) {
+    bar.querySelectorAll('button').forEach(b => b.classList.remove('active'));
+    // Find the button that triggers this tab
+    bar.querySelectorAll('button').forEach(b => {
+      if (b.getAttribute('onclick') && b.getAttribute('onclick').indexOf("'" + tab + "'") !== -1) b.classList.add('active');
+    });
+  }
+  var container = document.getElementById(group + '-tab-content');
+  if (container) {
+    container.querySelectorAll('.tab-pane').forEach(p => p.classList.remove('active'));
+    var pane = document.getElementById('tab-' + group + '-' + tab);
+    if (pane) pane.classList.add('active');
+  }
+  // Tab-specific refresh
+  if (group === 'automations') {
+    if (tab === 'scheduled') refreshCron();
+    if (tab === 'timers') refreshTimers();
+    if (tab === 'self-improve') refreshSelfImprove();
+    if (tab === 'analytics') refreshAdvisorAnalytics();
+  }
+  if (group === 'intelligence') {
+    if (tab === 'graph') refreshGraph();
+    if (tab === 'memory') refreshMemory();
+  }
+  if (group === 'home') {
+    if (tab === 'metrics') refreshHomeMetrics();
+    if (tab === 'sessions') refreshHomeSessions();
+    if (tab === 'activity') refreshActivity();
+  }
+  if (group === 'settings') {
+    if (tab === 'integrations') refreshSalesforce();
+    if (tab === 'projects') refreshProjects();
+    if (tab === 'remote') refreshRemoteAccess();
+  }
+}
+
+// ── Dynamic Team Nav ─────────────────────
+function renderTeamNav(agents) {
+  var container = document.getElementById('team-nav');
+  if (!container) return;
+  var html = '';
+  // Primary agent (Clementine) is always first
+  agents.forEach(function(a) {
+    var statusCls = a.status === 'active' ? 'online' : a.status === 'paused' ? 'paused' : a.status === 'error' ? 'error' : 'offline';
+    var initial = (a.name || '?').charAt(0).toUpperCase();
+    var isPrimary = a.isPrimary || a.slug === 'clementine' || a.slug === '';
+    html += '<div class="team-nav-item' + (currentAgentSlug === a.slug ? ' active' : '') + '" data-slug="' + esc(a.slug || '') + '" onclick="navigateTo(\\'agent-detail\\', {agentSlug: \\'' + esc(a.slug || '') + '\\'})"><div class="team-nav-avatar' + (isPrimary ? ' primary' : '') + '">' + initial + '</div><span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(a.name || 'Unknown') + '</span><div class="team-nav-status ' + statusCls + '"></div></div>';
+  });
+  container.innerHTML = html;
+}
+
+// ── Agent Detail (Full-screen management console) ──
+var _agentDetailData = null;
+var _agentDetailTab = 'schedule';
+
+async function renderAgentDetail(slug) {
+  var el = document.getElementById('agent-detail-content');
+  if (!el) return;
+  el.innerHTML = '<div class="empty-state">Loading agent...</div>';
+  try {
+    var officeRes = await apiFetch('/api/office');
+    var data = await officeRes.json();
+    var clem = data.clementine || {};
+    var agents = data.agents || [];
+    var agent = null;
+    var isPrimary = !slug || slug === '';
+    if (isPrimary) {
+      agent = { name: clem.name || 'Clementine', slug: '', status: clem.alive ? 'active' : 'offline', description: 'Primary AI Assistant', model: '', isPrimary: true, sessions: clem.sessions, crons: clem.crons, tokens: clem.tokens, currentActivity: clem.currentActivity, uptime: clem.uptime, channels: clem.channels || [], budgetMonthlyCents: 0 };
+    } else {
+      for (var i = 0; i < agents.length; i++) {
+        if (agents[i].slug === slug) { agent = agents[i]; break; }
+      }
+    }
+    if (!agent) { el.innerHTML = '<div class="empty-state">Agent not found: ' + esc(slug) + '</div>'; return; }
+    _agentDetailData = agent;
+
+    var statusColor = agent.status === 'active' ? 'var(--green)' : agent.status === 'paused' ? 'var(--yellow)' : agent.status === 'error' ? 'var(--red)' : 'var(--text-muted)';
+    var statusLabel = agent.status === 'active' ? 'Active' : agent.status === 'paused' ? 'Paused' : agent.status === 'error' ? 'Error' : 'Offline';
+    var initial = (agent.name || '?').charAt(0).toUpperCase();
+    var avatarCls = isPrimary ? 'team-nav-avatar primary' : 'team-nav-avatar';
+    var tokTotal = agent.tokens ? (agent.tokens.input || 0) + (agent.tokens.output || 0) : 0;
+    var runsToday = agent.crons ? (agent.crons.runsToday || 0) : 0;
+    var sessCount = agent.sessions ? (agent.sessions.active || 0) : 0;
+
+    var html = '';
+    // Hero bar
+    html += '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:20px;padding:16px 20px;background:var(--bg-secondary);border:1px solid var(--border);border-radius:var(--radius)">';
+    html += '<div style="display:flex;align-items:center;gap:14px">';
+    html += '<div class="' + avatarCls + '" style="width:44px;height:44px;font-size:18px">' + initial + '</div>';
+    html += '<div>';
+    html += '<div style="font-size:18px;font-weight:700;color:var(--text-primary)">' + esc(agent.name) + '</div>';
+    html += '<div style="font-size:13px;color:var(--text-muted)">' + esc(agent.description || '') + '</div>';
+    html += '</div>';
+    html += '<span style="display:inline-flex;align-items:center;gap:6px;padding:4px 12px;border-radius:12px;font-size:12px;font-weight:500;background:' + statusColor + '20;color:' + statusColor + '">';
+    html += '<span style="width:8px;height:8px;border-radius:50%;background:' + statusColor + '"></span>' + statusLabel + '</span>';
+    if (agent.model) html += '<span class="badge" style="margin-left:8px">' + esc(agent.model) + '</span>';
+    html += '</div>';
+    // Action buttons
+    html += '<div style="display:flex;gap:8px">';
+    if (!isPrimary) {
+      if (agent.status === 'active' || agent.agentStatus === 'active') {
+        html += '<button class="btn btn-sm" onclick="setAgentStatus(\\x27' + esc(slug) + '\\x27,\\x27paused\\x27)" style="color:var(--yellow)">Pause</button>';
+      } else {
+        html += '<button class="btn btn-sm" onclick="setAgentStatus(\\x27' + esc(slug) + '\\x27,\\x27active\\x27)" style="color:var(--green)">Resume</button>';
+      }
+      html += '<button class="btn btn-sm" onclick="editAgent(\\x27' + esc(slug) + '\\x27)">Edit</button>';
+    }
+    html += '</div></div>';
+
+    // Stat cards
+    html += '<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:20px">';
+    html += '<div style="text-align:center;padding:14px;background:var(--bg-secondary);border:1px solid var(--border);border-radius:var(--radius)"><div style="font-size:24px;font-weight:700;color:var(--green)">' + runsToday + '</div><div style="font-size:11px;color:var(--text-muted)">Runs Today</div></div>';
+    html += '<div style="text-align:center;padding:14px;background:var(--bg-secondary);border:1px solid var(--border);border-radius:var(--radius)"><div style="font-size:24px;font-weight:700;color:var(--accent)">' + sessCount + '</div><div style="font-size:11px;color:var(--text-muted)">Sessions</div></div>';
+    html += '<div style="text-align:center;padding:14px;background:var(--bg-secondary);border:1px solid var(--border);border-radius:var(--radius)"><div style="font-size:24px;font-weight:700;color:var(--purple)">' + fmtTokens(tokTotal) + '</div><div style="font-size:11px;color:var(--text-muted)">Tokens</div></div>';
+    var cronTotal = agent.crons ? (agent.crons.total || 0) : 0;
+    var cronOk = agent.crons ? (agent.crons.successCount || 0) : 0;
+    var successPct = cronTotal > 0 ? Math.round((cronOk / cronTotal) * 100) : 100;
+    html += '<div style="text-align:center;padding:14px;background:var(--bg-secondary);border:1px solid var(--border);border-radius:var(--radius)"><div style="font-size:24px;font-weight:700;color:' + (successPct >= 90 ? 'var(--green)' : successPct >= 70 ? 'var(--yellow)' : 'var(--red)') + '">' + successPct + '%</div><div style="font-size:11px;color:var(--text-muted)">Success Rate</div></div>';
+    html += '</div>';
+
+    // Tab bar
+    html += '<div class="tab-bar" id="agent-detail-tabs">';
+    var tabs = ['schedule', 'activity', 'sessions', 'tools', 'config'];
+    var tabLabels = { schedule: 'Schedule', activity: 'Activity', sessions: 'Sessions', tools: 'Tools & Access', config: 'Config' };
+    tabs.forEach(function(t) {
+      html += '<button class="' + (t === _agentDetailTab ? 'active' : '') + '" onclick="switchAgentDetailTab(\\x27' + t + '\\x27)">' + tabLabels[t] + '</button>';
+    });
+    html += '</div>';
+    html += '<div id="agent-detail-tab-content"></div>';
+
+    el.innerHTML = html;
+    loadAgentDetailTab(_agentDetailTab, slug, isPrimary);
+  } catch(e) {
+    el.innerHTML = '<div class="empty-state">Failed to load agent: ' + esc(String(e)) + '</div>';
+  }
+}
+
+function switchAgentDetailTab(tab) {
+  _agentDetailTab = tab;
+  var tabs = document.querySelectorAll('#agent-detail-tabs button');
+  tabs.forEach(function(t) { t.className = t.textContent.trim() === ({ schedule:'Schedule', activity:'Activity', sessions:'Sessions', tools:'Tools & Access', config:'Config' })[tab] ? 'active' : ''; });
+  loadAgentDetailTab(tab, currentAgentSlug, !currentAgentSlug || currentAgentSlug === '');
+}
+
+async function loadAgentDetailTab(tab, slug, isPrimary) {
+  var container = document.getElementById('agent-detail-tab-content');
+  if (!container) return;
+  container.innerHTML = '<div class="empty-state">Loading...</div>';
+  var a = _agentDetailData;
+
+  if (tab === 'schedule') {
+    var html = '';
+    // Cron jobs for this agent
+    try {
+      var cronRes = await apiFetch('/api/cron');
+      var cronData = await cronRes.json();
+      var jobs = (cronData.jobs || []).filter(function(j) {
+        if (isPrimary) return !j.agentSlug;
+        return j.agentSlug === slug;
+      });
+      html += '<div class="card" style="margin-bottom:16px"><div class="card-header" style="display:flex;justify-content:space-between;align-items:center"><span>Scheduled Tasks (' + jobs.length + ')</span>';
+      html += '<button class="btn btn-sm btn-primary" onclick="openCronModal()" style="font-size:11px">+ Add Task</button></div><div class="card-body" style="padding:0">';
+      if (jobs.length === 0) {
+        html += '<div class="empty-state" style="padding:24px">No scheduled tasks</div>';
+      } else {
+        html += '<table style="width:100%;border-collapse:collapse">';
+        html += '<thead><tr style="border-bottom:1px solid var(--border)"><th style="padding:8px 12px;text-align:left;color:var(--text-muted);font-size:11px">Name</th><th style="padding:8px 12px;text-align:left;color:var(--text-muted);font-size:11px">Schedule</th><th style="padding:8px 12px;text-align:left;color:var(--text-muted);font-size:11px">Last Run</th><th style="padding:8px 12px;text-align:left;color:var(--text-muted);font-size:11px">Status</th><th style="padding:8px 12px;text-align:center;color:var(--text-muted);font-size:11px">Run</th><th style="padding:8px 12px;text-align:center;color:var(--text-muted);font-size:11px">Enabled</th></tr></thead><tbody>';
+        jobs.forEach(function(j) {
+          var lastRun = j.lastRun ? fmtTimeAgo(j.lastRun.finishedAt || j.lastRun.startedAt) : '—';
+          var lastStatus = j.lastRun ? j.lastRun.status : '—';
+          var statusBadge = lastStatus === 'ok' ? 'badge-green' : lastStatus === 'error' ? 'badge-red' : 'badge-gray';
+          html += '<tr style="border-bottom:1px solid var(--border)">';
+          html += '<td style="padding:8px 12px;font-weight:500;font-size:13px">' + esc(j.name) + '</td>';
+          html += '<td style="padding:8px 12px;font-size:12px;color:var(--text-muted)">' + esc(j.schedule) + '</td>';
+          html += '<td style="padding:8px 12px;font-size:12px;color:var(--text-muted)">' + lastRun + '</td>';
+          html += '<td style="padding:8px 12px"><span class="badge ' + statusBadge + '" style="font-size:10px">' + lastStatus + '</span></td>';
+          html += '<td style="padding:8px 12px;text-align:center"><button class="btn btn-sm" onclick="apiPost(\\x27/api/cron/run/' + esc(j.name) + '\\x27)" style="font-size:10px;padding:2px 8px">Run</button></td>';
+          html += '<td style="padding:8px 12px;text-align:center"><label class="toggle-switch"><input type="checkbox"' + (j.enabled !== false ? ' checked' : '') + ' onchange="toggleCronJob(\\x27' + esc(j.name) + '\\x27)"><span class="toggle-slider"></span></label></td>';
+          html += '</tr>';
+        });
+        html += '</tbody></table>';
+      }
+      html += '</div></div>';
+    } catch(e) { html += '<div class="empty-state">Failed to load tasks</div>'; }
+
+    // Goals (if available)
+    try {
+      var goalsRes = await apiFetch('/api/goals/progress');
+      var goalsData = await goalsRes.json();
+      var goals = (goalsData.goals || []).filter(function(g) {
+        if (isPrimary) return true;
+        return g.owner === slug || (g.agentContributions && g.agentContributions[slug]);
+      });
+      if (goals.length > 0) {
+        html += '<div class="card"><div class="card-header">Goals (' + goals.length + ')</div><div class="card-body">';
+        goals.forEach(function(g) {
+          var pColor = g.status === 'completed' ? 'var(--green)' : g.status === 'blocked' ? 'var(--red)' : 'var(--accent)';
+          html += '<div style="padding:8px 0;border-bottom:1px solid var(--border)">';
+          html += '<div style="display:flex;align-items:center;gap:8px">';
+          html += '<span style="font-weight:500;color:var(--text-primary)">' + esc(g.title) + '</span>';
+          html += '<span class="badge" style="background:' + pColor + '20;color:' + pColor + ';font-size:10px">' + esc(g.status || 'active') + '</span>';
+          if (g.priority) html += '<span class="badge" style="font-size:10px">' + esc(g.priority) + '</span>';
+          html += '</div>';
+          if (g.nextActions && g.nextActions.length) {
+            html += '<div style="margin-top:4px;padding-left:8px">';
+            g.nextActions.slice(0, 3).forEach(function(na) {
+              html += '<div style="font-size:12px;color:var(--text-muted)">- ' + esc(na) + '</div>';
+            });
+            html += '</div>';
+          }
+          html += '</div>';
+        });
+        html += '</div></div>';
+      }
+    } catch(e) { /* goals optional */ }
+    container.innerHTML = html;
+
+  } else if (tab === 'activity') {
+    try {
+      var actUrl = isPrimary ? '/api/activity' : '/api/agents/' + slug + '/activity';
+      var actRes = await apiFetch(actUrl);
+      var actData = await actRes.json();
+      var items = actData.items || actData || [];
+      if (!Array.isArray(items)) items = [];
+      var html = '<div class="card"><div class="card-header">Recent Activity</div><div class="card-body">';
+      if (items.length === 0) {
+        html += '<div class="empty-state">No recent activity</div>';
+      } else {
+        items.slice(0, 50).forEach(function(item) {
+          var icon = item.source === 'cron' ? '&#9200;' : item.source === 'send' ? '&#9993;' : item.source === 'memory' ? '&#129504;' : item.source === 'approval' ? '&#9989;' : '&#128196;';
+          var statusBadge = item.status === 'ok' ? 'badge-green' : item.status === 'error' ? 'badge-red' : 'badge-gray';
+          html += '<div style="display:flex;align-items:center;gap:10px;padding:6px 0;border-bottom:1px solid var(--border)">';
+          html += '<span style="font-size:14px">' + icon + '</span>';
+          html += '<span style="flex:1;font-size:13px;color:var(--text-primary)">' + esc(item.title || item.jobName || item.subject || 'Activity') + '</span>';
+          if (item.status) html += '<span class="badge ' + statusBadge + '" style="font-size:10px">' + esc(item.status) + '</span>';
+          html += '<span style="font-size:11px;color:var(--text-muted)">' + fmtTimeAgo(item.timestamp || item.finishedAt) + '</span>';
+          html += '</div>';
+        });
+      }
+      html += '</div></div>';
+      container.innerHTML = html;
+    } catch(e) { container.innerHTML = '<div class="empty-state">Failed to load activity</div>'; }
+
+  } else if (tab === 'sessions') {
+    try {
+      var sessRes = await apiFetch('/api/sessions');
+      var sessData = await sessRes.json();
+      var keys = Object.keys(sessData).filter(function(k) {
+        if (isPrimary) return true;
+        return k.indexOf(slug) >= 0;
+      });
+      var html = '<div class="card"><div class="card-header">Sessions (' + keys.length + ')</div><div class="card-body">';
+      if (keys.length === 0) {
+        html += '<div class="empty-state">No sessions</div>';
+      } else {
+        keys.forEach(function(key) {
+          var s = sessData[key];
+          var icon = key.indexOf('discord') >= 0 ? '&#128172;' : key.indexOf('slack') >= 0 ? '&#128488;' : key.indexOf('dashboard') >= 0 ? '&#127760;' : '&#128172;';
+          html += '<div style="display:flex;align-items:center;gap:10px;padding:8px 0;border-bottom:1px solid var(--border)">';
+          html += '<span style="font-size:14px">' + icon + '</span>';
+          html += '<span style="flex:1;font-size:13px;font-weight:500">' + esc(key.split(':').pop() || key) + '</span>';
+          html += '<span style="font-size:12px;color:var(--text-muted)">' + (s.exchanges || 0) + ' exchanges</span>';
+          html += '<span style="font-size:11px;color:var(--text-muted)">' + fmtTimeAgo(s.lastActive) + '</span>';
+          html += '</div>';
+        });
+      }
+      html += '</div></div>';
+      container.innerHTML = html;
+    } catch(e) { container.innerHTML = '<div class="empty-state">Failed to load sessions</div>'; }
+
+  } else if (tab === 'tools') {
+    var html = '';
+    // Available tools
+    try {
+      var toolsRes = await apiFetch('/api/available-tools');
+      var toolsData = await toolsRes.json();
+      var categories = toolsData.categories || toolsData || {};
+      if (typeof categories === 'object' && !Array.isArray(categories)) {
+        html += '<div class="card" style="margin-bottom:16px"><div class="card-header">MCP Tools</div><div class="card-body">';
+        Object.keys(categories).forEach(function(cat) {
+          html += '<div style="margin-bottom:12px">';
+          html += '<div style="font-weight:600;font-size:12px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.05em;margin-bottom:6px">' + esc(cat) + '</div>';
+          var tools = categories[cat];
+          if (Array.isArray(tools)) {
+            tools.forEach(function(t) {
+              var toolName = typeof t === 'string' ? t : t.name || '';
+              var toolDesc = typeof t === 'object' ? (t.description || '') : '';
+              html += '<div style="display:flex;align-items:center;gap:8px;padding:4px 0">';
+              html += '<span style="font-size:13px;color:var(--text-primary);flex:1">' + esc(toolName) + '</span>';
+              if (toolDesc) html += '<span style="font-size:11px;color:var(--text-muted);max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(toolDesc) + '</span>';
+              html += '</div>';
+            });
+          }
+          html += '</div>';
+        });
+        html += '</div></div>';
+      }
+    } catch(e) { html += '<div class="empty-state">Failed to load tools</div>'; }
+
+    // Communication channels
+    if (a && a.channels && a.channels.length > 0) {
+      html += '<div class="card" style="margin-bottom:16px"><div class="card-header">Communication Channels</div><div class="card-body">';
+      a.channels.forEach(function(ch) {
+        var chIcon = ch === 'Discord' ? '&#128172;' : ch === 'Slack' ? '&#128488;' : ch === 'Telegram' ? '&#9992;' : '&#128279;';
+        html += '<div style="display:flex;align-items:center;gap:10px;padding:6px 0;border-bottom:1px solid var(--border)">';
+        html += '<span style="font-size:16px">' + chIcon + '</span>';
+        html += '<span style="flex:1;font-size:13px;font-weight:500">' + esc(ch) + '</span>';
+        html += '<span class="badge badge-green" style="font-size:10px">Connected</span>';
+        html += '</div>';
+      });
+      html += '</div></div>';
+    }
+    container.innerHTML = html || '<div class="empty-state">No tools or channels configured</div>';
+
+  } else if (tab === 'config') {
+    var html = '';
+    if (a) {
+      html += '<div class="card" style="margin-bottom:16px"><div class="card-header">Agent Profile</div><div class="card-body">';
+      html += '<div style="display:grid;grid-template-columns:120px 1fr;gap:8px;font-size:13px">';
+      html += '<div style="color:var(--text-muted);font-weight:500">Name</div><div>' + esc(a.name || '') + '</div>';
+      html += '<div style="color:var(--text-muted);font-weight:500">Description</div><div>' + esc(a.description || '') + '</div>';
+      html += '<div style="color:var(--text-muted);font-weight:500">Model</div><div>' + esc(a.model || 'default') + '</div>';
+      html += '<div style="color:var(--text-muted);font-weight:500">Status</div><div>' + esc(a.status || a.agentStatus || 'unknown') + '</div>';
+      if (a.project) { html += '<div style="color:var(--text-muted);font-weight:500">Project</div><div>' + esc(a.project) + '</div>'; }
+      html += '</div></div></div>';
+
+      // Budget
+      if (!isPrimary) {
+        try {
+          var budgetRes = await apiFetch('/api/agents/' + slug + '/budget');
+          var budget = await budgetRes.json();
+          if (budget && a.budgetMonthlyCents > 0) {
+            var pct = Math.min(100, Math.round((budget.spentCents / a.budgetMonthlyCents) * 100));
+            var bColor = pct > 90 ? 'var(--red)' : pct > 70 ? 'var(--yellow)' : 'var(--green)';
+            html += '<div class="card" style="margin-bottom:16px"><div class="card-header">Monthly Budget</div><div class="card-body">';
+            html += '<div style="display:flex;justify-content:space-between;font-size:12px;color:var(--text-muted);margin-bottom:4px"><span>$' + (budget.spentCents / 100).toFixed(2) + ' spent</span><span>$' + (a.budgetMonthlyCents / 100).toFixed(2) + ' limit</span></div>';
+            html += '<div style="height:8px;background:var(--bg-input);border-radius:4px;overflow:hidden"><div style="width:' + pct + '%;height:100%;background:' + bColor + '"></div></div>';
+            html += '<div style="text-align:right;font-size:11px;color:' + bColor + ';margin-top:4px">' + pct + '% used</div>';
+            html += '</div></div>';
+          }
+        } catch(e) { /* skip */ }
+
+        // Revision history
+        try {
+          var revRes = await apiFetch('/api/agents/' + slug + '/revisions');
+          var revData = await revRes.json();
+          if (revData.revisions && revData.revisions.length > 0) {
+            html += '<div class="card"><div class="card-header">Revision History</div><div class="card-body" style="padding:0">';
+            html += '<table style="width:100%;border-collapse:collapse"><thead><tr style="border-bottom:1px solid var(--border)"><th style="padding:8px 12px;text-align:left;color:var(--text-muted);font-size:11px">Date</th><th style="padding:8px 12px;text-align:left;color:var(--text-muted);font-size:11px">Changes</th><th style="padding:8px 12px;text-align:center;color:var(--text-muted);font-size:11px">Restore</th></tr></thead><tbody>';
+            revData.revisions.forEach(function(rev) {
+              html += '<tr style="border-bottom:1px solid var(--border)"><td style="padding:8px 12px;font-size:12px">' + fmtTimeAgo(rev.date) + '</td><td style="padding:8px 12px;font-size:12px;color:var(--text-muted)">' + esc(rev.summary || 'Configuration change') + '</td>';
+              html += '<td style="padding:8px 12px;text-align:center"><button class="btn btn-sm" style="font-size:10px;padding:2px 8px">Restore</button></td></tr>';
+            });
+            html += '</tbody></table></div></div>';
+          }
+        } catch(e) { /* skip */ }
+      }
+
+      if (!isPrimary) {
+        html += '<div style="margin-top:16px;display:flex;gap:8px">';
+        html += '<button class="btn" onclick="editAgent(\\x27' + esc(slug) + '\\x27)">Edit Agent</button>';
+        html += '<button class="btn btn-danger btn-sm" onclick="confirmDeleteAgent(\\x27' + esc(slug) + '\\x27,\\x27' + esc(a.name || slug) + '\\x27)">Delete Agent</button>';
+        html += '</div>';
+      }
+    }
+    container.innerHTML = html || '<div class="empty-state">No config available</div>';
+  }
+}
+
+async function toggleCronJob(name) {
+  try {
+    await apiFetch('/api/cron/' + encodeURIComponent(name) + '/toggle', { method: 'POST' });
+    toast('Toggled ' + name, 'success');
+  } catch(e) { toast('Failed to toggle: ' + e, 'error'); }
+}
 
 function toggleSidebar() {
   document.querySelector('.sidebar').classList.toggle('open');
@@ -7281,7 +7813,7 @@ async function refreshStatus() {
     }
 
     // Summary cards — fetch metrics when on overview
-    if (currentPage === 'overview') {
+    if (currentPage === 'home') {
       try {
         var mr = await apiFetch('/api/metrics');
         var md = await mr.json();
@@ -7376,7 +7908,7 @@ async function refreshSessions() {
     const r = await apiFetch('/api/sessions');
     const d = await r.json();
     const keys = Object.keys(d);
-    document.getElementById('nav-session-count').textContent = keys.length;
+    var _sc = document.getElementById('nav-session-count'); if (_sc) _sc.textContent = keys.length;
     if (keys.length === 0) {
       document.getElementById('panel-sessions').innerHTML = '<div class="empty-state">No active sessions</div>';
       return;
@@ -7544,7 +8076,7 @@ async function refreshCron() {
         html += '<div class="' + cardCls + '">'
           + '<div class="task-card-header">'
           + '<strong>' + esc(displayName) + '</strong>'
-          + '<div class="toggle' + (enabled ? ' on' : '') + '" onclick="apiPost(\\x27/api/cron/' + encodeURIComponent(job.name) + '/toggle\\x27)"></div>'
+          + '<label class="toggle-switch"><input type="checkbox"' + (enabled ? ' checked' : '') + ' onchange="toggleCronJob(\\x27' + esc(job.name) + '\\x27)"><span class="toggle-slider"></span></label>'
           + '</div>'
           + '<div class="task-card-schedule">' + schedHtml + '</div>'
           + '<div class="task-card-prompt">' + esc(job.prompt || '') + '</div>'
@@ -7896,7 +8428,7 @@ async function refreshProjects() {
     const d = await r.json();
     projectsData = d.projects || [];
     const linkedCount = projectsData.filter(p => p.linked).length;
-    document.getElementById('nav-project-count').textContent = linkedCount || projectsData.length;
+    var _pc = document.getElementById('nav-project-count'); if (_pc) _pc.textContent = linkedCount || projectsData.length;
 
     // Update the project selector in cron modal
     const sel = document.getElementById('cron-workdir');
@@ -8331,7 +8863,8 @@ async function refreshTimers() {
     const r = await apiFetch('/api/timers');
     const d = await r.json();
     const count = Array.isArray(d) ? d.length : 0;
-    document.getElementById('nav-timer-count').textContent = count;
+    var _tc = document.getElementById('nav-timer-count'); if (_tc) _tc.textContent = count;
+    var _ttc = document.getElementById('tab-timer-count'); if (_ttc) { _ttc.textContent = count; _ttc.style.display = count > 0 ? '' : 'none'; }
     if (!Array.isArray(d) || d.length === 0) {
       document.getElementById('panel-timers').innerHTML = '<div class="empty-state">No pending timers</div>';
       return;
@@ -9242,20 +9775,29 @@ function copyToClipboard(text) {
 // ── Refresh orchestrator ──────────────────
 function refreshAll() {
   refreshStatus();
-  refreshSessions();
-  refreshCron();
-  refreshTimers();
   refreshActivity();
-  refreshProjects(); // Always refresh — keeps nav badge + cron dropdown in sync
-  if (currentPage === 'memory') refreshMemory();
+  refreshTeamNav(); // Keep sidebar agent list fresh
+  if (currentPage === 'home') { refreshHomePlan(); refreshTeamPulse(); }
+  if (currentPage === 'automations') { refreshCron(); refreshTimers(); }
+  if (currentPage === 'intelligence') refreshMemory();
+  if (currentPage === 'settings') refreshProjects();
   if (currentPage === 'logs') refreshLogs();
-  if (currentPage === 'metrics') refreshMetrics();
-  if (currentPage === 'self-improve') refreshSelfImprove();
-  if (currentPage === 'team') refreshTeam();
-  if (currentPage === 'daily-plan') refreshDailyPlan();
-  if (currentPage === 'advisor') refreshAdvisorAnalytics();
-  if (currentPage === 'goals') refreshGoalsProgress();
+  if (currentPage === 'agent-detail') renderAgentDetail(currentAgentSlug);
   checkVersion();
+}
+
+// ── Team Nav Refresh ─────────────────────
+async function refreshTeamNav() {
+  try {
+    var officeRes = await apiFetch('/api/office');
+    var data = await officeRes.json();
+    var clem = data.clementine || {};
+    var agents = data.agents || [];
+    // Build team list: primary first, then agents
+    var teamList = [{ name: clem.name || '${name}', slug: '', status: clem.alive ? 'active' : 'offline', isPrimary: true }];
+    agents.forEach(function(a) { teamList.push({ name: a.name, slug: a.slug, status: a.status || 'offline', isPrimary: false }); });
+    renderTeamNav(teamList);
+  } catch(e) { /* silent */ }
 }
 
 // ── Team ──────────────────────────────────
@@ -9588,11 +10130,6 @@ async function refreshTeam() {
 
 var HIRING_PROMPT = "I'd like to hire a new team member. Please interview me to set them up.\\n\\nWalk me through it — ask me about their name, what they'll do, what tools or capabilities they need, which project they should be attached to, and who they should be able to talk to on the team. Keep it conversational — 3 to 5 questions max, one at a time.\\n\\nOnce you have enough info, show me a summary of the proposed config, and when I approve, use create_agent to set them up. Include a detailed system prompt in the personality field that defines their expertise, communication style, and working context.";
 
-function navigateTo(page) {
-  var nav = document.querySelector('.nav-item[data-page="' + page + '"]');
-  if (nav) nav.click();
-}
-
 function startHiringInterview() {
   navigateTo('chat');
   setTimeout(function() {
@@ -9923,6 +10460,8 @@ async function submitAgentForm(e) {
   } catch(e) { toast(String(e), 'error'); }
 }
 
+function confirmDeleteAgent(slug, name) { deleteAgent(slug); }
+
 async function deleteAgent(slug) {
   if (!confirm('Let go of "' + slug + '"? This removes the entire agent directory.')) return;
   try {
@@ -9930,7 +10469,8 @@ async function deleteAgent(slug) {
     var d = await r.json();
     if (d.ok) {
       toast('Deleted agent: ' + slug, 'success');
-      refreshTeam();
+      refreshTeamNav();
+      navigateTo('home');
     } else {
       toast(d.error || 'Failed', 'error');
     }
@@ -9949,7 +10489,8 @@ async function setAgentStatus(slug, status) {
     var d = await r.json();
     if (d.ok) {
       toast(slug + ' → ' + status, 'success');
-      refreshTeam();
+      refreshTeamNav();
+      if (currentPage === 'agent-detail') renderAgentDetail(currentAgentSlug);
     } else {
       toast(d.error || 'Failed', 'error');
     }
@@ -10247,9 +10788,11 @@ async function refreshSelfImprove() {
     const experiments = d.experiments || [];
     const pending = d.pending || [];
 
-    // Update nav badge
+    // Update tab badge
     const badge = document.getElementById('nav-si-pending');
     if (badge) badge.textContent = pending.length || '0';
+    var _sib = document.getElementById('tab-si-pending');
+    if (_sib) { _sib.textContent = pending.length || '0'; _sib.style.display = pending.length > 0 ? '' : 'none'; }
 
     // Status cards
     const cards = document.getElementById('si-status-cards');
@@ -10604,6 +11147,165 @@ async function applyPlanSuggestion(job, change, reason) {
   } catch (err) { toast('Error: ' + err, 'error'); }
 }
 
+// ── Home Page: Today's Plan (compact inline) ─
+async function refreshHomePlan() {
+  var container = document.getElementById('home-plan-content');
+  if (!container) return;
+  try {
+    var r = await apiFetch('/api/plans/today');
+    var d = await r.json();
+    if (!d.ok || !d.plan) {
+      container.innerHTML = '<div class="empty-state" style="padding:16px;font-size:13px">No plan for today yet. Plans are created on the first morning heartbeat.</div>';
+      return;
+    }
+    var plan = d.plan;
+    var urgencyColor = function(u) { return u >= 4 ? 'var(--red)' : u >= 3 ? 'var(--orange)' : u >= 2 ? 'var(--yellow)' : 'var(--text-muted)'; };
+    var urgencyLabel = function(u) { return u >= 5 ? 'CRITICAL' : u >= 4 ? 'HIGH' : u >= 3 ? 'MEDIUM' : u >= 2 ? 'LOW' : 'NICE'; };
+    var html = '';
+    if (plan.summary) {
+      html += '<p style="color:var(--text-secondary);margin:0 0 12px 0;font-size:13px">' + esc(plan.summary) + '</p>';
+    }
+    if (plan.priorities && plan.priorities.length) {
+      for (var i = 0; i < plan.priorities.length; i++) {
+        var p = plan.priorities[i];
+        html += '<div style="display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid var(--border)">';
+        html += '<span style="background:' + urgencyColor(p.urgency) + ';color:#000;font-size:10px;font-weight:700;padding:1px 6px;border-radius:8px;min-width:50px;text-align:center">' + urgencyLabel(p.urgency) + '</span>';
+        html += '<span style="color:var(--text-primary);flex:1;font-size:13px">' + esc(p.action) + '</span>';
+        html += '</div>';
+      }
+    }
+    if (plan.suggestedCronChanges && plan.suggestedCronChanges.length) {
+      html += '<div style="margin-top:12px;font-size:12px;font-weight:600;color:var(--orange);margin-bottom:6px">Suggested Changes</div>';
+      for (var j = 0; j < plan.suggestedCronChanges.length; j++) {
+        var c = plan.suggestedCronChanges[j];
+        html += '<div style="display:flex;align-items:center;gap:8px;padding:4px 0;font-size:12px">';
+        html += '<span style="color:var(--text-primary);font-weight:500">' + esc(c.job) + '</span>';
+        html += '<span style="color:var(--orange)">' + esc(c.change) + '</span>';
+        html += '<button class="btn btn-sm" onclick="applyPlanSuggestion(\\x27' + esc(c.job) + '\\x27,\\x27' + esc(c.change) + '\\x27,\\x27' + esc(c.reason) + '\\x27)" style="font-size:10px;padding:1px 6px">Apply</button>';
+        html += '</div>';
+      }
+    }
+    if (!html) html = '<div class="empty-state">Plan loaded but empty</div>';
+    container.innerHTML = html;
+    // Set date picker
+    var now = new Date();
+    var dp = document.getElementById('plan-date-picker');
+    if (dp) dp.value = now.getFullYear() + '-' + String(now.getMonth()+1).padStart(2,'0') + '-' + String(now.getDate()).padStart(2,'0');
+  } catch (err) {
+    container.innerHTML = '<div class="empty-state">Failed to load plan</div>';
+  }
+}
+
+// ── Home Page: Team Pulse ────────────────
+async function refreshTeamPulse() {
+  var container = document.getElementById('home-team-pulse');
+  var countEl = document.getElementById('team-pulse-count');
+  if (!container) return;
+  try {
+    var r = await apiFetch('/api/office');
+    var data = await r.json();
+    var clem = data.clementine || {};
+    var agents = data.agents || [];
+    var allAgents = [{ name: clem.name || '${name}', slug: '', status: clem.alive ? 'active' : 'offline', isPrimary: true, lastActivity: clem.currentActivity, sessions: clem.sessions || 0, runs: clem.runsToday || 0 }];
+    agents.forEach(function(a) {
+      allAgents.push({ name: a.name, slug: a.slug, status: a.status || 'offline', isPrimary: false, lastActivity: a.lastActivity, sessions: a.sessions || 0, runs: a.crons ? a.crons.length : 0 });
+    });
+    if (countEl) countEl.textContent = allAgents.length + ' agent' + (allAgents.length !== 1 ? 's' : '');
+    var html = '';
+    allAgents.forEach(function(a) {
+      var statusColor = a.status === 'active' ? 'var(--green)' : a.status === 'paused' ? 'var(--yellow)' : a.status === 'error' ? 'var(--red)' : 'var(--text-muted)';
+      var statusLabel = a.status === 'active' ? 'Active' : a.status === 'paused' ? 'Paused' : a.status === 'error' ? 'Error' : 'Offline';
+      var initial = (a.name || '?').charAt(0).toUpperCase();
+      var avatarCls = a.isPrimary ? 'team-nav-avatar primary' : 'team-nav-avatar';
+      html += '<div style="display:flex;align-items:center;gap:10px;padding:8px 4px;border-bottom:1px solid var(--border);cursor:pointer" onclick="navigateTo(\\x27agent-detail\\x27, {agentSlug: \\x27' + esc(a.slug) + '\\x27})">';
+      html += '<div class="' + avatarCls + '" style="width:28px;height:28px;font-size:12px">' + initial + '</div>';
+      html += '<div style="flex:1;min-width:0">';
+      html += '<div style="font-weight:500;font-size:13px;color:var(--text-primary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(a.name) + '</div>';
+      html += '<div style="font-size:11px;color:var(--text-muted)">' + (a.lastActivity ? esc(String(a.lastActivity)) : 'idle') + '</div>';
+      html += '</div>';
+      html += '<div style="display:flex;align-items:center;gap:8px">';
+      html += '<span style="font-size:11px;color:' + statusColor + '">' + statusLabel + '</span>';
+      html += '<div style="width:8px;height:8px;border-radius:50%;background:' + statusColor + '"></div>';
+      html += '</div>';
+      html += '</div>';
+    });
+    container.innerHTML = html || '<div class="empty-state">No agents configured</div>';
+  } catch(e) {
+    container.innerHTML = '<div class="empty-state">Failed to load team</div>';
+  }
+}
+
+// ── Home Page: Metrics Tab ───────────────
+async function refreshHomeMetrics() {
+  var container = document.getElementById('metrics-content-home');
+  if (!container) return;
+  try {
+    var r = await apiFetch('/api/metrics');
+    var d = await r.json();
+    var html = '';
+    // Time saved
+    var hours = d.timeSaved ? d.timeSaved.estimatedHours || 0 : 0;
+    var mins = d.timeSaved ? d.timeSaved.estimatedMinutes || 0 : 0;
+    html += '<div class="card" style="margin-bottom:16px"><div class="card-header">Time Saved</div><div class="card-body">';
+    html += '<div style="font-size:36px;font-weight:700;color:var(--green)">' + (hours >= 1 ? hours + 'h' : mins + 'm') + '</div>';
+    html += '<div style="font-size:12px;color:var(--text-muted);margin-top:4px">' + (d.timeSaved ? d.timeSaved.cronRuns + ' cron runs + ' + d.timeSaved.exchanges + ' exchanges' : '') + '</div>';
+    html += '</div></div>';
+    // Token usage
+    if (d.tokens) {
+      html += '<div class="card" style="margin-bottom:16px"><div class="card-header">Token Usage</div><div class="card-body">';
+      html += '<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:12px">';
+      html += '<div style="text-align:center"><div style="font-size:20px;font-weight:700;color:var(--accent)">' + fmtTokens(d.tokens.total || 0) + '</div><div style="font-size:11px;color:var(--text-muted)">Total</div></div>';
+      html += '<div style="text-align:center"><div style="font-size:20px;font-weight:700;color:var(--text-primary)">' + fmtTokens(d.tokens.input || 0) + '</div><div style="font-size:11px;color:var(--text-muted)">Input</div></div>';
+      html += '<div style="text-align:center"><div style="font-size:20px;font-weight:700;color:var(--text-primary)">' + fmtTokens(d.tokens.output || 0) + '</div><div style="font-size:11px;color:var(--text-muted)">Output</div></div>';
+      html += '</div></div></div>';
+    }
+    // Cron performance
+    if (d.cron) {
+      html += '<div class="card"><div class="card-header">Cron Performance</div><div class="card-body">';
+      html += '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:12px">';
+      html += '<div style="text-align:center"><div style="font-size:20px;font-weight:700">' + (d.cron.totalRuns || 0) + '</div><div style="font-size:11px;color:var(--text-muted)">Total Runs</div></div>';
+      html += '<div style="text-align:center"><div style="font-size:20px;font-weight:700;color:var(--green)">' + (d.cron.successCount || 0) + '</div><div style="font-size:11px;color:var(--text-muted)">Successes</div></div>';
+      html += '<div style="text-align:center"><div style="font-size:20px;font-weight:700;color:var(--red)">' + (d.cron.errorCount || 0) + '</div><div style="font-size:11px;color:var(--text-muted)">Errors</div></div>';
+      var avgDur = d.cron.avgDurationMs ? (d.cron.avgDurationMs / 1000).toFixed(1) + 's' : '—';
+      html += '<div style="text-align:center"><div style="font-size:20px;font-weight:700">' + avgDur + '</div><div style="font-size:11px;color:var(--text-muted)">Avg Duration</div></div>';
+      html += '</div></div></div>';
+    }
+    container.innerHTML = html || '<div class="empty-state">No metrics available</div>';
+  } catch(e) {
+    container.innerHTML = '<div class="empty-state">Failed to load metrics</div>';
+  }
+}
+
+// ── Home Page: Sessions Tab ──────────────
+async function refreshHomeSessions() {
+  var container = document.getElementById('panel-sessions-home');
+  if (!container) return;
+  try {
+    var r = await apiFetch('/api/sessions');
+    var d = await r.json();
+    var keys = Object.keys(d);
+    if (keys.length === 0) { container.innerHTML = '<div class="empty-state">No active sessions</div>'; return; }
+    var html = '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:12px">';
+    keys.forEach(function(key) {
+      var s = d[key];
+      var icon = key.indexOf('discord') >= 0 ? '&#128172;' : key.indexOf('slack') >= 0 ? '&#128488;' : key.indexOf('telegram') >= 0 ? '&#9992;' : key.indexOf('dashboard') >= 0 ? '&#127760;' : '&#128172;';
+      var exchanges = s.exchanges || 0;
+      var lastActive = s.lastActive ? fmtTimeAgo(s.lastActive) : 'unknown';
+      html += '<div class="card" style="padding:12px;cursor:pointer">';
+      html += '<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">';
+      html += '<span style="font-size:16px">' + icon + '</span>';
+      html += '<span style="font-weight:500;font-size:13px">' + esc(key.split(':').pop() || key) + '</span>';
+      html += '</div>';
+      html += '<div style="font-size:12px;color:var(--text-muted)">' + exchanges + ' exchanges · ' + lastActive + '</div>';
+      html += '</div>';
+    });
+    html += '</div>';
+    container.innerHTML = html;
+  } catch(e) {
+    container.innerHTML = '<div class="empty-state">Failed to load sessions</div>';
+  }
+}
+
 // ── Execution Analytics ───────────────────
 async function refreshAdvisorAnalytics() {
   try {
@@ -10931,6 +11633,7 @@ async function refreshSalesforce() {
 }
 
 refreshAll();
+refreshTeamNav();
 populateActivityAgentFilter();
 
 // ── SSE live updates (with 30s fallback poll) ──
@@ -10945,15 +11648,16 @@ try {
       if (evt.type === 'connected') return;
       if (evt.type === 'cron_complete' || evt.type === 'cron_triggered') {
         refreshActivity();
-        if (currentPage === 'cron') refreshCron();
-        if (currentPage === 'team') refreshTeam();
+        if (currentPage === 'automations') refreshCron();
+        refreshTeamNav();
       }
       if (evt.type === 'agent_created' || evt.type === 'agent_updated' || evt.type === 'agent_deleted' || evt.type === 'agent_status') {
-        if (currentPage === 'team') refreshTeam();
+        refreshTeamNav();
         refreshActivity();
+        if (currentPage === 'agent-detail') renderAgentDetail(currentAgentSlug);
       }
       if (evt.type === 'session_cleared') {
-        if (currentPage === 'sessions') refreshSessions();
+        if (currentPage === 'home') refreshSessions();
       }
     } catch(err) { /* ignore */ }
   };
