@@ -8040,7 +8040,9 @@ async function loadAgentDetailTab(tab, slug, isPrimary) {
     try {
       var cronRes = await apiFetch('/api/cron');
       var cronData = await cronRes.json();
-      var jobs = (cronData.jobs || []).filter(function(j) {
+      // Populate global cronJobsData so openEditCronModal can find jobs
+      cronJobsData = cronData.jobs || [];
+      var jobs = cronJobsData.filter(function(j) {
         if (isPrimary) return !j.agent;
         return j.agent === slug;
       });
