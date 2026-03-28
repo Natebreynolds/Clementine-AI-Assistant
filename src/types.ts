@@ -501,6 +501,7 @@ export interface DelegatedTask {
   createdAt: string;
   updatedAt: string;
   result?: string;             // the deliverable once completed
+  goalId?: string;             // linked goal (for goal-driven delegations)
 }
 
 // ── Verbose Level ───────────────────────────────────────────────────

@@ -24,7 +24,7 @@ import matter from 'gray-matter';
 import cron from 'node-cron';
 import type { Gateway } from '../gateway/router.js';
 import { TunnelManager } from './tunnel.js';
-import type { RemoteAccessConfig } from '../types.js';
+import type { RemoteAccessConfig, DelegatedTask } from '../types.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -3919,6 +3919,301 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
     } catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
   });
 
+  // ── Delegation API ────────────────────────────────────────────
+
+  const AGENTS_BASE = path.join(VAULT_DIR, '00-System', 'agents');
+
+  function readAllDelegations(): (DelegatedTask & { _agentDir: string })[] {
+    const all: (DelegatedTask & { _agentDir: string })[] = [];
+    if (!existsSync(AGENTS_BASE)) return all;
+    for (const slug of readdirSync(AGENTS_BASE).filter(d => !d.startsWith('_') && statSync(path.join(AGENTS_BASE, d)).isDirectory())) {
+      const delDir = path.join(AGENTS_BASE, slug, 'delegations');
+      if (!existsSync(delDir)) continue;
+      for (const f of readdirSync(delDir).filter(f => f.endsWith('.json'))) {
+        try {
+          const task = JSON.parse(readFileSync(path.join(delDir, f), 'utf-8')) as DelegatedTask;
+          all.push({ ...task, _agentDir: slug });
+        } catch { continue; }
+      }
+    }
+    return all;
+  }
+
+  // List delegations
+  app.get('/api/delegations', (_req, res) => {
+    try {
+      let delegations = readAllDelegations();
+      const agent = _req.query.agent as string | undefined;
+      const status = _req.query.status as string | undefined;
+      const goalId = _req.query.goalId as string | undefined;
+      if (agent) delegations = delegations.filter(d => d.toAgent === agent || d.fromAgent === agent);
+      if (status) delegations = delegations.filter(d => d.status === status);
+      if (goalId) delegations = delegations.filter(d => d.goalId === goalId);
+      res.json({ ok: true, delegations });
+    } catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
+  });
+
+  // Create delegation
+  app.post('/api/delegations', express.json(), (req, res) => {
+    try {
+      const { fromAgent, toAgent, task, expectedOutput, goalId } = req.body;
+      if (!toAgent || !task) { res.status(400).json({ ok: false, error: 'toAgent and task are required' }); return; }
+      const id = Math.random().toString(16).slice(2, 10);
+      const delDir = path.join(AGENTS_BASE, toAgent, 'delegations');
+      if (!existsSync(delDir)) mkdirSync(delDir, { recursive: true });
+      const delegation: DelegatedTask = {
+        id,
+        fromAgent: fromAgent || 'clementine',
+        toAgent,
+        task,
+        expectedOutput: expectedOutput || '',
+        status: 'pending',
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        goalId: goalId || undefined,
+      };
+      writeFileSync(path.join(delDir, `${id}.json`), JSON.stringify(delegation, null, 2));
+      res.json({ ok: true, delegation });
+    } catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
+  });
+
+  // Update delegation
+  app.put('/api/delegations/:id', express.json(), (req, res) => {
+    try {
+      const all = readAllDelegations();
+      const found = all.find(d => d.id === req.params.id);
+      if (!found) { res.status(404).json({ ok: false, error: 'Delegation not found' }); return; }
+      const filePath = path.join(AGENTS_BASE, found._agentDir, 'delegations', `${found.id}.json`);
+      const { status, result, task, expectedOutput } = req.body;
+      if (status !== undefined) found.status = status;
+      if (result !== undefined) found.result = result;
+      if (task !== undefined) found.task = task;
+      if (expectedOutput !== undefined) found.expectedOutput = expectedOutput;
+      found.updatedAt = new Date().toISOString();
+      const { _agentDir, ...clean } = found;
+      writeFileSync(filePath, JSON.stringify(clean, null, 2));
+      res.json({ ok: true, delegation: clean });
+    } catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
+  });
+
+  // Delete delegation
+  app.delete('/api/delegations/:id', (_req, res) => {
+    try {
+      const all = readAllDelegations();
+      const found = all.find(d => d.id === _req.params.id);
+      if (!found) { res.status(404).json({ ok: false, error: 'Delegation not found' }); return; }
+      unlinkSync(path.join(AGENTS_BASE, found._agentDir, 'delegations', `${found.id}.json`));
+      res.json({ ok: true });
+    } catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
+  });
+
+  // Execute delegation (fire-and-forget)
+  app.post('/api/delegations/:id/execute', async (req, res) => {
+    try {
+      const all = readAllDelegations();
+      const found = all.find(d => d.id === req.params.id);
+      if (!found) { res.status(404).json({ ok: false, error: 'Delegation not found' }); return; }
+      if (found.status === 'in_progress') { res.json({ ok: false, error: 'Already executing' }); return; }
+
+      // Update to in_progress
+      const filePath = path.join(AGENTS_BASE, found._agentDir, 'delegations', `${found.id}.json`);
+      const { _agentDir, ...clean } = found;
+      clean.status = 'in_progress';
+      clean.updatedAt = new Date().toISOString();
+      writeFileSync(filePath, JSON.stringify(clean, null, 2));
+
+      res.json({ ok: true, message: 'Delegation execution started' });
+      broadcastEvent({ type: 'delegation_started', data: { id: found.id, toAgent: found.toAgent } });
+
+      // Fire-and-forget execution
+      const prompt = `You have been delegated the following task:\n\n## Task\n${found.task}\n\n## Expected Output\n${found.expectedOutput || 'Complete the task to the best of your ability.'}\n\nComplete this task now.`;
+      getGateway().then(gw =>
+        gw.handleCronJob(`delegation:${found.id}`, prompt, 2, 15)
+      ).then(result => {
+        clean.status = 'completed';
+        clean.result = result;
+        clean.updatedAt = new Date().toISOString();
+        writeFileSync(filePath, JSON.stringify(clean, null, 2));
+        broadcastEvent({ type: 'delegation_complete', data: { id: found.id, toAgent: found.toAgent, status: 'completed' } });
+      }).catch(err => {
+        clean.status = 'pending';
+        clean.updatedAt = new Date().toISOString();
+        writeFileSync(filePath, JSON.stringify(clean, null, 2));
+        broadcastEvent({ type: 'delegation_complete', data: { id: found.id, toAgent: found.toAgent, status: 'error', error: String(err) } });
+      });
+    } catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
+  });
+
+  // ── Goal-Driven Cron Generation ────────────────────────────────
+
+  app.post('/api/goals/:id/generate-crons', async (req, res) => {
+    try {
+      const goalPath = path.join(GOALS_DIR, `${req.params.id}.json`);
+      if (!existsSync(goalPath)) { res.status(404).json({ ok: false, error: 'Goal not found' }); return; }
+      const goal = JSON.parse(readFileSync(goalPath, 'utf-8'));
+
+      const prompt = `You are analyzing a goal and proposing automated scheduled tasks (cron jobs) to make progress on it.
+
+## Goal: ${goal.title}
+${goal.description || ''}
+
+## Current Status: ${goal.status || 'active'}
+## Priority: ${goal.priority || 'medium'}
+## Owner: ${goal.owner || 'clementine'}
+${goal.nextActions?.length ? `## Next Actions:\n${goal.nextActions.map((a: string) => `- ${a}`).join('\n')}` : ''}
+${goal.blockers?.length ? `## Blockers:\n${goal.blockers.map((b: string) => `- ${b}`).join('\n')}` : ''}
+${goal.linkedCronJobs?.length ? `## Already Linked Cron Jobs:\n${goal.linkedCronJobs.map((j: string) => `- ${j}`).join('\n')}` : ''}
+
+## Instructions
+Propose 1-3 NEW cron jobs that would make automated progress on this goal. For each job, provide:
+- name: A short slug (lowercase, hyphens, no spaces)
+- schedule: A cron expression (e.g., "0 9 * * 1-5" for weekdays 9am)
+- prompt: The detailed task prompt the agent should execute when this job runs
+- tier: 1 (quick, under 10 min) or 2 (thorough, can take longer)
+- rationale: Why this job helps the goal
+
+Respond ONLY with valid JSON:
+{"proposals":[{"name":"...","schedule":"...","prompt":"...","tier":1,"rationale":"..."}]}`;
+
+      const gw = await getGateway();
+      const response = await gw.handleMessage('dashboard:cron-gen', prompt);
+
+      // Parse JSON from response (may be in code fence)
+      let proposals: unknown[] = [];
+      try {
+        const jsonMatch = response.match(/\{[\s\S]*"proposals"[\s\S]*\}/);
+        if (jsonMatch) {
+          const parsed = JSON.parse(jsonMatch[0]);
+          proposals = parsed.proposals || [];
+        }
+      } catch {
+        res.json({ ok: false, error: 'Could not parse LLM response', raw: response.slice(0, 1000) });
+        return;
+      }
+
+      res.json({ ok: true, proposals, goalId: goal.id, goalTitle: goal.title });
+    } catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
+  });
+
+  app.post('/api/goals/:id/approve-crons', express.json(), (req, res) => {
+    try {
+      const goalPath = path.join(GOALS_DIR, `${req.params.id}.json`);
+      if (!existsSync(goalPath)) { res.status(404).json({ ok: false, error: 'Goal not found' }); return; }
+      const goal = JSON.parse(readFileSync(goalPath, 'utf-8'));
+
+      const crons: Array<{ name: string; schedule: string; prompt: string; tier: number }> = req.body.crons || [];
+      if (crons.length === 0) { res.status(400).json({ ok: false, error: 'No crons to approve' }); return; }
+
+      // Read current CRON.md
+      const cronRaw = existsSync(CRON_FILE) ? readFileSync(CRON_FILE, 'utf-8') : '---\njobs: []\n---\n';
+      const parsed = matter(cronRaw);
+      const jobs: Array<Record<string, unknown>> = parsed.data.jobs || [];
+      const existingNames = new Set(jobs.map(j => j.name));
+
+      const added: string[] = [];
+      for (const c of crons) {
+        if (existingNames.has(c.name)) continue;
+        jobs.push({
+          name: c.name,
+          schedule: c.schedule,
+          prompt: c.prompt,
+          enabled: true,
+          tier: c.tier || 1,
+        });
+        added.push(c.name);
+      }
+
+      if (added.length > 0) {
+        parsed.data.jobs = jobs;
+        writeFileSync(CRON_FILE, matter.stringify(parsed.content, parsed.data));
+
+        // Update goal's linkedCronJobs
+        if (!goal.linkedCronJobs) goal.linkedCronJobs = [];
+        for (const name of added) {
+          if (!goal.linkedCronJobs.includes(name)) goal.linkedCronJobs.push(name);
+        }
+        goal.updatedAt = new Date().toISOString();
+        writeFileSync(goalPath, JSON.stringify(goal, null, 2));
+      }
+
+      res.json({ ok: true, added, skipped: crons.length - added.length });
+    } catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
+  });
+
+  // ── Workflow API ───────────────────────────────────────────────
+
+  const WORKFLOWS_DIR = path.join(VAULT_DIR, '00-System', 'workflows');
+  const WORKFLOW_RUNS_DIR = path.join(BASE_DIR, 'workflows', 'runs');
+
+  app.get('/api/workflows', async (_req, res) => {
+    try {
+      const workflows = await cachedAsync('workflows', 10_000, async () => {
+        const { parseAllWorkflows } = await import('../agent/workflow-runner.js');
+        const wfs: Array<Record<string, unknown>> = [];
+        // Global workflows
+        if (existsSync(WORKFLOWS_DIR)) {
+          for (const wf of parseAllWorkflows(WORKFLOWS_DIR)) {
+            wfs.push({ ...wf, scope: 'global' });
+          }
+        }
+        // Agent-scoped workflows
+        if (existsSync(AGENTS_BASE)) {
+          for (const slug of readdirSync(AGENTS_BASE).filter(d => !d.startsWith('_'))) {
+            const wfDir = path.join(AGENTS_BASE, slug, 'workflows');
+            if (!existsSync(wfDir)) continue;
+            for (const wf of parseAllWorkflows(wfDir)) {
+              wfs.push({ ...wf, agentSlug: slug, scope: slug });
+            }
+          }
+        }
+        return wfs;
+      });
+      res.json({ ok: true, workflows });
+    } catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
+  });
+
+  app.post('/api/workflows/:name/run', express.json(), async (req, res) => {
+    try {
+      const name = decodeURIComponent(req.params.name);
+      const { parseAllWorkflows } = await import('../agent/workflow-runner.js');
+      const allWfs = [];
+      if (existsSync(WORKFLOWS_DIR)) allWfs.push(...parseAllWorkflows(WORKFLOWS_DIR));
+      if (existsSync(AGENTS_BASE)) {
+        for (const slug of readdirSync(AGENTS_BASE).filter(d => !d.startsWith('_'))) {
+          const wfDir = path.join(AGENTS_BASE, slug, 'workflows');
+          if (existsSync(wfDir)) allWfs.push(...parseAllWorkflows(wfDir));
+        }
+      }
+      const wf = allWfs.find(w => w.name === name);
+      if (!wf) { res.status(404).json({ ok: false, error: 'Workflow not found: ' + name }); return; }
+
+      const inputs = req.body.inputs || {};
+      res.json({ ok: true, message: `Workflow '${name}' triggered` });
+      broadcastEvent({ type: 'workflow_triggered', data: { name } });
+
+      // Fire-and-forget execution
+      getGateway().then(gw => gw.handleWorkflow(wf, inputs)).then(result => {
+        broadcastEvent({ type: 'workflow_complete', data: { name, status: 'ok', preview: (result || '').slice(0, 300) } });
+      }).catch(err => {
+        broadcastEvent({ type: 'workflow_complete', data: { name, status: 'error', error: String(err) } });
+      });
+    } catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
+  });
+
+  app.get('/api/workflows/:name/runs', (_req, res) => {
+    try {
+      const name = decodeURIComponent(_req.params.name);
+      const safe = name.replace(/[^a-zA-Z0-9_-]/g, '_');
+      const logFile = path.join(WORKFLOW_RUNS_DIR, `${safe}.jsonl`);
+      if (!existsSync(logFile)) { res.json({ ok: true, runs: [] }); return; }
+      const lines = readFileSync(logFile, 'utf-8').trim().split('\n').filter(Boolean);
+      const runs = lines.slice(-20).reverse().map(l => {
+        try { return JSON.parse(l); } catch { return null; }
+      }).filter(Boolean);
+      res.json({ ok: true, runs });
+    } catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
+  });
+
   // ── Reflection Quality Trends API ──────────────────────────────
 
   const CRON_REFLECTIONS_DIR = path.join(BASE_DIR, 'cron', 'reflections');
@@ -6708,6 +7003,7 @@ function getDashboardHTML(token: string): string {
         <button class="active" onclick="switchTab('automations','scheduled')">Scheduled Tasks</button>
         <button onclick="switchTab('automations','timers')">Timers <span class="tab-badge" id="tab-timer-count" style="display:none">0</span></button>
         <button onclick="switchTab('automations','self-improve')">Self-Improve <span class="tab-badge" id="tab-si-pending" style="display:none">0</span></button>
+        <button onclick="switchTab('automations','workflows')">Workflows</button>
         <button onclick="switchTab('automations','analytics')">Execution Analytics</button>
       </div>
       <div id="automations-tab-content">
@@ -6729,6 +7025,9 @@ function getDashboardHTML(token: string): string {
             <div class="card-header">Experiment History</div>
             <div class="card-body" id="si-history-list"><div class="empty-state">No experiments yet</div></div>
           </div>
+        </div>
+        <div class="tab-pane" id="tab-automations-workflows">
+          <div id="panel-workflows"><div class="empty-state">Loading workflows...</div></div>
         </div>
         <div class="tab-pane" id="tab-automations-analytics">
           <div id="advisor-analytics-content"><div class="empty-state">Loading analytics...</div></div>
@@ -7382,6 +7681,53 @@ function getDashboardHTML(token: string): string {
   </div>
 </div>
 
+<!-- ═══ Delegation Modal ═══ -->
+<div class="modal-overlay" id="delegation-modal">
+  <div class="modal" style="width:480px">
+    <div class="modal-header">
+      <h3 id="delegation-modal-title">Delegate Task</h3>
+      <button class="btn-ghost btn-sm" onclick="closeDelegationModal()">&times;</button>
+    </div>
+    <div class="modal-body">
+      <input type="hidden" id="delegation-goal-id" value="">
+      <div class="form-row">
+        <label>Assign to *</label>
+        <select id="delegation-to-agent"></select>
+      </div>
+      <div class="form-row">
+        <label>Task *</label>
+        <textarea id="delegation-task" rows="3" placeholder="What should the agent do?"></textarea>
+      </div>
+      <div class="form-row">
+        <label>Expected Output</label>
+        <textarea id="delegation-expected" rows="2" placeholder="What does the deliverable look like?"></textarea>
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button onclick="closeDelegationModal()">Cancel</button>
+      <button class="btn-primary" onclick="submitDelegation(false)">Create</button>
+      <button class="btn-primary" style="background:var(--green)" onclick="submitDelegation(true)">Create & Execute</button>
+    </div>
+  </div>
+</div>
+
+<!-- ═══ Cron Proposals Modal ═══ -->
+<div class="modal-overlay" id="proposals-modal">
+  <div class="modal" style="width:580px">
+    <div class="modal-header">
+      <h3 id="proposals-modal-title">Generated Task Proposals</h3>
+      <button class="btn-ghost btn-sm" onclick="closeProposalsModal()">&times;</button>
+    </div>
+    <div class="modal-body" id="proposals-modal-body">
+      <div class="empty-state">Generating...</div>
+    </div>
+    <div class="modal-footer">
+      <button onclick="closeProposalsModal()">Cancel</button>
+      <button class="btn-primary" id="proposals-approve-btn" onclick="approveSelectedProposals()" style="display:none">Approve Selected</button>
+    </div>
+  </div>
+</div>
+
 <!-- ═══ Confirm Delete Modal ═══ -->
 <div class="modal-overlay" id="confirm-modal">
   <div class="modal" style="width:380px">
@@ -7590,6 +7936,7 @@ function switchTab(group, tab) {
     if (tab === 'scheduled') refreshCron();
     if (tab === 'timers') refreshTimers();
     if (tab === 'self-improve') refreshSelfImprove();
+    if (tab === 'workflows') refreshWorkflows();
     if (tab === 'analytics') refreshAdvisorAnalytics();
   }
   if (group === 'intelligence') {
@@ -7694,8 +8041,8 @@ async function renderAgentDetail(slug) {
 
     // Tab bar
     html += '<div class="tab-bar" id="agent-detail-tabs">';
-    var tabs = ['schedule', 'activity', 'sessions', 'tools', 'config'];
-    var tabLabels = { schedule: 'Schedule', activity: 'Activity', sessions: 'Sessions', tools: 'Tools & Access', config: 'Config' };
+    var tabs = ['schedule', 'delegations', 'activity', 'sessions', 'tools', 'config'];
+    var tabLabels = { schedule: 'Schedule', delegations: 'Delegations', activity: 'Activity', sessions: 'Sessions', tools: 'Tools & Access', config: 'Config' };
     tabs.forEach(function(t) {
       html += '<button class="' + (t === _agentDetailTab ? 'active' : '') + '" onclick="switchAgentDetailTab(\\x27' + t + '\\x27)">' + tabLabels[t] + '</button>';
     });
@@ -7712,7 +8059,7 @@ async function renderAgentDetail(slug) {
 function switchAgentDetailTab(tab) {
   _agentDetailTab = tab;
   var tabs = document.querySelectorAll('#agent-detail-tabs button');
-  tabs.forEach(function(t) { t.className = t.textContent.trim() === ({ schedule:'Schedule', activity:'Activity', sessions:'Sessions', tools:'Tools & Access', config:'Config' })[tab] ? 'active' : ''; });
+  tabs.forEach(function(t) { t.className = t.textContent.trim() === ({ schedule:'Schedule', delegations:'Delegations', activity:'Activity', sessions:'Sessions', tools:'Tools & Access', config:'Config' })[tab] ? 'active' : ''; });
   loadAgentDetailTab(tab, currentAgentSlug, !currentAgentSlug || currentAgentSlug === '');
 }
 
@@ -7788,6 +8135,7 @@ async function loadAgentDetailTab(tab, slug, isPrimary) {
           html += '<span class="badge" style="background:' + pColor + '20;color:' + pColor + ';font-size:10px">' + esc(g.status || 'active') + '</span>';
           if (g.priority) html += '<span class="badge" style="background:' + priColor + '20;color:' + priColor + ';font-size:10px">' + esc(g.priority) + '</span>';
           html += '<button class="btn btn-sm" onclick="editGoal(\\x27' + esc(g.id) + '\\x27)" style="font-size:10px;padding:2px 8px">Edit</button>';
+          html += '<button class="btn btn-sm" onclick="generateGoalCrons(\\x27' + esc(g.id) + '\\x27)" style="font-size:10px;padding:2px 8px;color:var(--accent)">Generate Tasks</button>';
           html += '<button class="btn btn-sm" onclick="deleteGoal(\\x27' + esc(g.id) + '\\x27,\\x27' + esc(g.title).replace(/'/g, '') + '\\x27)" style="font-size:10px;padding:2px 8px;color:var(--red)">Del</button>';
           html += '</div>';
           if (g.nextActions && g.nextActions.length) {
@@ -7802,6 +8150,59 @@ async function loadAgentDetailTab(tab, slug, isPrimary) {
       }
       html += '</div></div>';
     } catch(e) { /* goals optional */ }
+    container.innerHTML = html;
+
+  } else if (tab === 'delegations') {
+    var html = '';
+    try {
+      var delRes = await apiFetch('/api/delegations?agent=' + encodeURIComponent(slug || ''));
+      var delData = await delRes.json();
+      var delegations = delData.delegations || [];
+      var toMe = delegations.filter(function(d) { return d.toAgent === slug; });
+      var fromMe = delegations.filter(function(d) { return d.fromAgent === slug; });
+
+      // Assigned to this agent
+      html += '<div class="card" style="margin-bottom:16px"><div class="card-header" style="display:flex;justify-content:space-between;align-items:center"><span>Assigned Tasks (' + toMe.length + ')</span>';
+      html += '<button class="btn btn-sm btn-primary" onclick="openDelegationModal(\\x27' + esc(slug || '') + '\\x27)" style="font-size:11px">+ Delegate Task</button></div>';
+      html += '<div class="card-body" style="padding:0">';
+      if (toMe.length === 0) {
+        html += '<div class="empty-state" style="padding:24px">No tasks assigned</div>';
+      } else {
+        toMe.forEach(function(d) {
+          var sColor = d.status === 'completed' ? 'var(--green)' : d.status === 'in_progress' ? 'var(--accent)' : 'var(--text-muted)';
+          var sBadge = d.status === 'completed' ? 'badge-green' : d.status === 'in_progress' ? 'badge-orange' : 'badge-gray';
+          html += '<div style="padding:12px 16px;border-bottom:1px solid var(--border)">';
+          html += '<div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">';
+          html += '<span class="badge ' + sBadge + '" style="font-size:10px">' + esc(d.status) + '</span>';
+          html += '<span style="font-weight:500;font-size:13px;color:var(--text-primary);flex:1">' + esc(d.task) + '</span>';
+          if (d.status === 'pending') html += '<button class="btn btn-sm" onclick="executeDelegation(\\x27' + esc(d.id) + '\\x27)" style="font-size:10px;color:var(--green)">Execute</button>';
+          if (d.status === 'pending') html += '<button class="btn btn-sm" onclick="deleteDelegation(\\x27' + esc(d.id) + '\\x27)" style="font-size:10px;color:var(--red)">Del</button>';
+          html += '</div>';
+          if (d.expectedOutput) html += '<div style="font-size:12px;color:var(--text-muted);margin-bottom:4px">Expected: ' + esc(d.expectedOutput) + '</div>';
+          html += '<div style="font-size:11px;color:var(--text-muted)">From: ' + esc(d.fromAgent) + ' &middot; ' + fmtTimeAgo(d.updatedAt || d.createdAt) + '</div>';
+          if (d.status === 'completed' && d.result) {
+            html += '<details style="margin-top:8px"><summary style="cursor:pointer;font-size:12px;color:var(--accent)">View Result</summary>';
+            html += '<div style="margin-top:4px;padding:8px;background:var(--bg-input);border-radius:var(--radius-sm);font-size:12px;color:var(--text-secondary);max-height:200px;overflow-y:auto;white-space:pre-wrap">' + esc(d.result) + '</div></details>';
+          }
+          html += '</div>';
+        });
+      }
+      html += '</div></div>';
+
+      // Delegated from this agent
+      if (fromMe.length > 0) {
+        html += '<div class="card"><div class="card-header">Delegated by ' + esc(a ? a.name : slug) + ' (' + fromMe.length + ')</div><div class="card-body" style="padding:0">';
+        fromMe.forEach(function(d) {
+          var sBadge = d.status === 'completed' ? 'badge-green' : d.status === 'in_progress' ? 'badge-orange' : 'badge-gray';
+          html += '<div style="padding:10px 16px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:8px">';
+          html += '<span class="badge ' + sBadge + '" style="font-size:10px">' + esc(d.status) + '</span>';
+          html += '<span style="font-size:13px;color:var(--text-primary);flex:1">' + esc(d.task) + '</span>';
+          html += '<span style="font-size:11px;color:var(--text-muted)">To: ' + esc(d.toAgent) + '</span>';
+          html += '</div>';
+        });
+        html += '</div></div>';
+      }
+    } catch(e) { html += '<div class="empty-state">Failed to load delegations</div>'; }
     container.innerHTML = html;
 
   } else if (tab === 'activity') {
@@ -8888,6 +9289,152 @@ async function unlinkProject(projPath) {
     toast('Project unlinked');
     refreshProjects();
   } catch(e) { toast('Failed: ' + e, 'error'); }
+}
+
+// ── Delegation Modal ──────────────────────
+async function openDelegationModal(prefilledTo, goalId, taskText) {
+  var sel = document.getElementById('delegation-to-agent');
+  sel.innerHTML = '';
+  try {
+    var r = await apiFetch('/api/agents');
+    var agents = await r.json();
+    (agents || []).forEach(function(a) {
+      var opt = document.createElement('option');
+      opt.value = a.slug;
+      opt.textContent = a.name || a.slug;
+      if (a.slug === prefilledTo) opt.selected = true;
+      sel.appendChild(opt);
+    });
+  } catch { /* fallback empty */ }
+  document.getElementById('delegation-goal-id').value = goalId || '';
+  document.getElementById('delegation-task').value = taskText || '';
+  document.getElementById('delegation-expected').value = '';
+  document.getElementById('delegation-modal').classList.add('show');
+}
+
+function closeDelegationModal() {
+  document.getElementById('delegation-modal').classList.remove('show');
+}
+
+async function submitDelegation(andExecute) {
+  var toAgent = document.getElementById('delegation-to-agent').value;
+  var task = document.getElementById('delegation-task').value.trim();
+  if (!toAgent || !task) { toast('Agent and task are required', 'error'); return; }
+  var payload = {
+    fromAgent: currentAgentSlug || 'clementine',
+    toAgent: toAgent,
+    task: task,
+    expectedOutput: document.getElementById('delegation-expected').value.trim(),
+    goalId: document.getElementById('delegation-goal-id').value || undefined,
+  };
+  try {
+    var r = await apiFetch('/api/delegations', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    var d = await r.json();
+    if (!d.ok) { toast(d.error || 'Failed', 'error'); return; }
+    toast('Delegation created');
+    closeDelegationModal();
+    if (andExecute && d.delegation) {
+      var r2 = await apiFetch('/api/delegations/' + d.delegation.id + '/execute', { method: 'POST' });
+      var d2 = await r2.json();
+      if (d2.ok) toast('Execution started');
+      else toast(d2.error || 'Execute failed', 'error');
+    }
+    if (currentAgentSlug !== undefined) renderAgentDetail(currentAgentSlug);
+  } catch(e) { toast(String(e), 'error'); }
+}
+
+async function executeDelegation(id) {
+  try {
+    var r = await apiFetch('/api/delegations/' + id + '/execute', { method: 'POST' });
+    var d = await r.json();
+    if (d.ok) { toast('Execution started'); if (currentAgentSlug !== undefined) renderAgentDetail(currentAgentSlug); }
+    else toast(d.error || 'Failed', 'error');
+  } catch(e) { toast(String(e), 'error'); }
+}
+
+async function deleteDelegation(id) {
+  if (!confirm('Delete this delegation?')) return;
+  try {
+    var r = await apiFetch('/api/delegations/' + id, { method: 'DELETE' });
+    var d = await r.json();
+    if (d.ok) { toast('Delegation deleted'); if (currentAgentSlug !== undefined) renderAgentDetail(currentAgentSlug); }
+    else toast(d.error || 'Failed', 'error');
+  } catch(e) { toast(String(e), 'error'); }
+}
+
+// ── Cron Generation ──────────────────────
+var _proposalsGoalId = '';
+var _proposalsData = [];
+
+async function generateGoalCrons(goalId) {
+  _proposalsGoalId = goalId;
+  _proposalsData = [];
+  document.getElementById('proposals-modal').classList.add('show');
+  document.getElementById('proposals-modal-body').innerHTML = '<div class="empty-state" style="padding:32px"><div style="font-size:14px;color:var(--text-muted);margin-bottom:8px">Analyzing goal and generating task proposals...</div><div style="font-size:12px;color:var(--text-muted)">This may take 30-60 seconds.</div></div>';
+  document.getElementById('proposals-approve-btn').style.display = 'none';
+  try {
+    var r = await apiFetch('/api/goals/' + goalId + '/generate-crons', { method: 'POST' });
+    var d = await r.json();
+    if (!d.ok) {
+      document.getElementById('proposals-modal-body').innerHTML = '<div class="empty-state" style="padding:24px;color:var(--red)">Failed: ' + esc(d.error || 'Unknown error') + (d.raw ? '<br><br><details><summary>Raw response</summary><pre style="margin-top:8px;font-size:11px;white-space:pre-wrap;max-height:200px;overflow-y:auto">' + esc(d.raw) + '</pre></details>' : '') + '</div>';
+      return;
+    }
+    _proposalsData = d.proposals || [];
+    if (_proposalsData.length === 0) {
+      document.getElementById('proposals-modal-body').innerHTML = '<div class="empty-state" style="padding:24px">No proposals generated. The goal may already be well-covered by existing cron jobs.</div>';
+      return;
+    }
+    document.getElementById('proposals-modal-title').textContent = 'Proposals for: ' + esc(d.goalTitle || '');
+    var html = '';
+    _proposalsData.forEach(function(p, i) {
+      var schedLabel = (typeof describeCron === 'function' ? describeCron(p.schedule) : null) || p.schedule;
+      html += '<div style="padding:12px;border:1px solid var(--border);border-radius:var(--radius);margin-bottom:10px;background:var(--bg-secondary)">';
+      html += '<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">';
+      html += '<input type="checkbox" id="proposal-' + i + '" checked>';
+      html += '<span style="font-weight:600;font-size:14px;color:var(--text-primary)">' + esc(p.name) + '</span>';
+      html += '<span class="badge" style="font-size:10px">Tier ' + (p.tier || 1) + '</span>';
+      html += '</div>';
+      html += '<div style="font-size:12px;color:var(--text-muted);margin-bottom:4px">Schedule: ' + esc(schedLabel) + '</div>';
+      if (p.rationale) html += '<div style="font-size:12px;color:var(--text-secondary);margin-bottom:6px;font-style:italic">' + esc(p.rationale) + '</div>';
+      html += '<div style="font-size:12px;color:var(--text-secondary);padding:8px;background:var(--bg-input);border-radius:var(--radius-sm);white-space:pre-wrap;max-height:100px;overflow-y:auto">' + esc(p.prompt) + '</div>';
+      html += '</div>';
+    });
+    document.getElementById('proposals-modal-body').innerHTML = html;
+    document.getElementById('proposals-approve-btn').style.display = '';
+  } catch(e) {
+    document.getElementById('proposals-modal-body').innerHTML = '<div class="empty-state" style="padding:24px;color:var(--red)">Error: ' + esc(String(e)) + '</div>';
+  }
+}
+
+function closeProposalsModal() {
+  document.getElementById('proposals-modal').classList.remove('show');
+}
+
+async function approveSelectedProposals() {
+  var selected = [];
+  _proposalsData.forEach(function(p, i) {
+    var cb = document.getElementById('proposal-' + i);
+    if (cb && cb.checked) selected.push(p);
+  });
+  if (selected.length === 0) { toast('No proposals selected', 'error'); return; }
+  try {
+    var r = await apiFetch('/api/goals/' + _proposalsGoalId + '/approve-crons', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ crons: selected }),
+    });
+    var d = await r.json();
+    if (d.ok) {
+      toast(d.added.length + ' task(s) created' + (d.skipped > 0 ? ', ' + d.skipped + ' skipped (duplicates)' : ''));
+      closeProposalsModal();
+      if (typeof refreshGoalsProgress === 'function') refreshGoalsProgress();
+      if (typeof refreshCron === 'function') refreshCron();
+    } else { toast(d.error || 'Failed', 'error'); }
+  } catch(e) { toast(String(e), 'error'); }
 }
 
 // ── Goal Modal ────────────────────────────
@@ -11322,6 +11869,102 @@ async function restoreRevision(slug, revId) {
 }
 
 // ── Self-Improvement ──────────────────────
+// ── Workflows Tab ────────────────────────
+async function refreshWorkflows() {
+  var container = document.getElementById('panel-workflows');
+  if (!container) return;
+  container.innerHTML = '<div class="empty-state">Loading workflows...</div>';
+  try {
+    var r = await apiFetch('/api/workflows');
+    var data = await r.json();
+    var workflows = data.workflows || [];
+    if (workflows.length === 0) {
+      container.innerHTML = '<div class="empty-state">No workflows defined. Create .md files in vault/00-System/workflows/</div>';
+      return;
+    }
+    var html = '';
+    workflows.forEach(function(wf) {
+      var triggerLabel = wf.trigger && wf.trigger.schedule ? describeCron(wf.trigger.schedule) || wf.trigger.schedule : 'Manual only';
+      var stepCount = wf.steps ? wf.steps.length : 0;
+      html += '<div class="card" style="margin-bottom:12px">';
+      html += '<div class="card-header" style="display:flex;align-items:center;gap:10px">';
+      html += '<span style="flex:1;font-weight:600">' + esc(wf.name) + '</span>';
+      if (wf.scope && wf.scope !== 'global') html += '<span class="badge" style="font-size:10px">' + esc(wf.scope) + '</span>';
+      html += '<span class="badge ' + (wf.enabled ? 'badge-green' : 'badge-gray') + '" style="font-size:10px">' + (wf.enabled ? 'Enabled' : 'Disabled') + '</span>';
+      html += '<button class="btn btn-sm" onclick="runWorkflow(\\x27' + esc(wf.name) + '\\x27)" style="font-size:10px;color:var(--green)">Run</button>';
+      html += '<button class="btn btn-sm" onclick="showWorkflowRuns(\\x27' + esc(wf.name) + '\\x27)" style="font-size:10px">History</button>';
+      html += '</div>';
+      html += '<div class="card-body">';
+      if (wf.description) html += '<div style="font-size:13px;color:var(--text-secondary);margin-bottom:8px">' + esc(wf.description) + '</div>';
+      html += '<div style="display:flex;align-items:center;gap:12px;font-size:12px;color:var(--text-muted);margin-bottom:8px">';
+      html += '<span>Trigger: ' + esc(triggerLabel) + '</span>';
+      html += '<span>' + stepCount + ' step' + (stepCount !== 1 ? 's' : '') + '</span>';
+      if (wf.inputs && Object.keys(wf.inputs).length > 0) html += '<span>' + Object.keys(wf.inputs).length + ' input' + (Object.keys(wf.inputs).length !== 1 ? 's' : '') + '</span>';
+      html += '</div>';
+      // Step pipeline visualization
+      if (wf.steps && wf.steps.length > 0) {
+        html += '<div style="display:flex;align-items:center;gap:4px;padding:6px 0;overflow-x:auto;flex-wrap:wrap">';
+        wf.steps.forEach(function(step, i) {
+          if (i > 0) {
+            var hasDep = step.dependsOn && step.dependsOn.length > 0;
+            html += '<span style="color:var(--text-muted);font-size:12px">' + (hasDep ? '&#8594;' : '&#8644;') + '</span>';
+          }
+          html += '<span style="display:inline-flex;align-items:center;justify-content:center;min-width:28px;height:26px;padding:0 10px;border-radius:13px;background:var(--accent-glow);color:var(--accent);font-size:11px;font-weight:600;white-space:nowrap">' + esc(step.id) + '</span>';
+        });
+        html += '</div>';
+      }
+      html += '<div id="wf-runs-' + esc(wf.name).replace(/[^a-zA-Z0-9]/g, '_') + '" style="display:none"></div>';
+      html += '</div></div>';
+    });
+    container.innerHTML = html;
+  } catch(e) {
+    container.innerHTML = '<div class="empty-state">Failed to load workflows: ' + esc(String(e)) + '</div>';
+  }
+}
+
+async function runWorkflow(name) {
+  // Check if workflow has inputs — if so we'd need a modal, but for simplicity trigger directly
+  try {
+    var r = await apiFetch('/api/workflows/' + encodeURIComponent(name) + '/run', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ inputs: {} }),
+    });
+    var d = await r.json();
+    if (d.ok) toast('Workflow "' + name + '" triggered');
+    else toast(d.error || 'Failed', 'error');
+  } catch(e) { toast(String(e), 'error'); }
+}
+
+async function showWorkflowRuns(name) {
+  var safeId = 'wf-runs-' + name.replace(/[^a-zA-Z0-9]/g, '_');
+  var panel = document.getElementById(safeId);
+  if (!panel) return;
+  if (panel.style.display !== 'none') { panel.style.display = 'none'; return; }
+  panel.style.display = 'block';
+  panel.innerHTML = '<div style="font-size:12px;color:var(--text-muted);padding:8px 0">Loading runs...</div>';
+  try {
+    var r = await apiFetch('/api/workflows/' + encodeURIComponent(name) + '/runs');
+    var data = await r.json();
+    var runs = data.runs || [];
+    if (runs.length === 0) { panel.innerHTML = '<div style="font-size:12px;color:var(--text-muted);padding:8px 0">No runs yet</div>'; return; }
+    var html = '<table style="width:100%;border-collapse:collapse;margin-top:8px"><thead><tr style="border-bottom:1px solid var(--border)"><th style="padding:4px 8px;text-align:left;font-size:11px;color:var(--text-muted)">Run</th><th style="padding:4px 8px;text-align:left;font-size:11px;color:var(--text-muted)">Started</th><th style="padding:4px 8px;text-align:left;font-size:11px;color:var(--text-muted)">Status</th><th style="padding:4px 8px;text-align:left;font-size:11px;color:var(--text-muted)">Duration</th></tr></thead><tbody>';
+    runs.forEach(function(run) {
+      var sBadge = run.status === 'ok' ? 'badge-green' : run.status === 'error' ? 'badge-red' : 'badge-gray';
+      var durMs = run.finishedAt && run.startedAt ? new Date(run.finishedAt) - new Date(run.startedAt) : 0;
+      var durLabel = durMs > 0 ? (durMs / 1000).toFixed(1) + 's' : '—';
+      html += '<tr style="border-bottom:1px solid var(--border)">';
+      html += '<td style="padding:4px 8px;font-size:12px;font-family:monospace">' + esc((run.runId || '').slice(0, 8)) + '</td>';
+      html += '<td style="padding:4px 8px;font-size:12px;color:var(--text-muted)">' + fmtTimeAgo(run.startedAt) + '</td>';
+      html += '<td style="padding:4px 8px"><span class="badge ' + sBadge + '" style="font-size:10px">' + esc(run.status || 'unknown') + '</span></td>';
+      html += '<td style="padding:4px 8px;font-size:12px;color:var(--text-muted)">' + durLabel + '</td>';
+      html += '</tr>';
+    });
+    html += '</tbody></table>';
+    panel.innerHTML = html;
+  } catch(e) { panel.innerHTML = '<div style="font-size:12px;color:var(--red);padding:8px 0">Failed: ' + esc(String(e)) + '</div>'; }
+}
+
 async function refreshSelfImprove() {
   try {
     const r = await apiFetch('/api/self-improve');
@@ -12028,6 +12671,7 @@ async function refreshGoalsProgress() {
       html += '<span style="background:' + priorityColor(goal.priority) + ';color:#000;font-size:11px;font-weight:700;padding:2px 10px;border-radius:10px">' + esc(goal.priority) + '</span>';
       if (goal.owner) html += '<span style="font-size:12px;color:var(--text-muted)">Owner: ' + esc(goal.owner) + '</span>';
       html += '<button class="btn btn-sm" onclick="editGoal(\\x27' + esc(goal.id) + '\\x27)" style="font-size:10px;padding:2px 8px">Edit</button>';
+      html += '<button class="btn btn-sm" onclick="generateGoalCrons(\\x27' + esc(goal.id) + '\\x27)" style="font-size:10px;padding:2px 8px;color:var(--accent)">Generate Tasks</button>';
       html += '<button class="btn btn-sm" onclick="deleteGoal(\\x27' + esc(goal.id) + '\\x27,\\x27' + esc(goal.title).replace(/'/g, '') + '\\x27)" style="font-size:10px;padding:2px 8px;color:var(--red)">Del</button>';
       html += '</div>';
       html += '<div class="card-body">';
