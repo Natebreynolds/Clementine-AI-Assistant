@@ -39,6 +39,29 @@ const MEMORY_DB_PATH = path.join(VAULT_DIR, '.memory.db');
 const PROJECTS_META_FILE = path.join(BASE_DIR, 'projects.json');
 const DASHBOARD_PID_FILE = path.join(BASE_DIR, '.dashboard.pid');
 
+// ── Response cache ───────────────────────────────────────────────────
+
+interface CacheEntry<T> { data: T; expires: number; }
+const responseCache = new Map<string, CacheEntry<unknown>>();
+
+function cached<T>(key: string, ttlMs: number, compute: () => T): T {
+  const now = Date.now();
+  const entry = responseCache.get(key) as CacheEntry<T> | undefined;
+  if (entry && now < entry.expires) return entry.data;
+  const data = compute();
+  responseCache.set(key, { data, expires: now + ttlMs });
+  return data;
+}
+
+async function cachedAsync<T>(key: string, ttlMs: number, compute: () => Promise<T>): Promise<T> {
+  const now = Date.now();
+  const entry = responseCache.get(key) as CacheEntry<T> | undefined;
+  if (entry && now < entry.expires) return entry.data;
+  const data = await compute();
+  responseCache.set(key, { data, expires: now + ttlMs });
+  return data;
+}
+
 // ── Lazy gateway for chat ────────────────────────────────────────────
 
 let gatewayInstance: Gateway | null = null;
@@ -1179,67 +1202,194 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
     res.json({ content: getLogs(lines) });
   });
 
-  app.get('/api/activity', (_req, res) => {
-    const activities: Array<{ type: string; message: string; time: string; status?: string }> = [];
+  app.get('/api/activity', (req, res) => {
+    const agentFilter = String(req.query.agent || '');
+    const sourceFilter = String(req.query.source || '');
+    const limit = Math.min(Number(req.query.limit) || 50, 200);
+    const before = String(req.query.before || '');
 
-    // Scan cron runs for recent activity
-    const runsDir = path.join(BASE_DIR, 'cron', 'runs');
-    if (existsSync(runsDir)) {
-      try {
-        const files = readdirSync(runsDir).filter(f => f.endsWith('.jsonl'));
-        for (const file of files) {
-          const filePath = path.join(runsDir, file);
-          const lines = readFileSync(filePath, 'utf-8').trim().split('\n').filter(Boolean);
-          const recent = lines.slice(-5);
-          for (const line of recent) {
-            try {
-              const entry = JSON.parse(line);
-              activities.push({
-                type: 'cron',
-                message: (entry.jobName || file.replace('.jsonl', '')) + (entry.status === 'ok' ? ' completed' : ' failed'),
-                time: entry.finishedAt || entry.startedAt || '',
-                status: entry.status,
-              });
-            } catch { /* skip bad lines */ }
-          }
-        }
-      } catch { /* ignore */ }
-    }
+    const data = cached('activity:' + agentFilter + ':' + sourceFilter + ':' + before, 5_000, () => {
+      const events: Array<{
+        source: string; eventType: string; agentSlug: string | null;
+        title: string; body: string; timestamp: string; status: string;
+      }> = [];
 
-    // Scan recent log lines for chat messages and heartbeat events
-    const logFile = path.join(BASE_DIR, 'logs', 'clementine.log');
-    if (existsSync(logFile)) {
-      try {
-        const content = readFileSync(logFile, 'utf-8');
-        const logLines = content.split('\n').filter(Boolean).slice(-200);
-        for (const line of logLines) {
+      // ── Cron runs from JSONL files ──
+      if (!sourceFilter || sourceFilter === 'cron') {
+        const runsDir = path.join(BASE_DIR, 'cron', 'runs');
+        if (existsSync(runsDir)) {
           try {
-            const entry = JSON.parse(line);
-            const msg = entry.msg || '';
-            const logTime = typeof entry.time === 'number' ? new Date(entry.time).toISOString() : String(entry.time || '');
-            if (msg.includes('chat') || msg.includes('message') || msg.includes('gateway')) {
-              activities.push({
-                type: 'chat',
-                message: msg,
-                time: logTime,
-                status: 'ok',
-              });
-            } else if (msg.includes('heartbeat') || msg.includes('cron')) {
-              activities.push({
-                type: 'system',
-                message: msg,
-                time: logTime,
-                status: 'ok',
-              });
-            }
-          } catch { /* skip non-JSON lines */ }
-        }
-      } catch { /* ignore */ }
-    }
+            const files = readdirSync(runsDir).filter(f => f.endsWith('.jsonl'));
+            for (const file of files) {
+              const jobName = file.replace('.jsonl', '');
+              const colonIdx = jobName.indexOf(':');
+              const slug = colonIdx > 0 ? jobName.substring(0, colonIdx) : null;
+              if (agentFilter && slug !== agentFilter && agentFilter !== '__clementine__') continue;
+              if (agentFilter === '__clementine__' && slug) continue;
 
-    // Sort newest-first, limit to 15
-    activities.sort((a, b) => String(b.time || '').localeCompare(String(a.time || '')));
-    res.json({ activities: activities.slice(0, 15) });
+              const filePath = path.join(runsDir, file);
+              const lines = readFileSync(filePath, 'utf-8').trim().split('\n').filter(Boolean);
+              const recent = lines.slice(-20);
+              for (const line of recent) {
+                try {
+                  const e = JSON.parse(line);
+                  const ts = e.finishedAt || e.startedAt || '';
+                  if (before && ts >= before) continue;
+                  events.push({
+                    source: 'cron',
+                    eventType: e.status === 'ok' ? 'cron_ok' : 'cron_error',
+                    agentSlug: slug,
+                    title: (colonIdx > 0 ? jobName.substring(colonIdx + 1) : jobName) + (e.status === 'ok' ? ' completed' : ' failed'),
+                    body: e.outputPreview ? String(e.outputPreview).slice(0, 200) : (e.error ? String(e.error).slice(0, 200) : ''),
+                    timestamp: ts,
+                    status: e.status || 'ok',
+                  });
+                } catch { /* skip */ }
+              }
+            }
+          } catch { /* ignore */ }
+        }
+      }
+
+      // ── SQLite-backed events ──
+      if (existsSync(MEMORY_DB_PATH)) {
+        try {
+          const Database = require('better-sqlite3');
+          const db = new Database(MEMORY_DB_PATH, { readonly: true });
+          try {
+            const agentWhere = agentFilter ? ' AND agent_slug = ?' : '';
+            const agentParams = agentFilter ? [agentFilter] : [];
+            const beforeWhere = before ? ' AND {ts} < ?' : '';
+            const beforeParams = before ? [before] : [];
+
+            // Activities (SDR ops)
+            if (!sourceFilter || sourceFilter === 'activity') {
+              try {
+                const rows = db.prepare(
+                  `SELECT type, agent_slug, subject, detail, performed_at FROM activities
+                   WHERE 1=1${agentWhere}${beforeWhere.replace('{ts}', 'performed_at')}
+                   ORDER BY performed_at DESC LIMIT ?`
+                ).all(...agentParams, ...beforeParams, limit) as Array<Record<string, string>>;
+                for (const r of rows) {
+                  events.push({
+                    source: 'activity', eventType: r.type || 'action', agentSlug: r.agent_slug || null,
+                    title: r.subject || r.type || 'Activity', body: (r.detail || '').slice(0, 200),
+                    timestamp: r.performed_at || '', status: 'ok',
+                  });
+                }
+              } catch { /* table may not exist */ }
+            }
+
+            // Send log
+            if (!sourceFilter || sourceFilter === 'send') {
+              try {
+                const rows = db.prepare(
+                  `SELECT agent_slug, recipient, subject, sent_at FROM send_log
+                   WHERE 1=1${agentWhere}${beforeWhere.replace('{ts}', 'sent_at')}
+                   ORDER BY sent_at DESC LIMIT ?`
+                ).all(...agentParams, ...beforeParams, limit) as Array<Record<string, string>>;
+                for (const r of rows) {
+                  events.push({
+                    source: 'send', eventType: 'email_sent', agentSlug: r.agent_slug || null,
+                    title: r.subject || 'Email sent', body: 'To: ' + (r.recipient || ''),
+                    timestamp: r.sent_at || '', status: 'ok',
+                  });
+                }
+              } catch { /* table may not exist */ }
+            }
+
+            // Approval queue
+            if (!sourceFilter || sourceFilter === 'approval') {
+              try {
+                const rows = db.prepare(
+                  `SELECT agent_slug, action_type, summary, status, requested_at FROM approval_queue
+                   WHERE 1=1${agentWhere}${beforeWhere.replace('{ts}', 'requested_at')}
+                   ORDER BY requested_at DESC LIMIT ?`
+                ).all(...agentParams, ...beforeParams, limit) as Array<Record<string, string>>;
+                for (const r of rows) {
+                  events.push({
+                    source: 'approval', eventType: r.action_type || 'approval',
+                    agentSlug: r.agent_slug || null,
+                    title: r.summary || 'Approval request',
+                    body: 'Status: ' + (r.status || 'pending'),
+                    timestamp: r.requested_at || '', status: r.status || 'pending',
+                  });
+                }
+              } catch { /* table may not exist */ }
+            }
+
+            // Memory extractions
+            if (!sourceFilter || sourceFilter === 'memory') {
+              try {
+                const rows = db.prepare(
+                  `SELECT session_key, tool_name, user_message, extracted_at, agent_slug FROM memory_extractions
+                   WHERE status = 'active'${agentWhere}${beforeWhere.replace('{ts}', 'extracted_at')}
+                   ORDER BY extracted_at DESC LIMIT ?`
+                ).all(...agentParams, ...beforeParams, limit) as Array<Record<string, string>>;
+                for (const r of rows) {
+                  events.push({
+                    source: 'memory', eventType: r.tool_name || 'extraction',
+                    agentSlug: r.agent_slug || null,
+                    title: (r.tool_name || 'Memory').replace(/_/g, ' '),
+                    body: (r.user_message || '').slice(0, 200),
+                    timestamp: r.extracted_at || '', status: 'ok',
+                  });
+                }
+              } catch { /* table may not exist */ }
+            }
+          } finally {
+            db.close();
+          }
+        } catch { /* ignore DB errors */ }
+      }
+
+      // Sort newest-first, deduplicate by timestamp+title, apply limit
+      events.sort((a, b) => (b.timestamp || '').localeCompare(a.timestamp || ''));
+      const seen = new Set<string>();
+      const deduped = events.filter(e => {
+        const key = e.timestamp + '|' + e.title;
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      });
+      const sliced = deduped.slice(0, limit);
+      const hasMore = deduped.length > limit;
+
+      return { events: sliced, hasMore };
+    }); // end cached
+
+    res.json(data);
+  });
+
+  // ── Server-Sent Events ────────────────────────────────────────
+
+  const sseClients = new Set<express.Response>();
+
+  function broadcastEvent(event: { type: string; data?: unknown }) {
+    const msg = `data: ${JSON.stringify(event)}\n\n`;
+    for (const client of sseClients) {
+      try { client.write(msg); } catch { sseClients.delete(client); }
+    }
+  }
+
+  app.get('/api/events', (req, res) => {
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      'Connection': 'keep-alive',
+    });
+    res.write('data: {"type":"connected"}\n\n');
+    sseClients.add(res);
+
+    // Heartbeat every 30s to keep connection alive
+    const heartbeat = setInterval(() => {
+      try { res.write(': heartbeat\n\n'); } catch { clearInterval(heartbeat); sseClients.delete(res); }
+    }, 30_000);
+
+    req.on('close', () => {
+      clearInterval(heartbeat);
+      sseClients.delete(res);
+    });
   });
 
   // ── POST routes (actions) ──────────────────────────────────────
@@ -1268,9 +1418,12 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
         if (code && code !== 0) {
           console.error(`[cron-run] '${jobName}' exited with code ${code}: ${stderr.slice(0, 200)}`);
         }
+        broadcastEvent({ type: 'cron_complete', data: { job: jobName, code } });
+        responseCache.delete('activity:');  // Invalidate activity cache
       });
 
       child.unref();
+      broadcastEvent({ type: 'cron_triggered', data: { job: jobName } });
       res.json({ ok: true, message: `Triggered cron job: ${jobName}` });
     } catch (err) {
       res.status(500).json({ error: String(err) });
@@ -1390,6 +1543,7 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
       }
       delete sessions[key];
       writeFileSync(sessionsFile, JSON.stringify(sessions, null, 2));
+      broadcastEvent({ type: 'session_cleared', data: { key } });
       res.json({ ok: true, message: `Cleared session: ${key}` });
     } catch (err) {
       res.status(500).json({ error: String(err) });
@@ -1914,6 +2068,17 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
         { key: 'MS_CLIENT_ID', label: 'Client ID', hint: 'Azure app registration client ID' },
         { key: 'MS_CLIENT_SECRET', label: 'Client Secret', hint: 'Azure app registration secret', type: 'password' },
         { key: 'MS_USER_EMAIL', label: 'User Email', hint: 'Email address for mail/calendar access' },
+      ],
+    },
+    {
+      label: 'Salesforce',
+      keys: [
+        { key: 'SF_INSTANCE_URL', label: 'Instance URL', hint: 'e.g., https://yourorg.my.salesforce.com' },
+        { key: 'SF_CLIENT_ID', label: 'Client ID', hint: 'Connected App consumer key' },
+        { key: 'SF_CLIENT_SECRET', label: 'Client Secret', hint: 'Connected App consumer secret', type: 'password' },
+        { key: 'SF_USERNAME', label: 'Username', hint: 'Salesforce username for API access' },
+        { key: 'SF_PASSWORD', label: 'Password', hint: 'Password + security token concatenated', type: 'password' },
+        { key: 'SF_API_VERSION', label: 'API Version', hint: 'e.g., v62.0 (default)' },
       ],
     },
     {
@@ -2497,6 +2662,7 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
 
   app.get('/api/office', async (_req, res) => {
     try {
+      const data = await cachedAsync('office', 10_000, async () => {
       const gw = await getGateway();
       const mgr = gw.getAgentManager();
       const allAgents = mgr.listAll();
@@ -2613,7 +2779,7 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
         sessByAgent[slug].totalExchanges += Number(s.exchanges ?? 0);
       }
 
-      // ── Token usage per agent ──
+      // ── Token usage per agent (single batched query) ──
       type TokenAgg = { input: number; output: number };
       const tokensByAgent: Record<string, TokenAgg> = {};
       if (existsSync(MEMORY_DB_PATH)) {
@@ -2622,26 +2788,28 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
           const db = new Database(MEMORY_DB_PATH, { readonly: true });
           const tableExists = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='usage_log'").get();
           if (tableExists) {
-            // Per-agent usage (session_key patterns like "cron:slug:*" or "agent:slug:*")
-            for (const as of agentSlugs) {
-              const row = db.prepare(
-                `SELECT COALESCE(SUM(input_tokens), 0) as ti, COALESCE(SUM(output_tokens), 0) as to_
-                 FROM usage_log WHERE session_key LIKE ? OR session_key LIKE ? OR session_key LIKE ?`,
-              ).get(`cron:${as}:%`, `agent:${as}:%`, `discord:agent:${as}:%`) as { ti: number; to_: number };
-              if (row.ti > 0 || row.to_ > 0) tokensByAgent[as] = { input: row.ti, output: row.to_ };
+            // Build a CASE expression to bucket session_keys into agent slugs
+            const slugList = [...agentSlugs];
+            let caseExpr = 'CASE';
+            for (const s of slugList) {
+              caseExpr += ` WHEN session_key LIKE 'cron:${s}:%' OR session_key LIKE 'agent:${s}:%' OR session_key LIKE 'discord:agent:${s}:%' THEN '${s}'`;
             }
-            // Clementine = everything minus agent-scoped
-            const agentPrefixes = [...agentSlugs].flatMap(s => [`cron:${s}:%`, `agent:${s}:%`, `discord:agent:${s}:%`]);
-            let whereNot = '';
-            const params: string[] = [];
-            if (agentPrefixes.length > 0) {
-              whereNot = ' WHERE ' + agentPrefixes.map(() => 'session_key NOT LIKE ?').join(' AND ');
-              params.push(...agentPrefixes);
+            caseExpr += ` ELSE '__clementine__' END`;
+
+            const rows = db.prepare(
+              `SELECT ${caseExpr} as agent_slug,
+                      COALESCE(SUM(input_tokens), 0) as ti,
+                      COALESCE(SUM(output_tokens), 0) as to_
+               FROM usage_log GROUP BY agent_slug`,
+            ).all() as Array<{ agent_slug: string; ti: number; to_: number }>;
+            for (const row of rows) {
+              if (row.ti > 0 || row.to_ > 0) {
+                tokensByAgent[row.agent_slug] = { input: row.ti, output: row.to_ };
+              }
             }
-            const clemRow = db.prepare(
-              `SELECT COALESCE(SUM(input_tokens), 0) as ti, COALESCE(SUM(output_tokens), 0) as to_ FROM usage_log${whereNot}`,
-            ).get(...params) as { ti: number; to_: number };
-            tokensByAgent['__clementine__'] = { input: clemRow.ti, output: clemRow.to_ };
+            if (!tokensByAgent['__clementine__']) {
+              tokensByAgent['__clementine__'] = { input: 0, output: 0 };
+            }
           }
           db.close();
         } catch { /* ignore */ }
@@ -2711,7 +2879,9 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
         };
       });
 
-      res.json({ clementine: clementineData, agents: agentsData });
+      return { clementine: clementineData, agents: agentsData };
+      }); // end cachedAsync
+      res.json(data);
     } catch (err) {
       res.status(500).json({ error: String(err) });
     }
@@ -2746,6 +2916,8 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
         sendPolicy: sendPolicy || undefined,
         role: role || undefined,
       });
+      responseCache.delete('office');
+      broadcastEvent({ type: 'agent_created', data: { slug: agent.slug } });
       res.json({ ok: true, agent: { slug: agent.slug, name: agent.name } });
     } catch (err) {
       res.status(400).json({ error: String(err) });
@@ -2758,6 +2930,8 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
       const mgr = gw.getAgentManager();
       const { slug } = req.params;
       const agent = mgr.updateAgent(slug, req.body);
+      responseCache.delete('office');
+      broadcastEvent({ type: 'agent_updated', data: { slug: agent.slug } });
       res.json({ ok: true, agent: { slug: agent.slug, name: agent.name } });
     } catch (err) {
       res.status(400).json({ error: String(err) });
@@ -2769,6 +2943,8 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
       const gw = await getGateway();
       const mgr = gw.getAgentManager();
       mgr.deleteAgent(req.params.slug);
+      responseCache.delete('office');
+      broadcastEvent({ type: 'agent_deleted', data: { slug: req.params.slug } });
       res.json({ ok: true });
     } catch (err) {
       res.status(400).json({ error: String(err) });
@@ -3015,6 +3191,8 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
       const gw = await getGateway();
       const mgr = gw.getAgentManager();
       mgr.setStatus(req.params.slug, status);
+      responseCache.delete('office');
+      broadcastEvent({ type: 'agent_status', data: { slug: req.params.slug, status } });
       res.json({ ok: true, status });
     } catch (err) {
       res.status(400).json({ error: String(err) });
@@ -3142,6 +3320,72 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
       res.json({ ok: true, created, skipped, enrolled, errors: errors.slice(0, 20) });
     } catch (err) {
       res.status(500).json({ error: String(err) });
+    }
+  });
+
+  // ── Salesforce CRM endpoints ─────────────────────────────────────────
+
+  app.get('/api/salesforce/status', async (_req, res) => {
+    const envVars = parseEnvFile();
+    const instanceUrl = envVars['SF_INSTANCE_URL'] ?? '';
+    const clientId = envVars['SF_CLIENT_ID'] ?? '';
+    const clientSecret = envVars['SF_CLIENT_SECRET'] ?? '';
+    const username = envVars['SF_USERNAME'] ?? '';
+    const password = envVars['SF_PASSWORD'] ?? '';
+
+    if (!instanceUrl || !clientId || !clientSecret) {
+      res.json({ connected: false, error: 'Salesforce not configured — set SF_INSTANCE_URL, SF_CLIENT_ID, SF_CLIENT_SECRET in Settings' });
+      return;
+    }
+
+    try {
+      const loginHost = instanceUrl.includes('.sandbox.') || instanceUrl.includes('--')
+        ? 'https://test.salesforce.com' : 'https://login.salesforce.com';
+      const body = new URLSearchParams({
+        grant_type: 'password', client_id: clientId,
+        client_secret: clientSecret, username, password,
+      });
+      const tokenRes = await fetch(`${loginHost}/services/oauth2/token`, { method: 'POST', body });
+      if (!tokenRes.ok) {
+        const text = await tokenRes.text();
+        res.json({ connected: false, instanceUrl, error: `Auth failed (${tokenRes.status}): ${text}` });
+        return;
+      }
+      const tokenData = (await tokenRes.json()) as { access_token: string; instance_url: string };
+
+      // Quick API version check to verify connectivity
+      const apiVersion = envVars['SF_API_VERSION'] || 'v62.0';
+      const apiRes = await fetch(`${tokenData.instance_url}/services/data/${apiVersion}/limits`, {
+        headers: { Authorization: `Bearer ${tokenData.access_token}` },
+      });
+      let apiUsage: string | undefined;
+      if (apiRes.ok) {
+        const limits = (await apiRes.json()) as Record<string, { Max: number; Remaining: number }>;
+        if (limits.DailyApiRequests) {
+          const used = limits.DailyApiRequests.Max - limits.DailyApiRequests.Remaining;
+          apiUsage = `${used} / ${limits.DailyApiRequests.Max} daily API requests used`;
+        }
+      }
+
+      res.json({ connected: true, instanceUrl: tokenData.instance_url, username, apiUsage });
+    } catch (err) {
+      res.json({ connected: false, instanceUrl, error: String(err) });
+    }
+  });
+
+  app.get('/api/salesforce/sync-history', async (req, res) => {
+    if (!existsSync(MEMORY_DB_PATH)) return res.json({ history: [] });
+    try {
+      const Database = (await import('better-sqlite3')).default;
+      const db = new Database(MEMORY_DB_PATH, { readonly: true });
+      const limit = Math.min(Number(req.query.limit) || 50, 200);
+      const history = db.prepare(
+        `SELECT * FROM sf_sync_log ORDER BY synced_at DESC LIMIT ?`
+      ).all(limit);
+      db.close();
+      res.json({ history });
+    } catch (err) {
+      res.json({ history: [], error: String(err) });
     }
   });
 
@@ -5917,6 +6161,57 @@ function getDashboardHTML(token: string): string {
     .stat-grid { grid-template-columns: 1fr; }
     .modal { width: 100vw; max-height: 90vh; border-radius: 0; }
   }
+
+  /* Agent detail drawer */
+  .agent-drawer {
+    position: fixed; right: 0; top: 0; width: 480px; height: 100vh;
+    background: var(--bg); border-left: 1px solid var(--border);
+    transform: translateX(100%); transition: transform 0.2s ease;
+    z-index: 1100; display: flex; flex-direction: column;
+    box-shadow: -4px 0 24px rgba(0,0,0,0.3);
+  }
+  .agent-drawer.open { transform: translateX(0); }
+  .agent-drawer-overlay {
+    position: fixed; inset: 0; background: rgba(0,0,0,0.3);
+    z-index: 1099; display: none;
+  }
+  .agent-drawer-overlay.open { display: block; }
+  .drawer-header {
+    display: flex; justify-content: space-between; align-items: center;
+    padding: 16px 20px; border-bottom: 1px solid var(--border);
+    background: var(--bg-secondary);
+  }
+  .drawer-header .close-btn {
+    background: none; border: none; color: var(--text-muted); font-size: 20px;
+    cursor: pointer; padding: 4px 8px; border-radius: 4px;
+  }
+  .drawer-header .close-btn:hover { background: var(--bg-hover); color: var(--text-primary); }
+  .drawer-agent-name { font-weight: 700; font-size: 16px; color: var(--text-primary); }
+  .drawer-agent-desc { font-size: 12px; color: var(--text-muted); margin-top: 2px; }
+  .drawer-tabs {
+    display: flex; border-bottom: 1px solid var(--border);
+    background: var(--bg-secondary); padding: 0 16px;
+  }
+  .drawer-tabs button {
+    background: none; border: none; padding: 10px 14px; font-size: 13px;
+    color: var(--text-muted); cursor: pointer; border-bottom: 2px solid transparent;
+    font-family: inherit; transition: color 0.15s;
+  }
+  .drawer-tabs button:hover { color: var(--text-primary); }
+  .drawer-tabs button.active { color: var(--accent); border-bottom-color: var(--accent); }
+  .drawer-content { flex: 1; overflow-y: auto; padding: 16px 20px; }
+  .drawer-stat-grid {
+    display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-bottom: 16px;
+  }
+  .drawer-stat {
+    background: var(--bg-secondary); border-radius: 8px; padding: 12px;
+    text-align: center; border: 1px solid var(--border);
+  }
+  .drawer-stat-val { font-size: 20px; font-weight: 700; color: var(--text-primary); }
+  .drawer-stat-lbl { font-size: 11px; color: var(--text-muted); margin-top: 2px; }
+  @media (max-width: 600px) {
+    .agent-drawer { width: 100vw; }
+  }
 </style>
 </head>
 <body>
@@ -6002,6 +6297,12 @@ function getDashboardHTML(token: string): string {
       </div>
     </div>
     <div class="nav-section">
+      <div class="nav-section-title">Integrations</div>
+      <div class="nav-item" data-page="salesforce">
+        <span class="nav-icon">&#9729;</span> Salesforce
+      </div>
+    </div>
+    <div class="nav-section">
       <div class="nav-section-title">System</div>
       <div class="nav-item" data-page="sessions">
         <span class="nav-icon">&#128488;</span> Sessions
@@ -6043,7 +6344,22 @@ function getDashboardHTML(token: string): string {
       <div class="summary-grid" id="summary-cards"></div>
       <div class="grid-2">
         <div class="card">
-          <div class="card-header">Live Activity</div>
+          <div class="card-header" style="display:flex;justify-content:space-between;align-items:center">
+            <span>Live Activity</span>
+            <div style="display:flex;gap:6px;align-items:center">
+              <select id="activity-source-filter" onchange="refreshActivity()" style="font-size:11px;padding:2px 6px;border:1px solid var(--border);border-radius:4px;background:var(--bg-secondary);color:var(--text-primary)">
+                <option value="">All Sources</option>
+                <option value="cron">Cron</option>
+                <option value="activity">Activities</option>
+                <option value="send">Emails</option>
+                <option value="approval">Approvals</option>
+                <option value="memory">Memory</option>
+              </select>
+              <select id="activity-agent-filter" onchange="refreshActivity()" style="font-size:11px;padding:2px 6px;border:1px solid var(--border);border-radius:4px;background:var(--bg-secondary);color:var(--text-primary)">
+                <option value="">All Agents</option>
+              </select>
+            </div>
+          </div>
           <div class="card-body" id="panel-activity"><div class="empty-state">Loading...</div></div>
         </div>
         <div class="card">
@@ -6237,6 +6553,27 @@ function getDashboardHTML(token: string): string {
       </details>
     </div>
 
+    <!-- Agent Detail Drawer -->
+    <div class="agent-drawer-overlay" id="agent-drawer-overlay" onclick="closeAgentDrawer()"></div>
+    <div class="agent-drawer" id="agent-drawer">
+      <div class="drawer-header">
+        <div>
+          <div class="drawer-agent-name" id="drawer-agent-name"></div>
+          <div class="drawer-agent-desc" id="drawer-agent-desc"></div>
+        </div>
+        <button class="close-btn" onclick="closeAgentDrawer()">&times;</button>
+      </div>
+      <div class="drawer-tabs" id="drawer-tabs">
+        <button class="active" onclick="switchDrawerTab('overview')">Overview</button>
+        <button onclick="switchDrawerTab('activity')">Activity</button>
+        <button onclick="switchDrawerTab('sessions')">Sessions</button>
+        <button onclick="switchDrawerTab('config')">Config</button>
+      </div>
+      <div class="drawer-content" id="drawer-content">
+        <div class="empty-state">Select an agent</div>
+      </div>
+    </div>
+
     <!-- Agent Create/Edit Modal -->
     <div id="agent-modal" class="modal-overlay">
       <div class="modal" style="width:520px">
@@ -6420,6 +6757,49 @@ function getDashboardHTML(token: string): string {
       <div id="graph-canvas" style="height:500px;border:1px solid var(--border);border-radius:8px;background:#1e1e2e;position:relative"></div>
       <div id="graph-legend" style="display:flex;gap:16px;margin-top:8px;flex-wrap:wrap"></div>
       <div id="graph-detail-panel" style="margin-top:12px"></div>
+    </div>
+
+    <!-- ═══ Salesforce Page ═══ -->
+    <div class="page" id="page-salesforce">
+      <div class="page-title">Salesforce CRM</div>
+
+      <div class="card" style="margin-bottom:20px">
+        <div class="card-header" style="display:flex;align-items:center;gap:8px">
+          <span>Connection Status</span>
+          <span class="badge" id="sf-status-badge" style="font-size:10px">Checking...</span>
+        </div>
+        <div class="card-body" style="padding:16px" id="sf-status-content">
+          <div class="empty-state">Loading...</div>
+        </div>
+      </div>
+
+      <div class="card" style="margin-bottom:20px">
+        <div class="card-header">Sync History</div>
+        <div class="card-body" style="padding:0" id="sf-sync-history">
+          <div class="empty-state" style="padding:24px">Loading...</div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-header">Field Mapping (Lead)</div>
+        <div class="card-body" style="padding:0">
+          <table style="width:100%;border-collapse:collapse">
+            <thead><tr style="border-bottom:1px solid var(--border)">
+              <th style="padding:8px 12px;text-align:left;color:var(--text-muted);font-size:12px">Local Field</th>
+              <th style="padding:8px 12px;text-align:left;color:var(--text-muted);font-size:12px">SF Lead Field</th>
+              <th style="padding:8px 12px;text-align:left;color:var(--text-muted);font-size:12px">Notes</th>
+            </tr></thead>
+            <tbody style="font-size:13px">
+              <tr style="border-bottom:1px solid var(--border)"><td style="padding:8px 12px">name</td><td style="padding:8px 12px">FirstName + LastName</td><td style="padding:8px 12px;color:var(--text-muted)">Split on last space</td></tr>
+              <tr style="border-bottom:1px solid var(--border)"><td style="padding:8px 12px">email</td><td style="padding:8px 12px">Email</td><td style="padding:8px 12px;color:var(--text-muted)">Unique identifier</td></tr>
+              <tr style="border-bottom:1px solid var(--border)"><td style="padding:8px 12px">company</td><td style="padding:8px 12px">Company</td><td style="padding:8px 12px;color:var(--text-muted)">Required in SF (defaults to [Unknown])</td></tr>
+              <tr style="border-bottom:1px solid var(--border)"><td style="padding:8px 12px">title</td><td style="padding:8px 12px">Title</td><td style="padding:8px 12px;color:var(--text-muted)"></td></tr>
+              <tr style="border-bottom:1px solid var(--border)"><td style="padding:8px 12px">status</td><td style="padding:8px 12px">Status</td><td style="padding:8px 12px;color:var(--text-muted)">Mapped via lookup table</td></tr>
+              <tr><td style="padding:8px 12px">source</td><td style="padding:8px 12px">LeadSource</td><td style="padding:8px 12px;color:var(--text-muted)"></td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
     </div>
 
     <!-- ═══ Settings Page ═══ -->
@@ -6778,6 +7158,7 @@ document.querySelectorAll('.nav-item').forEach(item => {
     if (page === 'daily-plan') refreshDailyPlan();
     if (page === 'advisor') refreshAdvisorAnalytics();
     if (page === 'goals') refreshGoalsProgress();
+    if (page === 'salesforce') refreshSalesforce();
     // Close sidebar on mobile after nav
     closeSidebar();
   });
@@ -7968,25 +8349,101 @@ async function refreshTimers() {
 }
 
 // ── Activity Feed ─────────────────────────
-async function refreshActivity() {
+var activityLastTimestamp = '';
+var activityHasMore = false;
+
+var sourceIcons = {
+  cron: '&#9881;',        // gear
+  activity: '&#9889;',    // lightning
+  send: '&#9993;',        // envelope
+  approval: '&#9989;',    // checkmark
+  memory: '&#128218;',    // book
+};
+
+function activityEventHtml(e) {
+  var icon = sourceIcons[e.source] || '&#9679;';
+  var statusCls = e.status === 'ok' || e.status === 'approved' ? 'ok'
+    : (e.status === 'error' || e.eventType === 'cron_error') ? 'error'
+    : e.status === 'pending' ? '' : '';
+  var agentLabel = e.agentSlug ? '<span style="color:var(--accent);font-size:11px;margin-left:4px">[' + esc(e.agentSlug) + ']</span>' : '';
+  return '<div class="timeline-item ' + statusCls + '">'
+    + '<span style="margin-right:6px">' + icon + '</span>'
+    + '<span class="timeline-msg">' + esc(e.title) + agentLabel
+    + (e.body ? '<span style="display:block;font-size:11px;color:var(--text-muted);margin-top:2px;max-width:400px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(e.body) + '</span>' : '')
+    + '</span>'
+    + '<span class="timeline-time">' + timeAgo(e.timestamp) + '</span>'
+    + '</div>';
+}
+
+async function refreshActivity(append) {
   try {
-    const r = await apiFetch('/api/activity');
-    const d = await r.json();
-    const activities = d.activities || [];
-    if (activities.length === 0) {
-      document.getElementById('panel-activity').innerHTML = '<div class="empty-state">No recent activity</div>';
+    var sourceEl = document.getElementById('activity-source-filter');
+    var agentEl = document.getElementById('activity-agent-filter');
+    var source = sourceEl ? sourceEl.value : '';
+    var agent = agentEl ? agentEl.value : '';
+    var params = '?limit=30';
+    if (source) params += '&source=' + source;
+    if (agent) params += '&agent=' + agent;
+    if (append && activityLastTimestamp) params += '&before=' + encodeURIComponent(activityLastTimestamp);
+
+    var r = await apiFetch('/api/activity' + params);
+    var d = await r.json();
+    var events = d.events || [];
+    activityHasMore = d.hasMore || false;
+
+    if (events.length > 0) {
+      activityLastTimestamp = events[events.length - 1].timestamp;
+    }
+
+    var panel = document.getElementById('panel-activity');
+    if (!panel) return;
+
+    if (events.length === 0 && !append) {
+      panel.innerHTML = '<div class="empty-state">No recent activity</div>';
       return;
     }
-    let html = '<div class="timeline">';
-    for (const a of activities) {
-      var statusCls = a.status === 'ok' ? 'ok' : a.status === 'error' ? 'error' : '';
-      html += '<div class="timeline-item ' + statusCls + '">'
-        + '<span class="timeline-msg">' + esc(a.message) + '</span>'
-        + '<span class="timeline-time">' + timeAgo(a.time) + '</span>'
-        + '</div>';
+
+    var html = '';
+    if (!append) html = '<div class="timeline" id="activity-timeline">';
+    for (var i = 0; i < events.length; i++) {
+      html += activityEventHtml(events[i]);
     }
-    html += '</div>';
-    document.getElementById('panel-activity').innerHTML = html;
+    if (!append) {
+      if (activityHasMore) {
+        html += '<div style="text-align:center;padding:8px"><button class="btn btn-sm" onclick="refreshActivity(true)">Load more</button></div>';
+      }
+      html += '</div>';
+      panel.innerHTML = html;
+    } else {
+      var timeline = document.getElementById('activity-timeline');
+      if (timeline) {
+        // Remove old load-more button
+        var oldBtn = timeline.querySelector('[onclick="refreshActivity(true)"]');
+        if (oldBtn && oldBtn.parentElement) oldBtn.parentElement.remove();
+        // Append new events
+        timeline.insertAdjacentHTML('beforeend', html);
+        if (activityHasMore) {
+          timeline.insertAdjacentHTML('beforeend', '<div style="text-align:center;padding:8px"><button class="btn btn-sm" onclick="refreshActivity(true)">Load more</button></div>');
+        }
+      }
+    }
+  } catch(e) { }
+}
+
+// Populate agent filter dropdown from office data
+async function populateActivityAgentFilter() {
+  try {
+    var r = await apiFetch('/api/office');
+    var d = await r.json();
+    var sel = document.getElementById('activity-agent-filter');
+    if (!sel) return;
+    var opts = '<option value="">All Agents</option>';
+    opts += '<option value="__clementine__">Clementine</option>';
+    var agents = d.agents || [];
+    for (var i = 0; i < agents.length; i++) {
+      opts += '<option value="' + esc(agents[i].slug) + '">' + esc(agents[i].name) + '</option>';
+    }
+    sel.innerHTML = opts;
   } catch(e) { }
 }
 
@@ -8958,7 +9415,7 @@ async function refreshTeam() {
           // Health indicator placeholder
           var healthBadge = '<span class="desk-health-badge" id="health-' + a.slug + '"></span>';
 
-          return '<div class="desk-station ' + statusClass + '" data-agent-slug="' + a.slug + '">' +
+          return '<div class="desk-station ' + statusClass + '" data-agent-slug="' + a.slug + '" onclick="openAgentDrawer(\\'' + a.slug + '\\')" style="cursor:pointer">' +
             '<div class="desk-surface">' +
               '<div class="desk-monitor">' +
                 '<div class="monitor-channel">' + channelDisplay + '</div>' +
@@ -9014,6 +9471,28 @@ async function refreshTeam() {
               el.innerHTML = h.overall === 'critical' ? '!' : '?';
             }
           }).catch(function() {});
+          // Budget progress bar
+          if (a.budgetMonthlyCents > 0) {
+            apiFetch('/api/agents/' + a.slug + '/budget').then(function(r) { return r.json(); }).then(function(b) {
+              if (!b) return;
+              var el = document.getElementById('kpi-' + a.slug);
+              if (!el) return;
+              var pct = Math.min(100, Math.round((b.spentCents / a.budgetMonthlyCents) * 100));
+              var color = pct > 90 ? 'var(--red)' : pct > 70 ? 'var(--yellow)' : 'var(--green)';
+              var costDollars = (b.spentCents / 100).toFixed(2);
+              var budgetDollars = (a.budgetMonthlyCents / 100).toFixed(2);
+              el.innerHTML = (el.innerHTML || '') +
+                '<div style="width:100%;margin-top:6px;padding:0 4px">' +
+                  '<div style="display:flex;justify-content:space-between;font-size:10px;color:var(--text-muted);margin-bottom:2px">' +
+                    '<span>$' + costDollars + ' / $' + budgetDollars + '</span>' +
+                    '<span style="color:' + color + '">' + pct + '%</span>' +
+                  '</div>' +
+                  '<div style="height:4px;background:var(--bg-input);border-radius:2px;overflow:hidden">' +
+                    '<div style="width:' + pct + '%;height:100%;background:' + color + ';transition:width 0.3s"></div>' +
+                  '</div>' +
+                '</div>';
+            }).catch(function() {});
+          }
         });
       }
     }
@@ -9474,6 +9953,288 @@ async function setAgentStatus(slug, status) {
     } else {
       toast(d.error || 'Failed', 'error');
     }
+  } catch(e) { toast(String(e), 'error'); }
+}
+
+// ── Agent Detail Drawer ──────────────────
+var drawerSlug = '';
+var drawerTab = 'overview';
+var drawerAgentData = null;
+
+function openAgentDrawer(slug) {
+  drawerSlug = slug;
+  drawerTab = 'overview';
+  document.getElementById('agent-drawer').classList.add('open');
+  document.getElementById('agent-drawer-overlay').classList.add('open');
+  // Set active tab
+  var tabs = document.querySelectorAll('#drawer-tabs button');
+  tabs.forEach(function(t, i) { t.className = i === 0 ? 'active' : ''; });
+  // Find agent data from the last /api/office fetch
+  drawerAgentData = null;
+  apiFetch('/api/office').then(function(r) { return r.json(); }).then(function(d) {
+    var agents = d.agents || [];
+    for (var i = 0; i < agents.length; i++) {
+      if (agents[i].slug === slug) { drawerAgentData = agents[i]; break; }
+    }
+    document.getElementById('drawer-agent-name').textContent = drawerAgentData ? drawerAgentData.name : slug;
+    document.getElementById('drawer-agent-desc').textContent = drawerAgentData ? (drawerAgentData.description || '') : '';
+    loadDrawerTab('overview');
+  }).catch(function() {
+    document.getElementById('drawer-agent-name').textContent = slug;
+    loadDrawerTab('overview');
+  });
+}
+
+function closeAgentDrawer() {
+  document.getElementById('agent-drawer').classList.remove('open');
+  document.getElementById('agent-drawer-overlay').classList.remove('open');
+  drawerSlug = '';
+}
+
+function switchDrawerTab(tab) {
+  drawerTab = tab;
+  var tabs = document.querySelectorAll('#drawer-tabs button');
+  tabs.forEach(function(t) {
+    t.className = t.textContent.toLowerCase() === tab ? 'active' : '';
+  });
+  loadDrawerTab(tab);
+}
+
+async function loadDrawerTab(tab) {
+  var el = document.getElementById('drawer-content');
+  if (!el || !drawerSlug) return;
+  el.innerHTML = '<div class="empty-state">Loading...</div>';
+
+  if (tab === 'overview') {
+    await loadDrawerOverview(el);
+  } else if (tab === 'activity') {
+    await loadDrawerActivity(el);
+  } else if (tab === 'sessions') {
+    await loadDrawerSessions(el);
+  } else if (tab === 'config') {
+    await loadDrawerConfig(el);
+  }
+}
+
+async function loadDrawerOverview(el) {
+  var html = '';
+  var a = drawerAgentData;
+
+  // Status + platform info
+  if (a) {
+    var statusColor = a.agentStatus === 'active' ? 'var(--green)' : a.agentStatus === 'paused' ? 'var(--yellow)' : 'var(--red)';
+    html += '<div style="display:flex;gap:8px;align-items:center;margin-bottom:16px">';
+    html += '<span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:' + statusColor + '"></span>';
+    html += '<span style="font-weight:600">' + esc(a.agentStatus || 'unknown') + '</span>';
+    if (a.model) html += '<span class="badge">' + esc(a.model) + '</span>';
+    if (a.project) html += '<span class="badge" style="background:var(--purple);color:#fff">' + esc(a.project) + '</span>';
+    html += '</div>';
+  }
+
+  // Stat cards
+  html += '<div class="drawer-stat-grid">';
+  html += '<div class="drawer-stat"><div class="drawer-stat-val">' + (a && a.crons ? a.crons.runsToday : 0) + '</div><div class="drawer-stat-lbl">Runs Today</div></div>';
+  html += '<div class="drawer-stat"><div class="drawer-stat-val">' + (a && a.sessions ? a.sessions.active : 0) + '</div><div class="drawer-stat-lbl">Sessions</div></div>';
+  var tok = a && a.tokens ? a.tokens.input + a.tokens.output : 0;
+  html += '<div class="drawer-stat"><div class="drawer-stat-val">' + fmtTokens(tok) + '</div><div class="drawer-stat-lbl">Tokens</div></div>';
+  html += '</div>';
+
+  // Budget
+  try {
+    var budgetRes = await apiFetch('/api/agents/' + drawerSlug + '/budget');
+    var budget = await budgetRes.json();
+    if (budget && a && a.budgetMonthlyCents > 0) {
+      var pct = Math.min(100, Math.round((budget.spentCents / a.budgetMonthlyCents) * 100));
+      var bColor = pct > 90 ? 'var(--red)' : pct > 70 ? 'var(--yellow)' : 'var(--green)';
+      html += '<div style="margin-bottom:16px;padding:12px;background:var(--bg-secondary);border-radius:8px;border:1px solid var(--border)">';
+      html += '<div style="font-weight:600;font-size:13px;margin-bottom:8px">Monthly Budget</div>';
+      html += '<div style="display:flex;justify-content:space-between;font-size:12px;color:var(--text-muted);margin-bottom:4px">';
+      html += '<span>$' + (budget.spentCents / 100).toFixed(2) + ' spent</span>';
+      html += '<span>$' + (a.budgetMonthlyCents / 100).toFixed(2) + ' limit</span></div>';
+      html += '<div style="height:8px;background:var(--bg-input);border-radius:4px;overflow:hidden">';
+      html += '<div style="width:' + pct + '%;height:100%;background:' + bColor + ';transition:width 0.3s"></div></div>';
+      html += '<div style="text-align:right;font-size:11px;color:' + bColor + ';margin-top:4px">' + pct + '% used</div>';
+      html += '</div>';
+    }
+  } catch(e) { /* skip */ }
+
+  // Health
+  try {
+    var healthRes = await apiFetch('/api/agents/' + drawerSlug + '/health');
+    var health = await healthRes.json();
+    if (health) {
+      var hColor = health.overall === 'healthy' ? 'var(--green)' : health.overall === 'warning' ? 'var(--yellow)' : 'var(--red)';
+      html += '<div style="margin-bottom:16px;padding:12px;background:var(--bg-secondary);border-radius:8px;border:1px solid var(--border)">';
+      html += '<div style="font-weight:600;font-size:13px;margin-bottom:8px">Health</div>';
+      html += '<div style="display:flex;align-items:center;gap:8px">';
+      html += '<span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:' + hColor + '"></span>';
+      html += '<span style="font-weight:500;color:' + hColor + '">' + esc(health.overall || 'unknown') + '</span>';
+      html += '</div>';
+      if (health.issues && health.issues.length > 0) {
+        html += '<ul style="margin:8px 0 0;padding-left:20px;font-size:12px;color:var(--text-secondary)">';
+        for (var i = 0; i < health.issues.length; i++) {
+          html += '<li>' + esc(health.issues[i]) + '</li>';
+        }
+        html += '</ul>';
+      }
+      html += '</div>';
+    }
+  } catch(e) { /* skip */ }
+
+  // Cron jobs
+  if (a && a.crons && a.crons.jobs && a.crons.jobs.length > 0) {
+    html += '<div style="margin-bottom:16px;padding:12px;background:var(--bg-secondary);border-radius:8px;border:1px solid var(--border)">';
+    html += '<div style="font-weight:600;font-size:13px;margin-bottom:8px">Cron Jobs (' + a.crons.jobs.length + ')</div>';
+    for (var j = 0; j < a.crons.jobs.length; j++) {
+      var job = a.crons.jobs[j];
+      var dotColor = job.totalRuns === 0 ? 'var(--text-muted)' : (job.successes === job.totalRuns ? 'var(--green)' : 'var(--red)');
+      html += '<div style="display:flex;justify-content:space-between;align-items:center;padding:6px 0;border-bottom:1px solid var(--border);font-size:12px">';
+      html += '<div style="display:flex;align-items:center;gap:6px"><span style="display:inline-block;width:6px;height:6px;border-radius:50%;background:' + dotColor + '"></span><span style="font-weight:500">' + esc(job.name) + '</span></div>';
+      html += '<div style="color:var(--text-muted)">' + (job.schedule || '') + ' &middot; ' + fmtTimeAgo(job.lastRun) + '</div>';
+      html += '</div>';
+    }
+    html += '</div>';
+  }
+
+  // Platform connections
+  if (a && (a.hasDiscordToken || a.hasSlackToken)) {
+    html += '<div style="padding:12px;background:var(--bg-secondary);border-radius:8px;border:1px solid var(--border)">';
+    html += '<div style="font-weight:600;font-size:13px;margin-bottom:8px">Platforms</div>';
+    if (a.hasDiscordToken) {
+      var dColor = a.botStatus === 'online' ? 'var(--green)' : 'var(--text-muted)';
+      html += '<div style="display:flex;align-items:center;gap:6px;font-size:12px;padding:4px 0">';
+      html += '<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:' + dColor + '"></span>';
+      html += 'Discord: ' + (a.botTag || a.botStatus || 'configured') + '</div>';
+    }
+    if (a.hasSlackToken) {
+      var sColor = a.slackBotStatus === 'online' ? 'var(--green)' : 'var(--text-muted)';
+      html += '<div style="display:flex;align-items:center;gap:6px;font-size:12px;padding:4px 0">';
+      html += '<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:' + sColor + '"></span>';
+      html += 'Slack: ' + (a.slackBotStatus || 'configured') + '</div>';
+    }
+    html += '</div>';
+  }
+
+  el.innerHTML = html;
+}
+
+async function loadDrawerActivity(el) {
+  try {
+    var r = await apiFetch('/api/activity?agent=' + encodeURIComponent(drawerSlug) + '&limit=30');
+    var d = await r.json();
+    var events = d.events || [];
+    if (events.length === 0) {
+      el.innerHTML = '<div class="empty-state">No recent activity for this agent</div>';
+      return;
+    }
+    var html = '<div class="timeline">';
+    for (var i = 0; i < events.length; i++) {
+      html += activityEventHtml(events[i]);
+    }
+    html += '</div>';
+    el.innerHTML = html;
+  } catch(e) {
+    el.innerHTML = '<div class="empty-state">Failed to load activity</div>';
+  }
+}
+
+async function loadDrawerSessions(el) {
+  try {
+    var r = await apiFetch('/api/sessions');
+    var d = await r.json();
+    // Filter sessions that match this agent
+    var keys = Object.keys(d).filter(function(k) {
+      return k.indexOf(drawerSlug) !== -1;
+    });
+    if (keys.length === 0) {
+      el.innerHTML = '<div class="empty-state">No sessions for this agent</div>';
+      return;
+    }
+    var html = '';
+    for (var i = 0; i < keys.length; i++) {
+      var key = keys[i];
+      var sess = d[key];
+      var info = friendlySession(key);
+      html += '<div class="card" style="margin-bottom:8px;cursor:pointer" onclick="toggleDrawerTranscript(this, \\'' + key.replace(/'/g, "\\\\'") + '\\')">';
+      html += '<div class="card-header" style="display:flex;justify-content:space-between;font-size:12px">';
+      html += '<span>' + info.icon + ' ' + esc(info.label) + '</span>';
+      html += '<span style="color:var(--text-muted)">' + (sess.exchanges || 0) + ' exchanges &middot; ' + fmtTimeAgo(sess.timestamp) + '</span>';
+      html += '</div>';
+      html += '<div class="drawer-transcript" style="display:none;padding:8px;max-height:300px;overflow-y:auto;font-size:12px"></div>';
+      html += '</div>';
+    }
+    el.innerHTML = html;
+  } catch(e) {
+    el.innerHTML = '<div class="empty-state">Failed to load sessions</div>';
+  }
+}
+
+async function toggleDrawerTranscript(card, sessionKey) {
+  var transcriptEl = card.querySelector('.drawer-transcript');
+  if (!transcriptEl) return;
+  if (transcriptEl.style.display === 'none') {
+    transcriptEl.style.display = 'block';
+    if (!transcriptEl.dataset.loaded) {
+      transcriptEl.innerHTML = '<span style="color:var(--text-muted)">Loading...</span>';
+      try {
+        var r = await apiFetch('/api/sessions/' + encodeURIComponent(sessionKey) + '/messages');
+        var msgs = await r.json();
+        if (msgs.length === 0) {
+          transcriptEl.innerHTML = '<span style="color:var(--text-muted)">No messages</span>';
+        } else {
+          var html = '';
+          for (var i = 0; i < msgs.length; i++) {
+            var m = msgs[i];
+            var roleColor = m.role === 'user' ? 'var(--blue)' : 'var(--green)';
+            html += '<div style="margin-bottom:8px"><span style="font-weight:600;color:' + roleColor + '">' + esc(m.role) + '</span>';
+            html += '<span style="color:var(--text-muted);margin-left:6px;font-size:10px">' + fmtTimeAgo(m.created_at) + '</span>';
+            html += '<div style="margin-top:2px;color:var(--text-secondary);white-space:pre-wrap;word-break:break-word">' + esc((m.content || '').slice(0, 500)) + '</div></div>';
+          }
+          transcriptEl.innerHTML = html;
+        }
+      } catch(e) {
+        transcriptEl.innerHTML = '<span style="color:var(--red)">Failed to load</span>';
+      }
+      transcriptEl.dataset.loaded = '1';
+    }
+  } else {
+    transcriptEl.style.display = 'none';
+  }
+}
+
+async function loadDrawerConfig(el) {
+  try {
+    var r = await apiFetch('/api/agents/' + encodeURIComponent(drawerSlug) + '/revisions');
+    var revisions = await r.json();
+    if (!revisions || revisions.length === 0) {
+      el.innerHTML = '<div class="empty-state">No config revisions recorded</div>';
+      return;
+    }
+    var html = '<div style="font-size:12px">';
+    for (var i = 0; i < revisions.length; i++) {
+      var rev = revisions[i];
+      html += '<div style="display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px solid var(--border)">';
+      html += '<div><span style="font-weight:500">' + esc(rev.file_name || 'unknown') + '</span>';
+      html += '<span style="color:var(--text-muted);margin-left:8px">' + (rev.size_bytes ? Math.round(rev.size_bytes / 1024) + ' KB' : '') + '</span></div>';
+      html += '<div style="display:flex;align-items:center;gap:8px">';
+      html += '<span style="color:var(--text-muted)">' + fmtTimeAgo(rev.created_at) + '</span>';
+      html += '<button class="btn btn-sm" onclick="restoreRevision(\\'' + drawerSlug + '\\', ' + rev.id + ')">Restore</button>';
+      html += '</div></div>';
+    }
+    html += '</div>';
+    el.innerHTML = html;
+  } catch(e) {
+    el.innerHTML = '<div class="empty-state">Failed to load config history</div>';
+  }
+}
+
+async function restoreRevision(slug, revId) {
+  if (!confirm('Restore this config revision?')) return;
+  try {
+    var r = await apiFetch('/api/agents/' + slug + '/revisions/' + revId + '/restore', { method: 'POST' });
+    var d = await r.json();
+    if (d.ok) { toast('Revision restored', 'success'); loadDrawerTab('config'); }
+    else toast(d.error || 'Failed', 'error');
   } catch(e) { toast(String(e), 'error'); }
 }
 
@@ -10103,8 +10864,103 @@ async function refreshGoalsProgress() {
   }
 }
 
+async function refreshSalesforce() {
+  // Status
+  try {
+    const r = await apiFetch('/api/salesforce/status');
+    const d = await r.json();
+    const badge = document.getElementById('sf-status-badge');
+    const content = document.getElementById('sf-status-content');
+    if (d.connected) {
+      badge.textContent = 'Connected';
+      badge.style.background = 'var(--green)';
+      badge.style.color = '#fff';
+      var html = '<div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">';
+      html += '<div><div style="font-size:11px;color:var(--text-muted)">Instance</div><div style="font-size:13px">' + esc(d.instanceUrl || '') + '</div></div>';
+      html += '<div><div style="font-size:11px;color:var(--text-muted)">Username</div><div style="font-size:13px">' + esc(d.username || '') + '</div></div>';
+      if (d.apiUsage) {
+        html += '<div style="grid-column:1/-1"><div style="font-size:11px;color:var(--text-muted)">API Usage</div><div style="font-size:13px">' + esc(d.apiUsage) + '</div></div>';
+      }
+      html += '</div>';
+      content.innerHTML = html;
+    } else {
+      badge.textContent = 'Disconnected';
+      badge.style.background = 'var(--red)';
+      badge.style.color = '#fff';
+      content.innerHTML = '<div style="color:var(--text-muted)">' + esc(d.error || 'Not configured') + '</div>'
+        + '<div style="margin-top:8px"><a href="#" onclick="navigateTo(\'settings\');return false" style="color:var(--accent)">Configure in Settings</a></div>';
+    }
+  } catch (err) {
+    document.getElementById('sf-status-content').innerHTML = '<div class="empty-state">Failed to load: ' + esc(String(err)) + '</div>';
+  }
+
+  // Sync history
+  try {
+    const r = await apiFetch('/api/salesforce/sync-history?limit=30');
+    const d = await r.json();
+    const container = document.getElementById('sf-sync-history');
+    if (!d.history?.length) {
+      container.innerHTML = '<div class="empty-state" style="padding:24px">No sync history yet. Use the sf_sync tool or enable the salesforce-sync cron job on an SDR agent.</div>';
+      return;
+    }
+    var html = '<table style="width:100%;border-collapse:collapse"><thead><tr style="border-bottom:1px solid var(--border)">'
+      + '<th style="padding:8px 12px;text-align:left;font-size:12px;color:var(--text-muted)">Time</th>'
+      + '<th style="padding:8px 12px;text-align:left;font-size:12px;color:var(--text-muted)">Direction</th>'
+      + '<th style="padding:8px 12px;text-align:left;font-size:12px;color:var(--text-muted)">Object</th>'
+      + '<th style="padding:8px 12px;text-align:left;font-size:12px;color:var(--text-muted)">SF ID</th>'
+      + '<th style="padding:8px 12px;text-align:left;font-size:12px;color:var(--text-muted)">Status</th>'
+      + '</tr></thead><tbody>';
+    for (const row of d.history) {
+      var statusColor = row.sync_status === 'success' ? 'var(--green)' : row.sync_status === 'error' ? 'var(--red)' : 'var(--orange)';
+      html += '<tr style="border-bottom:1px solid var(--border)">';
+      html += '<td style="padding:6px 12px;font-size:13px">' + new Date(row.synced_at).toLocaleString() + '</td>';
+      html += '<td style="padding:6px 12px;font-size:13px">' + esc(row.sync_direction) + '</td>';
+      html += '<td style="padding:6px 12px;font-size:13px">' + esc(row.sf_object_type) + '</td>';
+      html += '<td style="padding:6px 12px;font-size:13px;font-family:monospace">' + esc(row.sf_id || '') + '</td>';
+      html += '<td style="padding:6px 12px"><span style="color:' + statusColor + ';font-size:12px;font-weight:600">' + esc(row.sync_status) + '</span></td>';
+      html += '</tr>';
+      if (row.error_message) {
+        html += '<tr style="border-bottom:1px solid var(--border)"><td colspan="5" style="padding:4px 12px 8px;font-size:12px;color:var(--red)">' + esc(row.error_message) + '</td></tr>';
+      }
+    }
+    html += '</tbody></table>';
+    container.innerHTML = html;
+  } catch (err) {
+    document.getElementById('sf-sync-history').innerHTML = '<div class="empty-state" style="padding:24px">Failed to load: ' + esc(String(err)) + '</div>';
+  }
+}
+
 refreshAll();
-setInterval(refreshAll, 5000);
+populateActivityAgentFilter();
+
+// ── SSE live updates (with 30s fallback poll) ──
+var sseConnected = false;
+try {
+  var evtSource = new EventSource('/api/events');
+  evtSource.onopen = function() { sseConnected = true; };
+  evtSource.onerror = function() { sseConnected = false; };
+  evtSource.onmessage = function(e) {
+    try {
+      var evt = JSON.parse(e.data);
+      if (evt.type === 'connected') return;
+      if (evt.type === 'cron_complete' || evt.type === 'cron_triggered') {
+        refreshActivity();
+        if (currentPage === 'cron') refreshCron();
+        if (currentPage === 'team') refreshTeam();
+      }
+      if (evt.type === 'agent_created' || evt.type === 'agent_updated' || evt.type === 'agent_deleted' || evt.type === 'agent_status') {
+        if (currentPage === 'team') refreshTeam();
+        refreshActivity();
+      }
+      if (evt.type === 'session_cleared') {
+        if (currentPage === 'sessions') refreshSessions();
+      }
+    } catch(err) { /* ignore */ }
+  };
+} catch(err) { /* SSE not supported */ }
+
+// Fallback poll at 30s if SSE connected, 5s otherwise
+setInterval(function() { refreshAll(); }, sseConnected ? 30000 : 5000);
 </script>
 </body>
 </html>`;
