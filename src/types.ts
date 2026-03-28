@@ -628,6 +628,26 @@ export interface ApprovalRequest {
   resolvedBy?: string;
 }
 
+// ── Salesforce Sync ─────────────────────────────────────────────────
+
+export interface SfSyncRecord {
+  id?: number;
+  localTable: 'leads' | 'activities';
+  localId: number;
+  sfObjectType: 'Lead' | 'Contact' | 'Opportunity' | 'Task' | 'Event';
+  sfId: string;
+  syncDirection: 'push' | 'pull';
+  syncedAt?: string;
+  syncStatus: 'success' | 'error' | 'conflict';
+  errorMessage?: string;
+}
+
+export interface SfFieldMapping {
+  localField: string;
+  sfField: string;
+  direction: 'bidirectional' | 'push-only' | 'pull-only';
+}
+
 // ── Utility types ────────────────────────────────────────────────────
 
 type float = number;

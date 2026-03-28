@@ -241,6 +241,27 @@ jobs:
     enabled: true
     tier: 1
     mode: standard
+
+  - name: salesforce-sync
+    schedule: "0 7,12,17 * * 1-5"
+    prompt: >-
+      You are ${agentName}. Run the Salesforce CRM sync.
+
+      STEP 1 — Run sf_sync with direction='both' to synchronize leads
+      bidirectionally with Salesforce.
+
+      STEP 2 — Review the sync results. If there are errors, log them
+      to the daily note using memory_write. If there is an auth failure
+      or rate limit issue, alert the owner.
+
+      STEP 3 — For any newly pulled leads, check if they match
+      the ICP defined in your playbook. If they do, flag them for
+      outreach consideration.
+
+      Output a brief sync summary as your final response.
+    enabled: false
+    tier: 1
+    mode: standard
 ---
 `;
 
