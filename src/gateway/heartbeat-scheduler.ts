@@ -907,10 +907,15 @@ export class HeartbeatScheduler {
       const line = response.slice(lineStart, lineEnd === -1 ? undefined : lineEnd).trim();
       const summary = line.replace(/\[topic:[^\]]+\]/g, '').trim();
 
+      // Derive agentSlug from topic key — e.g. "ross:appointments" → "ross"
+      const colonIdx = topic.indexOf(':');
+      const agentSlug = colonIdx > 0 ? topic.substring(0, colonIdx) : undefined;
+
       topics.push({
         topic,
         summary,
         reportedAt: new Date().toISOString(),
+        ...(agentSlug ? { agentSlug } : {}),
       });
     }
     return topics;
@@ -993,6 +998,7 @@ export class HeartbeatScheduler {
     priority?: 'high' | 'normal';
     maxTurns?: number;
     tier?: number;
+    agentSlug?: string;
   }): string {
     const queue = HeartbeatScheduler.loadWorkQueue();
     const id = randomBytes(4).toString('hex');
@@ -1006,6 +1012,7 @@ export class HeartbeatScheduler {
       maxTurns: opts.maxTurns ?? 3,
       tier: opts.tier ?? 1,
       status: 'pending',
+      ...(opts.agentSlug ? { agentSlug: opts.agentSlug } : {}),
     };
     queue.push(item);
     HeartbeatScheduler.saveWorkQueue(queue);

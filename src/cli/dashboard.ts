@@ -1197,6 +1197,70 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
     res.json(getHeartbeat());
   });
 
+  app.get('/api/heartbeat/agent/:slug', (req, res) => {
+    const slug = req.params.slug;
+    const state = getHeartbeat() as Record<string, unknown>;
+    const reportedTopics = (state.reportedTopics ?? []) as Array<Record<string, unknown>>;
+    const topics = reportedTopics.filter(
+      (t) => t.agentSlug === slug || (typeof t.topic === 'string' && t.topic.startsWith(slug + ':')),
+    );
+
+    const queueFile = path.join(BASE_DIR, 'heartbeat', 'work-queue.json');
+    let queue: Array<Record<string, unknown>> = [];
+    try {
+      if (existsSync(queueFile)) queue = JSON.parse(readFileSync(queueFile, 'utf-8'));
+    } catch { /* empty */ }
+    const agentQueue = queue.filter((i) => i.agentSlug === slug);
+
+    res.json({
+      topics,
+      workQueue: {
+        items: agentQueue,
+        pending: agentQueue.filter((i) => i.status === 'pending').length,
+        completed: agentQueue.filter((i) => i.status === 'completed').length,
+        failed: agentQueue.filter((i) => i.status === 'failed').length,
+      },
+      lastMention: topics.length > 0 ? topics[topics.length - 1].reportedAt : null,
+      globalState: {
+        lastTick: state.timestamp ?? null,
+        consecutiveSilentBeats: Number(state.consecutiveSilentBeats ?? 0),
+        lastDiscordMessage: state.lastDiscordMessageAt ?? null,
+      },
+    });
+  });
+
+  app.post('/api/heartbeat/queue', (req, res) => {
+    const { description, prompt, priority, agentSlug, maxTurns, tier } = req.body;
+    if (!description || !prompt) {
+      return res.status(400).json({ error: 'description and prompt are required' });
+    }
+    const queueFile = path.join(BASE_DIR, 'heartbeat', 'work-queue.json');
+    const queueDir = path.dirname(queueFile);
+    mkdirSync(queueDir, { recursive: true });
+
+    let queue: Array<Record<string, unknown>> = [];
+    try {
+      if (existsSync(queueFile)) queue = JSON.parse(readFileSync(queueFile, 'utf-8'));
+    } catch { /* start fresh */ }
+
+    const id = randomBytes(4).toString('hex');
+    const item: Record<string, unknown> = {
+      id,
+      description,
+      prompt,
+      source: 'dashboard',
+      priority: priority || 'normal',
+      queuedAt: new Date().toISOString(),
+      maxTurns: Math.min(Number(maxTurns) || 3, 5),
+      tier: Math.min(Number(tier) || 1, 2),
+      status: 'pending',
+    };
+    if (agentSlug) item.agentSlug = agentSlug;
+    queue.push(item);
+    writeFileSync(queueFile, JSON.stringify(queue, null, 2));
+    res.json({ ok: true, id });
+  });
+
   app.get('/api/memory', async (_req, res) => {
     res.json(await getMemory());
   });
@@ -7374,6 +7438,35 @@ function getDashboardHTML(token: string): string {
   </div>
 </div>
 
+<!-- ═══ Heartbeat Queue Modal ═══ -->
+<div class="modal-overlay" id="heartbeat-queue-modal">
+  <div class="modal" style="width:480px">
+    <div class="modal-header">
+      <h3>Queue Heartbeat Work</h3>
+      <button class="btn-ghost btn-sm" onclick="closeHeartbeatQueueModal()">&times;</button>
+    </div>
+    <div class="modal-body">
+      <input type="hidden" id="hbq-agent-slug" value="">
+      <div class="form-row">
+        <label>Description *</label>
+        <input type="text" id="hbq-description" placeholder="Short description of the work">
+      </div>
+      <div class="form-row">
+        <label>Prompt *</label>
+        <textarea id="hbq-prompt" rows="4" placeholder="Detailed instructions for the agent"></textarea>
+      </div>
+      <div class="form-row">
+        <label>Priority</label>
+        <select id="hbq-priority"><option value="normal">Normal</option><option value="high">High (next tick)</option></select>
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button onclick="closeHeartbeatQueueModal()">Cancel</button>
+      <button class="btn-primary" onclick="submitHeartbeatQueue()">Queue Work</button>
+    </div>
+  </div>
+</div>
+
 <!-- ═══ Cron Proposals Modal ═══ -->
 <div class="modal-overlay" id="proposals-modal">
   <div class="modal" style="width:580px">
@@ -7705,8 +7798,8 @@ async function renderAgentDetail(slug) {
 
     // Tab bar
     html += '<div class="tab-bar" id="agent-detail-tabs">';
-    var tabs = ['schedule', 'delegations', 'activity', 'sessions', 'tools', 'config'];
-    var tabLabels = { schedule: 'Schedule', delegations: 'Delegations', activity: 'Activity', sessions: 'Sessions', tools: 'Tools & Access', config: 'Config' };
+    var tabs = ['schedule', 'delegations', 'heartbeat', 'activity', 'sessions', 'tools', 'config'];
+    var tabLabels = { schedule: 'Schedule', delegations: 'Delegations', heartbeat: 'Heartbeat', activity: 'Activity', sessions: 'Sessions', tools: 'Tools & Access', config: 'Config' };
     tabs.forEach(function(t) {
       html += '<button class="' + (t === _agentDetailTab ? 'active' : '') + '" onclick="switchAgentDetailTab(\\x27' + t + '\\x27)">' + tabLabels[t] + '</button>';
     });
@@ -7723,7 +7816,7 @@ async function renderAgentDetail(slug) {
 function switchAgentDetailTab(tab) {
   _agentDetailTab = tab;
   var tabs = document.querySelectorAll('#agent-detail-tabs button');
-  tabs.forEach(function(t) { t.className = t.textContent.trim() === ({ schedule:'Schedule', delegations:'Delegations', activity:'Activity', sessions:'Sessions', tools:'Tools & Access', config:'Config' })[tab] ? 'active' : ''; });
+  tabs.forEach(function(t) { t.className = t.textContent.trim() === ({ schedule:'Schedule', delegations:'Delegations', heartbeat:'Heartbeat', activity:'Activity', sessions:'Sessions', tools:'Tools & Access', config:'Config' })[tab] ? 'active' : ''; });
   loadAgentDetailTab(tab, currentAgentSlug, !currentAgentSlug || currentAgentSlug === '');
 }
 
@@ -7867,6 +7960,74 @@ async function loadAgentDetailTab(tab, slug, isPrimary) {
         html += '</div></div>';
       }
     } catch(e) { html += '<div class="empty-state">Failed to load delegations</div>'; }
+    container.innerHTML = html;
+
+  } else if (tab === 'heartbeat') {
+    var html = '';
+    try {
+      var hbSlug = isPrimary ? '' : slug;
+      var hbRes = await apiFetch('/api/heartbeat/agent/' + encodeURIComponent(hbSlug || '__clementine__'));
+      var hbData = await hbRes.json();
+
+      // Stat cards strip
+      var lastMention = hbData.lastMention ? fmtTimeAgo(hbData.lastMention) : 'Never';
+      var pendingCount = hbData.workQueue ? hbData.workQueue.pending : 0;
+      var silentBeats = hbData.globalState ? hbData.globalState.consecutiveSilentBeats : 0;
+      var lastTick = hbData.globalState && hbData.globalState.lastTick ? fmtTimeAgo(hbData.globalState.lastTick) : 'N/A';
+
+      html += '<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:20px">';
+      html += '<div style="text-align:center;padding:14px;background:var(--bg-secondary);border:1px solid var(--border);border-radius:var(--radius)"><div style="font-size:16px;font-weight:700;color:var(--accent)">' + lastMention + '</div><div style="font-size:11px;color:var(--text-muted)">Last Mention</div></div>';
+      html += '<div style="text-align:center;padding:14px;background:var(--bg-secondary);border:1px solid var(--border);border-radius:var(--radius)"><div style="font-size:24px;font-weight:700;color:' + (pendingCount > 0 ? 'var(--yellow)' : 'var(--green)') + '">' + pendingCount + '</div><div style="font-size:11px;color:var(--text-muted)">Queue Pending</div></div>';
+      html += '<div style="text-align:center;padding:14px;background:var(--bg-secondary);border:1px solid var(--border);border-radius:var(--radius)"><div style="font-size:24px;font-weight:700;color:var(--text-secondary)">' + silentBeats + '</div><div style="font-size:11px;color:var(--text-muted)">Silent Beats</div></div>';
+      html += '<div style="text-align:center;padding:14px;background:var(--bg-secondary);border:1px solid var(--border);border-radius:var(--radius)"><div style="font-size:16px;font-weight:700;color:var(--text-secondary)">' + lastTick + '</div><div style="font-size:11px;color:var(--text-muted)">Last Tick</div></div>';
+      html += '</div>';
+
+      // Heartbeat Activity (reported topics)
+      var topics = hbData.topics || [];
+      html += '<div class="card" style="margin-bottom:16px"><div class="card-header">Heartbeat Activity (' + topics.length + ')</div><div class="card-body" style="padding:0">';
+      if (topics.length === 0) {
+        html += '<div class="empty-state" style="padding:24px">No heartbeat mentions for this agent yet</div>';
+      } else {
+        topics.slice().reverse().forEach(function(t) {
+          var time = t.reportedAt ? new Date(t.reportedAt).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) : '';
+          html += '<div style="display:flex;align-items:flex-start;gap:10px;padding:10px 16px;border-bottom:1px solid var(--border)">';
+          html += '<span style="font-size:12px;color:var(--text-muted);white-space:nowrap;min-width:70px">' + esc(time) + '</span>';
+          html += '<span style="flex:1;font-size:13px;color:var(--text-primary)">' + esc(t.summary || '') + '</span>';
+          html += '<span class="badge badge-gray" style="font-size:10px;white-space:nowrap">' + esc(t.topic || '') + '</span>';
+          html += '</div>';
+        });
+      }
+      html += '</div></div>';
+
+      // Work Queue
+      var queueItems = hbData.workQueue ? hbData.workQueue.items || [] : [];
+      html += '<div class="card"><div class="card-header" style="display:flex;justify-content:space-between;align-items:center"><span>Work Queue (' + queueItems.length + ')</span>';
+      html += '<button class="btn btn-sm btn-primary" onclick="openHeartbeatQueueModal(\\x27' + esc(slug || '') + '\\x27)" style="font-size:11px">+ Queue Work</button></div>';
+      html += '<div class="card-body" style="padding:0">';
+      if (queueItems.length === 0) {
+        html += '<div class="empty-state" style="padding:24px">No queued work for this agent</div>';
+      } else {
+        html += '<table style="width:100%;border-collapse:collapse"><thead><tr style="border-bottom:1px solid var(--border)">';
+        html += '<th style="padding:8px 12px;text-align:left;color:var(--text-muted);font-size:11px">Status</th>';
+        html += '<th style="padding:8px 12px;text-align:left;color:var(--text-muted);font-size:11px">Description</th>';
+        html += '<th style="padding:8px 12px;text-align:left;color:var(--text-muted);font-size:11px">Queued</th>';
+        html += '<th style="padding:8px 12px;text-align:left;color:var(--text-muted);font-size:11px">Result</th>';
+        html += '</tr></thead><tbody>';
+        queueItems.forEach(function(item) {
+          var sBadge = item.status === 'completed' ? 'badge-green' : item.status === 'failed' ? 'badge-red' : item.status === 'running' ? 'badge-orange' : 'badge-gray';
+          var resultText = item.status === 'completed' ? (item.result || 'Done').slice(0, 80) : item.status === 'failed' ? (item.error || 'Failed').slice(0, 80) : item.status === 'running' ? 'Running...' : 'Pending';
+          html += '<tr style="border-bottom:1px solid var(--border)">';
+          html += '<td style="padding:8px 12px"><span class="badge ' + sBadge + '" style="font-size:10px">' + esc(item.status) + '</span></td>';
+          html += '<td style="padding:8px 12px;font-size:13px">' + esc(item.description || '') + '</td>';
+          html += '<td style="padding:8px 12px;font-size:12px;color:var(--text-muted)">' + fmtTimeAgo(item.queuedAt) + '</td>';
+          html += '<td style="padding:8px 12px;font-size:12px;color:var(--text-muted);max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(resultText) + '</td>';
+          html += '</tr>';
+        });
+        html += '</tbody></table>';
+      }
+      html += '</div></div>';
+
+    } catch(e) { html += '<div class="empty-state">Failed to load heartbeat data</div>'; }
     container.innerHTML = html;
 
   } else if (tab === 'activity') {
@@ -9027,6 +9188,45 @@ async function deleteDelegation(id) {
     var d = await r.json();
     if (d.ok) { toast('Delegation deleted'); if (currentAgentSlug !== undefined) renderAgentDetail(currentAgentSlug); }
     else toast(d.error || 'Failed', 'error');
+  } catch(e) { toast(String(e), 'error'); }
+}
+
+// ── Heartbeat Queue ──────────────────────
+
+function openHeartbeatQueueModal(agentSlug) {
+  document.getElementById('hbq-agent-slug').value = agentSlug || '';
+  document.getElementById('hbq-description').value = '';
+  document.getElementById('hbq-prompt').value = '';
+  document.getElementById('hbq-priority').value = 'normal';
+  document.getElementById('heartbeat-queue-modal').classList.add('show');
+}
+
+function closeHeartbeatQueueModal() {
+  document.getElementById('heartbeat-queue-modal').classList.remove('show');
+}
+
+async function submitHeartbeatQueue() {
+  var description = document.getElementById('hbq-description').value.trim();
+  var prompt = document.getElementById('hbq-prompt').value.trim();
+  if (!description || !prompt) { toast('Description and prompt are required', 'error'); return; }
+  var payload = {
+    description: description,
+    prompt: prompt,
+    priority: document.getElementById('hbq-priority').value,
+    agentSlug: document.getElementById('hbq-agent-slug').value || undefined,
+  };
+  try {
+    var r = await apiFetch('/api/heartbeat/queue', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    var d = await r.json();
+    if (d.ok) {
+      toast('Work queued (ID: ' + d.id + ')');
+      closeHeartbeatQueueModal();
+      if (currentAgentSlug !== undefined) loadAgentDetailTab('heartbeat', currentAgentSlug, !currentAgentSlug || currentAgentSlug === '');
+    } else { toast(d.error || 'Failed to queue', 'error'); }
   } catch(e) { toast(String(e), 'error'); }
 }
 

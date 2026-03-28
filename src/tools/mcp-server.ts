@@ -1013,8 +1013,9 @@ server.tool(
     priority: z.enum(['high', 'normal']).optional().default('normal').describe('high = next tick, normal = when convenient'),
     max_turns: z.number().optional().default(3).describe('Max conversation turns for this work (1-5)'),
     tier: z.number().optional().default(1).describe('Security tier: 1 = vault-only, 2 = bash/git allowed'),
+    agent: z.string().optional().describe('Agent slug this work is for (e.g. "ross"). Omit for global work.'),
   },
-  async ({ description, prompt, priority, max_turns, tier }) => {
+  async ({ description, prompt, priority, max_turns, tier, agent }) => {
     const queueDir = path.dirname(HEARTBEAT_WORK_QUEUE_FILE);
     mkdirSync(queueDir, { recursive: true });
 
@@ -1026,7 +1027,7 @@ server.tool(
     } catch { /* start fresh */ }
 
     const id = randomBytes(4).toString('hex');
-    queue.push({
+    const item: Record<string, unknown> = {
       id,
       description,
       prompt,
@@ -1036,7 +1037,9 @@ server.tool(
       maxTurns: Math.min(max_turns, 5),
       tier: Math.min(tier, 2),
       status: 'pending',
-    });
+    };
+    if (agent) item.agentSlug = agent;
+    queue.push(item);
 
     writeFileSync(HEARTBEAT_WORK_QUEUE_FILE, JSON.stringify(queue, null, 2));
     return textResult(`Queued work item ${id}: "${description}" (priority: ${priority}, next heartbeat will pick it up)`);
