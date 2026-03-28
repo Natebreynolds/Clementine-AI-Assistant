@@ -7486,17 +7486,26 @@ async function loadAgentDetailTab(tab, slug, isPrimary) {
         html += '<div class="empty-state" style="padding:24px">No scheduled tasks</div>';
       } else {
         html += '<table style="width:100%;border-collapse:collapse">';
-        html += '<thead><tr style="border-bottom:1px solid var(--border)"><th style="padding:8px 12px;text-align:left;color:var(--text-muted);font-size:11px">Name</th><th style="padding:8px 12px;text-align:left;color:var(--text-muted);font-size:11px">Schedule</th><th style="padding:8px 12px;text-align:left;color:var(--text-muted);font-size:11px">Last Run</th><th style="padding:8px 12px;text-align:left;color:var(--text-muted);font-size:11px">Status</th><th style="padding:8px 12px;text-align:center;color:var(--text-muted);font-size:11px">Run</th><th style="padding:8px 12px;text-align:center;color:var(--text-muted);font-size:11px">Enabled</th></tr></thead><tbody>';
+        html += '<thead><tr style="border-bottom:1px solid var(--border)"><th style="padding:8px 12px;text-align:left;color:var(--text-muted);font-size:11px">Name</th><th style="padding:8px 12px;text-align:left;color:var(--text-muted);font-size:11px">Schedule</th><th style="padding:8px 12px;text-align:left;color:var(--text-muted);font-size:11px">Last Run</th><th style="padding:8px 12px;text-align:left;color:var(--text-muted);font-size:11px">Status</th><th style="padding:8px 12px;text-align:center;color:var(--text-muted);font-size:11px">Actions</th><th style="padding:8px 12px;text-align:center;color:var(--text-muted);font-size:11px">Enabled</th></tr></thead><tbody>';
         jobs.forEach(function(j) {
-          var lastRun = j.lastRun ? fmtTimeAgo(j.lastRun.finishedAt || j.lastRun.startedAt) : '—';
-          var lastStatus = j.lastRun ? j.lastRun.status : '—';
+          var lastRun = j.recentRuns && j.recentRuns.length > 0 ? fmtTimeAgo(j.recentRuns[0].finishedAt || j.recentRuns[0].startedAt) : (j.lastRun ? fmtTimeAgo(j.lastRun.finishedAt || j.lastRun.startedAt) : '—');
+          var lastStatus = j.recentRuns && j.recentRuns.length > 0 ? j.recentRuns[0].status : (j.lastRun ? j.lastRun.status : '—');
           var statusBadge = lastStatus === 'ok' ? 'badge-green' : lastStatus === 'error' ? 'badge-red' : 'badge-gray';
+          // Human-readable schedule
+          var humanSched = describeCron(j.schedule || '');
+          var schedDisplay = humanSched ? humanSched : esc(j.schedule || '');
+          // Clean display name (strip agent prefix)
+          var displayName = j.agent ? j.name.replace(j.agent + ':', '') : j.name;
+          var safeName = esc(j.name).replace(/'/g, '');
           html += '<tr style="border-bottom:1px solid var(--border)">';
-          html += '<td style="padding:8px 12px;font-weight:500;font-size:13px">' + esc(j.name) + '</td>';
-          html += '<td style="padding:8px 12px;font-size:12px;color:var(--text-muted)">' + esc(j.schedule) + '</td>';
+          html += '<td style="padding:8px 12px;font-weight:500;font-size:13px">' + esc(displayName) + '</td>';
+          html += '<td style="padding:8px 12px;font-size:12px;color:var(--text-muted)">' + schedDisplay + '</td>';
           html += '<td style="padding:8px 12px;font-size:12px;color:var(--text-muted)">' + lastRun + '</td>';
           html += '<td style="padding:8px 12px"><span class="badge ' + statusBadge + '" style="font-size:10px">' + lastStatus + '</span></td>';
-          html += '<td style="padding:8px 12px;text-align:center"><button class="btn btn-sm" onclick="apiPost(\\x27/api/cron/run/' + esc(j.name) + '\\x27)" style="font-size:10px;padding:2px 8px">Run</button></td>';
+          html += '<td style="padding:8px 12px;text-align:center"><div style="display:flex;gap:4px;justify-content:center">';
+          html += '<button class="btn btn-sm" onclick="apiPost(\\x27/api/cron/run/' + encodeURIComponent(j.name) + '\\x27)" style="font-size:10px;padding:2px 8px">Run</button>';
+          html += '<button class="btn btn-sm" onclick="openEditCronModal(\\x27' + safeName + '\\x27)" style="font-size:10px;padding:2px 8px">Edit</button>';
+          html += '</div></td>';
           html += '<td style="padding:8px 12px;text-align:center"><label class="toggle-switch"><input type="checkbox"' + (j.enabled !== false ? ' checked' : '') + ' onchange="toggleCronJob(\\x27' + esc(j.name) + '\\x27)"><span class="toggle-slider"></span></label></td>';
           html += '</tr>';
         });
@@ -9777,12 +9786,13 @@ function refreshAll() {
   refreshStatus();
   refreshActivity();
   refreshTeamNav(); // Keep sidebar agent list fresh
-  if (currentPage === 'home') { refreshHomePlan(); refreshTeamPulse(); }
+  // Home plan + pulse refresh on navigate, not on poll (prevents scroll jumps)
   if (currentPage === 'automations') { refreshCron(); refreshTimers(); }
   if (currentPage === 'intelligence') refreshMemory();
   if (currentPage === 'settings') refreshProjects();
   if (currentPage === 'logs') refreshLogs();
-  if (currentPage === 'agent-detail') renderAgentDetail(currentAgentSlug);
+  // Skip agent-detail on poll — full re-render nukes scroll position.
+  // It refreshes via SSE events or manual navigation instead.
   checkVersion();
 }
 
