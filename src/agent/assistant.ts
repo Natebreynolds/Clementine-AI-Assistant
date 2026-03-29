@@ -1171,6 +1171,19 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
 
       let contextStr = formatResultsForPrompt(results, SYSTEM_PROMPT_MAX_CONTEXT_CHARS);
 
+      // Enrich with matching procedural skills (if any)
+      try {
+        const { searchSkills, recordSkillUse } = await import('./skill-extractor.js');
+        const matchedSkills = searchSkills(enrichedQuery, 2);
+        if (matchedSkills.length > 0) {
+          const skillContext = matchedSkills.map(s => {
+            recordSkillUse(s.name);
+            return `## Skill: ${s.title}\n${s.content}`;
+          }).join('\n\n');
+          contextStr = `## Relevant Procedures (from past successful executions)\n\n${skillContext}\n\n${contextStr}`;
+        }
+      } catch { /* non-fatal — skills are supplementary */ }
+
       // Enrich with graph relationship context
       try {
         const { getSharedGraphStore } = await import('../memory/graph-store.js');
@@ -1961,6 +1974,33 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
 
     const last = exchanges[exchanges.length - 1];
     return `- Last discussed: ${last.user.slice(0, 200)}\n- Response: ${last.assistant.slice(0, 300)}`;
+  }
+
+  // ── Procedural Memory: Skill Extraction ────────────────────────────
+
+  /** Fire-and-forget: extract a reusable skill from a successful execution. */
+  private async extractSkillFromExecution(
+    source: 'unleashed' | 'cron' | 'chat',
+    jobName: string,
+    prompt: string,
+    output: string,
+    durationMs: number,
+    agentSlug?: string,
+  ): Promise<void> {
+    try {
+      const { extractSkill } = await import('./skill-extractor.js');
+      await extractSkill(this, {
+        source,
+        sourceJob: jobName,
+        agentSlug,
+        prompt,
+        output,
+        toolsUsed: [], // Tools tracked at a higher level; extraction prompt infers from output
+        durationMs,
+      });
+    } catch {
+      // Non-fatal — skill extraction failure should never block main flow
+    }
   }
 
   // ── Pre-Rotation Memory Flush ─────────────────────────────────────
@@ -2960,6 +3000,9 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
         if (this.onUnleashedComplete) {
           try { this.onUnleashedComplete(jobName, lastOutput); } catch { /* non-fatal */ }
         }
+        // Fire-and-forget: extract procedural skill from successful execution
+        this.extractSkillFromExecution('unleashed', jobName, jobPrompt, lastOutput, Date.now() - new Date(startedAt).getTime())
+          .catch(() => {});
         return lastOutput;
       }
     }
