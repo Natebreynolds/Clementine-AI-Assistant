@@ -65,14 +65,12 @@ The result: Clementine gets better the more you talk to it.
 ## Prerequisites
 
 - **Node.js 20-24 LTS** — `nvm install 22`
-- **Claude Code CLI** — `npm install -g @anthropic-ai/claude-code` (the setup wizard will install this automatically if missing)
+- **Claude Code CLI** — already installed if you're reading this in Claude Code
 
 ## Quick start
 
-One command to install everything and launch the setup wizard:
-
 ```bash
-npm install -g @anthropic-ai/claude-code && git clone https://github.com/Natebreynolds/Clementine-AI-Assistant.git clementine && cd clementine && npm install --loglevel=error --no-audit && npm run build && npm install -g . --loglevel=error --no-audit && clementine config setup
+git clone https://github.com/Natebreynolds/Clementine-AI-Assistant.git clementine && cd clementine && npm install --loglevel=error --no-audit && npm run build && npm install -g . --loglevel=error --no-audit && clementine config setup
 ```
 
 The setup wizard checks prerequisites, then walks you through identity, model, channels, and features. After setup:
