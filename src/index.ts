@@ -321,6 +321,7 @@ function printBanner(channels: string[], profiles: number, cronJobs: number, gra
 function ensureVaultDirs(): void {
   const dirs = [
     config.SYSTEM_DIR,
+    path.join(config.SYSTEM_DIR, 'skills'),
     config.DAILY_NOTES_DIR,
     config.PEOPLE_DIR,
     config.PROJECTS_DIR,
