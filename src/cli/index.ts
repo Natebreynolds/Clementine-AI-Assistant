@@ -24,6 +24,7 @@ import {
   closeSync,
   readSync,
   readFileSync,
+  readdirSync,
   writeFileSync,
   unlinkSync,
   mkdirSync,
@@ -553,6 +554,45 @@ function cmdDoctor(opts: { fix?: boolean } = {}): void {
       console.log(`  ${RED}FAIL${RESET}  vault/${filePath} missing`);
       issues++;
     }
+  }
+
+  // Vault directories & assets summary
+  const vaultDirs = [
+    ['00-System/skills', 'Skills (procedural memory)'],
+    ['00-System/agents', 'Agent configs'],
+  ] as const;
+  for (const [dirPath] of vaultDirs) {
+    const fullPath = path.join(vaultDir, dirPath);
+    if (existsSync(fullPath)) {
+      const count = readdirSync(fullPath).filter(f => f.endsWith('.md')).length;
+      console.log(`  ${GREEN}OK${RESET}  vault/${dirPath}/ (${count} file${count !== 1 ? 's' : ''})`);
+    } else {
+      console.log(`  ${YELLOW}WARN${RESET}  vault/${dirPath}/ missing (will be created on launch)`);
+    }
+  }
+
+  // Optional vault files (informational, not failures)
+  const optionalFiles = [
+    ['00-System/MEMORY.md', 'Long-term memory'],
+    ['00-System/HEARTBEAT.md', 'Heartbeat config'],
+    ['00-System/CRON.md', 'Cron jobs'],
+    ['00-System/FEEDBACK.md', 'Communication preferences'],
+  ] as const;
+  for (const [filePath, label] of optionalFiles) {
+    if (existsSync(path.join(vaultDir, filePath))) {
+      console.log(`  ${GREEN}OK${RESET}  vault/${filePath}`);
+    } else {
+      console.log(`  ${DIM}  ○  vault/${filePath} (${label} — created on use)${RESET}`);
+    }
+  }
+
+  // Memory database
+  const memDbPath = path.join(vaultDir, '.memory.db');
+  if (existsSync(memDbPath)) {
+    const sizeKb = Math.round(statSync(memDbPath).size / 1024);
+    console.log(`  ${GREEN}OK${RESET}  memory database (${sizeKb} KB)`);
+  } else {
+    console.log(`  ${DIM}  ○  memory database (created on first launch)${RESET}`);
   }
 
   // Channel tokens (informational)
