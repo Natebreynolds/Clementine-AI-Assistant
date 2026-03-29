@@ -148,7 +148,15 @@ export class HeartbeatScheduler {
       this.lastState.lastSelfImproveDate = this.lastSelfImproveDate;
       this.saveState();
       logger.info('Triggering nightly self-improvement cycle');
-      this.gateway.handleSelfImprove('run-nightly').catch(err => {
+      this.gateway.handleSelfImprove('run-nightly').then(summary => {
+        // Notify owner of self-improvement results
+        if (summary && !summary.includes('Iterations: 0')) {
+          this.dispatcher.send(
+            `**Self-Improvement Report (nightly)**\n${summary}`,
+            {},
+          ).catch(() => {});
+        }
+      }).catch(err => {
         logger.error({ err }, 'Nightly self-improvement failed');
       });
     }
