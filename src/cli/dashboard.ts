@@ -2639,6 +2639,104 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
     }
   });
 
+  // ── Builder chat endpoint ──────────────────────────────────────────
+
+  app.post('/api/builder/chat', async (req, res) => {
+    const { message, artifactType, agentSlug, currentArtifact } = req.body;
+    if (!message || typeof message !== 'string') {
+      res.status(400).json({ error: 'message is required' });
+      return;
+    }
+    const type = artifactType || 'skill';
+    const sessionKey = `dashboard:builder:${type}:${agentSlug || 'clementine'}`;
+
+    // Inject builder context before the user message
+    const artifactContext = currentArtifact
+      ? `\n\n[CURRENT ARTIFACT STATE — the user may have edited this directly]\n\`\`\`json-artifact\n${JSON.stringify(currentArtifact, null, 2)}\n\`\`\`\n`
+      : '';
+
+    const builderPrefix = type === 'skill'
+      ? `[BUILDER MODE: You are helping build a reusable skill. As you develop the procedure, output the current state as a JSON block:\n` +
+        '```json-artifact\n{"type":"skill","title":"...","description":"...","triggers":["..."],"steps":"markdown procedure"}\n```\n' +
+        `Update this block in EVERY response as the skill evolves. Ask clarifying questions to refine the procedure. Keep it conversational — one question at a time. ` +
+        `When the user says "save" or approves, output the final artifact block.]${artifactContext}\n\n`
+      : type === 'cron'
+      ? `[BUILDER MODE: You are helping build a scheduled cron job. As you develop the job, output the current state as a JSON block:\n` +
+        '```json-artifact\n{"type":"cron","name":"...","schedule":"cron expression","tier":1,"prompt":"the full job prompt","mode":"standard","enabled":true}\n```\n' +
+        `Update this block in EVERY response as the job evolves. Ask about schedule, what it should do, which tools/APIs it needs, what tier (1=read-only, 2=read-write), and whether it should run in unleashed mode. ` +
+        `When the user says "save" or approves, output the final artifact block.]${artifactContext}\n\n`
+      : `[BUILDER MODE: You are helping configure an agent artifact. Output structured JSON blocks as you build.]${artifactContext}\n\n`;
+
+    const enrichedMessage = builderPrefix + message;
+
+    try {
+      const gateway = await getGateway();
+      const response = await gateway.handleMessage(sessionKey, enrichedMessage);
+
+      // Parse any json-artifact blocks from the response
+      let artifact = null;
+      const artifactMatch = response?.match(/```json-artifact\s*\n([\s\S]*?)```/);
+      if (artifactMatch) {
+        try { artifact = JSON.parse(artifactMatch[1]); } catch { /* malformed */ }
+      }
+
+      // Strip the artifact block from the display response
+      const cleanResponse = response?.replace(/```json-artifact\s*\n[\s\S]*?```/g, '').trim();
+
+      res.json({ ok: true, response: cleanResponse, artifact });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  // Save completed builder artifact
+  app.post('/api/builder/save', (req, res) => {
+    try {
+      const { artifactType, artifact } = req.body;
+      if (!artifact) { res.status(400).json({ error: 'artifact is required' }); return; }
+
+      if (artifactType === 'skill') {
+        const skillsDir = path.join(VAULT_DIR, '00-System', 'skills');
+        if (!existsSync(skillsDir)) mkdirSync(skillsDir, { recursive: true });
+        const name = (artifact.title || 'untitled').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 60);
+        const now = new Date().toISOString();
+        const matterMod = require('gray-matter');
+        const content = matterMod.stringify(
+          `\n# ${artifact.title}\n\n${artifact.description || ''}\n\n## Procedure\n\n${artifact.steps || ''}\n`,
+          {
+            title: artifact.title, description: artifact.description || '', triggers: artifact.triggers || [],
+            source: 'builder', toolsUsed: artifact.toolsUsed || [], useCount: 0, createdAt: now, updatedAt: now,
+          },
+        );
+        writeFileSync(path.join(skillsDir, `${name}.md`), content);
+        res.json({ ok: true, name, message: `Skill "${artifact.title}" saved` });
+      } else if (artifactType === 'cron') {
+        // Read current CRON.md and append the new job
+        const cronFile = path.join(VAULT_DIR, '00-System', 'CRON.md');
+        if (!existsSync(cronFile)) { res.status(500).json({ error: 'CRON.md not found' }); return; }
+        const matterMod = require('gray-matter');
+        const parsed = matterMod(readFileSync(cronFile, 'utf-8'));
+        const jobs = parsed.data.jobs || [];
+        jobs.push({
+          name: artifact.name,
+          schedule: artifact.schedule,
+          prompt: artifact.prompt,
+          tier: artifact.tier || 1,
+          enabled: artifact.enabled !== false,
+          ...(artifact.mode === 'unleashed' ? { mode: 'unleashed', max_hours: artifact.max_hours || 1 } : {}),
+          ...(artifact.work_dir ? { work_dir: artifact.work_dir } : {}),
+        });
+        parsed.data.jobs = jobs;
+        writeFileSync(cronFile, matterMod.stringify(parsed.content, parsed.data));
+        res.json({ ok: true, name: artifact.name, message: `Cron job "${artifact.name}" saved` });
+      } else {
+        res.status(400).json({ error: `Unknown artifact type: ${artifactType}` });
+      }
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
   // ── Memory search route ───────────────────────────────────────────
 
   app.get('/api/memory/search', async (req, res) => {
@@ -6507,10 +6605,26 @@ function getDashboardHTML(token: string): string {
     flex-shrink: 0;
     margin-top: 2px;
   }
-  #page-chat.active {
+  #page-chat.active, #page-builder.active {
     display: flex !important;
     flex-direction: column;
     height: calc(100vh - var(--header-h));
+  }
+  #builder-preview .preview-field {
+    margin-bottom:12px;
+  }
+  #builder-preview .preview-field label {
+    font-size:11px;font-weight:600;color:var(--text-muted);display:block;margin-bottom:4px;
+  }
+  #builder-preview .preview-field input,
+  #builder-preview .preview-field textarea {
+    width:100%;padding:8px;border:1px solid var(--border);border-radius:6px;background:var(--bg-input);color:var(--text-primary);font-size:13px;
+  }
+  #builder-preview .preview-field textarea {
+    font-family:monospace;resize:vertical;
+  }
+  #builder-preview .preview-tag {
+    display:inline-block;background:var(--bg-tertiary);border:1px solid var(--border);border-radius:4px;padding:2px 8px;font-size:11px;margin:2px;
   }
   .quick-pill {
     border-radius: 20px !important;
@@ -6945,6 +7059,9 @@ function getDashboardHTML(token: string): string {
       <div class="nav-item" data-page="chat">
         <span class="nav-icon">&#128172;</span> Chat
       </div>
+      <div class="nav-item" data-page="builder">
+        <span class="nav-icon">&#128736;</span> Builder
+      </div>
     </div>
     <div class="nav-section">
       <div class="nav-section-title">Team</div>
@@ -7057,6 +7174,52 @@ function getDashboardHTML(token: string): string {
       <div class="card" id="mcp-status-widget" style="display:none;margin-top:16px"></div>
       <!-- Hidden: Quick controls data target (kept for refreshStatus compat) -->
       <div id="panel-controls" style="display:none"></div>
+    </div>
+
+    <!-- ═══ Builder Page — Conversational Artifact Creation ═══ -->
+    <div class="page" id="page-builder" style="display:flex;flex-direction:column;height:100%">
+      <div style="display:flex;align-items:center;gap:12px;padding:12px 16px;border-bottom:1px solid var(--border)">
+        <span class="page-title" style="margin:0;font-size:16px">Builder</span>
+        <select id="builder-type" onchange="resetBuilder()" style="padding:6px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg-secondary);color:var(--text-primary);font-size:13px">
+          <option value="skill">Skill</option>
+          <option value="cron">Cron Job</option>
+        </select>
+        <select id="builder-agent" style="padding:6px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg-secondary);color:var(--text-primary);font-size:13px">
+          <option value="">Clementine (global)</option>
+        </select>
+        <span style="flex:1"></span>
+        <button class="btn-sm" onclick="resetBuilder()" style="background:var(--bg-tertiary);border:1px solid var(--border);color:var(--text-secondary);padding:4px 12px;border-radius:6px;cursor:pointer;font-size:12px">New</button>
+        <button class="btn-sm btn-primary" id="builder-save-btn" onclick="saveBuilderArtifact()" style="padding:4px 16px;font-size:12px;display:none">Save</button>
+      </div>
+      <div style="display:flex;flex:1;min-height:0;overflow:hidden">
+        <!-- Left: Chat -->
+        <div style="flex:1;display:flex;flex-direction:column;border-right:1px solid var(--border)">
+          <div id="builder-messages" style="flex:1;overflow-y:auto;padding:16px">
+            <div class="empty-state" style="margin-top:40px">
+              <p style="color:var(--text-muted);margin-bottom:12px">Describe what you want to build.</p>
+              <div style="display:flex;flex-wrap:wrap;gap:8px;justify-content:center">
+                <button class="btn btn-sm quick-pill" onclick="builderQuick('Create a cron job that checks my email every morning and sends me a summary')">Email summary cron</button>
+                <button class="btn btn-sm quick-pill" onclick="builderQuick('Teach me how to run an outbound campaign via Salesforce')">Outbound campaign skill</button>
+                <button class="btn btn-sm quick-pill" onclick="builderQuick('Build a weekly analytics report that checks SEO rankings')">Weekly SEO report</button>
+              </div>
+            </div>
+          </div>
+          <div style="display:flex;gap:8px;padding:12px 16px;border-top:1px solid var(--border)">
+            <input type="text" id="builder-input" placeholder="Describe what you want to build..." onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendBuilderChat()}" style="flex:1;padding:10px 14px;border:1px solid var(--border);border-radius:8px;background:var(--bg-input);color:var(--text-primary);font-size:13px">
+            <button class="btn-primary" onclick="sendBuilderChat()" style="padding:10px 18px;border-radius:8px">Send</button>
+          </div>
+        </div>
+        <!-- Right: Live Preview -->
+        <div style="width:400px;display:flex;flex-direction:column;background:var(--bg-secondary)">
+          <div style="padding:12px 16px;border-bottom:1px solid var(--border);font-weight:600;font-size:13px;color:var(--text-secondary)">
+            Live Preview
+            <span id="builder-preview-status" style="font-size:11px;color:var(--text-muted);margin-left:8px"></span>
+          </div>
+          <div id="builder-preview" style="flex:1;overflow-y:auto;padding:16px">
+            <div class="empty-state" style="font-size:13px;color:var(--text-muted)">The artifact will appear here as you build it</div>
+          </div>
+        </div>
+      </div>
     </div>
 
     <!-- ═══ Agent Detail Page (full-screen management console) ═══ -->
@@ -8040,6 +8203,7 @@ function navigateTo(page, opts) {
   // Page-specific refresh
   if (page === 'home') { refreshStatus(); refreshActivity(); refreshHomePlan(); refreshTeamPulse(); }
   if (page === 'chat') { loadProfiles(); document.getElementById('chat-input').focus(); }
+  if (page === 'builder') { refreshBuilderAgents(); document.getElementById('builder-input').focus(); }
   if (page === 'automations') { refreshCron(); refreshTimers(); refreshSelfImprove(); refreshSkills(); }
   if (page === 'intelligence') { refreshMemory(); }
   if (page === 'settings') { refreshSettings(); refreshRemoteAccess(); refreshProjects(); refreshSalesforce(); }
@@ -10934,6 +11098,157 @@ async function switchProfile(slug) {
     container.innerHTML = '<div class="empty-state"><p style="margin-bottom:14px;color:var(--text-muted)">Profile switched' + (slug ? ' to <strong>' + esc(slug) + '</strong>' : '') + '. Session cleared.</p></div>';
     toast(slug ? 'Switched to ' + slug : 'Profile cleared', 'success');
   } catch(e) { toast('Failed to switch profile: ' + e, 'error'); }
+}
+
+// ── Builder (Conversational Artifact Creation) ──────────────────
+
+var builderArtifact = null;
+var builderSending = false;
+
+function resetBuilder() {
+  builderArtifact = null;
+  builderSending = false;
+  var msgs = document.getElementById('builder-messages');
+  if (msgs) msgs.innerHTML = '<div class="empty-state" style="margin-top:40px"><p style="color:var(--text-muted);margin-bottom:12px">Describe what you want to build.</p><div style="display:flex;flex-wrap:wrap;gap:8px;justify-content:center"><button class="btn btn-sm quick-pill" onclick="builderQuick(\\x27Create a cron job that checks my email every morning and sends me a summary\\x27)">Email summary cron</button><button class="btn btn-sm quick-pill" onclick="builderQuick(\\x27Teach me how to run an outbound campaign via Salesforce\\x27)">Outbound campaign skill</button><button class="btn btn-sm quick-pill" onclick="builderQuick(\\x27Build a weekly analytics report that checks SEO rankings\\x27)">Weekly SEO report</button></div></div>';
+  var preview = document.getElementById('builder-preview');
+  if (preview) preview.innerHTML = '<div class="empty-state" style="font-size:13px;color:var(--text-muted)">The artifact will appear here as you build it</div>';
+  var saveBtn = document.getElementById('builder-save-btn');
+  if (saveBtn) saveBtn.style.display = 'none';
+  var status = document.getElementById('builder-preview-status');
+  if (status) status.textContent = '';
+  var input = document.getElementById('builder-input');
+  if (input) input.value = '';
+}
+
+function builderQuick(text) {
+  var sel = document.getElementById('builder-type');
+  if (text.toLowerCase().includes('cron') || text.toLowerCase().includes('scheduled') || text.toLowerCase().includes('every')) {
+    sel.value = 'cron';
+  } else {
+    sel.value = 'skill';
+  }
+  document.getElementById('builder-input').value = text;
+  sendBuilderChat();
+}
+
+async function sendBuilderChat() {
+  if (builderSending) return;
+  var input = document.getElementById('builder-input');
+  var text = (input.value || '').trim();
+  if (!text) return;
+  input.value = '';
+  builderSending = true;
+
+  var msgs = document.getElementById('builder-messages');
+  // Remove empty state if present
+  var empty = msgs.querySelector('.empty-state');
+  if (empty) empty.remove();
+
+  // Add user bubble
+  msgs.innerHTML += '<div class="chat-bubble user" style="margin-bottom:10px">' + esc(text) + '</div>';
+
+  // Add typing indicator
+  msgs.innerHTML += '<div class="chat-bubble assistant chat-typing" id="builder-typing" style="margin-bottom:10px"><span></span><span></span><span></span></div>';
+  msgs.scrollTop = msgs.scrollHeight;
+
+  var type = document.getElementById('builder-type').value;
+  var agent = document.getElementById('builder-agent').value;
+
+  try {
+    var r = await apiJson('POST', '/api/builder/chat', {
+      message: text,
+      artifactType: type,
+      agentSlug: agent || undefined,
+      currentArtifact: builderArtifact,
+    });
+
+    // Remove typing indicator
+    var typing = document.getElementById('builder-typing');
+    if (typing) typing.remove();
+
+    if (r.response) {
+      msgs.innerHTML += '<div class="chat-bubble assistant" style="margin-bottom:10px">' + renderMd(r.response) + '</div>';
+    }
+
+    // Update preview if artifact returned
+    if (r.artifact) {
+      builderArtifact = r.artifact;
+      renderBuilderPreview(r.artifact, type);
+      document.getElementById('builder-save-btn').style.display = '';
+      document.getElementById('builder-preview-status').textContent = 'Updated';
+      setTimeout(function() {
+        var s = document.getElementById('builder-preview-status');
+        if (s) s.textContent = '';
+      }, 2000);
+    }
+
+    msgs.scrollTop = msgs.scrollHeight;
+  } catch(e) {
+    var t = document.getElementById('builder-typing');
+    if (t) t.remove();
+    msgs.innerHTML += '<div class="chat-bubble assistant" style="color:var(--red);margin-bottom:10px">Error: ' + esc(String(e)) + '</div>';
+  }
+  builderSending = false;
+}
+
+function renderBuilderPreview(artifact, type) {
+  var preview = document.getElementById('builder-preview');
+  if (!preview) return;
+  var html = '';
+  if (type === 'skill') {
+    html = '<div class="preview-field"><label>Title</label><input type="text" value="' + esc(artifact.title || '') + '" onchange="builderArtifact.title=this.value"></div>'
+      + '<div class="preview-field"><label>Description</label><input type="text" value="' + esc(artifact.description || '') + '" onchange="builderArtifact.description=this.value"></div>'
+      + '<div class="preview-field"><label>Triggers</label><input type="text" value="' + esc((artifact.triggers || []).join(', ')) + '" onchange="builderArtifact.triggers=this.value.split(\\x27,\\x27).map(function(t){return t.trim()}).filter(Boolean)"></div>'
+      + '<div class="preview-field"><label>Procedure</label><textarea rows="12" onchange="builderArtifact.steps=this.value">' + esc(artifact.steps || '') + '</textarea></div>';
+  } else if (type === 'cron') {
+    html = '<div class="preview-field"><label>Job Name</label><input type="text" value="' + esc(artifact.name || '') + '" onchange="builderArtifact.name=this.value"></div>'
+      + '<div class="preview-field"><label>Schedule (cron expression)</label><input type="text" value="' + esc(artifact.schedule || '') + '" onchange="builderArtifact.schedule=this.value"></div>'
+      + '<div class="preview-field"><label>Tier</label><select onchange="builderArtifact.tier=parseInt(this.value)">'
+      + '<option value="1"' + (artifact.tier === 1 ? ' selected' : '') + '>1 — Read-only</option>'
+      + '<option value="2"' + (artifact.tier === 2 ? ' selected' : '') + '>2 — Read+Write</option>'
+      + '<option value="3"' + (artifact.tier === 3 ? ' selected' : '') + '>3 — Full</option>'
+      + '</select></div>'
+      + '<div class="preview-field"><label>Mode</label><select onchange="builderArtifact.mode=this.value">'
+      + '<option value="standard"' + (artifact.mode !== 'unleashed' ? ' selected' : '') + '>Standard</option>'
+      + '<option value="unleashed"' + (artifact.mode === 'unleashed' ? ' selected' : '') + '>Unleashed</option>'
+      + '</select></div>'
+      + '<div class="preview-field"><label>Prompt</label><textarea rows="12" onchange="builderArtifact.prompt=this.value">' + esc(artifact.prompt || '') + '</textarea></div>';
+  }
+  preview.innerHTML = html;
+}
+
+async function saveBuilderArtifact() {
+  if (!builderArtifact) { toast('No artifact to save', 'error'); return; }
+  var type = document.getElementById('builder-type').value;
+  try {
+    var r = await apiJson('POST', '/api/builder/save', { artifactType: type, artifact: builderArtifact });
+    if (r.ok) {
+      toast(r.message || 'Saved!', 'success');
+      // Add confirmation to chat
+      var msgs = document.getElementById('builder-messages');
+      msgs.innerHTML += '<div style="text-align:center;padding:12px;color:var(--green);font-size:13px;font-weight:600">\\u2714 ' + esc(r.message || 'Saved') + '</div>';
+      msgs.scrollTop = msgs.scrollHeight;
+      document.getElementById('builder-save-btn').style.display = 'none';
+      // Refresh skills or cron
+      if (type === 'skill') refreshSkills();
+      if (type === 'cron') refreshCron();
+    } else {
+      toast(r.error || 'Save failed', 'error');
+    }
+  } catch(e) { toast('Error: ' + e, 'error'); }
+}
+
+// Populate agent dropdown when builder page loads
+function refreshBuilderAgents() {
+  var sel = document.getElementById('builder-agent');
+  if (!sel) return;
+  apiFetch('/api/agents').then(function(r) { return r.json(); }).then(function(d) {
+    var agents = d.agents || [];
+    sel.innerHTML = '<option value="">Clementine (global)</option>';
+    for (var a of agents) {
+      sel.innerHTML += '<option value="' + esc(a.slug) + '">' + esc(a.name) + '</option>';
+    }
+  }).catch(function() {});
 }
 
 // ── Memory Search ─────────────────────────
