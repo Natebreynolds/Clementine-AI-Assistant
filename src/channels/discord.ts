@@ -46,6 +46,8 @@ import {
   PKG_DIR,
   VAULT_DIR,
   BASE_DIR,
+  DEFAULT_MODEL_TIER,
+  ENABLE_1M_CONTEXT,
 } from '../config.js';
 import type { HeartbeatScheduler, CronScheduler } from '../gateway/heartbeat.js';
 import type { NotificationDispatcher } from '../gateway/notifications.js';
@@ -643,6 +645,11 @@ export async function startDiscord(
     const disabledCount = jobDefs.length - enabledCount;
     const schedSummary = `${enabledCount} active` + (disabledCount > 0 ? ` \u00b7 ${disabledCount} disabled` : '');
     embed.addFields({ name: '\u{1F4CB} Scheduled', value: schedSummary, inline: true });
+
+    // ── System info ──────────────────────────────────────────────
+    const modelLabel = (DEFAULT_MODEL_TIER as string).charAt(0).toUpperCase() + (DEFAULT_MODEL_TIER as string).slice(1);
+    const contextTag = ENABLE_1M_CONTEXT ? ' \u00b7 1M context' : '';
+    embed.addFields({ name: '\u{2699}\u{FE0F} System', value: `${modelLabel}${contextTag}`, inline: true });
 
     return embed;
   }
