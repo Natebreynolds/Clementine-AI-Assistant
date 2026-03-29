@@ -1037,4 +1037,22 @@ export class Gateway {
       releaseLane();
     }
   }
+
+  /** Extract a procedural skill from a successful cron execution (fire-and-forget). */
+  async extractCronSkill(jobName: string, prompt: string, output: string, durationMs: number, agentSlug?: string): Promise<void> {
+    try {
+      const { extractSkill } = await import('../agent/skill-extractor.js');
+      await extractSkill(this.assistant, {
+        source: 'cron',
+        sourceJob: jobName,
+        agentSlug,
+        prompt,
+        output,
+        toolsUsed: [],
+        durationMs,
+      });
+    } catch {
+      // Non-fatal
+    }
+  }
 }

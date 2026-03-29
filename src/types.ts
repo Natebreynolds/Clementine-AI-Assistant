@@ -333,6 +333,24 @@ export interface SessionReflection {
   createdAt?: string;
 }
 
+// ── Procedural Memory (Skills) ──────────────────────────────────────
+
+export interface SkillDocument {
+  name: string;                        // kebab-case slug
+  title: string;                       // Human-readable title
+  description: string;                 // What this skill does (1-2 sentences)
+  triggers: string[];                  // Keywords/phrases that should activate this skill
+  source: 'unleashed' | 'cron' | 'chat' | 'manual';
+  sourceJob?: string;                  // Job name or session key that produced this skill
+  agentSlug?: string;                  // Which agent learned this (null = global)
+  steps: string;                       // Markdown procedure body
+  toolsUsed: string[];                 // MCP tools referenced in the procedure
+  useCount: number;
+  lastUsed?: string;                   // ISO
+  createdAt: string;                   // ISO
+  updatedAt: string;                   // ISO
+}
+
 // ── Plan Orchestration ───────────────────────────────────────────────
 
 export interface PlanStep {

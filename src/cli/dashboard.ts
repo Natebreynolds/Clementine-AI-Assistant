@@ -2841,6 +2841,37 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
 
   // ── Self-Improvement API ─────────────────────────────────────────
 
+  // ── Skills (Procedural Memory) API ──────────────────────────────────
+
+  app.get('/api/skills', (_req, res) => {
+    try {
+      const skillsDir = path.join(VAULT_DIR, '00-System', 'skills');
+      if (!existsSync(skillsDir)) { res.json({ skills: [] }); return; }
+      const files = readdirSync(skillsDir).filter(f => f.endsWith('.md'));
+      const skills = files.map(f => {
+        try {
+          const parsed = matter(readFileSync(path.join(skillsDir, f), 'utf-8'));
+          return {
+            name: f.replace('.md', ''),
+            title: parsed.data.title ?? f,
+            description: parsed.data.description ?? '',
+            source: parsed.data.source ?? 'unknown',
+            sourceJob: parsed.data.sourceJob ?? null,
+            triggers: parsed.data.triggers ?? [],
+            toolsUsed: parsed.data.toolsUsed ?? [],
+            useCount: parsed.data.useCount ?? 0,
+            lastUsed: parsed.data.lastUsed ?? null,
+            createdAt: parsed.data.createdAt ?? '',
+            updatedAt: parsed.data.updatedAt ?? '',
+          };
+        } catch { return null; }
+      }).filter(Boolean);
+      res.json({ skills });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
   app.get('/api/self-improve', (_req, res) => {
     const siDir = path.join(BASE_DIR, 'self-improve');
     const stateFile = path.join(siDir, 'state.json');

@@ -855,6 +855,12 @@ export class CronScheduler {
 
           this.runLog.append(entry);
 
+          // Fire-and-forget: extract procedural skill from successful long-running cron jobs
+          if (entry.status === 'ok' && entry.durationMs > 30_000 && response && response.length > 500) {
+            this.gateway.extractCronSkill(job.name, job.prompt, response, entry.durationMs, job.agentSlug)
+              .catch(() => {});
+          }
+
           // Log to daily note so end-of-day summary has data to work with
           const durationSec = Math.round(entry.durationMs / 1000);
           const preview = response ? response.slice(0, 100).replace(/\n/g, ' ') : 'no output';
