@@ -186,6 +186,10 @@ export interface HeartbeatState {
   reportedTopics?: HeartbeatReportedTopic[];
   consecutiveSilentBeats?: number;
   lastDiscordMessageAt?: string;
+  /** Persisted scheduling dates — survive process restarts */
+  lastSelfImproveDate?: string;
+  lastConsolidationDate?: string;
+  lastAgentSiRuns?: Record<string, string>;
 }
 
 export interface HeartbeatWorkItem {
@@ -422,6 +426,8 @@ export interface SelfImproveConfig {
   autoApply?: boolean;
   /** Target a specific agent slug (for per-agent improvement cycles). */
   agentSlug?: string;
+  /** How to handle source code proposals. 'skip' = drop silently, 'propose-only' = save for human review. Default: 'propose-only'. */
+  sourceMode?: 'skip' | 'propose-only';
 }
 
 // ── Restart Sentinel ────────────────────────────────────────────────

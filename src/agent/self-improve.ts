@@ -51,13 +51,14 @@ const logger = pino({ name: 'clementine.self-improve' });
 // ── Defaults ─────────────────────────────────────────────────────────
 
 const DEFAULT_CONFIG: SelfImproveConfig = {
-  maxIterations: 10,
+  maxIterations: 6,
   iterationBudgetMs: 300_000,       // 5 min
   maxDurationMs: 3_600_000,         // 1 hour
-  acceptThreshold: 0.6,
+  acceptThreshold: 0.7,
   plateauLimit: 3,
   areas: ['soul', 'cron', 'workflow', 'memory', 'agent', 'source', 'communication'],
   autoApply: true,
+  sourceMode: 'propose-only',
 };
 
 // ── Paths ────────────────────────────────────────────────────────────
@@ -308,10 +309,20 @@ export class SelfImproveLoop {
                 state.pendingApprovals++;
               }
             } else if (this.config.autoApply && risk === 'high') {
-              // High-risk: skip entirely in auto mode (don't even save as pending)
-              logger.info({ id, area: proposal.area, risk }, 'Skipped high-risk proposal in auto mode');
-              experiment.approvalStatus = 'denied';
-              experiment.reason = 'High-risk area blocked in autonomous mode';
+              // High-risk: behavior depends on sourceMode config
+              if (this.config.sourceMode === 'skip') {
+                logger.info({ id, area: proposal.area, risk }, 'Skipped high-risk proposal in auto mode');
+                experiment.approvalStatus = 'denied';
+                experiment.reason = 'High-risk area blocked in autonomous mode (sourceMode=skip)';
+              } else {
+                // propose-only: save for human review, never auto-apply
+                await this.savePendingChange(experiment, before);
+                state.pendingApprovals++;
+                if (onProposal) {
+                  await onProposal(experiment);
+                }
+                logger.info({ id, area: proposal.area, risk }, 'Saved high-risk proposal for human review');
+              }
             } else {
               // Medium-risk or manual mode: save as pending for approval
               await this.savePendingChange(experiment, before);
@@ -566,60 +577,52 @@ export class SelfImproveLoop {
       }
     }
 
-    // Read current configuration files
-    const soulContent = existsSync(SOUL_FILE) ? readFileSync(SOUL_FILE, 'utf-8').slice(0, 3000) : '(not found)';
-    const agentsContent = existsSync(AGENTS_FILE) ? readFileSync(AGENTS_FILE, 'utf-8').slice(0, 2000) : '(not found)';
-    const cronContent = existsSync(CRON_FILE) ? readFileSync(CRON_FILE, 'utf-8').slice(0, 2000) : '(not found)';
-
-    let workflowSummaries = '(none)';
-    if (existsSync(WORKFLOWS_DIR)) {
-      const wfFiles = readdirSync(WORKFLOWS_DIR).filter(f => f.endsWith('.md'));
-      workflowSummaries = wfFiles.map(f => {
-        const content = readFileSync(path.join(WORKFLOWS_DIR, f), 'utf-8');
-        return `- ${f}: ${content.slice(0, 200)}...`;
-      }).join('\n') || '(none)';
-    }
-
-    // Gather agent configs
-    let agentSummaries = '(none)';
-    if (existsSync(AGENTS_DIR)) {
-      try {
-        const slugs = readdirSync(AGENTS_DIR, { withFileTypes: true } as any)
-          .filter((d: any) => d.isDirectory?.() ?? true)
-          .map((d: any) => typeof d === 'string' ? d : d.name);
-        agentSummaries = slugs.map((slug: string) => {
-          const agentFile = path.join(AGENTS_DIR, slug, 'agent.md');
-          if (!existsSync(agentFile)) return null;
-          const content = readFileSync(agentFile, 'utf-8');
-          return `- ${slug}/agent.md: ${content.slice(0, 400)}`;
-        }).filter(Boolean).join('\n') || '(none)';
-      } catch { agentSummaries = '(none)'; }
-    }
-
     // Format experiment history for the prompt
     const historyText = history.slice(-20).map(e =>
       `#${e.iteration} | ${e.area} | "${e.hypothesis.slice(0, 60)}" | ${(e.score * 10).toFixed(1)}/10 ${e.accepted ? '✅' : '❌'}`
     ).join('\n') || '(no prior experiments)';
 
-    // Enforce diversity: count recent proposals per area:target
+    // Enforce diversity: count recent proposals per area:target AND per area
     const recentTargets = new Map<string, number>();
-    for (const e of history.slice(-15)) {
+    const recentAreas = new Map<string, number>();
+    for (const e of history.slice(-10)) {
       const key = `${e.area}:${e.target}`;
       recentTargets.set(key, (recentTargets.get(key) ?? 0) + 1);
+      recentAreas.set(e.area, (recentAreas.get(e.area) ?? 0) + 1);
     }
     for (const p of this.getPendingChanges()) {
       const key = `${p.area}:${p.target}`;
       recentTargets.set(key, (recentTargets.get(key) ?? 0) + 1);
+      recentAreas.set(p.area, (recentAreas.get(p.area) ?? 0) + 1);
     }
+    // Block area:target pairs with >= 2 recent proposals
     const overTargeted = [...recentTargets.entries()]
       .filter(([, count]) => count >= 2)
       .map(([key]) => key);
+    // Block entire areas with >= 3 recent proposals
+    const overTargetedAreas = [...recentAreas.entries()]
+      .filter(([, count]) => count >= 3)
+      .map(([area]) => area);
 
-    const diversityConstraint = overTargeted.length > 0
-      ? `\n\n## DIVERSITY CONSTRAINT\nThese targets have been proposed recently and MUST NOT be targeted again:\n` +
-        overTargeted.map(t => `- ${t}`).join('\n') +
-        `\nChoose a DIFFERENT area/target. If no other improvement is needed, output { "area": null }.\n`
-      : '';
+    // Build area coverage stats to nudge the LLM toward unexplored areas
+    const allAreas = this.config.areas;
+    const areaCoverage = allAreas.map(area => {
+      const count = recentAreas.get(area) ?? 0;
+      return `- ${area}: ${count} recent proposals`;
+    }).join('\n');
+
+    const diversityConstraint =
+      `\n\n## AREA COVERAGE (target under-explored areas)\n${areaCoverage}\n` +
+      (overTargeted.length > 0 || overTargetedAreas.length > 0
+        ? `\n## DIVERSITY CONSTRAINT\n` +
+          (overTargetedAreas.length > 0
+            ? `These AREAS have been over-targeted and MUST NOT be chosen:\n${overTargetedAreas.map(a => `- ${a} (${recentAreas.get(a)} proposals)`).join('\n')}\n`
+            : '') +
+          (overTargeted.length > 0
+            ? `These specific targets MUST NOT be re-targeted:\n${overTargeted.map(t => `- ${t}`).join('\n')}\n`
+            : '') +
+          `Choose a DIFFERENT area/target. If no other improvement is needed, output { "area": null }.\n`
+        : '');
 
     const patternAnalysis = this.analyzeExperimentPatterns(history);
 
@@ -686,51 +689,73 @@ export class SelfImproveLoop {
         `- Focus on improving this agent's personality, instructions, and task execution quality.\n`
       : '';
 
-    const prompt =
-      `You are Clementine's self-improvement strategist. Analyze performance data and propose ONE specific improvement.\n\n` +
+    // ── Step 1: Analysis — identify top opportunities from metrics (no config dumps) ──
+    const analysisPrompt =
+      `You are Clementine's self-improvement strategist. Analyze the performance data below and identify the top 3 improvement opportunities.\n\n` +
       `## Recent Performance Data (last 7 days)\n` +
       `- Feedback: ${metrics.feedbackStats.positive} positive, ${metrics.feedbackStats.negative} negative, ${metrics.feedbackStats.mixed} mixed (${metrics.feedbackStats.total} total)\n` +
       `- Cron success rate: ${(metrics.cronSuccessRate * 100).toFixed(1)}%\n\n` +
       `### Negative feedback examples:\n${negativeFeedbackText}\n\n` +
       `### Cron job quality reflections (automated self-evaluation):\n${cronReflectionsText}\n\n` +
       `### Per-agent cron performance:\n${perAgentText}\n\n` +
-      `### Communication signals in feedback:\n` +
-      `- "silent", "no update", "how's it going" → agent didn't report progress\n` +
-      `- "too verbose", "just do it" → over-communication\n` +
-      `- "confused", "what happened" → unclear status\n\n` +
       `### Goal health:\n${goalHealthText}\n\n` +
-      `### Goal health signals:\n` +
-      `- STALE goals → cron prompts aren't making progress, or goals aren't linked to crons\n` +
-      `- Goals with 0 progress notes → agents never started working on them\n` +
-      `- Goals with no linked crons → no automated work loop driving progress\n\n` +
-      `### Execution advisor intervention outcomes:\n${advisorText}\n` +
-      `(If an intervention has low success, the job may need a prompt rewrite rather than parameter tuning.)\n\n` +
+      `### Execution advisor intervention outcomes:\n${advisorText}\n\n` +
       `### Cron job errors:\n${cronErrorsText}\n\n` +
       targetedTriggers +
-      `## Current Configuration\n` +
-      `### SOUL.md (personality/behavior):\n${soulContent}\n\n` +
-      `### AGENTS.md (operating instructions):\n${agentsContent}\n\n` +
-      `### CRON.md (scheduled jobs):\n${cronContent}\n\n` +
-      `### Workflows:\n${workflowSummaries}\n\n` +
-      `### Agent configs (team members with their own personality/tools):\n${agentSummaries}\n\n` +
       `## Experiment History (avoid repeating failed approaches):\n${historyText}\n\n` +
-      (patternAnalysis ? `\n\n${patternAnalysis}\n` : '') +
+      (patternAnalysis ? `${patternAnalysis}\n\n` : '') +
       diversityConstraint +
       agentFocusText +
-      `## Instructions\n` +
-      `- Focus on areas: ${areas}\n` +
-      `- Identify the SINGLE highest-impact improvement area\n` +
-      `- When an agent's average quality is below 3.0 or empty output rate exceeds 10%, prioritize improving their agent.md system prompt or cron job prompts (area: "agent", target: the agent slug)\n` +
-      `- Cross-reference per-agent performance with advisor intervention data: if an agent's jobs have low intervention success AND low quality, the agent's instructions likely need rewriting\n` +
-      `- For agents with high empty output rates, check if their cron prompts are too vague or success criteria are missing\n` +
-      `- Propose a SPECIFIC, MINIMAL change (not a full rewrite)\n` +
-      `- Explain WHY this change should improve the metric\n` +
-      `- IMPORTANT: "proposedChange" must be the COMPLETE updated file content (not just the diff or changed section), because it will replace the entire file\n` +
-      `- If there's no clear improvement needed, output: { "area": null }\n\n` +
-      `Output ONLY a JSON object with this structure (no markdown, no explanation):\n` +
-      `{ "area": "soul"|"cron"|"workflow"|"memory"|"agent"|"communication", "target": "file name or section (for agent, use the slug; for communication, use 'AGENTS.md')", "hypothesis": "what will improve and why", "proposedChange": "the complete updated file content with your minimal change applied" }`;
+      `\n## Instructions\n` +
+      `Rank these by expected impact. For each opportunity, specify:\n` +
+      `- area: ${areas}\n` +
+      `- target: the file/agent slug that should change\n` +
+      `- what: a 1-sentence description of what specifically should change\n` +
+      `- why: which metric this should improve\n\n` +
+      `Output ONLY a JSON array of 1-3 objects (no markdown, no explanation):\n` +
+      `[{ "area": "...", "target": "...", "what": "...", "why": "..." }]\n` +
+      `If no improvement is needed, output: []`;
 
-    const result = await this.assistant.runPlanStep('si-hypothesize', prompt, {
+    const analysisResult = await this.assistant.runPlanStep('si-analyze', analysisPrompt, {
+      tier: 2,
+      maxTurns: 3,
+      disableTools: true,
+    });
+
+    const opportunities = this.parseJsonResponse<Array<{
+      area: SelfImproveExperiment['area'];
+      target: string;
+      what: string;
+      why: string;
+    }>>(analysisResult);
+
+    if (!opportunities || opportunities.length === 0) return null;
+
+    // Pick the first opportunity that isn't over-targeted
+    const selected = opportunities.find(o => {
+      const key = `${o.area}:${o.target}`;
+      return !overTargeted.includes(key) && !overTargetedAreas.includes(o.area);
+    }) ?? opportunities[0];
+
+    // ── Step 2: Proposal — load only the target file, generate specific change ──
+    const currentContent = await this.readCurrentState(selected.area, selected.target);
+
+    const proposalPrompt =
+      `You identified this as the highest-impact improvement:\n` +
+      `- Area: ${selected.area}\n` +
+      `- Target: ${selected.target}\n` +
+      `- What: ${selected.what}\n` +
+      `- Why: ${selected.why}\n\n` +
+      `## Current file content:\n${currentContent.slice(0, 5000)}\n\n` +
+      `## Instructions\n` +
+      `- Generate a SPECIFIC, MINIMAL change (not a full rewrite)\n` +
+      `- Explain WHY this change should improve the metric\n` +
+      `- IMPORTANT: "proposedChange" must be the COMPLETE updated file content (not just the diff), because it will replace the entire file\n` +
+      `- For source code changes: preserve all imports, exports, and function signatures. Only modify implementation details.\n\n` +
+      `Output ONLY a JSON object (no markdown, no explanation):\n` +
+      `{ "area": "${selected.area}", "target": "${selected.target}", "hypothesis": "what will improve and why", "proposedChange": "the complete updated file content with your minimal change applied" }`;
+
+    const result = await this.assistant.runPlanStep('si-hypothesize', proposalPrompt, {
       tier: 2,
       maxTurns: 5,
       disableTools: true,
@@ -783,18 +808,19 @@ export class SelfImproveLoop {
     hypothesis: string,
   ): Promise<{ score: number; reasoning: string } | null> {
     const prompt =
-      `Score this proposed change to Clementine's configuration on a 0-10 scale.\n\n` +
+      `Score this proposed change using the structured rubric below.\n\n` +
       `## Current text (before):\n${before.slice(0, 3000)}\n\n` +
       `## Proposed change (after):\n${after.slice(0, 3000)}\n\n` +
       `## Hypothesis:\n${hypothesis}\n\n` +
-      `## Criteria:\n` +
-      `1. Clarity: Is the new text clearer and more specific?\n` +
-      `2. Safety: Does it maintain appropriate guardrails?\n` +
-      `3. Impact: Will it likely improve the identified weakness?\n` +
-      `4. Risk: Could it cause regressions in other areas?\n` +
-      `5. Minimality: Is it the smallest change that achieves the goal?\n\n` +
+      `## Rubric (score each criterion 0, 1, or 2):\n` +
+      `1. Specificity: 0=vague/generic, 1=somewhat specific, 2=precise and actionable\n` +
+      `2. Evidence: 0=no data backing, 1=some metric reference, 2=directly addresses a measured weakness\n` +
+      `3. Safety: 0=breaks guardrails or removes constraints, 1=minor concern, 2=clean, maintains all constraints\n` +
+      `4. Impact: 0=unlikely to help, 1=plausible improvement, 2=high-confidence improvement\n` +
+      `5. Novelty: 0=repeat of a failed approach, 1=incremental variation, 2=fresh angle\n\n` +
+      `Sum the 5 scores for a total 0-10.\n\n` +
       `Output ONLY a JSON object (no markdown, no explanation):\n` +
-      `{ "score": <0-10>, "reasoning": "brief explanation" }`;
+      `{ "specificity": <0-2>, "evidence": <0-2>, "safety": <0-2>, "impact": <0-2>, "novelty": <0-2>, "score": <0-10>, "reasoning": "brief explanation" }`;
 
     const result = await this.assistant.runPlanStep('si-evaluate', prompt, {
       tier: 2,
@@ -1305,7 +1331,24 @@ export class SelfImproveLoop {
 // ── Utility ──────────────────────────────────────────────────────────
 
 /** Validate that a proposed change has valid syntax for its target area. */
-export function validateProposal(area: string, _target: string, proposedChange: string): { valid: boolean; error?: string } {
+/** Files that must never be modified by self-improvement (catastrophic blast radius or self-referential). */
+const SOURCE_BLOCKLIST = new Set([
+  'config.ts',
+  'types.ts',
+  'gateway/router.ts',
+  'gateway/lanes.ts',
+  'gateway/heartbeat-scheduler.ts',
+  'gateway/cron-scheduler.ts',
+  'gateway/security-scanner.ts',
+  'agent/self-improve.ts',
+  'agent/safe-restart.ts',
+  'agent/source-mods.ts',
+  'cli/index.ts',
+  'cli/dashboard.ts',
+  'security/scanner.ts',
+]);
+
+export function validateProposal(area: string, target: string, proposedChange: string): { valid: boolean; error?: string } {
   if (!proposedChange.trim()) {
     return { valid: false, error: 'Proposed change is empty' };
   }
@@ -1331,6 +1374,17 @@ export function validateProposal(area: string, _target: string, proposedChange: 
       }
     } catch (err) {
       return { valid: false, error: `CRON.md validation failed: ${err}` };
+    }
+  }
+  if (area === 'source') {
+    // Check blocklist
+    if (SOURCE_BLOCKLIST.has(target)) {
+      return { valid: false, error: `Source file '${target}' is in the blocklist and cannot be modified by self-improvement` };
+    }
+    // Size sanity: reject wholesale rewrites (proposed content > 2x original would be caught by caller)
+    // Check basic TypeScript structure: must contain at least one import or export
+    if (!proposedChange.includes('import ') && !proposedChange.includes('export ')) {
+      return { valid: false, error: 'Source proposal missing import/export statements — likely not valid TypeScript' };
     }
   }
   return { valid: true };

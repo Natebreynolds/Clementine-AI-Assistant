@@ -64,6 +64,13 @@ export class HeartbeatScheduler {
     this.dispatcher = dispatcher;
     this.stateFile = path.join(BASE_DIR, '.heartbeat_state.json');
     this.lastState = this.loadState();
+
+    // Restore persisted scheduling dates from state so they survive restarts
+    if (this.lastState.lastSelfImproveDate) this.lastSelfImproveDate = this.lastState.lastSelfImproveDate;
+    if (this.lastState.lastConsolidationDate) this.lastConsolidationDate = this.lastState.lastConsolidationDate;
+    if (this.lastState.lastAgentSiRuns) {
+      this.lastAgentSiRuns = new Map(Object.entries(this.lastState.lastAgentSiRuns));
+    }
   }
 
   start(): void {
@@ -132,6 +139,69 @@ export class HeartbeatScheduler {
     const now = new Date();
     const hour = now.getHours();
 
+    // ── Nightly tasks: run regardless of active hours ─────────────────
+    // These have their own hour/date guards and must fire outside active hours.
+
+    // Nightly self-improvement: run once per day at 1 AM
+    if (hour === 1 && this.lastSelfImproveDate !== todayISO()) {
+      this.lastSelfImproveDate = todayISO();
+      this.lastState.lastSelfImproveDate = this.lastSelfImproveDate;
+      this.saveState();
+      logger.info('Triggering nightly self-improvement cycle');
+      this.gateway.handleSelfImprove('run-nightly').catch(err => {
+        logger.error({ err }, 'Nightly self-improvement failed');
+      });
+    }
+
+    // Weekly per-agent improvement: one agent per day at 2 AM, cycling through
+    if (hour === 2) {
+      try {
+        const agentMgr = this.gateway.getAgentManager();
+        const agents = agentMgr.listAll().filter(a => a.slug !== 'clementine');
+        if (agents.length > 0) {
+          const dayOfYear = Math.floor((Date.now() - new Date(now.getFullYear(), 0, 0).getTime()) / 86400000);
+          const agentIndex = dayOfYear % agents.length;
+          const targetAgent = agents[agentIndex];
+
+          const lastRun = this.getLastAgentSiRun(targetAgent.slug);
+          const daysSinceLastRun = lastRun ? (Date.now() - new Date(lastRun).getTime()) / 86400000 : Infinity;
+
+          if (daysSinceLastRun >= 7) {
+            logger.info({ agentSlug: targetAgent.slug }, 'Triggering weekly per-agent self-improvement');
+            this.gateway.handleSelfImprove('run-agent', { experimentId: targetAgent.slug }).catch(err => {
+              logger.error({ err, agentSlug: targetAgent.slug }, 'Per-agent self-improvement failed');
+            });
+            this.setLastAgentSiRun(targetAgent.slug);
+            this.lastState.lastAgentSiRuns = Object.fromEntries(this.lastAgentSiRuns);
+            this.saveState();
+          }
+        }
+      } catch (err) {
+        logger.warn({ err }, 'Per-agent self-improvement scheduling error');
+      }
+    }
+
+    // Evening memory consolidation: once per day between 7-9 PM
+    if (hour >= 19 && hour < 21 && this.lastConsolidationDate !== todayISO()) {
+      this.lastConsolidationDate = todayISO();
+      this.lastState.lastConsolidationDate = this.lastConsolidationDate;
+      this.saveState();
+      logger.info('Triggering evening memory consolidation');
+      this.gateway.handleCronJob(
+        'memory-consolidation',
+        'Review today\'s daily note and recent conversations. Promote any durable facts ' +
+        '(preferences, decisions, people info, project updates) to long-term memory using ' +
+        'memory_write. Skip anything already in MEMORY.md. Be selective — only save facts ' +
+        'that will be useful in future conversations. Do not create duplicate entries.',
+        1, // tier 1 (vault-only)
+        3, // max 3 turns
+        'haiku',
+      ).catch(err => {
+        logger.error({ err }, 'Evening memory consolidation failed');
+      });
+    }
+
+    // ── Active hours check ────────────────────────────────────────────
     // Check active hours
     if (hour < HEARTBEAT_ACTIVE_START || hour >= HEARTBEAT_ACTIVE_END) {
       logger.debug(`Heartbeat skipped: outside active hours (${hour}:00)`);
@@ -329,61 +399,6 @@ export class HeartbeatScheduler {
     this.processInbox();
     } // end of shouldInvokeAgent else-block
 
-    // Nightly self-improvement: run once per day at 2 AM
-    if (hour === 2 && this.lastSelfImproveDate !== todayISO()) {
-      this.lastSelfImproveDate = todayISO();
-      logger.info('Triggering nightly self-improvement cycle');
-      this.gateway.handleSelfImprove('run-nightly').catch(err => {
-        logger.error({ err }, 'Nightly self-improvement failed');
-      });
-    }
-
-    // Evening memory consolidation: once per day between 7-9 PM
-    if (hour >= 19 && hour < 21 && this.lastConsolidationDate !== todayISO()) {
-      this.lastConsolidationDate = todayISO();
-      logger.info('Triggering evening memory consolidation');
-      // Run as a lightweight cron-style task — reviews today's notes and
-      // promotes durable facts to long-term memory
-      this.gateway.handleCronJob(
-        'memory-consolidation',
-        'Review today\'s daily note and recent conversations. Promote any durable facts ' +
-        '(preferences, decisions, people info, project updates) to long-term memory using ' +
-        'memory_write. Skip anything already in MEMORY.md. Be selective — only save facts ' +
-        'that will be useful in future conversations. Do not create duplicate entries.',
-        1, // tier 1 (vault-only)
-        3, // max 3 turns
-        'haiku',
-      ).catch(err => {
-        logger.error({ err }, 'Evening memory consolidation failed');
-      });
-    }
-
-    // Weekly per-agent improvement: one agent per day, cycling through
-    if (hour === 3) {
-      try {
-        const agentMgr = this.gateway.getAgentManager();
-        const agents = agentMgr.listAll().filter(a => a.slug !== 'clementine');
-        if (agents.length > 0) {
-          const dayOfYear = Math.floor((Date.now() - new Date(now.getFullYear(), 0, 0).getTime()) / 86400000);
-          const agentIndex = dayOfYear % agents.length;
-          const targetAgent = agents[agentIndex];
-
-          // Only run weekly (check if 7 days since last run for this agent)
-          const lastRun = this.getLastAgentSiRun(targetAgent.slug);
-          const daysSinceLastRun = lastRun ? (Date.now() - new Date(lastRun).getTime()) / 86400000 : Infinity;
-
-          if (daysSinceLastRun >= 7) {
-            logger.info({ agentSlug: targetAgent.slug }, 'Triggering weekly per-agent self-improvement');
-            this.gateway.handleSelfImprove('run-agent', { experimentId: targetAgent.slug }).catch(err => {
-              logger.error({ err, agentSlug: targetAgent.slug }, 'Per-agent self-improvement failed');
-            });
-            this.setLastAgentSiRun(targetAgent.slug);
-          }
-        }
-      } catch (err) {
-        logger.warn({ err }, 'Per-agent self-improvement scheduling error');
-      }
-    }
   }
 
   private readHeartbeatConfig(): string {

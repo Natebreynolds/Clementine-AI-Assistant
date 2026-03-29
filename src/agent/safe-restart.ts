@@ -25,10 +25,20 @@ const logger = pino({ name: 'clementine.safe-restart' });
 
 const SENTINEL_PATH = path.join(BASE_DIR, '.restart-sentinel.json');
 
-/** Files that cannot be self-edited (security-critical). */
+/** Files that cannot be self-edited (security-critical or self-referential). */
 const BLOCKLIST = new Set([
   'src/config.ts',
+  'src/types.ts',
+  'src/gateway/router.ts',
+  'src/gateway/lanes.ts',
+  'src/gateway/heartbeat-scheduler.ts',
+  'src/gateway/cron-scheduler.ts',
   'src/gateway/security-scanner.ts',
+  'src/agent/self-improve.ts',
+  'src/agent/safe-restart.ts',
+  'src/agent/source-mods.ts',
+  'src/cli/index.ts',
+  'src/cli/dashboard.ts',
   'src/security/scanner.ts',
 ]);
 
