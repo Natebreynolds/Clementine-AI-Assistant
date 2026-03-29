@@ -7024,6 +7024,7 @@ function getDashboardHTML(token: string): string {
         <button class="active" onclick="switchTab('automations','scheduled')">Scheduled Tasks</button>
         <button onclick="switchTab('automations','timers')">Timers <span class="tab-badge" id="tab-timer-count" style="display:none">0</span></button>
         <button onclick="switchTab('automations','self-improve')">Self-Improve <span class="tab-badge" id="tab-si-pending" style="display:none">0</span></button>
+        <button onclick="switchTab('automations','skills')">Skills <span class="tab-badge" id="tab-skill-count" style="display:none">0</span></button>
         <button onclick="switchTab('automations','workflows')">Workflows</button>
         <button onclick="switchTab('automations','analytics')">Execution Analytics</button>
       </div>
@@ -7045,6 +7046,15 @@ function getDashboardHTML(token: string): string {
           <div class="card" style="margin-top:16px">
             <div class="card-header">Experiment History</div>
             <div class="card-body" id="si-history-list"><div class="empty-state">No experiments yet</div></div>
+          </div>
+        </div>
+        <div class="tab-pane" id="tab-automations-skills">
+          <div class="card">
+            <div class="card-header" style="display:flex;align-items:center;justify-content:space-between">
+              <span>Procedural Memory</span>
+              <span class="badge badge-gray" id="skill-count-badge" style="font-size:10px">0 skills</span>
+            </div>
+            <div class="card-body" id="panel-skills"><div class="empty-state">No skills learned yet. Skills are auto-extracted from successful tasks or taught via the teach_skill tool.</div></div>
           </div>
         </div>
         <div class="tab-pane" id="tab-automations-workflows">
@@ -7953,7 +7963,7 @@ function navigateTo(page, opts) {
   // Page-specific refresh
   if (page === 'home') { refreshStatus(); refreshActivity(); refreshHomePlan(); refreshTeamPulse(); }
   if (page === 'chat') { loadProfiles(); document.getElementById('chat-input').focus(); }
-  if (page === 'automations') { refreshCron(); refreshTimers(); refreshSelfImprove(); }
+  if (page === 'automations') { refreshCron(); refreshTimers(); refreshSelfImprove(); refreshSkills(); }
   if (page === 'intelligence') { refreshMemory(); }
   if (page === 'settings') { refreshSettings(); refreshRemoteAccess(); refreshProjects(); refreshSalesforce(); }
   if (page === 'logs') refreshLogs();
@@ -12419,6 +12429,45 @@ async function showWorkflowRuns(name) {
     html += '</tbody></table>';
     panel.innerHTML = html;
   } catch(e) { panel.innerHTML = '<div style="font-size:12px;color:var(--red);padding:8px 0">Failed: ' + esc(String(e)) + '</div>'; }
+}
+
+async function refreshSkills() {
+  try {
+    var r = await apiFetch('/api/skills');
+    var d = await r.json();
+    var skills = d.skills || [];
+    var badge = document.getElementById('tab-skill-count');
+    var countBadge = document.getElementById('skill-count-badge');
+    if (badge) { badge.textContent = skills.length || ''; badge.style.display = skills.length > 0 ? '' : 'none'; }
+    if (countBadge) countBadge.textContent = skills.length + ' skill' + (skills.length !== 1 ? 's' : '');
+    var container = document.getElementById('panel-skills');
+    if (!container) return;
+    if (skills.length === 0) {
+      container.innerHTML = '<div class="empty-state">No skills learned yet. Skills are auto-extracted from successful tasks or taught via the teach_skill tool.</div>';
+      return;
+    }
+    var html = '<div style="display:flex;flex-direction:column;gap:12px">';
+    for (var s of skills) {
+      var sourceTag = s.source === 'manual' ? '<span class="badge badge-blue" style="font-size:10px">taught</span>'
+        : s.source === 'cron' ? '<span class="badge badge-green" style="font-size:10px">cron</span>'
+        : s.source === 'unleashed' ? '<span class="badge badge-purple" style="font-size:10px">unleashed</span>'
+        : '<span class="badge badge-gray" style="font-size:10px">' + esc(s.source) + '</span>';
+      var triggers = (s.triggers || []).map(function(t) { return '<code style="font-size:11px;background:var(--bg-tertiary);padding:2px 6px;border-radius:3px">' + esc(t) + '</code>'; }).join(' ');
+      html += '<div style="padding:12px;border:1px solid var(--border);border-radius:8px;background:var(--bg-secondary)">'
+        + '<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">'
+        + '<strong>' + esc(s.title) + '</strong> ' + sourceTag
+        + '<span style="margin-left:auto;font-size:11px;color:var(--text-muted)">used ' + s.useCount + 'x</span>'
+        + '</div>'
+        + '<div style="font-size:12px;color:var(--text-secondary);margin-bottom:6px">' + esc(s.description) + '</div>'
+        + (triggers ? '<div style="display:flex;gap:4px;flex-wrap:wrap">' + triggers + '</div>' : '')
+        + '</div>';
+    }
+    html += '</div>';
+    container.innerHTML = html;
+  } catch(e) {
+    var c = document.getElementById('panel-skills');
+    if (c) c.innerHTML = '<div class="empty-state" style="color:var(--red)">Failed to load skills</div>';
+  }
 }
 
 async function refreshSelfImprove() {

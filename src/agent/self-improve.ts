@@ -735,6 +735,22 @@ export class SelfImproveLoop {
       tier: 2,
       maxTurns: 3,
       disableTools: true,
+      outputFormat: {
+        type: 'json_schema',
+        schema: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              area: { type: 'string' },
+              target: { type: 'string' },
+              what: { type: 'string' },
+              why: { type: 'string' },
+            },
+            required: ['area', 'target', 'what', 'why'],
+          },
+        },
+      },
     });
 
     const rawOpportunities = this.parseJsonResponse<Array<{
@@ -1140,6 +1156,36 @@ export class SelfImproveLoop {
         },
       );
       writeFileSync(feedbackFile, content);
+
+      // Write agent-specific PREFERENCES.md for agents with enough data
+      const agentReflections = new Map<string, typeof reflections>();
+      for (const r of reflections) {
+        if (r.agentSlug && r.agentSlug !== 'clementine') {
+          if (!agentReflections.has(r.agentSlug)) agentReflections.set(r.agentSlug, []);
+          agentReflections.get(r.agentSlug)!.push(r);
+        }
+      }
+      for (const [slug, agentRefls] of agentReflections) {
+        if (agentRefls.length < 2) continue; // Need enough data
+        const agentCorrections = agentRefls.flatMap(r => r.behavioralCorrections);
+        if (agentCorrections.length === 0) continue;
+
+        const agentPrefs = agentCorrections.map(c =>
+          `- [${c.category}] ${c.correction} (${c.strength})`
+        ).join('\n');
+
+        const agentDir = path.join(AGENTS_DIR, slug);
+        if (existsSync(agentDir)) {
+          const prefsFile = path.join(agentDir, 'PREFERENCES.md');
+          const prefsContent = matter.stringify(`\n## Agent Preferences\n\n${agentPrefs}\n`, {
+            preferences: agentPrefs,
+            last_synthesized: new Date().toISOString(),
+            reflection_count: agentRefls.length,
+          });
+          writeFileSync(prefsFile, prefsContent);
+          logger.info({ slug, corrections: agentCorrections.length }, 'Agent-specific preferences written');
+        }
+      }
 
       logger.info({
         bullets: bullets.length,
