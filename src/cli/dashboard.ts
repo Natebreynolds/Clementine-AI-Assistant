@@ -1317,6 +1317,9 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
       res.type('html').send(getLoginPageHTML());
       return;
     }
+    // Prevent browser/service-worker caching — token changes on every restart
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+    res.setHeader('Pragma', 'no-cache');
     res.type('html').send(getDashboardHTML(dashboardToken));
   });
 
@@ -4564,13 +4567,20 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
 
   app.get('/sw.js', (_req, res) => {
     res.setHeader('Content-Type', 'application/javascript');
-    res.send(`const CACHE = 'clem-v1';
-const SHELL = ['/', '/manifest.json', '/icon.svg'];
+    // Use build hash in cache name so updates bust the cache automatically
+    res.send(`const CACHE = 'clem-${buildHash}';
+const SHELL = ['/manifest.json', '/icon.svg'];
 self.addEventListener('install', e => e.waitUntil(caches.open(CACHE).then(c => c.addAll(SHELL)).then(() => self.skipWaiting())));
 self.addEventListener('activate', e => e.waitUntil(caches.keys().then(ks => Promise.all(ks.filter(k => k !== CACHE).map(k => caches.delete(k)))).then(() => self.clients.claim())));
 self.addEventListener('fetch', e => {
   if (e.request.method !== 'GET') return;
   if (e.request.url.includes('/api/')) return;
+  const url = new URL(e.request.url);
+  if (url.pathname === '/') {
+    // Always fetch fresh HTML (contains auth token) — never serve from cache
+    e.respondWith(fetch(e.request).catch(() => caches.match(e.request)));
+    return;
+  }
   e.respondWith(caches.match(e.request).then(r => r || fetch(e.request)));
 });`);
   });
