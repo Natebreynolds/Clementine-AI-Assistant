@@ -2278,6 +2278,7 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
       label: 'Model',
       keys: [
         { key: 'DEFAULT_MODEL_TIER', label: 'Default Tier', hint: 'haiku, sonnet, or opus', type: 'select:haiku,sonnet,opus' },
+        { key: 'ENABLE_1M_CONTEXT', label: '1M Context', hint: 'Enable 1M token context window for Sonnet (beta)', type: 'toggle' },
       ],
     },
     {
@@ -2448,7 +2449,7 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
     }
   });
 
-  app.put('/api/settings/:key', (req, res) => {
+  app.put('/api/settings/:key', async (req, res) => {
     try {
       const { key } = req.params;
       const { value } = req.body;
@@ -2462,6 +2463,13 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
         return;
       }
       writeEnvValue(key, value);
+
+      // Apply runtime-hot settings immediately (no restart needed)
+      if (key === 'ENABLE_1M_CONTEXT') {
+        const { setEnable1MContext } = await import('../config.js');
+        setEnable1MContext(value.toLowerCase() === 'true');
+      }
+
       res.json({ ok: true, message: `Updated ${key}` });
     } catch (err) {
       res.status(500).json({ error: String(err) });
@@ -10395,7 +10403,14 @@ async function refreshSettings() {
       for (var f of g.fields) {
         var inputId = 'setting-' + f.key;
         var inputHtml = '';
-        if (f.type && f.type.startsWith('select:')) {
+        if (f.type === 'toggle') {
+          var isOn = f.value === 'true';
+          inputHtml = '<label style="display:inline-flex;align-items:center;gap:8px;cursor:pointer">'
+            + '<div id="' + inputId + '" data-key="' + f.key + '" data-on="' + (isOn ? '1' : '0') + '" onclick="toggleSetting(this)"'
+            + ' style="width:40px;height:22px;border-radius:11px;background:' + (isOn ? 'var(--green,#2ecc71)' : 'var(--border,#555)') + ';position:relative;transition:background 0.2s;cursor:pointer">'
+            + '<div style="width:18px;height:18px;border-radius:50%;background:#fff;position:absolute;top:2px;' + (isOn ? 'left:20px' : 'left:2px') + ';transition:left 0.2s;box-shadow:0 1px 3px rgba(0,0,0,0.3)"></div></div>'
+            + '<span style="font-size:13px;color:var(--text-primary)">' + (isOn ? 'Enabled' : 'Disabled') + '</span></label>';
+        } else if (f.type && f.type.startsWith('select:')) {
           var options = f.type.slice(7).split(',');
           inputHtml = '<select id="' + inputId + '" style="width:100%;padding:6px 10px;border:1px solid var(--border);border-radius:4px;background:var(--bg-secondary);color:var(--text-primary);font-size:13px">';
           inputHtml += '<option value=""' + (!f.value ? ' selected' : '') + '>—</option>';
@@ -10480,6 +10495,19 @@ async function settingSave(input) {
   if (!value) return;
   await saveSettingValue(key, value);
   input.dataset.original = input.dataset.isPassword === '1' ? value.slice(0, 4) + '****' + value.slice(-4) : value;
+}
+
+async function toggleSetting(el) {
+  var key = el.dataset.key;
+  var isOn = el.dataset.on === '1';
+  var newValue = isOn ? 'false' : 'true';
+  el.dataset.on = isOn ? '0' : '1';
+  // Update visual state immediately
+  el.style.background = !isOn ? 'var(--green,#2ecc71)' : 'var(--border,#555)';
+  el.firstChild.style.left = !isOn ? '20px' : '2px';
+  var label = el.nextElementSibling;
+  if (label) label.textContent = !isOn ? 'Enabled' : 'Disabled';
+  await saveSettingValue(key, newValue);
 }
 
 async function saveSettingValue(key, value) {
