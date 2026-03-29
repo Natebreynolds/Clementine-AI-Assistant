@@ -737,14 +737,19 @@ export class SelfImproveLoop {
       disableTools: true,
     });
 
-    const opportunities = this.parseJsonResponse<Array<{
+    const rawOpportunities = this.parseJsonResponse<Array<{
       area: SelfImproveExperiment['area'];
       target: string;
       what: string;
       why: string;
     }>>(analysisResult);
 
-    if (!opportunities || opportunities.length === 0) return null;
+    // Guard: parseJsonResponse may return a non-array (single object, string, etc.)
+    const opportunities = Array.isArray(rawOpportunities)
+      ? rawOpportunities
+      : rawOpportunities ? [rawOpportunities as any] : [];
+
+    if (opportunities.length === 0) return null;
 
     // Pick the first opportunity that isn't over-targeted
     const selected = opportunities.find(o => {
