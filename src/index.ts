@@ -322,6 +322,7 @@ function ensureVaultDirs(): void {
   const dirs = [
     config.SYSTEM_DIR,
     path.join(config.SYSTEM_DIR, 'skills'),
+    config.AGENTS_DIR,
     config.DAILY_NOTES_DIR,
     config.PEOPLE_DIR,
     config.PROJECTS_DIR,

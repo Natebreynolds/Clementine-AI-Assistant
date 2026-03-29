@@ -6,6 +6,7 @@
  */
 
 import { input, select, checkbox, password, confirm } from '@inquirer/prompts';
+import { execSync } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { BASE_DIR, SYSTEM_DIR, PROJECTS_DIR, SOUL_FILE, MEMORY_FILE } from '../config.js';
@@ -16,6 +17,7 @@ const DIM = '\x1b[0;90m';
 const BOLD = '\x1b[1m';
 const ORANGE = '\x1b[38;5;208m';
 const GREEN = '\x1b[32m';
+const RED = '\x1b[31m';
 const CYAN = '\x1b[0;36m';
 const RESET = '\x1b[0m';
 
@@ -477,6 +479,65 @@ export async function runSetup(): Promise<void> {
   console.log(`  ${BOLD}Setup Wizard${RESET}`);
   console.log(`  ${DIM}Use arrow keys to navigate, space to toggle, enter to confirm.${RESET}`);
   console.log(`  ${DIM}Existing values are preserved as defaults.${RESET}`);
+
+  // ── Prerequisites check ─────────────────────────────────────────
+  console.log();
+  console.log(`  ${DIM}Checking prerequisites...${RESET}`);
+
+  // Node version
+  const major = parseInt(process.versions.node.split('.')[0], 10);
+  if (major < 20 || major > 24) {
+    console.error(`\n  ${RED}✗${RESET} Node.js v${process.versions.node} detected — requires 20-24 LTS`);
+    console.error(`    Fix: nvm install 22\n`);
+    process.exit(1);
+  }
+  console.log(`  ${GREEN}✓${RESET} Node.js v${process.versions.node}`);
+
+  // Claude Code CLI
+  let hasClaude = false;
+  try {
+    execSync('which claude', { stdio: 'pipe' });
+    hasClaude = true;
+  } catch { /* not found */ }
+
+  if (!hasClaude) {
+    console.log(`  ${ORANGE}!${RESET} Claude Code CLI not found`);
+    const installClaude = await confirm({
+      message: 'Claude Code CLI is required. Install it now? (npm install -g @anthropic-ai/claude-code)',
+      default: true,
+    });
+    if (installClaude) {
+      console.log(`  ${DIM}Installing Claude Code CLI...${RESET}`);
+      try {
+        execSync('npm install -g @anthropic-ai/claude-code', { stdio: 'inherit' });
+        console.log(`  ${GREEN}✓${RESET} Claude Code CLI installed`);
+      } catch {
+        console.error(`\n  ${RED}✗${RESET} Installation failed. Install manually: npm install -g @anthropic-ai/claude-code\n`);
+        process.exit(1);
+      }
+    } else {
+      console.error(`\n  ${RED}✗${RESET} Claude Code CLI is required. Install it: npm install -g @anthropic-ai/claude-code\n`);
+      process.exit(1);
+    }
+  } else {
+    console.log(`  ${GREEN}✓${RESET} Claude Code CLI`);
+  }
+
+  // better-sqlite3
+  try {
+    execSync('node -e "require(\'better-sqlite3\')"', { stdio: 'pipe', timeout: 5000 });
+    console.log(`  ${GREEN}✓${RESET} better-sqlite3`);
+  } catch {
+    console.log(`  ${ORANGE}!${RESET} better-sqlite3 native module needs rebuild`);
+    try {
+      execSync('npm rebuild better-sqlite3', { stdio: 'pipe' });
+      console.log(`  ${GREEN}✓${RESET} better-sqlite3 rebuilt`);
+    } catch {
+      console.log(`  ${DIM}  (non-fatal — memory search may not work until fixed)${RESET}`);
+    }
+  }
+
+  console.log();
 
   // ── Step 1: Identity ─────────────────────────────────────────────
   sectionHeader('Step 1: Identity');
