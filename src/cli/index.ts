@@ -1369,8 +1369,8 @@ async function cmdUpdate(options: { restart?: boolean; dryRun?: boolean }): Prom
     cmdDoctor({ fix: true }); // Fallback to in-memory version
   }
 
-  // 11. Kill any running dashboard process so it picks up new code on next start
-  //     Uses PID file — pgrep pattern can't match because process shows as "node dist/cli/index.js dashboard"
+  // 11. Kill any running dashboard process and relaunch after update
+  let dashboardWasRunning = false;
   try {
     const dashPidFile = path.join(BASE_DIR, '.dashboard.pid');
     if (existsSync(dashPidFile)) {
@@ -1378,12 +1378,28 @@ async function cmdUpdate(options: { restart?: boolean; dryRun?: boolean }): Prom
       if (!isNaN(dpid) && dpid !== process.pid) {
         try {
           process.kill(dpid, 'SIGTERM');
-          console.log(`  ${GREEN}OK${RESET}  Stopped dashboard process (restart with: clementine dashboard)`);
+          dashboardWasRunning = true;
+          console.log(`  ${GREEN}OK${RESET}  Stopped dashboard process`);
         } catch { /* already dead */ }
         try { unlinkSync(dashPidFile); } catch { /* ignore */ }
       }
     }
   } catch { /* no dashboard running */ }
+
+  // Re-launch dashboard if it was running (picks up fresh code)
+  if (dashboardWasRunning) {
+    try {
+      const { spawn: spawnChild } = await import('node:child_process');
+      const child = spawnChild('node', [path.join(PACKAGE_ROOT, 'dist/cli/index.js'), 'dashboard'], {
+        detached: true,
+        stdio: 'ignore',
+      });
+      child.unref();
+      console.log(`  ${GREEN}OK${RESET}  Dashboard relaunched`);
+    } catch {
+      console.log(`  ${YELLOW}WARN${RESET}  Could not relaunch dashboard — run: clementine dashboard`);
+    }
+  }
 
   // 12. Write update sentinel so the daemon can report what happened
   let commitHash = '';
