@@ -213,6 +213,18 @@ const AUTO_MEMORY_PROMPT = `You are a memory extraction agent. Your ONLY job is 
 - Use the MCP tools (memory_write, note_create, task_add, note_take).
 - NEVER respond to ${OWNER}. You are invisible. Just save facts and exit.
 
+## Behavioral Correction Detection:
+If ${OWNER} corrects HOW the assistant behaved (not a factual correction), output a JSON block:
+\`\`\`json-behavioral
+[
+  {"correction": "what the user wants changed", "category": "verbosity|tone|workflow|format|accuracy|proactivity|scope", "strength": "explicit|implicit"}
+]
+\`\`\`
+- "explicit" = user directly stated it ("don't summarize", "be more concise", "always check X first")
+- "implicit" = user's frustration or repeated redirections imply it
+- These are NOT facts about the world — they are preferences about assistant behavior.
+- If none detected, output an empty array [].
+
 ## Relationship Extraction:
 Additionally, after saving facts, output a JSON block with entity relationships found in this exchange:
 \`\`\`json-relationships
@@ -810,10 +822,21 @@ Delegate data-heavy work (SEO, analytics, bulk API calls for 3+ entities) to sub
 
     // Skip communication preferences and agentic instructions for autonomous runs
     if (!isAutonomous) {
+      // Shared communication preferences (all agents)
       const feedbackFile = path.join(VAULT_DIR, '00-System', 'FEEDBACK.md');
       const fbEntry = this.promptCache.get(feedbackFile);
       if (fbEntry?.data?.patterns_summary) {
         parts.push(`## Communication Preferences\n\n${fbEntry.data.patterns_summary}`);
+      }
+
+      // Agent-specific preferences (per-agent overrides)
+      if (profile?.agentDir) {
+        const agentPrefsFile = path.join(profile.agentDir, 'PREFERENCES.md');
+        this.promptCache.watch(agentPrefsFile);
+        const agentPrefs = this.promptCache.get(agentPrefsFile);
+        if (agentPrefs?.data?.preferences) {
+          parts.push(`## Agent-Specific Preferences (${profile.slug})\n\n${agentPrefs.data.preferences}`);
+        }
       }
 
       // Proactive feedback capture
@@ -1825,13 +1848,25 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
       `UUIDs, task IDs (T-001), URLs, file paths, email addresses, ` +
       `phone numbers, dates, branch names, PR numbers, and any other ` +
       `opaque identifiers. These cannot be reconstructed if lost.\n\n` +
-      `After the bullet points, add:\n\n` +
-      `## Communication Notes (1-2 bullets, only if notable)\n` +
-      `- Did the user redirect or correct the approach?\n` +
-      `- Did they express format/length preferences?\n` +
-      `- Did they seem frustrated, rushed, or particularly pleased?\n` +
-      `If nothing notable, write "No notable patterns."\n\n` +
-      `${conversation}\n\nRespond with ONLY the bullet points and communication notes, no preamble.`;
+      `After the bullet points, output a structured session reflection as a JSON block:\n\n` +
+      '```json-reflection\n' +
+      `{\n` +
+      `  "qualityScore": <1-5 where 1=user frustrated, 3=normal, 5=user delighted>,\n` +
+      `  "frictionSignals": ["user had to repeat X", "user said 'no not that'"],\n` +
+      `  "behavioralCorrections": [\n` +
+      `    {"correction": "what the user wants changed about assistant behavior", "category": "<category>", "strength": "explicit|implicit"}\n` +
+      `  ],\n` +
+      `  "preferencesLearned": [\n` +
+      `    {"preference": "what the user prefers", "confidence": "high|medium|low"}\n` +
+      `  ]\n` +
+      `}\n` +
+      '```\n\n' +
+      `Categories: verbosity, tone, workflow, format, accuracy, proactivity, scope.\n` +
+      `- "explicit" = user directly stated a correction ("don't summarize", "be more concise")\n` +
+      `- "implicit" = inferred from user frustration or repeated redirections\n` +
+      `- "high" confidence = user explicitly stated preference; "medium" = strong signal; "low" = single instance\n` +
+      `If no friction/corrections/preferences, use empty arrays and qualityScore 3.\n\n` +
+      `${conversation}\n\nRespond with ONLY the bullet points and the json-reflection block, no preamble.`;
 
     try {
       let summaryText = '';
@@ -1866,21 +1901,46 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
             this.memoryStore.indexEpisodicChunk(sessionKey, summaryText.trim());
           } catch { /* non-fatal */ }
 
-          // Auto-log communication notes as feedback for synthesis
+          // Parse structured session reflection and store
           try {
-            const commMatch = summaryText.match(/## Communication Notes[\s\S]*?\n([\s\S]*?)(?:\n##|$)/i);
-            if (commMatch) {
-              const notes = commMatch[1].trim();
-              if (notes && !notes.toLowerCase().includes('no notable patterns')) {
+            const reflMatch = summaryText.match(/```json-reflection\s*\n([\s\S]*?)```/);
+            if (reflMatch) {
+              const reflection = JSON.parse(reflMatch[1]);
+              const agentSlug = sessionKey.includes(':agent:')
+                ? sessionKey.split(':agent:')[1]?.split(':')[0]
+                : undefined;
+
+              this.memoryStore.saveSessionReflection({
+                sessionKey,
+                exchangeCount: exchanges.length,
+                frictionSignals: reflection.frictionSignals ?? [],
+                qualityScore: reflection.qualityScore ?? 3,
+                behavioralCorrections: reflection.behavioralCorrections ?? [],
+                preferencesLearned: reflection.preferencesLearned ?? [],
+                agentSlug,
+              });
+
+              // Log each behavioral correction as targeted feedback
+              for (const bc of (reflection.behavioralCorrections ?? [])) {
                 this.memoryStore.logFeedback({
                   sessionKey,
-                  channel: 'auto-reflection',
-                  rating: 'mixed',
-                  comment: notes,
+                  channel: 'behavioral-correction',
+                  rating: 'negative',
+                  comment: `[${bc.category}] ${bc.correction} (${bc.strength})`,
+                });
+              }
+
+              // Log each preference learned as positive feedback
+              for (const pl of (reflection.preferencesLearned ?? [])) {
+                this.memoryStore.logFeedback({
+                  sessionKey,
+                  channel: 'preference-learned',
+                  rating: 'positive',
+                  comment: `[${pl.confidence}] ${pl.preference}`,
                 });
               }
             }
-          } catch { /* non-fatal */ }
+          } catch { /* non-fatal — reflection parsing failure shouldn't block summary */ }
         }
         return summaryText.trim();
       }
@@ -2099,8 +2159,39 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
         }
       }
 
-      // Parse relationship triplets from extraction response and store in graph
+      // Parse outputs from extraction response
       const fullText = collectedText.join('');
+
+      // Parse behavioral corrections and store as session reflection data
+      const behMatch = fullText.match(/```json-behavioral\s*\n([\s\S]*?)```/);
+      if (behMatch && this.memoryStore) {
+        try {
+          const corrections = JSON.parse(behMatch[1]);
+          if (Array.isArray(corrections) && corrections.length > 0) {
+            // Store as a lightweight reflection from this single exchange
+            this.memoryStore.saveSessionReflection({
+              sessionKey: sessionKey ?? 'unknown',
+              exchangeCount: 1,
+              frictionSignals: [],
+              qualityScore: 3,
+              behavioralCorrections: corrections,
+              preferencesLearned: [],
+              agentSlug: profile?.slug,
+            });
+            // Also log as targeted feedback
+            for (const bc of corrections) {
+              this.memoryStore.logFeedback({
+                sessionKey,
+                channel: 'behavioral-correction',
+                rating: 'negative',
+                comment: `[${bc.category}] ${bc.correction} (${bc.strength})`,
+              });
+            }
+          }
+        } catch { /* non-fatal */ }
+      }
+
+      // Parse relationship triplets and store in graph
       const relMatch = fullText.match(/```json-relationships\s*\n([\s\S]*?)```/);
       if (relMatch) {
         try {

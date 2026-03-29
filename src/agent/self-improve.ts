@@ -689,6 +689,20 @@ export class SelfImproveLoop {
         `- Focus on improving this agent's personality, instructions, and task execution quality.\n`
       : '';
 
+    // Read SOUL.md evolution candidates from FEEDBACK.md (written by synthesizeFeedbackPatterns)
+    let soulCandidatesText = '';
+    try {
+      const feedbackFile = path.join(VAULT_DIR, '00-System', 'FEEDBACK.md');
+      if (existsSync(feedbackFile)) {
+        const parsed = matter(readFileSync(feedbackFile, 'utf-8'));
+        if (parsed.data?.soul_candidates) {
+          soulCandidatesText = `\n\n## Pending SOUL.md Evolution Candidates (from feedback synthesis)\n` +
+            `These are evidence-backed personality changes identified from user interactions. ` +
+            `Prioritize these when considering "soul" area improvements:\n${parsed.data.soul_candidates}\n`;
+        }
+      }
+    } catch { /* non-fatal */ }
+
     // ── Step 1: Analysis — identify top opportunities from metrics (no config dumps) ──
     const analysisPrompt =
       `You are Clementine's self-improvement strategist. Analyze the performance data below and identify the top 3 improvement opportunities.\n\n` +
@@ -706,6 +720,7 @@ export class SelfImproveLoop {
       (patternAnalysis ? `${patternAnalysis}\n\n` : '') +
       diversityConstraint +
       agentFocusText +
+      soulCandidatesText +
       `\n## Instructions\n` +
       `Rank these by expected impact. For each opportunity, specify:\n` +
       `- area: ${areas}\n` +
@@ -985,38 +1000,80 @@ export class SelfImproveLoop {
       const store = new MemoryStore(MEMORY_DB_PATH, VAULT_DIR);
       store.initialize();
 
+      // Gather from multiple sources
       const recentFeedback = store.getRecentFeedback(50);
+      const reflections = store.getRecentReflections(20);
+      const behavioralPatterns = store.getBehavioralPatterns(2);
+      const corrections = store.getRecentCorrections(10);
       store.close();
 
-      if (recentFeedback.length < 3) {
-        logger.info({ count: recentFeedback.length }, 'Not enough feedback to synthesize (need 3+)');
+      const totalSignals = recentFeedback.length + reflections.length + behavioralPatterns.length;
+      if (totalSignals < 3) {
+        logger.info({ totalSignals }, 'Not enough data to synthesize (need 3+)');
         return;
       }
 
-      // Group by rating for the synthesis prompt
+      // Format feedback by rating
       const grouped: Record<string, typeof recentFeedback> = {};
       for (const f of recentFeedback) {
         (grouped[f.rating] ??= []).push(f);
       }
-
       const feedbackLines: string[] = [];
       for (const [rating, items] of Object.entries(grouped)) {
         feedbackLines.push(`### ${rating.toUpperCase()} (${items.length})`);
         for (const f of items.slice(0, 15)) {
           const snippet = f.messageSnippet ? ` | Message: "${f.messageSnippet.slice(0, 100)}"` : '';
-          const resp = f.responseSnippet ? ` | Response: "${f.responseSnippet.slice(0, 100)}"` : '';
           const comment = f.comment ? ` | Comment: "${f.comment}"` : '';
-          feedbackLines.push(`- ${f.channel}${snippet}${resp}${comment}`);
+          feedbackLines.push(`- ${f.channel}${snippet}${comment}`);
         }
       }
 
+      // Format session reflections
+      const reflectionLines = reflections.map(r => {
+        const friction = r.frictionSignals.length > 0 ? ` | Friction: ${r.frictionSignals.join('; ')}` : '';
+        const corrections = r.behavioralCorrections.length > 0
+          ? ` | Corrections: ${r.behavioralCorrections.map(c => `${c.correction} [${c.category}]`).join('; ')}`
+          : '';
+        const prefs = r.preferencesLearned.length > 0
+          ? ` | Preferences: ${r.preferencesLearned.map(p => `${p.preference} [${p.confidence}]`).join('; ')}`
+          : '';
+        return `- Session ${r.sessionKey.slice(0, 30)} | Quality: ${r.qualityScore}/5 | ${r.exchangeCount} exchanges${friction}${corrections}${prefs}`;
+      });
+
+      // Format recurring behavioral patterns
+      const patternLines = behavioralPatterns.map(p =>
+        `- "${p.correction}" [${p.category}] — ${p.count} occurrences (last: ${p.lastSeen})`
+      );
+
       const prompt =
-        `Analyze this user feedback about an AI assistant's communication and distill 3-8 concise ` +
-        `communication preference bullets. Focus on HOW the user wants to be communicated with — ` +
-        `tone, format, length, proactivity, what to avoid.\n\n` +
-        `## Feedback Data (${recentFeedback.length} entries)\n${feedbackLines.join('\n')}\n\n` +
-        `Output ONLY a YAML-style bulleted list (each line starts with "- "). No preamble, no explanation.\n` +
-        `Example format:\n- Prefers concise answers unless elaboration is requested\n- Appreciates proactive blocker identification`;
+        `Analyze the multi-source data below about an AI assistant's interactions and produce TWO outputs.\n\n` +
+        `## 1. Feedback Entries (${recentFeedback.length})\n${feedbackLines.join('\n') || '(none)'}\n\n` +
+        `## 2. Session Reflections (${reflections.length})\n${reflectionLines.join('\n') || '(none)'}\n\n` +
+        `## 3. Recurring Behavioral Corrections (appeared 2+ times)\n${patternLines.join('\n') || '(none)'}\n\n` +
+        `## 4. Recent Fact Corrections (${corrections.length})\n` +
+        corrections.map(c => `- ${c.correction}`).join('\n') + '\n\n' +
+        `## OUTPUT 1: Communication Preferences\n` +
+        `Synthesize 5-10 specific, actionable behavioral rules from the evidence.\n` +
+        `Each rule should be:\n` +
+        `- Specific enough to follow ("Be concise" is bad; "Keep responses under 3 sentences unless asked for detail" is good)\n` +
+        `- Evidence-based (mention the signal count or pattern that supports it)\n` +
+        `- Categorized in brackets: [tone], [format], [verbosity], [proactivity], [workflow], [scope]\n\n` +
+        `## OUTPUT 2: SOUL.md Evolution Candidates\n` +
+        `Identify 0-3 patterns strong enough (3+ occurrences or high confidence) to warrant a change to the agent's\n` +
+        `core personality (SOUL.md). These should be durable behavioral shifts, not one-off preferences.\n` +
+        `For each candidate, output:\n` +
+        `- What trait should change\n` +
+        `- Current behavior → Desired behavior\n` +
+        `- Evidence count\n` +
+        `- Confidence: high (5+ signals) / medium (3-4 signals)\n\n` +
+        `Format your response as:\n` +
+        `## Communication Preferences\n` +
+        `- [category] Specific rule (evidence: N signals)\n` +
+        `...\n\n` +
+        `## SOUL.md Candidates\n` +
+        `- **Trait**: Current → Desired (evidence: N signals, confidence: high/medium)\n` +
+        `...\n\n` +
+        `If there are no SOUL.md candidates, write "No candidates — current personality is well-calibrated."`;
 
       const result = await this.assistant.runPlanStep('si-feedback-synthesis', prompt, {
         tier: 2,
@@ -1024,30 +1081,51 @@ export class SelfImproveLoop {
         disableTools: true,
       });
 
-      // Extract bullet lines from response
-      const bullets = result
-        .split('\n')
-        .map(l => l.trim())
-        .filter(l => l.startsWith('- '));
+      // Extract communication preferences
+      const prefSection = result.match(/## Communication Preferences\s*\n([\s\S]*?)(?=\n## SOUL|$)/i);
+      const bullets = prefSection
+        ? prefSection[1].split('\n').map(l => l.trim()).filter(l => l.startsWith('- '))
+        : result.split('\n').map(l => l.trim()).filter(l => l.startsWith('- '));
 
-      if (bullets.length === 0) {
-        logger.warn('Feedback synthesis returned no bullets');
+      // Extract SOUL.md candidates
+      const soulSection = result.match(/## SOUL\.md Candidates\s*\n([\s\S]*?)$/i);
+      const soulCandidates = soulSection
+        ? soulSection[1].split('\n').map(l => l.trim()).filter(l => l.startsWith('- '))
+        : [];
+
+      if (bullets.length === 0 && soulCandidates.length === 0) {
+        logger.warn('Feedback synthesis returned no output');
         return;
       }
 
       const patternsSummary = bullets.join('\n');
+      const soulCandidatesSummary = soulCandidates.length > 0
+        ? soulCandidates.join('\n')
+        : 'No candidates — current personality is well-calibrated.';
+
       const feedbackDir = path.join(VAULT_DIR, '00-System');
       if (!existsSync(feedbackDir)) mkdirSync(feedbackDir, { recursive: true });
 
       const feedbackFile = path.join(feedbackDir, 'FEEDBACK.md');
-      const content = matter.stringify('', {
-        patterns_summary: patternsSummary,
-        last_synthesized: new Date().toISOString(),
-        feedback_count: recentFeedback.length,
-      });
+      const content = matter.stringify(
+        `\n## Communication Preferences\n\n${patternsSummary}\n\n## Pending SOUL.md Candidates\n\n${soulCandidatesSummary}\n`,
+        {
+          patterns_summary: patternsSummary,
+          soul_candidates: soulCandidatesSummary,
+          last_synthesized: new Date().toISOString(),
+          feedback_count: recentFeedback.length,
+          reflection_count: reflections.length,
+          behavioral_correction_count: behavioralPatterns.length,
+        },
+      );
       writeFileSync(feedbackFile, content);
 
-      logger.info({ bullets: bullets.length, feedbackCount: recentFeedback.length }, 'Feedback patterns synthesized to FEEDBACK.md');
+      logger.info({
+        bullets: bullets.length,
+        soulCandidates: soulCandidates.length,
+        feedbackCount: recentFeedback.length,
+        reflectionCount: reflections.length,
+      }, 'Feedback patterns + SOUL.md candidates synthesized to FEEDBACK.md');
     } catch (err) {
       logger.error({ err }, 'Feedback synthesis failed');
     }
