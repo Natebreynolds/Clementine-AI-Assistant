@@ -62,24 +62,31 @@ The result: Clementine gets better the more you talk to it.
 
 ---
 
+## Prerequisites
+
+- **Node.js 20-24 LTS** — `nvm install 22`
+- **Claude Code CLI** — `npm install -g @anthropic-ai/claude-code` (the setup wizard will install this automatically if missing)
+
 ## Quick start
 
+One command to install everything and launch the setup wizard:
+
 ```bash
-git clone https://github.com/Natebreynolds/Clementine-AI-Assistant.git clementine && cd clementine && npm install --loglevel=error --no-audit && npm run build && npm install -g . --loglevel=error --no-audit
+npm install -g @anthropic-ai/claude-code && git clone https://github.com/Natebreynolds/Clementine-AI-Assistant.git clementine && cd clementine && npm install --loglevel=error --no-audit && npm run build && npm install -g . --loglevel=error --no-audit && clementine config setup
+```
+
+The setup wizard checks prerequisites, then walks you through identity, model, channels, and features. After setup:
+
+```bash
+clementine launch         # start as background daemon
+clementine status         # verify it's running
+clementine dashboard      # open the web command center
 ```
 
 Already have it? Update in place:
 
 ```bash
 clementine update
-```
-
-Then configure and launch:
-
-```bash
-clementine config setup   # interactive wizard
-clementine launch         # start as background daemon
-clementine status         # verify it's running
 ```
 
 That's it. Clementine is now running, connected to your configured channels, and learning.
@@ -111,6 +118,7 @@ That's it. Clementine is now running, connected to your configured channels, and
 │       └── {experiment-id}.json
 └── vault/                         ← Obsidian-compatible vault
     ├── 00-System/                 ← SOUL.md, MEMORY.md, HEARTBEAT.md, CRON.md
+    │   └── skills/                ← Procedural memory (auto-extracted from successful tasks)
     ├── 01-Daily-Notes/            ← Auto-generated daily logs (YYYY-MM-DD.md)
     ├── 02-People/                 ← Person notes (auto-created from conversations)
     ├── 03-Projects/               ← Project notes
@@ -353,6 +361,9 @@ WORKSPACE_DIRS=~/projects,~/work
 
 # Security
 ALLOW_ALL_USERS=false      # true = skip owner checks
+
+# Beta Features
+ENABLE_1M_CONTEXT=false    # Enable 1M token context for Sonnet (toggle in dashboard)
 ```
 
 Secrets can also be stored in macOS Keychain (`security find-generic-password`) — Clementine checks Keychain as a fallback for any missing `.env` value.
