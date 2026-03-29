@@ -71,14 +71,23 @@ async function cachedAsync<T>(key: string, ttlMs: number, compute: () => Promise
 let gatewayInstance: Gateway | null = null;
 let gatewayInitializing = false;
 
+/** Reset the cached gateway (called when daemon PID changes). */
+function resetGateway(): void {
+  gatewayInstance = null;
+  responseCache.clear();
+}
+
 async function getGateway(): Promise<Gateway> {
   if (gatewayInstance) return gatewayInstance;
   if (gatewayInitializing) {
-    // Wait for in-progress init
-    while (gatewayInitializing) {
+    // Wait for in-progress init (max 10s to avoid deadlock)
+    let waited = 0;
+    while (gatewayInitializing && waited < 10_000) {
       await new Promise((r) => setTimeout(r, 100));
+      waited += 100;
     }
-    return gatewayInstance!;
+    if (gatewayInstance) return gatewayInstance;
+    // Init failed or timed out — fall through to retry
   }
   gatewayInitializing = true;
   try {
@@ -91,9 +100,32 @@ async function getGateway(): Promise<Gateway> {
     const { setApprovalCallback } = await import('../agent/hooks.js');
     setApprovalCallback(async () => false);
     return gatewayInstance;
+  } catch (err) {
+    gatewayInstance = null; // Ensure null so next call retries
+    throw err;
   } finally {
     gatewayInitializing = false;
   }
+}
+
+// ── Daemon PID watcher — detect restarts and invalidate state ────────
+
+let lastKnownDaemonPid: number | null = null;
+let dashboardRunningPort = 3030;
+
+function startDaemonWatcher(broadcastFn: (event: { type: string; data?: unknown }) => void): void {
+  // Capture initial PID
+  lastKnownDaemonPid = readPid();
+
+  setInterval(() => {
+    const currentPid = readPid();
+    if (lastKnownDaemonPid !== null && currentPid !== lastKnownDaemonPid) {
+      // Daemon PID changed — invalidate everything
+      resetGateway();
+      broadcastFn({ type: 'daemon_restarted', data: { oldPid: lastKnownDaemonPid, newPid: currentPid } });
+    }
+    lastKnownDaemonPid = currentPid;
+  }, 5000);
 }
 
 // ── Memory search (direct DB access, read-only) ─────────────────────
@@ -1675,6 +1707,19 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
     } catch (err) {
       res.status(500).json({ error: String(err) });
     }
+  });
+
+  app.post('/api/dashboard/restart', (_req, res) => {
+    res.json({ ok: true, message: 'Dashboard restarting...' });
+    setTimeout(() => {
+      const { spawn: spawnChild } = require('node:child_process') as typeof import('node:child_process');
+      const child = spawnChild('node', [DIST_ENTRY, 'dashboard', '-p', String(dashboardRunningPort)], {
+        detached: true,
+        stdio: 'ignore',
+      });
+      child.unref();
+      process.exit(0);
+    }, 500);
   });
 
   app.post('/api/stop', (_req, res) => {
@@ -4374,6 +4419,12 @@ self.addEventListener('fetch', e => {
           console.log();
           console.log('  Press Ctrl+C to stop');
           console.log();
+
+          // Track running port for dashboard self-restart
+          dashboardRunningPort = actualPort;
+
+          // Start daemon PID watcher to detect restarts
+          startDaemonWatcher(broadcastEvent);
 
           // Write PID file so `clementine update` can reliably find us
           writeFileSync(DASHBOARD_PID_FILE, String(process.pid));
@@ -7323,7 +7374,10 @@ function getDashboardHTML(token: string): string {
       </div>
       <div id="settings-tab-content">
         <div class="tab-pane active" id="tab-settings-general">
-          <p style="color:var(--text-muted);margin-bottom:16px">Manage API keys and configuration. Changes are saved to <code>~/.clementine/.env</code> and take effect on daemon restart.</p>
+          <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px">
+            <p style="color:var(--text-muted);margin:0">Manage API keys and configuration. Changes are saved to <code>~/.clementine/.env</code>.</p>
+            <button class="btn-sm" style="white-space:nowrap;background:var(--bg-tertiary);border:1px solid var(--border);color:var(--text-primary);padding:6px 12px;border-radius:6px;cursor:pointer" onclick="restartDashboard()">Restart Dashboard</button>
+          </div>
           <div id="settings-content"><div class="empty-state">Loading settings...</div></div>
         </div>
         <div class="tab-pane" id="tab-settings-remote">
@@ -10529,6 +10583,23 @@ async function removeSetting(key) {
   } catch(e) { toast('Failed: ' + e, 'error'); }
 }
 
+async function restartDashboard() {
+  toast('Restarting dashboard...', 'info');
+  try {
+    await apiFetch('/api/dashboard/restart', { method: 'POST' });
+  } catch(e) { /* expected — server is shutting down */ }
+  // Poll until the new dashboard is ready, then reload
+  var attempts = 0;
+  var poll = setInterval(async function() {
+    attempts++;
+    if (attempts > 20) { clearInterval(poll); toast('Dashboard restart timed out — reload manually', 'error'); return; }
+    try {
+      var r = await fetch('/api/status');
+      if (r.ok) { clearInterval(poll); window.location.reload(); }
+    } catch(e) { /* still restarting */ }
+  }, 1000);
+}
+
 async function addCustomEnv() {
   var keyInput = document.getElementById('custom-env-key');
   var valInput = document.getElementById('custom-env-value');
@@ -13206,6 +13277,10 @@ try {
       }
       if (evt.type === 'session_cleared') {
         if (currentPage === 'home') refreshSessions();
+      }
+      if (evt.type === 'daemon_restarted') {
+        toast('Daemon restarted \u2014 refreshing data...', 'info');
+        setTimeout(function() { refreshAll(); }, 1500);
       }
     } catch(err) { /* ignore */ }
   };
