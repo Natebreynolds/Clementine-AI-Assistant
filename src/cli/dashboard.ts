@@ -2872,6 +2872,53 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
     }
   });
 
+  app.post('/api/skills', (req, res) => {
+    try {
+      const { title, description, triggers, steps } = req.body;
+      if (!title || !steps) { res.status(400).json({ error: 'title and steps are required' }); return; }
+
+      const skillsDir = path.join(VAULT_DIR, '00-System', 'skills');
+      if (!existsSync(skillsDir)) mkdirSync(skillsDir, { recursive: true });
+
+      const name = title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 60);
+      const now = new Date().toISOString();
+      const triggerList = (triggers || '').split(',').map((t: string) => t.trim()).filter(Boolean);
+
+      const matterMod = require('gray-matter');
+      const content = matterMod.stringify(
+        `\n# ${title}\n\n${description || ''}\n\n## Procedure\n\n${steps}\n`,
+        { title, description: description || '', triggers: triggerList, source: 'manual', toolsUsed: [], useCount: 0, createdAt: now, updatedAt: now },
+      );
+      writeFileSync(path.join(skillsDir, `${name}.md`), content);
+      res.json({ ok: true, name });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  app.delete('/api/skills/:name', (req, res) => {
+    try {
+      const filePath = path.join(VAULT_DIR, '00-System', 'skills', `${req.params.name}.md`);
+      if (!existsSync(filePath)) { res.status(404).json({ error: 'Skill not found' }); return; }
+      unlinkSync(filePath);
+      res.json({ ok: true });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  app.get('/api/skills/:name', (req, res) => {
+    try {
+      const filePath = path.join(VAULT_DIR, '00-System', 'skills', `${req.params.name}.md`);
+      if (!existsSync(filePath)) { res.status(404).json({ error: 'Skill not found' }); return; }
+      const matterMod = require('gray-matter');
+      const parsed = matterMod(readFileSync(filePath, 'utf-8'));
+      res.json({ ...parsed.data, name: req.params.name, content: parsed.content });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
   app.get('/api/self-improve', (_req, res) => {
     const siDir = path.join(BASE_DIR, 'self-improve');
     const stateFile = path.join(siDir, 'state.json');
@@ -7049,12 +7096,42 @@ function getDashboardHTML(token: string): string {
           </div>
         </div>
         <div class="tab-pane" id="tab-automations-skills">
+          <div class="card" style="margin-bottom:16px">
+            <div class="card-header" style="display:flex;align-items:center;justify-content:space-between">
+              <span>Teach a Skill</span>
+              <button class="btn-sm btn-primary" onclick="toggleTeachSkill()" id="teach-skill-toggle" style="font-size:12px">+ New Skill</button>
+            </div>
+            <div class="card-body" id="teach-skill-form" style="display:none;padding:16px">
+              <div style="display:grid;gap:12px">
+                <div>
+                  <label style="font-size:12px;font-weight:600;color:var(--text-secondary)">Title</label>
+                  <input type="text" id="skill-title" placeholder="e.g., Deploy to production" style="width:100%;padding:8px;border:1px solid var(--border);border-radius:6px;background:var(--bg-input);color:var(--text-primary);font-size:13px">
+                </div>
+                <div>
+                  <label style="font-size:12px;font-weight:600;color:var(--text-secondary)">Description</label>
+                  <input type="text" id="skill-description" placeholder="1-2 sentence summary of what this skill does" style="width:100%;padding:8px;border:1px solid var(--border);border-radius:6px;background:var(--bg-input);color:var(--text-primary);font-size:13px">
+                </div>
+                <div>
+                  <label style="font-size:12px;font-weight:600;color:var(--text-secondary)">Triggers <span style="font-weight:400;color:var(--text-muted)">(comma-separated keywords)</span></label>
+                  <input type="text" id="skill-triggers" placeholder="deploy, production, release, ship" style="width:100%;padding:8px;border:1px solid var(--border);border-radius:6px;background:var(--bg-input);color:var(--text-primary);font-size:13px">
+                </div>
+                <div>
+                  <label style="font-size:12px;font-weight:600;color:var(--text-secondary)">Procedure <span style="font-weight:400;color:var(--text-muted)">(markdown steps)</span></label>
+                  <textarea id="skill-steps" rows="6" placeholder="1. Run tests: npm test\n2. Build: npm run build\n3. Push: git push origin main\n4. Verify deploy succeeded" style="width:100%;padding:8px;border:1px solid var(--border);border-radius:6px;background:var(--bg-input);color:var(--text-primary);font-size:13px;font-family:monospace;resize:vertical"></textarea>
+                </div>
+                <div style="display:flex;gap:8px;justify-content:flex-end">
+                  <button class="btn-sm" onclick="toggleTeachSkill()" style="background:var(--bg-tertiary);border:1px solid var(--border);color:var(--text-primary);padding:6px 16px;border-radius:6px;cursor:pointer">Cancel</button>
+                  <button class="btn-sm btn-primary" onclick="saveSkill()" style="padding:6px 16px">Save Skill</button>
+                </div>
+              </div>
+            </div>
+          </div>
           <div class="card">
             <div class="card-header" style="display:flex;align-items:center;justify-content:space-between">
-              <span>Procedural Memory</span>
+              <span>Learned Skills</span>
               <span class="badge badge-gray" id="skill-count-badge" style="font-size:10px">0 skills</span>
             </div>
-            <div class="card-body" id="panel-skills"><div class="empty-state">No skills learned yet. Skills are auto-extracted from successful tasks or taught via the teach_skill tool.</div></div>
+            <div class="card-body" id="panel-skills"><div class="empty-state">No skills learned yet. Skills are auto-extracted from successful tasks or taught manually above.</div></div>
           </div>
         </div>
         <div class="tab-pane" id="tab-automations-workflows">
@@ -12431,6 +12508,65 @@ async function showWorkflowRuns(name) {
   } catch(e) { panel.innerHTML = '<div style="font-size:12px;color:var(--red);padding:8px 0">Failed: ' + esc(String(e)) + '</div>'; }
 }
 
+function toggleTeachSkill() {
+  var form = document.getElementById('teach-skill-form');
+  var btn = document.getElementById('teach-skill-toggle');
+  if (!form) return;
+  var showing = form.style.display !== 'none';
+  form.style.display = showing ? 'none' : '';
+  if (btn) btn.textContent = showing ? '+ New Skill' : 'Cancel';
+  if (!showing) {
+    var el = document.getElementById('skill-title');
+    if (el) el.focus();
+  }
+}
+
+async function saveSkill() {
+  var title = (document.getElementById('skill-title') || {}).value || '';
+  var description = (document.getElementById('skill-description') || {}).value || '';
+  var triggers = (document.getElementById('skill-triggers') || {}).value || '';
+  var steps = (document.getElementById('skill-steps') || {}).value || '';
+  if (!title.trim() || !steps.trim()) { toast('Title and procedure are required', 'error'); return; }
+  try {
+    var r = await apiJson('POST', '/api/skills', { title: title.trim(), description: description.trim(), triggers: triggers, steps: steps.trim() });
+    if (r.ok) {
+      toast('Skill saved: ' + title, 'success');
+      toggleTeachSkill();
+      document.getElementById('skill-title').value = '';
+      document.getElementById('skill-description').value = '';
+      document.getElementById('skill-triggers').value = '';
+      document.getElementById('skill-steps').value = '';
+      refreshSkills();
+    } else {
+      toast('Failed: ' + (r.error || 'unknown'), 'error');
+    }
+  } catch(e) { toast('Error: ' + e, 'error'); }
+}
+
+async function deleteSkill(name) {
+  if (!confirm('Delete skill "' + name + '"?')) return;
+  try {
+    await apiDelete('/api/skills/' + encodeURIComponent(name));
+    toast('Skill deleted', 'success');
+    refreshSkills();
+  } catch(e) { toast('Error: ' + e, 'error'); }
+}
+
+async function expandSkill(name) {
+  var detail = document.getElementById('skill-detail-' + name);
+  if (detail) { detail.remove(); return; }
+  try {
+    var r = await apiFetch('/api/skills/' + encodeURIComponent(name));
+    var d = await r.json();
+    var card = document.getElementById('skill-card-' + name);
+    if (!card) return;
+    var detailHtml = '<div id="skill-detail-' + esc(name) + '" style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border)">'
+      + '<pre style="white-space:pre-wrap;font-size:12px;color:var(--text-primary);background:var(--bg-tertiary);padding:12px;border-radius:6px;max-height:300px;overflow-y:auto">' + esc(d.content || '(no content)') + '</pre>'
+      + '</div>';
+    card.insertAdjacentHTML('beforeend', detailHtml);
+  } catch(e) { toast('Failed to load skill', 'error'); }
+}
+
 async function refreshSkills() {
   try {
     var r = await apiFetch('/api/skills');
@@ -12443,7 +12579,7 @@ async function refreshSkills() {
     var container = document.getElementById('panel-skills');
     if (!container) return;
     if (skills.length === 0) {
-      container.innerHTML = '<div class="empty-state">No skills learned yet. Skills are auto-extracted from successful tasks or taught via the teach_skill tool.</div>';
+      container.innerHTML = '<div class="empty-state">No skills learned yet. Skills are auto-extracted from successful tasks or taught manually above.</div>';
       return;
     }
     var html = '<div style="display:flex;flex-direction:column;gap:12px">';
@@ -12453,10 +12589,16 @@ async function refreshSkills() {
         : s.source === 'unleashed' ? '<span class="badge badge-purple" style="font-size:10px">unleashed</span>'
         : '<span class="badge badge-gray" style="font-size:10px">' + esc(s.source) + '</span>';
       var triggers = (s.triggers || []).map(function(t) { return '<code style="font-size:11px;background:var(--bg-tertiary);padding:2px 6px;border-radius:3px">' + esc(t) + '</code>'; }).join(' ');
-      html += '<div style="padding:12px;border:1px solid var(--border);border-radius:8px;background:var(--bg-secondary)">'
+      var age = s.updatedAt ? timeAgo(s.updatedAt) : '';
+      html += '<div id="skill-card-' + esc(s.name) + '" style="padding:12px;border:1px solid var(--border);border-radius:8px;background:var(--bg-secondary)">'
         + '<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">'
-        + '<strong>' + esc(s.title) + '</strong> ' + sourceTag
-        + '<span style="margin-left:auto;font-size:11px;color:var(--text-muted)">used ' + s.useCount + 'x</span>'
+        + '<strong style="cursor:pointer" onclick="expandSkill(\\x27' + esc(s.name) + '\\x27)">' + esc(s.title) + '</strong> ' + sourceTag
+        + (s.sourceJob ? '<span style="font-size:11px;color:var(--text-muted)">from ' + esc(s.sourceJob) + '</span>' : '')
+        + '<span style="margin-left:auto;display:flex;align-items:center;gap:8px">'
+        + '<span style="font-size:11px;color:var(--text-muted)">used ' + s.useCount + 'x' + (age ? ' \\u00b7 ' + age : '') + '</span>'
+        + '<button onclick="expandSkill(\\x27' + esc(s.name) + '\\x27)" style="background:none;border:1px solid var(--border);border-radius:4px;padding:2px 8px;font-size:11px;color:var(--text-secondary);cursor:pointer">View</button>'
+        + '<button onclick="deleteSkill(\\x27' + esc(s.name) + '\\x27)" style="background:none;border:1px solid var(--border);border-radius:4px;padding:2px 8px;font-size:11px;color:var(--red);cursor:pointer">Delete</button>'
+        + '</span>'
         + '</div>'
         + '<div style="font-size:12px;color:var(--text-secondary);margin-bottom:6px">' + esc(s.description) + '</div>'
         + (triggers ? '<div style="display:flex;gap:4px;flex-wrap:wrap">' + triggers + '</div>' : '')
