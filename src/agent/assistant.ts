@@ -51,6 +51,7 @@ import {
   CRON_REFLECTIONS_DIR,
   HANDOFFS_DIR,
   BUDGET,
+  ENABLE_1M_CONTEXT,
 } from '../config.js';
 import type { AgentProfile, OnTextCallback, OnToolActivityCallback, SessionData, VerboseLevel } from '../types.js';
 import {
@@ -924,9 +925,10 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
     disableAllTools?: boolean;
     verboseLevel?: VerboseLevel;
     abortController?: AbortController;
-    effort?: 'low' | 'medium' | 'high';
+    effort?: 'low' | 'medium' | 'high' | 'max';
     maxBudgetUsd?: number;
     thinking?: { type: 'adaptive' };
+    outputFormat?: { type: 'json_schema'; schema: Record<string, unknown> };
   } = {}): SDKOptions {
     const {
       isHeartbeat = false,
@@ -947,6 +949,7 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
       effort,
       maxBudgetUsd,
       thinking,
+      outputFormat,
     } = opts;
 
     let allowedTools = [
@@ -1054,7 +1057,7 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
     const fullSystemPrompt = customPrompt + '\n\n' + securityPrompt;
 
     // ── Compute effort level ──────────────────────────────────────
-    const computedEffort: 'low' | 'medium' | 'high' | undefined = effort ?? (
+    const computedEffort: 'low' | 'medium' | 'high' | 'max' | undefined = effort ?? (
       isHeartbeat && !isCron ? 'low'
       : isCron && (cronTier ?? 0) < 2 ? 'low'
       : isCron && !isUnleashed ? 'medium'
@@ -1076,6 +1079,12 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
     const computedThinking = thinking ?? (
       supportsThinking && needsThinking ? { type: 'adaptive' as const } : undefined
     );
+
+    // 1M context beta: enable for Sonnet when toggled and context-heavy work benefits
+    const isSonnet = resolvedModel.includes('sonnet');
+    const computedBetas = ENABLE_1M_CONTEXT && isSonnet
+      ? ['context-1m-2025-08-07' as const]
+      : undefined;
 
     return {
       systemPrompt: fullSystemPrompt,
@@ -1104,6 +1113,8 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
       ...(computedEffort ? { effort: computedEffort } : {}),
       ...(computedBudget !== undefined ? { maxBudgetUsd: computedBudget } : {}),
       ...(computedThinking ? { thinking: computedThinking } : {}),
+      ...(computedBetas ? { betas: computedBetas } : {}),
+      ...(outputFormat ? { outputFormat } : {}),
       canUseTool: async (toolName: string, toolInput: Record<string, unknown>, _options: { signal: AbortSignal; toolUseID: string }) => {
         const result = await enforceToolPermissions(toolName, toolInput, capturedSource);
         if (result.behavior === 'deny') {
@@ -2290,9 +2301,9 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
   async runPlanStep(
     stepId: string,
     prompt: string,
-    opts: { tier?: number; maxTurns?: number; model?: string; disableTools?: boolean } = {},
+    opts: { tier?: number; maxTurns?: number; model?: string; disableTools?: boolean; outputFormat?: { type: 'json_schema'; schema: Record<string, unknown> } } = {},
   ): Promise<string> {
-    const { tier = 2, maxTurns = 15, model, disableTools = false } = opts;
+    const { tier = 2, maxTurns = 15, model, disableTools = false, outputFormat } = opts;
 
     // Don't mutate the global — pass source through the closure instead
     const sdkOptions = this.buildOptions({
@@ -2304,6 +2315,7 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
       isPlanStep: true,
       sourceOverride: 'owner-dm',
       disableAllTools: disableTools,
+      outputFormat,
     });
 
     // Per-step detector so concurrent steps don't cross-contaminate

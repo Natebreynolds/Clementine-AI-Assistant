@@ -841,6 +841,22 @@ export class SelfImproveLoop {
       tier: 2,
       maxTurns: 3,
       disableTools: true,
+      outputFormat: {
+        type: 'json_schema',
+        schema: {
+          type: 'object',
+          properties: {
+            specificity: { type: 'number' },
+            evidence: { type: 'number' },
+            safety: { type: 'number' },
+            impact: { type: 'number' },
+            novelty: { type: 'number' },
+            score: { type: 'number' },
+            reasoning: { type: 'string' },
+          },
+          required: ['score', 'reasoning'],
+        },
+      },
     });
 
     return this.parseJsonResponse<{ score: number; reasoning: string }>(result);

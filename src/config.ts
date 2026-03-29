@@ -133,6 +133,9 @@ export const BUDGET = {
 export const DEFAULT_MODEL_TIER = (getEnv('DEFAULT_MODEL_TIER', 'sonnet')) as keyof Models;
 export const MODEL = MODELS[DEFAULT_MODEL_TIER] ?? MODELS.sonnet;
 
+/** Enable 1M context window for Sonnet (beta). Toggle via ENABLE_1M_CONTEXT=true in .env. */
+export const ENABLE_1M_CONTEXT = getEnv('ENABLE_1M_CONTEXT', 'false').toLowerCase() === 'true';
+
 // ── Discord ──────────────────────────────────────────────────────────
 
 export const DISCORD_TOKEN = getSecret('DISCORD_TOKEN');
