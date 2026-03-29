@@ -2544,10 +2544,25 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
         successCriteria.map(c => `- ${c}`).join('\n') + '\n\n';
     }
 
+    // ── Procedural skills: inject matching skills for this job ───────
+    let skillContext = '';
+    try {
+      const { searchSkills, recordSkillUse } = await import('./skill-extractor.js');
+      const matchedSkills = searchSkills(jobName + ' ' + jobPrompt.slice(0, 200), 2);
+      if (matchedSkills.length > 0) {
+        const skillLines = matchedSkills.map(s => {
+          recordSkillUse(s.name);
+          return `### ${s.title}\n${s.content}`;
+        });
+        skillContext = `## Learned Procedures (from past successful executions)\nFollow these proven approaches when applicable:\n\n${skillLines.join('\n\n')}\n\n`;
+      }
+    } catch { /* non-fatal — run without skills */ }
+
     const prompt =
       `[Scheduled task: ${jobName}]\n\n` +
       progressContext +
       goalContext +
+      skillContext +
       delegationContext +
       teamContext +
       criteriaContext +
@@ -2851,6 +2866,19 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
       const timestamp = now.toISOString().slice(0, 16).replace('T', ' ');
       const remainingHours = ((deadline - Date.now()) / (60 * 60 * 1000)).toFixed(1);
 
+      // Inject matching skills on first phase
+      let unleashedSkillContext = '';
+      if (phase === 1) {
+        try {
+          const { searchSkills, recordSkillUse } = await import('./skill-extractor.js');
+          const matchedSkills = searchSkills(jobName + ' ' + jobPrompt.slice(0, 200), 2);
+          if (matchedSkills.length > 0) {
+            unleashedSkillContext = `\n\n## Learned Procedures\nFollow these proven approaches when applicable:\n\n` +
+              matchedSkills.map(s => { recordSkillUse(s.name); return `### ${s.title}\n${s.content}`; }).join('\n\n') + '\n';
+          }
+        } catch { /* non-fatal */ }
+      }
+
       let prompt: string;
       if (phase === 1) {
         prompt =
@@ -2859,6 +2887,7 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
           `Time remaining: ${remainingHours} hours. You have ${turnsPerPhase} turns per phase.\n` +
           `After each phase completes, your session will be resumed with fresh context.\n\n` +
           `TASK:\n${jobPrompt}\n\n` +
+          unleashedSkillContext +
           `IMPORTANT:\n` +
           `- Work methodically through the task in phases\n` +
           `- At the end of this phase, output a STATUS SUMMARY of what you accomplished and what remains\n` +
