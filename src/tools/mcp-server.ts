@@ -3442,6 +3442,52 @@ server.tool(
   },
 );
 
+// ── Procedural Memory: teach_skill ──────────────────────────────────────
+
+server.tool(
+  'teach_skill',
+  'Teach Clementine a reusable procedure. Saves a skill document that will be recalled when similar tasks come up in the future.',
+  {
+    title: z.string().describe('Short descriptive title for the skill'),
+    description: z.string().describe('1-2 sentence description of what this skill does'),
+    triggers: z.array(z.string()).describe('Keywords or phrases that should activate this skill'),
+    steps: z.string().describe('Step-by-step procedure in markdown'),
+    toolsUsed: z.array(z.string()).optional().describe('MCP tools referenced in the procedure'),
+  },
+  async ({ title, description, triggers, steps, toolsUsed }) => {
+    const skillsDir = path.join(VAULT_DIR, '00-System', 'skills');
+    if (!existsSync(skillsDir)) mkdirSync(skillsDir, { recursive: true });
+
+    const name = title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 60);
+    const now = new Date().toISOString();
+
+    const frontmatter = {
+      title,
+      description,
+      triggers,
+      source: 'manual',
+      toolsUsed: toolsUsed ?? [],
+      useCount: 0,
+      createdAt: now,
+      updatedAt: now,
+    };
+
+    const matterMod = await import('gray-matter');
+    const content = matterMod.default.stringify(
+      `\n# ${title}\n\n${description}\n\n## Procedure\n\n${steps}\n`,
+      frontmatter,
+    );
+
+    const filePath = path.join(skillsDir, `${name}.md`);
+    writeFileSync(filePath, content);
+
+    // Trigger incremental index so the skill is searchable immediately
+    try { await incrementalSync(path.relative(VAULT_DIR, filePath)); } catch { /* non-fatal */ }
+
+    return textResult(`Skill saved: "${title}" (${name}.md) with ${triggers.length} triggers. It will be recalled when similar tasks come up.`);
+  },
+);
+
 // ── Self-Restart ────────────────────────────────────────────────────────
 
 server.tool(
