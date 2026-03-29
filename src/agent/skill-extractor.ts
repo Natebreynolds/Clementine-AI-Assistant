@@ -118,19 +118,20 @@ export async function extractSkill(
 function saveSkill(skill: SkillDocument): void {
   ensureSkillsDir();
 
-  const frontmatter = {
+  // gray-matter's YAML dumper throws on undefined values — omit them
+  const frontmatter: Record<string, unknown> = {
     title: skill.title,
     description: skill.description,
     triggers: skill.triggers,
     source: skill.source,
-    sourceJob: skill.sourceJob ?? undefined,
-    agentSlug: skill.agentSlug ?? undefined,
     toolsUsed: skill.toolsUsed,
     useCount: skill.useCount,
-    lastUsed: skill.lastUsed ?? undefined,
     createdAt: skill.createdAt,
     updatedAt: skill.updatedAt,
   };
+  if (skill.sourceJob) frontmatter.sourceJob = skill.sourceJob;
+  if (skill.agentSlug) frontmatter.agentSlug = skill.agentSlug;
+  if (skill.lastUsed) frontmatter.lastUsed = skill.lastUsed;
 
   const content = matter.stringify(`\n# ${skill.title}\n\n${skill.description}\n\n## Procedure\n\n${skill.steps}\n`, frontmatter);
   const filePath = path.join(SKILLS_DIR, `${skill.name}.md`);
