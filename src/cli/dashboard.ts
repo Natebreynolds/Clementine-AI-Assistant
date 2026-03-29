@@ -2663,7 +2663,8 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
       : type === 'cron'
       ? `[BUILDER MODE: You are helping build a scheduled cron job. As you develop the job, output the current state as a JSON block:\n` +
         '```json-artifact\n{"type":"cron","name":"...","schedule":"cron expression","tier":1,"prompt":"the full job prompt","mode":"standard","enabled":true}\n```\n' +
-        `Update this block in EVERY response as the job evolves. Ask about schedule, what it should do, which tools/APIs it needs, what tier (1=read-only, 2=read-write), and whether it should run in unleashed mode. ` +
+        `Update this block in EVERY response as the job evolves. Ask about schedule, what it should do, which tools/APIs it needs, what tier (1=read-only, 2=read-write), and whether it should run in unleashed mode.\n` +
+        `IMPORTANT: Cron jobs automatically pull in matching skills (learned procedures) at runtime. If the user describes a workflow that should be reusable, suggest creating it as a skill first, then building the cron job that references those trigger keywords. This way the cron gets smarter over time as skills improve.\n` +
         `When the user says "save" or approves, output the final artifact block.]${artifactContext}\n\n`
       : `[BUILDER MODE: You are helping configure an agent artifact. Output structured JSON blocks as you build.]${artifactContext}\n\n`;
 
