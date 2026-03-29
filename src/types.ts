@@ -308,6 +308,31 @@ export interface Feedback {
   createdAt?: string;
 }
 
+// ── Session Reflections ─────────────────────────────────────────────
+
+export interface BehavioralCorrection {
+  correction: string;
+  category: 'verbosity' | 'tone' | 'workflow' | 'format' | 'accuracy' | 'proactivity' | 'scope';
+  strength: 'explicit' | 'implicit';
+}
+
+export interface PreferenceLearned {
+  preference: string;
+  confidence: 'high' | 'medium' | 'low';
+}
+
+export interface SessionReflection {
+  id?: number;
+  sessionKey: string;
+  exchangeCount: number;
+  frictionSignals: string[];
+  qualityScore: number;            // 1-5
+  behavioralCorrections: BehavioralCorrection[];
+  preferencesLearned: PreferenceLearned[];
+  agentSlug?: string;
+  createdAt?: string;
+}
+
 // ── Plan Orchestration ───────────────────────────────────────────────
 
 export interface PlanStep {

@@ -225,6 +225,23 @@ export class MemoryStore {
       CREATE INDEX IF NOT EXISTS idx_feedback_created ON feedback(created_at);
     `);
 
+    // Session reflections for conversational learning
+    this.conn.exec(`
+      CREATE TABLE IF NOT EXISTS session_reflections (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_key TEXT NOT NULL,
+        exchange_count INTEGER DEFAULT 0,
+        friction_signals TEXT DEFAULT '[]',
+        quality_score INTEGER DEFAULT 3,
+        behavioral_corrections TEXT DEFAULT '[]',
+        preferences_learned TEXT DEFAULT '[]',
+        agent_slug TEXT DEFAULT NULL,
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_reflections_created ON session_reflections(created_at);
+      CREATE INDEX IF NOT EXISTS idx_reflections_agent ON session_reflections(agent_slug);
+    `);
+
     // Usage log table for token tracking
     this.conn.exec(`
       CREATE TABLE IF NOT EXISTS usage_log (
@@ -1539,6 +1556,96 @@ export class MemoryStore {
       stats.total += row.cnt;
     }
     return stats;
+  }
+
+  // ── Session Reflections ──────────────────────────────────────────
+
+  saveSessionReflection(reflection: {
+    sessionKey: string;
+    exchangeCount: number;
+    frictionSignals: string[];
+    qualityScore: number;
+    behavioralCorrections: Array<{ correction: string; category: string; strength: string }>;
+    preferencesLearned: Array<{ preference: string; confidence: string }>;
+    agentSlug?: string;
+  }): void {
+    this.conn
+      .prepare(
+        `INSERT INTO session_reflections
+         (session_key, exchange_count, friction_signals, quality_score, behavioral_corrections, preferences_learned, agent_slug)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        reflection.sessionKey,
+        reflection.exchangeCount,
+        JSON.stringify(reflection.frictionSignals),
+        reflection.qualityScore,
+        JSON.stringify(reflection.behavioralCorrections),
+        JSON.stringify(reflection.preferencesLearned),
+        reflection.agentSlug ?? null,
+      );
+  }
+
+  getRecentReflections(limit = 20, agentSlug?: string): Array<{
+    sessionKey: string;
+    exchangeCount: number;
+    frictionSignals: string[];
+    qualityScore: number;
+    behavioralCorrections: Array<{ correction: string; category: string; strength: string }>;
+    preferencesLearned: Array<{ preference: string; confidence: string }>;
+    agentSlug: string | null;
+    createdAt: string;
+  }> {
+    const query = agentSlug
+      ? `SELECT * FROM session_reflections WHERE agent_slug = ? ORDER BY created_at DESC LIMIT ?`
+      : `SELECT * FROM session_reflections ORDER BY created_at DESC LIMIT ?`;
+    const params = agentSlug ? [agentSlug, limit] : [limit];
+    const rows = this.conn.prepare(query).all(...params) as any[];
+    return rows.map(r => ({
+      sessionKey: r.session_key,
+      exchangeCount: r.exchange_count,
+      frictionSignals: JSON.parse(r.friction_signals || '[]'),
+      qualityScore: r.quality_score,
+      behavioralCorrections: JSON.parse(r.behavioral_corrections || '[]'),
+      preferencesLearned: JSON.parse(r.preferences_learned || '[]'),
+      agentSlug: r.agent_slug,
+      createdAt: r.created_at,
+    }));
+  }
+
+  /** Get recurring behavioral corrections (appeared in 2+ sessions). */
+  getBehavioralPatterns(minOccurrences = 2): Array<{
+    correction: string;
+    category: string;
+    count: number;
+    lastSeen: string;
+  }> {
+    const rows = this.conn.prepare(
+      `SELECT behavioral_corrections, created_at FROM session_reflections
+       WHERE created_at >= datetime('now', '-30 days')
+       ORDER BY created_at DESC`,
+    ).all() as Array<{ behavioral_corrections: string; created_at: string }>;
+
+    // Count occurrences of each correction (normalized lowercase)
+    const counts = new Map<string, { correction: string; category: string; count: number; lastSeen: string }>();
+    for (const row of rows) {
+      try {
+        const corrections = JSON.parse(row.behavioral_corrections || '[]') as Array<{ correction: string; category: string }>;
+        for (const c of corrections) {
+          const key = c.correction.toLowerCase().trim();
+          const existing = counts.get(key);
+          if (existing) {
+            existing.count++;
+          } else {
+            counts.set(key, { correction: c.correction, category: c.category, count: 1, lastSeen: row.created_at });
+          }
+        }
+      } catch { /* skip malformed */ }
+    }
+
+    return [...counts.values()]
+      .filter(c => c.count >= minOccurrences)
+      .sort((a, b) => b.count - a.count);
   }
 
   // ── Usage Tracking ────────────────────────────────────────────────
