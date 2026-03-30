@@ -289,6 +289,30 @@ export async function enforceToolPermissions(
   const effectiveSource = sourceOverride ?? interactionSource;
   const isOwnerDm = effectiveSource === 'owner-dm';
 
+  // ── Blocked CLI tools ─────────────────────────────────────────
+  // Check if a Bash command uses a blocked CLI tool
+  if (toolName === 'Bash') {
+    const command = String(toolInput.command ?? '');
+    const firstWord = command.trim().split(/\s+/)[0]?.replace(/^["']|["']$/g, '');
+    if (firstWord) {
+      try {
+        const { existsSync, readFileSync } = await import('node:fs');
+        const { join } = await import('node:path');
+        const cliToolsFile = join(process.env.CLEMENTINE_HOME ?? join(process.env.HOME ?? '', '.clementine'), 'cli-tools.json');
+        if (existsSync(cliToolsFile)) {
+          const cliTools = JSON.parse(readFileSync(cliToolsFile, 'utf-8')) as Array<{ cmd: string; blocked: boolean }>;
+          const blocked = cliTools.find(t => t.cmd === firstWord && t.blocked);
+          if (blocked) {
+            return {
+              behavior: 'deny',
+              message: `CLI tool "${firstWord}" is blocked. Unblock it in the dashboard Settings > Tools.`,
+            };
+          }
+        }
+      } catch { /* non-fatal — proceed if file read fails */ }
+    }
+  }
+
   // ── Credential file read blocking ──────────────────────────────
   // Owner DMs: allow (sanitizeResponse strips secrets from channel output)
   // Autonomous/channel: block

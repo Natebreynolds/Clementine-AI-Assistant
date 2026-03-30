@@ -430,13 +430,58 @@ const CLI_TOOL_PROBES = [
   { cmd: 'go', description: 'Go toolchain' },
   { cmd: 'ruby', description: 'Ruby runtime' },
   { cmd: 'sf', description: 'Salesforce CLI' },
+  { cmd: 'firecrawl', description: 'Web crawling and scraping CLI' },
+  { cmd: 'supabase', description: 'Supabase CLI' },
+  { cmd: 'vercel', description: 'Vercel deployment CLI' },
+  { cmd: 'netlify', description: 'Netlify deployment CLI' },
+  { cmd: 'fly', description: 'Fly.io deployment CLI' },
+  { cmd: 'railway', description: 'Railway deployment CLI' },
+  { cmd: 'wrangler', description: 'Cloudflare Workers CLI' },
+  { cmd: 'redis-cli', description: 'Redis client' },
+  { cmd: 'psql', description: 'PostgreSQL client' },
+  { cmd: 'mysql', description: 'MySQL client' },
+  { cmd: 'mongosh', description: 'MongoDB shell' },
+  { cmd: 'pip3', description: 'Python package manager' },
 ];
 
-function discoverCliTools(): ToolEntry[] {
-  return CLI_TOOL_PROBES.map(t => {
+// User-defined CLI tools (persisted to ~/.clementine/cli-tools.json)
+interface UserCliTool { cmd: string; description: string; blocked: boolean }
+
+function loadUserCliTools(): UserCliTool[] {
+  const toolsFile = path.join(BASE_DIR, 'cli-tools.json');
+  if (!existsSync(toolsFile)) return [];
+  try { return JSON.parse(readFileSync(toolsFile, 'utf-8')); } catch { return []; }
+}
+
+function saveUserCliTools(tools: UserCliTool[]): void {
+  writeFileSync(path.join(BASE_DIR, 'cli-tools.json'), JSON.stringify(tools, null, 2));
+}
+
+function discoverCliTools(): (ToolEntry & { blocked?: boolean; userDefined?: boolean })[] {
+  const userTools = loadUserCliTools();
+  const userToolMap = new Map(userTools.map(t => [t.cmd, t]));
+
+  // Merge hardcoded probes with user overrides
+  const allProbes = [...CLI_TOOL_PROBES];
+  // Add user-defined tools not in the probe list
+  for (const ut of userTools) {
+    if (!allProbes.some(p => p.cmd === ut.cmd)) {
+      allProbes.push({ cmd: ut.cmd, description: ut.description });
+    }
+  }
+
+  return allProbes.map(t => {
     let installed = false;
     try { execSync(`which ${t.cmd}`, { stdio: 'pipe' }); installed = true; } catch { /* not found */ }
-    return { name: t.cmd, description: t.description, type: 'cli', installed };
+    const userOverride = userToolMap.get(t.cmd);
+    return {
+      name: t.cmd,
+      description: userOverride?.description ?? t.description,
+      type: 'cli',
+      installed,
+      blocked: userOverride?.blocked ?? false,
+      userDefined: !!userOverride,
+    };
   });
 }
 
@@ -2942,6 +2987,73 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
   });
 
   // ── Self-Improvement API ─────────────────────────────────────────
+
+  // ── CLI Tools Management API ────────────────────────────────────────
+
+  app.get('/api/cli-tools', (_req, res) => {
+    try {
+      const tools = discoverCliTools();
+      res.json({ tools });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  app.post('/api/cli-tools', (req, res) => {
+    try {
+      const { cmd, description } = req.body;
+      if (!cmd) { res.status(400).json({ error: 'cmd is required' }); return; }
+      const tools = loadUserCliTools();
+      const existing = tools.find(t => t.cmd === cmd);
+      if (existing) {
+        existing.description = description || existing.description;
+      } else {
+        tools.push({ cmd, description: description || `Custom CLI: ${cmd}`, blocked: false });
+      }
+      saveUserCliTools(tools);
+      responseCache.delete('available-tools'); // bust cache
+      res.json({ ok: true });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  app.put('/api/cli-tools/:cmd', (req, res) => {
+    try {
+      const { cmd } = req.params;
+      const { description, blocked } = req.body;
+      const tools = loadUserCliTools();
+      const existing = tools.find(t => t.cmd === cmd);
+      if (existing) {
+        if (description !== undefined) existing.description = description;
+        if (blocked !== undefined) existing.blocked = blocked;
+      } else {
+        // Create user override for a probe-list tool
+        const probe = CLI_TOOL_PROBES.find(p => p.cmd === cmd);
+        tools.push({
+          cmd,
+          description: description ?? probe?.description ?? `CLI: ${cmd}`,
+          blocked: blocked ?? false,
+        });
+      }
+      saveUserCliTools(tools);
+      responseCache.delete('available-tools');
+      res.json({ ok: true });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  app.delete('/api/cli-tools/:cmd', (req, res) => {
+    try {
+      const tools = loadUserCliTools().filter(t => t.cmd !== req.params.cmd);
+      saveUserCliTools(tools);
+      responseCache.delete('available-tools');
+      res.json({ ok: true });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
 
   // ── Skills (Procedural Memory) API ──────────────────────────────────
 
