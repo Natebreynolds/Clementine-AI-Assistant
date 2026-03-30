@@ -831,7 +831,9 @@ export class CronScheduler {
           };
 
           if (response && !CronScheduler.isCronNoise(response) && job.mode !== 'unleashed') {
-            const result = await this.dispatcher.send(response, { agentSlug: job.agentSlug });
+            // Strip internal thinking/process narration from Discord output
+            const cleanedResponse = CronScheduler.stripThinkingPrefixes(response);
+            const result = await this.dispatcher.send(cleanedResponse, { agentSlug: job.agentSlug });
             if (!result.delivered) {
               entry.deliveryFailed = true;
               entry.deliveryError = Object.values(result.channelErrors).join('; ').slice(0, 300);
@@ -1096,6 +1098,35 @@ export class CronScheduler {
   }
 
   /** Filter out cron responses that are truly empty or nothing-to-report. */
+  /** Strip internal reasoning/thinking prefixes from cron output before sending to Discord. */
+  private static stripThinkingPrefixes(response: string): string {
+    // Split into lines and skip leading process narration
+    const lines = response.split('\n');
+    const thinkingPatterns = [
+      /^I('ll| will| need to| found| can see| should|'m going to) /i,
+      /^Let me /i,
+      /^Now (let me|I'll|I need) /i,
+      /^(First|Next),? (let me|I'll|I need) /i,
+      /^(Checking|Looking|Searching|Reading|Fetching|Pulling|Querying) /i,
+    ];
+
+    let startIdx = 0;
+    for (let i = 0; i < Math.min(lines.length, 5); i++) {
+      const line = lines[i].trim();
+      if (!line) { startIdx = i + 1; continue; }
+      if (thinkingPatterns.some(p => p.test(line))) {
+        startIdx = i + 1;
+      } else {
+        break;
+      }
+    }
+
+    if (startIdx > 0 && startIdx < lines.length) {
+      return lines.slice(startIdx).join('\n').trim();
+    }
+    return response;
+  }
+
   private static isCronNoise(response: string): boolean {
     const trimmed = response.trim();
     if (trimmed === '__NOTHING__') return true;
