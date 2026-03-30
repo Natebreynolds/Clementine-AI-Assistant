@@ -840,6 +840,20 @@ Delegate data-heavy work (SEO, analytics, bulk API calls for 3+ entities) to sub
         }
       }
 
+      // User Theory of Mind — structured user model
+      const userModelFile = path.join(VAULT_DIR, '00-System', 'USER_MODEL.md');
+      this.promptCache.watch(userModelFile);
+      const userModel = this.promptCache.get(userModelFile);
+      if (userModel?.data) {
+        const expertise = userModel.data.expertise ? `Expertise: ${Object.entries(userModel.data.expertise as Record<string, string>).map(([k, v]) => `${k}=${v}`).join(', ')}` : '';
+        const priorities = userModel.data.priorities ? `Priorities: ${(userModel.data.priorities as string[]).slice(0, 3).join('; ')}` : '';
+        const comm = userModel.data.communication ? `Communication: ${Object.entries(userModel.data.communication as Record<string, string>).map(([k, v]) => `${k}=${v}`).join(', ')}` : '';
+        const modelParts = [expertise, priorities, comm].filter(Boolean);
+        if (modelParts.length > 0) {
+          parts.push(`## User Context\n\n${modelParts.join('\n')}`);
+        }
+      }
+
       // Proactive feedback capture
       parts.push(`## Feedback Capture
 

@@ -353,6 +353,7 @@ function ensureVaultDirs(): void {
     config.SYSTEM_DIR,
     path.join(config.SYSTEM_DIR, 'skills'),
     config.AGENTS_DIR,
+    path.join(config.BASE_DIR, 'tools'),
     config.DAILY_NOTES_DIR,
     config.PEOPLE_DIR,
     config.PROJECTS_DIR,
