@@ -1647,6 +1647,10 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
         let hitRateLimit = false;
         const toolCalls: string[] = []; // Track tool calls for audit trail
 
+        // Metacognitive monitor — tracks reasoning quality during this execution
+        const { MetacognitiveMonitor } = await import('./metacognition.js');
+        const metacog = new MetacognitiveMonitor();
+
         try {
           const stream = query({ prompt, options: sdkOptions });
 
@@ -1669,6 +1673,11 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
                   const loopCheck = toolLoopDetector.recordCall(block.name, (block.input ?? {}) as Record<string, unknown>);
                   if (loopCheck.verdict === 'block') {
                     logger.warn({ tool: block.name, ...loopCheck }, 'Tool loop detected — blocking');
+                  }
+                  // Metacognitive monitoring
+                  const mcSignal = metacog.recordToolCall(block.name, (block.input ?? {}) as Record<string, unknown>);
+                  if (mcSignal.type === 'intervene' || mcSignal.type === 'warn') {
+                    logger.info({ reason: mcSignal.reason }, `Metacognition: ${mcSignal.guidance?.slice(0, 80)}`);
                   }
                   toolCalls.push(`${block.name}(${JSON.stringify(block.input ?? {}).slice(0, 200)})`);
                 }
@@ -1750,6 +1759,12 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
           } catch {
             // Non-fatal
           }
+        }
+
+        // Log metacognitive summary
+        const mcSummary = metacog.getSummary();
+        if (mcSummary.signals.length > 0 || mcSummary.toolCallCount > 10) {
+          logger.info({ ...mcSummary }, 'Metacognitive summary');
         }
 
         return [responseText, sessionId];
