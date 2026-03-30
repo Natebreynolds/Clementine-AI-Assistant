@@ -882,18 +882,9 @@ export class HeartbeatScheduler {
 
   private static shouldSuppressMessage(response: string): boolean {
     const trimmed = response.trim();
-    if (trimmed === '__NOTHING__') return true;
-
-    if (trimmed.length > 80) return false;
-
-    const lower = trimmed.toLowerCase();
-    const noisePatterns = [
-      'all clear', 'nothing to report', 'nothing new',
-      'no updates', 'everything looks good', 'no urgent',
-      'quiet heartbeat', 'all quiet', 'nothing noteworthy',
-      'no changes', 'same as before',
-    ];
-    return noisePatterns.some((p) => lower.includes(p));
+    // Only suppress the explicit opt-out signal — let everything else through.
+    // Short proactive messages ("Want me to check your email?") are valuable.
+    return trimmed === '__NOTHING__';
   }
 
   // ── Dedup Ledger ──────────────────────────────────────────────────
@@ -1064,7 +1055,7 @@ export class HeartbeatScheduler {
     if (hasRealChanges) return true;
 
     const silentBeats = this.lastState.consecutiveSilentBeats ?? 0;
-    if (silentBeats >= 6) return true;
+    if (silentBeats >= 3) return true;
 
     return false;
   }
