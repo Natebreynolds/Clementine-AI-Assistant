@@ -176,17 +176,29 @@ function verifySetup(): string[] {
     }
   }
 
-  // Check better-sqlite3 native module
+  // Check better-sqlite3 native module — auto-rebuild if broken
   try {
     require.resolve('better-sqlite3');
-    // If resolve works, try actually loading it
     execSync('node -e "require(\'better-sqlite3\')"', { stdio: 'pipe', timeout: 5000 });
   } catch {
-    errors.push(
-      'better-sqlite3 native module is broken (Node version mismatch).\n' +
-      '  Fix: npm rebuild better-sqlite3\n' +
-      '  Run: clementine doctor',
-    );
+    // Attempt auto-rebuild before reporting as error
+    try {
+      logger.info('better-sqlite3 native module broken — auto-rebuilding...');
+      execSync('npm rebuild better-sqlite3', {
+        cwd: config.PKG_DIR,
+        stdio: 'pipe',
+        timeout: 30000,
+      });
+      // Verify the rebuild worked
+      execSync('node -e "require(\'better-sqlite3\')"', { stdio: 'pipe', timeout: 5000 });
+      logger.info('better-sqlite3 rebuilt successfully');
+    } catch {
+      errors.push(
+        'better-sqlite3 native module is broken (Node version mismatch).\n' +
+        '  Auto-rebuild failed. Fix manually: npm rebuild better-sqlite3\n' +
+        '  Run: clementine doctor',
+      );
+    }
   }
 
   // Check vault system files
