@@ -8792,17 +8792,29 @@ async function loadAgentDetailTab(tab, slug, isPrimary) {
         if (isCli) html += '<span style="font-size:11px;color:var(--text-muted)">' + installedCount + ' installed</span>';
         html += '</div><div class="card-body" style="padding:0">';
 
+        // Add CLI tool button (before the tool list)
+        if (isCli) {
+          html += '<div style="padding:8px 12px;border-bottom:1px solid var(--border);display:flex;gap:8px;align-items:center">';
+          html += '<input type="text" id="add-cli-cmd" placeholder="command name" style="width:120px;padding:4px 8px;border:1px solid var(--border);border-radius:4px;background:var(--bg-input);color:var(--text-primary);font-size:12px">';
+          html += '<input type="text" id="add-cli-desc" placeholder="description for agents" style="flex:1;padding:4px 8px;border:1px solid var(--border);border-radius:4px;background:var(--bg-input);color:var(--text-primary);font-size:12px">';
+          html += '<button class="btn-sm btn-primary" onclick="addCliTool()" style="font-size:11px;padding:4px 10px">Add</button>';
+          html += '</div>';
+        }
+
         tools.forEach(function(t) {
           var toolName = t.name || '';
           var toolDesc = t.description || '';
           var isEnabled = !hasWhitelist || agentAllowed.indexOf(toolName) >= 0;
-          var dimmed = (isCli && !t.installed) ? ';opacity:0.4' : '';
+          var isBlocked = t.blocked || false;
+          var dimmed = (isCli && !t.installed) ? ';opacity:0.4' : (isCli && isBlocked) ? ';opacity:0.5' : '';
 
           html += '<div style="display:flex;align-items:center;gap:8px;padding:6px 12px;border-bottom:1px solid var(--border)' + dimmed + '">';
 
           // Status indicator
           if (isCli) {
-            if (t.installed) {
+            if (isBlocked) {
+              html += '<span style="color:var(--red);font-size:12px;min-width:16px" title="Blocked">&#x26D4;</span>';
+            } else if (t.installed) {
               html += '<span style="color:var(--green);font-size:12px;min-width:16px" title="Installed">&#10003;</span>';
             } else {
               html += '<span style="color:var(--text-muted);font-size:12px;min-width:16px" title="Not found">&#10007;</span>';
@@ -8812,8 +8824,12 @@ async function loadAgentDetailTab(tab, slug, isPrimary) {
           // Tool name
           html += '<span style="font-size:13px;color:var(--text-primary);font-weight:500;min-width:140px">' + esc(toolName) + '</span>';
 
-          // Description
-          html += '<span style="flex:1;font-size:11px;color:var(--text-muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(toolDesc) + '</span>';
+          // Description (editable on click for CLI tools)
+          if (isCli) {
+            html += '<span class="cli-desc" style="flex:1;font-size:11px;color:var(--text-muted);cursor:pointer;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="Click to edit description" onclick="editCliDesc(\\x27' + esc(toolName) + '\\x27, this)">' + esc(toolDesc) + '</span>';
+          } else {
+            html += '<span style="flex:1;font-size:11px;color:var(--text-muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(toolDesc) + '</span>';
+          }
 
           // API badge with connection status
           if (isApi && t.api) {
@@ -8832,6 +8848,11 @@ async function loadAgentDetailTab(tab, slug, isPrimary) {
           if (!isCli && !isApi && !isGlobalMcp) {
             var typeBadge = t.type === 'sdk' ? 'SDK' : 'MCP';
             html += '<span class="badge badge-gray" style="font-size:9px">' + typeBadge + '</span>';
+          }
+
+          // Block/unblock toggle for CLI tools
+          if (isCli && t.installed) {
+            html += '<button onclick="toggleCliBlock(\\x27' + esc(toolName) + '\\x27, ' + (isBlocked ? 'false' : 'true') + ')" style="background:none;border:1px solid ' + (isBlocked ? 'var(--green)' : 'var(--red)') + ';border-radius:4px;padding:2px 8px;font-size:10px;color:' + (isBlocked ? 'var(--green)' : 'var(--red)') + ';cursor:pointer;white-space:nowrap">' + (isBlocked ? 'Unblock' : 'Block') + '</button>';
           }
 
           // Toggle (only for non-CLI, non-primary agents)
@@ -12533,6 +12554,55 @@ async function inlineSave(slug, field) {
       toast(d.error || 'Failed', 'error');
     }
   } catch(e) { toast(String(e), 'error'); }
+}
+
+async function addCliTool() {
+  var cmdEl = document.getElementById('add-cli-cmd');
+  var descEl = document.getElementById('add-cli-desc');
+  var cmd = (cmdEl ? cmdEl.value : '').trim().toLowerCase().replace(/[^a-z0-9_-]/g, '');
+  var desc = (descEl ? descEl.value : '').trim();
+  if (!cmd) { toast('Command name is required', 'error'); return; }
+  try {
+    await apiJson('POST', '/api/cli-tools', { cmd: cmd, description: desc || 'Custom CLI tool: ' + cmd });
+    toast(cmd + ' added', 'success');
+    if (cmdEl) cmdEl.value = '';
+    if (descEl) descEl.value = '';
+    renderAgentDetail(currentAgentSlug, 'tools');
+  } catch(e) { toast('Failed: ' + e, 'error'); }
+}
+
+async function toggleCliBlock(cmd, blocked) {
+  try {
+    await apiJson('PUT', '/api/cli-tools/' + encodeURIComponent(cmd), { blocked: blocked });
+    toast(cmd + (blocked ? ' blocked' : ' unblocked'), blocked ? 'error' : 'success');
+    renderAgentDetail(currentAgentSlug, 'tools');
+  } catch(e) { toast('Failed: ' + e, 'error'); }
+}
+
+async function editCliDesc(cmd, el) {
+  var current = el.textContent;
+  var input = document.createElement('input');
+  input.type = 'text';
+  input.value = current;
+  input.style.cssText = 'width:100%;padding:2px 6px;border:1px solid var(--accent);border-radius:3px;background:var(--bg-input);color:var(--text-primary);font-size:11px';
+  input.onblur = async function() {
+    var newDesc = input.value.trim();
+    if (newDesc && newDesc !== current) {
+      try {
+        await apiJson('PUT', '/api/cli-tools/' + encodeURIComponent(cmd), { description: newDesc });
+        el.textContent = newDesc;
+        toast('Description updated', 'success');
+      } catch(e) { el.textContent = current; toast('Failed: ' + e, 'error'); }
+    } else {
+      el.textContent = current;
+    }
+    el.style.display = '';
+  };
+  input.onkeydown = function(e) { if (e.key === 'Enter') input.blur(); if (e.key === 'Escape') { input.value = current; input.blur(); } };
+  el.style.display = 'none';
+  el.parentElement.insertBefore(input, el.nextSibling);
+  input.focus();
+  input.select();
 }
 
 async function toggleAgentTool(slug, toolName, enabled) {
