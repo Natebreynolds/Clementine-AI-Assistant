@@ -617,6 +617,52 @@ function cmdDoctor(opts: { fix?: boolean } = {}): void {
     }
   }
 
+  // Daemon runtime check — verify it's running and channels connected
+  const pidFilePath = getPidFilePath();
+  if (existsSync(pidFilePath)) {
+    const daemonPid = parseInt(readFileSync(pidFilePath, 'utf-8').trim(), 10);
+    let daemonAlive = false;
+    try { process.kill(daemonPid, 0); daemonAlive = true; } catch { /* dead */ }
+    if (daemonAlive) {
+      console.log(`  ${GREEN}OK${RESET}  Daemon running (PID ${daemonPid})`);
+      // Check recent logs for startup errors
+      const logPath = path.join(BASE_DIR, 'logs', 'clementine.log');
+      if (existsSync(logPath)) {
+        try {
+          const logTail = readFileSync(logPath, 'utf-8').split('\n').filter(Boolean).slice(-30);
+          let discordOk = false;
+          const recentErrors: string[] = [];
+          for (const line of logTail) {
+            try {
+              const entry = JSON.parse(line);
+              if (entry.msg?.includes('online as') || entry.msg?.includes('Clementine online')) discordOk = true;
+              if (entry.level >= 50 && entry.pid === daemonPid) recentErrors.push(entry.msg?.slice(0, 100) ?? '');
+            } catch { /* skip */ }
+          }
+          if (discordOk) {
+            console.log(`  ${GREEN}OK${RESET}  Discord connected`);
+          } else {
+            console.log(`  ${YELLOW}WARN${RESET}  Discord connection not confirmed in recent logs`);
+            issues++;
+          }
+          if (recentErrors.length > 0) {
+            console.log(`  ${YELLOW}WARN${RESET}  ${recentErrors.length} error(s) in recent logs:`);
+            for (const err of recentErrors.slice(0, 3)) {
+              console.log(`       ${DIM}${err}${RESET}`);
+            }
+            issues++;
+          }
+        } catch { /* log read failed */ }
+      }
+    } else {
+      console.log(`  ${RED}FAIL${RESET}  Daemon not running (stale PID file: ${daemonPid})`);
+      console.log(`       Start it: clementine launch`);
+      issues++;
+    }
+  } else {
+    console.log(`  ${DIM}  ○  Daemon not running${RESET}`);
+  }
+
   // LaunchAgent health check (macOS only)
   if (process.platform === 'darwin') {
     const plistPath = getLaunchdPlistPath();
@@ -1478,7 +1524,73 @@ async function cmdUpdate(options: { restart?: boolean; dryRun?: boolean }): Prom
     cmdLaunch({});
   }
 
-  // 13. Show current version
+  // 13. Post-restart health check — verify daemon started and channels connected
+  if (options.restart || wasRunning) {
+    console.log(`  ${S()} Verifying startup...`);
+    // Wait for daemon to initialize
+    await new Promise(resolve => setTimeout(resolve, 5000));
+
+    // Check if process is alive
+    const newPid = (() => {
+      try {
+        const pidFile = getPidFilePath();
+        return existsSync(pidFile) ? parseInt(readFileSync(pidFile, 'utf-8').trim(), 10) : null;
+      } catch { return null; }
+    })();
+
+    if (newPid) {
+      try {
+        process.kill(newPid, 0); // Signal 0 = check if alive
+        console.log(`  ${GREEN}OK${RESET}  Daemon running (PID ${newPid})`);
+      } catch {
+        console.log(`  ${RED}FAIL${RESET}  Daemon crashed after restart — check: tail ~/.clementine/logs/clementine.log`);
+      }
+    } else {
+      console.log(`  ${RED}FAIL${RESET}  No PID file — daemon may not have started`);
+    }
+
+    // Check logs for startup errors
+    try {
+      const logPath = path.join(BASE_DIR, 'logs', 'clementine.log');
+      if (existsSync(logPath)) {
+        const logTail = readFileSync(logPath, 'utf-8').split('\n').filter(Boolean).slice(-20);
+        const startupErrors: string[] = [];
+        let discordOnline = false;
+        for (const line of logTail) {
+          try {
+            const entry = JSON.parse(line);
+            if (entry.level >= 50) startupErrors.push(entry.msg?.slice(0, 120) ?? 'Unknown error');
+            if (entry.msg?.includes('online as') || entry.msg?.includes('Clementine online')) discordOnline = true;
+          } catch { /* skip */ }
+        }
+        if (discordOnline) {
+          console.log(`  ${GREEN}OK${RESET}  Discord connected`);
+        } else {
+          console.log(`  ${YELLOW}WARN${RESET}  Discord connection not confirmed — check logs`);
+        }
+        if (startupErrors.length > 0) {
+          for (const err of startupErrors.slice(0, 3)) {
+            console.log(`  ${RED}ERR${RESET}  ${err}`);
+          }
+        }
+      }
+    } catch { /* non-fatal */ }
+
+    // Verify .env survived the update (critical keys still present)
+    try {
+      const envContent = readFileSync(ENV_PATH, 'utf-8');
+      const criticalKeys = ['DISCORD_TOKEN', 'DISCORD_OWNER_ID'];
+      const missingKeys = criticalKeys.filter(k => {
+        const re = new RegExp(`^${k}=.+`, 'm');
+        return !re.test(envContent);
+      });
+      if (missingKeys.length > 0) {
+        console.log(`  ${RED}FAIL${RESET}  .env missing: ${missingKeys.join(', ')} — run: clementine config setup`);
+      }
+    } catch { /* .env read failed */ }
+  }
+
+  // 14. Show current version
   console.log();
   if (commitHash) {
     console.log(`  ${GREEN}Updated to ${commitHash} (${commitDate})${RESET}`);
