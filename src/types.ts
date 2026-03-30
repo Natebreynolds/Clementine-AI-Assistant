@@ -333,6 +333,15 @@ export interface SessionReflection {
   createdAt?: string;
 }
 
+// ── User Theory of Mind ─────────────────────────────────────────────
+
+export interface UserModelUpdate {
+  field: string;                       // e.g., "expertise.salesforce"
+  value: string;                       // e.g., "expert"
+  evidence: string;                    // e.g., "user corrected my SOQL query"
+  confidence: 'high' | 'medium' | 'low';
+}
+
 // ── Procedural Memory (Skills) ──────────────────────────────────────
 
 export interface SkillDocument {

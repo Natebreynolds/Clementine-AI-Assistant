@@ -209,6 +209,13 @@ export class MemoryStore {
       // Column already exists
     }
 
+    // Add metacognitive_summary column to session_reflections
+    try {
+      this.conn.exec('ALTER TABLE session_reflections ADD COLUMN metacognitive_summary TEXT DEFAULT NULL');
+    } catch {
+      // Column already exists
+    }
+
     // Feedback table for response quality tracking
     this.conn.exec(`
       CREATE TABLE IF NOT EXISTS feedback (
@@ -235,6 +242,7 @@ export class MemoryStore {
         quality_score INTEGER DEFAULT 3,
         behavioral_corrections TEXT DEFAULT '[]',
         preferences_learned TEXT DEFAULT '[]',
+        metacognitive_summary TEXT DEFAULT NULL,
         agent_slug TEXT DEFAULT NULL,
         created_at TEXT NOT NULL DEFAULT (datetime('now'))
       );

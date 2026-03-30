@@ -3490,6 +3490,59 @@ server.tool(
 
 // ── Self-Restart ────────────────────────────────────────────────────────
 
+// ── Dynamic Tool Creation ───────────────────────────────────────────────
+
+server.tool(
+  'create_tool',
+  'Create a new reusable tool script that becomes available as an MCP tool after daemon restart. Write bash or python scripts that automate recurring tasks.',
+  {
+    name: z.string().describe('Tool name (lowercase, underscores). Will be the MCP tool name.'),
+    description: z.string().describe('What this tool does (shown in tool list)'),
+    language: z.enum(['bash', 'python']).describe('Script language'),
+    code: z.string().describe('The script code. First line should be the shebang (#!/bin/bash or #!/usr/bin/env python3)'),
+    args_description: z.string().optional().describe('Description of expected arguments'),
+  },
+  async ({ name, description, language, code, args_description }) => {
+    const toolsDir = path.join(BASE_DIR, 'tools');
+    if (!existsSync(toolsDir)) mkdirSync(toolsDir, { recursive: true });
+
+    const safeName = name.toLowerCase().replace(/[^a-z0-9_]/g, '_');
+    const ext = language === 'python' ? '.py' : '.sh';
+    const filePath = path.join(toolsDir, `${safeName}${ext}`);
+
+    // Prepend description as comment + shebang if not present
+    let scriptContent = code;
+    const shebang = language === 'python' ? '#!/usr/bin/env python3' : '#!/bin/bash';
+    if (!scriptContent.startsWith('#!')) {
+      scriptContent = `${shebang}\n# ${description}\n${scriptContent}`;
+    } else if (!scriptContent.includes(description)) {
+      // Add description after shebang
+      const lines = scriptContent.split('\n');
+      lines.splice(1, 0, `# ${description}`);
+      scriptContent = lines.join('\n');
+    }
+
+    writeFileSync(filePath, scriptContent, { mode: 0o755 });
+
+    // Write metadata file for richer registration
+    writeFileSync(filePath + '.meta.json', JSON.stringify({
+      name: safeName,
+      description,
+      language,
+      args_description: args_description ?? '',
+      createdAt: new Date().toISOString(),
+    }, null, 2));
+
+    return textResult(
+      `Tool "${safeName}" created at ~/.clementine/tools/${safeName}${ext}\n` +
+      `It will be available as an MCP tool after daemon restart.\n` +
+      (args_description ? `Args: ${args_description}` : ''),
+    );
+  },
+);
+
+// ── Self-Restart ────────────────────────────────────────────────────────
+
 server.tool(
   'self_restart',
   'Restart the Clementine daemon to pick up code changes. Sends SIGUSR1 to the running process, which triggers a graceful restart.',
@@ -5613,6 +5666,54 @@ async function main() {
   };
   process.on('SIGINT', () => shutdown('SIGINT'));
   process.on('SIGTERM', () => shutdown('SIGTERM'));
+
+  // Auto-register user-created tool scripts from ~/.clementine/tools/
+  const userToolsDir = path.join(BASE_DIR, 'tools');
+  if (existsSync(userToolsDir)) {
+    const toolFiles = readdirSync(userToolsDir).filter(f => f.endsWith('.sh') || f.endsWith('.py'));
+    for (const file of toolFiles) {
+      const toolName = file.replace(/\.(sh|py)$/, '').replace(/[^a-z0-9_]/gi, '_');
+      const filePath = path.join(userToolsDir, file);
+      const metaPath = filePath + '.meta.json';
+
+      let desc = `Custom tool: ${toolName}`;
+      let argsDesc = 'Optional arguments string';
+      if (existsSync(metaPath)) {
+        try {
+          const meta = JSON.parse(readFileSync(metaPath, 'utf-8'));
+          desc = meta.description || desc;
+          argsDesc = meta.args_description || argsDesc;
+        } catch { /* use defaults */ }
+      } else {
+        // Fallback: read first comment line for description
+        try {
+          const firstLines = readFileSync(filePath, 'utf-8').split('\n').slice(0, 3);
+          const commentLine = firstLines.find(l => l.startsWith('#') && !l.startsWith('#!'));
+          if (commentLine) desc = commentLine.slice(1).trim();
+        } catch { /* use default */ }
+      }
+
+      try {
+        server.tool(toolName, desc, { args: z.string().optional().describe(argsDesc) }, async ({ args }) => {
+          const { execSync: execTool } = await import('node:child_process');
+          try {
+            const result = execTool(`"${filePath}" ${args || ''}`, {
+              encoding: 'utf-8',
+              timeout: 30000,
+              cwd: BASE_DIR,
+              env: { ...process.env, CLEMENTINE_HOME: BASE_DIR },
+            });
+            return textResult(result.trim() || '(no output)');
+          } catch (err: any) {
+            return textResult(`Tool error: ${err.stderr || err.message || String(err)}`.slice(0, 500));
+          }
+        });
+        logger.info({ tool: toolName, file }, 'Registered user tool');
+      } catch (err) {
+        logger.warn({ tool: toolName, err }, 'Failed to register user tool');
+      }
+    }
+  }
 
   const transport = new StdioServerTransport();
   await server.connect(transport);
