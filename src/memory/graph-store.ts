@@ -121,26 +121,36 @@ export class GraphStore {
       this.available = true;
       this.ownsServer = false;
 
-      // Catch connection-level errors: disable on first error, then attempt reconnect
+      // Catch connection-level errors: disable and start reconnect loop
       let errorHandled = false;
       this.client.on?.('error', (err: Error) => {
         if (errorHandled) return;
         errorHandled = true;
-        logger.warn({ err: err.message }, 'FalkorDB connection lost — will attempt reconnect in 30s');
+        logger.warn({ err: err.message }, 'FalkorDB connection lost — starting reconnect loop');
         this.available = false;
         try { this.client?.disconnect?.(); } catch { /* ignore */ }
 
-        // Attempt reconnect after delay (non-blocking)
-        setTimeout(async () => {
+        // Reconnect loop: try every 30s up to 5 times, then back off to 5 min
+        let attempts = 0;
+        const reconnectLoop = async () => {
+          attempts++;
           try {
             const reconnected = await this.connectToRunning();
             if (reconnected) {
-              logger.info('FalkorDB reconnected successfully');
-            } else {
-              logger.warn('FalkorDB reconnect failed — graph features remain disabled');
+              logger.info({ attempts }, 'FalkorDB reconnected');
+              return; // Success — stop the loop
             }
-          } catch { /* silent */ }
-        }, 30_000);
+          } catch { /* retry */ }
+
+          if (attempts < 5) {
+            setTimeout(reconnectLoop, 30_000);       // Retry in 30s
+          } else if (attempts < 10) {
+            setTimeout(reconnectLoop, 5 * 60_000);   // Back off to 5 min
+          } else {
+            logger.warn('FalkorDB reconnect gave up after 10 attempts — graph features disabled until restart');
+          }
+        };
+        setTimeout(reconnectLoop, 30_000);
       });
 
       return true;

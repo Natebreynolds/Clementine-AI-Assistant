@@ -176,25 +176,43 @@ function verifySetup(): string[] {
     }
   }
 
-  // Check better-sqlite3 native module — auto-rebuild if broken
+  // Check better-sqlite3 native module — rebuild if Node version changed since last build
+  const nodeStampFile = path.join(config.BASE_DIR, '.node-version-stamp');
+  const currentNodeVersion = process.version;
+  let needsRebuild = false;
+
   try {
-    require.resolve('better-sqlite3');
     execSync('node -e "require(\'better-sqlite3\')"', { stdio: 'pipe', timeout: 5000 });
+    // Module loads — stamp current version if not already stamped
+    if (!existsSync(nodeStampFile) || readFileSync(nodeStampFile, 'utf-8').trim() !== currentNodeVersion) {
+      writeFileSync(nodeStampFile, currentNodeVersion);
+    }
   } catch {
-    // Attempt auto-rebuild before reporting as error
+    needsRebuild = true;
+  }
+
+  // Check if Node version changed since last successful build
+  if (!needsRebuild && existsSync(nodeStampFile)) {
+    const stamped = readFileSync(nodeStampFile, 'utf-8').trim();
+    if (stamped !== currentNodeVersion) {
+      logger.info({ stamped, current: currentNodeVersion }, 'Node version changed — rebuilding native modules');
+      needsRebuild = true;
+    }
+  }
+
+  if (needsRebuild) {
     try {
-      logger.info('better-sqlite3 native module broken — auto-rebuilding...');
       execSync('npm rebuild better-sqlite3', {
         cwd: config.PKG_DIR,
         stdio: 'pipe',
         timeout: 30000,
       });
-      // Verify the rebuild worked
       execSync('node -e "require(\'better-sqlite3\')"', { stdio: 'pipe', timeout: 5000 });
-      logger.info('better-sqlite3 rebuilt successfully');
+      writeFileSync(nodeStampFile, currentNodeVersion);
+      logger.info('better-sqlite3 rebuilt for Node ' + currentNodeVersion);
     } catch {
       errors.push(
-        'better-sqlite3 native module is broken (Node version mismatch).\n' +
+        'better-sqlite3 native module is broken.\n' +
         '  Auto-rebuild failed. Fix manually: npm rebuild better-sqlite3\n' +
         '  Run: clementine doctor',
       );
