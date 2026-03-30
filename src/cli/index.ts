@@ -1337,6 +1337,19 @@ async function cmdUpdate(options: { restart?: boolean; dryRun?: boolean }): Prom
     }
   }
 
+  // 7c. Smoke test — verify the build is actually runnable
+  try {
+    execSync('node -e "require(\'./dist/index.js\')" 2>&1 || true', {
+      cwd: PACKAGE_ROOT,
+      stdio: 'pipe',
+      timeout: 10000,
+      env: { ...process.env, CLEMENTINE_SMOKE_TEST: '1' },
+    });
+    console.log(`  ${GREEN}OK${RESET}  Build output verified`);
+  } catch {
+    console.log(`  ${YELLOW}WARN${RESET}  Build output may have issues — check after restart`);
+  }
+
   // 8. Reinstall globally
   console.log(`  ${S()} Reinstalling CLI globally...`);
   try {
@@ -1360,8 +1373,50 @@ async function cmdUpdate(options: { restart?: boolean; dryRun?: boolean }): Prom
       });
       console.log(`  ${GREEN}OK${RESET}  Local changes restored`);
     } catch {
-      console.error(`  ${YELLOW}WARN${RESET}  Could not auto-restore stashed changes`);
-      console.log(`       Your changes are saved in: git -C "${PACKAGE_ROOT}" stash list`);
+      console.error(`  ${YELLOW}WARN${RESET}  Could not auto-restore stashed changes — falling back to backup`);
+      // Restore .env from backup if stash pop failed
+      const backupEnv = path.join(backupDir, '.env');
+      if (existsSync(backupEnv)) {
+        try {
+          const { copyFileSync } = require('node:fs') as typeof import('node:fs');
+          copyFileSync(backupEnv, ENV_PATH);
+          console.log(`  ${GREEN}OK${RESET}  .env restored from backup`);
+        } catch {
+          console.error(`  ${RED}FAIL${RESET}  Could not restore .env — copy manually from: ${backupEnv}`);
+        }
+      }
+      // Drop the stash so it doesn't interfere with future updates
+      try { execSync('git stash drop', { cwd: PACKAGE_ROOT, stdio: 'pipe' }); } catch { /* ignore */ }
+    }
+  }
+
+  // 9b. Verify .env survived the update
+  if (existsSync(ENV_PATH)) {
+    const envContent = readFileSync(ENV_PATH, 'utf-8');
+    if (envContent.trim().length < 10) {
+      console.error(`  ${RED}FAIL${RESET}  .env appears empty — restoring from backup`);
+      const backupEnv = path.join(backupDir, '.env');
+      if (existsSync(backupEnv)) {
+        try {
+          const { copyFileSync } = require('node:fs') as typeof import('node:fs');
+          copyFileSync(backupEnv, ENV_PATH);
+          console.log(`  ${GREEN}OK${RESET}  .env restored from backup`);
+        } catch {
+          console.error(`  ${RED}FAIL${RESET}  Restore failed — copy manually from: ${backupEnv}`);
+        }
+      }
+    }
+  } else {
+    console.error(`  ${RED}FAIL${RESET}  .env missing after update — restoring from backup`);
+    const backupEnv = path.join(backupDir, '.env');
+    if (existsSync(backupEnv)) {
+      try {
+        const { copyFileSync } = require('node:fs') as typeof import('node:fs');
+        copyFileSync(backupEnv, ENV_PATH);
+        console.log(`  ${GREEN}OK${RESET}  .env restored from backup`);
+      } catch {
+        console.error(`  ${RED}FAIL${RESET}  Restore failed — run: clementine config setup`);
+      }
     }
   }
 
