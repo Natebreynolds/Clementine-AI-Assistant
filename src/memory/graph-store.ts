@@ -121,16 +121,26 @@ export class GraphStore {
       this.available = true;
       this.ownsServer = false;
 
-      // Catch connection-level errors: disable on first error, disconnect to stop retry storm
-      let errorLogged = false;
+      // Catch connection-level errors: disable on first error, then attempt reconnect
+      let errorHandled = false;
       this.client.on?.('error', (err: Error) => {
-        if (!errorLogged) {
-          errorLogged = true;
-          logger.warn({ err: err.message }, 'FalkorDB client connection lost — disabling graph features');
-          this.available = false;
-          // Disconnect to stop the auto-reconnect retry loop
-          try { this.client?.disconnect?.(); } catch { /* ignore */ }
-        }
+        if (errorHandled) return;
+        errorHandled = true;
+        logger.warn({ err: err.message }, 'FalkorDB connection lost — will attempt reconnect in 30s');
+        this.available = false;
+        try { this.client?.disconnect?.(); } catch { /* ignore */ }
+
+        // Attempt reconnect after delay (non-blocking)
+        setTimeout(async () => {
+          try {
+            const reconnected = await this.connectToRunning();
+            if (reconnected) {
+              logger.info('FalkorDB reconnected successfully');
+            } else {
+              logger.warn('FalkorDB reconnect failed — graph features remain disabled');
+            }
+          } catch { /* silent */ }
+        }, 30_000);
       });
 
       return true;
@@ -560,12 +570,25 @@ export class GraphStore {
  * Returns null if the daemon isn't running or graph isn't available.
  * Callers should cache the result and reuse it.
  */
+let _sharedInstance: GraphStore | null = null;
+let _sharedConnecting = false;
+
 export async function getSharedGraphStore(persistenceDir: string): Promise<GraphStore | null> {
+  // Return existing instance if available
+  if (_sharedInstance?.isAvailable()) return _sharedInstance;
+
+  // Prevent multiple callers from racing to connect
+  if (_sharedConnecting) return _sharedInstance;
+  _sharedConnecting = true;
+
   try {
-    const gs = new GraphStore(persistenceDir);
+    const gs = _sharedInstance ?? new GraphStore(persistenceDir);
     const connected = await gs.connectToRunning();
-    return connected ? gs : null;
+    _sharedInstance = connected ? gs : null;
+    return _sharedInstance;
   } catch {
     return null;
+  } finally {
+    _sharedConnecting = false;
   }
 }
