@@ -6,7 +6,7 @@
  * option alongside Clementine's own MCP server.
  */
 
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { BASE_DIR } from '../config.js';
@@ -38,6 +38,8 @@ const KNOWN_DESCRIPTIONS: Record<string, string> = {
   greptile: 'Codebase search and understanding',
   terraform: 'Infrastructure as code management',
   discord: 'Discord bot integration',
+  imessage: 'iMessage — read and send messages on macOS',
+  figma: 'Figma design files — read, inspect, and export',
 };
 
 // ── Cache ────────────────────────────────────────────────────────────
@@ -108,7 +110,50 @@ export function discoverMcpServers(): ManagedMcpServer[] {
     }
   } catch { /* ignore */ }
 
-  // 3. User-managed config (overrides auto-detected)
+  // 3. Claude Desktop Extensions (newer format — ant.dir.* directories)
+  try {
+    const extensionsDir = path.join(os.homedir(), 'Library', 'Application Support', 'Claude', 'Claude Extensions');
+    const extensionsSettingsDir = path.join(os.homedir(), 'Library', 'Application Support', 'Claude', 'Claude Extensions Settings');
+    if (existsSync(extensionsDir) && existsSync(extensionsSettingsDir)) {
+      const settingsFiles = readdirSync(extensionsSettingsDir).filter(f => f.endsWith('.json'));
+      for (const settingsFile of settingsFiles) {
+        try {
+          const settings = JSON.parse(readFileSync(path.join(extensionsSettingsDir, settingsFile), 'utf-8'));
+          if (!settings.isEnabled) continue;
+
+          const extId = settingsFile.replace('.json', '');
+          const extDir = path.join(extensionsDir, extId);
+          if (!existsSync(extDir)) continue;
+
+          // Read package.json for name and entry point
+          const pkgPath = path.join(extDir, 'package.json');
+          if (!existsSync(pkgPath)) continue;
+          const pkg = JSON.parse(readFileSync(pkgPath, 'utf-8'));
+          const serverEntry = path.join(extDir, pkg.main || 'server/index.js');
+
+          // Derive a friendly name from the extension ID
+          // ant.dir.ant.anthropic.imessage → imessage
+          // ant.dir.ant.figma.figma → figma
+          const parts = extId.split('.');
+          const friendlyName = parts[parts.length - 1] || extId;
+
+          if (servers.has(friendlyName)) continue;
+
+          servers.set(friendlyName, {
+            name: friendlyName,
+            type: 'stdio',
+            command: 'node',
+            args: [serverEntry],
+            description: pkg.description || KNOWN_DESCRIPTIONS[friendlyName] || `${friendlyName} (Claude Extension)`,
+            enabled: true,
+            source: 'auto-detected',
+          });
+        } catch { /* skip malformed extension */ }
+      }
+    }
+  } catch { /* ignore */ }
+
+  // 4. User-managed config (overrides auto-detected)
   try {
     if (existsSync(MCP_SERVERS_FILE)) {
       const userServers = JSON.parse(readFileSync(MCP_SERVERS_FILE, 'utf-8')) as Record<string, any>;
