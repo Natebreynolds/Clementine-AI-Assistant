@@ -19,7 +19,9 @@ import {
 } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
+const require = createRequire(import.meta.url);
 import matter from 'gray-matter';
 import cron from 'node-cron';
 import type { Gateway } from '../gateway/router.js';
@@ -3631,19 +3633,27 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
   // ── SDR Operational Endpoints ─────────────────────────────────────────
 
   /** Helper: open a read-only connection to the memory DB for SDR queries. */
-  function withSdrDb<T>(fn: (db: import('better-sqlite3').Database) => T): T | null {
-    if (!existsSync(MEMORY_DB_PATH)) return null;
-    const Database = require('better-sqlite3');
-    const db = new Database(MEMORY_DB_PATH, { readonly: true });
-    try { return fn(db); } catch { return null; } finally { db.close(); }
+  let _cachedDatabase: any = null;
+  async function _getDatabase(): Promise<any> {
+    if (_cachedDatabase) return _cachedDatabase;
+    const mod = await import('better-sqlite3');
+    _cachedDatabase = mod.default || mod;
+    return _cachedDatabase;
+  }
+  function withSdrDb<T>(fn: (db: import('better-sqlite3').Database) => T): Promise<T | null> {
+    if (!existsSync(MEMORY_DB_PATH)) return Promise.resolve(null);
+    return _getDatabase().then(Database => {
+      const db = new Database(MEMORY_DB_PATH, { readonly: true });
+      try { return fn(db); } catch { return null; } finally { db.close(); }
+    });
   }
 
   /** Per-agent activity log — merges activities + send_log tables. */
-  app.get('/api/agents/:slug/activity', (req, res) => {
+  app.get('/api/agents/:slug/activity', async (req, res) => {
     const slug = req.params.slug;
     const limit = Math.min(Number(req.query.limit) || 50, 200);
     const sinceIso = String(req.query.since || new Date(Date.now() - 24 * 3600000).toISOString());
-    const result = withSdrDb((db) => {
+    const result = await withSdrDb((db) => {
       const activities = db.prepare(
         `SELECT a.*, l.name as lead_name, l.email as lead_email FROM activities a
          LEFT JOIN leads l ON l.id = a.lead_id
@@ -3660,11 +3670,11 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
   });
 
   /** Per-agent KPI scorecards. */
-  app.get('/api/agents/:slug/kpis', (req, res) => {
+  app.get('/api/agents/:slug/kpis', async (req, res) => {
     const slug = req.params.slug;
     const days = Math.min(Number(req.query.days) || 7, 90);
     const sinceIso = new Date(Date.now() - days * 86400000).toISOString();
-    const result = withSdrDb((db) => {
+    const result = await withSdrDb((db) => {
       const q = (sql: string, ...args: unknown[]) => (db.prepare(sql).get(...args) as { cnt: number })?.cnt ?? 0;
       const emailsSent = q(`SELECT COUNT(*) as cnt FROM activities WHERE agent_slug = ? AND type = 'email_sent' AND performed_at >= ?`, slug, sinceIso);
       const emailsReceived = q(`SELECT COUNT(*) as cnt FROM activities WHERE agent_slug = ? AND type = 'email_received' AND performed_at >= ?`, slug, sinceIso);
@@ -3692,10 +3702,10 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
   });
 
   /** Approval queue — list pending / all. */
-  app.get('/api/approvals', (req, res) => {
+  app.get('/api/approvals', async (req, res) => {
     const status = String(req.query.status || 'pending');
     const slug = req.query.agent ? String(req.query.agent) : undefined;
-    const result = withSdrDb((db) => {
+    const result = await withSdrDb((db) => {
       const where = ['status = ?'];
       const vals: unknown[] = [status];
       if (slug) { where.push('agent_slug = ?'); vals.push(slug); }
@@ -3777,10 +3787,10 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
   });
 
   /** Per-agent transcript list. */
-  app.get('/api/agents/:slug/transcripts', (req, res) => {
+  app.get('/api/agents/:slug/transcripts', async (req, res) => {
     const slug = req.params.slug;
     const limit = Math.min(Number(req.query.limit) || 20, 100);
-    const result = withSdrDb((db) => {
+    const result = await withSdrDb((db) => {
       // Find sessions associated with this agent by matching session key patterns
       // Agent sessions use keys like: discord:channel:{id}:{userId} or cron:{jobName}
       return db.prepare(
@@ -3796,7 +3806,7 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
   });
 
   /** Agent health indicators. */
-  app.get('/api/agents/:slug/health', (req, res) => {
+  app.get('/api/agents/:slug/health', async (req, res) => {
     const slug = req.params.slug;
     const cronRunsDir = path.join(BASE_DIR, 'cron', 'runs');
     let cronHealth = 'healthy';
@@ -3824,7 +3834,7 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
     }
 
     // Check activity health — any emails sent in last 24h if sequences are active?
-    const activityResult = withSdrDb((db) => {
+    const activityResult = await withSdrDb((db) => {
       const activeSeqs = (db.prepare(
         `SELECT COUNT(*) as cnt FROM sequence_enrollments se JOIN leads l ON l.id = se.lead_id WHERE l.agent_slug = ? AND se.status = 'active'`
       ).get(slug) as { cnt: number })?.cnt ?? 0;
@@ -3844,9 +3854,9 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
   });
 
   /** Pipeline breakdown for an agent (lead status counts). */
-  app.get('/api/agents/:slug/pipeline', (req, res) => {
+  app.get('/api/agents/:slug/pipeline', async (req, res) => {
     const slug = req.params.slug;
-    const result = withSdrDb((db) => {
+    const result = await withSdrDb((db) => {
       return db.prepare(
         `SELECT status, COUNT(*) as count FROM leads WHERE agent_slug = ? GROUP BY status ORDER BY
          CASE status
@@ -3877,9 +3887,9 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
   });
 
   /** Agent budget + spend info. */
-  app.get('/api/agents/:slug/budget', (req, res) => {
+  app.get('/api/agents/:slug/budget', async (req, res) => {
     const slug = req.params.slug;
-    const result = withSdrDb((db) => {
+    const result = await withSdrDb((db) => {
       try {
         const row = db.prepare(
           `SELECT COALESCE(SUM(input_tokens), 0) as inp, COALESCE(SUM(output_tokens), 0) as out
@@ -3894,10 +3904,10 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
   });
 
   /** Config revision history for an agent. */
-  app.get('/api/agents/:slug/revisions', (req, res) => {
+  app.get('/api/agents/:slug/revisions', async (req, res) => {
     const slug = req.params.slug;
     const fileName = req.query.file ? String(req.query.file) : undefined;
-    const result = withSdrDb((db) => {
+    const result = await withSdrDb((db) => {
       try {
         if (fileName) {
           return db.prepare(
