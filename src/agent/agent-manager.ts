@@ -244,6 +244,9 @@ export class AgentManager {
       slackAppToken,
       slackChannelId: meta.slackChannelId ? String(meta.slackChannelId) : undefined,
       sendPolicy,
+      allowedMcpServers: Array.isArray(meta.allowedMcpServers)
+        ? meta.allowedMcpServers.map(String).filter(Boolean)
+        : undefined,
       status: (['active', 'paused', 'error', 'terminated'].includes(meta.status) ? meta.status : 'active') as AgentStatus,
       budgetMonthlyCents: meta.budgetMonthlyCents ? Number(meta.budgetMonthlyCents) : undefined,
     };

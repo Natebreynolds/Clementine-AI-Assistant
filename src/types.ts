@@ -163,6 +163,7 @@ export interface AgentProfile {
   slackAppToken?: string;          // Slack app token (xapp-...) required for Socket Mode
   slackChannelId?: string;         // Explicit Slack channel ID override
   sendPolicy?: SendPolicy;         // Autonomous outbound email policy (SDR agents)
+  allowedMcpServers?: string[];    // MCP servers this agent can access (empty = all enabled)
   status?: AgentStatus;            // Persistent agent status (default: active)
   budgetMonthlyCents?: number;     // Monthly token budget in cents (0 = unlimited)
   spentMonthlyCents?: number;      // Current month's spend (computed from usage_log)
@@ -331,6 +332,21 @@ export interface SessionReflection {
   preferencesLearned: PreferenceLearned[];
   agentSlug?: string;
   createdAt?: string;
+}
+
+// ── MCP Server Management ───────────────────────────────────────────
+
+export interface ManagedMcpServer {
+  name: string;
+  type: 'stdio' | 'http' | 'sse';
+  command?: string;                    // for stdio
+  args?: string[];                     // for stdio
+  url?: string;                        // for http/sse
+  headers?: Record<string, string>;    // for http/sse
+  env?: Record<string, string>;        // environment vars
+  description: string;
+  enabled: boolean;
+  source: 'auto-detected' | 'user';   // where it came from
 }
 
 // ── User Theory of Mind ─────────────────────────────────────────────
