@@ -137,6 +137,10 @@ function mcpTool(name: string): string {
   return `mcp__${TOOLS_SERVER}__${name}`;
 }
 
+// Lazy-load MCP bridge (sync after first import)
+let _mcpBridge: typeof import('./mcp-bridge.js') | null = null;
+import('./mcp-bridge.js').then(m => { _mcpBridge = m; }).catch(() => {});
+
 /** Resolve model alias ("haiku", "sonnet", "opus") to full model ID. */
 function resolveModel(model: string | null | undefined): string | null {
   if (!model) return null;
@@ -1100,6 +1104,14 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
       ? ['context-1m-2025-08-07' as const]
       : undefined;
 
+    // Merge external MCP servers (Claude Desktop, Claude Code, user-managed)
+    let externalMcpServers: Record<string, any> = {};
+    try {
+      if (_mcpBridge) {
+        externalMcpServers = _mcpBridge.getMcpServersForAgent(profile?.allowedMcpServers);
+      }
+    } catch { /* non-fatal — run with just Clementine's own server */ }
+
     return {
       systemPrompt: fullSystemPrompt,
       model: resolvedModel,
@@ -1119,6 +1131,7 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
             CLEMENTINE_TEAM_AGENT: profile?.slug ?? 'clementine',
           },
         },
+        ...externalMcpServers,
       },
       ...(abortController ? { abortController } : {}),
       maxTurns: effectiveMaxTurns,

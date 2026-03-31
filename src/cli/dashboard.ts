@@ -2988,6 +2988,53 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
 
   // ── Self-Improvement API ─────────────────────────────────────────
 
+  // ── MCP Server Management API ───────────────────────────────────────
+
+  app.get('/api/mcp-servers', async (_req, res) => {
+    try {
+      const { discoverMcpServers } = await import('../agent/mcp-bridge.js');
+      const servers = discoverMcpServers();
+      res.json({ servers });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  app.post('/api/mcp-servers', async (req, res) => {
+    try {
+      const { name, type, command, args, url, headers, env, description, enabled } = req.body;
+      if (!name) { res.status(400).json({ error: 'name is required' }); return; }
+      const { upsertMcpServer } = await import('../agent/mcp-bridge.js');
+      upsertMcpServer(name, { name, type: type || 'stdio', command, args, url, headers, env, description: description || `${name} MCP server`, enabled: enabled !== false });
+      responseCache.delete('available-tools');
+      res.json({ ok: true });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  app.put('/api/mcp-servers/:name', async (req, res) => {
+    try {
+      const { upsertMcpServer } = await import('../agent/mcp-bridge.js');
+      upsertMcpServer(req.params.name, { name: req.params.name, ...req.body });
+      responseCache.delete('available-tools');
+      res.json({ ok: true });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  app.delete('/api/mcp-servers/:name', async (req, res) => {
+    try {
+      const { removeMcpServer } = await import('../agent/mcp-bridge.js');
+      removeMcpServer(req.params.name);
+      responseCache.delete('available-tools');
+      res.json({ ok: true });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
   // ── CLI Tools Management API ────────────────────────────────────────
 
   app.get('/api/cli-tools', (_req, res) => {
@@ -7797,6 +7844,38 @@ function getDashboardHTML(token: string): string {
         </div>
         <div class="tab-pane" id="tab-settings-integrations">
           <div class="card" style="margin-bottom:20px">
+            <div class="card-header" style="display:flex;align-items:center;justify-content:space-between">
+              <span>MCP Servers</span>
+              <button class="btn-sm btn-primary" onclick="toggleAddMcpForm()" id="add-mcp-toggle" style="font-size:11px">+ Add Server</button>
+            </div>
+            <div class="card-body" id="add-mcp-form" style="display:none;padding:16px;border-bottom:1px solid var(--border)">
+              <div style="display:grid;gap:10px">
+                <div style="display:flex;gap:8px">
+                  <div style="flex:1"><label style="font-size:11px;font-weight:600;color:var(--text-muted)">Name</label><input type="text" id="mcp-name" placeholder="slack" style="width:100%;padding:6px 8px;border:1px solid var(--border);border-radius:4px;background:var(--bg-input);color:var(--text-primary);font-size:12px"></div>
+                  <div style="width:100px"><label style="font-size:11px;font-weight:600;color:var(--text-muted)">Transport</label><select id="mcp-type" style="width:100%;padding:6px;border:1px solid var(--border);border-radius:4px;background:var(--bg-secondary);color:var(--text-primary);font-size:12px" onchange="toggleMcpFields()"><option value="stdio">stdio</option><option value="http">http</option><option value="sse">sse</option></select></div>
+                </div>
+                <div id="mcp-stdio-fields">
+                  <div style="display:flex;gap:8px">
+                    <div style="flex:1"><label style="font-size:11px;font-weight:600;color:var(--text-muted)">Command</label><input type="text" id="mcp-command" placeholder="npx" style="width:100%;padding:6px 8px;border:1px solid var(--border);border-radius:4px;background:var(--bg-input);color:var(--text-primary);font-size:12px"></div>
+                    <div style="flex:2"><label style="font-size:11px;font-weight:600;color:var(--text-muted)">Args (comma-separated)</label><input type="text" id="mcp-args" placeholder="-y, @anthropic-ai/mcp-slack" style="width:100%;padding:6px 8px;border:1px solid var(--border);border-radius:4px;background:var(--bg-input);color:var(--text-primary);font-size:12px"></div>
+                  </div>
+                </div>
+                <div id="mcp-url-fields" style="display:none">
+                  <label style="font-size:11px;font-weight:600;color:var(--text-muted)">URL</label><input type="text" id="mcp-url" placeholder="http://localhost:8000" style="width:100%;padding:6px 8px;border:1px solid var(--border);border-radius:4px;background:var(--bg-input);color:var(--text-primary);font-size:12px">
+                </div>
+                <div><label style="font-size:11px;font-weight:600;color:var(--text-muted)">Description</label><input type="text" id="mcp-desc" placeholder="What this server provides" style="width:100%;padding:6px 8px;border:1px solid var(--border);border-radius:4px;background:var(--bg-input);color:var(--text-primary);font-size:12px"></div>
+                <div><label style="font-size:11px;font-weight:600;color:var(--text-muted)">Environment Variables (KEY=value, one per line)</label><textarea id="mcp-env" rows="2" placeholder="SLACK_BOT_TOKEN=xoxb-..." style="width:100%;padding:6px 8px;border:1px solid var(--border);border-radius:4px;background:var(--bg-input);color:var(--text-primary);font-size:12px;font-family:monospace;resize:vertical"></textarea></div>
+                <div style="display:flex;gap:8px;justify-content:flex-end">
+                  <button class="btn-sm" onclick="toggleAddMcpForm()" style="background:var(--bg-tertiary);border:1px solid var(--border);color:var(--text-primary);padding:4px 12px;border-radius:4px;cursor:pointer;font-size:11px">Cancel</button>
+                  <button class="btn-sm btn-primary" onclick="saveMcpServer()" style="font-size:11px;padding:4px 12px">Save</button>
+                </div>
+              </div>
+            </div>
+            <div class="card-body" style="padding:0" id="mcp-servers-list">
+              <div class="empty-state">Loading MCP servers...</div>
+            </div>
+          </div>
+          <div class="card" style="margin-bottom:20px">
             <div class="card-header" style="display:flex;align-items:center;gap:8px">
               <span>Salesforce Connection</span>
               <span class="badge" id="sf-status-badge" style="font-size:10px">Checking...</span>
@@ -8329,7 +8408,7 @@ function navigateTo(page, opts) {
   if (page === 'builder') { refreshBuilderAgents(); document.getElementById('builder-input').focus(); }
   if (page === 'automations') { refreshCron(); refreshTimers(); refreshSelfImprove(); refreshSkills(); }
   if (page === 'intelligence') { refreshMemory(); }
-  if (page === 'settings') { refreshSettings(); refreshRemoteAccess(); refreshProjects(); refreshSalesforce(); }
+  if (page === 'settings') { refreshSettings(); refreshRemoteAccess(); refreshProjects(); refreshSalesforce(); refreshMcpServers(); }
   if (page === 'logs') refreshLogs();
   if (page === 'agent-detail' && opts.agentSlug != null) {
     currentAgentSlug = opts.agentSlug;
@@ -13907,6 +13986,104 @@ async function refreshGoalsProgress() {
     container.innerHTML = html;
   } catch (err) {
     document.getElementById('goals-progress-content').innerHTML = '<div class="empty-state">Failed to load: ' + esc(String(err)) + '</div>';
+  }
+}
+
+// ── MCP Server Manager ─────────────────────────────────
+
+function toggleAddMcpForm() {
+  var form = document.getElementById('add-mcp-form');
+  var btn = document.getElementById('add-mcp-toggle');
+  if (!form) return;
+  var showing = form.style.display !== 'none';
+  form.style.display = showing ? 'none' : '';
+  if (btn) btn.textContent = showing ? '+ Add Server' : 'Cancel';
+}
+
+function toggleMcpFields() {
+  var type = (document.getElementById('mcp-type') || {}).value;
+  var stdio = document.getElementById('mcp-stdio-fields');
+  var url = document.getElementById('mcp-url-fields');
+  if (stdio) stdio.style.display = type === 'stdio' ? '' : 'none';
+  if (url) url.style.display = type !== 'stdio' ? '' : 'none';
+}
+
+async function saveMcpServer() {
+  var name = (document.getElementById('mcp-name') || {}).value?.trim();
+  if (!name) { toast('Name is required', 'error'); return; }
+  var type = (document.getElementById('mcp-type') || {}).value || 'stdio';
+  var payload = { name: name, type: type, description: (document.getElementById('mcp-desc') || {}).value?.trim() || '', enabled: true };
+  if (type === 'stdio') {
+    payload.command = (document.getElementById('mcp-command') || {}).value?.trim();
+    payload.args = ((document.getElementById('mcp-args') || {}).value || '').split(',').map(function(s) { return s.trim(); }).filter(Boolean);
+  } else {
+    payload.url = (document.getElementById('mcp-url') || {}).value?.trim();
+  }
+  // Parse env vars
+  var envText = (document.getElementById('mcp-env') || {}).value || '';
+  var env = {};
+  envText.split('\\n').forEach(function(line) {
+    var eq = line.indexOf('=');
+    if (eq > 0) env[line.slice(0, eq).trim()] = line.slice(eq + 1).trim();
+  });
+  if (Object.keys(env).length > 0) payload.env = env;
+  try {
+    await apiJson('POST', '/api/mcp-servers', payload);
+    toast(name + ' server added', 'success');
+    toggleAddMcpForm();
+    refreshMcpServers();
+  } catch(e) { toast('Failed: ' + e, 'error'); }
+}
+
+async function toggleMcpServer(name, enabled) {
+  try {
+    await apiJson('PUT', '/api/mcp-servers/' + encodeURIComponent(name), { enabled: enabled });
+    toast(name + (enabled ? ' enabled' : ' disabled'), enabled ? 'success' : 'info');
+    refreshMcpServers();
+  } catch(e) { toast('Failed: ' + e, 'error'); }
+}
+
+async function deleteMcpServer(name) {
+  if (!confirm('Remove ' + name + ' server config?')) return;
+  try {
+    await apiDelete('/api/mcp-servers/' + encodeURIComponent(name));
+    toast(name + ' removed', 'success');
+    refreshMcpServers();
+  } catch(e) { toast('Failed: ' + e, 'error'); }
+}
+
+async function refreshMcpServers() {
+  var container = document.getElementById('mcp-servers-list');
+  if (!container) return;
+  try {
+    var r = await apiFetch('/api/mcp-servers');
+    var d = await r.json();
+    var servers = d.servers || [];
+    if (servers.length === 0) {
+      container.innerHTML = '<div class="empty-state" style="padding:20px">No MCP servers discovered. Add one above or configure in Claude Desktop.</div>';
+      return;
+    }
+    var html = '';
+    servers.forEach(function(s) {
+      var statusColor = s.enabled ? 'var(--green)' : 'var(--text-muted)';
+      var sourceBadge = s.source === 'auto-detected'
+        ? '<span class="badge badge-blue" style="font-size:9px">auto</span>'
+        : '<span class="badge badge-gray" style="font-size:9px">user</span>';
+      var typeBadge = '<span style="font-size:10px;color:var(--text-muted);padding:1px 6px;border:1px solid var(--border);border-radius:3px">' + esc(s.type) + '</span>';
+      html += '<div style="display:flex;align-items:center;gap:8px;padding:8px 12px;border-bottom:1px solid var(--border);' + (s.enabled ? '' : 'opacity:0.5') + '">';
+      html += '<span style="width:8px;height:8px;border-radius:50%;background:' + statusColor + ';flex-shrink:0"></span>';
+      html += '<span style="font-size:13px;font-weight:500;color:var(--text-primary);min-width:120px">' + esc(s.name) + '</span>';
+      html += sourceBadge + ' ' + typeBadge;
+      html += '<span style="flex:1;font-size:11px;color:var(--text-muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(s.description) + '</span>';
+      html += '<button onclick="toggleMcpServer(\\x27' + esc(s.name) + '\\x27,' + (s.enabled ? 'false' : 'true') + ')" style="background:none;border:1px solid ' + (s.enabled ? 'var(--red)' : 'var(--green)') + ';border-radius:4px;padding:2px 8px;font-size:10px;color:' + (s.enabled ? 'var(--red)' : 'var(--green)') + ';cursor:pointer">' + (s.enabled ? 'Disable' : 'Enable') + '</button>';
+      if (s.source === 'user') {
+        html += '<button onclick="deleteMcpServer(\\x27' + esc(s.name) + '\\x27)" style="background:none;border:1px solid var(--border);border-radius:4px;padding:2px 8px;font-size:10px;color:var(--text-muted);cursor:pointer">Remove</button>';
+      }
+      html += '</div>';
+    });
+    container.innerHTML = html;
+  } catch(e) {
+    container.innerHTML = '<div class="empty-state" style="color:var(--red)">Failed to load MCP servers</div>';
   }
 }
 
