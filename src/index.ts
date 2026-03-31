@@ -593,6 +593,12 @@ async function asyncMain(): Promise<void> {
     logger.warn(warning);
   }
 
+  // ── Check MCP extension permissions ────────────────────────────
+  try {
+    const { checkPermissionsOnStartup } = await import('./agent/mcp-bridge.js');
+    checkPermissionsOnStartup();
+  } catch { /* non-fatal */ }
+
   // ── Initialize layers ────────────────────────────────────────────
 
   // Agent layer
