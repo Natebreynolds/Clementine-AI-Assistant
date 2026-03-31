@@ -925,12 +925,22 @@ async function asyncMain(): Promise<void> {
     cleanupPid();
 
     const { spawn } = await import('node:child_process');
+    const { openSync } = await import('node:fs');
     const entry = process.argv[1];
     const args = process.argv.slice(2);
     logger.info({ entry, args }, 'Spawning new instance');
+
+    // Redirect child stdout/stderr to log file so pino logs are preserved
+    const logPath = path.join(config.BASE_DIR, 'logs', 'clementine.log');
+    let childStdio: any = 'ignore';
+    try {
+      const logFd = openSync(logPath, 'a');
+      childStdio = ['ignore', logFd, logFd];
+    } catch { /* fallback to ignore if log file can't be opened */ }
+
     const child = spawn(process.execPath, [entry, ...args], {
       detached: true,
-      stdio: 'ignore',
+      stdio: childStdio,
       cwd: process.cwd(),
       env: process.env,
     });
