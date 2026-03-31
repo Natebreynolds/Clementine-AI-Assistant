@@ -3035,6 +3035,15 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
     }
   });
 
+  app.get('/api/mcp-permissions', async (_req, res) => {
+    try {
+      const { checkPermissions } = await import('../agent/mcp-bridge.js');
+      res.json({ permissions: checkPermissions() });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
   // ── CLI Tools Management API ────────────────────────────────────────
 
   app.get('/api/cli-tools', (_req, res) => {
@@ -14059,6 +14068,14 @@ async function refreshMcpServers() {
     var r = await apiFetch('/api/mcp-servers');
     var d = await r.json();
     var servers = d.servers || [];
+
+    // Check permissions for extensions that need macOS grants
+    var permMap = {};
+    try {
+      var pr = await apiFetch('/api/mcp-permissions');
+      var pd = await pr.json();
+      (pd.permissions || []).forEach(function(p) { permMap[p.server] = p; });
+    } catch(e) { /* non-fatal */ }
     if (servers.length === 0) {
       container.innerHTML = '<div class="empty-state" style="padding:20px">No MCP servers discovered. Add one above or configure in Claude Desktop.</div>';
       return;
@@ -14080,6 +14097,14 @@ async function refreshMcpServers() {
         html += '<button onclick="deleteMcpServer(\\x27' + esc(s.name) + '\\x27)" style="background:none;border:1px solid var(--border);border-radius:4px;padding:2px 8px;font-size:10px;color:var(--text-muted);cursor:pointer">Remove</button>';
       }
       html += '</div>';
+      // Permission warning row
+      var perm = permMap[s.name];
+      if (perm && !perm.granted) {
+        html += '<div style="padding:6px 12px 8px 36px;border-bottom:1px solid var(--border);background:rgba(231,76,60,0.05)">';
+        html += '<span style="color:var(--red);font-size:11px">&#9888; macOS permission needed for ' + esc(perm.resource) + '</span>';
+        html += '<span style="font-size:11px;color:var(--text-muted);margin-left:8px">System Settings \\u2192 Privacy & Security \\u2192 ' + esc(perm.settingsLabel) + '</span>';
+        html += '</div>';
+      }
     });
     container.innerHTML = html;
   } catch(e) {
