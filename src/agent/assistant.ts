@@ -821,6 +821,8 @@ Save important facts immediately; a background agent also extracts after each ex
 ## Context Window Management
 
 Delegate data-heavy work (SEO, analytics, bulk API calls for 3+ entities) to sub-agents via the Agent tool. They run in their own context and return summaries. Never pull bulk data directly.
+
+**Multi-file rule:** When a task involves reading or editing 2+ separate files/projects/briefs, ALWAYS spawn a sub-agent per file using the Agent tool. Give each sub-agent the full file path and clear instructions. This runs them in parallel, prevents context bloat, and frees you to respond to the user faster. NEVER sequentially read multiple large files in a single query — that blocks the user from doing anything else.
 `);
     }
 
@@ -1500,9 +1502,23 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
         `If a file can't be read, say so. If you're stuck, say so. Never stall silently.]\n\n${effectivePrompt}`;
     }
 
+    // Chat query timeout: abort after 10 minutes to prevent hour-long stalls
+    // that block the user from doing anything else
+    const CHAT_TIMEOUT_MS = 10 * 60 * 1000;
+    let chatTimeoutHandle: ReturnType<typeof setTimeout> | undefined;
+    const effectiveAbortController = abortController ?? new AbortController();
+    if (!abortController) {
+      chatTimeoutHandle = setTimeout(() => {
+        effectiveAbortController.abort();
+        logger.warn({ sessionKey: key }, 'Chat query timed out after 10 minutes');
+      }, CHAT_TIMEOUT_MS);
+    }
+
     let [responseText, sessionId] = await this.runQuery(
-      effectivePrompt, key, onText, model, profile, securityAnnotation, maxTurns, projectOverride, onToolActivity, verboseLevel, abortController,
+      effectivePrompt, key, onText, model, profile, securityAnnotation, maxTurns, projectOverride, onToolActivity, verboseLevel, effectiveAbortController,
     );
+
+    if (chatTimeoutHandle) clearTimeout(chatTimeoutHandle);
 
     // If we got a context-length / prompt-too-long error, retry with a fresh session
     const errLower = responseText.toLowerCase();
@@ -1751,7 +1767,15 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
           }
         } catch (e: unknown) {
           const errStr = String(e).toLowerCase();
-          if (errStr.includes('rate') && (errStr.includes('limit') || errStr.includes('rate_limit'))) {
+          if (errStr.includes('abort') || errStr.includes('cancel')) {
+            // Query was aborted (timeout or user cancel) — return partial output with explanation
+            logger.warn({ sessionKey }, 'Chat query aborted');
+            if (!responseText) {
+              responseText = 'This task was taking too long so I stopped it. For multi-file work, try asking me to handle one file at a time, or I can spawn sub-agents to process them in parallel.';
+            } else {
+              responseText += '\n\n*(Timed out — this is a partial result. Try breaking the task into smaller pieces or ask me to use sub-agents.)*';
+            }
+          } else if (errStr.includes('rate') && (errStr.includes('limit') || errStr.includes('rate_limit'))) {
             hitRateLimit = true;
           } else if (errStr.includes('prompt is too long') || errStr.includes('prompt too long') || errStr.includes('context_length')) {
             responseText = responseText || 'Error: prompt is too long — context window overflow from large tool responses.';
