@@ -65,12 +65,11 @@ import {
   setProfileAllowedTools,
   setSendPolicy,
   setInteractionSource,
-  setStallBreaker,
 } from './hooks.js';
 import { scanner } from '../security/scanner.js';
 import { AgentManager } from './agent-manager.js';
 import { extractLinks } from './link-extractor.js';
-import { toolLoopDetector, ToolLoopDetector } from './tool-loop-detector.js';
+import { StallGuard } from './stall-guard.js';
 import { formatResultsForPrompt } from '../memory/search.js';
 import { PromptCache } from './prompt-cache.js';
 
@@ -956,6 +955,7 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
     maxBudgetUsd?: number;
     thinking?: { type: 'adaptive' };
     outputFormat?: { type: 'json_schema'; schema: Record<string, unknown> };
+    stallGuard?: StallGuard;
   } = {}): SDKOptions {
     const {
       isHeartbeat = false,
@@ -977,6 +977,7 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
       maxBudgetUsd,
       thinking,
       outputFormat,
+      stallGuard,
     } = opts;
 
     let allowedTools = [
@@ -1152,6 +1153,13 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
       ...(computedBetas ? { betas: computedBetas } : {}),
       ...(outputFormat ? { outputFormat } : {}),
       canUseTool: async (toolName: string, toolInput: Record<string, unknown>, _options: { signal: AbortSignal; toolUseID: string }) => {
+        // Per-query stall guard (no global state — scoped to this query)
+        if (stallGuard) {
+          const stallCheck = stallGuard.shouldBlockTool(toolName);
+          if (stallCheck.block) {
+            return { behavior: 'deny' as const, message: stallCheck.message ?? 'Stall breaker.' };
+          }
+        }
         const result = await enforceToolPermissions(toolName, toolInput, capturedSource);
         if (result.behavior === 'deny') {
           return { behavior: 'deny' as const, message: result.message ?? 'Denied.' };
@@ -1368,8 +1376,7 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
         this.preRotationFlush(key).catch(() => {});
         this.sessions.delete(key);
         this.exchangeCounts.set(key, 0);
-        toolLoopDetector.reset();
-        sessionRotated = true;
+          sessionRotated = true;
       }
     }
 
@@ -1381,7 +1388,6 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
       this.saveAutoHandoff(key);
       this.sessions.delete(key);
       this.exchangeCounts.set(key, 0);
-      toolLoopDetector.reset();
       sessionRotated = true;
     }
 
@@ -1502,23 +1508,12 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
         `If a file can't be read, say so. If you're stuck, say so. Never stall silently.]\n\n${effectivePrompt}`;
     }
 
-    // Chat query timeout: abort after 10 minutes to prevent hour-long stalls
-    // that block the user from doing anything else
     const CHAT_TIMEOUT_MS = 10 * 60 * 1000;
-    let chatTimeoutHandle: ReturnType<typeof setTimeout> | undefined;
-    const effectiveAbortController = abortController ?? new AbortController();
-    if (!abortController) {
-      chatTimeoutHandle = setTimeout(() => {
-        effectiveAbortController.abort();
-        logger.warn({ sessionKey: key }, 'Chat query timed out after 10 minutes');
-      }, CHAT_TIMEOUT_MS);
-    }
+    const guard = new StallGuard();
 
     let [responseText, sessionId] = await this.runQuery(
-      effectivePrompt, key, onText, model, profile, securityAnnotation, maxTurns, projectOverride, onToolActivity, verboseLevel, effectiveAbortController,
+      effectivePrompt, key, onText, model, profile, securityAnnotation, maxTurns, projectOverride, onToolActivity, verboseLevel, abortController, guard, CHAT_TIMEOUT_MS,
     );
-
-    if (chatTimeoutHandle) clearTimeout(chatTimeoutHandle);
 
     // If we got a context-length / prompt-too-long error, retry with a fresh session
     const errLower = responseText.toLowerCase();
@@ -1531,7 +1526,6 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
       logger.warn({ sessionKey: key }, 'Context overflow detected — rotating session');
       this.sessions.delete(key);
       this.exchangeCounts.set(key, 0);
-      toolLoopDetector.reset();
       let retryPrompt = text;
       const summary = await this.summarizeSession(key);
       if (summary) {
@@ -1599,6 +1593,8 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
     onToolActivity?: OnToolActivityCallback,
     verboseLevel?: VerboseLevel,
     abortController?: AbortController,
+    stallGuard?: StallGuard,
+    timeoutMs?: number,
   ): Promise<[string, string]> {
     // Parallelize context retrieval and project matching — they're independent
     // If a project override is set, skip auto-matching entirely
@@ -1644,9 +1640,20 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
       retrievalContext += goalContext;
     }
 
+    // Timeout: abort the query after timeoutMs to prevent hour-long stalls
+    let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+    if (timeoutMs && !abortController) {
+      const ac = new AbortController();
+      abortController = ac;
+      timeoutHandle = setTimeout(() => {
+        ac.abort();
+        logger.warn({ sessionKey, timeoutMs }, 'Chat query timed out');
+      }, timeoutMs);
+    }
+
     try {
       for (let attempt = 0; attempt <= PersonalAssistant.RATE_LIMIT_MAX_RETRIES; attempt++) {
-        const sdkOptions = this.buildOptions({ model, maxTurns: maxTurnsOverride ?? null, retrievalContext, profile, sessionKey, streaming: !!onText, verboseLevel, abortController });
+        const sdkOptions = this.buildOptions({ model, maxTurns: maxTurnsOverride ?? null, retrievalContext, profile, sessionKey, streaming: !!onText, verboseLevel, abortController, stallGuard });
 
         // If a project matched, switch cwd so the agent gets its tools/CLAUDE.md
         if (matchedProject) {
@@ -1692,11 +1699,6 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
         let responseText = '';
         let sessionId = '';
         let hitRateLimit = false;
-        const toolCalls: string[] = []; // Track tool calls for audit trail
-
-        // Metacognitive monitor — tracks reasoning quality during this execution
-        const { MetacognitiveMonitor } = await import('./metacognition.js');
-        const metacog = new MetacognitiveMonitor();
 
         try {
           const stream = query({ prompt, options: sdkOptions });
@@ -1717,18 +1719,10 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
                   if (onToolActivity) {
                     try { await onToolActivity(block.name, (block.input ?? {}) as Record<string, unknown>); } catch { /* non-fatal */ }
                   }
-                  const loopCheck = toolLoopDetector.recordCall(block.name, (block.input ?? {}) as Record<string, unknown>);
-                  if (loopCheck.verdict === 'block') {
-                    logger.warn({ tool: block.name, ...loopCheck }, 'Tool loop detected — activating stall breaker');
-                    setStallBreaker(true, loopCheck.detail ?? 'Repetitive tool calls detected.');
+                  // StallGuard handles loop detection + metacognition + stall breaking
+                  if (stallGuard) {
+                    stallGuard.recordToolCall(block.name, (block.input ?? {}) as Record<string, unknown>);
                   }
-                  // Metacognitive monitoring — activate stall breaker on both warn and intervene
-                  const mcSignal = metacog.recordToolCall(block.name, (block.input ?? {}) as Record<string, unknown>);
-                  if (mcSignal.type === 'intervene' || mcSignal.type === 'warn') {
-                    logger.warn({ reason: mcSignal.reason }, `Metacognition ${mcSignal.type} — activating stall breaker: ${mcSignal.guidance?.slice(0, 80)}`);
-                    setStallBreaker(true, mcSignal.guidance ?? 'Agent appears stuck.');
-                  }
-                  toolCalls.push(`${block.name}(${JSON.stringify(block.input ?? {}).slice(0, 200)})`);
                 }
               }
             } else if (message.type === 'stream_event') {
@@ -1806,6 +1800,7 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
         }
 
         // Log tool calls to transcript for audit trail
+        const toolCalls = stallGuard?.getToolCalls() ?? [];
         if (sessionKey && toolCalls.length > 0 && this.memoryStore) {
           try {
             this.memoryStore.saveTurn(
@@ -1818,28 +1813,28 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
           }
         }
 
-        // Log metacognitive summary
-        const mcSummary = metacog.getSummary();
-        if (mcSummary.signals.length > 0 || mcSummary.toolCallCount > 10) {
-          logger.info({ ...mcSummary }, 'Metacognitive summary');
-        }
-
-        // Post-query stall detection: check if agent promised action but didn't deliver
-        const promiseSignal = metacog.detectPromiseWithoutAction(responseText, mcSummary.toolCallCount);
-        if (promiseSignal.type === 'intervene') {
-          logger.warn({ sessionKey, reason: promiseSignal.reason }, 'Stall detected: agent promised action without follow-through');
-          if (sessionKey) {
-            this.stallNudges.set(sessionKey,
-              `Your last response said "${responseText.slice(0, 120).replace(/\n/g, ' ')}…" ` +
-              `but you made only ${mcSummary.toolCallCount} tool call(s). You promised to act but didn't complete the task.`);
+        // Log stall guard summary
+        if (stallGuard) {
+          const summary = stallGuard.getSummary();
+          const mc = summary.metacognition;
+          if (mc.signals.length > 0 || mc.toolCallCount > 10 || summary.breakerActivated) {
+            logger.info({ ...mc, breakerActivated: summary.breakerActivated }, 'StallGuard summary');
           }
-        }
 
-        // Also flag if metacognition detected circular reasoning or research-without-action
-        if (!this.stallNudges.has(sessionKey ?? '') && mcSummary.stuckDetected && sessionKey) {
-          this.stallNudges.set(sessionKey,
-            `Previous query showed stuck behavior (${mcSummary.signals.join(', ')}). ` +
-            `${mcSummary.toolCallCount} tool calls made with ${mcSummary.confidenceFinal} confidence.`);
+          // Post-query: set nudge for NEXT query if this one showed stall signals
+          if (sessionKey) {
+            const promiseSignal = stallGuard.detectPromiseWithoutAction(responseText);
+            if (promiseSignal.type === 'intervene') {
+              logger.warn({ sessionKey, reason: promiseSignal.reason }, 'Stall: promised action without follow-through');
+              this.stallNudges.set(sessionKey,
+                `Your last response said "${responseText.slice(0, 120).replace(/\n/g, ' ')}…" ` +
+                `but you made only ${mc.toolCallCount} tool call(s). You promised to act but didn't complete the task.`);
+            } else if (mc.stuckDetected && !this.stallNudges.has(sessionKey)) {
+              this.stallNudges.set(sessionKey,
+                `Previous query showed stuck behavior (${mc.signals.join(', ')}). ` +
+                `${mc.toolCallCount} tool calls, ${mc.confidenceFinal} confidence.`);
+            }
+          }
         }
 
         return [responseText, sessionId];
@@ -1847,7 +1842,7 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
 
       return ['Sorry, I hit a temporary issue. Please try again.', ''];
     } finally {
-      setStallBreaker(false);
+      if (timeoutHandle) clearTimeout(timeoutHandle);
       setProfileTier(null);
       setSendPolicy(null, null);
       setInteractionSource('autonomous');
@@ -2451,6 +2446,8 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
     const { tier = 2, maxTurns = 15, model, disableTools = false, outputFormat } = opts;
 
     // Don't mutate the global — pass source through the closure instead
+    // Per-step stall guard so concurrent steps don't cross-contaminate
+    const stepGuard = new StallGuard();
     const sdkOptions = this.buildOptions({
       isHeartbeat: false,
       cronTier: tier,
@@ -2461,10 +2458,9 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
       sourceOverride: 'owner-dm',
       disableAllTools: disableTools,
       outputFormat,
+      stallGuard: stepGuard,
     });
 
-    // Per-step detector so concurrent steps don't cross-contaminate
-    const stepLoopDetector = new ToolLoopDetector();
     const trace: TraceEntry[] = [];
     const stream = query({ prompt, options: sdkOptions });
 
@@ -2475,11 +2471,7 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
           if (block.type === 'text' && block.text) {
             trace.push({ type: 'text', timestamp: new Date().toISOString(), content: block.text });
           } else if (block.type === 'tool_use' && block.name) {
-            const loopCheck = stepLoopDetector.recordCall(block.name, (block.input ?? {}) as Record<string, unknown>);
-            if (loopCheck.verdict === 'block') {
-              logger.warn({ tool: block.name, stepId, ...loopCheck }, 'Tool loop detected in plan step — activating stall breaker');
-              setStallBreaker(true, loopCheck.detail ?? 'Repetitive tool calls in plan step.');
-            }
+            stepGuard.recordToolCall(block.name, (block.input ?? {}) as Record<string, unknown>);
             trace.push({
               type: 'tool_call',
               timestamp: new Date().toISOString(),
@@ -2507,12 +2499,14 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
     successCriteria?: string[],
   ): Promise<string> {
     setInteractionSource('autonomous');
+    const cronGuard = new StallGuard();
     const sdkOptions = this.buildOptions({
       isHeartbeat: true,
       cronTier: tier,
       maxTurns: maxTurns ?? (tier >= 2 ? 30 : HEARTBEAT_MAX_TURNS),
       model: model ?? null,
       enableTeams: true,
+      stallGuard: cronGuard,
     });
 
     // Override cwd if a project workDir is specified
@@ -2699,11 +2693,7 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
                 trace.push({ type: 'text', timestamp: new Date().toISOString(), content: block.text });
               } else if (block.type === 'tool_use' && block.name) {
                 logToolUse(block.name, (block.input ?? {}) as Record<string, unknown>);
-                const loopCheck = toolLoopDetector.recordCall(block.name, (block.input ?? {}) as Record<string, unknown>);
-                if (loopCheck.verdict === 'block') {
-                  logger.warn({ tool: block.name, ...loopCheck }, 'Tool loop detected — activating stall breaker');
-                  setStallBreaker(true, loopCheck.detail ?? 'Repetitive tool calls detected.');
-                }
+                cronGuard.recordToolCall(block.name, (block.input ?? {}) as Record<string, unknown>);
                 trace.push({
                   type: 'tool_call',
                   timestamp: new Date().toISOString(),
@@ -2752,7 +2742,6 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
 
       return deliverable;
     } finally {
-      setStallBreaker(false);
       if (timeoutHandle) clearTimeout(timeoutHandle);
     }
   }
@@ -2948,6 +2937,7 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
       // Re-assert autonomous source — a chat message may have changed it between phases
       setInteractionSource('autonomous');
 
+      const phaseGuard = new StallGuard();
       const sdkOptions = this.buildOptions({
         isHeartbeat: true,
         cronTier: tier,
@@ -2956,6 +2946,7 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
         enableTeams: true,
         isUnleashed: true,
         maxBudgetUsd: BUDGET.unleashedPhase,
+        stallGuard: phaseGuard,
       });
 
       // Enable progress summaries for real-time status updates
@@ -3048,11 +3039,7 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
                 phaseOutput += block.text;
               } else if (block.type === 'tool_use' && block.name) {
                 logToolUse(block.name, (block.input ?? {}) as Record<string, unknown>);
-                const loopCheck = toolLoopDetector.recordCall(block.name, (block.input ?? {}) as Record<string, unknown>);
-                if (loopCheck.verdict === 'block') {
-                  logger.warn({ tool: block.name, ...loopCheck }, 'Tool loop detected — activating stall breaker');
-                  setStallBreaker(true, loopCheck.detail ?? 'Repetitive tool calls detected.');
-                }
+                phaseGuard.recordToolCall(block.name, (block.input ?? {}) as Record<string, unknown>);
               }
             }
           } else if (message.type === 'result') {
@@ -3195,6 +3182,7 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
       logger.info({ taskName, phase }, `Team task: starting phase ${phase}`);
       setInteractionSource('autonomous');
 
+      const teamGuard = new StallGuard();
       const sdkOptions = this.buildOptions({
         isHeartbeat: true,
         cronTier: 2, // Give full tool access (Bash, Write, Edit)
@@ -3202,6 +3190,7 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
         model: null,
         enableTeams: true,
         profile,
+        stallGuard: teamGuard,
       });
 
       if (profile.project) {
@@ -3402,7 +3391,7 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
     this.exchangeCounts.delete(sessionKey);
     this.sessionTimestamps.delete(sessionKey);
     this.lastExchanges.delete(sessionKey);
-    toolLoopDetector.reset();
+    this.stallNudges.delete(sessionKey);
     this.saveSessions();
   }
 
