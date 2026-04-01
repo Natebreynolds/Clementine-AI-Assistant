@@ -482,6 +482,8 @@ export class PersonalAssistant {
   private onPhaseProgress: ((jobName: string, phase: number, summary: string) => void) | null = null;
   private _lastMcpStatus: Array<{ name: string; status: string }> = [];
   private _lastMcpStatusTime: string = '';
+  /** Per-session stall nudge — set after a query shows stall signals, consumed on the next query. */
+  private stallNudges = new Map<string, string>();
 
   constructor() {
     this.profileManager = new AgentManager(AGENTS_DIR, PROFILES_DIR);
@@ -917,7 +919,11 @@ When a task is complex, output \`[PLAN_NEEDED: brief description]\` as the FIRST
       // Analysis paralysis guard
       parts.push(`## Execution Guard
 
-If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search, memory_read) without any action (Write, Edit, Bash, note_create, task_add, memory_write, delegate_task, or any tool that changes state): STOP. Either act or tell ${owner} what you need to proceed.`);
+If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search, memory_read) without any action (Write, Edit, Bash, note_create, task_add, memory_write, delegate_task, or any tool that changes state): STOP. Either act or tell ${owner} what you need to proceed.
+
+**No empty promises:** NEVER say "let me read that", "I'll grab the file", or "starting now" unless you ACTUALLY call the tool in the SAME response. If you say you're going to read a file, the Read tool call must appear in that same turn. If a tool call fails or a file can't be accessed, tell ${owner} immediately — do not say "still working on it" and hope for the best. Silence is worse than admitting a problem.
+
+**Progress on multi-step tasks:** When working through a list (multiple files, multiple items), report concrete progress after each item: what you completed, what's next. Never leave ${owner} wondering if you're stuck.`);
     }
 
     // Security rules are now appended to systemPrompt in buildOptions()
@@ -1482,6 +1488,17 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
       }
     }
 
+    // Inject stall nudge if the previous query for this session showed stall signals
+    if (key && this.stallNudges.has(key)) {
+      const nudge = this.stallNudges.get(key)!;
+      this.stallNudges.delete(key);
+      effectivePrompt =
+        `[SYSTEM ALERT — STALL DETECTED: ${nudge}\n` +
+        `Do NOT repeat vague promises like "let me read that" or "still working on it". ` +
+        `Either take the action NOW using your tools, or tell the user exactly what is blocking you. ` +
+        `If a file can't be read, say so. If you're stuck, say so. Never stall silently.]\n\n${effectivePrompt}`;
+    }
+
     let [responseText, sessionId] = await this.runQuery(
       effectivePrompt, key, onText, model, profile, securityAnnotation, maxTurns, projectOverride, onToolActivity, verboseLevel, abortController,
     );
@@ -1778,6 +1795,24 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
         const mcSummary = metacog.getSummary();
         if (mcSummary.signals.length > 0 || mcSummary.toolCallCount > 10) {
           logger.info({ ...mcSummary }, 'Metacognitive summary');
+        }
+
+        // Post-query stall detection: check if agent promised action but didn't deliver
+        const promiseSignal = metacog.detectPromiseWithoutAction(responseText, mcSummary.toolCallCount);
+        if (promiseSignal.type === 'intervene') {
+          logger.warn({ sessionKey, reason: promiseSignal.reason }, 'Stall detected: agent promised action without follow-through');
+          if (sessionKey) {
+            this.stallNudges.set(sessionKey,
+              `Your last response said "${responseText.slice(0, 120).replace(/\n/g, ' ')}…" ` +
+              `but you made only ${mcSummary.toolCallCount} tool call(s). You promised to act but didn't complete the task.`);
+          }
+        }
+
+        // Also flag if metacognition detected circular reasoning or research-without-action
+        if (!this.stallNudges.has(sessionKey ?? '') && mcSummary.stuckDetected && sessionKey) {
+          this.stallNudges.set(sessionKey,
+            `Previous query showed stuck behavior (${mcSummary.signals.join(', ')}). ` +
+            `${mcSummary.toolCallCount} tool calls made with ${mcSummary.confidenceFinal} confidence.`);
         }
 
         return [responseText, sessionId];
