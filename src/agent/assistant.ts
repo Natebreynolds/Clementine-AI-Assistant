@@ -65,6 +65,7 @@ import {
   setProfileAllowedTools,
   setSendPolicy,
   setInteractionSource,
+  setStallBreaker,
 } from './hooks.js';
 import { scanner } from '../security/scanner.js';
 import { AgentManager } from './agent-manager.js';
@@ -1702,12 +1703,16 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
                   }
                   const loopCheck = toolLoopDetector.recordCall(block.name, (block.input ?? {}) as Record<string, unknown>);
                   if (loopCheck.verdict === 'block') {
-                    logger.warn({ tool: block.name, ...loopCheck }, 'Tool loop detected — blocking');
+                    logger.warn({ tool: block.name, ...loopCheck }, 'Tool loop detected — activating stall breaker');
+                    setStallBreaker(true, loopCheck.detail ?? 'Repetitive tool calls detected.');
                   }
                   // Metacognitive monitoring
                   const mcSignal = metacog.recordToolCall(block.name, (block.input ?? {}) as Record<string, unknown>);
-                  if (mcSignal.type === 'intervene' || mcSignal.type === 'warn') {
-                    logger.info({ reason: mcSignal.reason }, `Metacognition: ${mcSignal.guidance?.slice(0, 80)}`);
+                  if (mcSignal.type === 'intervene') {
+                    logger.warn({ reason: mcSignal.reason }, `Metacognition intervene — activating stall breaker: ${mcSignal.guidance?.slice(0, 80)}`);
+                    setStallBreaker(true, mcSignal.guidance ?? 'Agent appears stuck.');
+                  } else if (mcSignal.type === 'warn') {
+                    logger.info({ reason: mcSignal.reason }, `Metacognition warn: ${mcSignal.guidance?.slice(0, 80)}`);
                   }
                   toolCalls.push(`${block.name}(${JSON.stringify(block.input ?? {}).slice(0, 200)})`);
                 }
@@ -1820,6 +1825,7 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
 
       return ['Sorry, I hit a temporary issue. Please try again.', ''];
     } finally {
+      setStallBreaker(false);
       setProfileTier(null);
       setSendPolicy(null, null);
       setInteractionSource('autonomous');
@@ -2449,7 +2455,8 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
           } else if (block.type === 'tool_use' && block.name) {
             const loopCheck = stepLoopDetector.recordCall(block.name, (block.input ?? {}) as Record<string, unknown>);
             if (loopCheck.verdict === 'block') {
-              logger.warn({ tool: block.name, stepId, ...loopCheck }, 'Tool loop detected in plan step');
+              logger.warn({ tool: block.name, stepId, ...loopCheck }, 'Tool loop detected in plan step — activating stall breaker');
+              setStallBreaker(true, loopCheck.detail ?? 'Repetitive tool calls in plan step.');
             }
             trace.push({
               type: 'tool_call',
@@ -2672,7 +2679,8 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
                 logToolUse(block.name, (block.input ?? {}) as Record<string, unknown>);
                 const loopCheck = toolLoopDetector.recordCall(block.name, (block.input ?? {}) as Record<string, unknown>);
                 if (loopCheck.verdict === 'block') {
-                  logger.warn({ tool: block.name, ...loopCheck }, 'Tool loop detected — blocking');
+                  logger.warn({ tool: block.name, ...loopCheck }, 'Tool loop detected — activating stall breaker');
+                  setStallBreaker(true, loopCheck.detail ?? 'Repetitive tool calls detected.');
                 }
                 trace.push({
                   type: 'tool_call',
@@ -2722,6 +2730,7 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
 
       return deliverable;
     } finally {
+      setStallBreaker(false);
       if (timeoutHandle) clearTimeout(timeoutHandle);
     }
   }
@@ -3019,7 +3028,8 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
                 logToolUse(block.name, (block.input ?? {}) as Record<string, unknown>);
                 const loopCheck = toolLoopDetector.recordCall(block.name, (block.input ?? {}) as Record<string, unknown>);
                 if (loopCheck.verdict === 'block') {
-                  logger.warn({ tool: block.name, ...loopCheck }, 'Tool loop detected — blocking');
+                  logger.warn({ tool: block.name, ...loopCheck }, 'Tool loop detected — activating stall breaker');
+                  setStallBreaker(true, loopCheck.detail ?? 'Repetitive tool calls detected.');
                 }
               }
             }
