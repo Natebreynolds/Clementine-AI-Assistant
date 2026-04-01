@@ -932,8 +932,16 @@ async function asyncMain(): Promise<void> {
 
     const { spawn } = await import('node:child_process');
     const { openSync } = await import('node:fs');
-    const entry = process.argv[1];
-    const args = process.argv.slice(2);
+    // Resolve the correct entry point — if started via `node -e` (e.g. from a
+    // leaked smoke test), argv[1] would be `-e` which is wrong. Use the known
+    // dist entry path instead.
+    let entry = process.argv[1];
+    let args = process.argv.slice(2);
+    if (entry === '-e' || entry === '--eval') {
+      entry = path.join(config.PKG_DIR, 'dist', 'index.js');
+      args = [];
+      logger.warn({ originalArgv: process.argv }, 'Self-restart: detected -e flag — using dist entry path instead');
+    }
     logger.info({ entry, args }, 'Spawning new instance');
 
     // Redirect child stdout/stderr to log file so pino logs are preserved
@@ -1026,6 +1034,12 @@ async function asyncMain(): Promise<void> {
 // ── Main ─────────────────────────────────────────────────────────────
 
 function main(): void {
+  // Smoke test mode: verify the module loads then exit immediately.
+  // Set by `clementine update` to validate the build without starting a full daemon.
+  if (process.env.CLEMENTINE_SMOKE_TEST) {
+    process.exit(0);
+  }
+
   // Singleton enforcement
   ensureSingleton();
   process.on('exit', cleanupPid);

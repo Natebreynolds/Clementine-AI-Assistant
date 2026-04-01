@@ -1348,12 +1348,14 @@ async function cmdUpdate(options: { restart?: boolean; dryRun?: boolean }): Prom
     }
   }
 
-  // 7c. Smoke test — verify the build is actually runnable
+  // 7c. Smoke test — verify the build is actually runnable.
+  // CLEMENTINE_SMOKE_TEST causes main() to exit(0) immediately, so
+  // this just verifies the module loads without starting the full daemon.
   try {
-    execSync('node -e "require(\'./dist/index.js\')" 2>&1 || true', {
+    execSync('node -e "require(\'./dist/index.js\')"', {
       cwd: PACKAGE_ROOT,
       stdio: 'pipe',
-      timeout: 10000,
+      timeout: 15000,
       env: { ...process.env, CLEMENTINE_SMOKE_TEST: '1' },
     });
     console.log(`  ${GREEN}OK${RESET}  Build output verified`);
