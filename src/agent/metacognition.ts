@@ -197,6 +197,45 @@ export class MetacognitiveMonitor {
     return undefined;
   }
 
+  /**
+   * Detect when the agent's text promises action but no tools were called.
+   * Call this after the query completes with the full response text.
+   *
+   * @returns A signal if the response looks like a stall (promised action, didn't deliver).
+   */
+  detectPromiseWithoutAction(responseText: string, toolCallCount: number): MetacognitiveSignal {
+    if (toolCallCount > 2) return { type: 'ok' };
+
+    const lower = responseText.toLowerCase();
+    const ACTION_PROMISES = [
+      /\blet me (?:read|grab|check|pull|get|look at|open|find|fetch|load)\b/,
+      /\bi'?ll (?:read|grab|check|pull|get|look at|open|find|fetch|start|work on)\b/,
+      /\bstarting (?:with|on|now)\b/,
+      /\bstill (?:on it|working|reading|looking)\b/,
+      /\bgive me (?:a moment|a sec|one moment)\b/,
+      /\bworking on (?:it|that|this)\b/,
+      /\blet me (?:take|have) a look\b/,
+    ];
+
+    const promisedAction = ACTION_PROMISES.some((rx) => rx.test(lower));
+    if (!promisedAction) return { type: 'ok' };
+
+    // The agent said it would do something but made 0-2 tool calls — likely stalled
+    if (!this.signals.includes('promise_without_action')) {
+      this.signals.push('promise_without_action');
+    }
+    this.confidence = 'low';
+    this.interventionCount++;
+
+    return {
+      type: 'intervene',
+      reason: 'promise_without_action',
+      guidance:
+        'You said you would take action but did not follow through. ' +
+        'Do not promise to read/grab/check something without actually doing it in the same turn.',
+    };
+  }
+
   /** Reset for a new execution (e.g., new phase in unleashed). */
   reset(): void {
     this.toolCalls = [];
