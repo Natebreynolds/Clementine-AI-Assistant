@@ -35,6 +35,14 @@ const auditLog: string[] = [];
  */
 let interactionSource: 'owner-dm' | 'owner-channel' | 'member-channel' | 'autonomous' = 'autonomous';
 
+/**
+ * Stall breaker — activated mid-query by metacognition when the agent is stuck
+ * in a read-only loop. When active, enforceToolPermissions denies further
+ * read-only tool calls, forcing the agent to act or respond.
+ */
+let stallBreakerActive = false;
+let stallBreakerReason = '';
+
 // ── Persistent audit logger ───────────────────────────────────────────
 
 const logsDir = path.join(BASE_DIR, 'logs');
@@ -90,6 +98,11 @@ export function setSendPolicyChecker(checker: ((agentSlug: string, recipientEmai
 
 export function setInteractionSource(source: 'owner-dm' | 'owner-channel' | 'member-channel' | 'autonomous'): void {
   interactionSource = source;
+}
+
+export function setStallBreaker(active: boolean, reason = ''): void {
+  stallBreakerActive = active;
+  stallBreakerReason = reason;
 }
 
 export function getInteractionSource(): 'owner-dm' | 'owner-channel' | 'member-channel' | 'autonomous' {
@@ -262,6 +275,20 @@ export async function enforceToolPermissions(
       return {
         behavior: 'deny',
         message: `${toolName} is not allowed during autonomous execution.`,
+      };
+    }
+  }
+
+  // ── Stall breaker — block further reads when agent is in a read loop ──
+  if (stallBreakerActive) {
+    const READ_ONLY_TOOLS = ['Read', 'Glob', 'Grep', 'WebSearch', 'WebFetch'];
+    if (READ_ONLY_TOOLS.includes(toolName)) {
+      return {
+        behavior: 'deny',
+        message:
+          `STALL BREAKER: You have been reading without acting for too long. ${stallBreakerReason} ` +
+          `STOP reading. Either perform a write/action tool call (Write, Edit, Bash, etc.) to complete the task, ` +
+          `or respond to the user explaining what is blocking you. Do NOT call another read-only tool.`,
       };
     }
   }
