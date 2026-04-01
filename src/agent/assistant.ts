@@ -1706,13 +1706,11 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
                     logger.warn({ tool: block.name, ...loopCheck }, 'Tool loop detected — activating stall breaker');
                     setStallBreaker(true, loopCheck.detail ?? 'Repetitive tool calls detected.');
                   }
-                  // Metacognitive monitoring
+                  // Metacognitive monitoring — activate stall breaker on both warn and intervene
                   const mcSignal = metacog.recordToolCall(block.name, (block.input ?? {}) as Record<string, unknown>);
-                  if (mcSignal.type === 'intervene') {
-                    logger.warn({ reason: mcSignal.reason }, `Metacognition intervene — activating stall breaker: ${mcSignal.guidance?.slice(0, 80)}`);
+                  if (mcSignal.type === 'intervene' || mcSignal.type === 'warn') {
+                    logger.warn({ reason: mcSignal.reason }, `Metacognition ${mcSignal.type} — activating stall breaker: ${mcSignal.guidance?.slice(0, 80)}`);
                     setStallBreaker(true, mcSignal.guidance ?? 'Agent appears stuck.');
-                  } else if (mcSignal.type === 'warn') {
-                    logger.info({ reason: mcSignal.reason }, `Metacognition warn: ${mcSignal.guidance?.slice(0, 80)}`);
                   }
                   toolCalls.push(`${block.name}(${JSON.stringify(block.input ?? {}).slice(0, 200)})`);
                 }

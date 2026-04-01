@@ -83,15 +83,25 @@ export class MetacognitiveMonitor {
     }
 
     // Signal: too many consecutive reads without action
+    // Fires on every read past the threshold (not just once) so the stall breaker stays active
+    if (this.consecutiveReads >= 8) {
+      this.confidence = 'low';
+      if (!this.signals.includes('research_without_action')) this.signals.push('research_without_action');
+      this.interventionCount++;
+      return {
+        type: 'intervene',
+        reason: 'research_without_action',
+        guidance: `You've done ${this.consecutiveReads} consecutive reads without acting. STOP reading and either act on what you have or tell the user what's blocking you.`,
+      };
+    }
     if (this.consecutiveReads >= 5) {
       this.confidence = 'medium';
-      const signal: MetacognitiveSignal = {
+      if (!this.signals.includes('research_without_action')) this.signals.push('research_without_action');
+      return {
         type: 'warn',
         reason: 'research_without_action',
-        guidance: 'You\'ve done 5+ reads without acting. Use what you have — act on the information gathered so far.',
+        guidance: `You've done ${this.consecutiveReads} consecutive reads without acting. Use what you have — act on the information gathered so far.`,
       };
-      if (!this.signals.includes('research_without_action')) this.signals.push('research_without_action');
-      return signal;
     }
 
     // Signal: same tool + similar input called 3+ times
