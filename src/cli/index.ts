@@ -629,13 +629,24 @@ function cmdDoctor(opts: { fix?: boolean } = {}): void {
       const logPath = path.join(BASE_DIR, 'logs', 'clementine.log');
       if (existsSync(logPath)) {
         try {
-          const logTail = readFileSync(logPath, 'utf-8').split('\n').filter(Boolean).slice(-30);
+          const logLines = readFileSync(logPath, 'utf-8').split('\n').filter(Boolean);
+          // Check last 200 lines for startup message, last 30 for errors
+          const logTail = logLines.slice(-200);
+          const recentTail = logLines.slice(-30);
           let discordOk = false;
           const recentErrors: string[] = [];
           for (const line of logTail) {
             try {
               const entry = JSON.parse(line);
+              // Startup confirmation
               if (entry.msg?.includes('online as') || entry.msg?.includes('Clementine online')) discordOk = true;
+              // Any discord activity (message processing, reactions, etc.) confirms connection
+              if (entry.name === 'clementine.discord' && entry.pid === daemonPid) discordOk = true;
+            } catch { /* skip */ }
+          }
+          for (const line of recentTail) {
+            try {
+              const entry = JSON.parse(line);
               if (entry.level >= 50 && entry.pid === daemonPid) recentErrors.push(entry.msg?.slice(0, 100) ?? '');
             } catch { /* skip */ }
           }
