@@ -513,9 +513,10 @@ export class Gateway {
         // Resolve verbose level for this session
         const verboseLevel = sess?.verboseLevel;
 
-        // Activity-based idle timeout: resets on agent output/tool calls.
-        // Only kills if the agent goes silent for CHAT_TIMEOUT_MS.
-        // Hard cap at CHAT_MAX_WALL_MS prevents truly runaway sessions.
+        // Timeout system:
+        // 1. Idle timeout (CHAT_TIMEOUT_MS): resets on agent output/tool calls
+        // 2. Hard wall cap (CHAT_MAX_WALL_MS): non-cooperative — returns immediately
+        //    to the user even if the SDK ignores the abort signal
         const chatAc = new AbortController();
         this.getSession(sessionKey).abortController = chatAc;
         const chatStarted = Date.now();
@@ -546,14 +547,33 @@ export class Gateway {
           ? async (name: string, input: Record<string, unknown>) => { resetIdleTimer(); return onToolActivity(name, input); }
           : undefined;
 
+        // Hard wall timer: if the SDK ignores abort (e.g. stuck in a sub-agent),
+        // this resolves immediately with a timeout message so the user isn't blocked.
+        let hardWallTimer: ReturnType<typeof setTimeout> | undefined;
+        const hardWallPromise = new Promise<[string, string]>((resolve) => {
+          hardWallTimer = setTimeout(() => {
+            chatAc.abort();
+            logger.warn({ sessionKey, wallMs: CHAT_MAX_WALL_MS }, 'Hard wall timeout — returning immediately');
+            resolve([
+              'This task hit the 10-minute limit. The work may have partially completed. ' +
+              'Try breaking it into smaller pieces — ask me to handle one file at a time.',
+              '',
+            ]);
+          }, CHAT_MAX_WALL_MS);
+        });
+
         try {
-          const [response] = await this.assistant.chat(
-            text,
-            effectiveSessionKey,
-            { onText: wrappedOnText, onToolActivity: wrappedOnToolActivity, model: effectiveModel, maxTurns, securityAnnotation, projectOverride, profile: resolvedProfile, verboseLevel, abortController: chatAc },
-          );
+          const [response] = await Promise.race([
+            this.assistant.chat(
+              text,
+              effectiveSessionKey,
+              { onText: wrappedOnText, onToolActivity: wrappedOnToolActivity, model: effectiveModel, maxTurns, securityAnnotation, projectOverride, profile: resolvedProfile, verboseLevel, abortController: chatAc },
+            ),
+            hardWallPromise,
+          ]);
 
           clearTimeout(chatTimer);
+          if (hardWallTimer) clearTimeout(hardWallTimer);
           { const cs = this.sessions.get(sessionKey); if (cs) delete cs.abortController; }
 
           // Re-baseline integrity checksums after chat (auto-memory may write to vault)
