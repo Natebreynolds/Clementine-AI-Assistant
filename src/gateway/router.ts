@@ -25,7 +25,7 @@ const CHAT_TIMEOUT_MS = 5 * 60 * 1000;
 
 /** Absolute wall-clock cap for interactive chat (30 minutes).
  *  Safety net so no session runs forever, even if active. */
-const CHAT_MAX_WALL_MS = 30 * 60 * 1000;
+const CHAT_MAX_WALL_MS = 10 * 60 * 1000;
 
 export type ChatErrorKind = 'rate_limit' | 'context_overflow' | 'auth' | 'transient' | 'unknown';
 

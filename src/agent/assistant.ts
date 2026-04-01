@@ -1646,11 +1646,12 @@ If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search
       retrievalContext += goalContext;
     }
 
-    // Timeout: abort the query after timeoutMs to prevent hour-long stalls
+    // Timeout: abort the query after timeoutMs to prevent hour-long stalls.
+    // Works with or without an existing abortController from the gateway.
     let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
-    if (timeoutMs && !abortController) {
-      const ac = new AbortController();
-      abortController = ac;
+    if (timeoutMs) {
+      const ac = abortController ?? new AbortController();
+      if (!abortController) abortController = ac;
       timeoutHandle = setTimeout(() => {
         ac.abort();
         logger.warn({ sessionKey, timeoutMs }, 'Chat query timed out');
