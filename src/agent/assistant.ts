@@ -822,6 +822,12 @@ Save important facts immediately; a background agent also extracts after each ex
 Delegate data-heavy work (SEO, analytics, bulk API calls for 3+ entities) to sub-agents via the Agent tool. They run in their own context and return summaries. Never pull bulk data directly.
 
 **Multi-file rule:** When a task involves reading or editing 2+ separate files/projects/briefs, ALWAYS spawn a sub-agent per file using the Agent tool. Give each sub-agent the full file path and clear instructions. This runs them in parallel, prevents context bloat, and frees you to respond to the user faster. NEVER sequentially read multiple large files in a single query — that blocks the user from doing anything else.
+
+**Sub-agent discipline:** When spawning sub-agents, give them SPECIFIC, bounded instructions. Each sub-agent prompt MUST include:
+1. The exact file path(s) to work on
+2. The exact changes to make (not "figure out what to change")
+3. A constraint: "Complete this in under 10 tool calls. If you can't, report what's blocking you."
+Never spawn a sub-agent with vague instructions like "handle this brief" — tell it exactly what to read, what to change, and where to write the result.
 `);
     }
 
