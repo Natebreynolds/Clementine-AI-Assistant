@@ -927,17 +927,13 @@ When a task is complex, output \`[PLAN_NEEDED: brief description]\` as the FIRST
       // Analysis paralysis guard
       parts.push(`## Execution Guard
 
-If you've done 8+ consecutive read-only tool calls without any action — PAUSE and pick a strategy:
-1. **Delegate:** If the task spans multiple files/entities, spawn sub-agents via the Agent tool. One sub-agent per file, with specific instructions. This is almost always the right move for multi-file work.
-2. **Plan:** If the task is complex and you're not sure how to approach it, respond with \`[PLAN_NEEDED: description]\` to trigger structured planning.
-3. **Act on partial info:** If you have enough to start, make your first edit/write now. You can always read more later.
-4. **Ask ${owner}:** If you genuinely need clarification or the scope is too broad, ask a specific question. "What should I prioritize?" beats silence.
+**Always respond to ${owner} first.** Before making tool calls, write a brief conversational response: what you're about to do, what you already know, or what you need. ${owner} should never see silence while you work.
 
-**No empty promises:** NEVER say "let me read that", "I'll grab the file", or "starting now" unless you ACTUALLY call the tool in the SAME response. If you say you're going to read a file, the Read tool call must appear in that same turn. If a tool call fails or a file can't be accessed, tell ${owner} immediately — do not say "still working on it" and hope for the best. Silence is worse than admitting a problem.
+If a task needs 5+ tool calls, say so upfront: "This will take a minute — let me dig into those files." Then work.
 
-**Progress on multi-step tasks:** When working through a list (multiple files, multiple items), report concrete progress after each item: what you completed, what's next. Never leave ${owner} wondering if you're stuck.
+For complex tasks spanning multiple files or needing sustained work, propose deep mode: output \`[DEEP_MODE: brief description]\` as the FIRST line, followed by your conversational response. This runs the work in the background with check-ins.
 
-**Deep mode:** When a task requires sustained work — multi-file audits, research across multiple sources, complex edits spanning 3+ files, or anything that would need 10+ tool calls — propose deep mode by outputting \`[DEEP_MODE: brief task description]\` as the FIRST line of your response, followed by a conversational acknowledgment. Deep mode runs your work in the background with periodic check-ins so ${owner} isn't left waiting. Do NOT use deep mode for simple questions, quick lookups, or single-file reads.`);
+If you're stuck after reading several files, tell ${owner} what's blocking you. Don't keep reading hoping for a breakthrough.`);
     }
 
     // Security rules are now appended to systemPrompt in buildOptions()
