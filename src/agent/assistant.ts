@@ -1708,6 +1708,7 @@ If you're stuck after reading several files, tell ${owner} what's blocking you. 
         let responseText = '';
         let sessionId = '';
         let hitRateLimit = false;
+        let lastAssistantBlocks: ContentBlock[] = [];
 
         try {
           const stream = query({ prompt, options: sdkOptions });
@@ -1717,6 +1718,7 @@ If you're stuck after reading several files, tell ${owner} what's blocking you. 
           for await (const message of stream) {
             if (message.type === 'assistant') {
               const blocks = getContentBlocks(message as SDKAssistantMessage);
+              lastAssistantBlocks = blocks; // Track for fallback text extraction
               for (const block of blocks) {
                 if (block.type === 'text' && block.text && !gotStreamEvents) {
                   // Only accumulate from assistant messages if we haven't
@@ -1812,12 +1814,29 @@ If you're stuck after reading several files, tell ${owner} what's blocking you. 
           responseText = "I'm being rate limited right now. Give me a minute and try again.";
         }
 
+        // ── Response guarantee ─────────────────────────────────────────
+        // If streaming didn't capture text, extract from the last assistant message.
+        // If that's also empty and tool calls were made, generate a fallback so the
+        // user never sees silence after real work was done.
+        const toolCalls = stallGuard?.getToolCalls() ?? [];
+        if (!responseText.trim() && lastAssistantBlocks.length > 0) {
+          const extracted = extractText(lastAssistantBlocks);
+          if (extracted.trim()) {
+            logger.info({ sessionKey, extractedLen: extracted.length }, 'Recovered response text from last assistant message');
+            responseText = extracted;
+          }
+        }
+        if (!responseText.trim() && toolCalls.length > 0) {
+          const toolNames = [...new Set(toolCalls.map(tc => tc.replace(/\(.*$/, '')))];
+          logger.warn({ sessionKey, toolCallCount: toolCalls.length, tools: toolNames }, 'No response text after tool execution — generating fallback');
+          responseText = `I worked through that but wasn't able to put together a proper response. I made ${toolCalls.length} tool calls (${toolNames.slice(0, 5).join(', ')}). Can you try asking again or narrow the request?`;
+        }
+
         if (sessionKey && sessionId) {
           this.sessions.set(sessionKey, sessionId);
         }
 
         // Log tool calls to transcript for audit trail
-        const toolCalls = stallGuard?.getToolCalls() ?? [];
         if (sessionKey && toolCalls.length > 0 && this.memoryStore) {
           try {
             this.memoryStore.saveTurn(
