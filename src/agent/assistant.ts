@@ -2455,44 +2455,40 @@ If you're stuck after reading several files, tell ${owner} what's blocking you. 
     changesSummary = '',
     timeContext = '',
     dedupContext = '',
+    profile?: AgentProfile | null,
   ): Promise<string> {
     setInteractionSource('autonomous');
     const sdkOptions = this.buildOptions({
       isHeartbeat: true,
       enableTeams: false,
       model: MODELS.haiku,
+      profile: profile ?? undefined,
     });
     const now = new Date();
     const localTime = formatTime(now);
     const localDate = formatDate(now);
     const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
     const owner = OWNER;
+    const agentName = profile?.name ?? 'personal assistant';
 
     const promptParts = [
-      `[Heartbeat — ${localTime}, ${localDate} (${tz})]\n`,
-      `You are checking in as ${owner}'s personal assistant. Write naturally — like a brief status update to a trusted colleague. Reference recent conversations if relevant. Match your energy to the time of day.`,
+      `[Heartbeat — ${localTime}, ${localDate} (${tz})]`,
+      `You're ${agentName}, checking in with ${owner}. Talk like a teammate giving a quick update — not a system generating a report. If you need to look something up to answer properly, use your tools first, then respond with what you found.`,
     ];
     if (dedupContext) {
-      promptParts.push(`\n${dedupContext}\n\nIf all of the above items are unchanged, respond with exactly: __NOTHING__`);
+      promptParts.push(`\n${dedupContext}\n\nIf all of the above are unchanged, respond with exactly: __NOTHING__`);
     }
     if (timeContext) {
-      promptParts.push(`\nTime context: ${timeContext}`);
+      promptParts.push(`\nTime of day: ${timeContext}`);
     }
     if (changesSummary) {
-      promptParts.push(
-        `\nWhat changed since last check-in: ${changesSummary}\n` +
-        'Focus only on what genuinely changed or work you completed. ' +
-        "Don't log routine check-ins to the daily note.",
-      );
+      promptParts.push(`\nWhat's new:\n${changesSummary}`);
     }
     promptParts.push(
-      `\nRESPONSE RULES:\n` +
-      `- If you completed work, briefly summarize the outcome.\n` +
-      `- If something genuinely new needs ${owner}'s attention, say it clearly.\n` +
-      `- If everything you'd say was already reported and nothing changed, respond with exactly: __NOTHING__\n` +
-      `- Tag each distinct topic you mention with [topic: short-key] so I can track what was reported.\n` +
-      `- No bullet-point checklists. Write naturally.\n\n` +
-      `Standing Instructions:\n${standingInstructions}`,
+      `\nIf nothing changed, respond with exactly: __NOTHING__\n` +
+      `Otherwise, keep it brief and conversational. No bullet lists, no formal reports. ` +
+      `Tag topics with [topic: key] for dedup tracking.\n\n` +
+      `Standing instructions:\n${standingInstructions}`,
     );
 
     let responseText = '';

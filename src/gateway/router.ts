@@ -704,16 +704,18 @@ export class Gateway {
     changesSummary = '',
     timeContext = '',
     dedupContext = '',
+    profile?: import('../types.js').AgentProfile | null,
   ): Promise<string> {
     const releaseLane = await lanes.acquire('heartbeat');
     try {
-      logger.info('Running heartbeat...');
+      logger.info({ agent: profile?.slug ?? 'clementine' }, 'Running heartbeat...');
       try {
         const response = await this.assistant.heartbeat(
           standingInstructions,
           changesSummary,
           timeContext,
           dedupContext,
+          profile,
         );
 
         // Re-baseline integrity checksums after heartbeat (may write to vault)
