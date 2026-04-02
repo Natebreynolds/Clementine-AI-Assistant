@@ -182,7 +182,7 @@ function verifySetup(): string[] {
   let needsRebuild = false;
 
   try {
-    execSync('node -e "require(\'better-sqlite3\')"', { stdio: 'pipe', timeout: 5000 });
+    execSync('node -e "require(\'better-sqlite3\')"', { cwd: config.PKG_DIR, stdio: 'pipe', timeout: 5000 });
     // Module loads — stamp current version if not already stamped
     if (!existsSync(nodeStampFile) || readFileSync(nodeStampFile, 'utf-8').trim() !== currentNodeVersion) {
       writeFileSync(nodeStampFile, currentNodeVersion);
@@ -207,7 +207,7 @@ function verifySetup(): string[] {
         stdio: 'pipe',
         timeout: 30000,
       });
-      execSync('node -e "require(\'better-sqlite3\')"', { stdio: 'pipe', timeout: 5000 });
+      execSync('node -e "require(\'better-sqlite3\')"', { cwd: config.PKG_DIR, stdio: 'pipe', timeout: 5000 });
       writeFileSync(nodeStampFile, currentNodeVersion);
       logger.info('better-sqlite3 rebuilt for Node ' + currentNodeVersion);
     } catch {
@@ -955,7 +955,7 @@ async function asyncMain(): Promise<void> {
     const child = spawn(process.execPath, [entry, ...args], {
       detached: true,
       stdio: childStdio,
-      cwd: process.cwd(),
+      cwd: config.PKG_DIR,
       env: process.env,
     });
     child.unref();
