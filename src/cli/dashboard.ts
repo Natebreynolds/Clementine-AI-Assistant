@@ -12272,10 +12272,12 @@ async function loadAgentToolOptions(selectedTools) {
       }; })(cat, header);
       panel.appendChild(header);
       d.categories[cat].forEach(function(tool) {
+        var toolName = typeof tool === 'string' ? tool : tool.name;
+        var toolLabel = typeof tool === 'string' ? tool : (tool.name + (tool.description ? ' — ' + tool.description : ''));
         var label = document.createElement('label');
         label.style.cssText = 'display:block;font-size:12px;padding:2px 0 2px 8px;cursor:pointer';
-        var checked = selected.indexOf(tool) >= 0 ? ' checked' : '';
-        label.innerHTML = '<input type="checkbox" class="agent-tool-cb" data-cat="' + cat + '" value="' + tool + '"' + checked + ' style="margin-right:6px">' + tool;
+        var checked = selected.indexOf(toolName) >= 0 ? ' checked' : '';
+        label.innerHTML = '<input type="checkbox" class="agent-tool-cb" data-cat="' + cat + '" value="' + toolName + '"' + checked + ' style="margin-right:6px">' + toolLabel;
         panel.appendChild(label);
       });
     }
