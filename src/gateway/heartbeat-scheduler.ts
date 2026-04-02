@@ -355,8 +355,10 @@ export class HeartbeatScheduler {
         const unhandled = entries.filter(e => !e.handled);
         if (unhandled.length > 0) {
           const incompleteSection = '## Incomplete Work (needs follow-up)\n' +
-            'These tasks were started but not completed. Proactively check if they still need attention ' +
-            'and let the user know the status or finish the work.\n' +
+            'Earlier tasks may not have been fully completed. Before reporting, VERIFY the current status: ' +
+            'check task files, vault notes, deployed sites, or any artifacts to determine what actually got done. ' +
+            'Then report your findings conversationally — e.g. "Those audits from earlier actually all completed successfully" ' +
+            'or "Two of three finished, the third still needs work." Never just say you\'re checking — do the check, then report.\n' +
             unhandled.map(e =>
               `- **${e.userPrompt.slice(0, 200)}** (${e.toolCallCount} tool calls, started ${e.timestamp})`
             ).join('\n');
