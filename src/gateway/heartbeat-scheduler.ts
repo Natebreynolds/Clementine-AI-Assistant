@@ -346,6 +346,31 @@ export class HeartbeatScheduler {
       changesSummary = workSummary + '\n\n' + changesSummary;
     }
 
+    // Check for incomplete work from previous chat queries
+    try {
+      const incompleteFile = path.join(BASE_DIR, 'incomplete-work.json');
+      if (existsSync(incompleteFile)) {
+        const entries: Array<{ sessionKey: string; userPrompt: string; toolCallCount: number; timestamp: string; handled: boolean }> =
+          JSON.parse(readFileSync(incompleteFile, 'utf-8'));
+        const unhandled = entries.filter(e => !e.handled);
+        if (unhandled.length > 0) {
+          const incompleteSection = '## Incomplete Work (needs follow-up)\n' +
+            'These tasks were started but not completed. Proactively check if they still need attention ' +
+            'and let the user know the status or finish the work.\n' +
+            unhandled.map(e =>
+              `- **${e.userPrompt.slice(0, 200)}** (${e.toolCallCount} tool calls, started ${e.timestamp})`
+            ).join('\n');
+          changesSummary = incompleteSection + '\n\n' + changesSummary;
+          // Mark as handled
+          for (const e of entries) { if (!e.handled) e.handled = true; }
+          writeFileSync(incompleteFile, JSON.stringify(entries, null, 2));
+          logger.info({ count: unhandled.length }, 'Injected incomplete work into heartbeat prompt');
+        }
+      }
+    } catch (err) {
+      logger.warn({ err }, 'Failed to read incomplete work for heartbeat');
+    }
+
     // Persist new state (reset silent counter since we're invoking)
     this.lastState = {
       ...this.lastState,
