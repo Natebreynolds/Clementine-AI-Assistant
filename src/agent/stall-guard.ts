@@ -18,6 +18,8 @@ import pino from 'pino';
 
 const logger = pino({ name: 'clementine.stall-guard' });
 
+// Only block SDK read tools — MCP tools (memory_read, etc.) are intentionally
+// left unblocked to give the agent some information access while forced to act.
 const READ_ONLY_TOOLS = new Set(['Read', 'Glob', 'Grep', 'WebSearch', 'WebFetch']);
 
 // ── Types ───────────────────────────────────────────────────────────
@@ -59,8 +61,15 @@ export class StallGuard {
   /**
    * Record a tool call. Runs loop detection and metacognition.
    * Activates the breaker if either detector fires.
+   *
+   * If the breaker is already active and this is a read-only tool, it was
+   * denied by shouldBlockTool. Skip metacognition tracking for denied tools
+   * to prevent a feedback loop where denials inflate the consecutive-read
+   * counter (logs showed counter spiraling from 5 → 15 in milliseconds).
    */
   recordToolCall(toolName: string, input: Record<string, unknown>): void {
+    const wasDenied = this.breakerActive && READ_ONLY_TOOLS.has(toolName);
+
     // Tool loop detector
     const loopCheck = this.loopDetector.recordCall(toolName, input);
     if (loopCheck.verdict === 'block') {
@@ -68,15 +77,21 @@ export class StallGuard {
       this.activate(loopCheck.detail ?? 'Repetitive tool calls detected.');
     }
 
-    // Metacognitive monitor (fires on warn AND intervene)
-    const mcSignal = this.metacog.recordToolCall(toolName, input);
-    if (mcSignal.type === 'intervene' || mcSignal.type === 'warn') {
-      logger.warn({ reason: mcSignal.reason }, `Metacognition ${mcSignal.type}: ${mcSignal.guidance?.slice(0, 80)}`);
-      this.activate(mcSignal.guidance ?? 'Agent appears stuck.');
+    // Metacognitive monitor — only hard-block on 'intervene'.
+    // 'warn' logs and drops confidence but doesn't activate the breaker,
+    // so the agent can still read during legitimate multi-file research.
+    if (!wasDenied) {
+      const mcSignal = this.metacog.recordToolCall(toolName, input);
+      if (mcSignal.type === 'intervene') {
+        logger.warn({ reason: mcSignal.reason }, `Metacognition intervene: ${mcSignal.guidance?.slice(0, 80)}`);
+        this.activate(mcSignal.guidance ?? 'Agent appears stuck.');
+      } else if (mcSignal.type === 'warn') {
+        logger.info({ reason: mcSignal.reason }, `Metacognition warn: ${mcSignal.guidance?.slice(0, 80)}`);
+      }
     }
 
     // Audit trail
-    this.toolCallLog.push(`${toolName}(${JSON.stringify(input).slice(0, 200)})`);
+    this.toolCallLog.push(`${wasDenied ? '✗' : ''}${toolName}(${JSON.stringify(input).slice(0, 200)})`);
   }
 
   /**
