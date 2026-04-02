@@ -48,7 +48,8 @@ const READ_TOOLS = new Set([
 ]);
 
 const ACTION_TOOLS = new Set([
-  'Write', 'Edit', 'Bash', 'memory_write', 'note_create', 'note_take',
+  'Write', 'Edit', 'Bash', 'Agent', 'Task', 'delegate_task',
+  'memory_write', 'note_create', 'note_take',
   'task_add', 'task_update', 'goal_create', 'goal_update', 'goal_work',
   'add_cron_job', 'create_agent', 'update_agent', 'delete_agent',
   'team_message', 'discord_channel_send', 'outlook_draft', 'outlook_send',
@@ -75,16 +76,19 @@ export class MetacognitiveMonitor {
     this.toolCalls.push({ name, inputHash, timestamp: Date.now() });
     this.uniqueTools.add(name);
 
-    // Track read/action balance
-    if (READ_TOOLS.has(name)) {
+    // Normalize MCP tool names: "mcp__clementine-tools__memory_write" → "memory_write"
+    const normalizedName = name.replace(/^mcp__[^_]+__/, '');
+
+    // Track read/action balance (check both raw and normalized names)
+    if (READ_TOOLS.has(name) || READ_TOOLS.has(normalizedName)) {
       this.consecutiveReads++;
-    } else if (ACTION_TOOLS.has(name)) {
+    } else if (ACTION_TOOLS.has(name) || ACTION_TOOLS.has(normalizedName)) {
       this.consecutiveReads = 0;
     }
 
     // Signal: too many consecutive reads without action
     // Fires on every read past the threshold (not just once) so the stall breaker stays active
-    if (this.consecutiveReads >= 8) {
+    if (this.consecutiveReads >= 12) {
       this.confidence = 'low';
       if (!this.signals.includes('research_without_action')) this.signals.push('research_without_action');
       this.interventionCount++;
@@ -94,13 +98,17 @@ export class MetacognitiveMonitor {
         guidance: `You've done ${this.consecutiveReads} consecutive reads without acting. STOP reading and either act on what you have or tell the user what's blocking you.`,
       };
     }
-    if (this.consecutiveReads >= 5) {
+    if (this.consecutiveReads >= 8) {
       this.confidence = 'medium';
       if (!this.signals.includes('research_without_action')) this.signals.push('research_without_action');
       return {
         type: 'warn',
         reason: 'research_without_action',
-        guidance: `You've done ${this.consecutiveReads} consecutive reads without acting. Use what you have — act on the information gathered so far.`,
+        guidance: `You've done ${this.consecutiveReads} consecutive reads without acting. Pick a strategy: ` +
+          `(1) Delegate — spawn sub-agents via the Agent tool for parallel work. ` +
+          `(2) Plan — respond with [PLAN_NEEDED: description] for complex tasks. ` +
+          `(3) Act on partial info — start editing with what you know. ` +
+          `(4) Ask the user a specific question if scope is unclear.`,
       };
     }
 

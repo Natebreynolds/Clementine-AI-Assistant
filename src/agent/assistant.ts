@@ -927,7 +927,11 @@ When a task is complex, output \`[PLAN_NEEDED: brief description]\` as the FIRST
       // Analysis paralysis guard
       parts.push(`## Execution Guard
 
-If you make 5+ consecutive read-only tool calls (Read, Grep, Glob, memory_search, memory_read) without any action (Write, Edit, Bash, note_create, task_add, memory_write, delegate_task, or any tool that changes state): STOP. Either act or tell ${owner} what you need to proceed.
+If you've done 8+ consecutive read-only tool calls without any action — PAUSE and pick a strategy:
+1. **Delegate:** If the task spans multiple files/entities, spawn sub-agents via the Agent tool. One sub-agent per file, with specific instructions. This is almost always the right move for multi-file work.
+2. **Plan:** If the task is complex and you're not sure how to approach it, respond with \`[PLAN_NEEDED: description]\` to trigger structured planning.
+3. **Act on partial info:** If you have enough to start, make your first edit/write now. You can always read more later.
+4. **Ask ${owner}:** If you genuinely need clarification or the scope is too broad, ask a specific question. "What should I prioritize?" beats silence.
 
 **No empty promises:** NEVER say "let me read that", "I'll grab the file", or "starting now" unless you ACTUALLY call the tool in the SAME response. If you say you're going to read a file, the Read tool call must appear in that same turn. If a tool call fails or a file can't be accessed, tell ${owner} immediately — do not say "still working on it" and hope for the best. Silence is worse than admitting a problem.
 
