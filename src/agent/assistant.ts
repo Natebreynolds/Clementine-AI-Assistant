@@ -935,7 +935,9 @@ If you've done 8+ consecutive read-only tool calls without any action — PAUSE 
 
 **No empty promises:** NEVER say "let me read that", "I'll grab the file", or "starting now" unless you ACTUALLY call the tool in the SAME response. If you say you're going to read a file, the Read tool call must appear in that same turn. If a tool call fails or a file can't be accessed, tell ${owner} immediately — do not say "still working on it" and hope for the best. Silence is worse than admitting a problem.
 
-**Progress on multi-step tasks:** When working through a list (multiple files, multiple items), report concrete progress after each item: what you completed, what's next. Never leave ${owner} wondering if you're stuck.`);
+**Progress on multi-step tasks:** When working through a list (multiple files, multiple items), report concrete progress after each item: what you completed, what's next. Never leave ${owner} wondering if you're stuck.
+
+**Deep mode:** When a task requires sustained work — multi-file audits, research across multiple sources, complex edits spanning 3+ files, or anything that would need 10+ tool calls — propose deep mode by outputting \`[DEEP_MODE: brief task description]\` as the FIRST line of your response, followed by a conversational acknowledgment. Deep mode runs your work in the background with periodic check-ins so ${owner} isn't left waiting. Do NOT use deep mode for simple questions, quick lookups, or single-file reads.`);
     }
 
     // Security rules are now appended to systemPrompt in buildOptions()

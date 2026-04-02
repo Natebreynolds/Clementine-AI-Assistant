@@ -10,7 +10,7 @@ import pino from 'pino';
 import { PersonalAssistant, type ProjectMeta } from '../agent/assistant.js';
 import type { OnTextCallback, OnToolActivityCallback, PlanProgressUpdate, PlanStep, SelfImproveConfig, SelfImproveExperiment, SessionProvenance, TeamMessage, VerboseLevel, WorkflowDefinition } from '../types.js';
 import { SelfImproveLoop } from '../agent/self-improve.js';
-import { MODELS, PROFILES_DIR, AGENTS_DIR, TEAM_COMMS_LOG } from '../config.js';
+import { MODELS, PROFILES_DIR, AGENTS_DIR, TEAM_COMMS_LOG, BASE_DIR } from '../config.js';
 import { scanner } from '../security/scanner.js';
 import { lanes } from './lanes.js';
 import { AgentManager } from '../agent/agent-manager.js';
@@ -48,6 +48,7 @@ interface SessionState {
   abortController?: AbortController;
   provenance?: SessionProvenance;
   lastAccessedAt: number;
+  deepTask?: { jobName: string; taskDesc: string; startedAt: string };
 }
 
 export class Gateway {
@@ -497,6 +498,36 @@ export class Gateway {
         const sess = this.sessions.get(sessionKey);
         const effectiveModel = model ?? sess?.model;
 
+        // ── Deep mode control ──────────────────────────────────────────
+        if (sess?.deepTask) {
+          const lower = text.toLowerCase().trim();
+          if (lower === 'cancel' || lower === 'stop' || lower === 'cancel deep' || lower === 'stop deep') {
+            const { jobName, taskDesc } = sess.deepTask;
+            try {
+              const cancelDir = path.join(BASE_DIR, 'unleashed', jobName);
+              const { mkdirSync, writeFileSync } = await import('node:fs');
+              mkdirSync(cancelDir, { recursive: true });
+              writeFileSync(path.join(cancelDir, 'CANCEL'), '');
+            } catch { /* best-effort */ }
+            delete sess.deepTask;
+            logger.info({ sessionKey, jobName }, 'Deep mode task cancelled by user');
+            return `Deep mode cancelled: ${taskDesc}`;
+          }
+          if (lower === 'status' || lower === 'deep status') {
+            const { taskDesc, startedAt, jobName } = sess.deepTask;
+            // Try to read latest progress from unleashed status file
+            let phaseInfo = '';
+            try {
+              const statusPath = path.join(BASE_DIR, 'unleashed', jobName, 'status.json');
+              const { readFileSync } = await import('node:fs');
+              const status = JSON.parse(readFileSync(statusPath, 'utf-8'));
+              phaseInfo = ` Phase ${status.phase ?? '?'}, status: ${status.status ?? 'running'}.`;
+            } catch { /* status file may not exist yet */ }
+            return `Deep mode running: ${taskDesc}\nStarted ${startedAt}.${phaseInfo}`;
+          }
+          // Otherwise, let the message go through normally — user can still chat
+        }
+
         // Resolve active profile
         let effectiveSessionKey = sessionKey;
         const profileSlug = sess?.profile;
@@ -598,6 +629,39 @@ export class Gateway {
               // Strip the [PLAN_NEEDED] tag and return the rest of the response
               return response.replace(/^\[PLAN_NEEDED:[^\]]*\]\s*/, '').trim() || '*(no response)*';
             }
+          }
+
+          // ── Deep mode detection ─────────────────────────────────────
+          // Agent proposes background execution for complex tasks
+          const deepMatch = response?.match(/^\[DEEP_MODE:\s*(.+?)\]\s*/s);
+          if (deepMatch) {
+            const taskDesc = deepMatch[1].trim() || text;
+            const ack = response.replace(/^\[DEEP_MODE:[^\]]*\]\s*/s, '').trim();
+            logger.info({ sessionKey, task: taskDesc }, 'Deep mode triggered by agent');
+
+            const currentSess = this.getSession(sessionKey);
+            const jobName = `deep-${Date.now()}`;
+            currentSess.deepTask = { jobName, taskDesc, startedAt: new Date().toISOString() };
+
+            // Spawn unleashed task in background — don't await
+            this.assistant.runUnleashedTask(
+              jobName,
+              `${taskDesc}\n\nOriginal request: ${text}`,
+              2,           // tier 2 (Bash/Write/Edit enabled)
+              undefined,   // default maxTurns (75/phase)
+              undefined,   // default model
+              undefined,   // default workDir
+              1,           // maxHours
+            ).then(() => {
+              logger.info({ sessionKey, jobName }, 'Deep mode task completed');
+            }).catch((err) => {
+              logger.error({ err, sessionKey, jobName }, 'Deep mode task failed');
+            }).finally(() => {
+              const s = this.sessions.get(sessionKey);
+              if (s?.deepTask?.jobName === jobName) delete s.deepTask;
+            });
+
+            return ack || `Running in deep mode: ${taskDesc}. I'll check in as I go.`;
           }
 
           return response || '*(no response)*';
