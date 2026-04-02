@@ -432,6 +432,39 @@ export class HeartbeatScheduler {
 
     // Fire-and-forget: process inbox items
     this.processInbox();
+
+    // ── Per-agent heartbeats ──────────────────────────────────────────
+    // Each team agent with a HEARTBEAT.md gets its own check-in
+    try {
+      const agentMgr = this.gateway.getAgentManager();
+      const agents = agentMgr.listAll().filter(a => a.slug !== 'clementine');
+      for (const agent of agents) {
+        const agentHbFile = path.join(BASE_DIR, 'vault', '00-System', 'agents', agent.slug, 'HEARTBEAT.md');
+        if (!existsSync(agentHbFile)) continue;
+        try {
+          const agentInstructions = readFileSync(agentHbFile, 'utf-8').trim();
+          if (!agentInstructions) continue;
+          const agentProfile = agent;
+          logger.info({ agent: agent.slug }, 'Running agent heartbeat');
+          const agentResponse = await this.gateway.handleHeartbeat(
+            agentInstructions,
+            '', // no shared changes summary for agent heartbeats
+            timeContext,
+            '', // no dedup for agent heartbeats yet
+            agentProfile,
+          );
+          if (agentResponse && !HeartbeatScheduler.shouldSuppressMessage(agentResponse)) {
+            const cleanAgentResponse = HeartbeatScheduler.stripTopicTags(agentResponse);
+            await this.dispatcher.send(`**[${agent.name} check-in]**\n\n${cleanAgentResponse}`, { agentSlug: agent.slug });
+          }
+        } catch (err) {
+          logger.warn({ err, agent: agent.slug }, 'Agent heartbeat failed');
+        }
+      }
+    } catch (err) {
+      logger.warn({ err }, 'Per-agent heartbeat loop failed');
+    }
+
     } // end of shouldInvokeAgent else-block
 
   }
