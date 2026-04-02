@@ -12476,6 +12476,18 @@ function onTokenInput(token) {
 
 async function submitAgentForm(e) {
   e.preventDefault();
+  var submitBtn = document.getElementById('agent-submit-btn');
+  submitBtn.textContent = 'Saving...';
+  submitBtn.disabled = true;
+  try { await _submitAgentFormInner(e); } catch(err) {
+    console.error('submitAgentForm error:', err);
+    toast('Form error: ' + String(err), 'error');
+  } finally {
+    submitBtn.textContent = document.getElementById('agent-edit-slug').value ? 'Save Changes' : 'Complete Hiring';
+    submitBtn.disabled = false;
+  }
+}
+async function _submitAgentFormInner(e) {
   var editSlug = document.getElementById('agent-edit-slug').value;
   var isEdit = Boolean(editSlug);
 
