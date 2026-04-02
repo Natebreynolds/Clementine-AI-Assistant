@@ -1761,10 +1761,14 @@ If you're stuck after reading several files, tell ${owner} what's blocking you. 
                     responseText = responseText || `Error: ${errorText}`;
                   }
                 }
-              } else if ('result' in result && (result as any).result && !responseText) {
-                // Success: capture the model's final response if not already accumulated from streaming
-                responseText = (result as any).result;
-                if (onText) await onText(responseText);
+              } else if ('result' in result && (result as any).result) {
+                // Success: use SDK result text if streaming didn't capture a substantive response
+                const sdkResult = (result as any).result as string;
+                logger.info({ sessionKey, streamedLen: responseText.length, resultLen: sdkResult.length }, 'SDK result text available');
+                if (!responseText.trim()) {
+                  responseText = sdkResult;
+                  if (onText) await onText(responseText);
+                }
               }
             } else if (message.type === 'system') {
               this.captureMcpStatus(message);
