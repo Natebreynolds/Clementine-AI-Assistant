@@ -117,6 +117,19 @@ export async function applyUpdate(pkgDir: string): Promise<UpdateApplyResult> {
       // Non-fatal — build may still work
     }
 
+    // 3b. Rebuild native modules (better-sqlite3) for current Node version
+    // The postinstall hook silently swallows errors, so do this explicitly.
+    try {
+      execSync('npm rebuild better-sqlite3', {
+        cwd: pkgDir,
+        stdio: 'pipe',
+        timeout: 60_000,
+      });
+      logger.info('Native module rebuild succeeded');
+    } catch (err) {
+      logger.warn({ err }, 'npm rebuild better-sqlite3 failed — memory may not work after restart');
+    }
+
     // 4. Build — use local tsc binary directly (npx can fail if typescript isn't cached)
     try {
       execSync('./node_modules/.bin/tsc', {
