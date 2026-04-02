@@ -1815,20 +1815,21 @@ If you're stuck after reading several files, tell ${owner} what's blocking you. 
         }
 
         // ── Response guarantee ─────────────────────────────────────────
-        // If streaming didn't capture text, extract from the last assistant message.
-        // If that's also empty and tool calls were made, generate a fallback so the
-        // user never sees silence after real work was done.
+        // The model often generates 30+ tool calls with minimal/no text. Ensure
+        // the user always gets a substantive response after real work is done.
         const toolCalls = stallGuard?.getToolCalls() ?? [];
-        if (!responseText.trim() && lastAssistantBlocks.length > 0) {
+        const hasSubstantiveResponse = responseText.trim().length > 50;
+
+        if (!hasSubstantiveResponse && lastAssistantBlocks.length > 0) {
           const extracted = extractText(lastAssistantBlocks);
-          if (extracted.trim()) {
-            logger.info({ sessionKey, extractedLen: extracted.length }, 'Recovered response text from last assistant message');
+          if (extracted.trim().length > responseText.trim().length) {
+            logger.info({ sessionKey, streamedLen: responseText.trim().length, extractedLen: extracted.trim().length }, 'Recovered fuller response from last assistant message');
             responseText = extracted;
           }
         }
-        if (!responseText.trim() && toolCalls.length > 0) {
+        if (responseText.trim().length <= 50 && toolCalls.length > 5) {
           const toolNames = [...new Set(toolCalls.map(tc => tc.replace(/\(.*$/, '')))];
-          logger.warn({ sessionKey, toolCallCount: toolCalls.length, tools: toolNames }, 'No response text after tool execution — generating fallback');
+          logger.warn({ sessionKey, responseLen: responseText.trim().length, toolCallCount: toolCalls.length, tools: toolNames }, 'Insufficient response after heavy tool use — generating fallback');
           responseText = `I worked through that but wasn't able to put together a proper response. I made ${toolCalls.length} tool calls (${toolNames.slice(0, 5).join(', ')}). Can you try asking again or narrow the request?`;
         }
 
