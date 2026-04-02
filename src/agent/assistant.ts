@@ -1765,6 +1765,10 @@ If you've done 8+ consecutive read-only tool calls without any action — PAUSE 
                     responseText = responseText || `Error: ${errorText}`;
                   }
                 }
+              } else if ('result' in result && (result as any).result && !responseText) {
+                // Success: capture the model's final response if not already accumulated from streaming
+                responseText = (result as any).result;
+                if (onText) await onText(responseText);
               }
             } else if (message.type === 'system') {
               this.captureMcpStatus(message);
