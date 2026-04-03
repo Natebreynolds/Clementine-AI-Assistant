@@ -572,8 +572,9 @@ export class Gateway {
 
         // Wrap callbacks to reset idle timer on agent activity + count tool calls
         let toolActivityCount = 0;
+        let lastStreamedText = '';
         const wrappedOnText = onText
-          ? async (token: string) => { resetIdleTimer(); return onText(token); }
+          ? async (token: string) => { resetIdleTimer(); lastStreamedText = token; return onText(token); }
           : undefined;
         const wrappedOnToolActivity = onToolActivity
           ? async (name: string, input: Record<string, unknown>) => { resetIdleTimer(); toolActivityCount++; return onToolActivity(name, input); }
@@ -721,10 +722,54 @@ export class Gateway {
           return response || '*(no response)*';
         } catch (err) {
           clearTimeout(chatTimer);
+          if (hardWallTimer) clearTimeout(hardWallTimer);
           { const cs = this.sessions.get(sessionKey); if (cs) delete cs.abortController; }
           // If aborted by user (!stop) or our timeout, return a friendly message
           if (chatAc.signal.aborted) {
             return "Stopped. What would you like to do instead?";
+          }
+
+          // ── Max turns hit — auto-escalate to deep mode instead of failing silently ──
+          // This is the #1 cause of "agent stops responding": it ran out of turns
+          // exploring files, the SDK throws, and the user gets nothing.
+          const isMaxTurns = String(err).includes('maximum number of turns') || String(err).includes('max_turns');
+          if (isMaxTurns && !maxTurns) {
+            logger.info({ sessionKey, toolActivityCount }, 'Max turns hit — auto-escalating to deep mode');
+
+            const currentSess = this.getSession(sessionKey);
+            const jobName = `deep-${Date.now()}`;
+            currentSess.deepTask = { jobName, taskDesc: text.slice(0, 200), startedAt: new Date().toISOString() };
+
+            // Grab any partial response that was streamed before the error
+            const partialResponse = wrappedOnText ? lastStreamedText : '';
+
+            this.assistant.runUnleashedTask(
+              jobName,
+              `Continue working on this task. The user asked: ${text}\n\nYou already started and ran out of turns. Pick up where you left off and complete the work.`,
+              2,
+              undefined,
+              undefined,
+              undefined,
+              1,
+            ).then((result) => {
+              logger.info({ sessionKey, jobName, resultLen: result?.length ?? 0 }, 'Max-turns deep mode completed');
+              if (result && result !== '__NOTHING__') {
+                this.assistant.injectPendingContext(sessionKey, text, result);
+              }
+            }).catch((deepErr) => {
+              logger.error({ err: deepErr, sessionKey, jobName }, 'Max-turns deep mode failed');
+              this.assistant.injectPendingContext(sessionKey, text, `Background work failed: ${String(deepErr).slice(0, 200)}`);
+            }).finally(() => {
+              const s = this.sessions.get(sessionKey);
+              if (s?.deepTask?.jobName === jobName) delete s.deepTask;
+            });
+
+            // Return whatever was streamed + a continuation message
+            const partial = partialResponse?.trim() ?? '';
+            if (partial.length > 20) {
+              return `${partial}\n\nI need more time to finish this — continuing in the background.`;
+            }
+            return `This is taking more work than expected — continuing in the background. I'll have results shortly.`;
           }
 
           const errKind = classifyChatError(err);
