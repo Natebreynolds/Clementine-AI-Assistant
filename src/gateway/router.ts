@@ -656,10 +656,14 @@ export class Gateway {
               undefined,   // default model
               undefined,   // default workDir
               1,           // maxHours
-            ).then(() => {
-              logger.info({ sessionKey, jobName }, 'Deep mode task completed');
+            ).then((result) => {
+              logger.info({ sessionKey, jobName, resultLen: result?.length ?? 0 }, 'Deep mode task completed');
+              if (result && result !== '__NOTHING__') {
+                this.assistant.injectPendingContext(sessionKey, text, result);
+              }
             }).catch((err) => {
               logger.error({ err, sessionKey, jobName }, 'Deep mode task failed');
+              this.assistant.injectPendingContext(sessionKey, text, `Background work failed: ${String(err).slice(0, 200)}`);
             }).finally(() => {
               const s = this.sessions.get(sessionKey);
               if (s?.deepTask?.jobName === jobName) delete s.deepTask;
@@ -687,10 +691,16 @@ export class Gateway {
               undefined,
               undefined,
               1,
-            ).then(() => {
-              logger.info({ sessionKey, jobName }, 'Auto-escalated deep mode completed');
+            ).then((result) => {
+              logger.info({ sessionKey, jobName, resultLen: result?.length ?? 0 }, 'Auto-escalated deep mode completed');
+              // Store result as pending context so the agent naturally references it
+              if (result && result !== '__NOTHING__') {
+                this.assistant.injectPendingContext(sessionKey, text, result);
+              }
             }).catch((err) => {
               logger.error({ err, sessionKey, jobName }, 'Auto-escalated deep mode failed');
+              // Notify user of failure
+              this.assistant.injectPendingContext(sessionKey, text, `The background work on "${text.slice(0, 100)}" failed: ${String(err).slice(0, 200)}`);
             }).finally(() => {
               const s = this.sessions.get(sessionKey);
               if (s?.deepTask?.jobName === jobName) delete s.deepTask;

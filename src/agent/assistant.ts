@@ -557,6 +557,15 @@ export class PersonalAssistant {
     return { servers: this._lastMcpStatus, updatedAt: this._lastMcpStatusTime };
   }
 
+  /** Inject a background work result into the session so the next chat naturally references it. */
+  injectPendingContext(sessionKey: string, userPrompt: string, result: string): void {
+    const pending = this.pendingContext.get(sessionKey) ?? [];
+    pending.push({ user: userPrompt.slice(0, 500), assistant: result.slice(0, 2000) });
+    if (pending.length > 3) pending.shift();
+    this.pendingContext.set(sessionKey, pending);
+    this.saveSessions();
+  }
+
   private async initMemoryStore(): Promise<void> {
     try {
       const { MemoryStore } = await import('../memory/store.js');
