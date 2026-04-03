@@ -849,6 +849,15 @@ Never spawn a sub-agent with vague instructions like "handle this brief" — tel
 
     if (profile) {
       parts.push(`You are currently operating as **${profile.name}** (${profile.description}).`);
+      // Inject linked projects so the agent knows what it has access to
+      const linkedProjectNames = profile.projects?.length ? profile.projects : (profile.project ? [profile.project] : []);
+      if (linkedProjectNames.length > 0) {
+        const projectDetails = linkedProjectNames.map(pName => {
+          const p = findProjectByName(pName);
+          return p ? `- **${pName}** (${p.path})` : `- ${pName} (not found)`;
+        });
+        parts.push(`Linked projects:\n${projectDetails.join('\n')}`);
+      }
     }
 
     // Inject hot corrections (explicit behavioral corrections from recent sessions)
@@ -1658,6 +1667,13 @@ If you're stuck after reading several files, tell ${owner} what's blocking you. 
     let matchedProject = projectOverride ?? autoMatchedProject;
     if (!matchedProject && profile?.project) {
       matchedProject = findProjectByName(profile.project) ?? null;
+    }
+    // Multi-project support: resolve first matching project for cwd, inject all as context
+    if (!matchedProject && profile?.projects?.length) {
+      for (const pName of profile.projects) {
+        const found = findProjectByName(pName);
+        if (found) { matchedProject = found; break; }
+      }
     }
     let retrievalContext = securityAnnotation
       ? `${securityAnnotation}\n\n${rawContext}`
@@ -3305,8 +3321,10 @@ If you're stuck after reading several files, tell ${owner} what's blocking you. 
         stallGuard: teamGuard,
       });
 
-      if (profile.project) {
-        const project = findProjectByName(profile.project);
+      // Resolve project for cwd: single project binding or first from multi-project list
+      const projectName = profile.project || profile.projects?.[0];
+      if (projectName) {
+        const project = findProjectByName(projectName);
         if (project) sdkOptions.cwd = project.path;
       }
 
