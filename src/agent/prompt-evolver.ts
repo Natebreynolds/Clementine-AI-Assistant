@@ -6,10 +6,10 @@
  * string to be appended to the original prompt.
  */
 
-import { existsSync, readFileSync, readdirSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync } from 'node:fs';
 import path from 'node:path';
 import pino from 'pino';
-import { CRON_REFLECTIONS_DIR, CRON_PROGRESS_DIR, GOALS_DIR } from '../config.js';
+import { BASE_DIR, CRON_REFLECTIONS_DIR, CRON_PROGRESS_DIR, GOALS_DIR } from '../config.js';
 import type { PersistentGoal, CronProgress } from '../types.js';
 
 const logger = pino({ name: 'clementine.prompt-evolver' });
@@ -35,6 +35,13 @@ export function evolvePrompt(ctx: PromptEvolutionContext): string {
   }
 
   try {
+    const strategyInsights = extractStrategyInsights(ctx.jobName);
+    if (strategyInsights) parts.push(strategyInsights);
+  } catch (err) {
+    logger.debug({ err, job: ctx.jobName }, 'Failed to extract strategy insights');
+  }
+
+  try {
     const progressInsights = extractProgressInsights(ctx.jobName);
     if (progressInsights) parts.push(progressInsights);
   } catch (err) {
@@ -49,6 +56,31 @@ export function evolvePrompt(ctx: PromptEvolutionContext): string {
   }
 
   return parts.join('\n\n');
+}
+
+/**
+ * Log a strategy observation after a cron run completes.
+ * Called by the cron scheduler to track which approaches work/fail.
+ */
+export function logStrategyObservation(jobName: string, observation: {
+  toolsUsed: string[];
+  quality: number;
+  status: 'ok' | 'error';
+}): void {
+  try {
+    const strategyDir = path.join(BASE_DIR, 'cron', 'strategies');
+    mkdirSync(strategyDir, { recursive: true });
+    const safe = jobName.replace(/[^a-zA-Z0-9_-]/g, '_');
+    const logFile = path.join(strategyDir, `${safe}.strategy.jsonl`);
+    appendFileSync(logFile, JSON.stringify({
+      timestamp: new Date().toISOString(),
+      toolsUsed: observation.toolsUsed.slice(0, 20),
+      quality: observation.quality,
+      status: observation.status,
+    }) + '\n');
+  } catch {
+    // non-fatal
+  }
 }
 
 /**
@@ -100,6 +132,70 @@ function extractReflectionLessons(jobName: string): string | null {
     }
 
     return parts.join('\n');
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Extract strategy insights by correlating tool usage patterns with quality scores.
+ * Identifies which approaches (tool combinations) tend to succeed vs. fail.
+ */
+function extractStrategyInsights(jobName: string): string | null {
+  const strategyDir = path.join(BASE_DIR, 'cron', 'strategies');
+  const safe = jobName.replace(/[^a-zA-Z0-9_-]/g, '_');
+  const logFile = path.join(strategyDir, `${safe}.strategy.jsonl`);
+  if (!existsSync(logFile)) return null;
+
+  try {
+    const lines = readFileSync(logFile, 'utf-8').trim().split('\n').filter(Boolean);
+    if (lines.length < 3) return null; // need enough data
+
+    const recent = lines.slice(-15);
+    // Tally quality by top tool used
+    const toolStats = new Map<string, { total: number; successCount: number; qualitySum: number }>();
+
+    for (const line of recent) {
+      try {
+        const entry = JSON.parse(line);
+        const topTools = (entry.toolsUsed ?? []).slice(0, 3) as string[];
+        const key = topTools.sort().join('+') || 'no-tools';
+        const stats = toolStats.get(key) ?? { total: 0, successCount: 0, qualitySum: 0 };
+        stats.total++;
+        if (entry.status === 'ok' && entry.quality >= 3) stats.successCount++;
+        stats.qualitySum += entry.quality ?? 3;
+        toolStats.set(key, stats);
+      } catch { continue; }
+    }
+
+    if (toolStats.size === 0) return null;
+
+    // Find best and worst approaches
+    const ranked = [...toolStats.entries()]
+      .filter(([, s]) => s.total >= 2)
+      .map(([approach, s]) => ({
+        approach,
+        successRate: s.successCount / s.total,
+        avgQuality: s.qualitySum / s.total,
+        total: s.total,
+      }))
+      .sort((a, b) => b.avgQuality - a.avgQuality);
+
+    if (ranked.length === 0) return null;
+
+    const parts: string[] = ['## Strategy Insights'];
+
+    const best = ranked[0];
+    if (best.successRate >= 0.7) {
+      parts.push(`Recommended approach: **${best.approach}** (${Math.round(best.successRate * 100)}% success rate over ${best.total} runs, avg quality: ${best.avgQuality.toFixed(1)})`);
+    }
+
+    const worst = ranked[ranked.length - 1];
+    if (ranked.length > 1 && worst.successRate < 0.5) {
+      parts.push(`Avoid: **${worst.approach}** (${Math.round(worst.successRate * 100)}% success rate — consider alternative tools)`);
+    }
+
+    return parts.length > 1 ? parts.join('\n') : null;
   } catch {
     return null;
   }

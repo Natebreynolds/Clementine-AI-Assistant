@@ -23,6 +23,7 @@ import type {
   TranscriptTurn,
   WikilinkConnection,
 } from '../types.js';
+import * as embeddingsModule from './embeddings.js';
 import { chunkFile } from './chunker.js';
 import { mmrRerank } from './mmr.js';
 import { deduplicateResults } from './search.js';
@@ -758,12 +759,79 @@ export class MemoryStore {
       }
     }
 
-    // 2. Recency
+    // 2. Vector similarity (if embeddings available)
+    let vectorResults: SearchResult[] = [];
+    try {
+      if (embeddingsModule.isReady()) {
+        const queryVec = embeddingsModule.embed(query);
+        if (queryVec) {
+          vectorResults = this.searchByEmbedding(queryVec, limit, agentSlug);
+        }
+      }
+    } catch {
+      // Embeddings not available — fallback to FTS only
+    }
+
+    // 3. Recency
     const recentResults = this.getRecentChunks(recencyLimit, agentSlug);
 
-    // 3. Merge and deduplicate (FTS results first, so they win on ties)
-    const merged = [...ftsResults, ...recentResults];
+    // 4. Merge and deduplicate (FTS results first, then vector, then recency)
+    const merged = [...ftsResults, ...vectorResults, ...recentResults];
     return mmrRerank(deduplicateResults(merged), 0.7, limit + recencyLimit);
+  }
+
+  /**
+   * Search chunks by embedding cosine similarity.
+   * Scans chunks that have stored embeddings and returns top matches.
+   */
+  private searchByEmbedding(queryVec: Float32Array, limit: number, agentSlug?: string): SearchResult[] {
+    const rows = this.conn
+      .prepare(
+        `SELECT id, source_file, section, content, chunk_type, embedding, salience, agent_slug, updated_at
+         FROM chunks
+         WHERE embedding IS NOT NULL AND consolidated = 0
+         ORDER BY updated_at DESC
+         LIMIT 500`,
+      )
+      .all() as Array<{
+        id: number;
+        source_file: string;
+        section: string;
+        content: string;
+        chunk_type: string;
+        embedding: Buffer;
+        salience: number;
+        agent_slug: string | null;
+        updated_at: string;
+      }>;
+
+    const scored: SearchResult[] = [];
+    for (const row of rows) {
+      try {
+        const vec = embeddingsModule.deserializeEmbedding(row.embedding);
+        const sim = embeddingsModule.cosineSimilarity(queryVec, vec);
+        if (sim < 0.15) continue; // threshold for relevance
+
+        let score = sim * 10; // scale to comparable range with FTS scores
+        if (row.salience > 0) score *= (1.0 + row.salience);
+        if (agentSlug && row.agent_slug === agentSlug) score *= 1.4;
+
+        scored.push({
+          sourceFile: row.source_file,
+          section: row.section,
+          content: row.content,
+          score,
+          chunkType: row.chunk_type,
+          matchType: 'vector',
+          lastUpdated: row.updated_at,
+          chunkId: row.id,
+          salience: row.salience,
+          agentSlug: row.agent_slug ?? undefined,
+        });
+      } catch { continue; }
+    }
+
+    return scored.sort((a, b) => b.score - a.score).slice(0, limit);
   }
 
   // ── Wikilink Graph ────────────────────────────────────────────────
@@ -1854,6 +1922,20 @@ export class MemoryStore {
       consolidated: row.consolidated,
       unconsolidated: row.total - row.consolidated,
     };
+  }
+
+  /**
+   * Insert a summary chunk created by the consolidation engine.
+   * Gets higher initial salience than regular chunks.
+   */
+  insertSummaryChunk(sourceFile: string, section: string, content: string): void {
+    const hash = createHash('sha256').update(content).digest('hex').slice(0, 16);
+    this.conn
+      .prepare(
+        `INSERT INTO chunks (source_file, section, content, chunk_type, content_hash, salience, consolidated)
+         VALUES (?, ?, ?, 'summary', ?, 0.8, 0)`,
+      )
+      .run(sourceFile, section, content, hash);
   }
 
   // ── SDR Operational Data ─────────────────────────────────────────

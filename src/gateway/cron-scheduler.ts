@@ -1433,6 +1433,8 @@ export class CronScheduler {
           `4. Keep your output concise — summarize what you accomplished.`;
 
         const jobName = `goal:${goal.title.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 40)}`;
+        const goalSnapshotUpdatedAt = goal.updatedAt;
+        const goalSnapshotNotes = goal.progressNotes?.length ?? 0;
         this.gateway.handleCronJob(
           jobName,
           prompt,
@@ -1443,13 +1445,155 @@ export class CronScheduler {
             this.dispatcher.send(`🎯 **Goal work: ${goal.title}**\n\n${result.slice(0, 1500)}`).catch(() => {});
           }
           logToDailyNote(`**Goal work: ${goal.title}** — ${(result || 'completed').slice(0, 100).replace(/\n/g, ' ')}`);
+
+          // ── Outcome attribution: log whether the session made progress ──
+          this.logGoalOutcome(trigger.goalId, goalPath, goalSnapshotUpdatedAt, goalSnapshotNotes, trigger.focus, trigger.source, result);
         }).catch((err) => {
           logger.error({ err, goalId: trigger.goalId }, 'Goal work session failed');
+          // Log failure outcome
+          this.logGoalOutcome(trigger.goalId, goalPath, goalSnapshotUpdatedAt, goalSnapshotNotes, trigger.focus, trigger.source, null, String(err));
         });
       } catch (err) {
         logger.warn({ err, file }, 'Failed to process goal trigger file');
         try { unlinkSync(filePath); } catch { /* ignore */ }
       }
+    }
+  }
+
+  /**
+   * Log goal work session outcome to a per-goal progress JSONL file.
+   * Creates the causal link: "action X was attempted for goal Y, result was Z."
+   */
+  private logGoalOutcome(
+    goalId: string,
+    goalPath: string,
+    prevUpdatedAt: string,
+    prevNotesCount: number,
+    focus: string,
+    source: string,
+    result: string | null,
+    error?: string,
+  ): void {
+    try {
+      let madeProgress = false;
+      let newNotesCount = prevNotesCount;
+
+      // Re-read the goal to check if goal_update was called during the session
+      if (existsSync(goalPath)) {
+        const updated = JSON.parse(readFileSync(goalPath, 'utf-8'));
+        madeProgress = updated.updatedAt !== prevUpdatedAt;
+        newNotesCount = updated.progressNotes?.length ?? 0;
+      }
+
+      const entry = {
+        timestamp: new Date().toISOString(),
+        goalId,
+        focus,
+        source,
+        madeProgress,
+        newProgressNotes: newNotesCount - prevNotesCount,
+        resultSnippet: error ? `ERROR: ${error.slice(0, 200)}` : (result || '').slice(0, 200).replace(/\n/g, ' '),
+        status: error ? 'error' as const : madeProgress ? 'progress' as const : 'no-change' as const,
+      };
+
+      const progressDir = path.join(GOALS_DIR, 'progress');
+      mkdirSync(progressDir, { recursive: true });
+      const progressFile = path.join(progressDir, `${goalId}.progress.jsonl`);
+      appendFileSync(progressFile, JSON.stringify(entry) + '\n');
+
+      logger.info({ goalId, madeProgress, status: entry.status }, 'Goal outcome logged');
+    } catch (err) {
+      logger.debug({ err, goalId }, 'Failed to log goal outcome (non-fatal)');
+    }
+  }
+
+  /**
+   * Apply non-destructive cron changes suggested by the daily planner.
+   * Only auto-applies suggestions that reference a high-priority goal with autoSchedule=true.
+   * Supports: 'add' (new job), 'enable', 'disable'. Does NOT support 'delete' or 'modify'.
+   */
+  applySuggestedCronChanges(suggestions: Array<{ job: string; change: string; reason: string }>): void {
+    if (!suggestions || suggestions.length === 0) return;
+
+    try {
+      // Only apply suggestions linked to high-priority autoSchedule goals
+      const goalFiles = existsSync(GOALS_DIR) ? readdirSync(GOALS_DIR).filter(f => f.endsWith('.json')) : [];
+      const autoScheduleGoalTitles = new Set<string>();
+      for (const f of goalFiles) {
+        try {
+          const goal = JSON.parse(readFileSync(path.join(GOALS_DIR, f), 'utf-8'));
+          if (goal.status === 'active' && goal.priority === 'high' && goal.autoSchedule) {
+            autoScheduleGoalTitles.add(goal.title.toLowerCase());
+          }
+        } catch { continue; }
+      }
+
+      if (autoScheduleGoalTitles.size === 0) return;
+
+      for (const suggestion of suggestions) {
+        // Check if this suggestion is related to an autoSchedule goal
+        const reasonLower = suggestion.reason.toLowerCase();
+        const isGoalLinked = [...autoScheduleGoalTitles].some(title => reasonLower.includes(title));
+        if (!isGoalLinked) continue;
+
+        const changeLower = suggestion.change.toLowerCase().trim();
+
+        if (changeLower === 'enable' || changeLower === 'disable') {
+          // Enable/disable an existing job
+          const existing = this.jobs.find(j => j.name === suggestion.job);
+          if (!existing) continue;
+
+          if (changeLower === 'enable') {
+            this.disabledJobs.delete(suggestion.job);
+          } else {
+            this.disabledJobs.add(suggestion.job);
+          }
+          logger.info({ job: suggestion.job, change: changeLower, reason: suggestion.reason }, 'Applied suggested cron change');
+          continue;
+        }
+
+        // For 'add' or new job suggestions — write to CRON.md
+        if (changeLower.startsWith('add') || changeLower.startsWith('create') || changeLower.startsWith('new')) {
+          // Parse a schedule from the suggestion reason if possible
+          const scheduleMatch = suggestion.reason.match(/(?:schedule|cron|at)\s*[:=]?\s*["']?([0-9*/,\- ]{9,})["']?/i);
+          if (!scheduleMatch) {
+            logger.debug({ job: suggestion.job }, 'Skipped add suggestion — no parseable schedule in reason');
+            continue;
+          }
+          const schedule = scheduleMatch[1].trim();
+          if (!cron.validate(schedule)) {
+            logger.debug({ job: suggestion.job, schedule }, 'Skipped add suggestion — invalid cron expression');
+            continue;
+          }
+
+          // Check duplicate
+          const exists = this.jobs.some(j => j.name === suggestion.job);
+          if (exists) {
+            logger.debug({ job: suggestion.job }, 'Skipped add suggestion — job already exists');
+            continue;
+          }
+
+          // Write to CRON.md via gray-matter
+          const matterMod = matter;
+          if (!existsSync(CRON_FILE)) continue;
+          const raw = readFileSync(CRON_FILE, 'utf-8');
+          const parsed = matterMod(raw);
+          const jobs = (parsed.data.jobs ?? []) as Array<Record<string, unknown>>;
+          jobs.push({
+            name: suggestion.job,
+            schedule,
+            prompt: suggestion.reason,
+            enabled: true,
+            tier: 1,
+          });
+          parsed.data.jobs = jobs;
+          const output = matterMod.stringify(parsed.content, parsed.data);
+          writeFileSync(CRON_FILE, output);
+          logger.info({ job: suggestion.job, schedule, reason: suggestion.reason }, 'Auto-created cron job from daily plan suggestion');
+        }
+      }
+    } catch (err) {
+      logger.warn({ err }, 'Failed to apply suggested cron changes');
     }
   }
 

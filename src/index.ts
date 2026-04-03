@@ -647,6 +647,7 @@ async function asyncMain(): Promise<void> {
   const { HeartbeatScheduler, CronScheduler } = await import('./gateway/heartbeat.js');
   const heartbeat = new HeartbeatScheduler(gateway, dispatcher);
   const cronScheduler = new CronScheduler(gateway, dispatcher);
+  heartbeat.setCronScheduler(cronScheduler);
 
   // ── Build channel tasks ──────────────────────────────────────────
   const channelTasks: Array<Promise<void>> = [];

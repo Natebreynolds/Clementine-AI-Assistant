@@ -32,6 +32,17 @@ import {
 } from '../config.js';
 import type { HeartbeatState, HeartbeatReportedTopic, HeartbeatWorkItem } from '../types.js';
 import type { CronRunEntry } from '../types.js';
+import type { CronScheduler } from './cron-scheduler.js';
+import {
+  gatherInsightSignals,
+  buildInsightPrompt,
+  parseInsightResponse,
+  canSendInsight,
+  recordInsightSent,
+  recordInsightAcked,
+  maybeIncreaseCooldown,
+  type InsightState,
+} from '../agent/insight-engine.js';
 import type { NotificationDispatcher } from './notifications.js';
 import type { Gateway } from './router.js';
 import { logToDailyNote, CronRunLog, todayISO } from './cron-scheduler.js';
@@ -50,6 +61,10 @@ export class HeartbeatScheduler {
   private lastSelfImproveDate = '';
   private lastConsolidationDate = '';
   private lastAgentSiRuns = new Map<string, string>();
+  private cronScheduler: CronScheduler | null = null;
+
+  /** Wire up the cron scheduler so daily plan suggestions can be applied. */
+  setCronScheduler(cs: CronScheduler): void { this.cronScheduler = cs; }
 
   private getLastAgentSiRun(slug: string): string | undefined {
     return this.lastAgentSiRuns.get(slug);
@@ -195,6 +210,36 @@ export class HeartbeatScheduler {
       this.lastState.lastConsolidationDate = this.lastConsolidationDate;
       this.saveState();
       logger.info('Triggering evening memory consolidation');
+
+      // Phase 1: Programmatic consolidation (dedup, summarize, extract principles)
+      import('../memory/consolidation.js').then(async ({ runConsolidation }) => {
+        const store = this.gateway.getMemoryStore();
+        if (!store) {
+          logger.debug('Memory store not available — skipping programmatic consolidation');
+          return;
+        }
+
+        // LLM callback for summarization/principle extraction
+        const llmCall = async (prompt: string): Promise<string> => {
+          const result = await this.gateway.handleCronJob(
+            'consolidation-llm',
+            prompt,
+            1,
+            1,
+            'haiku',
+          );
+          return result || '';
+        };
+
+        const result = await runConsolidation(store, llmCall);
+        if (result.deduped > 0 || result.summarized > 0 || result.principlesExtracted > 0) {
+          logger.info(result, 'Programmatic consolidation results');
+        }
+      }).catch(err => {
+        logger.warn({ err }, 'Programmatic consolidation failed');
+      });
+
+      // Phase 2: LLM-driven fact promotion (existing behavior, kept as complement)
       this.gateway.handleCronJob(
         'memory-consolidation',
         'Review today\'s daily note and recent conversations. Promote any durable facts ' +
@@ -206,6 +251,47 @@ export class HeartbeatScheduler {
         'haiku',
       ).catch(err => {
         logger.error({ err }, 'Evening memory consolidation failed');
+      });
+    }
+
+    // Sunday evening: weekly review (between 8-9 PM)
+    if (now.getDay() === 0 && hour >= 20 && hour < 21) {
+      import('../agent/strategic-planner.js').then(async ({ StrategicPlanner }) => {
+        const planner = new StrategicPlanner();
+        if (!planner.hasWeeklyReview()) {
+          logger.info('Triggering weekly review');
+          const review = await planner.generateWeeklyReview();
+          if (review.summary && review.summary !== 'No data available for weekly review.') {
+            this.dispatcher.send(
+              `**Weekly Review**\n\n${review.summary}\n\n` +
+              (review.accomplishments.length > 0 ? `**Done:** ${review.accomplishments.join('; ')}\n` : '') +
+              (review.recommendations.length > 0 ? `**Next week:** ${review.recommendations.join('; ')}` : ''),
+            ).catch(() => {});
+          }
+        }
+      }).catch(err => {
+        logger.warn({ err }, 'Weekly review failed');
+      });
+    }
+
+    // First Monday of month: monthly assessment (between 8-9 PM)
+    if (now.getDay() === 1 && now.getDate() <= 7 && hour >= 20 && hour < 21) {
+      import('../agent/strategic-planner.js').then(async ({ StrategicPlanner }) => {
+        const planner = new StrategicPlanner();
+        if (!planner.hasMonthlyAssessment()) {
+          logger.info('Triggering monthly strategic assessment');
+          const assessment = await planner.generateMonthlyAssessment();
+          if (assessment.summary && assessment.summary !== 'No data available for monthly assessment.') {
+            this.dispatcher.send(
+              `**Monthly Assessment**\n\n${assessment.summary}\n\n` +
+              (assessment.proposedGoals.length > 0
+                ? `**Proposed goals:** ${assessment.proposedGoals.map(g => g.title).join(', ')}`
+                : ''),
+            ).catch(() => {});
+          }
+        }
+      }).catch(err => {
+        logger.warn({ err }, 'Monthly assessment failed');
       });
     }
 
@@ -246,6 +332,24 @@ export class HeartbeatScheduler {
           }
           logger.info({ priorities: plan.priorities.length, urgent: plan.priorities.filter(p => p.urgency >= 4).length }, 'Daily plan generated');
         }
+
+        // Apply non-destructive cron changes suggested by the daily planner
+        if (plan.suggestedCronChanges?.length > 0 && this.cronScheduler) {
+          this.cronScheduler.applySuggestedCronChanges(plan.suggestedCronChanges);
+        }
+
+        // Goal-plan alignment check
+        try {
+          const { StrategicPlanner } = await import('../agent/strategic-planner.js');
+          const sp = new StrategicPlanner();
+          const warning = sp.checkGoalPlanAlignment(plan);
+          if (warning) {
+            logger.info({ warning }, 'Goal-plan misalignment detected');
+            // Inject warning into today's context so the heartbeat can surface it
+            plan.summary = `${plan.summary}\n\n⚠ ${warning}`;
+            writeFileSync(path.join(BASE_DIR, 'plans', 'daily', `${plan.date}.json`), JSON.stringify(plan, null, 2));
+          }
+        } catch { /* non-fatal */ }
       }
     } catch (err) {
       logger.warn({ err }, 'Daily planning failed (non-fatal)');
@@ -327,7 +431,7 @@ export class HeartbeatScheduler {
       logger.info({ silentBeats: this.lastState.consecutiveSilentBeats }, 'Heartbeat silent — nothing new');
 
       // Still run housekeeping
-      this.nudgeStaleGoals();
+      this.advanceGoals();
       this.processInbox();
       // Fall through to nightly tasks below — don't return early
     } else {
@@ -427,11 +531,18 @@ export class HeartbeatScheduler {
       logger.error({ err }, 'Heartbeat tick failed');
     }
 
-    // Fire-and-forget: nudge stale goals by writing trigger files
-    this.nudgeStaleGoals();
+    // Fire-and-forget: advance active goals by writing trigger files
+    this.advanceGoals();
 
     // Fire-and-forget: process inbox items
     this.processInbox();
+
+    // ── Proactive insight engine ─────────────────────────────────────
+    try {
+      await this.runInsightCheck();
+    } catch (err) {
+      logger.debug({ err }, 'Insight check failed (non-fatal)');
+    }
 
     // ── Per-agent heartbeats ──────────────────────────────────────────
     // Each team agent with a HEARTBEAT.md gets its own check-in
@@ -467,6 +578,75 @@ export class HeartbeatScheduler {
 
     } // end of shouldInvokeAgent else-block
 
+  }
+
+  /**
+   * Proactive insight check — gather signals, evaluate urgency, send if warranted.
+   * Runs as a lightweight Haiku call, separate from the main heartbeat LLM invocation.
+   */
+  private async runInsightCheck(): Promise<void> {
+    // Initialize insight state if needed
+    if (!this.lastState.insightState) {
+      this.lastState.insightState = {
+        sentToday: [],
+        unackedCount: 0,
+        cooldownMultiplier: 1,
+      };
+    }
+    const insightState = this.lastState.insightState as InsightState;
+
+    // Check throttling
+    if (!canSendInsight(insightState)) return;
+
+    // Check for increased cooldown due to ignored messages
+    maybeIncreaseCooldown(insightState);
+
+    // Gather raw signals (no LLM call)
+    const signals = gatherInsightSignals(this.gateway);
+    if (signals.length === 0) return;
+
+    // Build prompt for urgency rating
+    const prompt = buildInsightPrompt(signals);
+    if (!prompt) return;
+
+    // Run lightweight LLM call via gateway
+    const response = await this.gateway.handleCronJob(
+      'insight-check',
+      prompt,
+      1,   // tier 1
+      1,   // max 1 turn (just rating + message)
+      'haiku',
+    );
+
+    if (!response) return;
+
+    const insight = parseInsightResponse(response);
+    if (!insight) return;
+
+    // Urgency-based delivery
+    const hour = new Date().getHours();
+    const inActiveHours = hour >= HEARTBEAT_ACTIVE_START && hour < HEARTBEAT_ACTIVE_END;
+
+    if (insight.urgency >= 5) {
+      // Critical: send immediately regardless of hours
+      await this.dispatcher.send(`**[Proactive alert]** ${insight.message}`);
+      recordInsightSent(insightState);
+      this.saveState();
+    } else if (insight.urgency >= 4 && inActiveHours) {
+      // Important: send during active hours
+      await this.dispatcher.send(`**[Heads up]** ${insight.message}`);
+      recordInsightSent(insightState);
+      this.saveState();
+    }
+    // Urgency 3 = informational — already included in regular heartbeat context
+    // via the signals gathered above, no separate notification needed
+  }
+
+  /** Called when user replies to a proactive message — resets cooldown. */
+  recordInsightAcknowledged(): void {
+    if (!this.lastState.insightState) return;
+    recordInsightAcked(this.lastState.insightState as InsightState);
+    this.saveState();
   }
 
   private readHeartbeatConfig(): string {
@@ -738,11 +918,13 @@ export class HeartbeatScheduler {
   }
 
   /**
-   * Nudge the most urgent stale goal by writing a trigger file.
-   * Conservative: only nudges ONE goal per heartbeat tick, and skips
-   * if any trigger files are already pending (prevents double-triggering).
+   * Proactively advance goals by writing trigger files for the cron scheduler
+   * to pick up. Scores ALL active goals — not just stale ones — so high-priority
+   * goals with pending nextActions get worked on even if recently updated.
+   *
+   * Conservative: max 2 triggers per tick, skips if triggers are already pending.
    */
-  private nudgeStaleGoals(): void {
+  private advanceGoals(): void {
     try {
       const goalTriggerDir = path.join(BASE_DIR, 'cron', 'goal-triggers');
       mkdirSync(goalTriggerDir, { recursive: true });
@@ -758,8 +940,9 @@ export class HeartbeatScheduler {
       const now = Date.now();
       const DAY_MS = 86_400_000;
 
-      // Find stale goals sorted by urgency (priority + days overdue)
-      const staleGoals: Array<{ goal: any; urgency: number }> = [];
+      // Score ALL active goals — stale goals get urgency bonus, but
+      // non-stale high-priority goals with pending work also qualify.
+      const scoredGoals: Array<{ goal: any; score: number; reason: string }> = [];
       for (const f of files) {
         try {
           const goal = JSON.parse(readFileSync(path.join(GOALS_DIR, f), 'utf-8'));
@@ -768,41 +951,67 @@ export class HeartbeatScheduler {
           const lastUpdate = goal.updatedAt ? new Date(goal.updatedAt).getTime() : 0;
           const daysSinceUpdate = Math.floor((now - lastUpdate) / DAY_MS);
           const staleThreshold = goal.reviewFrequency === 'daily' ? 1 : goal.reviewFrequency === 'weekly' ? 7 : 30;
-          if (daysSinceUpdate <= staleThreshold) continue;
+          const isStale = daysSinceUpdate > staleThreshold;
+          const hasWork = (goal.nextActions?.length ?? 0) > 0;
 
-          // Urgency: high priority gets +10, days overdue adds to score
-          const priorityBoost = goal.priority === 'high' ? 10 : goal.priority === 'medium' ? 5 : 0;
-          staleGoals.push({ goal, urgency: priorityBoost + (daysSinceUpdate - staleThreshold) });
+          // Skip non-stale goals that have no pending work
+          if (!isStale && !hasWork) continue;
+
+          // Scoring: priority (high=15, medium=8, low=2) + staleness bonus + work availability
+          const priorityScore = goal.priority === 'high' ? 15 : goal.priority === 'medium' ? 8 : 2;
+          const stalenessScore = isStale ? Math.min(daysSinceUpdate - staleThreshold, 20) : 0;
+          const workScore = hasWork ? 5 : 0;
+          // Goals approaching target date get a deadline urgency boost
+          let deadlineScore = 0;
+          if (goal.targetDate) {
+            const daysUntilTarget = Math.floor((new Date(goal.targetDate).getTime() - now) / DAY_MS);
+            if (daysUntilTarget <= 0) deadlineScore = 20;       // overdue
+            else if (daysUntilTarget <= 3) deadlineScore = 10;   // imminent
+            else if (daysUntilTarget <= 7) deadlineScore = 5;    // approaching
+          }
+          const totalScore = priorityScore + stalenessScore + workScore + deadlineScore;
+
+          const reason = [
+            isStale ? `stale(${daysSinceUpdate}d)` : 'current',
+            `pri=${goal.priority}`,
+            hasWork ? 'has-work' : 'no-work',
+            deadlineScore > 0 ? `deadline-boost(${deadlineScore})` : '',
+          ].filter(Boolean).join(', ');
+
+          scoredGoals.push({ goal, score: totalScore, reason });
         } catch { continue; }
       }
 
-      if (staleGoals.length === 0) return;
+      if (scoredGoals.length === 0) return;
 
-      // Pick the most urgent
-      staleGoals.sort((a, b) => b.urgency - a.urgency);
-      const { goal } = staleGoals[0];
+      // Sort by score descending, take top 2
+      scoredGoals.sort((a, b) => b.score - a.score);
+      const toAdvance = scoredGoals.slice(0, 2);
 
-      const focus = goal.nextActions?.length > 0
-        ? goal.nextActions[0]
-        : `Review and update progress on "${goal.title}"`;
+      for (const { goal, reason } of toAdvance) {
+        const focus = goal.nextActions?.length > 0
+          ? goal.nextActions[0]
+          : `Review and update progress on "${goal.title}"`;
 
-      const trigger = {
-        goalId: goal.id,
-        focus,
-        maxTurns: 10,
-        triggeredAt: new Date().toISOString(),
-        source: 'heartbeat-nudge',
-      };
+        const trigger = {
+          goalId: goal.id,
+          focus,
+          maxTurns: 10,
+          triggeredAt: new Date().toISOString(),
+          source: 'heartbeat-advance',
+          reason,
+        };
 
-      const triggerPath = path.join(goalTriggerDir, `${goal.id}.trigger.json`);
-      writeFileSync(triggerPath, JSON.stringify(trigger, null, 2));
-      logger.info({ goalId: goal.id, title: goal.title, focus }, 'Nudged stale goal via trigger file');
+        const triggerPath = path.join(goalTriggerDir, `${goal.id}.trigger.json`);
+        writeFileSync(triggerPath, JSON.stringify(trigger, null, 2));
+        logger.info({ goalId: goal.id, title: goal.title, score: toAdvance[0].score, reason, focus }, 'Advancing goal via trigger');
+      }
 
       // Goal-driven task generation: find goals with nextActions but no matching tasks
       try {
         const tasksContent = existsSync(TASKS_FILE) ? readFileSync(TASKS_FILE, 'utf-8') : '';
 
-        for (const { goal: g } of staleGoals.slice(0, 3)) {
+        for (const { goal: g } of scoredGoals.slice(0, 3)) {
           if (!g.nextActions?.length) continue;
 
           const hasMatchingTask = g.nextActions.some((action: string) =>
@@ -824,7 +1033,7 @@ export class HeartbeatScheduler {
         }
 
         // Check goals with linked crons but no recent progress
-        for (const { goal: g } of staleGoals) {
+        for (const { goal: g } of scoredGoals) {
           if (!g.linkedCronJobs?.length) continue;
 
           const recentProgress = g.progressNotes?.length > 0;
@@ -844,7 +1053,7 @@ export class HeartbeatScheduler {
         logger.debug({ err }, 'Goal-driven task generation failed (non-fatal)');
       }
     } catch (err) {
-      logger.warn({ err }, 'Failed to nudge stale goals');
+      logger.warn({ err }, 'Failed to advance goals');
     }
   }
 

@@ -9,7 +9,7 @@
 import type { SearchResult } from '../types.js';
 
 /** Tokenize text into lowercase word set for Jaccard similarity. */
-function tokenize(text: string): Set<string> {
+export function tokenize(text: string): Set<string> {
   return new Set(
     text.toLowerCase()
       .replace(/[^\w\s]/g, ' ')
@@ -19,7 +19,7 @@ function tokenize(text: string): Set<string> {
 }
 
 /** Jaccard similarity between two token sets: |A∩B| / |A∪B| */
-function jaccard(a: Set<string>, b: Set<string>): number {
+export function jaccard(a: Set<string>, b: Set<string>): number {
   if (a.size === 0 && b.size === 0) return 1;
   let intersection = 0;
   for (const token of a) {
