@@ -407,26 +407,34 @@ export class CronScheduler {
       this.completedJobs.set(jobName, Date.now());
       if (result && result !== '__NOTHING__') {
         const slug = jobName.includes(':') ? jobName.split(':')[0] : undefined;
-        this.dispatcher.send(`✅ Unleashed task **${jobName}** completed:\n\n${result.slice(0, 1500)}`, { agentSlug: slug }).catch(() => {});
+        // Strip system metadata for clean conversational delivery
+        const cleanResult = result
+          .replace(/^TASK_COMPLETE:\s*/i, '')
+          .replace(/^STATUS SUMMARY:?\s*/im, '')
+          .slice(0, 1500);
+        this.dispatcher.send(cleanResult, { agentSlug: slug }).catch(() => {});
       }
     });
 
     // Wire up phase progress notifications for unleashed tasks
     this.gateway.setPhaseCompleteCallback((jobName, phase, _total, output) => {
-      const preview = output.slice(0, 500);
+      if (phase <= 1) return; // Don't spam for the first phase — wait for real progress
       const slug = jobName.includes(':') ? jobName.split(':')[0] : undefined;
-      this.dispatcher.send(`⏳ **${jobName}** — phase ${phase} complete:\n${preview}`, { agentSlug: slug }).catch(() => {});
+      const cleanOutput = output
+        .replace(/^STATUS SUMMARY:?\s*/im, '')
+        .slice(0, 500);
+      this.dispatcher.send(`Still working on it — ${cleanOutput}`, { agentSlug: slug }).catch(() => {});
     });
 
     // Wire up real-time progress summaries (throttled to max 1/minute)
     const lastProgressSent = new Map<string, number>();
-    this.gateway.setPhaseProgressCallback((jobName, phase, summary) => {
+    this.gateway.setPhaseProgressCallback((jobName, _phase, summary) => {
       const now = Date.now();
       const lastSent = lastProgressSent.get(jobName) ?? 0;
       if (now - lastSent < 60_000) return; // throttle: 1 per minute
       lastProgressSent.set(jobName, now);
       const slug = jobName.includes(':') ? jobName.split(':')[0] : undefined;
-      this.dispatcher.send(`📊 **${jobName}** (phase ${phase}): ${summary.slice(0, 300)}`, { agentSlug: slug }).catch(() => {});
+      this.dispatcher.send(summary.slice(0, 300), { agentSlug: slug }).catch(() => {});
     });
 
     logger.info(`Cron scheduler started with ${this.jobs.length} jobs`);
