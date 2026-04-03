@@ -1067,7 +1067,7 @@ If you're stuck after reading several files, tell ${owner} what's blocking you. 
     const disallowed = isHeartbeat && (!isCron || (cronTier ?? 0) < 2)
       ? getHeartbeatDisallowedTools()
       : [];
-    const effectiveMaxTurns = maxTurns ?? (isHeartbeat ? HEARTBEAT_MAX_TURNS : 15);
+    const effectiveMaxTurns = maxTurns ?? (isHeartbeat ? HEARTBEAT_MAX_TURNS : 30);
 
     // Determine security prompt to append to systemPrompt
     // Plan steps are user-initiated — use the interactive security prompt, not cron
@@ -1827,56 +1827,12 @@ If you're stuck after reading several files, tell ${owner} what's blocking you. 
             responseText = extracted;
           }
         }
-        if (responseText.trim().length <= 50 && toolCalls.length > 5) {
+        if (responseText.trim().length <= 50 && toolCalls.length > 3) {
           const toolNames = [...new Set(toolCalls.map(tc => tc.replace(/\(.*$/, '')))];
-          logger.warn({ sessionKey, responseLen: responseText.trim().length, toolCallCount: toolCalls.length, tools: toolNames }, 'Insufficient response after heavy tool use — firing summary follow-up');
-
-          // Follow-up query in the same session — model has context of all the tool work
-          // it just did. Low turn budget forces text response, not more tools.
-          try {
-            const [followUpText] = await this.runQuery(
-              'You ran out of turns working on a task. Based on everything you just read and did, ' +
-              'give a brief conversational summary of what you found so far. Then ask if the user ' +
-              'wants you to continue in deep mode or if they want what you have now.',
-              sessionKey, onText, model, profile, securityAnnotation,
-              5, // text-only budget
-            );
-            if (followUpText.trim().length > 50) {
-              responseText = followUpText;
-              logger.info({ sessionKey, followUpLen: followUpText.trim().length }, 'Follow-up summary generated successfully');
-            }
-          } catch (err) {
-            logger.warn({ err, sessionKey }, 'Follow-up summary query failed');
-          }
-
-          // If still insufficient after follow-up, use the static fallback
-          if (responseText.trim().length <= 50) {
-            responseText = `I worked through that but wasn't able to put together a proper response. I made ${toolCalls.length} tool calls (${toolNames.slice(0, 5).join(', ')}). Can you try asking again or narrow the request?`;
-          }
-
-          // Persist incomplete work for heartbeat pickup
-          if (sessionKey) {
-            try {
-              const incompleteFile = path.join(BASE_DIR, 'incomplete-work.json');
-              let entries: Array<{ sessionKey: string; userPrompt: string; toolCallCount: number; timestamp: string; handled: boolean }> = [];
-              try {
-                entries = JSON.parse(fs.readFileSync(incompleteFile, 'utf-8'));
-              } catch { /* file may not exist */ }
-              // Add new entry, cap at 20, expire entries older than 24h
-              const dayAgo = Date.now() - 24 * 60 * 60 * 1000;
-              entries = entries.filter(e => new Date(e.timestamp).getTime() > dayAgo && !e.handled);
-              entries.push({
-                sessionKey,
-                userPrompt: prompt.slice(0, 500),
-                toolCallCount: toolCalls.length,
-                timestamp: new Date().toISOString(),
-                handled: false,
-              });
-              if (entries.length > 20) entries = entries.slice(-20);
-              fs.writeFileSync(incompleteFile, JSON.stringify(entries, null, 2));
-            } catch (err) {
-              logger.warn({ err }, 'Failed to persist incomplete work');
-            }
+          logger.info({ sessionKey, responseLen: responseText.trim().length, toolCallCount: toolCalls.length, tools: toolNames }, 'Insufficient response after tool use — gateway will handle escalation');
+          // Hard fallback: ensure the user gets SOMETHING even if gateway doesn't escalate
+          if (responseText.trim().length <= 20) {
+            responseText = `I started working on that (${toolCalls.length} tool calls). The gateway should be continuing this in the background.`;
           }
         }
 

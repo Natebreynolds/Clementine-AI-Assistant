@@ -570,13 +570,14 @@ export class Gateway {
           }, CHAT_TIMEOUT_MS);
         };
 
-        // Wrap callbacks to reset idle timer on agent activity
+        // Wrap callbacks to reset idle timer on agent activity + count tool calls
+        let toolActivityCount = 0;
         const wrappedOnText = onText
           ? async (token: string) => { resetIdleTimer(); return onText(token); }
           : undefined;
         const wrappedOnToolActivity = onToolActivity
-          ? async (name: string, input: Record<string, unknown>) => { resetIdleTimer(); return onToolActivity(name, input); }
-          : undefined;
+          ? async (name: string, input: Record<string, unknown>) => { resetIdleTimer(); toolActivityCount++; return onToolActivity(name, input); }
+          : async (_name: string, _input: Record<string, unknown>) => { resetIdleTimer(); toolActivityCount++; };
 
         // Hard wall timer: if the SDK ignores abort (e.g. stuck in a sub-agent),
         // this resolves immediately with a timeout message so the user isn't blocked.
@@ -594,11 +595,14 @@ export class Gateway {
         });
 
         try {
+          // Phase 1: Quick try — 5 turns is enough for simple tasks.
+          // If the model burns all 5 on tools, we auto-escalate to deep mode.
+          const phase1MaxTurns = maxTurns ?? 5;
           const [response] = await Promise.race([
             this.assistant.chat(
               text,
               effectiveSessionKey,
-              { onText: wrappedOnText, onToolActivity: wrappedOnToolActivity, model: effectiveModel, maxTurns, securityAnnotation, projectOverride, profile: resolvedProfile, verboseLevel, abortController: chatAc },
+              { onText: wrappedOnText, onToolActivity: wrappedOnToolActivity, model: effectiveModel, maxTurns: phase1MaxTurns, securityAnnotation, projectOverride, profile: resolvedProfile, verboseLevel, abortController: chatAc },
             ),
             hardWallPromise,
           ]);
@@ -662,6 +666,40 @@ export class Gateway {
             });
 
             return ack || `Running in deep mode: ${taskDesc}. I'll check in as I go.`;
+          }
+
+          // ── Auto-escalation ──────────────────────────────────────────
+          // Phase 1 complete. If the model burned most of its turns on tools
+          // without a substantive response, auto-escalate to deep mode.
+          const isSubstantive = (response?.trim().length ?? 0) > 100;
+          if (!isSubstantive && toolActivityCount >= 3 && !maxTurns) {
+            logger.info({ sessionKey, toolActivityCount, responseLen: response?.trim().length ?? 0 }, 'Auto-escalating to deep mode — Phase 1 insufficient');
+
+            const currentSess = this.getSession(sessionKey);
+            const jobName = `deep-${Date.now()}`;
+            currentSess.deepTask = { jobName, taskDesc: text.slice(0, 200), startedAt: new Date().toISOString() };
+
+            this.assistant.runUnleashedTask(
+              jobName,
+              `Continue working on this task. The user asked: ${text}\n\nYou already started in a quick session and made ${toolActivityCount} tool calls. Pick up where you left off and complete the work.`,
+              2,
+              undefined,
+              undefined,
+              undefined,
+              1,
+            ).then(() => {
+              logger.info({ sessionKey, jobName }, 'Auto-escalated deep mode completed');
+            }).catch((err) => {
+              logger.error({ err, sessionKey, jobName }, 'Auto-escalated deep mode failed');
+            }).finally(() => {
+              const s = this.sessions.get(sessionKey);
+              if (s?.deepTask?.jobName === jobName) delete s.deepTask;
+            });
+
+            const ack = (response?.trim().length ?? 0) > 20
+              ? response + '\n\nThis needs more work — continuing in the background. I\'ll check in as I go.'
+              : 'This is going to take a bit of work. Running it in the background — I\'ll check in as I go.';
+            return ack;
           }
 
           return response || '*(no response)*';
