@@ -696,9 +696,14 @@ export class Gateway {
               if (s?.deepTask?.jobName === jobName) delete s.deepTask;
             });
 
-            const ack = (response?.trim().length ?? 0) > 20
-              ? response + '\n\nThis needs more work — continuing in the background. I\'ll check in as I go.'
-              : 'This is going to take a bit of work. Running it in the background — I\'ll check in as I go.';
+            // Clean ack: use Phase 1 fragment if it has content, otherwise a fresh message
+            const phase1Text = response?.trim() ?? '';
+            let ack: string;
+            if (phase1Text.length > 20) {
+              ack = `${phase1Text}\n\nThis needs more work — continuing in the background. I'll check in as I go.`;
+            } else {
+              ack = `Got it — this is going to take a bit. Working on it in the background and I'll check in as I go.`;
+            }
             return ack;
           }
 
