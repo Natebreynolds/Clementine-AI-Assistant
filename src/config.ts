@@ -120,14 +120,14 @@ export const MODELS: Models = {
 // ── Budget caps (USD per query) ──────────────────────────────────────
 
 export const BUDGET = {
-  heartbeat: 0.03,
-  cronT1: 0.10,
-  cronT2: 0.50,
-  chat: 2.00,
+  heartbeat: 0.10,
+  cronT1: 1.00,          // was 0.10 — single tool call + system prompt burns $0.40+
+  cronT2: 2.00,          // was 0.50 — tier-2 jobs use multiple tools
+  chat: 5.00,            // was 2.00 — multi-turn conversations need more room
   unleashedPhase: 5.00,
-  memoryExtraction: 0.05,
-  summarization: 0.02,
-  reflection: 0.02,
+  memoryExtraction: 0.30, // was 0.05 — extraction with context costs more
+  summarization: 0.10,    // was 0.02
+  reflection: 0.50,       // was 0.02 — skill extraction was hitting $0.50+
 } as const;
 
 export const DEFAULT_MODEL_TIER = (getEnv('DEFAULT_MODEL_TIER', 'sonnet')) as keyof Models;

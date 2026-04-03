@@ -64,6 +64,7 @@ export interface AgentCreateConfig {
   allowedTools?: string[];
   allowedUsers?: string[];           // Discord/Slack user IDs that can interact with this agent
   project?: string;
+  projects?: string[];
   discordToken?: string;           // Dedicated Discord bot token
   discordChannelId?: string;       // Channel ID for bot to listen in
   slackBotToken?: string;          // Slack bot token (xoxb-...)
@@ -237,6 +238,7 @@ export class AgentManager {
       avatar: meta.avatar ? String(meta.avatar) : undefined,
       team,
       project: meta.project ? String(meta.project) : undefined,
+      projects: Array.isArray(meta.projects) ? meta.projects.map(String) : undefined,
       agentDir: path.dirname(filePath),
       discordToken,
       discordChannelId: meta.discordChannelId ? String(meta.discordChannelId) : undefined,
