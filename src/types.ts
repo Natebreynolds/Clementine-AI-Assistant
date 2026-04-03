@@ -238,6 +238,12 @@ export interface CronJobDefinition {
   preCheck?: string;               // Shell command gate — exit 0 = run, non-zero = skip. Stdout injected as context.
 }
 
+export type TerminalReason =
+  | 'blocking_limit' | 'rapid_refill_breaker' | 'prompt_too_long'
+  | 'image_error' | 'model_error' | 'aborted_streaming' | 'aborted_tools'
+  | 'stop_hook_prevented' | 'hook_stopped' | 'tool_deferred'
+  | 'max_turns' | 'completed';
+
 export interface CronRunEntry {
   jobName: string;
   startedAt: string;
@@ -246,6 +252,7 @@ export interface CronRunEntry {
   durationMs: number;
   error?: string;
   errorType?: 'transient' | 'permanent';
+  terminalReason?: TerminalReason;  // precise SDK-reported reason for query termination
   attempt: number;
   outputPreview?: string;
   deliveryFailed?: boolean;

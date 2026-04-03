@@ -132,13 +132,27 @@ function checkTurnLimitHits(
   job: CronJobDefinition,
   advice: ExecutionAdvice,
 ): void {
-  // Look for runs where the error mentions "turn" or the duration is suspiciously
-  // close to what a turn-limited run looks like (error status with long duration)
+  // Use precise TerminalReason when available, fall back to regex on error text
   const turnLimitHits = runs.slice(0, 5).filter(r => {
     if (r.status !== 'error' && r.status !== 'retried') return false;
+    // Precise check via SDK TerminalReason
+    if (r.terminalReason === 'max_turns') return true;
+    // Fallback: regex on error text
     const errorLower = (r.error ?? '').toLowerCase();
     return errorLower.includes('turn') || errorLower.includes('max_turns') || errorLower.includes('maxturns');
   });
+
+  // Check for prompt_too_long — this needs a DIFFERENT fix (not more turns)
+  const promptTooLong = runs.slice(0, 5).filter(r =>
+    r.terminalReason === 'prompt_too_long'
+  );
+  if (promptTooLong.length >= 1) {
+    // Don't increase turns — the prompt itself is the problem
+    advice.promptEnrichment = (advice.promptEnrichment || '') +
+      '\n\n⚠ Previous runs hit prompt length limits. Be concise. Minimize system prompt injection.';
+    logger.debug({ job: job.name, hits: promptTooLong.length }, 'Prompt too long detected — adding conciseness guidance');
+    return; // skip turn adjustment
+  }
 
   if (turnLimitHits.length >= 2) {
     const currentMax = job.maxTurns ?? 5;
@@ -180,6 +194,15 @@ function checkModelUpgrade(
 ): void {
   if (!job.model || !job.model.toLowerCase().includes('haiku')) return;
 
+  // Precise: model_error from SDK means the model itself is the problem
+  const modelErrors = runs.slice(0, 5).filter(r => r.terminalReason === 'model_error');
+  if (modelErrors.length >= 1) {
+    advice.adjustedModel = 'sonnet';
+    logger.debug({ job: job.name, modelErrors: modelErrors.length }, 'Upgrading model — SDK reported model_error');
+    return;
+  }
+
+  // Fallback: generic failure count
   const recentFailures = runs.slice(0, 5).filter(r => r.status === 'error');
   if (recentFailures.length >= 3) {
     advice.adjustedModel = 'sonnet';
