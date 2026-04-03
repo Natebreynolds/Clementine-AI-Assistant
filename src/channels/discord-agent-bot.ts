@@ -311,11 +311,35 @@ export class AgentBotClient {
   }
 
   /**
-   * Send a notification to the owner's DMs on behalf of this agent bot.
-   * Used by BotManager.sendAsAgent() for cron result routing.
+   * Send a notification on behalf of this agent bot.
+   * Routes to the agent's own channel first (cron outputs stay in the agent's workspace).
+   * Falls back to owner DMs if no channel is configured.
    */
   async sendNotification(text: string, embed?: EmbedBuilder): Promise<void> {
     if (this.status !== 'online') throw new Error(`Bot ${this.config.slug} is not online`);
+
+    // Prefer the agent's own channel — keeps cron outputs in the agent's workspace
+    const agentChannelId = this.resolvedChannelIds[0];
+    if (agentChannelId) {
+      try {
+        const channel = await this.client.channels.fetch(agentChannelId);
+        if (channel && 'send' in channel) {
+          if (embed) {
+            await (channel as any).send({ embeds: [embed] });
+          } else {
+            const { chunkText } = await import('./discord-utils.js');
+            for (const chunk of chunkText(text, 1900)) {
+              await (channel as any).send(chunk);
+            }
+          }
+          return;
+        }
+      } catch (err) {
+        logger.warn({ err, slug: this.config.slug, channelId: agentChannelId }, 'Agent channel send failed — falling back to owner DM');
+      }
+    }
+
+    // Fallback: owner DMs
     const owner = await this.client.users.fetch(this.config.ownerId, { force: true });
     const dmChannel = await owner.createDM();
 
