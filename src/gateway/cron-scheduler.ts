@@ -458,12 +458,12 @@ export class CronScheduler {
       this.dispatcher.send(`Still working on it — ${cleanOutput}`, { agentSlug: slug }).catch(() => {});
     });
 
-    // Wire up real-time progress summaries (throttled to max 1/minute)
+    // Wire up real-time progress summaries (throttled to max 1 per 5 minutes)
     const lastProgressSent = new Map<string, number>();
     this.gateway.setPhaseProgressCallback((jobName, _phase, summary) => {
       const now = Date.now();
       const lastSent = lastProgressSent.get(jobName) ?? 0;
-      if (now - lastSent < 60_000) return; // throttle: 1 per minute
+      if (now - lastSent < 300_000) return; // throttle: 1 per 5 minutes
       lastProgressSent.set(jobName, now);
       const slug = jobName.includes(':') ? jobName.split(':')[0] : undefined;
       this.dispatcher.send(summary.slice(0, 300), { agentSlug: slug }).catch(() => {});

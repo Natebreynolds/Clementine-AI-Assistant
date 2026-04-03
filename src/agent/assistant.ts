@@ -3128,11 +3128,15 @@ If you're stuck after reading several files, tell ${owner} what's blocking you. 
       let phaseSessionId = '';
       let phaseToolCount = 0;
 
-      // Periodic progress beacon — sends a status update every 2 minutes
-      // so the user knows the task is still alive during long phases
-      const BEACON_INTERVAL_MS = 2 * 60 * 1000;
+      // Periodic progress beacon — sends a status update every 5 minutes
+      // so the user knows the task is still alive during long phases.
+      // Capped at 3 messages per phase to prevent notification spam.
+      const BEACON_INTERVAL_MS = 5 * 60 * 1000;
+      const MAX_BEACONS_PER_PHASE = 3;
+      let beaconCount = 0;
       const beaconTimer = setInterval(() => {
-        if (this.onPhaseProgress) {
+        if (this.onPhaseProgress && beaconCount < MAX_BEACONS_PER_PHASE) {
+          beaconCount++;
           const elapsed = Math.round((Date.now() - phaseStart) / 1000);
           try {
             this.onPhaseProgress(jobName, phase, `Still working — phase ${phase}, ${phaseToolCount} tool calls, ${elapsed}s elapsed`);
