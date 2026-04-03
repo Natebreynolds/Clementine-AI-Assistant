@@ -14,6 +14,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import {
   query,
+  listSubagents,
+  getSubagentMessages,
   type Options as SDKOptions,
   type SDKAssistantMessage,
   type SDKResultMessage,
@@ -483,6 +485,8 @@ export class PersonalAssistant {
   private onPhaseProgress: ((jobName: string, phase: number, summary: string) => void) | null = null;
   private _lastMcpStatus: Array<{ name: string; status: string }> = [];
   private _lastMcpStatusTime: string = '';
+  /** Terminal reason from the last SDK query — consumed by cron scheduler for precise error classification. */
+  private _lastTerminalReason?: string;
   /** Per-session stall nudge — set after a query shows stall signals, consumed on the next query. */
   private stallNudges = new Map<string, string>();
   /** Hot correction buffer — explicit behavioral corrections applied before nightly SI. */
@@ -1163,11 +1167,16 @@ If you're stuck after reading several files, tell ${owner} what's blocking you. 
       }
     } catch { /* non-fatal — run with just Clementine's own server */ }
 
+    // Permission mode: 'auto' for autonomous tier-2+ work (model classifier + canUseTool safety net),
+    // 'bypassPermissions' for interactive chat (user is watching) and low-tier tasks.
+    const useAutoPermissions = isCron && (cronTier ?? 0) >= 2 || isUnleashed;
+    const effectivePermissionMode = useAutoPermissions ? 'auto' : 'bypassPermissions';
+
     return {
       systemPrompt: fullSystemPrompt,
       model: resolvedModel,
       ...(fallback ? { fallbackModel: fallback } : {}),
-      permissionMode: 'bypassPermissions',
+      permissionMode: effectivePermissionMode as 'bypassPermissions' | 'auto',
       allowDangerouslySkipPermissions: true,
       tools: disableAllTools ? [] : allowedTools,
       disallowedTools: disallowed,
@@ -1781,6 +1790,7 @@ If you're stuck after reading several files, tell ${owner} what's blocking you. 
             } else if (message.type === 'result') {
               const result = message as SDKResultMessage;
               sessionId = result.session_id;
+              this._lastTerminalReason = (result as any).terminal_reason ?? undefined;
               this.logQueryResult(result, 'chat', sessionKey ?? 'unknown');
               if (result.is_error) {
                 // Error subtypes have `errors` array; success subtype has `result` string
@@ -2785,6 +2795,8 @@ If you're stuck after reading several files, tell ${owner} what's blocking you. 
             }
           } else if (message.type === 'result') {
             const result = message as SDKResultMessage;
+            // Capture terminal reason for execution advisor
+            this._lastTerminalReason = (result as any).terminal_reason ?? undefined;
             // Detect budget exceeded — treat as permanent error so cron doesn't retry
             if (result.is_error && 'result' in result) {
               const exitText = String((result as any).result ?? '');
@@ -3141,6 +3153,8 @@ If you're stuck after reading several files, tell ${owner} what's blocking you. 
           } else if (message.type === 'result') {
             const result = message as SDKResultMessage;
             phaseSessionId = result.session_id;
+            // Capture terminal reason for execution advisor
+            this._lastTerminalReason = (result as any).terminal_reason ?? undefined;
             this.logQueryResult(result, 'unleashed', `unleashed:${jobName}`, jobName);
             // Detect budget exceeded
             if (result.is_error && 'result' in result) {
@@ -3487,6 +3501,38 @@ If you're stuck after reading several files, tell ${owner} what's blocking you. 
   /** Expose memory store for direct operations (consolidation, etc.). */
   getMemoryStore(): any {
     return this.memoryStore;
+  }
+
+  /** Get the terminal reason from the last SDK query (consumed after read). */
+  consumeLastTerminalReason(): string | undefined {
+    const reason = this._lastTerminalReason;
+    this._lastTerminalReason = undefined;
+    return reason;
+  }
+
+  /**
+   * List subagent IDs for a given session.
+   * Uses the new SDK listSubagents() API for cross-agent introspection.
+   */
+  async getSubagentList(sessionId: string): Promise<string[]> {
+    try {
+      return await listSubagents(sessionId, { dir: BASE_DIR });
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * Get conversation messages from a subagent's transcript.
+   * Enables cross-agent learning — feed into memory extraction.
+   */
+  async getSubagentHistory(sessionId: string, agentId: string, limit = 20): Promise<Array<{ type: string; content: string }>> {
+    try {
+      const messages = await getSubagentMessages(sessionId, agentId, { dir: BASE_DIR, limit });
+      return messages.map(m => ({ type: m.type, content: String((m as any).message ?? '') }));
+    } catch {
+      return [];
+    }
   }
 
   clearSession(sessionKey: string): void {

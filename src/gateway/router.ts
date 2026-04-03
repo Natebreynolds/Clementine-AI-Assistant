@@ -976,6 +976,14 @@ export class Gateway {
     return this.assistant.getMemoryStore();
   }
 
+  /**
+   * Get and consume the terminal reason from the last SDK query.
+   * Used by the cron scheduler for precise error classification.
+   */
+  consumeLastTerminalReason(): string | undefined {
+    return this.assistant.consumeLastTerminalReason();
+  }
+
   // ── Approval system ─────────────────────────────────────────────────
 
   async requestApproval(descriptionOrId: string, explicitId?: string): Promise<boolean | string> {

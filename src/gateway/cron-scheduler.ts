@@ -251,6 +251,38 @@ export function classifyError(err: unknown): 'transient' | 'permanent' {
   return TRANSIENT_PATTERNS.some((re) => re.test(msg)) ? 'transient' : 'permanent';
 }
 
+/**
+ * Classify a TerminalReason from the SDK into a retry strategy.
+ * More precise than classifyError() which relies on regex.
+ */
+export function classifyTerminalReason(reason: string): 'transient' | 'permanent' {
+  switch (reason) {
+    // Retryable — infrastructure / rate limits
+    case 'blocking_limit':
+    case 'rapid_refill_breaker':
+    case 'aborted_streaming':
+      return 'transient';
+
+    // Permanent — the advisor or human needs to intervene
+    case 'max_turns':           // advisor should increase turns
+    case 'prompt_too_long':     // advisor should shorten prompt
+    case 'model_error':         // advisor should upgrade model
+    case 'hook_stopped':        // security blocked it
+    case 'stop_hook_prevented': // hook intervention
+    case 'image_error':         // bad input
+    case 'aborted_tools':       // timeout or user abort
+    case 'tool_deferred':       // tool was deferred
+      return 'permanent';
+
+    // Success
+    case 'completed':
+      return 'transient'; // won't actually be in error path, but safe default
+
+    default:
+      return 'permanent';
+  }
+}
+
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -827,6 +859,7 @@ export class CronScheduler {
 
           // Success — log and dispatch
           const finishedAt = new Date();
+          const terminalReason = this.gateway.consumeLastTerminalReason() as CronRunEntry['terminalReason'];
           const entry: CronRunEntry = {
             jobName: job.name,
             startedAt: startedAt.toISOString(),
@@ -836,6 +869,7 @@ export class CronScheduler {
             attempt,
             outputPreview: response ? response.slice(0, 200) : undefined,
             advisorApplied,
+            terminalReason,
           };
 
           if (response && !CronScheduler.isCronNoise(response) && job.mode !== 'unleashed') {
@@ -888,7 +922,10 @@ export class CronScheduler {
           return; // done
         } catch (err) {
           const finishedAt = new Date();
-          const errorType = classifyError(err);
+          const errTerminalReason = this.gateway.consumeLastTerminalReason() as CronRunEntry['terminalReason'];
+          const errorType = errTerminalReason
+            ? classifyTerminalReason(errTerminalReason)
+            : classifyError(err);
 
           this.runLog.append({
             jobName: job.name,
@@ -898,6 +935,7 @@ export class CronScheduler {
             durationMs: finishedAt.getTime() - startedAt.getTime(),
             error: String(err).slice(0, 1500),
             errorType,
+            terminalReason: errTerminalReason,
             attempt,
             advisorApplied,
           });
