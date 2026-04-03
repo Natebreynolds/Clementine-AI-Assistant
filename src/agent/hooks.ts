@@ -396,11 +396,12 @@ export async function enforceToolPermissions(
       return { behavior: 'allow' };
     }
 
-    // Default path: block autonomous sends for agents without sendPolicy
-    if (heartbeatActive) {
+    // Default path: block autonomous sends for agents without sendPolicy.
+    // Cron jobs and heartbeats should return output as response text, not post to channels.
+    if (heartbeatActive || effectiveSource === 'autonomous') {
       return {
         behavior: 'deny',
-        message: 'Sending messages is forbidden during autonomous execution. Configure a sendPolicy on the agent profile to enable autonomous sending.',
+        message: 'Sending to Discord channels is blocked during autonomous/cron execution. Return your output as response text instead — it gets delivered to the owner automatically.',
       };
     }
 
