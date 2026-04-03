@@ -3052,6 +3052,19 @@ If you're stuck after reading several files, tell ${owner} what's blocking you. 
 
       let phaseOutput = '';
       let phaseSessionId = '';
+      let phaseToolCount = 0;
+
+      // Periodic progress beacon — sends a status update every 2 minutes
+      // so the user knows the task is still alive during long phases
+      const BEACON_INTERVAL_MS = 2 * 60 * 1000;
+      const beaconTimer = setInterval(() => {
+        if (this.onPhaseProgress) {
+          const elapsed = Math.round((Date.now() - phaseStart) / 1000);
+          try {
+            this.onPhaseProgress(jobName, phase, `Still working — phase ${phase}, ${phaseToolCount} tool calls, ${elapsed}s elapsed`);
+          } catch { /* non-fatal */ }
+        }
+      }, BEACON_INTERVAL_MS);
 
       // Per-phase timeout: abort if overall deadline is reached during a phase.
       // Without this, a stuck SDK query hangs the entire unleashed task indefinitely
@@ -3076,6 +3089,7 @@ If you're stuck after reading several files, tell ${owner} what's blocking you. 
               } else if (block.type === 'tool_use' && block.name) {
                 logToolUse(block.name, (block.input ?? {}) as Record<string, unknown>);
                 phaseGuard.recordToolCall(block.name, (block.input ?? {}) as Record<string, unknown>);
+                phaseToolCount++;
               }
             }
           } else if (message.type === 'result') {
@@ -3100,8 +3114,10 @@ If you're stuck after reading several files, tell ${owner} what's blocking you. 
             // Init / streaming messages — no action needed
           }
         }
+        clearInterval(beaconTimer);
       } catch (err) {
         clearTimeout(phaseTimer);
+        clearInterval(beaconTimer);
         logger.error({ err, jobName, phase }, `Unleashed task phase ${phase} error`);
         appendProgress({ event: 'phase_error', phase, error: String(err) });
         consecutiveErrors++;
