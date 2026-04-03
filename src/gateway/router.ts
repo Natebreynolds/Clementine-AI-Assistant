@@ -968,6 +968,14 @@ export class Gateway {
     return this.assistant.searchMemory(query, limit);
   }
 
+  /**
+   * Get the memory store instance for direct operations (consolidation, etc.).
+   * Returns null if the store hasn't been initialized yet.
+   */
+  getMemoryStore(): any {
+    return this.assistant.getMemoryStore();
+  }
+
   // ── Approval system ─────────────────────────────────────────────────
 
   async requestApproval(descriptionOrId: string, explicitId?: string): Promise<boolean | string> {

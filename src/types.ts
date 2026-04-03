@@ -10,7 +10,7 @@ export interface SearchResult {
   content: string;
   score: float;
   chunkType: string;
-  matchType: 'fts' | 'recency' | 'timeline';
+  matchType: 'fts' | 'recency' | 'timeline' | 'vector';
   lastUpdated: string;
   chunkId: number;
   salience: number;
@@ -191,6 +191,14 @@ export interface HeartbeatState {
   lastSelfImproveDate?: string;
   lastConsolidationDate?: string;
   lastAgentSiRuns?: Record<string, string>;
+  /** Proactive insight engine state */
+  insightState?: {
+    sentToday: string[];
+    lastSentAt?: string;
+    unackedCount: number;
+    cooldownMultiplier: number;
+    currentDate?: string;
+  };
 }
 
 export interface HeartbeatWorkItem {
@@ -575,6 +583,18 @@ export interface PersistentGoal {
   blockers?: string[];
   reviewFrequency: 'daily' | 'weekly' | 'on-demand';
   linkedCronJobs?: string[];  // cron jobs that contribute to this goal
+  autoSchedule?: boolean;     // if true, daily planner can create/adjust cron jobs for this goal
+}
+
+export interface GoalProgressEntry {
+  timestamp: string;
+  goalId: string;
+  focus: string;
+  source: string;
+  madeProgress: boolean;
+  newProgressNotes: number;
+  resultSnippet: string;
+  status: 'progress' | 'no-change' | 'error';
 }
 
 // ── Cron Progress Continuity ────────────────────────────────────────

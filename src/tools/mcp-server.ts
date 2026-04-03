@@ -5091,8 +5091,9 @@ server.tool(
     nextActions: z.array(z.string()).optional().describe('Initial next actions to take'),
     reviewFrequency: z.enum(['daily', 'weekly', 'on-demand']).optional().describe('How often to review (default: "weekly")'),
     linkedCronJobs: z.array(z.string()).optional().describe('Cron job names that contribute to this goal'),
+    autoSchedule: z.boolean().optional().describe('Allow the daily planner to auto-create/adjust cron jobs for this goal (default: false)'),
   },
-  async ({ title, description, owner, priority, targetDate, nextActions, reviewFrequency, linkedCronJobs }) => {
+  async ({ title, description, owner, priority, targetDate, nextActions, reviewFrequency, linkedCronJobs, autoSchedule }) => {
     ensureGoalsDir();
     const id = randomBytes(4).toString('hex');
     const now = new Date().toISOString();
@@ -5111,6 +5112,7 @@ server.tool(
       blockers: [],
       reviewFrequency: reviewFrequency || 'weekly',
       linkedCronJobs: linkedCronJobs || [],
+      ...(autoSchedule ? { autoSchedule } : {}),
     };
     writeFileSync(path.join(GOALS_DIR, `${id}.json`), JSON.stringify(goal, null, 2));
     logger.info({ goalId: id, title }, 'Goal created');
@@ -5129,8 +5131,9 @@ server.tool(
     blockers: z.array(z.string()).optional().describe('Replace blockers list'),
     linkedCronJobs: z.array(z.string()).optional().describe('Replace linked cron jobs'),
     priority: z.enum(['high', 'medium', 'low']).optional().describe('Change priority'),
+    autoSchedule: z.boolean().optional().describe('Allow the daily planner to auto-create/adjust cron jobs for this goal'),
   },
-  async ({ id, status, progressNote, nextActions, blockers, linkedCronJobs, priority }) => {
+  async ({ id, status, progressNote, nextActions, blockers, linkedCronJobs, priority, autoSchedule }) => {
     const filePath = path.join(GOALS_DIR, `${id}.json`);
     if (!existsSync(filePath)) {
       return textResult(`Goal not found: ${id}`);
@@ -5142,6 +5145,7 @@ server.tool(
     if (blockers) goal.blockers = blockers;
     if (linkedCronJobs) goal.linkedCronJobs = linkedCronJobs;
     if (priority) goal.priority = priority;
+    if (autoSchedule !== undefined) goal.autoSchedule = autoSchedule;
     goal.updatedAt = new Date().toISOString();
     writeFileSync(filePath, JSON.stringify(goal, null, 2));
     logger.info({ goalId: id, status: goal.status }, 'Goal updated');

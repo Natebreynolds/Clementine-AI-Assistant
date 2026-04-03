@@ -72,6 +72,7 @@ import { extractLinks } from './link-extractor.js';
 import { StallGuard } from './stall-guard.js';
 import { formatResultsForPrompt } from '../memory/search.js';
 import { PromptCache } from './prompt-cache.js';
+import { searchSkills as searchSkillsSync } from './skill-extractor.js';
 
 // ── Token estimation & context window guard ─────────────────────────
 
@@ -484,6 +485,8 @@ export class PersonalAssistant {
   private _lastMcpStatusTime: string = '';
   /** Per-session stall nudge — set after a query shows stall signals, consumed on the next query. */
   private stallNudges = new Map<string, string>();
+  /** Hot correction buffer — explicit behavioral corrections applied before nightly SI. */
+  private hotCorrections: Array<{ correction: string; category: string; timestamp: string }> = [];
 
   constructor() {
     this.profileManager = new AgentManager(AGENTS_DIR, PROFILES_DIR);
@@ -842,6 +845,27 @@ Never spawn a sub-agent with vague instructions like "handle this brief" — tel
 
     if (profile) {
       parts.push(`You are currently operating as **${profile.name}** (${profile.description}).`);
+    }
+
+    // Inject hot corrections (explicit behavioral corrections from recent sessions)
+    if (this.hotCorrections.length > 0) {
+      const recentCutoff = Date.now() - 24 * 60 * 60 * 1000; // last 24 hours
+      const recent = this.hotCorrections.filter(c => new Date(c.timestamp).getTime() > recentCutoff);
+      if (recent.length > 0) {
+        const lines = recent.map(c => `- [${c.category}] ${c.correction}`);
+        parts.push(`## Recent Corrections (apply immediately)\n\n${lines.join('\n')}`);
+      }
+    }
+
+    // Proactive skill injection: match user message against skill triggers
+    if (this._lastUserMessage && !isAutonomous) {
+      try {
+        const matchedSkills = searchSkillsSync(this._lastUserMessage, 1);
+        if (matchedSkills.length > 0 && matchedSkills[0].score >= 4) {
+          const skill = matchedSkills[0];
+          parts.push(`## Relevant Skill: ${skill.title}\n\n${skill.content.slice(0, 800)}`);
+        }
+      } catch { /* non-fatal — skills dir may not exist */ }
     }
 
     // Skip communication preferences and agentic instructions for autonomous runs
@@ -2101,6 +2125,19 @@ If you're stuck after reading several files, tell ${owner} what's blocking you. 
                   rating: 'negative',
                   comment: `[${bc.category}] ${bc.correction} (${bc.strength})`,
                 });
+
+                // Push explicit corrections to hot buffer for immediate prompt injection
+                if (bc.strength === 'explicit') {
+                  this.hotCorrections.push({
+                    correction: bc.correction,
+                    category: bc.category,
+                    timestamp: new Date().toISOString(),
+                  });
+                  // Ring buffer: keep most recent 10
+                  if (this.hotCorrections.length > 10) {
+                    this.hotCorrections = this.hotCorrections.slice(-10);
+                  }
+                }
               }
 
               // Log each preference learned as positive feedback
@@ -3445,6 +3482,11 @@ If you're stuck after reading several files, tell ${owner} what's blocking you. 
     } catch {
       return [];
     }
+  }
+
+  /** Expose memory store for direct operations (consolidation, etc.). */
+  getMemoryStore(): any {
+    return this.memoryStore;
   }
 
   clearSession(sessionKey: string): void {
