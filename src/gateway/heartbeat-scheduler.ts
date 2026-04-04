@@ -31,7 +31,6 @@ import {
   HEARTBEAT_WORK_QUEUE_FILE,
 } from '../config.js';
 import type { HeartbeatState, HeartbeatReportedTopic, HeartbeatWorkItem } from '../types.js';
-import type { CronRunEntry } from '../types.js';
 import type { CronScheduler } from './cron-scheduler.js';
 import {
   gatherInsightSignals,
@@ -45,7 +44,7 @@ import {
 } from '../agent/insight-engine.js';
 import type { NotificationDispatcher } from './notifications.js';
 import type { Gateway } from './router.js';
-import { logToDailyNote, CronRunLog, todayISO } from './cron-scheduler.js';
+import { logToDailyNote, todayISO } from './cron-scheduler.js';
 
 const logger = pino({ name: 'clementine.heartbeat' });
 
@@ -322,7 +321,7 @@ export class HeartbeatScheduler {
                   writeFileSync(triggerPath, JSON.stringify({
                     goalId: item.id,
                     focus: item.action,
-                    maxTurns: 10,
+                    maxTurns: 30,
                     triggeredAt: new Date().toISOString(),
                     source: 'daily-plan',
                   }, null, 2));
@@ -1023,7 +1022,7 @@ export class HeartbeatScheduler {
         const trigger = {
           goalId: goal.id,
           focus,
-          maxTurns: 10,
+          maxTurns: 30,
           triggeredAt: new Date().toISOString(),
           source: 'heartbeat-advance',
           reason,
@@ -1034,51 +1033,9 @@ export class HeartbeatScheduler {
         logger.info({ goalId: goal.id, title: goal.title, score: toAdvance[0].score, reason, focus }, 'Advancing goal via trigger');
       }
 
-      // Goal-driven task generation: find goals with nextActions but no matching tasks
-      try {
-        const tasksContent = existsSync(TASKS_FILE) ? readFileSync(TASKS_FILE, 'utf-8') : '';
-
-        for (const { goal: g } of scoredGoals.slice(0, 3)) {
-          if (!g.nextActions?.length) continue;
-
-          const hasMatchingTask = g.nextActions.some((action: string) =>
-            tasksContent.toLowerCase().includes(action.toLowerCase().slice(0, 30))
-          );
-          if (hasMatchingTask) continue;
-
-          const taskTriggerPath = path.join(goalTriggerDir, `${g.id}-tasks.trigger.json`);
-          if (!existsSync(taskTriggerPath)) {
-            writeFileSync(taskTriggerPath, JSON.stringify({
-              goalId: g.id,
-              focus: `Create tasks for goal "${g.title}": ${g.nextActions.slice(0, 3).join('; ')}`,
-              maxTurns: 5,
-              triggeredAt: new Date().toISOString(),
-              source: 'goal-task-gen',
-            }, null, 2));
-            logger.info({ goalId: g.id }, 'Generated task trigger for goal with untracked nextActions');
-          }
-        }
-
-        // Check goals with linked crons but no recent progress
-        for (const { goal: g } of scoredGoals) {
-          if (!g.linkedCronJobs?.length) continue;
-
-          const recentProgress = g.progressNotes?.length > 0;
-          if (recentProgress) continue;
-
-          const runLog = new CronRunLog();
-          const allFailing = g.linkedCronJobs.every((cronName: string) => {
-            const recent = runLog.readRecent(cronName, 3);
-            return recent.length > 0 && recent.every((r: CronRunEntry) => r.status !== 'ok');
-          });
-
-          if (allFailing) {
-            logger.info({ goalId: g.id, crons: g.linkedCronJobs }, 'Goal has failing linked crons — needs attention');
-          }
-        }
-      } catch (err) {
-        logger.debug({ err }, 'Goal-driven task generation failed (non-fatal)');
-      }
+      // Note: task generation removed — the main goal trigger already includes
+      // nextActions[0] as focus, so a separate task-gen trigger was redundant
+      // and doubled every goal work attempt.
     } catch (err) {
       logger.warn({ err }, 'Failed to advance goals');
     }
