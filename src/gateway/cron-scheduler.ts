@@ -1426,7 +1426,7 @@ export class CronScheduler {
     }
   }
 
-  /** Process any pending goal work trigger files. */
+  /** Process any pending goal work trigger files. Routes through the execution advisor. */
   private processGoalTriggers(): void {
     if (!existsSync(this.goalTriggerDir)) return;
     let files: string[];
@@ -1473,23 +1473,75 @@ export class CronScheduler {
         const jobName = `goal:${goal.title.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 40)}`;
         const goalSnapshotUpdatedAt = goal.updatedAt;
         const goalSnapshotNotes = goal.progressNotes?.length ?? 0;
-        this.gateway.handleCronJob(
-          jobName,
-          prompt,
-          2, // tier 2 — logged
-          trigger.maxTurns ?? 15,
-        ).then((result) => {
-          if (result && !CronScheduler.isCronNoise(result)) {
-            this.dispatcher.send(`🎯 **Goal work: ${goal.title}**\n\n${result.slice(0, 1500)}`).catch(() => {});
-          }
-          logToDailyNote(`**Goal work: ${goal.title}** — ${(result || 'completed').slice(0, 100).replace(/\n/g, ' ')}`);
 
-          // ── Outcome attribution: log whether the session made progress ──
-          this.logGoalOutcome(trigger.goalId, goalPath, goalSnapshotUpdatedAt, goalSnapshotNotes, trigger.focus, trigger.source, result);
+        // ── Route through execution advisor (same path as regular cron jobs) ──
+        // Creates a synthetic CronJobDefinition so the advisor can apply circuit
+        // breakers, turn-limit adjustments, model upgrades, and unleashed escalation.
+        const syntheticJob: CronJobDefinition = {
+          name: jobName,
+          schedule: '',
+          prompt,
+          enabled: true,
+          tier: 2,
+          maxTurns: trigger.maxTurns ?? 15,
+          mode: 'standard',
+        };
+
+        import('../agent/execution-advisor.js').then(({ getExecutionAdvice }) => {
+          const advice = getExecutionAdvice(jobName, syntheticJob);
+
+          if (advice.shouldSkip) {
+            logger.info({ goalId: trigger.goalId, reason: advice.skipReason }, 'Goal work skipped by advisor (circuit breaker)');
+            this.logGoalOutcome(trigger.goalId, goalPath, goalSnapshotUpdatedAt, goalSnapshotNotes, trigger.focus, trigger.source, null, `Skipped: ${advice.skipReason}`);
+            return;
+          }
+
+          const effectiveMaxTurns = advice.adjustedMaxTurns ?? syntheticJob.maxTurns ?? 15;
+          const effectiveModel = advice.adjustedModel ?? undefined;
+          const useUnleashed = advice.shouldEscalate;
+          const enrichedPrompt = advice.promptEnrichment ? `${prompt}\n\n${advice.promptEnrichment}` : prompt;
+
+          logger.info({
+            goalId: trigger.goalId,
+            title: goal.title,
+            maxTurns: effectiveMaxTurns,
+            model: effectiveModel,
+            unleashed: useUnleashed,
+            enriched: !!advice.promptEnrichment,
+          }, 'Goal work: advisor applied');
+
+          this.gateway.handleCronJob(
+            jobName,
+            enrichedPrompt,
+            2,
+            effectiveMaxTurns,
+            effectiveModel,
+            undefined, // workDir
+            useUnleashed ? 'unleashed' : undefined,
+            useUnleashed ? 1 : undefined, // 1 hour max for unleashed goal work
+          ).then((result) => {
+            if (result && !CronScheduler.isCronNoise(result)) {
+              this.dispatcher.send(`🎯 **Goal work: ${goal.title}**\n\n${result.slice(0, 1500)}`).catch(() => {});
+            }
+            logToDailyNote(`**Goal work: ${goal.title}** — ${(result || 'completed').slice(0, 100).replace(/\n/g, ' ')}`);
+            this.logGoalOutcome(trigger.goalId, goalPath, goalSnapshotUpdatedAt, goalSnapshotNotes, trigger.focus, trigger.source, result);
+          }).catch((err) => {
+            logger.error({ err, goalId: trigger.goalId }, 'Goal work session failed');
+            this.logGoalOutcome(trigger.goalId, goalPath, goalSnapshotUpdatedAt, goalSnapshotNotes, trigger.focus, trigger.source, null, String(err));
+          });
         }).catch((err) => {
-          logger.error({ err, goalId: trigger.goalId }, 'Goal work session failed');
-          // Log failure outcome
-          this.logGoalOutcome(trigger.goalId, goalPath, goalSnapshotUpdatedAt, goalSnapshotNotes, trigger.focus, trigger.source, null, String(err));
+          // Advisor import failed — fall back to basic execution
+          logger.warn({ err, goalId: trigger.goalId }, 'Advisor unavailable — running goal work with defaults');
+          this.gateway.handleCronJob(jobName, prompt, 2, trigger.maxTurns ?? 15).then((result) => {
+            if (result && !CronScheduler.isCronNoise(result)) {
+              this.dispatcher.send(`🎯 **Goal work: ${goal.title}**\n\n${result.slice(0, 1500)}`).catch(() => {});
+            }
+            logToDailyNote(`**Goal work: ${goal.title}** — ${(result || 'completed').slice(0, 100).replace(/\n/g, ' ')}`);
+            this.logGoalOutcome(trigger.goalId, goalPath, goalSnapshotUpdatedAt, goalSnapshotNotes, trigger.focus, trigger.source, result);
+          }).catch((goalErr) => {
+            logger.error({ err: goalErr, goalId: trigger.goalId }, 'Goal work session failed');
+            this.logGoalOutcome(trigger.goalId, goalPath, goalSnapshotUpdatedAt, goalSnapshotNotes, trigger.focus, trigger.source, null, String(goalErr));
+          });
         });
       } catch (err) {
         logger.warn({ err, file }, 'Failed to process goal trigger file');
