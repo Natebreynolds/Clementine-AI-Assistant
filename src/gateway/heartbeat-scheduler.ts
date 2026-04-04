@@ -939,13 +939,11 @@ export class HeartbeatScheduler {
       const now = Date.now();
       const DAY_MS = 86_400_000;
 
-      // Load recent goal outcomes for intelligent throttling:
-      // - Failed goals: 2hr cooldown before retrying
-      // - Stale progress: if last 2 runs produced similar output, back off to 4hr
-      //   (the goal has nothing new to do — nagging the user adds no value)
+      // Load recent goal outcomes for disposition-based throttling.
+      // The agent classifies each outcome (ADVANCED, BLOCKED_ON_USER, etc.)
+      // and we use that to decide when/whether to retry.
       const goalCooldowns = new Set<string>();
-      const FAILURE_COOLDOWN_MS = 2 * 60 * 60 * 1000;
-      const STALE_COOLDOWN_MS = 4 * 60 * 60 * 1000;
+      const HOUR_MS = 60 * 60 * 1000;
       try {
         const progressDir = path.join(GOALS_DIR, 'progress');
         if (existsSync(progressDir)) {
@@ -957,31 +955,35 @@ export class HeartbeatScheduler {
             const goalId = recent[0].goalId;
             const lastEntry = recent[recent.length - 1];
             const lastAge = now - new Date(lastEntry.timestamp).getTime();
+            const disposition = lastEntry.disposition ?? lastEntry.status;
 
-            // Cooldown after failures
-            if ((lastEntry.status === 'error' || lastEntry.status === 'no-change') && lastAge < FAILURE_COOLDOWN_MS) {
-              goalCooldowns.add(goalId);
-              continue;
-            }
-
-            // Detect stale progress: last 2+ successes with similar output = nothing new to do
-            const recentSuccesses = recent.filter((e: any) => e.status === 'progress');
-            if (recentSuccesses.length >= 2 && lastAge < STALE_COOLDOWN_MS) {
-              const last = (recentSuccesses[recentSuccesses.length - 1].resultSnippet ?? '').toLowerCase();
-              const prev = (recentSuccesses[recentSuccesses.length - 2].resultSnippet ?? '').toLowerCase();
-              // Simple similarity: check if 60%+ of words overlap
-              const lastWords = new Set(last.split(/\s+/).filter((w: string) => w.length > 3));
-              const prevWords = new Set(prev.split(/\s+/).filter((w: string) => w.length > 3));
-              if (lastWords.size > 0 && prevWords.size > 0) {
-                let overlap = 0;
-                for (const w of lastWords) { if (prevWords.has(w)) overlap++; }
-                const similarity = overlap / Math.max(lastWords.size, prevWords.size);
-                if (similarity > 0.6) {
-                  goalCooldowns.add(goalId);
-                  logger.debug({ goalId, similarity: similarity.toFixed(2) }, 'Goal producing stale output — backing off');
-                  continue;
-                }
-              }
+            // Disposition-based cooldowns:
+            switch (disposition) {
+              case 'blocked-on-user':
+                // Don't retry until user interacts — check once per 8 hours as a gentle reminder
+                if (lastAge < 8 * HOUR_MS) goalCooldowns.add(goalId);
+                break;
+              case 'blocked-on-external':
+                // Check every 2 hours — external state may have changed
+                if (lastAge < 2 * HOUR_MS) goalCooldowns.add(goalId);
+                break;
+              case 'needs-different-approach':
+                // Wait 4 hours — give SI loop or human time to adjust strategy
+                if (lastAge < 4 * HOUR_MS) goalCooldowns.add(goalId);
+                break;
+              case 'monitoring':
+                // Monitoring = checked, nothing changed. Check every 2 hours
+                if (lastAge < 2 * HOUR_MS) goalCooldowns.add(goalId);
+                break;
+              case 'error':
+              case 'no-change':
+                // Failures: 2hr cooldown
+                if (lastAge < 2 * HOUR_MS) goalCooldowns.add(goalId);
+                break;
+              case 'advanced':
+              default:
+                // Made real progress — eligible for next tick (no cooldown)
+                break;
             }
           }
         }
