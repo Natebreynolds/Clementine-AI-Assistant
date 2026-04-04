@@ -434,9 +434,22 @@ export async function enforceToolPermissions(
     }
   }
 
-  // ── Credential write blocking (always — never write secrets to files) ─
+  // ── Agent config protection — prevent agents from editing allowedTools or security settings ─
   if (toolName === 'Write' || toolName === 'Edit') {
+    const filePath = String(toolInput.file_path ?? toolInput.path ?? '');
     const content = String(toolInput.content ?? toolInput.new_string ?? '');
+
+    // Block direct edits to agent.md files that modify allowedTools or add blocked tools
+    if (filePath.includes('agents/') && filePath.endsWith('agent.md')) {
+      if (content.includes('discord_channel_send') || /allowedTools\s*:/.test(content)) {
+        return {
+          behavior: 'deny',
+          message: 'Cannot modify agent allowedTools or add discord_channel_send via direct file edit. Use the update_agent tool instead.',
+        };
+      }
+    }
+
+    // Credential write blocking (always — never write secrets to files)
     if (matchesAny(content, CREDENTIAL_CONTENT_PATTERNS)) {
       return {
         behavior: 'deny',
