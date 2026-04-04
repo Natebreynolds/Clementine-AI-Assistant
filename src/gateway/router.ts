@@ -596,10 +596,9 @@ export class Gateway {
         });
 
         try {
-          // Phase 1: Quick try for direct user chat (auto-escalates to deep mode if needed).
-          // Agent sessions get more turns since they need to explore files before responding.
-          const isAgentSession = !!resolvedProfile;
-          const phase1MaxTurns = maxTurns ?? (isAgentSession ? 15 : 5);
+          // Phase 1: 15 turns for all sessions. If the model needs more, it
+          // auto-escalates to deep mode (background unleashed task).
+          const phase1MaxTurns = maxTurns ?? 15;
           const [response] = await Promise.race([
             this.assistant.chat(
               text,
