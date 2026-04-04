@@ -939,25 +939,49 @@ export class HeartbeatScheduler {
       const now = Date.now();
       const DAY_MS = 86_400_000;
 
-      // Load recent goal outcomes to enforce cooldown on failed goals
-      const recentFailures = new Set<string>();
-      const GOAL_COOLDOWN_MS = 2 * 60 * 60 * 1000; // 2 hours after failure
+      // Load recent goal outcomes for intelligent throttling:
+      // - Failed goals: 2hr cooldown before retrying
+      // - Stale progress: if last 2 runs produced similar output, back off to 4hr
+      //   (the goal has nothing new to do — nagging the user adds no value)
+      const goalCooldowns = new Set<string>();
+      const FAILURE_COOLDOWN_MS = 2 * 60 * 60 * 1000;
+      const STALE_COOLDOWN_MS = 4 * 60 * 60 * 1000;
       try {
         const progressDir = path.join(GOALS_DIR, 'progress');
         if (existsSync(progressDir)) {
           for (const pf of readdirSync(progressDir).filter(f => f.endsWith('.progress.jsonl'))) {
             const lines = readFileSync(path.join(progressDir, pf), 'utf-8').trim().split('\n').filter(Boolean);
-            // Check last 3 entries for recent failures
-            for (const line of lines.slice(-3)) {
-              try {
-                const entry = JSON.parse(line);
-                if (entry.status === 'error' || entry.status === 'no-change') {
-                  const entryAge = now - new Date(entry.timestamp).getTime();
-                  if (entryAge < GOAL_COOLDOWN_MS) {
-                    recentFailures.add(entry.goalId);
-                  }
+            const recent = lines.slice(-3).map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+            if (recent.length === 0) continue;
+
+            const goalId = recent[0].goalId;
+            const lastEntry = recent[recent.length - 1];
+            const lastAge = now - new Date(lastEntry.timestamp).getTime();
+
+            // Cooldown after failures
+            if ((lastEntry.status === 'error' || lastEntry.status === 'no-change') && lastAge < FAILURE_COOLDOWN_MS) {
+              goalCooldowns.add(goalId);
+              continue;
+            }
+
+            // Detect stale progress: last 2+ successes with similar output = nothing new to do
+            const recentSuccesses = recent.filter((e: any) => e.status === 'progress');
+            if (recentSuccesses.length >= 2 && lastAge < STALE_COOLDOWN_MS) {
+              const last = (recentSuccesses[recentSuccesses.length - 1].resultSnippet ?? '').toLowerCase();
+              const prev = (recentSuccesses[recentSuccesses.length - 2].resultSnippet ?? '').toLowerCase();
+              // Simple similarity: check if 60%+ of words overlap
+              const lastWords = new Set(last.split(/\s+/).filter((w: string) => w.length > 3));
+              const prevWords = new Set(prev.split(/\s+/).filter((w: string) => w.length > 3));
+              if (lastWords.size > 0 && prevWords.size > 0) {
+                let overlap = 0;
+                for (const w of lastWords) { if (prevWords.has(w)) overlap++; }
+                const similarity = overlap / Math.max(lastWords.size, prevWords.size);
+                if (similarity > 0.6) {
+                  goalCooldowns.add(goalId);
+                  logger.debug({ goalId, similarity: similarity.toFixed(2) }, 'Goal producing stale output — backing off');
+                  continue;
                 }
-              } catch { continue; }
+              }
             }
           }
         }
@@ -971,8 +995,8 @@ export class HeartbeatScheduler {
           const goal = JSON.parse(readFileSync(path.join(GOALS_DIR, f), 'utf-8'));
           if (goal.status !== 'active') continue;
 
-          // Skip goals that recently failed — wait for cooldown before retrying
-          if (recentFailures.has(goal.id)) continue;
+          // Skip goals in cooldown (failed recently or producing stale output)
+          if (goalCooldowns.has(goal.id)) continue;
 
           const lastUpdate = goal.updatedAt ? new Date(goal.updatedAt).getTime() : 0;
           const daysSinceUpdate = Math.floor((now - lastUpdate) / DAY_MS);
