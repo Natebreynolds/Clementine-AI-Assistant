@@ -1450,6 +1450,25 @@ export class CronScheduler {
 
         logger.info({ goalId: trigger.goalId, title: goal.title, focus: trigger.focus }, 'Processing goal work trigger');
 
+        // Load recent progress outcomes so the agent has context about what it already did
+        let recentOutcomesContext = '';
+        try {
+          const progressFile = path.join(GOALS_DIR, 'progress', `${trigger.goalId}.progress.jsonl`);
+          if (existsSync(progressFile)) {
+            const lines = readFileSync(progressFile, 'utf-8').trim().split('\n').filter(Boolean);
+            const recent = lines.slice(-5).map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+            if (recent.length > 0) {
+              const summaries = recent.map((e: any) => {
+                const ts = e.timestamp?.slice(0, 16) ?? '?';
+                const snippet = (e.resultSnippet ?? '').slice(0, 100);
+                const disposition = e.disposition ?? e.status;
+                return `- [${ts}] ${disposition}: ${snippet}`;
+              });
+              recentOutcomesContext = `## Recent session outcomes (DO NOT repeat these — advance beyond them)\n${summaries.join('\n')}\n\n`;
+            }
+          }
+        } catch { /* non-fatal */ }
+
         // Build a cron-like prompt that focuses on the goal
         const prompt =
           `You are working on a focused goal session.\n\n` +
@@ -1458,6 +1477,7 @@ export class CronScheduler {
           (goal.progressNotes?.length > 0
             ? `## Prior progress\n${goal.progressNotes.slice(-5).map((n: string) => `- ${n}`).join('\n')}\n\n`
             : '') +
+          recentOutcomesContext +
           (goal.nextActions?.length > 0
             ? `## Planned next actions\n${goal.nextActions.map((a: string) => `- ${a}`).join('\n')}\n\n`
             : '') +
@@ -1468,7 +1488,13 @@ export class CronScheduler {
           `1. Work on the focus area above. Use tools as needed.\n` +
           `2. When done, use \`goal_update\` to record progress notes, update next actions, and clear resolved blockers.\n` +
           `3. If blocked, add blockers and change status to "blocked".\n` +
-          `4. Keep your output concise — summarize what you accomplished.`;
+          `4. **Classify your outcome** — end your response with exactly one of these tags:\n` +
+          `   - [ADVANCED] — made concrete new progress (data gathered, action taken, deliverable produced)\n` +
+          `   - [BLOCKED_ON_USER] — need a decision or action from the user before continuing\n` +
+          `   - [BLOCKED_ON_EXTERNAL] — waiting on external data, API, or event\n` +
+          `   - [NEEDS_DIFFERENT_APPROACH] — tried the current approach and it's not working\n` +
+          `   - [MONITORING] — checked status, nothing changed, will check again later\n` +
+          `5. Keep your output concise — summarize what you accomplished.`;
 
         const jobName = `goal:${goal.title.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 40)}`;
         const goalSnapshotUpdatedAt = goal.updatedAt;
@@ -1575,12 +1601,21 @@ export class CronScheduler {
         newNotesCount = updated.progressNotes?.length ?? 0;
       }
 
+      // Parse disposition tag from agent output (e.g., [BLOCKED_ON_USER])
+      const dispositionMatch = (result ?? '').match(/\[(ADVANCED|BLOCKED_ON_USER|BLOCKED_ON_EXTERNAL|NEEDS_DIFFERENT_APPROACH|MONITORING)\]/);
+      const disposition = error
+        ? 'error'
+        : dispositionMatch
+          ? dispositionMatch[1].toLowerCase().replace(/_/g, '-')
+          : madeProgress ? 'advanced' : 'no-change';
+
       const entry = {
         timestamp: new Date().toISOString(),
         goalId,
         focus,
         source,
         madeProgress,
+        disposition,
         newProgressNotes: newNotesCount - prevNotesCount,
         resultSnippet: error ? `ERROR: ${error.slice(0, 200)}` : (result || '').slice(0, 200).replace(/\n/g, ' '),
         status: error ? 'error' as const : madeProgress ? 'progress' as const : 'no-change' as const,
@@ -1591,7 +1626,7 @@ export class CronScheduler {
       const progressFile = path.join(progressDir, `${goalId}.progress.jsonl`);
       appendFileSync(progressFile, JSON.stringify(entry) + '\n');
 
-      logger.info({ goalId, madeProgress, status: entry.status }, 'Goal outcome logged');
+      logger.info({ goalId, madeProgress, disposition, status: entry.status }, 'Goal outcome logged');
     } catch (err) {
       logger.debug({ err, goalId }, 'Failed to log goal outcome (non-fatal)');
     }
