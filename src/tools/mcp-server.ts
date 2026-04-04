@@ -1051,7 +1051,7 @@ server.tool(
 server.tool(
   'vault_stats',
   'Quick dashboard of vault health — note counts, task counts, memory size, recent activity.',
-  {},
+  { _empty: z.string().optional().describe('(no parameters needed)') },
   async () => {
     const lines = ['**Vault Dashboard:**\n'];
 
@@ -1519,7 +1519,7 @@ function parseDdgResults(
 server.tool(
   'github_prs',
   'Check GitHub PRs — review-requested and authored. Read-only.',
-  {},
+  { _empty: z.string().optional().describe('(no parameters needed)') },
   async () => {
     const parts: string[] = [];
 
@@ -2811,7 +2811,7 @@ function fieldMatch(field: string, value: number): boolean {
 server.tool(
   'cron_list',
   'List all scheduled cron jobs with human-readable schedules, next run times, and recent run status.',
-  {},
+  { _empty: z.string().optional().describe('(no parameters needed)') },
   async () => {
     if (!existsSync(CRON_FILE)) {
       return textResult('No cron jobs configured (CRON.md not found).');
@@ -3061,7 +3061,7 @@ const WORKFLOWS_DIR = path.join(SYSTEM_DIR, 'workflows');
 server.tool(
   'workflow_list',
   'List all multi-step workflows with name, description, step count, trigger, and enabled status.',
-  {},
+  { _empty: z.string().optional().describe('(no parameters needed)') },
   async () => {
     if (!existsSync(WORKFLOWS_DIR)) {
       return textResult('No workflows directory found. Create `vault/00-System/workflows/` and add workflow .md files.');
@@ -3546,7 +3546,7 @@ server.tool(
 server.tool(
   'self_restart',
   'Restart the Clementine daemon to pick up code changes. Sends SIGUSR1 to the running process, which triggers a graceful restart.',
-  {},
+  { _empty: z.string().optional().describe('(no parameters needed)') },
   async () => {
     const pidFile = path.join(BASE_DIR, `.${(env['ASSISTANT_NAME'] ?? 'clementine').toLowerCase()}.pid`);
     if (!existsSync(pidFile)) {
@@ -3571,7 +3571,7 @@ server.tool(
 server.tool(
   'self_improve_status',
   'Check the self-improvement system status: current state, pending approvals, baseline metrics, and recent experiment history.',
-  {},
+  { _empty: z.string().optional().describe('(no parameters needed)') },
   async () => {
     const siDir = path.join(BASE_DIR, 'self-improve');
     const stateFile = path.join(siDir, 'state.json');
@@ -3622,7 +3622,7 @@ server.tool(
 server.tool(
   'self_improve_run',
   'Trigger a self-improvement analysis cycle. This evaluates recent performance data and proposes improvements to system prompts, cron jobs, and workflows. Normally runs nightly via cron.',
-  {},
+  { _empty: z.string().optional().describe('(no parameters needed)') },
   async () => {
     return textResult(
       'Self-improvement cycle should be triggered via the CLI (`clementine self-improve run`) ' +
@@ -3720,7 +3720,7 @@ server.tool(
 server.tool(
   'sequence_due',
   'Get all sequence enrollments with steps due now (for cron processing).',
-  {},
+  { _empty: z.string().optional().describe('(no parameters needed)') },
   async () => {
     const store = await getStore();
     const agentSlug = ACTIVE_AGENT_SLUG ?? undefined;
@@ -4485,7 +4485,7 @@ server.tool(
   'List all team agents — their names, channel bindings, and messaging permissions. ' +
   'NOTE: As the primary agent, you can message ANY team agent using team_message regardless of canMessage settings. ' +
   'The canMessage field only restricts which agents *that agent* can message.',
-  {},
+  { _empty: z.string().optional().describe('(no parameters needed)') },
   async () => {
     const agents = await loadTeamAgents();
     if (agents.length === 0) {
@@ -4684,7 +4684,7 @@ server.tool(
   'team_pending_requests',
   'Check for pending requests from other team agents that need your response. ' +
   'Call this at the start of your work session to see if anyone is waiting for you.',
-  {},
+  { _empty: z.string().optional().describe('(no parameters needed)') },
   async () => {
     const callerSlug = process.env.CLEMENTINE_TEAM_AGENT ?? '';
     if (!callerSlug) {
