@@ -940,6 +940,30 @@ export class HeartbeatScheduler {
       const now = Date.now();
       const DAY_MS = 86_400_000;
 
+      // Load recent goal outcomes to enforce cooldown on failed goals
+      const recentFailures = new Set<string>();
+      const GOAL_COOLDOWN_MS = 2 * 60 * 60 * 1000; // 2 hours after failure
+      try {
+        const progressDir = path.join(GOALS_DIR, 'progress');
+        if (existsSync(progressDir)) {
+          for (const pf of readdirSync(progressDir).filter(f => f.endsWith('.progress.jsonl'))) {
+            const lines = readFileSync(path.join(progressDir, pf), 'utf-8').trim().split('\n').filter(Boolean);
+            // Check last 3 entries for recent failures
+            for (const line of lines.slice(-3)) {
+              try {
+                const entry = JSON.parse(line);
+                if (entry.status === 'error' || entry.status === 'no-change') {
+                  const entryAge = now - new Date(entry.timestamp).getTime();
+                  if (entryAge < GOAL_COOLDOWN_MS) {
+                    recentFailures.add(entry.goalId);
+                  }
+                }
+              } catch { continue; }
+            }
+          }
+        }
+      } catch { /* non-fatal */ }
+
       // Score ALL active goals — stale goals get urgency bonus, but
       // non-stale high-priority goals with pending work also qualify.
       const scoredGoals: Array<{ goal: any; score: number; reason: string }> = [];
@@ -947,6 +971,9 @@ export class HeartbeatScheduler {
         try {
           const goal = JSON.parse(readFileSync(path.join(GOALS_DIR, f), 'utf-8'));
           if (goal.status !== 'active') continue;
+
+          // Skip goals that recently failed — wait for cooldown before retrying
+          if (recentFailures.has(goal.id)) continue;
 
           const lastUpdate = goal.updatedAt ? new Date(goal.updatedAt).getTime() : 0;
           const daysSinceUpdate = Math.floor((now - lastUpdate) / DAY_MS);
