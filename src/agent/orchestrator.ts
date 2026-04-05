@@ -831,6 +831,13 @@ export class PlanOrchestrator {
 
     parts.push('## Your task:\n' + step.prompt);
 
+    // Agentic communication guidance for sub-agents
+    parts.push(`## Communication Style
+Work through this task narrating your reasoning:
+- After reading/searching, say what you found and what it means before acting.
+- If something fails or is unexpected, explain what happened and what you'll try instead.
+- End with a clear deliverable — the concrete output, not a promise to produce one.`);
+
     return parts.join('\n\n');
   }
 

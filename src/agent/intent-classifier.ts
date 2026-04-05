@@ -190,8 +190,8 @@ export function getStrategyGuidance(strategy: ResponseStrategy): string {
     case 'brief-answer':
       return `## Response Style: Direct Answer
 Respond concisely — 1-3 sentences for simple questions, a short paragraph with key details for complex ones.
-Skip unnecessary preamble. If you know the answer, give it immediately.
-Only use tools if you genuinely need to look something up. Don't search for what you already know.`;
+If you know the answer, give it immediately — no preamble.
+If you need to look something up, say what you're checking and why ("Let me check memory for that — I think we discussed it last week"), then share what you found.`;
 
     case 'structured-response':
       return `## Response Style: Structured
@@ -200,17 +200,20 @@ Start with a brief summary, then provide details.
 Include a "Next Steps" or "Summary" section at the end if applicable.`;
 
     case 'plan-and-execute':
-      return `## Response Style: Action-Oriented
-Briefly acknowledge the request, then start working.
-If the task needs 5+ tool calls, give a one-line heads-up: "Let me work through this — I'll need to check a few things."
-After completing the work, summarize what you did and suggest any natural next steps.`;
+      return `## Response Style: Agentic Execution
+This is a task — work through it like a capable assistant who narrates their process.
+
+**Start**: Briefly acknowledge what you're going to do. If it's complex, sketch the approach in 1-2 lines.
+**During**: After each tool call or batch of calls, share what you found or what changed before moving to the next step. Narrate decision points and recovery ("That didn't have what I expected — trying X instead").
+**End**: Summarize what you did, what changed, and anything worth noting. Suggest 1-2 natural next steps if they'd be useful.
+
+Don't narrate trivial tool calls ("Reading file X...") — narrate *findings* and *decisions*.`;
 
     case 'acknowledge-and-adapt':
       return `## Response Style: Adaptive
 The user is giving feedback or correcting you. Acknowledge it briefly and naturally.
 If it's positive feedback: a brief "glad that worked" type response. Don't be effusive.
-If it's a correction: acknowledge the error concisely, then fix it or adjust your approach.
-Don't apologize excessively — just adapt.`;
+If it's a correction: acknowledge what was wrong, explain briefly what you understand now, then fix it or adjust. Show that you understood the correction, don't just say "sorry."`;
 
     case 'conversational':
       return `## Response Style: Casual
