@@ -75,6 +75,7 @@ import { StallGuard } from './stall-guard.js';
 import { formatResultsForPrompt } from '../memory/search.js';
 import { PromptCache } from './prompt-cache.js';
 import { searchSkills as searchSkillsSync } from './skill-extractor.js';
+import { classifyIntent, getStrategyGuidance, type IntentClassification } from './intent-classifier.js';
 
 // ── Token estimation & context window guard ─────────────────────────
 
@@ -669,8 +670,9 @@ export class PersonalAssistant {
     sessionKey?: string | null;
     model?: string | null;
     verboseLevel?: VerboseLevel;
+    intentClassification?: IntentClassification | null;
   } = {}): string {
-    const { isHeartbeat = false, cronTier = null, retrievalContext = '', profile = null, sessionKey = null, model = null, verboseLevel } = opts;
+    const { isHeartbeat = false, cronTier = null, retrievalContext = '', profile = null, sessionKey = null, model = null, verboseLevel, intentClassification = null } = opts;
     const isAutonomous = isHeartbeat || cronTier !== null;
     const parts: string[] = [];
     const owner = OWNER;
@@ -926,6 +928,11 @@ When ${owner} expresses satisfaction ("nice", "perfect", "great job", "thanks") 
         parts.push(`## Verbosity: Detailed\n\nExplain your reasoning, share intermediate findings, think out loud.`);
       }
 
+      // Intent-driven response strategy guidance
+      if (intentClassification && !isAutonomous) {
+        parts.push(getStrategyGuidance(intentClassification.suggestedStrategy));
+      }
+
       // Autonomous delegation and agent coaching (only for primary agent, not team agents)
       if (!profile) {
         parts.push(`## Autonomous Delegation
@@ -970,12 +977,40 @@ When a task is complex, output \`[PLAN_NEEDED: brief description]\` as the FIRST
 
 **State persistence:** For complex inline work, use \`session_pause\` to save progress if work is getting heavy or might be interrupted. Resume later via \`session_resume\`.`);
 
-      // Analysis paralysis guard
-      parts.push(`## Execution Guard
+      // Agentic work protocol — replaces the old "Execution Guard"
+      parts.push(`## Agentic Work Protocol
 
-**Always respond to ${owner} first.** Before making tool calls, write a brief conversational response: what you're about to do, what you already know, or what you need. ${owner} should never see silence while you work.
+### Before Acting
+**Always respond to ${owner} first.** Before making tool calls, write a brief line about what you're doing and why:
+- "Let me check that file — if the config changed, that would explain the error."
+- "I'll search memory for your notes on this."
+${owner} should never see silence while you work.
 
-If a task needs 5+ tool calls, say so upfront: "This will take a minute — let me dig into those files." Then work.
+### During Work — Narrate Key Moments
+Don't narrate every tool call, but DO narrate:
+- **What you found** after reading/searching: "Found it — the issue is on line 42, the variable is undefined because..."
+- **Decision points**: "Two approaches here — X is simpler but Y handles edge cases. Going with Y."
+- **When something fails**: "That path doesn't exist. Looks like it was moved during the refactor. Searching for it..."
+- **Progress on multi-step work**: "That's 2 of 3 files updated. Last one is the test file."
+
+### Recovery — Explain, Then Adapt
+When a tool call fails or returns unexpected results:
+1. Say what went wrong in plain language (not raw error dumps)
+2. Say what you'll try instead and why
+3. If you've tried 3 approaches and none worked, stop and tell ${owner} what you've learned so far
+
+### After Work — Close the Loop
+After completing substantive work (3+ tool calls), briefly summarize:
+- What you did
+- What changed
+- Anything ${owner} should know or verify
+If there are natural next steps, suggest 1-2 as questions.
+
+### Depth Matching
+- **Quick question**: Just answer. No narration needed.
+- **Medium task (3-10 tool calls)**: Narrate findings and key decisions.
+- **Heavy task (10+ tool calls)**: Set expectations upfront ("This'll take a minute"), narrate major milestones, summarize at the end.
+- **Casual chat**: Be natural — no process talk.
 
 For complex tasks spanning multiple files or needing sustained work, propose deep mode: output \`[DEEP_MODE: brief description]\` as the FIRST line, followed by your conversational response. This runs the work in the background with check-ins.
 
@@ -1010,6 +1045,7 @@ If you're stuck after reading several files, tell ${owner} what's blocking you. 
     thinking?: { type: 'adaptive' };
     outputFormat?: { type: 'json_schema'; schema: Record<string, unknown> };
     stallGuard?: StallGuard;
+    intentClassification?: IntentClassification;
   } = {}): SDKOptions {
     const {
       isHeartbeat = false,
@@ -1032,6 +1068,7 @@ If you're stuck after reading several files, tell ${owner} what's blocking you. 
       thinking,
       outputFormat,
       stallGuard,
+      intentClassification,
     } = opts;
 
     let allowedTools = [
@@ -1134,7 +1171,7 @@ If you're stuck after reading several files, tell ${owner} what's blocking you. 
 
     // Build combined system prompt (custom + security rules)
     const customPrompt = this.buildSystemPrompt({
-      isHeartbeat, cronTier: isPlanStep ? null : cronTier, retrievalContext, profile, sessionKey, model, verboseLevel,
+      isHeartbeat, cronTier: isPlanStep ? null : cronTier, retrievalContext, profile, sessionKey, model, verboseLevel, intentClassification,
     });
     const fullSystemPrompt = customPrompt + '\n\n' + securityPrompt;
 
@@ -1567,11 +1604,21 @@ If you're stuck after reading several files, tell ${owner} what's blocking you. 
         `If a file can't be read, say so. If you're stuck, say so. Never stall silently.]\n\n${effectivePrompt}`;
     }
 
+    // ── Intent classification ─────────────────────────────────────
+    // Classify intent before the main query to dynamically tune response
+    // strategy, maxTurns, and effort level
+    const recentExchanges = key ? this.lastExchanges.get(key) : undefined;
+    const intent = classifyIntent(text, recentExchanges);
+    logger.debug({ intent: intent.type, confidence: intent.confidence, strategy: intent.suggestedStrategy }, 'Intent classified');
+
+    // Use intent-suggested maxTurns if caller didn't specify, and confidence is decent
+    const effectiveMaxTurns = maxTurns ?? (intent.confidence >= 0.3 ? intent.suggestedMaxTurns : undefined);
+
     const CHAT_TIMEOUT_MS = 10 * 60 * 1000;
     const guard = new StallGuard();
 
     let [responseText, sessionId] = await this.runQuery(
-      effectivePrompt, key, onText, model, profile, securityAnnotation, maxTurns, projectOverride, onToolActivity, verboseLevel, abortController, guard, CHAT_TIMEOUT_MS,
+      effectivePrompt, key, onText, model, profile, securityAnnotation, effectiveMaxTurns, projectOverride, onToolActivity, verboseLevel, abortController, guard, CHAT_TIMEOUT_MS, intent,
     );
 
     // If we got a context-length / prompt-too-long error, retry with a fresh session
@@ -1654,6 +1701,7 @@ If you're stuck after reading several files, tell ${owner} what's blocking you. 
     abortController?: AbortController,
     stallGuard?: StallGuard,
     timeoutMs?: number,
+    intentClassification?: IntentClassification,
   ): Promise<[string, string]> {
     // Parallelize context retrieval and project matching — they're independent
     // If a project override is set, skip auto-matching entirely
@@ -1720,7 +1768,7 @@ If you're stuck after reading several files, tell ${owner} what's blocking you. 
 
     try {
       for (let attempt = 0; attempt <= PersonalAssistant.RATE_LIMIT_MAX_RETRIES; attempt++) {
-        const sdkOptions = this.buildOptions({ model, maxTurns: maxTurnsOverride ?? null, retrievalContext, profile, sessionKey, streaming: !!onText, verboseLevel, abortController, stallGuard });
+        const sdkOptions = this.buildOptions({ model, maxTurns: maxTurnsOverride ?? null, retrievalContext, profile, sessionKey, streaming: !!onText, verboseLevel, abortController, stallGuard, intentClassification, effort: intentClassification?.suggestedEffort });
 
         // If a project matched, switch cwd so the agent gets its tools/CLAUDE.md
         if (matchedProject) {
@@ -2849,6 +2897,37 @@ If you're stuck after reading several files, tell ${owner} what's blocking you. 
       this.runCronReflection(jobName, jobPrompt, deliverable, successCriteria).catch(err => {
         logger.debug({ err, job: jobName }, 'Cron reflection failed (non-fatal)');
       });
+
+      // ── Confidence-based escalation ─────────────────────────────
+      // If the stall guard detected low confidence during the cron job,
+      // flag it for user review on the next heartbeat
+      if (cronGuard) {
+        const summary = cronGuard.getSummary();
+        const mc = summary.metacognition;
+        if (mc.confidenceFinal === 'low' && deliverable && deliverable !== '__NOTHING__') {
+          try {
+            const escalationsFile = path.join(BASE_DIR, 'escalations.json');
+            const escalations: Array<Record<string, unknown>> = fs.existsSync(escalationsFile)
+              ? JSON.parse(fs.readFileSync(escalationsFile, 'utf-8'))
+              : [];
+            escalations.push({
+              jobName,
+              timestamp: new Date().toISOString(),
+              confidence: mc.confidenceFinal,
+              signals: mc.signals,
+              toolCallCount: mc.toolCallCount,
+              deliverablePreview: deliverable.slice(0, 300),
+              reason: `Low confidence after ${mc.toolCallCount} tool calls. Signals: ${mc.signals.join(', ')}`,
+            });
+            // Keep only last 20 escalations
+            if (escalations.length > 20) escalations.splice(0, escalations.length - 20);
+            fs.writeFileSync(escalationsFile, JSON.stringify(escalations, null, 2));
+            logger.info({ job: jobName, confidence: mc.confidenceFinal, signals: mc.signals }, 'Cron job flagged for user review (low confidence)');
+          } catch (err) {
+            logger.debug({ err }, 'Failed to write escalation (non-fatal)');
+          }
+        }
+      }
 
       return deliverable;
     } finally {
