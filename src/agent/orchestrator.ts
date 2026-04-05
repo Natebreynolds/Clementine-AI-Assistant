@@ -144,7 +144,18 @@ interface PlanState {
   wavesCompleted: number;
   results: Record<string, string>;
   errors: Array<{ stepId: string; error: string }>;
+  retries: Record<string, number>;
 }
+
+/** Spot-check issue with severity — critical issues trigger repair flow. */
+interface SpotCheckIssue {
+  stepId: string;
+  issue: string;
+  severity: 'warning' | 'critical';
+}
+
+/** Repair decision from fast Haiku call. */
+type RepairDecision = 'retry' | 'skip' | 'abort';
 
 export class PlanOrchestrator {
   private assistant: PersonalAssistant;
@@ -288,6 +299,9 @@ export class PlanOrchestrator {
     // 4. Execute waves — with state persistence for resumability
     const results = new Map<string, string>();
     let longPlanWarned = false;
+    // Wave summaries for cross-step learning: compact findings from completed waves
+    // injected into ALL subsequent steps (not just dependents)
+    let waveSummaryContext = '';
 
     const state: PlanState = {
       id: this.stateId,
@@ -300,6 +314,7 @@ export class PlanOrchestrator {
       wavesCompleted: 0,
       results: {},
       errors: [],
+      retries: {},
     };
     this.saveState(state);
 
@@ -318,7 +333,7 @@ export class PlanOrchestrator {
       // Run wave steps with concurrency limit
       const settled = await settledWithLimit(
         wave.map((step) => async () => {
-          const prompt = this.buildStepPrompt(step, results);
+          const prompt = this.buildStepPrompt(step, results, waveSummaryContext);
           const result = await this.assistant.runPlanStep(step.id, prompt, {
             tier: step.tier ?? 2,
             maxTurns: step.maxTurns ?? 15,
@@ -363,15 +378,79 @@ export class PlanOrchestrator {
       }
       await safeProgress(this.getAllUpdates());
 
-      // Inter-wave spot-check: verify claimed artifacts exist before proceeding
-      // This prevents downstream waves from building on phantom results
+      // Inter-wave spot-check with severity levels: critical issues trigger repair
       const spotCheckIssues = this.spotCheckWaveResults(wave, results);
       if (spotCheckIssues.length > 0) {
         logger.warn({ issues: spotCheckIssues }, 'Spot-check found issues in wave results');
-        // Annotate results so the synthesis step knows about verification failures
+
         for (const issue of spotCheckIssues) {
+          if (issue.severity === 'critical' && this.hasDependents(issue.stepId, plan!.steps)) {
+            // Critical issue on a step with dependents — attempt repair
+            const retryCount = state.retries[issue.stepId] ?? 0;
+            if (retryCount < 1) {
+              const decision = await this.getRepairDecision(issue, results.get(issue.stepId) ?? '');
+              if (decision === 'retry') {
+                logger.info({ stepId: issue.stepId, attempt: retryCount + 1 }, 'Retrying failed step');
+                state.retries[issue.stepId] = retryCount + 1;
+                const step = wave.find(s => s.id === issue.stepId)!;
+                try {
+                  const retryPrompt = `[RETRY — Previous attempt failed: ${issue.issue}]\n\n` +
+                    this.buildStepPrompt(step, results, waveSummaryContext);
+                  const retryResult = await this.assistant.runPlanStep(step.id, retryPrompt, {
+                    tier: step.tier ?? 2,
+                    maxTurns: step.maxTurns ?? 15,
+                    model: step.model,
+                  });
+                  results.set(step.id, retryResult || '[No output on retry]');
+                  this.stepStatuses.set(step.id, {
+                    stepId: step.id,
+                    status: retryResult ? 'done' : 'failed',
+                    description: step.description,
+                    durationMs: Date.now() - (this.stepStartTimes.get(step.id) ?? this.startTime),
+                    resultPreview: (retryResult || '[No output on retry]').slice(0, 100),
+                  });
+                  logger.info({ stepId: step.id, success: !!retryResult }, 'Step retry completed');
+                } catch (err) {
+                  logger.warn({ stepId: step.id, err }, 'Step retry also failed');
+                }
+              } else if (decision === 'abort') {
+                logger.warn({ stepId: issue.stepId }, 'Repair decision: abort plan');
+                state.status = 'failed';
+                this.saveState(state);
+                return `Plan aborted — step "${this.stepStatuses.get(issue.stepId)?.description ?? issue.stepId}" failed critically and could not be repaired.`;
+              }
+              // 'skip' falls through — annotate and continue
+            }
+          }
+
+          // Annotate results so the synthesis step knows about issues
           const existing = results.get(issue.stepId) ?? '';
-          results.set(issue.stepId, existing + `\n\n[SPOT-CHECK WARNING: ${issue.issue}]`);
+          results.set(issue.stepId, existing + `\n\n[SPOT-CHECK ${issue.severity.toUpperCase()}: ${issue.issue}]`);
+        }
+      }
+
+      // ── Cross-step learning: build wave summary ─────────────────
+      // Compact summary of this wave's findings, injected into ALL subsequent steps
+      const waveFindings: string[] = [];
+      for (const step of wave) {
+        const status = this.stepStatuses.get(step.id);
+        if (status?.status === 'done') {
+          const result = results.get(step.id) ?? '';
+          // Extract first substantive sentence (skip headers, blank lines)
+          const lines = result.split('\n').filter(l => l.trim() && !l.startsWith('#') && !l.startsWith('['));
+          const summary = lines[0]?.slice(0, 150) ?? '';
+          if (summary) {
+            waveFindings.push(`- ${step.description}: ${summary}`);
+          }
+        } else if (status?.status === 'failed') {
+          waveFindings.push(`- ${step.description}: FAILED`);
+        }
+      }
+      if (waveFindings.length > 0) {
+        waveSummaryContext += (waveSummaryContext ? '\n' : '') + waveFindings.join('\n');
+        // Cap total wave summary to prevent prompt bloat
+        if (waveSummaryContext.length > 1500) {
+          waveSummaryContext = waveSummaryContext.slice(-1500);
         }
       }
 
@@ -541,8 +620,8 @@ export class PlanOrchestrator {
   private spotCheckWaveResults(
     wave: PlanStep[],
     results: Map<string, string>,
-  ): Array<{ stepId: string; issue: string }> {
-    const issues: Array<{ stepId: string; issue: string }> = [];
+  ): SpotCheckIssue[] {
+    const issues: SpotCheckIssue[] = [];
 
     for (const step of wave) {
       const result = results.get(step.id) ?? '';
@@ -551,19 +630,19 @@ export class PlanOrchestrator {
       // Skip already-failed steps
       if (status?.status === 'failed') continue;
 
-      // Check 1: Empty or near-empty output
+      // Check 1: Empty or near-empty output — critical (nothing to build on)
       if (result.length < 20) {
-        issues.push({ stepId: step.id, issue: `Output is empty or trivial (${result.length} chars)` });
+        issues.push({ stepId: step.id, issue: `Output is empty or trivial (${result.length} chars)`, severity: 'critical' });
         continue;
       }
 
-      // Check 2: Output is just an error message
+      // Check 2: Output is just an error message — critical
       if (result.startsWith('[FAILED:') || result.startsWith('Error:') || result.startsWith('Something went wrong')) {
-        issues.push({ stepId: step.id, issue: 'Output appears to be an error, not a result' });
+        issues.push({ stepId: step.id, issue: 'Output appears to be an error, not a result', severity: 'critical' });
         continue;
       }
 
-      // Check 3: Stub detection — output that restates the task without answering
+      // Check 3: Stub detection — warning (might have partial content)
       const stubPatterns = [
         /^I('ll| will) (start|begin|look into|investigate|check)/i,
         /^Let me (start|begin|look into|investigate|check)/i,
@@ -571,11 +650,47 @@ export class PlanOrchestrator {
       ];
       const firstLine = result.split('\n')[0];
       if (stubPatterns.some(p => p.test(firstLine)) && result.length < 200) {
-        issues.push({ stepId: step.id, issue: 'Output appears to be a stub/placeholder (restates intent without delivering results)' });
+        issues.push({ stepId: step.id, issue: 'Output appears to be a stub/placeholder (restates intent without delivering results)', severity: 'warning' });
       }
     }
 
     return issues;
+  }
+
+  /** Check if a step has downstream dependents in the plan. */
+  private hasDependents(stepId: string, steps: PlanStep[]): boolean {
+    return steps.some(s => s.dependsOn.includes(stepId));
+  }
+
+  /** Fast Haiku call to decide how to repair a failed critical step. */
+  private async getRepairDecision(issue: SpotCheckIssue, result: string): Promise<RepairDecision> {
+    try {
+      const prompt =
+        `A plan step failed during orchestration. Decide the best recovery action.\n\n` +
+        `Step: ${this.stepStatuses.get(issue.stepId)?.description ?? issue.stepId}\n` +
+        `Issue: ${issue.issue}\n` +
+        `Output (first 300 chars): ${result.slice(0, 300)}\n\n` +
+        `Options:\n` +
+        `- "retry": Try the step again with the error context appended (good if the failure seems transient or fixable)\n` +
+        `- "skip": Skip this step and let downstream steps work around the missing data (good if the step is non-essential)\n` +
+        `- "abort": Cancel the entire plan (good if this step is critical and can't be worked around)\n\n` +
+        `Respond with ONLY one word: retry, skip, or abort`;
+
+      const decision = await this.assistant.runPlanStep('repair-decision', prompt, {
+        tier: 1,
+        maxTurns: 1,
+        model: 'haiku',
+        disableTools: true,
+      });
+
+      const cleaned = decision.trim().toLowerCase();
+      if (cleaned.includes('retry')) return 'retry';
+      if (cleaned.includes('abort')) return 'abort';
+      return 'skip';
+    } catch {
+      // If the decision call itself fails, default to skip
+      return 'skip';
+    }
   }
 
   // ── Private helpers ──────────────────────────────────────────────────
@@ -682,8 +797,14 @@ export class PlanOrchestrator {
     return null;
   }
 
-  private buildStepPrompt(step: PlanStep, priorResults: Map<string, string>): string {
+  private buildStepPrompt(step: PlanStep, priorResults: Map<string, string>, waveSummaryContext?: string): string {
     const parts: string[] = [];
+
+    // Cross-step learning: inject compact summary from ALL prior waves
+    // so this step benefits from earlier findings even without explicit dependencies
+    if (waveSummaryContext) {
+      parts.push('## Context from prior work\n' + waveSummaryContext);
+    }
 
     // Inject prior step results for dependencies
     if (step.dependsOn.length > 0) {
