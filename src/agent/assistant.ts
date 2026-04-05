@@ -3179,8 +3179,11 @@ If you're stuck after reading several files, tell ${owner} what's blocking you. 
           `IMPORTANT:\n` +
           `- Work methodically through the task in phases\n` +
           `- At the end of this phase, output a STATUS SUMMARY of what you accomplished and what remains\n` +
-          `- Use sub-agents (Agent/Task tools) for parallel work streams\n` +
-          `- Save important intermediate results to files so they persist across phases`;
+          `- Save important intermediate results to files so they persist across phases\n\n` +
+          `PARALLELIZATION: When processing multiple items (prospects, accounts, emails, analyses), ` +
+          `use the Agent tool to spawn sub-agents that work in parallel. For example, if you need to ` +
+          `research 10 prospects, spawn 3-5 sub-agents that each handle a batch — don't process them ` +
+          `one at a time. Each sub-agent should receive specific items and return structured results.`;
       } else if (sessionId) {
         // Resuming existing session — agent has full conversation history
         prompt =
@@ -3216,9 +3219,15 @@ If you're stuck after reading several files, tell ${owner} what's blocking you. 
       const beaconTimer = setInterval(() => {
         if (this.onPhaseProgress && beaconCount < MAX_BEACONS_PER_PHASE) {
           beaconCount++;
-          const elapsed = Math.round((Date.now() - phaseStart) / 1000);
+          const mins = Math.round((Date.now() - phaseStart) / 60_000);
           try {
-            this.onPhaseProgress(jobName, phase, `Still working — phase ${phase}, ${phaseToolCount} tool calls, ${elapsed}s elapsed`);
+            // Conversational beacon — no technical jargon
+            const msg = mins < 3
+              ? 'Still on it — getting started.'
+              : mins < 10
+                ? `Making progress — about ${mins} minutes in.`
+                : `Still working — ${mins} minutes in. This one's taking a bit.`;
+            this.onPhaseProgress(jobName, phase, msg);
           } catch { /* non-fatal */ }
         }
       }, BEACON_INTERVAL_MS);
