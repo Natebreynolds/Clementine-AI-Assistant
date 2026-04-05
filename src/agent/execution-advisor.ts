@@ -118,6 +118,19 @@ export function getExecutionAdvice(jobName: string, job: CronJobDefinition): Exe
     // ── Rule 6: Sonnet still failing → escalate to unleashed ─────
     checkEscalation(recentRuns, reflections, job, advice);
 
+    // ── Rule 7: Low-confidence completions → flag for escalation ──
+    // If recent reflections show low quality even when the job "succeeds",
+    // mark for escalation so the user is notified
+    if (!advice.shouldEscalate) {
+      const recentLowQuality = reflections.slice(0, 3).filter(r => r.quality <= 3);
+      const recentSuccessRuns = recentRuns.slice(0, 3).filter(r => r.status === 'success');
+      if (recentLowQuality.length >= 2 && recentSuccessRuns.length >= 2) {
+        advice.shouldEscalate = true;
+        advice.escalationReason = `Job completes but quality is consistently low (${recentLowQuality.length}/3 reflections scored ≤3) — may need human review`;
+        logger.debug({ job: job.name, reason: advice.escalationReason }, 'Recommending escalation due to low-confidence completions');
+      }
+    }
+
   } catch (err) {
     logger.warn({ err, job: jobName }, 'Execution advisor error — proceeding with defaults');
   }

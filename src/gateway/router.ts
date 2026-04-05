@@ -51,6 +51,25 @@ interface SessionState {
   deepTask?: { jobName: string; taskDesc: string; startedAt: string };
 }
 
+/** Map tool names to user-friendly progress labels for streaming indicators. */
+function getToolProgressLabel(toolName: string): string {
+  const name = toolName.toLowerCase();
+  if (name.includes('read') || name.includes('glob') || name.includes('grep')) return 'reading files';
+  if (name.includes('write') || name.includes('edit')) return 'writing changes';
+  if (name.includes('bash')) return 'running commands';
+  if (name.includes('memory_search') || name.includes('memory_recall')) return 'searching memory';
+  if (name.includes('memory_write')) return 'saving to memory';
+  if (name.includes('web_search') || name.includes('websearch')) return 'searching the web';
+  if (name.includes('web_fetch') || name.includes('webfetch')) return 'fetching content';
+  if (name.includes('outlook') || name.includes('email')) return 'checking email';
+  if (name.includes('task')) return 'managing tasks';
+  if (name.includes('github')) return 'checking GitHub';
+  if (name.includes('note') || name.includes('vault')) return 'working in vault';
+  if (name.includes('goal')) return 'reviewing goals';
+  if (name.includes('team') || name.includes('agent')) return 'coordinating with team';
+  return 'working';
+}
+
 export class Gateway {
   public readonly assistant: PersonalAssistant;
 
@@ -573,12 +592,28 @@ export class Gateway {
         // Wrap callbacks to reset idle timer on agent activity + count tool calls
         let toolActivityCount = 0;
         let lastStreamedText = '';
+        let lastProgressEmitAt = Date.now();
         const wrappedOnText = onText
-          ? async (token: string) => { resetIdleTimer(); lastStreamedText = token; return onText(token); }
+          ? async (token: string) => { resetIdleTimer(); lastStreamedText = token; lastProgressEmitAt = Date.now(); return onText(token); }
           : undefined;
+
+        // Progress streaming: emit brief status indicators during long tool chains
+        // so the user doesn't see silence while the agent works
+        const emitToolProgress = async (name: string) => {
+          if (!onText) return;
+          const elapsed = Date.now() - lastProgressEmitAt;
+          // Emit progress after every 3rd tool call or 10 seconds of silence
+          if (toolActivityCount > 0 && (toolActivityCount % 3 === 0 || elapsed > 10_000)) {
+            const friendlyName = getToolProgressLabel(name);
+            const indicator = `\n\n*(${friendlyName}...)*`;
+            lastProgressEmitAt = Date.now();
+            try { await onText(lastStreamedText + indicator); } catch { /* non-fatal */ }
+          }
+        };
+
         const wrappedOnToolActivity = onToolActivity
-          ? async (name: string, input: Record<string, unknown>) => { resetIdleTimer(); toolActivityCount++; return onToolActivity(name, input); }
-          : async (_name: string, _input: Record<string, unknown>) => { resetIdleTimer(); toolActivityCount++; };
+          ? async (name: string, input: Record<string, unknown>) => { resetIdleTimer(); toolActivityCount++; await emitToolProgress(name); return onToolActivity(name, input); }
+          : async (name: string, _input: Record<string, unknown>) => { resetIdleTimer(); toolActivityCount++; await emitToolProgress(name); };
 
         // Hard wall timer: if the SDK ignores abort (e.g. stuck in a sub-agent),
         // this resolves immediately with a timeout message so the user isn't blocked.

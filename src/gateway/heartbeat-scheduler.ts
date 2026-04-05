@@ -388,6 +388,35 @@ export class HeartbeatScheduler {
       const todayPlan = dailyPlanner?.getPlan();
       if (todayPlan) {
         changesSummary += `\n\n## Today's Plan\n${todayPlan.summary}\nTop priorities: ${todayPlan.priorities.slice(0, 3).map(p => p.action).join('; ')}`;
+
+        // ── Goal-driven work auto-queuing ─────────────────────────
+        // Close the loop: daily planner priorities → work queue items
+        // Only queue high-urgency goal items that are autonomously actionable
+        const currentQueue = HeartbeatScheduler.loadWorkQueue();
+        const pendingDescriptions = new Set(
+          currentQueue.filter(i => i.status === 'pending' || i.status === 'running').map(i => i.description),
+        );
+
+        for (const priority of todayPlan.priorities) {
+          // Only auto-queue high-urgency goal items (urgency >= 7)
+          if (priority.type !== 'goal' || priority.urgency < 7) continue;
+          // Skip if already queued
+          if (pendingDescriptions.has(priority.action)) continue;
+          // Skip if the action requires human input (heuristic: contains question marks or decision words)
+          if (/\?|decide|choose|approve|confirm|review with|ask\s/i.test(priority.action)) continue;
+
+          HeartbeatScheduler.enqueueWork({
+            description: priority.action,
+            prompt: `Goal progress: ${priority.action}\n\nThis is a high-priority item from today's daily plan (goal: ${priority.id}). ` +
+              `Use goal_work to make progress. If you need information from the owner to proceed, ` +
+              `note the blocker and move on.`,
+            source: `daily-plan:${priority.id}`,
+            priority: 'high',
+            maxTurns: 10,
+            tier: 1,
+          });
+          logger.info({ goalId: priority.id, action: priority.action }, 'Auto-queued goal work from daily plan');
+        }
       }
     } catch (err) { logger.warn({ err }, 'Daily plan enrichment failed'); }
 
@@ -535,6 +564,34 @@ export class HeartbeatScheduler {
 
     // Fire-and-forget: process inbox items
     this.processInbox();
+
+    // ── Confidence-based escalations from cron jobs ──────────────────
+    // Check if any cron jobs flagged low-confidence results for user review
+    try {
+      const escalationsFile = path.join(BASE_DIR, 'escalations.json');
+      if (existsSync(escalationsFile)) {
+        const escalations = JSON.parse(readFileSync(escalationsFile, 'utf-8')) as Array<Record<string, unknown>>;
+        if (escalations.length > 0) {
+          // Drain all pending escalations
+          const messages: string[] = [];
+          for (const esc of escalations) {
+            messages.push(
+              `**${esc.jobName}** (${esc.confidence} confidence, ${esc.toolCallCount} tool calls): ` +
+              `${String(esc.deliverablePreview ?? '').slice(0, 200)}`,
+            );
+          }
+          // Clear escalations
+          writeFileSync(escalationsFile, '[]');
+          // Send notification
+          await this.dispatcher.send(
+            `**[Review needed]** These cron jobs completed but I'm not confident in the results:\n\n${messages.join('\n\n')}\n\nShould I try them again with a different approach?`,
+          );
+          logger.info({ count: escalations.length }, 'Delivered confidence escalations to user');
+        }
+      }
+    } catch (err) {
+      logger.debug({ err }, 'Escalation check failed (non-fatal)');
+    }
 
     // ── Proactive insight engine ─────────────────────────────────────
     try {
