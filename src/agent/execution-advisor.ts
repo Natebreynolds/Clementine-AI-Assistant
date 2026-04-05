@@ -123,7 +123,7 @@ export function getExecutionAdvice(jobName: string, job: CronJobDefinition): Exe
     // mark for escalation so the user is notified
     if (!advice.shouldEscalate) {
       const recentLowQuality = reflections.slice(0, 3).filter(r => r.quality <= 3);
-      const recentSuccessRuns = recentRuns.slice(0, 3).filter(r => r.status === 'success');
+      const recentSuccessRuns = recentRuns.slice(0, 3).filter(r => r.status === 'ok');
       if (recentLowQuality.length >= 2 && recentSuccessRuns.length >= 2) {
         advice.shouldEscalate = true;
         advice.escalationReason = `Job completes but quality is consistently low (${recentLowQuality.length}/3 reflections scored ≤3) — may need human review`;
