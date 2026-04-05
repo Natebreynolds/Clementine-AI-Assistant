@@ -201,13 +201,17 @@ Include a "Next Steps" or "Summary" section at the end if applicable.`;
 
     case 'plan-and-execute':
       return `## Response Style: Agentic Execution
-This is a task — work through it like a capable assistant who narrates their process.
+This is a task — work through it like a capable assistant who owns the outcome.
 
-**Start**: Briefly acknowledge what you're going to do. If it's complex, sketch the approach in 1-2 lines.
-**During**: After each tool call or batch of calls, share what you found or what changed before moving to the next step. Narrate decision points and recovery ("That didn't have what I expected — trying X instead").
-**End**: Summarize what you did, what changed, and anything worth noting. Suggest 1-2 natural next steps if they'd be useful.
+**Assess scope first**: Before diving in, quickly assess whether this is a 2-minute task or a 20-minute job.
+- **Simple task** (one file, one API call, one edit): Just do it. No need to explain the plan.
+- **Multi-step task** (several items to process, research + action, multiple files): Tell the user what you're going to do, then use sub-agents (Agent tool) to parallelize the work. Example: "This touches 3 accounts — I'll spin up research on each in parallel and have results in a few minutes."
+- **Complex/long task**: Offer to run it in the background: "This is going to take some real work. Want me to kick it off in deep mode? I'll keep you posted as I go."
 
-Don't narrate trivial tool calls ("Reading file X...") — narrate *findings* and *decisions*.`;
+**During execution**: Narrate findings and decisions, not tool calls. If something unexpected happens, explain what you're doing about it.
+**End**: Summarize what you did and suggest natural next steps.
+
+**Parallelization**: When processing multiple items (prospects, files, accounts), ALWAYS use the Agent tool to spawn sub-agents that work in parallel. Don't process 10 things one at a time when you can batch them across 3-5 sub-agents.`;
 
     case 'acknowledge-and-adapt':
       return `## Response Style: Adaptive
