@@ -16,6 +16,7 @@ import { lanes } from './lanes.js';
 import { AgentManager } from '../agent/agent-manager.js';
 import { TeamRouter } from '../agent/team-router.js';
 import { TeamBus } from '../agent/team-bus.js';
+import { events } from '../events/bus.js';
 
 const logger = pino({ name: 'clementine.gateway' });
 
@@ -468,6 +469,7 @@ export class Gateway {
 
       try {
         logger.info(`Message from ${sessionKey}: ${text.slice(0, 100)}...`);
+        events.emit('message:received', { sessionKey, text, timestamp: Date.now() });
 
         // ── Register provenance on first interaction ────────────────
         this.ensureProvenance(sessionKey);
@@ -634,6 +636,8 @@ export class Gateway {
           // Phase 1: 15 turns for all sessions. If the model needs more, it
           // auto-escalates to deep mode (background unleashed task).
           const phase1MaxTurns = maxTurns ?? 15;
+          events.emit('query:start', { sessionKey, model: effectiveModel, maxTurns: phase1MaxTurns, timestamp: Date.now() });
+          const queryStartMs = Date.now();
           const [response] = await Promise.race([
             this.assistant.chat(
               text,
@@ -646,6 +650,11 @@ export class Gateway {
           clearTimeout(chatTimer);
           if (hardWallTimer) clearTimeout(hardWallTimer);
           { const cs = this.sessions.get(sessionKey); if (cs) delete cs.abortController; }
+
+          events.emit('query:complete', {
+            sessionKey, responseLength: response?.length ?? 0,
+            toolActivityCount, durationMs: Date.now() - queryStartMs,
+          });
 
           // Re-baseline integrity checksums after chat (auto-memory may write to vault)
           scanner.refreshIntegrity();
@@ -841,7 +850,10 @@ export class Gateway {
   ): Promise<string> {
     const releaseLane = await lanes.acquire('heartbeat');
     try {
-      logger.info({ agent: profile?.slug ?? 'clementine' }, 'Running heartbeat...');
+      const agent = profile?.slug ?? 'clementine';
+      logger.info({ agent }, 'Running heartbeat...');
+      events.emit('heartbeat:start', { agent, timestamp: Date.now() });
+      const hbStart = Date.now();
       try {
         const response = await this.assistant.heartbeat(
           standingInstructions,
@@ -854,8 +866,10 @@ export class Gateway {
         // Re-baseline integrity checksums after heartbeat (may write to vault)
         scanner.refreshIntegrity();
 
+        events.emit('heartbeat:complete', { agent, durationMs: Date.now() - hbStart, responseLength: response?.length ?? 0 });
         return response;
       } catch (err) {
+        events.emit('heartbeat:error', { agent, error: String(err) });
         logger.error({ err }, 'Heartbeat error');
         return `Heartbeat error: ${err}`;
       }
@@ -879,6 +893,8 @@ export class Gateway {
     const releaseLane = await lanes.acquire('cron');
     try {
       logger.info(`Running cron job: ${jobName}${workDir ? ` in ${workDir}` : ''}${mode === 'unleashed' ? ' (unleashed)' : ''}`);
+      events.emit('cron:start', { jobName, tier, mode, timestamp: Date.now() });
+      const cronStart = Date.now();
       try {
         let response: string;
         if (mode === 'unleashed') {
@@ -890,8 +906,10 @@ export class Gateway {
         // Re-baseline integrity checksums after cron job (may write to vault)
         scanner.refreshIntegrity();
 
+        events.emit('cron:complete', { jobName, mode, durationMs: Date.now() - cronStart, responseLength: response?.length ?? 0 });
         return response;
       } catch (err) {
+        events.emit('cron:error', { jobName, mode, error: String(err) });
         logger.error({ err, jobName }, `Cron job error: ${jobName}`);
         throw err;
       }

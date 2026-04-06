@@ -1201,6 +1201,32 @@ If you're stuck after reading several files, tell ${owner} what's blocking you. 
       allowedTools.push('Task', 'Agent');
     }
 
+    // Include dynamically registered tools (user scripts + plugins)
+    try {
+      const toolsDir = path.join(BASE_DIR, 'tools');
+      const pluginsDir = path.join(BASE_DIR, 'plugins');
+      if (fs.existsSync(toolsDir)) {
+        for (const f of fs.readdirSync(toolsDir).filter(f => f.endsWith('.sh') || f.endsWith('.py'))) {
+          const toolName = f.replace(/\.(sh|py)$/, '').replace(/[^a-z0-9_]/gi, '_');
+          allowedTools.push(mcpTool(toolName));
+        }
+      }
+      if (fs.existsSync(pluginsDir)) {
+        for (const f of fs.readdirSync(pluginsDir).filter(f => f.endsWith('.js') || f.endsWith('.mjs'))) {
+          // Read manifest if available, otherwise skip (tools registered by plugins are auto-discovered)
+          const manifestPath = path.join(pluginsDir, f.replace(/\.(js|mjs)$/, '.json'));
+          if (fs.existsSync(manifestPath)) {
+            try {
+              const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf-8'));
+              if (Array.isArray(manifest.tools)) {
+                for (const t of manifest.tools) allowedTools.push(mcpTool(t));
+              }
+            } catch { /* skip */ }
+          }
+        }
+      }
+    } catch { /* non-fatal — dynamic tools are supplementary */ }
+
     // Agent tool whitelist: filter down to only allowed tools
     if (profile?.team?.allowedTools?.length) {
       const whitelist = new Set(profile.team.allowedTools.flatMap(t => [t, mcpTool(t)]));

@@ -3583,11 +3583,34 @@ server.tool(
       createdAt: new Date().toISOString(),
     }, null, 2));
 
-    return textResult(
-      `Tool "${safeName}" created at ~/.clementine/tools/${safeName}${ext}\n` +
-      `It will be available as an MCP tool after daemon restart.\n` +
-      (args_description ? `Args: ${args_description}` : ''),
-    );
+    // Hot-register: make the tool available immediately without restart
+    try {
+      server.tool(safeName, description, { args: z.string().optional().describe(args_description ?? 'Optional arguments') }, async ({ args }) => {
+        const { execSync: execTool } = await import('node:child_process');
+        try {
+          const result = execTool(`"${filePath}" ${args || ''}`, {
+            encoding: 'utf-8',
+            timeout: 30000,
+            cwd: BASE_DIR,
+            env: { ...process.env, CLEMENTINE_HOME: BASE_DIR },
+          });
+          return textResult(result.trim() || '(no output)');
+        } catch (err: any) {
+          return textResult(`Tool error: ${err.stderr || err.message || String(err)}`.slice(0, 500));
+        }
+      });
+      return textResult(
+        `Tool "${safeName}" created and registered — available immediately.\n` +
+        `Saved to ~/.clementine/tools/${safeName}${ext}\n` +
+        (args_description ? `Args: ${args_description}` : ''),
+      );
+    } catch {
+      return textResult(
+        `Tool "${safeName}" created at ~/.clementine/tools/${safeName}${ext}\n` +
+        `It will be available after daemon restart.\n` +
+        (args_description ? `Args: ${args_description}` : ''),
+      );
+    }
   },
 );
 
@@ -5765,6 +5788,27 @@ async function main() {
         logger.info({ tool: toolName, file }, 'Registered user tool');
       } catch (err) {
         logger.warn({ tool: toolName, err }, 'Failed to register user tool');
+      }
+    }
+  }
+
+  // Auto-register plugin modules from ~/.clementine/plugins/
+  // Each plugin is a .js/.mjs file that exports a register(server, z, helpers) function
+  const pluginsDir = path.join(BASE_DIR, 'plugins');
+  if (existsSync(pluginsDir)) {
+    const pluginFiles = readdirSync(pluginsDir).filter(f => f.endsWith('.js') || f.endsWith('.mjs'));
+    for (const file of pluginFiles) {
+      try {
+        const pluginPath = path.join(pluginsDir, file);
+        const plugin = await import(pluginPath);
+        if (typeof plugin.register === 'function') {
+          await plugin.register(server, z, { textResult, externalResult, getStore, BASE_DIR, VAULT_DIR, logger });
+          logger.info({ plugin: file }, 'Loaded plugin');
+        } else {
+          logger.warn({ plugin: file }, 'Plugin missing register() export — skipped');
+        }
+      } catch (err) {
+        logger.warn({ err, plugin: file }, 'Failed to load plugin');
       }
     }
   }
