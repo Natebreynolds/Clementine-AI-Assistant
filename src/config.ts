@@ -121,10 +121,10 @@ export const MODELS: Models = {
 // ── Budget caps (USD per query) ──────────────────────────────────────
 
 export const BUDGET = {
-  heartbeat: undefined,       // no cap — CLI plan is not metered
-  cronT1: undefined,
-  cronT2: undefined,
-  chat: undefined,
+  heartbeat: 0.50,            // $0.50 per heartbeat (Haiku, cheap)
+  cronT1: 2.00,               // $2 per tier-1 cron job (needs room for outlook+search)
+  cronT2: 5.00,               // $5 per tier-2 cron job
+  chat: 5.00,                 // $5 per interactive chat message
   unleashedPhase: undefined,
   memoryExtraction: undefined,
   summarization: undefined,

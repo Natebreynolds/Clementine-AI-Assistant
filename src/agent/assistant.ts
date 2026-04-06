@@ -1081,7 +1081,10 @@ If there are natural next steps, suggest 1-2 as questions.
 
 For complex tasks spanning multiple files or needing sustained work, propose deep mode: output \`[DEEP_MODE: brief description]\` as the FIRST line, followed by your conversational response. This runs the work in the background with check-ins.
 
-If you're stuck after reading several files, tell ${owner} what's blocking you. Don't keep reading hoping for a breakthrough.`);
+If you're stuck after reading several files, tell ${owner} what's blocking you. Don't keep reading hoping for a breakthrough.
+
+### Turn Budget Rule
+You have a limited number of turns per message (~15). **After 8-10 tool calls, you MUST stop and deliver what you've found so far**, even if your research is incomplete. A partial answer the user can see is infinitely better than an exhaustive answer that gets cut off. Never spend all your turns reading data — always reserve 2-3 turns for your response.`);
     }
 
     // Security rules are now appended to systemPrompt in buildOptions()
