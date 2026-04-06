@@ -39,6 +39,7 @@ import {
 } from '../config.js';
 import type {
   CronRunEntry,
+  EvolutionVersion,
   Feedback,
   SelfImproveConfig,
   SelfImproveExperiment,
@@ -68,6 +69,56 @@ const STATE_FILE = path.join(SELF_IMPROVE_DIR, 'state.json');
 const PENDING_DIR = path.join(SELF_IMPROVE_DIR, 'pending-changes');
 const APPROVAL_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 const IMPACT_CHECKS_FILE = path.join(SELF_IMPROVE_DIR, 'impact-checks.jsonl');
+const EVOLUTION_VERSIONS_FILE = path.join(SELF_IMPROVE_DIR, 'evolution-versions.json');
+const SOUL_BASELINE_FILE = path.join(SELF_IMPROVE_DIR, 'soul-baseline.md');
+
+/** Minimum Jaccard similarity between a proposed SOUL.md and the baseline.
+ *  Below this threshold, the change is rejected as identity drift. */
+const DRIFT_SIMILARITY_THRESHOLD = 0.55;
+
+/** If post-change metrics drop by more than this ratio, auto-rollback triggers. */
+const REGRESSION_ROLLBACK_THRESHOLD = 0.10;
+
+// ── Drift detection ─────────────────────────────────────────────────
+
+/** Tokenize text into a word set for Jaccard similarity. */
+function tokenizeForDrift(text: string): Set<string> {
+  return new Set(
+    text.toLowerCase()
+      .replace(/[^\w\s]/g, ' ')
+      .split(/\s+/)
+      .filter(w => w.length > 2),
+  );
+}
+
+/** Jaccard similarity between two token sets. */
+function jaccardSimilarity(a: Set<string>, b: Set<string>): number {
+  if (a.size === 0 && b.size === 0) return 1;
+  let intersection = 0;
+  for (const token of a) {
+    if (b.has(token)) intersection++;
+  }
+  const union = a.size + b.size - intersection;
+  return union === 0 ? 0 : intersection / union;
+}
+
+/** Check if a proposed change drifts too far from the baseline identity.
+ *  Only applies to 'soul' area changes. Returns { ok, similarity }. */
+function checkDrift(proposedContent: string): { ok: boolean; similarity: number } {
+  if (!existsSync(SOUL_BASELINE_FILE)) {
+    // First run: snapshot current SOUL.md as baseline
+    if (existsSync(SOUL_FILE)) {
+      mkdirSync(path.dirname(SOUL_BASELINE_FILE), { recursive: true });
+      writeFileSync(SOUL_BASELINE_FILE, readFileSync(SOUL_FILE, 'utf-8'));
+    }
+    return { ok: true, similarity: 1 };
+  }
+  const baseline = readFileSync(SOUL_BASELINE_FILE, 'utf-8');
+  const baseTokens = tokenizeForDrift(baseline);
+  const proposedTokens = tokenizeForDrift(proposedContent);
+  const similarity = jaccardSimilarity(baseTokens, proposedTokens);
+  return { ok: similarity >= DRIFT_SIMILARITY_THRESHOLD, similarity };
+}
 
 // ── Risk classification ──────────────────────────────────────────────
 
@@ -154,6 +205,12 @@ export class SelfImproveLoop {
     this.reconcileState();
     this.expireStaleProposals();
     await this.checkAppliedImpact();
+    // Capture SOUL.md baseline on first run (for drift detection)
+    if (!existsSync(SOUL_BASELINE_FILE) && existsSync(SOUL_FILE)) {
+      mkdirSync(path.dirname(SOUL_BASELINE_FILE), { recursive: true });
+      writeFileSync(SOUL_BASELINE_FILE, readFileSync(SOUL_FILE, 'utf-8'));
+      logger.info('Captured SOUL.md baseline for drift detection');
+    }
     const state = this.loadState();
     state.status = 'running';
     state.lastRunAt = new Date().toISOString();
@@ -230,6 +287,18 @@ export class SelfImproveLoop {
             continue;
           }
 
+          // Drift detection: reject SOUL.md changes that stray too far from baseline identity
+          if (proposal.area === 'soul') {
+            const drift = checkDrift(proposal.proposedChange);
+            if (!drift.ok) {
+              logger.warn({ similarity: drift.similarity.toFixed(3), threshold: DRIFT_SIMILARITY_THRESHOLD },
+                'Soul drift detected — proposed change deviates too far from baseline identity');
+              consecutiveLow++;
+              continue;
+            }
+            logger.debug({ similarity: drift.similarity.toFixed(3) }, 'Soul drift check passed');
+          }
+
           // Step 4: Read current state
           const before = await this.readCurrentState(proposal.area, proposal.target);
 
@@ -288,6 +357,8 @@ export class SelfImproveLoop {
                   writeFileSync(targetPath, proposal.proposedChange);
                   experiment.approvalStatus = 'approved';
                   this.updateExperimentStatus(id, 'approved');
+                  // Record version for rollback lineage
+                  this.recordVersion(id, proposal.area, proposal.target, proposal.hypothesis, before);
                   // Schedule impact check
                   try {
                     appendFileSync(IMPACT_CHECKS_FILE, JSON.stringify({
@@ -954,8 +1025,18 @@ export class SelfImproveLoop {
       return `Cannot apply change — validation failed: ${validation.error}`;
     }
 
+    // Drift check for soul changes — even approved changes must not drift too far
+    if (pending.area === 'soul') {
+      const drift = checkDrift(pending.proposedChange);
+      if (!drift.ok) {
+        return `Cannot apply change — identity drift too high (similarity: ${drift.similarity.toFixed(3)}, threshold: ${DRIFT_SIMILARITY_THRESHOLD})`;
+      }
+    }
+
     // Write the change (non-source areas)
     writeFileSync(targetPath, pending.proposedChange);
+    // Record version for rollback lineage
+    this.recordVersion(experimentId, pending.area, pending.target, pending.hypothesis, pending.before);
     logger.info({ id: experimentId, area: pending.area, target: pending.target }, 'Applied approved change');
 
     // Update experiment log — mark as approved
@@ -1374,13 +1455,14 @@ export class SelfImproveLoop {
     return expired;
   }
 
-  /** Check impact of previously applied changes. Runs at start of each self-improve cycle. */
+  /** Check impact of previously applied changes. Triggers auto-rollback on regression. */
   private async checkAppliedImpact(): Promise<void> {
     if (!existsSync(IMPACT_CHECKS_FILE)) return;
     try {
       const lines = readFileSync(IMPACT_CHECKS_FILE, 'utf-8').trim().split('\n').filter(Boolean);
       const remaining: string[] = [];
       const now = Date.now();
+      const state = this.loadState();
 
       for (const line of lines) {
         try {
@@ -1393,6 +1475,8 @@ export class SelfImproveLoop {
 
           // Measure current state for this area
           const metrics = await this.gatherMetrics();
+          const currentFeedbackRatio = metrics.feedbackStats.total > 0
+            ? metrics.feedbackStats.positive / metrics.feedbackStats.total : 1;
           const impact = {
             type: 'impact',
             experimentId: check.experimentId,
@@ -1400,11 +1484,27 @@ export class SelfImproveLoop {
             target: check.target,
             measuredAt: new Date().toISOString(),
             cronSuccessRate: metrics.cronSuccessRate,
-            feedbackPositiveRatio: metrics.feedbackStats.total > 0
-              ? metrics.feedbackStats.positive / metrics.feedbackStats.total : 1,
+            feedbackPositiveRatio: currentFeedbackRatio,
           };
           appendFileSync(EXPERIMENT_LOG, JSON.stringify(impact) + '\n');
           logger.info({ ...impact }, 'Impact measurement recorded');
+
+          // Auto-rollback: check if metrics regressed significantly
+          const baselineCron = state.baselineMetrics?.cronSuccessRate ?? 0;
+          const baselineFeedback = state.baselineMetrics?.feedbackPositiveRatio ?? 0;
+          const cronDrop = baselineCron > 0
+            ? (baselineCron - metrics.cronSuccessRate) / baselineCron : 0;
+          const feedbackDrop = baselineFeedback > 0
+            ? (baselineFeedback - currentFeedbackRatio) / baselineFeedback : 0;
+
+          if (cronDrop > REGRESSION_ROLLBACK_THRESHOLD || feedbackDrop > REGRESSION_ROLLBACK_THRESHOLD) {
+            logger.warn({
+              experimentId: check.experimentId,
+              cronDrop: `${(cronDrop * 100).toFixed(1)}%`,
+              feedbackDrop: `${(feedbackDrop * 100).toFixed(1)}%`,
+            }, 'Regression detected — initiating auto-rollback');
+            this.rollbackVersion(check.experimentId);
+          }
         } catch {
           remaining.push(line);
         }
@@ -1413,6 +1513,89 @@ export class SelfImproveLoop {
       writeFileSync(IMPACT_CHECKS_FILE, remaining.length > 0 ? remaining.join('\n') + '\n' : '');
     } catch (err) {
       logger.warn({ err }, 'Impact check failed');
+    }
+  }
+
+  // ── Version Lineage ───────────────────────────────────────────────
+
+  /** Load evolution version history. */
+  private loadVersions(): EvolutionVersion[] {
+    if (!existsSync(EVOLUTION_VERSIONS_FILE)) return [];
+    try {
+      return JSON.parse(readFileSync(EVOLUTION_VERSIONS_FILE, 'utf-8'));
+    } catch { return []; }
+  }
+
+  /** Save evolution version history. */
+  private saveVersions(versions: EvolutionVersion[]): void {
+    ensureDirs();
+    writeFileSync(EVOLUTION_VERSIONS_FILE, JSON.stringify(versions, null, 2));
+  }
+
+  /** Record a version when a change is applied. */
+  recordVersion(experimentId: string, area: string, target: string, rationale: string, beforeSnapshot: string): void {
+    const versions = this.loadVersions();
+
+    // Find parent: most recent non-rolled-back version for the same target
+    const parent = versions
+      .filter(v => v.area === area && v.target === target && !v.rolledBack)
+      .sort((a, b) => new Date(b.appliedAt).getTime() - new Date(a.appliedAt).getTime())[0];
+
+    versions.push({
+      experimentId,
+      area,
+      target,
+      appliedAt: new Date().toISOString(),
+      parentVersion: parent?.experimentId,
+      rationale,
+      beforeSnapshot,
+    });
+
+    // Keep at most 50 versions to prevent unbounded growth
+    if (versions.length > 50) {
+      versions.splice(0, versions.length - 50);
+    }
+
+    this.saveVersions(versions);
+  }
+
+  /** Rollback a specific version by restoring its beforeSnapshot. */
+  rollbackVersion(experimentId: string): boolean {
+    const versions = this.loadVersions();
+    const version = versions.find(v => v.experimentId === experimentId && !v.rolledBack);
+    if (!version) {
+      logger.warn({ experimentId }, 'No version found to rollback');
+      return false;
+    }
+
+    const targetPath = this.resolveTargetPath(version.area, version.target);
+    if (!targetPath) {
+      logger.warn({ area: version.area, target: version.target }, 'Cannot resolve target path for rollback');
+      return false;
+    }
+
+    try {
+      writeFileSync(targetPath, version.beforeSnapshot);
+      version.rolledBack = true;
+      version.rolledBackAt = new Date().toISOString();
+      this.saveVersions(versions);
+      this.updateExperimentStatus(experimentId, 'denied');
+
+      // Log the rollback event
+      appendFileSync(EXPERIMENT_LOG, JSON.stringify({
+        type: 'rollback',
+        experimentId,
+        area: version.area,
+        target: version.target,
+        rolledBackAt: version.rolledBackAt,
+        reason: 'Regression detected in post-change metrics',
+      }) + '\n');
+
+      logger.info({ experimentId, area: version.area, target: version.target }, 'Auto-rollback completed');
+      return true;
+    } catch (err) {
+      logger.error({ err, experimentId }, 'Auto-rollback failed');
+      return false;
     }
   }
 

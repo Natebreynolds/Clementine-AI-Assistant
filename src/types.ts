@@ -82,6 +82,43 @@ export interface Attachment {
   localPath?: string;
 }
 
+// ── Channel Capabilities ────────────────────────────────────────────
+
+/** Declares what a channel can do, enabling graceful degradation. */
+export interface ChannelCapabilities {
+  /** Channel supports threaded conversations. */
+  threads: boolean;
+  /** Channel supports rich text (markdown, formatting). */
+  richText: boolean;
+  /** Channel supports file/image attachments. */
+  attachments: boolean;
+  /** Channel supports interactive buttons/actions. */
+  buttons: boolean;
+  /** Channel supports emoji reactions. */
+  reactions: boolean;
+  /** Channel supports typing indicators. */
+  typingIndicators: boolean;
+  /** Channel supports editing previously sent messages. */
+  editMessages: boolean;
+  /** Channel supports inline images in responses. */
+  inlineImages: boolean;
+  /** Maximum message length (0 = unlimited). */
+  maxMessageLength: number;
+}
+
+/** Default capabilities for channels that don't declare their own. */
+export const DEFAULT_CHANNEL_CAPABILITIES: ChannelCapabilities = {
+  threads: false,
+  richText: false,
+  attachments: false,
+  buttons: false,
+  reactions: false,
+  typingIndicators: false,
+  editMessages: false,
+  inlineImages: false,
+  maxMessageLength: 0,
+};
+
 // ── Gateway ──────────────────────────────────────────────────────────
 
 export type OnTextCallback = (text: string) => Promise<void>;
@@ -486,6 +523,19 @@ export interface SelfImproveExperiment {
   error?: string;
 }
 
+/** Tracks a versioned evolution change for rollback chains. */
+export interface EvolutionVersion {
+  experimentId: string;                // Links back to the experiment
+  area: string;
+  target: string;
+  appliedAt: string;                   // ISO
+  parentVersion?: string;              // experimentId of previous change to same target
+  rationale: string;                   // Why this change was made
+  beforeSnapshot: string;              // Content before the change (for rollback)
+  rolledBack?: boolean;
+  rolledBackAt?: string;
+}
+
 export interface SelfImproveState {
   status: 'idle' | 'running' | 'completed' | 'failed';
   lastRunAt: string;                   // ISO
@@ -497,6 +547,8 @@ export interface SelfImproveState {
     avgResponseQuality: number;        // LLM judge score (0-1)
   };
   pendingApprovals: number;
+  /** Version lineage for applied changes — enables rollback chains. */
+  evolutionVersions?: EvolutionVersion[];
 }
 
 export interface SelfImproveConfig {

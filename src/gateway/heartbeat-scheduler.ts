@@ -1218,9 +1218,19 @@ export class HeartbeatScheduler {
 
   private static shouldSuppressMessage(response: string): boolean {
     const trimmed = response.trim();
-    // Only suppress the explicit opt-out signal — let everything else through.
-    // Short proactive messages ("Want me to check your email?") are valuable.
-    return trimmed === '__NOTHING__';
+    // Suppress the explicit opt-out signal
+    if (trimmed === '__NOTHING__') return true;
+    // Suppress variations the model sometimes produces
+    if (/^_*NOTHING_*$/i.test(trimmed)) return true;
+    // Suppress empty-substance responses: the model announces what it would do but produces no actual content
+    // e.g. "I'll run the heartbeat check." followed by nothing, or tool-not-available complaints
+    const lower = trimmed.toLowerCase();
+    if (lower.length < 200 && (
+      /^i'?ll run the heartbeat/i.test(lower) ||
+      /tools?.{0,20}(?:aren'?t|not|unavailable|isn'?t).{0,20}(?:available|accessible|loaded)/i.test(lower) ||
+      /can'?t (?:load state|check|properly run|access)/i.test(lower)
+    )) return true;
+    return false;
   }
 
   // ── Dedup Ledger ──────────────────────────────────────────────────

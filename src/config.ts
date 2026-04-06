@@ -80,6 +80,7 @@ export const TASKS_FILE = path.join(TASKS_DIR, 'TASKS.md');
 export const DAILY_TEMPLATE = path.join(TEMPLATES_DIR, '_Daily-Template.md');
 export const PEOPLE_TEMPLATE = path.join(TEMPLATES_DIR, '_People-Template.md');
 export const PROJECTS_META_FILE = path.join(BASE_DIR, 'projects.json');
+export const WORKING_MEMORY_FILE = path.join(BASE_DIR, 'working-memory.md');
 
 // ── Assistant identity ───────────────────────────────────────────────
 

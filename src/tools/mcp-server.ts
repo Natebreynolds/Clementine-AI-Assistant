@@ -9,7 +9,7 @@
 
 import { randomBytes } from 'node:crypto';
 import { execSync } from 'node:child_process';
-import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -56,6 +56,8 @@ const TEMPLATES_DIR = path.join(VAULT_DIR, '06-Templates');
 const INBOX_DIR = path.join(VAULT_DIR, '07-Inbox');
 
 const MEMORY_FILE = path.join(SYSTEM_DIR, 'MEMORY.md');
+const WORKING_MEMORY_FILE = path.join(BASE_DIR, 'working-memory.md');
+const WORKING_MEMORY_MAX_LINES = 75;
 const TASKS_FILE = path.join(TASKS_DIR, 'TASKS.md');
 const SOUL_FILE = path.join(SYSTEM_DIR, 'SOUL.md');
 const HEARTBEAT_FILE = path.join(SYSTEM_DIR, 'HEARTBEAT.md');
@@ -457,6 +459,54 @@ function globMd(dir: string): string[] {
 
 const serverName = (env['ASSISTANT_NAME'] ?? 'Clementine').toLowerCase() + '-tools';
 const server = new McpServer({ name: serverName, version: '1.0.0' });
+
+// ── 0. working_memory ──────────────────────────────────────────────────
+
+server.tool(
+  'working_memory',
+  'Persistent scratchpad that survives across conversations. Use to jot down current project context, TODOs, reminders, or anything you need to remember for next time. Actions: read, append, replace, clear.',
+  {
+    action: z.enum(['read', 'append', 'replace', 'clear']).describe('What to do with working memory'),
+    content: z.string().optional().describe('Text to append or replace with (required for append/replace)'),
+  },
+  async ({ action, content }) => {
+    switch (action) {
+      case 'read': {
+        if (!existsSync(WORKING_MEMORY_FILE)) {
+          return textResult('Working memory is empty.');
+        }
+        const text = readFileSync(WORKING_MEMORY_FILE, 'utf-8');
+        const lineCount = text.split('\n').length;
+        let result = text;
+        if (lineCount > WORKING_MEMORY_MAX_LINES) {
+          result += `\n\n⚠️ Working memory is ${lineCount} lines (limit: ${WORKING_MEMORY_MAX_LINES}). Consider compacting — remove resolved items and summarize.`;
+        }
+        return textResult(result);
+      }
+      case 'append': {
+        if (!content) return textResult('Error: content is required for append.');
+        const existing = existsSync(WORKING_MEMORY_FILE) ? readFileSync(WORKING_MEMORY_FILE, 'utf-8') : '';
+        const separator = existing && !existing.endsWith('\n') ? '\n' : '';
+        writeFileSync(WORKING_MEMORY_FILE, existing + separator + content + '\n');
+        const newLineCount = (existing + separator + content).split('\n').length;
+        let msg = `Appended to working memory.`;
+        if (newLineCount > WORKING_MEMORY_MAX_LINES) {
+          msg += ` ⚠️ Now ${newLineCount} lines — consider compacting.`;
+        }
+        return textResult(msg);
+      }
+      case 'replace': {
+        if (!content) return textResult('Error: content is required for replace.');
+        writeFileSync(WORKING_MEMORY_FILE, content + '\n');
+        return textResult('Working memory replaced.');
+      }
+      case 'clear': {
+        if (existsSync(WORKING_MEMORY_FILE)) unlinkSync(WORKING_MEMORY_FILE);
+        return textResult('Working memory cleared.');
+      }
+    }
+  },
+);
 
 // ── 1. memory_read ─────────────────────────────────────────────────────
 

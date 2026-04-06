@@ -54,8 +54,10 @@ import {
   HANDOFFS_DIR,
   BUDGET,
   ENABLE_1M_CONTEXT,
+  WORKING_MEMORY_FILE,
 } from '../config.js';
-import type { AgentProfile, OnTextCallback, OnToolActivityCallback, SessionData, VerboseLevel } from '../types.js';
+import type { AgentProfile, ChannelCapabilities, OnTextCallback, OnToolActivityCallback, SessionData, VerboseLevel } from '../types.js';
+import { DEFAULT_CHANNEL_CAPABILITIES } from '../types.js';
 import {
   enforceToolPermissions,
   getSecurityPrompt,
@@ -72,10 +74,64 @@ import { scanner } from '../security/scanner.js';
 import { AgentManager } from './agent-manager.js';
 import { extractLinks } from './link-extractor.js';
 import { StallGuard } from './stall-guard.js';
-import { formatResultsForPrompt } from '../memory/search.js';
+import { assembleContext } from '../memory/context-assembler.js';
 import { PromptCache } from './prompt-cache.js';
 import { searchSkills as searchSkillsSync } from './skill-extractor.js';
 import { classifyIntent, getStrategyGuidance, type IntentClassification } from './intent-classifier.js';
+
+// ── Channel capabilities ────────────────────────────────────────────
+
+/** Map channel label to its capabilities so the agent adapts its responses. */
+function getChannelCapabilities(channel: string): ChannelCapabilities {
+  switch (channel) {
+    case 'Discord DM':
+    case 'Discord channel':
+      return {
+        threads: true, richText: true, attachments: true, buttons: true,
+        reactions: true, typingIndicators: true, editMessages: true,
+        inlineImages: true, maxMessageLength: 2000,
+      };
+    case 'Slack':
+      return {
+        threads: true, richText: true, attachments: true, buttons: true,
+        reactions: true, typingIndicators: false, editMessages: true,
+        inlineImages: true, maxMessageLength: 40000,
+      };
+    case 'Telegram':
+      return {
+        threads: false, richText: true, attachments: true, buttons: true,
+        reactions: true, typingIndicators: true, editMessages: true,
+        inlineImages: true, maxMessageLength: 4096,
+      };
+    case 'WhatsApp':
+      return {
+        threads: false, richText: false, attachments: true, buttons: true,
+        reactions: true, typingIndicators: false, editMessages: false,
+        inlineImages: false, maxMessageLength: 4096,
+      };
+    case 'webhook':
+      return {
+        threads: false, richText: true, attachments: false, buttons: false,
+        reactions: false, typingIndicators: false, editMessages: false,
+        inlineImages: false, maxMessageLength: 0,
+      };
+    default:
+      return { ...DEFAULT_CHANNEL_CAPABILITIES, richText: true };
+  }
+}
+
+/** Format capabilities as a one-liner for system prompt injection. */
+function formatCapabilities(caps: ChannelCapabilities): string {
+  const features: string[] = [];
+  if (caps.threads) features.push('threads');
+  if (caps.richText) features.push('markdown');
+  if (caps.buttons) features.push('buttons');
+  if (caps.reactions) features.push('reactions');
+  if (caps.attachments) features.push('file attachments');
+  if (caps.editMessages) features.push('message editing');
+  if (caps.maxMessageLength > 0) features.push(`max ${caps.maxMessageLength} chars/message`);
+  return features.length > 0 ? features.join(', ') : 'text only';
+}
 
 // ── Token estimation & context window guard ─────────────────────────
 
@@ -709,6 +765,16 @@ export class PersonalAssistant {
         `Only reference if genuinely relevant — do not force callbacks to old context.*`,
       );
     } else {
+      // Fallback: inject working memory + MEMORY.md directly when no retrieval context
+      if (fs.existsSync(WORKING_MEMORY_FILE)) {
+        try {
+          const wmContent = fs.readFileSync(WORKING_MEMORY_FILE, 'utf-8').trim();
+          if (wmContent) {
+            const truncated = isAutonomous ? wmContent.slice(0, 1500) : wmContent;
+            parts.push(`## Working Memory (scratchpad)\n\n${truncated}`);
+          }
+        } catch { /* non-critical */ }
+      }
       const memoryEntry = this.promptCache.get(MEMORY_FILE);
       if (memoryEntry) {
         // Autonomous runs get truncated memory — just enough for context
@@ -789,12 +855,13 @@ export class PersonalAssistant {
     const resolvedModel = resolveModel(model) ?? MODEL;
     const modelLabel = Object.entries(MODELS).find(([, v]) => v === resolvedModel)?.[0] ?? resolvedModel;
 
+    const caps = !isAutonomous ? getChannelCapabilities(channel) : null;
     parts.push(`## Current Context
 
 - **Date:** ${formatDate(now)}
 - **Time:** ${formatTime(now)}
 - **Timezone:** ${Intl.DateTimeFormat().resolvedOptions().timeZone}
-- **Channel:** ${channel}
+- **Channel:** ${channel}${caps ? ` (${formatCapabilities(caps)})` : ''}
 - **Model:** ${modelLabel} (${resolvedModel})
 - **Vault:** ${vault}
 `);
@@ -1074,6 +1141,7 @@ If you're stuck after reading several files, tell ${owner} what's blocking you. 
     let allowedTools = [
       'Read', 'Write', 'Edit', 'Bash', 'Glob', 'Grep',
       'WebSearch', 'WebFetch',
+      mcpTool('working_memory'),
       mcpTool('memory_read'),
       mcpTool('memory_write'),
       mcpTool('memory_search'),
@@ -1271,6 +1339,7 @@ If you're stuck after reading several files, tell ${owner} what's blocking you. 
     userMessage: string,
     sessionKey?: string | null,
     agentSlug?: string,
+    isAutonomous?: boolean,
   ): Promise<string> {
     if (!this.memoryStore) return '';
 
@@ -1309,65 +1378,63 @@ If you're stuck after reading several files, tell ${owner} what's blocking you. 
         }
       }
 
-      let contextStr = formatResultsForPrompt(results, SYSTEM_PROMPT_MAX_CONTEXT_CHARS);
-
-      // Enrich with matching procedural skills (if any)
+      // Resolve skill context
+      let skillContext: string | undefined;
       try {
         const { searchSkills, recordSkillUse } = await import('./skill-extractor.js');
         const matchedSkills = searchSkills(enrichedQuery, 2);
         if (matchedSkills.length > 0) {
-          const skillContext = matchedSkills.map(s => {
-            recordSkillUse(s.name);
-            return `## Skill: ${s.title}\n${s.content}`;
-          }).join('\n\n');
-          contextStr = `## Relevant Procedures (from past successful executions)\n\n${skillContext}\n\n${contextStr}`;
+          skillContext = `## Relevant Procedures (from past successful executions)\n\n` +
+            matchedSkills.map(s => {
+              recordSkillUse(s.name);
+              return `## Skill: ${s.title}\n${s.content}`;
+            }).join('\n\n');
         }
-      } catch { /* non-fatal — skills are supplementary */ }
+      } catch { /* non-fatal */ }
 
-      // Enrich with graph relationship context
+      // Resolve graph context
+      let graphContext: string | undefined;
       try {
         const { getSharedGraphStore } = await import('../memory/graph-store.js');
         const { GRAPH_DB_DIR } = await import('../config.js');
         const gs = await getSharedGraphStore(GRAPH_DB_DIR);
         if (gs) {
           const entityIds = new Set<string>();
-
-          // Extract entity slugs from source file paths (People, Projects, Topics)
           for (const r of results ?? []) {
             const sf = (r as any).sourceFile ?? '';
-            // Only vault subdirectory files map cleanly to entities
             if (/0[2-4]-/.test(sf)) {
               const slug = path.basename(sf, '.md').toLowerCase().replace(/\s+/g, '-');
               if (slug) entityIds.add(slug);
             }
           }
-
-          // Extract entity mentions from user message + chunk content via wikilinks
           const wikilinkRe = /\[\[([^\]|]+)(?:\|[^\]]+)?\]\]/g;
           const textToScan = [userMessage, ...(results ?? []).map((r: any) => r.content ?? '')].join(' ');
           let wm: RegExpExecArray | null;
           while ((wm = wikilinkRe.exec(textToScan)) !== null) {
             entityIds.add(wm[1].toLowerCase().replace(/\s+/g, '-'));
           }
-
-          // Also try matching known query terms as entity IDs (lowercased words 3+ chars)
           for (const word of userMessage.toLowerCase().split(/\s+/)) {
             const clean = word.replace(/[^a-z0-9-]/g, '');
             if (clean.length >= 3) entityIds.add(clean);
           }
-
           if (entityIds.size > 0) {
-            const graphContext = await gs.enrichWithGraphContext([...entityIds].slice(0, 10));
-            if (graphContext) {
-              contextStr += graphContext;
-            }
+            const gc = await gs.enrichWithGraphContext([...entityIds].slice(0, 10));
+            if (gc) graphContext = gc;
           }
         }
-      } catch {
-        // Graph enrichment failed — non-fatal
-      }
+      } catch { /* non-fatal */ }
 
-      return contextStr;
+      // Assemble context within a priority-based budget
+      const assembled = await assembleContext({
+        totalBudget: SYSTEM_PROMPT_MAX_CONTEXT_CHARS,
+        workingMemoryPath: WORKING_MEMORY_FILE,
+        memoryResults: results,
+        skillContext,
+        graphContext,
+        isAutonomous: isAutonomous ?? false,
+      });
+
+      return assembled.text;
     } catch {
       return '';
     }
@@ -2537,7 +2604,7 @@ If you're stuck after reading several files, tell ${owner} what's blocking you. 
     const sdkOptions = this.buildOptions({
       isHeartbeat: true,
       enableTeams: false,
-      model: MODELS.haiku,
+      model: MODELS.sonnet,
       profile: profile ?? undefined,
     });
     const now = new Date();
@@ -2549,7 +2616,10 @@ If you're stuck after reading several files, tell ${owner} what's blocking you. 
 
     const promptParts = [
       `[Heartbeat — ${localTime}, ${localDate} (${tz})]`,
-      `You're ${agentName}, checking in with ${owner}. Talk like a teammate giving a quick update — not a system generating a report. If you need to look something up to answer properly, use your tools first, then respond with what you found.`,
+      `You're ${agentName}, checking in with ${owner}.`,
+      // Ground the model: context is already provided, no tool calls needed for basic check-ins
+      `The context below already contains everything you need — do NOT call tools to "check" or "load state". ` +
+      `Just read the context provided and respond based on what you see.`,
     ];
     if (dedupContext) {
       promptParts.push(`\n${dedupContext}\n\nIf all of the above are unchanged, respond with exactly: __NOTHING__`);
@@ -2562,7 +2632,8 @@ If you're stuck after reading several files, tell ${owner} what's blocking you. 
     }
     promptParts.push(
       `\nIf nothing changed, respond with exactly: __NOTHING__\n` +
-      `Otherwise, keep it brief and conversational. No bullet lists, no formal reports. ` +
+      `Otherwise, keep it brief and conversational (1-3 sentences). No bullet lists, no formal reports. ` +
+      `Never announce that you're going to check something — either you already have the info above, or respond __NOTHING__. ` +
       `Tag topics with [topic: key] for dedup tracking.\n\n` +
       `Standing instructions:\n${standingInstructions}`,
     );
