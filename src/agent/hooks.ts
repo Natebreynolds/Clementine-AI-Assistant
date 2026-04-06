@@ -23,6 +23,7 @@ let activeProfileAllowedTools: string[] | null = null;
 let approvalCallback: ((desc: string) => Promise<boolean>) | null = null;
 let activeSendPolicy: SendPolicy | null = null;
 let activeAgentSlug: string | null = null;
+let activeAgentDir: string | null = null;
 /** Injected by gateway — returns daily send count and suppression check for an agent. */
 let sendPolicyChecker: ((agentSlug: string, recipientEmail: string) => { dailyCount: number; suppressed: boolean }) | null = null;
 const auditLog: string[] = [];
@@ -83,6 +84,10 @@ export function setProfileAllowedTools(tools: string[] | null): void {
 export function setSendPolicy(policy: SendPolicy | null, agentSlug: string | null): void {
   activeSendPolicy = policy;
   activeAgentSlug = agentSlug;
+}
+
+export function setAgentDir(dir: string | null): void {
+  activeAgentDir = dir;
 }
 
 export function setSendPolicyChecker(checker: ((agentSlug: string, recipientEmail: string) => { dailyCount: number; suppressed: boolean }) | null): void {
@@ -431,6 +436,21 @@ export async function enforceToolPermissions(
         behavior: 'deny',
         message: 'Requests to private/internal URLs are blocked.',
       };
+    }
+  }
+
+  // ── Agent directory scoping — team agents can only write to their own dir ─
+  if ((toolName === 'Write' || toolName === 'Edit') && activeAgentDir) {
+    const filePath = String(toolInput.file_path ?? toolInput.path ?? '');
+    if (filePath) {
+      const normalizedPath = path.resolve(filePath);
+      const normalizedAgentDir = path.resolve(activeAgentDir);
+      if (!normalizedPath.startsWith(normalizedAgentDir + path.sep) && normalizedPath !== normalizedAgentDir) {
+        return {
+          behavior: 'deny',
+          message: `Agent cannot write outside its directory (${path.basename(activeAgentDir)}/). Request this change from the primary agent instead.`,
+        };
+      }
     }
   }
 

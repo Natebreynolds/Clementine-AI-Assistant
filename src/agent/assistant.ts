@@ -67,6 +67,7 @@ import {
   logToolUse,
   setProfileTier,
   setProfileAllowedTools,
+  setAgentDir,
   setSendPolicy,
   setInteractionSource,
 } from './hooks.js';
@@ -1855,6 +1856,7 @@ You have a limited number of turns per message (~15). **After 8-10 tool calls, y
     setProfileTier(profile?.tier ?? null);
     setProfileAllowedTools(profile?.team?.allowedTools ?? null);
     setSendPolicy(profile?.sendPolicy ?? null, profile?.slug ?? null);
+    setAgentDir(profile?.agentDir ?? null);
     setInteractionSource(inferInteractionSource(sessionKey));
     if (matchedProject) {
       logger.info({ project: matchedProject.path }, 'Auto-matched project from message');
@@ -2107,6 +2109,7 @@ You have a limited number of turns per message (~15). **After 8-10 tool calls, y
       if (timeoutHandle) clearTimeout(timeoutHandle);
       setProfileTier(null);
       setSendPolicy(null, null);
+      setAgentDir(null);
       setInteractionSource('autonomous');
     }
   }
