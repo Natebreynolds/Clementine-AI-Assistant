@@ -1378,51 +1378,57 @@ If you're stuck after reading several files, tell ${owner} what's blocking you. 
         }
       }
 
-      // Resolve skill context
-      let skillContext: string | undefined;
-      try {
-        const { searchSkills, recordSkillUse } = await import('./skill-extractor.js');
-        const matchedSkills = searchSkills(enrichedQuery, 2);
-        if (matchedSkills.length > 0) {
-          skillContext = `## Relevant Procedures (from past successful executions)\n\n` +
-            matchedSkills.map(s => {
-              recordSkillUse(s.name);
-              return `## Skill: ${s.title}\n${s.content}`;
-            }).join('\n\n');
-        }
-      } catch { /* non-fatal */ }
-
-      // Resolve graph context
-      let graphContext: string | undefined;
-      try {
-        const { getSharedGraphStore } = await import('../memory/graph-store.js');
-        const { GRAPH_DB_DIR } = await import('../config.js');
-        const gs = await getSharedGraphStore(GRAPH_DB_DIR);
-        if (gs) {
-          const entityIds = new Set<string>();
-          for (const r of results ?? []) {
-            const sf = (r as any).sourceFile ?? '';
-            if (/0[2-4]-/.test(sf)) {
-              const slug = path.basename(sf, '.md').toLowerCase().replace(/\s+/g, '-');
-              if (slug) entityIds.add(slug);
+      // Resolve skill + graph context in parallel (independent of each other)
+      const [skillContext, graphContext] = await Promise.all([
+        // Skills
+        (async (): Promise<string | undefined> => {
+          try {
+            const { searchSkills, recordSkillUse } = await import('./skill-extractor.js');
+            const matchedSkills = searchSkills(enrichedQuery, 2);
+            if (matchedSkills.length > 0) {
+              return `## Relevant Procedures (from past successful executions)\n\n` +
+                matchedSkills.map(s => {
+                  recordSkillUse(s.name);
+                  return `## Skill: ${s.title}\n${s.content}`;
+                }).join('\n\n');
             }
-          }
-          const wikilinkRe = /\[\[([^\]|]+)(?:\|[^\]]+)?\]\]/g;
-          const textToScan = [userMessage, ...(results ?? []).map((r: any) => r.content ?? '')].join(' ');
-          let wm: RegExpExecArray | null;
-          while ((wm = wikilinkRe.exec(textToScan)) !== null) {
-            entityIds.add(wm[1].toLowerCase().replace(/\s+/g, '-'));
-          }
-          for (const word of userMessage.toLowerCase().split(/\s+/)) {
-            const clean = word.replace(/[^a-z0-9-]/g, '');
-            if (clean.length >= 3) entityIds.add(clean);
-          }
-          if (entityIds.size > 0) {
-            const gc = await gs.enrichWithGraphContext([...entityIds].slice(0, 10));
-            if (gc) graphContext = gc;
-          }
-        }
-      } catch { /* non-fatal */ }
+          } catch { /* non-fatal */ }
+          return undefined;
+        })(),
+        // Graph relationships
+        (async (): Promise<string | undefined> => {
+          try {
+            const { getSharedGraphStore } = await import('../memory/graph-store.js');
+            const { GRAPH_DB_DIR } = await import('../config.js');
+            const gs = await getSharedGraphStore(GRAPH_DB_DIR);
+            if (gs) {
+              const entityIds = new Set<string>();
+              for (const r of results ?? []) {
+                const sf = (r as any).sourceFile ?? '';
+                if (/0[2-4]-/.test(sf)) {
+                  const slug = path.basename(sf, '.md').toLowerCase().replace(/\s+/g, '-');
+                  if (slug) entityIds.add(slug);
+                }
+              }
+              const wikilinkRe = /\[\[([^\]|]+)(?:\|[^\]]+)?\]\]/g;
+              const textToScan = [userMessage, ...(results ?? []).map((r: any) => r.content ?? '')].join(' ');
+              let wm: RegExpExecArray | null;
+              while ((wm = wikilinkRe.exec(textToScan)) !== null) {
+                entityIds.add(wm[1].toLowerCase().replace(/\s+/g, '-'));
+              }
+              for (const word of userMessage.toLowerCase().split(/\s+/)) {
+                const clean = word.replace(/[^a-z0-9-]/g, '');
+                if (clean.length >= 3) entityIds.add(clean);
+              }
+              if (entityIds.size > 0) {
+                const gc = await gs.enrichWithGraphContext([...entityIds].slice(0, 10));
+                if (gc) return gc;
+              }
+            }
+          } catch { /* non-fatal */ }
+          return undefined;
+        })(),
+      ]);
 
       // Assemble context within a priority-based budget
       const assembled = await assembleContext({
@@ -1440,7 +1446,30 @@ If you're stuck after reading several files, tell ${owner} what's blocking you. 
     }
   }
 
-  // ── Goal Matching ─────────────────────────────────────────────────
+  // ── Goal Matching (cached) ──────────────────────────────────────────
+
+  /** Cached active goals — avoids N file reads per query. Refreshes every 30s. */
+  private _goalCache: { goals: Array<{ goal: any; file: string }>; loadedAt: number } | null = null;
+  private static readonly GOAL_CACHE_TTL_MS = 30_000;
+
+  private loadGoalsFromCache(): Array<{ goal: any; file: string }> {
+    const now = Date.now();
+    if (this._goalCache && now - this._goalCache.loadedAt < PersonalAssistant.GOAL_CACHE_TTL_MS) {
+      return this._goalCache.goals;
+    }
+    const goals: Array<{ goal: any; file: string }> = [];
+    try {
+      if (!fs.existsSync(GOALS_DIR)) return goals;
+      for (const f of fs.readdirSync(GOALS_DIR).filter(f => f.endsWith('.json'))) {
+        try {
+          const goal = JSON.parse(fs.readFileSync(path.join(GOALS_DIR, f), 'utf-8'));
+          if (goal.status === 'active') goals.push({ goal, file: f });
+        } catch { continue; }
+      }
+    } catch { /* non-fatal */ }
+    this._goalCache = { goals, loadedAt: now };
+    return goals;
+  }
 
   /**
    * Match a user message against active goals by keyword overlap.
@@ -1449,36 +1478,26 @@ If you're stuck after reading several files, tell ${owner} what's blocking you. 
    */
   private matchGoals(userMessage: string): string {
     try {
-      if (!fs.existsSync(GOALS_DIR)) return '';
-      const files = fs.readdirSync(GOALS_DIR).filter(f => f.endsWith('.json'));
-      if (files.length === 0) return '';
+      const activeGoals = this.loadGoalsFromCache();
+      if (activeGoals.length === 0) return '';
 
       const lower = userMessage.toLowerCase();
       const matches: Array<{ goal: any; hits: number }> = [];
 
-      for (const f of files) {
-        try {
-          const goal = JSON.parse(fs.readFileSync(path.join(GOALS_DIR, f), 'utf-8'));
-          if (goal.status !== 'active') continue;
-
-          // Split title into keywords (>3 chars) and count matches
-          const titleWords = (goal.title || '').toLowerCase().split(/\s+/).filter((w: string) => w.length > 3);
-          let hits = 0;
-          for (const w of titleWords) {
-            if (lower.includes(w)) hits++;
-          }
-
-          // High-priority goals have a lower threshold (1 hit), others need 2+
-          const threshold = goal.priority === 'high' ? 1 : 2;
-          if (hits >= threshold) {
-            matches.push({ goal, hits });
-          }
-        } catch { continue; }
+      for (const { goal } of activeGoals) {
+        const titleWords = (goal.title || '').toLowerCase().split(/\s+/).filter((w: string) => w.length > 3);
+        let hits = 0;
+        for (const w of titleWords) {
+          if (lower.includes(w)) hits++;
+        }
+        const threshold = goal.priority === 'high' ? 1 : 2;
+        if (hits >= threshold) {
+          matches.push({ goal, hits });
+        }
       }
 
       if (matches.length === 0) return '';
 
-      // Sort by hits descending
       matches.sort((a, b) => b.hits - a.hits);
 
       const lines = matches.map(({ goal }) => {
