@@ -53,6 +53,11 @@ export const TASKS_FILE = path.join(TASKS_DIR, 'TASKS.md');
 export const SOUL_FILE = path.join(SYSTEM_DIR, 'SOUL.md');
 export const HEARTBEAT_FILE = path.join(SYSTEM_DIR, 'HEARTBEAT.md');
 export const CRON_FILE = path.join(SYSTEM_DIR, 'CRON.md');
+export const PROFILES_DIR = path.join(SYSTEM_DIR, 'profiles');
+export const AGENTS_DIR = path.join(SYSTEM_DIR, 'agents');
+export const TEAM_COMMS_LOG = path.join(BASE_DIR, 'logs', 'team-comms.jsonl');
+export const HANDOFFS_DIR = path.join(BASE_DIR, 'handoffs');
+export const DELEGATIONS_BASE = path.join(SYSTEM_DIR, 'agents');
 
 // ── Logger ─────────────────────────────────────────────────────────────
 
