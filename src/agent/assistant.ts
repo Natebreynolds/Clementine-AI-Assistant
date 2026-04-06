@@ -2604,7 +2604,7 @@ If you're stuck after reading several files, tell ${owner} what's blocking you. 
     const sdkOptions = this.buildOptions({
       isHeartbeat: true,
       enableTeams: false,
-      model: MODELS.sonnet,
+      model: MODELS.haiku,
       profile: profile ?? undefined,
     });
     const now = new Date();
@@ -2616,10 +2616,9 @@ If you're stuck after reading several files, tell ${owner} what's blocking you. 
 
     const promptParts = [
       `[Heartbeat — ${localTime}, ${localDate} (${tz})]`,
-      `You're ${agentName}, checking in with ${owner}.`,
-      // Ground the model: context is already provided, no tool calls needed for basic check-ins
-      `The context below already contains everything you need — do NOT call tools to "check" or "load state". ` +
-      `Just read the context provided and respond based on what you see.`,
+      `You're ${agentName}, casually checking in with ${owner}. Talk like a teammate — not a system.`,
+      `Do NOT call any tools. Everything you need is in the context below. ` +
+      `If you notice something that would need a tool to investigate or act on, just mention it conversationally and ask ${owner} if he wants you to look into it.`,
     ];
     if (dedupContext) {
       promptParts.push(`\n${dedupContext}\n\nIf all of the above are unchanged, respond with exactly: __NOTHING__`);
@@ -2632,8 +2631,8 @@ If you're stuck after reading several files, tell ${owner} what's blocking you. 
     }
     promptParts.push(
       `\nIf nothing changed, respond with exactly: __NOTHING__\n` +
-      `Otherwise, keep it brief and conversational (1-3 sentences). No bullet lists, no formal reports. ` +
-      `Never announce that you're going to check something — either you already have the info above, or respond __NOTHING__. ` +
+      `Otherwise, keep it casual and brief (1-3 sentences). No bullet lists, no formal reports, no repeating info from previous check-ins. ` +
+      `Only mention what's genuinely new or worth flagging. Be a person, not a dashboard. ` +
       `Tag topics with [topic: key] for dedup tracking.\n\n` +
       `Standing instructions:\n${standingInstructions}`,
     );
