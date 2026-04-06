@@ -742,14 +742,15 @@ export class PersonalAssistant {
       this._lastDailyNotePath = todayPath;
     }
 
-    const soulEntry = this.promptCache.get(SOUL_FILE);
-    if (soulEntry) {
-      // Autonomous runs only need identity, not full personality guidance
-      parts.push(isAutonomous ? soulEntry.content.slice(0, 1500) : soulEntry.content);
-    }
-
     if (profile?.systemPromptBody) {
+      // Team agents use their own identity — don't load SOUL.md (Clementine's personality)
       parts.push(profile.systemPromptBody);
+    } else {
+      const soulEntry = this.promptCache.get(SOUL_FILE);
+      if (soulEntry) {
+        // Autonomous runs only need identity, not full personality guidance
+        parts.push(isAutonomous ? soulEntry.content.slice(0, 1500) : soulEntry.content);
+      }
     }
 
     // Skip AGENTS.md for autonomous runs — not relevant for heartbeats/cron
