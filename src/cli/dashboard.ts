@@ -13909,7 +13909,7 @@ async function togglePromptHistory() {
       html += '<span class="badge badge-gray" style="font-size:9px">' + esc(v.changedBy || 'unknown') + '</span>';
       html += '<button class="btn btn-sm" data-prompt-version="' + v.version + '" onclick="restorePromptFromHistory(' + v.version + ')" style="font-size:10px;padding:2px 8px;margin-left:auto">Restore</button>';
       html += '</div>';
-      var preview = (v.prompt || '').slice(0, 100).replace(/\n/g, ' ');
+      var preview = (v.prompt || '').slice(0, 100).split(String.fromCharCode(10)).join(' ');
       html += '<div style="color:var(--text-muted);font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(preview) + '</div>';
       html += '</div>';
     });
