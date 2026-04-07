@@ -9,6 +9,7 @@ import express from 'express';
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { spawn, execSync } from 'node:child_process';
 import {
+  appendFileSync,
   existsSync,
   readFileSync,
   writeFileSync,
@@ -2211,7 +2212,25 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
       }
       // Apply updates
       if (updates.schedule !== undefined) jobs[idx].schedule = String(updates.schedule);
-      if (updates.prompt !== undefined) jobs[idx].prompt = String(updates.prompt);
+      if (updates.prompt !== undefined) {
+        const oldPrompt = jobs[idx].prompt;
+        const newPrompt = String(updates.prompt);
+        if (oldPrompt !== newPrompt) {
+          // Record prompt version history
+          try {
+            const histDir = path.join(BASE_DIR, 'cron', 'prompt-history');
+            if (!existsSync(histDir)) mkdirSync(histDir, { recursive: true });
+            const histFile = path.join(histDir, `${jobName.replace(/[^a-zA-Z0-9_:-]/g, '_')}.jsonl`);
+            const entry = JSON.stringify({
+              timestamp: new Date().toISOString(),
+              prompt: oldPrompt,
+              changedBy: updates.changedBy || 'dashboard',
+            });
+            appendFileSync(histFile, entry + '\n');
+          } catch { /* non-fatal */ }
+        }
+        jobs[idx].prompt = newPrompt;
+      }
       if (updates.enabled !== undefined) jobs[idx].enabled = Boolean(updates.enabled);
       if (updates.tier !== undefined) {
         const t = parseInt(String(updates.tier), 10);
@@ -2301,6 +2320,89 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
       jobs.splice(idx, 1);
       writeCronFileAt(cronFile, parsed, jobs);
       res.json({ ok: true, message: `Deleted cron job: ${jobName}` });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  // ── Prompt History routes ───────────────────────────────────────────
+
+  app.get('/api/cron/:job/prompt-history', (req, res) => {
+    try {
+      const jobName = req.params.job.replace(/[^a-zA-Z0-9_:-]/g, '_');
+      const histFile = path.join(BASE_DIR, 'cron', 'prompt-history', `${jobName}.jsonl`);
+      if (!existsSync(histFile)) { res.json({ versions: [] }); return; }
+      const lines = readFileSync(histFile, 'utf-8').split('\n').filter(Boolean);
+      const versions = lines.map((line, idx) => {
+        try {
+          const entry = JSON.parse(line);
+          return { version: idx + 1, ...entry };
+        } catch { return null; }
+      }).filter(Boolean).reverse(); // newest first
+      res.json({ versions });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  // ── Cron Attachment routes ──────────────────────────────────────────
+
+  const ATTACHMENTS_DIR = path.join(BASE_DIR, 'attachments');
+
+  app.get('/api/cron/:job/attachments', (req, res) => {
+    try {
+      const jobName = req.params.job.replace(/[^a-zA-Z0-9_:-]/g, '_');
+      const dir = path.join(ATTACHMENTS_DIR, jobName);
+      if (!existsSync(dir)) { res.json({ files: [] }); return; }
+      const files = readdirSync(dir).map(f => {
+        const stat = require('fs').statSync(path.join(dir, f));
+        return { name: f, size: stat.size, uploadedAt: stat.mtime.toISOString() };
+      });
+      res.json({ files });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  app.post('/api/cron/:job/attachments', (req, res) => {
+    try {
+      const jobName = req.params.job.replace(/[^a-zA-Z0-9_:-]/g, '_');
+      const { filename, content } = req.body;
+      if (!filename || !content) { res.status(400).json({ error: 'filename and content (base64) are required' }); return; }
+
+      // Sanitize filename
+      const safeName = path.basename(filename).replace(/[^a-zA-Z0-9._-]/g, '_');
+      const dir = path.join(ATTACHMENTS_DIR, jobName);
+      if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+
+      const buf = Buffer.from(content, 'base64');
+      writeFileSync(path.join(dir, safeName), buf);
+      res.json({ ok: true, filename: safeName, size: buf.length });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  app.delete('/api/cron/:job/attachments/:filename', (req, res) => {
+    try {
+      const jobName = req.params.job.replace(/[^a-zA-Z0-9_:-]/g, '_');
+      const safeName = path.basename(req.params.filename);
+      const filePath = path.join(ATTACHMENTS_DIR, jobName, safeName);
+      if (!existsSync(filePath)) { res.status(404).json({ error: 'File not found' }); return; }
+      unlinkSync(filePath);
+      res.json({ ok: true });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  app.get('/api/cron/:job/attachments/:filename', (req, res) => {
+    try {
+      const jobName = req.params.job.replace(/[^a-zA-Z0-9_:-]/g, '_');
+      const safeName = path.basename(req.params.filename);
+      const filePath = path.join(ATTACHMENTS_DIR, jobName, safeName);
+      if (!existsSync(filePath)) { res.status(404).json({ error: 'File not found' }); return; }
+      res.sendFile(filePath);
     } catch (err) {
       res.status(500).json({ error: String(err) });
     }
@@ -3191,6 +3293,89 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
     }
   });
 
+  // ── Agent-scoped Skills ──
+  app.get('/api/agents/:slug/skills', (req, res) => {
+    try {
+      const agentSlug = req.params.slug;
+      const globalDir = path.join(VAULT_DIR, '00-System', 'skills');
+      const agentDir = path.join(VAULT_DIR, '00-System', 'agents', agentSlug, 'skills');
+
+      const readSkills = (dir: string, scope: string) => {
+        if (!existsSync(dir)) return [];
+        return readdirSync(dir).filter(f => f.endsWith('.md')).map(f => {
+          try {
+            const parsed = matter(readFileSync(path.join(dir, f), 'utf-8'));
+            return {
+              name: f.replace('.md', ''),
+              title: parsed.data.title ?? f,
+              description: parsed.data.description ?? '',
+              source: parsed.data.source ?? 'unknown',
+              sourceJob: parsed.data.sourceJob ?? null,
+              triggers: parsed.data.triggers ?? [],
+              toolsUsed: parsed.data.toolsUsed ?? [],
+              useCount: parsed.data.useCount ?? 0,
+              lastUsed: parsed.data.lastUsed ?? null,
+              agentSlug: parsed.data.agentSlug ?? null,
+              createdAt: parsed.data.createdAt ?? '',
+              updatedAt: parsed.data.updatedAt ?? '',
+              scope,
+            };
+          } catch { return null; }
+        }).filter(Boolean);
+      };
+
+      const agentSkills = readSkills(agentDir, 'agent');
+      const globalSkills = readSkills(globalDir, 'global');
+      res.json({ skills: [...agentSkills, ...globalSkills] });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  app.post('/api/agents/:slug/skills', (req, res) => {
+    try {
+      const agentSlug = req.params.slug;
+      const { title, description, triggers, steps } = req.body;
+      if (!title || !steps) { res.status(400).json({ error: 'title and steps are required' }); return; }
+
+      const agentDir = path.join(VAULT_DIR, '00-System', 'agents', agentSlug, 'skills');
+      if (!existsSync(agentDir)) mkdirSync(agentDir, { recursive: true });
+
+      const name = title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 60);
+      const now = new Date().toISOString();
+      const triggerList = (triggers || '').split(',').map((t: string) => t.trim()).filter(Boolean);
+
+      const matterMod = require('gray-matter');
+      const content = matterMod.stringify(
+        `\n# ${title}\n\n${description || ''}\n\n## Procedure\n\n${steps}\n`,
+        { title, description: description || '', triggers: triggerList, source: 'manual', agentSlug, toolsUsed: [], useCount: 0, createdAt: now, updatedAt: now },
+      );
+      writeFileSync(path.join(agentDir, `${name}.md`), content);
+      res.json({ ok: true, name });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  app.delete('/api/agents/:slug/skills/:name', (req, res) => {
+    try {
+      const agentSlug = req.params.slug;
+      const agentDir = path.join(VAULT_DIR, '00-System', 'agents', agentSlug, 'skills');
+      const filePath = path.join(agentDir, `${req.params.name}.md`);
+      if (!existsSync(filePath)) {
+        // Fall back to global skills dir
+        const globalPath = path.join(VAULT_DIR, '00-System', 'skills', `${req.params.name}.md`);
+        if (!existsSync(globalPath)) { res.status(404).json({ error: 'Skill not found' }); return; }
+        unlinkSync(globalPath);
+      } else {
+        unlinkSync(filePath);
+      }
+      res.json({ ok: true });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
   app.get('/api/self-improve', (_req, res) => {
     const siDir = path.join(BASE_DIR, 'self-improve');
     const stateFile = path.join(siDir, 'state.json');
@@ -3667,6 +3852,93 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
       return { activities, sends };
     });
     res.json(result ?? { activities: [], sends: [] });
+  });
+
+  /** Per-agent execution log: aggregates run history across all jobs for this agent. */
+  app.get('/api/agents/:slug/execution-log', (req, res) => {
+    try {
+      const slug = req.params.slug;
+      const limit = Math.min(Number(req.query.limit) || 50, 200);
+      const runsDir = path.join(BASE_DIR, 'cron', 'runs');
+      if (!existsSync(runsDir)) { res.json({ runs: [] }); return; }
+
+      const allRuns: Array<Record<string, unknown>> = [];
+      const files = readdirSync(runsDir).filter(f => f.endsWith('.jsonl'));
+      for (const file of files) {
+        try {
+          const lines = readFileSync(path.join(runsDir, file), 'utf-8').split('\n').filter(Boolean);
+          for (const line of lines) {
+            try {
+              const run = JSON.parse(line);
+              // Filter by agent: jobs prefixed with agent slug, or unscoped for primary
+              const jobAgent = run.jobName?.includes(':') ? run.jobName.split(':')[0] : '';
+              if (slug === '' || slug === 'clementine') {
+                if (!jobAgent) allRuns.push(run);
+              } else {
+                if (jobAgent === slug) allRuns.push(run);
+              }
+            } catch { /* skip bad lines */ }
+          }
+        } catch { /* skip bad files */ }
+      }
+
+      // Sort by startedAt descending, limit
+      allRuns.sort((a, b) => String(b.startedAt || '').localeCompare(String(a.startedAt || '')));
+      const runs = allRuns.slice(0, limit).map(r => ({
+        jobName: r.jobName,
+        startedAt: r.startedAt,
+        finishedAt: r.finishedAt,
+        status: r.status,
+        durationMs: r.durationMs,
+        outputPreview: String(r.outputPreview || '').slice(0, 200),
+        attempt: r.attempt,
+      }));
+
+      res.json({ runs });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  /** Per-agent audit summary: quality metrics aggregated from run history. */
+  app.get('/api/agents/:slug/audit-summary', (req, res) => {
+    try {
+      const slug = req.params.slug;
+      const runsDir = path.join(BASE_DIR, 'cron', 'runs');
+      if (!existsSync(runsDir)) { res.json({ successRate: 0, avgDurationMs: 0, totalRuns: 0, totalTokens: 0 }); return; }
+
+      let totalRuns = 0, successCount = 0, totalDuration = 0;
+      const thirtyDaysAgo = new Date(Date.now() - 30 * 86400000).toISOString();
+
+      const files = readdirSync(runsDir).filter(f => f.endsWith('.jsonl'));
+      for (const file of files) {
+        try {
+          const lines = readFileSync(path.join(runsDir, file), 'utf-8').split('\n').filter(Boolean);
+          for (const line of lines) {
+            try {
+              const run = JSON.parse(line);
+              const jobAgent = run.jobName?.includes(':') ? run.jobName.split(':')[0] : '';
+              const isMatch = (slug === '' || slug === 'clementine') ? !jobAgent : jobAgent === slug;
+              if (!isMatch) continue;
+              if (run.startedAt && run.startedAt < thirtyDaysAgo) continue;
+              totalRuns++;
+              if (run.status === 'ok') successCount++;
+              if (run.durationMs) totalDuration += run.durationMs;
+            } catch { /* skip */ }
+          }
+        } catch { /* skip */ }
+      }
+
+      res.json({
+        successRate: totalRuns > 0 ? Math.round((successCount / totalRuns) * 100) : 0,
+        avgDurationMs: totalRuns > 0 ? Math.round(totalDuration / totalRuns) : 0,
+        totalRuns,
+        successCount,
+        period: '30d',
+      });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
   });
 
   /** Per-agent KPI scorecards. */
@@ -8109,6 +8381,15 @@ function getDashboardHTML(token: string): string {
         <textarea id="cron-prompt" rows="5" placeholder="What should the AI do when this task runs?"></textarea>
         <div class="form-hint">The instruction sent to the AI agent when this task fires.</div>
       </div>
+      <div class="form-group">
+        <label class="form-label">Reference Files <span style="color:var(--text-muted);font-weight:normal">(optional)</span></label>
+        <div id="cron-attachments-list" style="margin-bottom:8px"></div>
+        <label class="btn btn-sm" style="cursor:pointer;display:inline-flex;align-items:center;gap:4px;background:var(--bg-tertiary);border:1px solid var(--border);border-radius:6px;padding:6px 12px;font-size:12px;color:var(--text-primary)">
+          + Attach File
+          <input type="file" multiple accept=".csv,.md,.txt,.json,.docx,.xlsx" style="display:none" onchange="handleCronFileUpload(event)">
+        </label>
+        <div class="form-hint">CSV, Markdown, or text files the agent can reference during execution. Max 10MB per file.</div>
+      </div>
     </div>
     <div class="modal-footer">
       <button onclick="closeCronModal()">Cancel</button>
@@ -8502,7 +8783,7 @@ function renderTeamNav(agents) {
 
 // ── Agent Detail (Full-screen management console) ──
 var _agentDetailData = null;
-var _agentDetailTab = 'schedule';
+var _agentDetailTab = 'tasks';
 
 async function renderAgentDetail(slug) {
   var el = document.getElementById('agent-detail-content');
@@ -8571,8 +8852,8 @@ async function renderAgentDetail(slug) {
 
     // Tab bar
     html += '<div class="tab-bar" id="agent-detail-tabs">';
-    var tabs = ['schedule', 'delegations', 'heartbeat', 'activity', 'sessions', 'tools', 'config'];
-    var tabLabels = { schedule: 'Schedule', delegations: 'Delegations', heartbeat: 'Heartbeat', activity: 'Activity', sessions: 'Sessions', tools: 'Tools & Access', config: 'Config' };
+    var tabs = ['tasks', 'training', 'execution', 'settings'];
+    var tabLabels = { tasks: 'Tasks', training: 'Training', execution: 'Execution', settings: 'Settings' };
     tabs.forEach(function(t) {
       html += '<button class="' + (t === _agentDetailTab ? 'active' : '') + '" onclick="switchAgentDetailTab(\\x27' + t + '\\x27)">' + tabLabels[t] + '</button>';
     });
@@ -8589,7 +8870,7 @@ async function renderAgentDetail(slug) {
 function switchAgentDetailTab(tab) {
   _agentDetailTab = tab;
   var tabs = document.querySelectorAll('#agent-detail-tabs button');
-  tabs.forEach(function(t) { t.className = t.textContent.trim() === ({ schedule:'Schedule', delegations:'Delegations', heartbeat:'Heartbeat', activity:'Activity', sessions:'Sessions', tools:'Tools & Access', config:'Config' })[tab] ? 'active' : ''; });
+  tabs.forEach(function(t) { t.className = t.textContent.trim() === ({ tasks:'Tasks', training:'Training', execution:'Execution', settings:'Settings' })[tab] ? 'active' : ''; });
   loadAgentDetailTab(tab, currentAgentSlug, !currentAgentSlug || currentAgentSlug === '');
 }
 
@@ -8599,13 +8880,12 @@ async function loadAgentDetailTab(tab, slug, isPrimary) {
   container.innerHTML = '<div class="empty-state">Loading...</div>';
   var a = _agentDetailData;
 
-  if (tab === 'schedule') {
+  if (tab === 'tasks') {
     var html = '';
-    // Cron jobs for this agent
+    // Scheduled tasks for this agent
     try {
       var cronRes = await apiFetch('/api/cron');
       var cronData = await cronRes.json();
-      // Populate global cronJobsData so openEditCronModal can find jobs
       cronJobsData = cronData.jobs || [];
       var jobs = cronJobsData.filter(function(j) {
         if (isPrimary) return !j.agent;
@@ -8622,10 +8902,8 @@ async function loadAgentDetailTab(tab, slug, isPrimary) {
           var lastRun = j.recentRuns && j.recentRuns.length > 0 ? fmtTimeAgo(j.recentRuns[0].finishedAt || j.recentRuns[0].startedAt) : (j.lastRun ? fmtTimeAgo(j.lastRun.finishedAt || j.lastRun.startedAt) : '—');
           var lastStatus = j.recentRuns && j.recentRuns.length > 0 ? j.recentRuns[0].status : (j.lastRun ? j.lastRun.status : '—');
           var statusBadge = lastStatus === 'ok' ? 'badge-green' : lastStatus === 'error' ? 'badge-red' : 'badge-gray';
-          // Human-readable schedule
           var humanSched = describeCron(j.schedule || '');
           var schedDisplay = humanSched ? humanSched : esc(j.schedule || '');
-          // Clean display name (strip agent prefix)
           var displayName = j.agent ? j.name.replace(j.agent + ':', '') : j.name;
           var safeName = esc(j.name).replace(/'/g, '');
           html += '<tr style="border-bottom:1px solid var(--border)">';
@@ -8653,7 +8931,7 @@ async function loadAgentDetailTab(tab, slug, isPrimary) {
         if (isPrimary) return true;
         return g.owner === slug || (g.agentContributions && g.agentContributions[slug]);
       });
-      html += '<div class="card"><div class="card-header" style="display:flex;justify-content:space-between;align-items:center"><span>Goals (' + goals.length + ')</span>';
+      html += '<div class="card" style="margin-bottom:16px"><div class="card-header" style="display:flex;justify-content:space-between;align-items:center"><span>Goals (' + goals.length + ')</span>';
       html += '<button class="btn btn-sm btn-primary" onclick="openGoalModal(\\x27' + esc(slug || '') + '\\x27)" style="font-size:11px">+ New Goal</button></div><div class="card-body">';
       if (goals.length === 0) {
         html += '<div class="empty-state" style="padding:24px">No goals yet</div>';
@@ -8682,10 +8960,8 @@ async function loadAgentDetailTab(tab, slug, isPrimary) {
       }
       html += '</div></div>';
     } catch(e) { /* goals optional */ }
-    container.innerHTML = html;
 
-  } else if (tab === 'delegations') {
-    var html = '';
+    // Delegations
     try {
       var delRes = await apiFetch('/api/delegations?agent=' + encodeURIComponent(slug || ''));
       var delData = await delRes.json();
@@ -8693,15 +8969,11 @@ async function loadAgentDetailTab(tab, slug, isPrimary) {
       var toMe = delegations.filter(function(d) { return d.toAgent === slug; });
       var fromMe = delegations.filter(function(d) { return d.fromAgent === slug; });
 
-      // Assigned to this agent
-      html += '<div class="card" style="margin-bottom:16px"><div class="card-header" style="display:flex;justify-content:space-between;align-items:center"><span>Assigned Tasks (' + toMe.length + ')</span>';
-      html += '<button class="btn btn-sm btn-primary" onclick="openDelegationModal(\\x27' + esc(slug || '') + '\\x27)" style="font-size:11px">+ Delegate Task</button></div>';
-      html += '<div class="card-body" style="padding:0">';
-      if (toMe.length === 0) {
-        html += '<div class="empty-state" style="padding:24px">No tasks assigned</div>';
-      } else {
+      if (toMe.length > 0 || fromMe.length > 0) {
+        html += '<div class="card" style="margin-bottom:16px"><div class="card-header" style="display:flex;justify-content:space-between;align-items:center"><span>Delegations (' + (toMe.length + fromMe.length) + ')</span>';
+        html += '<button class="btn btn-sm btn-primary" onclick="openDelegationModal(\\x27' + esc(slug || '') + '\\x27)" style="font-size:11px">+ Delegate Task</button></div>';
+        html += '<div class="card-body" style="padding:0">';
         toMe.forEach(function(d) {
-          var sColor = d.status === 'completed' ? 'var(--green)' : d.status === 'in_progress' ? 'var(--accent)' : 'var(--text-muted)';
           var sBadge = d.status === 'completed' ? 'badge-green' : d.status === 'in_progress' ? 'badge-orange' : 'badge-gray';
           html += '<div style="padding:12px 16px;border-bottom:1px solid var(--border)">';
           html += '<div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">';
@@ -8718,12 +8990,6 @@ async function loadAgentDetailTab(tab, slug, isPrimary) {
           }
           html += '</div>';
         });
-      }
-      html += '</div></div>';
-
-      // Delegated from this agent
-      if (fromMe.length > 0) {
-        html += '<div class="card"><div class="card-header">Delegated by ' + esc(a ? a.name : slug) + ' (' + fromMe.length + ')</div><div class="card-body" style="padding:0">';
         fromMe.forEach(function(d) {
           var sBadge = d.status === 'completed' ? 'badge-green' : d.status === 'in_progress' ? 'badge-orange' : 'badge-gray';
           html += '<div style="padding:10px 16px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:8px">';
@@ -8734,54 +9000,32 @@ async function loadAgentDetailTab(tab, slug, isPrimary) {
         });
         html += '</div></div>';
       }
-    } catch(e) { html += '<div class="empty-state">Failed to load delegations</div>'; }
-    container.innerHTML = html;
+    } catch(e) { /* delegations optional */ }
 
-  } else if (tab === 'heartbeat') {
-    var html = '';
+    // Heartbeat & Work Queue
     try {
       var hbSlug = isPrimary ? '' : slug;
       var hbRes = await apiFetch('/api/heartbeat/agent/' + encodeURIComponent(hbSlug || '__clementine__'));
       var hbData = await hbRes.json();
 
-      // Stat cards strip
       var lastMention = hbData.lastMention ? fmtTimeAgo(hbData.lastMention) : 'Never';
       var pendingCount = hbData.workQueue ? hbData.workQueue.pending : 0;
       var silentBeats = hbData.globalState ? hbData.globalState.consecutiveSilentBeats : 0;
       var lastTick = hbData.globalState && hbData.globalState.lastTick ? fmtTimeAgo(hbData.globalState.lastTick) : 'N/A';
 
-      html += '<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:20px">';
-      html += '<div style="text-align:center;padding:14px;background:var(--bg-secondary);border:1px solid var(--border);border-radius:var(--radius)"><div style="font-size:16px;font-weight:700;color:var(--accent)">' + lastMention + '</div><div style="font-size:11px;color:var(--text-muted)">Last Mention</div></div>';
-      html += '<div style="text-align:center;padding:14px;background:var(--bg-secondary);border:1px solid var(--border);border-radius:var(--radius)"><div style="font-size:24px;font-weight:700;color:' + (pendingCount > 0 ? 'var(--yellow)' : 'var(--green)') + '">' + pendingCount + '</div><div style="font-size:11px;color:var(--text-muted)">Queue Pending</div></div>';
-      html += '<div style="text-align:center;padding:14px;background:var(--bg-secondary);border:1px solid var(--border);border-radius:var(--radius)"><div style="font-size:24px;font-weight:700;color:var(--text-secondary)">' + silentBeats + '</div><div style="font-size:11px;color:var(--text-muted)">Silent Beats</div></div>';
-      html += '<div style="text-align:center;padding:14px;background:var(--bg-secondary);border:1px solid var(--border);border-radius:var(--radius)"><div style="font-size:16px;font-weight:700;color:var(--text-secondary)">' + lastTick + '</div><div style="font-size:11px;color:var(--text-muted)">Last Tick</div></div>';
+      html += '<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:16px">';
+      html += '<div style="text-align:center;padding:12px;background:var(--bg-secondary);border:1px solid var(--border);border-radius:var(--radius)"><div style="font-size:14px;font-weight:700;color:var(--accent)">' + lastMention + '</div><div style="font-size:10px;color:var(--text-muted)">Last Mention</div></div>';
+      html += '<div style="text-align:center;padding:12px;background:var(--bg-secondary);border:1px solid var(--border);border-radius:var(--radius)"><div style="font-size:20px;font-weight:700;color:' + (pendingCount > 0 ? 'var(--yellow)' : 'var(--green)') + '">' + pendingCount + '</div><div style="font-size:10px;color:var(--text-muted)">Queue Pending</div></div>';
+      html += '<div style="text-align:center;padding:12px;background:var(--bg-secondary);border:1px solid var(--border);border-radius:var(--radius)"><div style="font-size:20px;font-weight:700;color:var(--text-secondary)">' + silentBeats + '</div><div style="font-size:10px;color:var(--text-muted)">Silent Beats</div></div>';
+      html += '<div style="text-align:center;padding:12px;background:var(--bg-secondary);border:1px solid var(--border);border-radius:var(--radius)"><div style="font-size:14px;font-weight:700;color:var(--text-secondary)">' + lastTick + '</div><div style="font-size:10px;color:var(--text-muted)">Last Tick</div></div>';
       html += '</div>';
-
-      // Heartbeat Activity (reported topics)
-      var topics = hbData.topics || [];
-      html += '<div class="card" style="margin-bottom:16px"><div class="card-header">Heartbeat Activity (' + topics.length + ')</div><div class="card-body" style="padding:0">';
-      if (topics.length === 0) {
-        html += '<div class="empty-state" style="padding:24px">No heartbeat mentions for this agent yet</div>';
-      } else {
-        topics.slice().reverse().forEach(function(t) {
-          var time = t.reportedAt ? new Date(t.reportedAt).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) : '';
-          html += '<div style="display:flex;align-items:flex-start;gap:10px;padding:10px 16px;border-bottom:1px solid var(--border)">';
-          html += '<span style="font-size:12px;color:var(--text-muted);white-space:nowrap;min-width:70px">' + esc(time) + '</span>';
-          html += '<span style="flex:1;font-size:13px;color:var(--text-primary)">' + esc(t.summary || '') + '</span>';
-          html += '<span class="badge badge-gray" style="font-size:10px;white-space:nowrap">' + esc(t.topic || '') + '</span>';
-          html += '</div>';
-        });
-      }
-      html += '</div></div>';
 
       // Work Queue
       var queueItems = hbData.workQueue ? hbData.workQueue.items || [] : [];
-      html += '<div class="card"><div class="card-header" style="display:flex;justify-content:space-between;align-items:center"><span>Work Queue (' + queueItems.length + ')</span>';
-      html += '<button class="btn btn-sm btn-primary" onclick="openHeartbeatQueueModal(\\x27' + esc(slug || '') + '\\x27)" style="font-size:11px">+ Queue Work</button></div>';
-      html += '<div class="card-body" style="padding:0">';
-      if (queueItems.length === 0) {
-        html += '<div class="empty-state" style="padding:24px">No queued work for this agent</div>';
-      } else {
+      if (queueItems.length > 0) {
+        html += '<div class="card"><div class="card-header" style="display:flex;justify-content:space-between;align-items:center"><span>Work Queue (' + queueItems.length + ')</span>';
+        html += '<button class="btn btn-sm btn-primary" onclick="openHeartbeatQueueModal(\\x27' + esc(slug || '') + '\\x27)" style="font-size:11px">+ Queue Work</button></div>';
+        html += '<div class="card-body" style="padding:0">';
         html += '<table style="width:100%;border-collapse:collapse"><thead><tr style="border-bottom:1px solid var(--border)">';
         html += '<th style="padding:8px 12px;text-align:left;color:var(--text-muted);font-size:11px">Status</th>';
         html += '<th style="padding:8px 12px;text-align:left;color:var(--text-muted);font-size:11px">Description</th>';
@@ -8799,39 +9043,124 @@ async function loadAgentDetailTab(tab, slug, isPrimary) {
           html += '</tr>';
         });
         html += '</tbody></table>';
+        html += '</div></div>';
       }
-      html += '</div></div>';
+    } catch(e) { /* heartbeat optional */ }
 
-    } catch(e) { html += '<div class="empty-state">Failed to load heartbeat data</div>'; }
     container.innerHTML = html;
 
-  } else if (tab === 'activity') {
+  } else if (tab === 'training') {
+    var html = '';
+    // Skills section
+    html += '<div class="card" style="margin-bottom:16px">';
+    html += '<div class="card-header" style="display:flex;align-items:center;justify-content:space-between"><span>Skills</span>';
+    html += '<button class="btn-sm btn-primary" onclick="toggleAgentTeachSkill()" id="agent-teach-skill-toggle" style="font-size:12px">+ Teach Skill</button></div>';
+    html += '<div id="agent-teach-skill-form" style="display:none;padding:16px;border-bottom:1px solid var(--border)">';
+    html += '<div style="display:grid;gap:12px">';
+    html += '<div><label style="font-size:12px;font-weight:600;color:var(--text-secondary)">Title</label>';
+    html += '<input type="text" id="agent-skill-title" placeholder="e.g., Deploy to production" style="width:100%;padding:8px;border:1px solid var(--border);border-radius:6px;background:var(--bg-input);color:var(--text-primary);font-size:13px"></div>';
+    html += '<div><label style="font-size:12px;font-weight:600;color:var(--text-secondary)">Description</label>';
+    html += '<input type="text" id="agent-skill-description" placeholder="1-2 sentence summary" style="width:100%;padding:8px;border:1px solid var(--border);border-radius:6px;background:var(--bg-input);color:var(--text-primary);font-size:13px"></div>';
+    html += '<div><label style="font-size:12px;font-weight:600;color:var(--text-secondary)">Triggers <span style="font-weight:400;color:var(--text-muted)">(comma-separated)</span></label>';
+    html += '<input type="text" id="agent-skill-triggers" placeholder="deploy, production, release" style="width:100%;padding:8px;border:1px solid var(--border);border-radius:6px;background:var(--bg-input);color:var(--text-primary);font-size:13px"></div>';
+    html += '<div><label style="font-size:12px;font-weight:600;color:var(--text-secondary)">Procedure <span style="font-weight:400;color:var(--text-muted)">(markdown steps)</span></label>';
+    html += '<textarea id="agent-skill-steps" rows="5" placeholder="1. Run tests\\n2. Build\\n3. Deploy" style="width:100%;padding:8px;border:1px solid var(--border);border-radius:6px;background:var(--bg-input);color:var(--text-primary);font-size:13px;font-family:monospace;resize:vertical"></textarea></div>';
+    html += '<div style="display:flex;gap:8px;justify-content:flex-end">';
+    html += '<button class="btn-sm" onclick="toggleAgentTeachSkill()" style="background:var(--bg-tertiary);border:1px solid var(--border);color:var(--text-primary);padding:6px 16px;border-radius:6px;cursor:pointer">Cancel</button>';
+    html += '<button class="btn-sm btn-primary" onclick="saveAgentSkill(\\x27' + esc(slug || '') + '\\x27)" style="padding:6px 16px">Save Skill</button>';
+    html += '</div></div></div>';
+    html += '<div class="card-body" id="agent-skills-list"><div class="empty-state">Loading skills...</div></div>';
+    html += '</div>';
+
+    // Prompt Lab section
+    html += '<div class="card">';
+    html += '<div class="card-header">Prompt Lab</div>';
+    html += '<div class="card-body" style="padding:16px">';
+    html += '<div style="margin-bottom:12px"><label style="font-size:12px;font-weight:600;color:var(--text-secondary);display:block;margin-bottom:4px">Select Task</label>';
+    html += '<select id="prompt-lab-job" onchange="loadPromptLab(this.value)" style="width:100%;padding:8px;border:1px solid var(--border);border-radius:6px;background:var(--bg-input);color:var(--text-primary);font-size:13px">';
+    html += '<option value="">-- Select a scheduled task --</option>';
+    html += '</select></div>';
+    html += '<div id="prompt-lab-editor" style="display:none">';
+    html += '<div style="margin-bottom:12px"><label style="font-size:12px;font-weight:600;color:var(--text-secondary);display:block;margin-bottom:4px">Prompt</label>';
+    html += '<textarea id="prompt-lab-text" rows="8" style="width:100%;padding:8px;border:1px solid var(--border);border-radius:6px;background:var(--bg-input);color:var(--text-primary);font-size:13px;font-family:monospace;resize:vertical"></textarea></div>';
+    html += '<div style="display:flex;gap:8px;margin-bottom:16px">';
+    html += '<button class="btn-sm btn-primary" onclick="savePromptLab()" style="padding:6px 16px">Save</button>';
+    html += '<button class="btn-sm btn-primary" onclick="saveAndRunPromptLab()" style="padding:6px 16px;background:var(--green)">Save & Run</button>';
+    html += '<button class="btn-sm" onclick="togglePromptHistory()" style="background:var(--bg-tertiary);border:1px solid var(--border);color:var(--text-primary);padding:6px 16px;border-radius:6px;cursor:pointer">History</button>';
+    html += '</div>';
+    html += '<div id="prompt-lab-history" style="display:none;margin-bottom:12px"></div>';
+    html += '<div id="prompt-lab-result" style="display:none"></div>';
+    html += '</div>';
+    html += '</div></div>';
+
+    container.innerHTML = html;
+    // Load skills for this agent
+    loadAgentSkills(slug || '', isPrimary);
+    // Populate Prompt Lab job dropdown
+    loadPromptLabJobs(slug || '', isPrimary);
+
+  } else if (tab === 'execution') {
+    var html = '';
+    var agentSlugForExec = isPrimary ? '' : slug;
+
+    // Audit summary cards
     try {
-      var actUrl = isPrimary ? '/api/activity' : '/api/agents/' + slug + '/activity';
-      var actRes = await apiFetch(actUrl);
-      var actData = await actRes.json();
-      var items = actData.items || actData || [];
-      if (!Array.isArray(items)) items = [];
-      var html = '<div class="card"><div class="card-header">Recent Activity</div><div class="card-body">';
-      if (items.length === 0) {
-        html += '<div class="empty-state">No recent activity</div>';
+      var auditRes = await apiFetch('/api/agents/' + encodeURIComponent(agentSlugForExec || 'clementine') + '/audit-summary');
+      var audit = await auditRes.json();
+      if (audit.totalRuns > 0) {
+        var avgDur = audit.avgDurationMs < 60000 ? (audit.avgDurationMs / 1000).toFixed(0) + 's' : (audit.avgDurationMs / 60000).toFixed(1) + 'm';
+        var srColor = audit.successRate >= 90 ? 'var(--green)' : audit.successRate >= 70 ? 'var(--yellow)' : 'var(--red)';
+        html += '<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:16px">';
+        html += '<div style="text-align:center;padding:14px;background:var(--bg-secondary);border:1px solid var(--border);border-radius:var(--radius)"><div style="font-size:24px;font-weight:700;color:' + srColor + '">' + audit.successRate + '%</div><div style="font-size:10px;color:var(--text-muted)">Success Rate (30d)</div></div>';
+        html += '<div style="text-align:center;padding:14px;background:var(--bg-secondary);border:1px solid var(--border);border-radius:var(--radius)"><div style="font-size:24px;font-weight:700;color:var(--accent)">' + audit.totalRuns + '</div><div style="font-size:10px;color:var(--text-muted)">Total Runs (30d)</div></div>';
+        html += '<div style="text-align:center;padding:14px;background:var(--bg-secondary);border:1px solid var(--border);border-radius:var(--radius)"><div style="font-size:24px;font-weight:700;color:var(--text-secondary)">' + avgDur + '</div><div style="font-size:10px;color:var(--text-muted)">Avg Duration</div></div>';
+        html += '<div style="text-align:center;padding:14px;background:var(--bg-secondary);border:1px solid var(--border);border-radius:var(--radius)"><div style="font-size:24px;font-weight:700;color:var(--green)">' + audit.successCount + '</div><div style="font-size:10px;color:var(--text-muted)">Successful Runs</div></div>';
+        html += '</div>';
+      }
+    } catch(e) { /* audit optional */ }
+
+    // Run history table
+    try {
+      var logRes = await apiFetch('/api/agents/' + encodeURIComponent(agentSlugForExec || 'clementine') + '/execution-log');
+      var logData = await logRes.json();
+      var runs = logData.runs || [];
+      html += '<div class="card" style="margin-bottom:16px"><div class="card-header" style="display:flex;justify-content:space-between;align-items:center"><span>Run History</span>';
+      html += '<span class="badge badge-gray" style="font-size:10px">' + runs.length + ' runs</span></div>';
+      html += '<div class="card-body" style="padding:0">';
+      if (runs.length === 0) {
+        html += '<div class="empty-state" style="padding:24px">No execution history yet</div>';
       } else {
-        items.slice(0, 50).forEach(function(item) {
-          var icon = item.source === 'cron' ? '&#9200;' : item.source === 'send' ? '&#9993;' : item.source === 'memory' ? '&#129504;' : item.source === 'approval' ? '&#9989;' : '&#128196;';
-          var statusBadge = item.status === 'ok' ? 'badge-green' : item.status === 'error' ? 'badge-red' : 'badge-gray';
-          html += '<div style="display:flex;align-items:center;gap:10px;padding:6px 0;border-bottom:1px solid var(--border)">';
-          html += '<span style="font-size:14px">' + icon + '</span>';
-          html += '<span style="flex:1;font-size:13px;color:var(--text-primary)">' + esc(item.title || item.jobName || item.subject || 'Activity') + '</span>';
-          if (item.status) html += '<span class="badge ' + statusBadge + '" style="font-size:10px">' + esc(item.status) + '</span>';
-          html += '<span style="font-size:11px;color:var(--text-muted)">' + fmtTimeAgo(item.timestamp || item.finishedAt) + '</span>';
-          html += '</div>';
+        html += '<table style="width:100%;border-collapse:collapse">';
+        html += '<thead><tr style="border-bottom:1px solid var(--border)">';
+        html += '<th style="padding:8px 12px;text-align:left;color:var(--text-muted);font-size:11px">Job</th>';
+        html += '<th style="padding:8px 12px;text-align:left;color:var(--text-muted);font-size:11px">Started</th>';
+        html += '<th style="padding:8px 12px;text-align:left;color:var(--text-muted);font-size:11px">Duration</th>';
+        html += '<th style="padding:8px 12px;text-align:left;color:var(--text-muted);font-size:11px">Status</th>';
+        html += '<th style="padding:8px 12px;text-align:left;color:var(--text-muted);font-size:11px">Output</th>';
+        html += '<th style="padding:8px 12px;text-align:center;color:var(--text-muted);font-size:11px">Trace</th>';
+        html += '</tr></thead><tbody>';
+        runs.forEach(function(run) {
+          var statusBadge = run.status === 'ok' ? 'badge-green' : run.status === 'error' ? 'badge-red' : run.status === 'skipped' ? 'badge-gray' : 'badge-orange';
+          var dur = run.durationMs ? (run.durationMs < 60000 ? (run.durationMs / 1000).toFixed(0) + 's' : (run.durationMs / 60000).toFixed(1) + 'm') : '-';
+          var displayName = run.jobName && run.jobName.includes(':') ? run.jobName.split(':').slice(1).join(':') : (run.jobName || '');
+          var safeJobName = esc(run.jobName || '').replace(/'/g, '');
+          var safeRowId = 'exec-trace-' + safeJobName.replace(/[^a-zA-Z0-9_-]/g, '_') + '-' + (run.startedAt || '').replace(/[^0-9]/g, '').slice(0, 14);
+          html += '<tr style="border-bottom:1px solid var(--border)">';
+          html += '<td style="padding:8px 12px;font-weight:500;font-size:13px">' + esc(displayName) + '</td>';
+          html += '<td style="padding:8px 12px;font-size:12px;color:var(--text-muted)">' + fmtTimeAgo(run.startedAt) + '</td>';
+          html += '<td style="padding:8px 12px;font-size:12px;color:var(--text-muted)">' + dur + '</td>';
+          html += '<td style="padding:8px 12px"><span class="badge ' + statusBadge + '" style="font-size:10px">' + esc(run.status || '') + '</span></td>';
+          html += '<td style="padding:8px 12px;font-size:12px;color:var(--text-muted);max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(run.outputPreview || '') + '</td>';
+          html += '<td style="padding:8px 12px;text-align:center"><button class="btn btn-sm" onclick="toggleInlineTrace(\\x27' + safeJobName + '\\x27,\\x27' + safeRowId + '\\x27)" style="font-size:10px;padding:2px 8px">View</button></td>';
+          html += '</tr>';
+          html += '<tr id="' + safeRowId + '" style="display:none"><td colspan="6" style="padding:0;background:var(--bg-tertiary)"><div class="inline-trace-content" style="max-height:400px;overflow-y:auto;font-size:12px"></div></td></tr>';
         });
+        html += '</tbody></table>';
       }
       html += '</div></div>';
-      container.innerHTML = html;
-    } catch(e) { container.innerHTML = '<div class="empty-state">Failed to load activity</div>'; }
+    } catch(e) { html += '<div class="empty-state">Failed to load execution log</div>'; }
 
-  } else if (tab === 'sessions') {
+    // Sessions
     try {
       var sessRes = await apiFetch('/api/sessions');
       var sessData = await sessRes.json();
@@ -8839,10 +9168,8 @@ async function loadAgentDetailTab(tab, slug, isPrimary) {
         if (isPrimary) return true;
         return k.indexOf(slug) >= 0;
       });
-      var html = '<div class="card"><div class="card-header">Sessions (' + keys.length + ')</div><div class="card-body">';
-      if (keys.length === 0) {
-        html += '<div class="empty-state">No sessions</div>';
-      } else {
+      if (keys.length > 0) {
+        html += '<div class="card"><div class="card-header">Sessions (' + keys.length + ')</div><div class="card-body">';
         keys.forEach(function(key) {
           var s = sessData[key];
           var icon = key.indexOf('discord') >= 0 ? '&#128172;' : key.indexOf('slack') >= 0 ? '&#128488;' : key.indexOf('dashboard') >= 0 ? '&#127760;' : '&#128172;';
@@ -8853,12 +9180,13 @@ async function loadAgentDetailTab(tab, slug, isPrimary) {
           html += '<span style="font-size:11px;color:var(--text-muted)">' + fmtTimeAgo(s.lastActive) + '</span>';
           html += '</div>';
         });
+        html += '</div></div>';
       }
-      html += '</div></div>';
-      container.innerHTML = html;
-    } catch(e) { container.innerHTML = '<div class="empty-state">Failed to load sessions</div>'; }
+    } catch(e) { /* sessions optional */ }
 
-  } else if (tab === 'tools') {
+    container.innerHTML = html || '<div class="empty-state">No execution data yet</div>';
+
+  } else if (tab === 'settings') {
     var html = '';
     var agentAllowed = (a && a.allowedTools) ? a.allowedTools : [];
     var hasWhitelist = agentAllowed.length > 0;
@@ -9001,10 +9329,7 @@ async function loadAgentDetailTab(tab, slug, isPrimary) {
       });
       html += '</div></div>';
     }
-    container.innerHTML = html || '<div class="empty-state">No tools or channels configured</div>';
-
-  } else if (tab === 'config') {
-    var html = '';
+    // Agent Profile (config section)
     if (a) {
       var canEdit = !isPrimary;
       var pencil = '&#9998;';
@@ -9102,7 +9427,7 @@ async function loadAgentDetailTab(tab, slug, isPrimary) {
         html += '</div>';
       }
     }
-    container.innerHTML = html || '<div class="empty-state">No config available</div>';
+    container.innerHTML = html || '<div class="empty-state">No settings available</div>';
   }
 }
 
@@ -9651,6 +9976,56 @@ function renderTrace(idx) {
   }
 
   document.getElementById('trace-content').innerHTML = html || '<div style="padding:20px;color:var(--text-muted)">Empty trace</div>';
+}
+
+// ── Inline Trace (Execution tab) ──
+async function toggleInlineTrace(jobName, rowId) {
+  var row = document.getElementById(rowId);
+  if (!row) return;
+  if (row.style.display !== 'none') {
+    row.style.display = 'none';
+    return;
+  }
+  row.style.display = '';
+  var content = row.querySelector('.inline-trace-content');
+  if (!content) return;
+  content.innerHTML = '<div style="padding:12px;color:var(--text-muted)">Loading trace...</div>';
+  try {
+    var r = await apiFetch('/api/cron/traces/' + encodeURIComponent(jobName));
+    var d = await r.json();
+    var traces = d.traces || [];
+    if (traces.length === 0) {
+      content.innerHTML = '<div style="padding:12px;color:var(--text-muted)">No traces recorded for this job. Traces are captured on the next run.</div>';
+      return;
+    }
+    // Show the most recent trace
+    var trace = traces[0];
+    if (!trace.trace || trace.trace.length === 0) {
+      content.innerHTML = '<div style="padding:12px;color:var(--text-muted)">Empty trace</div>';
+      return;
+    }
+    var html = '<div style="border-left:2px solid var(--border);margin:12px 16px;padding-left:16px">';
+    for (var i = 0; i < trace.trace.length; i++) {
+      var step = trace.trace[i];
+      var time = step.timestamp ? new Date(step.timestamp).toLocaleTimeString() : '';
+      var dotColor = step.type === 'tool_call' ? 'var(--accent)' : step.type === 'tool_result' ? 'var(--green)' : 'var(--text-muted)';
+      var typeLabel = step.type === 'tool_call' ? 'TOOL' : step.type === 'tool_result' ? 'RESULT' : 'TEXT';
+      var stepContent = esc(step.content || '');
+      if (stepContent.length > 300) stepContent = stepContent.slice(0, 300) + '...';
+      html += '<div style="position:relative;padding:8px 0;margin-bottom:4px">';
+      html += '<div style="position:absolute;left:-21px;top:10px;width:8px;height:8px;border-radius:50%;background:' + dotColor + '"></div>';
+      html += '<div style="display:flex;align-items:center;gap:8px;margin-bottom:2px">';
+      html += '<span style="font-size:10px;font-weight:bold;color:' + dotColor + ';text-transform:uppercase;min-width:45px">' + typeLabel + '</span>';
+      html += '<span style="font-size:10px;color:var(--text-muted)">' + time + '</span>';
+      html += '</div>';
+      html += '<div style="font-size:11px;color:var(--text-primary);white-space:pre-wrap;word-break:break-word;font-family:monospace;line-height:1.4">' + stepContent + '</div>';
+      html += '</div>';
+    }
+    html += '</div>';
+    content.innerHTML = html;
+  } catch(e) {
+    content.innerHTML = '<div style="padding:12px;color:var(--red)">Failed to load trace: ' + esc(String(e)) + '</div>';
+  }
 }
 
 async function cancelUnleashed(jobName) {
@@ -10339,12 +10714,122 @@ function openEditCronModal(jobName) {
   populateAfterJobDropdown(job.after || '', jobName);
   toggleUnleashedOptions();
   document.getElementById('cron-prompt').value = job.prompt || '';
+  _pendingAttachments = [];
+  loadCronAttachments(jobName);
   document.getElementById('cron-modal').classList.add('show');
 }
 
 function closeCronModal() {
   document.getElementById('cron-modal').classList.remove('show');
   editingCronJob = null;
+  // Clear attachment list
+  var attachList = document.getElementById('cron-attachments-list');
+  if (attachList) attachList.innerHTML = '';
+}
+
+// ── Cron Attachment Handling ──
+var _pendingAttachments = [];
+
+function handleCronFileUpload(event) {
+  var files = event.target.files;
+  if (!files || files.length === 0) return;
+  var maxSize = 10 * 1024 * 1024; // 10MB
+
+  for (var i = 0; i < files.length; i++) {
+    var file = files[i];
+    if (file.size > maxSize) {
+      toast('File "' + file.name + '" exceeds 10MB limit', 'error');
+      continue;
+    }
+    (function(f) {
+      var reader = new FileReader();
+      reader.onload = function(e) {
+        var base64 = e.target.result.split(',')[1] || '';
+        _pendingAttachments.push({ filename: f.name, content: base64, size: f.size });
+        renderCronAttachments();
+      };
+      reader.readAsDataURL(f);
+    })(file);
+  }
+  // Reset input so same file can be re-selected
+  event.target.value = '';
+}
+
+function removeCronAttachment(idx) {
+  _pendingAttachments.splice(idx, 1);
+  renderCronAttachments();
+}
+
+function removeExistingAttachment(jobName, filename) {
+  apiDelete('/api/cron/' + encodeURIComponent(jobName) + '/attachments/' + encodeURIComponent(filename))
+    .then(function() {
+      toast('Removed ' + filename, 'success');
+      loadCronAttachments(jobName);
+    })
+    .catch(function(e) { toast('Error: ' + e, 'error'); });
+}
+
+function renderCronAttachments() {
+  var container = document.getElementById('cron-attachments-list');
+  if (!container) return;
+  var existing = container.querySelectorAll('.attachment-existing');
+  var html = '';
+  // Keep existing attachments (from server)
+  existing.forEach(function(el) { html += el.outerHTML; });
+  // Add pending attachments
+  _pendingAttachments.forEach(function(att, idx) {
+    var sizeStr = att.size < 1024 ? att.size + ' B' : att.size < 1024 * 1024 ? (att.size / 1024).toFixed(1) + ' KB' : (att.size / (1024 * 1024)).toFixed(1) + ' MB';
+    html += '<div style="display:flex;align-items:center;gap:8px;padding:4px 8px;margin-bottom:4px;background:var(--bg-tertiary);border-radius:4px;font-size:12px" class="attachment-pending">';
+    html += '<span style="flex:1;color:var(--text-primary)">' + esc(att.filename) + '</span>';
+    html += '<span style="color:var(--text-muted)">' + sizeStr + '</span>';
+    html += '<span class="badge badge-blue" style="font-size:9px">new</span>';
+    html += '<button onclick="removeCronAttachment(' + idx + ')" style="background:none;border:none;color:var(--red);cursor:pointer;font-size:14px;padding:0 4px">&times;</button>';
+    html += '</div>';
+  });
+  container.innerHTML = html;
+}
+
+async function loadCronAttachments(jobName) {
+  var container = document.getElementById('cron-attachments-list');
+  if (!container) return;
+  try {
+    var r = await apiFetch('/api/cron/' + encodeURIComponent(jobName) + '/attachments');
+    var d = await r.json();
+    var files = d.files || [];
+    var html = '';
+    files.forEach(function(f) {
+      var sizeStr = f.size < 1024 ? f.size + ' B' : f.size < 1024 * 1024 ? (f.size / 1024).toFixed(1) + ' KB' : (f.size / (1024 * 1024)).toFixed(1) + ' MB';
+      html += '<div style="display:flex;align-items:center;gap:8px;padding:4px 8px;margin-bottom:4px;background:var(--bg-tertiary);border-radius:4px;font-size:12px" class="attachment-existing">';
+      html += '<span style="flex:1;color:var(--text-primary)">' + esc(f.name) + '</span>';
+      html += '<span style="color:var(--text-muted)">' + sizeStr + '</span>';
+      html += '<button onclick="removeExistingAttachment(\\x27' + esc(jobName) + '\\x27,\\x27' + esc(f.name) + '\\x27)" style="background:none;border:none;color:var(--red);cursor:pointer;font-size:14px;padding:0 4px">&times;</button>';
+      html += '</div>';
+    });
+    // Also render pending
+    _pendingAttachments.forEach(function(att, idx) {
+      var sizeStr = att.size < 1024 ? att.size + ' B' : att.size < 1024 * 1024 ? (att.size / 1024).toFixed(1) + ' KB' : (att.size / (1024 * 1024)).toFixed(1) + ' MB';
+      html += '<div style="display:flex;align-items:center;gap:8px;padding:4px 8px;margin-bottom:4px;background:var(--bg-tertiary);border-radius:4px;font-size:12px" class="attachment-pending">';
+      html += '<span style="flex:1;color:var(--text-primary)">' + esc(att.filename) + '</span>';
+      html += '<span style="color:var(--text-muted)">' + sizeStr + '</span>';
+      html += '<span class="badge badge-blue" style="font-size:9px">new</span>';
+      html += '<button onclick="removeCronAttachment(' + idx + ')" style="background:none;border:none;color:var(--red);cursor:pointer;font-size:14px;padding:0 4px">&times;</button>';
+      html += '</div>';
+    });
+    container.innerHTML = html;
+  } catch(e) { /* silent */ }
+}
+
+async function uploadPendingAttachments(jobName) {
+  for (var i = 0; i < _pendingAttachments.length; i++) {
+    var att = _pendingAttachments[i];
+    try {
+      await apiJson('POST', '/api/cron/' + encodeURIComponent(jobName) + '/attachments', {
+        filename: att.filename,
+        content: att.content,
+      });
+    } catch(e) { toast('Failed to upload ' + att.filename + ': ' + e, 'error'); }
+  }
+  _pendingAttachments = [];
 }
 
 async function saveCronJob() {
@@ -10368,8 +10853,10 @@ async function saveCronJob() {
 
   if (editingCronJob) {
     await apiJson('PUT', '/api/cron/' + encodeURIComponent(editingCronJob), body);
+    if (_pendingAttachments.length > 0) await uploadPendingAttachments(editingCronJob);
   } else {
     await apiJson('POST', '/api/cron', body);
+    if (_pendingAttachments.length > 0) await uploadPendingAttachments(name);
   }
   closeCronModal();
   refreshCron();
@@ -13229,6 +13716,215 @@ async function refreshSkills() {
   } catch(e) {
     var c = document.getElementById('panel-skills');
     if (c) c.innerHTML = '<div class="empty-state" style="color:var(--red)">Failed to load skills</div>';
+  }
+}
+
+// ── Agent-scoped Skills (Training tab) ──
+function toggleAgentTeachSkill() {
+  var form = document.getElementById('agent-teach-skill-form');
+  var btn = document.getElementById('agent-teach-skill-toggle');
+  if (!form) return;
+  var showing = form.style.display !== 'none';
+  form.style.display = showing ? 'none' : '';
+  if (btn) btn.textContent = showing ? '+ Teach Skill' : 'Cancel';
+  if (!showing) {
+    var el = document.getElementById('agent-skill-title');
+    if (el) el.focus();
+  }
+}
+
+async function saveAgentSkill(agentSlug) {
+  var title = (document.getElementById('agent-skill-title') || {}).value || '';
+  var description = (document.getElementById('agent-skill-description') || {}).value || '';
+  var triggers = (document.getElementById('agent-skill-triggers') || {}).value || '';
+  var steps = (document.getElementById('agent-skill-steps') || {}).value || '';
+  if (!title.trim() || !steps.trim()) { toast('Title and procedure are required', 'error'); return; }
+  try {
+    var endpoint = agentSlug ? '/api/agents/' + encodeURIComponent(agentSlug) + '/skills' : '/api/skills';
+    var r = await apiJson('POST', endpoint, { title: title.trim(), description: description.trim(), triggers: triggers, steps: steps.trim() });
+    if (r.ok) {
+      toast('Skill saved: ' + title, 'success');
+      toggleAgentTeachSkill();
+      document.getElementById('agent-skill-title').value = '';
+      document.getElementById('agent-skill-description').value = '';
+      document.getElementById('agent-skill-triggers').value = '';
+      document.getElementById('agent-skill-steps').value = '';
+      loadAgentSkills(agentSlug, !agentSlug);
+    } else {
+      toast('Failed: ' + (r.error || 'unknown'), 'error');
+    }
+  } catch(e) { toast('Error: ' + e, 'error'); }
+}
+
+async function loadAgentSkills(agentSlug, isPrimary) {
+  var container = document.getElementById('agent-skills-list');
+  if (!container) return;
+  try {
+    var endpoint = agentSlug ? '/api/agents/' + encodeURIComponent(agentSlug) + '/skills' : '/api/skills';
+    var r = await apiFetch(endpoint);
+    var d = await r.json();
+    var skills = d.skills || [];
+    if (skills.length === 0) {
+      container.innerHTML = '<div class="empty-state" style="padding:16px">No skills yet. Teach this agent a skill or they\'ll learn from successful tasks.</div>';
+      return;
+    }
+    var html = '<div style="display:flex;flex-direction:column;gap:8px;padding:12px">';
+    for (var s of skills) {
+      var sourceTag = s.source === 'manual' ? '<span class="badge badge-blue" style="font-size:10px">taught</span>'
+        : s.source === 'cron' ? '<span class="badge badge-green" style="font-size:10px">cron</span>'
+        : s.source === 'unleashed' ? '<span class="badge badge-purple" style="font-size:10px">unleashed</span>'
+        : '<span class="badge badge-gray" style="font-size:10px">' + esc(s.source || 'auto') + '</span>';
+      var scopeTag = s.agentSlug ? '<span class="badge badge-blue" style="font-size:10px">agent</span>' : '<span class="badge badge-gray" style="font-size:10px">global</span>';
+      var triggers = (s.triggers || []).map(function(t) { return '<code style="font-size:11px;background:var(--bg-tertiary);padding:2px 6px;border-radius:3px">' + esc(t) + '</code>'; }).join(' ');
+      var age = s.updatedAt ? timeAgo(s.updatedAt) : '';
+      html += '<div id="agent-skill-card-' + esc(s.name) + '" style="padding:10px;border:1px solid var(--border);border-radius:8px;background:var(--bg-secondary)">'
+        + '<div style="display:flex;align-items:center;gap:6px;margin-bottom:4px">'
+        + '<strong style="cursor:pointer;font-size:13px" onclick="expandSkill(\\x27' + esc(s.name) + '\\x27)">' + esc(s.title) + '</strong> ' + sourceTag + ' ' + scopeTag
+        + '<span style="margin-left:auto;display:flex;align-items:center;gap:6px">'
+        + '<span style="font-size:11px;color:var(--text-muted)">used ' + (s.useCount || 0) + 'x' + (age ? ' \\u00b7 ' + age : '') + '</span>'
+        + '<button onclick="expandSkill(\\x27' + esc(s.name) + '\\x27)" style="background:none;border:1px solid var(--border);border-radius:4px;padding:2px 8px;font-size:10px;color:var(--text-secondary);cursor:pointer">View</button>'
+        + '<button onclick="deleteAgentSkill(\\x27' + esc(agentSlug || '') + '\\x27,\\x27' + esc(s.name) + '\\x27)" style="background:none;border:1px solid var(--border);border-radius:4px;padding:2px 8px;font-size:10px;color:var(--red);cursor:pointer">Del</button>'
+        + '</span></div>'
+        + (s.description ? '<div style="font-size:12px;color:var(--text-secondary);margin-bottom:4px">' + esc(s.description) + '</div>' : '')
+        + (triggers ? '<div style="display:flex;gap:4px;flex-wrap:wrap">' + triggers + '</div>' : '')
+        + '</div>';
+    }
+    html += '</div>';
+    container.innerHTML = html;
+  } catch(e) {
+    container.innerHTML = '<div class="empty-state" style="color:var(--red)">Failed to load skills</div>';
+  }
+}
+
+async function deleteAgentSkill(agentSlug, name) {
+  if (!confirm('Delete skill "' + name + '"?')) return;
+  try {
+    var endpoint = agentSlug ? '/api/agents/' + encodeURIComponent(agentSlug) + '/skills/' + encodeURIComponent(name) : '/api/skills/' + encodeURIComponent(name);
+    await apiDelete(endpoint);
+    toast('Skill deleted', 'success');
+    loadAgentSkills(agentSlug, !agentSlug);
+  } catch(e) { toast('Error: ' + e, 'error'); }
+}
+
+// ── Prompt Lab (Training tab) ──
+var _promptLabJobName = '';
+
+async function loadPromptLabJobs(agentSlug, isPrimary) {
+  var select = document.getElementById('prompt-lab-job');
+  if (!select) return;
+  try {
+    var r = await apiFetch('/api/cron');
+    var d = await r.json();
+    var jobs = (d.jobs || []).filter(function(j) {
+      if (isPrimary) return !j.agent;
+      return j.agent === agentSlug;
+    });
+    var html = '<option value="">-- Select a scheduled task --</option>';
+    jobs.forEach(function(j) {
+      var displayName = j.agent ? j.name.replace(j.agent + ':', '') : j.name;
+      html += '<option value="' + esc(j.name) + '">' + esc(displayName) + '</option>';
+    });
+    select.innerHTML = html;
+  } catch(e) { /* silent */ }
+}
+
+async function loadPromptLab(jobName) {
+  _promptLabJobName = jobName;
+  var editor = document.getElementById('prompt-lab-editor');
+  var history = document.getElementById('prompt-lab-history');
+  var result = document.getElementById('prompt-lab-result');
+  if (!jobName) {
+    if (editor) editor.style.display = 'none';
+    return;
+  }
+  if (editor) editor.style.display = '';
+  if (history) history.style.display = 'none';
+  if (result) result.style.display = 'none';
+
+  // Load current prompt from cron data
+  try {
+    var r = await apiFetch('/api/cron');
+    var d = await r.json();
+    var jobs = d.jobs || [];
+    var job = jobs.find(function(j) { return j.name === jobName; });
+    if (job) {
+      document.getElementById('prompt-lab-text').value = job.prompt || '';
+    }
+  } catch(e) { /* silent */ }
+}
+
+async function savePromptLab() {
+  if (!_promptLabJobName) return;
+  var prompt = document.getElementById('prompt-lab-text').value;
+  try {
+    var r = await apiJson('PUT', '/api/cron/' + encodeURIComponent(_promptLabJobName), { prompt: prompt });
+    if (r.ok) {
+      toast('Prompt saved', 'success');
+    } else {
+      toast('Failed: ' + (r.error || 'unknown'), 'error');
+    }
+  } catch(e) { toast('Error: ' + e, 'error'); }
+}
+
+async function saveAndRunPromptLab() {
+  if (!_promptLabJobName) return;
+  await savePromptLab();
+  try {
+    await apiPost('/api/cron/run/' + encodeURIComponent(_promptLabJobName));
+    toast('Task triggered: ' + _promptLabJobName, 'success');
+    // Show result area
+    var result = document.getElementById('prompt-lab-result');
+    if (result) {
+      result.style.display = '';
+      result.innerHTML = '<div style="padding:12px;border:1px solid var(--border);border-radius:6px;background:var(--bg-secondary)"><span style="font-size:12px;color:var(--accent)">Task running... check the Execution tab for results.</span></div>';
+    }
+  } catch(e) { toast('Error: ' + e, 'error'); }
+}
+
+async function togglePromptHistory() {
+  var container = document.getElementById('prompt-lab-history');
+  if (!container) return;
+  if (container.style.display !== 'none') {
+    container.style.display = 'none';
+    return;
+  }
+  container.style.display = '';
+  container.innerHTML = '<div style="color:var(--text-muted);font-size:12px">Loading...</div>';
+
+  try {
+    var r = await apiFetch('/api/cron/' + encodeURIComponent(_promptLabJobName) + '/prompt-history');
+    var d = await r.json();
+    var versions = d.versions || [];
+    if (versions.length === 0) {
+      container.innerHTML = '<div style="padding:8px;font-size:12px;color:var(--text-muted)">No version history yet. History starts from the first edit.</div>';
+      return;
+    }
+    var html = '<div style="border:1px solid var(--border);border-radius:6px;overflow:hidden">';
+    html += '<div style="padding:8px 12px;background:var(--bg-secondary);font-size:12px;font-weight:600;color:var(--text-secondary);border-bottom:1px solid var(--border)">Version History</div>';
+    versions.forEach(function(v) {
+      html += '<div style="padding:8px 12px;border-bottom:1px solid var(--border);font-size:12px">';
+      html += '<div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">';
+      html += '<span style="font-weight:600;color:var(--text-primary)">v' + v.version + '</span>';
+      html += '<span style="color:var(--text-muted)">' + fmtTimeAgo(v.timestamp) + '</span>';
+      html += '<span class="badge badge-gray" style="font-size:9px">' + esc(v.changedBy || 'unknown') + '</span>';
+      html += '<button class="btn btn-sm" onclick="restorePromptVersion(\\x27' + esc(v.prompt || '').replace(/'/g, '').replace(/\\/g, '\\\\').replace(/\n/g, '\\n') + '\\x27)" style="font-size:10px;padding:2px 8px;margin-left:auto">Restore</button>';
+      html += '</div>';
+      var preview = (v.prompt || '').slice(0, 100).replace(/\n/g, ' ');
+      html += '<div style="color:var(--text-muted);font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(preview) + '</div>';
+      html += '</div>';
+    });
+    html += '</div>';
+    container.innerHTML = html;
+  } catch(e) {
+    container.innerHTML = '<div style="color:var(--red);font-size:12px">Failed to load history</div>';
+  }
+}
+
+function restorePromptVersion(promptText) {
+  var textarea = document.getElementById('prompt-lab-text');
+  if (textarea) {
+    textarea.value = promptText.replace(/\\n/g, '\n');
+    toast('Prompt restored — click Save to apply', 'success');
   }
 }
 

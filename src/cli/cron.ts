@@ -7,7 +7,7 @@
  */
 
 import { execSync } from 'node:child_process';
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, writeFileSync, mkdirSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import cron from 'node-cron';
@@ -125,6 +125,37 @@ export async function cmdCronRun(jobName: string): Promise<void> {
       });
       return;
     }
+  }
+
+  // ── Inject attachment content ──
+  const attachDir = path.join(BASE_DIR, 'attachments', job.name.replace(/[^a-zA-Z0-9_:-]/g, '_'));
+  if (existsSync(attachDir)) {
+    try {
+      const attachFiles = readdirSync(attachDir);
+      const textExts = ['.csv', '.md', '.txt', '.json', '.tsv'];
+      let attachContent = '';
+      let totalChars = 0;
+      const MAX_ATTACH_CHARS = 50_000;
+      for (const af of attachFiles) {
+        const ext = path.extname(af).toLowerCase();
+        const afPath = path.join(attachDir, af);
+        if (textExts.includes(ext)) {
+          const content = readFileSync(afPath, 'utf-8');
+          if (totalChars + content.length > MAX_ATTACH_CHARS) {
+            attachContent += `\n### ${af}\n*(truncated — file too large, available at: ${afPath})*\n`;
+            continue;
+          }
+          attachContent += `\n### ${af}\n\`\`\`\n${content}\n\`\`\`\n`;
+          totalChars += content.length;
+        } else {
+          attachContent += `\n### ${af}\n*(binary file — available at: ${afPath})*\n`;
+        }
+      }
+      if (attachContent) {
+        job = { ...job, prompt: `## Reference Files\nThese files were attached for context:\n${attachContent}\n\n${job.prompt}` };
+        console.log(`Injected ${attachFiles.length} attachment(s) into prompt`);
+      }
+    } catch { /* non-fatal */ }
   }
 
   console.log(`Running cron job: ${job.name}`);

@@ -1415,7 +1415,7 @@ You have a limited number of turns per message (~15). **After 8-10 tool calls, y
         (async (): Promise<string | undefined> => {
           try {
             const { searchSkills, recordSkillUse } = await import('./skill-extractor.js');
-            const matchedSkills = searchSkills(enrichedQuery, 2);
+            const matchedSkills = searchSkills(enrichedQuery, 2, agentSlug || undefined);
             if (matchedSkills.length > 0) {
               return `## Relevant Procedures (from past successful executions)\n\n` +
                 matchedSkills.map(s => {
@@ -2926,7 +2926,8 @@ You have a limited number of turns per message (~15). **After 8-10 tool calls, y
     let skillContext = '';
     try {
       const { searchSkills, recordSkillUse } = await import('./skill-extractor.js');
-      const matchedSkills = searchSkills(jobName + ' ' + jobPrompt.slice(0, 200), 2);
+      const cronAgentSlug = sdkOptions.env?.CLEMENTINE_TEAM_AGENT;
+      const matchedSkills = searchSkills(jobName + ' ' + jobPrompt.slice(0, 200), 2, cronAgentSlug || undefined);
       if (matchedSkills.length > 0) {
         const skillLines = matchedSkills.map(s => {
           recordSkillUse(s.name);
@@ -3281,7 +3282,8 @@ You have a limited number of turns per message (~15). **After 8-10 tool calls, y
       if (phase === 1) {
         try {
           const { searchSkills, recordSkillUse } = await import('./skill-extractor.js');
-          const matchedSkills = searchSkills(jobName + ' ' + jobPrompt.slice(0, 200), 2);
+          const unleashedAgentSlug = jobName.includes(':') ? jobName.split(':')[0] : undefined;
+          const matchedSkills = searchSkills(jobName + ' ' + jobPrompt.slice(0, 200), 2, unleashedAgentSlug);
           if (matchedSkills.length > 0) {
             unleashedSkillContext = `\n\n## Learned Procedures\nFollow these proven approaches when applicable:\n\n` +
               matchedSkills.map(s => { recordSkillUse(s.name); return `### ${s.title}\n${s.content}`; }).join('\n\n') + '\n';

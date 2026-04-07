@@ -226,44 +226,57 @@ async function mergeSkill(
 
 // ── Skill Retrieval ─────────────────────────────────────────────────
 
-/** Search skills by query text and return matching skill content for injection. */
-export function searchSkills(query: string, limit = 3): Array<{ name: string; title: string; content: string; score: number }> {
-  if (!existsSync(SKILLS_DIR)) return [];
+/** Search skills by query text and return matching skill content for injection. Agent-scoped skills get a priority boost. */
+export function searchSkills(query: string, limit = 3, agentSlug?: string): Array<{ name: string; title: string; content: string; score: number }> {
+  const dirs: Array<{ dir: string; boost: number }> = [];
+  // Agent-scoped skills get priority (boost=2)
+  if (agentSlug) {
+    const agentDir = path.join(VAULT_DIR, '00-System', 'agents', agentSlug, 'skills');
+    if (existsSync(agentDir)) dirs.push({ dir: agentDir, boost: 2 });
+  }
+  // Global skills (no boost)
+  if (existsSync(SKILLS_DIR)) dirs.push({ dir: SKILLS_DIR, boost: 0 });
 
-  const files = readdirSync(SKILLS_DIR).filter(f => f.endsWith('.md'));
-  if (files.length === 0) return [];
+  if (dirs.length === 0) return [];
 
   const queryWords = query.toLowerCase().split(/\s+/).filter(w => w.length > 2);
   const results: Array<{ name: string; title: string; content: string; score: number }> = [];
+  const seen = new Set<string>();
 
-  for (const file of files) {
-    try {
-      const raw = readFileSync(path.join(SKILLS_DIR, file), 'utf-8');
-      const parsed = matter(raw);
-      const triggers: string[] = parsed.data.triggers ?? [];
-      const title: string = parsed.data.title ?? '';
-      const description: string = parsed.data.description ?? '';
+  for (const { dir, boost } of dirs) {
+    const files = readdirSync(dir).filter(f => f.endsWith('.md'));
+    for (const file of files) {
+      const name = file.replace('.md', '');
+      if (seen.has(name)) continue;
+      seen.add(name);
+      try {
+        const raw = readFileSync(path.join(dir, file), 'utf-8');
+        const parsed = matter(raw);
+        const triggers: string[] = parsed.data.triggers ?? [];
+        const title: string = parsed.data.title ?? '';
+        const description: string = parsed.data.description ?? '';
 
-      // Score: trigger matches (high weight) + title/description word overlap
-      let score = 0;
-      const triggerLower = triggers.map(t => t.toLowerCase());
-      for (const word of queryWords) {
-        for (const trigger of triggerLower) {
-          if (trigger.includes(word) || word.includes(trigger)) score += 3;
+        // Score: trigger matches (high weight) + title/description word overlap + agent boost
+        let score = 0;
+        const triggerLower = triggers.map(t => t.toLowerCase());
+        for (const word of queryWords) {
+          for (const trigger of triggerLower) {
+            if (trigger.includes(word) || word.includes(trigger)) score += 3;
+          }
+          if (title.toLowerCase().includes(word)) score += 2;
+          if (description.toLowerCase().includes(word)) score += 1;
         }
-        if (title.toLowerCase().includes(word)) score += 2;
-        if (description.toLowerCase().includes(word)) score += 1;
-      }
 
-      if (score > 0) {
-        results.push({
-          name: file.replace('.md', ''),
-          title,
-          content: parsed.content.slice(0, 1500),
-          score,
-        });
-      }
-    } catch { /* skip */ }
+        if (score > 0) {
+          results.push({
+            name,
+            title,
+            content: parsed.content.slice(0, 1500),
+            score: score + boost,
+          });
+        }
+      } catch { /* skip */ }
+    }
   }
 
   return results.sort((a, b) => b.score - a.score).slice(0, limit);

@@ -812,13 +812,45 @@ export class CronScheduler {
         ? 1
         : 1 + (job.maxRetries ?? Math.min(priorErrors, BACKOFF_MS.length));
 
+      // ── Inject attachment content if present ──
+      let jobPrompt = job.prompt;
+      const attachDir = path.join(BASE_DIR, 'attachments', job.name.replace(/[^a-zA-Z0-9_:-]/g, '_'));
+      if (existsSync(attachDir)) {
+        try {
+          const attachFiles = readdirSync(attachDir);
+          const textExts = ['.csv', '.md', '.txt', '.json', '.tsv'];
+          let attachContent = '';
+          let totalChars = 0;
+          const MAX_ATTACH = 50_000;
+          for (const af of attachFiles) {
+            const ext = path.extname(af).toLowerCase();
+            const afPath = path.join(attachDir, af);
+            if (textExts.includes(ext)) {
+              const content = readFileSync(afPath, 'utf-8');
+              if (totalChars + content.length > MAX_ATTACH) {
+                attachContent += `\n### ${af}\n*(truncated — available at: ${afPath})*\n`;
+                continue;
+              }
+              attachContent += `\n### ${af}\n\`\`\`\n${content}\n\`\`\`\n`;
+              totalChars += content.length;
+            } else {
+              attachContent += `\n### ${af}\n*(binary file — available at: ${afPath})*\n`;
+            }
+          }
+          if (attachContent) {
+            jobPrompt = `## Reference Files\nThese files were attached for context:\n${attachContent}\n\n${jobPrompt}`;
+            logger.info({ job: job.name, files: attachFiles.length }, 'Injected attachments into prompt');
+          }
+        } catch { /* non-fatal */ }
+      }
+
       for (let attempt = 1; attempt <= maxAttempts; attempt++) {
         const startedAt = new Date();
         try {
           // Standard cron jobs get a timeout via SDK AbortController (advisor may override)
           let response = await this.gateway.handleCronJob(
             job.name,
-            job.prompt,
+            jobPrompt,
             job.tier,
             job.maxTurns,
             job.model,
@@ -835,7 +867,7 @@ export class CronScheduler {
             try {
               const retryResponse = await this.gateway.handleCronJob(
                 job.name,
-                job.prompt + '\n\nYou MUST produce a brief status update. Do NOT return __NOTHING__.',
+                jobPrompt + '\n\nYou MUST produce a brief status update. Do NOT return __NOTHING__.',
                 job.tier,
                 job.maxTurns,
                 job.model,

@@ -274,6 +274,7 @@ export interface CronJobDefinition {
   successCriteria?: string[];      // Verifiable acceptance criteria for goal-backward reflection
   alwaysDeliver?: boolean;         // If true, retry once with explicit prompt when response is empty/noise
   preCheck?: string;               // Shell command gate — exit 0 = run, non-zero = skip. Stdout injected as context.
+  attachments?: string[];          // Filenames in ~/.clementine/attachments/{job-name}/ injected at runtime
 }
 
 export type TerminalReason =
