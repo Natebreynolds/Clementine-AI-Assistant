@@ -7682,6 +7682,17 @@ function getDashboardHTML(token: string): string {
               </div>
             </div>
           </div>
+          <div id="builder-file-area" style="display:none;padding:8px 16px;border-top:1px solid var(--border);background:var(--bg-secondary)">
+            <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">
+              <span style="font-size:11px;font-weight:600;color:var(--text-secondary)">Reference Files</span>
+              <label style="cursor:pointer;display:inline-flex;align-items:center;gap:4px;background:var(--bg-tertiary);border:1px solid var(--border);border-radius:4px;padding:2px 8px;font-size:11px;color:var(--text-primary)">
+                + Add
+                <input type="file" multiple accept=".csv,.md,.txt,.json,.docx,.xlsx" style="display:none" onchange="handleBuilderFileUpload(event)">
+              </label>
+            </div>
+            <div id="builder-attachments-list"></div>
+            <div style="font-size:10px;color:var(--text-muted)">Files injected into the agent prompt at runtime</div>
+          </div>
           <div style="display:flex;gap:8px;padding:12px 16px;border-top:1px solid var(--border)">
             <input type="text" id="builder-input" placeholder="Describe what you want to build..." onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendBuilderChat()}" style="flex:1;padding:10px 14px;border:1px solid var(--border);border-radius:8px;background:var(--bg-input);color:var(--text-primary);font-size:13px">
             <button class="btn-primary" onclick="sendBuilderChat()" style="padding:10px 18px;border-radius:8px">Send</button>
@@ -11864,6 +11875,11 @@ function resetBuilder() {
   if (status) status.textContent = '';
   var input = document.getElementById('builder-input');
   if (input) input.value = '';
+  _builderAttachments = [];
+  var fileArea = document.getElementById('builder-file-area');
+  var type = (document.getElementById('builder-type') || {}).value;
+  if (fileArea) fileArea.style.display = (type === 'cron') ? '' : 'none';
+  renderBuilderAttachments();
 }
 
 function builderQuick(text) {
@@ -12011,12 +12027,14 @@ function refreshBuilderAgents(preselect) {
   var sel = document.getElementById('builder-agent');
   if (!sel) return;
   apiFetch('/api/agents').then(function(r) { return r.json(); }).then(function(d) {
-    var agents = d.agents || [];
-    sel.innerHTML = '<option value="">Clementine (global)</option>';
-    for (var a of agents) {
-      var selected = (preselect && a.slug === preselect) ? ' selected' : '';
-      sel.innerHTML += '<option value="' + esc(a.slug) + '"' + selected + '>' + esc(a.name) + '</option>';
+    var agents = Array.isArray(d) ? d : (d.agents || []);
+    var html = '<option value="">Clementine (global)</option>';
+    for (var i = 0; i < agents.length; i++) {
+      var a = agents[i];
+      var isSelected = (preselect && a.slug === preselect) ? ' selected' : '';
+      html += '<option value="' + esc(a.slug) + '"' + isSelected + '>' + esc(a.name) + '</option>';
     }
+    sel.innerHTML = html;
   }).catch(function() {});
 }
 
