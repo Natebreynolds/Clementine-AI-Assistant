@@ -225,6 +225,7 @@ export class GraphStore {
     to: EntityRef,
     type: string,
     props?: Record<string, any>,
+    temporal?: { validFrom?: string; validTo?: string },
   ): Promise<void> {
     if (!this.available) return;
     const fromLabel = from.label.replace(/[^A-Za-z]/g, '');
@@ -233,7 +234,12 @@ export class GraphStore {
     const propsStr = props
       ? ', ' + Object.entries(props).map(([k, _v]) => `r.${k} = $r_${k}`).join(', ')
       : '';
-    const params: Record<string, any> = { fromId: from.id, toId: to.id };
+    const params: Record<string, any> = {
+      fromId: from.id,
+      toId: to.id,
+      valid_from: temporal?.validFrom ?? new Date().toISOString(),
+      valid_to: temporal?.validTo ?? null,
+    };
     if (props) {
       for (const [k, v] of Object.entries(props)) {
         params[`r_${k}`] = v;
@@ -243,7 +249,7 @@ export class GraphStore {
       `MERGE (a:${fromLabel} {id: $fromId}) ` +
       `MERGE (b:${toLabel} {id: $toId}) ` +
       `MERGE (a)-[r:${relType}]->(b) ` +
-      `SET r.created_at = timestamp()${propsStr}`;
+      `SET r.created_at = timestamp(), r.valid_from = $valid_from, r.valid_to = $valid_to${propsStr}`;
     try {
       await this.graph.query(cypher, { params });
     } catch (err) {
@@ -251,28 +257,67 @@ export class GraphStore {
     }
   }
 
+  /**
+   * Mark a relationship as no longer active by setting its valid_to timestamp.
+   */
+  async invalidateRelationship(
+    fromId: string,
+    toId: string,
+    relType: string,
+    asOf?: string,
+  ): Promise<boolean> {
+    if (!this.available) return false;
+    const safeRelType = relType.replace(/[^A-Za-z_]/g, '');
+    const cypher =
+      `MATCH (a {id: $fromId})-[r:${safeRelType}]->(b {id: $toId}) ` +
+      `WHERE r.valid_to IS NULL ` +
+      `SET r.valid_to = $validTo ` +
+      `RETURN count(r) AS updated`;
+    try {
+      const res = await this.graph.query(cypher, {
+        params: { fromId, toId, validTo: asOf ?? new Date().toISOString() },
+      });
+      return (res.data?.[0]?.updated ?? 0) > 0;
+    } catch {
+      return false;
+    }
+  }
+
   async getRelationships(
     entityId: string,
     direction: 'in' | 'out' | 'both' = 'both',
     relType?: string,
+    asOf?: string,
   ): Promise<Array<{ from: string; to: string; type: string; properties: Record<string, any> }>> {
     if (!this.available) return [];
     const relFilter = relType ? `:${relType.replace(/[^A-Za-z_]/g, '')}` : '';
+
+    // Build temporal WHERE clause
+    let temporalWhere = '';
+    const params: Record<string, any> = { id: entityId };
+    if (asOf) {
+      temporalWhere = ' WHERE (r.valid_from IS NULL OR r.valid_from <= $asOf) AND (r.valid_to IS NULL OR r.valid_to > $asOf)';
+      params.asOf = asOf;
+    } else {
+      // By default show only active relationships (valid_to is null or not set)
+      temporalWhere = ' WHERE r.valid_to IS NULL';
+    }
+
     const queries: string[] = [];
     if (direction === 'out' || direction === 'both') {
       queries.push(
-        `MATCH (a {id: $id})-[r${relFilter}]->(b) RETURN a.id AS from, b.id AS to, type(r) AS rel, properties(r) AS props`,
+        `MATCH (a {id: $id})-[r${relFilter}]->(b)${temporalWhere} RETURN a.id AS from, b.id AS to, type(r) AS rel, properties(r) AS props`,
       );
     }
     if (direction === 'in' || direction === 'both') {
       queries.push(
-        `MATCH (a {id: $id})<-[r${relFilter}]-(b) RETURN b.id AS from, a.id AS to, type(r) AS rel, properties(r) AS props`,
+        `MATCH (a {id: $id})<-[r${relFilter}]-(b)${temporalWhere} RETURN b.id AS from, a.id AS to, type(r) AS rel, properties(r) AS props`,
       );
     }
     const results: Array<{ from: string; to: string; type: string; properties: Record<string, any> }> = [];
     for (const q of queries) {
       try {
-        const res = await this.graph.query(q, { params: { id: entityId } });
+        const res = await this.graph.query(q, { params });
         if (res.data) {
           for (const row of res.data) {
             results.push({
@@ -294,22 +339,36 @@ export class GraphStore {
     startId: string,
     maxDepth: number = 3,
     relTypes?: string[],
+    asOf?: string,
   ): Promise<TraversalResult[]> {
     if (!this.available) return [];
     const relFilter = relTypes?.length
       ? relTypes.map(t => t.replace(/[^A-Za-z_]/g, '')).join('|')
       : '';
     const relPattern = relFilter ? `:${relFilter}` : '';
+
+    // When asOf is specified, include relationship properties for post-filtering
     const cypher =
       `MATCH path = (start {id: $id})-[${relPattern}*1..${maxDepth}]->(end) ` +
       `RETURN end.id AS id, labels(end)[0] AS label, properties(end) AS props, ` +
-      `length(path) AS depth, [r IN relationships(path) | type(r)] AS rels`;
+      `length(path) AS depth, [r IN relationships(path) | type(r)] AS rels` +
+      (asOf ? `, [r IN relationships(path) | properties(r)] AS relProps` : '');
     try {
       const res = await this.graph.query(cypher, { params: { id: startId } });
       if (!res.data) return [];
       const seen = new Set<string>();
       const results: TraversalResult[] = [];
       for (const row of res.data) {
+        // If asOf specified, filter out paths with temporally invalid relationships
+        if (asOf && row.relProps) {
+          const allValid = (row.relProps as Array<Record<string, any>>).every((rp) => {
+            const from = rp.valid_from;
+            const to = rp.valid_to;
+            return (!from || from <= asOf) && (!to || to > asOf);
+          });
+          if (!allValid) continue;
+        }
+
         const eid = row.id;
         if (seen.has(eid)) continue;
         seen.add(eid);

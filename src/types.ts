@@ -15,7 +15,11 @@ export interface SearchResult {
   chunkId: number;
   salience: number;
   agentSlug?: string | null;
+  category?: string | null;
+  topic?: string | null;
 }
+
+export type ChunkCategory = 'facts' | 'events' | 'discoveries' | 'preferences' | 'advice';
 
 export interface Chunk {
   sourceFile: string;
@@ -24,6 +28,8 @@ export interface Chunk {
   chunkType: 'frontmatter' | 'heading' | 'preamble' | 'episodic';
   frontmatterJson: string;
   contentHash: string;
+  category?: ChunkCategory | null;
+  topic?: string | null;
 }
 
 export interface SyncStats {
@@ -607,6 +613,8 @@ export interface RelationshipTriplet {
   rel: string;
   to: EntityRef;
   context?: string;
+  validFrom?: string | null;
+  validTo?: string | null;
 }
 
 export interface TraversalResult {

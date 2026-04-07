@@ -11,7 +11,7 @@ import path from 'node:path';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import {
-  ACTIVE_AGENT_SLUG, BASE_DIR, MEMORY_FILE, SYSTEM_DIR,
+  ACTIVE_AGENT_SLUG, BASE_DIR, IDENTITY_FILE, MEMORY_FILE, SYSTEM_DIR,
   VAULT_DIR, WORKING_MEMORY_FILE, WORKING_MEMORY_MAX_LINES,
   ensureDailyNote, getStore, globMd, incrementalSync, logger, nowTime,
   resolvePath, textResult, todayStr, validateVaultPath,
@@ -89,9 +89,9 @@ server.tool(
 
 server.tool(
   'memory_write',
-  "Write or append to a vault note. Actions: 'append_daily' (add to today's log), 'update_memory' (update MEMORY.md section), 'write_note' (write/overwrite a note).",
+  "Write or append to a vault note. Actions: 'append_daily' (add to today's log), 'update_memory' (update MEMORY.md section), 'write_note' (write/overwrite a note), 'update_identity' (set identity seed — who you are, your role, key context).",
   {
-    action: z.enum(['append_daily', 'update_memory', 'write_note']).describe('Write action'),
+    action: z.enum(['append_daily', 'update_memory', 'write_note', 'update_identity']).describe('Write action'),
     content: z.string().describe('Text to write/append'),
     section: z.string().optional().describe('Section for append_daily or update_memory'),
     file_path: z.string().optional().describe('Relative vault path for write_note action'),
@@ -192,6 +192,14 @@ server.tool(
       return textResult(`Updated ${label} > ${sec}`);
     }
 
+    if (action === 'update_identity') {
+      mkdirSync(path.dirname(IDENTITY_FILE), { recursive: true });
+      writeFileSync(IDENTITY_FILE, content, 'utf-8');
+      const rel = path.relative(VAULT_DIR, IDENTITY_FILE);
+      await incrementalSync(rel, ACTIVE_AGENT_SLUG ?? undefined);
+      return textResult('Updated identity seed (IDENTITY.md)');
+    }
+
     if (action === 'write_note') {
       const relPath = file_path ?? '';
       if (!relPath) return textResult("Error: 'file_path' required for write_note");
@@ -212,17 +220,20 @@ server.tool(
 
 server.tool(
   'memory_search',
-  'FTS5 search across all vault notes. Returns matching chunks with relevance scores.',
+  'FTS5 search across all vault notes. Returns matching chunks with relevance scores. Optional category/topic filters narrow results.',
   {
     query: z.string().describe('Search text'),
     limit: z.number().optional().describe('Max results (default 20)'),
+    category: z.enum(['facts', 'events', 'discoveries', 'preferences', 'advice']).optional().describe('Filter by category'),
+    topic: z.string().optional().describe('Filter by topic'),
   },
-  async ({ query, limit }) => {
+  async ({ query, limit, category, topic }) => {
     const maxResults = limit ?? 20;
+    const filters = (category || topic) ? { category, topic } : undefined;
 
     try {
       const store = await getStore();
-      const results = store.searchFts(query, maxResults);
+      const results = store.searchFts(query, maxResults, filters);
 
       // Apply agent affinity boost
       if (ACTIVE_AGENT_SLUG && results.length > 0) {
@@ -277,15 +288,17 @@ server.tool(
 
 server.tool(
   'memory_recall',
-  'Context retrieval combining FTS5 relevance + recency search. Better than memory_search for finding related content by meaning.',
+  'Context retrieval combining FTS5 relevance + recency search. Better than memory_search for finding related content by meaning. Optional category/topic filters narrow results.',
   {
     query: z.string().describe('Natural language search query'),
+    category: z.enum(['facts', 'events', 'discoveries', 'preferences', 'advice']).optional().describe('Filter by category'),
+    topic: z.string().optional().describe('Filter by topic'),
   },
-  async ({ query }) => {
+  async ({ query, category, topic }) => {
     const store = await getStore();
     const results = store.searchContext(
       query,
-      { agentSlug: ACTIVE_AGENT_SLUG ?? undefined },
+      { agentSlug: ACTIVE_AGENT_SLUG ?? undefined, category, topic },
     ) as Array<{
       sourceFile: string; section: string; content: string; score: number;
       matchType: string; chunkId: number;
@@ -576,18 +589,19 @@ server.tool(
 
 server.tool(
   'memory_graph_connections',
-  'Find entities connected to a given entity in the knowledge graph. Supports multi-hop traversal with typed relationships.',
+  'Find entities connected to a given entity in the knowledge graph. Supports multi-hop traversal with typed relationships. Use as_of for point-in-time queries.',
   {
     entity: z.string().describe('Entity ID (slug) to find connections for'),
     max_hops: z.number().optional().describe('Maximum traversal depth (default: 2)'),
     relationship_types: z.array(z.string()).optional().describe('Filter by relationship types (e.g., ["WORKS_ON", "KNOWS"])'),
+    as_of: z.string().optional().describe('ISO timestamp for point-in-time query (e.g., "2026-01-15T00:00:00Z"). Only shows relationships active at that time.'),
   },
-  async ({ entity, max_hops, relationship_types }) => {
+  async ({ entity, max_hops, relationship_types, as_of }) => {
     const gs = await getGraphStore();
     if (!gs?.isAvailable()) {
       return textResult('Graph features are not available. The knowledge graph has not been initialized.');
     }
-    const results = await gs.traverse(entity, max_hops ?? 2, relationship_types);
+    const results = await gs.traverse(entity, max_hops ?? 2, relationship_types, as_of);
     if (results.length === 0) return textResult(`No connections found for '${entity}'.`);
     const lines = results.map((r: any) =>
       `[depth ${r.depth}] ${r.entity.label}:${r.entity.id} (via ${r.path.join(' → ')})`
@@ -615,6 +629,28 @@ server.tool(
       return rel ? `${n.id} -[${rel}]->` : n.id;
     }).join(' ');
     return textResult(`Path (${result.length} hops): ${chain}`);
+  },
+);
+
+server.tool(
+  'memory_graph_invalidate',
+  'Mark a relationship as no longer active by setting its end date. Use when a fact changes (e.g., someone leaves a company).',
+  {
+    from_entity: z.string().describe('Source entity ID (slug)'),
+    to_entity: z.string().describe('Target entity ID (slug)'),
+    relationship_type: z.string().describe('Relationship type (e.g., WORKS_AT)'),
+    as_of: z.string().optional().describe('ISO timestamp when relationship ended (defaults to now)'),
+  },
+  async ({ from_entity, to_entity, relationship_type, as_of }) => {
+    const gs = await getGraphStore();
+    if (!gs?.isAvailable()) {
+      return textResult('Graph features are not available. The knowledge graph has not been initialized.');
+    }
+    const updated = await gs.invalidateRelationship(from_entity, to_entity, relationship_type, as_of);
+    if (updated) {
+      return textResult(`Invalidated ${from_entity} -[${relationship_type}]-> ${to_entity} (ended ${as_of ?? 'now'})`);
+    }
+    return textResult(`No active ${relationship_type} relationship found between '${from_entity}' and '${to_entity}'.`);
   },
 );
 

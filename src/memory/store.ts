@@ -176,6 +176,32 @@ export class MemoryStore {
       // Column already exists
     }
 
+    // Add category column to chunks (hierarchical tag: facts/events/discoveries/preferences/advice)
+    try {
+      this.conn.exec('ALTER TABLE chunks ADD COLUMN category TEXT DEFAULT NULL');
+    } catch {
+      // Column already exists
+    }
+
+    // Add topic column to chunks (hierarchical tag: free-form topic string)
+    try {
+      this.conn.exec('ALTER TABLE chunks ADD COLUMN topic TEXT DEFAULT NULL');
+    } catch {
+      // Column already exists
+    }
+
+    // Indexes for category/topic filtering
+    try {
+      this.conn.exec('CREATE INDEX idx_chunks_category ON chunks(category)');
+    } catch {
+      // Index already exists
+    }
+    try {
+      this.conn.exec('CREATE INDEX idx_chunks_topic ON chunks(topic)');
+    } catch {
+      // Index already exists
+    }
+
     // Access log table for salience tracking
     this.conn.exec(`
       CREATE TABLE IF NOT EXISTS access_log (
@@ -510,8 +536,8 @@ export class MemoryStore {
       // Insert new chunks
       const insertStmt = this.conn.prepare(
         `INSERT INTO chunks
-         (source_file, section, content, chunk_type, frontmatter_json, content_hash)
-         VALUES (?, ?, ?, ?, ?, ?)`,
+         (source_file, section, content, chunk_type, frontmatter_json, content_hash, category, topic)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
       );
       for (const chunk of chunks) {
         insertStmt.run(
@@ -521,6 +547,8 @@ export class MemoryStore {
           chunk.chunkType,
           chunk.frontmatterJson,
           chunk.contentHash,
+          chunk.category ?? null,
+          chunk.topic ?? null,
         );
       }
 
@@ -572,8 +600,8 @@ export class MemoryStore {
     // Insert new chunks
     const insertStmt = this.conn.prepare(
       `INSERT INTO chunks
-       (source_file, section, content, chunk_type, frontmatter_json, content_hash, agent_slug)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+       (source_file, section, content, chunk_type, frontmatter_json, content_hash, agent_slug, category, topic)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     );
     for (const chunk of chunks) {
       insertStmt.run(
@@ -584,6 +612,8 @@ export class MemoryStore {
         chunk.frontmatterJson,
         chunk.contentHash,
         agentSlug ?? null,
+        chunk.category ?? null,
+        chunk.topic ?? null,
       );
     }
 
@@ -606,23 +636,36 @@ export class MemoryStore {
   /**
    * Full-text search using FTS5 with BM25 ranking.
    */
-  searchFts(query: string, limit: number = 20): SearchResult[] {
+  searchFts(
+    query: string,
+    limit: number = 20,
+    filters?: { category?: string; topic?: string },
+  ): SearchResult[] {
     const sanitized = MemoryStore.sanitizeFtsQuery(query);
     if (!sanitized) return [];
 
     try {
-      const rows = this.conn
-        .prepare(
-          `SELECT c.id, c.source_file, c.section, c.content, c.chunk_type,
-                  c.updated_at, c.salience, c.agent_slug,
+      let sql = `SELECT c.id, c.source_file, c.section, c.content, c.chunk_type,
+                  c.updated_at, c.salience, c.agent_slug, c.category, c.topic,
                   bm25(chunks_fts) as score
            FROM chunks_fts f
            JOIN chunks c ON c.id = f.rowid
-           WHERE chunks_fts MATCH ?
-           ORDER BY bm25(chunks_fts)
-           LIMIT ?`,
-        )
-        .all(sanitized, limit) as Array<{
+           WHERE chunks_fts MATCH ?`;
+      const params: any[] = [sanitized];
+
+      if (filters?.category) {
+        sql += ' AND c.category = ?';
+        params.push(filters.category);
+      }
+      if (filters?.topic) {
+        sql += ' AND c.topic = ?';
+        params.push(filters.topic);
+      }
+
+      sql += ' ORDER BY bm25(chunks_fts) LIMIT ?';
+      params.push(limit);
+
+      const rows = this.conn.prepare(sql).all(...params) as Array<{
         id: number;
         source_file: string;
         section: string;
@@ -631,6 +674,8 @@ export class MemoryStore {
         updated_at: string | null;
         salience: number | null;
         agent_slug: string | null;
+        category: string | null;
+        topic: string | null;
         score: number;
       }>;
 
@@ -645,6 +690,8 @@ export class MemoryStore {
         chunkId: row.id,
         salience: row.salience ?? 0,
         agentSlug: row.agent_slug ?? null,
+        category: row.category,
+        topic: row.topic,
       }));
     } catch {
       return [];
@@ -656,7 +703,11 @@ export class MemoryStore {
   /**
    * Get the most recently updated chunks.
    */
-  getRecentChunks(limit: number = 5, agentSlug?: string): SearchResult[] {
+  getRecentChunks(
+    limit: number = 5,
+    agentSlug?: string,
+    filters?: { category?: string; topic?: string },
+  ): SearchResult[] {
     type ChunkRow = {
       id: number;
       source_file: string;
@@ -666,6 +717,8 @@ export class MemoryStore {
       updated_at: string | null;
       salience: number | null;
       agent_slug: string | null;
+      category: string | null;
+      topic: string | null;
     };
 
     const mapRow = (row: ChunkRow): SearchResult => ({
@@ -679,23 +732,37 @@ export class MemoryStore {
       chunkId: row.id,
       salience: row.salience ?? 0,
       agentSlug: row.agent_slug ?? null,
+      category: row.category,
+      topic: row.topic,
     });
+
+    // Build optional WHERE clauses for category/topic
+    let filterSql = '';
+    const filterParams: any[] = [];
+    if (filters?.category) {
+      filterSql += ' AND category = ?';
+      filterParams.push(filters.category);
+    }
+    if (filters?.topic) {
+      filterSql += ' AND topic = ?';
+      filterParams.push(filters.topic);
+    }
 
     // If agent specified, get a mix: mostly agent-specific, some global
     if (agentSlug) {
       const agentRows = this.conn.prepare(
         `SELECT id, source_file, section, content, chunk_type,
-                updated_at, salience, agent_slug
-         FROM chunks WHERE agent_slug = ?
+                updated_at, salience, agent_slug, category, topic
+         FROM chunks WHERE agent_slug = ?${filterSql}
          ORDER BY updated_at DESC LIMIT ?`,
-      ).all(agentSlug, Math.ceil(limit * 0.6)) as ChunkRow[];
+      ).all(agentSlug, ...filterParams, Math.ceil(limit * 0.6)) as ChunkRow[];
 
       const globalRows = this.conn.prepare(
         `SELECT id, source_file, section, content, chunk_type,
-                updated_at, salience, agent_slug
-         FROM chunks WHERE agent_slug IS NULL
+                updated_at, salience, agent_slug, category, topic
+         FROM chunks WHERE agent_slug IS NULL${filterSql}
          ORDER BY updated_at DESC LIMIT ?`,
-      ).all(Math.ceil(limit * 0.4)) as ChunkRow[];
+      ).all(...filterParams, Math.ceil(limit * 0.4)) as ChunkRow[];
 
       return [...agentRows, ...globalRows].slice(0, limit).map(mapRow);
     }
@@ -703,12 +770,13 @@ export class MemoryStore {
     const rows = this.conn
       .prepare(
         `SELECT id, source_file, section, content, chunk_type,
-                updated_at, salience, agent_slug
+                updated_at, salience, agent_slug, category, topic
          FROM chunks
+         WHERE 1=1${filterSql}
          ORDER BY updated_at DESC
          LIMIT ?`,
       )
-      .all(limit) as ChunkRow[];
+      .all(...filterParams, limit) as ChunkRow[];
 
     return rows.map(mapRow);
   }
@@ -726,22 +794,29 @@ export class MemoryStore {
    */
   searchContext(
     query: string,
-    limitOrOpts: number | { limit?: number; recencyLimit?: number; agentSlug?: string } = 3,
+    limitOrOpts: number | { limit?: number; recencyLimit?: number; agentSlug?: string; category?: string; topic?: string } = 3,
     recencyLimitArg: number = 5,
   ): SearchResult[] {
     let limit: number;
     let recencyLimit: number;
     let agentSlug: string | undefined;
+    let category: string | undefined;
+    let topic: string | undefined;
     if (typeof limitOrOpts === 'object') {
       limit = limitOrOpts.limit ?? 3;
       recencyLimit = limitOrOpts.recencyLimit ?? 5;
       agentSlug = limitOrOpts.agentSlug;
+      category = limitOrOpts.category;
+      topic = limitOrOpts.topic;
     } else {
       limit = limitOrOpts;
       recencyLimit = recencyLimitArg;
     }
+
+    const tagFilters = (category || topic) ? { category, topic } : undefined;
+
     // 1. FTS5 relevance (fetch extra to allow re-ranking after boost)
-    const ftsResults = this.searchFts(query, agentSlug ? limit * 2 : limit);
+    const ftsResults = this.searchFts(query, agentSlug ? limit * 2 : limit, tagFilters);
 
     // Apply salience boost to FTS results
     for (const r of ftsResults) {
@@ -773,7 +848,7 @@ export class MemoryStore {
     }
 
     // 3. Recency
-    const recentResults = this.getRecentChunks(recencyLimit, agentSlug);
+    const recentResults = this.getRecentChunks(recencyLimit, agentSlug, tagFilters);
 
     // 4. Merge and deduplicate (FTS results first, then vector, then recency)
     const merged = [...ftsResults, ...vectorResults, ...recentResults];
@@ -787,7 +862,7 @@ export class MemoryStore {
   private searchByEmbedding(queryVec: Float32Array, limit: number, agentSlug?: string): SearchResult[] {
     const rows = this.conn
       .prepare(
-        `SELECT id, source_file, section, content, chunk_type, embedding, salience, agent_slug, updated_at
+        `SELECT id, source_file, section, content, chunk_type, embedding, salience, agent_slug, updated_at, category, topic
          FROM chunks
          WHERE embedding IS NOT NULL AND consolidated = 0
          ORDER BY updated_at DESC
@@ -803,6 +878,8 @@ export class MemoryStore {
         salience: number;
         agent_slug: string | null;
         updated_at: string;
+        category: string | null;
+        topic: string | null;
       }>;
 
     const scored: SearchResult[] = [];
@@ -827,6 +904,8 @@ export class MemoryStore {
           chunkId: row.id,
           salience: row.salience,
           agentSlug: row.agent_slug ?? undefined,
+          category: row.category,
+          topic: row.topic,
         });
       } catch { continue; }
     }
@@ -1268,10 +1347,10 @@ export class MemoryStore {
       .prepare(
         `INSERT INTO chunks
          (source_file, section, content, chunk_type, frontmatter_json,
-          content_hash, sector)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          content_hash, sector, category)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
       )
-      .run(sourceFile, 'session-summary', summaryText, 'episodic', '', hash, 'episodic');
+      .run(sourceFile, 'session-summary', summaryText, 'episodic', '', hash, 'episodic', 'events');
   }
 
   // ── Deduplication ──────────────────────────────────────────────
@@ -1853,7 +1932,7 @@ export class MemoryStore {
   }> {
     const rows = this.conn
       .prepare(
-        `SELECT id, source_file, section, content
+        `SELECT id, source_file, section, content, topic AS chunk_topic
          FROM chunks
          WHERE consolidated = 0
            AND sector = 'semantic'
@@ -1866,13 +1945,13 @@ export class MemoryStore {
       source_file: string;
       section: string;
       content: string;
+      chunk_topic: string | null;
     }>;
 
-    // Group by top-level topic (first path segment, e.g., "03-Projects", "04-Topics")
+    // Group by topic column (preferred) or fall back to directory path
     const groups = new Map<string, { chunkIds: number[]; contents: string[]; totalChars: number }>();
     for (const row of rows) {
-      // Use source_file directory as the grouping key
-      const topic = row.source_file.split('/').slice(0, 2).join('/') || row.source_file;
+      const topic = row.chunk_topic || row.source_file.split('/').slice(0, 2).join('/') || row.source_file;
       const group = groups.get(topic) ?? { chunkIds: [], contents: [], totalChars: 0 };
       group.chunkIds.push(row.id);
       group.contents.push(`[${row.section}] ${row.content}`);

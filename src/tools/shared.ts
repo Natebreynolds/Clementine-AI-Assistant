@@ -51,6 +51,7 @@ export const WORKING_MEMORY_FILE = path.join(BASE_DIR, 'working-memory.md');
 export const WORKING_MEMORY_MAX_LINES = 75;
 export const TASKS_FILE = path.join(TASKS_DIR, 'TASKS.md');
 export const SOUL_FILE = path.join(SYSTEM_DIR, 'SOUL.md');
+export const IDENTITY_FILE = path.join(SYSTEM_DIR, 'IDENTITY.md');
 export const HEARTBEAT_FILE = path.join(SYSTEM_DIR, 'HEARTBEAT.md');
 export const CRON_FILE = path.join(SYSTEM_DIR, 'CRON.md');
 export const PROFILES_DIR = path.join(SYSTEM_DIR, 'profiles');
@@ -69,13 +70,13 @@ export const logger = pino(
 // ── Lazy memory store ──────────────────────────────────────────────────
 
 export type MemoryStoreType = {
-  searchFts(query: string, limit: number): Array<{
+  searchFts(query: string, limit: number, filters?: { category?: string; topic?: string }): Array<{
     sourceFile: string; section: string; content: string; score: number;
     chunkType: string; matchType: string; lastUpdated: string; chunkId: number;
-    salience: number; agentSlug?: string | null;
+    salience: number; agentSlug?: string | null; category?: string | null; topic?: string | null;
   }>;
-  getRecentChunks(limit: number, agentSlug?: string): unknown[];
-  searchContext(query: string, limitOrOpts?: number | { limit?: number; recencyLimit?: number; agentSlug?: string }, recencyLimit?: number): unknown[];
+  getRecentChunks(limit: number, agentSlug?: string, filters?: { category?: string; topic?: string }): unknown[];
+  searchContext(query: string, limitOrOpts?: number | { limit?: number; recencyLimit?: number; agentSlug?: string; category?: string; topic?: string }, recencyLimit?: number): unknown[];
   getConnections(noteName: string): Array<{ direction: string; file: string; context: string }>;
   getTimeline(startDate: string, endDate: string, limit?: number): unknown[];
   searchTranscripts(query: string, limit?: number, sessionKey?: string): Array<{

@@ -9,13 +9,87 @@ import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import matter from 'gray-matter';
-import type { Chunk } from '../types.js';
+import type { Chunk, ChunkCategory } from '../types.js';
 
 /** Directories to skip when scanning the vault. */
 const SKIP_DIRS = new Set(['06-Templates', '.obsidian']);
 
 /** Maximum chunk size before splitting at paragraph boundaries. */
 const MAX_CHUNK_CHARS = 3000;
+
+/** Directory-to-category mapping for vault structure. */
+const DIR_CATEGORY_MAP: Record<string, ChunkCategory> = {
+  '00-System': 'advice',
+  '01-Daily-Notes': 'events',
+  '02-People': 'facts',
+  '03-Projects': 'discoveries',
+  '04-Topics': 'facts',
+  '05-Tasks': 'advice',
+  '07-Inbox': 'events',
+};
+
+/** Content keyword patterns for category detection (used as fallback). */
+const CATEGORY_KEYWORDS: Array<[RegExp, ChunkCategory]> = [
+  [/\b(prefer|always use|never use|i like|i don'?t like|i hate)\b/i, 'preferences'],
+  [/\b(learned|discovered|TIL|turns out|insight|breakthrough)\b/i, 'discoveries'],
+  [/\b(reminder|tip|rule of thumb|always|never|best practice)\b/i, 'advice'],
+];
+
+/**
+ * Detect category and topic for a chunk based on vault path, frontmatter, and content.
+ */
+function detectCategoryAndTopic(
+  relPath: string,
+  frontmatter: Record<string, any>,
+  content: string,
+): { category: ChunkCategory | null; topic: string | null } {
+  // Category detection (cascade)
+  let category: ChunkCategory | null = null;
+
+  // 1. Explicit frontmatter category
+  if (frontmatter.category) {
+    const fm = String(frontmatter.category).toLowerCase();
+    if (['facts', 'events', 'discoveries', 'preferences', 'advice'].includes(fm)) {
+      category = fm as ChunkCategory;
+    }
+  }
+
+  // 2. Directory-based
+  if (!category) {
+    const topDir = relPath.split('/')[0];
+    category = DIR_CATEGORY_MAP[topDir] ?? null;
+  }
+
+  // 3. Content keyword heuristics (only if nothing else matched)
+  if (!category) {
+    for (const [pattern, cat] of CATEGORY_KEYWORDS) {
+      if (pattern.test(content)) {
+        category = cat;
+        break;
+      }
+    }
+  }
+
+  // Topic detection (cascade)
+  let topic: string | null = null;
+
+  // 1. Explicit frontmatter topic or first tag
+  if (frontmatter.topic) {
+    topic = String(frontmatter.topic);
+  } else if (Array.isArray(frontmatter.tags) && frontmatter.tags.length > 0) {
+    topic = String(frontmatter.tags[0]);
+  }
+
+  // 2. Second path segment (subdirectory name)
+  if (!topic) {
+    const parts = relPath.split('/');
+    if (parts.length >= 3) {
+      topic = parts[1];
+    }
+  }
+
+  return { category, topic };
+}
 
 /**
  * Compute a truncated SHA-256 content hash (first 16 hex chars).
@@ -61,6 +135,7 @@ export function chunkFile(filePath: string, vaultDir: string): Chunk[] {
       : '';
 
   const chunks: Chunk[] = [];
+  const { category, topic } = detectCategoryAndTopic(relPath, parsed.data ?? {}, parsed.content);
 
   // Add frontmatter as its own chunk if present
   if (parsed.data && Object.keys(parsed.data).length > 0) {
@@ -74,6 +149,8 @@ export function chunkFile(filePath: string, vaultDir: string): Chunk[] {
       chunkType: 'frontmatter',
       frontmatterJson: fmJson,
       contentHash: contentHash(fmText),
+      category,
+      topic,
     });
   }
 
@@ -99,6 +176,8 @@ export function chunkFile(filePath: string, vaultDir: string): Chunk[] {
           content: subChunks[i],
           frontmatterJson: fmJson,
           contentHash: contentHash(subChunks[i]),
+          category,
+          topic,
         });
       }
     } else {
@@ -109,6 +188,8 @@ export function chunkFile(filePath: string, vaultDir: string): Chunk[] {
         content,
         frontmatterJson: fmJson,
         contentHash: contentHash(content),
+        category,
+        topic,
       });
     }
   }

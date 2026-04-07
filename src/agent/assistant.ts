@@ -55,6 +55,7 @@ import {
   BUDGET,
   ENABLE_1M_CONTEXT,
   WORKING_MEMORY_FILE,
+  IDENTITY_FILE,
 } from '../config.js';
 import type { AgentProfile, ChannelCapabilities, OnTextCallback, OnToolActivityCallback, SessionData, VerboseLevel } from '../types.js';
 import { DEFAULT_CHANNEL_CAPABILITIES } from '../types.js';
@@ -1464,6 +1465,7 @@ You have a limited number of turns per message (~15). **After 8-10 tool calls, y
       // Assemble context within a priority-based budget
       const assembled = await assembleContext({
         totalBudget: SYSTEM_PROMPT_MAX_CONTEXT_CHARS,
+        identityPath: IDENTITY_FILE,
         workingMemoryPath: WORKING_MEMORY_FILE,
         memoryResults: results,
         skillContext,

@@ -50,6 +50,8 @@ export interface AssemblerOptions {
   graphContext?: string;
   /** Whether this is an autonomous run (truncates aggressively). */
   isAutonomous?: boolean;
+  /** Identity file path (null to skip). */
+  identityPath?: string | null;
 }
 
 /**
@@ -69,6 +71,25 @@ export async function assembleContext(options: AssemblerOptions): Promise<Assemb
   const isAutonomous = options.isAutonomous ?? false;
 
   const slots: ContextSlot[] = [];
+
+  // Slot 0: Identity seed (always loaded, tiny footprint)
+  if (options.identityPath) {
+    const idPath = options.identityPath;
+    slots.push({
+      name: 'identity',
+      priority: 0,
+      maxChars: 500,
+      minRemainingBudget: 0,
+      resolve: () => {
+        if (!fs.existsSync(idPath)) return '';
+        try {
+          const content = fs.readFileSync(idPath, 'utf-8').trim();
+          if (!content) return '';
+          return `## Identity\n\n${content}`;
+        } catch { return ''; }
+      },
+    });
+  }
 
   // Slot 1: Working memory (highest priority — always fits)
   if (options.workingMemoryPath) {
