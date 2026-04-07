@@ -17,6 +17,57 @@ import {
   resolvePath, textResult, todayStr, validateVaultPath,
 } from './shared.js';
 
+/** Merge duplicate `## Section` headers in a MEMORY.md body, deduplicating lines. */
+function mergeDuplicateSections(body: string): string {
+  const lines = body.split('\n');
+  const sections = new Map<string, string[]>(); // heading → content lines
+  const order: string[] = []; // preserve first-seen order
+  let preamble: string[] = [];
+  let currentHeading = '';
+
+  for (const line of lines) {
+    if (line.startsWith('## ')) {
+      currentHeading = line;
+      if (!sections.has(currentHeading)) {
+        sections.set(currentHeading, []);
+        order.push(currentHeading);
+      }
+    } else if (!currentHeading) {
+      preamble.push(line);
+    } else {
+      sections.get(currentHeading)!.push(line);
+    }
+  }
+
+  if (sections.size === 0) return body; // no sections, nothing to merge
+
+  // Deduplicate lines within each section
+  for (const [heading, contentLines] of sections) {
+    const seen = new Set<string>();
+    const deduped: string[] = [];
+    for (const line of contentLines) {
+      const key = line.trim().toLowerCase();
+      if (!key || key === '') { deduped.push(line); continue; } // keep blank lines
+      if (!seen.has(key)) {
+        seen.add(key);
+        deduped.push(line);
+      }
+    }
+    sections.set(heading, deduped);
+  }
+
+  // Rebuild
+  let result = preamble.join('\n');
+  for (const heading of order) {
+    const content = sections.get(heading)!;
+    // Trim trailing empty lines from section
+    while (content.length > 0 && content[content.length - 1].trim() === '') content.pop();
+    result += '\n\n' + heading + '\n' + content.join('\n');
+  }
+
+  return result.replace(/\n{3,}/g, '\n\n').trim() + '\n';
+}
+
 export function registerMemoryTools(server: McpServer): void {
 // ── 0. working_memory ──────────────────────────────────────────────────
 
@@ -153,6 +204,9 @@ server.tool(
 
       let body = readFileSync(targetMemFile, 'utf-8');
 
+      // First, merge any duplicate section headers in the file
+      body = mergeDuplicateSections(body);
+
       const pattern = new RegExp(`(## ${sec.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\n)(.*?)(\\n## |$)`, 's');
       const match = pattern.exec(body);
 
@@ -167,8 +221,13 @@ server.tool(
           const isDup = existingLines.some(ex => {
             const a = newLine.toLowerCase().trim();
             const b = ex.toLowerCase().trim();
-            // Only skip exact matches (case-insensitive)
-            return a === b;
+            if (a === b) return true;
+            // Fuzzy: if one line contains 80%+ of the other's words, treat as dup
+            const aWords = a.split(/\s+/);
+            const bWords = b.split(/\s+/);
+            if (aWords.length < 3 || bWords.length < 3) return false;
+            const overlap = aWords.filter(w => bWords.includes(w)).length;
+            return overlap / Math.max(aWords.length, bWords.length) > 0.8;
           });
           if (!isDup) {
             filtered.push(newLine);
