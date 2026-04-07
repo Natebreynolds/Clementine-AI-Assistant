@@ -328,7 +328,36 @@ function cmdStop(): void {
 
 function cmdRestart(options: { foreground?: boolean }): void {
   cmdStop();
+
+  // Also restart dashboard if it was running
+  const dashPidFile = path.join(BASE_DIR, '.dashboard.pid');
+  let dashboardWasRunning = false;
+  try {
+    if (existsSync(dashPidFile)) {
+      const dpid = parseInt(readFileSync(dashPidFile, 'utf-8').trim(), 10);
+      if (!isNaN(dpid) && isProcessAlive(dpid)) {
+        dashboardWasRunning = true;
+        process.kill(dpid, 'SIGTERM');
+        console.log('  Stopped dashboard.');
+        try { unlinkSync(dashPidFile); } catch { /* ignore */ }
+      }
+    }
+  } catch { /* no dashboard running */ }
+
   cmdLaunch({ foreground: options.foreground });
+
+  if (dashboardWasRunning) {
+    try {
+      const child = require('node:child_process').spawn(
+        'node', [path.join(PACKAGE_ROOT, 'dist/cli/index.js'), 'dashboard'],
+        { detached: true, stdio: 'ignore' },
+      );
+      child.unref();
+      console.log('  Dashboard relaunched.');
+    } catch {
+      console.log('  Could not relaunch dashboard — run: clementine dashboard');
+    }
+  }
 }
 
 function cmdStatus(): void {
@@ -933,6 +962,47 @@ program
   .description('Restart the assistant (daemon by default)')
   .option('-f, --foreground', 'Run in foreground after restart')
   .action(cmdRestart);
+
+program
+  .command('rebuild')
+  .description('Rebuild from source and restart all processes (daemon + dashboard)')
+  .action(async () => {
+    const DIM = '\x1b[0;90m';
+    const GREEN = '\x1b[0;32m';
+    const RED = '\x1b[0;31m';
+    const RESET = '\x1b[0m';
+
+    console.log();
+    console.log(`  ${DIM}Rebuilding ${getAssistantName()}...${RESET}`);
+
+    // 1. Build
+    console.log(`  [1] Building...`);
+    try {
+      execSync('npm run build', { cwd: PACKAGE_ROOT, stdio: 'pipe' });
+      console.log(`  ${GREEN}OK${RESET}  Build succeeded`);
+    } catch (err: unknown) {
+      const msg = (err as { stderr?: Buffer }).stderr?.toString() || String(err);
+      console.error(`  ${RED}FAIL${RESET}  Build failed:\n${msg}`);
+      process.exit(1);
+    }
+
+    // 2. Reinstall globally so the `clementine` bin points to fresh code
+    console.log(`  [2] Installing...`);
+    try {
+      execSync('npm install -g .', { cwd: PACKAGE_ROOT, stdio: 'pipe' });
+      console.log(`  ${GREEN}OK${RESET}  Installed`);
+    } catch {
+      console.log(`  ${DIM}(global install skipped — not fatal)${RESET}`);
+    }
+
+    // 3. Restart everything
+    console.log(`  [3] Restarting...`);
+    cmdRestart({});
+
+    console.log();
+    console.log(`  ${GREEN}Done.${RESET} All processes restarted with fresh code.`);
+    console.log();
+  });
 
 program
   .command('status')

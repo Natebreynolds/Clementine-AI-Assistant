@@ -13907,7 +13907,7 @@ async function togglePromptHistory() {
       html += '<span style="font-weight:600;color:var(--text-primary)">v' + v.version + '</span>';
       html += '<span style="color:var(--text-muted)">' + fmtTimeAgo(v.timestamp) + '</span>';
       html += '<span class="badge badge-gray" style="font-size:9px">' + esc(v.changedBy || 'unknown') + '</span>';
-      html += '<button class="btn btn-sm" onclick="restorePromptVersion(\\x27' + esc(v.prompt || '').replace(/'/g, '').replace(/\\/g, '\\\\').replace(/\n/g, '\\n') + '\\x27)" style="font-size:10px;padding:2px 8px;margin-left:auto">Restore</button>';
+      html += '<button class="btn btn-sm" data-prompt-version="' + v.version + '" onclick="restorePromptFromHistory(' + v.version + ')" style="font-size:10px;padding:2px 8px;margin-left:auto">Restore</button>';
       html += '</div>';
       var preview = (v.prompt || '').slice(0, 100).replace(/\n/g, ' ');
       html += '<div style="color:var(--text-muted);font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(preview) + '</div>';
@@ -13920,12 +13920,23 @@ async function togglePromptHistory() {
   }
 }
 
-function restorePromptVersion(promptText) {
-  var textarea = document.getElementById('prompt-lab-text');
-  if (textarea) {
-    textarea.value = promptText.replace(/\\n/g, '\n');
-    toast('Prompt restored — click Save to apply', 'success');
-  }
+async function restorePromptFromHistory(version) {
+  if (!_promptLabJobName) return;
+  try {
+    var r = await apiFetch('/api/cron/' + encodeURIComponent(_promptLabJobName) + '/prompt-history');
+    var d = await r.json();
+    var versions = d.versions || [];
+    var v = versions.find(function(x) { return x.version === version; });
+    if (v && v.prompt) {
+      var textarea = document.getElementById('prompt-lab-text');
+      if (textarea) {
+        textarea.value = v.prompt;
+        toast('Prompt restored (v' + version + ') — click Save to apply', 'success');
+      }
+    } else {
+      toast('Version not found', 'error');
+    }
+  } catch(e) { toast('Error: ' + e, 'error'); }
 }
 
 async function refreshSelfImprove() {
