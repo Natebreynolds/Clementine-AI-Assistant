@@ -8722,7 +8722,7 @@ function navigateTo(page, opts) {
   // Page-specific refresh
   if (page === 'home') { refreshStatus(); refreshActivity(); refreshHomePlan(); refreshTeamPulse(); }
   if (page === 'chat') { loadProfiles(); document.getElementById('chat-input').focus(); }
-  if (page === 'builder') { refreshBuilderAgents(); document.getElementById('builder-input').focus(); }
+  if (page === 'builder') { refreshBuilderAgents(currentAgentSlug || ''); document.getElementById('builder-input').focus(); }
   if (page === 'automations') { refreshCron(); refreshTimers(); refreshSelfImprove(); refreshSkills(); }
   if (page === 'intelligence') { refreshMemory(); }
   if (page === 'settings') { refreshSettings(); refreshRemoteAccess(); refreshProjects(); refreshSalesforce(); refreshMcpServers(); }
@@ -11958,9 +11958,21 @@ function renderBuilderPreview(artifact, type) {
       + '<option value="standard"' + (artifact.mode !== 'unleashed' ? ' selected' : '') + '>Standard</option>'
       + '<option value="unleashed"' + (artifact.mode === 'unleashed' ? ' selected' : '') + '>Unleashed</option>'
       + '</select></div>'
-      + '<div class="preview-field"><label>Prompt</label><textarea rows="12" onchange="builderArtifact.prompt=this.value">' + esc(artifact.prompt || '') + '</textarea></div>';
+      + '<div class="preview-field"><label>Prompt</label><textarea rows="12" onchange="builderArtifact.prompt=this.value">' + esc(artifact.prompt || '') + '</textarea></div>'
+      + '<div class="preview-field"><label>Reference Files</label>'
+      + '<div id="builder-attachments-list"></div>'
+      + '<label style="cursor:pointer;display:inline-flex;align-items:center;gap:4px;background:var(--bg-tertiary);border:1px solid var(--border);border-radius:6px;padding:4px 10px;font-size:11px;color:var(--text-primary);margin-top:4px">'
+      + '+ Attach File'
+      + '<input type="file" multiple accept=".csv,.md,.txt,.json,.docx,.xlsx" style="display:none" onchange="handleBuilderFileUpload(event)">'
+      + '</label>'
+      + '<div style="font-size:10px;color:var(--text-muted);margin-top:4px">Files injected into the agent prompt at runtime</div>'
+      + '</div>';
   }
   preview.innerHTML = html;
+  // Load existing attachments if editing
+  if (type === 'cron' && artifact.name) {
+    loadBuilderAttachments(artifact.name);
+  }
 }
 
 async function saveBuilderArtifact() {
@@ -11970,13 +11982,22 @@ async function saveBuilderArtifact() {
     var agentSlug = (document.getElementById('builder-agent') || {}).value || '';
     var r = await apiJson('POST', '/api/builder/save', { artifactType: type, artifact: builderArtifact, agentSlug: agentSlug || undefined });
     if (r.ok) {
+      // Upload any pending attachments for cron jobs
+      if (type === 'cron' && _builderAttachments.length > 0 && r.name) {
+        for (var i = 0; i < _builderAttachments.length; i++) {
+          try {
+            await apiJson('POST', '/api/cron/' + encodeURIComponent(r.name) + '/attachments', {
+              filename: _builderAttachments[i].filename, content: _builderAttachments[i].content,
+            });
+          } catch(e) { /* non-fatal */ }
+        }
+        _builderAttachments = [];
+      }
       toast(r.message || 'Saved!', 'success');
-      // Add confirmation to chat
       var msgs = document.getElementById('builder-messages');
       msgs.innerHTML += '<div style="text-align:center;padding:12px;color:var(--green);font-size:13px;font-weight:600">\\u2714 ' + esc(r.message || 'Saved') + '</div>';
       msgs.scrollTop = msgs.scrollHeight;
       document.getElementById('builder-save-btn').style.display = 'none';
-      // Refresh skills or cron
       if (type === 'skill') refreshSkills();
       if (type === 'cron') refreshCron();
     } else {
@@ -11986,16 +12007,79 @@ async function saveBuilderArtifact() {
 }
 
 // Populate agent dropdown when builder page loads
-function refreshBuilderAgents() {
+function refreshBuilderAgents(preselect) {
   var sel = document.getElementById('builder-agent');
   if (!sel) return;
   apiFetch('/api/agents').then(function(r) { return r.json(); }).then(function(d) {
     var agents = d.agents || [];
     sel.innerHTML = '<option value="">Clementine (global)</option>';
     for (var a of agents) {
-      sel.innerHTML += '<option value="' + esc(a.slug) + '">' + esc(a.name) + '</option>';
+      var selected = (preselect && a.slug === preselect) ? ' selected' : '';
+      sel.innerHTML += '<option value="' + esc(a.slug) + '"' + selected + '>' + esc(a.name) + '</option>';
     }
   }).catch(function() {});
+}
+
+// ── Builder File Attachments ──────────────
+var _builderAttachments = [];
+
+function handleBuilderFileUpload(event) {
+  var files = event.target.files;
+  if (!files || files.length === 0) return;
+  for (var i = 0; i < files.length; i++) {
+    var file = files[i];
+    if (file.size > 10 * 1024 * 1024) { toast(file.name + ' exceeds 10MB', 'error'); continue; }
+    (function(f) {
+      var reader = new FileReader();
+      reader.onload = function(e) {
+        _builderAttachments.push({ filename: f.name, content: e.target.result.split(',')[1] || '', size: f.size });
+        renderBuilderAttachments();
+      };
+      reader.readAsDataURL(f);
+    })(file);
+  }
+  event.target.value = '';
+}
+
+function removeBuilderAttachment(idx) {
+  _builderAttachments.splice(idx, 1);
+  renderBuilderAttachments();
+}
+
+function renderBuilderAttachments() {
+  var container = document.getElementById('builder-attachments-list');
+  if (!container) return;
+  var html = '';
+  _builderAttachments.forEach(function(att, idx) {
+    var sizeStr = att.size < 1024 ? att.size + ' B' : (att.size / 1024).toFixed(1) + ' KB';
+    html += '<div style="display:flex;align-items:center;gap:6px;padding:3px 6px;margin-bottom:3px;background:var(--bg-tertiary);border-radius:4px;font-size:11px">';
+    html += '<span style="flex:1">' + esc(att.filename) + '</span>';
+    html += '<span style="color:var(--text-muted)">' + sizeStr + '</span>';
+    html += '<button onclick="removeBuilderAttachment(' + idx + ')" style="background:none;border:none;color:var(--red);cursor:pointer;padding:0 2px">&times;</button>';
+    html += '</div>';
+  });
+  container.innerHTML = html;
+}
+
+async function loadBuilderAttachments(jobName) {
+  var container = document.getElementById('builder-attachments-list');
+  if (!container) return;
+  try {
+    var r = await apiFetch('/api/cron/' + encodeURIComponent(jobName) + '/attachments');
+    var d = await r.json();
+    var files = d.files || [];
+    if (files.length > 0) {
+      var html = '';
+      files.forEach(function(f) {
+        var sizeStr = f.size < 1024 ? f.size + ' B' : (f.size / 1024).toFixed(1) + ' KB';
+        html += '<div style="display:flex;align-items:center;gap:6px;padding:3px 6px;margin-bottom:3px;background:var(--bg-tertiary);border-radius:4px;font-size:11px">';
+        html += '<span style="flex:1">' + esc(f.name) + '</span>';
+        html += '<span style="color:var(--text-muted)">' + sizeStr + '</span>';
+        html += '</div>';
+      });
+      container.innerHTML = html;
+    }
+  } catch(e) { /* silent */ }
 }
 
 // ── Memory Search ─────────────────────────
