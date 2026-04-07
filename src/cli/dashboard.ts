@@ -2807,8 +2807,9 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
       ? `\n\n[CURRENT ARTIFACT STATE — the user may have edited this directly]\n\`\`\`json-artifact\n${JSON.stringify(currentArtifact, null, 2)}\n\`\`\`\n`
       : '';
 
+    const agentContext = agentSlug ? `You are building this for the agent "${agentSlug}". The skill/cron will be scoped to this agent specifically.\n` : '';
     const builderPrefix = type === 'skill'
-      ? `[BUILDER MODE: You are helping build a reusable skill. As you develop the procedure, output the current state as a JSON block:\n` +
+      ? `[BUILDER MODE: You are helping build a reusable skill. ${agentContext}As you develop the procedure, output the current state as a JSON block:\n` +
         '```json-artifact\n{"type":"skill","title":"...","description":"...","triggers":["..."],"steps":"markdown procedure"}\n```\n' +
         `Update this block in EVERY response as the skill evolves. Ask clarifying questions to refine the procedure. Keep it conversational — one question at a time. ` +
         `When the user says "save" or approves, output the final artifact block.]${artifactContext}\n\n`
@@ -2845,43 +2846,58 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
   // Save completed builder artifact
   app.post('/api/builder/save', (req, res) => {
     try {
-      const { artifactType, artifact } = req.body;
+      const { artifactType, artifact, agentSlug } = req.body;
       if (!artifact) { res.status(400).json({ error: 'artifact is required' }); return; }
 
       if (artifactType === 'skill') {
-        const skillsDir = path.join(VAULT_DIR, '00-System', 'skills');
+        // Scope to agent if selected, otherwise global
+        const skillsDir = agentSlug
+          ? path.join(VAULT_DIR, '00-System', 'agents', agentSlug, 'skills')
+          : path.join(VAULT_DIR, '00-System', 'skills');
         if (!existsSync(skillsDir)) mkdirSync(skillsDir, { recursive: true });
         const name = (artifact.title || 'untitled').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 60);
         const now = new Date().toISOString();
         const matterMod = require('gray-matter');
+        const meta: Record<string, unknown> = {
+          title: artifact.title, description: artifact.description || '', triggers: artifact.triggers || [],
+          source: 'builder', toolsUsed: artifact.toolsUsed || [], useCount: 0, createdAt: now, updatedAt: now,
+        };
+        if (agentSlug) meta.agentSlug = agentSlug;
         const content = matterMod.stringify(
           `\n# ${artifact.title}\n\n${artifact.description || ''}\n\n## Procedure\n\n${artifact.steps || ''}\n`,
-          {
-            title: artifact.title, description: artifact.description || '', triggers: artifact.triggers || [],
-            source: 'builder', toolsUsed: artifact.toolsUsed || [], useCount: 0, createdAt: now, updatedAt: now,
-          },
+          meta,
         );
         writeFileSync(path.join(skillsDir, `${name}.md`), content);
-        res.json({ ok: true, name, message: `Skill "${artifact.title}" saved` });
+        const scope = agentSlug ? ` (for ${agentSlug})` : ' (global)';
+        res.json({ ok: true, name, message: `Skill "${artifact.title}" saved${scope}` });
       } else if (artifactType === 'cron') {
-        // Read current CRON.md and append the new job
-        const cronFile = path.join(VAULT_DIR, '00-System', 'CRON.md');
+        // Scope cron to agent if selected
+        const jobName = agentSlug && !artifact.name.startsWith(agentSlug + ':')
+          ? `${agentSlug}:${artifact.name}`
+          : artifact.name;
+        const { cronFile } = agentSlug
+          ? (() => {
+              const agentCronFile = path.join(VAULT_DIR, '00-System', 'agents', agentSlug, 'CRON.md');
+              return { cronFile: existsSync(agentCronFile) ? agentCronFile : path.join(VAULT_DIR, '00-System', 'CRON.md') };
+            })()
+          : { cronFile: path.join(VAULT_DIR, '00-System', 'CRON.md') };
         if (!existsSync(cronFile)) { res.status(500).json({ error: 'CRON.md not found' }); return; }
         const matterMod = require('gray-matter');
         const parsed = matterMod(readFileSync(cronFile, 'utf-8'));
         const jobs = parsed.data.jobs || [];
         jobs.push({
-          name: artifact.name,
+          name: jobName,
           schedule: artifact.schedule,
           prompt: artifact.prompt,
           tier: artifact.tier || 1,
           enabled: artifact.enabled !== false,
+          ...(agentSlug ? { agent: agentSlug } : {}),
           ...(artifact.mode === 'unleashed' ? { mode: 'unleashed', max_hours: artifact.max_hours || 1 } : {}),
           ...(artifact.work_dir ? { work_dir: artifact.work_dir } : {}),
         });
         parsed.data.jobs = jobs;
         writeFileSync(cronFile, matterMod.stringify(parsed.content, parsed.data));
-        res.json({ ok: true, name: artifact.name, message: `Cron job "${artifact.name}" saved` });
+        res.json({ ok: true, name: jobName, message: `Cron job "${jobName}" saved` });
       } else {
         res.status(400).json({ error: `Unknown artifact type: ${artifactType}` });
       }
@@ -3717,6 +3733,7 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
           slug: a.slug,
           name: a.name,
           description: a.description,
+          status: a.status ?? 'active',
           avatar: a.avatar ?? null,
           model: a.model ?? null,
           project: a.project ?? null,
@@ -11950,7 +11967,8 @@ async function saveBuilderArtifact() {
   if (!builderArtifact) { toast('No artifact to save', 'error'); return; }
   var type = document.getElementById('builder-type').value;
   try {
-    var r = await apiJson('POST', '/api/builder/save', { artifactType: type, artifact: builderArtifact });
+    var agentSlug = (document.getElementById('builder-agent') || {}).value || '';
+    var r = await apiJson('POST', '/api/builder/save', { artifactType: type, artifact: builderArtifact, agentSlug: agentSlug || undefined });
     if (r.ok) {
       toast(r.message || 'Saved!', 'success');
       // Add confirmation to chat
