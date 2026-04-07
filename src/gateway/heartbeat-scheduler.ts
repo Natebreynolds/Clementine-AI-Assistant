@@ -1222,6 +1222,8 @@ export class HeartbeatScheduler {
     if (trimmed === '__NOTHING__') return true;
     // Suppress variations the model sometimes produces
     if (/^_*NOTHING_*$/i.test(trimmed)) return true;
+    // Suppress "NOTHING" followed by parenthetical context (e.g. "NOTHING\n\n(Same blockers...)")
+    if (/^_*NOTHING_*\s*(\(|$)/im.test(trimmed)) return true;
     // Suppress empty-substance responses: the model announces what it would do but produces no actual content
     // e.g. "I'll run the heartbeat check." followed by nothing, or tool-not-available complaints
     const lower = trimmed.toLowerCase();
