@@ -5034,6 +5034,7 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
 
   app.get('/sw.js', (_req, res) => {
     res.setHeader('Content-Type', 'application/javascript');
+    res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
     // Use build hash in cache name so updates bust the cache automatically
     res.send(`const CACHE = 'clem-${buildHash}';
 const SHELL = ['/manifest.json', '/icon.svg'];
@@ -8733,7 +8734,11 @@ function navigateTo(page, opts) {
   // Page-specific refresh
   if (page === 'home') { refreshStatus(); refreshActivity(); refreshHomePlan(); refreshTeamPulse(); }
   if (page === 'chat') { loadProfiles(); document.getElementById('chat-input').focus(); }
-  if (page === 'builder') { refreshBuilderAgents(currentAgentSlug || ''); document.getElementById('builder-input').focus(); }
+  if (page === 'builder') {
+    var _builderPreselect = currentAgentSlug || '';
+    refreshBuilderAgents(_builderPreselect);
+    document.getElementById('builder-input').focus();
+  }
   if (page === 'automations') { refreshCron(); refreshTimers(); refreshSelfImprove(); refreshSkills(); }
   if (page === 'intelligence') { refreshMemory(); }
   if (page === 'settings') { refreshSettings(); refreshRemoteAccess(); refreshProjects(); refreshSalesforce(); refreshMcpServers(); }
@@ -15049,7 +15054,7 @@ var sseConnected = false;
 try {
   // Register service worker for PWA
   if ('serviceWorker' in navigator) {
-    navigator.serviceWorker.register('/sw.js').catch(function() {});
+    navigator.serviceWorker.register('/sw.js', { updateViaCache: 'none' }).catch(function() {});
   }
 
   var evtSource = new EventSource('/api/events');
