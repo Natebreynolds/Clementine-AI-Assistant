@@ -13765,7 +13765,7 @@ async function loadAgentSkills(agentSlug, isPrimary) {
     var d = await r.json();
     var skills = d.skills || [];
     if (skills.length === 0) {
-      container.innerHTML = '<div class="empty-state" style="padding:16px">No skills yet. Teach this agent a skill or they\'ll learn from successful tasks.</div>';
+      container.innerHTML = '<div class="empty-state" style="padding:16px">No skills yet. Teach a skill above, or skills are auto-extracted from successful tasks.</div>';
       return;
     }
     var html = '<div style="display:flex;flex-direction:column;gap:8px;padding:12px">';
