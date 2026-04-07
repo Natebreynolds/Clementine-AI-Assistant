@@ -12203,7 +12203,7 @@ async function checkVersion() {
       _restartBannerShown = true;
       var banner = document.createElement('div');
       banner.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:999;background:var(--clementine);color:#fff;text-align:center;padding:8px 16px;font-size:13px;font-weight:600;';
-      banner.innerHTML = 'A new version is available. Restart the dashboard to apply updates: <code style="background:rgba(0,0,0,0.2);padding:2px 8px;border-radius:4px;margin-left:8px">clementine dashboard</code>';
+      banner.innerHTML = 'A new version is available. <button onclick="restartDashboard()" style="background:rgba(0,0,0,0.3);color:#fff;border:1px solid rgba(255,255,255,0.4);padding:4px 16px;border-radius:6px;font-size:13px;font-weight:600;cursor:pointer;margin-left:8px">Restart Now</button>';
       document.body.appendChild(banner);
     }
     // Also handle live-reload for same-process changes (e.g. git pull without rebuild)
@@ -12212,6 +12212,17 @@ async function checkVersion() {
       setTimeout(function() { location.reload(); }, 2000);
     }
   } catch { /* ignore */ }
+}
+
+async function restartDashboard() {
+  toast('Restarting dashboard...', 'success');
+  try {
+    await apiPost('/api/dashboard/restart');
+    // Wait for new process to come up, then reload
+    setTimeout(function() { location.reload(); }, 3000);
+  } catch(e) {
+    toast('Restart failed: ' + e, 'error');
+  }
 }
 
 // ── Remote access management ──────────────────
