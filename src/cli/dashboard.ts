@@ -7663,9 +7663,8 @@ function getDashboardHTML(token: string): string {
           <option value="skill">Skill</option>
           <option value="cron">Cron Job</option>
         </select>
-        <select id="builder-agent" style="padding:6px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg-secondary);color:var(--text-primary);font-size:13px">
-          <option value="">Clementine (global)</option>
-        </select>
+        <span id="builder-agent-label" style="padding:6px 12px;font-size:13px;color:var(--text-secondary);font-weight:500"></span>
+        <input type="hidden" id="builder-agent" value="">
         <span style="flex:1"></span>
         <button class="btn-sm" onclick="resetBuilder()" style="background:var(--bg-tertiary);border:1px solid var(--border);color:var(--text-secondary);padding:4px 12px;border-radius:6px;cursor:pointer;font-size:12px">New</button>
         <button class="btn-sm btn-primary" id="builder-save-btn" onclick="saveBuilderArtifact()" style="padding:4px 16px;font-size:12px;display:none">Save</button>
@@ -12029,18 +12028,21 @@ async function saveBuilderArtifact() {
 
 // Populate agent dropdown when builder page loads
 function refreshBuilderAgents(preselect) {
-  var sel = document.getElementById('builder-agent');
-  if (!sel) return;
-  apiFetch('/api/agents').then(function(r) { return r.json(); }).then(function(d) {
-    var agents = Array.isArray(d) ? d : (d.agents || []);
-    var html = '<option value="">Clementine (global)</option>';
-    for (var i = 0; i < agents.length; i++) {
-      var a = agents[i];
-      html += '<option value="' + esc(a.slug) + '">' + esc(a.name) + '</option>';
-    }
-    sel.innerHTML = html;
-    if (preselect) sel.value = preselect;
-  }).catch(function() {});
+  var hidden = document.getElementById('builder-agent');
+  var label = document.getElementById('builder-agent-label');
+  if (!hidden || !label) return;
+  hidden.value = preselect || '';
+  if (!preselect) {
+    label.textContent = 'Clementine (global)';
+    return;
+  }
+  // Look up agent name from sidebar
+  var teamItem = document.querySelector('.team-nav-item[data-slug="' + preselect + '"] span');
+  if (teamItem) {
+    label.textContent = teamItem.textContent;
+  } else {
+    label.textContent = preselect;
+  }
 }
 
 // ── Builder File Attachments ──────────────
