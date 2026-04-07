@@ -12031,10 +12031,10 @@ function refreshBuilderAgents(preselect) {
     var html = '<option value="">Clementine (global)</option>';
     for (var i = 0; i < agents.length; i++) {
       var a = agents[i];
-      var isSelected = (preselect && a.slug === preselect) ? ' selected' : '';
-      html += '<option value="' + esc(a.slug) + '"' + isSelected + '>' + esc(a.name) + '</option>';
+      html += '<option value="' + esc(a.slug) + '">' + esc(a.name) + '</option>';
     }
     sel.innerHTML = html;
+    if (preselect) sel.value = preselect;
   }).catch(function() {});
 }
 
