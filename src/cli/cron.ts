@@ -127,6 +127,11 @@ export async function cmdCronRun(jobName: string): Promise<void> {
     }
   }
 
+  // ── Inject context field if present ──
+  if (job.context) {
+    job = { ...job, prompt: `## Context\n${job.context}\n\n${job.prompt}` };
+  }
+
   // ── Inject attachment content ──
   const attachDir = path.join(BASE_DIR, 'attachments', job.name.replace(/[^a-zA-Z0-9_:-]/g, '_'));
   if (existsSync(attachDir)) {

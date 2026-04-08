@@ -1168,21 +1168,6 @@ function getLogs(lines: number): string {
 
 // ── CRON CRUD helpers ────────────────────────────────────────────────
 
-function readCronFile(): { parsed: matter.GrayMatterFile<string>; jobs: Array<Record<string, unknown>> } {
-  let parsed: matter.GrayMatterFile<string>;
-  if (existsSync(CRON_FILE)) {
-    const raw = readFileSync(CRON_FILE, 'utf-8');
-    parsed = matter(raw);
-  } else {
-    const dir = path.dirname(CRON_FILE);
-    if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-    parsed = matter('');
-    parsed.data = {};
-  }
-  const jobs = (parsed.data.jobs ?? []) as Array<Record<string, unknown>>;
-  return { parsed, jobs };
-}
-
 /**
  * Resolve a job name to the correct CRON.md file.
  * Agent jobs use "agent-slug:job-name" format.
@@ -1222,18 +1207,6 @@ function writeCronFileAt(cronFile: string, parsed: matter.GrayMatterFile<string>
     throw new Error(`Generated CRON.md has invalid YAML: ${err instanceof Error ? err.message : err}`);
   }
   writeFileSync(cronFile, output);
-}
-
-function writeCronFile(parsed: matter.GrayMatterFile<string>, jobs: Array<Record<string, unknown>>): void {
-  parsed.data.jobs = jobs;
-  const output = matter.stringify(parsed.content, parsed.data);
-  // Validate before writing to prevent daemon crash from malformed YAML
-  try {
-    matter(output);
-  } catch (err) {
-    throw new Error(`Generated CRON.md has invalid YAML: ${err instanceof Error ? err.message : err}`);
-  }
-  writeFileSync(CRON_FILE, output);
 }
 
 // ── Express app ──────────────────────────────────────────────────────
@@ -2154,7 +2127,7 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
 
   app.post('/api/cron', (req, res) => {
     try {
-      const { name, schedule, prompt, tier, enabled, work_dir, mode, max_hours, max_retries, after } = req.body;
+      const { name, schedule, prompt, tier, enabled, work_dir, mode, max_hours, max_retries, after, agent, context } = req.body;
       if (!name || !schedule || !prompt) {
         res.status(400).json({ error: 'name, schedule, and prompt are required' });
         return;
@@ -2163,7 +2136,11 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
         res.status(400).json({ error: `Invalid cron expression: ${schedule}` });
         return;
       }
-      const { parsed, jobs } = readCronFile();
+      let cronFile = CRON_FILE;
+      if (agent) {
+        cronFile = path.join(VAULT_DIR, '00-System', 'agents', String(agent), 'CRON.md');
+      }
+      const { parsed, jobs } = readCronFileAt(cronFile);
       const duplicate = jobs.find(
         (j) => String(j.name ?? '').toLowerCase() === String(name).toLowerCase(),
       );
@@ -2186,8 +2163,9 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
       }
       if (max_retries != null && max_retries !== '') job.max_retries = Number(max_retries);
       if (after) job.after = String(after);
+      if (context) job.context = String(context);
       jobs.push(job);
-      writeCronFile(parsed, jobs);
+      writeCronFileAt(cronFile, parsed, jobs);
       res.json({ ok: true, message: `Created cron job: ${name}` });
     } catch (err) {
       res.status(500).json({ error: String(err) });
@@ -2197,9 +2175,10 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
   app.put('/api/cron/:name', (req, res) => {
     try {
       const jobName = req.params.name;
-      const { parsed, jobs } = readCronFile();
+      const { cronFile, bareJobName } = resolveJobCronFile(jobName);
+      const { parsed, jobs } = readCronFileAt(cronFile);
       const idx = jobs.findIndex(
-        (j) => String(j.name ?? '').toLowerCase() === jobName.toLowerCase(),
+        (j) => String(j.name ?? '').toLowerCase() === bareJobName.toLowerCase(),
       );
       if (idx === -1) {
         res.status(404).json({ error: `Job "${jobName}" not found` });
@@ -2266,7 +2245,14 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
           delete jobs[idx].after;
         }
       }
-      if (updates.name !== undefined && updates.name !== jobName) {
+      if (updates.context !== undefined) {
+        if (updates.context) {
+          jobs[idx].context = String(updates.context);
+        } else {
+          delete jobs[idx].context;
+        }
+      }
+      if (updates.name !== undefined && updates.name !== bareJobName) {
         // Rename — check for duplicates
         const dup = jobs.find(
           (j, i) => i !== idx && String(j.name ?? '').toLowerCase() === String(updates.name).toLowerCase(),
@@ -2277,7 +2263,7 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
         }
         jobs[idx].name = String(updates.name);
       }
-      writeCronFile(parsed, jobs);
+      writeCronFileAt(cronFile, parsed, jobs);
       res.json({ ok: true, message: `Updated cron job: ${jobs[idx].name}` });
     } catch (err) {
       res.status(500).json({ error: String(err) });
@@ -2786,6 +2772,52 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
       const gateway = await getGateway();
       const response = await gateway.handleMessage('dashboard:web', message);
       res.json({ ok: true, response });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  // ── Cron training chat endpoint ─────────────────────────────────────
+
+  app.post('/api/cron/train', async (req, res) => {
+    const { message, jobName, prompt, context, agentSlug } = req.body;
+    if (!message || typeof message !== 'string') {
+      res.status(400).json({ error: 'message is required' });
+      return;
+    }
+    const sessionKey = `dashboard:cron-train:${jobName || 'new'}`;
+    const agentLabel = agentSlug ? ` for agent "${agentSlug}"` : '';
+    const currentState = `\n\n[CURRENT CRON STATE${agentLabel}]\nJob name: ${jobName || '(new)'}\nPrompt: ${prompt || '(empty)'}\nContext: ${context || '(none)'}\n`;
+    const systemPrefix =
+      `[CRON TRAINING MODE: You are helping the user refine a scheduled task${agentLabel}. ` +
+      `The user wants to train/improve this cron job. Help them:\n` +
+      `- Refine the prompt wording for clarity and effectiveness\n` +
+      `- Add context, guidelines, or examples the agent should follow\n` +
+      `- Think about edge cases and failure modes\n` +
+      `- Suggest what reference files or data sources would help\n\n` +
+      `When you suggest changes to the prompt or context, output them in a block so the user can apply them:\n` +
+      '```suggested-prompt\nthe improved prompt text\n```\n' +
+      '```suggested-context\nadditional context or guidelines\n```\n' +
+      `Only include these blocks when you have a concrete suggestion. Keep the conversation natural — ask questions to understand what the cron should do.]${currentState}\n\n`;
+
+    try {
+      const gateway = await getGateway();
+      const response = await gateway.handleMessage(sessionKey, systemPrefix + message);
+
+      // Extract suggested-prompt and suggested-context blocks
+      let suggestedPrompt = null;
+      let suggestedContext = null;
+      const promptMatch = response?.match(/```suggested-prompt\s*\n([\s\S]*?)```/);
+      if (promptMatch) suggestedPrompt = promptMatch[1].trim();
+      const contextMatch = response?.match(/```suggested-context\s*\n([\s\S]*?)```/);
+      if (contextMatch) suggestedContext = contextMatch[1].trim();
+
+      const cleanResponse = response
+        ?.replace(/```suggested-prompt\s*\n[\s\S]*?```/g, '')
+        ?.replace(/```suggested-context\s*\n[\s\S]*?```/g, '')
+        ?.trim();
+
+      res.json({ ok: true, response: cleanResponse, suggestedPrompt, suggestedContext });
     } catch (err) {
       res.status(500).json({ error: String(err) });
     }
@@ -8410,6 +8442,11 @@ function getDashboardHTML(token: string): string {
         <div class="form-hint">The instruction sent to the AI agent when this task fires.</div>
       </div>
       <div class="form-group">
+        <label class="form-label">Context <span style="color:var(--text-muted);font-weight:normal">(optional — injected at runtime)</span></label>
+        <textarea id="cron-context" rows="4" placeholder="Guidelines, examples, formatting rules, data sources, or any context the agent should know when running this task..."></textarea>
+        <div class="form-hint">Freeform notes injected into the prompt at execution time. Use this for training data, style guides, or standing instructions.</div>
+      </div>
+      <div class="form-group">
         <label class="form-label">Reference Files <span style="color:var(--text-muted);font-weight:normal">(optional)</span></label>
         <div id="cron-attachments-list" style="margin-bottom:8px"></div>
         <label class="btn btn-sm" style="cursor:pointer;display:inline-flex;align-items:center;gap:4px;background:var(--bg-tertiary);border:1px solid var(--border);border-radius:6px;padding:6px 12px;font-size:12px;color:var(--text-primary)">
@@ -8418,8 +8455,28 @@ function getDashboardHTML(token: string): string {
         </label>
         <div class="form-hint">CSV, Markdown, or text files the agent can reference during execution. Max 10MB per file.</div>
       </div>
+
+      <!-- Training Chat -->
+      <div class="form-group" id="cron-training-section" style="display:none">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
+          <label class="form-label" style="margin:0">Training Chat</label>
+          <button class="btn btn-sm" onclick="toggleCronTraining()" style="font-size:11px" id="cron-training-toggle">Hide</button>
+        </div>
+        <div id="cron-training-chat" style="border:1px solid var(--border);border-radius:8px;background:var(--bg-secondary);overflow:hidden">
+          <div id="cron-training-messages" style="max-height:240px;overflow-y:auto;padding:12px;display:flex;flex-direction:column;gap:8px">
+            <div class="empty-state" style="padding:16px;font-size:12px;color:var(--text-muted)">Chat with the agent to refine this task. Ask for help with the prompt, suggest improvements, or add context.</div>
+          </div>
+          <div style="display:flex;gap:6px;padding:8px;border-top:1px solid var(--border);background:var(--bg-primary)">
+            <input type="text" id="cron-training-input" placeholder="Ask for help refining this task..." style="flex:1;font-size:12px;padding:6px 10px" onkeydown="if(event.key==='Enter')sendCronTraining()">
+            <button class="btn btn-sm btn-primary" id="cron-training-send" onclick="sendCronTraining()" style="font-size:11px;padding:4px 12px">Send</button>
+          </div>
+        </div>
+      </div>
     </div>
     <div class="modal-footer">
+      <div style="display:flex;align-items:center;gap:8px;flex:1">
+        <button class="btn btn-sm" id="cron-train-btn" onclick="showCronTraining()" style="font-size:11px;display:none">Train with Agent</button>
+      </div>
       <button onclick="closeCronModal()">Cancel</button>
       <button class="btn-primary" id="cron-modal-save" onclick="saveCronJob()">Create Task</button>
     </div>
@@ -8924,7 +8981,7 @@ async function loadAgentDetailTab(tab, slug, isPrimary) {
         return j.agent === slug;
       });
       html += '<div class="card" style="margin-bottom:16px"><div class="card-header" style="display:flex;justify-content:space-between;align-items:center"><span>Scheduled Tasks (' + jobs.length + ')</span>';
-      html += '<button class="btn btn-sm btn-primary" onclick="openCronModal()" style="font-size:11px">+ Add Task</button></div><div class="card-body" style="padding:0">';
+      html += '<button class="btn btn-sm btn-primary" onclick="openCreateCronModal(\\x27' + esc(isPrimary ? '' : slug) + '\\x27)" style="font-size:11px">+ Add Task</button></div><div class="card-body" style="padding:0">';
       if (jobs.length === 0) {
         html += '<div class="empty-state" style="padding:24px">No scheduled tasks</div>';
       } else {
@@ -10688,6 +10745,7 @@ async function deleteGoal(goalId, goalTitle) {
 
 // ── Cron Modal ────────────────────────────
 let editingCronJob = null;
+let _cronAgentContext = '';
 
 function populateAfterJobDropdown(selectedAfter, excludeName) {
   var sel = document.getElementById('cron-after');
@@ -10707,7 +10765,8 @@ function toggleUnleashedOptions() {
   document.getElementById('cron-maxhours-group').style.display = mode === 'unleashed' ? '' : 'none';
 }
 
-function openCreateCronModal() {
+function openCreateCronModal(agentSlug) {
+  _cronAgentContext = agentSlug || '';
   editingCronJob = null;
   document.getElementById('cron-modal-title').textContent = 'New Scheduled Task';
   document.getElementById('cron-modal-save').textContent = 'Create Task';
@@ -10726,12 +10785,17 @@ function openCreateCronModal() {
   populateAfterJobDropdown('');
   toggleUnleashedOptions();
   document.getElementById('cron-prompt').value = '';
+  document.getElementById('cron-context').value = '';
+  document.getElementById('cron-training-section').style.display = 'none';
+  document.getElementById('cron-train-btn').style.display = '';
+  resetCronTrainingChat();
   document.getElementById('cron-modal').classList.add('show');
 }
 
 function openEditCronModal(jobName) {
   const job = cronJobsData.find(j => j.name === jobName);
   if (!job) return;
+  _cronAgentContext = job.agent || '';
   editingCronJob = jobName;
   document.getElementById('cron-modal-title').textContent = 'Edit: ' + jobName;
   document.getElementById('cron-modal-save').textContent = 'Save Changes';
@@ -10746,6 +10810,10 @@ function openEditCronModal(jobName) {
   populateAfterJobDropdown(job.after || '', jobName);
   toggleUnleashedOptions();
   document.getElementById('cron-prompt').value = job.prompt || '';
+  document.getElementById('cron-context').value = job.context || '';
+  document.getElementById('cron-training-section').style.display = 'none';
+  document.getElementById('cron-train-btn').style.display = '';
+  resetCronTrainingChat();
   _pendingAttachments = [];
   loadCronAttachments(jobName);
   document.getElementById('cron-modal').classList.add('show');
@@ -10754,9 +10822,9 @@ function openEditCronModal(jobName) {
 function closeCronModal() {
   document.getElementById('cron-modal').classList.remove('show');
   editingCronJob = null;
-  // Clear attachment list
   var attachList = document.getElementById('cron-attachments-list');
   if (attachList) attachList.innerHTML = '';
+  resetCronTrainingChat();
 }
 
 // ── Cron Attachment Handling ──
@@ -10875,23 +10943,143 @@ async function saveCronJob() {
   const max_retries_val = document.getElementById('cron-max-retries').value;
   const max_retries = max_retries_val !== '' ? parseInt(max_retries_val) : undefined;
   const after = document.getElementById('cron-after').value || undefined;
+  const context = document.getElementById('cron-context').value.trim() || undefined;
 
   if (!name || !schedule || !prompt) {
     toast('Please fill in all fields', 'error');
     return;
   }
 
-  const body = { name, schedule, tier, prompt, enabled: true, work_dir: work_dir || undefined, mode, max_hours, max_retries, after };
+  const body = { name, schedule, tier, prompt, enabled: true, work_dir: work_dir || undefined, mode, max_hours, max_retries, after, context };
 
   if (editingCronJob) {
     await apiJson('PUT', '/api/cron/' + encodeURIComponent(editingCronJob), body);
     if (_pendingAttachments.length > 0) await uploadPendingAttachments(editingCronJob);
   } else {
-    await apiJson('POST', '/api/cron', body);
-    if (_pendingAttachments.length > 0) await uploadPendingAttachments(name);
+    var createBody = _cronAgentContext ? Object.assign({}, body, { agent: _cronAgentContext }) : body;
+    await apiJson('POST', '/api/cron', createBody);
+    var attachJobName = _cronAgentContext ? (_cronAgentContext + ':' + name) : name;
+    if (_pendingAttachments.length > 0) await uploadPendingAttachments(attachJobName);
   }
   closeCronModal();
   refreshCron();
+}
+
+// ── Cron Training Chat ───────────────────
+function showCronTraining() {
+  document.getElementById('cron-training-section').style.display = '';
+  document.getElementById('cron-train-btn').style.display = 'none';
+  document.getElementById('cron-training-input').focus();
+}
+
+function toggleCronTraining() {
+  var section = document.getElementById('cron-training-section');
+  if (section.style.display === 'none') {
+    section.style.display = '';
+    document.getElementById('cron-training-toggle').textContent = 'Hide';
+  } else {
+    section.style.display = 'none';
+    document.getElementById('cron-train-btn').style.display = '';
+  }
+}
+
+function resetCronTrainingChat() {
+  var msgs = document.getElementById('cron-training-messages');
+  if (msgs) msgs.innerHTML = '<div class="empty-state" style="padding:16px;font-size:12px;color:var(--text-muted)">Chat with the agent to refine this task. Ask for help with the prompt, suggest improvements, or add context.</div>';
+}
+
+async function sendCronTraining() {
+  var input = document.getElementById('cron-training-input');
+  var msg = input.value.trim();
+  if (!msg) return;
+  input.value = '';
+
+  var container = document.getElementById('cron-training-messages');
+  var empty = container.querySelector('.empty-state');
+  if (empty) empty.remove();
+
+  // User bubble
+  var userEl = document.createElement('div');
+  userEl.style.cssText = 'align-self:flex-end;background:var(--accent);color:#fff;padding:6px 10px;border-radius:10px 10px 2px 10px;font-size:12px;max-width:85%;word-break:break-word';
+  userEl.textContent = msg;
+  container.appendChild(userEl);
+
+  // Typing indicator
+  var typing = document.createElement('div');
+  typing.className = 'chat-typing';
+  typing.innerHTML = '<span></span><span></span><span></span>';
+  typing.style.cssText = 'align-self:flex-start;padding:6px 10px';
+  container.appendChild(typing);
+  container.scrollTop = container.scrollHeight;
+
+  var sendBtn = document.getElementById('cron-training-send');
+  input.disabled = true;
+  sendBtn.disabled = true;
+  sendBtn.textContent = '...';
+
+  try {
+    var r = await apiFetch('/api/cron/train', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        message: msg,
+        jobName: editingCronJob || document.getElementById('cron-name').value.trim(),
+        prompt: document.getElementById('cron-prompt').value.trim(),
+        context: document.getElementById('cron-context').value.trim(),
+        agentSlug: _cronAgentContext || undefined,
+      }),
+    });
+    var d = await r.json();
+    typing.remove();
+
+    // Assistant response
+    var asstEl = document.createElement('div');
+    asstEl.style.cssText = 'align-self:flex-start;background:var(--bg-tertiary);color:var(--text-primary);padding:6px 10px;border-radius:10px 10px 10px 2px;font-size:12px;max-width:85%;word-break:break-word';
+    asstEl.innerHTML = renderMd(d.response || d.error || 'No response');
+    container.appendChild(asstEl);
+
+    // Apply buttons for suggestions
+    if (d.suggestedPrompt) {
+      var applyPromptBtn = document.createElement('button');
+      applyPromptBtn.className = 'btn btn-sm btn-primary';
+      applyPromptBtn.style.cssText = 'margin:4px 0;font-size:10px;align-self:flex-start';
+      applyPromptBtn.textContent = 'Apply suggested prompt';
+      applyPromptBtn.onclick = function() {
+        document.getElementById('cron-prompt').value = d.suggestedPrompt;
+        toast('Prompt updated');
+        applyPromptBtn.disabled = true;
+        applyPromptBtn.textContent = 'Applied';
+      };
+      container.appendChild(applyPromptBtn);
+    }
+    if (d.suggestedContext) {
+      var applyCtxBtn = document.createElement('button');
+      applyCtxBtn.className = 'btn btn-sm';
+      applyCtxBtn.style.cssText = 'margin:4px 0;font-size:10px;align-self:flex-start;background:var(--bg-tertiary);border:1px solid var(--border)';
+      applyCtxBtn.textContent = 'Apply suggested context';
+      applyCtxBtn.onclick = function() {
+        var ctxEl = document.getElementById('cron-context');
+        var existing = ctxEl.value.trim();
+        ctxEl.value = existing ? existing + '\\n\\n' + d.suggestedContext : d.suggestedContext;
+        toast('Context updated');
+        applyCtxBtn.disabled = true;
+        applyCtxBtn.textContent = 'Applied';
+      };
+      container.appendChild(applyCtxBtn);
+    }
+  } catch(e) {
+    typing.remove();
+    var errEl = document.createElement('div');
+    errEl.style.cssText = 'align-self:flex-start;color:var(--red);font-size:12px;padding:6px 10px';
+    errEl.textContent = 'Error: ' + String(e);
+    container.appendChild(errEl);
+  }
+
+  input.disabled = false;
+  sendBtn.disabled = false;
+  sendBtn.textContent = 'Send';
+  input.focus();
+  container.scrollTop = container.scrollHeight;
 }
 
 // ── Delete Confirm ────────────────────────

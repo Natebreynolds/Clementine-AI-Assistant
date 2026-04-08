@@ -127,6 +127,7 @@ export function parseCronJobs(): CronJobDefinition[] {
       ? (job.success_criteria as unknown[]).map(c => String(c))
       : undefined;
     const alwaysDeliver = job.always_deliver === true ? true : undefined;
+    const context = job.context != null ? String(job.context) : undefined;
     const preCheck = job.pre_check != null ? String(job.pre_check) : undefined;
 
     if (!name || !schedule || !prompt) {
@@ -134,7 +135,7 @@ export function parseCronJobs(): CronJobDefinition[] {
       continue;
     }
 
-    jobs.push({ name, schedule, prompt, enabled, tier, maxTurns, model, workDir, mode, maxHours, maxRetries, after, successCriteria, alwaysDeliver, preCheck });
+    jobs.push({ name, schedule, prompt, enabled, tier, maxTurns, model, workDir, mode, maxHours, maxRetries, after, successCriteria, alwaysDeliver, context, preCheck });
   }
 
   return jobs;
@@ -183,6 +184,7 @@ export function parseAgentCronJobs(agentsDir: string): CronJobDefinition[] {
         const successCriteria = Array.isArray(job.success_criteria)
           ? (job.success_criteria as unknown[]).map(c => String(c))
           : undefined;
+        const context = job.context != null ? String(job.context) : undefined;
         const preCheck = job.pre_check != null ? String(job.pre_check) : undefined;
 
         if (!name || !schedule || !prompt) {
@@ -194,7 +196,7 @@ export function parseAgentCronJobs(agentsDir: string): CronJobDefinition[] {
         allJobs.push({
           name: `${slug}:${name}`,
           schedule, prompt, enabled, tier, maxTurns, model, workDir,
-          mode, maxHours, maxRetries, after, successCriteria, preCheck,
+          mode, maxHours, maxRetries, after, successCriteria, context, preCheck,
           agentSlug: slug,
         });
       }
@@ -812,8 +814,13 @@ export class CronScheduler {
         ? 1
         : 1 + (job.maxRetries ?? Math.min(priorErrors, BACKOFF_MS.length));
 
-      // ── Inject attachment content if present ──
+      // ── Inject context field if present ──
       let jobPrompt = job.prompt;
+      if (job.context) {
+        jobPrompt = `## Context\n${job.context}\n\n${jobPrompt}`;
+      }
+
+      // ── Inject attachment content if present ──
       const attachDir = path.join(BASE_DIR, 'attachments', job.name.replace(/[^a-zA-Z0-9_:-]/g, '_'));
       if (existsSync(attachDir)) {
         try {

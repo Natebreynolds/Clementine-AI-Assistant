@@ -279,6 +279,7 @@ export interface CronJobDefinition {
   agentSlug?: string;              // Agent that owns this cron job (scoped execution)
   successCriteria?: string[];      // Verifiable acceptance criteria for goal-backward reflection
   alwaysDeliver?: boolean;         // If true, retry once with explicit prompt when response is empty/noise
+  context?: string;                 // Freeform context/notes injected into prompt at runtime (training data, guidelines, etc.)
   preCheck?: string;               // Shell command gate — exit 0 = run, non-zero = skip. Stdout injected as context.
   attachments?: string[];          // Filenames in ~/.clementine/attachments/{job-name}/ injected at runtime
 }
