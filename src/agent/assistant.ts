@@ -1986,6 +1986,9 @@ You have a limited number of turns per message (~15). **After 8-10 tool calls, y
                     responseText = responseText || 'I hit the cost limit for this query. Try breaking it into smaller requests.';
                   } else if (lower.includes('rate') && lower.includes('limit')) {
                     hitRateLimit = true;
+                  } else if (lower.includes('does not have access') || lower.includes('please run /login') || lower.includes('not authenticated')) {
+                    // Auth errors — throw so the gateway circuit breaker catches it
+                    throw new Error(errorText);
                   } else {
                     responseText = responseText || `Error: ${errorText}`;
                   }
@@ -2019,6 +2022,9 @@ You have a limited number of turns per message (~15). **After 8-10 tool calls, y
             hitRateLimit = true;
           } else if (errStr.includes('prompt is too long') || errStr.includes('prompt too long') || errStr.includes('context_length')) {
             responseText = responseText || 'Error: prompt is too long — context window overflow from large tool responses.';
+          } else if (errStr.includes('does not have access') || errStr.includes('please run /login') || errStr.includes('not authenticated') || errStr.includes('invalid api key') || errStr.includes('invalid_api_key')) {
+            // Auth errors — rethrow so the gateway circuit breaker handles them
+            throw e;
           } else {
             logger.error({ err: e, sessionKey }, 'SDK query failed');
             if (!responseText) {

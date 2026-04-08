@@ -34,9 +34,14 @@ export function classifyChatError(err: unknown): ChatErrorKind {
   const msg = String(err);
   if (/rate.?limit|\b429\b|too many requests|quota.?exceeded/i.test(msg)) return 'rate_limit';
   if (/context.?length|token.?limit|maximum.?context|prompt.?too.?long/i.test(msg)) return 'context_overflow';
-  if (/\b401\b|\b403\b|auth|forbidden|invalid.?api.?key|permission/i.test(msg)) return 'auth';
+  if (/\b401\b|\b403\b|auth|forbidden|invalid.?api.?key|permission|does not have access|please run \/login/i.test(msg)) return 'auth';
   if (/timeout|ECONNRESET|ECONNREFUSED|ETIMEDOUT|\b5\d\d\b|overloaded|service.?unavailable/i.test(msg)) return 'transient';
   return 'unknown';
+}
+
+/** Detect auth-like errors in response text that the SDK returned as "successful" results. */
+export function looksLikeAuthError(text: string): boolean {
+  return /does not have access|please run \/login|not authenticated|invalid.*api.*key/i.test(text);
 }
 
 /** Per-session state consolidated into a single structure. */
@@ -80,6 +85,44 @@ export class Gateway {
   private sessions = new Map<string, SessionState>();
   private auditLog: string[] = [];
   private draining = false;
+
+  // Auth circuit breaker — suppresses repeated error spam after consecutive failures
+  private _authFailCount = 0;
+  private _authFailSince: number | null = null;
+  private _authLastProbe = 0;
+  private static readonly AUTH_FAIL_THRESHOLD = 2;     // open circuit after N consecutive auth errors
+  private static readonly AUTH_PROBE_INTERVAL = 60_000; // retry auth every 60s while circuit is open
+
+  /** Returns true if the auth circuit is open (too many consecutive auth failures). */
+  get authCircuitOpen(): boolean {
+    return this._authFailCount >= Gateway.AUTH_FAIL_THRESHOLD;
+  }
+
+  /** Record an auth failure. */
+  recordAuthFailure(): void {
+    this._authFailCount++;
+    if (!this._authFailSince) this._authFailSince = Date.now();
+    logger.warn({ consecutiveAuthFailures: this._authFailCount, since: this._authFailSince }, 'Auth failure recorded');
+  }
+
+  /** Clear the auth circuit after a successful request. */
+  clearAuthFailure(): void {
+    if (this._authFailCount > 0) {
+      logger.info({ previousFailures: this._authFailCount }, 'Auth recovered — circuit closed');
+    }
+    this._authFailCount = 0;
+    this._authFailSince = null;
+  }
+
+  /** Check if enough time has passed to allow an auth probe (one message let through). */
+  shouldProbeAuth(): boolean {
+    const now = Date.now();
+    if (now - this._authLastProbe > Gateway.AUTH_PROBE_INTERVAL) {
+      this._authLastProbe = now;
+      return true;
+    }
+    return false;
+  }
 
   // Team system (lazy-initialized)
   private _agentManager?: AgentManager;
@@ -463,6 +506,19 @@ export class Gateway {
     if (this.draining) {
       return "I'm restarting momentarily — your message will be processed after I'm back online.";
     }
+
+    // ── Auth circuit breaker — stop spamming error messages ────────
+    if (this.authCircuitOpen) {
+      if (!this.shouldProbeAuth()) {
+        // Circuit is open and not time to probe yet — suppress silently
+        const mins = Math.round((Date.now() - (this._authFailSince ?? Date.now())) / 60_000);
+        logger.debug({ sessionKey }, 'Auth circuit open — suppressing message');
+        return `I'm temporarily offline due to an authentication issue (${mins}m ago). The owner has been notified — I'll recover automatically once it's resolved.`;
+      }
+      // Allow this one message through as a probe to see if auth recovered
+      logger.info({ sessionKey }, 'Auth circuit open — allowing probe message');
+    }
+
     const releaseLane = await lanes.acquire('chat');
     try {
       const release = await this.acquireSessionLock(sessionKey);
@@ -762,6 +818,15 @@ export class Gateway {
             return ack;
           }
 
+          // ── Check if SDK returned an auth error as a "successful" response ──
+          if (response && looksLikeAuthError(response)) {
+            logger.warn({ sessionKey, response: response.slice(0, 200) }, 'SDK returned auth error as response text');
+            this.recordAuthFailure();
+            return "I'm temporarily offline due to an authentication issue. The owner needs to re-authenticate — I'll recover automatically once it's resolved.";
+          }
+
+          // Auth recovered if we got here
+          this.clearAuthFailure();
           return response || '*(no response)*';
         } catch (err) {
           clearTimeout(chatTimer);
@@ -826,7 +891,8 @@ export class Gateway {
               this.assistant.clearSession(effectiveSessionKey);
               return "That conversation got too long — I've started a fresh session. Please resend your message.";
             case 'auth':
-              return "There's an authentication issue with my API access. Please check the API key configuration.";
+              this.recordAuthFailure();
+              return "I'm temporarily offline due to an authentication issue. The owner needs to re-authenticate — I'll recover automatically once it's resolved.";
             case 'transient':
               return "I hit a temporary connection issue. Please try again in a moment.";
             default:
