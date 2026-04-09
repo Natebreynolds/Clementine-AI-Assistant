@@ -29,6 +29,7 @@ import {
   BASE_DIR,
   GOALS_DIR,
   HEARTBEAT_WORK_QUEUE_FILE,
+  DISCORD_OWNER_ID,
 } from '../config.js';
 import type { HeartbeatState, HeartbeatReportedTopic, HeartbeatWorkItem } from '../types.js';
 import type { CronScheduler } from './cron-scheduler.js';
@@ -540,6 +541,15 @@ export class HeartbeatScheduler {
         await this.dispatcher.send(`**[${timeStr} check-in]**\n\n${cleanResponse}`);
         logToDailyNote(`**${timeStr}**: ${cleanResponse.slice(0, 100).replace(/\n/g, ' ')}`);
 
+        // Inject heartbeat output into owner's DM session so replies have context
+        if (DISCORD_OWNER_ID && DISCORD_OWNER_ID !== '0') {
+          this.gateway.injectContext(
+            `discord:user:${DISCORD_OWNER_ID}`,
+            `[Heartbeat check-in at ${timeStr}]`,
+            cleanResponse,
+          );
+        }
+
         // Update dedup ledger
         if (newTopics.length > 0) {
           this.lastState.reportedTopics = [
@@ -623,6 +633,14 @@ export class HeartbeatScheduler {
           if (agentResponse && !HeartbeatScheduler.shouldSuppressMessage(agentResponse)) {
             const cleanAgentResponse = HeartbeatScheduler.stripTopicTags(agentResponse);
             await this.dispatcher.send(`**[${agent.name} check-in]**\n\n${cleanAgentResponse}`, { agentSlug: agent.slug });
+            // Inject agent heartbeat into owner's DM session so replies have context
+            if (DISCORD_OWNER_ID && DISCORD_OWNER_ID !== '0') {
+              this.gateway.injectContext(
+                `discord:user:${DISCORD_OWNER_ID}`,
+                `[${agent.name} check-in]`,
+                cleanAgentResponse,
+              );
+            }
           }
         } catch (err) {
           logger.warn({ err, agent: agent.slug }, 'Agent heartbeat failed');
