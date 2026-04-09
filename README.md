@@ -50,6 +50,7 @@ Clementine is three layers stacked on a shared memory store:
               │              Memory Store                    │
               │  SQLite FTS5 · Salience Scoring · Decay     │
               │  Episodic Memory · Wikilink Graph            │
+              │  FalkorDB Knowledge Graph · Procedural Skills│
               │  Obsidian Vault (source of truth)            │
               └─────────────────────────────────────────────┘
 ```
@@ -149,8 +150,13 @@ src/                               ← Package code (wherever npm installed it)
 │   ├── store.ts                   ← SQLite FTS5 memory store
 │   ├── search.ts                  ← Temporal decay, dedup, formatting
 │   └── chunker.ts                 ← Vault file parser (## headers, frontmatter)
-├── tools/
-│   └── mcp-server.ts             ← 27-tool MCP stdio server
+├── tools/                         ← MCP stdio server (30+ tools, decomposed by domain)
+│   ├── mcp-server.ts             ← Server entry + registration
+│   ├── goal-tools.ts             ← Goal lifecycle tools
+│   ├── vault-tools.ts            ← Vault read/write/search tools
+│   ├── team-tools.ts             ← Team agent tools
+│   ├── session-tools.ts          ← Session management tools
+│   └── admin-tools.ts            ← System admin tools
 ├── cli/
 │   ├── index.ts                   ← CLI commands (launch, stop, status, config, doctor)
 │   ├── setup.ts                   ← Interactive configuration wizard
@@ -219,6 +225,8 @@ User message
 - **Salience scoring** — Chunks gain score on retrieval, decay over time (30-day half-life)
 - **Episodic memory** — Session summaries indexed as searchable chunks
 - **Wikilink graph** — `[[wikilinks]]` parsed and queryable for connection discovery
+- **Knowledge graph** — FalkorDB-powered typed relationships and multi-hop traversal (people → projects → topics). Visualized on a dark canvas in the dashboard with type legend and edge labels.
+- **Procedural skills** — Reusable how-to recipes auto-extracted from successful task executions. Stored as Markdown in `vault/00-System/skills/` and injected into cron jobs and unleashed tasks at runtime. Teach new skills manually via the dashboard Skills tab or let Clementine learn them from conversations.
 - **Temporal decay** — Applied on every startup; stale memories naturally sink
 - **Pruning** — Episodic chunks >90 days with salience <0.01 are removed; old transcripts and access logs trimmed
 
@@ -276,11 +284,14 @@ clementine launch -f           Start in foreground (debug mode)
 clementine launch --install    Install as macOS login service (survives reboots)
 clementine stop                Stop the daemon
 clementine restart             Stop + relaunch
+clementine rebuild             Build + restart daemon + dashboard in one step
 clementine status              Show PID, uptime, active channels
 clementine update              Pull latest, rebuild, reinstall (preserves config)
 clementine update --dry-run    Preview update without making changes
 clementine doctor              Verify configuration and vault health
+clementine doctor --fix        Auto-fix common issues (redis, sqlite, FalkorDB)
 clementine dashboard           Open the local web command center (localhost:3030)
+clementine tools               List available MCP tools, plugins, and channels
 clementine config setup        Interactive configuration wizard
 clementine config set KEY VAL  Set a single config value
 clementine config get KEY      Read a config value
@@ -323,7 +334,10 @@ Run `clementine dashboard` to open a local web command center at `http://localho
 - **Hiring Interview** — Click "Hire a New Employee" and Clementine interviews you to build the agent config conversationally
 - **Manual Agent Setup** — Form modal with project dropdown (auto-populated from discovered projects) and categorized tool browser with checkboxes
 - **Auto-restart** — Daemon restarts automatically when the agent roster changes (from either the interview or manual path)
+- **Training Center** — Click any agent to open a 4-tab detail view: Schedule (per-agent cron jobs), Skills (per-agent procedural memory), Execution Traces (tool call history with timing), and Prompt Lab (test prompts against the agent)
+- **Skills** — Teach, view, and delete procedural skills. Skills are auto-extracted from successful tasks or taught manually via the dashboard.
 - **Self-Improvement** — View experiment history, approve/deny pending proposals, monitor baseline metrics
+- **Settings** — API key management, model config, custom env vars, service status
 
 No extra dependencies — the dashboard uses Express, which is already installed.
 
@@ -550,6 +564,16 @@ Phase 1 (75 turns) ──▶ Checkpoint ──▶ Phase 2 (75 turns) ──▶ C
 | **Cancellation** | Checked between every phase |
 | **Error recovery** | Failed phases reset the session and re-inject the original task |
 
+### Smart auto-escalation
+
+When you ask Clementine something complex in chat, she automatically assesses the scope:
+
+1. **Quick tasks** — handled inline within the normal chat turn budget
+2. **Complex tasks** — auto-escalated to deep mode (100 turns) with progress check-ins every 2 minutes
+3. **Multi-hour tasks** — escalated to unleashed mode with phased execution and checkpointing
+
+You can also trigger deep mode explicitly with `!deep <task>` in Discord or by prefixing any message with "deep:".
+
 ### Triggering unleashed tasks
 
 | Method | How |
@@ -559,6 +583,7 @@ Phase 1 (75 turns) ──▶ Checkpoint ──▶ Phase 2 (75 turns) ──▶ C
 | **CLI** | `clementine cron run <task>` — runs in foreground (for manual runs) |
 | **Cron schedule** | Set `mode: unleashed` in CRON.md — fires on schedule automatically |
 | **Chat** | Ask Clementine to create an unleashed task — she'll use the `add_cron_job` tool |
+| **Auto-escalation** | Chat automatically escalates to deep/unleashed when max turns are hit |
 
 ### Monitoring
 
@@ -669,10 +694,10 @@ Key system files:
 
 ## Requirements
 
-- **Node.js 20+** (for `--import` loader and `cpSync`)
-- **macOS** (Keychain integration, LaunchAgent, iMessage — works on Linux without these)
-- **Claude Code CLI** installed and authenticated (`npm install -g @anthropic-ai/claude-code`)
-- **Anthropic API key** (set in `.env` or Keychain)
+- **Node.js 20-24 LTS** (for `--import` loader and `cpSync`)
+- **macOS** (Keychain integration, LaunchAgent — works on Linux without these)
+- **Claude Code CLI** installed and authenticated (`npm install -g @anthropic-ai/claude-code && claude login`)
+- No API key needed — authentication is handled by the Claude Code CLI
 
 ---
 
