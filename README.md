@@ -70,10 +70,14 @@ The result: Clementine gets better the more you talk to it.
 ## Quick start
 
 ```bash
-git clone https://github.com/Natebreynolds/Clementine-AI-Assistant.git clementine && cd clementine && npm install --loglevel=error --no-audit && npm run build && npm install -g . --loglevel=error --no-audit && clementine config setup
+git clone https://github.com/Natebreynolds/Clementine-AI-Assistant.git clementine
+cd clementine
+bash install.sh
 ```
 
-The setup wizard checks prerequisites, then walks you through identity, model, channels, and features. After setup:
+The install script handles everything: system dependencies (redis, libomp, build tools), npm packages, TypeScript build, global CLI install, and launches the setup wizard. Safe to re-run — skips anything already installed.
+
+After setup:
 
 ```bash
 clementine launch         # start as background daemon
