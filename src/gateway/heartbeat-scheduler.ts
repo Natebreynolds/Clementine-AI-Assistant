@@ -45,7 +45,7 @@ import {
 } from '../agent/insight-engine.js';
 import type { NotificationDispatcher } from './notifications.js';
 import type { Gateway } from './router.js';
-import { logToDailyNote, todayISO } from './cron-scheduler.js';
+import { CronRunLog, logToDailyNote, todayISO } from './cron-scheduler.js';
 
 const logger = pino({ name: 'clementine.heartbeat' });
 
@@ -62,6 +62,7 @@ export class HeartbeatScheduler {
   private lastConsolidationDate = '';
   private lastAgentSiRuns = new Map<string, string>();
   private cronScheduler: CronScheduler | null = null;
+  private runLog = new CronRunLog();
 
   /** Wire up the cron scheduler so daily plan suggestions can be applied. */
   setCronScheduler(cs: CronScheduler): void { this.cronScheduler = cs; }
@@ -169,7 +170,7 @@ export class HeartbeatScheduler {
           this.dispatcher.send(
             `**Self-Improvement Report (nightly)**\n${summary}`,
             {},
-          ).catch(() => {});
+          ).catch(err => logger.debug({ err }, 'Failed to send self-improvement report'));
         }
       }).catch(err => {
         logger.error({ err }, 'Nightly self-improvement failed');
@@ -266,7 +267,7 @@ export class HeartbeatScheduler {
               `**Weekly Review**\n\n${review.summary}\n\n` +
               (review.accomplishments.length > 0 ? `**Done:** ${review.accomplishments.join('; ')}\n` : '') +
               (review.recommendations.length > 0 ? `**Next week:** ${review.recommendations.join('; ')}` : ''),
-            ).catch(() => {});
+            ).catch(err => logger.debug({ err }, 'Failed to send weekly review'));
           }
         }
       }).catch(err => {
@@ -287,7 +288,7 @@ export class HeartbeatScheduler {
               (assessment.proposedGoals.length > 0
                 ? `**Proposed goals:** ${assessment.proposedGoals.map(g => g.title).join(', ')}`
                 : ''),
-            ).catch(() => {});
+            ).catch(err => logger.debug({ err }, 'Failed to send monthly assessment'));
           }
         }
       }).catch(err => {
@@ -540,6 +541,17 @@ export class HeartbeatScheduler {
 
         await this.dispatcher.send(`**[${timeStr} check-in]**\n\n${cleanResponse}`);
         logToDailyNote(`**${timeStr}**: ${cleanResponse.slice(0, 100).replace(/\n/g, ' ')}`);
+
+        // Log to run history so heartbeats are visible via !cron runs __heartbeat__
+        this.runLog.append({
+          jobName: '__heartbeat__',
+          startedAt: now.toISOString(),
+          finishedAt: new Date().toISOString(),
+          status: 'ok',
+          durationMs: Date.now() - now.getTime(),
+          attempt: 1,
+          outputPreview: cleanResponse.slice(0, 200),
+        });
 
         // Inject heartbeat output into owner's DM session so replies have context
         if (DISCORD_OWNER_ID && DISCORD_OWNER_ID !== '0') {

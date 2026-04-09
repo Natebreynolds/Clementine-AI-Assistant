@@ -201,7 +201,7 @@ function mcpTool(name: string): string {
 
 // Lazy-load MCP bridge (sync after first import)
 let _mcpBridge: typeof import('./mcp-bridge.js') | null = null;
-import('./mcp-bridge.js').then(m => { _mcpBridge = m; }).catch(() => {});
+import('./mcp-bridge.js').then(m => { _mcpBridge = m; }).catch(err => logger.debug({ err }, 'MCP bridge lazy-load failed'));
 
 /** Resolve model alias ("haiku", "sonnet", "opus") to full model ID. */
 function resolveModel(model: string | null | undefined): string | null {
@@ -1588,7 +1588,7 @@ You have a limited number of turns per message (~15). **After 8-10 tool calls, y
       const elapsed = Date.now() - this.sessionTimestamps.get(key)!.getTime();
       if (elapsed > SESSION_EXPIRY_MS) {
         // Fire-and-forget: memory extraction is a write-only side effect
-        this.preRotationFlush(key).catch(() => {});
+        this.preRotationFlush(key).catch(err => logger.debug({ err, key }, 'Pre-rotation flush failed'));
         this.sessions.delete(key);
         this.exchangeCounts.set(key, 0);
           sessionRotated = true;
@@ -1598,7 +1598,7 @@ You have a limited number of turns per message (~15). **After 8-10 tool calls, y
     // Auto-rotate on exchange limit
     if (key && (this.exchangeCounts.get(key) ?? 0) >= MAX_SESSION_EXCHANGES) {
       // Fire-and-forget: memory extraction is a write-only side effect
-      this.preRotationFlush(key).catch(() => {});
+      this.preRotationFlush(key).catch(err => logger.debug({ err, key }, 'Pre-rotation flush failed'));
       // Auto-save handoff so the resumed session has context
       this.saveAutoHandoff(key);
       this.sessions.delete(key);
@@ -1625,7 +1625,7 @@ You have a limited number of turns per message (~15). **After 8-10 tool calls, y
           `${contextParts.join('\n\n')}]\n\n${text}`;
       }
       // Fire background LLM summary for storage/future retrieval
-      this.summarizeSessionAsync(key).catch(() => {});
+      this.summarizeSessionAsync(key).catch(err => logger.debug({ err, key }, 'Session summarization failed'));
     }
 
     // Resilience: inject exchange history if no session_id stored
@@ -1795,7 +1795,7 @@ You have a limited number of turns per message (~15). **After 8-10 tool calls, y
       !responseText.startsWith('Error:') &&
       this.worthExtracting(text, responseText)
     ) {
-      this.spawnMemoryExtraction(text, responseText, key, profile).catch(() => {});
+      this.spawnMemoryExtraction(text, responseText, key, profile).catch(err => logger.debug({ err }, 'Memory extraction failed'));
     }
 
     return [responseText, sessionId];
@@ -3479,7 +3479,7 @@ You have a limited number of turns per message (~15). **After 8-10 tool calls, y
         }
         // Fire-and-forget: extract procedural skill from successful execution
         this.extractSkillFromExecution('unleashed', jobName, jobPrompt, lastOutput, Date.now() - new Date(startedAt).getTime())
-          .catch(() => {});
+          .catch(err => logger.debug({ err, jobName }, 'Skill extraction from unleashed task failed'));
         return lastOutput;
       }
     }

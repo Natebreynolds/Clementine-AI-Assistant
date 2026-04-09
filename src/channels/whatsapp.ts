@@ -193,6 +193,12 @@ export async function startWhatsApp(
       }
     } catch (err) {
       logger.error({ err }, 'Error processing WhatsApp message');
+      // Don't leave the user in silence — send an error message back
+      try {
+        await sendWhatsApp(fromNumber, 'Something went wrong — try again in a moment.');
+      } catch (sendErr) {
+        logger.error({ err: sendErr }, 'Failed to send WhatsApp error notification');
+      }
     }
   });
 

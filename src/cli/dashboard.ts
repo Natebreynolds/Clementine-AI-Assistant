@@ -4458,6 +4458,142 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
     }
   });
 
+  // ── Discord setup flow ──────────────────────────────────────────────
+
+  /** Test a Discord bot token by calling GET /users/@me. */
+  app.post('/api/setup/discord/test', async (req, res) => {
+    try {
+      const { token } = req.body as { token?: string };
+      if (!token || token.length < 50) {
+        res.json({ ok: false, error: 'Token looks too short — check that you copied the full bot token.' });
+        return;
+      }
+      const meRes = await fetch('https://discord.com/api/v10/users/@me', {
+        headers: { Authorization: `Bot ${token}` },
+      });
+      if (!meRes.ok) {
+        const body = await meRes.text().catch(() => '');
+        res.json({ ok: false, error: `Discord returned ${meRes.status}. ${body.includes('401') ? 'Token is invalid — try resetting it in the developer portal.' : body.slice(0, 200)}` });
+        return;
+      }
+      const me = await meRes.json() as { id: string; username: string; discriminator?: string; bot?: boolean };
+      if (!me.bot) {
+        res.json({ ok: false, error: 'This looks like a user token, not a bot token. Go to your Discord app > Bot > Reset Token.' });
+        return;
+      }
+      res.json({ ok: true, botId: me.id, botUsername: me.username, botDiscriminator: me.discriminator ?? '0' });
+    } catch (err) {
+      res.json({ ok: false, error: String(err) });
+    }
+  });
+
+  /** Save Discord credentials and optionally trigger a restart. */
+  app.post('/api/setup/discord/save', (req, res) => {
+    try {
+      const { token, ownerId, restart } = req.body as { token?: string; ownerId?: string; restart?: boolean };
+      if (!token || token.length < 50) {
+        res.json({ ok: false, error: 'Bot token is required.' });
+        return;
+      }
+      if (!ownerId || !/^\d{17,20}$/.test(ownerId)) {
+        res.json({ ok: false, error: 'Owner user ID must be a 17-20 digit number. Right-click your name in Discord > Copy User ID.' });
+        return;
+      }
+      writeEnvValue('DISCORD_TOKEN', token);
+      writeEnvValue('DISCORD_OWNER_ID', ownerId);
+      writeEnvValue('CHANNEL_DISCORD', 'true');
+      res.json({ ok: true, message: 'Discord credentials saved.' + (restart ? ' Restarting...' : '') });
+      if (restart) {
+        setTimeout(() => {
+          try {
+            const pid = readPid();
+            if (pid && isProcessAlive(pid)) {
+              process.kill(pid, 'SIGHUP'); // graceful restart
+            }
+          } catch { /* ignore */ }
+        }, 500);
+      }
+    } catch (err) {
+      res.json({ ok: false, error: String(err) });
+    }
+  });
+
+  /** Generate a Discord OAuth2 invite URL with required permissions. */
+  app.get('/api/setup/discord/invite-url', (req, res) => {
+    try {
+      const { clientId } = req.query as { clientId?: string };
+      if (!clientId || !/^\d{17,20}$/.test(clientId)) {
+        res.json({ ok: false, error: 'Client ID is required. Find it in the Discord Developer Portal > Application > General.' });
+        return;
+      }
+      // Permissions: Send Messages, Read Messages/View Channels, Add Reactions, Use Slash Commands, Embed Links, Attach Files, Read Message History
+      const permissions = 277025770560;
+      const url = `https://discord.com/api/oauth2/authorize?client_id=${clientId}&permissions=${permissions}&scope=bot%20applications.commands`;
+      res.json({ ok: true, url });
+    } catch (err) {
+      res.json({ ok: false, error: String(err) });
+    }
+  });
+
+  /** Live channel connection status. */
+  app.get('/api/channels/status', (_req, res) => {
+    try {
+      const env = parseEnvFile();
+      const channels: Array<{ name: string; configured: boolean; connected: boolean; error?: string; details?: Record<string, unknown> }> = [];
+
+      // Discord
+      const discordConfigured = !!(env['DISCORD_TOKEN'] && env['DISCORD_OWNER_ID']);
+      let discordConnected = false;
+      try {
+        const statusFile = path.join(BASE_DIR, '.bot-status.json');
+        if (existsSync(statusFile)) {
+          const statuses = JSON.parse(readFileSync(statusFile, 'utf-8'));
+          // Primary bot uses __main__ key or check if Clementine is online
+          discordConnected = Object.values(statuses).some((s: any) => s.status === 'online');
+        }
+      } catch { /* ignore */ }
+      // Also check if the daemon is alive with discord channel active
+      const status = getStatus();
+      const activeChannels = (status.channels as string[]) || [];
+      if (activeChannels.includes('Discord')) discordConnected = true;
+
+      channels.push({
+        name: 'Discord',
+        configured: discordConfigured,
+        connected: discordConnected,
+        ...(!discordConfigured ? { error: 'Not configured — add your bot token and owner ID' } : {}),
+      });
+
+      // Slack
+      const slackConfigured = !!(env['SLACK_BOT_TOKEN'] && env['SLACK_APP_TOKEN']);
+      channels.push({
+        name: 'Slack',
+        configured: slackConfigured,
+        connected: activeChannels.includes('Slack'),
+      });
+
+      // Telegram
+      const telegramConfigured = !!env['TELEGRAM_BOT_TOKEN'];
+      channels.push({
+        name: 'Telegram',
+        configured: telegramConfigured,
+        connected: activeChannels.includes('Telegram'),
+      });
+
+      // WhatsApp
+      const whatsappConfigured = !!env['TWILIO_ACCOUNT_SID'];
+      channels.push({
+        name: 'WhatsApp',
+        configured: whatsappConfigured,
+        connected: activeChannels.some(c => c.startsWith('WhatsApp')),
+      });
+
+      res.json({ ok: true, channels });
+    } catch (err) {
+      res.json({ ok: false, error: String(err), channels: [] });
+    }
+  });
+
   // ── Slack channel discovery ────────────────────────────────────────
 
   /** Fetch all channels the main Slack bot can see, via conversations.list. */
@@ -6636,6 +6772,143 @@ function getDashboardHTML(token: string): string {
     letter-spacing: 0.05em;
     margin-top: 2px;
   }
+
+  /* ── Channel Status Dots ──────────────── */
+  .channel-dots {
+    display: inline-flex;
+    gap: 6px;
+    margin-left: 8px;
+  }
+  .ch-dot {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 20px;
+    height: 20px;
+    border-radius: 50%;
+    font-size: 10px;
+    font-weight: 700;
+    cursor: default;
+  }
+  .ch-dot.ch-connected {
+    background: rgba(52,199,89,0.15);
+    color: var(--green);
+    border: 1px solid rgba(52,199,89,0.3);
+  }
+  .ch-dot.ch-configured {
+    background: rgba(255,159,10,0.12);
+    color: #ff9f0a;
+    border: 1px solid rgba(255,159,10,0.3);
+  }
+  .ch-dot.ch-off {
+    background: rgba(125,133,144,0.08);
+    color: var(--text-muted);
+    border: 1px solid var(--border);
+    opacity: 0.5;
+  }
+
+  /* ── Discord Setup Banner ────────────── */
+  .discord-setup-banner {
+    margin-top: 16px;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    overflow: hidden;
+  }
+  .setup-banner-header {
+    padding: 12px 16px;
+    font-weight: 600;
+    font-size: 14px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    border-bottom: 1px solid var(--border);
+    background: rgba(88,86,214,0.06);
+  }
+  .setup-icon { font-size: 18px; }
+  .setup-banner-body {
+    padding: 16px;
+  }
+  .setup-steps {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+  }
+  .setup-step {
+    display: flex;
+    gap: 12px;
+    align-items: flex-start;
+  }
+  .step-num {
+    width: 24px;
+    height: 24px;
+    border-radius: 50%;
+    background: var(--accent);
+    color: white;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 12px;
+    font-weight: 700;
+    flex-shrink: 0;
+    margin-top: 2px;
+  }
+  .step-content {
+    flex: 1;
+  }
+  .step-title {
+    font-weight: 600;
+    font-size: 13px;
+    margin-bottom: 4px;
+  }
+  .step-desc {
+    font-size: 12px;
+    color: var(--text-dim);
+    margin-bottom: 8px;
+    line-height: 1.4;
+  }
+  .step-desc a {
+    color: var(--accent);
+    text-decoration: none;
+  }
+  .step-desc a:hover { text-decoration: underline; }
+  .setup-input {
+    display: block;
+    width: 100%;
+    max-width: 400px;
+    padding: 6px 10px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    font-size: 13px;
+    margin-bottom: 8px;
+    font-family: inherit;
+  }
+  .setup-input:focus {
+    outline: none;
+    border-color: var(--accent);
+  }
+  .setup-result {
+    font-size: 12px;
+    margin-left: 8px;
+  }
+  .setup-actions {
+    margin-top: 20px;
+    padding-top: 16px;
+    border-top: 1px solid var(--border);
+  }
+  .btn-primary {
+    background: var(--accent);
+    color: white;
+    border: none;
+    padding: 8px 20px;
+    border-radius: var(--radius);
+    font-weight: 600;
+    cursor: pointer;
+  }
+  .btn-primary:hover { opacity: 0.9; }
+  .btn-primary:disabled { opacity: 0.4; cursor: not-allowed; }
 
   /* ── Desk Stats Strip ─────────────────── */
   .desk-stats-strip {
@@ -12684,6 +12957,91 @@ function copyToClipboard(text) {
 }
 
 // ── Refresh orchestrator ──────────────────
+// ── Channel status + Discord setup ──────────────
+window._channelStatus = [];
+var _discordTestBotId = null;
+
+async function refreshChannelStatus() {
+  try {
+    var r = await apiFetch('/api/channels/status');
+    var d = await r.json();
+    if (d.ok) window._channelStatus = d.channels || [];
+  } catch(e) { /* ignore */ }
+}
+
+async function testDiscordToken() {
+  var token = document.getElementById('discord-setup-token').value.trim();
+  var resultEl = document.getElementById('discord-test-result');
+  if (!token) { resultEl.textContent = 'Paste your token first'; resultEl.style.color = 'var(--red)'; return; }
+  resultEl.textContent = 'Testing...'; resultEl.style.color = 'var(--text-dim)';
+  try {
+    var r = await apiFetch('/api/setup/discord/test', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token: token }),
+    });
+    var d = await r.json();
+    if (d.ok) {
+      resultEl.textContent = 'Connected as ' + d.botUsername;
+      resultEl.style.color = 'var(--green)';
+      _discordTestBotId = d.botId;
+      document.getElementById('discord-invite-btn').disabled = false;
+      document.getElementById('discord-save-btn').disabled = false;
+    } else {
+      resultEl.textContent = d.error || 'Token test failed';
+      resultEl.style.color = 'var(--red)';
+      _discordTestBotId = null;
+    }
+  } catch(e) {
+    resultEl.textContent = String(e);
+    resultEl.style.color = 'var(--red)';
+  }
+}
+
+async function generateInviteUrl() {
+  var resultEl = document.getElementById('discord-invite-result');
+  if (!_discordTestBotId) { resultEl.textContent = 'Test the token first'; return; }
+  try {
+    var r = await apiFetch('/api/setup/discord/invite-url?clientId=' + _discordTestBotId);
+    var d = await r.json();
+    if (d.ok) {
+      resultEl.innerHTML = '<a href="' + d.url + '" target="_blank">Click to invite bot to your server</a>';
+      resultEl.style.color = 'var(--green)';
+    } else {
+      resultEl.textContent = d.error;
+      resultEl.style.color = 'var(--red)';
+    }
+  } catch(e) {
+    resultEl.textContent = String(e);
+    resultEl.style.color = 'var(--red)';
+  }
+}
+
+async function saveDiscordSetup() {
+  var token = document.getElementById('discord-setup-token').value.trim();
+  var ownerId = document.getElementById('discord-setup-owner').value.trim();
+  if (!token) { toast('Paste your bot token', 'error'); return; }
+  if (!ownerId || !/^\d{17,20}$/.test(ownerId)) { toast('Enter a valid Discord user ID (17-20 digits)', 'error'); return; }
+  try {
+    var r = await apiFetch('/api/setup/discord/save', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token: token, ownerId: ownerId, restart: true }),
+    });
+    var d = await r.json();
+    if (d.ok) {
+      toast('Discord connected! Restarting daemon...', 'success');
+      // Hide the setup banner
+      var banner = document.getElementById('discord-setup-banner');
+      if (banner) banner.style.display = 'none';
+      // Refresh after restart
+      setTimeout(function() { refreshChannelStatus(); refreshAll(); }, 3000);
+    } else {
+      toast(d.error || 'Save failed', 'error');
+    }
+  } catch(e) { toast(String(e), 'error'); }
+}
+
 function refreshAll() {
   refreshStatus();
   refreshActivity();
@@ -12731,6 +13089,8 @@ function fmtTimeAgo(iso) {
 
 async function refreshTeam() {
   try {
+    // Fetch channel status in parallel with office data
+    await refreshChannelStatus();
     var officeRes = await apiFetch('/api/office');
     var data = await officeRes.json();
     var clem = data.clementine || {};
@@ -12759,13 +13119,30 @@ async function refreshTeam() {
         ? '<span>' + clem.currentActivity + '</span>' : '';
       var clemTokenTotal = (clem.tokens ? clem.tokens.input + clem.tokens.output : 0);
 
+      // Build channel status indicators
+      var channelDots = '';
+      if (window._channelStatus && window._channelStatus.length > 0) {
+        channelDots = '<div class="channel-dots">';
+        window._channelStatus.forEach(function(ch) {
+          var dotClass = ch.connected ? 'ch-connected' : (ch.configured ? 'ch-configured' : 'ch-off');
+          channelDots += '<span class="ch-dot ' + dotClass + '" title="' + ch.name + ': ' +
+            (ch.connected ? 'Connected' : ch.configured ? 'Configured but not connected' : 'Not configured') + '">' +
+            ch.name[0] + '</span>';
+        });
+        channelDots += '</div>';
+      }
+
+      // Check if Discord needs setup
+      var discordStatus = (window._channelStatus || []).find(function(ch) { return ch.name === 'Discord'; });
+      var needsDiscordSetup = !discordStatus || !discordStatus.configured;
+
       heroEl.innerHTML =
         '<div class="office-hero">' +
           '<div class="office-hero-left">' +
             '<div class="office-hero-avatar' + (isOnline ? ' online' : '') + '">C</div>' +
             '<div class="office-hero-info">' +
               '<div class="office-hero-name">' + (clem.name || 'Clementine') + '</div>' +
-              '<div class="office-hero-meta">' + statusPill + uptimeStr + activityStr + '</div>' +
+              '<div class="office-hero-meta">' + statusPill + channelDots + uptimeStr + activityStr + '</div>' +
             '</div>' +
           '</div>' +
           '<div class="office-hero-stats">' +
@@ -12774,7 +13151,53 @@ async function refreshTeam() {
             '<div class="office-hero-stat"><div class="stat-val">' + fmtTokens(clemTokenTotal) + '</div><div class="stat-lbl">Tokens</div></div>' +
             '<div class="office-hero-stat"><div class="stat-val">' + (clem.crons ? clem.crons.total : 0) + '</div><div class="stat-lbl">Cron Jobs</div></div>' +
           '</div>' +
-        '</div>';
+        '</div>' +
+        (needsDiscordSetup ?
+          '<div class="discord-setup-banner" id="discord-setup-banner">' +
+            '<div class="setup-banner-header">' +
+              '<span class="setup-icon">🔗</span> Connect Discord to start chatting' +
+            '</div>' +
+            '<div class="setup-banner-body" id="discord-setup-body">' +
+              '<div class="setup-steps">' +
+                '<div class="setup-step">' +
+                  '<div class="step-num">1</div>' +
+                  '<div class="step-content">' +
+                    '<div class="step-title">Create a Discord App</div>' +
+                    '<div class="step-desc">Go to <a href="https://discord.com/developers/applications" target="_blank">discord.com/developers</a> &rarr; New Application &rarr; Bot &rarr; Reset Token &rarr; copy it</div>' +
+                  '</div>' +
+                '</div>' +
+                '<div class="setup-step">' +
+                  '<div class="step-num">2</div>' +
+                  '<div class="step-content">' +
+                    '<div class="step-title">Paste your bot token</div>' +
+                    '<input type="password" id="discord-setup-token" class="setup-input" placeholder="Bot token" />' +
+                    '<button class="btn btn-sm" onclick="testDiscordToken()">Test Connection</button>' +
+                    '<span id="discord-test-result" class="setup-result"></span>' +
+                  '</div>' +
+                '</div>' +
+                '<div class="setup-step">' +
+                  '<div class="step-num">3</div>' +
+                  '<div class="step-content">' +
+                    '<div class="step-title">Your Discord user ID</div>' +
+                    '<div class="step-desc">Enable Developer Mode (Settings &rarr; Advanced), then right-click your name &rarr; Copy User ID</div>' +
+                    '<input type="text" id="discord-setup-owner" class="setup-input" placeholder="e.g. 123456789012345678" />' +
+                  '</div>' +
+                '</div>' +
+                '<div class="setup-step">' +
+                  '<div class="step-num">4</div>' +
+                  '<div class="step-content">' +
+                    '<div class="step-title">Invite bot to your server</div>' +
+                    '<button class="btn btn-sm" id="discord-invite-btn" onclick="generateInviteUrl()" disabled>Generate Invite Link</button>' +
+                    '<span id="discord-invite-result" class="setup-result"></span>' +
+                  '</div>' +
+                '</div>' +
+              '</div>' +
+              '<div class="setup-actions">' +
+                '<button class="btn btn-primary" id="discord-save-btn" onclick="saveDiscordSetup()" disabled>Save &amp; Connect</button>' +
+              '</div>' +
+            '</div>' +
+          '</div>'
+        : '');
     }
 
     // ── Agent desk cards ──

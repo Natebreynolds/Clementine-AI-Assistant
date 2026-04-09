@@ -642,6 +642,7 @@ async function asyncMain(): Promise<void> {
   // Notification dispatcher
   const { NotificationDispatcher } = await import('./gateway/notifications.js');
   const dispatcher = new NotificationDispatcher();
+  gateway.setDispatcher(dispatcher);
 
   // Heartbeat + Cron schedulers
   const { HeartbeatScheduler, CronScheduler } = await import('./gateway/heartbeat.js');
@@ -830,6 +831,11 @@ async function asyncMain(): Promise<void> {
 
   // ── Initialize all channels ─────────────────────────────────────
   await Promise.all(channelTasks);
+
+  // Warn if no notification channels registered — cron/heartbeat output will be lost
+  if (!dispatcher.hasChannels) {
+    logger.warn('⚠ No notification channels connected — cron and heartbeat output will not be delivered. Configure at least one channel (Discord, Slack, Telegram) to receive notifications.');
+  }
 
   // ── Deliver restart sentinel notification ──────────────────────
   if (sentinel) {

@@ -17,6 +17,7 @@ import { AgentManager } from '../agent/agent-manager.js';
 import { TeamRouter } from '../agent/team-router.js';
 import { TeamBus } from '../agent/team-bus.js';
 import { events } from '../events/bus.js';
+import type { NotificationDispatcher } from './notifications.js';
 
 const logger = pino({ name: 'clementine.gateway' });
 
@@ -123,6 +124,12 @@ export class Gateway {
     }
     return false;
   }
+
+  // Notification dispatcher — set via setDispatcher() after startup
+  private _dispatcher?: NotificationDispatcher;
+
+  /** Register the notification dispatcher so deep mode / auto-escalation results can be pushed to channels. */
+  setDispatcher(d: NotificationDispatcher): void { this._dispatcher = d; }
 
   // Team system (lazy-initialized)
   private _agentManager?: AgentManager;
@@ -761,10 +768,16 @@ export class Gateway {
               logger.info({ sessionKey, jobName, resultLen: result?.length ?? 0 }, 'Deep mode task completed');
               if (result && result !== '__NOTHING__') {
                 this.assistant.injectPendingContext(sessionKey, text, result);
+                // Push result to channels so the user sees it without having to message again
+                this._dispatcher?.send(`**[Deep mode complete]** ${taskDesc}\n\n${result.slice(0, 1500)}`)
+                  .catch(err => logger.debug({ err }, 'Failed to push deep mode result to channels'));
               }
             }).catch((err) => {
               logger.error({ err, sessionKey, jobName }, 'Deep mode task failed');
-              this.assistant.injectPendingContext(sessionKey, text, `Background work failed: ${String(err).slice(0, 200)}`);
+              const failMsg = `Background work failed: ${String(err).slice(0, 200)}`;
+              this.assistant.injectPendingContext(sessionKey, text, failMsg);
+              this._dispatcher?.send(`**[Deep mode failed]** ${taskDesc}: ${String(err).slice(0, 200)}`)
+                .catch(e => logger.debug({ err: e }, 'Failed to push deep mode failure to channels'));
             }).finally(() => {
               const s = this.sessions.get(sessionKey);
               if (s?.deepTask?.jobName === jobName) delete s.deepTask;
@@ -794,14 +807,17 @@ export class Gateway {
               1,
             ).then((result) => {
               logger.info({ sessionKey, jobName, resultLen: result?.length ?? 0 }, 'Auto-escalated deep mode completed');
-              // Store result as pending context so the agent naturally references it
               if (result && result !== '__NOTHING__') {
                 this.assistant.injectPendingContext(sessionKey, text, result);
+                this._dispatcher?.send(`**[Background work complete]** ${text.slice(0, 100)}\n\n${result.slice(0, 1500)}`)
+                  .catch(err => logger.debug({ err }, 'Failed to push auto-escalation result to channels'));
               }
             }).catch((err) => {
               logger.error({ err, sessionKey, jobName }, 'Auto-escalated deep mode failed');
-              // Notify user of failure
-              this.assistant.injectPendingContext(sessionKey, text, `The background work on "${text.slice(0, 100)}" failed: ${String(err).slice(0, 200)}`);
+              const failMsg = `The background work on "${text.slice(0, 100)}" failed: ${String(err).slice(0, 200)}`;
+              this.assistant.injectPendingContext(sessionKey, text, failMsg);
+              this._dispatcher?.send(`**[Background work failed]** ${text.slice(0, 100)}: ${String(err).slice(0, 200)}`)
+                .catch(e => logger.debug({ err: e }, 'Failed to push auto-escalation failure to channels'));
             }).finally(() => {
               const s = this.sessions.get(sessionKey);
               if (s?.deepTask?.jobName === jobName) delete s.deepTask;
@@ -863,10 +879,15 @@ export class Gateway {
               logger.info({ sessionKey, jobName, resultLen: result?.length ?? 0 }, 'Max-turns deep mode completed');
               if (result && result !== '__NOTHING__') {
                 this.assistant.injectPendingContext(sessionKey, text, result);
+                this._dispatcher?.send(`**[Background work complete]** ${text.slice(0, 100)}\n\n${result.slice(0, 1500)}`)
+                  .catch(err => logger.debug({ err }, 'Failed to push max-turns result to channels'));
               }
             }).catch((deepErr) => {
               logger.error({ err: deepErr, sessionKey, jobName }, 'Max-turns deep mode failed');
-              this.assistant.injectPendingContext(sessionKey, text, `Background work failed: ${String(deepErr).slice(0, 200)}`);
+              const failMsg = `Background work failed: ${String(deepErr).slice(0, 200)}`;
+              this.assistant.injectPendingContext(sessionKey, text, failMsg);
+              this._dispatcher?.send(`**[Background work failed]** ${text.slice(0, 100)}: ${String(deepErr).slice(0, 200)}`)
+                .catch(e => logger.debug({ err: e }, 'Failed to push max-turns failure to channels'));
             }).finally(() => {
               const s = this.sessions.get(sessionKey);
               if (s?.deepTask?.jobName === jobName) delete s.deepTask;

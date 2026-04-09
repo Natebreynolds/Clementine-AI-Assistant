@@ -446,7 +446,7 @@ export class CronScheduler {
           .replace(/^TASK_COMPLETE:\s*/i, '')
           .replace(/^STATUS SUMMARY:?\s*/im, '')
           .slice(0, 1500);
-        this.dispatcher.send(cleanResult, { agentSlug: slug }).catch(() => {});
+        this.dispatcher.send(cleanResult, { agentSlug: slug }).catch(err => logger.debug({ err }, 'Failed to send unleashed complete notification'));
       }
     });
 
@@ -457,7 +457,7 @@ export class CronScheduler {
       const cleanOutput = output
         .replace(/^STATUS SUMMARY:?\s*/im, '')
         .slice(0, 500);
-      this.dispatcher.send(`Still working on it — ${cleanOutput}`, { agentSlug: slug }).catch(() => {});
+      this.dispatcher.send(`Still working on it — ${cleanOutput}`, { agentSlug: slug }).catch(err => logger.debug({ err }, 'Failed to send phase progress notification'));
     });
 
     // Wire up real-time progress summaries (throttled to max 1 per 5 minutes)
@@ -468,7 +468,7 @@ export class CronScheduler {
       if (now - lastSent < 300_000) return; // throttle: 1 per 5 minutes
       lastProgressSent.set(jobName, now);
       const slug = jobName.includes(':') ? jobName.split(':')[0] : undefined;
-      this.dispatcher.send(summary.slice(0, 300), { agentSlug: slug }).catch(() => {});
+      this.dispatcher.send(summary.slice(0, 300), { agentSlug: slug }).catch(err => logger.debug({ err }, 'Failed to send phase progress summary'));
     });
 
     logger.info(`Cron scheduler started with ${this.jobs.length} jobs`);
@@ -911,7 +911,7 @@ export class CronScheduler {
             terminalReason,
           };
 
-          if (response && !CronScheduler.isCronNoise(response) && job.mode !== 'unleashed') {
+          if (response && !CronScheduler.isCronNoise(response)) {
             // Strip internal thinking/process narration from Discord output
             const cleanedResponse = CronScheduler.stripThinkingPrefixes(response);
             const result = await this.dispatcher.send(cleanedResponse, { agentSlug: job.agentSlug });
@@ -921,6 +921,8 @@ export class CronScheduler {
               // Preserve more output when delivery fails so it's recoverable
               entry.outputPreview = response.slice(0, 2000);
               logger.warn({ job: job.name, errors: result.channelErrors }, 'Cron output not delivered to any channel');
+              // Surface delivery failure in daily note so the user can discover it
+              logToDailyNote(`**[Delivery failed]** ${job.name} — output saved but couldn't reach any channel`);
             } else if (Object.keys(result.channelErrors).length > 0) {
               // Partial success — some channels failed. Log so broken channels are visible.
               entry.deliveryError = `partial: ${Object.entries(result.channelErrors).map(([ch, e]) => `${ch}: ${e}`).join('; ').slice(0, 300)}`;
@@ -941,7 +943,7 @@ export class CronScheduler {
           // Fire-and-forget: extract procedural skill from successful long-running cron jobs
           if (entry.status === 'ok' && entry.durationMs > 30_000 && response && response.length > 500) {
             this.gateway.extractCronSkill(job.name, job.prompt, response, entry.durationMs, job.agentSlug)
-              .catch(() => {});
+              .catch(err => logger.debug({ err, job: job.name }, 'Cron skill extraction failed'));
           }
 
           // Log to daily note so end-of-day summary has data to work with
@@ -1006,7 +1008,7 @@ export class CronScheduler {
 
       // Fire-and-forget: check if this agent's profile needs self-learning update
       if (job.agentSlug) {
-        this.checkAgentLearning(job.agentSlug, job.name).catch(() => {});
+        this.checkAgentLearning(job.agentSlug, job.name).catch(err => logger.debug({ err, job: job.name }, 'Agent learning check failed'));
       }
 
       // Close the feedback loop: append outcome to advisor decision log
@@ -1031,13 +1033,13 @@ export class CronScheduler {
       if (consErrors === 5) {
         // Circuit breaker just engaged — notify
         this.logAdvisorEvent('circuit-breaker', job.name, `Circuit breaker engaged after ${consErrors} consecutive errors`);
-        this.dispatcher.send(`⚡ **Circuit breaker engaged** for \`${job.name}\` — ${consErrors} consecutive errors. Will retry in 1 hour.`, { agentSlug: job.agentSlug }).catch(() => {});
+        this.dispatcher.send(`⚡ **Circuit breaker engaged** for \`${job.name}\` — ${consErrors} consecutive errors. Will retry in 1 hour.`, { agentSlug: job.agentSlug }).catch(err => logger.debug({ err }, 'Failed to send circuit breaker notification'));
       } else if (consErrors >= 5) {
         // Check if recovery probe just succeeded
         const lastRun = this.runLog.readRecent(job.name, 1)[0];
         if (lastRun?.status === 'ok') {
           this.logAdvisorEvent('circuit-recovery', job.name, `Circuit breaker recovered after ${consErrors} errors`);
-          this.dispatcher.send(`✅ **Circuit breaker recovered** — \`${job.name}\` succeeded after ${consErrors} prior errors.`, { agentSlug: job.agentSlug }).catch(() => {});
+          this.dispatcher.send(`✅ **Circuit breaker recovered** — \`${job.name}\` succeeded after ${consErrors} prior errors.`, { agentSlug: job.agentSlug }).catch(err => logger.debug({ err }, 'Failed to send circuit recovery notification'));
         }
       }
 
@@ -1453,7 +1455,7 @@ export class CronScheduler {
         logger.info({ jobName }, 'Processing MCP trigger for cron job');
         this.runManual(jobName).then((result) => {
           if (result && !result.includes('not found')) {
-            this.dispatcher.send(`🔧 **${jobName}** (triggered):\n\n${result.slice(0, 1500)}`).catch(() => {});
+            this.dispatcher.send(`🔧 **${jobName}** (triggered):\n\n${result.slice(0, 1500)}`).catch(err => logger.debug({ err }, 'Failed to send trigger result notification'));
           }
         }).catch((err) => {
           logger.error({ err, jobName }, 'Trigger-initiated job failed');
@@ -1586,7 +1588,7 @@ export class CronScheduler {
             useUnleashed ? 1 : undefined, // 1 hour max for unleashed goal work
           ).then((result) => {
             if (result && !CronScheduler.isCronNoise(result)) {
-              this.dispatcher.send(`🎯 **Goal work: ${goal.title}**\n\n${result.slice(0, 1500)}`).catch(() => {});
+              this.dispatcher.send(`🎯 **Goal work: ${goal.title}**\n\n${result.slice(0, 1500)}`).catch(err => logger.debug({ err }, 'Failed to send goal work notification'));
             }
             logToDailyNote(`**Goal work: ${goal.title}** — ${(result || 'completed').slice(0, 100).replace(/\n/g, ' ')}`);
             this.logGoalOutcome(trigger.goalId, goalPath, goalSnapshotUpdatedAt, goalSnapshotNotes, trigger.focus, trigger.source, result);
@@ -1599,7 +1601,7 @@ export class CronScheduler {
           logger.warn({ err, goalId: trigger.goalId }, 'Advisor unavailable — running goal work with defaults');
           this.gateway.handleCronJob(jobName, prompt, 2, trigger.maxTurns ?? 15).then((result) => {
             if (result && !CronScheduler.isCronNoise(result)) {
-              this.dispatcher.send(`🎯 **Goal work: ${goal.title}**\n\n${result.slice(0, 1500)}`).catch(() => {});
+              this.dispatcher.send(`🎯 **Goal work: ${goal.title}**\n\n${result.slice(0, 1500)}`).catch(err => logger.debug({ err }, 'Failed to send goal work notification'));
             }
             logToDailyNote(`**Goal work: ${goal.title}** — ${(result || 'completed').slice(0, 100).replace(/\n/g, ' ')}`);
             this.logGoalOutcome(trigger.goalId, goalPath, goalSnapshotUpdatedAt, goalSnapshotNotes, trigger.focus, trigger.source, result);
