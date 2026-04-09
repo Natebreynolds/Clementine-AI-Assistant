@@ -2851,7 +2851,19 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
         `Update this block in EVERY response as the job evolves. Ask about schedule, what it should do, which tools/APIs it needs, what tier (1=read-only, 2=read-write), and whether it should run in unleashed mode.\n` +
         `IMPORTANT: Cron jobs automatically pull in matching skills (learned procedures) at runtime. If the user describes a workflow that should be reusable, suggest creating it as a skill first, then building the cron job that references those trigger keywords. This way the cron gets smarter over time as skills improve.\n` +
         `When the user says "save" or approves, output the final artifact block.]${artifactContext}\n\n`
-      : `[BUILDER MODE: You are helping configure an agent artifact. Output structured JSON blocks as you build.]${artifactContext}\n\n`;
+      : type === 'agent'
+      ? `[BUILDER MODE: You are helping create a new AI agent team member. As you develop the agent config, output the current state as a JSON block:\n` +
+        '```json-artifact\n{"type":"agent","name":"...","description":"role description","model":"sonnet","personality":"system prompt / onboarding brief","tools":["tool1","tool2"],"channel":"","tier":2}\n```\n' +
+        `Update this block in EVERY response as the agent evolves. Ask about: the agent's role, what tools it needs, what model to use (haiku/sonnet/opus), its personality/system prompt, which channel it should operate in, and its security tier.\n` +
+        `Help the user think about what makes a good agent: clear role, specific tools, focused personality. Keep it conversational — one question at a time.\n` +
+        `When the user says "save" or approves, output the final artifact block.]${artifactContext}\n\n`
+      : type === 'workflow'
+      ? `[BUILDER MODE: You are helping build a multi-step workflow pipeline. As you develop the workflow, output the current state as a JSON block:\n` +
+        '```json-artifact\n{"type":"workflow","name":"...","description":"...","schedule":"","steps":"step1:\\n  prompt: ...\\nstep2:\\n  prompt: ...\\n  dependsOn: step1"}\n```\n' +
+        `Update this block in EVERY response as the workflow evolves. Ask about: what the workflow should accomplish, what steps are needed, which agents should run each step, dependencies between steps, and whether it should be triggered on a schedule or manually.\n` +
+        `Workflows are defined as markdown files with YAML frontmatter. Each step has an id, prompt, optional agent, and optional dependsOn array.\n` +
+        `When the user says "save" or approves, output the final artifact block.]${artifactContext}\n\n`
+      : `[BUILDER MODE: You are helping configure an artifact. Output structured JSON blocks as you build.]${artifactContext}\n\n`;
 
     const enrichedMessage = builderPrefix + message;
 
@@ -2930,6 +2942,47 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
         parsed.data.jobs = jobs;
         writeFileSync(cronFile, matterMod.stringify(parsed.content, parsed.data));
         res.json({ ok: true, name: jobName, message: `Cron job "${jobName}" saved` });
+      } else if (artifactType === 'agent') {
+        // Create agent via the same mechanism as the manual form
+        const slug = (artifact.name || 'new-agent').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40);
+        const agentDir = path.join(VAULT_DIR, '00-System', 'agents', slug);
+        if (!existsSync(agentDir)) mkdirSync(agentDir, { recursive: true });
+        const config = {
+          name: artifact.name || slug,
+          description: artifact.description || '',
+          model: artifact.model || '',
+          personality: artifact.personality || '',
+          allowedTools: artifact.tools || [],
+          tier: artifact.tier || 2,
+          channel: artifact.channel || '',
+          canMessage: [],
+          status: 'active',
+        };
+        writeFileSync(path.join(agentDir, 'config.json'), JSON.stringify(config, null, 2));
+        // Create empty CRON.md for the agent
+        const agentCronFile = path.join(agentDir, 'CRON.md');
+        if (!existsSync(agentCronFile)) {
+          writeFileSync(agentCronFile, '---\njobs: []\n---\n');
+        }
+        res.json({ ok: true, name: slug, message: `Agent "${artifact.name}" created` });
+      } else if (artifactType === 'workflow') {
+        // Save workflow as markdown file
+        const wfDir = path.join(VAULT_DIR, '00-System', 'workflows');
+        if (!existsSync(wfDir)) mkdirSync(wfDir, { recursive: true });
+        const wfName = (artifact.name || 'new-workflow').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 60);
+        const matterMod = require('gray-matter');
+        const meta: Record<string, unknown> = {
+          name: artifact.name || wfName,
+          description: artifact.description || '',
+          enabled: true,
+          ...(artifact.schedule ? { trigger: { schedule: artifact.schedule } } : {}),
+        };
+        const content = matterMod.stringify(
+          `\n# ${artifact.name || wfName}\n\n${artifact.description || ''}\n\n## Steps\n\n${artifact.steps || ''}\n`,
+          meta,
+        );
+        writeFileSync(path.join(wfDir, `${wfName}.md`), content);
+        res.json({ ok: true, name: wfName, message: `Workflow "${artifact.name}" saved` });
       } else {
         res.status(400).json({ error: `Unknown artifact type: ${artifactType}` });
       }
@@ -5625,6 +5678,107 @@ function getDashboardHTML(token: string): string {
     gap: 20px;
   }
 
+  /* ── Getting Started ────────────────────── */
+  .getting-started {
+    background: linear-gradient(135deg, var(--clementine-bg), rgba(77,158,255,0.06));
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    padding: 24px;
+    margin-bottom: 24px;
+    position: relative;
+  }
+  .gs-header {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-bottom: 20px;
+  }
+  .gs-title {
+    font-size: 18px;
+    font-weight: 700;
+    color: var(--text-primary);
+  }
+  .gs-subtitle {
+    font-size: 13px;
+    color: var(--text-muted);
+    flex: 1;
+  }
+  .gs-dismiss {
+    position: absolute;
+    top: 12px;
+    right: 12px;
+    font-size: 18px;
+  }
+  .gs-grid {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 16px;
+  }
+  .gs-card {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 20px 16px;
+    text-align: center;
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 8px;
+    transition: transform 0.15s, box-shadow 0.15s;
+  }
+  .gs-card:hover {
+    transform: translateY(-2px);
+    box-shadow: var(--shadow-sm);
+  }
+  .gs-card.gs-done {
+    opacity: 0.5;
+    border-color: var(--green);
+  }
+  .gs-card.gs-done::after {
+    content: '\\2713';
+    position: absolute;
+    top: 8px;
+    right: 10px;
+    color: var(--green);
+    font-size: 16px;
+    font-weight: 700;
+  }
+  .gs-step-num {
+    width: 24px;
+    height: 24px;
+    border-radius: 50%;
+    background: var(--clementine);
+    color: #fff;
+    font-size: 12px;
+    font-weight: 700;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+  }
+  .gs-card-icon {
+    font-size: 28px;
+    line-height: 1;
+  }
+  .gs-card-title {
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--text-primary);
+  }
+  .gs-card-desc {
+    font-size: 12px;
+    color: var(--text-muted);
+    line-height: 1.4;
+    margin-bottom: 4px;
+  }
+  @media (max-width: 768px) {
+    .gs-grid { grid-template-columns: 1fr 1fr; }
+  }
+  @media (max-width: 400px) {
+    .gs-grid { grid-template-columns: 1fr; }
+  }
+
   /* ── KV rows ────────────────────────────── */
   .kv-row {
     display: flex;
@@ -7843,8 +7997,17 @@ function getDashboardHTML(token: string): string {
       <div class="nav-item" data-page="chat">
         <span class="nav-icon">&#128172;</span> Chat
       </div>
+    </div>
+    <div class="nav-section">
+      <div class="nav-section-title">Build</div>
       <div class="nav-item" data-page="builder">
         <span class="nav-icon">&#128736;</span> Builder
+      </div>
+      <div class="nav-item" data-page="team">
+        <span class="nav-icon">&#128101;</span> The Office
+      </div>
+      <div class="nav-item" data-page="projects">
+        <span class="nav-icon">&#128194;</span> Projects
       </div>
     </div>
     <div class="nav-section">
@@ -7855,22 +8018,28 @@ function getDashboardHTML(token: string): string {
       </div>
     </div>
     <div class="nav-section">
-      <div class="nav-section-title">Operations</div>
+      <div class="nav-section-title">Automate</div>
       <div class="nav-item" data-page="automations">
-        <span class="nav-icon">&#9200;</span> Automations
+        <span class="nav-icon">&#9200;</span> Scheduled Tasks
         <span class="nav-badge" id="nav-cron-count">0</span>
       </div>
+      <div class="nav-item" data-page="workflows">
+        <span class="nav-icon">&#128260;</span> Workflows
+      </div>
+    </div>
+    <div class="nav-section">
+      <div class="nav-section-title">Insights</div>
       <div class="nav-item" data-page="intelligence">
         <span class="nav-icon">&#129504;</span> Intelligence
+      </div>
+      <div class="nav-item" data-page="logs">
+        <span class="nav-icon">&#128220;</span> Logs
       </div>
     </div>
     <div class="nav-section">
       <div class="nav-section-title">System</div>
       <div class="nav-item" data-page="settings">
         <span class="nav-icon">&#9881;</span> Settings
-      </div>
-      <div class="nav-item" data-page="logs">
-        <span class="nav-icon">&#128220;</span> Logs
       </div>
     </div>
   </nav>
@@ -7896,6 +8065,46 @@ function getDashboardHTML(token: string): string {
           <div class="agent-controls" id="hero-controls"></div>
         </div>
       </div>
+
+      <!-- Getting Started (shown for new users, hidden when setup is complete) -->
+      <div id="getting-started" class="getting-started" style="display:none">
+        <div class="gs-header">
+          <div class="gs-title">Get Started</div>
+          <div class="gs-subtitle">Set up your AI assistant in 4 steps</div>
+          <button class="btn-ghost btn-sm gs-dismiss" onclick="dismissGettingStarted()" title="Dismiss">&times;</button>
+        </div>
+        <div class="gs-grid">
+          <div class="gs-card" id="gs-step-agent">
+            <div class="gs-step-num">1</div>
+            <div class="gs-card-icon">&#128101;</div>
+            <div class="gs-card-title">Create an Agent</div>
+            <div class="gs-card-desc">Hire your first AI team member with a role, tools, and a channel.</div>
+            <button class="btn btn-sm btn-primary" onclick="navigateTo('team')">Go to The Office</button>
+          </div>
+          <div class="gs-card" id="gs-step-channel">
+            <div class="gs-step-num">2</div>
+            <div class="gs-card-icon">&#128172;</div>
+            <div class="gs-card-title">Connect a Channel</div>
+            <div class="gs-card-desc">Link Discord or Slack so your agents can communicate.</div>
+            <button class="btn btn-sm" onclick="navigateTo('settings')">Open Settings</button>
+          </div>
+          <div class="gs-card" id="gs-step-task">
+            <div class="gs-step-num">3</div>
+            <div class="gs-card-icon">&#9200;</div>
+            <div class="gs-card-title">Schedule a Task</div>
+            <div class="gs-card-desc">Set up cron jobs so agents work on autopilot.</div>
+            <button class="btn btn-sm" onclick="navigateTo('automations')">Add a Task</button>
+          </div>
+          <div class="gs-card" id="gs-step-project">
+            <div class="gs-step-num">4</div>
+            <div class="gs-card-icon">&#128194;</div>
+            <div class="gs-card-title">Link a Project</div>
+            <div class="gs-card-desc">Give agents context about your codebases and tools.</div>
+            <button class="btn btn-sm" onclick="navigateTo('projects')">Browse Projects</button>
+          </div>
+        </div>
+      </div>
+
       <div class="summary-grid" id="summary-cards"></div>
 
       <!-- Today's Plan + Team Pulse -->
@@ -7967,6 +8176,8 @@ function getDashboardHTML(token: string): string {
         <select id="builder-type" onchange="resetBuilder()" style="padding:6px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg-secondary);color:var(--text-primary);font-size:13px">
           <option value="skill">Skill</option>
           <option value="cron">Cron Job</option>
+          <option value="agent">Agent</option>
+          <option value="workflow">Workflow</option>
         </select>
         <span id="builder-agent-label" style="padding:6px 12px;font-size:13px;color:var(--text-secondary);font-weight:500"></span>
         <input type="hidden" id="builder-agent" value="">
@@ -7982,8 +8193,9 @@ function getDashboardHTML(token: string): string {
               <p style="color:var(--text-muted);margin-bottom:12px">Describe what you want to build.</p>
               <div style="display:flex;flex-wrap:wrap;gap:8px;justify-content:center">
                 <button class="btn btn-sm quick-pill" onclick="builderQuick('Create a cron job that checks my email every morning and sends me a summary')">Email summary cron</button>
-                <button class="btn btn-sm quick-pill" onclick="builderQuick('Teach me how to run an outbound campaign via Salesforce')">Outbound campaign skill</button>
+                <button class="btn btn-sm quick-pill" onclick="builderQuick('Create an SDR agent that researches leads and drafts outreach emails')">SDR agent</button>
                 <button class="btn btn-sm quick-pill" onclick="builderQuick('Build a weekly analytics report that checks SEO rankings')">Weekly SEO report</button>
+                <button class="btn btn-sm quick-pill" onclick="builderQuick('Create a workflow that researches a topic, writes a draft, and sends it for review')">Research workflow</button>
               </div>
             </div>
           </div>
@@ -8021,15 +8233,14 @@ function getDashboardHTML(token: string): string {
       <div id="agent-detail-content"><div class="empty-state">Select an agent from the sidebar</div></div>
     </div>
 
-    <!-- ═══ Automations Page (merged: Cron + Timers + Self-Improve + Advisor) ═══ -->
+    <!-- ═══ Scheduled Tasks Page (Cron + Timers + Self-Improve + Skills + Analytics) ═══ -->
     <div class="page" id="page-automations">
-      <div class="page-title">Automations</div>
+      <div class="page-title">Scheduled Tasks</div>
       <div class="tab-bar" id="automations-tabs">
         <button class="active" onclick="switchTab('automations','scheduled')">Scheduled Tasks</button>
         <button onclick="switchTab('automations','timers')">Timers <span class="tab-badge" id="tab-timer-count" style="display:none">0</span></button>
         <button onclick="switchTab('automations','self-improve')">Self-Improve <span class="tab-badge" id="tab-si-pending" style="display:none">0</span></button>
         <button onclick="switchTab('automations','skills')">Skills <span class="tab-badge" id="tab-skill-count" style="display:none">0</span></button>
-        <button onclick="switchTab('automations','workflows')">Workflows</button>
         <button onclick="switchTab('automations','analytics')">Execution Analytics</button>
       </div>
       <div id="automations-tab-content">
@@ -8445,7 +8656,6 @@ function getDashboardHTML(token: string): string {
         <button onclick="switchTab('settings','remote')">Remote Access</button>
         <button onclick="switchTab('settings','integrations')">Integrations</button>
         <button onclick="switchTab('settings','notifications')">Notifications</button>
-        <button onclick="switchTab('settings','projects')">Projects</button>
       </div>
       <div id="settings-tab-content">
         <div class="tab-pane active" id="tab-settings-general">
@@ -8552,6 +8762,29 @@ function getDashboardHTML(token: string): string {
           <div id="panel-projects"><div class="empty-state">Loading...</div></div>
         </div>
       </div>
+    </div>
+
+    <!-- ═══ Projects Page (promoted from Settings) ═══ -->
+    <div class="page" id="page-projects">
+      <div class="page-title">Projects</div>
+      <p style="color:var(--text-muted);margin-bottom:16px">Link projects to give Clementine automatic access to their tools and MCP servers. When you mention a linked project's keywords in chat, Clementine switches into that project's context automatically.</p>
+      <div class="card" style="margin-bottom:20px">
+        <div class="card-header" style="display:flex;align-items:center;justify-content:space-between">
+          <span>Workspace Directories</span>
+          <button class="btn btn-sm btn-primary" onclick="promptAddWorkspaceDir()" style="font-size:11px">+ Add Path</button>
+        </div>
+        <div class="card-body" id="workspace-dirs-list-projects" style="font-size:13px">
+          <div class="empty-state">Loading...</div>
+        </div>
+      </div>
+      <div id="panel-projects-page"><div class="empty-state">Loading...</div></div>
+    </div>
+
+    <!-- ═══ Workflows Page (promoted from Automations) ═══ -->
+    <div class="page" id="page-workflows">
+      <div class="page-title">Workflows</div>
+      <p style="color:var(--text-muted);margin-bottom:16px">Multi-step pipelines that orchestrate agents, tools, and data. Define workflows as .md files in <code>vault/00-System/workflows/</code>.</p>
+      <div id="panel-workflows-page"><div class="empty-state">Loading workflows...</div></div>
     </div>
 
   </div><!-- /content -->
@@ -9030,6 +9263,14 @@ function toast(msg, type) {
   setTimeout(() => el.remove(), 4000);
 }
 
+// ── Getting Started dismiss ──────────────
+window._gsDismissed = false;
+function dismissGettingStarted() {
+  window._gsDismissed = true;
+  var el = document.getElementById('getting-started');
+  if (el) el.style.display = 'none';
+}
+
 // ── Authenticated fetch helper ────────────
 var _dashToken = document.querySelector('meta[name="dashboard-token"]')?.getAttribute('content') || '';
 function apiFetch(url, opts) {
@@ -9070,8 +9311,11 @@ function navigateTo(page, opts) {
   }
   if (page === 'automations') { refreshCron(); refreshTimers(); refreshSelfImprove(); refreshSkills(); }
   if (page === 'intelligence') { refreshMemory(); }
-  if (page === 'settings') { refreshSettings(); refreshRemoteAccess(); refreshProjects(); refreshSalesforce(); refreshMcpServers(); }
+  if (page === 'settings') { refreshSettings(); refreshRemoteAccess(); refreshSalesforce(); refreshMcpServers(); }
   if (page === 'logs') refreshLogs();
+  if (page === 'team') { refreshTeam(); }
+  if (page === 'projects') { refreshProjects(); }
+  if (page === 'workflows') { refreshWorkflows(); }
   if (page === 'agent-detail' && opts.agentSlug != null) {
     currentAgentSlug = opts.agentSlug;
     renderAgentDetail(opts.agentSlug);
@@ -9934,6 +10178,24 @@ async function refreshStatus() {
       controls.innerHTML = '<button class="btn-primary btn-sm" onclick="apiPost(\\x27/api/launch\\x27)">Start Daemon</button>';
     }
 
+    // Getting Started — show for new users with no setup
+    if (currentPage === 'home') {
+      var gsEl = document.getElementById('getting-started');
+      if (gsEl && !window._gsDismissed) {
+        var hasAgents = (d.activeAgents || 0) > 0;
+        var hasCrons = (d.scheduledToday || 0) > 0 || (d.runsToday || 0) > 0;
+        var isNew = !hasAgents && !hasCrons;
+        gsEl.style.display = isNew ? 'block' : 'none';
+        // Mark completed steps
+        var gsAgent = document.getElementById('gs-step-agent');
+        var gsTask = document.getElementById('gs-step-task');
+        if (gsAgent) gsAgent.className = 'gs-card' + (hasAgents ? ' gs-done' : '');
+        if (gsTask) gsTask.className = 'gs-card' + (hasCrons ? ' gs-done' : '');
+        var gsChannel = document.getElementById('gs-step-channel');
+        if (gsChannel && d.channels && d.channels.length > 0) gsChannel.className = 'gs-card gs-done';
+      }
+    }
+
     // Summary cards — fetch metrics when on overview
     if (currentPage === 'home') {
       try {
@@ -10465,29 +10727,31 @@ async function refreshWorkspaceDirs() {
     const r = await apiFetch('/api/workspace-dirs');
     const d = await r.json();
     workspaceDirsList = d.dirs || [];
-    const el = document.getElementById('workspace-dirs-list');
-    if (!el) return;
-    if (workspaceDirsList.length === 0) {
-      el.innerHTML = '<span style="color:var(--text-muted)">No custom directories configured. Projects are scanned from ~/Desktop, ~/Documents, ~/Developer, etc. by default.</span>';
-      el.onclick = null;
-      return;
-    }
-    el.innerHTML = workspaceDirsList.map(function(dir, idx) {
-      return '<div style="display:flex;align-items:center;justify-content:space-between;padding:4px 0;border-bottom:1px solid var(--border)">'
-        + '<code style="font-size:12px">' + esc(dir) + '</code>'
-        + '<button class="btn-sm btn-danger" style="font-size:10px;padding:2px 8px" data-remove-ws-idx="' + idx + '">Remove</button>'
-        + '</div>';
-    }).join('');
-    el.onclick = function(ev) {
-      var target = ev.target;
-      while (target && target !== el) {
-        if (target.dataset && target.dataset.removeWsIdx !== undefined) {
-          removeWorkspaceDir(workspaceDirsList[parseInt(target.dataset.removeWsIdx)]);
-          return;
-        }
-        target = target.parentElement;
+    var targets = [document.getElementById('workspace-dirs-list'), document.getElementById('workspace-dirs-list-projects')];
+    targets.forEach(function(el) {
+      if (!el) return;
+      if (workspaceDirsList.length === 0) {
+        el.innerHTML = '<span style="color:var(--text-muted)">No custom directories configured. Projects are scanned from ~/Desktop, ~/Documents, ~/Developer, etc. by default.</span>';
+        el.onclick = null;
+        return;
       }
-    };
+      el.innerHTML = workspaceDirsList.map(function(dir, idx) {
+        return '<div style="display:flex;align-items:center;justify-content:space-between;padding:4px 0;border-bottom:1px solid var(--border)">'
+          + '<code style="font-size:12px">' + esc(dir) + '</code>'
+          + '<button class="btn-sm btn-danger" style="font-size:10px;padding:2px 8px" data-remove-ws-idx="' + idx + '">Remove</button>'
+          + '</div>';
+      }).join('');
+      el.onclick = function(ev) {
+        var target = ev.target;
+        while (target && target !== el) {
+          if (target.dataset && target.dataset.removeWsIdx !== undefined) {
+            removeWorkspaceDir(workspaceDirsList[parseInt(target.dataset.removeWsIdx)]);
+            return;
+          }
+          target = target.parentElement;
+        }
+      };
+    });
   } catch(e) { }
 }
 
@@ -10614,9 +10878,11 @@ async function refreshProjects() {
     }
     sel.value = currentVal;
 
-    // Render projects page
+    // Render projects page (both settings tab and standalone page)
     if (projectsData.length === 0) {
-      document.getElementById('panel-projects').innerHTML = '<div class="empty-state" style="padding:40px">No projects found. Add workspace directories above or place projects in ~/Desktop, ~/Documents, ~/Developer, etc.</div>';
+      var emptyMsg = '<div class="empty-state" style="padding:40px">No projects found. Add workspace directories above or place projects in ~/Desktop, ~/Documents, ~/Developer, etc.</div>';
+      var pp = document.getElementById('panel-projects'); if (pp) pp.innerHTML = emptyMsg;
+      var ppp = document.getElementById('panel-projects-page'); if (ppp) ppp.innerHTML = emptyMsg;
       return;
     }
 
@@ -10660,7 +10926,8 @@ async function refreshProjects() {
         + '</div></div>';
     }
     html += '</div>';
-    document.getElementById('panel-projects').innerHTML = html;
+    var pp2 = document.getElementById('panel-projects'); if (pp2) pp2.innerHTML = html;
+    var ppp2 = document.getElementById('panel-projects-page'); if (ppp2) ppp2.innerHTML = html;
   } catch(e) { }
 }
 
@@ -12331,7 +12598,7 @@ function resetBuilder() {
   builderArtifact = null;
   builderSending = false;
   var msgs = document.getElementById('builder-messages');
-  if (msgs) msgs.innerHTML = '<div class="empty-state" style="margin-top:40px"><p style="color:var(--text-muted);margin-bottom:12px">Describe what you want to build.</p><div style="display:flex;flex-wrap:wrap;gap:8px;justify-content:center"><button class="btn btn-sm quick-pill" onclick="builderQuick(\\x27Create a cron job that checks my email every morning and sends me a summary\\x27)">Email summary cron</button><button class="btn btn-sm quick-pill" onclick="builderQuick(\\x27Teach me how to run an outbound campaign via Salesforce\\x27)">Outbound campaign skill</button><button class="btn btn-sm quick-pill" onclick="builderQuick(\\x27Build a weekly analytics report that checks SEO rankings\\x27)">Weekly SEO report</button></div></div>';
+  if (msgs) msgs.innerHTML = '<div class="empty-state" style="margin-top:40px"><p style="color:var(--text-muted);margin-bottom:12px">Describe what you want to build.</p><div style="display:flex;flex-wrap:wrap;gap:8px;justify-content:center"><button class="btn btn-sm quick-pill" onclick="builderQuick(\\x27Create a cron job that checks my email every morning and sends me a summary\\x27)">Email summary cron</button><button class="btn btn-sm quick-pill" onclick="builderQuick(\\x27Create an SDR agent that researches leads and drafts outreach emails\\x27)">SDR agent</button><button class="btn btn-sm quick-pill" onclick="builderQuick(\\x27Build a weekly analytics report that checks SEO rankings\\x27)">Weekly SEO report</button><button class="btn btn-sm quick-pill" onclick="builderQuick(\\x27Create a workflow that researches a topic, writes a draft, and sends it for review\\x27)">Research workflow</button></div></div>';
   var preview = document.getElementById('builder-preview');
   if (preview) preview.innerHTML = '<div class="empty-state" style="font-size:13px;color:var(--text-muted)">The artifact will appear here as you build it</div>';
   var saveBtn = document.getElementById('builder-save-btn');
@@ -12349,7 +12616,12 @@ function resetBuilder() {
 
 function builderQuick(text) {
   var sel = document.getElementById('builder-type');
-  if (text.toLowerCase().includes('cron') || text.toLowerCase().includes('scheduled') || text.toLowerCase().includes('every')) {
+  var lower = text.toLowerCase();
+  if (lower.includes('agent') || lower.includes('hire') || lower.includes('team member') || lower.includes('sdr')) {
+    sel.value = 'agent';
+  } else if (lower.includes('workflow') || lower.includes('pipeline') || lower.includes('multi-step')) {
+    sel.value = 'workflow';
+  } else if (lower.includes('cron') || lower.includes('scheduled') || lower.includes('every')) {
     sel.value = 'cron';
   } else {
     sel.value = 'skill';
@@ -12448,6 +12720,23 @@ function renderBuilderPreview(artifact, type) {
       + '</label>'
       + '<div style="font-size:10px;color:var(--text-muted);margin-top:4px">Files injected into the agent prompt at runtime</div>'
       + '</div>';
+  } else if (type === 'agent') {
+    html = '<div class="preview-field"><label>Name</label><input type="text" value="' + esc(artifact.name || '') + '" onchange="builderArtifact.name=this.value"></div>'
+      + '<div class="preview-field"><label>Description / Role</label><input type="text" value="' + esc(artifact.description || '') + '" onchange="builderArtifact.description=this.value"></div>'
+      + '<div class="preview-field"><label>Model</label><select onchange="builderArtifact.model=this.value">'
+      + '<option value=""' + (!artifact.model ? ' selected' : '') + '>Default (Sonnet)</option>'
+      + '<option value="haiku"' + (artifact.model === 'haiku' ? ' selected' : '') + '>Haiku</option>'
+      + '<option value="sonnet"' + (artifact.model === 'sonnet' ? ' selected' : '') + '>Sonnet</option>'
+      + '<option value="opus"' + (artifact.model === 'opus' ? ' selected' : '') + '>Opus</option>'
+      + '</select></div>'
+      + '<div class="preview-field"><label>Personality / System Prompt</label><textarea rows="8" onchange="builderArtifact.personality=this.value">' + esc(artifact.personality || '') + '</textarea></div>'
+      + '<div class="preview-field"><label>Tools (comma-separated)</label><input type="text" value="' + esc((artifact.tools || []).join(', ')) + '" onchange="builderArtifact.tools=this.value.split(\\x27,\\x27).map(function(t){return t.trim()}).filter(Boolean)"></div>'
+      + '<div class="preview-field"><label>Channel</label><input type="text" value="' + esc(artifact.channel || '') + '" onchange="builderArtifact.channel=this.value" placeholder="e.g. discord, slack"></div>';
+  } else if (type === 'workflow') {
+    html = '<div class="preview-field"><label>Workflow Name</label><input type="text" value="' + esc(artifact.name || '') + '" onchange="builderArtifact.name=this.value"></div>'
+      + '<div class="preview-field"><label>Description</label><input type="text" value="' + esc(artifact.description || '') + '" onchange="builderArtifact.description=this.value"></div>'
+      + '<div class="preview-field"><label>Trigger Schedule (cron, optional)</label><input type="text" value="' + esc(artifact.schedule || '') + '" onchange="builderArtifact.schedule=this.value" placeholder="e.g. 0 9 * * 1 (Mondays at 9am)"></div>'
+      + '<div class="preview-field"><label>Steps (YAML/Markdown)</label><textarea rows="14" onchange="builderArtifact.steps=this.value">' + esc(artifact.steps || '') + '</textarea></div>';
   }
   preview.innerHTML = html;
   // Load existing attachments if editing
@@ -12481,6 +12770,8 @@ async function saveBuilderArtifact() {
       document.getElementById('builder-save-btn').style.display = 'none';
       if (type === 'skill') refreshSkills();
       if (type === 'cron') refreshCron();
+      if (type === 'agent') refreshTeamNav();
+      if (type === 'workflow') refreshWorkflows();
     } else {
       toast(r.error || 'Save failed', 'error');
     }
@@ -14270,15 +14561,15 @@ async function restoreRevision(slug, revId) {
 // ── Self-Improvement ──────────────────────
 // ── Workflows Tab ────────────────────────
 async function refreshWorkflows() {
-  var container = document.getElementById('panel-workflows');
-  if (!container) return;
-  container.innerHTML = '<div class="empty-state">Loading workflows...</div>';
+  var containers = [document.getElementById('panel-workflows'), document.getElementById('panel-workflows-page')].filter(Boolean);
+  if (containers.length === 0) return;
+  containers.forEach(function(c) { c.innerHTML = '<div class="empty-state">Loading workflows...</div>'; });
   try {
     var r = await apiFetch('/api/workflows');
     var data = await r.json();
     var workflows = data.workflows || [];
     if (workflows.length === 0) {
-      container.innerHTML = '<div class="empty-state">No workflows defined. Create .md files in vault/00-System/workflows/</div>';
+      containers.forEach(function(c) { c.innerHTML = '<div class="empty-state">No workflows defined. Create .md files in vault/00-System/workflows/</div>'; });
       return;
     }
     var html = '';
@@ -14315,9 +14606,9 @@ async function refreshWorkflows() {
       html += '<div id="wf-runs-' + esc(wf.name).replace(/[^a-zA-Z0-9]/g, '_') + '" style="display:none"></div>';
       html += '</div></div>';
     });
-    container.innerHTML = html;
+    containers.forEach(function(c) { c.innerHTML = html; });
   } catch(e) {
-    container.innerHTML = '<div class="empty-state">Failed to load workflows: ' + esc(String(e)) + '</div>';
+    containers.forEach(function(c) { c.innerHTML = '<div class="empty-state">Failed to load workflows: ' + esc(String(e)) + '</div>'; });
   }
 }
 
