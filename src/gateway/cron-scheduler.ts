@@ -453,6 +453,7 @@ export class CronScheduler {
     // Wire up phase progress notifications for unleashed tasks
     this.gateway.setPhaseCompleteCallback((jobName, phase, _total, output) => {
       if (phase <= 1) return; // Don't spam for the first phase — wait for real progress
+      if (/TASK_COMPLETE:/i.test(output)) return; // Final delivery handled by unleashed complete callback
       const slug = jobName.includes(':') ? jobName.split(':')[0] : undefined;
       const cleanOutput = output
         .replace(/^STATUS SUMMARY:?\s*/im, '')

@@ -1989,6 +1989,13 @@ You have a limited number of turns per message (~15). **After 8-10 tool calls, y
                   } else if (lower.includes('does not have access') || lower.includes('please run /login') || lower.includes('not authenticated')) {
                     // Auth errors — throw so the gateway circuit breaker catches it
                     throw new Error(errorText);
+                  } else if (lower.includes('no conversation found') || lower.includes('conversation not found') || lower.includes('session not found')) {
+                    // Stale session — clear and retry with fresh session
+                    logger.warn({ sessionKey }, 'Stale session ID — clearing and retrying');
+                    if (sessionKey) {
+                      this.sessions.delete(sessionKey);
+                    }
+                    break; // Break inner try, will retry in the for-loop with no resume ID
                   } else {
                     responseText = responseText || `Error: ${errorText}`;
                   }
@@ -2022,6 +2029,13 @@ You have a limited number of turns per message (~15). **After 8-10 tool calls, y
             hitRateLimit = true;
           } else if (errStr.includes('prompt is too long') || errStr.includes('prompt too long') || errStr.includes('context_length')) {
             responseText = responseText || 'Error: prompt is too long — context window overflow from large tool responses.';
+          } else if (errStr.includes('no conversation found') || errStr.includes('conversation not found') || errStr.includes('session not found')) {
+            // Stale session — clear and retry
+            logger.warn({ sessionKey }, 'Stale session ID (exception) — clearing and retrying');
+            if (sessionKey) {
+              this.sessions.delete(sessionKey);
+            }
+            continue; // Retry with fresh session
           } else if (errStr.includes('does not have access') || errStr.includes('please run /login') || errStr.includes('not authenticated') || errStr.includes('invalid api key') || errStr.includes('invalid_api_key')) {
             // Auth errors — rethrow so the gateway circuit breaker handles them
             throw e;
