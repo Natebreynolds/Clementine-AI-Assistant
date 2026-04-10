@@ -1935,6 +1935,7 @@ You have a limited number of turns per message (~15). **After 8-10 tool calls, y
         let responseText = '';
         let sessionId = '';
         let hitRateLimit = false;
+        let staleSession = false;
         let lastAssistantBlocks: ContentBlock[] = [];
 
         try {
@@ -1996,7 +1997,8 @@ You have a limited number of turns per message (~15). **After 8-10 tool calls, y
                     if (sessionKey) {
                       this.sessions.delete(sessionKey);
                     }
-                    break; // Break inner try, will retry in the for-loop with no resume ID
+                    staleSession = true;
+                    break; // Break inner stream loop — staleSession flag triggers retry
                   } else {
                     responseText = responseText || `Error: ${errorText}`;
                   }
@@ -2048,6 +2050,12 @@ You have a limited number of turns per message (~15). **After 8-10 tool calls, y
               responseText = `Hit an error: ${shortErr}. Try again or \`!clear\` to reset the session.`;
             }
           }
+        }
+
+        // Stale session — immediately retry with fresh session (no backoff needed)
+        if (staleSession && attempt < PersonalAssistant.RATE_LIMIT_MAX_RETRIES) {
+          responseText = '';
+          continue;
         }
 
         if (hitRateLimit && attempt < PersonalAssistant.RATE_LIMIT_MAX_RETRIES) {
