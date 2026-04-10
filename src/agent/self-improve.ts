@@ -810,37 +810,42 @@ export class SelfImproveLoop {
       outputFormat: {
         type: 'json_schema',
         schema: {
-          type: 'array',
-          items: {
-            type: 'object',
-            properties: {
-              area: { type: 'string' },
-              target: { type: 'string' },
-              what: { type: 'string' },
-              why: { type: 'string' },
+          type: 'object',
+          properties: {
+            results: {
+              type: 'array',
+              items: {
+                type: 'object',
+                properties: {
+                  area: { type: 'string' },
+                  target: { type: 'string' },
+                  what: { type: 'string' },
+                  why: { type: 'string' },
+                },
+                required: ['area', 'target', 'what', 'why'],
+              },
             },
-            required: ['area', 'target', 'what', 'why'],
           },
+          required: ['results'],
         },
       },
     });
 
-    const rawOpportunities = this.parseJsonResponse<Array<{
-      area: SelfImproveExperiment['area'];
-      target: string;
-      what: string;
-      why: string;
-    }>>(analysisResult);
+    const rawParsed = this.parseJsonResponse<
+      { results: Array<{ area: SelfImproveExperiment['area']; target: string; what: string; why: string }> }
+      | Array<{ area: SelfImproveExperiment['area']; target: string; what: string; why: string }>
+    >(analysisResult);
 
-    // Guard: parseJsonResponse may return a non-array (single object, string, etc.)
-    const opportunities = Array.isArray(rawOpportunities)
-      ? rawOpportunities
-      : rawOpportunities ? [rawOpportunities as any] : [];
+    // Handle both wrapped {results:[...]} and bare array responses
+    const opportunities = Array.isArray(rawParsed)
+      ? rawParsed
+      : Array.isArray((rawParsed as any)?.results) ? (rawParsed as any).results
+      : rawParsed ? [rawParsed as any] : [];
 
     if (opportunities.length === 0) return null;
 
     // Pick the first opportunity that isn't over-targeted
-    const selected = opportunities.find(o => {
+    const selected = opportunities.find((o: any) => {
       const key = `${o.area}:${o.target}`;
       return !overTargeted.includes(key) && !overTargetedAreas.includes(o.area);
     }) ?? opportunities[0];

@@ -1250,7 +1250,9 @@ You have a limited number of turns per message (~15). **After 8-10 tool calls, y
     const disallowed = isHeartbeat && (!isCron || (cronTier ?? 0) < 2)
       ? getHeartbeatDisallowedTools()
       : [];
-    const effectiveMaxTurns = maxTurns ?? (isHeartbeat ? HEARTBEAT_MAX_TURNS : 30);
+    // Cron jobs default by tier; pure heartbeat (non-cron) gets the low limit
+    const effectiveMaxTurns = maxTurns
+      ?? (isCron ? (cronTier === 2 ? 30 : 15) : isHeartbeat ? HEARTBEAT_MAX_TURNS : 30);
 
     // Determine security prompt to append to systemPrompt
     // Plan steps are user-initiated — use the interactive security prompt, not cron
@@ -1313,10 +1315,9 @@ You have a limited number of turns per message (~15). **After 8-10 tool calls, y
       }
     } catch { /* non-fatal — run with just Clementine's own server */ }
 
-    // Permission mode: 'auto' for autonomous tier-2+ work (model classifier + canUseTool safety net),
-    // 'bypassPermissions' for interactive chat (user is watching) and low-tier tasks.
-    const useAutoPermissions = isCron && (cronTier ?? 0) >= 2 || isUnleashed;
-    const effectivePermissionMode = useAutoPermissions ? 'auto' : 'bypassPermissions';
+    // Permission mode: always 'bypassPermissions' — this is a daemon/harness with no interactive
+    // terminal, so 'auto' mode (which requires plan support + human approval) doesn't apply.
+    const effectivePermissionMode = 'bypassPermissions';
 
     return {
       systemPrompt: fullSystemPrompt,
@@ -2803,7 +2804,7 @@ You have a limited number of turns per message (~15). **After 8-10 tool calls, y
     const sdkOptions = this.buildOptions({
       isHeartbeat: true,
       cronTier: tier,
-      maxTurns: maxTurns ?? (tier >= 2 ? 30 : HEARTBEAT_MAX_TURNS),
+      maxTurns: maxTurns ?? (tier >= 2 ? 30 : 15),
       model: model ?? null,
       enableTeams: true,
       stallGuard: cronGuard,

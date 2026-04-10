@@ -1329,6 +1329,64 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
     res.redirect('/');
   });
 
+  // ── Anthropic OAuth routes ──────────────────────────────────────
+
+  // Check current auth status by spawning a lightweight SDK query
+  app.get('/api/auth/anthropic/status', async (_req, res) => {
+    try {
+      const { query: sdkQuery } = await import('@anthropic-ai/claude-agent-sdk');
+      const q = sdkQuery({ prompt: '', options: { permissionMode: 'bypassPermissions' as any, allowDangerouslySkipPermissions: true, maxTurns: 0 } });
+      const account = await q.accountInfo();
+      q.close();
+      res.json({
+        authenticated: !!account?.email,
+        email: account?.email ?? null,
+        organization: account?.organization ?? null,
+        apiKeySource: account?.apiKeySource ?? null,
+      });
+    } catch (err) {
+      res.json({ authenticated: false, email: null, error: String(err).slice(0, 200) });
+    }
+  });
+
+  // Start OAuth login — spawns SDK query and calls claudeAuthenticate
+  let oauthQuery: any = null;
+  app.post('/api/auth/anthropic/login', async (_req, res) => {
+    try {
+      const { query: sdkQuery } = await import('@anthropic-ai/claude-agent-sdk');
+      // Close any previous auth query
+      if (oauthQuery) { try { oauthQuery.close(); } catch { /* ignore */ } }
+      oauthQuery = sdkQuery({ prompt: '', options: { permissionMode: 'bypassPermissions' as any, allowDangerouslySkipPermissions: true, maxTurns: 0 } });
+      const result = await (oauthQuery as any).claudeAuthenticate(true);
+      res.json({ ok: true, result });
+    } catch (err) {
+      res.status(500).json({ error: String(err).slice(0, 300) });
+    }
+  });
+
+  // Poll for OAuth completion
+  app.post('/api/auth/anthropic/wait', async (_req, res) => {
+    try {
+      if (!oauthQuery) {
+        res.status(400).json({ error: 'No OAuth flow in progress' });
+        return;
+      }
+      await (oauthQuery as any).claudeOAuthWaitForCompletion();
+      const account = await oauthQuery.accountInfo();
+      oauthQuery.close();
+      oauthQuery = null;
+      res.json({
+        ok: true,
+        authenticated: !!account?.email,
+        email: account?.email ?? null,
+        organization: account?.organization ?? null,
+      });
+    } catch (err) {
+      if (oauthQuery) { try { oauthQuery.close(); } catch { /* ignore */ } oauthQuery = null; }
+      res.status(500).json({ error: String(err).slice(0, 300) });
+    }
+  });
+
   // ── GET routes ───────────────────────────────────────────────────
 
   app.get('/', (req, res) => {
@@ -5711,7 +5769,7 @@ function getDashboardHTML(token: string): string {
   }
   .gs-grid {
     display: grid;
-    grid-template-columns: repeat(4, 1fr);
+    grid-template-columns: repeat(5, 1fr);
     gap: 16px;
   }
   .gs-card {
@@ -5771,6 +5829,9 @@ function getDashboardHTML(token: string): string {
     color: var(--text-muted);
     line-height: 1.4;
     margin-bottom: 4px;
+  }
+  @media (max-width: 1024px) {
+    .gs-grid { grid-template-columns: repeat(3, 1fr); }
   }
   @media (max-width: 768px) {
     .gs-grid { grid-template-columns: 1fr 1fr; }
@@ -8070,33 +8131,40 @@ function getDashboardHTML(token: string): string {
       <div id="getting-started" class="getting-started" style="display:none">
         <div class="gs-header">
           <div class="gs-title">Get Started</div>
-          <div class="gs-subtitle">Set up your AI assistant in 4 steps</div>
+          <div class="gs-subtitle">Set up your AI assistant in 5 steps</div>
           <button class="btn-ghost btn-sm gs-dismiss" onclick="dismissGettingStarted()" title="Dismiss">&times;</button>
         </div>
         <div class="gs-grid">
-          <div class="gs-card" id="gs-step-agent">
+          <div class="gs-card" id="gs-step-auth">
             <div class="gs-step-num">1</div>
+            <div class="gs-card-icon">&#128274;</div>
+            <div class="gs-card-title">Login with Anthropic</div>
+            <div class="gs-card-desc" id="gs-auth-desc">Connect your Anthropic account to power your agents.</div>
+            <button class="btn btn-sm btn-primary" id="gs-auth-btn" onclick="startAnthropicOAuth()">Login with Claude</button>
+          </div>
+          <div class="gs-card" id="gs-step-agent">
+            <div class="gs-step-num">2</div>
             <div class="gs-card-icon">&#128101;</div>
             <div class="gs-card-title">Create an Agent</div>
             <div class="gs-card-desc">Hire your first AI team member with a role, tools, and a channel.</div>
             <button class="btn btn-sm btn-primary" onclick="navigateTo('team')">Go to The Office</button>
           </div>
           <div class="gs-card" id="gs-step-channel">
-            <div class="gs-step-num">2</div>
+            <div class="gs-step-num">3</div>
             <div class="gs-card-icon">&#128172;</div>
             <div class="gs-card-title">Connect a Channel</div>
             <div class="gs-card-desc">Link Discord or Slack so your agents can communicate.</div>
             <button class="btn btn-sm" onclick="navigateTo('settings')">Open Settings</button>
           </div>
           <div class="gs-card" id="gs-step-task">
-            <div class="gs-step-num">3</div>
+            <div class="gs-step-num">4</div>
             <div class="gs-card-icon">&#9200;</div>
             <div class="gs-card-title">Schedule a Task</div>
             <div class="gs-card-desc">Set up cron jobs so agents work on autopilot.</div>
             <button class="btn btn-sm" onclick="navigateTo('automations')">Add a Task</button>
           </div>
           <div class="gs-card" id="gs-step-project">
-            <div class="gs-step-num">4</div>
+            <div class="gs-step-num">5</div>
             <div class="gs-card-icon">&#128194;</div>
             <div class="gs-card-title">Link a Project</div>
             <div class="gs-card-desc">Give agents context about your codebases and tools.</div>
@@ -9271,6 +9339,61 @@ function dismissGettingStarted() {
   if (el) el.style.display = 'none';
 }
 
+// ── Anthropic OAuth flow ─────────────────
+window._anthropicAuth = { authenticated: false, email: null };
+
+async function checkAnthropicAuth() {
+  try {
+    var r = await apiFetch('/api/auth/anthropic/status');
+    var d = await r.json();
+    window._anthropicAuth = d;
+    var card = document.getElementById('gs-step-auth');
+    var desc = document.getElementById('gs-auth-desc');
+    var btn = document.getElementById('gs-auth-btn');
+    if (d.authenticated && card) {
+      card.className = 'gs-card gs-done';
+      if (desc) desc.textContent = 'Connected as ' + d.email;
+      if (btn) { btn.textContent = 'Connected'; btn.disabled = true; }
+    }
+    // Also update settings auth indicator
+    var settingsAuth = document.getElementById('settings-auth-status');
+    if (settingsAuth) {
+      settingsAuth.innerHTML = d.authenticated
+        ? '<span style="color:var(--green)">Connected as ' + d.email + '</span>'
+        : '<span style="color:var(--text-muted)">Not connected</span>';
+    }
+    return d;
+  } catch { return { authenticated: false }; }
+}
+
+async function startAnthropicOAuth() {
+  var btn = document.getElementById('gs-auth-btn');
+  var desc = document.getElementById('gs-auth-desc');
+  if (btn) { btn.textContent = 'Opening login...'; btn.disabled = true; }
+  try {
+    var r = await apiFetch('/api/auth/anthropic/login', { method: 'POST' });
+    var d = await r.json();
+    if (!d.ok) throw new Error(d.error || 'Login failed');
+    if (desc) desc.textContent = 'Complete login in your browser, then wait...';
+    if (btn) btn.textContent = 'Waiting for login...';
+    // Poll for completion
+    var wr = await apiFetch('/api/auth/anthropic/wait', { method: 'POST' });
+    var wd = await wr.json();
+    if (wd.authenticated) {
+      window._anthropicAuth = wd;
+      var card = document.getElementById('gs-step-auth');
+      if (card) card.className = 'gs-card gs-done';
+      if (desc) desc.textContent = 'Connected as ' + wd.email;
+      if (btn) btn.textContent = 'Connected';
+    } else {
+      throw new Error(wd.error || 'Login did not complete');
+    }
+  } catch (err) {
+    if (desc) desc.textContent = 'Login failed: ' + err.message;
+    if (btn) { btn.textContent = 'Retry Login'; btn.disabled = false; }
+  }
+}
+
 // ── Authenticated fetch helper ────────────
 var _dashToken = document.querySelector('meta[name="dashboard-token"]')?.getAttribute('content') || '';
 function apiFetch(url, opts) {
@@ -10184,8 +10307,9 @@ async function refreshStatus() {
       if (gsEl && !window._gsDismissed) {
         var hasAgents = (d.activeAgents || 0) > 0;
         var hasCrons = (d.scheduledToday || 0) > 0 || (d.runsToday || 0) > 0;
-        var isNew = !hasAgents && !hasCrons;
-        gsEl.style.display = isNew ? 'block' : 'none';
+        var hasAuth = window._anthropicAuth && window._anthropicAuth.authenticated;
+        var isNew = !hasAgents && !hasCrons && !hasAuth;
+        gsEl.style.display = isNew || !hasAuth ? 'block' : 'none';
         // Mark completed steps
         var gsAgent = document.getElementById('gs-step-agent');
         var gsTask = document.getElementById('gs-step-task');
@@ -10193,6 +10317,8 @@ async function refreshStatus() {
         if (gsTask) gsTask.className = 'gs-card' + (hasCrons ? ' gs-done' : '');
         var gsChannel = document.getElementById('gs-step-channel');
         if (gsChannel && d.channels && d.channels.length > 0) gsChannel.className = 'gs-card gs-done';
+        // Auth status is checked separately — update card if already done
+        checkAnthropicAuth();
       }
     }
 
@@ -12220,11 +12346,23 @@ async function refreshSettings() {
     var html = '';
     for (var g of groups) {
       var anySet = g.fields.some(function(f) { return f.isSet; });
+      var isAnthropicGroup = g.label === 'Anthropic';
       html += '<div class="card" style="margin-bottom:16px">'
         + '<div class="card-header" style="display:flex;align-items:center;gap:8px">'
         + '<span>' + esc(g.label) + '</span>'
         + (anySet ? '<span class="badge badge-green" style="font-size:10px">Configured</span>' : '<span class="badge badge-gray" style="font-size:10px">Not configured</span>')
         + '</div><div class="card-body" style="padding:16px">';
+      if (isAnthropicGroup) {
+        html += '<div style="display:flex;align-items:center;gap:12px;margin-bottom:16px;padding:12px;border:1px solid var(--border);border-radius:8px;background:var(--bg-primary)">'
+          + '<div style="flex:1">'
+          + '<div style="font-weight:600;font-size:13px">Claude OAuth</div>'
+          + '<div style="font-size:11px;color:var(--text-muted);margin-top:2px">Login with your Anthropic account — no API key needed.</div>'
+          + '<div id="settings-auth-status" style="font-size:12px;margin-top:4px"><span style="color:var(--text-muted)">Checking...</span></div>'
+          + '</div>'
+          + '<button class="btn btn-sm btn-primary" onclick="startAnthropicOAuth()">Login with Claude</button>'
+          + '</div>'
+          + '<div style="font-size:11px;color:var(--text-muted);margin-bottom:12px;text-align:center">— or set an API key manually below —</div>';
+      }
       for (var f of g.fields) {
         var inputId = 'setting-' + f.key;
         var inputHtml = '';
@@ -12292,6 +12430,8 @@ async function refreshSettings() {
         }
       }
     }
+    // Check Anthropic OAuth status for the settings card
+    checkAnthropicAuth();
   } catch(e) {
     container.innerHTML = '<div class="empty-state" style="color:var(--red)">Failed to load settings: ' + esc(String(e)) + '</div>';
   }

@@ -147,7 +147,9 @@ export class GraphStore {
           } else if (attempts < 10) {
             setTimeout(reconnectLoop, 5 * 60_000);   // Back off to 5 min
           } else {
-            logger.warn('FalkorDB reconnect gave up after 10 attempts — graph features disabled until restart');
+            // Keep a slow background probe instead of giving up entirely
+            logger.warn({ attempts }, 'FalkorDB reconnect entering slow probe (every 30 min)');
+            setTimeout(reconnectLoop, 30 * 60_000);
           }
         };
         setTimeout(reconnectLoop, 30_000);
