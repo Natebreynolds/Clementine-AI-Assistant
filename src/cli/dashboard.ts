@@ -8397,10 +8397,11 @@ function getDashboardHTML(token: string): string {
         </div>
       </div>
 
-      <!-- Home Tabs: Activity | Metrics | Sessions -->
+      <!-- Home Tabs: Activity | Metrics | Agents | Sessions -->
       <div class="tab-bar" id="home-tabs">
         <button class="active" onclick="switchTab('home','activity')">Activity</button>
         <button onclick="switchTab('home','metrics')">Metrics</button>
+        <button onclick="switchTab('home','agents')">Agents</button>
         <button onclick="switchTab('home','sessions')">Sessions</button>
       </div>
       <div id="home-tab-content">
@@ -8427,6 +8428,9 @@ function getDashboardHTML(token: string): string {
         </div>
         <div class="tab-pane" id="tab-home-metrics">
           <div id="metrics-content-home"><div class="empty-state">Loading metrics...</div></div>
+        </div>
+        <div class="tab-pane" id="tab-home-agents">
+          <div id="panel-agents-compare"><div class="empty-state">Loading agent stats...</div></div>
         </div>
         <div class="tab-pane" id="tab-home-sessions">
           <div id="panel-sessions-home"><div class="empty-state">Loading sessions...</div></div>
@@ -9713,6 +9717,7 @@ function switchTab(group, tab) {
     if (tab === 'metrics') refreshHomeMetrics();
     if (tab === 'sessions') refreshHomeSessions();
     if (tab === 'activity') refreshActivity();
+    if (tab === 'agents') refreshAgentComparison();
   }
   if (group === 'settings') {
     if (tab === 'integrations') refreshSalesforce();
@@ -10074,6 +10079,51 @@ async function loadAgentDetailTab(tab, slug, isPrimary) {
         html += '</div>';
       }
     } catch(e) { /* audit optional */ }
+
+    // Agent usage stats (from new observability endpoint)
+    try {
+      var statsRes = await apiFetch('/api/agents/' + encodeURIComponent(agentSlugForExec || 'clementine') + '/stats?days=30');
+      var stats = await statsRes.json();
+      if (stats.ok && stats.numQueries > 0) {
+        html += '<div class="card" style="margin-bottom:16px"><div class="card-header">Usage Analytics (30 days)</div><div class="card-body">';
+        // Stats row
+        html += '<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:12px">';
+        html += '<div style="text-align:center;padding:10px"><div style="font-size:20px;font-weight:700;color:var(--purple)">' + fmtTokens(stats.totalTokens || 0) + '</div><div style="font-size:10px;color:var(--text-muted)">Total Tokens</div></div>';
+        html += '<div style="text-align:center;padding:10px"><div style="font-size:20px;font-weight:700;color:var(--accent)">' + (stats.numQueries || 0) + '</div><div style="font-size:10px;color:var(--text-muted)">Queries</div></div>';
+        html += '<div style="text-align:center;padding:10px"><div style="font-size:20px;font-weight:700;color:var(--text-secondary)">' + (stats.avgTurns || 0) + '</div><div style="font-size:10px;color:var(--text-muted)">Avg Turns/Query</div></div>';
+        var avgDurStats = stats.avgDurationMs < 60000 ? (stats.avgDurationMs / 1000).toFixed(0) + 's' : (stats.avgDurationMs / 60000).toFixed(1) + 'm';
+        html += '<div style="text-align:center;padding:10px"><div style="font-size:20px;font-weight:700;color:var(--text-secondary)">' + avgDurStats + '</div><div style="font-size:10px;color:var(--text-muted)">Avg Duration</div></div>';
+        html += '</div>';
+        // By source breakdown
+        if (stats.bySource && stats.bySource.length > 0) {
+          html += '<div style="margin-bottom:12px"><div style="font-size:11px;font-weight:600;color:var(--text-muted);margin-bottom:6px">By Source</div>';
+          html += '<div style="display:flex;gap:8px;flex-wrap:wrap">';
+          stats.bySource.forEach(function(s) {
+            var srcColor = s.source === 'chat' ? 'var(--accent)' : s.source === 'cron' ? 'var(--green)' : s.source === 'unleashed' ? 'var(--purple)' : 'var(--text-muted)';
+            html += '<div style="padding:6px 12px;border:1px solid var(--border);border-radius:6px;font-size:11px">';
+            html += '<span style="color:' + srcColor + ';font-weight:600">' + esc(s.source) + '</span>';
+            html += ' <span style="color:var(--text-muted)">' + s.count + ' runs, ' + fmtTokens(s.tokens || 0) + '</span>';
+            html += '</div>';
+          });
+          html += '</div></div>';
+        }
+        // Daily token sparkline (text-based mini chart)
+        if (stats.byDay && stats.byDay.length > 1) {
+          html += '<div><div style="font-size:11px;font-weight:600;color:var(--text-muted);margin-bottom:6px">Daily Token Usage</div>';
+          var maxTok = Math.max.apply(null, stats.byDay.map(function(d) { return d.tokens; }));
+          html += '<div style="display:flex;align-items:flex-end;gap:2px;height:50px">';
+          stats.byDay.forEach(function(d) {
+            var pct = maxTok > 0 ? Math.max(2, Math.round((d.tokens / maxTok) * 100)) : 2;
+            var dayLabel = d.day.slice(5); // MM-DD
+            html += '<div title="' + dayLabel + ': ' + fmtTokens(d.tokens) + '" style="flex:1;background:var(--accent);border-radius:2px 2px 0 0;min-width:4px;height:' + pct + '%;opacity:0.7"></div>';
+          });
+          html += '</div>';
+          html += '<div style="display:flex;justify-content:space-between;font-size:9px;color:var(--text-muted);margin-top:2px"><span>' + (stats.byDay[0].day || '').slice(5) + '</span><span>' + (stats.byDay[stats.byDay.length - 1].day || '').slice(5) + '</span></div>';
+          html += '</div>';
+        }
+        html += '</div></div>';
+      }
+    } catch(e) { /* stats optional */ }
 
     // Run history table
     try {
@@ -15454,10 +15504,27 @@ async function refreshSkills() {
       var shownTriggers = allTriggers.slice(0, 5).map(function(t) { return '<code style="font-size:11px;background:var(--bg-tertiary);padding:2px 6px;border-radius:3px">' + esc(t) + '</code>'; }).join(' ');
       var triggers = shownTriggers + (allTriggers.length > 5 ? ' <span style="font-size:11px;color:var(--text-muted)">+' + (allTriggers.length - 5) + ' more</span>' : '');
       var age = s.updatedAt ? timeAgo(s.updatedAt) : '';
+      // Source context for auto-extracted skills
+      var sourceCtx = '';
+      if (s.sourceJob) sourceCtx += '<span style="font-size:10px;color:var(--text-muted)">from ' + esc(s.sourceJob) + '</span>';
+      if (s.createdAt && (s.source === 'cron' || s.source === 'unleashed')) {
+        sourceCtx += '<span style="font-size:10px;color:var(--text-muted)">' + (sourceCtx ? ' \\u00b7 ' : '') + 'learned ' + timeAgo(s.createdAt) + '</span>';
+      }
+      // Tools used pills
+      var toolsPills = '';
+      if (s.toolsUsed && s.toolsUsed.length > 0) {
+        var shownTools = s.toolsUsed.slice(0, 4).map(function(t) {
+          return '<span style="font-size:10px;background:var(--accent)15;color:var(--accent);padding:1px 6px;border-radius:3px;border:1px solid var(--accent)30">' + esc(t) + '</span>';
+        }).join(' ');
+        toolsPills = '<div style="display:flex;gap:3px;flex-wrap:wrap;margin-top:4px">'
+          + shownTools
+          + (s.toolsUsed.length > 4 ? ' <span style="font-size:10px;color:var(--text-muted)">+' + (s.toolsUsed.length - 4) + '</span>' : '')
+          + '</div>';
+      }
       html += '<div id="skill-card-' + esc(s.name) + '" style="padding:12px;border:1px solid var(--border);border-radius:8px;background:var(--bg-secondary)">'
         + '<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">'
         + '<strong style="cursor:pointer" onclick="expandSkill(\\x27' + esc(s.name) + '\\x27)">' + esc(s.title) + '</strong> ' + sourceTag
-        + (s.sourceJob ? '<span style="font-size:11px;color:var(--text-muted)">from ' + esc(s.sourceJob) + '</span>' : '')
+        + (sourceCtx ? ' ' + sourceCtx : '')
         + '<span style="margin-left:auto;display:flex;align-items:center;gap:8px">'
         + '<span style="font-size:11px;color:var(--text-muted)">used ' + s.useCount + 'x' + (age ? ' \\u00b7 ' + age : '') + '</span>'
         + '<button onclick="expandSkill(\\x27' + esc(s.name) + '\\x27)" style="background:none;border:1px solid var(--border);border-radius:4px;padding:2px 8px;font-size:11px;color:var(--text-secondary);cursor:pointer">View</button>'
@@ -15465,8 +15532,9 @@ async function refreshSkills() {
         + '<button onclick="deleteSkill(\\x27' + esc(s.name) + '\\x27)" style="background:none;border:1px solid var(--border);border-radius:4px;padding:2px 8px;font-size:11px;color:var(--red);cursor:pointer">Delete</button>'
         + '</span>'
         + '</div>'
-        + '<div style="font-size:12px;color:var(--text-secondary);margin-bottom:6px">' + esc(s.description) + '</div>'
+        + '<div style="font-size:12px;color:var(--text-secondary);margin-bottom:4px">' + esc(s.description) + '</div>'
         + (triggers ? '<div style="display:flex;gap:4px;flex-wrap:wrap">' + triggers + '</div>' : '')
+        + toolsPills
         + '</div>';
     }
     html += '</div>';
@@ -15537,9 +15605,25 @@ async function loadAgentSkills(agentSlug, isPrimary) {
       var shownTriggersA = allTriggersA.slice(0, 5).map(function(t) { return '<code style="font-size:11px;background:var(--bg-tertiary);padding:2px 6px;border-radius:3px">' + esc(t) + '</code>'; }).join(' ');
       var triggers = shownTriggersA + (allTriggersA.length > 5 ? ' <span style="font-size:11px;color:var(--text-muted)">+' + (allTriggersA.length - 5) + ' more</span>' : '');
       var age = s.updatedAt ? timeAgo(s.updatedAt) : '';
+      var agentSourceCtx = '';
+      if (s.sourceJob) agentSourceCtx += '<span style="font-size:10px;color:var(--text-muted)">from ' + esc(s.sourceJob) + '</span>';
+      if (s.createdAt && (s.source === 'cron' || s.source === 'unleashed')) {
+        agentSourceCtx += '<span style="font-size:10px;color:var(--text-muted)">' + (agentSourceCtx ? ' \\u00b7 ' : '') + 'learned ' + timeAgo(s.createdAt) + '</span>';
+      }
+      var agentToolPills = '';
+      if (s.toolsUsed && s.toolsUsed.length > 0) {
+        var shownToolsA = s.toolsUsed.slice(0, 3).map(function(t) {
+          return '<span style="font-size:9px;background:var(--accent)15;color:var(--accent);padding:1px 5px;border-radius:3px;border:1px solid var(--accent)30">' + esc(t) + '</span>';
+        }).join(' ');
+        agentToolPills = '<div style="display:flex;gap:3px;flex-wrap:wrap;margin-top:3px">'
+          + shownToolsA
+          + (s.toolsUsed.length > 3 ? ' <span style="font-size:9px;color:var(--text-muted)">+' + (s.toolsUsed.length - 3) + '</span>' : '')
+          + '</div>';
+      }
       html += '<div id="agent-skill-card-' + esc(s.name) + '" style="padding:10px;border:1px solid var(--border);border-radius:8px;background:var(--bg-secondary)">'
         + '<div style="display:flex;align-items:center;gap:6px;margin-bottom:4px">'
         + '<strong style="cursor:pointer;font-size:13px" onclick="expandSkill(\\x27' + esc(s.name) + '\\x27)">' + esc(s.title) + '</strong> ' + sourceTag + ' ' + scopeTag
+        + (agentSourceCtx ? ' ' + agentSourceCtx : '')
         + '<span style="margin-left:auto;display:flex;align-items:center;gap:6px">'
         + '<span style="font-size:11px;color:var(--text-muted)">used ' + (s.useCount || 0) + 'x' + (age ? ' \\u00b7 ' + age : '') + '</span>'
         + '<button onclick="expandSkill(\\x27' + esc(s.name) + '\\x27)" style="background:none;border:1px solid var(--border);border-radius:4px;padding:2px 8px;font-size:10px;color:var(--text-secondary);cursor:pointer">View</button>'
@@ -15548,6 +15632,7 @@ async function loadAgentSkills(agentSlug, isPrimary) {
         + '</span></div>'
         + (s.description ? '<div style="font-size:12px;color:var(--text-secondary);margin-bottom:4px">' + esc(s.description) + '</div>' : '')
         + (triggers ? '<div style="display:flex;gap:4px;flex-wrap:wrap">' + triggers + '</div>' : '')
+        + agentToolPills
         + '</div>';
     }
     html += '</div>';
@@ -16152,6 +16237,98 @@ async function refreshTeamPulse() {
     container.innerHTML = html || '<div class="empty-state">No agents configured</div>';
   } catch(e) {
     container.innerHTML = '<div class="empty-state">Failed to load team</div>';
+  }
+}
+
+// ── Home Page: Agents Comparison Tab ─────
+async function refreshAgentComparison() {
+  var container = document.getElementById('panel-agents-compare');
+  if (!container) return;
+  container.innerHTML = '<div class="empty-state">Loading...</div>';
+  try {
+    var r = await apiFetch('/api/agents/compare?days=30');
+    var d = await r.json();
+    var agents = d.agents || [];
+
+    if (agents.length === 0) {
+      container.innerHTML = '<div class="empty-state">No agent usage data yet. Stats are collected as agents handle queries.</div>';
+      return;
+    }
+
+    var html = '<div class="card"><div class="card-header" style="display:flex;justify-content:space-between;align-items:center">'
+      + '<span>Agent Usage (30 days)</span>'
+      + '<span class="badge badge-gray" style="font-size:10px">' + agents.length + ' agent' + (agents.length !== 1 ? 's' : '') + '</span>'
+      + '</div><div class="card-body" style="padding:0">';
+    html += '<table style="width:100%;border-collapse:collapse">';
+    html += '<thead><tr style="border-bottom:1px solid var(--border)">';
+    html += '<th style="padding:10px 12px;text-align:left;color:var(--text-muted);font-size:11px">Agent</th>';
+    html += '<th style="padding:10px 12px;text-align:right;color:var(--text-muted);font-size:11px">Tokens</th>';
+    html += '<th style="padding:10px 12px;text-align:right;color:var(--text-muted);font-size:11px">Queries</th>';
+    html += '<th style="padding:10px 12px;text-align:right;color:var(--text-muted);font-size:11px">Avg Turns</th>';
+    html += '<th style="padding:10px 12px;text-align:right;color:var(--text-muted);font-size:11px">Est. Cost</th>';
+    html += '</tr></thead><tbody>';
+
+    var maxTokens = agents.length > 0 ? agents[0].totalTokens : 1;
+    agents.forEach(function(a, idx) {
+      var barPct = Math.max(2, Math.round((a.totalTokens / maxTokens) * 100));
+      var costEst = ((a.totalTokens / 1000000) * 3).toFixed(2); // rough ~$3/MTok estimate
+      var rankColor = idx === 0 ? 'var(--accent)' : 'var(--text-primary)';
+      html += '<tr style="border-bottom:1px solid var(--border)">';
+      html += '<td style="padding:10px 12px">';
+      html += '<div style="font-weight:600;font-size:13px;color:' + rankColor + '">' + esc(a.agentSlug || 'clementine') + '</div>';
+      html += '<div style="background:var(--bg-tertiary);border-radius:2px;height:4px;margin-top:4px;overflow:hidden"><div style="background:var(--accent);height:100%;width:' + barPct + '%;border-radius:2px"></div></div>';
+      html += '</td>';
+      html += '<td style="padding:10px 12px;text-align:right;font-size:13px;font-weight:500">' + fmtTokens(a.totalTokens || 0) + '</td>';
+      html += '<td style="padding:10px 12px;text-align:right;font-size:13px">' + (a.numQueries || 0) + '</td>';
+      html += '<td style="padding:10px 12px;text-align:right;font-size:13px">' + (Math.round((a.avgTurns || 0) * 10) / 10) + '</td>';
+      html += '<td style="padding:10px 12px;text-align:right;font-size:13px;color:var(--text-muted)">$' + costEst + '</td>';
+      html += '</tr>';
+    });
+
+    html += '</tbody></table></div></div>';
+
+    // Skills summary card
+    try {
+      var skillsRes = await apiFetch('/api/skills');
+      var skillsData = await skillsRes.json();
+      var skills = skillsData.skills || [];
+      if (skills.length > 0) {
+        var autoSkills = skills.filter(function(s) { return s.source === 'cron' || s.source === 'unleashed'; });
+        var builtSkills = skills.filter(function(s) { return s.source === 'builder'; });
+        var manualSkills = skills.filter(function(s) { return s.source === 'manual'; });
+        var totalUses = skills.reduce(function(sum, s) { return sum + (s.useCount || 0); }, 0);
+
+        html += '<div class="card" style="margin-top:16px"><div class="card-header">Skills Overview</div><div class="card-body">';
+        html += '<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:12px">';
+        html += '<div style="text-align:center;padding:10px"><div style="font-size:20px;font-weight:700;color:var(--accent)">' + skills.length + '</div><div style="font-size:10px;color:var(--text-muted)">Total Skills</div></div>';
+        html += '<div style="text-align:center;padding:10px"><div style="font-size:20px;font-weight:700;color:var(--green)">' + autoSkills.length + '</div><div style="font-size:10px;color:var(--text-muted)">Auto-Learned</div></div>';
+        html += '<div style="text-align:center;padding:10px"><div style="font-size:20px;font-weight:700;color:var(--purple)">' + builtSkills.length + '</div><div style="font-size:10px;color:var(--text-muted)">Built in Studio</div></div>';
+        html += '<div style="text-align:center;padding:10px"><div style="font-size:20px;font-weight:700;color:var(--text-secondary)">' + totalUses + '</div><div style="font-size:10px;color:var(--text-muted)">Total Uses</div></div>';
+        html += '</div>';
+
+        // Most used skills
+        var sorted = skills.slice().sort(function(a, b) { return (b.useCount || 0) - (a.useCount || 0); });
+        var topSkills = sorted.filter(function(s) { return s.useCount > 0; }).slice(0, 5);
+        if (topSkills.length > 0) {
+          html += '<div style="font-size:11px;font-weight:600;color:var(--text-muted);margin-bottom:6px">Most Used</div>';
+          topSkills.forEach(function(s) {
+            var srcBadge = s.source === 'cron' ? '<span style="font-size:9px;background:var(--green)20;color:var(--green);padding:1px 5px;border-radius:3px">cron</span>'
+              : s.source === 'unleashed' ? '<span style="font-size:9px;background:var(--purple)20;color:var(--purple);padding:1px 5px;border-radius:3px">unleashed</span>'
+              : s.source === 'builder' ? '<span style="font-size:9px;background:var(--accent)20;color:var(--accent);padding:1px 5px;border-radius:3px">built</span>'
+              : '';
+            html += '<div style="display:flex;align-items:center;gap:8px;padding:4px 0;font-size:12px">';
+            html += '<span style="font-weight:500;flex:1">' + esc(s.title) + '</span> ' + srcBadge;
+            html += '<span style="color:var(--text-muted)">' + s.useCount + ' uses</span>';
+            html += '</div>';
+          });
+        }
+        html += '</div></div>';
+      }
+    } catch(e) { /* skills summary optional */ }
+
+    container.innerHTML = html;
+  } catch(e) {
+    container.innerHTML = '<div class="empty-state" style="color:var(--red)">Failed to load agent comparison</div>';
   }
 }
 
