@@ -8,7 +8,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync } from 'node:fs';
 import pino from 'pino';
 import type { PersonalAssistant } from './assistant.js';
-import type { PlanStep, ExecutionPlan, PlanProgressUpdate } from '../types.js';
+import type { AgentProfile, PlanStep, ExecutionPlan, PlanProgressUpdate } from '../types.js';
 import { PLAN_STATE_DIR } from '../config.js';
 
 const logger = pino({ name: 'clementine.orchestrator' });
@@ -163,6 +163,7 @@ export class PlanOrchestrator {
   private stepStartTimes = new Map<string, number>();
   private startTime = 0;
   private stateId: string;
+  private agentProfiles = new Map<string, AgentProfile>();
 
   constructor(assistant: PersonalAssistant) {
     this.assistant = assistant;
@@ -209,11 +210,20 @@ export class PlanOrchestrator {
     taskDescription: string,
     onProgress?: (updates: PlanProgressUpdate[]) => Promise<void>,
     onApproval?: (planSummary: string, steps: PlanStep[]) => Promise<boolean | string>,
+    availableAgents?: AgentProfile[],
   ): Promise<string> {
     // Reset instance state for reuse safety
     this.stepStatuses.clear();
     this.stepStartTimes.clear();
+    this.agentProfiles.clear();
     this.startTime = Date.now();
+
+    // Index available agents for delegation lookups
+    if (availableAgents) {
+      for (const agent of availableAgents) {
+        this.agentProfiles.set(agent.slug, agent);
+      }
+    }
 
     const safeProgress = async (updates: PlanProgressUpdate[]): Promise<void> => {
       try { await onProgress?.(updates); } catch (err) {
@@ -231,7 +241,7 @@ export class PlanOrchestrator {
     // Plan → approval → (optional revision) loop
     planLoop: while (true) {
       try {
-        plan = await this.generatePlan(effectiveTask);
+        plan = await this.generatePlan(effectiveTask, availableAgents);
       } catch (err) {
         logger.warn({ err }, 'Plan generation failed — running as single step');
         return this.runSingleStep(taskDescription);
@@ -334,10 +344,15 @@ export class PlanOrchestrator {
       const settled = await settledWithLimit(
         wave.map((step) => async () => {
           const prompt = this.buildStepPrompt(step, results, waveSummaryContext);
+          const delegateProfile = step.delegateTo ? this.agentProfiles.get(step.delegateTo) : undefined;
+          if (step.delegateTo) {
+            logger.info({ stepId: step.id, delegateTo: step.delegateTo }, 'Delegating step to specialist agent');
+          }
           const result = await this.assistant.runPlanStep(step.id, prompt, {
             tier: step.tier ?? 2,
             maxTurns: step.maxTurns ?? 15,
             model: step.model,
+            delegateProfile,
           });
           return { stepId: step.id, result };
         }),
@@ -695,10 +710,22 @@ export class PlanOrchestrator {
 
   // ── Private helpers ──────────────────────────────────────────────────
 
-  private async generatePlan(task: string): Promise<ExecutionPlan> {
+  private async generatePlan(task: string, availableAgents?: AgentProfile[]): Promise<ExecutionPlan> {
+    // If team agents are available, inject their capabilities into the planner prompt
+    let agentContext = '';
+    if (availableAgents && availableAgents.length > 0) {
+      const agentLines = availableAgents.map(a => {
+        const tools = a.team?.allowedTools?.slice(0, 10).join(', ') || 'all tools';
+        return `- **${a.slug}**: ${a.description || a.name} (model: ${a.model || 'sonnet'}, tools: ${tools})`;
+      });
+      agentContext = `\n\n**Available Team Agents (delegate specialized steps to them via "delegateTo"):**\n${agentLines.join('\n')}\n` +
+        `If a step matches an agent's specialty, add "delegateTo": "agent-slug" to that step. ` +
+        `The delegated agent will run the step with their own personality, tools, and expertise.\n`;
+    }
+
     const plannerResult = await this.assistant.runPlanStep(
       'planner',
-      PLANNER_PROMPT + task + PLANNER_PROMPT_SUFFIX,
+      PLANNER_PROMPT + agentContext + task + PLANNER_PROMPT_SUFFIX,
       { tier: 2, maxTurns: 1, model: 'sonnet', disableTools: true },
     );
 
@@ -739,6 +766,11 @@ export class PlanOrchestrator {
       // Validate model
       const model = ALLOWED_MODELS.includes(s.model) ? s.model : undefined;
 
+      // Validate delegateTo — must be one of the available agents
+      const delegateTo = (typeof s.delegateTo === 'string' && availableAgents?.some(a => a.slug === s.delegateTo))
+        ? s.delegateTo
+        : undefined;
+
       steps.push({
         id,
         description: (s.description || `Step ${i + 1}`).slice(0, 80),
@@ -747,6 +779,7 @@ export class PlanOrchestrator {
         maxTurns: Math.min(Math.max(s.maxTurns ?? 15, 1), 50),
         tier: Math.min(s.tier ?? 2, 2), // Never exceed tier 2 from planner
         model,
+        delegateTo,
       });
     }
 

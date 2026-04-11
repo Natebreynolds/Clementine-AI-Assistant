@@ -297,6 +297,12 @@ export class MemoryStore {
       CREATE INDEX IF NOT EXISTS idx_usage_created ON usage_log(created_at);
     `);
 
+    // Migration: add agent_slug column for per-agent observability
+    try {
+      this.conn.exec(`ALTER TABLE usage_log ADD COLUMN agent_slug TEXT DEFAULT NULL`);
+      this.conn.exec(`CREATE INDEX IF NOT EXISTS idx_usage_agent ON usage_log(agent_slug)`);
+    } catch { /* column already exists */ }
+
     // ── SDR Operational Tables ───────────────────────────────────────
 
     // Leads — structured prospect records for SDR workflows
@@ -1815,11 +1821,12 @@ export class MemoryStore {
     modelUsage: Record<string, { inputTokens: number; outputTokens: number; cacheReadInputTokens: number; cacheCreationInputTokens: number }>;
     numTurns: number;
     durationMs: number;
+    agentSlug?: string;
   }): void {
     if (!this._stmtInsertUsage) {
       this._stmtInsertUsage = this.conn.prepare(
-        `INSERT INTO usage_log (session_key, source, model, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, num_turns, duration_ms)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO usage_log (session_key, source, model, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, num_turns, duration_ms, agent_slug)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       );
     }
     for (const [model, usage] of Object.entries(entry.modelUsage)) {
@@ -1833,6 +1840,7 @@ export class MemoryStore {
         usage.cacheCreationInputTokens ?? 0,
         entry.numTurns ?? 0,
         entry.durationMs ?? 0,
+        entry.agentSlug ?? null,
       );
     }
   }
@@ -1889,6 +1897,76 @@ export class MemoryStore {
       bySource,
       byDay,
     };
+  }
+
+  /**
+   * Get per-agent usage stats for observability dashboard.
+   */
+  getAgentStats(agentSlug: string, sinceIso?: string): {
+    totalInput: number;
+    totalOutput: number;
+    totalTokens: number;
+    numQueries: number;
+    avgTurns: number;
+    avgDurationMs: number;
+    bySource: Array<{ source: string; count: number; tokens: number }>;
+    byDay: Array<{ day: string; tokens: number; count: number }>;
+  } {
+    const where = sinceIso
+      ? `WHERE agent_slug = ? AND created_at >= ?`
+      : `WHERE agent_slug = ?`;
+    const params = sinceIso ? [agentSlug, sinceIso] : [agentSlug];
+
+    const totals = this.conn.prepare(
+      `SELECT COALESCE(SUM(input_tokens), 0) as ti, COALESCE(SUM(output_tokens), 0) as to_,
+              COUNT(*) as cnt, COALESCE(AVG(num_turns), 0) as avg_turns,
+              COALESCE(AVG(duration_ms), 0) as avg_dur
+       FROM usage_log ${where}`,
+    ).get(...params) as { ti: number; to_: number; cnt: number; avg_turns: number; avg_dur: number };
+
+    const bySource = this.conn.prepare(
+      `SELECT source, COUNT(*) as count, SUM(input_tokens + output_tokens) as tokens
+       FROM usage_log ${where} GROUP BY source ORDER BY tokens DESC`,
+    ).all(...params) as Array<{ source: string; count: number; tokens: number }>;
+
+    const byDay = this.conn.prepare(
+      `SELECT date(created_at) as day, SUM(input_tokens + output_tokens) as tokens, COUNT(*) as count
+       FROM usage_log ${where} ${sinceIso ? 'AND' : 'AND'} created_at >= date('now', '-14 days')
+       GROUP BY date(created_at) ORDER BY day`,
+    ).all(...params) as Array<{ day: string; tokens: number; count: number }>;
+
+    return {
+      totalInput: totals.ti,
+      totalOutput: totals.to_,
+      totalTokens: totals.ti + totals.to_,
+      numQueries: totals.cnt,
+      avgTurns: Math.round(totals.avg_turns * 10) / 10,
+      avgDurationMs: Math.round(totals.avg_dur),
+      bySource,
+      byDay,
+    };
+  }
+
+  /**
+   * Compare all agents by usage. Returns a leaderboard.
+   */
+  getAgentComparison(sinceIso?: string): Array<{
+    agentSlug: string;
+    totalTokens: number;
+    numQueries: number;
+    avgTurns: number;
+  }> {
+    const where = sinceIso ? `WHERE agent_slug IS NOT NULL AND created_at >= ?` : `WHERE agent_slug IS NOT NULL`;
+    const params = sinceIso ? [sinceIso] : [];
+
+    return this.conn.prepare(
+      `SELECT agent_slug as agentSlug,
+              SUM(input_tokens + output_tokens) as totalTokens,
+              COUNT(*) as numQueries,
+              COALESCE(AVG(num_turns), 0) as avgTurns
+       FROM usage_log ${where}
+       GROUP BY agent_slug ORDER BY totalTokens DESC`,
+    ).all(...params) as Array<{ agentSlug: string; totalTokens: number; numQueries: number; avgTurns: number }>;
   }
 
   /**

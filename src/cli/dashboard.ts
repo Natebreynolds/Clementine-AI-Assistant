@@ -4262,6 +4262,43 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
   });
 
   /** Per-agent KPI scorecards. */
+  // Agent usage stats (from usage_log with agent_slug)
+  app.get('/api/agents/:slug/stats', async (req, res) => {
+    try {
+      const slug = req.params.slug;
+      const days = Math.min(Number(req.query.days) || 30, 90);
+      const sinceIso = new Date(Date.now() - days * 86400000).toISOString();
+      const gateway = await getGateway();
+      const store = (gateway as any).assistant?.memoryStore;
+      if (!store || !store.getAgentStats) {
+        res.json({ error: 'Memory store not available' });
+        return;
+      }
+      const stats = store.getAgentStats(slug, sinceIso);
+      res.json({ ok: true, slug, period: { days, since: sinceIso }, ...stats });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  // Agent comparison leaderboard
+  app.get('/api/agents/compare', async (req, res) => {
+    try {
+      const days = Math.min(Number(req.query.days) || 30, 90);
+      const sinceIso = new Date(Date.now() - days * 86400000).toISOString();
+      const gateway = await getGateway();
+      const store = (gateway as any).assistant?.memoryStore;
+      if (!store || !store.getAgentComparison) {
+        res.json({ agents: [] });
+        return;
+      }
+      const agents = store.getAgentComparison(sinceIso);
+      res.json({ ok: true, period: { days, since: sinceIso }, agents });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
   app.get('/api/agents/:slug/kpis', async (req, res) => {
     const slug = req.params.slug;
     const days = Math.min(Number(req.query.days) || 7, 90);

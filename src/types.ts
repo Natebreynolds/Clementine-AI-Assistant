@@ -447,6 +447,7 @@ export interface PlanStep {
   maxTurns: number;        // Turns budget for this step (default 15, up to 50 for complex)
   tier: number;            // Security tier (default 2)
   model?: string;          // Optional model override (e.g., "haiku" for simple lookups)
+  delegateTo?: string;     // Agent slug to delegate this step to (uses their profile, tools, personality)
 }
 
 export interface ExecutionPlan {

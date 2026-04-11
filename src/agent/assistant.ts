@@ -549,6 +549,7 @@ export class PersonalAssistant {
   private _lastTerminalReason?: string;
   /** Per-session stall nudge — set after a query shows stall signals, consumed on the next query. */
   private stallNudges = new Map<string, string>();
+  private _compactedSessions = new Set<string>();
   /** Hot correction buffer — explicit behavioral corrections applied before nightly SI. */
   private hotCorrections: Array<{ correction: string; category: string; timestamp: string }> = [];
 
@@ -575,10 +576,11 @@ export class PersonalAssistant {
   // ── Shared stream helpers ──────────────────────────────────────────
 
   /** Log SDK result metrics and store usage. Shared across all query methods. */
-  private logQueryResult(result: SDKResultMessage, source: string, sessionKey: string, label?: string): void {
+  private logQueryResult(result: SDKResultMessage, source: string, sessionKey: string, label?: string, agentSlug?: string): void {
     if ('total_cost_usd' in result) {
       logger.info({
         ...(label ? { job: label } : {}),
+        ...(agentSlug ? { agent: agentSlug } : {}),
         cost_usd: result.total_cost_usd,
         num_turns: result.num_turns,
         duration_ms: result.duration_ms,
@@ -592,6 +594,7 @@ export class PersonalAssistant {
           modelUsage: result.modelUsage,
           numTurns: result.num_turns,
           durationMs: result.duration_ms,
+          agentSlug: agentSlug ?? undefined,
         });
       } catch (err) {
         logger.warn({ err }, 'Usage logging failed');
@@ -673,6 +676,29 @@ export class PersonalAssistant {
         // Mark as restored so first post-restart message injects context
         this.restoredSessions.add(key);
       }
+      // ── Crash Recovery: check event log for orphaned queries ──────
+      try {
+        const eventLog = getEventLog();
+        for (const key of this.sessions.keys()) {
+          if (eventLog.hasOrphanedQuery(key)) {
+            const recoveryCtx = eventLog.getRecoveryContext(key);
+            if (recoveryCtx) {
+              logger.info({ sessionKey: key }, 'Crash recovery: found orphaned query — injecting recovery context');
+              // Inject recovery as a pending context entry so the next message picks it up
+              const pending = this.pendingContext.get(key) ?? [];
+              pending.push({ user: '[system] Session interrupted', assistant: recoveryCtx });
+              this.pendingContext.set(key, pending);
+              // Mark as restored so the context gets injected
+              this.restoredSessions.add(key);
+              // Close the orphaned query in the event log
+              eventLog.emitQueryEnd(key, { responseLength: 0, terminalReason: 'crash_recovery', durationMs: 0 });
+            }
+          }
+        }
+      } catch (err) {
+        logger.debug({ err }, 'Crash recovery check failed — non-fatal');
+      }
+
     } catch (err) {
       logger.warn({ err }, 'Session restore failed — starting fresh');
     }
@@ -1963,6 +1989,19 @@ You have a limited number of turns per message (~15). **After 8-10 tool calls, y
             estimatedTokens: totalEstimate,
             remaining: remainingTokens,
           }, 'Context window guard: context getting tight');
+
+          // Auto-compact: summarize conversation into working memory and rotate session
+          // This prevents hitting the hard rotation limit with a jarring "session reset" message
+          if (sessionKey && !this._compactedSessions.has(sessionKey)) {
+            this._compactedSessions.add(sessionKey);
+            try {
+              this.compactContext(sessionKey);
+              logger.info({ sessionKey }, 'Context compaction: wrote summary to working memory and rotated session');
+              getEventLog().emit(sessionKey, 'compaction', { remainingTokens, exchanges: this.exchangeCounts.get(sessionKey) ?? 0 });
+            } catch (err) {
+              logger.debug({ err, sessionKey }, 'Context compaction failed — non-fatal');
+            }
+          }
         }
 
         let responseText = '';
@@ -2018,7 +2057,7 @@ You have a limited number of turns per message (~15). **After 8-10 tool calls, y
               const result = message as SDKResultMessage;
               sessionId = result.session_id;
               this._lastTerminalReason = (result as any).terminal_reason ?? undefined;
-              this.logQueryResult(result, 'chat', sessionKey ?? 'unknown');
+              this.logQueryResult(result, 'chat', sessionKey ?? 'unknown', undefined, profile?.slug);
               if (result.is_error) {
                 // Error subtypes have `errors` array; success subtype has `result` string
                 const errorText = 'errors' in result ? result.errors.join('; ') : ('result' in result ? result.result : '');
@@ -2199,6 +2238,56 @@ You have a limited number of turns per message (~15). **After 8-10 tool calls, y
       setAgentDir(null);
       setInteractionSource('autonomous');
     }
+  }
+
+  // ── Context Compaction ────────────────────────────────────────────
+
+  /**
+   * Compact a session's context when nearing the context window limit.
+   *
+   * Inspired by Anthropic's context compaction pattern: summarize what happened,
+   * write to working memory (which is injected into every new system prompt),
+   * and rotate the session so the next message starts fresh with the summary.
+   *
+   * No LLM call — uses buildLocalSummary for instant summarization.
+   */
+  private compactContext(sessionKey: string): void {
+    const summary = this.buildLocalSummary(sessionKey);
+    if (!summary) return;
+
+    // Build compaction block for working memory
+    const exchangeCount = this.exchangeCounts.get(sessionKey) ?? 0;
+    const compactionBlock = [
+      `## Session Compaction (auto-generated)`,
+      `Session ${sessionKey} compacted at ${exchangeCount} exchanges.`,
+      ``,
+      summary,
+      ``,
+      `*Continue from where this conversation left off.*`,
+    ].join('\n');
+
+    // Write to working memory so the next session picks it up via system prompt
+    try {
+      const existing = fs.existsSync(WORKING_MEMORY_FILE)
+        ? fs.readFileSync(WORKING_MEMORY_FILE, 'utf-8')
+        : '';
+
+      // Replace any prior compaction block, or append
+      const compactionRegex = /## Session Compaction \(auto-generated\)[\s\S]*?\*Continue from where this conversation left off\.\*/;
+      const updated = compactionRegex.test(existing)
+        ? existing.replace(compactionRegex, compactionBlock)
+        : existing.trimEnd() + '\n\n' + compactionBlock;
+
+      fs.writeFileSync(WORKING_MEMORY_FILE, updated);
+    } catch {
+      // If working memory write fails, still rotate — better than hitting the hard limit
+    }
+
+    // Rotate session — clear the session ID so next query starts fresh
+    // The working memory summary will provide continuity
+    this.sessions.delete(sessionKey);
+    this.exchangeCounts.set(sessionKey, 0);
+    this.saveSessions();
   }
 
   // ── Session Summarization ─────────────────────────────────────────
@@ -2865,9 +2954,9 @@ You have a limited number of turns per message (~15). **After 8-10 tool calls, y
   async runPlanStep(
     stepId: string,
     prompt: string,
-    opts: { tier?: number; maxTurns?: number; model?: string; disableTools?: boolean; outputFormat?: { type: 'json_schema'; schema: Record<string, unknown> } } = {},
+    opts: { tier?: number; maxTurns?: number; model?: string; disableTools?: boolean; outputFormat?: { type: 'json_schema'; schema: Record<string, unknown> }; delegateProfile?: AgentProfile } = {},
   ): Promise<string> {
-    const { tier = 2, maxTurns = 15, model, disableTools = false, outputFormat } = opts;
+    const { tier = 2, maxTurns = 15, model, disableTools = false, outputFormat, delegateProfile } = opts;
 
     // Don't mutate the global — pass source through the closure instead
     // Per-step stall guard so concurrent steps don't cross-contaminate
@@ -2876,13 +2965,14 @@ You have a limited number of turns per message (~15). **After 8-10 tool calls, y
       isHeartbeat: false,
       cronTier: tier,
       maxTurns,
-      model: model ?? null,
+      model: delegateProfile?.model ?? model ?? null,
       enableTeams: false,
       isPlanStep: true,
       sourceOverride: 'owner-dm',
       disableAllTools: disableTools,
       outputFormat,
       stallGuard: stepGuard,
+      profile: delegateProfile ?? null,
     });
 
     const trace: TraceEntry[] = [];
@@ -3153,7 +3243,7 @@ You have a limited number of turns per message (~15). **After 8-10 tool calls, y
                 throw new Error(`Budget exceeded for cron job '${jobName}'`);
               }
             }
-            this.logQueryResult(result, 'cron', `cron:${jobName}`, jobName);
+            this.logQueryResult(result, 'cron', `cron:${jobName}`, jobName, sdkOptions.env?.CLEMENTINE_TEAM_AGENT || undefined);
           } else if (message.type === 'system') {
             this.captureMcpStatus(message);
           } else if (message.type === 'stream_event') {
