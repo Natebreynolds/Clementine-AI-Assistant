@@ -8084,6 +8084,10 @@ function getDashboardHTML(token: string): string {
         <span class="nav-icon">&#9200;</span> Scheduled Tasks
         <span class="nav-badge" id="nav-cron-count">0</span>
       </div>
+      <div class="nav-item" onclick="navigateTo('automations'); setTimeout(function(){ switchTab('automations','skills'); }, 50)">
+        <span class="nav-icon">&#128161;</span> Skills
+        <span class="nav-badge" id="nav-skill-count" style="display:none">0</span>
+      </div>
       <div class="nav-item" data-page="workflows">
         <span class="nav-icon">&#128260;</span> Workflows
       </div>
@@ -8238,7 +8242,7 @@ function getDashboardHTML(token: string): string {
     </div>
 
     <!-- ═══ Builder Page — Conversational Artifact Creation ═══ -->
-    <div class="page" id="page-builder" style="display:flex;flex-direction:column;height:100%">
+    <div class="page" id="page-builder">
       <div style="display:flex;align-items:center;gap:12px;padding:12px 16px;border-bottom:1px solid var(--border)">
         <span class="page-title" style="margin:0;font-size:16px">Builder</span>
         <select id="builder-type" onchange="resetBuilder()" style="padding:6px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg-secondary);color:var(--text-primary);font-size:13px">
@@ -9281,6 +9285,19 @@ function getDashboardHTML(token: string): string {
 
 <div class="toast-container" id="toasts"></div>
 
+<!-- ═══ Session Viewer Modal ═══ -->
+<div class="modal-overlay" id="session-modal" onclick="if(event.target===this)closeSessionModal()">
+  <div class="modal" style="width:680px">
+    <div class="modal-header">
+      <h3 id="session-modal-title">Session</h3>
+      <button class="btn-ghost btn-sm" onclick="closeSessionModal()">&times;</button>
+    </div>
+    <div class="modal-body" id="session-modal-body">
+      <div class="empty-state">Loading session...</div>
+    </div>
+  </div>
+</div>
+
 <script>
 // ── Block-letter wordmark (matches terminal banner) ──
 (function() {
@@ -9526,7 +9543,7 @@ async function renderAgentDetail(slug) {
     var agent = null;
     var isPrimary = !slug || slug === '';
     if (isPrimary) {
-      agent = { name: clem.name || 'Clementine', slug: '', status: clem.alive ? 'active' : 'offline', description: 'Primary AI Assistant', model: '', isPrimary: true, sessions: clem.sessions, crons: clem.crons, tokens: clem.tokens, currentActivity: clem.currentActivity, uptime: clem.uptime, channels: clem.channels || [], budgetMonthlyCents: 0 };
+      agent = { name: clem.name || 'Clementine', slug: '', status: clem.status === 'online' ? 'active' : 'offline', description: 'Primary AI Assistant', model: '', isPrimary: true, sessions: clem.sessions, crons: clem.crons, tokens: clem.tokens, currentActivity: clem.currentActivity, uptime: clem.uptime, channels: clem.channels || [], budgetMonthlyCents: 0 };
     } else {
       for (var i = 0; i < agents.length; i++) {
         if (agents[i].slug === slug) { agent = agents[i]; break; }
@@ -10508,6 +10525,67 @@ async function viewSession(encodedKey) {
     panel.innerHTML = '<div class="empty-state" style="color:var(--red)">Error loading session: ' + esc(String(e)) + '</div>'
       + '<button class="btn-primary btn-sm" onclick="refreshSessions()">&larr; Back</button>';
   }
+}
+
+// ── Session Modal Viewer ─────────────────────────────
+async function viewSessionModal(encodedKey) {
+  var key = decodeURIComponent(encodedKey);
+  var modal = document.getElementById('session-modal');
+  var body = document.getElementById('session-modal-body');
+  var title = document.getElementById('session-modal-title');
+  var friendly = friendlySession(key);
+  title.innerHTML = friendly.icon + ' ' + esc(friendly.label);
+  body.innerHTML = '<div class="empty-state">Loading session...</div>';
+  modal.classList.add('show');
+
+  try {
+    var [msgRes, usageRes] = await Promise.all([
+      apiFetch('/api/sessions/' + encodedKey + '/messages'),
+      apiFetch('/api/sessions/' + encodedKey + '/usage'),
+    ]);
+    var msgData = await msgRes.json();
+    var usageData = await usageRes.json();
+    var html = '';
+
+    if (usageData.totalTokens > 0) {
+      html += '<div class="stat-grid" style="margin-bottom:12px">'
+        + statTile(formatTokens(usageData.totalTokens), 'Total Tokens')
+        + statTile(formatTokens(usageData.totalInput || 0), 'Input')
+        + statTile(formatTokens(usageData.totalOutput || 0), 'Output')
+        + statTile(usageData.numQueries || 0, 'Queries')
+        + '</div>';
+    }
+
+    var messages = msgData.messages || [];
+    if (messages.length === 0) {
+      html += '<div class="empty-state">No conversation history available</div>';
+    } else {
+      html += '<div style="max-height:60vh;overflow-y:auto;border:1px solid var(--border);border-radius:8px;padding:12px">';
+      for (var msg of messages) {
+        if (msg.role === 'system') continue;
+        var isUser = msg.role === 'user';
+        var bubbleStyle = isUser
+          ? 'background:var(--blue);color:#fff;margin-left:40px;border-radius:12px 12px 4px 12px'
+          : 'background:var(--bg-secondary);border:1px solid var(--border);margin-right:40px;border-radius:12px 12px 12px 4px';
+        var label = isUser ? 'You' : 'Assistant';
+        var content = msg.content || '';
+        if (content.length > 1000) content = content.slice(0, 1000) + '...';
+        html += '<div style="margin-bottom:10px">'
+          + '<div style="font-size:10px;color:var(--text-muted);margin-bottom:2px;' + (isUser ? 'text-align:right' : '') + '">'
+          + esc(label) + (msg.createdAt ? ' &middot; ' + timeAgo(msg.createdAt) : '') + '</div>'
+          + '<div style="padding:10px 14px;font-size:13px;line-height:1.5;white-space:pre-wrap;word-break:break-word;' + bubbleStyle + '">'
+          + esc(content)
+          + '</div></div>';
+      }
+      html += '</div>';
+    }
+    body.innerHTML = html;
+  } catch(e) {
+    body.innerHTML = '<div class="empty-state" style="color:var(--red)">Error loading session: ' + esc(String(e)) + '</div>';
+  }
+}
+function closeSessionModal() {
+  document.getElementById('session-modal').classList.remove('show');
 }
 
 // ── Cron Jobs ─────────────────────────────
@@ -12005,7 +12083,7 @@ function activityEventHtml(e) {
   return '<div class="timeline-item ' + statusCls + '">'
     + '<span style="margin-right:6px">' + icon + '</span>'
     + '<span class="timeline-msg">' + esc(e.title) + agentLabel
-    + (e.body ? '<span style="display:block;font-size:11px;color:var(--text-muted);margin-top:2px;max-width:400px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(e.body) + '</span>' : '')
+    + (e.body ? '<span onclick="this.style.whiteSpace=this.style.whiteSpace===\\x27normal\\x27?\\x27nowrap\\x27:\\x27normal\\x27;this.style.overflow=this.style.whiteSpace===\\x27normal\\x27?\\x27visible\\x27:\\x27hidden\\x27;this.style.maxWidth=this.style.whiteSpace===\\x27normal\\x27?\\x27none\\x27:\\x27400px\\x27" style="display:block;font-size:11px;color:var(--text-muted);margin-top:2px;max-width:400px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;cursor:pointer" title="Click to expand">' + esc(e.body) + '</span>' : '')
     + '</span>'
     + '<span class="timeline-time">' + timeAgo(e.timestamp) + '</span>'
     + '</div>';
@@ -13495,7 +13573,7 @@ async function refreshTeamNav() {
     var clem = data.clementine || {};
     var agents = data.agents || [];
     // Build team list: primary first, then agents
-    var teamList = [{ name: clem.name || '${name}', slug: '', status: clem.alive ? 'active' : 'offline', isPrimary: true }];
+    var teamList = [{ name: clem.name || '${name}', slug: '', status: clem.status === 'online' ? 'active' : 'offline', isPrimary: true }];
     agents.forEach(function(a) { teamList.push({ name: a.name, slug: a.slug, status: a.status || 'offline', isPrimary: false }); });
     renderTeamNav(teamList);
   } catch(e) { /* silent */ }
@@ -14863,6 +14941,8 @@ async function refreshSkills() {
     var countBadge = document.getElementById('skill-count-badge');
     if (badge) { badge.textContent = skills.length || ''; badge.style.display = skills.length > 0 ? '' : 'none'; }
     if (countBadge) countBadge.textContent = skills.length + ' skill' + (skills.length !== 1 ? 's' : '');
+    var navSkillBadge = document.getElementById('nav-skill-count');
+    if (navSkillBadge) { navSkillBadge.textContent = skills.length || ''; navSkillBadge.style.display = skills.length > 0 ? '' : 'none'; }
     var container = document.getElementById('panel-skills');
     if (!container) return;
     if (skills.length === 0) {
@@ -14875,7 +14955,9 @@ async function refreshSkills() {
         : s.source === 'cron' ? '<span class="badge badge-green" style="font-size:10px">cron</span>'
         : s.source === 'unleashed' ? '<span class="badge badge-purple" style="font-size:10px">unleashed</span>'
         : '<span class="badge badge-gray" style="font-size:10px">' + esc(s.source) + '</span>';
-      var triggers = (s.triggers || []).map(function(t) { return '<code style="font-size:11px;background:var(--bg-tertiary);padding:2px 6px;border-radius:3px">' + esc(t) + '</code>'; }).join(' ');
+      var allTriggers = s.triggers || [];
+      var shownTriggers = allTriggers.slice(0, 5).map(function(t) { return '<code style="font-size:11px;background:var(--bg-tertiary);padding:2px 6px;border-radius:3px">' + esc(t) + '</code>'; }).join(' ');
+      var triggers = shownTriggers + (allTriggers.length > 5 ? ' <span style="font-size:11px;color:var(--text-muted)">+' + (allTriggers.length - 5) + ' more</span>' : '');
       var age = s.updatedAt ? timeAgo(s.updatedAt) : '';
       html += '<div id="skill-card-' + esc(s.name) + '" style="padding:12px;border:1px solid var(--border);border-radius:8px;background:var(--bg-secondary)">'
         + '<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">'
@@ -14955,7 +15037,9 @@ async function loadAgentSkills(agentSlug, isPrimary) {
         : s.source === 'unleashed' ? '<span class="badge badge-purple" style="font-size:10px">unleashed</span>'
         : '<span class="badge badge-gray" style="font-size:10px">' + esc(s.source || 'auto') + '</span>';
       var scopeTag = s.agentSlug ? '<span class="badge badge-blue" style="font-size:10px">agent</span>' : '<span class="badge badge-gray" style="font-size:10px">global</span>';
-      var triggers = (s.triggers || []).map(function(t) { return '<code style="font-size:11px;background:var(--bg-tertiary);padding:2px 6px;border-radius:3px">' + esc(t) + '</code>'; }).join(' ');
+      var allTriggersA = s.triggers || [];
+      var shownTriggersA = allTriggersA.slice(0, 5).map(function(t) { return '<code style="font-size:11px;background:var(--bg-tertiary);padding:2px 6px;border-radius:3px">' + esc(t) + '</code>'; }).join(' ');
+      var triggers = shownTriggersA + (allTriggersA.length > 5 ? ' <span style="font-size:11px;color:var(--text-muted)">+' + (allTriggersA.length - 5) + ' more</span>' : '');
       var age = s.updatedAt ? timeAgo(s.updatedAt) : '';
       html += '<div id="agent-skill-card-' + esc(s.name) + '" style="padding:10px;border:1px solid var(--border);border-radius:8px;background:var(--bg-secondary)">'
         + '<div style="display:flex;align-items:center;gap:6px;margin-bottom:4px">'
@@ -15545,7 +15629,7 @@ async function refreshTeamPulse() {
     var data = await r.json();
     var clem = data.clementine || {};
     var agents = data.agents || [];
-    var allAgents = [{ name: clem.name || '${name}', slug: '', status: clem.alive ? 'active' : 'offline', isPrimary: true, lastActivity: clem.currentActivity, sessions: clem.sessions || 0, runs: clem.runsToday || 0 }];
+    var allAgents = [{ name: clem.name || '${name}', slug: '', status: clem.status === 'online' ? 'active' : 'offline', isPrimary: true, lastActivity: clem.currentActivity, sessions: clem.sessions || 0, runs: clem.runsToday || 0 }];
     agents.forEach(function(a) {
       allAgents.push({ name: a.name, slug: a.slug, status: a.status || 'offline', isPrimary: false, lastActivity: a.lastActivity, sessions: a.sessions || 0, runs: a.crons ? a.crons.length : 0 });
     });
@@ -15587,7 +15671,7 @@ async function refreshHomeMetrics() {
     var mins = d.timeSaved ? d.timeSaved.estimatedMinutes || 0 : 0;
     html += '<div class="card" style="margin-bottom:16px"><div class="card-header">Time Saved</div><div class="card-body">';
     html += '<div style="font-size:36px;font-weight:700;color:var(--green)">' + (hours >= 1 ? hours + 'h' : mins + 'm') + '</div>';
-    html += '<div style="font-size:12px;color:var(--text-muted);margin-top:4px">' + (d.timeSaved ? d.timeSaved.cronRuns + ' cron runs + ' + d.timeSaved.exchanges + ' exchanges' : '') + '</div>';
+    html += '<div style="font-size:12px;color:var(--text-muted);margin-top:4px">' + (d.cron ? d.cron.totalRuns : 0) + ' cron runs + ' + (d.sessions ? d.sessions.totalExchanges : 0) + ' exchanges</div>';
     html += '</div></div>';
     // Token usage
     if (d.tokens) {
@@ -15603,8 +15687,8 @@ async function refreshHomeMetrics() {
       html += '<div class="card"><div class="card-header">Cron Performance</div><div class="card-body">';
       html += '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:12px">';
       html += '<div style="text-align:center"><div style="font-size:20px;font-weight:700">' + (d.cron.totalRuns || 0) + '</div><div style="font-size:11px;color:var(--text-muted)">Total Runs</div></div>';
-      html += '<div style="text-align:center"><div style="font-size:20px;font-weight:700;color:var(--green)">' + (d.cron.successCount || 0) + '</div><div style="font-size:11px;color:var(--text-muted)">Successes</div></div>';
-      html += '<div style="text-align:center"><div style="font-size:20px;font-weight:700;color:var(--red)">' + (d.cron.errorCount || 0) + '</div><div style="font-size:11px;color:var(--text-muted)">Errors</div></div>';
+      html += '<div style="text-align:center"><div style="font-size:20px;font-weight:700;color:var(--green)">' + (d.cron.successRuns || 0) + '</div><div style="font-size:11px;color:var(--text-muted)">Successes</div></div>';
+      html += '<div style="text-align:center"><div style="font-size:20px;font-weight:700;color:var(--red)">' + (d.cron.errorRuns || 0) + '</div><div style="font-size:11px;color:var(--text-muted)">Errors</div></div>';
       var avgDur = d.cron.avgDurationMs ? (d.cron.avgDurationMs / 1000).toFixed(1) + 's' : '—';
       html += '<div style="text-align:center"><div style="font-size:20px;font-weight:700">' + avgDur + '</div><div style="font-size:11px;color:var(--text-muted)">Avg Duration</div></div>';
       html += '</div></div></div>';
@@ -15630,7 +15714,7 @@ async function refreshHomeSessions() {
       var icon = key.indexOf('discord') >= 0 ? '&#128172;' : key.indexOf('slack') >= 0 ? '&#128488;' : key.indexOf('telegram') >= 0 ? '&#9992;' : key.indexOf('dashboard') >= 0 ? '&#127760;' : '&#128172;';
       var exchanges = s.exchanges || 0;
       var lastActive = s.lastActive ? fmtTimeAgo(s.lastActive) : 'unknown';
-      html += '<div class="card" style="padding:12px;cursor:pointer">';
+      html += '<div class="card" style="padding:12px;cursor:pointer" onclick="viewSessionModal(\\x27' + encodeURIComponent(key) + '\\x27)">';
       html += '<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">';
       html += '<span style="font-size:16px">' + icon + '</span>';
       html += '<span style="font-weight:500;font-size:13px">' + esc(key.split(':').pop() || key) + '</span>';
