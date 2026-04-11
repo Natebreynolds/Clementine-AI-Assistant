@@ -30,6 +30,9 @@ import cron from 'node-cron';
 import type { Gateway } from '../gateway/router.js';
 import { TunnelManager } from './tunnel.js';
 import type { RemoteAccessConfig } from '../types.js';
+import { AgentManager } from '../agent/agent-manager.js';
+import { discoverMcpServers, getClaudeIntegrations } from '../agent/mcp-bridge.js';
+import { AGENTS_DIR } from '../config.js';
 import { goalsRouter } from './routes/goals.js';
 import { delegationsRouter } from './routes/delegations.js';
 import { workflowsRouter } from './routes/workflows.js';
@@ -1612,13 +1615,13 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
 
       // MCP servers (disk-based discovery, no gateway)
       try {
-        const { discoverMcpServers } = await import('../agent/mcp-bridge.js');
+
         result.mcpServers = { servers: discoverMcpServers() };
       } catch { result.mcpServers = { servers: [] }; }
 
       // Claude integrations
       try {
-        const { getClaudeIntegrations } = await import('../agent/mcp-bridge.js');
+
         result.claudeIntegrations = { integrations: getClaudeIntegrations() };
       } catch { result.claudeIntegrations = { integrations: [] }; }
 
@@ -1637,8 +1640,7 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
       // Office/agents — read directly from disk, no gateway needed
       // Returns same shape as /api/office: { clementine: {...}, agents: [...] }
       try {
-        const { AgentManager } = await import('../agent/agent-manager.js');
-        const { AGENTS_DIR: agDir } = await import('../config.js');
+        const agDir = AGENTS_DIR;
         const profilesDir = path.join(VAULT_DIR, '00-System', 'profiles');
         const mgr = new AgentManager(agDir, profilesDir);
         const allAgents = mgr.listAll();
@@ -3028,8 +3030,6 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
       return;
     }
 
-    const { AgentManager } = await import('../agent/agent-manager.js');
-    const { AGENTS_DIR } = await import('../config.js');
     const pm = new AgentManager(AGENTS_DIR, profilesDir);
     const profiles = pm.listAll().map(p => ({
       slug: p.slug,
@@ -5759,24 +5759,17 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
 </svg>`);
   });
 
+  // Service worker disabled — was causing stale connections that block the event loop on restart.
+  // Serves a self-unregistering script so any previously cached SW removes itself.
   app.get('/sw.js', (_req, res) => {
     res.setHeader('Content-Type', 'application/javascript');
     res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
-    // Use build hash in cache name so updates bust the cache automatically
-    res.send(`const CACHE = 'clem-${buildHash}';
-const SHELL = ['/manifest.json', '/icon.svg'];
-self.addEventListener('install', e => e.waitUntil(caches.open(CACHE).then(c => c.addAll(SHELL)).then(() => self.skipWaiting())));
-self.addEventListener('activate', e => e.waitUntil(caches.keys().then(ks => Promise.all(ks.filter(k => k !== CACHE).map(k => caches.delete(k)))).then(() => self.clients.claim())));
-self.addEventListener('fetch', e => {
-  if (e.request.method !== 'GET') return;
-  if (e.request.url.includes('/api/')) return;
-  const url = new URL(e.request.url);
-  if (url.pathname === '/') {
-    // Always fetch fresh HTML (contains auth token) — never serve from cache
-    e.respondWith(fetch(e.request).catch(() => caches.match(e.request)));
-    return;
-  }
-  e.respondWith(caches.match(e.request).then(r => r || fetch(e.request)));
+    res.send(`self.addEventListener('install', () => self.skipWaiting());
+self.addEventListener('activate', e => {
+  e.waitUntil(
+    caches.keys().then(ks => Promise.all(ks.map(k => caches.delete(k))))
+      .then(() => self.registration.unregister())
+  );
 });`);
   });
 
@@ -5844,12 +5837,17 @@ self.addEventListener('fetch', e => {
     }
   }
 
-  // Try to open in browser
-  try {
-    if (process.platform === 'darwin') {
-      execSync(`open http://localhost:${actualPort}`, { stdio: 'ignore' });
-    }
-  } catch { /* ignore */ }
+  // Open browser — disabled during startup to prevent event loop blocking.
+  // User can open manually or the URL is printed above.
+  if (!process.env.CLEMENTINE_NO_OPEN) {
+    setTimeout(() => {
+      try {
+        if (process.platform === 'darwin') {
+          execSync(`open http://localhost:${actualPort}`, { stdio: 'ignore' });
+        }
+      } catch { /* ignore */ }
+    }, 5000);
+  }
 
   // Auto-start tunnel if remote access is enabled
   if (remoteConfig.enabled && TunnelManager.isInstalled()) {
@@ -17229,8 +17227,9 @@ async function refreshSalesforce() {
 var sseConnected = false;
 try {
   // Register service worker for PWA
+  // Unregister any stale service workers — they cause connection issues on restart
   if ('serviceWorker' in navigator) {
-    navigator.serviceWorker.register('/sw.js', { updateViaCache: 'none' }).catch(function() {});
+    navigator.serviceWorker.getRegistrations().then(function(regs) { regs.forEach(function(r) { r.unregister(); }); });
   }
 
   var evtSource = new EventSource('/api/events?token=' + encodeURIComponent(_dashToken));
