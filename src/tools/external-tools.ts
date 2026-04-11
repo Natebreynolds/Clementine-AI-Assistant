@@ -16,13 +16,14 @@ import {
   ACTIVE_AGENT_SLUG, EXTERNAL_CONTENT_TAG, SYSTEM_DIR,
   env, externalResult, getStore, logger, textResult,
 } from './shared.js';
+import { getToolDescription } from './tool-meta.js';
 
 export function registerExternalTools(server: McpServer): void {
 // ── 13. rss_fetch ──────────────────────────────────────────────────────
 
 server.tool(
   'rss_fetch',
-  'Fetch and parse RSS feeds. Returns recent articles with titles, links, dates, and summaries.',
+  getToolDescription('rss_fetch') ?? 'Fetch and parse RSS feeds. Returns recent articles with titles, links, dates, and summaries.',
   {
     feed_url: z.string().optional().describe('Single RSS feed URL (optional — if omitted, reads from RSS-FEEDS.md)'),
   },
@@ -145,7 +146,7 @@ function extractAttr(xml: string, tag: string, attr: string): string {
 
 server.tool(
   'web_search',
-  'Search the web via DuckDuckGo. Returns titles, URLs, and snippets. No API key required.',
+  getToolDescription('web_search') ?? 'Search the web via DuckDuckGo. Returns titles, URLs, and snippets. No API key required.',
   {
     query: z.string().describe('Search query'),
     max_results: z.number().optional().default(5).describe('Max results (1-10)'),
@@ -213,7 +214,7 @@ function parseDdgResults(
 
 server.tool(
   'github_prs',
-  'Check GitHub PRs — review-requested and authored. Read-only.',
+  getToolDescription('github_prs') ?? 'Check GitHub PRs — review-requested and authored. Read-only.',
   { _empty: z.string().optional().describe('(no parameters needed)') },
   async () => {
     const parts: string[] = [];
@@ -384,7 +385,7 @@ async function graphPost(endpoint: string, body: unknown): Promise<any> {
 
 server.tool(
   'outlook_inbox',
-  'Read recent emails from the Outlook inbox. Returns sender, subject, date, and preview.',
+  getToolDescription('outlook_inbox') ?? 'Read recent emails from the Outlook inbox. Returns sender, subject, date, and preview.',
   {
     count: z.number().optional().default(10).describe('Number of emails to fetch (max 25)'),
     unread_only: z.boolean().optional().default(false).describe('Only return unread emails'),
@@ -414,7 +415,7 @@ server.tool(
 
 server.tool(
   'outlook_search',
-  'Search emails by keyword. Searches subject, body, and sender.',
+  getToolDescription('outlook_search') ?? 'Search emails by keyword. Searches subject, body, and sender.',
   {
     query: z.string().describe('Search query (keywords, sender name, subject text)'),
     count: z.number().optional().default(10).describe('Max results (max 25)'),

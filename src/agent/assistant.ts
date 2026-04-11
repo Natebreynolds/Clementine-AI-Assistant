@@ -80,6 +80,7 @@ import { assembleContext } from '../memory/context-assembler.js';
 import { PromptCache } from './prompt-cache.js';
 import { searchSkills as searchSkillsSync } from './skill-extractor.js';
 import { classifyIntent, getStrategyGuidance, type IntentClassification } from './intent-classifier.js';
+import { getEventLog } from './session-event-log.js';
 
 // ── Channel capabilities ────────────────────────────────────────────
 
@@ -1969,6 +1970,13 @@ You have a limited number of turns per message (~15). **After 8-10 tool calls, y
         let hitRateLimit = false;
         let staleSession = false;
         let lastAssistantBlocks: ContentBlock[] = [];
+        const queryStartMs = Date.now();
+
+        // Event log: track query lifecycle
+        const eventLog = getEventLog();
+        if (sessionKey) {
+          eventLog.emitQueryStart(sessionKey, prompt, { model: sdkOptions.model ?? undefined, source: 'chat' });
+        }
 
         try {
           const stream = query({ prompt, options: sdkOptions });
@@ -1987,6 +1995,7 @@ You have a limited number of turns per message (~15). **After 8-10 tool calls, y
                   if (onText) await onText(responseText);
                 } else if (block.type === 'tool_use' && block.name) {
                   logToolUse(block.name, (block.input ?? {}) as Record<string, unknown>);
+                  if (sessionKey) eventLog.emitToolCall(sessionKey, block.name, (block.input ?? {}) as Record<string, unknown>);
                   if (onToolActivity) {
                     try { await onToolActivity(block.name, (block.input ?? {}) as Record<string, unknown>); } catch { /* non-fatal */ }
                   }
@@ -2165,9 +2174,23 @@ You have a limited number of turns per message (~15). **After 8-10 tool calls, y
           }
         }
 
+        // Event log: query completed successfully
+        if (sessionKey) {
+          eventLog.emitQueryEnd(sessionKey, {
+            responseLength: responseText.length,
+            sessionId: sessionId || undefined,
+            terminalReason: this._lastTerminalReason,
+            durationMs: Date.now() - queryStartMs,
+          });
+        }
+
         return [responseText, sessionId];
       }
 
+      // Event log: all retries exhausted
+      if (sessionKey) {
+        getEventLog().emitError(sessionKey, 'All retries exhausted', { recoverable: false });
+      }
       return ['Sorry, I hit a temporary issue. Please try again.', ''];
     } finally {
       if (timeoutHandle) clearTimeout(timeoutHandle);
@@ -2416,6 +2439,66 @@ You have a limited number of turns per message (~15). **After 8-10 tool calls, y
 
     const last = exchanges[exchanges.length - 1];
     return `- Last discussed: ${last.user.slice(0, 200)}\n- Response: ${last.assistant.slice(0, 300)}`;
+  }
+
+  // ── Unleashed Checkpoint Parsing ────────────────────────────────────
+
+  /**
+   * Parse a structured checkpoint from an unleashed phase's STATUS SUMMARY output.
+   * Returns null if no recognizable structure is found.
+   */
+  static parseUnleashedCheckpoint(output: string): { summary: string; completed: string[]; remaining: string[]; artifacts: string[]; nextAction?: string } | null {
+    if (!output) return null;
+
+    // Try to find a STATUS SUMMARY section
+    const summaryMatch = output.match(/STATUS\s*SUMMARY[:\s]*\n([\s\S]*?)(?:\n(?:TASK_COMPLETE|$))/i)
+      ?? output.match(/## Status Summary\s*\n([\s\S]*?)$/i)
+      ?? output.match(/STATUS\s*SUMMARY[:\s]*([\s\S]{50,})/i);
+
+    const summaryBlock = summaryMatch ? summaryMatch[1].trim() : output.slice(-1500).trim();
+
+    // Extract bullet points for completed/remaining
+    const completed: string[] = [];
+    const remaining: string[] = [];
+    const artifacts: string[] = [];
+    let nextAction: string | undefined;
+
+    const lines = summaryBlock.split('\n');
+    let section: 'none' | 'completed' | 'remaining' | 'artifacts' | 'next' = 'none';
+
+    for (const line of lines) {
+      const lower = line.toLowerCase().trim();
+      if (lower.match(/^#+\s*completed|^completed:|^done:|^accomplished:|^\*\*completed/)) { section = 'completed'; continue; }
+      if (lower.match(/^#+\s*remaining|^remaining:|^todo:|^next steps:|^still need|^\*\*remaining/)) { section = 'remaining'; continue; }
+      if (lower.match(/^#+\s*artifacts|^artifacts:|^files created:|^output/)) { section = 'artifacts'; continue; }
+      if (lower.match(/^#+\s*next|^next action:|^next:/)) { section = 'next'; continue; }
+
+      const bullet = line.match(/^\s*[-*+]\s+(.+)/)?.[1]?.trim();
+      const numbered = line.match(/^\s*\d+[.)]\s+(.+)/)?.[1]?.trim();
+      const item = bullet || numbered;
+
+      if (item) {
+        if (section === 'completed') completed.push(item);
+        else if (section === 'remaining') remaining.push(item);
+        else if (section === 'artifacts') artifacts.push(item);
+        else if (section === 'next') nextAction = item;
+      } else if (section === 'next' && line.trim()) {
+        nextAction = line.trim();
+      }
+    }
+
+    // Build a one-line summary
+    const summary = completed.length > 0
+      ? `Completed ${completed.length} item(s). ${remaining.length > 0 ? `${remaining.length} remaining.` : 'All done.'}`
+      : summaryBlock.split('\n')[0].slice(0, 200);
+
+    // Only return if we extracted meaningful structure
+    if (completed.length === 0 && remaining.length === 0 && artifacts.length === 0) {
+      // Fallback: store the raw summary block as the summary
+      return { summary: summaryBlock.slice(0, 500), completed: [], remaining: [], artifacts: [] };
+    }
+
+    return { summary, completed, remaining, artifacts, nextAction };
   }
 
   // ── Procedural Memory: Skill Extraction ────────────────────────────
@@ -3403,31 +3486,56 @@ You have a limited number of turns per message (~15). **After 8-10 tool calls, y
           `use the Agent tool to spawn sub-agents that work in parallel. For example, if you need to ` +
           `research 10 prospects, spawn 3-5 sub-agents that each handle a batch — don't process them ` +
           `one at a time. Each sub-agent should receive specific items and return structured results.`;
-      } else if (sessionId) {
-        // Resuming existing session — agent has full conversation history
-        prompt =
-          `[UNLEASHED TASK: ${jobName} — Phase ${phase} — ${timestamp}]\n\n` +
-          `Continuing unleashed task. This is phase ${phase}.\n` +
-          `Time remaining: ${remainingHours} hours. You have ${turnsPerPhase} turns this phase.\n\n` +
-          `Continue working on the task. Pick up where you left off.\n` +
-          `If the task is COMPLETE, output "TASK_COMPLETE:" followed by a final summary.\n\n` +
-          `IMPORTANT: Output a STATUS SUMMARY at the end of this phase.`;
       } else {
-        // Fresh session after error — no conversation history available
-        prompt =
-          `[UNLEASHED TASK: ${jobName} — Phase ${phase} (recovery) — ${timestamp}]\n\n` +
-          `You are running in unleashed mode — a long-running autonomous task.\n` +
-          `Time remaining: ${remainingHours} hours. You have ${turnsPerPhase} turns this phase.\n` +
-          `Previous phases encountered an error and the session was reset.\n\n` +
-          `TASK:\n${jobPrompt}\n\n` +
-          `Check any files or progress from prior phases, then continue the work.\n` +
-          `If the task is COMPLETE, output "TASK_COMPLETE:" followed by a final summary.\n\n` +
-          `IMPORTANT: Output a STATUS SUMMARY at the end of this phase.`;
+        // Phase 2+ — inject structured checkpoint from previous phase if available
+        let checkpointContext = '';
+        try {
+          const cpFile = path.join(progressDir, `checkpoint-phase-${phase - 1}.json`);
+          if (fs.existsSync(cpFile)) {
+            const cp = JSON.parse(fs.readFileSync(cpFile, 'utf-8'));
+            const parts: string[] = [];
+            if (cp.summary) parts.push(`Previous phase summary: ${cp.summary}`);
+            if (cp.completed?.length) parts.push(`Completed: ${cp.completed.join(', ')}`);
+            if (cp.remaining?.length) parts.push(`Remaining: ${cp.remaining.join(', ')}`);
+            if (cp.artifacts?.length) parts.push(`Artifacts/files created: ${cp.artifacts.join(', ')}`);
+            if (cp.nextAction) parts.push(`Suggested next action: ${cp.nextAction}`);
+            checkpointContext = `\n## Previous Phase Checkpoint\n${parts.join('\n')}\n`;
+          }
+        } catch { /* fall back to no checkpoint */ }
+
+        if (sessionId) {
+          // Resuming existing session — agent has conversation history + structured checkpoint
+          prompt =
+            `[UNLEASHED TASK: ${jobName} — Phase ${phase} — ${timestamp}]\n\n` +
+            `Continuing unleashed task. This is phase ${phase}.\n` +
+            `Time remaining: ${remainingHours} hours. You have ${turnsPerPhase} turns this phase.\n` +
+            checkpointContext +
+            `\nContinue working on the task. Pick up where you left off.\n` +
+            `If the task is COMPLETE, output "TASK_COMPLETE:" followed by a final summary.\n\n` +
+            `IMPORTANT: Output a STATUS SUMMARY at the end of this phase.`;
+        } else {
+          // Fresh session after error — no conversation history, inject checkpoint + full task
+          prompt =
+            `[UNLEASHED TASK: ${jobName} — Phase ${phase} (recovery) — ${timestamp}]\n\n` +
+            `You are running in unleashed mode — a long-running autonomous task.\n` +
+            `Time remaining: ${remainingHours} hours. You have ${turnsPerPhase} turns this phase.\n` +
+            `Previous phases encountered an error and the session was reset.\n\n` +
+            `TASK:\n${jobPrompt}\n` +
+            checkpointContext +
+            `\nCheck any files or progress from prior phases, then continue the work.\n` +
+            `If the task is COMPLETE, output "TASK_COMPLETE:" followed by a final summary.\n\n` +
+            `IMPORTANT: Output a STATUS SUMMARY at the end of this phase.`;
+        }
       }
 
       let phaseOutput = '';
       let phaseSessionId = '';
       let phaseToolCount = 0;
+
+      // Event log: phase lifecycle tracking
+      const unleashedEventLog = getEventLog();
+      const unleashedSessionKey = `unleashed:${jobName}`;
+      unleashedEventLog.emitPhaseStart(unleashedSessionKey, phase, jobName);
 
       // Periodic progress beacon — sends a status update every 5 minutes
       // so the user knows the task is still alive during long phases.
@@ -3530,6 +3638,25 @@ You have a limited number of turns per message (~15). **After 8-10 tool calls, y
       sessionId = phaseSessionId;
       lastOutput = phaseOutput.trim();
       consecutiveErrors = 0;
+
+      // Event log: phase completed
+      unleashedEventLog.emitPhaseEnd(unleashedSessionKey, phase, { durationMs: phaseDurationMs, outputLength: lastOutput.length });
+
+      // Parse structured checkpoint from phase output
+      const checkpoint = PersonalAssistant.parseUnleashedCheckpoint(lastOutput);
+      if (checkpoint) {
+        try {
+          fs.writeFileSync(
+            path.join(progressDir, `checkpoint-phase-${phase}.json`),
+            JSON.stringify(checkpoint, null, 2),
+          );
+          unleashedEventLog.emitCheckpoint(unleashedSessionKey, checkpoint.summary, {
+            completed: checkpoint.completed,
+            remaining: checkpoint.remaining,
+            artifacts: checkpoint.artifacts,
+          });
+        } catch { /* non-fatal */ }
+      }
 
       appendProgress({
         event: 'phase_complete',

@@ -16,6 +16,7 @@ import {
   ensureDailyNote, getStore, globMd, incrementalSync, logger, nowTime,
   resolvePath, textResult, todayStr, validateVaultPath,
 } from './shared.js';
+import { getToolDescription } from './tool-meta.js';
 
 /** Merge duplicate `## Section` headers in a MEMORY.md body, deduplicating lines. */
 function mergeDuplicateSections(body: string): string {
@@ -73,7 +74,7 @@ export function registerMemoryTools(server: McpServer): void {
 
 server.tool(
   'working_memory',
-  'Persistent scratchpad that survives across conversations. Use to jot down current project context, TODOs, reminders, or anything you need to remember for next time. Actions: read, append, replace, clear.',
+  getToolDescription('working_memory') ?? 'Persistent scratchpad that survives across conversations. Use to jot down current project context, TODOs, reminders, or anything you need to remember for next time. Actions: read, append, replace, clear.',
   {
     action: z.enum(['read', 'append', 'replace', 'clear']).describe('What to do with working memory'),
     content: z.string().optional().describe('Text to append or replace with (required for append/replace)'),
@@ -122,7 +123,7 @@ server.tool(
 
 server.tool(
   'memory_read',
-  "Read a note from the Obsidian vault. Shortcuts: 'today', 'yesterday', 'memory', 'tasks', 'heartbeat', 'cron', 'soul'. Or pass a relative path or note name.",
+  getToolDescription('memory_read') ?? "Read a note from the Obsidian vault. Shortcuts: 'today', 'yesterday', 'memory', 'tasks', 'heartbeat', 'cron', 'soul'. Or pass a relative path or note name.",
   { name: z.string().describe('Note name, path, or shortcut') },
   async ({ name }) => {
     const filePath = resolvePath(name);
@@ -140,7 +141,7 @@ server.tool(
 
 server.tool(
   'memory_write',
-  "Write or append to a vault note. Actions: 'append_daily' (add to today's log), 'update_memory' (update MEMORY.md section), 'write_note' (write/overwrite a note), 'update_identity' (set identity seed — who you are, your role, key context).",
+  getToolDescription('memory_write') ?? "Write or append to a vault note. Actions: 'append_daily' (add to today's log), 'update_memory' (update MEMORY.md section), 'write_note' (write/overwrite a note), 'update_identity' (set identity seed — who you are, your role, key context).",
   {
     action: z.enum(['append_daily', 'update_memory', 'write_note', 'update_identity']).describe('Write action'),
     content: z.string().describe('Text to write/append'),
@@ -279,7 +280,7 @@ server.tool(
 
 server.tool(
   'memory_search',
-  'FTS5 search across all vault notes. Returns matching chunks with relevance scores. Optional category/topic filters narrow results.',
+  getToolDescription('memory_search') ?? 'FTS5 search across all vault notes. Returns matching chunks with relevance scores. Optional category/topic filters narrow results.',
   {
     query: z.string().describe('Search text'),
     limit: z.number().optional().describe('Max results (default 20)'),
@@ -347,7 +348,7 @@ server.tool(
 
 server.tool(
   'memory_recall',
-  'Context retrieval combining FTS5 relevance + recency search. Better than memory_search for finding related content by meaning. Optional category/topic filters narrow results.',
+  getToolDescription('memory_recall') ?? 'Context retrieval combining FTS5 relevance + recency search. Better than memory_search for finding related content by meaning. Optional category/topic filters narrow results.',
   {
     query: z.string().describe('Natural language search query'),
     category: z.enum(['facts', 'events', 'discoveries', 'preferences', 'advice']).optional().describe('Filter by category'),
