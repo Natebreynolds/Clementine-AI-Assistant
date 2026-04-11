@@ -138,14 +138,7 @@ function resetGateway(): void {
 async function getGateway(): Promise<Gateway> {
   if (gatewayInstance) return gatewayInstance;
   if (gatewayInitializing) {
-    // Wait for in-progress init (max 10s to avoid deadlock)
-    let waited = 0;
-    while (gatewayInitializing && waited < 10_000) {
-      await new Promise((r) => setTimeout(r, 100));
-      waited += 100;
-    }
-    if (gatewayInstance) return gatewayInstance;
-    // Init failed or timed out — fall through to retry
+    throw new Error('Gateway initializing');
   }
   gatewayInitializing = true;
   try {
@@ -159,11 +152,31 @@ async function getGateway(): Promise<Gateway> {
     setApprovalCallback(async () => false);
     return gatewayInstance;
   } catch (err) {
-    gatewayInstance = null; // Ensure null so next call retries
+    if (String(err).includes('Gateway initializing')) throw err;
+    gatewayInstance = null;
     throw err;
   } finally {
     gatewayInitializing = false;
   }
+}
+
+/** Wrapper for gateway-dependent route handlers — returns 503 if gateway isn't ready. */
+function gwHandler(handler: (gw: Gateway, req: import('express').Request, res: import('express').Response) => void | Promise<void>) {
+  return async (req: import('express').Request, res: import('express').Response) => {
+    try {
+      const gw = await getGateway();
+      await handler(gw, req, res);
+    } catch (err) {
+      if (!res.headersSent) {
+        const msg = String(err);
+        if (msg.includes('Gateway initializing')) {
+          res.status(503).json({ error: 'Gateway initializing — please retry', retryAfter: 2 });
+        } else {
+          res.status(500).json({ error: msg });
+        }
+      }
+    }
+  };
 }
 
 // ── Daemon PID watcher — detect restarts and invalidate state ────────
@@ -1275,7 +1288,10 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
 
   const port = parseInt(opts.port ?? '3030', 10);
   const app = express();
-  app.use(express.json());
+  app.use(express.json({ limit: '5mb' }));
+
+  // Health check — always responds, no auth, no middleware dependency
+  app.get('/health', (_req, res) => { res.json({ ok: true, ts: Date.now() }); });
 
   // ── Dashboard authentication ────────────────────────────────────────
   const dashboardToken = randomBytes(24).toString('hex');
@@ -1326,6 +1342,33 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
     }
   }, 10 * 60 * 1000);
 
+  // Quick ping — bypasses all middleware, tests /api path routing
+  app.get('/api/ping', (_req, res) => { res.json({ pong: true }); });
+
+  // SSE events — registered before auth so EventSource (which can't send headers) works
+  // Auth is done via token query param instead
+  app.get('/api/events', (req, res) => {
+    const token = req.query.token as string | undefined;
+    if (!token || !safeTokenEquals(token, dashboardToken)) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      'Connection': 'keep-alive',
+    });
+    res.write('data: {"type":"connected"}\n\n');
+    sseClients.add(res);
+    const heartbeat = setInterval(() => {
+      try { res.write(': heartbeat\n\n'); } catch { clearInterval(heartbeat); sseClients.delete(res); }
+    }, 30_000);
+    req.on('close', () => {
+      clearInterval(heartbeat);
+      sseClients.delete(res);
+    });
+  });
+
   // Protect /api routes with bearer token (GET / serves the SPA with token injected)
   app.use('/api', (req, res, next) => {
     const auth = req.headers.authorization;
@@ -1333,6 +1376,13 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
       res.status(401).json({ error: 'Unauthorized' });
       return;
     }
+    // Response timeout — prevent hung handlers from blocking the connection pool
+    const timeout = setTimeout(() => {
+      if (!res.headersSent) {
+        res.status(504).json({ error: 'Request timeout', retryAfter: 2 });
+      }
+    }, 8000);
+    res.on('finish', () => clearTimeout(timeout));
     next();
   });
 
@@ -1742,25 +1792,7 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
     }
   }
 
-  app.get('/api/events', (req, res) => {
-    res.writeHead(200, {
-      'Content-Type': 'text/event-stream',
-      'Cache-Control': 'no-cache',
-      'Connection': 'keep-alive',
-    });
-    res.write('data: {"type":"connected"}\n\n');
-    sseClients.add(res);
-
-    // Heartbeat every 30s to keep connection alive
-    const heartbeat = setInterval(() => {
-      try { res.write(': heartbeat\n\n'); } catch { clearInterval(heartbeat); sseClients.delete(res); }
-    }, 30_000);
-
-    req.on('close', () => {
-      clearInterval(heartbeat);
-      sseClients.delete(res);
-    });
-  });
+  // SSE events handler moved before auth middleware (see above)
 
   // ── POST routes (actions) ──────────────────────────────────────
 
@@ -2833,30 +2865,25 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
 
   // ── Profile routes ─────────────────────────────────────────────────
 
-  app.get('/api/profiles', async (_req, res) => {
-    try {
-      const profilesDir = path.join(VAULT_DIR, '00-System', 'profiles');
-      if (!existsSync(profilesDir)) {
-        res.json({ profiles: [], active: null });
-        return;
-      }
-
-      const gateway = await getGateway();
-      const { AgentManager } = await import('../agent/agent-manager.js');
-      const { AGENTS_DIR } = await import('../config.js');
-      const pm = new AgentManager(AGENTS_DIR, profilesDir);
-      const profiles = pm.listAll().map(p => ({
-        slug: p.slug,
-        name: p.name,
-        description: p.description,
-      }));
-
-      const activeSlug = gateway.getSessionProfile('dashboard:web') ?? null;
-      res.json({ profiles, active: activeSlug });
-    } catch (err) {
-      res.status(500).json({ error: String(err) });
+  app.get('/api/profiles', gwHandler(async (gw, _req, res) => {
+    const profilesDir = path.join(VAULT_DIR, '00-System', 'profiles');
+    if (!existsSync(profilesDir)) {
+      res.json({ profiles: [], active: null });
+      return;
     }
-  });
+
+    const { AgentManager } = await import('../agent/agent-manager.js');
+    const { AGENTS_DIR } = await import('../config.js');
+    const pm = new AgentManager(AGENTS_DIR, profilesDir);
+    const profiles = pm.listAll().map(p => ({
+      slug: p.slug,
+      name: p.name,
+      description: p.description,
+    }));
+
+    const activeSlug = gw.getSessionProfile('dashboard:web') ?? null;
+    res.json({ profiles, active: activeSlug });
+  }));
 
   app.post('/api/profiles/switch', async (req, res) => {
     try {
@@ -3408,14 +3435,9 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
 
   // ── MCP Status API ───────────────────────────────────────────────
 
-  app.get('/api/mcp-status', async (_req, res) => {
-    try {
-      const gw = await getGateway();
-      res.json(gw.getMcpStatus());
-    } catch {
-      res.json({ servers: [], updatedAt: '' });
-    }
-  });
+  app.get('/api/mcp-status', gwHandler(async (gw, _req, res) => {
+    res.json(gw.getMcpStatus());
+  }));
 
   // ── Self-Improvement API ─────────────────────────────────────────
 
@@ -5623,6 +5645,8 @@ self.addEventListener('fetch', e => {
 
           // Track running port for dashboard self-restart
           dashboardRunningPort = actualPort;
+
+          // Gateway init is lazy — triggered on first gateway-dependent API call
 
           // Start daemon PID watcher to detect restarts
           startDaemonWatcher(broadcastEvent);
@@ -9706,10 +9730,20 @@ async function startAnthropicOAuth() {
 
 // ── Authenticated fetch helper ────────────
 var _dashToken = document.querySelector('meta[name="dashboard-token"]')?.getAttribute('content') || '';
-function apiFetch(url, opts) {
+async function apiFetch(url, opts) {
   opts = opts || {};
   opts.headers = Object.assign({ 'Authorization': 'Bearer ' + _dashToken }, opts.headers || {});
-  return fetch(url, opts);
+  var maxRetries = 3;
+  for (var attempt = 0; attempt < maxRetries; attempt++) {
+    var resp = await fetch(url, opts);
+    if ((resp.status === 503 || resp.status === 504) && attempt < maxRetries - 1) {
+      // Gateway still initializing or timeout — wait and retry
+      await new Promise(function(r) { setTimeout(r, 2000); });
+      continue;
+    }
+    return resp;
+  }
+  return resp;
 }
 
 // ── Navigation ────────────────────────────
@@ -17002,7 +17036,7 @@ try {
     navigator.serviceWorker.register('/sw.js', { updateViaCache: 'none' }).catch(function() {});
   }
 
-  var evtSource = new EventSource('/api/events');
+  var evtSource = new EventSource('/api/events?token=' + encodeURIComponent(_dashToken));
   evtSource.onopen = function() { sseConnected = true; };
   evtSource.onerror = function() { sseConnected = false; };
   evtSource.onmessage = function(e) {
