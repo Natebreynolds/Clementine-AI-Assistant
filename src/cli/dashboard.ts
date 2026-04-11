@@ -3475,6 +3475,17 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
     }
   });
 
+  // ── Claude Desktop Integrations API ──────────────────────────────────
+
+  app.get('/api/claude-integrations', async (_req, res) => {
+    try {
+      const { getClaudeIntegrations } = await import('../agent/mcp-bridge.js');
+      res.json({ integrations: getClaudeIntegrations() });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
   // ── CLI Tools Management API ────────────────────────────────────────
 
   app.get('/api/cli-tools', (_req, res) => {
@@ -8496,6 +8507,7 @@ function getDashboardHTML(token: string): string {
         </div>
       </div>
 
+      <div class="card" id="claude-integrations-widget" style="display:none;margin-top:16px"></div>
       <div class="card" id="mcp-status-widget" style="display:none;margin-top:16px"></div>
       <!-- Hidden: Quick controls data target (kept for refreshStatus compat) -->
       <div id="panel-controls" style="display:none"></div>
@@ -9021,6 +9033,15 @@ function getDashboardHTML(token: string): string {
           </div>
         </div>
         <div class="tab-pane" id="tab-settings-integrations">
+          <div class="card" style="margin-bottom:20px">
+            <div class="card-header" style="display:flex;align-items:center;justify-content:space-between">
+              <span>Claude Desktop Integrations</span>
+              <span style="font-size:11px;color:var(--text-muted)">OAuth connections from Claude Desktop</span>
+            </div>
+            <div class="card-body" style="padding:0" id="claude-integrations-list">
+              <div class="empty-state" style="padding:16px">Loading integrations...</div>
+            </div>
+          </div>
           <div class="card" style="margin-bottom:20px">
             <div class="card-header" style="display:flex;align-items:center;justify-content:space-between">
               <span>MCP Servers</span>
@@ -9724,7 +9745,7 @@ function navigateTo(page, opts) {
   }
   if (page === 'automations') { refreshCron(); refreshTimers(); refreshSelfImprove(); refreshSkills(); }
   if (page === 'intelligence') { refreshMemory(); }
-  if (page === 'settings') { refreshSettings(); refreshRemoteAccess(); refreshSalesforce(); refreshMcpServers(); }
+  if (page === 'settings') { refreshSettings(); refreshRemoteAccess(); refreshSalesforce(); refreshClaudeIntegrations(); refreshMcpServers(); }
   if (page === 'logs') refreshLogs();
   if (page === 'team') { refreshTeam(); }
   if (page === 'projects') { refreshProjects(); }
@@ -10685,6 +10706,9 @@ async function refreshStatus() {
           + summaryCard('sc-purple', '&#128172;', totalExchanges, 'Messages', md.sessions ? md.sessions.activeSessions + ' sessions' : '')
           + summaryCard('sc-yellow', '&#9654;', nextDisplay, 'Next Up', nextTime || 'No upcoming jobs');
       } catch(me) { /* metrics optional */ }
+
+      // Claude Desktop Integrations widget
+      try { refreshClaudeIntegrations(); } catch { /* optional */ }
 
       // MCP Server Status widget
       try {
@@ -16787,6 +16811,66 @@ async function deleteMcpServer(name) {
     toast(name + ' removed', 'success');
     refreshMcpServers();
   } catch(e) { toast('Failed: ' + e, 'error'); }
+}
+
+async function refreshClaudeIntegrations() {
+  // Settings page list
+  var container = document.getElementById('claude-integrations-list');
+  // Dashboard home widget
+  var widget = document.getElementById('claude-integrations-widget');
+  try {
+    var r = await apiFetch('/api/claude-integrations');
+    var d = await r.json();
+    var integrations = d.integrations || [];
+
+    if (integrations.length === 0) {
+      if (container) container.innerHTML = '<div class="empty-state" style="padding:16px">No Claude Desktop integrations detected yet. Connect services in Claude Desktop (Settings > Integrations) and use them once — they\\'ll appear here automatically.</div>';
+      if (widget) widget.style.display = 'none';
+      return;
+    }
+
+    var html = '';
+    integrations.forEach(function(ig) {
+      var statusColor = ig.connected ? 'var(--green)' : 'var(--text-muted)';
+      var lastUsed = ig.lastUsed ? new Date(ig.lastUsed).toLocaleString() : 'Never';
+      var toolCount = (ig.tools || []).length;
+      html += '<div style="display:flex;align-items:center;gap:8px;padding:8px 12px;border-bottom:1px solid var(--border)">';
+      html += '<span style="width:8px;height:8px;border-radius:50%;background:' + statusColor + ';flex-shrink:0"></span>';
+      html += '<span style="font-size:13px;font-weight:500;color:var(--text-primary);min-width:140px">' + esc(ig.label) + '</span>';
+      html += '<span class="badge badge-blue" style="font-size:9px">Claude Desktop</span>';
+      html += '<span style="font-size:11px;color:var(--text-muted)">' + toolCount + ' tool' + (toolCount !== 1 ? 's' : '') + '</span>';
+      html += '<span style="flex:1"></span>';
+      html += '<span style="font-size:11px;color:var(--text-muted)">Last used: ' + esc(lastUsed) + '</span>';
+      html += '</div>';
+      // Tool list (collapsed)
+      if (ig.tools && ig.tools.length > 0) {
+        html += '<div style="padding:4px 12px 6px 36px;border-bottom:1px solid var(--border);background:var(--bg-secondary)">';
+        html += ig.tools.map(function(t) { return '<code style="font-size:10px;background:var(--surface);padding:1px 6px;border-radius:3px;color:var(--accent)">' + esc(t) + '</code>'; }).join(' ');
+        html += '</div>';
+      }
+    });
+
+    if (container) container.innerHTML = html;
+
+    // Dashboard widget
+    if (widget) {
+      var wHtml = '<div class="card-header">Claude Desktop Integrations</div><div class="card-body">';
+      integrations.forEach(function(ig) {
+        var dotColor = ig.connected ? 'var(--green)' : 'var(--text-muted)';
+        wHtml += '<div class="kv-row">';
+        wHtml += '<span class="kv-key" style="display:flex;align-items:center;gap:6px">';
+        wHtml += '<span style="width:8px;height:8px;border-radius:50%;background:' + dotColor + ';display:inline-block"></span>';
+        wHtml += esc(ig.label) + '</span>';
+        wHtml += '<span class="kv-val" style="font-size:11px">' + (ig.tools || []).length + ' tools</span></div>';
+      });
+      wHtml += '</div>';
+      widget.innerHTML = wHtml;
+      widget.style.display = 'block';
+    }
+  } catch(e) {
+    if (container) container.innerHTML = '<div class="empty-state" style="color:var(--red)">Failed to load integrations</div>';
+    if (widget) widget.style.display = 'none';
+  }
 }
 
 async function refreshMcpServers() {

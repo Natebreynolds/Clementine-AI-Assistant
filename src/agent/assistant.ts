@@ -946,6 +946,15 @@ Never spawn a sub-agent with vague instructions like "handle this brief" — tel
 `);
     }
 
+    // Inject Claude Desktop integration awareness (compact — ~20 tokens per integration)
+    try {
+      const integrations = _mcpBridge?.getClaudeIntegrations() ?? [];
+      if (integrations.length > 0) {
+        const names = integrations.map(ig => ig.label).join(', ');
+        parts.push(`**Connected via Claude Desktop:** ${names}. Use their \`mcp__claude_ai_*\` tools for email, calendar, etc.`);
+      }
+    } catch { /* non-fatal */ }
+
     if (profile) {
       parts.push(`You are currently operating as **${profile.name}** (${profile.description}).`);
       // Inject linked projects so the agent knows what it has access to
@@ -2038,6 +2047,10 @@ You have a limited number of turns per message (~15). **After 8-10 tool calls, y
                   if (onToolActivity) {
                     try { await onToolActivity(block.name, (block.input ?? {}) as Record<string, unknown>); } catch { /* non-fatal */ }
                   }
+                  // Track Claude Desktop integrations (mcp__claude_ai_*)
+                  if (_mcpBridge?.isClaudeDesktopTool(block.name)) {
+                    try { _mcpBridge.recordClaudeIntegrationUse(block.name); } catch { /* non-fatal */ }
+                  }
                   // StallGuard handles loop detection + metacognition + stall breaking
                   if (stallGuard) {
                     stallGuard.recordToolCall(block.name, (block.input ?? {}) as Record<string, unknown>);
@@ -2801,6 +2814,9 @@ You have a limited number of turns per message (~15). **After 8-10 tool calls, y
             }
             if (block.type === 'tool_use' && block.name) {
               logToolUse(`[auto-memory] ${block.name}`, (block.input ?? {}) as Record<string, unknown>);
+              if (_mcpBridge?.isClaudeDesktopTool(block.name)) {
+                try { _mcpBridge.recordClaudeIntegrationUse(block.name); } catch { /* non-fatal */ }
+              }
 
               // Log extraction provenance for transparency
               const toolBaseName = block.name.replace(/^mcp__[^_]+__/, '');
@@ -2935,6 +2951,9 @@ You have a limited number of turns per message (~15). **After 8-10 tool calls, y
             responseText += block.text;
           } else if (block.type === 'tool_use' && block.name) {
             logToolUse(block.name, (block.input ?? {}) as Record<string, unknown>);
+            if (_mcpBridge?.isClaudeDesktopTool(block.name)) {
+              try { _mcpBridge.recordClaudeIntegrationUse(block.name); } catch { /* non-fatal */ }
+            }
           }
         }
       } else if (message.type === 'result') {
@@ -3223,6 +3242,9 @@ You have a limited number of turns per message (~15). **After 8-10 tool calls, y
                 trace.push({ type: 'text', timestamp: new Date().toISOString(), content: block.text });
               } else if (block.type === 'tool_use' && block.name) {
                 logToolUse(block.name, (block.input ?? {}) as Record<string, unknown>);
+                if (_mcpBridge?.isClaudeDesktopTool(block.name)) {
+                  try { _mcpBridge.recordClaudeIntegrationUse(block.name); } catch { /* non-fatal */ }
+                }
                 cronGuard.recordToolCall(block.name, (block.input ?? {}) as Record<string, unknown>);
                 trace.push({
                   type: 'tool_call',
@@ -3671,6 +3693,9 @@ You have a limited number of turns per message (~15). **After 8-10 tool calls, y
                 phaseOutput += block.text;
               } else if (block.type === 'tool_use' && block.name) {
                 logToolUse(block.name, (block.input ?? {}) as Record<string, unknown>);
+                if (_mcpBridge?.isClaudeDesktopTool(block.name)) {
+                  try { _mcpBridge.recordClaudeIntegrationUse(block.name); } catch { /* non-fatal */ }
+                }
                 phaseGuard.recordToolCall(block.name, (block.input ?? {}) as Record<string, unknown>);
                 phaseToolCount++;
               }
@@ -3918,6 +3943,9 @@ You have a limited number of turns per message (~15). **After 8-10 tool calls, y
                 if (onText) onText(block.text);
               } else if (block.type === 'tool_use' && block.name) {
                 logToolUse(block.name, (block.input ?? {}) as Record<string, unknown>);
+                if (_mcpBridge?.isClaudeDesktopTool(block.name)) {
+                  try { _mcpBridge.recordClaudeIntegrationUse(block.name); } catch { /* non-fatal */ }
+                }
                 const toolLabel = block.name.replace(/^mcp__clementine-tools__/, '').replace(/_/g, ' ');
                 if (onText) onText(`\n[using ${toolLabel}...]\n`);
               }

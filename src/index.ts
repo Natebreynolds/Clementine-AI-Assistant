@@ -595,8 +595,9 @@ async function asyncMain(): Promise<void> {
 
   // ── Check MCP extension permissions ────────────────────────────
   try {
-    const { checkPermissionsOnStartup } = await import('./agent/mcp-bridge.js');
+    const { checkPermissionsOnStartup, bootstrapClaudeIntegrationsFromAuditLog } = await import('./agent/mcp-bridge.js');
     checkPermissionsOnStartup();
+    bootstrapClaudeIntegrationsFromAuditLog(path.join(config.BASE_DIR, 'logs', 'audit.log'));
   } catch { /* non-fatal */ }
 
   // ── Initialize layers ────────────────────────────────────────────

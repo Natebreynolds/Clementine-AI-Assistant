@@ -17,6 +17,7 @@ import type { ManagedMcpServer } from '../types.js';
 const logger = pino({ name: 'clementine.mcp-bridge' });
 
 const MCP_SERVERS_FILE = path.join(BASE_DIR, 'mcp-servers.json');
+const INTEGRATIONS_FILE = path.join(BASE_DIR, 'claude-integrations.json');
 const CACHE_TTL_MS = 60_000; // 60s cache
 
 // ── Known server descriptions ───────────────────────────────────────
@@ -330,4 +331,159 @@ export function getPermissionErrorMessage(serverName: string): string | null {
   return `I tried to use ${serverName} but macOS needs permission to access ${req.resource}. ` +
     `Open your Mac and go to System Settings > Privacy & Security > ${req.settingsLabel} — ` +
     `make sure Terminal (or the Node.js process) is allowed.`;
+}
+
+// ── Claude Desktop Integration Tracking ────────────────────────────
+// Claude Desktop has built-in OAuth integrations (Microsoft 365, Google, etc.)
+// that aren't discoverable on disk — they only appear as mcp__claude_ai_*
+// tool names at SDK runtime. We capture them here when seen.
+
+export interface ClaudeIntegration {
+  /** Integration name, e.g. "Microsoft_365" */
+  name: string;
+  /** Human-friendly label */
+  label: string;
+  /** Tools discovered for this integration */
+  tools: string[];
+  /** When first seen */
+  firstSeen: string;
+  /** When last used */
+  lastUsed: string;
+  /** Whether the user has it connected (true if we've seen it work) */
+  connected: boolean;
+}
+
+const INTEGRATION_LABELS: Record<string, string> = {
+  'Microsoft_365': 'Microsoft 365',
+  'Google_Workspace': 'Google Workspace',
+  'Google_Drive': 'Google Drive',
+  'Slack': 'Slack',
+  'Notion': 'Notion',
+  'GitHub': 'GitHub',
+  'Linear': 'Linear',
+  'Asana': 'Asana',
+  'Jira': 'Jira',
+  'Dropbox': 'Dropbox',
+  'Salesforce': 'Salesforce',
+};
+
+/**
+ * Check if a tool name is a Claude Desktop integration tool.
+ * Format: mcp__claude_ai_<IntegrationName>__<tool_name>
+ */
+export function isClaudeDesktopTool(toolName: string): boolean {
+  return toolName.startsWith('mcp__claude_ai_');
+}
+
+/** Parse integration name and tool from a claude_ai tool name. */
+function parseClaudeDesktopTool(toolName: string): { integration: string; tool: string } | null {
+  const match = toolName.match(/^mcp__claude_ai_([^_]+(?:_[^_]+)*)__(.+)$/);
+  if (!match) return null;
+  return { integration: match[1], tool: match[2] };
+}
+
+/** Load persisted integrations from disk. */
+export function loadClaudeIntegrations(): Record<string, ClaudeIntegration> {
+  try {
+    if (existsSync(INTEGRATIONS_FILE)) {
+      return JSON.parse(readFileSync(INTEGRATIONS_FILE, 'utf-8'));
+    }
+  } catch { /* ignore corrupt file */ }
+  return {};
+}
+
+/** Save integrations to disk. */
+function saveClaudeIntegrations(integrations: Record<string, ClaudeIntegration>): void {
+  writeFileSync(INTEGRATIONS_FILE, JSON.stringify(integrations, null, 2));
+}
+
+/**
+ * Record a Claude Desktop integration tool use.
+ * Call this whenever a mcp__claude_ai_* tool is seen in a tool_use block.
+ */
+export function recordClaudeIntegrationUse(toolName: string): void {
+  const parsed = parseClaudeDesktopTool(toolName);
+  if (!parsed) return;
+
+  const integrations = loadClaudeIntegrations();
+  const now = new Date().toISOString();
+  const existing = integrations[parsed.integration];
+
+  if (existing) {
+    existing.lastUsed = now;
+    existing.connected = true;
+    if (!existing.tools.includes(parsed.tool)) {
+      existing.tools.push(parsed.tool);
+    }
+  } else {
+    integrations[parsed.integration] = {
+      name: parsed.integration,
+      label: INTEGRATION_LABELS[parsed.integration] ?? parsed.integration.replace(/_/g, ' '),
+      tools: [parsed.tool],
+      firstSeen: now,
+      lastUsed: now,
+      connected: true,
+    };
+  }
+
+  saveClaudeIntegrations(integrations);
+}
+
+/** Get all discovered Claude Desktop integrations as a list. */
+export function getClaudeIntegrations(): ClaudeIntegration[] {
+  return Object.values(loadClaudeIntegrations());
+}
+
+/**
+ * Bootstrap integrations from the audit log.
+ * Call once on startup to seed the integrations file from historical data.
+ */
+export function bootstrapClaudeIntegrationsFromAuditLog(auditLogPath: string): void {
+  try {
+    if (!existsSync(auditLogPath)) return;
+    const integrations = loadClaudeIntegrations();
+    let changed = false;
+
+    const content = readFileSync(auditLogPath, 'utf-8');
+    for (const line of content.split('\n')) {
+      // Audit log format: "2026-04-09 17:00:21 mcp__claude_ai_Microsoft_365__outlook_email_search — query, limit"
+      const match = line.match(/(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) (mcp__claude_ai_[^\s]+)/);
+      if (!match) continue;
+
+      const [, timestamp, toolName] = match;
+      const parsed = parseClaudeDesktopTool(toolName);
+      if (!parsed) continue;
+
+      const existing = integrations[parsed.integration];
+      const isoTime = new Date(timestamp.replace(' ', 'T') + 'Z').toISOString();
+
+      if (existing) {
+        if (!existing.tools.includes(parsed.tool)) {
+          existing.tools.push(parsed.tool);
+          changed = true;
+        }
+        if (isoTime > existing.lastUsed) {
+          existing.lastUsed = isoTime;
+          changed = true;
+        }
+      } else {
+        integrations[parsed.integration] = {
+          name: parsed.integration,
+          label: INTEGRATION_LABELS[parsed.integration] ?? parsed.integration.replace(/_/g, ' '),
+          tools: [parsed.tool],
+          firstSeen: isoTime,
+          lastUsed: isoTime,
+          connected: true,
+        };
+        changed = true;
+      }
+    }
+
+    if (changed) {
+      saveClaudeIntegrations(integrations);
+      logger.info({ count: Object.keys(integrations).length }, 'Bootstrapped Claude Desktop integrations from audit log');
+    }
+  } catch (err) {
+    logger.debug({ err }, 'Failed to bootstrap integrations from audit log');
+  }
 }
