@@ -14,6 +14,8 @@ import {
   readFileSync,
   writeFileSync,
   unlinkSync,
+  rmSync,
+  copyFileSync,
   statSync,
   readdirSync,
   mkdirSync,
@@ -2883,47 +2885,86 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
 
   // ── Builder chat endpoint ──────────────────────────────────────────
 
+  // Track which builder sessions have received the full system prefix
+  const builderSessionInited = new Set<string>();
+
   app.post('/api/builder/chat', async (req, res) => {
-    const { message, artifactType, agentSlug, currentArtifact } = req.body;
+    const { message, artifactType, agentSlug, currentArtifact, attachments, linkedTools } = req.body;
     if (!message || typeof message !== 'string') {
       res.status(400).json({ error: 'message is required' });
       return;
     }
     const type = artifactType || 'skill';
     const sessionKey = `dashboard:builder:${type}:${agentSlug || 'clementine'}`;
+    const isFirstMessage = !builderSessionInited.has(sessionKey);
 
-    // Inject builder context before the user message
+    // ── Artifact state (compact JSON — no pretty-print to save tokens) ──
     const artifactContext = currentArtifact
-      ? `\n\n[CURRENT ARTIFACT STATE — the user may have edited this directly]\n\`\`\`json-artifact\n${JSON.stringify(currentArtifact, null, 2)}\n\`\`\`\n`
+      ? `\n[CURRENT ARTIFACT STATE]\n\`\`\`json-artifact\n${JSON.stringify(currentArtifact)}\n\`\`\`\n`
       : '';
 
-    const agentContext = agentSlug ? `You are building this for the agent "${agentSlug}". The skill/cron will be scoped to this agent specifically.\n` : '';
-    const builderPrefix = type === 'skill'
-      ? `[BUILDER MODE: You are helping build a reusable skill. ${agentContext}As you develop the procedure, output the current state as a JSON block:\n` +
-        '```json-artifact\n{"type":"skill","title":"...","description":"...","triggers":["..."],"steps":"markdown procedure"}\n```\n' +
-        `Update this block in EVERY response as the skill evolves. Ask clarifying questions to refine the procedure. Keep it conversational — one question at a time. ` +
-        `When the user says "save" or approves, output the final artifact block.]${artifactContext}\n\n`
-      : type === 'cron'
-      ? `[BUILDER MODE: You are helping build a scheduled cron job. As you develop the job, output the current state as a JSON block:\n` +
-        '```json-artifact\n{"type":"cron","name":"...","schedule":"cron expression","tier":1,"prompt":"the full job prompt","mode":"standard","enabled":true}\n```\n' +
-        `Update this block in EVERY response as the job evolves. Ask about schedule, what it should do, which tools/APIs it needs, what tier (1=read-only, 2=read-write), and whether it should run in unleashed mode.\n` +
-        `IMPORTANT: Cron jobs automatically pull in matching skills (learned procedures) at runtime. If the user describes a workflow that should be reusable, suggest creating it as a skill first, then building the cron job that references those trigger keywords. This way the cron gets smarter over time as skills improve.\n` +
-        `When the user says "save" or approves, output the final artifact block.]${artifactContext}\n\n`
-      : type === 'agent'
-      ? `[BUILDER MODE: You are helping create a new AI agent team member. As you develop the agent config, output the current state as a JSON block:\n` +
-        '```json-artifact\n{"type":"agent","name":"...","description":"role description","model":"sonnet","personality":"system prompt / onboarding brief","tools":["tool1","tool2"],"channel":"","tier":2}\n```\n' +
-        `Update this block in EVERY response as the agent evolves. Ask about: the agent's role, what tools it needs, what model to use (haiku/sonnet/opus), its personality/system prompt, which channel it should operate in, and its security tier.\n` +
-        `Help the user think about what makes a good agent: clear role, specific tools, focused personality. Keep it conversational — one question at a time.\n` +
-        `When the user says "save" or approves, output the final artifact block.]${artifactContext}\n\n`
-      : type === 'workflow'
-      ? `[BUILDER MODE: You are helping build a multi-step workflow pipeline. As you develop the workflow, output the current state as a JSON block:\n` +
-        '```json-artifact\n{"type":"workflow","name":"...","description":"...","schedule":"","steps":"step1:\\n  prompt: ...\\nstep2:\\n  prompt: ...\\n  dependsOn: step1"}\n```\n' +
-        `Update this block in EVERY response as the workflow evolves. Ask about: what the workflow should accomplish, what steps are needed, which agents should run each step, dependencies between steps, and whether it should be triggered on a schedule or manually.\n` +
-        `Workflows are defined as markdown files with YAML frontmatter. Each step has an id, prompt, optional agent, and optional dependsOn array.\n` +
-        `When the user says "save" or approves, output the final artifact block.]${artifactContext}\n\n`
-      : `[BUILDER MODE: You are helping configure an artifact. Output structured JSON blocks as you build.]${artifactContext}\n\n`;
+    // ── File attachments — decode base64 text files and inject contents ──
+    let fileContext = '';
+    if (Array.isArray(attachments) && attachments.length > 0) {
+      const fileParts: string[] = [];
+      for (const att of attachments) {
+        if (att.filename && att.content) {
+          try {
+            const decoded = Buffer.from(att.content, 'base64').toString('utf-8');
+            // Cap each file at 4K chars to keep context reasonable
+            const trimmed = decoded.length > 4000 ? decoded.slice(0, 4000) + '\n... (truncated)' : decoded;
+            fileParts.push(`### ${att.filename}\n\`\`\`\n${trimmed}\n\`\`\``);
+          } catch { /* skip binary files */ }
+        }
+      }
+      if (fileParts.length > 0) {
+        fileContext = `\n[REFERENCE FILES — the user attached these for context]\n${fileParts.join('\n\n')}\n`;
+      }
+    }
 
-    const enrichedMessage = builderPrefix + message;
+    // ── Linked tools context ──
+    let toolContext = '';
+    if (Array.isArray(linkedTools) && linkedTools.length > 0) {
+      toolContext = `\n[LINKED TOOLS — this skill should use these tools: ${linkedTools.join(', ')}]\n`;
+    }
+
+    // ── Build the enriched message ──
+    let enrichedMessage: string;
+
+    if (isFirstMessage) {
+      // Full system prefix on first message only
+      const agentContext = agentSlug ? `You are building this for the agent "${agentSlug}". The skill/cron will be scoped to this agent specifically.\n` : '';
+      const builderPrefix = type === 'skill'
+        ? `[BUILDER MODE: You are helping build a reusable skill. ${agentContext}As you develop the procedure, output the current state as a JSON block:\n` +
+          '```json-artifact\n{"type":"skill","title":"...","description":"...","triggers":["..."],"steps":"markdown procedure","toolsUsed":["tool1","tool2"]}\n```\n' +
+          `Update this block in EVERY response as the skill evolves. If the user has linked tools, include them in the toolsUsed array. Ask clarifying questions to refine the procedure. Keep it conversational — one question at a time. ` +
+          `When the user says "save" or approves, output the final artifact block.]\n\n`
+        : type === 'cron'
+        ? `[BUILDER MODE: You are helping build a scheduled cron job. As you develop the job, output the current state as a JSON block:\n` +
+          '```json-artifact\n{"type":"cron","name":"...","schedule":"cron expression","tier":1,"prompt":"the full job prompt","mode":"standard","enabled":true}\n```\n' +
+          `Update this block in EVERY response as the job evolves. Ask about schedule, what it should do, which tools/APIs it needs, what tier (1=read-only, 2=read-write), and whether it should run in unleashed mode.\n` +
+          `IMPORTANT: Cron jobs automatically pull in matching skills (learned procedures) at runtime. If the user describes a workflow that should be reusable, suggest creating it as a skill first, then building the cron job that references those trigger keywords. This way the cron gets smarter over time as skills improve.\n` +
+          `When the user says "save" or approves, output the final artifact block.]\n\n`
+        : type === 'agent'
+        ? `[BUILDER MODE: You are helping create a new AI agent team member. As you develop the agent config, output the current state as a JSON block:\n` +
+          '```json-artifact\n{"type":"agent","name":"...","description":"role description","model":"sonnet","personality":"system prompt / onboarding brief","tools":["tool1","tool2"],"channel":"","tier":2}\n```\n' +
+          `Update this block in EVERY response as the agent evolves. Ask about: the agent's role, what tools it needs, what model to use (haiku/sonnet/opus), its personality/system prompt, which channel it should operate in, and its security tier.\n` +
+          `Help the user think about what makes a good agent: clear role, specific tools, focused personality. Keep it conversational — one question at a time.\n` +
+          `When the user says "save" or approves, output the final artifact block.]\n\n`
+        : type === 'workflow'
+        ? `[BUILDER MODE: You are helping build a multi-step workflow pipeline. As you develop the workflow, output the current state as a JSON block:\n` +
+          '```json-artifact\n{"type":"workflow","name":"...","description":"...","schedule":"","steps":"step1:\\n  prompt: ...\\nstep2:\\n  prompt: ...\\n  dependsOn: step1"}\n```\n' +
+          `Update this block in EVERY response as the workflow evolves. Ask about: what the workflow should accomplish, what steps are needed, which agents should run each step, dependencies between steps, and whether it should be triggered on a schedule or manually.\n` +
+          `Workflows are defined as markdown files with YAML frontmatter. Each step has an id, prompt, optional agent, and optional dependsOn array.\n` +
+          `When the user says "save" or approves, output the final artifact block.]\n\n`
+        : `[BUILDER MODE: You are helping configure an artifact. Output structured JSON blocks as you build.]\n\n`;
+
+      enrichedMessage = builderPrefix + fileContext + toolContext + artifactContext + message;
+      builderSessionInited.add(sessionKey);
+    } else {
+      // Subsequent messages: just artifact state + files + tools + user message (no repeated prefix)
+      enrichedMessage = fileContext + toolContext + artifactContext + message;
+    }
 
     try {
       const gateway = await getGateway();
@@ -2945,10 +2986,46 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
     }
   });
 
+  // Reset builder session when user clicks "New"
+  app.post('/api/builder/reset', (_req, res) => {
+    const { artifactType, agentSlug } = _req.body;
+    const type = artifactType || 'skill';
+    const sessionKey = `dashboard:builder:${type}:${agentSlug || 'clementine'}`;
+    builderSessionInited.delete(sessionKey);
+    res.json({ ok: true });
+  });
+
+  // Test a skill by sending a trigger message through the gateway with skill context
+  app.post('/api/builder/test', async (req, res) => {
+    try {
+      const { artifact, testMessage } = req.body;
+      if (!artifact?.title || !artifact?.steps) {
+        res.status(400).json({ error: 'Skill artifact with title and steps is required' });
+        return;
+      }
+      const trigger = testMessage || (artifact.triggers?.[0] ? `I need to ${artifact.triggers[0]}` : `Help me with ${artifact.title}`);
+
+      // Build a test prompt that injects the skill as context
+      let skillContext = `## Skill Being Tested: ${artifact.title}\n\n${artifact.description || ''}\n\n## Procedure\n\n${artifact.steps}`;
+      if (artifact.toolsUsed?.length) {
+        skillContext += `\n\n**Tools for this skill:** ${artifact.toolsUsed.join(', ')}`;
+      }
+      const testPrompt = `[SKILL TEST MODE — You have a skill loaded. Use the procedure below to respond to the user's message. This is a dry-run test so describe what you would do at each step rather than actually executing tools.]\n\n${skillContext}\n\n${trigger}`;
+
+      const gateway = await getGateway();
+      const sessionKey = 'dashboard:builder:test';
+      const response = await gateway.handleMessage(sessionKey, testPrompt);
+
+      res.json({ ok: true, response: response || '(no response)', trigger });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
   // Save completed builder artifact
   app.post('/api/builder/save', (req, res) => {
     try {
-      const { artifactType, artifact, agentSlug } = req.body;
+      const { artifactType, artifact, agentSlug, attachments } = req.body;
       if (!artifact) { res.status(400).json({ error: 'artifact is required' }); return; }
 
       if (artifactType === 'skill') {
@@ -2960,11 +3037,43 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
         const name = (artifact.title || 'untitled').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 60);
         const now = new Date().toISOString();
         const matterMod = require('gray-matter');
+
+        // Backup existing skill before overwrite + preserve runtime stats
+        const existingPath = path.join(skillsDir, `${name}.md`);
+        let existingUseCount = 0;
+        let existingCreatedAt = now;
+        if (existsSync(existingPath)) {
+          copyFileSync(existingPath, existingPath.replace(/\.md$/, '.md.bak'));
+          try {
+            const prev = matterMod(readFileSync(existingPath, 'utf-8'));
+            existingUseCount = prev.data.useCount ?? 0;
+            existingCreatedAt = prev.data.createdAt ?? now;
+          } catch { /* use defaults */ }
+        }
+
         const meta: Record<string, unknown> = {
           title: artifact.title, description: artifact.description || '', triggers: artifact.triggers || [],
-          source: 'builder', toolsUsed: artifact.toolsUsed || [], useCount: 0, createdAt: now, updatedAt: now,
+          source: 'builder', toolsUsed: artifact.toolsUsed || [], useCount: existingUseCount, createdAt: existingCreatedAt, updatedAt: now,
         };
         if (agentSlug) meta.agentSlug = agentSlug;
+
+        // Persist attached reference files alongside the skill
+        const attachmentNames: string[] = [];
+        if (Array.isArray(attachments) && attachments.length > 0) {
+          const skillAttDir = path.join(skillsDir, name + '.files');
+          if (!existsSync(skillAttDir)) mkdirSync(skillAttDir, { recursive: true });
+          for (const att of attachments) {
+            if (att.filename && att.content) {
+              try {
+                const safeName = att.filename.replace(/[^a-zA-Z0-9._-]/g, '_');
+                writeFileSync(path.join(skillAttDir, safeName), Buffer.from(att.content, 'base64'));
+                attachmentNames.push(safeName);
+              } catch { /* skip bad files */ }
+            }
+          }
+        }
+        if (attachmentNames.length > 0) meta.attachments = attachmentNames;
+
         const content = matterMod.stringify(
           `\n# ${artifact.title}\n\n${artifact.description || ''}\n\n## Procedure\n\n${artifact.steps || ''}\n`,
           meta,
@@ -3431,9 +3540,15 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
 
   app.delete('/api/skills/:name', (req, res) => {
     try {
-      const filePath = path.join(VAULT_DIR, '00-System', 'skills', `${req.params.name}.md`);
+      const skillsDir = path.join(VAULT_DIR, '00-System', 'skills');
+      const filePath = path.join(skillsDir, `${req.params.name}.md`);
       if (!existsSync(filePath)) { res.status(404).json({ error: 'Skill not found' }); return; }
       unlinkSync(filePath);
+      // Clean up attachments directory and backup
+      const filesDir = path.join(skillsDir, `${req.params.name}.files`);
+      if (existsSync(filesDir)) rmSync(filesDir, { recursive: true, force: true });
+      const bakPath = filePath.replace(/\.md$/, '.md.bak');
+      if (existsSync(bakPath)) unlinkSync(bakPath);
       res.json({ ok: true });
     } catch (err) {
       res.status(500).json({ error: String(err) });
@@ -3442,11 +3557,47 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
 
   app.get('/api/skills/:name', (req, res) => {
     try {
-      const filePath = path.join(VAULT_DIR, '00-System', 'skills', `${req.params.name}.md`);
+      // Check agent-scoped first (via query param), then global
+      const agentSlug = req.query.agent as string | undefined;
+      let filePath: string;
+      let skillDir: string;
+      if (agentSlug) {
+        const agentPath = path.join(VAULT_DIR, '00-System', 'agents', agentSlug, 'skills', `${req.params.name}.md`);
+        if (existsSync(agentPath)) {
+          filePath = agentPath;
+          skillDir = path.join(VAULT_DIR, '00-System', 'agents', agentSlug, 'skills');
+        } else {
+          filePath = path.join(VAULT_DIR, '00-System', 'skills', `${req.params.name}.md`);
+          skillDir = path.join(VAULT_DIR, '00-System', 'skills');
+        }
+      } else {
+        filePath = path.join(VAULT_DIR, '00-System', 'skills', `${req.params.name}.md`);
+        skillDir = path.join(VAULT_DIR, '00-System', 'skills');
+      }
       if (!existsSync(filePath)) { res.status(404).json({ error: 'Skill not found' }); return; }
       const matterMod = require('gray-matter');
       const parsed = matterMod(readFileSync(filePath, 'utf-8'));
-      res.json({ ...parsed.data, name: req.params.name, content: parsed.content });
+
+      // Extract steps from content (after "## Procedure" heading)
+      const procMatch = parsed.content.match(/## Procedure\s*\n([\s\S]*)/);
+      const steps = procMatch ? procMatch[1].trim() : parsed.content.trim();
+
+      // Load attachment file list with base64 content for builder reload
+      const attachments: Array<{ filename: string; content: string; size: number }> = [];
+      const filesDir = path.join(skillDir, `${req.params.name}.files`);
+      if (existsSync(filesDir)) {
+        for (const f of readdirSync(filesDir)) {
+          try {
+            const fp = path.join(filesDir, f);
+            const stat = statSync(fp);
+            if (stat.isFile() && stat.size < 10 * 1024 * 1024) {
+              attachments.push({ filename: f, content: readFileSync(fp).toString('base64'), size: stat.size });
+            }
+          } catch { /* skip */ }
+        }
+      }
+
+      res.json({ ...parsed.data, name: req.params.name, content: parsed.content, steps, attachmentFiles: attachments });
     } catch (err) {
       res.status(500).json({ error: String(err) });
     }
@@ -3521,14 +3672,23 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
       const agentSlug = req.params.slug;
       const agentDir = path.join(VAULT_DIR, '00-System', 'agents', agentSlug, 'skills');
       const filePath = path.join(agentDir, `${req.params.name}.md`);
+      let targetDir: string;
       if (!existsSync(filePath)) {
         // Fall back to global skills dir
-        const globalPath = path.join(VAULT_DIR, '00-System', 'skills', `${req.params.name}.md`);
+        const globalDir = path.join(VAULT_DIR, '00-System', 'skills');
+        const globalPath = path.join(globalDir, `${req.params.name}.md`);
         if (!existsSync(globalPath)) { res.status(404).json({ error: 'Skill not found' }); return; }
         unlinkSync(globalPath);
+        targetDir = globalDir;
       } else {
         unlinkSync(filePath);
+        targetDir = agentDir;
       }
+      // Clean up attachments directory and backup
+      const filesDir = path.join(targetDir, `${req.params.name}.files`);
+      if (existsSync(filesDir)) rmSync(filesDir, { recursive: true, force: true });
+      const bakPath = path.join(targetDir, `${req.params.name}.md.bak`);
+      if (existsSync(bakPath)) unlinkSync(bakPath);
       res.json({ ok: true });
     } catch (err) {
       res.status(500).json({ error: String(err) });
@@ -8255,6 +8415,7 @@ function getDashboardHTML(token: string): string {
         <input type="hidden" id="builder-agent" value="">
         <span style="flex:1"></span>
         <button class="btn-sm" onclick="resetBuilder()" style="background:var(--bg-tertiary);border:1px solid var(--border);color:var(--text-secondary);padding:4px 12px;border-radius:6px;cursor:pointer;font-size:12px">New</button>
+        <button class="btn-sm" id="builder-test-btn" onclick="testBuilderSkill()" style="background:var(--bg-tertiary);border:1px solid var(--border);color:var(--text-secondary);padding:4px 12px;border-radius:6px;cursor:pointer;font-size:12px;display:none">Test</button>
         <button class="btn-sm btn-primary" id="builder-save-btn" onclick="saveBuilderArtifact()" style="padding:4px 16px;font-size:12px;display:none">Save</button>
       </div>
       <div style="display:flex;flex:1;min-height:0;overflow:hidden">
@@ -8271,18 +8432,21 @@ function getDashboardHTML(token: string): string {
               </div>
             </div>
           </div>
-          <div id="builder-file-area" style="display:none;padding:8px 16px;border-top:1px solid var(--border);background:var(--bg-secondary)">
+          <div id="builder-file-area" style="padding:8px 16px;border-top:1px solid var(--border);background:var(--bg-secondary)">
             <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">
               <span style="font-size:11px;font-weight:600;color:var(--text-secondary)">Reference Files</span>
               <label style="cursor:pointer;display:inline-flex;align-items:center;gap:4px;background:var(--bg-tertiary);border:1px solid var(--border);border-radius:4px;padding:2px 8px;font-size:11px;color:var(--text-primary)">
                 + Add
-                <input type="file" multiple accept=".csv,.md,.txt,.json,.docx,.xlsx" style="display:none" onchange="handleBuilderFileUpload(event)">
+                <input type="file" multiple accept=".csv,.md,.txt,.json,.docx,.xlsx,.yaml,.yml,.xml,.html,.py,.js,.ts" style="display:none" onchange="handleBuilderFileUpload(event)">
               </label>
+              <span style="font-size:10px;color:var(--text-muted)">Sent with each message so the AI can reference them</span>
             </div>
             <div id="builder-attachments-list"></div>
-            <div style="font-size:10px;color:var(--text-muted)">Files injected into the agent prompt at runtime</div>
           </div>
-          <div style="display:flex;gap:8px;padding:12px 16px;border-top:1px solid var(--border)">
+          <div style="display:flex;gap:8px;padding:12px 16px;border-top:1px solid var(--border);align-items:center">
+            <label style="cursor:pointer;display:flex;align-items:center;color:var(--text-muted);font-size:18px" title="Attach file">
+              <input type="file" multiple accept=".csv,.md,.txt,.json,.docx,.xlsx,.yaml,.yml,.xml,.html,.py,.js,.ts" style="display:none" onchange="handleBuilderFileUpload(event)">&#x1F4CE;
+            </label>
             <input type="text" id="builder-input" placeholder="Describe what you want to build..." onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendBuilderChat()}" style="flex:1;padding:10px 14px;border:1px solid var(--border);border-radius:8px;background:var(--bg-input);color:var(--text-primary);font-size:13px">
             <button class="btn-primary" onclick="sendBuilderChat()" style="padding:10px 18px;border-radius:8px">Send</button>
           </div>
@@ -12812,24 +12976,90 @@ async function switchProfile(slug) {
 var builderArtifact = null;
 var builderSending = false;
 
+async function editSkillInBuilder(name, agentSlug) {
+  try {
+    var url = '/api/skills/' + encodeURIComponent(name);
+    if (agentSlug) url += '?agent=' + encodeURIComponent(agentSlug);
+    var r = await apiFetch(url);
+    var d = await r.json();
+    if (d.error) { toast(d.error, 'error'); return; }
+
+    // Switch to builder page
+    showPage('builder');
+
+    // Set type to skill
+    var typeSelect = document.getElementById('builder-type');
+    if (typeSelect) typeSelect.value = 'skill';
+
+    // Set agent scope
+    var agentHidden = document.getElementById('builder-agent');
+    var agentLabel = document.getElementById('builder-agent-label');
+    if (agentHidden) agentHidden.value = agentSlug || '';
+    if (agentLabel) agentLabel.textContent = agentSlug ? 'Agent: ' + agentSlug : '';
+
+    // Reset session on server so next message gets full prefix
+    await apiJson('POST', '/api/builder/reset', { artifactType: 'skill', agentSlug: agentSlug || undefined }).catch(function(){});
+
+    // Populate artifact
+    builderArtifact = {
+      type: 'skill',
+      title: d.title || '',
+      description: d.description || '',
+      triggers: d.triggers || [],
+      steps: d.steps || d.content || '',
+      toolsUsed: d.toolsUsed || [],
+    };
+
+    // Load attachments
+    _builderAttachments = d.attachmentFiles || [];
+    renderBuilderAttachments();
+
+    // Load linked tools
+    _builderLinkedTools = d.toolsUsed || [];
+
+    // Render preview
+    renderBuilderPreview(builderArtifact, 'skill');
+    document.getElementById('builder-save-btn').style.display = '';
+    document.getElementById('builder-test-btn').style.display = '';
+
+    // Show editing context in chat
+    var msgs = document.getElementById('builder-messages');
+    if (msgs) {
+      msgs.innerHTML = '<div style="text-align:center;padding:12px;font-size:13px;color:var(--text-muted)">'
+        + 'Editing skill: <strong>' + esc(d.title || name) + '</strong>'
+        + (agentSlug ? ' <span class="badge badge-blue" style="font-size:10px">' + esc(agentSlug) + '</span>' : '')
+        + '<br><span style="font-size:11px">Make changes in the preview panel or chat to refine the skill.</span>'
+        + '</div>';
+    }
+
+    toast('Loaded "' + (d.title || name) + '" into builder', 'success');
+  } catch(e) {
+    toast('Failed to load skill: ' + e, 'error');
+  }
+}
+
 function resetBuilder() {
   builderArtifact = null;
   builderSending = false;
+  _builderLinkedTools = [];
   var msgs = document.getElementById('builder-messages');
   if (msgs) msgs.innerHTML = '<div class="empty-state" style="margin-top:40px"><p style="color:var(--text-muted);margin-bottom:12px">Describe what you want to build.</p><div style="display:flex;flex-wrap:wrap;gap:8px;justify-content:center"><button class="btn btn-sm quick-pill" onclick="builderQuick(\\x27Create a cron job that checks my email every morning and sends me a summary\\x27)">Email summary cron</button><button class="btn btn-sm quick-pill" onclick="builderQuick(\\x27Create an SDR agent that researches leads and drafts outreach emails\\x27)">SDR agent</button><button class="btn btn-sm quick-pill" onclick="builderQuick(\\x27Build a weekly analytics report that checks SEO rankings\\x27)">Weekly SEO report</button><button class="btn btn-sm quick-pill" onclick="builderQuick(\\x27Create a workflow that researches a topic, writes a draft, and sends it for review\\x27)">Research workflow</button></div></div>';
   var preview = document.getElementById('builder-preview');
   if (preview) preview.innerHTML = '<div class="empty-state" style="font-size:13px;color:var(--text-muted)">The artifact will appear here as you build it</div>';
   var saveBtn = document.getElementById('builder-save-btn');
   if (saveBtn) saveBtn.style.display = 'none';
+  var testBtn = document.getElementById('builder-test-btn');
+  if (testBtn) testBtn.style.display = 'none';
   var status = document.getElementById('builder-preview-status');
   if (status) status.textContent = '';
   var input = document.getElementById('builder-input');
   if (input) input.value = '';
   _builderAttachments = [];
-  var fileArea = document.getElementById('builder-file-area');
-  var type = (document.getElementById('builder-type') || {}).value;
-  if (fileArea) fileArea.style.display = (type === 'cron') ? '' : 'none';
   renderBuilderAttachments();
+  // Tell server to reset session so next message gets the full prefix
+  var type = (document.getElementById('builder-type') || {}).value;
+  var agent = (document.getElementById('builder-agent') || {}).value;
+  apiJson('POST', '/api/builder/reset', { artifactType: type, agentSlug: agent || undefined }).catch(function(){});
 }
 
 function builderQuick(text) {
@@ -12848,24 +13078,52 @@ function builderQuick(text) {
   sendBuilderChat();
 }
 
+var _builderQueue = [];
+
 async function sendBuilderChat() {
-  if (builderSending) return;
   var input = document.getElementById('builder-input');
   var text = (input.value || '').trim();
   if (!text) return;
   input.value = '';
-  builderSending = true;
 
   var msgs = document.getElementById('builder-messages');
   // Remove empty state if present
   var empty = msgs.querySelector('.empty-state');
   if (empty) empty.remove();
 
-  // Add user bubble
+  // Add user bubble immediately
   msgs.innerHTML += '<div class="chat-bubble user" style="margin-bottom:10px">' + esc(text) + '</div>';
+  msgs.scrollTop = msgs.scrollHeight;
+
+  // If already processing, queue this message
+  if (builderSending) {
+    _builderQueue.push(text);
+    msgs.innerHTML += '<div class="chat-bubble user" style="margin-bottom:4px;opacity:0.5;font-size:11px;padding:4px 10px;color:var(--text-muted)">Queued — will send after current response</div>';
+    msgs.scrollTop = msgs.scrollHeight;
+    return;
+  }
+
+  await _processBuilderMessage(text);
+
+  // Process queued messages
+  while (_builderQueue.length > 0) {
+    var next = _builderQueue.shift();
+    // Remove the "queued" indicator
+    var queued = msgs.querySelectorAll('.chat-bubble.user');
+    for (var i = 0; i < queued.length; i++) {
+      if (queued[i].style.opacity === '0.5') { queued[i].remove(); break; }
+    }
+    await _processBuilderMessage(next);
+  }
+}
+
+async function _processBuilderMessage(text) {
+  builderSending = true;
+  var msgs = document.getElementById('builder-messages');
 
   // Add typing indicator
-  msgs.innerHTML += '<div class="chat-bubble assistant chat-typing" id="builder-typing" style="margin-bottom:10px"><span></span><span></span><span></span></div>';
+  var typingId = 'builder-typing-' + Date.now();
+  msgs.innerHTML += '<div class="chat-bubble assistant chat-typing" id="' + typingId + '" style="margin-bottom:10px"><span></span><span></span><span></span></div>';
   msgs.scrollTop = msgs.scrollHeight;
 
   var type = document.getElementById('builder-type').value;
@@ -12877,10 +13135,12 @@ async function sendBuilderChat() {
       artifactType: type,
       agentSlug: agent || undefined,
       currentArtifact: builderArtifact,
+      attachments: _builderAttachments.length > 0 ? _builderAttachments : undefined,
+      linkedTools: _builderLinkedTools.length > 0 ? _builderLinkedTools : undefined,
     });
 
     // Remove typing indicator
-    var typing = document.getElementById('builder-typing');
+    var typing = document.getElementById(typingId);
     if (typing) typing.remove();
 
     if (r.response) {
@@ -12892,6 +13152,8 @@ async function sendBuilderChat() {
       builderArtifact = r.artifact;
       renderBuilderPreview(r.artifact, type);
       document.getElementById('builder-save-btn').style.display = '';
+      var testBtn = document.getElementById('builder-test-btn');
+      if (testBtn) testBtn.style.display = (type === 'skill') ? '' : 'none';
       document.getElementById('builder-preview-status').textContent = 'Updated';
       setTimeout(function() {
         var s = document.getElementById('builder-preview-status');
@@ -12901,7 +13163,7 @@ async function sendBuilderChat() {
 
     msgs.scrollTop = msgs.scrollHeight;
   } catch(e) {
-    var t = document.getElementById('builder-typing');
+    var t = document.getElementById(typingId);
     if (t) t.remove();
     msgs.innerHTML += '<div class="chat-bubble assistant" style="color:var(--red);margin-bottom:10px">Error: ' + esc(String(e)) + '</div>';
   }
@@ -12916,7 +13178,17 @@ function renderBuilderPreview(artifact, type) {
     html = '<div class="preview-field"><label>Title</label><input type="text" value="' + esc(artifact.title || '') + '" onchange="builderArtifact.title=this.value"></div>'
       + '<div class="preview-field"><label>Description</label><input type="text" value="' + esc(artifact.description || '') + '" onchange="builderArtifact.description=this.value"></div>'
       + '<div class="preview-field"><label>Triggers</label><input type="text" value="' + esc((artifact.triggers || []).join(', ')) + '" onchange="builderArtifact.triggers=this.value.split(\\x27,\\x27).map(function(t){return t.trim()}).filter(Boolean)"></div>'
-      + '<div class="preview-field"><label>Procedure</label><textarea rows="12" onchange="builderArtifact.steps=this.value">' + esc(artifact.steps || '') + '</textarea></div>';
+      + '<div class="preview-field"><label>Linked Tools</label>'
+      + '<div id="builder-tools-panel" style="max-height:180px;overflow-y:auto;border:1px solid var(--border);border-radius:6px;padding:6px 8px;background:var(--bg-primary);margin-bottom:4px"></div>'
+      + '<div style="font-size:10px;color:var(--text-muted)">Select tools this skill can use. These are saved in the skill and communicated to the AI during conversations.</div>'
+      + '</div>'
+      + '<div class="preview-field"><label>Procedure</label><textarea rows="10" onchange="builderArtifact.steps=this.value">' + esc(artifact.steps || '') + '</textarea></div>'
+      + '<div class="preview-field"><label>Reference Files</label>'
+      + '<div id="builder-preview-attachments"></div>'
+      + '<div style="font-size:10px;color:var(--text-muted);margin-top:2px">' + (_builderAttachments.length > 0 ? _builderAttachments.length + ' file(s) attached' : 'Add files in the chat panel below') + '</div>'
+      + '</div>';
+    // Load tool picker after DOM update
+    setTimeout(function() { loadBuilderToolOptions(artifact.toolsUsed || _builderLinkedTools); }, 50);
   } else if (type === 'cron') {
     html = '<div class="preview-field"><label>Job Name</label><input type="text" value="' + esc(artifact.name || '') + '" onchange="builderArtifact.name=this.value"></div>'
       + '<div class="preview-field"><label>Schedule (cron expression)</label><input type="text" value="' + esc(artifact.schedule || '') + '" onchange="builderArtifact.schedule=this.value"></div>'
@@ -12963,12 +13235,63 @@ function renderBuilderPreview(artifact, type) {
   }
 }
 
+async function testBuilderSkill() {
+  if (!builderArtifact || !builderArtifact.steps) {
+    toast('Build the skill procedure first', 'error');
+    return;
+  }
+  var msgs = document.getElementById('builder-messages');
+  var trigger = builderArtifact.triggers && builderArtifact.triggers.length > 0
+    ? 'I need to ' + builderArtifact.triggers[0]
+    : 'Help me with ' + (builderArtifact.title || 'this');
+
+  // Show test trigger in chat
+  msgs.innerHTML += '<div style="text-align:center;padding:8px;font-size:11px;color:var(--text-muted);border-top:1px solid var(--border);margin-top:8px">Testing with: "' + esc(trigger) + '"</div>';
+  msgs.innerHTML += '<div class="chat-bubble assistant chat-typing" id="builder-test-typing" style="margin-bottom:10px"><span></span><span></span><span></span></div>';
+  msgs.scrollTop = msgs.scrollHeight;
+
+  var testBtn = document.getElementById('builder-test-btn');
+  if (testBtn) { testBtn.disabled = true; testBtn.textContent = 'Testing...'; }
+
+  try {
+    // Sync tools into artifact
+    builderArtifact.toolsUsed = _builderLinkedTools;
+    var r = await apiJson('POST', '/api/builder/test', {
+      artifact: builderArtifact,
+      testMessage: trigger,
+    });
+
+    var typing = document.getElementById('builder-test-typing');
+    if (typing) typing.remove();
+
+    if (r.response) {
+      msgs.innerHTML += '<div style="border:1px solid var(--accent);border-radius:8px;padding:12px;margin:8px 0;background:var(--bg-secondary)">'
+        + '<div style="font-size:10px;font-weight:600;color:var(--accent);margin-bottom:6px">TEST RESULT</div>'
+        + '<div style="font-size:13px">' + renderMd(r.response) + '</div>'
+        + '</div>';
+    }
+    msgs.scrollTop = msgs.scrollHeight;
+  } catch(e) {
+    var t = document.getElementById('builder-test-typing');
+    if (t) t.remove();
+    msgs.innerHTML += '<div class="chat-bubble assistant" style="color:var(--red)">Test error: ' + esc(String(e)) + '</div>';
+  }
+  if (testBtn) { testBtn.disabled = false; testBtn.textContent = 'Test'; }
+}
+
 async function saveBuilderArtifact() {
   if (!builderArtifact) { toast('No artifact to save', 'error'); return; }
   var type = document.getElementById('builder-type').value;
   try {
     var agentSlug = (document.getElementById('builder-agent') || {}).value || '';
-    var r = await apiJson('POST', '/api/builder/save', { artifactType: type, artifact: builderArtifact, agentSlug: agentSlug || undefined });
+    // Sync linked tools into artifact before saving
+    if (type === 'skill') builderArtifact.toolsUsed = _builderLinkedTools;
+    var r = await apiJson('POST', '/api/builder/save', {
+      artifactType: type,
+      artifact: builderArtifact,
+      agentSlug: agentSlug || undefined,
+      attachments: (type === 'skill' && _builderAttachments.length > 0) ? _builderAttachments : undefined,
+    });
     if (r.ok) {
       // Upload any pending attachments for cron jobs
       if (type === 'cron' && _builderAttachments.length > 0 && r.name) {
@@ -13013,6 +13336,50 @@ function refreshBuilderAgents(preselect) {
   } else {
     label.textContent = preselect;
   }
+}
+
+// ── Builder Linked Tools ──────────────────
+var _builderLinkedTools = [];
+
+async function loadBuilderToolOptions(selectedTools) {
+  try {
+    var r = await apiFetch('/api/available-tools');
+    var d = await r.json();
+    var panel = document.getElementById('builder-tools-panel');
+    if (!panel) return;
+    panel.innerHTML = '';
+    var selected = selectedTools || [];
+    for (var cat in d.categories) {
+      var header = document.createElement('div');
+      header.style.cssText = 'font-weight:600;font-size:10px;color:var(--text-muted);margin:6px 0 2px;cursor:pointer;user-select:none';
+      header.textContent = '\\u25B8 ' + cat;
+      header.dataset.category = cat;
+      header.onclick = (function(catName) { return function() {
+        var cbs = panel.querySelectorAll('.builder-tool-cb[data-cat="' + catName + '"]');
+        var allChecked = Array.from(cbs).every(function(cb) { return cb.checked; });
+        cbs.forEach(function(cb) { cb.checked = !allChecked; });
+        syncBuilderLinkedTools();
+      }; })(cat);
+      panel.appendChild(header);
+      d.categories[cat].forEach(function(tool) {
+        var toolName = typeof tool === 'string' ? tool : tool.name;
+        var toolDesc = typeof tool === 'string' ? '' : (tool.description || '');
+        var label = document.createElement('label');
+        label.style.cssText = 'display:block;font-size:11px;padding:1px 0 1px 6px;cursor:pointer';
+        var checked = selected.indexOf(toolName) >= 0 ? ' checked' : '';
+        label.innerHTML = '<input type="checkbox" class="builder-tool-cb" data-cat="' + esc(cat) + '" value="' + esc(toolName) + '"' + checked + ' onchange="syncBuilderLinkedTools()" style="margin-right:4px;transform:scale(0.85)">'
+          + '<span>' + esc(toolName) + '</span>'
+          + (toolDesc ? '<span style="color:var(--text-muted);margin-left:4px">' + esc(toolDesc) + '</span>' : '');
+        panel.appendChild(label);
+      });
+    }
+  } catch(e) { /* fallback — panel stays empty */ }
+}
+
+function syncBuilderLinkedTools() {
+  _builderLinkedTools = Array.from(document.querySelectorAll('.builder-tool-cb:checked')).map(function(cb) { return cb.value; });
+  // Also sync into the artifact so it saves with toolsUsed
+  if (builderArtifact) builderArtifact.toolsUsed = _builderLinkedTools;
 }
 
 // ── Builder File Attachments ──────────────
@@ -14966,6 +15333,7 @@ async function refreshSkills() {
         + '<span style="margin-left:auto;display:flex;align-items:center;gap:8px">'
         + '<span style="font-size:11px;color:var(--text-muted)">used ' + s.useCount + 'x' + (age ? ' \\u00b7 ' + age : '') + '</span>'
         + '<button onclick="expandSkill(\\x27' + esc(s.name) + '\\x27)" style="background:none;border:1px solid var(--border);border-radius:4px;padding:2px 8px;font-size:11px;color:var(--text-secondary);cursor:pointer">View</button>'
+        + '<button onclick="editSkillInBuilder(\\x27' + esc(s.name) + '\\x27)" style="background:none;border:1px solid var(--border);border-radius:4px;padding:2px 8px;font-size:11px;color:var(--accent);cursor:pointer">Edit</button>'
         + '<button onclick="deleteSkill(\\x27' + esc(s.name) + '\\x27)" style="background:none;border:1px solid var(--border);border-radius:4px;padding:2px 8px;font-size:11px;color:var(--red);cursor:pointer">Delete</button>'
         + '</span>'
         + '</div>'
@@ -15047,6 +15415,7 @@ async function loadAgentSkills(agentSlug, isPrimary) {
         + '<span style="margin-left:auto;display:flex;align-items:center;gap:6px">'
         + '<span style="font-size:11px;color:var(--text-muted)">used ' + (s.useCount || 0) + 'x' + (age ? ' \\u00b7 ' + age : '') + '</span>'
         + '<button onclick="expandSkill(\\x27' + esc(s.name) + '\\x27)" style="background:none;border:1px solid var(--border);border-radius:4px;padding:2px 8px;font-size:10px;color:var(--text-secondary);cursor:pointer">View</button>'
+        + '<button onclick="editSkillInBuilder(\\x27' + esc(s.name) + '\\x27,\\x27' + esc(agentSlug || '') + '\\x27)" style="background:none;border:1px solid var(--border);border-radius:4px;padding:2px 8px;font-size:10px;color:var(--accent);cursor:pointer">Edit</button>'
         + '<button onclick="deleteAgentSkill(\\x27' + esc(agentSlug || '') + '\\x27,\\x27' + esc(s.name) + '\\x27)" style="background:none;border:1px solid var(--border);border-radius:4px;padding:2px 8px;font-size:10px;color:var(--red);cursor:pointer">Del</button>'
         + '</span></div>'
         + (s.description ? '<div style="font-size:12px;color:var(--text-secondary);margin-bottom:4px">' + esc(s.description) + '</div>' : '')

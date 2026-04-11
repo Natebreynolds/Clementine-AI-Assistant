@@ -945,10 +945,42 @@ Never spawn a sub-agent with vague instructions like "handle this brief" — tel
     // Proactive skill injection: match user message against skill triggers
     if (this._lastUserMessage && !isAutonomous) {
       try {
-        const matchedSkills = searchSkillsSync(this._lastUserMessage, 1);
+        const matchedSkills = searchSkillsSync(this._lastUserMessage, 1, profile?.slug);
         if (matchedSkills.length > 0 && matchedSkills[0].score >= 4) {
           const skill = matchedSkills[0];
-          parts.push(`## Relevant Skill: ${skill.title}\n\n${skill.content.slice(0, 800)}`);
+          let skillBlock = `## Relevant Skill: ${skill.title}\n\n${skill.content.slice(0, 800)}`;
+
+          // Surface linked tools + warn about whitelist conflicts
+          if (skill.toolsUsed.length > 0) {
+            skillBlock += `\n\n**Tools for this skill:** ${skill.toolsUsed.join(', ')}`;
+            if (profile?.team?.allowedTools?.length) {
+              const whitelist = new Set(profile.team.allowedTools);
+              const missing = skill.toolsUsed.filter(t => !whitelist.has(t));
+              if (missing.length > 0) {
+                skillBlock += `\n\n**Warning:** This skill requires tools not in your whitelist: ${missing.join(', ')}. These steps may fail. Ask ${OWNER} to add them to your allowed tools if needed.`;
+              }
+            }
+          }
+
+          // Inline attachment file contents (capped at 2K per file, 3 files max)
+          if (skill.attachments.length > 0) {
+            const attDir = path.join(skill.skillDir, skill.name + '.files');
+            const attParts: string[] = [];
+            for (const attName of skill.attachments.slice(0, 3)) {
+              const attPath = path.join(attDir, attName);
+              if (fs.existsSync(attPath)) {
+                try {
+                  const content = fs.readFileSync(attPath, 'utf-8').slice(0, 2000);
+                  attParts.push(`### ${attName}\n\`\`\`\n${content}\n\`\`\``);
+                } catch { /* skip binary/unreadable */ }
+              }
+            }
+            if (attParts.length > 0) {
+              skillBlock += `\n\n**Reference files:**\n${attParts.join('\n\n')}`;
+            }
+          }
+
+          parts.push(skillBlock);
         }
       } catch { /* non-fatal — skills dir may not exist */ }
     }
@@ -2962,7 +2994,22 @@ You have a limited number of turns per message (~15). **After 8-10 tool calls, y
       if (matchedSkills.length > 0) {
         const skillLines = matchedSkills.map(s => {
           recordSkillUse(s.name);
-          return `### ${s.title}\n${s.content}`;
+          let block = `### ${s.title}\n${s.content}`;
+          if (s.toolsUsed.length > 0) block += `\n**Tools:** ${s.toolsUsed.join(', ')}`;
+          // Inline attachment contents for cron context
+          if (s.attachments.length > 0) {
+            const attDir = path.join(s.skillDir, s.name + '.files');
+            for (const attName of s.attachments.slice(0, 3)) {
+              const attPath = path.join(attDir, attName);
+              if (fs.existsSync(attPath)) {
+                try {
+                  const content = fs.readFileSync(attPath, 'utf-8').slice(0, 2000);
+                  block += `\n#### ${attName}\n\`\`\`\n${content}\n\`\`\``;
+                } catch { /* skip */ }
+              }
+            }
+          }
+          return block;
         });
         skillContext = `## Learned Procedures (from past successful executions)\nFollow these proven approaches when applicable:\n\n${skillLines.join('\n\n')}\n\n`;
       }
@@ -3317,7 +3364,24 @@ You have a limited number of turns per message (~15). **After 8-10 tool calls, y
           const matchedSkills = searchSkills(jobName + ' ' + jobPrompt.slice(0, 200), 2, unleashedAgentSlug);
           if (matchedSkills.length > 0) {
             unleashedSkillContext = `\n\n## Learned Procedures\nFollow these proven approaches when applicable:\n\n` +
-              matchedSkills.map(s => { recordSkillUse(s.name); return `### ${s.title}\n${s.content}`; }).join('\n\n') + '\n';
+              matchedSkills.map(s => {
+                recordSkillUse(s.name);
+                let block = `### ${s.title}\n${s.content}`;
+                if (s.toolsUsed.length > 0) block += `\n**Tools:** ${s.toolsUsed.join(', ')}`;
+                if (s.attachments.length > 0) {
+                  const attDir = path.join(s.skillDir, s.name + '.files');
+                  for (const attName of s.attachments.slice(0, 3)) {
+                    const attPath = path.join(attDir, attName);
+                    if (fs.existsSync(attPath)) {
+                      try {
+                        const content = fs.readFileSync(attPath, 'utf-8').slice(0, 2000);
+                        block += `\n#### ${attName}\n\`\`\`\n${content}\n\`\`\``;
+                      } catch { /* skip */ }
+                    }
+                  }
+                }
+                return block;
+              }).join('\n\n') + '\n';
           }
         } catch { /* non-fatal */ }
       }

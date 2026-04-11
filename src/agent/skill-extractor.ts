@@ -9,7 +9,7 @@
  * during context search to avoid re-deriving procedures from scratch.
  */
 
-import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync, copyFileSync } from 'node:fs';
 import path from 'node:path';
 import matter from 'gray-matter';
 import pino from 'pino';
@@ -135,6 +135,10 @@ function saveSkill(skill: SkillDocument): void {
 
   const content = matter.stringify(`\n# ${skill.title}\n\n${skill.description}\n\n## Procedure\n\n${skill.steps}\n`, frontmatter);
   const filePath = path.join(SKILLS_DIR, `${skill.name}.md`);
+  // Backup existing before overwrite
+  if (existsSync(filePath)) {
+    try { copyFileSync(filePath, filePath.replace(/\.md$/, '.md.bak')); } catch { /* best-effort */ }
+  }
   writeFileSync(filePath, content);
 
   logger.info({ name: skill.name, source: skill.source }, 'Skill saved');
@@ -227,7 +231,17 @@ async function mergeSkill(
 // ── Skill Retrieval ─────────────────────────────────────────────────
 
 /** Search skills by query text and return matching skill content for injection. Agent-scoped skills get a priority boost. */
-export function searchSkills(query: string, limit = 3, agentSlug?: string): Array<{ name: string; title: string; content: string; score: number }> {
+export interface SkillMatch {
+  name: string;
+  title: string;
+  content: string;
+  score: number;
+  toolsUsed: string[];
+  attachments: string[];
+  skillDir: string;
+}
+
+export function searchSkills(query: string, limit = 3, agentSlug?: string): SkillMatch[] {
   const dirs: Array<{ dir: string; boost: number }> = [];
   // Agent-scoped skills get priority (boost=2)
   if (agentSlug) {
@@ -240,7 +254,7 @@ export function searchSkills(query: string, limit = 3, agentSlug?: string): Arra
   if (dirs.length === 0) return [];
 
   const queryWords = query.toLowerCase().split(/\s+/).filter(w => w.length > 2);
-  const results: Array<{ name: string; title: string; content: string; score: number }> = [];
+  const results: SkillMatch[] = [];
   const seen = new Set<string>();
 
   for (const { dir, boost } of dirs) {
@@ -273,6 +287,9 @@ export function searchSkills(query: string, limit = 3, agentSlug?: string): Arra
             title,
             content: parsed.content.slice(0, 1500),
             score: score + boost,
+            toolsUsed: parsed.data.toolsUsed ?? [],
+            attachments: parsed.data.attachments ?? [],
+            skillDir: dir,
           });
         }
       } catch { /* skip */ }
