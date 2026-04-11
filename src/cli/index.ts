@@ -1486,8 +1486,7 @@ async function cmdUpdate(options: { restart?: boolean; dryRun?: boolean }): Prom
       const backupEnv = path.join(backupDir, '.env');
       if (existsSync(backupEnv)) {
         try {
-          const { copyFileSync } = require('node:fs') as typeof import('node:fs');
-          copyFileSync(backupEnv, ENV_PATH);
+          cpSync(backupEnv, ENV_PATH);
           console.log(`  ${GREEN}OK${RESET}  .env restored from backup`);
         } catch {
           console.error(`  ${RED}FAIL${RESET}  Could not restore .env — copy manually from: ${backupEnv}`);
@@ -1506,8 +1505,7 @@ async function cmdUpdate(options: { restart?: boolean; dryRun?: boolean }): Prom
       const backupEnv = path.join(backupDir, '.env');
       if (existsSync(backupEnv)) {
         try {
-          const { copyFileSync } = require('node:fs') as typeof import('node:fs');
-          copyFileSync(backupEnv, ENV_PATH);
+          cpSync(backupEnv, ENV_PATH);
           console.log(`  ${GREEN}OK${RESET}  .env restored from backup`);
         } catch {
           console.error(`  ${RED}FAIL${RESET}  Restore failed — copy manually from: ${backupEnv}`);
@@ -1629,20 +1627,10 @@ async function cmdUpdate(options: { restart?: boolean; dryRun?: boolean }): Prom
     }
   } catch { /* no dashboard running */ }
 
-  // Re-launch dashboard if it was running (picks up fresh code)
-  // The new dashboard will call killExistingDashboards() on startup as a safety net
+  // Don't auto-relaunch dashboard during update — it causes duplicate process issues.
+  // The daemon restart below will handle it, or user can run: clementine dashboard
   if (dashboardWasRunning) {
-    try {
-      const { spawn: spawnChild } = await import('node:child_process');
-      const child = spawnChild('node', [path.join(PACKAGE_ROOT, 'dist/cli/index.js'), 'dashboard'], {
-        detached: true,
-        stdio: 'ignore',
-      });
-      child.unref();
-      console.log(`  ${GREEN}OK${RESET}  Dashboard relaunched`);
-    } catch {
-      console.log(`  ${YELLOW}WARN${RESET}  Could not relaunch dashboard — run: clementine dashboard`);
-    }
+    console.log(`  Dashboard stopped. Relaunch with: ${DIM}clementine dashboard${RESET}`);
   }
 
   // 12. Write update sentinel so the daemon can report what happened
