@@ -48,6 +48,59 @@ const MEMORY_DB_PATH = path.join(VAULT_DIR, '.memory.db');
 const PROJECTS_META_FILE = path.join(BASE_DIR, 'projects.json');
 const DASHBOARD_PID_FILE = path.join(BASE_DIR, '.dashboard.pid');
 
+/**
+ * Kill all existing dashboard processes before starting a new one.
+ * Uses both the PID file and a process sweep to catch orphans.
+ */
+export function killExistingDashboards(): number {
+  let killed = 0;
+  const myPid = process.pid;
+
+  // 1. Kill via PID file
+  try {
+    if (existsSync(DASHBOARD_PID_FILE)) {
+      const pid = parseInt(readFileSync(DASHBOARD_PID_FILE, 'utf-8').trim(), 10);
+      if (!isNaN(pid) && pid !== myPid) {
+        try { process.kill(pid, 'SIGTERM'); killed++; } catch { /* already dead */ }
+      }
+      try { unlinkSync(DASHBOARD_PID_FILE); } catch { /* ignore */ }
+    }
+  } catch { /* ignore */ }
+
+  // 2. Sweep for any other dashboard processes from this install
+  try {
+    const { execSync: exec } = require('node:child_process') as typeof import('node:child_process');
+    const scriptPath = path.join(__dirname, 'index.js');
+    // Find all node processes running "dashboard" from our dist
+    const psOutput = exec(
+      `ps ax -o pid,command | grep 'node.*dashboard' | grep -v grep`,
+      { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] },
+    ).trim();
+    if (psOutput) {
+      for (const line of psOutput.split('\n')) {
+        const match = line.trim().match(/^(\d+)\s+(.*)$/);
+        if (!match) continue;
+        const pid = parseInt(match[1], 10);
+        const cmd = match[2];
+        // Only kill dashboard processes from our install path, not other projects
+        if (pid !== myPid && cmd.includes(path.dirname(scriptPath)) && cmd.includes('dashboard')) {
+          try { process.kill(pid, 'SIGTERM'); killed++; } catch { /* already dead */ }
+        }
+      }
+    }
+  } catch { /* ps/grep may fail — non-fatal */ }
+
+  // Give processes a moment to exit
+  if (killed > 0) {
+    try {
+      const { execSync: exec } = require('node:child_process') as typeof import('node:child_process');
+      exec('sleep 0.5', { stdio: 'pipe' });
+    } catch { /* ignore */ }
+  }
+
+  return killed;
+}
+
 // ── Response cache ───────────────────────────────────────────────────
 
 interface CacheEntry<T> { data: T; expires: number; }
@@ -1214,6 +1267,12 @@ function writeCronFileAt(cronFile: string, parsed: matter.GrayMatterFile<string>
 // ── Express app ──────────────────────────────────────────────────────
 
 export async function cmdDashboard(opts: { port?: string }): Promise<void> {
+  // Kill any existing dashboard processes before starting
+  const killed = killExistingDashboards();
+  if (killed > 0) {
+    console.log(`  Killed ${killed} existing dashboard process(es)`);
+  }
+
   const port = parseInt(opts.port ?? '3030', 10);
   const app = express();
   app.use(express.json());

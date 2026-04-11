@@ -329,20 +329,16 @@ function cmdStop(): void {
 function cmdRestart(options: { foreground?: boolean }): void {
   cmdStop();
 
-  // Also restart dashboard if it was running
-  const dashPidFile = path.join(BASE_DIR, '.dashboard.pid');
+  // Kill ALL dashboard processes (not just PID file — catches orphans)
   let dashboardWasRunning = false;
   try {
-    if (existsSync(dashPidFile)) {
-      const dpid = parseInt(readFileSync(dashPidFile, 'utf-8').trim(), 10);
-      if (!isNaN(dpid) && isProcessAlive(dpid)) {
-        dashboardWasRunning = true;
-        process.kill(dpid, 'SIGTERM');
-        console.log('  Stopped dashboard.');
-        try { unlinkSync(dashPidFile); } catch { /* ignore */ }
-      }
+    const { killExistingDashboards } = require('./dashboard.js');
+    const killed = killExistingDashboards();
+    if (killed > 0) {
+      dashboardWasRunning = true;
+      console.log(`  Stopped ${killed} dashboard process(es).`);
     }
-  } catch { /* no dashboard running */ }
+  } catch { /* dashboard module may not be available */ }
 
   cmdLaunch({ foreground: options.foreground });
 
@@ -1020,7 +1016,7 @@ program
   .description('List available MCP tools, plugins, and channels')
   .action(cmdTools);
 
-program
+const dashCmd = program
   .command('dashboard')
   .description('Launch local command center')
   .option('-p, --port <n>', 'Port (default 3030)', '3030')
@@ -1029,6 +1025,33 @@ program
       console.error('Dashboard error:', err);
       process.exit(1);
     });
+  });
+
+dashCmd
+  .command('restart')
+  .description('Kill all running dashboard processes and relaunch')
+  .option('-p, --port <n>', 'Port (default 3030)', '3030')
+  .action((opts: { port?: string }) => {
+    const { killExistingDashboards } = require('./dashboard.js');
+    const killed = killExistingDashboards();
+    console.log(killed > 0 ? `  Killed ${killed} dashboard process(es).` : '  No dashboard processes found.');
+    console.log('  Relaunching dashboard...');
+    const child = require('node:child_process').spawn(
+      'node', [path.join(PACKAGE_ROOT, 'dist/cli/index.js'), 'dashboard', '-p', opts.port ?? '3030'],
+      { detached: true, stdio: 'ignore' },
+    );
+    child.unref();
+    console.log('  Dashboard restarted.');
+    process.exit(0);
+  });
+
+dashCmd
+  .command('stop')
+  .description('Stop all running dashboard processes')
+  .action(() => {
+    const { killExistingDashboards } = require('./dashboard.js');
+    const killed = killExistingDashboards();
+    console.log(killed > 0 ? `  Killed ${killed} dashboard process(es).` : '  No dashboard processes running.');
   });
 
 program
@@ -1593,24 +1616,19 @@ async function cmdUpdate(options: { restart?: boolean; dryRun?: boolean }): Prom
     cmdDoctor({ fix: true }); // Fallback to in-memory version
   }
 
-  // 11. Kill any running dashboard process and relaunch after update
+  // 11. Kill ALL running dashboard processes (not just PID file) and relaunch
   let dashboardWasRunning = false;
   try {
-    const dashPidFile = path.join(BASE_DIR, '.dashboard.pid');
-    if (existsSync(dashPidFile)) {
-      const dpid = parseInt(readFileSync(dashPidFile, 'utf-8').trim(), 10);
-      if (!isNaN(dpid) && dpid !== process.pid) {
-        try {
-          process.kill(dpid, 'SIGTERM');
-          dashboardWasRunning = true;
-          console.log(`  ${GREEN}OK${RESET}  Stopped dashboard process`);
-        } catch { /* already dead */ }
-        try { unlinkSync(dashPidFile); } catch { /* ignore */ }
-      }
+    const { killExistingDashboards } = await import('./dashboard.js');
+    const killed = killExistingDashboards();
+    if (killed > 0) {
+      dashboardWasRunning = true;
+      console.log(`  ${GREEN}OK${RESET}  Stopped ${killed} dashboard process(es)`);
     }
   } catch { /* no dashboard running */ }
 
   // Re-launch dashboard if it was running (picks up fresh code)
+  // The new dashboard will call killExistingDashboards() on startup as a safety net
   if (dashboardWasRunning) {
     try {
       const { spawn: spawnChild } = await import('node:child_process');
