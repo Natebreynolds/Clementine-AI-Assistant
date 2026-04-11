@@ -8244,8 +8244,8 @@ function getDashboardHTML(token: string): string {
         <span class="nav-icon">&#9200;</span> Scheduled Tasks
         <span class="nav-badge" id="nav-cron-count">0</span>
       </div>
-      <div class="nav-item" onclick="navigateTo('automations'); setTimeout(function(){ switchTab('automations','skills'); }, 50)">
-        <span class="nav-icon">&#128161;</span> Skills
+      <div class="nav-item" onclick="openSkillStudio()">
+        <span class="nav-icon">&#128161;</span> Skill Studio
         <span class="nav-badge" id="nav-skill-count" style="display:none">0</span>
       </div>
       <div class="nav-item" data-page="workflows">
@@ -8404,8 +8404,8 @@ function getDashboardHTML(token: string): string {
     <!-- ═══ Builder Page — Conversational Artifact Creation ═══ -->
     <div class="page" id="page-builder">
       <div style="display:flex;align-items:center;gap:12px;padding:12px 16px;border-bottom:1px solid var(--border)">
-        <span class="page-title" style="margin:0;font-size:16px">Builder</span>
-        <select id="builder-type" onchange="resetBuilder()" style="padding:6px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg-secondary);color:var(--text-primary);font-size:13px">
+        <span class="page-title" id="builder-page-title" style="margin:0;font-size:16px">Builder</span>
+        <select id="builder-type" onchange="resetBuilder();updateBuilderMode()" style="padding:6px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg-secondary);color:var(--text-primary);font-size:13px">
           <option value="skill">Skill</option>
           <option value="cron">Cron Job</option>
           <option value="agent">Agent</option>
@@ -8422,7 +8422,7 @@ function getDashboardHTML(token: string): string {
         <!-- Left: Chat -->
         <div style="flex:1;display:flex;flex-direction:column;border-right:1px solid var(--border)">
           <div id="builder-messages" style="flex:1;overflow-y:auto;padding:16px">
-            <div class="empty-state" style="margin-top:40px">
+            <div class="empty-state" id="builder-empty-state" style="margin-top:40px">
               <p style="color:var(--text-muted);margin-bottom:12px">Describe what you want to build.</p>
               <div style="display:flex;flex-wrap:wrap;gap:8px;justify-content:center">
                 <button class="btn btn-sm quick-pill" onclick="builderQuick('Create a cron job that checks my email every morning and sends me a summary')">Email summary cron</button>
@@ -8451,7 +8451,7 @@ function getDashboardHTML(token: string): string {
             <button class="btn-primary" onclick="sendBuilderChat()" style="padding:10px 18px;border-radius:8px">Send</button>
           </div>
         </div>
-        <!-- Right: Live Preview -->
+        <!-- Right: Live Preview + Existing Skills -->
         <div style="width:400px;display:flex;flex-direction:column;background:var(--bg-secondary)">
           <div style="padding:12px 16px;border-bottom:1px solid var(--border);font-weight:600;font-size:13px;color:var(--text-secondary)">
             Live Preview
@@ -8459,6 +8459,14 @@ function getDashboardHTML(token: string): string {
           </div>
           <div id="builder-preview" style="flex:1;overflow-y:auto;padding:16px">
             <div class="empty-state" style="font-size:13px;color:var(--text-muted)">The artifact will appear here as you build it</div>
+          </div>
+          <!-- Existing skills drawer (visible in skill mode) -->
+          <div id="builder-skills-drawer" style="display:none;border-top:2px solid var(--border);max-height:260px;overflow-y:auto">
+            <div style="padding:10px 16px;display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;background:var(--bg-secondary);z-index:1">
+              <span style="font-size:12px;font-weight:600;color:var(--text-secondary)">Existing Skills</span>
+              <span id="builder-skills-count" style="font-size:10px;color:var(--text-muted)"></span>
+            </div>
+            <div id="builder-skills-list" style="padding:0 12px 12px"></div>
           </div>
         </div>
       </div>
@@ -9611,6 +9619,7 @@ function navigateTo(page, opts) {
   if (page === 'builder') {
     var _builderPreselect = currentAgentSlug || '';
     refreshBuilderAgents(_builderPreselect);
+    updateBuilderMode();
     document.getElementById('builder-input').focus();
   }
   if (page === 'automations') { refreshCron(); refreshTimers(); refreshSelfImprove(); refreshSkills(); }
@@ -12971,6 +12980,88 @@ async function switchProfile(slug) {
   } catch(e) { toast('Failed to switch profile: ' + e, 'error'); }
 }
 
+// ── Skill Studio — opens builder in skill-focused mode ──────────
+
+function openSkillStudio() {
+  // Pre-set type to skill before navigating
+  var typeSelect = document.getElementById('builder-type');
+  if (typeSelect) typeSelect.value = 'skill';
+  navigateTo('builder');
+  // Update the UI for skill mode
+  updateBuilderMode();
+  // Show skill-specific empty state
+  var emptyState = document.getElementById('builder-empty-state');
+  if (emptyState && !builderArtifact) {
+    emptyState.innerHTML = '<p style="color:var(--text-muted);margin-bottom:8px;font-size:15px;font-weight:600">Skill Studio</p>'
+      + '<p style="color:var(--text-muted);margin-bottom:16px;font-size:13px">Teach a new skill by describing it, attach reference files, link tools, test it, then save.</p>'
+      + '<div style="display:flex;flex-wrap:wrap;gap:8px;justify-content:center">'
+      + '<button class="btn btn-sm quick-pill" onclick="builderQuick(\\x27Teach a skill for deploying to production — run tests, build, push, verify\\x27)">Deploy to prod</button>'
+      + '<button class="btn btn-sm quick-pill" onclick="builderQuick(\\x27Teach a skill for writing a weekly status report from git commits and calendar\\x27)">Weekly status report</button>'
+      + '<button class="btn btn-sm quick-pill" onclick="builderQuick(\\x27Teach a skill for onboarding a new team member — set up accounts, send welcome email\\x27)">Onboard team member</button>'
+      + '<button class="btn btn-sm quick-pill" onclick="builderQuick(\\x27Teach a skill for researching a company before a sales call\\x27)">Company research</button>'
+      + '</div>';
+  }
+}
+
+function updateBuilderMode() {
+  var type = (document.getElementById('builder-type') || {}).value || 'skill';
+  var title = document.getElementById('builder-page-title');
+  var drawer = document.getElementById('builder-skills-drawer');
+
+  if (type === 'skill') {
+    if (title) title.textContent = 'Skill Studio';
+    if (drawer) { drawer.style.display = ''; refreshBuilderSkills(); }
+    document.getElementById('builder-input').placeholder = 'Describe the skill you want to teach...';
+  } else {
+    if (title) title.textContent = 'Builder';
+    if (drawer) drawer.style.display = 'none';
+    document.getElementById('builder-input').placeholder = 'Describe what you want to build...';
+  }
+}
+
+async function refreshBuilderSkills() {
+  var container = document.getElementById('builder-skills-list');
+  var countEl = document.getElementById('builder-skills-count');
+  if (!container) return;
+  try {
+    var r = await apiFetch('/api/skills');
+    var d = await r.json();
+    var skills = d.skills || [];
+    if (countEl) countEl.textContent = skills.length + ' skill' + (skills.length !== 1 ? 's' : '');
+    if (skills.length === 0) {
+      container.innerHTML = '<div style="padding:8px;font-size:12px;color:var(--text-muted)">No skills yet. Build your first one above.</div>';
+      return;
+    }
+    var html = '';
+    for (var s of skills) {
+      var sourceTag = s.source === 'builder' ? '<span style="font-size:9px;background:var(--accent);color:white;padding:1px 5px;border-radius:3px">built</span>'
+        : s.source === 'manual' ? '<span style="font-size:9px;background:var(--blue);color:white;padding:1px 5px;border-radius:3px">taught</span>'
+        : '<span style="font-size:9px;background:var(--bg-tertiary);color:var(--text-muted);padding:1px 5px;border-radius:3px">' + esc(s.source || 'auto') + '</span>';
+      html += '<div style="display:flex;align-items:center;gap:6px;padding:6px 4px;border-bottom:1px solid var(--border);font-size:12px">'
+        + '<div style="flex:1;min-width:0">'
+        + '<div style="font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">' + esc(s.title) + ' ' + sourceTag + '</div>'
+        + '<div style="font-size:10px;color:var(--text-muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">' + esc(s.description || '') + '</div>'
+        + '</div>'
+        + '<button onclick="editSkillInBuilder(\\x27' + esc(s.name) + '\\x27)" style="background:none;border:1px solid var(--border);border-radius:4px;padding:2px 8px;font-size:10px;color:var(--accent);cursor:pointer;white-space:nowrap">Edit</button>'
+        + '<button onclick="deleteSkillFromStudio(\\x27' + esc(s.name) + '\\x27)" style="background:none;border:none;color:var(--red);cursor:pointer;font-size:14px;padding:0 2px">&times;</button>'
+        + '</div>';
+    }
+    container.innerHTML = html;
+  } catch(e) {
+    container.innerHTML = '<div style="padding:8px;font-size:12px;color:var(--red)">Failed to load</div>';
+  }
+}
+
+async function deleteSkillFromStudio(name) {
+  if (!confirm('Delete skill "' + name + '"?')) return;
+  try {
+    await apiDelete('/api/skills/' + encodeURIComponent(name));
+    toast('Skill deleted', 'success');
+    refreshBuilderSkills();
+    refreshSkills(); // also refresh the automations tab list
+  } catch(e) { toast('Error: ' + e, 'error'); }
+}
+
 // ── Builder (Conversational Artifact Creation) ──────────────────
 
 var builderArtifact = null;
@@ -12985,7 +13076,7 @@ async function editSkillInBuilder(name, agentSlug) {
     if (d.error) { toast(d.error, 'error'); return; }
 
     // Switch to builder page
-    showPage('builder');
+    navigateTo('builder');
 
     // Set type to skill
     var typeSelect = document.getElementById('builder-type');
@@ -13309,7 +13400,7 @@ async function saveBuilderArtifact() {
       msgs.innerHTML += '<div style="text-align:center;padding:12px;color:var(--green);font-size:13px;font-weight:600">\\u2714 ' + esc(r.message || 'Saved') + '</div>';
       msgs.scrollTop = msgs.scrollHeight;
       document.getElementById('builder-save-btn').style.display = 'none';
-      if (type === 'skill') refreshSkills();
+      if (type === 'skill') { refreshSkills(); refreshBuilderSkills(); }
       if (type === 'cron') refreshCron();
       if (type === 'agent') refreshTeamNav();
       if (type === 'workflow') refreshWorkflows();
