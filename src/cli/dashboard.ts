@@ -1458,17 +1458,22 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
   // ── Anthropic OAuth routes ──────────────────────────────────────
 
   // Check current auth status by spawning a lightweight SDK query
-  app.get('/api/auth/anthropic/status', async (_req, res) => {
+  // Anthropic auth status — check daemon's .env for API key presence instead of importing the SDK
+  // (SDK import blocks the event loop for 1-2s which freezes all other requests)
+  app.get('/api/auth/anthropic/status', (_req, res) => {
     try {
-      const { query: sdkQuery } = await import('@anthropic-ai/claude-agent-sdk');
-      const q = sdkQuery({ prompt: '', options: { permissionMode: 'bypassPermissions' as any, allowDangerouslySkipPermissions: true, maxTurns: 0 } });
-      const account = await q.accountInfo();
-      q.close();
+      const envPath = path.join(BASE_DIR, '.env');
+      let hasKey = false;
+      if (existsSync(envPath)) {
+        const content = readFileSync(envPath, 'utf-8');
+        hasKey = /^ANTHROPIC_API_KEY=.+/m.test(content);
+      }
+      // Also check process env (set by daemon)
+      if (!hasKey && process.env.ANTHROPIC_API_KEY) hasKey = true;
       res.json({
-        authenticated: !!account?.email,
-        email: account?.email ?? null,
-        organization: account?.organization ?? null,
-        apiKeySource: account?.apiKeySource ?? null,
+        authenticated: hasKey,
+        email: null,
+        apiKeySource: hasKey ? 'env' : null,
       });
     } catch (err) {
       res.json({ authenticated: false, email: null, error: String(err).slice(0, 200) });
@@ -1616,6 +1621,18 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
         const { getClaudeIntegrations } = await import('../agent/mcp-bridge.js');
         result.claudeIntegrations = { integrations: getClaudeIntegrations() };
       } catch { result.claudeIntegrations = { integrations: [] }; }
+
+      // Projects
+      try {
+        const projects = scanProjects();
+        const meta = loadProjectsMeta();
+        result.projects = {
+          projects: projects.map(p => {
+            const m = meta.find(pm => pm.path === p.path);
+            return { ...p, userDescription: m?.description ?? '', keywords: m?.keywords ?? [], linked: !!m };
+          }),
+        };
+      } catch { result.projects = { projects: [] }; }
 
       // Office/agents — read directly from disk, no gateway needed
       // Returns same shape as /api/office: { clementine: {...}, agents: [...] }
@@ -3981,9 +3998,11 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
 
   app.get('/api/team/agents', async (_req, res) => {
     try {
-      const gw = await getGateway();
-      const router = gw.getTeamRouter();
-      const agents = router.listTeamAgents();
+      const { AgentManager } = await import('../agent/agent-manager.js');
+      const { AGENTS_DIR: agDir } = await import('../config.js');
+      const profilesDir = path.join(VAULT_DIR, '00-System', 'profiles');
+      const mgr = new AgentManager(agDir, profilesDir);
+      const agents = mgr.listAll();
       res.json(agents.map(a => ({
         slug: a.slug,
         name: a.name,
@@ -4077,10 +4096,11 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
   app.get('/api/office', async (_req, res) => {
     try {
       const data = await cachedAsync('office', 10_000, async () => {
-      const gw = await getGateway();
-      const mgr = gw.getAgentManager();
-      const allAgents = mgr.listAll();
+      const { AgentManager } = await import('../agent/agent-manager.js');
       const { AGENTS_DIR: agDir } = await import('../config.js');
+      const profilesDir = path.join(VAULT_DIR, '00-System', 'profiles');
+      const mgr = new AgentManager(agDir, profilesDir);
+      const allAgents = mgr.listAll();
 
       // ── Bot statuses ──
       let botStatuses: Record<string, { status: string; botTag?: string; avatarUrl?: string }> = {};
@@ -10847,8 +10867,7 @@ async function refreshStatus(preloaded) {
         if (gsTask) gsTask.className = 'gs-card' + (hasCrons ? ' gs-done' : '');
         var gsChannel = document.getElementById('gs-step-channel');
         if (gsChannel && d.channels && d.channels.length > 0) gsChannel.className = 'gs-card gs-done';
-        // Auth status is checked separately — update card if already done
-        checkAnthropicAuth();
+        // Auth status checked once on init, not on every poll
       }
     }
 
@@ -11577,11 +11596,11 @@ function removeWorkspaceDir(dir) {
   });
 }
 
-async function refreshProjects() {
+async function refreshProjects(preloaded) {
   refreshWorkspaceDirs();
   try {
-    const r = await apiFetch('/api/projects');
-    const d = await r.json();
+    var d;
+    if (preloaded) { d = preloaded; } else { var r = await apiFetch('/api/projects'); d = await r.json(); }
     projectsData = d.projects || [];
     const linkedCount = projectsData.filter(p => p.linked).length;
     var _pc = document.getElementById('nav-project-count'); if (_pc) _pc.textContent = linkedCount || projectsData.length;
@@ -14381,7 +14400,9 @@ async function refreshAll() {
   // Page-specific refreshes (these are lightweight, no gateway)
   if (currentPage === 'automations') { refreshCron(); refreshTimers(); }
   if (currentPage === 'intelligence') refreshMemory();
-  if (currentPage === 'settings') refreshProjects();
+  if (currentPage === 'settings' || currentPage === 'projects') {
+    try { if (d && d.projects) refreshProjects(d.projects); else refreshProjects(); } catch { refreshProjects(); }
+  }
   if (currentPage === 'logs') refreshLogs();
 }
 
@@ -17195,6 +17216,7 @@ async function refreshSalesforce() {
     if (d.plan) { try { refreshHomePlan(d.plan); } catch(e) { console.warn('init: plan', e); } }
     if (d.version) { try { _loadedHash = d.version.started; } catch(e) { /* ignore */ } }
     if (d.claudeIntegrations) { try { refreshClaudeIntegrations(d.claudeIntegrations); } catch(e) { console.warn('init: integrations', e); } }
+    if (d.projects) { try { refreshProjects(d.projects); } catch(e) { console.warn('init: projects', e); } }
   } catch(e) {
     console.warn('Batch init failed, falling back to individual fetches', e);
     refreshAll();
