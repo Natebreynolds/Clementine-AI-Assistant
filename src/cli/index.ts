@@ -326,13 +326,13 @@ function cmdStop(): void {
   }
 }
 
-function cmdRestart(options: { foreground?: boolean }): void {
+async function cmdRestart(options: { foreground?: boolean }): Promise<void> {
   cmdStop();
 
   // Kill ALL dashboard processes (not just PID file — catches orphans)
   let dashboardWasRunning = false;
   try {
-    const { killExistingDashboards } = require('./dashboard.js');
+    const { killExistingDashboards } = await import('./dashboard.js');
     const killed = killExistingDashboards();
     if (killed > 0) {
       dashboardWasRunning = true;
@@ -344,7 +344,8 @@ function cmdRestart(options: { foreground?: boolean }): void {
 
   if (dashboardWasRunning) {
     try {
-      const child = require('node:child_process').spawn(
+      const { spawn: spawnProc } = await import('node:child_process');
+      const child = spawnProc(
         'node', [path.join(PACKAGE_ROOT, 'dist/cli/index.js'), 'dashboard'],
         { detached: true, stdio: 'ignore' },
       );
@@ -1031,12 +1032,13 @@ dashCmd
   .command('restart')
   .description('Kill all running dashboard processes and relaunch')
   .option('-p, --port <n>', 'Port (default 3030)', '3030')
-  .action((opts: { port?: string }) => {
-    const { killExistingDashboards } = require('./dashboard.js');
+  .action(async (opts: { port?: string }) => {
+    const { killExistingDashboards } = await import('./dashboard.js');
     const killed = killExistingDashboards();
     console.log(killed > 0 ? `  Killed ${killed} dashboard process(es).` : '  No dashboard processes found.');
     console.log('  Relaunching dashboard...');
-    const child = require('node:child_process').spawn(
+    const { spawn } = await import('node:child_process');
+    const child = spawn(
       'node', [path.join(PACKAGE_ROOT, 'dist/cli/index.js'), 'dashboard', '-p', opts.port ?? '3030'],
       { detached: true, stdio: 'ignore' },
     );
@@ -1048,8 +1050,8 @@ dashCmd
 dashCmd
   .command('stop')
   .description('Stop all running dashboard processes')
-  .action(() => {
-    const { killExistingDashboards } = require('./dashboard.js');
+  .action(async () => {
+    const { killExistingDashboards } = await import('./dashboard.js');
     const killed = killExistingDashboards();
     console.log(killed > 0 ? `  Killed ${killed} dashboard process(es).` : '  No dashboard processes running.');
   });

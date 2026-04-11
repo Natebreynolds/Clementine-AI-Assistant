@@ -69,10 +69,9 @@ export function killExistingDashboards(): number {
 
   // 2. Sweep for any other dashboard processes from this install
   try {
-    const { execSync: exec } = require('node:child_process') as typeof import('node:child_process');
     const scriptPath = path.join(__dirname, 'index.js');
     // Find all node processes running "dashboard" from our dist
-    const psOutput = exec(
+    const psOutput = execSync(
       `ps ax -o pid,command | grep 'node.*dashboard' | grep -v grep`,
       { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] },
     ).trim();
@@ -92,8 +91,7 @@ export function killExistingDashboards(): number {
 
   // 3. Kill orphaned cloudflared tunnel processes spawned by previous dashboard instances
   try {
-    const { execSync: exec } = require('node:child_process') as typeof import('node:child_process');
-    const tunnelOutput = exec(
+    const tunnelOutput = execSync(
       `ps ax -o pid,command | grep 'cloudflared tunnel --url http://localhost' | grep -v grep`,
       { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] },
     ).trim();
@@ -112,10 +110,7 @@ export function killExistingDashboards(): number {
 
   // Give processes a moment to exit
   if (killed > 0) {
-    try {
-      const { execSync: exec } = require('node:child_process') as typeof import('node:child_process');
-      exec('sleep 0.5', { stdio: 'pipe' });
-    } catch { /* ignore */ }
+    try { execSync('sleep 0.5', { stdio: 'pipe' }); } catch { /* ignore */ }
   }
 
   return killed;
