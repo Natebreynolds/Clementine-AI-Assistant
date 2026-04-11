@@ -90,6 +90,26 @@ export function killExistingDashboards(): number {
     }
   } catch { /* ps/grep may fail — non-fatal */ }
 
+  // 3. Kill orphaned cloudflared tunnel processes spawned by previous dashboard instances
+  try {
+    const { execSync: exec } = require('node:child_process') as typeof import('node:child_process');
+    const tunnelOutput = exec(
+      `ps ax -o pid,command | grep 'cloudflared tunnel --url http://localhost' | grep -v grep`,
+      { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] },
+    ).trim();
+    if (tunnelOutput) {
+      for (const line of tunnelOutput.split('\n')) {
+        const match = line.trim().match(/^(\d+)\s+/);
+        if (match) {
+          const pid = parseInt(match[1], 10);
+          if (pid !== myPid) {
+            try { process.kill(pid, 'SIGTERM'); } catch { /* already dead */ }
+          }
+        }
+      }
+    }
+  } catch { /* non-fatal */ }
+
   // Give processes a moment to exit
   if (killed > 0) {
     try {
@@ -1527,6 +1547,130 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
     }
     const needsRestart = currentHash !== buildHash;
     res.json({ hash: currentHash, started: buildHash, needsRestart });
+  });
+
+  // ── Batch init — single request for all page-load data ───────────
+  // Eliminates 12+ concurrent requests that were saturating the event loop.
+  app.get('/api/init', async (_req, res) => {
+    try {
+      const result: Record<string, unknown> = {};
+
+      // Version
+      let currentHash = buildHash;
+      try {
+        const currentMtime = String(Math.floor(statSync(distDashboard).mtimeMs));
+        const gitHash = execSync('git rev-parse --short HEAD', { cwd: PACKAGE_ROOT, encoding: 'utf-8' }).trim();
+        currentHash = gitHash + '-' + currentMtime;
+      } catch { try { currentHash = String(Math.floor(statSync(distDashboard).mtimeMs)); } catch { /* use cached */ } }
+      result.version = { hash: currentHash, started: buildHash, needsRestart: currentHash !== buildHash };
+
+      // Status
+      result.status = getStatus();
+
+      // Activity (default: no filters, limit 50)
+      try {
+        result.activity = cached('activity::::', 5_000, () => {
+          const events: Array<Record<string, unknown>> = [];
+          const runsDir = path.join(BASE_DIR, 'cron', 'runs');
+          if (existsSync(runsDir)) {
+            const files = readdirSync(runsDir).filter(f => f.endsWith('.jsonl'));
+            for (const file of files) {
+              const jobName = file.replace('.jsonl', '');
+              const colonIdx = jobName.indexOf(':');
+              const slug = colonIdx > 0 ? jobName.substring(0, colonIdx) : null;
+              const filePath = path.join(runsDir, file);
+              try {
+                const lines = readFileSync(filePath, 'utf-8').trim().split('\n').filter(Boolean);
+                for (const line of lines.slice(-10)) {
+                  try {
+                    const entry = JSON.parse(line);
+                    events.push({
+                      source: 'cron', eventType: 'cron_run', agentSlug: slug,
+                      title: jobName, body: entry.summary ?? '', timestamp: entry.timestamp ?? '',
+                      status: entry.success ? 'success' : 'error',
+                    });
+                  } catch { /* skip */ }
+                }
+              } catch { /* skip */ }
+            }
+          }
+          events.sort((a, b) => String(b.timestamp).localeCompare(String(a.timestamp)));
+          return { events: events.slice(0, 50) };
+        });
+      } catch { result.activity = { events: [] }; }
+
+      // Metrics
+      try { result.metrics = computeMetrics(); } catch { result.metrics = {}; }
+
+      // Today's plan
+      try {
+        const today = new Date();
+        const dateStr = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}`;
+        const planPath = path.join(PLANS_DIR, `${dateStr}.json`);
+        result.plan = existsSync(planPath) ? { ok: true, plan: JSON.parse(readFileSync(planPath, 'utf-8')) } : { ok: false, plan: null };
+      } catch { result.plan = { ok: false, plan: null }; }
+
+      // MCP servers (disk-based discovery, no gateway)
+      try {
+        const { discoverMcpServers } = await import('../agent/mcp-bridge.js');
+        result.mcpServers = { servers: discoverMcpServers() };
+      } catch { result.mcpServers = { servers: [] }; }
+
+      // Claude integrations
+      try {
+        const { getClaudeIntegrations } = await import('../agent/mcp-bridge.js');
+        result.claudeIntegrations = { integrations: getClaudeIntegrations() };
+      } catch { result.claudeIntegrations = { integrations: [] }; }
+
+      // Office/agents — read directly from disk, no gateway needed
+      // Returns same shape as /api/office: { clementine: {...}, agents: [...] }
+      try {
+        const { AgentManager } = await import('../agent/agent-manager.js');
+        const { AGENTS_DIR: agDir } = await import('../config.js');
+        const profilesDir = path.join(VAULT_DIR, '00-System', 'profiles');
+        const mgr = new AgentManager(agDir, profilesDir);
+        const allAgents = mgr.listAll();
+
+        // Bot statuses from disk
+        let botStatuses: Record<string, any> = {};
+        try { const p = path.join(BASE_DIR, '.bot-status.json'); if (existsSync(p)) botStatuses = JSON.parse(readFileSync(p, 'utf-8')); } catch { /* */ }
+        let slackStatuses: Record<string, any> = {};
+        try { const p = path.join(BASE_DIR, '.slack-bot-status.json'); if (existsSync(p)) slackStatuses = JSON.parse(readFileSync(p, 'utf-8')); } catch { /* */ }
+
+        const statusData = getStatus();
+        result.office = {
+          clementine: {
+            name: statusData.name,
+            status: statusData.alive ? 'online' : 'offline',
+            uptime: statusData.uptime || '',
+            currentActivity: statusData.currentActivity || 'Idle',
+            channels: statusData.channels || [],
+            sessions: { active: 0, totalExchanges: 0 },
+            crons: { total: 0, runsToday: 0, successRate: 100, jobs: [] },
+            tokens: { input: 0, output: 0 },
+          },
+          agents: allAgents.map(a => ({
+            slug: a.slug,
+            name: a.name,
+            description: a.description,
+            status: a.status ?? 'active',
+            avatar: a.avatar ?? null,
+            model: a.model ?? null,
+            project: a.project ?? null,
+            agentDir: mgr.getAgentDir(a.slug),
+            botStatus: botStatuses[a.slug]?.status ?? null,
+            slackBotStatus: slackStatuses[a.slug]?.status ?? null,
+            sessions: { active: 0, totalExchanges: 0 },
+            crons: { total: 0, runsToday: 0, successRate: 100, jobs: [] },
+            tokens: { input: 0, output: 0 },
+          })),
+        };
+      } catch { result.office = { clementine: { name: 'Clementine', status: 'offline' }, agents: [] }; }
+
+      res.json(result);
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
   });
 
   app.get('/api/status', (_req, res) => {
@@ -10621,10 +10765,10 @@ async function apiDelete(url) {
 
 // ── Status + Overview ─────────────────────
 let lastStatusData = {};
-async function refreshStatus() {
+async function refreshStatus(preloaded) {
   try {
-    const r = await apiFetch('/api/status');
-    const d = await r.json();
+    var d;
+    if (preloaded) { d = preloaded; } else { var r = await apiFetch('/api/status'); d = await r.json(); }
     lastStatusData = d;
 
     // Header status pill
@@ -12466,19 +12610,23 @@ function activityEventHtml(e) {
     + '</div>';
 }
 
-async function refreshActivity(append) {
+async function refreshActivity(append, preloaded) {
   try {
-    var sourceEl = document.getElementById('activity-source-filter');
-    var agentEl = document.getElementById('activity-agent-filter');
-    var source = sourceEl ? sourceEl.value : '';
-    var agent = agentEl ? agentEl.value : '';
-    var params = '?limit=30';
-    if (source) params += '&source=' + source;
-    if (agent) params += '&agent=' + agent;
-    if (append && activityLastTimestamp) params += '&before=' + encodeURIComponent(activityLastTimestamp);
-
-    var r = await apiFetch('/api/activity' + params);
-    var d = await r.json();
+    var d;
+    if (preloaded && !append) {
+      d = preloaded;
+    } else {
+      var sourceEl = document.getElementById('activity-source-filter');
+      var agentEl = document.getElementById('activity-agent-filter');
+      var source = sourceEl ? sourceEl.value : '';
+      var agent = agentEl ? agentEl.value : '';
+      var params = '?limit=30';
+      if (source) params += '&source=' + source;
+      if (agent) params += '&agent=' + agent;
+      if (append && activityLastTimestamp) params += '&before=' + encodeURIComponent(activityLastTimestamp);
+      var r = await apiFetch('/api/activity' + params);
+      d = await r.json();
+    }
     var events = d.events || [];
     activityHasMore = d.hasMore || false;
 
@@ -14213,25 +14361,40 @@ async function saveDiscordSetup() {
   } catch(e) { toast(String(e), 'error'); }
 }
 
-function refreshAll() {
-  refreshStatus();
-  refreshActivity();
-  refreshTeamNav(); // Keep sidebar agent list fresh
-  // Home plan + pulse refresh on navigate, not on poll (prevents scroll jumps)
+async function refreshAll() {
+  // Use batch init for core data — avoids concurrent requests that freeze the event loop
+  try {
+    var r = await apiFetch('/api/init');
+    var d = await r.json();
+    if (d.status) refreshStatus(d.status);
+    if (d.activity) refreshActivity(false, d.activity);
+    if (d.office) refreshTeamNav(d.office);
+    if (d.version) {
+      if (d.version.needsRestart && !_restartBannerShown) {
+        _restartBannerShown = true;
+        var banner = document.createElement('div');
+        banner.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:999;background:var(--clementine);color:#fff;text-align:center;padding:8px 16px;font-size:13px;font-weight:600;';
+        banner.innerHTML = 'A new version is available. <button onclick="restartDashboard()" style="background:rgba(0,0,0,0.3);color:#fff;border:1px solid rgba(255,255,255,0.4);padding:4px 16px;border-radius:6px;font-size:13px;font-weight:600;cursor:pointer;margin-left:8px">Restart Now</button>';
+        document.body.appendChild(banner);
+      }
+    }
+  } catch(e) {
+    // Fallback: individual lightweight calls only
+    try { refreshStatus(); } catch { /* */ }
+    try { refreshActivity(); } catch { /* */ }
+  }
+  // Page-specific refreshes (these are lightweight, no gateway)
   if (currentPage === 'automations') { refreshCron(); refreshTimers(); }
   if (currentPage === 'intelligence') refreshMemory();
   if (currentPage === 'settings') refreshProjects();
   if (currentPage === 'logs') refreshLogs();
-  // Skip agent-detail on poll — full re-render nukes scroll position.
-  // It refreshes via SSE events or manual navigation instead.
-  checkVersion();
 }
 
 // ── Team Nav Refresh ─────────────────────
-async function refreshTeamNav() {
+async function refreshTeamNav(preloadedOffice) {
   try {
-    var officeRes = await apiFetch('/api/office');
-    var data = await officeRes.json();
+    var data;
+    if (preloadedOffice) { data = preloadedOffice; } else { var officeRes = await apiFetch('/api/office'); data = await officeRes.json(); }
     var clem = data.clementine || {};
     var agents = data.agents || [];
     // Build team list: primary first, then agents
@@ -16270,12 +16433,12 @@ async function applyPlanSuggestion(job, change, reason) {
 }
 
 // ── Home Page: Today's Plan (compact inline) ─
-async function refreshHomePlan() {
+async function refreshHomePlan(preloaded) {
   var container = document.getElementById('home-plan-content');
   if (!container) return;
   try {
-    var r = await apiFetch('/api/plans/today');
-    var d = await r.json();
+    var d;
+    if (preloaded) { d = preloaded; } else { var r = await apiFetch('/api/plans/today'); d = await r.json(); }
     if (!d.ok || !d.plan) {
       container.innerHTML = '<div class="empty-state" style="padding:16px;font-size:13px">No plan for today yet. Plans are created on the first morning heartbeat.</div>';
       return;
@@ -16319,13 +16482,13 @@ async function refreshHomePlan() {
 }
 
 // ── Home Page: Team Pulse ────────────────
-async function refreshTeamPulse() {
+async function refreshTeamPulse(preloadedOffice) {
   var container = document.getElementById('home-team-pulse');
   var countEl = document.getElementById('team-pulse-count');
   if (!container) return;
   try {
-    var r = await apiFetch('/api/office');
-    var data = await r.json();
+    var data;
+    if (preloadedOffice) { data = preloadedOffice; } else { var r = await apiFetch('/api/office'); data = await r.json(); }
     var clem = data.clementine || {};
     var agents = data.agents || [];
     var allAgents = [{ name: clem.name || '${name}', slug: '', status: clem.status === 'online' ? 'active' : 'offline', isPrimary: true, lastActivity: clem.currentActivity, sessions: clem.sessions || 0, runs: clem.runsToday || 0 }];
@@ -16847,14 +17010,14 @@ async function deleteMcpServer(name) {
   } catch(e) { toast('Failed: ' + e, 'error'); }
 }
 
-async function refreshClaudeIntegrations() {
+async function refreshClaudeIntegrations(preloaded) {
   // Settings page list
   var container = document.getElementById('claude-integrations-list');
   // Dashboard home widget
   var widget = document.getElementById('claude-integrations-widget');
   try {
-    var r = await apiFetch('/api/claude-integrations');
-    var d = await r.json();
+    var d;
+    if (preloaded) { d = preloaded; } else { var r = await apiFetch('/api/claude-integrations'); d = await r.json(); }
     var integrations = d.integrations || [];
 
     if (integrations.length === 0) {
@@ -17024,9 +17187,26 @@ async function refreshSalesforce() {
   }
 }
 
-refreshAll();
-refreshTeamNav();
-populateActivityAgentFilter();
+// ── Initial load — single batch request instead of 12+ parallel fetches ──
+(async function initDashboard() {
+  try {
+    var r = await apiFetch('/api/init');
+    var d = await r.json();
+
+    // Feed data to individual render functions (same shape as individual endpoints)
+    if (d.status) { try { refreshStatus(d.status); } catch(e) { console.warn('init: status', e); } }
+    if (d.activity) { try { refreshActivity(false, d.activity); } catch(e) { console.warn('init: activity', e); } }
+    if (d.office) { try { refreshTeamNav(d.office); refreshTeamPulse(d.office); } catch(e) { console.warn('init: office', e); } }
+    if (d.plan) { try { refreshHomePlan(d.plan); } catch(e) { console.warn('init: plan', e); } }
+    if (d.version) { try { _loadedHash = d.version.started; } catch(e) { /* ignore */ } }
+    if (d.claudeIntegrations) { try { refreshClaudeIntegrations(d.claudeIntegrations); } catch(e) { console.warn('init: integrations', e); } }
+  } catch(e) {
+    console.warn('Batch init failed, falling back to individual fetches', e);
+    refreshAll();
+    refreshTeamNav();
+  }
+  populateActivityAgentFilter();
+})();
 
 // ── SSE live updates (with 30s fallback poll) ──
 var sseConnected = false;
