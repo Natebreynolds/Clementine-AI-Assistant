@@ -1306,7 +1306,12 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
 
   const port = parseInt(opts.port ?? '3030', 10);
   const app = express();
-  app.use(express.json({ limit: '5mb' }));
+  // Only parse JSON bodies on POST/PUT/PATCH — GET requests don't need body parsing
+  const jsonParser = express.json({ limit: '5mb' });
+  app.use((req, res, next) => {
+    if (req.method === 'GET' || req.method === 'HEAD' || req.method === 'OPTIONS') return next();
+    jsonParser(req, res, next);
+  });
 
   // Health check — always responds, no auth, no middleware dependency
   app.get('/health', (_req, res) => { res.json({ ok: true, ts: Date.now() }); });
@@ -5813,6 +5818,11 @@ self.addEventListener('activate', e => {
     try {
       await new Promise<void>((resolve, reject) => {
         const server = app.listen(actualPort, '127.0.0.1');
+        // Prevent stale connections from blocking the server
+        server.keepAliveTimeout = 5000;   // Close idle keep-alive connections after 5s
+        server.headersTimeout = 10000;    // Timeout waiting for request headers
+        server.requestTimeout = 30000;    // Timeout for entire request
+        server.maxConnections = 50;       // Limit concurrent connections
         server.once('listening', () => {
           const name = getAssistantName();
           console.log();
@@ -9958,7 +9968,7 @@ function navigateTo(page, opts) {
   var el = document.getElementById('page-' + page);
   if (el) { el.style.display = ''; el.classList.add('active'); }
   // Page-specific refresh
-  if (page === 'home') { refreshStatus(); refreshActivity(); refreshHomePlan(); refreshTeamPulse(); }
+  if (page === 'home') { refreshAll(); }
   if (page === 'chat') { loadProfiles(); document.getElementById('chat-input').focus(); }
   if (page === 'builder') {
     var _builderPreselect = currentAgentSlug || '';
@@ -17249,16 +17259,25 @@ async function refreshSalesforce() {
     refreshAll();
     refreshTeamNav();
   }
-  populateActivityAgentFilter();
+  // Populate agent filter from init data (avoid separate /api/office call)
+  if (d && d.office) {
+    try {
+      var sel = document.getElementById('activity-agent-filter');
+      if (sel) {
+        var opts = '<option value="">All Agents</option><option value="__clementine__">Clementine</option>';
+        var agents = d.office.agents || [];
+        for (var i = 0; i < agents.length; i++) {
+          opts += '<option value="' + esc(agents[i].slug) + '">' + esc(agents[i].name) + '</option>';
+        }
+        sel.innerHTML = opts;
+      }
+    } catch(e) { /* non-fatal */ }
+  }
 })();
 
 // ── SSE live updates (with 30s fallback poll) ──
 var sseConnected = false;
 try {
-  // Register service worker for PWA
-  // SW cleanup already done in <head> script — no registration here
-  }
-
   var evtSource = new EventSource('/api/events?token=' + encodeURIComponent(_dashToken));
   evtSource.onopen = function() { sseConnected = true; };
   evtSource.onerror = function() { sseConnected = false; };
@@ -17288,7 +17307,9 @@ try {
 } catch(err) { /* SSE not supported */ }
 
 // Fallback poll at 30s if SSE connected, 5s otherwise
-setInterval(function() { refreshAll(); }, sseConnected ? 30000 : 5000);
+// Poll interval: 30s when SSE connected, 10s otherwise (re-evaluates each tick)
+setInterval(function() { if (!sseConnected) refreshAll(); }, 10000);
+setInterval(function() { if (sseConnected) refreshAll(); }, 30000);
 </script>
 </body>
 </html>`;
