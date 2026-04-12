@@ -5921,9 +5921,10 @@ function getDashboardHTML(token: string): string {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="dashboard-token" content="${token}">
 <meta name="theme-color" content="#ff8c21">
-<meta name="apple-mobile-web-app-capable" content="yes">
-<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-<link rel="manifest" href="/manifest.json">
+<script>
+// Kill stale service workers IMMEDIATELY before anything else loads
+if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then(function(r){r.forEach(function(sw){sw.unregister()})});caches.keys().then(function(k){k.forEach(function(n){caches.delete(n)})})}
+</script>
 <link rel="icon" href="/icon.svg" type="image/svg+xml">
 <title>${name} Command Center</title>
 <style>
@@ -17258,9 +17259,7 @@ async function refreshSalesforce() {
 var sseConnected = false;
 try {
   // Register service worker for PWA
-  // Unregister any stale service workers — they cause connection issues on restart
-  if ('serviceWorker' in navigator) {
-    navigator.serviceWorker.getRegistrations().then(function(regs) { regs.forEach(function(r) { r.unregister(); }); });
+  // SW cleanup already done in <head> script — no registration here
   }
 
   var evtSource = new EventSource('/api/events?token=' + encodeURIComponent(_dashToken));
