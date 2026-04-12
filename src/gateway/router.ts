@@ -1366,9 +1366,15 @@ export class Gateway {
             autoApply: true,
           });
           const state = await nightlyLoop.run(onProposal);
-          return `Nightly self-improvement: ${state.status}. ` +
+          let summary = `Nightly self-improvement: ${state.status}. ` +
             `Iterations: ${state.currentIteration}, ` +
             `Pending approvals: ${state.pendingApprovals}`;
+          if (state.infraError) {
+            summary += `\n\n⚠️ **Infrastructure error — needs attention:**\n` +
+              `Category: ${state.infraError.category}\n` +
+              `${state.infraError.diagnostic}`;
+          }
+          return summary;
         }
         default:
           return `Unknown self-improve action: ${action}`;

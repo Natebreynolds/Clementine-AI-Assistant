@@ -174,6 +174,15 @@ export class HeartbeatScheduler {
         }
       }).catch(err => {
         logger.error({ err }, 'Nightly self-improvement failed');
+        // Surface infrastructure errors to the user — silent failures
+        // that repeat every night are worse than a one-time notification
+        this.dispatcher.send(
+          `**Self-Improvement Failed (nightly)**\n` +
+          `The self-improvement loop crashed: ${String(err).slice(0, 200)}\n\n` +
+          `This will keep failing every night until the root cause is fixed. ` +
+          `Ask me to check the self-improvement status for details.`,
+          {},
+        ).catch(() => { /* last resort — log already captured it */ });
       });
     }
 

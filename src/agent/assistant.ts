@@ -1375,10 +1375,12 @@ You have a limited number of turns per message (~15). **After 8-10 tool calls, y
       ? ['context-1m-2025-08-07' as const]
       : undefined;
 
-    // Merge external MCP servers (Claude Desktop, Claude Code, user-managed)
+    // Merge external MCP servers (Claude Desktop, Claude Code, user-managed).
+    // Skip when tools are disabled (no point connecting to servers we won't use)
+    // or for internal plan steps that only need Clementine's own tools.
     let externalMcpServers: Record<string, any> = {};
     try {
-      if (_mcpBridge) {
+      if (_mcpBridge && !disableAllTools && !isPlanStep) {
         externalMcpServers = _mcpBridge.getMcpServersForAgent(profile?.allowedMcpServers);
       }
     } catch { /* non-fatal — run with just Clementine's own server */ }

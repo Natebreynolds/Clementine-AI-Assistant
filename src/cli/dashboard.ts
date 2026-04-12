@@ -1298,11 +1298,48 @@ function writeCronFileAt(cronFile: string, parsed: matter.GrayMatterFile<string>
 // ── Express app ──────────────────────────────────────────────────────
 
 export async function cmdDashboard(opts: { port?: string }): Promise<void> {
-  // Kill any existing dashboard processes before starting
-  const killed = killExistingDashboards();
-  if (killed > 0) {
-    console.log(`  Killed ${killed} existing dashboard process(es)`);
+  // Child process skips the kill step — parent already handled it
+  if (!process.env.__CLEM_DASHBOARD_CHILD) {
+    const killed = killExistingDashboards();
+    if (killed > 0) {
+      console.log(`  Killed ${killed} existing dashboard process(es)`);
+    }
   }
+
+  // ── Child process isolation ──────────────────────────────────────────
+  // The full Express server (149 route handlers) freezes the Node event loop
+  // when run inside the CLI's main process. Spawning it as a child process
+  // gives it a fresh V8 heap and event loop — proven to fix the freeze.
+  if (!process.env.__CLEM_DASHBOARD_CHILD) {
+    const childPort = opts.port ?? '3030';
+    const child = spawn('node', [DIST_ENTRY, 'dashboard', '-p', childPort], {
+      env: { ...process.env, __CLEM_DASHBOARD_CHILD: '1' },
+      stdio: ['inherit', 'inherit', 'inherit'],
+    });
+
+    // Write the child's PID so other commands can find/kill it
+    writeFileSync(DASHBOARD_PID_FILE, String(child.pid));
+
+    const cleanup = () => {
+      try { unlinkSync(DASHBOARD_PID_FILE); } catch { /* ignore */ }
+    };
+
+    // Forward signals to child
+    process.on('SIGINT', () => { child.kill('SIGINT'); cleanup(); process.exit(0); });
+    process.on('SIGTERM', () => { child.kill('SIGTERM'); cleanup(); process.exit(0); });
+
+    // Wait for child to exit, then exit parent
+    await new Promise<void>((resolve) => {
+      child.on('exit', (code) => {
+        cleanup();
+        process.exitCode = code ?? 0;
+        resolve();
+      });
+    });
+    return;
+  }
+
+  // ── From here down, we're running inside the child process ───────────
 
   const port = parseInt(opts.port ?? '3030', 10);
   const app = express();

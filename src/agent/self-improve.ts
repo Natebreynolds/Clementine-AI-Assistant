@@ -79,6 +79,78 @@ const DRIFT_SIMILARITY_THRESHOLD = 0.55;
 /** If post-change metrics drop by more than this ratio, auto-rollback triggers. */
 const REGRESSION_ROLLBACK_THRESHOLD = 0.10;
 
+/** Max consecutive infrastructure errors before aborting the loop. */
+const MAX_INFRA_ERRORS = 2;
+
+// ── Error classification ────────────────────────────────────────────
+
+type ErrorCategory = 'infra_schema' | 'infra_auth' | 'infra_rate_limit' | 'infra_timeout' | 'hypothesis' | 'unknown';
+
+interface ClassifiedError {
+  category: ErrorCategory;
+  message: string;
+  /** Human-readable diagnostic explaining likely root cause and suggested fix. */
+  diagnostic: string;
+  /** Whether retrying the same operation is pointless (same error will recur). */
+  retryFutile: boolean;
+}
+
+/** Classify a self-improve error to determine if it's infrastructure (don't retry)
+ *  or hypothesis-related (safe to try a different approach). */
+function classifyError(err: unknown): ClassifiedError {
+  const msg = String(err);
+
+  // Tool schema validation errors from the API
+  if (msg.includes('input_schema') || msg.includes('Input should be')) {
+    return {
+      category: 'infra_schema',
+      message: msg.slice(0, 300),
+      diagnostic: 'An MCP server is exposing a tool with a malformed input_schema (type must be "object"). ' +
+        'This is an infrastructure issue — no iteration can succeed until the broken MCP server is fixed or excluded. ' +
+        'Check external MCP servers in claude_desktop_config.json and Claude Code settings for recently updated packages.',
+      retryFutile: true,
+    };
+  }
+
+  // Auth / API key errors
+  if (msg.includes('401') || msg.includes('403') || msg.includes('authentication') || msg.includes('Unauthorized')) {
+    return {
+      category: 'infra_auth',
+      message: msg.slice(0, 300),
+      diagnostic: 'API authentication failed. Check that the Anthropic API key is valid and not expired.',
+      retryFutile: true,
+    };
+  }
+
+  // Rate limits
+  if (msg.includes('429') || msg.includes('rate_limit') || msg.includes('Too many requests')) {
+    return {
+      category: 'infra_rate_limit',
+      message: msg.slice(0, 300),
+      diagnostic: 'Hit API rate limit. Subsequent iterations will likely fail too. Wait and retry next cycle.',
+      retryFutile: true,
+    };
+  }
+
+  // Timeouts
+  if (msg.includes('timeout') || msg.includes('ETIMEDOUT') || msg.includes('AbortError')) {
+    return {
+      category: 'infra_timeout',
+      message: msg.slice(0, 300),
+      diagnostic: 'LLM call timed out. This may be transient — worth retrying once.',
+      retryFutile: false,
+    };
+  }
+
+  // Everything else — likely a hypothesis or parsing error, safe to retry with a different approach
+  return {
+    category: 'unknown',
+    message: msg.slice(0, 300),
+    diagnostic: 'Unexpected error during iteration. May be transient.',
+    retryFutile: false,
+  };
+}
+
 // ── Drift detection ─────────────────────────────────────────────────
 
 /** Tokenize text into a word set for Jaccard similarity. */
@@ -416,6 +488,7 @@ export class SelfImproveLoop {
             accepted,
           }, `Iteration ${i} complete`);
         } catch (err) {
+          const classified = classifyError(err);
           const experiment: SelfImproveExperiment = {
             id,
             iteration: i,
@@ -424,21 +497,47 @@ export class SelfImproveLoop {
             durationMs: Date.now() - iterStart,
             area: this.config.areas[0],
             target: 'unknown',
-            hypothesis: 'Error during iteration',
+            hypothesis: `[${classified.category}] ${classified.diagnostic.slice(0, 120)}`,
             proposedChange: '',
             baselineScore: 0,
             score: 0,
             accepted: false,
             approvalStatus: 'denied',
-            reason: 'Error during iteration',
-            error: String(err),
+            reason: `Error: ${classified.category}`,
+            error: classified.message,
           };
           this.appendExperimentLog(experiment);
           history.push(experiment);
           state.totalExperiments++;
           consecutiveLow++;
 
-          logger.error({ err, iteration: i }, `Iteration ${i} failed`);
+          logger.error({
+            err,
+            iteration: i,
+            errorCategory: classified.category,
+            diagnostic: classified.diagnostic,
+            retryFutile: classified.retryFutile,
+          }, `Iteration ${i} failed: ${classified.category}`);
+
+          // If this is an infrastructure error that can't be fixed by retrying,
+          // check how many consecutive infra errors we've hit. If >= MAX_INFRA_ERRORS,
+          // abort the loop — every remaining iteration will fail the same way.
+          if (classified.retryFutile) {
+            const recentInfraErrors = history.slice(-MAX_INFRA_ERRORS)
+              .filter(e => e.reason?.startsWith('Error: infra_'));
+            if (recentInfraErrors.length >= MAX_INFRA_ERRORS) {
+              logger.warn({
+                category: classified.category,
+                diagnostic: classified.diagnostic,
+                consecutiveInfraErrors: recentInfraErrors.length,
+              }, 'Aborting self-improve loop — infrastructure error is persistent and cannot be fixed by retrying');
+              state.infraError = {
+                category: classified.category,
+                diagnostic: classified.diagnostic,
+              };
+              break;
+            }
+          }
         }
 
         this.saveState(state);

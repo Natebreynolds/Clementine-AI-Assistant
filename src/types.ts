@@ -558,6 +558,11 @@ export interface SelfImproveState {
   pendingApprovals: number;
   /** Version lineage for applied changes — enables rollback chains. */
   evolutionVersions?: EvolutionVersion[];
+  /** Set when the loop aborted due to a persistent infrastructure error. */
+  infraError?: {
+    category: string;
+    diagnostic: string;
+  };
 }
 
 export interface SelfImproveConfig {
