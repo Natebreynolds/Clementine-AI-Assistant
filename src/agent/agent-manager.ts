@@ -24,7 +24,7 @@ import { getScaffoldForRole } from './role-scaffolds.js';
 function storeAgentSecret(slug: string, key: string, value: string): void {
   execSync(
     `security add-generic-password -U -s "clementine" -a "AGENT_${slug.toUpperCase()}_${key}" -w "${value}"`,
-    { stdio: 'pipe' },
+    { stdio: 'pipe', timeout: 3000 },
   );
 }
 
@@ -32,7 +32,7 @@ function getAgentSecret(slug: string, key: string): string {
   try {
     return execSync(
       `security find-generic-password -s "clementine" -a "AGENT_${slug.toUpperCase()}_${key}" -w`,
-      { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] },
+      { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'], timeout: 3000 },
     ).trim();
   } catch {
     return '';
@@ -43,7 +43,7 @@ function deleteAgentSecret(slug: string, key: string): void {
   try {
     execSync(
       `security delete-generic-password -s "clementine" -a "AGENT_${slug.toUpperCase()}_${key}"`,
-      { stdio: 'pipe' },
+      { stdio: 'pipe', timeout: 3000 },
     );
   } catch { /* not found — ok */ }
 }

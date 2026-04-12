@@ -1562,7 +1562,7 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
       let currentHash = buildHash;
       try {
         const currentMtime = String(Math.floor(statSync(distDashboard).mtimeMs));
-        const gitHash = execSync('git rev-parse --short HEAD', { cwd: PACKAGE_ROOT, encoding: 'utf-8' }).trim();
+        const gitHash = execSync('git rev-parse --short HEAD', { cwd: PACKAGE_ROOT, encoding: 'utf-8', timeout: 3000 }).trim();
         currentHash = gitHash + '-' + currentMtime;
       } catch { try { currentHash = String(Math.floor(statSync(distDashboard).mtimeMs)); } catch { /* use cached */ } }
       result.version = { hash: currentHash, started: buildHash, needsRestart: currentHash !== buildHash };
@@ -1602,10 +1602,8 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
         });
       } catch { result.activity = { events: [] }; }
 
-      // Metrics
       try { result.metrics = computeMetrics(); } catch { result.metrics = {}; }
 
-      // Today's plan
       try {
         const today = new Date();
         const dateStr = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}`;
@@ -1613,19 +1611,16 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
         result.plan = existsSync(planPath) ? { ok: true, plan: JSON.parse(readFileSync(planPath, 'utf-8')) } : { ok: false, plan: null };
       } catch { result.plan = { ok: false, plan: null }; }
 
-      // MCP servers (disk-based discovery, no gateway)
       try {
 
         result.mcpServers = { servers: discoverMcpServers() };
       } catch { result.mcpServers = { servers: [] }; }
 
-      // Claude integrations
       try {
 
         result.claudeIntegrations = { integrations: getClaudeIntegrations() };
       } catch { result.claudeIntegrations = { integrations: [] }; }
 
-      // Projects
       try {
         const projects = scanProjects();
         const meta = loadProjectsMeta();
@@ -1637,7 +1632,6 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
         };
       } catch { result.projects = { projects: [] }; }
 
-      // Office/agents — read directly from disk, no gateway needed
       // Returns same shape as /api/office: { clementine: {...}, agents: [...] }
       try {
         const agDir = AGENTS_DIR;
@@ -3599,9 +3593,8 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
 
   // ── MCP Server Management API ───────────────────────────────────────
 
-  app.get('/api/mcp-servers', async (_req, res) => {
+  app.get('/api/mcp-servers', (_req, res) => {
     try {
-      const { discoverMcpServers } = await import('../agent/mcp-bridge.js');
       const servers = discoverMcpServers();
       res.json({ servers });
     } catch (err) {
@@ -3655,9 +3648,8 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
 
   // ── Claude Desktop Integrations API ──────────────────────────────────
 
-  app.get('/api/claude-integrations', async (_req, res) => {
+  app.get('/api/claude-integrations', (_req, res) => {
     try {
-      const { getClaudeIntegrations } = await import('../agent/mcp-bridge.js');
       res.json({ integrations: getClaudeIntegrations() });
     } catch (err) {
       res.status(500).json({ error: String(err) });
@@ -3998,10 +3990,8 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
 
   app.get('/api/team/agents', async (_req, res) => {
     try {
-      const { AgentManager } = await import('../agent/agent-manager.js');
-      const { AGENTS_DIR: agDir } = await import('../config.js');
       const profilesDir = path.join(VAULT_DIR, '00-System', 'profiles');
-      const mgr = new AgentManager(agDir, profilesDir);
+      const mgr = new AgentManager(AGENTS_DIR, profilesDir);
       const agents = mgr.listAll();
       res.json(agents.map(a => ({
         slug: a.slug,
@@ -4096,10 +4086,8 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
   app.get('/api/office', async (_req, res) => {
     try {
       const data = await cachedAsync('office', 10_000, async () => {
-      const { AgentManager } = await import('../agent/agent-manager.js');
-      const { AGENTS_DIR: agDir } = await import('../config.js');
       const profilesDir = path.join(VAULT_DIR, '00-System', 'profiles');
-      const mgr = new AgentManager(agDir, profilesDir);
+      const mgr = new AgentManager(AGENTS_DIR, profilesDir);
       const allAgents = mgr.listAll();
 
       // ── Bot statuses ──
@@ -4169,11 +4157,11 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
         } catch { /* ignore */ }
       }
       // Agent CRON.md files
-      if (existsSync(agDir)) {
+      if (existsSync(AGENTS_DIR)) {
         try {
-          const dirs = readdirSync(agDir, { withFileTypes: true }).filter(d => d.isDirectory()).map(d => d.name);
+          const dirs = readdirSync(AGENTS_DIR, { withFileTypes: true }).filter(d => d.isDirectory()).map(d => d.name);
           for (const slug of dirs) {
-            const cf = path.join(agDir, slug, 'CRON.md');
+            const cf = path.join(AGENTS_DIR, slug, 'CRON.md');
             if (!existsSync(cf)) continue;
             try {
               const parsed = matter(readFileSync(cf, 'utf-8'));
