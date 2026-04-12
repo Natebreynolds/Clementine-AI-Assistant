@@ -1373,7 +1373,7 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
     try {
       const result: Record<string, unknown> = {};
       result.version = { hash: buildHash, started: buildHash, needsRestart: false };
-      result.status = getStatus();
+      try { result.status = getStatus(); } catch { result.status = { alive: false, name: 'Clementine' }; }
       try { result.metrics = computeMetrics(); } catch { result.metrics = {}; }
       try {
         const today = new Date();
@@ -1675,7 +1675,7 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
         };
       } catch { result.projects = { projects: [] }; }
 
-      // Returns same shape as /api/office: { clementine: {...}, agents: [...] }
+      //
       try {
         const agDir = AGENTS_DIR;
         const profilesDir = path.join(VAULT_DIR, '00-System', 'profiles');
@@ -14423,17 +14423,14 @@ async function refreshAll() {
       }
     }
   } catch(e) {
-    // Fallback: individual lightweight calls only
-    try { refreshStatus(); } catch { /* */ }
-    try { refreshActivity(); } catch { /* */ }
+    console.warn('refreshAll failed:', e);
   }
-  // Page-specific refreshes (these are lightweight, no gateway)
-  if (currentPage === 'automations') { refreshCron(); refreshTimers(); }
-  if (currentPage === 'intelligence') refreshMemory();
-  if (currentPage === 'settings' || currentPage === 'projects') {
-    try { if (d && d.projects) refreshProjects(d.projects); else refreshProjects(); } catch { refreshProjects(); }
+  // Page-specific data from init response (no individual endpoint calls)
+  if (d) {
+    if ((currentPage === 'settings' || currentPage === 'projects') && d.projects) {
+      try { refreshProjects(d.projects); } catch { /* */ }
+    }
   }
-  if (currentPage === 'logs') refreshLogs();
 }
 
 // ── Team Nav Refresh ─────────────────────
