@@ -1363,6 +1363,49 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
   // Quick ping — bypasses all middleware, tests /api path routing
   app.get('/api/ping', (_req, res) => { res.json({ pong: true }); });
 
+  // Init endpoint — registered before auth for reliability (does own auth check)
+  app.get('/api/init', (req, res) => {
+    const auth = req.headers.authorization;
+    if (!auth || !safeTokenEquals(auth, `Bearer ${dashboardToken}`)) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+    try {
+      const result: Record<string, unknown> = {};
+      result.version = { hash: buildHash, started: buildHash, needsRestart: false };
+      result.status = getStatus();
+      try { result.metrics = computeMetrics(); } catch { result.metrics = {}; }
+      try {
+        const today = new Date();
+        const dateStr = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}`;
+        const planPath = path.join(PLANS_DIR, `${dateStr}.json`);
+        result.plan = existsSync(planPath) ? { ok: true, plan: JSON.parse(readFileSync(planPath, 'utf-8')) } : { ok: false, plan: null };
+      } catch { result.plan = { ok: false, plan: null }; }
+      try { result.mcpServers = { servers: discoverMcpServers() }; } catch { result.mcpServers = { servers: [] }; }
+      try { result.claudeIntegrations = { integrations: getClaudeIntegrations() }; } catch { result.claudeIntegrations = { integrations: [] }; }
+      try {
+        const projects = scanProjects();
+        const meta = loadProjectsMeta();
+        result.projects = { projects: projects.map(p => { const m = meta.find(pm => pm.path === p.path); return { ...p, userDescription: m?.description ?? '', keywords: m?.keywords ?? [], linked: !!m }; }) };
+      } catch { result.projects = { projects: [] }; }
+      try {
+        const profilesDir = path.join(VAULT_DIR, '00-System', 'profiles');
+        const mgr = new AgentManager(AGENTS_DIR, profilesDir);
+        const allAgents = mgr.listAll();
+        let botStatuses: Record<string, any> = {};
+        try { const p = path.join(BASE_DIR, '.bot-status.json'); if (existsSync(p)) botStatuses = JSON.parse(readFileSync(p, 'utf-8')); } catch { /* */ }
+        const statusData = getStatus();
+        result.office = {
+          clementine: { name: statusData.name, status: statusData.alive ? 'online' : 'offline' },
+          agents: allAgents.map(a => ({ slug: a.slug, name: a.name, description: a.description, status: a.status ?? 'active', avatar: a.avatar ?? null, botStatus: botStatuses[a.slug]?.status ?? null })),
+        };
+      } catch { result.office = { clementine: { name: 'Clementine', status: 'offline' }, agents: [] }; }
+      res.json(result);
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
   // SSE events — registered before auth so EventSource (which can't send headers) works
   // Auth is done via token query param instead
   app.get('/api/events', (req, res) => {
