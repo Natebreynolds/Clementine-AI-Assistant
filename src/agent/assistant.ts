@@ -2094,6 +2094,9 @@ You have a limited number of turns per message (~15). **After 8-10 tool calls, y
                     responseText = responseText || 'I hit the cost limit for this query. Try breaking it into smaller requests.';
                   } else if (lower.includes('rate') && lower.includes('limit')) {
                     hitRateLimit = true;
+                  } else if (lower.includes('maximum number of turns') || lower.includes('max_turns')) {
+                    // Max turns — rethrow so the gateway can auto-escalate to deep mode
+                    throw new Error(errorText);
                   } else if (lower.includes('does not have access') || lower.includes('please run /login') || lower.includes('not authenticated')) {
                     // Auth errors — throw so the gateway circuit breaker catches it
                     throw new Error(errorText);
@@ -2179,6 +2182,9 @@ You have a limited number of turns per message (~15). **After 8-10 tool calls, y
               this.sessions.delete(sessionKey);
             }
             continue; // Retry with fresh session
+          } else if (errStr.includes('maximum number of turns') || errStr.includes('max_turns')) {
+            // Max turns — rethrow so the gateway can auto-escalate to deep mode
+            throw e;
           } else if (errStr.includes('does not have access') || errStr.includes('please run /login') || errStr.includes('not authenticated') || errStr.includes('invalid api key') || errStr.includes('invalid_api_key')) {
             // Auth errors — rethrow so the gateway circuit breaker handles them
             throw e;
