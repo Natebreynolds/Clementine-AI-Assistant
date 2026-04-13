@@ -1269,6 +1269,7 @@ You have a limited number of turns per message (~15). **After 8-10 tool calls, y
       mcpTool('session_pause'),
       mcpTool('session_resume'),
       mcpTool('web_search'),
+      mcpTool('heartbeat_queue_work'),
     ];
 
     if (enableTeams) {
@@ -1309,6 +1310,15 @@ You have a limited number of turns per message (~15). **After 8-10 tool calls, y
       // Always allow team tools for team agents
       whitelist.add(mcpTool('team_message'));
       whitelist.add(mcpTool('team_list'));
+      // Always allow orchestration tools so agents can manage long-running work
+      whitelist.add(mcpTool('heartbeat_queue_work'));
+      whitelist.add(mcpTool('delegate_task'));
+      whitelist.add(mcpTool('check_delegation'));
+      whitelist.add(mcpTool('goal_create'));
+      whitelist.add(mcpTool('goal_update'));
+      whitelist.add(mcpTool('goal_list'));
+      whitelist.add(mcpTool('goal_get'));
+      whitelist.add(mcpTool('goal_work'));
       allowedTools = allowedTools.filter(t => whitelist.has(t));
     }
 
@@ -2019,6 +2029,7 @@ You have a limited number of turns per message (~15). **After 8-10 tool calls, y
         let sessionId = '';
         let hitRateLimit = false;
         let staleSession = false;
+        let contextRecovery = false;
         let lastAssistantBlocks: ContentBlock[] = [];
         const queryStartMs = Date.now();
 
@@ -2086,6 +2097,18 @@ You have a limited number of turns per message (~15). **After 8-10 tool calls, y
                   } else if (lower.includes('does not have access') || lower.includes('please run /login') || lower.includes('not authenticated')) {
                     // Auth errors — throw so the gateway circuit breaker catches it
                     throw new Error(errorText);
+                  } else if (lower.includes('autocompact') || lower.includes('thrash') || lower.includes('context refilled to the limit')) {
+                    // Autocompact thrashing — treat like the exception path
+                    logger.warn({ sessionKey }, 'Autocompact thrashing (result error) — will rotate session');
+                    if (sessionKey) {
+                      try { this.compactContext(sessionKey); } catch { /* best-effort */ }
+                      this.sessions.delete(sessionKey);
+                      this.exchangeCounts.set(sessionKey, 0);
+                      this._compactedSessions.delete(sessionKey);
+                    }
+                    staleSession = true; // Reuse stale session retry path
+                    contextRecovery = true;
+                    break;
                   } else if (lower.includes('no conversation found') || lower.includes('conversation not found') || lower.includes('session not found')) {
                     // Stale session — clear and retry with fresh session
                     logger.warn({ sessionKey }, 'Stale session ID — clearing and retrying');
@@ -2125,6 +2148,28 @@ You have a limited number of turns per message (~15). **After 8-10 tool calls, y
             }
           } else if (errStr.includes('rate') && (errStr.includes('limit') || errStr.includes('rate_limit'))) {
             hitRateLimit = true;
+          } else if (errStr.includes('autocompact') || errStr.includes('thrash') || errStr.includes('context refilled to the limit')) {
+            // SDK autocompact thrashing — tool outputs are too large for the context window.
+            // Rotate session and retry with a fresh context so the agent can continue.
+            logger.warn({ sessionKey }, 'Autocompact thrashing — rotating session and retrying');
+            if (sessionKey) {
+              try { this.compactContext(sessionKey); } catch { /* best-effort */ }
+              this.sessions.delete(sessionKey);
+              this.exchangeCounts.set(sessionKey, 0);
+              this._compactedSessions.delete(sessionKey);
+            }
+            if (attempt < PersonalAssistant.RATE_LIMIT_MAX_RETRIES) {
+              // Prepend a warning so the agent knows to use smaller queries
+              prompt = `[CONTEXT RECOVERED] Your previous session ran out of context space because tool outputs were too large. ` +
+                `A fresh session has been started. Key rules for this session:\n` +
+                `- Add LIMIT clauses to database queries (max 20 rows)\n` +
+                `- Pipe large command output through \`head -50\` or similar\n` +
+                `- If a task needs many queries, break it into smaller batches and deliver partial results between batches\n\n` +
+                `Continue with the user's request: ${prompt}`;
+              responseText = '';
+              continue;
+            }
+            responseText = responseText || 'The conversation context filled up from large tool outputs. I\'ve reset the session — please try again, and I\'ll keep query results smaller this time.';
           } else if (errStr.includes('prompt is too long') || errStr.includes('prompt too long') || errStr.includes('context_length')) {
             responseText = responseText || 'Error: prompt is too long — context window overflow from large tool responses.';
           } else if (errStr.includes('no conversation found') || errStr.includes('conversation not found') || errStr.includes('session not found')) {
@@ -2150,6 +2195,16 @@ You have a limited number of turns per message (~15). **After 8-10 tool calls, y
         // Stale session — immediately retry with fresh session (no backoff needed)
         if (staleSession && attempt < PersonalAssistant.RATE_LIMIT_MAX_RETRIES) {
           responseText = '';
+          if (contextRecovery) {
+            // Inject guidance so the agent avoids repeating the same large-output pattern
+            prompt = `[CONTEXT RECOVERED] Your previous session ran out of context space because tool outputs were too large. ` +
+              `A fresh session has been started. Key rules for this session:\n` +
+              `- Add LIMIT clauses to database queries (max 20 rows)\n` +
+              `- Pipe large command output through \`head -50\` or similar\n` +
+              `- If a task needs many queries, break it into smaller batches and deliver partial results between batches\n\n` +
+              `Continue with the user's request: ${prompt}`;
+            contextRecovery = false;
+          }
           continue;
         }
 
