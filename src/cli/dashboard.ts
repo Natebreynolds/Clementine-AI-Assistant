@@ -346,14 +346,15 @@ function cronFieldMatch(field: string, value: number): boolean {
   return false;
 }
 
-const PROJECT_MARKERS = [
-  '.git', 'package.json', 'pyproject.toml', 'Cargo.toml',
-  'go.mod', 'Makefile', 'CMakeLists.txt', 'build.gradle',
-  'pom.xml', 'Gemfile', 'mix.exs', '.claude/CLAUDE.md',
-];
+// Project scanning is done in a worker thread (see refreshProjectsAsync in cmdDashboard)
+// to avoid blocking the Express event loop. WORKSPACE_CANDIDATES and ProjectInfo remain
+// here as they're referenced by the worker code and other parts of the dashboard.
 
+// Desktop excluded — on macOS, statSync on Desktop entries can block
+// indefinitely due to iCloud/APFS interactions. Desktop projects can
+// be added explicitly via WORKSPACE_DIRS in .env.
 const WORKSPACE_CANDIDATES = [
-  'Desktop', 'Documents', 'Developer', 'Projects', 'projects',
+  'Documents', 'Developer', 'Projects', 'projects',
   'repos', 'Repos', 'src', 'code', 'Code', 'work', 'Work',
   'dev', 'Dev', 'github', 'GitHub', 'gitlab', 'GitLab',
 ];
@@ -367,72 +368,7 @@ interface ProjectInfo {
   scripts: string[];
   hasMcp: boolean;
   mcpServers: string[];
-}
-
-function detectProjectType(entries: string[]): string {
-  if (entries.includes('package.json')) return 'node';
-  if (entries.includes('pyproject.toml') || entries.includes('setup.py')) return 'python';
-  if (entries.includes('Cargo.toml')) return 'rust';
-  if (entries.includes('go.mod')) return 'go';
-  if (entries.includes('build.gradle') || entries.includes('pom.xml')) return 'java';
-  if (entries.includes('Gemfile')) return 'ruby';
-  if (entries.includes('mix.exs')) return 'elixir';
-  if (entries.includes('CMakeLists.txt')) return 'c/c++';
-  if (entries.includes('Makefile')) return 'make';
-  return 'unknown';
-}
-
-function getProjectDescription(dirPath: string, entries: string[]): string {
-  if (entries.includes('package.json')) {
-    try {
-      const pkg = JSON.parse(readFileSync(path.join(dirPath, 'package.json'), 'utf-8'));
-      if (pkg.description) return pkg.description;
-    } catch { /* ignore */ }
-  }
-  if (entries.includes('pyproject.toml')) {
-    try {
-      const toml = readFileSync(path.join(dirPath, 'pyproject.toml'), 'utf-8');
-      const match = toml.match(/description\s*=\s*"([^"]+)"/);
-      if (match) return match[1];
-    } catch { /* ignore */ }
-  }
-  return '';
-}
-
-function getProjectScripts(dirPath: string, entries: string[]): string[] {
-  if (entries.includes('package.json')) {
-    try {
-      const pkg = JSON.parse(readFileSync(path.join(dirPath, 'package.json'), 'utf-8'));
-      return Object.keys(pkg.scripts || {}).slice(0, 15);
-    } catch { /* ignore */ }
-  }
-  if (entries.includes('Makefile')) {
-    try {
-      const mk = readFileSync(path.join(dirPath, 'Makefile'), 'utf-8');
-      const targets = [...mk.matchAll(/^([a-zA-Z_][a-zA-Z0-9_-]*):/gm)].map(m => m[1]);
-      return targets.slice(0, 15);
-    } catch { /* ignore */ }
-  }
-  return [];
-}
-
-function getMcpServers(dirPath: string): string[] {
-  const servers: string[] = [];
-  // Check .mcp.json (project-level Claude Code MCP config)
-  for (const mcpPath of [
-    path.join(dirPath, '.mcp.json'),
-    path.join(dirPath, '.claude', 'mcp.json'),
-  ]) {
-    if (!existsSync(mcpPath)) continue;
-    try {
-      const data = JSON.parse(readFileSync(mcpPath, 'utf-8'));
-      const mcpServers = data.mcpServers || data.servers || {};
-      for (const name of Object.keys(mcpServers)) {
-        if (!servers.includes(name)) servers.push(name);
-      }
-    } catch { /* ignore */ }
-  }
-  return servers;
+  [key: string]: unknown; // Worker thread may add userDescription, keywords, linked
 }
 
 interface ProjectMetaEntry {
@@ -661,93 +597,6 @@ function discoverGlobalMcpServers(): ToolEntry[] {
   } catch { /* ignore */ }
 
   return servers;
-}
-
-// ── Project scanning ────────────────────────────────────────────────
-
-function scanProjects(): ProjectInfo[] {
-  const home = os.homedir();
-  const seen = new Set<string>();
-  const dirs: string[] = [];
-
-  const addDir = (d: string) => {
-    const resolved = path.resolve(d);
-    if (!seen.has(resolved) && existsSync(resolved)) {
-      try { if (statSync(resolved).isDirectory()) { seen.add(resolved); dirs.push(resolved); } } catch { /* ignore */ }
-    }
-  };
-
-  for (const candidate of WORKSPACE_CANDIDATES) {
-    addDir(path.join(home, candidate));
-  }
-
-  // Merge explicit WORKSPACE_DIRS from .env
-  if (existsSync(ENV_PATH)) {
-    const envContent = readFileSync(ENV_PATH, 'utf-8');
-    const match = envContent.match(/^WORKSPACE_DIRS=(.+)$/m);
-    if (match) {
-      for (const d of match[1].split(',').map(s => s.trim()).filter(Boolean)) {
-        addDir(d.startsWith('~') ? d.replace('~', home) : d);
-      }
-    }
-  }
-
-  const projects: ProjectInfo[] = [];
-
-  const addProject = (fullPath: string, name: string) => {
-    const resolvedProject = path.resolve(fullPath);
-    if (seen.has('proj:' + resolvedProject)) return;
-    seen.add('proj:' + resolvedProject);
-
-    let subEntries: string[];
-    try { subEntries = readdirSync(fullPath); } catch { return; }
-
-    const mcpServers = getMcpServers(fullPath);
-    projects.push({
-      name,
-      path: fullPath,
-      type: detectProjectType(subEntries),
-      description: getProjectDescription(fullPath, subEntries),
-      hasClaude: existsSync(path.join(fullPath, '.claude', 'CLAUDE.md')),
-      scripts: getProjectScripts(fullPath, subEntries),
-      hasMcp: mcpServers.length > 0,
-      mcpServers,
-    });
-  };
-
-  for (const wsDir of dirs) {
-    let entries: string[];
-    try { entries = readdirSync(wsDir); } catch { continue; }
-
-    // Check if the workspace dir itself is a project
-    const wsDirIsProject = PROJECT_MARKERS.some(marker => {
-      if (marker.includes('/')) return existsSync(path.join(wsDir, marker));
-      return entries.includes(marker);
-    });
-    if (wsDirIsProject) {
-      addProject(wsDir, path.basename(wsDir));
-    }
-
-    // Scan subdirectories for projects
-    for (const entry of entries) {
-      if (entry.startsWith('.')) continue;
-      const fullPath = path.join(wsDir, entry);
-      try { if (!statSync(fullPath).isDirectory()) continue; } catch { continue; }
-
-      let subEntries: string[];
-      try { subEntries = readdirSync(fullPath); } catch { continue; }
-
-      const isProject = PROJECT_MARKERS.some(marker => {
-        if (marker.includes('/')) return existsSync(path.join(fullPath, marker));
-        return subEntries.includes(marker);
-      });
-      if (!isProject) continue;
-
-      addProject(fullPath, entry);
-    }
-  }
-
-  return projects.sort((a, b) => a.name.localeCompare(b.name));
 }
 
 // ── Metrics computation ──────────────────────────────────────────────
@@ -1405,6 +1254,116 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
   // Quick ping — bypasses all middleware, tests /api path routing
   app.get('/api/ping', (_req, res) => { res.json({ pong: true }); });
 
+  // ── Background project scanner ───────────────────────────────────────
+  // scanProjects() does heavy synchronous filesystem I/O (statSync across
+  // hundreds of Desktop/Documents entries) which permanently blocks the
+  // event loop when run inside the Express process (macOS filesystem
+  // interaction with active sockets). Run it in a worker thread instead.
+  let cachedProjects: ProjectInfo[] | null = null;
+  const refreshProjectsAsync = () => {
+    const { Worker } = require('node:worker_threads') as typeof import('node:worker_threads');
+    const workerCode = `
+      const { parentPort } = require('node:worker_threads');
+      const { readdirSync, existsSync, readFileSync, statSync } = require('node:fs');
+      const path = require('node:path');
+      const os = require('node:os');
+      const home = os.homedir();
+      const BASE_DIR = process.env.CLEMENTINE_HOME || path.join(home, '.clementine');
+      const VAULT_DIR = path.join(BASE_DIR, 'vault');
+      const ENV_PATH = path.join(BASE_DIR, '.env');
+      const PROJECTS_META_FILE = path.join(BASE_DIR, 'projects.json');
+      const WORKSPACE_CANDIDATES = ${JSON.stringify(WORKSPACE_CANDIDATES)};
+      const PROJECT_MARKERS = ['package.json', 'pyproject.toml', 'setup.py', 'setup.cfg',
+        'Cargo.toml', 'go.mod', 'Makefile', 'CMakeLists.txt', '.claude/CLAUDE.md'];
+
+      function getMcpServers(dirPath) {
+        const servers = [];
+        for (const mcpPath of [path.join(dirPath, '.mcp.json'), path.join(dirPath, '.claude', 'mcp.json')]) {
+          if (!existsSync(mcpPath)) continue;
+          try {
+            const data = JSON.parse(readFileSync(mcpPath, 'utf-8'));
+            for (const name of Object.keys(data.mcpServers || data.servers || {})) {
+              if (!servers.includes(name)) servers.push(name);
+            }
+          } catch {}
+        }
+        return servers;
+      }
+
+      try {
+        const seen = new Set();
+        const dirs = [];
+        for (const c of WORKSPACE_CANDIDATES) {
+          const full = path.resolve(path.join(home, c));
+          if (!seen.has(full) && existsSync(full)) {
+            try { if (statSync(full).isDirectory()) { seen.add(full); dirs.push(full); } } catch {}
+          }
+        }
+        if (existsSync(ENV_PATH)) {
+          const match = readFileSync(ENV_PATH, 'utf-8').match(/^WORKSPACE_DIRS=(.+)$/m);
+          if (match) {
+            for (const d of match[1].split(',').map(s => s.trim()).filter(Boolean)) {
+              const full = path.resolve(d.startsWith('~') ? d.replace('~', home) : d);
+              if (!seen.has(full) && existsSync(full)) {
+                try { if (statSync(full).isDirectory()) { seen.add(full); dirs.push(full); } } catch {}
+              }
+            }
+          }
+        }
+
+        const projects = [];
+        const seenProj = new Set();
+        for (const wsDir of dirs) {
+          let entries;
+          try { entries = readdirSync(wsDir); } catch { continue; }
+          const wsDirIsProject = PROJECT_MARKERS.some(m => m.includes('/') ? existsSync(path.join(wsDir, m)) : entries.includes(m));
+          if (wsDirIsProject && !seenProj.has(wsDir)) {
+            seenProj.add(wsDir);
+            const mcps = getMcpServers(wsDir);
+            let desc = '';
+            try { if (entries.includes('package.json')) { const p = JSON.parse(readFileSync(path.join(wsDir, 'package.json'), 'utf-8')); desc = p.description || ''; } } catch {}
+            projects.push({ name: path.basename(wsDir), path: wsDir, type: entries.includes('package.json') ? 'node' : 'unknown', description: desc, hasClaude: existsSync(path.join(wsDir, '.claude', 'CLAUDE.md')), scripts: [], hasMcp: mcps.length > 0, mcpServers: mcps });
+          }
+          for (const entry of entries) {
+            if (entry.startsWith('.')) continue;
+            const full = path.join(wsDir, entry);
+            try { if (!statSync(full).isDirectory()) continue; } catch { continue; }
+            let sub;
+            try { sub = readdirSync(full); } catch { continue; }
+            if (!PROJECT_MARKERS.some(m => m.includes('/') ? existsSync(path.join(full, m)) : sub.includes(m))) continue;
+            if (seenProj.has(full)) continue;
+            seenProj.add(full);
+            const mcps = getMcpServers(full);
+            let desc = '';
+            try { if (sub.includes('package.json')) { const p = JSON.parse(readFileSync(path.join(full, 'package.json'), 'utf-8')); desc = p.description || ''; } } catch {}
+            projects.push({ name: entry, path: full, type: sub.includes('package.json') ? 'node' : 'unknown', description: desc, hasClaude: existsSync(path.join(full, '.claude', 'CLAUDE.md')), scripts: [], hasMcp: mcps.length > 0, mcpServers: mcps });
+          }
+        }
+
+        // Merge user metadata
+        let meta = [];
+        try { if (existsSync(PROJECTS_META_FILE)) meta = JSON.parse(readFileSync(PROJECTS_META_FILE, 'utf-8')); } catch {}
+        const merged = projects.map(p => {
+          const m = meta.find(pm => pm.path === p.path);
+          return { ...p, userDescription: m?.description || '', keywords: m?.keywords || [], linked: !!m };
+        });
+
+        parentPort.postMessage({ projects: merged.sort((a, b) => a.name.localeCompare(b.name)) });
+      } catch (err) {
+        parentPort.postMessage({ projects: [], error: String(err) });
+      }
+    `;
+    const worker = new Worker(workerCode, { eval: true, env: { ...process.env } });
+    worker.on('message', (msg: { projects: ProjectInfo[] }) => {
+      cachedProjects = msg.projects;
+    });
+    worker.on('error', () => { if (!cachedProjects) cachedProjects = []; });
+  };
+  // Initial scan in worker thread — non-blocking
+  setTimeout(refreshProjectsAsync, 100);
+  // Refresh every 60s
+  setInterval(refreshProjectsAsync, 60_000);
+
   // Init endpoint — registered before auth for reliability (does own auth check)
   app.get('/api/init', (req, res) => {
     const auth = req.headers.authorization;
@@ -1425,11 +1384,7 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
       } catch { result.plan = { ok: false, plan: null }; }
       try { result.mcpServers = { servers: discoverMcpServers() }; } catch { result.mcpServers = { servers: [] }; }
       try { result.claudeIntegrations = { integrations: getClaudeIntegrations() }; } catch { result.claudeIntegrations = { integrations: [] }; }
-      try {
-        const projects = scanProjects();
-        const meta = loadProjectsMeta();
-        result.projects = { projects: projects.map(p => { const m = meta.find(pm => pm.path === p.path); return { ...p, userDescription: m?.description ?? '', keywords: m?.keywords ?? [], linked: !!m }; }) };
-      } catch { result.projects = { projects: [] }; }
+      result.projects = { projects: cachedProjects ?? [] };
       try {
         const profilesDir = path.join(VAULT_DIR, '00-System', 'profiles');
         const mgr = new AgentManager(AGENTS_DIR, profilesDir);
@@ -1706,16 +1661,7 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
         result.claudeIntegrations = { integrations: getClaudeIntegrations() };
       } catch { result.claudeIntegrations = { integrations: [] }; }
 
-      try {
-        const projects = scanProjects();
-        const meta = loadProjectsMeta();
-        result.projects = {
-          projects: projects.map(p => {
-            const m = meta.find(pm => pm.path === p.path);
-            return { ...p, userDescription: m?.description ?? '', keywords: m?.keywords ?? [], linked: !!m };
-          }),
-        };
-      } catch { result.projects = { projects: [] }; }
+      result.projects = { projects: cachedProjects ?? [] };
 
       //
       try {
@@ -2324,7 +2270,7 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
 
         // Discover project-scoped MCP servers
         const projectMcp: Record<string, ToolEntry[]> = {};
-        const projects = scanProjects();
+        const projects = cachedProjects ?? [];
         for (const p of projects) {
           if (p.mcpServers.length) {
             for (const server of p.mcpServers) {
@@ -2347,18 +2293,9 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
 
   app.get('/api/projects', (_req, res) => {
     try {
-      const projects = scanProjects();
-      // Merge user-defined metadata from projects.json
-      const meta = loadProjectsMeta();
-      const merged = projects.map(p => {
-        const m = meta.find(pm => pm.path === p.path);
-        return {
-          ...p,
-          userDescription: m?.description ?? '',
-          keywords: m?.keywords ?? [],
-          linked: !!m,
-        };
-      });
+      // Use background-scanned projects — sync scanning blocks the event loop
+      const projects = cachedProjects ?? [];
+      const merged = projects;
       res.json({ projects: merged });
     } catch (err) {
       res.status(500).json({ error: String(err) });
