@@ -2144,12 +2144,12 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
         } catch (e: unknown) {
           const errStr = String(e).toLowerCase();
           if (errStr.includes('abort') || errStr.includes('cancel')) {
-            // Query was aborted (timeout or user cancel) — return partial output with explanation
+            // Query was aborted (timeout or user cancel) — return partial output
             logger.warn({ sessionKey }, 'Chat query aborted');
             if (!responseText) {
-              responseText = 'This task was taking too long so I stopped it. For multi-file work, try asking me to handle one file at a time, or I can spawn sub-agents to process them in parallel.';
+              responseText = 'I ran out of time on this one. Let me know if you want me to pick it back up.';
             } else {
-              responseText += '\n\n*(Timed out — this is a partial result. Try breaking the task into smaller pieces or ask me to use sub-agents.)*';
+              responseText += '\n\nI ran out of time but here\'s what I have so far. Want me to continue?';
             }
           } else if (errStr.includes('rate') && (errStr.includes('limit') || errStr.includes('rate_limit'))) {
             hitRateLimit = true;

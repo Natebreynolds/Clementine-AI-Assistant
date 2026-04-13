@@ -767,26 +767,45 @@ export class Gateway {
               undefined,   // default model
               undefined,   // default workDir
               1,           // maxHours
-            ).then((result) => {
+            ).then(async (result) => {
               logger.info({ sessionKey, jobName, resultLen: result?.length ?? 0 }, 'Deep mode task completed');
               if (result && result !== '__NOTHING__') {
-                this.assistant.injectPendingContext(sessionKey, text, result);
-                // Push result to channels so the user sees it without having to message again
-                this._dispatcher?.send(`**[Deep mode complete]** ${taskDesc}\n\n${result.slice(0, 1500)}`)
-                  .catch(err => logger.debug({ err }, 'Failed to push deep mode result to channels'));
+                // Route result back through the agent's session so it responds naturally
+                // The synthetic message gives the agent context to summarize its own work
+                try {
+                  await this.handleMessage(
+                    sessionKey,
+                    `[DEEP_MODE_RESULT] You just completed background work. Here are the results — summarize them conversationally for the user. Be natural, not robotic. Lead with what matters most.\n\nTask: ${taskDesc}\n\nResult:\n${result.slice(0, 3000)}`,
+                  );
+                  logger.info({ sessionKey, jobName }, 'Deep mode result delivered via agent follow-up');
+                } catch (followUpErr) {
+                  // Fallback: inject context + push notification
+                  logger.debug({ err: followUpErr, sessionKey }, 'Deep mode follow-up failed — using fallback delivery');
+                  this.assistant.injectPendingContext(sessionKey, text, result);
+                  this._dispatcher?.send(`${result.slice(0, 1500)}`)
+                    .catch(err => logger.debug({ err }, 'Failed to push deep mode result to channels'));
+                }
               }
-            }).catch((err) => {
+            }).catch(async (err) => {
               logger.error({ err, sessionKey, jobName }, 'Deep mode task failed');
               const failMsg = `Background work failed: ${String(err).slice(0, 200)}`;
               this.assistant.injectPendingContext(sessionKey, text, failMsg);
-              this._dispatcher?.send(`**[Deep mode failed]** ${taskDesc}: ${String(err).slice(0, 200)}`)
-                .catch(e => logger.debug({ err: e }, 'Failed to push deep mode failure to channels'));
+              // Route failure back through agent too
+              try {
+                await this.handleMessage(
+                  sessionKey,
+                  `[DEEP_MODE_RESULT] The background task "${taskDesc}" failed: ${failMsg}. Let the user know what happened and suggest next steps. Be brief.`,
+                );
+              } catch {
+                this._dispatcher?.send(`The background task failed: ${failMsg}`)
+                  .catch(e => logger.debug({ err: e }, 'Failed to push deep mode failure'));
+              }
             }).finally(() => {
               const s = this.sessions.get(sessionKey);
               if (s?.deepTask?.jobName === jobName) delete s.deepTask;
             });
 
-            return ack || `Running in deep mode: ${taskDesc}. I'll check in as I go.`;
+            return ack || `On it — working on this now. I'll follow up when it's done.`;
           }
 
           // ── Auto-escalation ──────────────────────────────────────────
@@ -808,33 +827,43 @@ export class Gateway {
               undefined,
               undefined,
               1,
-            ).then((result) => {
+            ).then(async (result) => {
               logger.info({ sessionKey, jobName, resultLen: result?.length ?? 0 }, 'Auto-escalated deep mode completed');
               if (result && result !== '__NOTHING__') {
-                this.assistant.injectPendingContext(sessionKey, text, result);
-                this._dispatcher?.send(`**[Background work complete]** ${text.slice(0, 100)}\n\n${result.slice(0, 1500)}`)
-                  .catch(err => logger.debug({ err }, 'Failed to push auto-escalation result to channels'));
+                try {
+                  await this.handleMessage(
+                    sessionKey,
+                    `[DEEP_MODE_RESULT] You just completed background work. Summarize conversationally — lead with what matters.\n\nTask: ${text.slice(0, 500)}\n\nResult:\n${result.slice(0, 3000)}`,
+                  );
+                } catch {
+                  this.assistant.injectPendingContext(sessionKey, text, result);
+                  this._dispatcher?.send(`${result.slice(0, 1500)}`)
+                    .catch(err => logger.debug({ err }, 'Failed to push auto-escalation result'));
+                }
               }
-            }).catch((err) => {
+            }).catch(async (err) => {
               logger.error({ err, sessionKey, jobName }, 'Auto-escalated deep mode failed');
-              const failMsg = `The background work on "${text.slice(0, 100)}" failed: ${String(err).slice(0, 200)}`;
+              const failMsg = `Background work failed: ${String(err).slice(0, 200)}`;
               this.assistant.injectPendingContext(sessionKey, text, failMsg);
-              this._dispatcher?.send(`**[Background work failed]** ${text.slice(0, 100)}: ${String(err).slice(0, 200)}`)
-                .catch(e => logger.debug({ err: e }, 'Failed to push auto-escalation failure to channels'));
+              try {
+                await this.handleMessage(
+                  sessionKey,
+                  `[DEEP_MODE_RESULT] The background task failed: ${failMsg}. Let the user know and suggest next steps. Be brief.`,
+                );
+              } catch {
+                this._dispatcher?.send(`Background task failed: ${failMsg}`)
+                  .catch(e => logger.debug({ err: e }, 'Failed to push failure'));
+              }
             }).finally(() => {
               const s = this.sessions.get(sessionKey);
               if (s?.deepTask?.jobName === jobName) delete s.deepTask;
             });
 
-            // Clean ack: use Phase 1 fragment if it has content, otherwise a fresh message
             const phase1Text = response?.trim() ?? '';
-            let ack: string;
             if (phase1Text.length > 20) {
-              ack = `${phase1Text}\n\nThis needs more work — continuing in the background. I'll check in as I go.`;
-            } else {
-              ack = `Got it — this is going to take a bit. Working on it in the background and I'll check in as I go.`;
+              return `${phase1Text}\n\nThis needs more work — I'll follow up when it's done.`;
             }
-            return ack;
+            return `This is going to take a bit. I'll follow up when it's done.`;
           }
 
           // ── Check if SDK returned an auth error as a "successful" response ──
@@ -878,30 +907,43 @@ export class Gateway {
               undefined,
               undefined,
               1,
-            ).then((result) => {
+            ).then(async (result) => {
               logger.info({ sessionKey, jobName, resultLen: result?.length ?? 0 }, 'Max-turns deep mode completed');
               if (result && result !== '__NOTHING__') {
-                this.assistant.injectPendingContext(sessionKey, text, result);
-                this._dispatcher?.send(`**[Background work complete]** ${text.slice(0, 100)}\n\n${result.slice(0, 1500)}`)
-                  .catch(err => logger.debug({ err }, 'Failed to push max-turns result to channels'));
+                try {
+                  await this.handleMessage(
+                    sessionKey,
+                    `[DEEP_MODE_RESULT] You just completed background work. Summarize conversationally — lead with what matters.\n\nTask: ${text.slice(0, 500)}\n\nResult:\n${result.slice(0, 3000)}`,
+                  );
+                } catch {
+                  this.assistant.injectPendingContext(sessionKey, text, result);
+                  this._dispatcher?.send(`${result.slice(0, 1500)}`)
+                    .catch(err => logger.debug({ err }, 'Failed to push max-turns result'));
+                }
               }
-            }).catch((deepErr) => {
+            }).catch(async (deepErr) => {
               logger.error({ err: deepErr, sessionKey, jobName }, 'Max-turns deep mode failed');
               const failMsg = `Background work failed: ${String(deepErr).slice(0, 200)}`;
               this.assistant.injectPendingContext(sessionKey, text, failMsg);
-              this._dispatcher?.send(`**[Background work failed]** ${text.slice(0, 100)}: ${String(deepErr).slice(0, 200)}`)
-                .catch(e => logger.debug({ err: e }, 'Failed to push max-turns failure to channels'));
+              try {
+                await this.handleMessage(
+                  sessionKey,
+                  `[DEEP_MODE_RESULT] The background task failed: ${failMsg}. Let the user know and suggest next steps. Be brief.`,
+                );
+              } catch {
+                this._dispatcher?.send(`Background task failed: ${failMsg}`)
+                  .catch(e => logger.debug({ err: e }, 'Failed to push failure'));
+              }
             }).finally(() => {
               const s = this.sessions.get(sessionKey);
               if (s?.deepTask?.jobName === jobName) delete s.deepTask;
             });
 
-            // Return whatever was streamed + a continuation message
             const partial = partialResponse?.trim() ?? '';
             if (partial.length > 20) {
-              return `${partial}\n\nI need more time to finish this — continuing in the background.`;
+              return `${partial}\n\nI need more time — I'll follow up when it's done.`;
             }
-            return `This is taking more work than expected — continuing in the background. I'll have results shortly.`;
+            return `This needs more work. I'll follow up when it's done.`;
           }
 
           const errKind = classifyChatError(err);
