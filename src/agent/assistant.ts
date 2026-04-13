@@ -1154,8 +1154,8 @@ For complex tasks spanning multiple files or needing sustained work, propose dee
 
 If you're stuck after reading several files, tell ${owner} what's blocking you. Don't keep reading hoping for a breakthrough.
 
-### Turn Budget Rule
-You have a limited number of turns per message (~15). **After 8-10 tool calls, you MUST stop and deliver what you've found so far**, even if your research is incomplete. A partial answer the user can see is infinitely better than an exhaustive answer that gets cut off. Never spend all your turns reading data — always reserve 2-3 turns for your response.`);
+### Pacing
+You have a cost budget per message — not a hard turn limit. Work until the task is done. For long tasks (10+ tool calls), narrate progress as you go so ${owner} can see you're making headway. If a task needs many database queries, keep result sets small (LIMIT 20) to avoid filling context.`);
     }
 
     // Security rules are now appended to systemPrompt in buildOptions()
@@ -1328,9 +1328,10 @@ You have a limited number of turns per message (~15). **After 8-10 tool calls, y
     const disallowed = isHeartbeat && (!isCron || (cronTier ?? 0) < 2)
       ? getHeartbeatDisallowedTools()
       : [];
-    // Cron jobs default by tier; pure heartbeat (non-cron) gets the low limit
+    // Cron/heartbeat get turn limits. Interactive chat has no turn cap —
+    // cost budget (maxBudgetUsd) is the primary guardrail.
     const effectiveMaxTurns = maxTurns
-      ?? (isCron ? (cronTier === 2 ? 30 : 15) : isHeartbeat ? HEARTBEAT_MAX_TURNS : 30);
+      ?? (isCron ? (cronTier === 2 ? 30 : 15) : isHeartbeat ? HEARTBEAT_MAX_TURNS : undefined);
 
     // Determine security prompt to append to systemPrompt
     // Plan steps are user-initiated — use the interactive security prompt, not cron
@@ -1811,10 +1812,11 @@ You have a limited number of turns per message (~15). **After 8-10 tool calls, y
     const intent = classifyIntent(text, recentExchanges);
     logger.debug({ intent: intent.type, confidence: intent.confidence, strategy: intent.suggestedStrategy }, 'Intent classified');
 
-    // Use intent-suggested maxTurns if caller didn't specify, and confidence is decent
-    const effectiveMaxTurns = maxTurns ?? (intent.confidence >= 0.3 ? intent.suggestedMaxTurns : undefined);
+    // If caller explicitly passed maxTurns (e.g. cron), respect it.
+    // Otherwise let the agent run — cost budget is the primary guardrail.
+    const effectiveMaxTurns = maxTurns;
 
-    const CHAT_TIMEOUT_MS = 10 * 60 * 1000;
+    const CHAT_TIMEOUT_MS = 30 * 60 * 1000;
     const guard = new StallGuard();
 
     let [responseText, sessionId] = await this.runQuery(

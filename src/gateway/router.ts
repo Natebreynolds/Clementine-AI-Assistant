@@ -26,8 +26,9 @@ const logger = pino({ name: 'clementine.gateway' });
 const CHAT_TIMEOUT_MS = 5 * 60 * 1000;
 
 /** Absolute wall-clock cap for interactive chat (30 minutes).
- *  Safety net so no session runs forever, even if active. */
-const CHAT_MAX_WALL_MS = 10 * 60 * 1000;
+ *  Safety net so no session runs forever, even if active.
+ *  Primary guardrail is cost budget (maxBudgetUsd), not this timer. */
+const CHAT_MAX_WALL_MS = 30 * 60 * 1000;
 
 export type ChatErrorKind = 'rate_limit' | 'context_overflow' | 'auth' | 'transient' | 'unknown';
 
@@ -688,24 +689,24 @@ export class Gateway {
             chatAc.abort();
             logger.warn({ sessionKey, wallMs: CHAT_MAX_WALL_MS }, 'Hard wall timeout — returning immediately');
             resolve([
-              'This task hit the 10-minute limit. The work may have partially completed. ' +
-              'Try breaking it into smaller pieces — ask me to handle one file at a time.',
+              'This task hit the 30-minute safety limit. The work may have partially completed. ' +
+              'Let me know if you want me to continue — I\'ll pick up where I left off.',
               '',
             ]);
           }, CHAT_MAX_WALL_MS);
         });
 
         try {
-          // Phase 1: 15 turns for all sessions. If the model needs more, it
-          // auto-escalates to deep mode (background unleashed task).
-          const phase1MaxTurns = maxTurns ?? 15;
-          events.emit('query:start', { sessionKey, model: effectiveModel, maxTurns: phase1MaxTurns, timestamp: Date.now() });
+          // No artificial turn cap — let the agent work until done.
+          // Primary guardrail is cost budget (maxBudgetUsd in buildOptions).
+          // Wall clock (CHAT_MAX_WALL_MS) and StallGuard are safety nets.
+          events.emit('query:start', { sessionKey, model: effectiveModel, maxTurns: maxTurns, timestamp: Date.now() });
           const queryStartMs = Date.now();
           const [response] = await Promise.race([
             this.assistant.chat(
               text,
               effectiveSessionKey,
-              { onText: wrappedOnText, onToolActivity: wrappedOnToolActivity, model: effectiveModel, maxTurns: phase1MaxTurns, securityAnnotation, projectOverride, profile: resolvedProfile, verboseLevel, abortController: chatAc },
+              { onText: wrappedOnText, onToolActivity: wrappedOnToolActivity, model: effectiveModel, maxTurns: maxTurns, securityAnnotation, projectOverride, profile: resolvedProfile, verboseLevel, abortController: chatAc },
             ),
             hardWallPromise,
           ]);
