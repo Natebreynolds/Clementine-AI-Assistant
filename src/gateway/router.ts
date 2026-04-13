@@ -21,9 +21,11 @@ import type { NotificationDispatcher } from './notifications.js';
 
 const logger = pino({ name: 'clementine.gateway' });
 
-/** Idle timeout for interactive chat messages (5 minutes).
- *  Resets on agent activity (text/tool calls). Only kills if truly stuck. */
-const CHAT_TIMEOUT_MS = 5 * 60 * 1000;
+/** Idle timeout for interactive chat messages (10 minutes).
+ *  Resets on agent activity (text/tool calls). Only kills if truly stuck.
+ *  Must be generous enough that slow tool executions (SF CLI, file uploads)
+ *  don't trigger it — the callback only fires at tool *start*, not during. */
+const CHAT_TIMEOUT_MS = 10 * 60 * 1000;
 
 /** Absolute wall-clock cap for interactive chat (30 minutes).
  *  Safety net so no session runs forever, even if active.
