@@ -287,6 +287,7 @@ export interface ParsedTask {
   priority: string;
   due: string;
   project: string;
+  assignee: string;
   recurrence: string;
   tags: string[];
   checked: boolean;
@@ -317,11 +318,13 @@ export function parseTasks(body: string): ParsedTask[] {
     const due = dueMatch ? dueMatch[1] : '';
     const projMatch = /#project:(\S+)/.exec(text);
     const project = projMatch ? projMatch[1] : '';
+    const assigneeMatch = /@assignee:(\S+)/.exec(text);
+    const assignee = assigneeMatch ? assigneeMatch[1] : '';
     const recMatch = /🔁\s*(\S+)/.exec(text);
     const recurrence = recMatch ? recMatch[1] : '';
     const tagMatches = text.match(/#(\S+)/g) ?? [];
     const tags = tagMatches.map(t => t.slice(1)).filter(t => !t.startsWith('project:'));
-    tasks.push({ id: taskId, text, status, priority, due, project, recurrence, tags, checked, indent, rawLine: line, isSubtask: indent.length >= 2 });
+    tasks.push({ id: taskId, text, status, priority, due, project, assignee, recurrence, tags, checked, indent, rawLine: line, isSubtask: indent.length >= 2 });
   }
   return tasks;
 }

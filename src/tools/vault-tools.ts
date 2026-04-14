@@ -81,14 +81,16 @@ ${body}
 
 server.tool(
   'task_list',
-  'List tasks from the master task list. Tasks have IDs like {T-001}.',
+  'List tasks from the master task list. Tasks have IDs like {T-001}. Tasks may have @assignee:agentname tags — use assignee filter to see only tasks for a specific agent.',
   {
     status: z.enum(['all', 'pending', 'completed']).optional().describe('Filter by status'),
     project: z.string().optional().describe('Filter by project tag'),
+    assignee: z.string().optional().describe('Filter by assignee (e.g. "ross-the-sdr", "nora-senior-sdr", "clementine"). Use "unassigned" to see tasks with no assignee.'),
   },
-  async ({ status, project }) => {
+  async ({ status, project, assignee }) => {
     const statusFilter = status ?? 'all';
     const projectFilter = project ?? '';
+    const assigneeFilter = assignee ?? '';
 
     if (!existsSync(TASKS_FILE)) {
       return textResult('No task list found.');
@@ -104,16 +106,29 @@ server.tool(
     if (projectFilter) {
       filtered = filtered.filter(t => t.project.toLowerCase() === projectFilter.toLowerCase());
     }
+    if (assigneeFilter) {
+      if (assigneeFilter === 'unassigned') {
+        filtered = filtered.filter(t => !t.assignee);
+      } else {
+        filtered = filtered.filter(t => t.assignee.toLowerCase() === assigneeFilter.toLowerCase());
+      }
+    }
 
     if (!filtered.length) {
       const parts: string[] = [statusFilter];
       if (projectFilter) parts.push(`project:${projectFilter}`);
+      if (assigneeFilter) parts.push(`assignee:${assigneeFilter}`);
       return textResult(`No tasks matching: ${parts.join(', ')}`);
     }
 
-    const lines = filtered.map(t => t.rawLine);
+    // Annotate each line with assignee if present
+    const lines = filtered.map(t => {
+      const assigneeNote = t.assignee ? ` [assignee: ${t.assignee}]` : '';
+      return t.rawLine + assigneeNote;
+    });
     let header = `**Tasks (${statusFilter})`;
     if (projectFilter) header += `, project:${projectFilter}`;
+    if (assigneeFilter) header += `, assignee:${assigneeFilter}`;
     header += ` — ${filtered.length} results:**`;
 
     return textResult(`${header}\n\n${lines.join('\n')}`);
@@ -125,9 +140,9 @@ server.tool(
 
 server.tool(
   'task_add',
-  'Add a new task to the master task list. Auto-generates a {T-NNN} ID.',
+  'Add a new task to the master task list. Auto-generates a {T-NNN} ID. Include @assignee:agentname in description to assign to a specific agent (e.g. @assignee:ross-the-sdr).',
   {
-    description: z.string().describe('Task description'),
+    description: z.string().describe('Task description. Include @assignee:agentname to assign to a specific agent.'),
     priority: z.enum(['high', 'medium', 'low']).optional().describe('Task priority'),
     due_date: z.string().optional().describe('Due date (YYYY-MM-DD)'),
     project: z.string().optional().describe('Project name'),
