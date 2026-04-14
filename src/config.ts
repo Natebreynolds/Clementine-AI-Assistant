@@ -264,10 +264,10 @@ const SECRET_VALIDATIONS: SecretValidation[] = [
   { key: 'SLACK_APP_TOKEN', channel: 'Slack', requiredWith: ['SLACK_BOT_TOKEN'] },
   { key: 'TELEGRAM_BOT_TOKEN', channel: 'Telegram' },
   { key: 'TWILIO_ACCOUNT_SID', channel: 'WhatsApp', requiredWith: ['TWILIO_AUTH_TOKEN', 'WHATSAPP_OWNER_PHONE'] },
-  // ANTHROPIC_API_KEY is optional — OAuth via `clementine login` is preferred.
-  // SDK subprocess reads keychain auth automatically when neither key is set.
-  { key: 'ANTHROPIC_API_KEY', channel: 'API (optional — use `clementine login` for OAuth)' },
-  { key: 'ANTHROPIC_AUTH_TOKEN', channel: 'API (OAuth — preferred over API key)' },
+  // Auth is optional here — clementine login sets CLAUDE_CODE_OAUTH_TOKEN (preferred).
+  // SDK subprocess reads CLAUDE_CODE_OAUTH_TOKEN > ANTHROPIC_AUTH_TOKEN > ANTHROPIC_API_KEY > Keychain.
+  { key: 'CLAUDE_CODE_OAUTH_TOKEN', channel: 'API (preferred — set via `clementine login`)' },
+  { key: 'ANTHROPIC_API_KEY', channel: 'API (legacy — use `clementine login` for OAuth instead)' },
   { key: 'SF_CLIENT_SECRET', channel: 'Salesforce', requiredWith: ['SF_CLIENT_ID', 'SF_INSTANCE_URL'] },
 ];
 

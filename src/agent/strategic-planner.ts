@@ -67,6 +67,8 @@ function getEnvValue(key: string): string {
 }
 
 function getAnthropicCredentials(): { apiKey?: string; authToken?: string } | null {
+  const oauthToken = getEnvValue('CLAUDE_CODE_OAUTH_TOKEN');
+  if (oauthToken) return { authToken: oauthToken };
   const authToken = getEnvValue('ANTHROPIC_AUTH_TOKEN');
   if (authToken) return { authToken };
   const apiKey = getEnvValue('ANTHROPIC_API_KEY');

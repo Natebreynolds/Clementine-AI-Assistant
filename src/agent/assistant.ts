@@ -260,14 +260,19 @@ function buildSafeEnv(): Record<string, string> {
     SHELL: process.env.SHELL ?? '',
   };
 
-  // Step 2: Auth credentials — ANTHROPIC_AUTH_TOKEN takes priority over ANTHROPIC_API_KEY.
-  // If neither is set the subprocess reads keychain OAuth automatically via HOME.
-  if (process.env.ANTHROPIC_AUTH_TOKEN) {
+  // Step 2: Auth credentials — priority order for the subprocess:
+  //   1. CLAUDE_CODE_OAUTH_TOKEN — long-lived OAuth token from `claude setup-token` (preferred)
+  //   2. ANTHROPIC_AUTH_TOKEN    — OAuth session token (from Keychain auto-read)
+  //   3. ANTHROPIC_API_KEY       — raw API key (legacy)
+  //   4. Keychain OAuth          — read automatically via HOME when none of the above are set
+  if (process.env.CLAUDE_CODE_OAUTH_TOKEN) {
+    sanitized.CLAUDE_CODE_OAUTH_TOKEN = process.env.CLAUDE_CODE_OAUTH_TOKEN;
+  } else if (process.env.ANTHROPIC_AUTH_TOKEN) {
     sanitized.ANTHROPIC_AUTH_TOKEN = process.env.ANTHROPIC_AUTH_TOKEN;
   } else if (process.env.ANTHROPIC_API_KEY) {
     sanitized.ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
   }
-  // When both are absent: HOME lets the subprocess find keychain OAuth — no extra config needed.
+  // When all are absent: HOME lets the subprocess find Keychain OAuth automatically.
 
   // Step 3: Add trusted markers AFTER sanitization
   sanitized.CLEMENTINE_HOME = BASE_DIR;

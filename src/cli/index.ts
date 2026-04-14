@@ -1004,7 +1004,8 @@ program
 program
   .command('login')
   .description('Authenticate with Anthropic and save credentials to ~/.clementine/.env')
-  .action(async () => {
+  .option('--api-key', 'Skip OAuth and use an API key instead')
+  .action(async (opts: { apiKey?: boolean }) => {
     const { default: Anthropic } = await import('@anthropic-ai/sdk');
     const envPath = path.join(BASE_DIR, '.env');
 
@@ -1027,30 +1028,68 @@ program
     };
 
     // Read explicit credentials from .env
+    let oauthToken: string | undefined;
     let authToken: string | undefined;
     let apiKey: string | undefined;
     if (existsSync(envPath)) {
       const content = readFileSync(envPath, 'utf-8');
+      const oauthMatch = content.match(/^CLAUDE_CODE_OAUTH_TOKEN=(.+)$/m);
       const tokenMatch = content.match(/^ANTHROPIC_AUTH_TOKEN=(.+)$/m);
       const keyMatch = content.match(/^ANTHROPIC_API_KEY=(.+)$/m);
+      if (oauthMatch) oauthToken = oauthMatch[1].trim();
       if (tokenMatch) authToken = tokenMatch[1].trim();
       if (keyMatch) apiKey = keyMatch[1].trim();
     }
+    if (!oauthToken) oauthToken = process.env.CLAUDE_CODE_OAUTH_TOKEN;
     if (!authToken) authToken = process.env.ANTHROPIC_AUTH_TOKEN;
     if (!apiKey) apiKey = process.env.ANTHROPIC_API_KEY;
+
+    // ── --api-key flag: skip straight to manual key entry ────────────
+    if (opts.apiKey) {
+      const CONSOLE_URL = 'https://console.anthropic.com/settings/keys';
+      console.log('\n  Opening Anthropic API keys page...');
+      try {
+        const opener = process.platform === 'darwin' ? 'open' : process.platform === 'win32' ? 'start' : 'xdg-open';
+        execSync(`${opener} "${CONSOLE_URL}"`, { stdio: 'ignore' });
+      } catch { /* non-fatal */ }
+      console.log(`  ${CONSOLE_URL}`);
+      console.log('  Paste your API key below and press Enter:\n');
+      process.stdout.write('  Paste key > ');
+      const key = await new Promise<string>((resolve) => {
+        process.stdin.setRawMode?.(false);
+        process.stdin.resume();
+        process.stdin.setEncoding('utf-8');
+        process.stdin.once('data', (chunk) => { process.stdin.pause(); resolve(String(chunk).trim()); });
+      });
+      if (!key) { console.error('\n  No input.\n'); process.exit(1); }
+      process.stdout.write('\n  Verifying...');
+      const isOAuth = key.startsWith('sk-ant-oat') || key.startsWith('sk-ant-rt');
+      const credKey = isOAuth ? 'CLAUDE_CODE_OAUTH_TOKEN' : 'ANTHROPIC_API_KEY';
+      const ok = await testAuth(isOAuth ? { authToken: key } : { apiKey: key });
+      if (!ok) { console.error(' invalid.\n'); process.exit(1); }
+      console.log(' ✓\n');
+      saveToEnv(credKey, key);
+      console.log(`  ✓ Saved ${credKey} to ~/.clementine/.env\n`);
+      return;
+    }
 
     console.log('\nChecking Anthropic authentication...\n');
 
     // Test existing explicit credentials first
+    if (oauthToken) {
+      process.stdout.write(`  CLAUDE_CODE_OAUTH_TOKEN  ${oauthToken.slice(0, 16)}...  `);
+      if (await testAuth({ authToken: oauthToken })) { console.log('✓ valid\n'); return; }
+      console.log('✗ expired');
+    }
     if (authToken) {
-      process.stdout.write(`  ANTHROPIC_AUTH_TOKEN  ${authToken.slice(0, 16)}...  `);
+      process.stdout.write(`  ANTHROPIC_AUTH_TOKEN     ${authToken.slice(0, 16)}...  `);
       if (await testAuth({ authToken })) { console.log('✓ valid\n'); return; }
-      console.log('✗ invalid or expired');
+      console.log('✗ expired');
     }
     if (apiKey) {
-      process.stdout.write(`  ANTHROPIC_API_KEY     ${apiKey.slice(0, 16)}...  `);
+      process.stdout.write(`  ANTHROPIC_API_KEY        ${apiKey.slice(0, 16)}...  `);
       if (await testAuth({ apiKey })) { console.log('✓ valid\n'); return; }
-      console.log('✗ invalid or expired');
+      console.log('✗ expired');
     }
 
     // ── Try to pull token from Claude Code keychain (macOS) ──────────
@@ -1080,53 +1119,49 @@ program
       }
     }
 
-    // ── Offer the two auth paths clearly ─────────────────────────────
-    console.log('\n  How would you like to authenticate?\n');
-    console.log('  A) Claude Code subscription  — install claude.ai/code, log in, then re-run `clementine login`');
-    console.log('  B) Anthropic API key         — opening console now...\n');
+    // ── Generate a long-lived token via claude setup-token ───────────
+    console.log('\n  Generating a long-lived OAuth token via Claude Code...');
+    console.log('  A browser window will open — complete the authorization, then come back here.\n');
 
-    // Open the API keys page for option B
-    const CONSOLE_URL = 'https://console.anthropic.com/settings/keys';
-    try {
-      const opener = process.platform === 'darwin' ? 'open'
-        : process.platform === 'win32' ? 'start'
-        : 'xdg-open';
-      execSync(`${opener} "${CONSOLE_URL}"`, { stdio: 'ignore' });
-    } catch { /* non-fatal */ }
+    // Detect claude binary
+    let claudeBin = 'claude';
+    try { execSync('claude --version', { stdio: 'pipe' }); } catch {
+      console.error('  `claude` not found on PATH.');
+      console.error('  Install Claude Code first: https://claude.ai/code\n');
+      process.exit(1);
+    }
 
-    console.log(`  ${CONSOLE_URL}`);
-    console.log('  Create or copy an API key from the page that just opened,');
-    console.log('  then paste it below. (Ctrl+C to cancel)\n');
-
-    process.stdout.write('  Paste API key > ');
-    const input = await new Promise<string>((resolve) => {
-      process.stdin.setRawMode?.(false);
-      process.stdin.resume();
-      process.stdin.setEncoding('utf-8');
-      process.stdin.once('data', (chunk) => {
-        process.stdin.pause();
-        resolve(String(chunk).trim());
+    const token = await new Promise<string | null>((resolve) => {
+      let output = '';
+      const child = spawn(claudeBin, ['setup-token'], { stdio: ['inherit', 'pipe', 'inherit'] });
+      child.stdout?.on('data', (chunk: Buffer) => {
+        const text = chunk.toString();
+        process.stdout.write(text);
+        output += text;
       });
+      child.on('close', () => {
+        // Token is printed to stdout — extract it
+        const match = output.match(/sk-ant-[A-Za-z0-9_-]+/);
+        resolve(match ? match[0] : null);
+      });
+      child.on('error', () => resolve(null));
     });
 
-    if (!input) {
-      console.error('\n  No input. Exiting.\n');
+    if (!token) {
+      console.error('\n  Could not extract token from output. Try again or use an API key:\n');
+      console.error('  clementine login --api-key\n');
       process.exit(1);
     }
 
-    const isAuthToken = input.startsWith('sk-ant-oat') || input.startsWith('sk-ant-rt');
-    const credKey = isAuthToken ? 'ANTHROPIC_AUTH_TOKEN' : 'ANTHROPIC_API_KEY';
-    const testOpts = isAuthToken ? { authToken: input } : { apiKey: input };
-
-    process.stdout.write('\n  Verifying...');
-    if (!await testAuth(testOpts)) {
-      console.error(' invalid. Check the key and try again.\n');
+    console.log('\n  Verifying token...');
+    if (!await testAuth({ authToken: token })) {
+      console.error('  Token verification failed. Try again.\n');
       process.exit(1);
     }
-    console.log(' ✓\n');
 
-    saveToEnv(credKey, input);
-    console.log(`  ✓ Saved to ~/.clementine/.env`);
+    saveToEnv('CLAUDE_CODE_OAUTH_TOKEN', token);
+    console.log('  ✓ Saved CLAUDE_CODE_OAUTH_TOKEN to ~/.clementine/.env');
+    console.log('  This token is valid for one year and uses your Claude subscription.\n');
     console.log('  Run `clementine launch` to start the daemon.\n');
   });
 
@@ -1136,16 +1171,20 @@ program
   .action(async () => {
     const { default: Anthropic } = await import('@anthropic-ai/sdk');
     const envPath = path.join(BASE_DIR, '.env');
+    let oauthToken: string | undefined;
     let authToken: string | undefined;
     let apiKey: string | undefined;
 
     if (existsSync(envPath)) {
       const content = readFileSync(envPath, 'utf-8');
+      const oauthMatch = content.match(/^CLAUDE_CODE_OAUTH_TOKEN=(.+)$/m);
       const tokenMatch = content.match(/^ANTHROPIC_AUTH_TOKEN=(.+)$/m);
       const keyMatch = content.match(/^ANTHROPIC_API_KEY=(.+)$/m);
+      if (oauthMatch) oauthToken = oauthMatch[1].trim();
       if (tokenMatch) authToken = tokenMatch[1].trim();
       if (keyMatch) apiKey = keyMatch[1].trim();
     }
+    if (!oauthToken) oauthToken = process.env.CLAUDE_CODE_OAUTH_TOKEN;
     if (!authToken) authToken = process.env.ANTHROPIC_AUTH_TOKEN;
     if (!apiKey) apiKey = process.env.ANTHROPIC_API_KEY;
 
@@ -1162,24 +1201,26 @@ program
     console.log('\nClementine Auth Status');
     console.log('──────────────────────');
 
+    if (oauthToken) {
+      process.stdout.write(`  CLAUDE_CODE_OAUTH_TOKEN  ${oauthToken.slice(0, 16)}...  `);
+      console.log(await testAuth({ authToken: oauthToken }) ? '✓ valid (1-year subscription token)' : '✗ expired');
+    }
     if (authToken) {
-      process.stdout.write(`ANTHROPIC_AUTH_TOKEN  ${authToken.slice(0, 16)}...  testing... `);
-      const ok = await testAuth({ authToken });
-      console.log(ok ? '✓ valid' : '✗ invalid');
+      process.stdout.write(`  ANTHROPIC_AUTH_TOKEN     ${authToken.slice(0, 16)}...  `);
+      console.log(await testAuth({ authToken }) ? '✓ valid' : '✗ expired');
     }
     if (apiKey) {
-      process.stdout.write(`ANTHROPIC_API_KEY     ${apiKey.slice(0, 16)}...  testing... `);
-      const ok = await testAuth({ apiKey });
-      console.log(ok ? '✓ valid' : '✗ invalid (expired or revoked)');
+      process.stdout.write(`  ANTHROPIC_API_KEY        ${apiKey.slice(0, 16)}...  `);
+      console.log(await testAuth({ apiKey }) ? '✓ valid' : '✗ expired or revoked');
     }
-    if (!authToken && !apiKey) {
-      console.log('No explicit credentials in ~/.clementine/.env');
-      console.log('The daemon subprocess reads auth from the macOS Keychain automatically');
-      console.log('when Claude Code is installed and logged in on this machine.');
+    if (!oauthToken && !authToken && !apiKey) {
+      console.log('  No explicit credentials in ~/.clementine/.env');
+      console.log('  Daemon subprocess reads from macOS Keychain if Claude Code is installed.\n');
+      console.log('  Run `clementine login` to set up credentials.');
     }
 
-    console.log('\n  To add credentials: clementine login');
-    console.log('  Docs: console.anthropic.com → API Keys\n');
+    console.log('\n  To refresh: clementine login');
+    console.log('  API key only: clementine login --api-key\n');
   });
 
 program
