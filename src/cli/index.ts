@@ -1153,16 +1153,13 @@ program
       process.exit(1);
     }
 
-    console.log('\n  Verifying token...');
-    if (!await testAuth({ authToken: token })) {
-      console.error('  Token verification failed. Try again.\n');
-      process.exit(1);
-    }
-
+    // CLAUDE_CODE_OAUTH_TOKEN is only usable by the Claude Code subprocess —
+    // not by the raw @anthropic-ai/sdk client. Trust that claude setup-token
+    // already verified it during the OAuth flow; just save it directly.
     saveToEnv('CLAUDE_CODE_OAUTH_TOKEN', token);
-    console.log('  ✓ Saved CLAUDE_CODE_OAUTH_TOKEN to ~/.clementine/.env');
-    console.log('  This token is valid for one year and uses your Claude subscription.\n');
-    console.log('  Run `clementine launch` to start the daemon.\n');
+    console.log('\n  ✓ Saved CLAUDE_CODE_OAUTH_TOKEN to ~/.clementine/.env');
+    console.log('  This token is valid for one year and uses your Claude subscription.');
+    console.log('  Run `clementine rebuild` to restart the daemon with the new token.\n');
   });
 
 program
@@ -1202,8 +1199,9 @@ program
     console.log('──────────────────────');
 
     if (oauthToken) {
-      process.stdout.write(`  CLAUDE_CODE_OAUTH_TOKEN  ${oauthToken.slice(0, 16)}...  `);
-      console.log(await testAuth({ authToken: oauthToken }) ? '✓ valid (1-year subscription token)' : '✗ expired');
+      // CLAUDE_CODE_OAUTH_TOKEN is only valid for the SDK subprocess, not the raw API client.
+      // Just confirm it's present — the daemon will surface auth errors if it's actually expired.
+      console.log(`  CLAUDE_CODE_OAUTH_TOKEN  ${oauthToken.slice(0, 16)}...  ✓ set (1-year subscription token)`);
     }
     if (authToken) {
       process.stdout.write(`  ANTHROPIC_AUTH_TOKEN     ${authToken.slice(0, 16)}...  `);
