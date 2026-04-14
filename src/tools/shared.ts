@@ -143,6 +143,31 @@ export function getStoreSync(): MemoryStoreType | null {
 const _rawAgentSlug = process.env.CLEMENTINE_TEAM_AGENT || null;
 export const ACTIVE_AGENT_SLUG: string | null = _rawAgentSlug === 'clementine' ? null : _rawAgentSlug;
 
+// ── Agent-aware path helpers ───────────────────────────────────────────
+
+// GOALS_DIR is defined in config.ts but not in shared.ts — define it here
+export const GOALS_DIR = path.join(BASE_DIR, 'goals');
+
+export function agentTasksFile(slug: string | null): string {
+  if (!slug) return TASKS_FILE;
+  return path.join(AGENTS_DIR, slug, 'TASKS.md');
+}
+
+export function agentWorkingMemoryFile(slug: string | null): string {
+  if (!slug) return WORKING_MEMORY_FILE;
+  return path.join(AGENTS_DIR, slug, 'working-memory.md');
+}
+
+export function agentGoalsDir(slug: string | null): string {
+  if (!slug) return GOALS_DIR;
+  return path.join(AGENTS_DIR, slug, 'goals');
+}
+
+export function agentDailyNotesDir(slug: string | null): string {
+  if (!slug) return DAILY_NOTES_DIR;
+  return path.join(AGENTS_DIR, slug, 'daily-notes');
+}
+
 // ── Date/Time helpers ───────────────────────────────���──────────────────
 
 export function todayStr(): string {

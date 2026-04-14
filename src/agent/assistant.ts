@@ -54,7 +54,6 @@ import {
   HANDOFFS_DIR,
   BUDGET,
   ENABLE_1M_CONTEXT,
-  WORKING_MEMORY_FILE,
   IDENTITY_FILE,
   CLAUDE_CODE_OAUTH_TOKEN,
   ANTHROPIC_API_KEY as CONFIG_ANTHROPIC_API_KEY,
@@ -75,6 +74,7 @@ import {
   setInteractionSource,
 } from './hooks.js';
 import { scanner } from '../security/scanner.js';
+import { agentWorkingMemoryFile } from '../tools/shared.js';
 import { AgentManager } from './agent-manager.js';
 import { extractLinks } from './link-extractor.js';
 import { StallGuard } from './stall-guard.js';
@@ -838,9 +838,10 @@ export class PersonalAssistant {
       );
     } else {
       // Fallback: inject working memory + MEMORY.md directly when no retrieval context
-      if (fs.existsSync(WORKING_MEMORY_FILE)) {
+      const _wmFileFallback = agentWorkingMemoryFile(profile?.slug ?? null);
+      if (fs.existsSync(_wmFileFallback)) {
         try {
-          const wmContent = fs.readFileSync(WORKING_MEMORY_FILE, 'utf-8').trim();
+          const wmContent = fs.readFileSync(_wmFileFallback, 'utf-8').trim();
           if (wmContent) {
             const truncated = isAutonomous ? wmContent.slice(0, 1500) : wmContent;
             parts.push(`## Working Memory (scratchpad)\n\n${truncated}`);
@@ -1591,7 +1592,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
       const assembled = await assembleContext({
         totalBudget: SYSTEM_PROMPT_MAX_CONTEXT_CHARS,
         identityPath: IDENTITY_FILE,
-        workingMemoryPath: WORKING_MEMORY_FILE,
+        workingMemoryPath: agentWorkingMemoryFile(agentSlug ?? null),
         memoryResults: results,
         skillContext,
         graphContext,
@@ -2401,8 +2402,12 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
 
     // Write to working memory so the next session picks it up via system prompt
     try {
-      const existing = fs.existsSync(WORKING_MEMORY_FILE)
-        ? fs.readFileSync(WORKING_MEMORY_FILE, 'utf-8')
+      const compactionAgentSlug = sessionKey.includes(':agent:')
+        ? (sessionKey.split(':agent:')[1]?.split(':')[0] ?? null)
+        : null;
+      const compactionWmFile = agentWorkingMemoryFile(compactionAgentSlug);
+      const existing = fs.existsSync(compactionWmFile)
+        ? fs.readFileSync(compactionWmFile, 'utf-8')
         : '';
 
       // Replace any prior compaction block, or append
@@ -2411,7 +2416,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
         ? existing.replace(compactionRegex, compactionBlock)
         : existing.trimEnd() + '\n\n' + compactionBlock;
 
-      fs.writeFileSync(WORKING_MEMORY_FILE, updated);
+      fs.writeFileSync(compactionWmFile, updated);
     } catch {
       // If working memory write fails, still rotate — better than hitting the hard limit
     }

@@ -33,6 +33,8 @@ import type { RemoteAccessConfig } from '../types.js';
 import { AgentManager } from '../agent/agent-manager.js';
 import { discoverMcpServers, getClaudeIntegrations } from '../agent/mcp-bridge.js';
 import { AGENTS_DIR } from '../config.js';
+import { parseTasks } from '../tools/shared.js';
+import { todayISO } from '../gateway/cron-scheduler.js';
 import { goalsRouter } from './routes/goals.js';
 import { delegationsRouter } from './routes/delegations.js';
 import { workflowsRouter } from './routes/workflows.js';
@@ -4873,6 +4875,133 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
     }
   });
 
+  // ── Agent detail endpoint ─────────────────────────────────────────────
+
+  app.get('/api/agents/:slug/detail', (req, res) => {
+    const { slug } = req.params;
+    const agentDir = path.join(AGENTS_DIR, slug);
+    if (!existsSync(agentDir)) return res.json({ error: 'Agent not found' });
+
+    const result: Record<string, unknown> = { slug };
+
+    // Tasks
+    const tasksFile = path.join(agentDir, 'TASKS.md');
+    if (existsSync(tasksFile)) {
+      const body = readFileSync(tasksFile, 'utf-8');
+      const tasks = parseTasks(body);
+      result.tasks = {
+        pending: tasks.filter(t => t.status === 'pending').length,
+        inProgress: tasks.filter(t => t.status === 'in-progress').length,
+        completed: tasks.filter(t => t.status === 'completed').length,
+        overdue: tasks.filter(t => t.status === 'pending' && t.due && t.due < todayISO()).length,
+        recent: tasks.filter(t => t.status === 'pending').slice(0, 5),
+      };
+    }
+
+    // Goals
+    const goalsDir = path.join(agentDir, 'goals');
+    if (existsSync(goalsDir)) {
+      const goalFiles = readdirSync(goalsDir).filter(f => f.endsWith('.json'));
+      result.goals = goalFiles
+        .map(f => { try { return JSON.parse(readFileSync(path.join(goalsDir, f), 'utf-8')); } catch { return null; } })
+        .filter(Boolean);
+    }
+
+    // Recent daily notes (last 7 days)
+    const dailyDir = path.join(agentDir, 'daily-notes');
+    if (existsSync(dailyDir)) {
+      const notes = readdirSync(dailyDir).filter(f => f.endsWith('.md')).sort().reverse().slice(0, 7);
+      result.dailyNotes = notes.map(f => ({
+        date: f.replace('.md', ''),
+        content: (() => { try { return readFileSync(path.join(dailyDir, f), 'utf-8'); } catch { return ''; } })(),
+      }));
+    }
+
+    // Working memory
+    const wmFile = path.join(agentDir, 'working-memory.md');
+    if (existsSync(wmFile)) {
+      try { result.workingMemory = readFileSync(wmFile, 'utf-8'); } catch {}
+    }
+
+    res.json(result);
+  });
+
+  // ── Team status endpoint ──────────────────────────────────────────────
+
+  app.get('/api/team/status', (_req, res) => {
+    if (!existsSync(AGENTS_DIR)) return res.json({ agents: [] });
+
+    const slugs = readdirSync(AGENTS_DIR, { withFileTypes: true })
+      .filter(d => d.isDirectory())
+      .map(d => d.name);
+
+    const agents = slugs.map(slug => {
+      const agentDir = path.join(AGENTS_DIR, slug);
+      const result: Record<string, unknown> = { slug };
+
+      // Name from agent.md
+      const agentMdPath = path.join(agentDir, 'agent.md');
+      if (existsSync(agentMdPath)) {
+        try {
+          const parsed = matter(readFileSync(agentMdPath, 'utf-8'));
+          result.name = parsed.data.name ?? slug;
+          result.description = parsed.data.description ?? '';
+          result.avatar = parsed.data.avatar ?? null;
+        } catch {}
+      }
+
+      // Tasks
+      const tasksFile = path.join(agentDir, 'TASKS.md');
+      if (existsSync(tasksFile)) {
+        const body = readFileSync(tasksFile, 'utf-8');
+        const tasks = parseTasks(body);
+        result.tasks = {
+          pending: tasks.filter(t => t.status === 'pending').length,
+          inProgress: tasks.filter(t => t.status === 'in-progress').length,
+          overdue: tasks.filter(t => t.status === 'pending' && t.due && t.due < todayISO()).length,
+        };
+      }
+
+      // Active goals count
+      const goalsDir = path.join(agentDir, 'goals');
+      if (existsSync(goalsDir)) {
+        const goalFiles = readdirSync(goalsDir).filter(f => f.endsWith('.json'));
+        const activeGoals = goalFiles
+          .map(f => { try { return JSON.parse(readFileSync(path.join(goalsDir, f), 'utf-8')); } catch { return null; } })
+          .filter((g): g is NonNullable<typeof g> => g !== null && g.status === 'active');
+        result.activeGoals = activeGoals.length;
+        result.firstGoalTitle = activeGoals[0]?.title ?? null;
+      }
+
+      // Most recent daily note
+      const dailyDir = path.join(agentDir, 'daily-notes');
+      if (existsSync(dailyDir)) {
+        const notes = readdirSync(dailyDir).filter(f => f.endsWith('.md')).sort().reverse();
+        if (notes.length > 0) {
+          result.lastNoteDate = notes[0].replace('.md', '');
+          try {
+            const noteContent = readFileSync(path.join(dailyDir, notes[0]), 'utf-8');
+            const lines = noteContent.split('\n').filter(l => l.trim() && !l.startsWith('#'));
+            result.lastNoteSnippet = lines[0]?.slice(0, 150) ?? '';
+          } catch {}
+        }
+      }
+
+      // Working memory snippet
+      const wmFile = path.join(agentDir, 'working-memory.md');
+      if (existsSync(wmFile)) {
+        try {
+          const wm = readFileSync(wmFile, 'utf-8');
+          result.workingMemorySnippet = wm.split('\n').filter(l => l.trim()).slice(0, 3).join(' ').slice(0, 200);
+        } catch {}
+      }
+
+      return result;
+    });
+
+    res.json({ agents });
+  });
+
   /** Bulk lead import — accepts CSV data, creates leads, optionally enrolls in sequence. */
   app.post('/api/leads/import', async (req, res) => {
     const { data, agentSlug, source, sequenceName } = req.body;
@@ -8578,6 +8707,9 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
     </div>
     <div class="nav-section">
       <div class="nav-section-title">Insights</div>
+      <div class="nav-item" data-page="team-status">
+        <span class="nav-icon">&#128202;</span> Team Status
+      </div>
       <div class="nav-item" data-page="intelligence">
         <span class="nav-icon">&#129504;</span> Intelligence
       </div>
@@ -8886,6 +9018,68 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
           <div id="advisor-analytics-content"><div class="empty-state">Loading analytics...</div></div>
         </div>
       </div>
+    </div>
+
+    <!-- ═══ Team Status Page ═══ -->
+    <div class="page" id="page-team-status">
+      <div class="page-title">Team Status</div>
+      <div id="team-status-grid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:16px;margin-top:16px"></div>
+      <script>
+        (function() {
+          function renderTeamStatus() {
+            fetch('/api/team/status').then(r => r.json()).then(data => {
+              const grid = document.getElementById('team-status-grid');
+              if (!grid) return;
+              if (!data.agents || data.agents.length === 0) {
+                grid.innerHTML = '<div class="empty-state">No agents found. Create an agent to get started.</div>';
+                return;
+              }
+              grid.innerHTML = data.agents.map(a => {
+                const avatarLetter = (a.name || a.slug || '?').charAt(0).toUpperCase();
+                const tasksHtml = a.tasks
+                  ? '<div style="margin:4px 0"><span style="font-size:12px;color:var(--text-secondary)">Tasks: </span>' +
+                    '<strong>' + (a.tasks.pending || 0) + ' pending</strong>' +
+                    (a.tasks.overdue > 0 ? ' <span style="color:#ef4444;font-weight:600">' + a.tasks.overdue + ' overdue</span>' : '') +
+                    '</div>'
+                  : '';
+                const goalsHtml = a.activeGoals > 0
+                  ? '<div style="margin:4px 0;font-size:12px"><span style="color:var(--text-secondary)">Goals: </span>' +
+                    '<strong>' + a.activeGoals + ' active</strong>' +
+                    (a.firstGoalTitle ? ' — ' + a.firstGoalTitle.slice(0, 60) : '') +
+                    '</div>'
+                  : '';
+                const noteHtml = a.lastNoteDate
+                  ? '<div style="margin:4px 0;font-size:12px;color:var(--text-secondary)">Last log: ' + a.lastNoteDate +
+                    (a.lastNoteSnippet ? ' — ' + a.lastNoteSnippet.slice(0, 100) : '') + '</div>'
+                  : '';
+                const wmHtml = a.workingMemorySnippet
+                  ? '<div style="margin-top:8px;padding:8px;background:var(--bg-input);border-radius:6px;font-size:11px;color:var(--text-secondary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + a.workingMemorySnippet + '</div>'
+                  : '';
+                return '<div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:16px;cursor:pointer" onclick="showPage(\'team\');setTimeout(()=>selectAgent(\''+a.slug+'\'),100)">' +
+                  '<div style="display:flex;align-items:center;gap:10px;margin-bottom:10px">' +
+                  '<div style="width:40px;height:40px;border-radius:50%;background:var(--clementine);color:#fff;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:18px">' + avatarLetter + '</div>' +
+                  '<div><div style="font-weight:600">' + (a.name || a.slug) + '</div>' +
+                  '<div style="font-size:11px;color:var(--text-secondary)">' + (a.description || a.slug) + '</div></div>' +
+                  '</div>' +
+                  tasksHtml + goalsHtml + noteHtml + wmHtml +
+                  '</div>';
+              }).join('');
+            }).catch(() => {
+              const grid = document.getElementById('team-status-grid');
+              if (grid) grid.innerHTML = '<div class="empty-state">Failed to load team status.</div>';
+            });
+          }
+          // Render when page becomes visible
+          document.addEventListener('DOMContentLoaded', () => {
+            const obs = new MutationObserver(() => {
+              const page = document.getElementById('page-team-status');
+              if (page && page.classList.contains('active')) renderTeamStatus();
+            });
+            const content = document.querySelector('.content');
+            if (content) obs.observe(content, { subtree: true, attributes: true, attributeFilter: ['class'] });
+          });
+        })();
+      </script>
     </div>
 
     <!-- ═══ Intelligence Page (merged: Search + Knowledge Graph + Memory) ═══ -->

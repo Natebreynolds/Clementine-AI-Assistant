@@ -10,10 +10,10 @@ import path from 'node:path';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import {
-  BASE_DIR, DAILY_NOTES_DIR, INBOX_DIR, MEMORY_FILE, PEOPLE_DIR,
+  ACTIVE_AGENT_SLUG, BASE_DIR, DAILY_NOTES_DIR, INBOX_DIR, MEMORY_FILE, PEOPLE_DIR,
   PROJECTS_DIR, SYSTEM_DIR, TASKS_DIR, TASKS_FILE, TEMPLATES_DIR,
   TOPICS_DIR, VAULT_DIR,
-  TASK_ID_RE, ensureDailyNote, folderForType, getStore, globMd, incrementalSync,
+  TASK_ID_RE, agentTasksFile, agentDailyNotesDir, ensureDailyNote, folderForType, getStore, globMd, incrementalSync,
   nextDueDate, nextTaskId, nowTime, parseTasks, textResult,
   timeOfDaySection, todayStr, validateVaultPath,
 } from './shared.js';
@@ -92,11 +92,12 @@ server.tool(
     const projectFilter = project ?? '';
     const assigneeFilter = assignee ?? '';
 
-    if (!existsSync(TASKS_FILE)) {
+    const tasksFilePath = agentTasksFile(ACTIVE_AGENT_SLUG);
+    if (!existsSync(tasksFilePath)) {
       return textResult('No task list found.');
     }
 
-    const body = readFileSync(TASKS_FILE, 'utf-8');
+    const body = readFileSync(tasksFilePath, 'utf-8');
     const allTasks = parseTasks(body);
     let filtered = allTasks;
 
@@ -164,23 +165,13 @@ server.tool(
       } catch { /* dedup failure is non-fatal */ }
     }
 
-    if (!existsSync(TASKS_FILE)) {
-      mkdirSync(TASKS_DIR, { recursive: true });
-      writeFileSync(TASKS_FILE, `---
-type: tasks
----
-
-# Tasks
-
-## Pending
-
-## In Progress
-
-## Completed
-`, 'utf-8');
+    const tasksFilePath = agentTasksFile(ACTIVE_AGENT_SLUG);
+    if (!existsSync(tasksFilePath)) {
+      mkdirSync(path.dirname(tasksFilePath), { recursive: true });
+      writeFileSync(tasksFilePath, `---\ntype: task-list\ntags:\n  - tasks\n---\n\n# Tasks\n\n## Pending\n\n## In Progress\n\n## Completed\n`, 'utf-8');
     }
 
-    let body = readFileSync(TASKS_FILE, 'utf-8');
+    let body = readFileSync(tasksFilePath, 'utf-8');
     const taskId = nextTaskId(body);
 
     // Build metadata suffix
@@ -205,8 +196,8 @@ type: tasks
       body += `\n## Pending\n\n${taskLine}\n`;
     }
 
-    writeFileSync(TASKS_FILE, body, 'utf-8');
-    const rel = path.relative(VAULT_DIR, TASKS_FILE);
+    writeFileSync(tasksFilePath, body, 'utf-8');
+    const rel = path.relative(VAULT_DIR, tasksFilePath);
     await incrementalSync(rel);
     return textResult(`Added task {${taskId}}: ${description}`);
   },
@@ -226,11 +217,12 @@ server.tool(
     due_date: z.string().optional().describe('New due date (YYYY-MM-DD)'),
   },
   async ({ task_id, status, description: _newDesc, priority: newPriority, due_date: newDue }) => {
-    if (!existsSync(TASKS_FILE)) {
+    const tasksFilePath = agentTasksFile(ACTIVE_AGENT_SLUG);
+    if (!existsSync(tasksFilePath)) {
       return textResult('No task list found.');
     }
 
-    let body = readFileSync(TASKS_FILE, 'utf-8');
+    let body = readFileSync(tasksFilePath, 'utf-8');
     const lines = body.split('\n');
 
     // Normalize task ID
@@ -333,8 +325,8 @@ server.tool(
       recurringMsg = ` | Next occurrence {${newId}} due ${nextDue}`;
     }
 
-    writeFileSync(TASKS_FILE, body, 'utf-8');
-    const rel = path.relative(VAULT_DIR, TASKS_FILE);
+    writeFileSync(tasksFilePath, body, 'utf-8');
+    const rel = path.relative(VAULT_DIR, tasksFilePath);
     await incrementalSync(rel);
     return textResult(`Moved to ${newStatus}: ${task_id}${recurringMsg}`);
   },
@@ -541,6 +533,36 @@ server.tool(
     const rel = path.relative(VAULT_DIR, dailyPath);
     await incrementalSync(rel);
     return textResult(`Noted in ${path.basename(dailyPath)} > ${section}`);
+  },
+);
+
+
+// ── agent_daily_note ───────────────────────────────────────────────────
+
+server.tool(
+  'agent_daily_note',
+  'Write an entry to today\'s daily note. When running as a team agent, writes to their own daily notes directory. Use this to log completed work, observations, and status updates.',
+  {
+    content: z.string().describe('Content to append to today\'s daily note'),
+    replace: z.boolean().optional().describe('If true, replace today\'s note entirely instead of appending'),
+  },
+  async ({ content, replace }) => {
+    const { todayISO } = await import('../gateway/cron-scheduler.js');
+    const notesDir = agentDailyNotesDir(ACTIVE_AGENT_SLUG);
+    if (!existsSync(notesDir)) mkdirSync(notesDir, { recursive: true });
+
+    const today = todayISO();
+    const notePath = path.join(notesDir, `${today}.md`);
+    const timestamp = new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
+
+    if (replace || !existsSync(notePath)) {
+      writeFileSync(notePath, `# Daily Log — ${today}\n\n${content}\n`);
+    } else {
+      const existing = readFileSync(notePath, 'utf-8');
+      writeFileSync(notePath, `${existing.trimEnd()}\n\n**${timestamp}:** ${content}\n`);
+    }
+
+    return textResult(`Daily note updated for ${today}.`);
   },
 );
 

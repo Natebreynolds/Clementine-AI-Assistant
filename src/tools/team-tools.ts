@@ -9,8 +9,9 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import {
   ACTIVE_AGENT_SLUG, AGENTS_DIR, BASE_DIR, DELEGATIONS_BASE,
-  PROFILES_DIR, TEAM_COMMS_LOG, env, logger, textResult,
+  PROFILES_DIR, TEAM_COMMS_LOG, env, logger, parseTasks, textResult,
 } from './shared.js';
+import { todayISO } from '../gateway/cron-scheduler.js';
 
 // ── Helpers ─────────────────────────────────────────────────────────────
 
@@ -245,6 +246,25 @@ export function registerTeamTools(server: McpServer): void {
       const body = personality || `You are ${name}. ${description}`;
       const matterMod = await import('gray-matter');
       writeFileSync(path.join(agentDir, 'agent.md'), matterMod.default.stringify(body, frontmatter));
+
+      // Scaffold per-agent context files
+      const tasksFile = path.join(agentDir, 'TASKS.md');
+      if (!existsSync(tasksFile)) {
+        writeFileSync(tasksFile, `---\ntype: task-list\ntags:\n  - tasks\n---\n\n# Tasks\n\n## Pending\n\n## In Progress\n\n## Completed\n`);
+      }
+      const wmFile = path.join(agentDir, 'working-memory.md');
+      if (!existsSync(wmFile)) {
+        writeFileSync(wmFile, `# Working Memory\n\n*Scratchpad for ${name}. Updated during runs and conversations.*\n`);
+      }
+      const goalsDir = path.join(agentDir, 'goals');
+      if (!existsSync(goalsDir)) mkdirSync(goalsDir, { recursive: true });
+      const dailyNotesDir = path.join(agentDir, 'daily-notes');
+      if (!existsSync(dailyNotesDir)) mkdirSync(dailyNotesDir, { recursive: true });
+      const cronFile = path.join(agentDir, 'CRON.md');
+      if (!existsSync(cronFile)) {
+        writeFileSync(cronFile, `---\ntype: cron-config\njobs: []\n---\n\n# Cron Jobs\n\n*No scheduled jobs yet.*\n`);
+      }
+
       return textResult(`Created agent '${name}' (${slug}).${channel_name ? ` Channel: #${channel_name}` : ''}${project ? ` Project: ${project}` : ''}`);
     },
   );
@@ -345,6 +365,105 @@ export function registerTeamTools(server: McpServer): void {
         return textResult(`Delegations for ${agent} (${delegations.length}):\n${lines.join('\n')}`);
       }
       return textResult('Provide "id" or "agent" parameter.');
+    },
+  );
+
+  // ── Team Status ────────────────────────────────────────────────────
+
+  server.tool(
+    'team_status',
+    'Get a summary of all team agents: their recent daily notes, pending tasks count, and active goals. Use this for morning briefings and cross-agent coordination.',
+    {
+      agent: z.string().optional().describe('Specific agent slug to check. If omitted, returns all agents.'),
+      include_tasks: z.boolean().optional().describe('Include pending task count (default true)'),
+      include_goals: z.boolean().optional().describe('Include active goals (default true)'),
+      include_daily_notes: z.boolean().optional().describe('Include last 3 days of daily notes (default true)'),
+    },
+    async ({ agent, include_tasks = true, include_goals = true, include_daily_notes = true }) => {
+      const agentsBase = AGENTS_DIR;
+      if (!existsSync(agentsBase)) return textResult('No agents found.');
+
+      const agentSlugs = readdirSync(agentsBase, { withFileTypes: true })
+        .filter(d => d.isDirectory())
+        .map(d => d.name)
+        .filter(n => !agent || n === agent);
+
+      if (!agentSlugs.length) return textResult('No agents found.');
+
+      const matterMod = await import('gray-matter');
+      const parts: string[] = ['# Team Status\n'];
+
+      for (const slug of agentSlugs) {
+        const agentDir = path.join(agentsBase, slug);
+        const agentMdPath = path.join(agentDir, 'agent.md');
+        let agentName = slug;
+        try {
+          const raw = readFileSync(agentMdPath, 'utf-8');
+          const parsed = matterMod.default(raw);
+          agentName = parsed.data.name ?? slug;
+        } catch {}
+
+        parts.push(`## ${agentName} (${slug})`);
+
+        // Tasks
+        if (include_tasks) {
+          const tasksFile = path.join(agentDir, 'TASKS.md');
+          if (existsSync(tasksFile)) {
+            const body = readFileSync(tasksFile, 'utf-8');
+            const tasks = parseTasks(body);
+            const pending = tasks.filter(t => t.status === 'pending');
+            const overdue = pending.filter(t => t.due && t.due < todayISO());
+            parts.push(`**Tasks:** ${pending.length} pending${overdue.length > 0 ? `, ${overdue.length} overdue` : ''}`);
+            if (pending.length > 0) {
+              parts.push(pending.slice(0, 3).map(t => `  - ${t.text.slice(0, 100)}`).join('\n'));
+            }
+          } else {
+            parts.push('**Tasks:** No task file yet');
+          }
+        }
+
+        // Goals
+        if (include_goals) {
+          const goalsDir = path.join(agentDir, 'goals');
+          if (existsSync(goalsDir)) {
+            const goalFiles = readdirSync(goalsDir).filter(f => f.endsWith('.json'));
+            const activeGoals = goalFiles
+              .map(f => { try { return JSON.parse(readFileSync(path.join(goalsDir, f), 'utf-8')); } catch { return null; } })
+              .filter((g): g is NonNullable<typeof g> => g !== null && g.status === 'active');
+            if (activeGoals.length > 0) {
+              parts.push(`**Goals (${activeGoals.length} active):**`);
+              for (const g of activeGoals.slice(0, 3)) {
+                const progress = g.progress ? ` — ${g.progress}` : '';
+                parts.push(`  - ${g.title}${progress}`);
+              }
+            }
+          }
+        }
+
+        // Daily notes
+        if (include_daily_notes) {
+          const dailyDir = path.join(agentDir, 'daily-notes');
+          if (existsSync(dailyDir)) {
+            const notes = readdirSync(dailyDir)
+              .filter(f => f.endsWith('.md'))
+              .sort().reverse().slice(0, 3);
+            if (notes.length > 0) {
+              parts.push('**Recent Activity:**');
+              for (const note of notes) {
+                try {
+                  const content = readFileSync(path.join(dailyDir, note), 'utf-8');
+                  const lines = content.split('\n').filter(l => l.trim() && !l.startsWith('#')).slice(0, 3);
+                  parts.push(`  ${note.replace('.md', '')}: ${lines[0]?.slice(0, 120) ?? '(empty)'}`);
+                } catch {}
+              }
+            }
+          }
+        }
+
+        parts.push('');
+      }
+
+      return textResult(parts.join('\n'));
     },
   );
 }

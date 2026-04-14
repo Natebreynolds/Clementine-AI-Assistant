@@ -12,7 +12,8 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import {
   ACTIVE_AGENT_SLUG, BASE_DIR, IDENTITY_FILE, MEMORY_FILE, SYSTEM_DIR,
-  VAULT_DIR, WORKING_MEMORY_FILE, WORKING_MEMORY_MAX_LINES,
+  VAULT_DIR, WORKING_MEMORY_MAX_LINES,
+  agentWorkingMemoryFile,
   ensureDailyNote, getStore, globMd, incrementalSync, logger, nowTime,
   resolvePath, textResult, todayStr, validateVaultPath,
 } from './shared.js';
@@ -80,12 +81,13 @@ server.tool(
     content: z.string().optional().describe('Text to append or replace with (required for append/replace)'),
   },
   async ({ action, content }) => {
+    const wmFile = agentWorkingMemoryFile(ACTIVE_AGENT_SLUG);
     switch (action) {
       case 'read': {
-        if (!existsSync(WORKING_MEMORY_FILE)) {
+        if (!existsSync(wmFile)) {
           return textResult('Working memory is empty.');
         }
-        const text = readFileSync(WORKING_MEMORY_FILE, 'utf-8');
+        const text = readFileSync(wmFile, 'utf-8');
         const lineCount = text.split('\n').length;
         let result = text;
         if (lineCount > WORKING_MEMORY_MAX_LINES) {
@@ -95,9 +97,9 @@ server.tool(
       }
       case 'append': {
         if (!content) return textResult('Error: content is required for append.');
-        const existing = existsSync(WORKING_MEMORY_FILE) ? readFileSync(WORKING_MEMORY_FILE, 'utf-8') : '';
+        const existing = existsSync(wmFile) ? readFileSync(wmFile, 'utf-8') : '';
         const separator = existing && !existing.endsWith('\n') ? '\n' : '';
-        writeFileSync(WORKING_MEMORY_FILE, existing + separator + content + '\n');
+        writeFileSync(wmFile, existing + separator + content + '\n');
         const newLineCount = (existing + separator + content).split('\n').length;
         let msg = `Appended to working memory.`;
         if (newLineCount > WORKING_MEMORY_MAX_LINES) {
@@ -107,11 +109,11 @@ server.tool(
       }
       case 'replace': {
         if (!content) return textResult('Error: content is required for replace.');
-        writeFileSync(WORKING_MEMORY_FILE, content + '\n');
+        writeFileSync(wmFile, content + '\n');
         return textResult('Working memory replaced.');
       }
       case 'clear': {
-        if (existsSync(WORKING_MEMORY_FILE)) unlinkSync(WORKING_MEMORY_FILE);
+        if (existsSync(wmFile)) unlinkSync(wmFile);
         return textResult('Working memory cleared.');
       }
     }
