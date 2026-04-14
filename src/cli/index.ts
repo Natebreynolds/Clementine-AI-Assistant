@@ -1065,36 +1065,40 @@ program
         if (token) {
           process.stdout.write('found. Verifying... ');
           if (await testAuth({ authToken: token })) {
-            console.log('✓ valid\n');
+            console.log('✓\n');
             saveToEnv('ANTHROPIC_AUTH_TOKEN', token);
-            console.log('  Saved ANTHROPIC_AUTH_TOKEN to ~/.clementine/.env');
-            console.log('  Clementine will use your Claude Code subscription going forward.\n');
+            console.log('  ✓ Authenticated via Claude Code subscription');
+            console.log('  Saved to ~/.clementine/.env — no API key needed.\n');
             return;
           }
-          console.log('token found but API call failed.');
+          console.log('expired.');
         } else {
-          console.log('no token in entry.');
+          console.log('not found.');
         }
       } catch {
         console.log('not found.');
       }
     }
 
-    // ── Open browser and prompt for paste ────────────────────────────
-    const CONSOLE_URL = 'https://console.anthropic.com/settings/keys';
-    console.log('\n  Opening Anthropic console in your browser...');
-    console.log(`  ${CONSOLE_URL}\n`);
-    console.log('  1. Create or copy an API key');
-    console.log('  2. Paste it here and press Enter\n');
+    // ── Offer the two auth paths clearly ─────────────────────────────
+    console.log('\n  How would you like to authenticate?\n');
+    console.log('  A) Claude Code subscription  — install claude.ai/code, log in, then re-run `clementine login`');
+    console.log('  B) Anthropic API key         — opening console now...\n');
 
+    // Open the API keys page for option B
+    const CONSOLE_URL = 'https://console.anthropic.com/settings/keys';
     try {
       const opener = process.platform === 'darwin' ? 'open'
         : process.platform === 'win32' ? 'start'
         : 'xdg-open';
       execSync(`${opener} "${CONSOLE_URL}"`, { stdio: 'ignore' });
-    } catch { /* non-fatal — URL is printed above as fallback */ }
+    } catch { /* non-fatal */ }
 
-    process.stdout.write('  Paste key > ');
+    console.log(`  ${CONSOLE_URL}`);
+    console.log('  Create or copy an API key from the page that just opened,');
+    console.log('  then paste it below. (Ctrl+C to cancel)\n');
+
+    process.stdout.write('  Paste API key > ');
     const input = await new Promise<string>((resolve) => {
       process.stdin.setRawMode?.(false);
       process.stdin.resume();
