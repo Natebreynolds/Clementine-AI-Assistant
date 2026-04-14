@@ -106,11 +106,26 @@ export class Gateway {
     return this._authFailCount >= Gateway.AUTH_FAIL_THRESHOLD;
   }
 
-  /** Record an auth failure. */
+  /** Record an auth failure. On first crossing the threshold, notify the owner proactively. */
   recordAuthFailure(): void {
+    const wasOpen = this.authCircuitOpen;
     this._authFailCount++;
     if (!this._authFailSince) this._authFailSince = Date.now();
     logger.warn({ consecutiveAuthFailures: this._authFailCount, since: this._authFailSince }, 'Auth failure recorded');
+
+    // Notify owner exactly once when the circuit first opens
+    if (!wasOpen && this.authCircuitOpen && this._dispatcher) {
+      const msg = [
+        '**Clementine is offline — authentication failed.**',
+        '',
+        'My connection to Anthropic has expired or been revoked. To restore service:',
+        '```',
+        'clementine login',
+        '```',
+        'This takes ~30 seconds and generates a new 1-year token. I\'ll come back online automatically once it\'s saved.',
+      ].join('\n');
+      this._dispatcher.send(msg).catch(() => {/* non-fatal */});
+    }
   }
 
   /** Clear the auth circuit after a successful request. */

@@ -56,6 +56,8 @@ import {
   ENABLE_1M_CONTEXT,
   WORKING_MEMORY_FILE,
   IDENTITY_FILE,
+  CLAUDE_CODE_OAUTH_TOKEN,
+  ANTHROPIC_API_KEY as CONFIG_ANTHROPIC_API_KEY,
 } from '../config.js';
 import type { AgentProfile, ChannelCapabilities, OnTextCallback, OnToolActivityCallback, SessionData, VerboseLevel } from '../types.js';
 import { DEFAULT_CHANNEL_CAPABILITIES } from '../types.js';
@@ -261,16 +263,23 @@ function buildSafeEnv(): Record<string, string> {
   };
 
   // Step 2: Auth credentials — priority order for the subprocess:
-  //   1. CLAUDE_CODE_OAUTH_TOKEN — long-lived OAuth token from `claude setup-token` (preferred)
+  //   1. CLAUDE_CODE_OAUTH_TOKEN — long-lived OAuth token from `clementine login` (preferred)
   //   2. ANTHROPIC_AUTH_TOKEN    — OAuth session token (from Keychain auto-read)
   //   3. ANTHROPIC_API_KEY       — raw API key (legacy)
   //   4. Keychain OAuth          — read automatically via HOME when none of the above are set
-  if (process.env.CLAUDE_CODE_OAUTH_TOKEN) {
-    sanitized.CLAUDE_CODE_OAUTH_TOKEN = process.env.CLAUDE_CODE_OAUTH_TOKEN;
-  } else if (process.env.ANTHROPIC_AUTH_TOKEN) {
-    sanitized.ANTHROPIC_AUTH_TOKEN = process.env.ANTHROPIC_AUTH_TOKEN;
-  } else if (process.env.ANTHROPIC_API_KEY) {
-    sanitized.ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
+  //
+  // Read from config (which reads ~/.clementine/.env) — process.env is intentionally
+  // not used here because config.ts keeps secrets out of process.env to prevent leakage.
+  const oauthTok = CLAUDE_CODE_OAUTH_TOKEN || process.env.CLAUDE_CODE_OAUTH_TOKEN;
+  const authTok = process.env.ANTHROPIC_AUTH_TOKEN;
+  const apiKeyVal = CONFIG_ANTHROPIC_API_KEY || process.env.ANTHROPIC_API_KEY;
+
+  if (oauthTok) {
+    sanitized.CLAUDE_CODE_OAUTH_TOKEN = oauthTok;
+  } else if (authTok) {
+    sanitized.ANTHROPIC_AUTH_TOKEN = authTok;
+  } else if (apiKeyVal) {
+    sanitized.ANTHROPIC_API_KEY = apiKeyVal;
   }
   // When all are absent: HOME lets the subprocess find Keychain OAuth automatically.
 

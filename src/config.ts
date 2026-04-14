@@ -369,4 +369,7 @@ export const STAGING_DIR = path.join(BASE_DIR, 'staging');
 
 // ── API ──────────────────────────────────────────────────────────────
 
+// Long-lived OAuth token from `clementine login` / `claude setup-token`.
+// Takes priority over ANTHROPIC_API_KEY in the SDK subprocess env.
+export const CLAUDE_CODE_OAUTH_TOKEN = getSecret('CLAUDE_CODE_OAUTH_TOKEN');
 export const ANTHROPIC_API_KEY = getSecret('ANTHROPIC_API_KEY');
