@@ -27,7 +27,10 @@ const PLANS_DIR = path.join(BASE_DIR, 'plans', 'daily');
 
 // ── .env reader (self-contained — no config.ts secret imports) ───────
 
-function getApiKey(): string {
+function getEnvValue(key: string): string {
+  // Check process env first (already loaded by the daemon)
+  if (process.env[key]) return process.env[key]!;
+  // Fall back to .env file
   const envPath = path.join(BASE_DIR, '.env');
   if (!existsSync(envPath)) return '';
   for (const line of readFileSync(envPath, 'utf-8').split('\n')) {
@@ -35,8 +38,7 @@ function getApiKey(): string {
     if (!trimmed || trimmed.startsWith('#')) continue;
     const eqIndex = trimmed.indexOf('=');
     if (eqIndex === -1) continue;
-    const key = trimmed.slice(0, eqIndex);
-    if (key !== 'ANTHROPIC_API_KEY') continue;
+    if (trimmed.slice(0, eqIndex) !== key) continue;
     let value = trimmed.slice(eqIndex + 1);
     if ((value.startsWith('"') && value.endsWith('"')) ||
         (value.startsWith("'") && value.endsWith("'"))) {
@@ -45,6 +47,19 @@ function getApiKey(): string {
     return value;
   }
   return '';
+}
+
+/**
+ * Build Anthropic client credentials.
+ * Priority: ANTHROPIC_AUTH_TOKEN (OAuth) > ANTHROPIC_API_KEY (legacy raw key).
+ * Returns null if neither is configured.
+ */
+function getAnthropicCredentials(): { apiKey?: string; authToken?: string } | null {
+  const authToken = getEnvValue('ANTHROPIC_AUTH_TOKEN');
+  if (authToken) return { authToken };
+  const apiKey = getEnvValue('ANTHROPIC_API_KEY');
+  if (apiKey) return { apiKey };
+  return null;
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────
@@ -288,14 +303,14 @@ Rules:
 - Focus on actionable items, not status reports
 - If everything is on track, return minimal priorities`;
 
-    const apiKey = getApiKey();
-    if (!apiKey) {
-      logger.warn('No ANTHROPIC_API_KEY found — generating fallback plan');
+    const creds = getAnthropicCredentials();
+    if (!creds) {
+      logger.warn('No Anthropic credentials found — generating fallback plan. Run `clementine login` to authenticate.');
       return this.fallbackPlan(today);
     }
 
     try {
-      const client = new Anthropic({ apiKey });
+      const client = new Anthropic(creds.authToken ? { authToken: creds.authToken } : { apiKey: creds.apiKey });
       const response = await client.messages.create({
         model: MODELS.haiku,
         max_tokens: 2000,

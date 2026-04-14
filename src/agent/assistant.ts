@@ -240,6 +240,14 @@ function inferInteractionSource(
  * Build a sanitized env for SDK subprocesses.
  * Order matters: sanitize first, then add trusted markers.
  * This prevents malicious env vars from overriding trusted flags.
+ *
+ * Auth strategy (in priority order for the embedded claude subprocess):
+ *   1. ANTHROPIC_AUTH_TOKEN — OAuth session token (preferred; set via `clementine login`)
+ *   2. ANTHROPIC_API_KEY    — raw API key (legacy; still works but expires less gracefully)
+ *   3. macOS Keychain        — read automatically by the subprocess via HOME when neither above is set
+ *
+ * We pass whichever explicit credential the user has configured in their .env,
+ * and let the subprocess fall back to keychain OAuth when neither is present.
  */
 function buildSafeEnv(): Record<string, string> {
   // Step 1: Start with only known-safe system vars
@@ -252,7 +260,16 @@ function buildSafeEnv(): Record<string, string> {
     SHELL: process.env.SHELL ?? '',
   };
 
-  // Step 2: Add trusted markers AFTER sanitization
+  // Step 2: Auth credentials — ANTHROPIC_AUTH_TOKEN takes priority over ANTHROPIC_API_KEY.
+  // If neither is set the subprocess reads keychain OAuth automatically via HOME.
+  if (process.env.ANTHROPIC_AUTH_TOKEN) {
+    sanitized.ANTHROPIC_AUTH_TOKEN = process.env.ANTHROPIC_AUTH_TOKEN;
+  } else if (process.env.ANTHROPIC_API_KEY) {
+    sanitized.ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
+  }
+  // When both are absent: HOME lets the subprocess find keychain OAuth — no extra config needed.
+
+  // Step 3: Add trusted markers AFTER sanitization
   sanitized.CLEMENTINE_HOME = BASE_DIR;
 
   return sanitized;

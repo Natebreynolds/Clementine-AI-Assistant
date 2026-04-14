@@ -46,7 +46,8 @@ export interface MonthlyAssessment {
 
 // ── .env reader ──────────────────────────────────────────────────────
 
-function getApiKey(): string {
+function getEnvValue(key: string): string {
+  if (process.env[key]) return process.env[key]!;
   const envPath = path.join(BASE_DIR, '.env');
   if (!existsSync(envPath)) return '';
   for (const line of readFileSync(envPath, 'utf-8').split('\n')) {
@@ -54,8 +55,7 @@ function getApiKey(): string {
     if (!trimmed || trimmed.startsWith('#')) continue;
     const eqIndex = trimmed.indexOf('=');
     if (eqIndex === -1) continue;
-    const key = trimmed.slice(0, eqIndex);
-    if (key !== 'ANTHROPIC_API_KEY') continue;
+    if (trimmed.slice(0, eqIndex) !== key) continue;
     let value = trimmed.slice(eqIndex + 1);
     if ((value.startsWith('"') && value.endsWith('"')) ||
         (value.startsWith("'") && value.endsWith("'"))) {
@@ -64,6 +64,20 @@ function getApiKey(): string {
     return value;
   }
   return '';
+}
+
+function getAnthropicCredentials(): { apiKey?: string; authToken?: string } | null {
+  const authToken = getEnvValue('ANTHROPIC_AUTH_TOKEN');
+  if (authToken) return { authToken };
+  const apiKey = getEnvValue('ANTHROPIC_API_KEY');
+  if (apiKey) return { apiKey };
+  return null;
+}
+
+function makeAnthropicClient(): Anthropic | null {
+  const creds = getAnthropicCredentials();
+  if (!creds) return null;
+  return new Anthropic(creds.authToken ? { authToken: creds.authToken } : { apiKey: creds.apiKey });
 }
 
 // ── Strategic Planner ────────────────────────────────────────────────
@@ -140,7 +154,6 @@ export class StrategicPlanner {
   }
 
   private async callLlmForWeekly(weekId: string, context: string): Promise<WeeklyReview> {
-    const apiKey = getApiKey();
     const goals = this.loadActiveGoals();
 
     const prompt =
@@ -171,10 +184,10 @@ export class StrategicPlanner {
       summary: 'No data available for weekly review.',
     };
 
-    if (!apiKey) return defaultReview;
+    const client = makeAnthropicClient();
+    if (!client) return defaultReview;
 
     try {
-      const client = new Anthropic({ apiKey });
       const response = await client.messages.create({
         model: MODELS.haiku,
         max_tokens: 1000,
@@ -249,7 +262,6 @@ export class StrategicPlanner {
   }
 
   private async callLlmForMonthly(monthId: string, context: string): Promise<MonthlyAssessment> {
-    const apiKey = getApiKey();
     const allGoals = this.loadAllGoals();
     const completed = allGoals.filter(g => g.status === 'completed').length;
     const total = allGoals.length || 1;
@@ -264,7 +276,8 @@ export class StrategicPlanner {
       summary: 'No data available for monthly assessment.',
     };
 
-    if (!apiKey) return defaultAssessment;
+    const client2 = makeAnthropicClient();
+    if (!client2) return defaultAssessment;
 
     const prompt =
       `You are generating a monthly strategic assessment for ${monthId}.\n\n` +
@@ -278,8 +291,7 @@ export class StrategicPlanner {
       `}`;
 
     try {
-      const client = new Anthropic({ apiKey });
-      const response = await client.messages.create({
+      const response = await client2.messages.create({
         model: MODELS.haiku,
         max_tokens: 1000,
         messages: [{ role: 'user', content: prompt }],

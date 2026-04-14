@@ -1506,17 +1506,21 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
   app.get('/api/auth/anthropic/status', (_req, res) => {
     try {
       const envPath = path.join(BASE_DIR, '.env');
+      let authMode: 'oauth-token' | 'api-key' | 'keychain' | 'none' = 'none';
       let hasKey = false;
       if (existsSync(envPath)) {
         const content = readFileSync(envPath, 'utf-8');
-        hasKey = /^ANTHROPIC_API_KEY=.+/m.test(content);
+        if (/^ANTHROPIC_AUTH_TOKEN=.+/m.test(content)) { hasKey = true; authMode = 'oauth-token'; }
+        else if (/^ANTHROPIC_API_KEY=.+/m.test(content)) { hasKey = true; authMode = 'api-key'; }
       }
-      // Also check process env (set by daemon)
-      if (!hasKey && process.env.ANTHROPIC_API_KEY) hasKey = true;
+      if (!hasKey && process.env.ANTHROPIC_AUTH_TOKEN) { hasKey = true; authMode = 'oauth-token'; }
+      if (!hasKey && process.env.ANTHROPIC_API_KEY) { hasKey = true; authMode = 'api-key'; }
+      // If no explicit creds, the SDK subprocess reads keychain OAuth automatically
+      if (!hasKey) { authMode = 'keychain'; hasKey = true; }
       res.json({
         authenticated: hasKey,
         email: null,
-        apiKeySource: hasKey ? 'env' : null,
+        apiKeySource: authMode,
       });
     } catch (err) {
       res.json({ authenticated: false, email: null, error: String(err).slice(0, 200) });
@@ -2824,7 +2828,8 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
     {
       label: 'Anthropic',
       keys: [
-        { key: 'ANTHROPIC_API_KEY', label: 'API Key', hint: 'Claude API key — required for agent execution', type: 'password' },
+        { key: 'ANTHROPIC_AUTH_TOKEN', label: 'OAuth Token', hint: 'Preferred — run `clementine login` to generate via Claude Code subscription', type: 'password' },
+        { key: 'ANTHROPIC_API_KEY', label: 'API Key (legacy)', hint: 'Raw API key — use only if not using OAuth login', type: 'password' },
       ],
     },
     {

@@ -1002,6 +1002,57 @@ program
   });
 
 program
+  .command('login')
+  .description('Authenticate with Anthropic (Claude Code subscription) — opens browser for OAuth')
+  .action(() => {
+    const claudeBin = process.env.CLAUDE_BIN || 'claude';
+    console.log('Opening Anthropic OAuth login...\n');
+    const child = spawn(claudeBin, ['login'], { stdio: 'inherit', shell: false });
+    child.on('close', (code) => {
+      if (code === 0) {
+        console.log('\n✓ Logged in. Clementine will now use your Claude Code subscription for API calls.');
+        console.log('  You can remove ANTHROPIC_API_KEY from ~/.clementine/.env if it is present.\n');
+      } else {
+        console.error(`\nLogin exited with code ${code}.`);
+        console.error('If `claude` is not on your PATH, set CLAUDE_BIN env var to its location.');
+        process.exit(code ?? 1);
+      }
+    });
+  });
+
+program
+  .command('auth')
+  .description('Show current authentication status')
+  .action(() => {
+    const envPath = path.join(BASE_DIR, '.env');
+    let authToken = process.env.ANTHROPIC_AUTH_TOKEN;
+    let apiKey = process.env.ANTHROPIC_API_KEY;
+
+    if (!authToken && !apiKey && existsSync(envPath)) {
+      const content = readFileSync(envPath, 'utf-8');
+      const tokenMatch = content.match(/^ANTHROPIC_AUTH_TOKEN=(.+)$/m);
+      const keyMatch = content.match(/^ANTHROPIC_API_KEY=(.+)$/m);
+      if (tokenMatch) authToken = tokenMatch[1].trim();
+      if (keyMatch) apiKey = keyMatch[1].trim();
+    }
+
+    console.log('\nClementine Auth Status');
+    console.log('──────────────────────');
+    if (authToken) {
+      console.log(`✓ ANTHROPIC_AUTH_TOKEN is set (${authToken.slice(0, 12)}...)`);
+      console.log('  Mode: OAuth session token');
+    } else if (apiKey) {
+      console.log(`✓ ANTHROPIC_API_KEY is set (${apiKey.slice(0, 12)}...)`);
+      console.log('  Mode: Raw API key (consider running `clementine login` for OAuth instead)');
+    } else {
+      console.log('  No explicit credentials found in .env');
+      console.log('  Mode: Keychain OAuth (via `claude login` — auto-read by SDK subprocess)');
+    }
+    console.log('\n  To switch to OAuth: run `clementine login`');
+    console.log('  To use an API key:  set ANTHROPIC_API_KEY in ~/.clementine/.env\n');
+  });
+
+program
   .command('status')
   .description('Show assistant status')
   .action(cmdStatus);
