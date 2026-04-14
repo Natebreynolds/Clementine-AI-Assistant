@@ -1443,7 +1443,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
     const effectivePermissionMode = 'bypassPermissions';
 
     return {
-      systemPrompt: fullSystemPrompt,
+      systemPrompt: stripLoneSurrogates(fullSystemPrompt),
       model: resolvedModel,
       ...(fallback ? { fallbackModel: fallback } : {}),
       permissionMode: effectivePermissionMode as 'bypassPermissions' | 'auto',
