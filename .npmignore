@@ -1,0 +1,25 @@
+# Source maps — useful for local dev, not needed by installers
+dist/**/*.js.map
+dist/**/*.d.ts.map
+
+# Source
+src/
+
+# Dev tooling
+.eslintrc*
+.prettierrc*
+tsconfig*.json
+vitest.config.*
+*.test.ts
+*.spec.ts
+
+# Local state / secrets
+.env
+.env.*
+!.env.example
+
+# Dev artifacts
+node_modules/
+dist.tmp/
+*.tgz
+.claude/

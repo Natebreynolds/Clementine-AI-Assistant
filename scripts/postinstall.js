@@ -2,11 +2,12 @@
 /**
  * Clementine postinstall script.
  *
- * Runs after `npm install -g clementine` to:
+ * Runs after `npm install -g clemmy-ts` to:
  *   1. Rebuild native modules (better-sqlite3) for the current Node version
  *   2. Initialize ~/.clementine/ directory structure if it doesn't exist
  *   3. Copy default vault templates from package to data home
- *   4. Print first-run instructions
+ *   4. Check for `claude` CLI on PATH (needed for OAuth login)
+ *   5. Print first-run instructions
  *
  * Safe to re-run — skips steps already completed.
  */
@@ -30,7 +31,7 @@ try {
   });
   process.stdout.write(' done.\n');
 } catch {
-  // Non-fatal — node-pre-gyp may have a prebuilt available
+  // Non-fatal — prebuild-install may have a prebuilt binary available
   process.stdout.write(' skipped (prebuilt may work).\n');
 }
 
@@ -52,15 +53,13 @@ const dirs = [
   path.join(DATA_HOME, 'cron'),
 ];
 
-let created = 0;
 for (const dir of dirs) {
   if (!existsSync(dir)) {
     mkdirSync(dir, { recursive: true });
-    created++;
   }
 }
 
-// ── Step 3: Copy default vault templates if vault is empty ─────────
+// ── Step 3: Copy default vault templates if not already present ─────
 const srcVault = path.join(PKG_DIR, 'vault', '00-System');
 const dstVault = path.join(DATA_HOME, 'vault', '00-System');
 
@@ -81,30 +80,46 @@ if (existsSync(srcVault)) {
   }
 }
 
-// ── Step 4: Print instructions ──────────────────────────────────────
+// ── Step 4: Check for claude CLI ────────────────────────────────────
+let claudeOnPath = false;
+try {
+  execSync('claude --version', { stdio: 'pipe' });
+  claudeOnPath = true;
+} catch { /* not on PATH */ }
+
+// ── Step 5: Print instructions ──────────────────────────────────────
 const alreadyConfigured = existsSync(path.join(DATA_HOME, '.env'));
 
 if (alreadyConfigured) {
   console.log('\n✓ Clementine already configured. Run `clementine status` to check.\n');
 } else {
+  const claudeNote = claudeOnPath
+    ? '║  Auth: run `clementine login` (uses your Claude Code subscription) ║'
+    : '║  Auth: install Claude Code CLI first, then `clementine login`      ║';
+
   console.log(`
-╔══════════════════════════════════════════════════════════════╗
-║           Clementine installed successfully!                  ║
-╠══════════════════════════════════════════════════════════════╣
-║                                                              ║
-║  Next steps:                                                 ║
-║                                                              ║
-║  1. Run: clementine setup                                    ║
-║     Configure your channels (Discord, Slack, Telegram...)    ║
-║                                                              ║
-║  2. Run: clementine launch                                   ║
-║     Start the assistant as a background daemon               ║
-║                                                              ║
-║  3. Run: clementine dashboard                                ║
-║     Open the web command center at localhost:3030            ║
-║                                                              ║
-║  Data directory: ${DATA_HOME.padEnd(44)}║
-║                                                              ║
-╚══════════════════════════════════════════════════════════════╝
+╔══════════════════════════════════════════════════════════════════╗
+║              Clementine installed successfully!                   ║
+╠══════════════════════════════════════════════════════════════════╣
+║                                                                  ║
+║  Next steps:                                                     ║
+║                                                                  ║
+║  1. Run: clementine login                                        ║
+║     Authenticate with your Claude Code subscription (OAuth)      ║
+║                                                                  ║
+║  2. Run: clementine setup                                        ║
+║     Configure your channels (Discord, Slack, Telegram...)        ║
+║                                                                  ║
+║  3. Run: clementine launch                                       ║
+║     Start the assistant as a background daemon                   ║
+║                                                                  ║
+║  4. Run: clementine dashboard                                    ║
+║     Open the web command center at localhost:3030                ║
+║                                                                  ║
+║  ${claudeNote.padEnd(65)}║
+║                                                                  ║
+║  Data directory: ${DATA_HOME.padEnd(47)}║
+║                                                                  ║
+╚══════════════════════════════════════════════════════════════════╝
 `);
 }
