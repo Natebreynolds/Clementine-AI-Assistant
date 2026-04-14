@@ -1003,10 +1003,28 @@ program
 
 program
   .command('login')
-  .description('Verify Anthropic auth and save credentials if needed')
+  .description('Authenticate with Anthropic and save credentials to ~/.clementine/.env')
   .action(async () => {
     const { default: Anthropic } = await import('@anthropic-ai/sdk');
     const envPath = path.join(BASE_DIR, '.env');
+
+    const testAuth = async (opts: { apiKey?: string; authToken?: string }): Promise<boolean> => {
+      try {
+        const client = new Anthropic(opts as any);
+        await client.models.list({ limit: 1 });
+        return true;
+      } catch {
+        return false;
+      }
+    };
+
+    const saveToEnv = (credKey: string, value: string) => {
+      mkdirSync(BASE_DIR, { recursive: true });
+      let content = existsSync(envPath) ? readFileSync(envPath, 'utf-8') : '';
+      content = content.replace(new RegExp(`^${credKey}=.*$\\n?`, 'm'), '').trimEnd();
+      content += `\n${credKey}=${value}\n`;
+      writeFileSync(envPath, content, { mode: 0o600 });
+    };
 
     // Read explicit credentials from .env
     let authToken: string | undefined;
@@ -1023,75 +1041,81 @@ program
 
     console.log('\nChecking Anthropic authentication...\n');
 
-    // Test whichever credential we have
-    const testAuth = async (opts: { apiKey?: string; authToken?: string }): Promise<boolean> => {
+    // Test existing explicit credentials first
+    if (authToken) {
+      process.stdout.write(`  ANTHROPIC_AUTH_TOKEN  ${authToken.slice(0, 16)}...  `);
+      if (await testAuth({ authToken })) { console.log('✓ valid\n'); return; }
+      console.log('✗ invalid or expired');
+    }
+    if (apiKey) {
+      process.stdout.write(`  ANTHROPIC_API_KEY     ${apiKey.slice(0, 16)}...  `);
+      if (await testAuth({ apiKey })) { console.log('✓ valid\n'); return; }
+      console.log('✗ invalid or expired');
+    }
+
+    // ── Try to pull token from Claude Code keychain (macOS) ──────────
+    if (process.platform === 'darwin') {
+      process.stdout.write('\n  Looking for Claude Code session in Keychain... ');
       try {
-        const client = new Anthropic(opts as any);
-        await client.models.list({ limit: 1 });
-        return true;
+        const raw = execSync('security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null', {
+          encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'],
+        }).trim();
+        const parsed = JSON.parse(raw);
+        const token: string | undefined = parsed?.claudeAiOauth?.accessToken;
+        if (token) {
+          process.stdout.write('found. Verifying... ');
+          if (await testAuth({ authToken: token })) {
+            console.log('✓ valid\n');
+            saveToEnv('ANTHROPIC_AUTH_TOKEN', token);
+            console.log('  Saved ANTHROPIC_AUTH_TOKEN to ~/.clementine/.env');
+            console.log('  Clementine will use your Claude Code subscription going forward.\n');
+            return;
+          }
+          console.log('token found but API call failed.');
+        } else {
+          console.log('no token in entry.');
+        }
       } catch {
-        return false;
+        console.log('not found.');
       }
-    };
-
-    if (authToken && await testAuth({ authToken })) {
-      console.log('✓ Authenticated via ANTHROPIC_AUTH_TOKEN\n');
-      return;
-    }
-    if (apiKey && await testAuth({ apiKey })) {
-      console.log('✓ Authenticated via ANTHROPIC_API_KEY\n');
-      return;
     }
 
-    // No working credentials — prompt for one
-    console.log('No valid credentials found in ~/.clementine/.env\n');
-    console.log('Options:');
-    console.log('  1. Enter an Anthropic API key  (console.anthropic.com → API Keys)');
-    console.log('  2. Enter an auth token         (ANTHROPIC_AUTH_TOKEN from your Claude Code session)\n');
-    console.log('Paste your key/token below and press Enter, or Ctrl+C to cancel:\n');
+    // ── Fall back: ask for an API key ────────────────────────────────
+    console.log('\n  No working credentials found automatically.\n');
+    console.log('  Options:');
+    console.log('  A) API key      — console.anthropic.com → API Keys');
+    console.log('  B) Auth token   — run `claude` CLI, then check ~/.clementine/.env after\n');
+    console.log('  Paste an API key or auth token and press Enter (Ctrl+C to cancel):\n');
 
-    process.stdout.write('> ');
+    process.stdout.write('  > ');
     const input = await new Promise<string>((resolve) => {
-      let buf = '';
       process.stdin.setRawMode?.(false);
       process.stdin.resume();
       process.stdin.setEncoding('utf-8');
       process.stdin.once('data', (chunk) => {
-        buf = String(chunk).trim();
         process.stdin.pause();
-        resolve(buf);
+        resolve(String(chunk).trim());
       });
     });
 
     if (!input) {
-      console.error('\nNo input provided. Exiting.\n');
+      console.error('\n  No input. Exiting.\n');
       process.exit(1);
     }
 
-    // Detect token type: auth tokens start with specific prefixes
     const isAuthToken = input.startsWith('sk-ant-oat') || input.startsWith('sk-ant-rt');
     const credKey = isAuthToken ? 'ANTHROPIC_AUTH_TOKEN' : 'ANTHROPIC_API_KEY';
     const testOpts = isAuthToken ? { authToken: input } : { apiKey: input };
 
-    process.stdout.write('\nVerifying...');
-    const ok = await testAuth(testOpts);
-    if (!ok) {
+    process.stdout.write('\n  Verifying...');
+    if (!await testAuth(testOpts)) {
       console.error(' invalid. Check the key and try again.\n');
       process.exit(1);
     }
-    console.log(' OK\n');
+    console.log(' ✓\n');
 
-    // Save to .env
-    mkdirSync(BASE_DIR, { recursive: true });
-    let envContent = existsSync(envPath) ? readFileSync(envPath, 'utf-8') : '';
-    // Remove any existing entry for this key
-    envContent = envContent.replace(new RegExp(`^${credKey}=.*$\\n?`, 'm'), '');
-    envContent = envContent.trimEnd();
-    envContent += `\n${credKey}=${input}\n`;
-    writeFileSync(envPath, envContent, { mode: 0o600 });
-
-    console.log(`✓ Saved ${credKey} to ~/.clementine/.env\n`);
-    console.log('  Run `clementine launch` to start the daemon.\n');
+    saveToEnv(credKey, input);
+    console.log(`  Saved ${credKey} to ~/.clementine/.env\n`);
   });
 
 program
