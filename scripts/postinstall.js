@@ -2,7 +2,7 @@
 /**
  * Clementine postinstall script.
  *
- * Runs after `npm install -g clemmy-ts` to:
+ * Runs after `npm install -g clementine-agent` to:
  *   1. Rebuild native modules (better-sqlite3) for the current Node version
  *   2. Initialize ~/.clementine/ directory structure if it doesn't exist
  *   3. Copy default vault templates from package to data home

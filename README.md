@@ -72,7 +72,7 @@ The result: Clementine gets better the more you talk to it.
 
 **Option A — npm (recommended):**
 ```bash
-npm install -g clemmy-ts
+npm install -g clementine-agent
 clementine setup
 ```
 
