@@ -1046,6 +1046,59 @@ export async function startDiscord(
       return;
     }
 
+    // ── Skill approval shortcuts (DM only) ──────────────────────────
+    // Natural language: "approve skill <name>" / "reject skill <name>" (from notification prompts)
+    // Explicit: "!skill pending|approve <name>|reject <name>"
+
+    if (isDm) {
+      const lc = text.toLowerCase().trim();
+
+      if (lc.startsWith('approve skill ') || lc.startsWith('reject skill ')) {
+        const isApprove = lc.startsWith('approve skill ');
+        const skillName = text.trim().split(/\s+/)[2];
+        if (skillName) {
+          const result = await gateway.handleSkill(isApprove ? 'approve' : 'reject', { name: skillName });
+          await message.reply(result);
+          return;
+        }
+      }
+
+      if (lc.startsWith('!skill')) {
+        const parts = text.split(/\s+/);
+        const subCmd = parts[1]?.toLowerCase();
+
+        if (!subCmd || subCmd === 'pending') {
+          const result = await gateway.handleSkill('pending');
+          await message.reply(result);
+          return;
+        }
+
+        if (subCmd === 'approve') {
+          const name = parts[2];
+          if (!name) { await message.reply('Usage: `!skill approve <name>`'); return; }
+          const result = await gateway.handleSkill('approve', { name });
+          await message.reply(result);
+          return;
+        }
+
+        if (subCmd === 'reject') {
+          const name = parts[2];
+          if (!name) { await message.reply('Usage: `!skill reject <name>`'); return; }
+          const result = await gateway.handleSkill('reject', { name });
+          await message.reply(result);
+          return;
+        }
+
+        await message.reply(
+          '**Skill Commands:**\n' +
+          '`!skill pending` — list skills waiting for approval\n' +
+          '`!skill approve <name>` — activate a pending skill\n' +
+          '`!skill reject <name>` — discard a pending skill',
+        );
+        return;
+      }
+    }
+
     // ── Team commands (DM only) ─────────────────────────────────────
 
     if (isDm && text.startsWith('!team')) {

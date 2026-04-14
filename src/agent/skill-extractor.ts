@@ -3,34 +3,45 @@
  *
  * Extracts reusable skill documents from successful multi-step executions
  * (unleashed jobs, cron runs, complex chat interactions) and stores them
- * as markdown files in vault/00-System/skills/.
+ * as markdown files in vault/00-System/skills/ (global) or
+ * vault/00-System/agents/{slug}/skills/ (agent-scoped).
+ *
+ * New skills land in a pending queue first. The owner approves or rejects
+ * them via chat or dashboard before they become active.
  *
  * Skills are automatically indexed by the memory store FTS5 and retrieved
  * during context search to avoid re-deriving procedures from scratch.
  */
 
-import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync, copyFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync, copyFileSync, unlinkSync } from 'node:fs';
 import path from 'node:path';
 import matter from 'gray-matter';
 import pino from 'pino';
 
-import { VAULT_DIR } from '../config.js';
+import { VAULT_DIR, AGENTS_DIR, PENDING_SKILLS_DIR } from '../config.js';
 import type { SkillDocument } from '../types.js';
 import type { PersonalAssistant } from './assistant.js';
 
 const logger = pino({ name: 'clementine.skills' });
 
-const SKILLS_DIR = path.join(VAULT_DIR, '00-System', 'skills');
+const GLOBAL_SKILLS_DIR = path.join(VAULT_DIR, '00-System', 'skills');
 
-function ensureSkillsDir(): void {
-  if (!existsSync(SKILLS_DIR)) mkdirSync(SKILLS_DIR, { recursive: true });
+function agentSkillsDir(agentSlug: string): string {
+  return path.join(AGENTS_DIR, agentSlug, 'skills');
+}
+
+function ensureDirs(): void {
+  for (const dir of [GLOBAL_SKILLS_DIR, PENDING_SKILLS_DIR]) {
+    if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+  }
 }
 
 // ── Skill Extraction ────────────────────────────────────────────────
 
 /**
  * Extract a reusable skill from a successful execution.
- * Runs a lightweight LLM call to distill the procedure.
+ * New skills go to the pending queue — owner must approve before they activate.
+ * Merges into existing approved skills directly (no re-approval needed).
  */
 export async function extractSkill(
   assistant: PersonalAssistant,
@@ -97,14 +108,29 @@ export async function extractSkill(
       updatedAt: now,
     };
 
-    // Check for duplicate/similar skills before saving
-    const existing = findSimilarSkill(skill.triggers);
+    // Check for duplicate/similar skills in active dirs (and pending) before saving
+    const existing = findSimilarActiveSkill(skill.triggers, context.agentSlug);
     if (existing) {
       logger.info({ name: existing.name, newTitle: skill.title }, 'Similar skill exists — merging');
       return mergeSkill(assistant, existing, skill);
     }
 
-    saveSkill(skill);
+    // Check pending for duplicates too — don't queue it twice
+    const existingPending = findSimilarPendingSkill(skill.triggers);
+    if (existingPending) {
+      logger.info({ name: existingPending.name, newTitle: skill.title }, 'Similar pending skill exists — skipping');
+      return null;
+    }
+
+    // Save to pending queue — owner approves before it goes live
+    savePendingSkill(skill);
+
+    // Notify owner via callback if wired
+    const cb = (assistant as any).onSkillProposed as ((skill: SkillDocument) => void) | null | undefined;
+    if (cb) {
+      try { cb(skill); } catch { /* non-fatal */ }
+    }
+
     return skill;
   } catch (err) {
     logger.error({ err, source: context.source }, 'Skill extraction failed');
@@ -114,9 +140,20 @@ export async function extractSkill(
 
 // ── Skill Storage ───────────────────────────────────────────────────
 
-/** Save a skill document to the vault as a markdown file. */
-function saveSkill(skill: SkillDocument): void {
-  ensureSkillsDir();
+/** Save a skill to the pending queue (JSON, awaiting approval). */
+function savePendingSkill(skill: SkillDocument): void {
+  ensureDirs();
+  const filePath = path.join(PENDING_SKILLS_DIR, `${skill.name}.json`);
+  writeFileSync(filePath, JSON.stringify(skill, null, 2));
+  logger.info({ name: skill.name, source: skill.source }, 'Skill queued for approval');
+}
+
+/** Save an approved skill as a formatted markdown file. Agent-scoped if agentSlug set. */
+function saveActiveSkill(skill: SkillDocument): void {
+  ensureDirs();
+
+  const targetDir = skill.agentSlug ? agentSkillsDir(skill.agentSlug) : GLOBAL_SKILLS_DIR;
+  if (!existsSync(targetDir)) mkdirSync(targetDir, { recursive: true });
 
   // gray-matter's YAML dumper throws on undefined values — omit them
   const frontmatter: Record<string, unknown> = {
@@ -134,52 +171,139 @@ function saveSkill(skill: SkillDocument): void {
   if (skill.lastUsed) frontmatter.lastUsed = skill.lastUsed;
 
   const content = matter.stringify(`\n# ${skill.title}\n\n${skill.description}\n\n## Procedure\n\n${skill.steps}\n`, frontmatter);
-  const filePath = path.join(SKILLS_DIR, `${skill.name}.md`);
+  const filePath = path.join(targetDir, `${skill.name}.md`);
+
   // Backup existing before overwrite
   if (existsSync(filePath)) {
     try { copyFileSync(filePath, filePath.replace(/\.md$/, '.md.bak')); } catch { /* best-effort */ }
   }
   writeFileSync(filePath, content);
 
-  logger.info({ name: skill.name, source: skill.source }, 'Skill saved');
+  logger.info({ name: skill.name, source: skill.source, agentSlug: skill.agentSlug ?? 'global' }, 'Skill saved');
 }
 
-/** Find a skill with overlapping triggers. */
-function findSimilarSkill(triggers: string[]): SkillDocument | null {
-  if (!existsSync(SKILLS_DIR)) return null;
+// ── Pending Skill Management ────────────────────────────────────────
 
-  const triggerSet = new Set(triggers.map(t => t.toLowerCase()));
-  const files = readdirSync(SKILLS_DIR).filter(f => f.endsWith('.md'));
+/** Move a pending skill to the active skills directory. */
+export function approvePendingSkill(name: string): { ok: boolean; message: string } {
+  ensureDirs();
+  const pendingFile = path.join(PENDING_SKILLS_DIR, `${name}.json`);
+  if (!existsSync(pendingFile)) {
+    return { ok: false, message: `Pending skill not found: ${name}` };
+  }
 
-  for (const file of files) {
-    try {
-      const content = readFileSync(path.join(SKILLS_DIR, file), 'utf-8');
-      const parsed = matter(content);
-      const existingTriggers: string[] = parsed.data.triggers ?? [];
-      const overlap = existingTriggers.filter(t => triggerSet.has(t.toLowerCase()));
-      if (overlap.length >= 2) {
+  try {
+    const skill: SkillDocument = JSON.parse(readFileSync(pendingFile, 'utf-8'));
+    skill.updatedAt = new Date().toISOString();
+    saveActiveSkill(skill);
+    unlinkSync(pendingFile);
+    logger.info({ name }, 'Pending skill approved and activated');
+    return { ok: true, message: `Skill **${skill.title}** is now active${skill.agentSlug ? ` for ${skill.agentSlug}` : ' (global)'}.` };
+  } catch (err) {
+    logger.error({ err, name }, 'Failed to approve pending skill');
+    return { ok: false, message: `Failed to approve skill: ${err instanceof Error ? err.message : String(err)}` };
+  }
+}
+
+/** Delete a pending skill (reject it). */
+export function rejectPendingSkill(name: string): { ok: boolean; message: string } {
+  const pendingFile = path.join(PENDING_SKILLS_DIR, `${name}.json`);
+  if (!existsSync(pendingFile)) {
+    return { ok: false, message: `Pending skill not found: ${name}` };
+  }
+  try {
+    unlinkSync(pendingFile);
+    logger.info({ name }, 'Pending skill rejected');
+    return { ok: true, message: `Skill **${name}** rejected and removed.` };
+  } catch (err) {
+    return { ok: false, message: `Failed to reject skill: ${err instanceof Error ? err.message : String(err)}` };
+  }
+}
+
+/** List all skills waiting for approval. */
+export function listPendingSkills(): Array<{ name: string; title: string; description: string; source: string; agentSlug?: string; createdAt: string }> {
+  if (!existsSync(PENDING_SKILLS_DIR)) return [];
+  return readdirSync(PENDING_SKILLS_DIR)
+    .filter(f => f.endsWith('.json'))
+    .map(f => {
+      try {
+        const skill: SkillDocument = JSON.parse(readFileSync(path.join(PENDING_SKILLS_DIR, f), 'utf-8'));
         return {
-          name: file.replace('.md', ''),
-          title: parsed.data.title ?? file,
-          description: parsed.data.description ?? '',
-          triggers: existingTriggers,
-          source: parsed.data.source ?? 'manual',
-          sourceJob: parsed.data.sourceJob,
-          agentSlug: parsed.data.agentSlug,
-          steps: parsed.content,
-          toolsUsed: parsed.data.toolsUsed ?? [],
-          useCount: parsed.data.useCount ?? 0,
-          lastUsed: parsed.data.lastUsed,
-          createdAt: parsed.data.createdAt ?? new Date().toISOString(),
-          updatedAt: parsed.data.updatedAt ?? new Date().toISOString(),
+          name: skill.name,
+          title: skill.title,
+          description: skill.description,
+          source: skill.source,
+          agentSlug: skill.agentSlug,
+          createdAt: skill.createdAt,
         };
-      }
-    } catch { /* skip malformed */ }
+      } catch { return null; }
+    })
+    .filter(Boolean) as any[];
+}
+
+// ── Similarity Detection ────────────────────────────────────────────
+
+/** Find an active skill (global or agent-scoped) with overlapping triggers. */
+function findSimilarActiveSkill(triggers: string[], agentSlug?: string): SkillDocument | null {
+  const dirs: string[] = [];
+  if (agentSlug) {
+    const ad = agentSkillsDir(agentSlug);
+    if (existsSync(ad)) dirs.push(ad);
+  }
+  if (existsSync(GLOBAL_SKILLS_DIR)) dirs.push(GLOBAL_SKILLS_DIR);
+
+  return findSimilarInDirs(triggers, dirs, false);
+}
+
+/** Find a pending skill with overlapping triggers (to avoid duplicates in queue). */
+function findSimilarPendingSkill(triggers: string[]): SkillDocument | null {
+  if (!existsSync(PENDING_SKILLS_DIR)) return null;
+  const triggerSet = new Set(triggers.map(t => t.toLowerCase()));
+  for (const f of readdirSync(PENDING_SKILLS_DIR).filter(f => f.endsWith('.json'))) {
+    try {
+      const skill: SkillDocument = JSON.parse(readFileSync(path.join(PENDING_SKILLS_DIR, f), 'utf-8'));
+      const overlap = skill.triggers.filter(t => triggerSet.has(t.toLowerCase()));
+      if (overlap.length >= 2) return skill;
+    } catch { /* skip */ }
   }
   return null;
 }
 
-/** Merge a new skill into an existing one by refining the procedure. */
+/** Shared similarity logic across markdown skill dirs. */
+function findSimilarInDirs(triggers: string[], dirs: string[], _isPending: boolean): SkillDocument | null {
+  const triggerSet = new Set(triggers.map(t => t.toLowerCase()));
+
+  for (const dir of dirs) {
+    for (const file of readdirSync(dir).filter(f => f.endsWith('.md'))) {
+      try {
+        const content = readFileSync(path.join(dir, file), 'utf-8');
+        const parsed = matter(content);
+        const existingTriggers: string[] = parsed.data.triggers ?? [];
+        const overlap = existingTriggers.filter(t => triggerSet.has(t.toLowerCase()));
+        if (overlap.length >= 2) {
+          return {
+            name: file.replace('.md', ''),
+            title: parsed.data.title ?? file,
+            description: parsed.data.description ?? '',
+            triggers: existingTriggers,
+            source: parsed.data.source ?? 'manual',
+            sourceJob: parsed.data.sourceJob,
+            agentSlug: parsed.data.agentSlug,
+            steps: parsed.content,
+            toolsUsed: parsed.data.toolsUsed ?? [],
+            useCount: parsed.data.useCount ?? 0,
+            lastUsed: parsed.data.lastUsed,
+            createdAt: parsed.data.createdAt ?? new Date().toISOString(),
+            updatedAt: parsed.data.updatedAt ?? new Date().toISOString(),
+          };
+        }
+      } catch { /* skip malformed */ }
+    }
+  }
+  return null;
+}
+
+/** Merge a new skill into an existing approved one by refining the procedure. */
 async function mergeSkill(
   assistant: PersonalAssistant,
   existing: SkillDocument,
@@ -219,7 +343,8 @@ async function mergeSkill(
       updatedAt: new Date().toISOString(),
     };
 
-    saveSkill(merged);
+    // Merges go directly to active (existing skill was already approved)
+    saveActiveSkill(merged);
     logger.info({ name: merged.name }, 'Skill merged and updated');
     return merged;
   } catch (err) {
@@ -245,11 +370,11 @@ export function searchSkills(query: string, limit = 3, agentSlug?: string): Skil
   const dirs: Array<{ dir: string; boost: number }> = [];
   // Agent-scoped skills get priority (boost=2)
   if (agentSlug) {
-    const agentDir = path.join(VAULT_DIR, '00-System', 'agents', agentSlug, 'skills');
+    const agentDir = agentSkillsDir(agentSlug);
     if (existsSync(agentDir)) dirs.push({ dir: agentDir, boost: 2 });
   }
   // Global skills (no boost)
-  if (existsSync(SKILLS_DIR)) dirs.push({ dir: SKILLS_DIR, boost: 0 });
+  if (existsSync(GLOBAL_SKILLS_DIR)) dirs.push({ dir: GLOBAL_SKILLS_DIR, boost: 0 });
 
   if (dirs.length === 0) return [];
 
@@ -300,36 +425,52 @@ export function searchSkills(query: string, limit = 3, agentSlug?: string): Skil
 }
 
 /** Record that a skill was used (bump use count). */
-export function recordSkillUse(skillName: string): void {
+export function recordSkillUse(skillName: string, agentSlug?: string): void {
   try {
-    const filePath = path.join(SKILLS_DIR, `${skillName}.md`);
-    if (!existsSync(filePath)) return;
-    const raw = readFileSync(filePath, 'utf-8');
-    const parsed = matter(raw);
-    parsed.data.useCount = (parsed.data.useCount ?? 0) + 1;
-    parsed.data.lastUsed = new Date().toISOString();
-    writeFileSync(filePath, matter.stringify(parsed.content, parsed.data));
+    // Check agent dir first, then global
+    const dirs = agentSlug ? [agentSkillsDir(agentSlug), GLOBAL_SKILLS_DIR] : [GLOBAL_SKILLS_DIR];
+    for (const dir of dirs) {
+      const filePath = path.join(dir, `${skillName}.md`);
+      if (!existsSync(filePath)) continue;
+      const raw = readFileSync(filePath, 'utf-8');
+      const parsed = matter(raw);
+      parsed.data.useCount = (parsed.data.useCount ?? 0) + 1;
+      parsed.data.lastUsed = new Date().toISOString();
+      writeFileSync(filePath, matter.stringify(parsed.content, parsed.data));
+      return;
+    }
   } catch { /* non-fatal */ }
 }
 
-/** List all skills (for dashboard/status). */
-export function listSkills(): Array<{ name: string; title: string; source: string; useCount: number; updatedAt: string }> {
-  if (!existsSync(SKILLS_DIR)) return [];
-  return readdirSync(SKILLS_DIR)
-    .filter(f => f.endsWith('.md'))
-    .map(f => {
+/** List all active skills (global + all agent-scoped). */
+export function listSkills(agentSlug?: string): Array<{ name: string; title: string; source: string; useCount: number; updatedAt: string; agentSlug?: string }> {
+  const results: ReturnType<typeof listSkills> = [];
+
+  const dirs: Array<{ dir: string; slug?: string }> = [];
+  if (agentSlug) {
+    dirs.push({ dir: agentSkillsDir(agentSlug), slug: agentSlug });
+  } else {
+    dirs.push({ dir: GLOBAL_SKILLS_DIR });
+  }
+
+  for (const { dir, slug } of dirs) {
+    if (!existsSync(dir)) continue;
+    for (const f of readdirSync(dir).filter(f => f.endsWith('.md'))) {
       try {
-        const parsed = matter(readFileSync(path.join(SKILLS_DIR, f), 'utf-8'));
-        return {
+        const parsed = matter(readFileSync(path.join(dir, f), 'utf-8'));
+        results.push({
           name: f.replace('.md', ''),
           title: parsed.data.title ?? f,
           source: parsed.data.source ?? 'unknown',
           useCount: parsed.data.useCount ?? 0,
           updatedAt: parsed.data.updatedAt ?? '',
-        };
-      } catch { return null; }
-    })
-    .filter(Boolean) as any[];
+          agentSlug: slug,
+        });
+      } catch { /* skip */ }
+    }
+  }
+
+  return results;
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────

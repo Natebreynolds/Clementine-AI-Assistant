@@ -644,6 +644,7 @@ async function asyncMain(): Promise<void> {
   const { NotificationDispatcher } = await import('./gateway/notifications.js');
   const dispatcher = new NotificationDispatcher();
   gateway.setDispatcher(dispatcher);
+  gateway.initSkillNotifications();
 
   // Heartbeat + Cron schedulers
   const { HeartbeatScheduler, CronScheduler } = await import('./gateway/heartbeat.js');

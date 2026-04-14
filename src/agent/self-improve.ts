@@ -57,7 +57,7 @@ const DEFAULT_CONFIG: SelfImproveConfig = {
   maxDurationMs: 3_600_000,         // 1 hour
   acceptThreshold: 0.7,
   plateauLimit: 3,
-  areas: ['soul', 'cron', 'workflow', 'memory', 'agent', 'source', 'communication'],
+  areas: ['soul', 'cron', 'workflow', 'memory', 'agent', 'source', 'communication', 'goal'],
   autoApply: true,
   sourceMode: 'propose-only',
 };
@@ -211,6 +211,7 @@ function classifyRisk(area: string): RiskTier {
     case 'communication': return 'medium'; // Global operating instructions
     case 'memory':    return 'medium'; // Memory config
     case 'source':    return 'high';   // Code changes — always blocked in auto mode
+    case 'goal':      return 'medium'; // New goals need owner review before activating
     default:          return 'high';
   }
 }
@@ -898,6 +899,10 @@ export class SelfImproveLoop {
       `- target: the file/agent slug that should change\n` +
       `- what: a 1-sentence description of what specifically should change\n` +
       `- why: which metric this should improve\n\n` +
+      `Area notes:\n` +
+      `- For "goal": target = "{owner}/{goal-slug}" (e.g. "clementine/improve-reply-rates" or "ross-the-sdr/book-demos"). ` +
+      `Propose when you observe a pattern in completed tasks or cron runs that suggests a missing or stale goal. ` +
+      `The proposedChange must be a JSON goal object with at minimum: title, description, priority, reviewFrequency.\n\n` +
       `Output ONLY a JSON array of 1-3 objects (no markdown, no explanation):\n` +
       `[{ "area": "...", "target": "...", "what": "...", "why": "..." }]\n` +
       `If no improvement is needed, output: []`;
@@ -1006,6 +1011,22 @@ export class SelfImproveLoop {
       case 'memory': {
         const memoryFile = path.join(VAULT_DIR, '00-System', 'MEMORY.md');
         return existsSync(memoryFile) ? readFileSync(memoryFile, 'utf-8') : '';
+      }
+      case 'goal': {
+        // target = "{owner}" e.g. "clementine" or an agent slug
+        const owner = target.split('/')[0];
+        const goalDir = owner === 'clementine'
+          ? GOALS_DIR
+          : path.join(AGENTS_DIR, owner, 'goals');
+        if (!existsSync(goalDir)) return '(no goals yet for this owner)';
+        const files = readdirSync(goalDir).filter(f => f.endsWith('.json') && !readdirSync(goalDir).includes(f + '.bak'));
+        const goals = files.map(f => {
+          try { return JSON.parse(readFileSync(path.join(goalDir, f), 'utf-8')); } catch { return null; }
+        }).filter(Boolean);
+        if (goals.length === 0) return '(no goals yet for this owner)';
+        return goals.map((g: any) =>
+          `[${g.status ?? 'unknown'}] ${g.title}: ${(g.description ?? '').slice(0, 120)}`
+        ).join('\n');
       }
       default:
         return '';
@@ -1121,6 +1142,43 @@ export class SelfImproveLoop {
         logger.warn({ err }, 'Failed to schedule impact check');
       }
       return `Applied source change to ${pending.target} — restart triggered.`;
+    }
+
+    // Goal area: parse JSON, inject required fields, ensure parent dir exists
+    if (pending.area === 'goal') {
+      try {
+        const goalData = JSON.parse(pending.proposedChange);
+        const [owner, goalSlug] = pending.target.split('/');
+        if (!goalSlug) return `Invalid goal target (need "owner/slug"): ${pending.target}`;
+
+        const goalDir = owner === 'clementine'
+          ? GOALS_DIR
+          : path.join(AGENTS_DIR, owner, 'goals');
+        mkdirSync(goalDir, { recursive: true });
+
+        const now = new Date().toISOString();
+        const goalJson = JSON.stringify({
+          id: goalSlug,
+          owner,
+          status: 'active',
+          createdAt: now,
+          progressNotes: [],
+          ...goalData,
+          updatedAt: now,
+        }, null, 2);
+
+        writeFileSync(targetPath, goalJson);
+        this.recordVersion(experimentId, pending.area, pending.target, pending.hypothesis, pending.before);
+        this.updateExperimentStatus(experimentId, 'approved');
+        try { unlinkSync(pendingFile); } catch { /* ignore */ }
+        const state = this.loadState();
+        state.pendingApprovals = Math.max(0, state.pendingApprovals - 1);
+        this.saveState(state);
+        logger.info({ id: experimentId, target: pending.target }, 'Goal created from self-improve proposal');
+        return `Goal created: ${goalData.title ?? goalSlug}`;
+      } catch (err) {
+        return `Failed to create goal: ${err instanceof Error ? err.message : String(err)}`;
+      }
     }
 
     // Final validation before writing
@@ -1804,6 +1862,13 @@ export class SelfImproveLoop {
         return AGENTS_FILE;
       case 'memory':
         return path.join(VAULT_DIR, '00-System', 'MEMORY.md');
+      case 'goal': {
+        // target = "{owner}/{goalSlug}" e.g. "clementine/book-10-demos-q2" or "ross-the-sdr/expand-pool"
+        const [owner, goalSlug] = target.split('/');
+        if (!goalSlug) return null; // need both owner and slug
+        if (owner === 'clementine') return path.join(GOALS_DIR, `${goalSlug}.json`);
+        return path.join(AGENTS_DIR, owner, 'goals', `${goalSlug}.json`);
+      }
       default:
         return null;
     }
@@ -1870,6 +1935,14 @@ export function validateProposal(area: string, target: string, proposedChange: s
       matter(proposedChange);
     } catch (err) {
       return { valid: false, error: `YAML frontmatter parse error: ${err instanceof Error ? err.message : String(err)}` };
+    }
+  }
+  if (area === 'goal') {
+    try {
+      const parsed = JSON.parse(proposedChange);
+      if (!parsed.title) return { valid: false, error: 'Goal proposal missing required "title" field' };
+    } catch (err) {
+      return { valid: false, error: `Goal proposal must be valid JSON: ${err instanceof Error ? err.message : String(err)}` };
     }
   }
   if (area === 'cron') {

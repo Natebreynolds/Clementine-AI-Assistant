@@ -585,6 +585,7 @@ export class PersonalAssistant {
   private onUnleashedComplete: ((jobName: string, result: string) => void) | null = null;
   private onPhaseComplete: ((jobName: string, phase: number, totalPhases: number, output: string) => void) | null = null;
   private onPhaseProgress: ((jobName: string, phase: number, summary: string) => void) | null = null;
+  onSkillProposed: ((skill: import('../types.js').SkillDocument) => void) | null = null;
   private _lastMcpStatus: Array<{ name: string; status: string }> = [];
   private _lastMcpStatusTime: string = '';
   /** Terminal reason from the last SDK query — consumed by cron scheduler for precise error classification. */
@@ -663,6 +664,10 @@ export class PersonalAssistant {
 
   setPhaseProgressCallback(cb: (jobName: string, phase: number, summary: string) => void): void {
     this.onPhaseProgress = cb;
+  }
+
+  setSkillProposedCallback(cb: (skill: import('../types.js').SkillDocument) => void): void {
+    this.onSkillProposed = cb;
   }
 
   getMcpStatus(): { servers: Array<{ name: string; status: string }>; updatedAt: string } {

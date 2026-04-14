@@ -492,6 +492,47 @@ export class Gateway {
     this.assistant.setPhaseProgressCallback(cb);
   }
 
+  /** Wire the skill-proposed notification — called once at startup so new skills surface to owner. */
+  initSkillNotifications(): void {
+    this.assistant.setSkillProposedCallback((skill) => {
+      const agentTag = skill.agentSlug ? ` (from ${skill.agentSlug})` : '';
+      const msg =
+        `New skill learned${agentTag}: **${skill.title}**\n` +
+        `${skill.description}\n\n` +
+        `Reply \`approve skill ${skill.name}\` to activate it or \`reject skill ${skill.name}\` to discard.`;
+      this._dispatcher?.send(msg).catch(() => { /* non-fatal */ });
+    });
+  }
+
+  // ── Skill management ──────────────────────────────────────────────
+
+  async handleSkill(action: string, args?: { name?: string }): Promise<string> {
+    const { approvePendingSkill, rejectPendingSkill, listPendingSkills } = await import('../agent/skill-extractor.js');
+
+    switch (action) {
+      case 'pending': {
+        const pending = listPendingSkills();
+        if (pending.length === 0) return 'No skills pending approval.';
+        return pending.map(s => {
+          const agentTag = s.agentSlug ? ` [${s.agentSlug}]` : ' [global]';
+          return `**${s.name}**${agentTag} — ${s.title}\n  ${s.description}\n  Source: ${s.source} | Created: ${s.createdAt.slice(0, 10)}`;
+        }).join('\n\n');
+      }
+      case 'approve': {
+        if (!args?.name) return 'Missing skill name.';
+        const result = approvePendingSkill(args.name);
+        return result.message;
+      }
+      case 'reject': {
+        if (!args?.name) return 'Missing skill name.';
+        const result = rejectPendingSkill(args.name);
+        return result.message;
+      }
+      default:
+        return `Unknown skill action: ${action}. Try: pending, approve <name>, reject <name>`;
+    }
+  }
+
   // ── Session verbose level ──────────────────────────────────────────
 
   setSessionVerboseLevel(sessionKey: string, level: VerboseLevel): void {
