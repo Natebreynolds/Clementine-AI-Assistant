@@ -676,6 +676,7 @@ export class Gateway {
         // Owner DMs are trusted — only block on high-confidence injection patterns,
         // not integrity changes (which are usually caused by Clementine's own writes).
         const isOwnerDm = sessionKey.startsWith('discord:user:') ||
+          sessionKey.startsWith('discord:agent:') ||
           sessionKey.startsWith('slack:dm:') ||
           sessionKey.startsWith('telegram:');
         const shouldBlock = scan.verdict === 'block' && !isOwnerDm;
@@ -1244,6 +1245,7 @@ export class Gateway {
         const scan = scanner.scan(taskDescription);
 
         const isOwnerDm = sessionKey.startsWith('discord:user:') ||
+          sessionKey.startsWith('discord:agent:') ||
           sessionKey.startsWith('slack:dm:') ||
           sessionKey.startsWith('telegram:');
         const shouldBlock = scan.verdict === 'block' && !isOwnerDm;

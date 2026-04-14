@@ -148,8 +148,12 @@ export class AgentBotClient {
       this.status = 'online';
       this.errorMessage = undefined;
 
-      // Resolve channels
+      // Resolve channels and pre-register them as "seen" in the gateway
+      // so the new-channel check-in gate doesn't fire for known agent channels
       this.resolvedChannelIds = this.discoverChannels();
+      for (const chId of this.resolvedChannelIds) {
+        this.gateway.markChannelSeen(`discord:channel:${chId}`);
+      }
 
       // Register slash commands for this bot
       try {
