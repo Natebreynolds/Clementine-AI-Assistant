@@ -111,7 +111,7 @@ That's it. Clementine is now running, connected to your configured channels, and
 ~/.clementine/                     ← Data home (created on first run)
 ├── .env                           ← Configuration (created by setup wizard)
 ├── .sessions.json                 ← Session persistence
-├── .memory.db                     ← SQLite FTS5 index
+├── .memory.db                     ← (legacy, unused — real DB is vault/.memory.db)
 ├── .clementine.pid                ← Daemon PID lock
 ├── logs/
 │   ├── clementine.log             ← Daemon stdout/stderr
@@ -154,9 +154,14 @@ src/                               ← Package code (wherever npm installed it)
 │   ├── heartbeat.ts               ← HeartbeatScheduler + CronScheduler
 │   └── notifications.ts           ← Channel-agnostic notification fan-out
 ├── memory/
-│   ├── store.ts                   ← SQLite FTS5 memory store
+│   ├── store.ts                   ← SQLite FTS5 memory store + embedding backfill
+│   ├── embeddings.ts              ← TF-IDF embedding provider (local, 512-dim vectors)
 │   ├── search.ts                  ← Temporal decay, dedup, formatting
-│   └── chunker.ts                 ← Vault file parser (## headers, frontmatter)
+│   ├── chunker.ts                 ← Vault file parser (## headers, frontmatter)
+│   ├── mmr.ts                     ← Maximal Marginal Relevance reranker
+│   ├── consolidation.ts           ← Evening consolidation engine (dedup, summarize, extract)
+│   ├── context-assembler.ts       ← Token-budgeted context slot filler
+│   └── graph-store.ts             ← FalkorDB knowledge graph layer (optional)
 ├── tools/                         ← MCP stdio server (30+ tools, decomposed by domain)
 │   ├── mcp-server.ts             ← Server entry + registration
 │   ├── goal-tools.ts             ← Goal lifecycle tools
@@ -199,14 +204,20 @@ Secrets never reach the Claude subprocess — `SAFE_ENV` filters credentials fro
 
 ### Memory architecture
 
+Three-layer retrieval merges full-text, vector, and recency signals into a single ranked context window:
+
 ```
 User message
     │
+    ├──▶ Layer 1: FTS5 (BM25 relevance)
+    ├──▶ Layer 2: TF-IDF vector similarity (cosine, threshold 0.15)
+    ├──▶ Layer 3: Recent chunks (time-windowed)
+    │
     ▼
-┌──────────────┐     ┌────────────────────┐
-│ FTS5 search  │────▶│ Context injection   │──▶ System prompt
-│ + recency    │     │ (top 3 + recent 5)  │
-└──────────────┘     └────────────────────┘
+┌──────────────────┐     ┌────────────────────┐
+│ MMR rerank       │────▶│ Context assembly    │──▶ System prompt
+│ + deduplication  │     │ (token-budgeted)    │
+└──────────────────┘     └────────────────────┘
     │
     │ salience boost on retrieval
     ▼
@@ -222,6 +233,12 @@ User message
 └──────────────┘
     │
     ▼
+┌──────────────────────┐
+│ Evening consolidation │──▶ Dedup (Jaccard) + topic summarization (LLM)
+│ + embedding rebuild   │    + principle extraction + TF-IDF vocab rebuild
+└──────────────────────┘
+    │
+    ▼
 ┌──────────────┐
 │ Startup       │──▶ Temporal decay + pruning
 │ maintenance   │    (stale memories sink, old data trimmed)
@@ -229,13 +246,18 @@ User message
 ```
 
 - **FTS5** — Full-text search with BM25 ranking, zero-cost, zero-latency
-- **Salience scoring** — Chunks gain score on retrieval, decay over time (30-day half-life)
+- **TF-IDF embeddings** — Local 512-dim vectors (no API calls), vocabulary rebuilt during sync and evening consolidation, cosine similarity search over recent chunks
+- **MMR reranking** — Maximal Marginal Relevance via Jaccard similarity removes near-duplicates and promotes diversity in results
+- **Salience scoring** — Chunks gain score on retrieval, decay over time (7-day half-life). Formula: `log(access_count + 1) * 0.15 + recency_decay * 0.3`
 - **Episodic memory** — Session summaries indexed as searchable chunks
 - **Wikilink graph** — `[[wikilinks]]` parsed and queryable for connection discovery
 - **Knowledge graph** — FalkorDB-powered typed relationships and multi-hop traversal (people → projects → topics). Visualized on a dark canvas in the dashboard with type legend and edge labels.
 - **Procedural skills** — Reusable how-to recipes auto-extracted from successful task executions. Stored as Markdown in `vault/00-System/skills/` and injected into cron jobs and unleashed tasks at runtime. Teach new skills manually via the dashboard Skills tab or let Clementine learn them from conversations.
+- **Evening consolidation** — Nightly pass: deduplicates chunks by Jaccard similarity (>70%), summarizes topic groups via LLM (Haiku), extracts recurring behavioral corrections into permanent rules, and rebuilds TF-IDF vocabulary + backfills embeddings
+- **Agent isolation** — Per-agent memory scoping via `agent_slug` column. Soft mode (default) boosts matching agent chunks 1.4x; strict mode filters to agent + global only
+- **Memory transparency** — Every memory write is logged to `memory_extractions` with user correction/dismissal support from the dashboard
 - **Temporal decay** — Applied on every startup; stale memories naturally sink
-- **Pruning** — Episodic chunks >90 days with salience <0.01 are removed; old transcripts and access logs trimmed
+- **Pruning** — Episodic chunks >90 days with salience <0.01 are removed; old transcripts, access logs, and orphaned references trimmed
 
 ### MCP tools (30+)
 
@@ -755,7 +777,7 @@ Run `clementine doctor` to verify the fix. This check is now built-in — doctor
 ### Memory search returns empty results
 
 1. Run `clementine doctor` — check the `better-sqlite3` line
-2. Verify the database exists: `ls ~/.clementine/.memory.db`
+2. Verify the database exists: `ls ~/.clementine/vault/.memory.db`
 3. If the DB is missing, restart the daemon — it creates the DB and indexes the vault on startup
 
 ### Daemon won't start / duplicate instances
