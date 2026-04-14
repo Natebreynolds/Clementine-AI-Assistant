@@ -164,7 +164,19 @@ export class HeartbeatScheduler {
       this.lastState.lastSelfImproveDate = this.lastSelfImproveDate;
       this.saveState();
       logger.info('Triggering nightly self-improvement cycle');
-      this.gateway.handleSelfImprove('run-nightly').then(summary => {
+      const notifyProposal = async (experiment: import('../types.js').SelfImproveExperiment) => {
+        const msg =
+          `**Self-Improve Proposal** (#${experiment.iteration}) — needs your approval\n` +
+          `**Area:** ${experiment.area} → ${experiment.target}\n` +
+          `**Score:** ${(experiment.score * 10).toFixed(1)}/10\n` +
+          `**Hypothesis:** ${experiment.hypothesis.slice(0, 200)}\n\n` +
+          `Run \`!self-improve apply ${experiment.id}\` to approve, ` +
+          `or \`!self-improve deny ${experiment.id}\` to reject. ` +
+          `Also visible in the dashboard under Automations → Self-Improve.`;
+        await this.dispatcher.send(msg, {})
+          .catch(err => logger.debug({ err }, 'Failed to send self-improve proposal notification'));
+      };
+      this.gateway.handleSelfImprove('run-nightly', {}, notifyProposal).then(summary => {
         // Notify owner of self-improvement results
         if (summary && !summary.includes('Iterations: 0')) {
           this.dispatcher.send(

@@ -733,6 +733,56 @@ export class CronScheduler {
       }
     }
 
+    // ── Owner confirmation gate ──────────────────────────────────────
+    if (job.requiresConfirmation) {
+      const timeoutMin = job.confirmationTimeoutMin ?? 5;
+      const confirmId = `cron-confirm-${job.name}-${Date.now()}`;
+      const timeoutSec = timeoutMin * 60;
+
+      logger.info({ job: job.name, timeoutMin }, 'Cron job requires confirmation — notifying owner');
+      await this.dispatcher.send(
+        `**Cron job ready to run:** "${job.name}"\n` +
+        `Schedule: \`${job.schedule}\`\n\n` +
+        `Reply \`yes\` or \`go\` to proceed, \`no\` or \`skip\` to cancel. ` +
+        `Auto-runs in ${timeoutMin} min if no reply.`,
+      ).catch(err => logger.debug({ err }, 'Failed to send cron confirmation request'));
+
+      // Override gateway's default 5-min timeout with the job's configured timeout
+      const approved = await new Promise<boolean>((resolve) => {
+        const timer = setTimeout(() => {
+          if (this.gateway.getPendingApprovals().includes(confirmId)) {
+            this.gateway.resolveApproval(confirmId, true); // auto-proceed on timeout
+          }
+          resolve(true);
+        }, timeoutSec * 1000);
+
+        // Register the approval — channel handlers resolve it via resolveApproval()
+        this.gateway.requestApproval(job.name, confirmId).then((result) => {
+          clearTimeout(timer);
+          resolve(result === true || result === 'go' || result === 'yes');
+        }).catch(() => {
+          clearTimeout(timer);
+          resolve(true); // on error, allow job to proceed
+        });
+      });
+
+      if (!approved) {
+        logger.info({ job: job.name }, 'Cron job skipped by owner');
+        this.runLog.append({
+          jobName: job.name,
+          startedAt: new Date().toISOString(),
+          finishedAt: new Date().toISOString(),
+          status: 'skipped',
+          durationMs: 0,
+          attempt: 0,
+          outputPreview: 'Skipped by owner at confirmation prompt',
+        });
+        return;
+      }
+
+      logger.info({ job: job.name }, 'Cron job confirmed — proceeding');
+    }
+
     // ── Adaptive execution: consult advisor before running ──
     const originalJob = job; // snapshot before mutation
     const { getExecutionAdvice } = await import('../agent/execution-advisor.js');

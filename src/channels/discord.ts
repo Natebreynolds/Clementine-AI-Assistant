@@ -1149,12 +1149,14 @@ export async function startDiscord(
 
     if (isDm) {
       const lower = text.toLowerCase();
-      if (['yes', 'no', 'approve', 'deny'].includes(lower)) {
+      if (['yes', 'no', 'approve', 'deny', 'go', 'skip', 'always'].includes(lower)) {
         const approvals = gateway.getPendingApprovals();
         if (approvals.length > 0) {
-          const approved = lower === 'yes' || lower === 'approve';
-          gateway.resolveApproval(approvals[approvals.length - 1], approved);
-          await message.react(approved ? '\u2705' : '\u274c');
+          // Pass 'always' as a string so the check-in gate can persist the channel
+          const result: boolean | string = lower === 'always' ? 'always' :
+            (lower === 'yes' || lower === 'approve' || lower === 'go');
+          gateway.resolveApproval(approvals[approvals.length - 1], result);
+          await message.react(lower === 'no' || lower === 'deny' || lower === 'skip' ? '\u274c' : '\u2705');
           return;
         }
       }

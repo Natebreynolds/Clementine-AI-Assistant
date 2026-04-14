@@ -211,6 +211,7 @@ export interface AgentProfile {
   status?: AgentStatus;            // Persistent agent status (default: active)
   budgetMonthlyCents?: number;     // Monthly token budget in cents (0 = unlimited)
   spentMonthlyCents?: number;      // Current month's spend (computed from usage_log)
+  strictMemoryIsolation?: boolean; // If true (default), only see own + global memory. false = soft boost (legacy).
 }
 
 export type AgentStatus = 'active' | 'paused' | 'error' | 'terminated';
@@ -282,6 +283,8 @@ export interface CronJobDefinition {
   context?: string;                 // Freeform context/notes injected into prompt at runtime (training data, guidelines, etc.)
   preCheck?: string;               // Shell command gate — exit 0 = run, non-zero = skip. Stdout injected as context.
   attachments?: string[];          // Filenames in ~/.clementine/attachments/{job-name}/ injected at runtime
+  requiresConfirmation?: boolean;  // If true, ask owner before running — auto-proceeds after timeout
+  confirmationTimeoutMin?: number; // Minutes to wait for confirmation before auto-proceeding (default: 5)
 }
 
 export type TerminalReason =

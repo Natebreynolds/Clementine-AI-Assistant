@@ -119,6 +119,7 @@ export type MemoryStoreType = {
     responseSnippet?: string; rating: string; comment?: string; createdAt: string;
   }>;
   getFeedbackStats(): { positive: number; negative: number; mixed: number; total: number };
+  promoteToGlobal(chunkId: number, promotedBy?: string): string;
   db: unknown;
 };
 

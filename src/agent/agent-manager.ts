@@ -251,6 +251,7 @@ export class AgentManager {
         : undefined,
       status: (['active', 'paused', 'error', 'terminated'].includes(meta.status) ? meta.status : 'active') as AgentStatus,
       budgetMonthlyCents: meta.budgetMonthlyCents ? Number(meta.budgetMonthlyCents) : undefined,
+      strictMemoryIsolation: meta.strictMemoryIsolation === false ? false : true, // default true for all agents
     };
   }
 
@@ -320,6 +321,7 @@ export class AgentManager {
       name: config.name,
       description: config.description,
       tier: Math.min(config.tier ?? 2, 2),
+      strictMemoryIsolation: true,  // new agents get hard isolation by default
     };
     if (config.model) frontmatter.model = config.model;
     if (config.avatar) frontmatter.avatar = config.avatar;

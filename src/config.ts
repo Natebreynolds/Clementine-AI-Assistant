@@ -340,6 +340,7 @@ export const SOURCE_MODS_DIR = path.join(SELF_IMPROVE_DIR, 'source-mods');
 // ── Goals & Cron Progress ───────────────────────────────────────────
 
 export const GOALS_DIR = path.join(BASE_DIR, 'goals');
+export const SEEN_CHANNELS_FILE = path.join(BASE_DIR, 'seen-channels.json');
 export const CRON_PROGRESS_DIR = path.join(BASE_DIR, 'cron', 'progress');
 export const CRON_REFLECTIONS_DIR = path.join(BASE_DIR, 'cron', 'reflections');
 export const DELEGATIONS_DIR = path.join(VAULT_DIR, '00-System', 'agents');

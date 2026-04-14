@@ -693,6 +693,25 @@ server.tool(
 );
 
 server.tool(
+  'promote_memory_to_global',
+  'Promote one of your private memories to global shared memory, making it visible to all agents. ' +
+  'Use when you have learned something universally useful that other agents should also know. ' +
+  'Requires a chunk ID (from memory_search results). Owner is notified of all promotions.',
+  {
+    chunk_id: z.number().describe('ID of the memory chunk to promote (from memory_search results)'),
+    reason: z.string().describe('Why this insight is worth sharing globally — shown in the audit log'),
+  },
+  async ({ chunk_id, reason }) => {
+    const store = await getStore();
+    if (!store) return textResult('Memory store not available.');
+
+    const result = store.promoteToGlobal(chunk_id, ACTIVE_AGENT_SLUG ?? 'unknown');
+    logger.info({ chunkId: chunk_id, promotedBy: ACTIVE_AGENT_SLUG, reason }, 'Memory promoted to global');
+    return textResult(`${result}\n\nReason: ${reason}`);
+  },
+);
+
+server.tool(
   'memory_graph_invalidate',
   'Mark a relationship as no longer active by setting its end date. Use when a fact changes (e.g., someone leaves a company).',
   {

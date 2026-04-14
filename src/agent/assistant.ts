@@ -154,6 +154,17 @@ export function estimateTokens(text: string): number {
   return Math.ceil(words * 1.3 + punctuation * 0.8 + lines * 0.5);
 }
 
+/**
+ * Strip lone Unicode surrogates (U+D800–U+DFFF) from a string so it can be
+ * safely serialized to JSON. Lone surrogates are valid in JS strings but
+ * produce invalid JSON ("no low surrogate in string"), causing 400 errors
+ * when the prompt is sent to the Claude API.
+ */
+function stripLoneSurrogates(s: string): string {
+  // Replace any surrogate not properly paired with the Unicode replacement char
+  return s.replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, '\uFFFD');
+}
+
 /** Format a millisecond duration as a human-friendly "X ago" string. */
 function formatTimeAgo(ms: number): string {
   const minutes = Math.floor(ms / 60_000);
@@ -1454,6 +1465,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
     sessionKey?: string | null,
     agentSlug?: string,
     isAutonomous?: boolean,
+    strictIsolation?: boolean,
   ): Promise<string> {
     if (!this.memoryStore) return '';
 
@@ -1476,7 +1488,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
 
       const results = this.memoryStore.searchContext(
         enrichedQuery,
-        { limit: SEARCH_CONTEXT_LIMIT, recencyLimit: SEARCH_RECENCY_LIMIT, agentSlug },
+        { limit: SEARCH_CONTEXT_LIMIT, recencyLimit: SEARCH_RECENCY_LIMIT, agentSlug, strict: strictIsolation },
       );
 
       if (results?.length > 0) {
@@ -1688,7 +1700,10 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
       sessionRotated = true;
     }
 
-    let effectivePrompt = text;
+    // Sanitize lone Unicode surrogates before any JSON serialization to the API.
+    // Lone surrogates (U+D800–U+DFFF) are valid JS strings but invalid JSON,
+    // causing 400 "no low surrogate in string" errors from the Claude API.
+    let effectivePrompt = stripLoneSurrogates(text);
 
     // If session rotated, use instant local summary + handoff + kick off LLM summary in background
     if (sessionRotated && key) {
@@ -1909,7 +1924,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
     // If a project override is set, skip auto-matching entirely
     const hasActiveSession = !!(sessionKey && this.sessions.has(sessionKey));
     const [rawContext, autoMatchedProject, linkContexts] = await Promise.all([
-      this.retrieveContext(prompt, sessionKey, profile?.slug),
+      this.retrieveContext(prompt, sessionKey, profile?.slug, false, profile?.strictMemoryIsolation ?? (profile ? true : false)),
       Promise.resolve(projectOverride || hasActiveSession ? null : matchProject(prompt)),
       extractLinks(prompt),
     ]);

@@ -152,6 +152,20 @@ export async function startTelegram(
     const chatId = ctx.chat.id;
     const sessionKey = `telegram:user:${userId}`;
 
+    // ── Approval responses ──────────────────────────────────────────
+    const lower = text.toLowerCase().trim();
+    if (['yes', 'no', 'approve', 'deny', 'go', 'skip', 'always'].includes(lower)) {
+      const approvals = gateway.getPendingApprovals();
+      if (approvals.length > 0) {
+        const result: boolean | string = lower === 'always' ? 'always' :
+          (lower === 'yes' || lower === 'approve' || lower === 'go');
+        gateway.resolveApproval(approvals[approvals.length - 1], result);
+        const approved = result !== false;
+        await ctx.reply(approved ? '✅ Approved.' : '❌ Denied.');
+        return;
+      }
+    }
+
     const streamer = new TelegramStreamingMessage(bot, chatId);
     await streamer.start();
 

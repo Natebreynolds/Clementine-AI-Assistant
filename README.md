@@ -70,6 +70,13 @@ The result: Clementine gets better the more you talk to it.
 
 ## Quick start
 
+**Option A — npm (recommended):**
+```bash
+npm install -g clemmy-ts
+clementine setup
+```
+
+**Option B — from source (for development):**
 ```bash
 git clone https://github.com/Natebreynolds/Clementine-AI-Assistant.git clementine
 cd clementine

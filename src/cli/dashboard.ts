@@ -3988,6 +3988,21 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
     res.json({ state, experiments, pending });
   });
 
+  app.post('/api/self-improve/run', async (_req, res) => {
+    try {
+      const gw = await getGateway();
+      // Don't await — run in background and return immediately
+      gw.handleSelfImprove('run').then(_summary => {
+        // complete
+      }).catch(err => {
+        console.error('Dashboard-triggered self-improve failed:', err);
+      });
+      res.json({ ok: true, message: 'Self-improvement cycle started in background.' });
+    } catch (err) {
+      res.json({ ok: false, message: String(err) });
+    }
+  });
+
   app.post('/api/self-improve/apply/:id', async (req, res) => {
     try {
       const gw = await getGateway();
@@ -8806,6 +8821,10 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
           </div>
         </div>
         <div class="tab-pane" id="tab-automations-self-improve">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+            <div style="font-size:13px;color:var(--text-secondary)">Self-improvement runs nightly at 1 AM. You can also trigger it manually.</div>
+            <button class="btn-sm btn-primary" onclick="siRunCycle()" id="si-run-btn">Run Now</button>
+          </div>
           <div class="grid-2" id="si-status-cards"></div>
           <div class="card" style="margin-top:16px">
             <div class="card-header">Pending Proposals</div>
@@ -16192,6 +16211,21 @@ async function siDeny(id) {
     else toast(d.message || 'Failed', 'error');
     refreshSelfImprove();
   } catch (err) { toast('Error: ' + err, 'error'); }
+}
+
+async function siRunCycle() {
+  const btn = document.getElementById('si-run-btn');
+  if (btn) { btn.textContent = 'Running...'; btn.setAttribute('disabled', 'true'); }
+  try {
+    const r = await apiFetch('/api/self-improve/run', { method: 'POST' });
+    const d = await r.json();
+    if (d.ok) toast('Self-improvement cycle started. Check back in a few minutes.', 'success');
+    else toast(d.message || 'Failed to start', 'error');
+  } catch (err) { toast('Error: ' + err, 'error'); }
+  finally {
+    if (btn) { btn.textContent = 'Run Now'; btn.removeAttribute('disabled'); }
+    setTimeout(refreshSelfImprove, 3000);
+  }
 }
 
 // ── Knowledge Graph ──────────────────────

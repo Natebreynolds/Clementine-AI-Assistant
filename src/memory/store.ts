@@ -11,7 +11,7 @@
  */
 
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, readdirSync, statSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import path from 'node:path';
 import Database from 'better-sqlite3';
 import type {
@@ -646,6 +646,7 @@ export class MemoryStore {
     query: string,
     limit: number = 20,
     filters?: { category?: string; topic?: string },
+    isolateAgentSlug?: string, // if set, filter to this agent + global (NULL)
   ): SearchResult[] {
     const sanitized = MemoryStore.sanitizeFtsQuery(query);
     if (!sanitized) return [];
@@ -659,6 +660,10 @@ export class MemoryStore {
            WHERE chunks_fts MATCH ?`;
       const params: any[] = [sanitized];
 
+      if (isolateAgentSlug) {
+        sql += ' AND (c.agent_slug = ? OR c.agent_slug IS NULL)';
+        params.push(isolateAgentSlug);
+      }
       if (filters?.category) {
         sql += ' AND c.category = ?';
         params.push(filters.category);
@@ -713,6 +718,7 @@ export class MemoryStore {
     limit: number = 5,
     agentSlug?: string,
     filters?: { category?: string; topic?: string },
+    strict = false,
   ): SearchResult[] {
     type ChunkRow = {
       id: number;
@@ -754,8 +760,21 @@ export class MemoryStore {
       filterParams.push(filters.topic);
     }
 
-    // If agent specified, get a mix: mostly agent-specific, some global
+    // If agent specified: hard isolation = only own + global; soft = mix with extra global
     if (agentSlug) {
+      if (strict) {
+        // Hard isolation: own chunks + global in one query
+        const rows = this.conn.prepare(
+          `SELECT id, source_file, section, content, chunk_type,
+                  updated_at, salience, agent_slug, category, topic
+           FROM chunks
+           WHERE (agent_slug = ? OR agent_slug IS NULL)${filterSql}
+           ORDER BY updated_at DESC LIMIT ?`,
+        ).all(agentSlug, ...filterParams, limit) as ChunkRow[];
+        return rows.map(mapRow);
+      }
+
+      // Soft isolation: weighted mix — 60% agent, 40% global
       const agentRows = this.conn.prepare(
         `SELECT id, source_file, section, content, chunk_type,
                 updated_at, salience, agent_slug, category, topic
@@ -800,7 +819,7 @@ export class MemoryStore {
    */
   searchContext(
     query: string,
-    limitOrOpts: number | { limit?: number; recencyLimit?: number; agentSlug?: string; category?: string; topic?: string } = 3,
+    limitOrOpts: number | { limit?: number; recencyLimit?: number; agentSlug?: string; category?: string; topic?: string; strict?: boolean } = 3,
     recencyLimitArg: number = 5,
   ): SearchResult[] {
     let limit: number;
@@ -808,12 +827,14 @@ export class MemoryStore {
     let agentSlug: string | undefined;
     let category: string | undefined;
     let topic: string | undefined;
+    let strict: boolean = false;
     if (typeof limitOrOpts === 'object') {
       limit = limitOrOpts.limit ?? 3;
       recencyLimit = limitOrOpts.recencyLimit ?? 5;
       agentSlug = limitOrOpts.agentSlug;
       category = limitOrOpts.category;
       topic = limitOrOpts.topic;
+      strict = limitOrOpts.strict ?? false;
     } else {
       limit = limitOrOpts;
       recencyLimit = recencyLimitArg;
@@ -822,7 +843,7 @@ export class MemoryStore {
     const tagFilters = (category || topic) ? { category, topic } : undefined;
 
     // 1. FTS5 relevance (fetch extra to allow re-ranking after boost)
-    const ftsResults = this.searchFts(query, agentSlug ? limit * 2 : limit, tagFilters);
+    const ftsResults = this.searchFts(query, agentSlug ? limit * 2 : limit, tagFilters, agentSlug && strict ? agentSlug : undefined);
 
     // Apply salience boost to FTS results
     for (const r of ftsResults) {
@@ -831,8 +852,8 @@ export class MemoryStore {
       }
     }
 
-    // Apply agent affinity boost — own-agent results get 1.4× score
-    if (agentSlug) {
+    // Soft-isolation: apply agent affinity boost when not strict
+    if (agentSlug && !strict) {
       for (const r of ftsResults) {
         if (r.agentSlug === agentSlug) {
           r.score *= 1.4;
@@ -846,7 +867,7 @@ export class MemoryStore {
       if (embeddingsModule.isReady()) {
         const queryVec = embeddingsModule.embed(query);
         if (queryVec) {
-          vectorResults = this.searchByEmbedding(queryVec, limit, agentSlug);
+          vectorResults = this.searchByEmbedding(queryVec, limit, agentSlug, strict);
         }
       }
     } catch {
@@ -854,7 +875,7 @@ export class MemoryStore {
     }
 
     // 3. Recency
-    const recentResults = this.getRecentChunks(recencyLimit, agentSlug, tagFilters);
+    const recentResults = this.getRecentChunks(recencyLimit, agentSlug, tagFilters, strict);
 
     // 4. Merge and deduplicate (FTS results first, then vector, then recency)
     const merged = [...ftsResults, ...vectorResults, ...recentResults];
@@ -865,7 +886,7 @@ export class MemoryStore {
    * Search chunks by embedding cosine similarity.
    * Scans chunks that have stored embeddings and returns top matches.
    */
-  private searchByEmbedding(queryVec: Float32Array, limit: number, agentSlug?: string): SearchResult[] {
+  private searchByEmbedding(queryVec: Float32Array, limit: number, agentSlug?: string, strict = false): SearchResult[] {
     const rows = this.conn
       .prepare(
         `SELECT id, source_file, section, content, chunk_type, embedding, salience, agent_slug, updated_at, category, topic
@@ -891,13 +912,17 @@ export class MemoryStore {
     const scored: SearchResult[] = [];
     for (const row of rows) {
       try {
+        // Hard isolation: skip chunks from other agents (allow own + global)
+        if (strict && agentSlug && row.agent_slug !== null && row.agent_slug !== agentSlug) continue;
+
         const vec = embeddingsModule.deserializeEmbedding(row.embedding);
         const sim = embeddingsModule.cosineSimilarity(queryVec, vec);
         if (sim < 0.15) continue; // threshold for relevance
 
         let score = sim * 10; // scale to comparable range with FTS scores
         if (row.salience > 0) score *= (1.0 + row.salience);
-        if (agentSlug && row.agent_slug === agentSlug) score *= 1.4;
+        // Soft isolation: apply boost (only when not strict)
+        if (!strict && agentSlug && row.agent_slug === agentSlug) score *= 1.4;
 
         scored.push({
           sourceFile: row.source_file,
@@ -917,6 +942,49 @@ export class MemoryStore {
     }
 
     return scored.sort((a, b) => b.score - a.score).slice(0, limit);
+  }
+
+  // ── Cross-agent learning: promote insight to global ──────────────
+
+  /**
+   * Promote a memory chunk to global visibility (agent_slug = NULL).
+   * Used by agents to deliberately share an insight across the agent ecosystem.
+   * Does NOT copy the chunk — it promotes the existing chunk in-place.
+   *
+   * @param chunkId - ID of the chunk to promote
+   * @param promotedBy - slug of the agent promoting it (for audit log)
+   * @returns description of what was promoted, or error message
+   */
+  promoteToGlobal(chunkId: number, promotedBy?: string): string {
+    try {
+      const existing = this.conn.prepare(
+        'SELECT id, source_file, section, content, agent_slug FROM chunks WHERE id = ?',
+      ).get(chunkId) as { id: number; source_file: string; section: string; content: string; agent_slug: string | null } | undefined;
+
+      if (!existing) return `Chunk ${chunkId} not found.`;
+      if (existing.agent_slug === null) return `Chunk ${chunkId} is already global.`;
+
+      this.conn.prepare(
+        'UPDATE chunks SET agent_slug = NULL WHERE id = ?',
+      ).run(chunkId);
+
+      const preview = existing.content.slice(0, 80).replace(/\n/g, ' ');
+      const msg = `Promoted chunk ${chunkId} (from ${existing.agent_slug ?? 'global'}) to global: "${preview}..."`;
+
+      // Append to promoted-insights log for audit trail
+      try {
+        const logDir = path.join(path.dirname(this.dbPath), '..', 'logs');
+        if (!existsSync(logDir)) mkdirSync(logDir, { recursive: true });
+        appendFileSync(
+          path.join(logDir, 'promoted-insights.jsonl'),
+          JSON.stringify({ ts: new Date().toISOString(), chunkId, promotedBy, section: existing.section, preview }) + '\n',
+        );
+      } catch { /* non-fatal */ }
+
+      return msg;
+    } catch (err) {
+      return `Failed to promote chunk: ${err}`;
+    }
   }
 
   // ── Wikilink Graph ────────────────────────────────────────────────
