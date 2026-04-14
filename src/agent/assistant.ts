@@ -1866,7 +1866,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
     const guard = new StallGuard();
 
     let [responseText, sessionId] = await this.runQuery(
-      effectivePrompt, key, onText, model, profile, securityAnnotation, effectiveMaxTurns, projectOverride, onToolActivity, verboseLevel, abortController, guard, CHAT_TIMEOUT_MS, intent,
+      stripLoneSurrogates(effectivePrompt), key, onText, model, profile, securityAnnotation, effectiveMaxTurns, projectOverride, onToolActivity, verboseLevel, abortController, guard, CHAT_TIMEOUT_MS, intent,
     );
 
     // If we got a context-length / prompt-too-long error, retry with a fresh session
@@ -1880,7 +1880,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
       logger.warn({ sessionKey: key }, 'Context overflow detected — rotating session');
       this.sessions.delete(key);
       this.exchangeCounts.set(key, 0);
-      let retryPrompt = text;
+      let retryPrompt = stripLoneSurrogates(text);
       const summary = await this.summarizeSession(key);
       if (summary) {
         retryPrompt =
@@ -1888,7 +1888,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
           `Here is a summary of what we were discussing:\n${summary}]\n\n` +
           `IMPORTANT: The previous attempt overflowed the context window, likely from large tool responses. ` +
           `If this task involves pulling data for multiple entities, delegate each to a sub-agent using the Agent tool ` +
-          `instead of calling data-heavy tools directly.\n\n${text}`;
+          `instead of calling data-heavy tools directly.\n\n${stripLoneSurrogates(text)}`;
       }
       [responseText, sessionId] = await this.runQuery(retryPrompt, key, onText, model, profile, securityAnnotation, maxTurns, undefined, onToolActivity, verboseLevel, abortController);
     }
@@ -1898,7 +1898,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
       this.exchangeCounts.set(key, (this.exchangeCounts.get(key) ?? 0) + 1);
       this.sessionTimestamps.set(key, new Date());
       const history = this.lastExchanges.get(key) ?? [];
-      history.push({ user: text, assistant: responseText });
+      history.push({ user: stripLoneSurrogates(text), assistant: responseText });
       if (history.length > SESSION_EXCHANGE_HISTORY_SIZE) {
         this.lastExchanges.set(key, history.slice(-SESSION_EXCHANGE_HISTORY_SIZE));
       } else {
@@ -1910,7 +1910,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
     // Save transcript turns
     if (key && this.memoryStore) {
       try {
-        this.memoryStore.saveTurn(key, 'user', text);
+        this.memoryStore.saveTurn(key, 'user', stripLoneSurrogates(text));
         this.memoryStore.saveTurn(key, 'assistant', responseText, model ?? MODEL);
       } catch (err) {
         logger.warn({ err, sessionKey: key }, 'Transcript save failed');
