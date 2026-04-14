@@ -580,6 +580,15 @@ export class MemoryStore {
       .get() as { cnt: number } | undefined;
     stats.chunksTotal = countRow?.cnt ?? 0;
 
+    // Rebuild embedding vocabulary and backfill missing embeddings
+    if (filesToUpdate.length > 0) {
+      try {
+        this.buildEmbeddings();
+      } catch {
+        // Non-fatal — FTS search still works without embeddings
+      }
+    }
+
     return stats;
   }
 
@@ -1343,6 +1352,11 @@ export class MemoryStore {
          WHERE accessed_at < datetime('now', ?)`,
       )
       .run(`-${accessRetention} days`);
+
+    // Clean orphaned access_log entries (chunk was deleted but access_log wasn't)
+    this.conn.exec(
+      'DELETE FROM access_log WHERE chunk_id NOT IN (SELECT id FROM chunks)',
+    );
 
     // Trim old transcripts (keep session_summaries which are more compact)
     const transcriptResult = this.conn
@@ -2522,12 +2536,55 @@ export class MemoryStore {
     ) as Array<Record<string, unknown>>;
   }
 
+  // ── Embeddings ──────────────────────────────────────────────────
+
+  /**
+   * Build the TF-IDF vocabulary from all chunk contents, then backfill
+   * embeddings for any chunks that don't have one yet.
+   * Safe to call repeatedly — skips chunks that already have embeddings.
+   */
+  buildEmbeddings(): { vocabSize: number; backfilled: number } {
+    // Gather all chunk contents for vocabulary building
+    const rows = this.conn
+      .prepare('SELECT id, content FROM chunks WHERE consolidated = 0')
+      .all() as Array<{ id: number; content: string }>;
+
+    if (rows.length === 0) return { vocabSize: 0, backfilled: 0 };
+
+    // Build vocabulary from corpus
+    embeddingsModule.buildVocab(rows.map((r) => r.content));
+
+    if (!embeddingsModule.isReady()) return { vocabSize: 0, backfilled: 0 };
+
+    // Backfill embeddings for chunks that don't have one
+    const missing = this.conn
+      .prepare('SELECT id, content FROM chunks WHERE embedding IS NULL AND consolidated = 0')
+      .all() as Array<{ id: number; content: string }>;
+
+    const updateStmt = this.conn.prepare('UPDATE chunks SET embedding = ? WHERE id = ?');
+    let backfilled = 0;
+
+    for (const row of missing) {
+      const vec = embeddingsModule.embed(row.content);
+      if (vec) {
+        updateStmt.run(embeddingsModule.serializeEmbedding(vec), row.id);
+        backfilled++;
+      }
+    }
+
+    return { vocabSize: rows.length, backfilled };
+  }
+
   // ── Helpers ───────────────────────────────────────────────────────
 
   /**
-   * Delete all chunks, wikilinks, and file hash for a given file.
+   * Delete all chunks, wikilinks, file hash, and access log for a given file.
    */
   private deleteFileChunks(relPath: string): void {
+    // Delete access_log entries for chunks being removed (prevent orphans)
+    this.conn
+      .prepare('DELETE FROM access_log WHERE chunk_id IN (SELECT id FROM chunks WHERE source_file = ?)')
+      .run(relPath);
     this.conn.prepare('DELETE FROM chunks WHERE source_file = ?').run(relPath);
     this.conn.prepare('DELETE FROM wikilinks WHERE source_file = ?').run(relPath);
     this.conn.prepare('DELETE FROM file_hashes WHERE rel_path = ?').run(relPath);

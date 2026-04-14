@@ -257,6 +257,16 @@ export class HeartbeatScheduler {
         if (result.deduped > 0 || result.summarized > 0 || result.principlesExtracted > 0) {
           logger.info(result, 'Programmatic consolidation results');
         }
+
+        // Rebuild embedding vocabulary and backfill after consolidation
+        try {
+          const embResult = store.buildEmbeddings();
+          if (embResult.backfilled > 0) {
+            logger.info(embResult, 'Embedding backfill after consolidation');
+          }
+        } catch (err) {
+          logger.debug({ err }, 'Embedding backfill failed (non-fatal)');
+        }
       }).catch(err => {
         logger.warn({ err }, 'Programmatic consolidation failed');
       });

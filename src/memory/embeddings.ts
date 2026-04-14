@@ -9,7 +9,7 @@
  * Query-time: embed the query, compute cosine similarity against stored vectors.
  */
 
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import pino from 'pino';
 
@@ -83,7 +83,6 @@ export function buildVocab(documents: string[]): void {
 
   // Persist to disk
   try {
-    const { writeFileSync, mkdirSync } = require('node:fs');
     mkdirSync(path.dirname(VOCAB_PATH), { recursive: true });
     writeFileSync(VOCAB_PATH, JSON.stringify(Object.fromEntries(idfVocab)));
     logger.info({ vocabSize: vocabWords.length, corpusSize: N }, 'Embedding vocabulary built');
