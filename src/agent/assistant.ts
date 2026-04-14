@@ -1893,8 +1893,11 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
       [responseText, sessionId] = await this.runQuery(retryPrompt, key, onText, model, profile, securityAnnotation, maxTurns, undefined, onToolActivity, verboseLevel, abortController);
     }
 
-    // Track exchange count, timestamp, and last exchange
-    if (key) {
+    // Track exchange count, timestamp, and last exchange.
+    // Never store API error responses — they poison session history and create
+    // a self-reinforcing loop where every subsequent request replays the errors.
+    const isApiError = responseText.startsWith('Error:') && responseText.includes('API Error:');
+    if (key && !isApiError) {
       this.exchangeCounts.set(key, (this.exchangeCounts.get(key) ?? 0) + 1);
       this.sessionTimestamps.set(key, new Date());
       const history = this.lastExchanges.get(key) ?? [];
@@ -1904,6 +1907,12 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
       } else {
         this.lastExchanges.set(key, history);
       }
+      this.saveSessions();
+    } else if (key && isApiError) {
+      // On API error, clear the SDK session so the binary starts fresh next turn
+      // (the existing session file may contain accumulated error messages)
+      logger.warn({ sessionKey: key }, 'API error response — clearing SDK session to prevent history poisoning');
+      this.sessions.delete(key);
       this.saveSessions();
     }
 
