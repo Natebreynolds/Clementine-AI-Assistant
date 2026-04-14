@@ -1080,51 +1080,21 @@ program
       }
     }
 
-    // ── Trigger browser OAuth via the embedded claude CLI ────────────
-    // The SDK ships its own claude binary. When run without valid credentials
-    // it opens a browser OAuth flow — the same experience as `claude` on first run.
-    console.log('\n  No credentials found. Opening Anthropic OAuth login...');
-    console.log('  Complete the browser flow, then type /exit or press Ctrl+C to return.\n');
+    // ── Open browser and prompt for paste ────────────────────────────
+    const CONSOLE_URL = 'https://console.anthropic.com/settings/keys';
+    console.log('\n  Opening Anthropic console in your browser...');
+    console.log(`  ${CONSOLE_URL}\n`);
+    console.log('  1. Create or copy an API key');
+    console.log('  2. Paste it here and press Enter\n');
 
-    const readKeychainToken = (): string | undefined => {
-      if (process.platform !== 'darwin') return undefined;
-      try {
-        const raw = execSync('security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null', {
-          encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'],
-        }).trim();
-        return JSON.parse(raw)?.claudeAiOauth?.accessToken ?? undefined;
-      } catch {
-        return undefined;
-      }
-    };
+    try {
+      const opener = process.platform === 'darwin' ? 'open'
+        : process.platform === 'win32' ? 'start'
+        : 'xdg-open';
+      execSync(`${opener} "${CONSOLE_URL}"`, { stdio: 'ignore' });
+    } catch { /* non-fatal — URL is printed above as fallback */ }
 
-    // Resolve the embedded CLI binary (co-located with the SDK package)
-    const sdkDir = path.dirname(new URL(
-      import.meta.resolve('@anthropic-ai/claude-agent-sdk'),
-    ).pathname);
-    const embeddedCli = path.join(sdkDir, 'cli.js');
-    const claudeBin = existsSync(embeddedCli) ? process.execPath : (process.env.CLAUDE_BIN || 'claude');
-    const claudeArgs = existsSync(embeddedCli) ? [embeddedCli] : [];
-
-    await new Promise<void>((resolve) => {
-      const child = spawn(claudeBin, claudeArgs, { stdio: 'inherit' });
-      child.on('close', () => resolve());
-      child.on('error', () => resolve());
-    });
-
-    // After the session, harvest the fresh keychain token
-    console.log('\n  Checking for new credentials...\n');
-    const freshToken = readKeychainToken();
-    if (freshToken && await testAuth({ authToken: freshToken })) {
-      saveToEnv('ANTHROPIC_AUTH_TOKEN', freshToken);
-      console.log('  ✓ Saved ANTHROPIC_AUTH_TOKEN to ~/.clementine/.env');
-      console.log('  Clementine will use your Claude Code subscription going forward.\n');
-      return;
-    }
-
-    // Last resort: manual paste
-    console.log('  Could not read token automatically. Paste your API key or auth token:\n');
-    process.stdout.write('  > ');
+    process.stdout.write('  Paste key > ');
     const input = await new Promise<string>((resolve) => {
       process.stdin.setRawMode?.(false);
       process.stdin.resume();
@@ -1152,7 +1122,8 @@ program
     console.log(' ✓\n');
 
     saveToEnv(credKey, input);
-    console.log(`  Saved ${credKey} to ~/.clementine/.env\n`);
+    console.log(`  ✓ Saved to ~/.clementine/.env`);
+    console.log('  Run `clementine launch` to start the daemon.\n');
   });
 
 program
