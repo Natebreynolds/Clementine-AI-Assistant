@@ -222,23 +222,41 @@ export async function cmdChat(opts: {
 
     // ── Send message ──────────────────────────────────────────
     process.stdout.write(`\n${DIM}thinking...${RESET}\r`);
+    let firstToken = true;
+    let streamedLen = 0;
 
     try {
       const response = await gateway.handleMessage(
         sessionKey,
         effectiveText,
-        undefined,
+        async (token: string) => {
+          if (firstToken) {
+            // Clear "thinking..." and show project context on first real token
+            process.stdout.write('\x1b[2K\r');
+            const matched = gateway.getLastMatchedProject(sessionKey);
+            if (matched) {
+              process.stdout.write(`${DIM}[project: ${path.basename(matched.path)}]${RESET}\n`);
+            }
+            firstToken = false;
+          }
+          process.stdout.write(token);
+          streamedLen += token.length;
+        },
         oneOffModel,
       );
-      // Clear "thinking..." line
-      process.stdout.write('\x1b[2K\r');
-      // Show active project if auto-matched
-      const matched = gateway.getLastMatchedProject(sessionKey);
-      if (matched) {
-        console.log(`\x1b[0;90m[project: ${path.basename(matched.path)}]\x1b[0m`);
+
+      // If we streamed, just add a newline. Otherwise fall back to full render.
+      if (streamedLen > 0) {
+        process.stdout.write('\n\n');
+      } else {
+        process.stdout.write('\x1b[2K\r');
+        const matched = gateway.getLastMatchedProject(sessionKey);
+        if (matched) {
+          console.log(`${DIM}[project: ${path.basename(matched.path)}]${RESET}`);
+        }
+        console.log(renderMarkdown(response));
+        console.log();
       }
-      console.log(renderMarkdown(response));
-      console.log();
     } catch (err) {
       process.stdout.write('\x1b[2K\r');
       console.error(`${YELLOW}Error: ${err}${RESET}`);
