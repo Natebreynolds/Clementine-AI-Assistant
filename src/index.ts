@@ -606,6 +606,30 @@ async function asyncMain(): Promise<void> {
   const { PersonalAssistant } = await import('./agent/assistant.js');
   const assistant = new PersonalAssistant();
 
+  // Memory maintenance — startup + periodic (non-blocking)
+  let maintenanceInterval: ReturnType<typeof setInterval> | undefined;
+  {
+    const memStore = assistant.getMemoryStore();
+    if (memStore) {
+      const { runStartupMaintenance, startPeriodicMaintenance } = await import('./memory/maintenance.js');
+      // Fire-and-forget startup maintenance
+      runStartupMaintenance(memStore).catch(() => {});
+      // Periodic maintenance every 6 hours (consolidation needs an LLM caller)
+      const { query } = await import('@anthropic-ai/claude-agent-sdk');
+      const llmCall = async (prompt: string): Promise<string> => {
+        try {
+          let result = '';
+          const stream = query({ prompt, options: { model: 'claude-haiku-4-5-20251001', maxTurns: 1, systemPrompt: 'You are a memory consolidation assistant. Be concise.' } });
+          for await (const msg of stream) {
+            if (msg.type === 'result') result = (msg as any).result ?? '';
+          }
+          return result;
+        } catch { return ''; }
+      };
+      maintenanceInterval = startPeriodicMaintenance(memStore, llmCall);
+    }
+  }
+
   // Gateway layer
   const { Gateway } = await import('./gateway/router.js');
   const gateway = new Gateway(assistant);
@@ -913,6 +937,7 @@ async function asyncMain(): Promise<void> {
   clearInterval(timerInterval);
   clearInterval(teamDeliveryInterval);
   clearInterval(sourceEditInterval);
+  if (maintenanceInterval) clearInterval(maintenanceInterval);
 
   // Close graph store FIRST — FalkorDBLite's cleanup.js registers an
   // uncaughtException handler that re-throws errors.  If a Redis socket

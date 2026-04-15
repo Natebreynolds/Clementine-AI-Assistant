@@ -320,8 +320,8 @@ export const LINK_EXTRACT_MAX_CHARS = 4000;
 
 export const MEMORY_DB_PATH = path.join(VAULT_DIR, '.memory.db');
 export const GRAPH_DB_DIR = path.join(BASE_DIR, '.graph.db');
-export const SEARCH_CONTEXT_LIMIT = 3;
-export const SEARCH_RECENCY_LIMIT = 3;
+export const SEARCH_CONTEXT_LIMIT = 6;
+export const SEARCH_RECENCY_LIMIT = 4;
 export const SYSTEM_PROMPT_MAX_CONTEXT_CHARS = 12000;
 
 // ── Session Persistence ──────────────────────────────────────────────

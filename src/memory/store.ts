@@ -900,9 +900,7 @@ export class MemoryStore {
       .prepare(
         `SELECT id, source_file, section, content, chunk_type, embedding, salience, agent_slug, updated_at, category, topic
          FROM chunks
-         WHERE embedding IS NOT NULL AND consolidated = 0
-         ORDER BY updated_at DESC
-         LIMIT 500`,
+         WHERE embedding IS NOT NULL`,
       )
       .all() as Array<{
         id: number;
@@ -2169,12 +2167,21 @@ export class MemoryStore {
    */
   insertSummaryChunk(sourceFile: string, section: string, content: string): void {
     const hash = createHash('sha256').update(content).digest('hex').slice(0, 16);
-    this.conn
+    const result = this.conn
       .prepare(
         `INSERT INTO chunks (source_file, section, content, chunk_type, content_hash, salience, consolidated)
          VALUES (?, ?, ?, 'summary', ?, 0.8, 0)`,
       )
       .run(sourceFile, section, content, hash);
+
+    // Immediately compute embedding so the summary is vector-searchable right away
+    if (embeddingsModule.isReady()) {
+      const vec = embeddingsModule.embed(content);
+      if (vec) {
+        this.conn.prepare('UPDATE chunks SET embedding = ? WHERE id = ?')
+          .run(embeddingsModule.serializeEmbedding(vec), result.lastInsertRowid);
+      }
+    }
   }
 
   // ── SDR Operational Data ─────────────────────────────────────────
@@ -2546,19 +2553,19 @@ export class MemoryStore {
   buildEmbeddings(): { vocabSize: number; backfilled: number } {
     // Gather all chunk contents for vocabulary building
     const rows = this.conn
-      .prepare('SELECT id, content FROM chunks WHERE consolidated = 0')
+      .prepare('SELECT id, content FROM chunks')
       .all() as Array<{ id: number; content: string }>;
 
     if (rows.length === 0) return { vocabSize: 0, backfilled: 0 };
 
-    // Build vocabulary from corpus
+    // Build vocabulary from entire corpus (including consolidated summaries)
     embeddingsModule.buildVocab(rows.map((r) => r.content));
 
     if (!embeddingsModule.isReady()) return { vocabSize: 0, backfilled: 0 };
 
-    // Backfill embeddings for chunks that don't have one
+    // Backfill embeddings for all chunks that don't have one
     const missing = this.conn
-      .prepare('SELECT id, content FROM chunks WHERE embedding IS NULL AND consolidated = 0')
+      .prepare('SELECT id, content FROM chunks WHERE embedding IS NULL')
       .all() as Array<{ id: number; content: string }>;
 
     const updateStmt = this.conn.prepare('UPDATE chunks SET embedding = ? WHERE id = ?');
