@@ -590,6 +590,44 @@ export async function runSetup(): Promise<void> {
     console.log(`  ${BOLD}${channel.name}${RESET}`);
     await collectCredentials(channel.credentials, entries);
 
+    // After Discord credentials: generate invite URL and offer to open it
+    if (channelValue === 'discord' && entries['DISCORD_TOKEN']) {
+      try {
+        // Bot tokens are base64(app_id).timestamp.hmac — extract the app ID from the first segment
+        const appId = Buffer.from(entries['DISCORD_TOKEN'].split('.')[0], 'base64').toString();
+        if (/^\d{17,20}$/.test(appId)) {
+          // Permissions: Send Messages, Read Messages, Read Message History, Embed Links,
+          // Attach Files, Use Slash Commands, Add Reactions, Manage Messages
+          const perms = '277025770560';
+          const inviteUrl = `https://discord.com/oauth2/authorize?client_id=${appId}&scope=bot+applications.commands&permissions=${perms}`;
+
+          console.log();
+          console.log(`  ${GREEN}${BOLD}Add your bot to your Discord server:${RESET}`);
+          console.log(`  ${CYAN}${inviteUrl}${RESET}`);
+          console.log();
+
+          const shouldOpen = await confirm({
+            message: 'Open this link in your browser now?',
+            default: true,
+          });
+
+          if (shouldOpen) {
+            try {
+              const openCmd = process.platform === 'darwin' ? 'open' : process.platform === 'win32' ? 'start' : 'xdg-open';
+              execSync(`${openCmd} "${inviteUrl}"`);
+              console.log(`  ${DIM}Authorize the bot in your browser, then come back here.${RESET}`);
+
+              await confirm({ message: 'Done? Press Enter to continue', default: true });
+            } catch {
+              console.log(`  ${DIM}Couldn't open browser — copy the link above and open it manually.${RESET}`);
+            }
+          }
+        }
+      } catch {
+        // Token format unexpected — skip invite URL, non-fatal
+      }
+    }
+
     // Set webhook enabled flag
     if (channelValue === 'webhook') {
       entries['WEBHOOK_ENABLED'] = 'true';
