@@ -85,6 +85,8 @@ bash install.sh
 
 The install script handles everything: system dependencies (redis, libomp, build tools), npm packages, TypeScript build, global CLI install, and launches the setup wizard. Safe to re-run — skips anything already installed.
 
+The setup wizard auto-generates a Discord bot invite URL from your token and offers to open it in your browser — no need to visit the Developer Portal manually.
+
 After setup:
 
 ```bash
@@ -324,6 +326,11 @@ clementine tools               List available MCP tools, plugins, and channels
 clementine config setup        Interactive configuration wizard
 clementine config set KEY VAL  Set a single config value
 clementine config get KEY      Read a config value
+clementine config edit         Open .env in your editor ($EDITOR)
+clementine memory search <q>   Search memory from the terminal (FTS5)
+clementine projects list       Show all linked projects
+clementine projects add <path> Link a project directory (-d desc, -k keywords)
+clementine projects remove <p> Unlink a project directory
 clementine cron list           List all cron jobs and last run status
 clementine cron run <job>      Run a specific cron job
 clementine cron run-due        Run all due jobs (for OS scheduler)
