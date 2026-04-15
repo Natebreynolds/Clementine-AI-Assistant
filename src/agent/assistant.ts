@@ -1585,41 +1585,36 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
           } catch { /* non-fatal */ }
           return undefined;
         })(),
-        // Graph relationships (2s timeout — nice-to-have, shouldn't block chat)
+        // Graph relationships
         (async (): Promise<string | undefined> => {
           try {
-            const graphTimeout = new Promise<undefined>(r => setTimeout(() => r(undefined), 2000));
-            const graphWork = (async () => {
-              const { getSharedGraphStore } = await import('../memory/graph-store.js');
-              const { GRAPH_DB_DIR } = await import('../config.js');
-              const gs = await getSharedGraphStore(GRAPH_DB_DIR);
-              if (gs) {
-                const entityIds = new Set<string>();
-                for (const r of results ?? []) {
-                  const sf = (r as any).sourceFile ?? '';
-                  if (/0[2-4]-/.test(sf)) {
-                    const slug = path.basename(sf, '.md').toLowerCase().replace(/\s+/g, '-');
-                    if (slug) entityIds.add(slug);
-                  }
-                }
-                const wikilinkRe = /\[\[([^\]|]+)(?:\|[^\]]+)?\]\]/g;
-                const textToScan = [userMessage, ...(results ?? []).map((r: any) => r.content ?? '')].join(' ');
-                let wm: RegExpExecArray | null;
-                while ((wm = wikilinkRe.exec(textToScan)) !== null) {
-                  entityIds.add(wm[1].toLowerCase().replace(/\s+/g, '-'));
-                }
-                for (const word of userMessage.toLowerCase().split(/\s+/)) {
-                  const clean = word.replace(/[^a-z0-9-]/g, '');
-                  if (clean.length >= 3) entityIds.add(clean);
-                }
-                if (entityIds.size > 0) {
-                  const gc = await gs.enrichWithGraphContext([...entityIds].slice(0, 10));
-                  if (gc) return gc;
+            const { getSharedGraphStore } = await import('../memory/graph-store.js');
+            const { GRAPH_DB_DIR } = await import('../config.js');
+            const gs = await getSharedGraphStore(GRAPH_DB_DIR);
+            if (gs) {
+              const entityIds = new Set<string>();
+              for (const r of results ?? []) {
+                const sf = (r as any).sourceFile ?? '';
+                if (/0[2-4]-/.test(sf)) {
+                  const slug = path.basename(sf, '.md').toLowerCase().replace(/\s+/g, '-');
+                  if (slug) entityIds.add(slug);
                 }
               }
-              return undefined;
-            })();
-            return await Promise.race([graphWork, graphTimeout]);
+              const wikilinkRe = /\[\[([^\]|]+)(?:\|[^\]]+)?\]\]/g;
+              const textToScan = [userMessage, ...(results ?? []).map((r: any) => r.content ?? '')].join(' ');
+              let wm: RegExpExecArray | null;
+              while ((wm = wikilinkRe.exec(textToScan)) !== null) {
+                entityIds.add(wm[1].toLowerCase().replace(/\s+/g, '-'));
+              }
+              for (const word of userMessage.toLowerCase().split(/\s+/)) {
+                const clean = word.replace(/[^a-z0-9-]/g, '');
+                if (clean.length >= 3) entityIds.add(clean);
+              }
+              if (entityIds.size > 0) {
+                const gc = await gs.enrichWithGraphContext([...entityIds].slice(0, 10));
+                if (gc) return gc;
+              }
+            }
           } catch { /* non-fatal */ }
           return undefined;
         })(),
@@ -2004,15 +1999,10 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
     // Parallelize context retrieval and project matching — they're independent
     // If a project override is set, skip auto-matching entirely
     const hasActiveSession = !!(sessionKey && this.sessions.has(sessionKey));
-    // Link extraction has a 3s timeout — URL fetches shouldn't block chat
-    const linkExtractWithTimeout = Promise.race([
-      extractLinks(prompt),
-      new Promise<Awaited<ReturnType<typeof extractLinks>>>(r => setTimeout(() => r([]), 3000)),
-    ]);
     const [rawContext, autoMatchedProject, linkContexts] = await Promise.all([
       this.retrieveContext(prompt, sessionKey, profile?.slug, false, profile?.strictMemoryIsolation ?? (profile ? true : false)),
       Promise.resolve(projectOverride || hasActiveSession ? null : matchProject(prompt)),
-      linkExtractWithTimeout,
+      extractLinks(prompt),
     ]);
     // Resolve project: explicit override > auto-match > profile binding
     let matchedProject = projectOverride ?? autoMatchedProject;
