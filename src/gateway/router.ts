@@ -1461,6 +1461,11 @@ export class Gateway {
     this.sessions.delete(sessionKey);
   }
 
+  /** Get the last auto-matched project for a session. */
+  getLastMatchedProject(sessionKey: string): { path: string; description?: string } | null {
+    return this.assistant.getLastMatchedProject(sessionKey);
+  }
+
   /** Evict stale session entries (no activity in 48h, no active lock). */
   evictStaleSessions(): number {
     const cutoff = Date.now() - 48 * 60 * 60 * 1000;

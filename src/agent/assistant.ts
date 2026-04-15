@@ -566,6 +566,31 @@ export function getLinkedProjects(): ProjectMeta[] {
   return loadProjectsMeta();
 }
 
+/** Add a project to the linked projects list. */
+export function addProject(projectPath: string, description?: string, keywords?: string[]): void {
+  const resolved = path.resolve(projectPath);
+  const projects = loadProjectsMeta();
+  // Avoid duplicates
+  if (projects.some(p => path.resolve(p.path) === resolved)) return;
+  const entry: ProjectMeta = { path: resolved };
+  if (description) entry.description = description;
+  if (keywords?.length) entry.keywords = keywords;
+  projects.push(entry);
+  fs.writeFileSync(PROJECTS_META_FILE, JSON.stringify(projects, null, 4));
+  _projectsMetaCacheTime = 0; // invalidate cache
+}
+
+/** Remove a project from the linked projects list. Returns true if removed. */
+export function removeProject(projectPath: string): boolean {
+  const resolved = path.resolve(projectPath);
+  const projects = loadProjectsMeta();
+  const filtered = projects.filter(p => path.resolve(p.path) !== resolved);
+  if (filtered.length === projects.length) return false;
+  fs.writeFileSync(PROJECTS_META_FILE, JSON.stringify(filtered, null, 4));
+  _projectsMetaCacheTime = 0; // invalidate cache
+  return true;
+}
+
 // ── PersonalAssistant ───────────────────────────────────────────────
 
 export class PersonalAssistant {
@@ -593,6 +618,8 @@ export class PersonalAssistant {
   /** Per-session stall nudge — set after a query shows stall signals, consumed on the next query. */
   private stallNudges = new Map<string, string>();
   private _compactedSessions = new Set<string>();
+  /** Last auto-matched project per session — exposed for CLI display. */
+  private _lastMatchedProject = new Map<string, ProjectMeta | null>();
   /** Hot correction buffer — explicit behavioral corrections applied before nightly SI. */
   private hotCorrections: Array<{ correction: string; category: string; timestamp: string }> = [];
 
@@ -1714,6 +1741,9 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
     this._lastUserMessage = text;
     let sessionRotated = false;
 
+    // Periodic cleanup: expire all sessions older than 24 hours
+    this.expireOldSessions();
+
     // Expire old sessions (4 hours)
     if (key && this.sessionTimestamps.has(key)) {
       const elapsed = Date.now() - this.sessionTimestamps.get(key)!.getTime();
@@ -2005,6 +2035,9 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
     setSendPolicy(profile?.sendPolicy ?? null, profile?.slug ?? null);
     setAgentDir(profile?.agentDir ?? null);
     setInteractionSource(inferInteractionSource(sessionKey));
+    // Track the matched project for CLI display
+    if (sessionKey) this._lastMatchedProject.set(sessionKey, matchedProject);
+
     if (matchedProject) {
       logger.info({ project: matchedProject.path }, 'Auto-matched project from message');
       const projName = path.basename(matchedProject.path);
@@ -2396,13 +2429,17 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
 
     // Build compaction block for working memory
     const exchangeCount = this.exchangeCounts.get(sessionKey) ?? 0;
+    const COMPACTION_START = '<!-- COMPACTION_START -->';
+    const COMPACTION_END = '<!-- COMPACTION_END -->';
     const compactionBlock = [
+      COMPACTION_START,
       `## Session Compaction (auto-generated)`,
       `Session ${sessionKey} compacted at ${exchangeCount} exchanges.`,
       ``,
       summary,
       ``,
       `*Continue from where this conversation left off.*`,
+      COMPACTION_END,
     ].join('\n');
 
     // Write to working memory so the next session picks it up via system prompt
@@ -2415,11 +2452,22 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
         ? fs.readFileSync(compactionWmFile, 'utf-8')
         : '';
 
-      // Replace any prior compaction block, or append
-      const compactionRegex = /## Session Compaction \(auto-generated\)[\s\S]*?\*Continue from where this conversation left off\.\*/;
-      const updated = compactionRegex.test(existing)
-        ? existing.replace(compactionRegex, compactionBlock)
-        : existing.trimEnd() + '\n\n' + compactionBlock;
+      // Replace any prior compaction block (try new sentinel format first, then legacy)
+      const sentinelRegex = /<!-- COMPACTION_START -->[\s\S]*?<!-- COMPACTION_END -->/;
+      const legacyRegex = /## Session Compaction \(auto-generated\)[\s\S]*?\*Continue from where this conversation left off\.\*/;
+      let updated: string;
+      if (sentinelRegex.test(existing)) {
+        updated = existing.replace(sentinelRegex, compactionBlock);
+      } else if (legacyRegex.test(existing)) {
+        updated = existing.replace(legacyRegex, compactionBlock);
+      } else {
+        updated = existing.trimEnd() + '\n\n' + compactionBlock;
+      }
+
+      // Size guard: if working memory exceeds 10KB, keep only the compaction block
+      if (Buffer.byteLength(updated) > 10_240) {
+        updated = compactionBlock;
+      }
 
       fs.writeFileSync(compactionWmFile, updated);
     } catch {
@@ -2430,7 +2478,24 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
     // The working memory summary will provide continuity
     this.sessions.delete(sessionKey);
     this.exchangeCounts.set(sessionKey, 0);
+    this.lastExchanges.delete(sessionKey);
+    this.sessionTimestamps.delete(sessionKey);
+    this.stallNudges.delete(sessionKey);
     this.saveSessions();
+  }
+
+  /**
+   * Expire sessions inactive for more than 24 hours.
+   * Called periodically from chat() to prevent unbounded map growth.
+   */
+  private expireOldSessions(): void {
+    const MAX_AGE_MS = 24 * 60 * 60 * 1000;
+    const now = Date.now();
+    for (const [key, ts] of this.sessionTimestamps) {
+      if (now - ts.getTime() > MAX_AGE_MS) {
+        this.clearSession(key);
+      }
+    }
   }
 
   // ── Session Summarization ─────────────────────────────────────────
@@ -4245,7 +4310,13 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
     this.sessionTimestamps.delete(sessionKey);
     this.lastExchanges.delete(sessionKey);
     this.stallNudges.delete(sessionKey);
+    this._lastMatchedProject.delete(sessionKey);
     this.saveSessions();
+  }
+
+  /** Get the last auto-matched project for a session (for CLI display). */
+  getLastMatchedProject(sessionKey: string): ProjectMeta | null {
+    return this._lastMatchedProject.get(sessionKey) ?? null;
   }
 
   getProfileManager(): AgentManager {

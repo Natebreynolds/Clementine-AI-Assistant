@@ -1333,6 +1333,132 @@ configCmd
   .description('List all config values')
   .action(cmdConfigList);
 
+configCmd
+  .command('edit')
+  .description('Open .env in your editor')
+  .action(() => {
+    if (!existsSync(ENV_PATH)) {
+      console.log('  No .env file found. Run: clementine config setup');
+      process.exit(1);
+    }
+    const editor = process.env.EDITOR || process.env.VISUAL || 'vi';
+    try {
+      execSync(`${editor} "${ENV_PATH}"`, { stdio: 'inherit' });
+    } catch {
+      console.error(`  Failed to open editor: ${editor}`);
+    }
+  });
+
+// ── Memory commands ─────────────────────────────────────────────────
+
+const memoryCmd = program
+  .command('memory')
+  .description('Search and manage memory');
+
+memoryCmd
+  .command('search <query>')
+  .description('Search memory (full-text)')
+  .option('-n, --limit <n>', 'Max results', '10')
+  .action(async (query: string, opts: { limit: string }) => {
+    const DIM = '\x1b[0;90m';
+    const BOLD = '\x1b[1m';
+    const CYAN = '\x1b[0;36m';
+    const RESET = '\x1b[0m';
+    try {
+      const { MemoryStore } = await import('../memory/store.js');
+      const VAULT_DIR = path.join(BASE_DIR, 'vault');
+      const DB_PATH = path.join(VAULT_DIR, '.memory.db');
+      const store = new MemoryStore(DB_PATH, VAULT_DIR);
+      const results = store.searchFts(query, parseInt(opts.limit, 10));
+      if (results.length === 0) {
+        console.log(`  No results for "${query}".`);
+        return;
+      }
+      console.log();
+      for (const r of results) {
+        const source = r.sourceFile ? path.basename(r.sourceFile) : 'unknown';
+        const section = r.section || '';
+        const snippet = r.content.replace(/\n/g, ' ').slice(0, 120);
+        console.log(`  ${BOLD}${source}${RESET}${section ? ` › ${CYAN}${section}${RESET}` : ''}`);
+        console.log(`  ${DIM}${snippet}${snippet.length >= 120 ? '…' : ''}${RESET}`);
+        console.log();
+      }
+    } catch (err) {
+      console.error(`  Error searching memory: ${err}`);
+    }
+  });
+
+// ── Projects commands ───────────────────────────────────────────────
+
+const projectsCmd = program
+  .command('projects')
+  .description('Manage linked projects');
+
+projectsCmd
+  .command('list')
+  .description('Show all linked projects')
+  .action(async () => {
+    const DIM = '\x1b[0;90m';
+    const BOLD = '\x1b[1m';
+    const RESET = '\x1b[0m';
+    try {
+      const { getLinkedProjects } = await import('../agent/assistant.js');
+      const projects = getLinkedProjects();
+      if (projects.length === 0) {
+        console.log('  No projects linked. Use: clementine projects add <path>');
+        return;
+      }
+      console.log();
+      for (const p of projects) {
+        console.log(`  ${BOLD}${path.basename(p.path)}${RESET}`);
+        console.log(`  ${DIM}${p.path}${RESET}`);
+        if (p.description) console.log(`  ${p.description}`);
+        if (p.keywords?.length) console.log(`  ${DIM}Keywords: ${p.keywords.join(', ')}${RESET}`);
+        console.log();
+      }
+    } catch (err) {
+      console.error(`  Error listing projects: ${err}`);
+    }
+  });
+
+projectsCmd
+  .command('add <path>')
+  .description('Link a project directory')
+  .option('-d, --description <desc>', 'Project description')
+  .option('-k, --keywords <kw>', 'Comma-separated keywords')
+  .action(async (projectPath: string, opts: { description?: string; keywords?: string }) => {
+    const resolved = path.resolve(projectPath);
+    if (!existsSync(resolved) || !statSync(resolved).isDirectory()) {
+      console.error(`  Not a directory: ${resolved}`);
+      process.exit(1);
+    }
+    try {
+      const { addProject } = await import('../agent/assistant.js');
+      const keywords = opts.keywords?.split(',').map(k => k.trim()).filter(Boolean);
+      addProject(resolved, opts.description, keywords);
+      console.log(`  Linked: ${resolved}`);
+    } catch (err) {
+      console.error(`  Error adding project: ${err}`);
+    }
+  });
+
+projectsCmd
+  .command('remove <path>')
+  .description('Unlink a project directory')
+  .action(async (projectPath: string) => {
+    const resolved = path.resolve(projectPath);
+    try {
+      const { removeProject } = await import('../agent/assistant.js');
+      if (removeProject(resolved)) {
+        console.log(`  Removed: ${resolved}`);
+      } else {
+        console.log(`  Not found: ${resolved}`);
+      }
+    } catch (err) {
+      console.error(`  Error removing project: ${err}`);
+    }
+  });
+
 // ── Update command ──────────────────────────────────────────────────
 
 async function cmdUpdate(options: { restart?: boolean; dryRun?: boolean }): Promise<void> {

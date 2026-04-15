@@ -232,6 +232,11 @@ export async function cmdChat(opts: {
       );
       // Clear "thinking..." line
       process.stdout.write('\x1b[2K\r');
+      // Show active project if auto-matched
+      const matched = gateway.getLastMatchedProject(sessionKey);
+      if (matched) {
+        console.log(`\x1b[0;90m[project: ${path.basename(matched.path)}]\x1b[0m`);
+      }
       console.log(renderMarkdown(response));
       console.log();
     } catch (err) {
