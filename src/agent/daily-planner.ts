@@ -9,7 +9,6 @@
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import pino from 'pino';
-import Anthropic from '@anthropic-ai/sdk';
 import {
   BASE_DIR,
   GOALS_DIR,
@@ -24,45 +23,6 @@ import type { PersistentGoal, DailyPlan, DailyPlanPriority } from '../types.js';
 const logger = pino({ name: 'clementine.daily-planner' });
 
 const PLANS_DIR = path.join(BASE_DIR, 'plans', 'daily');
-
-// ── .env reader (self-contained — no config.ts secret imports) ───────
-
-function getEnvValue(key: string): string {
-  // Check process env first (already loaded by the daemon)
-  if (process.env[key]) return process.env[key]!;
-  // Fall back to .env file
-  const envPath = path.join(BASE_DIR, '.env');
-  if (!existsSync(envPath)) return '';
-  for (const line of readFileSync(envPath, 'utf-8').split('\n')) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith('#')) continue;
-    const eqIndex = trimmed.indexOf('=');
-    if (eqIndex === -1) continue;
-    if (trimmed.slice(0, eqIndex) !== key) continue;
-    let value = trimmed.slice(eqIndex + 1);
-    if ((value.startsWith('"') && value.endsWith('"')) ||
-        (value.startsWith("'") && value.endsWith("'"))) {
-      value = value.slice(1, -1);
-    }
-    return value;
-  }
-  return '';
-}
-
-/**
- * Build Anthropic client credentials.
- * Priority: ANTHROPIC_AUTH_TOKEN (OAuth) > ANTHROPIC_API_KEY (legacy raw key).
- * Returns null if neither is configured.
- */
-function getAnthropicCredentials(): { apiKey?: string; authToken?: string } | null {
-  const oauthToken = getEnvValue('CLAUDE_CODE_OAUTH_TOKEN');
-  if (oauthToken) return { authToken: oauthToken };
-  const authToken = getEnvValue('ANTHROPIC_AUTH_TOKEN');
-  if (authToken) return { authToken };
-  const apiKey = getEnvValue('ANTHROPIC_API_KEY');
-  if (apiKey) return { apiKey };
-  return null;
-}
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
@@ -305,27 +265,28 @@ Rules:
 - Focus on actionable items, not status reports
 - If everything is on track, return minimal priorities`;
 
-    const creds = getAnthropicCredentials();
-    if (!creds) {
-      logger.warn('No Anthropic credentials found — generating fallback plan. Run `clementine login` to authenticate.');
-      return this.fallbackPlan(today);
-    }
-
     try {
-      const client = new Anthropic(creds.authToken ? { authToken: creds.authToken } : { apiKey: creds.apiKey });
-      const response = await client.messages.create({
-        model: MODELS.haiku,
-        max_tokens: 2000,
-        messages: [{ role: 'user', content: prompt }],
-        system: 'You are a planning assistant. Analyze the context and produce a prioritized daily plan as JSON. Return only valid JSON, no markdown fencing.',
+      const { query } = await import('@anthropic-ai/claude-agent-sdk');
+      let text = '';
+      const stream = query({
+        prompt,
+        options: {
+          model: MODELS.haiku,
+          maxTurns: 1,
+          systemPrompt: 'You are a planning assistant. Analyze the context and produce a prioritized daily plan as JSON. Return only valid JSON, no markdown fencing.',
+        },
       });
+      for await (const msg of stream) {
+        if (msg.type === 'result') text = (msg as any).result ?? '';
+      }
 
-      const text = response.content
-        .filter(block => block.type === 'text')
-        .map(block => block.text)
-        .join('');
+      if (!text) {
+        logger.warn('LLM returned empty plan — using fallback');
+        return this.fallbackPlan(today);
+      }
 
-      const plan = JSON.parse(text) as DailyPlan;
+      const cleaned = text.replace(/^```(?:json)?\s*/i, '').replace(/\s*```\s*$/, '').trim();
+      const plan = JSON.parse(cleaned) as DailyPlan;
       plan.date = today;
       plan.createdAt = new Date().toISOString();
       plan.priorities = plan.priorities ?? [];

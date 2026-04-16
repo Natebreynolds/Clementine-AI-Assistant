@@ -279,7 +279,7 @@ export class HeartbeatScheduler {
         'memory_write. Skip anything already in MEMORY.md. Be selective — only save facts ' +
         'that will be useful in future conversations. Do not create duplicate entries.',
         1, // tier 1 (vault-only)
-        3, // max 3 turns
+        10, // max 10 turns — workflow needs read + candidates + read + write + mark_consolidated
         'haiku',
       ).catch(err => {
         logger.error({ err }, 'Evening memory consolidation failed');

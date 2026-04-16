@@ -1113,6 +1113,23 @@ export class CronScheduler {
           logger.info({ job: job.name, consErrors }, 'Wrote self-improvement trigger for failing job');
         } catch { /* non-fatal */ }
       }
+
+      // Auto-disable after too many consecutive failures — prevents zombie jobs
+      // from burning resources indefinitely. Re-enable from the dashboard.
+      if (consErrors >= 10 && !this.disabledJobs.has(job.name)) {
+        this.disabledJobs.add(job.name);
+        const scheduledTask = this.scheduledTasks.get(job.name);
+        if (scheduledTask) {
+          scheduledTask.stop();
+          this.scheduledTasks.delete(job.name);
+        }
+        logger.error({ job: job.name, consErrors }, `Auto-disabled cron after ${consErrors} consecutive failures`);
+        this.logAdvisorEvent('auto-disabled', job.name, `Auto-disabled after ${consErrors} consecutive failures`);
+        this.dispatcher.send(
+          `🛑 **Cron auto-disabled** — \`${job.name}\` failed ${consErrors} times in a row. Fix the job and re-enable it from the dashboard.`,
+          { agentSlug: job.agentSlug },
+        ).catch(err => logger.debug({ err }, 'Failed to send auto-disable notification'));
+      }
     }
   }
 

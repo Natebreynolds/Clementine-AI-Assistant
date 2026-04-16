@@ -13,7 +13,6 @@
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import pino from 'pino';
-import Anthropic from '@anthropic-ai/sdk';
 import { BASE_DIR, GOALS_DIR, MODELS } from '../config.js';
 import type { DailyPlan, PersistentGoal } from '../types.js';
 
@@ -44,42 +43,21 @@ export interface MonthlyAssessment {
   summary: string;
 }
 
-// ── .env reader ──────────────────────────────────────────────────────
-
-function getEnvValue(key: string): string {
-  if (process.env[key]) return process.env[key]!;
-  const envPath = path.join(BASE_DIR, '.env');
-  if (!existsSync(envPath)) return '';
-  for (const line of readFileSync(envPath, 'utf-8').split('\n')) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith('#')) continue;
-    const eqIndex = trimmed.indexOf('=');
-    if (eqIndex === -1) continue;
-    if (trimmed.slice(0, eqIndex) !== key) continue;
-    let value = trimmed.slice(eqIndex + 1);
-    if ((value.startsWith('"') && value.endsWith('"')) ||
-        (value.startsWith("'") && value.endsWith("'"))) {
-      value = value.slice(1, -1);
-    }
-    return value;
+async function llmJsonCall(prompt: string, systemPrompt: string): Promise<string> {
+  const { query } = await import('@anthropic-ai/claude-agent-sdk');
+  let text = '';
+  const stream = query({
+    prompt,
+    options: {
+      model: MODELS.haiku,
+      maxTurns: 1,
+      systemPrompt,
+    },
+  });
+  for await (const msg of stream) {
+    if (msg.type === 'result') text = (msg as any).result ?? '';
   }
-  return '';
-}
-
-function getAnthropicCredentials(): { apiKey?: string; authToken?: string } | null {
-  const oauthToken = getEnvValue('CLAUDE_CODE_OAUTH_TOKEN');
-  if (oauthToken) return { authToken: oauthToken };
-  const authToken = getEnvValue('ANTHROPIC_AUTH_TOKEN');
-  if (authToken) return { authToken };
-  const apiKey = getEnvValue('ANTHROPIC_API_KEY');
-  if (apiKey) return { apiKey };
-  return null;
-}
-
-function makeAnthropicClient(): Anthropic | null {
-  const creds = getAnthropicCredentials();
-  if (!creds) return null;
-  return new Anthropic(creds.authToken ? { authToken: creds.authToken } : { apiKey: creds.apiKey });
+  return text;
 }
 
 // ── Strategic Planner ────────────────────────────────────────────────
@@ -186,17 +164,11 @@ export class StrategicPlanner {
       summary: 'No data available for weekly review.',
     };
 
-    const client = makeAnthropicClient();
-    if (!client) return defaultReview;
-
     try {
-      const response = await client.messages.create({
-        model: MODELS.haiku,
-        max_tokens: 1000,
-        messages: [{ role: 'user', content: prompt }],
-      });
-
-      const text = response.content[0]?.type === 'text' ? response.content[0].text : '';
+      const text = await llmJsonCall(
+        prompt,
+        'You synthesize weekly reviews. Return only valid JSON, no markdown fencing.',
+      );
       const jsonMatch = text.match(/\{[\s\S]*\}/);
       if (jsonMatch) {
         const parsed = JSON.parse(jsonMatch[0]);
@@ -278,9 +250,6 @@ export class StrategicPlanner {
       summary: 'No data available for monthly assessment.',
     };
 
-    const client2 = makeAnthropicClient();
-    if (!client2) return defaultAssessment;
-
     const prompt =
       `You are generating a monthly strategic assessment for ${monthId}.\n\n` +
       `${context}\n\n` +
@@ -293,13 +262,10 @@ export class StrategicPlanner {
       `}`;
 
     try {
-      const response = await client2.messages.create({
-        model: MODELS.haiku,
-        max_tokens: 1000,
-        messages: [{ role: 'user', content: prompt }],
-      });
-
-      const text = response.content[0]?.type === 'text' ? response.content[0].text : '';
+      const text = await llmJsonCall(
+        prompt,
+        'You produce monthly strategic assessments. Return only valid JSON, no markdown fencing.',
+      );
       const jsonMatch = text.match(/\{[\s\S]*\}/);
       if (jsonMatch) {
         const parsed = JSON.parse(jsonMatch[0]);
