@@ -961,6 +961,17 @@ program
   .action(cmdRestart);
 
 program
+  .command('setup')
+  .description('Run interactive setup wizard')
+  .action(() => {
+    ensureDataHome();
+    runSetup().catch((err: unknown) => {
+      console.error('Setup failed:', err);
+      process.exit(1);
+    });
+  });
+
+program
   .command('rebuild')
   .description('Rebuild from source and restart all processes (daemon + dashboard)')
   .action(async () => {
