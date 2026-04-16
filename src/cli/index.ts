@@ -82,6 +82,15 @@ function getLaunchdPlistPath(): string {
   return path.join(home, 'Library', 'LaunchAgents', `${getLaunchdLabel()}.plist`);
 }
 
+function getSystemdServiceName(): string {
+  return `${getAssistantName().toLowerCase()}.service`;
+}
+
+function getSystemdServicePath(): string {
+  const home = process.env.HOME ?? '';
+  return path.join(home, '.config', 'systemd', 'user', getSystemdServiceName());
+}
+
 function readPid(): number | null {
   const pidFile = getPidFilePath();
   if (!existsSync(pidFile)) return null;
@@ -128,16 +137,26 @@ function killPid(pid: number): void {
   }
 }
 
-/** Stop the daemon safely: unload LaunchAgent first (prevents respawn), then kill the process. */
+/** Stop the daemon safely: disable the service manager first (prevents respawn), then kill the process. */
 function stopDaemon(pid: number): void {
-  // Unload LaunchAgent BEFORE killing — otherwise launchd respawns it immediately
   if (process.platform === 'darwin') {
+    // Unload LaunchAgent BEFORE killing — otherwise launchd respawns it immediately
     const plist = getLaunchdPlistPath();
     if (existsSync(plist)) {
       try {
         execSync(`launchctl unload "${plist}"`, { stdio: 'pipe' });
       } catch {
         // not loaded — that's fine
+      }
+    }
+  } else if (process.platform === 'linux') {
+    // Stop systemd service BEFORE killing — otherwise systemd respawns it
+    const servicePath = getSystemdServicePath();
+    if (existsSync(servicePath)) {
+      try {
+        execSync(`systemctl --user stop ${getSystemdServiceName()}`, { stdio: 'pipe' });
+      } catch {
+        // not active — that's fine
       }
     }
   }
@@ -163,44 +182,65 @@ function ensureDataHome(): void {
 
 function cmdLaunch(options: { foreground?: boolean; install?: boolean; uninstall?: boolean }): void {
   if (options.uninstall) {
-    const plistPath = getLaunchdPlistPath();
-    if (existsSync(plistPath)) {
-      try {
-        execSync(`launchctl unload "${plistPath}"`, { stdio: 'ignore' });
-      } catch {
-        // not loaded
+    if (process.platform === 'darwin') {
+      const plistPath = getLaunchdPlistPath();
+      if (existsSync(plistPath)) {
+        try {
+          execSync(`launchctl unload "${plistPath}"`, { stdio: 'ignore' });
+        } catch {
+          // not loaded
+        }
+        unlinkSync(plistPath);
+        console.log(`  Uninstalled LaunchAgent: ${getLaunchdLabel()}`);
+      } else {
+        console.log('  LaunchAgent not installed.');
       }
-      unlinkSync(plistPath);
-      console.log(`  Uninstalled LaunchAgent: ${getLaunchdLabel()}`);
-    } else {
-      console.log('  LaunchAgent not installed.');
+    } else if (process.platform === 'linux') {
+      const servicePath = getSystemdServicePath();
+      const serviceName = getSystemdServiceName();
+      if (existsSync(servicePath)) {
+        try {
+          execSync(`systemctl --user stop ${serviceName}`, { stdio: 'ignore' });
+          execSync(`systemctl --user disable ${serviceName}`, { stdio: 'ignore' });
+        } catch {
+          // not active
+        }
+        unlinkSync(servicePath);
+        try {
+          execSync('systemctl --user daemon-reload', { stdio: 'ignore' });
+        } catch { /* ignore */ }
+        console.log(`  Uninstalled systemd service: ${serviceName}`);
+      } else {
+        console.log('  Systemd service not installed.');
+      }
     }
     return;
   }
 
   if (options.install) {
-    const plistPath = getLaunchdPlistPath();
-    const plistDir = path.dirname(plistPath);
-    if (!existsSync(plistDir)) {
-      mkdirSync(plistDir, { recursive: true });
-    }
-
-    // Unload existing plist if already installed (idempotent reinstall)
-    if (existsSync(plistPath)) {
-      try {
-        execSync(`launchctl unload "${plistPath}"`, { stdio: 'ignore' });
-      } catch {
-        // not loaded — fine
+    if (process.platform === 'darwin') {
+      const plistPath = getLaunchdPlistPath();
+      const plistDir = path.dirname(plistPath);
+      if (!existsSync(plistDir)) {
+        mkdirSync(plistDir, { recursive: true });
       }
-    }
 
-    const nodePath = process.execPath;
-    const logDir = path.join(BASE_DIR, 'logs');
-    if (!existsSync(logDir)) {
-      mkdirSync(logDir, { recursive: true });
-    }
+      // Unload existing plist if already installed (idempotent reinstall)
+      if (existsSync(plistPath)) {
+        try {
+          execSync(`launchctl unload "${plistPath}"`, { stdio: 'ignore' });
+        } catch {
+          // not loaded — fine
+        }
+      }
 
-    const plist = `<?xml version="1.0" encoding="UTF-8"?>
+      const nodePath = process.execPath;
+      const logDir = path.join(BASE_DIR, 'logs');
+      if (!existsSync(logDir)) {
+        mkdirSync(logDir, { recursive: true });
+      }
+
+      const plist = `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
@@ -233,14 +273,80 @@ function cmdLaunch(options: { foreground?: boolean; install?: boolean; uninstall
 </dict>
 </plist>`;
 
-    writeFileSync(plistPath, plist);
-    try {
-      execSync(`launchctl load "${plistPath}"`);
-      console.log(`  Installed and loaded LaunchAgent: ${getLaunchdLabel()}`);
-      console.log(`  Plist: ${plistPath}`);
-      console.log(`  Logs:  ${logDir}/`);
-    } catch (err) {
-      console.error(`  Failed to load LaunchAgent: ${err}`);
+      writeFileSync(plistPath, plist);
+      try {
+        execSync(`launchctl load "${plistPath}"`);
+        console.log(`  Installed and loaded LaunchAgent: ${getLaunchdLabel()}`);
+        console.log(`  Plist: ${plistPath}`);
+        console.log(`  Logs:  ${logDir}/`);
+      } catch (err) {
+        console.error(`  Failed to load LaunchAgent: ${err}`);
+      }
+    } else if (process.platform === 'linux') {
+      const servicePath = getSystemdServicePath();
+      const serviceName = getSystemdServiceName();
+      const serviceDir = path.dirname(servicePath);
+      if (!existsSync(serviceDir)) {
+        mkdirSync(serviceDir, { recursive: true });
+      }
+
+      // Stop existing service if already installed (idempotent reinstall)
+      if (existsSync(servicePath)) {
+        try {
+          execSync(`systemctl --user stop ${serviceName}`, { stdio: 'ignore' });
+        } catch {
+          // not active — fine
+        }
+      }
+
+      const nodePath = process.execPath;
+      const logDir = path.join(BASE_DIR, 'logs');
+      if (!existsSync(logDir)) {
+        mkdirSync(logDir, { recursive: true });
+      }
+
+      const envPath = path.join(BASE_DIR, '.env');
+      const servicePATH = [path.dirname(nodePath), '/usr/local/bin', '/usr/bin', '/bin']
+        .join(':');
+
+      const unit = `[Unit]
+Description=${getAssistantName()} AI Assistant
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=${nodePath} ${DIST_ENTRY}
+WorkingDirectory=${BASE_DIR}
+Environment=PATH=${servicePATH}
+Environment=CLEMENTINE_HOME=${BASE_DIR}
+EnvironmentFile=-${envPath}
+Restart=always
+RestartSec=5
+StandardOutput=append:${path.join(logDir, 'clementine.log')}
+StandardError=append:${path.join(logDir, 'clementine-error.log')}
+
+[Install]
+WantedBy=default.target
+`;
+
+      writeFileSync(servicePath, unit);
+      try {
+        execSync('systemctl --user daemon-reload', { stdio: 'pipe' });
+        execSync(`systemctl --user enable --now ${serviceName}`, { stdio: 'pipe' });
+        // Enable lingering so the service runs even when the user is not logged in (VPS)
+        try {
+          execSync(`loginctl enable-linger $(whoami)`, { stdio: 'pipe' });
+        } catch {
+          console.log('  Note: Could not enable linger. Run as root: loginctl enable-linger $(whoami)');
+        }
+        console.log(`  Installed and started systemd service: ${serviceName}`);
+        console.log(`  Service: ${servicePath}`);
+        console.log(`  Logs:    ${logDir}/`);
+        console.log(`  Status:  systemctl --user status ${serviceName}`);
+      } catch (err) {
+        console.error(`  Failed to enable systemd service: ${err}`);
+      }
     }
 
     // Also install the cron scheduler alongside the daemon
@@ -700,7 +806,7 @@ function cmdDoctor(opts: { fix?: boolean } = {}): void {
     console.log(`  ${DIM}  ○  Daemon not running${RESET}`);
   }
 
-  // LaunchAgent health check (macOS only)
+  // Service health check (platform-specific)
   if (process.platform === 'darwin') {
     const plistPath = getLaunchdPlistPath();
     if (existsSync(plistPath)) {
@@ -714,6 +820,22 @@ function cmdDoctor(opts: { fix?: boolean } = {}): void {
       }
     } else {
       console.log(`  ${YELLOW}WARN${RESET}  LaunchAgent not installed (run: clementine launch --install)`);
+      issues++;
+    }
+  } else if (process.platform === 'linux') {
+    const servicePath = getSystemdServicePath();
+    const serviceName = getSystemdServiceName();
+    if (existsSync(servicePath)) {
+      try {
+        execSync(`systemctl --user is-active ${serviceName}`, { stdio: 'pipe' });
+        console.log(`  ${GREEN}OK${RESET}  Systemd service installed and active`);
+      } catch {
+        console.log(`  ${YELLOW}WARN${RESET}  Systemd service installed but not active`);
+        console.log(`       Start it: systemctl --user start ${serviceName}`);
+        issues++;
+      }
+    } else {
+      console.log(`  ${YELLOW}WARN${RESET}  Systemd service not installed (run: clementine launch --install)`);
       issues++;
     }
   }

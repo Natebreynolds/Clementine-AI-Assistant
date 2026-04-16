@@ -726,22 +726,23 @@ export async function runSetup(): Promise<void> {
   console.log();
 
   // ── Step 8: Auto-start on login ───────────────────────────────────
-  if (process.platform === 'darwin') {
+  if (process.platform === 'darwin' || process.platform === 'linux') {
     sectionHeader('Step 8: Auto-Start');
 
-    console.log(`  ${DIM}Install a login service so ${entries['ASSISTANT_NAME'] || 'Clementine'} starts${RESET}`);
-    console.log(`  ${DIM}automatically when you turn on your computer.${RESET}`);
+    const serviceName = process.platform === 'darwin' ? 'LaunchAgent' : 'systemd service';
+    console.log(`  ${DIM}Install a ${serviceName} so ${entries['ASSISTANT_NAME'] || 'Clementine'} starts${RESET}`);
+    console.log(`  ${DIM}automatically when the system boots.${RESET}`);
     console.log();
 
     const installService = await confirm({
-      message: 'Start automatically on login? (recommended)',
+      message: 'Start automatically on boot? (recommended)',
       default: true,
     });
 
     if (installService) {
-      // Signal to the caller that LaunchAgent should be installed
-      writeFileSync(path.join(BASE_DIR, '.install-launchagent'), '');
-      console.log(`  ${GREEN}✔ Will install login service after first launch${RESET}`);
+      // Signal to the caller that the service should be installed
+      writeFileSync(path.join(BASE_DIR, '.install-service'), '');
+      console.log(`  ${GREEN}✔ Will install ${serviceName} after first launch${RESET}`);
     }
   }
 
