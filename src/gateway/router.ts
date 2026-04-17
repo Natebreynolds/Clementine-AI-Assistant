@@ -60,6 +60,14 @@ interface SessionState {
   provenance?: SessionProvenance;
   lastAccessedAt: number;
   deepTask?: { jobName: string; taskDesc: string; startedAt: string };
+  /** Last partial text streamed to the user — updated on every token. */
+  lastStreamedText?: string;
+  /**
+   * Set when the previous query was aborted by a new incoming message so that
+   * the next handleMessage can fold the partial output into its prompt.
+   * Consumed exactly once.
+   */
+  pendingInterrupt?: { partial: string; interruptedAt: number };
 }
 
 /** Map tool names to user-friendly progress labels for streaming indicators. */
@@ -215,7 +223,14 @@ export class Gateway {
       logger.warn({ err, sessionKey }, 'Deep mode agent follow-up failed — using raw fallback');
       if (rawFallback.trim()) {
         await this._dispatcher?.send(rawFallback.slice(0, 1500))
-          .catch(e => logger.debug({ err: e }, 'Failed to push deep mode fallback'));
+          .catch(async (e) => {
+            // Both paths failed — surface it instead of swallowing at debug level.
+            logger.warn({ err: e, sessionKey }, 'Deep mode fallback delivery failed — persisting to daily note');
+            try {
+              const { logToDailyNote } = await import('./cron-scheduler.js');
+              logToDailyNote(`**[Deep mode delivery failed]** Session ${sessionKey} — result was:\n\n${rawFallback.slice(0, 1500)}`);
+            } catch { /* best-effort */ }
+          });
       }
     }
   }
@@ -604,16 +619,31 @@ export class Gateway {
   }
 
   /**
-   * Serialize access to a session. Returns a function to call when done,
-   * or waits for the current holder to finish first.
+   * Serialize access to a session. If a query is already in-flight when a new
+   * message arrives, we interrupt it — abort the running query, capture its
+   * partial output so the next handler can fold it into the new prompt, then
+   * wait for the aborted handler to release the lock. This lets users redirect
+   * or correct the agent mid-response instead of queuing behind a long query.
    */
   private async acquireSessionLock(sessionKey: string): Promise<() => void> {
-    // Wait for any existing lock to resolve
     let s = this.getSession(sessionKey);
-    while (s.lock) {
-      logger.info(`Session ${sessionKey} is busy — queuing message`);
-      await s.lock;
-      s = this.getSession(sessionKey);
+
+    // If a query is in-flight, interrupt it rather than wait indefinitely.
+    if (s.lock) {
+      if (s.abortController && !s.abortController.signal.aborted) {
+        const partial = s.lastStreamedText ?? '';
+        s.pendingInterrupt = { partial, interruptedAt: Date.now() };
+        logger.info({ sessionKey, partialLen: partial.length }, 'New message arrived — interrupting in-flight query');
+        // Pass a reason string so assistant.ts can distinguish this from a
+        // timeout abort and show the right final message.
+        s.abortController.abort('interrupted-by-new-message');
+      }
+      // Drain any remaining lock promises (the aborted handler still needs to
+      // finish its finally block before we can proceed).
+      while (s.lock) {
+        await s.lock;
+        s = this.getSession(sessionKey);
+      }
     }
 
     // Create a new lock (a promise + its resolver)
@@ -841,8 +871,17 @@ export class Gateway {
         let toolActivityCount = 0;
         let lastStreamedText = '';
         let lastProgressEmitAt = Date.now();
+        const sessState = this.getSession(sessionKey);
         const wrappedOnText = onText
-          ? async (token: string) => { resetIdleTimer(); lastStreamedText = token; lastProgressEmitAt = Date.now(); return onText(token); }
+          ? async (token: string) => {
+              resetIdleTimer();
+              lastStreamedText = token;
+              // Mirror to session state so a concurrent acquireSessionLock()
+              // can capture the partial output on interrupt.
+              sessState.lastStreamedText = token;
+              lastProgressEmitAt = Date.now();
+              return onText(token);
+            }
           : undefined;
 
         // Progress streaming: emit brief status indicators during long tool chains
@@ -878,6 +917,24 @@ export class Gateway {
           }, CHAT_MAX_WALL_MS);
         });
 
+        // If the previous query on this session was interrupted by this
+        // incoming message, fold the partial output in so the agent can pivot
+        // smoothly instead of re-planning from scratch.
+        let chatPrompt = text;
+        const interrupt = sessState.pendingInterrupt;
+        if (interrupt && interrupt.partial.trim()) {
+          delete sessState.pendingInterrupt;
+          const partialPreview = interrupt.partial.slice(0, 1500);
+          chatPrompt =
+            `[You were mid-response when the user sent a new message — they chose not to wait. ` +
+            `Here's what you had said so far (may be mid-sentence):\n---\n${partialPreview}\n---\n` +
+            `New message from user:]\n\n${text}`;
+          logger.info({ sessionKey, partialLen: interrupt.partial.length }, 'Folding interrupted partial into new prompt');
+        } else if (interrupt) {
+          // Interrupt flag was set but no useful partial text — just clear it.
+          delete sessState.pendingInterrupt;
+        }
+
         try {
           // No artificial turn cap — let the agent work until done.
           // Primary guardrail is cost budget (maxBudgetUsd in buildOptions).
@@ -886,7 +943,7 @@ export class Gateway {
           const queryStartMs = Date.now();
           const [response] = await Promise.race([
             this.assistant.chat(
-              text,
+              chatPrompt,
               effectiveSessionKey,
               { onText: wrappedOnText, onToolActivity: wrappedOnToolActivity, model: effectiveModel, maxTurns: maxTurns, securityAnnotation, projectOverride, profile: resolvedProfile, verboseLevel, abortController: chatAc },
             ),

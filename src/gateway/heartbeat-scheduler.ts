@@ -194,7 +194,15 @@ export class HeartbeatScheduler {
           `This will keep failing every night until the root cause is fixed. ` +
           `Ask me to check the self-improvement status for details.`,
           {},
-        ).catch(() => { /* last resort — log already captured it */ });
+        ).catch(async (sendErr) => {
+          // If the notification about the failure also failed, surface it to the daily note
+          // so the user sees it on their next check-in instead of it vanishing into logs.
+          logger.warn({ err: sendErr }, 'Failed to notify about self-improvement failure — writing to daily note');
+          try {
+            const { logToDailyNote } = await import('./cron-scheduler.js');
+            logToDailyNote(`**[Self-improvement crashed]** ${String(err).slice(0, 400)}`);
+          } catch { /* best-effort */ }
+        });
       });
     }
 

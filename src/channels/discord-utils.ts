@@ -180,19 +180,37 @@ export class DiscordStreamingMessage {
       clearInterval(this.progressTimer);
       this.progressTimer = null;
     }
-    if (!text) text = '*(no response)*';
+    if (!text) text = "*(I didn't have anything to respond with — try rephrasing or giving me more context.)*";
     text = sanitizeResponse(text);
 
-    if (this.message) {
-      if (text.length <= 1900) {
-        await this.message.edit(text);
-        this.messageId = this.message.id;
+    try {
+      if (this.message) {
+        if (text.length <= 1900) {
+          await this.message.edit(text);
+          this.messageId = this.message.id;
+        } else {
+          await this.message.delete().catch(() => {});
+          await sendChunked(this.channel, text);
+        }
       } else {
-        await this.message.delete().catch(() => {});
         await sendChunked(this.channel, text);
       }
-    } else {
-      await sendChunked(this.channel, text);
+    } catch (err) {
+      // Delivery failed after the agent already generated a response.
+      // Log loudly + persist the response text to the daily note so it isn't
+      // lost silently. Don't re-throw — the callers don't have try/catch
+      // around finalize() and we don't want to introduce crashes.
+      const errMsg = err instanceof Error ? err.message : String(err);
+      try {
+        const pino = (await import('pino')).default;
+        pino({ name: 'clementine.discord' }).warn(
+          { err: errMsg, channelId: (this.channel as { id?: string }).id },
+          'Discord delivery failed — response text saved to daily note',
+        );
+        const { logToDailyNote } = await import('../gateway/cron-scheduler.js');
+        const preview = text.slice(0, 1500);
+        logToDailyNote(`**[Discord delivery failed]** Channel \`${(this.channel as { id?: string }).id ?? 'unknown'}\` — response was:\n\n${preview}`);
+      } catch { /* best-effort */ }
     }
   }
 

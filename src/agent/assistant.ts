@@ -2300,11 +2300,20 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
         } catch (e: unknown) {
           const errStr = String(e).toLowerCase();
           if (errStr.includes('abort') || errStr.includes('cancel')) {
-            // Query was aborted. Three sources: timeout, user cancel, or
-            // StallGuard tripped (runaway loop detected).
+            // Query was aborted. Four sources: timeout, user cancel, StallGuard
+            // tripped (runaway loop), or interrupted by a new user message.
             const stallAbort = !!stallGuard?.isBreakerActive();
-            logger.warn({ sessionKey, stallAbort }, 'Chat query aborted');
-            if (stallAbort) {
+            const abortReason = abortController?.signal.reason;
+            const interruptAbort = abortReason === 'interrupted-by-new-message';
+            logger.warn({ sessionKey, stallAbort, interruptAbort }, 'Chat query aborted');
+            if (interruptAbort) {
+              // New message came in — let the next query answer. Just mark
+              // the partial response so the user knows this one was cut off.
+              // (The next handleMessage call will fold this partial into its prompt.)
+              responseText = responseText
+                ? responseText + '\n\n*(interrupted — answering your new message…)*'
+                : '*(interrupted — switching to your new message…)*';
+            } else if (stallAbort) {
               const reason = stallGuard?.getBreakerReason() ?? 'runaway loop';
               const stallMsg =
                 `I got stuck in a loop — ${reason} ` +
