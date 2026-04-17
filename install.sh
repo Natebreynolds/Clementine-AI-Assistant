@@ -87,15 +87,15 @@ step "Checking prerequisites"
 if command_exists node; then
   NODE_VERSION=$(node --version)
   NODE_MAJOR=$(echo "$NODE_VERSION" | sed 's/v//' | cut -d. -f1)
-  if [ "$NODE_MAJOR" -ge 20 ] && [ "$NODE_MAJOR" -le 24 ]; then
+  if [ "$NODE_MAJOR" -ge 20 ]; then
     ok "Node.js ${NODE_VERSION}"
   else
-    fail "Node.js ${NODE_VERSION} — need v20-24 LTS.
+    fail "Node.js ${NODE_VERSION} — need v20 or newer.
          Switch version:  nvm install 22 && nvm use 22
          Then re-run:     bash install.sh"
   fi
 else
-  fail "Node.js not found. Clementine requires Node.js 20-24 LTS.
+  fail "Node.js not found. Clementine requires Node.js 20 or newer.
        Install via nvm:
          curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash
          nvm install 22
