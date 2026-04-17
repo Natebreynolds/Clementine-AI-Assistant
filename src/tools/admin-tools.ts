@@ -1379,7 +1379,7 @@ const PENDING_SOURCE_DIR = path.join(SELF_IMPROVE_DIR, 'pending-source-changes')
 
 server.tool(
   'self_edit_source',
-  'Edit Clementine source code safely. Validates in a staging worktree, commits, builds, and triggers restart only if compilation succeeds. The daemon picks up the pending change and executes it.',
+  'Edit most Clementine TypeScript source files (for new features or bug fixes). Validates in a staging worktree, compiles, and triggers restart on success. Blocked files: `src/config.ts`, `src/gateway/security-scanner.ts`, `src/security/scanner.ts`. Do NOT use this tool to change user-tunable settings (budget caps, model tier, heartbeat interval, timezone, channel IDs, etc.) — those live in `~/.clementine/.env` and are managed by the user via `clementine config set KEY value`, which survives `clementine update` / `npm update -g`.',
   {
     file: z.string().describe('Path relative to src/ (e.g., "channels/discord-agent-bot.ts")'),
     content: z.string().describe('Complete new file content'),

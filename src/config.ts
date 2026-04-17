@@ -120,17 +120,19 @@ export const MODELS: Models = {
 };
 
 // ── Budget caps (USD per query) ──────────────────────────────────────
+// User-tunable via `clementine config set BUDGET_<NAME>_USD <value>`
+// (writes to ~/.clementine/.env, survives npm update -g).
 
 export const BUDGET = {
-  heartbeat: 0.50,            // $0.50 per heartbeat (Haiku, cheap)
-  cronT1: 2.00,               // $2 per tier-1 cron job (needs room for outlook+search)
-  cronT2: 5.00,               // $5 per tier-2 cron job
-  chat: 5.00,                 // $5 per interactive chat message
+  heartbeat: Number(getEnv('BUDGET_HEARTBEAT_USD', '0.50')),     // per heartbeat (Haiku)
+  cronT1: Number(getEnv('BUDGET_CRON_T1_USD', '2.00')),          // per tier-1 cron job
+  cronT2: Number(getEnv('BUDGET_CRON_T2_USD', '5.00')),          // per tier-2 cron job
+  chat: Number(getEnv('BUDGET_CHAT_USD', '5.00')),               // per interactive chat
   unleashedPhase: undefined,
   memoryExtraction: undefined,
   summarization: undefined,
   reflection: undefined,
-} as const;
+};
 
 export const DEFAULT_MODEL_TIER = (getEnv('DEFAULT_MODEL_TIER', 'sonnet')) as keyof Models;
 export const MODEL = MODELS[DEFAULT_MODEL_TIER] ?? MODELS.sonnet;

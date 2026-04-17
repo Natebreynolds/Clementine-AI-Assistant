@@ -434,6 +434,43 @@ ENABLE_1M_CONTEXT=false    # Enable 1M token context for Sonnet (toggle in dashb
 
 Secrets can also be stored in macOS Keychain (`security find-generic-password`) — Clementine checks Keychain as a fallback for any missing `.env` value.
 
+### Tuning Clementine
+
+Clementine ships with sensible defaults. To change anything, use:
+
+```bash
+clementine config set <KEY> <value>   # writes to ~/.clementine/.env
+clementine config get <KEY>
+clementine config list                # show all overrides
+clementine restart                    # apply changes
+```
+
+Your overrides live in `~/.clementine/.env` — **they survive every `npm update -g` / `clementine update`** because they're in your data home, not the package directory.
+
+**Commonly tuned knobs:**
+
+| Key | Default | What it does |
+|-----|---------|--------------|
+| `BUDGET_CHAT_USD` | `5.00` | Max spend per interactive chat message |
+| `BUDGET_CRON_T1_USD` | `2.00` | Max spend per tier-1 cron job |
+| `BUDGET_CRON_T2_USD` | `5.00` | Max spend per tier-2 cron job |
+| `BUDGET_HEARTBEAT_USD` | `0.50` | Max spend per heartbeat tick |
+| `DEFAULT_MODEL_TIER` | `sonnet` | Default model: `haiku` / `sonnet` / `opus` |
+| `ENABLE_1M_CONTEXT` | `false` | Enable Sonnet 1M-token context (beta) |
+| `HEARTBEAT_INTERVAL_MINUTES` | `30` | How often the agent auto-checks in |
+| `HEARTBEAT_ACTIVE_START` | `8` | First hour of the active window (0–23) |
+| `HEARTBEAT_ACTIVE_END` | `22` | Last hour of the active window |
+| `TIMEZONE` | system TZ | IANA timezone string (e.g., `America/Los_Angeles`) |
+| `ALLOW_ALL_USERS` | `false` | `true` = skip owner-only gate (trust all DMs) |
+| `ASSISTANT_NAME` | `Clementine` | Display name across channels |
+
+Example — raise the chat budget to `$10` without ever touching source:
+
+```bash
+clementine config set BUDGET_CHAT_USD 10
+clementine restart
+```
+
 ---
 
 ## Models

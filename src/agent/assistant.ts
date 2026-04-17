@@ -2237,7 +2237,12 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
                   const lower = errorText.toLowerCase();
                   if (lower.includes('max_budget_usd') || lower.includes('budget')) {
                     logger.warn({ sessionKey }, 'Chat query hit budget cap');
-                    responseText = responseText || 'I hit the cost limit for this query. Try breaking it into smaller requests.';
+                    responseText = responseText || (
+                      `I hit the $${BUDGET.chat.toFixed(2)} cost cap for this query. Options:\n` +
+                      `• Break it into smaller requests\n` +
+                      `• Reply "deep mode" to queue this as a background task with a bigger budget\n` +
+                      `• Raise the cap permanently: \`clementine config set BUDGET_CHAT_USD 10\` then \`clementine restart\``
+                    );
                   } else if (lower.includes('rate') && lower.includes('limit')) {
                     hitRateLimit = true;
                   } else if (lower.includes('maximum number of turns') || lower.includes('max_turns')) {
