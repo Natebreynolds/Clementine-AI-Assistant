@@ -630,6 +630,7 @@ export class PersonalAssistant {
   private sessionTimestamps = new Map<string, Date>();
   private lastExchanges = new Map<string, Array<{ user: string; assistant: string }>>();
   private pendingContext = new Map<string, Array<{ user: string; assistant: string }>>();
+  private saveSessionsTimer?: ReturnType<typeof setTimeout>;
   private restoredSessions = new Set<string>();
   private profileManager: AgentManager;
   private promptCache: PromptCache;
@@ -807,7 +808,29 @@ export class PersonalAssistant {
     }
   }
 
+  /**
+   * Schedule a debounced session persist. Multiple calls within 500ms collapse
+   * into a single write, eliminating synchronous disk I/O from the per-turn
+   * hot path. On shutdown, call flushSessions() to write any pending state.
+   */
   private saveSessions(): void {
+    if (this.saveSessionsTimer) return;
+    this.saveSessionsTimer = setTimeout(() => {
+      this.saveSessionsTimer = undefined;
+      this.saveSessionsNow();
+    }, 500);
+  }
+
+  /** Flush any pending debounced save synchronously. Call on shutdown. */
+  flushSessions(): void {
+    if (this.saveSessionsTimer) {
+      clearTimeout(this.saveSessionsTimer);
+      this.saveSessionsTimer = undefined;
+    }
+    this.saveSessionsNow();
+  }
+
+  private saveSessionsNow(): void {
     try {
       const data: Record<string, SessionData> = {};
       // Collect all keys that have any state worth saving
@@ -1505,7 +1528,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
     const effectivePermissionMode = 'bypassPermissions';
 
     return {
-      systemPrompt: stripLoneSurrogates(fullSystemPrompt),
+      systemPrompt: fullSystemPrompt,
       model: resolvedModel,
       ...(fallback ? { fallbackModel: fallback } : {}),
       permissionMode: effectivePermissionMode as 'bypassPermissions' | 'auto',
@@ -1796,10 +1819,8 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
       sessionRotated = true;
     }
 
-    // Sanitize lone Unicode surrogates before any JSON serialization to the API.
-    // Lone surrogates (U+D800–U+DFFF) are valid JS strings but invalid JSON,
-    // causing 400 "no low surrogate in string" errors from the Claude API.
-    let effectivePrompt = stripLoneSurrogates(text);
+    // Lone-surrogate sanitization happens at the SDK boundary (see query() wrapper).
+    let effectivePrompt = text;
 
     // If session rotated, use instant local summary + handoff + kick off LLM summary in background
     if (sessionRotated && key) {
@@ -1931,7 +1952,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
     const guard = new StallGuard();
 
     let [responseText, sessionId] = await this.runQuery(
-      stripLoneSurrogates(effectivePrompt), key, onText, model, profile, securityAnnotation, effectiveMaxTurns, projectOverride, onToolActivity, verboseLevel, abortController, guard, CHAT_TIMEOUT_MS, intent,
+      effectivePrompt, key, onText, model, profile, securityAnnotation, effectiveMaxTurns, projectOverride, onToolActivity, verboseLevel, abortController, guard, CHAT_TIMEOUT_MS, intent,
     );
 
     // If we got a context-length / prompt-too-long error, retry with a fresh session
@@ -1945,7 +1966,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
       logger.warn({ sessionKey: key }, 'Context overflow detected — rotating session');
       this.sessions.delete(key);
       this.exchangeCounts.set(key, 0);
-      let retryPrompt = stripLoneSurrogates(text);
+      let retryPrompt = text;
       const summary = await this.summarizeSession(key);
       if (summary) {
         retryPrompt =
@@ -1953,7 +1974,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
           `Here is a summary of what we were discussing:\n${summary}]\n\n` +
           `IMPORTANT: The previous attempt overflowed the context window, likely from large tool responses. ` +
           `If this task involves pulling data for multiple entities, delegate each to a sub-agent using the Agent tool ` +
-          `instead of calling data-heavy tools directly.\n\n${stripLoneSurrogates(text)}`;
+          `instead of calling data-heavy tools directly.\n\n${text}`;
       }
       [responseText, sessionId] = await this.runQuery(retryPrompt, key, onText, model, profile, securityAnnotation, maxTurns, undefined, onToolActivity, verboseLevel, abortController);
     }
@@ -1966,7 +1987,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
       this.exchangeCounts.set(key, (this.exchangeCounts.get(key) ?? 0) + 1);
       this.sessionTimestamps.set(key, new Date());
       const history = this.lastExchanges.get(key) ?? [];
-      history.push({ user: stripLoneSurrogates(text), assistant: responseText });
+      history.push({ user: text, assistant: responseText });
       if (history.length > SESSION_EXCHANGE_HISTORY_SIZE) {
         this.lastExchanges.set(key, history.slice(-SESSION_EXCHANGE_HISTORY_SIZE));
       } else {
@@ -1984,7 +2005,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
     // Save transcript turns
     if (key && this.memoryStore) {
       try {
-        this.memoryStore.saveTurn(key, 'user', stripLoneSurrogates(text));
+        this.memoryStore.saveTurn(key, 'user', text);
         this.memoryStore.saveTurn(key, 'assistant', responseText, model ?? MODEL);
       } catch (err) {
         logger.warn({ err, sessionKey: key }, 'Transcript save failed');

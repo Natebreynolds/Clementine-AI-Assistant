@@ -954,6 +954,9 @@ async function asyncMain(): Promise<void> {
     await drainActiveSessions(gateway);
   }
 
+  // Flush any pending debounced session writes before exit.
+  try { assistant.flushSessions(); } catch (err) { logger.warn({ err }, 'Session flush on shutdown failed'); }
+
   // Now safe to tear down remaining infrastructure
   heartbeat.stop();
   cronScheduler.stop();

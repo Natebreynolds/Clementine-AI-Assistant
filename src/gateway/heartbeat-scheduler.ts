@@ -404,17 +404,18 @@ export class HeartbeatScheduler {
       changesSummary += `\n\nRecent activity:\n${activitySummary}`;
     }
 
+    // Load all goals once for this tick — loadGoalSummary, enrichGoalsWithMemory,
+    // and advanceGoals all read the same set from disk. One readdirSync + N
+    // readFileSyncs, reused by each consumer below.
+    const tickGoals = HeartbeatScheduler.loadAllGoals();
+
     // Inject active goal summaries so the heartbeat can flag goals needing attention
-    const goalSummary = HeartbeatScheduler.loadGoalSummary();
+    const goalSummary = HeartbeatScheduler.loadGoalSummary(tickGoals);
     if (goalSummary) {
       changesSummary += `\n\n${goalSummary}`;
     }
-
-    // Enrich active goals with relevant memory snippets
-    const goalMemoryContext = this.enrichGoalsWithMemory();
-    if (goalMemoryContext) {
-      changesSummary += `\n\n${goalMemoryContext}`;
-    }
+    // Note: enrichGoalsWithMemory() runs below, inside the non-silent branch —
+    // silent heartbeats discard the result, so we skip the work entirely.
 
     // Inject daily plan summary if available
     try {
@@ -492,10 +493,17 @@ export class HeartbeatScheduler {
       logger.info({ silentBeats: this.lastState.consecutiveSilentBeats }, 'Heartbeat silent — nothing new');
 
       // Still run housekeeping
-      this.advanceGoals();
+      this.advanceGoals(tickGoals);
       this.processInbox();
       // Fall through to nightly tasks below — don't return early
     } else {
+
+    // Enrich active goals with relevant memory snippets — only done when
+    // we're actually going to invoke the agent (silent ticks discarded the result).
+    const goalMemoryContext = this.enrichGoalsWithMemory(tickGoals);
+    if (goalMemoryContext) {
+      changesSummary += `\n\n${goalMemoryContext}`;
+    }
 
     // Build dedup context from previously reported topics
     const dedupContext = this.buildDedupContext();
@@ -613,7 +621,7 @@ export class HeartbeatScheduler {
     }
 
     // Fire-and-forget: advance active goals by writing trigger files
-    this.advanceGoals();
+    this.advanceGoals(tickGoals);
 
     // Fire-and-forget: process inbox items
     this.processInbox();
@@ -940,18 +948,36 @@ export class HeartbeatScheduler {
   }
 
   /**
-   * Load active goal summaries for injection into heartbeat prompts.
-   * Returns null if no active goals exist.
+   * Read and parse all goal JSON files from GOALS_DIR once. Callers that
+   * need filtered subsets (active only, priority-based, etc.) do their own
+   * filtering over the returned array. Used by heartbeatTick to avoid
+   * repeating the readdirSync+readFileSync pass for every goal-consuming
+   * method.
    */
-  static loadGoalSummary(): string | null {
+  static loadAllGoals(): Array<any> {
     try {
-      if (!existsSync(GOALS_DIR)) return null;
+      if (!existsSync(GOALS_DIR)) return [];
       const files = readdirSync(GOALS_DIR).filter(f => f.endsWith('.json'));
-      if (files.length === 0) return null;
-
-      const activeGoals = files
+      return files
         .map(f => { try { return JSON.parse(readFileSync(path.join(GOALS_DIR, f), 'utf-8')); } catch { return null; } })
-        .filter((g: any) => g && g.status === 'active');
+        .filter((g: any) => g !== null);
+    } catch (err) {
+      logger.warn({ err }, 'loadAllGoals failed');
+      return [];
+    }
+  }
+
+  /**
+   * Load active goal summaries for injection into heartbeat prompts.
+   * Returns null if no active goals exist. Pass `preloadedGoals` to reuse
+   * an already-read goal list and skip disk I/O.
+   */
+  static loadGoalSummary(preloadedGoals?: Array<any>): string | null {
+    try {
+      const allGoals = preloadedGoals ?? HeartbeatScheduler.loadAllGoals();
+      if (allGoals.length === 0) return null;
+
+      const activeGoals = allGoals.filter((g: any) => g && g.status === 'active');
 
       if (activeGoals.length === 0) return null;
 
@@ -994,16 +1020,14 @@ export class HeartbeatScheduler {
    * Enrich top active goals with relevant memory snippets.
    * Searches FTS5 memory for each goal's title+description to surface
    * recent conversations and facts the heartbeat agent can act on.
+   * Pass `preloadedGoals` to reuse an already-read goal list.
    */
-  private enrichGoalsWithMemory(): string | null {
+  private enrichGoalsWithMemory(preloadedGoals?: Array<any>): string | null {
     try {
-      if (!existsSync(GOALS_DIR)) return null;
-      const files = readdirSync(GOALS_DIR).filter(f => f.endsWith('.json'));
-      if (files.length === 0) return null;
+      const allGoals = preloadedGoals ?? HeartbeatScheduler.loadAllGoals();
+      if (allGoals.length === 0) return null;
 
-      const goals = files
-        .map(f => { try { return JSON.parse(readFileSync(path.join(GOALS_DIR, f), 'utf-8')); } catch { return null; } })
-        .filter((g: any) => g && g.status === 'active' && g.priority !== 'low');
+      const goals = allGoals.filter((g: any) => g && g.status === 'active' && g.priority !== 'low');
 
       if (goals.length === 0) return null;
 
@@ -1041,7 +1065,7 @@ export class HeartbeatScheduler {
    *
    * Conservative: max 2 triggers per tick, skips if triggers are already pending.
    */
-  private advanceGoals(): void {
+  private advanceGoals(preloadedGoals?: Array<any>): void {
     try {
       const goalTriggerDir = path.join(BASE_DIR, 'cron', 'goal-triggers');
       mkdirSync(goalTriggerDir, { recursive: true });
@@ -1050,9 +1074,8 @@ export class HeartbeatScheduler {
       const pending = readdirSync(goalTriggerDir).filter(f => f.endsWith('.trigger.json'));
       if (pending.length > 0) return;
 
-      if (!existsSync(GOALS_DIR)) return;
-      const files = readdirSync(GOALS_DIR).filter(f => f.endsWith('.json'));
-      if (files.length === 0) return;
+      const allGoals = preloadedGoals ?? HeartbeatScheduler.loadAllGoals();
+      if (allGoals.length === 0) return;
 
       const now = Date.now();
       const DAY_MS = 86_400_000;
@@ -1110,9 +1133,8 @@ export class HeartbeatScheduler {
       // Score ALL active goals — stale goals get urgency bonus, but
       // non-stale high-priority goals with pending work also qualify.
       const scoredGoals: Array<{ goal: any; score: number; reason: string }> = [];
-      for (const f of files) {
+      for (const goal of allGoals) {
         try {
-          const goal = JSON.parse(readFileSync(path.join(GOALS_DIR, f), 'utf-8'));
           if (goal.status !== 'active') continue;
 
           // Skip goals in cooldown (failed recently or producing stale output)
