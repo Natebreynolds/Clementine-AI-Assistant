@@ -63,29 +63,14 @@ The result: Clementine gets better the more you talk to it.
 
 ---
 
-## Prerequisites
+## Install (recommended)
 
-- **Node.js 20-24 LTS** — `nvm install 22`
-- **Claude Code CLI** — already installed if you're reading this in Claude Code
+Runtime: **Node.js 22 (recommended) or Node.js 20+**.
 
-## Quick start
-
-**Option A — npm (recommended):**
 ```bash
-npm install -g clementine-agent
+npm install -g clementine-agent@latest
 clementine setup
 ```
-
-**Option B — from source (for development):**
-```bash
-git clone https://github.com/Natebreynolds/Clementine-AI-Assistant.git clementine
-cd clementine
-bash install.sh
-```
-
-The install script handles everything: system dependencies (redis, libomp, build tools), npm packages, TypeScript build, global CLI install, and launches the setup wizard. Safe to re-run — skips anything already installed.
-
-The setup wizard auto-generates a Discord bot invite URL from your token and offers to open it in your browser — no need to visit the Developer Portal manually.
 
 After setup:
 
@@ -95,13 +80,38 @@ clementine status         # verify it's running
 clementine dashboard      # open the web command center
 ```
 
-Already have it? Update in place:
+Already installed? Update in place with `clementine update`.
+
+### Troubleshooting
+
+**`EACCES: permission denied` on `npm install -g`.** Your Node was installed system-wide (`/usr/local/lib/...`) and npm can't write there without sudo. Fix it once, permanently:
 
 ```bash
-clementine update
+mkdir -p ~/.npm-global
+npm config set prefix ~/.npm-global
+echo 'export PATH=~/.npm-global/bin:$PATH' >> ~/.zshrc && source ~/.zshrc
+npm install -g clementine-agent@latest
 ```
 
-That's it. Clementine is now running, connected to your configured channels, and learning.
+Or install Node via [nvm](https://github.com/nvm-sh/nvm) — user-scoped by default, no permission issues ever.
+
+**`clementine: command not found` after install succeeded.** Run `npm config get prefix` — its `/bin` directory needs to be on your `PATH`. Add `export PATH="$(npm config get prefix)/bin:$PATH"` to your shell profile.
+
+**Node version too old.** Install via nvm:
+```bash
+curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash
+nvm install 22
+```
+
+### Install from source (for development)
+
+```bash
+git clone https://github.com/Natebreynolds/Clementine-AI-Assistant.git clementine
+cd clementine
+bash install.sh
+```
+
+Handles system dependencies (redis, libomp, build tools), npm packages, TypeScript build, global CLI install, and launches the setup wizard. Safe to re-run.
 
 ---
 
