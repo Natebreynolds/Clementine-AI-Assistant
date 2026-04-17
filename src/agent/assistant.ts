@@ -13,7 +13,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import {
-  query,
+  query as rawQuery,
   listSubagents,
   getSubagentMessages,
   type Options as SDKOptions,
@@ -166,6 +166,35 @@ function stripLoneSurrogates(s: string): string {
   // Replace any surrogate not properly paired with the Unicode replacement char
   return s.replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, '\uFFFD');
 }
+
+/**
+ * Wrapper around the SDK's query() that sanitizes lone Unicode surrogates in
+ * prompt, systemPrompt, and appendSystemPrompt. Covers every call site in one
+ * place so new injection points (history, summaries, tool output) can't leak
+ * lone surrogates into the JSON body. Non-string prompts (streaming inputs)
+ * pass through untouched.
+ */
+const query: typeof rawQuery = ((args: Parameters<typeof rawQuery>[0]) => {
+  if (args && typeof args === 'object') {
+    const cleaned: any = { ...args };
+    if (typeof cleaned.prompt === 'string') {
+      cleaned.prompt = stripLoneSurrogates(cleaned.prompt);
+    }
+    if (cleaned.options && typeof cleaned.options === 'object') {
+      const opts: any = cleaned.options;
+      const newOpts: any = { ...opts };
+      if (typeof opts.systemPrompt === 'string') {
+        newOpts.systemPrompt = stripLoneSurrogates(opts.systemPrompt);
+      }
+      if (typeof opts.appendSystemPrompt === 'string') {
+        newOpts.appendSystemPrompt = stripLoneSurrogates(opts.appendSystemPrompt);
+      }
+      cleaned.options = newOpts;
+    }
+    return rawQuery(cleaned);
+  }
+  return rawQuery(args);
+}) as typeof rawQuery;
 
 /** Format a millisecond duration as a human-friendly "X ago" string. */
 function formatTimeAgo(ms: number): string {
