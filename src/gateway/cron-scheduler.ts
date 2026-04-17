@@ -1315,7 +1315,10 @@ export class CronScheduler {
     msg = msg.replace(/Claude Code process exited with code \d+/i, 'Task could not complete');
     // Truncate
     if (msg.length > 300) msg = msg.slice(0, 297) + '...';
-    return `${jobName} failed: ${msg.trim()}`;
+    return (
+      `Cron \`${jobName}\` failed: ${msg.trim()}\n` +
+      `Check \`clementine cron runs ${jobName}\` for details, or retry with \`clementine cron run ${jobName}\`.`
+    );
   }
 
   listJobs(): string {

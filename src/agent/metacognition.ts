@@ -128,7 +128,22 @@ export class MetacognitiveMonitor {
       return signal;
     }
 
-    // Signal: excessive tool calls (>20 in a single execution)
+    // Signal: excessive tool calls with near-zero output.
+    // Warn at 20, intervene (hard stop) at 60 — beyond 60 the agent is
+    // almost certainly in a runaway loop that will burn through the
+    // budget cap with nothing to show for it.
+    if (this.toolCalls.length >= 60 && this.outputCharCount < 200) {
+      this.confidence = 'low';
+      if (!this.signals.includes('high_effort_low_output')) {
+        this.signals.push('high_effort_low_output');
+      }
+      this.interventionCount++;
+      return {
+        type: 'intervene',
+        reason: 'high_effort_low_output',
+        guidance: `You've made ${this.toolCalls.length} tool calls across ${this.uniqueTools.size} tools with only ${this.outputCharCount} chars of output. This is a runaway loop. Stopping now to prevent budget waste.`,
+      };
+    }
     if (this.toolCalls.length > 20 && this.outputCharCount < 200) {
       this.confidence = 'low';
       if (!this.signals.includes('high_effort_low_output')) {

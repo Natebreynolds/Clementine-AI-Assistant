@@ -58,6 +58,12 @@ export class StallGuard {
     return { block: false };
   }
 
+  /** True when the stall breaker has been engaged during this query. */
+  isBreakerActive(): boolean { return this.breakerActive; }
+
+  /** Reason string set when the breaker engaged (empty if not active). */
+  getBreakerReason(): string { return this.breakerReason; }
+
   /**
    * Record a tool call. Runs loop detection and metacognition.
    * Activates the breaker if either detector fires.

@@ -1562,6 +1562,13 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
         if (stallGuard) {
           const stallCheck = stallGuard.shouldBlockTool(toolName);
           if (stallCheck.block) {
+            // When the breaker engages we also abort the whole query —
+            // denying a single tool isn't enough for a runaway loop,
+            // the agent will just try the next read-only tool.
+            if (abortController && !abortController.signal.aborted) {
+              logger.warn({ sessionKey, toolName }, 'StallGuard breaker engaged — aborting query');
+              abortController.abort();
+            }
             return { behavior: 'deny' as const, message: stallCheck.message ?? 'Stall breaker.' };
           }
         }
@@ -2293,9 +2300,19 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
         } catch (e: unknown) {
           const errStr = String(e).toLowerCase();
           if (errStr.includes('abort') || errStr.includes('cancel')) {
-            // Query was aborted (timeout or user cancel) — return partial output
-            logger.warn({ sessionKey }, 'Chat query aborted');
-            if (!responseText) {
+            // Query was aborted. Three sources: timeout, user cancel, or
+            // StallGuard tripped (runaway loop detected).
+            const stallAbort = !!stallGuard?.isBreakerActive();
+            logger.warn({ sessionKey, stallAbort }, 'Chat query aborted');
+            if (stallAbort) {
+              const reason = stallGuard?.getBreakerReason() ?? 'runaway loop';
+              const stallMsg =
+                `I got stuck in a loop — ${reason} ` +
+                `I stopped to save budget. Options:\n` +
+                `• Rephrase your request more specifically\n` +
+                `• Reply "deep mode" to queue this as a background task with a bigger budget`;
+              responseText = responseText ? responseText + '\n\n' + stallMsg : stallMsg;
+            } else if (!responseText) {
               responseText = 'I ran out of time on this one. Let me know if you want me to pick it back up.';
             } else {
               responseText += '\n\nI ran out of time but here\'s what I have so far. Want me to continue?';
@@ -2325,7 +2342,10 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
             }
             responseText = responseText || 'The conversation context filled up from large tool outputs. I\'ve reset the session — please try again, and I\'ll keep query results smaller this time.';
           } else if (errStr.includes('prompt is too long') || errStr.includes('prompt too long') || errStr.includes('context_length')) {
-            responseText = responseText || 'Error: prompt is too long — context window overflow from large tool responses.';
+            responseText = responseText || (
+              'The conversation got too large to process (tool responses filled the context window). ' +
+              "I've reset the session. Try again — I'll keep result sets smaller this time."
+            );
           } else if (errStr.includes('no conversation found') || errStr.includes('conversation not found') || errStr.includes('session not found')) {
             // Stale session — clear and retry
             logger.warn({ sessionKey }, 'Stale session ID (exception) — clearing and retrying');
@@ -2342,9 +2362,18 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
           } else {
             logger.error({ err: e, sessionKey }, 'SDK query failed');
             if (!responseText) {
-              // Surface a concise error description instead of a generic message
+              // Classify so the user gets a useful suggestion instead of raw error text.
               const shortErr = String(e).replace(/\n.*$/s, '').slice(0, 200);
-              responseText = `Hit an error: ${shortErr}. Try again or \`!clear\` to reset the session.`;
+              const lowerErr = String(e).toLowerCase();
+              let hint = '';
+              if (lowerErr.includes('econnrefused') || lowerErr.includes('socket') || lowerErr.includes('network')) {
+                hint = 'Looks like a network issue — check your internet and try again.';
+              } else if (lowerErr.includes('spawn') || lowerErr.includes('enoent')) {
+                hint = 'A required binary seems to be missing. Try `clementine doctor` to diagnose.';
+              } else {
+                hint = 'Try again, or `!clear` to reset the session. If it keeps happening, check `~/.clementine/logs/clementine.log`.';
+              }
+              responseText = `I hit an error: ${shortErr}\n\n${hint}`;
             }
           }
         }
@@ -3986,7 +4015,11 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
           appendProgress({ event: 'aborted', phase, reason: `${MAX_CONSECUTIVE_ERRORS} consecutive phase errors` });
           writeStatus({ jobName, status: 'error', phase, startedAt, finishedAt: new Date().toISOString() });
           logger.error(`Unleashed task ${jobName} aborted after ${MAX_CONSECUTIVE_ERRORS} consecutive errors`);
-          const errorResult = lastOutput || `Task "${jobName}" aborted after ${MAX_CONSECUTIVE_ERRORS} consecutive phase errors.`;
+          const errorResult = lastOutput || (
+            `Task "${jobName}" aborted after ${MAX_CONSECUTIVE_ERRORS} consecutive phase errors. ` +
+            `Check \`clementine cron runs ${jobName}\` for the failing phase, or retry with ` +
+            `\`clementine cron run ${jobName}\`.`
+          );
           if (this.onUnleashedComplete) {
             try { this.onUnleashedComplete(jobName, errorResult); } catch { /* non-fatal */ }
           }
