@@ -7,10 +7,14 @@
  ╚═════╝╚══════╝╚══════╝╚═╝     ╚═╝╚══════╝╚═╝  ╚═══╝   ╚═╝   ╚═╝╚═╝  ╚═══╝╚══════╝
 ```
 
-A persistent, ever-learning personal AI assistant that runs as a background daemon on macOS.
+A persistent, ever-learning personal AI assistant that runs as a background daemon on macOS and Linux.
 Built on the [Claude Code SDK](https://docs.anthropic.com/en/docs/claude-code-sdk), Obsidian-compatible vault, and SQLite FTS5.
 
 Connects to Discord, Slack, Telegram, WhatsApp, and webhooks. Remembers everything. Runs 24/7.
+
+**Requirements:** Node.js 20+ (22 recommended) · [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) authenticated · macOS or Linux.
+
+**Contents:** [How it works](#how-it-works) · [Install](#install-recommended) · [Architecture](#architecture) · [CLI](#cli-reference) · [Configuration](#configuration) · [Channels](#channels) · [Agents & Teams](#agents--teams) · [Cron](#scheduled-tasks--cron-jobs) · [Unleashed mode](#unleashed-mode) · [Self-improvement](#self-improvement) · [Vault](#vault) · [Development](#development) · [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -735,15 +739,6 @@ Key system files:
 | `HEARTBEAT.md` | Autonomous check-in configuration |
 | `CRON.md` | Scheduled task definitions (cron syntax) |
 | `TASKS.md` | Master task list with `{T-NNN}` IDs |
-
----
-
-## Requirements
-
-- **Node.js 20-24 LTS** (for `--import` loader and `cpSync`)
-- **macOS** (Keychain integration, LaunchAgent — works on Linux without these)
-- **Claude Code CLI** installed and authenticated (`npm install -g @anthropic-ai/claude-code && claude login`)
-- No API key needed — authentication is handled by the Claude Code CLI
 
 ---
 
