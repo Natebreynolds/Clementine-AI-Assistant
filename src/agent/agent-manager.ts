@@ -16,8 +16,10 @@ import fs from 'node:fs';
 import path from 'node:path';
 import matter from 'gray-matter';
 import type { AgentProfile, AgentStatus, SendPolicy, TeamAgentConfig } from '../types.js';
+import { randomBytes } from 'node:crypto';
 import { ProfileManager } from './profiles.js';
 import { getScaffoldForRole } from './role-scaffolds.js';
+import { writeGoalForOwner, type GoalRecord } from '../tools/shared.js';
 
 // ── Keychain helpers for agent secrets ────────────────────────────────
 
@@ -373,6 +375,37 @@ export class AgentManager {
         }
       }
     }
+
+    // Seed a starter goal so the agent shows up in goal reviews from day one.
+    // Status is "pending" — forces the owner to give it a real success metric
+    // before it starts driving goal_work sessions.
+    try {
+      const now = new Date().toISOString();
+      const starterGoal: GoalRecord = {
+        id: randomBytes(4).toString('hex'),
+        title: `${config.name}: Define Success Metric`,
+        description:
+          `Starter goal auto-created when ${config.name} was hired. Replace this with a ` +
+          `concrete outcome and measurable success metric (e.g., "book 3 demos/week", ` +
+          `"publish 2 posts/week", "reduce queue backlog under 50 items"). Set status to ` +
+          `"active" once defined so goal_work sessions can drive progress.`,
+        status: 'pending',
+        owner: slug,
+        priority: 'high',
+        createdAt: now,
+        updatedAt: now,
+        progressNotes: [],
+        nextActions: [
+          `Define the measurable success metric for ${config.name}`,
+          'Link the relevant cron jobs once the metric is set',
+          'Set status to "active" to enable goal_work sessions',
+        ],
+        blockers: ['Success metric not yet defined'],
+        reviewFrequency: 'weekly',
+        linkedCronJobs: [],
+      };
+      writeGoalForOwner(starterGoal);
+    } catch { /* non-fatal — agent is still created */ }
 
     // Invalidate cache
     this.cacheTime = 0;
