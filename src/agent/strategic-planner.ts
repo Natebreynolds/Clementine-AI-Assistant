@@ -14,6 +14,7 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 
 import path from 'node:path';
 import pino from 'pino';
 import { BASE_DIR, GOALS_DIR, MODELS } from '../config.js';
+import { listAllGoals } from '../tools/shared.js';
 import type { DailyPlan, PersistentGoal } from '../types.js';
 
 const logger = pino({ name: 'clementine.strategic-planner' });
@@ -326,25 +327,13 @@ export class StrategicPlanner {
   }
 
   private loadActiveGoals(): PersistentGoal[] {
-    if (!existsSync(GOALS_DIR)) return [];
-    return readdirSync(GOALS_DIR)
-      .filter(f => f.endsWith('.json'))
-      .map(f => {
-        try { return JSON.parse(readFileSync(path.join(GOALS_DIR, f), 'utf-8')); }
-        catch { return null; }
-      })
-      .filter((g: any) => g && g.status === 'active');
+    return listAllGoals()
+      .map(({ goal }) => goal as unknown as PersistentGoal)
+      .filter(g => g && g.status === 'active');
   }
 
   private loadAllGoals(): PersistentGoal[] {
-    if (!existsSync(GOALS_DIR)) return [];
-    return readdirSync(GOALS_DIR)
-      .filter(f => f.endsWith('.json'))
-      .map(f => {
-        try { return JSON.parse(readFileSync(path.join(GOALS_DIR, f), 'utf-8')); }
-        catch { return null; }
-      })
-      .filter(Boolean);
+    return listAllGoals().map(({ goal }) => goal as unknown as PersistentGoal);
   }
 }
 

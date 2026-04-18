@@ -37,6 +37,7 @@ import {
   CRON_REFLECTIONS_DIR,
   GOALS_DIR,
 } from '../config.js';
+import { listAllGoals } from '../tools/shared.js';
 import type {
   CronRunEntry,
   EvolutionVersion,
@@ -637,33 +638,27 @@ export class SelfImproveLoop {
       }
     } catch { /* non-fatal */ }
 
-    // Gather goal health data
+    // Gather goal health data (walks global + per-agent goals dirs)
     const goalHealth: GoalHealthEntry[] = [];
     try {
-      if (existsSync(GOALS_DIR)) {
-        const goalFiles = readdirSync(GOALS_DIR).filter(f => f.endsWith('.json'));
-        const now = Date.now();
-        const DAY_MS = 86_400_000;
-        for (const file of goalFiles) {
-          try {
-            const goal = JSON.parse(readFileSync(path.join(GOALS_DIR, file), 'utf-8'));
-            const lastUpdate = goal.updatedAt ? new Date(goal.updatedAt).getTime() : 0;
-            const daysSinceUpdate = Math.floor((now - lastUpdate) / DAY_MS);
-            const staleThreshold = goal.reviewFrequency === 'daily' ? 1 : goal.reviewFrequency === 'weekly' ? 7 : 30;
-            goalHealth.push({
-              id: goal.id,
-              title: goal.title,
-              status: goal.status,
-              owner: goal.owner,
-              priority: goal.priority,
-              daysSinceUpdate,
-              reviewFrequency: goal.reviewFrequency,
-              isStale: goal.status === 'active' && daysSinceUpdate > staleThreshold,
-              linkedCronJobs: goal.linkedCronJobs || [],
-              progressCount: goal.progressNotes?.length ?? 0,
-            });
-          } catch { /* skip malformed */ }
-        }
+      const now = Date.now();
+      const DAY_MS = 86_400_000;
+      for (const { goal, owner } of listAllGoals()) {
+        const lastUpdate = goal.updatedAt ? new Date(goal.updatedAt).getTime() : 0;
+        const daysSinceUpdate = Math.floor((now - lastUpdate) / DAY_MS);
+        const staleThreshold = goal.reviewFrequency === 'daily' ? 1 : goal.reviewFrequency === 'weekly' ? 7 : 30;
+        goalHealth.push({
+          id: goal.id,
+          title: goal.title,
+          status: goal.status as string,
+          owner: owner,
+          priority: goal.priority as string,
+          daysSinceUpdate,
+          reviewFrequency: goal.reviewFrequency as string,
+          isStale: goal.status === 'active' && daysSinceUpdate > staleThreshold,
+          linkedCronJobs: goal.linkedCronJobs || [],
+          progressCount: goal.progressNotes?.length ?? 0,
+        });
       }
     } catch { /* non-fatal */ }
 

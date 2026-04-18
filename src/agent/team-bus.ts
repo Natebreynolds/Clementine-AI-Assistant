@@ -6,13 +6,13 @@
  */
 
 import { createHash, randomBytes } from 'node:crypto';
-import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
-import os from 'node:os';
+import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import pino from 'pino';
 import type { AgentProfile, TeamMessage } from '../types.js';
 import type { Gateway } from '../gateway/router.js';
 import type { TeamRouter } from './team-router.js';
+import { listAllGoals } from '../tools/shared.js';
 
 const logger = pino({ name: 'clementine.team-bus' });
 
@@ -335,20 +335,10 @@ export class TeamBus {
     goalId: string,
     _sessionKey?: string,
   ): Promise<TeamMessage[]> {
-    const goalsDir = path.join(
-      process.env.CLEMENTINE_HOME || path.join(os.homedir(), '.clementine'),
-      'goals',
-    );
-
     let targetSlugs: string[] = [];
-    if (existsSync(goalsDir)) {
-      for (const f of readdirSync(goalsDir).filter(f => f.endsWith('.json'))) {
-        try {
-          const goal = JSON.parse(readFileSync(path.join(goalsDir, f), 'utf-8'));
-          if (goal.id === goalId && goal.owner && goal.owner !== fromSlug) {
-            targetSlugs.push(goal.owner);
-          }
-        } catch { continue; }
+    for (const { goal, owner } of listAllGoals()) {
+      if (goal.id === goalId && owner && owner !== fromSlug) {
+        targetSlugs.push(owner);
       }
     }
 

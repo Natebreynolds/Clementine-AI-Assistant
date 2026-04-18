@@ -11,12 +11,12 @@ import path from 'node:path';
 import pino from 'pino';
 import {
   BASE_DIR,
-  GOALS_DIR,
   CRON_REFLECTIONS_DIR,
   TASKS_FILE,
   INBOX_DIR,
   MODELS,
 } from '../config.js';
+import { listAllGoals } from '../tools/shared.js';
 import type { PersistentGoal, DailyPlan, DailyPlanPriority } from '../types.js';
 
 
@@ -121,16 +121,10 @@ export class DailyPlanner {
   }
 
   private loadActiveGoals(): PersistentGoal[] {
-    if (!existsSync(GOALS_DIR)) return [];
     try {
-      const files = readdirSync(GOALS_DIR).filter(f => f.endsWith('.json'));
-      const goals: PersistentGoal[] = [];
-      for (const f of files) {
-        try {
-          const goal = JSON.parse(readFileSync(path.join(GOALS_DIR, f), 'utf-8'));
-          if (goal.status === 'active') goals.push(goal);
-        } catch { continue; }
-      }
+      const goals = listAllGoals()
+        .map(({ goal }) => goal as unknown as PersistentGoal)
+        .filter(g => g && g.status === 'active');
       return goals.sort((a, b) => {
         const p = { high: 0, medium: 1, low: 2 };
         return (p[a.priority] ?? 2) - (p[b.priority] ?? 2);

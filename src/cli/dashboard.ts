@@ -5656,16 +5656,15 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
 
   // ── Goals, Delegations, Workflows, Digest — extracted routers ──
 
-  const GOALS_DIR = path.join(BASE_DIR, 'goals');
   const CRON_RUNS_DIR = path.join(BASE_DIR, 'cron', 'runs');
   const AGENTS_BASE = path.join(VAULT_DIR, '00-System', 'agents');
   const WORKFLOWS_DIR = path.join(VAULT_DIR, '00-System', 'workflows');
   const WORKFLOW_RUNS_DIR = path.join(BASE_DIR, 'workflows', 'runs');
 
-  app.use('/api/goals', goalsRouter({ goalsDir: GOALS_DIR, cronRunsDir: CRON_RUNS_DIR, vaultDir: VAULT_DIR, cronFile: CRON_FILE, getGateway }));
+  app.use('/api/goals', goalsRouter({ cronRunsDir: CRON_RUNS_DIR, vaultDir: VAULT_DIR, cronFile: CRON_FILE, getGateway }));
   app.use('/api/delegations', delegationsRouter({ agentsBase: AGENTS_BASE, getGateway, broadcastEvent }));
   app.use('/api/workflows', workflowsRouter({ workflowsDir: WORKFLOWS_DIR, workflowRunsDir: WORKFLOW_RUNS_DIR, agentsBase: AGENTS_BASE, getGateway, broadcastEvent, cachedAsync }));
-  app.use('/api/digest', digestRouter({ baseDir: BASE_DIR, vaultDir: VAULT_DIR, goalsDir: GOALS_DIR, memoryDbPath: MEMORY_DB_PATH, parseEnvFile, getGateway, cached }));
+  app.use('/api/digest', digestRouter({ baseDir: BASE_DIR, vaultDir: VAULT_DIR, memoryDbPath: MEMORY_DB_PATH, parseEnvFile, getGateway, cached }));
 
   // Voice audio route (served from digest router but needs top-level mount for /api/voice/ path)
   app.get('/api/voice/audio/:hash', (req, res) => {

@@ -6,10 +6,11 @@
  * string to be appended to the original prompt.
  */
 
-import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import pino from 'pino';
-import { BASE_DIR, CRON_REFLECTIONS_DIR, CRON_PROGRESS_DIR, GOALS_DIR } from '../config.js';
+import { BASE_DIR, CRON_REFLECTIONS_DIR, CRON_PROGRESS_DIR } from '../config.js';
+import { listAllGoals } from '../tools/shared.js';
 import type { PersistentGoal, CronProgress } from '../types.js';
 
 const logger = pino({ name: 'clementine.prompt-evolver' });
@@ -245,20 +246,13 @@ function extractProgressInsights(jobName: string): string | null {
  * Find goals that reference this cron job and inject alignment guidance.
  */
 function extractGoalGuidance(jobName: string): string | null {
-  if (!existsSync(GOALS_DIR)) return null;
-
   try {
-    const files = readdirSync(GOALS_DIR).filter(f => f.endsWith('.json'));
     const linkedGoals: PersistentGoal[] = [];
-
-    for (const f of files) {
-      try {
-        const goal: PersistentGoal = JSON.parse(readFileSync(path.join(GOALS_DIR, f), 'utf-8'));
-        if (goal.status !== 'active') continue;
-        if (goal.linkedCronJobs?.includes(jobName)) {
-          linkedGoals.push(goal);
-        }
-      } catch { continue; }
+    for (const { goal } of listAllGoals()) {
+      if (goal.status !== 'active') continue;
+      if (goal.linkedCronJobs?.includes(jobName)) {
+        linkedGoals.push(goal as unknown as PersistentGoal);
+      }
     }
 
     if (linkedGoals.length === 0) return null;

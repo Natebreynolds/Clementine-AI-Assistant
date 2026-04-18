@@ -14,11 +14,11 @@ import { randomBytes } from 'node:crypto';
 import path from 'node:path';
 import matter from 'gray-matter';
 import type { Gateway } from '../../gateway/router.js';
+import { listAllGoals } from '../../tools/shared.js';
 
 export interface DigestRouterDeps {
   baseDir: string;
   vaultDir: string;
-  goalsDir: string;
   memoryDbPath: string;
   parseEnvFile: () => Record<string, string>;
   getGateway: () => Promise<Gateway>;
@@ -41,7 +41,7 @@ export function getDigestPrefs(prefsFile: string): Record<string, unknown> {
 
 export function digestRouter(deps: DigestRouterDeps): Router {
   const router = Router();
-  const { baseDir, vaultDir, goalsDir, memoryDbPath, parseEnvFile, getGateway, cached } = deps;
+  const { baseDir, vaultDir, memoryDbPath, parseEnvFile, getGateway, cached } = deps;
   const prefsFile = path.join(baseDir, 'digest-preferences.json');
   const voiceCacheDir = path.join(baseDir, 'cache', 'voice');
 
@@ -110,11 +110,10 @@ export function digestRouter(deps: DigestRouterDeps): Router {
 
     if (secs.goals !== false) {
       try {
-        if (existsSync(goalsDir)) {
-          const files = readdirSync(goalsDir).filter(f => f.endsWith('.json'));
-          const goals = files.map(f => { try { return JSON.parse(readFileSync(path.join(goalsDir, f), 'utf-8')); } catch { return null; } }).filter(Boolean);
-          const active = goals.filter((g: Record<string, unknown>) => g.status === 'active');
-          const blocked = goals.filter((g: Record<string, unknown>) => g.status === 'blocked');
+        {
+          const goals = listAllGoals().map(e => e.goal as Record<string, unknown>);
+          const active = goals.filter(g => g.status === 'active');
+          const blocked = goals.filter(g => g.status === 'blocked');
           let goalText = `${active.length} active, ${blocked.length} blocked\n`;
           active.slice(0, 5).forEach((g: Record<string, unknown>) => {
             goalText += `  - ${g.title} [${g.priority}]`;

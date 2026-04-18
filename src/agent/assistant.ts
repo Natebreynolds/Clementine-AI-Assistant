@@ -48,7 +48,6 @@ import {
   UNLEASHED_DEFAULT_MAX_HOURS,
   UNLEASHED_MAX_PHASES,
   PROJECTS_META_FILE,
-  GOALS_DIR,
   CRON_PROGRESS_DIR,
   CRON_REFLECTIONS_DIR,
   HANDOFFS_DIR,
@@ -74,7 +73,7 @@ import {
   setInteractionSource,
 } from './hooks.js';
 import { scanner } from '../security/scanner.js';
-import { agentWorkingMemoryFile } from '../tools/shared.js';
+import { agentWorkingMemoryFile, listAllGoals } from '../tools/shared.js';
 import { AgentManager } from './agent-manager.js';
 import { extractLinks } from './link-extractor.js';
 import { StallGuard } from './stall-guard.js';
@@ -1709,12 +1708,8 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
     }
     const goals: Array<{ goal: any; file: string }> = [];
     try {
-      if (!fs.existsSync(GOALS_DIR)) return goals;
-      for (const f of fs.readdirSync(GOALS_DIR).filter(f => f.endsWith('.json'))) {
-        try {
-          const goal = JSON.parse(fs.readFileSync(path.join(GOALS_DIR, f), 'utf-8'));
-          if (goal.status === 'active') goals.push({ goal, file: f });
-        } catch { continue; }
+      for (const { goal, filePath } of listAllGoals()) {
+        if (goal.status === 'active') goals.push({ goal, file: path.basename(filePath) });
       }
     } catch { /* non-fatal */ }
     this._goalCache = { goals, loadedAt: now };
@@ -3373,10 +3368,9 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
     // ── Goal context: inject linked goal info ───────────────────────
     let goalContext = '';
     try {
-      if (fs.existsSync(GOALS_DIR)) {
-        const goalFiles = fs.readdirSync(GOALS_DIR).filter(f => f.endsWith('.json'));
-        const linkedGoals = goalFiles
-          .map(f => { try { return JSON.parse(fs.readFileSync(path.join(GOALS_DIR, f), 'utf-8')); } catch { return null; } })
+      {
+        const linkedGoals = listAllGoals()
+          .map(({ goal }) => goal)
           .filter(g => g && g.status === 'active' && g.linkedCronJobs?.includes(jobName));
 
         if (linkedGoals.length > 0) {

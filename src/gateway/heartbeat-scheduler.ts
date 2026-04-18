@@ -31,6 +31,7 @@ import {
   HEARTBEAT_WORK_QUEUE_FILE,
   DISCORD_OWNER_ID,
 } from '../config.js';
+import { listAllGoals } from '../tools/shared.js';
 import type { HeartbeatState, HeartbeatReportedTopic, HeartbeatWorkItem } from '../types.js';
 import type { CronScheduler } from './cron-scheduler.js';
 import {
@@ -956,19 +957,16 @@ export class HeartbeatScheduler {
   }
 
   /**
-   * Read and parse all goal JSON files from GOALS_DIR once. Callers that
-   * need filtered subsets (active only, priority-based, etc.) do their own
-   * filtering over the returned array. Used by heartbeatTick to avoid
-   * repeating the readdirSync+readFileSync pass for every goal-consuming
-   * method.
+   * Read and parse all goal JSON files across Clementine's global goals dir
+   * AND every per-agent goals dir. Callers that need filtered subsets
+   * (active only, priority-based, etc.) do their own filtering.
    */
   static loadAllGoals(): Array<any> {
     try {
-      if (!existsSync(GOALS_DIR)) return [];
-      const files = readdirSync(GOALS_DIR).filter(f => f.endsWith('.json'));
-      return files
-        .map(f => { try { return JSON.parse(readFileSync(path.join(GOALS_DIR, f), 'utf-8')); } catch { return null; } })
-        .filter((g: any) => g !== null);
+      return listAllGoals().map(({ goal, owner }) => ({
+        ...goal,
+        owner: goal.owner || owner,
+      }));
     } catch (err) {
       logger.warn({ err }, 'loadAllGoals failed');
       return [];

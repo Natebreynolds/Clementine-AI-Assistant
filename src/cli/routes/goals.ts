@@ -1,5 +1,9 @@
 /**
- * Goals API routes — extracted from dashboard.ts
+ * Goals API routes — extracted from dashboard.ts.
+ *
+ * Goals live per-owner: Clementine's at ~/.clementine/goals/, each agent's at
+ * ~/.clementine/vault/00-System/agents/{slug}/goals/. Uses the goal-store
+ * helpers in tools/shared.ts so the dashboard doesn't need to know the layout.
  */
 import { Router } from 'express';
 import express from 'express';
@@ -8,15 +12,14 @@ import {
   readFileSync,
   writeFileSync,
   readdirSync,
-  mkdirSync,
   unlinkSync,
 } from 'node:fs';
 import path from 'node:path';
 import matter from 'gray-matter';
 import type { Gateway } from '../../gateway/router.js';
+import { listAllGoals, findGoalPath, readGoalById, writeGoalForOwner, type GoalRecord } from '../../tools/shared.js';
 
 export interface GoalsRouterDeps {
-  goalsDir: string;
   cronRunsDir: string;
   vaultDir: string;
   cronFile: string;
@@ -25,56 +28,51 @@ export interface GoalsRouterDeps {
 
 export function goalsRouter(deps: GoalsRouterDeps): Router {
   const router = Router();
-  const { goalsDir, cronRunsDir, vaultDir, cronFile, getGateway } = deps;
+  const { cronRunsDir, vaultDir, cronFile, getGateway } = deps;
 
   // List goals with contributions + delegations
   router.get('/progress', (_req, res) => {
-    if (!existsSync(goalsDir)) { res.json({ goals: [] }); return; }
     try {
-      const files = readdirSync(goalsDir).filter(f => f.endsWith('.json'));
-      const goals = files.map(f => {
-        try {
-          const goal = JSON.parse(readFileSync(path.join(goalsDir, f), 'utf-8'));
-          const agentContributions: Record<string, { runs: number; successes: number; lastRun?: string }> = {};
-          if (goal.linkedCronJobs?.length && existsSync(cronRunsDir)) {
-            for (const jobName of goal.linkedCronJobs) {
-              const safe = jobName.replace(/[^a-zA-Z0-9_-]/g, '_');
-              const logFile = path.join(cronRunsDir, `${safe}.jsonl`);
-              if (!existsSync(logFile)) continue;
-              const lines = readFileSync(logFile, 'utf-8').trim().split('\n').filter(Boolean);
-              for (const line of lines.slice(-20)) {
+      const goals = listAllGoals().map(({ goal, owner }) => {
+        const agentContributions: Record<string, { runs: number; successes: number; lastRun?: string }> = {};
+        if (goal.linkedCronJobs?.length && existsSync(cronRunsDir)) {
+          for (const jobName of goal.linkedCronJobs) {
+            const safe = jobName.replace(/[^a-zA-Z0-9_-]/g, '_');
+            const logFile = path.join(cronRunsDir, `${safe}.jsonl`);
+            if (!existsSync(logFile)) continue;
+            const lines = readFileSync(logFile, 'utf-8').trim().split('\n').filter(Boolean);
+            for (const line of lines.slice(-20)) {
+              try {
+                const entry = JSON.parse(line);
+                const agent = entry.agentSlug || jobName;
+                if (!agentContributions[agent]) agentContributions[agent] = { runs: 0, successes: 0 };
+                agentContributions[agent].runs++;
+                if (entry.status === 'ok') agentContributions[agent].successes++;
+                agentContributions[agent].lastRun = entry.finishedAt;
+              } catch { continue; }
+            }
+          }
+        }
+        const delegationsDir = path.join(vaultDir, '00-System', 'agents');
+        const delegations: Array<{ agent: string; task: string; status: string }> = [];
+        if (existsSync(delegationsDir)) {
+          try {
+            for (const agentDir of readdirSync(delegationsDir)) {
+              const tasksDir = path.join(delegationsDir, agentDir, 'delegations');
+              if (!existsSync(tasksDir)) continue;
+              for (const tf of readdirSync(tasksDir).filter(tf => tf.endsWith('.json'))) {
                 try {
-                  const entry = JSON.parse(line);
-                  const agent = entry.agentSlug || jobName;
-                  if (!agentContributions[agent]) agentContributions[agent] = { runs: 0, successes: 0 };
-                  agentContributions[agent].runs++;
-                  if (entry.status === 'ok') agentContributions[agent].successes++;
-                  agentContributions[agent].lastRun = entry.finishedAt;
+                  const task = JSON.parse(readFileSync(path.join(tasksDir, tf), 'utf-8'));
+                  if (task.goalId === goal.id) {
+                    delegations.push({ agent: task.toAgent || agentDir, task: task.task || tf, status: task.status || 'pending' });
+                  }
                 } catch { continue; }
               }
             }
-          }
-          const delegationsDir = path.join(vaultDir, '00-System', 'agents');
-          const delegations: Array<{ agent: string; task: string; status: string }> = [];
-          if (existsSync(delegationsDir)) {
-            try {
-              for (const agentDir of readdirSync(delegationsDir)) {
-                const tasksDir = path.join(delegationsDir, agentDir, 'delegations');
-                if (!existsSync(tasksDir)) continue;
-                for (const tf of readdirSync(tasksDir).filter(tf => tf.endsWith('.json'))) {
-                  try {
-                    const task = JSON.parse(readFileSync(path.join(tasksDir, tf), 'utf-8'));
-                    if (task.goalId === goal.id) {
-                      delegations.push({ agent: task.toAgent || agentDir, task: task.task || tf, status: task.status || 'pending' });
-                    }
-                  } catch { continue; }
-                }
-              }
-            } catch { /* ignore */ }
-          }
-          return { ...goal, agentContributions, delegations };
-        } catch { return null; }
-      }).filter(Boolean);
+          } catch { /* ignore */ }
+        }
+        return { ...goal, owner, agentContributions, delegations };
+      });
       res.json({ goals });
     } catch { res.json({ goals: [] }); }
   });
@@ -82,11 +80,10 @@ export function goalsRouter(deps: GoalsRouterDeps): Router {
   // Create goal
   router.post('/', express.json(), (req, res) => {
     try {
-      if (!existsSync(goalsDir)) mkdirSync(goalsDir, { recursive: true });
       const id = Math.random().toString(16).slice(2, 10);
       const { title, description, owner, priority, status, targetDate, linkedCronJobs, nextActions, blockers, reviewFrequency } = req.body;
       if (!title) { res.status(400).json({ ok: false, error: 'Title is required' }); return; }
-      const goal = {
+      const goal: GoalRecord = {
         id, title, description: description || '', status: status || 'active',
         owner: owner || 'clementine', priority: priority || 'medium',
         createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
@@ -94,7 +91,7 @@ export function goalsRouter(deps: GoalsRouterDeps): Router {
         reviewFrequency: reviewFrequency || 'weekly', linkedCronJobs: linkedCronJobs || [],
         targetDate: targetDate || undefined,
       };
-      writeFileSync(path.join(goalsDir, `${id}.json`), JSON.stringify(goal, null, 2));
+      writeGoalForOwner(goal);
       res.json({ ok: true, goal });
     } catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
   });
@@ -102,13 +99,13 @@ export function goalsRouter(deps: GoalsRouterDeps): Router {
   // Update goal
   router.put('/:id', express.json(), (req, res) => {
     try {
-      const goalPath = path.join(goalsDir, `${req.params.id}.json`);
-      if (!existsSync(goalPath)) { res.status(404).json({ ok: false, error: 'Goal not found' }); return; }
-      const existing = JSON.parse(readFileSync(goalPath, 'utf-8'));
+      const found = findGoalPath(req.params.id);
+      if (!found) { res.status(404).json({ ok: false, error: 'Goal not found' }); return; }
+      const existing = readGoalById(req.params.id);
+      if (!existing) { res.status(404).json({ ok: false, error: 'Goal not found' }); return; }
       const { title, description, owner, priority, status, targetDate, linkedCronJobs, nextActions, blockers, reviewFrequency } = req.body;
       if (title !== undefined) existing.title = title;
       if (description !== undefined) existing.description = description;
-      if (owner !== undefined) existing.owner = owner;
       if (priority !== undefined) existing.priority = priority;
       if (status !== undefined) existing.status = status;
       if (targetDate !== undefined) existing.targetDate = targetDate;
@@ -117,7 +114,19 @@ export function goalsRouter(deps: GoalsRouterDeps): Router {
       if (blockers !== undefined) existing.blockers = blockers;
       if (reviewFrequency !== undefined) existing.reviewFrequency = reviewFrequency;
       existing.updatedAt = new Date().toISOString();
-      writeFileSync(goalPath, JSON.stringify(existing, null, 2));
+      // If owner changed, re-route to the new owner's dir and remove from old location.
+      // Write the new copy first so we don't lose the goal if unlink fails.
+      if (owner !== undefined && owner !== found.owner) {
+        existing.owner = owner;
+        writeGoalForOwner(existing);
+        try {
+          unlinkSync(found.filePath);
+        } catch (unlinkErr) {
+          console.warn(`[goals] Failed to remove old goal file ${found.filePath} after owner change to ${owner}:`, unlinkErr);
+        }
+      } else {
+        writeFileSync(found.filePath, JSON.stringify(existing, null, 2));
+      }
       res.json({ ok: true, goal: existing });
     } catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
   });
@@ -125,9 +134,9 @@ export function goalsRouter(deps: GoalsRouterDeps): Router {
   // Delete goal
   router.delete('/:id', (_req, res) => {
     try {
-      const goalPath = path.join(goalsDir, `${_req.params.id}.json`);
-      if (!existsSync(goalPath)) { res.status(404).json({ ok: false, error: 'Goal not found' }); return; }
-      unlinkSync(goalPath);
+      const found = findGoalPath(_req.params.id);
+      if (!found) { res.status(404).json({ ok: false, error: 'Goal not found' }); return; }
+      unlinkSync(found.filePath);
       res.json({ ok: true });
     } catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
   });
@@ -135,9 +144,8 @@ export function goalsRouter(deps: GoalsRouterDeps): Router {
   // Generate cron proposals from goal
   router.post('/:id/generate-crons', async (req, res) => {
     try {
-      const goalPath = path.join(goalsDir, `${req.params.id}.json`);
-      if (!existsSync(goalPath)) { res.status(404).json({ ok: false, error: 'Goal not found' }); return; }
-      const goal = JSON.parse(readFileSync(goalPath, 'utf-8'));
+      const goal = readGoalById(req.params.id);
+      if (!goal) { res.status(404).json({ ok: false, error: 'Goal not found' }); return; }
       const prompt = `You are analyzing a goal and proposing automated scheduled tasks (cron jobs) to make progress on it.
 
 ## Goal: ${goal.title}
@@ -181,9 +189,10 @@ Respond ONLY with valid JSON:
   // Approve cron proposals
   router.post('/:id/approve-crons', express.json(), (req, res) => {
     try {
-      const goalPath = path.join(goalsDir, `${req.params.id}.json`);
-      if (!existsSync(goalPath)) { res.status(404).json({ ok: false, error: 'Goal not found' }); return; }
-      const goal = JSON.parse(readFileSync(goalPath, 'utf-8'));
+      const found = findGoalPath(req.params.id);
+      if (!found) { res.status(404).json({ ok: false, error: 'Goal not found' }); return; }
+      const goal = readGoalById(req.params.id);
+      if (!goal) { res.status(404).json({ ok: false, error: 'Goal not found' }); return; }
       const crons: Array<{ name: string; schedule: string; prompt: string; tier: number }> = req.body.crons || [];
       if (crons.length === 0) { res.status(400).json({ ok: false, error: 'No crons to approve' }); return; }
 
@@ -205,7 +214,7 @@ Respond ONLY with valid JSON:
           if (!goal.linkedCronJobs.includes(name)) goal.linkedCronJobs.push(name);
         }
         goal.updatedAt = new Date().toISOString();
-        writeFileSync(goalPath, JSON.stringify(goal, null, 2));
+        writeFileSync(found.filePath, JSON.stringify(goal, null, 2));
       }
       res.json({ ok: true, added, skipped: crons.length - added.length });
     } catch (e) { res.status(500).json({ ok: false, error: String(e) }); }

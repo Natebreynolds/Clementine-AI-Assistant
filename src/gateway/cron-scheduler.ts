@@ -36,6 +36,7 @@ import {
   ADVISOR_LOG_PATH,
   TIMEZONE,
 } from '../config.js';
+import { listAllGoals, findGoalPath, readGoalById } from '../tools/shared.js';
 import type { CronJobDefinition, CronRunEntry, SelfImproveConfig, SelfImproveExperiment, SelfImproveState, WorkflowDefinition } from '../types.js';
 import type { NotificationDispatcher } from './notifications.js';
 import type { Gateway } from './router.js';
@@ -1286,6 +1287,13 @@ export class CronScheduler {
     const trimmed = response.trim();
     if (trimmed === '__NOTHING__') return true;
 
+    // Bare "NOTHING" (with or without underscores/parenthetical), matching heartbeat scheduler.
+    if (/^_*NOTHING_*\s*(\(|$)/im.test(trimmed)) return true;
+
+    // Goal-work [MONITORING] classification with no substantive body —
+    // Clementine checked the goal and nothing changed, so suppress the notification.
+    if (/^(_*NOTHING_*\s*)?\[MONITORING\]\s*$/i.test(trimmed)) return true;
+
     // Only treat as noise if the response is short — avoids filtering out
     // substantive responses that happen to start with "No updates, but..."
     if (trimmed.length > 80) return false;
@@ -1552,13 +1560,14 @@ export class CronScheduler {
         unlinkSync(filePath);
         if (!trigger.goalId) continue;
 
-        const goalPath = path.join(GOALS_DIR, `${trigger.goalId}.json`);
-        if (!existsSync(goalPath)) {
+        const found = findGoalPath(trigger.goalId);
+        if (!found) {
           logger.warn({ goalId: trigger.goalId }, 'Goal trigger references missing goal — skipping');
           continue;
         }
-        const goal = JSON.parse(readFileSync(goalPath, 'utf-8'));
-        if (goal.status !== 'active') continue;
+        const goalPath = found.filePath;
+        const goal = readGoalById(trigger.goalId);
+        if (!goal || goal.status !== 'active') continue;
 
         logger.info({ goalId: trigger.goalId, title: goal.title, focus: trigger.focus }, 'Processing goal work trigger');
 
@@ -1586,14 +1595,14 @@ export class CronScheduler {
           `You are working on a focused goal session.\n\n` +
           `## Goal: ${goal.title}\n${goal.description}\n\n` +
           `## Focus for this session\n${trigger.focus}\n\n` +
-          (goal.progressNotes?.length > 0
+          (goal.progressNotes && goal.progressNotes.length > 0
             ? `## Prior progress\n${goal.progressNotes.slice(-5).map((n: string) => `- ${n}`).join('\n')}\n\n`
             : '') +
           recentOutcomesContext +
-          (goal.nextActions?.length > 0
+          (goal.nextActions && goal.nextActions.length > 0
             ? `## Planned next actions\n${goal.nextActions.map((a: string) => `- ${a}`).join('\n')}\n\n`
             : '') +
-          (goal.blockers?.length > 0
+          (goal.blockers && goal.blockers.length > 0
             ? `## Current blockers\n${goal.blockers.map((b: string) => `- ${b}`).join('\n')}\n\n`
             : '') +
           `## Instructions\n` +
@@ -1609,8 +1618,17 @@ export class CronScheduler {
           `5. Keep your output concise — summarize what you accomplished.`;
 
         const jobName = `goal:${goal.title.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 40)}`;
-        const goalSnapshotUpdatedAt = goal.updatedAt;
+        const goalSnapshotUpdatedAt = goal.updatedAt ?? '';
         const goalSnapshotNotes = goal.progressNotes?.length ?? 0;
+
+        // Route goal work to the owning agent so the session runs with their
+        // tools/model and output lands in their Discord channel. Clementine-owned
+        // goals continue to run under Clementine's identity.
+        const ownerSlug = (found.owner && found.owner !== 'clementine') ? found.owner : null;
+        const dispatchOpts = ownerSlug ? { agentSlug: ownerSlug } : undefined;
+        if (ownerSlug) {
+          this.gateway.setSessionProfile(`cron:${jobName}`, ownerSlug);
+        }
 
         // ── Route through execution advisor (same path as regular cron jobs) ──
         // Creates a synthetic CronJobDefinition so the advisor can apply circuit
@@ -1623,6 +1641,7 @@ export class CronScheduler {
           tier: 2,
           maxTurns: trigger.maxTurns ?? 15,
           mode: 'standard',
+          ...(ownerSlug ? { agentSlug: ownerSlug } : {}),
         };
 
         import('../agent/execution-advisor.js').then(({ getExecutionAdvice }) => {
@@ -1659,7 +1678,7 @@ export class CronScheduler {
             useUnleashed ? 1 : undefined, // 1 hour max for unleashed goal work
           ).then((result) => {
             if (result && !CronScheduler.isCronNoise(result)) {
-              this.dispatcher.send(`🎯 **Goal work: ${goal.title}**\n\n${result.slice(0, 1500)}`).catch(err => logger.debug({ err }, 'Failed to send goal work notification'));
+              this.dispatcher.send(`🎯 **Goal work: ${goal.title}**\n\n${result.slice(0, 1500)}`, dispatchOpts).catch(err => logger.debug({ err }, 'Failed to send goal work notification'));
             }
             logToDailyNote(`**Goal work: ${goal.title}** — ${(result || 'completed').slice(0, 100).replace(/\n/g, ' ')}`);
             this.logGoalOutcome(trigger.goalId, goalPath, goalSnapshotUpdatedAt, goalSnapshotNotes, trigger.focus, trigger.source, result);
@@ -1672,7 +1691,7 @@ export class CronScheduler {
           logger.warn({ err, goalId: trigger.goalId }, 'Advisor unavailable — running goal work with defaults');
           this.gateway.handleCronJob(jobName, prompt, 2, trigger.maxTurns ?? 15).then((result) => {
             if (result && !CronScheduler.isCronNoise(result)) {
-              this.dispatcher.send(`🎯 **Goal work: ${goal.title}**\n\n${result.slice(0, 1500)}`).catch(err => logger.debug({ err }, 'Failed to send goal work notification'));
+              this.dispatcher.send(`🎯 **Goal work: ${goal.title}**\n\n${result.slice(0, 1500)}`, dispatchOpts).catch(err => logger.debug({ err }, 'Failed to send goal work notification'));
             }
             logToDailyNote(`**Goal work: ${goal.title}** — ${(result || 'completed').slice(0, 100).replace(/\n/g, ' ')}`);
             this.logGoalOutcome(trigger.goalId, goalPath, goalSnapshotUpdatedAt, goalSnapshotNotes, trigger.focus, trigger.source, result);
@@ -1754,15 +1773,11 @@ export class CronScheduler {
 
     try {
       // Only apply suggestions linked to high-priority autoSchedule goals
-      const goalFiles = existsSync(GOALS_DIR) ? readdirSync(GOALS_DIR).filter(f => f.endsWith('.json')) : [];
       const autoScheduleGoalTitles = new Set<string>();
-      for (const f of goalFiles) {
-        try {
-          const goal = JSON.parse(readFileSync(path.join(GOALS_DIR, f), 'utf-8'));
-          if (goal.status === 'active' && goal.priority === 'high' && goal.autoSchedule) {
-            autoScheduleGoalTitles.add(goal.title.toLowerCase());
-          }
-        } catch { continue; }
+      for (const { goal } of listAllGoals()) {
+        if (goal.status === 'active' && goal.priority === 'high' && goal.autoSchedule) {
+          autoScheduleGoalTitles.add(String(goal.title).toLowerCase());
+        }
       }
 
       if (autoScheduleGoalTitles.size === 0) return;

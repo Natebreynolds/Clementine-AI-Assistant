@@ -168,6 +168,109 @@ export function agentDailyNotesDir(slug: string | null): string {
   return path.join(AGENTS_DIR, slug, 'daily-notes');
 }
 
+// ── Goal store (global + per-agent) ────────────────────────────────────
+
+export type GoalRecord = {
+  id: string;
+  title: string;
+  description?: string;
+  owner: string;                     // "clementine" or an agent slug
+  status?: string;
+  priority?: string;
+  createdAt?: string;
+  updatedAt?: string;
+  progressNotes?: string[];
+  nextActions?: string[];
+  blockers?: string[];
+  reviewFrequency?: string;
+  linkedCronJobs?: string[];
+  [key: string]: unknown;
+};
+
+/** Return the directory where a goal owned by `owner` should live. */
+export function goalDirForOwner(owner: string): string {
+  if (!owner || owner === 'clementine') return GOALS_DIR;
+  return path.join(AGENTS_DIR, owner, 'goals');
+}
+
+/**
+ * Walk Clementine's global goals dir AND every per-agent goals dir.
+ * Returns {goal, path, owner} for each goal found. Owner is derived from
+ * the goal's `owner` field if set, else inferred from which directory it was in.
+ */
+export function listAllGoals(): Array<{ goal: GoalRecord; filePath: string; owner: string }> {
+  const results: Array<{ goal: GoalRecord; filePath: string; owner: string }> = [];
+
+  const readDir = (dir: string, inferredOwner: string) => {
+    if (!existsSync(dir)) return;
+    let files: string[];
+    try {
+      files = readdirSync(dir).filter(f => f.endsWith('.json'));
+    } catch {
+      return;
+    }
+    for (const f of files) {
+      const fp = path.join(dir, f);
+      try {
+        const goal = JSON.parse(readFileSync(fp, 'utf-8')) as GoalRecord;
+        if (!goal.id) continue;
+        const owner = (typeof goal.owner === 'string' && goal.owner) || inferredOwner;
+        results.push({ goal, filePath: fp, owner });
+      } catch { /* skip malformed */ }
+    }
+  };
+
+  readDir(GOALS_DIR, 'clementine');
+
+  if (existsSync(AGENTS_DIR)) {
+    let agentDirs: string[] = [];
+    try {
+      agentDirs = readdirSync(AGENTS_DIR, { withFileTypes: true } as { withFileTypes: true })
+        .filter(d => d.isDirectory() && !d.name.startsWith('_'))
+        .map(d => d.name);
+    } catch { /* ignore */ }
+    for (const slug of agentDirs) {
+      readDir(path.join(AGENTS_DIR, slug, 'goals'), slug);
+    }
+  }
+
+  return results;
+}
+
+/** Find a goal's file path by id across global + all agent dirs. */
+export function findGoalPath(id: string): { filePath: string; owner: string } | null {
+  for (const entry of listAllGoals()) {
+    if (entry.goal.id === id) {
+      return { filePath: entry.filePath, owner: entry.owner };
+    }
+  }
+  return null;
+}
+
+/** Read a goal by id; returns null if not found. */
+export function readGoalById(id: string): GoalRecord | null {
+  const found = findGoalPath(id);
+  if (!found) return null;
+  try {
+    return JSON.parse(readFileSync(found.filePath, 'utf-8')) as GoalRecord;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Write a goal to the correct directory based on its owner field.
+ * Creates the target directory if needed. Returns the path written.
+ */
+export function writeGoalForOwner(goal: GoalRecord): string {
+  const owner = goal.owner || 'clementine';
+  const dir = goalDirForOwner(owner);
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+  const fp = path.join(dir, `${goal.id}.json`);
+  writeFileSync(fp, JSON.stringify(goal, null, 2));
+  return fp;
+}
+
 // ── Date/Time helpers ───────────────────────────────���──────────────────
 
 export function todayStr(): string {

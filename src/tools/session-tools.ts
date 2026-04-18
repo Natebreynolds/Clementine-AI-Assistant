@@ -8,7 +8,7 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import {
   BASE_DIR, HANDOFFS_DIR, INBOX_DIR, TASKS_FILE,
-  logger, textResult, todayStr,
+  logger, textResult, todayStr, listAllGoals,
 } from './shared.js';
 
 function ensureHandoffsDir(): void {
@@ -84,21 +84,16 @@ export function registerSessionTools(server: McpServer): void {
       const maxItems = Math.min(limit ?? 10, 30);
       const items: Array<{ type: string; urgency: number; description: string }> = [];
 
-      // 1. Stale goals
-      const goalsDir = path.join(BASE_DIR, 'goals');
-      if (existsSync(goalsDir)) {
-        for (const f of readdirSync(goalsDir).filter(f => f.endsWith('.json'))) {
-          try {
-            const goal = JSON.parse(readFileSync(path.join(goalsDir, f), 'utf-8'));
-            if (goal.status !== 'active') continue;
-            if (agent_slug && goal.owner !== agent_slug) continue;
-            const daysSinceUpdate = Math.floor((Date.now() - new Date(goal.updatedAt).getTime()) / 86400000);
-            const staleThreshold = goal.reviewFrequency === 'daily' ? 1 : goal.reviewFrequency === 'weekly' ? 7 : 30;
-            if (daysSinceUpdate > staleThreshold) {
-              const urgency = Math.min(5, Math.floor(daysSinceUpdate / staleThreshold) + (goal.priority === 'high' ? 2 : goal.priority === 'medium' ? 1 : 0));
-              items.push({ type: 'stale-goal', urgency, description: `Goal "${goal.title}" stale for ${daysSinceUpdate}d (${goal.priority} priority)` });
-            }
-          } catch { continue; }
+      // 1. Stale goals (walks global + per-agent dirs)
+      for (const { goal, owner } of listAllGoals()) {
+        if (goal.status !== 'active') continue;
+        if (agent_slug && owner !== agent_slug) continue;
+        if (!goal.updatedAt) continue;
+        const daysSinceUpdate = Math.floor((Date.now() - new Date(goal.updatedAt).getTime()) / 86400000);
+        const staleThreshold = goal.reviewFrequency === 'daily' ? 1 : goal.reviewFrequency === 'weekly' ? 7 : 30;
+        if (daysSinceUpdate > staleThreshold) {
+          const urgency = Math.min(5, Math.floor(daysSinceUpdate / staleThreshold) + (goal.priority === 'high' ? 2 : goal.priority === 'medium' ? 1 : 0));
+          items.push({ type: 'stale-goal', urgency, description: `Goal "${goal.title}" stale for ${daysSinceUpdate}d (${goal.priority} priority)` });
         }
       }
 

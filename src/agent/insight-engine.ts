@@ -14,6 +14,7 @@ import path from 'node:path';
 import pino from 'pino';
 
 import { GOALS_DIR, BASE_DIR } from '../config.js';
+import { listAllGoals } from '../tools/shared.js';
 
 const logger = pino({ name: 'clementine.insight-engine' });
 
@@ -160,17 +161,11 @@ export function gatherInsightSignals(gateway: {
     if (sessionCount === 0) {
       // No recent activity — could note quiet period if there are pending goals
       try {
-        if (existsSync(GOALS_DIR)) {
-          const goals = readdirSync(GOALS_DIR).filter(f => f.endsWith('.json'));
-          const activeHighPriority = goals.filter(f => {
-            try {
-              const g = JSON.parse(readFileSync(path.join(GOALS_DIR, f), 'utf-8'));
-              return g.status === 'active' && g.priority === 'high';
-            } catch { return false; }
-          });
-          if (activeHighPriority.length > 0) {
-            signals.push(`Quiet period: ${activeHighPriority.length} high-priority goal(s) active but no recent user interaction`);
-          }
+        const activeHighPriority = listAllGoals().filter(({ goal }) =>
+          goal.status === 'active' && goal.priority === 'high',
+        );
+        if (activeHighPriority.length > 0) {
+          signals.push(`Quiet period: ${activeHighPriority.length} high-priority goal(s) active but no recent user interaction`);
         }
       } catch { /* non-fatal */ }
     }
