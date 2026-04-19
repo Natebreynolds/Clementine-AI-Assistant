@@ -303,8 +303,6 @@ function detectSelfImproveBreakage(now: number): BrokenJob | null {
     } catch { /* non-fatal */ }
   }
 
-  const lastRunMs = state.lastRunAt ? Date.parse(state.lastRunAt) : 0;
-  const lookback48h = now - 48 * 60 * 60 * 1000;
   const staleLookback = now - 7 * 24 * 60 * 60 * 1000; // 7 days
 
   const recentExperiments = experiments.filter(e => {
@@ -315,17 +313,24 @@ function detectSelfImproveBreakage(now: number): BrokenJob | null {
     e.approvalStatus === 'denied' && (e.reason?.startsWith('Error') ?? false),
   );
 
-  // Three break modes:
-  //  a. state.infraError is set (loop detected unfixable infra issue)
-  //  b. all 3+ most recent experiments within lookback are errors
-  //  c. loop ran recently but no new experiments appeared (silent early-exit)
+  // Break modes we care about:
+  //  a. state.infraError is set — loop detected unfixable infra issue
+  //  b. state.status === 'failed' — run threw, didn't complete normally
+  //  c. all 3+ most recent experiments are errors — persistent iteration failures
+  //
+  // Deliberately NOT flagging "silent early exit" (lastRunAt recent but no new
+  // experiments) when state.status === 'completed'. That's the expected
+  // plateau state: the hypothesizer returns null for every iteration because
+  // the diversity constraint has blocked every previously-targeted area, the
+  // loop skips, plateau triggers, loop exits cleanly. Not broken — saturated.
+  // Forcing alarm on a saturated-but-healthy loop would make the monitor
+  // unusable long-term.
   const hasInfraError = !!state.infraError;
+  const runFailed = state.status === 'failed';
   const allRecentErrored = recentExperiments.length >= 3
     && recentExperiments.every(e => e.approvalStatus === 'denied');
-  const silentEarlyExit = lastRunMs > lookback48h
-    && recentExperiments.length === 0;
 
-  if (!hasInfraError && !allRecentErrored && !silentEarlyExit) return null;
+  if (!hasInfraError && !runFailed && !allRecentErrored) return null;
 
   const lastErrors: string[] = [];
   for (let i = experiments.length - 1; i >= 0 && lastErrors.length < 3; i--) {
@@ -334,20 +339,11 @@ function detectSelfImproveBreakage(now: number): BrokenJob | null {
     lastErrors.push(err.slice(0, 400));
   }
 
-  // If we don't have an explicit infraError but the last recorded error
-  // looks schema-related, surface it — this captures the state where all
-  // iterations died with the same API 400 but state.infraError never got
-  // persisted (happens when MAX_INFRA_ERRORS isn't crossed within a run).
-  const lastLoggedError = experiments.length > 0 ? (experiments[experiments.length - 1]!.error ?? '') : '';
-  const inferredInfraSchema = /input_schema|tools\.\d+\.custom/i.test(lastLoggedError);
-
   let opinion: string;
   if (hasInfraError) {
     opinion = `infra: ${state.infraError!.category} — ${state.infraError!.diagnostic.slice(0, 200)}`;
-  } else if (silentEarlyExit && inferredInfraSchema) {
-    opinion = 'loop ran but produced no experiments — last logged error was an MCP tool schema validation (API 400). Check external MCP servers (claude_desktop_config.json, Claude Code settings) for a recently-updated package exposing a malformed input_schema.';
-  } else if (silentEarlyExit) {
-    opinion = 'loop ran but produced no experiments — likely crashing before iteration (check metrics gathering or hypothesis generation)';
+  } else if (runFailed) {
+    opinion = 'loop exited with status=failed — check daemon log for the thrown error';
   } else {
     opinion = `${recentErrors.length}/${recentExperiments.length} recent iterations errored`;
   }

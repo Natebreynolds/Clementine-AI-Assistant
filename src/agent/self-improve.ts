@@ -345,6 +345,26 @@ export class SelfImproveLoop {
         // Check plateau
         if (consecutiveLow >= this.config.plateauLimit) {
           logger.info({ consecutiveLow }, 'Plateau detected — stopping');
+          // Record the plateau in the experiment log so it's not silently
+          // invisible. Helps the dashboard and failure monitor distinguish
+          // "exhausted diverse hypotheses" from "crashed mid-run".
+          const plateauExperiment: SelfImproveExperiment = {
+            id: randomBytes(4).toString('hex'),
+            iteration: i,
+            startedAt: new Date(loopStart).toISOString(),
+            finishedAt: new Date().toISOString(),
+            durationMs: Date.now() - loopStart,
+            area: 'soul',
+            target: 'n/a',
+            hypothesis: 'No new hypothesis — diversity constraint exhausted',
+            proposedChange: '',
+            baselineScore: 0,
+            score: 0,
+            accepted: false,
+            approvalStatus: 'denied',
+            reason: 'Plateau: no novel improvement area remaining',
+          };
+          this.appendExperimentLog(plateauExperiment);
           break;
         }
 
