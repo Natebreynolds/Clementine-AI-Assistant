@@ -773,14 +773,44 @@ export class HeartbeatScheduler {
     const prompt = buildInsightPrompt(signals);
     if (!prompt) return;
 
-    // Run lightweight LLM call via gateway
-    const response = await this.gateway.handleCronJob(
-      'insight-check',
-      prompt,
-      1,   // tier 1
-      1,   // max 1 turn (just rating + message)
-      'haiku',
-    );
+    // Run lightweight LLM call via gateway. Log success AND failure to the
+    // cron run log so the failure monitor can see hourly breakage.
+    // maxTurns bumped 1 → 3 because the agent needs to fan out ~4 parallel
+    // tool calls (activity_history, outlook_inbox, goal_list, task_list)
+    // before composing its rating — at 1 turn it always crashes with
+    // "Reached maximum number of turns".
+    const icStartedAt = new Date();
+    let response: string | null = null;
+    try {
+      response = await this.gateway.handleCronJob(
+        'insight-check',
+        prompt,
+        1,   // tier 1
+        3,   // max 3 turns (parallel tool fan-out + synthesis)
+        'haiku',
+      );
+      this.runLog.append({
+        jobName: 'insight-check',
+        startedAt: icStartedAt.toISOString(),
+        finishedAt: new Date().toISOString(),
+        status: 'ok',
+        durationMs: Date.now() - icStartedAt.getTime(),
+        attempt: 1,
+        outputPreview: (response ?? '').slice(0, 200),
+      });
+    } catch (err) {
+      this.runLog.append({
+        jobName: 'insight-check',
+        startedAt: icStartedAt.toISOString(),
+        finishedAt: new Date().toISOString(),
+        status: 'error',
+        durationMs: Date.now() - icStartedAt.getTime(),
+        attempt: 1,
+        error: String(err).slice(0, 400),
+        errorType: 'transient',
+      });
+      throw err;
+    }
 
     if (!response) return;
 

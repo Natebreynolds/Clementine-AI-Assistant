@@ -35,10 +35,18 @@ const logger = pino({ name: 'clementine.failure-monitor' });
 const RUNS_DIR = path.join(BASE_DIR, 'cron', 'runs');
 const ADVISOR_EVENTS_FILE = path.join(BASE_DIR, 'cron', 'advisor-events.jsonl');
 const STATE_FILE = path.join(BASE_DIR, 'cron', 'failure-monitor.json');
+const SELF_IMPROVE_STATE_FILE = path.join(BASE_DIR, 'self-improve', 'state.json');
+const SELF_IMPROVE_LOG_FILE = path.join(BASE_DIR, 'self-improve', 'experiment-log.jsonl');
 
 /** A job is broken if it crosses any of these thresholds in the lookback window. */
 const ERRORS_IN_WINDOW = 3;
 const WINDOW_HOURS = 48;
+/**
+ * Independent of the window — a job whose last N runs are all failures is
+ * broken even if they're spread over days (daily cron jobs can't accumulate
+ * 3 failures in 48h, but 2 consecutive BLOCKED days is still broken).
+ */
+const CONSECUTIVE_FAILURES = 2;
 /** Don't re-DM the owner about the same broken job within this window. */
 const NOTIFY_COOLDOWN_HOURS = 24;
 
@@ -93,7 +101,38 @@ function readRunLog(filePath: string): CronRunEntry[] {
 }
 
 function isFailure(entry: CronRunEntry): boolean {
-  return entry.status === 'error' || entry.status === 'retried';
+  return entry.status === 'error' || entry.status === 'retried' || isSemanticFailure(entry);
+}
+
+/**
+ * "Semantic failure" — a run the scheduler called `ok` but whose agent output
+ * self-reports the task didn't actually complete. We only flag on explicit
+ * block/failure markers in the preview; the duration-vs-output heuristic was
+ * tested against the live corpus and produced too many false positives on
+ * legitimately quiet jobs (healthchecks, inbox probes that return empty
+ * when there's nothing to report).
+ *
+ * Markers are drawn from observed failure modes in Ross's cron jobs
+ * (kernel-vs-local Bash, "BLOCKED (no local bash access)") plus generic
+ * agent self-reports.
+ */
+function isSemanticFailure(entry: CronRunEntry): boolean {
+  if (entry.status !== 'ok') return false;
+  const preview = (entry.outputPreview ?? '').trim();
+  if (!preview) return false;
+  const previewLower = preview.toLowerCase();
+
+  // Match on word boundaries so "BLOCKED" matches "Result: BLOCKED" but
+  // "blockedBy" in a stray JSON fragment doesn't.
+  const markerRegexes = [
+    /\b(blocked|task_blocked|task_incomplete)\b/,
+    /\b(failed|could not|unable to|no local bash|permission denied)\b/,
+    /__nothing__/,
+  ];
+  for (const re of markerRegexes) {
+    if (re.test(previewLower)) return true;
+  }
+  return false;
 }
 
 /**
@@ -141,14 +180,28 @@ export function computeBrokenJobs(now = Date.now()): BrokenJob[] {
   try { files = readdirSync(RUNS_DIR).filter(f => f.endsWith('.jsonl')); }
   catch { return []; }
 
+  const dormantCutoffMs = now - 7 * 24 * 60 * 60 * 1000;
+
   for (const file of files) {
     const entries = readRunLog(path.join(RUNS_DIR, file));
     if (entries.length === 0) continue;
 
     const jobName = entries[0]!.jobName;
+
+    // Skip dormant jobs — if the last run is >7 days old the job is
+    // probably removed or renamed and its historical failures aren't
+    // actionable. Circuit breaker still counts because an engaged breaker
+    // is itself "the job stopped running".
+    const lastEntry = entries[entries.length - 1]!;
+    const lastRunMs = Date.parse(lastEntry.startedAt);
+
     // Always consult the breaker state — a stuck breaker is the primary
     // signal for "job has been silently broken for days".
     const cb = lastCircuitBreakerEvent(jobName);
+
+    if (!cb.engagedAt && Number.isFinite(lastRunMs) && lastRunMs < dormantCutoffMs) {
+      continue;
+    }
 
     const inWindow = entries.filter(e => {
       const ts = Date.parse(e.startedAt);
@@ -156,7 +209,21 @@ export function computeBrokenJobs(now = Date.now()): BrokenJob[] {
     });
     const failures = inWindow.filter(isFailure);
 
-    const meetsThreshold = failures.length >= ERRORS_IN_WINDOW || !!cb.engagedAt;
+    // Consecutive-failure signal: scan from most recent entry backward.
+    // Stops at the first non-failure (ignoring 'skipped' which is neither
+    // signal). Catches daily jobs that fail every run without accumulating
+    // 3 in a 48h window.
+    let consecutiveFailures = 0;
+    for (let i = entries.length - 1; i >= 0; i--) {
+      const e = entries[i]!;
+      if (e.status === 'skipped') continue;
+      if (isFailure(e)) consecutiveFailures++;
+      else break;
+    }
+
+    const meetsThreshold = failures.length >= ERRORS_IN_WINDOW
+      || consecutiveFailures >= CONSECUTIVE_FAILURES
+      || !!cb.engagedAt;
     if (!meetsThreshold) continue;
 
     // Gather up to 3 distinct error messages, newest first. Prefer in-window
@@ -191,6 +258,10 @@ export function computeBrokenJobs(now = Date.now()): BrokenJob[] {
     });
   }
 
+  // Also check the self-improve loop — it has its own log (not cron/runs/).
+  const siBroken = detectSelfImproveBreakage(now);
+  if (siBroken) broken.push(siBroken);
+
   // Most recently failing first
   broken.sort((a, b) => {
     const aT = a.lastErrorAt ? Date.parse(a.lastErrorAt) : 0;
@@ -199,6 +270,98 @@ export function computeBrokenJobs(now = Date.now()): BrokenJob[] {
   });
 
   return broken;
+}
+
+/**
+ * The self-improve loop writes to its own experiment-log.jsonl, not cron/runs/.
+ * Its breakage pattern is: state.lastRunAt keeps getting updated nightly but
+ * no new experiments are being appended (they're all failing pre-iteration),
+ * OR the most recent experiments are all errors, OR state.infraError is set.
+ *
+ * Returns a synthetic BrokenJob for the self-improve pseudo-job, or null if
+ * healthy / no data.
+ */
+function detectSelfImproveBreakage(now: number): BrokenJob | null {
+  if (!existsSync(SELF_IMPROVE_STATE_FILE)) return null;
+
+  let state: {
+    lastRunAt?: string;
+    status?: string;
+    totalExperiments?: number;
+    infraError?: { category: string; diagnostic: string };
+  } = {};
+  try { state = JSON.parse(readFileSync(SELF_IMPROVE_STATE_FILE, 'utf-8')); }
+  catch { return null; }
+
+  const experiments: Array<{ startedAt?: string; approvalStatus?: string; error?: string; reason?: string }> = [];
+  if (existsSync(SELF_IMPROVE_LOG_FILE)) {
+    try {
+      const lines = readFileSync(SELF_IMPROVE_LOG_FILE, 'utf-8').trim().split('\n').filter(Boolean);
+      for (const line of lines.slice(-10)) {
+        try { experiments.push(JSON.parse(line)); } catch { /* skip */ }
+      }
+    } catch { /* non-fatal */ }
+  }
+
+  const lastRunMs = state.lastRunAt ? Date.parse(state.lastRunAt) : 0;
+  const lookback48h = now - 48 * 60 * 60 * 1000;
+  const staleLookback = now - 7 * 24 * 60 * 60 * 1000; // 7 days
+
+  const recentExperiments = experiments.filter(e => {
+    const ts = e.startedAt ? Date.parse(e.startedAt) : 0;
+    return Number.isFinite(ts) && ts >= staleLookback;
+  });
+  const recentErrors = recentExperiments.filter(e =>
+    e.approvalStatus === 'denied' && (e.reason?.startsWith('Error') ?? false),
+  );
+
+  // Three break modes:
+  //  a. state.infraError is set (loop detected unfixable infra issue)
+  //  b. all 3+ most recent experiments within lookback are errors
+  //  c. loop ran recently but no new experiments appeared (silent early-exit)
+  const hasInfraError = !!state.infraError;
+  const allRecentErrored = recentExperiments.length >= 3
+    && recentExperiments.every(e => e.approvalStatus === 'denied');
+  const silentEarlyExit = lastRunMs > lookback48h
+    && recentExperiments.length === 0;
+
+  if (!hasInfraError && !allRecentErrored && !silentEarlyExit) return null;
+
+  const lastErrors: string[] = [];
+  for (let i = experiments.length - 1; i >= 0 && lastErrors.length < 3; i--) {
+    const err = (experiments[i]!.error ?? '').trim();
+    if (!err) continue;
+    lastErrors.push(err.slice(0, 400));
+  }
+
+  // If we don't have an explicit infraError but the last recorded error
+  // looks schema-related, surface it — this captures the state where all
+  // iterations died with the same API 400 but state.infraError never got
+  // persisted (happens when MAX_INFRA_ERRORS isn't crossed within a run).
+  const lastLoggedError = experiments.length > 0 ? (experiments[experiments.length - 1]!.error ?? '') : '';
+  const inferredInfraSchema = /input_schema|tools\.\d+\.custom/i.test(lastLoggedError);
+
+  let opinion: string;
+  if (hasInfraError) {
+    opinion = `infra: ${state.infraError!.category} — ${state.infraError!.diagnostic.slice(0, 200)}`;
+  } else if (silentEarlyExit && inferredInfraSchema) {
+    opinion = 'loop ran but produced no experiments — last logged error was an MCP tool schema validation (API 400). Check external MCP servers (claude_desktop_config.json, Claude Code settings) for a recently-updated package exposing a malformed input_schema.';
+  } else if (silentEarlyExit) {
+    opinion = 'loop ran but produced no experiments — likely crashing before iteration (check metrics gathering or hypothesis generation)';
+  } else {
+    opinion = `${recentErrors.length}/${recentExperiments.length} recent iterations errored`;
+  }
+
+  return {
+    jobName: 'self-improve',
+    agentSlug: undefined,
+    errorCount48h: recentErrors.length,
+    totalRuns48h: recentExperiments.length,
+    lastErrorAt: experiments[experiments.length - 1]?.startedAt ?? state.lastRunAt ?? null,
+    lastErrors,
+    circuitBreakerEngagedAt: hasInfraError ? state.lastRunAt ?? null : null,
+    lastAdvisorOpinion: opinion,
+  };
 }
 
 /** Format a broken-job report for the owner DM. */

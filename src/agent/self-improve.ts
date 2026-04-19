@@ -286,6 +286,31 @@ export class SelfImproveLoop {
       logger.info('Captured SOUL.md baseline for drift detection');
     }
     const state = this.loadState();
+
+    // If a prior run aborted on an infrastructure error that can't be fixed
+    // by retrying (malformed MCP tool schema, bad auth, etc.), don't spin
+    // the loop pointlessly. Wait at least 24h before re-probing — this gives
+    // the owner time to fix the infra and prevents us from writing dozens
+    // of identical error experiments. The failure monitor surfaces the
+    // infraError to the owner via the broken-jobs pipeline.
+    if (state.infraError && state.lastRunAt) {
+      const hoursSinceRun = (Date.now() - Date.parse(state.lastRunAt)) / 3_600_000;
+      if (Number.isFinite(hoursSinceRun) && hoursSinceRun < 24) {
+        logger.warn({
+          category: state.infraError.category,
+          diagnostic: state.infraError.diagnostic,
+          hoursSinceRun: Math.round(hoursSinceRun),
+        }, 'Self-improve skipped — prior infra error still in cooldown. See Broken Jobs panel.');
+        state.status = 'completed';
+        this.saveState(state);
+        return state;
+      }
+      // Past cooldown — clear the flag and probe fresh. If it still errors,
+      // the loop will set it again.
+      logger.info('Self-improve: infra error cooldown elapsed, probing again');
+      delete state.infraError;
+    }
+
     state.status = 'running';
     state.lastRunAt = new Date().toISOString();
     state.currentIteration = 0;
