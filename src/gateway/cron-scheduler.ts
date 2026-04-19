@@ -130,13 +130,20 @@ export function parseCronJobs(): CronJobDefinition[] {
     const alwaysDeliver = job.always_deliver === true ? true : undefined;
     const context = job.context != null ? String(job.context) : undefined;
     const preCheck = job.pre_check != null ? String(job.pre_check) : undefined;
+    // Optional: scope a global job to a specific agent's profile (loads
+    // the agent's allowedTools whitelist, system prompt, etc.). Accept
+    // both camelCase and snake_case to be forgiving of user-written YAML.
+    const agentSlugRaw = job.agentSlug ?? job.agent_slug;
+    const agentSlug = typeof agentSlugRaw === 'string' && /^[a-z0-9-]+$/i.test(agentSlugRaw)
+      ? agentSlugRaw
+      : undefined;
 
     if (!name || !schedule || !prompt) {
       logger.warn({ job }, 'Skipping malformed cron job');
       continue;
     }
 
-    jobs.push({ name, schedule, prompt, enabled, tier, maxTurns, model, workDir, mode, maxHours, maxRetries, after, successCriteria, alwaysDeliver, context, preCheck });
+    jobs.push({ name, schedule, prompt, enabled, tier, maxTurns, model, workDir, mode, maxHours, maxRetries, after, successCriteria, alwaysDeliver, context, preCheck, agentSlug });
   }
 
   return jobs;
