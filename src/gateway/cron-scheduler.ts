@@ -552,6 +552,10 @@ export class CronScheduler {
   }
 
   reloadJobs(): void {
+    // Snapshot the pre-reload job definitions so fix-verification can diff
+    // and flag any currently-failing job whose config just changed.
+    const oldJobs = this.jobs.map(j => ({ ...j }));
+
     // Stop existing scheduled tasks (but NOT the file watcher)
     for (const [name, task] of this.scheduledTasks) {
       task.stop();
@@ -648,6 +652,28 @@ export class CronScheduler {
         logger.info(`Cron job '${def.name}' scheduled: ${def.schedule} (${SYSTEM_TIMEZONE})`);
       }
     }
+
+    // Fix-verification: detect any currently-failing job whose definition just
+    // changed, and record a pending verification for their next run.
+    // Skipped on the first load (oldJobs empty) since there's no edit to verify.
+    if (oldJobs.length > 0) {
+      import('./fix-verification.js').then(({ recordEditsForFailingJobs }) => {
+        try { recordEditsForFailingJobs(oldJobs, this.jobs); }
+        catch (err) { logger.warn({ err }, 'Fix-verification capture failed'); }
+      }).catch(err => logger.warn({ err }, 'Fix-verification import failed'));
+    }
+  }
+
+  /**
+   * Wrap runLog.append so every completion also checks whether a fix
+   * verification is pending and DMs the verdict if so.
+   */
+  private _logRun(entry: CronRunEntry): void {
+    this.runLog.append(entry);
+    import('./fix-verification.js').then(({ checkAndDeliverVerification }) => {
+      checkAndDeliverVerification(entry, (text) => this.dispatcher.send(text, {}))
+        .catch(err => logger.warn({ err, job: entry.jobName }, 'Fix verification DM failed'));
+    }).catch(err => logger.warn({ err }, 'Fix-verification import failed'));
   }
 
   private async runJob(job: CronJobDefinition): Promise<void> {
@@ -721,7 +747,7 @@ export class CronScheduler {
         // Non-zero exit or timeout → skip the job
         const exitCode = (preCheckErr as { status?: number }).status ?? 1;
         logger.info({ job: job.name, exitCode }, 'Pre-check failed — skipping job (no work to do)');
-        this.runLog.append({
+        this._logRun({
           jobName: job.name,
           startedAt: new Date().toISOString(),
           finishedAt: new Date().toISOString(),
@@ -769,7 +795,7 @@ export class CronScheduler {
 
       if (!approved) {
         logger.info({ job: job.name }, 'Cron job skipped by owner');
-        this.runLog.append({
+        this._logRun({
           jobName: job.name,
           startedAt: new Date().toISOString(),
           finishedAt: new Date().toISOString(),
@@ -791,7 +817,7 @@ export class CronScheduler {
 
     if (advice.shouldSkip) {
       logger.info({ job: job.name, reason: advice.skipReason }, 'Execution advisor: circuit breaker — skipping job');
-      this.runLog.append({
+      this._logRun({
         jobName: job.name,
         startedAt: new Date().toISOString(),
         finishedAt: new Date().toISOString(),
@@ -990,7 +1016,7 @@ export class CronScheduler {
             }
           }
 
-          this.runLog.append(entry);
+          this._logRun(entry);
 
           // Fire-and-forget: extract procedural skill from successful long-running cron jobs
           if (entry.status === 'ok' && entry.durationMs > 30_000 && response && response.length > 500) {
@@ -1020,7 +1046,7 @@ export class CronScheduler {
             ? classifyTerminalReason(errTerminalReason)
             : classifyError(err);
 
-          this.runLog.append({
+          this._logRun({
             jobName: job.name,
             startedAt: startedAt.toISOString(),
             finishedAt: finishedAt.toISOString(),

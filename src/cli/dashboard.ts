@@ -2052,6 +2052,17 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
     }
   });
 
+  // ── Broken jobs (failure monitor) ───────────────────────────────
+
+  app.get('/api/cron/broken-jobs', async (_req, res) => {
+    try {
+      const { computeBrokenJobs } = await import('../gateway/failure-monitor.js');
+      res.json({ jobs: computeBrokenJobs() });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
   // ── Cron trace viewer ──────────────────────────────────────────
 
   app.get('/api/cron/traces/:job', (req, res) => {
@@ -9040,6 +9051,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
       <div class="page-title">Scheduled Tasks</div>
       <div class="tab-bar" id="automations-tabs">
         <button class="active" onclick="switchTab('automations','scheduled')">Scheduled Tasks</button>
+        <button onclick="switchTab('automations','broken')">Broken Jobs <span class="tab-badge" id="tab-broken-count" title="repeatedly failing" style="display:none;background:#ef4444;color:#fff">0</span></button>
         <button onclick="switchTab('automations','timers')">Timers <span class="tab-badge" id="tab-timer-count" style="display:none">0</span></button>
         <button onclick="switchTab('automations','self-improve')">Self-Improve <span class="tab-badge" id="tab-si-pending" style="display:none">0</span></button>
         <button onclick="switchTab('automations','skills')">Skills <span class="tab-badge" id="tab-skill-count" style="display:none">0</span><span class="tab-badge" id="tab-pending-skill-count" title="pending approval" style="display:none;background:#f59e0b;color:#000">0</span></button>
@@ -9048,6 +9060,15 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
       <div id="automations-tab-content">
         <div class="tab-pane active" id="tab-automations-scheduled">
           <div id="panel-cron"><div class="empty-state">Loading...</div></div>
+        </div>
+        <div class="tab-pane" id="tab-automations-broken">
+          <div class="card">
+            <div class="card-header" style="display:flex;align-items:center;justify-content:space-between">
+              <span>Repeatedly Failing Jobs (last 48h)</span>
+              <span class="badge badge-gray" id="broken-count-badge" style="font-size:10px">0 jobs</span>
+            </div>
+            <div class="card-body" id="panel-broken-jobs"><div class="empty-state">Loading...</div></div>
+          </div>
         </div>
         <div class="tab-pane" id="tab-automations-timers">
           <div class="card">
@@ -10272,7 +10293,7 @@ function navigateTo(page, opts) {
     updateBuilderMode();
     document.getElementById('builder-input').focus();
   }
-  if (page === 'automations') { refreshCron(); refreshTimers(); refreshSelfImprove(); refreshSkills(); }
+  if (page === 'automations') { refreshCron(); refreshTimers(); refreshSelfImprove(); refreshSkills(); refreshBrokenJobs(); }
   if (page === 'intelligence') { refreshMemory(); }
   if (page === 'settings') { refreshSettings(); refreshRemoteAccess(); refreshSalesforce(); refreshClaudeIntegrations(); refreshMcpServers(); }
   if (page === 'logs') refreshLogs();
@@ -10313,6 +10334,7 @@ function switchTab(group, tab) {
   // Tab-specific refresh
   if (group === 'automations') {
     if (tab === 'scheduled') refreshCron();
+    if (tab === 'broken') refreshBrokenJobs();
     if (tab === 'timers') refreshTimers();
     if (tab === 'self-improve') refreshSelfImprove();
     if (tab === 'workflows') refreshWorkflows();
@@ -16104,6 +16126,62 @@ async function expandSkill(name) {
       + '</div>';
     card.insertAdjacentHTML('beforeend', detailHtml);
   } catch(e) { toast('Failed to load skill', 'error'); }
+}
+
+async function refreshBrokenJobs() {
+  try {
+    var r = await apiFetch('/api/cron/broken-jobs');
+    var d = await r.json();
+    var jobs = d.jobs || [];
+    var tabBadge = document.getElementById('tab-broken-count');
+    if (tabBadge) {
+      tabBadge.textContent = String(jobs.length);
+      tabBadge.style.display = jobs.length > 0 ? '' : 'none';
+    }
+    var countBadge = document.getElementById('broken-count-badge');
+    if (countBadge) countBadge.textContent = jobs.length + ' job' + (jobs.length !== 1 ? 's' : '');
+    var container = document.getElementById('panel-broken-jobs');
+    if (!container) return;
+    if (jobs.length === 0) {
+      container.innerHTML = '<div class="empty-state">All jobs healthy in the last 48h.</div>';
+      return;
+    }
+    var html = '<div style="display:flex;flex-direction:column;gap:12px">';
+    for (var j of jobs) {
+      var breaker = j.circuitBreakerEngagedAt
+        ? '<span class="badge" style="background:rgba(239,68,68,0.15);color:#ef4444;font-size:10px">circuit broken</span>'
+        : '';
+      var lastErrorAt = j.lastErrorAt ? timeAgo(j.lastErrorAt) : 'unknown';
+      var failureRatio = j.errorCount48h + '/' + j.totalRuns48h;
+      var advisorLine = j.lastAdvisorOpinion
+        ? '<div style="font-size:11px;color:var(--text-muted);margin-top:6px"><strong>Advisor:</strong> ' + esc(j.lastAdvisorOpinion) + '</div>'
+        : '';
+      var errorsHtml = '';
+      if (j.lastErrors && j.lastErrors.length > 0) {
+        errorsHtml = '<div style="margin-top:8px;display:flex;flex-direction:column;gap:4px">';
+        for (var e of j.lastErrors) {
+          errorsHtml += '<pre style="font-size:11px;color:var(--text-secondary);background:var(--bg-tertiary);padding:6px 8px;border-radius:4px;white-space:pre-wrap;word-break:break-word;margin:0;max-height:120px;overflow-y:auto">' + esc(e) + '</pre>';
+        }
+        errorsHtml += '</div>';
+      }
+      var agentTag = j.agentSlug
+        ? '<span class="badge badge-blue" style="font-size:10px">' + esc(j.agentSlug) + '</span>'
+        : '';
+      html += '<div style="padding:12px;border:1px solid var(--border);border-radius:8px;background:var(--bg-secondary)">'
+        + '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">'
+        + '<strong>' + esc(j.jobName) + '</strong> ' + agentTag + ' ' + breaker
+        + '<span style="margin-left:auto;font-size:11px;color:var(--text-muted)">' + failureRatio + ' failed \\u00b7 last error ' + lastErrorAt + '</span>'
+        + '</div>'
+        + errorsHtml
+        + advisorLine
+        + '</div>';
+    }
+    html += '</div>';
+    container.innerHTML = html;
+  } catch(e) {
+    var c = document.getElementById('panel-broken-jobs');
+    if (c) c.innerHTML = '<div class="empty-state" style="color:var(--red)">Failed to load broken jobs</div>';
+  }
 }
 
 async function refreshPendingSkills() {

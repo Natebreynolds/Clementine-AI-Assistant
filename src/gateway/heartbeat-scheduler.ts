@@ -153,6 +153,14 @@ export class HeartbeatScheduler {
     // Periodic housekeeping: evict stale gateway sessions
     try { this.gateway.evictStaleSessions(); } catch (err) { logger.warn({ err }, 'Session eviction failed'); }
 
+    // Cron failure sweep — surface jobs that have been silently failing.
+    // Runs every tick; per-job 24h cooldown lives inside the monitor.
+    import('./failure-monitor.js').then(({ runFailureSweep }) => {
+      runFailureSweep((text) => this.dispatcher.send(text, {})).catch(err => {
+        logger.warn({ err }, 'Failure sweep failed');
+      });
+    }).catch(err => logger.warn({ err }, 'Failure sweep import failed'));
+
     const now = new Date();
     const hour = now.getHours();
 
