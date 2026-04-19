@@ -59,6 +59,18 @@ export interface BrokenJob {
   lastErrors: string[];                  // up to 3 distinct error messages
   circuitBreakerEngagedAt: string | null;
   lastAdvisorOpinion: string | null;
+  /** Populated asynchronously by the diagnostic agent when available. */
+  diagnosis?: {
+    rootCause: string;
+    confidence: 'high' | 'medium' | 'low';
+    proposedFix: {
+      type: string;
+      details: string;
+      diff?: string;
+    };
+    riskLevel: 'low' | 'medium' | 'high';
+    generatedAt: string;
+  };
 }
 
 interface MonitorState {
@@ -285,7 +297,29 @@ export function computeBrokenJobs(now = Date.now()): BrokenJob[] {
     return bT - aT;
   });
 
+  // Attach any cached diagnosis (fresh within 24h). Reads the cache file
+  // directly — avoids circular imports with failure-diagnostics.
+  attachCachedDiagnoses(broken, now);
+
   return broken;
+}
+
+const DIAGNOSTICS_CACHE_FILE = path.join(BASE_DIR, 'cron', 'failure-diagnostics.json');
+const DIAGNOSIS_TTL_MS = 24 * 60 * 60 * 1000;
+
+function attachCachedDiagnoses(jobs: BrokenJob[], now: number): void {
+  if (!existsSync(DIAGNOSTICS_CACHE_FILE)) return;
+  try {
+    const cache = JSON.parse(readFileSync(DIAGNOSTICS_CACHE_FILE, 'utf-8')) as Record<string, BrokenJob['diagnosis'] & { generatedAt: string }>;
+    for (const j of jobs) {
+      const d = cache[j.jobName];
+      if (!d) continue;
+      const age = now - Date.parse(d.generatedAt);
+      if (Number.isFinite(age) && age < DIAGNOSIS_TTL_MS) {
+        j.diagnosis = d;
+      }
+    }
+  } catch { /* cache may be malformed — ignore */ }
 }
 
 /**
@@ -384,12 +418,28 @@ function formatReport(jobs: BrokenJob[]): string {
   for (const j of jobs) {
     const breaker = j.circuitBreakerEngagedAt ? ' · circuit breaker engaged' : '';
     lines.push(`• \`${j.jobName}\` — ${j.errorCount48h}/${j.totalRuns48h} runs failed${breaker}`);
-    if (j.lastErrors.length > 0) {
-      const preview = j.lastErrors[0]!.split('\n')[0]!.slice(0, 140);
-      lines.push(`  Last error: ${preview}`);
-    }
-    if (j.lastAdvisorOpinion) {
-      lines.push(`  Advisor: ${j.lastAdvisorOpinion.slice(0, 140)}`);
+
+    // Prefer the diagnostic agent's analysis when available — it's more
+    // actionable than the raw error. Fall back to error + advisor lines.
+    if (j.diagnosis) {
+      const conf = j.diagnosis.confidence === 'high' ? '' : ` (${j.diagnosis.confidence} confidence)`;
+      lines.push(`  **Cause${conf}:** ${j.diagnosis.rootCause.slice(0, 240)}`);
+      lines.push(`  **Proposed fix:** ${j.diagnosis.proposedFix.details.slice(0, 240)}`);
+      if (j.diagnosis.proposedFix.diff) {
+        // Show a short diff preview inline; full diff in the dashboard.
+        const diffShort = j.diagnosis.proposedFix.diff.split('\n').slice(0, 4).join('\n');
+        lines.push('  ```diff');
+        lines.push('  ' + diffShort.replace(/\n/g, '\n  '));
+        lines.push('  ```');
+      }
+    } else {
+      if (j.lastErrors.length > 0) {
+        const preview = j.lastErrors[0]!.split('\n')[0]!.slice(0, 140);
+        lines.push(`  Last error: ${preview}`);
+      }
+      if (j.lastAdvisorOpinion) {
+        lines.push(`  Advisor: ${j.lastAdvisorOpinion.slice(0, 140)}`);
+      }
     }
   }
   lines.push('');
@@ -399,26 +449,41 @@ function formatReport(jobs: BrokenJob[]): string {
 
 /**
  * Run a sweep: identify currently-broken jobs, pick the ones we haven't
- * notified about recently, and dispatch one consolidated DM.
+ * notified about recently, invoke the diagnostic agent for new entries,
+ * and dispatch one consolidated DM.
+ *
+ * `gateway` is optional — omitted for tests that want to skip the LLM call.
+ * When present, we diagnose fresh broken jobs before notifying, so the
+ * report includes a root-cause + proposed fix for each.
  *
  * Returns the jobs that triggered a fresh notification (mostly for tests/logs).
  */
 export async function runFailureSweep(
   send: (text: string) => Promise<unknown>,
+  gateway?: import('./router.js').Gateway,
   now = Date.now(),
 ): Promise<BrokenJob[]> {
   const broken = computeBrokenJobs(now);
   if (broken.length === 0) {
-    // Clear cooldowns for jobs that recovered so future failures notify promptly.
+    // Clear cooldowns AND diagnostic cache entries for jobs that recovered.
     const state = loadState();
     let mutated = false;
+    const healedJobs: string[] = [];
     for (const name of Object.keys(state.notified)) {
       if (!broken.find(b => b.jobName === name)) {
         delete state.notified[name];
+        healedJobs.push(name);
         mutated = true;
       }
     }
     if (mutated) saveState(state);
+    // Opportunistically drop diagnosis cache for healed jobs
+    if (healedJobs.length > 0) {
+      try {
+        const { clearDiagnosis } = await import('./failure-diagnostics.js');
+        for (const name of healedJobs) clearDiagnosis(name);
+      } catch { /* non-fatal */ }
+    }
     return [];
   }
 
@@ -433,6 +498,26 @@ export async function runFailureSweep(
   }
 
   if (fresh.length === 0) return [];
+
+  // Diagnose fresh broken jobs before DMing. Each call is cached 24h, so a
+  // recurring failure doesn't re-invoke the LLM. Diagnosis is best-effort —
+  // if it fails or the gateway isn't wired, the report still goes out.
+  if (gateway) {
+    try {
+      const { diagnoseBrokenJob } = await import('./failure-diagnostics.js');
+      for (const job of fresh) {
+        if (job.diagnosis) continue; // already attached from cache
+        try {
+          const d = await diagnoseBrokenJob(job, gateway);
+          if (d) job.diagnosis = d;
+        } catch (err) {
+          logger.warn({ err, job: job.jobName }, 'Diagnosis attempt failed');
+        }
+      }
+    } catch (err) {
+      logger.warn({ err }, 'Failed to load diagnostics module');
+    }
+  }
 
   try {
     await send(formatReport(fresh));

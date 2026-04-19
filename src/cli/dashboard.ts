@@ -16167,11 +16167,39 @@ async function refreshBrokenJobs() {
       var agentTag = j.agentSlug
         ? '<span class="badge badge-blue" style="font-size:10px">' + esc(j.agentSlug) + '</span>'
         : '';
+
+      // Diagnosis block — root cause + proposed fix + diff preview.
+      var diagnosisHtml = '';
+      if (j.diagnosis) {
+        var riskColor = j.diagnosis.riskLevel === 'high' ? '#ef4444'
+          : j.diagnosis.riskLevel === 'medium' ? '#f59e0b' : '#22c55e';
+        var confLabel = j.diagnosis.confidence !== 'high'
+          ? ' <span style="font-size:10px;color:var(--text-muted)">(' + esc(j.diagnosis.confidence) + ' confidence)</span>'
+          : '';
+        var diffHtml = '';
+        if (j.diagnosis.proposedFix.diff) {
+          diffHtml = '<pre style="font-size:11px;background:#0f172a;color:#e2e8f0;padding:8px;border-radius:4px;margin:6px 0 0;white-space:pre-wrap;word-break:break-word;max-height:200px;overflow-y:auto">'
+            + esc(j.diagnosis.proposedFix.diff) + '</pre>';
+        }
+        diagnosisHtml = '<div style="margin-top:10px;padding:10px;border-left:3px solid ' + riskColor
+          + ';background:var(--bg-tertiary);border-radius:4px">'
+          + '<div style="font-size:12px;margin-bottom:4px"><strong>Root cause' + confLabel + ':</strong> '
+          + esc(j.diagnosis.rootCause) + '</div>'
+          + '<div style="font-size:12px"><strong>Proposed fix:</strong> '
+          + esc(j.diagnosis.proposedFix.details) + '</div>'
+          + diffHtml
+          + '<div style="font-size:10px;color:var(--text-muted);margin-top:6px">'
+          + esc(j.diagnosis.proposedFix.type) + ' \\u00b7 ' + esc(j.diagnosis.riskLevel) + ' risk \\u00b7 diagnosed ' + timeAgo(j.diagnosis.generatedAt)
+          + '</div>'
+          + '</div>';
+      }
+
       html += '<div style="padding:12px;border:1px solid var(--border);border-radius:8px;background:var(--bg-secondary)">'
         + '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">'
         + '<strong>' + esc(j.jobName) + '</strong> ' + agentTag + ' ' + breaker
         + '<span style="margin-left:auto;font-size:11px;color:var(--text-muted)">' + failureRatio + ' failed \\u00b7 last error ' + lastErrorAt + '</span>'
         + '</div>'
+        + diagnosisHtml
         + errorsHtml
         + advisorLine
         + '</div>';

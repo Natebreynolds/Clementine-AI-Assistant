@@ -155,8 +155,10 @@ export class HeartbeatScheduler {
 
     // Cron failure sweep — surface jobs that have been silently failing.
     // Runs every tick; per-job 24h cooldown lives inside the monitor.
+    // Passes the gateway so freshly-broken jobs get a diagnostic LLM call
+    // (cached 24h) before the DM goes out.
     import('./failure-monitor.js').then(({ runFailureSweep }) => {
-      runFailureSweep((text) => this.dispatcher.send(text, {})).catch(err => {
+      runFailureSweep((text) => this.dispatcher.send(text, {}), this.gateway).catch(err => {
         logger.warn({ err }, 'Failure sweep failed');
       });
     }).catch(err => logger.warn({ err }, 'Failure sweep import failed'));
