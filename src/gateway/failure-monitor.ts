@@ -197,7 +197,23 @@ export function computeBrokenJobs(now = Date.now()): BrokenJob[] {
 
     // Always consult the breaker state — a stuck breaker is the primary
     // signal for "job has been silently broken for days".
-    const cb = lastCircuitBreakerEvent(jobName);
+    let cb = lastCircuitBreakerEvent(jobName);
+
+    // Clear a "stuck" breaker flag if we see an ok run AFTER the last
+    // breaker engagement. The scheduler only logs a circuit-recovery
+    // event when consecutiveErrors >= 5 at recovery time — but a
+    // successful manual/probe run resets consecutiveErrors to 0 first,
+    // so the recovery branch never fires and the advisor log keeps the
+    // breaker appearing engaged forever. Fix: use run-log truth instead.
+    if (cb.engagedAt) {
+      const engagedMs = Date.parse(cb.engagedAt);
+      const hasOkSinceBreaker = entries.some(e =>
+        e.status === 'ok' && Date.parse(e.startedAt) > engagedMs,
+      );
+      if (hasOkSinceBreaker) {
+        cb = { engagedAt: null, lastOpinion: cb.lastOpinion };
+      }
+    }
 
     if (!cb.engagedAt && Number.isFinite(lastRunMs) && lastRunMs < dormantCutoffMs) {
       continue;
