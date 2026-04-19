@@ -148,9 +148,17 @@ async function cachedAsync<T>(key: string, ttlMs: number, compute: () => Promise
 
 let gatewayInstance: Gateway | null = null;
 let gatewayInitializing = false;
+let gatewayDispatcher: import('../gateway/notifications.js').NotificationDispatcher | null = null;
+
+/** SSE broadcaster; set once cmdDashboard has built the SSE infrastructure. */
+let dashboardSseBroadcast: ((event: { type: string; data?: unknown }) => void) | null = null;
 
 /** Reset the cached gateway (called when daemon PID changes). */
 function resetGateway(): void {
+  if (gatewayDispatcher) {
+    try { gatewayDispatcher.shutdown(); } catch { /* best-effort */ }
+    gatewayDispatcher = null;
+  }
   gatewayInstance = null;
   responseCache.clear();
 }
@@ -170,6 +178,26 @@ async function getGateway(): Promise<Gateway> {
     gatewayInstance = new GatewayClass(assistant);
     const { setApprovalCallback } = await import('../agent/hooks.js');
     setApprovalCallback(async () => false);
+
+    // Wire a local NotificationDispatcher so deep-task results launched from
+    // dashboard chat sessions can be pushed back into the browser via SSE.
+    try {
+      const { NotificationDispatcher } = await import('../gateway/notifications.js');
+      const dispatcher = new NotificationDispatcher();
+      dispatcher.register('dashboard', async (text, context) => {
+        if (!dashboardSseBroadcast) return;
+        dashboardSseBroadcast({
+          type: 'deep_result',
+          data: { sessionKey: context?.sessionKey ?? null, text },
+        });
+      });
+      gatewayInstance.setDispatcher(dispatcher);
+      gatewayDispatcher = dispatcher;
+    } catch (err) {
+      // Non-fatal — deep-task results from dashboard sessions just won't surface live
+      console.warn('Failed to wire dashboard SSE dispatcher:', err);
+    }
+
     return gatewayInstance;
   } catch (err) {
     if (String(err).includes('Gateway initializing')) throw err;
@@ -1981,6 +2009,9 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
     }
   }
 
+  // Let the lazy-gateway dispatcher publish deep_result events through SSE.
+  dashboardSseBroadcast = broadcastEvent;
+
   // SSE events handler moved before auth middleware (see above)
 
   // ── POST routes (actions) ──────────────────────────────────────
@@ -3754,16 +3785,80 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
 
   // ── Skills (Procedural Memory) API ──────────────────────────────────
 
-  app.get('/api/skills', (_req, res) => {
+  // NOTE: /api/skills/pending routes must come before /api/skills/:name so
+  // Express doesn't capture "pending" as a :name param.
+  app.get('/api/skills/pending', async (_req, res) => {
+    try {
+      const { listPendingSkills } = await import('../agent/skill-extractor.js');
+      res.json({ skills: listPendingSkills() });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  app.post('/api/skills/pending/:name/approve', async (req, res) => {
+    try {
+      const { approvePendingSkill } = await import('../agent/skill-extractor.js');
+      const result = approvePendingSkill(req.params.name);
+      if (!result.ok) { res.status(404).json(result); return; }
+      res.json(result);
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  app.post('/api/skills/pending/:name/reject', async (req, res) => {
+    try {
+      const { rejectPendingSkill } = await import('../agent/skill-extractor.js');
+      const result = rejectPendingSkill(req.params.name);
+      if (!result.ok) { res.status(404).json(result); return; }
+      res.json(result);
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  app.get('/api/skills', async (_req, res) => {
     try {
       const skillsDir = path.join(VAULT_DIR, '00-System', 'skills');
       if (!existsSync(skillsDir)) { res.json({ skills: [] }); return; }
+
+      // Aggregate last-7-day retrieval stats from skill_usage table (best-effort).
+      const usageStats = new Map<string, { retrievals7d: number; lastRetrievedAt: string | null; avgScore: number | null }>();
+      if (existsSync(MEMORY_DB_PATH)) {
+        try {
+          const Database = (await import('better-sqlite3')).default;
+          const db = new Database(MEMORY_DB_PATH, { readonly: true });
+          try {
+            const rows = db.prepare(
+              `SELECT skill_name,
+                      COUNT(*) AS retrievals,
+                      MAX(retrieved_at) AS last_retrieved_at,
+                      AVG(score) AS avg_score
+               FROM skill_usage
+               WHERE retrieved_at >= datetime('now', '-7 days')
+               GROUP BY skill_name`,
+            ).all() as Array<{ skill_name: string; retrievals: number; last_retrieved_at: string | null; avg_score: number | null }>;
+            for (const r of rows) {
+              usageStats.set(r.skill_name, {
+                retrievals7d: r.retrievals,
+                lastRetrievedAt: r.last_retrieved_at,
+                avgScore: r.avg_score,
+              });
+            }
+          } catch { /* skill_usage may not exist on older DBs */ }
+          db.close();
+        } catch { /* non-fatal */ }
+      }
+
       const files = readdirSync(skillsDir).filter(f => f.endsWith('.md'));
       const skills = files.map(f => {
         try {
           const parsed = matter(readFileSync(path.join(skillsDir, f), 'utf-8'));
+          const name = f.replace('.md', '');
+          const stats = usageStats.get(name);
           return {
-            name: f.replace('.md', ''),
+            name,
             title: parsed.data.title ?? f,
             description: parsed.data.description ?? '',
             source: parsed.data.source ?? 'unknown',
@@ -3774,6 +3869,9 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
             lastUsed: parsed.data.lastUsed ?? null,
             createdAt: parsed.data.createdAt ?? '',
             updatedAt: parsed.data.updatedAt ?? '',
+            retrievals7d: stats?.retrievals7d ?? 0,
+            lastRetrievedAt: stats?.lastRetrievedAt ?? null,
+            avgScore: stats?.avgScore ?? null,
           };
         } catch { return null; }
       }).filter(Boolean);
@@ -8944,7 +9042,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
         <button class="active" onclick="switchTab('automations','scheduled')">Scheduled Tasks</button>
         <button onclick="switchTab('automations','timers')">Timers <span class="tab-badge" id="tab-timer-count" style="display:none">0</span></button>
         <button onclick="switchTab('automations','self-improve')">Self-Improve <span class="tab-badge" id="tab-si-pending" style="display:none">0</span></button>
-        <button onclick="switchTab('automations','skills')">Skills <span class="tab-badge" id="tab-skill-count" style="display:none">0</span></button>
+        <button onclick="switchTab('automations','skills')">Skills <span class="tab-badge" id="tab-skill-count" style="display:none">0</span><span class="tab-badge" id="tab-pending-skill-count" title="pending approval" style="display:none;background:#f59e0b;color:#000">0</span></button>
         <button onclick="switchTab('automations','analytics')">Execution Analytics</button>
       </div>
       <div id="automations-tab-content">
@@ -9001,6 +9099,13 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
                 </div>
               </div>
             </div>
+          </div>
+          <div class="card" id="pending-skills-card" style="display:none">
+            <div class="card-header" style="display:flex;align-items:center;justify-content:space-between">
+              <span>Pending Approval</span>
+              <span class="badge badge-orange" id="pending-skills-count-badge" style="font-size:10px">0 pending</span>
+            </div>
+            <div class="card-body" id="panel-pending-skills"></div>
           </div>
           <div class="card">
             <div class="card-header" style="display:flex;align-items:center;justify-content:space-between">
@@ -16001,7 +16106,83 @@ async function expandSkill(name) {
   } catch(e) { toast('Failed to load skill', 'error'); }
 }
 
+async function refreshPendingSkills() {
+  try {
+    var r = await apiFetch('/api/skills/pending');
+    var d = await r.json();
+    var pending = d.skills || [];
+    var tabBadge = document.getElementById('tab-pending-skill-count');
+    if (tabBadge) {
+      tabBadge.textContent = String(pending.length);
+      tabBadge.style.display = pending.length > 0 ? '' : 'none';
+    }
+    var card = document.getElementById('pending-skills-card');
+    var countBadge = document.getElementById('pending-skills-count-badge');
+    var container = document.getElementById('panel-pending-skills');
+    if (!container) return;
+    if (pending.length === 0) {
+      if (card) card.style.display = 'none';
+      container.innerHTML = '';
+      return;
+    }
+    if (card) card.style.display = '';
+    if (countBadge) countBadge.textContent = pending.length + ' pending';
+
+    var html = '<div style="display:flex;flex-direction:column;gap:10px">';
+    for (var s of pending) {
+      var sourceTag = s.source === 'cron' ? '<span class="badge badge-green" style="font-size:10px">cron</span>'
+        : s.source === 'unleashed' ? '<span class="badge badge-purple" style="font-size:10px">unleashed</span>'
+        : s.source === 'chat' ? '<span class="badge badge-blue" style="font-size:10px">chat</span>'
+        : '<span class="badge badge-gray" style="font-size:10px">' + esc(s.source || 'unknown') + '</span>';
+      var age = s.createdAt ? timeAgo(s.createdAt) : '';
+      var scopeTag = s.agentSlug
+        ? '<span style="font-size:10px;color:var(--text-muted)">for ' + esc(s.agentSlug) + '</span>'
+        : '<span style="font-size:10px;color:var(--text-muted)">global</span>';
+      html += '<div style="padding:12px;border:1px solid var(--border);border-radius:8px;background:var(--bg-secondary)">'
+        + '<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;flex-wrap:wrap">'
+        + '<strong>' + esc(s.title) + '</strong> ' + sourceTag + ' ' + scopeTag
+        + (age ? ' <span style="font-size:10px;color:var(--text-muted)">\\u00b7 learned ' + age + '</span>' : '')
+        + '<span style="margin-left:auto;display:flex;gap:6px">'
+        + '<button onclick="approvePendingSkill(\\x27' + esc(s.name) + '\\x27)" style="background:var(--accent);border:1px solid var(--accent);border-radius:4px;padding:3px 10px;font-size:11px;color:white;cursor:pointer">Approve</button>'
+        + '<button onclick="rejectPendingSkill(\\x27' + esc(s.name) + '\\x27)" style="background:none;border:1px solid var(--border);border-radius:4px;padding:3px 10px;font-size:11px;color:var(--red);cursor:pointer">Reject</button>'
+        + '</span>'
+        + '</div>'
+        + '<div style="font-size:12px;color:var(--text-secondary)">' + esc(s.description || '') + '</div>'
+        + '</div>';
+    }
+    html += '</div>';
+    container.innerHTML = html;
+  } catch(e) { /* non-fatal */ }
+}
+
+async function approvePendingSkill(name) {
+  try {
+    var r = await apiJson('POST', '/api/skills/pending/' + encodeURIComponent(name) + '/approve', {});
+    if (r && r.ok) {
+      toast(r.message || 'Skill approved', 'success');
+      refreshPendingSkills();
+      refreshSkills();
+    } else {
+      toast((r && r.message) || 'Failed to approve', 'error');
+    }
+  } catch(e) { toast('Failed to approve skill', 'error'); }
+}
+
+async function rejectPendingSkill(name) {
+  if (!confirm('Reject this pending skill? It will be deleted.')) return;
+  try {
+    var r = await apiJson('POST', '/api/skills/pending/' + encodeURIComponent(name) + '/reject', {});
+    if (r && r.ok) {
+      toast(r.message || 'Skill rejected', 'success');
+      refreshPendingSkills();
+    } else {
+      toast((r && r.message) || 'Failed to reject', 'error');
+    }
+  } catch(e) { toast('Failed to reject skill', 'error'); }
+}
+
 async function refreshSkills() {
+  refreshPendingSkills();
   try {
     var r = await apiFetch('/api/skills');
     var d = await r.json();
@@ -16045,12 +16226,15 @@ async function refreshSkills() {
           + (s.toolsUsed.length > 4 ? ' <span style="font-size:10px;color:var(--text-muted)">+' + (s.toolsUsed.length - 4) + '</span>' : '')
           + '</div>';
       }
+      var retrieval7d = (typeof s.retrievals7d === 'number' && s.retrievals7d > 0)
+        ? ' \\u00b7 ' + s.retrievals7d + ' retrievals (7d)'
+        : '';
       html += '<div id="skill-card-' + esc(s.name) + '" style="padding:12px;border:1px solid var(--border);border-radius:8px;background:var(--bg-secondary)">'
         + '<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">'
         + '<strong style="cursor:pointer" onclick="expandSkill(\\x27' + esc(s.name) + '\\x27)">' + esc(s.title) + '</strong> ' + sourceTag
         + (sourceCtx ? ' ' + sourceCtx : '')
         + '<span style="margin-left:auto;display:flex;align-items:center;gap:8px">'
-        + '<span style="font-size:11px;color:var(--text-muted)">used ' + s.useCount + 'x' + (age ? ' \\u00b7 ' + age : '') + '</span>'
+        + '<span style="font-size:11px;color:var(--text-muted)">used ' + s.useCount + 'x' + (age ? ' \\u00b7 ' + age : '') + retrieval7d + '</span>'
         + '<button onclick="expandSkill(\\x27' + esc(s.name) + '\\x27)" style="background:none;border:1px solid var(--border);border-radius:4px;padding:2px 8px;font-size:11px;color:var(--text-secondary);cursor:pointer">View</button>'
         + '<button onclick="editSkillInBuilder(\\x27' + esc(s.name) + '\\x27)" style="background:none;border:1px solid var(--border);border-radius:4px;padding:2px 8px;font-size:11px;color:var(--accent);cursor:pointer">Edit</button>'
         + '<button onclick="deleteSkill(\\x27' + esc(s.name) + '\\x27)" style="background:none;border:1px solid var(--border);border-radius:4px;padding:2px 8px;font-size:11px;color:var(--red);cursor:pointer">Delete</button>'
@@ -17507,6 +17691,34 @@ try {
       if (evt.type === 'daemon_restarted') {
         toast('Daemon restarted \u2014 refreshing data...', 'info');
         setTimeout(function() { refreshAll(); }, 1500);
+      }
+      if (evt.type === 'deep_result') {
+        try {
+          var container = document.getElementById('chat-messages');
+          var text = (evt.data && evt.data.text) ? evt.data.text : '';
+          if (container && text) {
+            var emptyState = container.querySelector('.empty-state');
+            if (emptyState) emptyState.remove();
+            var row = document.createElement('div');
+            row.className = 'chat-assistant-row';
+            var av = document.createElement('div');
+            av.className = 'chat-avatar-sm';
+            av.innerHTML = (lastStatusData && lastStatusData.name ? lastStatusData.name : 'C').charAt(0).toUpperCase();
+            row.appendChild(av);
+            var bubble = document.createElement('div');
+            bubble.className = 'chat-bubble assistant';
+            bubble.innerHTML = renderMd(text);
+            var meta = document.createElement('div');
+            meta.className = 'chat-meta';
+            meta.textContent = new Date().toLocaleTimeString() + ' \u00b7 deep task';
+            bubble.appendChild(meta);
+            row.appendChild(bubble);
+            container.appendChild(row);
+            container.scrollTop = container.scrollHeight;
+          } else {
+            toast('Deep task result ready \u2014 open chat to view.', 'info');
+          }
+        } catch(e) { /* non-fatal */ }
       }
     } catch(err) { /* ignore */ }
   };

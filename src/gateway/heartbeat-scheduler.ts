@@ -235,6 +235,28 @@ export class HeartbeatScheduler {
       }
     }
 
+    // Daily stale-skill archival: run once per day at 3 AM. Skills never
+    // retrieved in 90+ days (both frontmatter useCount and skill_usage empty)
+    // get moved to .archive/ so they stop competing in trigger matching.
+    if (hour === 3 && this.lastState.lastSkillDecayDate !== todayISO()) {
+      this.lastState.lastSkillDecayDate = todayISO();
+      this.saveState();
+      import('../agent/skill-extractor.js').then(({ archiveStaleSkills }) => {
+        try {
+          const store = this.gateway.getMemoryStore();
+          const archived = archiveStaleSkills(
+            90,
+            store ? (name: string) => store.skillRetrievalCount(name) : undefined,
+          );
+          if (archived.length > 0) {
+            logger.info({ count: archived.length, names: archived.slice(0, 5) }, 'Archived stale skills');
+          }
+        } catch (err) {
+          logger.warn({ err }, 'Stale skill archival failed');
+        }
+      }).catch(err => logger.warn({ err }, 'Stale skill archival import failed'));
+    }
+
     // Evening memory consolidation: once per day between 7-9 PM
     if (hour >= 19 && hour < 21 && this.lastConsolidationDate !== todayISO()) {
       this.lastConsolidationDate = todayISO();

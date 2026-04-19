@@ -1110,6 +1110,13 @@ Never spawn a sub-agent with vague instructions like "handle this brief" — tel
         const matchedSkills = searchSkillsSync(this._lastUserMessage, 1, profile?.slug);
         if (matchedSkills.length > 0 && matchedSkills[0].score >= 4) {
           const skill = matchedSkills[0];
+          this.memoryStore?.logSkillUse?.({
+            skillName: skill.name,
+            sessionKey: sessionKey ?? null,
+            queryText: this._lastUserMessage,
+            score: skill.score,
+            agentSlug: profile?.slug ?? null,
+          });
           let skillBlock = `## Relevant Skill: ${skill.title}\n\n${skill.content.slice(0, 800)}`;
 
           // Surface linked tools + warn about whitelist conflicts
@@ -1637,6 +1644,13 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
               return `## Relevant Procedures (from past successful executions)\n\n` +
                 matchedSkills.map(s => {
                   recordSkillUse(s.name);
+                  this.memoryStore?.logSkillUse?.({
+                    skillName: s.name,
+                    sessionKey: sessionKey ?? null,
+                    queryText: enrichedQuery,
+                    score: s.score,
+                    agentSlug: agentSlug || null,
+                  });
                   return `## Skill: ${s.title}\n${s.content}`;
                 }).join('\n\n');
             }
@@ -3464,10 +3478,18 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
     try {
       const { searchSkills, recordSkillUse } = await import('./skill-extractor.js');
       const cronAgentSlug = sdkOptions.env?.CLEMENTINE_TEAM_AGENT;
-      const matchedSkills = searchSkills(jobName + ' ' + jobPrompt.slice(0, 200), 2, cronAgentSlug || undefined);
+      const skillQuery = jobName + ' ' + jobPrompt.slice(0, 200);
+      const matchedSkills = searchSkills(skillQuery, 2, cronAgentSlug || undefined);
       if (matchedSkills.length > 0) {
         const skillLines = matchedSkills.map(s => {
           recordSkillUse(s.name);
+          this.memoryStore?.logSkillUse?.({
+            skillName: s.name,
+            sessionKey: `cron:${cronAgentSlug ?? 'clementine'}:${jobName}`,
+            queryText: skillQuery,
+            score: s.score,
+            agentSlug: cronAgentSlug || null,
+          });
           let block = `### ${s.title}\n${s.content}`;
           if (s.toolsUsed.length > 0) block += `\n**Tools:** ${s.toolsUsed.join(', ')}`;
           // Inline attachment contents for cron context
@@ -3838,11 +3860,19 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
         try {
           const { searchSkills, recordSkillUse } = await import('./skill-extractor.js');
           const unleashedAgentSlug = jobName.includes(':') ? jobName.split(':')[0] : undefined;
-          const matchedSkills = searchSkills(jobName + ' ' + jobPrompt.slice(0, 200), 2, unleashedAgentSlug);
+          const unleashedSkillQuery = jobName + ' ' + jobPrompt.slice(0, 200);
+          const matchedSkills = searchSkills(unleashedSkillQuery, 2, unleashedAgentSlug);
           if (matchedSkills.length > 0) {
             unleashedSkillContext = `\n\n## Learned Procedures\nFollow these proven approaches when applicable:\n\n` +
               matchedSkills.map(s => {
                 recordSkillUse(s.name);
+                this.memoryStore?.logSkillUse?.({
+                  skillName: s.name,
+                  sessionKey: `unleashed:${jobName}`,
+                  queryText: unleashedSkillQuery,
+                  score: s.score,
+                  agentSlug: unleashedAgentSlug || null,
+                });
                 let block = `### ${s.title}\n${s.content}`;
                 if (s.toolsUsed.length > 0) block += `\n**Tools:** ${s.toolsUsed.join(', ')}`;
                 if (s.attachments.length > 0) {

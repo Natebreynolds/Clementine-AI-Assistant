@@ -436,7 +436,92 @@ export class MemoryStore {
       CREATE INDEX IF NOT EXISTS idx_sf_sync_local ON sf_sync_log(local_table, local_id);
       CREATE INDEX IF NOT EXISTS idx_sf_sync_sfid ON sf_sync_log(sf_id);
       CREATE INDEX IF NOT EXISTS idx_sf_sync_status ON sf_sync_log(sync_status);
+
+      CREATE TABLE IF NOT EXISTS skill_usage (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        skill_name TEXT NOT NULL,
+        session_key TEXT,
+        query_text TEXT,
+        retrieved_at TEXT NOT NULL DEFAULT (datetime('now')),
+        score REAL,
+        outcome TEXT,
+        agent_slug TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_skill_usage_name ON skill_usage(skill_name, retrieved_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_skill_usage_time ON skill_usage(retrieved_at DESC);
     `);
+  }
+
+  // ── Skill usage telemetry ─────────────────────────────────────────
+
+  private _stmtLogSkillUse: Database.Statement | null = null;
+
+  /**
+   * Record that a skill was retrieved and injected into a query context.
+   * Outcome is left null; a follow-up could backfill from reflection scores.
+   */
+  logSkillUse(row: {
+    skillName: string;
+    sessionKey?: string | null;
+    queryText?: string | null;
+    score?: number | null;
+    agentSlug?: string | null;
+  }): void {
+    try {
+      if (!this._stmtLogSkillUse) {
+        this._stmtLogSkillUse = this.conn.prepare(
+          'INSERT INTO skill_usage (skill_name, session_key, query_text, score, agent_slug) VALUES (?, ?, ?, ?, ?)',
+        );
+      }
+      this._stmtLogSkillUse.run(
+        row.skillName,
+        row.sessionKey ?? null,
+        row.queryText ? row.queryText.slice(0, 200) : null,
+        row.score ?? null,
+        row.agentSlug ?? null,
+      );
+    } catch {
+      // Best-effort — telemetry must never break retrieval.
+    }
+  }
+
+  /** Aggregate skill usage stats keyed by skill_name. */
+  skillUsageStats(windowDays = 7): Map<string, { retrievals: number; lastRetrievedAt: string | null; avgScore: number | null }> {
+    const out = new Map<string, { retrievals: number; lastRetrievedAt: string | null; avgScore: number | null }>();
+    try {
+      const rows = this.conn.prepare(
+        `SELECT skill_name,
+                COUNT(*) AS retrievals,
+                MAX(retrieved_at) AS last_retrieved_at,
+                AVG(score) AS avg_score
+         FROM skill_usage
+         WHERE retrieved_at >= datetime('now', ?)
+         GROUP BY skill_name`,
+      ).all(`-${Math.max(1, Math.floor(windowDays))} days`) as Array<{
+        skill_name: string;
+        retrievals: number;
+        last_retrieved_at: string | null;
+        avg_score: number | null;
+      }>;
+      for (const r of rows) {
+        out.set(r.skill_name, {
+          retrievals: r.retrievals,
+          lastRetrievedAt: r.last_retrieved_at,
+          avgScore: r.avg_score,
+        });
+      }
+    } catch {
+      // Table may not exist yet on legacy DBs — caller should tolerate empty.
+    }
+    return out;
+  }
+
+  /** Number of times a skill has been retrieved (all time). */
+  skillRetrievalCount(skillName: string): number {
+    try {
+      const row = this.conn.prepare('SELECT COUNT(*) AS cnt FROM skill_usage WHERE skill_name = ?').get(skillName) as { cnt: number } | undefined;
+      return row?.cnt ?? 0;
+    } catch { return 0; }
   }
 
   /**

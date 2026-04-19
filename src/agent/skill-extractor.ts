@@ -473,6 +473,66 @@ export function listSkills(agentSlug?: string): Array<{ name: string; title: str
   return results;
 }
 
+// ── Stale skill archival ────────────────────────────────────────────
+
+/**
+ * Move skills that were never used (useCount=0, no usage telemetry rows) and
+ * are older than `olderThanDays` to the `.archive/` subdirectory inside their
+ * skill dir. Returns the list of archived skill names.
+ *
+ * `retrievalCount(name)` is consulted so that even skills whose frontmatter
+ * useCount wasn't bumped (the FS write is best-effort) still get preserved
+ * when the SQLite telemetry shows retrievals.
+ */
+export function archiveStaleSkills(
+  olderThanDays = 90,
+  retrievalCount?: (skillName: string) => number,
+): string[] {
+  ensureDirs();
+  const archived: string[] = [];
+  const cutoffMs = Date.now() - olderThanDays * 24 * 60 * 60 * 1000;
+
+  const dirs: string[] = [];
+  if (existsSync(GLOBAL_SKILLS_DIR)) dirs.push(GLOBAL_SKILLS_DIR);
+  if (existsSync(AGENTS_DIR)) {
+    for (const entry of readdirSync(AGENTS_DIR)) {
+      const candidate = path.join(AGENTS_DIR, entry, 'skills');
+      if (existsSync(candidate)) dirs.push(candidate);
+    }
+  }
+
+  for (const dir of dirs) {
+    const archiveDir = path.join(dir, '.archive');
+    for (const file of readdirSync(dir).filter(f => f.endsWith('.md'))) {
+      const filePath = path.join(dir, file);
+      try {
+        const parsed = matter(readFileSync(filePath, 'utf-8'));
+        const name = file.replace(/\.md$/, '');
+        const useCount = Number(parsed.data.useCount ?? 0);
+        const createdAt = parsed.data.createdAt ? Date.parse(parsed.data.createdAt) : NaN;
+        if (!Number.isFinite(createdAt) || createdAt > cutoffMs) continue;
+        if (useCount > 0) continue;
+        if (retrievalCount && retrievalCount(name) > 0) continue;
+
+        if (!existsSync(archiveDir)) mkdirSync(archiveDir, { recursive: true });
+        const archivePath = path.join(archiveDir, file);
+        copyFileSync(filePath, archivePath);
+        unlinkSync(filePath);
+        // Also move the backup if it exists
+        const bakPath = filePath.replace(/\.md$/, '.md.bak');
+        if (existsSync(bakPath)) {
+          try { copyFileSync(bakPath, archivePath.replace(/\.md$/, '.md.bak')); unlinkSync(bakPath); }
+          catch { /* best-effort */ }
+        }
+        archived.push(name);
+        logger.info({ name, dir }, 'Archived stale skill (unused for ' + olderThanDays + '+ days)');
+      } catch { /* skip malformed */ }
+    }
+  }
+
+  return archived;
+}
+
 // ── Helpers ─────────────────────────────────────────────────────────
 
 function slugify(text: string): string {
