@@ -263,7 +263,23 @@ export async function startTelegram(
   });
 
   // Register notification sender
-  async function telegramNotify(text: string): Promise<void> {
+  async function telegramNotify(
+    text: string,
+    context?: import('../types.js').NotificationContext,
+  ): Promise<void> {
+    // Session-aware routing: send back to the originating chat when known.
+    if (context?.sessionKey) {
+      const chatId = parseTelegramSessionKey(context.sessionKey);
+      if (chatId) {
+        try {
+          await sendChunked(bot, chatId, mdToTelegram(text));
+          return;
+        } catch (err) {
+          logger.warn({ err, sessionKey: context.sessionKey }, 'Telegram session routing failed — falling back to owner');
+        }
+      }
+    }
+
     if (!TELEGRAM_OWNER_ID || ownerIdNum === 0) return;
     try {
       const notifyText = mdToTelegram(text);
@@ -271,6 +287,19 @@ export async function startTelegram(
     } catch (err) {
       logger.error({ err }, 'Failed to send Telegram notification');
     }
+  }
+
+  /**
+   * Parse a Telegram sessionKey and return the chat ID to post in.
+   * Formats supported: telegram:user:{chatId}, telegram:{chatId}.
+   */
+  function parseTelegramSessionKey(sessionKey: string): number | null {
+    const parts = sessionKey.split(':');
+    if (parts[0] !== 'telegram') return null;
+    const raw = parts[1] === 'user' ? parts[2] : parts[1];
+    if (!raw) return null;
+    const n = Number(raw);
+    return Number.isFinite(n) && n !== 0 ? n : null;
   }
 
   dispatcher.register('telegram', telegramNotify);

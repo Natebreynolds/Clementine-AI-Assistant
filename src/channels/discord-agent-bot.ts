@@ -333,6 +333,41 @@ export class AgentBotClient {
     }
   }
 
+  /** Send a DM to a specific user via this agent bot. */
+  async sendDmTo(userId: string, text: string, embed?: EmbedBuilder): Promise<void> {
+    if (this.status !== 'online') throw new Error(`Bot ${this.config.slug} is not online`);
+    const user = await this.client.users.fetch(userId, { force: true });
+    const dmChannel = await user.createDM();
+
+    if (embed) {
+      await dmChannel.send({ embeds: [embed] });
+    } else {
+      const { chunkText } = await import('./discord-utils.js');
+      for (const chunk of chunkText(text, 1900)) {
+        await dmChannel.send(chunk);
+      }
+    }
+  }
+
+  /** Send a message to a specific channel via this agent bot. */
+  async sendToChannel(channelId: string, text: string, embed?: EmbedBuilder): Promise<void> {
+    if (this.status !== 'online') throw new Error(`Bot ${this.config.slug} is not online`);
+    const channel = this.client.channels.cache.get(channelId)
+      ?? await this.client.channels.fetch(channelId).catch(() => null);
+    if (!channel || !('send' in channel)) {
+      throw new Error(`Channel ${channelId} not available to bot ${this.config.slug}`);
+    }
+
+    if (embed) {
+      await (channel as any).send({ embeds: [embed] });
+    } else {
+      const { chunkText } = await import('./discord-utils.js');
+      for (const chunk of chunkText(text, 1900)) {
+        await (channel as any).send(chunk);
+      }
+    }
+  }
+
   /** Send a startup status embed to the owner's DMs. */
   private async sendStartupStatus(): Promise<void> {
     if (!this.config.ownerId) return;

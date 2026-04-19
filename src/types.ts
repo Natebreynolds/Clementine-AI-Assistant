@@ -133,6 +133,8 @@ export type OnToolActivityCallback = (toolName: string, toolInput: Record<string
 
 export interface NotificationContext {
   agentSlug?: string;
+  /** When set, the dispatcher routes the message back to the channel that owns this session. */
+  sessionKey?: string;
 }
 
 export type NotificationSender = (text: string, context?: NotificationContext) => Promise<void>;

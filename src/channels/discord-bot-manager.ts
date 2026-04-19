@@ -218,6 +218,24 @@ export class BotManager {
     await bot.sendNotification(text, embed ?? undefined);
   }
 
+  /** Send a DM to a specific user through the agent's bot. */
+  async sendAsAgentToUser(slug: string, userId: string, text: string): Promise<void> {
+    const bot = this.bots.get(slug);
+    if (!bot) throw new Error(`No bot for agent '${slug}'`);
+
+    const embed = formatCronEmbed(text);
+    await bot.sendDmTo(userId, text, embed ?? undefined);
+  }
+
+  /** Send a message to a specific channel through the agent's bot. */
+  async sendAsAgentToChannel(slug: string, channelId: string, text: string): Promise<void> {
+    const bot = this.bots.get(slug);
+    if (!bot) throw new Error(`No bot for agent '${slug}'`);
+
+    const embed = formatCronEmbed(text);
+    await bot.sendToChannel(channelId, text, embed ?? undefined);
+  }
+
   /**
    * Deliver a team message to an agent's bot — posts the message visibly
    * in the bot's channel and triggers the agent to process and respond.

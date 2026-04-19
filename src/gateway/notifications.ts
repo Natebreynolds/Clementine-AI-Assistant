@@ -15,6 +15,16 @@ const logger = pino({ name: 'clementine.notifications' });
 /** Safety cap — prevent runaway messages, but each channel handles its own chunking/limits. */
 const MAX_MESSAGE_LENGTH = 8000;
 
+/** Map a sessionKey prefix to the registered channel name that owns it. */
+function channelForSessionKey(sessionKey: string): string | null {
+  if (sessionKey.startsWith('discord:')) return 'discord';
+  if (sessionKey.startsWith('slack:')) return 'slack';
+  if (sessionKey.startsWith('telegram:')) return 'telegram';
+  if (sessionKey.startsWith('whatsapp:')) return 'whatsapp';
+  if (sessionKey.startsWith('dashboard:')) return 'dashboard';
+  return null;
+}
+
 export interface SendResult {
   delivered: boolean;
   channelErrors: Record<string, string>;
@@ -73,10 +83,20 @@ export class NotificationDispatcher {
       ? text.slice(0, MAX_MESSAGE_LENGTH - 20) + '\n\n_(truncated)_'
       : text;
 
+    // If sessionKey is set, route only to the channel that owns it.
+    // Fan out to all channels only when no originating channel is known.
+    const targetChannel = context?.sessionKey ? channelForSessionKey(context.sessionKey) : null;
+    const scopedSenders: Array<[string, NotificationSender]> = [];
+    if (targetChannel && this.senders.has(targetChannel)) {
+      scopedSenders.push([targetChannel, this.senders.get(targetChannel)!]);
+    } else {
+      for (const entry of this.senders) scopedSenders.push(entry);
+    }
+
     const channelErrors: Record<string, string> = {};
     let anySuccess = false;
 
-    for (const [name, sender] of this.senders) {
+    for (const [name, sender] of scopedSenders) {
       try {
         await sender(capped, context);
         anySuccess = true;

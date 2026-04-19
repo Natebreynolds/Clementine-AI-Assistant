@@ -216,13 +216,13 @@ export class Gateway {
     try {
       const agentReply = await this.handleMessage(sessionKey, syntheticPrompt);
       if (agentReply?.trim()) {
-        await this._dispatcher?.send(agentReply);
+        await this._dispatcher?.send(agentReply, { sessionKey });
         logger.info({ sessionKey }, 'Deep mode result delivered via agent follow-up + dispatcher');
       }
     } catch (err) {
       logger.warn({ err, sessionKey }, 'Deep mode agent follow-up failed — using raw fallback');
       if (rawFallback.trim()) {
-        await this._dispatcher?.send(rawFallback.slice(0, 1500))
+        await this._dispatcher?.send(rawFallback.slice(0, 1500), { sessionKey })
           .catch(async (e) => {
             // Both paths failed — surface it instead of swallowing at debug level.
             logger.warn({ err: e, sessionKey }, 'Deep mode fallback delivery failed — persisting to daily note');

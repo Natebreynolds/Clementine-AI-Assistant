@@ -216,7 +216,17 @@ export async function startSlack(
   });
 
   // Register notification sender
-  async function slackNotify(text: string): Promise<void> {
+  async function slackNotify(
+    text: string,
+    context?: import('../types.js').NotificationContext,
+  ): Promise<void> {
+    // Session-aware routing: post back to the originating channel if known.
+    if (context?.sessionKey) {
+      const routed = await trySlackSessionRouting(context.sessionKey, text);
+      if (routed) return;
+      // Fall back to owner DM below
+    }
+
     if (!SLACK_OWNER_USER_ID) return;
     try {
       const dm = await app.client.conversations.open({ users: SLACK_OWNER_USER_ID });
@@ -227,6 +237,47 @@ export async function startSlack(
     } catch (err) {
       logger.error({ err }, 'Failed to send Slack notification');
     }
+  }
+
+  /**
+   * Route a notification back to the Slack channel/thread identified by sessionKey.
+   * Returns true on success.
+   *
+   * Session key formats:
+   *   slack:user:{userId}                          → DM to user
+   *   slack:channel:{channelId}:{userId}           → post in channel
+   *   slack:channel:{channelId}:{slug}:{userId}    → post in channel (agent-scoped chat)
+   *   slack:dm:{userId}                            → DM to user
+   *   slack:agent:{slug}:{userId}                  → DM to user (agent-scoped)
+   */
+  async function trySlackSessionRouting(sessionKey: string, text: string): Promise<boolean> {
+    const parts = sessionKey.split(':');
+    if (parts[0] !== 'slack' || parts.length < 3) return false;
+    const kind = parts[1];
+
+    try {
+      if ((kind === 'user' || kind === 'dm') && parts[2]) {
+        const dm = await app.client.conversations.open({ users: parts[2] });
+        const channelId = (dm.channel as { id: string })?.id;
+        if (!channelId) return false;
+        await sendChunkedSlack(app.client, channelId, mdToSlack(text));
+        return true;
+      }
+      if (kind === 'channel' && parts[2]) {
+        await sendChunkedSlack(app.client, parts[2], mdToSlack(text));
+        return true;
+      }
+      if (kind === 'agent' && parts[3]) {
+        const dm = await app.client.conversations.open({ users: parts[3] });
+        const channelId = (dm.channel as { id: string })?.id;
+        if (!channelId) return false;
+        await sendChunkedSlack(app.client, channelId, mdToSlack(text));
+        return true;
+      }
+    } catch (err) {
+      logger.warn({ err, sessionKey }, 'Slack session routing failed');
+    }
+    return false;
   }
 
   dispatcher.register('slack', slackNotify);

@@ -1932,7 +1932,147 @@ export async function startDiscord(
   // cron/heartbeat notifications don't depend on a fresh API fetch.
   let cachedDmChannel: Message['channel'] | null = null;
 
+  /**
+   * Send `text` to a specific channel via the main bot. Returns true on success.
+   * Caller should fall back to default delivery on failure.
+   */
+  async function sendToMainBotChannel(channelId: string, text: string): Promise<boolean> {
+    try {
+      const channel = client.channels.cache.get(channelId)
+        ?? await client.channels.fetch(channelId).catch(() => null);
+      if (!channel || !('send' in channel)) return false;
+      const embed = formatCronEmbed(text);
+      if (embed) {
+        await (channel as any).send({ embeds: [embed] });
+      } else {
+        for (const chunk of chunkText(text, 1900)) {
+          await (channel as any).send(chunk);
+        }
+      }
+      return true;
+    } catch (err) {
+      logger.warn({ err, channelId }, 'Main bot channel send failed');
+      return false;
+    }
+  }
+
+  /** Send a DM to a specific user via the main bot. Returns true on success. */
+  async function sendMainBotDm(userId: string, text: string): Promise<boolean> {
+    try {
+      const user = await client.users.fetch(userId, { force: true });
+      const dmChannel = await user.createDM();
+      const embed = formatCronEmbed(text);
+      if (embed) {
+        await dmChannel.send({ embeds: [embed] });
+      } else {
+        for (const chunk of chunkText(text, 1900)) {
+          await dmChannel.send(chunk);
+        }
+      }
+      return true;
+    } catch (err) {
+      logger.warn({ err, userId }, 'Main bot DM send failed');
+      return false;
+    }
+  }
+
+  /**
+   * Route a notification back to the channel/user identified by sessionKey.
+   * Returns true when delivered; false if the caller should fall back to default routing.
+   *
+   * Session key formats:
+   *   discord:user:{userId}                              → main bot DM to user
+   *   discord:channel:{channelId}:{userId}               → main bot, send in channel
+   *   discord:channel:{channelId}:{slug}:{userId}        → agent bot for {slug}, send in channel
+   *   discord:agent:{slug}:{userId}                      → agent bot DM to user
+   *   discord:member:{channelId}:{userId}                → agent bot that owns {channelId}, send in channel
+   *   discord:member:{channelId}:{slug}:{userId}         → agent bot for {slug}, send in channel
+   *   discord:member-dm:{slug}:{userId}                  → agent bot DM to non-owner user
+   */
+  async function trySessionRouting(sessionKey: string, text: string): Promise<boolean> {
+    const parts = sessionKey.split(':');
+    if (parts[0] !== 'discord' || parts.length < 3) return false;
+
+    const kind = parts[1];
+
+    try {
+      if (kind === 'user' && parts[2]) {
+        return await sendMainBotDm(parts[2], text);
+      }
+
+      if (kind === 'channel' && parts[2]) {
+        const channelId = parts[2];
+        // discord:channel:{channelId}:{slug}:{userId} → agent bot
+        if (parts.length >= 5 && botManager?.hasBot(parts[3])) {
+          try {
+            await botManager.sendAsAgentToChannel(parts[3], channelId, text);
+            return true;
+          } catch (err) {
+            logger.warn({ err, slug: parts[3], channelId }, 'Agent bot channel send failed — trying main bot');
+          }
+        }
+        return await sendToMainBotChannel(channelId, text);
+      }
+
+      if (kind === 'agent' && parts[2] && parts[3]) {
+        const slug = parts[2];
+        const userId = parts[3];
+        if (botManager?.hasBot(slug)) {
+          try {
+            await botManager.sendAsAgentToUser(slug, userId, text);
+            return true;
+          } catch (err) {
+            logger.warn({ err, slug, userId }, 'Agent bot DM send failed');
+            return false;
+          }
+        }
+        return false;
+      }
+
+      if (kind === 'member' && parts[2]) {
+        const channelId = parts[2];
+        // Figure out which agent owns this channel
+        const slug = parts.length >= 5 ? parts[3] : botManager?.getAgentForChannel(channelId) ?? null;
+        if (slug && botManager?.hasBot(slug)) {
+          try {
+            await botManager.sendAsAgentToChannel(slug, channelId, text);
+            return true;
+          } catch (err) {
+            logger.warn({ err, slug, channelId }, 'Agent bot channel send failed for member session');
+          }
+        }
+        return await sendToMainBotChannel(channelId, text);
+      }
+
+      if (kind === 'member-dm' && parts[2] && parts[3]) {
+        const slug = parts[2];
+        const userId = parts[3];
+        if (botManager?.hasBot(slug)) {
+          try {
+            await botManager.sendAsAgentToUser(slug, userId, text);
+            return true;
+          } catch (err) {
+            logger.warn({ err, slug, userId }, 'Agent bot DM send failed for member-dm session');
+            return false;
+          }
+        }
+        return false;
+      }
+    } catch (err) {
+      logger.warn({ err, sessionKey }, 'Session routing failed');
+    }
+
+    return false;
+  }
+
   async function discordNotify(text: string, context?: NotificationContext): Promise<void> {
+    // Session-aware routing: send back to the originating channel/user when we know it.
+    if (context?.sessionKey) {
+      const routed = await trySessionRouting(context.sessionKey, text);
+      if (routed) return;
+      // Fall through to legacy routing if session routing couldn't deliver
+    }
+
     // Route to agent bot if available
     if (context?.agentSlug && botManager?.hasBot(context.agentSlug)) {
       try {
