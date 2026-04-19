@@ -30,6 +30,31 @@ const CACHE_FILE = path.join(BASE_DIR, 'cron', 'failure-diagnostics.json');
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 const RUNS_DIR = path.join(BASE_DIR, 'cron', 'runs');
 
+/**
+ * Fields safe for one-click auto-apply. Limited to simple scalar YAML
+ * fields on cron jobs — nothing multi-line (prompt, pre_check, context,
+ * success_criteria), nothing structural (schedule edits would re-schedule
+ * a running job, handled manually).
+ */
+export const EDITABLE_FIELDS = new Set([
+  'tier',
+  'mode',
+  'max_hours',
+  'max_turns',
+  'max_retries',
+  'enabled',
+  'agentSlug',
+  'work_dir',
+  'model',
+  'always_deliver',
+  'after',
+  'timeout_ms',
+]);
+
+export type FixOperation =
+  | { op: 'set'; field: string; value: string | number | boolean }
+  | { op: 'remove'; field: string };
+
 export interface Diagnosis {
   rootCause: string;
   confidence: 'high' | 'medium' | 'low';
@@ -37,6 +62,16 @@ export interface Diagnosis {
     type: 'config_change' | 'prompt_change' | 'agent_scope' | 'disable' | 'credential_refresh' | 'escalate_to_owner';
     details: string;
     diff?: string;
+    /**
+     * When present, the fix can be applied with one click via the
+     * /api/cron/broken-jobs/:jobName/apply-fix endpoint. Operations are
+     * silently filtered against EDITABLE_FIELDS — a proposal that mixes
+     * safe and unsafe edits gets the unsafe ones dropped.
+     */
+    autoApply?: {
+      agentSlug?: string;
+      operations: FixOperation[];
+    };
   };
   riskLevel: 'low' | 'medium' | 'high';
   generatedAt: string;
@@ -183,6 +218,21 @@ function buildPrompt(broken: BrokenJob, jobDef: string | null, agentProfile: str
     '- **Output preview contains BLOCKED / "no local bash" / "permission denied"** → agent picked the wrong tool. Propose either scoping the job to an agent whose allowedTools excludes the bad MCP, or adding explicit tool-choice guidance in the prompt.',
     '- **No clear pattern** → escalate_to_owner with what you would need to know.',
     '',
+    '## Auto-apply contract',
+    '',
+    'When (and ONLY when) the fix is a simple edit to one of these scalar fields — tier, mode, max_hours, max_turns, max_retries, enabled, agentSlug, work_dir, model, always_deliver, after, timeout_ms — also populate `proposedFix.autoApply`. The owner can one-click approve it from the dashboard.',
+    '',
+    'For multi-line fields (prompt, pre_check, context, success_criteria), or for credential refreshes, or any change you are not very confident about: OMIT autoApply entirely. The owner will handle those manually.',
+    '',
+    `If the job is agent-scoped (job name includes ":"), set autoApply.agentSlug to the part BEFORE the colon. Otherwise omit it (global CRON.md).`,
+    '',
+    'Operations use the shape { "op": "set", "field": "<name>", "value": <scalar> } or { "op": "remove", "field": "<name>" }. Values are strings, numbers, or booleans.',
+    '',
+    'Examples:',
+    '- Remove unleashed mode + its companion: operations: [{"op":"remove","field":"mode"}, {"op":"remove","field":"max_hours"}, {"op":"set","field":"max_turns","value":25}]',
+    '- Scope a broken global job to Ross\'s profile: operations: [{"op":"set","field":"agentSlug","value":"ross-the-sdr"}]',
+    '- Bump maxTurns on an under-resourced job: operations: [{"op":"set","field":"max_turns","value":10}]',
+    '',
     '## Output schema (JSON only, no markdown fences):',
     '{',
     '  "rootCause": "1-2 sentences explaining WHY the job is failing, referencing specific fields or error patterns from the CURRENT config",',
@@ -190,7 +240,8 @@ function buildPrompt(broken: BrokenJob, jobDef: string | null, agentProfile: str
     '  "proposedFix": {',
     '    "type": "config_change|prompt_change|agent_scope|disable|credential_refresh|escalate_to_owner",',
     '    "details": "prose description of the fix, citing the exact field(s) to change",',
-    '    "diff": "optional: exact before/after diff if it is a small config edit"',
+    '    "diff": "optional: exact before/after diff",',
+    '    "autoApply": "optional: { agentSlug?, operations: [...] } — ONLY for simple scalar-field edits on the allowlist"',
     '  },',
     '  "riskLevel": "low|medium|high"',
     '}',
@@ -203,8 +254,15 @@ function parseResponse(raw: string): Diagnosis | null {
     // first top-level {...} object.
     const match = raw.match(/\{[\s\S]*\}/);
     if (!match) return null;
-    const parsed = JSON.parse(match[0]) as Partial<Diagnosis>;
+    const parsed = JSON.parse(match[0]) as Partial<Diagnosis> & {
+      proposedFix?: Partial<Diagnosis['proposedFix']> & {
+        autoApply?: { agentSlug?: unknown; operations?: unknown };
+      };
+    };
     if (!parsed.rootCause || !parsed.proposedFix) return null;
+
+    const autoApply = sanitizeAutoApply(parsed.proposedFix.autoApply);
+
     return {
       rootCause: String(parsed.rootCause).slice(0, 500),
       confidence: (parsed.confidence ?? 'medium') as Diagnosis['confidence'],
@@ -212,6 +270,7 @@ function parseResponse(raw: string): Diagnosis | null {
         type: (parsed.proposedFix.type ?? 'escalate_to_owner') as Diagnosis['proposedFix']['type'],
         details: String(parsed.proposedFix.details ?? '').slice(0, 800),
         diff: parsed.proposedFix.diff ? String(parsed.proposedFix.diff).slice(0, 1000) : undefined,
+        ...(autoApply ? { autoApply } : {}),
       },
       riskLevel: (parsed.riskLevel ?? 'medium') as Diagnosis['riskLevel'],
       generatedAt: new Date().toISOString(),
@@ -220,6 +279,40 @@ function parseResponse(raw: string): Diagnosis | null {
     logger.warn({ err }, 'Failed to parse diagnostic JSON');
     return null;
   }
+}
+
+/**
+ * Strictly validate and filter autoApply. Drops ops on non-allowlisted fields
+ * silently (rather than rejecting the whole diagnosis). Returns null if
+ * nothing valid remains.
+ */
+function sanitizeAutoApply(raw: unknown): NonNullable<Diagnosis['proposedFix']['autoApply']> | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const obj = raw as { agentSlug?: unknown; operations?: unknown };
+  if (!Array.isArray(obj.operations)) return null;
+
+  const operations: FixOperation[] = [];
+  for (const op of obj.operations) {
+    if (!op || typeof op !== 'object') continue;
+    const raw = op as { op?: unknown; field?: unknown; value?: unknown };
+    if (typeof raw.field !== 'string') continue;
+    if (!EDITABLE_FIELDS.has(raw.field)) continue;
+
+    if (raw.op === 'remove') {
+      operations.push({ op: 'remove', field: raw.field });
+    } else if (raw.op === 'set') {
+      const v = raw.value;
+      if (typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean') {
+        operations.push({ op: 'set', field: raw.field, value: v });
+      }
+    }
+  }
+  if (operations.length === 0) return null;
+
+  const agentSlug = typeof obj.agentSlug === 'string' && /^[a-z0-9-]+$/i.test(obj.agentSlug)
+    ? obj.agentSlug
+    : undefined;
+  return agentSlug ? { agentSlug, operations } : { operations };
 }
 
 /**

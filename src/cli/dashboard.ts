@@ -2063,6 +2063,58 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
     }
   });
 
+  /**
+   * Apply the cached diagnosis's autoApply operations to the right CRON.md.
+   * Strict safety: requires a fresh diagnosis, requires autoApply present,
+   * requires riskLevel == 'low'. Otherwise returns 409 with a reason.
+   */
+  app.post('/api/cron/broken-jobs/:jobName/apply-fix', async (req, res) => {
+    const jobName = req.params.jobName;
+    try {
+      const { getDiagnosisIfFresh, clearDiagnosis } = await import('../gateway/failure-diagnostics.js');
+      const { applyFix } = await import('../gateway/fix-applier.js');
+
+      const d = getDiagnosisIfFresh(jobName);
+      if (!d) {
+        res.status(404).json({ error: 'No fresh diagnosis for this job. Wait for the next sweep.' });
+        return;
+      }
+      if (!d.proposedFix.autoApply) {
+        res.status(409).json({ error: 'Diagnosis has no auto-applicable operations — review manually.' });
+        return;
+      }
+      if (d.riskLevel !== 'low') {
+        res.status(409).json({ error: `riskLevel is '${d.riskLevel}' — only 'low' is auto-apply-able.` });
+        return;
+      }
+
+      const dryRun = req.body?.dryRun === true;
+      const result = applyFix(jobName, d.proposedFix.autoApply, { dryRun });
+
+      if (result.ok && !dryRun) {
+        // Clear the cached diagnosis so the next sweep re-evaluates with the
+        // new config. The existing CRON.md watcher will reload cron jobs
+        // within a couple of seconds.
+        clearDiagnosis(jobName);
+      }
+
+      res.status(result.ok ? 200 : 400).json(result);
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  /** Dismiss a diagnosis without applying — clears the cached result. */
+  app.post('/api/cron/broken-jobs/:jobName/dismiss-diagnosis', async (req, res) => {
+    try {
+      const { clearDiagnosis } = await import('../gateway/failure-diagnostics.js');
+      clearDiagnosis(req.params.jobName);
+      res.json({ ok: true });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
   // ── Cron trace viewer ──────────────────────────────────────────
 
   app.get('/api/cron/traces/:job', (req, res) => {
@@ -16128,6 +16180,49 @@ async function expandSkill(name) {
   } catch(e) { toast('Failed to load skill', 'error'); }
 }
 
+async function applyBrokenJobFix(jobName) {
+  try {
+    // First: dry-run to get the actual diff to show in the confirm dialog
+    var dryRes = await apiJson('POST', '/api/cron/broken-jobs/' + encodeURIComponent(jobName) + '/apply-fix', { dryRun: true });
+    if (!dryRes || !dryRes.ok) {
+      toast('Cannot apply: ' + ((dryRes && (dryRes.message || dryRes.error)) || 'unknown error'), 'error');
+      return;
+    }
+    var diffPreview = (dryRes.diff || '(no diff)').slice(0, 1200);
+    var msg = 'Apply this fix to ' + jobName + '?\n\n'
+      + 'File: ' + (dryRes.file || 'unknown') + '\n'
+      + 'Operations: ' + (dryRes.appliedOps || []).length + '\n\n'
+      + diffPreview
+      + '\n\nA .bak will be written. The daemon auto-reloads; the next run will be fix-verified.';
+    if (!confirm(msg)) return;
+
+    var res = await apiJson('POST', '/api/cron/broken-jobs/' + encodeURIComponent(jobName) + '/apply-fix', {});
+    if (res && res.ok) {
+      toast('Applied ' + (res.appliedOps || []).length + ' op(s) to ' + jobName, 'success');
+      refreshBrokenJobs();
+    } else {
+      toast('Apply failed: ' + ((res && (res.message || res.error)) || 'unknown'), 'error');
+    }
+  } catch (e) {
+    toast('Apply failed: ' + String(e), 'error');
+  }
+}
+
+async function dismissBrokenJobDiagnosis(jobName) {
+  if (!confirm('Clear the cached diagnosis for ' + jobName + '? It will be re-diagnosed on the next sweep if still failing.')) return;
+  try {
+    var res = await apiJson('POST', '/api/cron/broken-jobs/' + encodeURIComponent(jobName) + '/dismiss-diagnosis', {});
+    if (res && res.ok) {
+      toast('Diagnosis dismissed', 'info');
+      refreshBrokenJobs();
+    } else {
+      toast('Failed to dismiss: ' + ((res && res.error) || 'unknown'), 'error');
+    }
+  } catch (e) {
+    toast('Failed to dismiss: ' + String(e), 'error');
+  }
+}
+
 async function refreshBrokenJobs() {
   try {
     var r = await apiFetch('/api/cron/broken-jobs');
@@ -16168,7 +16263,8 @@ async function refreshBrokenJobs() {
         ? '<span class="badge badge-blue" style="font-size:10px">' + esc(j.agentSlug) + '</span>'
         : '';
 
-      // Diagnosis block — root cause + proposed fix + diff preview.
+      // Diagnosis block — root cause + proposed fix + diff preview +
+      // Apply/Dismiss buttons when autoApply is present and risk is low.
       var diagnosisHtml = '';
       if (j.diagnosis) {
         var riskColor = j.diagnosis.riskLevel === 'high' ? '#ef4444'
@@ -16181,6 +16277,27 @@ async function refreshBrokenJobs() {
           diffHtml = '<pre style="font-size:11px;background:#0f172a;color:#e2e8f0;padding:8px;border-radius:4px;margin:6px 0 0;white-space:pre-wrap;word-break:break-word;max-height:200px;overflow-y:auto">'
             + esc(j.diagnosis.proposedFix.diff) + '</pre>';
         }
+
+        var canAutoApply = !!j.diagnosis.proposedFix.autoApply
+          && j.diagnosis.riskLevel === 'low';
+        var actionsHtml = '';
+        if (canAutoApply) {
+          var opCount = (j.diagnosis.proposedFix.autoApply.operations || []).length;
+          actionsHtml = '<div style="margin-top:10px;display:flex;gap:8px;align-items:center">'
+            + '<button onclick="applyBrokenJobFix(\\x27' + esc(j.jobName) + '\\x27)" '
+            + 'style="background:var(--accent);border:1px solid var(--accent);color:white;padding:4px 12px;border-radius:4px;font-size:11px;cursor:pointer">'
+            + 'Apply fix (' + opCount + ' op' + (opCount === 1 ? '' : 's') + ')</button>'
+            + '<button onclick="dismissBrokenJobDiagnosis(\\x27' + esc(j.jobName) + '\\x27)" '
+            + 'style="background:none;border:1px solid var(--border);color:var(--text-secondary);padding:4px 12px;border-radius:4px;font-size:11px;cursor:pointer">'
+            + 'Dismiss</button>'
+            + '<span style="font-size:10px;color:var(--text-muted);margin-left:auto">auto-verified after next run</span>'
+            + '</div>';
+        } else if (j.diagnosis.proposedFix.autoApply && j.diagnosis.riskLevel !== 'low') {
+          actionsHtml = '<div style="margin-top:10px;font-size:11px;color:var(--text-muted);font-style:italic">'
+            + 'Not auto-applicable (risk: ' + esc(j.diagnosis.riskLevel) + ') — review manually'
+            + '</div>';
+        }
+
         diagnosisHtml = '<div style="margin-top:10px;padding:10px;border-left:3px solid ' + riskColor
           + ';background:var(--bg-tertiary);border-radius:4px">'
           + '<div style="font-size:12px;margin-bottom:4px"><strong>Root cause' + confLabel + ':</strong> '
@@ -16188,6 +16305,7 @@ async function refreshBrokenJobs() {
           + '<div style="font-size:12px"><strong>Proposed fix:</strong> '
           + esc(j.diagnosis.proposedFix.details) + '</div>'
           + diffHtml
+          + actionsHtml
           + '<div style="font-size:10px;color:var(--text-muted);margin-top:6px">'
           + esc(j.diagnosis.proposedFix.type) + ' \\u00b7 ' + esc(j.diagnosis.riskLevel) + ' risk \\u00b7 diagnosed ' + timeAgo(j.diagnosis.generatedAt)
           + '</div>'
