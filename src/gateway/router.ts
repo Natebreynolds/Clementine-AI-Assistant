@@ -1109,12 +1109,36 @@ export class Gateway {
           }
 
           // ── Deep mode detection ─────────────────────────────────────
-          // Agent proposes background execution for complex tasks
-          const deepMatch = response?.match(/^\[DEEP_MODE:\s*(.+?)\]\s*/s);
+          // Agent proposes background execution for complex tasks.
+          //
+          // Syntax:
+          //   [DEEP_MODE: task description]
+          //   [DEEP_MODE(work_dir=/abs/path): task description]   ← NEW
+          //
+          // The optional work_dir= parameter runs the unleashed task in a
+          // different project directory. Useful when the task belongs to
+          // a Claude Code project with its own CLAUDE.md / slash commands
+          // (e.g. the proposal-builder project for audit-queue approvals).
+          const deepMatch = response?.match(/^\[DEEP_MODE(?:\(([^)]+)\))?:\s*(.+?)\]\s*/s);
           if (deepMatch) {
-            const taskDesc = deepMatch[1].trim() || text;
-            const ack = response.replace(/^\[DEEP_MODE:[^\]]*\]\s*/s, '').trim();
+            const paramsStr = deepMatch[1] ?? '';
+            const taskDesc = deepMatch[2].trim() || text;
+            const ack = response.replace(/^\[DEEP_MODE(?:\([^)]*\))?:[^\]]*\]\s*/s, '').trim();
             logger.info({ sessionKey, task: taskDesc }, 'Deep mode triggered by agent');
+
+            // Parse optional work_dir parameter — strict: must be an absolute
+            // path and must exist. Anything else falls back to default.
+            let deepWorkDir: string | undefined;
+            const wdMatch = paramsStr.match(/work_dir=([^,\s]+)/);
+            if (wdMatch) {
+              const candidate = wdMatch[1]!.trim().replace(/^["']|["']$/g, '');
+              if (path.isAbsolute(candidate) && existsSync(candidate)) {
+                deepWorkDir = candidate;
+                logger.info({ sessionKey, workDir: deepWorkDir }, 'Deep mode using custom work_dir');
+              } else {
+                logger.warn({ sessionKey, candidate }, 'Deep mode work_dir rejected (not absolute or does not exist)');
+              }
+            }
 
             const currentSess = this.getSession(sessionKey);
             const jobName = `deep-${Date.now()}`;
@@ -1124,11 +1148,11 @@ export class Gateway {
             this.assistant.runUnleashedTask(
               jobName,
               `${taskDesc}\n\nOriginal request: ${text}`,
-              2,           // tier 2 (Bash/Write/Edit enabled)
-              undefined,   // default maxTurns (75/phase)
-              undefined,   // default model
-              undefined,   // default workDir
-              1,           // maxHours
+              2,               // tier 2 (Bash/Write/Edit enabled)
+              undefined,       // default maxTurns (75/phase)
+              undefined,       // default model
+              deepWorkDir,     // honors [DEEP_MODE(work_dir=...)] if provided
+              1,               // maxHours
             ).then(async (result) => {
               logger.info({ sessionKey, jobName, resultLen: result?.length ?? 0 }, 'Deep mode task completed');
               if (result && result !== '__NOTHING__') {
