@@ -14,11 +14,12 @@
  * claims the dashboard's manual verify/fail path covers the gap.
  */
 
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import path from 'node:path';
 import pino from 'pino';
 
 import { BASE_DIR, MEMORY_DB_PATH, VAULT_DIR } from '../config.js';
+import type { Gateway } from './router.js';
 
 const logger = pino({ name: 'clementine.claim-tracker' });
 
@@ -158,6 +159,45 @@ const PATTERNS: Pattern[] = [
 ];
 
 /**
+ * In-memory queue of DMs that regex-extraction missed but that look like
+ * they might contain claims (long enough, user-facing session). The
+ * heartbeat sweep drains this queue and runs the LLM fallback.
+ *
+ * Bounded to prevent memory growth — oldest entries are evicted.
+ */
+const MAX_PENDING_LLM = 20;
+const pendingLLMExtraction: Array<{
+  text: string;
+  sessionKey: string | null;
+  agentSlug: string | null;
+  queuedAt: number;
+}> = [];
+
+function enqueueForLLM(text: string, sessionKey: string | null, agentSlug: string | null): void {
+  // De-dup by text hash within the queue — don't re-enqueue the same DM.
+  const hash = sha1(text);
+  if (pendingLLMExtraction.some(e => sha1(e.text) === hash)) return;
+  pendingLLMExtraction.push({ text, sessionKey, agentSlug, queuedAt: Date.now() });
+  while (pendingLLMExtraction.length > MAX_PENDING_LLM) pendingLLMExtraction.shift();
+}
+
+function sha1(s: string): string {
+  return createHash('sha1').update(s).digest('hex');
+}
+
+/** Should a non-matching DM be considered for LLM fallback? */
+function isLLMFallbackCandidate(text: string, sessionKey: string | null): boolean {
+  if (!sessionKey) return false;
+  if (text.length < 100) return false;
+  // Owner-facing DMs only. Skip heartbeat check-ins (they have their own
+  // gate) and skip cron notification messages that are the system talking
+  // about itself.
+  if (!sessionKey.startsWith('discord:') && !sessionKey.startsWith('slack:') && !sessionKey.startsWith('telegram:')) return false;
+  if (text.startsWith('**[') && text.includes('check-in]')) return false;
+  return true;
+}
+
+/**
  * Extract claims from a message. Returns empty array if nothing matched.
  * Caller supplies sessionKey for traceability. Never throws.
  */
@@ -197,7 +237,125 @@ export function extractClaims(text: string, sessionKey?: string | null, agentSlu
     });
   }
 
+  // Regex missed this DM but it looks like it could contain a claim the
+  // regex patterns can't catch ("Got that done", "Sent it, you should see
+  // it in a minute"). Queue for LLM fallback on the next heartbeat.
+  if (out.length === 0 && isLLMFallbackCandidate(text, sessionKey ?? null)) {
+    enqueueForLLM(text, sessionKey ?? null, agentSlug ?? null);
+  }
+
   return out;
+}
+
+/**
+ * Drain the LLM-fallback queue: pick up to N enqueued DMs, ask Haiku
+ * to extract claims via the same shape the regex patterns use, persist
+ * any found. Best-effort — errors just leave the queue unchanged for
+ * the next sweep.
+ */
+export async function drainLLMFallback(gateway: Gateway, maxPerSweep = 3): Promise<number> {
+  let drained = 0;
+  const batch = pendingLLMExtraction.splice(0, Math.min(maxPerSweep, pendingLLMExtraction.length));
+
+  for (const item of batch) {
+    try {
+      const claims = await llmExtractClaims(item.text, gateway);
+      if (claims.length === 0) continue;
+      const toRecord = claims.map(c => ({
+        id: randomBytes(6).toString('hex'),
+        sessionKey: item.sessionKey,
+        messageSnippet: item.text.slice(0, 400),
+        claimType: c.claimType,
+        subject: c.subject,
+        dueAt: c.dueAt,
+        verifyStrategy: c.verifyStrategy,
+        agentSlug: item.agentSlug,
+      }));
+      await recordClaims(toRecord);
+      drained += claims.length;
+    } catch (err) {
+      logger.debug({ err }, 'LLM fallback extraction failed for one DM');
+    }
+  }
+
+  return drained;
+}
+
+async function llmExtractClaims(text: string, gateway: Gateway): Promise<Array<{
+  claimType: ClaimType;
+  subject: string;
+  dueAt: string | null;
+  verifyStrategy: VerifyStrategy;
+}>> {
+  const prompt = [
+    'You are analyzing a chat message Clementine (an AI assistant) just sent to her owner. Did Clementine make any commitments, promises, or claims about something she did or will do?',
+    '',
+    'Only extract claims where there\'s a clear, concrete action. Do NOT extract:',
+    '- Status updates ("inbox has 5 messages")',
+    '- Questions ("Should I proceed?")',
+    '- Suggestions ("You might want to check X")',
+    '- Routine check-ins or greetings',
+    '',
+    'DO extract:',
+    '- "I scheduled X" / "I added Y to your tasks" / "I fixed Z"',
+    '- "I\'ll send X at Ypm" / "Will run Y tomorrow"',
+    '- "Sent email to X" / "Posted to #channel"',
+    '',
+    '## Message:',
+    text.slice(0, 1500),
+    '',
+    'Output a JSON object only (no fences):',
+    '{',
+    '  "claims": [',
+    '    {',
+    '      "claimType": "scheduled|fixed|will_do|sent|added",',
+    '      "subject": "short description of what (the noun phrase)",',
+    '      "dueAt": "ISO timestamp if a specific time was mentioned, else null"',
+    '    }',
+    '  ]',
+    '}',
+    'Empty array if no real commitments.',
+  ].join('\n');
+
+  let raw: string;
+  try {
+    raw = await gateway.handleCronJob(
+      'llm-claim-extract',
+      prompt,
+      1, // tier 1
+      3, // tight maxTurns
+      'haiku',
+    );
+  } catch {
+    return [];
+  }
+
+  try {
+    const m = raw.match(/\{[\s\S]*\}/);
+    if (!m) return [];
+    const parsed = JSON.parse(m[0]) as { claims?: Array<{ claimType?: unknown; subject?: unknown; dueAt?: unknown }> };
+    const claims = parsed.claims ?? [];
+    const out: Array<{ claimType: ClaimType; subject: string; dueAt: string | null; verifyStrategy: VerifyStrategy }> = [];
+    const validTypes: ClaimType[] = ['scheduled', 'fixed', 'will_do', 'sent', 'added'];
+
+    for (const c of claims) {
+      if (typeof c.subject !== 'string' || !c.subject.trim()) continue;
+      const type = typeof c.claimType === 'string' && validTypes.includes(c.claimType as ClaimType)
+        ? (c.claimType as ClaimType)
+        : 'unknown';
+      if (type === 'unknown') continue;
+      const dueAt = typeof c.dueAt === 'string' && /^\d{4}-\d{2}-\d{2}T/.test(c.dueAt) ? c.dueAt : null;
+      out.push({
+        claimType: type,
+        subject: c.subject.trim().slice(0, 200),
+        dueAt,
+        verifyStrategy: type === 'scheduled' ? 'cron_run_check' : 'manual',
+      });
+    }
+    return out;
+  } catch {
+    return [];
+  }
 }
 
 // ── Persistence ──────────────────────────────────────────────────────

@@ -467,6 +467,17 @@ export class MemoryStore {
       CREATE INDEX IF NOT EXISTS idx_claims_status ON claims(status, extracted_at DESC);
       CREATE INDEX IF NOT EXISTS idx_claims_due ON claims(due_at) WHERE status = 'pending';
       CREATE INDEX IF NOT EXISTS idx_claims_extracted ON claims(extracted_at DESC);
+
+      CREATE TABLE IF NOT EXISTS graded_runs (
+        job_name TEXT NOT NULL,
+        started_at TEXT NOT NULL,
+        passed INTEGER NOT NULL,
+        score INTEGER NOT NULL,
+        reasoning TEXT,
+        graded_at TEXT NOT NULL DEFAULT (datetime('now')),
+        PRIMARY KEY (job_name, started_at)
+      );
+      CREATE INDEX IF NOT EXISTS idx_graded_runs_job ON graded_runs(job_name, started_at DESC);
     `);
   }
 

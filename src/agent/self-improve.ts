@@ -768,25 +768,50 @@ export class SelfImproveLoop {
   ): Promise<{ area: SelfImproveExperiment['area']; target: string; hypothesis: string; proposedChange: string } | null> {
     // Read targeted triggers (written by cron scheduler when jobs fail repeatedly)
     let targetedTriggers = '';
+    const triggerBullets: string[] = [];
+
+    // Source 1: explicit triggers written by the cron scheduler at 3+
+    // consecutive errors (legacy path — we still honor and drain).
     const triggersDir = path.join(SELF_IMPROVE_DIR, 'triggers');
     if (existsSync(triggersDir)) {
       const triggerFiles = readdirSync(triggersDir).filter(f => f.endsWith('.json'));
-      if (triggerFiles.length > 0) {
-        const triggers = triggerFiles.slice(0, 3).map(f => {
-          try {
-            const t = JSON.parse(readFileSync(path.join(triggersDir, f), 'utf-8'));
-            // Clean up trigger after reading
-            unlinkSync(path.join(triggersDir, f));
-            return t;
-          } catch { return null; }
-        }).filter(Boolean);
-        if (triggers.length > 0) {
-          targetedTriggers = `\n\n## PRIORITY: Failing Jobs Needing Attention\n` +
-            `These jobs have been failing repeatedly and need prompt/config fixes:\n` +
-            triggers.map((t: any) => `- **${t.jobName}**: ${t.consecutiveErrors} consecutive errors. Recent: ${(t.recentErrors ?? []).join('; ')}`).join('\n') +
-            `\n\nFocus your improvement hypothesis on fixing these jobs first.\n`;
-        }
+      const triggers = triggerFiles.slice(0, 3).map(f => {
+        try {
+          const t = JSON.parse(readFileSync(path.join(triggersDir, f), 'utf-8'));
+          unlinkSync(path.join(triggersDir, f));
+          return t;
+        } catch { return null; }
+      }).filter(Boolean);
+      for (const t of triggers) {
+        triggerBullets.push(
+          `- **${t.jobName}**: ${t.consecutiveErrors} consecutive errors. Recent: ${(t.recentErrors ?? []).join('; ')}`,
+        );
       }
+    }
+
+    // Source 2: broken-jobs from the failure monitor. These are jobs the
+    // user hasn't applied a fix for yet — real, current gaps the hypothesizer
+    // should target. Complements the diversity constraint: even if the area
+    // has been over-targeted historically, a specific broken job is a fresh
+    // concrete signal.
+    try {
+      const { computeBrokenJobs } = await import('../gateway/failure-monitor.js');
+      const broken = computeBrokenJobs();
+      for (const b of broken.slice(0, 3)) {
+        const diagHint = b.diagnosis
+          ? ` Diagnosis: ${b.diagnosis.rootCause.slice(0, 120)}`
+          : '';
+        triggerBullets.push(
+          `- **${b.jobName}**: ${b.errorCount48h}/${b.totalRuns48h} failed in 48h${b.circuitBreakerEngagedAt ? ' (breaker engaged)' : ''}.${diagHint}`,
+        );
+      }
+    } catch { /* failure-monitor module optional */ }
+
+    if (triggerBullets.length > 0) {
+      targetedTriggers = `\n\n## PRIORITY: Failing Jobs Needing Attention\n` +
+        `These jobs have been failing recently and need prompt/config fixes:\n` +
+        triggerBullets.join('\n') +
+        `\n\nFocus your improvement hypothesis on fixing these jobs first.\n`;
     }
 
     // Format experiment history for the prompt
@@ -794,32 +819,60 @@ export class SelfImproveLoop {
       `#${e.iteration} | ${e.area} | "${e.hypothesis.slice(0, 60)}" | ${(e.score * 10).toFixed(1)}/10 ${e.accepted ? '✅' : '❌'}`
     ).join('\n') || '(no prior experiments)';
 
-    // Enforce diversity: count recent proposals per area:target AND per area
-    const recentTargets = new Map<string, number>();
-    const recentAreas = new Map<string, number>();
-    for (const e of history.slice(-10)) {
+    // Enforce diversity: count recent proposals per area:target AND per area.
+    // A pair is only "over-targeted" if its MOST RECENT attempt was within
+    // the last 30 days — otherwise it's fair game to retry with fresh data.
+    // Stops the saturation state where after ~60 experiments the loop has
+    // blocked every area:target pair permanently and produces no new
+    // hypotheses (the Apr 11-19 plateau).
+    const DIVERSITY_WINDOW_MS = 30 * 24 * 60 * 60 * 1000;
+    const diversityCutoff = Date.now() - DIVERSITY_WINDOW_MS;
+
+    const recentTargets = new Map<string, { count: number; newestMs: number }>();
+    const recentAreas = new Map<string, { count: number; newestMs: number }>();
+
+    for (const e of history.slice(-50)) {
       const key = `${e.area}:${e.target}`;
-      recentTargets.set(key, (recentTargets.get(key) ?? 0) + 1);
-      recentAreas.set(e.area, (recentAreas.get(e.area) ?? 0) + 1);
+      const ts = Date.parse(e.startedAt);
+      const tsMs = Number.isFinite(ts) ? ts : 0;
+      const cur = recentTargets.get(key);
+      recentTargets.set(key, {
+        count: (cur?.count ?? 0) + 1,
+        newestMs: Math.max(cur?.newestMs ?? 0, tsMs),
+      });
+      const curA = recentAreas.get(e.area);
+      recentAreas.set(e.area, {
+        count: (curA?.count ?? 0) + 1,
+        newestMs: Math.max(curA?.newestMs ?? 0, tsMs),
+      });
     }
     for (const p of this.getPendingChanges()) {
       const key = `${p.area}:${p.target}`;
-      recentTargets.set(key, (recentTargets.get(key) ?? 0) + 1);
-      recentAreas.set(p.area, (recentAreas.get(p.area) ?? 0) + 1);
+      const now = Date.now();
+      const cur = recentTargets.get(key);
+      recentTargets.set(key, {
+        count: (cur?.count ?? 0) + 1,
+        newestMs: Math.max(cur?.newestMs ?? 0, now),
+      });
+      const curA = recentAreas.get(p.area);
+      recentAreas.set(p.area, {
+        count: (curA?.count ?? 0) + 1,
+        newestMs: Math.max(curA?.newestMs ?? 0, now),
+      });
     }
-    // Block area:target pairs with >= 2 recent proposals
+    // Block only when both (a) count is high enough AND (b) the last attempt
+    // was within the diversity window.
     const overTargeted = [...recentTargets.entries()]
-      .filter(([, count]) => count >= 2)
+      .filter(([, v]) => v.count >= 2 && v.newestMs > diversityCutoff)
       .map(([key]) => key);
-    // Block entire areas with >= 3 recent proposals
     const overTargetedAreas = [...recentAreas.entries()]
-      .filter(([, count]) => count >= 3)
+      .filter(([, v]) => v.count >= 3 && v.newestMs > diversityCutoff)
       .map(([area]) => area);
 
     // Build area coverage stats to nudge the LLM toward unexplored areas
     const allAreas = this.config.areas;
     const areaCoverage = allAreas.map(area => {
-      const count = recentAreas.get(area) ?? 0;
+      const count = recentAreas.get(area)?.count ?? 0;
       return `- ${area}: ${count} recent proposals`;
     }).join('\n');
 
@@ -828,7 +881,7 @@ export class SelfImproveLoop {
       (overTargeted.length > 0 || overTargetedAreas.length > 0
         ? `\n## DIVERSITY CONSTRAINT\n` +
           (overTargetedAreas.length > 0
-            ? `These AREAS have been over-targeted and MUST NOT be chosen:\n${overTargetedAreas.map(a => `- ${a} (${recentAreas.get(a)} proposals)`).join('\n')}\n`
+            ? `These AREAS have been over-targeted and MUST NOT be chosen:\n${overTargetedAreas.map(a => `- ${a} (${recentAreas.get(a)?.count ?? 0} proposals)`).join('\n')}\n`
             : '') +
           (overTargeted.length > 0
             ? `These specific targets MUST NOT be re-targeted:\n${overTargeted.map(t => `- ${t}`).join('\n')}\n`

@@ -165,12 +165,22 @@ export class HeartbeatScheduler {
 
     // Claim verification sweep — auto-verify pending claims whose due
     // times have passed (e.g. "I scheduled X for 8am" → check at 9am).
-    import('./claim-tracker.js').then(({ verifyDueClaims }) => {
-      verifyDueClaims().then(({ verified, failed, expired }) => {
+    import('./claim-tracker.js').then(async ({ verifyDueClaims, drainLLMFallback }) => {
+      try {
+        const { verified, failed, expired } = await verifyDueClaims();
         if (verified + failed + expired > 0) {
           logger.info({ verified, failed, expired }, 'Claim verification sweep complete');
         }
-      }).catch(err => logger.warn({ err }, 'Claim verification sweep failed'));
+      } catch (err) {
+        logger.warn({ err }, 'Claim verification sweep failed');
+      }
+      // LLM fallback for regex-missed DMs — bounded batch per sweep
+      try {
+        const drained = await drainLLMFallback(this.gateway, 3);
+        if (drained > 0) logger.info({ count: drained }, 'LLM claim fallback extracted');
+      } catch (err) {
+        logger.debug({ err }, 'LLM claim fallback failed (non-fatal)');
+      }
     }).catch(err => logger.warn({ err }, 'Claim tracker import failed'));
 
     const now = new Date();

@@ -119,8 +119,45 @@ function readRunLog(filePath: string): CronRunEntry[] {
   }
 }
 
-function isFailure(entry: CronRunEntry): boolean {
-  return entry.status === 'error' || entry.status === 'retried' || isSemanticFailure(entry);
+function isFailure(entry: CronRunEntry, gradeCache?: Map<string, boolean>): boolean {
+  if (entry.status === 'error' || entry.status === 'retried') return true;
+  if (isSemanticFailure(entry)) return true;
+  // Outcome grader verdict, if we have one for this (job, time) tuple.
+  // Key format: `${jobName}|${startedAt}`. A `false` grade means the LLM
+  // judged the apparent-ok run as semantically failed.
+  if (gradeCache) {
+    const key = `${entry.jobName}|${entry.startedAt}`;
+    const passed = gradeCache.get(key);
+    if (passed === false) return true;
+  }
+  return false;
+}
+
+/**
+ * Pre-load outcome grades for recent runs of all jobs so the synchronous
+ * isFailure check can consult them without hitting SQLite per call.
+ * Returns a map keyed by `${jobName}|${startedAt}` with the `passed` verdict.
+ */
+function loadGradeCache(): Map<string, boolean> {
+  const cache = new Map<string, boolean>();
+  try {
+    const { MEMORY_DB_PATH } = require('../config.js');
+    if (!existsSync(MEMORY_DB_PATH)) return cache;
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const Database = require('better-sqlite3');
+    const db = new Database(MEMORY_DB_PATH, { readonly: true });
+    try {
+      const rows = db.prepare(
+        `SELECT job_name, started_at, passed FROM graded_runs
+         WHERE graded_at >= datetime('now', '-14 days')`,
+      ).all() as Array<{ job_name: string; started_at: string; passed: number }>;
+      for (const r of rows) {
+        cache.set(`${r.job_name}|${r.started_at}`, r.passed === 1);
+      }
+    } catch { /* graded_runs may not exist on older DBs */ }
+    db.close();
+  } catch { /* non-fatal */ }
+  return cache;
 }
 
 /**
@@ -200,6 +237,7 @@ export function computeBrokenJobs(now = Date.now()): BrokenJob[] {
   catch { return []; }
 
   const dormantCutoffMs = now - 7 * 24 * 60 * 60 * 1000;
+  const gradeCache = loadGradeCache();
 
   for (const file of files) {
     const entries = readRunLog(path.join(RUNS_DIR, file));
@@ -242,7 +280,7 @@ export function computeBrokenJobs(now = Date.now()): BrokenJob[] {
       const ts = Date.parse(e.startedAt);
       return Number.isFinite(ts) && ts >= sinceMs;
     });
-    const failures = inWindow.filter(isFailure);
+    const failures = inWindow.filter(e => isFailure(e, gradeCache));
 
     // Consecutive-failure signal: scan from most recent entry backward.
     // Stops at the first non-failure (ignoring 'skipped' which is neither
@@ -252,7 +290,7 @@ export function computeBrokenJobs(now = Date.now()): BrokenJob[] {
     for (let i = entries.length - 1; i >= 0; i--) {
       const e = entries[i]!;
       if (e.status === 'skipped') continue;
-      if (isFailure(e)) consecutiveFailures++;
+      if (isFailure(e, gradeCache)) consecutiveFailures++;
       else break;
     }
 
@@ -266,7 +304,7 @@ export function computeBrokenJobs(now = Date.now()): BrokenJob[] {
     // back to the most recent errors anywhere in the log.
     const errSource = failures.length > 0
       ? failures
-      : entries.filter(isFailure);
+      : entries.filter(e => isFailure(e, gradeCache));
     const distinctErrors: string[] = [];
     const seen = new Set<string>();
     for (let i = errSource.length - 1; i >= 0 && distinctErrors.length < 3; i--) {
@@ -470,6 +508,18 @@ export async function runFailureSweep(
   gateway?: import('./router.js').Gateway,
   now = Date.now(),
 ): Promise<BrokenJob[]> {
+  // Opportunistically grade suspicious ok runs BEFORE computing broken
+  // jobs, so fresh grades feed into this same sweep's detection.
+  // Scoped to a handful of recent suspicious entries per job to keep cost
+  // bounded (~$0.01 per grade; cached forever).
+  if (gateway) {
+    try {
+      await gradeSuspiciousRecentRuns(gateway, now);
+    } catch (err) {
+      logger.warn({ err }, 'Suspicious-run grading pre-pass failed (non-fatal)');
+    }
+  }
+
   const broken = computeBrokenJobs(now);
   if (broken.length === 0) {
     // Clear cooldowns AND diagnostic cache entries for jobs that recovered.
@@ -551,4 +601,56 @@ function appendAuditLog(action: string, jobNames: string[]): void {
       timestamp: new Date().toISOString(),
     }) + '\n');
   } catch { /* non-fatal */ }
+}
+
+/**
+ * Scan each job's recent runs for suspicious apparent-ok entries and grade
+ * them. Each job contributes at most 2 LLM calls per sweep. Results are
+ * cached per (jobName, startedAt), so a suspicious run grades exactly once.
+ */
+async function gradeSuspiciousRecentRuns(
+  gateway: import('./router.js').Gateway,
+  now: number,
+): Promise<void> {
+  const { isSuspicious, gradeRun, getGrade } = await import('./outcome-grader.js');
+  if (!existsSync(RUNS_DIR)) return;
+
+  // Only look at the last 48h so we're not burning grades on ancient entries.
+  const sinceMs = now - 48 * 60 * 60 * 1000;
+
+  let files: string[] = [];
+  try { files = readdirSync(RUNS_DIR).filter(f => f.endsWith('.jsonl')); }
+  catch { return; }
+
+  for (const file of files) {
+    const entries = readRunLog(path.join(RUNS_DIR, file));
+    const recent = entries
+      .filter(e => {
+        const ts = Date.parse(e.startedAt);
+        return Number.isFinite(ts) && ts >= sinceMs;
+      })
+      .filter(isSuspicious);
+
+    // Budget: at most 2 per job per sweep. Take the newest.
+    for (const entry of recent.slice(-2)) {
+      const cached = await getGrade(entry.jobName, entry.startedAt);
+      if (cached) continue;
+      // Attempt to read the job prompt for richer grading context.
+      const jobPrompt = await loadJobPrompt(entry.jobName);
+      await gradeRun(entry, gateway, jobPrompt ?? undefined);
+    }
+  }
+}
+
+/** Load the current CRON.md prompt for a job. Returns null if not found. */
+async function loadJobPrompt(jobName: string): Promise<string | null> {
+  try {
+    const { parseCronJobs, parseAgentCronJobs } = await import('./cron-scheduler.js');
+    const { AGENTS_DIR } = await import('../config.js');
+    const allJobs = [...parseCronJobs(), ...parseAgentCronJobs(AGENTS_DIR)];
+    const job = allJobs.find(j => j.name === jobName);
+    return job?.prompt ?? null;
+  } catch {
+    return null;
+  }
 }
