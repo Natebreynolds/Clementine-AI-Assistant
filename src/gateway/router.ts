@@ -235,6 +235,79 @@ export class Gateway {
     }
   }
 
+  /**
+   * For Clementine-owned sessions, classify whether the message should be
+   * delegated to a specialist agent. Returns null when routing isn't
+   * eligible; { delegated: true, ackMessage } when auto-delegated;
+   * { delegated: false, softSuggest } when only suggesting.
+   */
+  static routeAuditLogPath(): string {
+    return path.join(BASE_DIR, 'routing-audit.jsonl');
+  }
+
+  private async _maybeRouteToSpecialist(
+    sessionKey: string,
+    text: string,
+    onText?: OnTextCallback,
+  ): Promise<{ delegated: true; ackMessage: string } | { delegated: false; softSuggest: string } | null> {
+    try {
+      const { isRoutable, classifyRoute } = await import('../agent/route-classifier.js');
+
+      // Fetch team roster and build the set of agent slugs for the routing gate
+      const agentMgr = this.getAgentManager();
+      const agents = agentMgr.listAll();
+      const ownerAgentSlugs = new Set(agents.filter(a => a.slug !== 'clementine').map(a => a.slug));
+
+      if (!isRoutable(sessionKey, ownerAgentSlugs)) return null;
+      if (ownerAgentSlugs.size === 0) return null; // no team to route to
+
+      const decision = await classifyRoute(text, agents, this);
+      if (!decision) return null;
+
+      logRouteDecision({ sessionKey, message: text, decision });
+
+      if (decision.targetAgent === 'clementine') return null;
+      const targetProfile = agents.find(a => a.slug === decision.targetAgent);
+      if (!targetProfile) return null;
+
+      // Auto-delegate at high confidence
+      if (decision.confidence >= 0.8) {
+        // Fire the team task in the background; ack immediately.
+        const ackMessage = `Routing this to **${targetProfile.name}** (${decision.reasoning.toLowerCase()}). I'll post their response back here when done.`;
+        onText?.(ackMessage).catch(() => { /* non-fatal */ });
+
+        this.handleTeamTask('Clementine', 'clementine', text, targetProfile)
+          .then(response => {
+            if (!response) return;
+            const delivery = `**${targetProfile.name}**: ${response}`;
+            return this._dispatcher?.send(delivery, { sessionKey });
+          })
+          .catch(err => {
+            logger.warn({ err, target: decision.targetAgent }, 'Delegated task failed');
+            void this._dispatcher?.send(
+              `**${targetProfile.name}** hit an error handling that: ${String(err).slice(0, 200)}`,
+              { sessionKey },
+            );
+          });
+
+        return { delegated: true, ackMessage };
+      }
+
+      // Soft-suggest at medium confidence
+      if (decision.confidence >= 0.5) {
+        return {
+          delegated: false,
+          softSuggest: `[Routing suggestion: This looks like it could be ${targetProfile.name}'s domain (${decision.reasoning}). If you want to delegate, reply "send to ${targetProfile.name}" or address them directly. Otherwise I'll handle it.]`,
+        };
+      }
+
+      return null; // low confidence — stay with Clementine silently
+    } catch (err) {
+      logger.debug({ err, sessionKey }, 'Team routing attempt failed (non-fatal)');
+      return null;
+    }
+  }
+
   // Team system (lazy-initialized)
   private _agentManager?: AgentManager;
   private _teamRouter?: TeamRouter;
@@ -794,6 +867,25 @@ export class Gateway {
         // Use per-message override, then session default, then global default
         const sess = this.sessions.get(sessionKey);
         const effectiveModel = model ?? sess?.model;
+
+        // ── Team routing (Clementine-owned sessions only) ──────────────
+        // If the user is talking TO Clementine (her main bot DM, owner
+        // channel, dashboard, or CLI) and hasn't locked the session to a
+        // specific agent profile, classify whether the message should go
+        // to a specialist. Direct-to-agent-bot sessions bypass this entirely.
+        // Small-talk and meta queries stay with Clementine by default.
+        const routingResult = !isInternalMsg && !sess?.profile && !text.startsWith('!')
+          ? await this._maybeRouteToSpecialist(sessionKey, text, onText)
+          : null;
+        if (routingResult?.delegated) {
+          return routingResult.ackMessage;
+        }
+        // Soft-suggest mode: pass annotation through to Clementine's reply
+        if (routingResult?.softSuggest) {
+          securityAnnotation = (securityAnnotation
+            ? securityAnnotation + '\n\n'
+            : '') + routingResult.softSuggest;
+        }
 
         // ── Deep mode control ──────────────────────────────────────────
         if (sess?.deepTask) {
@@ -1659,4 +1751,61 @@ export class Gateway {
       // Non-fatal
     }
   }
+}
+
+interface RouteAuditEntry {
+  timestamp: string;
+  sessionKey: string;
+  messageSnippet: string;
+  targetAgent: string;
+  confidence: number;
+  reasoning: string;
+  action: 'auto-delegated' | 'soft-suggested' | 'stayed-with-clementine';
+}
+
+/**
+ * In-memory ring buffer of recent routing decisions. The dashboard
+ * endpoint reads from this without hitting disk. Persisted to
+ * routing-audit.jsonl on every append so a restart replays them from
+ * the file next boot (TODO if we need the history to survive restarts).
+ */
+const _routeAuditBuffer: RouteAuditEntry[] = [];
+
+function logRouteDecision(opts: {
+  sessionKey: string;
+  message: string;
+  decision: { targetAgent: string; confidence: number; reasoning: string };
+}): void {
+  const action: RouteAuditEntry['action'] =
+    opts.decision.targetAgent === 'clementine'
+      ? 'stayed-with-clementine'
+      : opts.decision.confidence >= 0.8
+        ? 'auto-delegated'
+        : opts.decision.confidence >= 0.5
+          ? 'soft-suggested'
+          : 'stayed-with-clementine';
+  const entry: RouteAuditEntry = {
+    timestamp: new Date().toISOString(),
+    sessionKey: opts.sessionKey,
+    messageSnippet: opts.message.slice(0, 300),
+    targetAgent: opts.decision.targetAgent,
+    confidence: opts.decision.confidence,
+    reasoning: opts.decision.reasoning,
+    action,
+  };
+
+  _routeAuditBuffer.push(entry);
+  while (_routeAuditBuffer.length > 200) _routeAuditBuffer.shift();
+
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { appendFileSync } = require('node:fs');
+    appendFileSync(Gateway.routeAuditLogPath(), JSON.stringify(entry) + '\n');
+  } catch (err) {
+    logger.debug({ err }, 'Route audit log write failed (non-fatal)');
+  }
+}
+
+export function getRecentRouteDecisions(limit = 50): RouteAuditEntry[] {
+  return _routeAuditBuffer.slice(-limit).reverse();
 }

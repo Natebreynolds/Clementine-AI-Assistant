@@ -2052,6 +2052,17 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
     }
   });
 
+  // ── Team routing audit ──────────────────────────────────────────
+
+  app.get('/api/routing-audit', async (_req, res) => {
+    try {
+      const { getRecentRouteDecisions } = await import('../gateway/router.js');
+      res.json({ decisions: getRecentRouteDecisions(50) });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
   // ── Claims + trust score ────────────────────────────────────────
 
   app.get('/api/claims', async (req, res) => {
@@ -9388,6 +9399,13 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
         <div class="card-header">Recent claims</div>
         <div class="card-body" id="panel-claims"><div class="empty-state">Loading...</div></div>
       </div>
+      <div class="card" style="margin-top:16px">
+        <div class="card-header" style="display:flex;align-items:center;justify-content:space-between">
+          <span>Team routing decisions</span>
+          <span style="font-size:11px;color:var(--text-muted)">Only owner-facing Clementine sessions are classified &mdash; agent-bot DMs bypass routing entirely.</span>
+        </div>
+        <div class="card-body" id="panel-routing-audit"><div class="empty-state">Loading...</div></div>
+      </div>
     </div>
 
     <!-- ═══ Logs Page ═══ -->
@@ -10429,7 +10447,7 @@ function navigateTo(page, opts) {
     document.getElementById('builder-input').focus();
   }
   if (page === 'automations') { refreshCron(); refreshTimers(); refreshSelfImprove(); refreshSkills(); refreshBrokenJobs(); }
-  if (page === 'claims') { refreshClaims(); }
+  if (page === 'claims') { refreshClaims(); refreshRoutingAudit(); }
   if (page === 'intelligence') { refreshMemory(); }
   if (page === 'settings') { refreshSettings(); refreshRemoteAccess(); refreshSalesforce(); refreshClaudeIntegrations(); refreshMcpServers(); }
   if (page === 'logs') refreshLogs();
@@ -16369,6 +16387,44 @@ async function refreshClaims(filter) {
   } catch (e) {
     var c = document.getElementById('panel-claims');
     if (c) c.innerHTML = '<div class="empty-state" style="color:var(--red)">Failed to load claims</div>';
+  }
+}
+
+async function refreshRoutingAudit() {
+  var container = document.getElementById('panel-routing-audit');
+  if (!container) return;
+  try {
+    var r = await apiFetch('/api/routing-audit');
+    var d = await r.json();
+    var decisions = d.decisions || [];
+    if (decisions.length === 0) {
+      container.innerHTML = '<div class="empty-state">No routing decisions yet. Send Clementine a message that could be delegated and it will show up here.</div>';
+      return;
+    }
+    var actionColor = {
+      'auto-delegated': '#22c55e',
+      'soft-suggested': '#f59e0b',
+      'stayed-with-clementine': '#6b7280',
+    };
+    var html = '<div style="display:flex;flex-direction:column;gap:6px;font-size:12px">';
+    for (var de of decisions) {
+      var color = actionColor[de.action] || '#6b7280';
+      var confPct = Math.round((de.confidence || 0) * 100);
+      html += '<div style="padding:8px 10px;border:1px solid var(--border);border-left:3px solid ' + color + ';border-radius:4px;background:var(--bg-secondary)">'
+        + '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">'
+        + '<span style="font-size:10px;padding:1px 6px;background:' + color + '22;color:' + color + ';border-radius:3px">' + esc(de.action) + '</span>'
+        + '<span style="font-size:11px"><strong>' + esc(de.targetAgent) + '</strong> @ ' + confPct + '%</span>'
+        + '<span style="font-size:10px;color:var(--text-muted)">' + timeAgo(de.timestamp) + '</span>'
+        + '<span style="font-size:10px;color:var(--text-muted);margin-left:auto">' + esc(de.sessionKey) + '</span>'
+        + '</div>'
+        + '<div style="font-size:11px;color:var(--text-secondary);margin-top:4px">\u201c' + esc(de.messageSnippet.slice(0, 200)) + '\u201d</div>'
+        + '<div style="font-size:10px;color:var(--text-muted);margin-top:2px;font-style:italic">' + esc(de.reasoning) + '</div>'
+        + '</div>';
+    }
+    html += '</div>';
+    container.innerHTML = html;
+  } catch (e) {
+    container.innerHTML = '<div class="empty-state" style="color:var(--red)">Failed to load routing audit</div>';
   }
 }
 
