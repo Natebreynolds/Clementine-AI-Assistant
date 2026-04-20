@@ -107,7 +107,23 @@ export class NotificationDispatcher {
       }
     }
 
+    // Extract and persist claims from successfully-delivered messages.
+    // Fire-and-forget — extraction errors never block delivery.
+    if (anySuccess) {
+      void this._trackClaims(capped, context);
+    }
+
     return { delivered: anySuccess, channelErrors };
+  }
+
+  private async _trackClaims(text: string, context?: NotificationContext): Promise<void> {
+    try {
+      const { extractClaims, recordClaims } = await import('./claim-tracker.js');
+      const claims = extractClaims(text, context?.sessionKey ?? null, context?.agentSlug ?? null);
+      if (claims.length > 0) await recordClaims(claims);
+    } catch (err) {
+      logger.debug({ err }, 'Claim extraction failed (non-fatal)');
+    }
   }
 
   /** Stop the retry queue timer (for graceful shutdown). */

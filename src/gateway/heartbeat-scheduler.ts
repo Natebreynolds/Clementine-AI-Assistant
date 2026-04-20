@@ -163,6 +163,16 @@ export class HeartbeatScheduler {
       });
     }).catch(err => logger.warn({ err }, 'Failure sweep import failed'));
 
+    // Claim verification sweep — auto-verify pending claims whose due
+    // times have passed (e.g. "I scheduled X for 8am" → check at 9am).
+    import('./claim-tracker.js').then(({ verifyDueClaims }) => {
+      verifyDueClaims().then(({ verified, failed, expired }) => {
+        if (verified + failed + expired > 0) {
+          logger.info({ verified, failed, expired }, 'Claim verification sweep complete');
+        }
+      }).catch(err => logger.warn({ err }, 'Claim verification sweep failed'));
+    }).catch(err => logger.warn({ err }, 'Claim tracker import failed'));
+
     const now = new Date();
     const hour = now.getHours();
 

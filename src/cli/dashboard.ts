@@ -2052,6 +2052,59 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
     }
   });
 
+  // ── Claims + trust score ────────────────────────────────────────
+
+  app.get('/api/claims', async (req, res) => {
+    try {
+      const { listClaims, trustScore } = await import('../gateway/claim-tracker.js');
+      const status = req.query.status as string | undefined;
+      const limit = Number(req.query.limit ?? 50);
+      const sinceHours = req.query.sinceHours ? Number(req.query.sinceHours) : undefined;
+      const validStatus = ['pending', 'verified', 'failed', 'expired', 'dismissed'];
+      const claims = await listClaims({
+        ...(status && validStatus.includes(status) ? { status: status as any } : {}),
+        limit: Number.isFinite(limit) ? limit : 50,
+        ...(sinceHours && Number.isFinite(sinceHours) ? { sinceHours } : {}),
+      });
+      const trust = await trustScore(30);
+      res.json({ claims, trust });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  app.post('/api/claims/:id/mark-verified', async (req, res) => {
+    try {
+      const { setClaimStatus } = await import('../gateway/claim-tracker.js');
+      const verdict = typeof req.body?.verdict === 'string' ? req.body.verdict.slice(0, 400) : 'Manually verified by owner';
+      const ok = await setClaimStatus(req.params.id, 'verified', verdict);
+      res.json({ ok });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  app.post('/api/claims/:id/mark-failed', async (req, res) => {
+    try {
+      const { setClaimStatus } = await import('../gateway/claim-tracker.js');
+      const verdict = typeof req.body?.verdict === 'string' ? req.body.verdict.slice(0, 400) : 'Manually marked as failed by owner';
+      const ok = await setClaimStatus(req.params.id, 'failed', verdict);
+      res.json({ ok });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  app.post('/api/claims/:id/dismiss', async (req, res) => {
+    try {
+      const { setClaimStatus } = await import('../gateway/claim-tracker.js');
+      const ok = await setClaimStatus(req.params.id, 'dismissed', 'Dismissed — not a tracked promise');
+      res.json({ ok });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
   // ── Broken jobs (failure monitor) ───────────────────────────────
 
   app.get('/api/cron/broken-jobs', async (_req, res) => {
@@ -8873,6 +8926,10 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
       <div class="nav-item" data-page="intelligence">
         <span class="nav-icon">&#129504;</span> Intelligence
       </div>
+      <div class="nav-item" data-page="claims">
+        <span class="nav-icon">&#128274;</span> Trust &amp; Claims
+        <span class="nav-badge" id="nav-trust-score" style="display:none">--</span>
+      </div>
       <div class="nav-item" data-page="logs">
         <span class="nav-icon">&#128220;</span> Logs
       </div>
@@ -9305,6 +9362,32 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
     <!-- Hidden: Sessions (shown in Home tabs in Phase 2) -->
     <div class="page" id="page-sessions" style="display:none">
       <div id="panel-sessions"><div class="empty-state">Loading...</div></div>
+    </div>
+
+    <!-- ═══ Trust & Claims Page ═══ -->
+    <div class="page" id="page-claims">
+      <div class="page-title">Trust &amp; Claims</div>
+      <div class="card" style="margin-bottom:16px">
+        <div class="card-body" style="display:flex;align-items:center;gap:16px;padding:16px">
+          <div style="font-size:36px;font-weight:700" id="trust-score-big">--</div>
+          <div style="flex:1">
+            <div style="font-size:13px;font-weight:600">Clementine's trust score</div>
+            <div style="font-size:11px;color:var(--text-muted)" id="trust-score-detail">
+              Rolling over the last 30 verified or failed claims.
+            </div>
+          </div>
+          <div style="display:flex;gap:6px">
+            <button class="btn-sm" onclick="refreshClaims('all')" id="claims-filter-all" style="padding:4px 10px">All</button>
+            <button class="btn-sm" onclick="refreshClaims('pending')" id="claims-filter-pending" style="padding:4px 10px">Pending</button>
+            <button class="btn-sm" onclick="refreshClaims('verified')" id="claims-filter-verified" style="padding:4px 10px">Verified</button>
+            <button class="btn-sm" onclick="refreshClaims('failed')" id="claims-filter-failed" style="padding:4px 10px">Failed</button>
+          </div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-header">Recent claims</div>
+        <div class="card-body" id="panel-claims"><div class="empty-state">Loading...</div></div>
+      </div>
     </div>
 
     <!-- ═══ Logs Page ═══ -->
@@ -10346,6 +10429,7 @@ function navigateTo(page, opts) {
     document.getElementById('builder-input').focus();
   }
   if (page === 'automations') { refreshCron(); refreshTimers(); refreshSelfImprove(); refreshSkills(); refreshBrokenJobs(); }
+  if (page === 'claims') { refreshClaims(); }
   if (page === 'intelligence') { refreshMemory(); }
   if (page === 'settings') { refreshSettings(); refreshRemoteAccess(); refreshSalesforce(); refreshClaudeIntegrations(); refreshMcpServers(); }
   if (page === 'logs') refreshLogs();
@@ -16180,6 +16264,129 @@ async function expandSkill(name) {
   } catch(e) { toast('Failed to load skill', 'error'); }
 }
 
+// ── Trust & Claims ────────────────────────
+var _claimsFilter = 'all';
+
+function formatTrustScore(trust) {
+  if (!trust) return { big: '--', detail: 'No claims recorded yet.' };
+  if (trust.score === null) {
+    return {
+      big: trust.total === 0 ? '--' : String(trust.total),
+      detail: trust.total === 0
+        ? 'No verified or failed claims yet. Score activates after 3+ verdicts.'
+        : 'Only ' + trust.total + ' verdict' + (trust.total === 1 ? '' : 's') + ' so far \u2014 score activates at 3+.',
+    };
+  }
+  var pct = Math.round(trust.score * 100);
+  return {
+    big: pct + '%',
+    detail: trust.verified + ' verified, ' + trust.failed + ' failed over last ' + trust.total + ' judged claims.',
+  };
+}
+
+async function refreshClaims(filter) {
+  if (filter && filter !== _claimsFilter) _claimsFilter = filter;
+  try {
+    var url = '/api/claims?limit=100';
+    if (_claimsFilter && _claimsFilter !== 'all') url += '&status=' + encodeURIComponent(_claimsFilter);
+    var r = await apiFetch(url);
+    var d = await r.json();
+
+    // Trust score
+    var t = formatTrustScore(d.trust);
+    var big = document.getElementById('trust-score-big');
+    var detail = document.getElementById('trust-score-detail');
+    if (big) big.textContent = t.big;
+    if (detail) detail.textContent = t.detail;
+    var navBadge = document.getElementById('nav-trust-score');
+    if (navBadge) {
+      if (d.trust && d.trust.score !== null) {
+        navBadge.textContent = Math.round(d.trust.score * 100) + '%';
+        navBadge.style.display = '';
+      } else {
+        navBadge.style.display = 'none';
+      }
+    }
+
+    // Filter-button highlighting
+    ['all', 'pending', 'verified', 'failed'].forEach(function(k) {
+      var btn = document.getElementById('claims-filter-' + k);
+      if (!btn) return;
+      if (k === _claimsFilter) {
+        btn.style.background = 'var(--accent)';
+        btn.style.color = 'white';
+        btn.style.border = '1px solid var(--accent)';
+      } else {
+        btn.style.background = 'var(--bg-tertiary)';
+        btn.style.color = 'var(--text-primary)';
+        btn.style.border = '1px solid var(--border)';
+      }
+    });
+
+    var claims = d.claims || [];
+    var container = document.getElementById('panel-claims');
+    if (!container) return;
+    if (claims.length === 0) {
+      container.innerHTML = '<div class="empty-state">No claims in this view.</div>';
+      return;
+    }
+
+    var statusColor = {
+      pending: '#f59e0b',
+      verified: '#22c55e',
+      failed: '#ef4444',
+      expired: '#6b7280',
+      dismissed: '#6b7280',
+    };
+
+    var html = '<div style="display:flex;flex-direction:column;gap:8px">';
+    for (var c of claims) {
+      var color = statusColor[c.status] || '#6b7280';
+      var due = c.dueAt ? ' \u00b7 due ' + timeAgo(c.dueAt) : '';
+      var ver = c.verifiedAt ? ' \u00b7 verdict ' + timeAgo(c.verifiedAt) : '';
+      var actions = c.status === 'pending'
+        ? '<span style="margin-left:auto;display:flex;gap:4px">'
+          + '<button onclick="markClaim(\\x27' + esc(c.id) + '\\x27,\\x27verified\\x27)" style="background:none;border:1px solid var(--border);border-radius:3px;padding:2px 8px;font-size:11px;color:#22c55e;cursor:pointer">Verified</button>'
+          + '<button onclick="markClaim(\\x27' + esc(c.id) + '\\x27,\\x27failed\\x27)" style="background:none;border:1px solid var(--border);border-radius:3px;padding:2px 8px;font-size:11px;color:#ef4444;cursor:pointer">Failed</button>'
+          + '<button onclick="markClaim(\\x27' + esc(c.id) + '\\x27,\\x27dismissed\\x27)" style="background:none;border:1px solid var(--border);border-radius:3px;padding:2px 8px;font-size:11px;color:var(--text-muted);cursor:pointer">Dismiss</button>'
+          + '</span>'
+        : '';
+      var verdictLine = c.verdict ? '<div style="font-size:11px;color:var(--text-muted);margin-top:4px;font-style:italic">\u201c' + esc(c.verdict) + '\u201d</div>' : '';
+      html += '<div style="padding:10px;border:1px solid var(--border);border-left:3px solid ' + color + ';border-radius:6px;background:var(--bg-secondary)">'
+        + '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">'
+        + '<span style="font-size:10px;padding:1px 6px;background:' + color + '33;color:' + color + ';border-radius:3px;text-transform:uppercase;letter-spacing:0.5px">' + esc(c.status) + '</span>'
+        + '<span style="font-size:10px;color:var(--text-muted)">' + esc(c.claimType) + '</span>'
+        + '<strong style="font-size:13px">' + esc(c.subject) + '</strong>'
+        + '<span style="font-size:10px;color:var(--text-muted);margin-left:auto">' + timeAgo(c.extractedAt) + due + ver + '</span>'
+        + '</div>'
+        + '<div style="font-size:11px;color:var(--text-secondary);margin-top:6px">' + esc(c.messageSnippet.slice(0, 300)) + '</div>'
+        + verdictLine
+        + actions
+        + '</div>';
+    }
+    html += '</div>';
+    container.innerHTML = html;
+  } catch (e) {
+    var c = document.getElementById('panel-claims');
+    if (c) c.innerHTML = '<div class="empty-state" style="color:var(--red)">Failed to load claims</div>';
+  }
+}
+
+async function markClaim(id, status) {
+  var endpoint = status === 'verified' ? 'mark-verified' : status === 'failed' ? 'mark-failed' : 'dismiss';
+  try {
+    var res = await apiJson('POST', '/api/claims/' + encodeURIComponent(id) + '/' + endpoint, {});
+    if (res && res.ok) {
+      toast('Claim marked ' + status, 'success');
+      refreshClaims();
+    } else {
+      toast('Failed to update claim', 'error');
+    }
+  } catch (e) {
+    toast('Error: ' + String(e), 'error');
+  }
+}
+
 async function applyBrokenJobFix(jobName) {
   try {
     // First: dry-run to get the actual diff to show in the confirm dialog
@@ -17873,6 +18080,17 @@ async function refreshSalesforce() {
     refreshAll();
     refreshTeamNav();
   }
+  // Lightweight trust-score fetch for the nav badge (any page benefits from this)
+  try {
+    var tr = await apiFetch('/api/claims?limit=1');
+    var td = await tr.json();
+    var navBadge = document.getElementById('nav-trust-score');
+    if (navBadge && td && td.trust && td.trust.score !== null) {
+      navBadge.textContent = Math.round(td.trust.score * 100) + '%';
+      navBadge.style.display = '';
+    }
+  } catch(e) { /* non-fatal */ }
+
   // Populate agent filter from init data (avoid separate /api/office call)
   if (d && d.office) {
     try {

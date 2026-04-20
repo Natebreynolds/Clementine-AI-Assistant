@@ -449,6 +449,24 @@ export class MemoryStore {
       );
       CREATE INDEX IF NOT EXISTS idx_skill_usage_name ON skill_usage(skill_name, retrieved_at DESC);
       CREATE INDEX IF NOT EXISTS idx_skill_usage_time ON skill_usage(retrieved_at DESC);
+
+      CREATE TABLE IF NOT EXISTS claims (
+        id TEXT PRIMARY KEY,
+        session_key TEXT,
+        message_snippet TEXT NOT NULL,
+        claim_type TEXT NOT NULL,
+        subject TEXT NOT NULL,
+        due_at TEXT,
+        verify_strategy TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending',
+        verdict TEXT,
+        extracted_at TEXT NOT NULL DEFAULT (datetime('now')),
+        verified_at TEXT,
+        agent_slug TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_claims_status ON claims(status, extracted_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_claims_due ON claims(due_at) WHERE status = 'pending';
+      CREATE INDEX IF NOT EXISTS idx_claims_extracted ON claims(extracted_at DESC);
     `);
   }
 
