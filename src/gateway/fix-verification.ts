@@ -12,6 +12,7 @@ import {
   existsSync,
   mkdirSync,
   readFileSync,
+  renameSync,
   writeFileSync,
 } from 'node:fs';
 import path from 'node:path';
@@ -52,7 +53,6 @@ function saveState(state: State): void {
     mkdirSync(path.dirname(STATE_FILE), { recursive: true });
     const tmp = STATE_FILE + '.tmp';
     writeFileSync(tmp, JSON.stringify(state, null, 2));
-    const { renameSync } = require('node:fs') as typeof import('node:fs');
     renameSync(tmp, STATE_FILE);
   } catch (err) {
     logger.warn({ err }, 'Failed to persist fix-verification state');

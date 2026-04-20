@@ -22,12 +22,14 @@ import {
   mkdirSync,
   readFileSync,
   readdirSync,
+  renameSync,
   writeFileSync,
 } from 'node:fs';
 import path from 'node:path';
+import Database from 'better-sqlite3';
 import pino from 'pino';
 
-import { BASE_DIR } from '../config.js';
+import { BASE_DIR, MEMORY_DB_PATH } from '../config.js';
 import type { CronRunEntry } from '../types.js';
 
 const logger = pino({ name: 'clementine.failure-monitor' });
@@ -101,7 +103,6 @@ function saveState(state: MonitorState): void {
     // writes from corrupting the state if the process is killed mid-write.
     const tmp = STATE_FILE + '.tmp';
     writeFileSync(tmp, JSON.stringify(state, null, 2));
-    const { renameSync } = require('node:fs') as typeof import('node:fs');
     renameSync(tmp, STATE_FILE);
   } catch (err) {
     logger.warn({ err }, 'Failed to persist failure-monitor state');
@@ -146,10 +147,7 @@ function isFailure(entry: CronRunEntry, gradeCache?: Map<string, boolean>): bool
 function loadGradeCache(): Map<string, boolean> {
   const cache = new Map<string, boolean>();
   try {
-    const { MEMORY_DB_PATH } = require('../config.js');
     if (!existsSync(MEMORY_DB_PATH)) return cache;
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const Database = require('better-sqlite3');
     const db = new Database(MEMORY_DB_PATH, { readonly: true });
     try {
       const rows = db.prepare(
@@ -161,7 +159,9 @@ function loadGradeCache(): Map<string, boolean> {
       }
     } catch { /* graded_runs may not exist on older DBs */ }
     db.close();
-  } catch { /* non-fatal */ }
+  } catch (err) {
+    logger.warn({ err }, 'Failed to load grade cache');
+  }
   return cache;
 }
 

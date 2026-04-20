@@ -6,7 +6,7 @@
  */
 
 import path from 'node:path';
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
 import pino from 'pino';
 import { PersonalAssistant, type ProjectMeta } from '../agent/assistant.js';
 import type { OnTextCallback, OnToolActivityCallback, PlanProgressUpdate, PlanStep, SelfImproveConfig, SelfImproveExperiment, SessionProvenance, TeamMessage, VerboseLevel, WorkflowDefinition } from '../types.js';
@@ -874,7 +874,15 @@ export class Gateway {
         // specific agent profile, classify whether the message should go
         // to a specialist. Direct-to-agent-bot sessions bypass this entirely.
         // Small-talk and meta queries stay with Clementine by default.
-        const routingResult = !isInternalMsg && !sess?.profile && !text.startsWith('!')
+        //
+        // Also bypass structured workflow messages — button clicks, approvals,
+        // and other system-injected interactions are not free-form chat and
+        // shouldn't be reclassified. They already have an intended flow.
+        const isStructuredWorkflowMsg = text.startsWith('[Button clicked:')
+          || text.startsWith('[Approval:')
+          || text.startsWith('[Reaction:')
+          || text.startsWith('[System:');
+        const routingResult = !isInternalMsg && !sess?.profile && !text.startsWith('!') && !isStructuredWorkflowMsg
           ? await this._maybeRouteToSpecialist(sessionKey, text, onText)
           : null;
         if (routingResult?.delegated) {
@@ -1823,8 +1831,6 @@ function logRouteDecision(opts: {
   while (_routeAuditBuffer.length > 200) _routeAuditBuffer.shift();
 
   try {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const { appendFileSync } = require('node:fs');
     appendFileSync(Gateway.routeAuditLogPath(), JSON.stringify(entry) + '\n');
   } catch (err) {
     logger.debug({ err }, 'Route audit log write failed (non-fatal)');

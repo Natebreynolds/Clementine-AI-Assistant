@@ -13,8 +13,10 @@ import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import path from 'node:path';
 import pino from 'pino';
 
-import { GOALS_DIR, BASE_DIR } from '../config.js';
+import { GOALS_DIR, BASE_DIR, MEMORY_DB_PATH, VAULT_DIR } from '../config.js';
 import { listAllGoals } from '../tools/shared.js';
+import { computeBrokenJobs } from '../gateway/failure-monitor.js';
+import { MemoryStore } from '../memory/store.js';
 
 const logger = pino({ name: 'clementine.insight-engine' });
 
@@ -196,9 +198,7 @@ export function gatherInsightSignals(gateway: {
   //    with a diagnosis is a real, actionable signal the owner should
   //    see proactively rather than stumble across in the dashboard.
   try {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const fm = require('../gateway/failure-monitor.js');
-    const broken = fm.computeBrokenJobs();
+    const broken = computeBrokenJobs();
     for (const b of broken.slice(0, 3)) {
       const hint = b.diagnosis?.rootCause
         ? ` — ${b.diagnosis.rootCause.slice(0, 120)}`
@@ -208,19 +208,18 @@ export function gatherInsightSignals(gateway: {
         signals.push(`One-click fix available for "${b.jobName}" — ${b.diagnosis.proposedFix.details.slice(0, 100)}`);
       }
     }
-  } catch { /* failure-monitor may not be loadable; fine */ }
+  } catch (err) {
+    logger.debug({ err }, 'Failed to pull broken-jobs signals');
+  }
 
   // 6. Claim tracker — failed claims in the last N hours erode trust.
   //    Surface them so the owner sees "Clementine said she'd do X; she
   //    didn't" instead of silently swallowing the miss.
   try {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const { MemoryStore } = require('../memory/store.js');
-    const { MEMORY_DB_PATH, VAULT_DIR } = require('../config.js');
     if (existsSync(MEMORY_DB_PATH)) {
       const store = new MemoryStore(MEMORY_DB_PATH, VAULT_DIR);
       store.initialize();
-      const db = (store as any).conn as import('better-sqlite3').Database;
+      const db = (store as unknown as { conn: import('better-sqlite3').Database }).conn;
       try {
         const rows = db.prepare(
           `SELECT subject, claim_type FROM claims
@@ -233,7 +232,9 @@ export function gatherInsightSignals(gateway: {
       } catch { /* table may not exist */ }
       store.close();
     }
-  } catch { /* non-fatal */ }
+  } catch (err) {
+    logger.debug({ err }, 'Failed to pull failed-claims signals');
+  }
 
   return signals;
 }
