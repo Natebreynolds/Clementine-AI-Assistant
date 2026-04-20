@@ -887,6 +887,31 @@ export class Gateway {
             : '') + routingResult.softSuggest;
         }
 
+        // ── Pre-flight planning for complex asks ───────────────────────
+        // For interactive sessions only (owner DMs, dashboard, CLI), a
+        // cheap deterministic heuristic flags complex multi-step requests.
+        // When it fires, we prepend a directive to the text that tells
+        // the agent to propose a plan + stop, rather than executing
+        // directly. Not a hard stop — on the user's "go" reply the
+        // agent proceeds from the plan it proposed.
+        let enrichedText = text;
+        const isInteractive = isOwnerDm
+          || sessionKey.startsWith('dashboard:')
+          || sessionKey.startsWith('cli:');
+        if (isInteractive && !isInternalMsg && !text.startsWith('!')) {
+          try {
+            const { classifyComplexity, planFirstDirective } = await import('../agent/complexity-classifier.js');
+            const verdict = classifyComplexity(text);
+            if (verdict.complex) {
+              logger.info({ sessionKey, signals: verdict.signals, reason: verdict.reason },
+                'Pre-flight planning directive injected');
+              enrichedText = `${planFirstDirective()}\n\n---\n\n${text}`;
+            }
+          } catch (err) {
+            logger.debug({ err }, 'Complexity classifier failed (non-fatal)');
+          }
+        }
+
         // ── Deep mode control ──────────────────────────────────────────
         if (sess?.deepTask) {
           const lower = text.toLowerCase().trim();
@@ -1012,7 +1037,7 @@ export class Gateway {
         // If the previous query on this session was interrupted by this
         // incoming message, fold the partial output in so the agent can pivot
         // smoothly instead of re-planning from scratch.
-        let chatPrompt = text;
+        let chatPrompt = enrichedText;
         const interrupt = sessState.pendingInterrupt;
         if (interrupt && interrupt.partial.trim()) {
           delete sessState.pendingInterrupt;
@@ -1020,7 +1045,7 @@ export class Gateway {
           chatPrompt =
             `[You were mid-response when the user sent a new message — they chose not to wait. ` +
             `Here's what you had said so far (may be mid-sentence):\n---\n${partialPreview}\n---\n` +
-            `New message from user:]\n\n${text}`;
+            `New message from user:]\n\n${enrichedText}`;
           logger.info({ sessionKey, partialLen: interrupt.partial.length }, 'Folding interrupted partial into new prompt');
         } else if (interrupt) {
           // Interrupt flag was set but no useful partial text — just clear it.
