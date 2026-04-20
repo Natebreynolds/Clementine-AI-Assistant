@@ -50,30 +50,35 @@ export interface RouteDecision {
  * - `slack:agent:*`, `slack:channel:*:{slug}:*`
  * - `team:*` — inter-agent messages travel via team-bus, never route
  */
-export function isRoutable(sessionKey: string, ownerAgentSlugs: Set<string>): boolean {
+export function isRoutable(sessionKey: string, _ownerAgentSlugs: Set<string>): boolean {
   if (!sessionKey) return false;
   const parts = sessionKey.split(':');
+
+  // Structural rule: any 5+ part channel key has an agent slug embedded
+  // (e.g. `discord:channel:{channelId}:{slug}:{userId}`). We reject this
+  // regardless of whether the slug appears in a passed-in roster — the
+  // ownerAgentSlugs list can be stale during agent-hire/rename events,
+  // and the key SHAPE is the safer source of truth.
+  //
+  // `_ownerAgentSlugs` is kept in the signature for future use but the
+  // current implementation is structure-only.
 
   // Agent-bot DMs and member sessions are always agent-scoped
   if (parts[0] === 'discord') {
     const kind = parts[1];
     if (kind === 'agent' || kind === 'member' || kind === 'member-dm') return false;
-    // 5-part discord:channel:{channelId}:{slug}:{userId} means agent in team chat
-    if (kind === 'channel' && parts.length >= 5 && ownerAgentSlugs.has(parts[3] ?? '')) {
-      return false;
-    }
+    // Any 5+ part channel key → agent-scoped, never route
+    if (kind === 'channel' && parts.length >= 5) return false;
     // discord:user:* and the 4-part discord:channel:{channelId}:{userId} pass
-    return kind === 'user' || kind === 'channel';
+    return kind === 'user' || (kind === 'channel' && parts.length === 4);
   }
 
   if (parts[0] === 'slack') {
     const kind = parts[1];
     if (kind === 'agent') return false;
-    // slack:channel:{channelId}:{slug}:{userId} — agent-scoped
-    if (kind === 'channel' && parts.length >= 5 && ownerAgentSlugs.has(parts[3] ?? '')) {
-      return false;
-    }
-    return kind === 'user' || kind === 'dm' || kind === 'channel';
+    // Any 5+ part channel key → agent-scoped
+    if (kind === 'channel' && parts.length >= 5) return false;
+    return kind === 'user' || kind === 'dm' || (kind === 'channel' && parts.length === 4);
   }
 
   if (parts[0] === 'telegram') return parts[1] === 'user' || /^\d+$/.test(parts[1] ?? '');

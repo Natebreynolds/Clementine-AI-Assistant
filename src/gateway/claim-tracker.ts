@@ -166,18 +166,30 @@ const PATTERNS: Pattern[] = [
  * Bounded to prevent memory growth — oldest entries are evicted.
  */
 const MAX_PENDING_LLM = 20;
+const PENDING_LLM_TTL_MS = 6 * 60 * 60 * 1000; // 6h — after that a claim is stale anyway
 const pendingLLMExtraction: Array<{
   text: string;
+  hash: string;
   sessionKey: string | null;
   agentSlug: string | null;
   queuedAt: number;
 }> = [];
 
+function pruneExpiredPending(now = Date.now()): void {
+  while (pendingLLMExtraction.length > 0) {
+    const oldest = pendingLLMExtraction[0]!;
+    if (now - oldest.queuedAt <= PENDING_LLM_TTL_MS) break;
+    pendingLLMExtraction.shift();
+  }
+}
+
 function enqueueForLLM(text: string, sessionKey: string | null, agentSlug: string | null): void {
+  const now = Date.now();
+  pruneExpiredPending(now);
   // De-dup by text hash within the queue — don't re-enqueue the same DM.
   const hash = sha1(text);
-  if (pendingLLMExtraction.some(e => sha1(e.text) === hash)) return;
-  pendingLLMExtraction.push({ text, sessionKey, agentSlug, queuedAt: Date.now() });
+  if (pendingLLMExtraction.some(e => e.hash === hash)) return;
+  pendingLLMExtraction.push({ text, hash, sessionKey, agentSlug, queuedAt: now });
   while (pendingLLMExtraction.length > MAX_PENDING_LLM) pendingLLMExtraction.shift();
 }
 
@@ -254,12 +266,17 @@ export function extractClaims(text: string, sessionKey?: string | null, agentSlu
  * the next sweep.
  */
 export async function drainLLMFallback(gateway: Gateway, maxPerSweep = 3): Promise<number> {
+  pruneExpiredPending();
   let drained = 0;
-  const batch = pendingLLMExtraction.splice(0, Math.min(maxPerSweep, pendingLLMExtraction.length));
+  // Peek — don't remove yet. We only splice on successful processing so a
+  // transient LLM failure doesn't silently drop the candidate.
+  const batch = pendingLLMExtraction.slice(0, Math.min(maxPerSweep, pendingLLMExtraction.length));
+  const toRemove = new Set<string>();
 
   for (const item of batch) {
     try {
       const claims = await llmExtractClaims(item.text, gateway);
+      toRemove.add(item.hash); // success (or "no claims" — not worth re-trying)
       if (claims.length === 0) continue;
       const toRecord = claims.map(c => ({
         id: randomBytes(6).toString('hex'),
@@ -274,7 +291,16 @@ export async function drainLLMFallback(gateway: Gateway, maxPerSweep = 3): Promi
       await recordClaims(toRecord);
       drained += claims.length;
     } catch (err) {
+      // Don't add to toRemove — leave in queue for next sweep. TTL eventually
+      // evicts permanently-failing entries.
       logger.debug({ err }, 'LLM fallback extraction failed for one DM');
+    }
+  }
+
+  // Remove successfully-processed entries in one pass
+  if (toRemove.size > 0) {
+    for (let i = pendingLLMExtraction.length - 1; i >= 0; i--) {
+      if (toRemove.has(pendingLLMExtraction[i]!.hash)) pendingLLMExtraction.splice(i, 1);
     }
   }
 

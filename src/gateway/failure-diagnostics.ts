@@ -94,7 +94,10 @@ function loadCache(): DiagnosisCache {
 function saveCache(cache: DiagnosisCache): void {
   try {
     mkdirSync(path.dirname(CACHE_FILE), { recursive: true });
-    writeFileSync(CACHE_FILE, JSON.stringify(cache, null, 2));
+    const tmp = CACHE_FILE + '.tmp';
+    writeFileSync(tmp, JSON.stringify(cache, null, 2));
+    const { renameSync } = require('node:fs') as typeof import('node:fs');
+    renameSync(tmp, CACHE_FILE);
   } catch (err) {
     logger.warn({ err }, 'Failed to persist diagnostic cache');
   }

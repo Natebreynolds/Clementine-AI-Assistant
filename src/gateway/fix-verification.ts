@@ -50,7 +50,10 @@ function loadState(): State {
 function saveState(state: State): void {
   try {
     mkdirSync(path.dirname(STATE_FILE), { recursive: true });
-    writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
+    const tmp = STATE_FILE + '.tmp';
+    writeFileSync(tmp, JSON.stringify(state, null, 2));
+    const { renameSync } = require('node:fs') as typeof import('node:fs');
+    renameSync(tmp, STATE_FILE);
   } catch (err) {
     logger.warn({ err }, 'Failed to persist fix-verification state');
   }

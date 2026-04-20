@@ -97,7 +97,12 @@ function loadState(): MonitorState {
 function saveState(state: MonitorState): void {
   try {
     mkdirSync(path.dirname(STATE_FILE), { recursive: true });
-    writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
+    // Atomic write — write to temp file then rename. Prevents partial
+    // writes from corrupting the state if the process is killed mid-write.
+    const tmp = STATE_FILE + '.tmp';
+    writeFileSync(tmp, JSON.stringify(state, null, 2));
+    const { renameSync } = require('node:fs') as typeof import('node:fs');
+    renameSync(tmp, STATE_FILE);
   } catch (err) {
     logger.warn({ err }, 'Failed to persist failure-monitor state');
   }
