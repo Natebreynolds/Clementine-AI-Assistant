@@ -192,6 +192,49 @@ export function gatherInsightSignals(gateway: {
     }
   } catch { /* non-fatal */ }
 
+  // 5. Broken jobs from the failure monitor. Any currently-flagged job
+  //    with a diagnosis is a real, actionable signal the owner should
+  //    see proactively rather than stumble across in the dashboard.
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const fm = require('../gateway/failure-monitor.js');
+    const broken = fm.computeBrokenJobs();
+    for (const b of broken.slice(0, 3)) {
+      const hint = b.diagnosis?.rootCause
+        ? ` — ${b.diagnosis.rootCause.slice(0, 120)}`
+        : '';
+      signals.push(`Broken cron job "${b.jobName}": ${b.errorCount48h}/${b.totalRuns48h} failures${hint}`);
+      if (b.diagnosis?.proposedFix?.autoApply) {
+        signals.push(`One-click fix available for "${b.jobName}" — ${b.diagnosis.proposedFix.details.slice(0, 100)}`);
+      }
+    }
+  } catch { /* failure-monitor may not be loadable; fine */ }
+
+  // 6. Claim tracker — failed claims in the last N hours erode trust.
+  //    Surface them so the owner sees "Clementine said she'd do X; she
+  //    didn't" instead of silently swallowing the miss.
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { MemoryStore } = require('../memory/store.js');
+    const { MEMORY_DB_PATH, VAULT_DIR } = require('../config.js');
+    if (existsSync(MEMORY_DB_PATH)) {
+      const store = new MemoryStore(MEMORY_DB_PATH, VAULT_DIR);
+      store.initialize();
+      const db = (store as any).conn as import('better-sqlite3').Database;
+      try {
+        const rows = db.prepare(
+          `SELECT subject, claim_type FROM claims
+           WHERE status = 'failed' AND verified_at >= datetime('now', '-6 hours')
+           ORDER BY verified_at DESC LIMIT 3`,
+        ).all() as Array<{ subject: string; claim_type: string }>;
+        for (const r of rows) {
+          signals.push(`Failed claim: "${r.subject}" (${r.claim_type}) — I promised and didn't deliver`);
+        }
+      } catch { /* table may not exist */ }
+      store.close();
+    }
+  } catch { /* non-fatal */ }
+
   return signals;
 }
 
