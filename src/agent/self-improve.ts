@@ -319,6 +319,11 @@ export class SelfImproveLoop {
     const loopStart = Date.now();
     const history = this.loadExperimentLog();
     let consecutiveLow = 0;
+    // Cap accepted proposals per run so the owner's approval queue stays
+    // scannable. The nightly loop should surface 1-3 solid ideas — not a
+    // flood — even if the hypothesizer is inspired.
+    const maxAcceptancesPerRun = 3;
+    let acceptedThisRun = 0;
 
     try {
       // Step 1: Gather baseline metrics
@@ -523,6 +528,7 @@ export class SelfImproveLoop {
               }
             }
             consecutiveLow = 0;
+            acceptedThisRun++;
           } else {
             consecutiveLow++;
           }
@@ -533,7 +539,14 @@ export class SelfImproveLoop {
             area: proposal.area,
             score,
             accepted,
+            acceptedThisRun,
           }, `Iteration ${i} complete`);
+
+          // Stop once we've landed enough good ideas for the owner to review.
+          if (acceptedThisRun >= maxAcceptancesPerRun) {
+            logger.info({ acceptedThisRun }, 'Reached max-acceptances per run — stopping');
+            break;
+          }
         } catch (err) {
           const classified = classifyError(err);
           const experiment: SelfImproveExperiment = {
@@ -832,6 +845,15 @@ export class SelfImproveLoop {
     const recentAreas = new Map<string, { count: number; newestMs: number }>();
 
     for (const e of history.slice(-50)) {
+      // Skip error-fallback experiments. They default to `area: 'soul', target:
+      // 'unknown'` (see the error-catch block below) and historically have
+      // poisoned diversity accounting — e.g. a ~2-week stretch of API errors
+      // artificially blacklisted the whole 'soul' area even though no real
+      // attempt was made. A crashed iteration isn't evidence we explored the
+      // space, just that the SDK call failed.
+      if (e.reason?.startsWith('Error:')) continue;
+      // Plateau markers also shouldn't count as attempts.
+      if (e.hypothesis?.startsWith('No new hypothesis')) continue;
       const key = `${e.area}:${e.target}`;
       const ts = Date.parse(e.startedAt);
       const tsMs = Number.isFinite(ts) ? ts : 0;
@@ -886,7 +908,7 @@ export class SelfImproveLoop {
           (overTargeted.length > 0
             ? `These specific targets MUST NOT be re-targeted:\n${overTargeted.map(t => `- ${t}`).join('\n')}\n`
             : '') +
-          `Choose a DIFFERENT area/target. If no other improvement is needed, output { "area": null }.\n`
+          `Choose a DIFFERENT area/target. If no other improvement is genuinely needed today, return an empty results array: { "results": [] }.\n`
         : '');
 
     const patternAnalysis = this.analyzeExperimentPatterns(history);
@@ -987,18 +1009,17 @@ export class SelfImproveLoop {
       agentFocusText +
       soulCandidatesText +
       `\n## Instructions\n` +
-      `Rank these by expected impact. For each opportunity, specify:\n` +
+      `Propose **1-3 concrete, high-impact improvements** the owner should review today — no fewer (aim for at least one actionable suggestion when data warrants it), no more (the owner reads each proposal manually and you'll overwhelm them). Rank by expected impact; drop anything below "solid idea".\n\n` +
+      `For each opportunity, specify:\n` +
       `- area: ${areas}\n` +
-      `- target: the file/agent slug that should change\n` +
+      `- target: the exact file path / agent slug / cron job name that should change (not "unknown", not "n/a")\n` +
       `- what: a 1-sentence description of what specifically should change\n` +
-      `- why: which metric this should improve\n\n` +
+      `- why: which metric or signal from the data above this should improve\n\n` +
       `Area notes:\n` +
       `- For "goal": target = "{owner}/{goal-slug}" (e.g. "clementine/improve-reply-rates" or "ross-the-sdr/book-demos"). ` +
       `Propose when you observe a pattern in completed tasks or cron runs that suggests a missing or stale goal. ` +
       `The proposedChange must be a JSON goal object with at minimum: title, description, priority, reviewFrequency.\n\n` +
-      `Output ONLY a JSON array of 1-3 objects (no markdown, no explanation):\n` +
-      `[{ "area": "...", "target": "...", "what": "...", "why": "..." }]\n` +
-      `If no improvement is needed, output: []`;
+      `Return your answer as a JSON object matching the schema: { "results": [ ... ] }. Up to 3 items. If absolutely nothing actionable today, return { "results": [] }.`;
 
     const analysisResult = await this.assistant.runPlanStep('si-analyze', analysisPrompt, {
       tier: 2,
