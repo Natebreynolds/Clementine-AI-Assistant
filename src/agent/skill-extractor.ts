@@ -21,6 +21,7 @@ import pino from 'pino';
 import { VAULT_DIR, AGENTS_DIR, PENDING_SKILLS_DIR } from '../config.js';
 import type { SkillDocument } from '../types.js';
 import type { PersonalAssistant } from './assistant.js';
+import { embed as embedText, cosineSimilarity, isReady as embeddingsReady } from '../memory/embeddings.js';
 
 const logger = pino({ name: 'clementine.skills' });
 
@@ -366,6 +367,24 @@ export interface SkillMatch {
   skillDir: string;
 }
 
+/**
+ * Cache of skill embeddings so we don't re-embed every skill's frontmatter
+ * on every query. Keyed by the absolute path of the skill file; invalidated
+ * implicitly (the cache stays in memory for the daemon's lifetime — skill
+ * edits require a restart, same as the rest of the skill pipeline).
+ */
+const skillEmbeddingCache = new Map<string, Float32Array>();
+
+function getSkillEmbedding(filePath: string, triggers: string[], title: string, description: string): Float32Array | null {
+  const cached = skillEmbeddingCache.get(filePath);
+  if (cached) return cached;
+  const corpus = [title, description, triggers.join(' ')].filter(Boolean).join(' ');
+  if (!corpus) return null;
+  const vec = embedText(corpus);
+  if (vec) skillEmbeddingCache.set(filePath, vec);
+  return vec;
+}
+
 export function searchSkills(
   query: string,
   limit = 3,
@@ -388,6 +407,12 @@ export function searchSkills(
   const seen = new Set<string>();
   const suppressed = opts?.suppressedNames;
 
+  // Semantic matching is optional — only engages if the vault has built an
+  // embedding vocabulary (MemoryStore.buildEmbeddings). Falls back to pure
+  // keyword scoring for fresh installs.
+  const useSemantic = embeddingsReady();
+  const queryVec = useSemantic ? embedText(query) : null;
+
   for (const { dir, boost } of dirs) {
     const files = readdirSync(dir).filter(f => f.endsWith('.md'));
     for (const file of files) {
@@ -397,8 +422,9 @@ export function searchSkills(
       // Feedback-gated: skip skills that have been repeatedly associated with
       // negative user feedback (see store.getSkillsToSuppress).
       if (suppressed?.has(name)) continue;
+      const filePath = path.join(dir, file);
       try {
-        const raw = readFileSync(path.join(dir, file), 'utf-8');
+        const raw = readFileSync(filePath, 'utf-8');
         const parsed = matter(raw);
         const triggers: string[] = parsed.data.triggers ?? [];
         const title: string = parsed.data.title ?? '';
@@ -420,12 +446,27 @@ export function searchSkills(
           if (description.toLowerCase().includes(word)) score += 1;
         }
 
-        if (score > 0) {
+        // Semantic bonus: add cosine similarity × 4 so a strong semantic
+        // match (cos ~ 0.7+) contributes like a single keyword hit, and
+        // very close matches (cos ~ 0.9+) surface as a solid lead even
+        // when the user's phrasing doesn't share vocabulary with the
+        // skill's triggers. Keyword hits still dominate when present.
+        let semanticScore = 0;
+        if (queryVec) {
+          const skillVec = getSkillEmbedding(filePath, triggerLower, title, description);
+          if (skillVec) {
+            const cos = cosineSimilarity(queryVec, skillVec);
+            if (cos > 0.3) semanticScore = cos * 4;
+          }
+        }
+
+        const totalScore = score + semanticScore;
+        if (totalScore > 0) {
           results.push({
             name,
             title,
             content: parsed.content.slice(0, 1500),
-            score: score + boost,
+            score: totalScore + boost,
             toolsUsed: parsed.data.toolsUsed ?? [],
             attachments: parsed.data.attachments ?? [],
             skillDir: dir,

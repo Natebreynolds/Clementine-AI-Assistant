@@ -14,9 +14,30 @@
 
 export interface ComplexityVerdict {
   complex: boolean;
+  /**
+   * High-confidence subset of `complex`. When true, the task is ambitious
+   * enough that the gateway should route it straight to deep/background
+   * execution instead of running a main-agent turn that would almost
+   * certainly get auto-escalated after burning tool calls.
+   */
+  deepWorthy: boolean;
   reason: string;
   signals: string[];
 }
+
+/**
+ * Explicit phrasings that essentially request a long-running background job.
+ * Triggers deepWorthy on their own, regardless of other signals.
+ */
+const DEEP_MODE_ASKS = [
+  /\b(deeply|extensively|thoroughly)\s+(research|analy[sz]e|investigate|audit|review)\b/i,
+  /\bcomprehensive(ly)?\s+(research|analy[sz]is|report|audit)\b/i,
+  /\bgo\s+(do|handle|tackle)\s+this\b/i,
+  /\brun\s+in\s+the\s+background\b/i,
+  /\bdeep\s+(mode|dive|work)\b/i,
+  /\bbackground\s+(task|work|job)\b/i,
+  /\btake\s+your\s+time\b/i,
+];
 
 /**
  * Action verbs that signal the user is asking Clementine to DO things
@@ -91,19 +112,26 @@ function countEntities(text: string): number {
  * Classify complexity. Pure function — no LLM, no I/O.
  */
 export function classifyComplexity(text: string): ComplexityVerdict {
-  if (!text || typeof text !== 'string') return { complex: false, reason: 'empty', signals: [] };
+  if (!text || typeof text !== 'string') return { complex: false, deepWorthy: false, reason: 'empty', signals: [] };
   const trimmed = text.trim();
 
   // Skip commands and very short messages
-  if (trimmed.length < 30) return { complex: false, reason: 'too short', signals: [] };
-  if (trimmed.startsWith('!') || trimmed.startsWith('/')) return { complex: false, reason: 'command', signals: [] };
+  if (trimmed.length < 30) return { complex: false, deepWorthy: false, reason: 'too short', signals: [] };
+  if (trimmed.startsWith('!') || trimmed.startsWith('/')) return { complex: false, deepWorthy: false, reason: 'command', signals: [] };
+
+  // Signal 0: explicit deep-mode ask — short-circuits both gates.
+  for (const re of DEEP_MODE_ASKS) {
+    if (re.test(trimmed)) {
+      return { complex: true, deepWorthy: true, reason: 'explicit deep-mode ask', signals: ['deep-mode-ask'] };
+    }
+  }
 
   const signals: string[] = [];
 
   // Signal 1: explicit ask for plan-first
   for (const re of EXPLICIT_PLAN_ASKS) {
     if (re.test(trimmed)) {
-      return { complex: true, reason: 'user explicitly asked for a plan', signals: ['explicit-plan-ask'] };
+      return { complex: true, deepWorthy: false, reason: 'user explicitly asked for a plan', signals: ['explicit-plan-ask'] };
     }
   }
 
@@ -112,8 +140,9 @@ export function classifyComplexity(text: string): ComplexityVerdict {
   if (verbs >= 3) signals.push(`${verbs} action verbs`);
 
   // Signal 3: chain markers
+  let hasChain = false;
   for (const re of CHAIN_MARKERS) {
-    if (re.test(trimmed)) { signals.push('chain marker'); break; }
+    if (re.test(trimmed)) { signals.push('chain marker'); hasChain = true; break; }
   }
 
   // Signal 4: multiple entities
@@ -121,22 +150,34 @@ export function classifyComplexity(text: string): ComplexityVerdict {
   if (entities >= 3) signals.push(`${entities} entities`);
 
   // Signal 5: long message with at least one action verb (big scope, not just a question)
-  if (trimmed.length > 400 && verbs >= 1) signals.push('long + action');
+  const isLong = trimmed.length > 400 && verbs >= 1;
+  if (isLong) signals.push('long + action');
 
   // Gate: at least 2 signals fire, OR a single high-confidence signal
   // (chain markers, explicit-plan-ask, or 3+ action verbs).
-  const highConfidenceSingles = [
+  const highConfidenceSingles = [verbs >= 3, hasChain];
+  const complex = highConfidenceSingles.some(Boolean) || signals.length >= 2;
+
+  // deepWorthy raises the bar: multiple strong signals AND sustained scope.
+  // Specifically, any TWO of {3+ verbs, chain marker, long+action, 3+ entities}.
+  const strongCount = [
     verbs >= 3,
-    signals.includes('chain marker'),
-  ];
-  if (highConfidenceSingles.some(Boolean)) {
-    return { complex: true, reason: 'strong single signal', signals };
-  }
-  if (signals.length >= 2) {
-    return { complex: true, reason: 'multiple signals', signals };
+    hasChain,
+    isLong,
+    entities >= 3,
+  ].filter(Boolean).length;
+  const deepWorthy = strongCount >= 2;
+
+  if (complex) {
+    return {
+      complex: true,
+      deepWorthy,
+      reason: deepWorthy ? 'deep-worthy: multiple strong signals' : (highConfidenceSingles.some(Boolean) ? 'strong single signal' : 'multiple signals'),
+      signals,
+    };
   }
 
-  return { complex: false, reason: 'below threshold', signals };
+  return { complex: false, deepWorthy: false, reason: 'below threshold', signals };
 }
 
 /**

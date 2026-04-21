@@ -1017,10 +1017,59 @@ export class Gateway {
         const isInteractive = isOwnerDm
           || sessionKey.startsWith('dashboard:')
           || sessionKey.startsWith('cli:');
-        if (isInteractive && !isInternalMsg && !text.startsWith('!')) {
+        if (isInteractive && !isInternalMsg && !text.startsWith('!') && !sess?.deepTask) {
           try {
             const { classifyComplexity, planFirstDirective } = await import('../agent/complexity-classifier.js');
             const verdict = classifyComplexity(text);
+
+            // deepWorthy: skip the main-agent turn entirely and route
+            // straight to background execution. Saves the turn that would
+            // almost certainly get auto-escalated after burning 3+ tool
+            // calls (see the post-flight auto-escalation path below).
+            if (verdict.deepWorthy) {
+              logger.info({ sessionKey, signals: verdict.signals, reason: verdict.reason },
+                'Pre-flight deep-mode gate fired — spawning background task');
+              const currentSess = this.getSession(sessionKey);
+              const jobName = `deep-${Date.now()}`;
+              currentSess.deepTask = { jobName, taskDesc: text.slice(0, 200), startedAt: new Date().toISOString() };
+              const preflightAgentSlug = this._agentSlugFromSessionKey(sessionKey);
+
+              this.assistant.runUnleashedTask(
+                jobName,
+                `The user asked: ${text}\n\nThis was routed straight to background execution because it looks like sustained multi-step work. Complete the task thoroughly and return a conversational summary.`,
+                2,                           // tier 2 (Bash/Write/Edit enabled)
+                undefined,                   // default maxTurns
+                undefined,                   // default model
+                undefined,                   // default work_dir
+                1,                           // maxHours
+                preflightAgentSlug,
+              ).then(async (result) => {
+                logger.info({ sessionKey, jobName, resultLen: result?.length ?? 0 }, 'Pre-flight deep-mode task completed');
+                if (result && result !== '__NOTHING__') {
+                  this.assistant.injectPendingContext(sessionKey, text, result);
+                  await this._deliverDeepResult(
+                    sessionKey,
+                    `[DEEP_MODE_RESULT] You just completed background work for this user request. Summarize conversationally — lead with what matters.\n\nTask: ${text.slice(0, 500)}\n\nResult:\n${result.slice(0, 3000)}`,
+                    result,
+                  );
+                }
+              }).catch(async (err) => {
+                logger.error({ err, sessionKey, jobName }, 'Pre-flight deep-mode task failed');
+                const failMsg = `Background work failed: ${String(err).slice(0, 200)}`;
+                this.assistant.injectPendingContext(sessionKey, text, failMsg);
+                await this._deliverDeepResult(
+                  sessionKey,
+                  `[DEEP_MODE_RESULT] The background task failed: ${failMsg}. Let the user know and suggest next steps. Be brief.`,
+                  `Background task failed: ${failMsg}`,
+                );
+              }).finally(() => {
+                const s = this.sessions.get(sessionKey);
+                if (s?.deepTask?.jobName === jobName) delete s.deepTask;
+              });
+
+              return `On it — this looks like real work. Running it in the background; I'll follow up when it's done. Reply "cancel" to stop or "status" to check in.`;
+            }
+
             if (verdict.complex) {
               logger.info({ sessionKey, signals: verdict.signals, reason: verdict.reason },
                 'Pre-flight planning directive injected');
