@@ -193,19 +193,23 @@ function getChannelToolDenyList(channel: string): string[] {
 // ── Token estimation & context window guard ─────────────────────────
 
 /**
- * Estimate token count using a weighted heuristic.
- * BPE tokenizers average ~4 chars/token for prose, but code, punctuation,
- * and whitespace-heavy content tokenize differently.
+ * Estimate token count for Claude.
+ *
+ * Anthropic's published rule of thumb is ~3.5 chars/token for English prose.
+ * Clementine's prompts blend English guidance with code, JSON, YAML, and
+ * structured memory — so we use 3.3 chars/token, slightly denser than pure
+ * English, which tracks within ~10% of the SDK's reported input_tokens in
+ * practice (see audit.jsonl tokens_in for live calibration).
+ *
+ * The previous weighted-regex heuristic (words×1.3 + punct×0.8 + lines×0.5)
+ * systematically undercounted code and JSON, triggering spurious compactions.
+ *
+ * Callers that need exact counts should read `usage.input_tokens` from the
+ * SDK result; this function is for pre-flight planning only.
  */
 export function estimateTokens(text: string): number {
   if (!text) return 0;
-  // Count words (sequences of alphanumeric chars) — average ~1.3 tokens per word
-  const words = text.match(/\b\w+\b/g)?.length ?? 0;
-  // Count non-word tokens: punctuation, brackets, operators (each is ~1 token)
-  const punctuation = text.match(/[^\w\s]/g)?.length ?? 0;
-  // Newlines and indentation: roughly 1 token per line
-  const lines = text.split('\n').length;
-  return Math.ceil(words * 1.3 + punctuation * 0.8 + lines * 0.5);
+  return Math.ceil(text.length / 3.3);
 }
 
 /**
@@ -869,6 +873,21 @@ export class PersonalAssistant {
         fs.readFileSync(SESSIONS_FILE, 'utf-8'),
       );
       const now = Date.now();
+      // Drop old-format Slack session keys that pre-date workspace namespacing
+      // (`slack:user:*`, `slack:dm:*`). The new format is
+      // `slack:team:{teamId}:user:{userId}`; old keys can't be safely remapped
+      // because the originating workspace isn't known, so they're dropped and
+      // users rotate into a fresh session on their next message.
+      let droppedLegacy = 0;
+      for (const key of Object.keys(data)) {
+        if (/^slack:(user|dm):/.test(key)) {
+          delete data[key];
+          droppedLegacy++;
+        }
+      }
+      if (droppedLegacy > 0) {
+        logger.info({ dropped: droppedLegacy }, 'Migrated sessions: dropped pre-workspace-namespacing Slack keys');
+      }
       for (const [key, entry] of Object.entries(data)) {
         const ts = new Date(entry.timestamp);
         if (now - ts.getTime() > SESSION_EXPIRY_MS) continue;

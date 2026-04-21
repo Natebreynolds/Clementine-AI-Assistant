@@ -89,7 +89,7 @@ export async function startSlack(
     logger.error({ err: error }, 'Slack app error — continuing');
   });
 
-  app.message(async ({ message, client }) => {
+  app.message(async ({ message, client, context }) => {
     try {
     // Type guard: only handle regular user messages
     if (!('user' in message) || !('text' in message)) return;
@@ -100,6 +100,10 @@ export async function startSlack(
     if (slackBotManager?.getOwnedChannelIds().includes(message.channel)) return;
 
     const userId = message.user;
+    // Slack user IDs are scoped per-workspace, so a bare `slack:user:{uid}`
+    // collides across workspaces. Namespace by team/workspace ID so sessions
+    // stay isolated even when the same bot is installed in multiple workspaces.
+    const teamId = context.teamId ?? (await client.auth.test().then(r => r.team_id).catch(() => 'unknown'));
 
     // Owner-only check
     if (SLACK_OWNER_USER_ID && userId !== SLACK_OWNER_USER_ID) {
@@ -125,7 +129,7 @@ export async function startSlack(
 
     const channel = message.channel;
     const threadTs = ('thread_ts' in message ? message.thread_ts : undefined) ?? message.ts;
-    const sessionKey = `slack:user:${userId}`;
+    const sessionKey = `slack:team:${teamId}:user:${userId}`;
 
     // ── !stop — abort active query (bypasses session lock) ────────────
     if (text === '!stop' || text === '/stop') {

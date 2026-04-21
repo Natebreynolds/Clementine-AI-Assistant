@@ -14,6 +14,7 @@ import {
   mkdirSync,
   readFileSync,
   readdirSync,
+  renameSync,
   statSync,
   unlinkSync,
   watchFile,
@@ -43,6 +44,7 @@ import type { Gateway } from './router.js';
 import { scanner } from '../security/scanner.js';
 import { parseAllWorkflows as parseAllWorkflowsSync } from '../agent/workflow-runner.js';
 import { SelfImproveLoop } from '../agent/self-improve.js';
+import { logAuditJsonl } from '../agent/hooks.js';
 
 const logger = pino({ name: 'clementine.cron' });
 
@@ -387,6 +389,7 @@ export class CronScheduler {
   private disabledJobs = new Set<string>();
   private scheduledTasks = new Map<string, cron.ScheduledTask>();
   private runningJobs = new Set<string>();
+  private runMetadata = new Map<string, { startedAt: string; runId: string }>();
   private completedJobs = new Map<string, number>(); // jobName → completion timestamp
   private watching = false;
   readonly runLog: CronRunLog;
@@ -405,6 +408,11 @@ export class CronScheduler {
   // Event-driven status change listeners (used by Discord status embed)
   private statusChangeListeners: Array<() => void> = [];
 
+  // Disk-backed mirror of runningJobs for crash-safe idempotency. If the
+  // daemon dies mid-run, startup reconciliation surfaces the interrupted job
+  // to audit.jsonl and clears the file so the next scheduled tick proceeds.
+  private static readonly RUNNING_JOBS_FILE = path.join(BASE_DIR, 'cron-running.json');
+
   constructor(gateway: Gateway, dispatcher: NotificationDispatcher) {
     this.gateway = gateway;
     this.dispatcher = dispatcher;
@@ -413,6 +421,61 @@ export class CronScheduler {
     // available for queries before start() is called — agent bots
     // query jobs on connect which happens before start().
     this.loadJobDefinitions();
+  }
+
+  /**
+   * Atomically persist the current runningJobs set to disk. Uses write-then-
+   * rename so a crash mid-write cannot corrupt the file.
+   */
+  private persistRunningJobs(metaByName?: Map<string, { startedAt: string; runId: string }>): void {
+    try {
+      const entries = [...this.runningJobs].map(name => ({
+        jobName: name,
+        startedAt: metaByName?.get(name)?.startedAt ?? new Date().toISOString(),
+        runId: metaByName?.get(name)?.runId ?? '',
+        pid: process.pid,
+      }));
+      const tmp = CronScheduler.RUNNING_JOBS_FILE + '.tmp';
+      writeFileSync(tmp, JSON.stringify(entries, null, 2));
+      renameSync(tmp, CronScheduler.RUNNING_JOBS_FILE);
+    } catch (err) {
+      logger.debug({ err }, 'Failed to persist running-jobs file');
+    }
+  }
+
+  /**
+   * On startup, read the persisted running-jobs file. Any entries present
+   * represent jobs interrupted by a previous crash. Surface each to audit.jsonl
+   * and clear the file. Deliberately do NOT auto-restart — the next scheduled
+   * tick handles it, avoiding duplicate external side effects (emails sent,
+   * commits pushed, etc.) from a partial prior run.
+   */
+  private reconcileInterruptedJobs(): void {
+    try {
+      if (!existsSync(CronScheduler.RUNNING_JOBS_FILE)) return;
+      const raw = readFileSync(CronScheduler.RUNNING_JOBS_FILE, 'utf-8');
+      const entries = JSON.parse(raw) as Array<{ jobName: string; startedAt: string; runId: string; pid: number }>;
+      if (!Array.isArray(entries) || entries.length === 0) {
+        unlinkSync(CronScheduler.RUNNING_JOBS_FILE);
+        return;
+      }
+      const detectedAt = new Date().toISOString();
+      for (const entry of entries) {
+        logger.warn({ ...entry, detectedAt }, 'Interrupted cron job detected on startup');
+        logAuditJsonl({
+          event_type: 'cron_interrupted',
+          jobName: entry.jobName,
+          runId: entry.runId,
+          startedAt: entry.startedAt,
+          detectedAt,
+          previousPid: entry.pid,
+        });
+      }
+      unlinkSync(CronScheduler.RUNNING_JOBS_FILE);
+    } catch (err) {
+      logger.warn({ err }, 'Failed to reconcile running-jobs file — starting fresh');
+      try { unlinkSync(CronScheduler.RUNNING_JOBS_FILE); } catch { /* ignore */ }
+    }
   }
 
   /** Load job definitions from CRON.md and agent dirs without scheduling tasks. */
@@ -436,6 +499,10 @@ export class CronScheduler {
   }
 
   start(): void {
+    // Surface any jobs that were mid-run when the daemon last died and clear
+    // the crash-consistency file before scheduling new ticks.
+    this.reconcileInterruptedJobs();
+
     this.reloadJobs();
     this.reloadWorkflows();
     this.watchCronFile();
@@ -882,6 +949,11 @@ export class CronScheduler {
     }
 
     this.runningJobs.add(job.name);
+    this.runMetadata.set(job.name, {
+      startedAt: new Date().toISOString(),
+      runId: Math.random().toString(36).slice(2, 10),
+    });
+    this.persistRunningJobs(this.runMetadata);
     this.emitStatusChange();
 
     try {
@@ -1091,6 +1163,8 @@ export class CronScheduler {
       }
     } finally {
       this.runningJobs.delete(job.name);
+      this.runMetadata.delete(job.name);
+      this.persistRunningJobs(this.runMetadata);
       this.emitStatusChange();
 
       // Fire-and-forget: check if this agent's profile needs self-learning update

@@ -877,6 +877,8 @@ export class Gateway {
         const isOwnerDm = sessionKey.startsWith('discord:user:') ||
           sessionKey.startsWith('discord:agent:') ||
           sessionKey.startsWith('slack:dm:') ||
+          // New workspace-namespaced Slack DMs: slack:team:{teamId}:user:{userId}
+          /^slack:team:[^:]+:(user|dm):/.test(sessionKey) ||
           sessionKey.startsWith('telegram:');
         const shouldBlock = scan.verdict === 'block' && !isOwnerDm;
 
@@ -1557,6 +1559,8 @@ export class Gateway {
         const isOwnerDm = sessionKey.startsWith('discord:user:') ||
           sessionKey.startsWith('discord:agent:') ||
           sessionKey.startsWith('slack:dm:') ||
+          // New workspace-namespaced Slack DMs: slack:team:{teamId}:user:{userId}
+          /^slack:team:[^:]+:(user|dm):/.test(sessionKey) ||
           sessionKey.startsWith('telegram:');
         const shouldBlock = scan.verdict === 'block' && !isOwnerDm;
 
