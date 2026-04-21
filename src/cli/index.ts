@@ -520,16 +520,25 @@ function cmdDoctor(opts: { fix?: boolean } = {}): void {
   console.log();
 
   let issues = 0;
-  let warnings = 0;
   let fixed = 0;
   const isMac = process.platform === 'darwin';
   const isLinux = process.platform === 'linux';
-  const hasBrew = isMac && (() => { try { execSync('which brew', { stdio: 'pipe' }); return true; } catch { return false; } })();
+  let hasBrew = isMac && (() => { try { execSync('which brew', { stdio: 'pipe' }); return true; } catch { return false; } })();
   const hasApt = isLinux && (() => { try { execSync('which apt-get', { stdio: 'pipe' }); return true; } catch { return false; } })();
 
-  // One-liner to install Homebrew on macOS — surfaced when brew is missing
-  // so users have a copy-pasteable fix instead of searching for it.
+  // Homebrew official installer. Honors NONINTERACTIVE=1 (set by tryFix) so
+  // it won't block on sudo or "Press Return" prompts, though it still needs
+  // the password cached or sudoless access. Surfaced as copy-paste guidance
+  // when --fix is off.
   const BREW_INSTALL_CMD = '/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"';
+
+  /** Resolve the current brew binary path after a fresh install. */
+  const brewBin = (): string => {
+    for (const p of ['/opt/homebrew/bin/brew', '/usr/local/bin/brew']) {
+      if (existsSync(p)) return p;
+    }
+    return 'brew';
+  };
 
   /** Attempt a fix command, return true on success. */
   function tryFix(label: string, cmd: string, opts?: { cwd?: string; timeout?: number }): boolean {
@@ -603,29 +612,48 @@ function cmdDoctor(opts: { fix?: boolean } = {}): void {
     }
   }
 
+  // macOS: if Homebrew is missing and --fix is on, install it up front so
+  // the subsequent redis-server / libomp checks can auto-resolve. Brew's
+  // installer honors NONINTERACTIVE=1 (which tryFix sets), but still needs
+  // sudo access — fails gracefully and falls back to copy-paste guidance
+  // if sudo isn't available.
+  if (isMac && !hasBrew && fix) {
+    console.log(`  ${RED}FAIL${RESET}  Homebrew not installed (required to install graph-memory deps)`);
+    if (tryFix('Homebrew', BREW_INSTALL_CMD, { timeout: 600000 })) {
+      hasBrew = existsSync('/opt/homebrew/bin/brew') || existsSync('/usr/local/bin/brew');
+    }
+    if (!hasBrew) {
+      console.log(`       Install manually, then re-run ${CYAN}clementine doctor --fix${RESET}:`);
+      console.log(`         ${BREW_INSTALL_CMD}`);
+      issues++;
+    }
+  } else if (isMac && !hasBrew) {
+    console.log(`  ${RED}FAIL${RESET}  Homebrew not installed (required to install graph-memory deps)`);
+    console.log(`       Install it, then run ${CYAN}clementine doctor --fix${RESET}:`);
+    console.log(`         ${BREW_INSTALL_CMD}`);
+    issues++;
+  }
+
   // FalkorDB graph engine — system dependencies: redis
-  // Optional at runtime: graph-store.ts degrades gracefully (isAvailable()
-  // returns false; graph operations become no-ops). Missing deps are a
-  // warning, not a blocking issue — daemon launches fine without them.
+  // The knowledge-graph layer is a core memory feature. Missing deps are
+  // a blocking issue: the daemon technically launches (graph-store.ts has
+  // a no-op degradation path), but memory features the framework depends
+  // on are silently absent. Surface it loudly.
   try {
     execSync('which redis-server', { stdio: 'pipe' });
     console.log(`  ${GREEN}OK${RESET}  redis-server found`);
   } catch {
-    console.log(`  ${YELLOW}WARN${RESET}  redis-server not found (optional — enables knowledge graph)`);
-    const fixCmd = hasBrew ? 'brew install redis' : hasApt ? 'sudo apt-get install -y redis-server' : null;
+    console.log(`  ${RED}FAIL${RESET}  redis-server not found (required for graph memory)`);
+    const fixCmd = hasBrew ? `${brewBin()} install redis` : hasApt ? 'sudo apt-get install -y redis-server' : null;
     if (fixCmd && tryFix('redis-server', fixCmd)) {
       // fixed
-    } else if (!fixCmd && fix) {
-      if (isMac) {
-        console.log(`       ${YELLOW}Homebrew not installed.${RESET} Install it first, then re-run ${CYAN}clementine doctor --fix${RESET}:`);
-        console.log(`         ${BREW_INSTALL_CMD}`);
-      } else {
-        console.log(`       Install redis-server manually (no supported package manager detected)`);
-      }
-      warnings++;
     } else {
-      console.log(`       Fix: brew install redis (macOS) or sudo apt install redis-server (Linux)`);
-      warnings++;
+      if (isMac && !hasBrew) {
+        console.log(`       Install Homebrew first (see above), then ${CYAN}clementine doctor --fix${RESET}`);
+      } else {
+        console.log(`       Fix: brew install redis (macOS) or sudo apt install redis-server (Linux)`);
+      }
+      issues++;
     }
   }
 
@@ -639,22 +667,17 @@ function cmdDoctor(opts: { fix?: boolean } = {}): void {
     }
     console.log(`  ${GREEN}OK${RESET}  libomp (OpenMP runtime) found`);
   } catch {
-    console.log(`  ${YELLOW}WARN${RESET}  libomp (OpenMP runtime) not found (optional — enables knowledge graph)`);
-    const fixCmd = hasBrew ? 'brew install libomp' : hasApt ? 'sudo apt-get install -y libomp-dev' : null;
+    console.log(`  ${RED}FAIL${RESET}  libomp (OpenMP runtime) not found (required for graph memory)`);
+    const fixCmd = hasBrew ? `${brewBin()} install libomp` : hasApt ? 'sudo apt-get install -y libomp-dev' : null;
     if (fixCmd && tryFix('libomp', fixCmd)) {
       // fixed
-    } else if (!fixCmd && fix) {
-      if (isMac) {
-        // Redis check above already printed the brew installer command;
-        // avoid spamming it twice by just pointing back to that guidance.
-        console.log(`       Install Homebrew (see redis-server WARN above), then ${CYAN}brew install libomp${RESET}`);
-      } else {
-        console.log(`       Install libomp manually (no supported package manager detected)`);
-      }
-      warnings++;
     } else {
-      console.log(`       Fix: brew install libomp (macOS) or sudo apt install libomp-dev (Linux)`);
-      warnings++;
+      if (isMac && !hasBrew) {
+        console.log(`       Install Homebrew first (see above), then ${CYAN}clementine doctor --fix${RESET}`);
+      } else {
+        console.log(`       Fix: brew install libomp (macOS) or sudo apt install libomp-dev (Linux)`);
+      }
+      issues++;
     }
   }
 
@@ -666,11 +689,11 @@ function cmdDoctor(opts: { fix?: boolean } = {}): void {
     );
     console.log(`  ${GREEN}OK${RESET}  FalkorDB graph engine binaries installed`);
   } catch {
-    console.log(`  ${YELLOW}WARN${RESET}  FalkorDB graph engine binaries not available (optional — enables knowledge graph)`);
+    console.log(`  ${RED}FAIL${RESET}  FalkorDB graph engine binaries not available`);
     if (!tryFix('FalkorDB binaries', `node node_modules/falkordblite/scripts/postinstall.js`, { cwd: PACKAGE_ROOT, timeout: 180000 })) {
       console.log(`       Fix: cd ${PACKAGE_ROOT} && node node_modules/falkordblite/scripts/postinstall.js`);
       console.log(`       ${DIM}(Usually self-heals once redis-server + libomp are installed)${RESET}`);
-      warnings++;
+      issues++;
     }
   }
 
@@ -859,17 +882,14 @@ function cmdDoctor(opts: { fix?: boolean } = {}): void {
   }
 
   console.log();
-  const warnSuffix = warnings > 0 ? `, ${warnings} warning(s)` : '';
-  if (issues === 0 && fixed === 0 && warnings === 0) {
+  if (issues === 0 && fixed === 0) {
     console.log(`  ${GREEN}All checks passed.${RESET}`);
-  } else if (issues === 0 && fixed === 0 && warnings > 0) {
-    console.log(`  ${GREEN}Ready to launch.${RESET} ${warnings} optional dependency warning(s) — safe to ignore or install for full experience.`);
   } else if (issues === 0 && fixed > 0) {
-    console.log(`  ${GREEN}All issues fixed!${RESET} (${fixed} auto-fixed${warnSuffix})`);
+    console.log(`  ${GREEN}All issues fixed!${RESET} (${fixed} auto-fixed)`);
   } else if (fixed > 0) {
-    console.log(`  ${YELLOW}${issues} issue(s) remaining${RESET} (${fixed} auto-fixed${warnSuffix})`);
+    console.log(`  ${YELLOW}${issues} issue(s) remaining${RESET} (${fixed} auto-fixed)`);
   } else {
-    console.log(`  ${YELLOW}${issues} issue(s) found${warnSuffix}.${RESET}${!fix ? ` Run ${CYAN}clementine doctor --fix${RESET} to auto-install dependencies.` : ''}`);
+    console.log(`  ${YELLOW}${issues} issue(s) found.${RESET}${!fix ? ` Run ${CYAN}clementine doctor --fix${RESET} to auto-install dependencies.` : ''}`);
   }
   console.log();
 }
