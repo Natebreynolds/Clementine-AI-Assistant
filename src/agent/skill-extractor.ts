@@ -396,8 +396,13 @@ export function searchSkills(query: string, limit = 3, agentSlug?: string): Skil
         const description: string = parsed.data.description ?? '';
 
         // Score: trigger matches (high weight) + title/description word overlap + agent boost
+        // Filter non-string triggers defensively — YAML quirks like leading "##"
+        // parse as null and would crash toLowerCase(), causing the entire skill
+        // to be silently dropped by the outer catch. Skip them instead.
         let score = 0;
-        const triggerLower = triggers.map(t => t.toLowerCase());
+        const triggerLower = triggers
+          .filter((t): t is string => typeof t === 'string' && t.length > 0)
+          .map(t => t.toLowerCase());
         for (const word of queryWords) {
           for (const trigger of triggerLower) {
             if (trigger.includes(word) || word.includes(trigger)) score += 3;
