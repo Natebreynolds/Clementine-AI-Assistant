@@ -89,7 +89,11 @@ export type MemoryStoreType = {
   pruneStaleData(opts?: {
     maxAgeDays?: number; salienceThreshold?: number;
     accessLogRetentionDays?: number; transcriptRetentionDays?: number;
-  }): { episodicPruned: number; accessLogPruned: number; transcriptsPruned: number };
+    behavioralRetentionDays?: number;
+  }): {
+    episodicPruned: number; accessLogPruned: number; transcriptsPruned: number;
+    skillUsagePruned: number; feedbackPruned: number; reflectionsPruned: number; usageLogPruned: number;
+  };
   checkDuplicate(content: string, sourceFile?: string): {
     isDuplicate: boolean; matchType: 'exact' | 'near' | null; matchId?: number;
   };

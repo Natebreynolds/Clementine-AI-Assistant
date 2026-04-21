@@ -10,6 +10,7 @@
  */
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import path from 'node:path';
 import pino from 'pino';
 
@@ -181,6 +182,19 @@ export function deserializeEmbedding(buf: Buffer): Float32Array {
 export function isReady(): boolean {
   loadVocab();
   return vocabWords.length >= 50; // need at least 50 vocab words
+}
+
+/**
+ * Stable hash of the current vocabulary's word→dimension mapping. When this
+ * changes, previously-stored embedding vectors become silently incorrect
+ * because dimension N now represents a different word. Callers (MemoryStore
+ * backfill) use this hash to detect staleness and invalidate stored vectors.
+ */
+export function getVocabHash(): string {
+  loadVocab();
+  if (vocabWords.length === 0) return '';
+  // Order-sensitive: dimension assignment depends on insertion order.
+  return createHash('sha1').update(vocabWords.join('|')).digest('hex').slice(0, 16);
 }
 
 const STOP_WORDS = new Set([

@@ -11,9 +11,10 @@
  */
 
 import { createHash } from 'node:crypto';
-import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import Database from 'better-sqlite3';
+import { BASE_DIR } from '../config.js';
 import type {
   Feedback,
   MemoryExtraction,
@@ -201,6 +202,22 @@ export class MemoryStore {
     } catch {
       // Index already exists
     }
+
+    // Hot-path indices: every chat turn sorts/filters chunks by updated_at
+    // (recency) and by (agent_slug, updated_at) for agent-scoped recent
+    // context. Without these the queries do full table scans.
+    try {
+      this.conn.exec('CREATE INDEX idx_chunks_updated_at ON chunks(updated_at DESC)');
+    } catch { /* already exists */ }
+    try {
+      this.conn.exec('CREATE INDEX idx_chunks_agent_updated ON chunks(agent_slug, updated_at DESC)');
+    } catch { /* already exists */ }
+    // Embedding filter — searchByEmbedding's base predicate is
+    // `embedding IS NOT NULL`; a partial index turns that into an
+    // index-only scan for the candidate set.
+    try {
+      this.conn.exec('CREATE INDEX idx_chunks_has_embedding ON chunks(id) WHERE embedding IS NOT NULL');
+    } catch { /* already exists */ }
 
     // Access log table for salience tracking
     this.conn.exec(`
@@ -644,21 +661,24 @@ export class MemoryStore {
       }
     }
 
-    // Process changed/new files
-    for (const filePath of filesToUpdate) {
+    // Process changed/new files inside a single transaction so a 1000-file
+    // sync produces one WAL commit instead of 1000+. Prepared statements are
+    // hoisted out of the loop — better-sqlite3 caches by SQL text anyway, but
+    // the explicit handle avoids re-parsing and makes the intent clear.
+    const insertStmt = this.conn.prepare(
+      `INSERT INTO chunks
+       (source_file, section, content, chunk_type, frontmatter_json, content_hash, category, topic)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    );
+    const upsertHashStmt = this.conn.prepare(
+      `INSERT OR REPLACE INTO file_hashes (rel_path, content_hash, last_synced)
+       VALUES (?, ?, datetime('now'))`,
+    );
+    const processFile = (filePath: string): void => {
       const rel = path.relative(this.vaultDir, filePath);
       const chunks = chunkFile(filePath, this.vaultDir);
-      if (chunks.length === 0) continue;
-
-      // Delete old chunks for this file
+      if (chunks.length === 0) return;
       this.deleteFileChunks(rel);
-
-      // Insert new chunks
-      const insertStmt = this.conn.prepare(
-        `INSERT INTO chunks
-         (source_file, section, content, chunk_type, frontmatter_json, content_hash, category, topic)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-      );
       for (const chunk of chunks) {
         insertStmt.run(
           chunk.sourceFile,
@@ -671,22 +691,16 @@ export class MemoryStore {
           chunk.topic ?? null,
         );
       }
-
-      // Parse and index wikilinks
       this.indexWikilinks(rel, filePath);
-
-      // Update file hash
       const bytes = readFileSync(filePath);
       const fileHash = createHash('sha256').update(bytes).digest('hex').slice(0, 16);
-      this.conn
-        .prepare(
-          `INSERT OR REPLACE INTO file_hashes (rel_path, content_hash, last_synced)
-           VALUES (?, ?, datetime('now'))`,
-        )
-        .run(rel, fileHash);
-
+      upsertHashStmt.run(rel, fileHash);
       stats.filesUpdated++;
-    }
+    };
+    const processAll = this.conn.transaction((files: string[]) => {
+      for (const f of files) processFile(f);
+    });
+    processAll(filesToUpdate);
 
     // Count total chunks
     const countRow = this.conn
@@ -1010,32 +1024,33 @@ export class MemoryStore {
    * Scans chunks that have stored embeddings and returns top matches.
    */
   private searchByEmbedding(queryVec: Float32Array, limit: number, agentSlug?: string, strict = false): SearchResult[] {
-    const rows = this.conn
-      .prepare(
-        `SELECT id, source_file, section, content, chunk_type, embedding, salience, agent_slug, updated_at, category, topic
-         FROM chunks
-         WHERE embedding IS NOT NULL`,
-      )
-      .all() as Array<{
-        id: number;
-        source_file: string;
-        section: string;
-        content: string;
-        chunk_type: string;
-        embedding: Buffer;
-        salience: number;
-        agent_slug: string | null;
-        updated_at: string;
-        category: string | null;
-        topic: string | null;
-      }>;
+    // Push agent-isolation into SQL so we don't deserialize embeddings for
+    // rows we'd immediately reject. Soft isolation (non-strict) still loads
+    // all embeddings because the boost is applied post-scoring, but at
+    // least strict mode no longer scans foreign-agent chunks.
+    let sql = 'SELECT id, source_file, section, content, chunk_type, embedding, salience, agent_slug, updated_at, category, topic FROM chunks WHERE embedding IS NOT NULL';
+    const params: Array<string | number> = [];
+    if (strict && agentSlug) {
+      sql += ' AND (agent_slug IS NULL OR agent_slug = ?)';
+      params.push(agentSlug);
+    }
+    const rows = this.conn.prepare(sql).all(...params) as Array<{
+      id: number;
+      source_file: string;
+      section: string;
+      content: string;
+      chunk_type: string;
+      embedding: Buffer;
+      salience: number;
+      agent_slug: string | null;
+      updated_at: string;
+      category: string | null;
+      topic: string | null;
+    }>;
 
     const scored: SearchResult[] = [];
     for (const row of rows) {
       try {
-        // Hard isolation: skip chunks from other agents (allow own + global)
-        if (strict && agentSlug && row.agent_slug !== null && row.agent_slug !== agentSlug) continue;
-
         const vec = embeddingsModule.deserializeEmbedding(row.embedding);
         const sim = embeddingsModule.cosineSimilarity(queryVec, vec);
         if (sim < 0.15) continue; // threshold for relevance
@@ -1441,11 +1456,24 @@ export class MemoryStore {
     salienceThreshold?: number;
     accessLogRetentionDays?: number;
     transcriptRetentionDays?: number;
-  } = {}): { episodicPruned: number; accessLogPruned: number; transcriptsPruned: number } {
+    behavioralRetentionDays?: number;
+  } = {}): {
+    episodicPruned: number;
+    accessLogPruned: number;
+    transcriptsPruned: number;
+    skillUsagePruned: number;
+    feedbackPruned: number;
+    reflectionsPruned: number;
+    usageLogPruned: number;
+  } {
     const maxAge = opts.maxAgeDays ?? 90;
     const threshold = opts.salienceThreshold ?? 0.01;
     const accessRetention = opts.accessLogRetentionDays ?? 60;
     const transcriptRetention = opts.transcriptRetentionDays ?? 90;
+    // Behavioral telemetry kept longer than transcripts so the feedback loop
+    // (getFeedbackStats, getBehavioralPatterns, getSkillsToSuppress) has a
+    // wide enough window to aggregate meaningful signal.
+    const behavioralRetention = opts.behavioralRetentionDays ?? 180;
 
     // Prune stale episodic chunks (not vault-sourced content)
     const episodicResult = this.conn
@@ -1478,10 +1506,31 @@ export class MemoryStore {
       )
       .run(`-${transcriptRetention} days`);
 
+    // Behavioral telemetry pruning — these tables were previously unbounded.
+    // Each is append-only, so a rolling window is safe; aggregate stats
+    // consume the window directly rather than historical totals.
+    const skillUsageResult = this.conn
+      .prepare(`DELETE FROM skill_usage WHERE retrieved_at < datetime('now', ?)`)
+      .run(`-${behavioralRetention} days`);
+    const feedbackResult = this.conn
+      .prepare(`DELETE FROM feedback WHERE created_at < datetime('now', ?)`)
+      .run(`-${behavioralRetention} days`);
+    const reflectionsResult = this.conn
+      .prepare(`DELETE FROM session_reflections WHERE created_at < datetime('now', ?)`)
+      .run(`-${behavioralRetention} days`);
+    // Usage log is denser (per-exchange) — keep a shorter window.
+    const usageResult = this.conn
+      .prepare(`DELETE FROM usage_log WHERE created_at < datetime('now', ?)`)
+      .run(`-${Math.min(behavioralRetention, 90)} days`);
+
     return {
       episodicPruned: episodicResult.changes,
       accessLogPruned: accessResult.changes,
       transcriptsPruned: transcriptResult.changes,
+      skillUsagePruned: skillUsageResult.changes,
+      feedbackPruned: feedbackResult.changes,
+      reflectionsPruned: reflectionsResult.changes,
+      usageLogPruned: usageResult.changes,
     };
   }
 
@@ -2696,18 +2745,42 @@ export class MemoryStore {
    * embeddings for any chunks that don't have one yet.
    * Safe to call repeatedly — skips chunks that already have embeddings.
    */
-  buildEmbeddings(): { vocabSize: number; backfilled: number } {
+  buildEmbeddings(): { vocabSize: number; backfilled: number; invalidated: number } {
     // Gather all chunk contents for vocabulary building
     const rows = this.conn
       .prepare('SELECT id, content FROM chunks')
       .all() as Array<{ id: number; content: string }>;
 
-    if (rows.length === 0) return { vocabSize: 0, backfilled: 0 };
+    if (rows.length === 0) return { vocabSize: 0, backfilled: 0, invalidated: 0 };
+
+    // Capture prior vocab hash BEFORE rebuild. If buildVocab produces a
+    // different word→dimension mapping, previously-stored embedding vectors
+    // become silently wrong (dimension N now represents a different word).
+    const hashFile = path.join(BASE_DIR, '.embedding-vocab.hash');
+    let priorHash = '';
+    try {
+      if (existsSync(hashFile)) priorHash = readFileSync(hashFile, 'utf-8').trim();
+    } catch { /* first run */ }
 
     // Build vocabulary from entire corpus (including consolidated summaries)
     embeddingsModule.buildVocab(rows.map((r) => r.content));
 
-    if (!embeddingsModule.isReady()) return { vocabSize: 0, backfilled: 0 };
+    if (!embeddingsModule.isReady()) return { vocabSize: 0, backfilled: 0, invalidated: 0 };
+
+    // If the vocab shifted, invalidate every stored vector so they re-embed
+    // against the new word→dim mapping. Without this, old vectors silently
+    // mismatch query vectors and cosine similarity returns nonsense.
+    const newHash = embeddingsModule.getVocabHash();
+    let invalidated = 0;
+    if (priorHash && priorHash !== newHash) {
+      const res = this.conn.prepare('UPDATE chunks SET embedding = NULL WHERE embedding IS NOT NULL').run();
+      invalidated = res.changes;
+      // Count is returned in the result object — callers (maintenance cycle)
+      // log it there. No local logger in this file to avoid the import.
+    }
+    try {
+      writeFileSync(hashFile, newHash);
+    } catch { /* non-fatal */ }
 
     // Backfill embeddings for all chunks that don't have one
     const missing = this.conn
@@ -2717,15 +2790,20 @@ export class MemoryStore {
     const updateStmt = this.conn.prepare('UPDATE chunks SET embedding = ? WHERE id = ?');
     let backfilled = 0;
 
-    for (const row of missing) {
-      const vec = embeddingsModule.embed(row.content);
-      if (vec) {
-        updateStmt.run(embeddingsModule.serializeEmbedding(vec), row.id);
-        backfilled++;
+    // Wrap backfill in a transaction — potentially thousands of UPDATEs
+    // per vocab shift, and a single WAL commit is dramatically faster.
+    const backfillAll = this.conn.transaction((items: Array<{ id: number; content: string }>) => {
+      for (const row of items) {
+        const vec = embeddingsModule.embed(row.content);
+        if (vec) {
+          updateStmt.run(embeddingsModule.serializeEmbedding(vec), row.id);
+          backfilled++;
+        }
       }
-    }
+    });
+    backfillAll(missing);
 
-    return { vocabSize: rows.length, backfilled };
+    return { vocabSize: rows.length, backfilled, invalidated };
   }
 
   // ── Helpers ───────────────────────────────────────────────────────
