@@ -5,7 +5,79 @@
  * chunking, and sanitization without importing the monolith.
  */
 
-import { EmbedBuilder, type Message } from 'discord.js';
+import { EmbedBuilder, type Client, type Message } from 'discord.js';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import path from 'node:path';
+import pino from 'pino';
+import { BASE_DIR } from '../config.js';
+
+const utilsLogger = pino({ name: 'clementine.discord-utils' });
+
+// ── Persistent status-embed state ─────────────────────────────────────
+//
+// When the daemon restarts, in-memory references to status-embed messages
+// are lost, so the bots used to post a fresh pinned embed every time.
+// Persist (channelId, messageId) per slug so the next boot can fetch the
+// existing message and edit it in place — no restart ping spam.
+
+const STATUS_EMBED_STATE_FILE = path.join(BASE_DIR, '.agent-status-embeds.json');
+
+type StatusEmbedStateMap = Record<string, { channelId: string; messageId: string }>;
+
+function loadStatusEmbedState(): StatusEmbedStateMap {
+  try {
+    if (!existsSync(STATUS_EMBED_STATE_FILE)) return {};
+    return JSON.parse(readFileSync(STATUS_EMBED_STATE_FILE, 'utf-8')) as StatusEmbedStateMap;
+  } catch {
+    return {};
+  }
+}
+
+function saveStatusEmbedState(state: StatusEmbedStateMap): void {
+  try {
+    writeFileSync(STATUS_EMBED_STATE_FILE, JSON.stringify(state, null, 2));
+  } catch (err) {
+    utilsLogger.debug({ err }, 'Failed to save status embed state (non-fatal)');
+  }
+}
+
+export function getSavedStatusEmbed(slug: string): { channelId: string; messageId: string } | null {
+  const s = loadStatusEmbedState()[slug];
+  return s ?? null;
+}
+
+export function setSavedStatusEmbed(slug: string, channelId: string, messageId: string): void {
+  const state = loadStatusEmbedState();
+  state[slug] = { channelId, messageId };
+  saveStatusEmbedState(state);
+}
+
+export function clearSavedStatusEmbed(slug: string): void {
+  const state = loadStatusEmbedState();
+  delete state[slug];
+  saveStatusEmbedState(state);
+}
+
+/**
+ * Try to re-hydrate a previously-saved status embed message so that on
+ * restart the bot edits it in place instead of posting a fresh one.
+ * Returns the Message if still reachable, else null.
+ */
+export async function rehydrateStatusEmbed(
+  client: Client,
+  slug: string,
+): Promise<Message | null> {
+  const saved = getSavedStatusEmbed(slug);
+  if (!saved) return null;
+  try {
+    const channel = await client.channels.fetch(saved.channelId).catch(() => null);
+    if (!channel || !('messages' in channel)) return null;
+    const msg = await (channel as any).messages.fetch(saved.messageId).catch(() => null);
+    return msg ?? null;
+  } catch {
+    return null;
+  }
+}
 
 export const STREAM_EDIT_INTERVAL = 400;
 export const THINKING_INDICATOR = '\u2728 *thinking...*';

@@ -36,7 +36,7 @@ import pino from 'pino';
 import type { AgentProfile } from '../types.js';
 import type { Gateway } from '../gateway/router.js';
 import type { CronScheduler } from '../gateway/heartbeat.js';
-import { chunkText, sendChunked, DiscordStreamingMessage, friendlyToolName, sanitizeResponse } from './discord-utils.js';
+import { chunkText, sendChunked, DiscordStreamingMessage, friendlyToolName, sanitizeResponse, rehydrateStatusEmbed, setSavedStatusEmbed } from './discord-utils.js';
 import { MODELS } from '../config.js';
 import * as cronParser from 'cron-parser';
 
@@ -183,11 +183,15 @@ export class AgentBotClient {
         }],
       });
 
-      // Send startup status to owner's DMs
-      await this.sendStartupStatus();
+      // Intentionally NOT sending a startup DM. The main Clementine bot
+      // already posts a consolidated "here's who's online" embed in the
+      // owner DM, so per-agent DMs on every restart are pure noise.
 
-      // Send status embed to the agent's primary channel (if available)
+      // Send status embed to the agent's primary channel (if available).
+      // Rehydrate any prior embed first so we edit-in-place instead of
+      // posting a fresh pinned message on every restart.
       if (this.config.cronScheduler && this.resolvedChannelIds.length > 0) {
+        this.statusEmbedMessage = await rehydrateStatusEmbed(this.client, this.config.slug);
         await this.sendOrUpdateStatusEmbed();
 
         // Auto-update status embed on state changes (debounced)
@@ -368,35 +372,6 @@ export class AgentBotClient {
     }
   }
 
-  /** Send a startup status embed to the owner's DMs. */
-  private async sendStartupStatus(): Promise<void> {
-    if (!this.config.ownerId) return;
-
-    try {
-      const owner = await this.client.users.fetch(this.config.ownerId, { force: true });
-      const dmChannel = await owner.createDM();
-
-      // Use the rich agent status embed if cronScheduler is available
-      const embed = this.config.cronScheduler
-        ? this.buildAgentStatusEmbed()
-        : new EmbedBuilder()
-            .setColor(0x22c55e)
-            .setTitle(`${this.config.profile.name} is online`)
-            .setDescription(this.config.profile.description)
-            .addFields(
-              { name: 'Model', value: this.config.profile.model || 'sonnet', inline: true },
-              { name: 'Tier', value: String(this.config.profile.tier), inline: true },
-            )
-            .setFooter({ text: `Agent bot \u00b7 ${this.client.user?.tag ?? 'unknown'}` })
-            .setTimestamp();
-
-      await dmChannel.send({ embeds: [embed] });
-      logger.info({ slug: this.config.slug }, 'Sent startup status embed to owner DMs');
-    } catch (err) {
-      logger.error({ err, slug: this.config.slug }, 'Failed to send startup status embed');
-    }
-  }
-
   // ── Agent-scoped status embed ──────────────────────────────────────
 
   private buildAgentStatusEmbed(): EmbedBuilder {
@@ -543,6 +518,11 @@ export class AgentBotClient {
         if (channel && 'send' in channel) {
           this.statusEmbedMessage = await (channel as any).send({ embeds: [embed] });
           try { await this.statusEmbedMessage!.pin(); } catch { /* may lack perms */ }
+          // Persist so the next restart edits this same message instead of
+          // posting another pinned copy.
+          if (this.statusEmbedMessage) {
+            setSavedStatusEmbed(this.config.slug, channelId, this.statusEmbedMessage.id);
+          }
         }
       }
     } catch (err) {
@@ -996,6 +976,9 @@ export class AgentBotClient {
         if ('send' in message.channel) {
           this.statusEmbedMessage = await (message.channel as any).send({ embeds: [embed] });
           try { await this.statusEmbedMessage!.pin(); } catch { /* non-fatal */ }
+          if (this.statusEmbedMessage) {
+            setSavedStatusEmbed(this.config.slug, (message.channel as any).id, this.statusEmbedMessage.id);
+          }
         }
       } else {
         await message.reply('Status dashboard unavailable (no scheduler connected).');

@@ -35,6 +35,8 @@ import {
   DiscordStreamingMessage,
   friendlyToolName,
   formatCronEmbed,
+  rehydrateStatusEmbed,
+  setSavedStatusEmbed,
 } from './discord-utils.js';
 import type { NotificationContext } from '../types.js';
 import {
@@ -141,6 +143,19 @@ interface BotMessageContext {
 }
 
 const botMessageMap = new Map<string, BotMessageContext>();
+
+/**
+ * Recognize short natural-language stop commands so the user doesn't have
+ * to remember the `!stop` slash syntax. Only matches short standalone
+ * messages (≤30 chars) so a longer message containing the word "stop" is
+ * not misread as an abort.
+ */
+function isStopCommand(text: string): boolean {
+  const t = text.trim().toLowerCase().replace(/[.!?,]+$/g, '');
+  if (t === '!stop' || t === '/stop') return true;
+  if (t.length > 30) return false;
+  return /^(stop|cancel|nevermind|never mind|hold on|wait( (stop|up))?|pause|abort)$/.test(t);
+}
 
 function trackBotMessage(messageId: string, context: BotMessageContext): void {
   botMessageMap.set(messageId, context);
@@ -700,6 +715,11 @@ export async function startDiscord(
         statusEmbedMessage = await (target as any).send({ embeds: [embed] });
         // Pin the status message so it's easy to find
         try { await statusEmbedMessage!.pin(); } catch { /* may already be pinned or lack perms */ }
+        // Persist so the next restart edits this message instead of posting another
+        const channelId = (statusEmbedMessage as any)?.channelId ?? (target as any)?.id;
+        if (channelId && statusEmbedMessage) {
+          setSavedStatusEmbed('clementine', channelId, statusEmbedMessage.id);
+        }
       }
     } catch (err) {
       logger.error({ err }, 'Failed to update status embed');
@@ -717,6 +737,10 @@ export async function startDiscord(
         }
         statusEmbedMessage = await (channel as any).send({ embeds: [embed] });
         try { await statusEmbedMessage!.pin(); } catch { /* non-fatal */ }
+        const channelId = (statusEmbedMessage as any)?.channelId ?? (channel as any)?.id;
+        if (channelId && statusEmbedMessage) {
+          setSavedStatusEmbed('clementine', channelId, statusEmbedMessage.id);
+        }
       }
     } catch (err) {
       logger.error({ err }, 'Failed to send fresh status embed');
@@ -743,15 +767,18 @@ export async function startDiscord(
 
     updatePresence();
 
-    // Auto-send status embed to owner's DMs on startup
+    // Rehydrate + auto-update the owner-DM status embed. If a prior pinned
+    // embed is still reachable we edit it in place so restarts don't spam
+    // the owner's DM with fresh pinned messages.
     try {
       const owner = await client.users.fetch(DISCORD_OWNER_ID, { force: true });
       const dmChannel = await owner.createDM();
       cachedDmChannel = dmChannel;
+      statusEmbedMessage = await rehydrateStatusEmbed(client, 'clementine');
       await sendOrUpdateStatusEmbed(dmChannel);
-      logger.info('Sent startup status embed to owner DMs');
+      logger.info({ rehydrated: !!statusEmbedMessage }, 'Status embed ready for owner DM');
     } catch (err) {
-      logger.error({ err }, 'Failed to send startup status embed');
+      logger.error({ err }, 'Failed to prepare startup status embed');
     }
 
     // Event-driven embed updates — debounced to avoid API spam
@@ -1261,9 +1288,12 @@ export async function startDiscord(
       } catch { /* referenced message may be deleted */ }
     }
 
-    // ── !stop — abort active query (bypasses session lock) ────────────
-
-    if (isDm && (text === '!stop' || text === '/stop')) {
+    // ── Stop command — abort active query + any in-flight team tasks ─
+    // Accept the canonical !stop/ /stop AND plain natural-language variants
+    // ("stop", "Stop", "Stop.", "cancel", "wait stop", "nevermind") that
+    // users actually type. Only triggers on short standalone messages so
+    // we don't accidentally abort a longer message that contains "stop".
+    if (isDm && isStopCommand(text)) {
       const stopped = gateway.stopSession(sessionKey);
       await message.reply(stopped ? 'Stopping...' : 'Nothing running to stop.');
       return;

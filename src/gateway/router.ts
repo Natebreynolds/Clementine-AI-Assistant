@@ -57,6 +57,12 @@ interface SessionState {
   project?: ProjectMeta;
   lock?: Promise<void>;
   abortController?: AbortController;
+  /**
+   * Abort controllers for in-flight team tasks spawned from this session.
+   * `stopSession` aborts every one of these so "Stop" actually halts the
+   * delegated work, not just the chat query that folded the partial.
+   */
+  teamTaskControllers?: Set<AbortController>;
   provenance?: SessionProvenance;
   lastAccessedAt: number;
   deepTask?: { jobName: string; taskDesc: string; startedAt: string };
@@ -203,6 +209,21 @@ export class Gateway {
   }
 
   /**
+   * Resolve the agent slug for a session so cross-agent delivery stays in-persona.
+   * Prefers the explicit session profile (set by agent bots + cron-scheduler), then
+   * falls back to parsing the session-key format.
+   */
+  private _agentSlugFromSessionKey(sessionKey: string): string | undefined {
+    const profile = this.getSessionProfile(sessionKey);
+    if (profile && profile !== 'clementine') return profile;
+    const parts = sessionKey.split(':');
+    if (parts[0] !== 'discord') return undefined;
+    if (parts[1] === 'agent' || parts[1] === 'member-dm') return parts[2];
+    if ((parts[1] === 'channel' || parts[1] === 'member') && parts.length >= 5) return parts[3];
+    return undefined;
+  }
+
+  /**
    * Deliver a deep-mode result back to the user.
    * Routes through the agent's session so it responds conversationally,
    * then pushes the agent's reply via the dispatcher so it actually reaches the channel.
@@ -213,16 +234,18 @@ export class Gateway {
     syntheticPrompt: string,
     rawFallback: string,
   ): Promise<void> {
+    const agentSlug = this._agentSlugFromSessionKey(sessionKey);
+    const ctx = { sessionKey, ...(agentSlug ? { agentSlug } : {}) };
     try {
       const agentReply = await this.handleMessage(sessionKey, syntheticPrompt);
       if (agentReply?.trim()) {
-        await this._dispatcher?.send(agentReply, { sessionKey });
-        logger.info({ sessionKey }, 'Deep mode result delivered via agent follow-up + dispatcher');
+        await this._dispatcher?.send(agentReply, ctx);
+        logger.info({ sessionKey, agentSlug }, 'Deep mode result delivered via agent follow-up + dispatcher');
       }
     } catch (err) {
       logger.warn({ err, sessionKey }, 'Deep mode agent follow-up failed — using raw fallback');
       if (rawFallback.trim()) {
-        await this._dispatcher?.send(rawFallback.slice(0, 1500), { sessionKey })
+        await this._dispatcher?.send(rawFallback.slice(0, 1500), ctx)
           .catch(async (e) => {
             // Both paths failed — surface it instead of swallowing at debug level.
             logger.warn({ err: e, sessionKey }, 'Deep mode fallback delivery failed — persisting to daily note');
@@ -276,18 +299,32 @@ export class Gateway {
         const ackMessage = `Routing this to **${targetProfile.name}** (${decision.reasoning.toLowerCase()}). I'll post their response back here when done.`;
         onText?.(ackMessage).catch(() => { /* non-fatal */ });
 
-        this.handleTeamTask('Clementine', 'clementine', text, targetProfile)
+        // Track this task so "Stop" can abort it along with the chat query.
+        const teamAbortController = new AbortController();
+        const sess = this.getSession(sessionKey);
+        if (!sess.teamTaskControllers) sess.teamTaskControllers = new Set();
+        sess.teamTaskControllers.add(teamAbortController);
+
+        this.handleTeamTask('Clementine', 'clementine', text, targetProfile, undefined, teamAbortController)
           .then(response => {
             if (!response) return;
             const delivery = `**${targetProfile.name}**: ${response}`;
-            return this._dispatcher?.send(delivery, { sessionKey });
+            return this._dispatcher?.send(delivery, { sessionKey, agentSlug: targetProfile.slug });
           })
           .catch(err => {
+            if (teamAbortController.signal.aborted) {
+              logger.info({ target: decision.targetAgent, sessionKey }, 'Delegated task aborted by user');
+              return;
+            }
             logger.warn({ err, target: decision.targetAgent }, 'Delegated task failed');
             void this._dispatcher?.send(
               `**${targetProfile.name}** hit an error handling that: ${String(err).slice(0, 200)}`,
-              { sessionKey },
+              { sessionKey, agentSlug: targetProfile.slug },
             );
+          })
+          .finally(() => {
+            const s = this.sessions.get(sessionKey);
+            s?.teamTaskControllers?.delete(teamAbortController);
           });
 
         return { delegated: true, ackMessage };
@@ -678,17 +715,26 @@ export class Gateway {
   }
 
   /**
-   * Abort an in-progress chat query for a session.
-   * Returns true if there was an active query to abort.
+   * Abort an in-progress chat query AND any in-flight delegated team tasks
+   * for this session. Returns true if anything was actually aborted.
    */
   stopSession(sessionKey: string): boolean {
-    const ac = this.sessions.get(sessionKey)?.abortController;
+    const s = this.sessions.get(sessionKey);
+    let aborted = false;
+    const ac = s?.abortController;
     if (ac && !ac.signal.aborted) {
       ac.abort();
-      logger.info({ sessionKey }, 'Session stopped by user');
-      return true;
+      aborted = true;
     }
-    return false;
+    if (s?.teamTaskControllers?.size) {
+      for (const tac of s.teamTaskControllers) {
+        if (!tac.signal.aborted) tac.abort();
+      }
+      aborted = true;
+      logger.info({ sessionKey, count: s.teamTaskControllers.size }, 'Aborted in-flight team tasks');
+    }
+    if (aborted) logger.info({ sessionKey }, 'Session stopped by user');
+    return aborted;
   }
 
   /**
@@ -1143,6 +1189,7 @@ export class Gateway {
             const currentSess = this.getSession(sessionKey);
             const jobName = `deep-${Date.now()}`;
             currentSess.deepTask = { jobName, taskDesc, startedAt: new Date().toISOString() };
+            const deepAgentSlug = this._agentSlugFromSessionKey(sessionKey);
 
             // Spawn unleashed task in background — don't await
             this.assistant.runUnleashedTask(
@@ -1153,6 +1200,7 @@ export class Gateway {
               undefined,       // default model
               deepWorkDir,     // honors [DEEP_MODE(work_dir=...)] if provided
               1,               // maxHours
+              deepAgentSlug,   // preserve agent persona in deep mode
             ).then(async (result) => {
               logger.info({ sessionKey, jobName, resultLen: result?.length ?? 0 }, 'Deep mode task completed');
               if (result && result !== '__NOTHING__') {
@@ -1190,6 +1238,7 @@ export class Gateway {
             const currentSess = this.getSession(sessionKey);
             const jobName = `deep-${Date.now()}`;
             currentSess.deepTask = { jobName, taskDesc: text.slice(0, 200), startedAt: new Date().toISOString() };
+            const escAgentSlug = this._agentSlugFromSessionKey(sessionKey);
 
             this.assistant.runUnleashedTask(
               jobName,
@@ -1199,6 +1248,7 @@ export class Gateway {
               undefined,
               undefined,
               1,
+              escAgentSlug,
             ).then(async (result) => {
               logger.info({ sessionKey, jobName, resultLen: result?.length ?? 0 }, 'Auto-escalated deep mode completed');
               if (result && result !== '__NOTHING__') {
@@ -1259,6 +1309,7 @@ export class Gateway {
             const currentSess = this.getSession(sessionKey);
             const jobName = `deep-${Date.now()}`;
             currentSess.deepTask = { jobName, taskDesc: text.slice(0, 200), startedAt: new Date().toISOString() };
+            const mtAgentSlug = this._agentSlugFromSessionKey(sessionKey);
 
             // Grab any partial response that was streamed before the error
             const partialResponse = wrappedOnText ? lastStreamedText : '';
@@ -1271,6 +1322,7 @@ export class Gateway {
               undefined,
               undefined,
               1,
+              mtAgentSlug,
             ).then(async (result) => {
               logger.info({ sessionKey, jobName, resultLen: result?.length ?? 0 }, 'Max-turns deep mode completed');
               if (result && result !== '__NOTHING__') {
@@ -1377,18 +1429,19 @@ export class Gateway {
     maxHours?: number,
     timeoutMs?: number,
     successCriteria?: string[],
+    agentSlug?: string,
   ): Promise<string> {
     const releaseLane = await lanes.acquire('cron');
     try {
-      logger.info(`Running cron job: ${jobName}${workDir ? ` in ${workDir}` : ''}${mode === 'unleashed' ? ' (unleashed)' : ''}`);
+      logger.info(`Running cron job: ${jobName}${workDir ? ` in ${workDir}` : ''}${mode === 'unleashed' ? ' (unleashed)' : ''}${agentSlug && agentSlug !== 'clementine' ? ` as ${agentSlug}` : ''}`);
       events.emit('cron:start', { jobName, tier, mode, timestamp: Date.now() });
       const cronStart = Date.now();
       try {
         let response: string;
         if (mode === 'unleashed') {
-          response = await this.assistant.runUnleashedTask(jobName, jobPrompt, tier, maxTurns, model, workDir, maxHours);
+          response = await this.assistant.runUnleashedTask(jobName, jobPrompt, tier, maxTurns, model, workDir, maxHours, agentSlug);
         } else {
-          response = await this.assistant.runCronJob(jobName, jobPrompt, tier, maxTurns, model, workDir, timeoutMs, successCriteria);
+          response = await this.assistant.runCronJob(jobName, jobPrompt, tier, maxTurns, model, workDir, timeoutMs, successCriteria, agentSlug);
         }
 
         // Re-baseline integrity checksums after cron job (may write to vault)
@@ -1419,11 +1472,12 @@ export class Gateway {
     content: string,
     profile: import('../types.js').AgentProfile,
     onText?: (token: string) => void,
+    abortController?: AbortController,
   ): Promise<string> {
     const releaseLane = await lanes.acquire('cron');
     try {
       logger.info({ fromSlug, toSlug: profile.slug }, 'Running team message as autonomous task');
-      const response = await this.assistant.runTeamTask(fromName, fromSlug, content, profile, onText);
+      const response = await this.assistant.runTeamTask(fromName, fromSlug, content, profile, onText, abortController);
       scanner.refreshIntegrity();
       return response;
     } catch (err) {

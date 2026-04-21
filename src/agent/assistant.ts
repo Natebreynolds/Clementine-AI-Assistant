@@ -1498,13 +1498,18 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
       : undefined
     );
 
-    // ── Compute budget cap ────────────────────────────────────────
+    // ── Compute budget (telemetry only) ───────────────────────────
+    // Cost is informational on a Claude subscription — killing a job
+    // mid-phase because it hit $5 in tokens is worse than the cost.
+    // We still compute the figure so dashboards/logs can show it, but
+    // do not pass it into the SDK as an enforcement knob.
     const computedBudget: number | undefined = maxBudgetUsd ?? (
       isHeartbeat && !isCron ? BUDGET.heartbeat
       : isCron && (cronTier ?? 0) < 2 ? BUDGET.cronT1
       : isCron ? BUDGET.cronT2
       : BUDGET.chat
     );
+    void computedBudget; // reserved for future cost telemetry — not enforced
 
     // ── Compute adaptive thinking ─────────────────────────────────
     const supportsThinking = !resolvedModel.includes('haiku');
@@ -1559,7 +1564,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
       cwd: BASE_DIR,
       env: SAFE_ENV,
       ...(computedEffort ? { effort: computedEffort } : {}),
-      ...(computedBudget !== undefined ? { maxBudgetUsd: computedBudget } : {}),
+      // maxBudgetUsd intentionally omitted — see comment above.
       ...(computedThinking ? { thinking: computedThinking } : {}),
       ...(computedBetas ? { betas: computedBetas } : {}),
       ...(outputFormat ? { outputFormat } : {}),
@@ -3327,8 +3332,12 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
     workDir?: string,
     timeoutMs?: number,
     successCriteria?: string[],
+    agentSlug?: string,
   ): Promise<string> {
     setInteractionSource('autonomous');
+    const cronProfile = agentSlug && agentSlug !== 'clementine'
+      ? this.profileManager.get(agentSlug)
+      : null;
     const cronGuard = new StallGuard();
     const sdkOptions = this.buildOptions({
       isHeartbeat: true,
@@ -3337,6 +3346,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
       model: model ?? null,
       enableTeams: true,
       stallGuard: cronGuard,
+      profile: cronProfile,
     });
 
     // Override cwd if a project workDir is specified
@@ -3758,8 +3768,12 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
     model?: string,
     workDir?: string,
     maxHours?: number,
+    agentSlug?: string,
   ): Promise<string> {
     setInteractionSource('autonomous');
+    const unleashedProfile = agentSlug && agentSlug !== 'clementine'
+      ? this.profileManager.get(agentSlug)
+      : null;
 
     const effectiveMaxHours = maxHours ?? UNLEASHED_DEFAULT_MAX_HOURS;
     const turnsPerPhase = maxTurns ?? UNLEASHED_PHASE_TURNS;
@@ -3836,6 +3850,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
         isUnleashed: true,
         maxBudgetUsd: BUDGET.unleashedPhase,
         stallGuard: phaseGuard,
+        profile: unleashedProfile,
       });
 
       // Enable progress summaries for real-time status updates
@@ -4155,6 +4170,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
     content: string,
     profile: AgentProfile,
     onText?: (token: string) => void,
+    externalAbortController?: AbortController,
   ): Promise<string> {
     setInteractionSource('autonomous');
 
@@ -4170,6 +4186,10 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
     let consecutiveErrors = 0;
 
     while (phase < maxPhases) {
+      if (externalAbortController?.signal.aborted) {
+        logger.info({ taskName, phase }, 'Team task aborted by caller');
+        return lastOutput || `Team task aborted by caller at phase ${phase}.`;
+      }
       if (Date.now() >= deadline) {
         logger.info({ taskName, phase }, 'Team task timed out');
         return lastOutput || `Team task timed out after ${maxHours}h at phase ${phase}.`;
@@ -4245,6 +4265,15 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
         phaseAc.abort();
         logger.warn({ taskName, phase }, `Team task phase ${phase} aborted — deadline reached`);
       }, Math.max(deadline - Date.now(), 0));
+      // Propagate external abort (e.g., user sent "Stop") into the phase controller
+      const onExternalAbort = () => {
+        phaseAc.abort();
+        logger.info({ taskName, phase }, `Team task phase ${phase} aborted by caller`);
+      };
+      if (externalAbortController) {
+        if (externalAbortController.signal.aborted) phaseAc.abort();
+        else externalAbortController.signal.addEventListener('abort', onExternalAbort, { once: true });
+      }
       sdkOptions.abortController = phaseAc;
 
       try {
@@ -4293,6 +4322,13 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
         }
       } catch (err) {
         clearTimeout(phaseTimer);
+        externalAbortController?.signal.removeEventListener('abort', onExternalAbort);
+        // If this phase aborted because the caller cancelled, return cleanly —
+        // no retry, no 3-strikes counter.
+        if (externalAbortController?.signal.aborted) {
+          logger.info({ taskName, phase }, 'Team task aborted mid-phase by caller');
+          return lastOutput || `Team task aborted by caller at phase ${phase}.`;
+        }
         logger.error({ err, taskName, phase }, 'Team task phase error');
         consecutiveErrors++;
         if (consecutiveErrors >= 3) {
@@ -4303,6 +4339,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
       }
 
       clearTimeout(phaseTimer);
+      externalAbortController?.signal.removeEventListener('abort', onExternalAbort);
       sessionId = phaseSessionId;
       lastOutput = phaseOutput.trim();
       consecutiveErrors = 0;

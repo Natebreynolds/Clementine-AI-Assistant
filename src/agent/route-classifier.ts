@@ -31,6 +31,37 @@ export interface RouteDecision {
 }
 
 /**
+ * Direct-imperative guardrail.
+ *
+ * When the user is explicitly instructing Clementine to do the work herself
+ * — "I need you to…", "you need to…", "use the CLI…", "stop/wait" —
+ * routing to a specialist is almost always wrong. The user knows who they
+ * are talking to and is asking *her* to act. Delegating here produces the
+ * "every message spawns a team task" cascade that leaves the user waiting
+ * and shouting "Stop".
+ *
+ * This check runs before the LLM classifier and the explicit-mention fast
+ * path, so even "Nora, I need you to do X" stays with Clementine when Nate
+ * is DMing Clementine (the `isRoutable` gate already guarantees the session
+ * belongs to Clementine).
+ */
+const DIRECT_IMPERATIVE_PATTERNS: RegExp[] = [
+  /\bi (need|want|would like) you to\b/i,
+  /\byou (need to|should|gotta|have to|must)\b/i,
+  /\b(please )?(use|run|execute|call|invoke|query|check|pull|grab|fetch|look up|lookup|search) (the )?(sf|salesforce|cli|bash|sdk|api|db|database)\b/i,
+  /^(stop|wait|hold on|nevermind|never mind|cancel)\b/i,
+];
+
+export function isDirectImperative(userMessage: string): { match: boolean; pattern?: string } {
+  const text = userMessage.trim();
+  for (const re of DIRECT_IMPERATIVE_PATTERNS) {
+    const m = text.match(re);
+    if (m) return { match: true, pattern: m[0] };
+  }
+  return { match: false };
+}
+
+/**
  * Session keys eligible for routing. Any key NOT in this set is
  * considered agent-scoped or system-scoped and never routes.
  *
@@ -172,6 +203,14 @@ export async function classifyRoute(
   // Only classify when there's at least one non-clementine agent available.
   const specialists = agents.filter(a => a.slug !== 'clementine');
   if (specialists.length === 0) return null;
+
+  // Direct-imperative guardrail: user is instructing Clementine to act —
+  // do not delegate, even if an agent is named.
+  const imperative = isDirectImperative(userMessage);
+  if (imperative.match) {
+    logger.info({ pattern: imperative.pattern }, 'Routing skipped — direct imperative');
+    return null;
+  }
 
   // Fast path: explicit slug mention anywhere in the message.
   for (const a of specialists) {

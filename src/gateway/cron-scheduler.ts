@@ -951,6 +951,7 @@ export class CronScheduler {
             job.maxHours,
             effectiveTimeoutMs,
             job.successCriteria,
+            job.agentSlug,
           );
 
           // alwaysDeliver: retry once if the response is empty/noise
@@ -968,6 +969,7 @@ export class CronScheduler {
                 job.maxHours,
                 effectiveTimeoutMs,
                 job.successCriteria,
+                job.agentSlug,
               );
               if (retryResponse && !CronScheduler.isCronNoise(retryResponse)) {
                 response = retryResponse;
@@ -1709,6 +1711,9 @@ export class CronScheduler {
             undefined, // workDir
             useUnleashed ? 'unleashed' : undefined,
             useUnleashed ? 1 : undefined, // 1 hour max for unleashed goal work
+            undefined, // timeoutMs (use default)
+            undefined, // successCriteria
+            ownerSlug ?? undefined,
           ).then((result) => {
             if (result && !CronScheduler.isCronNoise(result)) {
               this.dispatcher.send(`🎯 **Goal work: ${goal.title}**\n\n${result.slice(0, 1500)}`, dispatchOpts).catch(err => logger.debug({ err }, 'Failed to send goal work notification'));
@@ -1722,7 +1727,19 @@ export class CronScheduler {
         }).catch((err) => {
           // Advisor import failed — fall back to basic execution
           logger.warn({ err, goalId: trigger.goalId }, 'Advisor unavailable — running goal work with defaults');
-          this.gateway.handleCronJob(jobName, prompt, 2, trigger.maxTurns ?? 15).then((result) => {
+          this.gateway.handleCronJob(
+            jobName,
+            prompt,
+            2,
+            trigger.maxTurns ?? 15,
+            undefined, // model
+            undefined, // workDir
+            undefined, // mode
+            undefined, // maxHours
+            undefined, // timeoutMs
+            undefined, // successCriteria
+            ownerSlug ?? undefined,
+          ).then((result) => {
             if (result && !CronScheduler.isCronNoise(result)) {
               this.dispatcher.send(`🎯 **Goal work: ${goal.title}**\n\n${result.slice(0, 1500)}`, dispatchOpts).catch(err => logger.debug({ err }, 'Failed to send goal work notification'));
             }
