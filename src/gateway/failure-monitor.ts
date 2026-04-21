@@ -31,6 +31,7 @@ import pino from 'pino';
 
 import { BASE_DIR, MEMORY_DB_PATH } from '../config.js';
 import type { CronRunEntry } from '../types.js';
+import { logAuditJsonl } from '../agent/hooks.js';
 
 const logger = pino({ name: 'clementine.failure-monitor' });
 
@@ -84,15 +85,19 @@ export interface BrokenJob {
 
 interface MonitorState {
   notified: Record<string, { lastNotifiedAt: string; lastErrorCount: number }>;
+  staleNotified: Record<string, { lastNotifiedAt: string; lastRunAt: string | null }>;
 }
 
 function loadState(): MonitorState {
   try {
-    if (!existsSync(STATE_FILE)) return { notified: {} };
+    if (!existsSync(STATE_FILE)) return { notified: {}, staleNotified: {} };
     const raw = JSON.parse(readFileSync(STATE_FILE, 'utf-8'));
-    return { notified: raw.notified ?? {} };
+    return {
+      notified: raw.notified ?? {},
+      staleNotified: raw.staleNotified ?? {},
+    };
   } catch {
-    return { notified: {} };
+    return { notified: {}, staleNotified: {} };
   }
 }
 
@@ -525,6 +530,15 @@ export async function runFailureSweep(
     }
   }
 
+  // SLA sweep runs unconditionally — catches jobs that silently stopped
+  // firing entirely, which the broken-job detector can't see because those
+  // jobs produce no error entries.
+  try {
+    await runSlaSweep(send, now);
+  } catch (err) {
+    logger.warn({ err }, 'SLA sweep failed (non-fatal)');
+  }
+
   const broken = computeBrokenJobs(now);
   if (broken.length === 0) {
     // Clear cooldowns AND diagnostic cache entries for jobs that recovered.
@@ -597,6 +611,70 @@ export async function runFailureSweep(
   return fresh;
 }
 
+/**
+ * Detect and notify about jobs whose last run is >= SLA_MISSED_TICKS
+ * expected intervals old. Each stale job gets one notification per
+ * SLA_NOTIFY_COOLDOWN_HOURS window. Always emits cron_sla_breach to
+ * audit.jsonl regardless of cooldown so the trace record is complete.
+ */
+async function runSlaSweep(
+  send: (text: string) => Promise<unknown>,
+  now: number,
+): Promise<void> {
+  const stale = await computeStaleCronJobs(now);
+  if (stale.length === 0) {
+    // Clear cooldowns for jobs that recovered (are no longer stale).
+    const state = loadState();
+    let mutated = false;
+    for (const name of Object.keys(state.staleNotified)) {
+      if (!stale.find(s => s.jobName === name)) {
+        delete state.staleNotified[name];
+        mutated = true;
+      }
+    }
+    if (mutated) saveState(state);
+    return;
+  }
+
+  // Emit audit events for every stale detection so downstream
+  // tooling (dashboards, alerts) has a complete record.
+  for (const job of stale) {
+    logAuditJsonl({
+      event_type: 'cron_sla_breach',
+      jobName: job.jobName,
+      agent_slug: job.agentSlug,
+      schedule: job.schedule,
+      lastRunAt: job.lastRunAt,
+      expectedIntervalMs: job.expectedIntervalMs,
+      overdueMinutes: job.overdueMinutes,
+    });
+  }
+
+  // Apply per-job notify cooldown so we don't spam.
+  const state = loadState();
+  const cooldownMs = SLA_NOTIFY_COOLDOWN_HOURS * 60 * 60 * 1000;
+  const fresh: StaleCronJob[] = [];
+  for (const job of stale) {
+    const prev = state.staleNotified[job.jobName];
+    if (prev && now - Date.parse(prev.lastNotifiedAt) < cooldownMs) continue;
+    fresh.push(job);
+  }
+  if (fresh.length === 0) return;
+
+  try {
+    await send(formatStaleReport(fresh));
+    const stamp = new Date(now).toISOString();
+    for (const job of fresh) {
+      state.staleNotified[job.jobName] = { lastNotifiedAt: stamp, lastRunAt: job.lastRunAt };
+    }
+    saveState(state);
+    appendAuditLog('sla_notified', fresh.map(j => j.jobName));
+    logger.info({ count: fresh.length, jobs: fresh.map(j => j.jobName) }, 'SLA monitor: notified owner about stale jobs');
+  } catch (err) {
+    logger.warn({ err }, 'SLA monitor: notification dispatch failed');
+  }
+}
+
 function appendAuditLog(action: string, jobNames: string[]): void {
   try {
     const auditPath = path.join(BASE_DIR, 'cron', 'failure-monitor.log');
@@ -658,4 +736,93 @@ async function loadJobPrompt(jobName: string): Promise<string | null> {
   } catch {
     return null;
   }
+}
+
+// ── SLA monitor: detect cron jobs that haven't run when they should have ──
+
+export interface StaleCronJob {
+  jobName: string;
+  agentSlug?: string;
+  schedule: string;
+  /** ISO timestamp of the job's most recent run, or null if it has never run. */
+  lastRunAt: string | null;
+  /** Expected time between consecutive scheduled runs, in ms. */
+  expectedIntervalMs: number;
+  /** How far past the *second* expected tick we are, in minutes. */
+  overdueMinutes: number;
+}
+
+/** A job is "stale" if it has missed >= this many expected ticks. */
+const SLA_MISSED_TICKS = 3;
+/** Absolute floor so sub-hourly cron jobs don't alert too aggressively. */
+const SLA_MIN_OVERDUE_MS = 30 * 60 * 1000;
+/** Don't re-DM the owner about the same stale job within this window. */
+const SLA_NOTIFY_COOLDOWN_HOURS = 12;
+
+/**
+ * Walk enabled cron jobs and find ones that haven't run in at least
+ * SLA_MISSED_TICKS × their expected interval. Distinct from the broken-job
+ * detector which needs actual error entries — this catches the opposite
+ * failure mode: a job that silently stopped firing at all.
+ */
+export async function computeStaleCronJobs(now = Date.now()): Promise<StaleCronJob[]> {
+  const { parseCronJobs, parseAgentCronJobs, CronRunLog } = await import('./cron-scheduler.js');
+  const { AGENTS_DIR } = await import('../config.js');
+  const cronParser = await import('cron-parser');
+
+  const jobs = [...parseCronJobs(), ...parseAgentCronJobs(AGENTS_DIR)];
+  const runLog = new CronRunLog();
+  const stale: StaleCronJob[] = [];
+
+  for (const job of jobs) {
+    if (!job.enabled) continue;
+    if (job.mode === 'unleashed') continue; // one-shot, no recurring SLA
+
+    // Normalize schedule — node-cron accepts 6-field (with seconds) but
+    // cron-parser only takes 5-field.
+    const fields = job.schedule.trim().split(/\s+/);
+    const expr = fields.length === 6 ? fields.slice(1).join(' ') : job.schedule;
+
+    let intervalMs: number;
+    try {
+      const parser = cronParser.CronExpressionParser.parse(expr);
+      const next = parser.next().toDate().getTime();
+      const prev = parser.prev().toDate().getTime();
+      intervalMs = next - prev;
+    } catch {
+      continue; // malformed schedule — separate concern
+    }
+    if (intervalMs <= 0) continue;
+
+    const recent = runLog.readRecent(job.name, 1);
+    const lastRunAt = recent[0]?.startedAt ?? null;
+    const lastRunMs = lastRunAt ? Date.parse(lastRunAt) : 0;
+
+    const threshold = Math.max(intervalMs * SLA_MISSED_TICKS, SLA_MIN_OVERDUE_MS);
+    const sinceLastRun = now - lastRunMs;
+    if (sinceLastRun <= threshold) continue;
+
+    stale.push({
+      jobName: job.name,
+      agentSlug: job.agentSlug,
+      schedule: job.schedule,
+      lastRunAt,
+      expectedIntervalMs: intervalMs,
+      overdueMinutes: Math.round((sinceLastRun - intervalMs) / 60_000),
+    });
+  }
+
+  return stale;
+}
+
+function formatStaleReport(stale: StaleCronJob[]): string {
+  const lines = ['**Cron SLA breach — jobs that should have run but didn\'t:**', ''];
+  for (const job of stale) {
+    const last = job.lastRunAt ? `last ran ${new Date(job.lastRunAt).toISOString().slice(0, 16).replace('T', ' ')}` : 'never run';
+    const intervalMin = Math.round(job.expectedIntervalMs / 60_000);
+    lines.push(`- **${job.jobName}** (${job.schedule}, every ${intervalMin}m) — ${last}, overdue by ~${job.overdueMinutes}m`);
+  }
+  lines.push('');
+  lines.push('The scheduler may be stuck, the job may have thrown before logging, or it may have been silently disabled. Check the dashboard Scheduled Tasks panel.');
+  return lines.join('\n');
 }
