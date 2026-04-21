@@ -248,31 +248,42 @@ export async function startSlack(
    * Returns true on success.
    *
    * Session key formats:
-   *   slack:user:{userId}                          → DM to user
+   *   slack:team:{teamId}:user:{userId}            → DM to user (workspace-namespaced, current format)
+   *   slack:team:{teamId}:dm:{userId}              → DM to user (workspace-namespaced)
+   *   slack:user:{userId}                          → DM to user (legacy, pre-namespacing)
+   *   slack:dm:{userId}                            → DM to user (legacy)
    *   slack:channel:{channelId}:{userId}           → post in channel
    *   slack:channel:{channelId}:{slug}:{userId}    → post in channel (agent-scoped chat)
-   *   slack:dm:{userId}                            → DM to user
    *   slack:agent:{slug}:{userId}                  → DM to user (agent-scoped)
    */
   async function trySlackSessionRouting(sessionKey: string, text: string): Promise<boolean> {
     const parts = sessionKey.split(':');
     if (parts[0] !== 'slack' || parts.length < 3) return false;
-    const kind = parts[1];
+
+    // Strip the `team:{teamId}:` workspace prefix if present so downstream
+    // routing logic stays format-agnostic. The current bolt app is connected
+    // to a single workspace, so we use the existing client regardless of which
+    // teamId the session names.
+    let effectiveParts = parts;
+    if (parts[1] === 'team' && parts.length >= 4) {
+      effectiveParts = ['slack', ...parts.slice(3)];
+    }
+    const kind = effectiveParts[1];
 
     try {
-      if ((kind === 'user' || kind === 'dm') && parts[2]) {
-        const dm = await app.client.conversations.open({ users: parts[2] });
+      if ((kind === 'user' || kind === 'dm') && effectiveParts[2]) {
+        const dm = await app.client.conversations.open({ users: effectiveParts[2] });
         const channelId = (dm.channel as { id: string })?.id;
         if (!channelId) return false;
         await sendChunkedSlack(app.client, channelId, mdToSlack(text));
         return true;
       }
-      if (kind === 'channel' && parts[2]) {
-        await sendChunkedSlack(app.client, parts[2], mdToSlack(text));
+      if (kind === 'channel' && effectiveParts[2]) {
+        await sendChunkedSlack(app.client, effectiveParts[2], mdToSlack(text));
         return true;
       }
-      if (kind === 'agent' && parts[3]) {
-        const dm = await app.client.conversations.open({ users: parts[3] });
+      if (kind === 'agent' && effectiveParts[3]) {
+        const dm = await app.client.conversations.open({ users: effectiveParts[3] });
         const channelId = (dm.channel as { id: string })?.id;
         if (!channelId) return false;
         await sendChunkedSlack(app.client, channelId, mdToSlack(text));

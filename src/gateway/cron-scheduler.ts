@@ -511,9 +511,16 @@ export class CronScheduler {
 
     this.watchTriggers();
 
+    // Deep-mode jobs are owned by the router (_deliverDeepResult). The
+    // cron-scheduler callbacks below only dispatch for cron-originated runs;
+    // phase updates for deep-mode runs get routed back to the originating
+    // session instead of fanning out to every registered channel.
+    const isDeepMode = (jobName: string) => jobName.startsWith('deep-');
+
     // Wire up push notifications for unleashed task completions
     this.gateway.setUnleashedCompleteCallback((jobName, result) => {
       this.completedJobs.set(jobName, Date.now());
+      if (isDeepMode(jobName)) return; // router handles delivery via _deliverDeepResult
       if (result && result !== '__NOTHING__') {
         const slug = jobName.includes(':') ? jobName.split(':')[0] : undefined;
         // Strip system metadata for clean conversational delivery
@@ -533,7 +540,13 @@ export class CronScheduler {
       const cleanOutput = output
         .replace(/^STATUS SUMMARY:?\s*/im, '')
         .slice(0, 500);
-      this.dispatcher.send(`Still working on it — ${cleanOutput}`, { agentSlug: slug }).catch(err => logger.debug({ err }, 'Failed to send phase progress notification'));
+      // For deep-mode runs, target the originating session so the progress
+      // update lands in the same Discord DM / Slack thread / dashboard window.
+      const deepSessionKey = isDeepMode(jobName) ? this.gateway.findDeepTaskSessionKey(jobName) : null;
+      const ctx: { agentSlug?: string; sessionKey?: string } = {};
+      if (slug) ctx.agentSlug = slug;
+      if (deepSessionKey) ctx.sessionKey = deepSessionKey;
+      this.dispatcher.send(`Still working on it — ${cleanOutput}`, ctx).catch(err => logger.debug({ err }, 'Failed to send phase progress notification'));
     });
 
     // Wire up real-time progress summaries (throttled to max 1 per 5 minutes)
@@ -544,7 +557,11 @@ export class CronScheduler {
       if (now - lastSent < 300_000) return; // throttle: 1 per 5 minutes
       lastProgressSent.set(jobName, now);
       const slug = jobName.includes(':') ? jobName.split(':')[0] : undefined;
-      this.dispatcher.send(summary.slice(0, 300), { agentSlug: slug }).catch(err => logger.debug({ err }, 'Failed to send phase progress summary'));
+      const deepSessionKey = isDeepMode(jobName) ? this.gateway.findDeepTaskSessionKey(jobName) : null;
+      const ctx: { agentSlug?: string; sessionKey?: string } = {};
+      if (slug) ctx.agentSlug = slug;
+      if (deepSessionKey) ctx.sessionKey = deepSessionKey;
+      this.dispatcher.send(summary.slice(0, 300), ctx).catch(err => logger.debug({ err }, 'Failed to send phase progress summary'));
     });
 
     logger.info(`Cron scheduler started with ${this.jobs.length} jobs`);

@@ -369,6 +369,19 @@ export class Gateway {
     return s;
   }
 
+  /**
+   * Reverse-lookup the session key that owns a given deep-mode jobName.
+   * Used by the cron-scheduler callbacks so phase-progress and completion
+   * messages can be routed back to the originating channel instead of
+   * fanning out to every registered sender.
+   */
+  findDeepTaskSessionKey(jobName: string): string | null {
+    for (const [key, sess] of this.sessions) {
+      if (sess.deepTask?.jobName === jobName) return key;
+    }
+    return null;
+  }
+
   // ── Team system accessors ──────────────────────────────────────────
 
   getAgentManager(): AgentManager {
