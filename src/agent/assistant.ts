@@ -71,6 +71,7 @@ import {
   setAgentDir,
   setSendPolicy,
   setInteractionSource,
+  logAuditJsonl,
 } from './hooks.js';
 import { scanner } from '../security/scanner.js';
 import { agentWorkingMemoryFile, listAllGoals } from '../tools/shared.js';
@@ -135,6 +136,58 @@ function formatCapabilities(caps: ChannelCapabilities): string {
   if (caps.editMessages) features.push('message editing');
   if (caps.maxMessageLength > 0) features.push(`max ${caps.maxMessageLength} chars/message`);
   return features.length > 0 ? features.join(', ') : 'text only';
+}
+
+/** Derive the human-readable channel label from a session key. */
+function deriveChannel(opts: { sessionKey?: string | null; isAutonomous: boolean; cronTier?: number | null }): string {
+  const { sessionKey, isAutonomous, cronTier } = opts;
+  if (isAutonomous) return cronTier != null ? 'cron' : 'heartbeat';
+  if (!sessionKey) return 'unknown';
+  if (sessionKey.startsWith('discord:user:')) return 'Discord DM';
+  if (sessionKey.startsWith('discord:channel:')) return 'Discord channel';
+  if (sessionKey.startsWith('slack:')) return 'Slack';
+  if (sessionKey.startsWith('telegram:')) return 'Telegram';
+  if (sessionKey.startsWith('whatsapp:')) return 'WhatsApp';
+  if (sessionKey.startsWith('webhook:')) return 'webhook';
+  return 'direct';
+}
+
+/**
+ * Per-channel tool deny list. Narrows what the agent can invoke based on the
+ * surface area of the channel — e.g. a public Discord channel shouldn't execute
+ * shell commands on the owner's box, and SMS/WhatsApp shouldn't touch the
+ * filesystem. Owner-direct surfaces (Discord DM, dashboard, direct CLI) get the
+ * full toolset.
+ *
+ * Returned tools are added to the SDK's `disallowedTools`. Denial is strict —
+ * it overrides the positive allowlist in buildOptions.
+ */
+function getChannelToolDenyList(channel: string): string[] {
+  const CODE_EXEC = ['Bash', 'Write', 'Edit'];
+  const SHARED_DENY = [...CODE_EXEC];
+  const SMS_DENY = [
+    ...CODE_EXEC,
+    mcpTool('browser_screenshot'),
+    mcpTool('github_prs'),
+    mcpTool('rss_fetch'),
+    mcpTool('web_search'),
+    mcpTool('analyze_image'),
+    mcpTool('self_restart'),
+    mcpTool('update_self'),
+  ];
+  switch (channel) {
+    case 'Discord channel':
+    case 'Slack':
+      return SHARED_DENY;
+    case 'WhatsApp':
+    case 'Telegram':
+      return SMS_DENY;
+    case 'webhook':
+      return SMS_DENY;
+    default:
+      // Discord DM (owner), direct, dashboard:web, autonomous, unknown → full tools.
+      return [];
+  }
 }
 
 // ── Token estimation & context window guard ─────────────────────────
@@ -676,6 +729,20 @@ export class PersonalAssistant {
 
   /** Log SDK result metrics and store usage. Shared across all query methods. */
   private logQueryResult(result: SDKResultMessage, source: string, sessionKey: string, label?: string, agentSlug?: string): void {
+    // Aggregate cache stats across all models used this turn
+    let cacheRead = 0;
+    let cacheCreation = 0;
+    let inputTokens = 0;
+    if (result.modelUsage) {
+      for (const usage of Object.values(result.modelUsage)) {
+        cacheRead += usage.cacheReadInputTokens ?? 0;
+        cacheCreation += usage.cacheCreationInputTokens ?? 0;
+        inputTokens += usage.inputTokens ?? 0;
+      }
+    }
+    const cacheDenominator = inputTokens + cacheRead + cacheCreation;
+    const cacheHitRate = cacheDenominator > 0 ? cacheRead / cacheDenominator : 0;
+
     if ('total_cost_usd' in result) {
       logger.info({
         ...(label ? { job: label } : {}),
@@ -683,7 +750,23 @@ export class PersonalAssistant {
         cost_usd: result.total_cost_usd,
         num_turns: result.num_turns,
         duration_ms: result.duration_ms,
+        cache_read_tokens: cacheRead,
+        cache_creation_tokens: cacheCreation,
+        cache_hit_rate: Number(cacheHitRate.toFixed(3)),
       }, `${source} query completed`);
+      logAuditJsonl({
+        event_type: 'query_complete',
+        source,
+        agent_slug: agentSlug,
+        job: label,
+        cost_usd: result.total_cost_usd,
+        num_turns: result.num_turns,
+        duration_ms: result.duration_ms,
+        tokens_in: inputTokens,
+        cache_read_tokens: cacheRead,
+        cache_creation_tokens: cacheCreation,
+        cache_hit_rate: Number(cacheHitRate.toFixed(3)),
+      });
     }
     if (this.memoryStore && result.modelUsage) {
       try {
@@ -745,8 +828,35 @@ export class PersonalAssistant {
       const { MEMORY_DB_PATH } = await import('../config.js');
       this.memoryStore = new MemoryStore(MEMORY_DB_PATH, VAULT_DIR);
       this.memoryStore.initialize();
+      this.primeHotCorrections();
     } catch (err) {
       logger.warn({ err }, 'Memory store init failed — falling back to static prompts');
+    }
+  }
+
+  /**
+   * Seed the in-memory hotCorrections ring buffer from persisted behavioral
+   * patterns (corrections that recurred across ≥2 sessions in the last 30d).
+   * Without this, daemon restarts would wipe the prompt-injected corrections
+   * until they reoccurred live.
+   */
+  private primeHotCorrections(): void {
+    if (!this.memoryStore) return;
+    try {
+      const patterns = this.memoryStore.getBehavioralPatterns(2);
+      const now = new Date().toISOString();
+      for (const p of patterns.slice(0, 10)) {
+        this.hotCorrections.push({
+          correction: p.correction,
+          category: p.category,
+          timestamp: now,
+        });
+      }
+      if (patterns.length > 0) {
+        logger.info({ primed: Math.min(patterns.length, 10) }, 'Primed hot corrections from behavioral patterns');
+      }
+    } catch (err) {
+      logger.warn({ err }, 'Priming hot corrections failed');
     }
   }
 
@@ -992,36 +1102,6 @@ export class PersonalAssistant {
       }
     }
 
-    const now = new Date();
-
-    // Derive channel label from session key
-    let channel = 'unknown';
-    if (isAutonomous) {
-      channel = cronTier !== null ? 'cron' : 'heartbeat';
-    } else if (sessionKey) {
-      if (sessionKey.startsWith('discord:user:')) channel = 'Discord DM';
-      else if (sessionKey.startsWith('discord:channel:')) channel = 'Discord channel';
-      else if (sessionKey.startsWith('slack:')) channel = 'Slack';
-      else if (sessionKey.startsWith('telegram:')) channel = 'Telegram';
-      else if (sessionKey.startsWith('whatsapp:')) channel = 'WhatsApp';
-      else if (sessionKey.startsWith('webhook:')) channel = 'webhook';
-      else channel = 'direct';
-    }
-
-    const resolvedModel = resolveModel(model) ?? MODEL;
-    const modelLabel = Object.entries(MODELS).find(([, v]) => v === resolvedModel)?.[0] ?? resolvedModel;
-
-    const caps = !isAutonomous ? getChannelCapabilities(channel) : null;
-    parts.push(`## Current Context
-
-- **Date:** ${formatDate(now)}
-- **Time:** ${formatTime(now)}
-- **Timezone:** ${Intl.DateTimeFormat().resolvedOptions().timeZone}
-- **Channel:** ${channel}${caps ? ` (${formatCapabilities(caps)})` : ''}
-- **Model:** ${modelLabel} (${resolvedModel})
-- **Vault:** ${vault}
-`);
-
     if (isAutonomous) {
       // Minimal vault reference for heartbeats/cron — they know their tools
       parts.push(`Vault: \`${vault}\`. Key files: MEMORY.md, ${todayISO()}.md (today), TASKS.md. Use MCP tools (memory_read/write, task_list/add/update, note_take).`);
@@ -1107,7 +1187,8 @@ Never spawn a sub-agent with vague instructions like "handle this brief" — tel
     // Proactive skill injection: match user message against skill triggers
     if (this._lastUserMessage && !isAutonomous) {
       try {
-        const matchedSkills = searchSkillsSync(this._lastUserMessage, 1, profile?.slug);
+        const suppressedNames = this.memoryStore?.getSkillsToSuppress?.(profile?.slug);
+        const matchedSkills = searchSkillsSync(this._lastUserMessage, 1, profile?.slug, { suppressedNames });
         if (matchedSkills.length > 0 && matchedSkills[0].score >= 4) {
           const skill = matchedSkills[0];
           this.memoryStore?.logSkillUse?.({
@@ -1293,6 +1374,22 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
 
     // Security rules are now appended to systemPrompt in buildOptions()
 
+    // Volatile suffix — put last so the stable prefix above stays cache-friendly.
+    const channel = deriveChannel({ sessionKey, isAutonomous, cronTier });
+    const resolvedModel = resolveModel(model) ?? MODEL;
+    const modelLabel = Object.entries(MODELS).find(([, v]) => v === resolvedModel)?.[0] ?? resolvedModel;
+    const caps = !isAutonomous ? getChannelCapabilities(channel) : null;
+    const now = new Date();
+    parts.push(`## Current Context
+
+- **Date:** ${formatDate(now)}
+- **Time:** ${formatTime(now)}
+- **Timezone:** ${Intl.DateTimeFormat().resolvedOptions().timeZone}
+- **Channel:** ${channel}${caps ? ` (${formatCapabilities(caps)})` : ''}
+- **Model:** ${modelLabel} (${resolvedModel})
+- **Vault:** ${vault}
+`);
+
     return parts.join('\n\n---\n\n');
   }
 
@@ -1459,8 +1556,17 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
     // Cron tier 1 gets heartbeat restrictions (read-only + vault writes).
     const isCron = cronTier !== null;
     const disallowed = isHeartbeat && (!isCron || (cronTier ?? 0) < 2)
-      ? getHeartbeatDisallowedTools()
+      ? [...getHeartbeatDisallowedTools()]
       : [];
+
+    // Per-channel tool scoping: narrow tools for surfaces where destructive
+    // operations shouldn't happen (public Discord/Slack channels, SMS-like
+    // channels, webhooks). Owner DMs + dashboard keep the full toolset.
+    const channelForScoping = deriveChannel({ sessionKey, isAutonomous: isHeartbeat || isCron, cronTier });
+    const channelDeny = getChannelToolDenyList(channelForScoping);
+    if (channelDeny.length > 0) {
+      for (const t of channelDeny) if (!disallowed.includes(t)) disallowed.push(t);
+    }
     // Cron/heartbeat get turn limits. Interactive chat has no turn cap —
     // cost budget (maxBudgetUsd) is the primary guardrail.
     const effectiveMaxTurns = maxTurns
@@ -1644,7 +1750,8 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
         (async (): Promise<string | undefined> => {
           try {
             const { searchSkills, recordSkillUse } = await import('./skill-extractor.js');
-            const matchedSkills = searchSkills(enrichedQuery, 2, agentSlug || undefined);
+            const suppressedNames = this.memoryStore?.getSkillsToSuppress?.(agentSlug || undefined);
+            const matchedSkills = searchSkills(enrichedQuery, 2, agentSlug || undefined, { suppressedNames });
             if (matchedSkills.length > 0) {
               return `## Relevant Procedures (from past successful executions)\n\n` +
                 matchedSkills.map(s => {
@@ -2195,6 +2302,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
         let responseText = '';
         let sessionId = '';
         let hitRateLimit = false;
+        let rateLimitRetryAfterMs: number | null = null;
         let staleSession = false;
         let contextRecovery = false;
         let lastAssistantBlocks: ContentBlock[] = [];
@@ -2342,6 +2450,16 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
             }
           } else if (errStr.includes('rate') && (errStr.includes('limit') || errStr.includes('rate_limit'))) {
             hitRateLimit = true;
+            // Try to respect any retry hint the server surfaced in the error text.
+            // Matches: "retry-after: 30", "retry after 30 seconds", "retry in 30s".
+            const m = errStr.match(/retry[-\s]?(?:after|in)[:\s]*(\d+)\s*(ms|s|seconds?|milliseconds?)?/);
+            if (m) {
+              const n = Number(m[1]);
+              if (Number.isFinite(n) && n > 0) {
+                const unit = (m[2] ?? 's').toLowerCase();
+                rateLimitRetryAfterMs = unit.startsWith('ms') || unit.startsWith('milli') ? n : n * 1000;
+              }
+            }
           } else if (errStr.includes('autocompact') || errStr.includes('thrash') || errStr.includes('context refilled to the limit')) {
             // SDK autocompact thrashing — tool outputs are too large for the context window.
             // Rotate session and retry with a fresh context so the agent can continue.
@@ -2418,10 +2536,16 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
         }
 
         if (hitRateLimit && attempt < PersonalAssistant.RATE_LIMIT_MAX_RETRIES) {
-          const wait = PersonalAssistant.RATE_LIMIT_BACKOFF[
-            Math.min(attempt, PersonalAssistant.RATE_LIMIT_BACKOFF.length - 1)
-          ];
+          const base = rateLimitRetryAfterMs
+            ?? PersonalAssistant.RATE_LIMIT_BACKOFF[
+              Math.min(attempt, PersonalAssistant.RATE_LIMIT_BACKOFF.length - 1)
+            ];
+          // ±25% jitter so concurrent retries don't align and re-collide.
+          const jitter = 1 + (Math.random() - 0.5) * 0.5;
+          const wait = Math.max(500, Math.round(base * jitter));
+          logger.info({ sessionKey, attempt, waitMs: wait, hintedRetryAfterMs: rateLimitRetryAfterMs }, 'Rate-limited — waiting before retry');
           await new Promise((r) => setTimeout(r, wait));
+          rateLimitRetryAfterMs = null; // hint is per-attempt
           continue;
         }
 
@@ -3489,7 +3613,8 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
       const { searchSkills, recordSkillUse } = await import('./skill-extractor.js');
       const cronAgentSlug = sdkOptions.env?.CLEMENTINE_TEAM_AGENT;
       const skillQuery = jobName + ' ' + jobPrompt.slice(0, 200);
-      const matchedSkills = searchSkills(skillQuery, 2, cronAgentSlug || undefined);
+      const suppressedNames = this.memoryStore?.getSkillsToSuppress?.(cronAgentSlug || undefined);
+      const matchedSkills = searchSkills(skillQuery, 2, cronAgentSlug || undefined, { suppressedNames });
       if (matchedSkills.length > 0) {
         const skillLines = matchedSkills.map(s => {
           recordSkillUse(s.name);
@@ -3876,7 +4001,8 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
           const { searchSkills, recordSkillUse } = await import('./skill-extractor.js');
           const unleashedAgentSlug = jobName.includes(':') ? jobName.split(':')[0] : undefined;
           const unleashedSkillQuery = jobName + ' ' + jobPrompt.slice(0, 200);
-          const matchedSkills = searchSkills(unleashedSkillQuery, 2, unleashedAgentSlug);
+          const suppressedNames = this.memoryStore?.getSkillsToSuppress?.(unleashedAgentSlug);
+          const matchedSkills = searchSkills(unleashedSkillQuery, 2, unleashedAgentSlug, { suppressedNames });
           if (matchedSkills.length > 0) {
             unleashedSkillContext = `\n\n## Learned Procedures\nFollow these proven approaches when applicable:\n\n` +
               matchedSkills.map(s => {

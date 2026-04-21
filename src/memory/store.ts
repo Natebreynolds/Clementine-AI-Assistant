@@ -1894,6 +1894,38 @@ export class MemoryStore {
   }
 
   /**
+   * Skills to suppress from retrieval: those that coincide with negative feedback
+   * in ≥3 sessions and whose negative rate exceeds 50% of rated sessions.
+   * Attribution is by session_key join; a feedback entry is credited to every
+   * skill retrieved in that session. Window: last 60 days.
+   */
+  getSkillsToSuppress(agentSlug?: string): Set<string> {
+    const suppressed = new Set<string>();
+    try {
+      const sql = `
+        SELECT su.skill_name,
+               SUM(CASE WHEN f.rating = 'negative' THEN 1 ELSE 0 END) AS negative,
+               SUM(CASE WHEN f.rating = 'positive' THEN 1 ELSE 0 END) AS positive,
+               COUNT(DISTINCT f.id) AS total
+        FROM skill_usage su
+        JOIN feedback f ON f.session_key = su.session_key
+        WHERE su.retrieved_at >= datetime('now', '-60 days')
+          AND f.created_at >= su.retrieved_at
+          ${agentSlug ? 'AND su.agent_slug = ?' : ''}
+        GROUP BY su.skill_name
+        HAVING negative >= 3 AND negative * 2 > total
+      `;
+      const rows = this.conn.prepare(sql).all(
+        ...(agentSlug ? [agentSlug] : []),
+      ) as Array<{ skill_name: string; negative: number; positive: number; total: number }>;
+      for (const r of rows) suppressed.add(r.skill_name);
+    } catch {
+      // skill_usage or feedback tables may be empty / legacy — return empty set
+    }
+    return suppressed;
+  }
+
+  /**
    * Get aggregate feedback statistics.
    */
   getFeedbackStats(): { positive: number; negative: number; mixed: number; total: number } {

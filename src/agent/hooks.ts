@@ -11,6 +11,8 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
+import { AsyncLocalStorage } from 'node:async_hooks';
+import { randomUUID } from 'node:crypto';
 import { OWNER_NAME, BASE_DIR, TIMEZONE } from '../config.js';
 import type { SendPolicy } from '../types.js';
 
@@ -42,21 +44,116 @@ let interactionSource: 'owner-dm' | 'owner-channel' | 'member-channel' | 'autono
 const logsDir = path.join(BASE_DIR, 'logs');
 fs.mkdirSync(logsDir, { recursive: true });
 const auditLogPath = path.join(logsDir, 'audit.log');
+const auditJsonlPath = path.join(logsDir, 'audit.jsonl');
 const MAX_AUDIT_SIZE = 5 * 1024 * 1024; // 5 MB
+
+function rotateIfLarge(filePath: string): void {
+  try {
+    if (!fs.existsSync(filePath)) return;
+    const stat = fs.statSync(filePath);
+    if (stat.size <= MAX_AUDIT_SIZE) return;
+    const backup = filePath + '.1';
+    if (fs.existsSync(backup)) fs.unlinkSync(backup);
+    fs.renameSync(filePath, backup);
+  } catch {
+    // Non-fatal
+  }
+}
 
 function appendAuditFile(line: string): void {
   try {
-    // Simple rotation: if file exceeds max size, rename to .log.1 and start fresh
-    if (fs.existsSync(auditLogPath)) {
-      const stat = fs.statSync(auditLogPath);
-      if (stat.size > MAX_AUDIT_SIZE) {
-        const backup = auditLogPath + '.1';
-        if (fs.existsSync(backup)) fs.unlinkSync(backup);
-        fs.renameSync(auditLogPath, backup);
-      }
-    }
+    rotateIfLarge(auditLogPath);
     const timestamp = new Date().toISOString().replace('T', ' ').slice(0, 19);
     fs.appendFileSync(auditLogPath, `${timestamp} ${line}\n`);
+  } catch {
+    // Non-fatal — audit logging should never crash the assistant
+  }
+}
+
+// ── Distributed trace context (AsyncLocalStorage) ─────────────────────
+
+export interface TraceContext {
+  trace_id: string;
+  session_id?: string;
+  channel?: string;
+  agent_slug?: string;
+  span_stack: string[]; // [span_id, parent_span_id, ...]
+}
+
+const traceStorage = new AsyncLocalStorage<TraceContext>();
+
+function shortId(): string {
+  // 8-char id — collision-resistant enough for per-session correlation and
+  // much easier to eyeball in logs than a full UUID.
+  return randomUUID().replace(/-/g, '').slice(0, 8);
+}
+
+/**
+ * Run `fn` inside a trace context. Creates a new trace_id if none is supplied
+ * and inherited from an outer context. Nested calls push a span_id onto the
+ * stack so parent/child relationships survive async hops.
+ */
+export function runWithTrace<T>(
+  ctx: {
+    trace_id?: string;
+    session_id?: string;
+    channel?: string;
+    agent_slug?: string;
+  },
+  fn: () => Promise<T> | T,
+): Promise<T> | T {
+  const existing = traceStorage.getStore();
+  const trace_id = ctx.trace_id ?? existing?.trace_id ?? shortId();
+  const store: TraceContext = {
+    trace_id,
+    session_id: ctx.session_id ?? existing?.session_id,
+    channel: ctx.channel ?? existing?.channel,
+    agent_slug: ctx.agent_slug ?? existing?.agent_slug,
+    span_stack: [shortId(), ...(existing?.span_stack ?? [])],
+  };
+  return traceStorage.run(store, fn);
+}
+
+export function getTraceContext(): TraceContext | undefined {
+  return traceStorage.getStore();
+}
+
+// ── Structured JSONL audit events ─────────────────────────────────────
+
+export interface AuditEvent {
+  event_type: string;
+  tool_name?: string;
+  duration_ms?: number;
+  tokens_in?: number;
+  tokens_out?: number;
+  cache_read_tokens?: number;
+  cache_creation_tokens?: number;
+  cost_usd?: number;
+  num_turns?: number;
+  error?: string;
+  [key: string]: unknown;
+}
+
+/**
+ * Append a structured event to audit.jsonl with the current trace context.
+ * Runs alongside (not in place of) the legacy text audit.log so existing
+ * consumers keep working.
+ */
+export function logAuditJsonl(event: AuditEvent): void {
+  try {
+    rotateIfLarge(auditJsonlPath);
+    const ctx = traceStorage.getStore();
+    const payload: Record<string, unknown> = {
+      ts: new Date().toISOString(),
+      trace_id: ctx?.trace_id,
+      span_id: ctx?.span_stack[0],
+      parent_span_id: ctx?.span_stack[1],
+      session_id: ctx?.session_id,
+      channel: ctx?.channel,
+      agent_slug: ctx?.agent_slug,
+      ...event,
+    };
+    fs.appendFileSync(auditJsonlPath, JSON.stringify(payload) + '\n');
   } catch {
     // Non-fatal — audit logging should never crash the assistant
   }
@@ -121,6 +218,11 @@ export function logToolUse(toolName: string, toolInput: Record<string, unknown>)
   const entry = `- \`${timestamp}\` **${toolName}** — ${summary}`;
   auditLog.push(entry);
   appendAuditFile(`${toolName} — ${summary}`);
+  logAuditJsonl({
+    event_type: 'tool_use',
+    tool_name: toolName,
+    summary,
+  });
 }
 
 // ── Heartbeat tool restrictions ─────────────────────────────────────

@@ -9,6 +9,7 @@ import path from 'node:path';
 import { appendFileSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
 import pino from 'pino';
 import { PersonalAssistant, type ProjectMeta } from '../agent/assistant.js';
+import { runWithTrace, logAuditJsonl } from '../agent/hooks.js';
 import type { OnTextCallback, OnToolActivityCallback, PlanProgressUpdate, PlanStep, SelfImproveConfig, SelfImproveExperiment, SessionProvenance, TeamMessage, VerboseLevel, WorkflowDefinition } from '../types.js';
 import { SelfImproveLoop } from '../agent/self-improve.js';
 import { MODELS, PROFILES_DIR, AGENTS_DIR, TEAM_COMMS_LOG, BASE_DIR, SEEN_CHANNELS_FILE } from '../config.js';
@@ -792,6 +793,55 @@ export class Gateway {
     if (this.draining) {
       return "I'm restarting momentarily — your message will be processed after I'm back online.";
     }
+
+    // Derive channel label for the trace tag. Mirrors deriveChannel() in the
+    // agent layer but kept small here so the router stays independent.
+    const channelForTrace = sessionKey.startsWith('discord:user:') ? 'Discord DM'
+      : sessionKey.startsWith('discord:channel:') ? 'Discord channel'
+      : sessionKey.startsWith('slack:') ? 'Slack'
+      : sessionKey.startsWith('telegram:') ? 'Telegram'
+      : sessionKey.startsWith('whatsapp:') ? 'WhatsApp'
+      : sessionKey.startsWith('webhook:') ? 'webhook'
+      : sessionKey.startsWith('dashboard:') ? 'dashboard'
+      : 'direct';
+
+    const traceStart = Date.now();
+    return runWithTrace(
+      { session_id: sessionKey, channel: channelForTrace },
+      async () => {
+        logAuditJsonl({
+          event_type: 'message_received',
+          text_preview: text.slice(0, 120),
+          text_len: text.length,
+        });
+        try {
+          const result = await this._handleMessageInner(sessionKey, text, onText, model, maxTurns, onToolActivity);
+          logAuditJsonl({
+            event_type: 'message_completed',
+            duration_ms: Date.now() - traceStart,
+            response_len: result.length,
+          });
+          return result;
+        } catch (err) {
+          logAuditJsonl({
+            event_type: 'message_failed',
+            duration_ms: Date.now() - traceStart,
+            error: String(err).slice(0, 300),
+          });
+          throw err;
+        }
+      },
+    ) as Promise<string>;
+  }
+
+  private async _handleMessageInner(
+    sessionKey: string,
+    text: string,
+    onText?: OnTextCallback,
+    model?: string,
+    maxTurns?: number,
+    onToolActivity?: OnToolActivityCallback,
+  ): Promise<string> {
 
     // ── Auth circuit breaker — stop spamming error messages ────────
     if (this.authCircuitOpen) {

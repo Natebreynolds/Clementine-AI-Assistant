@@ -366,7 +366,12 @@ export interface SkillMatch {
   skillDir: string;
 }
 
-export function searchSkills(query: string, limit = 3, agentSlug?: string): SkillMatch[] {
+export function searchSkills(
+  query: string,
+  limit = 3,
+  agentSlug?: string,
+  opts?: { suppressedNames?: Set<string> },
+): SkillMatch[] {
   const dirs: Array<{ dir: string; boost: number }> = [];
   // Agent-scoped skills get priority (boost=2)
   if (agentSlug) {
@@ -381,6 +386,7 @@ export function searchSkills(query: string, limit = 3, agentSlug?: string): Skil
   const queryWords = query.toLowerCase().split(/\s+/).filter(w => w.length > 2);
   const results: SkillMatch[] = [];
   const seen = new Set<string>();
+  const suppressed = opts?.suppressedNames;
 
   for (const { dir, boost } of dirs) {
     const files = readdirSync(dir).filter(f => f.endsWith('.md'));
@@ -388,6 +394,9 @@ export function searchSkills(query: string, limit = 3, agentSlug?: string): Skil
       const name = file.replace('.md', '');
       if (seen.has(name)) continue;
       seen.add(name);
+      // Feedback-gated: skip skills that have been repeatedly associated with
+      // negative user feedback (see store.getSkillsToSuppress).
+      if (suppressed?.has(name)) continue;
       try {
         const raw = readFileSync(path.join(dir, file), 'utf-8');
         const parsed = matter(raw);
