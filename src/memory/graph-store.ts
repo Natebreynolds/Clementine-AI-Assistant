@@ -632,6 +632,52 @@ export class GraphStore {
     if (lines.length === 0) return '';
     return '\n## Relationship Context\n' + lines.join('\n');
   }
+
+  /**
+   * Drop Note nodes whose slug isn't in the caller-provided set of valid IDs.
+   * Wikilinks into deleted vault files leave dangling Note nodes with
+   * MENTIONS edges pointing at them — this cleans those up.
+   *
+   * Deliberately NOT auto-scheduled: blast radius is significant, and the
+   * caller (dashboard action, MCP tool, manual script) should supply the
+   * authoritative valid-IDs set. Runs DETACH DELETE so incoming edges go
+   * with the node.
+   *
+   * Returns counts of what was removed.
+   */
+  async invalidateOrphanedNotes(validIds: Set<string>): Promise<{ scanned: number; deleted: number }> {
+    if (!this.available) return { scanned: 0, deleted: 0 };
+    if (validIds.size === 0) {
+      // Defense: refuse to run with an empty set — would delete every Note.
+      logger.warn('invalidateOrphanedNotes called with empty validIds — refusing to run');
+      return { scanned: 0, deleted: 0 };
+    }
+
+    let scanned = 0;
+    let deleted = 0;
+    try {
+      const res = await this.graph.query('MATCH (n:Note) RETURN n.id AS id');
+      const rows = (res.data ?? []) as Array<{ id: string | null }>;
+      scanned = rows.length;
+      for (const row of rows) {
+        const id = row.id;
+        if (!id || validIds.has(id)) continue;
+        try {
+          await this.graph.query('MATCH (n:Note {id: $id}) DETACH DELETE n', { params: { id } });
+          deleted++;
+        } catch (err) {
+          logger.debug({ err, id }, 'Orphan Note deletion failed');
+        }
+      }
+    } catch (err) {
+      logger.warn({ err }, 'invalidateOrphanedNotes query failed');
+    }
+
+    if (deleted > 0) {
+      logger.info({ scanned, deleted, validIdsSize: validIds.size }, 'Invalidated orphan Note nodes');
+    }
+    return { scanned, deleted };
+  }
 }
 
 // ── Shared Client Helper ───────────────────────────────────────────────

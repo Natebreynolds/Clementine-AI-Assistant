@@ -22,8 +22,13 @@ interface ContextSlot {
   maxChars: number;
   /** Minimum remaining budget required before this slot is filled. 0 = always attempt. */
   minRemainingBudget: number;
-  /** Resolve the content for this slot. Returns empty string to skip. */
-  resolve: () => string | Promise<string>;
+  /**
+   * Resolve the content for this slot. Receives the effective budget
+   * (min of slot's maxChars and actually-remaining total), so the slot can
+   * produce content that fits exactly rather than relying on the outer
+   * mid-string truncation which cuts entries in half.
+   */
+  resolve: (effectiveBudget: number) => string | Promise<string>;
 }
 
 export interface AssembledContext {
@@ -80,12 +85,13 @@ export async function assembleContext(options: AssemblerOptions): Promise<Assemb
       priority: 0,
       maxChars: 500,
       minRemainingBudget: 0,
-      resolve: () => {
+      resolve: (budget) => {
         if (!fs.existsSync(idPath)) return '';
         try {
           const content = fs.readFileSync(idPath, 'utf-8').trim();
           if (!content) return '';
-          return `## Identity\n\n${content}`;
+          const block = `## Identity\n\n${content}`;
+          return block.length > budget ? block.slice(0, budget) : block;
         } catch { return ''; }
       },
     });
@@ -99,12 +105,13 @@ export async function assembleContext(options: AssemblerOptions): Promise<Assemb
       priority: 1,
       maxChars: isAutonomous ? 1000 : 2000,
       minRemainingBudget: 0,
-      resolve: () => {
+      resolve: (budget) => {
         if (!fs.existsSync(wmPath)) return '';
         try {
           const content = fs.readFileSync(wmPath, 'utf-8').trim();
           if (!content) return '';
-          return `## Working Memory (scratchpad)\n\n${content}`;
+          const block = `## Working Memory (scratchpad)\n\n${content}`;
+          return block.length > budget ? block.slice(0, budget) : block;
         } catch { return ''; }
       },
     });
@@ -118,11 +125,16 @@ export async function assembleContext(options: AssemblerOptions): Promise<Assemb
       priority: 2,
       maxChars: isAutonomous ? 1000 : 2000,
       minRemainingBudget: 500,
-      resolve: () => skillCtx,
+      resolve: (budget) => skillCtx.length > budget ? skillCtx.slice(0, budget) : skillCtx,
     });
   }
 
   // Slot 3: Memory search results (core recall)
+  // formatResultsForPrompt respects the effective budget and breaks on
+  // entry boundaries (not mid-string), so we don't need the outer
+  // slice-truncation to kick in here. Previously this slot was double-
+  // truncated: formatter used its own 8000 cap, then the outer loop cut
+  // further by Math.min(maxChars, remaining), chopping entries in half.
   if (options.memoryResults && options.memoryResults.length > 0) {
     const results = options.memoryResults;
     slots.push({
@@ -130,10 +142,7 @@ export async function assembleContext(options: AssemblerOptions): Promise<Assemb
       priority: 3,
       maxChars: isAutonomous ? 2000 : 8000,
       minRemainingBudget: 200,
-      resolve: () => {
-        // formatResultsForPrompt already handles truncation within its own budget
-        return formatResultsForPrompt(results, isAutonomous ? 2000 : 8000);
-      },
+      resolve: (budget) => formatResultsForPrompt(results, budget),
     });
   }
 
@@ -145,7 +154,7 @@ export async function assembleContext(options: AssemblerOptions): Promise<Assemb
       priority: 4,
       maxChars: 2000,
       minRemainingBudget: 500,
-      resolve: () => graphCtx,
+      resolve: (budget) => graphCtx.length > budget ? graphCtx.slice(0, budget) : graphCtx,
     });
   }
 
@@ -166,20 +175,29 @@ export async function assembleContext(options: AssemblerOptions): Promise<Assemb
     }
 
     try {
-      let content = await slot.resolve();
+      // The slot's effective budget is the smaller of its own maxChars and
+      // what's actually remaining across all slots. Passed into resolve so
+      // the slot produces right-sized content up front, not a mid-entry
+      // truncation after the fact.
+      const effectiveBudget = Math.min(slot.maxChars, remaining);
+      const content = await slot.resolve(effectiveBudget);
       if (!content) {
         skipped.push(slot.name);
         continue;
       }
 
-      // Truncate to the smaller of slot max and remaining budget
-      const limit = Math.min(slot.maxChars, remaining);
-      if (content.length > limit) {
-        content = content.slice(0, limit) + '\n...(truncated)';
+      // Safety net: if resolve() ignored the budget and returned too much,
+      // clip at a line boundary rather than a character boundary so we don't
+      // leave a malformed half-block in the prompt.
+      let finalContent = content;
+      if (content.length > effectiveBudget) {
+        const trimmed = content.slice(0, effectiveBudget);
+        const lastNewline = trimmed.lastIndexOf('\n');
+        finalContent = (lastNewline > 0 ? trimmed.slice(0, lastNewline) : trimmed) + '\n...(truncated)';
       }
 
-      parts.push(content);
-      remaining -= content.length;
+      parts.push(finalContent);
+      remaining -= finalContent.length;
       included.push(slot.name);
     } catch {
       skipped.push(slot.name);

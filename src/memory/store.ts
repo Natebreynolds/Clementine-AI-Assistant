@@ -15,6 +15,7 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statS
 import path from 'node:path';
 import Database from 'better-sqlite3';
 import { BASE_DIR } from '../config.js';
+import { temporalDecay } from './search.js';
 import type {
   Feedback,
   MemoryExtraction,
@@ -870,20 +871,30 @@ export class MemoryStore {
       topic: string | null;
     };
 
-    const mapRow = (row: ChunkRow): SearchResult => ({
-      sourceFile: row.source_file,
-      section: row.section,
-      content: row.content,
-      score: 0,
-      chunkType: row.chunk_type,
-      matchType: 'recency' as const,
-      lastUpdated: row.updated_at ?? '',
-      chunkId: row.id,
-      salience: row.salience ?? 0,
-      agentSlug: row.agent_slug ?? null,
-      category: row.category,
-      topic: row.topic,
-    });
+    const now = Date.now();
+    const mapRow = (row: ChunkRow): SearchResult => {
+      // Score recency by exponential decay (half-life 30 days). Previously
+      // every recent row got score=0, which meant MMR's min-max normalization
+      // ranked them at the floor — a two-day-old chunk and a six-month-old
+      // chunk were indistinguishable. Decay lets recent results actually
+      // compete with FTS and vector matches during rerank.
+      const daysOld = row.updated_at ? (now - Date.parse(row.updated_at)) / 86_400_000 : 0;
+      const decayed = temporalDecay(daysOld);
+      return {
+        sourceFile: row.source_file,
+        section: row.section,
+        content: row.content,
+        score: decayed,
+        chunkType: row.chunk_type,
+        matchType: 'recency' as const,
+        lastUpdated: row.updated_at ?? '',
+        chunkId: row.id,
+        salience: row.salience ?? 0,
+        agentSlug: row.agent_slug ?? null,
+        category: row.category,
+        topic: row.topic,
+      };
+    };
 
     // Build optional WHERE clauses for category/topic
     let filterSql = '';
