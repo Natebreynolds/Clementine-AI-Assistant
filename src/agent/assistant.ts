@@ -1215,7 +1215,9 @@ The **only source of truth for tool availability is your function schema**. Do n
 
 **Never** say the tool "isn't loaded in this session," "doesn't carry over from Claude Desktop," "the tools array is empty," or "MCP server still connecting." If any of those phrasings come to mind, call the tool directly and report what actually happens instead.
 
-\`list_allowed_tools\` / \`disallow_tool\` manage the whitelist. \`integration_status\` is for env-var (API key) integrations — not for claude_ai_* connectors, which are schema-driven.
+\`list_allowed_tools\` / \`disallow_tool\` manage the whitelist. \`integration_status\` is for env-var (API key) integrations — **not** for claude_ai_* connectors, which are schema-driven. Don't use \`integration_status\` as a proxy for "can I call Drive / Gmail / etc." — those are always tried by direct tool call, not status lookup.
+
+**Critical rule: if the user asks you to use a claude_ai_* connector, you call the connector tool. Full stop.** Do not report "I tried and it failed" unless there was an actual tool call that returned an actual error — your audit log records every tool call, so narrating a failed attempt when the audit shows no call will be spotted.
 
 ## Context Window Management
 
@@ -1809,13 +1811,16 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
           type: 'stdio',
           command: 'node',
           args: [MCP_SERVER_SCRIPT],
+          // Spread process.env so the MCP subprocess sees the full environment
+          // the daemon is running with — API keys hydrated from .env/Keychain,
+          // PATH, HOME, etc. Without this, tools that inspect env vars
+          // (integration_status, Outlook/Graph, Salesforce) see only the
+          // handful we pass and report everything as "missing." Our explicit
+          // keys come after the spread so we always win on overlaps.
           env: {
+            ...process.env,
             CLEMENTINE_HOME: BASE_DIR,
             CLEMENTINE_TEAM_AGENT: profile?.slug ?? 'clementine',
-            // Propagate interaction-source so the MCP subprocess can gate
-            // owner-only tools. Without this, getInteractionSource() inside
-            // the subprocess returns the module-default 'autonomous' and
-            // every owner-DM-gated tool (env_set, allow_tool, etc.) refuses.
             CLEMENTINE_INTERACTION_SOURCE: sourceOverride ?? inferInteractionSource(sessionKey),
           },
         },
@@ -3373,6 +3378,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
               command: 'node',
               args: [MCP_SERVER_SCRIPT],
               env: {
+                ...process.env,
                 CLEMENTINE_HOME: BASE_DIR,
                 CLEMENTINE_TEAM_AGENT: profile?.slug ?? 'clementine',
                 // Auto-memory extractor runs autonomously.
