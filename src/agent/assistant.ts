@@ -1710,6 +1710,11 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
     if (channelDeny.length > 0) {
       for (const t of channelDeny) if (!disallowed.includes(t)) disallowed.push(t);
     }
+    // ToolSearch returns misleading "MCP server still connecting" text for
+    // Claude Desktop connectors (Drive/Gmail/etc.) during cold boot, which
+    // sonnet interprets as "tool unavailable" and bails instead of just
+    // calling the tool directly. Removing it forces direct tool calls.
+    if (!disallowed.includes('ToolSearch')) disallowed.push('ToolSearch');
     // Cron/heartbeat get turn limits. Interactive chat has no turn cap —
     // cost budget (maxBudgetUsd) is the primary guardrail.
     const effectiveMaxTurns = maxTurns
