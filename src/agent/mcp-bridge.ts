@@ -441,6 +441,75 @@ export function getClaudeIntegrations(): ClaudeIntegration[] {
   return Object.values(loadClaudeIntegrations());
 }
 
+// ── SDK tool inventory probe ───────────────────────────────────────────
+
+const TOOL_INVENTORY_FILE = path.join(BASE_DIR, '.tool-inventory.json');
+const TOOL_INVENTORY_MAX_AGE_MS = 24 * 60 * 60 * 1000; // 24h
+
+export interface ToolInventory {
+  /** ISO timestamp of the probe */
+  probedAt: string;
+  /** Full list of tool names the SDK reported in init.tools when no whitelist was applied */
+  tools: string[];
+}
+
+export function loadToolInventory(): ToolInventory | null {
+  try {
+    if (!existsSync(TOOL_INVENTORY_FILE)) return null;
+    const data = JSON.parse(readFileSync(TOOL_INVENTORY_FILE, 'utf-8')) as ToolInventory;
+    if (!Array.isArray(data.tools)) return null;
+    return data;
+  } catch { return null; }
+}
+
+function saveToolInventory(inv: ToolInventory): void {
+  try { writeFileSync(TOOL_INVENTORY_FILE, JSON.stringify(inv, null, 2)); }
+  catch { /* non-fatal */ }
+}
+
+/**
+ * Run a minimal SDK query with NO tool whitelist so the init message
+ * returns every tool Claude Code is actually surfacing — claude_ai_*
+ * connectors, plugins, built-ins, custom MCP servers. Cached for 24h.
+ * This removes any need to hardcode user-specific tool names in the
+ * system prompt; whatever Claude Desktop is currently connecting to the
+ * user's account becomes automatically available to the agent.
+ */
+export async function probeAvailableTools(force = false): Promise<ToolInventory> {
+  const cached = loadToolInventory();
+  if (!force && cached) {
+    const age = Date.now() - Date.parse(cached.probedAt);
+    if (Number.isFinite(age) && age < TOOL_INVENTORY_MAX_AGE_MS) return cached;
+  }
+  try {
+    const { query } = await import('@anthropic-ai/claude-agent-sdk');
+    const stream = query({
+      prompt: 'ok',
+      options: {
+        systemPrompt: 'Reply ok.',
+        model: 'claude-haiku-4-5',
+        permissionMode: 'bypassPermissions',
+        allowDangerouslySkipPermissions: true,
+      },
+    });
+    let tools: string[] = [];
+    for await (const msg of stream as AsyncIterable<any>) {
+      if (msg?.type === 'system' && msg?.subtype === 'init' && Array.isArray(msg.tools)) {
+        tools = msg.tools as string[];
+        break;
+      }
+      if (msg?.type === 'result') break;
+    }
+    const inv: ToolInventory = { probedAt: new Date().toISOString(), tools };
+    saveToolInventory(inv);
+    logger.info({ toolCount: tools.length }, 'Tool inventory probed');
+    return inv;
+  } catch (err) {
+    logger.warn({ err }, 'Tool inventory probe failed — using cached or empty');
+    return cached ?? { probedAt: new Date(0).toISOString(), tools: [] };
+  }
+}
+
 /**
  * Register every integration found in a tool inventory. The SDK's system
  * init message (subtype='init') includes a `tools: string[]` with the full

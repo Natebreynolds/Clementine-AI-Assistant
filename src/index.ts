@@ -595,9 +595,13 @@ async function asyncMain(): Promise<void> {
 
   // ── Check MCP extension permissions ────────────────────────────
   try {
-    const { checkPermissionsOnStartup, bootstrapClaudeIntegrationsFromAuditLog } = await import('./agent/mcp-bridge.js');
+    const { checkPermissionsOnStartup, bootstrapClaudeIntegrationsFromAuditLog, probeAvailableTools } = await import('./agent/mcp-bridge.js');
     checkPermissionsOnStartup();
     bootstrapClaudeIntegrationsFromAuditLog(path.join(config.BASE_DIR, 'logs', 'audit.log'));
+    // Fire-and-forget: probe the SDK's full tool inventory so buildOptions
+    // knows everything Claude Code is surfacing (claude_ai_* connectors,
+    // plugins, etc.) without per-user hardcoding. Cached 24h.
+    probeAvailableTools().catch(() => { /* non-fatal, buildOptions falls back to baseline */ });
   } catch { /* non-fatal */ }
 
   // ── Initialize layers ────────────────────────────────────────────

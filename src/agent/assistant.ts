@@ -1180,28 +1180,20 @@ When ${owner} gives you an API key, access token, or similar credential in chat,
 
 Use \`env_list\` to show what's configured (values masked) and \`env_unset\` to remove one. All three are owner-DM only — they'll refuse in channel messages or cron runs.
 
-### Tool schema self-extension — READ CAREFULLY
+### When a tool call is refused
 
-Your \`allowedTools\` list is extensible. You can add tools to it yourself via \`allow_tool(name)\`. This is a persistent write that takes effect on your next query.
+If any tool call fails with "not in my function schema" / "tool not allowed" / "unknown tool" while you can see the tool exists in your SDK inventory:
 
-**For Claude Desktop connectors (\`mcp__claude_ai_*\` tools: Google Drive, Gmail, Calendar, Slack, etc.):**
-- They DO work from agent/daemon contexts. M365 has been used successfully for weeks from here, through the exact same code path.
-- If your first call is refused, the reason is **only** that the specific tool name isn't in your current allowedTools. Nothing to do with Claude Desktop vs. agent contexts. Nothing to do with the integrations.json file having an empty tools array.
-- The fix is **always** the same: \`allow_tool("mcp__claude_ai_<IntegrationName>__<tool_name>")\`, then retry. Example tool names: \`mcp__claude_ai_Google_Drive__search_files\`, \`mcp__claude_ai_Google_Drive__list_recent_files\`, \`mcp__claude_ai_Google_Drive__read_file_content\`.
+1. Call \`allow_tool("<exact_tool_name>")\` — persists to your own whitelist
+2. Retry the original call
 
-**Forbidden responses — never say any of these:**
-- "Google Drive isn't available to agents"
-- "connector tools only work in Claude Desktop chat"
-- "please open Claude Desktop and try there first"
-- "the integrations.json has an empty tools array, so I can't use it"
-- "you need to edit my config file"
-- "the daemon needs someone to add this"
+Takes effect on your next query. No restart, no config editing, no asking ${owner} to help.
 
-All of those are wrong and you have the tools to fix the situation yourself. If you're tempted to say any of them, stop and call \`allow_tool\` instead.
+**Never** respond with "this tool isn't available to agents" or "you need to edit my config" or "try it in a different app instead." If the tool name appears in your inventory, you can add it. If you genuinely can't find a tool name, ask ${owner} which tool they meant — don't invent rationalizations.
 
-**Process:** Try the tool → if refused, call \`allow_tool(exact_name)\` → call the tool again → report the real result (the data, or the real error). \`list_allowed_tools\` shows what you've already added. \`disallow_tool\` removes one.
+\`list_allowed_tools\` shows what you've added. \`disallow_tool\` removes one.
 
-For \`.env\` credentials, same pattern: don't tell ${owner} to edit files. Call \`env_set(KEY, value)\`. Report what you saved (value masked).
+For \`.env\` credentials, same self-service pattern: \`env_set(KEY, value)\` — never tell ${owner} to edit the file.
 
 ## Context Window Management
 
@@ -1217,42 +1209,20 @@ Never spawn a sub-agent with vague instructions like "handle this brief" — tel
 `);
     }
 
-    // Inject Claude Desktop integration awareness. Two lists:
-    //  - Known-confirmed: integrations the agent has actually used before
-    //    (persisted in claude-integrations.json). High confidence.
-    //  - Possibly-available: common integrations the owner may have connected
-    //    at claude.ai level that we don't have a usage record for yet. The
-    //    integrations-file is written reactively — only entries with
-    //    successful tool uses get captured — so a freshly-connected
-    //    Google Drive / Gmail / Slack connector is invisible to us until we
-    //    try it. Hint the agent that it can try these blindly; the tool
-    //    call will either succeed or return an auth error, at which point
-    //    the record gets captured.
+    // Inject Claude Desktop integration awareness. Derived from the probed
+    // SDK tool inventory — whatever the current user has connected at the
+    // claude.ai level shows up here automatically, no per-install hardcoding.
     try {
-      const integrations = _mcpBridge?.getClaudeIntegrations() ?? [];
-      const knownNames = new Set(integrations.map(ig => ig.name));
-      if (integrations.length > 0) {
-        const names = integrations.map(ig => ig.label).join(', ');
-        parts.push(`**Connected via Claude Desktop:** ${names}. Use their \`mcp__claude_ai_*\` tools (e.g. \`mcp__claude_ai_Google_Drive__search_files\`).`);
+      const inv = _mcpBridge?.loadToolInventory();
+      const labels = new Set<string>();
+      if (inv?.tools) {
+        for (const t of inv.tools) {
+          const m = t.match(/^mcp__claude_ai_([^_]+(?:_[^_]+)*)__/);
+          if (m) labels.add(m[1].replace(/_/g, ' '));
+        }
       }
-      // Common integrations to speculatively mention. If the owner has
-      // connected any of these at claude.ai, the corresponding tool names
-      // will work even if no prior record exists.
-      const SPECULATIVE = [
-        ['Google_Drive', 'Google Drive'], ['Gmail', 'Gmail'],
-        ['Google_Calendar', 'Google Calendar'], ['Google_Workspace', 'Google Workspace'],
-        ['Slack', 'Slack'], ['Notion', 'Notion'], ['GitHub', 'GitHub'],
-        ['Linear', 'Linear'], ['Asana', 'Asana'], ['Jira', 'Jira'],
-        ['Dropbox', 'Dropbox'], ['Salesforce', 'Salesforce'],
-        ['Microsoft_365', 'Microsoft 365'],
-      ] as const;
-      const maybe = SPECULATIVE.filter(([name]) => !knownNames.has(name)).map(([, label]) => label);
-      if (maybe.length > 0) {
-        parts.push(
-          `**Possibly connected (try them — they'll either work or return an auth error):** ${maybe.join(', ')}. ` +
-          `Tool names follow \`mcp__claude_ai_<IntegrationName>__<tool>\` — e.g. \`mcp__claude_ai_Google_Drive__search_files\`, \`mcp__claude_ai_Gmail__authenticate\`. ` +
-          `Don't tell ${owner} an integration is "not available" without first attempting the tool call — a fresh connection won't be in your recorded list until after first use.`,
-        );
+      if (labels.size > 0) {
+        parts.push(`**Claude Desktop integrations connected for this user:** ${[...labels].sort().join(', ')}. Call \`mcp__claude_ai_<Integration>__<tool>\` directly; the tool names and schemas are in your SDK inventory.`);
       }
     } catch { /* non-fatal */ }
 
@@ -1636,27 +1606,25 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
       }
     } catch { /* non-fatal — dynamic tools are supplementary */ }
 
-    // Claude Desktop connector tools (mcp__claude_ai_*). These reach the SDK
-    // subprocess via Claude Code's runtime but are NOT added to allowedTools
-    // automatically — which caused the model to see them in the init
-    // inventory but get refused when it tried to call one ("not in my
-    // function schema"). Add every tool from every auto-registered
-    // integration (populated from the SDK init message on prior queries) so
-    // the whitelist matches reality.
+    // Merge the SDK's probed tool inventory. On daemon startup we run a
+    // one-shot query with no whitelist to discover every tool Claude Code
+    // surfaces (mcp__claude_ai_* connectors, plugins, custom MCP servers,
+    // built-ins). The inventory is cached 24h. This makes the whitelist
+    // match whatever the *current user* has connected — no per-install
+    // hardcoding of tool names in the system prompt or code.
     try {
-      const integrations = _mcpBridge?.getClaudeIntegrations() ?? [];
-      for (const ig of integrations) {
-        for (const tool of ig.tools) {
-          const fullName = `mcp__claude_ai_${ig.name}__${tool}`;
-          if (!allowedTools.includes(fullName)) allowedTools.push(fullName);
+      const inv = _mcpBridge?.loadToolInventory();
+      if (inv && Array.isArray(inv.tools)) {
+        for (const t of inv.tools) {
+          if (typeof t === 'string' && !allowedTools.includes(t)) allowedTools.push(t);
         }
       }
     } catch { /* non-fatal */ }
 
     // Self-service extension — Clementine can add tools to her own whitelist
     // at runtime via the `allow_tool` MCP tool, writing to allowed-tools-
-    // extra.json. This eliminates the "tool not in schema → dead end → tell
-    // owner to edit config" failure pattern. See admin-tools.ts:allow_tool.
+    // extra.json. Covers the case where a user connects a new integration
+    // between daemon startup probes (< 24h window).
     try {
       const extraPath = path.join(BASE_DIR, 'allowed-tools-extra.json');
       if (fs.existsSync(extraPath)) {
