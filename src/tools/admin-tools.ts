@@ -1632,11 +1632,142 @@ server.tool(
 );
 
 
-// ── Self-Restart ────────────────────────────────────────────────────────
+// ── Self-Update / Self-Restart ─────────────────────────────────────────
+
+/** Resolve the git-clone source dir this daemon is running from. */
+function resolvePackageRoot(): string {
+  // This file is at clementine-dev/dist/tools/admin-tools.js at runtime.
+  // Climb two dirs to get the package root.
+  const here = path.dirname(fileURLToPath(import.meta.url));
+  return path.resolve(here, '..', '..');
+}
+
+server.tool(
+  'where_is_source',
+  'Report the absolute path of the source tree this daemon is running from, whether it\'s a git clone, the current commit, and whether it has local uncommitted changes. Call this first before any self_update to confirm which checkout you\'re about to modify — avoids the "multiple clones in home dir" confusion where an agent updates the wrong one.',
+  {},
+  async () => {
+    const root = resolvePackageRoot();
+    const gitDir = path.join(root, '.git');
+    const isGit = existsSync(gitDir);
+    const lines = [`Package root: ${root}`, `Git repo: ${isGit ? 'yes' : 'no'}`];
+    if (isGit) {
+      try {
+        const commit = execSync('git rev-parse --short HEAD', { cwd: root, encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+        const branch = execSync('git rev-parse --abbrev-ref HEAD', { cwd: root, encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+        const status = execSync('git status --porcelain', { cwd: root, encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+        lines.push(`Branch: ${branch} @ ${commit}`);
+        lines.push(`Uncommitted changes: ${status ? 'yes' : 'no'}`);
+        if (status) lines.push(`\n${status}`);
+      } catch { /* best-effort */ }
+    }
+    lines.push('', 'ONLY modify files under this path when updating source. Other ~/clementine* directories may be stale checkouts — ignore them.');
+    return textResult(lines.join('\n'));
+  },
+);
+
+server.tool(
+  'self_update',
+  'Update Clementine to the latest main-branch code and restart. Runs git pull + npm install (if lockfile changed) + npm run build in the running daemon\'s source dir, then signals SIGUSR1 to restart. Owner-DM only. Use this instead of manually invoking git/npm — it operates on the correct source dir and handles the restart cleanly. Returns immediately; the daemon will be unreachable for ~15s during rebuild+restart.',
+  {
+    branch: z.string().optional().describe('Branch to pull (default "main")'),
+  },
+  async ({ branch }) => {
+    const gate = requireOwnerDm();
+    if (!gate.ok) return textResult(gate.message);
+    const root = resolvePackageRoot();
+    if (!existsSync(path.join(root, '.git'))) {
+      return textResult(`Refused: ${root} is not a git clone. This daemon was likely installed via npm — updates should go through \`npm install -g clementine-agent@latest\`, not self_update.`);
+    }
+    const targetBranch = branch ?? 'main';
+    const out: string[] = [];
+    const runQuiet = (cmd: string, args: string[], timeout = 120000): { ok: boolean; output: string } => {
+      try {
+        const res = execSync(`${cmd} ${args.map(a => `'${a.replace(/'/g, "'\\''")}'`).join(' ')}`, {
+          cwd: root, encoding: 'utf-8', timeout,
+          stdio: ['ignore', 'pipe', 'pipe'],
+        });
+        return { ok: true, output: res };
+      } catch (e: any) {
+        return { ok: false, output: (e?.stdout ?? '') + '\n' + (e?.stderr ?? '') + '\n' + String(e).slice(0, 200) };
+      }
+    };
+
+    // 1. Stash local changes so git pull is clean
+    const statusProbe = runQuiet('git', ['status', '--porcelain']);
+    const hadLocal = statusProbe.ok && statusProbe.output.trim().length > 0;
+    let stashed = false;
+    if (hadLocal) {
+      const stashRes = runQuiet('git', ['stash', 'push', '-u', '-m', `self_update ${new Date().toISOString()}`]);
+      if (stashRes.ok) {
+        stashed = true;
+        out.push('Stashed local changes (restore with `git stash pop` in the source dir if needed).');
+      } else {
+        return textResult(`Refused: couldn't stash local changes in ${root}. ${stashRes.output.slice(0, 200)}`);
+      }
+    }
+
+    // 2. Checkout target branch if not already there
+    const branchProbe = runQuiet('git', ['rev-parse', '--abbrev-ref', 'HEAD']);
+    if (branchProbe.ok && branchProbe.output.trim() !== targetBranch) {
+      const coRes = runQuiet('git', ['checkout', targetBranch]);
+      if (!coRes.ok) return textResult(`git checkout ${targetBranch} failed: ${coRes.output.slice(0, 300)}`);
+    }
+
+    // 3. Record pre-pull hashes so we know if package-lock changed
+    const preLock = existsSync(path.join(root, 'package-lock.json')) ? readFileSync(path.join(root, 'package-lock.json'), 'utf-8').length : 0;
+    const preCommit = runQuiet('git', ['rev-parse', 'HEAD']).output.trim();
+
+    // 4. Pull
+    const pullRes = runQuiet('git', ['pull', '--ff-only', 'origin', targetBranch], 60000);
+    if (!pullRes.ok) return textResult(`git pull failed: ${pullRes.output.slice(0, 300)}\n\n${stashed ? 'Local changes are preserved in git stash; inspect with `git stash list`.' : ''}`);
+    const postCommit = runQuiet('git', ['rev-parse', 'HEAD']).output.trim();
+
+    if (preCommit === postCommit) {
+      out.push(`Already up to date at ${preCommit.slice(0, 7)}.`);
+      return textResult(out.join('\n'));
+    }
+    out.push(`Pulled: ${preCommit.slice(0, 7)} → ${postCommit.slice(0, 7)}`);
+
+    // 5. npm install only if package-lock changed
+    const postLock = existsSync(path.join(root, 'package-lock.json')) ? readFileSync(path.join(root, 'package-lock.json'), 'utf-8').length : 0;
+    if (postLock !== preLock) {
+      out.push('package-lock.json changed — running npm install...');
+      const installRes = runQuiet('npm', ['install'], 180000);
+      if (!installRes.ok) return textResult(`${out.join('\n')}\n\nnpm install failed: ${installRes.output.slice(0, 300)}`);
+      out.push('  ok');
+    }
+
+    // 6. Build
+    out.push('Building...');
+    const buildRes = runQuiet('npm', ['run', 'build'], 300000);
+    if (!buildRes.ok) return textResult(`${out.join('\n')}\n\nBuild failed: ${buildRes.output.slice(0, 300)}`);
+    out.push('  ok');
+
+    // 7. Trigger graceful self-restart
+    const pidFile = path.join(BASE_DIR, `.${(env['ASSISTANT_NAME'] ?? 'clementine').toLowerCase()}.pid`);
+    if (existsSync(pidFile)) {
+      const pid = parseInt(readFileSync(pidFile, 'utf-8').trim(), 10);
+      if (!isNaN(pid)) {
+        try {
+          process.kill(pid, 0);
+          process.kill(pid, 'SIGUSR1');
+          out.push(`Sent SIGUSR1 to PID ${pid}. I'll be back in ~15s on the new build.`);
+        } catch {
+          out.push('Daemon PID not running — no restart signal sent. New build is on disk; launch manually.');
+        }
+      }
+    } else {
+      out.push('No PID file found. Build succeeded but restart not triggered — run `clementine launch` manually.');
+    }
+
+    return textResult(out.join('\n'));
+  },
+);
 
 server.tool(
   'self_restart',
-  'Restart the Clementine daemon to pick up code changes. Sends SIGUSR1 to the running process, which triggers a graceful restart.',
+  'Restart the Clementine daemon to pick up code changes. Sends SIGUSR1 to the running process, which triggers a graceful restart. Use self_update instead if you also need to pull/build first.',
   { _empty: z.string().optional().describe('(no parameters needed)') },
   async () => {
     const pidFile = path.join(BASE_DIR, `.${(env['ASSISTANT_NAME'] ?? 'clementine').toLowerCase()}.pid`);

@@ -1197,6 +1197,12 @@ You have a declarative registry of every integration you can configure. Use it:
 
 Companion tools: \`env_list\` (masked values + backend), \`env_unset\` (removes + clears Keychain entry).
 
+### Self-update (when ${owner} asks you to update yourself)
+
+Call \`self_update\` — **never** manually \`cd ~/clementine && git pull\` or hunt for a source directory. There may be multiple clementine-related directories in home (stale \`~/clementine\`, the real \`~/clementine-dev\`, the data dir \`~/.clementine\`). \`self_update\` knows which source tree this daemon is actually running from — the others are stale or irrelevant and touching them will produce nothing useful while creating dangerous diverging state.
+
+If you're unsure what's happening first, run \`where_is_source\` — it reports the absolute source path, current branch/commit, and whether there are uncommitted changes. \`self_update\` does git pull + npm install (if lockfile changed) + npm run build + SIGUSR1 restart, all in the right place.
+
 ### When a tool call is refused
 
 If any tool call fails with "not in my function schema" / "tool not allowed" / "unknown tool" while the tool appears in your SDK inventory:
@@ -1579,6 +1585,8 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
       mcpTool('list_allowed_tools'),
       mcpTool('disallow_tool'),
       mcpTool('self_restart'),
+      mcpTool('self_update'),
+      mcpTool('where_is_source'),
       mcpTool('cron_list'),
       mcpTool('add_cron_job'),
       mcpTool('memory_report'),
