@@ -72,11 +72,17 @@ function maskSecret(value: string): string {
 }
 
 function requireOwnerDm(): { ok: true } | { ok: false; message: string } {
-  const source = getInteractionSource();
+  // The MCP server runs as a subprocess, so getInteractionSource() reads the
+  // subprocess's own module state — always the 'autonomous' default. The
+  // parent daemon propagates the real source via CLEMENTINE_INTERACTION_SOURCE.
+  // Fall back to the in-module state only if env isn't set (tool-runner tests).
+  const source = (process.env.CLEMENTINE_INTERACTION_SOURCE as
+    | 'owner-dm' | 'owner-channel' | 'member-channel' | 'autonomous'
+    | undefined) ?? getInteractionSource();
   if (source !== 'owner-dm') {
     return {
       ok: false,
-      message: `Env writes are restricted to direct owner conversations. Current interaction source: ${source}. Ask the owner to message directly if they want to change credentials.`,
+      message: `This tool is restricted to direct owner conversations. Current interaction source: ${source}. Ask the owner to message directly if they want to run this.`,
     };
   }
   return { ok: true };

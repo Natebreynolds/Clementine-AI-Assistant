@@ -1812,6 +1812,11 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
           env: {
             CLEMENTINE_HOME: BASE_DIR,
             CLEMENTINE_TEAM_AGENT: profile?.slug ?? 'clementine',
+            // Propagate interaction-source so the MCP subprocess can gate
+            // owner-only tools. Without this, getInteractionSource() inside
+            // the subprocess returns the module-default 'autonomous' and
+            // every owner-DM-gated tool (env_set, allow_tool, etc.) refuses.
+            CLEMENTINE_INTERACTION_SOURCE: sourceOverride ?? inferInteractionSource(sessionKey),
           },
         },
         ...externalMcpServers,
@@ -3370,6 +3375,8 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
               env: {
                 CLEMENTINE_HOME: BASE_DIR,
                 CLEMENTINE_TEAM_AGENT: profile?.slug ?? 'clementine',
+                // Auto-memory extractor runs autonomously.
+                CLEMENTINE_INTERACTION_SOURCE: 'autonomous',
               },
             },
           },
