@@ -379,7 +379,14 @@ export function isClaudeDesktopTool(toolName: string): boolean {
 function parseClaudeDesktopTool(toolName: string): { integration: string; tool: string } | null {
   const match = toolName.match(/^mcp__claude_ai_([^_]+(?:_[^_]+)*)__(.+)$/);
   if (!match) return null;
-  return { integration: match[1], tool: match[2] };
+  const raw = match[1];
+  // Normalize against the known canonical set (case-insensitive) so we don't
+  // create both `Microsoft_365` and `microsoft_365` entries when the SDK
+  // occasionally hands us a lowercased tool name.
+  const canonical = Object.keys(INTEGRATION_LABELS).find(
+    k => k.toLowerCase() === raw.toLowerCase(),
+  ) ?? raw;
+  return { integration: canonical, tool: match[2] };
 }
 
 /** Load persisted integrations from disk. */

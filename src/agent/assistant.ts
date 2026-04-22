@@ -1171,12 +1171,42 @@ Never spawn a sub-agent with vague instructions like "handle this brief" — tel
 `);
     }
 
-    // Inject Claude Desktop integration awareness (compact — ~20 tokens per integration)
+    // Inject Claude Desktop integration awareness. Two lists:
+    //  - Known-confirmed: integrations the agent has actually used before
+    //    (persisted in claude-integrations.json). High confidence.
+    //  - Possibly-available: common integrations the owner may have connected
+    //    at claude.ai level that we don't have a usage record for yet. The
+    //    integrations-file is written reactively — only entries with
+    //    successful tool uses get captured — so a freshly-connected
+    //    Google Drive / Gmail / Slack connector is invisible to us until we
+    //    try it. Hint the agent that it can try these blindly; the tool
+    //    call will either succeed or return an auth error, at which point
+    //    the record gets captured.
     try {
       const integrations = _mcpBridge?.getClaudeIntegrations() ?? [];
+      const knownNames = new Set(integrations.map(ig => ig.name));
       if (integrations.length > 0) {
         const names = integrations.map(ig => ig.label).join(', ');
-        parts.push(`**Connected via Claude Desktop:** ${names}. Use their \`mcp__claude_ai_*\` tools for email, calendar, etc.`);
+        parts.push(`**Connected via Claude Desktop:** ${names}. Use their \`mcp__claude_ai_*\` tools (e.g. \`mcp__claude_ai_Google_Drive__search_files\`).`);
+      }
+      // Common integrations to speculatively mention. If the owner has
+      // connected any of these at claude.ai, the corresponding tool names
+      // will work even if no prior record exists.
+      const SPECULATIVE = [
+        ['Google_Drive', 'Google Drive'], ['Gmail', 'Gmail'],
+        ['Google_Calendar', 'Google Calendar'], ['Google_Workspace', 'Google Workspace'],
+        ['Slack', 'Slack'], ['Notion', 'Notion'], ['GitHub', 'GitHub'],
+        ['Linear', 'Linear'], ['Asana', 'Asana'], ['Jira', 'Jira'],
+        ['Dropbox', 'Dropbox'], ['Salesforce', 'Salesforce'],
+        ['Microsoft_365', 'Microsoft 365'],
+      ] as const;
+      const maybe = SPECULATIVE.filter(([name]) => !knownNames.has(name)).map(([, label]) => label);
+      if (maybe.length > 0) {
+        parts.push(
+          `**Possibly connected (try them — they'll either work or return an auth error):** ${maybe.join(', ')}. ` +
+          `Tool names follow \`mcp__claude_ai_<IntegrationName>__<tool>\` — e.g. \`mcp__claude_ai_Google_Drive__search_files\`, \`mcp__claude_ai_Gmail__authenticate\`. ` +
+          `Don't tell ${owner} an integration is "not available" without first attempting the tool call — a fresh connection won't be in your recorded list until after first use.`,
+        );
       }
     } catch { /* non-fatal */ }
 
