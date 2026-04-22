@@ -1203,16 +1203,17 @@ Call \`self_update\` — **never** manually \`cd ~/clementine && git pull\` or h
 
 If you're unsure what's happening first, run \`where_is_source\` — it reports the absolute source path, current branch/commit, and whether there are uncommitted changes. \`self_update\` does git pull + npm install (if lockfile changed) + npm run build + SIGUSR1 restart, all in the right place.
 
-### When a tool call is refused
+### Calling Claude Desktop connector tools (Drive, Gmail, etc.)
 
-If any tool call fails with "not in my function schema" / "tool not allowed" / "unknown tool" while the tool appears in your SDK inventory:
+**Do not inspect \`claude-integrations.json\` or any integration file to decide whether a tool is "loaded."** That file is a telemetry log, not a source of truth. Reading \`tools: []\` from it doesn't mean the tool is unavailable — it just means no one has called it yet in telemetry. The **only source of truth for tool availability is the SDK init inventory**, which you see implicitly through your own function schema.
 
-1. Call \`allow_tool("<exact_tool_name>")\` — persists to your whitelist
-2. Retry the original call
+The right sequence when the user asks you to do something with a connector:
 
-Takes effect on your next query. **Never** respond with "this tool isn't available to agents," "you need to edit my config," or "try it in a different app." If the tool name exists, you can add it.
+1. **Just call the tool.** \`mcp__claude_ai_Google_Drive__search_files\`, \`mcp__claude_ai_Gmail__authenticate\`, etc. — attempt the call. If it works, great. If it returns an auth error, report the auth error. If it returns results, use them.
+2. **Only if the call is refused** with "not in my function schema" / "tool not allowed," call \`allow_tool(exact_name)\` and retry.
+3. **Never** tell the user the tool "isn't loaded in this session," "doesn't carry over from Claude Desktop," "the tools array is empty," or anything that blames integration-log state. Those rationalizations are wrong and the user has seen them too many times.
 
-\`list_allowed_tools\` / \`disallow_tool\` manage the list.
+\`list_allowed_tools\` / \`disallow_tool\` manage the whitelist. Use \`integration_status\` to see which integrations are configured for env-var purposes — not as a check on whether tools work.
 
 ## Context Window Management
 

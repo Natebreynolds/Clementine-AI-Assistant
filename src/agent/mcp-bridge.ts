@@ -502,6 +502,18 @@ export async function probeAvailableTools(force = false): Promise<ToolInventory>
     }
     const inv: ToolInventory = { probedAt: new Date().toISOString(), tools };
     saveToolInventory(inv);
+    // Also sync claude-integrations.json so the agent-facing integration list
+    // stays consistent with what the SDK actually has available. Without this
+    // sync, the integrations file stays empty for freshly-connected services
+    // (e.g. Google_Drive tools: []) even though the inventory probe sees
+    // them — and the agent reads the integrations file, sees empty, and
+    // confabulates that the tools aren't loaded.
+    try {
+      const result = registerClaudeIntegrationsFromToolList(tools);
+      if (result.added.length + result.updated.length > 0) {
+        logger.info({ added: result.added, updated: result.updated }, 'Synced integrations from probed tool inventory');
+      }
+    } catch { /* non-fatal */ }
     logger.info({ toolCount: tools.length }, 'Tool inventory probed');
     return inv;
   } catch (err) {
