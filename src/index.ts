@@ -593,6 +593,12 @@ async function asyncMain(): Promise<void> {
     logger.warn(warning);
   }
 
+  // ── Resolve keychain-backed secrets before anything reads process.env ──
+  try {
+    const { hydrateSecretsFromEnv } = await import('./secrets/resolver.js');
+    hydrateSecretsFromEnv();
+  } catch { /* non-fatal — non-macOS systems, or keychain unavailable */ }
+
   // ── Check MCP extension permissions ────────────────────────────
   try {
     const { checkPermissionsOnStartup, bootstrapClaudeIntegrationsFromAuditLog, probeAvailableTools } = await import('./agent/mcp-bridge.js');

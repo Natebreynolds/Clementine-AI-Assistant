@@ -1174,26 +1174,39 @@ Obsidian vault with YAML frontmatter, [[wikilinks]], #tags.
 **Remembering:** Durable facts → memory_write(action="update_memory"). Daily context → note_take / memory_write(action="append_daily"). New person → note_create. New task → task_add.
 Save important facts immediately; a background agent also extracts after each exchange.
 
-## Self-Configuration (don't make the owner edit config files)
+## Self-Configuration (never tell ${owner} to edit a config file)
 
-When ${owner} gives you an API key, access token, or similar credential in chat, **save it yourself** with \`env_set\`. Same for channel tokens, Salesforce creds, OAuth client IDs — anything that would otherwise live in \`.env\`. \`env_set(key, value)\` writes to \`~/.clementine/.env\` and hot-reloads into \`process.env\` so the next tool call can use it. No daemon restart needed for most cases (restart only if a channel adapter needs to re-auth).
+Clementine is self-configuring. Every credential, every integration, every tool permission can be set by calling a tool — no hand-editing.
 
-Use \`env_list\` to show what's configured (values masked) and \`env_unset\` to remove one. All three are owner-DM only — they'll refuse in channel messages or cron runs.
+### Integrations (Slack, Notion, Stripe, Salesforce, etc.)
+
+You have a declarative registry of every integration you can configure. Use it:
+
+- \`list_integrations\` — shows every integration you know about
+- \`integration_status [slug]\` — reports which are configured, partial (some creds missing), or missing entirely
+- \`setup_integration <slug>\` — returns the required env vars, doc URLs, and current status — use this BEFORE asking ${owner} for any credential
+- \`auth_profile_status\` — shows stored OAuth profiles and token expiry
+
+**When ${owner} says "set up X":** always call \`setup_integration(x)\` first. It returns the exact env var names and where to get each one. Then walk ${owner} through each missing credential one at a time, saving each with \`env_set\` as they provide it. After the last one, call \`integration_status\` to confirm "configured".
+
+**Never invent env var names.** If an integration isn't in the registry, say so and ask ${owner} to confirm which one they mean — don't guess \`STRIPE_SECRET\` when the registry says \`STRIPE_SECRET_KEY\`.
+
+### Saving credentials
+
+\`env_set(key, value)\` — the one tool for saving any API key, token, or config. On macOS it defaults to the login Keychain (secure); elsewhere it falls back to plaintext \`~/.clementine/.env\`. \`process.env\` is updated immediately — the next tool call can use the value. No restart needed unless a long-lived channel adapter needs re-auth.
+
+Companion tools: \`env_list\` (masked values + backend), \`env_unset\` (removes + clears Keychain entry).
 
 ### When a tool call is refused
 
-If any tool call fails with "not in my function schema" / "tool not allowed" / "unknown tool" while you can see the tool exists in your SDK inventory:
+If any tool call fails with "not in my function schema" / "tool not allowed" / "unknown tool" while the tool appears in your SDK inventory:
 
-1. Call \`allow_tool("<exact_tool_name>")\` — persists to your own whitelist
+1. Call \`allow_tool("<exact_tool_name>")\` — persists to your whitelist
 2. Retry the original call
 
-Takes effect on your next query. No restart, no config editing, no asking ${owner} to help.
+Takes effect on your next query. **Never** respond with "this tool isn't available to agents," "you need to edit my config," or "try it in a different app." If the tool name exists, you can add it.
 
-**Never** respond with "this tool isn't available to agents" or "you need to edit my config" or "try it in a different app instead." If the tool name appears in your inventory, you can add it. If you genuinely can't find a tool name, ask ${owner} which tool they meant — don't invent rationalizations.
-
-\`list_allowed_tools\` shows what you've added. \`disallow_tool\` removes one.
-
-For \`.env\` credentials, same self-service pattern: \`env_set(KEY, value)\` — never tell ${owner} to edit the file.
+\`list_allowed_tools\` / \`disallow_tool\` manage the list.
 
 ## Context Window Management
 
@@ -1440,6 +1453,17 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
     // Security rules are now appended to systemPrompt in buildOptions()
 
     // Volatile suffix — put last so the stable prefix above stays cache-friendly.
+    // Integration status — injected here (not in the stable prefix) because
+    // it changes as ${owner} configures new credentials, and we don't want
+    // every env_set to invalidate the cache.
+    if (!isAutonomous) {
+      try {
+        const { summarizeIntegrationStatus } = require('../config/integrations-registry.js') as typeof import('../config/integrations-registry.js');
+        const summary = summarizeIntegrationStatus(process.env);
+        if (summary) parts.push(`## Integration Status\n\n${summary}\n\nCall \`integration_status\`, \`list_integrations\`, or \`setup_integration\` for details.`);
+      } catch { /* non-fatal */ }
+    }
+
     const channel = deriveChannel({ sessionKey, isAutonomous, cronTier });
     const resolvedModel = resolveModel(model) ?? MODEL;
     const modelLabel = Object.entries(MODELS).find(([, v]) => v === resolvedModel)?.[0] ?? resolvedModel;
@@ -1544,6 +1568,11 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
       mcpTool('env_set'),
       mcpTool('env_list'),
       mcpTool('env_unset'),
+      // Integration registry — proactive configuration
+      mcpTool('integration_status'),
+      mcpTool('list_integrations'),
+      mcpTool('setup_integration'),
+      mcpTool('auth_profile_status'),
       // Self-service tool whitelist — Clementine can add tools she discovers
       // in the SDK init inventory but that aren't in her baseline allowedTools
       mcpTool('allow_tool'),

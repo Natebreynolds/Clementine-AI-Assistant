@@ -22,6 +22,9 @@ import {
 } from './shared.js';
 import { getInteractionSource } from '../agent/hooks.js';
 import { renameSync } from 'node:fs';
+import * as keychain from '../secrets/keychain.js';
+import * as authProfiles from '../secrets/auth-profiles.js';
+import { classifyIntegrations, findIntegration, INTEGRATIONS } from '../config/integrations-registry.js';
 
 function readEnvFile(): Record<string, string> { return env; }
 
@@ -143,12 +146,13 @@ server.tool(
 
 server.tool(
   'env_set',
-  'Save or update an environment variable in ~/.clementine/.env (API keys, tokens, config). Owner-DM only. Changes take effect immediately — the new value becomes available to process.env and to the next tool call. Use this when the owner gives a credential in chat instead of telling them to hand-edit files.',
+  'Save or update a credential (API key, token, config). Owner-DM only. On macOS it defaults to the login Keychain for security — the .env file only gets a reference stub. Changes take effect immediately; process.env gets the real value and the next tool call can use it. Use this when the owner gives a credential in chat — never tell them to hand-edit files.',
   {
     key: z.string().describe('Env var name (uppercase with underscores, e.g. STRIPE_API_KEY)'),
     value: z.string().describe('The value to store. Never echo back to the user; it will be masked in logs.'),
+    storage: z.enum(['keychain', 'env', 'auto']).optional().describe('Where to store it. "auto" (default) uses macOS Keychain when available, falls back to plain .env. "keychain" forces Keychain. "env" forces plaintext .env.'),
   },
-  async ({ key, value }) => {
+  async ({ key, value, storage }) => {
     const gate = requireOwnerDm();
     if (!gate.ok) return textResult(gate.message);
     const normalizedKey = key.trim();
@@ -157,17 +161,41 @@ server.tool(
     }
     if (!value) return textResult('Refused: empty value. Use env_unset to remove a key.');
 
+    const mode = storage ?? 'auto';
+    const useKeychain = (mode === 'keychain') || (mode === 'auto' && keychain.isAvailable());
+    if (mode === 'keychain' && !keychain.isAvailable()) {
+      return textResult('Refused: Keychain storage requested but macOS Keychain is unavailable on this system.');
+    }
+
     const map = parseEnvFile();
     const existed = map.has(normalizedKey);
-    map.set(normalizedKey, value);
+    let envFileValue: string;
+    let backendNote: string;
+
+    if (useKeychain) {
+      try {
+        envFileValue = keychain.set(normalizedKey, value);
+        backendNote = 'stored in macOS Keychain (service: clementine-agent); .env holds only a reference';
+      } catch (err) {
+        logger.warn({ err, key: normalizedKey }, 'Keychain write failed — falling back to plain .env');
+        envFileValue = value;
+        backendNote = `Keychain unavailable (${String(err).slice(0, 100)}) — stored plaintext in .env`;
+      }
+    } else {
+      envFileValue = value;
+      backendNote = 'stored plaintext in .env';
+    }
+
+    map.set(normalizedKey, envFileValue);
     try {
       writeEnvFile(map);
     } catch (err) {
       return textResult(`Failed to write .env: ${String(err).slice(0, 200)}`);
     }
+    // process.env gets the REAL value regardless of backend, so tools can use it now
     process.env[normalizedKey] = value;
-    logger.info({ key: normalizedKey, existed, masked: maskSecret(value) }, 'env_set');
-    return textResult(`${existed ? 'Updated' : 'Added'} ${normalizedKey} in ~/.clementine/.env (value: ${maskSecret(value)}). Available to tools immediately; a daemon restart is not required for most cases.`);
+    logger.info({ key: normalizedKey, existed, masked: maskSecret(value), storage: useKeychain ? 'keychain' : 'env' }, 'env_set');
+    return textResult(`${existed ? 'Updated' : 'Added'} ${normalizedKey} (value: ${maskSecret(value)}). ${backendNote}. Active immediately — no restart needed.`);
   },
 );
 
@@ -187,7 +215,7 @@ server.tool(
 
 server.tool(
   'env_unset',
-  'Remove an environment variable from ~/.clementine/.env. Owner-DM only. Also clears from the running process.',
+  'Remove an environment variable. Owner-DM only. Also clears from Keychain (if backed by Keychain) and from the running process.',
   {
     key: z.string().describe('Env var name to remove'),
   },
@@ -196,6 +224,7 @@ server.tool(
     if (!gate.ok) return textResult(gate.message);
     const normalizedKey = key.trim();
     const map = parseEnvFile();
+    const hadKeychain = map.has(normalizedKey) && keychain.isRef(map.get(normalizedKey) ?? '');
     if (!map.has(normalizedKey)) return textResult(`${normalizedKey} is not set in ~/.clementine/.env`);
     map.delete(normalizedKey);
     try {
@@ -203,9 +232,122 @@ server.tool(
     } catch (err) {
       return textResult(`Failed to write .env: ${String(err).slice(0, 200)}`);
     }
+    if (hadKeychain) {
+      try { keychain.remove(normalizedKey); } catch { /* best-effort */ }
+    }
     delete process.env[normalizedKey];
-    logger.info({ key: normalizedKey }, 'env_unset');
-    return textResult(`Removed ${normalizedKey} from ~/.clementine/.env`);
+    logger.info({ key: normalizedKey, keychainCleared: hadKeychain }, 'env_unset');
+    return textResult(`Removed ${normalizedKey}${hadKeychain ? ' (including Keychain entry)' : ''}.`);
+  },
+);
+
+server.tool(
+  'env_list',
+  'List configured env vars with their storage backend (Keychain or plaintext) and masked values. Owner-DM only.',
+  {},
+  async () => {
+    const gate = requireOwnerDm();
+    if (!gate.ok) return textResult(gate.message);
+    const map = parseEnvFile();
+    if (map.size === 0) return textResult('No env vars configured.');
+    const lines = [...map.entries()].map(([k, v]) => {
+      const backend = keychain.isRef(v) ? '[keychain]' : '[env]    ';
+      const resolved = keychain.isRef(v) ? (keychain.get(k) ?? '(keychain read failed)') : v;
+      return `${backend} ${k} = ${maskSecret(resolved)}`;
+    });
+    return textResult(`Configured env vars (${map.size}):\n${lines.join('\n')}`);
+  },
+);
+
+// ── Integration registry tools ──────────────────────────────────────
+
+server.tool(
+  'integration_status',
+  'Show which third-party integrations (Slack, Notion, Stripe, etc.) are configured, partial (some credentials set, others missing), or missing entirely. Use this when the owner asks "what\'s set up?" or when you need to know whether to expect a credential before attempting a tool call. Reports the declarative registry — do not invent integrations not listed here.',
+  {
+    slug: z.string().optional().describe('Optional: specific integration slug to check (e.g. "slack"). If omitted, returns all.'),
+  },
+  async ({ slug }) => {
+    const slugs = slug ? [slug] : undefined;
+    const reports = classifyIntegrations(process.env, slugs);
+    if (reports.length === 0) return textResult(`Unknown integration slug: ${slug}. Use list_integrations to see available.`);
+    const icon = (s: string) => s === 'configured' ? '✓' : s === 'partial' ? '~' : '✗';
+    const lines = reports.map(r => {
+      const base = `${icon(r.status)} ${r.label} (${r.slug}) — ${r.status}`;
+      const detail: string[] = [];
+      if (r.have.length > 0) detail.push(`have: ${r.have.join(', ')}`);
+      if (r.missing.length > 0) detail.push(`missing: ${r.missing.join(', ')}`);
+      if (r.optionalMissing.length > 0) detail.push(`optional not set: ${r.optionalMissing.join(', ')}`);
+      return detail.length > 0 ? `${base}\n    ${detail.join(' | ')}` : base;
+    });
+    return textResult(lines.join('\n'));
+  },
+);
+
+server.tool(
+  'list_integrations',
+  'List every integration Clementine knows how to configure, with one-line descriptions. Use this to answer "what can I hook up?" or to find the slug for setup_integration.',
+  {},
+  async () => {
+    const lines = INTEGRATIONS.map(i => {
+      const required = i.requirements.filter(r => r.required).map(r => r.envVar).join(', ');
+      return `- **${i.label}** (\`${i.slug}\`, ${i.kind}): ${i.description}${required ? ` — requires ${required}` : ''}`;
+    });
+    return textResult(`Available integrations (${INTEGRATIONS.length}):\n${lines.join('\n')}`);
+  },
+);
+
+server.tool(
+  'setup_integration',
+  'Get the step-by-step setup info for an integration: required env vars, doc URLs for where to find each credential, and current status. Use this when the owner says "set up Slack" or similar — call this first, then walk them through each missing credential conversationally and save each one with env_set. Never guess at required env vars; trust this registry.',
+  {
+    slug: z.string().describe('Integration slug from list_integrations (e.g. "slack", "notion", "stripe")'),
+  },
+  async ({ slug }) => {
+    const integration = findIntegration(slug);
+    if (!integration) {
+      return textResult(`Unknown integration slug: ${slug}. Run list_integrations to see what's available.`);
+    }
+    const [status] = classifyIntegrations(process.env, [integration.slug]);
+    const lines: string[] = [];
+    lines.push(`## ${integration.label} (${integration.slug})`);
+    lines.push('');
+    lines.push(integration.description);
+    if (integration.docUrl) lines.push(`Docs: ${integration.docUrl}`);
+    if (integration.capabilities?.length) lines.push(`Unlocks: ${integration.capabilities.join(', ')}`);
+    lines.push('');
+    lines.push(`**Current status:** ${status.status}${status.have.length ? ` (have ${status.have.join(', ')})` : ''}`);
+    lines.push('');
+    lines.push('**Credentials:**');
+    for (const req of integration.requirements) {
+      const present = !!process.env[req.envVar];
+      const badge = present ? '✓ set' : (req.required ? '✗ REQUIRED' : '○ optional');
+      const line = `- \`${req.envVar}\` — ${req.label} [${badge}]`;
+      lines.push(line);
+      if (!present && req.docUrl) lines.push(`  → ${req.docUrl}`);
+    }
+    lines.push('');
+    lines.push('Next step: ask the owner for each unset REQUIRED credential, one at a time, and save each with env_set. Quote the doc URL when you ask so they know where to find it. After saving the last one, run integration_status to confirm "configured".');
+    return textResult(lines.join('\n'));
+  },
+);
+
+// ── OAuth profile tools ────────────────────────────────────────────
+
+server.tool(
+  'auth_profile_status',
+  'Show stored OAuth profiles (for providers that use OAuth, not just API keys). Reports which accounts are authenticated and when tokens expire. Owner-DM only.',
+  {},
+  async () => {
+    const gate = requireOwnerDm();
+    if (!gate.ok) return textResult(gate.message);
+    const statuses = authProfiles.statusAll();
+    if (statuses.length === 0) return textResult('No OAuth profiles stored. (API-key integrations are tracked via integration_status instead.)');
+    const lines = statuses.map(s => {
+      const exp = s.expiresInMinutes === null ? 'no expiry' : s.expiresInMinutes < 0 ? `expired ${Math.abs(s.expiresInMinutes)}m ago` : `expires in ${s.expiresInMinutes}m`;
+      return `- ${s.provider}${s.accountId ? ` (${s.accountId})` : ''}: ${s.valid ? '✓' : '✗'} ${exp}`;
+    });
+    return textResult(`OAuth profiles:\n${lines.join('\n')}`);
   },
 );
 
