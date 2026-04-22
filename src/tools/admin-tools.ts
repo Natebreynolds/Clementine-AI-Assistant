@@ -357,7 +357,7 @@ function writeExtraAllowedTools(tools: string[]): void {
 
 server.tool(
   'allow_tool',
-  'Add a tool name to your self-managed allowedTools list. Use when you see a tool in the SDK inventory but get "not in function schema" when you try to call it. Writes to ~/.clementine/allowed-tools-extra.json; takes effect on your NEXT query. Owner-DM only. Common case: Claude Desktop connector tools like mcp__claude_ai_Google_Drive__search_files that appear in the init inventory but aren\'t in your baseline whitelist.',
+  'Add a tool name to your self-managed allowedTools list. Use when you see a tool in the SDK inventory but get "not in function schema" when you try to call it. Writes to ~/.clementine/allowed-tools-extra.json; takes effect on your NEXT query. If the tool name isn\'t yet in the cached inventory, this auto-refreshes the probe first — covers the case where the owner just added a new Claude Desktop connector. Owner-DM only.',
   {
     name: z.string().describe('Exact tool name (e.g. "mcp__claude_ai_Google_Drive__search_files")'),
     reason: z.string().optional().describe('Brief note: why you need this tool. For audit trail.'),
@@ -367,13 +367,29 @@ server.tool(
     if (!gate.ok) return textResult(gate.message);
     const trimmed = name.trim();
     if (!trimmed) return textResult('Refused: empty tool name.');
-    // Loose format check — MCP tool names, built-in tool names, or namespaced patterns.
     if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(trimmed.replace(/__[A-Za-z0-9_-]+/g, ''))) {
       return textResult(`Refused: "${trimmed}" doesn't look like a valid tool name. Use a literal name like "mcp__claude_ai_Google_Drive__search_files" or a built-in like "WebFetch".`);
     }
+
+    // Auto-refresh inventory when the requested tool isn't in the cached
+    // inventory. This handles the "owner just added a connector at
+    // claude.ai" case without requiring them to wait for the hourly
+    // refresh or restart the daemon.
+    let refreshNote = '';
+    try {
+      const { probeAvailableTools } = await import('../agent/mcp-bridge.js');
+      const cached = (await import('../agent/mcp-bridge.js')).loadToolInventory();
+      if (!cached?.tools?.includes(trimmed)) {
+        const refreshed = await probeAvailableTools(true);
+        if (refreshed.tools.includes(trimmed)) {
+          refreshNote = ' (picked up from a fresh probe — looks like the connector just came online)';
+        }
+      }
+    } catch { /* non-fatal */ }
+
     const current = readExtraAllowedTools();
     if (current.includes(trimmed)) {
-      return textResult(`${trimmed} is already in your extra-allowed list. If it's still being refused, it may be disallowed by a higher-priority block (heartbeat/cron disallowed tools, profile tier).`);
+      return textResult(`${trimmed} is already in your extra-allowed list${refreshNote}. If it's still being refused, it may be disallowed by a higher-priority block (heartbeat/cron disallowed tools, profile tier).`);
     }
     current.push(trimmed);
     try {
@@ -382,7 +398,33 @@ server.tool(
       return textResult(`Failed to persist: ${String(err).slice(0, 200)}`);
     }
     logger.info({ name: trimmed, reason, totalExtras: current.length }, 'allow_tool');
-    return textResult(`Added ${trimmed} to ~/.clementine/allowed-tools-extra.json (${current.length} total extras). Active on your next query — no daemon restart needed.${reason ? ` Reason: ${reason}` : ''}`);
+    return textResult(`Added ${trimmed} to ~/.clementine/allowed-tools-extra.json (${current.length} total extras)${refreshNote}. Active on your next query — no daemon restart needed.${reason ? ` Reason: ${reason}` : ''}`);
+  },
+);
+
+server.tool(
+  'refresh_tool_inventory',
+  'Force a fresh probe of the SDK\'s tool inventory, picking up any Claude Desktop connectors the owner has added since the last cache refresh. Owner-DM only. Use this when the owner says "I just added X at claude.ai" or when an expected integration isn\'t showing up. Updates ~/.clementine/.tool-inventory.json and syncs claude-integrations.json. Returns a diff of what changed.',
+  {},
+  async () => {
+    const gate = requireOwnerDm();
+    if (!gate.ok) return textResult(gate.message);
+    try {
+      const { probeAvailableTools, loadToolInventory } = await import('../agent/mcp-bridge.js');
+      const before = loadToolInventory();
+      const beforeSet = new Set(before?.tools ?? []);
+      const after = await probeAvailableTools(true);
+      const afterSet = new Set(after.tools);
+      const added = [...afterSet].filter(t => !beforeSet.has(t));
+      const removed = [...beforeSet].filter(t => !afterSet.has(t));
+      const lines = [`Probed ${after.tools.length} tools.`];
+      if (added.length) lines.push(`\n**Added since last probe:** ${added.length}\n${added.slice(0, 20).map(t => `- ${t}`).join('\n')}${added.length > 20 ? `\n... +${added.length - 20} more` : ''}`);
+      if (removed.length) lines.push(`\n**Removed since last probe:** ${removed.length}\n${removed.slice(0, 10).map(t => `- ${t}`).join('\n')}`);
+      if (!added.length && !removed.length) lines.push('No change since last probe.');
+      return textResult(lines.join('\n'));
+    } catch (err) {
+      return textResult(`Probe failed: ${String(err).slice(0, 200)}`);
+    }
   },
 );
 

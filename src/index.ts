@@ -604,10 +604,21 @@ async function asyncMain(): Promise<void> {
     const { checkPermissionsOnStartup, bootstrapClaudeIntegrationsFromAuditLog, probeAvailableTools } = await import('./agent/mcp-bridge.js');
     checkPermissionsOnStartup();
     bootstrapClaudeIntegrationsFromAuditLog(path.join(config.BASE_DIR, 'logs', 'audit.log'));
-    // Fire-and-forget: probe the SDK's full tool inventory so buildOptions
-    // knows everything Claude Code is surfacing (claude_ai_* connectors,
-    // plugins, etc.) without per-user hardcoding. Cached 24h.
-    probeAvailableTools().catch(() => { /* non-fatal, buildOptions falls back to baseline */ });
+    // Probe the SDK's full tool inventory so buildOptions knows everything
+    // Claude Code is surfacing (claude_ai_* connectors, plugins, etc.)
+    // without per-user hardcoding. Cached 1h. On fresh probe, log a short
+    // summary so the owner can verify which connectors were detected
+    // without having to ask the assistant.
+    probeAvailableTools().then(inv => {
+      const integrations = new Set<string>();
+      for (const t of inv.tools) {
+        const m = t.match(/^mcp__claude_ai_([^_]+(?:_[^_]+)*)__/);
+        if (m) integrations.add(m[1].replace(/_/g, ' '));
+      }
+      if (integrations.size > 0) {
+        logger.info({ integrations: [...integrations].sort(), toolCount: inv.tools.length }, '🦞 Claude Desktop integrations detected');
+      }
+    }).catch(() => { /* non-fatal, buildOptions falls back to baseline */ });
   } catch { /* non-fatal */ }
 
   // ── Initialize layers ────────────────────────────────────────────

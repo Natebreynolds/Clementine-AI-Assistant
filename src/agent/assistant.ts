@@ -1205,15 +1205,17 @@ If you're unsure what's happening first, run \`where_is_source\` — it reports 
 
 ### Calling Claude Desktop connector tools (Drive, Gmail, etc.)
 
-**Do not inspect \`claude-integrations.json\` or any integration file to decide whether a tool is "loaded."** That file is a telemetry log, not a source of truth. Reading \`tools: []\` from it doesn't mean the tool is unavailable — it just means no one has called it yet in telemetry. The **only source of truth for tool availability is the SDK init inventory**, which you see implicitly through your own function schema.
+The **only source of truth for tool availability is your function schema**. Do not inspect \`claude-integrations.json\`, the inventory file, or run \`ToolSearch\` to "check" first — those are telemetry caches, not reality.
 
-The right sequence when the user asks you to do something with a connector:
+**The right sequence when the user asks you to do something with a connector:**
 
-1. **Just call the tool.** \`mcp__claude_ai_Google_Drive__search_files\`, \`mcp__claude_ai_Gmail__authenticate\`, etc. — attempt the call. If it works, great. If it returns an auth error, report the auth error. If it returns results, use them.
-2. **Only if the call is refused** with "not in my function schema" / "tool not allowed," call \`allow_tool(exact_name)\` and retry.
-3. **Never** tell the user the tool "isn't loaded in this session," "doesn't carry over from Claude Desktop," "the tools array is empty," or anything that blames integration-log state. Those rationalizations are wrong and the user has seen them too many times.
+1. **Just call the tool.** \`mcp__claude_ai_Google_Drive__search_files\`, \`mcp__claude_ai_Gmail__authenticate\`, etc. Attempt it. Report the literal result — real data, auth error, or whatever.
+2. **If refused** with "not in my function schema" / "tool not allowed," call \`allow_tool(exact_name)\` and retry. \`allow_tool\` auto-refreshes the inventory if the name is new — handles the case where the owner just added a connector at claude.ai.
+3. **If the owner says "I just added X at claude.ai"** or anything similar, call \`refresh_tool_inventory\` first to pick up the new connector. Report what came online.
 
-\`list_allowed_tools\` / \`disallow_tool\` manage the whitelist. Use \`integration_status\` to see which integrations are configured for env-var purposes — not as a check on whether tools work.
+**Never** say the tool "isn't loaded in this session," "doesn't carry over from Claude Desktop," "the tools array is empty," or "MCP server still connecting." If any of those phrasings come to mind, call the tool directly and report what actually happens instead.
+
+\`list_allowed_tools\` / \`disallow_tool\` manage the whitelist. \`integration_status\` is for env-var (API key) integrations — not for claude_ai_* connectors, which are schema-driven.
 
 ## Context Window Management
 
@@ -1585,6 +1587,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
       mcpTool('allow_tool'),
       mcpTool('list_allowed_tools'),
       mcpTool('disallow_tool'),
+      mcpTool('refresh_tool_inventory'),
       mcpTool('self_restart'),
       mcpTool('self_update'),
       mcpTool('where_is_source'),

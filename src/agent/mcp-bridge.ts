@@ -444,7 +444,10 @@ export function getClaudeIntegrations(): ClaudeIntegration[] {
 // ── SDK tool inventory probe ───────────────────────────────────────────
 
 const TOOL_INVENTORY_FILE = path.join(BASE_DIR, '.tool-inventory.json');
-const TOOL_INVENTORY_MAX_AGE_MS = 24 * 60 * 60 * 1000; // 24h
+// 1h TTL — short enough that a connector added at claude.ai propagates
+// within the hour without the user having to do anything. Forced refresh
+// via probeAvailableTools(true) is still available.
+const TOOL_INVENTORY_MAX_AGE_MS = 60 * 60 * 1000;
 
 export interface ToolInventory {
   /** ISO timestamp of the probe */
