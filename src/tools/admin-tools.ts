@@ -200,20 +200,6 @@ server.tool(
 );
 
 server.tool(
-  'env_list',
-  'List the names of environment variables configured in ~/.clementine/.env. Returns key names only — values are masked. Owner-DM only.',
-  {},
-  async () => {
-    const gate = requireOwnerDm();
-    if (!gate.ok) return textResult(gate.message);
-    const map = parseEnvFile();
-    if (map.size === 0) return textResult('No env vars configured in ~/.clementine/.env');
-    const lines = [...map.entries()].map(([k, v]) => `- ${k} = ${maskSecret(v)}`);
-    return textResult(`Configured env vars (${map.size}):\n${lines.join('\n')}`);
-  },
-);
-
-server.tool(
   'env_unset',
   'Remove an environment variable. Owner-DM only. Also clears from Keychain (if backed by Keychain) and from the running process.',
   {
