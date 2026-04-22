@@ -209,6 +209,91 @@ server.tool(
   },
 );
 
+// ── Self-service tool whitelist ────────────────────────────────────────
+
+const ALLOWED_TOOLS_EXTRA = path.join(BASE_DIR, 'allowed-tools-extra.json');
+
+function readExtraAllowedTools(): string[] {
+  if (!existsSync(ALLOWED_TOOLS_EXTRA)) return [];
+  try {
+    const arr = JSON.parse(readFileSync(ALLOWED_TOOLS_EXTRA, 'utf-8'));
+    return Array.isArray(arr) ? arr.filter((x): x is string => typeof x === 'string') : [];
+  } catch { return []; }
+}
+
+function writeExtraAllowedTools(tools: string[]): void {
+  if (!existsSync(BASE_DIR)) mkdirSync(BASE_DIR, { recursive: true });
+  const unique = [...new Set(tools)].sort();
+  writeFileSync(ALLOWED_TOOLS_EXTRA, JSON.stringify(unique, null, 2));
+}
+
+server.tool(
+  'allow_tool',
+  'Add a tool name to your self-managed allowedTools list. Use when you see a tool in the SDK inventory but get "not in function schema" when you try to call it. Writes to ~/.clementine/allowed-tools-extra.json; takes effect on your NEXT query. Owner-DM only. Common case: Claude Desktop connector tools like mcp__claude_ai_Google_Drive__search_files that appear in the init inventory but aren\'t in your baseline whitelist.',
+  {
+    name: z.string().describe('Exact tool name (e.g. "mcp__claude_ai_Google_Drive__search_files")'),
+    reason: z.string().optional().describe('Brief note: why you need this tool. For audit trail.'),
+  },
+  async ({ name, reason }) => {
+    const gate = requireOwnerDm();
+    if (!gate.ok) return textResult(gate.message);
+    const trimmed = name.trim();
+    if (!trimmed) return textResult('Refused: empty tool name.');
+    // Loose format check — MCP tool names, built-in tool names, or namespaced patterns.
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(trimmed.replace(/__[A-Za-z0-9_-]+/g, ''))) {
+      return textResult(`Refused: "${trimmed}" doesn't look like a valid tool name. Use a literal name like "mcp__claude_ai_Google_Drive__search_files" or a built-in like "WebFetch".`);
+    }
+    const current = readExtraAllowedTools();
+    if (current.includes(trimmed)) {
+      return textResult(`${trimmed} is already in your extra-allowed list. If it's still being refused, it may be disallowed by a higher-priority block (heartbeat/cron disallowed tools, profile tier).`);
+    }
+    current.push(trimmed);
+    try {
+      writeExtraAllowedTools(current);
+    } catch (err) {
+      return textResult(`Failed to persist: ${String(err).slice(0, 200)}`);
+    }
+    logger.info({ name: trimmed, reason, totalExtras: current.length }, 'allow_tool');
+    return textResult(`Added ${trimmed} to ~/.clementine/allowed-tools-extra.json (${current.length} total extras). Active on your next query — no daemon restart needed.${reason ? ` Reason: ${reason}` : ''}`);
+  },
+);
+
+server.tool(
+  'list_allowed_tools',
+  'Show the current self-managed allowedTools extras (tools you added via allow_tool on top of the built-in whitelist). Owner-DM only.',
+  {},
+  async () => {
+    const gate = requireOwnerDm();
+    if (!gate.ok) return textResult(gate.message);
+    const current = readExtraAllowedTools();
+    if (current.length === 0) return textResult('No extra tools registered. The built-in whitelist is the only source; add entries via `allow_tool` when you encounter "not in function schema" errors.');
+    return textResult(`Extra allowed tools (${current.length}):\n${current.map(t => `- ${t}`).join('\n')}\n\nStored in ~/.clementine/allowed-tools-extra.json; merged into allowedTools on every query.`);
+  },
+);
+
+server.tool(
+  'disallow_tool',
+  'Remove a tool from your self-managed allowedTools extras. Takes effect on next query. Owner-DM only.',
+  {
+    name: z.string().describe('Exact tool name to remove'),
+  },
+  async ({ name }) => {
+    const gate = requireOwnerDm();
+    if (!gate.ok) return textResult(gate.message);
+    const trimmed = name.trim();
+    const current = readExtraAllowedTools();
+    if (!current.includes(trimmed)) return textResult(`${trimmed} isn't in the extras list. Nothing to remove.`);
+    const next = current.filter(t => t !== trimmed);
+    try {
+      writeExtraAllowedTools(next);
+    } catch (err) {
+      return textResult(`Failed to persist: ${String(err).slice(0, 200)}`);
+    }
+    logger.info({ name: trimmed, totalExtras: next.length }, 'disallow_tool');
+    return textResult(`Removed ${trimmed} from extras (${next.length} remaining).`);
+  },
+);
+
 
 // ── Workspace Tools ─────────────────────────────────────────────────────
 

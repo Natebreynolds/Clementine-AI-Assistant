@@ -1180,7 +1180,13 @@ When ${owner} gives you an API key, access token, or similar credential in chat,
 
 Use \`env_list\` to show what's configured (values masked) and \`env_unset\` to remove one. All three are owner-DM only — they'll refuse in channel messages or cron runs.
 
-Don't tell ${owner} "add this to your .env" — just call env_set and report what you saved. For integrations connected at claude.ai (Google Drive, Gmail, Slack, Notion, Linear, etc.), the \`mcp__claude_ai_*\` tools appear automatically via Claude Desktop — never claim one is "not available" without trying the tool call first.
+### Tool schema self-extension
+
+If a tool call fails with **"not in my function schema" / "tool not allowed" / "unknown tool"** BUT you can see it in the SDK init inventory (e.g. \`mcp__claude_ai_Google_Drive__search_files\`), call \`allow_tool(name)\` to add it to your whitelist. Takes effect on your next query — no restart, no owner intervention. Then try the original task again.
+
+This is the correct response to "tool not in schema" errors. **Do not dead-end** and tell ${owner} to edit a config file. Use \`list_allowed_tools\` to see what you've already added, \`disallow_tool\` to remove one.
+
+Don't tell ${owner} "add this to your .env" — just call env_set and report what you saved. For integrations connected at claude.ai (Google Drive, Gmail, Slack, Notion, Linear, etc.), the \`mcp__claude_ai_*\` tools appear in your SDK init inventory; if your first call is refused, call \`allow_tool\` with the exact tool name and retry.
 
 ## Context Window Management
 
@@ -1553,6 +1559,11 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
       mcpTool('env_set'),
       mcpTool('env_list'),
       mcpTool('env_unset'),
+      // Self-service tool whitelist — Clementine can add tools she discovers
+      // in the SDK init inventory but that aren't in her baseline allowedTools
+      mcpTool('allow_tool'),
+      mcpTool('list_allowed_tools'),
+      mcpTool('disallow_tool'),
       mcpTool('self_restart'),
       mcpTool('cron_list'),
       mcpTool('add_cron_job'),
@@ -1609,6 +1620,39 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
         }
       }
     } catch { /* non-fatal — dynamic tools are supplementary */ }
+
+    // Claude Desktop connector tools (mcp__claude_ai_*). These reach the SDK
+    // subprocess via Claude Code's runtime but are NOT added to allowedTools
+    // automatically — which caused the model to see them in the init
+    // inventory but get refused when it tried to call one ("not in my
+    // function schema"). Add every tool from every auto-registered
+    // integration (populated from the SDK init message on prior queries) so
+    // the whitelist matches reality.
+    try {
+      const integrations = _mcpBridge?.getClaudeIntegrations() ?? [];
+      for (const ig of integrations) {
+        for (const tool of ig.tools) {
+          const fullName = `mcp__claude_ai_${ig.name}__${tool}`;
+          if (!allowedTools.includes(fullName)) allowedTools.push(fullName);
+        }
+      }
+    } catch { /* non-fatal */ }
+
+    // Self-service extension — Clementine can add tools to her own whitelist
+    // at runtime via the `allow_tool` MCP tool, writing to allowed-tools-
+    // extra.json. This eliminates the "tool not in schema → dead end → tell
+    // owner to edit config" failure pattern. See admin-tools.ts:allow_tool.
+    try {
+      const extraPath = path.join(BASE_DIR, 'allowed-tools-extra.json');
+      if (fs.existsSync(extraPath)) {
+        const extras = JSON.parse(fs.readFileSync(extraPath, 'utf-8')) as string[];
+        if (Array.isArray(extras)) {
+          for (const t of extras) {
+            if (typeof t === 'string' && !allowedTools.includes(t)) allowedTools.push(t);
+          }
+        }
+      }
+    } catch { /* non-fatal */ }
 
     // Agent tool whitelist: filter down to only allowed tools
     if (profile?.team?.allowedTools?.length) {
