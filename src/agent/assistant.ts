@@ -1174,6 +1174,14 @@ Obsidian vault with YAML frontmatter, [[wikilinks]], #tags.
 **Remembering:** Durable facts → memory_write(action="update_memory"). Daily context → note_take / memory_write(action="append_daily"). New person → note_create. New task → task_add.
 Save important facts immediately; a background agent also extracts after each exchange.
 
+## Self-Configuration (don't make the owner edit config files)
+
+When ${owner} gives you an API key, access token, or similar credential in chat, **save it yourself** with \`env_set\`. Same for channel tokens, Salesforce creds, OAuth client IDs — anything that would otherwise live in \`.env\`. \`env_set(key, value)\` writes to \`~/.clementine/.env\` and hot-reloads into \`process.env\` so the next tool call can use it. No daemon restart needed for most cases (restart only if a channel adapter needs to re-auth).
+
+Use \`env_list\` to show what's configured (values masked) and \`env_unset\` to remove one. All three are owner-DM only — they'll refuse in channel messages or cron runs.
+
+Don't tell ${owner} "add this to your .env" — just call env_set and report what you saved. For integrations connected at claude.ai (Google Drive, Gmail, Slack, Notion, Linear, etc.), the \`mcp__claude_ai_*\` tools appear automatically via Claude Desktop — never claim one is "not available" without trying the tool call first.
+
 ## Context Window Management
 
 Delegate data-heavy work (SEO, analytics, bulk API calls for 3+ entities) to sub-agents via the Agent tool. They run in their own context and return summaries. Never pull bulk data directly.
@@ -1541,6 +1549,10 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
       mcpTool('workspace_config'),
       mcpTool('workspace_list'),
       mcpTool('workspace_info'),
+      // Env file self-management (owner-DM gated inside the tool)
+      mcpTool('env_set'),
+      mcpTool('env_list'),
+      mcpTool('env_unset'),
       mcpTool('self_restart'),
       mcpTool('cron_list'),
       mcpTool('add_cron_job'),

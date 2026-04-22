@@ -18,10 +18,66 @@ import Anthropic from '@anthropic-ai/sdk';
 import { z } from 'zod';
 import {
   BASE_DIR, CRON_FILE, SYSTEM_DIR,
-  env, getStore, logger, textResult, 
+  env, getStore, logger, textResult,
 } from './shared.js';
+import { getInteractionSource } from '../agent/hooks.js';
+import { renameSync } from 'node:fs';
 
 function readEnvFile(): Record<string, string> { return env; }
+
+// ── Env file management helpers (tools registered inside registerAdminTools) ──
+
+const ENV_PATH = path.join(BASE_DIR, '.env');
+
+/** Parse a .env file into key→value pairs. Preserves order when re-serialized. */
+function parseEnvFile(): Map<string, string> {
+  const map = new Map<string, string>();
+  if (!existsSync(ENV_PATH)) return map;
+  const text = readFileSync(ENV_PATH, 'utf-8');
+  for (const rawLine of text.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith('#')) continue;
+    const eq = line.indexOf('=');
+    if (eq < 0) continue;
+    const key = line.slice(0, eq).trim();
+    let value = line.slice(eq + 1);
+    if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+      value = value.slice(1, -1);
+    }
+    map.set(key, value);
+  }
+  return map;
+}
+
+/** Atomic write — write to .tmp then rename. Mode 0o600. */
+function writeEnvFile(map: Map<string, string>): void {
+  if (!existsSync(BASE_DIR)) mkdirSync(BASE_DIR, { recursive: true });
+  const lines: string[] = [];
+  for (const [key, value] of map) {
+    const needsQuote = /[\s#'"\\]/.test(value) || value === '';
+    lines.push(`${key}=${needsQuote ? `"${value.replace(/"/g, '\\"')}"` : value}`);
+  }
+  const tmp = ENV_PATH + '.tmp';
+  writeFileSync(tmp, lines.join('\n') + '\n', { mode: 0o600 });
+  renameSync(tmp, ENV_PATH);
+}
+
+/** Mask a secret for safe logging: keep first 4 + last 4, dots in between. */
+function maskSecret(value: string): string {
+  if (value.length <= 8) return '•'.repeat(Math.max(value.length, 4));
+  return value.slice(0, 4) + '…' + value.slice(-4);
+}
+
+function requireOwnerDm(): { ok: true } | { ok: false; message: string } {
+  const source = getInteractionSource();
+  if (source !== 'owner-dm') {
+    return {
+      ok: false,
+      message: `Env writes are restricted to direct owner conversations. Current interaction source: ${source}. Ask the owner to message directly if they want to change credentials.`,
+    };
+  }
+  return { ok: true };
+}
 
 export function registerAdminTools(server: McpServer): void {
 // ── 16. set_timer ──────────────────────────────────────────────────────
@@ -80,6 +136,76 @@ server.tool(
     });
 
     return textResult(`Timer set. Reminder in ${minutes} minute${minutes !== 1 ? 's' : ''} (~${fireTime}): "${message}"`);
+  },
+);
+
+// ── Env self-configuration (owner-DM only) ────────────────────────────
+
+server.tool(
+  'env_set',
+  'Save or update an environment variable in ~/.clementine/.env (API keys, tokens, config). Owner-DM only. Changes take effect immediately — the new value becomes available to process.env and to the next tool call. Use this when the owner gives a credential in chat instead of telling them to hand-edit files.',
+  {
+    key: z.string().describe('Env var name (uppercase with underscores, e.g. STRIPE_API_KEY)'),
+    value: z.string().describe('The value to store. Never echo back to the user; it will be masked in logs.'),
+  },
+  async ({ key, value }) => {
+    const gate = requireOwnerDm();
+    if (!gate.ok) return textResult(gate.message);
+    const normalizedKey = key.trim();
+    if (!/^[A-Z][A-Z0-9_]*$/.test(normalizedKey)) {
+      return textResult(`Env var name must be uppercase letters, digits, and underscores only. Got: ${normalizedKey}`);
+    }
+    if (!value) return textResult('Refused: empty value. Use env_unset to remove a key.');
+
+    const map = parseEnvFile();
+    const existed = map.has(normalizedKey);
+    map.set(normalizedKey, value);
+    try {
+      writeEnvFile(map);
+    } catch (err) {
+      return textResult(`Failed to write .env: ${String(err).slice(0, 200)}`);
+    }
+    process.env[normalizedKey] = value;
+    logger.info({ key: normalizedKey, existed, masked: maskSecret(value) }, 'env_set');
+    return textResult(`${existed ? 'Updated' : 'Added'} ${normalizedKey} in ~/.clementine/.env (value: ${maskSecret(value)}). Available to tools immediately; a daemon restart is not required for most cases.`);
+  },
+);
+
+server.tool(
+  'env_list',
+  'List the names of environment variables configured in ~/.clementine/.env. Returns key names only — values are masked. Owner-DM only.',
+  {},
+  async () => {
+    const gate = requireOwnerDm();
+    if (!gate.ok) return textResult(gate.message);
+    const map = parseEnvFile();
+    if (map.size === 0) return textResult('No env vars configured in ~/.clementine/.env');
+    const lines = [...map.entries()].map(([k, v]) => `- ${k} = ${maskSecret(v)}`);
+    return textResult(`Configured env vars (${map.size}):\n${lines.join('\n')}`);
+  },
+);
+
+server.tool(
+  'env_unset',
+  'Remove an environment variable from ~/.clementine/.env. Owner-DM only. Also clears from the running process.',
+  {
+    key: z.string().describe('Env var name to remove'),
+  },
+  async ({ key }) => {
+    const gate = requireOwnerDm();
+    if (!gate.ok) return textResult(gate.message);
+    const normalizedKey = key.trim();
+    const map = parseEnvFile();
+    if (!map.has(normalizedKey)) return textResult(`${normalizedKey} is not set in ~/.clementine/.env`);
+    map.delete(normalizedKey);
+    try {
+      writeEnvFile(map);
+    } catch (err) {
+      return textResult(`Failed to write .env: ${String(err).slice(0, 200)}`);
+    }
+    delete process.env[normalizedKey];
+    logger.info({ key: normalizedKey }, 'env_unset');
+    return textResult(`Removed ${normalizedKey} from ~/.clementine/.env`);
   },
 );
 
