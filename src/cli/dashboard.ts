@@ -1177,6 +1177,15 @@ function writeCronFileAt(cronFile: string, parsed: matter.GrayMatterFile<string>
 // ── Express app ──────────────────────────────────────────────────────
 
 export async function cmdDashboard(opts: { port?: string }): Promise<void> {
+  // Ensure BASE_DIR exists before any dashboard-local files (PID file, auth
+  // token) are written. Other CLI commands route through ensureDataHome() in
+  // index.ts, but the dashboard command doesn't — on a truly fresh install
+  // where someone runs `clementine dashboard` before `clementine launch` or
+  // `config setup`, the parent-process writeFileSync(DASHBOARD_PID_FILE)
+  // would ENOENT and the dashboard would die before the browser could see
+  // it. Idempotent, so safe for every invocation.
+  try { mkdirSync(BASE_DIR, { recursive: true }); } catch { /* ignore */ }
+
   // Child process skips the kill step — parent already handled it
   if (!process.env.__CLEM_DASHBOARD_CHILD) {
     const killed = killExistingDashboards();
