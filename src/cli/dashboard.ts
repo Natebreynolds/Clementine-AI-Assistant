@@ -9309,7 +9309,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
                 const wmHtml = a.workingMemorySnippet
                   ? '<div style="margin-top:8px;padding:8px;background:var(--bg-input);border-radius:6px;font-size:11px;color:var(--text-secondary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + a.workingMemorySnippet + '</div>'
                   : '';
-                return '<div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:16px;cursor:pointer" onclick="showPage(\'team\');setTimeout(()=>selectAgent(\''+a.slug+'\'),100)">' +
+                return '<div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:16px;cursor:pointer" onclick="showPage(\\'team\\');setTimeout(()=>selectAgent(\\''+a.slug+'\\'),100)">' +
                   '<div style="display:flex;align-items:center;gap:10px;margin-bottom:10px">' +
                   '<div style="width:40px;height:40px;border-radius:50%;background:var(--clementine);color:#fff;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:18px">' + avatarLetter + '</div>' +
                   '<div><div style="font-weight:600">' + (a.name || a.slug) + '</div>' +
@@ -16461,11 +16461,11 @@ async function applyBrokenJobFix(jobName) {
       return;
     }
     var diffPreview = (dryRes.diff || '(no diff)').slice(0, 1200);
-    var msg = 'Apply this fix to ' + jobName + '?\n\n'
-      + 'File: ' + (dryRes.file || 'unknown') + '\n'
-      + 'Operations: ' + (dryRes.appliedOps || []).length + '\n\n'
+    var msg = 'Apply this fix to ' + jobName + '?\\n\\n'
+      + 'File: ' + (dryRes.file || 'unknown') + '\\n'
+      + 'Operations: ' + (dryRes.appliedOps || []).length + '\\n\\n'
       + diffPreview
-      + '\n\nA .bak will be written. The daemon auto-reloads; the next run will be fix-verified.';
+      + '\\n\\nA .bak will be written. The daemon auto-reloads; the next run will be fix-verified.';
     if (!confirm(msg)) return;
 
     var res = await apiJson('POST', '/api/cron/broken-jobs/' + encodeURIComponent(jobName) + '/apply-fix', {});
