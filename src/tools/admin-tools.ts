@@ -261,7 +261,14 @@ server.tool(
   },
   async ({ slug }) => {
     const slugs = slug ? [slug] : undefined;
-    const reports = classifyIntegrations(process.env, slugs);
+    // `env` from shared.ts is the parsed .env file — the authoritative source
+    // for configured credentials in this project. Falls through to process.env
+    // for anything overridden at runtime (keychain-hydrated secrets, shell
+    // env, etc.). Do NOT read process.env alone: config.ts deliberately
+    // keeps .env values out of process.env, so classifying from process.env
+    // shows everything "missing."
+    const merged = { ...process.env, ...env };
+    const reports = classifyIntegrations(merged, slugs);
     if (reports.length === 0) return textResult(`Unknown integration slug: ${slug}. Use list_integrations to see available.`);
     const icon = (s: string) => s === 'configured' ? '✓' : s === 'partial' ? '~' : '✗';
     const lines = reports.map(r => {
@@ -300,7 +307,8 @@ server.tool(
     if (!integration) {
       return textResult(`Unknown integration slug: ${slug}. Run list_integrations to see what's available.`);
     }
-    const [status] = classifyIntegrations(process.env, [integration.slug]);
+    const merged = { ...process.env, ...env };
+    const [status] = classifyIntegrations(merged, [integration.slug]);
     const lines: string[] = [];
     lines.push(`## ${integration.label} (${integration.slug})`);
     lines.push('');
@@ -312,7 +320,7 @@ server.tool(
     lines.push('');
     lines.push('**Credentials:**');
     for (const req of integration.requirements) {
-      const present = !!process.env[req.envVar];
+      const present = !!merged[req.envVar];
       const badge = present ? '✓ set' : (req.required ? '✗ REQUIRED' : '○ optional');
       const line = `- \`${req.envVar}\` — ${req.label} [${badge}]`;
       lines.push(line);

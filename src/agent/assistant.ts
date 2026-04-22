@@ -1470,7 +1470,8 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
     if (!isAutonomous) {
       try {
         const { summarizeIntegrationStatus } = require('../config/integrations-registry.js') as typeof import('../config/integrations-registry.js');
-        const summary = summarizeIntegrationStatus(process.env);
+        const { envSnapshot } = require('../config.js') as typeof import('../config.js');
+        const summary = summarizeIntegrationStatus(envSnapshot());
         if (summary) parts.push(`## Integration Status\n\n${summary}\n\nCall \`integration_status\`, \`list_integrations\`, or \`setup_integration\` for details.`);
       } catch { /* non-fatal */ }
     }

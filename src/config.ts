@@ -55,6 +55,11 @@ function getEnv(key: string, fallback = ''): string {
   return env[key] ?? process.env[key] ?? fallback;
 }
 
+/** Merged view of process.env overlaid with .env. Use for classifyIntegrations / summarizeIntegrationStatus. */
+export function envSnapshot(): Record<string, string | undefined> {
+  return { ...process.env, ...env };
+}
+
 // ── Paths ────────────────────────────────────────────────────────────
 
 export const VAULT_DIR = path.join(BASE_DIR, 'vault');
