@@ -791,9 +791,26 @@ export class PersonalAssistant {
   /** Capture MCP server status from system init messages. */
   private captureMcpStatus(message: unknown): void {
     const sysMsg = message as any;
-    if (sysMsg.subtype === 'init' && sysMsg.mcp_servers) {
+    if (sysMsg.subtype !== 'init') return;
+    if (sysMsg.mcp_servers) {
       this._lastMcpStatus = sysMsg.mcp_servers;
       this._lastMcpStatusTime = new Date().toISOString();
+    }
+    // Auto-register Claude Desktop integrations from the authoritative tool
+    // list the SDK reports on init. Previously the claude-integrations file
+    // was written reactively — only after the agent successfully called an
+    // integration tool — which meant a freshly-connected Google Drive or
+    // Gmail was invisible until used. Now every session-init rewrites the
+    // list to match reality.
+    if (Array.isArray(sysMsg.tools) && sysMsg.tools.length > 0 && _mcpBridge) {
+      try {
+        const { added, updated } = _mcpBridge.registerClaudeIntegrationsFromToolList(sysMsg.tools);
+        if (added.length > 0 || updated.length > 0) {
+          logger.info({ added, updated }, 'Registered Claude Desktop integrations from SDK tool inventory');
+        }
+      } catch (err) {
+        logger.debug({ err }, 'Integration auto-registration failed (non-fatal)');
+      }
     }
   }
 

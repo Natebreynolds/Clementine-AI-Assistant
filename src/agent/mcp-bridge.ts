@@ -442,6 +442,62 @@ export function getClaudeIntegrations(): ClaudeIntegration[] {
 }
 
 /**
+ * Register every integration found in a tool inventory. The SDK's system
+ * init message (subtype='init') includes a `tools: string[]` with the full
+ * set of tools the agent actually has access to this session — including
+ * every mcp__claude_ai_* tool Claude Desktop is surfacing. Walking that
+ * list on init gives us the authoritative, up-to-date integration set
+ * without waiting for the agent to blindly try each one.
+ *
+ * Idempotent: if an entry already exists, we merge new tool names into it
+ * and bump `connected = true` without touching firstSeen/lastUsed.
+ */
+export function registerClaudeIntegrationsFromToolList(tools: string[]): {
+  added: string[];
+  updated: string[];
+} {
+  const added: string[] = [];
+  const updated: string[] = [];
+  if (!Array.isArray(tools) || tools.length === 0) return { added, updated };
+
+  const integrations = loadClaudeIntegrations();
+  const now = new Date().toISOString();
+  let dirty = false;
+
+  for (const toolName of tools) {
+    const parsed = parseClaudeDesktopTool(toolName);
+    if (!parsed) continue;
+    const existing = integrations[parsed.integration];
+    if (existing) {
+      if (!existing.tools.includes(parsed.tool)) {
+        existing.tools.push(parsed.tool);
+        existing.tools.sort();
+        dirty = true;
+      }
+      if (!existing.connected) {
+        existing.connected = true;
+        dirty = true;
+      }
+      if (!updated.includes(parsed.integration)) updated.push(parsed.integration);
+    } else {
+      integrations[parsed.integration] = {
+        name: parsed.integration,
+        label: INTEGRATION_LABELS[parsed.integration] ?? parsed.integration.replace(/_/g, ' '),
+        tools: [parsed.tool],
+        firstSeen: now,
+        lastUsed: now,
+        connected: true,
+      };
+      added.push(parsed.integration);
+      dirty = true;
+    }
+  }
+
+  if (dirty) saveClaudeIntegrations(integrations);
+  return { added, updated };
+}
+
+/**
  * Bootstrap integrations from the audit log.
  * Call once on startup to seed the integrations file from historical data.
  */
