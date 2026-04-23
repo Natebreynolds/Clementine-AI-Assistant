@@ -1226,20 +1226,43 @@ Never spawn a sub-agent with vague instructions like "handle this brief" — tel
 `);
     }
 
-    // Inject Claude Desktop integration awareness. Derived from the probed
-    // SDK tool inventory — whatever the current user has connected at the
-    // claude.ai level shows up here automatically, no per-install hardcoding.
+    // Inject MCP server awareness. Derived from the probed SDK tool inventory.
+    // Covers three namespaces:
+    //   - claude_ai_* → remote OAuth connectors (Drive, Gmail, M365, Slack, etc.)
+    //   - Desktop Extensions + per-query stdio servers (imessage, figma,
+    //     hostinger, supabase, dataforseo, browsermcp, apify, kernel, etc.)
+    //   - plugin_* → Claude Code plugin tools
+    // Without this, the agent only "knows" about claude_ai_* connectors and
+    // denies capabilities it actually has (e.g. "no iMessage integration")
+    // even though mcp__imessage__* tools are in allowedTools.
     try {
       const inv = _mcpBridge?.loadToolInventory();
-      const labels = new Set<string>();
+      const byServer = new Map<string, number>();
       if (inv?.tools) {
         for (const t of inv.tools) {
-          const m = t.match(/^mcp__claude_ai_([^_]+(?:_[^_]+)*)__/);
-          if (m) labels.add(m[1].replace(/_/g, ' '));
+          const m = t.match(/^mcp__([^_]+(?:_[^_]+)*)__/);
+          if (!m) continue;
+          const server = m[1];
+          // Skip clementine's own server — it's already documented in the
+          // self-service section. Keep everything else.
+          if (server === TOOLS_SERVER) continue;
+          byServer.set(server, (byServer.get(server) ?? 0) + 1);
         }
       }
-      if (labels.size > 0) {
-        parts.push(`**Claude Desktop integrations connected for this user:** ${[...labels].sort().join(', ')}. Call \`mcp__claude_ai_<Integration>__<tool>\` directly; the tool names and schemas are in your SDK inventory.`);
+      if (byServer.size > 0) {
+        const lines = [...byServer.entries()]
+          .sort(([a], [b]) => a.localeCompare(b))
+          .map(([server, n]) => {
+            // Humanize: claude_ai_Google_Drive → "Google Drive (claude.ai)"
+            if (server.startsWith('claude_ai_')) {
+              return `- ${server.slice('claude_ai_'.length).replace(/_/g, ' ')} (${n} tools) — prefix \`mcp__${server}__\``;
+            }
+            return `- ${server} (${n} tools) — prefix \`mcp__${server}__\``;
+          });
+        parts.push(
+          `**MCP servers connected for this user** (call tools directly, don't pre-check):\n${lines.join('\n')}\n\n` +
+          `The exact tool names and schemas are in your SDK function inventory — just call the tool that matches the user's request.`
+        );
       }
     } catch { /* non-fatal */ }
 
