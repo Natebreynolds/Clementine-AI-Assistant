@@ -1870,7 +1870,16 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
       ...(abortController ? { abortController } : {}),
       maxTurns: effectiveMaxTurns,
       cwd: BASE_DIR,
-      env: SAFE_ENV,
+      // NOTE: do NOT pass `env: SAFE_ENV` here. The SDK's `env` option
+      // replaces process.env for the claude CLI subprocess, and the CLI's
+      // claude.ai remote connector bootstrap (Drive, Gmail, Calendar, M365,
+      // Slack) silently drops when vars it expects aren't present. The
+      // probeAvailableTools() call doesn't pass `env`, inherits process.env,
+      // and correctly surfaces claude.ai connectors. Matching that behavior
+      // here is the fix for the week-long "No such tool available:
+      // mcp__claude_ai_Google_Drive__*" bug. Per-MCP-server env isolation
+      // still happens inside the mcpServers entries (line ~1855) — this
+      // change only affects the CLI subprocess's own env.
       ...(computedEffort ? { effort: computedEffort } : {}),
       // maxBudgetUsd intentionally omitted — see comment above.
       ...(computedThinking ? { thinking: computedThinking } : {}),
