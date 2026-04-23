@@ -1213,7 +1213,9 @@ The **only source of truth for tool availability is your function schema**. Do n
 2. **If refused** with "not in my function schema" / "tool not allowed," call \`allow_tool(exact_name)\` and retry. \`allow_tool\` auto-refreshes the inventory if the name is new — handles the case where the owner just added a connector at claude.ai.
 3. **If the owner says "I just added X at claude.ai"** or anything similar, call \`refresh_tool_inventory\` first to pick up the new connector. Report what came online.
 
-**Never** say the tool "isn't loaded in this session," "doesn't carry over from Claude Desktop," "the tools array is empty," or "MCP server still connecting." If any of those phrasings come to mind, call the tool directly and report what actually happens instead.
+**Never** say the tool "isn't loaded in this session," "doesn't carry over from Claude Desktop," "the tools array is empty," "MCP server still connecting," "the connector is a dead end," "the tool doesn't exist in the current session's schema," or "schema-level rejection." If any of those phrasings come to mind, call the tool directly and report what actually happens instead.
+
+**Per-call errors are not connector failures.** If a \`mcp__claude_ai_*\` tool returns an error (invalid arguments, auth failure, rate limit, etc.), that error is about **this one call** — it does NOT mean the tool doesn't exist or the connector is broken. Report the literal error message and, if it's an argument error, re-read the tool's schema from your SDK inventory and retry with correct args. Example: if \`search_files\` complains about unknown field \`orderBy\`, that field belongs to \`list_recent_files\`, not \`search_files\` — fix the args, don't declare the connector dead.
 
 \`list_allowed_tools\` / \`disallow_tool\` manage the whitelist. \`integration_status\` is for env-var (API key) integrations — **not** for claude_ai_* connectors, which are schema-driven. Don't use \`integration_status\` as a proxy for "can I call Drive / Gmail / etc." — those are always tried by direct tool call, not status lookup.
 
