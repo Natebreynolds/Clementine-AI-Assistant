@@ -798,6 +798,20 @@ export class PersonalAssistant {
     if (sysMsg.mcp_servers) {
       this._lastMcpStatus = sysMsg.mcp_servers;
       this._lastMcpStatusTime = new Date().toISOString();
+      // Diagnostic (1.0.64+): log per-server connection status on every
+      // init so we can tell whether "No such tool available" errors are
+      // caused by a failed spawn vs misconfigured allowedTools vs session
+      // weirdness. Single-line grep target: 'SDK init — MCP servers'.
+      try {
+        const statuses = sysMsg.mcp_servers.map((s: any) => `${s.name}:${s.status}`);
+        logger.info({
+          statuses,
+          toolCount: Array.isArray(sysMsg.tools) ? sysMsg.tools.length : 0,
+          sessionId: sysMsg.session_id,
+          cwd: sysMsg.cwd,
+          model: sysMsg.model,
+        }, 'SDK init — MCP servers');
+      } catch { /* non-fatal */ }
     }
     // Auto-register Claude Desktop integrations from the authoritative tool
     // list the SDK reports on init. Previously the claude-integrations file
@@ -2525,6 +2539,21 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
         }
 
         try {
+          // Diagnostic (1.0.64+): log the exact options we hand to query().
+          // Compare against a known-working standalone call to pinpoint
+          // config drift. Single-line grep target: 'query() options'.
+          logger.info({
+            sessionKey,
+            cwd: sdkOptions.cwd,
+            mcpServerKeys: Object.keys((sdkOptions as any).mcpServers ?? {}),
+            toolsCount: Array.isArray(sdkOptions.tools) ? sdkOptions.tools.length : 'preset-or-omitted',
+            allowedToolsCount: (sdkOptions as any).allowedTools?.length ?? 0,
+            disallowedToolsCount: (sdkOptions as any).disallowedTools?.length ?? 0,
+            hasResume: !!(sdkOptions as any).resume,
+            resumeSessionId: (sdkOptions as any).resume,
+            model: sdkOptions.model,
+          }, 'query() options');
+
           const stream = query({ prompt, options: sdkOptions });
 
           let gotStreamEvents = false;
@@ -2869,6 +2898,36 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
                 })(),
                 replyPreview: responseText.slice(0, 200).replace(/\n/g, ' '),
               }, 'Contradiction validator pass');
+              // Diagnostic (1.0.64+): dump EVERY tool_result whose content
+              // looks like the SDK's "No such tool available" error, with
+              // its full content + corresponding tool_use. The specific
+              // pairing is what we need to diagnose whether a particular
+              // server failed to register vs a specific tool was dropped.
+              try {
+                const useById = new Map<string, string>();
+                for (const msg of collectedSdkMessages) {
+                  if (msg.type !== 'assistant' || !msg.message?.content) continue;
+                  for (const b of (Array.isArray(msg.message.content) ? msg.message.content : [])) {
+                    if (b?.type === 'tool_use' && b.id && b.name) useById.set(b.id, b.name);
+                  }
+                }
+                for (const msg of collectedSdkMessages) {
+                  if (msg.type !== 'user' || !msg.message?.content) continue;
+                  for (const b of (Array.isArray(msg.message.content) ? msg.message.content : [])) {
+                    if (b?.type !== 'tool_result') continue;
+                    const contentStr = typeof b.content === 'string' ? b.content : JSON.stringify(b.content);
+                    if (/tool_use_error/i.test(contentStr)) {
+                      logger.warn({
+                        sessionKey,
+                        tool_use_id: b.tool_use_id,
+                        tool_name: useById.get(b.tool_use_id) ?? '(unknown)',
+                        is_error: b.is_error,
+                        content: contentStr.slice(0, 600),
+                      }, 'SDK tool_use_error surfaced');
+                    }
+                  }
+                }
+              } catch { /* non-fatal */ }
             }
             const finding = detectContradiction(responseText, toolCallRecords);
             if (finding) {
