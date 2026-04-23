@@ -375,6 +375,36 @@ export interface SkillMatch {
  */
 const skillEmbeddingCache = new Map<string, Float32Array>();
 
+/**
+ * Recursively list every .md skill file under `dir`. Returns absolute
+ * paths, relative paths (for dedupe/naming), and an `isAuto` flag set
+ * when the file lives under an `auto/` subtree. Used so auto-generated
+ * MCP skills under `skills/auto/<server>/<tool>.md` surface in search
+ * while user-authored top-level skills win on score tiebreak.
+ */
+function walkSkillFiles(root: string): Array<{ filePath: string; relPath: string; isAuto: boolean }> {
+  const out: Array<{ filePath: string; relPath: string; isAuto: boolean }> = [];
+  function walk(dir: string, rel: string): void {
+    let entries: import('node:fs').Dirent[];
+    try { entries = readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const ent of entries) {
+      const name = ent.name;
+      // Skip backup files and hidden files
+      if (name.endsWith('.bak') || name.startsWith('.')) continue;
+      const full = path.join(dir, name);
+      const nextRel = rel ? path.join(rel, name) : name;
+      if (ent.isDirectory()) {
+        walk(full, nextRel);
+      } else if (ent.isFile() && name.endsWith('.md')) {
+        const isAuto = nextRel.split(path.sep)[0] === 'auto';
+        out.push({ filePath: full, relPath: nextRel, isAuto });
+      }
+    }
+  }
+  walk(root, '');
+  return out;
+}
+
 function getSkillEmbedding(filePath: string, triggers: string[], title: string, description: string): Float32Array | null {
   const cached = skillEmbeddingCache.get(filePath);
   if (cached) return cached;
@@ -414,15 +444,20 @@ export function searchSkills(
   const queryVec = useSemantic ? embedText(query) : null;
 
   for (const { dir, boost } of dirs) {
-    const files = readdirSync(dir).filter(f => f.endsWith('.md'));
-    for (const file of files) {
-      const name = file.replace('.md', '');
+    // Walk recursively so skills/auto/<server>/<tool>.md gets indexed
+    // alongside top-level user-authored skills. Track whether a given
+    // file lives under an `auto/` subtree so user-authored wins on
+    // tiebreak even when both match the query.
+    const files = walkSkillFiles(dir);
+    for (const { filePath, relPath, isAuto } of files) {
+      // Use relPath (no .md, slashes → dashes) so same-name skills in
+      // different subdirs don't collide in the dedupe set.
+      const name = relPath.replace(/\.md$/, '').replace(/[\\/]/g, '-');
       if (seen.has(name)) continue;
       seen.add(name);
       // Feedback-gated: skip skills that have been repeatedly associated with
       // negative user feedback (see store.getSkillsToSuppress).
       if (suppressed?.has(name)) continue;
-      const filePath = path.join(dir, file);
       try {
         const raw = readFileSync(filePath, 'utf-8');
         const parsed = matter(raw);
@@ -438,10 +473,32 @@ export function searchSkills(
         const triggerLower = triggers
           .filter((t): t is string => typeof t === 'string' && t.length > 0)
           .map(t => t.toLowerCase());
-        for (const word of queryWords) {
-          for (const trigger of triggerLower) {
-            if (trigger.includes(word) || word.includes(trigger)) score += 3;
+        const queryLower = query.toLowerCase();
+        // Tokenize into whole words so "list" the trigger-word doesn't
+        // match every "list X" trigger when a single query word "list"
+        // shows up in a totally unrelated query.
+        for (const trigger of triggerLower) {
+          // Full-phrase substring hit (rare but strongest signal)
+          if (trigger.length >= 4 && queryLower.includes(trigger)) {
+            score += 5;
+            continue;
           }
+          // Word-coverage: fraction of trigger words present in the query
+          // (with loose substring match per word to catch plurals etc).
+          const tWords = trigger.split(/\s+/).filter(w => w.length > 2);
+          if (tWords.length === 0) continue;
+          let matched = 0;
+          for (const tw of tWords) {
+            if (queryWords.some(qw => qw.includes(tw) || tw.includes(qw))) matched++;
+          }
+          const coverage = matched / tWords.length;
+          // Require ≥50% of the trigger's words to appear. This is what
+          // stops "list supabase" from matching "list my imessages" — the
+          // word "supabase" isn't in the query so coverage = 0.5, which
+          // lands at a tiny score; a fully covered trigger lands strong.
+          if (coverage >= 0.5) score += coverage * 3;
+        }
+        for (const word of queryWords) {
           if (title.toLowerCase().includes(word)) score += 2;
           if (description.toLowerCase().includes(word)) score += 1;
         }
@@ -460,13 +517,19 @@ export function searchSkills(
           }
         }
 
+        // Auto-skills get a small penalty so user-authored skills win
+        // when both match. Still surface auto-skills when nothing else
+        // does — they're the only source of canonical MCP tool knowledge
+        // for connectors the user hasn't explicitly documented.
+        const autoPenalty = isAuto ? -0.5 : 0;
+
         const totalScore = score + semanticScore;
         if (totalScore > 0) {
           results.push({
             name,
             title,
             content: parsed.content.slice(0, 1500),
-            score: totalScore + boost,
+            score: totalScore + boost + autoPenalty,
             toolsUsed: parsed.data.toolsUsed ?? [],
             attachments: parsed.data.attachments ?? [],
             skillDir: dir,

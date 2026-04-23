@@ -443,6 +443,31 @@ server.tool(
 );
 
 server.tool(
+  'refresh_skills',
+  'Re-fetch canonical schemas from every MCP server and regenerate auto-skills under ~/.clementine/vault/00-System/skills/auto/. Runs automatically on daemon boot; use this tool mid-session when the owner adds a new connector or updates an MCP server. Owner-DM only. Returns counts of skills written/unchanged/pruned.',
+  {},
+  async () => {
+    const gate = requireOwnerDm();
+    if (!gate.ok) return textResult(gate.message);
+    try {
+      const { fetchAllSchemas } = await import('../agent/mcp-schemas.js');
+      const { synthesizeSkillsFromSchemas } = await import('../agent/auto-skills.js');
+      const schemas = await fetchAllSchemas();
+      const result = synthesizeSkillsFromSchemas(schemas);
+      const serverLines = Object.entries(schemas.servers).map(([name, s]) =>
+        `- **${name}**: ${s.tools.length} tools${s.error ? ` (error: ${s.error.slice(0, 80)})` : ''}`
+      );
+      return textResult(
+        `Fetched schemas from ${Object.keys(schemas.servers).length} MCP servers.\n${serverLines.join('\n')}\n\n` +
+        `**Skills:** ${result.written} written, ${result.unchanged} unchanged, ${result.pruned} pruned. Total tools indexed: ${result.toolCount}.`
+      );
+    } catch (err) {
+      return textResult(`Skill refresh failed: ${String(err).slice(0, 300)}`);
+    }
+  },
+);
+
+server.tool(
   'list_allowed_tools',
   'Show the current self-managed allowedTools extras (tools you added via allow_tool on top of the built-in whitelist). Owner-DM only.',
   {},

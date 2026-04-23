@@ -1607,6 +1607,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
       mcpTool('list_allowed_tools'),
       mcpTool('disallow_tool'),
       mcpTool('refresh_tool_inventory'),
+      mcpTool('refresh_skills'),
       mcpTool('self_restart'),
       mcpTool('self_update'),
       mcpTool('where_is_source'),

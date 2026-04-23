@@ -613,7 +613,7 @@ async function asyncMain(): Promise<void> {
     // have been taken with a stale probe config (e.g. before we started
     // passing mcpServers to the probe). Re-probe fresh so Extensions and
     // per-query MCP servers are discovered and whitelisted immediately.
-    probeAvailableTools(true).then(inv => {
+    probeAvailableTools(true).then(async inv => {
       const integrations = new Set<string>();
       for (const t of inv.tools) {
         const m = t.match(/^mcp__claude_ai_([^_]+(?:_[^_]+)*)__/);
@@ -621,6 +621,19 @@ async function asyncMain(): Promise<void> {
       }
       if (integrations.size > 0) {
         logger.info({ integrations: [...integrations].sort(), toolCount: inv.tools.length }, '🦞 Claude Desktop integrations detected');
+      }
+      // After inventory is live, fetch canonical schemas from every stdio
+      // MCP server we can reach, then synthesize auto-skills for every
+      // tool. This is the load-bearing pipeline for "Clementine knows how
+      // to call any connector the user has" — no per-tool hardcoding.
+      try {
+        const { fetchAllSchemas } = await import('./agent/mcp-schemas.js');
+        const { synthesizeSkillsFromSchemas } = await import('./agent/auto-skills.js');
+        const schemas = await fetchAllSchemas();
+        const result = synthesizeSkillsFromSchemas(schemas);
+        logger.info(result, '📚 Auto-skills synthesized from MCP schemas');
+      } catch (err) {
+        logger.warn({ err }, 'Auto-skill synthesis failed (non-fatal)');
       }
     }).catch(() => { /* non-fatal, buildOptions falls back to baseline */ });
   } catch { /* non-fatal */ }
