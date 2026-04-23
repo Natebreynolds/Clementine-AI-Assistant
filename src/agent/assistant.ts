@@ -2841,6 +2841,23 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
                 sdkMessagesCaptured: collectedSdkMessages.length,
                 toolCallsPaired: toolCallRecords.length,
                 resultClasses: toolCallRecords.map(r => `${r.name}:${r.resultClass}`),
+                firstResultPreview: toolCallRecords[0]?.resultPreview?.slice(0, 300),
+                rawFirstToolResult: (() => {
+                  // Dump the raw user-message tool_result block so we can
+                  // see is_error + content shape when the classifier picks
+                  // a result class that looks wrong (e.g. other_error when
+                  // the MCP server actually returned success).
+                  for (const msg of collectedSdkMessages) {
+                    if (msg.type !== 'user' || !msg.message?.content) continue;
+                    const blocks = Array.isArray(msg.message.content) ? msg.message.content : [];
+                    for (const b of blocks) {
+                      if (b?.type === 'tool_result') {
+                        return { is_error: b.is_error, content_shape: Array.isArray(b.content) ? 'array' : typeof b.content, content_head: JSON.stringify(b.content).slice(0, 300) };
+                      }
+                    }
+                  }
+                  return null;
+                })(),
                 replyPreview: responseText.slice(0, 200).replace(/\n/g, ' '),
               }, 'Contradiction validator pass');
             }
