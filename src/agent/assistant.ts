@@ -2549,35 +2549,6 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
           const stream = query({ prompt, options: sdkOptions });
 
           let gotStreamEvents = false;
-          // Live status text shown to the user while model is thinking / calling
-          // tools. Rendered as italic markdown lines prepended to the reply.
-          // Stripped from the final `responseText` before return so transcripts
-          // stay clean. Feels like motion — a 30s turn no longer looks frozen.
-          let statusText = '';
-          const hasStreamingSurface = typeof onText === 'function';
-          const flushStatus = async () => {
-            if (!hasStreamingSurface) return;
-            const combined = statusText
-              ? (responseText ? `${statusText}\n\n${responseText}` : statusText)
-              : responseText;
-            try { await onText!(combined); } catch { /* non-fatal */ }
-          };
-          // Pre-first-token status: show something within the first ~2s so the
-          // user knows the daemon got the message and is working. Derived from
-          // intent classifier type → short phrase; generic otherwise.
-          if (hasStreamingSurface) {
-            const hintMap: Record<string, string> = {
-              question: 'Looking into that',
-              task: 'On it',
-              feedback: 'Got it',
-              casual: 'One sec',
-              followup: 'Picking that up',
-              correction: 'Got it — correcting',
-            };
-            const hint = (intentClassification?.type && hintMap[intentClassification.type]) || 'Working on it';
-            statusText = `_${hint}…_`;
-            await flushStatus();
-          }
 
           for await (const message of stream) {
             // Capture assistant + user messages for post-turn contradiction
@@ -2594,18 +2565,10 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
                   // Only accumulate from assistant messages if we haven't
                   // received stream_event deltas (which already accumulated text)
                   responseText += block.text;
-                  if (onText) await onText((statusText ? `${statusText}\n\n` : '') + responseText);
+                  if (onText) await onText(responseText);
                 } else if (block.type === 'tool_use' && block.name) {
                   logToolUse(block.name, (block.input ?? {}) as Record<string, unknown>);
                   if (sessionKey) eventLog.emitToolCall(sessionKey, block.name, (block.input ?? {}) as Record<string, unknown>);
-                  // Append a one-line tool-use status to the live stream so
-                  // the user sees real progress during multi-turn ops.
-                  if (hasStreamingSurface) {
-                    const shortName = block.name.replace(/^mcp__[^_]+(?:_[^_]+)*__/, '').slice(0, 50);
-                    const line = `_→ ${shortName}_`;
-                    statusText = statusText ? `${statusText}\n${line}` : line;
-                    await flushStatus();
-                  }
                   if (onToolActivity) {
                     try { await onToolActivity(block.name, (block.input ?? {}) as Record<string, unknown>); } catch { /* non-fatal */ }
                   }
@@ -2626,7 +2589,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
               const evt = partial.event as { type?: string; delta?: { type?: string; text?: string } };
               if (evt.type === 'content_block_delta' && evt.delta?.type === 'text_delta' && evt.delta.text) {
                 responseText += evt.delta.text;
-                if (onText) await onText((statusText ? `${statusText}\n\n` : '') + responseText);
+                if (onText) await onText(responseText);
               }
             } else if (message.type === 'result') {
               const result = message as SDKResultMessage;
