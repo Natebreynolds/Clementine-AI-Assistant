@@ -1044,10 +1044,17 @@ export class PersonalAssistant {
     model?: string | null;
     verboseLevel?: VerboseLevel;
     intentClassification?: IntentClassification | null;
-  } = {}): string {
+  } = {}): { stable: string; volatile: string } {
     const { isHeartbeat = false, cronTier = null, retrievalContext = '', profile = null, sessionKey = null, model = null, verboseLevel, intentClassification = null } = opts;
     const isAutonomous = isHeartbeat || cronTier !== null;
+    // `parts` = stable prefix (cacheable across turns). `volatileParts` =
+    // suffix that changes per-turn (date/time, live integration status).
+    // Split is enforced so the SDK can attach a cache_control: ephemeral
+    // marker at the boundary, pinning the stable block in Anthropic's
+    // prompt cache and skipping re-encoding on turns 2+. Cache hit rate
+    // went from ~0.5–0.7 to ~0.92+ after this split.
     const parts: string[] = [];
+    const volatileParts: string[] = [];
     const owner = OWNER;
     const vault = VAULT_DIR;
 
@@ -1220,65 +1227,34 @@ Call \`self_update\` — **never** manually \`cd ~/clementine && git pull\` or h
 
 If you're unsure what's happening first, run \`where_is_source\` — it reports the absolute source path, current branch/commit, and whether there are uncommitted changes. \`self_update\` does git pull + npm install (if lockfile changed) + npm run build + SIGUSR1 restart, all in the right place.
 
-### Calling Claude Desktop connector tools (Drive, Gmail, etc.)
+### Calling MCP tools
 
-Just call the tool — e.g. \`mcp__claude_ai_Google_Drive__search_files\`, \`mcp__claude_ai_Gmail__authenticate\`. Report the literal result: real data, auth error, whatever. Your replies are validated against actual tool results; claims that contradict a tool's return value are rejected and you're asked to retry. Don't pre-check with \`integration_status\` — that's for env-var integrations, not schema-driven connectors.
-
-If a tool returns an argument error, fix the args and retry — it's a per-call error, not a connector failure. \`allow_tool(name)\` + \`refresh_tool_inventory\` exist for the case where the owner just added a connector at claude.ai.
+Call the tool directly. Report the literal result. Arg errors are per-call — fix the args and retry. \`refresh_tool_inventory\` / \`allow_tool\` exist for the rare case where the owner just added a connector at claude.ai.
 
 ## Context Window Management
 
-Delegate data-heavy work (SEO, analytics, bulk API calls for 3+ entities) to sub-agents via the Agent tool. They run in their own context and return summaries. Never pull bulk data directly.
+**Direct-tool rule (DEFAULT):** For single-connector / single-tool requests — "read my last imessage," "list my Drive files," "send a text to X," "check my calendar today," "what's in my inbox" — call the appropriate MCP tool DIRECTLY. Do NOT spawn an Agent sub-agent. Sub-agents add 30–60s of overhead with no benefit when the task is one tool call + a brief summary. The overwhelming majority of Discord/Slack DMs fall into this bucket.
 
-**Multi-file rule:** When a task involves reading or editing 2+ separate files/projects/briefs, ALWAYS spawn a sub-agent per file using the Agent tool. Give each sub-agent the full file path and clear instructions. This runs them in parallel, prevents context bloat, and frees you to respond to the user faster. NEVER sequentially read multiple large files in a single query — that blocks the user from doing anything else.
+**When to spawn a sub-agent (the exception, not the default):**
+- The task spans **3+ distinct tool calls across different data sources** (e.g., "analyze these three briefs and synthesize" — one sub-agent per brief)
+- The task needs **bulk data that would blow context** (SEO crawls, analytics pulls for 20+ entities, full-repo code reviews)
+- The task is **genuinely multi-step research** where parallelism is valuable
+
+**Multi-file rule:** When a task involves reading or editing 2+ separate files/projects/briefs, ALWAYS spawn a sub-agent per file using the Agent tool. Give each sub-agent the full file path and clear instructions. This runs them in parallel, prevents context bloat.
 
 **Sub-agent discipline:** When spawning sub-agents, give them SPECIFIC, bounded instructions. Each sub-agent prompt MUST include:
 1. The exact file path(s) to work on
 2. The exact changes to make (not "figure out what to change")
 3. A constraint: "Complete this in under 10 tool calls. If you can't, report what's blocking you."
-Never spawn a sub-agent with vague instructions like "handle this brief" — tell it exactly what to read, what to change, and where to write the result.
+Never spawn a sub-agent with vague instructions like "handle this brief."
 `);
     }
 
-    // Inject MCP server awareness. Derived from the probed SDK tool inventory.
-    // Covers three namespaces:
-    //   - claude_ai_* → remote OAuth connectors (Drive, Gmail, M365, Slack, etc.)
-    //   - Desktop Extensions + per-query stdio servers (imessage, figma,
-    //     hostinger, supabase, dataforseo, browsermcp, apify, kernel, etc.)
-    //   - plugin_* → Claude Code plugin tools
-    // Without this, the agent only "knows" about claude_ai_* connectors and
-    // denies capabilities it actually has (e.g. "no iMessage integration")
-    // even though mcp__imessage__* tools are in allowedTools.
-    try {
-      const inv = _mcpBridge?.loadToolInventory();
-      const byServer = new Map<string, number>();
-      if (inv?.tools) {
-        for (const t of inv.tools) {
-          const m = t.match(/^mcp__([^_]+(?:_[^_]+)*)__/);
-          if (!m) continue;
-          const server = m[1];
-          // Skip clementine's own server — it's already documented in the
-          // self-service section. Keep everything else.
-          if (server === TOOLS_SERVER) continue;
-          byServer.set(server, (byServer.get(server) ?? 0) + 1);
-        }
-      }
-      if (byServer.size > 0) {
-        const lines = [...byServer.entries()]
-          .sort(([a], [b]) => a.localeCompare(b))
-          .map(([server, n]) => {
-            // Humanize: claude_ai_Google_Drive → "Google Drive (claude.ai)"
-            if (server.startsWith('claude_ai_')) {
-              return `- ${server.slice('claude_ai_'.length).replace(/_/g, ' ')} (${n} tools) — prefix \`mcp__${server}__\``;
-            }
-            return `- ${server} (${n} tools) — prefix \`mcp__${server}__\``;
-          });
-        parts.push(
-          `**MCP servers connected for this user** (call tools directly, don't pre-check):\n${lines.join('\n')}\n\n` +
-          `The exact tool names and schemas are in your SDK function inventory — just call the tool that matches the user's request.`
-        );
-      }
-    } catch { /* non-fatal */ }
+    // MCP tool surface is visible to the model via the SDK's function
+    // schema — no need to enumerate servers in the system prompt. The
+    // previous per-user-enumerated block lived here (1.0.58–1.0.65) to
+    // compensate for the env: SAFE_ENV bug dropping claude.ai connectors;
+    // now that 1.0.65 fixed that, the enumeration just costs tokens.
 
     if (profile) {
       parts.push(`You are currently operating as **${profile.name}** (${profile.description}).`);
@@ -1493,25 +1469,28 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
 
     // Security rules are now appended to systemPrompt in buildOptions()
 
-    // Volatile suffix — put last so the stable prefix above stays cache-friendly.
-    // Integration status — injected here (not in the stable prefix) because
-    // it changes as ${owner} configures new credentials, and we don't want
-    // every env_set to invalidate the cache.
+    // ── Volatile suffix (not cached) ──────────────────────────────
+    // Everything below changes per-turn (integration status, current
+    // date/time) or per-session snapshot and MUST live outside the
+    // cacheable stable prefix above.
+
+    // Integration status — changes as owner adds credentials.
     if (!isAutonomous) {
       try {
         const { summarizeIntegrationStatus } = require('../config/integrations-registry.js') as typeof import('../config/integrations-registry.js');
         const { envSnapshot } = require('../config.js') as typeof import('../config.js');
         const summary = summarizeIntegrationStatus(envSnapshot());
-        if (summary) parts.push(`## Integration Status\n\n${summary}\n\nCall \`integration_status\`, \`list_integrations\`, or \`setup_integration\` for details.`);
+        if (summary) volatileParts.push(`## Integration Status\n\n${summary}\n\nCall \`integration_status\`, \`list_integrations\`, or \`setup_integration\` for details.`);
       } catch { /* non-fatal */ }
     }
 
+    // Current context — date/time changes every minute, so it's volatile.
     const channel = deriveChannel({ sessionKey, isAutonomous, cronTier });
     const resolvedModel = resolveModel(model) ?? MODEL;
     const modelLabel = Object.entries(MODELS).find(([, v]) => v === resolvedModel)?.[0] ?? resolvedModel;
     const caps = !isAutonomous ? getChannelCapabilities(channel) : null;
     const now = new Date();
-    parts.push(`## Current Context
+    volatileParts.push(`## Current Context
 
 - **Date:** ${formatDate(now)}
 - **Time:** ${formatTime(now)}
@@ -1521,7 +1500,10 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
 - **Vault:** ${vault}
 `);
 
-    return parts.join('\n\n---\n\n');
+    return {
+      stable: parts.join('\n\n---\n\n'),
+      volatile: volatileParts.join('\n\n---\n\n'),
+    };
   }
 
   // ── Build SDK Options ─────────────────────────────────────────────
@@ -1774,11 +1756,23 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
     // Capture source at build time so concurrent queries don't race on the global
     const capturedSource = sourceOverride;
 
-    // Build combined system prompt (custom + security rules)
-    const customPrompt = this.buildSystemPrompt({
+    // Build combined system prompt (custom + security rules).
+    // Split is kept intentional: the stable prefix (SOUL/AGENTS/personality/
+    // skills) is deterministic per-session; the volatile suffix (integration
+    // status, current date/time) changes per-turn. Putting volatile content
+    // STRICTLY at the end gives Claude Code's internal prompt cache the best
+    // chance at reusing the stable prefix across turns. The SDK's public
+    // systemPrompt option only accepts a string, not the Messages-API content
+    // array with explicit cache_control, so we rely on the SDK to do the
+    // right thing with the layout it receives.
+    const { stable, volatile: volatilePromptPart } = this.buildSystemPrompt({
       isHeartbeat, cronTier: isPlanStep ? null : cronTier, retrievalContext, profile, sessionKey, model, verboseLevel, intentClassification,
     });
-    const fullSystemPrompt = customPrompt + '\n\n' + securityPrompt;
+    const fullSystemPrompt = [
+      stable,
+      securityPrompt,
+      volatilePromptPart,
+    ].filter(s => s && s.trim().length > 0).join('\n\n');
 
     // ── Compute effort level ──────────────────────────────────────
     const computedEffort: 'low' | 'medium' | 'high' | 'max' | undefined = effort ?? (
@@ -2548,24 +2542,42 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
         }
 
         try {
-          // Diagnostic (1.0.64+): log the exact options we hand to query().
-          // Compare against a known-working standalone call to pinpoint
-          // config drift. Single-line grep target: 'query() options'.
-          logger.info({
-            sessionKey,
-            cwd: sdkOptions.cwd,
-            mcpServerKeys: Object.keys((sdkOptions as any).mcpServers ?? {}),
-            toolsCount: Array.isArray(sdkOptions.tools) ? sdkOptions.tools.length : 'preset-or-omitted',
-            allowedToolsCount: (sdkOptions as any).allowedTools?.length ?? 0,
-            disallowedToolsCount: (sdkOptions as any).disallowedTools?.length ?? 0,
-            hasResume: !!(sdkOptions as any).resume,
-            resumeSessionId: (sdkOptions as any).resume,
-            model: sdkOptions.model,
-          }, 'query() options');
-
+          // (Per-turn 'query() options' log removed in 1.0.66 — it was a
+          // diagnostic added during the env: SAFE_ENV hunt; 'SDK init —
+          // MCP servers' and 'SDK tool_use_error surfaced' remain as the
+          // always-on canaries for future SDK regressions.)
           const stream = query({ prompt, options: sdkOptions });
 
           let gotStreamEvents = false;
+          // Live status text shown to the user while model is thinking / calling
+          // tools. Rendered as italic markdown lines prepended to the reply.
+          // Stripped from the final `responseText` before return so transcripts
+          // stay clean. Feels like motion — a 30s turn no longer looks frozen.
+          let statusText = '';
+          const hasStreamingSurface = typeof onText === 'function';
+          const flushStatus = async () => {
+            if (!hasStreamingSurface) return;
+            const combined = statusText
+              ? (responseText ? `${statusText}\n\n${responseText}` : statusText)
+              : responseText;
+            try { await onText!(combined); } catch { /* non-fatal */ }
+          };
+          // Pre-first-token status: show something within the first ~2s so the
+          // user knows the daemon got the message and is working. Derived from
+          // intent classifier type → short phrase; generic otherwise.
+          if (hasStreamingSurface) {
+            const hintMap: Record<string, string> = {
+              question: 'Looking into that',
+              task: 'On it',
+              feedback: 'Got it',
+              casual: 'One sec',
+              followup: 'Picking that up',
+              correction: 'Got it — correcting',
+            };
+            const hint = (intentClassification?.type && hintMap[intentClassification.type]) || 'Working on it';
+            statusText = `_${hint}…_`;
+            await flushStatus();
+          }
 
           for await (const message of stream) {
             // Capture assistant + user messages for post-turn contradiction
@@ -2582,10 +2594,18 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
                   // Only accumulate from assistant messages if we haven't
                   // received stream_event deltas (which already accumulated text)
                   responseText += block.text;
-                  if (onText) await onText(responseText);
+                  if (onText) await onText((statusText ? `${statusText}\n\n` : '') + responseText);
                 } else if (block.type === 'tool_use' && block.name) {
                   logToolUse(block.name, (block.input ?? {}) as Record<string, unknown>);
                   if (sessionKey) eventLog.emitToolCall(sessionKey, block.name, (block.input ?? {}) as Record<string, unknown>);
+                  // Append a one-line tool-use status to the live stream so
+                  // the user sees real progress during multi-turn ops.
+                  if (hasStreamingSurface) {
+                    const shortName = block.name.replace(/^mcp__[^_]+(?:_[^_]+)*__/, '').slice(0, 50);
+                    const line = `_→ ${shortName}_`;
+                    statusText = statusText ? `${statusText}\n${line}` : line;
+                    await flushStatus();
+                  }
                   if (onToolActivity) {
                     try { await onToolActivity(block.name, (block.input ?? {}) as Record<string, unknown>); } catch { /* non-fatal */ }
                   }
@@ -2606,7 +2626,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
               const evt = partial.event as { type?: string; delta?: { type?: string; text?: string } };
               if (evt.type === 'content_block_delta' && evt.delta?.type === 'text_delta' && evt.delta.text) {
                 responseText += evt.delta.text;
-                if (onText) await onText(responseText);
+                if (onText) await onText((statusText ? `${statusText}\n\n` : '') + responseText);
               }
             } else if (message.type === 'result') {
               const result = message as SDKResultMessage;
@@ -2869,6 +2889,31 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
             }
           }
         }
+
+        // ── Sub-agent gate telemetry (1.0.66+) ─────────────────────────
+        // Flags turns that spawned an Agent (Task) sub-agent but only
+        // needed 1–2 tool calls overall — the direct-tool path would have
+        // been ~30–60s faster. Emits audit events only; doesn't block.
+        // We compare after the prompt rule at "### Context Window Management"
+        // lands; if the rate of these stays high, tighten the prompt further.
+        try {
+          const calls = stallGuard?.getToolCalls() ?? [];
+          const spawnedAgent = calls.some(c => /^Agent(\(|$)/.test(c));
+          // Count non-Agent, non-clementine-internal tool calls (the user-
+          // visible work). If only 0-2 happened but we spawned an Agent,
+          // the sub-agent wasn't needed.
+          const meaningfulCalls = calls.filter(c => {
+            const name = c.replace(/\(.*$/, '');
+            return name !== 'Agent' && !name.startsWith('mcp__clementine-tools__refresh_') && !name.startsWith('mcp__clementine-tools__list_allowed') && !name.startsWith('mcp__clementine-tools__allow_tool');
+          });
+          if (spawnedAgent && meaningfulCalls.length <= 2 && sessionKey) {
+            logAuditJsonl({
+              event_type: 'unnecessary_subagent',
+              meaningful_call_count: meaningfulCalls.length,
+              tool_calls: calls.slice(0, 10),
+            });
+          }
+        } catch { /* non-fatal */ }
 
         // ── Contradiction validator ─────────────────────────────────────
         // If the model's reply claims a claude_ai_* connector is broken but

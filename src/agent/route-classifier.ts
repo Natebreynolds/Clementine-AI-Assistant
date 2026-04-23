@@ -212,14 +212,17 @@ export async function classifyRoute(
     return null;
   }
 
-  // Fast path: explicit slug mention anywhere in the message.
+  // Fast path A — explicit slug or first-name mention. Build this first so
+  // we can early-exit the whole classifier when there's a hit, AND to
+  // decide whether the cheaper short-message fast-paths below are safe
+  // (they're safe only when no specialist was named).
+  const trimmed = userMessage.trim();
   for (const a of specialists) {
     const nameLower = a.name.toLowerCase();
     const firstName = nameLower.split(/\s+/)[0]!;
-    // Only match on reasonable word boundaries; skip one-letter firsts
     if (firstName.length < 3) continue;
     const wordRe = new RegExp(`\\b(${firstName}|${a.slug})\\b`, 'i');
-    if (wordRe.test(userMessage)) {
+    if (wordRe.test(trimmed)) {
       logger.debug({ slug: a.slug, trigger: 'explicit-mention' }, 'Fast-path routing decision');
       return {
         targetAgent: a.slug,
@@ -227,6 +230,24 @@ export async function classifyRoute(
         reasoning: `User explicitly addressed ${a.name} by name.`,
       };
     }
+  }
+
+  // Fast path B — short messages (≤ 40 chars, no specialist named above)
+  // almost always mean "talk to Clementine." Greetings, acknowledgements,
+  // "what's up", single-tool asks all fit. Burning a Haiku call to route
+  // "ok thanks" or "check my drive" is pure overhead. Returns null so the
+  // caller defaults to Clementine without invoking the classifier LLM.
+  if (trimmed.length <= 40) {
+    logger.debug({ length: trimmed.length, trigger: 'short-message' }, 'Routing skipped — short owner message');
+    return null;
+  }
+
+  // Fast path C — question-word openers (what/when/who/how/can/does/is/…).
+  // These are almost universally questions for the assistant herself
+  // rather than delegation requests. Cheap to detect, no LLM call.
+  if (/^\s*(what|when|who|where|why|how|can|could|would|should|will|do|does|did|is|are|was|were)\b/i.test(trimmed)) {
+    logger.debug({ trigger: 'question-opener' }, 'Routing skipped — question-opener');
+    return null;
   }
 
   // LLM classifier for everything else.

@@ -29,9 +29,18 @@ export interface ToolCallRecord {
 const ARG_ERROR_RE = /\b(invalid|unknown field|required|missing parameter|schema|unrecognized|unexpected property)\b/i;
 const AUTH_ERROR_RE = /\b(unauthori[sz]ed|401|not authenticated|token expired|token has expired|invalid[_ ]?token|access denied)\b/i;
 
-/** Regex matching reply phrasings that claim a connector-wide failure. */
+/**
+ * Regex matching reply phrasings that claim a connector-wide failure.
+ *
+ * Shrunk in 1.0.66 after the root-cause fix (env: SAFE_ENV was stripping
+ * claude.ai connector bootstrap in the daemon, landed in 1.0.65). That
+ * removed the upstream need for ~15 defensive phrasings. We keep three
+ * core patterns as a cheap safety net — anything else means the model
+ * invented a new way to confabulate, which we'd rather see raw in the
+ * audit log than silently paper over.
+ */
 export const CONTRADICTION_RE =
-  /(dead\s*end|doesn'?t exist|not in (the |my )?schema|schema[- ]level|aren'?t loading into|(not|isn'?t|aren'?t|wasn'?t) (loaded|wired|available|connected|coming through|responding|reachable|working)|connector[^.]{0,40}(dropped|is (a )?dead)|tools? array is empty|MCP server (still connecting|dropped|not responding|just isn'?t connected|isn'?t connected)|no such tool available|tool doesn'?t exist|both directions are blocked|(restart|close and reopen|reconnect) Claude Code)/i;
+  /(dead\s*end|not in (the |my )?schema|no such tool available)/i;
 
 export function classifyResult(content: string, isError: boolean): ToolResultClass {
   if (!isError) return 'success';

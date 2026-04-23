@@ -181,9 +181,22 @@ export async function startWhatsApp(
     // Return TwiML immediately; process in background
     res.type('application/xml').send('<Response></Response>');
 
-    // Process and reply asynchronously
+    // Process and reply asynchronously. Twilio-delivered WhatsApp doesn't
+    // support editing sent messages, so we can't mirror the Discord/Telegram
+    // edit-in-place streaming. Fallback: within ~2s, send a single "On it…"
+    // ack bubble so the user sees motion immediately. When the full reply
+    // is ready, send it as a follow-up. Two messages > 30s of silence.
+    let ackSent = false;
+    const ackTimer = setTimeout(() => {
+      ackSent = true;
+      sendWhatsApp(fromNumber, '_On it…_').catch(err => logger.debug({ err }, 'WhatsApp ack send failed'));
+    }, 2000);
     try {
-      const response = await gateway.handleMessage(sessionKey, body);
+      // onText is called many times with partial text; we ignore intermediate
+      // calls (no edits) and rely on the final return value for delivery.
+      // The ack above covers the "I see you" signal.
+      const response = await gateway.handleMessage(sessionKey, body, () => Promise.resolve());
+      clearTimeout(ackTimer);
       if (response) {
         const clean = cleanForWhatsApp(response);
         const chunks = splitMessage(clean);
@@ -191,7 +204,9 @@ export async function startWhatsApp(
           await sendWhatsApp(fromNumber, chunk);
         }
       }
+      void ackSent; // suppress unused warning — flag exists for debug visibility
     } catch (err) {
+      clearTimeout(ackTimer);
       logger.error({ err }, 'Error processing WhatsApp message');
       // Don't leave the user in silence — send an error message back
       try {
