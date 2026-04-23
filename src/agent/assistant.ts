@@ -1821,7 +1821,16 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
       ...(fallback ? { fallbackModel: fallback } : {}),
       permissionMode: effectivePermissionMode as 'bypassPermissions' | 'auto',
       allowDangerouslySkipPermissions: true,
-      tools: disableAllTools ? [] : allowedTools,
+      // SDK field semantics (per node_modules/@anthropic-ai/claude-agent-sdk/sdk.d.ts):
+      //   - `tools`        → which built-in tools the model can see (Read, Bash, Task, …)
+      //   - `mcpServers`   → MCP servers to spawn; all their declared tools are exposed automatically
+      //   - `allowedTools` → auto-allow list covering both built-ins AND MCP tool names
+      //                      (MCP names MUST live here, not in `tools` — that was the bug
+      //                      producing `<tool_use_error>No such tool available: mcp__*__*`
+      //                      for every Extension and custom stdio server).
+      //   - `disallowedTools` → blocklist, takes precedence.
+      tools: disableAllTools ? [] : allowedTools.filter(t => !t.startsWith('mcp__')),
+      allowedTools: disableAllTools ? [] : allowedTools,
       disallowedTools: disallowed,
       ...(streaming ? { includePartialMessages: true } : {}),
       mcpServers: {
@@ -3479,7 +3488,10 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
           model: AUTO_MEMORY_MODEL,
           permissionMode: 'bypassPermissions',
           allowDangerouslySkipPermissions: true,
-          tools: [
+          // MCP tool names live in allowedTools, not tools. See note at
+          // buildOptions — `tools` is for built-ins only.
+          tools: [],
+          allowedTools: [
             mcpTool('memory_write'),
             mcpTool('memory_search'),
             mcpTool('note_create'),
