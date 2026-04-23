@@ -225,6 +225,60 @@ function stripLoneSurrogates(s: string): string {
 }
 
 /**
+ * Build a context-recovered retry prompt that carries mid-task state
+ * forward across an autocompact-rotation. The old session was blown by
+ * too-large tool outputs; the new session must know which tool calls
+ * were already made this turn (so it doesn't redo them) AND tighten its
+ * output discipline (the thing that caused the blow-up in the first
+ * place). Called from both thrash-handling paths in runQuery.
+ *
+ * `snapshot` is captured BEFORE session rotation from stallGuard + the
+ * partial responseText. Safe to pass null when no snapshot exists.
+ */
+function buildContextRecoveredPrompt(
+  originalPrompt: string,
+  snapshot: { toolCalls: string[]; partialText: string } | null,
+): string {
+  const parts: string[] = [
+    '[CONTEXT RECOVERED] Your previous session was rotated because tool outputs filled the context window. A fresh session has been started.',
+    '',
+    '**Rules for this session (non-negotiable):**',
+    '- Add `LIMIT 20` to every SQL query unless you need a count (use `SELECT COUNT(*)`).',
+    '- Pipe long Bash / API / log output through `head -50` (or redirect to a file and read the path in a later turn).',
+    '- Break multi-entity work into batches of ≤ 20 and deliver partial results between batches.',
+  ];
+
+  if (snapshot && snapshot.toolCalls.length > 0) {
+    // De-duplicate the list while preserving order — agents often make the
+    // same API call against different inputs; collapse to tool name only
+    // so the continuation prompt fits a short budget.
+    const uniqueTools: string[] = [];
+    const seen = new Set<string>();
+    for (const c of snapshot.toolCalls) {
+      const name = c.replace(/\(.*$/, '').trim();
+      if (!seen.has(name)) { seen.add(name); uniqueTools.push(name); }
+    }
+    parts.push('');
+    parts.push('**Progress from the rotated session (DO NOT repeat these calls):**');
+    parts.push(`- ${snapshot.toolCalls.length} tool calls across ${uniqueTools.length} distinct tools: ${uniqueTools.slice(0, 12).join(', ')}${uniqueTools.length > 12 ? ', …' : ''}`);
+    parts.push(`- Total calls made: ${snapshot.toolCalls.slice(-20).join(' → ')}`);
+  }
+
+  if (snapshot && snapshot.partialText.trim().length > 0) {
+    parts.push('');
+    parts.push(`**Partial response you had already started (last ${Math.min(snapshot.partialText.length, 1000)} chars):**`);
+    parts.push('> ' + snapshot.partialText.trim().replace(/\n/g, '\n> ').slice(0, 1200));
+    parts.push('Continue from where that left off — don\'t restart the reasoning.');
+  }
+
+  parts.push('');
+  parts.push('**Original user request to continue working on:**');
+  parts.push(originalPrompt);
+
+  return parts.join('\n');
+}
+
+/**
  * Wrapper around the SDK's query() that sanitizes lone Unicode surrogates in
  * prompt, systemPrompt, and appendSystemPrompt. Covers every call site in one
  * place so new injection points (history, summaries, tool output) can't leak
@@ -1075,6 +1129,24 @@ export class PersonalAssistant {
         parts.push(isAutonomous ? soulEntry.content.slice(0, 1500) : soulEntry.content);
       }
     }
+
+    // Universal output discipline — applies to Clementine AND every team agent.
+    // Autocompact thrashing (SDK mid-turn session rotation from too-large
+    // tool outputs) is almost always caused by unbounded Bash / SQL / API
+    // responses filling the context window. The `[CONTEXT RECOVERED]`
+    // prefix already tells agents these rules, but only AFTER thrash. This
+    // block lands them in the cacheable prefix so they're active from turn 1.
+    parts.push(`## Output discipline (required to avoid context thrashing)
+
+Large tool outputs blow the context window and rotate your session mid-task — you lose state and start over. Prevent it:
+
+- **Bash / shell**: always pipe to \`head -50\` (or \`tail -50\`) for logs, JSON dumps, SQL rows, API blobs. If you need the full output, redirect to a file under \`~/.clementine/vault/07-Inbox/\` or a dedicated scratch dir, then read the path in a later turn.
+- **SQL**: add \`LIMIT 20\` to every query unless you genuinely need more. If you need a count, use \`SELECT COUNT(*)\` not \`SELECT * \`.
+- **Web scrapes / API fetches**: paginate instead of asking for everything at once. Page size ≤ 20 rows / 5 pages at a time.
+- **File reads**: for anything bigger than ~300 lines, read with an offset+limit or grep for what you need rather than reading whole.
+- **Summarize as you go**: if you've done 5+ tool calls in a turn, write a one-line progress note to working memory before the next call. That state survives if the session rotates.
+
+**If you see "[CONTEXT RECOVERED]"** in your next prompt: the session was just rotated mid-work because output ballooned. Read the "progress so far" notes, DO NOT repeat completed work, and continue from where you left off with tighter outputs.`);
 
     // Skip AGENTS.md for autonomous runs — not relevant for heartbeats/cron
     if (!isAutonomous) {
@@ -2534,6 +2606,13 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
         // blocks) so we can pair them and compare against the outgoing reply.
         const collectedSdkMessages: Array<{ type: string; message?: any }> = [];
         const queryStartMs = Date.now();
+        // Mid-task state snapshotted when autocompact thrashing rotates the
+        // session. Captures the tool-call sequence + partial responseText
+        // so the retried session gets a "you've already done X, Y, Z —
+        // continue from Z+1" note instead of starting over and redoing
+        // the same Bash/API calls that blew the context in the first place.
+        // Cleared once consumed in the retry prompt.
+        let preRotationSnapshot: { toolCalls: string[]; partialText: string } | null = null;
 
         // Event log: track query lifecycle
         const eventLog = getEventLog();
@@ -2620,6 +2699,12 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
                   } else if (lower.includes('autocompact') || lower.includes('thrash') || lower.includes('context refilled to the limit')) {
                     // Autocompact thrashing — treat like the exception path
                     logger.warn({ sessionKey }, 'Autocompact thrashing (result error) — will rotate session');
+                    // Capture mid-task state BEFORE rotating, so the retry
+                    // prompt can tell the new session what's already done.
+                    preRotationSnapshot = {
+                      toolCalls: stallGuard?.getToolCalls() ?? [],
+                      partialText: responseText.slice(-1000),
+                    };
                     if (sessionKey) {
                       try { this.compactContext(sessionKey); } catch { /* best-effort */ }
                       this.sessions.delete(sessionKey);
@@ -2701,6 +2786,12 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
             // SDK autocompact thrashing — tool outputs are too large for the context window.
             // Rotate session and retry with a fresh context so the agent can continue.
             logger.warn({ sessionKey }, 'Autocompact thrashing — rotating session and retrying');
+            // Capture mid-task state BEFORE rotating so the retry prompt
+            // can reference completed work and avoid redoing it.
+            preRotationSnapshot = {
+              toolCalls: stallGuard?.getToolCalls() ?? [],
+              partialText: responseText.slice(-1000),
+            };
             if (sessionKey) {
               try { this.compactContext(sessionKey); } catch { /* best-effort */ }
               this.sessions.delete(sessionKey);
@@ -2708,13 +2799,8 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
               this._compactedSessions.delete(sessionKey);
             }
             if (attempt < PersonalAssistant.RATE_LIMIT_MAX_RETRIES) {
-              // Prepend a warning so the agent knows to use smaller queries
-              prompt = `[CONTEXT RECOVERED] Your previous session ran out of context space because tool outputs were too large. ` +
-                `A fresh session has been started. Key rules for this session:\n` +
-                `- Add LIMIT clauses to database queries (max 20 rows)\n` +
-                `- Pipe large command output through \`head -50\` or similar\n` +
-                `- If a task needs many queries, break it into smaller batches and deliver partial results between batches\n\n` +
-                `Continue with the user's request: ${prompt}`;
+              prompt = buildContextRecoveredPrompt(prompt, preRotationSnapshot);
+              preRotationSnapshot = null;
               responseText = '';
               continue;
             }
@@ -2760,13 +2846,8 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
         if (staleSession && attempt < PersonalAssistant.RATE_LIMIT_MAX_RETRIES) {
           responseText = '';
           if (contextRecovery) {
-            // Inject guidance so the agent avoids repeating the same large-output pattern
-            prompt = `[CONTEXT RECOVERED] Your previous session ran out of context space because tool outputs were too large. ` +
-              `A fresh session has been started. Key rules for this session:\n` +
-              `- Add LIMIT clauses to database queries (max 20 rows)\n` +
-              `- Pipe large command output through \`head -50\` or similar\n` +
-              `- If a task needs many queries, break it into smaller batches and deliver partial results between batches\n\n` +
-              `Continue with the user's request: ${prompt}`;
+            prompt = buildContextRecoveredPrompt(prompt, preRotationSnapshot);
+            preRotationSnapshot = null;
             contextRecovery = false;
           }
           continue;
