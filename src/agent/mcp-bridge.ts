@@ -486,6 +486,13 @@ export async function probeAvailableTools(force = false): Promise<ToolInventory>
   }
   try {
     const { query } = await import('@anthropic-ai/claude-agent-sdk');
+    // Pass the same mcpServers the real query uses so the probe sees
+    // every tool a real query would see — Desktop Extensions (iMessage,
+    // figma), user-managed stdio servers (hostinger, supabase, etc.),
+    // anything wired through mcp-bridge. Without this, init.tools only
+    // reflects Claude Code's global config — Extensions are invisible
+    // and the SDK schema-rejects calls to their tools at runtime.
+    const externalMcpServers = getMcpServersForAgent();
     const stream = query({
       prompt: 'ok',
       options: {
@@ -493,6 +500,7 @@ export async function probeAvailableTools(force = false): Promise<ToolInventory>
         model: 'claude-haiku-4-5',
         permissionMode: 'bypassPermissions',
         allowDangerouslySkipPermissions: true,
+        mcpServers: externalMcpServers,
       },
     });
     let tools: string[] = [];

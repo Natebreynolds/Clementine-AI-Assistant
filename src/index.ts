@@ -609,7 +609,11 @@ async function asyncMain(): Promise<void> {
     // without per-user hardcoding. Cached 1h. On fresh probe, log a short
     // summary so the owner can verify which connectors were detected
     // without having to ask the assistant.
-    probeAvailableTools().then(inv => {
+    // force=true on startup: the 1h cache from a prior daemon version may
+    // have been taken with a stale probe config (e.g. before we started
+    // passing mcpServers to the probe). Re-probe fresh so Extensions and
+    // per-query MCP servers are discovered and whitelisted immediately.
+    probeAvailableTools(true).then(inv => {
       const integrations = new Set<string>();
       for (const t of inv.tools) {
         const m = t.match(/^mcp__claude_ai_([^_]+(?:_[^_]+)*)__/);
