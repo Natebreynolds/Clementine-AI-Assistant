@@ -31,7 +31,7 @@ const AUTH_ERROR_RE = /\b(unauthori[sz]ed|401|not authenticated|token expired|to
 
 /** Regex matching reply phrasings that claim a connector-wide failure. */
 export const CONTRADICTION_RE =
-  /(dead\s*end|doesn'?t exist|not in (the |my )?schema|schema[- ]level|not available|isn'?t loaded|tools array is empty|MCP server still connecting|connector is (a )?dead|no such tool available|tool doesn't exist)/i;
+  /(dead\s*end|doesn'?t exist|not in (the |my )?schema|schema[- ]level|aren'?t loading into|(not|isn'?t|aren'?t) (loaded|wired|available|coming through|responding)|connector[^.]{0,40}(dropped|is (a )?dead)|tools? array is empty|MCP server (still connecting|dropped|not responding)|no such tool available|tool doesn'?t exist|both directions are blocked)/i;
 
 export function classifyResult(content: string, isError: boolean): ToolResultClass {
   if (!isError) return 'success';
@@ -120,7 +120,15 @@ export function detectContradiction(
   const match = reply.match(CONTRADICTION_RE);
   if (!match) return null;
 
-  const connectorCalls = calls.filter(c => c.name.startsWith('mcp__claude_ai_'));
+  // Cover every connector — claude_ai_* (remote), imessage/figma/hostinger/etc.
+  // (Desktop Extensions + stdio servers), everything except Clementine's own
+  // tools server and plugins. Earlier versions only filtered claude_ai_*,
+  // which let "isn't loaded" replies slip through for iMessage etc.
+  const connectorCalls = calls.filter(
+    c => c.name.startsWith('mcp__') &&
+         !c.name.startsWith('mcp__clementine-tools__') &&
+         !c.name.startsWith('mcp__plugin_'),
+  );
   const recoverable = connectorCalls.find(
     c => c.resultClass === 'success' || c.resultClass === 'arg_error',
   );
