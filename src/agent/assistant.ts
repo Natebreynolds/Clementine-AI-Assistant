@@ -2832,6 +2832,18 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
         if (!contradictionRetried && attempt < PersonalAssistant.RATE_LIMIT_MAX_RETRIES && responseText.trim()) {
           try {
             const toolCallRecords = collectToolCalls(collectedSdkMessages);
+            // Diagnostic — emits once per turn so we can see what the
+            // validator is working with even when it doesn't fire. Without
+            // this we're blind to the "regex missed the phrasing" case.
+            if (toolCallRecords.length > 0) {
+              logger.info({
+                sessionKey,
+                sdkMessagesCaptured: collectedSdkMessages.length,
+                toolCallsPaired: toolCallRecords.length,
+                resultClasses: toolCallRecords.map(r => `${r.name}:${r.resultClass}`),
+                replyPreview: responseText.slice(0, 200).replace(/\n/g, ' '),
+              }, 'Contradiction validator pass');
+            }
             const finding = detectContradiction(responseText, toolCallRecords);
             if (finding) {
               contradictionRetried = true;
