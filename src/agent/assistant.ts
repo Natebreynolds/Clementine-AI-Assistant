@@ -78,6 +78,7 @@ import { agentWorkingMemoryFile, listAllGoals } from '../tools/shared.js';
 import { AgentManager } from './agent-manager.js';
 import { extractLinks } from './link-extractor.js';
 import { StallGuard } from './stall-guard.js';
+import { collectToolCalls, detectContradiction, buildCorrectionPrompt } from './contradiction-validator.js';
 import { assembleContext } from '../memory/context-assembler.js';
 import { PromptCache } from './prompt-cache.js';
 import { searchSkills as searchSkillsSync } from './skill-extractor.js';
@@ -703,6 +704,8 @@ export class PersonalAssistant {
   private _lastTerminalReason?: string;
   /** Per-session stall nudge — set after a query shows stall signals, consumed on the next query. */
   private stallNudges = new Map<string, string>();
+  /** Last contradiction finding per session, consumed by the session transcript writer to splice a correction note. */
+  private _lastContradictionFinding = new Map<string, import('./contradiction-validator.js').ContradictionFinding>();
   private _compactedSessions = new Set<string>();
   /** Last auto-matched project per session — exposed for CLI display. */
   private _lastMatchedProject = new Map<string, ProjectMeta | null>();
@@ -1205,21 +1208,9 @@ If you're unsure what's happening first, run \`where_is_source\` — it reports 
 
 ### Calling Claude Desktop connector tools (Drive, Gmail, etc.)
 
-The **only source of truth for tool availability is your function schema**. Do not inspect \`claude-integrations.json\`, the inventory file, or run \`ToolSearch\` to "check" first — those are telemetry caches, not reality.
+Just call the tool — e.g. \`mcp__claude_ai_Google_Drive__search_files\`, \`mcp__claude_ai_Gmail__authenticate\`. Report the literal result: real data, auth error, whatever. Your replies are validated against actual tool results; claims that contradict a tool's return value are rejected and you're asked to retry. Don't pre-check with \`integration_status\` — that's for env-var integrations, not schema-driven connectors.
 
-**The right sequence when the user asks you to do something with a connector:**
-
-1. **Just call the tool.** \`mcp__claude_ai_Google_Drive__search_files\`, \`mcp__claude_ai_Gmail__authenticate\`, etc. Attempt it. Report the literal result — real data, auth error, or whatever.
-2. **If refused** with "not in my function schema" / "tool not allowed," call \`allow_tool(exact_name)\` and retry. \`allow_tool\` auto-refreshes the inventory if the name is new — handles the case where the owner just added a connector at claude.ai.
-3. **If the owner says "I just added X at claude.ai"** or anything similar, call \`refresh_tool_inventory\` first to pick up the new connector. Report what came online.
-
-**Never** say the tool "isn't loaded in this session," "doesn't carry over from Claude Desktop," "the tools array is empty," "MCP server still connecting," "the connector is a dead end," "the tool doesn't exist in the current session's schema," or "schema-level rejection." If any of those phrasings come to mind, call the tool directly and report what actually happens instead.
-
-**Per-call errors are not connector failures.** If a \`mcp__claude_ai_*\` tool returns an error (invalid arguments, auth failure, rate limit, etc.), that error is about **this one call** — it does NOT mean the tool doesn't exist or the connector is broken. Report the literal error message and, if it's an argument error, re-read the tool's schema from your SDK inventory and retry with correct args. Example: if \`search_files\` complains about unknown field \`orderBy\`, that field belongs to \`list_recent_files\`, not \`search_files\` — fix the args, don't declare the connector dead.
-
-\`list_allowed_tools\` / \`disallow_tool\` manage the whitelist. \`integration_status\` is for env-var (API key) integrations — **not** for claude_ai_* connectors, which are schema-driven. Don't use \`integration_status\` as a proxy for "can I call Drive / Gmail / etc." — those are always tried by direct tool call, not status lookup.
-
-**Critical rule: if the user asks you to use a claude_ai_* connector, you call the connector tool. Full stop.** Do not report "I tried and it failed" unless there was an actual tool call that returned an actual error — your audit log records every tool call, so narrating a failed attempt when the audit shows no call will be spotted.
+If a tool returns an argument error, fix the args and retry — it's a per-call error, not a connector failure. \`allow_tool(name)\` + \`refresh_tool_inventory\` exist for the case where the owner just added a connector at claude.ai.
 
 ## Context Window Management
 
@@ -2298,6 +2289,19 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
     if (key && this.memoryStore) {
       try {
         this.memoryStore.saveTurn(key, 'user', text);
+        // Fix B: if a contradiction fired this turn, splice a system-role note
+        // into the transcript BEFORE the assistant reply. Future turns that
+        // read transcript history will see the correction and won't anchor on
+        // the bad phrasing. Generic across all connectors; triggered only when
+        // Fix A fired, so benign otherwise.
+        const finding = this._lastContradictionFinding.get(key);
+        if (finding) {
+          this._lastContradictionFinding.delete(key);
+          const note =
+            `[system: Previous draft reply contained "${finding.matchedPhrase}" but ${finding.tool.name} ${finding.tool.resultClass === 'success' ? 'succeeded' : 'returned a per-call error (not a connector failure)'}. ` +
+            `Corrected reply above is based on the actual tool result.]`;
+          this.memoryStore.saveTurn(key, 'system', note);
+        }
         this.memoryStore.saveTurn(key, 'assistant', responseText, model ?? MODEL);
       } catch (err) {
         logger.warn({ err, sessionKey: key }, 'Transcript save failed');
@@ -2405,6 +2409,11 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
       }, timeoutMs);
     }
 
+    // One-shot flag so a contradiction retry can't chain into infinite loops.
+    // Flipped true on the first intervention; subsequent replies go through
+    // un-validated (but still logged).
+    let contradictionRetried = false;
+
     try {
       for (let attempt = 0; attempt <= PersonalAssistant.RATE_LIMIT_MAX_RETRIES; attempt++) {
         const sdkOptions = this.buildOptions({ model, maxTurns: maxTurnsOverride ?? null, retrievalContext, profile, sessionKey, streaming: !!onText, verboseLevel, abortController, stallGuard, intentClassification, effort: intentClassification?.suggestedEffort });
@@ -2470,6 +2479,10 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
         let staleSession = false;
         let contextRecovery = false;
         let lastAssistantBlocks: ContentBlock[] = [];
+        // Raw SDK messages for post-turn contradiction validation. We capture
+        // assistant messages (tool_use blocks) and user messages (tool_result
+        // blocks) so we can pair them and compare against the outgoing reply.
+        const collectedSdkMessages: Array<{ type: string; message?: any }> = [];
         const queryStartMs = Date.now();
 
         // Event log: track query lifecycle
@@ -2484,6 +2497,12 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
           let gotStreamEvents = false;
 
           for await (const message of stream) {
+            // Capture assistant + user messages for post-turn contradiction
+            // validation. Must happen before the switch below so we catch
+            // every message type, including ones we don't otherwise handle.
+            if (message.type === 'assistant' || message.type === 'user') {
+              collectedSdkMessages.push({ type: message.type, message: (message as any).message });
+            }
             if (message.type === 'assistant') {
               const blocks = getContentBlocks(message as SDKAssistantMessage);
               lastAssistantBlocks = blocks; // Track for fallback text extraction
@@ -2777,6 +2796,46 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
                 `Previous query showed stuck behavior (${mc.signals.join(', ')}). ` +
                 `${mc.toolCallCount} tool calls, ${mc.confidenceFinal} confidence.`);
             }
+          }
+        }
+
+        // ── Contradiction validator ─────────────────────────────────────
+        // If the model's reply claims a claude_ai_* connector is broken but
+        // the audit log (this turn's tool_use/tool_result pairs) shows the
+        // tool actually succeeded or returned a fixable arg error, reject the
+        // reply and force one more turn with the literal tool result in hand.
+        // Deterministic — does not rely on prompt obedience.
+        if (!contradictionRetried && attempt < PersonalAssistant.RATE_LIMIT_MAX_RETRIES && responseText.trim()) {
+          try {
+            const toolCallRecords = collectToolCalls(collectedSdkMessages);
+            const finding = detectContradiction(responseText, toolCallRecords);
+            if (finding) {
+              contradictionRetried = true;
+              logger.warn({
+                sessionKey,
+                tool: finding.tool.name,
+                resultClass: finding.tool.resultClass,
+                matchedPhrase: finding.matchedPhrase,
+              }, 'Contradiction detected — rewriting reply');
+              logAuditJsonl({
+                event_type: 'confabulation_corrected',
+                tool_name: finding.tool.name,
+                result_class: finding.tool.resultClass,
+                matched_phrase: finding.matchedPhrase,
+                rejected_reply_preview: responseText.slice(0, 300),
+                tool_result_preview: finding.tool.resultPreview,
+              });
+              // Hand the correction prompt to the SDK as the next user turn.
+              // Resume the same session so the model keeps its context.
+              prompt = buildCorrectionPrompt(finding);
+              responseText = '';
+              // Also record the contradiction for Fix B (session splice) later.
+              this._lastContradictionFinding.set(sessionKey ?? '__no_session__', finding);
+              continue;
+            }
+          } catch (err) {
+            // Validator errors must never break the main reply path.
+            logger.debug({ err }, 'Contradiction validator errored — passing reply through');
           }
         }
 
