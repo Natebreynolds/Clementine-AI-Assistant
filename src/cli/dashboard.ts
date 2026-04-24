@@ -12326,14 +12326,24 @@ async function checkAnthropicAuth() {
     var btn = document.getElementById('gs-auth-btn');
     if (d.authenticated && card) {
       card.className = 'gs-card gs-done';
-      if (desc) desc.textContent = 'Connected as ' + d.email;
+      // Email is null when auth comes from the Claude Code keychain (OAuth
+      // login via clementine-login or claude-login that we do not have read
+      // access to). Avoid rendering "Connected as null" — looks broken and
+      // makes users re-click login, which hits an SDK bug in claudeAuthenticate.
+      var label = d.email
+        ? 'Connected as ' + d.email
+        : 'Connected via ' + (d.apiKeySource === 'keychain' ? 'Claude Code keychain' : d.apiKeySource || 'API');
+      if (desc) desc.textContent = label;
       if (btn) { btn.textContent = 'Connected'; btn.disabled = true; }
     }
     // Also update settings auth indicator
     var settingsAuth = document.getElementById('settings-auth-status');
     if (settingsAuth) {
+      var sLabel = d.authenticated
+        ? (d.email ? 'Connected as ' + d.email : 'Connected via ' + (d.apiKeySource || 'API'))
+        : '';
       settingsAuth.innerHTML = d.authenticated
-        ? '<span style="color:var(--green)">Connected as ' + d.email + '</span>'
+        ? '<span style="color:var(--green)">' + sLabel + '</span>'
         : '<span style="color:var(--text-muted)">Not connected</span>';
     }
     return d;
@@ -12343,6 +12353,23 @@ async function checkAnthropicAuth() {
 async function startAnthropicOAuth() {
   var btn = document.getElementById('gs-auth-btn');
   var desc = document.getElementById('gs-auth-desc');
+  // Precheck: if the user is already authenticated (env var or keychain),
+  // don't trigger the SDK OAuth flow — which has an upstream bug where
+  // claudeAuthenticate sends a malformed Messages API request with
+  // cache_control on an empty text block (HTTP 400).
+  try {
+    var statusResp = await apiFetch('/api/auth/anthropic/status');
+    var statusData = await statusResp.json();
+    if (statusData && statusData.authenticated) {
+      var card = document.getElementById('gs-step-auth');
+      if (card) card.className = 'gs-card gs-done';
+      if (desc) desc.textContent = statusData.email
+        ? 'Connected as ' + statusData.email
+        : 'Already connected via ' + (statusData.apiKeySource || 'API') + ' — no login needed';
+      if (btn) { btn.textContent = 'Connected'; btn.disabled = true; }
+      return;
+    }
+  } catch (_) { /* fall through to real login */ }
   if (btn) { btn.textContent = 'Opening login...'; btn.disabled = true; }
   try {
     var r = await apiFetch('/api/auth/anthropic/login', { method: 'POST' });
@@ -12363,7 +12390,15 @@ async function startAnthropicOAuth() {
       throw new Error(wd.error || 'Login did not complete');
     }
   } catch (err) {
-    if (desc) desc.textContent = 'Login failed: ' + err.message;
+    // Special case: the SDK's claudeAuthenticate has a known bug where it
+    // sends malformed API payloads ("cache_control cannot be set for empty
+    // text blocks"). If that fires, point the user at the CLI login path.
+    var msg = err && err.message ? err.message : String(err);
+    if (/cache_control.+empty text blocks/i.test(msg)) {
+      if (desc) desc.textContent = 'In-browser login hit a known SDK bug. Run "clementine login" in your terminal instead, or check if you are already logged in — the daemon only needs to start once.';
+    } else {
+      if (desc) desc.textContent = 'Login failed: ' + msg;
+    }
     if (btn) { btn.textContent = 'Retry Login'; btn.disabled = false; }
   }
 }
