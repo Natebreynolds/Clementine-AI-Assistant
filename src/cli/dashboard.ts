@@ -2485,6 +2485,203 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
     res.end();
   });
 
+  // ── Connector Feeds ────────────────────────────────────────────────
+  //
+  // A feed = a CRON.md job with `managed: connector-feed` frontmatter, plus
+  // a source-registry row pointing at the feed's target folder. Feeds are
+  // built from recipes in src/brain/connector-recipes.ts — the wizard in
+  // the Intelligence → Sources tab composes recipe + field values + schedule
+  // into a cron prompt that uses the user's authenticated Claude Desktop
+  // connectors (Google Drive, Gmail, Outlook, etc.) to pull records and
+  // calls brain_ingest_folder to commit them.
+
+  app.get('/api/brain/connectors', async (_req, res) => {
+    try {
+      const { getClaudeIntegrations } = await import('../agent/mcp-bridge.js');
+      const { RECIPES } = await import('../brain/connector-recipes.js');
+      const integrations = getClaudeIntegrations();
+      // A connector is "useful" for feeds only if it has surfaced some
+      // substantive tools (not just the stubbed authenticate/complete pair).
+      const meaningful = integrations.map((i) => ({
+        ...i,
+        hasFeedReadyTools: i.tools.some((t) => !/^(authenticate|complete_authentication)$/.test(t)),
+      }));
+      res.json({
+        integrations: meaningful,
+        recipes: RECIPES.map((r) => ({
+          id: r.id, label: r.label, description: r.description, icon: r.icon,
+          integration: r.integration, fields: r.fields,
+          defaultSchedule: r.defaultSchedule, tier: r.tier,
+        })),
+      });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.get('/api/brain/feeds', (_req, res) => {
+    try {
+      const { parsed, jobs } = readCronFileAt(CRON_FILE);
+      void parsed;
+      const feeds = jobs
+        .filter((j) => String((j as any).managed ?? '') === 'connector-feed')
+        .map((j) => ({
+          name: String(j.name ?? ''),
+          schedule: String(j.schedule ?? ''),
+          enabled: j.enabled !== false,
+          tier: Number(j.tier ?? 1),
+          recipeId: String((j as any).recipe_id ?? ''),
+          slug: String((j as any).feed_slug ?? ''),
+          targetFolder: String((j as any).target_folder ?? ''),
+          fields: (j as any).recipe_fields ?? {},
+          prompt: String(j.prompt ?? ''),
+        }));
+      res.json({ feeds });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.post('/api/brain/feeds', async (req, res) => {
+    try {
+      const body = (req.body ?? {}) as {
+        recipeId?: string;
+        values?: Record<string, string>;
+        schedule?: string;
+      };
+      if (!body.recipeId) { res.status(400).json({ error: 'recipeId is required' }); return; }
+      const { recipeById, buildFeedSpec, missingFields } = await import('../brain/connector-recipes.js');
+      const recipe = recipeById(body.recipeId);
+      if (!recipe) { res.status(400).json({ error: `unknown recipeId: ${body.recipeId}` }); return; }
+      const values = body.values ?? {};
+      const missing = missingFields(recipe, values);
+      if (missing.length) {
+        res.status(400).json({ error: `missing required field(s): ${missing.join(', ')}` });
+        return;
+      }
+      const schedule = (body.schedule || recipe.defaultSchedule).trim();
+      if (!cron.validate(schedule)) {
+        res.status(400).json({ error: `invalid cron expression: ${schedule}` });
+        return;
+      }
+      const spec = buildFeedSpec(recipe, values);
+
+      const { parsed, jobs } = readCronFileAt(CRON_FILE);
+      if (jobs.find((j) => String(j.name ?? '').toLowerCase() === spec.jobName.toLowerCase())) {
+        res.status(409).json({ error: `feed "${spec.jobName}" already exists` });
+        return;
+      }
+      jobs.push({
+        name: spec.jobName,
+        schedule,
+        prompt: spec.prompt,
+        tier: recipe.tier,
+        enabled: true,
+        managed: 'connector-feed',
+        recipe_id: recipe.id,
+        feed_slug: spec.slug,
+        target_folder: spec.targetFolder,
+        recipe_fields: values,
+      });
+      writeCronFileAt(CRON_FILE, parsed, jobs);
+
+      // Register the source row so the feed shows up alongside other sources
+      // and ingestion_runs get a coherent per-feed audit trail.
+      try {
+        const { upsertSource } = await import('../brain/source-registry.js');
+        await upsertSource({
+          slug: spec.slug,
+          kind: 'seed',
+          adapter: 'markdown',
+          configJson: JSON.stringify({
+            managed: 'connector-feed',
+            recipeId: recipe.id,
+            fields: values,
+            inputPath: path.join(VAULT_DIR, spec.targetFolder),
+          }),
+          targetFolder: spec.targetFolder,
+          intelligence: 'auto',
+          enabled: true,
+        });
+      } catch (err) {
+        // Non-fatal: the cron can still run even if the source registry write
+        // fails (brain_ingest_folder will upsert on first run).
+        console.warn('[feeds] upsertSource failed, continuing:', err);
+      }
+
+      res.json({
+        ok: true,
+        feed: {
+          name: spec.jobName,
+          schedule,
+          slug: spec.slug,
+          targetFolder: spec.targetFolder,
+          recipeId: recipe.id,
+        },
+      });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.post('/api/brain/feeds/:name/run', (req, res) => {
+    // Delegate to the same spawn-and-detach path /api/cron/run uses so we
+    // get the same broadcast events and exit handling.
+    const jobName = req.params.name;
+    try {
+      const { parsed, jobs } = readCronFileAt(CRON_FILE);
+      void parsed;
+      const job = jobs.find((j) => String(j.name ?? '') === jobName);
+      if (!job || String((job as any).managed ?? '') !== 'connector-feed') {
+        res.status(404).json({ error: `feed "${jobName}" not found` });
+        return;
+      }
+      const child = spawn('node', [DIST_ENTRY, 'cron', 'run', jobName], {
+        detached: true,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        cwd: BASE_DIR,
+        env: { ...process.env, CLEMENTINE_HOME: BASE_DIR },
+      });
+      child.on('exit', (code) => {
+        broadcastEvent({ type: 'cron_complete', data: { job: jobName, code } });
+      });
+      child.unref();
+      broadcastEvent({ type: 'cron_triggered', data: { job: jobName } });
+      res.json({ ok: true, message: `triggered feed: ${jobName}` });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.delete('/api/brain/feeds/:name', async (req, res) => {
+    try {
+      const jobName = req.params.name;
+      const { parsed, jobs } = readCronFileAt(CRON_FILE);
+      const idx = jobs.findIndex((j) => String(j.name ?? '') === jobName);
+      if (idx === -1 || String((jobs[idx] as any).managed ?? '') !== 'connector-feed') {
+        res.status(404).json({ error: `feed "${jobName}" not found` });
+        return;
+      }
+      const slug = String((jobs[idx] as any).feed_slug ?? '');
+      jobs.splice(idx, 1);
+      writeCronFileAt(CRON_FILE, parsed, jobs);
+
+      // Remove the source-registry row too (the 04-Ingest folder is left
+      // alone so already-ingested records survive).
+      if (slug) {
+        try {
+          const { deleteSource } = await import('../brain/source-registry.js');
+          await deleteSource(slug);
+        } catch (err) {
+          console.warn('[feeds] deleteSource failed:', err);
+        }
+      }
+      res.json({ ok: true, message: `deleted feed: ${jobName}` });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
   app.get('/api/brain/sources', async (_req, res) => {
     try {
       const { listSources } = await import('../brain/source-registry.js');
@@ -9940,6 +10137,33 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
 
         <!-- Sources -->
         <div class="tab-pane" id="tab-intelligence-sources">
+
+          <!-- ═══ Auto-seed feeds (Claude Desktop connectors → cron → brain) ═══ -->
+          <div class="card" style="padding:16px;margin-bottom:16px">
+            <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px">
+              <div style="font-weight:600">Auto-seed feeds</div>
+              <button class="btn-primary" onclick="brainOpenFeedWizard()">+ Add feed</button>
+            </div>
+            <div style="color:var(--muted);font-size:13px;margin-bottom:12px">
+              One-click scheduled feeds that use your authenticated Claude Desktop connectors (Google Drive, Outlook, Gmail, Slack…) to pull records and commit them to the brain. No API keys required.
+            </div>
+            <div id="brain-feeds-connectors" style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:12px"></div>
+            <div id="brain-feeds-list"></div>
+          </div>
+
+          <!-- ═══ Auto-seed feed wizard (hidden by default) ═══ -->
+          <div id="brain-feed-wizard" class="card" style="display:none;padding:16px;margin-bottom:16px">
+            <div style="font-weight:600;margin-bottom:4px">Add auto-seed feed</div>
+            <div id="brain-feed-wizard-breadcrumbs" style="color:var(--muted);font-size:12px;margin-bottom:12px"></div>
+            <div id="brain-feed-wizard-step"></div>
+            <div style="display:flex;gap:8px;margin-top:14px">
+              <button class="btn" onclick="brainFeedWizardBack()" id="brain-feed-wizard-back">← Back</button>
+              <button class="btn-primary" onclick="brainFeedWizardNext()" id="brain-feed-wizard-next">Next →</button>
+              <button class="btn" onclick="brainCloseFeedWizard()">Cancel</button>
+              <div id="brain-feed-wizard-status" style="margin-left:auto;font-size:13px"></div>
+            </div>
+          </div>
+
           <div style="display:flex;gap:8px;margin-bottom:16px;flex-wrap:wrap">
             <button class="btn-primary" onclick="brainShowPollForm()">+ Scheduled REST poll</button>
             <button class="btn-primary" onclick="brainShowWebhookForm()">+ Inbound webhook</button>
@@ -10253,6 +10477,259 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
             '</div>';
         }
 
+        // ── Auto-seed Feed wizard ───────────────────────────────────────
+        let brainFeedWizardState = null; // { step, catalog, pick, values, schedule }
+
+        function brainScheduleChips() {
+          return [
+            { key: 'daily-7', label: 'Daily 7am', cron: '0 7 * * *' },
+            { key: 'daily-9', label: 'Daily 9am', cron: '0 9 * * *' },
+            { key: 'hourly', label: 'Hourly', cron: '0 * * * *' },
+            { key: 'every-4', label: 'Every 4h', cron: '0 */4 * * *' },
+            { key: 'weekly', label: 'Weekly Mon 8am', cron: '0 8 * * 1' },
+          ];
+        }
+
+        async function brainLoadFeedConnectors() {
+          try {
+            const resp = await apiFetch('/api/brain/connectors');
+            const data = await resp.json();
+            const el = document.getElementById('brain-feeds-connectors');
+            if (!el) return data;
+            if (!data.integrations || !data.integrations.length) {
+              el.innerHTML = '<div style="color:var(--muted);font-size:13px">No Claude Desktop connectors detected yet. Open Claude Desktop → Connectors to sign into Google Drive, Outlook, Gmail, etc.</div>';
+              return data;
+            }
+            el.innerHTML = data.integrations.map(function(i) {
+              const ok = i.connected && i.hasFeedReadyTools;
+              const color = ok ? '#2f7d32' : '#8a5a00';
+              const bg = ok ? '#e8f5e9' : '#fff3cd';
+              const dot = ok ? '✓' : '⚠';
+              const label = ok ? i.label : i.label + ' (incomplete in Claude Desktop)';
+              return '<span style="padding:3px 10px;border-radius:12px;background:' + bg + ';color:' + color + ';font-size:12px;font-weight:500">' + dot + ' ' + escapeHtml(label) + '</span>';
+            }).join('');
+            return data;
+          } catch (err) {
+            console.error('brainLoadFeedConnectors failed', err);
+            return { integrations: [], recipes: [] };
+          }
+        }
+
+        async function brainLoadFeeds() {
+          try {
+            const resp = await apiFetch('/api/brain/feeds');
+            const data = await resp.json();
+            const el = document.getElementById('brain-feeds-list');
+            if (!el) return;
+            if (!data.feeds || !data.feeds.length) {
+              el.innerHTML = '<div style="color:var(--muted);font-size:13px;padding:8px 0">No feeds yet. Click <b>+ Add feed</b> to wire one up.</div>';
+              return;
+            }
+            el.innerHTML = data.feeds.map(function(f) {
+              const fieldsLine = Object.keys(f.fields || {}).length
+                ? Object.entries(f.fields).map(function(kv) { return '<code style="font-size:11px">' + escapeHtml(kv[0]) + '=' + escapeHtml(String(kv[1])) + '</code>'; }).join(' · ')
+                : '<span style="color:var(--muted)">no fields</span>';
+              return '<div class="card" style="padding:10px 12px;margin-bottom:8px;display:flex;align-items:center;gap:12px">' +
+                '<div style="flex:1">' +
+                '<div style="font-weight:600">' + escapeHtml(f.name) + (f.enabled ? '' : ' <span style="color:#e66;font-weight:normal">(disabled)</span>') + '</div>' +
+                '<div style="font-size:12px;color:var(--muted)">' +
+                'Recipe: <code>' + escapeHtml(f.recipeId) + '</code> · Schedule: <code>' + escapeHtml(f.schedule) + '</code> · Target: <code>' + escapeHtml(f.targetFolder) + '</code>' +
+                '</div>' +
+                '<div style="font-size:12px;margin-top:4px">' + fieldsLine + '</div>' +
+                '</div>' +
+                '<button class="btn-primary" onclick="brainRunFeed(\\'' + f.name.replace(/"/g, '') + '\\')">Run now</button> ' +
+                '<button class="btn" onclick="brainDeleteFeed(\\'' + f.name.replace(/"/g, '') + '\\')">🗑</button>' +
+                '</div>';
+            }).join('');
+          } catch (err) {
+            console.error('brainLoadFeeds failed', err);
+          }
+        }
+
+        async function brainOpenFeedWizard() {
+          const data = await brainLoadFeedConnectors();
+          const connected = (data.integrations || []).filter(function(i) { return i.connected && i.hasFeedReadyTools; });
+          brainFeedWizardState = {
+            step: 0,
+            catalog: data,
+            connected,
+            pick: null,
+            recipe: null,
+            values: {},
+            schedule: '',
+          };
+          document.getElementById('brain-feed-wizard').style.display = '';
+          brainFeedWizardRender();
+        }
+
+        function brainCloseFeedWizard() {
+          brainFeedWizardState = null;
+          document.getElementById('brain-feed-wizard').style.display = 'none';
+        }
+
+        function brainFeedWizardBack() {
+          if (!brainFeedWizardState) return;
+          if (brainFeedWizardState.step === 0) { brainCloseFeedWizard(); return; }
+          brainFeedWizardState.step -= 1;
+          brainFeedWizardRender();
+        }
+
+        function brainFeedWizardNext() {
+          if (!brainFeedWizardState) return;
+          const s = brainFeedWizardState;
+          if (s.step === 0) {
+            if (!s.pick) { document.getElementById('brain-feed-wizard-status').innerHTML = '<span style="color:#e66">Pick a connector.</span>'; return; }
+            s.step = 1;
+          } else if (s.step === 1) {
+            if (!s.recipe) { document.getElementById('brain-feed-wizard-status').innerHTML = '<span style="color:#e66">Pick a recipe.</span>'; return; }
+            s.values = {};
+            for (const f of (s.recipe.fields || [])) {
+              if (f.defaultValue) s.values[f.key] = f.defaultValue;
+            }
+            s.schedule = s.recipe.defaultSchedule;
+            s.step = 2;
+          } else if (s.step === 2) {
+            for (const key of Object.keys({})) void key;
+            const inputs = document.querySelectorAll('#brain-feed-wizard-step [data-field]');
+            inputs.forEach(function(inp) { s.values[inp.dataset.field] = inp.value; });
+            const missing = (s.recipe.fields || []).filter(function(f) { return f.required && !(s.values[f.key] || '').trim(); });
+            if (missing.length) { document.getElementById('brain-feed-wizard-status').innerHTML = '<span style="color:#e66">Required: ' + missing.map(function(f) { return f.label; }).join(', ') + '</span>'; return; }
+            s.step = 3;
+          } else if (s.step === 3) {
+            brainFeedWizardSubmit();
+            return;
+          }
+          document.getElementById('brain-feed-wizard-status').innerHTML = '';
+          brainFeedWizardRender();
+        }
+
+        function brainFeedWizardRender() {
+          if (!brainFeedWizardState) return;
+          const s = brainFeedWizardState;
+          const crumbs = ['Connector','Recipe','Fields','Schedule'].map(function(c, i) {
+            return (i === s.step) ? '<b>' + c + '</b>' : c;
+          }).join(' → ');
+          document.getElementById('brain-feed-wizard-breadcrumbs').innerHTML = crumbs;
+          const backBtn = document.getElementById('brain-feed-wizard-back');
+          backBtn.textContent = '← Back';
+          backBtn.style.display = s.step === 0 ? 'none' : '';
+          document.getElementById('brain-feed-wizard-next').textContent = s.step === 3 ? 'Create feed' : 'Next →';
+
+          let html = '';
+          if (s.step === 0) {
+            if (!s.connected.length) {
+              html = '<div style="color:#8a5a00">No connectors have feed-ready tools. Open Claude Desktop → Connectors and sign into Google Drive, Outlook, Gmail, or Slack first.</div>';
+            } else {
+              html = '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:8px">' +
+                s.connected.map(function(i) {
+                  const picked = s.pick && s.pick.name === i.name;
+                  return '<button class="btn' + (picked ? '-primary' : '') + '" onclick="brainFeedWizardPickConnector(\\'' + i.name + '\\')" style="padding:12px;text-align:left">' +
+                    '<div style="font-weight:600">' + escapeHtml(i.label) + '</div>' +
+                    '<div style="font-size:11px;color:var(--muted)">' + (i.tools || []).length + ' tools</div>' +
+                  '</button>';
+                }).join('') + '</div>';
+            }
+          } else if (s.step === 1) {
+            const recipes = (s.catalog.recipes || []).filter(function(r) { return r.integration === s.pick.name; });
+            if (!recipes.length) {
+              html = '<div style="color:var(--muted)">No recipes for this connector yet.</div>';
+            } else {
+              html = '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:8px">' +
+                recipes.map(function(r) {
+                  const picked = s.recipe && s.recipe.id === r.id;
+                  return '<button class="btn' + (picked ? '-primary' : '') + '" onclick="brainFeedWizardPickRecipe(\\'' + r.id + '\\')" style="padding:12px;text-align:left">' +
+                    '<div style="font-weight:600">' + escapeHtml((r.icon || '') + ' ' + r.label) + '</div>' +
+                    '<div style="font-size:12px;margin-top:4px;color:var(--muted);white-space:normal;line-height:1.4">' + escapeHtml(r.description) + '</div>' +
+                  '</button>';
+                }).join('') + '</div>';
+            }
+          } else if (s.step === 2) {
+            const fields = s.recipe.fields || [];
+            if (!fields.length) {
+              html = '<div style="color:var(--muted)">This recipe has no fields. Click Next to pick a schedule.</div>';
+            } else {
+              html = '<div style="display:grid;grid-template-columns:180px 1fr;gap:10px;align-items:center">' +
+                fields.map(function(f) {
+                  const val = s.values[f.key] != null ? s.values[f.key] : (f.defaultValue || '');
+                  const help = f.help ? '<div style="font-size:11px;color:var(--muted);margin-top:2px">' + escapeHtml(f.help) + '</div>' : '';
+                  return '<label style="font-weight:500">' + escapeHtml(f.label) + (f.required ? ' <span style="color:#e66">*</span>' : '') + '</label>' +
+                    '<div><input type="text" data-field="' + f.key + '" value="' + escapeHtml(val) + '" placeholder="' + escapeHtml(f.placeholder || '') + '" style="width:100%">' + help + '</div>';
+                }).join('') + '</div>';
+            }
+          } else if (s.step === 3) {
+            const chips = brainScheduleChips();
+            html = '<div style="margin-bottom:10px">Choose how often this feed runs:</div>' +
+              '<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px">' +
+                chips.map(function(c) {
+                  const picked = s.schedule === c.cron;
+                  return '<button class="btn' + (picked ? '-primary' : '') + '" onclick="brainFeedWizardPickSchedule(\\'' + c.cron + '\\')" style="padding:6px 12px">' + escapeHtml(c.label) + '</button>';
+                }).join('') +
+              '</div>' +
+              '<div style="display:flex;gap:8px;align-items:center;font-size:13px">' +
+                '<label style="min-width:100px">Custom cron:</label>' +
+                '<input type="text" id="brain-feed-schedule-custom" value="' + escapeHtml(s.schedule) + '" style="flex:1" oninput="brainFeedWizardSetCustomSchedule(this.value)">' +
+              '</div>';
+          }
+          document.getElementById('brain-feed-wizard-step').innerHTML = html;
+        }
+
+        function brainFeedWizardPickConnector(name) {
+          const i = (brainFeedWizardState.catalog.integrations || []).find(function(x) { return x.name === name; });
+          brainFeedWizardState.pick = i;
+          brainFeedWizardState.recipe = null;
+          brainFeedWizardRender();
+        }
+
+        function brainFeedWizardPickRecipe(id) {
+          const r = (brainFeedWizardState.catalog.recipes || []).find(function(x) { return x.id === id; });
+          brainFeedWizardState.recipe = r;
+          brainFeedWizardRender();
+        }
+
+        function brainFeedWizardPickSchedule(cron) {
+          brainFeedWizardState.schedule = cron;
+          brainFeedWizardRender();
+        }
+
+        function brainFeedWizardSetCustomSchedule(val) {
+          if (brainFeedWizardState) brainFeedWizardState.schedule = val;
+        }
+
+        async function brainFeedWizardSubmit() {
+          const s = brainFeedWizardState;
+          document.getElementById('brain-feed-wizard-status').innerHTML = 'Creating…';
+          try {
+            const resp = await apiFetch('/api/brain/feeds', {
+              method: 'POST', headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ recipeId: s.recipe.id, values: s.values, schedule: s.schedule }),
+            });
+            const data = await resp.json();
+            if (!resp.ok) {
+              document.getElementById('brain-feed-wizard-status').innerHTML = '<span style="color:#e66">' + escapeHtml(data.error || 'save failed') + '</span>';
+              return;
+            }
+            brainCloseFeedWizard();
+            brainLoadFeeds();
+          } catch (err) {
+            document.getElementById('brain-feed-wizard-status').innerHTML = '<span style="color:#e66">' + escapeHtml(String(err)) + '</span>';
+          }
+        }
+
+        async function brainRunFeed(name) {
+          const resp = await apiFetch('/api/brain/feeds/' + encodeURIComponent(name) + '/run', { method: 'POST' });
+          const data = await resp.json();
+          if (!resp.ok) { alert('Run failed: ' + (data.error || 'unknown')); return; }
+          alert('Triggered — watch the Ingestion Runs tab in ~30–90s for results.');
+        }
+
+        async function brainDeleteFeed(name) {
+          if (!confirm('Delete feed "' + name + '"? (The 04-Ingest folder is kept so historical records survive.)')) return;
+          const resp = await apiFetch('/api/brain/feeds/' + encodeURIComponent(name), { method: 'DELETE' });
+          const data = await resp.json();
+          if (!resp.ok) { alert('Delete failed: ' + (data.error || 'unknown')); return; }
+          brainLoadFeeds();
+        }
+
         async function brainLoadSources() {
           const resp = await apiFetch('/api/brain/sources');
           const data = await resp.json();
@@ -10543,7 +11020,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
           const origSwitch = window.switchTab;
           window.switchTab = function(page, tab) {
             origSwitch(page, tab);
-            if (page === 'intelligence' && tab === 'sources') brainLoadSources();
+            if (page === 'intelligence' && tab === 'sources') { brainLoadSources(); brainLoadFeedConnectors(); brainLoadFeeds(); }
             if (page === 'intelligence' && tab === 'runs') brainLoadRuns();
           };
         })();
