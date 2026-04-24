@@ -10177,10 +10177,18 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
         // ── File / folder picker (hits /api/fs/browse) ──────────────────
 
         let _brainPickerCurrent = '';
+        function brainParentDir(p) {
+          if (!p) return '~';
+          const trimmed = p.endsWith('/') && p.length > 1 ? p.slice(0, -1) : p;
+          const idx = trimmed.lastIndexOf('/');
+          if (idx <= 0) return '/';
+          return trimmed.slice(0, idx);
+        }
+
         async function brainOpenPicker() {
           document.getElementById('brain-picker').style.display = '';
           const seeded = document.getElementById('brain-seed-path').value.trim();
-          const home = (seeded && seeded.startsWith('/') ? seeded.replace(/\/+[^/]*$/, '') : '') || '~';
+          const home = (seeded && seeded.indexOf('/') === 0) ? brainParentDir(seeded) : '~';
           await brainPickerLoad(home);
         }
 
@@ -10189,9 +10197,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
         }
 
         async function brainPickerUp() {
-          const cur = _brainPickerCurrent || '/';
-          const up = cur.replace(/\/+[^/]+\/?$/, '') || '/';
-          await brainPickerLoad(up);
+          await brainPickerLoad(brainParentDir(_brainPickerCurrent || '/'));
         }
 
         async function brainPickerLoad(p) {
