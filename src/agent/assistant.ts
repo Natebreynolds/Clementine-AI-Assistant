@@ -2012,6 +2012,13 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
       supportsThinking && needsThinking ? { type: 'adaptive' as const } : undefined
     );
 
+    // Haiku rejects user-configurable task budgets with a 400 ("This model
+    // does not support user-configurable task budgets"). Only pass
+    // taskBudget to models that accept it — otherwise every Haiku cron
+    // run dies on arrival and (historically) got mis-classified as a
+    // permanent "budget exceeded" failure.
+    const supportsTaskBudget = !resolvedModel.includes('haiku');
+
     // 1M context beta: enable for Sonnet when toggled and context-heavy work benefits
     const isSonnet = resolvedModel.includes('sonnet');
     const computedBetas = ENABLE_1M_CONTEXT && isSonnet
@@ -2043,7 +2050,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
       permissionMode: effectivePermissionMode as 'bypassPermissions' | 'auto',
       allowDangerouslySkipPermissions: true,
       ...(sessionStore ? { sessionStore } : {}),
-      ...(computedTaskBudget ? { taskBudget: { total: computedTaskBudget } } : {}),
+      ...(computedTaskBudget && supportsTaskBudget ? { taskBudget: { total: computedTaskBudget } } : {}),
       // SDK field semantics (per node_modules/@anthropic-ai/claude-agent-sdk/sdk.d.ts):
       //   - `tools`        → which built-in tools the model can see (Read, Bash, Task, …)
       //   - `mcpServers`   → MCP servers to spawn; all their declared tools are exposed automatically
@@ -2892,7 +2899,11 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
                 const errorText = 'errors' in result ? result.errors.join('; ') : ('result' in result ? result.result : '');
                 if (errorText) {
                   const lower = errorText.toLowerCase();
-                  if (lower.includes('max_budget_usd') || lower.includes('budget')) {
+                  // Strict match — only fire on the actual dollar-budget
+                  // marker. The bare word "budget" was matching Anthropic's
+                  // unrelated "does not support user-configurable task
+                  // budgets" 400, which killed Haiku chats.
+                  if (lower.includes('max_budget_usd')) {
                     logger.warn({ sessionKey }, 'Chat query hit budget cap');
                     responseText = responseText || (
                       `I hit the $${BUDGET.chat.toFixed(2)} cost cap for this query. Options:\n` +
@@ -4356,11 +4367,16 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
             const result = message as SDKResultMessage;
             // Capture terminal reason for execution advisor
             this._lastTerminalReason = (result as any).terminal_reason ?? undefined;
-            // Detect budget exceeded — treat as permanent error so cron doesn't retry
+            // Detect ACTUAL dollar-budget cap — treat as permanent so cron
+            // doesn't retry when we've intentionally capped spend. Use a
+            // strict marker ("max_budget_usd") because the bare word
+            // "budget" was catching Anthropic's unrelated "does not support
+            // user-configurable task budgets" error and pinning perfectly
+            // healthy Haiku jobs as permanent failures.
             if (result.is_error && 'result' in result) {
               const exitText = String((result as any).result ?? '');
-              if (exitText.includes('max_budget_usd') || exitText.includes('budget')) {
-                logger.warn({ job: jobName }, 'Cron job hit budget cap — treating as permanent error');
+              if (exitText.includes('max_budget_usd')) {
+                logger.warn({ job: jobName }, 'Cron job hit dollar budget cap — treating as permanent error');
                 throw new Error(`Budget exceeded for cron job '${jobName}'`);
               }
             }
@@ -4819,11 +4835,12 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
             // Capture terminal reason for execution advisor
             this._lastTerminalReason = (result as any).terminal_reason ?? undefined;
             this.logQueryResult(result, 'unleashed', `unleashed:${jobName}`, jobName);
-            // Detect budget exceeded
+            // Detect dollar-budget exceeded (strict marker — see cron
+            // handler above for the reasoning).
             if (result.is_error && 'result' in result) {
               const exitText = String((result as any).result ?? '');
-              if (exitText.includes('max_budget_usd') || exitText.includes('budget')) {
-                logger.warn({ job: jobName, phase }, 'Unleashed phase hit budget cap');
+              if (exitText.includes('max_budget_usd')) {
+                logger.warn({ job: jobName, phase }, 'Unleashed phase hit dollar budget cap');
                 appendProgress({ event: 'budget_exceeded', phase });
               }
             }
