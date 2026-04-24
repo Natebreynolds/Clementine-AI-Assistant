@@ -179,12 +179,14 @@ export type MemoryStoreType = {
     slug: string; kind: string; adapter: string; configJson?: string;
     credentialRef?: string | null; scheduleCron?: string | null;
     targetFolder?: string | null; agentSlug?: string | null;
+    project?: string | null;
     intelligence?: string; enabled?: boolean;
   }): void;
   getSource(slug: string): {
     slug: string; kind: string; adapter: string; configJson: string;
     credentialRef: string | null; scheduleCron: string | null;
     targetFolder: string | null; agentSlug: string | null;
+    project: string | null;
     intelligence: string; enabled: boolean;
     lastRunAt: string | null; lastStatus: string | null;
     createdAt: string; updatedAt: string;

@@ -2356,6 +2356,7 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
         slug?: string; kind?: string; adapter?: string;
         configJson?: string; scheduleCron?: string | null;
         targetFolder?: string | null; credentialRef?: string | null;
+        project?: string | null;
         intelligence?: string; enabled?: boolean;
       };
       if (!body.slug || !body.kind || !body.adapter) {
@@ -2371,6 +2372,7 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
         scheduleCron: body.scheduleCron ?? null,
         targetFolder: body.targetFolder ?? null,
         credentialRef: body.credentialRef ?? null,
+        project: body.project ?? null,
         intelligence: (body.intelligence as 'auto' | 'template-only' | 'llm-per-record') ?? 'auto',
         enabled: body.enabled !== false,
       });
@@ -9799,6 +9801,8 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
               <input type="text" id="brain-webhook-slug" placeholder="signup-leads">
               <label>Target folder</label>
               <input type="text" id="brain-webhook-folder" placeholder="04-Ingest/signups">
+              <label>Project (optional)</label>
+              <select id="brain-webhook-project"><option value="">(none)</option></select>
             </div>
             <div style="display:flex;gap:8px;margin-top:12px">
               <button class="btn-primary" onclick="brainSaveWebhook()">Generate URL + secret</button>
@@ -9830,6 +9834,8 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
               <input type="text" id="brain-poll-cron" placeholder="0 * * * *  (hourly)">
               <label>Target folder</label>
               <input type="text" id="brain-poll-folder" placeholder="04-Ingest/stripe">
+              <label>Project (optional)</label>
+              <select id="brain-poll-project"><option value="">(none)</option></select>
             </div>
             <div style="display:flex;gap:8px;margin-top:12px">
               <button class="btn-primary" onclick="brainSavePoll()">Save + enable</button>
@@ -9947,16 +9953,21 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
             el.innerHTML = '<div style="color:var(--muted);padding:20px">No sources yet. Seed a local file/folder in the <a href="#" onclick="switchTab(\\'intelligence\\',\\'seed\\');return false">Seed Upload</a> tab, or register a scheduled REST poll above.</div>';
             return;
           }
-          el.innerHTML = '<table class="data-table"><thead><tr><th>Slug</th><th>Kind</th><th>Adapter</th><th>Schedule</th><th>Target</th><th>Enabled</th><th>Last run</th><th>Status</th><th>Actions</th></tr></thead><tbody>' +
-            data.sources.map((s) =>
-              '<tr><td>' + escapeHtml(s.slug) + '</td><td>' + escapeHtml(s.kind) + '</td><td>' + escapeHtml(s.adapter) + '</td>' +
-              '<td><code style="font-size:11px">' + escapeHtml(s.scheduleCron || '—') + '</code></td>' +
-              '<td>' + escapeHtml(s.targetFolder || '—') + '</td>' +
-              '<td>' + (s.enabled ? 'yes' : 'no') + '</td>' +
-              '<td>' + escapeHtml(s.lastRunAt || '—') + '</td>' +
-              '<td>' + escapeHtml(s.lastStatus || '—') + '</td>' +
-              '<td><button class="btn" onclick="brainRunSource(\\'' + escapeHtml(s.slug) + '\\')">Run</button> ' +
-              '<button class="btn" onclick="brainDeleteSource(\\'' + escapeHtml(s.slug) + '\\')">🗑</button></td></tr>').join('') +
+          el.innerHTML = '<table class="data-table"><thead><tr><th>Slug</th><th>Kind</th><th>Adapter</th><th>Schedule</th><th>Target</th><th>Project</th><th>Enabled</th><th>Last run</th><th>Status</th><th>Actions</th></tr></thead><tbody>' +
+            data.sources.map((s) => {
+              const projTag = s.project
+                ? '<code style="font-size:11px">' + escapeHtml(s.project.split('/').filter(Boolean).pop() || s.project) + '</code>'
+                : '—';
+              return '<tr><td>' + escapeHtml(s.slug) + '</td><td>' + escapeHtml(s.kind) + '</td><td>' + escapeHtml(s.adapter) + '</td>' +
+                '<td><code style="font-size:11px">' + escapeHtml(s.scheduleCron || '—') + '</code></td>' +
+                '<td>' + escapeHtml(s.targetFolder || '—') + '</td>' +
+                '<td>' + projTag + '</td>' +
+                '<td>' + (s.enabled ? 'yes' : 'no') + '</td>' +
+                '<td>' + escapeHtml(s.lastRunAt || '—') + '</td>' +
+                '<td>' + escapeHtml(s.lastStatus || '—') + '</td>' +
+                '<td><button class="btn" onclick="brainRunSource(\\'' + escapeHtml(s.slug) + '\\')">Run</button> ' +
+                '<button class="btn" onclick="brainDeleteSource(\\'' + escapeHtml(s.slug) + '\\')">🗑</button></td></tr>';
+            }).join('') +
             '</tbody></table>';
         }
 
@@ -9975,16 +9986,33 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
           brainLoadSources();
         }
 
+        async function brainLoadProjects(selectIds) {
+          try {
+            const resp = await apiFetch('/api/projects');
+            const data = await resp.json();
+            const projects = (data.projects || []).map((p) => (typeof p === 'string' ? { path: p } : p));
+            for (const id of selectIds) {
+              const sel = document.getElementById(id);
+              if (!sel) continue;
+              sel.innerHTML = '<option value="">(none)</option>' + projects.map((p) =>
+                '<option value="' + escapeHtml(p.path) + '">' + escapeHtml(p.path) + '</option>'
+              ).join('');
+            }
+          } catch (err) { /* non-fatal */ }
+        }
+
         function brainShowPollForm() {
           document.getElementById('brain-poll-form').style.display = '';
           document.getElementById('brain-creds-form').style.display = 'none';
           const wf = document.getElementById('brain-webhook-form'); if (wf) wf.style.display = 'none';
+          brainLoadProjects(['brain-poll-project']);
         }
 
         function brainShowWebhookForm() {
           document.getElementById('brain-webhook-form').style.display = '';
           document.getElementById('brain-poll-form').style.display = 'none';
           document.getElementById('brain-creds-form').style.display = 'none';
+          brainLoadProjects(['brain-webhook-project']);
         }
 
         async function brainSaveWebhook() {
@@ -10013,6 +10041,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
 
           // 2) Register the webhook source
           statusEl.innerHTML = 'Registering source…';
+          const projectVal = document.getElementById('brain-webhook-project').value || null;
           const resp = await apiFetch('/api/brain/sources', {
             method: 'POST', headers: { 'content-type': 'application/json' },
             body: JSON.stringify({
@@ -10020,6 +10049,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
               configJson: '{}',
               credentialRef: credRef,
               targetFolder: folder,
+              project: projectVal,
               enabled: true,
             }),
           });
@@ -10060,6 +10090,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
 
           const cfg = { url, method, headers, params };
           if (recordsPath) cfg.recordsJsonPath = recordsPath;
+          const projectVal = document.getElementById('brain-poll-project').value || null;
 
           statusEl.innerHTML = 'Saving…';
           const resp = await apiFetch('/api/brain/sources', {
@@ -10069,6 +10100,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
               configJson: JSON.stringify(cfg),
               scheduleCron: cronExpr || null,
               targetFolder: folder || ('04-Ingest/' + slug),
+              project: projectVal,
               enabled: true,
             }),
           });

@@ -321,6 +321,17 @@ async function writeRecord(record: IngestedRecord, source: Source, store: any): 
   const nowIso = new Date().toISOString();
   const sourceType: string = source.kind; // 'seed' | 'poll' | 'webhook'
 
+  // Project tagging: sources linked to a project propagate that link
+  // into every ingested record's frontmatter + tags, so agents bound to
+  // a project can filter their memory_search results by project tag.
+  if (source.project) {
+    const projSlug = projectSlugFromPath(source.project);
+    record.frontmatter = { ...record.frontmatter, project: source.project, project_slug: projSlug };
+    if (!record.tags.some((t) => t === `project:${projSlug}`)) {
+      record.tags = [...record.tags, `project:${projSlug}`];
+    }
+  }
+
   // 1) Raw payload → artifact store
   const artifactId = store.storeArtifact({
     toolName: `ingest:${source.slug}`,
@@ -397,6 +408,12 @@ function serializeYaml(val: unknown): string {
   const str = String(val);
   if (/[\n:#&*{}[\],|>!%@`]/.test(str) || /^\s|\s$/.test(str)) return JSON.stringify(str);
   return str;
+}
+
+/** Derive a short tag-friendly slug from a project path. */
+function projectSlugFromPath(projectPath: string): string {
+  const base = projectPath.split('/').filter(Boolean).pop() ?? projectPath;
+  return base.toLowerCase().replace(/[^a-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '') || 'project';
 }
 
 function coerceCol(v: unknown): string | number | null {

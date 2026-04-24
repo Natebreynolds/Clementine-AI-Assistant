@@ -874,6 +874,7 @@ export interface Source {
   scheduleCron?: string | null;    // for kind='poll'
   targetFolder?: string | null;    // vault folder for distilled notes
   agentSlug?: string | null;       // NULL = global brain (default)
+  project?: string | null;         // project path (from ~/.clementine/projects.json) — tags ingested records
   intelligence: IntelligenceMode;
   enabled: boolean;
   lastRunAt?: string | null;

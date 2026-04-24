@@ -640,6 +640,12 @@ export class MemoryStore {
       CREATE INDEX IF NOT EXISTS idx_sources_kind ON sources(kind);
       CREATE INDEX IF NOT EXISTS idx_sources_enabled ON sources(enabled);
     `);
+    try {
+      this.conn.exec('ALTER TABLE sources ADD COLUMN project TEXT DEFAULT NULL');
+    } catch { /* already exists */ }
+    try {
+      this.conn.exec('CREATE INDEX idx_sources_project ON sources(project)');
+    } catch { /* already exists */ }
 
     // Ingestion runs — per-run audit trail
     this.conn.exec(`
@@ -1977,19 +1983,20 @@ export class MemoryStore {
     scheduleCron?: string | null;
     targetFolder?: string | null;
     agentSlug?: string | null;
+    project?: string | null;
     intelligence?: string;
     enabled?: boolean;
   }): void {
     this.conn
       .prepare(
         `INSERT INTO sources (slug, kind, adapter, config_json, credential_ref, schedule_cron,
-                              target_folder, agent_slug, intelligence, enabled, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+                              target_folder, agent_slug, project, intelligence, enabled, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
          ON CONFLICT(slug) DO UPDATE SET
            kind=excluded.kind, adapter=excluded.adapter, config_json=excluded.config_json,
            credential_ref=excluded.credential_ref, schedule_cron=excluded.schedule_cron,
            target_folder=excluded.target_folder, agent_slug=excluded.agent_slug,
-           intelligence=excluded.intelligence, enabled=excluded.enabled,
+           project=excluded.project, intelligence=excluded.intelligence, enabled=excluded.enabled,
            updated_at=datetime('now')`,
       )
       .run(
@@ -2001,6 +2008,7 @@ export class MemoryStore {
         input.scheduleCron ?? null,
         input.targetFolder ?? null,
         input.agentSlug ?? null,
+        input.project ?? null,
         input.intelligence ?? 'auto',
         input.enabled === false ? 0 : 1,
       );
@@ -2010,6 +2018,7 @@ export class MemoryStore {
     slug: string; kind: string; adapter: string; configJson: string;
     credentialRef: string | null; scheduleCron: string | null;
     targetFolder: string | null; agentSlug: string | null;
+    project: string | null;
     intelligence: string; enabled: boolean;
     lastRunAt: string | null; lastStatus: string | null;
     createdAt: string; updatedAt: string;
@@ -2017,7 +2026,7 @@ export class MemoryStore {
     const row = this.conn
       .prepare(
         `SELECT slug, kind, adapter, config_json, credential_ref, schedule_cron,
-                target_folder, agent_slug, intelligence, enabled, last_run_at,
+                target_folder, agent_slug, project, intelligence, enabled, last_run_at,
                 last_status, created_at, updated_at
          FROM sources WHERE slug = ?`,
       )
@@ -2027,6 +2036,7 @@ export class MemoryStore {
       slug: row.slug, kind: row.kind, adapter: row.adapter, configJson: row.config_json,
       credentialRef: row.credential_ref, scheduleCron: row.schedule_cron,
       targetFolder: row.target_folder, agentSlug: row.agent_slug,
+      project: row.project ?? null,
       intelligence: row.intelligence, enabled: !!row.enabled,
       lastRunAt: row.last_run_at, lastStatus: row.last_status,
       createdAt: row.created_at, updatedAt: row.updated_at,

@@ -24,6 +24,7 @@ export async function upsertSource(source: Partial<Source> & { slug: string; kin
     scheduleCron: source.scheduleCron ?? null,
     targetFolder: source.targetFolder ?? null,
     agentSlug: source.agentSlug ?? null,
+    project: source.project ?? null,
     intelligence: source.intelligence ?? 'auto',
     enabled: source.enabled !== false,
   });
@@ -42,6 +43,7 @@ export async function getSource(slug: string): Promise<Source | null> {
     scheduleCron: row.scheduleCron,
     targetFolder: row.targetFolder,
     agentSlug: row.agentSlug,
+    project: row.project ?? null,
     intelligence: (row.intelligence as Source['intelligence']) ?? 'auto',
     enabled: row.enabled,
     lastRunAt: row.lastRunAt,
@@ -57,6 +59,7 @@ export async function listSources(filter: { enabled?: boolean; kind?: Source['ki
     slug: string; kind: string; adapter: string; configJson: string;
     credentialRef: string | null; scheduleCron: string | null;
     targetFolder: string | null; agentSlug: string | null;
+    project: string | null;
     intelligence: string; enabled: boolean;
     lastRunAt: string | null; lastStatus: string | null;
     createdAt: string; updatedAt: string;
@@ -71,6 +74,7 @@ export async function listSources(filter: { enabled?: boolean; kind?: Source['ki
     scheduleCron: row.scheduleCron,
     targetFolder: row.targetFolder,
     agentSlug: row.agentSlug,
+    project: row.project ?? null,
     intelligence: (row.intelligence as Source['intelligence']) ?? 'auto',
     enabled: row.enabled,
     lastRunAt: row.lastRunAt,
