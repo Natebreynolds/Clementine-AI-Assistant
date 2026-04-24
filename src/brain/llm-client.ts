@@ -1,13 +1,17 @@
 /**
- * Clementine — Minimal Anthropic client wrapper for the brain.
+ * Clementine — Brain LLM client.
  *
- * Ingestion calls Haiku for per-chunk distillation and one-shot schema
- * inference. Tests inject a deterministic override via `setLLMOverride()`
- * so the pipeline can be verified without network.
+ * Routes single-shot distillation/schema-inference calls through the
+ * PersonalAssistant's `runPlanStep()`, which uses the Claude Agent SDK
+ * under the hood. That path honors OAuth tokens from `clementine login`
+ * (the raw Messages API does not), so brain ingestion works with
+ * whatever credentials the rest of Clementine already uses.
+ *
+ * Tests inject a deterministic override via `setLLMOverride()` so the
+ * pipeline can be verified without spawning the SDK subprocess.
  */
 
-import Anthropic from '@anthropic-ai/sdk';
-import { MODELS, ANTHROPIC_API_KEY, CLAUDE_CODE_OAUTH_TOKEN } from '../config.js';
+import { MODELS } from '../config.js';
 
 export interface LLMCallOpts {
   model?: string;
@@ -15,6 +19,8 @@ export interface LLMCallOpts {
   system?: string;
   /** Response format hint — if 'json', asks the model for JSON-only output. */
   format?: 'text' | 'json';
+  /** Distinct id for telemetry / logging (e.g. 'brain-distill', 'brain-schema'). */
+  stepId?: string;
 }
 
 export type LLMCallFn = (prompt: string, opts?: LLMCallOpts) => Promise<string>;
@@ -26,35 +32,23 @@ export function setLLMOverride(fn: LLMCallFn | null): void {
   override = fn;
 }
 
-let client: Anthropic | null = null;
-function getClient(): Anthropic {
-  if (!client) {
-    // Brain ingestion calls the raw Messages API. Anthropic does NOT
-    // accept OAuth tokens (from `clementine login`) on /v1/messages —
-    // only API keys — so we require one explicitly and surface a clear
-    // remediation message when it's missing. OAuth works for the Agent
-    // SDK used elsewhere in Clementine; routing brain calls through the
-    // SDK is a future option, but for now an API key is required.
-    const apiKey = ANTHROPIC_API_KEY || process.env.ANTHROPIC_API_KEY;
-    if (!apiKey) {
-      const hasOauth = Boolean(CLAUDE_CODE_OAUTH_TOKEN || process.env.CLAUDE_CODE_OAUTH_TOKEN);
-      throw new Error(
-        hasOauth
-          ? 'Brain ingestion requires an Anthropic API key. Your OAuth token (from `clementine login`) works for the Agent SDK but not for the Messages API used here. Run `clementine login --api-key` or set ANTHROPIC_API_KEY in ~/.clementine/.env.'
-          : 'Brain ingestion requires an Anthropic API key. Run `clementine login --api-key` or set ANTHROPIC_API_KEY in ~/.clementine/.env.',
-      );
-    }
-    client = new Anthropic({ apiKey });
-  }
-  return client;
+// Lazy singleton — we avoid spinning up the assistant (which loads SOUL,
+// agent profiles, etc.) unless the pipeline actually needs an LLM call.
+let _assistant: unknown | null = null;
+async function getAssistant(): Promise<{ runPlanStep: (id: string, prompt: string, opts?: Record<string, unknown>) => Promise<string> }> {
+  if (_assistant) return _assistant as any;
+  const { PersonalAssistant } = await import('../agent/assistant.js');
+  _assistant = new PersonalAssistant();
+  return _assistant as any;
 }
 
 /** Single-shot completion. Returns the assistant's text output. */
 export async function callLLM(prompt: string, opts: LLMCallOpts = {}): Promise<string> {
   if (override) return override(prompt, opts);
 
-  const model = opts.model ?? MODELS.haiku;
-  const maxTokens = opts.maxTokens ?? 1024;
+  // Inline the system prompt and format hint into the user prompt since
+  // runPlanStep takes a single string. The SDK's own security prompt is
+  // still applied; ours sits on top for task-specific guidance.
   const systemParts: string[] = [];
   if (opts.system) systemParts.push(opts.system);
   if (opts.format === 'json') {
@@ -62,25 +56,27 @@ export async function callLLM(prompt: string, opts: LLMCallOpts = {}): Promise<s
       'Respond with a single valid JSON object. No prose, no code fences, no explanation.',
     );
   }
+  const finalPrompt = systemParts.length
+    ? `${systemParts.join('\n\n')}\n\n---\n\n${prompt}`
+    : prompt;
 
-  const result = await getClient().messages.create({
+  const assistant = await getAssistant();
+  const stepId = opts.stepId ?? 'brain-call';
+  const model = opts.model ?? MODELS.haiku;
+
+  const result = await assistant.runPlanStep(stepId, finalPrompt, {
+    tier: 1,            // low-security (read-only, no tools)
+    maxTurns: 1,        // single assistant turn
+    disableTools: true, // no tool use — pure completion
     model,
-    max_tokens: maxTokens,
-    system: systemParts.join('\n\n') || undefined,
-    messages: [{ role: 'user', content: prompt }],
   });
-
-  const first = result.content[0];
-  if (first && first.type === 'text') return first.text;
-  return '';
+  return (result ?? '').trim();
 }
 
 /** Parse a JSON response defensively (strip code fences, trailing text). */
 export function parseJsonResponse<T = unknown>(raw: string): T | null {
   let text = raw.trim();
-  // Strip ```json or ``` fences if present
   text = text.replace(/^```(?:json)?\s*/i, '').replace(/\s*```\s*$/i, '').trim();
-  // Find the first { or [ and matching last } or ]
   const firstBrace = Math.min(
     ...['{', '['].map((c) => {
       const i = text.indexOf(c);
