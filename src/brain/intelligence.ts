@@ -99,11 +99,19 @@ function readPath(obj: unknown, key: string): unknown {
   return cur;
 }
 
-/** Apply a schema mapping to a single structured record (no LLM call). */
+/**
+ * Apply a schema mapping to a single structured record (no LLM call).
+ *
+ * `targetFolderOverride` (when set) wins over the mapping's folder — that
+ * lets the registered source's `target_folder` stay authoritative so a
+ * user who seeds slug "customers" always finds records under their own
+ * folder instead of whichever semantic bucket the LLM inferred.
+ */
 export function applyTemplate(
   record: RawRecord,
   mapping: SchemaMapping,
   sourceSlug: string,
+  targetFolderOverride?: string | null,
 ): Omit<IngestedRecord, 'artifactId'> {
   const structured = (record.metadata?.structured as Record<string, unknown>) ?? {};
   const title = renderTemplate(mapping.titleTemplate, structured) || record.externalId || 'Untitled';
@@ -143,7 +151,7 @@ export function applyTemplate(
 
   const externalId = record.externalId ?? contentHash(record.rawPayload);
   const safeSlug = externalId.replace(/[^a-z0-9_-]+/gi, '-').slice(0, 80);
-  const safeFolder = sanitizeFolder(mapping.targetFolder, sourceSlug);
+  const safeFolder = sanitizeFolder(targetFolderOverride || mapping.targetFolder, sourceSlug);
   const targetRelPath = `${safeFolder}/${safeSlug}.md`;
 
   return {

@@ -261,7 +261,10 @@ async function processStructured(
   counters: Counters,
 ): Promise<void> {
   try {
-    const partial = applyTemplate(record, mapping, source.slug);
+    // Pass source.targetFolder as the authoritative override so records
+    // always land in the folder the user registered (not whatever bucket
+    // the schema-infer LLM picked).
+    const partial = applyTemplate(record, mapping, source.slug, source.targetFolder ?? null);
     const ingested: IngestedRecord = { ...partial };
     const summaryBundle = { title: ingested.title, summary: ingested.summary, tags: ingested.tags, externalId: ingested.externalId };
     if (opts.dryRun) {
