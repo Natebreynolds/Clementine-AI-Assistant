@@ -2430,6 +2430,8 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
           title: r.title, tags: r.tags, targetRelPath: r.targetRelPath,
           body: (r.body || '').slice(0, 800),
         })),
+        recordsIn: result.recordsIn,
+        errors: result.errors.slice(0, 10),
       });
     } catch (err) {
       write({ type: 'error', error: err instanceof Error ? err.message : String(err) });
@@ -10146,14 +10148,25 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
 
           const manifest = manifestData.manifest;
           const preview = finalData.preview || [];
+          const errorsList = finalData.errors || [];
           const manifestRows = Object.entries(manifest.formats || {})
             .map(([fmt, n]) => '<tr><td>' + escapeHtml(fmt) + '</td><td>' + n + '</td></tr>').join('');
+          const warnBlock = errorsList.length
+            ? '<div style="margin-top:10px;padding:10px;background:#fff3cd;border:1px solid #f0c36d;border-radius:6px;color:#8a5a00;font-size:13px">' +
+              '<div style="font-weight:600;margin-bottom:4px">' + errorsList.length + ' file(s) could not be ingested</div>' +
+              errorsList.map((e) => '<div style="font-family:monospace;font-size:12px">• ' + escapeHtml(e.error) + '</div>').join('') +
+              '</div>'
+            : '';
+          const emptyNote = (preview.length === 0 && !errorsList.length)
+            ? '<div style="margin-top:10px;padding:10px;background:#fff3cd;border:1px solid #f0c36d;border-radius:6px;color:#8a5a00;font-size:13px">No records extracted. The file may be empty or in an unsupported format.</div>'
+            : '';
           manifestEl.innerHTML =
             '<div class="card" style="padding:12px"><div style="font-weight:600;margin-bottom:8px">Manifest</div>' +
             '<div style="color:var(--muted);font-size:13px;margin-bottom:8px">' +
             manifest.totalFiles + ' file(s), ' + brainHumanBytes(manifest.totalBytes) +
             ' · scanned in ' + Math.floor((Date.now() - progress.startedAt) / 1000) + 's</div>' +
-            '<table class="data-table"><thead><tr><th>Format</th><th>Count</th></tr></thead><tbody>' + manifestRows + '</tbody></table></div>';
+            '<table class="data-table"><thead><tr><th>Format</th><th>Count</th></tr></thead><tbody>' + manifestRows + '</tbody></table>' +
+            warnBlock + emptyNote + '</div>';
           if (preview.length) {
             const previewHtml = preview.slice(0, 10).map((p, i) =>
               '<div class="card" style="padding:12px;margin-bottom:8px">' +
@@ -10216,14 +10229,27 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
             return;
           }
           const elapsed = Math.floor((Date.now() - progress.startedAt) / 1000);
+          const errList = finalData.errors || [];
+          const headerColor = (finalData.recordsWritten > 0) ? '#4ade80' : '#e5a84a';
+          const headerIcon = (finalData.recordsWritten > 0) ? '✓' : '⚠';
+          const headerText = (finalData.recordsWritten > 0)
+            ? 'Ingestion complete'
+            : 'Ingestion finished, but nothing was written';
+          const errBlock = errList.length
+            ? '<div style="margin-top:10px;padding:10px;background:#fff3cd;border:1px solid #f0c36d;border-radius:6px;color:#8a5a00;font-size:13px">' +
+              '<div style="font-weight:600;margin-bottom:4px">' + errList.length + ' error(s)</div>' +
+              errList.map((e) => '<div style="font-family:monospace;font-size:12px">• ' + escapeHtml(e.error) + '</div>').join('') +
+              '</div>'
+            : '';
           progEl.innerHTML =
             '<div class="card" style="padding:12px">' +
-            '<div style="font-weight:600;color:#4ade80">✓ Ingestion complete · ' + elapsed + 's</div>' +
+            '<div style="font-weight:600;color:' + headerColor + '">' + headerIcon + ' ' + headerText + ' · ' + elapsed + 's</div>' +
             '<div>Records in: ' + finalData.recordsIn + '</div>' +
             '<div>Records written: ' + finalData.recordsWritten + '</div>' +
             '<div>Records skipped: ' + finalData.recordsSkipped + '</div>' +
             '<div>Records failed: ' + finalData.recordsFailed + '</div>' +
             (finalData.overviewNotePath ? '<div style="margin-top:8px">Overview note: <code>' + escapeHtml(finalData.overviewNotePath) + '</code></div>' : '') +
+            errBlock +
             '</div>';
         }
 

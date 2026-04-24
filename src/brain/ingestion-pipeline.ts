@@ -125,31 +125,39 @@ export async function runIngestion(opts: IngestOptions): Promise<IngestResult> {
     const pendingStructured: RawRecord[] = [];
 
     for (const iter of recordIterators) {
-      for await (const record of iter) {
-        recordsIn += 1;
-        if (opts.limit && recordsIn > opts.limit) break;
+      // Wrap so one unreadable file doesn't abort an otherwise-good folder
+      // ingest — record the adapter error and move on to the next iterator.
+      try {
+        for await (const record of iter) {
+          recordsIn += 1;
+          if (opts.limit && recordsIn > opts.limit) break;
 
-        const flowPath = classifyRecord(record, intelligenceMode);
-        if (flowPath === 'structured') {
-          if (!schemaMapping && samples.length < SAMPLE_SIZE) {
-            samples.push(record);
-            pendingStructured.push(record);
-            continue;
-          }
-          if (!schemaMapping && samples.length >= SAMPLE_SIZE) {
-            schemaMapping = await inferSchema(samples, source.slug);
-            await applyStructuredColumns(schemaMapping);
-            for (const s of pendingStructured) {
-              await processStructured(s, schemaMapping, source, opts, store, report, plannedRecords, errors, writtenSummaries, counters());
+          const flowPath = classifyRecord(record, intelligenceMode);
+          if (flowPath === 'structured') {
+            if (!schemaMapping && samples.length < SAMPLE_SIZE) {
+              samples.push(record);
+              pendingStructured.push(record);
+              continue;
             }
-            pendingStructured.length = 0;
+            if (!schemaMapping && samples.length >= SAMPLE_SIZE) {
+              schemaMapping = await inferSchema(samples, source.slug);
+              await applyStructuredColumns(schemaMapping);
+              for (const s of pendingStructured) {
+                await processStructured(s, schemaMapping, source, opts, store, report, plannedRecords, errors, writtenSummaries, counters());
+              }
+              pendingStructured.length = 0;
+            }
+            if (schemaMapping) {
+              await processStructured(record, schemaMapping, source, opts, store, report, plannedRecords, errors, writtenSummaries, counters());
+            }
+          } else {
+            await processFreeForm(record, source, opts, store, report, plannedRecords, errors, writtenSummaries, counters());
           }
-          if (schemaMapping) {
-            await processStructured(record, schemaMapping, source, opts, store, report, plannedRecords, errors, writtenSummaries, counters());
-          }
-        } else {
-          await processFreeForm(record, source, opts, store, report, plannedRecords, errors, writtenSummaries, counters());
         }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        errors.push({ error: msg });
+        report('parsing', msg);
       }
     }
 
@@ -291,11 +299,20 @@ async function processFreeForm(
   counters: Counters,
 ): Promise<void> {
   try {
-    report('distilling');
     const chunks = chunkContent(record.content, 3000);
-    const distillations = [];
-    for (const chunk of chunks) {
-      distillations.push(await distillChunk(chunk, record.metadata ?? {}));
+    report('distilling', chunks.length > 1 ? `chunk 0/${chunks.length}` : undefined);
+    // Parallelize per-chunk Haiku calls in small batches — one chunk at a
+    // time on a 30KB PDF adds up to 60–90s; 5-way concurrency cuts it to
+    // ~15s without pushing the API's rate limits.
+    const CONCURRENCY = 5;
+    const distillations = new Array(chunks.length);
+    let completed = 0;
+    for (let i = 0; i < chunks.length; i += CONCURRENCY) {
+      const batch = chunks.slice(i, i + CONCURRENCY);
+      const results = await Promise.all(batch.map((chunk) => distillChunk(chunk, record.metadata ?? {})));
+      for (let j = 0; j < results.length; j++) distillations[i + j] = results[j];
+      completed += results.length;
+      if (chunks.length > 1) report('distilling', `chunk ${completed}/${chunks.length}`);
     }
     const targetFolder = sanitizeFolder(source.targetFolder || `04-Ingest/${source.slug}`, source.slug);
     const partial = combineDistillations(record, distillations, source.slug, targetFolder);
