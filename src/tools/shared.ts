@@ -124,6 +124,101 @@ export type MemoryStoreType = {
   }>;
   getFeedbackStats(): { positive: number; negative: number; mixed: number; total: number };
   promoteToGlobal(chunkId: number, promotedBy?: string): string;
+  recordOutcome(
+    outcomes: Array<{ chunkId: number; referenced: boolean }>,
+    sessionKey?: string | null,
+  ): void;
+  storeArtifact(input: {
+    toolName: string;
+    summary: string;
+    content: string;
+    tags?: string;
+    sessionKey?: string | null;
+    agentSlug?: string | null;
+  }): number;
+  searchArtifacts(opts?: {
+    query?: string;
+    limit?: number;
+    sessionKey?: string | null;
+    agentSlug?: string | null;
+  }): Array<{
+    id: number; toolName: string; summary: string; tags: string;
+    storedAt: string; sessionKey: string | null; agentSlug: string | null;
+    accessCount: number;
+  }>;
+  getArtifact(id: number): {
+    id: number; toolName: string; summary: string; content: string; tags: string;
+    storedAt: string; sessionKey: string | null; agentSlug: string | null;
+    accessCount: number;
+  } | null;
+  appendSessionEntries(
+    sessionId: string,
+    projectKey: string,
+    subpath: string,
+    entries: Array<Record<string, unknown>>,
+  ): void;
+  loadSessionEntries(
+    sessionId: string,
+    subpath: string,
+  ): Array<Record<string, unknown>> | null;
+  listSdkSessions(projectKey: string): Array<{ sessionId: string; mtime: number }>;
+  listSdkSessionSubkeys(sessionId: string): string[];
+  deleteSdkSession(sessionId: string): void;
+  upsertSessionSummary(
+    sessionId: string,
+    subpath: string,
+    projectKey: string,
+    mtime: number,
+    data: Record<string, unknown>,
+  ): void;
+  listSdkSessionSummaries(projectKey: string): Array<{
+    sessionId: string; subpath: string; mtime: number; data: Record<string, unknown>;
+  }>;
+  // ── Brain / Ingestion ───────────────────────────────────────────
+  upsertSource(input: {
+    slug: string; kind: string; adapter: string; configJson?: string;
+    credentialRef?: string | null; scheduleCron?: string | null;
+    targetFolder?: string | null; agentSlug?: string | null;
+    intelligence?: string; enabled?: boolean;
+  }): void;
+  getSource(slug: string): {
+    slug: string; kind: string; adapter: string; configJson: string;
+    credentialRef: string | null; scheduleCron: string | null;
+    targetFolder: string | null; agentSlug: string | null;
+    intelligence: string; enabled: boolean;
+    lastRunAt: string | null; lastStatus: string | null;
+    createdAt: string; updatedAt: string;
+  } | null;
+  listSources(filter?: { enabled?: boolean; kind?: string }): Array<unknown>;
+  deleteSource(slug: string): void;
+  markSourceRun(slug: string, status: 'ok' | 'error' | 'partial'): void;
+  createIngestionRun(sourceSlug: string): number;
+  updateIngestionRun(id: number, patch: {
+    recordsIn?: number; recordsWritten?: number; recordsSkipped?: number;
+    recordsFailed?: number; overviewNotePath?: string | null;
+    errorsJson?: string | null; status?: 'running' | 'ok' | 'error' | 'partial';
+    finished?: boolean;
+  }): void;
+  listIngestionRuns(sourceSlug?: string, limit?: number): Array<{
+    id: number; sourceSlug: string; startedAt: string; finishedAt: string | null;
+    recordsIn: number; recordsWritten: number; recordsSkipped: number; recordsFailed: number;
+    overviewNotePath: string | null; errorsJson: string | null; status: string;
+  }>;
+  findChunkByExternalId(sourceSlug: string, externalId: string): {
+    id: number; sourceFile: string; contentHash: string;
+  } | null;
+  tagChunksForSource(relPath: string, meta: {
+    sourceSlug: string; externalId: string; sourceType: string; lastSyncedAt?: string;
+  }): void;
+  insertIngestedRow(input: {
+    sourceSlug: string; externalId: string;
+    chunkId?: number | null; artifactId?: number | null;
+    rowJson: string;
+    structuredColumns?: Record<string, string | number | null>;
+  }): number;
+  ensureIngestedRowColumn(column: string, sqlType: 'TEXT' | 'REAL' | 'INTEGER'): void;
+  queryIngestedRows(sql: string, params?: unknown[], hardLimit?: number): unknown[];
+  ingestedRowColumns(): string[];
   db: unknown;
 };
 

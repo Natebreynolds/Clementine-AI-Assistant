@@ -16,6 +16,7 @@ import {
   query as rawQuery,
   listSubagents,
   getSubagentMessages,
+  SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
   type Options as SDKOptions,
   type SDKAssistantMessage,
   type SDKResultMessage,
@@ -52,6 +53,7 @@ import {
   CRON_REFLECTIONS_DIR,
   HANDOFFS_DIR,
   BUDGET,
+  TASK_BUDGET_TOKENS,
   ENABLE_1M_CONTEXT,
   IDENTITY_FILE,
   CLAUDE_CODE_OAUTH_TOKEN,
@@ -296,6 +298,10 @@ const query: typeof rawQuery = ((args: Parameters<typeof rawQuery>[0]) => {
       const newOpts: any = { ...opts };
       if (typeof opts.systemPrompt === 'string') {
         newOpts.systemPrompt = stripLoneSurrogates(opts.systemPrompt);
+      } else if (Array.isArray(opts.systemPrompt)) {
+        newOpts.systemPrompt = opts.systemPrompt.map((s: unknown) =>
+          typeof s === 'string' ? stripLoneSurrogates(s) : s,
+        );
       }
       if (typeof opts.appendSystemPrompt === 'string') {
         newOpts.appendSystemPrompt = stripLoneSurrogates(opts.appendSystemPrompt);
@@ -731,6 +737,88 @@ export function removeProject(projectPath: string): boolean {
   return true;
 }
 
+// ── Retrieval Outcome Heuristic ─────────────────────────────────────
+
+/**
+ * Decide whether a retrieved memory chunk shows up in the assistant's
+ * response. We key on distinctive tokens (multi-letter capitalized words,
+ * numbers of 2+ digits) that are unlikely to appear in the response unless
+ * the chunk's content actually influenced what was said.
+ *
+ * Intentionally a cheap local heuristic — no LLM call. False positives are
+ * tolerable since the outcome score is bounded and averaged over many
+ * observations.
+ */
+const OUTCOME_STOPWORDS = new Set([
+  'there', 'these', 'those', 'their', 'where', 'which', 'while',
+  'would', 'could', 'should', 'about', 'being', 'after', 'before',
+  'again', 'against', 'because',
+]);
+
+export interface ProactiveGoalInput {
+  goal: {
+    title: string;
+    priority?: string;
+    owner?: string;
+    nextActions?: string[];
+  };
+}
+
+/**
+ * Build the compact "active goals" block that gets injected when no goal
+ * keyword matches the user's prompt. Pure so it can be tested without the
+ * full Assistant/vault setup.
+ */
+export function buildActiveGoalsBlock(
+  goals: ProactiveGoalInput[],
+  agentSlug?: string | null,
+  maxEntries: number = 6,
+): string {
+  if (goals.length === 0) return '';
+
+  const filtered = goals.filter(({ goal }) => {
+    if (!agentSlug) return true;
+    return goal.owner === agentSlug || goal.owner === 'clementine';
+  });
+  if (filtered.length === 0) return '';
+
+  const rank: Record<string, number> = { high: 0, medium: 1, low: 2 };
+  const sorted = [...filtered].sort((a, b) => {
+    const ra = rank[a.goal.priority ?? 'medium'] ?? 1;
+    const rb = rank[b.goal.priority ?? 'medium'] ?? 1;
+    return ra - rb;
+  });
+
+  const top = sorted.slice(0, maxEntries);
+  const lines = top.map(({ goal }) => {
+    const next = goal.nextActions?.[0];
+    const nextBit = next ? ` → ${String(next).slice(0, 80)}` : '';
+    return `- [${goal.priority ?? 'medium'}] ${goal.title}${nextBit}`;
+  });
+
+  return `\n\n## Active Goals (background context)\n${lines.join('\n')}\n`;
+}
+
+export function chunkReferencedInResponse(chunkContent: string, responseLower: string): boolean {
+  if (!chunkContent || !responseLower) return false;
+
+  const distinctive = new Set<string>();
+  const capMatches = chunkContent.match(/\b[A-Z][a-zA-Z]{3,}\b/g) ?? [];
+  for (const m of capMatches) {
+    const lower = m.toLowerCase();
+    if (!OUTCOME_STOPWORDS.has(lower)) distinctive.add(lower);
+  }
+  const numMatches = chunkContent.match(/\b\d{2,}\b/g) ?? [];
+  for (const m of numMatches) distinctive.add(m);
+
+  if (distinctive.size === 0) return false;
+
+  for (const tok of distinctive) {
+    if (responseLower.includes(tok)) return true;
+  }
+  return false;
+}
+
 // ── PersonalAssistant ───────────────────────────────────────────────
 
 export class PersonalAssistant {
@@ -763,6 +851,14 @@ export class PersonalAssistant {
   private _compactedSessions = new Set<string>();
   /** Last auto-matched project per session — exposed for CLI display. */
   private _lastMatchedProject = new Map<string, ProjectMeta | null>();
+  /**
+   * Chunks retrieved on the most recent turn per session, kept so the
+   * post-response outcome scorer can check which actually got referenced.
+   * Cleared after each scoring pass.
+   */
+  private _lastRetrievedChunks = new Map<string, Array<{ id: number; content: string }>>();
+  /** Lazy-built SessionStore adapter that mirrors SDK transcripts to SQLite. */
+  private _sessionStore: import('@anthropic-ai/claude-agent-sdk').SessionStore | null = null;
   /** Hot correction buffer — explicit behavioral corrections applied before nightly SI. */
   private hotCorrections: Array<{ correction: string; category: string; timestamp: string }> = [];
 
@@ -921,9 +1017,25 @@ export class PersonalAssistant {
       this.memoryStore = new MemoryStore(MEMORY_DB_PATH, VAULT_DIR);
       this.memoryStore.initialize();
       this.primeHotCorrections();
+      // Build the SDK SessionStore adapter now that the store is live.
+      try {
+        const { createMemorySessionStore } = await import('./session-store-adapter.js');
+        this._sessionStore = createMemorySessionStore(this.memoryStore);
+      } catch (err) {
+        logger.warn({ err }, 'SessionStore adapter init failed — SDK will use local-only sessions');
+      }
     } catch (err) {
       logger.warn({ err }, 'Memory store init failed — falling back to static prompts');
     }
+  }
+
+  /**
+   * Return the cached SessionStore adapter. Null until initMemoryStore
+   * completes, in which case the SDK falls back to local-only sessions —
+   * no crash on cold boot.
+   */
+  private getSessionStore(): import('@anthropic-ai/claude-agent-sdk').SessionStore | null {
+    return this._sessionStore;
   }
 
   /**
@@ -1829,22 +1941,31 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
     const capturedSource = sourceOverride;
 
     // Build combined system prompt (custom + security rules).
-    // Split is kept intentional: the stable prefix (SOUL/AGENTS/personality/
-    // skills) is deterministic per-session; the volatile suffix (integration
-    // status, current date/time) changes per-turn. Putting volatile content
-    // STRICTLY at the end gives Claude Code's internal prompt cache the best
-    // chance at reusing the stable prefix across turns. The SDK's public
-    // systemPrompt option only accepts a string, not the Messages-API content
-    // array with explicit cache_control, so we rely on the SDK to do the
-    // right thing with the layout it receives.
+    // Stable prefix (SOUL/AGENTS/personality/skills + security rules) is
+    // deterministic per-session and cacheable across turns; the volatile
+    // suffix (retrieved memory, active goals, current date/time, integration
+    // status) changes per-turn and must NOT be in the cached prefix.
+    //
+    // The SDK's string[] systemPrompt with SYSTEM_PROMPT_DYNAMIC_BOUNDARY
+    // (added in @anthropic-ai/claude-agent-sdk 0.2.119) tells the prompt
+    // cache exactly where the boundary is, so cross-turn cache hits work
+    // even when our per-turn goals/memory block changes.
     const { stable, volatile: volatilePromptPart } = this.buildSystemPrompt({
       isHeartbeat, cronTier: isPlanStep ? null : cronTier, retrievalContext, profile, sessionKey, model, verboseLevel, intentClassification,
     });
-    const fullSystemPrompt = [
-      stable,
-      securityPrompt,
-      volatilePromptPart,
-    ].filter(s => s && s.trim().length > 0).join('\n\n');
+
+    const stablePrefixParts = [stable, securityPrompt]
+      .filter(s => s && s.trim().length > 0);
+    const volatileSuffix = volatilePromptPart && volatilePromptPart.trim().length > 0
+      ? volatilePromptPart
+      : '';
+
+    // If there is no volatile content, a plain string keeps the call simple
+    // and behaves identically for the cache. Only use the array form when
+    // we actually have dynamic content to split off.
+    const fullSystemPrompt: string | string[] = volatileSuffix
+      ? [...stablePrefixParts, SYSTEM_PROMPT_DYNAMIC_BOUNDARY, volatileSuffix]
+      : stablePrefixParts.join('\n\n');
 
     // ── Compute effort level ──────────────────────────────────────
     const computedEffort: 'low' | 'medium' | 'high' | 'max' | undefined = effort ?? (
@@ -1867,6 +1988,22 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
       : BUDGET.chat
     );
     void computedBudget; // reserved for future cost telemetry — not enforced
+
+    // ── Task budget (tokens) ──────────────────────────────────────
+    // Soft brake — the SDK tells the model its remaining token budget so it
+    // paces tool use. Prevents runaway loops in autonomous contexts without
+    // killing long, legitimate work. Interactive chat stays uncapped.
+    const computedTaskBudget: number | undefined = isPlanStep
+      ? TASK_BUDGET_TOKENS.planStep
+      : isUnleashed
+        ? TASK_BUDGET_TOKENS.unleashedPhase
+        : isCron && (cronTier ?? 0) < 2
+          ? TASK_BUDGET_TOKENS.cronT1
+          : isCron
+            ? TASK_BUDGET_TOKENS.cronT2
+            : isHeartbeat
+              ? TASK_BUDGET_TOKENS.heartbeat
+              : TASK_BUDGET_TOKENS.chat;
 
     // ── Compute adaptive thinking ─────────────────────────────────
     const supportsThinking = !resolvedModel.includes('haiku');
@@ -1895,12 +2032,18 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
     // terminal, so 'auto' mode (which requires plan support + human approval) doesn't apply.
     const effectivePermissionMode = 'bypassPermissions';
 
+    // SessionStore adapter: mirror SDK transcripts into our SQLite store.
+    // Resume then works from the durable store, not just local JSONL.
+    const sessionStore = this.getSessionStore();
+
     return {
       systemPrompt: fullSystemPrompt,
       model: resolvedModel,
       ...(fallback ? { fallbackModel: fallback } : {}),
       permissionMode: effectivePermissionMode as 'bypassPermissions' | 'auto',
       allowDangerouslySkipPermissions: true,
+      ...(sessionStore ? { sessionStore } : {}),
+      ...(computedTaskBudget ? { taskBudget: { total: computedTaskBudget } } : {}),
       // SDK field semantics (per node_modules/@anthropic-ai/claude-agent-sdk/sdk.d.ts):
       //   - `tools`        → which built-in tools the model can see (Read, Bash, Task, …)
       //   - `mcpServers`   → MCP servers to spawn; all their declared tools are exposed automatically
@@ -2017,6 +2160,17 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
             this.memoryStore.recordAccess(accessedIds, 'retrieval');
           } catch {
             // Non-fatal
+          }
+        }
+        // Stash chunks for post-response outcome scoring. Only populate if
+        // we have a sessionKey to key against — chunks with no session can't
+        // be attributed to a response.
+        if (sessionKey) {
+          const stash = results
+            .filter((r: any) => typeof r.chunkId === 'number' && r.chunkId !== 0 && typeof r.content === 'string')
+            .map((r: any) => ({ id: r.chunkId as number, content: r.content as string }));
+          if (stash.length > 0) {
+            this._lastRetrievedChunks.set(sessionKey, stash);
           }
         }
       }
@@ -2163,6 +2317,20 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
       });
 
       return `\n\n## Relevant Goals\n${lines.join('\n')}\n`;
+    } catch {
+      return '';
+    }
+  }
+
+  /**
+   * Compact always-on block of active goals. Used when no keyword match
+   * fires so the agent still sees what it's supposed to be working on.
+   * Scoped: for agent sessions, includes that agent's goals plus any
+   * clementine-owned goals it might contribute to.
+   */
+  private formatActiveGoalsBlock(agentSlug?: string | null): string {
+    try {
+      return buildActiveGoalsBlock(this.loadGoalsFromCache(), agentSlug);
     } catch {
       return '';
     }
@@ -2440,7 +2608,38 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
       this.spawnMemoryExtraction(text, responseText, key, profile).catch(err => logger.debug({ err }, 'Memory extraction failed'));
     }
 
+    // Score outcome-driven salience: for the chunks we retrieved this turn,
+    // check which actually showed up in the response and adjust their
+    // `last_outcome_score`. Fire-and-forget; failure is non-fatal.
+    if (key && responseText && !isApiError) {
+      this.scoreRetrievalOutcomes(key, responseText);
+    }
+
     return [responseText, sessionId];
+  }
+
+  /**
+   * Compare retrieved chunks against the response text and record which
+   * were referenced. Uses a distinctive-token overlap heuristic — cheap,
+   * deterministic, no extra LLM calls. Called right after a turn completes.
+   */
+  private scoreRetrievalOutcomes(sessionKey: string, responseText: string): void {
+    const stash = this._lastRetrievedChunks.get(sessionKey);
+    if (!stash || stash.length === 0) return;
+    this._lastRetrievedChunks.delete(sessionKey);
+
+    if (!this.memoryStore || typeof this.memoryStore.recordOutcome !== 'function') return;
+
+    try {
+      const responseLower = responseText.toLowerCase();
+      const outcomes = stash.map(({ id, content }) => {
+        const referenced = chunkReferencedInResponse(content, responseLower);
+        return { chunkId: id, referenced };
+      });
+      this.memoryStore.recordOutcome(outcomes, sessionKey);
+    } catch (err) {
+      logger.debug({ err, sessionKey }, 'Outcome scoring failed');
+    }
   }
 
   // ── Run Query ─────────────────────────────────────────────────────
@@ -2513,10 +2712,16 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
       retrievalContext = `## Active Project: ${projName}${projDesc}\n\nYou are operating in the context of the **${projName}** project at \`${matchedProject.path}\`. You have access to this project's tools, MCP servers, and configuration.\n\n${retrievalContext}`;
     }
 
-    // Inject matching goal context so the agent is goal-aware without tool calls
+    // Inject matching goal context so the agent is goal-aware without tool calls.
+    // If no keyword match, fall back to a compact always-on block so active
+    // goals stay in context even when the user message doesn't mention them —
+    // this is what keeps multi-session work coherent across tangential turns.
     const goalContext = this.matchGoals(prompt);
     if (goalContext) {
       retrievalContext += goalContext;
+    } else {
+      const proactive = this.formatActiveGoalsBlock(profile?.slug);
+      if (proactive) retrievalContext += proactive;
     }
 
     // Timeout: abort the query after timeoutMs to prevent hour-long stalls.
@@ -2550,8 +2755,15 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
           sdkOptions.resume = this.sessions.get(sessionKey);
         }
 
-        // Context window guard: estimate token usage and bail if too tight
-        const systemPromptText = typeof sdkOptions.systemPrompt === 'string' ? sdkOptions.systemPrompt : '';
+        // Context window guard: estimate token usage and bail if too tight.
+        // systemPrompt may be a plain string or a string[] with a boundary
+        // sentinel — sum across the array elements so the estimate is honest.
+        const sp = sdkOptions.systemPrompt;
+        const systemPromptText = typeof sp === 'string'
+          ? sp
+          : Array.isArray(sp)
+            ? sp.filter((s): s is string => typeof s === 'string' && s !== SYSTEM_PROMPT_DYNAMIC_BOUNDARY).join('\n\n')
+            : '';
         const systemPromptTokens = estimateTokens(systemPromptText);
         const promptTokens = estimateTokens(prompt);
         const totalEstimate = systemPromptTokens + promptTokens;

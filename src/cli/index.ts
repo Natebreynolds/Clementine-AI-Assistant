@@ -37,6 +37,7 @@ import { runSetup } from './setup.js';
 import { cmdCronList, cmdCronRun, cmdCronRunDue, cmdCronRuns, cmdCronAdd, cmdCronTest, cmdHeartbeat } from './cron.js';
 import { cmdDashboard } from './dashboard.js';
 import { cmdChat } from './chat.js';
+import { cmdIngestSeed, cmdIngestRun, cmdIngestList, cmdIngestStatus } from './ingest.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -2848,5 +2849,34 @@ program
   .option('--cron', 'Show cron log instead of daemon log')
   .option('--json', 'Raw JSON output')
   .action(cmdLogs);
+
+// ── Brain / Ingest ──────────────────────────────────────────────────
+
+const ingestCmd = program
+  .command('ingest')
+  .description('Seed and manage external data sources for the brain');
+
+ingestCmd
+  .command('seed <path>')
+  .description('Bulk import a file or folder (CSV, JSON, PDF, email, DOCX, MD) into the brain')
+  .option('--slug <slug>', 'Source slug (defaults to filename)')
+  .option('--intelligence <mode>', "Intelligence mode: 'auto' | 'template-only' | 'llm-per-record'", 'auto')
+  .action((input: string, opts: { slug?: string; intelligence?: 'auto' | 'template-only' | 'llm-per-record' }) =>
+    cmdIngestSeed(input, opts));
+
+ingestCmd
+  .command('run <slug>')
+  .description('Re-run a previously registered source')
+  .action(cmdIngestRun);
+
+ingestCmd
+  .command('list')
+  .description('List all registered sources')
+  .action(cmdIngestList);
+
+ingestCmd
+  .command('status <slug>')
+  .description('Show recent runs and metadata for a source')
+  .action(cmdIngestStatus);
 
 program.parse();

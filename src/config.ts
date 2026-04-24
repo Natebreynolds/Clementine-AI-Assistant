@@ -139,6 +139,32 @@ export const BUDGET = {
   reflection: undefined,
 };
 
+// ── Task budget caps (tokens per query) ──────────────────────────────
+// Passed to the Claude Agent SDK as `taskBudget: { total }`. The model is
+// told its remaining token budget so it can pace tool use and wrap up
+// before the cap — a soft brake that prevents runaway loops in
+// autonomous contexts. Undefined = no cap. Tunable via env.
+//
+// Zero means "disabled" — treat as undefined so the SDK sees no cap.
+
+function optionalTokenEnv(name: string, def: number | undefined): number | undefined {
+  const raw = getEnv(name, def === undefined ? '' : String(def));
+  if (!raw) return undefined;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n <= 0) return undefined;
+  return Math.floor(n);
+}
+
+export const TASK_BUDGET_TOKENS = {
+  heartbeat: optionalTokenEnv('TASK_BUDGET_HEARTBEAT', 30_000),
+  cronT1: optionalTokenEnv('TASK_BUDGET_CRON_T1', 80_000),
+  cronT2: optionalTokenEnv('TASK_BUDGET_CRON_T2', 250_000),
+  unleashedPhase: optionalTokenEnv('TASK_BUDGET_UNLEASHED', 500_000),
+  planStep: optionalTokenEnv('TASK_BUDGET_PLAN_STEP', 50_000),
+  // Interactive chat: off by default — let the user and maxTurns drive it.
+  chat: optionalTokenEnv('TASK_BUDGET_CHAT', undefined),
+};
+
 export const DEFAULT_MODEL_TIER = (getEnv('DEFAULT_MODEL_TIER', 'sonnet')) as keyof Models;
 export const MODEL = MODELS[DEFAULT_MODEL_TIER] ?? MODELS.sonnet;
 

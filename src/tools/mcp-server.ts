@@ -31,6 +31,7 @@ import { registerAdminTools } from './admin-tools.js';
 import { registerGoalTools } from './goal-tools.js';
 import { registerTeamTools } from './team-tools.js';
 import { registerSessionTools } from './session-tools.js';
+import { registerArtifactTools } from './artifact-tools.js';
 
 // ── Server ──────────────────────────────────────────────────────────────
 
@@ -45,6 +46,7 @@ registerAdminTools(server);
 registerGoalTools(server);
 registerTeamTools(server);
 registerSessionTools(server);
+registerArtifactTools(server);
 
 // ── Main ────────────────────────────────────────────────────────────────
 

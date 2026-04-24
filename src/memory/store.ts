@@ -231,6 +231,106 @@ export class MemoryStore {
       CREATE INDEX IF NOT EXISTS idx_access_log_chunk ON access_log(chunk_id);
     `);
 
+    // Outcome-driven salience: per-turn "was this retrieved chunk actually
+    // referenced in the response?" signal. Feeds last_outcome_score on chunks
+    // so chunks that earn their context budget stay high, and chunks that
+    // keep losing bids drift down.
+    try {
+      this.conn.exec('ALTER TABLE chunks ADD COLUMN last_outcome_score REAL DEFAULT 0.0');
+    } catch { /* already exists */ }
+
+    this.conn.exec(`
+      CREATE TABLE IF NOT EXISTS outcomes (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        chunk_id INTEGER NOT NULL,
+        session_key TEXT,
+        referenced INTEGER NOT NULL,
+        created_at TEXT DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_outcomes_chunk ON outcomes(chunk_id);
+      CREATE INDEX IF NOT EXISTS idx_outcomes_created ON outcomes(created_at);
+    `);
+
+    // SDK SessionStore mirror: append-only sidecar for the transcript
+    // JSONL that the Claude Agent SDK writes locally. Lets resume pull
+    // session state from our SQLite instead of local files; idempotent
+    // on uuid so retries and imports don't duplicate.
+    this.conn.exec(`
+      CREATE TABLE IF NOT EXISTS sdk_session_entries (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id TEXT NOT NULL,
+        project_key TEXT NOT NULL,
+        subpath TEXT NOT NULL DEFAULT '',
+        uuid TEXT,
+        type TEXT NOT NULL,
+        entry_json TEXT NOT NULL,
+        created_at TEXT DEFAULT (datetime('now'))
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_sdk_session_entries_uuid
+        ON sdk_session_entries(session_id, subpath, uuid) WHERE uuid IS NOT NULL;
+      CREATE INDEX IF NOT EXISTS idx_sdk_session_entries_session
+        ON sdk_session_entries(session_id, subpath, id);
+    `);
+
+    // SessionStore sidecar for incremental session summaries.
+    this.conn.exec(`
+      CREATE TABLE IF NOT EXISTS sdk_session_summaries (
+        session_id TEXT NOT NULL,
+        subpath TEXT NOT NULL DEFAULT '',
+        project_key TEXT NOT NULL,
+        mtime INTEGER NOT NULL,
+        data_json TEXT NOT NULL,
+        PRIMARY KEY (session_id, subpath)
+      );
+      CREATE INDEX IF NOT EXISTS idx_sdk_session_summaries_project
+        ON sdk_session_summaries(project_key, mtime DESC);
+    `);
+
+    // Artifact memory: persistent store for large tool outputs so the
+    // agent can recall them many turns later without re-running the tool.
+    // Content lives here verbatim; a summary lets the agent skim without
+    // pulling the full blob back into context.
+    this.conn.exec(`
+      CREATE TABLE IF NOT EXISTS tool_artifacts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_key TEXT,
+        agent_slug TEXT,
+        tool_name TEXT NOT NULL,
+        summary TEXT NOT NULL,
+        content TEXT NOT NULL,
+        tags TEXT DEFAULT '',
+        stored_at TEXT DEFAULT (datetime('now')),
+        last_accessed_at TEXT,
+        access_count INTEGER DEFAULT 0
+      );
+      CREATE INDEX IF NOT EXISTS idx_artifacts_session ON tool_artifacts(session_key);
+      CREATE INDEX IF NOT EXISTS idx_artifacts_stored ON tool_artifacts(stored_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_artifacts_agent ON tool_artifacts(agent_slug);
+
+      CREATE VIRTUAL TABLE IF NOT EXISTS tool_artifacts_fts USING fts5(
+        tool_name, summary, content, tags,
+        content='tool_artifacts', content_rowid='id',
+        tokenize='porter unicode61'
+      );
+
+      CREATE TRIGGER IF NOT EXISTS tool_artifacts_ai AFTER INSERT ON tool_artifacts BEGIN
+        INSERT INTO tool_artifacts_fts(rowid, tool_name, summary, content, tags)
+        VALUES (new.id, new.tool_name, new.summary, new.content, new.tags);
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS tool_artifacts_ad AFTER DELETE ON tool_artifacts BEGIN
+        INSERT INTO tool_artifacts_fts(tool_artifacts_fts, rowid, tool_name, summary, content, tags)
+        VALUES ('delete', old.id, old.tool_name, old.summary, old.content, old.tags);
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS tool_artifacts_au AFTER UPDATE ON tool_artifacts BEGIN
+        INSERT INTO tool_artifacts_fts(tool_artifacts_fts, rowid, tool_name, summary, content, tags)
+        VALUES ('delete', old.id, old.tool_name, old.summary, old.content, old.tags);
+        INSERT INTO tool_artifacts_fts(rowid, tool_name, summary, content, tags)
+        VALUES (new.id, new.tool_name, new.summary, new.content, new.tags);
+      END;
+    `);
+
     // Memory extractions table for transparency
     this.conn.exec(`
       CREATE TABLE IF NOT EXISTS memory_extractions (
@@ -496,6 +596,89 @@ export class MemoryStore {
         PRIMARY KEY (job_name, started_at)
       );
       CREATE INDEX IF NOT EXISTS idx_graded_runs_job ON graded_runs(job_name, started_at DESC);
+    `);
+
+    // ── Brain / Ingestion ─────────────────────────────────────────────
+    // Extends chunks with external provenance so ingested content
+    // (CSV rows, PDFs, emails, API responses) can be upserted by stable
+    // upstream id instead of vault path. Every existing search tool sees
+    // ingested content for free — this is NOT a parallel store.
+    try {
+      this.conn.exec('ALTER TABLE chunks ADD COLUMN source_slug TEXT DEFAULT NULL');
+    } catch { /* already exists */ }
+    try {
+      this.conn.exec('ALTER TABLE chunks ADD COLUMN external_id TEXT DEFAULT NULL');
+    } catch { /* already exists */ }
+    try {
+      this.conn.exec('ALTER TABLE chunks ADD COLUMN source_type TEXT DEFAULT NULL');
+    } catch { /* already exists */ }
+    try {
+      this.conn.exec('ALTER TABLE chunks ADD COLUMN last_synced_at TEXT DEFAULT NULL');
+    } catch { /* already exists */ }
+    try {
+      this.conn.exec('CREATE INDEX idx_chunks_source_external ON chunks(source_slug, external_id)');
+    } catch { /* already exists */ }
+
+    // Source registry — declarative external data sources
+    this.conn.exec(`
+      CREATE TABLE IF NOT EXISTS sources (
+        slug TEXT PRIMARY KEY,
+        kind TEXT NOT NULL,
+        adapter TEXT NOT NULL,
+        config_json TEXT NOT NULL DEFAULT '{}',
+        credential_ref TEXT,
+        schedule_cron TEXT,
+        target_folder TEXT,
+        agent_slug TEXT,
+        intelligence TEXT NOT NULL DEFAULT 'auto',
+        enabled INTEGER NOT NULL DEFAULT 1,
+        last_run_at TEXT,
+        last_status TEXT,
+        created_at TEXT DEFAULT (datetime('now')),
+        updated_at TEXT DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_sources_kind ON sources(kind);
+      CREATE INDEX IF NOT EXISTS idx_sources_enabled ON sources(enabled);
+    `);
+
+    // Ingestion runs — per-run audit trail
+    this.conn.exec(`
+      CREATE TABLE IF NOT EXISTS ingestion_runs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        source_slug TEXT NOT NULL,
+        started_at TEXT NOT NULL DEFAULT (datetime('now')),
+        finished_at TEXT,
+        records_in INTEGER NOT NULL DEFAULT 0,
+        records_written INTEGER NOT NULL DEFAULT 0,
+        records_skipped INTEGER NOT NULL DEFAULT 0,
+        records_failed INTEGER NOT NULL DEFAULT 0,
+        overview_note_path TEXT,
+        errors_json TEXT,
+        status TEXT NOT NULL DEFAULT 'running'
+      );
+      CREATE INDEX IF NOT EXISTS idx_ingestion_runs_source ON ingestion_runs(source_slug, started_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_ingestion_runs_status ON ingestion_runs(status);
+    `);
+
+    // Ingested rows — structured overlay on chunks for SQL aggregates.
+    // chunk_id FK makes this an INDEX on top of chunks, not a silo.
+    // Per-source dynamic columns are added via ALTER TABLE during
+    // schema-infer (e.g. amount REAL, customer_id TEXT).
+    this.conn.exec(`
+      CREATE TABLE IF NOT EXISTS ingested_rows (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        source_slug TEXT NOT NULL,
+        external_id TEXT NOT NULL,
+        chunk_id INTEGER,
+        artifact_id INTEGER,
+        row_json TEXT NOT NULL,
+        ingested_at TEXT DEFAULT (datetime('now'))
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_ingested_rows_key
+        ON ingested_rows(source_slug, external_id);
+      CREATE INDEX IF NOT EXISTS idx_ingested_rows_chunk ON ingested_rows(chunk_id);
+      CREATE INDEX IF NOT EXISTS idx_ingested_rows_ingested
+        ON ingested_rows(ingested_at DESC);
     `);
   }
 
@@ -791,7 +974,7 @@ export class MemoryStore {
 
     try {
       let sql = `SELECT c.id, c.source_file, c.section, c.content, c.chunk_type,
-                  c.updated_at, c.salience, c.agent_slug, c.category, c.topic,
+                  c.updated_at, c.salience, c.last_outcome_score, c.agent_slug, c.category, c.topic,
                   bm25(chunks_fts) as score
            FROM chunks_fts f
            JOIN chunks c ON c.id = f.rowid
@@ -822,6 +1005,7 @@ export class MemoryStore {
         chunk_type: string;
         updated_at: string | null;
         salience: number | null;
+        last_outcome_score: number | null;
         agent_slug: string | null;
         category: string | null;
         topic: string | null;
@@ -838,6 +1022,7 @@ export class MemoryStore {
         lastUpdated: row.updated_at ?? '',
         chunkId: row.id,
         salience: row.salience ?? 0,
+        lastOutcomeScore: row.last_outcome_score ?? 0,
         agentSlug: row.agent_slug ?? null,
         category: row.category,
         topic: row.topic,
@@ -866,6 +1051,7 @@ export class MemoryStore {
       chunk_type: string;
       updated_at: string | null;
       salience: number | null;
+      last_outcome_score: number | null;
       agent_slug: string | null;
       category: string | null;
       topic: string | null;
@@ -890,6 +1076,7 @@ export class MemoryStore {
         lastUpdated: row.updated_at ?? '',
         chunkId: row.id,
         salience: row.salience ?? 0,
+        lastOutcomeScore: row.last_outcome_score ?? 0,
         agentSlug: row.agent_slug ?? null,
         category: row.category,
         topic: row.topic,
@@ -914,7 +1101,7 @@ export class MemoryStore {
         // Hard isolation: own chunks + global in one query
         const rows = this.conn.prepare(
           `SELECT id, source_file, section, content, chunk_type,
-                  updated_at, salience, agent_slug, category, topic
+                  updated_at, salience, last_outcome_score, agent_slug, category, topic
            FROM chunks
            WHERE (agent_slug = ? OR agent_slug IS NULL)${filterSql}
            ORDER BY updated_at DESC LIMIT ?`,
@@ -925,14 +1112,14 @@ export class MemoryStore {
       // Soft isolation: weighted mix — 60% agent, 40% global
       const agentRows = this.conn.prepare(
         `SELECT id, source_file, section, content, chunk_type,
-                updated_at, salience, agent_slug, category, topic
+                updated_at, salience, last_outcome_score, agent_slug, category, topic
          FROM chunks WHERE agent_slug = ?${filterSql}
          ORDER BY updated_at DESC LIMIT ?`,
       ).all(agentSlug, ...filterParams, Math.ceil(limit * 0.6)) as ChunkRow[];
 
       const globalRows = this.conn.prepare(
         `SELECT id, source_file, section, content, chunk_type,
-                updated_at, salience, agent_slug, category, topic
+                updated_at, salience, last_outcome_score, agent_slug, category, topic
          FROM chunks WHERE agent_slug IS NULL${filterSql}
          ORDER BY updated_at DESC LIMIT ?`,
       ).all(...filterParams, Math.ceil(limit * 0.4)) as ChunkRow[];
@@ -943,7 +1130,7 @@ export class MemoryStore {
     const rows = this.conn
       .prepare(
         `SELECT id, source_file, section, content, chunk_type,
-                updated_at, salience, agent_slug, category, topic
+                updated_at, salience, last_outcome_score, agent_slug, category, topic
          FROM chunks
          WHERE 1=1${filterSql}
          ORDER BY updated_at DESC
@@ -998,6 +1185,14 @@ export class MemoryStore {
       if (r.salience > 0) {
         r.score *= 1.0 + r.salience;
       }
+      // Outcome-driven adjustment: chunks that recently got cited in
+      // responses get a small boost; chunks that were pulled in and
+      // ignored get a small penalty. Bounded to ±30% so outcome noise
+      // can't dominate ranking.
+      const outcome = r.lastOutcomeScore ?? 0;
+      if (outcome !== 0) {
+        r.score *= 1.0 + 0.3 * outcome;
+      }
     }
 
     // Soft-isolation: apply agent affinity boost when not strict
@@ -1039,7 +1234,7 @@ export class MemoryStore {
     // rows we'd immediately reject. Soft isolation (non-strict) still loads
     // all embeddings because the boost is applied post-scoring, but at
     // least strict mode no longer scans foreign-agent chunks.
-    let sql = 'SELECT id, source_file, section, content, chunk_type, embedding, salience, agent_slug, updated_at, category, topic FROM chunks WHERE embedding IS NOT NULL';
+    let sql = 'SELECT id, source_file, section, content, chunk_type, embedding, salience, last_outcome_score, agent_slug, updated_at, category, topic FROM chunks WHERE embedding IS NOT NULL';
     const params: Array<string | number> = [];
     if (strict && agentSlug) {
       sql += ' AND (agent_slug IS NULL OR agent_slug = ?)';
@@ -1053,6 +1248,7 @@ export class MemoryStore {
       chunk_type: string;
       embedding: Buffer;
       salience: number;
+      last_outcome_score: number | null;
       agent_slug: string | null;
       updated_at: string;
       category: string | null;
@@ -1068,6 +1264,8 @@ export class MemoryStore {
 
         let score = sim * 10; // scale to comparable range with FTS scores
         if (row.salience > 0) score *= (1.0 + row.salience);
+        const outcome = row.last_outcome_score ?? 0;
+        if (outcome !== 0) score *= 1.0 + 0.3 * outcome;
         // Soft isolation: apply boost (only when not strict)
         if (!strict && agentSlug && row.agent_slug === agentSlug) score *= 1.4;
 
@@ -1081,6 +1279,7 @@ export class MemoryStore {
           lastUpdated: row.updated_at,
           chunkId: row.id,
           salience: row.salience,
+          lastOutcomeScore: outcome,
           agentSlug: row.agent_slug ?? undefined,
           category: row.category,
           topic: row.topic,
@@ -1392,6 +1591,618 @@ export class MemoryStore {
     this.conn
       .prepare('UPDATE chunks SET salience = ? WHERE id = ?')
       .run(salience, chunkId);
+  }
+
+  // ── Outcome-Driven Salience ────────────────────────────────────
+
+  /**
+   * Record whether retrieved chunks were actually referenced in the
+   * assistant's response. Updates `last_outcome_score` as an exponential
+   * moving average in [-1, 1]: chunks that keep getting cited drift toward
+   * +1 (search boost), chunks that keep getting retrieved-and-ignored drift
+   * toward -1 (search penalty).
+   *
+   * Ranking applies this as a bounded ±30% multiplier so it influences but
+   * can't dominate salience + BM25 + vector score.
+   */
+  recordOutcome(
+    outcomes: Array<{ chunkId: number; referenced: boolean }>,
+    sessionKey?: string | null,
+  ): void {
+    if (outcomes.length === 0) return;
+
+    const alpha = 0.3; // EMA weight on the new observation
+
+    const logStmt = this.conn.prepare(
+      'INSERT INTO outcomes (chunk_id, session_key, referenced) VALUES (?, ?, ?)',
+    );
+    const readStmt = this.conn.prepare(
+      'SELECT last_outcome_score FROM chunks WHERE id = ?',
+    );
+    const writeStmt = this.conn.prepare(
+      'UPDATE chunks SET last_outcome_score = ? WHERE id = ?',
+    );
+
+    const tx = this.conn.transaction((rows: Array<{ chunkId: number; referenced: boolean }>) => {
+      for (const o of rows) {
+        try {
+          logStmt.run(o.chunkId, sessionKey ?? null, o.referenced ? 1 : 0);
+          const cur = readStmt.get(o.chunkId) as { last_outcome_score: number | null } | undefined;
+          const prev = cur?.last_outcome_score ?? 0;
+          const observation = o.referenced ? 1 : -1;
+          let next = alpha * observation + (1 - alpha) * prev;
+          if (next > 1) next = 1;
+          if (next < -1) next = -1;
+          writeStmt.run(next, o.chunkId);
+        } catch {
+          // Non-fatal; keep going
+        }
+      }
+    });
+
+    try {
+      tx(outcomes);
+    } catch {
+      // Non-fatal
+    }
+  }
+
+  // ── SDK Session Store Sidecar ───────────────────────────────────
+
+  /**
+   * Idempotent append for a batch of SDK session transcript entries.
+   * Entries with a uuid are upserted on (session_id, subpath, uuid);
+   * entries without a uuid always insert.
+   */
+  appendSessionEntries(
+    sessionId: string,
+    projectKey: string,
+    subpath: string,
+    entries: Array<{ type: string; uuid?: string; [k: string]: unknown }>,
+  ): void {
+    if (entries.length === 0) return;
+
+    // Partial unique index on (session_id, subpath, uuid) WHERE uuid IS NOT NULL
+    // can't be named in ON CONFLICT, so use OR IGNORE to let the index enforce
+    // idempotency silently on duplicate uuid.
+    const insertWithUuid = this.conn.prepare(
+      `INSERT OR IGNORE INTO sdk_session_entries (session_id, project_key, subpath, uuid, type, entry_json)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    );
+    const insertNoUuid = this.conn.prepare(
+      `INSERT INTO sdk_session_entries (session_id, project_key, subpath, uuid, type, entry_json)
+       VALUES (?, ?, ?, NULL, ?, ?)`,
+    );
+
+    const tx = this.conn.transaction((rows: typeof entries) => {
+      for (const e of rows) {
+        const json = JSON.stringify(e);
+        if (typeof e.uuid === 'string' && e.uuid.length > 0) {
+          insertWithUuid.run(sessionId, projectKey, subpath, e.uuid, e.type, json);
+        } else {
+          insertNoUuid.run(sessionId, projectKey, subpath, e.type, json);
+        }
+      }
+    });
+    tx(entries);
+  }
+
+  /**
+   * Load all entries for a session/subpath in insertion order.
+   * Returns null if the key was never written, so the SDK can distinguish
+   * "no-op resume" from "empty session".
+   */
+  loadSessionEntries(
+    sessionId: string,
+    subpath: string,
+  ): Array<Record<string, unknown>> | null {
+    const rows = this.conn
+      .prepare(
+        `SELECT entry_json FROM sdk_session_entries
+         WHERE session_id = ? AND subpath = ?
+         ORDER BY id ASC`,
+      )
+      .all(sessionId, subpath) as Array<{ entry_json: string }>;
+
+    if (rows.length === 0) {
+      // Distinguish never-written from emptied by checking if we've ever
+      // seen this session_id at all (any subpath).
+      const any = this.conn
+        .prepare('SELECT 1 FROM sdk_session_entries WHERE session_id = ? LIMIT 1')
+        .get(sessionId);
+      if (!any) return null;
+      return [];
+    }
+
+    const out: Array<Record<string, unknown>> = [];
+    for (const r of rows) {
+      try {
+        out.push(JSON.parse(r.entry_json));
+      } catch { /* skip malformed — shouldn't happen */ }
+    }
+    return out;
+  }
+
+  /**
+   * List sessions under a project, newest first. Uses the summary sidecar
+   * when present; falls back to distinct session ids from the entries table.
+   */
+  listSdkSessions(projectKey: string): Array<{ sessionId: string; mtime: number }> {
+    const rows = this.conn
+      .prepare(
+        `SELECT DISTINCT session_id,
+                (strftime('%s', MAX(created_at)) * 1000) as mtime
+         FROM sdk_session_entries
+         WHERE project_key = ? AND subpath = ''
+         GROUP BY session_id
+         ORDER BY mtime DESC`,
+      )
+      .all(projectKey) as Array<{ session_id: string; mtime: number }>;
+    return rows.map(r => ({ sessionId: r.session_id, mtime: r.mtime }));
+  }
+
+  /** Delete all entries (and summary) for a session across all subpaths. */
+  deleteSdkSession(sessionId: string): void {
+    const tx = this.conn.transaction(() => {
+      this.conn.prepare('DELETE FROM sdk_session_entries WHERE session_id = ?').run(sessionId);
+      this.conn.prepare('DELETE FROM sdk_session_summaries WHERE session_id = ?').run(sessionId);
+    });
+    tx();
+  }
+
+  /** List subpath keys recorded for a session — used to discover subagent transcripts. */
+  listSdkSessionSubkeys(sessionId: string): string[] {
+    const rows = this.conn
+      .prepare(
+        `SELECT DISTINCT subpath FROM sdk_session_entries
+         WHERE session_id = ? AND subpath <> ''`,
+      )
+      .all(sessionId) as Array<{ subpath: string }>;
+    return rows.map(r => r.subpath);
+  }
+
+  /** Upsert an SDK-provided session summary sidecar. Opaque data blob. */
+  upsertSessionSummary(
+    sessionId: string,
+    subpath: string,
+    projectKey: string,
+    mtime: number,
+    data: Record<string, unknown>,
+  ): void {
+    this.conn
+      .prepare(
+        `INSERT INTO sdk_session_summaries (session_id, subpath, project_key, mtime, data_json)
+         VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(session_id, subpath) DO UPDATE SET
+           project_key = excluded.project_key,
+           mtime = excluded.mtime,
+           data_json = excluded.data_json`,
+      )
+      .run(sessionId, subpath, projectKey, mtime, JSON.stringify(data));
+  }
+
+  listSdkSessionSummaries(projectKey: string): Array<{
+    sessionId: string;
+    subpath: string;
+    mtime: number;
+    data: Record<string, unknown>;
+  }> {
+    const rows = this.conn
+      .prepare(
+        `SELECT session_id, subpath, mtime, data_json FROM sdk_session_summaries
+         WHERE project_key = ? ORDER BY mtime DESC`,
+      )
+      .all(projectKey) as Array<{
+      session_id: string; subpath: string; mtime: number; data_json: string;
+    }>;
+    return rows.map(r => {
+      let data: Record<string, unknown> = {};
+      try { data = JSON.parse(r.data_json); } catch { /* keep empty */ }
+      return { sessionId: r.session_id, subpath: r.subpath, mtime: r.mtime, data };
+    });
+  }
+
+  // ── Artifact Memory ─────────────────────────────────────────────
+
+  /**
+   * Persist a tool output (or any blob the agent wants to remember) so
+   * later turns can recall it without re-running the tool.
+   */
+  storeArtifact(input: {
+    toolName: string;
+    summary: string;
+    content: string;
+    tags?: string;
+    sessionKey?: string | null;
+    agentSlug?: string | null;
+  }): number {
+    const stmt = this.conn.prepare(
+      `INSERT INTO tool_artifacts (session_key, agent_slug, tool_name, summary, content, tags)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    );
+    const info = stmt.run(
+      input.sessionKey ?? null,
+      input.agentSlug ?? null,
+      input.toolName,
+      input.summary,
+      input.content,
+      input.tags ?? '',
+    );
+    return info.lastInsertRowid as number;
+  }
+
+  /**
+   * Search artifacts via FTS over summary + content + tool_name + tags.
+   * Returns metadata only — use getArtifact(id) to pull the full blob.
+   */
+  searchArtifacts(opts: {
+    query?: string;
+    limit?: number;
+    sessionKey?: string | null;
+    agentSlug?: string | null;
+  } = {}): Array<{
+    id: number;
+    toolName: string;
+    summary: string;
+    tags: string;
+    storedAt: string;
+    sessionKey: string | null;
+    agentSlug: string | null;
+    accessCount: number;
+  }> {
+    const limit = opts.limit ?? 10;
+
+    // Build rows via FTS if a query is given, otherwise fall back to
+    // recency ordering on the base table.
+    if (opts.query && opts.query.trim()) {
+      const sanitized = MemoryStore.sanitizeFtsQuery(opts.query);
+      if (sanitized) {
+        let sql = `SELECT a.id, a.tool_name, a.summary, a.tags, a.stored_at,
+                          a.session_key, a.agent_slug, a.access_count
+                   FROM tool_artifacts_fts f
+                   JOIN tool_artifacts a ON a.id = f.rowid
+                   WHERE tool_artifacts_fts MATCH ?`;
+        const params: any[] = [sanitized];
+        if (opts.sessionKey) { sql += ' AND a.session_key = ?'; params.push(opts.sessionKey); }
+        if (opts.agentSlug) { sql += ' AND a.agent_slug = ?'; params.push(opts.agentSlug); }
+        sql += ' ORDER BY bm25(tool_artifacts_fts) LIMIT ?';
+        params.push(limit);
+        try {
+          const rows = this.conn.prepare(sql).all(...params) as Array<{
+            id: number; tool_name: string; summary: string; tags: string;
+            stored_at: string; session_key: string | null; agent_slug: string | null;
+            access_count: number;
+          }>;
+          return rows.map((r) => ({
+            id: r.id, toolName: r.tool_name, summary: r.summary, tags: r.tags,
+            storedAt: r.stored_at, sessionKey: r.session_key, agentSlug: r.agent_slug,
+            accessCount: r.access_count,
+          }));
+        } catch {
+          // Fall through to recency-only if FTS errors
+        }
+      }
+    }
+
+    let sql = `SELECT id, tool_name, summary, tags, stored_at,
+                      session_key, agent_slug, access_count
+               FROM tool_artifacts WHERE 1=1`;
+    const params: any[] = [];
+    if (opts.sessionKey) { sql += ' AND session_key = ?'; params.push(opts.sessionKey); }
+    if (opts.agentSlug) { sql += ' AND agent_slug = ?'; params.push(opts.agentSlug); }
+    // stored_at is second-precision; tiebreak on id DESC so same-second
+    // inserts still come back in insertion order (newest first).
+    sql += ' ORDER BY stored_at DESC, id DESC LIMIT ?';
+    params.push(limit);
+    const rows = this.conn.prepare(sql).all(...params) as Array<{
+      id: number; tool_name: string; summary: string; tags: string;
+      stored_at: string; session_key: string | null; agent_slug: string | null;
+      access_count: number;
+    }>;
+    return rows.map((r) => ({
+      id: r.id, toolName: r.tool_name, summary: r.summary, tags: r.tags,
+      storedAt: r.stored_at, sessionKey: r.session_key, agentSlug: r.agent_slug,
+      accessCount: r.access_count,
+    }));
+  }
+
+  /**
+   * Fetch a single artifact with full content. Bumps access_count and
+   * last_accessed_at so recency-based pruning can keep the useful ones.
+   */
+  getArtifact(id: number): {
+    id: number;
+    toolName: string;
+    summary: string;
+    content: string;
+    tags: string;
+    storedAt: string;
+    sessionKey: string | null;
+    agentSlug: string | null;
+    accessCount: number;
+  } | null {
+    const row = this.conn
+      .prepare(
+        `SELECT id, session_key, agent_slug, tool_name, summary, content, tags,
+                stored_at, access_count
+         FROM tool_artifacts WHERE id = ?`,
+      )
+      .get(id) as
+      | {
+          id: number; session_key: string | null; agent_slug: string | null;
+          tool_name: string; summary: string; content: string; tags: string;
+          stored_at: string; access_count: number;
+        }
+      | undefined;
+
+    if (!row) return null;
+
+    try {
+      this.conn
+        .prepare(
+          `UPDATE tool_artifacts
+           SET access_count = access_count + 1, last_accessed_at = datetime('now')
+           WHERE id = ?`,
+        )
+        .run(id);
+    } catch { /* non-fatal */ }
+
+    return {
+      id: row.id,
+      toolName: row.tool_name,
+      summary: row.summary,
+      content: row.content,
+      tags: row.tags,
+      storedAt: row.stored_at,
+      sessionKey: row.session_key,
+      agentSlug: row.agent_slug,
+      accessCount: row.access_count + 1,
+    };
+  }
+
+  // ── Brain / Ingestion helpers ─────────────────────────────────────
+  //
+  // All of these operate on tables that EXTEND the existing memory
+  // system: `chunks` gains four columns for external provenance, and
+  // three new tables (sources, ingestion_runs, ingested_rows) reference
+  // chunks via FK — they are an overlay, not a parallel store.
+
+  /** Register or update a declarative source. */
+  upsertSource(input: {
+    slug: string;
+    kind: string;
+    adapter: string;
+    configJson?: string;
+    credentialRef?: string | null;
+    scheduleCron?: string | null;
+    targetFolder?: string | null;
+    agentSlug?: string | null;
+    intelligence?: string;
+    enabled?: boolean;
+  }): void {
+    this.conn
+      .prepare(
+        `INSERT INTO sources (slug, kind, adapter, config_json, credential_ref, schedule_cron,
+                              target_folder, agent_slug, intelligence, enabled, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+         ON CONFLICT(slug) DO UPDATE SET
+           kind=excluded.kind, adapter=excluded.adapter, config_json=excluded.config_json,
+           credential_ref=excluded.credential_ref, schedule_cron=excluded.schedule_cron,
+           target_folder=excluded.target_folder, agent_slug=excluded.agent_slug,
+           intelligence=excluded.intelligence, enabled=excluded.enabled,
+           updated_at=datetime('now')`,
+      )
+      .run(
+        input.slug,
+        input.kind,
+        input.adapter,
+        input.configJson ?? '{}',
+        input.credentialRef ?? null,
+        input.scheduleCron ?? null,
+        input.targetFolder ?? null,
+        input.agentSlug ?? null,
+        input.intelligence ?? 'auto',
+        input.enabled === false ? 0 : 1,
+      );
+  }
+
+  getSource(slug: string): {
+    slug: string; kind: string; adapter: string; configJson: string;
+    credentialRef: string | null; scheduleCron: string | null;
+    targetFolder: string | null; agentSlug: string | null;
+    intelligence: string; enabled: boolean;
+    lastRunAt: string | null; lastStatus: string | null;
+    createdAt: string; updatedAt: string;
+  } | null {
+    const row = this.conn
+      .prepare(
+        `SELECT slug, kind, adapter, config_json, credential_ref, schedule_cron,
+                target_folder, agent_slug, intelligence, enabled, last_run_at,
+                last_status, created_at, updated_at
+         FROM sources WHERE slug = ?`,
+      )
+      .get(slug) as any;
+    if (!row) return null;
+    return {
+      slug: row.slug, kind: row.kind, adapter: row.adapter, configJson: row.config_json,
+      credentialRef: row.credential_ref, scheduleCron: row.schedule_cron,
+      targetFolder: row.target_folder, agentSlug: row.agent_slug,
+      intelligence: row.intelligence, enabled: !!row.enabled,
+      lastRunAt: row.last_run_at, lastStatus: row.last_status,
+      createdAt: row.created_at, updatedAt: row.updated_at,
+    };
+  }
+
+  listSources(filter: { enabled?: boolean; kind?: string } = {}): Array<ReturnType<MemoryStore['getSource']>> {
+    let sql = `SELECT slug FROM sources WHERE 1=1`;
+    const params: any[] = [];
+    if (filter.enabled !== undefined) { sql += ' AND enabled = ?'; params.push(filter.enabled ? 1 : 0); }
+    if (filter.kind) { sql += ' AND kind = ?'; params.push(filter.kind); }
+    sql += ' ORDER BY slug';
+    const slugs = (this.conn.prepare(sql).all(...params) as Array<{ slug: string }>).map((r) => r.slug);
+    return slugs.map((s) => this.getSource(s));
+  }
+
+  deleteSource(slug: string): void {
+    this.conn.prepare(`DELETE FROM sources WHERE slug = ?`).run(slug);
+  }
+
+  markSourceRun(slug: string, status: 'ok' | 'error' | 'partial'): void {
+    this.conn
+      .prepare(`UPDATE sources SET last_run_at = datetime('now'), last_status = ? WHERE slug = ?`)
+      .run(status, slug);
+  }
+
+  /** Create an ingestion_runs row in 'running' state. Returns the new run id. */
+  createIngestionRun(sourceSlug: string): number {
+    const info = this.conn
+      .prepare(`INSERT INTO ingestion_runs (source_slug) VALUES (?)`)
+      .run(sourceSlug);
+    return info.lastInsertRowid as number;
+  }
+
+  updateIngestionRun(id: number, patch: {
+    recordsIn?: number;
+    recordsWritten?: number;
+    recordsSkipped?: number;
+    recordsFailed?: number;
+    overviewNotePath?: string | null;
+    errorsJson?: string | null;
+    status?: 'running' | 'ok' | 'error' | 'partial';
+    finished?: boolean;
+  }): void {
+    const sets: string[] = [];
+    const params: any[] = [];
+    if (patch.recordsIn !== undefined) { sets.push('records_in = ?'); params.push(patch.recordsIn); }
+    if (patch.recordsWritten !== undefined) { sets.push('records_written = ?'); params.push(patch.recordsWritten); }
+    if (patch.recordsSkipped !== undefined) { sets.push('records_skipped = ?'); params.push(patch.recordsSkipped); }
+    if (patch.recordsFailed !== undefined) { sets.push('records_failed = ?'); params.push(patch.recordsFailed); }
+    if (patch.overviewNotePath !== undefined) { sets.push('overview_note_path = ?'); params.push(patch.overviewNotePath); }
+    if (patch.errorsJson !== undefined) { sets.push('errors_json = ?'); params.push(patch.errorsJson); }
+    if (patch.status !== undefined) { sets.push('status = ?'); params.push(patch.status); }
+    if (patch.finished) { sets.push(`finished_at = datetime('now')`); }
+    if (sets.length === 0) return;
+    params.push(id);
+    this.conn.prepare(`UPDATE ingestion_runs SET ${sets.join(', ')} WHERE id = ?`).run(...params);
+  }
+
+  listIngestionRuns(sourceSlug?: string, limit = 50): Array<{
+    id: number; sourceSlug: string; startedAt: string; finishedAt: string | null;
+    recordsIn: number; recordsWritten: number; recordsSkipped: number; recordsFailed: number;
+    overviewNotePath: string | null; errorsJson: string | null; status: string;
+  }> {
+    let sql = `SELECT id, source_slug, started_at, finished_at, records_in, records_written,
+                      records_skipped, records_failed, overview_note_path, errors_json, status
+               FROM ingestion_runs`;
+    const params: any[] = [];
+    if (sourceSlug) { sql += ` WHERE source_slug = ?`; params.push(sourceSlug); }
+    sql += ` ORDER BY started_at DESC LIMIT ?`;
+    params.push(limit);
+    const rows = this.conn.prepare(sql).all(...params) as any[];
+    return rows.map((r) => ({
+      id: r.id, sourceSlug: r.source_slug, startedAt: r.started_at, finishedAt: r.finished_at,
+      recordsIn: r.records_in, recordsWritten: r.records_written,
+      recordsSkipped: r.records_skipped, recordsFailed: r.records_failed,
+      overviewNotePath: r.overview_note_path, errorsJson: r.errors_json, status: r.status,
+    }));
+  }
+
+  /** Find a chunk previously written for (sourceSlug, externalId) so the pipeline can upsert. */
+  findChunkByExternalId(sourceSlug: string, externalId: string): {
+    id: number; sourceFile: string; contentHash: string;
+  } | null {
+    const row = this.conn
+      .prepare(
+        `SELECT id, source_file, content_hash FROM chunks
+         WHERE source_slug = ? AND external_id = ? LIMIT 1`,
+      )
+      .get(sourceSlug, externalId) as any;
+    if (!row) return null;
+    return { id: row.id, sourceFile: row.source_file, contentHash: row.content_hash };
+  }
+
+  /** Tag all chunks from a vault file with ingestion provenance (called after updateFile). */
+  tagChunksForSource(relPath: string, meta: {
+    sourceSlug: string; externalId: string; sourceType: string; lastSyncedAt?: string;
+  }): void {
+    this.conn
+      .prepare(
+        `UPDATE chunks
+         SET source_slug = ?, external_id = ?, source_type = ?, last_synced_at = COALESCE(?, datetime('now'))
+         WHERE source_file = ?`,
+      )
+      .run(meta.sourceSlug, meta.externalId, meta.sourceType, meta.lastSyncedAt ?? null, relPath);
+  }
+
+  /** Insert (or replace) a structured row overlay for SQL aggregate queries. */
+  insertIngestedRow(input: {
+    sourceSlug: string;
+    externalId: string;
+    chunkId?: number | null;
+    artifactId?: number | null;
+    rowJson: string;
+    structuredColumns?: Record<string, string | number | null>;
+  }): number {
+    const info = this.conn
+      .prepare(
+        `INSERT INTO ingested_rows (source_slug, external_id, chunk_id, artifact_id, row_json)
+         VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(source_slug, external_id) DO UPDATE SET
+           chunk_id = excluded.chunk_id, artifact_id = excluded.artifact_id,
+           row_json = excluded.row_json, ingested_at = datetime('now')`,
+      )
+      .run(
+        input.sourceSlug,
+        input.externalId,
+        input.chunkId ?? null,
+        input.artifactId ?? null,
+        input.rowJson,
+      );
+    const id = (info.lastInsertRowid as number) || this.conn
+      .prepare(`SELECT id FROM ingested_rows WHERE source_slug = ? AND external_id = ?`)
+      .get(input.sourceSlug, input.externalId) as any;
+    const rowId = typeof id === 'number' ? id : id.id;
+    // Apply per-source dynamic columns (populated after schema-infer ALTER TABLEs)
+    if (input.structuredColumns) {
+      for (const [col, val] of Object.entries(input.structuredColumns)) {
+        if (!/^[a-z][a-z0-9_]*$/i.test(col)) continue;
+        try {
+          this.conn.prepare(`UPDATE ingested_rows SET ${col} = ? WHERE id = ?`).run(val, rowId);
+        } catch { /* column doesn't exist yet — schema-infer hasn't added it */ }
+      }
+    }
+    return rowId;
+  }
+
+  /** Declare a per-source structured column (idempotent). Called once during schema-infer. */
+  ensureIngestedRowColumn(column: string, sqlType: 'TEXT' | 'REAL' | 'INTEGER'): void {
+    if (!/^[a-z][a-z0-9_]*$/i.test(column)) return;
+    try {
+      this.conn.exec(`ALTER TABLE ingested_rows ADD COLUMN ${column} ${sqlType}`);
+    } catch { /* already exists */ }
+  }
+
+  /**
+   * Read-only SQL query over ingested_rows. Intended for agent-facing
+   * brain_query tool; caller must pass a SELECT statement (no writes).
+   * A defensive LIMIT is appended if none present.
+   */
+  queryIngestedRows(sql: string, params: unknown[] = [], hardLimit = 500): unknown[] {
+    const trimmed = sql.trim();
+    if (!/^select\b/i.test(trimmed)) {
+      throw new Error('queryIngestedRows only accepts SELECT statements');
+    }
+    const hasLimit = /\blimit\b/i.test(trimmed);
+    const final = hasLimit ? trimmed : `${trimmed} LIMIT ${hardLimit}`;
+    return this.conn.prepare(final).all(...params);
+  }
+
+  /** Columns present on ingested_rows (for schema discovery by agents). */
+  ingestedRowColumns(): string[] {
+    const rows = this.conn
+      .prepare(`PRAGMA table_info(ingested_rows)`)
+      .all() as Array<{ name: string }>;
+    return rows.map((r) => r.name);
   }
 
   // ── Decay & Pruning ─────────────────────────────────────────────

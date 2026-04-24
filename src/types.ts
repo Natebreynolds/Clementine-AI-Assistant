@@ -14,6 +14,7 @@ export interface SearchResult {
   lastUpdated: string;
   chunkId: number;
   salience: number;
+  lastOutcomeScore?: number;
   agentSlug?: string | null;
   category?: string | null;
   topic?: string | null;
@@ -849,6 +850,107 @@ export interface SfFieldMapping {
   localField: string;
   sfField: string;
   direction: 'bidirectional' | 'push-only' | 'pull-only';
+}
+
+// ── Brain / Ingestion ────────────────────────────────────────────────
+
+/** Supported v1 ingest formats detected by format-detector. */
+export type DetectedFormat =
+  | 'csv' | 'json' | 'jsonl' | 'markdown' | 'pdf' | 'email' | 'docx' | 'unknown';
+
+/** Operational mode for a source. */
+export type SourceKind = 'seed' | 'poll' | 'webhook';
+
+/** How per-record intelligence runs. `auto` = tiered (template for structured, LLM for free-form). */
+export type IntelligenceMode = 'auto' | 'template-only' | 'llm-per-record';
+
+/** A declarative external data source registered in the brain. */
+export interface Source {
+  slug: string;
+  kind: SourceKind;
+  adapter: DetectedFormat | 'rest' | 'webhook';
+  configJson: string;              // adapter-specific config (endpoint, headers, mapping, etc.)
+  credentialRef?: string | null;   // key into ~/.clementine/credentials.json
+  scheduleCron?: string | null;    // for kind='poll'
+  targetFolder?: string | null;    // vault folder for distilled notes
+  agentSlug?: string | null;       // NULL = global brain (default)
+  intelligence: IntelligenceMode;
+  enabled: boolean;
+  lastRunAt?: string | null;
+  lastStatus?: 'ok' | 'error' | 'partial' | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** Audit record for one ingestion run. */
+export interface IngestionRun {
+  id?: number;
+  sourceSlug: string;
+  startedAt: string;
+  finishedAt?: string | null;
+  recordsIn: number;
+  recordsWritten: number;
+  recordsSkipped: number;
+  recordsFailed: number;
+  overviewNotePath?: string | null;
+  errorsJson?: string | null;      // JSON array of {record, error}
+  status: 'running' | 'ok' | 'error' | 'partial';
+}
+
+/** Live progress event emitted during an ingestion run. */
+export interface IngestionProgress {
+  runId: number;
+  sourceSlug: string;
+  stage: 'detecting' | 'parsing' | 'distilling' | 'writing' | 'summarizing' | 'done' | 'error';
+  recordsIn: number;
+  recordsWritten: number;
+  recordsSkipped: number;
+  recordsFailed: number;
+  message?: string;
+}
+
+/** A raw record emerging from an adapter before distillation. */
+export interface RawRecord {
+  externalId?: string;             // stable upstream key if available; otherwise derived from content hash
+  content: string;                 // text to chunk/distill (may be one CSV row as JSON, one PDF page, one email body, etc.)
+  rawPayload: string;              // full original payload (JSON/string) for artifact audit
+  metadata?: Record<string, unknown>;  // adapter-specific hints (row_index, pdf_page, email_from, etc.)
+}
+
+/** A fully-processed ingestion record ready for write. */
+export interface IngestedRecord {
+  sourceSlug: string;
+  externalId: string;
+  title: string;
+  summary: string;                 // short distilled summary (feeds batch overview)
+  body: string;                    // full markdown body (may embed summary + details)
+  frontmatter: Record<string, unknown>;
+  tags: string[];
+  targetRelPath: string;           // vault relative path for the note (e.g. '04-Deals/stripe-cus_abc.md')
+  artifactId?: number;
+  rawPayload: string;              // what gets stored as artifact
+  structuredRow?: Record<string, unknown>;  // populated for tabular sources → ingested_rows
+  graphEntities?: Array<{ label: string; id: string; properties?: Record<string, unknown> }>;
+  graphRelationships?: Array<{ from: string; rel: string; to: string; context?: string }>;
+}
+
+/** Manifest returned by format-detector for a seed path (file or folder). */
+export interface DetectedManifest {
+  files: Array<{ path: string; format: DetectedFormat; sizeBytes: number }>;
+  totalFiles: number;
+  formats: Partial<Record<DetectedFormat, number>>;  // counts per format
+  totalBytes: number;
+}
+
+/** Health summary for a source on the dashboard. */
+export interface SourceHealth {
+  slug: string;
+  state: 'green' | 'yellow' | 'red' | 'unknown';
+  lastRunAt?: string | null;
+  lastStatus?: string | null;
+  recentErrorRate: number;         // 0-1 over last 10 runs
+  recentRecords: number;
+  nextRunAt?: string | null;
 }
 
 // ── Utility types ────────────────────────────────────────────────────
