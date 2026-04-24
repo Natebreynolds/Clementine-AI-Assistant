@@ -29,7 +29,19 @@ export function setLLMOverride(fn: LLMCallFn | null): void {
 let client: Anthropic | null = null;
 function getClient(): Anthropic {
   if (!client) {
-    client = new Anthropic({ apiKey: ANTHROPIC_API_KEY || process.env.ANTHROPIC_API_KEY });
+    // Honor the same credential precedence the rest of Clementine uses:
+    // OAuth token > legacy auth token > API key. The Anthropic SDK will
+    // throw "Could not resolve authentication method" if we pass only
+    // apiKey when the user has set an OAuth token instead.
+    const authToken =
+      process.env.CLAUDE_CODE_OAUTH_TOKEN ||
+      process.env.ANTHROPIC_AUTH_TOKEN;
+    const apiKey = ANTHROPIC_API_KEY || process.env.ANTHROPIC_API_KEY;
+    if (authToken) {
+      client = new Anthropic({ authToken });
+    } else {
+      client = new Anthropic({ apiKey });
+    }
   }
   return client;
 }
