@@ -8,6 +8,7 @@
 
 import { execSync } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
+import * as fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -407,3 +408,56 @@ export const STAGING_DIR = path.join(BASE_DIR, 'staging');
 // Takes priority over ANTHROPIC_API_KEY in the SDK subprocess env.
 export const CLAUDE_CODE_OAUTH_TOKEN = getSecret('CLAUDE_CODE_OAUTH_TOKEN');
 export const ANTHROPIC_API_KEY = getSecret('ANTHROPIC_API_KEY');
+
+// ── Brain credentials ────────────────────────────────────────────────
+//
+// User-managed secrets referenced by Brain sources (scheduled REST polls,
+// webhook HMAC secrets). Stored plaintext in ~/.clementine/credentials.json
+// — gitignored, mode 0600 enforced on write. Keychain integration can come
+// later; for now this matches the rest of Clementine's "local-first, single
+// user" model.
+
+export const CREDENTIALS_FILE = path.join(BASE_DIR, 'credentials.json');
+
+let _credentialsCache: Record<string, string> | null = null;
+let _credentialsMtime = 0;
+
+export function getCredential(ref: string): string | null {
+  try {
+    const stat = fs.statSync(CREDENTIALS_FILE);
+    if (stat.mtimeMs !== _credentialsMtime) {
+      const raw = fs.readFileSync(CREDENTIALS_FILE, 'utf-8');
+      _credentialsCache = JSON.parse(raw) as Record<string, string>;
+      _credentialsMtime = stat.mtimeMs;
+    }
+  } catch {
+    // File doesn't exist or is unreadable — fall back to env var
+    _credentialsCache = _credentialsCache ?? {};
+  }
+  const fromFile = _credentialsCache?.[ref];
+  if (fromFile) return fromFile;
+  // Env-var fallback so users can set credentials without the file
+  return process.env[ref] ?? null;
+}
+
+/** Set a credential (creates the file if needed, enforces 0600). */
+export function setCredential(ref: string, value: string): void {
+  let current: Record<string, string> = {};
+  try {
+    const raw = fs.readFileSync(CREDENTIALS_FILE, 'utf-8');
+    current = JSON.parse(raw) as Record<string, string>;
+  } catch { /* new file */ }
+  current[ref] = value;
+  if (!fs.existsSync(BASE_DIR)) fs.mkdirSync(BASE_DIR, { recursive: true });
+  fs.writeFileSync(CREDENTIALS_FILE, JSON.stringify(current, null, 2), { mode: 0o600 });
+  _credentialsCache = current;
+  _credentialsMtime = fs.statSync(CREDENTIALS_FILE).mtimeMs;
+}
+
+/** List known credential refs (not their values) for dashboard display. */
+export function listCredentialRefs(): string[] {
+  try {
+    const raw = fs.readFileSync(CREDENTIALS_FILE, 'utf-8');
+    return Object.keys(JSON.parse(raw) as Record<string, string>);
+  } catch { return []; }
+}

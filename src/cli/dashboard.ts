@@ -2263,6 +2263,77 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
     }
   });
 
+  // Create or update a source (used by dashboard "Add Source" + poll source forms)
+  app.post('/api/brain/sources', async (req, res) => {
+    try {
+      const body = (req.body ?? {}) as {
+        slug?: string; kind?: string; adapter?: string;
+        configJson?: string; scheduleCron?: string | null;
+        targetFolder?: string | null; credentialRef?: string | null;
+        intelligence?: string; enabled?: boolean;
+      };
+      if (!body.slug || !body.kind || !body.adapter) {
+        res.status(400).json({ error: 'slug, kind, and adapter are required' });
+        return;
+      }
+      const { upsertSource, getSource } = await import('../brain/source-registry.js');
+      await upsertSource({
+        slug: body.slug,
+        kind: body.kind as 'seed' | 'poll' | 'webhook',
+        adapter: body.adapter as 'csv' | 'json' | 'jsonl' | 'markdown' | 'pdf' | 'email' | 'docx' | 'rest' | 'webhook',
+        configJson: body.configJson ?? '{}',
+        scheduleCron: body.scheduleCron ?? null,
+        targetFolder: body.targetFolder ?? null,
+        credentialRef: body.credentialRef ?? null,
+        intelligence: (body.intelligence as 'auto' | 'template-only' | 'llm-per-record') ?? 'auto',
+        enabled: body.enabled !== false,
+      });
+      const saved = await getSource(body.slug);
+      res.json({ source: saved });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.delete('/api/brain/sources/:slug', async (req, res) => {
+    try {
+      const { deleteSource } = await import('../brain/source-registry.js');
+      await deleteSource(req.params.slug);
+      res.json({ ok: true });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  // Credential management (refs only — values never leave ~/.clementine/credentials.json)
+  app.get('/api/brain/credentials', async (_req, res) => {
+    try {
+      const { listCredentialRefs } = await import('../config.js');
+      res.json({ refs: listCredentialRefs() });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.post('/api/brain/credentials', async (req, res) => {
+    try {
+      const body = (req.body ?? {}) as { ref?: string; value?: string };
+      if (!body.ref || typeof body.value !== 'string') {
+        res.status(400).json({ error: 'ref and value are required' });
+        return;
+      }
+      if (!/^[a-z0-9_]+$/i.test(body.ref)) {
+        res.status(400).json({ error: 'ref must be alphanumeric + underscores' });
+        return;
+      }
+      const { setCredential } = await import('../config.js');
+      setCredential(body.ref, body.value);
+      res.json({ ok: true });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
   app.get('/api/brain/runs', async (req, res) => {
     try {
       const { getStore } = await import('../tools/shared.js');
@@ -9625,6 +9696,59 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
 
         <!-- Sources -->
         <div class="tab-pane" id="tab-intelligence-sources">
+          <div style="display:flex;gap:8px;margin-bottom:16px;flex-wrap:wrap">
+            <button class="btn-primary" onclick="brainShowPollForm()">+ Scheduled REST poll</button>
+            <button class="btn" onclick="brainShowCredsForm()">🔑 Credentials</button>
+          </div>
+
+          <!-- Poll source form -->
+          <div id="brain-poll-form" class="card" style="display:none;padding:16px;margin-bottom:16px">
+            <div style="font-weight:600;margin-bottom:8px">New scheduled REST source</div>
+            <div style="color:var(--muted);font-size:13px;margin-bottom:12px">
+              Polls an HTTP endpoint on a cron schedule and ingests the response body into the brain. Reference credentials in headers with <code>${"${"}cred_ref${"}"}</code>.
+            </div>
+            <div style="display:grid;grid-template-columns:140px 1fr;gap:8px;align-items:center;font-size:13px">
+              <label>Slug</label>
+              <input type="text" id="brain-poll-slug" placeholder="stripe-customers">
+              <label>URL</label>
+              <input type="text" id="brain-poll-url" placeholder="https://api.example.com/v1/items">
+              <label>Method</label>
+              <select id="brain-poll-method"><option>GET</option><option>POST</option></select>
+              <label>Headers (JSON)</label>
+              <input type="text" id="brain-poll-headers" placeholder='{"Authorization":"Bearer $\{stripe_api_key}"}'>
+              <label>Query params (JSON)</label>
+              <input type="text" id="brain-poll-params" placeholder='{"limit":"100"}'>
+              <label>Records JSON path</label>
+              <input type="text" id="brain-poll-recordspath" placeholder="data">
+              <label>Cron schedule</label>
+              <input type="text" id="brain-poll-cron" placeholder="0 * * * *  (hourly)">
+              <label>Target folder</label>
+              <input type="text" id="brain-poll-folder" placeholder="04-Ingest/stripe">
+            </div>
+            <div style="display:flex;gap:8px;margin-top:12px">
+              <button class="btn-primary" onclick="brainSavePoll()">Save + enable</button>
+              <button class="btn" onclick="brainSavePoll(true)">Save + run once now</button>
+              <button class="btn" onclick="document.getElementById('brain-poll-form').style.display='none'">Cancel</button>
+            </div>
+            <div id="brain-poll-status" style="margin-top:12px"></div>
+          </div>
+
+          <!-- Credentials form -->
+          <div id="brain-creds-form" class="card" style="display:none;padding:16px;margin-bottom:16px">
+            <div style="font-weight:600;margin-bottom:8px">Brain credentials</div>
+            <div style="color:var(--muted);font-size:13px;margin-bottom:12px">
+              Stored in <code>~/.clementine/credentials.json</code> (mode 0600, gitignored). Values never leave this machine. Reference them in source headers as <code>${"${"}ref${"}"}</code>.
+            </div>
+            <div id="brain-creds-list" style="margin-bottom:12px"></div>
+            <div style="display:flex;gap:8px">
+              <input type="text" id="brain-cred-ref" placeholder="e.g. stripe_api_key" style="flex:1">
+              <input type="password" id="brain-cred-val" placeholder="value" style="flex:2">
+              <button class="btn-primary" onclick="brainSaveCred()">Save</button>
+              <button class="btn" onclick="document.getElementById('brain-creds-form').style.display='none'">Close</button>
+            </div>
+            <div id="brain-cred-status" style="margin-top:8px;font-size:13px"></div>
+          </div>
+
           <div id="brain-sources-list"></div>
         </div>
 
@@ -9714,17 +9838,114 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
           const data = await resp.json();
           const el = document.getElementById('brain-sources-list');
           if (!data.sources || !data.sources.length) {
-            el.innerHTML = '<div style="color:var(--muted);padding:20px">No sources yet. Seed your first one in the <a href="#" onclick="switchTab(\\'intelligence\\',\\'seed\\');return false">Seed Upload</a> tab.</div>';
+            el.innerHTML = '<div style="color:var(--muted);padding:20px">No sources yet. Seed a local file/folder in the <a href="#" onclick="switchTab(\\'intelligence\\',\\'seed\\');return false">Seed Upload</a> tab, or register a scheduled REST poll above.</div>';
             return;
           }
-          el.innerHTML = '<table class="data-table"><thead><tr><th>Slug</th><th>Kind</th><th>Adapter</th><th>Target folder</th><th>Enabled</th><th>Last run</th><th>Status</th></tr></thead><tbody>' +
+          el.innerHTML = '<table class="data-table"><thead><tr><th>Slug</th><th>Kind</th><th>Adapter</th><th>Schedule</th><th>Target</th><th>Enabled</th><th>Last run</th><th>Status</th><th>Actions</th></tr></thead><tbody>' +
             data.sources.map((s) =>
               '<tr><td>' + escapeHtml(s.slug) + '</td><td>' + escapeHtml(s.kind) + '</td><td>' + escapeHtml(s.adapter) + '</td>' +
+              '<td><code style="font-size:11px">' + escapeHtml(s.scheduleCron || '—') + '</code></td>' +
               '<td>' + escapeHtml(s.targetFolder || '—') + '</td>' +
               '<td>' + (s.enabled ? 'yes' : 'no') + '</td>' +
               '<td>' + escapeHtml(s.lastRunAt || '—') + '</td>' +
-              '<td>' + escapeHtml(s.lastStatus || '—') + '</td></tr>').join('') +
+              '<td>' + escapeHtml(s.lastStatus || '—') + '</td>' +
+              '<td><button class="btn" onclick="brainRunSource(\\'' + escapeHtml(s.slug) + '\\')">Run</button> ' +
+              '<button class="btn" onclick="brainDeleteSource(\\'' + escapeHtml(s.slug) + '\\')">🗑</button></td></tr>').join('') +
             '</tbody></table>';
+        }
+
+        async function brainRunSource(slug) {
+          if (!confirm('Run source "' + slug + '" now?')) return;
+          const resp = await apiFetch('/api/brain/sources/' + encodeURIComponent(slug) + '/run', { method: 'POST' });
+          const data = await resp.json();
+          if (!resp.ok) { alert('Error: ' + (data.error || 'unknown')); return; }
+          alert('Done. in=' + data.recordsIn + ' written=' + data.recordsWritten + ' failed=' + data.recordsFailed);
+          brainLoadSources();
+        }
+
+        async function brainDeleteSource(slug) {
+          if (!confirm('Delete source "' + slug + '"? This does NOT remove ingested data from the brain.')) return;
+          await apiFetch('/api/brain/sources/' + encodeURIComponent(slug), { method: 'DELETE' });
+          brainLoadSources();
+        }
+
+        function brainShowPollForm() {
+          document.getElementById('brain-poll-form').style.display = '';
+          document.getElementById('brain-creds-form').style.display = 'none';
+        }
+
+        async function brainSavePoll(runNow) {
+          const slug = document.getElementById('brain-poll-slug').value.trim();
+          const url = document.getElementById('brain-poll-url').value.trim();
+          const method = document.getElementById('brain-poll-method').value;
+          const headersText = document.getElementById('brain-poll-headers').value.trim();
+          const paramsText = document.getElementById('brain-poll-params').value.trim();
+          const recordsPath = document.getElementById('brain-poll-recordspath').value.trim();
+          const cronExpr = document.getElementById('brain-poll-cron').value.trim();
+          const folder = document.getElementById('brain-poll-folder').value.trim();
+          const statusEl = document.getElementById('brain-poll-status');
+          if (!slug || !url) { statusEl.innerHTML = '<span style="color:#e66">slug and URL required</span>'; return; }
+
+          let headers = {}, params = {};
+          try { if (headersText) headers = JSON.parse(headersText); } catch (e) { statusEl.innerHTML = '<span style="color:#e66">Invalid headers JSON</span>'; return; }
+          try { if (paramsText) params = JSON.parse(paramsText); } catch (e) { statusEl.innerHTML = '<span style="color:#e66">Invalid params JSON</span>'; return; }
+
+          const cfg = { url, method, headers, params };
+          if (recordsPath) cfg.recordsJsonPath = recordsPath;
+
+          statusEl.innerHTML = 'Saving…';
+          const resp = await apiFetch('/api/brain/sources', {
+            method: 'POST', headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({
+              slug, kind: 'poll', adapter: 'rest',
+              configJson: JSON.stringify(cfg),
+              scheduleCron: cronExpr || null,
+              targetFolder: folder || ('04-Ingest/' + slug),
+              enabled: true,
+            }),
+          });
+          const data = await resp.json();
+          if (!resp.ok) { statusEl.innerHTML = '<span style="color:#e66">' + escapeHtml(data.error || 'save failed') + '</span>'; return; }
+          statusEl.innerHTML = '<span style="color:#4ade80">✓ Saved</span>';
+
+          if (runNow) {
+            statusEl.innerHTML += ' · running first poll…';
+            const runResp = await apiFetch('/api/brain/sources/' + encodeURIComponent(slug) + '/run', { method: 'POST' });
+            const runData = await runResp.json();
+            statusEl.innerHTML = runResp.ok
+              ? '<span style="color:#4ade80">✓ Saved + run: in=' + runData.recordsIn + ' written=' + runData.recordsWritten + '</span>'
+              : '<span style="color:#e66">Saved but run failed: ' + escapeHtml(runData.error || 'unknown') + '</span>';
+          }
+          brainLoadSources();
+        }
+
+        async function brainShowCredsForm() {
+          document.getElementById('brain-creds-form').style.display = '';
+          document.getElementById('brain-poll-form').style.display = 'none';
+          const resp = await apiFetch('/api/brain/credentials');
+          const data = await resp.json();
+          const refs = data.refs || [];
+          document.getElementById('brain-creds-list').innerHTML = refs.length
+            ? '<div style="color:var(--muted);font-size:13px;margin-bottom:8px">Stored refs: ' + refs.map((r) => '<code>' + escapeHtml(r) + '</code>').join(', ') + '</div>'
+            : '<div style="color:var(--muted);font-size:13px;margin-bottom:8px">No credentials saved yet.</div>';
+        }
+
+        async function brainSaveCred() {
+          const ref = document.getElementById('brain-cred-ref').value.trim();
+          const value = document.getElementById('brain-cred-val').value;
+          const statusEl = document.getElementById('brain-cred-status');
+          if (!ref || !value) { statusEl.innerHTML = '<span style="color:#e66">ref and value required</span>'; return; }
+          const resp = await apiFetch('/api/brain/credentials', {
+            method: 'POST', headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ ref, value }),
+          });
+          const data = await resp.json();
+          statusEl.innerHTML = resp.ok
+            ? '<span style="color:#4ade80">✓ Saved ' + escapeHtml(ref) + '</span>'
+            : '<span style="color:#e66">' + escapeHtml(data.error || 'save failed') + '</span>';
+          document.getElementById('brain-cred-ref').value = '';
+          document.getElementById('brain-cred-val').value = '';
+          brainShowCredsForm(); // refresh list
         }
 
         async function brainLoadRuns() {

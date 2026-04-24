@@ -86,9 +86,11 @@ export async function deleteSource(slug: string): Promise<void> {
 }
 
 /**
- * Run a registered source. Seed sources require an `inputPath`; poll/
- * webhook sources accept a pre-built `records` iterator from their caller
- * (the scheduler's REST adapter or the webhook handler).
+ * Run a registered source. Auto-wires the right input:
+ *   - kind='seed' → uses inputPath (from opts or stored configJson)
+ *   - kind='poll' → builds REST iterator from source config
+ *   - kind='webhook' → requires caller to pass records
+ * Callers can still override with an explicit inputPath or records.
  */
 export async function runSource(
   slug: string,
@@ -102,10 +104,28 @@ export async function runSource(
     throw new Error(`Source disabled: ${slug}`);
   }
 
+  let inputPath = opts.inputPath;
+  let records = opts.records;
+
+  // Auto-resolve input based on source kind when caller didn't specify.
+  if (!inputPath && !records) {
+    if (source.kind === 'seed') {
+      // Seed sources carry the original file/folder path in configJson
+      try {
+        const cfg = JSON.parse(source.configJson ?? '{}') as { inputPath?: string };
+        if (cfg.inputPath) inputPath = cfg.inputPath;
+      } catch { /* fall through — pipeline will no-op if no input */ }
+    } else if (source.kind === 'poll' && source.adapter === 'rest') {
+      const { buildRestIterator } = await import('./ingest-scheduler.js');
+      records = await buildRestIterator(slug);
+    }
+    // webhook sources have no default — caller must pass records
+  }
+
   const ingestOpts: IngestOptions = {
     source,
-    inputPath: opts.inputPath,
-    records: opts.records,
+    inputPath,
+    records,
     dryRun: opts.dryRun,
     limit: opts.limit,
     onProgress: opts.onProgress,

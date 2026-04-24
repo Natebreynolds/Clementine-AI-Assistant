@@ -819,6 +819,14 @@ async function asyncMain(): Promise<void> {
   cronScheduler.start();
   const timerInterval = startTimerChecker(dispatcher, gateway);
 
+  // Start brain ingest scheduler (polls registered REST sources on their cron)
+  try {
+    const { getIngestScheduler } = await import('./brain/ingest-scheduler.js');
+    await getIngestScheduler().start();
+  } catch (err) {
+    logger.warn({ err }, 'Brain ingest scheduler failed to start');
+  }
+
   // Deliver pending team messages every 15s (picks up MCP-written messages)
   const teamDeliveryInterval = setInterval(() => {
     try { gateway.getTeamBus().deliverPending(); } catch (err) { logger.warn({ err }, 'Team delivery error'); }
