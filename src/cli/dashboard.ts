@@ -10259,9 +10259,11 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
           }
 
           try {
-            const resp = await fetch('/api/brain/seed/upload', {
+            // Use apiFetch so 401s (after a daemon restart regenerates the
+            // token) trigger an automatic page reload instead of silent fail.
+            const resp = await apiFetch('/api/brain/seed/upload', {
               method: 'POST',
-              headers: { 'Authorization': 'Bearer ' + _dashToken, 'X-Upload-Id': uploadId },
+              headers: { 'X-Upload-Id': uploadId },
               body: form,
             });
             const data = await resp.json();
@@ -11329,6 +11331,21 @@ async function apiFetch(url, opts) {
       // Gateway still initializing or timeout — wait and retry
       await new Promise(function(r) { setTimeout(r, 2000); });
       continue;
+    }
+    // 401 means the dashboard was restarted and regenerated its token.
+    // The page still in your browser has a stale one baked into <meta>,
+    // so every API call silently fails. Reload once to pick up the new
+    // HTML (and new token). Guard against reload loops with sessionStorage.
+    if (resp.status === 401) {
+      var key = '_dashReloadedOnce';
+      if (!sessionStorage.getItem(key)) {
+        sessionStorage.setItem(key, String(Date.now()));
+        console.warn('Dashboard token expired — reloading to refresh.');
+        location.reload();
+        // Let the reload kick in; return the 401 so any caller that
+        // handles it sees a consistent result until the page unloads.
+        return resp;
+      }
     }
     return resp;
   }
