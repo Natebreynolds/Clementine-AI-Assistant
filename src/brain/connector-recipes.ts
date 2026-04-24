@@ -22,8 +22,18 @@ export interface RecipeFieldPicker {
   /** Full tool name, e.g. "mcp__claude_ai_Google_Drive__search_files" */
   tool: string;
   /** Natural-language instruction to the probe agent — becomes the body of
-   *  "Call the tool X to {intent}, return a JSON array of {id, label}". */
+   *  "Call the tool X to {intent}, return a JSON array of {id, label}".
+   *  For typeahead pickers, may include the placeholder `{{query}}` which
+   *  the server substitutes with the user's typed search string. */
   intent: string;
+  /** When set, the picker renders as a typeahead: user types at least
+   *  `minQueryLength` chars (default 2), we debounce ~400ms, then fire the
+   *  probe with `{{query}}` replaced. Use for tools whose list operation
+   *  requires a query argument (e.g. search_contacts, Gmail search). */
+  queryArg?: string;
+  /** Minimum characters the user must type before firing the probe. Ignored
+   *  when queryArg is unset. Default 2. */
+  minQueryLength?: number;
   /** If true, user can type a custom value instead of picking from the list
    *  (falls back to the raw text). Useful when the source allows queries
    *  that aren't enumerable. */
@@ -274,7 +284,9 @@ Steps:
         help: 'Pick an iMessage contact. Their phone number or email becomes the thread id.',
         picker: {
           tool: 'mcp__imessage__search_contacts',
-          intent: 'list my iMessage contacts. Use the handle (phone number or email) as id, the display name (or handle if no name) as label, and the most-recent-message date as sublabel.',
+          intent: 'call search_contacts with query "{{query}}". For each match, output {id: the contact\'s phone number or email handle, label: the display name (or the handle if no name), sublabel: "handle: " + handle}. Return up to 15 results.',
+          queryArg: 'query',
+          minQueryLength: 2,
           allowCustom: true,
         },
       },

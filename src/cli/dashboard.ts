@@ -2580,12 +2580,17 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
 
   app.post('/api/brain/mcp/probe', async (req, res) => {
     try {
-      const body = (req.body ?? {}) as { tool?: string; intent?: string; force?: boolean };
+      const body = (req.body ?? {}) as { tool?: string; intent?: string; query?: string; force?: boolean };
       const tool = String(body.tool ?? '').trim();
-      const intent = String(body.intent ?? '').trim();
+      const rawIntent = String(body.intent ?? '').trim();
+      const userQuery = String(body.query ?? '').trim();
       if (!tool) { res.status(400).json({ error: 'tool is required' }); return; }
-      if (!intent) { res.status(400).json({ error: 'intent is required' }); return; }
+      if (!rawIntent) { res.status(400).json({ error: 'intent is required' }); return; }
 
+      // Typeahead pickers include a {{query}} placeholder. Substitute (and
+      // escape any JSON-breakers) before cache key + prompt.
+      const safeQuery = userQuery.replace(/"/g, '\\"').slice(0, 200);
+      const intent = rawIntent.replace(/\{\{query\}\}/g, safeQuery);
       const cacheKey = `${tool}::${intent}`;
       if (!body.force) {
         const cached = brainProbeCache.get(cacheKey);
@@ -10729,11 +10734,42 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
           brainFeedWizardRender();
         }
 
+        // Per-field typeahead state: { [fieldKey]: { timer, lastQuery } }
+        const brainPickerTypeahead = {};
+
         async function brainRenderFieldPicker(field, values) {
           const container = document.querySelector('[data-field-picker="' + field.key + '"]');
           const hidden = document.querySelector('input[type=hidden][data-field="' + field.key + '"]');
           if (!container || !hidden) return;
           const picker = field.picker;
+
+          // Typeahead mode: render a search box. User types → debounce → probe.
+          if (picker.queryArg) {
+            const minLen = picker.minQueryLength || 2;
+            const currentVal = hidden.value || values[field.key] || '';
+            container.innerHTML =
+              '<input type="text" id="brain-picker-search-' + field.key + '" placeholder="Type to search (min ' + minLen + ' chars)…" style="width:100%" value="">' +
+              '<div id="brain-picker-results-' + field.key + '" style="margin-top:6px;max-height:240px;overflow-y:auto"></div>' +
+              (currentVal
+                ? '<div style="font-size:12px;margin-top:6px">Selected: <code>' + escapeHtml(currentVal) + '</code></div>'
+                : '');
+            const searchEl = document.getElementById('brain-picker-search-' + field.key);
+            searchEl.oninput = function() {
+              const q = this.value.trim();
+              if (brainPickerTypeahead[field.key] && brainPickerTypeahead[field.key].timer) {
+                clearTimeout(brainPickerTypeahead[field.key].timer);
+              }
+              if (q.length < minLen) {
+                document.getElementById('brain-picker-results-' + field.key).innerHTML =
+                  '<div style="color:var(--muted);font-size:12px;padding:6px">Type at least ' + minLen + ' characters…</div>';
+                return;
+              }
+              brainPickerTypeahead[field.key] = {
+                timer: setTimeout(function() { brainFireTypeaheadProbe(field, q); }, 400),
+              };
+            };
+            return;
+          }
 
           try {
             const resp = await apiFetch('/api/brain/mcp/probe', {
@@ -10779,6 +10815,56 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
               '<input type="text" value="' + escapeHtml(values[field.key] || '') + '" placeholder="(probe failed — type manually)" style="width:100%" oninput="(document.querySelector(\\'input[type=hidden][data-field=' + field.key + ']\\')||{}).value=this.value">' +
               '<div style="color:#e66;font-size:11px;margin-top:4px">Picker failed: ' + escapeHtml(String(err && err.message ? err.message : err)) + ' — type a value manually.</div>';
           }
+        }
+
+        async function brainFireTypeaheadProbe(field, query) {
+          const resultsEl = document.getElementById('brain-picker-results-' + field.key);
+          const hidden = document.querySelector('input[type=hidden][data-field="' + field.key + '"]');
+          if (!resultsEl || !hidden) return;
+          resultsEl.innerHTML = '<div style="color:var(--muted);font-size:12px;padding:6px">Searching…</div>';
+          try {
+            const resp = await apiFetch('/api/brain/mcp/probe', {
+              method: 'POST', headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ tool: field.picker.tool, intent: field.picker.intent, query }),
+            });
+            const data = await resp.json();
+            if (!resp.ok) throw new Error(data.error || 'probe failed');
+            const items = data.items || [];
+            if (!items.length) {
+              resultsEl.innerHTML = '<div style="color:#8a5a00;font-size:12px;padding:6px">No matches for "' + escapeHtml(query) + '"' + (data.rawPreview ? ' (' + escapeHtml(data.rawPreview.slice(0, 100)) + ')' : '') + '</div>';
+              return;
+            }
+            resultsEl.innerHTML = items.map(function(it) {
+              const lbl = escapeHtml(it.label) + (it.sublabel ? ' <span style="color:var(--muted);font-size:11px">— ' + escapeHtml(it.sublabel) + '</span>' : '');
+              return '<button class="btn" onclick="brainPickTypeaheadItem(\\'' + field.key + '\\', \\'' + encodeURIComponent(it.id) + '\\', \\'' + encodeURIComponent(it.label) + '\\')" style="display:block;width:100%;text-align:left;padding:6px 10px;margin-bottom:2px">' + lbl + '</button>';
+            }).join('') +
+              '<div style="font-size:11px;color:var(--muted);margin-top:4px">' + items.length + ' result' + (items.length === 1 ? '' : 's') + (data.cached ? ' (cached)' : '') + '</div>';
+          } catch (err) {
+            resultsEl.innerHTML = '<div style="color:#e66;font-size:12px;padding:6px">' + escapeHtml(String(err && err.message ? err.message : err)) + '</div>';
+          }
+        }
+
+        function brainPickTypeaheadItem(fieldKey, encodedId, encodedLabel) {
+          const id = decodeURIComponent(encodedId);
+          const label = decodeURIComponent(encodedLabel);
+          const hidden = document.querySelector('input[type=hidden][data-field="' + fieldKey + '"]');
+          if (hidden) hidden.value = id;
+          // Show a confirmation chip and collapse the results.
+          const container = document.querySelector('[data-field-picker="' + fieldKey + '"]');
+          if (!container) return;
+          const searchEl = document.getElementById('brain-picker-search-' + fieldKey);
+          if (searchEl) searchEl.value = label;
+          const resultsEl = document.getElementById('brain-picker-results-' + fieldKey);
+          if (resultsEl) resultsEl.innerHTML = '';
+          // Inject a "selected" line
+          let sel = container.querySelector('.brain-picker-selected');
+          if (!sel) {
+            sel = document.createElement('div');
+            sel.className = 'brain-picker-selected';
+            sel.style.cssText = 'font-size:12px;margin-top:6px';
+            container.appendChild(sel);
+          }
+          sel.innerHTML = '✓ Selected: <b>' + escapeHtml(label) + '</b> <code style="font-size:11px;color:var(--muted)">' + escapeHtml(id) + '</code>';
         }
 
         function brainFieldPickerToggleCustom(fieldKey, encodedPicker) {
