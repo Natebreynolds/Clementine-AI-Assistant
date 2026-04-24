@@ -6,7 +6,7 @@
  */
 
 import express from 'express';
-import { randomBytes, timingSafeEqual } from 'node:crypto';
+import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 import { spawn, execSync } from 'node:child_process';
 import {
   appendFileSync,
@@ -1240,6 +1240,102 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
 
   // Health check — always responds, no auth, no middleware dependency
   app.get('/health', (_req, res) => { res.json({ ok: true, ts: Date.now() }); });
+
+  // ── Webhook ingestion ─────────────────────────────────────────────
+  //
+  // Inbound HTTP endpoint for brain sources with kind='webhook'. Each
+  // registered webhook source has a credentialRef whose value is the
+  // shared secret; callers sign the raw body with HMAC-SHA256 and send
+  // it in the `X-Signature: sha256=<hex>` header. No dashboard token
+  // required — HMAC IS the auth.
+  //
+  // Registered BEFORE the /api auth middleware so the bearer check
+  // doesn't kick in; uses its own raw-body parser so the bytes we
+  // verify are identical to what the client signed.
+  const rawBodyParser = express.raw({ type: '*/*', limit: '5mb' });
+  app.post('/webhook/:slug', rawBodyParser, async (req, res) => {
+    const slug = req.params.slug;
+    try {
+      const { getSource } = await import('../brain/source-registry.js');
+      const { runIngestion } = await import('../brain/ingestion-pipeline.js');
+      const { getCredential } = await import('../config.js');
+
+      const source = await getSource(slug);
+      if (!source) { res.status(404).json({ error: 'Unknown source' }); return; }
+      if (source.kind !== 'webhook') { res.status(400).json({ error: `Source ${slug} is not a webhook (kind=${source.kind})` }); return; }
+      if (!source.enabled) { res.status(503).json({ error: 'Source disabled' }); return; }
+      if (!source.credentialRef) { res.status(500).json({ error: 'Webhook source has no HMAC secret configured' }); return; }
+      const secret = getCredential(source.credentialRef);
+      if (!secret) { res.status(500).json({ error: 'HMAC secret not found in credentials store' }); return; }
+
+      // Verify signature. Accept both `sha256=<hex>` and raw hex.
+      const sig = String(req.headers['x-signature'] ?? req.headers['x-hub-signature-256'] ?? '').trim();
+      const rawBody: Buffer = Buffer.isBuffer(req.body) ? req.body : Buffer.from(String(req.body ?? ''));
+      const expected = createHmac('sha256', secret).update(rawBody).digest('hex');
+      const given = sig.startsWith('sha256=') ? sig.slice('sha256='.length) : sig;
+      if (!given || !safeHexEquals(given, expected)) {
+        res.status(401).json({ error: 'Invalid or missing HMAC signature' });
+        return;
+      }
+
+      // Parse payload. Support single object or array of objects.
+      let payload: unknown;
+      try {
+        payload = JSON.parse(rawBody.toString('utf-8'));
+      } catch (err) {
+        res.status(400).json({ error: `Body is not JSON: ${err instanceof Error ? err.message : String(err)}` });
+        return;
+      }
+      const items = Array.isArray(payload) ? payload : [payload];
+
+      // Build a one-shot iterator of RawRecords from the payload
+      const { contentHash, pickIdField } = await import('../brain/adapters/common.js');
+      const records = (async function* () {
+        let idField: string | null = null;
+        for (let i = 0; i < items.length; i++) {
+          const obj = items[i];
+          if (!obj || typeof obj !== 'object') continue;
+          const rec = obj as Record<string, unknown>;
+          if (idField === null) idField = pickIdField(Object.keys(rec));
+          const rawJson = JSON.stringify(rec);
+          const idFromField = idField ? String(rec[idField] ?? '').trim() : '';
+          yield {
+            externalId: idFromField ? `${slug}-${idFromField}` : `${slug}-${i}-${contentHash(rawJson)}`,
+            content: Object.entries(rec)
+              .filter(([, v]) => v !== undefined && v !== null && v !== '')
+              .map(([k, v]) => `${k}: ${typeof v === 'object' ? JSON.stringify(v) : String(v)}`)
+              .join('\n'),
+            rawPayload: rawJson,
+            metadata: {
+              adapter: 'rest',       // treat webhook payloads as structured records
+              source_slug: slug,
+              received_at: new Date().toISOString(),
+              record_index: i,
+              structured: rec,
+              content_hash: contentHash(rawJson),
+            },
+          };
+        }
+      })();
+
+      const result = await runIngestion({ source, records });
+      res.json({
+        runId: result.runId,
+        recordsIn: result.recordsIn,
+        recordsWritten: result.recordsWritten,
+        recordsFailed: result.recordsFailed,
+      });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  function safeHexEquals(a: string, b: string): boolean {
+    if (a.length !== b.length) return false;
+    let diff = 0;
+    for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+    return diff === 0;
+  }
 
   // ── Dashboard authentication ────────────────────────────────────────
   const dashboardToken = randomBytes(24).toString('hex');
@@ -9698,7 +9794,27 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
         <div class="tab-pane" id="tab-intelligence-sources">
           <div style="display:flex;gap:8px;margin-bottom:16px;flex-wrap:wrap">
             <button class="btn-primary" onclick="brainShowPollForm()">+ Scheduled REST poll</button>
+            <button class="btn-primary" onclick="brainShowWebhookForm()">+ Inbound webhook</button>
             <button class="btn" onclick="brainShowCredsForm()">🔑 Credentials</button>
+          </div>
+
+          <!-- Webhook form -->
+          <div id="brain-webhook-form" class="card" style="display:none;padding:16px;margin-bottom:16px">
+            <div style="font-weight:600;margin-bottom:8px">New inbound webhook</div>
+            <div style="color:var(--muted);font-size:13px;margin-bottom:12px">
+              Point an external service (Typeform, Stripe, Zapier, a signup form) at the URL below. Every POST is verified with HMAC-SHA256 and ingested into the brain. Each payload becomes one brain record — or if the body is a JSON array, one record per element.
+            </div>
+            <div style="display:grid;grid-template-columns:140px 1fr;gap:8px;align-items:center;font-size:13px">
+              <label>Slug</label>
+              <input type="text" id="brain-webhook-slug" placeholder="signup-leads">
+              <label>Target folder</label>
+              <input type="text" id="brain-webhook-folder" placeholder="04-Ingest/signups">
+            </div>
+            <div style="display:flex;gap:8px;margin-top:12px">
+              <button class="btn-primary" onclick="brainSaveWebhook()">Generate URL + secret</button>
+              <button class="btn" onclick="document.getElementById('brain-webhook-form').style.display='none'">Cancel</button>
+            </div>
+            <div id="brain-webhook-status" style="margin-top:12px"></div>
           </div>
 
           <!-- Poll source form -->
@@ -9872,6 +9988,68 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
         function brainShowPollForm() {
           document.getElementById('brain-poll-form').style.display = '';
           document.getElementById('brain-creds-form').style.display = 'none';
+          const wf = document.getElementById('brain-webhook-form'); if (wf) wf.style.display = 'none';
+        }
+
+        function brainShowWebhookForm() {
+          document.getElementById('brain-webhook-form').style.display = '';
+          document.getElementById('brain-poll-form').style.display = 'none';
+          document.getElementById('brain-creds-form').style.display = 'none';
+        }
+
+        async function brainSaveWebhook() {
+          const slug = document.getElementById('brain-webhook-slug').value.trim();
+          const folder = document.getElementById('brain-webhook-folder').value.trim() || ('04-Ingest/' + slug);
+          const statusEl = document.getElementById('brain-webhook-status');
+          if (!slug) { statusEl.innerHTML = '<span style="color:#e66">slug required</span>'; return; }
+          if (!/^[a-z][a-z0-9_-]*$/.test(slug)) { statusEl.innerHTML = '<span style="color:#e66">slug must be lowercase alphanumeric</span>'; return; }
+
+          // 1) Generate a random 32-byte secret and save it under ref "webhook_<slug>"
+          const bytes = new Uint8Array(32);
+          crypto.getRandomValues(bytes);
+          const secret = Array.from(bytes).map((b) => b.toString(16).padStart(2, '0')).join('');
+          const credRef = 'webhook_' + slug.replace(/-/g, '_');
+
+          statusEl.innerHTML = 'Saving secret…';
+          const credResp = await apiFetch('/api/brain/credentials', {
+            method: 'POST', headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ ref: credRef, value: secret }),
+          });
+          if (!credResp.ok) {
+            const e = await credResp.json();
+            statusEl.innerHTML = '<span style="color:#e66">Secret save failed: ' + escapeHtml(e.error || 'unknown') + '</span>';
+            return;
+          }
+
+          // 2) Register the webhook source
+          statusEl.innerHTML = 'Registering source…';
+          const resp = await apiFetch('/api/brain/sources', {
+            method: 'POST', headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({
+              slug, kind: 'webhook', adapter: 'webhook',
+              configJson: '{}',
+              credentialRef: credRef,
+              targetFolder: folder,
+              enabled: true,
+            }),
+          });
+          if (!resp.ok) {
+            const e = await resp.json();
+            statusEl.innerHTML = '<span style="color:#e66">' + escapeHtml(e.error || 'save failed') + '</span>';
+            return;
+          }
+
+          const url = location.origin + '/webhook/' + encodeURIComponent(slug);
+          statusEl.innerHTML =
+            '<div style="padding:12px;background:#1e2a1e;border:1px solid #2ea043;border-radius:6px">' +
+            '<div style="color:#4ade80;font-weight:600;margin-bottom:8px">✓ Webhook ready</div>' +
+            '<div style="font-size:13px;margin-bottom:4px">POST URL:</div>' +
+            '<code style="display:block;word-break:break-all;padding:6px;background:#0d1117;border-radius:4px;margin-bottom:8px">' + escapeHtml(url) + '</code>' +
+            '<div style="font-size:13px;margin-bottom:4px">HMAC secret (copy now — won\\'t be shown again):</div>' +
+            '<code style="display:block;word-break:break-all;padding:6px;background:#0d1117;border-radius:4px;margin-bottom:8px">' + escapeHtml(secret) + '</code>' +
+            '<div style="font-size:12px;color:var(--muted)">Clients sign the raw request body with HMAC-SHA256 and send <code>X-Signature: sha256=&lt;hex&gt;</code>.</div>' +
+            '</div>';
+          brainLoadSources();
         }
 
         async function brainSavePoll(runNow) {
