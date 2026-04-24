@@ -2075,6 +2075,86 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
     }
   });
 
+  // ── Filesystem browser (used by Brain seed picker) ─────────────
+  //
+  // Localhost-only, auth-protected. Expands ~, resolves symlinks, and
+  // rejects obvious traversal attempts. Intended for interactive file
+  // selection — not a general-purpose file API.
+
+  app.get('/api/fs/browse', (req, res) => {
+    try {
+      const raw = String(req.query.path ?? '~').trim() || '~';
+      const expanded = raw.startsWith('~')
+        ? path.join(os.homedir(), raw.slice(1))
+        : raw;
+      const resolved = path.resolve(expanded);
+
+      // Block a few obvious danger spots on macOS / Linux. Single-user
+      // localhost doesn't need paranoid sandboxing but we shouldn't
+      // enumerate system secrets just because someone typed /etc.
+      const blocked = ['/etc', '/System', '/private/etc', '/dev', '/bin', '/sbin', '/usr/bin', '/usr/sbin'];
+      for (const b of blocked) {
+        if (resolved === b || resolved.startsWith(b + '/')) {
+          res.status(403).json({ error: `Path ${b} is off-limits` });
+          return;
+        }
+      }
+
+      let stat;
+      try { stat = statSync(resolved); } catch (err) {
+        res.status(404).json({ error: `Cannot read ${resolved}: ${err instanceof Error ? err.message : String(err)}` });
+        return;
+      }
+
+      if (stat.isFile()) {
+        // Return the file's parent dir with the selected file highlighted
+        const parent = path.dirname(resolved);
+        const parentEntries = safeListDir(parent);
+        res.json({
+          path: parent,
+          selected: resolved,
+          items: parentEntries,
+        });
+        return;
+      }
+
+      if (!stat.isDirectory()) {
+        res.status(400).json({ error: 'Not a file or directory' });
+        return;
+      }
+
+      const items = safeListDir(resolved);
+      res.json({ path: resolved, items });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  function safeListDir(dir: string): Array<{ name: string; path: string; isDir: boolean; sizeBytes: number; mtime: string | null }> {
+    let entries: string[];
+    try { entries = readdirSync(dir); } catch { return []; }
+    const results: Array<{ name: string; path: string; isDir: boolean; sizeBytes: number; mtime: string | null }> = [];
+    for (const name of entries) {
+      if (name.startsWith('.') && name !== '..') continue; // hide dotfiles by default
+      const abs = path.join(dir, name);
+      try {
+        const s = statSync(abs);
+        results.push({
+          name,
+          path: abs,
+          isDir: s.isDirectory(),
+          sizeBytes: s.isFile() ? s.size : 0,
+          mtime: s.mtime.toISOString(),
+        });
+      } catch { /* unreadable — skip */ }
+    }
+    results.sort((a, b) => {
+      if (a.isDir !== b.isDir) return a.isDir ? -1 : 1;
+      return a.name.localeCompare(b.name);
+    });
+    return results;
+  }
+
   // ── Brain / Ingestion ──────────────────────────────────────────
 
   function deriveBrainSlug(inputPath: string): string {
@@ -9060,9 +9140,6 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
       <div class="nav-item" data-page="workflows">
         <span class="nav-icon">&#128260;</span> Workflows
       </div>
-      <div class="nav-item" data-page="brain">
-        <span class="nav-icon">&#129504;</span> Brain
-      </div>
     </div>
     <div class="nav-section">
       <div class="nav-section-title">Insights</div>
@@ -9070,7 +9147,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
         <span class="nav-icon">&#128202;</span> Team Status
       </div>
       <div class="nav-item" data-page="intelligence">
-        <span class="nav-icon">&#129504;</span> Intelligence
+        <span class="nav-icon">&#129504;</span> Brain
       </div>
       <div class="nav-item" data-page="claims">
         <span class="nav-icon">&#128274;</span> Trust &amp; Claims
@@ -9462,200 +9539,23 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
       </script>
     </div>
 
-    <!-- ═══ Brain Page (Sources + Seed Upload + Ingestion Runs) ═══ -->
-    <div class="page" id="page-brain">
-      <div class="page-title">Brain</div>
-      <div style="color:var(--muted,#888);margin-bottom:20px">
-        Seed your brain with a backlog of data (CSV, JSON, PDF, email, DOCX, markdown) and keep it fed from external sources over time.
-      </div>
-      <div class="tab-bar" id="brain-tabs">
-        <button class="active" onclick="switchTab('brain','seed')">Seed Upload</button>
-        <button onclick="switchTab('brain','sources')">Sources</button>
-        <button onclick="switchTab('brain','runs')">Ingestion Runs</button>
-      </div>
-
-      <!-- Tab: Seed Upload -->
-      <div class="tab-content" id="brain-tab-seed">
-        <div class="card" style="padding:20px;margin-bottom:16px">
-          <div style="font-weight:600;margin-bottom:8px">Seed from local path</div>
-          <div style="color:var(--muted,#888);margin-bottom:12px;font-size:13px">
-            Paste an absolute path to a file or folder. The detector walks it and shows a manifest of what it found; Preview runs the first 10 records through the full pipeline (no writes); Commit ingests everything.
-          </div>
-          <div style="display:flex;gap:8px;margin-bottom:12px">
-            <input type="text" id="brain-seed-path" placeholder="/Users/you/exports/customers.csv" style="flex:1">
-            <input type="text" id="brain-seed-slug" placeholder="slug (auto if blank)" style="width:200px">
-          </div>
-          <div style="display:flex;gap:8px">
-            <button class="btn-primary" onclick="brainPreviewSeed()">Preview</button>
-            <button class="btn-primary" id="brain-commit-btn" onclick="brainCommitSeed()" style="display:none">Commit Ingestion</button>
-          </div>
-          <div id="brain-seed-manifest" style="margin-top:16px"></div>
-          <div id="brain-seed-preview" style="margin-top:16px"></div>
-          <div id="brain-seed-progress" style="margin-top:16px"></div>
-        </div>
-      </div>
-
-      <!-- Tab: Sources -->
-      <div class="tab-content" id="brain-tab-sources" style="display:none">
-        <div id="brain-sources-list"></div>
-      </div>
-
-      <!-- Tab: Ingestion Runs -->
-      <div class="tab-content" id="brain-tab-runs" style="display:none">
-        <div id="brain-runs-list"></div>
-      </div>
-
-      <script>
-        async function brainPreviewSeed() {
-          const pathVal = document.getElementById('brain-seed-path').value.trim();
-          const slugVal = document.getElementById('brain-seed-slug').value.trim();
-          if (!pathVal) { alert('Enter a file or folder path'); return; }
-          document.getElementById('brain-seed-manifest').innerHTML = '<div>Scanning…</div>';
-          document.getElementById('brain-seed-preview').innerHTML = '';
-          document.getElementById('brain-commit-btn').style.display = 'none';
-
-          const resp = await fetch('/api/brain/seed/preview', {
-            method: 'POST', headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ path: pathVal, slug: slugVal || undefined }),
-          });
-          const data = await resp.json();
-          if (!resp.ok) {
-            document.getElementById('brain-seed-manifest').innerHTML =
-              '<div style="color:#e66">Error: ' + escapeHtml(data.error ?? 'unknown') + '</div>';
-            return;
-          }
-
-          const manifestRows = Object.entries(data.manifest.formats || {})
-            .map(([fmt, n]) => '<tr><td>' + escapeHtml(fmt) + '</td><td>' + n + '</td></tr>').join('');
-          document.getElementById('brain-seed-manifest').innerHTML =
-            '<div class="card" style="padding:12px"><div style="font-weight:600;margin-bottom:8px">Manifest</div>' +
-            '<div style="color:var(--muted);font-size:13px;margin-bottom:8px">' +
-            data.manifest.totalFiles + ' file(s), ' + humanBytes(data.manifest.totalBytes) + '</div>' +
-            '<table class="data-table"><thead><tr><th>Format</th><th>Count</th></tr></thead><tbody>' +
-            manifestRows + '</tbody></table></div>';
-
-          if (data.preview && data.preview.length) {
-            const previewHtml = data.preview.slice(0, 10).map((p, i) =>
-              '<div class="card" style="padding:12px;margin-bottom:8px">' +
-              '<div style="font-weight:600">#' + (i + 1) + ' ' + escapeHtml(p.title || '(untitled)') + '</div>' +
-              '<div style="color:var(--muted);font-size:12px;margin:4px 0">' + escapeHtml(p.targetRelPath || '') + '</div>' +
-              '<div style="font-size:13px">' + escapeHtml((p.body || '').slice(0, 400)) + '</div>' +
-              (p.tags && p.tags.length ? '<div style="margin-top:6px;font-size:12px;color:#888">tags: ' + p.tags.map(escapeHtml).join(', ') + '</div>' : '') +
-              '</div>'
-            ).join('');
-            document.getElementById('brain-seed-preview').innerHTML =
-              '<div style="font-weight:600;margin-bottom:8px">Preview (first ' + Math.min(data.preview.length, 10) + ' records, dry-run)</div>' +
-              previewHtml;
-          }
-          document.getElementById('brain-commit-btn').style.display = '';
-          document.getElementById('brain-commit-btn').dataset.path = pathVal;
-          document.getElementById('brain-commit-btn').dataset.slug = slugVal || data.suggestedSlug || '';
-        }
-
-        async function brainCommitSeed() {
-          const btn = document.getElementById('brain-commit-btn');
-          const pathVal = btn.dataset.path;
-          const slugVal = btn.dataset.slug;
-          const progEl = document.getElementById('brain-seed-progress');
-          btn.disabled = true;
-          progEl.innerHTML = '<div>Starting ingestion…</div>';
-
-          try {
-            const resp = await fetch('/api/brain/seed/commit', {
-              method: 'POST', headers: { 'content-type': 'application/json' },
-              body: JSON.stringify({ path: pathVal, slug: slugVal }),
-            });
-            const data = await resp.json();
-            if (!resp.ok) {
-              progEl.innerHTML = '<div style="color:#e66">Error: ' + escapeHtml(data.error || 'unknown') + '</div>';
-              return;
-            }
-            progEl.innerHTML =
-              '<div class="card" style="padding:12px">' +
-              '<div style="font-weight:600">Ingestion complete</div>' +
-              '<div>Records in: ' + data.recordsIn + '</div>' +
-              '<div>Records written: ' + data.recordsWritten + '</div>' +
-              '<div>Records skipped: ' + data.recordsSkipped + '</div>' +
-              '<div>Records failed: ' + data.recordsFailed + '</div>' +
-              (data.overviewNotePath ? '<div style="margin-top:8px">Overview note: <code>' + escapeHtml(data.overviewNotePath) + '</code></div>' : '') +
-              '</div>';
-          } catch (err) {
-            progEl.innerHTML = '<div style="color:#e66">' + escapeHtml(String(err)) + '</div>';
-          } finally {
-            btn.disabled = false;
-          }
-        }
-
-        async function brainLoadSources() {
-          const resp = await fetch('/api/brain/sources');
-          const data = await resp.json();
-          const el = document.getElementById('brain-sources-list');
-          if (!data.sources || !data.sources.length) {
-            el.innerHTML = '<div style="color:var(--muted)">No sources yet. Seed your first one above.</div>';
-            return;
-          }
-          el.innerHTML = '<table class="data-table"><thead><tr><th>Slug</th><th>Kind</th><th>Adapter</th><th>Enabled</th><th>Last run</th><th>Status</th></tr></thead><tbody>' +
-            data.sources.map((s) =>
-              '<tr><td>' + escapeHtml(s.slug) + '</td><td>' + escapeHtml(s.kind) + '</td><td>' + escapeHtml(s.adapter) + '</td>' +
-              '<td>' + (s.enabled ? 'yes' : 'no') + '</td>' +
-              '<td>' + escapeHtml(s.lastRunAt || '—') + '</td>' +
-              '<td>' + escapeHtml(s.lastStatus || '—') + '</td></tr>'
-            ).join('') + '</tbody></table>';
-        }
-
-        async function brainLoadRuns() {
-          const resp = await fetch('/api/brain/runs');
-          const data = await resp.json();
-          const el = document.getElementById('brain-runs-list');
-          if (!data.runs || !data.runs.length) {
-            el.innerHTML = '<div style="color:var(--muted)">No ingestion runs yet.</div>';
-            return;
-          }
-          el.innerHTML = '<table class="data-table"><thead><tr><th>#</th><th>Source</th><th>Started</th><th>Status</th><th>In</th><th>Written</th><th>Skipped</th><th>Failed</th><th>Overview</th></tr></thead><tbody>' +
-            data.runs.map((r) =>
-              '<tr><td>' + r.id + '</td><td>' + escapeHtml(r.sourceSlug) + '</td>' +
-              '<td>' + escapeHtml(r.startedAt) + '</td>' +
-              '<td>' + escapeHtml(r.status) + '</td>' +
-              '<td>' + r.recordsIn + '</td><td>' + r.recordsWritten + '</td>' +
-              '<td>' + r.recordsSkipped + '</td><td>' + r.recordsFailed + '</td>' +
-              '<td>' + (r.overviewNotePath ? '<code style="font-size:12px">' + escapeHtml(r.overviewNotePath) + '</code>' : '—') + '</td></tr>'
-            ).join('') + '</tbody></table>';
-        }
-
-        function humanBytes(n) {
-          if (n < 1024) return n + ' B';
-          if (n < 1048576) return (n / 1024).toFixed(1) + ' KB';
-          if (n < 1073741824) return (n / 1048576).toFixed(1) + ' MB';
-          return (n / 1073741824).toFixed(2) + ' GB';
-        }
-
-        // Wire tab + page activation
-        (function() {
-          const origSwitch = window.switchTab;
-          window.switchTab = function(page, tab) {
-            origSwitch(page, tab);
-            if (page === 'brain' && tab === 'sources') brainLoadSources();
-            if (page === 'brain' && tab === 'runs') brainLoadRuns();
-          };
-          document.addEventListener('click', (e) => {
-            const item = e.target.closest('[data-page="brain"]');
-            if (item) setTimeout(brainLoadSources, 50);
-          });
-        })();
-      </script>
-    </div>
-
-    <!-- ═══ Intelligence Page (merged: Search + Knowledge Graph + Memory) ═══ -->
+    <!-- ═══ Brain Page (unified: Search + Graph + Stats + Sources + Seed + Runs) ═══ -->
     <div class="page" id="page-intelligence">
-      <div class="page-title">Intelligence</div>
+      <div class="page-title">Brain</div>
+      <div style="color:var(--muted,#888);margin-bottom:16px;font-size:13px">
+        Query what you know, and feed new knowledge in. Everything on this page writes to or reads from the same memory + knowledge graph.
+      </div>
       <div style="display:flex;gap:10px;margin-bottom:16px">
         <input type="text" id="memory-search-input" placeholder="Search vault, notes, memory..." style="flex:1" onkeydown="if(event.key==='Enter')runMemorySearch()">
         <button class="btn-primary" onclick="runMemorySearch()">Search</button>
       </div>
       <div class="tab-bar" id="intelligence-tabs">
-        <button class="active" onclick="switchTab('intelligence','search')">Search Results</button>
+        <button class="active" onclick="switchTab('intelligence','search')">Search</button>
         <button onclick="switchTab('intelligence','graph')">Knowledge Graph</button>
         <button onclick="switchTab('intelligence','memory')">Memory Stats</button>
+        <button onclick="switchTab('intelligence','seed')">Seed Upload</button>
+        <button onclick="switchTab('intelligence','sources')">Sources</button>
+        <button onclick="switchTab('intelligence','runs')">Ingestion Runs</button>
       </div>
       <div id="intelligence-tab-content">
         <div class="tab-pane active" id="tab-intelligence-search">
@@ -9685,7 +9585,238 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
             <div class="card-body" id="panel-memory"><div class="empty-state">Loading...</div></div>
           </div>
         </div>
+
+        <!-- Seed Upload -->
+        <div class="tab-pane" id="tab-intelligence-seed">
+          <div class="card" style="padding:20px;margin-bottom:16px">
+            <div style="font-weight:600;margin-bottom:8px">Drop a file or folder into the brain</div>
+            <div style="color:var(--muted);margin-bottom:12px;font-size:13px">
+              Supports CSV, JSON, JSONL, Markdown, PDF, email (.eml / .mbox), DOCX. Preview runs the first 10 records through the full pipeline without writing anything; Commit ingests everything.
+            </div>
+
+            <div style="display:flex;gap:8px;margin-bottom:8px">
+              <button class="btn" onclick="brainOpenPicker()" style="white-space:nowrap">📂 Browse…</button>
+              <input type="text" id="brain-seed-path" placeholder="/Users/you/exports/customers.csv" style="flex:1">
+              <input type="text" id="brain-seed-slug" placeholder="slug (auto if blank)" style="width:220px">
+            </div>
+
+            <!-- File picker (hidden by default) -->
+            <div id="brain-picker" style="display:none;margin:10px 0;border:1px solid var(--border);border-radius:6px;overflow:hidden">
+              <div style="padding:8px 12px;background:#1a1a24;display:flex;gap:8px;align-items:center">
+                <button class="btn" onclick="brainPickerUp()">⬆</button>
+                <input type="text" id="brain-picker-path" style="flex:1" onkeydown="if(event.key==='Enter')brainPickerGo()">
+                <button class="btn" onclick="brainPickerGo()">Go</button>
+                <button class="btn" onclick="brainPickerChoose()">Use this folder</button>
+                <button class="btn" onclick="document.getElementById('brain-picker').style.display='none'">✕</button>
+              </div>
+              <div id="brain-picker-list" style="max-height:260px;overflow:auto;padding:8px 12px"></div>
+            </div>
+
+            <div style="display:flex;gap:8px;margin-top:8px">
+              <button class="btn-primary" onclick="brainPreviewSeed()">Preview</button>
+              <button class="btn-primary" id="brain-commit-btn" onclick="brainCommitSeed()" style="display:none">Commit ingestion</button>
+            </div>
+
+            <div id="brain-seed-manifest" style="margin-top:16px"></div>
+            <div id="brain-seed-preview" style="margin-top:16px"></div>
+            <div id="brain-seed-progress" style="margin-top:16px"></div>
+          </div>
+        </div>
+
+        <!-- Sources -->
+        <div class="tab-pane" id="tab-intelligence-sources">
+          <div id="brain-sources-list"></div>
+        </div>
+
+        <!-- Ingestion Runs -->
+        <div class="tab-pane" id="tab-intelligence-runs">
+          <div id="brain-runs-list"></div>
+        </div>
       </div>
+
+      <script>
+        // ── Brain tab-pane logic (merged into Intelligence page) ────────
+
+        async function brainPreviewSeed() {
+          const pathVal = document.getElementById('brain-seed-path').value.trim();
+          const slugVal = document.getElementById('brain-seed-slug').value.trim();
+          if (!pathVal) { alert('Enter or pick a file/folder path'); return; }
+          document.getElementById('brain-seed-manifest').innerHTML = '<div>Scanning…</div>';
+          document.getElementById('brain-seed-preview').innerHTML = '';
+          document.getElementById('brain-commit-btn').style.display = 'none';
+          const resp = await apiFetch('/api/brain/seed/preview', {
+            method: 'POST', headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ path: pathVal, slug: slugVal || undefined }),
+          });
+          const data = await resp.json();
+          if (!resp.ok) {
+            document.getElementById('brain-seed-manifest').innerHTML = '<div style="color:#e66">Error: ' + escapeHtml(data.error ?? 'unknown') + '</div>';
+            return;
+          }
+          const manifestRows = Object.entries(data.manifest.formats || {})
+            .map(([fmt, n]) => '<tr><td>' + escapeHtml(fmt) + '</td><td>' + n + '</td></tr>').join('');
+          document.getElementById('brain-seed-manifest').innerHTML =
+            '<div class="card" style="padding:12px"><div style="font-weight:600;margin-bottom:8px">Manifest</div>' +
+            '<div style="color:var(--muted);font-size:13px;margin-bottom:8px">' +
+            data.manifest.totalFiles + ' file(s), ' + brainHumanBytes(data.manifest.totalBytes) + '</div>' +
+            '<table class="data-table"><thead><tr><th>Format</th><th>Count</th></tr></thead><tbody>' + manifestRows + '</tbody></table></div>';
+          if (data.preview && data.preview.length) {
+            const previewHtml = data.preview.slice(0, 10).map((p, i) =>
+              '<div class="card" style="padding:12px;margin-bottom:8px">' +
+              '<div style="font-weight:600">#' + (i + 1) + ' ' + escapeHtml(p.title || '(untitled)') + '</div>' +
+              '<div style="color:var(--muted);font-size:12px;margin:4px 0">' + escapeHtml(p.targetRelPath || '') + '</div>' +
+              '<div style="font-size:13px">' + escapeHtml((p.body || '').slice(0, 400)) + '</div>' +
+              (p.tags && p.tags.length ? '<div style="margin-top:6px;font-size:12px;color:#888">tags: ' + p.tags.map(escapeHtml).join(', ') + '</div>' : '') +
+              '</div>').join('');
+            document.getElementById('brain-seed-preview').innerHTML =
+              '<div style="font-weight:600;margin-bottom:8px">Preview (first ' + Math.min(data.preview.length, 10) + ' records, dry-run)</div>' + previewHtml;
+          }
+          document.getElementById('brain-commit-btn').style.display = '';
+          document.getElementById('brain-commit-btn').dataset.path = pathVal;
+          document.getElementById('brain-commit-btn').dataset.slug = slugVal || data.suggestedSlug || '';
+        }
+
+        async function brainCommitSeed() {
+          const btn = document.getElementById('brain-commit-btn');
+          const pathVal = btn.dataset.path;
+          const slugVal = btn.dataset.slug;
+          const progEl = document.getElementById('brain-seed-progress');
+          btn.disabled = true;
+          progEl.innerHTML = '<div>Running ingestion (can take 30–60s for LLM distillation)…</div>';
+          try {
+            const resp = await apiFetch('/api/brain/seed/commit', {
+              method: 'POST', headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ path: pathVal, slug: slugVal }),
+            });
+            const data = await resp.json();
+            if (!resp.ok) {
+              progEl.innerHTML = '<div style="color:#e66">Error: ' + escapeHtml(data.error || 'unknown') + '</div>';
+              return;
+            }
+            progEl.innerHTML =
+              '<div class="card" style="padding:12px">' +
+              '<div style="font-weight:600;color:#4ade80">✓ Ingestion complete</div>' +
+              '<div>Records in: ' + data.recordsIn + '</div>' +
+              '<div>Records written: ' + data.recordsWritten + '</div>' +
+              '<div>Records skipped: ' + data.recordsSkipped + '</div>' +
+              '<div>Records failed: ' + data.recordsFailed + '</div>' +
+              (data.overviewNotePath ? '<div style="margin-top:8px">Overview note: <code>' + escapeHtml(data.overviewNotePath) + '</code></div>' : '') +
+              '</div>';
+          } catch (err) {
+            progEl.innerHTML = '<div style="color:#e66">' + escapeHtml(String(err)) + '</div>';
+          } finally {
+            btn.disabled = false;
+          }
+        }
+
+        async function brainLoadSources() {
+          const resp = await apiFetch('/api/brain/sources');
+          const data = await resp.json();
+          const el = document.getElementById('brain-sources-list');
+          if (!data.sources || !data.sources.length) {
+            el.innerHTML = '<div style="color:var(--muted);padding:20px">No sources yet. Seed your first one in the <a href="#" onclick="switchTab(\\'intelligence\\',\\'seed\\');return false">Seed Upload</a> tab.</div>';
+            return;
+          }
+          el.innerHTML = '<table class="data-table"><thead><tr><th>Slug</th><th>Kind</th><th>Adapter</th><th>Target folder</th><th>Enabled</th><th>Last run</th><th>Status</th></tr></thead><tbody>' +
+            data.sources.map((s) =>
+              '<tr><td>' + escapeHtml(s.slug) + '</td><td>' + escapeHtml(s.kind) + '</td><td>' + escapeHtml(s.adapter) + '</td>' +
+              '<td>' + escapeHtml(s.targetFolder || '—') + '</td>' +
+              '<td>' + (s.enabled ? 'yes' : 'no') + '</td>' +
+              '<td>' + escapeHtml(s.lastRunAt || '—') + '</td>' +
+              '<td>' + escapeHtml(s.lastStatus || '—') + '</td></tr>').join('') +
+            '</tbody></table>';
+        }
+
+        async function brainLoadRuns() {
+          const resp = await apiFetch('/api/brain/runs');
+          const data = await resp.json();
+          const el = document.getElementById('brain-runs-list');
+          if (!data.runs || !data.runs.length) {
+            el.innerHTML = '<div style="color:var(--muted);padding:20px">No ingestion runs yet.</div>';
+            return;
+          }
+          el.innerHTML = '<table class="data-table"><thead><tr><th>#</th><th>Source</th><th>Started</th><th>Status</th><th>In</th><th>Written</th><th>Skipped</th><th>Failed</th><th>Overview</th></tr></thead><tbody>' +
+            data.runs.map((r) =>
+              '<tr><td>' + r.id + '</td><td>' + escapeHtml(r.sourceSlug) + '</td>' +
+              '<td>' + escapeHtml(r.startedAt) + '</td>' +
+              '<td>' + escapeHtml(r.status) + '</td>' +
+              '<td>' + r.recordsIn + '</td><td>' + r.recordsWritten + '</td>' +
+              '<td>' + r.recordsSkipped + '</td><td>' + r.recordsFailed + '</td>' +
+              '<td>' + (r.overviewNotePath ? '<code style="font-size:12px">' + escapeHtml(r.overviewNotePath) + '</code>' : '—') + '</td></tr>').join('') +
+            '</tbody></table>';
+        }
+
+        function brainHumanBytes(n) {
+          if (n < 1024) return n + ' B';
+          if (n < 1048576) return (n / 1024).toFixed(1) + ' KB';
+          if (n < 1073741824) return (n / 1048576).toFixed(1) + ' MB';
+          return (n / 1073741824).toFixed(2) + ' GB';
+        }
+
+        // ── File / folder picker (hits /api/fs/browse) ──────────────────
+
+        let _brainPickerCurrent = '';
+        async function brainOpenPicker() {
+          document.getElementById('brain-picker').style.display = '';
+          const seeded = document.getElementById('brain-seed-path').value.trim();
+          const home = (seeded && seeded.startsWith('/') ? seeded.replace(/\/+[^/]*$/, '') : '') || '~';
+          await brainPickerLoad(home);
+        }
+
+        async function brainPickerGo() {
+          await brainPickerLoad(document.getElementById('brain-picker-path').value.trim() || '~');
+        }
+
+        async function brainPickerUp() {
+          const cur = _brainPickerCurrent || '/';
+          const up = cur.replace(/\/+[^/]+\/?$/, '') || '/';
+          await brainPickerLoad(up);
+        }
+
+        async function brainPickerLoad(p) {
+          const resp = await apiFetch('/api/fs/browse?path=' + encodeURIComponent(p));
+          const data = await resp.json();
+          if (!resp.ok) {
+            document.getElementById('brain-picker-list').innerHTML =
+              '<div style="color:#e66">' + escapeHtml(data.error || 'browse failed') + '</div>';
+            return;
+          }
+          _brainPickerCurrent = data.path;
+          document.getElementById('brain-picker-path').value = data.path;
+          const items = data.items || [];
+          const rows = items.map((it) => {
+            const icon = it.isDir ? '📁' : '📄';
+            const detail = it.isDir ? '' : '<span style="color:var(--muted);font-size:12px;margin-left:8px">' + brainHumanBytes(it.sizeBytes) + '</span>';
+            return '<div style="padding:4px 0;cursor:pointer" onclick="brainPickerClick(' + JSON.stringify(it).replace(/"/g, '&quot;') + ')">' +
+              icon + ' ' + escapeHtml(it.name) + detail + '</div>';
+          }).join('');
+          document.getElementById('brain-picker-list').innerHTML = rows || '<div style="color:var(--muted)">(empty)</div>';
+        }
+
+        function brainPickerClick(item) {
+          if (item.isDir) {
+            brainPickerLoad(item.path);
+          } else {
+            document.getElementById('brain-seed-path').value = item.path;
+            document.getElementById('brain-picker').style.display = 'none';
+          }
+        }
+
+        function brainPickerChoose() {
+          document.getElementById('brain-seed-path').value = _brainPickerCurrent;
+          document.getElementById('brain-picker').style.display = 'none';
+        }
+
+        // Wire tab refresh on switchTab → brain tabs
+        (function() {
+          const origSwitch = window.switchTab;
+          window.switchTab = function(page, tab) {
+            origSwitch(page, tab);
+            if (page === 'intelligence' && tab === 'sources') brainLoadSources();
+            if (page === 'intelligence' && tab === 'runs') brainLoadRuns();
+          };
+        })();
+      </script>
     </div>
 
     <!-- Hidden: Sessions (shown in Home tabs in Phase 2) -->
