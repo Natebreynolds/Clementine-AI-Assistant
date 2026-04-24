@@ -29,21 +29,22 @@ export function setLLMOverride(fn: LLMCallFn | null): void {
 let client: Anthropic | null = null;
 function getClient(): Anthropic {
   if (!client) {
-    // Honor Clementine's credential precedence (see src/config.ts):
-    // CLAUDE_CODE_OAUTH_TOKEN > ANTHROPIC_AUTH_TOKEN > ANTHROPIC_API_KEY.
-    // The config module loads from ~/.clementine/.env + Keychain, which is
-    // where `clementine login` stores the OAuth token — process.env alone
-    // is not enough.
-    const authToken =
-      CLAUDE_CODE_OAUTH_TOKEN ||
-      process.env.CLAUDE_CODE_OAUTH_TOKEN ||
-      process.env.ANTHROPIC_AUTH_TOKEN;
+    // Brain ingestion calls the raw Messages API. Anthropic does NOT
+    // accept OAuth tokens (from `clementine login`) on /v1/messages —
+    // only API keys — so we require one explicitly and surface a clear
+    // remediation message when it's missing. OAuth works for the Agent
+    // SDK used elsewhere in Clementine; routing brain calls through the
+    // SDK is a future option, but for now an API key is required.
     const apiKey = ANTHROPIC_API_KEY || process.env.ANTHROPIC_API_KEY;
-    if (authToken) {
-      client = new Anthropic({ authToken });
-    } else {
-      client = new Anthropic({ apiKey });
+    if (!apiKey) {
+      const hasOauth = Boolean(CLAUDE_CODE_OAUTH_TOKEN || process.env.CLAUDE_CODE_OAUTH_TOKEN);
+      throw new Error(
+        hasOauth
+          ? 'Brain ingestion requires an Anthropic API key. Your OAuth token (from `clementine login`) works for the Agent SDK but not for the Messages API used here. Run `clementine login --api-key` or set ANTHROPIC_API_KEY in ~/.clementine/.env.'
+          : 'Brain ingestion requires an Anthropic API key. Run `clementine login --api-key` or set ANTHROPIC_API_KEY in ~/.clementine/.env.',
+      );
     }
+    client = new Anthropic({ apiKey });
   }
   return client;
 }
