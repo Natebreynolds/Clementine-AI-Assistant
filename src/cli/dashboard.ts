@@ -2497,23 +2497,149 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
 
   app.get('/api/brain/connectors', async (_req, res) => {
     try {
-      const { getClaudeIntegrations } = await import('../agent/mcp-bridge.js');
+      const { getClaudeIntegrations, loadToolInventory } = await import('../agent/mcp-bridge.js');
       const { RECIPES } = await import('../brain/connector-recipes.js');
-      const integrations = getClaudeIntegrations();
-      // A connector is "useful" for feeds only if it has surfaced some
-      // substantive tools (not just the stubbed authenticate/complete pair).
-      const meaningful = integrations.map((i) => ({
-        ...i,
-        hasFeedReadyTools: i.tools.some((t) => !/^(authenticate|complete_authentication)$/.test(t)),
-      }));
+
+      // Claude Desktop integrations carry richer metadata (label, connected
+      // state, firstSeen/lastUsed). Everything else we infer from the SDK
+      // tool inventory by grouping mcp__<server>__<tool> by server prefix.
+      const claudeDesktop = getClaudeIntegrations();
+      const claudeDesktopByName = new Map(claudeDesktop.map((c) => [c.name, c]));
+
+      const inv = loadToolInventory();
+      const mcpByServer = new Map<string, string[]>();
+      for (const toolName of (inv?.tools ?? [])) {
+        if (!toolName.startsWith('mcp__')) continue;
+        const body = toolName.slice(5); // strip "mcp__"
+        const idx = body.indexOf('__');
+        if (idx < 1) continue;
+        const server = body.slice(0, idx);
+        const tool = body.slice(idx + 2);
+        if (!mcpByServer.has(server)) mcpByServer.set(server, []);
+        mcpByServer.get(server)!.push(tool);
+      }
+
+      const integrations: Array<{
+        name: string;
+        label: string;
+        kind: 'claude-desktop' | 'mcp-server';
+        tools: string[];
+        connected: boolean;
+        hasFeedReadyTools: boolean;
+      }> = [];
+
+      // First, Claude Desktop integrations (match claude_ai_<Name>)
+      for (const [server, tools] of mcpByServer.entries()) {
+        if (!server.startsWith('claude_ai_')) continue;
+        const name = server.slice('claude_ai_'.length);
+        const cd = claudeDesktopByName.get(name);
+        integrations.push({
+          name,
+          label: cd?.label ?? name.replace(/_/g, ' '),
+          kind: 'claude-desktop',
+          tools,
+          connected: cd?.connected ?? true,
+          hasFeedReadyTools: tools.some((t) => !/^(authenticate|complete_authentication)$/.test(t)),
+        });
+      }
+
+      // Then, every other MCP server. These are directly reachable through
+      // the Agent SDK because probeAvailableTools() saw them in init.tools.
+      for (const [server, tools] of mcpByServer.entries()) {
+        if (server.startsWith('claude_ai_')) continue;
+        integrations.push({
+          name: server,
+          label: server.replace(/[-_]/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase()),
+          kind: 'mcp-server',
+          tools,
+          connected: true, // if it's in the inventory, the SDK can call it
+          hasFeedReadyTools: tools.length > 0,
+        });
+      }
+
+      integrations.sort((a, b) => a.label.localeCompare(b.label));
+
       res.json({
-        integrations: meaningful,
+        integrations,
         recipes: RECIPES.map((r) => ({
           id: r.id, label: r.label, description: r.description, icon: r.icon,
           integration: r.integration, fields: r.fields,
           defaultSchedule: r.defaultSchedule, tier: r.tier,
         })),
       });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  // In-memory probe cache. Each entry is (tool, intent) → {items, expiresAt}.
+  // 10-minute TTL so repeated wizard opens don't repeatedly hit Haiku, but
+  // fresh enough that newly-created folders / labels appear within minutes.
+  const brainProbeCache = new Map<string, { items: Array<{ id: string; label: string; sublabel?: string }>; expiresAt: number }>();
+  const BRAIN_PROBE_TTL_MS = 10 * 60 * 1000;
+
+  app.post('/api/brain/mcp/probe', async (req, res) => {
+    try {
+      const body = (req.body ?? {}) as { tool?: string; intent?: string; force?: boolean };
+      const tool = String(body.tool ?? '').trim();
+      const intent = String(body.intent ?? '').trim();
+      if (!tool) { res.status(400).json({ error: 'tool is required' }); return; }
+      if (!intent) { res.status(400).json({ error: 'intent is required' }); return; }
+
+      const cacheKey = `${tool}::${intent}`;
+      if (!body.force) {
+        const cached = brainProbeCache.get(cacheKey);
+        if (cached && cached.expiresAt > Date.now()) {
+          res.json({ items: cached.items, cached: true });
+          return;
+        }
+      }
+
+      const { query } = await import('@anthropic-ai/claude-agent-sdk');
+      const { parseJsonResponse } = await import('../brain/llm-client.js');
+      const { MODELS } = await import('../config.js');
+
+      // Strict prompt: force JSON-only output. The tool lookup goes through
+      // the SDK so claude_ai_* and regular MCP servers work uniformly.
+      const stream = query({
+        prompt: `Call the tool \`${tool}\` to ${intent}.
+Return ONLY a JSON array. Each element must be an object with shape \`{"id": string, "label": string, "sublabel"?: string}\`. Use the source system's stable id for \`id\` (so the feed can reference it later). Use a short human-readable title for \`label\`. Optional \`sublabel\` can include path, email, date, or any disambiguating detail.
+Do NOT include prose, markdown, code fences, or explanation. Just the JSON array.
+If the tool returns nothing or errors, return an empty array \`[]\`.`,
+        options: {
+          model: MODELS.haiku,
+          maxTurns: 3,
+          systemPrompt: 'You are a data enumerator. You call the given tool once, extract the items from its response, and emit a strict JSON array. No commentary.',
+          allowedTools: [tool],
+          permissionMode: 'bypassPermissions',
+          settingSources: [],
+        },
+      });
+
+      let text = '';
+      for await (const msg of stream) {
+        if ((msg as any).type === 'assistant') {
+          const content = (msg as any).message?.content ?? [];
+          for (const block of content) {
+            if (block.type === 'text' && typeof block.text === 'string') text += block.text;
+          }
+        } else if ((msg as any).type === 'result') {
+          break;
+        }
+      }
+
+      const parsed = parseJsonResponse<Array<{ id: string; label: string; sublabel?: string }>>(text);
+      const items = Array.isArray(parsed)
+        ? parsed
+            .filter((p) => p && typeof p.id === 'string' && typeof p.label === 'string')
+            .map((p) => ({ id: p.id, label: p.label, sublabel: typeof p.sublabel === 'string' ? p.sublabel : undefined }))
+        : [];
+
+      brainProbeCache.set(cacheKey, { items, expiresAt: Date.now() + BRAIN_PROBE_TTL_MS });
+      // Always include a short preview of the agent's raw output so the UI
+      // can explain why a picker is empty (common causes: tool errored, tool
+      // returned nothing matching, agent refused in prose).
+      res.json({ items, cached: false, rawPreview: text.slice(0, 400) });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }
@@ -10603,6 +10729,75 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
           brainFeedWizardRender();
         }
 
+        async function brainRenderFieldPicker(field, values) {
+          const container = document.querySelector('[data-field-picker="' + field.key + '"]');
+          const hidden = document.querySelector('input[type=hidden][data-field="' + field.key + '"]');
+          if (!container || !hidden) return;
+          const picker = field.picker;
+
+          try {
+            const resp = await apiFetch('/api/brain/mcp/probe', {
+              method: 'POST', headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ tool: picker.tool, intent: picker.intent }),
+            });
+            const data = await resp.json();
+            if (!resp.ok) throw new Error(data.error || 'probe failed');
+
+            const items = data.items || [];
+            const currentVal = hidden.value || values[field.key] || '';
+
+            if (!items.length) {
+              // No items returned. Fall back to a plain text input so the user
+              // can still set the value manually.
+              container.innerHTML =
+                '<input type="text" value="' + escapeHtml(currentVal) + '" placeholder="(type a value)" style="width:100%" oninput="(document.querySelector(\\'input[type=hidden][data-field=' + field.key + ']\\')||{}).value=this.value">' +
+                '<div style="color:#8a5a00;font-size:11px;margin-top:4px">Nothing returned from the probe — type a value manually' + (data.rawPreview ? ' (probe output: ' + escapeHtml(data.rawPreview.slice(0, 120)) + '…)' : '') + '</div>';
+              return;
+            }
+
+            const options = items.map(function(it) {
+              const selected = it.id === currentVal ? ' selected' : '';
+              const lbl = it.label + (it.sublabel ? ' — ' + it.sublabel : '');
+              return '<option value="' + escapeHtml(it.id) + '"' + selected + '>' + escapeHtml(lbl) + '</option>';
+            }).join('');
+
+            const customAllowed = picker.allowCustom;
+            container.innerHTML =
+              '<select style="width:100%;padding:6px" onchange="(document.querySelector(\\'input[type=hidden][data-field=' + field.key + ']\\')||{}).value=this.value">' +
+                (currentVal && !items.find(function(i) { return i.id === currentVal; }) ? '<option value="' + escapeHtml(currentVal) + '" selected>' + escapeHtml(currentVal) + ' (custom)</option>' : '') +
+                '<option value="">— pick one —</option>' +
+                options +
+              '</select>' +
+              '<div style="font-size:11px;color:var(--muted);margin-top:4px">' +
+                items.length + ' result' + (items.length === 1 ? '' : 's') + (data.cached ? ' (cached)' : ' from ' + escapeHtml(picker.tool)) +
+                (customAllowed ? ' · <a href="#" onclick="brainFieldPickerToggleCustom(\\'' + field.key + '\\', \\'' + encodeURIComponent(JSON.stringify(picker)) + '\\');return false">type a custom value instead</a>' : '') +
+              '</div>';
+            // Ensure the hidden input matches the initial selection
+            if (!hidden.value && items[0]) hidden.value = '';
+          } catch (err) {
+            container.innerHTML =
+              '<input type="text" value="' + escapeHtml(values[field.key] || '') + '" placeholder="(probe failed — type manually)" style="width:100%" oninput="(document.querySelector(\\'input[type=hidden][data-field=' + field.key + ']\\')||{}).value=this.value">' +
+              '<div style="color:#e66;font-size:11px;margin-top:4px">Picker failed: ' + escapeHtml(String(err && err.message ? err.message : err)) + ' — type a value manually.</div>';
+          }
+        }
+
+        function brainFieldPickerToggleCustom(fieldKey, encodedPicker) {
+          const container = document.querySelector('[data-field-picker="' + fieldKey + '"]');
+          const hidden = document.querySelector('input[type=hidden][data-field="' + fieldKey + '"]');
+          if (!container || !hidden) return;
+          container.innerHTML =
+            '<input type="text" value="' + escapeHtml(hidden.value || '') + '" placeholder="(type a value)" style="width:100%" oninput="(document.querySelector(\\'input[type=hidden][data-field=' + fieldKey + ']\\')||{}).value=this.value">' +
+            '<div style="font-size:11px;margin-top:4px"><a href="#" onclick="brainFieldPickerReload(\\'' + fieldKey + '\\', \\'' + encodedPicker + '\\');return false">← back to picker</a></div>';
+        }
+
+        async function brainFieldPickerReload(fieldKey, encodedPicker) {
+          const picker = JSON.parse(decodeURIComponent(encodedPicker));
+          const s = brainFeedWizardState;
+          if (!s) return;
+          const field = (s.recipe.fields || []).find(function(f) { return f.key === fieldKey; });
+          if (field) await brainRenderFieldPicker(field, s.values);
+        }
+
         function brainFeedWizardRender() {
           if (!brainFeedWizardState) return;
           const s = brainFeedWizardState;
@@ -10648,13 +10843,30 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
             if (!fields.length) {
               html = '<div style="color:var(--muted)">This recipe has no fields. Click Next to pick a schedule.</div>';
             } else {
-              html = '<div style="display:grid;grid-template-columns:180px 1fr;gap:10px;align-items:center">' +
+              html = '<div style="display:grid;grid-template-columns:180px 1fr;gap:10px;align-items:start">' +
                 fields.map(function(f) {
                   const val = s.values[f.key] != null ? s.values[f.key] : (f.defaultValue || '');
                   const help = f.help ? '<div style="font-size:11px;color:var(--muted);margin-top:2px">' + escapeHtml(f.help) + '</div>' : '';
-                  return '<label style="font-weight:500">' + escapeHtml(f.label) + (f.required ? ' <span style="color:#e66">*</span>' : '') + '</label>' +
-                    '<div><input type="text" data-field="' + f.key + '" value="' + escapeHtml(val) + '" placeholder="' + escapeHtml(f.placeholder || '') + '" style="width:100%">' + help + '</div>';
+                  let control;
+                  if (f.picker) {
+                    // Pickers render their own container; fetchPicker fills it.
+                    control = '<div data-field-picker="' + f.key + '" style="width:100%">' +
+                      '<div style="color:var(--muted);font-size:13px;padding:6px">Loading choices…</div>' +
+                    '</div>' +
+                    '<input type="hidden" data-field="' + f.key + '" value="' + escapeHtml(val) + '">';
+                  } else {
+                    control = '<input type="text" data-field="' + f.key + '" value="' + escapeHtml(val) + '" placeholder="' + escapeHtml(f.placeholder || '') + '" style="width:100%">';
+                  }
+                  return '<label style="font-weight:500;padding-top:6px">' + escapeHtml(f.label) + (f.required ? ' <span style="color:#e66">*</span>' : '') + '</label>' +
+                    '<div>' + control + help + '</div>';
                 }).join('') + '</div>';
+
+              // After render, fire probes for any picker fields.
+              setTimeout(function() {
+                for (const f of fields) {
+                  if (f.picker) brainRenderFieldPicker(f, s.values);
+                }
+              }, 0);
             }
           } else if (s.step === 3) {
             const chips = brainScheduleChips();

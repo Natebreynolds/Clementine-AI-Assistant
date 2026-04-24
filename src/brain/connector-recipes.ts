@@ -18,6 +18,18 @@
  *   {{slug}}       — the feed's computed slug (used for folder + dedup)
  */
 
+export interface RecipeFieldPicker {
+  /** Full tool name, e.g. "mcp__claude_ai_Google_Drive__search_files" */
+  tool: string;
+  /** Natural-language instruction to the probe agent — becomes the body of
+   *  "Call the tool X to {intent}, return a JSON array of {id, label}". */
+  intent: string;
+  /** If true, user can type a custom value instead of picking from the list
+   *  (falls back to the raw text). Useful when the source allows queries
+   *  that aren't enumerable. */
+  allowCustom?: boolean;
+}
+
 export interface RecipeField {
   key: string;
   label: string;
@@ -25,6 +37,8 @@ export interface RecipeField {
   help?: string;
   required?: boolean;
   defaultValue?: string;
+  /** When present, render as a searchable picker populated by /api/brain/mcp/probe. */
+  picker?: RecipeFieldPicker;
 }
 
 export interface ConnectorRecipe {
@@ -81,8 +95,17 @@ export const RECIPES: ConnectorRecipe[] = [
     integration: 'Google_Drive',
     requiredTools: ['search_files', 'read_file_content'],
     fields: [
-      { key: 'folder', label: 'Folder name or partial path', placeholder: 'Active Projects', required: true,
-        help: 'The wizard searches Drive for folders matching this text. Exact name is safest.' },
+      {
+        key: 'folder',
+        label: 'Folder',
+        required: true,
+        help: 'Pick a folder from your Google Drive. You can also type a name to filter the list.',
+        picker: {
+          tool: 'mcp__claude_ai_Google_Drive__search_files',
+          intent: 'find up to 20 Google Drive folders. Call search_files exactly once with mimeType filter "application/vnd.google-apps.folder". For each returned folder, output {id: folder.id, label: folder.name, sublabel: "Modified " + folder.modifiedTime}.',
+          allowCustom: true,
+        },
+      },
     ],
     defaultSchedule: '0 8 * * *',
     tier: 2,
@@ -209,7 +232,17 @@ Steps:
     integration: 'Microsoft_365',
     requiredTools: ['sharepoint_folder_search', 'read_resource'],
     fields: [
-      { key: 'folder', label: 'Folder path or name', placeholder: 'Shared Documents/Proposals', required: true },
+      {
+        key: 'folder',
+        label: 'Folder',
+        required: true,
+        help: 'Pick a SharePoint folder. Type to filter.',
+        picker: {
+          tool: 'mcp__claude_ai_Microsoft_365__sharepoint_folder_search',
+          intent: 'list available SharePoint folders and document libraries. Use the folder\'s drive-item id as id, the folder name as label, and the site/library path as sublabel.',
+          allowCustom: true,
+        },
+      },
     ],
     defaultSchedule: '0 8 * * *',
     tier: 2,
@@ -223,6 +256,41 @@ Steps:
 2. For each file, use \`read_resource\` to fetch content.
 3. For each record: \`externalId\` = the SharePoint item id, \`title\` = the file name, \`content\` = the extracted text, \`metadata\` = \`{path, modifiedAt, author, size}\`.
 4. ${COMMIT_INSTRUCTIONS.replace(/{{slug}}/g, ctx.slug).replace(/{{targetFolder}}/g, ctx.targetFolder)}
+`,
+  },
+
+  {
+    id: 'imessage-thread',
+    label: 'iMessage: watch a conversation',
+    description: 'Ingest recent messages from a specific iMessage contact into the brain.',
+    icon: '💬',
+    integration: 'imessage',
+    requiredTools: ['search_contacts', 'read_imessages'],
+    fields: [
+      {
+        key: 'contact',
+        label: 'Contact',
+        required: true,
+        help: 'Pick an iMessage contact. Their phone number or email becomes the thread id.',
+        picker: {
+          tool: 'mcp__imessage__search_contacts',
+          intent: 'list my iMessage contacts. Use the handle (phone number or email) as id, the display name (or handle if no name) as label, and the most-recent-message date as sublabel.',
+          allowCustom: true,
+        },
+      },
+      { key: 'limit', label: 'Max messages per run', placeholder: '50', defaultValue: '50' },
+    ],
+    defaultSchedule: '0 */6 * * *',
+    tier: 2,
+    slugFromValues: (v) => `imessage-${slugify(v.contact || 'thread')}`,
+    buildPrompt: (v, ctx) => `You are running the iMessage feed for contact "${v.contact}".
+
+Goal: ingest up to ${v.limit || '50'} recent iMessage messages from the thread with ${v.contact} into the brain.
+
+Steps:
+1. Call \`read_imessages\` (iMessage) for contact "${v.contact}" with limit ${v.limit || '50'}.
+2. For each message: \`externalId\` = the message id (or a stable hash of contact + timestamp + text if no id), \`title\` = first 60 chars of the text or "[attachment]", \`content\` = "From: <handle>\\nDate: <iso>\\n\\n<text>", \`metadata\` = \`{contact, sender, timestamp, isFromMe, service}\`.
+3. ${COMMIT_INSTRUCTIONS.replace(/{{slug}}/g, ctx.slug).replace(/{{targetFolder}}/g, ctx.targetFolder)}
 `,
   },
 
