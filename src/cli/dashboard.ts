@@ -1231,28 +1231,16 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
 
   const port = parseInt(opts.port ?? '3030', 10);
   const app = express();
-  // Only parse JSON bodies on POST/PUT/PATCH — GET requests don't need body parsing
   const jsonParser = express.json({ limit: '5mb' });
-  app.use((req, res, next) => {
-    if (req.method === 'GET' || req.method === 'HEAD' || req.method === 'OPTIONS') return next();
-    jsonParser(req, res, next);
-  });
+  const rawBodyParser = express.raw({ type: '*/*', limit: '5mb' });
 
   // Health check — always responds, no auth, no middleware dependency
   app.get('/health', (_req, res) => { res.json({ ok: true, ts: Date.now() }); });
 
-  // ── Webhook ingestion ─────────────────────────────────────────────
-  //
-  // Inbound HTTP endpoint for brain sources with kind='webhook'. Each
-  // registered webhook source has a credentialRef whose value is the
-  // shared secret; callers sign the raw body with HMAC-SHA256 and send
-  // it in the `X-Signature: sha256=<hex>` header. No dashboard token
-  // required — HMAC IS the auth.
-  //
-  // Registered BEFORE the /api auth middleware so the bearer check
-  // doesn't kick in; uses its own raw-body parser so the bytes we
-  // verify are identical to what the client signed.
-  const rawBodyParser = express.raw({ type: '*/*', limit: '5mb' });
+  // ── Webhook ingestion (raw-body, HMAC-authed) ─────────────────────
+  // MUST be registered BEFORE the generic json parser below — otherwise
+  // that parser consumes the body and HMAC verification fails since we
+  // need to hash the exact bytes the client signed.
   app.post('/webhook/:slug', rawBodyParser, async (req, res) => {
     const slug = req.params.slug;
     try {
@@ -1268,7 +1256,6 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
       const secret = getCredential(source.credentialRef);
       if (!secret) { res.status(500).json({ error: 'HMAC secret not found in credentials store' }); return; }
 
-      // Verify signature. Accept both `sha256=<hex>` and raw hex.
       const sig = String(req.headers['x-signature'] ?? req.headers['x-hub-signature-256'] ?? '').trim();
       const rawBody: Buffer = Buffer.isBuffer(req.body) ? req.body : Buffer.from(String(req.body ?? ''));
       const expected = createHmac('sha256', secret).update(rawBody).digest('hex');
@@ -1278,17 +1265,13 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
         return;
       }
 
-      // Parse payload. Support single object or array of objects.
       let payload: unknown;
-      try {
-        payload = JSON.parse(rawBody.toString('utf-8'));
-      } catch (err) {
+      try { payload = JSON.parse(rawBody.toString('utf-8')); } catch (err) {
         res.status(400).json({ error: `Body is not JSON: ${err instanceof Error ? err.message : String(err)}` });
         return;
       }
       const items = Array.isArray(payload) ? payload : [payload];
 
-      // Build a one-shot iterator of RawRecords from the payload
       const { contentHash, pickIdField } = await import('../brain/adapters/common.js');
       const records = (async function* () {
         let idField: string | null = null;
@@ -1307,7 +1290,7 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
               .join('\n'),
             rawPayload: rawJson,
             metadata: {
-              adapter: 'rest',       // treat webhook payloads as structured records
+              adapter: 'rest',
               source_slug: slug,
               received_at: new Date().toISOString(),
               record_index: i,
@@ -1336,6 +1319,13 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
     for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
     return diff === 0;
   }
+
+  // Only parse JSON bodies on POST/PUT/PATCH — GET requests don't need body parsing.
+  // Registered AFTER the webhook route so /webhook/* keeps its raw body.
+  app.use((req, res, next) => {
+    if (req.method === 'GET' || req.method === 'HEAD' || req.method === 'OPTIONS') return next();
+    jsonParser(req, res, next);
+  });
 
   // ── Dashboard authentication ────────────────────────────────────────
   const dashboardToken = randomBytes(24).toString('hex');
