@@ -1,16 +1,19 @@
 /**
  * Clementine — Brain LLM client.
  *
- * Routes single-shot distillation/schema-inference calls through the
- * PersonalAssistant's `runPlanStep()`, which uses the Claude Agent SDK
- * under the hood. That path honors OAuth tokens from `clementine login`
- * (the raw Messages API does not), so brain ingestion works with
- * whatever credentials the rest of Clementine already uses.
+ * Single-shot completions via the Claude Agent SDK so OAuth tokens from
+ * `clementine login` work (the raw Messages API rejects OAuth). We use
+ * the low-level `query()` with a minimal option set — no tools, no
+ * plan-mode effort budgets, no setting sources — because ingestion just
+ * wants "prompt in → text out". `PersonalAssistant.runPlanStep()` is
+ * overkill here and its `effort: 'high'` default triggers task budgets
+ * that Haiku doesn't support.
  *
  * Tests inject a deterministic override via `setLLMOverride()` so the
  * pipeline can be verified without spawning the SDK subprocess.
  */
 
+import { query } from '@anthropic-ai/claude-agent-sdk';
 import { MODELS } from '../config.js';
 
 export interface LLMCallOpts {
@@ -32,23 +35,10 @@ export function setLLMOverride(fn: LLMCallFn | null): void {
   override = fn;
 }
 
-// Lazy singleton — we avoid spinning up the assistant (which loads SOUL,
-// agent profiles, etc.) unless the pipeline actually needs an LLM call.
-let _assistant: unknown | null = null;
-async function getAssistant(): Promise<{ runPlanStep: (id: string, prompt: string, opts?: Record<string, unknown>) => Promise<string> }> {
-  if (_assistant) return _assistant as any;
-  const { PersonalAssistant } = await import('../agent/assistant.js');
-  _assistant = new PersonalAssistant();
-  return _assistant as any;
-}
-
 /** Single-shot completion. Returns the assistant's text output. */
 export async function callLLM(prompt: string, opts: LLMCallOpts = {}): Promise<string> {
   if (override) return override(prompt, opts);
 
-  // Inline the system prompt and format hint into the user prompt since
-  // runPlanStep takes a single string. The SDK's own security prompt is
-  // still applied; ours sits on top for task-specific guidance.
   const systemParts: string[] = [];
   if (opts.system) systemParts.push(opts.system);
   if (opts.format === 'json') {
@@ -56,21 +46,38 @@ export async function callLLM(prompt: string, opts: LLMCallOpts = {}): Promise<s
       'Respond with a single valid JSON object. No prose, no code fences, no explanation.',
     );
   }
-  const finalPrompt = systemParts.length
-    ? `${systemParts.join('\n\n')}\n\n---\n\n${prompt}`
-    : prompt;
 
-  const assistant = await getAssistant();
-  const stepId = opts.stepId ?? 'brain-call';
-  const model = opts.model ?? MODELS.haiku;
-
-  const result = await assistant.runPlanStep(stepId, finalPrompt, {
-    tier: 1,            // low-security (read-only, no tools)
-    maxTurns: 1,        // single assistant turn
-    disableTools: true, // no tool use — pure completion
-    model,
+  const stream = query({
+    prompt,
+    options: {
+      model: opts.model ?? MODELS.haiku,
+      maxTurns: 1,
+      systemPrompt: systemParts.join('\n\n') || undefined,
+      // No built-in tools: brain calls are pure completions
+      tools: [],
+      permissionMode: 'bypassPermissions',
+      // Don't inherit user ~/.claude settings — those pull in hooks,
+      // allowed-tool lists, and statusline config that can slow or
+      // fail our minimal call.
+      settingSources: [],
+    },
   });
-  return (result ?? '').trim();
+
+  let assistantText = '';
+  for await (const message of stream) {
+    if (message.type === 'assistant') {
+      const content = (message as { message?: { content?: Array<{ type: string; text?: string }> } })
+        .message?.content ?? [];
+      for (const block of content) {
+        if (block.type === 'text' && typeof block.text === 'string') {
+          assistantText += block.text;
+        }
+      }
+    } else if (message.type === 'result') {
+      break; // Single-turn done
+    }
+  }
+  return assistantText.trim();
 }
 
 /** Parse a JSON response defensively (strip code fences, trailing text). */
