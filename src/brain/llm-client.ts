@@ -7,7 +7,7 @@
  */
 
 import Anthropic from '@anthropic-ai/sdk';
-import { MODELS, ANTHROPIC_API_KEY } from '../config.js';
+import { MODELS, ANTHROPIC_API_KEY, CLAUDE_CODE_OAUTH_TOKEN } from '../config.js';
 
 export interface LLMCallOpts {
   model?: string;
@@ -29,11 +29,13 @@ export function setLLMOverride(fn: LLMCallFn | null): void {
 let client: Anthropic | null = null;
 function getClient(): Anthropic {
   if (!client) {
-    // Honor the same credential precedence the rest of Clementine uses:
-    // OAuth token > legacy auth token > API key. The Anthropic SDK will
-    // throw "Could not resolve authentication method" if we pass only
-    // apiKey when the user has set an OAuth token instead.
+    // Honor Clementine's credential precedence (see src/config.ts):
+    // CLAUDE_CODE_OAUTH_TOKEN > ANTHROPIC_AUTH_TOKEN > ANTHROPIC_API_KEY.
+    // The config module loads from ~/.clementine/.env + Keychain, which is
+    // where `clementine login` stores the OAuth token — process.env alone
+    // is not enough.
     const authToken =
+      CLAUDE_CODE_OAUTH_TOKEN ||
       process.env.CLAUDE_CODE_OAUTH_TOKEN ||
       process.env.ANTHROPIC_AUTH_TOKEN;
     const apiKey = ANTHROPIC_API_KEY || process.env.ANTHROPIC_API_KEY;
