@@ -279,16 +279,10 @@ Steps:
     fields: [
       {
         key: 'contact',
-        label: 'Contact',
+        label: 'Phone number or email',
+        placeholder: '+15551234567  or  someone@example.com',
         required: true,
-        help: 'Pick an iMessage contact. Their phone number or email becomes the thread id.',
-        picker: {
-          tool: 'mcp__imessage__search_contacts',
-          intent: 'call search_contacts with query "{{query}}". For each match, output {id: the contact\'s phone number or email handle, label: the display name (or the handle if no name), sublabel: "handle: " + handle}. Return up to 15 results.',
-          queryArg: 'query',
-          minQueryLength: 2,
-          allowCustom: true,
-        },
+        help: 'Paste the contact\'s iMessage handle exactly as it appears in your Messages thread. The iMessage MCP\'s search_contacts reads the Contacts app via AppleScript and is unreliable — we bypass it by letting you paste the handle directly.',
       },
       { key: 'limit', label: 'Max messages per run', placeholder: '50', defaultValue: '50' },
     ],

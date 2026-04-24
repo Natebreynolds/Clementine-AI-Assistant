@@ -2602,7 +2602,14 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
 
       const { query } = await import('@anthropic-ai/claude-agent-sdk');
       const { parseJsonResponse } = await import('../brain/llm-client.js');
+      const { getMcpServersForAgent } = await import('../agent/mcp-bridge.js');
       const { MODELS } = await import('../config.js');
+
+      // Pass the full MCP server map so the one-shot probe can call
+      // Extension-provided tools (iMessage, figma, supabase, etc.).
+      // Without this the SDK only sees built-in + claude_ai_* tools
+      // and every Extension tool call is silently rejected at runtime.
+      const mcpServers = getMcpServersForAgent();
 
       // Strict prompt: force JSON-only output. The tool lookup goes through
       // the SDK so claude_ai_* and regular MCP servers work uniformly.
@@ -2616,6 +2623,7 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
           maxTurns: 3,
           systemPrompt: 'You are a data enumerator. You call the given tool once, extract the items from its response, and emit a strict JSON array. No commentary.',
           allowedTools: [tool],
+          mcpServers,
           permissionMode: 'bypassPermissions',
           settingSources: [],
         },
@@ -10765,7 +10773,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
                 return;
               }
               brainPickerTypeahead[field.key] = {
-                timer: setTimeout(function() { brainFireTypeaheadProbe(field, q); }, 400),
+                timer: setTimeout(function() { brainFireTypeaheadProbe(field, q); }, 600),
               };
             };
             return;
@@ -10831,7 +10839,15 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
             if (!resp.ok) throw new Error(data.error || 'probe failed');
             const items = data.items || [];
             if (!items.length) {
-              resultsEl.innerHTML = '<div style="color:#8a5a00;font-size:12px;padding:6px">No matches for "' + escapeHtml(query) + '"' + (data.rawPreview ? ' (' + escapeHtml(data.rawPreview.slice(0, 100)) + ')' : '') + '</div>';
+              // If the raw preview is anything other than an empty array (with
+              // or without a markdown code fence), show it so the user can tell
+              // whether the tool actually ran.
+              const trimmed = (data.rawPreview || '').trim();
+              const isEmptyArray = /^\s*\[\s*\]\s*$/.test(trimmed.replace(/^[^\[]*/, '').replace(/[^\]]*$/, ''));
+              const rawHint = trimmed && !isEmptyArray
+                ? ' <span style="color:var(--muted)">Tool said: ' + escapeHtml(trimmed.slice(0, 140)) + '</span>'
+                : '';
+              resultsEl.innerHTML = '<div style="color:#8a5a00;font-size:12px;padding:6px">No matches for "' + escapeHtml(query) + '". The tool may be limited by macOS permissions or not support this query — use <a href="#" onclick="brainFieldPickerToggleCustom(\\'' + field.key + '\\', \\'\\');return false">type a value directly</a>.' + rawHint + '</div>';
               return;
             }
             resultsEl.innerHTML = items.map(function(it) {
