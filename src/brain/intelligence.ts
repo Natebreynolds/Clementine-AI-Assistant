@@ -33,7 +33,7 @@ Output a JSON object with these fields:
 - summary_template: one or two sentence string summarizing a row
 - tag_templates: array of tag strings (may include {{field}} placeholders)
 - frontmatter_keys: array of record field names to mirror into note frontmatter
-- structured_columns: array of { name, type } where type is "TEXT" | "REAL" | "INTEGER"; pick 3-10 columns that would support useful aggregate queries (amounts, dates, statuses, counts, ids)
+- structured_columns: MUST include every field that could support aggregate queries or filters — amounts, counts, dates, statuses, categories, ids, prices, scores, foreign keys. Type is "TEXT" | "REAL" | "INTEGER". Err on the side of MORE columns (3-10 is typical); an agent can't ask "total revenue by category" without both amount AND category as columns. Skip only free-form prose fields.
 - target_folder: short vault folder name like "04-Customers" or "04-Deals"
 - entity_hints: array of field names (person/company/product names) that should become [[wikilinks]] in the note body`;
 
@@ -343,6 +343,10 @@ export function classifyRecord(
   if (sourceIntelligence === 'template-only') return 'structured';
   if (sourceIntelligence === 'llm-per-record') return 'free-form';
   const adapter = (record.metadata?.adapter as string) ?? '';
-  if (adapter === 'csv' || adapter === 'json' || adapter === 'jsonl') return 'structured';
+  // Tabular / structured adapters use schema-infer + template (1 LLM call
+  // amortized across all rows). REST API responses are treated as
+  // structured by default — their payloads are almost always uniform
+  // JSON objects that benefit from column-based querying.
+  if (adapter === 'csv' || adapter === 'json' || adapter === 'jsonl' || adapter === 'rest') return 'structured';
   return 'free-form';
 }
