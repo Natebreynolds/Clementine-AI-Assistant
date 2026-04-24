@@ -2161,6 +2161,56 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
     }
   });
 
+  // ── Brain seed upload (native file picker → multipart → temp dir) ──
+  //
+  // Browsers can't expose real filesystem paths for security. Clicking
+  // the native file picker gives us File blobs; we save them to a
+  // per-upload folder under ~/.clementine/uploads/ preserving any
+  // webkitRelativePath structure (so a folder upload becomes a real
+  // on-disk folder the pipeline can walk).
+
+  {
+    const uploadsRoot = path.join(BASE_DIR, 'uploads');
+    if (!existsSync(uploadsRoot)) mkdirSync(uploadsRoot, { recursive: true });
+    const multer = (await import('multer')).default;
+    const storage = multer.diskStorage({
+      destination: (req, file, cb) => {
+        // Expect a header X-Upload-Id so multiple files share one folder
+        const uid = String(req.headers['x-upload-id'] ?? '').replace(/[^a-z0-9-]/gi, '') || randomBytes(6).toString('hex');
+        // Preserve folder structure from webkitRelativePath (sent as filename
+        // prefix). originalname may be "folder/sub/file.csv" for dir upload.
+        const rel = file.originalname || 'upload';
+        const safeRel = rel.split('/').map((s) => s.replace(/[^a-z0-9._-]+/gi, '_')).join('/');
+        const absDir = path.join(uploadsRoot, uid, path.dirname(safeRel));
+        if (!existsSync(absDir)) mkdirSync(absDir, { recursive: true });
+        cb(null, absDir);
+      },
+      filename: (_req, file, cb) => {
+        const rel = file.originalname || 'upload';
+        const safeBase = path.basename(rel).replace(/[^a-z0-9._-]+/gi, '_');
+        cb(null, safeBase);
+      },
+    });
+    const upload = multer({ storage, limits: { fileSize: 50 * 1024 * 1024, files: 500 } });
+
+    app.post('/api/brain/seed/upload', upload.array('files'), (req, res) => {
+      try {
+        const uid = String(req.headers['x-upload-id'] ?? '').replace(/[^a-z0-9-]/gi, '') ||
+          (Array.isArray(req.files) && req.files.length > 0 ? path.basename(path.dirname((req.files[0] as Express.Multer.File).path)) : '');
+        const rootDir = uid ? path.join(uploadsRoot, uid) : uploadsRoot;
+        const files = (req.files as Express.Multer.File[] | undefined) ?? [];
+        res.json({
+          path: rootDir,
+          uploadId: uid,
+          count: files.length,
+          totalBytes: files.reduce((a, f) => a + (f.size ?? 0), 0),
+        });
+      } catch (err) {
+        res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+      }
+    });
+  }
+
   // ── Filesystem browser (used by Brain seed picker) ─────────────
   //
   // Localhost-only, auth-protected. Expands ~, resolves symlinks, and
@@ -9753,23 +9803,23 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
               Supports CSV, JSON, JSONL, Markdown, PDF, email (.eml / .mbox), DOCX. Preview runs the first 10 records through the full pipeline without writing anything; Commit ingests everything.
             </div>
 
-            <div style="display:flex;gap:8px;margin-bottom:8px">
-              <button class="btn" onclick="brainOpenPicker()" style="white-space:nowrap">📂 Browse…</button>
-              <input type="text" id="brain-seed-path" placeholder="/Users/you/exports/customers.csv" style="flex:1">
+            <!-- Primary: native file/folder pickers -->
+            <div style="display:flex;gap:8px;margin-bottom:8px;flex-wrap:wrap">
+              <button class="btn-primary" onclick="document.getElementById('brain-file-input').click()">📄 Choose file(s)…</button>
+              <button class="btn-primary" onclick="document.getElementById('brain-folder-input').click()">📁 Choose folder…</button>
               <input type="text" id="brain-seed-slug" placeholder="slug (auto if blank)" style="width:220px">
             </div>
+            <input type="file" id="brain-file-input" multiple style="display:none" onchange="brainHandleFilesChosen(this.files, false)">
+            <input type="file" id="brain-folder-input" webkitdirectory directory multiple style="display:none" onchange="brainHandleFilesChosen(this.files, true)">
+            <div id="brain-upload-status" style="margin-bottom:8px;color:var(--muted);font-size:13px"></div>
 
-            <!-- File picker (hidden by default) -->
-            <div id="brain-picker" style="display:none;margin:10px 0;border:1px solid var(--border);border-radius:6px;overflow:hidden">
-              <div style="padding:8px 12px;background:#1a1a24;display:flex;gap:8px;align-items:center">
-                <button class="btn" onclick="brainPickerUp()">⬆</button>
-                <input type="text" id="brain-picker-path" style="flex:1" onkeydown="if(event.key==='Enter')brainPickerGo()">
-                <button class="btn" onclick="brainPickerGo()">Go</button>
-                <button class="btn" onclick="brainPickerChoose()">Use this folder</button>
-                <button class="btn" onclick="document.getElementById('brain-picker').style.display='none'">✕</button>
+            <!-- Secondary: for power users who want to point at an existing on-disk path -->
+            <details style="margin-bottom:8px">
+              <summary style="color:var(--muted);font-size:13px;cursor:pointer">Advanced — type an absolute path instead of uploading</summary>
+              <div style="display:flex;gap:8px;margin-top:6px">
+                <input type="text" id="brain-seed-path" placeholder="/Users/you/exports/customers.csv" style="flex:1">
               </div>
-              <div id="brain-picker-list" style="max-height:260px;overflow:auto;padding:8px 12px"></div>
-            </div>
+            </details>
 
             <div style="display:flex;gap:8px;margin-top:8px">
               <button class="btn-primary" onclick="brainPreviewSeed()">Preview</button>
@@ -10174,64 +10224,58 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
           return (n / 1073741824).toFixed(2) + ' GB';
         }
 
-        // ── File / folder picker (hits /api/fs/browse) ──────────────────
+        // ── Native file-picker upload flow ─────────────────────────────
+        //
+        // Browsers don't expose filesystem paths. User picks file(s) or
+        // a folder via the OS dialog → we upload them (preserving folder
+        // structure) to ~/.clementine/uploads/<id>/ → backend returns
+        // the on-disk path, which we feed into the existing preview/
+        // commit pipeline.
 
-        let _brainPickerCurrent = '';
-        function brainParentDir(p) {
-          if (!p) return '~';
-          const trimmed = p.endsWith('/') && p.length > 1 ? p.slice(0, -1) : p;
-          const idx = trimmed.lastIndexOf('/');
-          if (idx <= 0) return '/';
-          return trimmed.slice(0, idx);
-        }
+        async function brainHandleFilesChosen(fileList, isFolder) {
+          const statusEl = document.getElementById('brain-upload-status');
+          if (!fileList || fileList.length === 0) return;
+          const files = Array.from(fileList);
+          const totalBytes = files.reduce((a, f) => a + f.size, 0);
+          statusEl.innerHTML = 'Uploading ' + files.length + ' file' + (files.length === 1 ? '' : 's') +
+            ' (' + brainHumanBytes(totalBytes) + ')…';
 
-        async function brainOpenPicker() {
-          document.getElementById('brain-picker').style.display = '';
-          const seeded = document.getElementById('brain-seed-path').value.trim();
-          const home = (seeded && seeded.indexOf('/') === 0) ? brainParentDir(seeded) : '~';
-          await brainPickerLoad(home);
-        }
-
-        async function brainPickerGo() {
-          await brainPickerLoad(document.getElementById('brain-picker-path').value.trim() || '~');
-        }
-
-        async function brainPickerUp() {
-          await brainPickerLoad(brainParentDir(_brainPickerCurrent || '/'));
-        }
-
-        async function brainPickerLoad(p) {
-          const resp = await apiFetch('/api/fs/browse?path=' + encodeURIComponent(p));
-          const data = await resp.json();
-          if (!resp.ok) {
-            document.getElementById('brain-picker-list').innerHTML =
-              '<div style="color:#e66">' + escapeHtml(data.error || 'browse failed') + '</div>';
-            return;
+          // Auto-generate a slug from the folder name or first filename if user hasn't set one
+          const slugInput = document.getElementById('brain-seed-slug');
+          if (!slugInput.value.trim()) {
+            const first = files[0];
+            const source = isFolder && first.webkitRelativePath
+              ? first.webkitRelativePath.split('/')[0]
+              : (first.name || '').replace(/\.[^.]+$/, '');
+            slugInput.value = source.toLowerCase().replace(/[^a-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '') || 'upload';
           }
-          _brainPickerCurrent = data.path;
-          document.getElementById('brain-picker-path').value = data.path;
-          const items = data.items || [];
-          const rows = items.map((it) => {
-            const icon = it.isDir ? '📁' : '📄';
-            const detail = it.isDir ? '' : '<span style="color:var(--muted);font-size:12px;margin-left:8px">' + brainHumanBytes(it.sizeBytes) + '</span>';
-            return '<div style="padding:4px 0;cursor:pointer" onclick="brainPickerClick(' + JSON.stringify(it).replace(/"/g, '&quot;') + ')">' +
-              icon + ' ' + escapeHtml(it.name) + detail + '</div>';
-          }).join('');
-          document.getElementById('brain-picker-list').innerHTML = rows || '<div style="color:var(--muted)">(empty)</div>';
-        }
 
-        function brainPickerClick(item) {
-          if (item.isDir) {
-            brainPickerLoad(item.path);
-          } else {
-            document.getElementById('brain-seed-path').value = item.path;
-            document.getElementById('brain-picker').style.display = 'none';
+          const uploadId = 'up-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8);
+          const form = new FormData();
+          for (const f of files) {
+            // webkitRelativePath gives the folder-relative path for folder uploads
+            const name = (isFolder && f.webkitRelativePath) ? f.webkitRelativePath : f.name;
+            form.append('files', f, name);
           }
-        }
 
-        function brainPickerChoose() {
-          document.getElementById('brain-seed-path').value = _brainPickerCurrent;
-          document.getElementById('brain-picker').style.display = 'none';
+          try {
+            const resp = await fetch('/api/brain/seed/upload', {
+              method: 'POST',
+              headers: { 'Authorization': 'Bearer ' + _dashToken, 'X-Upload-Id': uploadId },
+              body: form,
+            });
+            const data = await resp.json();
+            if (!resp.ok) {
+              statusEl.innerHTML = '<span style="color:#e66">Upload failed: ' + escapeHtml(data.error || 'unknown') + '</span>';
+              return;
+            }
+            statusEl.innerHTML = '<span style="color:#4ade80">✓ Uploaded ' + data.count + ' file(s)</span>';
+            document.getElementById('brain-seed-path').value = data.path;
+            // Kick off preview immediately
+            await brainPreviewSeed();
+          } catch (err) {
+            statusEl.innerHTML = '<span style="color:#e66">Upload error: ' + escapeHtml(String(err)) + '</span>';
+          }
         }
 
         // Wire tab refresh on switchTab → brain tabs
