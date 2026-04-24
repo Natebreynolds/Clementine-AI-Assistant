@@ -2379,6 +2379,110 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
     }
   });
 
+  // Streaming NDJSON variants — the dry-run preview and full commit both call
+  // the LLM synchronously per chunk, which can take 30s+ even for small files.
+  // The ingestion pipeline already emits per-stage progress via onProgress;
+  // these endpoints surface it to the dashboard so the UI can show live
+  // stage + record counts instead of a frozen "Scanning…".
+
+  app.post('/api/brain/seed/preview/stream', async (req, res) => {
+    res.writeHead(200, {
+      'Content-Type': 'application/x-ndjson',
+      'Cache-Control': 'no-cache',
+      'X-Accel-Buffering': 'no',
+    });
+    const write = (obj: unknown) => { try { res.write(JSON.stringify(obj) + '\n'); } catch { /* client gone */ } };
+    try {
+      const body = (req.body ?? {}) as { path?: string; slug?: string };
+      const inputPath = body.path?.trim();
+      if (!inputPath) { write({ type: 'error', error: 'path is required' }); res.end(); return; }
+      const { detectManifest } = await import('../brain/format-detector.js');
+      const { runIngestion } = await import('../brain/ingestion-pipeline.js');
+      const manifest = detectManifest(inputPath);
+      const suggestedSlug = body.slug || deriveBrainSlug(inputPath);
+      write({ type: 'manifest', manifest, suggestedSlug });
+      const ephemeralSource = {
+        slug: suggestedSlug,
+        kind: 'seed' as const,
+        adapter: 'csv' as const,
+        configJson: '{}',
+        credentialRef: null,
+        scheduleCron: null,
+        targetFolder: `04-Ingest/${suggestedSlug}`,
+        agentSlug: null,
+        intelligence: 'auto' as const,
+        enabled: true,
+        lastRunAt: null,
+        lastStatus: null,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      };
+      const result = await runIngestion({
+        source: ephemeralSource,
+        inputPath,
+        dryRun: true,
+        limit: 10,
+        onProgress: (p) => write({ type: 'progress', ...p }),
+      });
+      write({
+        type: 'done',
+        preview: (result.plannedRecords ?? []).map((r) => ({
+          title: r.title, tags: r.tags, targetRelPath: r.targetRelPath,
+          body: (r.body || '').slice(0, 800),
+        })),
+      });
+    } catch (err) {
+      write({ type: 'error', error: err instanceof Error ? err.message : String(err) });
+    }
+    res.end();
+  });
+
+  app.post('/api/brain/seed/commit/stream', async (req, res) => {
+    res.writeHead(200, {
+      'Content-Type': 'application/x-ndjson',
+      'Cache-Control': 'no-cache',
+      'X-Accel-Buffering': 'no',
+    });
+    const write = (obj: unknown) => { try { res.write(JSON.stringify(obj) + '\n'); } catch { /* client gone */ } };
+    try {
+      const body = (req.body ?? {}) as { path?: string; slug?: string };
+      const inputPath = body.path?.trim();
+      if (!inputPath) { write({ type: 'error', error: 'path is required' }); res.end(); return; }
+      const slug = body.slug?.trim() || deriveBrainSlug(inputPath);
+      const { upsertSource, getSource } = await import('../brain/source-registry.js');
+      const { runIngestion } = await import('../brain/ingestion-pipeline.js');
+      await upsertSource({
+        slug,
+        kind: 'seed',
+        adapter: 'csv',
+        configJson: JSON.stringify({ inputPath }),
+        targetFolder: `04-Ingest/${slug}`,
+        intelligence: 'auto',
+        enabled: true,
+      });
+      const source = await getSource(slug);
+      if (!source) { write({ type: 'error', error: 'failed to register source' }); res.end(); return; }
+      const result = await runIngestion({
+        source,
+        inputPath,
+        onProgress: (p) => write({ type: 'progress', ...p }),
+      });
+      write({
+        type: 'done',
+        runId: result.runId,
+        recordsIn: result.recordsIn,
+        recordsWritten: result.recordsWritten,
+        recordsSkipped: result.recordsSkipped,
+        recordsFailed: result.recordsFailed,
+        overviewNotePath: result.overviewNotePath,
+        errors: result.errors.slice(0, 10),
+      });
+    } catch (err) {
+      write({ type: 'error', error: err instanceof Error ? err.message : String(err) });
+    }
+    res.end();
+  });
+
   app.get('/api/brain/sources', async (_req, res) => {
     try {
       const { listSources } = await import('../brain/source-registry.js');
@@ -9923,43 +10027,147 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
       <script>
         // ── Brain tab-pane logic (merged into Intelligence page) ────────
 
+        // HTML-escape helper. Aliased to the global esc() from the main
+        // script so every existing escapeHtml() call in this block resolves.
+        const escapeHtml = (s) => (typeof esc === 'function' ? esc(s) : String(s ?? '')
+          .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;'));
+
+        // Stream newline-delimited JSON from a POST endpoint. The ingestion
+        // pipeline emits per-stage progress which the dashboard renders live —
+        // without this the preview looks frozen on "Scanning…" for the full
+        // ~30s an LLM distillation takes.
+        async function brainStreamNdjson(url, body, onEvent) {
+          const resp = await apiFetch(url, {
+            method: 'POST', headers: { 'content-type': 'application/json' },
+            body: JSON.stringify(body),
+          });
+          if (!resp.ok) {
+            let err = 'HTTP ' + resp.status;
+            try { const d = await resp.json(); err = d.error || err; } catch (_) {}
+            onEvent({ type: 'error', error: err });
+            return;
+          }
+          const reader = resp.body.getReader();
+          const decoder = new TextDecoder();
+          let buf = '';
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buf += decoder.decode(value, { stream: true });
+            let idx;
+            while ((idx = buf.indexOf('\\n')) >= 0) {
+              const line = buf.slice(0, idx).trim();
+              buf = buf.slice(idx + 1);
+              if (line) {
+                try { onEvent(JSON.parse(line)); } catch (_) {}
+              }
+            }
+          }
+          const tail = buf.trim();
+          if (tail) { try { onEvent(JSON.parse(tail)); } catch (_) {} }
+        }
+
+        const BRAIN_STAGE_LABELS = {
+          detecting: 'Scanning files',
+          parsing: 'Parsing content',
+          distilling: 'Distilling with Claude Haiku',
+          writing: 'Writing to vault',
+          summarizing: 'Summarizing',
+          done: 'Finalizing',
+          error: 'Error',
+        };
+
+        function brainRenderProgress(el, opts) {
+          const label = BRAIN_STAGE_LABELS[opts.stage] || opts.stage || 'Working';
+          const elapsed = Math.floor((Date.now() - opts.startedAt) / 1000);
+          const counts = [];
+          if (opts.recordsIn) counts.push(opts.recordsIn + ' record' + (opts.recordsIn === 1 ? '' : 's') + ' in');
+          if (opts.recordsWritten) counts.push(opts.recordsWritten + ' written');
+          if (opts.recordsSkipped) counts.push(opts.recordsSkipped + ' skipped');
+          if (opts.recordsFailed) counts.push(opts.recordsFailed + ' failed');
+          const countsLine = counts.length ? counts.join(' · ') : '';
+          el.innerHTML =
+            '<div class="card" style="padding:12px">' +
+            '<div style="display:flex;align-items:center;gap:10px">' +
+            '<div class="brain-spin" style="width:14px;height:14px;border:2px solid var(--border);border-top-color:var(--accent,#3b82f6);border-radius:50%;animation:brainspin 0.8s linear infinite"></div>' +
+            '<div style="font-weight:600">' + escapeHtml(label) + '…</div>' +
+            '<div style="margin-left:auto;color:var(--muted);font-size:12px">' + elapsed + 's</div>' +
+            '</div>' +
+            (countsLine ? '<div style="color:var(--muted);font-size:12px;margin-top:6px">' + escapeHtml(countsLine) + '</div>' : '') +
+            (opts.message ? '<div style="color:var(--muted);font-size:12px;margin-top:4px">' + escapeHtml(opts.message) + '</div>' : '') +
+            '</div>' +
+            '<style>@keyframes brainspin{to{transform:rotate(360deg)}}</style>';
+        }
+
         async function brainPreviewSeed() {
           const pathVal = document.getElementById('brain-seed-path').value.trim();
           const slugVal = document.getElementById('brain-seed-slug').value.trim();
           if (!pathVal) { alert('Enter or pick a file/folder path'); return; }
-          document.getElementById('brain-seed-manifest').innerHTML = '<div>Scanning…</div>';
-          document.getElementById('brain-seed-preview').innerHTML = '';
+          const manifestEl = document.getElementById('brain-seed-manifest');
+          const previewEl = document.getElementById('brain-seed-preview');
+          previewEl.innerHTML = '';
           document.getElementById('brain-commit-btn').style.display = 'none';
-          const resp = await apiFetch('/api/brain/seed/preview', {
-            method: 'POST', headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ path: pathVal, slug: slugVal || undefined }),
+
+          const progress = { startedAt: Date.now(), stage: 'detecting', recordsIn: 0, recordsWritten: 0, recordsSkipped: 0, recordsFailed: 0, message: null };
+          brainRenderProgress(manifestEl, progress);
+          const ticker = setInterval(() => brainRenderProgress(manifestEl, progress), 1000);
+
+          let manifestData = null;
+          let finalData = null;
+          let errorMsg = null;
+
+          await brainStreamNdjson('/api/brain/seed/preview/stream', { path: pathVal, slug: slugVal || undefined }, (ev) => {
+            if (ev.type === 'manifest') {
+              manifestData = ev;
+            } else if (ev.type === 'progress') {
+              progress.stage = ev.stage;
+              progress.recordsIn = ev.recordsIn || 0;
+              progress.recordsWritten = ev.recordsWritten || 0;
+              progress.recordsSkipped = ev.recordsSkipped || 0;
+              progress.recordsFailed = ev.recordsFailed || 0;
+              progress.message = ev.message || null;
+              brainRenderProgress(manifestEl, progress);
+            } else if (ev.type === 'done') {
+              finalData = ev;
+            } else if (ev.type === 'error') {
+              errorMsg = ev.error || 'unknown';
+            }
           });
-          const data = await resp.json();
-          if (!resp.ok) {
-            document.getElementById('brain-seed-manifest').innerHTML = '<div style="color:#e66">Error: ' + escapeHtml(data.error ?? 'unknown') + '</div>';
+          clearInterval(ticker);
+
+          if (errorMsg) {
+            manifestEl.innerHTML = '<div style="color:#e66">Error: ' + escapeHtml(errorMsg) + '</div>';
             return;
           }
-          const manifestRows = Object.entries(data.manifest.formats || {})
+          if (!manifestData || !finalData) {
+            manifestEl.innerHTML = '<div style="color:#e66">Preview ended without a result. Check dashboard logs.</div>';
+            return;
+          }
+
+          const manifest = manifestData.manifest;
+          const preview = finalData.preview || [];
+          const manifestRows = Object.entries(manifest.formats || {})
             .map(([fmt, n]) => '<tr><td>' + escapeHtml(fmt) + '</td><td>' + n + '</td></tr>').join('');
-          document.getElementById('brain-seed-manifest').innerHTML =
+          manifestEl.innerHTML =
             '<div class="card" style="padding:12px"><div style="font-weight:600;margin-bottom:8px">Manifest</div>' +
             '<div style="color:var(--muted);font-size:13px;margin-bottom:8px">' +
-            data.manifest.totalFiles + ' file(s), ' + brainHumanBytes(data.manifest.totalBytes) + '</div>' +
+            manifest.totalFiles + ' file(s), ' + brainHumanBytes(manifest.totalBytes) +
+            ' · scanned in ' + Math.floor((Date.now() - progress.startedAt) / 1000) + 's</div>' +
             '<table class="data-table"><thead><tr><th>Format</th><th>Count</th></tr></thead><tbody>' + manifestRows + '</tbody></table></div>';
-          if (data.preview && data.preview.length) {
-            const previewHtml = data.preview.slice(0, 10).map((p, i) =>
+          if (preview.length) {
+            const previewHtml = preview.slice(0, 10).map((p, i) =>
               '<div class="card" style="padding:12px;margin-bottom:8px">' +
               '<div style="font-weight:600">#' + (i + 1) + ' ' + escapeHtml(p.title || '(untitled)') + '</div>' +
               '<div style="color:var(--muted);font-size:12px;margin:4px 0">' + escapeHtml(p.targetRelPath || '') + '</div>' +
               '<div style="font-size:13px">' + escapeHtml((p.body || '').slice(0, 400)) + '</div>' +
               (p.tags && p.tags.length ? '<div style="margin-top:6px;font-size:12px;color:#888">tags: ' + p.tags.map(escapeHtml).join(', ') + '</div>' : '') +
               '</div>').join('');
-            document.getElementById('brain-seed-preview').innerHTML =
-              '<div style="font-weight:600;margin-bottom:8px">Preview (first ' + Math.min(data.preview.length, 10) + ' records, dry-run)</div>' + previewHtml;
+            previewEl.innerHTML =
+              '<div style="font-weight:600;margin-bottom:8px">Preview (first ' + Math.min(preview.length, 10) + ' records, dry-run)</div>' + previewHtml;
           }
           document.getElementById('brain-commit-btn').style.display = '';
           document.getElementById('brain-commit-btn').dataset.path = pathVal;
-          document.getElementById('brain-commit-btn').dataset.slug = slugVal || data.suggestedSlug || '';
+          document.getElementById('brain-commit-btn').dataset.slug = slugVal || manifestData.suggestedSlug || '';
         }
 
         async function brainCommitSeed() {
@@ -9968,31 +10176,55 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
           const slugVal = btn.dataset.slug;
           const progEl = document.getElementById('brain-seed-progress');
           btn.disabled = true;
-          progEl.innerHTML = '<div>Running ingestion (can take 30–60s for LLM distillation)…</div>';
+
+          const progress = { startedAt: Date.now(), stage: 'detecting', recordsIn: 0, recordsWritten: 0, recordsSkipped: 0, recordsFailed: 0, message: null };
+          brainRenderProgress(progEl, progress);
+          const ticker = setInterval(() => brainRenderProgress(progEl, progress), 1000);
+
+          let finalData = null;
+          let errorMsg = null;
+
           try {
-            const resp = await apiFetch('/api/brain/seed/commit', {
-              method: 'POST', headers: { 'content-type': 'application/json' },
-              body: JSON.stringify({ path: pathVal, slug: slugVal }),
+            await brainStreamNdjson('/api/brain/seed/commit/stream', { path: pathVal, slug: slugVal }, (ev) => {
+              if (ev.type === 'progress') {
+                progress.stage = ev.stage;
+                progress.recordsIn = ev.recordsIn || 0;
+                progress.recordsWritten = ev.recordsWritten || 0;
+                progress.recordsSkipped = ev.recordsSkipped || 0;
+                progress.recordsFailed = ev.recordsFailed || 0;
+                progress.message = ev.message || null;
+                brainRenderProgress(progEl, progress);
+              } else if (ev.type === 'done') {
+                finalData = ev;
+              } else if (ev.type === 'error') {
+                errorMsg = ev.error || 'unknown';
+              }
             });
-            const data = await resp.json();
-            if (!resp.ok) {
-              progEl.innerHTML = '<div style="color:#e66">Error: ' + escapeHtml(data.error || 'unknown') + '</div>';
-              return;
-            }
-            progEl.innerHTML =
-              '<div class="card" style="padding:12px">' +
-              '<div style="font-weight:600;color:#4ade80">✓ Ingestion complete</div>' +
-              '<div>Records in: ' + data.recordsIn + '</div>' +
-              '<div>Records written: ' + data.recordsWritten + '</div>' +
-              '<div>Records skipped: ' + data.recordsSkipped + '</div>' +
-              '<div>Records failed: ' + data.recordsFailed + '</div>' +
-              (data.overviewNotePath ? '<div style="margin-top:8px">Overview note: <code>' + escapeHtml(data.overviewNotePath) + '</code></div>' : '') +
-              '</div>';
           } catch (err) {
-            progEl.innerHTML = '<div style="color:#e66">' + escapeHtml(String(err)) + '</div>';
+            errorMsg = String(err);
           } finally {
+            clearInterval(ticker);
             btn.disabled = false;
           }
+
+          if (errorMsg) {
+            progEl.innerHTML = '<div style="color:#e66">Error: ' + escapeHtml(errorMsg) + '</div>';
+            return;
+          }
+          if (!finalData) {
+            progEl.innerHTML = '<div style="color:#e66">Ingestion ended without a result. Check dashboard logs.</div>';
+            return;
+          }
+          const elapsed = Math.floor((Date.now() - progress.startedAt) / 1000);
+          progEl.innerHTML =
+            '<div class="card" style="padding:12px">' +
+            '<div style="font-weight:600;color:#4ade80">✓ Ingestion complete · ' + elapsed + 's</div>' +
+            '<div>Records in: ' + finalData.recordsIn + '</div>' +
+            '<div>Records written: ' + finalData.recordsWritten + '</div>' +
+            '<div>Records skipped: ' + finalData.recordsSkipped + '</div>' +
+            '<div>Records failed: ' + finalData.recordsFailed + '</div>' +
+            (finalData.overviewNotePath ? '<div style="margin-top:8px">Overview note: <code>' + escapeHtml(finalData.overviewNotePath) + '</code></div>' : '') +
+            '</div>';
         }
 
         async function brainLoadSources() {
