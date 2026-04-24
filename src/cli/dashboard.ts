@@ -1473,12 +1473,15 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
       res.status(401).json({ error: 'Unauthorized' });
       return;
     }
-    // Response timeout — prevent hung handlers from blocking the connection pool
+    // Response timeout — prevent hung handlers from blocking the connection pool.
+    // Brain routes drive LLM calls + multi-file writes and need a longer budget.
+    const isLongRunning = req.path.startsWith('/brain/');
+    const timeoutMs = isLongRunning ? 10 * 60 * 1000 : 8000;
     const timeout = setTimeout(() => {
       if (!res.headersSent) {
         res.status(504).json({ error: 'Request timeout', retryAfter: 2 });
       }
-    }, 8000);
+    }, timeoutMs);
     res.on('finish', () => clearTimeout(timeout));
     next();
   });
