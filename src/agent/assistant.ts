@@ -3550,7 +3550,10 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
           cwd: BASE_DIR,
           env: SAFE_ENV,
           effort: 'low',
-          maxBudgetUsd: BUDGET.summarization,
+          // Budgets are opt-in. If BUDGET.summarization is undefined we
+          // must NOT include the key — some SDK codepaths treat a present
+          // undefined as a budget=0 cap.
+          ...(BUDGET.summarization ? { maxBudgetUsd: BUDGET.summarization } : {}),
         },
       });
 
@@ -3897,7 +3900,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
           cwd: BASE_DIR,
           env: SAFE_ENV,
           effort: 'low',
-          maxBudgetUsd: BUDGET.memoryExtraction,
+          ...(BUDGET.memoryExtraction ? { maxBudgetUsd: BUDGET.memoryExtraction } : {}),
         },
       });
 
@@ -4486,7 +4489,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
           cwd: BASE_DIR,
           env: SAFE_ENV,
           effort: 'low',
-          maxBudgetUsd: BUDGET.reflection,
+          ...(BUDGET.reflection ? { maxBudgetUsd: BUDGET.reflection } : {}),
           outputFormat: {
             type: 'json_schema',
             schema: {
@@ -4649,7 +4652,10 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
         model: model ?? null,
         enableTeams: true,
         isUnleashed: true,
-        maxBudgetUsd: BUDGET.unleashedPhase,
+        // buildOptions intentionally drops this before reaching the SDK
+        // (line ~2100 comment). Passing it here only matters if someone
+        // later re-enables the SDK knob.
+        ...(BUDGET.unleashedPhase ? { maxBudgetUsd: BUDGET.unleashedPhase } : {}),
         stallGuard: phaseGuard,
         profile: unleashedProfile,
       });
