@@ -1914,6 +1914,27 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
     res.json(getAgentHeartbeats());
   });
 
+  app.get('/api/background-tasks', async (_req, res) => {
+    try {
+      const { listBackgroundTasks } = await import('../agent/background-tasks.js');
+      const tasks = listBackgroundTasks();
+      const now = Date.now();
+      // Add derived fields convenient for UI use
+      const out = tasks.map((t) => {
+        const startedMs = t.startedAt ? new Date(t.startedAt).getTime() : 0;
+        const completedMs = t.completedAt ? new Date(t.completedAt).getTime() : 0;
+        return {
+          ...t,
+          runningForMs: t.status === 'running' && startedMs > 0 ? now - startedMs : null,
+          totalDurationMs: startedMs > 0 && completedMs > 0 ? completedMs - startedMs : null,
+        };
+      });
+      res.json(out);
+    } catch (err) {
+      res.status(500).json({ error: String(err).slice(0, 200) });
+    }
+  });
+
   app.get('/api/heartbeat/agent/:slug', (req, res) => {
     const slug = req.params.slug;
     const state = getHeartbeat() as Record<string, unknown>;

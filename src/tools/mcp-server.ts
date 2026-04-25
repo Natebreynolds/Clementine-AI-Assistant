@@ -34,6 +34,7 @@ import { registerSessionTools } from './session-tools.js';
 import { registerArtifactTools } from './artifact-tools.js';
 import { registerBrainTools } from './brain-tools.js';
 import { registerAgentHeartbeatTools } from './agent-heartbeat-tools.js';
+import { registerBackgroundTaskTools } from './background-task-tools.js';
 
 // ── Server ──────────────────────────────────────────────────────────────
 
@@ -51,6 +52,7 @@ registerSessionTools(server);
 registerArtifactTools(server);
 registerBrainTools(server);
 registerAgentHeartbeatTools(server);
+registerBackgroundTaskTools(server);
 
 // ── Main ────────────────────────────────────────────────────────────────
 

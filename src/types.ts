@@ -284,6 +284,33 @@ export interface HeartbeatWorkItem {
   agentSlug?: string;
 }
 
+// ── Background tasks ─────────────────────────────────────────────────
+
+/**
+ * Long-running autonomous task an agent kicks off via the
+ * `start_background_task` MCP tool. The task runs in the daemon as an
+ * unleashed cron-style job with the requesting agent's profile, then
+ * notifies that agent's Discord channel on completion.
+ *
+ * Lifecycle: pending → running → (done | failed | aborted)
+ *
+ * Persisted as ~/.clementine/background-tasks/<id>.json. The file is
+ * the source of truth; status is updated in place as the task progresses.
+ */
+export interface BackgroundTask {
+  id: string;
+  fromAgent: string;          // Slug of the agent that initiated the task
+  prompt: string;             // The full task prompt
+  maxMinutes: number;         // Hard wall-clock cap
+  status: 'pending' | 'running' | 'done' | 'failed' | 'aborted';
+  createdAt: string;          // ISO when the request was filed (status='pending')
+  startedAt?: string;         // ISO when the daemon actually picked it up
+  completedAt?: string;       // ISO when terminal status was reached
+  result?: string;            // Final output (truncated to ~3KB on save)
+  error?: string;             // If status='failed' or 'aborted'
+  deliverableNote?: string;   // Optional vault path produced by the run
+}
+
 // ── Per-agent heartbeat ──────────────────────────────────────────────
 
 /**

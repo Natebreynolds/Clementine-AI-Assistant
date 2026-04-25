@@ -833,6 +833,20 @@ async function asyncMain(): Promise<void> {
   heartbeat.start();
   cronScheduler.start();
   agentHeartbeats.start();
+
+  // Background-task hygiene: any task left in 'running' is from a prior
+  // process. Mark them aborted so the lifecycle is honest. (P6b will add
+  // resumability; for now fail-fast is clearer than silently re-running.)
+  try {
+    const { abortStaleRunningTasks } = await import('./agent/background-tasks.js');
+    const aborted = abortStaleRunningTasks();
+    if (aborted > 0) {
+      logger.info({ count: aborted }, 'Aborted stale running background tasks from prior daemon');
+    }
+  } catch (err) {
+    logger.warn({ err }, 'Background task hygiene check failed — non-fatal');
+  }
+
   const timerInterval = startTimerChecker(dispatcher, gateway);
 
   // Start brain ingest scheduler (polls registered REST sources on their cron)

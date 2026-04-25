@@ -47,6 +47,12 @@ import { SelfImproveLoop } from '../agent/self-improve.js';
 import { logAuditJsonl } from '../agent/hooks.js';
 import type { ProactiveDecision } from '../agent/proactive-engine.js';
 import {
+  listBackgroundTasks,
+  markDone as markBgTaskDone,
+  markFailed as markBgTaskFailed,
+  markRunning as markBgTaskRunning,
+} from '../agent/background-tasks.js';
+import {
   outcomeStatusFromGoalDisposition,
   recentDecisions,
   recordDecisionOutcome,
@@ -1657,7 +1663,80 @@ export class CronScheduler {
     this.triggerTimer = setInterval(() => {
       this.processTriggers();
       this.processGoalTriggers();
+      this.processBackgroundTasks();
     }, 3000);
+  }
+
+  /**
+   * Pick up pending background tasks and run them via the unleashed
+   * cron path. Each task gets the originating agent's profile and
+   * Discord channel for the completion notification.
+   *
+   * Concurrency: a task moves from 'pending' to 'running' synchronously
+   * before the long-running work starts, so a second tick won't pick up
+   * the same task twice. Failures are logged + persisted; we never throw
+   * out of the trigger interval.
+   */
+  private processBackgroundTasks(): void {
+    let pending: ReturnType<typeof listBackgroundTasks>;
+    try {
+      pending = listBackgroundTasks({ status: 'pending' });
+    } catch {
+      return;
+    }
+    if (pending.length === 0) return;
+
+    for (const task of pending) {
+      // Move to 'running' synchronously so the next tick (3s away) won't
+      // re-pick. Even if the work below errors, the state is honest.
+      const started = markBgTaskRunning(task.id);
+      if (!started) continue;
+
+      logger.info({ id: task.id, fromAgent: task.fromAgent, maxMinutes: task.maxMinutes }, 'Background task picked up');
+
+      // Don't await — fire-and-forget. The 3s tick continues to scan.
+      const jobName = `bg:${task.id}`;
+      const maxHours = Math.max(0.05, task.maxMinutes / 60);
+
+      this.gateway.handleCronJob(
+        jobName,
+        task.prompt,
+        2,                    // tier 2 (Bash/Write/Edit available)
+        undefined,            // default maxTurns
+        undefined,            // default model
+        undefined,            // default workDir
+        'unleashed',          // long-running mode
+        maxHours,
+        undefined,            // timeoutMs (maxHours covers it)
+        undefined,            // successCriteria
+        task.fromAgent,       // agentSlug — runs as the originator
+      ).then((result) => {
+        try {
+          markBgTaskDone(task.id, result ?? '(no output)');
+        } catch (err) {
+          logger.warn({ err, id: task.id }, 'Failed to mark background task done');
+        }
+        // Dispatch the deliverable to the originating agent's channel.
+        const deliveryHead = `**Background task ${task.id} done** — ${task.prompt.slice(0, 100).replace(/\s+/g, ' ')}${task.prompt.length > 100 ? '...' : ''}\n\n`;
+        const body = (result ?? '').slice(0, 1500);
+        this.dispatcher
+          .send(deliveryHead + body, { agentSlug: task.fromAgent !== 'clementine' ? task.fromAgent : undefined })
+          .catch((err) => logger.debug({ err, id: task.id }, 'Failed to dispatch background task result'));
+      }).catch((err) => {
+        const errStr = String(err).slice(0, 500);
+        try {
+          markBgTaskFailed(task.id, errStr, 'failed');
+        } catch (saveErr) {
+          logger.warn({ err: saveErr, id: task.id }, 'Failed to mark background task failed');
+        }
+        this.dispatcher
+          .send(
+            `**Background task ${task.id} failed** — ${errStr.slice(0, 200)}`,
+            { agentSlug: task.fromAgent !== 'clementine' ? task.fromAgent : undefined },
+          )
+          .catch(() => { /* non-fatal */ });
+      });
+    }
   }
 
   /** Process any pending trigger files and run the corresponding jobs. */
