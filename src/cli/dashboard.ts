@@ -1070,6 +1070,51 @@ function getHeartbeat(): Record<string, unknown> {
   }
 }
 
+/**
+ * Read per-agent heartbeat states from disk (one state.json per agent
+ * under ~/.clementine/heartbeat/agents/<slug>/). Returns an array sorted
+ * by next-due-soonest, with relative-time strings convenient for UI use.
+ */
+function getAgentHeartbeats(): Array<Record<string, unknown>> {
+  const agentsRoot = path.join(BASE_DIR, 'heartbeat', 'agents');
+  if (!existsSync(agentsRoot)) return [];
+  const out: Array<Record<string, unknown>> = [];
+  let dirs: string[] = [];
+  try {
+    dirs = readdirSync(agentsRoot, { withFileTypes: true })
+      .filter((d) => d.isDirectory())
+      .map((d) => d.name);
+  } catch { return []; }
+
+  const now = Date.now();
+  for (const slug of dirs) {
+    const stateFile = path.join(agentsRoot, slug, 'state.json');
+    if (!existsSync(stateFile)) continue;
+    try {
+      const state = JSON.parse(readFileSync(stateFile, 'utf-8')) as Record<string, unknown>;
+      const lastTickMs = state.lastTickAt ? new Date(String(state.lastTickAt)).getTime() : 0;
+      const nextCheckMs = state.nextCheckAt ? new Date(String(state.nextCheckAt)).getTime() : 0;
+      out.push({
+        slug,
+        lastTickAt: state.lastTickAt ?? null,
+        nextCheckAt: state.nextCheckAt ?? null,
+        silentTickCount: Number(state.silentTickCount ?? 0),
+        fingerprint: state.fingerprint ?? '',
+        lastSignalSummary: state.lastSignalSummary ?? null,
+        lastTickAgoMs: lastTickMs ? now - lastTickMs : null,
+        nextCheckInMs: nextCheckMs ? nextCheckMs - now : null,
+        isDue: nextCheckMs > 0 && nextCheckMs <= now,
+      });
+    } catch { /* skip malformed */ }
+  }
+  out.sort((a, b) => {
+    const ai = typeof a.nextCheckInMs === 'number' ? a.nextCheckInMs : Number.MAX_SAFE_INTEGER;
+    const bi = typeof b.nextCheckInMs === 'number' ? b.nextCheckInMs : Number.MAX_SAFE_INTEGER;
+    return ai - bi;
+  });
+  return out;
+}
+
 async function getMemory(): Promise<Record<string, unknown>> {
   const memoryFile = path.join(VAULT_DIR, '00-System', 'MEMORY.md');
   let content = '';
@@ -1862,6 +1907,10 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
 
   app.get('/api/heartbeat', (_req, res) => {
     res.json(getHeartbeat());
+  });
+
+  app.get('/api/agent-heartbeats', (_req, res) => {
+    res.json(getAgentHeartbeats());
   });
 
   app.get('/api/heartbeat/agent/:slug', (req, res) => {
