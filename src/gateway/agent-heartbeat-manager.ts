@@ -11,7 +11,7 @@
  * daemon or stall others.
  */
 
-import { existsSync, mkdirSync, type FSWatcher, watch } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, unlinkSync, type FSWatcher, watch } from 'node:fs';
 import path from 'node:path';
 import pino from 'pino';
 import { AGENTS_DIR, BASE_DIR } from '../config.js';
@@ -113,18 +113,12 @@ export class AgentHeartbeatManager {
         if (eventType !== 'rename' || !filename) return;
         if (!filename.endsWith('.json')) return;
         const slug = filename.replace(/\.json$/, '');
-        // Consume the sentinel + wake the agent
-        try {
-          // Use unlinkSync via require to keep top-level import surface tight
-          // (already imported existsSync — we use it before unlink to be safe)
-          const sentinelPath = path.join(wakeDir, filename);
-          if (existsSync(sentinelPath)) {
-            // best-effort: import unlinkSync inline
-            // eslint-disable-next-line @typescript-eslint/no-var-requires
-            const fs = require('node:fs') as typeof import('node:fs');
-            try { fs.unlinkSync(sentinelPath); } catch { /* ignore */ }
-          }
-        } catch { /* non-fatal */ }
+        // Consume the sentinel + wake the agent. Best-effort delete so the
+        // same sentinel can't fire repeatedly.
+        const sentinelPath = path.join(wakeDir, filename);
+        if (existsSync(sentinelPath)) {
+          try { unlinkSync(sentinelPath); } catch { /* ignore */ }
+        }
         this.scheduleWake(slug, 'wake-sentinel');
       });
     } catch (err) {
@@ -186,9 +180,7 @@ export class AgentHeartbeatManager {
       // the file (idempotencyKey-named). Read it, find the owner, wake them.
       const triggerPath = path.join(BASE_DIR, 'cron', 'goal-triggers', filename);
       if (!existsSync(triggerPath)) return; // file was already consumed by cron-scheduler
-      // eslint-disable-next-line @typescript-eslint/no-var-requires
-      const fs = require('node:fs') as typeof import('node:fs');
-      const trigger = JSON.parse(fs.readFileSync(triggerPath, 'utf-8')) as { goalId?: string };
+      const trigger = JSON.parse(readFileSync(triggerPath, 'utf-8')) as { goalId?: string };
       if (!trigger.goalId) return;
       const lookup = listAllGoals().find((g) => g.goal && g.goal.id === trigger.goalId);
       if (!lookup || !lookup.owner || lookup.owner === 'clementine') return;
