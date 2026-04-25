@@ -1101,6 +1101,7 @@ function getAgentHeartbeats(): Array<Record<string, unknown>> {
         silentTickCount: Number(state.silentTickCount ?? 0),
         fingerprint: state.fingerprint ?? '',
         lastSignalSummary: state.lastSignalSummary ?? null,
+        lastTickKind: state.lastTickKind ?? null,
         lastTickAgoMs: lastTickMs ? now - lastTickMs : null,
         nextCheckInMs: nextCheckMs ? nextCheckMs - now : null,
         isDue: nextCheckMs > 0 && nextCheckMs <= now,
@@ -8919,6 +8920,26 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
   }
   .desk-kpi-strip .dss-icon { font-size: 12px; opacity: 0.7; }
   .desk-kpi-strip .dss-val { font-weight: 700; color: var(--accent); }
+
+  /* ── Heartbeat Strip ────────────── */
+  .desk-hb-strip {
+    display: flex;
+    justify-content: center;
+    gap: 6px;
+    padding: 2px 12px;
+    font-size: 10px;
+    color: var(--text-muted);
+    min-height: 0;
+  }
+  .desk-hb-strip:empty { display: none; }
+  .desk-hb-strip .dss-item {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    white-space: nowrap;
+  }
+  .desk-hb-strip .dss-icon { font-size: 11px; opacity: 0.85; }
+  .desk-hb-strip .dss-val { font-weight: 600; color: var(--text-secondary); }
 
   /* ── Health Badge ──────────────────── */
   .desk-health-badge {
@@ -17215,6 +17236,9 @@ async function refreshTeam() {
             '</details>';
           }
 
+          // Heartbeat strip — last/next tick, populated async from /api/agent-heartbeats
+          var hbStrip = '<div class="desk-hb-strip" id="hb-' + a.slug + '"></div>';
+
           // SDR KPI strip (fetched async, populated by data attribute)
           var kpiStrip = '<div class="desk-kpi-strip" id="kpi-' + a.slug + '"></div>';
 
@@ -17242,6 +17266,7 @@ async function refreshTeam() {
               (actions ? '<div class="desk-actions">' + actions + '</div>' : '') +
             '</div>' +
             statsStrip +
+            hbStrip +
             kpiStrip +
             cronDetails +
           '</div>';
@@ -17254,6 +17279,54 @@ async function refreshTeam() {
         );
 
         grid.innerHTML = cards.join('');
+
+        // Heartbeat strip — single batch fetch, populate per-agent (avoids N requests).
+        apiFetch('/api/agent-heartbeats').then(function(r) { return r.json(); }).then(function(hbList) {
+          if (!Array.isArray(hbList)) return;
+          var byAgent = {};
+          for (var i = 0; i < hbList.length; i++) byAgent[hbList[i].slug] = hbList[i];
+          agents.forEach(function(a) {
+            var hb = byAgent[a.slug];
+            var el = document.getElementById('hb-' + a.slug);
+            if (!el || !hb) return;
+            // "in 12 min" / "due now" / "10s ago tick"
+            var nextLabel;
+            if (hb.isDue) {
+              nextLabel = 'due now';
+            } else if (typeof hb.nextCheckInMs === 'number') {
+              var mins = Math.max(1, Math.round(hb.nextCheckInMs / 60000));
+              nextLabel = mins < 60 ? 'in ' + mins + 'm' : 'in ' + Math.floor(mins / 60) + 'h';
+            } else {
+              nextLabel = '—';
+            }
+            var lastLabel = hb.lastTickAt ? fmtTimeAgo(hb.lastTickAt) : 'never';
+            // Tick-kind icon — small visual signal
+            var kindIcon = '';
+            var kindTitle = '';
+            switch (hb.lastSignalSummary && hb.lastSignalSummary.indexOf('llm tick error') === 0
+              ? 'error' : '') {
+              case 'error':
+                kindIcon = '⚠'; kindTitle = 'Last tick errored — fell back to quiet cadence';
+                break;
+            }
+            // Use a literal field if available — backend exposes lastTickKind via state file
+            // (we read it through getAgentHeartbeats which preserves the field)
+            if (!kindIcon) {
+              switch (hb.lastTickKind) {
+                case 'acted':    kindIcon = '⚡'; kindTitle = 'Active — agent took action last tick'; break;
+                case 'quiet':    kindIcon = '◌'; kindTitle = 'Quiet — agent saw signals but had nothing to do'; break;
+                case 'silent':   kindIcon = '·'; kindTitle = 'Silent — fingerprint unchanged, backing off'; break;
+                case 'override': kindIcon = '◇'; kindTitle = 'Override — cadence set explicitly by the agent'; break;
+                default:         kindIcon = '·'; kindTitle = 'No tick recorded yet';
+              }
+            }
+            el.innerHTML =
+              '<span class="dss-item" title="' + kindTitle + '">' +
+                '<span class="dss-icon">' + kindIcon + '</span> ' +
+                '<span class="dss-val">' + lastLabel + '</span> · next ' + nextLabel +
+              '</span>';
+          });
+        }).catch(function() { /* heartbeat endpoint missing or daemon old — silently skip */ });
 
         // Async-fetch KPIs and health for each agent
         agents.forEach(function(a) {
