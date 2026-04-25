@@ -1,8 +1,8 @@
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { AgentHeartbeatScheduler } from '../src/gateway/agent-heartbeat-scheduler.js';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { AgentHeartbeatScheduler, type AgentHeartbeatGateway } from '../src/gateway/agent-heartbeat-scheduler.js';
 import type { AgentManager } from '../src/agent/agent-manager.js';
 import type { AgentHeartbeatState, AgentProfile } from '../src/types.js';
 
@@ -122,5 +122,130 @@ describe('AgentHeartbeatScheduler (cheap path)', () => {
     sched.setNextCheckIn(99 * 60, now); // above MAX_INTERVAL_MIN — should clamp to 12h
     state = sched.loadState();
     expect(new Date(state.nextCheckAt).getTime() - now.getTime()).toBe(12 * 60 * 60_000);
+  });
+});
+
+describe('AgentHeartbeatScheduler.parseLlmTickOutput', () => {
+  it('extracts NEXT_CHECK directive in minutes', () => {
+    expect(AgentHeartbeatScheduler.parseLlmTickOutput('All quiet. [NEXT_CHECK: 60m]')).toEqual({
+      nextCheckMinutes: 60,
+      summary: 'All quiet.',
+    });
+  });
+
+  it('returns undefined when directive is absent', () => {
+    const out = AgentHeartbeatScheduler.parseLlmTickOutput('Nothing to do here.');
+    expect(out.nextCheckMinutes).toBeUndefined();
+    expect(out.summary).toBe('Nothing to do here.');
+  });
+
+  it('strips the directive from the summary even when malformed', () => {
+    const out = AgentHeartbeatScheduler.parseLlmTickOutput('Did the thing. [NEXT_CHECK: 15] more notes');
+    expect(out.nextCheckMinutes).toBe(15);
+    expect(out.summary).toBe('Did the thing.  more notes');
+  });
+});
+
+describe('AgentHeartbeatScheduler (LLM tick path)', () => {
+  let baseDir: string;
+  let agentsDir: string;
+  const slug = 'test-agent';
+
+  beforeEach(() => {
+    baseDir = mkdtempSync(path.join(tmpdir(), 'clementine-ahb-llm-'));
+    agentsDir = path.join(baseDir, 'agents');
+    mkdirSync(agentsDir, { recursive: true });
+  });
+
+  afterEach(() => {
+    rmSync(baseDir, { recursive: true, force: true });
+  });
+
+  function makeAgentManagerLocal(): AgentManager {
+    const profile: AgentProfile = {
+      slug: 'test-agent',
+      name: 'Test Agent',
+      tier: 1,
+      description: 'fixture',
+      systemPromptBody: '',
+      status: 'active',
+    };
+    return {
+      get: () => profile,
+      isRunnable: () => true,
+      listAll: () => [profile],
+    } as unknown as AgentManager;
+  }
+
+  it('does NOT call the LLM on the very first tick (empty prior fingerprint)', async () => {
+    const handleCronJob = vi.fn(async () => 'ok [NEXT_CHECK: 60m]');
+    const gateway: AgentHeartbeatGateway = { handleCronJob };
+    const sched = new AgentHeartbeatScheduler(slug, makeAgentManagerLocal(), { baseDir, agentsDir, gateway });
+
+    await sched.tick(new Date('2026-04-25T10:00:00Z'));
+    expect(handleCronJob).not.toHaveBeenCalled();
+  });
+
+  it('calls the LLM when the fingerprint changes after the first tick', async () => {
+    const handleCronJob = vi.fn(async () => 'all quiet [NEXT_CHECK: 60m]');
+    const gateway: AgentHeartbeatGateway = { handleCronJob };
+    const sched = new AgentHeartbeatScheduler(slug, makeAgentManagerLocal(), { baseDir, agentsDir, gateway });
+
+    // First tick — establishes baseline fingerprint, no LLM call
+    await sched.tick(new Date('2026-04-25T10:00:00Z'));
+    expect(handleCronJob).not.toHaveBeenCalled();
+
+    // Drop a pending task → fingerprint changes
+    const tasksDir = path.join(agentsDir, slug, 'tasks');
+    mkdirSync(tasksDir, { recursive: true });
+    writeFileSync(
+      path.join(tasksDir, 'task-1.json'),
+      JSON.stringify({ id: 'task-1', status: 'pending', task: 'do thing', fromAgent: 'clementine', expectedOutput: 'done' }),
+    );
+
+    await sched.tick(new Date('2026-04-25T10:30:00Z'));
+    expect(handleCronJob).toHaveBeenCalledTimes(1);
+    const [jobName, , , , , , , , , , agentSlug] = handleCronJob.mock.calls[0];
+    expect(jobName).toBe(`heartbeat:${slug}`);
+    expect(agentSlug).toBe(slug);
+  });
+
+  it('honors [NEXT_CHECK: Xm] directive from LLM output to schedule next tick', async () => {
+    const handleCronJob = vi.fn(async () => 'busy [NEXT_CHECK: 10m]');
+    const gateway: AgentHeartbeatGateway = { handleCronJob };
+    const sched = new AgentHeartbeatScheduler(slug, makeAgentManagerLocal(), { baseDir, agentsDir, gateway });
+
+    await sched.tick(new Date('2026-04-25T10:00:00Z'));
+    const tasksDir = path.join(agentsDir, slug, 'tasks');
+    mkdirSync(tasksDir, { recursive: true });
+    writeFileSync(
+      path.join(tasksDir, 't1.json'),
+      JSON.stringify({ id: 't1', status: 'pending', task: 'x', fromAgent: 'c', expectedOutput: 'y' }),
+    );
+    const now = new Date('2026-04-25T10:30:00Z');
+    const after = await sched.tick(now);
+
+    const elapsedMs = new Date(after.nextCheckAt).getTime() - now.getTime();
+    expect(elapsedMs).toBe(10 * 60_000);
+  });
+
+  it('falls back to default cadence when LLM tick throws', async () => {
+    const handleCronJob = vi.fn(async () => { throw new Error('rate limited'); });
+    const gateway: AgentHeartbeatGateway = { handleCronJob };
+    const sched = new AgentHeartbeatScheduler(slug, makeAgentManagerLocal(), { baseDir, agentsDir, gateway });
+
+    await sched.tick(new Date('2026-04-25T10:00:00Z'));
+    const tasksDir = path.join(agentsDir, slug, 'tasks');
+    mkdirSync(tasksDir, { recursive: true });
+    writeFileSync(
+      path.join(tasksDir, 't1.json'),
+      JSON.stringify({ id: 't1', status: 'pending', task: 'x', fromAgent: 'c', expectedOutput: 'y' }),
+    );
+
+    const now = new Date('2026-04-25T10:30:00Z');
+    const after = await sched.tick(now);
+    // Default 30min cadence on error
+    expect(new Date(after.nextCheckAt).getTime() - now.getTime()).toBe(30 * 60_000);
+    expect(after.lastSignalSummary).toMatch(/llm tick error/);
   });
 });

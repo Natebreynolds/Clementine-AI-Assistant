@@ -13,7 +13,7 @@
 
 import pino from 'pino';
 import type { AgentManager } from '../agent/agent-manager.js';
-import { AgentHeartbeatScheduler } from './agent-heartbeat-scheduler.js';
+import { AgentHeartbeatScheduler, type AgentHeartbeatGateway } from './agent-heartbeat-scheduler.js';
 
 const logger = pino({ name: 'clementine.agent-heartbeat-manager' });
 
@@ -21,13 +21,15 @@ const OUTER_TICK_MS = 60_000;
 
 export class AgentHeartbeatManager {
   private readonly agentManager: AgentManager;
+  private readonly gateway: AgentHeartbeatGateway | null;
   private readonly schedulers = new Map<string, AgentHeartbeatScheduler>();
   private timer: ReturnType<typeof setInterval> | null = null;
   private running = false;
   private ticking = false;
 
-  constructor(agentManager: AgentManager) {
+  constructor(agentManager: AgentManager, gateway?: AgentHeartbeatGateway) {
     this.agentManager = agentManager;
+    this.gateway = gateway ?? null;
   }
 
   start(): void {
@@ -70,7 +72,10 @@ export class AgentHeartbeatManager {
     // Add new
     for (const slug of active) {
       if (!this.schedulers.has(slug)) {
-        this.schedulers.set(slug, new AgentHeartbeatScheduler(slug, this.agentManager));
+        this.schedulers.set(
+          slug,
+          new AgentHeartbeatScheduler(slug, this.agentManager, this.gateway ? { gateway: this.gateway } : {}),
+        );
         logger.info({ slug }, 'Agent heartbeat: registered scheduler');
       }
     }

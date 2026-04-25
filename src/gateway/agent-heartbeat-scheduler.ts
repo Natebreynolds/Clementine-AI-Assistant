@@ -24,7 +24,7 @@ import path from 'node:path';
 import pino from 'pino';
 import { AGENTS_DIR, BASE_DIR } from '../config.js';
 import { listAllGoals } from '../tools/shared.js';
-import type { AgentHeartbeatState } from '../types.js';
+import type { AgentHeartbeatState, AgentProfile } from '../types.js';
 import type { AgentManager } from '../agent/agent-manager.js';
 
 const logger = pino({ name: 'clementine.agent-heartbeat' });
@@ -33,11 +33,37 @@ const DEFAULT_INTERVAL_MIN = 30;
 const MIN_INTERVAL_MIN = 5;
 const MAX_INTERVAL_MIN = 12 * 60;
 
+/**
+ * Minimal gateway surface the scheduler needs for the LLM tick path.
+ * Kept narrow so tests can mock it without pulling in the full Gateway.
+ */
+export interface AgentHeartbeatGateway {
+  handleCronJob(
+    jobName: string,
+    jobPrompt: string,
+    tier?: number,
+    maxTurns?: number,
+    model?: string,
+    workDir?: string,
+    mode?: 'standard' | 'unleashed',
+    maxHours?: number,
+    timeoutMs?: number,
+    successCriteria?: string[],
+    agentSlug?: string,
+  ): Promise<string>;
+}
+
 export interface AgentHeartbeatOptions {
   /** Override the base directory for test isolation. Defaults to config.BASE_DIR. */
   baseDir?: string;
   /** Override the agents directory for test isolation. Defaults to config.AGENTS_DIR. */
   agentsDir?: string;
+  /**
+   * Gateway used for the LLM tick path. When omitted, the scheduler runs in
+   * cheap-path-only mode (observation + logging, no LLM call). Tests pass
+   * mocks here; production passes the real Gateway.
+   */
+  gateway?: AgentHeartbeatGateway;
 }
 
 export class AgentHeartbeatScheduler {
@@ -46,6 +72,7 @@ export class AgentHeartbeatScheduler {
   private readonly baseDir: string;
   private readonly agentsDir: string;
   private readonly stateFile: string;
+  private readonly gateway: AgentHeartbeatGateway | null;
 
   constructor(slug: string, agentManager: AgentManager, opts: AgentHeartbeatOptions = {}) {
     this.slug = slug;
@@ -53,6 +80,7 @@ export class AgentHeartbeatScheduler {
     this.baseDir = opts.baseDir ?? BASE_DIR;
     this.agentsDir = opts.agentsDir ?? AGENTS_DIR;
     this.stateFile = path.join(this.baseDir, 'heartbeat', 'agents', slug, 'state.json');
+    this.gateway = opts.gateway ?? null;
   }
 
   /** Read persisted state, or return a fresh state ready to tick now. */
@@ -166,8 +194,13 @@ export class AgentHeartbeatScheduler {
   }
 
   /**
-   * Cheap-path tick. Returns the new state. P3 will branch into an LLM
-   * call when the fingerprint changed; for now we just observe and log.
+   * Tick. Loads state, builds fingerprint, decides whether to invoke the
+   * LLM path, persists the new state. The LLM call is only made when:
+   *
+   *   1. The fingerprint changed (something material moved since last tick), AND
+   *   2. The prior fingerprint was non-empty (we don't fire LLM on the very
+   *      first tick after daemon start — those are noisy and not signal), AND
+   *   3. A gateway is wired (opts.gateway). Tests run cheap-path-only.
    */
   async tick(now: Date = new Date()): Promise<AgentHeartbeatState> {
     const profile = this.agentManager.get(this.slug);
@@ -199,28 +232,102 @@ export class AgentHeartbeatScheduler {
     const prior = this.loadState();
     const { fingerprint, signals } = this.buildFingerprint();
     const changed = fingerprint !== prior.fingerprint;
-    const next = new Date(now.getTime() + DEFAULT_INTERVAL_MIN * 60_000);
 
+    let nextCheckMinutes = DEFAULT_INTERVAL_MIN;
+    let lastSignalSummary: string | undefined;
+
+    const shouldRunLlm = changed && prior.fingerprint !== '' && this.gateway !== null;
+
+    if (shouldRunLlm) {
+      try {
+        const result = await this.runLlmTick(profile, signals, prior, now);
+        nextCheckMinutes = result.nextCheckMinutes ?? DEFAULT_INTERVAL_MIN;
+        lastSignalSummary = result.summary?.slice(0, 240);
+      } catch (err) {
+        logger.warn({ err, slug: this.slug }, 'Agent LLM tick failed — using default cadence');
+        lastSignalSummary = `llm tick error: ${String(err).slice(0, 200)}`;
+      }
+    } else if (changed) {
+      lastSignalSummary = `signal change: ${JSON.stringify(signals)}`.slice(0, 240);
+    } else {
+      lastSignalSummary = prior.lastSignalSummary;
+    }
+
+    const clampedMin = Math.max(MIN_INTERVAL_MIN, Math.min(MAX_INTERVAL_MIN, Math.floor(nextCheckMinutes)));
+    const next = new Date(now.getTime() + clampedMin * 60_000);
     const state: AgentHeartbeatState = {
       slug: this.slug,
       lastTickAt: now.toISOString(),
       nextCheckAt: next.toISOString(),
       silentTickCount: changed ? 0 : prior.silentTickCount + 1,
       fingerprint,
-      ...(changed
-        ? { lastSignalSummary: `signal change: ${JSON.stringify(signals)}`.slice(0, 240) }
-        : prior.lastSignalSummary
-          ? { lastSignalSummary: prior.lastSignalSummary }
-          : {}),
+      ...(lastSignalSummary ? { lastSignalSummary } : {}),
     };
     this.saveState(state);
 
     if (changed) {
-      logger.info({ slug: this.slug, signals, fingerprint }, 'Agent heartbeat: signal change detected (LLM path is P3)');
+      logger.info({ slug: this.slug, signals, fingerprint, ranLlm: shouldRunLlm, nextCheckMin: clampedMin }, 'Agent heartbeat tick');
     } else {
       logger.debug({ slug: this.slug, silentTicks: state.silentTickCount }, 'Agent heartbeat: silent tick');
     }
     return state;
+  }
+
+  /**
+   * Build and dispatch the LLM tick prompt via gateway.handleCronJob.
+   * Output already routes to the agent's Discord channel (dispatcher.send
+   * is called inside the cron path with the agentSlug).
+   */
+  private async runLlmTick(
+    profile: AgentProfile,
+    signals: Record<string, string | number>,
+    prior: AgentHeartbeatState,
+    now: Date,
+  ): Promise<{ nextCheckMinutes: number | undefined; summary: string }> {
+    if (!this.gateway) {
+      return { nextCheckMinutes: undefined, summary: '' };
+    }
+
+    const sinceLastMin = prior.lastTickAt
+      ? Math.max(0, Math.round((now.getTime() - new Date(prior.lastTickAt).getTime()) / 60_000))
+      : 0;
+
+    const prompt = [
+      `[Heartbeat check-in: ${profile.slug}]`,
+      '',
+      `You are ${profile.name}. ${profile.description}`,
+      '',
+      `## Routine check-in`,
+      `This is your scheduled heartbeat tick (${sinceLastMin}min since last).`,
+      `Something in your scope has changed since you last checked in.`,
+      '',
+      `### Signals`,
+      `- Pending delegated tasks: ${signals.pendingTasks ?? 0}`,
+      `- Latest goal update: ${signals.latestGoalUpdate || 'none'}`,
+      `- Latest cron run: ${signals.latestCronRunMs ? new Date(Number(signals.latestCronRunMs)).toISOString() : 'none'}`,
+      '',
+      `### Instructions`,
+      `1. Quickly scan TASKS.md, your goals, and recent cron output for anything that needs action right now.`,
+      `2. If there's a clear next action you can take in 1–2 turns, do it.`,
+      `3. If you're blocked, waiting on someone, or it's all-quiet, say so concisely.`,
+      `4. End your response with \`[NEXT_CHECK: Xm]\` to set when to check in next (5–720 min). Default 30m. Use shorter intervals during active work, longer during quiet hours.`,
+      `5. Keep your response under 3 sentences unless you actually took action.`,
+    ].join('\n');
+
+    const jobName = `heartbeat:${this.slug}`;
+    const result = await this.gateway.handleCronJob(jobName, prompt, 1, 5, undefined, undefined, 'standard', undefined, undefined, undefined, this.slug);
+
+    const parsed = AgentHeartbeatScheduler.parseLlmTickOutput(result);
+    return { nextCheckMinutes: parsed.nextCheckMinutes, summary: parsed.summary };
+  }
+
+  /** Parse `[NEXT_CHECK: Xm]` directive from the agent's output. Public for tests. */
+  static parseLlmTickOutput(output: string): { nextCheckMinutes: number | undefined; summary: string } {
+    const match = output.match(/\[NEXT_CHECK:\s*(\d+)\s*m?\]/i);
+    const nextCheckMinutes = match ? parseInt(match[1], 10) : undefined;
+    // Strip the directive from the summary so logs don't echo it back
+    const summary = output.replace(/\[NEXT_CHECK:[^\]]*\]/gi, '').trim();
+    return { nextCheckMinutes, summary };
   }
 
   /** Schedule the next check explicitly. Clamped to [MIN, MAX] minutes. */

@@ -724,9 +724,10 @@ async function asyncMain(): Promise<void> {
   heartbeat.setCronScheduler(cronScheduler);
 
   // Per-agent heartbeats (Ross / Sasha / Nora / future hires). Cheap-path
-  // observation only in P2 — LLM ticks land in P3.
+  // observation on every tick; LLM tick fires on signal change with the
+  // agent's profile and routes output to their Discord channel.
   const { AgentHeartbeatManager } = await import('./gateway/agent-heartbeat-manager.js');
-  const agentHeartbeats = new AgentHeartbeatManager(gateway.getAgentManager());
+  const agentHeartbeats = new AgentHeartbeatManager(gateway.getAgentManager(), gateway);
 
   // ── Build channel tasks ──────────────────────────────────────────
   const channelTasks: Array<Promise<void>> = [];
