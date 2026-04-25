@@ -30,6 +30,58 @@ export interface RouteDecision {
   reasoning: string;
 }
 
+// ── LRU cache for repeated messages ──────────────────────────────────
+// Same text + same available-agents set → same decision. Skips the
+// Haiku LLM call entirely on cache hit (saves 1-2 seconds per repeat).
+// Bounded by both size and TTL so stale rosters can't cause wrong routes.
+const ROUTE_CACHE_MAX = 100;
+const ROUTE_CACHE_TTL_MS = 5 * 60 * 1000;
+
+interface CacheEntry {
+  decision: RouteDecision | null; // null = "stay with Clementine"
+  expiresAt: number;
+}
+
+// Insertion-ordered Map = LRU when we delete-and-reinsert on hit.
+const routeCache = new Map<string, CacheEntry>();
+
+function cacheKey(text: string, agents: AgentProfile[]): string {
+  // Trim + normalize whitespace so trailing-newline variations of the
+  // same message hit the same cache entry.
+  const normText = text.replace(/\s+/g, ' ').trim();
+  // Sort slugs so order doesn't matter; include count to invalidate on
+  // hire/fire (the agents array changes shape).
+  const slugFingerprint = agents.map(a => a.slug).sort().join(',');
+  return `${slugFingerprint}::${normText}`;
+}
+
+function cacheGet(key: string, now: number): CacheEntry | null {
+  const entry = routeCache.get(key);
+  if (!entry) return null;
+  if (entry.expiresAt <= now) {
+    routeCache.delete(key);
+    return null;
+  }
+  // LRU touch: remove + re-insert to move to end of insertion order
+  routeCache.delete(key);
+  routeCache.set(key, entry);
+  return entry;
+}
+
+function cachePut(key: string, decision: RouteDecision | null, now: number): void {
+  routeCache.set(key, { decision, expiresAt: now + ROUTE_CACHE_TTL_MS });
+  while (routeCache.size > ROUTE_CACHE_MAX) {
+    const oldest = routeCache.keys().next().value;
+    if (oldest === undefined) break;
+    routeCache.delete(oldest);
+  }
+}
+
+/** Test-only: reset the cache between runs. */
+export function _resetRouteCache(): void {
+  routeCache.clear();
+}
+
 /**
  * Direct-imperative guardrail.
  *
@@ -250,6 +302,16 @@ export async function classifyRoute(
     return null;
   }
 
+  // Cache hit short-circuit — same message + same roster as a recent
+  // call gets the same decision without firing the Haiku classifier.
+  const now = Date.now();
+  const key = cacheKey(userMessage, agents);
+  const hit = cacheGet(key, now);
+  if (hit) {
+    logger.debug({ trigger: 'cache-hit', cachedAgent: hit.decision?.targetAgent ?? 'clementine' }, 'Route classifier cache hit');
+    return hit.decision;
+  }
+
   // LLM classifier for everything else.
   const prompt = buildPrompt(userMessage, agents);
   let raw: string;
@@ -263,6 +325,7 @@ export async function classifyRoute(
     );
   } catch (err) {
     logger.warn({ err }, 'Route classifier call failed');
+    // Don't cache failures — next call should retry the LLM.
     return null;
   }
 
@@ -281,5 +344,6 @@ export async function classifyRoute(
     decision.confidence = Math.min(decision.confidence, 0.3);
   }
 
+  cachePut(key, decision, now);
   return decision;
 }
