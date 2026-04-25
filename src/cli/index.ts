@@ -1100,10 +1100,16 @@ function cmdTools(): void {
 
 const program = new Command();
 
+let pkgVersion = '0.0.0';
+try {
+  const pkgRaw = readFileSync(path.join(PACKAGE_ROOT, 'package.json'), 'utf-8');
+  pkgVersion = String(JSON.parse(pkgRaw).version ?? '0.0.0');
+} catch { /* fall back to placeholder */ }
+
 program
   .name('clementine')
   .description('Clementine Personal AI Assistant')
-  .version('1.0.0');
+  .version(pkgVersion);
 
 program
   .command('launch')
@@ -1647,11 +1653,42 @@ async function cmdUpdate(options: { restart?: boolean; dryRun?: boolean }): Prom
   console.log(`  ${DIM}Updating ${getAssistantName()}...${RESET}`);
   console.log();
 
-  // 1. Check we're in a git repo
-  if (!existsSync(path.join(PACKAGE_ROOT, '.git'))) {
-    console.error(`  ${RED}FAIL${RESET}  Package root is not a git repository: ${PACKAGE_ROOT}`);
-    console.error('  Update requires a git-cloned installation.');
-    process.exit(1);
+  // 1. Detect install flavor. Two valid paths:
+  //    - git-clone install (PACKAGE_ROOT has .git) → pull + rebuild path below
+  //    - npm-global install (no .git) → delegate to `npm install -g clementine-agent@latest`
+  const isGitInstall = existsSync(path.join(PACKAGE_ROOT, '.git'));
+  if (!isGitInstall) {
+    if (options.dryRun) {
+      console.log(`  ${DIM}[dry-run]${RESET}  Would run: npm install -g clementine-agent@latest`);
+      if (options.restart) console.log(`  ${DIM}[dry-run]${RESET}  Would restart the daemon`);
+      return;
+    }
+    console.log(`  ${DIM}npm-global install detected at ${PACKAGE_ROOT}${RESET}`);
+    console.log(`  ${DIM}Running: npm install -g clementine-agent@latest${RESET}`);
+    console.log();
+    try {
+      execSync('npm install -g clementine-agent@latest', { stdio: 'inherit' });
+      console.log();
+      console.log(`  ${GREEN}OK${RESET}  Updated via npm`);
+    } catch (err) {
+      console.error(`  ${RED}FAIL${RESET}  npm update failed: ${String(err).slice(0, 200)}`);
+      console.error(`  ${YELLOW}Hint${RESET}  If you see EACCES, see README "Troubleshooting" for npm prefix setup.`);
+      process.exit(1);
+    }
+    if (options.restart) {
+      try {
+        console.log(`  ${DIM}Restarting daemon...${RESET}`);
+        execSync('clementine restart', { stdio: 'inherit' });
+        console.log(`  ${GREEN}OK${RESET}  Daemon restarted`);
+      } catch (err) {
+        console.error(`  ${YELLOW}WARN${RESET}  Restart failed: ${String(err).slice(0, 200)}. Run \`clementine restart\` manually.`);
+      }
+    } else {
+      console.log();
+      console.log(`  ${DIM}Restart your daemon to pick up the new code:${RESET}`);
+      console.log(`    clementine restart`);
+    }
+    return;
   }
 
   let step = 0;
@@ -1683,11 +1720,15 @@ async function cmdUpdate(options: { restart?: boolean; dryRun?: boolean }): Prom
   try {
     const status = execSync('git status --porcelain', { cwd: PACKAGE_ROOT, encoding: 'utf-8' }).trim();
     if (status) {
-      console.log(`  ${S()} Stashing local changes...`);
-      const stashOut = execSync('git stash', { cwd: PACKAGE_ROOT, encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] }).trim();
-      didStash = !stashOut.includes('No local changes');
-      if (didStash) {
-        console.log(`  ${GREEN}OK${RESET}  Stashed local changes`);
+      if (options.dryRun) {
+        console.log(`  ${S()} Would stash local changes`);
+      } else {
+        console.log(`  ${S()} Stashing local changes...`);
+        const stashOut = execSync('git stash', { cwd: PACKAGE_ROOT, encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] }).trim();
+        didStash = !stashOut.includes('No local changes');
+        if (didStash) {
+          console.log(`  ${GREEN}OK${RESET}  Stashed local changes`);
+        }
       }
     }
   } catch {
@@ -1743,12 +1784,14 @@ async function cmdUpdate(options: { restart?: boolean; dryRun?: boolean }): Prom
   const pid = readPid();
   const wasRunning = pid && isProcessAlive(pid);
   if (wasRunning) {
-    console.log(`  ${S()} Stopping daemon (PID ${pid})...`);
-    if (!options.dryRun) {
+    if (options.dryRun) {
+      console.log(`  ${S()} Would stop daemon (PID ${pid})`);
+    } else {
+      console.log(`  ${S()} Stopping daemon (PID ${pid})...`);
       stopDaemon(pid!);
       try { unlinkSync(getPidFilePath()); } catch { /* ignore */ }
+      console.log(`  ${GREEN}OK${RESET}  Daemon stopped`);
     }
-    console.log(`  ${GREEN}OK${RESET}  Daemon stopped`);
   }
 
   // Helper: if update fails after stopping daemon, relaunch before exiting
