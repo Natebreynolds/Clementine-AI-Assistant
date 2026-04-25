@@ -585,6 +585,19 @@ The dashboard's "The Office" page shows each agent as an animated desk station w
 - Channel assignment, model badge, project badge, tool count
 - Edit and "Let Go" (delete) actions
 
+### Decision-loop reflection
+
+Each agent's autonomous decisions are recorded to a proactive ledger (action chosen, signal source, eventual outcome). The `decision_reflection` MCP tool reads that ledger, computes per-action success rates, and surfaces calibration patterns:
+
+- "act_now success rate is 33% — many autonomous actions did not advance"
+- "Queue-heavy bias: 12 queued vs 2 act_now — engine is being conservative"
+- "Zero ask_user despite active autonomous work"
+- Plus concrete tuning suggestions
+
+By default the report is saved to `vault/00-System/agents/<slug>/reflections/<date>.md`. Pass `append_to_memory: true` to also write a compact summary into the agent's `working-memory.md` so the next heartbeat tick reads it as prompt context — that's how agents self-tune without code changes.
+
+The shipped `vault/00-System/CRON.md` template includes a `weekly-decision-reflection` job (Sundays 9am) that runs reflection for the daemon and every active specialist.
+
 ### Per-agent heartbeats
 
 Each specialist (Ross / Sasha / your hires) gets their own autonomous heartbeat scheduler alongside Clementine's. The cycle:

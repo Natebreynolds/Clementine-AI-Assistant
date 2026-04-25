@@ -35,6 +35,7 @@ import { registerArtifactTools } from './artifact-tools.js';
 import { registerBrainTools } from './brain-tools.js';
 import { registerAgentHeartbeatTools } from './agent-heartbeat-tools.js';
 import { registerBackgroundTaskTools } from './background-task-tools.js';
+import { registerDecisionReflectionTools } from './decision-reflection-tools.js';
 
 // ── Server ──────────────────────────────────────────────────────────────
 
@@ -53,6 +54,7 @@ registerArtifactTools(server);
 registerBrainTools(server);
 registerAgentHeartbeatTools(server);
 registerBackgroundTaskTools(server);
+registerDecisionReflectionTools(server);
 
 // ── Main ────────────────────────────────────────────────────────────────
 

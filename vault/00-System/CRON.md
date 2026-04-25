@@ -37,6 +37,21 @@ jobs:
       4. Write a brief summary of the day in today's daily note under ## Summary
     tier: 1
     enabled: true
+
+  - name: weekly-decision-reflection
+    schedule: "0 9 * * 0"
+    prompt: >
+      Run a self-reflection on the past week's autonomous decisions.
+      1. Call `decision_reflection` with window_days=7, save_to_history=true, append_to_memory=true.
+         This reads the proactive ledger, computes per-action success rates, identifies
+         miscalibration patterns, and writes a tuning note to your working-memory so the
+         next heartbeat tick reads it as context.
+      2. For each specialist on the team (use `team_list` to enumerate), also run
+         `decision_reflection` with their slug, save_to_history=true, append_to_memory=true.
+      3. Briefly summarize in today's daily note under "## Decision reflection" — list each
+         agent's headline pattern (e.g., "Ross: act_now success 33%, raise threshold").
+    tier: 1
+    enabled: true
 tags:
   - system
   - cron
@@ -53,6 +68,7 @@ Scheduled tasks that run automatically at specific times. Edit the frontmatter a
 | morning-briefing | 8:00 AM daily | Comprehensive morning briefing |
 | weekly-review | 6:00 PM Fridays | Weekly summary + planning |
 | daily-memory-cleanup | 10:00 PM daily | Promote daily facts to long-term memory |
+| weekly-decision-reflection | 9:00 AM Sundays | Per-agent self-tuning from proactive ledger |
 
 ## Schedule Syntax
 
