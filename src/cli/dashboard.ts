@@ -1366,6 +1366,76 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
     return diff === 0;
   }
 
+  // ── Webhook → action triggers ─────────────────────────────────────
+  // Sibling of /webhook/:slug. Where /webhook/:slug ingests data into
+  // the brain, /webhook-action/:source dispatches agentic actions
+  // (wake an agent, start a background task) based on a YAML-ish config
+  // at ~/.clementine/webhook-actions.json. Same HMAC verification.
+  app.post('/webhook-action/:source', rawBodyParser, async (req, res) => {
+    const sourceParam = req.params.source;
+    const {
+      getSourceConfig,
+      dispatchWebhookActions,
+      logWebhookEvent,
+    } = await import('../agent/webhook-actions.js');
+
+    const cfg = getSourceConfig(sourceParam);
+    if (!cfg) {
+      res.status(404).json({ error: `No webhook-action config for source "${sourceParam}"` });
+      return;
+    }
+
+    // Resolve the HMAC secret (env first, inline fallback for local dev).
+    const secret = (cfg.secretEnv ? process.env[cfg.secretEnv] : undefined) ?? cfg.secret ?? '';
+    if (!secret) {
+      res.status(500).json({ error: `Webhook source "${sourceParam}" has no secret configured` });
+      return;
+    }
+
+    const sig = String(req.headers['x-signature'] ?? req.headers['x-hub-signature-256'] ?? '').trim();
+    const rawBody: Buffer = Buffer.isBuffer(req.body) ? req.body : Buffer.from(String(req.body ?? ''));
+    const expected = createHmac('sha256', secret).update(rawBody).digest('hex');
+    const given = sig.startsWith('sha256=') ? sig.slice('sha256='.length) : sig;
+    if (!given || !safeHexEquals(given, expected)) {
+      logWebhookEvent({
+        timestamp: new Date().toISOString(),
+        source: sourceParam,
+        verified: false,
+        matched: 0,
+        dispatched: 0,
+        errors: ['HMAC signature mismatch'],
+        payloadPreview: rawBody.toString('utf-8').slice(0, 200),
+      });
+      res.status(401).json({ error: 'Invalid or missing HMAC signature' });
+      return;
+    }
+
+    let payload: unknown;
+    try {
+      payload = JSON.parse(rawBody.toString('utf-8'));
+    } catch (err) {
+      res.status(400).json({ error: `Body is not JSON: ${err instanceof Error ? err.message : String(err)}` });
+      return;
+    }
+
+    const result = dispatchWebhookActions(sourceParam, payload);
+    logWebhookEvent({
+      timestamp: new Date().toISOString(),
+      source: sourceParam,
+      verified: true,
+      matched: result.matched,
+      dispatched: result.dispatched,
+      errors: result.errors,
+      payloadPreview: rawBody.toString('utf-8').slice(0, 200),
+    });
+
+    res.json({
+      matched: result.matched,
+      dispatched: result.dispatched,
+      errors: result.errors,
+    });
+  });
+
   // Only parse JSON bodies on POST/PUT/PATCH — GET requests don't need body parsing.
   // Registered AFTER the webhook route so /webhook/* keeps its raw body.
   app.use((req, res, next) => {
@@ -1912,6 +1982,36 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
 
   app.get('/api/agent-heartbeats', (_req, res) => {
     res.json(getAgentHeartbeats());
+  });
+
+  app.get('/api/webhook-actions', async (_req, res) => {
+    try {
+      const { loadWebhookActionConfig, recentWebhookEvents } = await import('../agent/webhook-actions.js');
+      const cfg = loadWebhookActionConfig();
+      // Don't leak secrets — strip secret/secretEnv from the config response
+      const sanitized = {
+        hooks: cfg.hooks.map((h) => ({
+          source: h.source,
+          hasSecret: Boolean(h.secret) || Boolean(h.secretEnv),
+          secretEnv: h.secretEnv ?? null,
+          rules: h.on.length,
+          on: h.on.map((r) => ({
+            do: r.do,
+            agent: r.agent,
+            match: r.match ?? {},
+            reason: r.reason,
+            promptHead: r.prompt ? r.prompt.slice(0, 120) : undefined,
+            maxMinutes: r.maxMinutes,
+          })),
+        })),
+      };
+      res.json({
+        config: sanitized,
+        recent: recentWebhookEvents(50),
+      });
+    } catch (err) {
+      res.status(500).json({ error: String(err).slice(0, 200) });
+    }
   });
 
   app.get('/api/background-tasks', async (_req, res) => {
