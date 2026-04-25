@@ -2012,12 +2012,18 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
       supportsThinking && needsThinking ? { type: 'adaptive' as const } : undefined
     );
 
-    // Haiku rejects user-configurable task budgets with a 400 ("This model
-    // does not support user-configurable task budgets"). Only pass
-    // taskBudget to models that accept it — otherwise every Haiku cron
-    // run dies on arrival and (historically) got mis-classified as a
-    // permanent "budget exceeded" failure.
-    const supportsTaskBudget = !resolvedModel.includes('haiku');
+    // ── taskBudget: don't pass to the SDK ─────────────────────────
+    // The Anthropic API now rejects `taskBudget` for both Haiku AND Sonnet
+    // ("This model does not support user-configurable task budgets" — 400).
+    // We previously gated by !haiku, but that left Sonnet crons (e.g.,
+    // ross-the-sdr:reply-detection) failing on every run. Cost is
+    // informational on a Claude subscription anyway — `maxTurns` and the
+    // wall-clock cap (`maxHours` for unleashed) are the actual brakes.
+    //
+    // computedTaskBudget is still computed below for any future telemetry
+    // path that wants to log "soft target" values, but it is intentionally
+    // never passed into sdkOptions.
+    const supportsTaskBudget = false;
 
     // 1M context beta: enable for Sonnet when toggled and context-heavy work benefits
     const isSonnet = resolvedModel.includes('sonnet');

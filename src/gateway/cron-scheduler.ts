@@ -539,10 +539,24 @@ export class CronScheduler {
     // session instead of fanning out to every registered channel.
     const isDeepMode = (jobName: string) => jobName.startsWith('deep-');
 
-    // Wire up push notifications for unleashed task completions
+    // Wire up push notifications for unleashed task completions.
+    //
+    // This callback is only meant for AD-HOC unleashed tasks (chat-triggered
+    // "deep mode" follow-ups that didn't go through a registered job). Three
+    // other paths already own their own delivery and would otherwise produce
+    // double-dispatches:
+    //
+    //   1. deep-mode (`deep-*`)  → router handles delivery via _deliverDeepResult
+    //   2. background tasks (`bg:*`) → processBackgroundTasks dispatches result
+    //   3. registered cron jobs   → cron-runner success path dispatches at line ~1115
+    //
+    // Each path is gated below; without the guards Sasha's morning brief was
+    // landing twice in her Discord channel.
     this.gateway.setUnleashedCompleteCallback((jobName, result) => {
       this.completedJobs.set(jobName, Date.now());
-      if (isDeepMode(jobName)) return; // router handles delivery via _deliverDeepResult
+      if (isDeepMode(jobName)) return;                 // (1) deep-mode router
+      if (jobName.startsWith('bg:')) return;           // (2) background-task dispatcher
+      if (this.jobs.some(j => j.name === jobName)) return; // (3) registered cron job
       if (result && result !== '__NOTHING__') {
         const slug = jobName.includes(':') ? jobName.split(':')[0] : undefined;
         // Strip system metadata for clean conversational delivery

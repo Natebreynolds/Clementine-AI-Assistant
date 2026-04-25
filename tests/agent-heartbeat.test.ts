@@ -43,7 +43,9 @@ describe('AgentHeartbeatScheduler (cheap path)', () => {
 
   it('writes state on the first tick and reports the agent as not-yet-due thereafter', async () => {
     const sched = new AgentHeartbeatScheduler(slug, makeAgentManager(), { baseDir, agentsDir });
-    const before = new Date('2026-04-25T10:00:00Z');
+    // Use a "before" anchored ahead of wall-clock-now so isDue's fresh-state
+    // default (nextCheckAt = real "now") satisfies nextCheckAt <= before.
+    const before = new Date(Date.now() + 60_000);
 
     expect(sched.isDue(before)).toBe(true); // fresh state defaults to due
 
