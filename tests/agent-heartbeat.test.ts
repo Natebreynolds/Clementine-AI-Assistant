@@ -123,6 +123,21 @@ describe('AgentHeartbeatScheduler (cheap path)', () => {
     state = sched.loadState();
     expect(new Date(state.nextCheckAt).getTime() - now.getTime()).toBe(12 * 60 * 60_000);
   });
+
+  it('markDue() bypasses the MIN clamp and makes isDue() true immediately', async () => {
+    const sched = new AgentHeartbeatScheduler(slug, makeAgentManager(), { baseDir, agentsDir });
+    // Establish a non-due baseline by ticking once (sets nextCheckAt = now + 30min)
+    const t1 = new Date('2026-04-25T10:00:00Z');
+    await sched.tick(t1);
+    expect(sched.isDue(t1)).toBe(false);
+
+    sched.markDue(t1);
+    expect(sched.isDue(t1)).toBe(true);
+
+    const state = sched.loadState();
+    // nextCheckAt should be exactly t1 (or earlier), NOT clamped to t1+5min
+    expect(new Date(state.nextCheckAt).getTime()).toBeLessThanOrEqual(t1.getTime());
+  });
 });
 
 describe('AgentHeartbeatScheduler.parseLlmTickOutput', () => {

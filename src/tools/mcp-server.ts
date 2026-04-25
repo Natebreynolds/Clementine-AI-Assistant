@@ -33,6 +33,7 @@ import { registerTeamTools } from './team-tools.js';
 import { registerSessionTools } from './session-tools.js';
 import { registerArtifactTools } from './artifact-tools.js';
 import { registerBrainTools } from './brain-tools.js';
+import { registerAgentHeartbeatTools } from './agent-heartbeat-tools.js';
 
 // ── Server ──────────────────────────────────────────────────────────────
 
@@ -49,6 +50,7 @@ registerTeamTools(server);
 registerSessionTools(server);
 registerArtifactTools(server);
 registerBrainTools(server);
+registerAgentHeartbeatTools(server);
 
 // ── Main ────────────────────────────────────────────────────────────────
 

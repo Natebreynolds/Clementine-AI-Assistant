@@ -342,6 +342,22 @@ export class AgentHeartbeatScheduler {
     this.saveState(state);
   }
 
+  /**
+   * Mark the agent as due for a tick right now. Used for event-driven wake-ups
+   * (a delegated task arrives, an explicit wake_agent call) — bypasses the
+   * MIN_INTERVAL_MIN clamp that setNextCheckIn applies, since this is "wake
+   * now" not "set future cadence."
+   */
+  markDue(now: Date = new Date()): void {
+    const prior = this.loadState();
+    const state: AgentHeartbeatState = {
+      ...prior,
+      slug: this.slug,
+      nextCheckAt: now.toISOString(),
+    };
+    this.saveState(state);
+  }
+
   getSlug(): string {
     return this.slug;
   }
