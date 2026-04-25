@@ -556,7 +556,7 @@ Both paths trigger an automatic daemon restart when the new agent is detected.
 
 ### Agent configuration
 
-Each agent is defined by a YAML frontmatter file in `~/.clementine/agents/<slug>/agent.md`:
+Each agent is defined by a YAML frontmatter file in `~/.clementine/vault/00-System/agents/<slug>/agent.md`:
 
 | Field | Description |
 |-------|-------------|
@@ -584,6 +584,26 @@ The dashboard's "The Office" page shows each agent as an animated desk station w
 - Discord bot avatar (auto-pulled) or initial
 - Channel assignment, model badge, project badge, tool count
 - Edit and "Let Go" (delete) actions
+
+### Per-agent heartbeats
+
+Each specialist (Ross / Sasha / your hires) gets their own autonomous heartbeat scheduler alongside Clementine's. The cycle:
+
+1. **Cheap tick** every 30 min: load the agent's state, hash three signals (pending delegated tasks, latest goal update, latest cron run). If unchanged → silent tick, no LLM call, no cost.
+2. **LLM tick** when a signal *changes* between ticks (a delegated task arrived, a goal moved, a cron deliverable to review): the scheduler invokes `assistant.heartbeat()` with the agent's profile. Output flows through their dedicated Discord bot to their channel.
+3. **Self-adjusting cadence**: agents end their LLM-tick output with `[NEXT_CHECK: Xm]` to set when to check in next (5–720 min). Clamped at the bounds. Default 30m if omitted.
+
+State per agent at `~/.clementine/heartbeat/agents/<slug>/state.json`. Live observability via:
+
+```bash
+curl -H "X-Token: $(cat ~/.clementine/.dashboard-token)" \
+     http://localhost:3030/api/agent-heartbeats | jq
+```
+
+Routing rules — Clementine remains the master delegator:
+- Inbox triage runs as Clementine, but she'll hand off via `team_message` when an item clearly belongs to a specialist (she's allowed to guess).
+- Daily-plan goal-priorities owned by a specialist now fire goal-triggers (which run as the owner) instead of queueing as Clementine's work.
+- Goal advancement triggers route to `goal.owner` automatically.
 
 ---
 
