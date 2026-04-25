@@ -729,6 +729,12 @@ async function asyncMain(): Promise<void> {
   const { AgentHeartbeatManager } = await import('./gateway/agent-heartbeat-manager.js');
   const agentHeartbeats = new AgentHeartbeatManager(gateway.getAgentManager(), gateway);
 
+  // Self-improve loop — closes the gap between "trigger written" and
+  // "fix applied." Every 10 min, scans self-improve/triggers/, classifies
+  // failures, auto-applies safe cron-config fixes, escalates risky ones.
+  const { SelfImproveLoop } = await import('./agent/self-improve-loop.js');
+  const selfImproveLoop = new SelfImproveLoop(dispatcher);
+
   // ── Build channel tasks ──────────────────────────────────────────
   const channelTasks: Array<Promise<void>> = [];
   const activeChannels: string[] = [];
@@ -833,6 +839,7 @@ async function asyncMain(): Promise<void> {
   heartbeat.start();
   cronScheduler.start();
   agentHeartbeats.start();
+  selfImproveLoop.start();
 
   // Background-task hygiene: any task left in 'running' is from a prior
   // process. Mark them aborted so the lifecycle is honest. (P6b will add
@@ -1037,6 +1044,7 @@ async function asyncMain(): Promise<void> {
   heartbeat.stop();
   cronScheduler.stop();
   agentHeartbeats.stop();
+  selfImproveLoop.stop();
 
   // ── Self-restart (enhanced with health check + rollback) ────────
   if (restartRequested) {
