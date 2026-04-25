@@ -33,6 +33,55 @@ const DEFAULT_INTERVAL_MIN = 30;
 const MIN_INTERVAL_MIN = 5;
 const MAX_INTERVAL_MIN = 12 * 60;
 
+// ── Adaptive cadence ─────────────────────────────────────────────────
+// Tick-outcome → next-check interval (minutes). Plain numbers tuned for
+// the typical "specialist running on a goal" workload — fast when active,
+// gradually slower when idle.
+const ACTED_INTERVAL_MIN = 10;
+const QUIET_INTERVAL_MIN = 60;
+// Exponential backoff schedule for consecutive silent ticks. Index = streak
+// length (capped at last entry). 0 silent → unused; 1st → 30, 2nd → 60, ...
+const SILENT_BACKOFF_MIN = [30, 60, 120, 240, 480, 720];
+// Off-hours multiplier. Applied after kind-based interval, capped at MAX.
+const OFF_HOURS_MULTIPLIER = 4;
+// Default active hours when an agent's profile doesn't specify
+const DEFAULT_ACTIVE_START_HOUR = 8;
+const DEFAULT_ACTIVE_END_HOUR = 22;
+
+/**
+ * Compute the next-check interval (minutes) for an upcoming tick. Pure
+ * function of the inputs — exported for tests.
+ */
+export function computeNextInterval(opts: {
+  kind: 'acted' | 'quiet' | 'silent' | 'override';
+  silentStreak: number;
+  isActiveHours: boolean;
+  overrideMin?: number;
+}): number {
+  if (opts.kind === 'override' && typeof opts.overrideMin === 'number') {
+    // User-set override always wins, still clamped to bounds.
+    return Math.max(MIN_INTERVAL_MIN, Math.min(MAX_INTERVAL_MIN, Math.floor(opts.overrideMin)));
+  }
+  let base: number;
+  if (opts.kind === 'acted') {
+    base = ACTED_INTERVAL_MIN;
+  } else if (opts.kind === 'quiet') {
+    base = QUIET_INTERVAL_MIN;
+  } else {
+    // silent
+    const idx = Math.min(Math.max(0, opts.silentStreak - 1), SILENT_BACKOFF_MIN.length - 1);
+    base = SILENT_BACKOFF_MIN[idx];
+  }
+  if (!opts.isActiveHours) base *= OFF_HOURS_MULTIPLIER;
+  return Math.max(MIN_INTERVAL_MIN, Math.min(MAX_INTERVAL_MIN, base));
+}
+
+function isWithinActiveHours(now: Date, profile: AgentProfile): boolean {
+  const hours = profile.activeHours ?? { start: DEFAULT_ACTIVE_START_HOUR, end: DEFAULT_ACTIVE_END_HOUR };
+  const localHour = now.getHours() + now.getMinutes() / 60;
+  return localHour >= hours.start && localHour < hours.end;
+}
+
 /**
  * Minimal gateway surface the scheduler needs for the LLM tick path.
  * Kept narrow so tests can mock it without pulling in the full Gateway.
@@ -88,6 +137,10 @@ export class AgentHeartbeatScheduler {
     try {
       if (existsSync(this.stateFile)) {
         const raw = JSON.parse(readFileSync(this.stateFile, 'utf-8')) as Partial<AgentHeartbeatState>;
+        const validKinds = ['acted', 'quiet', 'silent', 'override'] as const;
+        const kind = validKinds.includes(raw.lastTickKind as typeof validKinds[number])
+          ? (raw.lastTickKind as 'acted' | 'quiet' | 'silent' | 'override')
+          : undefined;
         return {
           slug: this.slug,
           lastTickAt: String(raw.lastTickAt ?? ''),
@@ -95,6 +148,7 @@ export class AgentHeartbeatScheduler {
           silentTickCount: Number(raw.silentTickCount ?? 0),
           fingerprint: String(raw.fingerprint ?? ''),
           ...(raw.lastSignalSummary ? { lastSignalSummary: raw.lastSignalSummary } : {}),
+          ...(kind ? { lastTickKind: kind } : {}),
         };
       }
     } catch (err) {
@@ -233,19 +287,34 @@ export class AgentHeartbeatScheduler {
     const { fingerprint, signals } = this.buildFingerprint();
     const changed = fingerprint !== prior.fingerprint;
 
-    let nextCheckMinutes = DEFAULT_INTERVAL_MIN;
     let lastSignalSummary: string | undefined;
+    let llmResult: { nextCheckMinutes: number | undefined; summary: string; ranLlm: boolean; tookAction: boolean } = {
+      nextCheckMinutes: undefined,
+      summary: '',
+      ranLlm: false,
+      tookAction: false,
+    };
 
     const shouldRunLlm = changed && prior.fingerprint !== '' && this.gateway !== null;
 
     if (shouldRunLlm) {
       try {
         const result = await this.runLlmTick(profile, signals, prior, now);
-        nextCheckMinutes = result.nextCheckMinutes ?? DEFAULT_INTERVAL_MIN;
-        lastSignalSummary = result.summary?.slice(0, 240);
+        // Heuristic: a meaningful response means the agent took action. Short
+        // "all quiet" / "[ALL_QUIET]" responses don't count.
+        const summary = result.summary ?? '';
+        const tookAction = summary.length > 200 && !/\[ALL_QUIET\]/i.test(summary);
+        llmResult = {
+          nextCheckMinutes: result.nextCheckMinutes,
+          summary,
+          ranLlm: true,
+          tookAction,
+        };
+        lastSignalSummary = summary.slice(0, 240);
       } catch (err) {
         logger.warn({ err, slug: this.slug }, 'Agent LLM tick failed — using default cadence');
         lastSignalSummary = `llm tick error: ${String(err).slice(0, 200)}`;
+        llmResult.ranLlm = true; // we attempted, treat as 'quiet' for backoff
       }
     } else if (changed) {
       lastSignalSummary = `signal change: ${JSON.stringify(signals)}`.slice(0, 240);
@@ -253,22 +322,40 @@ export class AgentHeartbeatScheduler {
       lastSignalSummary = prior.lastSignalSummary;
     }
 
-    const clampedMin = Math.max(MIN_INTERVAL_MIN, Math.min(MAX_INTERVAL_MIN, Math.floor(nextCheckMinutes)));
-    const next = new Date(now.getTime() + clampedMin * 60_000);
+    // Classify outcome → drives adaptive cadence.
+    const newSilentStreak = changed ? 0 : prior.silentTickCount + 1;
+    const tickKind: 'acted' | 'quiet' | 'silent' | 'override' = (() => {
+      if (typeof llmResult.nextCheckMinutes === 'number') return 'override';
+      if (!changed) return 'silent';
+      if (llmResult.ranLlm && llmResult.tookAction) return 'acted';
+      return 'quiet';
+    })();
+    const isActive = isWithinActiveHours(now, profile);
+    const computedMin = computeNextInterval({
+      kind: tickKind,
+      silentStreak: newSilentStreak,
+      isActiveHours: isActive,
+      overrideMin: llmResult.nextCheckMinutes,
+    });
+    const next = new Date(now.getTime() + computedMin * 60_000);
     const state: AgentHeartbeatState = {
       slug: this.slug,
       lastTickAt: now.toISOString(),
       nextCheckAt: next.toISOString(),
-      silentTickCount: changed ? 0 : prior.silentTickCount + 1,
+      silentTickCount: newSilentStreak,
       fingerprint,
+      lastTickKind: tickKind,
       ...(lastSignalSummary ? { lastSignalSummary } : {}),
     };
     this.saveState(state);
 
     if (changed) {
-      logger.info({ slug: this.slug, signals, fingerprint, ranLlm: shouldRunLlm, nextCheckMin: clampedMin }, 'Agent heartbeat tick');
+      logger.info(
+        { slug: this.slug, signals, fingerprint, ranLlm: shouldRunLlm, kind: tickKind, nextCheckMin: computedMin, isActive },
+        'Agent heartbeat tick',
+      );
     } else {
-      logger.debug({ slug: this.slug, silentTicks: state.silentTickCount }, 'Agent heartbeat: silent tick');
+      logger.debug({ slug: this.slug, silentTicks: state.silentTickCount, nextCheckMin: computedMin, isActive }, 'Agent heartbeat: silent tick');
     }
     return state;
   }

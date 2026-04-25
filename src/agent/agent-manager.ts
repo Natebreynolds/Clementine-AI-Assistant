@@ -213,6 +213,21 @@ export class AgentManager {
       }
     }
 
+    // Parse active_hours from frontmatter ("HH:MM-HH:MM" → decimal hours).
+    // Same-day windows only; midnight-crossing strings are ignored.
+    let activeHours: { start: number; end: number } | undefined;
+    const ahRaw = meta.active_hours ?? meta.activeHours;
+    if (typeof ahRaw === 'string') {
+      const m = ahRaw.match(/^(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})$/);
+      if (m) {
+        const start = Number(m[1]) + Number(m[2]) / 60;
+        const end = Number(m[3]) + Number(m[4]) / 60;
+        if (start < end && start >= 0 && end <= 24) {
+          activeHours = { start, end };
+        }
+      }
+    }
+
     // Parse sendPolicy from frontmatter
     let sendPolicy: SendPolicy | undefined;
     if (meta.sendPolicy && typeof meta.sendPolicy === 'object') {
@@ -254,6 +269,7 @@ export class AgentManager {
       status: (['active', 'paused', 'error', 'terminated'].includes(meta.status) ? meta.status : 'active') as AgentStatus,
       budgetMonthlyCents: meta.budgetMonthlyCents ? Number(meta.budgetMonthlyCents) : undefined,
       strictMemoryIsolation: meta.strictMemoryIsolation === false ? false : true, // default true for all agents
+      activeHours,
     };
   }
 

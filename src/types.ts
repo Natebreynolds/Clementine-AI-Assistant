@@ -223,6 +223,14 @@ export interface AgentProfile {
   budgetMonthlyCents?: number;     // Monthly token budget in cents (0 = unlimited)
   spentMonthlyCents?: number;      // Current month's spend (computed from usage_log)
   strictMemoryIsolation?: boolean; // If true (default), only see own + global memory. false = soft boost (legacy).
+  /**
+   * Active-hours window for adaptive heartbeat cadence. Decimal hours in
+   * the local timezone, e.g., { start: 8, end: 18 } = 8:00am–6:00pm.
+   * When the current time is outside this window, the agent's next-check
+   * interval is multiplied by 4. Parsed from `active_hours: "HH:MM-HH:MM"`
+   * in agent.md frontmatter; same-day windows only.
+   */
+  activeHours?: { start: number; end: number };
 }
 
 export type AgentStatus = 'active' | 'paused' | 'error' | 'terminated';
@@ -290,6 +298,15 @@ export interface AgentHeartbeatState {
   silentTickCount: number;     // Consecutive ticks with no signal change (bounds idle cost)
   fingerprint: string;         // Hash of "anything material" — unchanged → silent tick
   lastSignalSummary?: string;  // Short note: last reason a tick lit up
+  /**
+   * Outcome of the last tick. Drives adaptive cadence:
+   *   - 'acted' → next check at active-mode interval (10 min default)
+   *   - 'quiet' → next check at quiet interval (60 min)
+   *   - 'silent' → exponential backoff (30 → 60 → 120 → 240 → 480, capped)
+   *   - 'override' → agent explicitly set [NEXT_CHECK: Xm], honored as-is
+   *   - undefined → first tick or pre-1.0.84 state
+   */
+  lastTickKind?: 'acted' | 'quiet' | 'silent' | 'override';
 }
 
 // ── Cron Jobs ────────────────────────────────────────────────────────

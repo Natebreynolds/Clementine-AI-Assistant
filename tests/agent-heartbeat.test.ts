@@ -2,7 +2,11 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { AgentHeartbeatScheduler, type AgentHeartbeatGateway } from '../src/gateway/agent-heartbeat-scheduler.js';
+import {
+  AgentHeartbeatScheduler,
+  computeNextInterval,
+  type AgentHeartbeatGateway,
+} from '../src/gateway/agent-heartbeat-scheduler.js';
 import type { AgentManager } from '../src/agent/agent-manager.js';
 import type { AgentHeartbeatState, AgentProfile } from '../src/types.js';
 
@@ -140,6 +144,47 @@ describe('AgentHeartbeatScheduler (cheap path)', () => {
   });
 });
 
+describe('computeNextInterval (adaptive cadence)', () => {
+  it('acted ticks return the active-mode interval (10 min)', () => {
+    expect(computeNextInterval({ kind: 'acted', silentStreak: 0, isActiveHours: true })).toBe(10);
+  });
+
+  it('quiet ticks return the quiet interval (60 min)', () => {
+    expect(computeNextInterval({ kind: 'quiet', silentStreak: 0, isActiveHours: true })).toBe(60);
+  });
+
+  it('silent ticks back off exponentially', () => {
+    expect(computeNextInterval({ kind: 'silent', silentStreak: 1, isActiveHours: true })).toBe(30);
+    expect(computeNextInterval({ kind: 'silent', silentStreak: 2, isActiveHours: true })).toBe(60);
+    expect(computeNextInterval({ kind: 'silent', silentStreak: 3, isActiveHours: true })).toBe(120);
+    expect(computeNextInterval({ kind: 'silent', silentStreak: 4, isActiveHours: true })).toBe(240);
+    expect(computeNextInterval({ kind: 'silent', silentStreak: 5, isActiveHours: true })).toBe(480);
+    // Caps at the last entry (720), not unbounded
+    expect(computeNextInterval({ kind: 'silent', silentStreak: 100, isActiveHours: true })).toBe(720);
+  });
+
+  it('off-hours multiplies the interval by 4 (capped at MAX 12h = 720)', () => {
+    // acted: 10 * 4 = 40
+    expect(computeNextInterval({ kind: 'acted', silentStreak: 0, isActiveHours: false })).toBe(40);
+    // quiet: 60 * 4 = 240
+    expect(computeNextInterval({ kind: 'quiet', silentStreak: 0, isActiveHours: false })).toBe(240);
+    // silent[3] = 120 * 4 = 480
+    expect(computeNextInterval({ kind: 'silent', silentStreak: 3, isActiveHours: false })).toBe(480);
+    // silent[5] = 480 * 4 = 1920, capped at 720
+    expect(computeNextInterval({ kind: 'silent', silentStreak: 5, isActiveHours: false })).toBe(720);
+  });
+
+  it('override always wins (still clamped to [5, 720])', () => {
+    expect(computeNextInterval({ kind: 'override', silentStreak: 0, isActiveHours: true, overrideMin: 15 })).toBe(15);
+    // Below MIN clamps up to 5
+    expect(computeNextInterval({ kind: 'override', silentStreak: 0, isActiveHours: true, overrideMin: 1 })).toBe(5);
+    // Above MAX clamps down to 720
+    expect(computeNextInterval({ kind: 'override', silentStreak: 0, isActiveHours: true, overrideMin: 9999 })).toBe(720);
+    // Even off-hours: override doesn't get the 4x multiplier
+    expect(computeNextInterval({ kind: 'override', silentStreak: 0, isActiveHours: false, overrideMin: 30 })).toBe(30);
+  });
+});
+
 describe('AgentHeartbeatScheduler.parseLlmTickOutput', () => {
   it('extracts NEXT_CHECK directive in minutes', () => {
     expect(AgentHeartbeatScheduler.parseLlmTickOutput('All quiet. [NEXT_CHECK: 60m]')).toEqual({
@@ -244,12 +289,15 @@ describe('AgentHeartbeatScheduler (LLM tick path)', () => {
     expect(elapsedMs).toBe(10 * 60_000);
   });
 
-  it('falls back to default cadence when LLM tick throws', async () => {
+  it('falls back to quiet cadence when LLM tick throws (active hours)', async () => {
     const handleCronJob = vi.fn(async () => { throw new Error('rate limited'); });
     const gateway: AgentHeartbeatGateway = { handleCronJob };
     const sched = new AgentHeartbeatScheduler(slug, makeAgentManagerLocal(), { baseDir, agentsDir, gateway });
 
-    await sched.tick(new Date('2026-04-25T10:00:00Z'));
+    // Use local-time Dates (no 'Z') so the active-hours check is deterministic
+    // regardless of machine timezone — both ticks fire at 3pm local, which is
+    // inside the default 08:00–22:00 window.
+    await sched.tick(new Date('2026-04-25T15:00:00'));
     const tasksDir = path.join(agentsDir, slug, 'tasks');
     mkdirSync(tasksDir, { recursive: true });
     writeFileSync(
@@ -257,10 +305,11 @@ describe('AgentHeartbeatScheduler (LLM tick path)', () => {
       JSON.stringify({ id: 't1', status: 'pending', task: 'x', fromAgent: 'c', expectedOutput: 'y' }),
     );
 
-    const now = new Date('2026-04-25T10:30:00Z');
+    const now = new Date('2026-04-25T15:30:00');
     const after = await sched.tick(now);
-    // Default 30min cadence on error
-    expect(new Date(after.nextCheckAt).getTime() - now.getTime()).toBe(30 * 60_000);
+    // LLM tick errored but classifier treats it as 'quiet' → 60 min
+    expect(new Date(after.nextCheckAt).getTime() - now.getTime()).toBe(60 * 60_000);
     expect(after.lastSignalSummary).toMatch(/llm tick error/);
+    expect(after.lastTickKind).toBe('quiet');
   });
 });
