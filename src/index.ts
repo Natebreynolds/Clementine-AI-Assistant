@@ -723,6 +723,11 @@ async function asyncMain(): Promise<void> {
   const cronScheduler = new CronScheduler(gateway, dispatcher);
   heartbeat.setCronScheduler(cronScheduler);
 
+  // Per-agent heartbeats (Ross / Sasha / Nora / future hires). Cheap-path
+  // observation only in P2 — LLM ticks land in P3.
+  const { AgentHeartbeatManager } = await import('./gateway/agent-heartbeat-manager.js');
+  const agentHeartbeats = new AgentHeartbeatManager(gateway.getAgentManager());
+
   // ── Build channel tasks ──────────────────────────────────────────
   const channelTasks: Array<Promise<void>> = [];
   const activeChannels: string[] = [];
@@ -826,6 +831,7 @@ async function asyncMain(): Promise<void> {
   // Start heartbeat + cron + timers
   heartbeat.start();
   cronScheduler.start();
+  agentHeartbeats.start();
   const timerInterval = startTimerChecker(dispatcher, gateway);
 
   // Start brain ingest scheduler (polls registered REST sources on their cron)
@@ -1015,6 +1021,7 @@ async function asyncMain(): Promise<void> {
   // Now safe to tear down remaining infrastructure
   heartbeat.stop();
   cronScheduler.stop();
+  agentHeartbeats.stop();
 
   // ── Self-restart (enhanced with health check + rollback) ────────
   if (restartRequested) {

@@ -268,6 +268,22 @@ export interface HeartbeatWorkItem {
   agentSlug?: string;
 }
 
+// ── Per-agent heartbeat ──────────────────────────────────────────────
+
+/**
+ * State for one specialist agent's heartbeat scheduler. Persisted at
+ * ~/.clementine/heartbeat/agents/<slug>/state.json. Manager reads
+ * `nextCheckAt` to decide whether the agent is due for a tick.
+ */
+export interface AgentHeartbeatState {
+  slug: string;
+  lastTickAt: string;          // ISO timestamp of the last tick (cheap or LLM)
+  nextCheckAt: string;         // ISO timestamp at which the agent is next due
+  silentTickCount: number;     // Consecutive ticks with no signal change (bounds idle cost)
+  fingerprint: string;         // Hash of "anything material" — unchanged → silent tick
+  lastSignalSummary?: string;  // Short note: last reason a tick lit up
+}
+
 // ── Cron Jobs ────────────────────────────────────────────────────────
 
 export interface CronJobDefinition {
