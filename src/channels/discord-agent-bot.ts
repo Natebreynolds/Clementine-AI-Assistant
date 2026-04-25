@@ -264,8 +264,15 @@ export class AgentBotClient {
    *
    * Priority:
    * 1. Explicit channelIds from config (e.g. discordChannelId in agent.md)
-   * 2. Match by channelName in any guild the bot is in
-   * 3. All text channels the bot can see (fallback for simple setups)
+   * 2. Match by channelName in any guild the bot is in (single name or array)
+   * 3. **DM-only.** If neither is configured, the bot does not subscribe to any
+   *    text channel — it only responds in DMs. Each agent has its own bot
+   *    token specifically so it has its own DM lane to the owner; spamming
+   *    every visible channel by default is the opposite of what users want.
+   *
+   * Previously this fell back to "all visible text channels," which made
+   * Ross + Nora respond everywhere in guild because they had no channelName
+   * set. Opt-in is the correct default.
    */
   private discoverChannels(): string[] {
     // 1. Explicit IDs
@@ -298,24 +305,18 @@ export class AgentBotClient {
       }
       logger.warn(
         { slug: this.config.slug, channelNames },
-        'No channels found matching channelName(s) — falling back to all visible text channels',
+        'No channels found matching channelName(s) — falling back to DM-only',
       );
     }
 
-    // 3. Fallback: all text channels the bot can see
-    const all: string[] = [];
-    for (const guild of this.client.guilds.cache.values()) {
-      for (const channel of guild.channels.cache.values()) {
-        if (channel.type === ChannelType.GuildText) {
-          all.push(channel.id);
-        }
-      }
-    }
+    // 3. DM-only. Bot will still respond to DMs (handleMessage checks isDMBased
+    // before consulting resolvedChannelIds), so this is the right "no channels"
+    // default — not silence.
     logger.info(
-      { slug: this.config.slug, count: all.length },
-      'Fallback: listening in all visible text channels',
+      { slug: this.config.slug },
+      'Bot in DM-only mode (no channelName configured)',
     );
-    return all;
+    return [];
   }
 
   /**
