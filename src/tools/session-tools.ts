@@ -10,6 +10,16 @@ import {
   BASE_DIR, HANDOFFS_DIR, INBOX_DIR, TASKS_FILE,
   logger, textResult, todayStr, listAllGoals,
 } from './shared.js';
+import { decideDiscoveredWorkItem, type ProactiveAction, type ProactiveWorkType } from '../agent/proactive-engine.js';
+import { recentDecisions } from '../agent/proactive-ledger.js';
+
+const ACTION_LABEL: Record<ProactiveAction, string> = {
+  act_now: 'Doing now',
+  queue: 'Queued',
+  ask_user: 'Needs you',
+  snooze: 'Snoozed',
+  ignore: 'Skipped',
+};
 
 function ensureHandoffsDir(): void {
   if (!existsSync(HANDOFFS_DIR)) mkdirSync(HANDOFFS_DIR, { recursive: true });
@@ -82,7 +92,7 @@ export function registerSessionTools(server: McpServer): void {
     },
     async ({ agent_slug, limit }) => {
       const maxItems = Math.min(limit ?? 10, 30);
-      const items: Array<{ type: string; urgency: number; description: string }> = [];
+      const items: Array<{ type: ProactiveWorkType; urgency: number; description: string; id?: string }> = [];
 
       // 1. Stale goals (walks global + per-agent dirs)
       for (const { goal, owner } of listAllGoals()) {
@@ -93,7 +103,7 @@ export function registerSessionTools(server: McpServer): void {
         const staleThreshold = goal.reviewFrequency === 'daily' ? 1 : goal.reviewFrequency === 'weekly' ? 7 : 30;
         if (daysSinceUpdate > staleThreshold) {
           const urgency = Math.min(5, Math.floor(daysSinceUpdate / staleThreshold) + (goal.priority === 'high' ? 2 : goal.priority === 'medium' ? 1 : 0));
-          items.push({ type: 'stale-goal', urgency, description: `Goal "${goal.title}" stale for ${daysSinceUpdate}d (${goal.priority} priority)` });
+          items.push({ type: 'stale-goal', id: goal.id, urgency, description: `Goal "${goal.title}" stale for ${daysSinceUpdate}d (${goal.priority} priority)` });
         }
       }
 
@@ -108,7 +118,7 @@ export function registerSessionTools(server: McpServer): void {
             const errCount = consecutiveErrors === -1 ? recent.length : consecutiveErrors;
             if (errCount >= 2) {
               const jobName = recent[0]?.jobName ?? f.replace('.jsonl', '');
-              items.push({ type: 'cron-failure', urgency: Math.min(5, errCount), description: `Job "${jobName}" has ${errCount} consecutive failures` });
+              items.push({ type: 'cron-failure', id: jobName, urgency: Math.min(5, errCount), description: `Job "${jobName}" has ${errCount} consecutive failures` });
             }
           } catch { continue; }
         }
@@ -120,13 +130,13 @@ export function registerSessionTools(server: McpServer): void {
         const today = todayStr();
         const overdue = (content.match(/- \[ \].*?📅\s*(\d{4}-\d{2}-\d{2})/g) ?? [])
           .filter(line => { const m = line.match(/📅\s*(\d{4}-\d{2}-\d{2})/); return m && m[1] < today; });
-        if (overdue.length > 0) items.push({ type: 'overdue-tasks', urgency: 4, description: `${overdue.length} overdue task(s) in TASKS.md` });
+        if (overdue.length > 0) items.push({ type: 'overdue-tasks', id: 'tasks-overdue', urgency: 4, description: `${overdue.length} overdue task(s) in TASKS.md` });
       }
 
       // 4. Inbox items
       if (existsSync(INBOX_DIR)) {
         const inboxFiles = readdirSync(INBOX_DIR).filter(f => f.endsWith('.md') && !f.startsWith('_'));
-        if (inboxFiles.length > 0) items.push({ type: 'inbox', urgency: 2, description: `${inboxFiles.length} unprocessed inbox item(s)` });
+        if (inboxFiles.length > 0) items.push({ type: 'inbox', id: 'inbox', urgency: 2, description: `${inboxFiles.length} unprocessed inbox item(s)` });
       }
 
       // 5. Daily plan priorities
@@ -136,7 +146,7 @@ export function registerSessionTools(server: McpServer): void {
           const plan = JSON.parse(readFileSync(planFile, 'utf-8'));
           for (const p of (plan.priorities ?? []).slice(0, 5)) {
             const alreadyListed = items.some(i => i.description.includes(p.id) || i.description.includes(p.action?.slice(0, 20)));
-            if (!alreadyListed) items.push({ type: `plan-${p.type}`, urgency: p.urgency ?? 3, description: `[From daily plan] ${p.action}` });
+            if (!alreadyListed) items.push({ type: `plan-${p.type}` as ProactiveWorkType, id: p.id, urgency: p.urgency ?? 3, description: `[From daily plan] ${p.action}` });
           }
         } catch { /* non-fatal */ }
       }
@@ -144,8 +154,56 @@ export function registerSessionTools(server: McpServer): void {
       items.sort((a, b) => b.urgency - a.urgency);
       const topItems = items.slice(0, maxItems);
       if (topItems.length === 0) return textResult('No work items discovered. All goals on track, no failures, inbox clear.');
-      const lines = topItems.map(i => `- [${i.type}] Urgency ${i.urgency}/5: ${i.description}`);
+      const lines = topItems.map((i) => {
+        const decision = decideDiscoveredWorkItem(i);
+        const label = ACTION_LABEL[decision.action];
+        return `- [${i.type}] Urgency ${i.urgency}/5 → ${label}: ${i.description}`;
+      });
       return textResult(`## Discovered Work Items (${topItems.length})\n${lines.join('\n')}`);
+    },
+  );
+
+  server.tool(
+    'proactive_stats',
+    'Report how the proactive engine has been deciding and what those decisions led to. Use to tune urgency thresholds.',
+    {
+      since_hours: z.number().optional().describe('Window in hours (default: 168 = 7 days)'),
+    },
+    async ({ since_hours }) => {
+      const windowMs = (since_hours ?? 168) * 60 * 60 * 1000;
+      const records = recentDecisions({ sinceMs: windowMs }, undefined);
+      if (records.length === 0) return textResult('No proactive decisions recorded in window.');
+
+      type Bucket = { decided: number; outcomes: Record<string, number> };
+      const bySource = new Map<string, Map<ProactiveAction, Bucket>>();
+      const outcomeByKey = new Map<string, string>();
+      for (const r of records) {
+        if (r.outcome) outcomeByKey.set(r.decision.idempotencyKey, r.outcome.status);
+      }
+      for (const r of records) {
+        if (r.outcome) continue;
+        const sourceMap = bySource.get(r.decision.source) ?? new Map();
+        const bucket = sourceMap.get(r.decision.action) ?? { decided: 0, outcomes: {} };
+        bucket.decided++;
+        const outcome = outcomeByKey.get(r.decision.idempotencyKey);
+        if (outcome) bucket.outcomes[outcome] = (bucket.outcomes[outcome] ?? 0) + 1;
+        sourceMap.set(r.decision.action, bucket);
+        bySource.set(r.decision.source, sourceMap);
+      }
+
+      const lines: string[] = [`## Proactive Stats (last ${since_hours ?? 168}h, ${records.length} records)\n`];
+      for (const [source, actionMap] of bySource) {
+        lines.push(`### ${source}`);
+        for (const [action, bucket] of actionMap) {
+          const outcomes = Object.entries(bucket.outcomes);
+          const outcomeStr = outcomes.length === 0
+            ? 'no outcomes recorded'
+            : outcomes.map(([k, v]) => `${k}=${v}`).join(', ');
+          lines.push(`- ${ACTION_LABEL[action]} (${action}): decided ${bucket.decided}× → ${outcomeStr}`);
+        }
+        lines.push('');
+      }
+      return textResult(lines.join('\n'));
     },
   );
 }

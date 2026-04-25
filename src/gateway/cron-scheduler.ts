@@ -45,8 +45,24 @@ import { scanner } from '../security/scanner.js';
 import { parseAllWorkflows as parseAllWorkflowsSync } from '../agent/workflow-runner.js';
 import { SelfImproveLoop } from '../agent/self-improve.js';
 import { logAuditJsonl } from '../agent/hooks.js';
+import type { ProactiveDecision } from '../agent/proactive-engine.js';
+import {
+  outcomeStatusFromGoalDisposition,
+  recentDecisions,
+  recordDecisionOutcome,
+} from '../agent/proactive-ledger.js';
 
 const logger = pino({ name: 'clementine.cron' });
+
+interface GoalTriggerPayload {
+  goalId: string;
+  focus: string;
+  maxTurns?: number;
+  triggeredAt?: string;
+  source?: string;
+  reason?: string;
+  decision?: ProactiveDecision;
+}
 
 /** Default timeout for standard cron jobs (10 minutes). */
 const CRON_STANDARD_TIMEOUT_MS = 10 * 60 * 1000;
@@ -1682,7 +1698,7 @@ export class CronScheduler {
     for (const file of files) {
       const filePath = path.join(this.goalTriggerDir, file);
       try {
-        const trigger = JSON.parse(readFileSync(filePath, 'utf-8'));
+        const trigger = JSON.parse(readFileSync(filePath, 'utf-8')) as GoalTriggerPayload;
         unlinkSync(filePath);
         if (!trigger.goalId) continue;
 
@@ -1775,7 +1791,7 @@ export class CronScheduler {
 
           if (advice.shouldSkip) {
             logger.info({ goalId: trigger.goalId, reason: advice.skipReason }, 'Goal work skipped by advisor (circuit breaker)');
-            this.logGoalOutcome(trigger.goalId, goalPath, goalSnapshotUpdatedAt, goalSnapshotNotes, trigger.focus, trigger.source, null, `Skipped: ${advice.skipReason}`);
+            this.logGoalOutcome(trigger.goalId, goalPath, goalSnapshotUpdatedAt, goalSnapshotNotes, trigger.focus, trigger.source ?? 'unknown', null, `Skipped: ${advice.skipReason}`, trigger.decision);
             return;
           }
 
@@ -1810,10 +1826,10 @@ export class CronScheduler {
               this.dispatcher.send(`🎯 **Goal work: ${goal.title}**\n\n${result.slice(0, 1500)}`, dispatchOpts).catch(err => logger.debug({ err }, 'Failed to send goal work notification'));
             }
             logToDailyNote(`**Goal work: ${goal.title}** — ${(result || 'completed').slice(0, 100).replace(/\n/g, ' ')}`);
-            this.logGoalOutcome(trigger.goalId, goalPath, goalSnapshotUpdatedAt, goalSnapshotNotes, trigger.focus, trigger.source, result);
+            this.logGoalOutcome(trigger.goalId, goalPath, goalSnapshotUpdatedAt, goalSnapshotNotes, trigger.focus, trigger.source ?? 'unknown', result, undefined, trigger.decision);
           }).catch((err) => {
             logger.error({ err, goalId: trigger.goalId }, 'Goal work session failed');
-            this.logGoalOutcome(trigger.goalId, goalPath, goalSnapshotUpdatedAt, goalSnapshotNotes, trigger.focus, trigger.source, null, String(err));
+            this.logGoalOutcome(trigger.goalId, goalPath, goalSnapshotUpdatedAt, goalSnapshotNotes, trigger.focus, trigger.source ?? 'unknown', null, String(err), trigger.decision);
           });
         }).catch((err) => {
           // Advisor import failed — fall back to basic execution
@@ -1835,10 +1851,10 @@ export class CronScheduler {
               this.dispatcher.send(`🎯 **Goal work: ${goal.title}**\n\n${result.slice(0, 1500)}`, dispatchOpts).catch(err => logger.debug({ err }, 'Failed to send goal work notification'));
             }
             logToDailyNote(`**Goal work: ${goal.title}** — ${(result || 'completed').slice(0, 100).replace(/\n/g, ' ')}`);
-            this.logGoalOutcome(trigger.goalId, goalPath, goalSnapshotUpdatedAt, goalSnapshotNotes, trigger.focus, trigger.source, result);
+            this.logGoalOutcome(trigger.goalId, goalPath, goalSnapshotUpdatedAt, goalSnapshotNotes, trigger.focus, trigger.source ?? 'unknown', result, undefined, trigger.decision);
           }).catch((goalErr) => {
             logger.error({ err: goalErr, goalId: trigger.goalId }, 'Goal work session failed');
-            this.logGoalOutcome(trigger.goalId, goalPath, goalSnapshotUpdatedAt, goalSnapshotNotes, trigger.focus, trigger.source, null, String(goalErr));
+            this.logGoalOutcome(trigger.goalId, goalPath, goalSnapshotUpdatedAt, goalSnapshotNotes, trigger.focus, trigger.source ?? 'unknown', null, String(goalErr), trigger.decision);
           });
         });
       } catch (err) {
@@ -1861,6 +1877,7 @@ export class CronScheduler {
     source: string,
     result: string | null,
     error?: string,
+    proactiveDecision?: ProactiveDecision,
   ): void {
     try {
       let madeProgress = false;
@@ -1898,9 +1915,60 @@ export class CronScheduler {
       const progressFile = path.join(progressDir, `${goalId}.progress.jsonl`);
       appendFileSync(progressFile, JSON.stringify(entry) + '\n');
 
+      if (proactiveDecision) {
+        this.logProactiveDecisionOutcome(proactiveDecision, {
+          goalId,
+          focus,
+          source,
+          disposition,
+          madeProgress,
+          resultSnippet: entry.resultSnippet,
+          newProgressNotes: entry.newProgressNotes,
+        });
+      }
+
       logger.info({ goalId, madeProgress, disposition, status: entry.status }, 'Goal outcome logged');
     } catch (err) {
       logger.debug({ err, goalId }, 'Failed to log goal outcome (non-fatal)');
+    }
+  }
+
+  private logProactiveDecisionOutcome(
+    decision: ProactiveDecision,
+    details: {
+      goalId: string;
+      focus: string;
+      source: string;
+      disposition: string;
+      madeProgress: boolean;
+      resultSnippet: string;
+      newProgressNotes: number;
+    },
+  ): void {
+    try {
+      const existing = recentDecisions({ idempotencyKey: decision.idempotencyKey }, undefined)[0];
+      const decisionId = existing?.id ?? decision.idempotencyKey;
+      recordDecisionOutcome(
+        decisionId,
+        decision,
+        {
+          signalType: 'goal-work-outcome',
+          description: details.focus,
+          goalId: details.goalId,
+          metadata: {
+            source: details.source,
+            disposition: details.disposition,
+            madeProgress: details.madeProgress,
+            newProgressNotes: details.newProgressNotes,
+          },
+        },
+        {
+          status: outcomeStatusFromGoalDisposition(details.disposition),
+          summary: details.resultSnippet || details.disposition,
+        },
+      );
+    } catch (err) {
+      logger.debug({ err, goalId: details.goalId }, 'Failed to log proactive decision outcome (non-fatal)');
     }
   }
 

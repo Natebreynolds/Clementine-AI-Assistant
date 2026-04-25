@@ -139,7 +139,7 @@ export function gatherInsightSignals(gateway: {
 
   // 2. Check for cron job failures
   try {
-    const runLogDir = path.join(BASE_DIR, 'cron', 'run-log');
+    const runLogDir = path.join(BASE_DIR, 'cron', 'runs');
     if (existsSync(runLogDir)) {
       const logFiles = readdirSync(runLogDir).filter(f => f.endsWith('.jsonl')).slice(0, 10);
       for (const file of logFiles) {
@@ -148,7 +148,8 @@ export function gatherInsightSignals(gateway: {
         if (!lastLine) continue;
         try {
           const entry = JSON.parse(lastLine);
-          if (new Date(entry.timestamp) > new Date(twoHoursAgo) && entry.status === 'error') {
+          const finishedAt = entry.finishedAt ?? entry.timestamp;
+          if (finishedAt && new Date(finishedAt) > new Date(twoHoursAgo) && entry.status === 'error') {
             signals.push(`Cron job "${entry.jobName || file.replace('.jsonl', '')}" failed: ${(entry.error || '').slice(0, 100)}`);
           }
         } catch { continue; }

@@ -2081,11 +2081,9 @@ export function validateProposal(area: string, target: string, proposedChange: s
     if (SOURCE_BLOCKLIST.has(target)) {
       return { valid: false, error: `Source file '${target}' is in the blocklist and cannot be modified by self-improvement` };
     }
-    // Size sanity: reject wholesale rewrites (proposed content > 2x original would be caught by caller)
-    // Check basic TypeScript structure: must contain at least one import or export
-    if (!proposedChange.includes('import ') && !proposedChange.includes('export ')) {
-      return { valid: false, error: 'Source proposal missing import/export statements — likely not valid TypeScript' };
-    }
+    // Size sanity: reject wholesale rewrites (proposed content > 2x original would be caught by caller).
+    // Source proposals may be small patches or modules without import/export statements;
+    // callers that apply source changes do the syntax-aware validation.
   }
   return { valid: true };
 }

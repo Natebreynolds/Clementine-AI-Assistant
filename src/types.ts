@@ -255,6 +255,8 @@ export interface HeartbeatWorkItem {
   description: string;
   prompt: string;
   source: string;
+  // Stable hash used for cross-tick dedup. When omitted, dedup falls back to `source`.
+  idempotencyKey?: string;
   priority: 'high' | 'normal';
   queuedAt: string;
   maxTurns: number;

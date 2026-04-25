@@ -44,11 +44,25 @@ import {
   maybeIncreaseCooldown,
   type InsightState,
 } from '../agent/insight-engine.js';
+import {
+  decideDailyPlanPriority,
+  decideDiscoveredWorkItem,
+  decideGoalAdvancement,
+  decisionShouldCreateGoalTrigger,
+  decisionShouldQueueHeartbeatWork,
+} from '../agent/proactive-engine.js';
+import {
+  recentDecisions,
+  recordDecision,
+  recordDecisionOutcome,
+  wasRecentlyDecided,
+} from '../agent/proactive-ledger.js';
 import type { NotificationDispatcher } from './notifications.js';
 import type { Gateway } from './router.js';
 import { CronRunLog, logToDailyNote, todayISO } from './cron-scheduler.js';
 
 const logger = pino({ name: 'clementine.heartbeat' });
+const PROACTIVE_DECISION_DEDUPE_MS = 24 * 60 * 60 * 1000;
 
 // ── HeartbeatScheduler ────────────────────────────────────────────────
 
@@ -391,6 +405,13 @@ export class HeartbeatScheduler {
     // ── Active hours check ────────────────────────────────────────────
     // Check active hours
     if (hour < HEARTBEAT_ACTIVE_START || hour >= HEARTBEAT_ACTIVE_END) {
+      // Critical proactive alerts are allowed outside active hours; normal
+      // heartbeat narration still stays quiet.
+      try {
+        await this.runInsightCheck();
+      } catch (err) {
+        logger.debug({ err }, 'Outside-hours insight check failed (non-fatal)');
+      }
       logger.debug(`Heartbeat skipped: outside active hours (${hour}:00)`);
       return;
     }
@@ -404,26 +425,59 @@ export class HeartbeatScheduler {
         logger.info('First active-hours tick — generating daily plan');
         const plan = await dailyPlanner.plan();
         if (plan.priorities.length > 0) {
-          const highUrgency = plan.priorities.filter(p => p.urgency >= 4);
-          if (highUrgency.length > 0) {
-            const goalTriggerDir = path.join(BASE_DIR, 'cron', 'goal-triggers');
-            mkdirSync(goalTriggerDir, { recursive: true });
-            for (const item of highUrgency) {
-              if (item.type === 'goal') {
-                const triggerPath = path.join(goalTriggerDir, `${item.id}.trigger.json`);
-                if (!existsSync(triggerPath)) {
-                  writeFileSync(triggerPath, JSON.stringify({
-                    goalId: item.id,
-                    focus: item.action,
-                    maxTurns: 30,
-                    triggeredAt: new Date().toISOString(),
-                    source: 'daily-plan',
-                  }, null, 2));
-                }
+          const goalTriggerDir = path.join(BASE_DIR, 'cron', 'goal-triggers');
+          mkdirSync(goalTriggerDir, { recursive: true });
+
+          let acted = 0;
+          let queued = 0;
+          let askUser = 0;
+          for (const item of plan.priorities) {
+            const decision = decideDailyPlanPriority({ priority: item, date: plan.date });
+            if (decision.action === 'ask_user') askUser++;
+
+            if (item.type === 'goal' && decisionShouldCreateGoalTrigger(decision)) {
+              if (wasRecentlyDecided(decision.idempotencyKey, PROACTIVE_DECISION_DEDUPE_MS)) continue;
+              const triggerPath = path.join(goalTriggerDir, `${decision.idempotencyKey}.trigger.json`);
+              if (!existsSync(triggerPath)) {
+                writeFileSync(triggerPath, JSON.stringify({
+                  goalId: item.id,
+                  focus: item.action,
+                  maxTurns: 30,
+                  triggeredAt: new Date().toISOString(),
+                  source: 'daily-plan',
+                  decision,
+                }, null, 2));
+                recordDecision(decision, {
+                  signalType: 'daily-plan-priority',
+                  description: item.action,
+                  goalId: item.id,
+                  metadata: { planDate: plan.date, type: item.type },
+                });
+                acted++;
               }
+            } else if (item.type === 'goal' && decisionShouldQueueHeartbeatWork(decision)) {
+              if (wasRecentlyDecided(decision.idempotencyKey, PROACTIVE_DECISION_DEDUPE_MS)) continue;
+              HeartbeatScheduler.enqueueWork({
+                description: item.action,
+                prompt: `Goal progress: ${item.action}\n\nThis is a medium-priority item from today's daily plan (goal: ${item.id}). ` +
+                  `Use goal_work to make progress. If you need information from the owner to proceed, ` +
+                  `note the blocker and move on.`,
+                source: `daily-plan:${item.id}`,
+                idempotencyKey: decision.idempotencyKey,
+                priority: 'normal',
+                maxTurns: 10,
+                tier: 1,
+              });
+              recordDecision(decision, {
+                signalType: 'daily-plan-priority',
+                description: item.action,
+                goalId: item.id,
+                metadata: { planDate: plan.date, type: item.type },
+              });
+              queued++;
             }
           }
-          logger.info({ priorities: plan.priorities.length, urgent: plan.priorities.filter(p => p.urgency >= 4).length }, 'Daily plan generated');
+          logger.info({ priorities: plan.priorities.length, acted, queued, askUser }, 'Daily plan generated and evaluated');
         }
 
         // Apply non-destructive cron changes suggested by the daily planner
@@ -486,19 +540,12 @@ export class HeartbeatScheduler {
 
         // ── Goal-driven work auto-queuing ─────────────────────────
         // Close the loop: daily planner priorities → work queue items
-        // Only queue high-urgency goal items that are autonomously actionable
-        const currentQueue = HeartbeatScheduler.loadWorkQueue();
-        const pendingDescriptions = new Set(
-          currentQueue.filter(i => i.status === 'pending' || i.status === 'running').map(i => i.description),
-        );
-
+        // The proactive ledger (wasRecentlyDecided) plus enqueueWork's
+        // in-flight dedup cover what the old description-based set was for.
         for (const priority of todayPlan.priorities) {
-          // Only auto-queue high-urgency goal items (urgency >= 7)
-          if (priority.type !== 'goal' || priority.urgency < 7) continue;
-          // Skip if already queued
-          if (pendingDescriptions.has(priority.action)) continue;
-          // Skip if the action requires human input (heuristic: contains question marks or decision words)
-          if (/\?|decide|choose|approve|confirm|review with|ask\s/i.test(priority.action)) continue;
+          const decision = decideDailyPlanPriority({ priority, date: todayPlan.date });
+          if (priority.type !== 'goal' || !decisionShouldQueueHeartbeatWork(decision)) continue;
+          if (wasRecentlyDecided(decision.idempotencyKey, PROACTIVE_DECISION_DEDUPE_MS)) continue;
 
           HeartbeatScheduler.enqueueWork({
             description: priority.action,
@@ -506,9 +553,16 @@ export class HeartbeatScheduler {
               `Use goal_work to make progress. If you need information from the owner to proceed, ` +
               `note the blocker and move on.`,
             source: `daily-plan:${priority.id}`,
+            idempotencyKey: decision.idempotencyKey,
             priority: 'high',
             maxTurns: 10,
             tier: 1,
+          });
+          recordDecision(decision, {
+            signalType: 'daily-plan-priority',
+            description: priority.action,
+            goalId: priority.id,
+            metadata: { planDate: todayPlan.date, type: priority.type },
           });
           logger.info({ goalId: priority.id, action: priority.action }, 'Auto-queued goal work from daily plan');
         }
@@ -532,9 +586,11 @@ export class HeartbeatScheduler {
         this.completeItem(item.id, result || 'completed');
         completedWork.push({ description: item.description, result: result || 'completed' });
         logToDailyNote(`**Heartbeat work: ${item.description}** — ${(result || 'completed').slice(0, 100).replace(/\n/g, ' ')}`);
+        this.recordWorkItemOutcome(item, 'advanced', result || 'completed');
       } catch (err) {
         this.failItem(item.id, String(err));
         logger.warn({ err, id: item.id }, 'Heartbeat work item failed');
+        this.recordWorkItemOutcome(item, 'failed', String(err));
       }
     }
 
@@ -1069,7 +1125,8 @@ export class HeartbeatScheduler {
 
       if (activeGoals.length === 0) return null;
 
-      const now = Date.now();
+      const nowDate = new Date();
+      const now = nowDate.getTime();
       const DAY_MS = 86_400_000;
       const lines = activeGoals.map((g: any) => {
         const nextAct = g.nextActions?.length > 0 ? ` | Next: ${g.nextActions[0]}` : '';
@@ -1165,8 +1222,8 @@ export class HeartbeatScheduler {
       const allGoals = preloadedGoals ?? HeartbeatScheduler.loadAllGoals();
       if (allGoals.length === 0) return;
 
-      const now = Date.now();
-      const DAY_MS = 86_400_000;
+      const nowDate = new Date();
+      const now = nowDate.getTime();
 
       // Load recent goal outcomes for disposition-based throttling.
       // The agent classifies each outcome (ADVANCED, BLOCKED_ON_USER, etc.)
@@ -1218,47 +1275,20 @@ export class HeartbeatScheduler {
         }
       } catch { /* non-fatal */ }
 
-      // Score ALL active goals — stale goals get urgency bonus, but
-      // non-stale high-priority goals with pending work also qualify.
-      const scoredGoals: Array<{ goal: any; score: number; reason: string }> = [];
+      // Score ALL active goals through the proactive decision engine. Stale
+      // goals get urgency, but current high-priority goals with pending work
+      // also qualify.
+      const scoredGoals: NonNullable<ReturnType<typeof decideGoalAdvancement>>[] = [];
       for (const goal of allGoals) {
         try {
-          if (goal.status !== 'active') continue;
-
-          // Skip goals in cooldown (failed recently or producing stale output)
-          if (goalCooldowns.has(goal.id)) continue;
-
-          const lastUpdate = goal.updatedAt ? new Date(goal.updatedAt).getTime() : 0;
-          const daysSinceUpdate = Math.floor((now - lastUpdate) / DAY_MS);
-          const staleThreshold = goal.reviewFrequency === 'daily' ? 1 : goal.reviewFrequency === 'weekly' ? 7 : 30;
-          const isStale = daysSinceUpdate > staleThreshold;
-          const hasWork = (goal.nextActions?.length ?? 0) > 0;
-
-          // Skip non-stale goals that have no pending work
-          if (!isStale && !hasWork) continue;
-
-          // Scoring: priority (high=15, medium=8, low=2) + staleness bonus + work availability
-          const priorityScore = goal.priority === 'high' ? 15 : goal.priority === 'medium' ? 8 : 2;
-          const stalenessScore = isStale ? Math.min(daysSinceUpdate - staleThreshold, 20) : 0;
-          const workScore = hasWork ? 5 : 0;
-          // Goals approaching target date get a deadline urgency boost
-          let deadlineScore = 0;
-          if (goal.targetDate) {
-            const daysUntilTarget = Math.floor((new Date(goal.targetDate).getTime() - now) / DAY_MS);
-            if (daysUntilTarget <= 0) deadlineScore = 20;       // overdue
-            else if (daysUntilTarget <= 3) deadlineScore = 10;   // imminent
-            else if (daysUntilTarget <= 7) deadlineScore = 5;    // approaching
+          const advancement = decideGoalAdvancement({
+            goal,
+            now: nowDate,
+            inCooldown: goalCooldowns.has(goal.id),
+          });
+          if (advancement && decisionShouldCreateGoalTrigger(advancement.decision)) {
+            scoredGoals.push(advancement);
           }
-          const totalScore = priorityScore + stalenessScore + workScore + deadlineScore;
-
-          const reason = [
-            isStale ? `stale(${daysSinceUpdate}d)` : 'current',
-            `pri=${goal.priority}`,
-            hasWork ? 'has-work' : 'no-work',
-            deadlineScore > 0 ? `deadline-boost(${deadlineScore})` : '',
-          ].filter(Boolean).join(', ');
-
-          scoredGoals.push({ goal, score: totalScore, reason });
         } catch { continue; }
       }
 
@@ -1268,11 +1298,8 @@ export class HeartbeatScheduler {
       scoredGoals.sort((a, b) => b.score - a.score);
       const toAdvance = scoredGoals.slice(0, 2);
 
-      for (const { goal, reason } of toAdvance) {
-        const focus = goal.nextActions?.length > 0
-          ? goal.nextActions[0]
-          : `Review and update progress on "${goal.title}"`;
-
+      for (const { goal, reason, focus, decision, score } of toAdvance) {
+        if (wasRecentlyDecided(decision.idempotencyKey, PROACTIVE_DECISION_DEDUPE_MS)) continue;
         const trigger = {
           goalId: goal.id,
           focus,
@@ -1280,11 +1307,19 @@ export class HeartbeatScheduler {
           triggeredAt: new Date().toISOString(),
           source: 'heartbeat-advance',
           reason,
+          decision,
         };
 
-        const triggerPath = path.join(goalTriggerDir, `${goal.id}.trigger.json`);
+        const triggerPath = path.join(goalTriggerDir, `${decision.idempotencyKey}.trigger.json`);
         writeFileSync(triggerPath, JSON.stringify(trigger, null, 2));
-        logger.info({ goalId: goal.id, title: goal.title, score: toAdvance[0].score, reason, focus }, 'Advancing goal via trigger');
+        recordDecision(decision, {
+          signalType: 'goal-advancement',
+          description: focus,
+          goalId: goal.id,
+          owner: goal.owner,
+          metadata: { score, reason, title: goal.title },
+        });
+        logger.info({ goalId: goal.id, title: goal.title, score, reason, focus, decision: decision.action }, 'Advancing goal via trigger');
       }
 
       // Note: task generation removed — the main goal trigger already includes
@@ -1322,6 +1357,37 @@ export class HeartbeatScheduler {
         try {
           const content = readFileSync(filePath, 'utf-8');
           const title = file.replace(/\.md$/, '');
+          const decision = decideDiscoveredWorkItem({
+            type: 'inbox',
+            id: title,
+            description: `Triage inbox item: ${title}`,
+            urgency: 2,
+            source: 'inbox',
+          });
+          if (wasRecentlyDecided(decision.idempotencyKey, PROACTIVE_DECISION_DEDUPE_MS)) continue;
+          if (decision.action !== 'act_now') {
+            HeartbeatScheduler.enqueueWork({
+              description: `Triage inbox item: ${title}`,
+              prompt: `Triage this inbox item later: ${title}`,
+              source: `inbox:${title}`,
+              idempotencyKey: decision.idempotencyKey,
+              priority: 'normal',
+              maxTurns: 5,
+              tier: 1,
+            });
+            recordDecision(decision, {
+              signalType: 'inbox-triage',
+              description: `Triage inbox item: ${title}`,
+              metadata: { file },
+            });
+            continue;
+          }
+          const decisionContext = {
+            signalType: 'inbox-triage',
+            description: `Triage inbox item: ${title}`,
+            metadata: { file },
+          };
+          const decisionRecord = recordDecision(decision, decisionContext);
 
           // Move file before processing to prevent duplicate triage on next tick
           const destPath = path.join(processedDir, file);
@@ -1355,6 +1421,14 @@ export class HeartbeatScheduler {
                 logToDailyNote(`**Inbox processed: ${title}** — ${result.slice(0, 100).replace(/\n/g, ' ')}`);
               }
               logger.info({ file: title }, 'Inbox item processed');
+              try {
+                recordDecisionOutcome(decisionRecord.id, decision, decisionContext, {
+                  status: 'advanced',
+                  summary: (result ?? 'processed').slice(0, 200),
+                });
+              } catch (err) {
+                logger.debug({ err, file: title }, 'Failed to record inbox outcome (non-fatal)');
+              }
             })
             .catch((err) => {
               // Restore file to inbox on failure so it retries
@@ -1363,6 +1437,14 @@ export class HeartbeatScheduler {
                 unlinkSync(destPath);
               } catch { /* best-effort restore */ }
               logger.warn({ err, file: title }, 'Failed to process inbox item');
+              try {
+                recordDecisionOutcome(decisionRecord.id, decision, decisionContext, {
+                  status: 'failed',
+                  summary: String(err).slice(0, 200),
+                });
+              } catch (recordErr) {
+                logger.debug({ err: recordErr, file: title }, 'Failed to record inbox outcome (non-fatal)');
+              }
             });
         } catch (err) {
           logger.warn({ err, file }, 'Failed to read inbox item');
@@ -1524,22 +1606,53 @@ export class HeartbeatScheduler {
     }
   }
 
+  private recordWorkItemOutcome(
+    item: HeartbeatWorkItem,
+    status: 'advanced' | 'failed',
+    summary: string,
+  ): void {
+    const key = item.idempotencyKey;
+    if (!key) return;
+    try {
+      const original = recentDecisions({ idempotencyKey: key }, undefined)[0];
+      if (!original) return;
+      recordDecisionOutcome(original.id, original.decision, original.context, {
+        status,
+        summary: summary.slice(0, 200),
+      });
+    } catch (err) {
+      logger.debug({ err, id: item.id }, 'Failed to record work-item outcome (non-fatal)');
+    }
+  }
+
   static enqueueWork(opts: {
     description: string;
     prompt: string;
     source: string;
+    idempotencyKey?: string;
     priority?: 'high' | 'normal';
     maxTurns?: number;
     tier?: number;
     agentSlug?: string;
   }): string {
     const queue = HeartbeatScheduler.loadWorkQueue();
+    // Only dedup against in-flight items here. Cross-tick "we already acted on this
+    // signal" lives in the proactive ledger (wasRecentlyDecided); blocking on
+    // 'completed' here would prevent legitimate re-runs of multi-session work.
+    const dedupKey = opts.idempotencyKey ?? opts.source;
+    const existing = queue.find((item) =>
+      (item.idempotencyKey ?? item.source) === dedupKey &&
+      (item.status === 'pending' || item.status === 'running')
+    );
+    if (existing) return existing.id;
+
     const id = randomBytes(4).toString('hex');
     const item: HeartbeatWorkItem = {
       id,
       description: opts.description,
       prompt: opts.prompt,
       source: opts.source,
+      ...(opts.idempotencyKey ? { idempotencyKey: opts.idempotencyKey } : {}),
       priority: opts.priority ?? 'normal',
       queuedAt: new Date().toISOString(),
       maxTurns: opts.maxTurns ?? 3,
