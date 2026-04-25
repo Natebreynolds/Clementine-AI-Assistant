@@ -132,6 +132,14 @@ export type OnTextCallback = (text: string) => Promise<void>;
 
 export type OnToolActivityCallback = (toolName: string, toolInput: Record<string, unknown>) => Promise<void>;
 
+/**
+ * Pre-query progress callback. Fired at stage transitions BEFORE the SDK
+ * query starts (routing, complexity classification, lock waits, etc.) so
+ * the user sees the indicator change instead of staring at "thinking..."
+ * for several seconds.
+ */
+export type OnProgressCallback = (status: string) => Promise<void>;
+
 export interface NotificationContext {
   agentSlug?: string;
   /** When set, the dispatcher routes the message back to the channel that owns this session. */

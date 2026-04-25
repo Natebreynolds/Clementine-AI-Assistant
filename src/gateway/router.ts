@@ -10,7 +10,7 @@ import { appendFileSync, existsSync, readFileSync, writeFileSync } from 'node:fs
 import pino from 'pino';
 import { PersonalAssistant, type ProjectMeta } from '../agent/assistant.js';
 import { runWithTrace, logAuditJsonl } from '../agent/hooks.js';
-import type { OnTextCallback, OnToolActivityCallback, PlanProgressUpdate, PlanStep, SelfImproveConfig, SelfImproveExperiment, SessionProvenance, TeamMessage, VerboseLevel, WorkflowDefinition } from '../types.js';
+import type { OnProgressCallback, OnTextCallback, OnToolActivityCallback, PlanProgressUpdate, PlanStep, SelfImproveConfig, SelfImproveExperiment, SessionProvenance, TeamMessage, VerboseLevel, WorkflowDefinition } from '../types.js';
 import { SelfImproveLoop } from '../agent/self-improve.js';
 import { MODELS, PROFILES_DIR, AGENTS_DIR, TEAM_COMMS_LOG, BASE_DIR, SEEN_CHANNELS_FILE } from '../config.js';
 import { scanner } from '../security/scanner.js';
@@ -802,6 +802,7 @@ export class Gateway {
     model?: string,
     maxTurns?: number,
     onToolActivity?: OnToolActivityCallback,
+    onProgress?: OnProgressCallback,
   ): Promise<string> {
     if (this.draining) {
       return "I'm restarting momentarily — your message will be processed after I'm back online.";
@@ -828,7 +829,7 @@ export class Gateway {
           text_len: text.length,
         });
         try {
-          const result = await this._handleMessageInner(sessionKey, text, onText, model, maxTurns, onToolActivity);
+          const result = await this._handleMessageInner(sessionKey, text, onText, model, maxTurns, onToolActivity, onProgress);
           logAuditJsonl({
             event_type: 'message_completed',
             duration_ms: Date.now() - traceStart,
@@ -854,6 +855,7 @@ export class Gateway {
     model?: string,
     maxTurns?: number,
     onToolActivity?: OnToolActivityCallback,
+    onProgress?: OnProgressCallback,
   ): Promise<string> {
 
     // ── Auth circuit breaker — stop spamming error messages ────────
@@ -868,11 +870,31 @@ export class Gateway {
       logger.info({ sessionKey }, 'Auth circuit open — allowing probe message');
     }
 
+    // Show "queued" status if either lane or session lock is contended,
+    // so the user doesn't stare at "thinking..." for up to 60s while a
+    // previous message is still processing.
+    const laneWaitStart = Date.now();
+    let queuedStatusShown = false;
+    const queuedTimer = onProgress
+      ? setTimeout(() => {
+          queuedStatusShown = true;
+          onProgress('waiting for previous message to finish...').catch(() => { /* non-fatal */ });
+        }, 750)
+      : null;
     const releaseLane = await lanes.acquire('chat');
+    if (queuedTimer) clearTimeout(queuedTimer);
     try {
       const release = await this.acquireSessionLock(sessionKey);
 
       try {
+        if (queuedStatusShown && onProgress) {
+          // Lane was busy — clear the wait notice now that we're moving
+          await onProgress('thinking...').catch(() => { /* non-fatal */ });
+        }
+        const laneWaitMs = Date.now() - laneWaitStart;
+        if (laneWaitMs > 1000) {
+          logger.info({ sessionKey, laneWaitMs }, 'Chat lane wait was non-trivial');
+        }
         logger.info(`Message from ${sessionKey}: ${text.slice(0, 100)}...`);
         events.emit('message:received', { sessionKey, text, timestamp: Date.now() });
 
@@ -993,6 +1015,9 @@ export class Gateway {
           || text.startsWith('[Approval:')
           || text.startsWith('[Reaction:')
           || text.startsWith('[System:');
+        if (!isInternalMsg && !sess?.profile && !text.startsWith('!') && !isStructuredWorkflowMsg && onProgress) {
+          await onProgress('checking if a teammate should handle this...').catch(() => { /* non-fatal */ });
+        }
         const routingResult = !isInternalMsg && !sess?.profile && !text.startsWith('!') && !isStructuredWorkflowMsg
           ? await this._maybeRouteToSpecialist(sessionKey, text, onText)
           : null;
@@ -1225,6 +1250,9 @@ export class Gateway {
           // Primary guardrail is cost budget (maxBudgetUsd in buildOptions).
           // Wall clock (CHAT_MAX_WALL_MS) and StallGuard are safety nets.
           events.emit('query:start', { sessionKey, model: effectiveModel, maxTurns: maxTurns, timestamp: Date.now() });
+          if (onProgress) {
+            await onProgress('thinking...').catch(() => { /* non-fatal */ });
+          }
           const queryStartMs = Date.now();
           const [response] = await Promise.race([
             this.assistant.chat(

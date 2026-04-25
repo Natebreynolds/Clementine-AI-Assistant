@@ -1318,6 +1318,7 @@ export async function startDiscord(
         oneOffModel,
         oneOffMaxTurns,
         (toolName, toolInput) => { streamer.setToolStatus(friendlyToolName(toolName, toolInput)); return Promise.resolve(); },
+        (status) => { streamer.setToolStatus(status); return Promise.resolve(); },
       );
       await streamer.finalize(response);
       updatePresence(sessionKey);
