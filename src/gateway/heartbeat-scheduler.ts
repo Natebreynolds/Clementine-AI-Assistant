@@ -28,10 +28,11 @@ import {
   HEARTBEAT_ACTIVE_END,
   BASE_DIR,
   GOALS_DIR,
+  AGENTS_DIR,
   HEARTBEAT_WORK_QUEUE_FILE,
   DISCORD_OWNER_ID,
 } from '../config.js';
-import { listAllGoals } from '../tools/shared.js';
+import { findGoalPath, listAllGoals } from '../tools/shared.js';
 import type { HeartbeatState, HeartbeatReportedTopic, HeartbeatWorkItem } from '../types.js';
 import type { CronScheduler } from './cron-scheduler.js';
 import {
@@ -546,6 +547,37 @@ export class HeartbeatScheduler {
           const decision = decideDailyPlanPriority({ priority, date: todayPlan.date });
           if (priority.type !== 'goal' || !decisionShouldQueueHeartbeatWork(decision)) continue;
           if (wasRecentlyDecided(decision.idempotencyKey, PROACTIVE_DECISION_DEDUPE_MS)) continue;
+
+          // If the goal belongs to a specialist agent, route to them via a
+          // goal-trigger file instead of running the work as Clementine.
+          // processGoalTriggers in cron-scheduler reads goal.owner and
+          // dispatches with the right profile + Discord channel.
+          const goalLookup = findGoalPath(priority.id);
+          const ownerSlug = goalLookup && goalLookup.owner !== 'clementine' ? goalLookup.owner : null;
+
+          if (ownerSlug) {
+            const goalTriggerDir = path.join(BASE_DIR, 'cron', 'goal-triggers');
+            mkdirSync(goalTriggerDir, { recursive: true });
+            const trigger = {
+              goalId: priority.id,
+              focus: priority.action,
+              maxTurns: 15,
+              triggeredAt: new Date().toISOString(),
+              source: 'daily-plan',
+              decision,
+            };
+            const triggerPath = path.join(goalTriggerDir, `${decision.idempotencyKey}.trigger.json`);
+            writeFileSync(triggerPath, JSON.stringify(trigger, null, 2));
+            recordDecision(decision, {
+              signalType: 'daily-plan-priority',
+              description: priority.action,
+              goalId: priority.id,
+              owner: ownerSlug,
+              metadata: { planDate: todayPlan.date, type: priority.type, routedTo: ownerSlug },
+            });
+            logger.info({ goalId: priority.id, owner: ownerSlug, action: priority.action }, 'Routed daily-plan goal to owning agent');
+            continue;
+          }
 
           HeartbeatScheduler.enqueueWork({
             description: priority.action,
@@ -1399,19 +1431,44 @@ export class HeartbeatScheduler {
             continue;
           }
 
+          // Load active team so Clementine can delegate when an item belongs
+          // to a specialist. Read agent.md frontmatter for slug/name/scope.
+          const teamLines: string[] = [];
+          try {
+            if (existsSync(AGENTS_DIR)) {
+              const agentDirs = readdirSync(AGENTS_DIR, { withFileTypes: true } as { withFileTypes: true })
+                .filter((d) => d.isDirectory() && !d.name.startsWith('_'))
+                .map((d) => d.name);
+              for (const slug of agentDirs) {
+                const agentMd = path.join(AGENTS_DIR, slug, 'agent.md');
+                if (!existsSync(agentMd)) continue;
+                try {
+                  const fm = matter(readFileSync(agentMd, 'utf-8')).data as { name?: string; description?: string };
+                  const desc = (fm.description ?? '').replace(/\s+/g, ' ').trim().slice(0, 160);
+                  teamLines.push(`- \`${slug}\` (${fm.name ?? slug})${desc ? ` — ${desc}` : ''}`);
+                } catch { /* skip malformed agent.md */ }
+              }
+            }
+          } catch { /* non-fatal */ }
+          const teamBlock = teamLines.length > 0
+            ? `## Your Team (delegate when work clearly belongs to one of them)\n${teamLines.join('\n')}\n\n`
+            : '';
+
           // Build a prompt for the agent to triage this inbox item
           const prompt =
             `Triage this inbox item and take appropriate action.\n\n` +
             `**Title:** ${title}\n` +
             `**Content:**\n${content.slice(0, 2000)}\n\n` +
+            teamBlock +
             `## Instructions:\n` +
-            `1. Determine the intent: Is this a task, a reference/note, a reminder, or something else?\n` +
+            `1. Determine the intent: Is this a task, a reference/note, a reminder, project update, or work for a teammate?\n` +
             `2. Take the appropriate action:\n` +
             `   - **Task**: Use \`task_add\` to create a task with the right priority and due date.\n` +
             `   - **Reference**: Use \`note_create\` or \`memory_write\` to file it in the vault.\n` +
             `   - **Reminder**: Add to today's daily note with \`memory_write(action="append_daily")\`.\n` +
             `   - **Project update**: Update the relevant project note.\n` +
-            `3. Respond with a one-line summary of what you did.`;
+            `   - **Delegate to a teammate**: If the item is clearly work for a specialist on your team, use \`team_message\` to hand it off with enough context for them to act. Don't try to do their job yourself.\n` +
+            `3. Respond with a one-line summary of what you did (including who you delegated to, if anyone).`;
 
           // Fire-and-forget — run as a lightweight cron job
           this.gateway

@@ -34,3 +34,6 @@ logs/
 # Bot status files (runtime state)
 .bot-status.json
 .slack-bot-status.json
+
+# Local dev screenshots (Playwright/manual captures at repo root)
+*.png

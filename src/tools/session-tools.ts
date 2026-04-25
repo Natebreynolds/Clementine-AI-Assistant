@@ -154,6 +154,11 @@ export function registerSessionTools(server: McpServer): void {
       items.sort((a, b) => b.urgency - a.urgency);
       const topItems = items.slice(0, maxItems);
       if (topItems.length === 0) return textResult('No work items discovered. All goals on track, no failures, inbox clear.');
+      // Decisions here are advisory — the agent surveys, then chooses whether
+      // to act. We deliberately do NOT recordDecision: the autonomous paths
+      // (processInbox, daily-plan loop, goal advancement) record their own
+      // decisions when they actually act, so the ledger reflects committed
+      // decisions and proactive_stats stays signal-rich.
       const lines = topItems.map((i) => {
         const decision = decideDiscoveredWorkItem(i);
         const label = ACTION_LABEL[decision.action];

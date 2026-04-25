@@ -504,26 +504,35 @@ function startTimerChecker(
 const LOG_MAX_BYTES = 2 * 1024 * 1024; // 2 MB
 const LOG_MAX_BACKUPS = 7;
 
+function rotateOne(logFile: string): void {
+  if (!existsSync(logFile)) return;
+  const size = statSync(logFile).size;
+  if (size < LOG_MAX_BYTES) return;
+
+  // Rotate: delete .log.7, shift .log.6→.log.7, ... .log→.log.1
+  const oldest = `${logFile}.${LOG_MAX_BACKUPS}`;
+  if (existsSync(oldest)) unlinkSync(oldest);
+
+  for (let i = LOG_MAX_BACKUPS - 1; i >= 1; i--) {
+    const src = `${logFile}.${i}`;
+    if (existsSync(src)) renameSync(src, `${logFile}.${i + 1}`);
+  }
+
+  renameSync(logFile, `${logFile}.1`);
+  writeFileSync(logFile, '');
+}
+
 function rotateLogIfNeeded(): void {
-  const logFile = path.join(config.BASE_DIR, 'logs', 'clementine.log');
-  try {
-    if (!existsSync(logFile)) return;
-    const size = statSync(logFile).size;
-    if (size < LOG_MAX_BYTES) return;
-
-    // Rotate: delete .log.7, shift .log.6→.log.7, ... .log→.log.1
-    const oldest = `${logFile}.${LOG_MAX_BACKUPS}`;
-    if (existsSync(oldest)) unlinkSync(oldest);
-
-    for (let i = LOG_MAX_BACKUPS - 1; i >= 1; i--) {
-      const src = `${logFile}.${i}`;
-      if (existsSync(src)) renameSync(src, `${logFile}.${i + 1}`);
+  // cron.log is appended to by launchd-spawned `clementine cron run` invocations
+  // — each is a one-shot process that closes the FD after writing, so a
+  // rename-rotate at daemon startup is safe.
+  const logsDir = path.join(config.BASE_DIR, 'logs');
+  for (const name of ['clementine.log', 'cron.log']) {
+    try {
+      rotateOne(path.join(logsDir, name));
+    } catch (err) {
+      logger.warn({ err, name }, 'Log rotation failed — continuing startup');
     }
-
-    renameSync(logFile, `${logFile}.1`);
-    writeFileSync(logFile, '');
-  } catch (err) {
-    logger.warn({ err }, 'Log rotation failed — continuing startup');
   }
 }
 
