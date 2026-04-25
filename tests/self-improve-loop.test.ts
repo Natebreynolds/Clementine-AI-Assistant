@@ -105,7 +105,7 @@ describe('SelfImproveLoop.tick — end-to-end', () => {
     writeTrigger('market-leader-followup', ['Reached maximum number of turns (8)']);
 
     const send = vi.fn(async () => ({ delivered: true, channelErrors: {} }));
-    const loop = new SelfImproveLoop({ send }, { triggersDir, pendingDir, cronPath });
+    const loop = new SelfImproveLoop({ send }, { triggersDir, pendingDir, cronPath, disableWatch: true });
     const result = await loop.tick();
 
     expect(result.processed).toBe(1);
@@ -135,7 +135,7 @@ describe('SelfImproveLoop.tick — end-to-end', () => {
     writeTrigger('morning-briefing', ['Reached maximum number of turns (8)']);
 
     const send = vi.fn(async () => ({ delivered: true, channelErrors: {} }));
-    const loop = new SelfImproveLoop({ send }, { triggersDir, pendingDir, cronPath });
+    const loop = new SelfImproveLoop({ send }, { triggersDir, pendingDir, cronPath, disableWatch: true });
     await loop.tick();
 
     const [, ctx] = send.mock.calls[0];
@@ -149,7 +149,7 @@ describe('SelfImproveLoop.tick — end-to-end', () => {
     writeTrigger('x', ['Reached maximum number of turns (8)']);
 
     const send = vi.fn(async () => ({ delivered: true, channelErrors: {} }));
-    const loop = new SelfImproveLoop({ send }, { triggersDir, pendingDir, cronPath });
+    const loop = new SelfImproveLoop({ send }, { triggersDir, pendingDir, cronPath, disableWatch: true });
     const result = await loop.tick();
 
     expect(result.processed).toBe(1);
@@ -164,7 +164,7 @@ describe('SelfImproveLoop.tick — end-to-end', () => {
     writeTrigger('y', ['This model does not support user-configurable task budgets']);
 
     const send = vi.fn(async () => ({ delivered: true, channelErrors: {} }));
-    const loop = new SelfImproveLoop({ send }, { triggersDir, pendingDir, cronPath });
+    const loop = new SelfImproveLoop({ send }, { triggersDir, pendingDir, cronPath, disableWatch: true });
     const result = await loop.tick();
 
     expect(result.noop).toBe(1);
@@ -179,7 +179,7 @@ describe('SelfImproveLoop.tick — end-to-end', () => {
     writeTrigger('z', ['Some weird error nobody has classified yet']);
 
     const send = vi.fn(async () => ({ delivered: true, channelErrors: {} }));
-    const loop = new SelfImproveLoop({ send }, { triggersDir, pendingDir, cronPath });
+    const loop = new SelfImproveLoop({ send }, { triggersDir, pendingDir, cronPath, disableWatch: true });
     const result = await loop.tick();
 
     expect(result.pending).toBe(1);
@@ -204,10 +204,41 @@ describe('SelfImproveLoop.tick — end-to-end', () => {
     writeFileSync(path.join(triggersDir, 'bad.json'), 'not json');
     writeCronFile([]);
     const send = vi.fn(async () => ({ delivered: true, channelErrors: {} }));
-    const loop = new SelfImproveLoop({ send }, { triggersDir, pendingDir, cronPath });
+    const loop = new SelfImproveLoop({ send }, { triggersDir, pendingDir, cronPath, disableWatch: true });
     const result = await loop.tick();
     expect(result.processed).toBe(0); // counted as failed parse, not "successfully processed"
     expect(existsSync(path.join(triggersDir, 'bad.json'))).toBe(false);
+  });
+
+  it('event-driven: fires tick within debounce window when a trigger lands', async () => {
+    writeCronFile([
+      { name: 'event-test', schedule: '* * * * *', agentSlug: 'ross-the-sdr' },
+    ]);
+    const send = vi.fn(async () => ({ delivered: true, channelErrors: {} }));
+    // Use a large fallback tickMs so only the watch path can produce results
+    const loop = new SelfImproveLoop({ send }, {
+      triggersDir, pendingDir, cronPath,
+      tickMs: 999_999_999,
+    });
+    loop.start();
+    try {
+      // Wait for the initial-on-start tick (boots empty)
+      await new Promise((r) => setTimeout(r, 100));
+      expect(send).not.toHaveBeenCalled();
+
+      // Drop a trigger — fs.watch should fire, debounce ~2s, then tick
+      writeTrigger('event-test', ['Reached maximum number of turns (8)']);
+
+      // 2.5s = enough for debounce + tick
+      await new Promise((r) => setTimeout(r, 2500));
+
+      expect(send).toHaveBeenCalled();
+      const [text, ctx] = send.mock.calls[0];
+      expect(ctx?.agentSlug).toBe('ross-the-sdr');
+      expect(text).toMatch(/Auto-fixed/);
+    } finally {
+      loop.stop();
+    }
   });
 
   it('processes multiple triggers in one tick', async () => {
@@ -219,7 +250,7 @@ describe('SelfImproveLoop.tick — end-to-end', () => {
     writeTrigger('b', ['Autocompact is thrashing']);
 
     const send = vi.fn(async () => ({ delivered: true, channelErrors: {} }));
-    const loop = new SelfImproveLoop({ send }, { triggersDir, pendingDir, cronPath });
+    const loop = new SelfImproveLoop({ send }, { triggersDir, pendingDir, cronPath, disableWatch: true });
     const result = await loop.tick();
 
     expect(result.processed).toBe(2);

@@ -31,7 +31,9 @@ import {
   readdirSync,
   readFileSync,
   unlinkSync,
+  watch,
   writeFileSync,
+  type FSWatcher,
 } from 'node:fs';
 import path from 'node:path';
 import matter from 'gray-matter';
@@ -40,7 +42,20 @@ import { BASE_DIR, SYSTEM_DIR } from '../config.js';
 
 const logger = pino({ name: 'clementine.self-improve-loop' });
 
-const TICK_MS = 10 * 60 * 1000;
+/**
+ * Fallback tick interval. The loop is primarily event-driven via fs.watch
+ * on the triggers directory — this is just a slow safety net for cases
+ * where fs.watch dropped an event (rare but possible) or where the
+ * daemon booted with triggers already in place from before fs.watch was
+ * registered. 1h is plenty: the upstream cron scheduler runs at most
+ * once per minute, and a job needs 3+ consecutive errors to even produce
+ * a trigger, so the situation is already hours-stale by the time we see
+ * a trigger.
+ */
+const FALLBACK_TICK_MS = 60 * 60 * 1000;
+
+/** Coalesce a burst of fs.watch events into a single tick. */
+const WATCH_DEBOUNCE_MS = 2000;
 const TRIGGERS_DIR = path.join(BASE_DIR, 'self-improve', 'triggers');
 const PENDING_CHANGES_DIR = path.join(BASE_DIR, 'self-improve', 'pending-changes');
 const CRON_PATH = path.join(SYSTEM_DIR, 'CRON.md');
@@ -80,12 +95,21 @@ export interface SelfImproveDispatcher {
 }
 
 export interface SelfImproveLoopOptions {
-  /** Override scan interval for tests. */
+  /**
+   * Override the fallback safety-net tick interval. The loop is primarily
+   * event-driven; this is just a backstop. Used by tests to disable the
+   * timer entirely (set to 0 or a very large number).
+   */
   tickMs?: number;
   /** Override directories for tests. */
   triggersDir?: string;
   pendingDir?: string;
   cronPath?: string;
+  /**
+   * Disable the fs.watch event-driven path. Tests use this so they can
+   * call tick() directly without racing the watcher.
+   */
+  disableWatch?: boolean;
 }
 
 // ── Pattern recognition ──────────────────────────────────────────────
@@ -222,28 +246,54 @@ export class SelfImproveLoop {
   private readonly pendingDir: string;
   private readonly cronPath: string;
   private readonly dispatcher: SelfImproveDispatcher;
+  private readonly watchEnabled: boolean;
   private timer: ReturnType<typeof setInterval> | null = null;
+  private watcher: FSWatcher | null = null;
+  private debounceTimer: ReturnType<typeof setTimeout> | null = null;
   private running = false;
   private ticking = false;
 
   constructor(dispatcher: SelfImproveDispatcher, opts: SelfImproveLoopOptions = {}) {
     this.dispatcher = dispatcher;
-    this.tickMs = opts.tickMs ?? TICK_MS;
+    this.tickMs = opts.tickMs ?? FALLBACK_TICK_MS;
     this.triggersDir = opts.triggersDir ?? TRIGGERS_DIR;
     this.pendingDir = opts.pendingDir ?? PENDING_CHANGES_DIR;
     this.cronPath = opts.cronPath ?? CRON_PATH;
+    this.watchEnabled = opts.disableWatch !== true;
   }
 
   start(): void {
     if (this.running) return;
     this.running = true;
     // Run immediately so any backlog from the prior daemon gets handled
-    // without a 10-minute wait.
+    // without a long wait.
     this.tick().catch((err) => logger.error({ err }, 'Initial self-improve tick failed'));
+
+    // Event-driven primary path: watch the triggers dir. cron-scheduler
+    // writes a file when a job hits consErrors >= 3; we react within
+    // ~2 seconds (debounce window) instead of polling every 10 minutes
+    // for a directory that's empty 99% of the time.
+    if (this.watchEnabled) {
+      try {
+        mkdirSync(this.triggersDir, { recursive: true });
+        this.watcher = watch(this.triggersDir, (eventType, filename) => {
+          if (eventType !== 'rename' || !filename || !filename.endsWith('.json')) return;
+          this.scheduleDebouncedTick();
+        });
+      } catch (err) {
+        logger.warn({ err, dir: this.triggersDir }, 'Failed to watch triggers dir — falling back to polling only');
+      }
+    }
+
+    // Slow fallback safety net — covers fs.watch event drops + boot-with-backlog.
     this.timer = setInterval(() => {
-      this.tick().catch((err) => logger.error({ err }, 'Self-improve tick failed'));
+      this.tick().catch((err) => logger.error({ err }, 'Self-improve fallback tick failed'));
     }, this.tickMs);
-    logger.info({ tickMs: this.tickMs }, 'Self-improve loop started');
+
+    logger.info(
+      { fallbackTickMs: this.tickMs, watchEnabled: this.watchEnabled && this.watcher !== null },
+      'Self-improve loop started',
+    );
   }
 
   stop(): void {
@@ -253,7 +303,25 @@ export class SelfImproveLoop {
       clearInterval(this.timer);
       this.timer = null;
     }
+    if (this.watcher) {
+      try { this.watcher.close(); } catch { /* ignore */ }
+      this.watcher = null;
+    }
+    if (this.debounceTimer) {
+      clearTimeout(this.debounceTimer);
+      this.debounceTimer = null;
+    }
     logger.info('Self-improve loop stopped');
+  }
+
+  /** Coalesce a burst of fs.watch events (multiple triggers landing in
+   * quick succession) into a single tick. */
+  private scheduleDebouncedTick(): void {
+    if (this.debounceTimer) clearTimeout(this.debounceTimer);
+    this.debounceTimer = setTimeout(() => {
+      this.debounceTimer = null;
+      this.tick().catch((err) => logger.error({ err }, 'Self-improve event-driven tick failed'));
+    }, WATCH_DEBOUNCE_MS);
   }
 
   /**
