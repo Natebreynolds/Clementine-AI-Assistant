@@ -1269,6 +1269,66 @@ async function cmdConfigMigrateFromKeychain(opts: { dryRun?: boolean; key?: stri
   console.log();
 }
 
+// ── Config keychain-fix-acl ─────────────────────────────────────────
+
+async function cmdConfigKeychainFixAcl(opts: { list?: boolean }): Promise<void> {
+  const { listClementineKeychainEntries, fixAllClementineEntries } =
+    await import('../config/keychain-fix-acl.js');
+
+  const DIM = '\x1b[0;90m';
+  const BOLD = '\x1b[1m';
+  const GREEN = '\x1b[0;32m';
+  const YELLOW = '\x1b[0;33m';
+  const RED = '\x1b[0;31m';
+  const RESET = '\x1b[0m';
+
+  const entries = listClementineKeychainEntries();
+
+  console.log();
+  console.log(`  ${BOLD}Found ${entries.length} clementine-agent keychain entr${entries.length === 1 ? 'y' : 'ies'}.${RESET}`);
+  for (const e of entries) console.log(`    ${DIM}${e.account}${RESET}`);
+  console.log();
+
+  if (entries.length === 0) {
+    console.log(`  ${GREEN}Nothing to fix.${RESET}`);
+    console.log();
+    return;
+  }
+
+  if (opts.list) {
+    console.log(`  ${DIM}--list mode — no changes made. Drop the flag to apply.${RESET}`);
+    console.log();
+    return;
+  }
+
+  console.log(`  ${BOLD}Fixing ACLs...${RESET}`);
+  console.log(`  ${DIM}macOS may ask for your login keychain password (the system prompt — it DOES appear).${RESET}`);
+  console.log(`  ${DIM}You may also be asked to "Always Allow" — pick that.${RESET}`);
+  console.log();
+
+  const results = fixAllClementineEntries();
+  let okCount = 0;
+  let failCount = 0;
+  for (const r of results) {
+    if (r.status === 'fixed') {
+      console.log(`    ${GREEN}✓${RESET} ${r.account}`);
+      okCount++;
+    } else {
+      console.log(`    ${RED}✗${RESET} ${r.account} ${DIM}— ${r.error}${RESET}`);
+      failCount++;
+    }
+  }
+  console.log();
+  if (failCount === 0) {
+    console.log(`  ${GREEN}All ${okCount} entries fixed.${RESET} ${DIM}Future reads via the security CLI succeed silently.${RESET}`);
+  } else {
+    console.log(`  ${YELLOW}${okCount} fixed, ${failCount} failed.${RESET}`);
+    console.log(`  ${DIM}Failed entries can be fixed manually in Keychain Access.app:${RESET}`);
+    console.log(`  ${DIM}  search "clementine-agent" → double-click → Access Control → Allow all applications.${RESET}`);
+  }
+  console.log();
+}
+
 // ── Advisor commands ────────────────────────────────────────────────
 
 const ADVISOR_MODES = ['off', 'shadow', 'primary'] as const;
@@ -1961,6 +2021,14 @@ configCmd
   .option('-k, --key <name...>', 'Limit to specific key(s); repeat or comma-separate for multiple')
   .action(async (opts: { dryRun?: boolean; key?: string[] }) => {
     await cmdConfigMigrateFromKeychain(opts);
+  });
+
+configCmd
+  .command('keychain-fix-acl')
+  .description('One-shot fix for clementine-agent keychain entries that prompt on every read (one master prompt then no more)')
+  .option('--list', 'List entries without changing anything')
+  .action(async (opts: { list?: boolean }) => {
+    await cmdConfigKeychainFixAcl(opts);
   });
 
 configCmd
