@@ -2007,7 +2007,7 @@ configCmd
 
 configCmd
   .command('migrate-to-keychain')
-  .description('Move plaintext credentials in .env into the macOS keychain (in place)')
+  .description('Move plaintext credentials in .env into the macOS keychain (NOT recommended in v1.1.4+ — keychain entries can produce per-process approval prompts; plain .env at mode 0600 is the supported default)')
   .option('--dry-run', 'Show what would migrate without writing anything')
   .option('-k, --key <name...>', 'Limit to specific key(s); repeat or comma-separate for multiple')
   .action(async (opts: { dryRun?: boolean; key?: string[] }) => {

@@ -62,11 +62,25 @@ export class NotificationDispatcher {
 
   /** Send a notification; automatically queues for retry on total failure. */
   async send(text: string, context?: NotificationContext): Promise<SendResult> {
-    const result = await this.sendDirect(text, context);
+    // Outbound credential redaction happens HERE, at the public entrypoint,
+    // BEFORE any failure could enqueue the message for retry. Otherwise an
+    // un-redacted credential would persist to ~/.clementine/.delivery-queue.json
+    // for the retry window. Pattern-based + known-value scan; cheap enough to
+    // run on every send. See src/security/redact.ts for policy.
+    const { text: redacted, stats: redactionStats } = redactSecrets(text);
+    if (redactionStats.redactionCount > 0) {
+      logger.warn(
+        { count: redactionStats.redactionCount, labels: redactionStats.labelsHit, sessionKey: context?.sessionKey },
+        `Redacted ${redactionStats.redactionCount} credential-shaped value(s) before delivery`,
+      );
+    }
 
-    // If delivery failed and there were actual senders (not "no channels"), queue for retry
+    const result = await this.sendDirect(redacted, context);
+
+    // If delivery failed and there were actual senders (not "no channels"), queue for retry.
+    // Stored text is already-redacted so disk persistence never holds a credential.
     if (!result.delivered && this.senders.size > 0) {
-      this._retryQueue.enqueue(text, context);
+      this._retryQueue.enqueue(redacted, context);
     }
 
     return result;
@@ -79,22 +93,12 @@ export class NotificationDispatcher {
       return { delivered: false, channelErrors: { _: 'no channels registered' } };
     }
 
-    // Outbound credential redaction — last-line defense against the agent
-    // accidentally (or via prompt injection) shipping a credential to a
-    // public channel. Pattern-based + known-value scan; cheap enough to
-    // run on every send. See src/security/redact.ts for the policy.
-    const { text: redacted, stats: redactionStats } = redactSecrets(text);
-    if (redactionStats.redactionCount > 0) {
-      logger.warn(
-        { count: redactionStats.redactionCount, labels: redactionStats.labelsHit, sessionKey: context?.sessionKey },
-        `Redacted ${redactionStats.redactionCount} credential-shaped value(s) before delivery`,
-      );
-    }
-
-    // Sanity cap only — each channel sender handles its own chunking/truncation
-    const capped = redacted.length > MAX_MESSAGE_LENGTH
-      ? redacted.slice(0, MAX_MESSAGE_LENGTH - 20) + '\n\n_(truncated)_'
-      : redacted;
+    // Sanity cap only — each channel sender handles its own chunking/truncation.
+    // Redaction happens at send() (public entrypoint) before any retry-enqueue,
+    // so anything reaching here is already safe.
+    const capped = text.length > MAX_MESSAGE_LENGTH
+      ? text.slice(0, MAX_MESSAGE_LENGTH - 20) + '\n\n_(truncated)_'
+      : text;
 
     // If sessionKey is set, route only to the channel that owns it.
     // Fan out to all channels only when no originating channel is known.
