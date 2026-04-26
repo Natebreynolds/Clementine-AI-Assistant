@@ -44,6 +44,7 @@ import type { Gateway } from './router.js';
 import { scanner } from '../security/scanner.js';
 import { parseAllWorkflows as parseAllWorkflowsSync } from '../agent/workflow-runner.js';
 import { SelfImproveLoop } from '../agent/self-improve.js';
+import { loadPromptOverridesForJob, watchPromptOverrides } from '../agent/prompt-overrides/loader.js';
 import { logAuditJsonl } from '../agent/hooks.js';
 import type { ProactiveDecision } from '../agent/proactive-engine.js';
 import {
@@ -530,6 +531,7 @@ export class CronScheduler {
     this.watchCronFile();
     this.watchAgentsDir();
     this.watchWorkflowDir();
+    watchPromptOverrides();
 
     this.watchTriggers();
 
@@ -980,6 +982,17 @@ export class CronScheduler {
         job: job.name,
         ...advisorApplied,
       }, 'Execution advisor applied overrides');
+    }
+
+    // User-authored prompt overrides — applied AFTER advisor enrichment so user
+    // intent sits at the top of the final prompt. These are static per-file,
+    // not subject to advisor suppression rules.
+    const userOverride = loadPromptOverridesForJob(job.name, job.agentSlug);
+    if (userOverride) {
+      // Mutable copy if not already cloned by the advisor block above.
+      if (!advisorApplied) job = { ...job };
+      job.prompt = `${userOverride}\n\n${job.prompt}`;
+      logger.debug({ job: job.name, overrideLen: userOverride.length }, 'Applied user prompt overrides');
     }
 
     // Compute effective timeout: advisor override > standard default

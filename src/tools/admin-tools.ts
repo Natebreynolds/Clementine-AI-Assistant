@@ -1992,6 +1992,84 @@ server.tool(
   },
 );
 
+// ── Prompt Overrides ────────────────────────────────────────────────────
+
+server.tool(
+  'prompt_override_write',
+  'Write a markdown file under ~/.clementine/prompt-overrides/ that gets prepended to a job\'s prompt at runtime. Use this when you identify that a specific cron job, agent, or all jobs need additional guidance, context, or constraints. Survives `npm update -g clementine` and reloads in <1s. Scopes: "global" (every job), "agent" (every job for one agent), "job" (one specific job).',
+  {
+    scope: z.enum(['global', 'agent', 'job']).describe('Which jobs the override applies to'),
+    scopeKey: z.string().optional().describe('For scope=agent: the agent slug. For scope=job: the job name. Ignored for scope=global.'),
+    content: z.string().min(1).describe('Markdown body to prepend to the prompt. May include optional gray-matter frontmatter for priority/position.'),
+    reason: z.string().describe('Why this override is being written — for the audit log.'),
+  },
+  async ({ scope, scopeKey, content, reason }) => {
+    if ((scope === 'agent' || scope === 'job') && !scopeKey) {
+      return textResult(`Error: scope="${scope}" requires scopeKey to be provided.`);
+    }
+    if (scopeKey && /[\/\\\.]/.test(scopeKey)) {
+      return textResult('Error: scopeKey cannot contain "/", "\\", or "."');
+    }
+
+    const ROOT = path.join(BASE_DIR, 'prompt-overrides');
+    let targetPath: string;
+    if (scope === 'global') {
+      targetPath = path.join(ROOT, '_global.md');
+    } else if (scope === 'agent') {
+      targetPath = path.join(ROOT, 'agents', `${scopeKey}.md`);
+    } else {
+      targetPath = path.join(ROOT, 'jobs', `${scopeKey}.md`);
+    }
+
+    try {
+      mkdirSync(path.dirname(targetPath), { recursive: true });
+      const tmp = `${targetPath}.${process.pid}.${Date.now()}.tmp`;
+      writeFileSync(tmp, content);
+      renameSync(tmp, targetPath);
+      logger.info({ scope, scopeKey, targetPath, reason, contentLen: content.length }, 'Wrote prompt override');
+      return textResult(
+        `Prompt override written.\n` +
+        `Scope: ${scope}${scopeKey ? ` (${scopeKey})` : ''}\n` +
+        `Path: ${targetPath}\n` +
+        `Reason: ${reason}\n\n` +
+        `The override will be picked up on the next job run (hot-reloads via fs.watch within ~1s).`,
+      );
+    } catch (err) {
+      logger.error({ err, scope, scopeKey, targetPath }, 'Failed to write prompt override');
+      return textResult(`Failed to write prompt override: ${String(err)}`);
+    }
+  },
+);
+
+server.tool(
+  'prompt_override_list',
+  'List all prompt overrides currently active in ~/.clementine/prompt-overrides/, grouped by scope. Use this to see what overrides exist before writing or removing one.',
+  {},
+  async () => {
+    const ROOT = path.join(BASE_DIR, 'prompt-overrides');
+    if (!existsSync(ROOT)) {
+      return textResult('No prompt-overrides directory yet. Use prompt_override_write to create one.');
+    }
+    const lines: string[] = ['## Prompt Overrides'];
+    const globalPath = path.join(ROOT, '_global.md');
+    if (existsSync(globalPath)) lines.push(`- global: _global.md`);
+    const agentsDir = path.join(ROOT, 'agents');
+    if (existsSync(agentsDir)) {
+      for (const f of readdirSync(agentsDir).filter(f => f.endsWith('.md'))) {
+        lines.push(`- agent: ${path.basename(f, '.md')}`);
+      }
+    }
+    const jobsDir = path.join(ROOT, 'jobs');
+    if (existsSync(jobsDir)) {
+      for (const f of readdirSync(jobsDir).filter(f => f.endsWith('.md'))) {
+        lines.push(`- job: ${path.basename(f, '.md')}`);
+      }
+    }
+    if (lines.length === 1) lines.push('(none)');
+    return textResult(lines.join('\n'));
+  },
+);
+
 server.tool(
   'update_self',
   'Check for and apply upstream code updates. Can check without applying, or check and apply in one step.',
