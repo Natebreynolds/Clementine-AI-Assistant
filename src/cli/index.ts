@@ -38,6 +38,7 @@ import { cmdCronList, cmdCronRun, cmdCronRunDue, cmdCronRuns, cmdCronAdd, cmdCro
 import { cmdDashboard } from './dashboard.js';
 import { cmdChat } from './chat.js';
 import { cmdIngestSeed, cmdIngestRun, cmdIngestList, cmdIngestStatus } from './ingest.js';
+import { isSensitiveEnvKey } from '../secrets/sensitivity.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -951,9 +952,7 @@ function cmdConfigList(): void {
       const match = line.match(/^([A-Z_]+)=(.+)$/);
       if (match) {
         const [, k, v] = match;
-        const sensitiveKeys = ['TOKEN', 'SECRET', 'API_KEY', 'AUTH_TOKEN', 'SID'];
-        const isSensitive = sensitiveKeys.some((s) => k.includes(s));
-        if (isSensitive && v.length > 8) {
+        if (isSensitiveEnvKey(k) && v.length > 8) {
           console.log(`  ${k}=${v.slice(0, 4)}${'*'.repeat(v.length - 8)}${v.slice(-4)}`);
         } else {
           console.log(`  ${line}`);

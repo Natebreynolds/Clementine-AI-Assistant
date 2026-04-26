@@ -24,6 +24,7 @@ import { ALLOW_SOURCE_EDITS } from '../config.js';
 import { getInteractionSource } from '../agent/hooks.js';
 import { renameSync } from 'node:fs';
 import * as keychain from '../secrets/keychain.js';
+import { isSensitiveEnvKey } from '../secrets/sensitivity.js';
 import * as authProfiles from '../secrets/auth-profiles.js';
 import { classifyIntegrations, findIntegration, INTEGRATIONS } from '../config/integrations-registry.js';
 
@@ -153,11 +154,11 @@ server.tool(
 
 server.tool(
   'env_set',
-  'Save or update a credential (API key, token, config). Owner-DM only. On macOS it defaults to the login Keychain for security — the .env file only gets a reference stub. Changes take effect immediately; process.env gets the real value and the next tool call can use it. Use this when the owner gives a credential in chat — never tell them to hand-edit files.',
+  'Save or update an env var. Owner-DM only. In "auto" mode (default), credential-shaped keys (API keys, tokens, secrets, passwords) go to the macOS Keychain; everything else goes to plain ~/.clementine/.env. Force keychain or env via the storage arg if you need to override. Changes take effect immediately; process.env gets the real value and the next tool call can use it. Use this when the owner gives a value in chat — never tell them to hand-edit files.',
   {
     key: z.string().describe('Env var name (uppercase with underscores, e.g. STRIPE_API_KEY)'),
     value: z.string().describe('The value to store. Never echo back to the user; it will be masked in logs.'),
-    storage: z.enum(['keychain', 'env', 'auto']).optional().describe('Where to store it. "auto" (default) uses macOS Keychain when available, falls back to plain .env. "keychain" forces Keychain. "env" forces plaintext .env.'),
+    storage: z.enum(['keychain', 'env', 'auto']).optional().describe('Where to store it. "auto" (default) routes credential-shaped keys to Keychain and config-shaped keys to plain .env. "keychain" forces Keychain. "env" forces plaintext .env.'),
   },
   async ({ key, value, storage }) => {
     const gate = requireOwnerDm();
@@ -169,7 +170,12 @@ server.tool(
     if (!value) return textResult('Refused: empty value. Use env_unset to remove a key.');
 
     const mode = storage ?? 'auto';
-    const useKeychain = (mode === 'keychain') || (mode === 'auto' && keychain.isAvailable());
+    const looksSensitive = isSensitiveEnvKey(normalizedKey);
+    // auto mode: keychain-route only credential-shaped keys, so config knobs
+    // (BUDGET_*, OWNER_NAME, etc.) stay readable as plain .env values.
+    const useKeychain =
+      mode === 'keychain' ||
+      (mode === 'auto' && looksSensitive && keychain.isAvailable());
     if (mode === 'keychain' && !keychain.isAvailable()) {
       return textResult('Refused: Keychain storage requested but macOS Keychain is unavailable on this system.');
     }
