@@ -446,8 +446,8 @@ export const ALLOW_SOURCE_EDITS = (() => {
 //   off     — no rule loader (default, identical to pre-2a behavior)
 //   shadow  — rule engine runs alongside the legacy TS path; differences
 //             are logged but TS path's advice is what's returned.
-//   primary — rule engine is the source of truth; TS path is dead code.
-//             (Reserved for Phase 2b — not yet wired.)
+//   primary — rule engine is the source of truth; legacy TS path is only
+//             consulted as a fallback if the loader is unavailable.
 export const ADVISOR_RULES_LOADER: 'off' | 'shadow' | 'primary' = (() => {
   const raw = getEnv('CLEMENTINE_ADVISOR_RULES_LOADER', '').toLowerCase().trim();
   if (raw === 'shadow') return 'shadow';

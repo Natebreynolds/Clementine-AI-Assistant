@@ -13,10 +13,18 @@ import pino from 'pino';
 import { ADVISOR_RULES_LOADER, CRON_REFLECTIONS_DIR, ADVISOR_LOG_PATH } from '../config.js';
 import { CronRunLog } from '../gateway/heartbeat.js';
 import { evolvePrompt } from './prompt-evolver.js';
+import {
+  loadAdvisorRules,
+  getLoadedRules,
+  watchUserRulesDir,
+} from './advisor-rules/loader.js';
+import { buildRuleContext } from './advisor-rules/context.js';
+import { applyRules } from './advisor-rules/engine.js';
 import type { CronJobDefinition, ExecutionAdvice } from '../types.js';
 
 const logger = pino({ name: 'clementine.execution-advisor' });
 const shadowLogger = pino({ name: 'clementine.advisor-rules-shadow' });
+const primaryLogger = pino({ name: 'clementine.advisor-rules-primary' });
 
 // ── Tier caps for maxTurns ──────────────────────────────────────────
 
@@ -47,7 +55,44 @@ export interface ReflectionEntry {
 
 // ── Core function ───────────────────────────────────────────────────
 
+export type AdvisorRulesMode = 'off' | 'shadow' | 'primary';
+
 export function getExecutionAdvice(jobName: string, job: CronJobDefinition): ExecutionAdvice {
+  return getExecutionAdviceWithMode(jobName, job, ADVISOR_RULES_LOADER);
+}
+
+/**
+ * Mode-parameterized variant of getExecutionAdvice. Public so tests can
+ * exercise primary mode without mutating module-level env state.
+ */
+export function getExecutionAdviceWithMode(
+  jobName: string,
+  job: CronJobDefinition,
+  mode: AdvisorRulesMode,
+): ExecutionAdvice {
+  // Primary mode: rule engine is the source of truth. Falls through to the
+  // legacy TS path only if the loader is unavailable for some reason.
+  if (mode === 'primary') {
+    if (ensureRulesInitialized()) {
+      return computePrimaryAdvice(jobName, job);
+    }
+    primaryLogger.warn({ jobName }, 'Primary rule engine unavailable — falling back to legacy TS path');
+  }
+
+  const advice = computeLegacyAdvice(jobName, job);
+
+  // Shadow mode: run the YAML rule engine on the same job, log any divergence
+  // from the legacy TS advice. Non-throwing — never affects the returned advice.
+  if (mode === 'shadow' && ensureRulesInitialized()) {
+    runShadowComparison(jobName, job, advice);
+  }
+
+  return advice;
+}
+
+// ── Legacy TS path (kept as fallback for primary mode) ──────────────
+
+function computeLegacyAdvice(jobName: string, job: CronJobDefinition): ExecutionAdvice {
   const advice: ExecutionAdvice = {
     adjustedMaxTurns: null,
     adjustedModel: null,
@@ -137,80 +182,72 @@ export function getExecutionAdvice(jobName: string, job: CronJobDefinition): Exe
     logger.warn({ err, job: jobName }, 'Execution advisor error — proceeding with defaults');
   }
 
-  // Shadow mode: run the YAML rule engine on the same job, log any divergence
-  // from the legacy TS advice. Non-throwing — never affects the returned advice.
-  if (ADVISOR_RULES_LOADER === 'shadow') {
-    runShadowComparison(jobName, job, advice);
-  }
-
   return advice;
 }
 
-// ── Shadow-mode comparison ──────────────────────────────────────────
+// ── Rule-engine path ────────────────────────────────────────────────
 
-let shadowInitialized = false;
-let shadowAvailable = false;
-type ShadowDeps = {
-  loadAdvisorRules: typeof import('./advisor-rules/loader.js').loadAdvisorRules;
-  getLoadedRules: typeof import('./advisor-rules/loader.js').getLoadedRules;
-  watchUserRulesDir: typeof import('./advisor-rules/loader.js').watchUserRulesDir;
-  buildRuleContext: typeof import('./advisor-rules/context.js').buildRuleContext;
-  applyRules: typeof import('./advisor-rules/engine.js').applyRules;
-};
-let shadowDeps: ShadowDeps | null = null;
+let rulesInitialized = false;
+let rulesAvailable = false;
 
-async function ensureShadowInitialized(): Promise<void> {
-  if (shadowInitialized) return;
-  shadowInitialized = true;
+/** Sync init for the rule loader. Idempotent. Safe to call from any mode. */
+function ensureRulesInitialized(): boolean {
+  if (rulesInitialized) return rulesAvailable;
+  rulesInitialized = true;
   try {
-    const [loaderMod, contextMod, engineMod] = await Promise.all([
-      import('./advisor-rules/loader.js'),
-      import('./advisor-rules/context.js'),
-      import('./advisor-rules/engine.js'),
-    ]);
-    shadowDeps = {
-      loadAdvisorRules: loaderMod.loadAdvisorRules,
-      getLoadedRules: loaderMod.getLoadedRules,
-      watchUserRulesDir: loaderMod.watchUserRulesDir,
-      buildRuleContext: contextMod.buildRuleContext,
-      applyRules: engineMod.applyRules,
-    };
-    shadowDeps.loadAdvisorRules();
-    shadowDeps.watchUserRulesDir();
-    shadowAvailable = true;
-    shadowLogger.info('Advisor rules shadow mode initialized');
+    loadAdvisorRules();
+    watchUserRulesDir();
+    rulesAvailable = true;
+    primaryLogger.info({ ruleCount: getLoadedRules().length }, 'Advisor rules initialized');
   } catch (err) {
-    shadowLogger.warn({ err }, 'Failed to initialize advisor rules shadow mode');
+    primaryLogger.warn({ err }, 'Failed to initialize advisor rules — TS path will be used');
+    rulesAvailable = false;
+  }
+  return rulesAvailable;
+}
+
+function computePrimaryAdvice(jobName: string, job: CronJobDefinition): ExecutionAdvice {
+  try {
+    const rules = getLoadedRules();
+    const ctx = buildRuleContext(jobName, job);
+    const { advice, traces } = applyRules(rules, ctx);
+    const fired = traces.filter(t => t.fired).map(t => t.ruleId);
+    if (fired.length > 0) {
+      primaryLogger.debug({ jobName, firedRules: fired }, 'Rule engine produced advice');
+    }
+    return advice;
+  } catch (err) {
+    primaryLogger.warn({ err, jobName }, 'Rule engine threw — falling back to legacy TS path for this call');
+    return computeLegacyAdvice(jobName, job);
   }
 }
 
 function runShadowComparison(jobName: string, job: CronJobDefinition, tsAdvice: ExecutionAdvice): void {
-  // Fire-and-forget: kicks off async init the first time, then runs comparison
-  // synchronously on subsequent calls. Never throws.
-  ensureShadowInitialized()
-    .then(() => {
-      if (!shadowAvailable || !shadowDeps) return;
-      try {
-        const rules = shadowDeps.getLoadedRules();
-        const ctx = shadowDeps.buildRuleContext(jobName, job);
-        const { advice: yamlAdvice, traces } = shadowDeps.applyRules(rules, ctx);
-        const diffs = diffAdvice(tsAdvice, yamlAdvice);
-        if (diffs.length > 0) {
-          shadowLogger.warn(
-            { jobName, diffs, firedRules: traces.filter(t => t.fired).map(t => t.ruleId) },
-            'Shadow advisor diverged from TS path',
-          );
-        } else {
-          shadowLogger.debug(
-            { jobName, firedRules: traces.filter(t => t.fired).map(t => t.ruleId) },
-            'Shadow advisor matches TS path',
-          );
-        }
-      } catch (err) {
-        shadowLogger.warn({ err, jobName }, 'Shadow advisor run failed');
-      }
-    })
-    .catch(() => { /* unreachable — ensureShadowInitialized swallows */ });
+  try {
+    const rules = getLoadedRules();
+    const ctx = buildRuleContext(jobName, job);
+    const { advice: yamlAdvice, traces } = applyRules(rules, ctx);
+    const diffs = diffAdvice(tsAdvice, yamlAdvice);
+    if (diffs.length > 0) {
+      shadowLogger.warn(
+        { jobName, diffs, firedRules: traces.filter(t => t.fired).map(t => t.ruleId) },
+        'Shadow advisor diverged from TS path',
+      );
+    } else {
+      shadowLogger.debug(
+        { jobName, firedRules: traces.filter(t => t.fired).map(t => t.ruleId) },
+        'Shadow advisor matches TS path',
+      );
+    }
+  } catch (err) {
+    shadowLogger.warn({ err, jobName }, 'Shadow advisor run failed');
+  }
+}
+
+/** Test-only: clear the rule-init flag so subsequent calls re-init. */
+export function _resetAdvisorRulesInit(): void {
+  rulesInitialized = false;
+  rulesAvailable = false;
 }
 
 function diffAdvice(a: ExecutionAdvice, b: ExecutionAdvice): Array<{ field: string; ts: unknown; yaml: unknown }> {
