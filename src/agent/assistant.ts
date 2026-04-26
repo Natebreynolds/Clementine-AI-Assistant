@@ -5216,7 +5216,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
     }
   }
 
-  getRecentActivity(sinceIso: string): Array<{
+  getRecentActivity(sinceIso: string, maxEntries?: number): Array<{
     sessionKey: string;
     role: string;
     content: string;
@@ -5224,7 +5224,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
   }> {
     if (!this.memoryStore) return [];
     try {
-      return this.memoryStore.getRecentActivity(sinceIso);
+      return this.memoryStore.getRecentActivity(sinceIso, maxEntries);
     } catch {
       return [];
     }

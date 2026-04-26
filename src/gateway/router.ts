@@ -1731,13 +1731,13 @@ export class Gateway {
    * Get recent transcript activity across all sessions.
    * Used by heartbeat to know what happened since the last check.
    */
-  getRecentActivity(sinceIso: string): Array<{
+  getRecentActivity(sinceIso: string, maxEntries?: number): Array<{
     sessionKey: string;
     role: string;
     content: string;
     createdAt: string;
   }> {
-    return this.assistant.getRecentActivity(sinceIso);
+    return this.assistant.getRecentActivity(sinceIso, maxEntries);
   }
 
   /**

@@ -108,7 +108,7 @@ export function maybeIncreaseCooldown(state: InsightState): void {
  * Returns structured event summaries that can be passed to an LLM for urgency rating.
  */
 export function gatherInsightSignals(gateway: {
-  getRecentActivity: (since: string) => Array<{ sessionKey: string; role: string; content: string; createdAt: string }>;
+  getRecentActivity: (since: string, maxEntries?: number) => Array<{ sessionKey: string; role: string; content: string; createdAt: string }>;
 }): string[] {
   const signals: string[] = [];
   const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
@@ -213,7 +213,26 @@ export function gatherInsightSignals(gateway: {
     logger.debug({ err }, 'Failed to pull broken-jobs signals');
   }
 
-  // 6. Claim tracker — failed claims in the last N hours erode trust.
+  // 6. Conversational signals derived from recent transcripts.
+  //    Surfaces patterns IN the conversation itself, not just system events:
+  //    user frustration markers, repeating topics, etc. These are early
+  //    warning signs that the agent's responses may be off-track.
+  try {
+    const since24h = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+    const since7d = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+    // 24h frustration scan — 50 entries plenty to count corrections in a day.
+    const recent = gateway.getRecentActivity(since24h, 50);
+    for (const s of detectFrustrationSignals(recent)) signals.push(s);
+
+    // 7d repeat-topic scan — pull more entries since topics span sessions.
+    // Cap at 200 to keep keyword extraction cheap.
+    const week = gateway.getRecentActivity(since7d, 200);
+    for (const s of detectRepeatedTopics(week)) signals.push(s);
+  } catch (err) {
+    logger.debug({ err }, 'Failed to pull conversational signals');
+  }
+
+  // 7. Claim tracker — failed claims in the last N hours erode trust.
   //    Surface them so the owner sees "Clementine said she'd do X; she
   //    didn't" instead of silently swallowing the miss.
   try {
@@ -238,6 +257,105 @@ export function gatherInsightSignals(gateway: {
   }
 
   return signals;
+}
+
+// ── Conversational signal detectors ─────────────────────────────────
+//
+// Pure functions over recent transcript activity. Exported so the insight
+// dashboard / debug commands can run them independently of the full
+// gatherInsightSignals path.
+
+/**
+ * Markers that suggest the user is correcting or frustrated with the
+ * agent's last response. Tuned to start-of-message tokens since
+ * mid-message "no" or "actually" is often just normal narrative.
+ */
+const CORRECTION_PATTERNS: RegExp[] = [
+  /^(no|nope|not\b)/i,
+  /^(actually|wait)\b/i,
+  /^(that['’]?s| that is) (wrong|not|incorrect|backwards|opposite)/i,
+  /^I (meant|said|wanted|asked)\b/i,
+  /^you (didn['’]?t|misunderstood|got it wrong|missed)/i,
+  /^(stop|cancel|undo|nevermind|never mind)\b/i,
+];
+
+export function detectFrustrationSignals(
+  activity: Array<{ sessionKey: string; role: string; content: string; createdAt: string }>,
+): string[] {
+  const signals: string[] = [];
+  let count = 0;
+  const sessionsAffected = new Set<string>();
+  for (const entry of activity) {
+    if (entry.role !== 'user') continue;
+    const trimmed = entry.content.trim();
+    for (const re of CORRECTION_PATTERNS) {
+      if (re.test(trimmed)) {
+        count++;
+        sessionsAffected.add(entry.sessionKey);
+        break;
+      }
+    }
+  }
+  if (count >= 3) {
+    signals.push(
+      `Conversation friction: ${count} user correction(s) across ${sessionsAffected.size} session(s) in the last 24h — recent agent responses may be off-track`,
+    );
+  }
+  return signals;
+}
+
+/**
+ * Words too generic to count as a topic — would otherwise dominate the
+ * "recurring topic" signal with noise like "thanks", "okay", "please".
+ */
+const TOPIC_STOPWORDS = new Set([
+  'about', 'after', 'again', 'against', 'because', 'before', 'being', 'between',
+  'could', 'doing', 'don’t', 'down', 'during', 'each', 'from', 'further',
+  'going', 'gonna', 'have', 'having', 'here', 'into', 'just', 'know', 'like',
+  'maybe', 'might', 'more', 'most', 'much', 'need', 'okay', 'only', 'other',
+  'over', 'please', 'really', 'said', 'same', 'some', 'still', 'such', 'than',
+  'that', 'them', 'then', 'there', 'these', 'they', 'thing', 'think', 'this',
+  'those', 'through', 'thanks', 'time', 'told', 'under', 'until', 'using', 'very',
+  'want', 'wanted', 'wants', 'were', 'what', 'when', 'where', 'which', 'while',
+  'will', 'with', 'would', 'your', 'yours', 'yeah', 'yes',
+  'tonight', 'today', 'tomorrow', 'morning', 'evening', 'session', 'work',
+  'doing', 'made', 'make', 'making', 'sure', 'right', 'wrong', 'good', 'bad',
+  'much', 'many', 'lots',
+]);
+
+export function detectRepeatedTopics(
+  activity: Array<{ sessionKey: string; role: string; content: string; createdAt: string }>,
+): string[] {
+  // Build a (keyword → set of session IDs) map. A keyword that shows up in
+  // 3+ DISTINCT sessions across the window is "recurring" — could be an
+  // unresolved thread, a project the user is grinding on, or a question
+  // they've asked multiple ways.
+  const sessionsForKeyword = new Map<string, Set<string>>();
+  for (const entry of activity) {
+    if (entry.role !== 'user') continue;
+    const text = entry.content.toLowerCase();
+    // Word extraction: 5+ chars, alpha-only (no numbers/punctuation).
+    const matches = text.match(/[a-z][a-z’]{4,15}/g) ?? [];
+    const seenInThisMessage = new Set<string>();
+    for (const w of matches) {
+      if (TOPIC_STOPWORDS.has(w)) continue;
+      if (seenInThisMessage.has(w)) continue;       // dedupe within a single message
+      seenInThisMessage.add(w);
+      if (!sessionsForKeyword.has(w)) sessionsForKeyword.set(w, new Set());
+      sessionsForKeyword.get(w)!.add(entry.sessionKey);
+    }
+  }
+
+  // Rank by session-spread; surface the top 2 to avoid flooding insight
+  // notifications with too many topic mentions.
+  const ranked = [...sessionsForKeyword.entries()]
+    .filter(([, sessions]) => sessions.size >= 3)
+    .sort((a, b) => b[1].size - a[1].size)
+    .slice(0, 2);
+
+  return ranked.map(([keyword, sessions]) =>
+    `Recurring topic "${keyword}" came up across ${sessions.size} sessions this week — possible ongoing thread`,
+  );
 }
 
 /**
