@@ -416,6 +416,19 @@ function applyAdvisorRuleFix(
   appendAudit({ kind: 'advisor-rule', jobName, file: targetPath, ruleId: autoApply.ruleId, diff });
   logger.info({ jobName, ruleId: autoApply.ruleId, file: targetPath }, 'Applied advisor-rule fix');
 
+  // Phase 8.1 — record this autoApply for verification. The next
+  // AUTOAPPLY_VERDICT_WINDOW non-skipped runs decide whether the rule
+  // helped; if not, fix-verification auto-reverts (deletes the file).
+  // Lazy import to avoid circular dependency (fix-verification imports
+  // failure-monitor which transitively touches the cron path).
+  import('./fix-verification.js').then(({ recordAutoApplyForVerification }) => {
+    recordAutoApplyForVerification(jobName, {
+      kind: 'advisor-rule',
+      file: targetPath,
+      ruleId: autoApply.ruleId,
+    });
+  }).catch(err => logger.warn({ err, jobName }, 'Failed to record autoApply for verification'));
+
   return {
     ok: true,
     message: `Wrote advisor rule ${autoApply.ruleId} (hot-reloads on next eval)`,
@@ -478,6 +491,16 @@ function applyPromptOverrideFix(
     { jobName, scope: autoApply.scope, scopeKey: autoApply.scopeKey, file: targetPath },
     'Applied prompt-override fix',
   );
+
+  // Phase 8.1 — same multi-run verification flow as advisor-rule.
+  import('./fix-verification.js').then(({ recordAutoApplyForVerification }) => {
+    recordAutoApplyForVerification(jobName, {
+      kind: 'prompt-override',
+      file: targetPath,
+      scope: autoApply.scope,
+      scopeKey: autoApply.scopeKey,
+    });
+  }).catch(err => logger.warn({ err, jobName }, 'Failed to record autoApply for verification'));
 
   return {
     ok: true,
