@@ -1186,8 +1186,10 @@ export class MemoryStore {
     // 1. FTS5 relevance (fetch extra to allow re-ranking after boost)
     const ftsResults = this.searchFts(query, agentSlug ? limit * 2 : limit, tagFilters, agentSlug && strict ? agentSlug : undefined);
 
-    // Apply salience boost to FTS results
+    // Apply boosts. Order doesn't matter (all multiplicative) but readability does.
+    const nowMs = Date.now();
     for (const r of ftsResults) {
+      // Salience: editor-curated importance (admin tag, sticky note, etc.)
       if (r.salience > 0) {
         r.score *= 1.0 + r.salience;
       }
@@ -1198,6 +1200,17 @@ export class MemoryStore {
       const outcome = r.lastOutcomeScore ?? 0;
       if (outcome !== 0) {
         r.score *= 1.0 + 0.3 * outcome;
+      }
+      // Temporal decay — without this, a 2-year-old chunk with the same BM25
+      // score ranks identically to one from yesterday. Half-life of 30 days
+      // (matches TEMPORAL_DECAY_HALF_LIFE_DAYS in config). Applied to a
+      // bounded fraction (max 60% reduction) so genuinely high-relevance
+      // historical context still surfaces — this is a tiebreaker, not a cliff.
+      if (r.lastUpdated) {
+        const daysOld = Math.max(0, (nowMs - new Date(r.lastUpdated).getTime()) / 86_400_000);
+        const decay = temporalDecay(daysOld, 30);
+        // Clamp to [0.4, 1.0] so very old chunks lose at most 60% of their score.
+        r.score *= Math.max(0.4, decay);
       }
     }
 
