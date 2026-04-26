@@ -1098,6 +1098,98 @@ async function cmdConfigDoctor(opts: { json?: boolean }): Promise<void> {
   process.exit(report.exitCode);
 }
 
+// ── Config migrate-to-keychain ───────────────────────────────────────
+
+async function cmdConfigMigrateToKeychain(opts: { dryRun?: boolean; key?: string[] }): Promise<void> {
+  const { planMigration, applyMigration } = await import('../config/migrate-keychain.js');
+
+  const DIM = '\x1b[0;90m';
+  const BOLD = '\x1b[1m';
+  const GREEN = '\x1b[0;32m';
+  const YELLOW = '\x1b[0;33m';
+  const RED = '\x1b[0;31m';
+  const CYAN = '\x1b[0;36m';
+  const RESET = '\x1b[0m';
+
+  // Commander gives us either ['a', 'b'] or ['a,b'] depending on how the
+  // user passed the flag — normalize.
+  const only = opts.key
+    ? opts.key.flatMap(k => k.split(',').map(s => s.trim()).filter(Boolean))
+    : undefined;
+
+  const plan = planMigration(BASE_DIR, only ? { only } : {});
+
+  console.log();
+  console.log(`  ${BOLD}.env path:${RESET}  ${plan.envPath}`);
+  console.log();
+
+  if (plan.candidates.length === 0) {
+    console.log(`  ${DIM}No env entries found (.env may be empty or missing).${RESET}`);
+    console.log();
+    return;
+  }
+
+  // Group by status for readable output
+  const groups: Record<string, typeof plan.candidates> = {};
+  for (const c of plan.candidates) {
+    (groups[c.status] ??= []).push(c);
+  }
+
+  const renderGroup = (label: string, color: string, items: typeof plan.candidates) => {
+    if (!items || items.length === 0) return;
+    console.log(`  ${color}${label}${RESET} ${DIM}(${items.length})${RESET}`);
+    for (const c of items) {
+      console.log(`    ${c.key} ${DIM}(${c.valueLength} chars)${RESET}`);
+    }
+    console.log();
+  };
+
+  renderGroup('Will migrate to keychain', CYAN, groups.migrated);
+  renderGroup('Already in keychain (skipped)', DIM, groups['already-keychain']);
+  renderGroup('Not credential-shaped (skipped)', DIM, groups['not-sensitive']);
+  renderGroup('Too short to be a credential (skipped)', DIM, groups['too-short']);
+
+  if (plan.toMigrate.length === 0) {
+    console.log(`  ${GREEN}Nothing to migrate.${RESET}`);
+    console.log();
+    return;
+  }
+
+  if (opts.dryRun) {
+    console.log(`  ${YELLOW}Dry run — no changes written.${RESET}`);
+    console.log(`  ${DIM}Re-run without --dry-run to apply.${RESET}`);
+    console.log();
+    return;
+  }
+
+  console.log(`  ${BOLD}Applying...${RESET}`);
+  let result;
+  try {
+    result = applyMigration(BASE_DIR, only ? { only } : {});
+  } catch (err) {
+    console.error(`  ${RED}Failed:${RESET} ${(err as Error).message}`);
+    process.exit(1);
+  }
+
+  if (result.failed.length > 0) {
+    console.log(`  ${RED}Some keychain writes failed — .env was NOT modified:${RESET}`);
+    for (const f of result.failed) {
+      console.log(`    ${RED}✗${RESET} ${f.key}: ${f.error}`);
+    }
+    console.log();
+    process.exit(1);
+  }
+
+  for (const key of result.migrated) {
+    console.log(`    ${GREEN}✓${RESET} ${key} ${DIM}→ keychain${RESET}`);
+  }
+  console.log();
+  console.log(`  ${GREEN}Migrated ${result.migrated.length} key${result.migrated.length === 1 ? '' : 's'}.${RESET}`);
+  console.log(`  ${DIM}First daemon read of each ref will trigger a one-time keychain prompt;${RESET}`);
+  console.log(`  ${DIM}choose Always Allow to make the prompt permanent.${RESET}`);
+  console.log();
+}
+
 // ── Advisor commands ────────────────────────────────────────────────
 
 const ADVISOR_MODES = ['off', 'shadow', 'primary'] as const;
@@ -1772,6 +1864,15 @@ configCmd
   .option('--json', 'Emit machine-readable JSON instead of a checklist')
   .action(async (opts: { json?: boolean }) => {
     await cmdConfigDoctor(opts);
+  });
+
+configCmd
+  .command('migrate-to-keychain')
+  .description('Move plaintext credentials in .env into the macOS keychain (in place)')
+  .option('--dry-run', 'Show what would migrate without writing anything')
+  .option('-k, --key <name...>', 'Limit to specific key(s); repeat or comma-separate for multiple')
+  .action(async (opts: { dryRun?: boolean; key?: string[] }) => {
+    await cmdConfigMigrateToKeychain(opts);
   });
 
 configCmd
