@@ -58,7 +58,22 @@ const ACTION_TOOLS = new Set([
 
 // ── MetacognitiveMonitor ────────────────────────────────────────────
 
+/**
+ * Execution mode the monitor is observing. Chat sessions deliver via output
+ * text, so "many tool calls + zero output" is genuinely suspicious. Cron
+ * jobs (especially unleashed) deliver via side effects (sent emails, updated
+ * records, written files) — chat-text length is NOT the success signal, so
+ * the high_effort_low_output heuristic must be disabled or it produces
+ * 100+ false-positive interventions per run (observed 2026-04-26 on
+ * market-leader-followup which sent 17 real emails while this guard fired
+ * 169 times). Other heuristics (circular_reasoning via repeated identical
+ * tool calls, research_without_action via consecutive reads) stay active —
+ * those are real bug shapes regardless of mode.
+ */
+export type MetacognitiveMode = 'chat' | 'cron' | 'unleashed';
+
 export class MetacognitiveMonitor {
+  private readonly mode: MetacognitiveMode;
   private toolCalls: Array<{ name: string; inputHash: string; timestamp: number }> = [];
   private uniqueTools = new Set<string>();
   private consecutiveReads = 0;
@@ -67,6 +82,10 @@ export class MetacognitiveMonitor {
   private interventionCount = 0;
   private signals: string[] = [];
   private confidence: 'high' | 'medium' | 'low' = 'high';
+
+  constructor(mode: MetacognitiveMode = 'chat') {
+    this.mode = mode;
+  }
 
   /**
    * Record a tool call. Returns a signal if the pattern is concerning.
@@ -129,30 +148,33 @@ export class MetacognitiveMonitor {
     }
 
     // Signal: excessive tool calls with near-zero output.
-    // Warn at 20, intervene (hard stop) at 60 — beyond 60 the agent is
-    // almost certainly in a runaway loop that will burn through the
-    // budget cap with nothing to show for it.
-    if (this.toolCalls.length >= 60 && this.outputCharCount < 200) {
-      this.confidence = 'low';
-      if (!this.signals.includes('high_effort_low_output')) {
-        this.signals.push('high_effort_low_output');
-      }
-      this.interventionCount++;
-      return {
-        type: 'intervene',
-        reason: 'high_effort_low_output',
-        guidance: `You've made ${this.toolCalls.length} tool calls across ${this.uniqueTools.size} tools with only ${this.outputCharCount} chars of output. This is a runaway loop. Stopping now to prevent budget waste.`,
-      };
-    }
-    if (this.toolCalls.length > 20 && this.outputCharCount < 200) {
-      this.confidence = 'low';
-      if (!this.signals.includes('high_effort_low_output')) {
-        this.signals.push('high_effort_low_output');
+    // Chat scenarios deliver via output text, so this is meaningful there.
+    // Cron and unleashed scenarios deliver via side effects (emails sent,
+    // records updated, files written) — chat-text length is irrelevant.
+    // Skip entirely outside chat mode.
+    if (this.mode === 'chat') {
+      if (this.toolCalls.length >= 60 && this.outputCharCount < 200) {
+        this.confidence = 'low';
+        if (!this.signals.includes('high_effort_low_output')) {
+          this.signals.push('high_effort_low_output');
+        }
+        this.interventionCount++;
         return {
-          type: 'warn',
+          type: 'intervene',
           reason: 'high_effort_low_output',
-          guidance: 'You\'ve made 20+ tool calls with minimal output. Step back and simplify your approach.',
+          guidance: `You've made ${this.toolCalls.length} tool calls across ${this.uniqueTools.size} tools with only ${this.outputCharCount} chars of output. This is a runaway loop. Stopping now to prevent budget waste.`,
         };
+      }
+      if (this.toolCalls.length > 20 && this.outputCharCount < 200) {
+        this.confidence = 'low';
+        if (!this.signals.includes('high_effort_low_output')) {
+          this.signals.push('high_effort_low_output');
+          return {
+            type: 'warn',
+            reason: 'high_effort_low_output',
+            guidance: 'You\'ve made 20+ tool calls with minimal output. Step back and simplify your approach.',
+          };
+        }
       }
     }
 

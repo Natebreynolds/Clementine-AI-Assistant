@@ -4142,7 +4142,10 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
     const cronProfile = agentSlug && agentSlug !== 'clementine'
       ? this.profileManager.get(agentSlug)
       : null;
-    const cronGuard = new StallGuard();
+    // Cron jobs deliver via side effects (sent emails, updated records, etc),
+    // not chat text — pass mode='cron' so high_effort_low_output guard is
+    // disabled. Loop detection and circular-reasoning checks stay active.
+    const cronGuard = new StallGuard('cron');
     const sdkOptions = this.buildOptions({
       isHeartbeat: true,
       cronTier: tier,
@@ -4650,7 +4653,8 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
       // Re-assert autonomous source — a chat message may have changed it between phases
       setInteractionSource('autonomous');
 
-      const phaseGuard = new StallGuard();
+      // Unleashed phases run side-effect-heavy work; same logic as cron mode.
+      const phaseGuard = new StallGuard('unleashed');
       const sdkOptions = this.buildOptions({
         isHeartbeat: true,
         cronTier: tier,

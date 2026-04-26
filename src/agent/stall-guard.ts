@@ -13,8 +13,15 @@
  */
 
 import { ToolLoopDetector } from './tool-loop-detector.js';
-import { MetacognitiveMonitor, type MetacognitiveSignal, type MetacognitiveSummary } from './metacognition.js';
+import {
+  MetacognitiveMonitor,
+  type MetacognitiveMode,
+  type MetacognitiveSignal,
+  type MetacognitiveSummary,
+} from './metacognition.js';
 import pino from 'pino';
+
+export type StallGuardMode = MetacognitiveMode;
 
 const logger = pino({ name: 'clementine.stall-guard' });
 
@@ -35,10 +42,20 @@ export interface StallSummary {
 
 export class StallGuard {
   private loopDetector = new ToolLoopDetector();
-  private metacog = new MetacognitiveMonitor();
+  private readonly metacog: MetacognitiveMonitor;
   private breakerActive = false;
   private breakerReason = '';
   private toolCallLog: string[] = [];
+
+  /**
+   * @param mode 'chat' (default) keeps full output-text-driven heuristics.
+   *             'cron' / 'unleashed' disable the high_effort_low_output check
+   *             since side effects, not chat text, are the deliverable for
+   *             those execution contexts.
+   */
+  constructor(mode: StallGuardMode = 'chat') {
+    this.metacog = new MetacognitiveMonitor(mode);
+  }
 
   /**
    * Check if a tool should be blocked. Called from canUseTool.
