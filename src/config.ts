@@ -71,6 +71,20 @@ function isKeychainRef(value: string | undefined): value is string {
   return typeof value === 'string' && value.startsWith(KEYCHAIN_REF_PREFIX);
 }
 
+/**
+ * Hard cap on each `security find-generic-password` shell call. The macOS
+ * keychain prompts the user for read access on first use of any entry created
+ * with restrictive ACL (`-T ''`). If the prompt doesn't appear (hidden behind
+ * a window, denied silently, or the user is afk), the call would otherwise
+ * block indefinitely — which means `clementine` and the daemon would hang at
+ * boot. Cap and fall through to the caller's default; the failure caches as
+ * null so we don't re-prompt this process. Override via env if needed.
+ */
+const KEYCHAIN_TIMEOUT_MS = Math.max(
+  500,
+  parseInt(env['CLEMENTINE_KEYCHAIN_TIMEOUT_MS'] ?? process.env.CLEMENTINE_KEYCHAIN_TIMEOUT_MS ?? '3000', 10) || 3000,
+);
+
 function resolveKeychainRef(stub: string): string | undefined {
   if (resolvedKeychainRefs.has(stub)) {
     const cached = resolvedKeychainRefs.get(stub);
@@ -82,7 +96,7 @@ function resolveKeychainRef(stub: string): string | undefined {
   try {
     const result = execSync(
       `security find-generic-password -s clementine-agent -a ${shellEscape(account)} -w`,
-      { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] },
+      { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'], timeout: KEYCHAIN_TIMEOUT_MS },
     ).trim();
     resolvedKeychainRefs.set(stub, result || null);
     return result || undefined;
@@ -185,7 +199,7 @@ function getSecret(envKey: string, keychainService?: string): string {
   try {
     const result = execSync(
       `security find-generic-password -s ${shellEscape(service)} -a ${shellEscape(envKey)} -w`,
-      { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] },
+      { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'], timeout: KEYCHAIN_TIMEOUT_MS },
     );
     return result.trim();
   } catch {

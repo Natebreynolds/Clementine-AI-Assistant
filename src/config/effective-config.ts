@@ -114,6 +114,12 @@ function shellEscape(s: string): string {
   return `'${s.replace(/'/g, "'\\''")}'`;
 }
 
+/** Hard cap per shell call — see config.ts for rationale. */
+const KEYCHAIN_TIMEOUT_MS = Math.max(
+  500,
+  parseInt(process.env.CLEMENTINE_KEYCHAIN_TIMEOUT_MS ?? '3000', 10) || 3000,
+);
+
 function resolveRef(stub: string): string | undefined {
   if (refCache.has(stub)) {
     const v = refCache.get(stub);
@@ -123,7 +129,7 @@ function resolveRef(stub: string): string | undefined {
   try {
     const result = execSync(
       `security find-generic-password -s clementine-agent -a ${shellEscape(account)} -w`,
-      { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] },
+      { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'], timeout: KEYCHAIN_TIMEOUT_MS },
     ).trim();
     refCache.set(stub, result || null);
     return result || undefined;

@@ -59,14 +59,20 @@ export function set(envVar: string, value: string): string {
     throw new Error('Keychain unavailable on this platform');
   }
   const account = `${SERVICE_NAME}-${envVar}`;
-  // -U updates existing entry in place; -s = service; -a = account; -w = password
+  // -U updates existing entry in place; -s = service; -a = account; -w = password.
+  // -T /usr/bin/security pre-approves the `security` CLI itself — that's what
+  // every Clementine read goes through, so reads via clementine/the daemon
+  // don't produce a per-process keychain dialog. Without this flag, every
+  // node process that reads the entry would block on a UI prompt that may
+  // never appear (hidden behind windows, dismissed silently, etc.) — which
+  // is the bug that motivated this change.
   const result = spawnSync('/usr/bin/security', [
     'add-generic-password',
     '-U',
     '-s', SERVICE_NAME,
     '-a', account,
     '-w', value,
-    '-T', '',  // no apps pre-approved — will prompt on first read; user can approve for login session
+    '-T', '/usr/bin/security',
     '-l', `Clementine: ${envVar}`,
   ], { stdio: 'pipe' });
   if (result.status !== 0) {
