@@ -1045,6 +1045,59 @@ async function cmdConfigShow(opts: { json?: boolean; group?: string }): Promise<
   }
 }
 
+// ── Config doctor ────────────────────────────────────────────────────
+
+async function cmdConfigDoctor(opts: { json?: boolean }): Promise<void> {
+  const { runDoctor } = await import('../config/config-doctor.js');
+  const report = runDoctor(BASE_DIR);
+
+  if (opts.json) {
+    console.log(JSON.stringify(report, null, 2));
+    process.exit(report.exitCode);
+  }
+
+  const DIM = '\x1b[0;90m';
+  const BOLD = '\x1b[1m';
+  const GREEN = '\x1b[0;32m';
+  const YELLOW = '\x1b[0;33m';
+  const RED = '\x1b[0;31m';
+  const RESET = '\x1b[0m';
+
+  const sevColor = { error: RED, warning: YELLOW, info: DIM };
+  const sevSymbol = { error: '✗', warning: '⚠', info: '·' };
+
+  console.log();
+  console.log(`  ${BOLD}Data home:${RESET}        ${report.baseDir}`);
+  console.log(`  ${BOLD}.env present:${RESET}     ${report.hasEnvFile ? GREEN + 'yes' : DIM + 'no'}${RESET}`);
+  console.log(`  ${BOLD}clementine.json:${RESET}  ${report.hasJsonFile ? GREEN + 'present' : DIM + 'missing'}${RESET}`);
+  console.log();
+
+  if (report.findings.length === 0) {
+    console.log(`  ${GREEN}✓ All checks passed.${RESET}`);
+    console.log();
+    process.exit(0);
+  }
+
+  for (const f of report.findings) {
+    const c = sevColor[f.severity];
+    const sym = sevSymbol[f.severity];
+    const keyTag = f.key ? `${BOLD}${f.key}${RESET} ${DIM}—${RESET} ` : '';
+    console.log(`  ${c}${sym}${RESET} ${keyTag}${f.message}`);
+    if (f.fix) {
+      console.log(`    ${DIM}↳${RESET} ${f.fix}`);
+    }
+  }
+
+  console.log();
+  const summary: string[] = [];
+  if (report.counts.error > 0) summary.push(`${RED}${report.counts.error} error${report.counts.error === 1 ? '' : 's'}${RESET}`);
+  if (report.counts.warning > 0) summary.push(`${YELLOW}${report.counts.warning} warning${report.counts.warning === 1 ? '' : 's'}${RESET}`);
+  if (report.counts.info > 0) summary.push(`${DIM}${report.counts.info} info${RESET}`);
+  console.log(`  ${summary.join(', ')}`);
+  console.log();
+  process.exit(report.exitCode);
+}
+
 // ── Advisor commands ────────────────────────────────────────────────
 
 const ADVISOR_MODES = ['off', 'shadow', 'primary'] as const;
@@ -1711,6 +1764,14 @@ configCmd
   .option('-g, --group <name>', 'Filter to a single group (e.g. budgets)')
   .action(async (opts: { json?: boolean; group?: string }) => {
     await cmdConfigShow(opts);
+  });
+
+configCmd
+  .command('doctor')
+  .description('Validate config: stale keychain refs, type errors, missing channel deps')
+  .option('--json', 'Emit machine-readable JSON instead of a checklist')
+  .action(async (opts: { json?: boolean }) => {
+    await cmdConfigDoctor(opts);
   });
 
 configCmd
