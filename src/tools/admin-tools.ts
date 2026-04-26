@@ -154,11 +154,11 @@ server.tool(
 
 server.tool(
   'env_set',
-  'Save or update an env var. Owner-DM only. In "auto" mode (default), credential-shaped keys (API keys, tokens, secrets, passwords) go to the macOS Keychain; everything else goes to plain ~/.clementine/.env. Force keychain or env via the storage arg if you need to override. Changes take effect immediately; process.env gets the real value and the next tool call can use it. Use this when the owner gives a value in chat — never tell them to hand-edit files.',
+  'Save or update an env var. Owner-DM only. Default behavior writes to plain ~/.clementine/.env (mode 0600). Pass storage="keychain" to opt into macOS Keychain storage — but be aware keychain entries can require per-app approval prompts on first read which create UX friction (see commit history for the rabbit hole). Use plain .env unless you specifically need at-rest encryption beyond filesystem permissions.',
   {
     key: z.string().describe('Env var name (uppercase with underscores, e.g. STRIPE_API_KEY)'),
     value: z.string().describe('The value to store. Never echo back to the user; it will be masked in logs.'),
-    storage: z.enum(['keychain', 'env', 'auto']).optional().describe('Where to store it. "auto" (default) routes credential-shaped keys to Keychain and config-shaped keys to plain .env. "keychain" forces Keychain. "env" forces plaintext .env.'),
+    storage: z.enum(['keychain', 'env', 'auto']).optional().describe('Where to store it. Default (and "auto"/"env") writes plaintext to ~/.clementine/.env. "keychain" opts into macOS Keychain — only use when at-rest encryption matters more than read ergonomics.'),
   },
   async ({ key, value, storage }) => {
     const gate = requireOwnerDm();
@@ -170,15 +170,19 @@ server.tool(
     if (!value) return textResult('Refused: empty value. Use env_unset to remove a key.');
 
     const mode = storage ?? 'auto';
-    const looksSensitive = isSensitiveEnvKey(normalizedKey);
-    // auto mode: keychain-route only credential-shaped keys, so config knobs
-    // (BUDGET_*, OWNER_NAME, etc.) stay readable as plain .env values.
-    const useKeychain =
-      mode === 'keychain' ||
-      (mode === 'auto' && looksSensitive && keychain.isAvailable());
+    // Keychain is now strictly opt-in. The legacy 'auto' mode used to route
+    // credential-shaped keys to keychain, but that produced a class of read-
+    // approval dialog UX bugs (see commits 88cfd99 .. c34da0b). Plaintext .env
+    // with mode 0600 is the safer default — credentials still encrypted at
+    // rest if FileVault is on, and no per-process keychain prompts.
+    const useKeychain = mode === 'keychain';
     if (mode === 'keychain' && !keychain.isAvailable()) {
       return textResult('Refused: Keychain storage requested but macOS Keychain is unavailable on this system.');
     }
+    // Reference unused-but-imported helper so the import line stays meaningful
+    // for grep — it's used by other modules and we may re-enable smart routing
+    // later behind a feature flag.
+    void isSensitiveEnvKey;
 
     const map = parseEnvFile();
     const existed = map.has(normalizedKey);

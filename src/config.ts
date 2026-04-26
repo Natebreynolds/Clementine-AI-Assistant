@@ -135,6 +135,20 @@ export function _resetKeychainRefCache(): void {
   resolvedKeychainRefs.clear();
 }
 
+/**
+ * Return the keychain stubs that couldn't be resolved this process. Used by
+ * the daemon entrypoint to log a clear remediation hint at boot if any
+ * keychain reads are failing (typically: ACL not yet partition-listed →
+ * `clementine config keychain-fix-acl` fixes it).
+ */
+export function getFailedKeychainResolutions(): string[] {
+  const out: string[] = [];
+  for (const [stub, value] of resolvedKeychainRefs) {
+    if (value === null) out.push(stub);
+  }
+  return out;
+}
+
 // ── Paths ────────────────────────────────────────────────────────────
 
 export const VAULT_DIR = path.join(BASE_DIR, 'vault');

@@ -608,6 +608,25 @@ async function asyncMain(): Promise<void> {
     hydrateSecretsFromEnv();
   } catch { /* non-fatal — non-macOS systems, or keychain unavailable */ }
 
+  // ── Surface keychain resolution failures with a clear remediation hint ──
+  // If any keychain ref couldn't be read at module-init time, the user is
+  // probably hitting the per-process approval-dialog issue (entry written
+  // with the wrong ACL). The fix is one command — print it loud so they
+  // don't have to grep for the answer.
+  const failedKcRefs = config.getFailedKeychainResolutions();
+  if (failedKcRefs.length > 0) {
+    logger.warn(
+      { count: failedKcRefs.length, refs: failedKcRefs },
+      `${failedKcRefs.length} keychain reference(s) could not be resolved at startup.`,
+    );
+    logger.warn(
+      'Affected channels/integrations may be degraded. Fix in one command: clementine config keychain-fix-acl',
+    );
+    logger.warn(
+      'See: https://github.com/Natebreynolds/Clementine-AI-Assistant#keychain-prompts',
+    );
+  }
+
   // ── Check MCP extension permissions ────────────────────────────
   try {
     const { checkPermissionsOnStartup, bootstrapClaudeIntegrationsFromAuditLog, probeAvailableTools } = await import('./agent/mcp-bridge.js');
