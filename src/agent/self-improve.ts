@@ -20,6 +20,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import matter from 'gray-matter';
+import { load as yamlLoad } from 'js-yaml';
 import path from 'node:path';
 import pino from 'pino';
 
@@ -33,7 +34,6 @@ import {
   VAULT_DIR,
   MEMORY_DB_PATH,
   AGENTS_DIR,
-  PKG_DIR,
   CRON_REFLECTIONS_DIR,
   GOALS_DIR,
 } from '../config.js';
@@ -58,9 +58,13 @@ const DEFAULT_CONFIG: SelfImproveConfig = {
   maxDurationMs: 3_600_000,         // 1 hour
   acceptThreshold: 0.7,
   plateauLimit: 3,
-  // 'source' deprecated — self-improvement should produce data (cron, workflow, etc.),
-  // not engine TS edits. Re-add only with CLEMENTINE_ALLOW_SOURCE_EDITS=1.
-  areas: ['soul', 'cron', 'workflow', 'memory', 'agent', 'communication', 'goal'],
+  // 'source' deprecated — self-improvement produces data, not engine TS edits.
+  // 'advisor-rule' writes YAML to ~/.clementine/advisor-rules/user/.
+  // 'prompt-override' writes markdown to ~/.clementine/prompt-overrides/.
+  areas: [
+    'soul', 'cron', 'workflow', 'memory', 'agent', 'communication', 'goal',
+    'advisor-rule', 'prompt-override',
+  ],
   autoApply: true,
   sourceMode: 'skip',
 };
@@ -201,21 +205,23 @@ function checkDrift(proposedContent: string): { ok: boolean; similarity: number 
 type RiskTier = 'low' | 'medium' | 'high';
 
 /** Classify the risk level of a proposed change.
- * - low: agent prompts, individual cron job prompts — auto-apply safe
+ * - low: agent prompts, individual cron job prompts, advisor rules, prompt overrides
  * - medium: SOUL.md, AGENTS.md, MEMORY.md — needs owner approval
- * - high: source code — stays blocked
+ * - high: source code — stays blocked (deprecated path; kept for back-compat)
  */
 function classifyRisk(area: string): RiskTier {
   switch (area) {
-    case 'agent':     return 'low';    // Agent-scoped, easily reversible
-    case 'cron':      return 'low';    // Cron prompt tweaks, low blast radius
-    case 'workflow':  return 'low';    // Workflow definitions, scoped
-    case 'soul':      return 'medium'; // Core personality — needs approval
-    case 'communication': return 'medium'; // Global operating instructions
-    case 'memory':    return 'medium'; // Memory config
-    case 'source':    return 'high';   // Code changes — always blocked in auto mode
-    case 'goal':      return 'medium'; // New goals need owner review before activating
-    default:          return 'high';
+    case 'agent':            return 'low';
+    case 'cron':             return 'low';
+    case 'workflow':         return 'low';
+    case 'advisor-rule':     return 'low';    // YAML files, hot-reloaded, easily deleted
+    case 'prompt-override':  return 'low';    // Markdown files, hot-reloaded, easily deleted
+    case 'soul':             return 'medium'; // Core personality — needs approval
+    case 'communication':    return 'medium'; // Global operating instructions
+    case 'memory':           return 'medium'; // Memory config
+    case 'goal':             return 'medium'; // New goals need owner review before activating
+    case 'source':           return 'high';   // Deprecated — quarantined in Phase 1
+    default:                 return 'high';
   }
 }
 
@@ -1020,7 +1026,15 @@ export class SelfImproveLoop {
       `Area notes:\n` +
       `- For "goal": target = "{owner}/{goal-slug}" (e.g. "clementine/improve-reply-rates" or "ross-the-sdr/book-demos"). ` +
       `Propose when you observe a pattern in completed tasks or cron runs that suggests a missing or stale goal. ` +
-      `The proposedChange must be a JSON goal object with at minimum: title, description, priority, reviewFrequency.\n\n` +
+      `The proposedChange must be a JSON goal object with at minimum: title, description, priority, reviewFrequency.\n` +
+      `- For "advisor-rule": target = ruleId in kebab-case (e.g. "skip-turn-bump-on-unleashed"). ` +
+      `Use when the fix is a behavioral rule that affects ALL jobs matching some scope, not just one cron job. ` +
+      `Examples: "for unleashed jobs, never bump maxTurns" or "for ross-the-sdr, double timeout on max_turns". ` +
+      `The proposedChange must be a full advisor rule YAML body with: schemaVersion: 1, id (must match target), description, priority (use 100+ to override builtins), appliesTo, when[], then[]. ` +
+      `User rules at priority 100+ override engine builtins of the same id.\n` +
+      `- For "prompt-override": target = "global", "agent:<slug>", or "job:<jobName>" (e.g. "job:market-leader-followup"). ` +
+      `Use when a job/agent needs more standing guidance — markdown that gets prepended to its prompt. ` +
+      `The proposedChange is the markdown body (optionally with gray-matter frontmatter for priority/position).\n\n` +
       `Return your answer as a JSON object matching the schema: { "results": [ ... ] }. Up to 3 items. If absolutely nothing actionable today, return { "results": [] }.`;
 
     const analysisResult = await this.assistant.runPlanStep('si-analyze', analysisPrompt, {
@@ -1118,10 +1132,6 @@ export class SelfImproveLoop {
         const agentFile = path.join(AGENTS_DIR, target, 'agent.md');
         return existsSync(agentFile) ? readFileSync(agentFile, 'utf-8') : '';
       }
-      case 'source': {
-        const srcFile = path.join(PKG_DIR, 'src', target);
-        return existsSync(srcFile) ? readFileSync(srcFile, 'utf-8') : '';
-      }
       case 'communication':
         return existsSync(AGENTS_FILE) ? readFileSync(AGENTS_FILE, 'utf-8') : '';
       case 'memory': {
@@ -1143,6 +1153,20 @@ export class SelfImproveLoop {
         return goals.map((g: any) =>
           `[${g.status ?? 'unknown'}] ${g.title}: ${(g.description ?? '').slice(0, 120)}`
         ).join('\n');
+      }
+      case 'advisor-rule': {
+        // target = ruleId (kebab-case). Show user override file if present, else builtin.
+        const userPath = path.join(BASE_DIR, 'advisor-rules', 'user', `${target}.yaml`);
+        if (existsSync(userPath)) return readFileSync(userPath, 'utf-8');
+        const builtinPath = path.join(BASE_DIR, 'advisor-rules', 'builtin', `${target}.yaml`);
+        if (existsSync(builtinPath)) return readFileSync(builtinPath, 'utf-8');
+        return '(no existing advisor rule for this id — proposing a new one)';
+      }
+      case 'prompt-override': {
+        // target = 'global' | 'agent:<slug>' | 'job:<jobName>'
+        const filePath = promptOverridePathForTarget(target);
+        if (filePath && existsSync(filePath)) return readFileSync(filePath, 'utf-8');
+        return '(no existing prompt override for this scope — proposing a new one)';
       }
       default:
         return '';
@@ -1228,36 +1252,10 @@ export class SelfImproveLoop {
       return `Cannot resolve target path for area=${pending.area}, target=${pending.target}`;
     }
 
-    // Route source changes through the safe pipeline
+    // 'source' area is deprecated (Phase 1 quarantine). Reject up-front so a
+    // misbehaving proposal cannot reach the safeSourceEdit primitive.
     if (pending.area === 'source') {
-      const { safeSourceEdit } = await import('./safe-restart.js');
-      const result = await safeSourceEdit(PKG_DIR, [
-        { relativePath: `src/${pending.target}`, content: pending.proposedChange },
-      ], { experimentId, reason: `self-improve: ${pending.hypothesis.slice(0, 60)}`, description: pending.hypothesis });
-
-      if (!result.success) {
-        return `Source edit failed: ${result.error}${result.preflightErrors ? '\n' + result.preflightErrors.join('\n') : ''}`;
-      }
-
-      // Update experiment log — mark as approved
-      this.updateExperimentStatus(experimentId, 'approved');
-      try { unlinkSync(pendingFile); } catch { /* ignore */ }
-      const state = this.loadState();
-      state.pendingApprovals = Math.max(0, state.pendingApprovals - 1);
-      this.saveState(state);
-      // Schedule impact measurement for 24h later
-      try {
-        appendFileSync(IMPACT_CHECKS_FILE, JSON.stringify({
-          experimentId,
-          area: pending.area,
-          target: pending.target,
-          appliedAt: new Date().toISOString(),
-          checkAfterMs: 24 * 60 * 60 * 1000,
-        }) + '\n');
-      } catch (err) {
-        logger.warn({ err }, 'Failed to schedule impact check');
-      }
-      return `Applied source change to ${pending.target} — restart triggered.`;
+      return 'source area is deprecated — propose advisor-rule or prompt-override instead';
     }
 
     // Goal area: parse JSON, inject required fields, ensure parent dir exists
@@ -1312,6 +1310,7 @@ export class SelfImproveLoop {
     }
 
     // Write the change (non-source areas)
+    mkdirSync(path.dirname(targetPath), { recursive: true });
     writeFileSync(targetPath, pending.proposedChange);
     // Record version for rollback lineage
     this.recordVersion(experimentId, pending.area, pending.target, pending.hypothesis, pending.before);
@@ -1971,9 +1970,6 @@ export class SelfImproveLoop {
       case 'agent': {
         return path.join(AGENTS_DIR, target, 'agent.md');
       }
-      case 'source': {
-        return path.join(PKG_DIR, 'src', target);
-      }
       case 'communication':
         return AGENTS_FILE;
       case 'memory':
@@ -1985,6 +1981,11 @@ export class SelfImproveLoop {
         if (owner === 'clementine') return path.join(GOALS_DIR, `${goalSlug}.json`);
         return path.join(AGENTS_DIR, owner, 'goals', `${goalSlug}.json`);
       }
+      case 'advisor-rule':
+        if (!/^[a-z0-9-]+$/.test(target)) return null;
+        return path.join(BASE_DIR, 'advisor-rules', 'user', `${target}.yaml`);
+      case 'prompt-override':
+        return promptOverridePathForTarget(target);
       default:
         return null;
     }
@@ -2025,23 +2026,6 @@ export class SelfImproveLoop {
 // ── Utility ──────────────────────────────────────────────────────────
 
 /** Validate that a proposed change has valid syntax for its target area. */
-/** Files that must never be modified by self-improvement (catastrophic blast radius or self-referential). */
-const SOURCE_BLOCKLIST = new Set([
-  'config.ts',
-  'types.ts',
-  'gateway/router.ts',
-  'gateway/lanes.ts',
-  'gateway/heartbeat-scheduler.ts',
-  'gateway/cron-scheduler.ts',
-  'gateway/security-scanner.ts',
-  'agent/self-improve.ts',
-  'agent/safe-restart.ts',
-  'agent/source-mods.ts',
-  'cli/index.ts',
-  'cli/dashboard.ts',
-  'security/scanner.ts',
-]);
-
 export function validateProposal(area: string, target: string, proposedChange: string): { valid: boolean; error?: string } {
   if (!proposedChange.trim()) {
     return { valid: false, error: 'Proposed change is empty' };
@@ -2079,15 +2063,63 @@ export function validateProposal(area: string, target: string, proposedChange: s
     }
   }
   if (area === 'source') {
-    // Check blocklist
-    if (SOURCE_BLOCKLIST.has(target)) {
-      return { valid: false, error: `Source file '${target}' is in the blocklist and cannot be modified by self-improvement` };
+    // Deprecated — Phase 1 quarantined source self-edit. Reject up front so
+    // a misbehaving LLM proposal doesn't even get cached.
+    return { valid: false, error: 'source area is deprecated; propose advisor-rule or prompt-override instead' };
+  }
+  if (area === 'advisor-rule') {
+    // Must parse as YAML and have schemaVersion: 1, id matching target, when[], then[].
+    if (!/^[a-z0-9-]+$/.test(target)) {
+      return { valid: false, error: `advisor-rule target must be kebab-case (got "${target}")` };
     }
-    // Size sanity: reject wholesale rewrites (proposed content > 2x original would be caught by caller).
-    // Source proposals may be small patches or modules without import/export statements;
-    // callers that apply source changes do the syntax-aware validation.
+    let parsed: unknown;
+    try {
+      parsed = yamlLoad(proposedChange);
+    } catch (err) {
+      return { valid: false, error: `advisor-rule YAML parse error: ${err instanceof Error ? err.message : String(err)}` };
+    }
+    if (!parsed || typeof parsed !== 'object') {
+      return { valid: false, error: 'advisor-rule body did not parse as a YAML object' };
+    }
+    const r = parsed as Record<string, unknown>;
+    if (r.schemaVersion !== 1) return { valid: false, error: 'advisor-rule must declare schemaVersion: 1' };
+    if (typeof r.id !== 'string' || r.id !== target) {
+      return { valid: false, error: `advisor-rule id must match target ("${target}")` };
+    }
+    if (!Array.isArray(r.when) || !Array.isArray(r.then)) {
+      return { valid: false, error: 'advisor-rule must have when[] and then[] arrays' };
+    }
+  }
+  if (area === 'prompt-override') {
+    // target format: 'global' | 'agent:<slug>' | 'job:<jobName>'
+    const path = promptOverridePathForTarget(target);
+    if (!path) {
+      return { valid: false, error: `prompt-override target must be 'global', 'agent:<slug>', or 'job:<jobName>' (got "${target}")` };
+    }
+    if (proposedChange.length > 20_000) {
+      return { valid: false, error: 'prompt-override content exceeds 20KB sanity bound' };
+    }
   }
   return { valid: true };
+}
+
+/**
+ * Resolve the on-disk path for a prompt-override `target` string.
+ * Accepted forms: 'global', 'agent:<slug>', 'job:<jobName>'. Returns null
+ * for malformed targets.
+ */
+export function promptOverridePathForTarget(target: string): string | null {
+  const root = path.join(BASE_DIR, 'prompt-overrides');
+  if (target === 'global') return path.join(root, '_global.md');
+  const idx = target.indexOf(':');
+  if (idx <= 0) return null;
+  const scope = target.slice(0, idx);
+  const key = target.slice(idx + 1);
+  if (!key) return null;
+  if (/[\/\\\.]/.test(key)) return null;
+  if (scope === 'agent') return path.join(root, 'agents', `${key}.md`);
+  if (scope === 'job')   return path.join(root, 'jobs',   `${key}.md`);
+  return null;
 }
 
 function ensureDirs(): void {

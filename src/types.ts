@@ -597,7 +597,7 @@ export interface SelfImproveExperiment {
   startedAt: string;                   // ISO
   finishedAt: string;                  // ISO
   durationMs: number;
-  area: 'soul' | 'cron' | 'workflow' | 'memory' | 'agent' | 'source' | 'communication' | 'goal';
+  area: 'soul' | 'cron' | 'workflow' | 'memory' | 'agent' | 'source' | 'communication' | 'goal' | 'advisor-rule' | 'prompt-override';
   target: string;                      // e.g., "SOUL.md personality section"
   hypothesis: string;                  // What the LLM decided to try
   proposedChange: string;              // The actual modification
@@ -648,7 +648,7 @@ export interface SelfImproveConfig {
   maxDurationMs: number;               // Default: 3_600_000 (1 hour)
   acceptThreshold: number;             // Default: 0.6 (score must beat this)
   plateauLimit: number;                // Default: 3 consecutive low-score stops loop
-  areas: ('soul' | 'cron' | 'workflow' | 'memory' | 'agent' | 'source' | 'communication' | 'goal')[];
+  areas: ('soul' | 'cron' | 'workflow' | 'memory' | 'agent' | 'source' | 'communication' | 'goal' | 'advisor-rule' | 'prompt-override')[];
   /** Enable tiered auto-apply: low-risk changes apply without approval. Default: false. */
   autoApply?: boolean;
   /** Target a specific agent slug (for per-agent improvement cycles). */
