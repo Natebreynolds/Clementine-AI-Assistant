@@ -1,0 +1,20 @@
+schemaVersion: 1
+id: model-upgrade-on-error
+description: >
+  Upgrade haiku-tier models to sonnet when the SDK reports model_error
+  (precise signal that the model itself is the problem).
+priority: 40
+appliesTo:
+  jobMode: standard
+when:
+  - kind: modelContains
+    substring: haiku
+  - kind: recentTerminalReason
+    reason: model_error
+    window: 5
+    atLeast: 1
+then:
+  - kind: setModel
+    model: sonnet
+log:
+  reason: Upgrading model — SDK reported model_error

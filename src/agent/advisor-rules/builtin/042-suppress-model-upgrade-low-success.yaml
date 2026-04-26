@@ -1,0 +1,17 @@
+schemaVersion: 1
+id: suppress-model-upgrade-low-success
+description: >
+  Clear model upgrade if past decisions show model upgrades succeed
+  less than 20% of the time for this job.
+priority: 42
+when:
+  - kind: adviceFieldSet
+    field: adjustedModel
+  - kind: interventionStatBelow
+    stat: modelUpgradeSuccessRate
+    threshold: 0.2
+then:
+  - kind: clearAdviceField
+    field: adjustedModel
+log:
+  reason: Suppressing model upgrade — historically ineffective

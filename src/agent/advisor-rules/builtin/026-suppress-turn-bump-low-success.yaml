@@ -1,0 +1,17 @@
+schemaVersion: 1
+id: suppress-turn-bump-low-success
+description: >
+  Clear the maxTurns adjustment if past advisor decisions show turn
+  adjustments succeed less than 20% of the time for this job.
+priority: 26
+when:
+  - kind: adviceFieldSet
+    field: adjustedMaxTurns
+  - kind: interventionStatBelow
+    stat: turnAdjustSuccessRate
+    threshold: 0.2
+then:
+  - kind: clearAdviceField
+    field: adjustedMaxTurns
+log:
+  reason: Suppressing turn adjustment — historically ineffective

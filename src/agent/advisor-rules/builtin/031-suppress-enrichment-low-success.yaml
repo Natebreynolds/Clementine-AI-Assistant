@@ -1,0 +1,17 @@
+schemaVersion: 1
+id: suppress-enrichment-low-success
+description: >
+  Clear prompt enrichment if past decisions show enrichment succeeds
+  less than 20% of the time for this job.
+priority: 31
+when:
+  - kind: adviceFieldSet
+    field: promptEnrichment
+  - kind: interventionStatBelow
+    stat: enrichmentSuccessRate
+    threshold: 0.2
+then:
+  - kind: clearAdviceField
+    field: promptEnrichment
+log:
+  reason: Suppressing prompt enrichment — historically ineffective

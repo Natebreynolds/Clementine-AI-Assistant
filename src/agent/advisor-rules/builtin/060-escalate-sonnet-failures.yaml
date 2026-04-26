@@ -1,0 +1,22 @@
+schemaVersion: 1
+id: escalate-sonnet-failures
+description: >
+  Escalate to unleashed when a sonnet-tier job is still failing after a
+  potential model upgrade. Uses effectiveModelContains so it triggers
+  for jobs that started on sonnet AND for jobs upgraded to sonnet by
+  the model-upgrade rules.
+priority: 60
+appliesTo:
+  jobMode: standard
+when:
+  - kind: effectiveModelContains
+    substring: sonnet
+  - kind: recentErrorCount
+    window: 5
+    atLeast: 3
+then:
+  - kind: escalateWithReason
+    reason: "recent failures on sonnet-tier model"
+    reasonTemplate: "{{ recentErrorCount }} recent failures on sonnet-tier model"
+log:
+  reason: Recommending escalation to unleashed

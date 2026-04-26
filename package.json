@@ -1,6 +1,6 @@
 {
   "name": "clementine-agent",
-  "version": "1.0.94",
+  "version": "1.0.95",
   "description": "Clementine — Personal AI Assistant (TypeScript)",
   "type": "module",
   "main": "dist/index.js",
@@ -8,7 +8,8 @@
     "clementine": "dist/cli/index.js"
   },
   "scripts": {
-    "build": "rm -rf dist.tmp 2>/dev/null; tsc --outDir dist.tmp && rm -rf dist && mv dist.tmp dist && chmod +x dist/cli/index.js",
+    "build:assets": "mkdir -p dist/agent/advisor-rules/builtin && (cp src/agent/advisor-rules/builtin/*.yaml dist/agent/advisor-rules/builtin/ 2>/dev/null || true)",
+    "build": "rm -rf dist.tmp 2>/dev/null; tsc --outDir dist.tmp && rm -rf dist && mv dist.tmp dist && chmod +x dist/cli/index.js && npm run build:assets",
     "prepublishOnly": "npm run build && find dist -name '*.map' -delete",
     "dev": "tsx src/index.ts",
     "start": "node dist/index.js",
@@ -35,6 +36,7 @@
     "falkordblite": "^0.2.0",
     "grammy": "^1.35.0",
     "gray-matter": "^4.0.3",
+    "js-yaml": "^4.1.1",
     "mailparser": "^3.7.1",
     "mammoth": "^1.8.0",
     "multer": "^2.1.1",
@@ -47,6 +49,7 @@
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.13",
     "@types/express": "^5.0.0",
+    "@types/js-yaml": "^4.0.9",
     "@types/mailparser": "^3.4.5",
     "@types/node": "^22.12.0",
     "@types/node-cron": "^3.0.11",

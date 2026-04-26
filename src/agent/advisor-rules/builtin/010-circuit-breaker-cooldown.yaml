@@ -1,0 +1,18 @@
+schemaVersion: 1
+id: circuit-breaker-cooldown
+description: >
+  Skip the run when 5+ consecutive errors are followed by a recent (within
+  60min) run — circuit breaker is engaged and we are still cooling down.
+priority: 10
+when:
+  - kind: consecutiveErrorsAtLeast
+    count: 5
+  - kind: lastRunWithinMs
+    ms: 3600000
+then:
+  - kind: skipWithReason
+    reason: "consecutive errors — circuit breaker engaged"
+    reasonTemplate: "{{ consecutiveErrors }} consecutive errors — circuit breaker engaged (next probe in {{ cooldownProbeMin }}m)"
+stopOnFire: true
+log:
+  reason: Circuit breaker — cooling down

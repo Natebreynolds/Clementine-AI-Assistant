@@ -1,0 +1,20 @@
+schemaVersion: 1
+id: prompt-too-long
+description: >
+  When recent runs hit prompt-length limits, append conciseness guidance
+  rather than bumping turns. Runs before turn-limit-hits and shadows it
+  via skipIf so the turn-bump rule does not fire when prompt size is the
+  real constraint.
+priority: 20
+appliesTo:
+  jobMode: standard
+when:
+  - kind: recentTerminalReason
+    reason: prompt_too_long
+    window: 5
+    atLeast: 1
+then:
+  - kind: appendPromptEnrichment
+    text: "\n\n⚠ Previous runs hit prompt length limits. Be concise. Minimize system prompt injection."
+log:
+  reason: Prompt too long detected — adding conciseness guidance

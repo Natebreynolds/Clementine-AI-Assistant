@@ -1,0 +1,25 @@
+schemaVersion: 1
+id: escalate-sonnet-low-quality
+description: >
+  Escalate when a sonnet-tier job has 3+ low-quality reflections.
+  Companion to escalate-sonnet-failures; runs after so failures-based
+  reason wins if both apply.
+priority: 61
+appliesTo:
+  jobMode: standard
+skipIf:
+  - kind: adviceFieldSet
+    field: shouldEscalate
+when:
+  - kind: effectiveModelContains
+    substring: sonnet
+  - kind: lowQualityReflectionCount
+    window: 5
+    maxQuality: 2
+    atLeast: 3
+then:
+  - kind: escalateWithReason
+    reason: "low-quality reflections despite sonnet-tier model"
+    reasonTemplate: "{{ lowQualityReflectionCount }} low-quality reflections despite sonnet-tier model"
+log:
+  reason: Recommending escalation due to low-quality reflections

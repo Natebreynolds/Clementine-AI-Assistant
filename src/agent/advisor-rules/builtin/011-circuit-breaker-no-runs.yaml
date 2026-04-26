@@ -1,0 +1,15 @@
+schemaVersion: 1
+id: circuit-breaker-no-runs
+description: >
+  Defensive — if we have 5+ consecutive errors but no recent runs (state
+  divergence), skip without probe info. Should virtually never fire.
+priority: 11
+when:
+  - kind: consecutiveErrorsAtLeast
+    count: 5
+  - kind: noRecentRuns
+then:
+  - kind: skipWithReason
+    reason: "consecutive errors — circuit breaker engaged"
+    reasonTemplate: "{{ consecutiveErrors }} consecutive errors — circuit breaker engaged"
+stopOnFire: true

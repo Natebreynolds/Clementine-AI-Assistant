@@ -1,0 +1,17 @@
+schemaVersion: 1
+id: reflection-quality
+description: >
+  When reflections show consistently low quality, delegate to the prompt
+  evolver for prompt enrichment. Skips unleashed jobs.
+priority: 30
+appliesTo:
+  jobMode: standard
+when:
+  - kind: avgReflectionQualityBelow
+    window: 5
+    threshold: 3.0
+    minSamples: 3
+then:
+  - kind: invokePromptEvolver
+log:
+  reason: Built prompt enrichment via prompt evolver

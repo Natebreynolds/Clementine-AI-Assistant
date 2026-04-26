@@ -1,0 +1,24 @@
+schemaVersion: 1
+id: turn-limit-hits
+description: >
+  When recent runs hit max_turns, bump maxTurns up to the tier cap. Skips
+  unleashed jobs (they manage turns via UNLEASHED_PHASE_TURNS) and skips
+  when prompt_too_long is the real constraint.
+priority: 25
+appliesTo:
+  jobMode: standard
+skipIf:
+  - kind: recentTerminalReason
+    reason: prompt_too_long
+    window: 5
+    atLeast: 1
+when:
+  - kind: recentTerminalReason
+    reason: max_turns
+    window: 5
+    atLeast: 2
+then:
+  - kind: bumpMaxTurns
+    multiplier: 1.5
+log:
+  reason: Adjusting maxTurns due to turn-limit hits

@@ -1,0 +1,24 @@
+schemaVersion: 1
+id: escalate-low-confidence-completions
+description: >
+  When a job consistently completes successfully but produces low-quality
+  output (2+ low-quality reflections AND 2+ ok runs in the last 3),
+  flag for human review. Skips if any earlier rule already escalated.
+priority: 70
+skipIf:
+  - kind: adviceFieldSet
+    field: shouldEscalate
+when:
+  - kind: lowQualityReflectionCount
+    window: 3
+    maxQuality: 3
+    atLeast: 2
+  - kind: recentSuccessCountAtLeast
+    window: 3
+    atLeast: 2
+then:
+  - kind: escalateWithReason
+    reason: "Job completes but quality is consistently low — may need human review"
+    reasonTemplate: "Job completes but quality is consistently low ({{ lowQualityReflectionCount }}/3 reflections scored ≤3) — may need human review"
+log:
+  reason: Recommending escalation due to low-confidence completions

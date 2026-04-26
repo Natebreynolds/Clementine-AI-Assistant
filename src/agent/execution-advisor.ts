@@ -10,27 +10,29 @@ import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import pino from 'pino';
 
-import { CRON_REFLECTIONS_DIR, ADVISOR_LOG_PATH } from '../config.js';
+import { ADVISOR_RULES_LOADER, CRON_REFLECTIONS_DIR, ADVISOR_LOG_PATH } from '../config.js';
 import { CronRunLog } from '../gateway/heartbeat.js';
 import { evolvePrompt } from './prompt-evolver.js';
 import type { CronJobDefinition, ExecutionAdvice } from '../types.js';
 
 const logger = pino({ name: 'clementine.execution-advisor' });
+const shadowLogger = pino({ name: 'clementine.advisor-rules-shadow' });
 
 // ── Tier caps for maxTurns ──────────────────────────────────────────
 
-const TIER_MAX_TURNS: Record<number, number> = {
+export const TIER_MAX_TURNS: Record<number, number> = {
   1: 15,
   2: 50,
 };
 
-const DEFAULT_TIMEOUT_MS = 600_000;       // 10 minutes
-const MAX_TIMEOUT_MS = 20 * 60 * 1000;    // 20 minutes
-const CIRCUIT_BREAKER_COOLDOWN_MS = 60 * 60 * 1000; // 1 hour between retry probes
+export const DEFAULT_TIMEOUT_MS = 600_000;       // 10 minutes
+export const MAX_TIMEOUT_MS = 20 * 60 * 1000;    // 20 minutes
+export const CIRCUIT_BREAKER_COOLDOWN_MS = 60 * 60 * 1000; // 1 hour between retry probes
+export const DEFAULT_MAX_TURNS_FALLBACK = 5;     // when job.maxTurns is unset
 
 // ── Reflection entry shape (from JSONL) ─────────────────────────────
 
-interface ReflectionEntry {
+export interface ReflectionEntry {
   jobName: string;
   timestamp: string;
   existence: boolean;
@@ -135,7 +137,95 @@ export function getExecutionAdvice(jobName: string, job: CronJobDefinition): Exe
     logger.warn({ err, job: jobName }, 'Execution advisor error — proceeding with defaults');
   }
 
+  // Shadow mode: run the YAML rule engine on the same job, log any divergence
+  // from the legacy TS advice. Non-throwing — never affects the returned advice.
+  if (ADVISOR_RULES_LOADER === 'shadow') {
+    runShadowComparison(jobName, job, advice);
+  }
+
   return advice;
+}
+
+// ── Shadow-mode comparison ──────────────────────────────────────────
+
+let shadowInitialized = false;
+let shadowAvailable = false;
+type ShadowDeps = {
+  loadAdvisorRules: typeof import('./advisor-rules/loader.js').loadAdvisorRules;
+  getLoadedRules: typeof import('./advisor-rules/loader.js').getLoadedRules;
+  watchUserRulesDir: typeof import('./advisor-rules/loader.js').watchUserRulesDir;
+  buildRuleContext: typeof import('./advisor-rules/context.js').buildRuleContext;
+  applyRules: typeof import('./advisor-rules/engine.js').applyRules;
+};
+let shadowDeps: ShadowDeps | null = null;
+
+async function ensureShadowInitialized(): Promise<void> {
+  if (shadowInitialized) return;
+  shadowInitialized = true;
+  try {
+    const [loaderMod, contextMod, engineMod] = await Promise.all([
+      import('./advisor-rules/loader.js'),
+      import('./advisor-rules/context.js'),
+      import('./advisor-rules/engine.js'),
+    ]);
+    shadowDeps = {
+      loadAdvisorRules: loaderMod.loadAdvisorRules,
+      getLoadedRules: loaderMod.getLoadedRules,
+      watchUserRulesDir: loaderMod.watchUserRulesDir,
+      buildRuleContext: contextMod.buildRuleContext,
+      applyRules: engineMod.applyRules,
+    };
+    shadowDeps.loadAdvisorRules();
+    shadowDeps.watchUserRulesDir();
+    shadowAvailable = true;
+    shadowLogger.info('Advisor rules shadow mode initialized');
+  } catch (err) {
+    shadowLogger.warn({ err }, 'Failed to initialize advisor rules shadow mode');
+  }
+}
+
+function runShadowComparison(jobName: string, job: CronJobDefinition, tsAdvice: ExecutionAdvice): void {
+  // Fire-and-forget: kicks off async init the first time, then runs comparison
+  // synchronously on subsequent calls. Never throws.
+  ensureShadowInitialized()
+    .then(() => {
+      if (!shadowAvailable || !shadowDeps) return;
+      try {
+        const rules = shadowDeps.getLoadedRules();
+        const ctx = shadowDeps.buildRuleContext(jobName, job);
+        const { advice: yamlAdvice, traces } = shadowDeps.applyRules(rules, ctx);
+        const diffs = diffAdvice(tsAdvice, yamlAdvice);
+        if (diffs.length > 0) {
+          shadowLogger.warn(
+            { jobName, diffs, firedRules: traces.filter(t => t.fired).map(t => t.ruleId) },
+            'Shadow advisor diverged from TS path',
+          );
+        } else {
+          shadowLogger.debug(
+            { jobName, firedRules: traces.filter(t => t.fired).map(t => t.ruleId) },
+            'Shadow advisor matches TS path',
+          );
+        }
+      } catch (err) {
+        shadowLogger.warn({ err, jobName }, 'Shadow advisor run failed');
+      }
+    })
+    .catch(() => { /* unreachable — ensureShadowInitialized swallows */ });
+}
+
+function diffAdvice(a: ExecutionAdvice, b: ExecutionAdvice): Array<{ field: string; ts: unknown; yaml: unknown }> {
+  const fields: Array<keyof ExecutionAdvice> = [
+    'adjustedMaxTurns', 'adjustedModel', 'adjustedTimeoutMs',
+    'promptEnrichment', 'shouldEscalate', 'shouldSkip',
+    'escalationReason', 'skipReason',
+  ];
+  const out: Array<{ field: string; ts: unknown; yaml: unknown }> = [];
+  for (const f of fields) {
+    const ta = a[f] ?? null;
+    const tb = b[f] ?? null;
+    if (ta !== tb) out.push({ field: f, ts: ta, yaml: tb });
+  }
+  return out;
 }
 
 // ── Rule helpers ────────────────────────────────────────────────────
@@ -172,7 +262,7 @@ export function checkTurnLimitHits(
   }
 
   if (turnLimitHits.length >= 2) {
-    const currentMax = job.maxTurns ?? 5;
+    const currentMax = job.maxTurns ?? DEFAULT_MAX_TURNS_FALLBACK;
     const tierCap = TIER_MAX_TURNS[job.tier] ?? TIER_MAX_TURNS[1];
     const proposed = Math.ceil(currentMax * 1.5);
     advice.adjustedMaxTurns = Math.min(proposed, tierCap);
@@ -277,7 +367,7 @@ function checkEscalation(
 
 // ── Outcome learning ─────────────────────────────────────────────────
 
-interface InterventionStats {
+export interface InterventionStats {
   modelUpgradeSuccessRate: number | null;
   turnAdjustSuccessRate: number | null;
   enrichmentSuccessRate: number | null;
@@ -288,7 +378,7 @@ interface InterventionStats {
  * Read past advisor outcomes to learn which interventions actually work
  * for a given job. Returns null rates when insufficient data exists.
  */
-function getInterventionStats(jobName: string): InterventionStats {
+export function getInterventionStats(jobName: string): InterventionStats {
   const stats: InterventionStats = {
     modelUpgradeSuccessRate: null,
     turnAdjustSuccessRate: null,
@@ -335,7 +425,7 @@ function getInterventionStats(jobName: string): InterventionStats {
 
 // ── Reflection file reader ──────────────────────────────────────────
 
-function readReflections(jobName: string): ReflectionEntry[] {
+export function readReflections(jobName: string): ReflectionEntry[] {
   try {
     const safeJob = jobName.replace(/[^a-zA-Z0-9_-]/g, '_');
     const reflPath = path.join(CRON_REFLECTIONS_DIR, `${safeJob}.jsonl`);

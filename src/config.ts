@@ -415,6 +415,19 @@ export const ALLOW_SOURCE_EDITS = (() => {
   return raw === '1' || raw === 'true' || raw === 'yes';
 })();
 
+// Advisor rule engine mode:
+//   off     — no rule loader (default, identical to pre-2a behavior)
+//   shadow  — rule engine runs alongside the legacy TS path; differences
+//             are logged but TS path's advice is what's returned.
+//   primary — rule engine is the source of truth; TS path is dead code.
+//             (Reserved for Phase 2b — not yet wired.)
+export const ADVISOR_RULES_LOADER: 'off' | 'shadow' | 'primary' = (() => {
+  const raw = getEnv('CLEMENTINE_ADVISOR_RULES_LOADER', '').toLowerCase().trim();
+  if (raw === 'shadow') return 'shadow';
+  if (raw === 'primary') return 'primary';
+  return 'off';
+})();
+
 // ── API ──────────────────────────────────────────────────────────────
 
 // Long-lived OAuth token from `clementine login` / `claude setup-token`.

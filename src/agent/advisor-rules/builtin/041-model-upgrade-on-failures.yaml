@@ -1,0 +1,22 @@
+schemaVersion: 1
+id: model-upgrade-on-failures
+description: >
+  Fallback model upgrade when haiku-tier shows 3+ recent failures even
+  without an explicit model_error signal.
+priority: 41
+appliesTo:
+  jobMode: standard
+skipIf:
+  - kind: adviceFieldSet
+    field: adjustedModel
+when:
+  - kind: modelContains
+    substring: haiku
+  - kind: recentErrorCount
+    window: 5
+    atLeast: 3
+then:
+  - kind: setModel
+    model: sonnet
+log:
+  reason: Upgrading model from haiku to sonnet due to repeated failures

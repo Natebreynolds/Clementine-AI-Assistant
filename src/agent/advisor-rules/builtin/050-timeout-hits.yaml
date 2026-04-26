@@ -1,0 +1,18 @@
+schemaVersion: 1
+id: timeout-hits
+description: >
+  Bump timeout when 2+ recent runs ran past 95% of the standard cron
+  timeout. Skips unleashed jobs (different timeout model).
+priority: 50
+appliesTo:
+  jobMode: standard
+when:
+  - kind: recentTimeoutHits
+    window: 5
+    atLeast: 2
+    thresholdRatio: 0.95
+then:
+  - kind: bumpTimeoutMs
+    multiplier: 1.5
+log:
+  reason: Adjusting timeout due to timeout hits
