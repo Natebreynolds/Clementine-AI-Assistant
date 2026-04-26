@@ -16,7 +16,7 @@ import { randomBytes } from 'node:crypto';
 import path from 'node:path';
 import pino from 'pino';
 
-import { BASE_DIR } from '../config.js';
+import { ALLOW_SOURCE_EDITS, BASE_DIR } from '../config.js';
 import { preflightSourceChange } from './source-preflight.js';
 import { recordSourceMod } from './source-mods.js';
 import type { RestartSentinel } from '../types.js';
@@ -24,6 +24,12 @@ import type { RestartSentinel } from '../types.js';
 const logger = pino({ name: 'clementine.safe-restart' });
 
 const SENTINEL_PATH = path.join(BASE_DIR, '.restart-sentinel.json');
+
+const DEPRECATION_MESSAGE =
+  'Source self-editing is disabled. Use advisor-rule YAML, CRON.md frontmatter, ' +
+  'or prompt-override markdown instead — those land without a restart and survive ' +
+  'npm updates. Set CLEMENTINE_ALLOW_SOURCE_EDITS=1 in ~/.clementine/.env only for ' +
+  'genuine engine bugs that cannot be expressed as data.';
 
 /** Files that cannot be self-edited (security-critical or self-referential). */
 const BLOCKLIST = new Set([
@@ -65,6 +71,15 @@ export async function safeSourceEdit(
   opts?: { experimentId?: string; reason?: string; sessionKey?: string; description?: string },
 ): Promise<SafeEditResult> {
   const reason = opts?.reason ?? 'source self-edit';
+
+  // Quarantine: source self-edit is deprecated. Off by default.
+  if (!ALLOW_SOURCE_EDITS) {
+    logger.warn(
+      { fileCount: changes.length, files: changes.map(c => c.relativePath), reason },
+      'Source self-edit refused — primitive is disabled',
+    );
+    return { success: false, error: DEPRECATION_MESSAGE };
+  }
 
   // Validate against blocklist
   for (const change of changes) {

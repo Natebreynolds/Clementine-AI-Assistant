@@ -7,7 +7,7 @@
 
 import express from 'express';
 import pino from 'pino';
-import { WEBHOOK_PORT, WEBHOOK_SECRET } from '../config.js';
+import { WEBHOOK_BIND, WEBHOOK_PORT, WEBHOOK_SECRET } from '../config.js';
 import type { Gateway } from '../gateway/router.js';
 
 const logger = pino({ name: 'clementine.webhook' });
@@ -15,6 +15,12 @@ const logger = pino({ name: 'clementine.webhook' });
 // ── Entry point ───────────────────────────────────────────────────────
 
 export async function startWebhook(gateway: Gateway): Promise<void> {
+  if (!WEBHOOK_SECRET) {
+    throw new Error(
+      'WEBHOOK_ENABLED=true requires WEBHOOK_SECRET to be set. Refusing to start an unauthenticated webhook server.',
+    );
+  }
+
   const app = express();
   app.use(express.json());
 
@@ -77,9 +83,9 @@ export async function startWebhook(gateway: Gateway): Promise<void> {
     }
   });
 
-  // ── GET /api/status — health check ────────────────────────────────
+  // ── GET /api/status — health check (auth-gated to avoid uptime leakage) ──
 
-  app.get('/api/status', (_req, res) => {
+  app.get('/api/status', requireAuth, (_req, res) => {
     res.json({
       status: 'ok',
       uptime: process.uptime(),
@@ -90,9 +96,13 @@ export async function startWebhook(gateway: Gateway): Promise<void> {
   // ── Start server ──────────────────────────────────────────────────
 
   const port = WEBHOOK_PORT;
+  const bind = WEBHOOK_BIND;
+  if (bind !== '127.0.0.1' && bind !== 'localhost') {
+    logger.warn({ bind }, '⚠ Webhook bound to non-localhost address — bearer auth is your only protection. Prefer tunneling (cloudflared) over exposing directly.');
+  }
   await new Promise<void>((resolve) => {
-    app.listen(port, '0.0.0.0', () => {
-      logger.info(`Webhook API server listening on port ${port}`);
+    app.listen(port, bind, () => {
+      logger.info({ bind, port }, 'Webhook API server listening');
       resolve();
     });
   });

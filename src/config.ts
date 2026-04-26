@@ -210,6 +210,9 @@ export const WHATSAPP_WEBHOOK_PORT = parseInt(getEnv('WHATSAPP_WEBHOOK_PORT', '8
 export const WEBHOOK_ENABLED = getEnv('WEBHOOK_ENABLED', 'false').toLowerCase() === 'true';
 export const WEBHOOK_PORT = parseInt(getEnv('WEBHOOK_PORT', '8420'), 10);
 export const WEBHOOK_SECRET = getSecret('WEBHOOK_SECRET');
+// Default bind to localhost only — flip to 0.0.0.0 explicitly via WEBHOOK_BIND
+// for tunneled or LAN-exposed setups. Avoids the OpenClaw CVE-2026-25253 shape.
+export const WEBHOOK_BIND = getEnv('WEBHOOK_BIND', '127.0.0.1');
 
 // ── Voice ────────────────────────────────────────────────────────────
 
@@ -401,6 +404,16 @@ export const REMOTE_ACCESS_CONFIG = path.join(BASE_DIR, 'remote-access.json');
 // ── Source Self-Edit Staging ─────────────────────────────────────────
 
 export const STAGING_DIR = path.join(BASE_DIR, 'staging');
+
+// Source self-editing is deprecated. The data-driven path (advisor rules,
+// CRON.md frontmatter, prompt overrides) is the supported way to evolve
+// behavior without requiring a new release. Set CLEMENTINE_ALLOW_SOURCE_EDITS=1
+// in ~/.clementine/.env to re-enable for genuine engine bugs that can't be
+// expressed as data — the primitive itself stays on disk for that escape hatch.
+export const ALLOW_SOURCE_EDITS = (() => {
+  const raw = getEnv('CLEMENTINE_ALLOW_SOURCE_EDITS', '').toLowerCase().trim();
+  return raw === '1' || raw === 'true' || raw === 'yes';
+})();
 
 // ── API ──────────────────────────────────────────────────────────────
 

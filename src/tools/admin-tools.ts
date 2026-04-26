@@ -20,6 +20,7 @@ import {
   BASE_DIR, CRON_FILE, SYSTEM_DIR,
   env, getStore, logger, textResult,
 } from './shared.js';
+import { ALLOW_SOURCE_EDITS } from '../config.js';
 import { getInteractionSource } from '../agent/hooks.js';
 import { renameSync } from 'node:fs';
 import * as keychain from '../secrets/keychain.js';
@@ -1930,13 +1931,30 @@ const PENDING_SOURCE_DIR = path.join(SELF_IMPROVE_DIR, 'pending-source-changes')
 
 server.tool(
   'self_edit_source',
-  'Edit most Clementine TypeScript source files (for new features or bug fixes). Validates in a staging worktree, compiles, and triggers restart on success. Blocked files: `src/config.ts`, `src/gateway/security-scanner.ts`, `src/security/scanner.ts`. Do NOT use this tool to change user-tunable settings (budget caps, model tier, heartbeat interval, timezone, channel IDs, etc.) — those live in `~/.clementine/.env` and are managed by the user via `clementine config set KEY value`, which survives `clementine update` / `npm update -g`.',
+  'DEPRECATED — source self-editing is disabled. Improvements should be expressed as data, not TypeScript: edit advisor rules in ~/.clementine/advisor-rules/, CRON.md frontmatter, or prompt overrides. Those land without a restart and survive npm updates. Only re-enabled (CLEMENTINE_ALLOW_SOURCE_EDITS=1) for genuine engine bugs that cannot be expressed as data.',
   {
-    file: z.string().describe('Path relative to src/ (e.g., "channels/discord-agent-bot.ts")'),
+    file: z.string().describe('Path relative to src/'),
     content: z.string().describe('Complete new file content'),
     reason: z.string().describe('Why this change is being made'),
   },
-  async ({ file, content, reason }) => {
+  async ({ file, content: _content, reason }) => {
+    if (!ALLOW_SOURCE_EDITS) {
+      logger.warn(
+        { file, reason },
+        'self_edit_source called while disabled — rejecting',
+      );
+      return textResult(
+        'Source self-editing is disabled. The fix you want belongs in user-space data, not engine TypeScript:\n' +
+        '  • Cron job behavior → edit ~/.clementine/vault/00-System/CRON.md frontmatter\n' +
+        '  • Advisor logic → write a YAML file in ~/.clementine/advisor-rules/ (coming in next phase)\n' +
+        '  • Prompt content → edit the per-job prompt in CRON.md\n' +
+        '  • Agent behavior → edit the agent.md / SOUL.md\n\n' +
+        'Those changes land without a restart and survive `npm update -g clementine`. ' +
+        'If this is a genuine engine bug that cannot be expressed as data, ask the owner to set ' +
+        'CLEMENTINE_ALLOW_SOURCE_EDITS=1 in ~/.clementine/.env.',
+      );
+    }
+
     // Security blocklist
     const BLOCKLIST = ['config.ts', 'gateway/security-scanner.ts', 'security/scanner.ts'];
     if (BLOCKLIST.some(b => file === b || file.startsWith(b))) {
@@ -1952,7 +1970,7 @@ server.tool(
     const pending = {
       id,
       file: `src/${file}`,
-      content,
+      content: _content,
       reason,
       createdAt: new Date().toISOString(),
     };

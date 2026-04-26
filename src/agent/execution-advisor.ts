@@ -140,11 +140,15 @@ export function getExecutionAdvice(jobName: string, job: CronJobDefinition): Exe
 
 // ── Rule helpers ────────────────────────────────────────────────────
 
-function checkTurnLimitHits(
+export function checkTurnLimitHits(
   runs: ReturnType<CronRunLog['readRecent']>,
   job: CronJobDefinition,
   advice: ExecutionAdvice,
 ): void {
+  // Unleashed jobs manage per-phase turns via UNLEASHED_PHASE_TURNS, not job.maxTurns.
+  // Bumping maxTurns here would override the unleashed limit with a small value.
+  if (job.mode === 'unleashed') return;
+
   // Use precise TerminalReason when available, fall back to regex on error text
   const turnLimitHits = runs.slice(0, 5).filter(r => {
     if (r.status !== 'error' && r.status !== 'retried') return false;
@@ -176,11 +180,13 @@ function checkTurnLimitHits(
   }
 }
 
-function checkReflectionQuality(
+export function checkReflectionQuality(
   reflections: ReflectionEntry[],
   job: CronJobDefinition,
   advice: ExecutionAdvice,
 ): void {
+  if (job.mode === 'unleashed') return;
+
   const recent = reflections.slice(0, 5); // already newest-first
   if (recent.length < 3) return;
 
@@ -223,11 +229,13 @@ function checkModelUpgrade(
   }
 }
 
-function checkTimeoutHits(
+export function checkTimeoutHits(
   runs: ReturnType<CronRunLog['readRecent']>,
   job: CronJobDefinition,
   advice: ExecutionAdvice,
 ): void {
+  if (job.mode === 'unleashed') return;
+
   const timeoutMs = DEFAULT_TIMEOUT_MS; // standard cron timeout
   const threshold = timeoutMs * 0.95;
 

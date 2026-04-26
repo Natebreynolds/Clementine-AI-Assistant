@@ -58,9 +58,11 @@ const DEFAULT_CONFIG: SelfImproveConfig = {
   maxDurationMs: 3_600_000,         // 1 hour
   acceptThreshold: 0.7,
   plateauLimit: 3,
-  areas: ['soul', 'cron', 'workflow', 'memory', 'agent', 'source', 'communication', 'goal'],
+  // 'source' deprecated — self-improvement should produce data (cron, workflow, etc.),
+  // not engine TS edits. Re-add only with CLEMENTINE_ALLOW_SOURCE_EDITS=1.
+  areas: ['soul', 'cron', 'workflow', 'memory', 'agent', 'communication', 'goal'],
   autoApply: true,
-  sourceMode: 'propose-only',
+  sourceMode: 'skip',
 };
 
 // ── Paths ────────────────────────────────────────────────────────────
