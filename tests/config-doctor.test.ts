@@ -104,20 +104,37 @@ describe('runDoctor', () => {
     expect(r.findings.find(f => f.message.includes('exceeds BUDGET_CRON_T2_USD'))).toBeDefined();
   });
 
-  it('flags plaintext credentials in .env', () => {
+  it('does NOT warn about plaintext credentials in .env (v1.1.4+ policy: .env IS the default)', () => {
     writeFileSync(
       path.join(baseDir, '.env'),
       // pragma: allowlist secret
       'STRIPE_API_KEY=placeholder-credential-value-1234567890abcdef\n',
     );
     const r = runDoctor(baseDir);
-    const finding = r.findings.find(f => f.key === 'STRIPE_API_KEY');
-    expect(finding).toBeDefined();
-    expect(finding!.severity).toBe('warning');
-    expect(finding!.message).toContain('plaintext');
+    expect(r.findings.find(f => f.key === 'STRIPE_API_KEY')).toBeUndefined();
   });
 
-  it('does not flag short plaintext values (likely config not credentials)', () => {
+  it('flags world-readable .env permissions', () => {
+    const envPath = path.join(baseDir, '.env');
+    writeFileSync(envPath, 'OWNER_NAME=Nate\n');
+    // chmod 644 — readable by group + others
+    require('node:fs').chmodSync(envPath, 0o644);
+    const r = runDoctor(baseDir);
+    const finding = r.findings.find(f => f.message.includes('readable by other users'));
+    expect(finding).toBeDefined();
+    expect(finding!.severity).toBe('error');
+    expect(finding!.fix).toContain('chmod 600');
+  });
+
+  it('does not flag mode 0600 .env', () => {
+    const envPath = path.join(baseDir, '.env');
+    writeFileSync(envPath, 'OWNER_NAME=Nate\n');
+    require('node:fs').chmodSync(envPath, 0o600);
+    const r = runDoctor(baseDir);
+    expect(r.findings.find(f => f.message.includes('readable by other users'))).toBeUndefined();
+  });
+
+  it('does not flag short plaintext values (was a config-shape false-positive guard)', () => {
     writeFileSync(path.join(baseDir, '.env'), 'WEBHOOK_PORT=8420\n');
     const r = runDoctor(baseDir);
     expect(r.findings.find(f => f.key === 'WEBHOOK_PORT')).toBeUndefined();

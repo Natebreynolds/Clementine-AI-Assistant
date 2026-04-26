@@ -17,7 +17,6 @@
 import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { computeEffectiveConfig, type EffectiveConfig } from './effective-config.js';
-import { isSensitiveEnvKey } from '../secrets/sensitivity.js';
 
 export type Severity = 'error' | 'warning' | 'info';
 
@@ -206,32 +205,30 @@ function checkChannelRequirements(cfg: EffectiveConfig, findings: Finding[]): vo
 }
 
 function checkPlaintextSecretsInEnv(_cfg: EffectiveConfig, baseDir: string, findings: Finding[]): void {
-  // Scan .env directly for sensitive-looking keys that hold long plaintext
-  // values. Stops bot tokens from quietly sitting in .env when they should
-  // be in the keychain.
+  // Sanity check on .env file permissions.
+  //
+  // History: this function previously WARNED whenever credential-shaped keys
+  // (DISCORD_TOKEN, *_API_KEY, etc.) sat as plaintext in .env, recommending
+  // migration to the macOS Keychain. After the 2026-04-26 rabbit hole
+  // (commits 88cfd99 .. c5a2eb5) we reversed that recommendation: plaintext
+  // .env at mode 0600 is the supported default, and keychain is opt-in only.
+  // The old warning is now misleading guidance, so it's removed.
+  //
+  // What we DO check: file mode. If .env is world-readable or group-readable
+  // we flag that as a real risk regardless of what's inside.
   const envPath = path.join(baseDir, '.env');
   if (!existsSync(envPath)) return;
-  let raw: string;
-  try { raw = readFileSync(envPath, 'utf-8'); }
-  catch { return; }
-
-  for (const line of raw.split('\n')) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith('#')) continue;
-    const eq = trimmed.indexOf('=');
-    if (eq === -1) continue;
-    const key = trimmed.slice(0, eq);
-    const value = trimmed.slice(eq + 1);
-    if (!isSensitiveEnvKey(key)) continue;
-    if (value.startsWith('keychain:')) continue; // already a ref — fine
-    if (value.length < 16) continue; // probably a config-shaped value (port number, etc.)
-    findings.push({
-      severity: 'warning',
-      key,
-      message: `${key} is stored as plaintext in .env. Credential-shaped keys should live in the keychain on macOS.`,
-      fix: `# In a chat with Clementine: env_set ${key} <value> storage=auto  (auto routes credentials to keychain)`,
-    });
-  }
+  try {
+    const st = require('node:fs').statSync(envPath) as { mode: number };
+    const worldOrGroupReadable = (st.mode & 0o077) !== 0;
+    if (worldOrGroupReadable) {
+      findings.push({
+        severity: 'error',
+        message: `.env file is readable by other users (mode ${(st.mode & 0o777).toString(8)}). Restrict to owner-only.`,
+        fix: `chmod 600 ${envPath}`,
+      });
+    }
+  } catch { /* stat failed — non-fatal, doctor continues */ }
 }
 
 function checkRangeSanity(cfg: EffectiveConfig, findings: Finding[]): void {
