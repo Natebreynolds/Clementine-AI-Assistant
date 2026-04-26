@@ -92,19 +92,17 @@ export const IDENTITY_FILE = path.join(SYSTEM_DIR, 'IDENTITY.md');
 // ── Assistant identity ───────────────────────────────────────────────
 
 // JSON config — loaded once at module init. Lower precedence than .env.
-import { loadClementineJson } from './config/clementine-json.js';
+import { loadClementineJson, resolveNumber, resolveString } from './config/clementine-json.js';
 const json = loadClementineJson(BASE_DIR);
 
-/**
- * Resolve a value with full precedence: process.env > .env > clementine.json > default.
- * `getEnv` already covers the first two (process.env wins inside getEnv), so this
- * helper just adds JSON as a fallback before the hardcoded default.
- */
+/** Wrap resolveString with this module's getEnv lookup so call sites stay terse. */
 function getEnvOrJson(envKey: string, jsonValue: string | undefined, fallback: string): string {
-  const fromEnv = getEnv(envKey, '');
-  if (fromEnv) return fromEnv;
-  if (jsonValue) return jsonValue;
-  return fallback;
+  return resolveString(getEnv(envKey, ''), jsonValue, fallback);
+}
+
+/** Numeric variant — env > JSON > default; non-finite env is ignored. */
+function getEnvOrJsonNumber(envKey: string, jsonValue: number | undefined, fallback: number): number {
+  return resolveNumber(getEnv(envKey, ''), jsonValue, fallback);
 }
 
 export const ASSISTANT_NAME = getEnvOrJson('ASSISTANT_NAME', json.assistantName, 'Clementine');
@@ -136,20 +134,21 @@ function getSecret(envKey: string, keychainService?: string): string {
 // ── Models ───────────────────────────────────────────────────────────
 
 export const MODELS: Models = {
-  haiku: 'claude-haiku-4-5-20251001',
-  sonnet: 'claude-sonnet-4-6',
-  opus: 'claude-opus-4-6',
+  haiku: getEnvOrJson('HAIKU_MODEL', json.models?.haiku, 'claude-haiku-4-5-20251001'),
+  sonnet: getEnvOrJson('SONNET_MODEL', json.models?.sonnet, 'claude-sonnet-4-6'),
+  opus: getEnvOrJson('OPUS_MODEL', json.models?.opus, 'claude-opus-4-6'),
 };
 
 // ── Budget caps (USD per query) ──────────────────────────────────────
 // User-tunable via `clementine config set BUDGET_<NAME>_USD <value>`
-// (writes to ~/.clementine/.env, survives npm update -g).
+// (writes to ~/.clementine/.env, survives npm update -g) or via
+// `budgets.*` keys in clementine.json.
 
 export const BUDGET = {
-  heartbeat: Number(getEnv('BUDGET_HEARTBEAT_USD', '0.50')),     // per heartbeat (Haiku)
-  cronT1: Number(getEnv('BUDGET_CRON_T1_USD', '2.00')),          // per tier-1 cron job
-  cronT2: Number(getEnv('BUDGET_CRON_T2_USD', '5.00')),          // per tier-2 cron job
-  chat: Number(getEnv('BUDGET_CHAT_USD', '5.00')),               // per interactive chat
+  heartbeat: getEnvOrJsonNumber('BUDGET_HEARTBEAT_USD', json.budgets?.heartbeat, 0.50), // per heartbeat (Haiku)
+  cronT1: getEnvOrJsonNumber('BUDGET_CRON_T1_USD', json.budgets?.cronT1, 2.00),         // per tier-1 cron job
+  cronT2: getEnvOrJsonNumber('BUDGET_CRON_T2_USD', json.budgets?.cronT2, 5.00),         // per tier-2 cron job
+  chat: getEnvOrJsonNumber('BUDGET_CHAT_USD', json.budgets?.chat, 5.00),                // per interactive chat
   unleashedPhase: undefined,
   memoryExtraction: undefined,
   summarization: undefined,
@@ -182,7 +181,7 @@ export const TASK_BUDGET_TOKENS = {
   chat: optionalTokenEnv('TASK_BUDGET_CHAT', undefined),
 };
 
-export const DEFAULT_MODEL_TIER = (getEnv('DEFAULT_MODEL_TIER', 'sonnet')) as keyof Models;
+export const DEFAULT_MODEL_TIER = (getEnvOrJson('DEFAULT_MODEL_TIER', json.models?.default, 'sonnet')) as keyof Models;
 export const MODEL = MODELS[DEFAULT_MODEL_TIER] ?? MODELS.sonnet;
 
 /** Enable 1M context window for Sonnet (beta). Toggle via ENABLE_1M_CONTEXT=true in .env or dashboard. */
@@ -267,20 +266,32 @@ export const TIMEZONE = getEnvOrJson('TIMEZONE', json.timezone, Intl.DateTimeFor
 
 // ── Heartbeat ────────────────────────────────────────────────────────
 
-export const HEARTBEAT_INTERVAL_MINUTES = parseInt(getEnv('HEARTBEAT_INTERVAL_MINUTES', '30'), 10) || 30;
-export const HEARTBEAT_ACTIVE_START = parseInt(getEnv('HEARTBEAT_ACTIVE_START', '8'), 10);
-export const HEARTBEAT_ACTIVE_END = parseInt(getEnv('HEARTBEAT_ACTIVE_END', '22'), 10);
+export const HEARTBEAT_INTERVAL_MINUTES = Math.floor(
+  getEnvOrJsonNumber('HEARTBEAT_INTERVAL_MINUTES', json.heartbeat?.intervalMinutes, 30),
+) || 30;
+export const HEARTBEAT_ACTIVE_START = Math.floor(
+  getEnvOrJsonNumber('HEARTBEAT_ACTIVE_START', json.heartbeat?.activeStart, 8),
+);
+export const HEARTBEAT_ACTIVE_END = Math.floor(
+  getEnvOrJsonNumber('HEARTBEAT_ACTIVE_END', json.heartbeat?.activeEnd, 22),
+);
 export const HEARTBEAT_MAX_TURNS = 5;
 export const HEARTBEAT_WORK_QUEUE_FILE = path.join(BASE_DIR, 'heartbeat', 'work-queue.json');
 
 // ── Unleashed mode ──────────────────────────────────────────────────
 
 /** Max turns per phase in unleashed mode before checkpointing. */
-export const UNLEASHED_PHASE_TURNS = 75;
+export const UNLEASHED_PHASE_TURNS = Math.floor(
+  getEnvOrJsonNumber('UNLEASHED_PHASE_TURNS', json.unleashed?.phaseTurns, 75),
+);
 /** Default max duration for unleashed tasks (hours). */
-export const UNLEASHED_DEFAULT_MAX_HOURS = 6;
+export const UNLEASHED_DEFAULT_MAX_HOURS = getEnvOrJsonNumber(
+  'UNLEASHED_DEFAULT_MAX_HOURS', json.unleashed?.defaultMaxHours, 6,
+);
 /** Max phases before forcing completion. */
-export const UNLEASHED_MAX_PHASES = 50;
+export const UNLEASHED_MAX_PHASES = Math.floor(
+  getEnvOrJsonNumber('UNLEASHED_MAX_PHASES', json.unleashed?.maxPhases, 50),
+);
 
 // ── Workspace ───────────────────────────────────────────────────────
 

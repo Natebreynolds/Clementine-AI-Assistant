@@ -81,6 +81,24 @@ export const migration: Migration = {
     if (bC !== undefined) budgets.chat = bC;
     if (Object.keys(budgets).length > 0) out.budgets = budgets;
 
+    const heartbeat: Record<string, number> = {};
+    const hI = num(env['HEARTBEAT_INTERVAL_MINUTES']);
+    const hS = num(env['HEARTBEAT_ACTIVE_START']);
+    const hE = num(env['HEARTBEAT_ACTIVE_END']);
+    if (hI !== undefined) heartbeat.intervalMinutes = hI;
+    if (hS !== undefined) heartbeat.activeStart = hS;
+    if (hE !== undefined) heartbeat.activeEnd = hE;
+    if (Object.keys(heartbeat).length > 0) out.heartbeat = heartbeat;
+
+    const unleashed: Record<string, number> = {};
+    const uPT = num(env['UNLEASHED_PHASE_TURNS']);
+    const uMH = num(env['UNLEASHED_DEFAULT_MAX_HOURS']);
+    const uMP = num(env['UNLEASHED_MAX_PHASES']);
+    if (uPT !== undefined) unleashed.phaseTurns = uPT;
+    if (uMH !== undefined) unleashed.defaultMaxHours = uMH;
+    if (uMP !== undefined) unleashed.maxPhases = uMP;
+    if (Object.keys(unleashed).length > 0) out.unleashed = unleashed;
+
     // Write as JSON with a leading comment-as-docstring isn't valid JSON.
     // Instead we ship a sibling README that explains, and keep the JSON pure.
     const tmp = `${targetPath}.${process.pid}.${Date.now()}.tmp`;

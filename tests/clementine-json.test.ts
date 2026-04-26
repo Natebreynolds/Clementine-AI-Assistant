@@ -5,6 +5,8 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
   _resetClementineJsonCache,
   loadClementineJson,
+  resolveNumber,
+  resolveString,
 } from '../src/config/clementine-json.js';
 import { migration as migration0005 } from '../src/vault-migrations/0005-create-clementine-json.js';
 
@@ -116,6 +118,10 @@ describe('migration 0005 — create clementine.json', () => {
         'BUDGET_HEARTBEAT_USD=0.50',
         'BUDGET_CRON_T2_USD=5.00',
         'DEFAULT_MODEL_TIER=sonnet',
+        'HEARTBEAT_INTERVAL_MINUTES=45',
+        'HEARTBEAT_ACTIVE_START=6',
+        'UNLEASHED_PHASE_TURNS=100',
+        'UNLEASHED_DEFAULT_MAX_HOURS=4',
       ].join('\n'),
     );
 
@@ -130,6 +136,11 @@ describe('migration 0005 — create clementine.json', () => {
     expect(json.models.default).toBe('sonnet');
     expect(json.budgets.heartbeat).toBe(0.5);
     expect(json.budgets.cronT2).toBe(5);
+    expect(json.heartbeat.intervalMinutes).toBe(45);
+    expect(json.heartbeat.activeStart).toBe(6);
+    expect(json.heartbeat.activeEnd).toBeUndefined(); // not in .env, omitted
+    expect(json.unleashed.phaseTurns).toBe(100);
+    expect(json.unleashed.defaultMaxHours).toBe(4);
 
     // README also written
     const readme = readFileSync(path.join(baseDir, 'README.md'), 'utf-8');
@@ -168,5 +179,38 @@ describe('migration 0005 — create clementine.json', () => {
     const json = JSON.parse(readFileSync(path.join(baseDir, 'clementine.json'), 'utf-8'));
     expect(json.schemaVersion).toBe(1);
     expect(Object.keys(json)).toEqual(['schemaVersion']);
+  });
+});
+
+describe('resolveString — env > json > default', () => {
+  it('uses env value when present', () => {
+    expect(resolveString('from-env', 'from-json', 'default')).toBe('from-env');
+  });
+  it('falls back to JSON when env is empty', () => {
+    expect(resolveString('', 'from-json', 'default')).toBe('from-json');
+  });
+  it('falls back to default when env and JSON are both unset', () => {
+    expect(resolveString('', undefined, 'default')).toBe('default');
+  });
+});
+
+describe('resolveNumber — env > json > default with finite-check', () => {
+  it('uses env value when it parses as finite', () => {
+    expect(resolveNumber('0.99', 0.10, 0.50)).toBe(0.99);
+  });
+  it('uses env zero (zero is finite, not falsy here)', () => {
+    expect(resolveNumber('0', 0.10, 0.50)).toBe(0);
+  });
+  it('falls back to JSON when env is non-finite garbage', () => {
+    expect(resolveNumber('not-a-number', 0.10, 0.50)).toBe(0.10);
+  });
+  it('falls back to JSON when env is empty', () => {
+    expect(resolveNumber('', 0.10, 0.50)).toBe(0.10);
+  });
+  it('falls back to default when JSON is undefined', () => {
+    expect(resolveNumber('', undefined, 0.50)).toBe(0.50);
+  });
+  it('json zero is preserved', () => {
+    expect(resolveNumber('', 0, 0.50)).toBe(0);
   });
 });

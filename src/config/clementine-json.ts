@@ -113,3 +113,38 @@ export function loadClementineJson(baseDir: string): ClementineJson {
 export function _resetClementineJsonCache(): void {
   cache.clear();
 }
+
+// ── Resolution helpers (pure) ────────────────────────────────────────
+//
+// `getEnv` in config.ts feeds `envValue` here. Precedence is the env
+// value (already process.env > .env merged by getEnv), then the JSON
+// value, then the compiled default. Empty string from env is treated
+// as unset to match the .env parser's "key with empty value" behavior.
+
+/** String resolution. */
+export function resolveString(
+  envValue: string,
+  jsonValue: string | undefined,
+  fallback: string,
+): string {
+  if (envValue) return envValue;
+  if (jsonValue) return jsonValue;
+  return fallback;
+}
+
+/**
+ * Numeric resolution. Env values that don't parse as finite numbers
+ * fall through to JSON, then the default — mirrors optionalTokenEnv tolerance.
+ */
+export function resolveNumber(
+  envValue: string,
+  jsonValue: number | undefined,
+  fallback: number,
+): number {
+  if (envValue) {
+    const n = Number(envValue);
+    if (Number.isFinite(n)) return n;
+  }
+  if (jsonValue !== undefined) return jsonValue;
+  return fallback;
+}
