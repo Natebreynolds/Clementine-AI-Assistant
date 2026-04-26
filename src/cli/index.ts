@@ -1190,6 +1190,85 @@ async function cmdConfigMigrateToKeychain(opts: { dryRun?: boolean; key?: string
   console.log();
 }
 
+// ── Config migrate-from-keychain (inverse of migrate-to-keychain) ───
+
+async function cmdConfigMigrateFromKeychain(opts: { dryRun?: boolean; key?: string[] }): Promise<void> {
+  const { planReverseMigration, applyReverseMigration } = await import('../config/migrate-from-keychain.js');
+
+  const DIM = '\x1b[0;90m';
+  const BOLD = '\x1b[1m';
+  const GREEN = '\x1b[0;32m';
+  const YELLOW = '\x1b[0;33m';
+  const RED = '\x1b[0;31m';
+  const CYAN = '\x1b[0;36m';
+  const RESET = '\x1b[0m';
+
+  const only = opts.key
+    ? opts.key.flatMap(k => k.split(',').map(s => s.trim()).filter(Boolean))
+    : undefined;
+
+  const plan = planReverseMigration(BASE_DIR, only ? { only } : {});
+
+  console.log();
+  console.log(`  ${BOLD}.env path:${RESET}  ${plan.envPath}`);
+  console.log();
+
+  const groups: Record<string, typeof plan.candidates> = {};
+  for (const c of plan.candidates) (groups[c.status] ??= []).push(c);
+
+  const renderGroup = (label: string, color: string, items: typeof plan.candidates, showRef = false) => {
+    if (!items || items.length === 0) return;
+    console.log(`  ${color}${label}${RESET} ${DIM}(${items.length})${RESET}`);
+    for (const c of items) {
+      const refTag = showRef && c.ref ? ` ${DIM}${c.ref}${RESET}` : '';
+      console.log(`    ${c.key}${refTag}`);
+    }
+    console.log();
+  };
+
+  renderGroup('Will migrate from keychain → .env', CYAN, groups.migrated);
+  renderGroup('Sensitive — left in keychain (correct)', DIM, groups['sensitive-skipped']);
+  renderGroup('Unresolvable refs (keychain entry missing)', RED, groups.unresolvable, true);
+
+  if (plan.toMigrate.length === 0) {
+    console.log(`  ${GREEN}Nothing to migrate.${RESET}`);
+    if (plan.unresolvable.length > 0) {
+      console.log(`  ${YELLOW}${plan.unresolvable.length} unresolvable ref(s) above — fix or delete by hand.${RESET}`);
+    }
+    console.log();
+    return;
+  }
+
+  if (opts.dryRun) {
+    console.log(`  ${YELLOW}Dry run — no changes written.${RESET}`);
+    console.log();
+    return;
+  }
+
+  console.log(`  ${BOLD}Applying...${RESET}`);
+  let result;
+  try {
+    result = applyReverseMigration(BASE_DIR, only ? { only } : {});
+  } catch (err) {
+    console.error(`  ${RED}Failed:${RESET} ${(err as Error).message}`);
+    process.exit(1);
+  }
+
+  if (result.failed.length > 0) {
+    console.log(`  ${RED}Some keychain reads failed — .env was NOT modified:${RESET}`);
+    for (const f of result.failed) console.log(`    ${RED}✗${RESET} ${f.key}: ${f.error}`);
+    console.log();
+    process.exit(1);
+  }
+
+  for (const key of result.migrated) {
+    console.log(`    ${GREEN}✓${RESET} ${key} ${DIM}→ .env (keychain entry deleted)${RESET}`);
+  }
+  console.log();
+  console.log(`  ${GREEN}Migrated ${result.migrated.length} key${result.migrated.length === 1 ? '' : 's'} out of keychain.${RESET}`);
+  console.log();
+}
+
 // ── Advisor commands ────────────────────────────────────────────────
 
 const ADVISOR_MODES = ['off', 'shadow', 'primary'] as const;
@@ -1873,6 +1952,15 @@ configCmd
   .option('-k, --key <name...>', 'Limit to specific key(s); repeat or comma-separate for multiple')
   .action(async (opts: { dryRun?: boolean; key?: string[] }) => {
     await cmdConfigMigrateToKeychain(opts);
+  });
+
+configCmd
+  .command('migrate-from-keychain')
+  .description('Pull non-credential values OUT of keychain back to plaintext .env (only API keys belong in keychain)')
+  .option('--dry-run', 'Show what would migrate without writing anything')
+  .option('-k, --key <name...>', 'Limit to specific key(s); repeat or comma-separate for multiple')
+  .action(async (opts: { dryRun?: boolean; key?: string[] }) => {
+    await cmdConfigMigrateFromKeychain(opts);
   });
 
 configCmd
