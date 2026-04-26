@@ -9,8 +9,8 @@
 import { existsSync, readFileSync, writeFileSync, mkdirSync, readdirSync, copyFileSync } from 'node:fs';
 import path from 'node:path';
 import pino from 'pino';
-import { VAULT_MIGRATIONS_STATE } from '../config.js';
-import type { MigrationState, VaultMigration, VaultMigrationSummary } from './types.js';
+import { BASE_DIR, PKG_DIR, VAULT_MIGRATIONS_STATE } from '../config.js';
+import type { AnyMigration, MigrationContext, MigrationState, VaultMigrationSummary } from './types.js';
 
 const logger = pino({ name: 'clementine.vault-migrations' });
 
@@ -44,9 +44,10 @@ function backupFile(filePath: string, backupDir: string): void {
 /**
  * Discover all migration modules in the compiled dist/vault-migrations/ directory.
  * Returns them sorted by filename (numeric prefix ensures correct order).
+ * Accepts both VaultMigration (legacy) and Migration (multi-target) shapes.
  */
-async function discoverMigrations(): Promise<VaultMigration[]> {
-  const migrations: VaultMigration[] = [];
+async function discoverMigrations(): Promise<AnyMigration[]> {
+  const migrations: AnyMigration[] = [];
 
   // Look for compiled migration files next to this runner
   const migrationsDir = path.dirname(new URL(import.meta.url).pathname);
@@ -68,19 +69,28 @@ async function discoverMigrations(): Promise<VaultMigration[]> {
         migrations.push(mod.migration);
       }
     } catch (err) {
-      logger.warn({ file, err }, 'Failed to load vault migration');
+      logger.warn({ file, err }, 'Failed to load migration');
     }
   }
 
   return migrations;
 }
 
+/** Discriminator — true if migration uses the new MigrationContext shape. */
+function isContextMigration(m: AnyMigration): boolean {
+  return typeof (m as { kind?: unknown }).kind === 'string';
+}
+
 /**
- * Run all pending vault migrations against the user's vault.
- * Idempotent — safe to call multiple times.
+ * Run all pending migrations. Each is dispatched based on its shape:
+ *   - VaultMigration (no `kind` field) → apply(vaultDir)
+ *   - Migration       (has `kind` field) → apply(MigrationContext)
+ *
+ * Idempotent — safe to call multiple times. State is tracked in
+ * `~/.clementine/.vault-migrations.json` (kept this filename for back-compat).
  */
-export async function runVaultMigrations(
-  vaultDir: string,
+export async function runMigrations(
+  ctx: MigrationContext,
   backupDir?: string,
 ): Promise<VaultMigrationSummary> {
   const summary: VaultMigrationSummary = {
@@ -98,17 +108,15 @@ export async function runVaultMigrations(
   if (migrations.length === 0) return summary;
 
   for (const migration of migrations) {
-    // Skip if already recorded as applied
     if (appliedIds.has(migration.id)) {
       summary.alreadyRun.push(migration.id);
       continue;
     }
 
     try {
-      // Back up target files before migration
-      if (backupDir) {
-        // Best-effort backup of the vault's 00-System dir (most common target)
-        const systemDir = path.join(vaultDir, '00-System');
+      // Best-effort backup of the vault's 00-System dir for vault-style migrations
+      if (backupDir && !isContextMigration(migration)) {
+        const systemDir = path.join(ctx.vaultDir, '00-System');
         if (existsSync(systemDir)) {
           const systemFiles = readdirSync(systemDir).filter(f => f.endsWith('.md'));
           for (const f of systemFiles) {
@@ -117,35 +125,40 @@ export async function runVaultMigrations(
         }
       }
 
-      const result = migration.apply(vaultDir);
+      const result = isContextMigration(migration)
+        ? await (migration as { apply: (c: MigrationContext) => unknown }).apply(ctx)
+        : (migration as { apply: (v: string) => unknown }).apply(ctx.vaultDir);
 
-      if (result.applied) {
+      const r = result as { applied?: boolean; skipped?: boolean; details?: string };
+
+      if (r.applied) {
         summary.applied.push(migration.id);
-        state.applied.push({
-          id: migration.id,
-          appliedAt: new Date().toISOString(),
-          result: 'applied',
-        });
-        logger.info({ id: migration.id, details: result.details }, 'Vault migration applied');
-      } else if (result.skipped) {
+        state.applied.push({ id: migration.id, appliedAt: new Date().toISOString(), result: 'applied' });
+        logger.info({ id: migration.id, details: r.details }, 'Migration applied');
+      } else if (r.skipped) {
         summary.skipped.push(migration.id);
-        // Record as applied so we don't re-check every update
-        state.applied.push({
-          id: migration.id,
-          appliedAt: new Date().toISOString(),
-          result: 'skipped',
-        });
-        logger.info({ id: migration.id, details: result.details }, 'Vault migration skipped (already present)');
+        state.applied.push({ id: migration.id, appliedAt: new Date().toISOString(), result: 'skipped' });
+        logger.info({ id: migration.id, details: r.details }, 'Migration skipped (already present)');
       }
     } catch (err) {
       const errMsg = String(err).slice(0, 200);
       summary.failed.push(migration.id);
       summary.errors.push({ id: migration.id, error: errMsg });
-      // Do NOT record as applied — will retry on next update
-      logger.warn({ id: migration.id, err }, 'Vault migration failed');
+      logger.warn({ id: migration.id, err }, 'Migration failed');
     }
   }
 
   saveState(state);
   return summary;
+}
+
+/**
+ * Back-compat wrapper: existing call sites pass just vaultDir. Builds a
+ * default MigrationContext from BASE_DIR and PKG_DIR.
+ */
+export async function runVaultMigrations(
+  vaultDir: string,
+  backupDir?: string,
+): Promise<VaultMigrationSummary> {
+  return runMigrations({ vaultDir, baseDir: BASE_DIR, pkgDir: PKG_DIR }, backupDir);
 }
