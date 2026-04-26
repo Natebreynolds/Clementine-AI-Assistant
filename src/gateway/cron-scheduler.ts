@@ -255,6 +255,63 @@ export function validateCronYaml(content: string): string | null {
   }
 }
 
+/**
+ * Detect duplicate job definitions across the global CRON.md and agent-scoped
+ * CRON.md files. A "duplicate" is a global job tagged with `agentSlug: X`
+ * whose bare name matches a job defined in `agents/X/CRON.md` — i.e. the same
+ * conceptual job exists in two places, usually with diverged prompts.
+ *
+ * Returns a list of warnings; pure function, safe to call from any surface.
+ * The scheduler logs these on every reload so the user sees them on first
+ * boot AND on every CRON.md edit.
+ */
+export interface DuplicateJobWarning {
+  bareName: string;
+  agentSlug: string;
+  globalJobName: string;
+  agentJobName: string;
+  /** Diverged fields between the two definitions, for actionable reporting. */
+  divergedFields: string[];
+}
+
+export function findDuplicateJobDefinitions(
+  globalJobs: CronJobDefinition[],
+  agentJobs: CronJobDefinition[],
+): DuplicateJobWarning[] {
+  const warnings: DuplicateJobWarning[] = [];
+  // Index agent jobs by `${slug}:${bareName}` (which is how parseAgentCronJobs
+  // names them). For each global job with an agentSlug, look up the
+  // corresponding agent-scoped name.
+  const agentByName = new Map<string, CronJobDefinition>();
+  for (const a of agentJobs) agentByName.set(a.name, a);
+
+  for (const g of globalJobs) {
+    if (!g.agentSlug) continue;
+    const expected = `${g.agentSlug}:${g.name}`;
+    const a = agentByName.get(expected);
+    if (!a) continue;
+    // Found a duplicate. Compute diverged fields so the warning is actionable.
+    const diverged: string[] = [];
+    const compare: Array<keyof CronJobDefinition> = [
+      'schedule', 'enabled', 'tier', 'mode', 'maxHours', 'maxTurns',
+      'workDir', 'prompt', 'preCheck',
+    ];
+    for (const f of compare) {
+      const gv = g[f];
+      const av = a[f];
+      if (JSON.stringify(gv) !== JSON.stringify(av)) diverged.push(f);
+    }
+    warnings.push({
+      bareName: g.name,
+      agentSlug: g.agentSlug,
+      globalJobName: g.name,
+      agentJobName: a.name,
+      divergedFields: diverged,
+    });
+  }
+  return warnings;
+}
+
 // ── Retry / backoff ──────────────────────────────────────────────────
 
 /** Exponential backoff schedule in ms: 30s, 1m, 5m, 15m, 60m */
@@ -503,10 +560,25 @@ export class CronScheduler {
 
   /** Load job definitions from CRON.md and agent dirs without scheduling tasks. */
   private loadJobDefinitions(): void {
-    this.jobs = parseCronJobs();
+    const globalJobs = parseCronJobs();
     const agentJobs = parseAgentCronJobs(AGENTS_DIR);
-    if (agentJobs.length > 0) {
-      this.jobs.push(...agentJobs);
+    this.jobs = [...globalJobs, ...agentJobs];
+
+    // Surface duplicate definitions loud — these are footguns where the same
+    // conceptual job is defined in both global and agent-scoped CRON.md, often
+    // with diverged prompts. The user usually wants one of them deleted.
+    const dupes = findDuplicateJobDefinitions(globalJobs, agentJobs);
+    for (const d of dupes) {
+      logger.warn(
+        {
+          bareName: d.bareName,
+          agentSlug: d.agentSlug,
+          globalJob: d.globalJobName,
+          agentJob: d.agentJobName,
+          divergedFields: d.divergedFields,
+        },
+        `Duplicate cron definition: '${d.bareName}' is defined in both global CRON.md (with agentSlug=${d.agentSlug}) and agents/${d.agentSlug}/CRON.md. Consolidate to avoid confusion — pick one and delete the other.`,
+      );
     }
   }
 
