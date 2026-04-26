@@ -966,6 +966,102 @@ function cmdConfigList(): void {
   console.log();
 }
 
+// ── Advisor commands ────────────────────────────────────────────────
+
+const ADVISOR_MODES = ['off', 'shadow', 'primary'] as const;
+type AdvisorMode = typeof ADVISOR_MODES[number];
+
+function readAdvisorMode(): AdvisorMode {
+  if (!existsSync(ENV_PATH)) return 'off';
+  const content = readFileSync(ENV_PATH, 'utf-8');
+  const match = content.match(/^CLEMENTINE_ADVISOR_RULES_LOADER=(.*)$/m);
+  if (!match) return 'off';
+  const raw = match[1].trim().toLowerCase();
+  if (raw === 'shadow' || raw === 'primary') return raw;
+  return 'off';
+}
+
+async function cmdAdvisorStatus(): Promise<void> {
+  const DIM = '\x1b[0;90m';
+  const BOLD = '\x1b[1m';
+  const CYAN = '\x1b[0;36m';
+  const YELLOW = '\x1b[0;33m';
+  const GREEN = '\x1b[0;32m';
+  const RESET = '\x1b[0m';
+
+  const mode = readAdvisorMode();
+  const modeColor = mode === 'primary' ? GREEN : mode === 'shadow' ? CYAN : DIM;
+
+  console.log();
+  console.log(`  ${BOLD}Advisor mode:${RESET} ${modeColor}${mode}${RESET}`);
+  if (mode === 'off') {
+    console.log(`  ${DIM}Legacy TS path is the source of truth. Rule engine not loaded.${RESET}`);
+  } else if (mode === 'shadow') {
+    console.log(`  ${DIM}Rule engine runs alongside TS path; divergences logged but TS path wins.${RESET}`);
+  } else {
+    console.log(`  ${DIM}Rule engine is the source of truth; TS path used only as fallback.${RESET}`);
+  }
+
+  // Load the rules from disk to show the user-visible inventory.
+  try {
+    const { loadAdvisorRules } = await import('../agent/advisor-rules/loader.js');
+    const rules = loadAdvisorRules();
+    const builtinCount = rules.filter(r => r._sourcePath?.includes('/builtin/')).length;
+    const userCount = rules.length - builtinCount;
+    console.log();
+    console.log(`  ${BOLD}Loaded rules:${RESET} ${rules.length} ${DIM}(${builtinCount} builtin, ${userCount} user)${RESET}`);
+  } catch (err) {
+    console.log(`  ${YELLOW}Could not load rules:${RESET} ${(err as Error).message}`);
+  }
+
+  console.log();
+  console.log(`  ${DIM}Switch mode: clementine advisor mode <off|shadow|primary>${RESET}`);
+  console.log(`  ${DIM}List rules:  clementine advisor rules${RESET}`);
+  console.log();
+}
+
+function cmdAdvisorMode(mode: string): void {
+  const YELLOW = '\x1b[0;33m';
+  const GREEN = '\x1b[0;32m';
+  const RESET = '\x1b[0m';
+
+  const lower = mode.toLowerCase();
+  if (!ADVISOR_MODES.includes(lower as AdvisorMode)) {
+    console.error(`  Invalid mode "${mode}". Choose one of: ${ADVISOR_MODES.join(', ')}`);
+    process.exit(1);
+  }
+  cmdConfigSet('CLEMENTINE_ADVISOR_RULES_LOADER', lower);
+  console.log(`  ${GREEN}Advisor mode set to ${lower}.${RESET}`);
+  console.log(`  ${YELLOW}Restart the daemon for the change to take effect:${RESET} clementine restart`);
+}
+
+async function cmdAdvisorRules(): Promise<void> {
+  const DIM = '\x1b[0;90m';
+  const BOLD = '\x1b[1m';
+  const CYAN = '\x1b[0;36m';
+  const RESET = '\x1b[0m';
+
+  try {
+    const { loadAdvisorRules } = await import('../agent/advisor-rules/loader.js');
+    const rules = loadAdvisorRules();
+    if (rules.length === 0) {
+      console.log('  No advisor rules loaded.');
+      return;
+    }
+    console.log();
+    console.log(`  ${BOLD}${'PRI'.padEnd(5)}${'ID'.padEnd(38)}SOURCE  DESCRIPTION${RESET}`);
+    for (const r of rules) {
+      const source = r._sourcePath?.includes('/builtin/') ? 'builtin' : 'user   ';
+      const desc = (r.description || '').slice(0, 60);
+      console.log(`  ${String(r.priority).padEnd(5)}${CYAN}${r.id.padEnd(38)}${RESET}${DIM}${source}${RESET}  ${desc}`);
+    }
+    console.log();
+  } catch (err) {
+    console.error(`  Error loading rules: ${(err as Error).message}`);
+    process.exit(1);
+  }
+}
+
 // ── Tools command ───────────────────────────────────────────────────
 
 function cmdTools(): void {
@@ -1417,6 +1513,21 @@ program
   .command('tools')
   .description('List available MCP tools, plugins, and channels')
   .action(cmdTools);
+
+const advisorCmd = program
+  .command('advisor')
+  .description('Inspect and configure the execution advisor')
+  .action(() => cmdAdvisorStatus());
+
+advisorCmd
+  .command('mode <mode>')
+  .description('Set advisor mode (off | shadow | primary) — restart required')
+  .action(cmdAdvisorMode);
+
+advisorCmd
+  .command('rules')
+  .description('List loaded advisor rules')
+  .action(cmdAdvisorRules);
 
 const dashCmd = program
   .command('dashboard')

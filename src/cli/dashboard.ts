@@ -7058,6 +7058,23 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
     } catch { res.json({ byType: {}, totalOutcomes: 0 }); }
   });
 
+  app.get('/api/advisor/status', async (_req, res) => {
+    try {
+      const { ADVISOR_RULES_LOADER } = await import('../config.js');
+      const { loadAdvisorRules } = await import('../agent/advisor-rules/loader.js');
+      const rules = loadAdvisorRules();
+      const builtinCount = rules.filter(r => r._sourcePath?.includes('/builtin/')).length;
+      res.json({
+        mode: ADVISOR_RULES_LOADER,
+        ruleCount: rules.length,
+        builtinCount,
+        userCount: rules.length - builtinCount,
+      });
+    } catch (err) {
+      res.json({ mode: 'off', ruleCount: 0, builtinCount: 0, userCount: 0, error: String(err) });
+    }
+  });
+
   // ── Remote access API ────────────────────────────────────────────
 
   app.get('/api/remote-access', (_req, res) => {
@@ -19880,11 +19897,33 @@ async function refreshHomeSessions() {
 // ── Execution Analytics ───────────────────
 async function refreshAdvisorAnalytics() {
   try {
-    const r = await apiFetch('/api/advisor/analytics');
+    const [statusR, r] = await Promise.all([
+      apiFetch('/api/advisor/status'),
+      apiFetch('/api/advisor/analytics'),
+    ]);
+    const status = await statusR.json();
     const data = await r.json();
     const container = document.getElementById('advisor-analytics-content');
 
     let html = '';
+
+    // Mode chip — surfaces the active rule-engine mode at a glance.
+    const modeColors = { off: 'var(--gray)', shadow: 'var(--blue)', primary: 'var(--green)' };
+    const modeColor = modeColors[status.mode] || 'var(--gray)';
+    const modeHints = {
+      off: 'Legacy TS path is the source of truth.',
+      shadow: 'Rule engine runs alongside the TS path; divergences are logged.',
+      primary: 'Rule engine is the source of truth.',
+    };
+    const modeHint = modeHints[status.mode] || '';
+    html += '<div style="display:flex;align-items:center;gap:12px;margin-bottom:16px;padding:10px 14px;background:var(--bg-elev);border-radius:8px;border-left:3px solid ' + modeColor + '">';
+    html += '<span style="font-size:11px;text-transform:uppercase;letter-spacing:0.05em;color:var(--text-dim)">Advisor mode</span>';
+    html += '<span style="font-weight:600;color:' + modeColor + '">' + esc(status.mode) + '</span>';
+    html += '<span style="font-size:12px;color:var(--text-dim)">' + esc(modeHint) + '</span>';
+    html += '<span style="margin-left:auto;font-size:11px;color:var(--text-dim)">' + status.ruleCount + ' rule' + (status.ruleCount === 1 ? '' : 's') + ' loaded';
+    if (status.userCount > 0) html += ' (' + status.userCount + ' user)';
+    html += '</span>';
+    html += '</div>';
 
     // Summary cards row
     html += '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:20px">';
