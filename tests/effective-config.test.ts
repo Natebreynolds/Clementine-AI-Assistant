@@ -127,4 +127,20 @@ describe('computeEffectiveConfig', () => {
     const ownerName = cfg.entries.find(e => e.key === 'OWNER_NAME')!;
     expect(ownerName.source).toBe('default');
   });
+
+  it('marks unresolvable keychain refs and surfaces fallback', () => {
+    // Stub a non-existent account — `security` will exit non-zero, resolver
+    // returns undefined, inspector should fall through to default and flag
+    // unresolvedRef.
+    writeFileSync(
+      path.join(baseDir, '.env'),
+      // pragma: allowlist secret
+      'BUDGET_HEARTBEAT_USD=keychain:nonexistent-account-' + Date.now() + '\n',
+    );
+    const cfg = computeEffectiveConfig(baseDir);
+    const budget = cfg.entries.find(e => e.key === 'BUDGET_HEARTBEAT_USD')!;
+    expect(budget.source).toBe('default');
+    expect(budget.value).toBe(0.50);
+    expect(budget.unresolvedRef).toMatch(/^keychain:nonexistent-account-/);
+  });
 });

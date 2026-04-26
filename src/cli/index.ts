@@ -1028,15 +1028,19 @@ async function cmdConfigShow(opts: { json?: boolean; group?: string }): Promise<
   const keyWidth = Math.max(...filtered.map(e => e.key.length));
   const valueWidth = Math.max(...filtered.map(e => String(e.value).length), 12);
 
+  const RED = '\x1b[0;31m';
+
   for (const [group, entries] of byGroup) {
     console.log(`  ${BOLD}${group}${RESET}`);
     for (const entry of entries) {
       const c = sourceColor[entry.source] ?? RESET;
       const valueStr = String(entry.value);
-      const shadow = entry.shadowedBy && entry.shadowedBy.length > 0
-        ? ` ${DIM}(shadows: ${entry.shadowedBy.join(', ')})${RESET}`
-        : '';
-      console.log(`    ${entry.key.padEnd(keyWidth)}  ${valueStr.padEnd(valueWidth)}  ${c}${entry.source}${RESET}${shadow}`);
+      const annotations: string[] = [];
+      if (entry.resolvedFrom === 'keychain') annotations.push(`${BLUE}via keychain${RESET}`);
+      if (entry.unresolvedRef) annotations.push(`${RED}UNRESOLVED REF — using fallback${RESET}`);
+      if (entry.shadowedBy && entry.shadowedBy.length > 0) annotations.push(`${DIM}shadows: ${entry.shadowedBy.join(', ')}${RESET}`);
+      const annot = annotations.length > 0 ? ` ${DIM}(${RESET}${annotations.join(`${DIM},${RESET} `)}${DIM})${RESET}` : '';
+      console.log(`    ${entry.key.padEnd(keyWidth)}  ${valueStr.padEnd(valueWidth)}  ${c}${entry.source}${RESET}${annot}`);
     }
     console.log();
   }

@@ -51,14 +51,74 @@ function readEnvFile(): Record<string, string> {
 
 const env = readEnvFile();
 
-/** Look up a config value: local .env first, then process.env fallback. */
+// ── Keychain-ref resolution (lazy, cached) ──────────────────────────
+//
+// `.env` may store keychain stubs ("keychain:clementine-agent-FOO") in place
+// of actual values for any key — not just the SECRET-classified ones that
+// `getSecret` knows about. Without resolution, getEnv would return the
+// literal stub and downstream code (Number(...), comparisons, etc.) would
+// silently misbehave.
+//
+// Resolution is lazy (first read of a ref triggers the keychain shell call)
+// and memoised, so users see at most one approval prompt per ref over the
+// daemon's lifetime. A failed resolution caches `null` so repeated reads
+// don't re-prompt; callers fall through to their own fallback.
+
+const KEYCHAIN_REF_PREFIX = 'keychain:'; // pragma: allowlist secret
+const resolvedKeychainRefs = new Map<string, string | null>();
+
+function isKeychainRef(value: string | undefined): value is string {
+  return typeof value === 'string' && value.startsWith(KEYCHAIN_REF_PREFIX);
+}
+
+function resolveKeychainRef(stub: string): string | undefined {
+  if (resolvedKeychainRefs.has(stub)) {
+    const cached = resolvedKeychainRefs.get(stub);
+    return cached ?? undefined;
+  }
+  // Stub format: keychain:<service>-<account>. The whole tail after the prefix
+  // is the account name under the well-known service "clementine-agent".
+  const account = stub.slice(KEYCHAIN_REF_PREFIX.length);
+  try {
+    const result = execSync(
+      `security find-generic-password -s clementine-agent -a ${shellEscape(account)} -w`,
+      { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] },
+    ).trim();
+    resolvedKeychainRefs.set(stub, result || null);
+    return result || undefined;
+  } catch {
+    resolvedKeychainRefs.set(stub, null);
+    return undefined;
+  }
+}
+
+function maybeResolveRef(value: string | undefined): string | undefined {
+  if (!value) return value;
+  if (!isKeychainRef(value)) return value;
+  return resolveKeychainRef(value);
+}
+
+/**
+ * Look up a config value: local .env first, then process.env fallback.
+ * Keychain refs in either source are resolved lazily; failed resolution
+ * falls through to the fallback rather than returning the literal stub.
+ */
 function getEnv(key: string, fallback = ''): string {
-  return env[key] ?? process.env[key] ?? fallback;
+  const fromLocal = maybeResolveRef(env[key]);
+  if (fromLocal !== undefined && fromLocal !== '') return fromLocal;
+  const fromProcess = maybeResolveRef(process.env[key]);
+  if (fromProcess !== undefined && fromProcess !== '') return fromProcess;
+  return fallback;
 }
 
 /** Merged view of process.env overlaid with .env. Use for classifyIntegrations / summarizeIntegrationStatus. */
 export function envSnapshot(): Record<string, string | undefined> {
   return { ...process.env, ...env };
+}
+
+/** Test-only: clear the keychain ref cache so re-resolution can be tested. */
+export function _resetKeychainRefCache(): void {
+  resolvedKeychainRefs.clear();
 }
 
 // ── Paths ────────────────────────────────────────────────────────────
@@ -116,8 +176,10 @@ export function shellEscape(s: string): string {
 }
 
 function getSecret(envKey: string, keychainService?: string): string {
-  const value = env[envKey] ?? '';
-  if (value) return value;
+  // Resolve keychain refs from .env in place so secrets stored as stubs
+  // come back as their real values (same blind spot as getEnv had pre-fix).
+  const local = maybeResolveRef(env[envKey]);
+  if (local) return local;
 
   const service = keychainService ?? ASSISTANT_NAME.toLowerCase();
   try {

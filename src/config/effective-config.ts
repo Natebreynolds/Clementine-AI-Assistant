@@ -11,6 +11,7 @@
  * Mirrors the precedence: process.env > .env > clementine.json > compiled default.
  */
 
+import { execSync } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { loadClementineJson } from './clementine-json.js';
@@ -25,6 +26,10 @@ export interface ConfigEntry {
   shadowedBy?: ConfigSource[];
   /** Optional: human-readable section/group for the report. */
   group?: string;
+  /** Set when the source held a `keychain:` ref that the inspector resolved on-the-fly. */
+  resolvedFrom?: 'keychain';
+  /** Set when the source held a keychain ref but resolution failed (no entry / denied). */
+  unresolvedRef?: string;
 }
 
 export interface EffectiveConfig {
@@ -98,6 +103,36 @@ const SPECS: KeySpec[] = [
   { key: 'SF_API_VERSION', group: 'channels', default: 'v62.0' },
 ];
 
+// ── Keychain-ref resolution ──────────────────────────────────────────
+// Mirrors config.ts's lazy/cached resolver but kept independent so this
+// module stays a pure utility (no shared mutable state with the daemon).
+
+const KEYCHAIN_REF_PREFIX = 'keychain:'; // pragma: allowlist secret
+const refCache = new Map<string, string | null>();
+
+function shellEscape(s: string): string {
+  return `'${s.replace(/'/g, "'\\''")}'`;
+}
+
+function resolveRef(stub: string): string | undefined {
+  if (refCache.has(stub)) {
+    const v = refCache.get(stub);
+    return v ?? undefined;
+  }
+  const account = stub.slice(KEYCHAIN_REF_PREFIX.length);
+  try {
+    const result = execSync(
+      `security find-generic-password -s clementine-agent -a ${shellEscape(account)} -w`,
+      { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] },
+    ).trim();
+    refCache.set(stub, result || null);
+    return result || undefined;
+  } catch {
+    refCache.set(stub, null);
+    return undefined;
+  }
+}
+
 function readEnvFile(baseDir: string): Record<string, string> {
   const envPath = path.join(baseDir, '.env');
   if (!existsSync(envPath)) return {};
@@ -151,13 +186,32 @@ export function computeEffectiveConfig(baseDir: string): EffectiveConfig {
 
     let value: string | number | boolean;
     let source: ConfigSource;
+    let resolvedFrom: 'keychain' | undefined;
+    let unresolvedRef: string | undefined;
 
-    if (fromProcessEnv && fromProcessEnv.length > 0) {
-      value = fromProcessEnv;
+    // Helper: if a string source holds a keychain ref, resolve it. On
+    // failure, return undefined so we fall through to the next source.
+    const consume = (raw: string | undefined): { value: string; resolved: boolean } | { unresolvedRef: string } | null => {
+      if (!raw) return null;
+      if (raw.startsWith(KEYCHAIN_REF_PREFIX)) {
+        const r = resolveRef(raw);
+        if (r !== undefined) return { value: r, resolved: true };
+        return { unresolvedRef: raw };
+      }
+      return { value: raw, resolved: false };
+    };
+
+    const procResult = consume(fromProcessEnv);
+    const envResult = consume(fromEnvFile);
+
+    if (procResult && 'value' in procResult) {
+      value = procResult.value;
       source = 'process.env';
-    } else if (fromEnvFile && fromEnvFile.length > 0) {
-      value = fromEnvFile;
+      if (procResult.resolved) resolvedFrom = 'keychain';
+    } else if (envResult && 'value' in envResult) {
+      value = envResult.value;
       source = '.env';
+      if (envResult.resolved) resolvedFrom = 'keychain';
     } else if (fromJson !== undefined && fromJson !== '' && fromJson !== null) {
       value = fromJson as string | number;
       source = 'clementine.json';
@@ -167,6 +221,14 @@ export function computeEffectiveConfig(baseDir: string): EffectiveConfig {
     } else {
       value = spec.default ?? '';
       source = 'default';
+    }
+
+    // If the higher-precedence source held an unresolvable ref, surface that
+    // explicitly so users know the daemon is silently using the fallback.
+    if (procResult && 'unresolvedRef' in procResult && source !== 'process.env') {
+      unresolvedRef = procResult.unresolvedRef;
+    } else if (envResult && 'unresolvedRef' in envResult && source !== '.env') {
+      unresolvedRef = envResult.unresolvedRef;
     }
 
     // Track which other sources had values, to surface "this is overriding X."
@@ -181,6 +243,8 @@ export function computeEffectiveConfig(baseDir: string): EffectiveConfig {
       source,
       shadowedBy: shadowedBy.length > 0 ? shadowedBy : undefined,
       group: spec.group,
+      ...(resolvedFrom ? { resolvedFrom } : {}),
+      ...(unresolvedRef ? { unresolvedRef } : {}),
     });
   }
 
