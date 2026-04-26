@@ -63,24 +63,7 @@ export interface BrokenJob {
   circuitBreakerEngagedAt: string | null;
   lastAdvisorOpinion: string | null;
   /** Populated asynchronously by the diagnostic agent when available. */
-  diagnosis?: {
-    rootCause: string;
-    confidence: 'high' | 'medium' | 'low';
-    proposedFix: {
-      type: string;
-      details: string;
-      diff?: string;
-      autoApply?: {
-        agentSlug?: string;
-        operations: Array<
-          | { op: 'set'; field: string; value: string | number | boolean }
-          | { op: 'remove'; field: string }
-        >;
-      };
-    };
-    riskLevel: 'low' | 'medium' | 'high';
-    generatedAt: string;
-  };
+  diagnosis?: import('./failure-diagnostics.js').Diagnosis;
 }
 
 interface MonitorState {

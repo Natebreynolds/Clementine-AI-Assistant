@@ -18,13 +18,22 @@ import {
   existsSync,
   mkdirSync,
   readFileSync,
+  renameSync,
   writeFileSync,
 } from 'node:fs';
 import path from 'node:path';
 import pino from 'pino';
+import yaml from 'js-yaml';
 
 import { AGENTS_DIR, BASE_DIR, CRON_FILE } from '../config.js';
-import { EDITABLE_FIELDS, type FixOperation } from './failure-diagnostics.js';
+import {
+  EDITABLE_FIELDS,
+  type AutoApply,
+  type AutoApplyAdvisorRule,
+  type AutoApplyCron,
+  type AutoApplyPromptOverride,
+  type FixOperation,
+} from './failure-diagnostics.js';
 
 const logger = pino({ name: 'clementine.fix-applier' });
 
@@ -251,15 +260,38 @@ function findBlockEnd(lines: string[], start: number): number {
   return lines.length;
 }
 
+export interface ApplyOptions {
+  dryRun?: boolean;
+  /** Override BASE_DIR for advisor-rule and prompt-override write paths. Tests only. */
+  baseDir?: string;
+}
+
 /**
- * Apply a proposed fix to the right CRON.md file. Idempotent with respect
- * to already-applied ops (remove on a missing field is a no-op, set on a
- * matching value is a no-op).
+ * Apply a proposed fix to the right target. Dispatches on autoApply.kind:
+ *   'cron'             — edit CRON.md frontmatter (the original path)
+ *   'advisor-rule'     — write a YAML rule under ~/.clementine/advisor-rules/user/
+ *   'prompt-override'  — write a markdown override under ~/.clementine/prompt-overrides/
+ *
+ * Each path has its own backup/audit. All idempotent: re-applying the same
+ * fix produces the same on-disk state.
  */
 export function applyFix(
   jobName: string,
-  autoApply: { agentSlug?: string; operations: FixOperation[] },
-  opts: { dryRun?: boolean } = {},
+  autoApply: AutoApply,
+  opts: ApplyOptions = {},
+): ApplyResult {
+  // Default 'cron' for back-compat with old AutoApplyCron objects without kind.
+  const kind = autoApply.kind ?? 'cron';
+  if (kind === 'cron') return applyCronFix(jobName, autoApply as AutoApplyCron, opts);
+  if (kind === 'advisor-rule') return applyAdvisorRuleFix(jobName, autoApply as AutoApplyAdvisorRule, opts);
+  if (kind === 'prompt-override') return applyPromptOverrideFix(jobName, autoApply as AutoApplyPromptOverride, opts);
+  return { ok: false, message: `Unknown autoApply.kind: ${String(kind)}` };
+}
+
+function applyCronFix(
+  jobName: string,
+  autoApply: AutoApplyCron,
+  opts: { dryRun?: boolean },
 ): ApplyResult {
   const cronFile = resolveCronFile(jobName, autoApply);
   if (!cronFile) {
@@ -310,6 +342,7 @@ export function applyFix(
   writeFileSync(cronFile, newContent);
 
   appendAudit({
+    kind: 'cron',
     jobName,
     file: cronFile,
     applied,
@@ -329,13 +362,132 @@ export function applyFix(
   };
 }
 
-function appendAudit(entry: {
-  jobName: string;
-  file: string;
-  applied: FixOperation[];
-  skipped: FixOperation[];
-  diff: string;
-}): void {
+// ── Advisor rule writer ──────────────────────────────────────────────
+
+function userRulesDir(baseDir: string): string {
+  return path.join(baseDir, 'advisor-rules', 'user');
+}
+
+function applyAdvisorRuleFix(
+  jobName: string,
+  autoApply: AutoApplyAdvisorRule,
+  opts: ApplyOptions,
+): ApplyResult {
+  const targetDir = userRulesDir(opts.baseDir ?? BASE_DIR);
+  // Validate that the YAML parses and has the minimum schema shape. Don't
+  // require full Phase 2 zod validation here — the loader will reject invalid
+  // rules at read time and the next reload — but catch obvious malformed input.
+  let parsed: unknown;
+  try {
+    parsed = yaml.load(autoApply.yamlContent);
+  } catch (err) {
+    return { ok: false, message: `Invalid YAML in advisor-rule body: ${String(err)}` };
+  }
+  if (!parsed || typeof parsed !== 'object') {
+    return { ok: false, message: 'advisor-rule yamlContent did not parse as a YAML object' };
+  }
+  const r = parsed as Record<string, unknown>;
+  if (r.schemaVersion !== 1) {
+    return { ok: false, message: 'advisor-rule must declare schemaVersion: 1' };
+  }
+  if (typeof r.id !== 'string' || r.id !== autoApply.ruleId) {
+    return { ok: false, message: `advisor-rule yamlContent id must match ruleId="${autoApply.ruleId}"` };
+  }
+  if (!Array.isArray(r.when) || !Array.isArray(r.then)) {
+    return { ok: false, message: 'advisor-rule must have when[] and then[] arrays' };
+  }
+
+  const targetPath = path.join(targetDir, `${autoApply.ruleId}.yaml`);
+  const diff = `+ advisor-rule ${autoApply.ruleId} → ${targetPath}`;
+
+  if (opts.dryRun) {
+    return { ok: true, message: 'Dry run: advisor-rule would be written', file: targetPath, diff };
+  }
+
+  try {
+    mkdirSync(targetDir, { recursive: true });
+    const tmp = `${targetPath}.${process.pid}.${Date.now()}.tmp`;
+    writeFileSync(tmp, autoApply.yamlContent);
+    renameSync(tmp, targetPath);
+  } catch (err) {
+    return { ok: false, message: `Failed to write advisor rule: ${String(err)}` };
+  }
+
+  appendAudit({ kind: 'advisor-rule', jobName, file: targetPath, ruleId: autoApply.ruleId, diff });
+  logger.info({ jobName, ruleId: autoApply.ruleId, file: targetPath }, 'Applied advisor-rule fix');
+
+  return {
+    ok: true,
+    message: `Wrote advisor rule ${autoApply.ruleId} (hot-reloads on next eval)`,
+    file: targetPath,
+    diff,
+  };
+}
+
+// ── Prompt override writer ───────────────────────────────────────────
+
+function promptOverridesDir(baseDir: string): string {
+  return path.join(baseDir, 'prompt-overrides');
+}
+
+function applyPromptOverrideFix(
+  jobName: string,
+  autoApply: AutoApplyPromptOverride,
+  opts: ApplyOptions,
+): ApplyResult {
+  const root = promptOverridesDir(opts.baseDir ?? BASE_DIR);
+  // Resolve target path from scope.
+  let targetPath: string;
+  if (autoApply.scope === 'global') {
+    targetPath = path.join(root, '_global.md');
+  } else {
+    if (!autoApply.scopeKey) {
+      return { ok: false, message: `prompt-override scope=${autoApply.scope} requires scopeKey` };
+    }
+    if (/[\/\\\.]/.test(autoApply.scopeKey)) {
+      return { ok: false, message: 'prompt-override scopeKey cannot contain "/", "\\", or "."' };
+    }
+    const sub = autoApply.scope === 'agent' ? 'agents' : 'jobs';
+    targetPath = path.join(root, sub, `${autoApply.scopeKey}.md`);
+  }
+
+  const diff = `+ prompt-override ${autoApply.scope}${autoApply.scopeKey ? `:${autoApply.scopeKey}` : ''} → ${targetPath}`;
+
+  if (opts.dryRun) {
+    return { ok: true, message: 'Dry run: prompt-override would be written', file: targetPath, diff };
+  }
+
+  try {
+    mkdirSync(path.dirname(targetPath), { recursive: true });
+    const tmp = `${targetPath}.${process.pid}.${Date.now()}.tmp`;
+    writeFileSync(tmp, autoApply.content);
+    renameSync(tmp, targetPath);
+  } catch (err) {
+    return { ok: false, message: `Failed to write prompt override: ${String(err)}` };
+  }
+
+  appendAudit({
+    kind: 'prompt-override',
+    jobName,
+    file: targetPath,
+    scope: autoApply.scope,
+    scopeKey: autoApply.scopeKey,
+    diff,
+  });
+  logger.info(
+    { jobName, scope: autoApply.scope, scopeKey: autoApply.scopeKey, file: targetPath },
+    'Applied prompt-override fix',
+  );
+
+  return {
+    ok: true,
+    message: `Wrote prompt override ${autoApply.scope}${autoApply.scopeKey ? `:${autoApply.scopeKey}` : ''}`,
+    file: targetPath,
+    diff,
+  };
+}
+
+function appendAudit(entry: Record<string, unknown>): void {
   try {
     mkdirSync(path.dirname(AUDIT_FILE), { recursive: true });
     appendFileSync(

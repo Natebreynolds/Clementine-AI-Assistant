@@ -56,23 +56,44 @@ export type FixOperation =
   | { op: 'set'; field: string; value: string | number | boolean }
   | { op: 'remove'; field: string };
 
+/** CRON.md frontmatter edit (the original auto-apply shape). */
+export interface AutoApplyCron {
+  kind?: 'cron';                          // default; back-compat with the old shape
+  agentSlug?: string;
+  operations: FixOperation[];
+}
+
+/** Write a YAML rule to ~/.clementine/advisor-rules/user/<ruleId>.yaml */
+export interface AutoApplyAdvisorRule {
+  kind: 'advisor-rule';
+  ruleId: string;
+  yamlContent: string;
+}
+
+/** Write a markdown override to ~/.clementine/prompt-overrides/... */
+export interface AutoApplyPromptOverride {
+  kind: 'prompt-override';
+  scope: 'global' | 'agent' | 'job';
+  scopeKey?: string;     // required for scope=agent or scope=job
+  content: string;       // markdown body, optional gray-matter frontmatter
+}
+
+export type AutoApply = AutoApplyCron | AutoApplyAdvisorRule | AutoApplyPromptOverride;
+
 export interface Diagnosis {
   rootCause: string;
   confidence: 'high' | 'medium' | 'low';
   proposedFix: {
-    type: 'config_change' | 'prompt_change' | 'agent_scope' | 'disable' | 'credential_refresh' | 'escalate_to_owner';
+    type: 'config_change' | 'prompt_change' | 'agent_scope' | 'disable' | 'credential_refresh' | 'advisor_rule' | 'prompt_override' | 'escalate_to_owner';
     details: string;
     diff?: string;
     /**
-     * When present, the fix can be applied with one click via the
-     * /api/cron/broken-jobs/:jobName/apply-fix endpoint. Operations are
-     * silently filtered against EDITABLE_FIELDS — a proposal that mixes
-     * safe and unsafe edits gets the unsafe ones dropped.
+     * When present, the fix can be applied with one click via the dashboard's
+     * apply-fix endpoint. Three shapes (kind=cron|advisor-rule|prompt-override).
+     * Each kind has its own validator that runs in sanitizeAutoApply before
+     * the proposal is cached, and again in fix-applier before any write.
      */
-    autoApply?: {
-      agentSlug?: string;
-      operations: FixOperation[];
-    };
+    autoApply?: AutoApply;
   };
   riskLevel: 'low' | 'medium' | 'high';
   generatedAt: string;
@@ -223,28 +244,43 @@ function buildPrompt(broken: BrokenJob, jobDef: string | null, agentProfile: str
     '',
     '## Auto-apply contract',
     '',
-    'When (and ONLY when) the fix is a simple edit to one of these scalar fields — tier, mode, max_hours, max_turns, max_retries, enabled, agentSlug, work_dir, model, always_deliver, after, timeout_ms — also populate `proposedFix.autoApply`. The owner can one-click approve it from the dashboard.',
+    'When the fix is mechanical — set or remove a known scalar field, write a small advisor rule, or add prompt guidance — ALSO populate `proposedFix.autoApply`. The owner can one-click approve it. There are three KINDS of auto-apply, pick the one that matches:',
     '',
-    'For multi-line fields (prompt, pre_check, context, success_criteria), or for credential refreshes, or any change you are not very confident about: OMIT autoApply entirely. The owner will handle those manually.',
-    '',
-    `If the job is agent-scoped (job name includes ":"), set autoApply.agentSlug to the part BEFORE the colon. Otherwise omit it (global CRON.md).`,
-    '',
-    'Operations use the shape { "op": "set", "field": "<name>", "value": <scalar> } or { "op": "remove", "field": "<name>" }. Values are strings, numbers, or booleans.',
-    '',
+    '### kind: "cron" (default — edit CRON.md frontmatter)',
+    'Use for: tier, mode, max_hours, max_turns, max_retries, enabled, agentSlug, work_dir, model, always_deliver, after, timeout_ms.',
+    'Shape: { "kind": "cron", "agentSlug"?: "...", "operations": [...] }',
+    'Operations: { "op": "set", "field": "<name>", "value": <scalar> } or { "op": "remove", "field": "<name>" }.',
+    'If the job is agent-scoped (job name has ":"), set agentSlug to the prefix.',
     'Examples:',
-    '- Remove unleashed mode + its companion: operations: [{"op":"remove","field":"mode"}, {"op":"remove","field":"max_hours"}, {"op":"set","field":"max_turns","value":25}]',
-    '- Scope a broken global job to Ross\'s profile: operations: [{"op":"set","field":"agentSlug","value":"ross-the-sdr"}]',
-    '- Bump maxTurns on an under-resourced job: operations: [{"op":"set","field":"max_turns","value":10}]',
+    '- Remove unleashed + companion + cap turns: { "kind": "cron", "operations": [{"op":"remove","field":"mode"}, {"op":"remove","field":"max_hours"}, {"op":"set","field":"max_turns","value":25}] }',
+    '- Bump maxTurns: { "kind": "cron", "operations": [{"op":"set","field":"max_turns","value":10}] }',
+    '',
+    '### kind: "advisor-rule" (write a YAML rule to ~/.clementine/advisor-rules/user/)',
+    'Use when the fix is a behavioral rule that should affect ALL jobs matching some scope, not just one cron job. Examples: "for unleashed jobs, never bump maxTurns" or "for ross-the-sdr, always set timeout to 900s on max_turns errors".',
+    'Shape: { "kind": "advisor-rule", "ruleId": "kebab-case-id", "yamlContent": "<full yaml body>" }',
+    'The YAML body must be a valid advisor rule (schemaVersion: 1, id, description, priority, when, then). User rules at priority 100+ override builtins of the same id.',
+    'Example:',
+    '{ "kind": "advisor-rule", "ruleId": "ross-aggressive-timeout", "yamlContent": "schemaVersion: 1\\nid: ross-aggressive-timeout\\ndescription: Bump timeout for ross\\npriority: 105\\nappliesTo:\\n  agentSlug: ross-the-sdr\\nwhen:\\n  - kind: recentTimeoutHits\\n    window: 5\\n    atLeast: 1\\nthen:\\n  - kind: bumpTimeoutMs\\n    multiplier: 2.0" }',
+    '',
+    '### kind: "prompt-override" (write a markdown file to ~/.clementine/prompt-overrides/)',
+    'Use when the fix is "give the LLM more guidance for this job/agent". Examples: a job consistently misses an edge case, an agent needs a reminder about output format.',
+    'Shape: { "kind": "prompt-override", "scope": "job"|"agent"|"global", "scopeKey": "<job or agent name>", "content": "<markdown body>" }',
+    'For scope=global, omit scopeKey. For scope=agent, scopeKey is the agent slug. For scope=job, scopeKey is the BARE job name (no agent prefix).',
+    'Example:',
+    '{ "kind": "prompt-override", "scope": "job", "scopeKey": "market-leader-followup", "content": "If the inbox query returns 0 rows, batch the duplicate-task cleanup in groups of 50 using bash heredoc loops. Do not enumerate task IDs in the prompt." }',
+    '',
+    '## When NOT to use autoApply',
+    'For credential refreshes, multi-line CRON.md edits beyond the scalar allowlist, or any change you are not confident about: OMIT autoApply entirely. The owner will handle those manually.',
     '',
     '## Output schema (JSON only, no markdown fences):',
     '{',
-    '  "rootCause": "1-2 sentences explaining WHY the job is failing, referencing specific fields or error patterns from the CURRENT config",',
+    '  "rootCause": "1-2 sentences explaining WHY the job is failing",',
     '  "confidence": "high|medium|low",',
     '  "proposedFix": {',
-    '    "type": "config_change|prompt_change|agent_scope|disable|credential_refresh|escalate_to_owner",',
-    '    "details": "prose description of the fix, citing the exact field(s) to change",',
-    '    "diff": "optional: exact before/after diff",',
-    '    "autoApply": "optional: { agentSlug?, operations: [...] } — ONLY for simple scalar-field edits on the allowlist"',
+    '    "type": "config_change|prompt_change|agent_scope|disable|credential_refresh|advisor_rule|prompt_override|escalate_to_owner",',
+    '    "details": "prose description of the fix",',
+    '    "diff": "optional: before/after diff",',
+    '    "autoApply": "optional: one of the three shapes above"',
     '  },',
     '  "riskLevel": "low|medium|high"',
     '}',
@@ -285,28 +321,37 @@ function parseResponse(raw: string): Diagnosis | null {
 }
 
 /**
- * Strictly validate and filter autoApply. Drops ops on non-allowlisted fields
- * silently (rather than rejecting the whole diagnosis). Returns null if
- * nothing valid remains.
+ * Strictly validate and filter autoApply. Dispatches on `kind` (default 'cron'
+ * for back-compat). Returns null if validation fails for the chosen kind.
  */
-function sanitizeAutoApply(raw: unknown): NonNullable<Diagnosis['proposedFix']['autoApply']> | null {
+function sanitizeAutoApply(raw: unknown): AutoApply | null {
   if (!raw || typeof raw !== 'object') return null;
+  const obj = raw as { kind?: unknown };
+  const kind = typeof obj.kind === 'string' ? obj.kind : 'cron';
+
+  if (kind === 'cron') return sanitizeAutoApplyCron(obj);
+  if (kind === 'advisor-rule') return sanitizeAutoApplyAdvisorRule(obj);
+  if (kind === 'prompt-override') return sanitizeAutoApplyPromptOverride(obj);
+  return null;
+}
+
+function sanitizeAutoApplyCron(raw: object): AutoApplyCron | null {
   const obj = raw as { agentSlug?: unknown; operations?: unknown };
   if (!Array.isArray(obj.operations)) return null;
 
   const operations: FixOperation[] = [];
   for (const op of obj.operations) {
     if (!op || typeof op !== 'object') continue;
-    const raw = op as { op?: unknown; field?: unknown; value?: unknown };
-    if (typeof raw.field !== 'string') continue;
-    if (!EDITABLE_FIELDS.has(raw.field)) continue;
+    const r = op as { op?: unknown; field?: unknown; value?: unknown };
+    if (typeof r.field !== 'string') continue;
+    if (!EDITABLE_FIELDS.has(r.field)) continue;
 
-    if (raw.op === 'remove') {
-      operations.push({ op: 'remove', field: raw.field });
-    } else if (raw.op === 'set') {
-      const v = raw.value;
+    if (r.op === 'remove') {
+      operations.push({ op: 'remove', field: r.field });
+    } else if (r.op === 'set') {
+      const v = r.value;
       if (typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean') {
-        operations.push({ op: 'set', field: raw.field, value: v });
+        operations.push({ op: 'set', field: r.field, value: v });
       }
     }
   }
@@ -315,7 +360,40 @@ function sanitizeAutoApply(raw: unknown): NonNullable<Diagnosis['proposedFix']['
   const agentSlug = typeof obj.agentSlug === 'string' && /^[a-z0-9-]+$/i.test(obj.agentSlug)
     ? obj.agentSlug
     : undefined;
-  return agentSlug ? { agentSlug, operations } : { operations };
+  return { kind: 'cron', operations, ...(agentSlug ? { agentSlug } : {}) };
+}
+
+function sanitizeAutoApplyAdvisorRule(raw: object): AutoApplyAdvisorRule | null {
+  const obj = raw as { ruleId?: unknown; yamlContent?: unknown };
+  if (typeof obj.ruleId !== 'string' || !obj.ruleId.trim()) return null;
+  if (!/^[a-z0-9-]+$/.test(obj.ruleId)) return null; // safe filename
+  if (typeof obj.yamlContent !== 'string' || !obj.yamlContent.trim()) return null;
+  if (obj.yamlContent.length > 10_000) return null; // sanity bound
+  return {
+    kind: 'advisor-rule',
+    ruleId: obj.ruleId,
+    yamlContent: obj.yamlContent,
+  };
+}
+
+function sanitizeAutoApplyPromptOverride(raw: object): AutoApplyPromptOverride | null {
+  const obj = raw as { scope?: unknown; scopeKey?: unknown; content?: unknown };
+  if (obj.scope !== 'global' && obj.scope !== 'agent' && obj.scope !== 'job') return null;
+  if (typeof obj.content !== 'string' || !obj.content.trim()) return null;
+  if (obj.content.length > 20_000) return null; // sanity bound
+
+  if (obj.scope === 'global') {
+    return { kind: 'prompt-override', scope: 'global', content: obj.content };
+  }
+  // agent or job — require scopeKey, validate as safe filename
+  if (typeof obj.scopeKey !== 'string' || !obj.scopeKey) return null;
+  if (!/^[a-zA-Z0-9_:-]+$/.test(obj.scopeKey)) return null;
+  return {
+    kind: 'prompt-override',
+    scope: obj.scope,
+    scopeKey: obj.scopeKey,
+    content: obj.content,
+  };
 }
 
 /**
