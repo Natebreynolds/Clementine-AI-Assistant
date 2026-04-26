@@ -25,7 +25,17 @@ export async function sendChunkedSlack(
   text: string,
   threadTs?: string,
 ): Promise<void> {
-  let remaining = text;
+  // Last-line outbound credential redaction. Same rationale as
+  // discord-utils.sendChunked — chat replies bypass the dispatcher and
+  // arrive here directly, so apply redaction at the channel boundary.
+  const { redactSecrets } = await import('../security/redact.js');
+  const { text: redacted, stats } = redactSecrets(text);
+  if (stats.redactionCount > 0) {
+    console.warn(
+      `[clementine] sendChunkedSlack: redacted ${stats.redactionCount} credential-shaped value(s) [${stats.labelsHit.join(',')}]`,
+    );
+  }
+  let remaining = redacted;
   while (remaining) {
     if (remaining.length <= SLACK_MSG_LIMIT) {
       await client.chat.postMessage({ channel, text: remaining, thread_ts: threadTs });

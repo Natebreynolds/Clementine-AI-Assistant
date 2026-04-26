@@ -136,7 +136,21 @@ export async function sendChunked(
     return;
   }
   text = sanitizeResponse(text);
-  for (const chunk of chunkText(text, 1900)) {
+  // Last-line outbound credential redaction. Dispatcher-level redaction
+  // (gateway/notifications.ts) covers cron/heartbeat sends, but chat
+  // replies bypass the dispatcher and arrive here directly. Idempotent:
+  // re-redacting an already-redacted string is a no-op since the
+  // [REDACTED:label] markers don't match any pattern or known value.
+  const { redactSecrets } = await import('../security/redact.js');
+  const { text: redacted, stats } = redactSecrets(text);
+  if (stats.redactionCount > 0) {
+    // Log via console — pino isn't imported here and adding an import would
+    // bloat this lightweight utility module.
+    console.warn(
+      `[clementine] sendChunked: redacted ${stats.redactionCount} credential-shaped value(s) [${stats.labelsHit.join(',')}]`,
+    );
+  }
+  for (const chunk of chunkText(redacted, 1900)) {
     await channel.send(chunk);
   }
 }

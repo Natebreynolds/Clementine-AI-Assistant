@@ -33,7 +33,16 @@ async function sendChunked(
   chatId: number | string,
   text: string,
 ): Promise<void> {
-  let remaining = text;
+  // Last-line outbound credential redaction. Same rationale as
+  // discord-utils.sendChunked — chat replies bypass the dispatcher.
+  const { redactSecrets } = await import('../security/redact.js');
+  const { text: redacted, stats } = redactSecrets(text);
+  if (stats.redactionCount > 0) {
+    console.warn(
+      `[clementine] telegram sendChunked: redacted ${stats.redactionCount} credential-shaped value(s) [${stats.labelsHit.join(',')}]`,
+    );
+  }
+  let remaining = redacted;
   while (remaining) {
     if (remaining.length <= TELEGRAM_MSG_LIMIT) {
       await bot.api.sendMessage(chatId, remaining);

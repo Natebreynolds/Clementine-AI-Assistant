@@ -147,4 +147,16 @@ describe('redactSecrets — combined layers', () => {
     const r = redactSecrets('');
     expect(r.stats.redactionCount).toBe(0);
   });
+
+  it('idempotent on already-redacted text — channel-edge double-pass is safe', () => {
+    // Dispatcher-level redaction may run before sendChunked-level redaction.
+    // Re-redacting the same string must not corrupt the [REDACTED:...] markers
+    // or count them as new findings.
+    // pragma: allowlist secret
+    const first = redactSecrets('token sk-ant-api03-aaaaaaaaaaaaaaaaaa here');
+    expect(first.stats.redactionCount).toBe(1);
+    const second = redactSecrets(first.text);
+    expect(second.text).toBe(first.text);
+    expect(second.stats.redactionCount).toBe(0);
+  });
 });

@@ -4288,7 +4288,12 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
     try {
       const gateway = await getGateway();
       const response = await gateway.handleMessage('dashboard:web', message);
-      res.json({ ok: true, response });
+      // Outbound credential redaction — same defense applied at the channel
+      // edges. Dashboard is admin-only but a leaked credential in chat output
+      // could still end up in browser history, screenshots, etc.
+      const { redactSecrets } = await import('../security/redact.js');
+      const { text: redacted } = redactSecrets(response ?? '');
+      res.json({ ok: true, response: redacted });
     } catch (err) {
       res.status(500).json({ error: String(err) });
     }
