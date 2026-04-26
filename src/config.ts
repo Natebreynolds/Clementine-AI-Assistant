@@ -91,9 +91,25 @@ export const IDENTITY_FILE = path.join(SYSTEM_DIR, 'IDENTITY.md');
 
 // ── Assistant identity ───────────────────────────────────────────────
 
-export const ASSISTANT_NAME = getEnv('ASSISTANT_NAME', 'Clementine');
+// JSON config — loaded once at module init. Lower precedence than .env.
+import { loadClementineJson } from './config/clementine-json.js';
+const json = loadClementineJson(BASE_DIR);
+
+/**
+ * Resolve a value with full precedence: process.env > .env > clementine.json > default.
+ * `getEnv` already covers the first two (process.env wins inside getEnv), so this
+ * helper just adds JSON as a fallback before the hardcoded default.
+ */
+function getEnvOrJson(envKey: string, jsonValue: string | undefined, fallback: string): string {
+  const fromEnv = getEnv(envKey, '');
+  if (fromEnv) return fromEnv;
+  if (jsonValue) return jsonValue;
+  return fallback;
+}
+
+export const ASSISTANT_NAME = getEnvOrJson('ASSISTANT_NAME', json.assistantName, 'Clementine');
 export const ASSISTANT_NICKNAME = getEnv('ASSISTANT_NICKNAME', 'Clemmy');
-export const OWNER_NAME = getEnv('OWNER_NAME');
+export const OWNER_NAME = getEnvOrJson('OWNER_NAME', json.ownerName, '');
 
 // ── Secrets (with macOS Keychain fallback) ───────────────────────────
 
@@ -247,7 +263,7 @@ export const ALLOW_ALL_USERS = getEnv('ALLOW_ALL_USERS', 'false').toLowerCase() 
 // ── Timezone ─────────────────────────────────────────────────────────
 
 /** User-configurable timezone. Falls back to system-detected timezone. */
-export const TIMEZONE = getEnv('TIMEZONE') || Intl.DateTimeFormat().resolvedOptions().timeZone;
+export const TIMEZONE = getEnvOrJson('TIMEZONE', json.timezone, Intl.DateTimeFormat().resolvedOptions().timeZone);
 
 // ── Heartbeat ────────────────────────────────────────────────────────
 
