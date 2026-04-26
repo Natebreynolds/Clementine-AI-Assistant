@@ -1275,6 +1275,7 @@ export class MemoryStore {
     }>;
 
     const scored: SearchResult[] = [];
+    const nowMs = Date.now();
     for (const row of rows) {
       try {
         const vec = embeddingsModule.deserializeEmbedding(row.embedding);
@@ -1287,6 +1288,16 @@ export class MemoryStore {
         if (outcome !== 0) score *= 1.0 + 0.3 * outcome;
         // Soft isolation: apply boost (only when not strict)
         if (!strict && agentSlug && row.agent_slug === agentSlug) score *= 1.4;
+        // Temporal decay — same policy as FTS scoring (Phase 9d). Without
+        // this, vector and FTS rankings disagree on freshness: FTS prefers
+        // recent at equal relevance but vector treats all timestamps
+        // equally, so MMR rerank surfaces stale matches when vector wins.
+        // Same 30-day half-life, same 0.4 floor — see store.ts FTS path
+        // for design rationale.
+        if (row.updated_at) {
+          const daysOld = Math.max(0, (nowMs - new Date(row.updated_at).getTime()) / 86_400_000);
+          score *= Math.max(0.4, temporalDecay(daysOld, 30));
+        }
 
         scored.push({
           sourceFile: row.source_file,
