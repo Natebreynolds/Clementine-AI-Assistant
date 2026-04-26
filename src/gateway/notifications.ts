@@ -9,6 +9,7 @@
 import pino from 'pino';
 import type { NotificationSender, NotificationContext } from '../types.js';
 import { DeliveryQueue } from './delivery-queue.js';
+import { redactSecrets } from '../security/redact.js';
 
 const logger = pino({ name: 'clementine.notifications' });
 
@@ -78,10 +79,22 @@ export class NotificationDispatcher {
       return { delivered: false, channelErrors: { _: 'no channels registered' } };
     }
 
+    // Outbound credential redaction — last-line defense against the agent
+    // accidentally (or via prompt injection) shipping a credential to a
+    // public channel. Pattern-based + known-value scan; cheap enough to
+    // run on every send. See src/security/redact.ts for the policy.
+    const { text: redacted, stats: redactionStats } = redactSecrets(text);
+    if (redactionStats.redactionCount > 0) {
+      logger.warn(
+        { count: redactionStats.redactionCount, labels: redactionStats.labelsHit, sessionKey: context?.sessionKey },
+        `Redacted ${redactionStats.redactionCount} credential-shaped value(s) before delivery`,
+      );
+    }
+
     // Sanity cap only — each channel sender handles its own chunking/truncation
-    const capped = text.length > MAX_MESSAGE_LENGTH
-      ? text.slice(0, MAX_MESSAGE_LENGTH - 20) + '\n\n_(truncated)_'
-      : text;
+    const capped = redacted.length > MAX_MESSAGE_LENGTH
+      ? redacted.slice(0, MAX_MESSAGE_LENGTH - 20) + '\n\n_(truncated)_'
+      : redacted;
 
     // If sessionKey is set, route only to the channel that owns it.
     // Fan out to all channels only when no originating channel is known.
