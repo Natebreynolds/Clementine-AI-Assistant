@@ -61,8 +61,16 @@ export function listClementineKeychainEntries(): KeychainEntry[] {
 
 /**
  * Add `apple-tool:,apple:` to the partition list of a given account.
- * The user gets a system prompt asking for their login keychain password
- * (or none, if it was approved earlier in the session).
+ *
+ * `security set-generic-password-partition-list` prompts on the controlling
+ * terminal — `password to unlock default:` — for the user's login keychain
+ * password. We must inherit stdio so the child can read from the parent's
+ * TTY; piped stdio causes security to consume an empty line and fail with
+ * "exit code null" / "wrong password."
+ *
+ * That means this function only works when called from an interactive shell.
+ * Callers in non-TTY contexts should fall back to instructing the user to
+ * run `clementine config keychain-fix-acl` from their own terminal.
  */
 export function fixAcl(account: string): AclFixResult {
   const result = spawnSync('/usr/bin/security', [
@@ -71,17 +79,16 @@ export function fixAcl(account: string): AclFixResult {
     '-a', account,
     '-S', 'apple-tool:,apple:',
   ], {
-    stdio: ['pipe', 'pipe', 'pipe'],
-    timeout: 60_000, // 60s — gives the user time to type the keychain password
+    stdio: 'inherit',
+    timeout: 120_000, // 2min — generous since the user is typing per call
   });
   if (result.status === 0) {
     return { account, status: 'fixed' };
   }
-  const stderr = result.stderr.toString().slice(0, 200);
   return {
     account,
     status: 'failed',
-    error: stderr || `exit code ${result.status}`,
+    error: result.error?.message ?? `exit code ${result.status}`,
   };
 }
 
