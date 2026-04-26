@@ -966,6 +966,82 @@ function cmdConfigList(): void {
   console.log();
 }
 
+// ── Config show ──────────────────────────────────────────────────────
+
+async function cmdConfigShow(opts: { json?: boolean; group?: string }): Promise<void> {
+  const { computeEffectiveConfig } = await import('../config/effective-config.js');
+  const cfg = computeEffectiveConfig(BASE_DIR);
+
+  if (opts.json) {
+    console.log(JSON.stringify(cfg, null, 2));
+    return;
+  }
+
+  const DIM = '\x1b[0;90m';
+  const BOLD = '\x1b[1m';
+  const CYAN = '\x1b[0;36m';
+  const GREEN = '\x1b[0;32m';
+  const YELLOW = '\x1b[0;33m';
+  const BLUE = '\x1b[0;34m';
+  const RESET = '\x1b[0m';
+
+  const sourceColor: Record<string, string> = {
+    'process.env': YELLOW,
+    '.env': GREEN,
+    'clementine.json': CYAN,
+    'system': BLUE,
+    'default': DIM,
+  };
+
+  console.log();
+  console.log(`  ${BOLD}Data home:${RESET}        ${cfg.baseDir}`);
+  console.log(`  ${BOLD}.env present:${RESET}     ${cfg.hasEnvFile ? GREEN + 'yes' : DIM + 'no'}${RESET}`);
+  console.log(`  ${BOLD}clementine.json:${RESET}  ${cfg.hasJsonFile ? GREEN + 'present' : DIM + 'missing — defaults active'}${RESET}`);
+  console.log();
+  console.log(`  ${DIM}Sources (highest precedence first):${RESET}`);
+  console.log(`    ${YELLOW}process.env${RESET}     runtime override`);
+  console.log(`    ${GREEN}.env${RESET}            ~/.clementine/.env`);
+  console.log(`    ${CYAN}clementine.json${RESET} canonical user config`);
+  console.log(`    ${BLUE}system${RESET}          OS-derived default (e.g., timezone)`);
+  console.log(`    ${DIM}default${RESET}         compiled fallback`);
+  console.log();
+
+  // Group entries
+  const filtered = opts.group
+    ? cfg.entries.filter(e => e.group === opts.group)
+    : cfg.entries;
+
+  const byGroup = new Map<string, typeof filtered>();
+  for (const entry of filtered) {
+    const g = entry.group ?? 'misc';
+    if (!byGroup.has(g)) byGroup.set(g, []);
+    byGroup.get(g)!.push(entry);
+  }
+
+  if (filtered.length === 0) {
+    console.log(`  ${DIM}No entries${opts.group ? ` in group "${opts.group}"` : ''}.${RESET}`);
+    console.log();
+    return;
+  }
+
+  // Column widths
+  const keyWidth = Math.max(...filtered.map(e => e.key.length));
+  const valueWidth = Math.max(...filtered.map(e => String(e.value).length), 12);
+
+  for (const [group, entries] of byGroup) {
+    console.log(`  ${BOLD}${group}${RESET}`);
+    for (const entry of entries) {
+      const c = sourceColor[entry.source] ?? RESET;
+      const valueStr = String(entry.value);
+      const shadow = entry.shadowedBy && entry.shadowedBy.length > 0
+        ? ` ${DIM}(shadows: ${entry.shadowedBy.join(', ')})${RESET}`
+        : '';
+      console.log(`    ${entry.key.padEnd(keyWidth)}  ${valueStr.padEnd(valueWidth)}  ${c}${entry.source}${RESET}${shadow}`);
+    }
+    console.log();
+  }
+}
+
 // ── Advisor commands ────────────────────────────────────────────────
 
 const ADVISOR_MODES = ['off', 'shadow', 'primary'] as const;
@@ -1624,6 +1700,15 @@ configCmd
   .command('list')
   .description('List all config values')
   .action(cmdConfigList);
+
+configCmd
+  .command('show')
+  .description('Show effective config with provenance (env / json / default)')
+  .option('--json', 'Emit machine-readable JSON instead of a table')
+  .option('-g, --group <name>', 'Filter to a single group (e.g. budgets)')
+  .action(async (opts: { json?: boolean; group?: string }) => {
+    await cmdConfigShow(opts);
+  });
 
 configCmd
   .command('edit')
