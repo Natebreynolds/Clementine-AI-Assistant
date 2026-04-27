@@ -430,6 +430,12 @@ export class MemoryStore {
       this.conn.exec(`CREATE INDEX IF NOT EXISTS idx_usage_agent ON usage_log(agent_slug)`);
     } catch { /* column already exists */ }
 
+    // Migration: add cost_cents for budget enforcement (per-agent monthly caps).
+    // Stored as INTEGER cents to avoid float precision drift across aggregations.
+    try {
+      this.conn.exec(`ALTER TABLE usage_log ADD COLUMN cost_cents INTEGER DEFAULT 0`);
+    } catch { /* column already exists */ }
+
     // ── SDR Operational Tables ───────────────────────────────────────
 
     // Leads — structured prospect records for SDR workflows
@@ -3210,7 +3216,10 @@ export class MemoryStore {
 
   /**
    * Log token usage from an SDK query result.
-   * Iterates modelUsage record and inserts one row per model.
+   * Iterates modelUsage record and inserts one row per model. Cost is
+   * apportioned across models proportionally to total tokens (input +
+   * output) so per-agent monthly aggregations stay accurate when a turn
+   * uses more than one model.
    */
   logUsage(entry: {
     sessionKey: string;
@@ -3219,14 +3228,30 @@ export class MemoryStore {
     numTurns: number;
     durationMs: number;
     agentSlug?: string;
+    /** Total cost in USD for the whole turn (from SDK result.total_cost_usd). */
+    totalCostUsd?: number;
   }): void {
     if (!this._stmtInsertUsage) {
       this._stmtInsertUsage = this.conn.prepare(
-        `INSERT INTO usage_log (session_key, source, model, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, num_turns, duration_ms, agent_slug)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO usage_log (session_key, source, model, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, num_turns, duration_ms, agent_slug, cost_cents)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       );
     }
+
+    // Apportion the total cost across models by token share.
+    const totalCostCents = entry.totalCostUsd != null
+      ? Math.max(0, Math.round(entry.totalCostUsd * 100))
+      : 0;
+    const totalTokens = Object.values(entry.modelUsage).reduce(
+      (sum, u) => sum + (u.inputTokens ?? 0) + (u.outputTokens ?? 0),
+      0,
+    );
+
     for (const [model, usage] of Object.entries(entry.modelUsage)) {
+      const modelTokens = (usage.inputTokens ?? 0) + (usage.outputTokens ?? 0);
+      const shareCents = totalCostCents > 0 && totalTokens > 0
+        ? Math.round(totalCostCents * (modelTokens / totalTokens))
+        : 0;
       this._stmtInsertUsage.run(
         entry.sessionKey,
         entry.source,
@@ -3238,7 +3263,34 @@ export class MemoryStore {
         entry.numTurns ?? 0,
         entry.durationMs ?? 0,
         entry.agentSlug ?? null,
+        shareCents,
       );
+    }
+  }
+
+  /**
+   * Get the current month's spend in cents for an agent (or for global
+   * Clementine if agentSlug is null/undefined). "Month" = first day of
+   * the current calendar month in UTC.
+   */
+  getMonthlyCostCents(agentSlug: string | null | undefined): number {
+    const startOfMonth = new Date();
+    startOfMonth.setUTCDate(1);
+    startOfMonth.setUTCHours(0, 0, 0, 0);
+    const sinceIso = startOfMonth.toISOString();
+
+    const where = agentSlug
+      ? 'WHERE agent_slug = ? AND created_at >= ?'
+      : 'WHERE agent_slug IS NULL AND created_at >= ?';
+    const params = agentSlug ? [agentSlug, sinceIso] : [sinceIso];
+
+    try {
+      const row = this.conn
+        .prepare(`SELECT COALESCE(SUM(cost_cents), 0) as total FROM usage_log ${where}`)
+        .get(...params) as { total: number } | undefined;
+      return row?.total ?? 0;
+    } catch {
+      return 0;
     }
   }
 

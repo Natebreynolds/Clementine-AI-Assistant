@@ -735,6 +735,21 @@ async function asyncMain(): Promise<void> {
   gateway.setDispatcher(dispatcher);
   gateway.initSkillNotifications();
 
+  // Crash recovery — surface any forensic dumps written before this start.
+  // Fire-and-forget; if the dispatcher isn't ready yet, the next launch
+  // catches it on retry (the .ack rename only happens after send succeeds).
+  void (async () => {
+    try {
+      const { surfaceUnreadCrashReports } = await import('./agent/crash-forensics.js');
+      const count = await surfaceUnreadCrashReports(config.BASE_DIR, async (msg) => { await dispatcher.send(msg); });
+      if (count > 0) {
+        logger.info({ count }, 'Surfaced crash recovery summary to owner');
+      }
+    } catch (err) {
+      logger.warn({ err }, 'Failed to surface crash recovery summary');
+    }
+  })();
+
   // Heartbeat + Cron schedulers
   const { HeartbeatScheduler, CronScheduler } = await import('./gateway/heartbeat.js');
   const heartbeat = new HeartbeatScheduler(gateway, dispatcher);
@@ -1195,6 +1210,13 @@ function main(): void {
   process.on('unhandledRejection', (err) => {
     logger.error({ err }, 'Unhandled promise rejection — daemon staying alive');
   });
+
+  // Crash forensics — write a JSON dump alongside the existing log line
+  // so the next launch can surface "I crashed because X" via chat.
+  // Fire-and-forget: failure to load shouldn't block daemon startup.
+  import('./agent/crash-forensics.js')
+    .then(({ installCrashHandlers }) => installCrashHandlers(config.BASE_DIR))
+    .catch((err) => logger.warn({ err }, 'Failed to install crash forensics handlers — continuing without them'));
 
   // First-run auto-setup
   const envFile = path.join(config.BASE_DIR, '.env');

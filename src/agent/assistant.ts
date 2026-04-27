@@ -934,6 +934,7 @@ export class PersonalAssistant {
           numTurns: result.num_turns,
           durationMs: result.duration_ms,
           agentSlug: agentSlug ?? undefined,
+          totalCostUsd: 'total_cost_usd' in result ? (result as { total_cost_usd: number }).total_cost_usd : undefined,
         });
       } catch (err) {
         logger.warn({ err }, 'Usage logging failed');
@@ -4197,6 +4198,18 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
     const cronProfile = agentSlug && agentSlug !== 'clementine'
       ? this.profileManager.get(agentSlug)
       : null;
+
+    // Per-agent monthly budget gate. Refuse to start the cron run if this
+    // agent has exceeded its cap for the calendar month. The breaker
+    // surfaces via insight-engine so the owner sees it without polling.
+    if (cronProfile && this.memoryStore) {
+      const { checkAgentBudget } = await import('./budget-enforcement.js');
+      const budget = checkAgentBudget(cronProfile, this.memoryStore);
+      if (!budget.allowed) {
+        logger.warn({ jobName, agentSlug, spent: budget.spentCents, limit: budget.limitCents }, 'Cron job skipped — agent over monthly budget');
+        return `[BUDGET_BLOCK] ${budget.message}`;
+      }
+    }
     // Cron jobs deliver via side effects (sent emails, updated records, etc),
     // not chat text — pass mode='cron' so high_effort_low_output guard is
     // disabled. Loop detection and circular-reasoning checks stay active.

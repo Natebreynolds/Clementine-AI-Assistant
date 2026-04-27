@@ -753,6 +753,30 @@ export async function startDiscord(
     logger.error({ err }, 'Discord client error — will attempt to reconnect');
   });
 
+  // ── Connection lifecycle observability ─────────────────────────────
+  // discord.js auto-reconnects via the WebSocketManager — these handlers
+  // give us visibility into when shards drop and recover so the daemon
+  // can report "Discord went offline at HH:MM, came back at HH:MM" instead
+  // of leaving the user wondering why nothing was responding.
+  let lastDisconnectAt: number | null = null;
+  client.on(Events.ShardDisconnect, (event, shardId) => {
+    lastDisconnectAt = Date.now();
+    logger.warn({ shardId, code: event?.code, reason: event?.reason }, 'Discord shard disconnected');
+  });
+  client.on(Events.ShardReconnecting, (shardId) => {
+    logger.info({ shardId }, 'Discord shard reconnecting...');
+  });
+  client.on(Events.ShardReady, (shardId, unavailableGuilds) => {
+    if (lastDisconnectAt !== null) {
+      const downtimeMs = Date.now() - lastDisconnectAt;
+      const downtimeSec = Math.round(downtimeMs / 1000);
+      logger.info({ shardId, unavailableGuilds: unavailableGuilds?.size, downtimeSec }, 'Discord shard reconnected');
+      lastDisconnectAt = null;
+    } else {
+      logger.info({ shardId, unavailableGuilds: unavailableGuilds?.size }, 'Discord shard ready');
+    }
+  });
+
   client.once(Events.ClientReady, async (readyClient) => {
     logger.info(`${ASSISTANT_NAME} online as ${readyClient.user.tag}`);
 
