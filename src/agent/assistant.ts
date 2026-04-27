@@ -80,6 +80,7 @@ import { AgentManager } from './agent-manager.js';
 import { extractLinks } from './link-extractor.js';
 import { StallGuard } from './stall-guard.js';
 import { collectToolCalls, detectContradiction, buildCorrectionPrompt } from './contradiction-validator.js';
+import { recordToolOutcome as recordMcpToolOutcome } from './mcp-circuit-breaker.js';
 import { assembleContext } from '../memory/context-assembler.js';
 import { PromptCache } from './prompt-cache.js';
 import { searchSkills as searchSkillsSync } from './skill-extractor.js';
@@ -3239,6 +3240,12 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
         if (!contradictionRetried && attempt < PersonalAssistant.RATE_LIMIT_MAX_RETRIES && responseText.trim()) {
           try {
             const toolCallRecords = collectToolCalls(collectedSdkMessages);
+            // Feed every tool outcome to the MCP circuit breaker so flaky
+            // connectors get tripped + surfaced via the advisor-events
+            // path that insight-engine already monitors.
+            for (const r of toolCallRecords) {
+              try { recordMcpToolOutcome(r.name, r.resultClass); } catch { /* non-fatal */ }
+            }
             // Diagnostic — emits once per turn so we can see what the
             // validator is working with even when it doesn't fire. Without
             // this we're blind to the "regex missed the phrasing" case.
