@@ -4169,6 +4169,12 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
     agentSlug?: string,
   ): Promise<string> {
     setInteractionSource('autonomous');
+    // Tag every tool_use audit event with the cron job name + agent so
+    // analytics tool-usage can show "Bash×893 driven by market-leader-followup"
+    // instead of "driven by: unknown". Cleared on next setInteractionSource
+    // (cron/heartbeat boundary or interactive chat takeover).
+    const { setActiveQueryContext } = await import('./hooks.js');
+    setActiveQueryContext({ job: jobName, source: 'cron', agentSlug });
     const cronProfile = agentSlug && agentSlug !== 'clementine'
       ? this.profileManager.get(agentSlug)
       : null;
@@ -4682,6 +4688,10 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
 
       // Re-assert autonomous source — a chat message may have changed it between phases
       setInteractionSource('autonomous');
+      // Tag tool_use audit events with the unleashed job name (Phase 11).
+      // Re-asserted each phase since setInteractionSource clears the context.
+      const { setActiveQueryContext: _setActiveQueryContext } = await import('./hooks.js');
+      _setActiveQueryContext({ job: jobName, source: 'unleashed', agentSlug });
 
       // Unleashed phases run side-effect-heavy work; same logic as cron mode.
       const phaseGuard = new StallGuard('unleashed');

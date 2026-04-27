@@ -1329,6 +1329,69 @@ async function cmdConfigKeychainFixAcl(opts: { list?: boolean }): Promise<void> 
   console.log();
 }
 
+// ── Analytics ────────────────────────────────────────────────────────
+
+async function cmdAnalyticsToolUsage(opts: { hours?: string; json?: boolean; limit?: string }): Promise<void> {
+  const { buildToolUsageReport, defaultAuditLogPath } = await import('../analytics/tool-usage.js');
+  const hours = Math.max(1, parseInt(opts.hours ?? '24', 10) || 24);
+  const limit = Math.max(1, parseInt(opts.limit ?? '10', 10) || 10);
+  const end = new Date();
+  const start = new Date(end.getTime() - hours * 60 * 60 * 1000);
+  const report = buildToolUsageReport(defaultAuditLogPath(BASE_DIR), start.toISOString(), end.toISOString());
+
+  if (opts.json) {
+    console.log(JSON.stringify(report, null, 2));
+    return;
+  }
+
+  const DIM = '\x1b[0;90m';
+  const BOLD = '\x1b[1m';
+  const CYAN = '\x1b[0;36m';
+  const GREEN = '\x1b[0;32m';
+  const YELLOW = '\x1b[0;33m';
+  const RESET = '\x1b[0m';
+
+  console.log();
+  console.log(`  ${BOLD}Window:${RESET} last ${hours}h ${DIM}(${start.toISOString()} → ${end.toISOString()})${RESET}`);
+  console.log(`  ${BOLD}Total tool calls:${RESET} ${report.totalToolCalls.toLocaleString()}`);
+  console.log(`  ${BOLD}Total queries:${RESET}    ${report.totalQueries.toLocaleString()}`);
+  console.log(`  ${BOLD}Total cost:${RESET}       ${GREEN}$${report.totalCostUsd.toFixed(4)}${RESET}`);
+  console.log();
+
+  if (report.families.length === 0) {
+    console.log(`  ${DIM}No tool_use events in window.${RESET}`);
+    console.log();
+    return;
+  }
+
+  const top = report.families.slice(0, limit);
+  const maxCalls = Math.max(...top.map(f => f.totalCalls));
+  const familyWidth = Math.max(...top.map(f => f.family.length), 12);
+
+  console.log(`  ${BOLD}Top ${top.length} tool families${RESET}`);
+  for (const f of top) {
+    const pct = report.totalToolCalls > 0
+      ? ((f.totalCalls / report.totalToolCalls) * 100).toFixed(1)
+      : '0.0';
+    const barLen = Math.round((f.totalCalls / maxCalls) * 28);
+    const bar = '█'.repeat(barLen).padEnd(28);
+    console.log(
+      `    ${CYAN}${f.family.padEnd(familyWidth)}${RESET}  ` +
+      `${String(f.totalCalls).padStart(5)} ${DIM}calls${RESET}  ` +
+      `${pct.padStart(5)}%  ${YELLOW}${bar}${RESET}`,
+    );
+
+    // Top 2 individual tools within each family + top source
+    const topTools = f.byTool.slice(0, 2).map(t => `${t.tool}×${t.count}`).join(', ');
+    const topSource = f.bySource[0];
+    console.log(`      ${DIM}top tools: ${topTools}${RESET}`);
+    if (topSource) {
+      console.log(`      ${DIM}driven by: ${topSource.source} (${topSource.count} calls)${RESET}`);
+    }
+  }
+  console.log();
+}
+
 // ── Advisor commands ────────────────────────────────────────────────
 
 const ADVISOR_MODES = ['off', 'shadow', 'primary'] as const;
@@ -1891,6 +1954,20 @@ advisorCmd
   .command('rules')
   .description('List loaded advisor rules')
   .action(cmdAdvisorRules);
+
+const analyticsCmd = program
+  .command('analytics')
+  .description('Production telemetry: tool usage, cost breakdowns');
+
+analyticsCmd
+  .command('tool-usage')
+  .description('Show which tool families are firing most over a time window')
+  .option('-h, --hours <n>', 'Window size in hours (default 24)', '24')
+  .option('--json', 'Emit machine-readable JSON')
+  .option('-l, --limit <n>', 'Show top N families (default 10)', '10')
+  .action(async (opts: { hours?: string; json?: boolean; limit?: string }) => {
+    await cmdAnalyticsToolUsage(opts);
+  });
 
 const dashCmd = program
   .command('dashboard')

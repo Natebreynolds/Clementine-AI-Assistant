@@ -193,6 +193,11 @@ export function setSendPolicyChecker(checker: ((agentSlug: string, recipientEmai
 
 export function setInteractionSource(source: 'owner-dm' | 'owner-channel' | 'member-channel' | 'autonomous'): void {
   interactionSource = source;
+  // Clear any leftover query attribution context. Cron / unleashed paths
+  // immediately call setActiveQueryContext after this; interactive chat
+  // doesn't, so anything still set from a prior cron run gets reset.
+  activeJob = null;
+  activeSource = null;
 }
 
 
@@ -212,6 +217,27 @@ export function clearAuditLog(): void {
   auditLog.length = 0;
 }
 
+// Ambient job/source context so audit tool_use events carry attribution.
+// Set by the assistant before running a query; cleared after. Without this
+// the analytics view shows everything as "driven by: unknown". The
+// activeAgentSlug field is already declared above (line ~27) for the
+// existing send-policy infrastructure — we read but don't redeclare it.
+let activeJob: string | null = null;
+let activeSource: string | null = null;
+
+export function setActiveQueryContext(ctx: { job?: string | null; source?: string | null; agentSlug?: string | null }): void {
+  activeJob = ctx.job ?? null;
+  activeSource = ctx.source ?? null;
+  if (ctx.agentSlug !== undefined) activeAgentSlug = ctx.agentSlug;
+}
+
+export function clearActiveQueryContext(): void {
+  activeJob = null;
+  activeSource = null;
+  // Don't clear activeAgentSlug — it's owned by the send-policy path,
+  // not by us. setInteractionSource resets it in the relevant transitions.
+}
+
 export function logToolUse(toolName: string, toolInput: Record<string, unknown>): void {
   const timestamp = new Date().toLocaleTimeString('en-US', { hour12: false });
   const summary = summarizeToolCall(toolName, toolInput);
@@ -222,6 +248,9 @@ export function logToolUse(toolName: string, toolInput: Record<string, unknown>)
     event_type: 'tool_use',
     tool_name: toolName,
     summary,
+    ...(activeJob ? { job: activeJob } : {}),
+    ...(activeSource ? { source: activeSource } : {}),
+    ...(activeAgentSlug ? { agent_slug: activeAgentSlug } : {}),
   });
 }
 
