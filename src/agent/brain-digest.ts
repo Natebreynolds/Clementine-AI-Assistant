@@ -156,40 +156,106 @@ function gatherMemoryDeltas(memoryStore: MemoryStore, sinceIso: string): BrainDi
 
 /**
  * Format the raw inputs as a single text block the LLM can synthesize.
- * Kept terse — the LLM does the heavy lifting of pattern surfacing.
+ * Pre-LLM compression: rank by signal-bearing fields (failures over runs,
+ * agent-spread over cluster size, growth over alpha-sort) and summarize the
+ * tail rather than dropping it. Same picture in fewer tokens — the model
+ * still sees the long-tail counts but doesn't pay tokens for each entry.
+ *
+ * Inspired by the skill-chaining COMPRESS pattern: filter at the boundary,
+ * synthesize in the LLM. Tail-summary lines preserve the volume signal
+ * ("X more agents added Y chunks total") without per-row cost.
  */
 export function formatRawMaterial(inputs: BrainDigestInputs): string {
   const sections: string[] = [];
 
   sections.push(`## Window\nLast ${inputs.windowDays} days.`);
 
-  sections.push(`## Team roster\n${inputs.agents.length === 0 ? '(no specialist agents)' : inputs.agents.map(a => `- ${a.name} (${a.slug})`).join('\n')}`);
+  // Team roster — split active vs. quiet so the synthesis prompt naturally
+  // weights active agents in "per-agent highlights" without confabulating
+  // about agents that did nothing this window.
+  const activeSlugSet = new Set<string>([
+    ...inputs.cronRunsByJob.map(r => r.agentSlug).filter((s): s is string => !!s),
+    ...inputs.memoryDeltas.filter(d => d.agentSlug !== 'global').map(d => d.agentSlug),
+  ]);
+  const activeAgents = inputs.agents.filter(a => activeSlugSet.has(a.slug));
+  const quietAgents = inputs.agents.filter(a => !activeSlugSet.has(a.slug));
+  if (inputs.agents.length === 0) {
+    sections.push(`## Team roster\n(no specialist agents)`);
+  } else {
+    const lines: string[] = [];
+    if (activeAgents.length > 0) {
+      lines.push(`Active this window:\n${activeAgents.map(a => `- ${a.name} (${a.slug})`).join('\n')}`);
+    }
+    if (quietAgents.length > 0) {
+      lines.push(`Quiet this window: ${quietAgents.map(a => a.slug).join(', ')}`);
+    }
+    sections.push(`## Team roster\n${lines.join('\n\n')}`);
+  }
 
+  // Cron activity — failures-first ranking so the synthesis prompt sees the
+  // problem signal early, with a tail summary preserving total volume.
   if (inputs.cronRunsByJob.length === 0) {
     sections.push(`## Cron activity\n(no autonomous runs in window)`);
   } else {
-    const lines = inputs.cronRunsByJob.slice(0, 20).map(r => {
+    const ranked = [...inputs.cronRunsByJob].sort((a, b) => {
+      // Failures dominate; ties broken by run count (busier jobs more important).
+      if (b.failures !== a.failures) return b.failures - a.failures;
+      return b.runs - a.runs;
+    });
+    const TOP_N = 12;
+    const top = ranked.slice(0, TOP_N);
+    const tail = ranked.slice(TOP_N);
+    const lines = top.map(r => {
       const tag = r.agentSlug ? ` [${r.agentSlug}]` : '';
       const failTag = r.failures > 0 ? ` — ${r.failures} failure${r.failures === 1 ? '' : 's'}` : '';
       return `- ${r.jobName}${tag}: ${r.runs} run${r.runs === 1 ? '' : 's'}${failTag}`;
     });
+    if (tail.length > 0) {
+      const tailRuns = tail.reduce((s, r) => s + r.runs, 0);
+      const tailFailures = tail.reduce((s, r) => s + r.failures, 0);
+      lines.push(`- _…and ${tail.length} more job${tail.length === 1 ? '' : 's'}: ${tailRuns} runs, ${tailFailures} failures total_`);
+    }
     sections.push(`## Cron activity\n${lines.join('\n')}`);
   }
 
+  // Memory growth — top-N by delta, summarize rest. The LLM doesn't need a
+  // 30-line list of every agent that wrote one chunk; it needs to know who
+  // wrote a lot.
   if (inputs.memoryDeltas.length === 0) {
     sections.push(`## Memory growth\n(no new chunks in window)`);
   } else {
-    const lines = inputs.memoryDeltas.map(d => `- ${d.agentSlug}: +${d.chunksAdded} chunks`);
+    const TOP_N = 8;
+    const top = inputs.memoryDeltas.slice(0, TOP_N);
+    const tail = inputs.memoryDeltas.slice(TOP_N);
+    const lines = top.map(d => `- ${d.agentSlug}: +${d.chunksAdded} chunks`);
+    if (tail.length > 0) {
+      const tailTotal = tail.reduce((s, d) => s + d.chunksAdded, 0);
+      lines.push(`- _…and ${tail.length} other agent${tail.length === 1 ? '' : 's'}: +${tailTotal} chunks combined_`);
+    }
     sections.push(`## Memory growth\n${lines.join('\n')}`);
   }
 
+  // Cross-agent recurrence — widest-spread clusters first (most agents
+  // touched), with cluster size as tiebreaker. Spread is the signal of
+  // "this is genuinely team knowledge" — a 3-cluster touching 4 agents
+  // matters more than a 10-cluster touching 2.
   if (inputs.crossAgentClusters.length === 0) {
     sections.push(`## Cross-agent recurrence\n(no facts surfaced from 2+ agents)`);
   } else {
-    const lines = inputs.crossAgentClusters.slice(0, 12).map((c, i) => {
+    const ranked = [...inputs.crossAgentClusters].sort((a, b) => {
+      if (b.agents.length !== a.agents.length) return b.agents.length - a.agents.length;
+      return b.memberCount - a.memberCount;
+    });
+    const TOP_N = 8;
+    const top = ranked.slice(0, TOP_N);
+    const tail = ranked.slice(TOP_N);
+    const lines = top.map((c, i) => {
       const preview = c.representativeContent.replace(/\n/g, ' ').slice(0, 200);
       return `${i + 1}. agents: ${c.agents.join(', ')} (${c.memberCount} chunks)\n   "${preview}${preview.length >= 200 ? '…' : ''}"`;
     });
+    if (tail.length > 0) {
+      lines.push(`_…and ${tail.length} more cross-agent cluster${tail.length === 1 ? '' : 's'} (smaller spread, not surfaced individually)._`);
+    }
     sections.push(`## Cross-agent recurrence\n${lines.join('\n')}`);
   }
 

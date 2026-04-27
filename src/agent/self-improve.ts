@@ -942,28 +942,50 @@ export class SelfImproveLoop {
 
     const patternAnalysis = this.analyzeExperimentPatterns(history);
 
-    // Format negative feedback
-    const negativeFeedbackText = metrics.negativeFeedback.slice(0, 5).map(f =>
+    // Pre-LLM compression: when this is a focused per-agent cycle, filter
+    // every metrics text to that agent's own data. Without this, the LLM
+    // sees ALL agents' cron errors / reflections and may propose changes
+    // for the focused agent based on signals from a totally different one.
+    // (Skill-chaining COMPRESS pattern: filter at the boundary, synthesize
+    // in the LLM.)
+    const focusedSlug = this.config.agentSlug;
+    const isAgentScoped = (jobName: string): boolean =>
+      !!focusedSlug && jobName.startsWith(`${focusedSlug}:`);
+
+    const filteredNegativeFeedback = focusedSlug
+      // Negative feedback rows don't carry agent tags reliably — keep all
+      // when in agent mode but cap tighter so noise stays bounded.
+      ? metrics.negativeFeedback.slice(0, 3)
+      : metrics.negativeFeedback.slice(0, 5);
+    const negativeFeedbackText = filteredNegativeFeedback.map(f =>
       `- Rating: ${f.rating} | Message: "${(f.messageSnippet ?? '').slice(0, 100)}" | Response: "${(f.responseSnippet ?? '').slice(0, 100)}"${f.comment ? ` | Comment: "${f.comment}"` : ''}`
     ).join('\n') || '(no negative feedback)';
 
-    // Format cron errors
-    const cronErrorsText = metrics.cronErrors.slice(0, 5).map(e =>
+    // Format cron errors — filter to focused agent's jobs when applicable.
+    const filteredCronErrors = focusedSlug
+      ? metrics.cronErrors.filter(e => isAgentScoped(e.jobName ?? ''))
+      : metrics.cronErrors;
+    const cronErrorsText = filteredCronErrors.slice(0, 5).map(e =>
       `- Job: ${e.jobName} | Error: ${(e.error ?? 'unknown').slice(0, 200)} | At: ${e.startedAt}`
-    ).join('\n') || '(no cron errors)';
+    ).join('\n') || (focusedSlug ? `(no cron errors for ${focusedSlug} in window)` : '(no cron errors)');
 
-    // Format cron reflections (quality ratings from automated reflection passes)
-    const cronReflectionsText = metrics.cronReflections.slice(-10).map(r =>
+    // Format cron reflections — same filter.
+    const filteredReflections = focusedSlug
+      ? metrics.cronReflections.filter(r => r.agentSlug === focusedSlug || isAgentScoped(r.jobName ?? ''))
+      : metrics.cronReflections;
+    const cronReflectionsText = filteredReflections.slice(-10).map(r =>
       `- Job: ${r.jobName}${r.agentSlug ? ` (${r.agentSlug})` : ''} | Quality: ${r.quality}/5 | ` +
       `Exist: ${r.existence ?? '?'} Substance: ${r.substance ?? '?'} Actionable: ${r.actionable ?? '?'} ` +
       `Comm: ${r.communication ?? '?'} | ` +
       `Gap: "${r.gap?.slice(0, 80) ?? ''}"${r.commNote ? ` | CommNote: "${r.commNote.slice(0, 80)}"` : ''} | At: ${r.timestamp}`
-    ).join('\n') || '(no cron reflections yet)';
+    ).join('\n') || (focusedSlug ? `(no cron reflections for ${focusedSlug} yet)` : '(no cron reflections yet)');
 
-    // Compute per-agent metrics from reflections
+    // Compute per-agent metrics from reflections — when focused, only show
+    // this agent's row (the others are irrelevant to the proposal).
     const agentMetrics = new Map<string, { total: number; qualitySum: number; emptyCount: number; gaps: string[] }>();
     for (const r of metrics.cronReflections) {
       const slug = r.agentSlug || 'clementine';
+      if (focusedSlug && slug !== focusedSlug) continue;
       if (!agentMetrics.has(slug)) {
         agentMetrics.set(slug, { total: 0, qualitySum: 0, emptyCount: 0, gaps: [] });
       }
@@ -981,7 +1003,7 @@ export class SelfImproveLoop {
           const topGaps = m.gaps.slice(-3).map(g => g.slice(0, 60)).join('; ') || 'none';
           return `- ${slug}: avg quality ${avgQ}/5, ${emptyPct}% empty outputs, common gaps: "${topGaps}"`;
         }).join('\n')
-      : '(no per-agent data yet)';
+      : (focusedSlug ? `(no reflection data for ${focusedSlug} yet)` : '(no per-agent data yet)');
 
     // Format goal health data
     const goalHealthText = metrics.goalHealth.length > 0
