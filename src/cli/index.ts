@@ -466,20 +466,25 @@ async function cmdRestart(options: { foreground?: boolean }): Promise<void> {
 }
 
 function cmdStatus(): void {
+  const DIM = '\x1b[0;90m';
+  const RESET = '\x1b[0m';
   const pid = readPid();
   const name = getAssistantName();
+  const localVersion = readPkgVersion(PACKAGE_ROOT);
 
   if (!pid) {
-    console.log(`  ${name} is not running (no PID file).`);
+    console.log(`  ${name} is not running ${DIM}(no PID file, v${localVersion})${RESET}.`);
+    surfaceUpdateNudge(localVersion);
     return;
   }
 
   if (!isProcessAlive(pid)) {
-    console.log(`  ${name} is not running (stale PID ${pid}).`);
+    console.log(`  ${name} is not running ${DIM}(stale PID ${pid}, v${localVersion})${RESET}.`);
+    surfaceUpdateNudge(localVersion);
     return;
   }
 
-  console.log(`  ${name} is running (PID ${pid})`);
+  console.log(`  ${name} is running ${DIM}(PID ${pid}, v${localVersion})${RESET}`);
 
   // Show uptime from PID file mtime
   try {
@@ -504,6 +509,37 @@ function cmdStatus(): void {
   }
   if (channels.length > 0) {
     console.log(`  Channels: ${channels.join(', ')}`);
+  }
+
+  surfaceUpdateNudge(localVersion);
+}
+
+/**
+ * Print a one-line nudge if a newer version is on npm. Reads the cached
+ * result synchronously (no network on the hot path) and fires off an async
+ * refresh in the background so the next call has fresh data.
+ */
+function surfaceUpdateNudge(localVersion: string): void {
+  const DIM = '\x1b[0;90m';
+  const BOLD = '\x1b[1m';
+  const YELLOW = '\x1b[1;33m';
+  const RESET = '\x1b[0m';
+  try {
+    const cached = (() => {
+      // Lazy require to avoid pulling https/network into trivial CLI calls
+      // when the cache module isn't needed.
+      const { readCachedUpdateCheck } = require('./version-check.js') as typeof import('./version-check.js');
+      return readCachedUpdateCheck(BASE_DIR, localVersion);
+    })();
+    if (cached?.updateAvailable && cached.latestVersion) {
+      console.log(`  ${YELLOW}⬆${RESET}  Update available: ${BOLD}v${cached.latestVersion}${RESET} ${DIM}(you're on v${localVersion})${RESET}`);
+      console.log(`     ${DIM}Run: ${BOLD}clementine update restart${RESET}`);
+    }
+    // Fire-and-forget background refresh — never blocks status output.
+    const { checkForUpdate } = require('./version-check.js') as typeof import('./version-check.js');
+    void checkForUpdate(BASE_DIR, localVersion).catch(() => { /* silent */ });
+  } catch {
+    // version-check failed to load — degrade silently
   }
 }
 
@@ -2093,11 +2129,16 @@ program
 
 program
   .command('update')
-  .description('Pull latest code, rebuild, and reinstall (preserves config)')
-  .argument('[action]', 'Optional: "restart" to restart daemon after update')
+  .description('Pull latest code, rebuild, and reinstall (preserves config). Pass "history" to show recent updates.')
+  .argument('[action]', 'Optional: "restart" = restart daemon after update; "history" = show update log')
   .option('--restart', 'Restart daemon after update')
   .option('--dry-run', 'Preview what would happen without making changes')
-  .action((action: string | undefined, options: { restart?: boolean; dryRun?: boolean }) => {
+  .option('-n, --limit <n>', 'For history mode: max entries to show', '10')
+  .action((action: string | undefined, options: { restart?: boolean; dryRun?: boolean; limit?: string }) => {
+    if (action === 'history') {
+      cmdUpdateHistory(parseInt(options.limit ?? '10', 10));
+      return;
+    }
     if (action === 'restart') options.restart = true;
     cmdUpdate(options).catch((err: unknown) => {
       console.error('Update failed:', err);
@@ -2704,15 +2745,106 @@ projectsCmd
 
 // ── Update command ──────────────────────────────────────────────────
 
+/** Print the last N entries from update-history.jsonl. */
+function cmdUpdateHistory(limit: number): void {
+  const BOLD = '\x1b[1m';
+  const DIM = '\x1b[0;90m';
+  const GREEN = '\x1b[0;32m';
+  const RED = '\x1b[0;31m';
+  const RESET = '\x1b[0m';
+  const historyPath = path.join(BASE_DIR, 'update-history.jsonl');
+  if (!existsSync(historyPath)) {
+    console.log();
+    console.log(`  ${DIM}No update history yet (${historyPath} doesn't exist).${RESET}`);
+    console.log(`  Run ${BOLD}clementine update${RESET} once to start the log.`);
+    console.log();
+    return;
+  }
+  const lines = readFileSync(historyPath, 'utf-8').split('\n').filter(Boolean);
+  const entries = lines
+    .map(l => { try { return JSON.parse(l); } catch { return null; } })
+    .filter((e): e is Record<string, unknown> => e !== null)
+    .slice(-Math.max(1, limit))
+    .reverse();
+  if (entries.length === 0) {
+    console.log(`  ${DIM}History file exists but is empty or unparseable.${RESET}`);
+    return;
+  }
+  console.log();
+  console.log(`  ${BOLD}Update history${RESET}  ${DIM}(${historyPath})${RESET}`);
+  console.log();
+  for (const e of entries) {
+    const ts = String(e.timestamp ?? '').slice(0, 19).replace('T', ' ');
+    const from = String(e.fromVersion ?? '?');
+    const to = String(e.toVersion ?? '?');
+    const flavor = String(e.flavor ?? 'git');
+    const failed = e.failed === true;
+    const arrow = from === to ? '=' : '→';
+    const verLabel = failed
+      ? `${RED}v${from} ${arrow} v${to} FAILED${RESET}`
+      : (from === to ? `${DIM}v${from}${RESET}` : `v${from} ${arrow} ${BOLD}v${to}${RESET}`);
+    const dur = typeof e.durationMs === 'number' ? ` ${DIM}(${Math.round(e.durationMs / 1000)}s)${RESET}` : '';
+    console.log(`  ${DIM}${ts}${RESET}  ${verLabel}  ${DIM}[${flavor}]${RESET}${dur}`);
+    if (typeof e.commitHash === 'string' && e.commitHash) {
+      console.log(`     ${DIM}commit ${e.commitHash}${e.commitDate ? ` (${e.commitDate})` : ''}, ${e.commitsPulled ?? 0} commit${e.commitsPulled === 1 ? '' : 's'} pulled${RESET}`);
+    }
+    if (typeof e.summary === 'string' && e.summary) {
+      const trimmed = e.summary.length > 100 ? e.summary.slice(0, 100) + '…' : e.summary;
+      console.log(`     ${DIM}${trimmed}${RESET}`);
+    }
+    if (failed && typeof e.error === 'string') {
+      console.log(`     ${RED}error: ${e.error.slice(0, 120)}${RESET}`);
+    }
+    const modSummary: string[] = [];
+    if (typeof e.modsReapplied === 'number' && e.modsReapplied > 0) modSummary.push(`${e.modsReapplied} re-applied`);
+    if (typeof e.modsSuperseded === 'number' && e.modsSuperseded > 0) modSummary.push(`${e.modsSuperseded} superseded`);
+    if (typeof e.modsNeedReconciliation === 'number' && e.modsNeedReconciliation > 0) modSummary.push(`${e.modsNeedReconciliation} need attention`);
+    if (typeof e.modsFailed === 'number' && e.modsFailed > 0) modSummary.push(`${e.modsFailed} failed`);
+    if (modSummary.length > 0) {
+      console.log(`     ${DIM}source mods: ${modSummary.join(', ')}${RESET}`);
+    }
+  }
+  console.log();
+  console.log(`  ${GREEN}Showing ${entries.length}${RESET}${DIM} of ${lines.length} total entries.${RESET}`);
+  console.log();
+}
+
+/** Read the npm version from a package.json (returns 'unknown' on failure). */
+function readPkgVersion(packageRoot: string): string {
+  try {
+    const pkgPath = path.join(packageRoot, 'package.json');
+    if (!existsSync(pkgPath)) return 'unknown';
+    const pkg = JSON.parse(readFileSync(pkgPath, 'utf-8')) as { version?: string };
+    return pkg.version ?? 'unknown';
+  } catch {
+    return 'unknown';
+  }
+}
+
+/** Append one line to the update-history log. Append-only, never throws. */
+function appendUpdateHistory(entry: Record<string, unknown>): void {
+  try {
+    const historyPath = path.join(BASE_DIR, 'update-history.jsonl');
+    const line = JSON.stringify({ timestamp: new Date().toISOString(), ...entry }) + '\n';
+    require('node:fs').appendFileSync(historyPath, line, { mode: 0o600 });
+  } catch {
+    // Non-fatal — history is observability, not critical state.
+  }
+}
+
 async function cmdUpdate(options: { restart?: boolean; dryRun?: boolean }): Promise<void> {
   const DIM = '\x1b[0;90m';
+  const BOLD = '\x1b[1m';
   const GREEN = '\x1b[0;32m';
   const YELLOW = '\x1b[1;33m';
   const RED = '\x1b[0;31m';
   const RESET = '\x1b[0m';
 
+  const updateStartedAt = Date.now();
+  const previousVersion = readPkgVersion(PACKAGE_ROOT);
+
   console.log();
-  console.log(`  ${DIM}Updating ${getAssistantName()}...${RESET}`);
+  console.log(`  ${DIM}Updating ${getAssistantName()} (current: v${previousVersion})...${RESET}`);
   console.log();
 
   // 1. Detect install flavor. Two valid paths:
@@ -2730,11 +2862,33 @@ async function cmdUpdate(options: { restart?: boolean; dryRun?: boolean }): Prom
     console.log();
     try {
       execSync('npm install -g clementine-agent@latest', { stdio: 'inherit' });
+      const newVersion = readPkgVersion(PACKAGE_ROOT);
       console.log();
-      console.log(`  ${GREEN}OK${RESET}  Updated via npm`);
+      if (previousVersion !== 'unknown' && newVersion !== 'unknown' && previousVersion !== newVersion) {
+        console.log(`  ${GREEN}OK${RESET}  Updated v${previousVersion} → ${BOLD}v${newVersion}${RESET}`);
+      } else if (previousVersion === newVersion) {
+        console.log(`  ${GREEN}OK${RESET}  Already on latest (v${newVersion})`);
+      } else {
+        console.log(`  ${GREEN}OK${RESET}  Updated via npm`);
+      }
+      appendUpdateHistory({
+        flavor: 'npm-global',
+        fromVersion: previousVersion,
+        toVersion: newVersion,
+        durationMs: Date.now() - updateStartedAt,
+        restartRequested: !!options.restart,
+      });
     } catch (err) {
       console.error(`  ${RED}FAIL${RESET}  npm update failed: ${String(err).slice(0, 200)}`);
       console.error(`  ${YELLOW}Hint${RESET}  If you see EACCES, see README "Troubleshooting" for npm prefix setup.`);
+      appendUpdateHistory({
+        flavor: 'npm-global',
+        fromVersion: previousVersion,
+        toVersion: previousVersion,
+        durationMs: Date.now() - updateStartedAt,
+        failed: true,
+        error: String(err).slice(0, 300),
+      });
       process.exit(1);
     }
     if (options.restart) {
@@ -3271,6 +3425,28 @@ async function cmdUpdate(options: { restart?: boolean; dryRun?: boolean }): Prom
     }).trim().slice(0, 10);
   } catch { /* best effort */ }
 
+  // Capture the new version once the build is verified — package.json on
+  // disk is now authoritative for the version we're about to run.
+  const newVersion = readPkgVersion(PACKAGE_ROOT);
+
+  // Persist update history before the restart (in case daemon restart fails,
+  // we still have the record of what was attempted).
+  appendUpdateHistory({
+    flavor: 'git',
+    fromVersion: previousVersion,
+    toVersion: newVersion,
+    commitHash,
+    commitDate,
+    commitsPulled,
+    summary: pullSummary.split('\n').slice(0, 5).join('; '),
+    modsReapplied: reconcileResult?.reapplied.length ?? 0,
+    modsSuperseded: reconcileResult?.superseded.length ?? 0,
+    modsNeedReconciliation: reconcileResult?.needsReconciliation.length ?? 0,
+    modsFailed: reconcileResult?.failed.length ?? 0,
+    durationMs: Date.now() - updateStartedAt,
+    restartRequested: !!(options.restart || wasRunning),
+  });
+
   if (options.restart || wasRunning) {
     const sentinelPath = path.join(BASE_DIR, '.restart-sentinel.json');
     const sentinel: import('../types.js').RestartSentinel = {
@@ -3278,6 +3454,8 @@ async function cmdUpdate(options: { restart?: boolean; dryRun?: boolean }): Prom
       restartedAt: new Date().toISOString(),
       reason: 'update',
       updateDetails: {
+        previousVersion,
+        newVersion,
         commitHash,
         commitDate,
         commitsBehind: commitsPulled,
@@ -3364,7 +3542,11 @@ async function cmdUpdate(options: { restart?: boolean; dryRun?: boolean }): Prom
 
   // 14. Show current version
   console.log();
-  if (commitHash) {
+  if (previousVersion !== 'unknown' && newVersion !== 'unknown' && previousVersion !== newVersion) {
+    console.log(`  ${GREEN}Updated v${previousVersion} → ${BOLD}v${newVersion}${RESET}${commitHash ? ` ${DIM}(${commitHash})${RESET}` : ''}`);
+  } else if (previousVersion === newVersion && previousVersion !== 'unknown') {
+    console.log(`  ${GREEN}Already on latest (v${newVersion})${RESET}${commitHash ? ` ${DIM}(${commitHash})${RESET}` : ''}`);
+  } else if (commitHash) {
     console.log(`  ${GREEN}Updated to ${commitHash} (${commitDate})${RESET}`);
   } else {
     console.log(`  ${GREEN}Update complete.${RESET}`);

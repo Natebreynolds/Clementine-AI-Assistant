@@ -676,6 +676,10 @@ export interface RestartSentinel {
   changedFiles?: string[];     // for rollback if child crashes
   // Update details (populated by `clementine update` and auto-update)
   updateDetails?: {
+    /** Semver before the update — read from package.json prior to git pull. */
+    previousVersion?: string;
+    /** Semver after the update — read from package.json after build. */
+    newVersion?: string;
     commitHash?: string;
     commitDate?: string;
     commitsBehind?: number;     // how many commits were pulled

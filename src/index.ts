@@ -973,8 +973,12 @@ async function asyncMain(): Promise<void> {
       const d = sentinel.updateDetails;
       const parts: string[] = [];
 
-      // Version info
-      if (d.commitHash) {
+      // Version info — prefer semver transition over commit hash for human readability.
+      if (d.previousVersion && d.newVersion && d.previousVersion !== d.newVersion) {
+        parts.push(`Updated v${d.previousVersion} → v${d.newVersion}`);
+      } else if (d.newVersion) {
+        parts.push(`Now on v${d.newVersion}`);
+      } else if (d.commitHash) {
         parts.push(`Updated to ${d.commitHash}${d.commitDate ? ` (${d.commitDate})` : ''}`);
       } else {
         parts.push('Update applied');
