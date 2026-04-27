@@ -2141,11 +2141,12 @@ function safeJobName(name: string): string {
 
 server.tool(
   'cron_progress_read',
-  'Read progress state from a previous cron job run. Returns what was completed, what is pending, and free-form notes from the last run.',
+  'Read progress state from a previous cron job run. Returns what was completed (most recent first, capped), what is pending, and free-form notes from the last run.',
   {
     job_name: z.string().describe('Cron job name'),
+    max_completed: z.number().int().positive().optional().describe('Max completedItems to return (default 50, most recent first). Phase 11d: long-running jobs accumulate hundreds of items that bloat the agent context — the cap is plenty for "what did I do recently".'),
   },
-  async ({ job_name }) => {
+  async ({ job_name, max_completed }) => {
     ensureCronProgressDir();
     const filePath = path.join(CRON_PROGRESS_DIR, `${safeJobName(job_name)}.json`);
     if (!existsSync(filePath)) {
@@ -2157,17 +2158,36 @@ server.tool(
         `## Progress for "${job_name}"`,
         `**Last run:** ${progress.lastRunAt} | **Run count:** ${progress.runCount}`,
       ];
+      const cap = max_completed ?? 50;
       if (progress.completedItems?.length > 0) {
-        lines.push(`\n### Completed\n${progress.completedItems.map((i: string) => `- ${i}`).join('\n')}`);
+        const total = progress.completedItems.length;
+        // Most-recent-first slice, then re-reverse so output reads chronologically.
+        const sliced = total > cap
+          ? progress.completedItems.slice(-cap)
+          : progress.completedItems;
+        const droppedNote = total > cap
+          ? ` _(showing ${cap} most recent of ${total}; pass max_completed for more)_`
+          : '';
+        lines.push(`\n### Completed${droppedNote}\n${sliced.map((i: string) => `- ${i}`).join('\n')}`);
       }
       if (progress.pendingItems?.length > 0) {
         lines.push(`\n### Pending\n${progress.pendingItems.map((i: string) => `- [ ] ${i}`).join('\n')}`);
       }
       if (progress.notes) {
-        lines.push(`\n### Notes\n${progress.notes}`);
+        // Notes can be unbounded — cap to ~5KB which is plenty for human-
+        // readable reminders without ballooning context.
+        const notes = String(progress.notes);
+        const cappedNotes = notes.length > 5000
+          ? notes.slice(0, 4800) + '\n\n[…notes truncated, ' + (notes.length - 4800).toLocaleString() + ' more chars]'
+          : notes;
+        lines.push(`\n### Notes\n${cappedNotes}`);
       }
       if (progress.state && Object.keys(progress.state).length > 0) {
-        lines.push(`\n### Custom State\n\`\`\`json\n${JSON.stringify(progress.state, null, 2)}\n\`\`\``);
+        const stateJson = JSON.stringify(progress.state, null, 2);
+        const cappedState = stateJson.length > 5000
+          ? stateJson.slice(0, 4800) + '\n…'
+          : stateJson;
+        lines.push(`\n### Custom State\n\`\`\`json\n${cappedState}\n\`\`\``);
       }
       return textResult(lines.join('\n'));
     } catch {

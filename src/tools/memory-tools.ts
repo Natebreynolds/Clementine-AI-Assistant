@@ -13,7 +13,7 @@ import { z } from 'zod';
 import {
   ACTIVE_AGENT_SLUG, BASE_DIR, IDENTITY_FILE, MEMORY_FILE, SYSTEM_DIR,
   VAULT_DIR, WORKING_MEMORY_MAX_LINES,
-  agentWorkingMemoryFile,
+  agentWorkingMemoryFile, capOutput, DEFAULT_OUTPUT_MAX_CHARS,
   ensureDailyNote, getStore, globMd, incrementalSync, logger, nowTime,
   resolvePath, textResult, todayStr, validateVaultPath,
 } from './shared.js';
@@ -126,15 +126,22 @@ server.tool(
 server.tool(
   'memory_read',
   getToolDescription('memory_read') ?? "Read a note from the Obsidian vault. Shortcuts: 'today', 'yesterday', 'memory', 'tasks', 'heartbeat', 'cron', 'soul'. Or pass a relative path or note name.",
-  { name: z.string().describe('Note name, path, or shortcut') },
-  async ({ name }) => {
+  {
+    name: z.string().describe('Note name, path, or shortcut'),
+    max_chars: z.number().int().positive().optional().describe(`Max chars to return (default ${DEFAULT_OUTPUT_MAX_CHARS}). Larger files are head-truncated with a marker — pass a higher value if you genuinely need more.`),
+  },
+  async ({ name, max_chars }) => {
     const filePath = resolvePath(name);
     if (!existsSync(filePath)) {
       return textResult(`Note not found: ${name}`);
     }
     const content = readFileSync(filePath, 'utf-8');
     const rel = path.relative(VAULT_DIR, filePath);
-    return textResult(`**${rel}:**\n\n${content}`);
+    // Cap output to avoid the unbounded-blob cost issue surfaced by Phase
+    // 11b analytics (some MEMORY.md files run 60KB+ and were the single
+    // biggest cost-per-call driver in the clementine-tools family).
+    const capped = capOutput(content, max_chars ?? DEFAULT_OUTPUT_MAX_CHARS, { hintParam: 'max_chars' });
+    return textResult(`**${rel}:**\n\n${capped}`);
   },
 );
 
