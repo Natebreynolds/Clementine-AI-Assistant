@@ -2244,6 +2244,91 @@ configCmd
     }
   });
 
+// ── Brain commands ──────────────────────────────────────────────────
+
+const brainCmd = program
+  .command('brain')
+  .description('Cross-agent synthesis — leadable summaries of what your team learned');
+
+brainCmd
+  .command('digest')
+  .description('Run a brain digest — synthesize the past N days of cross-agent activity into a leadable narrative')
+  .option('-d, --days <n>', 'Window in days', '7')
+  .option('-m, --model <model>', 'Model to use for synthesis (sonnet, haiku, opus)', 'sonnet')
+  .option('--save', 'Also save the digest to vault/00-System/brain-digests/<date>.md')
+  .option('--raw', 'Print the raw signals only — skip the LLM synthesis')
+  .action(async (opts: { days: string; model: string; save?: boolean; raw?: boolean }) => {
+    const BOLD = '\x1b[1m';
+    const DIM = '\x1b[0;90m';
+    const GREEN = '\x1b[0;32m';
+    const RED = '\x1b[0;31m';
+    const RESET = '\x1b[0m';
+    const days = Math.max(1, Math.min(60, parseInt(opts.days, 10) || 7));
+    process.env.CLEMENTINE_HOME = BASE_DIR;
+    delete process.env['CLAUDECODE'];
+
+    try {
+      const { AgentManager } = await import('../agent/agent-manager.js');
+      const { MemoryStore } = await import('../memory/store.js');
+      const { gatherBrainDigestInputs, formatRawMaterial, runBrainDigest } = await import('../agent/brain-digest.js');
+
+      const VAULT_DIR = path.join(BASE_DIR, 'vault');
+      const DB_PATH = path.join(VAULT_DIR, '.memory.db');
+      const AGENTS_DIR = path.join(BASE_DIR, 'agents');
+
+      const agentManager = new AgentManager(AGENTS_DIR);
+      const memoryStore = new MemoryStore(DB_PATH, VAULT_DIR);
+
+      // Raw mode short-circuits the LLM call — useful for inspecting signals.
+      if (opts.raw) {
+        const inputs = gatherBrainDigestInputs({ agentManager, memoryStore, baseDir: BASE_DIR, windowDays: days });
+        console.log();
+        console.log(`  ${BOLD}Brain digest — raw signals (${days} days)${RESET}`);
+        console.log();
+        console.log(formatRawMaterial(inputs));
+        console.log();
+        return;
+      }
+
+      console.log();
+      console.log(`  ${DIM}Synthesizing brain digest over ${days} days using ${opts.model}…${RESET}`);
+
+      const { PersonalAssistant } = await import('../agent/assistant.js');
+      const assistant = new PersonalAssistant();
+      // Headless: auto-deny any approval prompts during synthesis.
+      const { setApprovalCallback } = await import('../agent/hooks.js');
+      setApprovalCallback(async () => false);
+
+      const result = await runBrainDigest({
+        assistant,
+        agentManager,
+        memoryStore,
+        baseDir: BASE_DIR,
+        windowDays: days,
+        model: opts.model,
+      });
+
+      console.log();
+      console.log(result.markdown);
+      console.log();
+      console.log(`  ${DIM}Sources: ${result.inputs.agents.length} agent(s), ${result.inputs.cronRunsByJob.length} cron job(s) active, ${result.inputs.crossAgentClusters.length} cross-agent cluster(s).${RESET}`);
+
+      if (opts.save) {
+        const digestsDir = path.join(VAULT_DIR, '00-System', 'brain-digests');
+        mkdirSync(digestsDir, { recursive: true });
+        const stamp = new Date().toISOString().slice(0, 10);
+        const filename = path.join(digestsDir, `${stamp}-${days}d.md`);
+        const fileBody = `---\ntype: brain-digest\ngeneratedAt: ${new Date().toISOString()}\nwindowDays: ${days}\nmodel: ${opts.model}\n---\n\n${result.markdown}\n`;
+        writeFileSync(filename, fileBody);
+        console.log(`  ${GREEN}✓${RESET} Saved to ${DIM}${filename}${RESET}`);
+      }
+      console.log();
+    } catch (err) {
+      console.error(`  ${RED}Error generating brain digest:${RESET} ${err instanceof Error ? err.message : String(err)}`);
+      process.exit(1);
+    }
+  });
+
 // ── Agent commands ──────────────────────────────────────────────────
 
 const agentCmd = program
