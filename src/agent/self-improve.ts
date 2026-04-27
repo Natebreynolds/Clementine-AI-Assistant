@@ -1024,15 +1024,15 @@ export class SelfImproveLoop {
       `- what: a 1-sentence description of what specifically should change\n` +
       `- why: which metric or signal from the data above this should improve\n\n` +
       `Area notes:\n` +
-      `- For "goal": target = "{owner}/{goal-slug}" (e.g. "clementine/<goal-slug>" or "<agent-slug>/<goal-slug>"). ` +
+      `- For "goal": target = "{owner}/{goal-slug}" (e.g. "clementine/improve-response-time" or "inbox-triage/clear-backlog"). ` +
       `Propose when you observe a pattern in completed tasks or cron runs that suggests a missing or stale goal. ` +
       `The proposedChange must be a JSON goal object with at minimum: title, description, priority, reviewFrequency.\n` +
       `- For "advisor-rule": target = ruleId in kebab-case (e.g. "skip-turn-bump-on-unleashed"). ` +
       `Use when the fix is a behavioral rule that affects ALL jobs matching some scope, not just one cron job. ` +
-      `Examples: "for unleashed jobs, never bump maxTurns" or "for <agent-slug>, double timeout on max_turns". ` +
+      `Examples: "for unleashed jobs, never bump maxTurns" or "for the inbox-triage agent, double timeout on max_turns errors". ` +
       `The proposedChange must be a full advisor rule YAML body with: schemaVersion: 1, id (must match target), description, priority (use 100+ to override builtins), appliesTo, when[], then[]. ` +
       `User rules at priority 100+ override engine builtins of the same id.\n` +
-      `- For "prompt-override": target = "global", "agent:<slug>", or "job:<jobName>" (e.g. "job:<job-name>"). ` +
+      `- For "prompt-override": target = "global", "agent:<slug>", or "job:<jobName>" (e.g. "job:daily-summary"). ` +
       `Use when a job/agent needs more standing guidance — markdown that gets prepended to its prompt. ` +
       `The proposedChange is the markdown body (optionally with gray-matter frontmatter for priority/position).\n\n` +
       `Return your answer as a JSON object matching the schema: { "results": [ ... ] }. Up to 3 items. If absolutely nothing actionable today, return { "results": [] }.`;

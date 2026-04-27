@@ -85,7 +85,7 @@ server.tool(
   {
     status: z.enum(['all', 'pending', 'completed']).optional().describe('Filter by status'),
     project: z.string().optional().describe('Filter by project tag'),
-    assignee: z.string().optional().describe('Filter by assignee (an agent slug, e.g. "<agent-slug>" or "clementine"). Use "unassigned" to see tasks with no assignee.'),
+    assignee: z.string().optional().describe('Filter by assignee (an agent slug, e.g. "inbox-triage" or "clementine"). Use "unassigned" to see tasks with no assignee.'),
   },
   async ({ status, project, assignee }) => {
     const statusFilter = status ?? 'all';
@@ -141,7 +141,7 @@ server.tool(
 
 server.tool(
   'task_add',
-  'Add a new task to the master task list. Auto-generates a {T-NNN} ID. Include @assignee:<agent-slug> in description to assign to a specific agent.',
+  'Add a new task to the master task list. Auto-generates a {T-NNN} ID. Include @assignee:agentslug in description to assign to a specific agent (e.g. @assignee:inbox-triage).',
   {
     description: z.string().describe('Task description. Include @assignee:agentname to assign to a specific agent.'),
     priority: z.enum(['high', 'medium', 'low']).optional().describe('Task priority'),
@@ -345,7 +345,7 @@ server.tool(
     priority: z.enum(['high', 'normal']).optional().default('normal').describe('high = next tick, normal = when convenient'),
     max_turns: z.number().optional().default(3).describe('Max conversation turns for this work (1-5)'),
     tier: z.number().optional().default(1).describe('Security tier: 1 = vault-only, 2 = bash/git allowed'),
-    agent: z.string().optional().describe('Agent slug this work is for (e.g. "<agent-slug>"). Omit for global work.'),
+    agent: z.string().optional().describe('Agent slug this work is for (e.g. "inbox-triage"). Omit for global work.'),
   },
   async ({ description, prompt, priority, max_turns, tier, agent }) => {
     const queueDir = path.dirname(HEARTBEAT_WORK_QUEUE_FILE);

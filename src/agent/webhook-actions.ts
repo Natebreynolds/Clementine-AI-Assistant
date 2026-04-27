@@ -20,7 +20,7 @@
  *           {
  *             "match": { "action": "opened", "pull_request": "*" },
  *             "do": "wake_agent",
- *             "agent": "<agent-slug>",
+ *             "agent": "inbox-triage",
  *             "reason": "PR opened — review needed"
  *           }
  *         ]

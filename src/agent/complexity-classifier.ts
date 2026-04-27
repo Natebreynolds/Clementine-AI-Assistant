@@ -199,6 +199,6 @@ export function planFirstDirective(): string {
     'When I reply "go" (or equivalent) in the next message, proceed with the plan.',
     'If I edit the plan, revise and ask again.',
     '',
-    'SKIP this protocol only if the request is actually a single step disguised as multiple (e.g., "send an email to <recipient> about X and cc <other>" is one email, not two).',
+    'SKIP this protocol only if the request is actually a single step disguised as multiple (e.g., "send an email to Sam about the proposal and cc Jordan" is one email, not two).',
   ].join('\n');
 }
