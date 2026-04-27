@@ -1668,6 +1668,36 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
       } catch { /* non-fatal */ }
     }
 
+    // Conversational context — same signals the insight engine surfaces
+    // proactively (Phase 10), but injected directly into the agent's prompt
+    // so it can adjust its own approach. Scoped to chat sessions because
+    // cron/heartbeat don't have a "user feeling frustrated" axis to react to,
+    // and inflating their prompt doesn't help. Only injected when at least
+    // one signal fires — keeps the prompt clean during normal sessions.
+    if (!isAutonomous) {
+      try {
+        const { detectFrustrationSignals, detectRepeatedTopics } =
+          require('./insight-engine.js') as typeof import('./insight-engine.js');
+        const since24h = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+        const since7d = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+        const recent = this.getRecentActivity(since24h, 50);
+        const week = this.getRecentActivity(since7d, 200);
+        const frustration = detectFrustrationSignals(recent);
+        const topics = detectRepeatedTopics(week);
+        const allSignals = [...frustration, ...topics];
+        if (allSignals.length > 0) {
+          const guidance = frustration.length > 0
+            ? '\n\n**Adjust your approach:** When friction signals are present, lead with a clarifying question instead of assuming. Acknowledge the prior misunderstanding briefly without over-apologizing. Confirm understanding before acting.'
+            : '\n\n**Use this context naturally:** Recurring topics may indicate an unresolved thread — if relevant, offer to close the loop or summarize current state. Do not force callbacks if not directly applicable.';
+          volatileParts.push(
+            `## Conversational Context\n\nSignals from recent sessions:\n` +
+            allSignals.map(s => `- ${s}`).join('\n') +
+            guidance,
+          );
+        }
+      } catch { /* non-fatal — insight-engine optional */ }
+    }
+
     // Current context — date/time changes every minute, so it's volatile.
     const channel = deriveChannel({ sessionKey, isAutonomous, cronTier });
     const resolvedModel = resolveModel(model) ?? MODEL;
