@@ -34,6 +34,34 @@ const logger = pino({ name: 'clementine.graph' });
 const GRAPH_NAME = 'clementine';
 const WIKILINK_RE = /\[\[([^\]|]+)(?:\|[^\]]+)?\]\]/g;
 
+/**
+ * Phase 13 — extract structured info from arbitrary error objects so log
+ * entries always carry SOMETHING useful even when err.message is empty.
+ * Node socket errors have .code, .errno, .syscall, .address, .port that
+ * tell us "ECONNREFUSED on /tmp/x.sock" instead of the empty string the
+ * falkordb client surfaces by default.
+ */
+export function extractErrorInfo(err: unknown): Record<string, unknown> {
+  if (!err) return { errKind: 'no-error-object' };
+  if (typeof err !== 'object') return { errKind: 'primitive', err: String(err).slice(0, 200) };
+  const e = err as Record<string, unknown>;
+  const out: Record<string, unknown> = {};
+  if (typeof e.message === 'string' && e.message.length > 0) out.errMessage = e.message.slice(0, 200);
+  if (typeof e.name === 'string') out.errName = e.name;
+  if (e.code !== undefined) out.errCode = e.code;
+  if (e.errno !== undefined) out.errno = e.errno;
+  if (e.syscall !== undefined) out.errSyscall = e.syscall;
+  if (e.address !== undefined) out.errAddress = e.address;
+  if (e.port !== undefined) out.errPort = e.port;
+  if (e.path !== undefined) out.errPath = e.path;
+  // Fall back to the constructor name + JSON shape if nothing meaningful surfaced
+  if (Object.keys(out).length === 0) {
+    out.errKind = (e.constructor as { name?: string })?.name ?? 'unknown';
+    try { out.errJson = JSON.stringify(e).slice(0, 300); } catch { /* ignore */ }
+  }
+  return out;
+}
+
 /** Well-known file where the daemon writes the socket path for other processes. */
 const SOCKET_FILE_NAME = '.graph.sock';
 
@@ -44,6 +72,9 @@ export class GraphStore {
   private available = false;
   private persistenceDir: string;
   private ownsServer = false;
+  private livenessProbeTimer: NodeJS.Timeout | null = null;
+  private livenessFailureStreak = 0;
+  private livenessRestartAttempts = 0;
 
   constructor(persistenceDir: string) {
     this.persistenceDir = persistenceDir;
@@ -71,15 +102,22 @@ export class GraphStore {
       this.available = true;
       this.ownsServer = true;
 
-      // Catch connection-level errors: log once, disable gracefully
+      // Catch connection-level errors with full diagnosis (Phase 13).
       let serverErrorLogged = false;
       this.db.on?.('error', (err: Error) => {
         if (!serverErrorLogged) {
           serverErrorLogged = true;
-          logger.warn({ err: err.message }, 'FalkorDB server error — disabling graph features');
+          logger.warn(extractErrorInfo(err), 'FalkorDB server error — disabling graph features');
           this.available = false;
         }
       });
+
+      // Phase 13 — server-side liveness probe with auto-restart.
+      // Periodically (60s) ping the embedded server with a tiny query.
+      // If the ping fails, the server has hung or quietly died. Auto-
+      // restart by reinitializing instead of leaving graph features
+      // silently broken until the next daemon restart.
+      this.startLivenessProbe();
 
       // Write socket path so MCP/dashboard/assistant can connect
       writeFileSync(this.socketFilePath, this.db.socketPath, 'utf-8');
@@ -121,42 +159,61 @@ export class GraphStore {
       this.available = true;
       this.ownsServer = false;
 
-      // Catch connection-level errors: disable and start reconnect loop
+      // Catch connection-level errors: disable and start reconnect loop.
+      // Phase 13: capture FULL error context (errno, code, syscall) instead
+      // of just .message — falkordb client emits raw socket errors that
+      // often have empty .message strings, leaving us blind to root cause.
       let errorHandled = false;
       this.client.on?.('error', (err: Error) => {
         if (errorHandled) return;
         errorHandled = true;
-        logger.warn({ err: err.message }, 'FalkorDB connection lost — starting reconnect loop');
+        const errInfo = extractErrorInfo(err);
+        logger.warn(
+          { ...errInfo, pid: process.pid, socketPath },
+          'FalkorDB connection lost — starting reconnect loop',
+        );
         this.available = false;
         try { this.client?.disconnect?.(); } catch { /* ignore */ }
 
-        // Reconnect loop: try every 30s up to 5 times, then back off to 5 min
+        // Reconnect schedule (Phase 13): exponential backoff from 1s up to
+        // 60s for the first 6 attempts (covers transient blips fast), then
+        // 5min × 5 (handles a daemon-restart window), then a slow 30min
+        // probe forever. Total time to "give up fast retries" reduced from
+        // 150s (5×30s) to 109s (1+3+10+30+60+5*60) but the EARLY attempts
+        // are much more aggressive — most blips recover within seconds.
+        const SCHEDULE_MS = [
+          1_000, 3_000, 10_000, 30_000, 60_000,
+          5 * 60_000, 5 * 60_000, 5 * 60_000, 5 * 60_000, 5 * 60_000,
+        ];
+        const SLOW_PROBE_MS = 30 * 60_000;
         let attempts = 0;
         const reconnectLoop = async () => {
           attempts++;
           try {
             const reconnected = await this.connectToRunning();
             if (reconnected) {
-              logger.info({ attempts }, 'FalkorDB reconnected');
-              return; // Success — stop the loop
+              logger.info({ attempts, pid: process.pid }, 'FalkorDB reconnected');
+              return;
             }
-          } catch { /* retry */ }
-
-          if (attempts < 5) {
-            setTimeout(reconnectLoop, 30_000);       // Retry in 30s
-          } else if (attempts < 10) {
-            setTimeout(reconnectLoop, 5 * 60_000);   // Back off to 5 min
-          } else {
-            // Keep a slow background probe instead of giving up entirely
-            logger.warn({ attempts }, 'FalkorDB reconnect entering slow probe (every 30 min)');
-            setTimeout(reconnectLoop, 30 * 60_000);
+          } catch (retryErr) {
+            // Capture retry failures too — silent catch was hiding root cause
+            const ri = extractErrorInfo(retryErr);
+            logger.debug({ ...ri, attempts }, 'FalkorDB reconnect attempt failed');
           }
+          const delay = SCHEDULE_MS[attempts - 1] ?? SLOW_PROBE_MS;
+          if (attempts === SCHEDULE_MS.length) {
+            logger.warn({ attempts, pid: process.pid }, 'FalkorDB reconnect exhausted fast-retry schedule — entering slow probe (every 30 min)');
+          }
+          setTimeout(reconnectLoop, delay);
         };
-        setTimeout(reconnectLoop, 30_000);
+        setTimeout(reconnectLoop, SCHEDULE_MS[0]);
       });
 
       return true;
-    } catch {
+    } catch (err) {
+      // Phase 13: log connect-time failures too (was swallowing them silently)
+      const errInfo = extractErrorInfo(err);
+      logger.debug({ ...errInfo, socketPath: this.socketFilePath }, 'FalkorDB initial connect failed');
       this.available = false;
       return false;
     }
@@ -166,7 +223,108 @@ export class GraphStore {
     return this.available;
   }
 
+  // ── Liveness probe (daemon only — Phase 13) ──────────────────────────
+
+  /**
+   * Periodic health check on the owned embedded server. Runs every 60s.
+   * Pings with a trivial Cypher query (RETURN 1). Two consecutive failures
+   * trigger a restart attempt. Backs off after 3 restart attempts to avoid
+   * crash-loop noise — at that point graph features stay disabled until
+   * the daemon is manually restarted.
+   *
+   * Daemon-only because client processes have their own reconnect loop on
+   * the .on('error') path. The probe specifically catches the case where
+   * the server hangs (no error event but stops responding).
+   */
+  private startLivenessProbe(): void {
+    if (this.livenessProbeTimer) return;
+    const PROBE_INTERVAL_MS = 60_000;
+    const MAX_RESTART_ATTEMPTS = 3;
+
+    const probe = async () => {
+      if (!this.ownsServer) return;       // safety — only the server owner probes
+      if (!this.available || !this.graph) {
+        // Already disabled — let the existing recovery paths run.
+        return;
+      }
+      try {
+        await Promise.race([
+          this.graph.query('RETURN 1 AS ping'),
+          new Promise((_, reject) => setTimeout(() => reject(new Error('probe-timeout')), 5_000)),
+        ]);
+        // Probe succeeded — reset failure streak.
+        if (this.livenessFailureStreak > 0) {
+          logger.info({ priorFailures: this.livenessFailureStreak }, 'FalkorDB liveness probe recovered');
+          this.livenessFailureStreak = 0;
+        }
+      } catch (err) {
+        this.livenessFailureStreak++;
+        logger.warn(
+          { ...extractErrorInfo(err), streak: this.livenessFailureStreak },
+          'FalkorDB liveness probe failed',
+        );
+        if (this.livenessFailureStreak >= 2) {
+          await this.attemptServerRestart(MAX_RESTART_ATTEMPTS);
+        }
+      }
+    };
+
+    this.livenessProbeTimer = setInterval(probe, PROBE_INTERVAL_MS);
+    // Don't keep the daemon alive just for the probe.
+    this.livenessProbeTimer.unref?.();
+  }
+
+  private async attemptServerRestart(maxAttempts: number): Promise<void> {
+    if (this.livenessRestartAttempts >= maxAttempts) {
+      logger.error(
+        { attempts: this.livenessRestartAttempts },
+        'FalkorDB restart attempts exhausted — graph features disabled until daemon restart',
+      );
+      this.available = false;
+      if (this.livenessProbeTimer) {
+        clearInterval(this.livenessProbeTimer);
+        this.livenessProbeTimer = null;
+      }
+      return;
+    }
+    this.livenessRestartAttempts++;
+    logger.warn(
+      { attempt: this.livenessRestartAttempts, max: maxAttempts },
+      'FalkorDB restart attempt',
+    );
+    try {
+      // Tear down the current server gracefully.
+      try { await this.db?.close?.(); } catch { /* ignore */ }
+      this.db = null;
+      this.graph = null;
+      this.available = false;
+      try { unlinkSync(this.socketFilePath); } catch { /* ignore */ }
+      // Re-initialize. initialize() will re-register error handlers and
+      // re-start the probe — but we don't want to start a NESTED probe,
+      // so clear the timer first.
+      if (this.livenessProbeTimer) {
+        clearInterval(this.livenessProbeTimer);
+        this.livenessProbeTimer = null;
+      }
+      this.livenessFailureStreak = 0;
+      await this.initialize();
+      if (this.available) {
+        logger.info({ attempt: this.livenessRestartAttempts }, 'FalkorDB restart succeeded');
+      }
+    } catch (err) {
+      logger.error(
+        extractErrorInfo(err),
+        'FalkorDB restart attempt failed',
+      );
+    }
+  }
+
   async close(): Promise<void> {
+    // Stop the liveness probe before tearing down (Phase 13).
+    if (this.livenessProbeTimer) {
+      clearInterval(this.livenessProbeTimer);
+      this.livenessProbeTimer = null;
+    }
     if (this.ownsServer && this.db) {
       // Clean up socket file
       try { unlinkSync(this.socketFilePath); } catch { /* ignore */ }
