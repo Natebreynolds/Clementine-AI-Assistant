@@ -857,6 +857,16 @@ export class Gateway {
     onToolActivity?: OnToolActivityCallback,
     onProgress?: OnProgressCallback,
   ): Promise<string> {
+    // Per-segment latency capture — emitted as a single 'chat:latency' line
+    // on the happy path so we can grep/aggregate without parsing many lines.
+    const tInnerStart = Date.now();
+    const timings: {
+      laneWaitMs?: number;
+      scanMs?: number;
+      routingMs?: number;
+      chatMs?: number;
+      firstTokenMs?: number;
+    } = {};
 
     // ── Auth circuit breaker — stop spamming error messages ────────
     if (this.authCircuitOpen) {
@@ -892,6 +902,7 @@ export class Gateway {
           await onProgress('thinking...').catch(() => { /* non-fatal */ });
         }
         const laneWaitMs = Date.now() - laneWaitStart;
+        timings.laneWaitMs = laneWaitMs;
         if (laneWaitMs > 1000) {
           logger.info({ sessionKey, laneWaitMs }, 'Chat lane wait was non-trivial');
         }
@@ -904,8 +915,10 @@ export class Gateway {
         // ── Pre-flight injection scan ───────────────────────────────
         // Re-baseline integrity before scanning — auto-memory, crons, and heartbeats
         // legitimately modify vault files between messages. Skip if refreshed within 5s.
+        const tScanStart = Date.now();
         scanner.refreshIfStale(5000);
         const scan = scanner.scan(text);
+        timings.scanMs = Date.now() - tScanStart;
 
         // Owner DMs are trusted — only block on high-confidence injection patterns,
         // not integrity changes (which are usually caused by Clementine's own writes).
@@ -1018,9 +1031,11 @@ export class Gateway {
         if (!isInternalMsg && !sess?.profile && !text.startsWith('!') && !isStructuredWorkflowMsg && onProgress) {
           await onProgress('checking if a teammate should handle this...').catch(() => { /* non-fatal */ });
         }
+        const tRoutingStart = Date.now();
         const routingResult = !isInternalMsg && !sess?.profile && !text.startsWith('!') && !isStructuredWorkflowMsg
           ? await this._maybeRouteToSpecialist(sessionKey, text, onText)
           : null;
+        timings.routingMs = Date.now() - tRoutingStart;
         if (routingResult?.delegated) {
           return routingResult.ackMessage;
         }
@@ -1181,9 +1196,11 @@ export class Gateway {
         let toolActivityCount = 0;
         let lastStreamedText = '';
         let lastProgressEmitAt = Date.now();
+        let firstTokenAt: number | undefined;
         const sessState = this.getSession(sessionKey);
         const wrappedOnText = onText
           ? async (token: string) => {
+              if (firstTokenAt === undefined) firstTokenAt = Date.now();
               resetIdleTimer();
               lastStreamedText = token;
               // Mirror to session state so a concurrent acquireSessionLock()
@@ -1267,10 +1284,24 @@ export class Gateway {
           if (hardWallTimer) clearTimeout(hardWallTimer);
           { const cs = this.sessions.get(sessionKey); if (cs) delete cs.abortController; }
 
+          const chatMs = Date.now() - queryStartMs;
+          timings.chatMs = chatMs;
+          if (firstTokenAt !== undefined) {
+            timings.firstTokenMs = firstTokenAt - queryStartMs;
+          }
           events.emit('query:complete', {
             sessionKey, responseLength: response?.length ?? 0,
-            toolActivityCount, durationMs: Date.now() - queryStartMs,
+            toolActivityCount, durationMs: chatMs,
           });
+
+          // One greppable line per chat completion — feed for the latency dashboard.
+          logger.info({
+            sessionKey,
+            totalMs: Date.now() - tInnerStart,
+            ...timings,
+            toolActivityCount,
+            responseLen: response?.length ?? 0,
+          }, 'chat:latency');
 
           // Re-baseline integrity checksums after chat (auto-memory may write to vault)
           scanner.refreshIntegrity();
