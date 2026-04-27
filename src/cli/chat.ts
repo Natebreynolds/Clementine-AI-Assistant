@@ -96,9 +96,9 @@ export async function cmdChat(opts: {
 
   // Apply initial profile override
   if (opts.profile) {
-    const { PROFILES_DIR, AGENTS_DIR } = await import('../config.js');
+    const { AGENTS_DIR } = await import('../config.js');
     const { AgentManager } = await import('../agent/agent-manager.js');
-    const pm = new AgentManager(AGENTS_DIR, PROFILES_DIR);
+    const pm = new AgentManager(AGENTS_DIR);
     const profile = pm.get(opts.profile);
     if (profile) {
       gateway.setSessionProfile(sessionKey, opts.profile);

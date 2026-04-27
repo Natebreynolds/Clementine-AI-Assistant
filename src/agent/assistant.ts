@@ -32,7 +32,6 @@ import {
   SOUL_FILE,
   AGENTS_FILE,
   MEMORY_FILE,
-  PROFILES_DIR,
   AGENTS_DIR,
   ASSISTANT_NAME,
   OWNER_NAME,
@@ -863,7 +862,7 @@ export class PersonalAssistant {
   private hotCorrections: Array<{ correction: string; category: string; timestamp: string }> = [];
 
   constructor() {
-    this.profileManager = new AgentManager(AGENTS_DIR, PROFILES_DIR);
+    this.profileManager = new AgentManager(AGENTS_DIR);
     this.promptCache = new PromptCache();
     this.initPromptWatchers();
     this.loadSessions();

@@ -14,25 +14,13 @@ import { existsSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import type { Migration, MigrationContext, MigrationResult } from './types.js';
 
+import { parseEnvText } from '../config/env-parser.js';
+
 /** Re-parse .env independently of config.ts's module-level cache. */
 function readEnv(baseDir: string): Record<string, string> {
   const envPath = path.join(baseDir, '.env');
   if (!existsSync(envPath)) return {};
-  const result: Record<string, string> = {};
-  for (const line of readFileSync(envPath, 'utf-8').split('\n')) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith('#')) continue;
-    const eqIndex = trimmed.indexOf('=');
-    if (eqIndex === -1) continue;
-    const key = trimmed.slice(0, eqIndex);
-    let value = trimmed.slice(eqIndex + 1);
-    if ((value.startsWith('"') && value.endsWith('"')) ||
-        (value.startsWith("'") && value.endsWith("'"))) {
-      value = value.slice(1, -1);
-    }
-    result[key] = value;
-  }
-  return result;
+  return parseEnvText(readFileSync(envPath, 'utf-8'));
 }
 
 function num(v: string | undefined): number | undefined {

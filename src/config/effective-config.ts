@@ -107,12 +107,10 @@ const SPECS: KeySpec[] = [
 // Mirrors config.ts's lazy/cached resolver but kept independent so this
 // module stays a pure utility (no shared mutable state with the daemon).
 
+import { parseEnvText, shellEscape } from './env-parser.js';
+
 const KEYCHAIN_REF_PREFIX = 'keychain:'; // pragma: allowlist secret
 const refCache = new Map<string, string | null>();
-
-function shellEscape(s: string): string {
-  return `'${s.replace(/'/g, "'\\''")}'`;
-}
 
 /** Hard cap per shell call — see config.ts for rationale. */
 const KEYCHAIN_TIMEOUT_MS = Math.max(
@@ -142,21 +140,7 @@ function resolveRef(stub: string): string | undefined {
 function readEnvFile(baseDir: string): Record<string, string> {
   const envPath = path.join(baseDir, '.env');
   if (!existsSync(envPath)) return {};
-  const result: Record<string, string> = {};
-  for (const line of readFileSync(envPath, 'utf-8').split('\n')) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith('#')) continue;
-    const eqIndex = trimmed.indexOf('=');
-    if (eqIndex === -1) continue;
-    const key = trimmed.slice(0, eqIndex);
-    let value = trimmed.slice(eqIndex + 1);
-    if ((value.startsWith('"') && value.endsWith('"')) ||
-        (value.startsWith("'") && value.endsWith("'"))) {
-      value = value.slice(1, -1);
-    }
-    result[key] = value;
-  }
-  return result;
+  return parseEnvText(readFileSync(envPath, 'utf-8'));
 }
 
 function getJsonValue(json: Record<string, unknown>, dottedPath: string): unknown {

@@ -361,7 +361,6 @@ function ensureVaultDirs(): void {
     config.TASKS_DIR,
     config.TEMPLATES_DIR,
     config.INBOX_DIR,
-    config.PROFILES_DIR,
   ];
 
   for (const dir of dirs) {

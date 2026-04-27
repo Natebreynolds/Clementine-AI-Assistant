@@ -14,24 +14,12 @@ import pino from 'pino';
 
 export const BASE_DIR = process.env.CLEMENTINE_HOME || path.join(os.homedir(), '.clementine');
 
+import { parseEnvText } from '../config/env-parser.js';
+
 function readEnvFile(): Record<string, string> {
   const envPath = path.join(BASE_DIR, '.env');
   if (!existsSync(envPath)) return {};
-  const result: Record<string, string> = {};
-  for (const line of readFileSync(envPath, 'utf-8').split('\n')) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith('#')) continue;
-    const eqIndex = trimmed.indexOf('=');
-    if (eqIndex === -1) continue;
-    const key = trimmed.slice(0, eqIndex);
-    let value = trimmed.slice(eqIndex + 1);
-    if ((value.startsWith('"') && value.endsWith('"')) ||
-        (value.startsWith("'") && value.endsWith("'"))) {
-      value = value.slice(1, -1);
-    }
-    result[key] = value;
-  }
-  return result;
+  return parseEnvText(readFileSync(envPath, 'utf-8'));
 }
 
 export const env = readEnvFile();
@@ -54,7 +42,6 @@ export const SOUL_FILE = path.join(SYSTEM_DIR, 'SOUL.md');
 export const IDENTITY_FILE = path.join(SYSTEM_DIR, 'IDENTITY.md');
 export const HEARTBEAT_FILE = path.join(SYSTEM_DIR, 'HEARTBEAT.md');
 export const CRON_FILE = path.join(SYSTEM_DIR, 'CRON.md');
-export const PROFILES_DIR = path.join(SYSTEM_DIR, 'profiles');
 export const AGENTS_DIR = path.join(SYSTEM_DIR, 'agents');
 export const TEAM_COMMS_LOG = path.join(BASE_DIR, 'logs', 'team-comms.jsonl');
 export const HANDOFFS_DIR = path.join(BASE_DIR, 'handoffs');

@@ -27,26 +27,12 @@ export const BASE_DIR = process.env.CLEMENTINE_HOME || path.join(os.homedir(), '
 
 // ── .env parser (never sets process.env) ────────────────────────────
 
+import { parseEnvText, shellEscape as _shellEscape } from './config/env-parser.js';
+
 function readEnvFile(): Record<string, string> {
   const envPath = path.join(BASE_DIR, '.env');
   if (!existsSync(envPath)) return {};
-
-  const result: Record<string, string> = {};
-  for (const line of readFileSync(envPath, 'utf-8').split('\n')) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith('#')) continue;
-    const eqIndex = trimmed.indexOf('=');
-    if (eqIndex === -1) continue;
-    const key = trimmed.slice(0, eqIndex);
-    let value = trimmed.slice(eqIndex + 1);
-    // Strip surrounding quotes
-    if ((value.startsWith('"') && value.endsWith('"')) ||
-        (value.startsWith("'") && value.endsWith("'"))) {
-      value = value.slice(1, -1);
-    }
-    result[key] = value;
-  }
-  return result;
+  return parseEnvText(readFileSync(envPath, 'utf-8'));
 }
 
 const env = readEnvFile();
@@ -161,7 +147,9 @@ export const TOPICS_DIR = path.join(VAULT_DIR, '04-Topics');
 export const TASKS_DIR = path.join(VAULT_DIR, '05-Tasks');
 export const TEMPLATES_DIR = path.join(VAULT_DIR, '06-Templates');
 export const INBOX_DIR = path.join(VAULT_DIR, '07-Inbox');
-export const PROFILES_DIR = path.join(SYSTEM_DIR, 'profiles');
+// PROFILES_DIR (vault/00-System/profiles/) removed in Phase 14 cleanup —
+// the legacy profile format hasn't been used in production for a long time.
+// AGENTS_DIR is the canonical home for agent definitions.
 export const AGENTS_DIR = path.join(SYSTEM_DIR, 'agents');
 
 export const SOUL_FILE = path.join(SYSTEM_DIR, 'SOUL.md');
@@ -199,9 +187,9 @@ export const OWNER_NAME = getEnvOrJson('OWNER_NAME', json.ownerName, '');
 
 // ── Secrets (with macOS Keychain fallback) ───────────────────────────
 
-export function shellEscape(s: string): string {
-  return `'${s.replace(/'/g, "'\\''")}'`;
-}
+// Re-export shellEscape from the shared helper so existing call sites
+// (config.ts internal uses + downstream importers) keep working.
+export const shellEscape = _shellEscape;
 
 function getSecret(envKey: string, keychainService?: string): string {
   // Resolve keychain refs from .env in place so secrets stored as stubs

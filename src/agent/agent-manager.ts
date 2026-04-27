@@ -17,7 +17,10 @@ import path from 'node:path';
 import matter from 'gray-matter';
 import type { AgentProfile, AgentStatus, SendPolicy, TeamAgentConfig } from '../types.js';
 import { randomBytes } from 'node:crypto';
-import { ProfileManager } from './profiles.js';
+// Phase 14 cleanup: legacy ProfileManager (vault/00-System/profiles/*.md)
+// removed — that directory has been empty for a long time and the new format
+// (vault/00-System/agents/<slug>/agent.md) supersedes it. Constructor no
+// longer takes a legacyProfilesDir argument.
 import { getScaffoldForRole } from './role-scaffolds.js';
 import { writeGoalForOwner, type GoalRecord } from '../tools/shared.js';
 
@@ -80,13 +83,11 @@ export interface AgentCreateConfig {
 
 export class AgentManager {
   private agentsDir: string;
-  private legacyManager: ProfileManager;
   private cache = new Map<string, AgentProfile>();
   private cacheTime = 0;
 
-  constructor(agentsDir: string, legacyProfilesDir: string) {
+  constructor(agentsDir: string) {
     this.agentsDir = agentsDir;
-    this.legacyManager = new ProfileManager(legacyProfilesDir);
   }
 
   private refreshIfStale(): void {
@@ -118,13 +119,6 @@ export class AgentManager {
         }
       } catch {
         // agents dir not readable
-      }
-    }
-
-    // 2. Load legacy profiles (only for slugs not already loaded)
-    for (const legacy of this.legacyManager.listAll()) {
-      if (!profiles.has(legacy.slug)) {
-        profiles.set(legacy.slug, legacy);
       }
     }
 

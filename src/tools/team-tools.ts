@@ -9,7 +9,7 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import {
   ACTIVE_AGENT_SLUG, AGENTS_DIR, BASE_DIR, DELEGATIONS_BASE,
-  PROFILES_DIR, TEAM_COMMS_LOG, env, logger, parseTasks, textResult,
+  TEAM_COMMS_LOG, env, logger, parseTasks, textResult,
 } from './shared.js';
 import { todayISO } from '../gateway/cron-scheduler.js';
 
@@ -44,18 +44,9 @@ async function loadTeamAgents(): Promise<TeamAgentInfo[]> {
     } catch { /* agents dir not readable */ }
   }
 
-  if (existsSync(PROFILES_DIR)) {
-    for (const file of readdirSync(PROFILES_DIR).filter(f => f.endsWith('.md') && !f.startsWith('_'))) {
-      try {
-        const slug = file.replace(/\.md$/, '');
-        if (seen.has(slug)) continue;
-        const { data } = (await import('gray-matter')).default(readFileSync(path.join(PROFILES_DIR, file), 'utf-8'));
-        const channelName = data.channelName ? String(data.channelName) : '';
-        if (!channelName) continue;
-        agents.push({ slug, name: String(data.name ?? slug), channelName, canMessage: Array.isArray(data.canMessage) ? data.canMessage.map(String) : [], description: String(data.description ?? '') });
-      } catch { /* skip */ }
-    }
-  }
+  // Phase 14: legacy PROFILES_DIR fallback removed — that directory has
+  // been empty in production for a long time and the new format
+  // (vault/00-System/agents/<slug>/agent.md) is the only source loaded above.
 
   return agents;
 }

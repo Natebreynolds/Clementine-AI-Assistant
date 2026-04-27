@@ -1627,8 +1627,7 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
       try { result.claudeIntegrations = { integrations: getClaudeIntegrations() }; } catch { result.claudeIntegrations = { integrations: [] }; }
       result.projects = { projects: cachedProjects ?? [] };
       try {
-        const profilesDir = path.join(VAULT_DIR, '00-System', 'profiles');
-        const mgr = new AgentManager(AGENTS_DIR, profilesDir);
+        const mgr = new AgentManager(AGENTS_DIR);
         const allAgents = mgr.listAll();
         let botStatuses: Record<string, any> = {};
         try { const p = path.join(BASE_DIR, '.bot-status.json'); if (existsSync(p)) botStatuses = JSON.parse(readFileSync(p, 'utf-8')); } catch { /* */ }
@@ -1914,8 +1913,7 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
       //
       try {
         const agDir = AGENTS_DIR;
-        const profilesDir = path.join(VAULT_DIR, '00-System', 'profiles');
-        const mgr = new AgentManager(agDir, profilesDir);
+        const mgr = new AgentManager(agDir);
         const allAgents = mgr.listAll();
 
         // Bot statuses from disk
@@ -4239,13 +4237,10 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
   // ── Profile routes ─────────────────────────────────────────────────
 
   app.get('/api/profiles', gwHandler(async (gw, _req, res) => {
-    const profilesDir = path.join(VAULT_DIR, '00-System', 'profiles');
-    if (!existsSync(profilesDir)) {
-      res.json({ profiles: [], active: null });
-      return;
-    }
-
-    const pm = new AgentManager(AGENTS_DIR, profilesDir);
+    // Phase 14: previously checked the legacy profilesDir; now that the
+    // legacy fallback is gone, AgentManager.listAll() returns [] when
+    // AGENTS_DIR is missing or empty. No separate guard needed.
+    const pm = new AgentManager(AGENTS_DIR);
     const profiles = pm.listAll().map(p => ({
       slug: p.slug,
       name: p.name,
@@ -5320,8 +5315,7 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
 
   app.get('/api/team/agents', async (_req, res) => {
     try {
-      const profilesDir = path.join(VAULT_DIR, '00-System', 'profiles');
-      const mgr = new AgentManager(AGENTS_DIR, profilesDir);
+      const mgr = new AgentManager(AGENTS_DIR);
       const agents = mgr.listAll();
       res.json(agents.map(a => ({
         slug: a.slug,
@@ -5416,8 +5410,7 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
   app.get('/api/office', async (_req, res) => {
     try {
       const data = await cachedAsync('office', 10_000, async () => {
-      const profilesDir = path.join(VAULT_DIR, '00-System', 'profiles');
-      const mgr = new AgentManager(AGENTS_DIR, profilesDir);
+      const mgr = new AgentManager(AGENTS_DIR);
       const allAgents = mgr.listAll();
 
       // ── Bot statuses ──

@@ -12,7 +12,7 @@ import { PersonalAssistant, type ProjectMeta } from '../agent/assistant.js';
 import { runWithTrace, logAuditJsonl } from '../agent/hooks.js';
 import type { OnProgressCallback, OnTextCallback, OnToolActivityCallback, PlanProgressUpdate, PlanStep, SelfImproveConfig, SelfImproveExperiment, SessionProvenance, TeamMessage, VerboseLevel, WorkflowDefinition } from '../types.js';
 import { SelfImproveLoop } from '../agent/self-improve.js';
-import { MODELS, PROFILES_DIR, AGENTS_DIR, TEAM_COMMS_LOG, BASE_DIR, SEEN_CHANNELS_FILE } from '../config.js';
+import { MODELS, AGENTS_DIR, TEAM_COMMS_LOG, BASE_DIR, SEEN_CHANNELS_FILE } from '../config.js';
 import { scanner } from '../security/scanner.js';
 import { lanes } from './lanes.js';
 import { AgentManager } from '../agent/agent-manager.js';
@@ -386,7 +386,7 @@ export class Gateway {
 
   getAgentManager(): AgentManager {
     if (!this._agentManager) {
-      this._agentManager = new AgentManager(AGENTS_DIR, PROFILES_DIR);
+      this._agentManager = new AgentManager(AGENTS_DIR);
     }
     return this._agentManager;
   }
