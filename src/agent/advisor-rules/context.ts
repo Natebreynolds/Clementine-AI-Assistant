@@ -12,7 +12,6 @@
 
 import { CronRunLog } from '../../gateway/cron-scheduler.js';
 import {
-  CIRCUIT_BREAKER_COOLDOWN_MS as _COOLDOWN_MS,
   DEFAULT_MAX_TURNS_FALLBACK,
   DEFAULT_TIMEOUT_MS,
   MAX_TIMEOUT_MS,
@@ -23,7 +22,16 @@ import {
 import type { CronJobDefinition, ExecutionAdvice } from '../../types.js';
 import type { RuleContext } from './types.js';
 
-void _COOLDOWN_MS; // currently encoded as a literal in builtin YAMLs; re-export hook
+// NOTE: Phase 9c (commit 4451f36) made execution-advisor.ts static-import
+// THIS module, creating a circular dep. The previous module-init line
+// `void CIRCUIT_BREAKER_COOLDOWN_MS as _COOLDOWN_MS` was deferring access
+// in source comment terms but actually FORCED a TDZ access at context.ts
+// module-init — which is BEFORE execution-advisor.ts has reached line 38
+// where the const is declared. That produced "Cannot access '_COOLDOWN_MS'
+// before initialization" errors on every cron run after Phase 9c shipped.
+// Removed the import + the void line. The cooldown duration is encoded as
+// a literal in the builtin YAML rules, so this module never actually
+// needed the constant — the import was documentation noise.
 
 /**
  * Build a fresh RuleContext for a job. Pass an existing `advice` if you want
