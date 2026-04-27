@@ -64,11 +64,10 @@ const ACTION_TOOLS = new Set([
  * jobs (especially unleashed) deliver via side effects (sent emails, updated
  * records, written files) — chat-text length is NOT the success signal, so
  * the high_effort_low_output heuristic must be disabled or it produces
- * 100+ false-positive interventions per run (observed 2026-04-26 on
- * market-leader-followup which sent 17 real emails while this guard fired
- * 169 times). Other heuristics (circular_reasoning via repeated identical
- * tool calls, research_without_action via consecutive reads) stay active —
- * those are real bug shapes regardless of mode.
+ * many false-positive interventions per run on side-effect-heavy jobs.
+ * Other heuristics (circular_reasoning via repeated identical tool calls,
+ * research_without_action via consecutive reads) stay active — those are
+ * real bug shapes regardless of mode.
  */
 export type MetacognitiveMode = 'chat' | 'cron' | 'unleashed';
 

@@ -45,6 +45,7 @@ import {
   DISCORD_WATCHED_CHANNELS,
   MODELS,
   ASSISTANT_NAME,
+  OWNER_NAME,
   PKG_DIR,
   VAULT_DIR,
   BASE_DIR,
@@ -611,7 +612,7 @@ export async function startDiscord(
         const diffMs = u.nextMs - now.getTime();
         const diffMin = Math.round(diffMs / 60000);
         const timeStr = formatDuration(diffMin);
-        // Strip agent slug prefix from job name if it matches (avoid "ross-the-sdr:task ross-the-sdr")
+        // Strip agent slug prefix from job name if it matches (avoid "<agent-slug>:task <agent-slug>")
         const displayName = u.agent && u.name.startsWith(`${u.agent}:`)
           ? u.name.slice(u.agent.length + 1)
           : u.name;
@@ -1882,7 +1883,8 @@ export async function startDiscord(
     const originalContent = button.message.content ?? '';
 
     // Build context message for the agent
-    const agentMessage = `[Button clicked: ${action}]\n\nOriginal request:\n${originalContent}\n\nNate ${action} this request. ${isApprove ? 'Proceed as requested.' : 'Skip this request and log that it was denied.'}`;
+    const owner = OWNER_NAME || 'The owner';
+    const agentMessage = `[Button clicked: ${action}]\n\nOriginal request:\n${originalContent}\n\n${owner} ${action} this request. ${isApprove ? 'Proceed as requested.' : 'Skip this request and log that it was denied.'}`;
 
     // Process through gateway
     const streamer = new DiscordStreamingMessage(button.channel!);

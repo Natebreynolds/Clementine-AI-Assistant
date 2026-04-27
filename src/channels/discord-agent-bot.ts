@@ -271,8 +271,8 @@ export class AgentBotClient {
    *    every visible channel by default is the opposite of what users want.
    *
    * Previously this fell back to "all visible text channels," which made
-   * Ross + Nora respond everywhere in guild because they had no channelName
-   * set. Opt-in is the correct default.
+   * agent bots respond everywhere in the guild because they had no
+   * channelName set. Opt-in is the correct default.
    */
   private discoverChannels(): string[] {
     // 1. Explicit IDs

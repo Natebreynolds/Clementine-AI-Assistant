@@ -44,7 +44,7 @@ export function registerAgentHeartbeatTools(server: McpServer): void {
     'wake_agent',
     'Wake an agent\'s heartbeat right now instead of waiting for their next poll cycle. Use after delegating urgent work or when an external signal needs immediate attention. The target agent will tick within ~3 seconds (debounced) and decide what to do.',
     {
-      slug: z.string().describe('Slug of the agent to wake (e.g., "ross-the-sdr")'),
+      slug: z.string().describe('Slug of the agent to wake (e.g., "<agent-slug>")'),
       reason: z.string().optional().describe('One-line reason for the wake — appears in the agent\'s next tick context'),
     },
     async ({ slug, reason }) => {

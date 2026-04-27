@@ -35,7 +35,7 @@ If all of the above have already been reported and nothing changed:
 
 - You will be told what you already reported. Do NOT repeat those items unless their STATUS CHANGED.
 - Tag every distinct topic you mention: `[topic: short-key]`
-  - Examples: `[topic: task:T-005]`, `[topic: ross-appointments]`, `[topic: sf-query-noise]`
+  - Examples: `[topic: task:T-005]`, `[topic: agent-appointments]`, `[topic: query-noise]`
 
 ## When to Alert (even if previously mentioned)
 

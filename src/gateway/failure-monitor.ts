@@ -2,9 +2,8 @@
  * Clementine TypeScript — Cron failure monitor.
  *
  * Surfaces cron jobs that have been failing repeatedly so they don't sit
- * silently broken (which is what happened to ross-the-sdr:reply-detection —
- * the existing circuit breaker fired ONCE at consErrors=5 and then went
- * quiet for days).
+ * silently broken (the existing circuit breaker fires once at
+ * consErrors=5 and then goes quiet, leaving recurring failures invisible).
  *
  * Threshold: a job is "broken" if either
  *   - it has >= 3 error/retried entries in the last 48h, OR
@@ -161,7 +160,7 @@ function loadGradeCache(): Map<string, boolean> {
  * legitimately quiet jobs (healthchecks, inbox probes that return empty
  * when there's nothing to report).
  *
- * Markers are drawn from observed failure modes in Ross's cron jobs
+ * Markers are drawn from observed failure modes in agent cron jobs
  * (kernel-vs-local Bash, "BLOCKED (no local bash access)") plus generic
  * agent self-reports.
  */

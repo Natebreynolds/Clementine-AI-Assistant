@@ -13,7 +13,7 @@ jobs:
       5. Format as a clear briefing with sections: Tasks, Yesterday Recap, Today's Focus
       Keep it concise but actionable.
     tier: 1
-    enabled: true
+    enabled: false
 
   - name: weekly-review
     schedule: "0 18 * * 5"
@@ -25,7 +25,7 @@ jobs:
       4. Suggest priorities for next week
       5. Write the review to today's daily note under a "## Weekly Review" section
     tier: 2
-    enabled: true
+    enabled: false
 
   - name: daily-memory-cleanup
     schedule: "0 22 * * *"
@@ -36,7 +36,7 @@ jobs:
       3. Move completed tasks from Pending to Completed in TASKS.md
       4. Write a brief summary of the day in today's daily note under ## Summary
     tier: 1
-    enabled: true
+    enabled: false
 
   - name: weekly-decision-reflection
     schedule: "0 9 * * 0"
@@ -49,9 +49,9 @@ jobs:
       2. For each specialist on the team (use `team_list` to enumerate), also run
          `decision_reflection` with their slug, save_to_history=true, append_to_memory=true.
       3. Briefly summarize in today's daily note under "## Decision reflection" — list each
-         agent's headline pattern (e.g., "Ross: act_now success 33%, raise threshold").
+         agent's headline pattern.
     tier: 1
-    enabled: true
+    enabled: false
 tags:
   - system
   - cron
@@ -59,9 +59,11 @@ tags:
 
 # Cron Jobs
 
-Scheduled tasks that run automatically at specific times. Edit the frontmatter above to add, modify, or disable jobs.
+> **Fresh installs ship with all jobs disabled.** Review each one and flip `enabled: true` for the workflows you actually want. Edit the schedules and prompts to match your routine.
 
-## Active Jobs
+Scheduled tasks that run automatically at specific times. Edit the frontmatter above to add, modify, or enable jobs.
+
+## Example Jobs (disabled by default)
 
 | Job | Schedule | Description |
 |-----|----------|-------------|
@@ -81,7 +83,7 @@ Add a new entry to the `jobs` list in the frontmatter above:
 ```yaml
   - name: my-new-job
     schedule: "0 12 * * *"
-    prompt: "What should Clementine do"
+    prompt: "What should the assistant do"
     tier: 1
     enabled: true
 ```

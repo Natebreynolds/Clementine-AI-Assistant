@@ -229,7 +229,7 @@ const FEATURES: FeatureDef[] = [
       {
         key: 'MS_USER_EMAIL',
         label: 'Mailbox email address',
-        help: `The email address Clementine should access (e.g. nathan@example.com)`,
+        help: `The email address Clementine should access (e.g. you@example.com)`,
       },
     ],
   },

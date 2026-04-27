@@ -2,8 +2,8 @@
  * Clementine TypeScript — Team-routing classifier.
  *
  * Decides whether a user message addressed to Clementine should be
- * delegated to a specialist agent (Ross, Sasha, Nora, etc.) or handled
- * by Clementine herself.
+ * delegated to a specialist agent on the user's team or handled by
+ * Clementine herself.
  *
  * CRITICAL safety rail: this classifier is ONLY invoked when the user
  * is talking TO Clementine. Direct-to-agent messages (agent bot DMs,
@@ -93,9 +93,9 @@ export function _resetRouteCache(): void {
  * and shouting "Stop".
  *
  * This check runs before the LLM classifier and the explicit-mention fast
- * path, so even "Nora, I need you to do X" stays with Clementine when Nate
- * is DMing Clementine (the `isRoutable` gate already guarantees the session
- * belongs to Clementine).
+ * path, so even "<agent>, I need you to do X" stays with Clementine when
+ * the owner is DMing Clementine (the `isRoutable` gate already guarantees
+ * the session belongs to Clementine).
  */
 const DIRECT_IMPERATIVE_PATTERNS: RegExp[] = [
   /\bi (need|want|would like) you to\b/i,
@@ -111,6 +111,32 @@ export function isDirectImperative(userMessage: string): { match: boolean; patte
     if (m) return { match: true, pattern: m[0] };
   }
   return { match: false };
+}
+
+/**
+ * Decide whether the user is talking ABOUT an agent rather than to them.
+ * The explicit-mention fast path otherwise routes a message like
+ * "how are <agent>'s tasks looking" straight to that agent because it
+ * sees a bare name match. We catch two shapes here:
+ *
+ *  - **Possessive**: "<agent>'s tasks", "<agent>' update" — the agent is the topic.
+ *  - **Question/meta opener before the name**: "how is <agent>", "did <agent> handle X",
+ *    "any update on <agent>", "what about <agent>". A question word followed
+ *    by up to ~40 chars of words/whitespace before the name is almost always
+ *    a meta-question, not a vocative.
+ *
+ * "<agent>, are you done?" stays vocative because the question word ("are")
+ * appears AFTER the name.
+ */
+export function isAskingAboutAgent(text: string, firstName: string, slug: string): boolean {
+  const ident = `${firstName}|${slug}`;
+  const possessiveRe = new RegExp(`\\b(${ident})('s|s')\\b`, 'i');
+  if (possessiveRe.test(text)) return true;
+  const askingRe = new RegExp(
+    `\\b(how|what|where|who|when|why|is|are|was|were|did|does|do|will|can|could|would|should|has|have|had|tell\\s+me|show\\s+me|let\\s+me\\s+know|any\\s+update|update\\s+on|status\\s+of|about)\\b[\\s\\w']{0,40}?\\b(${ident})\\b`,
+    'i',
+  );
+  return askingRe.test(text);
 }
 
 /**
@@ -199,9 +225,9 @@ function buildPrompt(userMessage: string, agents: AgentProfile[]): string {
     '## Decision rules',
     '',
     '- Default to **clementine** (the generalist) unless the request clearly matches a specialist agent\'s domain.',
-    '- Match on DOMAIN, not keywords. "Help me think about our outbound strategy" is strategic → Clementine. "Send a follow-up to Aaron about the Scorpion audit" is operational outbound → the SDR agent.',
-    '- If the user explicitly names an agent ("have Ross do X"), pick that agent at confidence 1.0.',
-    '- If the request is meta ("what agents do I have", "how did Ross do this week") → clementine.',
+    '- Match on DOMAIN, not keywords. "Help me think about our outbound strategy" is strategic → Clementine. "Send a follow-up to <prospect> about the <project> audit" is operational outbound → the SDR agent.',
+    '- If the user explicitly names an agent ("have <agent-name> do X"), pick that agent at confidence 1.0.',
+    '- If the request is meta ("what agents do I have", "how did <agent-name> do this week") → clementine.',
     '- Small talk, greetings, casual chat → clementine.',
     '- Ambiguous or multi-domain requests → clementine with lower confidence (she can delegate herself).',
     '',
@@ -274,14 +300,21 @@ export async function classifyRoute(
     const firstName = nameLower.split(/\s+/)[0]!;
     if (firstName.length < 3) continue;
     const wordRe = new RegExp(`\\b(${firstName}|${a.slug})\\b`, 'i');
-    if (wordRe.test(trimmed)) {
-      logger.debug({ slug: a.slug, trigger: 'explicit-mention' }, 'Fast-path routing decision');
-      return {
-        targetAgent: a.slug,
-        confidence: 1.0,
-        reasoning: `User explicitly addressed ${a.name} by name.`,
-      };
+    if (!wordRe.test(trimmed)) continue;
+    if (isAskingAboutAgent(trimmed, firstName, a.slug)) {
+      // The user is asking ABOUT the agent ("how is <agent> doing", "<agent>'s
+      // tasks", "did <agent> handle that?") rather than addressing them. Fall
+      // through to the LLM classifier, which has a system-prompt rule for
+      // meta-questions and routes them back to clementine.
+      logger.debug({ slug: a.slug, trigger: 'meta-mention-bypass' }, 'Routing skipped — name appears as topic, not vocative');
+      continue;
     }
+    logger.debug({ slug: a.slug, trigger: 'explicit-mention' }, 'Fast-path routing decision');
+    return {
+      targetAgent: a.slug,
+      confidence: 1.0,
+      reasoning: `User explicitly addressed ${a.name} by name.`,
+    };
   }
 
   // Fast path B — short messages (≤ 40 chars, no specialist named above)

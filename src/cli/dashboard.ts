@@ -12299,7 +12299,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
       </div>
       <div class="form-row">
         <label>Linked Cron Jobs <span style="font-weight:400;color:var(--text-muted)">(comma-separated)</span></label>
-        <input type="text" id="goal-linked-crons" placeholder="e.g. ross-heartbeat, sasha-deal-support-scan">
+        <input type="text" id="goal-linked-crons" placeholder="e.g. agent-heartbeat, deal-support-scan">
       </div>
     </div>
     <div class="modal-footer">

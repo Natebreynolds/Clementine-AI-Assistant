@@ -135,7 +135,7 @@ function readJobDefinition(jobName: string): string | null {
   const candidateFiles: string[] = [];
 
   if (rest.length > 0) {
-    // agent-scoped: ross-the-sdr:reply-detection
+    // agent-scoped: <agent-slug>:<job-name>
     candidateFiles.push(path.join(AGENTS_DIR, maybeSlug!, 'CRON.md'));
   }
   candidateFiles.push(CRON_FILE);
@@ -256,18 +256,18 @@ function buildPrompt(broken: BrokenJob, jobDef: string | null, agentProfile: str
     '- Bump maxTurns: { "kind": "cron", "operations": [{"op":"set","field":"max_turns","value":10}] }',
     '',
     '### kind: "advisor-rule" (write a YAML rule to ~/.clementine/advisor-rules/user/)',
-    'Use when the fix is a behavioral rule that should affect ALL jobs matching some scope, not just one cron job. Examples: "for unleashed jobs, never bump maxTurns" or "for ross-the-sdr, always set timeout to 900s on max_turns errors".',
+    'Use when the fix is a behavioral rule that should affect ALL jobs matching some scope, not just one cron job. Examples: "for unleashed jobs, never bump maxTurns" or "for <agent-slug>, always set timeout to 900s on max_turns errors".',
     'Shape: { "kind": "advisor-rule", "ruleId": "kebab-case-id", "yamlContent": "<full yaml body>" }',
     'The YAML body must be a valid advisor rule (schemaVersion: 1, id, description, priority, when, then). User rules at priority 100+ override builtins of the same id.',
     'Example:',
-    '{ "kind": "advisor-rule", "ruleId": "ross-aggressive-timeout", "yamlContent": "schemaVersion: 1\\nid: ross-aggressive-timeout\\ndescription: Bump timeout for ross\\npriority: 105\\nappliesTo:\\n  agentSlug: ross-the-sdr\\nwhen:\\n  - kind: recentTimeoutHits\\n    window: 5\\n    atLeast: 1\\nthen:\\n  - kind: bumpTimeoutMs\\n    multiplier: 2.0" }',
+    '{ "kind": "advisor-rule", "ruleId": "<agent-slug>-aggressive-timeout", "yamlContent": "schemaVersion: 1\\nid: <agent-slug>-aggressive-timeout\\ndescription: Bump timeout for <agent-slug>\\npriority: 105\\nappliesTo:\\n  agentSlug: <agent-slug>\\nwhen:\\n  - kind: recentTimeoutHits\\n    window: 5\\n    atLeast: 1\\nthen:\\n  - kind: bumpTimeoutMs\\n    multiplier: 2.0" }',
     '',
     '### kind: "prompt-override" (write a markdown file to ~/.clementine/prompt-overrides/)',
     'Use when the fix is "give the LLM more guidance for this job/agent". Examples: a job consistently misses an edge case, an agent needs a reminder about output format.',
     'Shape: { "kind": "prompt-override", "scope": "job"|"agent"|"global", "scopeKey": "<job or agent name>", "content": "<markdown body>" }',
     'For scope=global, omit scopeKey. For scope=agent, scopeKey is the agent slug. For scope=job, scopeKey is the BARE job name (no agent prefix).',
     'Example:',
-    '{ "kind": "prompt-override", "scope": "job", "scopeKey": "market-leader-followup", "content": "If the inbox query returns 0 rows, batch the duplicate-task cleanup in groups of 50 using bash heredoc loops. Do not enumerate task IDs in the prompt." }',
+    '{ "kind": "prompt-override", "scope": "job", "scopeKey": "<job-name>", "content": "If the upstream query returns 0 rows, batch follow-up work in groups of 50 using bash heredoc loops. Do not enumerate item IDs in the prompt." }',
     '',
     '## When NOT to use autoApply',
     'For credential refreshes, multi-line CRON.md edits beyond the scalar allowlist, or any change you are not confident about: OMIT autoApply entirely. The owner will handle those manually.',

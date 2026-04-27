@@ -1579,7 +1579,7 @@ export class HeartbeatScheduler {
       const line = response.slice(lineStart, lineEnd === -1 ? undefined : lineEnd).trim();
       const summary = line.replace(/\[topic:[^\]]+\]/g, '').trim();
 
-      // Derive agentSlug from topic key — e.g. "ross:appointments" → "ross"
+      // Derive agentSlug from topic key — e.g. "<agent-slug>:appointments" → "<agent-slug>"
       const colonIdx = topic.indexOf(':');
       const agentSlug = colonIdx > 0 ? topic.substring(0, colonIdx) : undefined;
 

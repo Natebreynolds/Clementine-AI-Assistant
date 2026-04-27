@@ -741,9 +741,9 @@ async function asyncMain(): Promise<void> {
   const cronScheduler = new CronScheduler(gateway, dispatcher);
   heartbeat.setCronScheduler(cronScheduler);
 
-  // Per-agent heartbeats (Ross / Sasha / Nora / future hires). Cheap-path
-  // observation on every tick; LLM tick fires on signal change with the
-  // agent's profile and routes output to their Discord channel.
+  // Per-agent heartbeats — one cheap-path observer per registered specialist.
+  // LLM tick fires on signal change with the agent's profile and routes
+  // output to their Discord channel.
   const { AgentHeartbeatManager } = await import('./gateway/agent-heartbeat-manager.js');
   const agentHeartbeats = new AgentHeartbeatManager(gateway.getAgentManager(), gateway);
 

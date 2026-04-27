@@ -62,7 +62,7 @@ function resolveCronFile(jobName: string, autoApply: { agentSlug?: string }): st
     return null;
   }
 
-  // Infer from jobName prefix (e.g., "ross-the-sdr:reply-detection")
+  // Infer from jobName prefix (e.g., "<agent-slug>:<job-name>")
   if (jobName.includes(':')) {
     const slug = jobName.split(':')[0]!;
     const f = path.join(AGENTS_DIR, slug, 'CRON.md');

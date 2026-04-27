@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { _resetRouteCache, classifyRoute } from '../src/agent/route-classifier.js';
+import { _resetRouteCache, classifyRoute, isAskingAboutAgent } from '../src/agent/route-classifier.js';
 import type { AgentProfile } from '../src/types.js';
 import type { Gateway } from '../src/gateway/router.js';
 
@@ -67,6 +67,46 @@ describe('route classifier — LRU cache', () => {
     expect(second?.targetAgent).toBe('ross-the-sdr');
     // Both calls fired the LLM — failure wasn't cached
     expect(handleCronJob).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not auto-route when the user is asking ABOUT an agent', async () => {
+    const handleCronJob = vi.fn(async () => JSON.stringify({ targetAgent: 'clementine', confidence: 0.9, reasoning: 'meta question' }));
+    const gateway = { handleCronJob } as unknown as Gateway;
+    const agents = [makeAgent('ross-the-sdr', 'Ross', 'Outbound SDR')];
+
+    // Long enough to bypass short-message; opens with "got it" so question-opener
+    // also doesn't catch it. Pre-fix this routed to ross at confidence 1.0 because
+    // the bare word "ross" matched the explicit-mention regex.
+    const msg = 'got it how is ross crons looking are they fixed today';
+    const decision = await classifyRoute(msg, agents, gateway);
+    // Should NOT be the auto-route to ross — either falls through to the LLM
+    // (which routes back to clementine) or returns clementine outright.
+    expect(decision?.targetAgent).not.toBe('ross-the-sdr');
+  });
+
+  it('still routes when the user addresses the agent vocatively', async () => {
+    const handleCronJob = vi.fn();
+    const gateway = { handleCronJob } as unknown as Gateway;
+    const agents = [makeAgent('ross-the-sdr', 'Ross', 'Outbound SDR')];
+
+    const msg = 'ross please send a follow-up to the Acme decision-maker about the demo';
+    const decision = await classifyRoute(msg, agents, gateway);
+    expect(decision?.targetAgent).toBe('ross-the-sdr');
+    expect(decision?.confidence).toBe(1.0);
+    expect(handleCronJob).not.toHaveBeenCalled(); // fast-path, no LLM
+  });
+
+  it('isAskingAboutAgent — recognizes meta shapes, not vocatives', () => {
+    // Asking-about (true)
+    expect(isAskingAboutAgent('how is ross crons looking', 'ross', 'ross-the-sdr')).toBe(true);
+    expect(isAskingAboutAgent("ross's tasks for today", 'ross', 'ross-the-sdr')).toBe(true);
+    expect(isAskingAboutAgent('did ross handle the followups', 'ross', 'ross-the-sdr')).toBe(true);
+    expect(isAskingAboutAgent('any update on ross from yesterday', 'ross', 'ross-the-sdr')).toBe(true);
+    expect(isAskingAboutAgent('what about ross', 'ross', 'ross-the-sdr')).toBe(true);
+    // Vocative (false)
+    expect(isAskingAboutAgent('ross please draft a followup', 'ross', 'ross-the-sdr')).toBe(false);
+    expect(isAskingAboutAgent('hey ross can you check Acme', 'ross', 'ross-the-sdr')).toBe(false);
+    expect(isAskingAboutAgent('ross, are you done with that', 'ross', 'ross-the-sdr')).toBe(false);
   });
 
   it('normalizes whitespace so trailing-newline variants share the cache', async () => {

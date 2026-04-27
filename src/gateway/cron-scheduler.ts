@@ -624,8 +624,8 @@ export class CronScheduler {
     //   2. background tasks (`bg:*`) → processBackgroundTasks dispatches result
     //   3. registered cron jobs   → cron-runner success path dispatches at line ~1115
     //
-    // Each path is gated below; without the guards Sasha's morning brief was
-    // landing twice in her Discord channel.
+    // Each path is gated below; without the guards a registered cron's
+    // result was landing twice in the destination channel.
     this.gateway.setUnleashedCompleteCallback((jobName, result) => {
       this.completedJobs.set(jobName, Date.now());
       if (isDeepMode(jobName)) return;                 // (1) deep-mode router

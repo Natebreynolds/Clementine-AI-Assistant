@@ -1,7 +1,7 @@
 /**
- * Per-agent heartbeat scheduler — one instance per specialist agent
- * (Ross, Sasha, Nora, etc.). Runs autonomously alongside Clementine's
- * own HeartbeatScheduler.
+ * Per-agent heartbeat scheduler — one instance per specialist agent on
+ * the user's team. Runs autonomously alongside Clementine's own
+ * HeartbeatScheduler.
  *
  * Phase 2 — cheap path only. No LLM call. The tick loads state, scans
  * three signals (pending delegated tasks, recent goal updates, recent

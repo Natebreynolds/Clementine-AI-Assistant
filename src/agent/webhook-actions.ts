@@ -20,7 +20,7 @@
  *           {
  *             "match": { "action": "opened", "pull_request": "*" },
  *             "do": "wake_agent",
- *             "agent": "ross-the-sdr",
+ *             "agent": "<agent-slug>",
  *             "reason": "PR opened — review needed"
  *           }
  *         ]
