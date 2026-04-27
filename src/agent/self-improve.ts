@@ -998,11 +998,34 @@ export class SelfImproveLoop {
 
     const areas = this.config.areas.map(a => `'${a}'`).join(', ');
 
+    // For per-agent cycles, also pull the agent's CURRENT instructions
+    // (agent.md body) so the LLM proposes changes informed by what's there
+    // rather than blind. Without this, "improve agent X" was generating
+    // proposals that contradicted or duplicated standing instructions.
+    let agentBodyText = '';
+    if (this.config.agentSlug) {
+      try {
+        const agentFile = path.join(AGENTS_DIR, this.config.agentSlug, 'agent.md');
+        if (existsSync(agentFile)) {
+          const raw = readFileSync(agentFile, 'utf-8');
+          // Cap to keep the prompt tractable — agent.md can be 10K+ chars.
+          // The first 4K covers the role, personality, and most standing
+          // instructions; deeper sections (long examples, references) are
+          // less important for "what should change" decisions.
+          const trimmed = raw.length > 4000 ? raw.slice(0, 4000) + '\n\n[...truncated, full file at agents/' + this.config.agentSlug + '/agent.md]' : raw;
+          agentBodyText = `\n\n## CURRENT agent.md for "${this.config.agentSlug}"\n` +
+            `These are the agent's existing standing instructions — your proposals should refine or extend these, not contradict or duplicate them.\n\n` +
+            '```markdown\n' + trimmed + '\n```\n';
+        }
+      } catch { /* non-fatal — fall through with empty body text */ }
+    }
+
     const agentFocusText = this.config.agentSlug
       ? `\n\n## AGENT FOCUS: ${this.config.agentSlug}\nThis is a focused improvement cycle for agent "${this.config.agentSlug}" ONLY.\n` +
         `- You MUST target area "agent" with target "${this.config.agentSlug}", OR area "cron" targeting a cron job that this agent runs.\n` +
         `- Do NOT propose changes to SOUL.md, AGENTS.md, source code, or other agents.\n` +
-        `- Focus on improving this agent's personality, instructions, and task execution quality.\n`
+        `- Focus on improving this agent's personality, instructions, and task execution quality.\n` +
+        agentBodyText
       : '';
 
     // Read SOUL.md evolution candidates from FEEDBACK.md (written by synthesizeFeedbackPatterns)
