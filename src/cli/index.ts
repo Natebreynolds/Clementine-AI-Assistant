@@ -3997,20 +3997,185 @@ const siCmd = program
 
 siCmd
   .command('status')
-  .description('Show self-improvement state and baseline metrics')
-  .action(async () => {
+  .description('Show self-improvement health — last cycle, infra errors, per-agent runs, recent activity')
+  .option('--json', 'Emit machine-readable JSON')
+  .action(async (opts: { json?: boolean }) => {
+    const BOLD = '\x1b[1m';
+    const DIM = '\x1b[0;90m';
+    const GREEN = '\x1b[0;32m';
+    const YELLOW = '\x1b[1;33m';
+    const RED = '\x1b[0;31m';
+    const CYAN = '\x1b[0;36m';
+    const RESET = '\x1b[0m';
     try {
+      process.env.CLEMENTINE_HOME = BASE_DIR;
       const { SelfImproveLoop } = await import('../agent/self-improve.js');
       const { PersonalAssistant } = await import('../agent/assistant.js');
       const assistant = new PersonalAssistant();
       const loop = new SelfImproveLoop(assistant);
       const state = loop.loadState();
-      const m = state.baselineMetrics;
-      console.log(`Status: ${state.status}`);
-      console.log(`Last run: ${state.lastRunAt || 'never'}`);
-      console.log(`Total experiments: ${state.totalExperiments}`);
-      console.log(`Pending approvals: ${state.pendingApprovals}`);
-      console.log(`Baseline — Feedback: ${(m.feedbackPositiveRatio * 100).toFixed(0)}% positive, Cron: ${(m.cronSuccessRate * 100).toFixed(0)}% success, Quality: ${m.avgResponseQuality.toFixed(2)}`);
+      const log = loop.loadExperimentLog();
+      const pending = loop.getPendingChanges();
+
+      // Compute "last successful cycle" — most recent log entry that wasn't
+      // a plateau record or pure infra failure. Different from lastRunAt
+      // (which moves on every attempt, even crashed ones).
+      const lastSuccessful = [...log].reverse().find(e =>
+        e.area !== 'soul' || e.hypothesis !== 'No new hypothesis — diversity constraint exhausted'
+      );
+
+      const nowMs = Date.now();
+      const formatAge = (iso?: string): string => {
+        if (!iso) return 'never';
+        const ms = nowMs - Date.parse(iso);
+        const h = Math.floor(ms / 3_600_000);
+        if (h < 1) return `${Math.floor(ms / 60_000)}m ago`;
+        if (h < 48) return `${h}h ago`;
+        return `${Math.floor(h / 24)}d ago`;
+      };
+
+      // Auto-applied count over the last 7 days = experiments with status 'approved'
+      const since7d = nowMs - 7 * 86_400_000;
+      const autoAppliedRecent = log.filter(e =>
+        e.approvalStatus === 'approved' && Date.parse(e.startedAt) >= since7d
+      ).length;
+
+      // Per-agent SI runs from heartbeat state file.
+      const hbStateFile = path.join(BASE_DIR, '.heartbeat_state.json');
+      let perAgentRuns: Record<string, string> = {};
+      try {
+        if (existsSync(hbStateFile)) {
+          const hb = JSON.parse(readFileSync(hbStateFile, 'utf-8'));
+          perAgentRuns = (hb.lastAgentSiRuns ?? {}) as Record<string, string>;
+        }
+      } catch { /* non-fatal */ }
+
+      if (opts.json) {
+        console.log(JSON.stringify({
+          state,
+          lastSuccessfulAt: lastSuccessful?.startedAt ?? null,
+          autoAppliedLast7d: autoAppliedRecent,
+          pendingCount: pending.length,
+          perAgentRuns,
+          recent: log.slice(-5).reverse(),
+        }, null, 2));
+        return;
+      }
+
+      // ── Header ─────────────────────────────────────────────────────
+      console.log();
+      console.log(`  ${BOLD}Self-improve loop${RESET}`);
+      console.log(`  ${DIM}Status:           ${RESET}${state.status}`);
+      console.log(`  ${DIM}Last attempted:   ${RESET}${state.lastRunAt || 'never'} ${DIM}(${formatAge(state.lastRunAt)})${RESET}`);
+
+      // Stalled-loop warning: if we have a lastRunAt but no successful cycle
+      // in 36+ hours, surface red. That's the visibility gap from pillar #4.
+      const lastSuccAt = lastSuccessful?.startedAt;
+      const hoursSinceSuccess = lastSuccAt ? (nowMs - Date.parse(lastSuccAt)) / 3_600_000 : null;
+      if (lastSuccAt) {
+        const stallTag = hoursSinceSuccess !== null && hoursSinceSuccess > 36 ? `  ${YELLOW}⚠ stalled${RESET}` : `  ${GREEN}✓${RESET}`;
+        console.log(`  ${DIM}Last successful:  ${RESET}${lastSuccAt} ${DIM}(${formatAge(lastSuccAt)})${RESET}${stallTag}`);
+      } else {
+        console.log(`  ${DIM}Last successful:  ${RESET}never  ${YELLOW}⚠ no cycles yet${RESET}`);
+      }
+
+      console.log(`  ${DIM}Total experiments:${RESET} ${state.totalExperiments}`);
+      console.log(`  ${DIM}Auto-applied (7d):${RESET} ${autoAppliedRecent}`);
+      console.log(`  ${DIM}Pending review:   ${RESET}${pending.length > 0 ? `${YELLOW}${pending.length}${RESET}` : '0'}`);
+
+      if (state.infraError) {
+        console.log();
+        console.log(`  ${RED}⚠ Infra error blocking the loop:${RESET}`);
+        console.log(`    Category:   ${state.infraError.category}`);
+        console.log(`    Diagnostic: ${state.infraError.diagnostic.slice(0, 200)}`);
+      } else {
+        console.log(`  ${DIM}Infra errors:     ${RESET}${GREEN}none${RESET}`);
+      }
+
+      // ── Per-agent cycles ───────────────────────────────────────────
+      const agentEntries = Object.entries(perAgentRuns);
+      if (agentEntries.length > 0) {
+        console.log();
+        console.log(`  ${BOLD}Per-agent cycles${RESET}  ${DIM}(weekly cadence, 2 AM)${RESET}`);
+        for (const [slug, iso] of agentEntries) {
+          console.log(`    ${CYAN}${slug.padEnd(28)}${RESET}${DIM}last run ${formatAge(iso)}${RESET}`);
+        }
+      }
+
+      // ── Recent activity ────────────────────────────────────────────
+      const recent = log.slice(-5).reverse();
+      if (recent.length > 0) {
+        console.log();
+        console.log(`  ${BOLD}Recent activity${RESET}`);
+        for (const e of recent) {
+          const score = (e.score * 10).toFixed(1);
+          let icon = '❌';
+          if (e.approvalStatus === 'approved') icon = '✅';
+          else if (e.approvalStatus === 'pending') icon = '⏳';
+          else if (e.approvalStatus === 'unsurfaced') icon = '⛔';
+          const what = e.hypothesis.slice(0, 60);
+          console.log(`    ${icon} ${DIM}#${String(e.iteration).padEnd(3)}${RESET} ${e.area.padEnd(16)} ${score.padStart(4)}/10  "${what}"`);
+        }
+      }
+
+      if (pending.length > 0) {
+        console.log();
+        console.log(`  ${YELLOW}${pending.length} change(s) pending your review${RESET}`);
+        console.log(`    ${BOLD}clementine self-improve pending${RESET} ${DIM}— see what they propose${RESET}`);
+        console.log(`    ${BOLD}clementine self-improve apply <id>${RESET} ${DIM}— approve and apply one${RESET}`);
+      }
+      console.log();
+    } catch (err) {
+      console.error('Error:', err);
+      process.exit(1);
+    }
+  });
+
+siCmd
+  .command('pending')
+  .description('List pending self-improve changes — what needs your review')
+  .option('--json', 'Emit machine-readable JSON')
+  .action(async (opts: { json?: boolean }) => {
+    const BOLD = '\x1b[1m';
+    const DIM = '\x1b[0;90m';
+    const YELLOW = '\x1b[1;33m';
+    const CYAN = '\x1b[0;36m';
+    const RESET = '\x1b[0m';
+    try {
+      process.env.CLEMENTINE_HOME = BASE_DIR;
+      const { SelfImproveLoop } = await import('../agent/self-improve.js');
+      const { PersonalAssistant } = await import('../agent/assistant.js');
+      const assistant = new PersonalAssistant();
+      const loop = new SelfImproveLoop(assistant);
+      const pending = loop.getPendingChanges();
+
+      if (opts.json) {
+        console.log(JSON.stringify(pending.map(p => ({
+          id: p.id, area: p.area, target: p.target,
+          score: p.score, hypothesis: p.hypothesis, reason: p.reason,
+        })), null, 2));
+        return;
+      }
+
+      if (pending.length === 0) {
+        console.log();
+        console.log(`  ${DIM}No changes pending review.${RESET}`);
+        console.log();
+        return;
+      }
+
+      console.log();
+      console.log(`  ${YELLOW}${pending.length} change${pending.length === 1 ? '' : 's'} pending${RESET}`);
+      console.log();
+      for (const p of pending) {
+        const score = (p.score * 10).toFixed(1);
+        console.log(`  ${BOLD}#${p.id}${RESET}  ${CYAN}${p.area}${RESET} ${DIM}→${RESET} ${p.target}  ${DIM}(score ${score}/10)${RESET}`);
+        console.log(`    ${p.hypothesis}`);
+        console.log(`    ${DIM}${p.reason}${RESET}`);
+        console.log();
+      }
+      console.log(`  Apply: ${BOLD}clementine self-improve apply <id>${RESET}`);
+      console.log();
     } catch (err) {
       console.error('Error:', err);
       process.exit(1);
