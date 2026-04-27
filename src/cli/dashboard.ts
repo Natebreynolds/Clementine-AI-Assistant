@@ -16939,6 +16939,51 @@ async function refreshToolUsagePanel() {
       }
       html += '</table>';
     }
+
+    // Phase 11e: cost-by-source pivot — aggregates the bySource maps from
+    // every family into a single "top jobs by spend" view. Uses only data
+    // already in the response, no extra API call.
+    const sourceTotals = {};
+    for (const f of (data.families || [])) {
+      const callsPerSource = {};
+      for (const s of (f.bySource || [])) callsPerSource[s.source] = s.count;
+      const familyTotalCalls = f.totalCalls || 0;
+      for (const s of (f.bySource || [])) {
+        const share = familyTotalCalls > 0 ? s.count / familyTotalCalls : 0;
+        const cost = (f.estimatedCostUsd || 0) * share;
+        if (!sourceTotals[s.source]) sourceTotals[s.source] = { source: s.source, cost: 0, calls: 0 };
+        sourceTotals[s.source].cost += cost;
+        sourceTotals[s.source].calls += s.count;
+      }
+    }
+    const sourceList = Object.values(sourceTotals)
+      .filter(s => s.source !== 'unknown' || sourceTotals.unknown.cost > 0)
+      .sort((a, b) => b.cost - a.cost);
+
+    if (sourceList.length > 0) {
+      const maxSrcCost = Math.max.apply(null, sourceList.map(s => s.cost).concat([0.0001]));
+      html += '<div style="margin-top:18px"><div style="font-weight:600;font-size:13px;margin-bottom:8px;color:var(--text-secondary)">Top jobs by cost</div>';
+      html += '<table style="width:100%;font-size:13px"><tr>'
+        + '<th>Job / source</th><th style="text-align:right">Cost</th><th style="text-align:right">Share</th><th style="text-align:right">Calls</th><th>Distribution</th></tr>';
+      const totalSrcCost = sourceList.reduce((sum, s) => sum + s.cost, 0);
+      for (const s of sourceList.slice(0, 10)) {
+        const pct = totalSrcCost > 0 ? ((s.cost / totalSrcCost) * 100).toFixed(1) + '%' : '0.0%';
+        const barW = Math.max(2, Math.round((s.cost / maxSrcCost) * 100));
+        const sourceLabel = s.source === 'unknown'
+          ? '<em style="color:var(--text-muted)">unattributed</em>'
+          : '<strong>' + esc(s.source) + '</strong>';
+        html += '<tr>'
+          + '<td>' + sourceLabel + '</td>'
+          + '<td style="text-align:right;color:var(--green)">$' + s.cost.toFixed(2) + '</td>'
+          + '<td style="text-align:right;color:var(--text-muted)">' + pct + '</td>'
+          + '<td style="text-align:right">' + s.calls.toLocaleString() + '</td>'
+          + '<td><div style="background:var(--bg-elev);height:8px;border-radius:4px;overflow:hidden;width:100%;max-width:160px">'
+          + '<div style="background:var(--blue);height:100%;width:' + barW + '%"></div></div></td>'
+          + '</tr>';
+      }
+      html += '</table></div>';
+    }
+
     html += '</div></div>';
     host.innerHTML = html;
   } catch(e) {

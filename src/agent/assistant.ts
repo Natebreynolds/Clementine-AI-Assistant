@@ -1680,19 +1680,32 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
           require('./insight-engine.js') as typeof import('./insight-engine.js');
         const since24h = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
         const since7d = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
-        const recent = this.getRecentActivity(since24h, 50);
-        const week = this.getRecentActivity(since7d, 200);
+        let recent = this.getRecentActivity(since24h, 50);
+        let week = this.getRecentActivity(since7d, 200);
+        // Phase 10c: per-agent scope filter. Per-agent bot session keys
+        // embed the agent slug (e.g. dm:ross-the-sdr:userId), so when this
+        // prompt is for a specific agent profile we only consider sessions
+        // that involved THAT agent. Without this filter, Nate's frustration
+        // chatting with Sasha would leak into Ross's prompt — wrong signal.
+        if (profile?.slug) {
+          const slugMarker = `:${profile.slug}:`;
+          recent = recent.filter(e => e.sessionKey.includes(slugMarker));
+          week = week.filter(e => e.sessionKey.includes(slugMarker));
+        }
         const frustration = detectFrustrationSignals(recent);
         const topics = detectRepeatedTopics(week);
         const allSignals = [...frustration, ...topics];
         if (allSignals.length > 0) {
+          const scopeNote = profile?.slug
+            ? `\n\n*Scope: signals from sessions with you (${profile.slug}).*`
+            : '';
           const guidance = frustration.length > 0
             ? '\n\n**Adjust your approach:** When friction signals are present, lead with a clarifying question instead of assuming. Acknowledge the prior misunderstanding briefly without over-apologizing. Confirm understanding before acting.'
             : '\n\n**Use this context naturally:** Recurring topics may indicate an unresolved thread — if relevant, offer to close the loop or summarize current state. Do not force callbacks if not directly applicable.';
           volatileParts.push(
             `## Conversational Context\n\nSignals from recent sessions:\n` +
             allSignals.map(s => `- ${s}`).join('\n') +
-            guidance,
+            guidance + scopeNote,
           );
         }
       } catch { /* non-fatal — insight-engine optional */ }
