@@ -4677,6 +4677,28 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
     res.json(computeMetrics());
   });
 
+  // ── Tool-usage analytics (Phase 11/11b) ─────────────────────────
+  // Surfaces the same per-family cost + call breakdown the CLI report
+  // shows. Window defaults to last 24h; ?hours=N for longer windows.
+  app.get('/api/analytics/tool-usage', async (req, res) => {
+    try {
+      const { buildToolUsageReport, defaultAuditLogPath } =
+        await import('../analytics/tool-usage.js');
+      const hoursRaw = String(req.query.hours ?? '24');
+      const hours = Math.max(1, Math.min(168, parseInt(hoursRaw, 10) || 24));
+      const end = new Date();
+      const start = new Date(end.getTime() - hours * 60 * 60 * 1000);
+      const report = buildToolUsageReport(
+        defaultAuditLogPath(BASE_DIR),
+        start.toISOString(),
+        end.toISOString(),
+      );
+      res.json({ ok: true, hours, ...report });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: String(err) });
+    }
+  });
+
   // ── Token Usage API ──────────────────────────────────────────────
 
   app.get('/api/metrics/usage', async (_req, res) => {
@@ -16840,9 +16862,93 @@ async function refreshMetrics() {
     }
 
     container.innerHTML = html;
+
+    // Phase 11c: append Tool-Usage / Cost Attribution panel.
+    // Lazy-loaded after the main metrics so a slow audit-log scan
+    // doesn't block the time-saved/token hero rows from appearing.
+    refreshToolUsagePanel();
   } catch(e) {
     document.getElementById('metrics-content').innerHTML = '<div class="empty-state">Error loading metrics</div>';
   }
+}
+
+async function refreshToolUsagePanel() {
+  const containerId = 'tool-usage-panel';
+  let host = document.getElementById(containerId);
+  if (!host) {
+    host = document.createElement('div');
+    host.id = containerId;
+    host.style.marginTop = '16px';
+    const metricsContent = document.getElementById('metrics-content');
+    if (metricsContent) metricsContent.appendChild(host);
+  }
+  host.innerHTML = '<div class="empty-state">Loading tool-usage analytics...</div>';
+
+  try {
+    const hours = window.toolUsageHours || 24;
+    const r = await apiFetch('/api/analytics/tool-usage?hours=' + hours);
+    const data = await r.json();
+    if (!data.ok) {
+      host.innerHTML = '<div class="empty-state">Tool-usage unavailable: ' + esc(data.error || 'unknown') + '</div>';
+      return;
+    }
+
+    const top = (data.families || []).slice(0, 8);
+    const maxCost = Math.max.apply(null, top.map(f => f.estimatedCostUsd).concat([0.0001]));
+
+    let html = '<div class="card">';
+    html += '<div class="card-header" style="display:flex;align-items:center;justify-content:space-between">'
+      + '<span>Tool Usage &amp; Cost Attribution</span>'
+      + '<div style="display:flex;gap:6px">'
+      + '<button class="btn btn-sm" onclick="setToolUsageHours(6)" style="' + (hours === 6 ? 'background:var(--accent);color:#000' : '') + '">6h</button>'
+      + '<button class="btn btn-sm" onclick="setToolUsageHours(24)" style="' + (hours === 24 ? 'background:var(--accent);color:#000' : '') + '">24h</button>'
+      + '<button class="btn btn-sm" onclick="setToolUsageHours(48)" style="' + (hours === 48 ? 'background:var(--accent);color:#000' : '') + '">48h</button>'
+      + '<button class="btn btn-sm" onclick="setToolUsageHours(168)" style="' + (hours === 168 ? 'background:var(--accent);color:#000' : '') + '">7d</button>'
+      + '</div></div>';
+    html += '<div class="card-body">';
+
+    // Headline strip
+    html += '<div style="display:flex;gap:24px;flex-wrap:wrap;margin-bottom:14px;font-size:13px">'
+      + '<div><span style="color:var(--text-muted)">Tool calls:</span> <strong>' + (data.totalToolCalls || 0).toLocaleString() + '</strong></div>'
+      + '<div><span style="color:var(--text-muted)">Queries:</span> <strong>' + (data.totalQueries || 0) + '</strong></div>'
+      + '<div><span style="color:var(--text-muted)">Total cost:</span> <strong style="color:var(--green)">$' + (data.totalCostUsd || 0).toFixed(2) + '</strong></div>'
+      + '<div><span style="color:var(--text-muted)">Attributed:</span> <strong>$' + (data.attributedCostUsd || 0).toFixed(2) + '</strong></div>'
+      + '</div>';
+
+    if (top.length === 0) {
+      html += '<div class="empty-state">No tool_use events in window.</div>';
+    } else {
+      html += '<table style="width:100%;font-size:13px"><tr>'
+        + '<th>Family</th><th style="text-align:right">Cost</th><th style="text-align:right">Share</th><th style="text-align:right">Calls</th><th>Distribution</th><th>Top tool</th></tr>';
+      for (const f of top) {
+        const pct = data.attributedCostUsd > 0
+          ? ((f.estimatedCostUsd / data.attributedCostUsd) * 100).toFixed(1) + '%'
+          : '0.0%';
+        const barW = Math.max(2, Math.round((f.estimatedCostUsd / maxCost) * 100));
+        const topTool = (f.byTool || [])[0];
+        const topToolLabel = topTool ? topTool.tool + ' (×' + topTool.count + ')' : '—';
+        html += '<tr>'
+          + '<td><strong>' + esc(f.family) + '</strong></td>'
+          + '<td style="text-align:right;color:var(--green)">$' + f.estimatedCostUsd.toFixed(2) + '</td>'
+          + '<td style="text-align:right;color:var(--text-muted)">' + pct + '</td>'
+          + '<td style="text-align:right">' + f.totalCalls.toLocaleString() + '</td>'
+          + '<td><div style="background:var(--bg-elev);height:8px;border-radius:4px;overflow:hidden;width:100%;max-width:160px">'
+          + '<div style="background:var(--accent);height:100%;width:' + barW + '%"></div></div></td>'
+          + '<td style="font-size:11px;color:var(--text-muted)">' + esc(topToolLabel) + '</td>'
+          + '</tr>';
+      }
+      html += '</table>';
+    }
+    html += '</div></div>';
+    host.innerHTML = html;
+  } catch(e) {
+    host.innerHTML = '<div class="empty-state">Failed to load tool-usage: ' + esc(String(e)) + '</div>';
+  }
+}
+
+function setToolUsageHours(h) {
+  window.toolUsageHours = h;
+  refreshToolUsagePanel();
 }
 
 function statTile(value, label, color) {
