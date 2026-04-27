@@ -2381,6 +2381,221 @@ const memoryCmd = program
   .description('Search and manage memory');
 
 memoryCmd
+  .command('status')
+  .description('Show memory store stats — chunk count, embeddings coverage, agent/category breakdown, salience')
+  .option('--json', 'Emit machine-readable JSON')
+  .action(async (opts: { json?: boolean }) => {
+    const BOLD = '\x1b[1m';
+    const DIM = '\x1b[0;90m';
+    const CYAN = '\x1b[0;36m';
+    const RESET = '\x1b[0m';
+    try {
+      const { MemoryStore } = await import('../memory/store.js');
+      const VAULT_DIR = path.join(BASE_DIR, 'vault');
+      const DB_PATH = path.join(VAULT_DIR, '.memory.db');
+      const store = new MemoryStore(DB_PATH, VAULT_DIR);
+      const stats = store.getMemoryStats();
+      if (opts.json) {
+        console.log(JSON.stringify(stats, null, 2));
+        return;
+      }
+      const pct = stats.totalChunks > 0
+        ? ((stats.chunksWithEmbeddings / stats.totalChunks) * 100).toFixed(1)
+        : '0.0';
+      console.log();
+      console.log(`  ${BOLD}Memory store${RESET}  ${DIM}${DB_PATH}${RESET}`);
+      console.log();
+      console.log(`  Total chunks:         ${BOLD}${stats.totalChunks.toLocaleString()}${RESET}`);
+      console.log(`  With embeddings:      ${stats.chunksWithEmbeddings.toLocaleString()} ${DIM}(${pct}%, TF-IDF 512-dim)${RESET}`);
+      console.log(`  Pinned (manual):      ${stats.pinnedChunks}`);
+      console.log(`  Avg salience:         ${stats.avgSalience.toFixed(3)} ${DIM}(0 = no access boost; >1 = strong reinforcement)${RESET}`);
+      if (stats.oldestUpdated) {
+        console.log(`  Date range:           ${stats.oldestUpdated.slice(0, 10)} → ${stats.newestUpdated?.slice(0, 10)}`);
+      }
+      console.log();
+      console.log(`  ${BOLD}Per agent${RESET}`);
+      for (const a of stats.perAgent.slice(0, 10)) {
+        console.log(`    ${CYAN}${a.agentSlug.padEnd(28)}${RESET}${a.count.toLocaleString().padStart(8)}`);
+      }
+      if (stats.perAgent.length > 10) console.log(`    ${DIM}…and ${stats.perAgent.length - 10} more${RESET}`);
+      console.log();
+      console.log(`  ${BOLD}Per category${RESET}`);
+      for (const c of stats.perCategory.slice(0, 10)) {
+        console.log(`    ${CYAN}${c.category.padEnd(28)}${RESET}${c.count.toLocaleString().padStart(8)}`);
+      }
+      console.log();
+    } catch (err) {
+      console.error(`  Error reading memory stats: ${err}`);
+      process.exit(1);
+    }
+  });
+
+memoryCmd
+  .command('pin <chunkId>')
+  .description('Pin a chunk — gives its score a 2x boost in recall (use chunk IDs from `memory search`)')
+  .action(async (chunkIdStr: string) => {
+    const GREEN = '\x1b[0;32m';
+    const RED = '\x1b[0;31m';
+    const RESET = '\x1b[0m';
+    const chunkId = parseInt(chunkIdStr, 10);
+    if (!Number.isFinite(chunkId) || chunkId <= 0) {
+      console.error(`  ${RED}Invalid chunk id${RESET}: "${chunkIdStr}". Use IDs from \`clementine memory search\`.`);
+      process.exit(1);
+    }
+    try {
+      const { MemoryStore } = await import('../memory/store.js');
+      const VAULT_DIR = path.join(BASE_DIR, 'vault');
+      const DB_PATH = path.join(VAULT_DIR, '.memory.db');
+      const store = new MemoryStore(DB_PATH, VAULT_DIR);
+      const ok = store.setPinned(chunkId, true);
+      if (!ok) {
+        console.error(`  ${RED}Chunk ${chunkId} not found.${RESET}`);
+        process.exit(1);
+      }
+      console.log(`  ${GREEN}✓${RESET} Pinned chunk ${chunkId}. It now gets a 2× boost in memory_recall.`);
+    } catch (err) {
+      console.error(`  Error pinning chunk: ${err}`);
+      process.exit(1);
+    }
+  });
+
+memoryCmd
+  .command('unpin <chunkId>')
+  .description('Unpin a chunk — removes the manual 2x boost, leaves automatic salience untouched')
+  .action(async (chunkIdStr: string) => {
+    const GREEN = '\x1b[0;32m';
+    const RED = '\x1b[0;31m';
+    const RESET = '\x1b[0m';
+    const chunkId = parseInt(chunkIdStr, 10);
+    if (!Number.isFinite(chunkId) || chunkId <= 0) {
+      console.error(`  ${RED}Invalid chunk id${RESET}: "${chunkIdStr}".`);
+      process.exit(1);
+    }
+    try {
+      const { MemoryStore } = await import('../memory/store.js');
+      const VAULT_DIR = path.join(BASE_DIR, 'vault');
+      const DB_PATH = path.join(VAULT_DIR, '.memory.db');
+      const store = new MemoryStore(DB_PATH, VAULT_DIR);
+      const ok = store.setPinned(chunkId, false);
+      if (!ok) {
+        console.error(`  ${RED}Chunk ${chunkId} not found.${RESET}`);
+        process.exit(1);
+      }
+      console.log(`  ${GREEN}✓${RESET} Unpinned chunk ${chunkId}.`);
+    } catch (err) {
+      console.error(`  Error unpinning chunk: ${err}`);
+      process.exit(1);
+    }
+  });
+
+memoryCmd
+  .command('dedup')
+  .description('Find near-duplicate chunks via embedding cosine similarity. Dry-run by default.')
+  .option('--threshold <n>', 'Cosine similarity threshold (0-1)', '0.95')
+  .option('--apply', 'Actually delete duplicates (default: dry-run preview only)')
+  .option('--limit <n>', 'Max clusters to report', '50')
+  .action(async (opts: { threshold: string; apply?: boolean; limit: string }) => {
+    const BOLD = '\x1b[1m';
+    const DIM = '\x1b[0;90m';
+    const GREEN = '\x1b[0;32m';
+    const YELLOW = '\x1b[0;33m';
+    const RESET = '\x1b[0m';
+    const threshold = parseFloat(opts.threshold);
+    const limit = parseInt(opts.limit, 10);
+    try {
+      const { MemoryStore } = await import('../memory/store.js');
+      const VAULT_DIR = path.join(BASE_DIR, 'vault');
+      const DB_PATH = path.join(VAULT_DIR, '.memory.db');
+      const store = new MemoryStore(DB_PATH, VAULT_DIR);
+      const clusters = store.findNearDuplicates({ threshold, limit });
+      if (clusters.length === 0) {
+        console.log(`  ${GREEN}No near-duplicates found above threshold ${threshold}.${RESET}`);
+        return;
+      }
+      const totalDupes = clusters.reduce((sum, c) => sum + c.duplicates.length, 0);
+      console.log();
+      console.log(`  ${BOLD}Found ${clusters.length} cluster${clusters.length === 1 ? '' : 's'} (${totalDupes} duplicate chunk${totalDupes === 1 ? '' : 's'})${RESET}`);
+      console.log(`  ${DIM}Keeping the most-recent chunk per cluster; older copies will be removed if --apply is passed.${RESET}`);
+      console.log();
+      for (const cluster of clusters.slice(0, 20)) {
+        const keepLabel = `${cluster.keep.sourceFile} > ${cluster.keep.section}`;
+        const agent = cluster.keep.agentSlug ?? 'global';
+        console.log(`  ${BOLD}KEEP${RESET} #${cluster.keep.chunkId}  ${DIM}[${agent}]${RESET}  ${keepLabel}`);
+        for (const dup of cluster.duplicates) {
+          const dupLabel = `${dup.sourceFile} > ${dup.section}`;
+          console.log(`    ${YELLOW}drop${RESET} #${dup.chunkId}  sim=${dup.similarity.toFixed(3)}  ${DIM}${dupLabel}${RESET}`);
+        }
+      }
+      if (clusters.length > 20) {
+        console.log(`  ${DIM}…and ${clusters.length - 20} more clusters (raise --limit to see them).${RESET}`);
+      }
+      console.log();
+      if (opts.apply) {
+        const allDupeIds = clusters.flatMap(c => c.duplicates.map(d => d.chunkId));
+        const removed = store.deleteChunks(allDupeIds);
+        console.log(`  ${GREEN}✓${RESET} Deleted ${removed} duplicate chunk${removed === 1 ? '' : 's'}.`);
+      } else {
+        console.log(`  ${DIM}This was a preview. Re-run with ${BOLD}--apply${RESET}${DIM} to delete the duplicates.${RESET}`);
+      }
+      console.log();
+    } catch (err) {
+      console.error(`  Error during dedup: ${err}`);
+      process.exit(1);
+    }
+  });
+
+memoryCmd
+  .command('cross-agent')
+  .description('Surface chunks that recur across 3+ agents — candidates for promotion to global memory')
+  .option('--threshold <n>', 'Cosine similarity threshold for "same idea" (0-1)', '0.88')
+  .option('--min-agents <n>', 'Minimum distinct agents touched by a cluster', '3')
+  .option('--limit <n>', 'Max clusters to report', '30')
+  .action(async (opts: { threshold: string; minAgents: string; limit: string }) => {
+    const BOLD = '\x1b[1m';
+    const DIM = '\x1b[0;90m';
+    const CYAN = '\x1b[0;36m';
+    const GREEN = '\x1b[0;32m';
+    const RESET = '\x1b[0m';
+    try {
+      const { MemoryStore } = await import('../memory/store.js');
+      const VAULT_DIR = path.join(BASE_DIR, 'vault');
+      const DB_PATH = path.join(VAULT_DIR, '.memory.db');
+      const store = new MemoryStore(DB_PATH, VAULT_DIR);
+      const clusters = store.findCrossAgentRecurrence({
+        threshold: parseFloat(opts.threshold),
+        minAgents: parseInt(opts.minAgents, 10),
+        limit: parseInt(opts.limit, 10),
+      });
+      if (clusters.length === 0) {
+        console.log(`  ${GREEN}No cross-agent recurrence found above threshold ${opts.threshold} touching ${opts.minAgents}+ agents.${RESET}`);
+        return;
+      }
+      console.log();
+      console.log(`  ${BOLD}Found ${clusters.length} cluster${clusters.length === 1 ? '' : 's'} recurring across ${opts.minAgents}+ agents${RESET}`);
+      console.log(`  ${DIM}These are candidates for promotion to global memory — facts the team has independently arrived at.${RESET}`);
+      console.log();
+      for (const c of clusters) {
+        const preview = c.representative.content.replace(/\n/g, ' ').slice(0, 140);
+        console.log(`  ${BOLD}Cluster (${c.agents.length} agents)${RESET}  ${CYAN}${c.agents.join(', ')}${RESET}`);
+        console.log(`    representative #${c.representative.chunkId}  ${DIM}${c.representative.sourceFile} > ${c.representative.section}${RESET}`);
+        console.log(`    ${DIM}${preview}${preview.length >= 140 ? '…' : ''}${RESET}`);
+        for (const m of c.members.slice(1, 4)) {
+          console.log(`    ${DIM}└─ #${m.chunkId} [${m.agentSlug}] sim=${m.similarity.toFixed(3)}${RESET}`);
+        }
+        if (c.members.length > 4) {
+          console.log(`    ${DIM}└─ +${c.members.length - 4} more${RESET}`);
+        }
+        console.log();
+      }
+      console.log(`  ${DIM}To promote a chunk to global, use the agent-side ${BOLD}memory_promote${RESET}${DIM} tool with the chunk id, or pin it with ${BOLD}clementine memory pin <id>${RESET}${DIM} for now.${RESET}`);
+      console.log();
+    } catch (err) {
+      console.error(`  Error finding cross-agent recurrence: ${err}`);
+      process.exit(1);
+    }
+  });
+
+memoryCmd
   .command('search <query>')
   .description('Search memory (full-text)')
   .option('-n, --limit <n>', 'Max results', '10')
@@ -2404,10 +2619,13 @@ memoryCmd
         const source = r.sourceFile ? path.basename(r.sourceFile) : 'unknown';
         const section = r.section || '';
         const snippet = r.content.replace(/\n/g, ' ').slice(0, 120);
-        console.log(`  ${BOLD}${source}${RESET}${section ? ` › ${CYAN}${section}${RESET}` : ''}`);
+        const pinned = r.pinned ? ' 📌' : '';
+        console.log(`  ${DIM}#${r.chunkId}${RESET}  ${BOLD}${source}${RESET}${section ? ` › ${CYAN}${section}${RESET}` : ''}${pinned}`);
         console.log(`  ${DIM}${snippet}${snippet.length >= 120 ? '…' : ''}${RESET}`);
         console.log();
       }
+      console.log(`  ${DIM}Tip: pin a chunk to boost its score in recall — ${BOLD}clementine memory pin <id>${RESET}`);
+      console.log();
     } catch (err) {
       console.error(`  Error searching memory: ${err}`);
     }

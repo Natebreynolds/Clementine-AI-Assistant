@@ -192,6 +192,15 @@ export class MemoryStore {
       // Column already exists
     }
 
+    // Add pinned flag — manual salience reinforcement. When true, recall
+    // applies an extra score boost on top of the access-pattern salience.
+    // Toggled by `clementine memory pin/unpin <chunkId>` (or the dashboard).
+    try {
+      this.conn.exec('ALTER TABLE chunks ADD COLUMN pinned INTEGER DEFAULT 0');
+    } catch {
+      // Column already exists
+    }
+
     // Indexes for category/topic filtering
     try {
       this.conn.exec('CREATE INDEX idx_chunks_category ON chunks(category)');
@@ -789,6 +798,255 @@ export class MemoryStore {
     } catch { return 0; }
   }
 
+  /** Toggle the manual pin flag on a chunk. Pinned chunks get a 2x score boost in recall. */
+  setPinned(chunkId: number, pinned: boolean): boolean {
+    try {
+      const result = this.conn.prepare('UPDATE chunks SET pinned = ? WHERE id = ?')
+        .run(pinned ? 1 : 0, chunkId);
+      return result.changes > 0;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Aggregate stats for the memory store — used by `clementine memory status`.
+   * Single-pass scans so it stays fast even on large chunk tables.
+   */
+  getMemoryStats(): {
+    totalChunks: number;
+    chunksWithEmbeddings: number;
+    pinnedChunks: number;
+    perAgent: Array<{ agentSlug: string; count: number }>;
+    perCategory: Array<{ category: string; count: number }>;
+    avgSalience: number;
+    oldestUpdated: string | null;
+    newestUpdated: string | null;
+  } {
+    const totalChunks = this.getChunkCount();
+    const chunksWithEmbeddings = (this.conn
+      .prepare('SELECT COUNT(*) as cnt FROM chunks WHERE embedding IS NOT NULL')
+      .get() as { cnt: number } | undefined)?.cnt ?? 0;
+    const pinnedChunks = (this.conn
+      .prepare('SELECT COUNT(*) as cnt FROM chunks WHERE pinned = 1')
+      .get() as { cnt: number } | undefined)?.cnt ?? 0;
+    const perAgent = (this.conn
+      .prepare(`SELECT COALESCE(agent_slug, 'global') as agentSlug, COUNT(*) as count
+                FROM chunks GROUP BY agent_slug ORDER BY count DESC`)
+      .all() as Array<{ agentSlug: string; count: number }>);
+    const perCategory = (this.conn
+      .prepare(`SELECT COALESCE(category, '(none)') as category, COUNT(*) as count
+                FROM chunks GROUP BY category ORDER BY count DESC`)
+      .all() as Array<{ category: string; count: number }>);
+    const avgRow = this.conn
+      .prepare('SELECT AVG(salience) as avg FROM chunks WHERE salience > 0')
+      .get() as { avg: number | null } | undefined;
+    const dateRow = this.conn
+      .prepare('SELECT MIN(updated_at) as oldest, MAX(updated_at) as newest FROM chunks WHERE updated_at IS NOT NULL')
+      .get() as { oldest: string | null; newest: string | null } | undefined;
+    return {
+      totalChunks,
+      chunksWithEmbeddings,
+      pinnedChunks,
+      perAgent,
+      perCategory,
+      avgSalience: avgRow?.avg ?? 0,
+      oldestUpdated: dateRow?.oldest ?? null,
+      newestUpdated: dateRow?.newest ?? null,
+    };
+  }
+
+  /**
+   * Find clusters of near-duplicate chunks using embedding cosine similarity.
+   * Returns clusters where at least 2 chunks score above the threshold.
+   *
+   * Caller decides what to do — typical use is `clementine memory dedup` to
+   * preview / merge / mark-superseded. Per-pair O(n²) within agent scope to
+   * keep the search space tractable; cross-agent dupes are surfaced separately
+   * by the auto-promote flow.
+   */
+  findNearDuplicates(opts: { threshold?: number; minLen?: number; limit?: number } = {}): Array<{
+    keep: { chunkId: number; sourceFile: string; section: string; content: string; agentSlug: string | null; updatedAt: string | null };
+    duplicates: Array<{ chunkId: number; sourceFile: string; section: string; content: string; agentSlug: string | null; updatedAt: string | null; similarity: number }>;
+  }> {
+    const threshold = opts.threshold ?? 0.95;
+    const minLen = opts.minLen ?? 80;        // skip very short chunks — too easily collide
+    const limitClusters = opts.limit ?? 50;  // cap results so the CLI stays readable
+
+    if (!embeddingsModule.isReady()) return [];
+
+    const rows = this.conn.prepare(
+      `SELECT id, source_file, section, content, embedding, agent_slug, updated_at
+       FROM chunks
+       WHERE embedding IS NOT NULL AND length(content) >= ?
+       ORDER BY agent_slug, updated_at DESC`,
+    ).all(minLen) as Array<{
+      id: number;
+      source_file: string;
+      section: string;
+      content: string;
+      embedding: Buffer;
+      agent_slug: string | null;
+      updated_at: string | null;
+    }>;
+
+    // Group by agent first — only compare within the same scope to bound the
+    // O(n²) blow-up. Cross-agent dedup is the auto-promote flow's job.
+    const buckets = new Map<string, typeof rows>();
+    for (const r of rows) {
+      const key = r.agent_slug ?? '__global__';
+      if (!buckets.has(key)) buckets.set(key, []);
+      buckets.get(key)!.push(r);
+    }
+
+    const clusters: Array<ReturnType<typeof this.findNearDuplicates>[number]> = [];
+    const consumed = new Set<number>();
+
+    for (const bucket of buckets.values()) {
+      // Decode embeddings once per row.
+      const decoded = bucket.map(r => ({
+        ...r,
+        vec: embeddingsModule.deserializeEmbedding(r.embedding),
+      }));
+      for (let i = 0; i < decoded.length; i++) {
+        if (consumed.has(decoded[i].id)) continue;
+        const head = decoded[i];
+        const dupes: Array<{ chunkId: number; sourceFile: string; section: string; content: string; agentSlug: string | null; updatedAt: string | null; similarity: number }> = [];
+        for (let j = i + 1; j < decoded.length; j++) {
+          if (consumed.has(decoded[j].id)) continue;
+          const sim = embeddingsModule.cosineSimilarity(head.vec, decoded[j].vec);
+          if (sim >= threshold) {
+            dupes.push({
+              chunkId: decoded[j].id,
+              sourceFile: decoded[j].source_file,
+              section: decoded[j].section,
+              content: decoded[j].content,
+              agentSlug: decoded[j].agent_slug,
+              updatedAt: decoded[j].updated_at,
+              similarity: sim,
+            });
+            consumed.add(decoded[j].id);
+          }
+        }
+        if (dupes.length > 0) {
+          consumed.add(head.id);
+          clusters.push({
+            keep: {
+              chunkId: head.id,
+              sourceFile: head.source_file,
+              section: head.section,
+              content: head.content,
+              agentSlug: head.agent_slug,
+              updatedAt: head.updated_at,
+            },
+            duplicates: dupes,
+          });
+          if (clusters.length >= limitClusters) return clusters;
+        }
+      }
+    }
+    return clusters;
+  }
+
+  /** Delete chunks by id. Used by dedup --apply. */
+  deleteChunks(chunkIds: number[]): number {
+    if (!chunkIds.length) return 0;
+    const placeholders = chunkIds.map(() => '?').join(',');
+    const result = this.conn.prepare(`DELETE FROM chunks WHERE id IN (${placeholders})`).run(...chunkIds);
+    return result.changes;
+  }
+
+  /**
+   * Find chunks whose semantic content recurs across 3+ different agents —
+   * candidates for promotion to global memory. Detection-only; surfacing.
+   * The user (or a future cron) decides whether to actually promote.
+   *
+   * Approach: scan agent-scoped chunks with embeddings, cluster cross-agent
+   * pairs above the similarity threshold, return clusters touching >= minAgents
+   * distinct agents. Limits keep the O(n²) scan tractable on large stores.
+   */
+  findCrossAgentRecurrence(opts: { threshold?: number; minAgents?: number; minLen?: number; limit?: number } = {}): Array<{
+    representative: { chunkId: number; sourceFile: string; section: string; content: string; agentSlug: string };
+    members: Array<{ chunkId: number; sourceFile: string; section: string; agentSlug: string; similarity: number; updatedAt: string | null }>;
+    agents: string[]; // distinct agent slugs touched by the cluster
+  }> {
+    const threshold = opts.threshold ?? 0.88; // looser than dedup — paraphrases count
+    const minAgents = opts.minAgents ?? 3;
+    const minLen = opts.minLen ?? 100;
+    const limitClusters = opts.limit ?? 30;
+
+    if (!embeddingsModule.isReady()) return [];
+
+    // Only consider chunks that ARE agent-scoped (NULL = already global).
+    const rows = this.conn.prepare(
+      `SELECT id, source_file, section, content, embedding, agent_slug, updated_at
+       FROM chunks
+       WHERE embedding IS NOT NULL
+         AND agent_slug IS NOT NULL
+         AND length(content) >= ?
+       ORDER BY updated_at DESC`,
+    ).all(minLen) as Array<{
+      id: number;
+      source_file: string;
+      section: string;
+      content: string;
+      embedding: Buffer;
+      agent_slug: string;
+      updated_at: string | null;
+    }>;
+
+    if (rows.length < minAgents) return [];
+
+    const decoded = rows.map(r => ({ ...r, vec: embeddingsModule.deserializeEmbedding(r.embedding) }));
+
+    const clusters: ReturnType<typeof this.findCrossAgentRecurrence> = [];
+    const consumed = new Set<number>();
+
+    for (let i = 0; i < decoded.length; i++) {
+      if (consumed.has(decoded[i].id)) continue;
+      const head = decoded[i];
+      const members: Array<{ chunkId: number; sourceFile: string; section: string; agentSlug: string; similarity: number; updatedAt: string | null }> = [
+        { chunkId: head.id, sourceFile: head.source_file, section: head.section, agentSlug: head.agent_slug, similarity: 1.0, updatedAt: head.updated_at },
+      ];
+      const agentsTouched = new Set<string>([head.agent_slug]);
+
+      for (let j = i + 1; j < decoded.length; j++) {
+        if (consumed.has(decoded[j].id)) continue;
+        const sim = embeddingsModule.cosineSimilarity(head.vec, decoded[j].vec);
+        if (sim >= threshold) {
+          members.push({
+            chunkId: decoded[j].id,
+            sourceFile: decoded[j].source_file,
+            section: decoded[j].section,
+            agentSlug: decoded[j].agent_slug,
+            similarity: sim,
+            updatedAt: decoded[j].updated_at,
+          });
+          agentsTouched.add(decoded[j].agent_slug);
+        }
+      }
+
+      if (agentsTouched.size >= minAgents) {
+        // Mark all in this cluster consumed so we don't re-cluster around them.
+        for (const m of members) consumed.add(m.chunkId);
+        clusters.push({
+          representative: {
+            chunkId: head.id,
+            sourceFile: head.source_file,
+            section: head.section,
+            content: head.content,
+            agentSlug: head.agent_slug,
+          },
+          members,
+          agents: Array.from(agentsTouched).sort(),
+        });
+        if (clusters.length >= limitClusters) break;
+      }
+    }
+
+    return clusters;
+  }
+
   // ── Full Sync ──────────────────────────────────────────────────────
 
   /**
@@ -981,7 +1239,7 @@ export class MemoryStore {
     try {
       let sql = `SELECT c.id, c.source_file, c.section, c.content, c.chunk_type,
                   c.updated_at, c.salience, c.last_outcome_score, c.agent_slug, c.category, c.topic,
-                  bm25(chunks_fts) as score
+                  c.pinned, bm25(chunks_fts) as score
            FROM chunks_fts f
            JOIN chunks c ON c.id = f.rowid
            WHERE chunks_fts MATCH ?`;
@@ -1015,6 +1273,7 @@ export class MemoryStore {
         agent_slug: string | null;
         category: string | null;
         topic: string | null;
+        pinned: number | null;
         score: number;
       }>;
 
@@ -1032,6 +1291,7 @@ export class MemoryStore {
         agentSlug: row.agent_slug ?? null,
         category: row.category,
         topic: row.topic,
+        pinned: row.pinned === 1,
       }));
     } catch {
       return [];
@@ -1192,6 +1452,12 @@ export class MemoryStore {
       // Salience: editor-curated importance (admin tag, sticky note, etc.)
       if (r.salience > 0) {
         r.score *= 1.0 + r.salience;
+      }
+      // Manual pin: stronger boost than access-pattern salience. Toggled via
+      // `clementine memory pin <chunkId>`. Doubles the relevance score so
+      // pinned chunks consistently rank near the top within their relevance band.
+      if (r.pinned) {
+        r.score *= 2.0;
       }
       // Outcome-driven adjustment: chunks that recently got cited in
       // responses get a small boost; chunks that were pulled in and

@@ -18,6 +18,7 @@ export interface SearchResult {
   agentSlug?: string | null;
   category?: string | null;
   topic?: string | null;
+  pinned?: boolean;
 }
 
 export type ChunkCategory = 'facts' | 'events' | 'discoveries' | 'preferences' | 'advice';

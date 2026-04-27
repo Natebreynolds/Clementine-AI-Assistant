@@ -121,6 +121,57 @@ server.tool(
 );
 
 
+// ── 0b. team_scratchpad ────────────────────────────────────────────────
+//
+// Cross-agent shared scratchpad. Unlike working_memory (per-agent), this
+// is a single shared markdown file every agent can read and append to.
+// Use cases: live coordination ("Sasha is drafting the brief, Ross hold
+// outbound for 30m"), cross-agent context drops, async hand-offs that
+// don't warrant a full goal_create or task_add. Append tags every entry
+// with the author's agent slug + ISO timestamp so the trail stays clear.
+
+const TEAM_SCRATCHPAD_FILE = path.join(BASE_DIR, 'team-scratchpad.md');
+
+server.tool(
+  'team_scratchpad',
+  getToolDescription('team_scratchpad') ?? 'Cross-agent shared scratchpad for live team coordination. All agents read/write the same file. Use for hand-offs, "I am working on X", short-term context drops. For durable facts, use memory_write/MEMORY.md instead.',
+  {
+    action: z.enum(['read', 'append', 'replace', 'clear']).describe('What to do with the team scratchpad'),
+    content: z.string().optional().describe('Text to append or replace with (required for append/replace)'),
+  },
+  async ({ action, content }) => {
+    const author = ACTIVE_AGENT_SLUG ?? 'clementine';
+    switch (action) {
+      case 'read': {
+        if (!existsSync(TEAM_SCRATCHPAD_FILE)) {
+          return textResult('Team scratchpad is empty.');
+        }
+        return textResult(readFileSync(TEAM_SCRATCHPAD_FILE, 'utf-8'));
+      }
+      case 'append': {
+        if (!content) return textResult('Error: content is required for append.');
+        const stamp = new Date().toISOString();
+        const entry = `\n- **[${author}@${stamp}]** ${content}\n`;
+        const existing = existsSync(TEAM_SCRATCHPAD_FILE) ? readFileSync(TEAM_SCRATCHPAD_FILE, 'utf-8') : '# Team Scratchpad\n\nShared across all agents. Append tags entries with author + timestamp.\n';
+        writeFileSync(TEAM_SCRATCHPAD_FILE, existing + entry);
+        return textResult(`Appended to team scratchpad as ${author}.`);
+      }
+      case 'replace': {
+        if (!content) return textResult('Error: content is required for replace.');
+        const stamp = new Date().toISOString();
+        const header = `# Team Scratchpad\n\n_Replaced by ${author} at ${stamp}._\n\n`;
+        writeFileSync(TEAM_SCRATCHPAD_FILE, header + content + '\n');
+        return textResult(`Team scratchpad replaced by ${author}.`);
+      }
+      case 'clear': {
+        if (existsSync(TEAM_SCRATCHPAD_FILE)) unlinkSync(TEAM_SCRATCHPAD_FILE);
+        return textResult('Team scratchpad cleared.');
+      }
+    }
+  },
+);
+
+
 // ── 1. memory_read ─────────────────────────────────────────────────────
 
 server.tool(
