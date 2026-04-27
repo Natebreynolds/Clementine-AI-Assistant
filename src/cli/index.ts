@@ -2203,6 +2203,177 @@ configCmd
     }
   });
 
+// ── Agent commands ──────────────────────────────────────────────────
+
+const agentCmd = program
+  .command('agent')
+  .description('Hire, list, and manage specialist agents');
+
+agentCmd
+  .command('list')
+  .description('List all agents with status and tier')
+  .option('--json', 'Emit machine-readable JSON')
+  .action(async (opts: { json?: boolean }) => {
+    const BOLD = '\x1b[1m';
+    const DIM = '\x1b[0;90m';
+    const GREEN = '\x1b[0;32m';
+    const YELLOW = '\x1b[0;33m';
+    const RED = '\x1b[0;31m';
+    const RESET = '\x1b[0m';
+    try {
+      const { AgentManager } = await import('../agent/agent-manager.js');
+      const AGENTS_DIR = path.join(BASE_DIR, 'agents');
+      const mgr = new AgentManager(AGENTS_DIR);
+      const agents = mgr.listAll();
+      if (opts.json) {
+        console.log(JSON.stringify(agents.map(a => ({
+          slug: a.slug, name: a.name, status: a.status, tier: a.tier,
+          description: a.description, hasChannel: !!a.team?.channelName,
+        })), null, 2));
+        return;
+      }
+      if (agents.length === 0) {
+        console.log(`\n  No agents found in ${AGENTS_DIR}.`);
+        console.log(`  Hire one: ${BOLD}clementine agent new <slug>${RESET}\n`);
+        return;
+      }
+      console.log();
+      console.log(`  ${BOLD}${'SLUG'.padEnd(28)}${'NAME'.padEnd(24)}${'STATUS'.padEnd(12)}${'TIER'.padEnd(6)}${RESET}`);
+      console.log(`  ${DIM}${'─'.repeat(70)}${RESET}`);
+      for (const a of agents) {
+        const statusColor = a.status === 'active' ? GREEN : a.status === 'paused' ? YELLOW : RED;
+        const statusStr = `${statusColor}${(a.status ?? 'active').padEnd(10)}${RESET}`;
+        console.log(`  ${a.slug.padEnd(28)}${(a.name ?? '').slice(0, 22).padEnd(24)}${statusStr}  ${String(a.tier).padEnd(6)}`);
+      }
+      console.log();
+    } catch (err) {
+      console.error(`  Error listing agents: ${err}`);
+      process.exit(1);
+    }
+  });
+
+agentCmd
+  .command('new <slug>')
+  .description('Scaffold a new agent at agents/<slug>/agent.md (does not overwrite)')
+  .option('-n, --name <name>', 'Display name (default: title-case of slug)')
+  .option('-d, --description <text>', 'One-line description of what the agent does')
+  .option('-r, --role <role>', 'Role template — auto-scaffolds CRON.md / PLAYBOOK.md (sdr, researcher)')
+  .option('-t, --tier <tier>', 'Security tier — 1 = vault-only, 2 = bash/git allowed', '1')
+  .option('-m, --model <model>', 'Default model (sonnet, haiku, opus). Inherits global default if omitted.')
+  .option('--channel <name>', 'Discord/Slack channel name the agent listens in (enables team mode)')
+  .action(async (slug: string, opts: {
+    name?: string; description?: string; role?: string;
+    tier?: string; model?: string; channel?: string;
+  }) => {
+    const BOLD = '\x1b[1m';
+    const DIM = '\x1b[0;90m';
+    const GREEN = '\x1b[0;32m';
+    const RED = '\x1b[0;31m';
+    const RESET = '\x1b[0m';
+
+    // Validate slug — lowercase, dashes, alphanumeric, no leading/trailing dash.
+    if (!/^[a-z0-9][a-z0-9-]*[a-z0-9]$/.test(slug) || slug.length < 3) {
+      console.error(`  ${RED}Invalid slug${RESET}: must be 3+ chars, lowercase letters/digits/dashes, no leading/trailing dash. Got: "${slug}"`);
+      process.exit(1);
+    }
+    if (slug === 'clementine') {
+      console.error(`  ${RED}Reserved slug${RESET}: "clementine" is the master assistant. Pick a different name.`);
+      process.exit(1);
+    }
+
+    const tier = Math.max(1, Math.min(2, parseInt(opts.tier ?? '1', 10) || 1));
+    const name = opts.name ?? slug.split('-').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
+    const description = opts.description ?? `${name} — specialist agent.`;
+
+    try {
+      const { AgentManager } = await import('../agent/agent-manager.js');
+      const AGENTS_DIR = path.join(BASE_DIR, 'agents');
+      const mgr = new AgentManager(AGENTS_DIR);
+
+      // Refuse if already taken (createAgent throws but we want a friendly error)
+      if (mgr.get(slug)) {
+        console.error(`  ${RED}Agent "${slug}" already exists${RESET}. Edit ${path.join(AGENTS_DIR, slug, 'agent.md')} or pick a different slug.`);
+        process.exit(1);
+      }
+
+      const config: Parameters<typeof mgr.createAgent>[0] = {
+        name,
+        description,
+        tier,
+      };
+      if (opts.model) config.model = opts.model;
+      if (opts.channel) config.channelName = opts.channel;
+      if (opts.role) config.role = opts.role;
+
+      const profile = mgr.createAgent(config);
+      const agentMdPath = path.join(profile.agentDir ?? path.join(AGENTS_DIR, slug), 'agent.md');
+
+      console.log();
+      console.log(`  ${GREEN}✓${RESET} Created agent ${BOLD}${profile.name}${RESET} (${profile.slug})`);
+      console.log(`  ${DIM}File: ${agentMdPath}${RESET}`);
+      if (opts.role) {
+        console.log(`  ${DIM}Role scaffold "${opts.role}" wrote CRON.md / PLAYBOOK.md / SEQUENCES.md if applicable.${RESET}`);
+      }
+      console.log();
+      console.log(`  Next steps:`);
+      console.log(`    1. Edit ${BOLD}agent.md${RESET} to refine personality / standing instructions`);
+      if (!opts.channel) {
+        console.log(`    2. Add a ${BOLD}channelName${RESET} (and DISCORD/SLACK token via 'clementine config set') to give them their own bot`);
+      }
+      console.log(`    3. Edit ${BOLD}~/.clementine/agents/${slug}/CRON.md${RESET} to schedule autonomous work`);
+      console.log(`    4. Restart the daemon: ${BOLD}clementine restart${RESET}`);
+      console.log();
+    } catch (err) {
+      console.error(`  ${RED}Failed to create agent${RESET}: ${err instanceof Error ? err.message : String(err)}`);
+      process.exit(1);
+    }
+  });
+
+agentCmd
+  .command('show <slug>')
+  .description('Show an agent\'s file path and parsed profile summary')
+  .action(async (slug: string) => {
+    const BOLD = '\x1b[1m';
+    const DIM = '\x1b[0;90m';
+    const RED = '\x1b[0;31m';
+    const RESET = '\x1b[0m';
+    try {
+      const { AgentManager } = await import('../agent/agent-manager.js');
+      const AGENTS_DIR = path.join(BASE_DIR, 'agents');
+      const mgr = new AgentManager(AGENTS_DIR);
+      const profile = mgr.get(slug);
+      if (!profile) {
+        console.error(`  ${RED}Agent "${slug}" not found${RESET}.`);
+        console.error(`  List agents: ${BOLD}clementine agent list${RESET}`);
+        process.exit(1);
+      }
+      const agentMdPath = path.join(profile.agentDir ?? path.join(AGENTS_DIR, slug), 'agent.md');
+      console.log();
+      console.log(`  ${BOLD}${profile.name}${RESET}  ${DIM}(${profile.slug})${RESET}`);
+      console.log(`  ${DIM}${agentMdPath}${RESET}`);
+      console.log();
+      console.log(`  Status:       ${profile.status ?? 'active'}`);
+      console.log(`  Tier:         ${profile.tier}`);
+      if (profile.model) console.log(`  Model:        ${profile.model}`);
+      console.log(`  Description:  ${profile.description || DIM + '(none)' + RESET}`);
+      if (profile.team?.channelName) {
+        const ch = Array.isArray(profile.team.channelName) ? profile.team.channelName.join(', ') : profile.team.channelName;
+        console.log(`  Channel:      ${ch}`);
+      }
+      if (profile.activeHours) {
+        console.log(`  Active hours: ${profile.activeHours.start.toFixed(2)}–${profile.activeHours.end.toFixed(2)} (decimal hours)`);
+      }
+      if (profile.budgetMonthlyCents != null && profile.budgetMonthlyCents > 0) {
+        console.log(`  Budget/mo:    $${(profile.budgetMonthlyCents / 100).toFixed(2)}`);
+      }
+      console.log(`  Strict mem:   ${profile.strictMemoryIsolation === false ? 'no (soft boost)' : 'yes (default)'}`);
+      console.log();
+    } catch (err) {
+      console.error(`  Error reading agent: ${err}`);
+      process.exit(1);
+    }
+  });
+
 // ── Memory commands ─────────────────────────────────────────────────
 
 const memoryCmd = program

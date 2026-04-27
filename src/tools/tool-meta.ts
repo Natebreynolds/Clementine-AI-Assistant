@@ -38,9 +38,15 @@ const TOOL_META: Record<string, ToolMeta> = {
   },
 
   memory_recall: {
-    description: 'Context retrieval combining text relevance + recency. Better than memory_search for finding related content — it considers how recently notes were updated. Use this as your default "what do I know about X" tool.',
-    exampleUsage: 'Use before responding to questions about people, projects, or topics the user has discussed before.',
+    description: 'Context retrieval combining text relevance + recency, scoped to YOUR memory + global memory. Best as your default "what do I know about X" tool when the question lives in your domain. For cross-agent synthesis (what your team as a whole knows), use brain_recall instead.',
+    exampleUsage: 'Use before responding to questions about people, projects, or topics the user has discussed with you before.',
     returnHint: 'Ranked chunks with source file, category, and content preview.',
+  },
+
+  brain_recall: {
+    description: 'CROSS-AGENT unified recall — searches the entire memory store across YOU and every team agent, with source-agent attribution per result. Use for synthesis questions ("what does my team know about X?", "have any of my agents discussed Y?"), or whenever you need the full picture instead of just your own scope. Specialist agents normally stay in memory_recall (which respects their isolation); brain_recall is the single-brain view, primarily for Clementine.',
+    exampleUsage: 'When the user asks "what have we collectively learned about Acme this quarter", brain_recall returns chunks from every agent that touched the topic.',
+    returnHint: 'Ranked chunks tagged [agent: <slug>] or [agent: global], plus source file and content preview.',
   },
 
   memory_read: {

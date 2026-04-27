@@ -57,6 +57,7 @@ const DEFAULT_CONFIG: SelfImproveConfig = {
   iterationBudgetMs: 300_000,       // 5 min
   maxDurationMs: 3_600_000,         // 1 hour
   acceptThreshold: 0.7,
+  surfaceThreshold: 0.85,
   plateauLimit: 3,
   // 'source' deprecated — self-improvement produces data, not engine TS edits.
   // 'advisor-rule' writes YAML to ~/.clementine/advisor-rules/user/.
@@ -443,6 +444,11 @@ export class SelfImproveLoop {
           const score = evaluation?.score ?? 0;
           const normalizedScore = score / 10; // Convert 0-10 to 0-1
           const accepted = normalizedScore >= this.config.acceptThreshold;
+          // Surface gate: even when accepted, only score >= surfaceThreshold
+          // reaches the user's pending-changes inbox. Below that floor we
+          // keep the experiment in the trend log but don't ping the user.
+          const surfaceFloor = this.config.surfaceThreshold ?? this.config.acceptThreshold;
+          const surfaced = normalizedScore >= surfaceFloor;
 
           const priorScores = history
             .filter(e => e.area === proposal.area && e.target === proposal.target && e.score > 0)
@@ -450,6 +456,15 @@ export class SelfImproveLoop {
           const baselineScore = priorScores.length > 0
             ? priorScores.reduce((a, b) => a + b, 0) / priorScores.length
             : 0.5;
+
+          const initialStatus: SelfImproveExperiment['approvalStatus'] = accepted
+            ? (surfaced ? 'pending' : 'unsurfaced')
+            : 'denied';
+          const reason = accepted
+            ? (surfaced
+                ? `Score ${score}/10 exceeds surface threshold — pending approval`
+                : `Score ${score}/10 accepted but below surface floor (${surfaceFloor * 10}/10) — kept in trend log only`)
+            : `Score ${score}/10 below accept threshold (${this.config.acceptThreshold * 10}/10)`;
 
           const experiment: SelfImproveExperiment = {
             id,
@@ -464,10 +479,8 @@ export class SelfImproveLoop {
             baselineScore,
             score: normalizedScore,
             accepted,
-            approvalStatus: accepted ? 'pending' : 'denied',
-            reason: accepted
-              ? `Score ${score}/10 exceeds threshold — pending approval`
-              : `Score ${score}/10 below threshold (${this.config.acceptThreshold * 10}/10)`,
+            approvalStatus: initialStatus,
+            reason,
           };
 
           // Step 7: Log
@@ -475,8 +488,16 @@ export class SelfImproveLoop {
           history.push(experiment);
           state.totalExperiments++;
 
-          // Step 6: Gate — save pending change + notify (tiered by risk)
-          if (accepted) {
+          if (accepted && !surfaced) {
+            logger.info(
+              { id, area: proposal.area, target: proposal.target, score: score, surfaceFloor: surfaceFloor * 10 },
+              'Proposal accepted but unsurfaced — below noise floor, not added to review queue',
+            );
+          }
+
+          // Step 6: Gate — save pending change + notify (tiered by risk).
+          // Only proposals that ALSO clear the surface floor reach the inbox.
+          if (accepted && surfaced) {
             const risk = classifyRisk(proposal.area);
 
             if (this.config.autoApply && risk === 'low') {

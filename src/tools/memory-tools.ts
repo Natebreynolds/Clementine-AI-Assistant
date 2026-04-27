@@ -357,7 +357,7 @@ server.tool(
 
 server.tool(
   'memory_recall',
-  getToolDescription('memory_recall') ?? 'Context retrieval combining FTS5 relevance + recency search. Better than memory_search for finding related content by meaning. Optional category/topic filters narrow results.',
+  getToolDescription('memory_recall') ?? 'Context retrieval combining FTS5 relevance + recency search, scoped to your memory + global. For cross-agent synthesis use brain_recall.',
   {
     query: z.string().describe('Natural language search query'),
     category: z.enum(['facts', 'events', 'discoveries', 'preferences', 'advice']).optional().describe('Filter by category'),
@@ -370,7 +370,7 @@ server.tool(
       { agentSlug: ACTIVE_AGENT_SLUG ?? undefined, category, topic },
     ) as Array<{
       sourceFile: string; section: string; content: string; score: number;
-      matchType: string; chunkId: number;
+      matchType: string; chunkId: number; agentSlug?: string | null;
     }>;
 
     if (!results.length) {
@@ -383,11 +383,74 @@ server.tool(
 
     const lines = results.map(r => {
       const label = `[${r.matchType}]`;
+      const agentTag = r.agentSlug ? ` [agent: ${r.agentSlug}]` : '';
       const preview = r.content.slice(0, 300).replace(/\n/g, ' ');
-      return `**${r.sourceFile} > ${r.section}** ${label} (score: ${r.score.toFixed(3)})\n${preview}\n`;
+      return `**${r.sourceFile} > ${r.section}** ${label}${agentTag} (score: ${r.score.toFixed(3)})\n${preview}\n`;
     });
 
     return textResult(lines.join('\n'));
+  },
+);
+
+
+// ── 4b. brain_recall ──────────────────────────────────────────────────
+//
+// Cross-agent unified recall. Differs from memory_recall in two ways:
+//   1. No agentSlug scope — pulls from every agent's memory + global.
+//   2. Always tags each result with [agent: <slug>] so the caller can
+//      see provenance (which agent's memory the chunk came from).
+//
+// Intended caller: Clementine herself. Specialist agents normally stay in
+// memory_recall (which respects strict isolation). brain_recall is the
+// "single brain" view that lets the master assistant synthesize across
+// the whole team.
+
+server.tool(
+  'brain_recall',
+  getToolDescription('brain_recall') ?? 'Cross-agent unified recall — searches across all agents with source-agent attribution. Use for synthesis questions or when you need the full picture, not just your own scope.',
+  {
+    query: z.string().describe('Natural language query — what to find across all agents'),
+    category: z.enum(['facts', 'events', 'discoveries', 'preferences', 'advice']).optional().describe('Filter by category'),
+    topic: z.string().optional().describe('Filter by topic'),
+    limit: z.number().optional().describe('Max results across all agents (default 12)'),
+  },
+  async ({ query, category, topic, limit }) => {
+    const store = await getStore();
+    // Intentionally omit agentSlug — we want the unscoped, cross-agent view.
+    const results = store.searchContext(
+      query,
+      { category, topic, limit: limit ?? 12 },
+    ) as Array<{
+      sourceFile: string; section: string; content: string; score: number;
+      matchType: string; chunkId: number; agentSlug?: string | null;
+    }>;
+
+    if (!results.length) {
+      return textResult(`No results for: ${query}`);
+    }
+
+    const chunkIds = results.map(r => r.chunkId).filter(Boolean);
+    if (chunkIds.length) store.recordAccess(chunkIds);
+
+    // Group attribution counts so the agent gets a quick summary of the spread.
+    const perAgent = new Map<string, number>();
+    for (const r of results) {
+      const key = r.agentSlug ?? 'global';
+      perAgent.set(key, (perAgent.get(key) ?? 0) + 1);
+    }
+    const spread = Array.from(perAgent.entries())
+      .sort((a, b) => b[1] - a[1])
+      .map(([slug, n]) => `${slug}:${n}`)
+      .join(', ');
+
+    const lines = results.map(r => {
+      const agent = r.agentSlug ?? 'global';
+      const label = `[${r.matchType}]`;
+      const preview = r.content.slice(0, 300).replace(/\n/g, ' ');
+      return `**${r.sourceFile} > ${r.section}** ${label} [agent: ${agent}] (score: ${r.score.toFixed(3)})\n${preview}\n`;
+    });
+
+    return textResult(`Cross-agent spread: ${spread}\n\n${lines.join('\n')}`);
   },
 );
 

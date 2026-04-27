@@ -604,7 +604,7 @@ export interface SelfImproveExperiment {
   baselineScore: number;               // Score before (0-1)
   score: number;                       // Evaluation score (0-1)
   accepted: boolean;                   // Did it pass evaluation threshold?
-  approvalStatus: 'pending' | 'approved' | 'denied' | 'expired';
+  approvalStatus: 'pending' | 'approved' | 'denied' | 'expired' | 'unsurfaced';
   reason: string;                      // Why accepted/rejected
   error?: string;
 }
@@ -646,7 +646,14 @@ export interface SelfImproveConfig {
   maxIterations: number;               // Default: 10
   iterationBudgetMs: number;           // Default: 300_000 (5 min)
   maxDurationMs: number;               // Default: 3_600_000 (1 hour)
-  acceptThreshold: number;             // Default: 0.6 (score must beat this)
+  acceptThreshold: number;             // Default: 0.7 (score must beat this to register as accepted)
+  /**
+   * Default: 0.85. Stricter floor for what reaches the user's pending-changes
+   * inbox. Proposals scoring >= acceptThreshold but < surfaceThreshold are
+   * marked 'unsurfaced' — kept in the experiment log for trend analysis but
+   * NOT written to PENDING_DIR. Cuts noise without losing signal data.
+   */
+  surfaceThreshold?: number;
   plateauLimit: number;                // Default: 3 consecutive low-score stops loop
   areas: ('soul' | 'cron' | 'workflow' | 'memory' | 'agent' | 'source' | 'communication' | 'goal' | 'advisor-rule' | 'prompt-override')[];
   /** Enable tiered auto-apply: low-risk changes apply without approval. Default: false. */
