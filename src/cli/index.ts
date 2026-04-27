@@ -913,7 +913,10 @@ function cmdConfigSet(key: string, value: string): void {
     content = content.trimEnd() + `\n${upperKey}=${value}\n`;
   }
 
-  writeFileSync(ENV_PATH, content);
+  // Mode 0o600 — credentials live here; never world-readable. Phase 12
+  // hardening also fixes pre-existing .env files via `clementine config
+  // harden-permissions`.
+  writeFileSync(ENV_PATH, content, { mode: 0o600 });
   console.log(`  Set ${upperKey}=${value}`);
 }
 
@@ -1267,6 +1270,73 @@ async function cmdConfigMigrateFromKeychain(opts: { dryRun?: boolean; key?: stri
   console.log();
   console.log(`  ${GREEN}Migrated ${result.migrated.length} key${result.migrated.length === 1 ? '' : 's'} out of keychain.${RESET}`);
   console.log();
+}
+
+// ── Config harden-permissions ────────────────────────────────────────
+
+async function cmdConfigHardenPermissions(opts: { dryRun?: boolean; json?: boolean }): Promise<void> {
+  const { hardenPermissions } = await import('../config/harden-permissions.js');
+  const report = hardenPermissions(BASE_DIR, { dryRun: opts.dryRun });
+
+  if (opts.json) {
+    console.log(JSON.stringify(report, null, 2));
+    process.exit(report.failed > 0 ? 1 : 0);
+  }
+
+  const DIM = '\x1b[0;90m';
+  const BOLD = '\x1b[1m';
+  const GREEN = '\x1b[0;32m';
+  const YELLOW = '\x1b[0;33m';
+  const RED = '\x1b[0;31m';
+  const CYAN = '\x1b[0;36m';
+  const RESET = '\x1b[0m';
+
+  console.log();
+  console.log(`  ${BOLD}Data home:${RESET}  ${report.baseDir}`);
+  console.log(`  ${BOLD}Mode:${RESET}        ${opts.dryRun ? `${YELLOW}dry run${RESET}` : `${GREEN}apply${RESET}`}`);
+  console.log();
+
+  console.log(`  ${BOLD}Scanned:${RESET}         ${report.scanned}`);
+  console.log(`  ${GREEN}Tightened:${RESET}       ${report.tightened}`);
+  console.log(`  ${DIM}Already correct:${RESET} ${report.alreadyCorrect}`);
+  console.log(`  ${DIM}Skipped:${RESET}         ${report.skipped}`);
+  if (report.failed > 0) {
+    console.log(`  ${RED}Failed:${RESET}          ${report.failed}`);
+  }
+  console.log();
+
+  // Show first ~20 tightened entries — enough to see the shape without flooding
+  const tightened = report.entries.filter(e => e.status === 'tightened').slice(0, 20);
+  if (tightened.length > 0) {
+    console.log(`  ${BOLD}${opts.dryRun ? 'Would tighten' : 'Tightened'} (showing first ${tightened.length}):${RESET}`);
+    for (const e of tightened) {
+      const rel = e.path.startsWith(report.baseDir + '/') ? e.path.slice(report.baseDir.length + 1) : e.path;
+      const kindTag = e.kind === 'directory' ? `${CYAN}d${RESET}` : `${DIM}-${RESET}`;
+      console.log(`    ${kindTag} ${e.beforeMode} ${DIM}→${RESET} ${GREEN}${e.afterMode}${RESET}  ${rel}`);
+    }
+    if (report.tightened > tightened.length) {
+      console.log(`    ${DIM}... ${report.tightened - tightened.length} more${RESET}`);
+    }
+    console.log();
+  }
+
+  const failed = report.entries.filter(e => e.status === 'failed').slice(0, 10);
+  if (failed.length > 0) {
+    console.log(`  ${RED}${BOLD}Failed:${RESET}`);
+    for (const e of failed) {
+      console.log(`    ${RED}✗${RESET} ${e.path} — ${e.error ?? 'unknown'}`);
+    }
+    console.log();
+  }
+
+  if (opts.dryRun) {
+    console.log(`  ${DIM}Re-run without --dry-run to apply.${RESET}`);
+    console.log();
+  } else if (report.tightened > 0) {
+    console.log(`  ${GREEN}Done.${RESET} ${DIM}Re-run \`clementine config doctor\` to confirm permissions are now correct.${RESET}`);
+    console.log();
+  }
+  process.exit(report.failed > 0 ? 1 : 0);
 }
 
 // ── Config keychain-fix-acl ─────────────────────────────────────────
@@ -2109,6 +2179,15 @@ configCmd
   });
 
 configCmd
+  .command('harden-permissions')
+  .description('Tighten file modes in ~/.clementine/ — files to 0600, directories to 0700')
+  .option('--dry-run', 'Preview without changing anything')
+  .option('--json', 'Emit machine-readable JSON')
+  .action(async (opts: { dryRun?: boolean; json?: boolean }) => {
+    await cmdConfigHardenPermissions(opts);
+  });
+
+configCmd
   .command('edit')
   .description('Open .env in your editor')
   .action(() => {
@@ -2336,10 +2415,10 @@ async function cmdUpdate(options: { restart?: boolean; dryRun?: boolean }): Prom
   if (!options.dryRun) {
     mkdirSync(backupDir, { recursive: true });
 
-    // .env
+    // .env (mode 0o600 — backup carries credentials, same protection as live file)
     if (existsSync(ENV_PATH)) {
       const envContent = readFileSync(ENV_PATH, 'utf-8');
-      writeFileSync(path.join(backupDir, '.env'), envContent);
+      writeFileSync(path.join(backupDir, '.env'), envContent, { mode: 0o600 });
     }
 
     // Cron state
