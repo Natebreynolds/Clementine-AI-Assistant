@@ -120,15 +120,58 @@ describe('buildToolUsageReport', () => {
     expect(r.totalToolCalls).toBe(1);
   });
 
-  it('ranks families by total call count desc', () => {
+  it('ranks families by attributed cost first, then call count', () => {
+    // Family A (shell): 1 call in a $1 query → $1 attributed
+    // Family B (fs-read): 4 calls in a $0.40 query → $0.10 each, $0.40 total
+    // shell wins on cost despite fewer calls.
     writeLog([
-      { ts: '2026-04-26T10:00:00Z', event_type: 'tool_use', tool_name: 'Read' },
-      { ts: '2026-04-26T10:01:00Z', event_type: 'tool_use', tool_name: 'Bash' },
-      { ts: '2026-04-26T10:02:00Z', event_type: 'tool_use', tool_name: 'Bash' },
-      { ts: '2026-04-26T10:03:00Z', event_type: 'tool_use', tool_name: 'Bash' },
+      { ts: '2026-04-26T10:00:00Z', event_type: 'tool_use', tool_name: 'Bash' },
+      { ts: '2026-04-26T10:00:30Z', event_type: 'query_complete', cost_usd: 1.00 },
+      { ts: '2026-04-26T10:01:00Z', event_type: 'tool_use', tool_name: 'Read' },
+      { ts: '2026-04-26T10:01:01Z', event_type: 'tool_use', tool_name: 'Read' },
+      { ts: '2026-04-26T10:01:02Z', event_type: 'tool_use', tool_name: 'Read' },
+      { ts: '2026-04-26T10:01:03Z', event_type: 'tool_use', tool_name: 'Read' },
+      { ts: '2026-04-26T10:01:30Z', event_type: 'query_complete', cost_usd: 0.40 },
     ]);
     const r = buildToolUsageReport(auditPath, '2026-04-26T00:00:00Z', '2026-04-27T00:00:00Z');
     expect(r.families[0]!.family).toBe('shell');
-    expect(r.families[0]!.totalCalls).toBe(3);
+    expect(r.families[0]!.estimatedCostUsd).toBeCloseTo(1.0, 2);
+    expect(r.families[1]!.family).toBe('fs-read');
+    expect(r.families[1]!.estimatedCostUsd).toBeCloseTo(0.40, 2);
+  });
+
+  it('attributes query cost evenly across tool calls in its window', () => {
+    // 3 Bash calls then a $0.30 query → $0.10 each
+    writeLog([
+      { ts: '2026-04-26T10:00:00Z', event_type: 'tool_use', tool_name: 'Bash' },
+      { ts: '2026-04-26T10:00:01Z', event_type: 'tool_use', tool_name: 'Bash' },
+      { ts: '2026-04-26T10:00:02Z', event_type: 'tool_use', tool_name: 'Bash' },
+      { ts: '2026-04-26T10:00:30Z', event_type: 'query_complete', cost_usd: 0.30 },
+    ]);
+    const r = buildToolUsageReport(auditPath, '2026-04-26T00:00:00Z', '2026-04-27T00:00:00Z');
+    const shell = r.families.find(f => f.family === 'shell')!;
+    expect(shell.estimatedCostUsd).toBeCloseTo(0.30, 4);
+    expect(r.attributedCostUsd).toBeCloseTo(0.30, 4);
+  });
+
+  it('tool calls without a closing query_complete contribute zero cost', () => {
+    writeLog([
+      { ts: '2026-04-26T10:00:00Z', event_type: 'tool_use', tool_name: 'Bash' },
+      { ts: '2026-04-26T10:00:01Z', event_type: 'tool_use', tool_name: 'Bash' },
+      // No query_complete in window — the query's cost lives in a later window.
+    ]);
+    const r = buildToolUsageReport(auditPath, '2026-04-26T00:00:00Z', '2026-04-27T00:00:00Z');
+    expect(r.attributedCostUsd).toBe(0);
+    expect(r.families[0]!.estimatedCostUsd).toBe(0);
+    expect(r.families[0]!.totalCalls).toBe(2); // calls still counted
+  });
+
+  it('query_complete with no preceding tool_use contributes to totalCost but not attributedCost', () => {
+    writeLog([
+      { ts: '2026-04-26T10:00:00Z', event_type: 'query_complete', cost_usd: 0.50 },
+    ]);
+    const r = buildToolUsageReport(auditPath, '2026-04-26T00:00:00Z', '2026-04-27T00:00:00Z');
+    expect(r.totalCostUsd).toBeCloseTo(0.50, 4);
+    expect(r.attributedCostUsd).toBe(0);
   });
 });

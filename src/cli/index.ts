@@ -1355,7 +1355,7 @@ async function cmdAnalyticsToolUsage(opts: { hours?: string; json?: boolean; lim
   console.log(`  ${BOLD}Window:${RESET} last ${hours}h ${DIM}(${start.toISOString()} → ${end.toISOString()})${RESET}`);
   console.log(`  ${BOLD}Total tool calls:${RESET} ${report.totalToolCalls.toLocaleString()}`);
   console.log(`  ${BOLD}Total queries:${RESET}    ${report.totalQueries.toLocaleString()}`);
-  console.log(`  ${BOLD}Total cost:${RESET}       ${GREEN}$${report.totalCostUsd.toFixed(4)}${RESET}`);
+  console.log(`  ${BOLD}Total cost:${RESET}       ${GREEN}$${report.totalCostUsd.toFixed(4)}${RESET} ${DIM}(attributed to tools: $${report.attributedCostUsd.toFixed(4)})${RESET}`);
   console.log();
 
   if (report.families.length === 0) {
@@ -1365,27 +1365,27 @@ async function cmdAnalyticsToolUsage(opts: { hours?: string; json?: boolean; lim
   }
 
   const top = report.families.slice(0, limit);
-  const maxCalls = Math.max(...top.map(f => f.totalCalls));
+  const maxCost = Math.max(...top.map(f => f.estimatedCostUsd), 0.0001);
   const familyWidth = Math.max(...top.map(f => f.family.length), 12);
 
-  console.log(`  ${BOLD}Top ${top.length} tool families${RESET}`);
+  console.log(`  ${BOLD}Top ${top.length} tool families ${DIM}(ranked by attributed cost)${RESET}`);
   for (const f of top) {
-    const pct = report.totalToolCalls > 0
-      ? ((f.totalCalls / report.totalToolCalls) * 100).toFixed(1)
+    const pct = report.attributedCostUsd > 0
+      ? ((f.estimatedCostUsd / report.attributedCostUsd) * 100).toFixed(1)
       : '0.0';
-    const barLen = Math.round((f.totalCalls / maxCalls) * 28);
-    const bar = '█'.repeat(barLen).padEnd(28);
+    const barLen = Math.round((f.estimatedCostUsd / maxCost) * 24);
+    const bar = '█'.repeat(barLen).padEnd(24);
     console.log(
       `    ${CYAN}${f.family.padEnd(familyWidth)}${RESET}  ` +
-      `${String(f.totalCalls).padStart(5)} ${DIM}calls${RESET}  ` +
-      `${pct.padStart(5)}%  ${YELLOW}${bar}${RESET}`,
+      `${GREEN}$${f.estimatedCostUsd.toFixed(2).padStart(7)}${RESET} ` +
+      `${pct.padStart(5)}%  ` +
+      `${DIM}${String(f.totalCalls).padStart(5)} calls${RESET}  ` +
+      `${YELLOW}${bar}${RESET}`,
     );
-
-    // Top 2 individual tools within each family + top source
     const topTools = f.byTool.slice(0, 2).map(t => `${t.tool}×${t.count}`).join(', ');
     const topSource = f.bySource[0];
     console.log(`      ${DIM}top tools: ${topTools}${RESET}`);
-    if (topSource) {
+    if (topSource && topSource.source !== 'unknown') {
       console.log(`      ${DIM}driven by: ${topSource.source} (${topSource.count} calls)${RESET}`);
     }
   }
