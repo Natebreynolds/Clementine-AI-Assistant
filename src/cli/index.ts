@@ -2244,6 +2244,189 @@ configCmd
     }
   });
 
+// ── Skills commands ─────────────────────────────────────────────────
+//
+// Procedural memory the agent extracts from successful runs lives at
+// vault/00-System/skills/ (global) and agents/<slug>/skills/ (per-agent).
+// New skills land in pending-approval until the owner OKs them. These
+// commands give the owner a CLI path that mirrors the dashboard UI.
+
+const skillsCmd = program
+  .command('skills')
+  .description('List, inspect, approve, and reject extracted skills');
+
+skillsCmd
+  .command('list')
+  .description('List all approved skills (global + per-agent) with use counts')
+  .option('-a, --agent <slug>', 'Filter to a specific agent\'s skills')
+  .option('--json', 'Emit machine-readable JSON')
+  .action(async (opts: { agent?: string; json?: boolean }) => {
+    const BOLD = '\x1b[1m';
+    const DIM = '\x1b[0;90m';
+    const CYAN = '\x1b[0;36m';
+    const RESET = '\x1b[0m';
+    try {
+      process.env.CLEMENTINE_HOME = BASE_DIR;
+      const { listSkills } = await import('../agent/skill-extractor.js');
+      const skills = listSkills(opts.agent);
+      if (opts.json) {
+        console.log(JSON.stringify(skills, null, 2));
+        return;
+      }
+      if (skills.length === 0) {
+        console.log();
+        console.log(`  ${DIM}No approved skills yet${opts.agent ? ` for "${opts.agent}"` : ''}.${RESET}`);
+        console.log(`  Skills get auto-extracted from successful cron / unleashed runs and queued for approval.`);
+        console.log(`  Pending: ${BOLD}clementine skills pending${RESET}`);
+        console.log();
+        return;
+      }
+      console.log();
+      console.log(`  ${BOLD}${'NAME'.padEnd(36)}${'AGENT'.padEnd(20)}${'USES'.padEnd(8)}${'UPDATED'}${RESET}`);
+      console.log(`  ${DIM}${'─'.repeat(80)}${RESET}`);
+      for (const s of skills) {
+        const agent = s.agentSlug ?? 'global';
+        const updated = s.updatedAt.slice(0, 10);
+        console.log(`  ${s.name.slice(0, 34).padEnd(36)}${CYAN}${agent.slice(0, 18).padEnd(20)}${RESET}${String(s.useCount).padEnd(8)}${DIM}${updated}${RESET}`);
+      }
+      console.log();
+      console.log(`  ${DIM}Total: ${skills.length} skill${skills.length === 1 ? '' : 's'}.${RESET}`);
+      console.log();
+    } catch (err) {
+      console.error(`  Error listing skills: ${err}`);
+      process.exit(1);
+    }
+  });
+
+skillsCmd
+  .command('pending')
+  .description('Show skills awaiting your approval')
+  .option('--json', 'Emit machine-readable JSON')
+  .action(async (opts: { json?: boolean }) => {
+    const BOLD = '\x1b[1m';
+    const DIM = '\x1b[0;90m';
+    const YELLOW = '\x1b[1;33m';
+    const RESET = '\x1b[0m';
+    try {
+      process.env.CLEMENTINE_HOME = BASE_DIR;
+      const { listPendingSkills } = await import('../agent/skill-extractor.js');
+      const pending = listPendingSkills();
+      if (opts.json) {
+        console.log(JSON.stringify(pending, null, 2));
+        return;
+      }
+      if (pending.length === 0) {
+        console.log();
+        console.log(`  ${DIM}No skills pending approval.${RESET}`);
+        console.log();
+        return;
+      }
+      console.log();
+      console.log(`  ${YELLOW}${pending.length} skill${pending.length === 1 ? '' : 's'} pending approval${RESET}`);
+      console.log();
+      for (const s of pending) {
+        const agent = s.agentSlug ? ` [agent: ${s.agentSlug}]` : '';
+        console.log(`  ${BOLD}${s.name}${RESET}${DIM}${agent}${RESET}`);
+        console.log(`    ${s.title}`);
+        console.log(`    ${DIM}${s.description}${RESET}`);
+        console.log(`    ${DIM}From ${s.source} • ${s.createdAt.slice(0, 19).replace('T', ' ')}${RESET}`);
+        console.log();
+      }
+      console.log(`  Approve: ${BOLD}clementine skills approve <name>${RESET}`);
+      console.log(`  Reject:  ${BOLD}clementine skills reject <name>${RESET}`);
+      console.log();
+    } catch (err) {
+      console.error(`  Error listing pending skills: ${err}`);
+      process.exit(1);
+    }
+  });
+
+skillsCmd
+  .command('approve <name>')
+  .description('Approve a pending skill (moves it from pending into the active library)')
+  .action(async (name: string) => {
+    const GREEN = '\x1b[0;32m';
+    const RED = '\x1b[0;31m';
+    const RESET = '\x1b[0m';
+    try {
+      process.env.CLEMENTINE_HOME = BASE_DIR;
+      const { approvePendingSkill } = await import('../agent/skill-extractor.js');
+      const result = approvePendingSkill(name);
+      if (result.ok) {
+        console.log(`  ${GREEN}✓${RESET} ${result.message}`);
+      } else {
+        console.error(`  ${RED}✗${RESET} ${result.message}`);
+        process.exit(1);
+      }
+    } catch (err) {
+      console.error(`  Error approving skill: ${err}`);
+      process.exit(1);
+    }
+  });
+
+skillsCmd
+  .command('reject <name>')
+  .description('Reject a pending skill (deletes it from the queue)')
+  .action(async (name: string) => {
+    const GREEN = '\x1b[0;32m';
+    const RED = '\x1b[0;31m';
+    const RESET = '\x1b[0m';
+    try {
+      process.env.CLEMENTINE_HOME = BASE_DIR;
+      const { rejectPendingSkill } = await import('../agent/skill-extractor.js');
+      const result = rejectPendingSkill(name);
+      if (result.ok) {
+        console.log(`  ${GREEN}✓${RESET} ${result.message}`);
+      } else {
+        console.error(`  ${RED}✗${RESET} ${result.message}`);
+        process.exit(1);
+      }
+    } catch (err) {
+      console.error(`  Error rejecting skill: ${err}`);
+      process.exit(1);
+    }
+  });
+
+skillsCmd
+  .command('search <query>')
+  .description('Preview which skills would be injected for a given query — useful for debugging skill matching')
+  .option('-a, --agent <slug>', 'Search as a specific agent (skills get the agent boost)')
+  .option('-n, --limit <n>', 'Max matches to show', '5')
+  .action(async (query: string, opts: { agent?: string; limit?: string }) => {
+    const BOLD = '\x1b[1m';
+    const DIM = '\x1b[0;90m';
+    const CYAN = '\x1b[0;36m';
+    const GREEN = '\x1b[0;32m';
+    const RESET = '\x1b[0m';
+    try {
+      process.env.CLEMENTINE_HOME = BASE_DIR;
+      const { searchSkills } = await import('../agent/skill-extractor.js');
+      const limit = parseInt(opts.limit ?? '5', 10);
+      const matches = searchSkills(query, limit, opts.agent);
+      if (matches.length === 0) {
+        console.log();
+        console.log(`  ${DIM}No skills matched "${query}"${opts.agent ? ` for agent ${opts.agent}` : ''}.${RESET}`);
+        console.log();
+        return;
+      }
+      console.log();
+      console.log(`  ${BOLD}${matches.length} skill${matches.length === 1 ? '' : 's'} matched${RESET} ${DIM}(threshold for injection: score >= 4)${RESET}`);
+      console.log();
+      for (const m of matches) {
+        const inject = m.score >= 4 ? `${GREEN}✓ would inject${RESET}` : `${DIM}below threshold${RESET}`;
+        console.log(`  ${BOLD}${m.name}${RESET}  ${CYAN}score: ${m.score.toFixed(2)}${RESET}  ${inject}`);
+        console.log(`    ${m.title}`);
+        if (m.toolsUsed.length > 0) {
+          console.log(`    ${DIM}Tools: ${m.toolsUsed.join(', ')}${RESET}`);
+        }
+        console.log();
+      }
+    } catch (err) {
+      console.error(`  Error searching skills: ${err}`);
+      process.exit(1);
+    }
+  });
+
 // ── Brain commands ──────────────────────────────────────────────────
 
 const brainCmd = program
