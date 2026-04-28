@@ -182,7 +182,7 @@ function ensureDataHome(): void {
 
 // ── Commands ─────────────────────────────────────────────────────────
 
-function cmdLaunch(options: { foreground?: boolean; install?: boolean; uninstall?: boolean }): void {
+async function cmdLaunch(options: { foreground?: boolean; install?: boolean; uninstall?: boolean; skipWizard?: boolean }): Promise<void> {
   if (options.uninstall) {
     if (process.platform === 'darwin') {
       const plistPath = getLaunchdPlistPath();
@@ -217,6 +217,22 @@ function cmdLaunch(options: { foreground?: boolean; install?: boolean; uninstall
       }
     }
     return;
+  }
+
+  // Ensure data home exists so the wizard's sentinel write lands somewhere,
+  // then run the one-time keychain ACL repair wizard if applicable. This
+  // happens before --install so the launchd-spawned daemon (no TTY) inherits
+  // already-repaired entries; before --foreground so the user sees the
+  // prompt; and before the daemon spawn for the same reason.
+  ensureDataHome();
+  if (!options.skipWizard) {
+    try {
+      const { runFirstRunKeychainWizardIfNeeded } = await import('../config/keychain-first-run-wizard.js');
+      await runFirstRunKeychainWizardIfNeeded(BASE_DIR);
+    } catch (err) {
+      // Wizard failure must never block launch — log and continue.
+      console.error(`  ${'\x1b[0;90m'}keychain wizard skipped: ${(err as Error).message}${'\x1b[0m'}`);
+    }
   }
 
   if (options.install) {
@@ -448,7 +464,7 @@ async function cmdRestart(options: { foreground?: boolean }): Promise<void> {
     }
   } catch { /* dashboard module may not be available */ }
 
-  cmdLaunch({ foreground: options.foreground });
+  await cmdLaunch({ foreground: options.foreground });
 
   if (dashboardWasRunning) {
     try {
@@ -1380,6 +1396,7 @@ async function cmdConfigHardenPermissions(opts: { dryRun?: boolean; json?: boole
 async function cmdConfigKeychainFixAcl(opts: { list?: boolean }): Promise<void> {
   const { listClementineKeychainEntries, fixAllClementineEntries } =
     await import('../config/keychain-fix-acl.js');
+  const { markKeychainWizardDone } = await import('../config/keychain-first-run-wizard.js');
 
   const DIM = '\x1b[0;90m';
   const BOLD = '\x1b[1m';
@@ -1398,6 +1415,8 @@ async function cmdConfigKeychainFixAcl(opts: { list?: boolean }): Promise<void> 
   if (entries.length === 0) {
     console.log(`  ${GREEN}Nothing to fix.${RESET}`);
     console.log();
+    // No entries means the launch wizard has nothing to do either.
+    markKeychainWizardDone(BASE_DIR);
     return;
   }
 
@@ -1432,6 +1451,9 @@ async function cmdConfigKeychainFixAcl(opts: { list?: boolean }): Promise<void> 
     console.log(`  ${DIM}Failed entries can be fixed manually in Keychain Access.app:${RESET}`);
     console.log(`  ${DIM}  search "clementine-agent" → double-click → Access Control → Allow all applications.${RESET}`);
   }
+  // Always mark the launch wizard satisfied — user has explicitly decided
+  // to deal with this via the manual command.
+  markKeychainWizardDone(BASE_DIR);
   console.log();
 }
 
@@ -3278,13 +3300,15 @@ async function cmdUpdate(options: { restart?: boolean; dryRun?: boolean }): Prom
     }
   }
 
-  // Helper: if update fails after stopping daemon, relaunch before exiting
-  function failAndRestart(backupDir: string): never {
+  // Helper: if update fails after stopping daemon, relaunch before exiting.
+  // Runs cmdLaunch with skipWizard so it doesn't try to prompt mid-recovery —
+  // the wizard, if needed, fires on the user's next intentional `clementine launch`.
+  async function failAndRestart(backupDir: string): Promise<never> {
     if (wasRunning) {
       console.log();
       console.log(`  Restarting daemon (was running before update)...`);
       try {
-        cmdLaunch({});
+        await cmdLaunch({ skipWizard: true });
         console.log(`  ${GREEN}OK${RESET}  Daemon restarted`);
       } catch {
         console.error(`  ${YELLOW}WARN${RESET}  Could not restart daemon — run: clementine launch`);
@@ -3371,7 +3395,7 @@ async function cmdUpdate(options: { restart?: boolean; dryRun?: boolean }): Prom
       console.log(`  ${DIM}Restoring stashed changes...${RESET}`);
       try { execSync('git stash pop', { cwd: PACKAGE_ROOT, stdio: 'pipe' }); } catch { /* best effort */ }
     }
-    failAndRestart(backupDir);
+    await failAndRestart(backupDir);
   }
 
   // 6. npm install
@@ -3384,7 +3408,7 @@ async function cmdUpdate(options: { restart?: boolean; dryRun?: boolean }): Prom
     console.log(`  ${GREEN}OK${RESET}  Dependencies installed`);
   } catch (err) {
     console.error(`  ${RED}FAIL${RESET}  npm install failed: ${String(err).slice(0, 200)}`);
-    failAndRestart(backupDir);
+    await failAndRestart(backupDir);
   }
 
   // 6b. Rebuild native modules (better-sqlite3) for current Node version
@@ -3470,7 +3494,7 @@ async function cmdUpdate(options: { restart?: boolean; dryRun?: boolean }): Prom
       console.log(`  ${GREEN}OK${RESET}  Build succeeded (after reinstall)`);
     } catch (retryErr) {
       console.error(`  ${RED}FAIL${RESET}  Build failed after update: ${String(retryErr).slice(0, 200)}`);
-      failAndRestart(backupDir);
+      await failAndRestart(backupDir);
     }
   }
 
@@ -3486,7 +3510,7 @@ async function cmdUpdate(options: { restart?: boolean; dryRun?: boolean }): Prom
         console.log(`  ${GREEN}OK${RESET}  Clean rebuild succeeded`);
       } catch (err) {
         console.error(`  ${RED}FAIL${RESET}  Clean rebuild failed: ${String(err).slice(0, 200)}`);
-        failAndRestart(backupDir);
+        await failAndRestart(backupDir);
       }
     }
   }
@@ -3739,7 +3763,7 @@ async function cmdUpdate(options: { restart?: boolean; dryRun?: boolean }): Prom
     // Ensure build output is fully flushed before spawning new process
     execSync('sync', { stdio: 'pipe' });
     console.log(`  ${S()} Restarting daemon...`);
-    cmdLaunch({});
+    await cmdLaunch({ skipWizard: true });
   }
 
   // 13. Post-restart health check — verify daemon started and channels connected
