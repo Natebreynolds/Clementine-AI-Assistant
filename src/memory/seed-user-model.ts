@@ -45,14 +45,14 @@ const MAX_MEMORY_MD_CHARS = 4000;
 const MAX_CHUNK_CHARS = 4000;
 const MAX_SUMMARIES_CHARS = 1500;
 
-function gatherCorpus(store: SeedSourceStore): { corpus: string; sourceCount: number } {
+function gatherCorpus(store: SeedSourceStore, memoryFilePath: string): { corpus: string; sourceCount: number } {
   const parts: string[] = [];
   let sourceCount = 0;
 
   // 1. MEMORY.md — highest-signal source, the agent's curated profile note
-  if (existsSync(MEMORY_FILE)) {
+  if (existsSync(memoryFilePath)) {
     try {
-      const md = readFileSync(MEMORY_FILE, 'utf-8').slice(0, MAX_MEMORY_MD_CHARS);
+      const md = readFileSync(memoryFilePath, 'utf-8').slice(0, MAX_MEMORY_MD_CHARS);
       if (md.trim()) {
         parts.push(`## MEMORY.md\n${md}`);
         sourceCount++;
@@ -185,8 +185,10 @@ function parseProposals(raw: string): {
 export async function seedUserModelFromMemory(
   store: SeedSourceStore,
   llmCall: (prompt: string) => Promise<string>,
+  opts: { memoryFilePath?: string } = {},
 ): Promise<UserModelProposals> {
-  const { corpus, sourceCount } = gatherCorpus(store);
+  const memFile = opts.memoryFilePath ?? MEMORY_FILE;
+  const { corpus, sourceCount } = gatherCorpus(store, memFile);
 
   if (!corpus.trim() || sourceCount === 0) {
     return {

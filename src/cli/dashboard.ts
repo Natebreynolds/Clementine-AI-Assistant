@@ -16582,6 +16582,144 @@ async function saveUserModelSlot(slot) {
   } catch (e) { toast('Save failed: ' + String(e), 'error'); }
 }
 
+async function seedUserModel() {
+  var seedPanel = document.getElementById('user-model-seed-panel');
+  if (!seedPanel) return;
+  seedPanel.style.display = 'block';
+  seedPanel.innerHTML =
+    '<div class="card" style="padding:14px;border-left:3px solid var(--accent,#f59e0b)">'
+    + '<div style="font-weight:600;margin-bottom:6px">✨ Analyzing your existing memory…</div>'
+    + '<div style="font-size:12px;color:var(--text-muted)">Running Haiku over MEMORY.md, top-salience chunks, and recent session summaries. Usually 5–15 seconds.</div>'
+    + '</div>';
+  try {
+    var r = await apiFetch('/api/user-model/seed', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: '{}',
+    });
+    var d = await r.json();
+    if (!d.ok || !d.proposals) {
+      seedPanel.innerHTML =
+        '<div class="card" style="padding:14px;border-left:3px solid var(--red,#ef4444)">'
+        + '<div style="font-weight:600;margin-bottom:6px">Seed failed</div>'
+        + '<div style="font-size:12px;color:var(--text-muted)">' + esc(d.error || 'Unknown error') + '</div>'
+        + '<div style="margin-top:10px"><button class="btn" onclick="dismissSeedPanel()" style="font-size:12px">Dismiss</button></div>'
+        + '</div>';
+      return;
+    }
+    renderSeedProposals(d.proposals);
+  } catch (e) {
+    seedPanel.innerHTML =
+      '<div class="card" style="padding:14px;border-left:3px solid var(--red,#ef4444)">'
+      + '<div style="font-weight:600">Seed failed: ' + esc(String(e)) + '</div>'
+      + '<div style="margin-top:10px"><button class="btn" onclick="dismissSeedPanel()" style="font-size:12px">Dismiss</button></div>'
+      + '</div>';
+  }
+}
+
+function renderSeedProposals(p) {
+  var seedPanel = document.getElementById('user-model-seed-panel');
+  if (!seedPanel) return;
+  var labelMap = {
+    user_facts: 'User Facts',
+    goals: 'Active Goals',
+    relationships: 'Key Relationships',
+    agent_persona: 'Agent Persona',
+  };
+  var slots = ['user_facts', 'goals', 'relationships', 'agent_persona'];
+  var anyContent = slots.some(function(s) { return (p[s] || '').trim().length > 0; });
+  if (!anyContent) {
+    seedPanel.innerHTML =
+      '<div class="card" style="padding:14px;border-left:3px solid var(--accent,#f59e0b)">'
+      + '<div style="font-weight:600;margin-bottom:4px">No clear signal in memory yet</div>'
+      + '<div style="font-size:12px;color:var(--text-muted)">Haiku analyzed ' + (p.sourceCount || 0) + ' source items but found no facts strong enough to seed slots. Have a few conversations and try again, or fill the slots manually below.</div>'
+      + '<div style="margin-top:10px"><button class="btn" onclick="dismissSeedPanel()" style="font-size:12px">Dismiss</button></div>'
+      + '</div>';
+    return;
+  }
+  var html = '<div class="card" style="padding:14px;border-left:3px solid var(--accent,#f59e0b)">';
+  html += '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;gap:8px;flex-wrap:wrap">';
+  html += '<div><div style="font-weight:600">✨ Proposed values from memory</div>';
+  html += '<div style="font-size:11px;color:var(--text-muted)">Reviewed ' + (p.sourceCount || 0) + ' source items. Edit any slot before applying. Skipped slots stay empty.</div></div>';
+  html += '<div style="display:flex;gap:6px"><button class="btn-primary" onclick="applyAllSeedSlots()" style="font-size:12px">Apply all</button><button class="btn" onclick="dismissSeedPanel()" style="font-size:12px">Dismiss</button></div>';
+  html += '</div>';
+  for (var i = 0; i < slots.length; i++) {
+    var slot = slots[i];
+    var content = (p[slot] || '').trim();
+    if (!content) continue;
+    var label = labelMap[slot] || slot;
+    html += '<div class="seed-slot-card" data-slot="' + esc(slot) + '" style="margin-top:10px;padding:10px;background:var(--bg-input);border-radius:6px">';
+    html += '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">';
+    html += '<div style="font-weight:600;font-size:13px">' + esc(label) + '</div>';
+    html += '<div style="display:flex;gap:6px"><button class="btn-primary" onclick="applySeedSlot(\\'' + esc(slot) + '\\')" style="font-size:11px;padding:2px 10px">Apply</button><button class="btn" onclick="skipSeedSlot(\\'' + esc(slot) + '\\')" style="font-size:11px;padding:2px 10px">Skip</button></div>';
+    html += '</div>';
+    html += '<textarea id="seed-textarea-' + esc(slot) + '" style="width:100%;min-height:70px;padding:6px;border:1px solid var(--border);border-radius:4px;background:var(--bg);color:var(--text);font-family:inherit;font-size:12px;resize:vertical">' + esc(content) + '</textarea>';
+    html += '</div>';
+  }
+  html += '</div>';
+  seedPanel.innerHTML = html;
+}
+
+async function applySeedSlot(slot) {
+  var ta = document.getElementById('seed-textarea-' + slot);
+  if (!ta) return;
+  var content = ta.value;
+  var scope = document.getElementById('user-model-scope');
+  var agentSlug = scope && scope.value ? scope.value : null;
+  try {
+    var r = await apiFetch('/api/user-model/' + encodeURIComponent(slot), {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content: content, agentSlug: agentSlug }),
+    });
+    var d = await r.json();
+    if (d.ok) {
+      toast('Applied ' + slot, 'success');
+      var card = document.querySelector('.seed-slot-card[data-slot="' + slot + '"]');
+      if (card) card.remove();
+      loadUserModel();
+    } else {
+      toast('Apply failed: ' + (d.error || 'unknown'), 'error');
+    }
+  } catch (e) { toast('Apply failed: ' + String(e), 'error'); }
+}
+
+function skipSeedSlot(slot) {
+  var card = document.querySelector('.seed-slot-card[data-slot="' + slot + '"]');
+  if (card) card.remove();
+}
+
+async function applyAllSeedSlots() {
+  var slots = ['user_facts', 'goals', 'relationships', 'agent_persona'];
+  var applied = 0;
+  for (var i = 0; i < slots.length; i++) {
+    var ta = document.getElementById('seed-textarea-' + slots[i]);
+    if (!ta || !ta.value.trim()) continue;
+    var scope = document.getElementById('user-model-scope');
+    var agentSlug = scope && scope.value ? scope.value : null;
+    try {
+      var r = await apiFetch('/api/user-model/' + encodeURIComponent(slots[i]), {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ content: ta.value, agentSlug: agentSlug }),
+      });
+      var d = await r.json();
+      if (d.ok) applied++;
+    } catch (e) { /* continue */ }
+  }
+  toast('Applied ' + applied + ' slot' + (applied === 1 ? '' : 's'), 'success');
+  dismissSeedPanel();
+  loadUserModel();
+}
+
+function dismissSeedPanel() {
+  var seedPanel = document.getElementById('user-model-seed-panel');
+  if (seedPanel) {
+    seedPanel.style.display = 'none';
+    seedPanel.innerHTML = '';
+  }
+}
+
 async function clearUserModelSlot(slot) {
   if (!confirm('Clear the "' + slot + '" slot? This deletes everything currently stored there.')) return;
   var scope = document.getElementById('user-model-scope');
