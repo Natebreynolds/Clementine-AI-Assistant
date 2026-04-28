@@ -3763,7 +3763,10 @@ async function cmdUpdate(options: { restart?: boolean; dryRun?: boolean }): Prom
     // Ensure build output is fully flushed before spawning new process
     execSync('sync', { stdio: 'pipe' });
     console.log(`  ${S()} Restarting daemon...`);
-    await cmdLaunch({ skipWizard: true });
+    // Let the keychain wizard fire here too — for users on launchd who only
+    // ever run `clementine update` (the daemon respawns automatically), this
+    // is their one chance to see the prompt and repair legacy ACLs.
+    await cmdLaunch({});
   }
 
   // 13. Post-restart health check — verify daemon started and channels connected
