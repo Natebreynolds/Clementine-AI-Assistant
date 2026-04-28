@@ -121,6 +121,80 @@ server.tool(
 );
 
 
+// ── 0a. user_model ─────────────────────────────────────────────────────
+//
+// MemGPT-style core memory. Coherent "what we know about the user" surface
+// always loaded into context (priority 0 in the assembler, above identity).
+// Distinct from working_memory (your scratchpad about the *task*) and from
+// the chunk store (retrieved on demand). Use this for facts that should
+// always be top-of-mind: the user's role, lasting preferences, active goals,
+// key relationships.
+//
+// Slots: user_facts, goals, relationships, agent_persona.
+// Per-slot char_limit: 2000 (hard cap so context never bloats).
+
+server.tool(
+  'user_model',
+  getToolDescription('user_model') ?? "MemGPT-style core memory: small, always-in-context block tracking who the user is. Slots: user_facts (role/preferences/identifiers), goals (active intents), relationships (people/projects), agent_persona (per-agent self-identity). Actions: list (all slots), read (one slot), replace (overwrite slot), append (add to slot), clear (delete slot).",
+  {
+    action: z.enum(['list', 'read', 'replace', 'append', 'clear']).describe('What to do with the user model'),
+    slot: z.enum(['user_facts', 'goals', 'relationships', 'agent_persona']).optional().describe('Which slot (required for read/replace/append/clear)'),
+    content: z.string().optional().describe('Text to write (required for replace/append)'),
+  },
+  async ({ action, slot, content }) => {
+    const store = await getStore();
+    const agentSlug = ACTIVE_AGENT_SLUG;
+
+    switch (action) {
+      case 'list': {
+        const blocks = store.getAllUserModelBlocks(agentSlug);
+        if (blocks.length === 0) {
+          return textResult('User model is empty. Use action="replace" or action="append" with a slot to populate.');
+        }
+        const labelMap: Record<string, string> = {
+          user_facts: 'User Facts',
+          goals: 'Active Goals',
+          relationships: 'Key Relationships',
+          agent_persona: 'Agent Persona',
+        };
+        const out = blocks.map(b => {
+          const label = labelMap[b.slot] ?? b.slot;
+          const scope = b.agentSlug ? `agent=${b.agentSlug}` : 'global';
+          const charsUsed = `${b.content.length}/${b.charLimit}`;
+          return `### ${label} (${scope}, ${charsUsed} chars, updated ${b.updatedAt})\n${b.content || '(empty)'}`;
+        }).join('\n\n');
+        return textResult(out);
+      }
+      case 'read': {
+        if (!slot) return textResult('Error: slot is required for read.');
+        const block = store.getUserModelBlock(slot, agentSlug);
+        if (!block) return textResult(`Slot "${slot}" is empty.`);
+        return textResult(`### ${slot} (${block.content.length}/${block.charLimit} chars, updated ${block.updatedAt})\n${block.content}`);
+      }
+      case 'replace': {
+        if (!slot) return textResult('Error: slot is required for replace.');
+        if (typeof content !== 'string') return textResult('Error: content is required for replace.');
+        const r = store.setUserModelBlock({ slot, content, agentSlug });
+        const note = r.truncated ? ' (content was truncated to char_limit)' : '';
+        return textResult(`User model "${slot}" replaced${note}.`);
+      }
+      case 'append': {
+        if (!slot) return textResult('Error: slot is required for append.');
+        if (typeof content !== 'string' || !content.trim()) return textResult('Error: non-empty content is required for append.');
+        const r = store.appendUserModelBlock({ slot, content, agentSlug });
+        const note = r.truncated ? ' (oldest content rolled off to fit char_limit)' : '';
+        return textResult(`Appended to user model "${slot}"${note}.`);
+      }
+      case 'clear': {
+        if (!slot) return textResult('Error: slot is required for clear.');
+        const removed = store.deleteUserModelBlock(slot, agentSlug);
+        return textResult(removed ? `Cleared user model "${slot}".` : `Slot "${slot}" was already empty.`);
+      }
+    }
+  },
+);
+
+
 // ── 0b. team_scratchpad ────────────────────────────────────────────────
 //
 // Cross-agent shared scratchpad. Unlike working_memory (per-agent), this

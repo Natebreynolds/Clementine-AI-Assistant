@@ -208,6 +208,84 @@ export type MemoryStoreType = {
   ensureIngestedRowColumn(column: string, sqlType: 'TEXT' | 'REAL' | 'INTEGER'): void;
   queryIngestedRows(sql: string, params?: unknown[], hardLimit?: number): unknown[];
   ingestedRowColumns(): string[];
+  // ── User mental model (MemGPT-style core memory) ───────────────
+  getUserModelBlock(slot: string, agentSlug?: string | null): {
+    slot: string; content: string; charLimit: number; agentSlug: string | null; updatedAt: string;
+  } | null;
+  getAllUserModelBlocks(agentSlug?: string | null): Array<{
+    slot: string; content: string; charLimit: number; agentSlug: string | null; updatedAt: string;
+  }>;
+  setUserModelBlock(opts: {
+    slot: string; content: string; agentSlug?: string | null; charLimit?: number;
+  }): { slot: string; content: string; truncated: boolean };
+  appendUserModelBlock(opts: {
+    slot: string; content: string; agentSlug?: string | null;
+  }): { slot: string; content: string; truncated: boolean };
+  deleteUserModelBlock(slot: string, agentSlug?: string | null): boolean;
+  renderUserModel(agentSlug?: string | null, maxChars?: number): string;
+  // ── Recall traces (per-message retrieval audit) ───────────────
+  logRecallTrace(opts: {
+    sessionKey: string; messageId?: string | null; query: string;
+    chunkIds: number[]; scores: number[]; agentSlug?: string | null;
+  }): void;
+  getRecentRecallTraces(sessionKey: string, limit?: number): Array<{
+    id: number; messageId: string | null; query: string;
+    chunkIds: number[]; scores: number[]; retrievedAt: string;
+  }>;
+  getRecallTrace(traceId: number): {
+    id: number; sessionKey: string | null; messageId: string | null;
+    query: string; retrievedAt: string;
+    chunks: Array<{
+      id: number; sourceFile: string; section: string; content: string;
+      chunkType: string; score: number; pinned: boolean; consolidated: boolean;
+      derivedFrom: number[] | null;
+    }>;
+  } | null;
+  getChunksByIds(chunkIds: number[]): Array<{
+    id: number; sourceFile: string; section: string; content: string;
+    chunkType: string; agentSlug: string | null; pinned: boolean;
+    consolidated: boolean; derivedFrom: number[] | null;
+    salience: number; updatedAt: string;
+  }>;
+  // ── Chunk CRUD (dashboard curation) ────────────────────────────
+  setPinned(chunkId: number, pinned: boolean): boolean;
+  getChunkDetail(chunkId: number): {
+    id: number; sourceFile: string; section: string; content: string;
+    chunkType: string; salience: number; pinned: boolean; consolidated: boolean;
+    deletedAt: string | null; derivedFrom: number[] | null;
+    agentSlug: string | null; category: string | null; topic: string | null;
+    createdAt: string; updatedAt: string; historyCount: number;
+  } | null;
+  updateChunkContent(opts: {
+    chunkId: number; content?: string; section?: string;
+    category?: string | null; topic?: string | null; editedBy?: string | null;
+  }): boolean;
+  softDeleteChunk(chunkId: number): boolean;
+  restoreChunk(chunkId: number): boolean;
+  getChunkHistory(chunkId: number, limit?: number): Array<{
+    id: number; prevContent: string; prevSection: string | null;
+    prevCategory: string | null; prevTopic: string | null;
+    editedBy: string | null; editedAt: string;
+  }>;
+  // ── Dense embeddings (neural, async backfill) ─────────────────
+  backfillDenseEmbeddings(opts?: {
+    limit?: number;
+    onProgress?: (done: number, total: number) => void;
+    forceModel?: string;
+  }): Promise<{ embedded: number; skipped: number; failed: number; model: string }>;
+  // Stats also exposes dense fields
+  getMemoryStats(): {
+    totalChunks: number;
+    chunksWithEmbeddings: number;
+    chunksWithDenseEmbeddings: number;
+    denseEmbeddingModels: Array<{ model: string; count: number }>;
+    pinnedChunks: number;
+    perAgent: Array<{ agentSlug: string; count: number }>;
+    perCategory: Array<{ category: string; count: number }>;
+    avgSalience: number;
+    oldestUpdated: string | null;
+    newestUpdated: string | null;
+  };
   db: unknown;
 };
 

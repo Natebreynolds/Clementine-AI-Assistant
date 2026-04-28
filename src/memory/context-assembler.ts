@@ -57,6 +57,8 @@ export interface AssemblerOptions {
   isAutonomous?: boolean;
   /** Identity file path (null to skip). */
   identityPath?: string | null;
+  /** Pre-rendered user model block (MemGPT-style core memory). */
+  userModelBlock?: string | null;
 }
 
 /**
@@ -76,6 +78,21 @@ export async function assembleContext(options: AssemblerOptions): Promise<Assemb
   const isAutonomous = options.isAutonomous ?? false;
 
   const slots: ContextSlot[] = [];
+
+  // Slot -1: User mental model (MemGPT-style core memory). Highest priority,
+  // always loaded. Coherent "what we know about the user" surface that the
+  // agent can self-edit via the user_model MCP tool. Capped at 8K chars
+  // total across all slots; auto-truncated to whatever budget remains.
+  if (options.userModelBlock) {
+    const umBlock = options.userModelBlock;
+    slots.push({
+      name: 'user-model',
+      priority: -1,
+      maxChars: isAutonomous ? 4000 : 8000,
+      minRemainingBudget: 0,
+      resolve: (budget) => umBlock.length > budget ? umBlock.slice(0, budget) : umBlock,
+    });
+  }
 
   // Slot 0: Identity seed (always loaded, tiny footprint)
   if (options.identityPath) {

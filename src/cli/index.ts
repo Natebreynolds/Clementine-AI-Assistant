@@ -2736,8 +2736,19 @@ memoryCmd
       console.log();
       console.log(`  ${BOLD}Memory store${RESET}  ${DIM}${DB_PATH}${RESET}`);
       console.log();
+      const densePct = stats.totalChunks > 0
+        ? ((stats.chunksWithDenseEmbeddings / stats.totalChunks) * 100).toFixed(1)
+        : '0.0';
       console.log(`  Total chunks:         ${BOLD}${stats.totalChunks.toLocaleString()}${RESET}`);
-      console.log(`  With embeddings:      ${stats.chunksWithEmbeddings.toLocaleString()} ${DIM}(${pct}%, TF-IDF 512-dim)${RESET}`);
+      console.log(`  TF-IDF embeddings:    ${stats.chunksWithEmbeddings.toLocaleString()} ${DIM}(${pct}%, sparse 512-dim)${RESET}`);
+      console.log(`  Dense embeddings:     ${stats.chunksWithDenseEmbeddings.toLocaleString()} ${DIM}(${densePct}%, neural 768-dim)${RESET}`);
+      if (stats.denseEmbeddingModels.length > 0) {
+        for (const m of stats.denseEmbeddingModels) {
+          console.log(`    ${DIM}${m.model.padEnd(48)}${m.count.toLocaleString().padStart(8)}${RESET}`);
+        }
+      } else if (stats.totalChunks > 0) {
+        console.log(`    ${DIM}Run \`clementine memory reembed\` to backfill dense embeddings.${RESET}`);
+      }
       console.log(`  Pinned (manual):      ${stats.pinnedChunks}`);
       console.log(`  Avg salience:         ${stats.avgSalience.toFixed(3)} ${DIM}(0 = no access boost; >1 = strong reinforcement)${RESET}`);
       if (stats.oldestUpdated) {
@@ -2815,6 +2826,73 @@ memoryCmd
       console.log(`  ${GREEN}✓${RESET} Unpinned chunk ${chunkId}.`);
     } catch (err) {
       console.error(`  Error unpinning chunk: ${err}`);
+      process.exit(1);
+    }
+  });
+
+memoryCmd
+  .command('reembed')
+  .description('Backfill dense neural embeddings for all chunks (or all stale chunks if model changed). Default model: Snowflake/snowflake-arctic-embed-m-v1.5 — first run downloads ~440MB to ~/.clementine/models/.')
+  .option('--limit <n>', 'Max chunks to embed in this run (default: all)')
+  .option('--model <id>', 'Override embedding model id (e.g. Xenova/bge-base-en-v1.5)')
+  .action(async (opts: { limit?: string; model?: string }) => {
+    const BOLD = '\x1b[1m';
+    const DIM = '\x1b[0;90m';
+    const GREEN = '\x1b[0;32m';
+    const YELLOW = '\x1b[0;33m';
+    const RED = '\x1b[0;31m';
+    const RESET = '\x1b[0m';
+    try {
+      if (opts.model) {
+        process.env.EMBEDDING_DENSE_MODEL = opts.model;
+      }
+      const limit = opts.limit ? parseInt(opts.limit, 10) : undefined;
+      const { MemoryStore } = await import('../memory/store.js');
+      const embeddings = await import('../memory/embeddings.js');
+      const VAULT_DIR = path.join(BASE_DIR, 'vault');
+      const DB_PATH = path.join(VAULT_DIR, '.memory.db');
+      const store = new MemoryStore(DB_PATH, VAULT_DIR);
+      store.initialize();
+
+      console.log();
+      console.log(`  ${BOLD}Dense embedding backfill${RESET}`);
+      console.log(`  Model: ${embeddings.currentDenseModel()}`);
+      console.log(`  ${DIM}Loading model (first run downloads ~440MB)…${RESET}`);
+      const ready = await embeddings.probeDenseReady();
+      if (!ready) {
+        console.error(`  ${RED}Failed to load dense embedding model.${RESET}`);
+        console.error(`  ${DIM}Try a different --model id or check network access for the initial download.${RESET}`);
+        process.exit(1);
+      }
+      console.log(`  ${GREEN}✓${RESET} Model ready (${embeddings.denseDimension()}-dim).`);
+      console.log();
+
+      const startTime = Date.now();
+      let lastReport = 0;
+      const result = await store.backfillDenseEmbeddings({
+        limit,
+        onProgress: (done, total) => {
+          // Throttle to avoid spamming
+          const now = Date.now();
+          if (now - lastReport < 500 && done < total) return;
+          lastReport = now;
+          const pct = total > 0 ? Math.round((done / total) * 100) : 0;
+          const elapsed = Math.round((now - startTime) / 1000);
+          process.stdout.write(`\r  Progress: ${BOLD}${done.toLocaleString()}${RESET}/${total.toLocaleString()} (${pct}%) ${DIM}${elapsed}s${RESET}    `);
+        },
+      });
+      process.stdout.write('\n\n');
+      const elapsed = Math.round((Date.now() - startTime) / 1000);
+      console.log(`  ${GREEN}✓${RESET} Embedded ${BOLD}${result.embedded.toLocaleString()}${RESET} chunks ${DIM}(${elapsed}s elapsed)${RESET}`);
+      if (result.failed > 0) {
+        console.log(`  ${YELLOW}!${RESET} Failed: ${result.failed.toLocaleString()} ${DIM}(model returned null — usually empty or invalid input)${RESET}`);
+      }
+      console.log(`  Model: ${result.model}`);
+      console.log();
+      console.log(`  ${DIM}Run \`clementine memory status\` to see updated coverage.${RESET}`);
+      console.log();
+    } catch (err) {
+      console.error(`  ${RED}Error during reembed${RESET}: ${err}`);
       process.exit(1);
     }
   });

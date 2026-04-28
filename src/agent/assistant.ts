@@ -82,6 +82,7 @@ import { StallGuard } from './stall-guard.js';
 import { collectToolCalls, detectContradiction, buildCorrectionPrompt } from './contradiction-validator.js';
 import { recordToolOutcome as recordMcpToolOutcome } from './mcp-circuit-breaker.js';
 import { assembleContext } from '../memory/context-assembler.js';
+import * as embeddingsModule from '../memory/embeddings.js';
 import { PromptCache } from './prompt-cache.js';
 import { searchSkills as searchSkillsSync } from './skill-extractor.js';
 import { classifyIntent, getStrategyGuidance, type IntentClassification } from './intent-classifier.js';
@@ -443,13 +444,23 @@ const AUTO_MEMORY_PROMPT = `You are a memory extraction agent. Your ONLY job is 
 
 {current_memory}
 
-## What to extract:
-- **Facts about ${OWNER}** — preferences, opinions, decisions, personal details → update_memory in "About ${OWNER}" section
+## Where to save what (memory routing):
+
+**Always-in-context core memory** (use the user_model tool — these stay top-of-mind in every future session):
+- **Lasting facts about ${OWNER}** (role, location, identifiers, durable preferences, communication style) → user_model(action="append", slot="user_facts", content=...)
+- **Active goals/intents** (what ${OWNER} is trying to accomplish right now) → user_model(action="append", slot="goals", content=...)
+- **Key people/projects** (recurring relationships) → user_model(action="append", slot="relationships", content=...)
+- Use action="replace" instead of "append" if you're updating an existing fact rather than adding a new one. Slots are capped at 2000 chars — older content rolls off on append.
+
+**Vault notes** (use memory_write/note_create — durable but retrieved on demand):
 - **People mentioned** — names, relationships, context → create or update person notes in 02-People/
 - **Projects/work** — project names, status updates, decisions → update relevant project notes
-- **Tasks** — anything ${OWNER} asked to be done later → task_add
-- **Preferences** — tools, workflows, foods, styles, etc. → update_memory in "Preferences" section
-- **Dates/events** — meetings, deadlines, appointments → note in daily log or task with due date
+- **Dates/events** — meetings, deadlines, appointments → note in daily log
+- **Specific episodes** — "on Tuesday we discussed X" → memory_write(action="append_daily")
+
+**Tasks** — anything ${OWNER} asked to be done later → task_add
+
+Routing rule: if the fact is something the agent should *always know* (not just "find when relevant"), it belongs in user_model. Episodic events and topical knowledge belong in the vault.
 
 ## What to skip:
 - Greetings, small talk, "thanks", "ok"
@@ -466,7 +477,7 @@ const AUTO_MEMORY_PROMPT = `You are a memory extraction agent. Your ONLY job is 
 - Only save genuinely NEW facts not already present in the Current Memory above.
 - If updating an existing topic, use memory_write(action="update_memory") to REPLACE the section, not append duplicates.
 - If there's nothing new to save, respond "No new facts." and exit — do NOT call any tools.
-- Use the MCP tools (memory_write, note_create, task_add, note_take).
+- Use the MCP tools (user_model, memory_write, note_create, task_add, note_take).
 - NEVER respond to ${OWNER}. You are invisible. Just save facts and exit.
 
 ## Behavioral Correction Detection:
@@ -2203,9 +2214,28 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
         enrichedQuery = enrichedQuery.slice(0, 1000);
       }
 
+      // Pre-compute dense query embedding if the model is ready. Done outside
+      // searchContext (which is sync) so the dense path doesn't force the
+      // entire call chain to be async. If embedDense fails or isn't available,
+      // searchContext falls back to TF-IDF.
+      let queryDenseVec: Float32Array | undefined;
+      try {
+        if (embeddingsModule.isDenseReady()) {
+          const v = await embeddingsModule.embedDense(enrichedQuery, true);
+          if (v) queryDenseVec = v;
+        }
+      } catch { /* fallback to sparse */ }
+
       const results = this.memoryStore.searchContext(
         enrichedQuery,
-        { limit: SEARCH_CONTEXT_LIMIT, recencyLimit: SEARCH_RECENCY_LIMIT, agentSlug, strict: strictIsolation },
+        {
+          limit: SEARCH_CONTEXT_LIMIT,
+          recencyLimit: SEARCH_RECENCY_LIMIT,
+          agentSlug,
+          strict: strictIsolation,
+          sessionKey: sessionKey ?? undefined,
+          queryDenseVec,
+        },
       );
 
       if (results?.length > 0) {
@@ -2292,6 +2322,16 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
         })(),
       ]);
 
+      // Render user model block (MemGPT-style core memory). Per-agent if
+      // running as a hired agent, otherwise the global block. Empty string
+      // when no slots are populated yet — context-assembler will skip the
+      // slot rather than emit an empty heading.
+      let userModelBlock: string | null = null;
+      try {
+        userModelBlock = this.memoryStore.renderUserModel?.(agentSlug ?? null) ?? null;
+        if (!userModelBlock) userModelBlock = null;
+      } catch { userModelBlock = null; }
+
       // Assemble context within a priority-based budget
       const assembled = await assembleContext({
         totalBudget: SYSTEM_PROMPT_MAX_CONTEXT_CHARS,
@@ -2300,6 +2340,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
         memoryResults: results,
         skillContext,
         graphContext,
+        userModelBlock,
         isAutonomous: isAutonomous ?? false,
       });
 

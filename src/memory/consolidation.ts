@@ -30,7 +30,7 @@ interface MemoryStoreHandle {
   }>;
   markConsolidated(chunkIds: number[]): void;
   getConsolidationStats(): { totalChunks: number; consolidated: number; unconsolidated: number };
-  insertSummaryChunk(sourceFile: string, section: string, content: string): void;
+  insertSummaryChunk(sourceFile: string, section: string, content: string, derivedFromIds?: number[]): void;
   getBehavioralPatterns(minOccurrences: number): Array<{ correction: string; count: number; category: string; lastSeen: string }>;
 }
 
@@ -167,11 +167,12 @@ async function summarizeTopics(
     try {
       const summary = await llmCall(prompt);
       if (summary && summary.length > 50) {
-        // Insert summary as a new chunk
+        // Insert summary as a new chunk with lineage back to source chunks
         store.insertSummaryChunk(
           group.topic,
           `Consolidated Summary (${group.chunkIds.length} chunks)`,
           summary.slice(0, 3000),
+          group.chunkIds,
         );
         // Mark source chunks as consolidated
         store.markConsolidated(group.chunkIds);

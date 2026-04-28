@@ -1,12 +1,26 @@
 /**
  * Clementine TypeScript — Embedding Provider.
  *
- * Provides vector embeddings for memory chunks to enable semantic search.
- * Uses a lightweight local approach (TF-IDF vectors stored as Float32Array blobs)
- * that runs without external API calls or heavy WASM dependencies.
+ * Two paths share this module:
  *
- * The embedding column (BLOB) in the chunks table stores serialized Float32Arrays.
- * Query-time: embed the query, compute cosine similarity against stored vectors.
+ *  1. Sparse TF-IDF (legacy, sync). 512-dim, built from in-memory vocab.
+ *     Always available, runs synchronously, no external deps. Stored in
+ *     chunks.embedding (BLOB).
+ *
+ *  2. Dense neural (preferred when available, async). Uses
+ *     `@xenova/transformers` to run a local sentence-embedding model
+ *     (default: Snowflake/snowflake-arctic-embed-m-v1.5, 768-dim) entirely
+ *     on-device. Stored in chunks.embedding_dense (BLOB) with
+ *     chunks.embedding_dense_model tracking which model produced it.
+ *
+ * Runtime behavior:
+ *  - At store insert time, sync TF-IDF is computed (cheap, no I/O).
+ *  - At query time, the agent first tries embedDense() (async). If that
+ *    succeeds, dense search is used. Otherwise it falls back to TF-IDF.
+ *  - Dense backfill runs out-of-band via `clementine memory:reembed`.
+ *
+ * The dense model is lazy-loaded on first use. Model files (~440MB for
+ * arctic-embed-m) cache to ~/.clementine/models/ so subsequent runs are fast.
  */
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
@@ -195,6 +209,118 @@ export function getVocabHash(): string {
   if (vocabWords.length === 0) return '';
   // Order-sensitive: dimension assignment depends on insertion order.
   return createHash('sha1').update(vocabWords.join('|')).digest('hex').slice(0, 16);
+}
+
+// ── Dense neural embeddings (transformers.js) ─────────────────────────
+
+/** Default dense model. Override with EMBEDDING_DENSE_MODEL env. */
+const DEFAULT_DENSE_MODEL = 'Snowflake/snowflake-arctic-embed-m-v1.5';
+/** Output dimension. Both arctic-embed-m and bge-base produce 768-dim vectors. */
+const DENSE_DIMENSION = 768;
+/** Where transformers.js caches model weights. */
+const MODEL_CACHE_DIR = path.join(BASE_DIR, 'models');
+
+/** Configured model id (lazy-resolved). */
+function getDenseModelId(): string {
+  return process.env.EMBEDDING_DENSE_MODEL || DEFAULT_DENSE_MODEL;
+}
+
+/** Cached pipeline. Promise-shaped so concurrent first-use callers share one load. */
+let densePipelinePromise: Promise<unknown> | null = null;
+/** Tristate readiness: undefined = not tried, true = loaded, false = load failed. */
+let denseLoadState: undefined | true | false = undefined;
+
+/** Force re-initialization on next embed call (used by memory:reembed --provider). */
+export function resetDensePipeline(): void {
+  densePipelinePromise = null;
+  denseLoadState = undefined;
+}
+
+async function getDensePipeline(): Promise<unknown> {
+  if (densePipelinePromise) return densePipelinePromise;
+  densePipelinePromise = (async () => {
+    try {
+      mkdirSync(MODEL_CACHE_DIR, { recursive: true });
+    } catch { /* non-fatal */ }
+    const transformers = (await import('@xenova/transformers')) as unknown as {
+      pipeline: (task: string, model: string) => Promise<unknown>;
+      env: { cacheDir?: string; localURL?: string; allowLocalModels?: boolean };
+    };
+    transformers.env.cacheDir = MODEL_CACHE_DIR;
+    transformers.env.allowLocalModels = true;
+    const modelId = getDenseModelId();
+    logger.info({ modelId, cacheDir: MODEL_CACHE_DIR }, 'Loading dense embedding model (first use downloads ~440MB)');
+    const pipe = await transformers.pipeline('feature-extraction', modelId);
+    denseLoadState = true;
+    logger.info({ modelId }, 'Dense embedding model loaded');
+    return pipe;
+  })().catch((err) => {
+    denseLoadState = false;
+    logger.warn({ err }, 'Dense embedding model failed to load — falling back to TF-IDF');
+    densePipelinePromise = null;
+    throw err;
+  });
+  return densePipelinePromise;
+}
+
+/** Compute a dense neural embedding. isQuery=true prefixes with the
+ *  arctic-embed retrieval instruction; isQuery=false embeds passages raw. */
+export async function embedDense(text: string, isQuery: boolean = false): Promise<Float32Array | null> {
+  if (!text || !text.trim()) return null;
+  try {
+    const pipe = await getDensePipeline();
+    const input = isQuery
+      ? `Represent this sentence for searching relevant passages: ${text}`
+      : text;
+    // arctic-embed uses CLS pooling per its model card; bge models accept
+    // either cls or mean. CLS is the safe default for the arctic family.
+    const output = await (pipe as (text: string, opts: unknown) => Promise<{ data: Float32Array }>)(
+      input,
+      { pooling: 'cls', normalize: true },
+    );
+    // output.data is a Float32Array view — copy so the underlying buffer
+    // doesn't get reused by the next call.
+    return new Float32Array(output.data);
+  } catch (err) {
+    logger.debug({ err }, 'Dense embed failed');
+    return null;
+  }
+}
+
+/** Sequential batch — transformers.js doesn't easily batch on-CPU and
+ *  parallelism produces tiny gains while doubling memory. Used by backfill. */
+export async function embedDenseBatch(texts: string[]): Promise<Array<Float32Array | null>> {
+  const results: Array<Float32Array | null> = [];
+  for (const text of texts) {
+    results.push(await embedDense(text, false));
+  }
+  return results;
+}
+
+export function denseDimension(): number {
+  return DENSE_DIMENSION;
+}
+
+export function currentDenseModel(): string {
+  return getDenseModelId();
+}
+
+/** Has the dense model loaded successfully at least once?
+ *  Returns false if not yet attempted or load previously failed. */
+export function isDenseReady(): boolean {
+  return denseLoadState === true;
+}
+
+/** Probe whether dense embeddings are usable in this process. Triggers
+ *  the model load if it hasn't happened yet. Used at daemon startup so
+ *  later query-time embeds don't pay the load cost. */
+export async function probeDenseReady(): Promise<boolean> {
+  try {
+    await getDensePipeline();
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 const STOP_WORDS = new Set([

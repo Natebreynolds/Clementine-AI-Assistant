@@ -261,10 +261,12 @@ async function searchMemory(query: string, limit = 20): Promise<{ results: Array
     const ftsQuery = words.map((w) => `"${w.replace(/"/g, '')}"`).join(' OR ');
     const rows = db.prepare(
       `SELECT c.id, c.source_file, c.section, c.content, c.chunk_type,
-              c.updated_at, c.salience, bm25(chunks_fts) as score
+              c.updated_at, c.salience, c.pinned, bm25(chunks_fts) as score
        FROM chunks_fts f
        JOIN chunks c ON c.id = f.rowid
+       LEFT JOIN chunk_soft_deletes sd ON sd.chunk_id = c.id
        WHERE chunks_fts MATCH ?
+         AND sd.chunk_id IS NULL
        ORDER BY bm25(chunks_fts)
        LIMIT ?`,
     ).all(ftsQuery, limit) as Array<Record<string, unknown>>;
@@ -4288,7 +4290,299 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
       // could still end up in browser history, screenshots, etc.
       const { redactSecrets } = await import('../security/redact.js');
       const { text: redacted } = redactSecrets(response ?? '');
-      res.json({ ok: true, response: redacted });
+
+      // Attach the recall trace that powered this answer (if memory was used).
+      // Lets the chat UI render a "🧠 N sources" affordance on each assistant
+      // message, expandable to the chunks retrieved + their scores.
+      let trace: {
+        id: number;
+        query: string;
+        retrievedAt: string;
+        chunkCount: number;
+      } | null = null;
+      try {
+        const store = (gateway as any).assistant?.memoryStore;
+        if (store?.getRecentRecallTraces) {
+          const traces = store.getRecentRecallTraces('dashboard:web', 1);
+          if (traces.length > 0) {
+            trace = {
+              id: traces[0].id,
+              query: traces[0].query,
+              retrievedAt: traces[0].retrievedAt,
+              chunkCount: traces[0].chunkIds.length,
+            };
+          }
+        }
+      } catch { /* trace is optional */ }
+
+      res.json({ ok: true, response: redacted, trace });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  // ── Recall trace expansion (per-message memory provenance) ─────────
+  // Returns the chunks that were retrieved for a specific trace, with their
+  // scores and provenance (source_file, section, derived_from for summaries).
+  app.get('/api/recall-traces/:id', async (req, res) => {
+    try {
+      const id = Number(req.params.id);
+      if (!Number.isFinite(id) || id <= 0) {
+        res.status(400).json({ error: 'invalid trace id' });
+        return;
+      }
+      const gateway = await getGateway();
+      const store = (gateway as any).assistant?.memoryStore;
+      if (!store?.getRecallTrace) {
+        res.status(503).json({ error: 'Memory store not available' });
+        return;
+      }
+      const trace = store.getRecallTrace(id);
+      if (!trace) {
+        res.status(404).json({ error: 'trace not found' });
+        return;
+      }
+      res.json({ ok: true, trace });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  // List recent recall traces for a session (default: dashboard:web).
+  // Powers a future "Memory Trace" tab on session detail; also useful for
+  // CLI inspection.
+  app.get('/api/recall-traces', async (req, res) => {
+    try {
+      const sessionKey = String(req.query.sessionKey ?? 'dashboard:web');
+      const limit = Math.min(Math.max(Number(req.query.limit) || 20, 1), 200);
+      const gateway = await getGateway();
+      const store = (gateway as any).assistant?.memoryStore;
+      if (!store?.getRecentRecallTraces) {
+        res.json({ traces: [] });
+        return;
+      }
+      const traces = store.getRecentRecallTraces(sessionKey, limit);
+      res.json({ ok: true, sessionKey, traces });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  // ── User mental model (MemGPT-style core memory) ─────────────────
+  // Always-in-context surface. Slots: user_facts, goals, relationships,
+  // agent_persona. agent_slug=null is the global block; per-agent overrides
+  // layer on top in agent context.
+
+  app.get('/api/user-model', async (req, res) => {
+    try {
+      const agentSlug = req.query.agentSlug ? String(req.query.agentSlug) : null;
+      const gateway = await getGateway();
+      const store = (gateway as any).assistant?.memoryStore;
+      if (!store?.getAllUserModelBlocks) {
+        res.status(503).json({ error: 'Memory store not available' });
+        return;
+      }
+      const blocks = store.getAllUserModelBlocks(agentSlug);
+      const slots = ['user_facts', 'goals', 'relationships', 'agent_persona'];
+      // Always return a row for each slot (empty if unset) so the UI can render
+      // editable textareas without special-casing missing slots.
+      const merged = slots.map((slot: string) => {
+        const found = blocks.find((b: any) => b.slot === slot);
+        return found ?? {
+          slot,
+          content: '',
+          charLimit: 2000,
+          agentSlug: null,
+          updatedAt: null,
+        };
+      });
+      res.json({ ok: true, agentSlug, blocks: merged });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  app.put('/api/user-model/:slot', async (req, res) => {
+    try {
+      const slot = String(req.params.slot);
+      const validSlots = ['user_facts', 'goals', 'relationships', 'agent_persona'];
+      if (!validSlots.includes(slot)) {
+        res.status(400).json({ error: 'invalid slot' });
+        return;
+      }
+      const content = String(req.body?.content ?? '');
+      const agentSlug = req.body?.agentSlug ? String(req.body.agentSlug) : null;
+      const gateway = await getGateway();
+      const store = (gateway as any).assistant?.memoryStore;
+      if (!store?.setUserModelBlock) {
+        res.status(503).json({ error: 'Memory store not available' });
+        return;
+      }
+      const result = store.setUserModelBlock({ slot, content, agentSlug });
+      res.json({ ok: true, ...result });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  app.delete('/api/user-model/:slot', async (req, res) => {
+    try {
+      const slot = String(req.params.slot);
+      const agentSlug = req.query.agentSlug ? String(req.query.agentSlug) : null;
+      const gateway = await getGateway();
+      const store = (gateway as any).assistant?.memoryStore;
+      if (!store?.deleteUserModelBlock) {
+        res.status(503).json({ error: 'Memory store not available' });
+        return;
+      }
+      const removed = store.deleteUserModelBlock(slot, agentSlug);
+      res.json({ ok: true, removed });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  // ── Memory chunk CRUD (dashboard curation) ───────────────────────
+  // Lets the user fix wrong/stale memory directly from the search panel
+  // instead of having to wait for auto-extraction to drift in the right
+  // direction. Soft-delete via deleted_at; FTS trigger keeps deleted
+  // content out of search results.
+
+  app.get('/api/memory/chunks/:id', async (req, res) => {
+    try {
+      const id = Number(req.params.id);
+      if (!Number.isFinite(id) || id <= 0) {
+        res.status(400).json({ error: 'invalid chunk id' });
+        return;
+      }
+      const gateway = await getGateway();
+      const store = (gateway as any).assistant?.memoryStore;
+      if (!store?.getChunkDetail) {
+        res.status(503).json({ error: 'Memory store not available' });
+        return;
+      }
+      const chunk = store.getChunkDetail(id);
+      if (!chunk) {
+        res.status(404).json({ error: 'chunk not found' });
+        return;
+      }
+      res.json({ ok: true, chunk });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  app.put('/api/memory/chunks/:id', async (req, res) => {
+    try {
+      const id = Number(req.params.id);
+      if (!Number.isFinite(id) || id <= 0) {
+        res.status(400).json({ error: 'invalid chunk id' });
+        return;
+      }
+      const body = (req.body ?? {}) as Record<string, unknown>;
+      const gateway = await getGateway();
+      const store = (gateway as any).assistant?.memoryStore;
+      if (!store?.updateChunkContent) {
+        res.status(503).json({ error: 'Memory store not available' });
+        return;
+      }
+      const opts: {
+        chunkId: number; content?: string; section?: string;
+        category?: string | null; topic?: string | null; editedBy?: string | null;
+      } = { chunkId: id, editedBy: 'dashboard' };
+      if (typeof body.content === 'string') opts.content = body.content;
+      if (typeof body.section === 'string') opts.section = body.section;
+      if (body.category === null || typeof body.category === 'string') opts.category = body.category;
+      if (body.topic === null || typeof body.topic === 'string') opts.topic = body.topic;
+      const ok = store.updateChunkContent(opts);
+      if (!ok) {
+        res.status(404).json({ error: 'chunk not found' });
+        return;
+      }
+      const chunk = store.getChunkDetail(id);
+      res.json({ ok: true, chunk });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  app.delete('/api/memory/chunks/:id', async (req, res) => {
+    try {
+      const id = Number(req.params.id);
+      if (!Number.isFinite(id) || id <= 0) {
+        res.status(400).json({ error: 'invalid chunk id' });
+        return;
+      }
+      const gateway = await getGateway();
+      const store = (gateway as any).assistant?.memoryStore;
+      if (!store?.softDeleteChunk) {
+        res.status(503).json({ error: 'Memory store not available' });
+        return;
+      }
+      const removed = store.softDeleteChunk(id);
+      res.json({ ok: true, removed });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  app.post('/api/memory/chunks/:id/restore', async (req, res) => {
+    try {
+      const id = Number(req.params.id);
+      if (!Number.isFinite(id) || id <= 0) {
+        res.status(400).json({ error: 'invalid chunk id' });
+        return;
+      }
+      const gateway = await getGateway();
+      const store = (gateway as any).assistant?.memoryStore;
+      if (!store?.restoreChunk) {
+        res.status(503).json({ error: 'Memory store not available' });
+        return;
+      }
+      const restored = store.restoreChunk(id);
+      res.json({ ok: true, restored });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  app.post('/api/memory/chunks/:id/pin', async (req, res) => {
+    try {
+      const id = Number(req.params.id);
+      if (!Number.isFinite(id) || id <= 0) {
+        res.status(400).json({ error: 'invalid chunk id' });
+        return;
+      }
+      const pinned = !!(req.body?.pinned ?? true);
+      const gateway = await getGateway();
+      const store = (gateway as any).assistant?.memoryStore;
+      if (!store?.setPinned) {
+        res.status(503).json({ error: 'Memory store not available' });
+        return;
+      }
+      const ok = store.setPinned(id, pinned);
+      res.json({ ok: true, updated: ok, pinned });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  app.get('/api/memory/chunks/:id/history', async (req, res) => {
+    try {
+      const id = Number(req.params.id);
+      if (!Number.isFinite(id) || id <= 0) {
+        res.status(400).json({ error: 'invalid chunk id' });
+        return;
+      }
+      const limit = Math.min(Math.max(Number(req.query.limit) || 20, 1), 100);
+      const gateway = await getGateway();
+      const store = (gateway as any).assistant?.memoryStore;
+      if (!store?.getChunkHistory) {
+        res.status(503).json({ error: 'Memory store not available' });
+        return;
+      }
+      const history = store.getChunkHistory(id, limit);
+      res.json({ ok: true, history });
     } catch (err) {
       res.status(500).json({ error: String(err) });
     }
@@ -10431,6 +10725,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
       <div class="tab-bar" id="intelligence-tabs">
         <button class="active" onclick="switchTab('intelligence','search')">Search</button>
         <button onclick="switchTab('intelligence','graph')">Knowledge Graph</button>
+        <button onclick="switchTab('intelligence','user-model')">User Model</button>
         <button onclick="switchTab('intelligence','memory')">Memory Stats</button>
         <button onclick="switchTab('intelligence','seed')">Seed Upload</button>
         <button onclick="switchTab('intelligence','sources')">Sources</button>
@@ -10463,6 +10758,21 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
             <div class="card-header">MEMORY.md</div>
             <div class="card-body" id="panel-memory"><div class="empty-state">Loading...</div></div>
           </div>
+        </div>
+
+        <!-- User Model — MemGPT-style core memory blocks always loaded into context -->
+        <div class="tab-pane" id="tab-intelligence-user-model">
+          <div style="color:var(--muted,#888);margin-bottom:12px;font-size:13px">
+            What the agent always knows about you. These slots load into every conversation's context (above retrieved memory). Edit directly to correct or steer.
+          </div>
+          <div style="display:flex;gap:8px;margin-bottom:12px;align-items:center">
+            <label style="font-size:13px;color:var(--text-secondary)">Scope:</label>
+            <select id="user-model-scope" style="padding:6px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg-input);color:var(--text);font-size:13px" onchange="loadUserModel()">
+              <option value="">Global</option>
+            </select>
+            <button class="btn" onclick="loadUserModel()" style="font-size:13px">Refresh</button>
+          </div>
+          <div id="user-model-panel"><div class="empty-state">Loading user model…</div></div>
         </div>
 
         <!-- Seed Upload -->
@@ -16062,6 +16372,17 @@ async function sendChat() {
     asstMeta.className = 'chat-meta';
     asstMeta.textContent = new Date().toLocaleTimeString();
     asstBubble.appendChild(asstMeta);
+    // Recall trace affordance — shows which memory chunks powered this answer.
+    if (d.trace && d.trace.chunkCount > 0) {
+      var traceLink = document.createElement('div');
+      traceLink.className = 'chat-trace-link';
+      traceLink.style.cssText = 'margin-top:6px;font-size:11px;color:var(--text-muted);cursor:pointer;user-select:none';
+      traceLink.textContent = '🧠 ' + d.trace.chunkCount + ' source' + (d.trace.chunkCount === 1 ? '' : 's');
+      traceLink.dataset.traceId = String(d.trace.id);
+      traceLink.dataset.expanded = 'false';
+      traceLink.onclick = function() { toggleRecallTrace(traceLink); };
+      asstBubble.appendChild(traceLink);
+    }
     asstRow.appendChild(asstBubble);
     container.appendChild(asstRow);
   } catch(e) {
@@ -16078,6 +16399,277 @@ async function sendChat() {
   sendBtn.textContent = 'Send';
   input.focus();
   container.scrollTop = container.scrollHeight;
+}
+
+// ── Recall trace expansion ────────────────
+async function toggleRecallTrace(linkEl) {
+  var traceId = linkEl.dataset.traceId;
+  var expanded = linkEl.dataset.expanded === 'true';
+  // Find or create the panel directly after the link
+  var panel = linkEl.nextElementSibling && linkEl.nextElementSibling.classList && linkEl.nextElementSibling.classList.contains('chat-trace-panel')
+    ? linkEl.nextElementSibling : null;
+
+  if (expanded) {
+    if (panel) panel.remove();
+    linkEl.dataset.expanded = 'false';
+    linkEl.textContent = linkEl.textContent.replace('▾', '').trim();
+    return;
+  }
+
+  if (!panel) {
+    panel = document.createElement('div');
+    panel.className = 'chat-trace-panel';
+    panel.style.cssText = 'margin-top:6px;padding:8px 10px;border-left:2px solid var(--border);background:var(--bg-soft);border-radius:4px;font-size:11px';
+    panel.innerHTML = '<div style="color:var(--text-muted)">Loading sources…</div>';
+    linkEl.insertAdjacentElement('afterend', panel);
+  }
+
+  try {
+    var r = await apiFetch('/api/recall-traces/' + encodeURIComponent(traceId));
+    var d = await r.json();
+    if (!d || !d.trace) {
+      panel.innerHTML = '<div style="color:var(--red)">Trace not found</div>';
+      return;
+    }
+    var t = d.trace;
+    var html = '<div style="color:var(--text-muted);margin-bottom:6px"><strong>Query:</strong> ' + esc(t.query) + '</div>';
+    html += '<div style="display:flex;flex-direction:column;gap:6px">';
+    for (var i = 0; i < t.chunks.length; i++) {
+      var c = t.chunks[i];
+      var snippet = (c.content || '').slice(0, 240);
+      if ((c.content || '').length > 240) snippet += '…';
+      var badges = '';
+      if (c.pinned) badges += '<span style="background:var(--accent);color:#fff;padding:1px 5px;border-radius:3px;font-size:10px;margin-left:4px">📌 pinned</span>';
+      if (c.consolidated) badges += '<span style="background:var(--bg);color:var(--text-muted);padding:1px 5px;border-radius:3px;font-size:10px;margin-left:4px">consolidated</span>';
+      if (c.derivedFrom && c.derivedFrom.length) badges += '<span style="background:var(--bg);color:var(--text-muted);padding:1px 5px;border-radius:3px;font-size:10px;margin-left:4px" title="Derived from chunk ids: ' + c.derivedFrom.join(', ') + '">↳ ' + c.derivedFrom.length + ' source' + (c.derivedFrom.length === 1 ? '' : 's') + '</span>';
+      html += '<div style="border-left:2px solid var(--border);padding-left:8px">';
+      html += '<div style="display:flex;justify-content:space-between;align-items:center"><span style="color:var(--accent);font-weight:600">' + esc(c.sourceFile || '?') + '</span><span style="color:var(--text-muted)">score ' + (typeof c.score === 'number' ? c.score.toFixed(3) : '?') + badges + '</span></div>';
+      html += '<div style="color:var(--text-muted);font-size:10px;margin:2px 0">' + esc(c.section || '') + '</div>';
+      html += '<div style="white-space:pre-wrap">' + esc(snippet) + '</div>';
+      html += '</div>';
+    }
+    html += '</div>';
+    panel.innerHTML = html;
+    linkEl.dataset.expanded = 'true';
+  } catch (e) {
+    panel.innerHTML = '<div style="color:var(--red)">Failed to load: ' + esc(String(e)) + '</div>';
+  }
+}
+
+// ── User Model (MemGPT-style core memory) ────────
+async function loadUserModel() {
+  var panel = document.getElementById('user-model-panel');
+  if (!panel) return;
+  var scope = document.getElementById('user-model-scope');
+  var agentSlug = scope && scope.value ? scope.value : '';
+  panel.innerHTML = '<div class="empty-state">Loading…</div>';
+  try {
+    var qs = agentSlug ? '?agentSlug=' + encodeURIComponent(agentSlug) : '';
+    var r = await apiFetch('/api/user-model' + qs);
+    var d = await r.json();
+    if (!d.ok) {
+      panel.innerHTML = '<div class="empty-state">Failed to load: ' + esc(d.error || 'unknown error') + '</div>';
+      return;
+    }
+    var labelMap = {
+      user_facts: 'User Facts',
+      goals: 'Active Goals',
+      relationships: 'Key Relationships',
+      agent_persona: 'Agent Persona',
+    };
+    var helpMap = {
+      user_facts: 'Who they are: name, role, location, lasting preferences (writing style, tools, communication style).',
+      goals: 'What they\\'re actively working toward right now. Updated as goals shift.',
+      relationships: 'People, projects, channels they regularly interact with.',
+      agent_persona: 'For multi-agent: this agent\\'s self-identity in its working relationship with the user.',
+    };
+    var html = '<div style="display:flex;flex-direction:column;gap:14px">';
+    for (var i = 0; i < d.blocks.length; i++) {
+      var b = d.blocks[i];
+      var label = labelMap[b.slot] || b.slot;
+      var help = helpMap[b.slot] || '';
+      var charsUsed = (b.content || '').length;
+      var pct = Math.round((charsUsed / (b.charLimit || 2000)) * 100);
+      var pctColor = pct > 90 ? 'var(--red,#ef4444)' : pct > 70 ? 'var(--accent,#f59e0b)' : 'var(--text-muted)';
+      var scopeLabel = b.agentSlug ? 'agent=' + esc(b.agentSlug) : 'global';
+      var updated = b.updatedAt ? 'updated ' + esc(b.updatedAt) : 'never set';
+      html += '<div class="card" style="padding:14px">';
+      html += '<div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:6px">';
+      html += '<div><div style="font-weight:600;font-size:14px">' + esc(label) + '</div>';
+      html += '<div style="font-size:11px;color:var(--text-muted);margin-top:2px">' + esc(help) + '</div></div>';
+      html += '<div style="font-size:11px;color:' + pctColor + '">' + charsUsed + '/' + (b.charLimit || 2000) + ' chars · ' + scopeLabel + ' · ' + updated + '</div>';
+      html += '</div>';
+      html += '<textarea id="um-textarea-' + esc(b.slot) + '" style="width:100%;min-height:80px;padding:8px;border:1px solid var(--border);border-radius:6px;background:var(--bg-input);color:var(--text);font-family:inherit;font-size:13px;resize:vertical">' + esc(b.content || '') + '</textarea>';
+      html += '<div style="display:flex;gap:6px;margin-top:8px;justify-content:flex-end">';
+      html += '<button class="btn" onclick="clearUserModelSlot(\\'' + esc(b.slot) + '\\')" style="font-size:12px">Clear</button>';
+      html += '<button class="btn-primary" onclick="saveUserModelSlot(\\'' + esc(b.slot) + '\\')" style="font-size:12px">Save</button>';
+      html += '</div>';
+      html += '</div>';
+    }
+    html += '</div>';
+    panel.innerHTML = html;
+  } catch (e) {
+    panel.innerHTML = '<div class="empty-state">Failed to load: ' + esc(String(e)) + '</div>';
+  }
+}
+
+async function saveUserModelSlot(slot) {
+  var ta = document.getElementById('um-textarea-' + slot);
+  if (!ta) return;
+  var scope = document.getElementById('user-model-scope');
+  var agentSlug = scope && scope.value ? scope.value : null;
+  try {
+    var r = await apiFetch('/api/user-model/' + encodeURIComponent(slot), {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content: ta.value, agentSlug: agentSlug }),
+    });
+    var d = await r.json();
+    if (d.ok) {
+      toast('Saved ' + slot + (d.truncated ? ' (truncated to char_limit)' : ''), 'success');
+      loadUserModel();
+    } else {
+      toast('Save failed: ' + (d.error || 'unknown'), 'error');
+    }
+  } catch (e) { toast('Save failed: ' + String(e), 'error'); }
+}
+
+async function clearUserModelSlot(slot) {
+  if (!confirm('Clear the "' + slot + '" slot? This deletes everything currently stored there.')) return;
+  var scope = document.getElementById('user-model-scope');
+  var agentSlug = scope && scope.value ? scope.value : null;
+  try {
+    var qs = agentSlug ? '?agentSlug=' + encodeURIComponent(agentSlug) : '';
+    var r = await apiFetch('/api/user-model/' + encodeURIComponent(slot) + qs, { method: 'DELETE' });
+    var d = await r.json();
+    if (d.ok) {
+      toast('Cleared ' + slot, 'success');
+      loadUserModel();
+    } else {
+      toast('Clear failed: ' + (d.error || 'unknown'), 'error');
+    }
+  } catch (e) { toast('Clear failed: ' + String(e), 'error'); }
+}
+
+// Auto-load when the User Model tab becomes active
+(function() {
+  document.addEventListener('DOMContentLoaded', function() {
+    var obs = new MutationObserver(function() {
+      var pane = document.getElementById('tab-intelligence-user-model');
+      if (pane && pane.classList.contains('active')) {
+        // Populate the agent scope dropdown from the team list (best-effort)
+        var scope = document.getElementById('user-model-scope');
+        if (scope && scope.children.length === 1) {
+          fetch('/api/team/agents').then(function(r) { return r.json(); }).then(function(d) {
+            var agents = (d && d.agents) || [];
+            for (var i = 0; i < agents.length; i++) {
+              var opt = document.createElement('option');
+              opt.value = agents[i].slug;
+              opt.textContent = 'Agent: ' + (agents[i].name || agents[i].slug);
+              scope.appendChild(opt);
+            }
+          }).catch(function() { /* team API optional */ });
+        }
+        loadUserModel();
+      }
+    });
+    var content = document.querySelector('.content');
+    if (content) obs.observe(content, { subtree: true, attributes: true, attributeFilter: ['class'] });
+  });
+})();
+
+// ── Memory chunk CRUD (search panel actions) ────
+async function editChunk(id) {
+  var row = document.getElementById('chunk-row-' + id);
+  if (!row) return;
+  var contentDiv = document.getElementById('chunk-content-' + id);
+  if (!contentDiv) return;
+  // If already editing, no-op
+  if (row.dataset.editing === 'true') return;
+  row.dataset.editing = 'true';
+
+  // Fetch full content (search result is truncated to 500 chars)
+  try {
+    var r = await apiFetch('/api/memory/chunks/' + id);
+    var d = await r.json();
+    if (!d.ok || !d.chunk) {
+      toast('Failed to load chunk: ' + (d.error || 'unknown'), 'error');
+      row.dataset.editing = 'false';
+      return;
+    }
+    var fullContent = d.chunk.content || '';
+    var section = d.chunk.section || '';
+    contentDiv.innerHTML =
+      '<div style="margin-top:6px">'
+      + '<input type="text" id="edit-section-' + id + '" placeholder="Section" value="' + esc(section) + '" style="width:100%;padding:6px;border:1px solid var(--border);border-radius:4px;background:var(--bg-input);color:var(--text);font-size:12px;margin-bottom:6px">'
+      + '<textarea id="edit-content-' + id + '" style="width:100%;min-height:140px;padding:8px;border:1px solid var(--border);border-radius:4px;background:var(--bg-input);color:var(--text);font-family:inherit;font-size:13px;resize:vertical">' + esc(fullContent) + '</textarea>'
+      + '<div style="display:flex;gap:6px;margin-top:6px;justify-content:flex-end">'
+      + '<button class="btn" style="font-size:12px" onclick="cancelEditChunk(' + id + ')">Cancel</button>'
+      + '<button class="btn-primary" style="font-size:12px" onclick="saveEditChunk(' + id + ')">Save</button>'
+      + '</div></div>';
+  } catch (e) {
+    toast('Failed to load chunk: ' + String(e), 'error');
+    row.dataset.editing = 'false';
+  }
+}
+
+async function saveEditChunk(id) {
+  var contentEl = document.getElementById('edit-content-' + id);
+  var sectionEl = document.getElementById('edit-section-' + id);
+  if (!contentEl) return;
+  try {
+    var r = await apiFetch('/api/memory/chunks/' + id, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        content: contentEl.value,
+        section: sectionEl ? sectionEl.value : undefined,
+      }),
+    });
+    var d = await r.json();
+    if (d.ok) {
+      toast('Chunk saved', 'success');
+      runMemorySearch(); // re-render with updated data
+    } else {
+      toast('Save failed: ' + (d.error || 'unknown'), 'error');
+    }
+  } catch (e) { toast('Save failed: ' + String(e), 'error'); }
+}
+
+function cancelEditChunk(id) {
+  // Easiest: re-run the search to restore original rendering
+  runMemorySearch();
+}
+
+async function togglePinChunk(id, pinned) {
+  try {
+    var r = await apiFetch('/api/memory/chunks/' + id + '/pin', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ pinned: pinned }),
+    });
+    var d = await r.json();
+    if (d.ok) {
+      toast(pinned ? 'Pinned' : 'Unpinned', 'success');
+      runMemorySearch();
+    } else {
+      toast('Pin failed: ' + (d.error || 'unknown'), 'error');
+    }
+  } catch (e) { toast('Pin failed: ' + String(e), 'error'); }
+}
+
+async function deleteChunk(id) {
+  if (!confirm('Delete this chunk? It will be excluded from search and retrieval. (Soft-delete — recoverable via the database.)')) return;
+  try {
+    var r = await apiFetch('/api/memory/chunks/' + id, { method: 'DELETE' });
+    var d = await r.json();
+    if (d.ok) {
+      toast(d.removed ? 'Chunk deleted' : 'Chunk was already deleted', 'success');
+      runMemorySearch();
+    } else {
+      toast('Delete failed: ' + (d.error || 'unknown'), 'error');
+    }
+  } catch (e) { toast('Delete failed: ' + String(e), 'error'); }
 }
 
 // ── Profile Switching ─────────────────────
@@ -16705,13 +17297,22 @@ async function runMemorySearch() {
 
     for (const r of d.results) {
       const score = Math.abs(r.score || 0).toFixed(2);
-      html += '<div class="search-result">'
-        + '<div class="search-result-header">'
-        + '<span class="search-result-file">' + esc(r.source_file) + '</span>'
-        + '<span class="search-result-score">score: ' + score + '</span>'
+      const pinned = r.pinned ? ' 📌' : '';
+      const idAttr = r.id ? String(r.id) : '';
+      html += '<div class="search-result" data-chunk-id="' + esc(idAttr) + '" id="chunk-row-' + esc(idAttr) + '">'
+        + '<div class="search-result-header" style="display:flex;justify-content:space-between;align-items:center">'
+        + '<span class="search-result-file">' + esc(r.source_file) + pinned + '</span>'
+        + '<div style="display:flex;gap:6px;align-items:center">'
+        + '<span class="search-result-score" style="font-size:11px;color:var(--text-muted)">score ' + score + '</span>'
+        + (idAttr ? (
+          '<button class="btn" style="font-size:11px;padding:2px 8px" onclick="editChunk(' + idAttr + ')">Edit</button>'
+          + '<button class="btn" style="font-size:11px;padding:2px 8px" onclick="togglePinChunk(' + idAttr + ',' + (r.pinned ? 'false' : 'true') + ')">' + (r.pinned ? 'Unpin' : 'Pin') + '</button>'
+          + '<button class="btn" style="font-size:11px;padding:2px 8px;color:var(--red,#ef4444)" onclick="deleteChunk(' + idAttr + ')">Delete</button>'
+        ) : '')
+        + '</div>'
         + '</div>'
         + '<div class="search-result-section">' + esc(r.section || '') + ' &middot; ' + esc(r.chunk_type || '') + '</div>'
-        + '<div class="search-result-content">' + esc((r.content || '').slice(0, 500)) + '</div>'
+        + '<div class="search-result-content" id="chunk-content-' + esc(idAttr) + '">' + esc((r.content || '').slice(0, 500)) + '</div>'
         + '</div>';
     }
     container.innerHTML = html;

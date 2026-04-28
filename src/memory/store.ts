@@ -701,6 +701,120 @@ export class MemoryStore {
       CREATE INDEX IF NOT EXISTS idx_ingested_rows_ingested
         ON ingested_rows(ingested_at DESC);
     `);
+
+    // Derived-from lineage — when consolidation/principle extraction produces
+    // a summary chunk, this stores the source chunk IDs that fed into it.
+    // JSON array of chunk IDs. Lets the dashboard show "this principle was
+    // derived from these N source episodes" — abstractions become auditable
+    // instead of magic.
+    try {
+      this.conn.exec('ALTER TABLE chunks ADD COLUMN derived_from TEXT DEFAULT NULL');
+    } catch { /* already exists */ }
+
+    // Recall traces — per-message audit of which chunks were retrieved for
+    // context. Powers the "🧠 N sources" affordance in the dashboard chat
+    // panel and is the debugging substrate for retrieval-quality work
+    // (dense embeddings, scoring tweaks, etc). Pruned to 90 days by
+    // pruneStaleData() to bound write amplification.
+    this.conn.exec(`
+      CREATE TABLE IF NOT EXISTS recall_traces (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_key TEXT,
+        message_id TEXT,
+        query TEXT NOT NULL,
+        chunk_ids TEXT NOT NULL,
+        scores TEXT NOT NULL,
+        agent_slug TEXT,
+        retrieved_at TEXT DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_recall_traces_session
+        ON recall_traces(session_key, retrieved_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_recall_traces_message
+        ON recall_traces(message_id) WHERE message_id IS NOT NULL;
+      CREATE INDEX IF NOT EXISTS idx_recall_traces_retrieved
+        ON recall_traces(retrieved_at);
+    `);
+
+    // Dense neural embeddings (transformers.js — arctic-embed-m by default).
+    // Parallel to the existing chunks.embedding (TF-IDF, 512-dim) so we can
+    // backfill incrementally and fall back gracefully if the dense model
+    // isn't available yet. embedding_dense_model tracks which model produced
+    // each vector — lets us migrate to a new model later by re-running the
+    // memory:reembed command.
+    try {
+      this.conn.exec('ALTER TABLE chunks ADD COLUMN embedding_dense BLOB');
+    } catch { /* already exists */ }
+    try {
+      this.conn.exec('ALTER TABLE chunks ADD COLUMN embedding_dense_model TEXT DEFAULT NULL');
+    } catch { /* already exists */ }
+    try {
+      this.conn.exec('CREATE INDEX idx_chunks_has_dense ON chunks(id) WHERE embedding_dense IS NOT NULL');
+    } catch { /* already exists */ }
+
+    // Soft-delete via a separate table — keeps the chunks_au trigger
+    // out of the path so we don't have to fight with the FTS5 contentless
+    // index's delete-then-insert semantics. Search query paths LEFT JOIN
+    // this table and filter WHERE chunk_soft_deletes.chunk_id IS NULL.
+    // Soft-delete and restore handle FTS index updates explicitly without
+    // UPDATEing the chunks row at all.
+    this.conn.exec(`
+      CREATE TABLE IF NOT EXISTS chunk_soft_deletes (
+        chunk_id INTEGER PRIMARY KEY,
+        deleted_at TEXT NOT NULL DEFAULT (datetime('now')),
+        deleted_by TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_chunk_soft_deletes_at
+        ON chunk_soft_deletes(deleted_at);
+    `);
+
+    // Clean up earlier experimental trigger variants from dev versions.
+    // The original chunks_au handles the normal "edit a chunk" path correctly.
+    try {
+      this.conn.exec('DROP TRIGGER IF EXISTS chunks_au_remove');
+      this.conn.exec('DROP TRIGGER IF EXISTS chunks_au_insert');
+      this.conn.exec('DROP TRIGGER IF EXISTS chunks_au1_remove');
+      this.conn.exec('DROP TRIGGER IF EXISTS chunks_au2_insert');
+    } catch { /* best-effort */ }
+
+    // Edit history — append-only audit trail for content edits via the
+    // dashboard CRUD UI. Lets the user see "what did I change in this chunk
+    // and when" if memory drifts in surprising ways.
+    this.conn.exec(`
+      CREATE TABLE IF NOT EXISTS chunk_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        chunk_id INTEGER NOT NULL,
+        prev_content TEXT NOT NULL,
+        prev_section TEXT,
+        prev_category TEXT,
+        prev_topic TEXT,
+        edited_by TEXT,
+        edited_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_chunk_history_chunk ON chunk_history(chunk_id, edited_at DESC);
+    `);
+
+    // User mental model — MemGPT-style core memory blocks always loaded into
+    // the agent's context. Unlike chunks (retrieved on demand), these are
+    // the coherent "what we know about Nathan" surface: identifiers, lasting
+    // preferences, active goals, key relationships, agent persona. Editable
+    // by the agent via the user_model MCP tool, and by the user via the
+    // dashboard "User Model" panel. Hard char_limit per slot prevents bloat.
+    //
+    // Per-agent isolation: agent_slug NULL = global (main user model).
+    // Specific slug = per-agent override (e.g., the SDR agent has its own
+    // sense of who Nathan is in that working relationship).
+    this.conn.exec(`
+      CREATE TABLE IF NOT EXISTS user_model_blocks (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        slot TEXT NOT NULL,
+        content TEXT NOT NULL DEFAULT '',
+        char_limit INTEGER NOT NULL DEFAULT 2000,
+        agent_slug TEXT,
+        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_user_model_slot_agent
+        ON user_model_blocks(slot, COALESCE(agent_slug, ''));
+    `);
   }
 
   // ── Skill usage telemetry ─────────────────────────────────────────
@@ -815,6 +929,221 @@ export class MemoryStore {
     }
   }
 
+  // ── Chunk CRUD (dashboard curation) ───────────────────────────────
+
+  /** Full detail for a single chunk, including soft-delete state and provenance. */
+  getChunkDetail(chunkId: number): {
+    id: number;
+    sourceFile: string;
+    section: string;
+    content: string;
+    chunkType: string;
+    salience: number;
+    pinned: boolean;
+    consolidated: boolean;
+    deletedAt: string | null;
+    derivedFrom: number[] | null;
+    agentSlug: string | null;
+    category: string | null;
+    topic: string | null;
+    createdAt: string;
+    updatedAt: string;
+    historyCount: number;
+  } | null {
+    const row = this.conn.prepare(
+      `SELECT c.id, c.source_file, c.section, c.content, c.chunk_type, c.salience,
+              c.pinned, c.consolidated, c.derived_from, c.agent_slug, c.category, c.topic,
+              c.created_at, c.updated_at, sd.deleted_at AS soft_deleted_at
+       FROM chunks c
+       LEFT JOIN chunk_soft_deletes sd ON sd.chunk_id = c.id
+       WHERE c.id = ?`,
+    ).get(chunkId) as {
+      id: number;
+      source_file: string;
+      section: string;
+      content: string;
+      chunk_type: string;
+      salience: number;
+      pinned: number;
+      consolidated: number;
+      soft_deleted_at: string | null;
+      derived_from: string | null;
+      agent_slug: string | null;
+      category: string | null;
+      topic: string | null;
+      created_at: string;
+      updated_at: string;
+    } | undefined;
+    if (!row) return null;
+    const histRow = this.conn.prepare(
+      'SELECT COUNT(*) as c FROM chunk_history WHERE chunk_id = ?',
+    ).get(chunkId) as { c: number } | undefined;
+    return {
+      id: row.id,
+      sourceFile: row.source_file,
+      section: row.section,
+      content: row.content,
+      chunkType: row.chunk_type,
+      salience: row.salience,
+      pinned: !!row.pinned,
+      consolidated: !!row.consolidated,
+      deletedAt: row.soft_deleted_at,
+      derivedFrom: row.derived_from ? this._parseJsonArray<number>(row.derived_from) : null,
+      agentSlug: row.agent_slug,
+      category: row.category,
+      topic: row.topic,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+      historyCount: histRow?.c ?? 0,
+    };
+  }
+
+  /**
+   * Edit a chunk's content (and optionally section/category/topic). Records
+   * the previous values to chunk_history for audit. Re-computes content_hash
+   * and embedding (if vocab is ready). FTS index updates via trigger.
+   */
+  updateChunkContent(opts: {
+    chunkId: number;
+    content?: string;
+    section?: string;
+    category?: string | null;
+    topic?: string | null;
+    editedBy?: string | null;
+  }): boolean {
+    const existing = this.conn.prepare(
+      `SELECT content, section, category, topic FROM chunks WHERE id = ?`,
+    ).get(opts.chunkId) as {
+      content: string; section: string; category: string | null; topic: string | null;
+    } | undefined;
+    if (!existing) return false;
+
+    const newContent = opts.content ?? existing.content;
+    const newSection = opts.section ?? existing.section;
+    const newCategory = opts.category !== undefined ? opts.category : existing.category;
+    const newTopic = opts.topic !== undefined ? opts.topic : existing.topic;
+
+    const contentChanged = newContent !== existing.content;
+    const anyChange = contentChanged
+      || newSection !== existing.section
+      || newCategory !== existing.category
+      || newTopic !== existing.topic;
+    if (!anyChange) return true; // no-op succeeds
+
+    // Audit row first — keep previous values regardless of which field changed.
+    this.conn.prepare(
+      `INSERT INTO chunk_history (chunk_id, prev_content, prev_section, prev_category, prev_topic, edited_by)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    ).run(
+      opts.chunkId, existing.content, existing.section,
+      existing.category, existing.topic, opts.editedBy ?? null,
+    );
+
+    const newHash = createHash('sha256').update(newContent).digest('hex').slice(0, 16);
+    this.conn.prepare(
+      `UPDATE chunks
+       SET content = ?, section = ?, category = ?, topic = ?,
+           content_hash = ?, updated_at = datetime('now')
+       WHERE id = ?`,
+    ).run(newContent, newSection, newCategory, newTopic, newHash, opts.chunkId);
+
+    // Recompute embedding if content changed
+    if (contentChanged && embeddingsModule.isReady()) {
+      try {
+        const vec = embeddingsModule.embed(newContent);
+        if (vec) {
+          this.conn.prepare('UPDATE chunks SET embedding = ? WHERE id = ?')
+            .run(embeddingsModule.serializeEmbedding(vec), opts.chunkId);
+        }
+      } catch { /* embedding is best-effort */ }
+    }
+
+    return true;
+  }
+
+  /** Soft-delete a chunk. Inserts a row into chunk_soft_deletes (the chunks
+   *  row itself is untouched) and removes the chunk from the FTS index.
+   *  Search query paths LEFT JOIN chunk_soft_deletes so deleted chunks are
+   *  excluded everywhere. */
+  softDeleteChunk(chunkId: number, deletedBy?: string | null): boolean {
+    const tx = this.conn.transaction((id: number) => {
+      const row = this.conn.prepare(
+        `SELECT c.id, c.source_file, c.section, c.content
+         FROM chunks c LEFT JOIN chunk_soft_deletes sd ON sd.chunk_id = c.id
+         WHERE c.id = ? AND sd.chunk_id IS NULL`,
+      ).get(id) as { id: number; source_file: string; section: string; content: string } | undefined;
+      if (!row) return false;
+      this.conn.prepare(
+        `INSERT INTO chunk_soft_deletes (chunk_id, deleted_by) VALUES (?, ?)`,
+      ).run(id, deletedBy ?? null);
+      // Remove from FTS index — search joins on chunk_soft_deletes already
+      // filter, but pulling out of FTS speeds up MATCH queries (fewer terms
+      // to scan) and is correct hygiene.
+      this.conn.prepare(
+        `INSERT INTO chunks_fts(chunks_fts, rowid, source_file, section, content)
+         VALUES ('delete', ?, ?, ?, ?)`,
+      ).run(row.id, row.source_file, row.section, row.content);
+      return true;
+    });
+    return tx(chunkId) as boolean;
+  }
+
+  /** Restore a soft-deleted chunk. Removes the chunk_soft_deletes row and
+   *  re-inserts the content into the FTS index. */
+  restoreChunk(chunkId: number): boolean {
+    const tx = this.conn.transaction((id: number) => {
+      const row = this.conn.prepare(
+        `SELECT c.id, c.source_file, c.section, c.content
+         FROM chunks c JOIN chunk_soft_deletes sd ON sd.chunk_id = c.id
+         WHERE c.id = ?`,
+      ).get(id) as { id: number; source_file: string; section: string; content: string } | undefined;
+      if (!row) return false;
+      this.conn.prepare(`DELETE FROM chunk_soft_deletes WHERE chunk_id = ?`).run(id);
+      // Re-insert into FTS. The chunks row's content is unchanged so this
+      // adds back the same indexed terms that softDeleteChunk removed.
+      this.conn.prepare(
+        `INSERT INTO chunks_fts(rowid, source_file, section, content)
+         VALUES (?, ?, ?, ?)`,
+      ).run(row.id, row.source_file, row.section, row.content);
+      return true;
+    });
+    return tx(chunkId) as boolean;
+  }
+
+  /** Recent edit history for a chunk (newest first). */
+  getChunkHistory(chunkId: number, limit = 20): Array<{
+    id: number;
+    prevContent: string;
+    prevSection: string | null;
+    prevCategory: string | null;
+    prevTopic: string | null;
+    editedBy: string | null;
+    editedAt: string;
+  }> {
+    const rows = this.conn.prepare(
+      `SELECT id, prev_content, prev_section, prev_category, prev_topic, edited_by, edited_at
+       FROM chunk_history WHERE chunk_id = ?
+       ORDER BY edited_at DESC, id DESC LIMIT ?`,
+    ).all(chunkId, limit) as Array<{
+      id: number;
+      prev_content: string;
+      prev_section: string | null;
+      prev_category: string | null;
+      prev_topic: string | null;
+      edited_by: string | null;
+      edited_at: string;
+    }>;
+    return rows.map(r => ({
+      id: r.id,
+      prevContent: r.prev_content,
+      prevSection: r.prev_section,
+      prevCategory: r.prev_category,
+      prevTopic: r.prev_topic,
+      editedBy: r.edited_by,
+      editedAt: r.edited_at,
+    }));
+  }
+
   /**
    * Aggregate stats for the memory store — used by `clementine memory status`.
    * Single-pass scans so it stays fast even on large chunk tables.
@@ -822,6 +1151,8 @@ export class MemoryStore {
   getMemoryStats(): {
     totalChunks: number;
     chunksWithEmbeddings: number;
+    chunksWithDenseEmbeddings: number;
+    denseEmbeddingModels: Array<{ model: string; count: number }>;
     pinnedChunks: number;
     perAgent: Array<{ agentSlug: string; count: number }>;
     perCategory: Array<{ category: string; count: number }>;
@@ -833,6 +1164,14 @@ export class MemoryStore {
     const chunksWithEmbeddings = (this.conn
       .prepare('SELECT COUNT(*) as cnt FROM chunks WHERE embedding IS NOT NULL')
       .get() as { cnt: number } | undefined)?.cnt ?? 0;
+    const chunksWithDenseEmbeddings = (this.conn
+      .prepare('SELECT COUNT(*) as cnt FROM chunks WHERE embedding_dense IS NOT NULL')
+      .get() as { cnt: number } | undefined)?.cnt ?? 0;
+    const denseEmbeddingModels = (this.conn
+      .prepare(`SELECT COALESCE(embedding_dense_model, '(unknown)') as model, COUNT(*) as count
+                FROM chunks WHERE embedding_dense IS NOT NULL
+                GROUP BY embedding_dense_model ORDER BY count DESC`)
+      .all() as Array<{ model: string; count: number }>);
     const pinnedChunks = (this.conn
       .prepare('SELECT COUNT(*) as cnt FROM chunks WHERE pinned = 1')
       .get() as { cnt: number } | undefined)?.cnt ?? 0;
@@ -853,6 +1192,8 @@ export class MemoryStore {
     return {
       totalChunks,
       chunksWithEmbeddings,
+      chunksWithDenseEmbeddings,
+      denseEmbeddingModels,
       pinnedChunks,
       perAgent,
       perCategory,
@@ -1248,7 +1589,9 @@ export class MemoryStore {
                   c.pinned, bm25(chunks_fts) as score
            FROM chunks_fts f
            JOIN chunks c ON c.id = f.rowid
-           WHERE chunks_fts MATCH ?`;
+           LEFT JOIN chunk_soft_deletes sd ON sd.chunk_id = c.id
+           WHERE chunks_fts MATCH ?
+             AND sd.chunk_id IS NULL`;
       const params: any[] = [sanitized];
 
       if (isolateAgentSlug) {
@@ -1368,32 +1711,37 @@ export class MemoryStore {
     }
 
     // If agent specified: hard isolation = only own + global; soft = mix with extra global
+    // Soft-delete filter for all branches: LEFT JOIN chunk_soft_deletes and
+    // require the join row to be NULL.
+    const sdJoin = ' LEFT JOIN chunk_soft_deletes sd ON sd.chunk_id = c.id ';
+    const sdFilter = ' AND sd.chunk_id IS NULL ';
+
     if (agentSlug) {
       if (strict) {
-        // Hard isolation: own chunks + global in one query
         const rows = this.conn.prepare(
-          `SELECT id, source_file, section, content, chunk_type,
-                  updated_at, salience, last_outcome_score, agent_slug, category, topic
-           FROM chunks
-           WHERE (agent_slug = ? OR agent_slug IS NULL)${filterSql}
-           ORDER BY updated_at DESC LIMIT ?`,
+          `SELECT c.id, c.source_file, c.section, c.content, c.chunk_type,
+                  c.updated_at, c.salience, c.last_outcome_score, c.agent_slug, c.category, c.topic
+           FROM chunks c${sdJoin}
+           WHERE (c.agent_slug = ? OR c.agent_slug IS NULL)${sdFilter}${filterSql.replace(/(?<!c\.)agent_slug|(?<!c\.)category|(?<!c\.)topic/g, m => 'c.' + m)}
+           ORDER BY c.updated_at DESC LIMIT ?`,
         ).all(agentSlug, ...filterParams, limit) as ChunkRow[];
         return rows.map(mapRow);
       }
 
-      // Soft isolation: weighted mix — 60% agent, 40% global
       const agentRows = this.conn.prepare(
-        `SELECT id, source_file, section, content, chunk_type,
-                updated_at, salience, last_outcome_score, agent_slug, category, topic
-         FROM chunks WHERE agent_slug = ?${filterSql}
-         ORDER BY updated_at DESC LIMIT ?`,
+        `SELECT c.id, c.source_file, c.section, c.content, c.chunk_type,
+                c.updated_at, c.salience, c.last_outcome_score, c.agent_slug, c.category, c.topic
+         FROM chunks c${sdJoin}
+         WHERE c.agent_slug = ?${sdFilter}${filterSql.replace(/(?<!c\.)agent_slug|(?<!c\.)category|(?<!c\.)topic/g, m => 'c.' + m)}
+         ORDER BY c.updated_at DESC LIMIT ?`,
       ).all(agentSlug, ...filterParams, Math.ceil(limit * 0.6)) as ChunkRow[];
 
       const globalRows = this.conn.prepare(
-        `SELECT id, source_file, section, content, chunk_type,
-                updated_at, salience, last_outcome_score, agent_slug, category, topic
-         FROM chunks WHERE agent_slug IS NULL${filterSql}
-         ORDER BY updated_at DESC LIMIT ?`,
+        `SELECT c.id, c.source_file, c.section, c.content, c.chunk_type,
+                c.updated_at, c.salience, c.last_outcome_score, c.agent_slug, c.category, c.topic
+         FROM chunks c${sdJoin}
+         WHERE c.agent_slug IS NULL${sdFilter}${filterSql.replace(/(?<!c\.)agent_slug|(?<!c\.)category|(?<!c\.)topic/g, m => 'c.' + m)}
+         ORDER BY c.updated_at DESC LIMIT ?`,
       ).all(...filterParams, Math.ceil(limit * 0.4)) as ChunkRow[];
 
       return [...agentRows, ...globalRows].slice(0, limit).map(mapRow);
@@ -1401,11 +1749,11 @@ export class MemoryStore {
 
     const rows = this.conn
       .prepare(
-        `SELECT id, source_file, section, content, chunk_type,
-                updated_at, salience, last_outcome_score, agent_slug, category, topic
-         FROM chunks
-         WHERE 1=1${filterSql}
-         ORDER BY updated_at DESC
+        `SELECT c.id, c.source_file, c.section, c.content, c.chunk_type,
+                c.updated_at, c.salience, c.last_outcome_score, c.agent_slug, c.category, c.topic
+         FROM chunks c${sdJoin}
+         WHERE 1=1${sdFilter}${filterSql.replace(/(?<!c\.)agent_slug|(?<!c\.)category|(?<!c\.)topic/g, m => 'c.' + m)}
+         ORDER BY c.updated_at DESC
          LIMIT ?`,
       )
       .all(...filterParams, limit) as ChunkRow[];
@@ -1426,7 +1774,21 @@ export class MemoryStore {
    */
   searchContext(
     query: string,
-    limitOrOpts: number | { limit?: number; recencyLimit?: number; agentSlug?: string; category?: string; topic?: string; strict?: boolean } = 3,
+    limitOrOpts: number | {
+      limit?: number;
+      recencyLimit?: number;
+      agentSlug?: string;
+      category?: string;
+      topic?: string;
+      strict?: boolean;
+      sessionKey?: string;
+      messageId?: string;
+      skipTrace?: boolean;
+      /** Pre-computed dense query vector. When provided, use the dense
+       *  embedding column for vector search. Caller computes this via
+       *  embedDense() (async) so this method can stay sync. */
+      queryDenseVec?: Float32Array;
+    } = 3,
     recencyLimitArg: number = 5,
   ): SearchResult[] {
     let limit: number;
@@ -1435,6 +1797,10 @@ export class MemoryStore {
     let category: string | undefined;
     let topic: string | undefined;
     let strict: boolean = false;
+    let sessionKey: string | undefined;
+    let messageId: string | undefined;
+    let skipTrace: boolean = false;
+    let queryDenseVec: Float32Array | undefined;
     if (typeof limitOrOpts === 'object') {
       limit = limitOrOpts.limit ?? 3;
       recencyLimit = limitOrOpts.recencyLimit ?? 5;
@@ -1442,6 +1808,10 @@ export class MemoryStore {
       category = limitOrOpts.category;
       topic = limitOrOpts.topic;
       strict = limitOrOpts.strict ?? false;
+      sessionKey = limitOrOpts.sessionKey;
+      messageId = limitOrOpts.messageId;
+      skipTrace = limitOrOpts.skipTrace ?? false;
+      queryDenseVec = limitOrOpts.queryDenseVec;
     } else {
       limit = limitOrOpts;
       recencyLimit = recencyLimitArg;
@@ -1495,17 +1865,25 @@ export class MemoryStore {
       }
     }
 
-    // 2. Vector similarity (if embeddings available)
+    // 2. Vector similarity. Prefer dense if a pre-computed query vector
+    // was passed in (caller did the async embedDense up the stack). Fall
+    // back to TF-IDF if no dense vec available — keeps single-process
+    // sync paths and tests working without the model loaded.
     let vectorResults: SearchResult[] = [];
-    try {
-      if (embeddingsModule.isReady()) {
-        const queryVec = embeddingsModule.embed(query);
-        if (queryVec) {
-          vectorResults = this.searchByEmbedding(queryVec, limit, agentSlug, strict);
+    if (queryDenseVec && queryDenseVec.length > 0) {
+      try {
+        vectorResults = this.searchByDenseEmbedding(queryDenseVec, limit, agentSlug, strict);
+      } catch { /* dense search failed — leave empty */ }
+    }
+    if (vectorResults.length === 0) {
+      try {
+        if (embeddingsModule.isReady()) {
+          const queryVec = embeddingsModule.embed(query);
+          if (queryVec) {
+            vectorResults = this.searchByEmbedding(queryVec, limit, agentSlug, strict);
+          }
         }
-      }
-    } catch {
-      // Embeddings not available — fallback to FTS only
+      } catch { /* embeddings not available — fall through */ }
     }
 
     // 3. Recency
@@ -1513,7 +1891,389 @@ export class MemoryStore {
 
     // 4. Merge and deduplicate (FTS results first, then vector, then recency)
     const merged = [...ftsResults, ...vectorResults, ...recentResults];
-    return mmrRerank(deduplicateResults(merged), 0.7, limit + recencyLimit);
+    const finalResults = mmrRerank(deduplicateResults(merged), 0.7, limit + recencyLimit);
+
+    // 5. Log recall trace if session context provided. Skipped for internal
+    // calls (e.g. consolidation, dedup checks) by passing skipTrace=true.
+    if (sessionKey && !skipTrace && finalResults.length > 0) {
+      this.logRecallTrace({
+        sessionKey,
+        messageId: messageId ?? null,
+        query,
+        chunkIds: finalResults.map(r => r.chunkId),
+        scores: finalResults.map(r => r.score),
+        agentSlug: agentSlug ?? null,
+      });
+    }
+
+    return finalResults;
+  }
+
+  /**
+   * Log a recall trace — which chunks were retrieved for a given query/message.
+   * Powers dashboard "🧠 N sources" affordance and retrieval debugging.
+   * Non-fatal: errors are swallowed so retrieval never fails on logging issues.
+   */
+  logRecallTrace(opts: {
+    sessionKey: string;
+    messageId?: string | null;
+    query: string;
+    chunkIds: number[];
+    scores: number[];
+    agentSlug?: string | null;
+  }): void {
+    if (opts.chunkIds.length === 0) return;
+    try {
+      this.conn.prepare(
+        `INSERT INTO recall_traces (session_key, message_id, query, chunk_ids, scores, agent_slug)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+      ).run(
+        opts.sessionKey,
+        opts.messageId ?? null,
+        opts.query,
+        JSON.stringify(opts.chunkIds),
+        JSON.stringify(opts.scores),
+        opts.agentSlug ?? null,
+      );
+    } catch {
+      // Non-fatal — recall trace logging never breaks retrieval
+    }
+  }
+
+  /**
+   * Fetch recent recall traces for a session, newest first.
+   * Used by the dashboard chat panel to show "what memory powered this answer".
+   */
+  getRecentRecallTraces(sessionKey: string, limit = 50): Array<{
+    id: number;
+    messageId: string | null;
+    query: string;
+    chunkIds: number[];
+    scores: number[];
+    retrievedAt: string;
+  }> {
+    const rows = this.conn.prepare(
+      `SELECT id, message_id, query, chunk_ids, scores, retrieved_at
+       FROM recall_traces
+       WHERE session_key = ?
+       ORDER BY retrieved_at DESC, id DESC
+       LIMIT ?`,
+    ).all(sessionKey, limit) as Array<{
+      id: number;
+      message_id: string | null;
+      query: string;
+      chunk_ids: string;
+      scores: string;
+      retrieved_at: string;
+    }>;
+
+    return rows.map((r) => ({
+      id: r.id,
+      messageId: r.message_id,
+      query: r.query,
+      chunkIds: this._parseJsonArray<number>(r.chunk_ids),
+      scores: this._parseJsonArray<number>(r.scores),
+      retrievedAt: r.retrieved_at,
+    }));
+  }
+
+  /**
+   * Fetch a single recall trace by id, with hydrated chunk details.
+   * Used for the dashboard "view sources" expansion on a single message.
+   */
+  getRecallTrace(traceId: number): {
+    id: number;
+    sessionKey: string | null;
+    messageId: string | null;
+    query: string;
+    retrievedAt: string;
+    chunks: Array<{
+      id: number;
+      sourceFile: string;
+      section: string;
+      content: string;
+      chunkType: string;
+      score: number;
+      pinned: boolean;
+      consolidated: boolean;
+      derivedFrom: number[] | null;
+    }>;
+  } | null {
+    const trace = this.conn.prepare(
+      `SELECT id, session_key, message_id, query, chunk_ids, scores, retrieved_at
+       FROM recall_traces WHERE id = ?`,
+    ).get(traceId) as {
+      id: number;
+      session_key: string | null;
+      message_id: string | null;
+      query: string;
+      chunk_ids: string;
+      scores: string;
+      retrieved_at: string;
+    } | undefined;
+    if (!trace) return null;
+
+    const chunkIds = this._parseJsonArray<number>(trace.chunk_ids);
+    const scores = this._parseJsonArray<number>(trace.scores);
+    const chunks = this.getChunksByIds(chunkIds);
+    // Re-order chunks to match trace order, attach scores
+    const byId = new Map(chunks.map(c => [c.id, c]));
+    const ordered: Array<{
+      id: number;
+      sourceFile: string;
+      section: string;
+      content: string;
+      chunkType: string;
+      score: number;
+      pinned: boolean;
+      consolidated: boolean;
+      derivedFrom: number[] | null;
+    }> = [];
+    chunkIds.forEach((id, idx) => {
+      const c = byId.get(id);
+      if (c) ordered.push({ ...c, score: scores[idx] ?? 0 });
+    });
+
+    return {
+      id: trace.id,
+      sessionKey: trace.session_key,
+      messageId: trace.message_id,
+      query: trace.query,
+      retrievedAt: trace.retrieved_at,
+      chunks: ordered,
+    };
+  }
+
+  /**
+   * Fetch chunks by id with provenance fields. Used by recall trace hydration
+   * and the "view source memories" link on consolidated chunks (derived_from).
+   */
+  getChunksByIds(chunkIds: number[]): Array<{
+    id: number;
+    sourceFile: string;
+    section: string;
+    content: string;
+    chunkType: string;
+    agentSlug: string | null;
+    pinned: boolean;
+    consolidated: boolean;
+    derivedFrom: number[] | null;
+    salience: number;
+    updatedAt: string;
+  }> {
+    if (chunkIds.length === 0) return [];
+    const placeholders = chunkIds.map(() => '?').join(',');
+    const rows = this.conn.prepare(
+      `SELECT id, source_file, section, content, chunk_type, agent_slug,
+              pinned, consolidated, derived_from, salience, updated_at
+       FROM chunks WHERE id IN (${placeholders})`,
+    ).all(...chunkIds) as Array<{
+      id: number;
+      source_file: string;
+      section: string;
+      content: string;
+      chunk_type: string;
+      agent_slug: string | null;
+      pinned: number;
+      consolidated: number;
+      derived_from: string | null;
+      salience: number;
+      updated_at: string;
+    }>;
+
+    return rows.map((r) => ({
+      id: r.id,
+      sourceFile: r.source_file,
+      section: r.section,
+      content: r.content,
+      chunkType: r.chunk_type,
+      agentSlug: r.agent_slug,
+      pinned: !!r.pinned,
+      consolidated: !!r.consolidated,
+      derivedFrom: r.derived_from ? this._parseJsonArray<number>(r.derived_from) : null,
+      salience: r.salience,
+      updatedAt: r.updated_at,
+    }));
+  }
+
+  private _parseJsonArray<T>(json: string): T[] {
+    try {
+      const parsed = JSON.parse(json);
+      return Array.isArray(parsed) ? (parsed as T[]) : [];
+    } catch {
+      return [];
+    }
+  }
+
+  // ── User Mental Model ──────────────────────────────────────────────
+  //
+  // MemGPT-style core memory: a small, always-in-context surface for
+  // "what we know about the user" — identifiers, lasting preferences,
+  // active goals, relationships, agent persona. Editable by the agent
+  // via MCP tool and by the user via the dashboard.
+
+  /** The fixed slot vocabulary. Adding new slots is a code change so the
+   *  agent doesn't sprawl into ad-hoc namespaces. */
+  static readonly USER_MODEL_SLOTS = ['user_facts', 'goals', 'relationships', 'agent_persona'] as const;
+
+  /** Get a single user-model slot. Returns the global block (agent_slug NULL)
+   *  unless an explicit agent_slug is provided. */
+  getUserModelBlock(slot: string, agentSlug?: string | null): {
+    slot: string;
+    content: string;
+    charLimit: number;
+    agentSlug: string | null;
+    updatedAt: string;
+  } | null {
+    const row = this.conn.prepare(
+      `SELECT slot, content, char_limit, agent_slug, updated_at
+       FROM user_model_blocks
+       WHERE slot = ? AND COALESCE(agent_slug, '') = COALESCE(?, '')`,
+    ).get(slot, agentSlug ?? null) as {
+      slot: string;
+      content: string;
+      char_limit: number;
+      agent_slug: string | null;
+      updated_at: string;
+    } | undefined;
+    if (!row) return null;
+    return {
+      slot: row.slot,
+      content: row.content,
+      charLimit: row.char_limit,
+      agentSlug: row.agent_slug,
+      updatedAt: row.updated_at,
+    };
+  }
+
+  /** List every user-model slot (across all agents).
+   *  When agentSlug is provided, returns per-agent slots first (falling back
+   *  to global slots for any not yet customized for this agent). */
+  getAllUserModelBlocks(agentSlug?: string | null): Array<{
+    slot: string;
+    content: string;
+    charLimit: number;
+    agentSlug: string | null;
+    updatedAt: string;
+  }> {
+    if (agentSlug) {
+      // Layered view: agent-specific takes precedence over global.
+      const rows = this.conn.prepare(
+        `SELECT slot, content, char_limit, agent_slug, updated_at
+         FROM user_model_blocks
+         WHERE agent_slug = ? OR agent_slug IS NULL
+         ORDER BY slot ASC, agent_slug DESC`,
+      ).all(agentSlug) as Array<{
+        slot: string; content: string; char_limit: number; agent_slug: string | null; updated_at: string;
+      }>;
+      const seen = new Set<string>();
+      const out: Array<{ slot: string; content: string; charLimit: number; agentSlug: string | null; updatedAt: string }> = [];
+      for (const r of rows) {
+        if (seen.has(r.slot)) continue;
+        seen.add(r.slot);
+        out.push({
+          slot: r.slot, content: r.content, charLimit: r.char_limit,
+          agentSlug: r.agent_slug, updatedAt: r.updated_at,
+        });
+      }
+      return out;
+    }
+    const rows = this.conn.prepare(
+      `SELECT slot, content, char_limit, agent_slug, updated_at
+       FROM user_model_blocks
+       WHERE agent_slug IS NULL
+       ORDER BY slot ASC`,
+    ).all() as Array<{
+      slot: string; content: string; char_limit: number; agent_slug: string | null; updated_at: string;
+    }>;
+    return rows.map(r => ({
+      slot: r.slot, content: r.content, charLimit: r.char_limit,
+      agentSlug: r.agent_slug, updatedAt: r.updated_at,
+    }));
+  }
+
+  /** Replace the content of a single slot. Truncates to char_limit. */
+  setUserModelBlock(opts: {
+    slot: string;
+    content: string;
+    agentSlug?: string | null;
+    charLimit?: number;
+  }): { slot: string; content: string; truncated: boolean } {
+    const charLimit = opts.charLimit ?? 2000;
+    const truncated = opts.content.length > charLimit;
+    const content = truncated ? opts.content.slice(0, charLimit) : opts.content;
+
+    this.conn.prepare(
+      `INSERT INTO user_model_blocks (slot, content, char_limit, agent_slug, updated_at)
+       VALUES (?, ?, ?, ?, datetime('now'))
+       ON CONFLICT(slot, COALESCE(agent_slug, '')) DO UPDATE SET
+         content = excluded.content,
+         char_limit = excluded.char_limit,
+         updated_at = datetime('now')`,
+    ).run(opts.slot, content, charLimit, opts.agentSlug ?? null);
+
+    return { slot: opts.slot, content, truncated };
+  }
+
+  /** Append content to a slot, joined with a newline. Truncates oldest content
+   *  when char_limit would be exceeded so the most recent additions always fit. */
+  appendUserModelBlock(opts: {
+    slot: string;
+    content: string;
+    agentSlug?: string | null;
+  }): { slot: string; content: string; truncated: boolean } {
+    const existing = this.getUserModelBlock(opts.slot, opts.agentSlug ?? null);
+    const charLimit = existing?.charLimit ?? 2000;
+    const sep = existing?.content ? '\n' : '';
+    let merged = (existing?.content ?? '') + sep + opts.content;
+
+    let truncated = false;
+    if (merged.length > charLimit) {
+      // Keep the tail (most recent additions) — older entries fall off
+      merged = merged.slice(-charLimit);
+      truncated = true;
+    }
+
+    this.conn.prepare(
+      `INSERT INTO user_model_blocks (slot, content, char_limit, agent_slug, updated_at)
+       VALUES (?, ?, ?, ?, datetime('now'))
+       ON CONFLICT(slot, COALESCE(agent_slug, '')) DO UPDATE SET
+         content = excluded.content,
+         updated_at = datetime('now')`,
+    ).run(opts.slot, merged, charLimit, opts.agentSlug ?? null);
+
+    return { slot: opts.slot, content: merged, truncated };
+  }
+
+  /** Delete a single slot (resets to empty). */
+  deleteUserModelBlock(slot: string, agentSlug?: string | null): boolean {
+    const result = this.conn.prepare(
+      `DELETE FROM user_model_blocks
+       WHERE slot = ? AND COALESCE(agent_slug, '') = COALESCE(?, '')`,
+    ).run(slot, agentSlug ?? null);
+    return result.changes > 0;
+  }
+
+  /** Render the full user model as a single context-assembler-friendly block. */
+  renderUserModel(agentSlug?: string | null, maxChars = 8000): string {
+    const blocks = this.getAllUserModelBlocks(agentSlug ?? null);
+    const slotOrder = MemoryStore.USER_MODEL_SLOTS;
+    const labelMap: Record<string, string> = {
+      user_facts: 'User Facts',
+      goals: 'Active Goals',
+      relationships: 'Key Relationships',
+      agent_persona: 'Agent Persona',
+    };
+    const parts: string[] = [];
+    for (const slot of slotOrder) {
+      const block = blocks.find(b => b.slot === slot);
+      if (!block || !block.content.trim()) continue;
+      parts.push(`### ${labelMap[slot] ?? slot}\n${block.content.trim()}`);
+    }
+    if (parts.length === 0) return '';
+    let out = `## User Model\n\n${parts.join('\n\n')}`;
+    if (out.length > maxChars) out = out.slice(0, maxChars).replace(/\n[^\n]*$/, '\n…(truncated)');
+    return out;
   }
 
   /**
@@ -1525,10 +2285,15 @@ export class MemoryStore {
     // rows we'd immediately reject. Soft isolation (non-strict) still loads
     // all embeddings because the boost is applied post-scoring, but at
     // least strict mode no longer scans foreign-agent chunks.
-    let sql = 'SELECT id, source_file, section, content, chunk_type, embedding, salience, last_outcome_score, agent_slug, updated_at, category, topic FROM chunks WHERE embedding IS NOT NULL';
+    let sql = `SELECT c.id, c.source_file, c.section, c.content, c.chunk_type,
+                      c.embedding, c.salience, c.last_outcome_score, c.agent_slug,
+                      c.updated_at, c.category, c.topic
+                 FROM chunks c
+                 LEFT JOIN chunk_soft_deletes sd ON sd.chunk_id = c.id
+                 WHERE c.embedding IS NOT NULL AND sd.chunk_id IS NULL`;
     const params: Array<string | number> = [];
     if (strict && agentSlug) {
-      sql += ' AND (agent_slug IS NULL OR agent_slug = ?)';
+      sql += ' AND (c.agent_slug IS NULL OR c.agent_slug = ?)';
       params.push(agentSlug);
     }
     const rows = this.conn.prepare(sql).all(...params) as Array<{
@@ -1590,6 +2355,133 @@ export class MemoryStore {
     }
 
     return scored.sort((a, b) => b.score - a.score).slice(0, limit);
+  }
+
+  /**
+   * Dense-embedding search. Parallel to searchByEmbedding but uses the
+   * 768-dim neural embedding column instead of TF-IDF. Same scoring boosts
+   * and temporal decay so dense and sparse paths produce comparable scores
+   * for MMR rerank. The caller pre-computes queryVec via embedDense() —
+   * we don't compute it here because that would require this method to be
+   * async, which propagates up the entire searchContext chain.
+   */
+  private searchByDenseEmbedding(queryVec: Float32Array, limit: number, agentSlug?: string, strict = false): SearchResult[] {
+    let sql = `SELECT c.id, c.source_file, c.section, c.content, c.chunk_type,
+                      c.embedding_dense, c.salience, c.last_outcome_score, c.agent_slug,
+                      c.updated_at, c.category, c.topic
+                 FROM chunks c
+                 LEFT JOIN chunk_soft_deletes sd ON sd.chunk_id = c.id
+                 WHERE c.embedding_dense IS NOT NULL AND sd.chunk_id IS NULL`;
+    const params: Array<string | number> = [];
+    if (strict && agentSlug) {
+      sql += ' AND (c.agent_slug IS NULL OR c.agent_slug = ?)';
+      params.push(agentSlug);
+    }
+    const rows = this.conn.prepare(sql).all(...params) as Array<{
+      id: number;
+      source_file: string;
+      section: string;
+      content: string;
+      chunk_type: string;
+      embedding_dense: Buffer;
+      salience: number;
+      last_outcome_score: number | null;
+      agent_slug: string | null;
+      updated_at: string;
+      category: string | null;
+      topic: string | null;
+    }>;
+
+    const scored: SearchResult[] = [];
+    const nowMs = Date.now();
+    for (const row of rows) {
+      try {
+        const vec = embeddingsModule.deserializeEmbedding(row.embedding_dense);
+        const sim = embeddingsModule.cosineSimilarity(queryVec, vec);
+        if (sim < 0.3) continue; // dense models produce more confident similarities; raise threshold from 0.15
+        let score = sim * 10;
+        if (row.salience > 0) score *= (1.0 + row.salience);
+        const outcome = row.last_outcome_score ?? 0;
+        if (outcome !== 0) score *= 1.0 + 0.3 * outcome;
+        if (!strict && agentSlug && row.agent_slug === agentSlug) score *= 1.4;
+        if (row.updated_at) {
+          const daysOld = Math.max(0, (nowMs - new Date(row.updated_at).getTime()) / 86_400_000);
+          score *= Math.max(0.4, temporalDecay(daysOld, 30));
+        }
+        scored.push({
+          sourceFile: row.source_file,
+          section: row.section,
+          content: row.content,
+          score,
+          chunkType: row.chunk_type,
+          matchType: 'vector',
+          lastUpdated: row.updated_at,
+          chunkId: row.id,
+          salience: row.salience,
+          lastOutcomeScore: outcome,
+          agentSlug: row.agent_slug ?? undefined,
+          category: row.category,
+          topic: row.topic,
+        });
+      } catch { continue; }
+    }
+    return scored.sort((a, b) => b.score - a.score).slice(0, limit);
+  }
+
+  /**
+   * Backfill dense embeddings on chunks that don't yet have one (or that
+   * were embedded by an older model). Async because the dense model itself
+   * is async. Yields progress via callback so the CLI can show a counter.
+   */
+  async backfillDenseEmbeddings(opts: {
+    limit?: number;
+    onProgress?: (done: number, total: number) => void;
+    forceModel?: string;
+  } = {}): Promise<{ embedded: number; skipped: number; failed: number; model: string }> {
+    const currentModel = embeddingsModule.currentDenseModel();
+    const targetModel = opts.forceModel ?? currentModel;
+
+    // Only re-embed chunks that lack an embedding for the current model. Soft-deleted
+    // chunks are skipped; hard-deleted are gone naturally via the join.
+    const candidates = this.conn.prepare(
+      `SELECT c.id, c.content
+       FROM chunks c
+       LEFT JOIN chunk_soft_deletes sd ON sd.chunk_id = c.id
+       WHERE sd.chunk_id IS NULL
+         AND (c.embedding_dense IS NULL OR c.embedding_dense_model IS NULL OR c.embedding_dense_model != ?)
+         AND length(c.content) >= 1
+       ORDER BY c.updated_at DESC
+       ${opts.limit ? 'LIMIT ?' : ''}`,
+    ).all(...[targetModel, ...(opts.limit ? [opts.limit] : [])]) as Array<{ id: number; content: string }>;
+
+    const total = candidates.length;
+    let embedded = 0;
+    let failed = 0;
+
+    const updateStmt = this.conn.prepare(
+      `UPDATE chunks SET embedding_dense = ?, embedding_dense_model = ? WHERE id = ?`,
+    );
+
+    for (let i = 0; i < candidates.length; i++) {
+      const c = candidates[i];
+      try {
+        const vec = await embeddingsModule.embedDense(c.content, false);
+        if (vec) {
+          updateStmt.run(embeddingsModule.serializeEmbedding(vec), targetModel, c.id);
+          embedded++;
+        } else {
+          failed++;
+        }
+      } catch {
+        failed++;
+      }
+      if (opts.onProgress && (i + 1) % 25 === 0) {
+        opts.onProgress(i + 1, total);
+      }
+    }
+    if (opts.onProgress) opts.onProgress(total, total);
+
+    return { embedded, skipped: 0, failed, model: targetModel };
   }
 
   // ── Cross-agent learning: promote insight to global ──────────────
@@ -2585,6 +3477,7 @@ export class MemoryStore {
     accessLogRetentionDays?: number;
     transcriptRetentionDays?: number;
     behavioralRetentionDays?: number;
+    recallTraceRetentionDays?: number;
   } = {}): {
     episodicPruned: number;
     accessLogPruned: number;
@@ -2593,6 +3486,7 @@ export class MemoryStore {
     feedbackPruned: number;
     reflectionsPruned: number;
     usageLogPruned: number;
+    recallTracesPruned: number;
   } {
     const maxAge = opts.maxAgeDays ?? 90;
     const threshold = opts.salienceThreshold ?? 0.01;
@@ -2602,6 +3496,10 @@ export class MemoryStore {
     // (getFeedbackStats, getBehavioralPatterns, getSkillsToSuppress) has a
     // wide enough window to aggregate meaningful signal.
     const behavioralRetention = opts.behavioralRetentionDays ?? 180;
+    // Recall traces are written ~once per agent retrieval — high write volume.
+    // 90-day window is enough to debug "why did the agent answer that way last
+    // week" without letting the table grow unbounded.
+    const recallRetention = opts.recallTraceRetentionDays ?? 90;
 
     // Prune stale episodic chunks (not vault-sourced content)
     const episodicResult = this.conn
@@ -2651,6 +3549,17 @@ export class MemoryStore {
       .prepare(`DELETE FROM usage_log WHERE created_at < datetime('now', ?)`)
       .run(`-${Math.min(behavioralRetention, 90)} days`);
 
+    // Recall traces — bounded by retrieval frequency, can grow fast.
+    let recallTracesPruned = 0;
+    try {
+      const recallResult = this.conn
+        .prepare(`DELETE FROM recall_traces WHERE retrieved_at < datetime('now', ?)`)
+        .run(`-${recallRetention} days`);
+      recallTracesPruned = recallResult.changes;
+    } catch {
+      // Table may not exist on first boot before initialize() runs the new schema
+    }
+
     return {
       episodicPruned: episodicResult.changes,
       accessLogPruned: accessResult.changes,
@@ -2659,6 +3568,7 @@ export class MemoryStore {
       feedbackPruned: feedbackResult.changes,
       reflectionsPruned: reflectionsResult.changes,
       usageLogPruned: usageResult.changes,
+      recallTracesPruned,
     };
   }
 
@@ -3533,15 +4443,20 @@ export class MemoryStore {
   /**
    * Insert a summary chunk created by the consolidation engine.
    * Gets higher initial salience than regular chunks.
+   *
+   * `derivedFromIds` records the source chunks that fed into this summary.
+   * Stored as JSON in `chunks.derived_from` so the dashboard can show
+   * "view source memories" — abstractions become auditable.
    */
-  insertSummaryChunk(sourceFile: string, section: string, content: string): void {
+  insertSummaryChunk(sourceFile: string, section: string, content: string, derivedFromIds?: number[]): void {
     const hash = createHash('sha256').update(content).digest('hex').slice(0, 16);
+    const derivedJson = derivedFromIds && derivedFromIds.length > 0 ? JSON.stringify(derivedFromIds) : null;
     const result = this.conn
       .prepare(
-        `INSERT INTO chunks (source_file, section, content, chunk_type, content_hash, salience, consolidated)
-         VALUES (?, ?, ?, 'summary', ?, 0.8, 0)`,
+        `INSERT INTO chunks (source_file, section, content, chunk_type, content_hash, salience, consolidated, derived_from)
+         VALUES (?, ?, ?, 'summary', ?, 0.8, 0, ?)`,
       )
-      .run(sourceFile, section, content, hash);
+      .run(sourceFile, section, content, hash, derivedJson);
 
     // Immediately compute embedding so the summary is vector-searchable right away
     if (embeddingsModule.isReady()) {
