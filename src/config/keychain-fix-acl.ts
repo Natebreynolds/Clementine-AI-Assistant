@@ -161,7 +161,11 @@ function locateKeychain(service: Service, account: string): string | null {
   return m ? m[1]! : null;
 }
 
-export function fixAcl(service: Service, account: string): AclFixResult {
+export function fixAcl(
+  service: Service,
+  account: string,
+  opts: { keychainPassword?: string } = {},
+): AclFixResult {
   const keychainPath = locateKeychain(service, account);
   if (!keychainPath) {
     return {
@@ -173,25 +177,35 @@ export function fixAcl(service: Service, account: string): AclFixResult {
   }
   // Pass the keychain path as the trailing positional arg so partition-list
   // doesn't search the wrong store.
-  const args = [
+  const baseArgs = [
     'set-generic-password-partition-list',
     '-s', service,
     '-a', account,
     '-S', 'apple-tool:,apple:',
-    keychainPath,
   ];
+  // When a password is provided, pass it via -k and capture stdio so security
+  // doesn't prompt — that's the whole point. Without -k, security prompts on
+  // the inherited TTY for each entry, which means N entries = N prompts.
+  const args = opts.keychainPassword
+    ? [...baseArgs, '-k', opts.keychainPassword, keychainPath]
+    : [...baseArgs, keychainPath];
   const result = spawnSync('/usr/bin/security', args, {
-    stdio: 'inherit',
+    stdio: opts.keychainPassword ? ['ignore', 'pipe', 'pipe'] : 'inherit',
     timeout: 120_000,
   });
   if (result.status === 0) {
     return { service, account, status: 'fixed' };
   }
+  // When stdio was captured, surface stderr in the error so callers can
+  // detect "wrong password" vs other failures.
+  const stderr = opts.keychainPassword && result.stderr
+    ? result.stderr.toString().trim().slice(0, 200)
+    : '';
   return {
     service,
     account,
     status: 'failed',
-    error: result.error?.message ?? `exit code ${result.status}`,
+    error: stderr || result.error?.message || `exit code ${result.status}`,
   };
 }
 
@@ -199,8 +213,14 @@ export function fixAcl(service: Service, account: string): AclFixResult {
  * Plan + apply: enumerate entries, fix each Clementine-shaped one in turn.
  * Foreign entries (other apps under the legacy "clementine" service) get
  * reported with status='skipped-foreign' and never touched.
+ *
+ * Pass opts.keychainPassword to authorize all entries with one stored password
+ * instead of one TTY prompt per entry — that's how the wizard avoids the
+ * 7-prompt bombardment.
  */
-export function fixAllClementineEntries(): AclFixResult[] {
+export function fixAllClementineEntries(
+  opts: { keychainPassword?: string } = {},
+): AclFixResult[] {
   const entries = listClementineKeychainEntries();
   const results: AclFixResult[] = [];
   for (const entry of entries) {
@@ -208,7 +228,7 @@ export function fixAllClementineEntries(): AclFixResult[] {
       results.push({ service: entry.service, account: entry.account, status: 'skipped-foreign' });
       continue;
     }
-    results.push(fixAcl(entry.service, entry.account));
+    results.push(fixAcl(entry.service, entry.account, opts));
   }
   return results;
 }

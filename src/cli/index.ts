@@ -1396,7 +1396,8 @@ async function cmdConfigHardenPermissions(opts: { dryRun?: boolean; json?: boole
 async function cmdConfigKeychainFixAcl(opts: { list?: boolean }): Promise<void> {
   const { listClementineKeychainEntries, fixAllClementineEntries } =
     await import('../config/keychain-fix-acl.js');
-  const { markKeychainWizardDone } = await import('../config/keychain-first-run-wizard.js');
+  const { markKeychainWizardDone, readPasswordFromTty } =
+    await import('../config/keychain-first-run-wizard.js');
 
   const DIM = '\x1b[0;90m';
   const BOLD = '\x1b[1m';
@@ -1426,34 +1427,53 @@ async function cmdConfigKeychainFixAcl(opts: { list?: boolean }): Promise<void> 
     return;
   }
 
+  console.log(`  ${DIM}Enter your macOS login password ONCE — it authorizes${RESET}`);
+  console.log(`  ${DIM}all ${entries.length} ACL update${entries.length === 1 ? '' : 's'} in a single pass. Not stored.${RESET}`);
+  console.log();
+  const password = await readPasswordFromTty(`  ${BOLD}macOS login password:${RESET} `);
+  if (!password) {
+    console.log();
+    console.log(`  ${YELLOW}Empty password — aborted.${RESET}`);
+    console.log();
+    return;
+  }
+
+  console.log();
   console.log(`  ${BOLD}Fixing ACLs...${RESET}`);
-  console.log(`  ${DIM}macOS may ask for your login keychain password (the system prompt — it DOES appear).${RESET}`);
-  console.log(`  ${DIM}You may also be asked to "Always Allow" — pick that.${RESET}`);
   console.log();
 
-  const results = fixAllClementineEntries();
+  const results = fixAllClementineEntries({ keychainPassword: password });
   let okCount = 0;
   let failCount = 0;
+  let wrongPasswordHit = false;
   for (const r of results) {
     if (r.status === 'fixed') {
       console.log(`    ${GREEN}✓${RESET} ${r.account}`);
       okCount++;
-    } else {
+    } else if (r.status === 'failed') {
       console.log(`    ${RED}✗${RESET} ${r.account} ${DIM}— ${r.error}${RESET}`);
       failCount++;
+      if (r.error && /MAC verification|AuthFailure|UserCanceled|-25293/i.test(r.error)) {
+        wrongPasswordHit = true;
+      }
     }
   }
   console.log();
   if (failCount === 0) {
     console.log(`  ${GREEN}All ${okCount} entries fixed.${RESET} ${DIM}Future reads via the security CLI succeed silently.${RESET}`);
+  } else if (wrongPasswordHit && okCount === 0) {
+    console.log(`  ${RED}Wrong password — no entries repaired.${RESET}`);
+    console.log(`  ${DIM}Re-run: clementine config keychain-fix-acl${RESET}`);
   } else {
     console.log(`  ${YELLOW}${okCount} fixed, ${failCount} failed.${RESET}`);
     console.log(`  ${DIM}Failed entries can be fixed manually in Keychain Access.app:${RESET}`);
     console.log(`  ${DIM}  search "clementine-agent" → double-click → Access Control → Allow all applications.${RESET}`);
   }
-  // Always mark the launch wizard satisfied — user has explicitly decided
-  // to deal with this via the manual command.
-  markKeychainWizardDone(BASE_DIR);
+  // Mark the launch wizard satisfied unless the password was clearly wrong —
+  // user has explicitly decided to deal with this via the manual command.
+  if (!(wrongPasswordHit && okCount === 0)) {
+    markKeychainWizardDone(BASE_DIR);
+  }
   console.log();
 }
 

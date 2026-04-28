@@ -1,6 +1,6 @@
 /**
  * One-time interactive wizard that repairs ACLs on legacy clementine-agent
- * keychain entries during `clementine launch`.
+ * keychain entries during `clementine launch` / `clementine update`.
  *
  * Why this exists: entries written before commit 88cfd99 used
  * `add-generic-password -T ''` (no apps pre-approved), so every Clementine
@@ -9,10 +9,11 @@
  * entries that need a one-time partition-list repair to stop the prompt
  * cascade.
  *
- * The manual fix is `clementine config keychain-fix-acl`. This wizard runs
- * the same fix automatically on the next `clementine launch` (where we
- * know we have a TTY for the macOS login-keychain password prompt), then
- * writes a sentinel so we never prompt again on this machine.
+ * macOS's `set-generic-password-partition-list` requires the login keychain
+ * password to authorize the ACL change — once per entry. To avoid prompting
+ * the user N times for N entries, we ask once via masked stdin, then pass
+ * the password to each call via -k. End result: one password entry, all
+ * entries fixed in one pass.
  *
  * Skipped when:
  *   - non-darwin platform (no keychain),
@@ -42,6 +43,66 @@ export function markKeychainWizardDone(baseDir: string): void {
   }
 }
 
+/**
+ * Read a line from the TTY without echoing characters. Each keypress shows
+ * an asterisk so the user has visual feedback for length. Returns the
+ * collected string. Ctrl-C aborts the process.
+ *
+ * Uses raw mode directly because Node's readline always echoes input.
+ * Exported so the manual `clementine config keychain-fix-acl` command can
+ * use the same one-prompt UX.
+ */
+export function readPasswordFromTty(prompt: string): Promise<string> {
+  return new Promise((resolve) => {
+    output.write(prompt);
+    let value = '';
+    const wasRaw = input.isRaw === true;
+    if (typeof input.setRawMode === 'function') input.setRawMode(true);
+    input.resume();
+    input.setEncoding('utf8');
+
+    const finish = (): void => {
+      input.removeListener('data', onData);
+      if (typeof input.setRawMode === 'function') input.setRawMode(wasRaw);
+      input.pause();
+      output.write('\n');
+      resolve(value);
+    };
+
+    const onData = (chunk: string): void => {
+      // Raw stdin can deliver multiple chars per chunk (paste, escape seqs).
+      for (const char of chunk) {
+        const code = char.charCodeAt(0);
+        // Ctrl-C → abort the process entirely (user wants out).
+        if (code === 0x03) {
+          output.write('\n');
+          process.exit(130);
+        }
+        // Enter (LF/CR) or Ctrl-D → submit whatever we have.
+        if (code === 0x0a || code === 0x0d || code === 0x04) {
+          finish();
+          return;
+        }
+        // Backspace (DEL or BS).
+        if (code === 0x7f || code === 0x08) {
+          if (value.length > 0) {
+            value = value.slice(0, -1);
+            output.write('\b \b');
+          }
+          continue;
+        }
+        // Printable ASCII + UTF-8 — skip anything else (arrow keys, escape seqs).
+        if (code >= 0x20 && code !== 0x7f) {
+          value += char;
+          output.write('*');
+        }
+      }
+    };
+
+    input.on('data', onData);
+  });
+}
+
 export async function runFirstRunKeychainWizardIfNeeded(baseDir: string): Promise<void> {
   if (process.platform !== 'darwin') return;
   if (!input.isTTY) return;
@@ -52,7 +113,6 @@ export async function runFirstRunKeychainWizardIfNeeded(baseDir: string): Promis
 
   const entries = listClementineKeychainEntries().filter((e) => e.isClementine);
   if (entries.length === 0) {
-    // Nothing to fix — write sentinel so we don't re-scan every launch.
     markKeychainWizardDone(baseDir);
     return;
   }
@@ -68,10 +128,11 @@ export async function runFirstRunKeychainWizardIfNeeded(baseDir: string): Promis
   console.log(`  ${BOLD}One-time keychain setup${RESET}`);
   console.log(`  ${DIM}${entries.length} keychain entr${entries.length === 1 ? 'y' : 'ies'} from a previous version need an${RESET}`);
   console.log(`  ${DIM}access-control update so Clementine can read them${RESET}`);
-  console.log(`  ${DIM}silently — otherwise macOS will prompt on every read.${RESET}`);
+  console.log(`  ${DIM}silently — otherwise macOS prompts on every read.${RESET}`);
   console.log();
-  console.log(`  ${DIM}macOS will ask once for your login-keychain password.${RESET}`);
-  console.log(`  ${DIM}After that, no more prompts. We won't ask again.${RESET}`);
+  console.log(`  ${DIM}You'll enter your macOS login password ONCE below —${RESET}`);
+  console.log(`  ${DIM}it authorizes all ACL updates in a single pass.${RESET}`);
+  console.log(`  ${DIM}Not stored. Won't ask again.${RESET}`);
   console.log();
 
   const rl = readline.createInterface({ input, output });
@@ -84,7 +145,16 @@ export async function runFirstRunKeychainWizardIfNeeded(baseDir: string): Promis
 
   if (answer === 'n' || answer === 'no') {
     console.log();
-    console.log(`  ${YELLOW}Skipped.${RESET} ${DIM}Run later with: clementine config keychain-fix-acl${RESET}`);
+    console.log(`  ${YELLOW}Skipped.${RESET} ${DIM}Run later: clementine config keychain-fix-acl${RESET}`);
+    console.log();
+    markKeychainWizardDone(baseDir);
+    return;
+  }
+
+  const password = await readPasswordFromTty(`  ${BOLD}macOS login password:${RESET} `);
+  if (!password) {
+    console.log();
+    console.log(`  ${YELLOW}Empty password — skipped.${RESET} ${DIM}Run later: clementine config keychain-fix-acl${RESET}`);
     console.log();
     markKeychainWizardDone(baseDir);
     return;
@@ -94,9 +164,10 @@ export async function runFirstRunKeychainWizardIfNeeded(baseDir: string): Promis
   console.log(`  ${BOLD}Repairing ACLs...${RESET}`);
   console.log();
 
-  const results = fixAllClementineEntries();
+  const results = fixAllClementineEntries({ keychainPassword: password });
   let okCount = 0;
   let failCount = 0;
+  let wrongPasswordHit = false;
   for (const r of results) {
     if (r.status === 'fixed') {
       console.log(`    ${GREEN}✓${RESET} ${r.account}`);
@@ -104,12 +175,20 @@ export async function runFirstRunKeychainWizardIfNeeded(baseDir: string): Promis
     } else if (r.status === 'failed') {
       console.log(`    ${RED}✗${RESET} ${r.account} ${DIM}— ${r.error ?? 'unknown'}${RESET}`);
       failCount++;
+      // security's stderr for a bad password contains "MAC verification failed"
+      // or similar. Catch the common shapes so we can re-prompt next launch.
+      if (r.error && /MAC verification|AuthFailure|UserCanceled|-25293/i.test(r.error)) {
+        wrongPasswordHit = true;
+      }
     }
   }
 
   console.log();
   if (failCount === 0) {
     console.log(`  ${GREEN}Done — ${okCount} entr${okCount === 1 ? 'y' : 'ies'} repaired.${RESET} ${DIM}Future reads silent.${RESET}`);
+  } else if (wrongPasswordHit && okCount === 0) {
+    console.log(`  ${RED}Wrong password — no entries repaired.${RESET}`);
+    console.log(`  ${DIM}We'll ask again on next launch.${RESET}`);
   } else {
     console.log(`  ${YELLOW}${okCount} fixed, ${failCount} failed.${RESET}`);
     console.log(`  ${DIM}Failed entries can be fixed manually in Keychain Access.app:${RESET}`);
@@ -117,7 +196,9 @@ export async function runFirstRunKeychainWizardIfNeeded(baseDir: string): Promis
   }
   console.log();
 
-  // Always mark done — even on partial failure we don't want to re-prompt
-  // every launch. The user can re-run the manual command if they want.
-  markKeychainWizardDone(baseDir);
+  // Don't write sentinel if the password was wrong AND nothing succeeded —
+  // let the user retry on the next launch. Any other outcome marks done.
+  if (!(wrongPasswordHit && okCount === 0)) {
+    markKeychainWizardDone(baseDir);
+  }
 }
