@@ -4442,6 +4442,52 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
     }
   });
 
+  // Seed the user model from existing memory — one-shot Haiku pass over
+  // MEMORY.md, top-salience chunks, and recent session summaries. Returns
+  // proposed values for each slot; the dashboard UI shows them in an
+  // editable review panel before applying. Nothing is written to
+  // user_model_blocks until the user clicks "Apply" on a slot.
+  app.post('/api/user-model/seed', async (_req, res) => {
+    try {
+      const gateway = await getGateway();
+      const store = (gateway as any).assistant?.memoryStore;
+      if (!store) {
+        res.status(503).json({ error: 'Memory store not available' });
+        return;
+      }
+      // Build the LLM caller using the same Claude Agent SDK pattern as
+      // periodic memory consolidation (see src/index.ts:684).
+      const { query } = await import('@anthropic-ai/claude-agent-sdk');
+      const llmCall = async (prompt: string): Promise<string> => {
+        try {
+          let result = '';
+          const stream = query({
+            prompt,
+            options: {
+              model: 'claude-haiku-4-5-20251001',
+              maxTurns: 1,
+              systemPrompt: 'You are a memory consolidation assistant. Extract only facts directly evidenced by the corpus. Be terse. Output exactly the requested format.',
+            },
+          });
+          for await (const msg of stream) {
+            if ((msg as { type?: string }).type === 'result') {
+              result = (msg as { result?: string }).result ?? '';
+            }
+          }
+          return result;
+        } catch {
+          return '';
+        }
+      };
+
+      const { seedUserModelFromMemory } = await import('../memory/seed-user-model.js');
+      const proposals = await seedUserModelFromMemory(store, llmCall);
+      res.json({ ok: true, proposals });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
   // ── Memory chunk CRUD (dashboard curation) ───────────────────────
   // Lets the user fix wrong/stale memory directly from the search panel
   // instead of having to wait for auto-extraction to drift in the right
@@ -10765,13 +10811,15 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
           <div style="color:var(--muted,#888);margin-bottom:12px;font-size:13px">
             What the agent always knows about you. These slots load into every conversation's context (above retrieved memory). Edit directly to correct or steer.
           </div>
-          <div style="display:flex;gap:8px;margin-bottom:12px;align-items:center">
+          <div style="display:flex;gap:8px;margin-bottom:12px;align-items:center;flex-wrap:wrap">
             <label style="font-size:13px;color:var(--text-secondary)">Scope:</label>
             <select id="user-model-scope" style="padding:6px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg-input);color:var(--text);font-size:13px" onchange="loadUserModel()">
               <option value="">Global</option>
             </select>
             <button class="btn" onclick="loadUserModel()" style="font-size:13px">Refresh</button>
+            <button class="btn-primary" onclick="seedUserModel()" style="font-size:13px;margin-left:auto" title="One-shot Haiku pass over MEMORY.md + top-salience chunks + recent sessions to propose initial slot values. Review and apply per-slot.">✨ Seed from existing memory</button>
           </div>
+          <div id="user-model-seed-panel" style="display:none;margin-bottom:14px"></div>
           <div id="user-model-panel"><div class="empty-state">Loading user model…</div></div>
         </div>
 
