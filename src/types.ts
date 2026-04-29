@@ -844,6 +844,15 @@ export interface RemoteAccessConfig {
   lastStarted?: string;
 }
 
+export interface SessionRecord {
+  id: string;
+  expiresAt: number;
+  persistent: boolean;
+  createdAt: number;
+  lastUsedAt: number;
+  userAgent?: string;
+}
+
 // ── Agent Config Revisions ──────────────────────────────────────────
 
 export interface ConfigRevision {

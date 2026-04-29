@@ -29,10 +29,10 @@ import matter from 'gray-matter';
 import cron from 'node-cron';
 import type { Gateway } from '../gateway/router.js';
 import { TunnelManager } from './tunnel.js';
-import type { RemoteAccessConfig } from '../types.js';
+import type { RemoteAccessConfig, SessionRecord } from '../types.js';
 import { AgentManager } from '../agent/agent-manager.js';
 import { discoverMcpServers, getClaudeIntegrations } from '../agent/mcp-bridge.js';
-import { AGENTS_DIR } from '../config.js';
+import { AGENTS_DIR, SESSIONS_FILE } from '../config.js';
 import { parseTasks } from '../tools/shared.js';
 import { todayISO } from '../gateway/cron-scheduler.js';
 import { goalsRouter } from './routes/goals.js';
@@ -1452,46 +1452,94 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
 
   // ── Remote access + session management ─────────────────────────────
   const remoteConfig = loadRemoteConfig();
-  const sessions = new Map<string, number>(); // sessionId → expiresAt
+  const sessions = new Map<string, SessionRecord>();
   let tunnelManager: TunnelManager | null = null;
-  const SESSION_MAX_AGE = 24 * 60 * 60 * 1000; // 24 hours
+  const SESSION_TTL_DEFAULT = 24 * 60 * 60 * 1000;       // 24 hours
+  const SESSION_TTL_PERSISTENT = 30 * 24 * 60 * 60 * 1000; // 30 days
   const loginRateLimit = { count: 0, resetAt: Date.now() + 15 * 60 * 1000 };
+
+  function loadSessions(): void {
+    if (!existsSync(SESSIONS_FILE)) return;
+    try {
+      const raw = JSON.parse(readFileSync(SESSIONS_FILE, 'utf-8')) as SessionRecord[];
+      const now = Date.now();
+      for (const s of raw) {
+        if (s && s.id && s.expiresAt > now) sessions.set(s.id, s);
+      }
+    } catch { /* corrupt file — start fresh */ }
+  }
+
+  function persistSessions(): void {
+    try {
+      writeFileSync(SESSIONS_FILE, JSON.stringify(Array.from(sessions.values()), null, 2), { mode: 0o600 });
+    } catch { /* best-effort; in-memory store still works */ }
+  }
+
+  loadSessions();
 
   function isRemoteRequest(req: express.Request): boolean {
     // cloudflared sets CF-Connecting-IP for tunneled traffic
     return Boolean(req.headers['cf-connecting-ip']);
   }
 
-  function hasValidSession(req: express.Request): boolean {
+  function readSessionId(req: express.Request): string | null {
     const cookie = req.headers.cookie ?? '';
     const match = cookie.match(/__clem_session=([a-f0-9]+)/);
-    if (!match) return false;
-    const sessionId = match[1];
-    const expiresAt = sessions.get(sessionId);
-    if (!expiresAt || Date.now() > expiresAt) {
-      sessions.delete(sessionId);
+    return match ? match[1] : null;
+  }
+
+  function hasValidSession(req: express.Request): boolean {
+    const sessionId = readSessionId(req);
+    if (!sessionId) return false;
+    const record = sessions.get(sessionId);
+    if (!record || Date.now() > record.expiresAt) {
+      if (record) {
+        sessions.delete(sessionId);
+        persistSessions();
+      }
       return false;
     }
+    record.lastUsedAt = Date.now();
+    // Don't persist on every request — the cleanup interval will pick it up
     return true;
   }
 
-  function createSession(res: express.Response): void {
+  function createSession(res: express.Response, req: express.Request, persistent = false): string {
     const sessionId = randomBytes(32).toString('hex');
-    sessions.set(sessionId, Date.now() + SESSION_MAX_AGE);
+    const ttl = persistent ? SESSION_TTL_PERSISTENT : SESSION_TTL_DEFAULT;
+    const now = Date.now();
+    const record: SessionRecord = {
+      id: sessionId,
+      expiresAt: now + ttl,
+      persistent,
+      createdAt: now,
+      lastUsedAt: now,
+      userAgent: typeof req.headers['user-agent'] === 'string' ? req.headers['user-agent'].slice(0, 200) : undefined,
+    };
+    sessions.set(sessionId, record);
+    persistSessions();
     res.cookie('__clem_session', sessionId, {
       httpOnly: true,
       sameSite: 'lax',
-      maxAge: SESSION_MAX_AGE,
+      maxAge: ttl,
       path: '/',
     });
+    return sessionId;
   }
 
-  // Clean expired sessions every 10 minutes
+  function revokeSession(sessionId: string): boolean {
+    const existed = sessions.delete(sessionId);
+    if (existed) persistSessions();
+    return existed;
+  }
+
+  // Clean expired sessions every 10 minutes; also persist lastUsedAt updates
   setInterval(() => {
     const now = Date.now();
-    for (const [id, exp] of sessions) {
-      if (now > exp) sessions.delete(id);
+    for (const [id, rec] of sessions) {
+      if (now > rec.expiresAt) sessions.delete(id);
     }
+    persistSessions();
   }, 10 * 60 * 1000);
 
   // Quick ping — bypasses all middleware, tests /api path routing
@@ -1717,7 +1765,7 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
       return;
     }
 
-    const { token } = req.body ?? {};
+    const { token, remember } = req.body ?? {};
     if (!token || typeof token !== 'string') {
       res.status(400).json({ error: 'Token is required' });
       return;
@@ -1734,13 +1782,49 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
       return;
     }
 
-    createSession(res);
+    createSession(res, req, Boolean(remember));
     res.json({ ok: true });
   });
 
-  app.get('/auth/logout', (_req, res) => {
+  app.get('/auth/logout', (req, res) => {
+    const sessionId = readSessionId(req);
+    if (sessionId) revokeSession(sessionId);
     res.clearCookie('__clem_session', { path: '/' });
     res.redirect('/');
+  });
+
+  // List active sessions (cookie-authenticated; bearer-token gate doesn't apply at /auth/*)
+  app.get('/auth/sessions', (req, res) => {
+    if (!hasValidSession(req)) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+    const currentId = readSessionId(req);
+    const list = Array.from(sessions.values())
+      .sort((a, b) => b.lastUsedAt - a.lastUsedAt)
+      .map(s => ({
+        id: s.id,
+        createdAt: s.createdAt,
+        lastUsedAt: s.lastUsedAt,
+        expiresAt: s.expiresAt,
+        persistent: s.persistent,
+        userAgent: s.userAgent ?? null,
+        current: s.id === currentId,
+      }));
+    res.json({ sessions: list });
+  });
+
+  app.delete('/auth/sessions/:id', (req, res) => {
+    if (!hasValidSession(req)) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+    const targetId = req.params.id;
+    const existed = revokeSession(targetId);
+    if (readSessionId(req) === targetId) {
+      res.clearCookie('__clem_session', { path: '/' });
+    }
+    res.json({ ok: existed });
   });
 
   // ── Anthropic OAuth routes ──────────────────────────────────────
@@ -10319,31 +10403,24 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
   <!-- Sidebar -->
   <nav class="sidebar">
     <div class="nav-section">
-      <div class="nav-section-title">Command Center</div>
+      <div class="nav-section-title">Today</div>
       <div class="nav-item active" data-page="home">
         <span class="nav-icon">&#9679;</span> Home
       </div>
       <div class="nav-item" data-page="chat">
         <span class="nav-icon">&#128172;</span> Chat
       </div>
-    </div>
-    <div class="nav-section">
-      <div class="nav-section-title">Build</div>
-      <div class="nav-item" data-page="builder">
-        <span class="nav-icon">&#128736;</span> Builder
+      <div class="nav-item" data-page="daily-plan">
+        <span class="nav-icon">&#128197;</span> Daily Plan
       </div>
-      <div class="nav-item" data-page="team">
-        <span class="nav-icon">&#128101;</span> The Office
-      </div>
-      <div class="nav-item" data-page="projects">
-        <span class="nav-icon">&#128194;</span> Projects
+      <div class="nav-item" data-page="goals">
+        <span class="nav-icon">&#127919;</span> Goals
       </div>
     </div>
     <div class="nav-section">
-      <div class="nav-section-title">Team</div>
-      <div id="team-nav"></div>
-      <div class="team-hire-btn" onclick="showAgentCreateModal()">
-        <span style="font-size:14px">+</span> Hire Agent
+      <div class="nav-section-title">Brain</div>
+      <div class="nav-item" data-page="intelligence">
+        <span class="nav-icon">&#129504;</span> Brain
       </div>
     </div>
     <div class="nav-section">
@@ -10352,28 +10429,60 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
         <span class="nav-icon">&#9200;</span> Scheduled Tasks
         <span class="nav-badge" id="nav-cron-count">0</span>
       </div>
-      <div class="nav-item" onclick="openSkillStudio()">
-        <span class="nav-icon">&#128161;</span> Skill Studio
+      <div class="nav-item" onclick="openAutomationsTab('skills')">
+        <span class="nav-icon">&#128737;</span> Skills
         <span class="nav-badge" id="nav-skill-count" style="display:none">0</span>
+      </div>
+      <div class="nav-item" onclick="openAutomationsTab('timers')">
+        <span class="nav-icon">&#9201;</span> Timers
       </div>
       <div class="nav-item" data-page="workflows">
         <span class="nav-icon">&#128260;</span> Workflows
       </div>
+      <div class="nav-item" data-page="unleashed">
+        <span class="nav-icon">&#128640;</span> Unleashed
+        <span class="nav-badge" id="nav-unleashed-count" style="display:none">0</span>
+      </div>
     </div>
     <div class="nav-section">
-      <div class="nav-section-title">Insights</div>
+      <div class="nav-section-title">Team</div>
+      <div class="nav-item" data-page="team">
+        <span class="nav-icon">&#128101;</span> The Office
+      </div>
       <div class="nav-item" data-page="team-status">
         <span class="nav-icon">&#128202;</span> Team Status
       </div>
-      <div class="nav-item" data-page="intelligence">
-        <span class="nav-icon">&#129504;</span> Brain
+      <div id="team-nav"></div>
+      <div class="team-hire-btn" onclick="showAgentCreateModal()">
+        <span style="font-size:14px">+</span> Hire Agent
       </div>
+    </div>
+    <div class="nav-section">
+      <div class="nav-section-title">Build</div>
+      <div class="nav-item" data-page="builder">
+        <span class="nav-icon">&#128736;</span> Builder
+      </div>
+      <div class="nav-item" onclick="openSkillStudio()">
+        <span class="nav-icon">&#128161;</span> Skill Studio
+      </div>
+      <div class="nav-item" data-page="projects">
+        <span class="nav-icon">&#128194;</span> Projects
+      </div>
+    </div>
+    <div class="nav-section">
+      <div class="nav-section-title">Insights</div>
       <div class="nav-item" data-page="claims">
         <span class="nav-icon">&#128274;</span> Trust &amp; Claims
         <span class="nav-badge" id="nav-trust-score" style="display:none">--</span>
       </div>
+      <div class="nav-item" data-page="metrics">
+        <span class="nav-icon">&#128200;</span> Metrics
+      </div>
       <div class="nav-item" data-page="logs">
         <span class="nav-icon">&#128220;</span> Logs
+      </div>
+      <div class="nav-item" data-page="sessions">
+        <span class="nav-icon">&#128221;</span> Sessions
       </div>
     </div>
     <div class="nav-section">
@@ -10475,50 +10584,26 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
         </div>
       </div>
 
-      <!-- Home Tabs: Activity | Metrics | Agents | Sessions -->
-      <div class="tab-bar" id="home-tabs">
-        <button class="active" onclick="switchTab('home','activity')">Activity</button>
-        <button onclick="switchTab('home','metrics')">Metrics</button>
-        <button onclick="switchTab('home','agents')">Agents</button>
-        <button onclick="switchTab('home','sessions')">Sessions</button>
-      </div>
-      <div id="home-tab-content">
-        <div class="tab-pane active" id="tab-home-activity">
-          <div class="card">
-            <div class="card-header" style="display:flex;justify-content:space-between;align-items:center">
-              <span>Live Activity</span>
-              <div style="display:flex;gap:6px;align-items:center">
-                <select id="activity-source-filter" onchange="refreshActivity()" style="font-size:11px;padding:2px 6px;border:1px solid var(--border);border-radius:4px;background:var(--bg-secondary);color:var(--text-primary)">
-                  <option value="">All Sources</option>
-                  <option value="cron">Cron</option>
-                  <option value="activity">Activities</option>
-                  <option value="send">Emails</option>
-                  <option value="approval">Approvals</option>
-                  <option value="memory">Memory</option>
-                </select>
-                <select id="activity-agent-filter" onchange="refreshActivity()" style="font-size:11px;padding:2px 6px;border:1px solid var(--border);border-radius:4px;background:var(--bg-secondary);color:var(--text-primary)">
-                  <option value="">All Agents</option>
-                </select>
-              </div>
-            </div>
-            <div class="card-body" id="panel-activity"><div class="empty-state">Loading...</div></div>
+      <!-- Live Activity feed — primary home content. Metrics, Sessions, and per-agent stats moved to dedicated sidebar pages. -->
+      <div class="card">
+        <div class="card-header" style="display:flex;justify-content:space-between;align-items:center">
+          <span>Live Activity</span>
+          <div style="display:flex;gap:6px;align-items:center">
+            <select id="activity-source-filter" onchange="refreshActivity()" style="font-size:11px;padding:2px 6px;border:1px solid var(--border);border-radius:4px;background:var(--bg-secondary);color:var(--text-primary)">
+              <option value="">All Sources</option>
+              <option value="cron">Cron</option>
+              <option value="activity">Activities</option>
+              <option value="send">Emails</option>
+              <option value="approval">Approvals</option>
+              <option value="memory">Memory</option>
+            </select>
+            <select id="activity-agent-filter" onchange="refreshActivity()" style="font-size:11px;padding:2px 6px;border:1px solid var(--border);border-radius:4px;background:var(--bg-secondary);color:var(--text-primary)">
+              <option value="">All Agents</option>
+            </select>
           </div>
         </div>
-        <div class="tab-pane" id="tab-home-metrics">
-          <div id="metrics-content-home"><div class="empty-state">Loading metrics...</div></div>
-        </div>
-        <div class="tab-pane" id="tab-home-agents">
-          <div id="panel-agents-compare"><div class="empty-state">Loading agent stats...</div></div>
-        </div>
-        <div class="tab-pane" id="tab-home-sessions">
-          <div id="panel-sessions-home"><div class="empty-state">Loading sessions...</div></div>
-        </div>
+        <div class="card-body" id="panel-activity"><div class="empty-state">Loading...</div></div>
       </div>
-
-      <div class="card" id="claude-integrations-widget" style="display:none;margin-top:16px"></div>
-      <div class="card" id="mcp-status-widget" style="display:none;margin-top:16px"></div>
-      <!-- Hidden: Quick controls data target (kept for refreshStatus compat) -->
-      <div id="panel-controls" style="display:none"></div>
     </div>
 
     <!-- ═══ Builder Page — Conversational Artifact Creation ═══ -->
@@ -11927,8 +12012,10 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
       </script>
     </div>
 
-    <!-- Hidden: Sessions (shown in Home tabs in Phase 2) -->
-    <div class="page" id="page-sessions" style="display:none">
+    <!-- ═══ Sessions Page ═══ -->
+    <div class="page" id="page-sessions">
+      <div class="page-title">Sessions</div>
+      <p style="color:var(--text-muted);margin-bottom:16px">Active conversation sessions across channels. Each session is a continuous thread with one user.</p>
       <div id="panel-sessions"><div class="empty-state">Loading...</div></div>
     </div>
 
@@ -12010,8 +12097,10 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
       </div>
     </div>
 
-    <!-- Hidden: Metrics (shown in Home tabs in Phase 2) -->
-    <div class="page" id="page-metrics" style="display:none">
+    <!-- ═══ Metrics Page ═══ -->
+    <div class="page" id="page-metrics">
+      <div class="page-title">Metrics</div>
+      <p style="color:var(--text-muted);margin-bottom:16px">Time-saved estimates, run success rates, and per-job breakdowns.</p>
       <div id="metrics-content"><div class="empty-state">Loading metrics...</div></div>
     </div>
 
@@ -12032,8 +12121,10 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
       </details>
     </div>
 
-    <!-- Hidden: Goals (moved to Agent Detail in Phase 3) -->
-    <div class="page" id="page-goals" style="display:none">
+    <!-- ═══ Goals Page ═══ -->
+    <div class="page" id="page-goals">
+      <div class="page-title">Goals</div>
+      <p style="color:var(--text-muted);margin-bottom:16px">Long-running objectives the team is contributing to. Tracks per-agent contribution and run success rate.</p>
       <div id="goals-progress-content"><div class="empty-state">Loading goals...</div></div>
     </div>
 
@@ -12260,6 +12351,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
       <div class="tab-bar" id="settings-tabs">
         <button class="active" onclick="switchTab('settings','general')">General</button>
         <button onclick="switchTab('settings','remote')">Remote Access</button>
+        <button onclick="switchTab('settings','security')">Security</button>
         <button onclick="switchTab('settings','integrations')">Integrations</button>
         <button onclick="switchTab('settings','notifications')">Notifications</button>
       </div>
@@ -12281,6 +12373,21 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
               <div class="empty-state">Loading...</div>
             </div>
           </div>
+        </div>
+        <div class="tab-pane" id="tab-settings-security">
+          <div class="card">
+            <div class="card-header" style="display:flex;align-items:center;justify-content:space-between">
+              <span>Active Sessions</span>
+              <button class="btn-sm" style="font-size:11px" onclick="refreshAuthSessions()">Refresh</button>
+            </div>
+            <div class="card-body" style="padding:0" id="sessions-list">
+              <div class="empty-state" style="padding:24px">Loading sessions...</div>
+            </div>
+          </div>
+          <p style="color:var(--text-muted);font-size:12px;margin-top:12px">
+            Sessions persist across daemon restarts. "Remember me" sessions last 30 days; standard sessions expire after 24 hours.
+            Revoke any device you no longer trust.
+          </p>
         </div>
         <div class="tab-pane" id="tab-settings-integrations">
           <div class="card" style="margin-bottom:20px">
@@ -12363,19 +12470,6 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
         <div class="tab-pane" id="tab-settings-notifications">
           <div id="digest-settings-content"><div class="empty-state">Loading...</div></div>
         </div>
-        <div class="tab-pane" id="tab-settings-projects">
-          <p style="color:var(--text-muted);margin-bottom:16px">Link projects to give Clementine automatic access to their tools and MCP servers. When you mention a linked project's keywords in chat, Clementine switches into that project's context automatically.</p>
-          <div class="card" style="margin-bottom:20px">
-            <div class="card-header" style="display:flex;align-items:center;justify-content:space-between">
-              <span>Workspace Directories</span>
-              <button class="btn btn-sm btn-primary" onclick="promptAddWorkspaceDir()" style="font-size:11px">+ Add Path</button>
-            </div>
-            <div class="card-body" id="workspace-dirs-list" style="font-size:13px">
-              <div class="empty-state">Loading...</div>
-            </div>
-          </div>
-          <div id="panel-projects"><div class="empty-state">Loading...</div></div>
-        </div>
       </div>
     </div>
 
@@ -12400,6 +12494,13 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
       <div class="page-title">Workflows</div>
       <p style="color:var(--text-muted);margin-bottom:16px">Multi-step pipelines that orchestrate agents, tools, and data. Define workflows as .md files in <code>vault/00-System/workflows/</code>.</p>
       <div id="panel-workflows-page"><div class="empty-state">Loading workflows...</div></div>
+    </div>
+
+    <!-- ═══ Unleashed Page ═══ -->
+    <div class="page" id="page-unleashed">
+      <div class="page-title">Unleashed</div>
+      <p style="color:var(--text-muted);margin-bottom:16px">Long-running autonomous tasks that work in phases with checkpointing. Cancel a task by dropping a CANCEL marker — the agent stops at the next phase boundary.</p>
+      <div id="panel-unleashed"><div class="empty-state">Loading...</div></div>
     </div>
 
   </div><!-- /content -->
@@ -13061,11 +13162,79 @@ function navigateTo(page, opts) {
   if (page === 'team') { refreshTeam(); }
   if (page === 'projects') { refreshProjects(); }
   if (page === 'workflows') { refreshWorkflows(); }
+  if (page === 'unleashed') { refreshUnleashed(); }
+  if (page === 'goals') { refreshGoalsProgress(); }
+  if (page === 'metrics') { refreshMetrics(); }
+  if (page === 'sessions') { refreshSessions(); }
+  if (page === 'daily-plan') { refreshDailyPlan(); }
   if (page === 'agent-detail' && opts.agentSlug != null) {
     currentAgentSlug = opts.agentSlug;
     renderAgentDetail(opts.agentSlug);
   }
   closeSidebar();
+}
+
+// Shortcut nav items that drop into a sub-tab on the Automations page
+function openAutomationsTab(tab) {
+  navigateTo('automations');
+  setTimeout(function() { switchTab('automations', tab); }, 0);
+}
+
+async function refreshUnleashed() {
+  var el = document.getElementById('panel-unleashed');
+  if (!el) return;
+  try {
+    var r = await apiFetch('/api/unleashed');
+    var d = await r.json();
+    var tasks = d.tasks || [];
+    var badge = document.getElementById('nav-unleashed-count');
+    if (badge) {
+      var running = tasks.filter(function(t) { return t.status === 'running'; }).length;
+      if (running > 0) { badge.style.display = ''; badge.textContent = String(running); }
+      else { badge.style.display = 'none'; }
+    }
+    if (tasks.length === 0) {
+      el.innerHTML = '<div class="empty-state" style="padding:24px">No unleashed tasks. Schedule a cron job in <a href="#" onclick="navigateTo(\\'automations\\');return false">Scheduled Tasks</a> with mode = "unleashed" to start one.</div>';
+      return;
+    }
+    var html = '<table style="width:100%;border-collapse:collapse;font-size:13px"><thead><tr style="border-bottom:1px solid var(--border);background:var(--bg-tertiary)">';
+    html += '<th style="padding:8px 12px;text-align:left;color:var(--text-muted);font-weight:600">Task</th>';
+    html += '<th style="padding:8px 12px;text-align:left;color:var(--text-muted);font-weight:600">Status</th>';
+    html += '<th style="padding:8px 12px;text-align:left;color:var(--text-muted);font-weight:600">Phase</th>';
+    html += '<th style="padding:8px 12px;text-align:left;color:var(--text-muted);font-weight:600">Started</th>';
+    html += '<th style="padding:8px 12px;text-align:right;color:var(--text-muted);font-weight:600">Action</th>';
+    html += '</tr></thead><tbody>';
+    tasks.forEach(function(t) {
+      var statusColor = t.status === 'running' ? 'var(--green)' : t.status === 'completed' ? 'var(--blue)' : t.status === 'cancelled' ? 'var(--text-muted)' : 'var(--orange)';
+      html += '<tr style="border-bottom:1px solid var(--border)">';
+      html += '<td style="padding:10px 12px;font-weight:600">' + esc(t.name || '—') + '</td>';
+      html += '<td style="padding:10px 12px"><span style="color:' + statusColor + ';font-size:11px;font-weight:600;text-transform:uppercase">' + esc(t.status || 'unknown') + '</span></td>';
+      html += '<td style="padding:10px 12px;color:var(--text-muted)">' + esc(t.phase != null ? String(t.phase) : '—') + '</td>';
+      html += '<td style="padding:10px 12px;color:var(--text-muted)">' + esc(t.startedAt || '—') + '</td>';
+      html += '<td style="padding:10px 12px;text-align:right">';
+      if (t.status === 'running') {
+        html += '<button class="btn-sm" style="font-size:11px;color:#ef4444" onclick="cancelUnleashed(\\'' + esc(t.name) + '\\')">Cancel</button>';
+      }
+      html += '</td></tr>';
+    });
+    html += '</tbody></table>';
+    el.innerHTML = html;
+  } catch (ex) {
+    el.innerHTML = '<div class="empty-state" style="padding:24px">Error: ' + esc(String(ex)) + '</div>';
+  }
+}
+
+async function cancelUnleashed(name) {
+  if (!confirm('Cancel unleashed task "' + name + '"? It will stop at the next phase boundary.')) return;
+  try {
+    var r = await apiFetch('/api/unleashed/' + encodeURIComponent(name) + '/cancel', { method: 'POST' });
+    var d = await r.json();
+    if (d.ok) toast('Cancel requested', 'success');
+    else toast(d.error || 'Cancel failed', 'error');
+    refreshUnleashed();
+  } catch (ex) {
+    toast('Cancel failed: ' + ex, 'error');
+  }
 }
 
 // Bind static nav items
@@ -13105,17 +13274,94 @@ function switchTab(group, tab) {
     if (tab === 'graph') refreshGraph();
     if (tab === 'memory') refreshMemory();
   }
-  if (group === 'home') {
-    if (tab === 'metrics') refreshHomeMetrics();
-    if (tab === 'sessions') refreshHomeSessions();
-    if (tab === 'activity') refreshActivity();
-    if (tab === 'agents') refreshAgentComparison();
-  }
   if (group === 'settings') {
     if (tab === 'integrations') refreshSalesforce();
-    if (tab === 'projects') refreshProjects();
     if (tab === 'remote') refreshRemoteAccess();
+    if (tab === 'security') refreshAuthSessions();
     if (tab === 'notifications') refreshDigestSettings();
+  }
+}
+
+async function refreshAuthSessions() {
+  var el = document.getElementById('sessions-list');
+  if (!el) return;
+  try {
+    var r = await fetch('/auth/sessions', { credentials: 'same-origin' });
+    if (!r.ok) {
+      if (r.status === 401) {
+        el.innerHTML = '<div class="empty-state" style="padding:24px">Session-based view is only available for tunneled remote access. Localhost runs do not need login.</div>';
+        return;
+      }
+      el.innerHTML = '<div class="empty-state" style="padding:24px">Failed to load sessions.</div>';
+      return;
+    }
+    var d = await r.json();
+    var rows = (d.sessions || []);
+    if (rows.length === 0) {
+      el.innerHTML = '<div class="empty-state" style="padding:24px">No active sessions.</div>';
+      return;
+    }
+    function fmt(t) {
+      if (!t) return '—';
+      var diff = Date.now() - t;
+      var s = Math.floor(diff / 1000);
+      if (s < 60) return s + 's ago';
+      if (s < 3600) return Math.floor(s / 60) + 'm ago';
+      if (s < 86400) return Math.floor(s / 3600) + 'h ago';
+      return Math.floor(s / 86400) + 'd ago';
+    }
+    function fmtExpires(t) {
+      var diff = t - Date.now();
+      if (diff <= 0) return 'expired';
+      var d = Math.floor(diff / 86400000);
+      if (d > 1) return 'in ' + d + ' days';
+      var h = Math.floor(diff / 3600000);
+      if (h > 1) return 'in ' + h + ' hours';
+      return 'in ' + Math.floor(diff / 60000) + ' min';
+    }
+    var html = '<table style="width:100%;border-collapse:collapse;font-size:13px">';
+    html += '<thead><tr style="border-bottom:1px solid var(--border);background:var(--bg-tertiary)">';
+    html += '<th style="padding:8px 12px;text-align:left;color:var(--text-muted);font-weight:600">Device</th>';
+    html += '<th style="padding:8px 12px;text-align:left;color:var(--text-muted);font-weight:600">Created</th>';
+    html += '<th style="padding:8px 12px;text-align:left;color:var(--text-muted);font-weight:600">Last used</th>';
+    html += '<th style="padding:8px 12px;text-align:left;color:var(--text-muted);font-weight:600">Expires</th>';
+    html += '<th style="padding:8px 12px;text-align:right;color:var(--text-muted);font-weight:600">Action</th>';
+    html += '</tr></thead><tbody>';
+    rows.forEach(function(s) {
+      var ua = s.userAgent || 'Unknown device';
+      var label = s.persistent ? '<span style="background:#f97316;color:#fff;padding:1px 6px;border-radius:3px;font-size:10px;margin-left:6px">Remember</span>' : '';
+      var current = s.current ? '<span style="background:#10b981;color:#fff;padding:1px 6px;border-radius:3px;font-size:10px;margin-left:6px">This device</span>' : '';
+      html += '<tr style="border-bottom:1px solid var(--border)">';
+      html += '<td style="padding:10px 12px;max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(ua) + label + current + '</td>';
+      html += '<td style="padding:10px 12px;color:var(--text-muted)">' + fmt(s.createdAt) + '</td>';
+      html += '<td style="padding:10px 12px;color:var(--text-muted)">' + fmt(s.lastUsedAt) + '</td>';
+      html += '<td style="padding:10px 12px;color:var(--text-muted)">' + fmtExpires(s.expiresAt) + '</td>';
+      html += '<td style="padding:10px 12px;text-align:right">';
+      html += '<button class="btn-sm" style="font-size:11px;color:#ef4444" onclick="revokeSession(\\'' + esc(s.id) + '\\',' + (s.current ? 'true' : 'false') + ')">Revoke</button>';
+      html += '</td></tr>';
+    });
+    html += '</tbody></table>';
+    el.innerHTML = html;
+  } catch (ex) {
+    el.innerHTML = '<div class="empty-state" style="padding:24px">Error: ' + esc(String(ex)) + '</div>';
+  }
+}
+
+async function revokeSession(id, isCurrent) {
+  var msg = isCurrent
+    ? 'Revoke this session? You will be signed out immediately.'
+    : 'Revoke this session?';
+  if (!confirm(msg)) return;
+  try {
+    var r = await fetch('/auth/sessions/' + encodeURIComponent(id), { method: 'DELETE', credentials: 'same-origin' });
+    if (!r.ok) { alert('Revoke failed'); return; }
+    if (isCurrent) {
+      window.location.href = '/';
+      return;
+    }
+    refreshAuthSessions();
+  } catch (ex) {
+    alert('Revoke failed: ' + ex);
   }
 }
 
@@ -21538,6 +21784,14 @@ function getLoginPageHTML(): string {
     margin-top: 24px; font-size: 12px;
     color: #475569; text-align: center; line-height: 1.5;
   }
+  .remember-row {
+    display: flex; align-items: center; gap: 8px;
+    margin: 16px 0; font-size: 13px; color: #94a3b8;
+    cursor: pointer; user-select: none;
+  }
+  .remember-row input[type="checkbox"] {
+    accent-color: #f97316; width: 14px; height: 14px; cursor: pointer;
+  }
 </style>
 </head>
 <body>
@@ -21551,6 +21805,10 @@ function getLoginPageHTML(): string {
         <input type="password" class="form-input" id="token-input"
           placeholder="clem_XXXX-XXXX-XXXX" autocomplete="off" autofocus>
       </div>
+      <label class="remember-row">
+        <input type="checkbox" id="remember-input">
+        <span>Remember me on this device for 30 days</span>
+      </label>
       <button type="submit" class="btn-login" id="login-btn">Sign In</button>
       <div class="error-msg" id="error-msg"></div>
     </form>
@@ -21565,6 +21823,7 @@ function getLoginPageHTML(): string {
       var btn = document.getElementById('login-btn');
       var err = document.getElementById('error-msg');
       var token = document.getElementById('token-input').value.trim();
+      var remember = document.getElementById('remember-input').checked;
       if (!token) return;
       btn.disabled = true;
       btn.textContent = 'Signing in...';
@@ -21573,7 +21832,7 @@ function getLoginPageHTML(): string {
         var r = await fetch('/auth/login', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ token: token })
+          body: JSON.stringify({ token: token, remember: remember })
         });
         var d = await r.json();
         if (d.ok) {

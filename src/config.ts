@@ -506,6 +506,9 @@ export const ADVISOR_LOG_PATH = path.join(BASE_DIR, 'cron', 'advisor-decisions.j
 
 export const REMOTE_ACCESS_CONFIG = path.join(BASE_DIR, 'remote-access.json');
 
+/** Persistent session store for the dashboard /auth flow (mode 0600 enforced on write). */
+export const SESSIONS_FILE = path.join(BASE_DIR, '.sessions.json');
+
 // ── Source Self-Edit Staging ─────────────────────────────────────────
 
 export const STAGING_DIR = path.join(BASE_DIR, 'staging');
