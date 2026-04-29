@@ -18269,13 +18269,16 @@ function _renderBuilderCanvas(drawflowData) {
   editor.reroute = true;
   editor.editor_mode = 'edit';
   editor.start();
+  // Assign global BEFORE decoration runs — decoration reads node data via
+  // editor.export() to recover stepIds (Drawflow doesn't preserve our
+  // df-* attrs without a template).
+  _builderCanvasEditor = editor;
   try {
     editor.import(drawflowData || { drawflow: { Home: { data: {} } } });
     _decorateBuilderNodes(host, _builderCanvasLastWorkflow);
   } catch (err) {
     host.innerHTML = '<div style="padding:24px;color:var(--red)">Failed to render canvas: ' + esc(String(err)) + '</div>';
   }
-  _builderCanvasEditor = editor;
   _bindBuilderCanvasEvents(editor);
 }
 
