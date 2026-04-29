@@ -2462,6 +2462,30 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
     }
   });
 
+  app.delete('/api/builder/workflows/:id', async (req, res) => {
+    try {
+      const id = decodeURIComponent(req.params.id);
+      const [{ readWorkflow, parseBuilderId }, { emitBuilderEvent }] = await Promise.all([
+        import('../dashboard/builder/serializer.js'),
+        import('../dashboard/builder/events.js'),
+      ]);
+      const parsed = parseBuilderId(id);
+      if (!parsed) { res.status(400).json({ error: 'Bad id' }); return; }
+      if (parsed.origin === 'cron') {
+        res.status(400).json({ error: 'Cron entries: use workflow_set_enabled false (or edit CRON.md directly).' });
+        return;
+      }
+      const wf = readWorkflow(id);
+      if (!wf) { res.status(404).json({ error: 'Not found' }); return; }
+      const { unlinkSync, existsSync } = await import('node:fs');
+      if (wf.sourceFile && existsSync(wf.sourceFile)) unlinkSync(wf.sourceFile);
+      emitBuilderEvent({ type: 'workflow:deleted', workflowId: id });
+      res.json({ ok: true });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
   app.post('/api/builder/workflows/:id/save-from-drawflow', async (req, res) => {
     try {
       const id = decodeURIComponent(req.params.id);
@@ -8042,20 +8066,24 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
 </script>
 <link rel="icon" href="/icon.svg" type="image/svg+xml">
 <link rel="stylesheet" href="/static/drawflow.min.css">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap">
 <title>${name} Command Center</title>
 <style>
   :root {
-    --bg-primary: #f5f6f8;
+    /* ── Slate palette (chromatic, not pure neutral) ── */
+    --bg-primary: #f8fafc;
     --bg-secondary: #ffffff;
-    --bg-card: rgba(255,255,255,0.95);
-    --bg-hover: #eef1f5;
-    --bg-input: #f0f2f5;
-    --bg-tertiary: #ebedf0;
-    --border: #d8dde5;
-    --border-light: #c5ccd6;
-    --text-primary: #1a1a2e;
-    --text-secondary: #5a6070;
-    --text-muted: #8a92a0;
+    --bg-card: rgba(255,255,255,0.96);
+    --bg-hover: #f1f5f9;
+    --bg-input: #f8fafc;
+    --bg-tertiary: #e2e8f0;
+    --border: #cbd5e1;
+    --border-light: #e2e8f0;
+    --text-primary: #0f172a;
+    --text-secondary: #475569;
+    --text-muted: #94a3b8;
     --accent: #4d9eff;
     --accent-glow: rgba(43, 125, 233, 0.10);
     --purple: #7c3aed;
@@ -8064,56 +8092,122 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
     --clementine-dark: #e67a10;
     --clementine-glow: rgba(255, 140, 33, 0.10);
     --clementine-bg: rgba(255, 140, 33, 0.08);
-    --green: #2ea043;
-    --green-bg: rgba(46, 160, 67, 0.12);
-    --red: #e5534b;
-    --red-bg: rgba(229, 83, 75, 0.12);
-    --yellow: #d4a72c;
-    --yellow-bg: rgba(212, 167, 44, 0.12);
-    --orange: #f0883e;
-    --shadow-sm: 0 2px 8px rgba(0,0,0,0.06);
-    --shadow-md: 0 8px 24px rgba(0,0,0,0.12);
-    --sidebar-w: 220px;
-    --header-h: 56px;
-    --radius: 10px;
-    --radius-sm: 5px;
+    --green: #16a34a;
+    --green-bg: rgba(22, 163, 74, 0.10);
+    --red: #ef4444;
+    --red-bg: rgba(239, 68, 68, 0.10);
+    --yellow: #ca8a04;
+    --yellow-bg: rgba(202, 138, 4, 0.10);
+    /* ── Shadows (softer + more elevated) ── */
+    --shadow-xs: 0 1px 2px rgba(15, 23, 42, 0.04);
+    --shadow-sm: 0 1px 3px rgba(15, 23, 42, 0.06), 0 1px 2px rgba(15, 23, 42, 0.04);
+    --shadow-md: 0 4px 12px rgba(15, 23, 42, 0.08), 0 2px 4px rgba(15, 23, 42, 0.06);
+    --shadow-lg: 0 12px 32px rgba(15, 23, 42, 0.12), 0 4px 8px rgba(15, 23, 42, 0.08);
+    /* ── Layout ── */
+    --sidebar-w: 200px;
+    --header-h: 52px;
+    /* ── Radius scale (tightened) ── */
+    --radius-xs: 4px;
+    --radius-sm: 6px;
+    --radius-md: 8px;
+    --radius-lg: 12px;
+    --radius-xl: 16px;
+    --radius: 8px;             /* alias for legacy callers */
+    /* ── Type scale ── */
+    --text-xs: 11px;
+    --text-sm: 12px;
+    --text-base: 13px;
+    --text-md: 14px;
+    --text-lg: 16px;
+    --text-xl: 20px;
+    --text-2xl: 24px;
+    /* ── Motion ── */
+    --motion-fast: 100ms cubic-bezier(0.4, 0, 0.2, 1);
+    --motion: 150ms cubic-bezier(0.4, 0, 0.2, 1);
+    --motion-slow: 300ms cubic-bezier(0.4, 0, 0.2, 1);
+    /* ── Focus ring ── */
+    --ring: 0 0 0 2px var(--clementine), 0 0 0 4px rgba(255, 140, 33, 0.18);
   }
   [data-theme="dark"] {
-    --bg-primary: #0d1117;
-    --bg-secondary: #161b22;
-    --bg-card: rgba(22,27,34,0.95);
-    --bg-hover: #1c2129;
-    --bg-input: #21262d;
-    --bg-tertiary: #1c2129;
-    --border: #30363d;
-    --border-light: #3d444d;
-    --text-primary: #e6edf3;
-    --text-secondary: #9dacba;
-    --text-muted: #7d8590;
-    --accent: #58a6ff;
-    --accent-glow: rgba(88, 166, 255, 0.12);
-    --purple: #a371f7;
+    --bg-primary: #0b0f17;
+    --bg-secondary: #131923;
+    --bg-card: rgba(19, 25, 35, 0.96);
+    --bg-hover: #1a212d;
+    --bg-input: #1a212d;
+    --bg-tertiary: #1f2733;
+    --border: #2d3748;
+    --border-light: #1f2733;
+    --text-primary: #e2e8f0;
+    --text-secondary: #94a3b8;
+    --text-muted: #64748b;
+    --accent: #60a5fa;
+    --accent-glow: rgba(96, 165, 250, 0.12);
+    --purple: #a78bfa;
     --clementine: #ffa54f;
     --clementine-dark: #ff8c21;
-    --clementine-glow: rgba(255, 165, 79, 0.12);
+    --clementine-glow: rgba(255, 165, 79, 0.14);
     --clementine-bg: rgba(255, 165, 79, 0.08);
-    --green: #3fb950;
-    --green-bg: rgba(63, 185, 80, 0.15);
-    --red: #f85149;
-    --red-bg: rgba(248, 81, 73, 0.15);
-    --yellow: #d29922;
-    --yellow-bg: rgba(210, 153, 34, 0.15);
-    --orange: #f0883e;
-    --shadow-sm: 0 2px 8px rgba(0,0,0,0.3);
-    --shadow-md: 0 8px 24px rgba(0,0,0,0.5);
+    --green: #22c55e;
+    --green-bg: rgba(34, 197, 94, 0.14);
+    --red: #f87171;
+    --red-bg: rgba(248, 113, 113, 0.14);
+    --yellow: #eab308;
+    --yellow-bg: rgba(234, 179, 8, 0.14);
+    --shadow-xs: 0 1px 2px rgba(0, 0, 0, 0.4);
+    --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.5), 0 1px 2px rgba(0, 0, 0, 0.3);
+    --shadow-md: 0 4px 12px rgba(0, 0, 0, 0.5), 0 2px 4px rgba(0, 0, 0, 0.3);
+    --shadow-lg: 0 12px 32px rgba(0, 0, 0, 0.6), 0 4px 8px rgba(0, 0, 0, 0.4);
+    --ring: 0 0 0 2px var(--clementine), 0 0 0 4px rgba(255, 165, 79, 0.22);
+  }
+  /* OS-preference dark mode unless user has explicitly chosen a theme */
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme]) {
+      --bg-primary: #0b0f17;
+      --bg-secondary: #131923;
+      --bg-card: rgba(19, 25, 35, 0.96);
+      --bg-hover: #1a212d;
+      --bg-input: #1a212d;
+      --bg-tertiary: #1f2733;
+      --border: #2d3748;
+      --border-light: #1f2733;
+      --text-primary: #e2e8f0;
+      --text-secondary: #94a3b8;
+      --text-muted: #64748b;
+      --accent: #60a5fa;
+      --accent-glow: rgba(96, 165, 250, 0.12);
+      --purple: #a78bfa;
+      --clementine: #ffa54f;
+      --clementine-glow: rgba(255, 165, 79, 0.14);
+      --clementine-bg: rgba(255, 165, 79, 0.08);
+      --green: #22c55e;
+      --green-bg: rgba(34, 197, 94, 0.14);
+      --red: #f87171;
+      --red-bg: rgba(248, 113, 113, 0.14);
+      --yellow: #eab308;
+      --yellow-bg: rgba(234, 179, 8, 0.14);
+      --shadow-xs: 0 1px 2px rgba(0, 0, 0, 0.4);
+      --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.5), 0 1px 2px rgba(0, 0, 0, 0.3);
+      --shadow-md: 0 4px 12px rgba(0, 0, 0, 0.5), 0 2px 4px rgba(0, 0, 0, 0.3);
+      --shadow-lg: 0 12px 32px rgba(0, 0, 0, 0.6), 0 4px 8px rgba(0, 0, 0, 0.4);
+    }
   }
   * { margin: 0; padding: 0; box-sizing: border-box; }
+  *:focus-visible {
+    outline: none;
+    box-shadow: var(--ring);
+    border-radius: var(--radius-xs);
+  }
   body {
-    font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', system-ui, sans-serif;
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+    font-feature-settings: 'cv02', 'cv11', 'ss01', 'ss03';
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
     background: var(--bg-primary);
     color: var(--text-primary);
     min-height: 100vh;
     overflow: hidden;
+    font-size: var(--text-base);
+    line-height: 1.5;
   }
 
   /* ── Layout ─────────────────────────────── */
@@ -8248,41 +8342,58 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
     display: flex;
     align-items: center;
     gap: 10px;
-    padding: 8px 12px;
+    padding: 7px 10px;
     border-radius: var(--radius-sm);
-    font-size: 13px;
+    font-size: var(--text-base);
+    font-weight: 500;
     color: var(--text-secondary);
     cursor: pointer;
-    transition: all 0.15s;
+    transition: background var(--motion), color var(--motion);
     user-select: none;
+    position: relative;
   }
   .nav-item:hover {
     background: var(--bg-hover);
     color: var(--text-primary);
   }
   .nav-item.active {
-    background: var(--clementine-glow);
+    background: linear-gradient(90deg, rgba(255,140,33,0.14) 0%, rgba(255,140,33,0.06) 100%);
     color: var(--clementine);
+    font-weight: 600;
+  }
+  .nav-item.active::before {
+    content: '';
+    position: absolute;
+    left: 0;
+    top: 6px;
+    bottom: 6px;
+    width: 3px;
+    background: var(--clementine);
+    border-radius: 0 2px 2px 0;
   }
   .nav-icon {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
     width: 18px;
-    text-align: center;
-    font-size: 14px;
+    height: 18px;
     flex-shrink: 0;
+    color: currentColor;
   }
+  .nav-icon .icn { width: 16px; height: 16px; }
   .nav-badge {
     margin-left: auto;
     background: var(--bg-hover);
     color: var(--text-muted);
-    font-size: 10px;
+    font-size: var(--text-xs);
     font-weight: 600;
-    padding: 2px 7px;
+    padding: 1px 7px;
     border-radius: 10px;
     min-width: 18px;
     text-align: center;
   }
   .nav-item.active .nav-badge {
-    background: var(--clementine-glow);
+    background: rgba(255,140,33,0.18);
     color: var(--clementine);
   }
 
@@ -8301,44 +8412,47 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
     letter-spacing: -0.02em;
   }
 
-  /* ── Standard page header (.page-head) — applied to most info pages ── */
+  /* ── Standard page header (.page-head) — refined for v1.4 ── */
   .page-head {
     display: flex;
-    align-items: flex-start;
+    align-items: center;
     gap: 14px;
-    padding: 18px 22px 14px;
+    padding: 20px 24px 16px;
     border-bottom: 1px solid var(--border);
-    margin-bottom: 18px;
+    margin-bottom: 20px;
     flex-wrap: wrap;
+    position: relative;
+    background: linear-gradient(180deg, rgba(255,140,33,0.025) 0%, transparent 70%);
   }
   .page-head .icon {
-    width: 36px;
-    height: 36px;
-    border-radius: 8px;
-    background: linear-gradient(135deg, rgba(255,140,33,0.15), rgba(255,140,33,0.04));
+    width: 32px;
+    height: 32px;
+    border-radius: var(--radius-sm);
+    background: var(--clementine-bg);
     color: var(--clementine);
     display: flex;
     align-items: center;
     justify-content: center;
-    font-size: 20px;
     flex-shrink: 0;
   }
+  .page-head .icon .icn { width: 18px; height: 18px; }
   .page-head .title-block {
     flex: 1;
     min-width: 220px;
   }
   .page-head .title-block h1 {
-    font-size: 20px;
+    font-size: var(--text-xl);
     font-weight: 600;
     margin: 0 0 2px;
-    letter-spacing: -0.01em;
+    letter-spacing: -0.02em;
     color: var(--text-primary);
+    line-height: 1.2;
   }
   .page-head .title-block .desc {
-    font-size: 13px;
+    font-size: var(--text-base);
     color: var(--text-muted);
     margin: 0;
-    line-height: 1.4;
+    line-height: 1.45;
   }
   .page-head .actions {
     display: flex;
@@ -8347,7 +8461,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
     flex-wrap: wrap;
   }
   .page-section {
-    padding: 0 22px 22px;
+    padding: 0 24px 24px;
   }
   /* ── First-time empty state with CTA (use when there's truly no data yet) ── */
   .empty-cta {
@@ -8435,6 +8549,24 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
 
   /* Cmd+K palette */
   .cmdk-row:hover { background: var(--bg-hover) !important; }
+
+  /* ── Lucide stroke icons (vendored) ── */
+  .icn {
+    display: inline-block;
+    vertical-align: middle;
+    width: 16px;
+    height: 16px;
+    stroke: currentColor;
+    stroke-width: 2;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+    fill: none;
+    flex-shrink: 0;
+  }
+  .icn-sm { width: 14px; height: 14px; }
+  .icn-md { width: 18px; height: 18px; }
+  .icn-lg { width: 22px; height: 22px; stroke-width: 1.75; }
+  .icn-xl { width: 28px; height: 28px; stroke-width: 1.5; }
 
   /* ── Home layout — chat-first daily driver ─── */
   .home-layout {
@@ -8785,38 +8917,58 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
     background: currentColor;
   }
 
-  /* ── Buttons ────────────────────────────── */
+  /* ── Buttons (v1.4 refresh) ─────────────────── */
   button, .btn {
-    background: var(--bg-hover);
+    background: var(--bg-secondary);
     color: var(--text-primary);
-    border: 1px solid var(--border-light);
+    border: 1px solid var(--border);
     border-radius: var(--radius-sm);
-    padding: 6px 14px;
-    font-size: 12px;
+    padding: 7px 14px;
+    font-size: var(--text-base);
     font-weight: 500;
     cursor: pointer;
-    transition: all 0.15s;
+    transition: background var(--motion), border-color var(--motion), color var(--motion), transform var(--motion-fast), box-shadow var(--motion);
     font-family: inherit;
+    line-height: 1.2;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    white-space: nowrap;
   }
   button:hover, .btn:hover {
-    background: var(--border-light);
+    background: var(--bg-hover);
+    border-color: var(--border-light);
   }
-  .btn-sm { padding: 4px 10px; font-size: 11px; }
+  button:active, .btn:active { transform: translateY(1px); }
+  .btn-sm { padding: 4px 10px; font-size: var(--text-sm); border-radius: var(--radius-xs); }
+  .btn-lg { padding: 9px 18px; font-size: var(--text-md); }
   .btn-primary {
+    background: var(--clementine);
+    border-color: var(--clementine);
+    color: #fff;
+    box-shadow: var(--shadow-xs);
+  }
+  .btn-primary:hover {
+    background: var(--clementine-dark);
+    border-color: var(--clementine-dark);
+    box-shadow: var(--shadow-sm);
+  }
+  .btn-accent {
     background: var(--accent);
     border-color: var(--accent);
     color: #fff;
+    box-shadow: var(--shadow-xs);
   }
-  .btn-primary:hover {
-    background: #3d8ae8;
-    border-color: #3d8ae8;
-  }
+  .btn-accent:hover { filter: brightness(1.05); }
   .btn-success {
+    background: var(--bg-secondary);
     border-color: var(--green);
     color: var(--green);
   }
   .btn-success:hover { background: var(--green-bg); }
   .btn-danger {
+    background: var(--bg-secondary);
     border-color: var(--red);
     color: var(--red);
   }
@@ -8830,10 +8982,19 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
     background: var(--bg-hover);
     color: var(--text-primary);
   }
+  .btn-icon {
+    padding: 6px;
+    width: 32px;
+    height: 32px;
+    border-radius: var(--radius-sm);
+  }
+  .btn-icon.btn-sm { width: 26px; height: 26px; padding: 4px; }
   .btn-group {
     display: flex;
-    gap: 8px;
+    gap: 6px;
   }
+  .btn .icn { width: 14px; height: 14px; }
+  .btn-lg .icn { width: 16px; height: 16px; }
 
   /* ── Tables ─────────────────────────────── */
   table {
@@ -10022,16 +10183,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
     padding-top: 16px;
     border-top: 1px solid var(--border);
   }
-  .btn-primary {
-    background: var(--accent);
-    color: white;
-    border: none;
-    padding: 8px 20px;
-    border-radius: var(--radius);
-    font-weight: 600;
-    cursor: pointer;
-  }
-  .btn-primary:hover { opacity: 0.9; }
+  /* Disabled-state hooks for primary buttons (rest is unified above). */
   .btn-primary:disabled { opacity: 0.4; cursor: not-allowed; }
 
   /* ── Desk Stats Strip ─────────────────── */
@@ -10922,33 +11074,40 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
   .toggle-switch input:checked + .toggle-slider { background: var(--green); }
   .toggle-switch input:checked + .toggle-slider::before { transform: translateX(16px); }
 
-  /* ── Tab Bar ────────────────────────────── */
+  /* ── Tab Bar (v1.4 refresh) ─────────────────── */
   .tab-bar {
     display: flex;
     border-bottom: 1px solid var(--border);
     margin-bottom: 20px;
-    gap: 0;
+    gap: 4px;
     overflow-x: auto;
+    padding: 0 4px;
   }
   .tab-bar button {
     background: none;
     border: none;
-    padding: 10px 18px;
-    font-size: 13px;
+    padding: 10px 14px;
+    font-size: var(--text-base);
     font-weight: 500;
     color: var(--text-muted);
     cursor: pointer;
     border-bottom: 2px solid transparent;
     font-family: inherit;
-    transition: color 0.15s, border-color 0.15s;
+    transition: color var(--motion), border-color var(--motion), background var(--motion);
     white-space: nowrap;
     position: relative;
+    border-radius: var(--radius-xs) var(--radius-xs) 0 0;
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
   }
-  .tab-bar button:hover { color: var(--text-primary); }
+  .tab-bar button:hover { color: var(--text-primary); background: var(--bg-hover); }
   .tab-bar button.active {
-    color: var(--accent);
-    border-bottom-color: var(--accent);
+    color: var(--clementine);
+    border-bottom-color: var(--clementine);
+    background: transparent;
   }
+  .tab-bar button .icn { width: 14px; height: 14px; }
   .tab-bar .tab-badge {
     display: inline-flex;
     align-items: center;
@@ -11058,39 +11217,60 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
   <!-- Sidebar — 5 destinations only. Sub-pages live as tabs within each. -->
   <nav class="sidebar">
     <div class="nav-section">
-      <div class="nav-item active" data-page="home" title="Chat, today, activity">
-        <span class="nav-icon">&#127819;</span> Home
+      <div class="nav-item active" data-page="home" data-icon="home" title="Chat, today, activity">
+        <span class="nav-icon"></span> Home
       </div>
-      <div class="nav-item" data-page="build" title="Workflows, crons, skills">
-        <span class="nav-icon">&#128736;</span> Build
-        <span class="nav-badge" id="nav-cron-count">0</span>
+      <div class="nav-item" data-page="build" data-icon="workflow" title="Workflows, crons, skills">
+        <span class="nav-icon"></span> Build
+        <span class="nav-badge" id="nav-cron-count" style="display:none">0</span>
       </div>
-      <div class="nav-item" data-page="team" title="Agents, activity, goals">
-        <span class="nav-icon">&#128101;</span> Team
+      <div class="nav-item" data-page="team" data-icon="users" title="Agents, activity, goals">
+        <span class="nav-icon"></span> Team
       </div>
-      <div class="nav-item" data-page="brain" title="Memory, knowledge, ingestion, health">
-        <span class="nav-icon">&#129504;</span> Brain
+      <div class="nav-item" data-page="brain" data-icon="brain" title="Memory, knowledge, ingestion, health">
+        <span class="nav-icon"></span> Brain
       </div>
-      <div class="nav-item" data-page="settings" title="Channels, integrations, system">
-        <span class="nav-icon">&#9881;</span> Settings
+      <div class="nav-item" data-page="settings" data-icon="settings" title="Channels, integrations, system">
+        <span class="nav-icon"></span> Settings
       </div>
     </div>
     <!-- Per-agent quick-jump (loaded from team-nav helper). -->
-    <div class="nav-section" style="margin-top:18px">
+    <div class="nav-section" style="margin-top:14px">
       <div class="nav-section-title">Agents</div>
       <div id="team-nav"></div>
-      <div class="team-hire-btn" onclick="showAgentCreateModal()">
-        <span style="font-size:14px">+</span> Hire
+      <div class="team-hire-btn" onclick="showAgentCreateModal()" data-icon="plus">
+        <span class="hire-plus"></span> Hire
       </div>
     </div>
     <div style="flex:1"></div>
     <div class="nav-section">
-      <div class="nav-item" onclick="openCommandK()" style="font-size:12px;color:var(--text-muted);justify-content:space-between" title="Quick search (Cmd+K)">
-        <span><span class="nav-icon">&#128269;</span> Search</span>
-        <kbd style="font-size:10px;padding:1px 5px;border:1px solid var(--border);border-radius:3px">&#8984;K</kbd>
+      <div class="nav-item" onclick="openCommandK()" data-icon="search" style="font-size:12px;color:var(--text-muted);justify-content:space-between" title="Quick search (Cmd+K)">
+        <span style="display:inline-flex;align-items:center;gap:8px"><span class="nav-icon"></span> Search</span>
+        <kbd style="font-size:10px;padding:2px 6px;border:1px solid var(--border);border-radius:var(--radius-xs);background:var(--bg-input);color:var(--text-secondary)">&#8984;K</kbd>
       </div>
     </div>
   </nav>
+  <script>
+    // Inject Lucide icons into elements that declared data-icon, after page render.
+    (function hydrateIcons() {
+      function run() {
+        document.querySelectorAll('[data-icon]').forEach(function(el) {
+          if (el.dataset._iconHydrated) return;
+          el.dataset._iconHydrated = '1';
+          var name = el.getAttribute('data-icon');
+          if (!window.LUCIDE || !window.lucide) return;
+          var slot = el.querySelector('.nav-icon, .hire-plus, .icon-slot');
+          if (slot) slot.innerHTML = window.lucide(name, 'icn-md');
+        });
+      }
+      if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', run);
+      else run();
+      // Re-run on dynamic insertion (e.g. agent nav). Polled cheaply.
+      setInterval(run, 1000);
+      // Expose so dynamic markup can call after building DOM.
+      window.hydrateLucideIcons = run;
+    })();
+  </script>
   <div class="sidebar-overlay" id="sidebar-overlay" onclick="toggleSidebar()"></div>
 
   <!-- Content -->
@@ -11239,10 +11419,10 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
     <!-- ═══ Builder Page — Conversational Artifact Creation ═══ -->
     <div class="page" id="page-build">
       <div class="tab-bar" id="build-tabs" style="margin:0;padding:0 18px;background:var(--bg-secondary);border-bottom:1px solid var(--border)">
-        <button class="active" data-build-tab="workflows" onclick="switchBuildTab('workflows')">&#128279; Workflows</button>
-        <button data-build-tab="crons" onclick="switchBuildTab('crons')">&#9200; Crons <span class="tab-badge" id="build-tab-cron-count" style="display:none">0</span></button>
-        <button data-build-tab="skills" onclick="switchBuildTab('skills')">&#128737; Skills <span class="tab-badge" id="build-tab-skill-count" style="display:none">0</span></button>
-        <button data-build-tab="templates" onclick="switchBuildTab('templates')">&#128221; Templates</button>
+        <button class="active" data-build-tab="workflows" data-icon="workflow" onclick="switchBuildTab('workflows')"><span class="icon-slot"></span> Workflows</button>
+        <button data-build-tab="crons" data-icon="clock" onclick="switchBuildTab('crons')"><span class="icon-slot"></span> Crons <span class="tab-badge" id="build-tab-cron-count" style="display:none">0</span></button>
+        <button data-build-tab="skills" data-icon="shield" onclick="switchBuildTab('skills')"><span class="icon-slot"></span> Skills <span class="tab-badge" id="build-tab-skill-count" style="display:none">0</span></button>
+        <button data-build-tab="templates" data-icon="fileText" onclick="switchBuildTab('templates')"><span class="icon-slot"></span> Templates</button>
       </div>
       <!-- Builder header strip — persists across tabs (except Templates) -->
       <div id="build-header-strip" style="display:flex;align-items:center;gap:12px;padding:10px 18px;border-bottom:1px solid var(--border)">
@@ -11259,10 +11439,10 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
         <button class="btn-sm" id="builder-test-btn" onclick="testBuilderSkill()" style="background:var(--bg-tertiary);border:1px solid var(--border);color:var(--text-secondary);padding:4px 12px;border-radius:6px;cursor:pointer;font-size:12px;display:none">Test</button>
         <button class="btn-sm btn-primary" id="builder-save-btn" onclick="saveBuilderArtifact()" style="padding:4px 16px;font-size:12px;display:none">Save</button>
       </div>
-      <!-- Build tab content area -->
+      <!-- Build tab content area: canvas DOMINATES, chat is a sidebar -->
       <div id="build-tab-workflows" data-build-tabpane="workflows" style="display:flex;flex:1;min-height:0;overflow:hidden">
-        <!-- Left: Chat -->
-        <div style="flex:1;display:flex;flex-direction:column;border-right:1px solid var(--border)">
+        <!-- Left: Chat sidebar (compact) -->
+        <div id="builder-chat-sidebar" style="width:360px;flex-shrink:0;display:flex;flex-direction:column;border-right:1px solid var(--border);background:var(--bg-secondary)">
           <div id="builder-messages" style="flex:1;overflow-y:auto;padding:16px">
             <div class="empty-state" id="builder-empty-state" style="margin-top:40px">
               <p style="color:var(--text-muted);margin-bottom:12px">Describe what you want to build.</p>
@@ -11293,8 +11473,8 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
             <button class="btn-primary" onclick="sendBuilderChat()" style="padding:10px 18px;border-radius:8px">Send</button>
           </div>
         </div>
-        <!-- Right: Live Preview / Canvas + Existing Skills -->
-        <div id="builder-right-pane" style="width:520px;display:flex;flex-direction:column;background:var(--bg-secondary)">
+        <!-- Right: Canvas (dominant) + Existing Skills drawer -->
+        <div id="builder-right-pane" style="flex:1;min-width:0;display:flex;flex-direction:column;background:var(--bg-primary)">
           <div style="padding:12px 16px;border-bottom:1px solid var(--border);font-weight:600;font-size:13px;color:var(--text-secondary);display:flex;align-items:center;gap:10px;flex-wrap:wrap">
             <span id="builder-right-pane-title">Live Preview</span>
             <span id="builder-preview-status" style="font-size:11px;color:var(--text-muted)"></span>
@@ -11336,7 +11516,8 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
             <div id="builder-canvas-footer" style="padding:6px 14px;border-top:1px solid var(--border);font-size:11px;color:var(--text-muted);display:flex;gap:14px;align-items:center">
               <span id="builder-canvas-status"></span>
               <span style="flex:1"></span>
-              <span id="builder-canvas-id" style="font-family:monospace;opacity:0.6"></span>
+              <button id="builder-delete-btn" onclick="deleteCurrentBuilderWorkflow()" title="Delete this workflow" style="display:none;background:none;border:1px solid transparent;color:var(--red);font-size:11px;cursor:pointer;padding:2px 8px;border-radius:var(--radius-xs)">Delete</button>
+              <span id="builder-canvas-id" style="font-family:'JetBrains Mono',monospace;opacity:0.6"></span>
             </div>
           </div>
           <!-- Existing skills drawer (visible in skill mode) -->
@@ -11455,7 +11636,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
     <!-- ═══ Brain Page (unified: Search + Graph + Stats + Sources + Seed + Runs) ═══ -->
     <div class="page" id="page-brain">
       <div class="page-head">
-        <div class="icon">&#129504;</div>
+        <div class="icon icon-slot" data-icon="brain"></div>
         <div class="title-block">
           <h1>Brain</h1>
           <p class="desc">Query what you know, feed new knowledge in, and watch the system learn.</p>
@@ -11466,12 +11647,12 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
         </div>
       </div>
       <div class="tab-bar" id="intelligence-tabs" style="margin:0 0 0 18px">
-        <button class="active" onclick="switchTab('intelligence','search')">Memory</button>
-        <button onclick="switchTab('intelligence','graph')">Knowledge</button>
-        <button onclick="switchTab('intelligence','sources')">Ingestion</button>
-        <button onclick="switchTab('intelligence','health')">Health <span class="tab-badge" id="brain-health-badge" style="display:none;background:#ef4444;color:#fff">0</span></button>
-        <button onclick="switchTab('intelligence','user-model')">User Model</button>
-        <button onclick="switchTab('intelligence','learning')">Learning <span class="tab-badge" id="brain-learning-badge" style="display:none;background:#f59e0b;color:#000">0</span></button>
+        <button class="active" data-icon="database" onclick="switchTab('intelligence','search')"><span class="icon-slot"></span> Memory</button>
+        <button data-icon="sparkles" onclick="switchTab('intelligence','graph')"><span class="icon-slot"></span> Knowledge</button>
+        <button data-icon="folder" onclick="switchTab('intelligence','sources')"><span class="icon-slot"></span> Ingestion</button>
+        <button data-icon="zap" onclick="switchTab('intelligence','health')"><span class="icon-slot"></span> Health <span class="tab-badge" id="brain-health-badge" style="display:none;background:#ef4444;color:#fff">0</span></button>
+        <button data-icon="users" onclick="switchTab('intelligence','user-model')"><span class="icon-slot"></span> User Model</button>
+        <button data-icon="brain" onclick="switchTab('intelligence','learning')"><span class="icon-slot"></span> Learning <span class="tab-badge" id="brain-learning-badge" style="display:none;background:#f59e0b;color:#000">0</span></button>
         <button onclick="switchTab('intelligence','memory')">Stats</button>
         <button onclick="switchTab('intelligence','seed')">Seed</button>
         <button onclick="switchTab('intelligence','runs')">Runs</button>
@@ -12713,7 +12894,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
     <!-- ═══ Team Page — The Office ═══ -->
     <div class="page" id="page-team">
       <div class="page-head">
-        <div class="icon">&#128101;</div>
+        <div class="icon icon-slot" data-icon="users"></div>
         <div class="title-block">
           <h1>The Office</h1>
           <p class="desc">Your team of agents — what they're doing, what they're contributing to.</p>
@@ -12726,10 +12907,10 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
         </div>
       </div>
       <div class="tab-bar" id="team-tabs" style="margin:0 0 0 18px">
-        <button class="active" onclick="switchTab('team','roster')">Roster</button>
-        <button onclick="switchTab('team','activity')">Activity</button>
-        <button onclick="switchTab('team','goals')">Goals</button>
-        <button onclick="switchTab('team','comms')">Comms</button>
+        <button class="active" data-icon="users" onclick="switchTab('team','roster')"><span class="icon-slot"></span> Roster</button>
+        <button data-icon="list" onclick="switchTab('team','activity')"><span class="icon-slot"></span> Activity</button>
+        <button data-icon="target" onclick="switchTab('team','goals')"><span class="icon-slot"></span> Goals</button>
+        <button data-icon="messageSquare" onclick="switchTab('team','comms')"><span class="icon-slot"></span> Comms</button>
       </div>
       <div id="team-tab-content">
       <div class="tab-pane active" id="tab-team-roster">
@@ -13791,6 +13972,46 @@ var prevAgentSlugs = null;
 // Five top-level destinations: home, build, team, brain, settings.
 // Sub-pages live as tabs within each destination.
 // Old routes redirect once for back-compat.
+
+// ── Lucide stroke icons (MIT, lucide.dev). Inline so there's no font/asset fetch. ──
+var LUCIDE = {
+  home:        '<path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/>',
+  wrench:      '<path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/>',
+  users:       '<path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/>',
+  brain:       '<path d="M9.5 2A2.5 2.5 0 0 1 12 4.5v15a2.5 2.5 0 0 1-4.96.44 2.5 2.5 0 0 1-2.96-3.08 3 3 0 0 1-.34-5.58 2.5 2.5 0 0 1 1.32-4.24 2.5 2.5 0 0 1 1.98-3A2.5 2.5 0 0 1 9.5 2"/><path d="M14.5 2A2.5 2.5 0 0 0 12 4.5v15a2.5 2.5 0 0 0 4.96.44 2.5 2.5 0 0 0 2.96-3.08 3 3 0 0 0 .34-5.58 2.5 2.5 0 0 0-1.32-4.24 2.5 2.5 0 0 0-1.98-3A2.5 2.5 0 0 0 14.5 2"/>',
+  settings:    '<path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2"/><circle cx="12" cy="12" r="3"/>',
+  search:      '<circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/>',
+  plus:        '<path d="M5 12h14"/><path d="M12 5v14"/>',
+  x:           '<path d="M18 6 6 18"/><path d="m6 6 12 12"/>',
+  check:       '<path d="M20 6 9 17l-5-5"/>',
+  play:        '<polygon points="6 3 20 12 6 21 6 3"/>',
+  eye:         '<path d="M2 12s3-7 10-7 10 7 10 7-3 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/>',
+  trash:       '<path d="M3 6h18"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>',
+  pencil:      '<path d="M21.174 6.812a1 1 0 0 0-3.986-3.987L3.842 16.174a2 2 0 0 0-.5.83l-1.321 4.352a.5.5 0 0 0 .623.622l4.353-1.32a2 2 0 0 0 .83-.497z"/>',
+  link:        '<path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/>',
+  clock:       '<circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/>',
+  shield:      '<path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/>',
+  fileText:    '<path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><polyline points="14 2 14 8 20 8"/><line x1="16" x2="8" y1="13" y2="13"/><line x1="16" x2="8" y1="17" y2="17"/><line x1="10" x2="8" y1="9" y2="9"/>',
+  workflow:    '<rect x="3" y="3" width="6" height="6" rx="1"/><rect x="15" y="3" width="6" height="6" rx="1"/><rect x="9" y="15" width="6" height="6" rx="1"/><path d="M6 9v3a2 2 0 0 0 2 2h2"/><path d="M18 9v3a2 2 0 0 1-2 2h-2"/>',
+  bell:        '<path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/>',
+  calendar:    '<rect width="18" height="18" x="3" y="4" rx="2"/><path d="M16 2v4"/><path d="M8 2v4"/><path d="M3 10h18"/>',
+  list:        '<line x1="8" x2="21" y1="6" y2="6"/><line x1="8" x2="21" y1="12" y2="12"/><line x1="8" x2="21" y1="18" y2="18"/><line x1="3" x2="3.01" y1="6" y2="6"/><line x1="3" x2="3.01" y1="12" y2="12"/><line x1="3" x2="3.01" y1="18" y2="18"/>',
+  messageSquare:'<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>',
+  target:      '<circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/>',
+  folder:      '<path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.93a2 2 0 0 1-1.66-.9l-.82-1.2A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/>',
+  refresh:     '<path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M3 21v-5h5"/>',
+  zap:         '<path d="M4 14a1 1 0 0 1-.78-1.63l9.9-10.2a.5.5 0 0 1 .86.46l-1.92 6.02A1 1 0 0 0 13 10h7a1 1 0 0 1 .78 1.63l-9.9 10.2a.5.5 0 0 1-.86-.46l1.92-6.02A1 1 0 0 0 11 14z"/>',
+  sparkles:    '<path d="M9.937 15.5A2 2 0 0 0 8.5 14.063l-6.135-1.582a.5.5 0 0 1 0-.962L8.5 9.936A2 2 0 0 0 9.937 8.5l1.582-6.135a.5.5 0 0 1 .963 0L14.063 8.5A2 2 0 0 0 15.5 9.937l6.135 1.581a.5.5 0 0 1 0 .964L15.5 14.063a2 2 0 0 0-1.437 1.437l-1.582 6.135a.5.5 0 0 1-.963 0z"/>',
+  command:     '<path d="M15 6v12a3 3 0 1 0 3-3H6a3 3 0 1 0 3 3V6a3 3 0 1 0-3 3h12a3 3 0 1 0-3-3"/>',
+  send:        '<path d="m22 2-7 20-4-9-9-4Z"/><path d="M22 2 11 13"/>',
+  arrowRight:  '<path d="M5 12h14"/><path d="m12 5 7 7-7 7"/>',
+  tool:        '<path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/>',
+  database:    '<ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14a9 3 0 0 0 18 0V5"/><path d="M3 12a9 3 0 0 0 18 0"/>',
+};
+function lucide(name, cls) {
+  var path = LUCIDE[name] || '';
+  return '<svg class="icn ' + (cls || '') + '" viewBox="0 0 24 24" aria-hidden="true">' + path + '</svg>';
+}
 
 var DESTINATIONS = ['home', 'build', 'team', 'brain', 'settings'];
 
@@ -18235,6 +18456,8 @@ async function openBuilderWorkflow(id) {
 
     var idEl = document.getElementById('builder-canvas-id');
     if (idEl) idEl.textContent = id;
+    var delBtn = document.getElementById('builder-delete-btn');
+    if (delBtn) delBtn.style.display = id.startsWith('workflow:') ? '' : 'none';
 
     var banner = document.getElementById('builder-canvas-banner');
     if (banner) {
@@ -18321,16 +18544,13 @@ async function _flushBuilderSave() {
   setTimeout(function() { _builderRecentSaveTokens.delete(saveToken); }, 5000);
   try {
     var data = _builderCanvasEditor.export();
-    var r = await apiJson('POST', '/api/builder/workflows/' + encodeURIComponent(_builderCanvasOpenId) + '/save-from-drawflow', { drawflow: data, saveToken: saveToken });
+    // force:true — autosave persists partial states (incomplete MCP/channel
+    // configs, dangling deps). Validation surfaces in the banner; never blocks.
+    var r = await apiJson('POST', '/api/builder/workflows/' + encodeURIComponent(_builderCanvasOpenId) + '/save-from-drawflow', { drawflow: data, saveToken: saveToken, force: true });
     if (r.error) {
-      if (r.validation && r.validation.issues) {
-        _setBuilderSaveStatus('error', r.validation.issues.length + ' validation error' + (r.validation.issues.length === 1 ? '' : 's'));
-      } else {
-        _setBuilderSaveStatus('error', r.error);
-      }
+      _setBuilderSaveStatus('error', r.error);
     } else {
       _setBuilderSaveStatus('saved');
-      // Refresh banner from validation if warnings
       _updateBuilderBannerFromValidation(r.validation);
     }
   } catch (err) {
@@ -18439,6 +18659,27 @@ async function validateBuilderCanvas() {
     var lines = r.issues.map(function(i) { return '[' + i.severity + '] ' + (i.stepId ? '(' + i.stepId + ') ' : '') + i.message; });
     alert('Validation:\\n\\n' + lines.join('\\n'));
   } catch (err) { toast('Validate failed: ' + err, 'error'); }
+}
+
+async function deleteCurrentBuilderWorkflow() {
+  if (!_builderCanvasOpenId) return;
+  if (!_builderCanvasOpenId.startsWith('workflow:')) {
+    toast('Cron entries can\\x27t be deleted from here — disable instead.', 'info');
+    return;
+  }
+  var name = _builderCanvasOpenId.replace(/^workflow:/, '');
+  if (!confirm('Delete workflow "' + name + '"? This is permanent.')) return;
+  try {
+    var r = await fetch('/api/builder/workflows/' + encodeURIComponent(_builderCanvasOpenId), {
+      method: 'DELETE',
+      headers: { 'authorization': 'Bearer ' + _dashToken },
+    });
+    if (!r.ok) { var d = await r.json().catch(function() { return {}; }); toast('Delete failed: ' + (d.error || r.status), 'error'); return; }
+    toast('Deleted ' + name, 'success');
+    closeBuilderCanvas();
+    var t = document.querySelector('#build-tabs button.active')?.getAttribute('data-build-tab');
+    refreshBuilderCanvasPicker(t === 'crons' ? 'cron' : 'workflow');
+  } catch (err) { toast('Delete error: ' + err, 'error'); }
 }
 
 async function dryRunBuilderCanvas() {
