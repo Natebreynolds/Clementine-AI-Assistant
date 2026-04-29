@@ -891,7 +891,13 @@ function getStatus(): Record<string, unknown> {
             try {
               const st = JSON.parse(readFileSync(statusFile, 'utf-8'));
               if (st.status === 'running') {
-                currentActivity = 'Deep work: ' + (st.jobName || dir);
+                // If the unleashed run has a real jobName, use it; otherwise just say
+                // "Deep work in progress" — exposing the auto-generated dir id like
+                // "deep-1776118926610..." in the header reads as debug noise.
+                const friendly = st.jobName && !/^deep-\d{10,}$/.test(st.jobName)
+                  ? st.jobName
+                  : null;
+                currentActivity = friendly ? ('Deep work: ' + friendly) : 'Deep work in progress';
                 break;
               }
             } catch { /* skip */ }
@@ -2189,6 +2195,326 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
     queue.push(item);
     writeFileSync(queueFile, JSON.stringify(queue, null, 2));
     res.json({ ok: true, id });
+  });
+
+  app.get('/api/home-digest', async (_req, res) => {
+    try {
+      const now = new Date();
+      const dayName = ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'][now.getDay()];
+      const dayLabel = now.toLocaleDateString(undefined, { weekday: 'long', month: 'long', day: 'numeric' });
+      const hour = now.getHours();
+      const greetingPart = hour < 5 ? 'Good evening' : hour < 12 ? 'Good morning' : hour < 18 ? 'Good afternoon' : 'Good evening';
+
+      // ── Resolve user name (USER_MODEL.md → MEMORY.md → env → OS user) ──
+      let userName: string | null = null;
+      const tryName = (v: unknown) => {
+        if (typeof v === 'string' && v.trim()) {
+          userName = v.trim().split(/\s+/)[0];
+          return true;
+        }
+        return false;
+      };
+      try {
+        const matter = (await import('gray-matter')).default;
+        const userModelPath = path.join(VAULT_DIR, '00-System', 'USER_MODEL.md');
+        if (!userName && existsSync(userModelPath)) {
+          const um = matter(readFileSync(userModelPath, 'utf-8'));
+          const d = um.data as Record<string, unknown>;
+          tryName(d.preferred_name) || tryName(d.first_name) || tryName(d.name) || tryName(d.user_name);
+        }
+        const memoryPath = path.join(VAULT_DIR, '00-System', 'MEMORY.md');
+        if (!userName && existsSync(memoryPath)) {
+          const mm = matter(readFileSync(memoryPath, 'utf-8'));
+          const d = mm.data as Record<string, unknown>;
+          tryName(d.preferred_name) || tryName(d.first_name) || tryName(d.name) || tryName(d.user_name);
+        }
+      } catch { /* */ }
+      if (!userName) tryName(process.env.CLEMENTINE_USER_NAME || process.env.USER_NAME);
+      if (!userName) {
+        try {
+          const os = await import('os');
+          const u = os.userInfo().username;
+          if (u && u !== 'root') tryName(u.replace(/[._-].*$/, ''));
+        } catch { /* */ }
+      }
+      if (!userName) userName = 'there';
+      // Capitalize first letter so "nathan" → "Nathan"
+      userName = userName.charAt(0).toUpperCase() + userName.slice(1);
+
+      // ── KPIs ──
+      const kpis: Record<string, number> = {
+        activeRuns: 0,
+        runsToday: 0,
+        timeSavedMinutes: 0,
+        pendingApprovals: 0,
+        overdueTasks: 0,
+      };
+
+      // active unleashed runs
+      try {
+        const unleashedDir = path.join(BASE_DIR, 'unleashed');
+        if (existsSync(unleashedDir)) {
+          const dirs = readdirSync(unleashedDir, { withFileTypes: true } as any).filter((d: any) => d.isDirectory());
+          for (const d of dirs as any[]) {
+            const statusFile = path.join(unleashedDir, d.name, 'status.json');
+            if (existsSync(statusFile)) {
+              try {
+                const s = JSON.parse(readFileSync(statusFile, 'utf-8'));
+                if (s.status === 'running') kpis.activeRuns++;
+              } catch { /* */ }
+            }
+          }
+        }
+      } catch { /* */ }
+
+      // runs today + time saved (rough heuristic: 5 min per cron run)
+      try {
+        const cronRunsDir = path.join(BASE_DIR, 'cron', 'runs');
+        if (existsSync(cronRunsDir)) {
+          const today = now.toISOString().slice(0, 10);
+          const files = readdirSync(cronRunsDir).filter(f => f.endsWith('.jsonl'));
+          for (const f of files) {
+            try {
+              const lines = readFileSync(path.join(cronRunsDir, f), 'utf-8').trim().split('\n').filter(Boolean);
+              for (const line of lines.slice(-30)) {
+                try {
+                  const e = JSON.parse(line);
+                  const ts = e.completedAt || e.startedAt || e.timestamp;
+                  if (!ts) continue;
+                  if (String(ts).slice(0, 10) === today) kpis.runsToday++;
+                } catch { /* */ }
+              }
+            } catch { /* */ }
+          }
+          // Time saved this week — count last 7 days × 5 min
+          const weekAgo = Date.now() - 7 * 24 * 60 * 60 * 1000;
+          let weeklyRuns = 0;
+          for (const f of files) {
+            try {
+              const lines = readFileSync(path.join(cronRunsDir, f), 'utf-8').trim().split('\n').filter(Boolean);
+              for (const line of lines) {
+                try {
+                  const e = JSON.parse(line);
+                  const ts = new Date(e.completedAt || e.startedAt || e.timestamp || 0).getTime();
+                  if (ts >= weekAgo) weeklyRuns++;
+                } catch { /* */ }
+              }
+            } catch { /* */ }
+          }
+          kpis.timeSavedMinutes = weeklyRuns * 5;
+        }
+      } catch { /* */ }
+
+      // pending approvals (self-improve)
+      try {
+        const siDir = path.join(BASE_DIR, 'self-improve');
+        const proposalsFile = path.join(siDir, 'proposals.json');
+        if (existsSync(proposalsFile)) {
+          const data = JSON.parse(readFileSync(proposalsFile, 'utf-8'));
+          const items = Array.isArray(data) ? data : (data.proposals || []);
+          kpis.pendingApprovals = items.filter((p: any) => p.status === 'pending').length;
+        }
+      } catch { /* */ }
+
+      // overdue tasks
+      try {
+        const tasksFile = path.join(VAULT_DIR, '05-Tasks', 'TASKS.md');
+        if (existsSync(tasksFile)) {
+          const content = readFileSync(tasksFile, 'utf-8');
+          const todayStr = now.toISOString().slice(0, 10);
+          // Match "- [ ] task @YYYY-MM-DD" pattern; overdue if date < today
+          const lines = content.split('\n').filter(l => /^[-*]\s*\[ \]/.test(l));
+          for (const line of lines) {
+            const m = line.match(/@(\d{4}-\d{2}-\d{2})/);
+            if (m && m[1] < todayStr) kpis.overdueTasks++;
+          }
+        }
+      } catch { /* */ }
+
+      // ── Today's runs ──
+      const todayRuns: Array<{ name: string; nextRun: string | null; lastRun: string | null; firedToday: boolean; agentSlug: string | null }> = [];
+      try {
+        const { parseCronJobs, parseAgentCronJobs } = await import('../gateway/cron-scheduler.js');
+        const all = [...parseCronJobs(), ...parseAgentCronJobs(path.join(VAULT_DIR, '00-System', 'agents'))];
+        const cronParser = await import('cron-parser');
+        const todayStart = new Date(now.toDateString()).getTime();
+        const todayEnd = todayStart + 24 * 60 * 60 * 1000;
+        for (const job of all) {
+          if (!job.enabled) continue;
+          let next: string | null = null;
+          let firedToday = false;
+          try {
+            const interval = (cronParser as any).CronExpressionParser?.parse?.(job.schedule, { currentDate: now }) ??
+                             (cronParser as any).default?.parseExpression?.(job.schedule, { currentDate: now }) ??
+                             (cronParser as any).parseExpression?.(job.schedule, { currentDate: now });
+            const nextDate: Date = typeof interval.next === 'function' ? interval.next().toDate() : interval.next();
+            next = nextDate.toISOString();
+          } catch { /* */ }
+          // Did it fire today already? Look at cron runs.
+          try {
+            const runsFile = path.join(BASE_DIR, 'cron', 'runs', job.name + '.jsonl');
+            if (existsSync(runsFile)) {
+              const tail = readFileSync(runsFile, 'utf-8').trim().split('\n').filter(Boolean).slice(-12);
+              for (const line of tail) {
+                try {
+                  const e = JSON.parse(line);
+                  const ts = new Date(e.completedAt || e.startedAt || 0).getTime();
+                  if (ts >= todayStart && ts < todayEnd) { firedToday = true; break; }
+                } catch { /* */ }
+              }
+            }
+          } catch { /* */ }
+          todayRuns.push({
+            name: job.name,
+            nextRun: next,
+            lastRun: null,
+            firedToday,
+            agentSlug: job.agentSlug ?? null,
+          });
+        }
+      } catch { /* */ }
+      // Sort: fired today first (so user sees what already happened), then upcoming by nextRun
+      todayRuns.sort((a, b) => {
+        if (a.firedToday !== b.firedToday) return a.firedToday ? -1 : 1;
+        if (!a.nextRun) return 1;
+        if (!b.nextRun) return -1;
+        return new Date(a.nextRun).getTime() - new Date(b.nextRun).getTime();
+      });
+
+      // ── Briefing: parse today's daily note ──
+      const briefing: { highlights: Array<{ text: string; source: string }>; needsReview: Array<{ text: string; href?: string }> } = {
+        highlights: [],
+        needsReview: [],
+      };
+      const todayStr = now.toISOString().slice(0, 10);
+      const dailyNotePath = path.join(VAULT_DIR, '01-Daily-Notes', todayStr + '.md');
+      try {
+        if (existsSync(dailyNotePath)) {
+          const note = readFileSync(dailyNotePath, 'utf-8');
+          // Parse Sends (cron job result lines)
+          const sendsMatch = note.match(/##\s+([\w-]+)\s+\d{4}-\d{2}-\d{2}\s*\n\s*\n###\s+Sends\s*\n([\s\S]*?)(?:\n###|\n##|$)/g);
+          if (sendsMatch) {
+            for (const block of sendsMatch.slice(0, 3)) {
+              const titleM = block.match(/##\s+([\w-]+)\s/);
+              const title = titleM ? titleM[1] : 'cron';
+              const sendLines = block.split('\n').filter(l => l.trim().startsWith('- ')).slice(0, 5);
+              if (sendLines.length > 0) {
+                briefing.highlights.push({
+                  text: title + ' sent ' + sendLines.length + (sendLines.length === 1 ? ' message' : ' messages'),
+                  source: 'daily-note',
+                });
+              }
+            }
+          }
+          // Parse one-line summary lines like "<job-name> 2026-04-28: T2: 0 sent | T3: 0 ... | Replies: 0 | Skipped: ..."
+          const summaryLines = note.split('\n').filter(l => /\d{4}-\d{2}-\d{2}.*Replies/i.test(l)).slice(0, 3);
+          for (const s of summaryLines) {
+            briefing.highlights.push({ text: s.trim().replace(/^.*?\d{4}-\d{2}-\d{2}:?\s*/, ''), source: 'daily-note' });
+          }
+          // Parse "## Interactions" entries
+          const interactionsMatch = note.match(/## Interactions\s*\n([\s\S]*?)(?:\n##|$)/);
+          if (interactionsMatch) {
+            const lines = interactionsMatch[1].split('\n').filter(l => l.trim().startsWith('- **'));
+            // Take the most informative lines (longest contentful body)
+            const interactiveOnes = lines
+              .map(l => {
+                const stripped = l.replace(/^- \*\*[^*]+\*\*[^:]*:\s*/, '');
+                return { line: l, body: stripped, len: stripped.length };
+              })
+              .filter(x => x.len > 40)
+              .sort((a, b) => b.len - a.len)
+              .slice(0, 4);
+            for (const i of interactiveOnes) {
+              const titleM = i.line.match(/\*\*([^*]+)\*\*/);
+              const title = titleM ? titleM[1] : 'agent';
+              briefing.highlights.push({
+                text: '[' + title + '] ' + i.body.slice(0, 200),
+                source: 'interactions',
+              });
+            }
+          }
+        }
+      } catch { /* */ }
+
+      // Fallback: if briefing.highlights is sparse, pull from /api/activity-style events
+      if (briefing.highlights.length < 3) {
+        try {
+          const cronRunsDir = path.join(BASE_DIR, 'cron', 'runs');
+          if (existsSync(cronRunsDir)) {
+            const todayMs = new Date(todayStr + 'T00:00:00Z').getTime();
+            const recent: Array<{ ts: number; title: string; body: string }> = [];
+            for (const f of readdirSync(cronRunsDir).filter(x => x.endsWith('.jsonl')).slice(0, 30)) {
+              try {
+                const lines = readFileSync(path.join(cronRunsDir, f), 'utf-8').trim().split('\n').filter(Boolean).slice(-5);
+                for (const line of lines) {
+                  try {
+                    const e = JSON.parse(line);
+                    const ts = new Date(e.completedAt || e.startedAt || 0).getTime();
+                    if (ts < todayMs) continue;
+                    const body = (e.responsePreview || e.summary || e.output || '').slice(0, 180);
+                    if (!body) continue;
+                    recent.push({ ts, title: f.replace('.jsonl', ''), body });
+                  } catch { /* */ }
+                }
+              } catch { /* */ }
+            }
+            recent.sort((a, b) => b.ts - a.ts);
+            for (const r of recent.slice(0, 4 - briefing.highlights.length)) {
+              briefing.highlights.push({ text: '[' + r.title + '] ' + r.body, source: 'activity' });
+            }
+          }
+        } catch { /* */ }
+      }
+
+      // Needs review: pending approvals + overdue + broken jobs + active unleashed
+      if (kpis.pendingApprovals > 0) {
+        briefing.needsReview.push({
+          text: kpis.pendingApprovals + ' self-improve proposal' + (kpis.pendingApprovals === 1 ? '' : 's') + ' awaiting review',
+          href: '#brain/learning',
+        });
+      }
+      if (kpis.overdueTasks > 0) {
+        briefing.needsReview.push({
+          text: kpis.overdueTasks + ' overdue task' + (kpis.overdueTasks === 1 ? '' : 's'),
+          href: '#team/goals',
+        });
+      }
+      if (kpis.activeRuns > 0) {
+        briefing.needsReview.push({
+          text: kpis.activeRuns + ' unleashed task' + (kpis.activeRuns === 1 ? '' : 's') + ' running',
+          href: '#build/workflows',
+        });
+      }
+      // Broken jobs (consecutive failures)
+      try {
+        const cronRunsDir = path.join(BASE_DIR, 'cron', 'runs');
+        if (existsSync(cronRunsDir)) {
+          for (const f of readdirSync(cronRunsDir).filter(x => x.endsWith('.jsonl'))) {
+            try {
+              const tail = readFileSync(path.join(cronRunsDir, f), 'utf-8').trim().split('\n').filter(Boolean).slice(-3);
+              const failures = tail.filter(l => {
+                try { const e = JSON.parse(l); return e.status === 'error' || e.error; } catch { return false; }
+              });
+              if (failures.length >= 2) {
+                briefing.needsReview.push({
+                  text: f.replace('.jsonl', '') + ' failing — last ' + failures.length + ' runs errored',
+                  href: '#build/crons',
+                });
+              }
+            } catch { /* */ }
+          }
+        }
+      } catch { /* */ }
+
+      res.json({
+        greeting: { phrase: greetingPart, name: userName, dayLabel, dayName },
+        kpis,
+        briefing,
+        todayRuns: todayRuns.slice(0, 6),
+      });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
   });
 
   app.get('/api/vault-files', async (req, res) => {
@@ -8231,6 +8557,22 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
     --motion-slow: 300ms cubic-bezier(0.4, 0, 0.2, 1);
     /* ── Focus ring ── */
     --ring: 0 0 0 2px var(--clementine), 0 0 0 4px rgba(255, 140, 33, 0.18);
+    /* ── 0-10 numerical bg/text scales (additive — existing semantic tokens still work) ── */
+    --bg-0: #ffffff;
+    --bg-1: #fcfdfe;
+    --bg-2: #f8fafc;
+    --bg-3: #f1f5f9;
+    --bg-4: #e2e8f0;
+    --bg-5: #cbd5e1;
+    --bg-6: #94a3b8;
+    --bg-7: #64748b;
+    --bg-8: #475569;
+    --bg-9: #1e293b;
+    --bg-10: #0f172a;
+    --text-1: #0f172a;
+    --text-2: #334155;
+    --text-3: #64748b;
+    --text-4: #94a3b8;
   }
   [data-theme="dark"] {
     --bg-primary: #0b0f17;
@@ -8262,6 +8604,22 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
     --shadow-md: 0 4px 12px rgba(0, 0, 0, 0.5), 0 2px 4px rgba(0, 0, 0, 0.3);
     --shadow-lg: 0 12px 32px rgba(0, 0, 0, 0.6), 0 4px 8px rgba(0, 0, 0, 0.4);
     --ring: 0 0 0 2px var(--clementine), 0 0 0 4px rgba(255, 165, 79, 0.22);
+    /* Dark variants of the 0-10 scale */
+    --bg-0: #0b0f17;
+    --bg-1: #0f1421;
+    --bg-2: #131923;
+    --bg-3: #1a212d;
+    --bg-4: #1f2733;
+    --bg-5: #2d3748;
+    --bg-6: #475569;
+    --bg-7: #64748b;
+    --bg-8: #94a3b8;
+    --bg-9: #cbd5e1;
+    --bg-10: #f1f5f9;
+    --text-1: #e2e8f0;
+    --text-2: #cbd5e1;
+    --text-3: #94a3b8;
+    --text-4: #64748b;
   }
   /* OS-preference dark mode unless user has explicitly chosen a theme */
   @media (prefers-color-scheme: dark) {
@@ -8300,6 +8658,17 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
     outline: none;
     box-shadow: var(--ring);
     border-radius: var(--radius-xs);
+  }
+  /* Honor user's reduced-motion preference: kill every animation/transition. */
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      animation-duration: 0.001ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.001ms !important;
+      scroll-behavior: auto !important;
+    }
   }
   body {
     font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
@@ -8672,66 +9041,279 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
   .icn-lg { width: 22px; height: 22px; stroke-width: 1.75; }
   .icn-xl { width: 28px; height: 28px; stroke-width: 1.5; }
 
-  /* ── Home layout — chat-first daily driver ─── */
-  .home-layout {
+  /* ── Home (v1.5 daily-driver dashboard) ─────── */
+  .home-shell {
+    max-width: 1180px;
+    margin: 0 auto;
+    padding: 24px 28px 120px;
+    display: flex;
+    flex-direction: column;
+    gap: 22px;
+  }
+  .home-greeting {
+    display: flex;
+    align-items: flex-end;
+    justify-content: space-between;
+    gap: 16px;
+    margin-top: 4px;
+  }
+  .home-greeting-text h1 {
+    font-size: 26px;
+    font-weight: 600;
+    letter-spacing: -0.025em;
+    color: var(--text-primary);
+    margin: 0;
+    line-height: 1.15;
+  }
+  .home-greeting-day {
+    font-size: var(--text-base);
+    color: var(--text-muted);
+    margin: 4px 0 0;
+  }
+  .home-greeting-actions { display: flex; gap: 8px; }
+
+  /* KPI strip */
+  .kpi-strip {
     display: grid;
-    grid-template-columns: 1fr 320px;
-    gap: 18px;
-    height: calc(100vh - var(--header-h));
-    padding: 18px;
-    box-sizing: border-box;
+    grid-template-columns: repeat(5, minmax(0, 1fr));
+    gap: 10px;
   }
-  .home-main {
-    display: flex;
-    flex-direction: column;
-    gap: 14px;
-    min-height: 0;
-    overflow-y: auto;
-  }
-  .home-chat {
-    display: flex;
-    flex-direction: column;
-    flex: 1;
-    min-height: 320px;
+  .kpi-tile {
     background: var(--bg-card);
     border: 1px solid var(--border);
-    border-radius: 12px;
-    overflow: hidden;
-    box-shadow: 0 2px 8px rgba(0,0,0,0.06);
+    border-radius: var(--radius-md);
+    padding: 12px 14px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    transition: background var(--motion), border-color var(--motion), transform var(--motion-fast);
+    position: relative;
+    min-width: 0;
   }
-  .home-chat-messages {
+  .kpi-tile[onclick] { cursor: pointer; }
+  .kpi-tile[onclick]:hover { background: var(--bg-hover); border-color: var(--clementine); transform: translateY(-1px); }
+  .kpi-tile .kpi-icon {
+    width: 22px;
+    height: 22px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--text-muted);
+    margin-bottom: 2px;
+  }
+  .kpi-tile .kpi-icon .icn { width: 16px; height: 16px; }
+  .kpi-tile .kpi-value {
+    font-size: 22px;
+    font-weight: 600;
+    color: var(--text-primary);
+    line-height: 1;
+    letter-spacing: -0.01em;
+  }
+  .kpi-tile .kpi-value.muted { color: var(--text-muted); font-weight: 500; }
+  .kpi-tile .kpi-label {
+    font-size: var(--text-xs);
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    font-weight: 500;
+  }
+  .kpi-tile.alert .kpi-value { color: var(--clementine); }
+  .kpi-tile.alert::before {
+    content: '';
+    position: absolute;
+    top: 0; right: 0;
+    width: 6px; height: 6px;
+    border-radius: 50%;
+    background: var(--clementine);
+    transform: translate(50%, -50%);
+    box-shadow: 0 0 0 3px var(--bg-primary);
+  }
+
+  /* Two-column home grid (briefing + today's runs) */
+  .home-grid-2 {
+    display: grid;
+    grid-template-columns: minmax(0, 2fr) minmax(0, 1fr);
+    gap: 14px;
+    align-items: start;
+  }
+  .briefing-card .card-body { padding: 14px 18px; line-height: 1.55; }
+  .briefing-section-title {
+    font-size: var(--text-xs);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--text-muted);
+    font-weight: 600;
+    margin: 4px 0 8px;
+  }
+  .briefing-list { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 8px; }
+  .briefing-item {
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+    font-size: var(--text-base);
+    color: var(--text-primary);
+    line-height: 1.45;
+  }
+  .briefing-item::before {
+    content: '';
+    width: 4px;
+    height: 4px;
+    border-radius: 50%;
+    background: var(--clementine);
+    margin-top: 8px;
+    flex-shrink: 0;
+  }
+  .briefing-item.review {
+    background: var(--clementine-bg);
+    padding: 8px 10px;
+    border-radius: var(--radius-sm);
+    cursor: pointer;
+    transition: background var(--motion);
+  }
+  .briefing-item.review::before { background: var(--clementine); }
+  .briefing-item.review:hover { background: rgba(255,140,33,0.14); }
+  .briefing-item.review .arrow { margin-left: auto; color: var(--clementine); flex-shrink: 0; }
+
+  .runs-card .card-body { padding: 8px 0; }
+  .run-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 8px 16px;
+    font-size: var(--text-base);
+    border-left: 2px solid transparent;
+    transition: background var(--motion), border-color var(--motion);
+  }
+  .run-row.fired {
+    border-left-color: var(--green);
+    color: var(--text-muted);
+  }
+  .run-row.upcoming { border-left-color: var(--clementine); }
+  .run-row .run-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .run-row .run-time { font-size: var(--text-xs); color: var(--text-muted); flex-shrink: 0; }
+  .run-row .run-icon { width: 14px; height: 14px; flex-shrink: 0; }
+  .run-row.fired .run-icon { color: var(--green); }
+  .run-row.upcoming .run-icon { color: var(--clementine); }
+
+  .home-activity { margin: 0; }
+
+  @media (max-width: 900px) {
+    .kpi-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .home-grid-2 { grid-template-columns: 1fr; }
+    .home-greeting-text h1 { font-size: 22px; }
+  }
+
+  /* ── Floating chat FAB + panel ─────────────── */
+  .home-chat-fab {
+    position: fixed;
+    right: 22px;
+    bottom: 22px;
+    z-index: 200;
+    background: var(--clementine);
+    color: #fff;
+    border: none;
+    border-radius: 999px;
+    padding: 12px 18px;
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    font-size: var(--text-base);
+    font-weight: 500;
+    box-shadow: var(--shadow-md);
+    cursor: pointer;
+    transition: transform var(--motion-fast), box-shadow var(--motion);
+  }
+  .home-chat-fab:hover { transform: translateY(-1px); box-shadow: var(--shadow-lg); }
+  .home-chat-fab .icn { width: 16px; height: 16px; }
+  .home-chat-fab-label { white-space: nowrap; }
+  .home-chat-fab.compact .home-chat-fab-label { display: none; }
+  .home-chat-fab.hidden { display: none; }
+
+  .home-chat-panel {
+    position: fixed;
+    right: 22px;
+    bottom: 22px;
+    z-index: 199;
+    width: 420px;
+    max-width: calc(100vw - 44px);
+    height: 560px;
+    max-height: calc(100vh - var(--header-h) - 44px);
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    box-shadow: var(--shadow-lg);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    transform: translateY(20px) scale(0.96);
+    opacity: 0;
+    pointer-events: none;
+    transition: transform var(--motion), opacity var(--motion);
+  }
+  .home-chat-panel.open {
+    transform: translateY(0) scale(1);
+    opacity: 1;
+    pointer-events: auto;
+  }
+  .home-chat-panel-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 12px 14px;
+    border-bottom: 1px solid var(--border);
+    font-size: var(--text-base);
+    font-weight: 600;
+    background: var(--bg-secondary);
+  }
+  .home-chat-panel-header .icn { width: 16px; height: 16px; color: var(--clementine); }
+  .home-chat-panel-header select {
+    padding: 4px 8px;
+    font-size: var(--text-xs);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-xs);
+    background: var(--bg-input);
+    color: var(--text-primary);
+  }
+  .home-chat-panel-messages {
     flex: 1;
     overflow-y: auto;
-    padding: 18px 20px;
-    min-height: 280px;
+    padding: 14px 16px;
+    background: var(--bg-primary);
   }
-  .home-chat-input-row {
+  .home-chat-panel-input-row {
     display: flex;
     gap: 8px;
-    padding: 12px 16px;
+    padding: 10px 12px;
     border-top: 1px solid var(--border);
     background: var(--bg-secondary);
     align-items: center;
   }
-  .home-chat-input-row input[type="text"] {
+  .home-chat-panel-input-row input[type="text"] {
     flex: 1;
-    padding: 10px 14px;
+    padding: 8px 12px;
     border: 1px solid var(--border);
-    border-radius: 8px;
+    border-radius: var(--radius-sm);
     background: var(--bg-input);
     color: var(--text-primary);
-    font-size: 14px;
+    font-size: var(--text-base);
+    font-family: inherit;
   }
-  .home-chat-input-row select {
-    padding: 6px 10px;
-    border: 1px solid var(--border);
-    border-radius: 6px;
-    background: var(--bg-secondary);
-    color: var(--text-primary);
-    font-size: 12px;
+  .home-chat-panel-input-row .btn-icon { padding: 6px; }
+  .home-chat-panel-input-row .icn { width: 14px; height: 14px; }
+
+  @media (max-width: 600px) {
+    .home-chat-panel {
+      right: 8px;
+      bottom: 8px;
+      width: calc(100vw - 16px);
+      height: calc(100vh - var(--header-h) - 16px);
+    }
+    .home-chat-fab {
+      right: 12px;
+      bottom: 12px;
+      padding: 10px 14px;
+    }
   }
-  .home-chat-input-row button { padding: 9px 18px; border-radius: 8px; }
-  .home-activity { margin: 0; }
 
   /* Right rail */
   .home-rail {
@@ -11411,11 +11993,12 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
       function run() {
         document.querySelectorAll('[data-icon]').forEach(function(el) {
           if (el.dataset._iconHydrated) return;
+          if (!window.LUCIDE || !window.lucide) return;
           el.dataset._iconHydrated = '1';
           var name = el.getAttribute('data-icon');
-          if (!window.LUCIDE || !window.lucide) return;
           var slot = el.querySelector('.nav-icon, .hire-plus, .icon-slot');
-          if (slot) slot.innerHTML = window.lucide(name, 'icn-md');
+          var target = slot || el;
+          target.innerHTML = window.lucide(name, 'icn-md');
         });
       }
       if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', run);
@@ -11431,143 +12014,140 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
   <!-- Content -->
   <div class="content">
 
-    <!-- ═══ Home — chat-first daily driver ═══ -->
+    <!-- ═══ Home — daily-driver dashboard ═══ -->
     <div class="page active" id="page-home">
-      <div class="home-layout">
-        <main class="home-main">
-          <!-- Getting Started (shown for new users only) -->
-          <div id="getting-started" class="getting-started" style="display:none">
-            <div class="gs-header">
-              <div class="gs-title">Get Started</div>
-              <div class="gs-subtitle">Set up your AI assistant in 5 steps</div>
-              <button class="btn-ghost btn-sm gs-dismiss" onclick="dismissGettingStarted()" title="Dismiss">&times;</button>
+      <div class="home-shell">
+        <!-- Getting Started (shown for new users only) -->
+        <div id="getting-started" class="getting-started" style="display:none">
+          <div class="gs-header">
+            <div class="gs-title">Get Started</div>
+            <div class="gs-subtitle">Set up your AI assistant in 5 steps</div>
+            <button class="btn-ghost btn-sm gs-dismiss" onclick="dismissGettingStarted()" title="Dismiss">&times;</button>
+          </div>
+          <div class="gs-grid">
+            <div class="gs-card" id="gs-step-auth">
+              <div class="gs-step-num">1</div>
+              <div class="gs-card-icon">&#128274;</div>
+              <div class="gs-card-title">Login with Anthropic</div>
+              <div class="gs-card-desc" id="gs-auth-desc">Connect your Anthropic account to power your agents.</div>
+              <button class="btn btn-sm btn-primary" id="gs-auth-btn" onclick="startAnthropicOAuth()">Login with Claude</button>
             </div>
-            <div class="gs-grid">
-              <div class="gs-card" id="gs-step-auth">
-                <div class="gs-step-num">1</div>
-                <div class="gs-card-icon">&#128274;</div>
-                <div class="gs-card-title">Login with Anthropic</div>
-                <div class="gs-card-desc" id="gs-auth-desc">Connect your Anthropic account to power your agents.</div>
-                <button class="btn btn-sm btn-primary" id="gs-auth-btn" onclick="startAnthropicOAuth()">Login with Claude</button>
-              </div>
-              <div class="gs-card" id="gs-step-agent">
-                <div class="gs-step-num">2</div>
-                <div class="gs-card-icon">&#128101;</div>
-                <div class="gs-card-title">Create an Agent</div>
-                <div class="gs-card-desc">Hire your first AI team member with a role, tools, and a channel.</div>
-                <button class="btn btn-sm btn-primary" onclick="navigateTo('team')">Go to The Office</button>
-              </div>
-              <div class="gs-card" id="gs-step-channel">
-                <div class="gs-step-num">3</div>
-                <div class="gs-card-icon">&#128172;</div>
-                <div class="gs-card-title">Connect a Channel</div>
-                <div class="gs-card-desc">Link Discord or Slack so your agents can communicate.</div>
-                <button class="btn btn-sm" onclick="navigateTo('settings', { tab: 'channels' })">Open Settings</button>
-              </div>
-              <div class="gs-card" id="gs-step-task">
-                <div class="gs-step-num">4</div>
-                <div class="gs-card-icon">&#9200;</div>
-                <div class="gs-card-title">Schedule a Task</div>
-                <div class="gs-card-desc">Set up cron jobs so agents work on autopilot.</div>
-                <button class="btn btn-sm" onclick="navigateTo('build', { tab: 'crons' })">Add a Task</button>
-              </div>
-              <div class="gs-card" id="gs-step-project">
-                <div class="gs-step-num">5</div>
-                <div class="gs-card-icon">&#128194;</div>
-                <div class="gs-card-title">Link a Project</div>
-                <div class="gs-card-desc">Give agents context about your codebases and tools.</div>
-                <button class="btn btn-sm" onclick="navigateTo('settings', { tab: 'projects' })">Browse Projects</button>
-              </div>
+            <div class="gs-card" id="gs-step-agent">
+              <div class="gs-step-num">2</div>
+              <div class="gs-card-icon">&#128101;</div>
+              <div class="gs-card-title">Create an Agent</div>
+              <div class="gs-card-desc">Hire your first AI team member with a role, tools, and a channel.</div>
+              <button class="btn btn-sm btn-primary" onclick="navigateTo('team')">Go to The Office</button>
+            </div>
+            <div class="gs-card" id="gs-step-channel">
+              <div class="gs-step-num">3</div>
+              <div class="gs-card-icon">&#128172;</div>
+              <div class="gs-card-title">Connect a Channel</div>
+              <div class="gs-card-desc">Link Discord or Slack so your agents can communicate.</div>
+              <button class="btn btn-sm" onclick="navigateTo('settings', { tab: 'channels' })">Open Settings</button>
+            </div>
+            <div class="gs-card" id="gs-step-task">
+              <div class="gs-step-num">4</div>
+              <div class="gs-card-icon">&#9200;</div>
+              <div class="gs-card-title">Schedule a Task</div>
+              <div class="gs-card-desc">Set up cron jobs so agents work on autopilot.</div>
+              <button class="btn btn-sm" onclick="navigateTo('build', { tab: 'crons' })">Add a Task</button>
+            </div>
+            <div class="gs-card" id="gs-step-project">
+              <div class="gs-step-num">5</div>
+              <div class="gs-card-icon">&#128194;</div>
+              <div class="gs-card-title">Link a Project</div>
+              <div class="gs-card-desc">Give agents context about your codebases and tools.</div>
+              <button class="btn btn-sm" onclick="navigateTo('settings', { tab: 'projects' })">Browse Projects</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- Greeting -->
+        <header class="home-greeting">
+          <div class="home-greeting-text">
+            <h1 id="home-greet-line"><span id="home-greet-phrase">Hello</span><span id="home-greet-comma">,</span> <span id="home-greet-name">there</span></h1>
+            <p id="home-greet-day" class="home-greeting-day">…</p>
+          </div>
+          <div class="home-greeting-actions">
+            <button class="btn-sm btn-ghost" onclick="refreshHomeDigest()" title="Refresh dashboard">
+              <span class="icon-slot" data-icon="refresh"></span>
+            </button>
+          </div>
+        </header>
+
+        <!-- KPI strip -->
+        <section class="kpi-strip" id="home-kpis">
+          <div class="kpi-tile" data-kpi="activeRuns" onclick="navigateTo('build',{tab:'workflows'})">
+            <div class="kpi-icon" data-icon="zap"></div>
+            <div class="kpi-value" id="kpi-active-runs">--</div>
+            <div class="kpi-label">Active runs</div>
+          </div>
+          <div class="kpi-tile" data-kpi="runsToday">
+            <div class="kpi-icon" data-icon="clock"></div>
+            <div class="kpi-value" id="kpi-runs-today">--</div>
+            <div class="kpi-label">Runs today</div>
+          </div>
+          <div class="kpi-tile" data-kpi="timeSaved">
+            <div class="kpi-icon" data-icon="sparkles"></div>
+            <div class="kpi-value" id="kpi-time-saved">--</div>
+            <div class="kpi-label">Saved this week</div>
+          </div>
+          <div class="kpi-tile" data-kpi="approvals" onclick="navigateTo('brain',{tab:'learning'})">
+            <div class="kpi-icon" data-icon="check"></div>
+            <div class="kpi-value" id="kpi-approvals">--</div>
+            <div class="kpi-label">Need approval</div>
+          </div>
+          <div class="kpi-tile" data-kpi="overdue" onclick="navigateTo('team',{tab:'goals'})">
+            <div class="kpi-icon" data-icon="target"></div>
+            <div class="kpi-value" id="kpi-overdue">--</div>
+            <div class="kpi-label">Overdue</div>
+          </div>
+        </section>
+
+        <!-- Today's briefing + Today's runs side-by-side -->
+        <section class="home-grid-2">
+          <div class="card briefing-card">
+            <div class="card-header">
+              <span><span class="icon-slot" data-icon="fileText"></span> Today's briefing</span>
+              <span style="font-size:var(--text-xs);color:var(--text-muted)" id="briefing-source-hint"></span>
+            </div>
+            <div class="card-body" id="briefing-body">
+              <div class="skel-block"><div class="skel-row med"></div><div class="skel-row"></div><div class="skel-row short"></div></div>
             </div>
           </div>
 
-          <!-- Chat panel — primary surface -->
-          <div class="home-chat">
-            <div id="chat-messages" class="home-chat-messages">
-              <div class="empty-state" style="margin-top:32px">
-                <p style="margin-bottom:14px;color:var(--text-muted)">What can I help with?</p>
-                <div style="display:flex;flex-wrap:wrap;gap:8px;justify-content:center">
-                  <button class="btn btn-sm quick-pill" onclick="quickChat(&quot;What&apos;s on my schedule?&quot;)">What's on my schedule?</button>
-                  <button class="btn btn-sm quick-pill" onclick="quickChat('Check my email')">Check my email</button>
-                  <button class="btn btn-sm quick-pill" onclick="quickChat('Run morning briefing')">Run morning briefing</button>
-                  <button class="btn btn-sm quick-pill" onclick="quickChat('What did you do today?')">What did you do today?</button>
-                </div>
-              </div>
+          <div class="card runs-card">
+            <div class="card-header">
+              <span><span class="icon-slot" data-icon="clock"></span> Today's runs</span>
+              <button class="btn-sm btn-ghost" onclick="navigateTo('build',{tab:'crons'})" style="font-size:var(--text-xs);padding:2px 8px">View all</button>
             </div>
-            <div class="home-chat-input-row">
-              <input type="text" id="chat-input" placeholder="Ask Clementine anything..." onkeydown="if(event.key==='Enter'&amp;&amp;!event.shiftKey){event.preventDefault();sendChat()}">
-              <select id="chat-profile-select" onchange="switchProfile(this.value)" title="Active profile">
-                <option value="">Default</option>
+            <div class="card-body" id="today-runs-body">
+              <div class="skel-block"><div class="skel-row med"></div><div class="skel-row short"></div></div>
+            </div>
+          </div>
+        </section>
+
+        <!-- Recent activity -->
+        <section class="card home-activity">
+          <div class="card-header" style="display:flex;justify-content:space-between;align-items:center">
+            <span><span class="icon-slot" data-icon="list"></span> Recent activity</span>
+            <div style="display:flex;gap:6px;align-items:center">
+              <select id="activity-source-filter" onchange="refreshActivity()" style="font-size:var(--text-xs);padding:3px 8px;border:1px solid var(--border);border-radius:var(--radius-xs);background:var(--bg-secondary);color:var(--text-primary)">
+                <option value="">All sources</option>
+                <option value="cron">Cron</option>
+                <option value="activity">Activities</option>
+                <option value="send">Emails</option>
+                <option value="approval">Approvals</option>
+                <option value="memory">Memory</option>
               </select>
-              <button class="btn-primary" id="chat-send-btn" onclick="sendChat()">Send</button>
+              <select id="activity-agent-filter" onchange="refreshActivity()" style="font-size:var(--text-xs);padding:3px 8px;border:1px solid var(--border);border-radius:var(--radius-xs);background:var(--bg-secondary);color:var(--text-primary)">
+                <option value="">All agents</option>
+              </select>
             </div>
           </div>
-
-          <!-- Activity feed -->
-          <div class="card home-activity">
-            <div class="card-header" style="display:flex;justify-content:space-between;align-items:center">
-              <span>Live activity</span>
-              <div style="display:flex;gap:6px;align-items:center">
-                <select id="activity-source-filter" onchange="refreshActivity()" style="font-size:11px;padding:2px 6px;border:1px solid var(--border);border-radius:4px;background:var(--bg-secondary);color:var(--text-primary)">
-                  <option value="">All Sources</option>
-                  <option value="cron">Cron</option>
-                  <option value="activity">Activities</option>
-                  <option value="send">Emails</option>
-                  <option value="approval">Approvals</option>
-                  <option value="memory">Memory</option>
-                </select>
-                <select id="activity-agent-filter" onchange="refreshActivity()" style="font-size:11px;padding:2px 6px;border:1px solid var(--border);border-radius:4px;background:var(--bg-secondary);color:var(--text-primary)">
-                  <option value="">All Agents</option>
-                </select>
-              </div>
-            </div>
-            <div class="card-body" id="panel-activity"><div class="skel-block"><div class="skel-row med"></div><div class="skel-row"></div><div class="skel-row short"></div></div></div>
-          </div>
-        </main>
-
-        <!-- Right rail: Today / Upcoming / Active / Time-saved / Approvals -->
-        <aside class="home-rail" id="home-rail">
-          <button class="rail-collapse-btn" onclick="toggleHomeRail()" title="Hide rail">&times;</button>
-
-          <section class="rail-card">
-            <div class="rail-header">
-              <span><span class="status-pip green"></span>Daemon</span>
-              <span id="rail-daemon-uptime" style="font-size:11px;color:var(--text-muted)">--</span>
-            </div>
-            <div class="rail-body" id="rail-daemon-body">
-              <div class="agent-activity" id="agent-activity"><span class="agent-activity-dot"></span><span>Loading...</span></div>
-            </div>
-          </section>
-
-          <section class="rail-card">
-            <div class="rail-header">
-              <span>Today</span>
-              <input type="date" id="plan-date-picker" style="padding:2px 6px;font-size:10px;background:var(--bg-input);border:1px solid var(--border);border-radius:3px;color:var(--text-primary)">
-            </div>
-            <div class="rail-body" id="home-plan-content"><div class="skel-row med"></div><div class="skel-row"></div></div>
-          </section>
-
-          <section class="rail-card">
-            <div class="rail-header"><span>Upcoming runs</span><span id="rail-upcoming-count" class="rail-badge">0</span></div>
-            <div class="rail-body" id="rail-upcoming"><div class="skel-row short"></div></div>
-          </section>
-
-          <section class="rail-card">
-            <div class="rail-header"><span>Active runs</span><span id="rail-active-count" class="rail-badge" style="display:none">0</span></div>
-            <div class="rail-body" id="rail-active"><div style="font-size:12px;color:var(--text-muted)">Nothing running.</div></div>
-          </section>
-
-          <section class="rail-card">
-            <div class="rail-header"><span>Time saved this week</span></div>
-            <div class="rail-body" id="rail-time-saved"><div class="skel-row short"></div></div>
-          </section>
-
-          <section class="rail-card">
-            <div class="rail-header"><span>Approvals</span><span id="rail-approvals-count" class="rail-badge" style="display:none">0</span></div>
-            <div class="rail-body" id="rail-approvals"><div style="font-size:12px;color:var(--text-muted)">Nothing pending.</div></div>
-          </section>
-        </aside>
-        <button class="home-rail-toggle" onclick="toggleHomeRail()" title="Open status rail">&#9776;</button>
+          <div class="card-body" id="panel-activity"><div class="skel-block"><div class="skel-row med"></div><div class="skel-row"></div><div class="skel-row short"></div></div></div>
+        </section>
       </div>
     </div>
 
@@ -13049,6 +13629,41 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
       </script>
     </div>
 
+    <!-- Floating chat FAB + panel — anchored bottom-right.
+         Pass 3 styles this; structure is here so existing chat handlers
+         (sendChat, switchProfile, quickChat) keep finding the IDs they target. -->
+    <button id="home-chat-fab" class="home-chat-fab" onclick="toggleHomeChat()" title="Ask Clementine (?)">
+      <span class="icon-slot" data-icon="messageSquare"></span>
+      <span class="home-chat-fab-label">Ask Clementine</span>
+    </button>
+    <div id="home-chat-panel" class="home-chat-panel" aria-hidden="true">
+      <div class="home-chat-panel-header">
+        <span><span class="icon-slot" data-icon="messageSquare"></span> Chat</span>
+        <span style="flex:1"></span>
+        <select id="chat-profile-select" onchange="switchProfile(this.value)" title="Active profile">
+          <option value="">Default</option>
+        </select>
+        <button class="btn-icon btn-sm" onclick="toggleHomeChat()" title="Close chat">×</button>
+      </div>
+      <div id="chat-messages" class="home-chat-panel-messages">
+        <div class="empty-state" style="margin-top:24px">
+          <p style="margin-bottom:12px;color:var(--text-muted);font-size:var(--text-base)">What can I help with?</p>
+          <div style="display:flex;flex-wrap:wrap;gap:6px;justify-content:center">
+            <button class="btn btn-sm quick-pill" onclick="quickChat(&quot;What&apos;s on my schedule?&quot;)">Schedule?</button>
+            <button class="btn btn-sm quick-pill" onclick="quickChat('Check my email')">Email</button>
+            <button class="btn btn-sm quick-pill" onclick="quickChat('Run morning briefing')">Briefing</button>
+            <button class="btn btn-sm quick-pill" onclick="quickChat('What did you do today?')">Today's work</button>
+          </div>
+        </div>
+      </div>
+      <div class="home-chat-panel-input-row">
+        <input type="text" id="chat-input" placeholder="Ask anything..." onkeydown="if(event.key==='Enter'&amp;&amp;!event.shiftKey){event.preventDefault();sendChat()}">
+        <button class="btn-primary btn-sm" id="chat-send-btn" onclick="sendChat()" title="Send">
+          <span class="icon-slot" data-icon="send"></span>
+        </button>
+      </div>
+    </div>
+
     <!-- Sessions, Trust & Claims, Logs, Chat, Metrics, Daily Plan pages
          removed in Session 2 — content lives on Home or migrates to other
          destinations in Sessions 3-4. Page references for these IDs are
@@ -14242,6 +14857,7 @@ function navigateTo(page, opts) {
   switch (page) {
     case 'home':
       refreshAll();
+      if (typeof refreshHomeDigest === 'function') refreshHomeDigest();
       // tab is a soft hint on Home (one cohesive layout): focus the relevant area.
       var t = opts.tab || 'chat';
       setTimeout(function() {
@@ -20774,6 +21390,147 @@ async function saveDiscordSetup() {
   } catch(e) { toast(String(e), 'error'); }
 }
 
+// ── Home digest (v1.5 daily-driver) ────────────────────────────
+async function refreshHomeDigest() {
+  try {
+    var r = await apiFetch('/api/home-digest');
+    var d = await r.json();
+    if (!d || d.error) return;
+
+    // Greeting
+    var greetPhraseEl = document.getElementById('home-greet-phrase');
+    var greetNameEl = document.getElementById('home-greet-name');
+    var greetDayEl = document.getElementById('home-greet-day');
+    if (d.greeting) {
+      if (greetPhraseEl) greetPhraseEl.textContent = d.greeting.phrase || 'Hello';
+      if (greetNameEl) greetNameEl.textContent = d.greeting.name || 'there';
+      if (greetDayEl) greetDayEl.textContent = d.greeting.dayLabel || '';
+    }
+
+    // KPIs
+    var k = d.kpis || {};
+    var setKpi = function(id, value, alertWhen) {
+      var el = document.getElementById(id);
+      if (!el) return;
+      el.textContent = (value == null) ? '0' : String(value);
+      var tile = el.closest('.kpi-tile');
+      if (tile) {
+        tile.classList.toggle('alert', alertWhen);
+        tile.classList.toggle('muted', !value);
+      }
+      el.classList.toggle('muted', !value);
+    };
+    setKpi('kpi-active-runs', k.activeRuns || 0, (k.activeRuns || 0) > 0);
+    setKpi('kpi-runs-today', k.runsToday || 0, false);
+    var minutes = k.timeSavedMinutes || 0;
+    var savedEl = document.getElementById('kpi-time-saved');
+    if (savedEl) {
+      savedEl.textContent = minutes >= 60 ? (minutes / 60).toFixed(1) + 'h' : (minutes + 'm');
+      savedEl.classList.toggle('muted', minutes === 0);
+    }
+    setKpi('kpi-approvals', k.pendingApprovals || 0, (k.pendingApprovals || 0) > 0);
+    setKpi('kpi-overdue', k.overdueTasks || 0, (k.overdueTasks || 0) > 0);
+
+    // Briefing
+    var briefBody = document.getElementById('briefing-body');
+    var briefHint = document.getElementById('briefing-source-hint');
+    if (briefBody) {
+      var b = d.briefing || { highlights: [], needsReview: [] };
+      var html = '';
+      if (b.highlights.length) {
+        html += '<div class="briefing-section-title">What\\x27s happened today</div>';
+        html += '<ul class="briefing-list">';
+        for (var i = 0; i < b.highlights.length; i++) {
+          html += '<li class="briefing-item">' + esc(b.highlights[i].text) + '</li>';
+        }
+        html += '</ul>';
+      } else {
+        html += '<div style="color:var(--text-muted);font-size:var(--text-base);padding:6px 0">No notable activity in today\\x27s daily note yet. Your team\\x27s morning briefing fires at 8:00am.</div>';
+      }
+      if (b.needsReview.length) {
+        html += '<div class="briefing-section-title" style="margin-top:18px">Needs your review</div>';
+        html += '<ul class="briefing-list">';
+        for (var j = 0; j < b.needsReview.length; j++) {
+          var item = b.needsReview[j];
+          var hrefAttr = item.href ? 'onclick="briefingNeedsReviewClick(\\x27' + esc(item.href) + '\\x27)"' : '';
+          html += '<li class="briefing-item review" ' + hrefAttr + '>' + esc(item.text) + (item.href ? '<span class="arrow">&rarr;</span>' : '') + '</li>';
+        }
+        html += '</ul>';
+      }
+      briefBody.innerHTML = html;
+      if (briefHint) {
+        var sourceCount = b.highlights.filter(function(h) { return h.source === 'daily-note'; }).length;
+        briefHint.textContent = sourceCount > 0 ? ('from today\\x27s daily note') : (b.highlights.length > 0 ? 'from recent activity' : '');
+      }
+    }
+
+    // Today's runs
+    var runsBody = document.getElementById('today-runs-body');
+    if (runsBody) {
+      var runs = d.todayRuns || [];
+      if (!runs.length) {
+        runsBody.innerHTML = '<div style="padding:14px 18px;color:var(--text-muted);font-size:var(--text-sm)">No scheduled runs configured. <a href="#" onclick="navigateTo(\\x27build\\x27,{tab:\\x27crons\\x27});return false" style="color:var(--clementine)">Add one in Build &rarr; Crons</a>.</div>';
+      } else {
+        var html2 = '';
+        for (var n = 0; n < runs.length; n++) {
+          var run = runs[n];
+          var status = run.firedToday ? 'fired' : 'upcoming';
+          var label = run.firedToday ? 'fired today' : (run.nextRun ? timeUntil(run.nextRun) : 'manual');
+          html2 += '<div class="run-row ' + status + '" onclick="navigateTo(\\x27build\\x27,{tab:\\x27crons\\x27})">'
+            + '<span class="run-icon">' + (status === 'fired' ? lucide('check', 'icn-sm') : lucide('clock', 'icn-sm')) + '</span>'
+            + '<span class="run-name">' + esc(run.name) + '</span>'
+            + '<span class="run-time">' + esc(label) + '</span>'
+            + '</div>';
+        }
+        runsBody.innerHTML = html2;
+      }
+    }
+  } catch (err) {
+    console.warn('refreshHomeDigest failed:', err);
+  }
+}
+
+// ── Home chat FAB + panel ────────────────────────────────────────
+function toggleHomeChat(forceOpen) {
+  var fab = document.getElementById('home-chat-fab');
+  var panel = document.getElementById('home-chat-panel');
+  if (!panel || !fab) return;
+  var willOpen = forceOpen != null ? !!forceOpen : !panel.classList.contains('open');
+  panel.classList.toggle('open', willOpen);
+  panel.setAttribute('aria-hidden', willOpen ? 'false' : 'true');
+  fab.classList.toggle('hidden', willOpen);
+  if (willOpen) {
+    setTimeout(function() {
+      var input = document.getElementById('chat-input');
+      if (input) input.focus();
+    }, 80);
+    if (typeof loadProfiles === 'function') loadProfiles();
+  }
+}
+
+// Keyboard shortcut: ? toggles chat (when not typing in another input)
+document.addEventListener('keydown', function(e) {
+  if (e.key === '?' && !e.metaKey && !e.ctrlKey) {
+    var t = e.target;
+    if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return;
+    e.preventDefault();
+    toggleHomeChat();
+  }
+  // Esc closes chat panel
+  if (e.key === 'Escape') {
+    var panel = document.getElementById('home-chat-panel');
+    if (panel && panel.classList.contains('open')) toggleHomeChat(false);
+  }
+});
+
+function briefingNeedsReviewClick(href) {
+  if (!href) return;
+  if (href.startsWith('#')) {
+    var parts = href.replace(/^#/, '').split('/');
+    if (parts[0]) navigateTo(parts[0], parts[1] ? { tab: parts[1] } : {});
+  }
+}
+
 function toggleHomeRail() {
   var rail = document.getElementById('home-rail');
   if (!rail) return;
@@ -24228,8 +24985,8 @@ async function refreshSalesforce() {
     if (d.status) { try { refreshStatus(d.status); } catch(e) { console.warn('init: status', e); } }
     if (d.activity) { try { refreshActivity(false, d.activity); } catch(e) { console.warn('init: activity', e); } }
     else { try { refreshActivity(); } catch(e) { console.warn('init: activity fallback', e); } }
-    // Populate the home right rail (daemon, plan, runs, time-saved, approvals)
-    if (typeof refreshHomeRail === 'function') { try { refreshHomeRail(); } catch(e) { console.warn('init: rail', e); } }
+    // Populate the home digest (greeting, KPIs, briefing, today's runs)
+    if (typeof refreshHomeDigest === 'function') { try { refreshHomeDigest(); } catch(e) { console.warn('init: digest', e); } }
     if (d.office) { try { refreshTeamNav(d.office); refreshTeamPulse(d.office); } catch(e) { console.warn('init: office', e); } }
     if (d.plan) { try { refreshHomePlan(d.plan); } catch(e) { console.warn('init: plan', e); } }
     if (d.version) { try { _loadedHash = d.version.started; } catch(e) { /* ignore */ } }
