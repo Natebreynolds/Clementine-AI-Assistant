@@ -20,43 +20,15 @@ Connects to Discord, Slack, Telegram, WhatsApp, and webhooks. Remembers everythi
 
 ## How it works
 
-Clementine is three layers stacked on a shared memory store:
+Clementine is four layers over a shared memory store:
 
 ```
-                    ┌─────────────────────────────────────────┐
-                    │            Channel Layer                 │
-                    │  Discord · Slack · Telegram · WhatsApp   │
-                    │  Webhook API · Discord Guild Channels     │
-                    └────────────────┬────────────────────────┘
-                                     │
-                    ┌────────────────▼────────────────────────┐
-                    │           Gateway Layer                  │
-                    │  Router · Session Manager · Heartbeat    │
-                    │  Cron Scheduler · Unleashed Engine       │
-                    │  Notification Dispatch                   │
-                    └────────────────┬────────────────────────┘
-                                     │
-                    ┌────────────────▼────────────────────────┐
-                    │            Agent Layer                   │
-                    │  Claude Code SDK · Security Hooks        │
-                    │  Auto-Memory · Session Rotation          │
-                    │  Agent Profiles · Sub-Agent Teams        │
-                    │  Self-Improvement Loop                   │
-                    └────────────────┬────────────────────────┘
-                                     │
-                    ┌────────────────▼────────────────────────┐
-                    │          MCP Tool Server                 │
-                    │  30+ tools over stdio transport          │
-                    │  Memory · Tasks · Vault · Workspace      │
-                    └────────────────┬────────────────────────┘
-                                     │
-              ┌──────────────────────▼──────────────────────┐
-              │              Memory Store                    │
-              │  SQLite FTS5 · Salience Scoring · Decay     │
-              │  Episodic Memory · Wikilink Graph            │
-              │  FalkorDB Knowledge Graph · Procedural Skills│
-              │  Obsidian Vault (source of truth)            │
-              └─────────────────────────────────────────────┘
+  Channels   →   Gateway     →   Agent           →   MCP tools  →   Memory
+  Discord        Router          Claude SDK          100+ tools     SQLite FTS5
+  Slack          Sessions        Security hooks      stdio          + vectors
+  Telegram       Heartbeats      Auto-memory                        Knowledge graph
+  WhatsApp       Cron + queues   Sub-agents                         Obsidian vault
+  Webhook        Delivery        Self-improve                       (source of truth)
 ```
 
 ### The memory loop
@@ -86,7 +58,7 @@ clementine dashboard      # open the web command center
 
 Already installed? Update in place with `clementine update`.
 
-### Troubleshooting
+### Install issues
 
 **`EACCES: permission denied` on `npm install -g`.** Your Node was installed system-wide (`/usr/local/lib/...`) and npm can't write there without sudo. Fix it once, permanently:
 
@@ -127,72 +99,34 @@ Handles system dependencies (redis, libomp, build tools), npm packages, TypeScri
 ~/.clementine/                     ← Data home (created on first run)
 ├── .env                           ← Configuration (created by setup wizard)
 ├── .sessions.json                 ← Session persistence
-├── .memory.db                     ← (legacy, unused — real DB is vault/.memory.db)
 ├── .clementine.pid                ← Daemon PID lock
-├── logs/
-│   ├── clementine.log             ← Daemon stdout/stderr
-│   └── audit.log                  ← Security audit trail
+├── logs/                          ← Daemon log + security audit log
 ├── cron/runs/                     ← Per-job JSONL run logs
-├── unleashed/                     ← Unleashed task progress & checkpoints
-│   └── <task>/
-│       ├── status.json            ← Current status, phase, timing
-│       └── progress.jsonl         ← Phase-by-phase event log
-├── self-improve/                  ← Self-improvement state
-│   ├── experiment-log.jsonl       ← Append-only experiment history
-│   ├── state.json                 ← Loop status, baseline metrics
-│   └── pending-changes/           ← Proposed diffs awaiting approval
-│       └── {experiment-id}.json
-└── vault/                         ← Obsidian-compatible vault
-    ├── 00-System/                 ← SOUL.md, MEMORY.md, HEARTBEAT.md, CRON.md
-    │   └── skills/                ← Procedural memory (auto-extracted from successful tasks)
-    ├── 01-Daily-Notes/            ← Auto-generated daily logs (YYYY-MM-DD.md)
-    ├── 02-People/                 ← Person notes (auto-created from conversations)
-    ├── 03-Projects/               ← Project notes
-    ├── 04-Topics/                 ← Knowledge topics
-    ├── 05-Tasks/                  ← TASKS.md master list ({T-NNN} IDs)
-    ├── 06-Templates/              ← Note templates
-    └── 07-Inbox/                  ← Quick captures
+├── unleashed/<task>/              ← Long-running task progress + status
+├── self-improve/                  ← Experiment log, state, pending proposals
+├── heartbeat/agents/<slug>/       ← Per-agent heartbeat state
+└── vault/                         ← Obsidian-compatible vault (see Vault section)
+    └── .memory.db                 ← SQLite FTS5 + vector index
 
-src/                               ← Package code (wherever npm installed it)
-├── agent/
-│   ├── assistant.ts               ← PersonalAssistant — the brain
-│   ├── hooks.ts                   ← Security enforcement (3-tier model)
-│   ├── profiles.ts                ← Agent profile switching
-│   └── self-improve.ts            ← Nightly self-improvement loop engine
-├── channels/
-│   ├── discord.ts                 ← Discord.js adapter
-│   ├── slack.ts                   ← Slack Socket Mode adapter
-│   ├── telegram.ts                ← grammY adapter
-│   ├── whatsapp.ts                ← Twilio WhatsApp bridge
-│   └── webhook.ts                 ← HTTP webhook API
-├── gateway/
-│   ├── router.ts                  ← Message routing + session management
-│   ├── heartbeat.ts               ← HeartbeatScheduler + CronScheduler
-│   └── notifications.ts           ← Channel-agnostic notification fan-out
-├── memory/
-│   ├── store.ts                   ← SQLite FTS5 memory store + embedding backfill
-│   ├── embeddings.ts              ← TF-IDF embedding provider (local, 512-dim vectors)
-│   ├── search.ts                  ← Temporal decay, dedup, formatting
-│   ├── chunker.ts                 ← Vault file parser (## headers, frontmatter)
-│   ├── mmr.ts                     ← Maximal Marginal Relevance reranker
-│   ├── consolidation.ts           ← Evening consolidation engine (dedup, summarize, extract)
-│   ├── context-assembler.ts       ← Token-budgeted context slot filler
-│   └── graph-store.ts             ← FalkorDB knowledge graph layer (optional)
-├── tools/                         ← MCP stdio server (30+ tools, decomposed by domain)
-│   ├── mcp-server.ts             ← Server entry + registration
-│   ├── goal-tools.ts             ← Goal lifecycle tools
-│   ├── vault-tools.ts            ← Vault read/write/search tools
-│   ├── team-tools.ts             ← Team agent tools
-│   ├── session-tools.ts          ← Session management tools
-│   └── admin-tools.ts            ← System admin tools
-├── cli/
-│   ├── index.ts                   ← CLI commands (launch, stop, status, config, doctor)
-│   ├── setup.ts                   ← Interactive configuration wizard
-│   ├── dashboard.ts               ← Local web dashboard (command center)
-│   └── cron.ts                    ← Cron job runner and scheduler
-├── config.ts                      ← Paths, secrets, models (never pollutes process.env)
-├── types.ts                       ← Shared TypeScript interfaces
-└── index.ts                       ← Main entry point (multi-channel startup)
+src/                               ← Package code (npm install location)
+├── agent/                         ← The brain: assistant, hooks, agent manager,
+│                                    proactive engine, self-improvement, advisor,
+│                                    skill extraction, complexity classifier, …
+├── channels/                      ← Discord, Slack, Telegram, WhatsApp, Webhook
+│                                    (+ per-agent Discord/Slack bot managers)
+├── gateway/                       ← Router, heartbeat schedulers, cron scheduler,
+│                                    delivery queue, failure monitor
+├── memory/                        ← SQLite FTS5 store, embeddings, MMR rerank,
+│                                    chunker, consolidation, graph store
+├── tools/                         ← MCP stdio server (100+ tools, by domain)
+├── cli/                           ← CLI entry, setup wizard, dashboard, cron runner
+├── brain/                         ← Ingestion pipeline + connectors
+├── analytics/                     ← Tool-usage telemetry
+├── security/, secrets/            ← Secret/credential helpers, hardening
+├── vault-migrations/              ← Versioned vault upgrades
+├── config.ts                      ← Paths, secrets, models (never leaks to env)
+├── types.ts                       ← Shared TypeScript types
+└── index.ts                       ← Multi-channel startup entry
 ```
 
 ### Code vs. data separation
@@ -220,143 +154,99 @@ Secrets never reach the Claude subprocess — `SAFE_ENV` filters credentials fro
 
 ### Memory architecture
 
-Three-layer retrieval merges full-text, vector, and recency signals into a single ranked context window:
+Retrieval merges three signals (FTS5 BM25, TF-IDF cosine, recency), reranks with MMR for diversity, and fills a token-budgeted context window. After each turn, a background Sonnet pass extracts memories to the vault. Sessions get summarized into episodic chunks. A nightly consolidation pass dedups, summarizes, and rebuilds the embedding vocabulary. Startup applies temporal decay and prunes old data.
 
-```
-User message
-    │
-    ├──▶ Layer 1: FTS5 (BM25 relevance)
-    ├──▶ Layer 2: TF-IDF vector similarity (cosine, threshold 0.15)
-    ├──▶ Layer 3: Recent chunks (time-windowed)
-    │
-    ▼
-┌──────────────────┐     ┌────────────────────┐
-│ MMR rerank       │────▶│ Context assembly    │──▶ System prompt
-│ + deduplication  │     │ (token-budgeted)    │
-└──────────────────┘     └────────────────────┘
-    │
-    │ salience boost on retrieval
-    ▼
-┌──────────────┐     ┌────────────────────┐
-│ Assistant     │────▶│ Auto-memory pass   │──▶ Vault writes
-│ responds     │     │ (background Sonnet) │    (MEMORY.md, people, tasks)
-└──────────────┘     └────────────────────┘
-    │
-    ▼
-┌──────────────┐
-│ Session       │──▶ Episodic chunk indexed
-│ summarization │    (sector='episodic')
-└──────────────┘
-    │
-    ▼
-┌──────────────────────┐
-│ Evening consolidation │──▶ Dedup (Jaccard) + topic summarization (LLM)
-│ + embedding rebuild   │    + principle extraction + TF-IDF vocab rebuild
-└──────────────────────┘
-    │
-    ▼
-┌──────────────┐
-│ Startup       │──▶ Temporal decay + pruning
-│ maintenance   │    (stale memories sink, old data trimmed)
-└──────────────┘
-```
-
-- **FTS5** — Full-text search with BM25 ranking, zero-cost, zero-latency
-- **TF-IDF embeddings** — Local 512-dim vectors (no API calls), vocabulary rebuilt during sync and evening consolidation, cosine similarity search over recent chunks
-- **MMR reranking** — Maximal Marginal Relevance via Jaccard similarity removes near-duplicates and promotes diversity in results
-- **Salience scoring** — Chunks gain score on retrieval, decay over time (7-day half-life). Formula: `log(access_count + 1) * 0.15 + recency_decay * 0.3`
+- **FTS5** — Full-text BM25 search, local, zero-cost
+- **TF-IDF embeddings** — Local 512-dim vectors (no API calls), rebuilt nightly
+- **MMR reranking** — Jaccard-based diversity, removes near-duplicates
+- **Salience** — Boost on retrieval, 7-day half-life decay
 - **Episodic memory** — Session summaries indexed as searchable chunks
-- **Wikilink graph** — `[[wikilinks]]` parsed and queryable for connection discovery
-- **Knowledge graph** — FalkorDB-powered typed relationships and multi-hop traversal (people → projects → topics). Visualized on a dark canvas in the dashboard with type legend and edge labels.
-- **Procedural skills** — Reusable how-to recipes auto-extracted from successful task executions. Stored as Markdown in `vault/00-System/skills/` and injected into cron jobs and unleashed tasks at runtime. Teach new skills manually via the dashboard Skills tab or let Clementine learn them from conversations.
-- **Evening consolidation** — Nightly pass: deduplicates chunks by Jaccard similarity (>70%), summarizes topic groups via LLM (Haiku), extracts recurring behavioral corrections into permanent rules, and rebuilds TF-IDF vocabulary + backfills embeddings
-- **Agent isolation** — Per-agent memory scoping via `agent_slug` column. Soft mode (default) boosts matching agent chunks 1.4x; strict mode filters to agent + global only
-- **Memory transparency** — Every memory write is logged to `memory_extractions` with user correction/dismissal support from the dashboard
-- **Temporal decay** — Applied on every startup; stale memories naturally sink
-- **Pruning** — Episodic chunks >90 days with salience <0.01 are removed; old transcripts, access logs, and orphaned references trimmed
+- **Wikilink + knowledge graph** — `[[wikilinks]]` graph + optional FalkorDB typed relationships (visualized in dashboard)
+- **Procedural skills** — Auto-extracted from successful tasks, stored at `vault/00-System/skills/`, injected into future runs
+- **Evening consolidation** — Nightly: Jaccard dedup (>70%), topic summarization (Haiku), behavioral-rule extraction, vocabulary rebuild
+- **Agent isolation** — Per-agent scoping via `agent_slug`; soft (1.4× boost) or strict modes
+- **Transparency** — Every write logged to `memory_extractions`; correct/dismiss from dashboard
+- **Pruning** — Episodic >90 days with salience <0.01 removed; old transcripts and access logs trimmed
 
-### MCP tools (30+)
+### MCP tools (100+)
 
-| Tool | Description |
-|------|-------------|
-| `memory_read` | Read vault notes (shortcuts: today, yesterday, memory, tasks, soul) |
-| `memory_write` | Write/append to vault (daily log, MEMORY.md sections, arbitrary notes) |
-| `memory_search` | FTS5 full-text search across all vault notes |
-| `memory_recall` | Combined FTS5 + recency search with salience boost |
-| `memory_connections` | Query the wikilink graph for a note |
-| `memory_timeline` | Chronological view of vault changes by date range |
-| `transcript_search` | Search past conversation transcripts |
-| `note_create` | Create notes (person, project, topic, task, inbox) |
-| `note_take` | Quick timestamped capture to daily log |
-| `daily_note` | Create or read today's daily note |
-| `task_list` | List tasks with status/project filters |
-| `task_add` | Add tasks with priority, due dates, projects |
-| `task_update` | Update task status (supports recurring tasks) |
-| `vault_stats` | Dashboard of vault health and activity |
-| `rss_fetch` | Fetch and parse RSS/Atom feeds |
-| `github_prs` | Check GitHub PRs (review-requested + authored) |
-| `browser_screenshot` | Take screenshots via Kernel cloud browser |
-| `set_timer` | Set short-term reminders (notifies via active channels) |
-| `outlook_inbox` | Read recent emails from Outlook inbox |
-| `outlook_search` | Search Outlook emails by query |
-| `outlook_calendar` | View upcoming calendar events |
-| `outlook_draft` | Create an email draft in Outlook |
-| `outlook_send` | Send an email from Outlook (Tier 3, requires approval) |
-| `discord_channel_send` | Post messages to any Discord text channel by ID |
-| `workspace_config` | Add, remove, or list workspace directories at runtime |
-| `workspace_list` | Scan workspace directories for local project roots |
-| `workspace_info` | Read a project's README, CLAUDE.md, manifest, and directory tree |
-| `add_cron_job` | Create scheduled tasks (supports standard and unleashed mode, project context) |
-| `self_restart` | Restart the daemon (for self-updates and config changes) |
-| `analyze_image` | Analyze images with vision capabilities |
-| `memory_report` | Generate a transparency report of all memory extractions |
-| `memory_correct` | Correct or dismiss a previously extracted memory |
-| `feedback_log` | Log user feedback on responses |
-| `feedback_report` | View feedback history and patterns |
-| `team_list` | List all team agents with status, channel, and capabilities |
-| `team_message` | Send a message to another agent (permission-scoped, synchronous) |
-| `create_agent` | Create a new agent with name, role, tools, project, and team connections |
-| `self_improve_status` | Check self-improvement state, pending approvals, experiment history |
-| `self_improve_run` | Trigger a self-improvement analysis cycle |
+Tools are grouped by domain. Run `clementine tools` to see the live list.
+
+| Group | Examples |
+|-------|----------|
+| **Memory** | `memory_read`, `memory_write`, `memory_search`, `memory_recall`, `memory_connections`, `memory_timeline`, `memory_consolidate`, `memory_correct`, `memory_report`, `memory_graph_*` |
+| **Vault & notes** | `note_create`, `note_take`, `daily_note`, `task_list`, `task_add`, `task_update`, `vault_stats`, `transcript_search` |
+| **Workspace** | `workspace_config`, `workspace_list`, `workspace_info` |
+| **External** | `web_search`, `rss_fetch`, `github_prs`, `browser_screenshot`, `analyze_image`, `outlook_*`, `sf_*` (Salesforce), `discord_channel_*` |
+| **Agents & teams** | `create_agent`, `update_agent`, `delete_agent`, `team_list`, `team_message`, `team_request`, `team_status`, `delegate_task`, `wake_agent` |
+| **Goals & background** | `goal_create`, `goal_update`, `goal_work`, `start_background_task`, `get_background_task`, `discover_work` |
+| **Cron & workflows** | `add_cron_job`, `cron_list`, `cron_run_history`, `trigger_cron_job`, `workflow_create`, `workflow_run`, `workflow_save`, `workflow_*` |
+| **Self-improvement** | `self_improve_run`, `self_improve_status`, `self_edit_source`, `prompt_override_*`, `decision_reflection`, `feedback_log`, `feedback_report` |
+| **System** | `self_restart`, `self_update`, `set_timer`, `env_set`, `allow_tool`, `setup_integration`, `auth_profile_status` |
 
 ---
 
 ## CLI reference
 
+Run `clementine --help` to see everything; the most common commands:
+
+**Daemon**
 ```
-clementine launch              Start as background daemon (default)
-clementine launch -f           Start in foreground (debug mode)
-clementine launch --install    Install as macOS login service (survives reboots)
-clementine stop                Stop the daemon
-clementine restart             Stop + relaunch
-clementine rebuild             Build + restart daemon + dashboard in one step
-clementine status              Show PID, uptime, active channels
-clementine update              Pull latest, rebuild, reinstall (preserves config)
-clementine update --dry-run    Preview update without making changes
-clementine doctor              Verify configuration and vault health
-clementine doctor --fix        Auto-fix common issues (redis, sqlite, FalkorDB)
-clementine dashboard           Open the local web command center (localhost:3030)
-clementine tools               List available MCP tools, plugins, and channels
-clementine config setup        Interactive configuration wizard
-clementine config set KEY VAL  Set a single config value
-clementine config get KEY      Read a config value
-clementine config edit         Open .env in your editor ($EDITOR)
-clementine memory search <q>   Search memory from the terminal (FTS5)
-clementine projects list       Show all linked projects
-clementine projects add <path> Link a project directory (-d desc, -k keywords)
-clementine projects remove <p> Unlink a project directory
-clementine cron list           List all cron jobs and last run status
-clementine cron run <job>      Run a specific cron job
-clementine cron run-due        Run all due jobs (for OS scheduler)
-clementine cron runs [job]     View run history (with retry/error details)
-clementine cron install        Install OS-level scheduler (launchd/crontab)
-clementine cron uninstall      Remove OS-level scheduler
-clementine heartbeat           Run a one-shot heartbeat check
-clementine self-improve status Show self-improvement state and baseline metrics
-clementine self-improve run    Trigger a self-improvement cycle
-clementine self-improve history Show experiment history
-clementine self-improve apply <id>  Approve and apply a pending change
-clementine --help              Show all commands
+clementine launch [-f] [--install]   Start daemon (foreground / macOS login service)
+clementine stop | restart | rebuild  Lifecycle controls
+clementine status                    PID, uptime, active channels
+clementine update [--dry-run]        Pull latest, rebuild, reinstall (preserves config)
+clementine doctor [--fix]            Verify (and optionally repair) config and vault
+clementine dashboard                 Open the web command center (localhost:3030)
+clementine tools                     List available MCP tools, plugins, and channels
+```
+
+**Config & secrets**
+```
+clementine setup                     Interactive setup wizard
+clementine config set KEY VAL        Write to ~/.clementine/.env
+clementine config get KEY
+clementine config list               Show all overrides
+clementine config edit               Open .env in $EDITOR
+clementine login | auth              Authenticate Claude Code / OAuth providers
+```
+
+**Chat & memory**
+```
+clementine chat                      Interactive REPL
+clementine memory status             Index size, recent activity
+clementine memory search <q>         FTS5 search
+clementine memory dedup | reembed    Maintenance
+clementine brain digest              Run the brain digest pipeline
+```
+
+**Projects & agents**
+```
+clementine projects list | add <p> | remove <p>
+clementine agent list | new <slug> | show <slug>
+clementine skills list | pending | approve <name> | reject <name> | search <q>
+```
+
+**Cron, workflows, heartbeat**
+```
+clementine cron list | run <job> | run-due | runs [job]
+clementine cron add <name> <schedule> <prompt>
+clementine cron install | uninstall  OS-level scheduler (launchd / crontab)
+clementine workflow list | run <name>
+clementine heartbeat                 One-shot heartbeat tick
+```
+
+**Self-improvement**
+```
+clementine self-improve status | run | history | pending | apply <id>
+```
+
+**Diagnostics**
+```
+clementine advisor | rules           Live advisor rules
+clementine mode <mode>               Switch operating mode
+clementine analytics | tool-usage    Telemetry on tool usage
+clementine ingest seed <path> | run <slug> | list
 ```
 
 ### Daemon behavior
@@ -369,27 +259,17 @@ clementine --help              Show all commands
 
 ### Dashboard
 
-Run `clementine dashboard` to open a local web command center at `http://localhost:3030`. The dashboard provides:
+Run `clementine dashboard` to open the command center at `http://localhost:3030`. Five pages:
 
-- **Metrics** — Time saved estimates, session counts, cron job stats, memory size
-- **Chat** — Talk to your assistant directly from the browser
-- **Memory search** — Full-text search across all vault notes (FTS5)
-- **Scheduled tasks** — Create, edit, run, toggle, and delete cron jobs with a visual schedule builder
-- **Project-aware cron** — Assign cron jobs to specific project directories
-- **Unleashed mode** — Create long-running autonomous tasks, monitor phase progress, cancel running tasks
-- **Projects** — Browse all discovered workspace projects with type, description, and tool badges
-- **Live status** — Daemon health, LaunchAgent status, active channels
-- **Sessions** — View and manage active conversation sessions
-- **The Office** — Visual agent management with desk-station cards showing status, avatars, channels, and tools
-- **Hiring Interview** — Click "Hire a New Employee" and Clementine interviews you to build the agent config conversationally
-- **Manual Agent Setup** — Form modal with project dropdown (auto-populated from discovered projects) and categorized tool browser with checkboxes
-- **Auto-restart** — Daemon restarts automatically when the agent roster changes (from either the interview or manual path)
-- **Training Center** — Click any agent to open a 4-tab detail view: Schedule (per-agent cron jobs), Skills (per-agent procedural memory), Execution Traces (tool call history with timing), and Prompt Lab (test prompts against the agent)
-- **Skills** — Teach, view, and delete procedural skills. Skills are auto-extracted from successful tasks or taught manually via the dashboard.
-- **Self-Improvement** — View experiment history, approve/deny pending proposals, monitor baseline metrics
-- **Settings** — API key management, model config, custom env vars, service status
+| Page | What's there |
+|------|--------------|
+| **Home** | Chat with Clementine, today's briefing, recent activity, KPIs |
+| **Build** | Workflows, scheduled tasks (visual cron builder), skills, unleashed tasks |
+| **Team** | Agents (hire / edit / let go), goals, delegations, decision-reflection reports |
+| **Brain** | Memory search (FTS5), knowledge graph, ingestion sources, vault health |
+| **Settings** | Channels, integrations, API keys, model config, env vars, service status |
 
-No extra dependencies — the dashboard uses Express, which is already installed.
+Cron jobs can be project-aware (assign a `work_dir`) and switched between standard and unleashed mode. The agent roster auto-restarts the daemon on changes. No extra deps — runs on Express.
 
 ---
 
@@ -475,13 +355,13 @@ clementine restart
 
 ## Models
 
-| Tier | Model Alias | Use case |
-|------|-------------|----------|
-| `haiku` | `haiku` (latest Haiku) | Lightweight tasks, cron noise filtering |
-| `sonnet` | `sonnet` (latest Sonnet) | Default conversation + auto-memory extraction |
-| `opus` | `opus` (latest Opus) | Available via config or agent profiles |
+| Tier | Use case |
+|------|----------|
+| `haiku` | Lightweight tasks, cron noise filtering |
+| `sonnet` | Default conversation + auto-memory extraction |
+| `opus` | Per-agent override or global default |
 
-Model aliases always resolve to the latest version via the Claude Code SDK. To pin a specific version, set `DEFAULT_MODEL_TIER` to a full model name (e.g. `claude-sonnet-4-6`).
+Aliases resolve to the latest version via the Claude Code SDK. To pin a specific version, set `DEFAULT_MODEL_TIER` to a full model name (e.g. `claude-sonnet-4-6`). Each agent can override the model in its `agent.md` frontmatter.
 
 Change the default with `clementine config set DEFAULT_MODEL_TIER opus`, then `clementine restart`.
 
@@ -545,14 +425,12 @@ Clementine supports multi-agent teams — each agent gets its own Discord bot, c
 
 ### Creating agents
 
-Two paths to create a new agent:
+Open the **Team** page in the dashboard, then either:
 
-| Method | How |
-|--------|-----|
-| **Hiring interview** | Click "Hire a New Employee" in the dashboard (or an empty desk card). Clementine asks 3–5 questions about the agent's name, role, tools, project, and team connections, then calls `create_agent` automatically. |
-| **Manual setup** | Click "Manual Setup" to open a form with project dropdown, categorized tool browser, model selector, and team connection fields. |
+- **Hire a New Employee** — Clementine interviews you (3–5 questions: name, role, tools, project, team connections) and calls `create_agent`.
+- **Manual Setup** — form with project dropdown, categorized tool browser, model selector, and team-connection fields.
 
-Both paths trigger an automatic daemon restart when the new agent is detected.
+Both paths auto-restart the daemon when the new agent appears.
 
 ### Agent configuration
 
@@ -576,14 +454,6 @@ Each agent is defined by a YAML frontmatter file in `~/.clementine/vault/00-Syst
 Agents communicate via the `team_message` tool. Messages are permission-scoped — an agent can only message slugs listed in its `canMessage` field. The primary agent can message anyone.
 
 Messages are delivered synchronously: the sender waits for the recipient's response. Conversation depth is tracked to prevent infinite loops.
-
-### The Office (dashboard)
-
-The dashboard's "The Office" page shows each agent as an animated desk station with:
-- Live status indicator (online / connecting / error / offline)
-- Discord bot avatar (auto-pulled) or initial
-- Channel assignment, model badge, project badge, tool count
-- Edit and "Let Go" (delete) actions
 
 ### Decision-loop reflection
 
@@ -657,20 +527,14 @@ The dashboard provides a visual schedule builder with dropdowns for frequency (d
 
 ## Unleashed mode
 
-For tasks that take hours — codebase refactors, research projects, content generation pipelines — unleashed mode runs autonomously with phased execution and checkpointing.
-
-```
-Phase 1 (75 turns) ──▶ Checkpoint ──▶ Phase 2 (75 turns) ──▶ Checkpoint ──▶ ...
-     │                      │                │                      │
-     └─ Session resume ─────┘                └─ Session resume ─────┘
-```
+For tasks that take hours — codebase refactors, research projects, content pipelines — unleashed mode runs autonomously in phases with session resumption between each.
 
 ### How it works
 
-1. The task runs in phases (default 75 turns per phase)
-2. Between phases, the SDK session is **resumed** — the agent keeps its full conversation history
-3. Progress is saved to `~/.clementine/unleashed/<task>/` (JSONL log + status file)
-4. The agent can spawn sub-agents for parallel work streams
+1. Runs in phases (default 75 turns each)
+2. Between phases, the SDK session is **resumed** — full conversation history preserved
+3. Progress saved to `~/.clementine/unleashed/<task>/` (status + JSONL log)
+4. Can spawn sub-agents for parallel work
 5. Cancel anytime via the dashboard or by touching a `CANCEL` file
 
 ### Safety guardrails
@@ -719,19 +583,7 @@ Progress is also logged to `~/.clementine/unleashed/<task>/progress.jsonl` for d
 
 ## Self-improvement
 
-Clementine can autonomously improve herself using an iterative loop inspired by Karpathy's autoresearch pattern: **gather data, diagnose weaknesses, hypothesize a fix, evaluate the fix, and propose the change for approval**.
-
-```
-  ┌──────────┐    ┌──────────┐    ┌─────────────┐    ┌──────────┐    ┌──────────┐
-  │  Gather  │───▶│ Diagnose │───▶│ Hypothesize │───▶│ Evaluate │───▶│   Gate   │
-  │ feedback │    │ weakness │    │  a change   │    │ LLM judge│    │ approve? │
-  │ cron logs│    │ patterns │    │  (minimal)  │    │  0-10    │    │          │
-  └──────────┘    └──────────┘    └─────────────┘    └──────────┘    └──────────┘
-       │                                                                   │
-       │              ┌──────────────────────────────────────┐             │
-       └──────────────│  Repeat until plateau or time limit  │◀────────────┘
-                      └──────────────────────────────────────┘
-```
+Clementine runs an iterative self-improvement loop: **gather data → diagnose weakness → hypothesize a fix → LLM-judge it → gate for human approval**. Repeats until plateau or time limit.
 
 ### What it targets
 
@@ -800,6 +652,21 @@ After the loop completes, memory maintenance runs automatically (temporal decay 
 
 The vault is an Obsidian-compatible folder of Markdown files with YAML frontmatter, `[[wikilinks]]`, and `#tags`. Open `~/.clementine/vault/` in Obsidian to browse your assistant's memory visually.
 
+Folder structure under `~/.clementine/vault/`:
+
+```
+00-System/         SOUL.md, MEMORY.md, HEARTBEAT.md, CRON.md, AGENTS.md
+                   agents/<slug>/agent.md   ← per-agent config
+                   skills/                  ← procedural skills
+01-Daily-Notes/    YYYY-MM-DD.md auto-generated daily logs
+02-People/         Person notes (auto-created from conversations)
+03-Projects/       Project notes
+04-Topics/         Knowledge topics
+05-Tasks/          TASKS.md master list with {T-NNN} IDs
+06-Templates/      Note templates
+07-Inbox/          Quick captures
+```
+
 Key system files:
 
 | File | Purpose |
@@ -807,7 +674,8 @@ Key system files:
 | `SOUL.md` | Core personality and behavioral instructions |
 | `MEMORY.md` | Auto-extracted facts, preferences, people context |
 | `HEARTBEAT.md` | Autonomous check-in configuration |
-| `CRON.md` | Scheduled task definitions (cron syntax) |
+| `CRON.md` | Scheduled task definitions |
+| `AGENTS.md` | Master roster of agents |
 | `TASKS.md` | Master task list with `{T-NNN}` IDs |
 
 ---
