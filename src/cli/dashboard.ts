@@ -11255,7 +11255,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
         <span id="builder-agent-label" style="padding:0;font-size:13px;color:var(--text-secondary);font-weight:500"></span>
         <input type="hidden" id="builder-agent" value="">
         <span style="flex:1"></span>
-        <button class="btn-sm" onclick="resetBuilder()" style="background:var(--bg-tertiary);border:1px solid var(--border);color:var(--text-secondary);padding:4px 12px;border-radius:6px;cursor:pointer;font-size:12px">New</button>
+        <button class="btn-sm btn-primary" onclick="newFromBuildHeader()" title="Create a new artifact for this tab" style="padding:4px 14px;border-radius:6px;cursor:pointer;font-size:12px">New</button>
         <button class="btn-sm" id="builder-test-btn" onclick="testBuilderSkill()" style="background:var(--bg-tertiary);border:1px solid var(--border);color:var(--text-secondary);padding:4px 12px;border-radius:6px;cursor:pointer;font-size:12px;display:none">Test</button>
         <button class="btn-sm btn-primary" id="builder-save-btn" onclick="saveBuilderArtifact()" style="padding:4px 16px;font-size:12px;display:none">Save</button>
       </div>
@@ -11324,7 +11324,15 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
               <div onclick="_builderAddNodeOfKind('loop')" class="builder-palette-item" data-kind="loop">loop</div>
             </div>
             <!-- Slide-out config panel -->
-            <div id="builder-config-panel" style="display:none;position:absolute;right:0;top:0;bottom:0;width:340px;background:var(--bg-secondary);border-left:1px solid var(--border);box-shadow:-4px 0 16px rgba(0,0,0,0.15);z-index:12;display:flex;flex-direction:column"></div>
+            <div id="builder-config-panel" style="display:none;position:absolute;right:0;top:0;bottom:0;width:340px;background:var(--bg-secondary);border-left:1px solid var(--border);box-shadow:-4px 0 16px rgba(0,0,0,0.15);z-index:12;flex-direction:column"></div>
+            <!-- Empty-state CTA — visible when no workflow is open on the canvas -->
+            <div id="builder-canvas-empty" style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:14px;color:var(--text-muted);text-align:center;padding:32px;pointer-events:none">
+              <div style="font-size:38px;opacity:0.4">&#128279;</div>
+              <div style="font-size:14px;font-weight:500;color:var(--text-secondary)">No workflow open</div>
+              <div style="font-size:12px;line-height:1.5;max-width:280px">
+                Pick one from the dropdown above &mdash; or click <strong>New</strong> in the header to create one from scratch, or open the <strong>Templates</strong> tab for starter patterns.
+              </div>
+            </div>
             <div id="builder-canvas-footer" style="padding:6px 14px;border-top:1px solid var(--border);font-size:11px;color:var(--text-muted);display:flex;gap:14px;align-items:center">
               <span id="builder-canvas-status"></span>
               <span style="flex:1"></span>
@@ -13927,6 +13935,9 @@ function switchBuildTab(tab) {
   var workPane = document.getElementById('build-tab-workflows');
   var tplPane = document.getElementById('build-tab-templates');
   var headerStrip = document.getElementById('build-header-strip');
+  // Always close any open workflow when changing tabs — switching context
+  // is a clean slate, not a stale node hanging on the canvas.
+  if (typeof closeBuilderCanvas === 'function') closeBuilderCanvas();
   if (tab === 'templates') {
     if (workPane) workPane.style.display = 'none';
     if (tplPane) tplPane.style.display = '';
@@ -13947,12 +13958,49 @@ function switchBuildTab(tab) {
         updateBuilderMode();
       }
     }
+    // Preload Drawflow eagerly so the canvas is responsive when the
+    // user picks a workflow (rather than waiting for the lazy load).
+    if (typeof _ensureDrawflowLoaded === 'function') {
+      _ensureDrawflowLoaded().catch(function() { /* */ });
+    }
     // Focus chat input
     setTimeout(function() {
       var bi = document.getElementById('builder-input');
       if (bi) bi.focus();
     }, 60);
   }
+}
+
+// "New" button in the Build header strip — context-aware: prompts for a
+// name and creates the right artifact for the active tab. Workflows + Crons
+// route through the workflow_create surface; Skills falls back to the
+// existing chat-based Skill Studio reset.
+async function newFromBuildHeader() {
+  var activeTab = document.querySelector('#build-tabs button.active')?.getAttribute('data-build-tab') || 'workflows';
+  if (activeTab === 'skills') {
+    if (typeof resetBuilder === 'function') resetBuilder();
+    var bi = document.getElementById('builder-input');
+    if (bi) bi.focus();
+    return;
+  }
+  if (activeTab === 'templates') {
+    toast('Pick a template to fork from the cards.', 'info');
+    return;
+  }
+  var noun = activeTab === 'crons' ? 'cron' : 'workflow';
+  var name = prompt('Name your new ' + noun + ':');
+  if (!name || !name.trim()) return;
+  try {
+    var body = { name: name.trim() };
+    if (activeTab === 'crons') body.schedule = '0 9 * * *';  // sensible default; user edits in canvas
+    var r = await apiJson('POST', '/api/builder/workflows', body);
+    if (r && r.error) { toast('Create failed: ' + r.error, 'error'); return; }
+    if (r && r.id) {
+      await refreshBuilderCanvasPicker(activeTab === 'crons' ? 'cron' : 'workflow');
+      await openBuilderWorkflow(r.id);
+      toast('Created ' + noun + ': ' + name, 'success');
+    }
+  } catch (err) { toast('Create error: ' + err, 'error'); }
 }
 
 // ── Build templates: fork a starter pattern into a new workflow ─────
@@ -18209,6 +18257,9 @@ async function openBuilderWorkflow(id) {
 function _renderBuilderCanvas(drawflowData) {
   var host = document.getElementById('builder-canvas');
   if (!host) return;
+  // Hide empty-state CTA — there's a workflow open now.
+  var empty = document.getElementById('builder-canvas-empty');
+  if (empty) empty.style.display = 'none';
   // Tear down previous editor
   if (_builderCanvasEditor) {
     try { _builderCanvasEditor.clear(); } catch (e) { /* ignore */ }
@@ -18316,35 +18367,30 @@ function _updateBuilderBannerFromValidation(v) {
 }
 
 function _decorateBuilderNodes(host, wf) {
-  if (!wf) return;
+  if (!wf || !_builderCanvasEditor) return;
+  // Pull each Drawflow node's data via the editor (which preserves the
+  // stepId we set in stepToNodeData on the server side). Earlier code tried
+  // to recover stepId from a df-stepId input, which Drawflow doesn't emit
+  // unless you use templates — so every node decorated with the same step.
+  // Now we look the step up by stepId directly.
   var byStepId = {};
   for (var i = 0; i < wf.steps.length; i++) byStepId[wf.steps[i].id] = wf.steps[i];
-  // Drawflow renders blank node bodies by default — overlay our own content.
+  var allData = _builderCanvasEditor.export();
+  var nodeData = (allData && allData.drawflow && allData.drawflow.Home && allData.drawflow.Home.data) || {};
   var nodes = host.querySelectorAll('.drawflow-node');
   nodes.forEach(function(nodeEl) {
     var contentEl = nodeEl.querySelector('.drawflow_content_node');
     if (!contentEl || contentEl.dataset._decorated) return;
     contentEl.dataset._decorated = '1';
-    var dataAttr = nodeEl.querySelector('input[df-stepId]');
-    var stepId = dataAttr ? dataAttr.value : null;
-    // Drawflow doesn't auto-bind without templates — derive from class instead
-    var classNames = (nodeEl.className || '').split(/\s+/).filter(function(c) { return c.indexOf('cl-node-') === 0; });
-    var kind = classNames.length ? classNames[0].replace('cl-node-', '') : 'prompt';
-    var title = '';
-    var body = '';
-    var matchedStep = null;
-    for (var j = 0; j < wf.steps.length; j++) {
-      var s = wf.steps[j];
-      if ((s.kind || 'prompt') === kind) { matchedStep = s; break; }
-    }
-    if (!matchedStep) {
-      // Best-effort: use first step
-      matchedStep = wf.steps[0];
-    }
-    title = (matchedStep ? matchedStep.id : '?');
-    body = _summarizeStep(matchedStep, kind);
+    var numericId = (nodeEl.id || '').replace(/^node-/, '');
+    var data = (nodeData[numericId] && nodeData[numericId].data) || {};
+    var stepId = data.stepId || null;
+    var step = stepId ? byStepId[stepId] : null;
+    var kind = (data.kind || (step && step.kind) || 'prompt');
+    var title = step ? step.id : (stepId || '?');
+    var body = _summarizeStep(step || data, kind);
     contentEl.innerHTML =
-      '<div style="font-weight:600;font-size:12px;margin-bottom:4px;color:#fff;text-transform:lowercase">' + esc(kind) + ' · ' + esc(title) + '</div>' +
+      '<div style="font-weight:600;font-size:12px;margin-bottom:4px;color:#fff;text-transform:lowercase">' + esc(kind) + ' &middot; ' + esc(title) + '</div>' +
       '<div style="font-size:11px;color:rgba(255,255,255,0.85);line-height:1.35;max-height:80px;overflow:hidden">' + esc(body) + '</div>';
   });
 }
@@ -18372,6 +18418,14 @@ function closeBuilderCanvas() {
   if (idEl) idEl.textContent = '';
   var banner = document.getElementById('builder-canvas-banner');
   if (banner) banner.style.display = 'none';
+  // Reset picker if it has a stale selection
+  var picker = document.getElementById('builder-canvas-picker');
+  if (picker && picker.value) picker.value = '';
+  // Close config panel if it was open
+  if (typeof _closeNodeConfigPanel === 'function') _closeNodeConfigPanel();
+  // Show empty-state CTA
+  var empty = document.getElementById('builder-canvas-empty');
+  if (empty) empty.style.display = 'flex';
 }
 
 async function validateBuilderCanvas() {
