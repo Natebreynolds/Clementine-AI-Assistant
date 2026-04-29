@@ -550,6 +550,46 @@ export interface WorkflowInput {
   description?: string;
 }
 
+export type WorkflowStepKind =
+  | 'prompt'
+  | 'mcp'
+  | 'channel'
+  | 'transform'
+  | 'conditional'
+  | 'loop';
+
+export interface WorkflowStepMcpConfig {
+  server: string;
+  tool: string;
+  inputs?: Record<string, unknown>;
+}
+
+export interface WorkflowStepChannelConfig {
+  channel: 'discord' | 'slack' | 'telegram' | 'whatsapp' | 'email' | 'webhook';
+  target: string;
+  content: string;
+}
+
+export interface WorkflowStepTransformConfig {
+  expression: string;
+}
+
+export interface WorkflowStepConditionalConfig {
+  condition: string;
+  trueNext?: string[];
+  falseNext?: string[];
+}
+
+export interface WorkflowStepLoopConfig {
+  items: string;
+  bodyStepIds: string[];
+}
+
+export interface WorkflowStepCanvas {
+  x: number;
+  y: number;
+}
+
 export interface WorkflowStep {
   id: string;
   prompt: string;
@@ -558,6 +598,13 @@ export interface WorkflowStep {
   tier: number;
   maxTurns: number;
   workDir?: string;
+  kind?: WorkflowStepKind;
+  mcp?: WorkflowStepMcpConfig;
+  channel?: WorkflowStepChannelConfig;
+  transform?: WorkflowStepTransformConfig;
+  conditional?: WorkflowStepConditionalConfig;
+  loop?: WorkflowStepLoopConfig;
+  canvas?: WorkflowStepCanvas;
 }
 
 export interface WorkflowDefinition {
@@ -569,7 +616,21 @@ export interface WorkflowDefinition {
   steps: WorkflowStep[];
   synthesis?: { prompt: string };
   sourceFile: string;
-  agentSlug?: string;              // Agent that owns this workflow (scoped execution)
+  agentSlug?: string;
+}
+
+export type WorkflowOriginKind = 'workflow' | 'cron';
+
+export interface BuilderWorkflowSummary {
+  id: string;
+  origin: WorkflowOriginKind;
+  name: string;
+  description: string;
+  enabled: boolean;
+  schedule?: string;
+  stepCount: number;
+  sourceFile: string;
+  agentSlug?: string;
 }
 
 export interface WorkflowRunEntry {

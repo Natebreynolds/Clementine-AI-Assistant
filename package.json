@@ -8,7 +8,7 @@
     "clementine": "dist/cli/index.js"
   },
   "scripts": {
-    "build:assets": "mkdir -p dist/agent/advisor-rules/builtin && (cp src/agent/advisor-rules/builtin/*.yaml dist/agent/advisor-rules/builtin/ 2>/dev/null || true)",
+    "build:assets": "mkdir -p dist/agent/advisor-rules/builtin && (cp src/agent/advisor-rules/builtin/*.yaml dist/agent/advisor-rules/builtin/ 2>/dev/null || true) && mkdir -p dist/cli/static && (cp src/cli/static/* dist/cli/static/ 2>/dev/null || true)",
     "build": "rm -rf dist.tmp 2>/dev/null; tsc --outDir dist.tmp && rm -rf dist && mv dist.tmp dist && chmod +x dist/cli/index.js && npm run build:assets",
     "prepublishOnly": "npm run build && find dist -name '*.map' -delete",
     "dev": "tsx src/index.ts",

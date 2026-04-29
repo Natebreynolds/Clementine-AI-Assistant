@@ -765,6 +765,16 @@ async function asyncMain(): Promise<void> {
   const cronScheduler = new CronScheduler(gateway, dispatcher);
   heartbeat.setCronScheduler(cronScheduler);
 
+  // Builder runner — wire MCP invoke handler so canvas test runs can hit
+  // real read-only MCP tools (gmail.list_unread, github.list_prs, etc.).
+  // Stdio clients are pooled per server with idle teardown.
+  try {
+    const { installBuilderMcpHandler } = await import('./dashboard/builder/mcp-invoke.js');
+    installBuilderMcpHandler();
+  } catch (err) {
+    logger.warn({ err }, 'Builder MCP invoke handler install failed (non-fatal)');
+  }
+
   // Per-agent heartbeats — one cheap-path observer per registered specialist.
   // LLM tick fires on signal change with the agent's profile and routes
   // output to their Discord channel.
@@ -1094,6 +1104,14 @@ async function asyncMain(): Promise<void> {
       await memStore.flushWrites();
     }
   } catch (err) { logger.warn({ err }, 'Memory write queue drain failed'); }
+
+  // Tear down builder MCP client pool (best-effort).
+  try {
+    const { shutdownBuilderMcpHandler } = await import('./dashboard/builder/mcp-invoke.js');
+    await shutdownBuilderMcpHandler();
+  } catch (err) {
+    logger.warn({ err }, 'Builder MCP handler shutdown failed (non-fatal)');
+  }
 
   // Now safe to tear down remaining infrastructure
   heartbeat.stop();

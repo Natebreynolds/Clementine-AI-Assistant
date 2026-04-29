@@ -1282,6 +1282,14 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
   const jsonParser = express.json({ limit: '5mb' });
   const rawBodyParser = express.raw({ type: '*/*', limit: '5mb' });
 
+  // Vendored frontend assets (Drawflow for the Builder canvas, etc.)
+  // Public — no auth required.
+  app.use('/static', express.static(path.join(__dirname, 'static'), {
+    maxAge: '7d',
+    etag: true,
+    index: false,
+  }));
+
   // Health check — always responds, no auth, no middleware dependency
   app.get('/health', (_req, res) => { res.json({ ok: true, ts: Date.now() }); });
 
@@ -2364,6 +2372,219 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
 
   // Let the lazy-gateway dispatcher publish deep_result events through SSE.
   dashboardSseBroadcast = broadcastEvent;
+
+  // ── Builder event bridge ──────────────────────────────────────
+  // Forward events from src/dashboard/builder/events.ts through SSE so the
+  // Builder page can update its canvas live as the agent edits via MCP tools.
+  (async () => {
+    try {
+      const { onAnyBuilderEvent } = await import('../dashboard/builder/events.js');
+      onAnyBuilderEvent((e) => {
+        broadcastEvent({ type: 'builder', data: e });
+      });
+    } catch {
+      // Builder event bridge optional; ignore if module fails to load.
+    }
+  })();
+
+  // ── Builder API routes ─────────────────────────────────────────
+
+  app.get('/api/builder/workflows', async (_req, res) => {
+    try {
+      const { listAllForBuilder } = await import('../dashboard/builder/serializer.js');
+      res.json({ workflows: listAllForBuilder() });
+    } catch (err) {
+      res.status(500).json({ error: 'Failed to list workflows', detail: String(err) });
+    }
+  });
+
+  app.get('/api/builder/workflows/:id', async (req, res) => {
+    try {
+      const id = decodeURIComponent(req.params.id);
+      const [{ readWorkflow, workflowToDrawflow }, { validateWorkflow }] = await Promise.all([
+        import('../dashboard/builder/serializer.js'),
+        import('../dashboard/builder/validation.js'),
+      ]);
+      const wf = readWorkflow(id);
+      if (!wf) { res.status(404).json({ error: 'Not found' }); return; }
+      res.json({
+        id,
+        workflow: wf,
+        drawflow: workflowToDrawflow(wf),
+        validation: validateWorkflow(wf),
+      });
+    } catch (err) {
+      res.status(500).json({ error: 'Failed to read workflow', detail: String(err) });
+    }
+  });
+
+  app.put('/api/builder/workflows/:id', async (req, res) => {
+    try {
+      const id = decodeURIComponent(req.params.id);
+      const body = req.body as { workflow?: unknown; force?: boolean };
+      if (!body || typeof body.workflow !== 'object') { res.status(400).json({ error: 'Missing workflow body' }); return; }
+      const [{ readWorkflow, saveWorkflow }, { validateWorkflow }, { emitBuilderEvent }] = await Promise.all([
+        import('../dashboard/builder/serializer.js'),
+        import('../dashboard/builder/validation.js'),
+        import('../dashboard/builder/events.js'),
+      ]);
+      const existing = readWorkflow(id);
+      if (!existing) { res.status(404).json({ error: 'Not found' }); return; }
+      const incoming = body.workflow as Record<string, unknown>;
+      const next = { ...(incoming as object), sourceFile: existing.sourceFile } as typeof existing;
+      const v = validateWorkflow(next);
+      if (!v.ok && !body.force) { res.status(400).json({ error: 'validation', validation: v }); return; }
+      const result = saveWorkflow(id, next);
+      if (!result.ok) { res.status(400).json({ error: result.error }); return; }
+      emitBuilderEvent({ type: 'workflow:patched', workflowId: id, payload: { workflow: next } });
+      res.json({ ok: true, validation: v });
+    } catch (err) {
+      res.status(500).json({ error: 'Failed to save workflow', detail: String(err) });
+    }
+  });
+
+  app.get('/api/builder/mcp-discovery', async (_req, res) => {
+    try {
+      const { discoverMcpServers, loadToolInventory } = await import('../agent/mcp-bridge.js');
+      const servers = discoverMcpServers();
+      const inv = loadToolInventory();
+      const out = servers.map((s: { name: string; enabled: boolean }) => ({
+        name: s.name,
+        enabled: s.enabled,
+        tools: (inv?.tools ?? [])
+          .filter((t: string) => t.startsWith(`mcp__${s.name}__`))
+          .map((t: string) => t.split('__')[2])
+          .filter((x: string | undefined): x is string => !!x),
+      }));
+      res.json({ servers: out });
+    } catch (err) {
+      res.status(500).json({ error: 'mcp-discovery failed', detail: String(err) });
+    }
+  });
+
+  app.post('/api/builder/workflows/:id/save-from-drawflow', async (req, res) => {
+    try {
+      const id = decodeURIComponent(req.params.id);
+      const body = req.body as { drawflow?: unknown; force?: boolean; saveToken?: string };
+      if (!body || !body.drawflow) { res.status(400).json({ error: 'Missing drawflow body' }); return; }
+      const [{ readWorkflow, drawflowToWorkflow, saveWorkflow, workflowToDrawflow }, { validateWorkflow }, { emitBuilderEvent }] = await Promise.all([
+        import('../dashboard/builder/serializer.js'),
+        import('../dashboard/builder/validation.js'),
+        import('../dashboard/builder/events.js'),
+      ]);
+      const existing = readWorkflow(id);
+      if (!existing) { res.status(404).json({ error: 'Not found' }); return; }
+      const next = drawflowToWorkflow(body.drawflow as Parameters<typeof drawflowToWorkflow>[0], existing);
+      const v = validateWorkflow(next);
+      if (!v.ok && !body.force) { res.status(400).json({ error: 'validation', validation: v }); return; }
+      const result = saveWorkflow(id, next);
+      if (!result.ok) { res.status(400).json({ error: result.error }); return; }
+      emitBuilderEvent({ type: 'workflow:patched', workflowId: id, payload: { workflow: next, saveToken: body.saveToken ?? null } });
+      res.json({ ok: true, validation: v, drawflow: workflowToDrawflow(next) });
+    } catch (err) {
+      res.status(500).json({ error: 'Save failed', detail: String(err) });
+    }
+  });
+
+  app.post('/api/builder/workflows/:id/validate', async (req, res) => {
+    try {
+      const id = decodeURIComponent(req.params.id);
+      const [{ readWorkflow }, { validateWorkflow }] = await Promise.all([
+        import('../dashboard/builder/serializer.js'),
+        import('../dashboard/builder/validation.js'),
+      ]);
+      const wf = readWorkflow(id);
+      if (!wf) { res.status(404).json({ error: 'Not found' }); return; }
+      res.json(validateWorkflow(wf));
+    } catch (err) {
+      res.status(500).json({ error: 'Validate failed', detail: String(err) });
+    }
+  });
+
+  app.post('/api/builder/workflows/:id/test', async (req, res) => {
+    try {
+      const id = decodeURIComponent(req.params.id);
+      const body = (req.body ?? {}) as { mode?: 'mock' | 'real'; perStepTimeoutMs?: number; totalBudgetMs?: number };
+      const [{ readWorkflow }, { runWorkflowTest }] = await Promise.all([
+        import('../dashboard/builder/serializer.js'),
+        import('../dashboard/builder/runner.js'),
+      ]);
+      const wf = readWorkflow(id);
+      if (!wf) { res.status(404).json({ error: 'Not found' }); return; }
+      const runId = (await import('node:crypto')).randomUUID();
+      // Kick off async — respond immediately with the runId; events stream over SSE.
+      res.json({ ok: true, runId });
+      runWorkflowTest(wf, {
+        workflowId: id,
+        runId,
+        mode: body.mode ?? 'mock',
+        perStepTimeoutMs: body.perStepTimeoutMs,
+        totalBudgetMs: body.totalBudgetMs,
+      }).catch(() => { /* errors already streamed via events */ });
+    } catch (err) {
+      res.status(500).json({ error: 'Test failed to start', detail: String(err) });
+    }
+  });
+
+  app.post('/api/builder/runs/:runId/cancel', async (req, res) => {
+    try {
+      const runId = decodeURIComponent(req.params.runId);
+      const { cancelRun } = await import('../dashboard/builder/runner.js');
+      const cancelled = cancelRun(runId);
+      res.json({ ok: cancelled });
+    } catch (err) {
+      res.status(500).json({ error: 'Cancel failed', detail: String(err) });
+    }
+  });
+
+  app.post('/api/builder/workflows/:id/dry-run', async (req, res) => {
+    try {
+      const id = decodeURIComponent(req.params.id);
+      const [{ readWorkflow }, { dryRunWorkflow }] = await Promise.all([
+        import('../dashboard/builder/serializer.js'),
+        import('../dashboard/builder/dry-run.js'),
+      ]);
+      const wf = readWorkflow(id);
+      if (!wf) { res.status(404).json({ error: 'Not found' }); return; }
+      res.json(dryRunWorkflow(wf));
+    } catch (err) {
+      res.status(500).json({ error: 'Dry-run failed', detail: String(err) });
+    }
+  });
+
+  app.post('/api/builder/workflows', async (req, res) => {
+    try {
+      const body = req.body as { name?: string; description?: string; schedule?: string; initialPrompt?: string };
+      if (!body || !body.name) { res.status(400).json({ error: 'name required' }); return; }
+      const [{ saveWorkflow, workflowId }, { emitBuilderEvent }] = await Promise.all([
+        import('../dashboard/builder/serializer.js'),
+        import('../dashboard/builder/events.js'),
+      ]);
+      const slug = body.name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 64) || 'workflow';
+      const wf = {
+        name: body.name,
+        description: body.description ?? '',
+        enabled: true,
+        trigger: body.schedule ? { schedule: body.schedule, manual: false } : { manual: true },
+        inputs: {},
+        steps: [{
+          id: 's1',
+          prompt: body.initialPrompt ?? 'Describe what this workflow should do.',
+          dependsOn: [],
+          tier: 1,
+          maxTurns: 15,
+        }],
+        sourceFile: '',
+      };
+      const id = workflowId(slug);
+      const result = saveWorkflow(id, wf);
+      if (!result.ok) { res.status(400).json({ error: result.error }); return; }
+      emitBuilderEvent({ type: 'workflow:created', workflowId: id, payload: { workflow: wf } });
+      res.json({ ok: true, id });
+    } catch (err) {
+      res.status(500).json({ error: 'Create failed', detail: String(err) });
+    }
+  });
 
   // SSE events handler moved before auth middleware (see above)
 
@@ -4591,6 +4812,30 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
       const graphStore = (gateway as any).assistant?.graphStore;
       const health = store.getMemoryHealth({ graphStore, topCitedLimit: 10 });
       res.json({ ok: true, health });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  app.post('/api/memory/health/action', async (req, res) => {
+    try {
+      const action = (req.body?.action ?? '') as string;
+      const gateway = await getGateway();
+      const store = (gateway as any).assistant?.memoryStore;
+      if (!store) { res.status(503).json({ error: 'Memory store not available' }); return; }
+      if (action === 'janitor') {
+        const { runJanitor } = await import('../memory/maintenance.js');
+        const result = runJanitor(store);
+        res.json({ ok: true, action, result });
+        return;
+      }
+      if (action === 'rebuild-fts' || action === 'fix-orphans') {
+        const { runIntegrityProbes } = await import('../memory/integrity.js');
+        const report = runIntegrityProbes(store);
+        res.json({ ok: true, action, report });
+        return;
+      }
+      res.status(400).json({ error: 'Unknown action: ' + action });
     } catch (err) {
       res.status(500).json({ error: String(err) });
     }
@@ -7796,6 +8041,7 @@ function getDashboardHTML(token: string): string {
 if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then(function(r){r.forEach(function(sw){sw.unregister()})});caches.keys().then(function(k){k.forEach(function(n){caches.delete(n)})})}
 </script>
 <link rel="icon" href="/icon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/static/drawflow.min.css">
 <title>${name} Command Center</title>
 <style>
   :root {
@@ -8053,6 +8299,319 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
     margin-bottom: 20px;
     color: var(--text-primary);
     letter-spacing: -0.02em;
+  }
+
+  /* ── Standard page header (.page-head) — applied to most info pages ── */
+  .page-head {
+    display: flex;
+    align-items: flex-start;
+    gap: 14px;
+    padding: 18px 22px 14px;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 18px;
+    flex-wrap: wrap;
+  }
+  .page-head .icon {
+    width: 36px;
+    height: 36px;
+    border-radius: 8px;
+    background: linear-gradient(135deg, rgba(255,140,33,0.15), rgba(255,140,33,0.04));
+    color: var(--clementine);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 20px;
+    flex-shrink: 0;
+  }
+  .page-head .title-block {
+    flex: 1;
+    min-width: 220px;
+  }
+  .page-head .title-block h1 {
+    font-size: 20px;
+    font-weight: 600;
+    margin: 0 0 2px;
+    letter-spacing: -0.01em;
+    color: var(--text-primary);
+  }
+  .page-head .title-block .desc {
+    font-size: 13px;
+    color: var(--text-muted);
+    margin: 0;
+    line-height: 1.4;
+  }
+  .page-head .actions {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    flex-wrap: wrap;
+  }
+  .page-section {
+    padding: 0 22px 22px;
+  }
+  /* ── First-time empty state with CTA (use when there's truly no data yet) ── */
+  .empty-cta {
+    text-align: center;
+    padding: 48px 24px;
+    color: var(--text-muted);
+  }
+  .empty-cta .icon {
+    font-size: 36px;
+    margin-bottom: 12px;
+    opacity: 0.5;
+  }
+  .empty-cta .label {
+    font-size: 14px;
+    margin-bottom: 4px;
+    color: var(--text-secondary);
+    font-weight: 500;
+  }
+  .empty-cta .hint {
+    font-size: 12px;
+    color: var(--text-muted);
+    margin-bottom: 18px;
+  }
+  /* ── Skeleton shimmer for loading lists ── */
+  .skel-block {
+    padding: 12px 18px;
+  }
+  .skel-row {
+    height: 14px;
+    border-radius: 4px;
+    background: linear-gradient(90deg, var(--bg-tertiary) 0%, var(--bg-hover) 50%, var(--bg-tertiary) 100%);
+    background-size: 200% 100%;
+    animation: skelShimmer 1.4s ease-in-out infinite;
+    margin-bottom: 10px;
+  }
+  .skel-row.short { width: 40%; }
+  .skel-row.med { width: 65%; }
+  @keyframes skelShimmer {
+    0% { background-position: 200% 0; }
+    100% { background-position: -200% 0; }
+  }
+  /* ── Row actions (icon-style buttons that appear inline on a list row) ── */
+  .row-actions {
+    display: inline-flex;
+    gap: 6px;
+    align-items: center;
+  }
+  .row-actions button {
+    background: none;
+    border: 1px solid transparent;
+    color: var(--text-muted);
+    font-size: 11px;
+    padding: 3px 8px;
+    border-radius: 4px;
+    cursor: pointer;
+    transition: background 0.15s, border-color 0.15s, color 0.15s;
+  }
+  .row-actions button:hover {
+    background: var(--bg-hover);
+    border-color: var(--border);
+    color: var(--text-primary);
+  }
+  .row-actions button.primary { color: var(--clementine); }
+  .row-actions button.danger:hover { color: var(--red); border-color: rgba(239,68,68,0.3); }
+  .clickable-row {
+    cursor: pointer;
+    transition: background 0.12s;
+  }
+  .clickable-row:hover { background: var(--bg-hover); }
+
+  /* ── Status pip (used for daemon status, channel status, agent status) ── */
+  .status-pip {
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: #888;
+    margin-right: 6px;
+    flex-shrink: 0;
+  }
+  .status-pip.green { background: #22c55e; box-shadow: 0 0 6px rgba(34,197,94,0.5); }
+  .status-pip.amber { background: #f59e0b; }
+  .status-pip.red { background: #ef4444; box-shadow: 0 0 6px rgba(239,68,68,0.4); }
+  .status-pip.muted { background: var(--text-muted); }
+
+  /* Cmd+K palette */
+  .cmdk-row:hover { background: var(--bg-hover) !important; }
+
+  /* ── Home layout — chat-first daily driver ─── */
+  .home-layout {
+    display: grid;
+    grid-template-columns: 1fr 320px;
+    gap: 18px;
+    height: calc(100vh - var(--header-h));
+    padding: 18px;
+    box-sizing: border-box;
+  }
+  .home-main {
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+    min-height: 0;
+    overflow-y: auto;
+  }
+  .home-chat {
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    min-height: 320px;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    overflow: hidden;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.06);
+  }
+  .home-chat-messages {
+    flex: 1;
+    overflow-y: auto;
+    padding: 18px 20px;
+    min-height: 280px;
+  }
+  .home-chat-input-row {
+    display: flex;
+    gap: 8px;
+    padding: 12px 16px;
+    border-top: 1px solid var(--border);
+    background: var(--bg-secondary);
+    align-items: center;
+  }
+  .home-chat-input-row input[type="text"] {
+    flex: 1;
+    padding: 10px 14px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--bg-input);
+    color: var(--text-primary);
+    font-size: 14px;
+  }
+  .home-chat-input-row select {
+    padding: 6px 10px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--bg-secondary);
+    color: var(--text-primary);
+    font-size: 12px;
+  }
+  .home-chat-input-row button { padding: 9px 18px; border-radius: 8px; }
+  .home-activity { margin: 0; }
+
+  /* Right rail */
+  .home-rail {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    overflow-y: auto;
+    position: relative;
+  }
+  .home-rail.collapsed {
+    display: none;
+  }
+  .rail-collapse-btn {
+    position: absolute;
+    top: -4px;
+    right: -4px;
+    background: none;
+    border: 1px solid var(--border);
+    color: var(--text-muted);
+    width: 22px;
+    height: 22px;
+    border-radius: 50%;
+    cursor: pointer;
+    font-size: 14px;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    z-index: 5;
+  }
+  .rail-card {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    overflow: hidden;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.04);
+  }
+  .rail-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 10px 14px;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-secondary);
+    border-bottom: 1px solid var(--border);
+    background: var(--bg-secondary);
+  }
+  .rail-body { padding: 12px 14px; font-size: 12.5px; line-height: 1.5; }
+  .rail-body .empty-state, .rail-body .skel-row { font-size: 11px; }
+  .rail-badge {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 18px;
+    height: 18px;
+    padding: 0 6px;
+    border-radius: 9px;
+    background: var(--clementine);
+    color: #fff;
+    font-size: 10px;
+    font-weight: 600;
+  }
+  .rail-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 0;
+    font-size: 12px;
+    border-bottom: 1px dashed var(--border);
+  }
+  .rail-row:last-child { border-bottom: none; }
+  .rail-row .label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .rail-row .meta { font-size: 10px; color: var(--text-muted); flex-shrink: 0; }
+
+  /* Floating "open rail" button when collapsed */
+  .home-rail-toggle {
+    position: fixed;
+    top: 80px;
+    right: 18px;
+    z-index: 100;
+    width: 36px;
+    height: 36px;
+    border-radius: 50%;
+    background: var(--clementine);
+    color: #fff;
+    border: none;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.2);
+    cursor: pointer;
+    font-size: 14px;
+    display: none;
+  }
+  .home-rail.collapsed ~ .home-rail-toggle,
+  .home-rail.collapsed + .home-rail-toggle { display: block; }
+
+  /* Narrow screens: rail becomes a slide-out drawer */
+  @media (max-width: 1024px) {
+    .home-layout { grid-template-columns: 1fr; }
+    .home-rail {
+      position: fixed;
+      right: 0;
+      top: var(--header-h);
+      bottom: 0;
+      width: 320px;
+      max-width: 90vw;
+      transform: translateX(100%);
+      transition: transform 0.2s ease;
+      background: var(--bg);
+      border-left: 1px solid var(--border);
+      box-shadow: -4px 0 20px rgba(0,0,0,0.15);
+      padding: 14px;
+      z-index: 50;
+    }
+    .home-rail.open { transform: translateX(0); }
+    .rail-collapse-btn { display: flex; }
+    .home-rail-toggle { display: block; }
+    .home-rail.open ~ .home-rail-toggle { display: none; }
   }
 
   /* ── Cards ──────────────────────────────── */
@@ -9974,11 +10533,92 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
     flex-shrink: 0;
     margin-top: 2px;
   }
-  #page-chat.active, #page-builder.active {
+  /* Build page is full-height flex (canvas + chat). Home page handles its own layout. */
+  #page-build.active {
     display: flex !important;
     flex-direction: column;
     height: calc(100vh - var(--header-h));
   }
+  /* === Builder canvas (Drawflow node kinds) === */
+  #builder-canvas .drawflow-node {
+    background: #2a3040;
+    border: 1px solid #3a4255;
+    border-radius: 8px;
+    color: #fff;
+    padding: 10px 12px;
+    min-width: 180px;
+    max-width: 240px;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.25);
+  }
+  #builder-canvas .drawflow-node.selected { border-color: var(--clementine); }
+  #builder-canvas .drawflow-node.cl-node-prompt { background: #2a3550; border-color: #3a4570; }
+  #builder-canvas .drawflow-node.cl-node-mcp { background: #2c4039; border-color: #3a5a4f; }
+  #builder-canvas .drawflow-node.cl-node-channel { background: #44324a; border-color: #5b3f6a; }
+  #builder-canvas .drawflow-node.cl-node-transform { background: #3d3a28; border-color: #564f33; }
+  #builder-canvas .drawflow-node.cl-node-conditional { background: #4a352a; border-color: #6b4737; }
+  #builder-canvas .drawflow-node.cl-node-loop { background: #2e4350; border-color: #3f5a6c; }
+  #builder-canvas .drawflow-node .input, #builder-canvas .drawflow-node .output {
+    background: #555c70;
+    border: 2px solid #2a3040;
+  }
+  #builder-canvas .drawflow .connection .main-path {
+    stroke: #5b6580;
+    stroke-width: 2px;
+  }
+  #builder-canvas .drawflow .connection .main-path:hover { stroke: var(--clementine); }
+  /* Per-step run status (Phase 2e) */
+  #builder-canvas .drawflow-node.cl-step-running {
+    box-shadow: 0 0 0 2px var(--clementine), 0 2px 8px rgba(0,0,0,0.3);
+    animation: cl-step-pulse 1.6s ease-in-out infinite;
+  }
+  #builder-canvas .drawflow-node.cl-step-done {
+    box-shadow: 0 0 0 2px #4caf50, 0 2px 8px rgba(0,0,0,0.3);
+  }
+  #builder-canvas .drawflow-node.cl-step-failed,
+  #builder-canvas .drawflow-node.cl-step-timeout {
+    box-shadow: 0 0 0 2px #e64a4a, 0 2px 8px rgba(0,0,0,0.3);
+  }
+  #builder-canvas .drawflow-node.cl-step-skipped,
+  #builder-canvas .drawflow-node.cl-step-cancelled {
+    opacity: 0.55;
+    box-shadow: 0 0 0 1px #888, 0 2px 8px rgba(0,0,0,0.2);
+  }
+  @keyframes cl-step-pulse {
+    0%, 100% { box-shadow: 0 0 0 2px var(--clementine), 0 2px 8px rgba(0,0,0,0.3); }
+    50% { box-shadow: 0 0 0 4px rgba(255,140,33,0.5), 0 2px 8px rgba(0,0,0,0.3); }
+  }
+  /* Node palette popover */
+  .builder-palette-item {
+    padding: 7px 12px;
+    border-radius: 5px;
+    font-size: 12px;
+    color: var(--text-primary);
+    cursor: pointer;
+  }
+  .builder-palette-item:hover { background: var(--bg-hover); }
+  /* Config panel rows */
+  #builder-config-panel .cfg-row { margin-bottom: 10px; }
+  #builder-config-panel .cfg-row label {
+    display: block;
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--text-muted);
+    margin-bottom: 4px;
+  }
+  #builder-config-panel .cfg-row input,
+  #builder-config-panel .cfg-row select,
+  #builder-config-panel .cfg-row textarea {
+    width: 100%;
+    padding: 6px 8px;
+    border: 1px solid var(--border);
+    border-radius: 5px;
+    background: var(--bg-input);
+    color: var(--text-primary);
+    font-size: 12px;
+    font-family: inherit;
+  }
+  #builder-config-panel .cfg-row textarea { font-family: monospace; resize: vertical; }
   #builder-preview .preview-field {
     margin-bottom:12px;
   }
@@ -10143,10 +10783,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
     .stat-value { font-size: 20px; }
     .stat-label { font-size: 10px; }
 
-    /* Chat: full height + mobile-friendly input */
-    #page-chat.active {
-      height: calc(100vh - var(--header-h));
-    }
+    /* Mobile-friendly chat input (lives inside Home now). */
     #chat-input {
       font-size: 16px; /* prevents iOS zoom on focus */
       min-height: 40px;
@@ -10418,98 +11055,39 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
     </div>
   </header>
 
-  <!-- Sidebar -->
+  <!-- Sidebar — 5 destinations only. Sub-pages live as tabs within each. -->
   <nav class="sidebar">
     <div class="nav-section">
-      <div class="nav-section-title">Today</div>
-      <div class="nav-item active" data-page="home">
-        <span class="nav-icon">&#9679;</span> Home
+      <div class="nav-item active" data-page="home" title="Chat, today, activity">
+        <span class="nav-icon">&#127819;</span> Home
       </div>
-      <div class="nav-item" data-page="chat">
-        <span class="nav-icon">&#128172;</span> Chat
-      </div>
-      <div class="nav-item" data-page="daily-plan">
-        <span class="nav-icon">&#128197;</span> Daily Plan
-      </div>
-      <div class="nav-item" data-page="goals">
-        <span class="nav-icon">&#127919;</span> Goals
-      </div>
-    </div>
-    <div class="nav-section">
-      <div class="nav-section-title">Brain</div>
-      <div class="nav-item" data-page="intelligence">
-        <span class="nav-icon">&#129504;</span> Brain
-      </div>
-    </div>
-    <div class="nav-section">
-      <div class="nav-section-title">Automate</div>
-      <div class="nav-item" data-page="automations">
-        <span class="nav-icon">&#9200;</span> Scheduled Tasks
+      <div class="nav-item" data-page="build" title="Workflows, crons, skills">
+        <span class="nav-icon">&#128736;</span> Build
         <span class="nav-badge" id="nav-cron-count">0</span>
       </div>
-      <div class="nav-item" onclick="openAutomationsTab('skills')">
-        <span class="nav-icon">&#128737;</span> Skills
-        <span class="nav-badge" id="nav-skill-count" style="display:none">0</span>
+      <div class="nav-item" data-page="team" title="Agents, activity, goals">
+        <span class="nav-icon">&#128101;</span> Team
       </div>
-      <div class="nav-item" onclick="openAutomationsTab('timers')">
-        <span class="nav-icon">&#9201;</span> Timers
+      <div class="nav-item" data-page="brain" title="Memory, knowledge, ingestion, health">
+        <span class="nav-icon">&#129504;</span> Brain
       </div>
-      <div class="nav-item" data-page="workflows">
-        <span class="nav-icon">&#128260;</span> Workflows
-      </div>
-      <div class="nav-item" data-page="unleashed">
-        <span class="nav-icon">&#128640;</span> Unleashed
-        <span class="nav-badge" id="nav-unleashed-count" style="display:none">0</span>
+      <div class="nav-item" data-page="settings" title="Channels, integrations, system">
+        <span class="nav-icon">&#9881;</span> Settings
       </div>
     </div>
-    <div class="nav-section">
-      <div class="nav-section-title">Team</div>
-      <div class="nav-item" data-page="team">
-        <span class="nav-icon">&#128101;</span> The Office
-      </div>
-      <div class="nav-item" data-page="team-status">
-        <span class="nav-icon">&#128202;</span> Team Status
-      </div>
+    <!-- Per-agent quick-jump (loaded from team-nav helper). -->
+    <div class="nav-section" style="margin-top:18px">
+      <div class="nav-section-title">Agents</div>
       <div id="team-nav"></div>
       <div class="team-hire-btn" onclick="showAgentCreateModal()">
-        <span style="font-size:14px">+</span> Hire Agent
+        <span style="font-size:14px">+</span> Hire
       </div>
     </div>
+    <div style="flex:1"></div>
     <div class="nav-section">
-      <div class="nav-section-title">Build</div>
-      <div class="nav-item" data-page="builder">
-        <span class="nav-icon">&#128736;</span> Builder
-      </div>
-      <div class="nav-item" onclick="openSkillStudio()">
-        <span class="nav-icon">&#128161;</span> Skill Studio
-      </div>
-      <div class="nav-item" data-page="projects">
-        <span class="nav-icon">&#128194;</span> Projects
-      </div>
-    </div>
-    <div class="nav-section">
-      <div class="nav-section-title">Insights</div>
-      <div class="nav-item" data-page="claims">
-        <span class="nav-icon">&#128274;</span> Trust &amp; Claims
-        <span class="nav-badge" id="nav-trust-score" style="display:none">--</span>
-      </div>
-      <div class="nav-item" data-page="metrics">
-        <span class="nav-icon">&#128200;</span> Metrics
-      </div>
-      <div class="nav-item" data-page="memory-health">
-        <span class="nav-icon">&#129504;</span> Memory Health
-      </div>
-      <div class="nav-item" data-page="logs">
-        <span class="nav-icon">&#128220;</span> Logs
-      </div>
-      <div class="nav-item" data-page="sessions">
-        <span class="nav-icon">&#128221;</span> Sessions
-      </div>
-    </div>
-    <div class="nav-section">
-      <div class="nav-section-title">System</div>
-      <div class="nav-item" data-page="settings">
-        <span class="nav-icon">&#9881;</span> Settings
+      <div class="nav-item" onclick="openCommandK()" style="font-size:12px;color:var(--text-muted);justify-content:space-between" title="Quick search (Cmd+K)">
+        <span><span class="nav-icon">&#128269;</span> Search</span>
+        <kbd style="font-size:10px;padding:1px 5px;border:1px solid var(--border);border-radius:3px">&#8984;K</kbd>
       </div>
     </div>
   </nav>
@@ -10518,133 +11096,171 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
   <!-- Content -->
   <div class="content">
 
-    <!-- ═══ Home Page ═══ -->
+    <!-- ═══ Home — chat-first daily driver ═══ -->
     <div class="page active" id="page-home">
-      <div class="agent-hero" id="agent-hero">
-        <div class="agent-hero-top">
-          <div class="agent-avatar" id="agent-avatar">${name.charAt(0).toUpperCase()}</div>
-          <div class="agent-info">
-            <div class="hero-wordmark" id="hero-wordmark"></div>
-            <div class="agent-activity" id="agent-activity">
-              <span class="agent-activity-dot"></span>
-              <span>Loading...</span>
+      <div class="home-layout">
+        <main class="home-main">
+          <!-- Getting Started (shown for new users only) -->
+          <div id="getting-started" class="getting-started" style="display:none">
+            <div class="gs-header">
+              <div class="gs-title">Get Started</div>
+              <div class="gs-subtitle">Set up your AI assistant in 5 steps</div>
+              <button class="btn-ghost btn-sm gs-dismiss" onclick="dismissGettingStarted()" title="Dismiss">&times;</button>
             </div>
-            <div class="agent-meta" id="agent-meta"></div>
-            <div class="agent-channels" id="agent-channels"></div>
-          </div>
-          <div class="agent-controls" id="hero-controls"></div>
-        </div>
-      </div>
-
-      <!-- Getting Started (shown for new users, hidden when setup is complete) -->
-      <div id="getting-started" class="getting-started" style="display:none">
-        <div class="gs-header">
-          <div class="gs-title">Get Started</div>
-          <div class="gs-subtitle">Set up your AI assistant in 5 steps</div>
-          <button class="btn-ghost btn-sm gs-dismiss" onclick="dismissGettingStarted()" title="Dismiss">&times;</button>
-        </div>
-        <div class="gs-grid">
-          <div class="gs-card" id="gs-step-auth">
-            <div class="gs-step-num">1</div>
-            <div class="gs-card-icon">&#128274;</div>
-            <div class="gs-card-title">Login with Anthropic</div>
-            <div class="gs-card-desc" id="gs-auth-desc">Connect your Anthropic account to power your agents.</div>
-            <button class="btn btn-sm btn-primary" id="gs-auth-btn" onclick="startAnthropicOAuth()">Login with Claude</button>
-          </div>
-          <div class="gs-card" id="gs-step-agent">
-            <div class="gs-step-num">2</div>
-            <div class="gs-card-icon">&#128101;</div>
-            <div class="gs-card-title">Create an Agent</div>
-            <div class="gs-card-desc">Hire your first AI team member with a role, tools, and a channel.</div>
-            <button class="btn btn-sm btn-primary" onclick="navigateTo('team')">Go to The Office</button>
-          </div>
-          <div class="gs-card" id="gs-step-channel">
-            <div class="gs-step-num">3</div>
-            <div class="gs-card-icon">&#128172;</div>
-            <div class="gs-card-title">Connect a Channel</div>
-            <div class="gs-card-desc">Link Discord or Slack so your agents can communicate.</div>
-            <button class="btn btn-sm" onclick="navigateTo('settings')">Open Settings</button>
-          </div>
-          <div class="gs-card" id="gs-step-task">
-            <div class="gs-step-num">4</div>
-            <div class="gs-card-icon">&#9200;</div>
-            <div class="gs-card-title">Schedule a Task</div>
-            <div class="gs-card-desc">Set up cron jobs so agents work on autopilot.</div>
-            <button class="btn btn-sm" onclick="navigateTo('automations')">Add a Task</button>
-          </div>
-          <div class="gs-card" id="gs-step-project">
-            <div class="gs-step-num">5</div>
-            <div class="gs-card-icon">&#128194;</div>
-            <div class="gs-card-title">Link a Project</div>
-            <div class="gs-card-desc">Give agents context about your codebases and tools.</div>
-            <button class="btn btn-sm" onclick="navigateTo('projects')">Browse Projects</button>
-          </div>
-        </div>
-      </div>
-
-      <div class="summary-grid" id="summary-cards"></div>
-
-      <!-- Today's Plan + Team Pulse -->
-      <div style="display:grid;grid-template-columns:3fr 2fr;gap:16px;margin-bottom:16px">
-        <div class="card">
-          <div class="card-header" style="display:flex;justify-content:space-between;align-items:center">
-            <span>Today's Plan</span>
-            <div style="display:flex;gap:8px;align-items:center">
-              <input type="date" id="plan-date-picker" style="padding:4px 8px;font-size:11px;background:var(--bg-input);border:1px solid var(--border);border-radius:4px;color:var(--text-primary)">
-              <button class="btn btn-sm" onclick="loadPlanForDate(document.getElementById('plan-date-picker').value)" style="font-size:11px">Load</button>
+            <div class="gs-grid">
+              <div class="gs-card" id="gs-step-auth">
+                <div class="gs-step-num">1</div>
+                <div class="gs-card-icon">&#128274;</div>
+                <div class="gs-card-title">Login with Anthropic</div>
+                <div class="gs-card-desc" id="gs-auth-desc">Connect your Anthropic account to power your agents.</div>
+                <button class="btn btn-sm btn-primary" id="gs-auth-btn" onclick="startAnthropicOAuth()">Login with Claude</button>
+              </div>
+              <div class="gs-card" id="gs-step-agent">
+                <div class="gs-step-num">2</div>
+                <div class="gs-card-icon">&#128101;</div>
+                <div class="gs-card-title">Create an Agent</div>
+                <div class="gs-card-desc">Hire your first AI team member with a role, tools, and a channel.</div>
+                <button class="btn btn-sm btn-primary" onclick="navigateTo('team')">Go to The Office</button>
+              </div>
+              <div class="gs-card" id="gs-step-channel">
+                <div class="gs-step-num">3</div>
+                <div class="gs-card-icon">&#128172;</div>
+                <div class="gs-card-title">Connect a Channel</div>
+                <div class="gs-card-desc">Link Discord or Slack so your agents can communicate.</div>
+                <button class="btn btn-sm" onclick="navigateTo('settings', { tab: 'channels' })">Open Settings</button>
+              </div>
+              <div class="gs-card" id="gs-step-task">
+                <div class="gs-step-num">4</div>
+                <div class="gs-card-icon">&#9200;</div>
+                <div class="gs-card-title">Schedule a Task</div>
+                <div class="gs-card-desc">Set up cron jobs so agents work on autopilot.</div>
+                <button class="btn btn-sm" onclick="navigateTo('build', { tab: 'crons' })">Add a Task</button>
+              </div>
+              <div class="gs-card" id="gs-step-project">
+                <div class="gs-step-num">5</div>
+                <div class="gs-card-icon">&#128194;</div>
+                <div class="gs-card-title">Link a Project</div>
+                <div class="gs-card-desc">Give agents context about your codebases and tools.</div>
+                <button class="btn btn-sm" onclick="navigateTo('settings', { tab: 'projects' })">Browse Projects</button>
+              </div>
             </div>
           </div>
-          <div class="card-body" id="home-plan-content" style="max-height:320px;overflow-y:auto"><div class="empty-state">Loading plan...</div></div>
-        </div>
-        <div class="card">
-          <div class="card-header" style="display:flex;justify-content:space-between;align-items:center">
-            <span>Team Pulse</span>
-            <span style="font-size:11px;color:var(--text-muted)" id="team-pulse-count"></span>
-          </div>
-          <div class="card-body" id="home-team-pulse" style="max-height:320px;overflow-y:auto"><div class="empty-state">Loading team...</div></div>
-        </div>
-      </div>
 
-      <!-- Live Activity feed — primary home content. Metrics, Sessions, and per-agent stats moved to dedicated sidebar pages. -->
-      <div class="card">
-        <div class="card-header" style="display:flex;justify-content:space-between;align-items:center">
-          <span>Live Activity</span>
-          <div style="display:flex;gap:6px;align-items:center">
-            <select id="activity-source-filter" onchange="refreshActivity()" style="font-size:11px;padding:2px 6px;border:1px solid var(--border);border-radius:4px;background:var(--bg-secondary);color:var(--text-primary)">
-              <option value="">All Sources</option>
-              <option value="cron">Cron</option>
-              <option value="activity">Activities</option>
-              <option value="send">Emails</option>
-              <option value="approval">Approvals</option>
-              <option value="memory">Memory</option>
-            </select>
-            <select id="activity-agent-filter" onchange="refreshActivity()" style="font-size:11px;padding:2px 6px;border:1px solid var(--border);border-radius:4px;background:var(--bg-secondary);color:var(--text-primary)">
-              <option value="">All Agents</option>
-            </select>
+          <!-- Chat panel — primary surface -->
+          <div class="home-chat">
+            <div id="chat-messages" class="home-chat-messages">
+              <div class="empty-state" style="margin-top:32px">
+                <p style="margin-bottom:14px;color:var(--text-muted)">What can I help with?</p>
+                <div style="display:flex;flex-wrap:wrap;gap:8px;justify-content:center">
+                  <button class="btn btn-sm quick-pill" onclick="quickChat(&quot;What&apos;s on my schedule?&quot;)">What's on my schedule?</button>
+                  <button class="btn btn-sm quick-pill" onclick="quickChat('Check my email')">Check my email</button>
+                  <button class="btn btn-sm quick-pill" onclick="quickChat('Run morning briefing')">Run morning briefing</button>
+                  <button class="btn btn-sm quick-pill" onclick="quickChat('What did you do today?')">What did you do today?</button>
+                </div>
+              </div>
+            </div>
+            <div class="home-chat-input-row">
+              <input type="text" id="chat-input" placeholder="Ask Clementine anything..." onkeydown="if(event.key==='Enter'&amp;&amp;!event.shiftKey){event.preventDefault();sendChat()}">
+              <select id="chat-profile-select" onchange="switchProfile(this.value)" title="Active profile">
+                <option value="">Default</option>
+              </select>
+              <button class="btn-primary" id="chat-send-btn" onclick="sendChat()">Send</button>
+            </div>
           </div>
-        </div>
-        <div class="card-body" id="panel-activity"><div class="empty-state">Loading...</div></div>
+
+          <!-- Activity feed -->
+          <div class="card home-activity">
+            <div class="card-header" style="display:flex;justify-content:space-between;align-items:center">
+              <span>Live activity</span>
+              <div style="display:flex;gap:6px;align-items:center">
+                <select id="activity-source-filter" onchange="refreshActivity()" style="font-size:11px;padding:2px 6px;border:1px solid var(--border);border-radius:4px;background:var(--bg-secondary);color:var(--text-primary)">
+                  <option value="">All Sources</option>
+                  <option value="cron">Cron</option>
+                  <option value="activity">Activities</option>
+                  <option value="send">Emails</option>
+                  <option value="approval">Approvals</option>
+                  <option value="memory">Memory</option>
+                </select>
+                <select id="activity-agent-filter" onchange="refreshActivity()" style="font-size:11px;padding:2px 6px;border:1px solid var(--border);border-radius:4px;background:var(--bg-secondary);color:var(--text-primary)">
+                  <option value="">All Agents</option>
+                </select>
+              </div>
+            </div>
+            <div class="card-body" id="panel-activity"><div class="skel-block"><div class="skel-row med"></div><div class="skel-row"></div><div class="skel-row short"></div></div></div>
+          </div>
+        </main>
+
+        <!-- Right rail: Today / Upcoming / Active / Time-saved / Approvals -->
+        <aside class="home-rail" id="home-rail">
+          <button class="rail-collapse-btn" onclick="toggleHomeRail()" title="Hide rail">&times;</button>
+
+          <section class="rail-card">
+            <div class="rail-header">
+              <span><span class="status-pip green"></span>Daemon</span>
+              <span id="rail-daemon-uptime" style="font-size:11px;color:var(--text-muted)">--</span>
+            </div>
+            <div class="rail-body" id="rail-daemon-body">
+              <div class="agent-activity" id="agent-activity"><span class="agent-activity-dot"></span><span>Loading...</span></div>
+            </div>
+          </section>
+
+          <section class="rail-card">
+            <div class="rail-header">
+              <span>Today</span>
+              <input type="date" id="plan-date-picker" style="padding:2px 6px;font-size:10px;background:var(--bg-input);border:1px solid var(--border);border-radius:3px;color:var(--text-primary)">
+            </div>
+            <div class="rail-body" id="home-plan-content"><div class="skel-row med"></div><div class="skel-row"></div></div>
+          </section>
+
+          <section class="rail-card">
+            <div class="rail-header"><span>Upcoming runs</span><span id="rail-upcoming-count" class="rail-badge">0</span></div>
+            <div class="rail-body" id="rail-upcoming"><div class="skel-row short"></div></div>
+          </section>
+
+          <section class="rail-card">
+            <div class="rail-header"><span>Active runs</span><span id="rail-active-count" class="rail-badge" style="display:none">0</span></div>
+            <div class="rail-body" id="rail-active"><div style="font-size:12px;color:var(--text-muted)">Nothing running.</div></div>
+          </section>
+
+          <section class="rail-card">
+            <div class="rail-header"><span>Time saved this week</span></div>
+            <div class="rail-body" id="rail-time-saved"><div class="skel-row short"></div></div>
+          </section>
+
+          <section class="rail-card">
+            <div class="rail-header"><span>Approvals</span><span id="rail-approvals-count" class="rail-badge" style="display:none">0</span></div>
+            <div class="rail-body" id="rail-approvals"><div style="font-size:12px;color:var(--text-muted)">Nothing pending.</div></div>
+          </section>
+        </aside>
+        <button class="home-rail-toggle" onclick="toggleHomeRail()" title="Open status rail">&#9776;</button>
       </div>
     </div>
 
     <!-- ═══ Builder Page — Conversational Artifact Creation ═══ -->
-    <div class="page" id="page-builder">
-      <div style="display:flex;align-items:center;gap:12px;padding:12px 16px;border-bottom:1px solid var(--border)">
-        <span class="page-title" id="builder-page-title" style="margin:0;font-size:16px">Builder</span>
-        <select id="builder-type" onchange="resetBuilder();updateBuilderMode()" style="padding:6px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg-secondary);color:var(--text-primary);font-size:13px">
-          <option value="skill">Skill</option>
-          <option value="cron">Cron Job</option>
-          <option value="agent">Agent</option>
-          <option value="workflow">Workflow</option>
+    <div class="page" id="page-build">
+      <div class="tab-bar" id="build-tabs" style="margin:0;padding:0 18px;background:var(--bg-secondary);border-bottom:1px solid var(--border)">
+        <button class="active" data-build-tab="workflows" onclick="switchBuildTab('workflows')">&#128279; Workflows</button>
+        <button data-build-tab="crons" onclick="switchBuildTab('crons')">&#9200; Crons <span class="tab-badge" id="build-tab-cron-count" style="display:none">0</span></button>
+        <button data-build-tab="skills" onclick="switchBuildTab('skills')">&#128737; Skills <span class="tab-badge" id="build-tab-skill-count" style="display:none">0</span></button>
+        <button data-build-tab="templates" onclick="switchBuildTab('templates')">&#128221; Templates</button>
+      </div>
+      <!-- Builder header strip — persists across tabs (except Templates) -->
+      <div id="build-header-strip" style="display:flex;align-items:center;gap:12px;padding:10px 18px;border-bottom:1px solid var(--border)">
+        <select id="builder-type" onchange="resetBuilder();updateBuilderMode()" style="display:none">
+          <option value="skill">skill</option>
+          <option value="cron">cron</option>
+          <option value="agent">agent</option>
+          <option value="workflow">workflow</option>
         </select>
-        <span id="builder-agent-label" style="padding:6px 12px;font-size:13px;color:var(--text-secondary);font-weight:500"></span>
+        <span id="builder-agent-label" style="padding:0;font-size:13px;color:var(--text-secondary);font-weight:500"></span>
         <input type="hidden" id="builder-agent" value="">
         <span style="flex:1"></span>
         <button class="btn-sm" onclick="resetBuilder()" style="background:var(--bg-tertiary);border:1px solid var(--border);color:var(--text-secondary);padding:4px 12px;border-radius:6px;cursor:pointer;font-size:12px">New</button>
         <button class="btn-sm" id="builder-test-btn" onclick="testBuilderSkill()" style="background:var(--bg-tertiary);border:1px solid var(--border);color:var(--text-secondary);padding:4px 12px;border-radius:6px;cursor:pointer;font-size:12px;display:none">Test</button>
         <button class="btn-sm btn-primary" id="builder-save-btn" onclick="saveBuilderArtifact()" style="padding:4px 16px;font-size:12px;display:none">Save</button>
       </div>
-      <div style="display:flex;flex:1;min-height:0;overflow:hidden">
+      <!-- Build tab content area -->
+      <div id="build-tab-workflows" data-build-tabpane="workflows" style="display:flex;flex:1;min-height:0;overflow:hidden">
         <!-- Left: Chat -->
         <div style="flex:1;display:flex;flex-direction:column;border-right:1px solid var(--border)">
           <div id="builder-messages" style="flex:1;overflow-y:auto;padding:16px">
@@ -10677,14 +11293,43 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
             <button class="btn-primary" onclick="sendBuilderChat()" style="padding:10px 18px;border-radius:8px">Send</button>
           </div>
         </div>
-        <!-- Right: Live Preview + Existing Skills -->
-        <div style="width:400px;display:flex;flex-direction:column;background:var(--bg-secondary)">
-          <div style="padding:12px 16px;border-bottom:1px solid var(--border);font-weight:600;font-size:13px;color:var(--text-secondary)">
-            Live Preview
-            <span id="builder-preview-status" style="font-size:11px;color:var(--text-muted);margin-left:8px"></span>
+        <!-- Right: Live Preview / Canvas + Existing Skills -->
+        <div id="builder-right-pane" style="width:520px;display:flex;flex-direction:column;background:var(--bg-secondary)">
+          <div style="padding:12px 16px;border-bottom:1px solid var(--border);font-weight:600;font-size:13px;color:var(--text-secondary);display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+            <span id="builder-right-pane-title">Live Preview</span>
+            <span id="builder-preview-status" style="font-size:11px;color:var(--text-muted)"></span>
+            <span style="flex:1"></span>
+            <select id="builder-canvas-picker" onchange="openBuilderWorkflow(this.value)" style="display:none;padding:4px 8px;border:1px solid var(--border);border-radius:6px;background:var(--bg-secondary);color:var(--text-primary);font-size:12px;max-width:240px">
+              <option value="">— pick a workflow —</option>
+            </select>
+            <button id="builder-canvas-validate-btn" onclick="validateBuilderCanvas()" title="Static checks (cycles, missing fields, deps)" style="display:none;background:var(--bg-tertiary);border:1px solid var(--border);color:var(--text-secondary);padding:3px 8px;border-radius:4px;cursor:pointer;font-size:11px">Validate</button>
+            <button id="builder-canvas-dryrun-btn" onclick="dryRunBuilderCanvas()" title="Describe what each step would do (no execution)" style="display:none;background:var(--bg-tertiary);border:1px solid var(--border);color:var(--text-secondary);padding:3px 8px;border-radius:4px;cursor:pointer;font-size:11px">Dry-run</button>
+            <button id="builder-canvas-test-btn" onclick="testBuilderCanvas()" title="Test run (mock-safe by default)" style="display:none;background:var(--clementine);border:none;color:#fff;padding:3px 10px;border-radius:4px;cursor:pointer;font-size:11px">Test</button>
+            <button id="builder-canvas-cancel-btn" onclick="cancelBuilderTest()" title="Cancel test run" style="display:none;background:var(--red);border:none;color:#fff;padding:3px 10px;border-radius:4px;cursor:pointer;font-size:11px">Cancel</button>
           </div>
           <div id="builder-preview" style="flex:1;overflow-y:auto;padding:16px">
             <div class="empty-state" style="font-size:13px;color:var(--text-muted)">The artifact will appear here as you build it</div>
+          </div>
+          <div id="builder-canvas-host" style="display:none;flex:1;flex-direction:column;min-height:0;position:relative">
+            <div id="builder-canvas-banner" style="padding:8px 14px;background:var(--bg-tertiary);border-bottom:1px solid var(--border);font-size:11px;color:var(--text-muted);display:none"></div>
+            <div id="builder-canvas" style="flex:1;background:var(--bg-tertiary);position:relative;overflow:hidden"></div>
+            <!-- Floating add-node FAB + palette popover -->
+            <button id="builder-palette-btn" onclick="toggleBuilderPalette()" title="Add a step" style="position:absolute;left:14px;bottom:48px;width:40px;height:40px;border-radius:50%;background:var(--clementine);color:#fff;border:none;font-size:20px;font-weight:600;cursor:pointer;box-shadow:0 2px 8px rgba(0,0,0,0.25);z-index:10">+</button>
+            <div id="builder-palette-pop" style="display:none;position:absolute;left:60px;bottom:48px;background:var(--bg-secondary);border:1px solid var(--border);border-radius:8px;padding:6px;box-shadow:0 4px 16px rgba(0,0,0,0.2);z-index:11;min-width:160px">
+              <div onclick="_builderAddNodeOfKind('prompt')" class="builder-palette-item" data-kind="prompt">prompt</div>
+              <div onclick="_builderAddNodeOfKind('mcp')" class="builder-palette-item" data-kind="mcp">mcp tool</div>
+              <div onclick="_builderAddNodeOfKind('channel')" class="builder-palette-item" data-kind="channel">channel</div>
+              <div onclick="_builderAddNodeOfKind('transform')" class="builder-palette-item" data-kind="transform">transform</div>
+              <div onclick="_builderAddNodeOfKind('conditional')" class="builder-palette-item" data-kind="conditional">conditional</div>
+              <div onclick="_builderAddNodeOfKind('loop')" class="builder-palette-item" data-kind="loop">loop</div>
+            </div>
+            <!-- Slide-out config panel -->
+            <div id="builder-config-panel" style="display:none;position:absolute;right:0;top:0;bottom:0;width:340px;background:var(--bg-secondary);border-left:1px solid var(--border);box-shadow:-4px 0 16px rgba(0,0,0,0.15);z-index:12;display:flex;flex-direction:column"></div>
+            <div id="builder-canvas-footer" style="padding:6px 14px;border-top:1px solid var(--border);font-size:11px;color:var(--text-muted);display:flex;gap:14px;align-items:center">
+              <span id="builder-canvas-status"></span>
+              <span style="flex:1"></span>
+              <span id="builder-canvas-id" style="font-family:monospace;opacity:0.6"></span>
+            </div>
           </div>
           <!-- Existing skills drawer (visible in skill mode) -->
           <div id="builder-skills-drawer" style="display:none;border-top:2px solid var(--border);max-height:260px;overflow-y:auto">
@@ -10696,192 +11341,132 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
           </div>
         </div>
       </div>
-    </div>
 
-    <!-- ═══ Agent Detail Page (full-screen management console) ═══ -->
-    <div class="page" id="page-agent-detail">
-      <div id="agent-detail-content"><div class="empty-state">Select an agent from the sidebar</div></div>
-    </div>
-
-    <!-- ═══ Scheduled Tasks Page (Cron + Timers + Self-Improve + Skills + Analytics) ═══ -->
-    <div class="page" id="page-automations">
-      <div class="page-title">Scheduled Tasks</div>
-      <div class="tab-bar" id="automations-tabs">
-        <button class="active" onclick="switchTab('automations','scheduled')">Scheduled Tasks</button>
-        <button onclick="switchTab('automations','broken')">Broken Jobs <span class="tab-badge" id="tab-broken-count" title="repeatedly failing" style="display:none;background:#ef4444;color:#fff">0</span></button>
-        <button onclick="switchTab('automations','timers')">Timers <span class="tab-badge" id="tab-timer-count" style="display:none">0</span></button>
-        <button onclick="switchTab('automations','self-improve')">Self-Improve <span class="tab-badge" id="tab-si-pending" style="display:none">0</span></button>
-        <button onclick="switchTab('automations','skills')">Skills <span class="tab-badge" id="tab-skill-count" style="display:none">0</span><span class="tab-badge" id="tab-pending-skill-count" title="pending approval" style="display:none;background:#f59e0b;color:#000">0</span></button>
-        <button onclick="switchTab('automations','analytics')">Execution Analytics</button>
-      </div>
-      <div id="automations-tab-content">
-        <div class="tab-pane active" id="tab-automations-scheduled">
-          <div id="panel-cron"><div class="empty-state">Loading...</div></div>
-        </div>
-        <div class="tab-pane" id="tab-automations-broken">
-          <div class="card">
-            <div class="card-header" style="display:flex;align-items:center;justify-content:space-between">
-              <span>Repeatedly Failing Jobs (last 48h)</span>
-              <span class="badge badge-gray" id="broken-count-badge" style="font-size:10px">0 jobs</span>
+      <!-- Templates tab — starter patterns -->
+      <div id="build-tab-templates" data-build-tabpane="templates" style="display:none;padding:24px;overflow-y:auto">
+        <div style="max-width:920px;margin:0 auto">
+          <h2 style="font-size:18px;font-weight:600;margin:0 0 6px;color:var(--text-primary)">Start from a template</h2>
+          <p style="font-size:13px;color:var(--text-muted);margin:0 0 18px">Pick a pre-built pattern to fork into a new editable workflow.</p>
+          <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:14px">
+            <div class="card clickable-row" onclick="forkBuildTemplate('daily-news-digest')" style="padding:18px">
+              <div style="font-size:24px;margin-bottom:8px">&#128240;</div>
+              <div style="font-weight:600;font-size:14px;margin-bottom:4px">Daily news digest</div>
+              <div style="font-size:12px;color:var(--text-muted);line-height:1.4">Cron 7am: pull RSS sources, summarize, send to Slack/email.</div>
+              <div style="margin-top:10px;font-size:11px;color:var(--clementine);font-weight:500">cron · 4 steps</div>
             </div>
-            <div class="card-body" id="panel-broken-jobs"><div class="empty-state">Loading...</div></div>
-          </div>
-        </div>
-        <div class="tab-pane" id="tab-automations-timers">
-          <div class="card">
-            <div class="card-body" id="panel-timers"><div class="empty-state">Loading...</div></div>
-          </div>
-        </div>
-        <div class="tab-pane" id="tab-automations-self-improve">
-          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
-            <div style="font-size:13px;color:var(--text-secondary)">Self-improvement runs nightly at 1 AM. You can also trigger it manually.</div>
-            <button class="btn-sm btn-primary" onclick="siRunCycle()" id="si-run-btn">Run Now</button>
-          </div>
-          <div class="grid-2" id="si-status-cards"></div>
-          <div class="card" style="margin-top:16px">
-            <div class="card-header">Pending Proposals</div>
-            <div class="card-body" id="si-pending-list"><div class="empty-state">No pending proposals</div></div>
-          </div>
-          <div class="card" style="margin-top:16px">
-            <div class="card-header">Experiment History</div>
-            <div class="card-body" id="si-history-list"><div class="empty-state">No experiments yet</div></div>
-          </div>
-        </div>
-        <div class="tab-pane" id="tab-automations-skills">
-          <div class="card" style="margin-bottom:16px">
-            <div class="card-header" style="display:flex;align-items:center;justify-content:space-between">
-              <span>Teach a Skill</span>
-              <button class="btn-sm btn-primary" onclick="toggleTeachSkill()" id="teach-skill-toggle" style="font-size:12px">+ New Skill</button>
+            <div class="card clickable-row" onclick="forkBuildTemplate('lead-picker')" style="padding:18px">
+              <div style="font-size:24px;margin-bottom:8px">&#128202;</div>
+              <div style="font-weight:600;font-size:14px;margin-bottom:4px">Lead picker → Salesforce</div>
+              <div style="font-size:12px;color:var(--text-muted);line-height:1.4">Manual workflow: search leads by ICP, review, push selected to SF.</div>
+              <div style="margin-top:10px;font-size:11px;color:var(--clementine);font-weight:500">manual · 3 steps</div>
             </div>
-            <div class="card-body" id="teach-skill-form" style="display:none;padding:16px">
-              <div style="display:grid;gap:12px">
-                <div>
-                  <label style="font-size:12px;font-weight:600;color:var(--text-secondary)">Title</label>
-                  <input type="text" id="skill-title" placeholder="e.g., Deploy to production" style="width:100%;padding:8px;border:1px solid var(--border);border-radius:6px;background:var(--bg-input);color:var(--text-primary);font-size:13px">
-                </div>
-                <div>
-                  <label style="font-size:12px;font-weight:600;color:var(--text-secondary)">Description</label>
-                  <input type="text" id="skill-description" placeholder="1-2 sentence summary of what this skill does" style="width:100%;padding:8px;border:1px solid var(--border);border-radius:6px;background:var(--bg-input);color:var(--text-primary);font-size:13px">
-                </div>
-                <div>
-                  <label style="font-size:12px;font-weight:600;color:var(--text-secondary)">Triggers <span style="font-weight:400;color:var(--text-muted)">(comma-separated keywords)</span></label>
-                  <input type="text" id="skill-triggers" placeholder="deploy, production, release, ship" style="width:100%;padding:8px;border:1px solid var(--border);border-radius:6px;background:var(--bg-input);color:var(--text-primary);font-size:13px">
-                </div>
-                <div>
-                  <label style="font-size:12px;font-weight:600;color:var(--text-secondary)">Procedure <span style="font-weight:400;color:var(--text-muted)">(markdown steps)</span></label>
-                  <textarea id="skill-steps" rows="6" placeholder="1. Run tests: npm test\n2. Build: npm run build\n3. Push: git push origin main\n4. Verify deploy succeeded" style="width:100%;padding:8px;border:1px solid var(--border);border-radius:6px;background:var(--bg-input);color:var(--text-primary);font-size:13px;font-family:monospace;resize:vertical"></textarea>
-                </div>
-                <div style="display:flex;gap:8px;justify-content:flex-end">
-                  <button class="btn-sm" onclick="toggleTeachSkill()" style="background:var(--bg-tertiary);border:1px solid var(--border);color:var(--text-primary);padding:6px 16px;border-radius:6px;cursor:pointer">Cancel</button>
-                  <button class="btn-sm btn-primary" onclick="saveSkill()" style="padding:6px 16px">Save Skill</button>
-                </div>
-              </div>
+            <div class="card clickable-row" onclick="forkBuildTemplate('pr-review-queue')" style="padding:18px">
+              <div style="font-size:24px;margin-bottom:8px">&#128221;</div>
+              <div style="font-weight:600;font-size:14px;margin-bottom:4px">PR review queue</div>
+              <div style="font-size:12px;color:var(--text-muted);line-height:1.4">Cron 9am M-F: list open PRs, summarize risk, message to Slack.</div>
+              <div style="margin-top:10px;font-size:11px;color:var(--clementine);font-weight:500">cron · 3 steps</div>
+            </div>
+            <div class="card clickable-row" onclick="forkBuildTemplate('email-triage')" style="padding:18px">
+              <div style="font-size:24px;margin-bottom:8px">&#128231;</div>
+              <div style="font-weight:600;font-size:14px;margin-bottom:4px">Email triage</div>
+              <div style="font-size:12px;color:var(--text-muted);line-height:1.4">Cron 8am: list unread emails, classify by intent, draft replies for review.</div>
+              <div style="margin-top:10px;font-size:11px;color:var(--clementine);font-weight:500">cron · 4 steps</div>
+            </div>
+            <div class="card clickable-row" onclick="forkBuildTemplate('weekly-review')" style="padding:18px">
+              <div style="font-size:24px;margin-bottom:8px">&#128197;</div>
+              <div style="font-weight:600;font-size:14px;margin-bottom:4px">Weekly review</div>
+              <div style="font-size:12px;color:var(--text-muted);line-height:1.4">Cron Fri 6pm: review the week's daily notes, generate review note.</div>
+              <div style="margin-top:10px;font-size:11px;color:var(--clementine);font-weight:500">cron · 3 steps</div>
+            </div>
+            <div class="card clickable-row" onclick="forkBuildTemplate('blank-workflow')" style="padding:18px;border-style:dashed">
+              <div style="font-size:24px;margin-bottom:8px">&#10133;</div>
+              <div style="font-weight:600;font-size:14px;margin-bottom:4px">Blank workflow</div>
+              <div style="font-size:12px;color:var(--text-muted);line-height:1.4">Start from scratch with a single prompt step.</div>
+              <div style="margin-top:10px;font-size:11px;color:var(--clementine);font-weight:500">manual · 1 step</div>
             </div>
           </div>
-          <div class="card" id="pending-skills-card" style="display:none">
-            <div class="card-header" style="display:flex;align-items:center;justify-content:space-between">
-              <span>Pending Approval</span>
-              <span class="badge badge-orange" id="pending-skills-count-badge" style="font-size:10px">0 pending</span>
-            </div>
-            <div class="card-body" id="panel-pending-skills"></div>
-          </div>
-          <div class="card">
-            <div class="card-header" style="display:flex;align-items:center;justify-content:space-between">
-              <span>Learned Skills</span>
-              <span class="badge badge-gray" id="skill-count-badge" style="font-size:10px">0 skills</span>
-            </div>
-            <div class="card-body" id="panel-skills"><div class="empty-state">No skills learned yet. Skills are auto-extracted from successful tasks or taught manually above.</div></div>
-          </div>
-        </div>
-        <div class="tab-pane" id="tab-automations-workflows">
-          <div id="panel-workflows"><div class="empty-state">Loading workflows...</div></div>
-        </div>
-        <div class="tab-pane" id="tab-automations-analytics">
-          <div id="advisor-analytics-content"><div class="empty-state">Loading analytics...</div></div>
         </div>
       </div>
     </div>
 
-    <!-- ═══ Team Status Page ═══ -->
-    <div class="page" id="page-team-status">
-      <div class="page-title">Team Status</div>
-      <div id="team-status-grid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:16px;margin-top:16px"></div>
-      <script>
-        (function() {
-          function renderTeamStatus() {
-            fetch('/api/team/status').then(r => r.json()).then(data => {
-              const grid = document.getElementById('team-status-grid');
-              if (!grid) return;
-              if (!data.agents || data.agents.length === 0) {
-                grid.innerHTML = '<div class="empty-state">No agents found. Create an agent to get started.</div>';
-                return;
-              }
-              grid.innerHTML = data.agents.map(a => {
-                const avatarLetter = (a.name || a.slug || '?').charAt(0).toUpperCase();
-                const tasksHtml = a.tasks
-                  ? '<div style="margin:4px 0"><span style="font-size:12px;color:var(--text-secondary)">Tasks: </span>' +
-                    '<strong>' + (a.tasks.pending || 0) + ' pending</strong>' +
-                    (a.tasks.overdue > 0 ? ' <span style="color:#ef4444;font-weight:600">' + a.tasks.overdue + ' overdue</span>' : '') +
-                    '</div>'
-                  : '';
-                const goalsHtml = a.activeGoals > 0
-                  ? '<div style="margin:4px 0;font-size:12px"><span style="color:var(--text-secondary)">Goals: </span>' +
-                    '<strong>' + a.activeGoals + ' active</strong>' +
-                    (a.firstGoalTitle ? ' — ' + a.firstGoalTitle.slice(0, 60) : '') +
-                    '</div>'
-                  : '';
-                const noteHtml = a.lastNoteDate
-                  ? '<div style="margin:4px 0;font-size:12px;color:var(--text-secondary)">Last log: ' + a.lastNoteDate +
-                    (a.lastNoteSnippet ? ' — ' + a.lastNoteSnippet.slice(0, 100) : '') + '</div>'
-                  : '';
-                const wmHtml = a.workingMemorySnippet
-                  ? '<div style="margin-top:8px;padding:8px;background:var(--bg-input);border-radius:6px;font-size:11px;color:var(--text-secondary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + a.workingMemorySnippet + '</div>'
-                  : '';
-                return '<div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:16px;cursor:pointer" onclick="showPage(\\'team\\');setTimeout(()=>selectAgent(\\''+a.slug+'\\'),100)">' +
-                  '<div style="display:flex;align-items:center;gap:10px;margin-bottom:10px">' +
-                  '<div style="width:40px;height:40px;border-radius:50%;background:var(--clementine);color:#fff;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:18px">' + avatarLetter + '</div>' +
-                  '<div><div style="font-weight:600">' + (a.name || a.slug) + '</div>' +
-                  '<div style="font-size:11px;color:var(--text-secondary)">' + (a.description || a.slug) + '</div></div>' +
-                  '</div>' +
-                  tasksHtml + goalsHtml + noteHtml + wmHtml +
-                  '</div>';
-              }).join('');
-            }).catch(() => {
-              const grid = document.getElementById('team-status-grid');
-              if (grid) grid.innerHTML = '<div class="empty-state">Failed to load team status.</div>';
-            });
-          }
-          // Render when page becomes visible
-          document.addEventListener('DOMContentLoaded', () => {
-            const obs = new MutationObserver(() => {
-              const page = document.getElementById('page-team-status');
-              if (page && page.classList.contains('active')) renderTeamStatus();
-            });
-            const content = document.querySelector('.content');
-            if (content) obs.observe(content, { subtree: true, attributes: true, attributeFilter: ['class'] });
+    <!-- page-agent-detail merged into Team page; click an agent in Roster to drill down. -->
+
+
+    <!-- DELETED in Session 5 — automations content moved to Build / Brain → Learning.
+         (Block formerly housed: panel-cron, panel-broken-jobs, panel-timers,
+         si-* status cards/proposals/history, teach-skill-form, panel-skills,
+         pending-skills-card, panel-workflows, advisor-analytics-content.) -->
+    <!-- (Session 5) page-automations parking removed. Self-Improve now lives in
+         Brain → Learning; Build (Workflows/Crons/Skills/Templates) is the home for
+         everything else that was here. -->
+
+    <!-- page-team-status merged into Team → Activity tab.
+         Render is now triggered by switchTab('team','activity'). -->
+    <script>
+      (function() {
+        window.renderTeamStatus = function renderTeamStatus() {
+          fetch('/api/team/status').then(function(r) { return r.json(); }).then(function(data) {
+            var grid = document.getElementById('team-status-grid');
+            if (!grid) return;
+            if (!data.agents || data.agents.length === 0) {
+              grid.innerHTML = '<div class="empty-cta"><div class="label">No agents yet</div><div class="hint">Hire your first agent from the Roster tab.</div></div>';
+              return;
+            }
+            grid.innerHTML = data.agents.map(function(a) {
+              var avatarLetter = (a.name || a.slug || '?').charAt(0).toUpperCase();
+              var tasksHtml = a.tasks
+                ? '<div style="margin:4px 0"><span style="font-size:12px;color:var(--text-secondary)">Tasks: </span><strong>' + (a.tasks.pending || 0) + ' pending</strong>' +
+                  (a.tasks.overdue > 0 ? ' <span style="color:#ef4444;font-weight:600">' + a.tasks.overdue + ' overdue</span>' : '') + '</div>'
+                : '';
+              var goalsHtml = a.activeGoals > 0
+                ? '<div style="margin:4px 0;font-size:12px"><span style="color:var(--text-secondary)">Goals: </span><strong>' + a.activeGoals + ' active</strong>' +
+                  (a.firstGoalTitle ? ' — ' + a.firstGoalTitle.slice(0, 60) : '') + '</div>'
+                : '';
+              var noteHtml = a.lastNoteDate
+                ? '<div style="margin:4px 0;font-size:12px;color:var(--text-secondary)">Last log: ' + a.lastNoteDate +
+                  (a.lastNoteSnippet ? ' — ' + a.lastNoteSnippet.slice(0, 100) : '') + '</div>'
+                : '';
+              var wmHtml = a.workingMemorySnippet
+                ? '<div style="margin-top:8px;padding:8px;background:var(--bg-input);border-radius:6px;font-size:11px;color:var(--text-secondary)">' + a.workingMemorySnippet + '</div>'
+                : '';
+              return '<div class="clickable-row" style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:16px" onclick="navigateTo(\\x27team\\x27,{tab:\\x27roster\\x27,agentSlug:\\x27' + a.slug + '\\x27})">' +
+                '<div style="display:flex;align-items:center;gap:10px;margin-bottom:10px">' +
+                '<div style="width:40px;height:40px;border-radius:50%;background:var(--clementine);color:#fff;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:18px">' + avatarLetter + '</div>' +
+                '<div><div style="font-weight:600">' + (a.name || a.slug) + '</div>' +
+                '<div style="font-size:11px;color:var(--text-secondary)">' + (a.description || a.slug) + '</div></div></div>' +
+                tasksHtml + goalsHtml + noteHtml + wmHtml + '</div>';
+            }).join('');
+          }).catch(function() {
+            var grid = document.getElementById('team-status-grid');
+            if (grid) grid.innerHTML = '<div class="empty-state">Failed to load team status.</div>';
           });
-        })();
-      </script>
-    </div>
+        };
+      })();
+    </script>
 
     <!-- ═══ Brain Page (unified: Search + Graph + Stats + Sources + Seed + Runs) ═══ -->
-    <div class="page" id="page-intelligence">
-      <div class="page-title">Brain</div>
-      <div style="color:var(--muted,#888);margin-bottom:16px;font-size:13px">
-        Query what you know, and feed new knowledge in. Everything on this page writes to or reads from the same memory + knowledge graph.
+    <div class="page" id="page-brain">
+      <div class="page-head">
+        <div class="icon">&#129504;</div>
+        <div class="title-block">
+          <h1>Brain</h1>
+          <p class="desc">Query what you know, feed new knowledge in, and watch the system learn.</p>
+        </div>
+        <div class="actions" style="flex:1;max-width:480px;display:flex;gap:8px">
+          <input type="text" id="memory-search-input" placeholder="Search vault, notes, memory..." style="flex:1;padding:6px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg-input);color:var(--text-primary);font-size:13px" onkeydown="if(event.key==='Enter')runMemorySearch()">
+          <button class="btn-primary btn-sm" onclick="runMemorySearch()">Search</button>
+        </div>
       </div>
-      <div style="display:flex;gap:10px;margin-bottom:16px">
-        <input type="text" id="memory-search-input" placeholder="Search vault, notes, memory..." style="flex:1" onkeydown="if(event.key==='Enter')runMemorySearch()">
-        <button class="btn-primary" onclick="runMemorySearch()">Search</button>
-      </div>
-      <div class="tab-bar" id="intelligence-tabs">
-        <button class="active" onclick="switchTab('intelligence','search')">Search</button>
-        <button onclick="switchTab('intelligence','graph')">Knowledge Graph</button>
+      <div class="tab-bar" id="intelligence-tabs" style="margin:0 0 0 18px">
+        <button class="active" onclick="switchTab('intelligence','search')">Memory</button>
+        <button onclick="switchTab('intelligence','graph')">Knowledge</button>
+        <button onclick="switchTab('intelligence','sources')">Ingestion</button>
+        <button onclick="switchTab('intelligence','health')">Health <span class="tab-badge" id="brain-health-badge" style="display:none;background:#ef4444;color:#fff">0</span></button>
         <button onclick="switchTab('intelligence','user-model')">User Model</button>
-        <button onclick="switchTab('intelligence','memory')">Memory Stats</button>
-        <button onclick="switchTab('intelligence','seed')">Seed Upload</button>
-        <button onclick="switchTab('intelligence','sources')">Sources</button>
-        <button onclick="switchTab('intelligence','runs')">Ingestion Runs</button>
+        <button onclick="switchTab('intelligence','learning')">Learning <span class="tab-badge" id="brain-learning-badge" style="display:none;background:#f59e0b;color:#000">0</span></button>
+        <button onclick="switchTab('intelligence','memory')">Stats</button>
+        <button onclick="switchTab('intelligence','seed')">Seed</button>
+        <button onclick="switchTab('intelligence','runs')">Runs</button>
       </div>
       <div id="intelligence-tab-content">
         <div class="tab-pane active" id="tab-intelligence-search">
@@ -11082,6 +11667,68 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
         <!-- Ingestion Runs -->
         <div class="tab-pane" id="tab-intelligence-runs">
           <div id="brain-runs-list"></div>
+        </div>
+        <div class="tab-pane" id="tab-intelligence-health">
+          <div style="display:flex;align-items:center;gap:8px;margin-bottom:14px;flex-wrap:wrap">
+            <button class="btn-sm" onclick="memoryHealthAction('janitor')" title="Run the janitor cleanup pass now">Run cleanup</button>
+            <button class="btn-sm" onclick="memoryHealthAction('rebuild-fts')" title="Rebuild the FTS5 index">Rebuild FTS</button>
+            <button class="btn-sm" onclick="memoryHealthAction('fix-orphans')" title="Null out missing derived_from refs">Fix orphans</button>
+            <button class="btn-sm" onclick="refreshMemoryHealth()">Refresh</button>
+          </div>
+          <div id="memory-health-content">
+            <div class="skel-block"><div class="skel-row med"></div><div class="skel-row"></div><div class="skel-row short"></div></div>
+          </div>
+          <div class="card" style="margin-top:18px">
+            <div class="card-header" style="display:flex;align-items:center;justify-content:space-between">
+              <span>Trust &amp; claim verification</span>
+              <span id="trust-score-detail" style="font-size:11px;color:var(--text-muted)">Rolling 30-claim score</span>
+            </div>
+            <div class="card-body" style="padding:14px;display:flex;align-items:center;gap:14px">
+              <span style="font-size:28px;font-weight:700" id="trust-score-big">--</span>
+              <div style="flex:1;display:flex;gap:6px;flex-wrap:wrap">
+                <button class="btn-sm" onclick="refreshClaims('all')" id="claims-filter-all">All</button>
+                <button class="btn-sm" onclick="refreshClaims('pending')" id="claims-filter-pending">Pending</button>
+                <button class="btn-sm" onclick="refreshClaims('verified')" id="claims-filter-verified">Verified</button>
+                <button class="btn-sm" onclick="refreshClaims('failed')" id="claims-filter-failed">Failed</button>
+              </div>
+            </div>
+          </div>
+          <div class="card" style="margin-top:14px">
+            <div class="card-header">Recent claims</div>
+            <div class="card-body" id="panel-claims">
+              <div class="skel-block"><div class="skel-row med"></div><div class="skel-row short"></div></div>
+            </div>
+          </div>
+          <div class="card" style="margin-top:14px">
+            <div class="card-header" style="display:flex;align-items:center;justify-content:space-between">
+              <span>Team routing decisions</span>
+              <span style="font-size:11px;color:var(--text-muted)">Owner-facing sessions only</span>
+            </div>
+            <div class="card-body" id="panel-routing-audit">
+              <div class="skel-block"><div class="skel-row med"></div></div>
+            </div>
+          </div>
+        </div>
+        <div class="tab-pane" id="tab-intelligence-learning">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+            <div style="font-size:13px;color:var(--text-secondary)">Self-improvement runs nightly at 1 AM. You can also trigger it manually.</div>
+            <button class="btn-sm btn-primary" onclick="siRunCycle()" id="si-run-btn">Run Now</button>
+          </div>
+          <div class="grid-2" id="si-status-cards">
+            <div class="skel-block"><div class="skel-row med"></div><div class="skel-row short"></div></div>
+            <div class="skel-block"><div class="skel-row med"></div><div class="skel-row short"></div></div>
+          </div>
+          <div class="card" style="margin-top:16px">
+            <div class="card-header" style="display:flex;align-items:center;justify-content:space-between">
+              <span>Pending Proposals</span>
+              <span class="tab-badge" id="tab-si-pending" style="display:none;background:#f59e0b;color:#000">0</span>
+            </div>
+            <div class="card-body" id="si-pending-list"><div class="empty-state">No pending proposals</div></div>
+          </div>
+          <div class="card" style="margin-top:16px">
+            <div class="card-header">Experiment History</div>
+            <div class="card-body" id="si-history-list"><div class="empty-state">No experiments yet</div></div>
+          </div>
         </div>
       </div>
 
@@ -12037,143 +12684,47 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
       </script>
     </div>
 
-    <!-- ═══ Sessions Page ═══ -->
-    <div class="page" id="page-sessions">
-      <div class="page-title">Sessions</div>
-      <p style="color:var(--text-muted);margin-bottom:16px">Active conversation sessions across channels. Each session is a continuous thread with one user.</p>
-      <div id="panel-sessions"><div class="empty-state">Loading...</div></div>
+    <!-- Sessions, Trust & Claims, Logs, Chat, Metrics, Daily Plan pages
+         removed in Session 2 — content lives on Home or migrates to other
+         destinations in Sessions 3-4. Page references for these IDs are
+         resolved via ROUTE_REDIRECTS in navigateTo. -->
+
+    <!-- Hidden mounting points for daily-plan content used by the Home rail
+         (refreshDailyPlan looks for these by ID). Keeping the IDs avoids
+         touching every refreshDailyPlan callsite right now. -->
+    <div style="display:none">
+      <div id="plan-diff-content"></div>
+      <div id="plan-history-list"></div>
+      <input type="date" id="plan-date-picker-secondary" disabled>
     </div>
 
-    <!-- ═══ Trust & Claims Page ═══ -->
-    <div class="page" id="page-claims">
-      <div class="page-title">Trust &amp; Claims</div>
-      <div class="card" style="margin-bottom:16px">
-        <div class="card-body" style="display:flex;align-items:center;gap:16px;padding:16px">
-          <div style="font-size:36px;font-weight:700" id="trust-score-big">--</div>
-          <div style="flex:1">
-            <div style="font-size:13px;font-weight:600">Clementine's trust score</div>
-            <div style="font-size:11px;color:var(--text-muted)" id="trust-score-detail">
-              Rolling over the last 30 verified or failed claims.
-            </div>
-          </div>
-          <div style="display:flex;gap:6px">
-            <button class="btn-sm" onclick="refreshClaims('all')" id="claims-filter-all" style="padding:4px 10px">All</button>
-            <button class="btn-sm" onclick="refreshClaims('pending')" id="claims-filter-pending" style="padding:4px 10px">Pending</button>
-            <button class="btn-sm" onclick="refreshClaims('verified')" id="claims-filter-verified" style="padding:4px 10px">Verified</button>
-            <button class="btn-sm" onclick="refreshClaims('failed')" id="claims-filter-failed" style="padding:4px 10px">Failed</button>
-          </div>
-        </div>
-      </div>
-      <div class="card">
-        <div class="card-header">Recent claims</div>
-        <div class="card-body" id="panel-claims"><div class="empty-state">Loading...</div></div>
-      </div>
-      <div class="card" style="margin-top:16px">
-        <div class="card-header" style="display:flex;align-items:center;justify-content:space-between">
-          <span>Team routing decisions</span>
-          <span style="font-size:11px;color:var(--text-muted)">Only owner-facing Clementine sessions are classified &mdash; agent-bot DMs bypass routing entirely.</span>
-        </div>
-        <div class="card-body" id="panel-routing-audit"><div class="empty-state">Loading...</div></div>
-      </div>
-    </div>
+    <!-- (Session 5) page-memory-health parking stub removed. Brain → Health is the live home. -->
 
-    <!-- ═══ Logs Page ═══ -->
-    <div class="page" id="page-logs">
-      <div class="page-title">Logs</div>
-      <div class="log-toolbar">
-        <input type="text" class="log-filter" id="log-filter" placeholder="Filter logs...">
-        <select id="log-level-filter" style="background:var(--bg-input);border:1px solid var(--border);border-radius:var(--radius-sm);padding:6px 10px;font-size:12px;color:var(--text-primary);font-family:inherit;cursor:pointer" onchange="applyLogFilter()">
-          <option value="">All Levels</option>
-          <option value="error">Error+</option>
-          <option value="warn">Warn+</option>
-          <option value="info">Info+</option>
-          <option value="debug">Debug+</option>
-        </select>
-        <button onclick="refreshLogs()">Refresh</button>
-        <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--text-secondary);cursor:pointer">
-          <input type="checkbox" id="log-autoscroll" checked> Auto-scroll
-        </label>
-      </div>
-      <div class="log-viewer" id="panel-logs"><div class="empty-state">Loading...</div></div>
-    </div>
-
-    <!-- ═══ Chat Page ═══ -->
-    <div class="page" id="page-chat">
-      <div id="chat-messages" style="flex:1;overflow-y:auto;padding:16px">
-        <div class="empty-state">
-          <p style="margin-bottom:14px;color:var(--text-muted)">Send a message to start a conversation.</p>
-          <div style="display:flex;flex-wrap:wrap;gap:8px;justify-content:center">
-            <button class="btn btn-sm quick-pill" onclick="quickChat(&quot;What&apos;s on my schedule?&quot;)">What's on my schedule?</button>
-            <button class="btn btn-sm quick-pill" onclick="quickChat('Check my email')">Check my email</button>
-            <button class="btn btn-sm quick-pill" onclick="quickChat('Run morning briefing')">Run morning briefing</button>
-            <button class="btn btn-sm quick-pill" onclick="quickChat('What did you do today?')">What did you do today?</button>
-          </div>
-        </div>
-      </div>
-      <div style="border-top:1px solid var(--border);padding:8px 14px 0;display:flex;align-items:center;gap:8px" id="chat-profile-bar">
-        <span style="font-size:11px;color:var(--text-muted)">Profile:</span>
-        <select id="chat-profile-select" onchange="switchProfile(this.value)" style="font-size:11px;padding:2px 6px;border:1px solid var(--border);border-radius:4px;background:var(--bg-secondary);color:var(--text-primary)">
-          <option value="">Default</option>
-        </select>
-      </div>
-      <div style="border-top:1px solid var(--border);padding:14px;display:flex;gap:10px">
-        <input type="text" id="chat-input" placeholder="Type a message..." style="flex:1" onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendChat()}">
-        <button class="btn-primary" id="chat-send-btn" onclick="sendChat()">Send</button>
-      </div>
-    </div>
-
-    <!-- ═══ Metrics Page ═══ -->
-    <div class="page" id="page-metrics">
-      <div class="page-title">Metrics</div>
-      <p style="color:var(--text-muted);margin-bottom:16px">Time-saved estimates, run success rates, and per-job breakdowns.</p>
-      <div id="metrics-content"><div class="empty-state">Loading metrics...</div></div>
-    </div>
-
-    <!-- ═══ Memory Health Page ═══ -->
-    <div class="page" id="page-memory-health">
-      <div class="page-title">Memory Health</div>
-      <p style="color:var(--text-muted);margin-bottom:16px">Bounded growth, retrieval signal, and curation drift &mdash; everything the janitor manages.</p>
-      <div style="display:flex;gap:8px;margin-bottom:16px">
-        <button class="btn btn-sm" onclick="refreshMemoryHealth()">Refresh</button>
-      </div>
-      <div id="memory-health-content"><div class="empty-state">Loading memory health...</div></div>
-    </div>
-
-    <!-- ═══ Daily Plan Page ═══ -->
-    <div class="page" id="page-daily-plan">
-      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:20px">
-        <div class="page-title" style="margin-bottom:0">Daily Plan</div>
-        <div style="display:flex;gap:8px;align-items:center">
-          <input type="date" id="plan-date-picker" style="padding:6px 10px;background:var(--bg-input);border:1px solid var(--border);border-radius:6px;color:var(--text-primary)">
-          <button class="btn btn-sm" onclick="loadPlanForDate(document.getElementById('plan-date-picker').value)">Load</button>
-        </div>
-      </div>
-      <div id="daily-plan-content"><div class="empty-state">Loading plan...</div></div>
-      <div id="plan-diff-content" style="margin-top:16px"></div>
-      <details style="margin-top:16px">
-        <summary style="cursor:pointer;font-weight:600;color:var(--text-secondary);font-size:13px;padding:8px 0;user-select:none">Plan History</summary>
-        <div id="plan-history-list" style="margin-top:8px"><div class="empty-state">Loading...</div></div>
-      </details>
-    </div>
-
-    <!-- ═══ Goals Page ═══ -->
-    <div class="page" id="page-goals">
-      <div class="page-title">Goals</div>
-      <p style="color:var(--text-muted);margin-bottom:16px">Long-running objectives the team is contributing to. Tracks per-agent contribution and run success rate.</p>
-      <div id="goals-progress-content"><div class="empty-state">Loading goals...</div></div>
-    </div>
+    <!-- page-goals merged into Team → Goals tab. -->
 
     <!-- ═══ Team Page — The Office ═══ -->
     <div class="page" id="page-team">
-      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
-        <div class="page-title" style="margin-bottom:0">The Office</div>
-        <div style="display:flex;gap:8px;align-items:center">
-          <button class="btn" onclick="startHiringInterview()" style="background:var(--green);color:#000;font-weight:600">Hire a New Employee</button>
-          <button class="btn btn-sm" onclick="applyRoleTemplate('sdr')" style="color:var(--accent)" title="Pre-filled SDR role template">+ SDR</button>
-          <button class="btn btn-sm" onclick="applyRoleTemplate('researcher')" style="color:var(--text-muted)" title="Pre-filled researcher role template">+ Researcher</button>
-          <button class="btn btn-sm" onclick="showAgentCreateModal()" style="color:var(--text-muted)">Manual Setup</button>
+      <div class="page-head">
+        <div class="icon">&#128101;</div>
+        <div class="title-block">
+          <h1>The Office</h1>
+          <p class="desc">Your team of agents — what they're doing, what they're contributing to.</p>
+        </div>
+        <div class="actions">
+          <button class="btn-primary btn-sm" onclick="startHiringInterview()" style="background:var(--green);color:#000">Hire</button>
+          <button class="btn-sm" onclick="applyRoleTemplate('sdr')" title="Pre-filled SDR role template">+ SDR</button>
+          <button class="btn-sm" onclick="applyRoleTemplate('researcher')" title="Pre-filled researcher role template">+ Researcher</button>
+          <button class="btn-sm" onclick="showAgentCreateModal()">Manual</button>
         </div>
       </div>
+      <div class="tab-bar" id="team-tabs" style="margin:0 0 0 18px">
+        <button class="active" onclick="switchTab('team','roster')">Roster</button>
+        <button onclick="switchTab('team','activity')">Activity</button>
+        <button onclick="switchTab('team','goals')">Goals</button>
+        <button onclick="switchTab('team','comms')">Comms</button>
+      </div>
+      <div id="team-tab-content">
+      <div class="tab-pane active" id="tab-team-roster">
       <div id="office-hero-section"></div>
       <div class="office-floor" id="team-agent-grid">
         <div class="empty-state">No agents configured</div>
@@ -12378,17 +12929,60 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
         </form>
         </div>
       </div>
+      </div><!-- /tab-team-roster -->
+
+      <!-- Team → Activity tab (migrated from page-team-status) -->
+      <div class="tab-pane" id="tab-team-activity" style="padding:18px">
+        <div id="team-status-grid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:16px">
+          <div class="skel-block"><div class="skel-row med"></div><div class="skel-row"></div><div class="skel-row short"></div></div>
+        </div>
+      </div>
+
+      <!-- Team → Goals tab (migrated from page-goals) -->
+      <div class="tab-pane" id="tab-team-goals" style="padding:18px">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px">
+          <p style="margin:0;font-size:13px;color:var(--text-muted)">Long-running objectives the team contributes to. Per-agent contribution + run success rate.</p>
+          <button class="btn-primary btn-sm" onclick="openNewGoalForm()">+ New Goal</button>
+        </div>
+        <div id="new-goal-form" style="display:none;background:var(--bg-secondary);border:1px solid var(--border);border-radius:8px;padding:16px;margin-bottom:14px">
+          <div style="font-weight:600;font-size:13px;margin-bottom:10px">New goal</div>
+          <input type="text" id="new-goal-title" placeholder="Goal title (e.g., 'Pipeline: 12 qualified leads/week')" style="width:100%;padding:8px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg-input);color:var(--text-primary);margin-bottom:8px">
+          <textarea id="new-goal-desc" placeholder="Why does this matter? (optional)" rows="2" style="width:100%;padding:8px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg-input);color:var(--text-primary);font-family:inherit;margin-bottom:10px"></textarea>
+          <div style="display:flex;gap:8px;justify-content:flex-end">
+            <button class="btn-sm" onclick="document.getElementById('new-goal-form').style.display='none'">Cancel</button>
+            <button class="btn-sm btn-primary" onclick="submitNewGoal()">Create</button>
+          </div>
+        </div>
+        <div id="goals-progress-content">
+          <div class="skel-block"><div class="skel-row med"></div><div class="skel-row"></div><div class="skel-row short"></div></div>
+        </div>
+      </div>
+
+      <!-- Team → Comms tab — placeholder (Session 5 will fill). -->
+      <div class="tab-pane" id="tab-team-comms" style="padding:18px">
+        <div class="empty-cta">
+          <div class="icon">&#128227;</div>
+          <div class="label">Inter-agent communications</div>
+          <div class="hint">Coming soon — message log + topology visualization across agents.</div>
+        </div>
+      </div>
+      </div><!-- /team-tab-content -->
     </div>
+
+    <!-- (Session 5) team-status / agent-detail / goals parking divs removed.
+         Team's Roster / Activity / Goals tabs are the live homes. -->
 
     <!-- ═══ Settings Page (merged: General + Remote + Integrations + Projects) ═══ -->
     <div class="page" id="page-settings">
       <div class="page-title">Settings</div>
       <div class="tab-bar" id="settings-tabs">
-        <button class="active" onclick="switchTab('settings','general')">General</button>
-        <button onclick="switchTab('settings','remote')">Remote Access</button>
-        <button onclick="switchTab('settings','security')">Security</button>
+        <button class="active" onclick="switchTab('settings','general')">Channels &amp; Env</button>
         <button onclick="switchTab('settings','integrations')">Integrations</button>
-        <button onclick="switchTab('settings','notifications')">Notifications</button>
+        <button onclick="switchTab('settings','projects')">Projects</button>
+        <button onclick="switchTab('settings','security')">Security</button>
+        <button onclick="switchTab('settings','logs')">Logs</button>
+        <button onclick="switchTab('settings','remote')">Remote Access</button>
+        <button onclick="switchTab('settings','advanced')">Advanced</button>
       </div>
       <div id="settings-tab-content">
         <div class="tab-pane active" id="tab-settings-general">
@@ -12502,41 +13096,62 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
             </div>
           </div>
         </div>
-        <div class="tab-pane" id="tab-settings-notifications">
-          <div id="digest-settings-content"><div class="empty-state">Loading...</div></div>
+        <div class="tab-pane" id="tab-settings-projects">
+          <p style="color:var(--text-muted);margin-bottom:16px;font-size:13px">Link projects to give Clementine automatic access to their tools and MCP servers. When you mention a linked project's keywords in chat, Clementine switches into that project's context automatically.</p>
+          <div class="card" style="margin-bottom:20px">
+            <div class="card-header" style="display:flex;align-items:center;justify-content:space-between">
+              <span>Workspace Directories</span>
+              <button class="btn btn-sm btn-primary" onclick="promptAddWorkspaceDir()" style="font-size:11px">+ Add Path</button>
+            </div>
+            <div class="card-body" id="workspace-dirs-list-projects" style="font-size:13px">
+              <div class="skel-block"><div class="skel-row med"></div><div class="skel-row short"></div></div>
+            </div>
+          </div>
+          <div id="panel-projects-page">
+            <div class="skel-block"><div class="skel-row med"></div><div class="skel-row"></div></div>
+          </div>
+        </div>
+        <div class="tab-pane" id="tab-settings-logs">
+          <div style="display:flex;gap:8px;align-items:center;margin-bottom:14px;flex-wrap:wrap">
+            <input type="text" class="log-filter" id="log-filter" placeholder="Filter logs..." style="padding:6px 10px;border:1px solid var(--border);border-radius:6px;font-size:12px;background:var(--bg-input);color:var(--text-primary);min-width:180px;flex:1">
+            <select id="log-level-filter" style="background:var(--bg-input);border:1px solid var(--border);border-radius:6px;padding:6px 10px;font-size:12px;color:var(--text-primary);font-family:inherit;cursor:pointer" onchange="applyLogFilter()">
+              <option value="">All Levels</option>
+              <option value="error">Error+</option>
+              <option value="warn">Warn+</option>
+              <option value="info">Info+</option>
+              <option value="debug">Debug+</option>
+            </select>
+            <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--text-secondary);cursor:pointer">
+              <input type="checkbox" id="log-autoscroll" checked> Auto-scroll
+            </label>
+            <button class="btn-sm" onclick="refreshLogs()">Refresh</button>
+          </div>
+          <div class="log-viewer" id="panel-logs">
+            <div class="skel-block" style="padding:18px"><div class="skel-row med"></div><div class="skel-row"></div><div class="skel-row short"></div></div>
+          </div>
+        </div>
+        <div class="tab-pane" id="tab-settings-advanced">
+          <div class="card" style="margin-bottom:16px">
+            <div class="card-header">Diagnostics &amp; maintenance</div>
+            <div class="card-body" style="padding:16px;display:flex;gap:8px;flex-wrap:wrap">
+              <button class="btn-sm" onclick="restartDashboard()">Restart Dashboard</button>
+              <button class="btn-sm" onclick="if(confirm('Restart the daemon? Active sessions drain first.')) apiPost('/api/restart')">Restart Daemon</button>
+              <button class="btn-sm" onclick="apiFetch('/api/doctor').then(function(r){return r.text()}).then(function(t){alert(t)})">Run Doctor</button>
+              <button class="btn-sm" onclick="apiFetch('/api/version').then(function(r){return r.json()}).then(function(d){alert('Version: '+(d.version||'?')+'\\nNode: '+(d.node||'?'))})">Build info</button>
+            </div>
+          </div>
+          <div class="card">
+            <div class="card-header">Notifications &amp; digest</div>
+            <div class="card-body" style="padding:16px" id="digest-settings-content">
+              <div class="skel-block"><div class="skel-row med"></div><div class="skel-row short"></div></div>
+            </div>
+          </div>
         </div>
       </div>
     </div>
 
-    <!-- ═══ Projects Page (promoted from Settings) ═══ -->
-    <div class="page" id="page-projects">
-      <div class="page-title">Projects</div>
-      <p style="color:var(--text-muted);margin-bottom:16px">Link projects to give Clementine automatic access to their tools and MCP servers. When you mention a linked project's keywords in chat, Clementine switches into that project's context automatically.</p>
-      <div class="card" style="margin-bottom:20px">
-        <div class="card-header" style="display:flex;align-items:center;justify-content:space-between">
-          <span>Workspace Directories</span>
-          <button class="btn btn-sm btn-primary" onclick="promptAddWorkspaceDir()" style="font-size:11px">+ Add Path</button>
-        </div>
-        <div class="card-body" id="workspace-dirs-list-projects" style="font-size:13px">
-          <div class="empty-state">Loading...</div>
-        </div>
-      </div>
-      <div id="panel-projects-page"><div class="empty-state">Loading...</div></div>
-    </div>
-
-    <!-- ═══ Workflows Page (promoted from Automations) ═══ -->
-    <div class="page" id="page-workflows">
-      <div class="page-title">Workflows</div>
-      <p style="color:var(--text-muted);margin-bottom:16px">Multi-step pipelines that orchestrate agents, tools, and data. Define workflows as .md files in <code>vault/00-System/workflows/</code>.</p>
-      <div id="panel-workflows-page"><div class="empty-state">Loading workflows...</div></div>
-    </div>
-
-    <!-- ═══ Unleashed Page ═══ -->
-    <div class="page" id="page-unleashed">
-      <div class="page-title">Unleashed</div>
-      <p style="color:var(--text-muted);margin-bottom:16px">Long-running autonomous tasks that work in phases with checkpointing. Cancel a task by dropping a CANCEL marker — the agent stops at the next phase boundary.</p>
-      <div id="panel-unleashed"><div class="empty-state">Loading...</div></div>
-    </div>
+    <!-- (Session 5) page-workflows / page-unleashed parking divs removed.
+         Build → Workflows + Home rail Active Runs are the live homes. -->
 
   </div><!-- /content -->
 </div><!-- /layout -->
@@ -13163,58 +13778,322 @@ let currentPage = 'home';
 var currentAgentSlug = null;
 var prevAgentSlugs = null;
 
+// ── Routing ────────────────────────────────────────────────────
+//
+// Five top-level destinations: home, build, team, brain, settings.
+// Sub-pages live as tabs within each destination.
+// Old routes redirect once for back-compat.
+
+var DESTINATIONS = ['home', 'build', 'team', 'brain', 'settings'];
+
+var ROUTE_REDIRECTS = {
+  // old hash → new {page, tab}
+  'chat': { page: 'home', tab: 'chat' },
+  'sessions': { page: 'home', tab: 'activity' },
+  'daily-plan': { page: 'home', tab: 'today' },
+  'goals': { page: 'team', tab: 'goals' },
+  'workflows': { page: 'build', tab: 'workflows' },
+  'automations': { page: 'build', tab: 'crons' },
+  'unleashed': { page: 'build', tab: 'workflows' },
+  'builder': { page: 'build', tab: 'workflows' },
+  'skill-studio': { page: 'build', tab: 'skills' },
+  'team-status': { page: 'team', tab: 'activity' },
+  'agent-detail': { page: 'team', tab: 'roster' },
+  'intelligence': { page: 'brain', tab: 'memory' },
+  'memory-health': { page: 'brain', tab: 'health' },
+  'claims': { page: 'brain', tab: 'health' },
+  'metrics': { page: 'team', tab: 'activity' },
+  'logs': { page: 'settings', tab: 'logs' },
+  'projects': { page: 'settings', tab: 'projects' },
+};
+
 function navigateTo(page, opts) {
   opts = opts || {};
+
+  // Redirect old route names to the new IA so existing callers + bookmarks work.
+  if (ROUTE_REDIRECTS[page]) {
+    var r = ROUTE_REDIRECTS[page];
+    return navigateTo(r.page, Object.assign({ tab: r.tab }, opts));
+  }
+
+  if (DESTINATIONS.indexOf(page) === -1) page = 'home';
   currentPage = page;
-  // Clear all active states
-  document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
-  document.querySelectorAll('.team-nav-item').forEach(n => n.classList.remove('active'));
-  document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
-  // Activate the right nav item
+
+  document.querySelectorAll('.nav-item').forEach(function(n) { n.classList.remove('active'); });
+  document.querySelectorAll('.team-nav-item').forEach(function(n) { n.classList.remove('active'); });
+  document.querySelectorAll('.page').forEach(function(p) { p.classList.remove('active'); });
+
   var navEl = document.querySelector('.nav-item[data-page="' + page + '"]');
   if (navEl) navEl.classList.add('active');
   if (opts.agentSlug != null) {
     var teamEl = document.querySelector('.team-nav-item[data-slug="' + opts.agentSlug + '"]');
     if (teamEl) teamEl.classList.add('active');
   }
-  // Show the page
+
   var el = document.getElementById('page-' + page);
   if (el) { el.style.display = ''; el.classList.add('active'); }
-  // Page-specific refresh
-  if (page === 'home') { refreshAll(); }
-  if (page === 'chat') { loadProfiles(); document.getElementById('chat-input').focus(); }
-  if (page === 'builder') {
-    var _builderPreselect = currentAgentSlug || '';
-    refreshBuilderAgents(_builderPreselect);
-    updateBuilderMode();
-    document.getElementById('builder-input').focus();
+
+  // Per-destination init + tab routing
+  switch (page) {
+    case 'home':
+      refreshAll();
+      // tab is a soft hint on Home (one cohesive layout): focus the relevant area.
+      var t = opts.tab || 'chat';
+      setTimeout(function() {
+        if (t === 'chat') {
+          var ci = document.getElementById('chat-input');
+          if (ci) ci.focus();
+        } else if (t === 'today') {
+          var rail = document.getElementById('home-rail');
+          if (rail && window.matchMedia('(max-width: 1024px)').matches) rail.classList.add('open');
+          var p = document.getElementById('home-plan-content');
+          if (p) p.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+        } else if (t === 'activity') {
+          var act = document.getElementById('panel-activity');
+          if (act) act.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        }
+      }, 80);
+      break;
+    case 'build':
+      switchBuildTab(opts.tab || 'workflows');
+      var bp = currentAgentSlug || '';
+      refreshBuilderAgents(bp);
+      break;
+    case 'team':
+      refreshTeam();
+      switchDestTab('team', opts.tab || 'roster');
+      if (opts.agentSlug) {
+        currentAgentSlug = opts.agentSlug;
+        if (typeof openAgentDrawer === 'function') openAgentDrawer(opts.agentSlug);
+      }
+      break;
+    case 'brain':
+      if (typeof refreshMemory === 'function') refreshMemory();
+      var bt = opts.tab || 'memory';
+      // Spec tab names → internal intelligence-tab ids
+      var intelTab = bt === 'memory' ? 'search'
+        : bt === 'knowledge' ? 'graph'
+        : bt === 'ingestion' ? 'sources'
+        : bt === 'health' ? 'health'
+        : bt === 'user-model' ? 'user-model'
+        : bt === 'learning' ? 'learning'
+        : bt;
+      try { switchTab('intelligence', intelTab); } catch (e) { /* */ }
+      if (bt === 'health') {
+        if (typeof refreshMemoryHealth === 'function') refreshMemoryHealth();
+        if (typeof refreshClaims === 'function') refreshClaims();
+        if (typeof refreshRoutingAudit === 'function') refreshRoutingAudit();
+      }
+      if (bt === 'learning' && typeof refreshSelfImprove === 'function') refreshSelfImprove();
+      break;
+    case 'settings':
+      switchDestTab('settings', opts.tab || 'channels');
+      break;
   }
-  if (page === 'automations') { refreshCron(); refreshTimers(); refreshSelfImprove(); refreshSkills(); refreshBrokenJobs(); }
-  if (page === 'claims') { refreshClaims(); refreshRoutingAudit(); }
-  if (page === 'intelligence') { refreshMemory(); }
-  if (page === 'settings') { refreshSettings(); refreshRemoteAccess(); refreshSalesforce(); refreshClaudeIntegrations(); refreshMcpServers(); }
-  if (page === 'logs') refreshLogs();
-  if (page === 'team') { refreshTeam(); }
-  if (page === 'projects') { refreshProjects(); }
-  if (page === 'workflows') { refreshWorkflows(); }
-  if (page === 'unleashed') { refreshUnleashed(); }
-  if (page === 'goals') { refreshGoalsProgress(); }
-  if (page === 'metrics') { refreshMetrics(); }
-  if (page === 'memory-health') { refreshMemoryHealth(); }
-  if (page === 'sessions') { refreshSessions(); }
-  if (page === 'daily-plan') { refreshDailyPlan(); }
-  if (page === 'agent-detail' && opts.agentSlug != null) {
-    currentAgentSlug = opts.agentSlug;
-    renderAgentDetail(opts.agentSlug);
-  }
+
   closeSidebar();
 }
 
-// Shortcut nav items that drop into a sub-tab on the Automations page
-function openAutomationsTab(tab) {
-  navigateTo('automations');
-  setTimeout(function() { switchTab('automations', tab); }, 0);
+/** Switch the active tab inside a destination. Tabs use [data-tab] markup. */
+function switchDestTab(page, tab) {
+  if (!tab) return;
+  var pageEl = document.getElementById('page-' + page);
+  if (!pageEl) return;
+  pageEl.querySelectorAll('[data-tab]').forEach(function(el) {
+    var match = el.getAttribute('data-tab') === tab;
+    if (el.tagName === 'BUTTON' || el.classList.contains('tab-btn')) {
+      el.classList.toggle('active', match);
+    } else {
+      el.style.display = match ? '' : 'none';
+    }
+  });
+  // Per-tab init hook (called after DOM update)
+  var initFn = window['_init_' + page + '_' + tab];
+  if (typeof initFn === 'function') {
+    try { initFn(); } catch (err) { console.warn('Tab init failed:', err); }
+  }
 }
+
+// (Session 5) openAutomationsTab compat shim removed — all callers route via navigateTo + ROUTE_REDIRECTS.
+
+// ── Build (Workflows / Crons / Skills / Templates) tabs ─────────────
+function switchBuildTab(tab) {
+  if (!tab) tab = 'workflows';
+  // Update tab-bar active state
+  document.querySelectorAll('#build-tabs button').forEach(function(b) {
+    b.classList.toggle('active', b.getAttribute('data-build-tab') === tab);
+  });
+  // Show/hide tab panes
+  var workPane = document.getElementById('build-tab-workflows');
+  var tplPane = document.getElementById('build-tab-templates');
+  var headerStrip = document.getElementById('build-header-strip');
+  if (tab === 'templates') {
+    if (workPane) workPane.style.display = 'none';
+    if (tplPane) tplPane.style.display = '';
+    if (headerStrip) headerStrip.style.display = 'none';
+  } else {
+    if (workPane) workPane.style.display = 'flex';
+    if (tplPane) tplPane.style.display = 'none';
+    if (headerStrip) headerStrip.style.display = 'flex';
+    // Map build-tab → builder-type so the canvas + chat reflect the tab.
+    var typeSel = document.getElementById('builder-type');
+    if (typeSel) {
+      var nextType = tab === 'crons' ? 'cron' : tab === 'skills' ? 'skill' : 'workflow';
+      if (typeSel.value !== nextType) {
+        typeSel.value = nextType;
+        if (typeof resetBuilder === 'function') resetBuilder();
+        if (typeof updateBuilderMode === 'function') updateBuilderMode();
+      } else if (typeof updateBuilderMode === 'function') {
+        updateBuilderMode();
+      }
+    }
+    // Focus chat input
+    setTimeout(function() {
+      var bi = document.getElementById('builder-input');
+      if (bi) bi.focus();
+    }, 60);
+  }
+}
+
+// ── Build templates: fork a starter pattern into a new workflow ─────
+async function forkBuildTemplate(templateId) {
+  var templates = {
+    'daily-news-digest': {
+      name: 'Daily news digest',
+      description: 'Morning news roundup pulled from configured RSS feeds.',
+      schedule: '0 7 * * *',
+      initialPrompt: 'Pull today headlines from configured RSS sources, summarize the top 5 stories, format as a brief digest, then send to my preferred channel.',
+    },
+    'lead-picker': {
+      name: 'Lead picker (manual)',
+      description: 'Search leads matching ICP, pick from canvas, push selected to Salesforce.',
+      schedule: undefined,
+      initialPrompt: 'Use Salesforce search to find prospects matching the ICP I describe. Show results so I can pick which to push as leads.',
+    },
+    'pr-review-queue': {
+      name: 'PR review queue',
+      description: 'Weekday morning summary of open PRs that need review.',
+      schedule: '0 9 * * 1-5',
+      initialPrompt: 'List open GitHub PRs that need my review, summarize each PRs risk level and key changes, send a digest to Slack.',
+    },
+    'email-triage': {
+      name: 'Email triage',
+      description: 'Morning unread-email triage with classified suggested actions.',
+      schedule: '0 8 * * *',
+      initialPrompt: 'List unread emails, classify each by intent (reply / archive / snooze / delegate), draft replies for the ones needing one, surface for my approval.',
+    },
+    'weekly-review': {
+      name: 'Weekly review',
+      description: 'Friday-evening review of the week and next-week priorities.',
+      schedule: '0 18 * * 5',
+      initialPrompt: 'Read this past 7 days of daily notes, summarize what got done, list whats still pending, suggest top 3 priorities for next week, append to today daily note as ## Weekly Review.',
+    },
+    'blank-workflow': {
+      name: 'New workflow',
+      description: '',
+      schedule: undefined,
+      initialPrompt: 'Describe what this workflow should do.',
+    },
+  };
+  var tpl = templates[templateId];
+  if (!tpl) { toast('Unknown template', 'error'); return; }
+  var name = prompt('Name for the new workflow:', tpl.name);
+  if (!name) return;
+  try {
+    var r = await apiJson('POST', '/api/builder/workflows', {
+      name: name,
+      description: tpl.description,
+      schedule: tpl.schedule,
+      initialPrompt: tpl.initialPrompt,
+    });
+    if (r && r.error) { toast('Create failed: ' + r.error, 'error'); return; }
+    if (r && r.id) {
+      switchBuildTab(tpl.schedule ? 'crons' : 'workflows');
+      refreshBuilderCanvasPicker(tpl.schedule ? 'cron' : 'workflow');
+      setTimeout(function() { openBuilderWorkflow(r.id); }, 200);
+      toast('Forked template: ' + name, 'success');
+    }
+  } catch (err) {
+    toast('Fork failed: ' + err, 'error');
+  }
+}
+
+// Cmd+K palette — keyboard-only quick navigation.
+function openCommandK() {
+  var existing = document.getElementById('cmdk-overlay');
+  if (existing) { existing.remove(); return; }
+  var overlay = document.createElement('div');
+  overlay.id = 'cmdk-overlay';
+  overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.4);z-index:2000;display:flex;align-items:flex-start;justify-content:center;padding-top:120px';
+  overlay.onclick = function(e) { if (e.target === overlay) overlay.remove(); };
+  var box = document.createElement('div');
+  box.style.cssText = 'width:520px;max-width:92vw;background:var(--bg-secondary);border:1px solid var(--border);border-radius:10px;box-shadow:0 12px 40px rgba(0,0,0,0.35);overflow:hidden';
+  box.innerHTML =
+    '<input id="cmdk-input" type="text" placeholder="Jump to…  (home, build/workflows, team/goals, brain/health, settings/logs)" style="width:100%;padding:14px 18px;border:none;background:transparent;color:var(--text-primary);font-size:14px;outline:none;border-bottom:1px solid var(--border)">' +
+    '<div id="cmdk-results" style="max-height:320px;overflow-y:auto"></div>';
+  overlay.appendChild(box);
+  document.body.appendChild(overlay);
+  var input = document.getElementById('cmdk-input');
+  var results = document.getElementById('cmdk-results');
+  var entries = [
+    { kw: 'home chat',          page: 'home',     tab: 'chat',         label: 'Home · Chat' },
+    { kw: 'home today plan',    page: 'home',     tab: 'today',        label: 'Home · Today' },
+    { kw: 'home activity',      page: 'home',     tab: 'activity',     label: 'Home · Activity' },
+    { kw: 'build workflows',    page: 'build',    tab: 'workflows',    label: 'Build · Workflows' },
+    { kw: 'build crons',        page: 'build',    tab: 'crons',        label: 'Build · Crons' },
+    { kw: 'build skills',       page: 'build',    tab: 'skills',       label: 'Build · Skills' },
+    { kw: 'build templates',    page: 'build',    tab: 'templates',    label: 'Build · Templates' },
+    { kw: 'team roster',        page: 'team',     tab: 'roster',       label: 'Team · Roster' },
+    { kw: 'team activity',      page: 'team',     tab: 'activity',     label: 'Team · Activity' },
+    { kw: 'team comms',         page: 'team',     tab: 'comms',        label: 'Team · Comms' },
+    { kw: 'team goals',         page: 'team',     tab: 'goals',        label: 'Team · Goals' },
+    { kw: 'brain memory',       page: 'brain',    tab: 'memory',       label: 'Brain · Memory' },
+    { kw: 'brain knowledge',    page: 'brain',    tab: 'knowledge',    label: 'Brain · Knowledge' },
+    { kw: 'brain ingestion',    page: 'brain',    tab: 'ingestion',    label: 'Brain · Ingestion' },
+    { kw: 'brain health',       page: 'brain',    tab: 'health',       label: 'Brain · Health' },
+    { kw: 'brain user model',   page: 'brain',    tab: 'user-model',   label: 'Brain · User Model' },
+    { kw: 'settings channels',  page: 'settings', tab: 'channels',     label: 'Settings · Channels' },
+    { kw: 'settings integrations mcp', page: 'settings', tab: 'integrations', label: 'Settings · Integrations' },
+    { kw: 'settings projects',  page: 'settings', tab: 'projects',     label: 'Settings · Projects' },
+    { kw: 'settings security',  page: 'settings', tab: 'security',     label: 'Settings · Security' },
+    { kw: 'settings logs',      page: 'settings', tab: 'logs',         label: 'Settings · Logs' },
+    { kw: 'settings advanced',  page: 'settings', tab: 'advanced',     label: 'Settings · Advanced' },
+  ];
+  function render() {
+    var q = (input.value || '').toLowerCase().trim();
+    var hits = q ? entries.filter(function(e) { return e.kw.indexOf(q) !== -1 || e.label.toLowerCase().indexOf(q) !== -1; }) : entries;
+    results.innerHTML = hits.slice(0, 12).map(function(e, i) {
+      return '<div class="cmdk-row" data-page="' + e.page + '" data-tab="' + e.tab + '" style="padding:10px 18px;font-size:13px;cursor:pointer;display:flex;justify-content:space-between;align-items:center' + (i === 0 ? ';background:var(--bg-hover)' : '') + '">' +
+        '<span>' + e.label + '</span>' +
+        '<span style="font-size:11px;color:var(--text-muted)">' + e.page + '/' + e.tab + '</span>' +
+      '</div>';
+    }).join('') || '<div style="padding:14px 18px;color:var(--text-muted);font-size:12px">No matches</div>';
+    results.querySelectorAll('.cmdk-row').forEach(function(row) {
+      row.onclick = function() {
+        navigateTo(row.getAttribute('data-page'), { tab: row.getAttribute('data-tab') });
+        overlay.remove();
+      };
+    });
+  }
+  input.oninput = render;
+  input.onkeydown = function(e) {
+    if (e.key === 'Escape') overlay.remove();
+    if (e.key === 'Enter') {
+      var first = results.querySelector('.cmdk-row');
+      if (first) first.click();
+    }
+  };
+  render();
+  setTimeout(function() { input.focus(); }, 30);
+}
+
+// Global keyboard shortcut for Cmd+K / Ctrl+K
+document.addEventListener('keydown', function(e) {
+  if ((e.metaKey || e.ctrlKey) && e.key === 'k') {
+    e.preventDefault();
+    openCommandK();
+  }
+});
 
 async function refreshUnleashed() {
   var el = document.getElementById('panel-unleashed');
@@ -13298,23 +14177,27 @@ function switchTab(group, tab) {
     if (pane) pane.classList.add('active');
   }
   // Tab-specific refresh
-  if (group === 'automations') {
-    if (tab === 'scheduled') refreshCron();
-    if (tab === 'broken') refreshBrokenJobs();
-    if (tab === 'timers') refreshTimers();
-    if (tab === 'self-improve') refreshSelfImprove();
-    if (tab === 'workflows') refreshWorkflows();
-    if (tab === 'analytics') refreshAdvisorAnalytics();
-  }
   if (group === 'intelligence') {
     if (tab === 'graph') refreshGraph();
     if (tab === 'memory') refreshMemory();
+    if (tab === 'health') {
+      if (typeof refreshMemoryHealth === 'function') refreshMemoryHealth();
+      if (typeof refreshClaims === 'function') refreshClaims();
+      if (typeof refreshRoutingAudit === 'function') refreshRoutingAudit();
+    }
+    if (tab === 'learning' && typeof refreshSelfImprove === 'function') refreshSelfImprove();
   }
   if (group === 'settings') {
     if (tab === 'integrations') refreshSalesforce();
     if (tab === 'remote') refreshRemoteAccess();
     if (tab === 'security') refreshAuthSessions();
-    if (tab === 'notifications') refreshDigestSettings();
+    if (tab === 'projects' && typeof refreshProjects === 'function') refreshProjects();
+    if (tab === 'logs' && typeof refreshLogs === 'function') refreshLogs();
+    if (tab === 'advanced' && typeof refreshDigestSettings === 'function') refreshDigestSettings();
+  }
+  if (group === 'team') {
+    if (tab === 'activity' && typeof renderTeamStatus === 'function') renderTeamStatus();
+    if (tab === 'goals' && typeof refreshGoalsProgress === 'function') refreshGoalsProgress();
   }
 }
 
@@ -14381,7 +15264,7 @@ async function refreshSessions() {
       var s = d[key];
       var friendly = friendlySession(key);
       var safeKey = esc(key).replace(/'/g, '');
-      html += '<div class="session-card" style="cursor:pointer" onclick="viewSession(\\x27' + encodeURIComponent(key) + '\\x27)">'
+      html += '<div class="session-card clickable-row" onclick="viewSession(\\x27' + encodeURIComponent(key) + '\\x27)">'
         + '<div class="session-card-header">'
         + '<span class="session-card-icon">' + friendly.icon + '</span>'
         + '<span class="session-card-name">' + esc(friendly.label) + '</span>'
@@ -14390,12 +15273,24 @@ async function refreshSessions() {
         + '<div class="session-card-meta">Last active: ' + timeAgo(s.timestamp) + '</div>'
         + '<div class="session-card-meta" style="font-family:monospace;font-size:10px">' + esc(key) + '</div>'
         + '<div class="session-card-actions">'
+        + '<button class="btn-sm btn-primary" onclick="event.stopPropagation();resumeSession(\\x27' + encodeURIComponent(key) + '\\x27)" title="Open in chat">Resume</button>'
         + '<button class="btn-danger btn-sm" onclick="event.stopPropagation();if(confirm(\\x27Clear session ' + safeKey + '?\\x27))apiPost(\\x27/api/sessions/' + encodeURIComponent(key) + '/clear\\x27)">Clear</button>'
         + '</div></div>';
     }
     html += '</div>';
     document.getElementById('panel-sessions').innerHTML = html;
   } catch(e) { }
+}
+
+function resumeSession(encodedKey) {
+  var key = decodeURIComponent(encodedKey);
+  // The dashboard chat session is fixed at "dashboard:web" today, so we
+  // navigate to chat and surface a hint. If/when chat gains multi-session
+  // support, this is the place to bind the active session id.
+  navigateTo('chat');
+  var indicator = document.getElementById('chat-session-indicator');
+  if (indicator) indicator.textContent = key;
+  toast('Switched to ' + (friendlySession(key).label || key), 'info');
 }
 
 async function viewSession(encodedKey) {
@@ -17194,6 +18089,12 @@ function updateBuilderMode() {
   var type = (document.getElementById('builder-type') || {}).value || 'skill';
   var title = document.getElementById('builder-page-title');
   var drawer = document.getElementById('builder-skills-drawer');
+  var preview = document.getElementById('builder-preview');
+  var canvasHost = document.getElementById('builder-canvas-host');
+  var picker = document.getElementById('builder-canvas-picker');
+  var validateBtn = document.getElementById('builder-canvas-validate-btn');
+  var dryrunBtn = document.getElementById('builder-canvas-dryrun-btn');
+  var paneTitle = document.getElementById('builder-right-pane-title');
 
   if (type === 'skill') {
     if (title) title.textContent = 'Skill Studio';
@@ -17203,6 +18104,682 @@ function updateBuilderMode() {
     if (title) title.textContent = 'Builder';
     if (drawer) drawer.style.display = 'none';
     document.getElementById('builder-input').placeholder = 'Describe what you want to build...';
+  }
+
+  // Canvas mode for cron + workflow types
+  var canvasMode = (type === 'cron' || type === 'workflow');
+  var testBtn = document.getElementById('builder-canvas-test-btn');
+  if (canvasMode) {
+    if (preview) preview.style.display = 'none';
+    if (canvasHost) canvasHost.style.display = 'flex';
+    if (picker) picker.style.display = '';
+    if (validateBtn) validateBtn.style.display = '';
+    if (dryrunBtn) dryrunBtn.style.display = '';
+    if (testBtn) testBtn.style.display = '';
+    if (paneTitle) paneTitle.textContent = (type === 'cron' ? 'Crons' : 'Workflows');
+    refreshBuilderCanvasPicker(type);
+  } else {
+    if (preview) preview.style.display = '';
+    if (canvasHost) canvasHost.style.display = 'none';
+    if (picker) picker.style.display = 'none';
+    if (validateBtn) validateBtn.style.display = 'none';
+    if (dryrunBtn) dryrunBtn.style.display = 'none';
+    if (testBtn) testBtn.style.display = 'none';
+    if (paneTitle) paneTitle.textContent = 'Live Preview';
+    closeBuilderCanvas();
+  }
+}
+
+// ── Builder visual canvas (Phase 1: read-only, agent edits via MCP tools) ──
+
+var _builderCanvasEditor = null;
+var _builderCanvasOpenId = null;
+var _builderCanvasLastWorkflow = null;
+var _builderDrawflowLoading = null;
+
+function _ensureDrawflowLoaded() {
+  if (window.Drawflow) return Promise.resolve();
+  if (_builderDrawflowLoading) return _builderDrawflowLoading;
+  _builderDrawflowLoading = new Promise(function(resolve, reject) {
+    var s = document.createElement('script');
+    s.src = '/static/drawflow.min.js';
+    s.onload = function() { resolve(); };
+    s.onerror = function() { reject(new Error('Failed to load Drawflow')); };
+    document.head.appendChild(s);
+  });
+  return _builderDrawflowLoading;
+}
+
+async function refreshBuilderCanvasPicker(type) {
+  var picker = document.getElementById('builder-canvas-picker');
+  if (!picker) return;
+  try {
+    var r = await apiFetch('/api/builder/workflows');
+    var d = await r.json();
+    var items = (d.workflows || []).filter(function(w) { return w.origin === type; });
+    var opts = '<option value="">' + (items.length ? '— pick a ' + type + ' —' : '(none yet)') + '</option>';
+    for (var i = 0; i < items.length; i++) {
+      var w = items[i];
+      var lbl = w.name + (w.schedule ? '  ·  ' + w.schedule : '') + (w.enabled ? '' : '  · off');
+      opts += '<option value="' + esc(w.id) + '">' + esc(lbl) + '</option>';
+    }
+    picker.innerHTML = opts;
+    if (_builderCanvasOpenId) picker.value = _builderCanvasOpenId;
+  } catch (err) {
+    picker.innerHTML = '<option value="">(failed to load)</option>';
+  }
+}
+
+async function openBuilderWorkflow(id) {
+  if (!id) { closeBuilderCanvas(); return; }
+  try {
+    await _ensureDrawflowLoaded();
+    var r = await apiFetch('/api/builder/workflows/' + encodeURIComponent(id));
+    if (!r.ok) {
+      var msg = await r.json().catch(function() { return {}; });
+      toast('Failed to open: ' + (msg.error || r.status), 'error');
+      return;
+    }
+    var d = await r.json();
+    _builderCanvasOpenId = id;
+    _builderCanvasLastWorkflow = d.workflow;
+    _renderBuilderCanvas(d.drawflow);
+
+    var idEl = document.getElementById('builder-canvas-id');
+    if (idEl) idEl.textContent = id;
+
+    var banner = document.getElementById('builder-canvas-banner');
+    if (banner) {
+      var issues = (d.validation && d.validation.issues) || [];
+      var errors = issues.filter(function(i) { return i.severity === 'error'; });
+      if (errors.length) {
+        banner.style.display = '';
+        banner.style.background = 'rgba(255,80,80,0.12)';
+        banner.style.color = 'var(--red)';
+        banner.textContent = errors.length + ' validation error' + (errors.length === 1 ? '' : 's') + ' — open Validate for details';
+      } else {
+        banner.style.display = 'none';
+      }
+    }
+  } catch (err) {
+    toast('Canvas error: ' + err, 'error');
+  }
+}
+
+function _renderBuilderCanvas(drawflowData) {
+  var host = document.getElementById('builder-canvas');
+  if (!host) return;
+  // Tear down previous editor
+  if (_builderCanvasEditor) {
+    try { _builderCanvasEditor.clear(); } catch (e) { /* ignore */ }
+    host.innerHTML = '';
+  }
+  var editor = new window.Drawflow(host);
+  editor.reroute = true;
+  editor.editor_mode = 'edit';
+  editor.start();
+  try {
+    editor.import(drawflowData || { drawflow: { Home: { data: {} } } });
+    _decorateBuilderNodes(host, _builderCanvasLastWorkflow);
+  } catch (err) {
+    host.innerHTML = '<div style="padding:24px;color:var(--red)">Failed to render canvas: ' + esc(String(err)) + '</div>';
+  }
+  _builderCanvasEditor = editor;
+  _bindBuilderCanvasEvents(editor);
+}
+
+var _builderSaveTimer = null;
+var _builderSavePending = false;
+var _builderRecentSaveTokens = new Set();
+
+function _bindBuilderCanvasEvents(editor) {
+  // Drawflow event names: nodeMoved, connectionCreated, connectionRemoved,
+  // nodeDataChanged, nodeRemoved.
+  ['nodeMoved', 'connectionCreated', 'connectionRemoved', 'nodeDataChanged', 'nodeRemoved'].forEach(function(evt) {
+    try {
+      editor.on(evt, function() {
+        if (evt === 'nodeMoved') _scheduleBuilderSave(800);
+        else _scheduleBuilderSave(300);
+      });
+    } catch (e) { /* drawflow always exposes .on, but be safe */ }
+  });
+  try {
+    editor.on('nodeSelected', function(nodeId) { _openNodeConfigPanel(nodeId); });
+    editor.on('nodeUnselected', function() { _closeNodeConfigPanel(); });
+  } catch (e) { /* */ }
+}
+
+function _scheduleBuilderSave(delay) {
+  if (_builderSaveTimer) clearTimeout(_builderSaveTimer);
+  _builderSaveTimer = setTimeout(function() { _flushBuilderSave(); }, delay || 500);
+}
+
+async function _flushBuilderSave() {
+  if (!_builderCanvasEditor || !_builderCanvasOpenId) return;
+  if (_builderSavePending) {
+    _scheduleBuilderSave(400);
+    return;
+  }
+  _builderSavePending = true;
+  _setBuilderSaveStatus('saving');
+  var saveToken = 'sv_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
+  _builderRecentSaveTokens.add(saveToken);
+  setTimeout(function() { _builderRecentSaveTokens.delete(saveToken); }, 5000);
+  try {
+    var data = _builderCanvasEditor.export();
+    var r = await apiJson('POST', '/api/builder/workflows/' + encodeURIComponent(_builderCanvasOpenId) + '/save-from-drawflow', { drawflow: data, saveToken: saveToken });
+    if (r.error) {
+      if (r.validation && r.validation.issues) {
+        _setBuilderSaveStatus('error', r.validation.issues.length + ' validation error' + (r.validation.issues.length === 1 ? '' : 's'));
+      } else {
+        _setBuilderSaveStatus('error', r.error);
+      }
+    } else {
+      _setBuilderSaveStatus('saved');
+      // Refresh banner from validation if warnings
+      _updateBuilderBannerFromValidation(r.validation);
+    }
+  } catch (err) {
+    _setBuilderSaveStatus('error', String(err));
+  } finally {
+    _builderSavePending = false;
+  }
+}
+
+function _setBuilderSaveStatus(state, detail) {
+  var el = document.getElementById('builder-canvas-status');
+  if (!el) return;
+  if (state === 'saving') { el.textContent = 'Saving…'; el.style.color = 'var(--text-muted)'; }
+  else if (state === 'saved') { el.textContent = 'Saved'; el.style.color = 'var(--green, #4caf50)'; setTimeout(function() { if (el.textContent === 'Saved') el.textContent = ''; }, 1500); }
+  else if (state === 'error') { el.textContent = 'Save error: ' + (detail || ''); el.style.color = 'var(--red)'; }
+}
+
+function _updateBuilderBannerFromValidation(v) {
+  var banner = document.getElementById('builder-canvas-banner');
+  if (!banner || !v) return;
+  var issues = v.issues || [];
+  var errors = issues.filter(function(i) { return i.severity === 'error'; });
+  var warnings = issues.filter(function(i) { return i.severity === 'warning'; });
+  if (errors.length) {
+    banner.style.display = '';
+    banner.style.background = 'rgba(255,80,80,0.12)';
+    banner.style.color = 'var(--red)';
+    banner.textContent = errors.length + ' validation error' + (errors.length === 1 ? '' : 's') + ' — open Validate for details';
+  } else if (warnings.length) {
+    banner.style.display = '';
+    banner.style.background = 'rgba(240,180,0,0.12)';
+    banner.style.color = '#a37100';
+    banner.textContent = warnings.length + ' warning' + (warnings.length === 1 ? '' : 's') + ' — Validate for details';
+  } else {
+    banner.style.display = 'none';
+  }
+}
+
+function _decorateBuilderNodes(host, wf) {
+  if (!wf) return;
+  var byStepId = {};
+  for (var i = 0; i < wf.steps.length; i++) byStepId[wf.steps[i].id] = wf.steps[i];
+  // Drawflow renders blank node bodies by default — overlay our own content.
+  var nodes = host.querySelectorAll('.drawflow-node');
+  nodes.forEach(function(nodeEl) {
+    var contentEl = nodeEl.querySelector('.drawflow_content_node');
+    if (!contentEl || contentEl.dataset._decorated) return;
+    contentEl.dataset._decorated = '1';
+    var dataAttr = nodeEl.querySelector('input[df-stepId]');
+    var stepId = dataAttr ? dataAttr.value : null;
+    // Drawflow doesn't auto-bind without templates — derive from class instead
+    var classNames = (nodeEl.className || '').split(/\s+/).filter(function(c) { return c.indexOf('cl-node-') === 0; });
+    var kind = classNames.length ? classNames[0].replace('cl-node-', '') : 'prompt';
+    var title = '';
+    var body = '';
+    var matchedStep = null;
+    for (var j = 0; j < wf.steps.length; j++) {
+      var s = wf.steps[j];
+      if ((s.kind || 'prompt') === kind) { matchedStep = s; break; }
+    }
+    if (!matchedStep) {
+      // Best-effort: use first step
+      matchedStep = wf.steps[0];
+    }
+    title = (matchedStep ? matchedStep.id : '?');
+    body = _summarizeStep(matchedStep, kind);
+    contentEl.innerHTML =
+      '<div style="font-weight:600;font-size:12px;margin-bottom:4px;color:#fff;text-transform:lowercase">' + esc(kind) + ' · ' + esc(title) + '</div>' +
+      '<div style="font-size:11px;color:rgba(255,255,255,0.85);line-height:1.35;max-height:80px;overflow:hidden">' + esc(body) + '</div>';
+  });
+}
+
+function _summarizeStep(step, kind) {
+  if (!step) return '';
+  if (kind === 'mcp' && step.mcp) return step.mcp.server + '.' + step.mcp.tool;
+  if (kind === 'channel' && step.channel) return step.channel.channel + ' → ' + step.channel.target;
+  if (kind === 'transform' && step.transform) return step.transform.expression;
+  if (kind === 'conditional' && step.conditional) return 'if ' + step.conditional.condition;
+  if (kind === 'loop' && step.loop) return 'for each ' + step.loop.items;
+  return (step.prompt || '').slice(0, 200);
+}
+
+function closeBuilderCanvas() {
+  _builderCanvasOpenId = null;
+  _builderCanvasLastWorkflow = null;
+  if (_builderCanvasEditor) {
+    try { _builderCanvasEditor.clear(); } catch (e) { /* ignore */ }
+    _builderCanvasEditor = null;
+  }
+  var host = document.getElementById('builder-canvas');
+  if (host) host.innerHTML = '';
+  var idEl = document.getElementById('builder-canvas-id');
+  if (idEl) idEl.textContent = '';
+  var banner = document.getElementById('builder-canvas-banner');
+  if (banner) banner.style.display = 'none';
+}
+
+async function validateBuilderCanvas() {
+  if (!_builderCanvasOpenId) { toast('Open a workflow first', 'info'); return; }
+  try {
+    var r = await apiJson('POST', '/api/builder/workflows/' + encodeURIComponent(_builderCanvasOpenId) + '/validate', {});
+    if (!r.issues || r.issues.length === 0) { toast('OK — no issues', 'success'); return; }
+    var lines = r.issues.map(function(i) { return '[' + i.severity + '] ' + (i.stepId ? '(' + i.stepId + ') ' : '') + i.message; });
+    alert('Validation:\\n\\n' + lines.join('\\n'));
+  } catch (err) { toast('Validate failed: ' + err, 'error'); }
+}
+
+async function dryRunBuilderCanvas() {
+  if (!_builderCanvasOpenId) { toast('Open a workflow first', 'info'); return; }
+  try {
+    var r = await apiJson('POST', '/api/builder/workflows/' + encodeURIComponent(_builderCanvasOpenId) + '/dry-run', {});
+    var lines = [];
+    lines.push(r.ok ? 'DRY RUN — would execute:' : 'DRY RUN (validation issues found):');
+    lines.push('');
+    for (var i = 0; i < r.steps.length; i++) {
+      var s = r.steps[i];
+      lines.push('[wave ' + s.wave + '] ' + s.description);
+      for (var k = 0; k < s.warnings.length; k++) lines.push('  ⚠ ' + s.warnings[k]);
+    }
+    if (r.estimatedTokens) lines.push('', '~' + r.estimatedTokens.total.toLocaleString() + ' tokens estimate (' + r.estimatedTokens.promptSteps + ' prompt step' + (r.estimatedTokens.promptSteps === 1 ? '' : 's') + ')');
+    if (r.notes && r.notes.length) { lines.push(''); for (var n = 0; n < r.notes.length; n++) lines.push(r.notes[n]); }
+    alert(lines.join('\\n'));
+  } catch (err) { toast('Dry-run failed: ' + err, 'error'); }
+}
+
+function _handleBuilderEvent(evt) {
+  if (!evt || !evt.workflowId) return;
+  // Run events are routed to the test-run handler.
+  if (evt.type && evt.type.indexOf && evt.type.indexOf('run:') === 0) {
+    _onRunEvent(evt);
+    return;
+  }
+  // Suppress echoes of our own saves: server reflects the saveToken back.
+  var token = evt.payload && evt.payload.saveToken;
+  if (token && _builderRecentSaveTokens.has(token)) {
+    _builderRecentSaveTokens.delete(token);
+    return;
+  }
+  // Re-render if event is for the open workflow.
+  if (evt.workflowId === _builderCanvasOpenId) {
+    if (evt.type === 'workflow:deleted') { closeBuilderCanvas(); refreshBuilderCanvasPicker(document.getElementById('builder-type').value); return; }
+    openBuilderWorkflow(_builderCanvasOpenId);
+  }
+  // Refresh picker when list changes
+  if (evt.type === 'workflow:created' || evt.type === 'workflow:deleted' || evt.type === 'workflow:renamed') {
+    refreshBuilderCanvasPicker(document.getElementById('builder-type').value);
+  }
+}
+
+// ── Node palette (Phase 2b) ─────────────────────────────────────
+
+var _builderPaletteOpen = false;
+
+function toggleBuilderPalette() {
+  var pop = document.getElementById('builder-palette-pop');
+  if (!pop) return;
+  _builderPaletteOpen = !_builderPaletteOpen;
+  pop.style.display = _builderPaletteOpen ? '' : 'none';
+}
+
+function _builderAddNodeOfKind(kind) {
+  if (!_builderCanvasEditor) return;
+  toggleBuilderPalette();
+  var canvas = document.getElementById('builder-canvas');
+  if (!canvas) return;
+  var rect = canvas.getBoundingClientRect();
+  var posX = (rect.width / 2) - 100;
+  var posY = (rect.height / 2) - 40;
+  var stepId = _generateUniqueStepId(kind);
+  var data = _defaultDataForKind(kind, stepId);
+  var className = 'cl-node cl-node-' + kind;
+  var nodeId = _builderCanvasEditor.addNode(_nodeNameForKind(kind), 1, 1, posX, posY, className, data, '');
+  // Drawflow needs a tick before we can decorate
+  setTimeout(function() {
+    _decorateBuilderNodeById(nodeId, kind, data);
+    _scheduleBuilderSave(200);
+  }, 50);
+}
+
+function _nodeNameForKind(kind) {
+  switch (kind) {
+    case 'mcp': return 'MCP Tool';
+    case 'channel': return 'Channel';
+    case 'transform': return 'Transform';
+    case 'conditional': return 'Conditional';
+    case 'loop': return 'Loop';
+    default: return 'Prompt';
+  }
+}
+
+function _defaultDataForKind(kind, stepId) {
+  var base = { stepId: stepId, prompt: '', tier: 1, maxTurns: 15, kind: kind };
+  if (kind === 'prompt') return Object.assign({}, base, { prompt: 'Describe what this step should do.' });
+  if (kind === 'mcp') return Object.assign({}, base, { mcp: { server: '', tool: '', inputs: {} } });
+  if (kind === 'channel') return Object.assign({}, base, { channel: { channel: 'slack', target: '#me', content: '' } });
+  if (kind === 'transform') return Object.assign({}, base, { transform: { expression: 'input' } });
+  if (kind === 'conditional') return Object.assign({}, base, { conditional: { condition: 'true', trueNext: [], falseNext: [] } });
+  if (kind === 'loop') return Object.assign({}, base, { loop: { items: 'input', bodyStepIds: [] } });
+  return base;
+}
+
+function _generateUniqueStepId(kind) {
+  var used = new Set();
+  if (_builderCanvasEditor) {
+    var data = _builderCanvasEditor.export();
+    var nodes = data && data.drawflow && data.drawflow.Home && data.drawflow.Home.data ? data.drawflow.Home.data : {};
+    for (var k in nodes) {
+      var d = nodes[k].data || {};
+      if (d.stepId) used.add(d.stepId);
+    }
+  }
+  var prefix = kind.slice(0, 4);
+  var i = 1;
+  while (used.has(prefix + i)) i++;
+  return prefix + i;
+}
+
+function _decorateBuilderNodeById(nodeId, kind, data) {
+  var nodeEl = document.querySelector('.drawflow-node[id="node-' + nodeId + '"]');
+  if (!nodeEl) return;
+  var content = nodeEl.querySelector('.drawflow_content_node');
+  if (!content) return;
+  content.dataset._decorated = '1';
+  content.innerHTML =
+    '<div style="font-weight:600;font-size:12px;margin-bottom:4px;color:#fff;text-transform:lowercase">' + esc(kind) + ' · ' + esc(data.stepId) + '</div>' +
+    '<div style="font-size:11px;color:rgba(255,255,255,0.85);line-height:1.35;max-height:80px;overflow:hidden">' + esc(_summarizeStepData(data, kind)) + '</div>';
+}
+
+function _summarizeStepData(d, kind) {
+  if (!d) return '';
+  if (kind === 'mcp' && d.mcp) return (d.mcp.server || '?') + '.' + (d.mcp.tool || '?');
+  if (kind === 'channel' && d.channel) return d.channel.channel + ' → ' + d.channel.target;
+  if (kind === 'transform' && d.transform) return d.transform.expression || '';
+  if (kind === 'conditional' && d.conditional) return 'if ' + (d.conditional.condition || '');
+  if (kind === 'loop' && d.loop) return 'for each ' + (d.loop.items || '');
+  return (d.prompt || '').slice(0, 200);
+}
+
+// ── Per-node config panel (Phase 2c) ───────────────────────────
+
+var _builderConfigOpenNodeId = null;
+var _builderMcpToolsCache = null;
+
+function _openNodeConfigPanel(nodeId) {
+  if (!_builderCanvasEditor) return;
+  _builderConfigOpenNodeId = nodeId;
+  var node = _builderCanvasEditor.getNodeFromId(nodeId);
+  if (!node) return;
+  var data = node.data || {};
+  var kind = data.kind || 'prompt';
+  var panel = document.getElementById('builder-config-panel');
+  if (!panel) return;
+  panel.style.display = '';
+  panel.innerHTML = _renderConfigPanel(nodeId, kind, data);
+  _bindConfigPanelInputs(nodeId, kind);
+  if (kind === 'mcp') _populateMcpDropdowns();
+}
+
+function _closeNodeConfigPanel() {
+  _builderConfigOpenNodeId = null;
+  var panel = document.getElementById('builder-config-panel');
+  if (panel) panel.style.display = 'none';
+}
+
+function _renderConfigPanel(nodeId, kind, d) {
+  var common = (
+    '<div class="cfg-row"><label>Step id</label><input type="text" data-cfg="stepId" value="' + esc(d.stepId || '') + '"></div>' +
+    '<div class="cfg-row"><label>Tier</label><input type="number" min="1" max="5" data-cfg="tier" value="' + (d.tier || 1) + '"></div>' +
+    '<div class="cfg-row"><label>Max turns</label><input type="number" min="1" data-cfg="maxTurns" value="' + (d.maxTurns || 15) + '"></div>' +
+    '<div class="cfg-row"><label>Model</label><input type="text" data-cfg="model" placeholder="default" value="' + esc(d.model || '') + '"></div>'
+  );
+  var kindHtml = '';
+  if (kind === 'prompt') {
+    kindHtml = '<div class="cfg-row"><label>Prompt</label><textarea data-cfg="prompt" rows="6">' + esc(d.prompt || '') + '</textarea></div>';
+  } else if (kind === 'mcp') {
+    var m = d.mcp || {};
+    kindHtml = (
+      '<div class="cfg-row"><label>MCP server</label><select data-cfg="mcp.server" id="cfg-mcp-server"><option value="' + esc(m.server || '') + '">' + esc(m.server || '— pick —') + '</option></select></div>' +
+      '<div class="cfg-row"><label>MCP tool</label><select data-cfg="mcp.tool" id="cfg-mcp-tool"><option value="' + esc(m.tool || '') + '">' + esc(m.tool || '— pick —') + '</option></select></div>' +
+      '<div class="cfg-row"><label>Inputs (JSON)</label><textarea data-cfg="mcp.inputs" rows="4">' + esc(JSON.stringify(m.inputs || {}, null, 2)) + '</textarea></div>' +
+      '<div class="cfg-row"><label>Description</label><textarea data-cfg="prompt" rows="3">' + esc(d.prompt || '') + '</textarea></div>'
+    );
+  } else if (kind === 'channel') {
+    var c = d.channel || {};
+    kindHtml = (
+      '<div class="cfg-row"><label>Channel</label><select data-cfg="channel.channel">' +
+        ['discord','slack','telegram','whatsapp','email','webhook'].map(function(k) { return '<option' + (c.channel === k ? ' selected' : '') + '>' + k + '</option>'; }).join('') +
+      '</select></div>' +
+      '<div class="cfg-row"><label>Target</label><input type="text" data-cfg="channel.target" placeholder="#channel, user id, email…" value="' + esc(c.target || '') + '"></div>' +
+      '<div class="cfg-row"><label>Content</label><textarea data-cfg="channel.content" rows="6">' + esc(c.content || '') + '</textarea></div>'
+    );
+  } else if (kind === 'transform') {
+    var t = d.transform || {};
+    kindHtml = '<div class="cfg-row"><label>Expression</label><textarea data-cfg="transform.expression" rows="6" placeholder="JS expression that returns shaped data">' + esc(t.expression || '') + '</textarea></div>';
+  } else if (kind === 'conditional') {
+    var co = d.conditional || {};
+    kindHtml = (
+      '<div class="cfg-row"><label>Condition</label><textarea data-cfg="conditional.condition" rows="3" placeholder="JS expression — truthy/falsy">' + esc(co.condition || '') + '</textarea></div>' +
+      '<div class="cfg-row"><label>True → step ids</label><input type="text" data-cfg="conditional.trueNext" placeholder="comma-separated" value="' + esc((co.trueNext || []).join(',')) + '"></div>' +
+      '<div class="cfg-row"><label>False → step ids</label><input type="text" data-cfg="conditional.falseNext" placeholder="comma-separated" value="' + esc((co.falseNext || []).join(',')) + '"></div>'
+    );
+  } else if (kind === 'loop') {
+    var l = d.loop || {};
+    kindHtml = (
+      '<div class="cfg-row"><label>Items</label><input type="text" data-cfg="loop.items" placeholder="JS expression returning iterable" value="' + esc(l.items || '') + '"></div>' +
+      '<div class="cfg-row"><label>Body step ids</label><input type="text" data-cfg="loop.bodyStepIds" placeholder="comma-separated" value="' + esc((l.bodyStepIds || []).join(',')) + '"></div>'
+    );
+  }
+  var lastRun = _builderRunStepResults && _builderRunStepResults[d.stepId || ''];
+  var lastRunBtn = lastRun
+    ? '<button onclick="showStepOutput(\\x27' + esc(d.stepId || '') + '\\x27)" style="margin-top:4px;background:var(--bg-tertiary);border:1px solid var(--border);color:var(--text-secondary);padding:4px 10px;border-radius:4px;cursor:pointer;font-size:11px;width:100%">Show last run output (' + esc(lastRun.status || '') + ')</button>'
+    : '';
+  return (
+    '<div style="display:flex;align-items:center;gap:8px;padding:10px 14px;border-bottom:1px solid var(--border);font-weight:600;font-size:12px">' +
+      '<span>' + esc(kind) + ' step</span>' +
+      '<span style="flex:1"></span>' +
+      '<button onclick="_deleteSelectedNode()" title="Delete this node" style="background:none;border:none;color:var(--red);cursor:pointer;font-size:16px">×</button>' +
+    '</div>' +
+    '<div style="padding:10px 14px;flex:1;overflow-y:auto" id="builder-config-fields">' +
+      common +
+      '<div style="border-top:1px dashed var(--border);margin:10px 0"></div>' +
+      kindHtml +
+      (lastRunBtn ? '<div style="border-top:1px dashed var(--border);margin:14px 0 8px"></div>' + lastRunBtn : '') +
+    '</div>'
+  );
+}
+
+function _bindConfigPanelInputs(nodeId) {
+  var panel = document.getElementById('builder-config-panel');
+  if (!panel) return;
+  panel.querySelectorAll('[data-cfg]').forEach(function(el) {
+    el.addEventListener('change', function() { _applyConfigField(nodeId, el); });
+    if (el.tagName === 'TEXTAREA' || el.tagName === 'INPUT') {
+      el.addEventListener('blur', function() { _applyConfigField(nodeId, el); });
+    }
+  });
+}
+
+function _applyConfigField(nodeId, el) {
+  if (!_builderCanvasEditor) return;
+  var node = _builderCanvasEditor.getNodeFromId(nodeId);
+  if (!node) return;
+  var pathStr = el.getAttribute('data-cfg') || '';
+  var pathParts = pathStr.split('.');
+  var raw = el.value;
+  var parsed;
+  if (pathStr.endsWith('.inputs')) {
+    try { parsed = raw ? JSON.parse(raw) : {}; } catch (e) { toast('Invalid JSON in inputs', 'error'); return; }
+  } else if (pathStr === 'tier' || pathStr === 'maxTurns') {
+    parsed = Number(raw) || 0;
+  } else if (pathStr === 'conditional.trueNext' || pathStr === 'conditional.falseNext' || pathStr === 'loop.bodyStepIds') {
+    parsed = raw ? raw.split(',').map(function(s) { return s.trim(); }).filter(Boolean) : [];
+  } else {
+    parsed = raw;
+  }
+  var newData = JSON.parse(JSON.stringify(node.data || {}));
+  var cur = newData;
+  for (var i = 0; i < pathParts.length - 1; i++) {
+    if (!cur[pathParts[i]] || typeof cur[pathParts[i]] !== 'object') cur[pathParts[i]] = {};
+    cur = cur[pathParts[i]];
+  }
+  cur[pathParts[pathParts.length - 1]] = parsed;
+  _builderCanvasEditor.updateNodeDataFromId(nodeId, newData);
+  // Re-decorate the node visually
+  _decorateBuilderNodeById(nodeId, newData.kind || 'prompt', newData);
+  _scheduleBuilderSave(300);
+}
+
+function _deleteSelectedNode() {
+  if (!_builderCanvasEditor || !_builderConfigOpenNodeId) return;
+  if (!confirm('Delete this node?')) return;
+  _builderCanvasEditor.removeNodeId('node-' + _builderConfigOpenNodeId);
+  _closeNodeConfigPanel();
+  _scheduleBuilderSave(150);
+}
+
+// ── Test runs (Phase 2d/2e) ─────────────────────────────────────
+
+var _builderActiveRunId = null;
+var _builderRunStepResults = {};
+
+async function testBuilderCanvas() {
+  if (!_builderCanvasOpenId) { toast('Open a workflow first', 'info'); return; }
+  if (_builderActiveRunId) { toast('A test is already running', 'info'); return; }
+  // Always flush any pending save so the test sees the latest graph
+  if (_builderSaveTimer) { clearTimeout(_builderSaveTimer); _builderSaveTimer = null; await _flushBuilderSave(); }
+  _clearRunVisualState();
+  try {
+    var r = await apiJson('POST', '/api/builder/workflows/' + encodeURIComponent(_builderCanvasOpenId) + '/test', { mode: 'mock' });
+    if (r.error) { toast(r.error, 'error'); return; }
+    _builderActiveRunId = r.runId;
+    _builderRunStepResults = {};
+    var cancel = document.getElementById('builder-canvas-cancel-btn');
+    if (cancel) cancel.style.display = '';
+    _setBuilderSaveStatus('saved');  // override status with a more useful one below
+    _setRunFooter('Running test… (' + r.runId.slice(0, 8) + ')');
+  } catch (err) {
+    toast('Test failed to start: ' + err, 'error');
+  }
+}
+
+async function cancelBuilderTest() {
+  if (!_builderActiveRunId) return;
+  try {
+    await apiJson('POST', '/api/builder/runs/' + encodeURIComponent(_builderActiveRunId) + '/cancel', {});
+  } catch (err) { /* SSE will still report the cancellation */ }
+}
+
+function _clearRunVisualState() {
+  document.querySelectorAll('#builder-canvas .drawflow-node').forEach(function(n) {
+    n.classList.remove('cl-step-running', 'cl-step-done', 'cl-step-failed', 'cl-step-skipped', 'cl-step-cancelled', 'cl-step-timeout');
+  });
+}
+
+function _setRunFooter(text) {
+  var el = document.getElementById('builder-canvas-status');
+  if (el) { el.textContent = text || ''; el.style.color = 'var(--text-muted)'; }
+}
+
+function _findNodeElForStepId(stepId) {
+  if (!_builderCanvasEditor) return null;
+  var data = _builderCanvasEditor.export();
+  var nodes = data && data.drawflow && data.drawflow.Home && data.drawflow.Home.data ? data.drawflow.Home.data : {};
+  for (var k in nodes) {
+    var d = nodes[k].data || {};
+    if (d.stepId === stepId) return document.querySelector('.drawflow-node[id="node-' + k + '"]');
+  }
+  return null;
+}
+
+function _onRunEvent(evt) {
+  if (!evt || !evt.runId || evt.workflowId !== _builderCanvasOpenId) return;
+  if (evt.type === 'run:started') {
+    _setRunFooter('Running test… (' + evt.runId.slice(0, 8) + ')');
+    return;
+  }
+  if (evt.type === 'run:step-status') {
+    var p = evt.payload || {};
+    var nodeEl = _findNodeElForStepId(p.stepId);
+    if (nodeEl) {
+      nodeEl.classList.remove('cl-step-running', 'cl-step-done', 'cl-step-failed', 'cl-step-skipped', 'cl-step-cancelled', 'cl-step-timeout');
+      nodeEl.classList.add('cl-step-' + p.status);
+    }
+    return;
+  }
+  if (evt.type === 'run:step-output') {
+    var po = evt.payload || {};
+    _builderRunStepResults[po.stepId] = po;
+    return;
+  }
+  if (evt.type === 'run:completed' || evt.type === 'run:cancelled') {
+    var ec = (evt.payload && evt.payload.status) || (evt.type === 'run:cancelled' ? 'cancelled' : 'ok');
+    var dur = (evt.payload && evt.payload.durationMs) || 0;
+    _builderActiveRunId = null;
+    var cancel = document.getElementById('builder-canvas-cancel-btn');
+    if (cancel) cancel.style.display = 'none';
+    _setRunFooter('Test ' + ec + ' in ' + dur + 'ms — click a node for output');
+    return;
+  }
+}
+
+function showStepOutput(stepId) {
+  var po = _builderRunStepResults[stepId];
+  if (!po) { toast('No output for ' + stepId + ' yet', 'info'); return; }
+  var lines = ['Step: ' + stepId, 'Status: ' + po.status, ''];
+  if (po.error) lines.push('Error: ' + po.error, '');
+  if (po.output != null) lines.push(typeof po.output === 'string' ? po.output : JSON.stringify(po.output, null, 2));
+  alert(lines.join('\\n'));
+}
+
+async function _populateMcpDropdowns() {
+  try {
+    if (!_builderMcpToolsCache) {
+      // Fetch from the agent-side discovery — proxied through a simple endpoint
+      // (we build a small client-side bridge by listing available servers via /api/builder/mcp-discovery)
+      var r = await apiFetch('/api/builder/mcp-discovery');
+      _builderMcpToolsCache = await r.json();
+    }
+    var serverSel = document.getElementById('cfg-mcp-server');
+    var toolSel = document.getElementById('cfg-mcp-tool');
+    if (!serverSel || !toolSel) return;
+    var current = serverSel.value;
+    var opts = '<option value="">— pick —</option>';
+    var servers = (_builderMcpToolsCache && _builderMcpToolsCache.servers) || [];
+    for (var i = 0; i < servers.length; i++) {
+      var s = servers[i];
+      opts += '<option value="' + esc(s.name) + '"' + (s.name === current ? ' selected' : '') + '>' + esc(s.name) + (s.enabled ? '' : ' (off)') + '</option>';
+    }
+    serverSel.innerHTML = opts;
+    var rebuildTools = function() {
+      var s = servers.filter(function(x) { return x.name === serverSel.value; })[0];
+      var tools = (s && s.tools) || [];
+      var curT = toolSel.value;
+      var t = '<option value="">— pick —</option>';
+      for (var j = 0; j < tools.length; j++) {
+        t += '<option value="' + esc(tools[j]) + '"' + (tools[j] === curT ? ' selected' : '') + '>' + esc(tools[j]) + '</option>';
+      }
+      toolSel.innerHTML = t;
+    };
+    rebuildTools();
+    serverSel.addEventListener('change', rebuildTools);
+  } catch (err) {
+    /* non-fatal — dropdowns just stay sparse */
   }
 }
 
@@ -17803,6 +19380,76 @@ function formatBytes(n) {
   if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
   if (n < 1024 * 1024 * 1024) return (n / 1024 / 1024).toFixed(1) + ' MB';
   return (n / 1024 / 1024 / 1024).toFixed(2) + ' GB';
+}
+
+async function memoryHealthAction(action) {
+  var labels = { 'janitor': 'cleanup', 'rebuild-fts': 'FTS rebuild', 'fix-orphans': 'orphan fix' };
+  if (!confirm('Run ' + (labels[action] || action) + ' now?')) return;
+  try {
+    var r = await apiJson('POST', '/api/memory/health/action', { action: action });
+    if (r.error) { toast('Action failed: ' + r.error, 'error'); return; }
+    var detail = '';
+    if (r.result) detail = ' — ' + Object.entries(r.result).slice(0, 4).map(function(p) { return p[0] + ':' + p[1]; }).join(', ');
+    if (r.report) detail = ' — orphans nulled: ' + (r.report.orphanRefsNulled || 0) + ', FTS rebuilds: ' + (r.report.ftsRebuilds || 0);
+    toast(action + ' complete' + detail, 'success');
+    refreshMemoryHealth();
+  } catch (err) {
+    toast('Action error: ' + err, 'error');
+  }
+}
+
+// ── Goals: inline create form ────────────────────────────────────
+function openNewGoalForm() {
+  var el = document.getElementById('new-goal-form');
+  if (!el) return;
+  el.style.display = '';
+  setTimeout(function() {
+    var t = document.getElementById('new-goal-title');
+    if (t) t.focus();
+  }, 50);
+}
+
+async function submitNewGoal() {
+  var titleEl = document.getElementById('new-goal-title');
+  var descEl = document.getElementById('new-goal-desc');
+  var title = (titleEl?.value || '').trim();
+  if (!title) { toast('Goal needs a title', 'error'); return; }
+  try {
+    var r = await apiJson('POST', '/api/goals', { title: title, description: (descEl?.value || '').trim() });
+    if (r && r.error) { toast('Create failed: ' + r.error, 'error'); return; }
+    if (titleEl) titleEl.value = '';
+    if (descEl) descEl.value = '';
+    document.getElementById('new-goal-form').style.display = 'none';
+    toast('Goal created', 'success');
+    if (typeof refreshGoals === 'function') refreshGoals();
+  } catch (err) { toast('Create error: ' + err, 'error'); }
+}
+
+// ── Workflows: open Builder for a brand-new workflow ─────────────
+function openBuilderForNewWorkflow() {
+  navigateTo('builder');
+  setTimeout(function() {
+    var typeSel = document.getElementById('builder-type');
+    if (typeSel) { typeSel.value = 'workflow'; updateBuilderMode(); }
+    var name = prompt('Name your new workflow:');
+    if (!name) return;
+    apiJson('POST', '/api/builder/workflows', { name: name }).then(function(r) {
+      if (r && r.error) { toast('Create failed: ' + r.error, 'error'); return; }
+      if (r && r.id) {
+        // Refresh picker, then open the new workflow
+        refreshBuilderCanvasPicker('workflow');
+        setTimeout(function() { openBuilderWorkflow(r.id); }, 200);
+      }
+    });
+  }, 100);
+}
+
+// ── Unleashed: open the start-task picker ────────────────────────
+function openStartUnleashedTask() {
+  // Reuse the existing cron list — pick a cron job, run it in unleashed mode.
+  // For v1 just route to Automations where the existing controls live.
+  navigateTo('automations');
+  toast('Pick a cron job and click "Run unleashed" — kicks off long-running mode.', 'info');
 }
 
 async function refreshMemoryHealth() {
@@ -18520,6 +20167,131 @@ async function saveDiscordSetup() {
   } catch(e) { toast(String(e), 'error'); }
 }
 
+function toggleHomeRail() {
+  var rail = document.getElementById('home-rail');
+  if (!rail) return;
+  // Mobile: open/close. Desktop: collapse/show.
+  if (window.matchMedia('(max-width: 1024px)').matches) {
+    rail.classList.toggle('open');
+  } else {
+    rail.classList.toggle('collapsed');
+  }
+}
+
+async function refreshHomeRail() {
+  // Daemon status
+  try {
+    var rs = await apiFetch('/api/status');
+    var ds = await rs.json();
+    var pip = document.querySelector('#rail-daemon-body .agent-activity-dot');
+    var label = document.querySelector('#rail-daemon-body .agent-activity span:last-child');
+    if (label) label.textContent = ds.running ? 'Daemon running' : 'Daemon stopped';
+    if (pip) pip.style.background = ds.running ? '#22c55e' : '#ef4444';
+    var up = document.getElementById('rail-daemon-uptime');
+    if (up && ds.uptimeMs) up.textContent = Math.round(ds.uptimeMs / 60000) + 'm';
+  } catch { /* */ }
+
+  // Today's plan (compact)
+  try {
+    var rp = await apiFetch('/api/daily-plan');
+    var dp = await rp.json();
+    var planEl = document.getElementById('home-plan-content');
+    if (planEl) {
+      if (!dp || !dp.plan) {
+        planEl.innerHTML = '<div style="font-size:12px;color:var(--text-muted)">No plan yet today.</div>';
+      } else {
+        var items = (dp.plan.items || []).slice(0, 4);
+        if (items.length === 0) {
+          planEl.innerHTML = '<div style="font-size:12px;color:var(--text-muted)">No items in today\\x27s plan.</div>';
+        } else {
+          planEl.innerHTML = items.map(function(it) {
+            return '<div class="rail-row"><span class="label">' + esc(it.title || it.text || '') + '</span><span class="meta">' + esc(it.time || '') + '</span></div>';
+          }).join('');
+        }
+      }
+    }
+  } catch {
+    var pe = document.getElementById('home-plan-content');
+    if (pe) pe.innerHTML = '<div style="font-size:11px;color:var(--text-muted)">No plan available.</div>';
+  }
+
+  // Upcoming cron fires (next 3)
+  try {
+    var rc = await apiFetch('/api/cron');
+    var dc = await rc.json();
+    var jobs = (dc.jobs || []).filter(function(j) { return j.enabled && j.nextRun; });
+    jobs.sort(function(a, b) { return new Date(a.nextRun).getTime() - new Date(b.nextRun).getTime(); });
+    var top = jobs.slice(0, 3);
+    var ue = document.getElementById('rail-upcoming');
+    var uc = document.getElementById('rail-upcoming-count');
+    if (uc) uc.textContent = String(jobs.length);
+    if (ue) {
+      ue.innerHTML = top.length ? top.map(function(j) {
+        return '<div class="rail-row clickable-row" onclick="navigateTo(\\x27build\\x27,{tab:\\x27crons\\x27})"><span class="label">' + esc(j.name) + '</span><span class="meta">' + esc(timeUntil(j.nextRun)) + '</span></div>';
+      }).join('') : '<div style="font-size:11px;color:var(--text-muted)">Nothing scheduled soon.</div>';
+    }
+  } catch { /* */ }
+
+  // Active unleashed runs
+  try {
+    var ru = await apiFetch('/api/unleashed');
+    var du = await ru.json();
+    var active = (du.tasks || []).filter(function(t) { return t.status === 'running'; });
+    var ae = document.getElementById('rail-active');
+    var ac = document.getElementById('rail-active-count');
+    if (ac) {
+      if (active.length > 0) { ac.style.display = ''; ac.textContent = String(active.length); }
+      else ac.style.display = 'none';
+    }
+    if (ae) {
+      ae.innerHTML = active.length ? active.map(function(t) {
+        return '<div class="rail-row clickable-row" onclick="navigateTo(\\x27build\\x27,{tab:\\x27workflows\\x27})"><span class="label">' + esc(t.name) + '</span><span class="meta">' + esc(t.phase || '') + '</span></div>';
+      }).join('') : '<div style="font-size:11px;color:var(--text-muted)">Nothing running.</div>';
+    }
+  } catch { /* */ }
+
+  // Time saved (rough: cron runs * 5min + activity exchanges * 2min, this week)
+  try {
+    var rm = await apiFetch('/api/metrics?period=week');
+    var dm = await rm.json();
+    var minutes = ((dm.cronRuns || 0) * 5) + ((dm.exchanges || 0) * 2);
+    var ts = document.getElementById('rail-time-saved');
+    if (ts) {
+      if (minutes >= 60) ts.innerHTML = '<div style="font-size:18px;font-weight:600">' + (minutes / 60).toFixed(1) + 'h</div><div style="font-size:11px;color:var(--text-muted)">across ' + (dm.cronRuns || 0) + ' cron runs + ' + (dm.exchanges || 0) + ' chats</div>';
+      else ts.innerHTML = '<div style="font-size:18px;font-weight:600">' + minutes + 'm</div><div style="font-size:11px;color:var(--text-muted)">across ' + (dm.cronRuns || 0) + ' cron runs</div>';
+    }
+  } catch { /* */ }
+
+  // Approvals (self-improve proposals + pending skills)
+  try {
+    var rsi = await apiFetch('/api/self-improve');
+    var dsi = await rsi.json();
+    var pending = (dsi.proposals || []).filter(function(p) { return p.status === 'pending'; });
+    var ae2 = document.getElementById('rail-approvals');
+    var ac2 = document.getElementById('rail-approvals-count');
+    if (ac2) {
+      if (pending.length > 0) { ac2.style.display = ''; ac2.textContent = String(pending.length); }
+      else ac2.style.display = 'none';
+    }
+    if (ae2) {
+      if (pending.length === 0) ae2.innerHTML = '<div style="font-size:11px;color:var(--text-muted)">Nothing pending.</div>';
+      else ae2.innerHTML = pending.slice(0, 3).map(function(p) {
+        return '<div class="rail-row clickable-row" onclick="navigateTo(\\x27brain\\x27,{tab:\\x27learning\\x27})"><span class="label">' + esc(p.area || 'proposal') + ': ' + esc((p.target || '').slice(0, 40)) + '</span><span class="meta">' + esc(((p.score || 0) * 100).toFixed(0)) + '%</span></div>';
+      }).join('');
+    }
+  } catch { /* */ }
+}
+
+function timeUntil(iso) {
+  if (!iso) return '';
+  var ms = new Date(iso).getTime() - Date.now();
+  if (ms < 0) return 'past';
+  var min = Math.round(ms / 60000);
+  if (min < 60) return 'in ' + min + 'm';
+  if (min < 24 * 60) return 'in ' + Math.round(min / 60) + 'h';
+  return 'in ' + Math.round(min / (24 * 60)) + 'd';
+}
+
 async function refreshAll() {
   // Use batch init for core data — avoids concurrent requests that freeze the event loop
   try {
@@ -18528,6 +20300,8 @@ async function refreshAll() {
     if (d.status) refreshStatus(d.status);
     if (d.activity) refreshActivity(false, d.activity);
     if (d.office) refreshTeamNav(d.office);
+    // Home rail data — fire and forget, doesn't block init render.
+    if (currentPage === 'home') refreshHomeRail();
     if (d.version) {
       if (d.version.needsRestart && !_restartBannerShown) {
         _restartBannerShown = true;
@@ -21896,6 +23670,9 @@ try {
       if (evt.type === 'daemon_restarted') {
         toast('Daemon restarted \u2014 refreshing data...', 'info');
         setTimeout(function() { refreshAll(); }, 1500);
+      }
+      if (evt.type === 'builder') {
+        try { _handleBuilderEvent(evt.data); } catch(e) { /* non-fatal */ }
       }
       if (evt.type === 'deep_result') {
         try {

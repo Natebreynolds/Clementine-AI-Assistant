@@ -1733,9 +1733,41 @@ export class Gateway {
     try {
       logger.info({ workflow: workflow.name, inputs }, 'Running workflow');
       try {
-        const { WorkflowRunner } = await import('../agent/workflow-runner.js');
+        const [{ WorkflowRunner }, { emitBuilderEvent }, { workflowId }] = await Promise.all([
+          import('../agent/workflow-runner.js'),
+          import('../dashboard/builder/events.js'),
+          import('../dashboard/builder/serializer.js'),
+        ]);
         const runner = new WorkflowRunner(this.assistant);
-        const result = await runner.run(workflow, inputs);
+
+        // Derive builder id so the dashboard canvas can light up live if it's open.
+        const baseName = workflow.sourceFile
+          ? workflow.sourceFile.split('/').pop()?.replace(/\.md$/, '') ?? workflow.name
+          : workflow.name;
+        const builderId = workflowId(baseName);
+        const runId = `sched-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+
+        emitBuilderEvent({ type: 'run:started', workflowId: builderId, runId, payload: { mode: 'real', stepCount: workflow.steps.length } });
+
+        const result = await runner.run(workflow, inputs, (updates) => {
+          for (const u of updates) {
+            if (u.status === 'waiting') continue;
+            const status = u.status === 'done' ? 'done' : u.status === 'failed' ? 'failed' : u.status === 'skipped' ? 'skipped' : 'running';
+            emitBuilderEvent({
+              type: 'run:step-status',
+              workflowId: builderId,
+              runId,
+              payload: { stepId: u.stepId, status, durationMs: u.durationMs, mocked: false },
+            });
+          }
+        });
+
+        emitBuilderEvent({
+          type: 'run:completed',
+          workflowId: builderId,
+          runId,
+          payload: { status: result.status === 'ok' ? 'ok' : 'error', durationMs: result.entry.durationMs },
+        });
 
         // Re-baseline integrity checksums after workflow (may write to vault)
         scanner.refreshIntegrity();
