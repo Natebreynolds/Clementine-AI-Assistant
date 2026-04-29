@@ -20597,6 +20597,7 @@ async function refreshAll() {
     var d = await r.json();
     if (d.status) refreshStatus(d.status);
     if (d.activity) refreshActivity(false, d.activity);
+    else refreshActivity();  // Fall back to direct /api/activity fetch when init didn't include it
     if (d.office) refreshTeamNav(d.office);
     // Home rail data — fire and forget, doesn't block init render.
     if (currentPage === 'home') refreshHomeRail();
@@ -23905,6 +23906,7 @@ async function refreshSalesforce() {
     // Feed data to individual render functions (same shape as individual endpoints)
     if (d.status) { try { refreshStatus(d.status); } catch(e) { console.warn('init: status', e); } }
     if (d.activity) { try { refreshActivity(false, d.activity); } catch(e) { console.warn('init: activity', e); } }
+    else { try { refreshActivity(); } catch(e) { console.warn('init: activity fallback', e); } }
     if (d.office) { try { refreshTeamNav(d.office); refreshTeamPulse(d.office); } catch(e) { console.warn('init: office', e); } }
     if (d.plan) { try { refreshHomePlan(d.plan); } catch(e) { console.warn('init: plan', e); } }
     if (d.version) { try { _loadedHash = d.version.started; } catch(e) { /* ignore */ } }
