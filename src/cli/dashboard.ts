@@ -8633,13 +8633,15 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
   .home-rail {
     display: flex;
     flex-direction: column;
-    gap: 12px;
+    gap: 8px;
     overflow-y: auto;
     position: relative;
   }
   .home-rail.collapsed {
     display: none;
   }
+  /* Auto-hide cards that have no actionable content (set via JS toggling .rail-card.empty) */
+  .rail-card.empty { display: none; }
   .rail-collapse-btn {
     position: absolute;
     top: -4px;
@@ -8660,23 +8662,24 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
   .rail-card {
     background: var(--bg-card);
     border: 1px solid var(--border);
-    border-radius: 10px;
+    border-radius: var(--radius-md);
     overflow: hidden;
-    box-shadow: 0 1px 4px rgba(0,0,0,0.04);
+    box-shadow: var(--shadow-xs);
   }
   .rail-header {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    padding: 10px 14px;
-    font-size: 12px;
+    padding: 8px 12px;
+    font-size: var(--text-xs);
     font-weight: 600;
-    color: var(--text-secondary);
-    border-bottom: 1px solid var(--border);
-    background: var(--bg-secondary);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--text-muted);
+    background: transparent;
   }
-  .rail-body { padding: 12px 14px; font-size: 12.5px; line-height: 1.5; }
-  .rail-body .empty-state, .rail-body .skel-row { font-size: 11px; }
+  .rail-body { padding: 8px 12px 10px; font-size: var(--text-sm); line-height: 1.45; }
+  .rail-body .empty-state, .rail-body .skel-row { font-size: var(--text-xs); }
   .rail-badge {
     display: inline-flex;
     align-items: center;
@@ -10455,35 +10458,39 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
     margin-top: 4px;
   }
 
-  /* ── Timeline ───────────────────────────── */
+  /* ── Timeline (compact) ───────────────────── */
   .timeline {
     position: relative;
-    padding-left: 24px;
+    padding-left: 18px;
   }
   .timeline::before {
     content: '';
     position: absolute;
-    left: 7px;
+    left: 5px;
     top: 4px;
     bottom: 4px;
-    width: 2px;
+    width: 1px;
     background: var(--border);
   }
   .timeline-item {
     position: relative;
-    padding: 8px 0;
-    font-size: 12px;
+    padding: 4px 0;
+    font-size: var(--text-sm);
     display: flex;
-    align-items: flex-start;
-    gap: 10px;
+    align-items: center;
+    gap: 8px;
+    border-radius: var(--radius-xs);
+    transition: background var(--motion);
   }
+  .timeline-item:hover { background: var(--bg-hover); }
   .timeline-item::before {
     content: '';
     position: absolute;
-    left: -20px;
-    top: 14px;
-    width: 8px;
-    height: 8px;
+    left: -16px;
+    top: 50%;
+    transform: translateY(-50%);
+    width: 7px;
+    height: 7px;
     border-radius: 50%;
     background: var(--text-muted);
     border: 2px solid var(--bg-primary);
@@ -10491,8 +10498,32 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
   }
   .timeline-item.ok::before { background: var(--green); }
   .timeline-item.error::before { background: var(--red); }
-  .timeline-msg { flex: 1; color: var(--text-primary); line-height: 1.4; }
-  .timeline-time { flex-shrink: 0; color: var(--text-muted); font-size: 11px; }
+  .timeline-msg {
+    flex: 1;
+    color: var(--text-primary);
+    line-height: 1.35;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    min-width: 0;
+  }
+  .timeline-title { font-weight: 500; }
+  .timeline-agent {
+    color: var(--clementine);
+    font-size: var(--text-xs);
+    margin-left: 6px;
+    font-weight: 500;
+  }
+  .timeline-body {
+    color: var(--text-muted);
+    font-size: var(--text-xs);
+    margin-left: 4px;
+  }
+  .timeline-time { flex-shrink: 0; color: var(--text-muted); font-size: var(--text-xs); }
+  /* Cap activity card height so chat dominates the page */
+  .home-activity .card-body { max-height: 320px; overflow-y: auto; padding: 10px 16px; }
+  /* Hide chat profile selector when default — the row gets cleaner */
+  .home-chat-input-row .chat-profile-spacer { display: none; }
 
   /* ── Task Cards ─────────────────────────── */
   .task-grid {
@@ -17175,15 +17206,15 @@ var sourceIcons = {
 };
 
 function activityEventHtml(e) {
-  var icon = sourceIcons[e.source] || '&#9679;';
   var statusCls = e.status === 'ok' || e.status === 'approved' ? 'ok'
     : (e.status === 'error' || e.eventType === 'cron_error') ? 'error'
-    : e.status === 'pending' ? '' : '';
-  var agentLabel = e.agentSlug ? '<span style="color:var(--accent);font-size:11px;margin-left:4px">[' + esc(e.agentSlug) + ']</span>' : '';
-  return '<div class="timeline-item ' + statusCls + '">'
-    + '<span style="margin-right:6px">' + icon + '</span>'
-    + '<span class="timeline-msg">' + esc(e.title) + agentLabel
-    + (e.body ? '<span onclick="this.style.whiteSpace=this.style.whiteSpace===\\x27normal\\x27?\\x27nowrap\\x27:\\x27normal\\x27;this.style.overflow=this.style.whiteSpace===\\x27normal\\x27?\\x27visible\\x27:\\x27hidden\\x27;this.style.maxWidth=this.style.whiteSpace===\\x27normal\\x27?\\x27none\\x27:\\x27400px\\x27" style="display:block;font-size:11px;color:var(--text-muted);margin-top:2px;max-width:400px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;cursor:pointer" title="Click to expand">' + esc(e.body) + '</span>' : '')
+    : e.status === 'pending' ? 'pending' : '';
+  var agentLabel = e.agentSlug ? '<span class="timeline-agent">[' + esc(e.agentSlug) + ']</span>' : '';
+  return '<div class="timeline-item ' + statusCls + '" title="' + esc(e.body || e.title) + '">'
+    + '<span class="timeline-msg">'
+      + '<span class="timeline-title">' + esc(e.title) + '</span>'
+      + agentLabel
+      + (e.body ? ' <span class="timeline-body">&middot; ' + esc(e.body) + '</span>' : '')
     + '</span>'
     + '<span class="timeline-time">' + timeAgo(e.timestamp) + '</span>'
     + '</div>';
@@ -18311,13 +18342,17 @@ async function loadProfiles() {
     var d = await r.json();
     var sel = document.getElementById('chat-profile-select');
     sel.innerHTML = '<option value="">Default</option>';
+    var customCount = 0;
     for (var p of (d.profiles || [])) {
       var opt = document.createElement('option');
       opt.value = p.slug;
       opt.textContent = p.name + (p.description ? ' — ' + p.description : '');
       if (p.slug === d.active) opt.selected = true;
       sel.appendChild(opt);
+      customCount++;
     }
+    // Hide the picker entirely if there are no custom profiles — declutters the chat input row.
+    sel.style.display = customCount === 0 ? 'none' : '';
   } catch(e) { /* profiles are optional */ }
 }
 
@@ -20476,44 +20511,53 @@ function toggleHomeRail() {
   }
 }
 
+function _railCard(bodyId) {
+  var body = document.getElementById(bodyId);
+  return body ? body.closest('.rail-card') : null;
+}
+function _setRailEmpty(bodyId, isEmpty) {
+  var card = _railCard(bodyId);
+  if (card) card.classList.toggle('empty', !!isEmpty);
+}
+
 async function refreshHomeRail() {
-  // Daemon status
+  // Daemon status — only surface when explicitly stopped. Treat null/undefined
+  // (running-state unknown) as "fine, hide" since the dashboard wouldn't be
+  // serving requests if the daemon were truly down.
   try {
     var rs = await apiFetch('/api/status');
     var ds = await rs.json();
+    var stopped = ds.running === false;
     var pip = document.querySelector('#rail-daemon-body .agent-activity-dot');
     var label = document.querySelector('#rail-daemon-body .agent-activity span:last-child');
-    if (label) label.textContent = ds.running ? 'Daemon running' : 'Daemon stopped';
-    if (pip) pip.style.background = ds.running ? '#22c55e' : '#ef4444';
+    if (label) label.textContent = stopped ? 'Daemon stopped' : 'Running';
+    if (pip) pip.style.background = stopped ? '#ef4444' : '#22c55e';
     var up = document.getElementById('rail-daemon-uptime');
     if (up && ds.uptimeMs) up.textContent = Math.round(ds.uptimeMs / 60000) + 'm';
-  } catch { /* */ }
+    _setRailEmpty('rail-daemon-body', !stopped);
+  } catch { _setRailEmpty('rail-daemon-body', true); }
 
-  // Today's plan (compact)
+  // Today's plan (compact). Hide card if no plan or zero items.
   try {
     var rp = await apiFetch('/api/daily-plan');
     var dp = await rp.json();
     var planEl = document.getElementById('home-plan-content');
+    var items = dp && dp.plan ? (dp.plan.items || []) : [];
     if (planEl) {
-      if (!dp || !dp.plan) {
-        planEl.innerHTML = '<div style="font-size:12px;color:var(--text-muted)">No plan yet today.</div>';
+      if (items.length === 0) {
+        planEl.innerHTML = '<div style="font-size:11px;color:var(--text-muted)">No plan yet today.</div>';
       } else {
-        var items = (dp.plan.items || []).slice(0, 4);
-        if (items.length === 0) {
-          planEl.innerHTML = '<div style="font-size:12px;color:var(--text-muted)">No items in today\\x27s plan.</div>';
-        } else {
-          planEl.innerHTML = items.map(function(it) {
-            return '<div class="rail-row"><span class="label">' + esc(it.title || it.text || '') + '</span><span class="meta">' + esc(it.time || '') + '</span></div>';
-          }).join('');
-        }
+        planEl.innerHTML = items.slice(0, 4).map(function(it) {
+          return '<div class="rail-row"><span class="label">' + esc(it.title || it.text || '') + '</span><span class="meta">' + esc(it.time || '') + '</span></div>';
+        }).join('');
       }
     }
+    _setRailEmpty('home-plan-content', items.length === 0);
   } catch {
-    var pe = document.getElementById('home-plan-content');
-    if (pe) pe.innerHTML = '<div style="font-size:11px;color:var(--text-muted)">No plan available.</div>';
+    _setRailEmpty('home-plan-content', true);
   }
 
-  // Upcoming cron fires (next 3)
+  // Upcoming cron fires (next 3) — hide card if nothing scheduled
   try {
     var rc = await apiFetch('/api/cron');
     var dc = await rc.json();
@@ -20524,13 +20568,14 @@ async function refreshHomeRail() {
     var uc = document.getElementById('rail-upcoming-count');
     if (uc) uc.textContent = String(jobs.length);
     if (ue) {
-      ue.innerHTML = top.length ? top.map(function(j) {
+      ue.innerHTML = top.map(function(j) {
         return '<div class="rail-row clickable-row" onclick="navigateTo(\\x27build\\x27,{tab:\\x27crons\\x27})"><span class="label">' + esc(j.name) + '</span><span class="meta">' + esc(timeUntil(j.nextRun)) + '</span></div>';
-      }).join('') : '<div style="font-size:11px;color:var(--text-muted)">Nothing scheduled soon.</div>';
+      }).join('');
     }
-  } catch { /* */ }
+    _setRailEmpty('rail-upcoming', top.length === 0);
+  } catch { _setRailEmpty('rail-upcoming', true); }
 
-  // Active unleashed runs
+  // Active unleashed runs — hide card unless something running
   try {
     var ru = await apiFetch('/api/unleashed');
     var du = await ru.json();
@@ -20542,25 +20587,27 @@ async function refreshHomeRail() {
       else ac.style.display = 'none';
     }
     if (ae) {
-      ae.innerHTML = active.length ? active.map(function(t) {
+      ae.innerHTML = active.map(function(t) {
         return '<div class="rail-row clickable-row" onclick="navigateTo(\\x27build\\x27,{tab:\\x27workflows\\x27})"><span class="label">' + esc(t.name) + '</span><span class="meta">' + esc(t.phase || '') + '</span></div>';
-      }).join('') : '<div style="font-size:11px;color:var(--text-muted)">Nothing running.</div>';
+      }).join('');
     }
-  } catch { /* */ }
+    _setRailEmpty('rail-active', active.length === 0);
+  } catch { _setRailEmpty('rail-active', true); }
 
-  // Time saved (rough: cron runs * 5min + activity exchanges * 2min, this week)
+  // Time saved (compact). Hide if zero.
   try {
     var rm = await apiFetch('/api/metrics?period=week');
     var dm = await rm.json();
     var minutes = ((dm.cronRuns || 0) * 5) + ((dm.exchanges || 0) * 2);
     var ts = document.getElementById('rail-time-saved');
     if (ts) {
-      if (minutes >= 60) ts.innerHTML = '<div style="font-size:18px;font-weight:600">' + (minutes / 60).toFixed(1) + 'h</div><div style="font-size:11px;color:var(--text-muted)">across ' + (dm.cronRuns || 0) + ' cron runs + ' + (dm.exchanges || 0) + ' chats</div>';
-      else ts.innerHTML = '<div style="font-size:18px;font-weight:600">' + minutes + 'm</div><div style="font-size:11px;color:var(--text-muted)">across ' + (dm.cronRuns || 0) + ' cron runs</div>';
+      if (minutes >= 60) ts.innerHTML = '<div style="font-size:var(--text-md);font-weight:600">' + (minutes / 60).toFixed(1) + 'h</div><div style="font-size:11px;color:var(--text-muted)">' + (dm.cronRuns || 0) + ' runs · ' + (dm.exchanges || 0) + ' chats</div>';
+      else ts.innerHTML = '<div style="font-size:var(--text-md);font-weight:600">' + minutes + 'm</div><div style="font-size:11px;color:var(--text-muted)">' + (dm.cronRuns || 0) + ' runs</div>';
     }
-  } catch { /* */ }
+    _setRailEmpty('rail-time-saved', minutes === 0);
+  } catch { _setRailEmpty('rail-time-saved', true); }
 
-  // Approvals (self-improve proposals + pending skills)
+  // Approvals — hide card unless something pending
   try {
     var rsi = await apiFetch('/api/self-improve');
     var dsi = await rsi.json();
@@ -20572,12 +20619,12 @@ async function refreshHomeRail() {
       else ac2.style.display = 'none';
     }
     if (ae2) {
-      if (pending.length === 0) ae2.innerHTML = '<div style="font-size:11px;color:var(--text-muted)">Nothing pending.</div>';
-      else ae2.innerHTML = pending.slice(0, 3).map(function(p) {
+      ae2.innerHTML = pending.slice(0, 3).map(function(p) {
         return '<div class="rail-row clickable-row" onclick="navigateTo(\\x27brain\\x27,{tab:\\x27learning\\x27})"><span class="label">' + esc(p.area || 'proposal') + ': ' + esc((p.target || '').slice(0, 40)) + '</span><span class="meta">' + esc(((p.score || 0) * 100).toFixed(0)) + '%</span></div>';
       }).join('');
     }
-  } catch { /* */ }
+    _setRailEmpty('rail-approvals', pending.length === 0);
+  } catch { _setRailEmpty('rail-approvals', true); }
 }
 
 function timeUntil(iso) {
@@ -23907,6 +23954,8 @@ async function refreshSalesforce() {
     if (d.status) { try { refreshStatus(d.status); } catch(e) { console.warn('init: status', e); } }
     if (d.activity) { try { refreshActivity(false, d.activity); } catch(e) { console.warn('init: activity', e); } }
     else { try { refreshActivity(); } catch(e) { console.warn('init: activity fallback', e); } }
+    // Populate the home right rail (daemon, plan, runs, time-saved, approvals)
+    if (typeof refreshHomeRail === 'function') { try { refreshHomeRail(); } catch(e) { console.warn('init: rail', e); } }
     if (d.office) { try { refreshTeamNav(d.office); refreshTeamPulse(d.office); } catch(e) { console.warn('init: office', e); } }
     if (d.plan) { try { refreshHomePlan(d.plan); } catch(e) { console.warn('init: plan', e); } }
     if (d.version) { try { _loadedHash = d.version.started; } catch(e) { /* ignore */ } }
