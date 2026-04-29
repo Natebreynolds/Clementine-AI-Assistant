@@ -2191,6 +2191,110 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
     res.json({ ok: true, id });
   });
 
+  app.get('/api/vault-files', async (req, res) => {
+    try {
+      const limit = Math.min(parseInt(String(req.query.limit ?? '120'), 10) || 120, 500);
+      const sinceDays = Math.max(parseInt(String(req.query.sinceDays ?? '30'), 10) || 30, 1);
+      const agentFilter = typeof req.query.agent === 'string' ? req.query.agent : '';
+      const folderFilter = typeof req.query.folder === 'string' ? req.query.folder : '';
+      const search = typeof req.query.q === 'string' ? req.query.q.toLowerCase() : '';
+      const includeAuto = req.query.includeAuto === '1';
+      const cutoffMs = Date.now() - sinceDays * 24 * 60 * 60 * 1000;
+      const vaultRoot = path.join(BASE_DIR, 'vault');
+      const matter = (await import('gray-matter')).default;
+      const files: Array<{
+        path: string; relPath: string; title: string; folder: string;
+        agentSlug: string | null; mtime: string; sizeBytes: number; type: string | null;
+      }> = [];
+      function walk(dir: string) {
+        let entries: string[] = [];
+        try { entries = readdirSync(dir); } catch { return; }
+        for (const e of entries) {
+          if (e.startsWith('.')) continue;
+          const full = path.join(dir, e);
+          let stat;
+          try { stat = statSync(full); } catch { continue; }
+          if (stat.isDirectory()) {
+            walk(full);
+            continue;
+          }
+          if (!e.endsWith('.md')) continue;
+          if (e.endsWith('.md.bak')) continue;
+          if (stat.mtimeMs < cutoffMs) continue;
+          const rel = path.relative(vaultRoot, full);
+          // Skip auto-generated MCP/skill wrappers unless explicitly requested.
+          // Path patterns: 00-System/skills/auto/* (generated tool wrappers).
+          if (!includeAuto && rel.startsWith('00-System/skills/auto/')) continue;
+          if (!includeAuto && rel.startsWith('00-System/agents/') && /\/(MEMORY|HEARTBEAT|TASKS|CRON)\.md$/.test(rel)) continue;
+          const folder = path.dirname(rel).split(path.sep)[0] || '';
+          let agentSlug: string | null = null;
+          if (rel.startsWith('00-System/agents/')) {
+            const m = rel.match(/^00-System\/agents\/([^/]+)\//);
+            if (m) agentSlug = m[1];
+          }
+          // Skip system housekeeping files (their author will surface via mtime in agent's own dir)
+          let title = path.basename(rel, '.md');
+          let typeTag: string | null = null;
+          try {
+            const head = readFileSync(full, 'utf-8').slice(0, 4000);
+            const parsed = matter(head);
+            const data = parsed.data as Record<string, unknown>;
+            if (typeof data.title === 'string') title = data.title;
+            else if (typeof data.name === 'string') title = data.name;
+            else {
+              const h1 = (parsed.content || '').match(/^#\s+(.+)$/m);
+              if (h1) title = h1[1].trim();
+            }
+            if (typeof data.type === 'string') typeTag = data.type;
+          } catch { /* */ }
+          files.push({
+            path: full,
+            relPath: rel,
+            title,
+            folder,
+            agentSlug,
+            mtime: new Date(stat.mtimeMs).toISOString(),
+            sizeBytes: stat.size,
+            type: typeTag,
+          });
+        }
+      }
+      walk(vaultRoot);
+      let filtered = files
+        .sort((a, b) => b.mtime.localeCompare(a.mtime))
+        .filter(f => {
+          if (agentFilter === '__shared__' && f.agentSlug != null) return false;
+          if (agentFilter && agentFilter !== '__shared__' && f.agentSlug !== agentFilter) return false;
+          if (folderFilter && f.folder !== folderFilter) return false;
+          if (search) {
+            const hay = (f.title + ' ' + f.relPath).toLowerCase();
+            if (!hay.includes(search)) return false;
+          }
+          return true;
+        })
+        .slice(0, limit);
+      // Compute folder counts for filter chips
+      const folderCounts: Record<string, number> = {};
+      for (const f of files) folderCounts[f.folder] = (folderCounts[f.folder] || 0) + 1;
+      res.json({ files: filtered, total: files.length, folderCounts });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  app.get('/api/vault-file', async (req, res) => {
+    try {
+      const relPath = typeof req.query.path === 'string' ? req.query.path : '';
+      if (!relPath || relPath.includes('..')) { res.status(400).json({ error: 'Bad path' }); return; }
+      const full = path.join(BASE_DIR, 'vault', relPath);
+      if (!existsSync(full)) { res.status(404).json({ error: 'Not found' }); return; }
+      const content = readFileSync(full, 'utf-8');
+      res.json({ path: relPath, content });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
   app.get('/api/memory', async (_req, res) => {
     res.json(await getMemory());
   });
@@ -10525,6 +10629,26 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
   /* Hide chat profile selector when default — the row gets cleaner */
   .home-chat-input-row .chat-profile-spacer { display: none; }
 
+  /* Vault file folder chips */
+  .vault-folder-chip {
+    padding: 4px 12px;
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    font-size: var(--text-sm);
+    color: var(--text-secondary);
+    cursor: pointer;
+    transition: all var(--motion);
+    background: var(--bg-secondary);
+    user-select: none;
+  }
+  .vault-folder-chip:hover { background: var(--bg-hover); color: var(--text-primary); }
+  .vault-folder-chip.active {
+    background: var(--clementine-bg);
+    color: var(--clementine);
+    border-color: var(--clementine);
+    font-weight: 500;
+  }
+
   /* ── Task Cards ─────────────────────────── */
   .task-grid {
     display: grid;
@@ -11680,6 +11804,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
       <div class="tab-bar" id="intelligence-tabs" style="margin:0 0 0 18px">
         <button class="active" data-icon="database" onclick="switchTab('intelligence','search')"><span class="icon-slot"></span> Memory</button>
         <button data-icon="sparkles" onclick="switchTab('intelligence','graph')"><span class="icon-slot"></span> Knowledge</button>
+        <button data-icon="fileText" onclick="switchTab('intelligence','files')"><span class="icon-slot"></span> Files</button>
         <button data-icon="folder" onclick="switchTab('intelligence','sources')"><span class="icon-slot"></span> Ingestion</button>
         <button data-icon="zap" onclick="switchTab('intelligence','health')"><span class="icon-slot"></span> Health <span class="tab-badge" id="brain-health-badge" style="display:none;background:#ef4444;color:#fff">0</span></button>
         <button data-icon="users" onclick="switchTab('intelligence','user-model')"><span class="icon-slot"></span> User Model</button>
@@ -11887,6 +12012,26 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
         <!-- Ingestion Runs -->
         <div class="tab-pane" id="tab-intelligence-runs">
           <div id="brain-runs-list"></div>
+        </div>
+        <div class="tab-pane" id="tab-intelligence-files">
+          <div style="display:flex;align-items:center;gap:10px;margin-bottom:14px;flex-wrap:wrap">
+            <input type="text" id="vault-files-search" placeholder="Search title or path..." style="flex:1;min-width:200px;padding:7px 12px;border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--bg-input);color:var(--text-primary);font-size:13px" oninput="refreshVaultFiles()">
+            <select id="vault-files-agent-filter" onchange="refreshVaultFiles()" style="padding:7px 10px;border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--bg-secondary);color:var(--text-primary);font-size:12px">
+              <option value="">All authors</option>
+              <option value="__shared__">Shared (vault root)</option>
+            </select>
+            <select id="vault-files-since" onchange="refreshVaultFiles()" style="padding:7px 10px;border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--bg-secondary);color:var(--text-primary);font-size:12px">
+              <option value="7">Past 7 days</option>
+              <option value="30" selected>Past 30 days</option>
+              <option value="90">Past 90 days</option>
+              <option value="365">Past year</option>
+            </select>
+            <button class="btn-sm" onclick="refreshVaultFiles()">Refresh</button>
+          </div>
+          <div id="vault-files-folder-chips" style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:12px"></div>
+          <div id="vault-files-list">
+            <div class="skel-block"><div class="skel-row med"></div><div class="skel-row"></div><div class="skel-row short"></div></div>
+          </div>
         </div>
         <div class="tab-pane" id="tab-intelligence-health">
           <div style="display:flex;align-items:center;gap:8px;margin-bottom:14px;flex-wrap:wrap">
@@ -14480,6 +14625,7 @@ function switchTab(group, tab) {
   if (group === 'intelligence') {
     if (tab === 'graph') refreshGraph();
     if (tab === 'memory') refreshMemory();
+    if (tab === 'files' && typeof refreshVaultFiles === 'function') refreshVaultFiles();
     if (tab === 'health') {
       if (typeof refreshMemoryHealth === 'function') refreshMemoryHealth();
       if (typeof refreshClaims === 'function') refreshClaims();
@@ -19729,6 +19875,134 @@ async function memoryHealthAction(action) {
   } catch (err) {
     toast('Action error: ' + err, 'error');
   }
+}
+
+// ── Vault Files (Brain → Files tab) ──────────────────────────────
+var _vaultFilesCache = null;
+var _vaultFilesFolder = '';   // current folder filter
+
+async function refreshVaultFiles() {
+  var listEl = document.getElementById('vault-files-list');
+  if (!listEl) return;
+  var q = document.getElementById('vault-files-search')?.value || '';
+  var agent = document.getElementById('vault-files-agent-filter')?.value || '';
+  var since = document.getElementById('vault-files-since')?.value || '30';
+  // Show skeleton while loading
+  listEl.innerHTML = '<div class="skel-block"><div class="skel-row med"></div><div class="skel-row"></div><div class="skel-row short"></div></div>';
+  try {
+    var url = '/api/vault-files?sinceDays=' + encodeURIComponent(since)
+      + (q ? '&q=' + encodeURIComponent(q) : '')
+      + (agent ? '&agent=' + encodeURIComponent(agent) : '')
+      + (_vaultFilesFolder ? '&folder=' + encodeURIComponent(_vaultFilesFolder) : '');
+    var r = await apiFetch(url);
+    var d = await r.json();
+    var files = d.files || [];
+    _vaultFilesCache = files;
+    // Populate agent filter from ALL files response (use server's full set, not filtered)
+    var agentSel = document.getElementById('vault-files-agent-filter');
+    if (agentSel && agentSel.options.length <= 2) {
+      var slugs = [...new Set(files.map(function(f) { return f.agentSlug; }).filter(Boolean))].sort();
+      slugs.forEach(function(slug) {
+        var opt = document.createElement('option');
+        opt.value = slug;
+        opt.textContent = slug;
+        agentSel.appendChild(opt);
+      });
+    }
+    // Render folder filter chips (using folderCounts from server)
+    var chipsEl = document.getElementById('vault-files-folder-chips');
+    if (chipsEl && d.folderCounts) {
+      var folders = Object.entries(d.folderCounts).sort(function(a, b) { return b[1] - a[1]; });
+      var totalCount = folders.reduce(function(s, p) { return s + p[1]; }, 0);
+      var chipHtml = '<div class="vault-folder-chip' + (_vaultFilesFolder === '' ? ' active' : '') + '" data-folder="" onclick="setVaultFolderFilter(\\x27\\x27)">All <span style="opacity:0.6">' + totalCount + '</span></div>';
+      folders.forEach(function(p) {
+        var folder = p[0]; var count = p[1];
+        if (!folder) return;
+        chipHtml += '<div class="vault-folder-chip' + (_vaultFilesFolder === folder ? ' active' : '') + '" data-folder="' + esc(folder) + '" onclick="setVaultFolderFilter(\\x27' + esc(folder) + '\\x27)">' + esc(folder) + ' <span style="opacity:0.6">' + count + '</span></div>';
+      });
+      chipsEl.innerHTML = chipHtml;
+    }
+    if (files.length === 0) {
+      listEl.innerHTML = '<div class="empty-cta"><div class="label">No recent files</div><div class="hint">Try a wider time window or different filter.</div></div>';
+      return;
+    }
+    var html = '<div style="font-size:11px;color:var(--text-muted);margin-bottom:10px">Showing ' + files.length + ' of ' + d.total + ' files modified in the last ' + since + ' days.</div>';
+    html += '<div style="display:flex;flex-direction:column;gap:1px;border:1px solid var(--border);border-radius:var(--radius-md);overflow:hidden;background:var(--bg-card)">';
+    for (var i = 0; i < files.length; i++) {
+      var f = files[i];
+      var agentBadge = f.agentSlug
+        ? '<span style="font-size:10px;background:var(--clementine-bg);color:var(--clementine);padding:2px 7px;border-radius:var(--radius-xs);font-weight:500">' + esc(f.agentSlug) + '</span>'
+        : '<span style="font-size:10px;background:var(--bg-tertiary);color:var(--text-muted);padding:2px 7px;border-radius:var(--radius-xs)">shared</span>';
+      var typeBadge = f.type ? '<span style="font-size:10px;color:var(--text-muted);margin-right:6px">' + esc(f.type) + '</span>' : '';
+      html += '<div class="vault-file-row clickable-row" data-path="' + esc(f.relPath) + '" style="display:flex;align-items:center;gap:12px;padding:10px 14px;background:var(--bg-secondary);border-bottom:1px solid var(--border-light);font-size:13px">'
+        + '<div style="flex:1;min-width:0">'
+          + '<div style="font-weight:500;color:var(--text-primary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">' + esc(f.title) + '</div>'
+          + '<div style="font-size:11px;color:var(--text-muted);font-family:\\x27JetBrains Mono\\x27,monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:2px">' + esc(f.relPath) + '</div>'
+        + '</div>'
+        + '<div style="display:flex;align-items:center;gap:8px;flex-shrink:0">'
+          + typeBadge + agentBadge
+          + '<span style="font-size:11px;color:var(--text-muted);min-width:60px;text-align:right">' + esc(timeAgo(f.mtime)) + '</span>'
+        + '</div>'
+        + '</div>';
+    }
+    html += '</div>';
+    listEl.innerHTML = html;
+    // Wire row clicks
+    listEl.querySelectorAll('.vault-file-row').forEach(function(row) {
+      row.onclick = function() { openVaultFile(row.getAttribute('data-path')); };
+    });
+  } catch (err) {
+    listEl.innerHTML = '<div style="padding:24px;color:var(--red);font-size:13px">Failed to load: ' + esc(String(err)) + '</div>';
+  }
+}
+
+async function openVaultFile(relPath) {
+  if (!relPath) return;
+  // Build/reuse a slide-out drawer for content preview
+  var drawer = document.getElementById('vault-file-drawer');
+  if (!drawer) {
+    drawer = document.createElement('div');
+    drawer.id = 'vault-file-drawer';
+    drawer.style.cssText = 'position:fixed;right:0;top:0;bottom:0;width:560px;max-width:92vw;background:var(--bg-secondary);border-left:1px solid var(--border);box-shadow:-8px 0 32px rgba(0,0,0,0.18);z-index:200;display:flex;flex-direction:column;transform:translateX(100%);transition:transform 200ms ease';
+    drawer.innerHTML =
+      '<div style="display:flex;align-items:center;gap:10px;padding:14px 18px;border-bottom:1px solid var(--border);flex-shrink:0">'
+        + '<div style="flex:1;min-width:0">'
+          + '<div id="vault-file-drawer-title" style="font-weight:600;font-size:15px;letter-spacing:-0.01em"></div>'
+          + '<div id="vault-file-drawer-path" style="font-size:11px;color:var(--text-muted);font-family:\\x27JetBrains Mono\\x27,monospace;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis"></div>'
+        + '</div>'
+        + '<button class="btn-icon btn-sm" onclick="closeVaultFileDrawer()" title="Close">' + lucide('x', 'icn-sm') + '</button>'
+      + '</div>'
+      + '<div id="vault-file-drawer-body" style="flex:1;overflow-y:auto;padding:18px 22px;font-size:13px;line-height:1.55"></div>';
+    document.body.appendChild(drawer);
+  }
+  var titleEl = document.getElementById('vault-file-drawer-title');
+  var pathEl = document.getElementById('vault-file-drawer-path');
+  var body = document.getElementById('vault-file-drawer-body');
+  if (titleEl) titleEl.textContent = relPath.split('/').pop().replace(/\\.md$/, '');
+  if (pathEl) pathEl.textContent = relPath;
+  if (body) body.innerHTML = '<div class="skel-block"><div class="skel-row"></div><div class="skel-row med"></div><div class="skel-row short"></div></div>';
+  drawer.style.transform = 'translateX(0)';
+  try {
+    var r = await apiFetch('/api/vault-file?path=' + encodeURIComponent(relPath));
+    var d = await r.json();
+    if (d.error) {
+      body.innerHTML = '<div style="color:var(--red)">' + esc(d.error) + '</div>';
+      return;
+    }
+    body.innerHTML = renderMd(d.content);
+  } catch (err) {
+    body.innerHTML = '<div style="color:var(--red)">Failed: ' + esc(String(err)) + '</div>';
+  }
+}
+
+function closeVaultFileDrawer() {
+  var drawer = document.getElementById('vault-file-drawer');
+  if (drawer) drawer.style.transform = 'translateX(100%)';
+}
+
+function setVaultFolderFilter(folder) {
+  _vaultFilesFolder = folder || '';
+  refreshVaultFiles();
 }
 
 // ── Goals: inline create form ────────────────────────────────────
