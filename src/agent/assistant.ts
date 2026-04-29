@@ -1739,6 +1739,18 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
 - **Vault:** ${vault}
 `);
 
+    // Staleness nudges — high-salience user-model slots that haven't been
+    // touched in a long time (Mem0 2026 calls this out as an open problem:
+    // confidently-wrong memories don't decay, they just become stale). Goes
+    // in volatile because it changes day-to-day. Skipped when nothing is
+    // stale so we don't clutter the prompt.
+    try {
+      const nudge = this.memoryStore?.getStalenessNudges?.({ agentSlug: profile?.slug });
+      if (nudge) {
+        volatileParts.push(`## Memory Maintenance\n\n${nudge}`);
+      }
+    } catch { /* best-effort; never block the prompt */ }
+
     return {
       stable: parts.join('\n\n---\n\n'),
       volatile: volatileParts.join('\n\n---\n\n'),

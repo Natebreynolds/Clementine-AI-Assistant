@@ -676,6 +676,15 @@ async function asyncMain(): Promise<void> {
   {
     const memStore = assistant.getMemoryStore();
     if (memStore) {
+      // Async write queue: route transcript saves, recall traces, outcomes,
+      // and access-log inserts off the request thread. ~250ms flush window;
+      // drained on shutdown below. Idempotent — safe if called twice.
+      try {
+        memStore.enableWriteQueue();
+      } catch (err) {
+        logger.warn({ err }, 'Failed to enable memory write queue — falling back to sync writes');
+      }
+
       const { runStartupMaintenance, startPeriodicMaintenance } = await import('./memory/maintenance.js');
       // Fire-and-forget startup maintenance
       runStartupMaintenance(memStore).catch(() => {});
@@ -1076,6 +1085,15 @@ async function asyncMain(): Promise<void> {
 
   // Flush any pending debounced session writes before exit.
   try { assistant.flushSessions(); } catch (err) { logger.warn({ err }, 'Session flush on shutdown failed'); }
+
+  // Drain the memory write queue so transcripts/recall traces/outcomes/access
+  // logs that were enqueued in the last <250ms make it to SQLite.
+  try {
+    const memStore = assistant.getMemoryStore();
+    if (memStore && typeof memStore.flushWrites === 'function') {
+      await memStore.flushWrites();
+    }
+  } catch (err) { logger.warn({ err }, 'Memory write queue drain failed'); }
 
   // Now safe to tear down remaining infrastructure
   heartbeat.stop();

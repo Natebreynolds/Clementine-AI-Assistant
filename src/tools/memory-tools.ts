@@ -410,6 +410,49 @@ server.tool(
 );
 
 
+// ── 2b. memory_record_procedure ────────────────────────────────────────
+
+server.tool(
+  'memory_record_procedure',
+  getToolDescription('memory_record_procedure') ?? 'Record a learned workflow as a durable procedure. Use when you notice a repeating multi-step task ("how Nate ships a release", "how to handle inbound replies"). Stored under 00-System/procedures/ with category=procedure and trigger verbs that surface it later. Different from memory_write/MEMORY.md: those store facts, this stores reusable HOW-TO. From Mem0\'s 2026 procedural-memory pattern.',
+  {
+    title: z.string().describe('Short procedure title (becomes filename slug)'),
+    steps: z.string().describe('Numbered steps or markdown body describing how to perform the task'),
+    triggers: z.array(z.string()).min(1).describe('Verb phrases (e.g. ["ship release", "publish to npm"]) that should surface this procedure when the user query contains them. Lowercase preferred.'),
+    notes: z.string().optional().describe('Optional context: when to use, when NOT to use, gotchas'),
+  },
+  async ({ title, steps, triggers, notes }) => {
+    const slug = title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 80);
+    if (!slug) return textResult('Error: title must contain alphanumerics');
+    const proceduresDir = path.join(SYSTEM_DIR, 'procedures');
+    mkdirSync(proceduresDir, { recursive: true });
+    const filePath = path.join(proceduresDir, `${slug}.md`);
+    const triggersYaml = triggers.map((t) => `  - ${JSON.stringify(t.toLowerCase())}`).join('\n');
+    const body = [
+      '---',
+      `title: ${JSON.stringify(title)}`,
+      'category: procedure',
+      'triggers:',
+      triggersYaml,
+      `created_at: ${new Date().toISOString()}`,
+      ACTIVE_AGENT_SLUG ? `agent_slug: ${JSON.stringify(ACTIVE_AGENT_SLUG)}` : '',
+      '---',
+      '',
+      `# ${title}`,
+      '',
+      '## Steps',
+      '',
+      steps.trim(),
+      '',
+      ...(notes ? ['## Notes', '', notes.trim(), ''] : []),
+    ].filter((line) => line !== '').join('\n') + '\n';
+    writeFileSync(filePath, body, 'utf-8');
+    const rel = path.relative(VAULT_DIR, filePath);
+    await incrementalSync(rel, ACTIVE_AGENT_SLUG ?? undefined);
+    return textResult(`Recorded procedure: ${rel} (triggers: ${triggers.join(', ')})`);
+  },
+);
+
 // ── 3. memory_search ───────────────────────────────────────────────────
 
 server.tool(
@@ -418,7 +461,7 @@ server.tool(
   {
     query: z.string().describe('Search text'),
     limit: z.number().optional().describe('Max results (default 20)'),
-    category: z.enum(['facts', 'events', 'discoveries', 'preferences', 'advice']).optional().describe('Filter by category'),
+    category: z.enum(['facts', 'events', 'discoveries', 'preferences', 'advice', 'procedure']).optional().describe('Filter by category'),
     topic: z.string().optional().describe('Filter by topic'),
   },
   async ({ query, limit, category, topic }) => {

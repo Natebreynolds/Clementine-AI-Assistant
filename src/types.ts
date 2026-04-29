@@ -10,7 +10,7 @@ export interface SearchResult {
   content: string;
   score: float;
   chunkType: string;
-  matchType: 'fts' | 'recency' | 'timeline' | 'vector';
+  matchType: 'fts' | 'recency' | 'timeline' | 'vector' | 'graph';
   lastUpdated: string;
   chunkId: number;
   salience: number;
@@ -21,7 +21,7 @@ export interface SearchResult {
   pinned?: boolean;
 }
 
-export type ChunkCategory = 'facts' | 'events' | 'discoveries' | 'preferences' | 'advice';
+export type ChunkCategory = 'facts' | 'events' | 'discoveries' | 'preferences' | 'advice' | 'procedure';
 
 export interface Chunk {
   sourceFile: string;

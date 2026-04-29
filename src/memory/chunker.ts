@@ -28,6 +28,14 @@ const DIR_CATEGORY_MAP: Record<string, ChunkCategory> = {
   '07-Inbox': 'events',
 };
 
+/**
+ * Procedural memory: learned workflows live in 00-System/procedures/.
+ * Frontmatter `triggers: [verb-phrases]` is parsed separately by the store
+ * and used at retrieval time to boost the chunk when a query mentions one
+ * of the trigger verbs. Pattern adopted from Mem0's v1.0.0 procedural tier.
+ */
+const PROCEDURE_DIR = '00-System/procedures';
+
 /** Content keyword patterns for category detection (used as fallback). */
 const CATEGORY_KEYWORDS: Array<[RegExp, ChunkCategory]> = [
   [/\b(prefer|always use|never use|i like|i don'?t like|i hate)\b/i, 'preferences'],
@@ -49,12 +57,17 @@ function detectCategoryAndTopic(
   // 1. Explicit frontmatter category
   if (frontmatter.category) {
     const fm = String(frontmatter.category).toLowerCase();
-    if (['facts', 'events', 'discoveries', 'preferences', 'advice'].includes(fm)) {
+    if (['facts', 'events', 'discoveries', 'preferences', 'advice', 'procedure'].includes(fm)) {
       category = fm as ChunkCategory;
     }
   }
 
-  // 2. Directory-based
+  // 2. Procedure directory (overrides directory map below).
+  if (!category && relPath.startsWith(PROCEDURE_DIR)) {
+    category = 'procedure';
+  }
+
+  // 3. Directory-based
   if (!category) {
     const topDir = relPath.split('/')[0];
     category = DIR_CATEGORY_MAP[topDir] ?? null;

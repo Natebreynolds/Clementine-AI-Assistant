@@ -4578,6 +4578,24 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
   // direction. Soft-delete via deleted_at; FTS trigger keeps deleted
   // content out of search results.
 
+  // Memory Health snapshot — single endpoint feeding the dashboard tab.
+  // Read-only aggregate over the existing tables; no caching needed (cheap).
+  app.get('/api/memory/health', async (_req, res) => {
+    try {
+      const gateway = await getGateway();
+      const store = (gateway as any).assistant?.memoryStore;
+      if (!store?.getMemoryHealth) {
+        res.status(503).json({ error: 'Memory store not available' });
+        return;
+      }
+      const graphStore = (gateway as any).assistant?.graphStore;
+      const health = store.getMemoryHealth({ graphStore, topCitedLimit: 10 });
+      res.json({ ok: true, health });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
   app.get('/api/memory/chunks/:id', async (req, res) => {
     try {
       const id = Number(req.params.id);
@@ -10478,6 +10496,9 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
       <div class="nav-item" data-page="metrics">
         <span class="nav-icon">&#128200;</span> Metrics
       </div>
+      <div class="nav-item" data-page="memory-health">
+        <span class="nav-icon">&#129504;</span> Memory Health
+      </div>
       <div class="nav-item" data-page="logs">
         <span class="nav-icon">&#128220;</span> Logs
       </div>
@@ -10884,6 +10905,10 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
           <div id="graph-detail-panel" style="margin-top:12px"></div>
         </div>
         <div class="tab-pane" id="tab-intelligence-memory">
+          <div style="margin-bottom:12px;font-size:13px;color:var(--text-muted)">
+            Stats and content browsing. For janitor, integrity, write queue, and staleness diagnostics see
+            <a href="#" onclick="navigateTo('memory-health');return false" style="color:var(--accent)">Memory Health &rarr;</a>
+          </div>
           <div class="grid-2" id="memory-stats"></div>
           <div class="card">
             <div class="card-header">MEMORY.md</div>
@@ -12104,6 +12129,16 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
       <div id="metrics-content"><div class="empty-state">Loading metrics...</div></div>
     </div>
 
+    <!-- ═══ Memory Health Page ═══ -->
+    <div class="page" id="page-memory-health">
+      <div class="page-title">Memory Health</div>
+      <p style="color:var(--text-muted);margin-bottom:16px">Bounded growth, retrieval signal, and curation drift &mdash; everything the janitor manages.</p>
+      <div style="display:flex;gap:8px;margin-bottom:16px">
+        <button class="btn btn-sm" onclick="refreshMemoryHealth()">Refresh</button>
+      </div>
+      <div id="memory-health-content"><div class="empty-state">Loading memory health...</div></div>
+    </div>
+
     <!-- ═══ Daily Plan Page ═══ -->
     <div class="page" id="page-daily-plan">
       <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:20px">
@@ -13165,6 +13200,7 @@ function navigateTo(page, opts) {
   if (page === 'unleashed') { refreshUnleashed(); }
   if (page === 'goals') { refreshGoalsProgress(); }
   if (page === 'metrics') { refreshMetrics(); }
+  if (page === 'memory-health') { refreshMemoryHealth(); }
   if (page === 'sessions') { refreshSessions(); }
   if (page === 'daily-plan') { refreshDailyPlan(); }
   if (page === 'agent-detail' && opts.agentSlug != null) {
@@ -17759,6 +17795,192 @@ function formatTokens(n) {
   if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M';
   if (n >= 1000) return (n / 1000).toFixed(1) + 'K';
   return String(n);
+}
+
+function formatBytes(n) {
+  if (n == null) return '—';
+  if (n < 1024) return n + ' B';
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+  if (n < 1024 * 1024 * 1024) return (n / 1024 / 1024).toFixed(1) + ' MB';
+  return (n / 1024 / 1024 / 1024).toFixed(2) + ' GB';
+}
+
+async function refreshMemoryHealth() {
+  var el = document.getElementById('memory-health-content');
+  if (!el) return;
+  try {
+    var r = await apiFetch('/api/memory/health');
+    var d = await r.json();
+    if (!d.ok || !d.health) {
+      el.innerHTML = '<div class="empty-state">' + esc(d.error || 'No data') + '</div>';
+      return;
+    }
+    var h = d.health;
+    var consolidatedPct = h.chunks.total > 0
+      ? ((h.chunks.consolidated / h.chunks.total) * 100).toFixed(1)
+      : '0.0';
+    var zombiePct = h.chunks.total > 0
+      ? ((h.chunks.zombieCount / h.chunks.total) * 100).toFixed(1)
+      : '0.0';
+
+    var html = '';
+
+    // Hero tiles row.
+    html += '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;margin-bottom:20px">';
+    html += '<div class="metric-hero"><div class="metric-hero-value">' + (h.chunks.total || 0)
+      + '</div><div class="metric-hero-label">Total Chunks</div>'
+      + '<div class="metric-hero-sub">' + (h.chunks.pinned || 0) + ' pinned &middot; ' + (h.chunks.softDeleted || 0) + ' soft-deleted</div></div>';
+    html += '<div class="metric-hero"><div class="metric-hero-value">' + consolidatedPct
+      + '%</div><div class="metric-hero-label">Consolidated</div>'
+      + '<div class="metric-hero-sub">' + (h.chunks.consolidated || 0) + ' of ' + (h.chunks.total || 0) + ' chunks</div></div>';
+    html += '<div class="metric-hero"><div class="metric-hero-value">' + (h.chunks.zombieCount || 0)
+      + '</div><div class="metric-hero-label">Zombies</div>'
+      + '<div class="metric-hero-sub">' + zombiePct + '% of total &middot; eligible to expire</div></div>';
+    html += '<div class="metric-hero"><div class="metric-hero-value">' + formatBytes(h.dbSizeBytes)
+      + '</div><div class="metric-hero-label">DB File Size</div>'
+      + '<div class="metric-hero-sub">last vacuum: ' + esc(h.lastVacuumAt || 'never') + '</div></div>';
+    html += '</div>';
+
+    // Two-column layout: categories + table sizes on left, top cited on right.
+    html += '<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">';
+
+    // Left column: categories.
+    html += '<div class="card"><div class="card-header"><h3>Chunks by Category</h3></div><div class="card-body">';
+    if (!h.chunksByCategory || h.chunksByCategory.length === 0) {
+      html += '<div class="empty-state">No chunks yet.</div>';
+    } else {
+      html += '<table class="data-table"><thead><tr><th>Category</th><th style="text-align:right">Count</th></tr></thead><tbody>';
+      for (var i = 0; i < h.chunksByCategory.length; i++) {
+        var c = h.chunksByCategory[i];
+        html += '<tr><td>' + esc(c.category || '—') + '</td><td style="text-align:right">' + c.count + '</td></tr>';
+      }
+      html += '</tbody></table>';
+    }
+    html += '</div></div>';
+
+    // Right column: top cited.
+    html += '<div class="card"><div class="card-header"><h3>Top Cited (last 30d)</h3></div><div class="card-body">';
+    if (!h.topCitedLast30d || h.topCitedLast30d.length === 0) {
+      html += '<div class="empty-state">No outcomes recorded in the last 30 days.</div>';
+    } else {
+      html += '<table class="data-table"><thead><tr><th>Source</th><th>Section</th><th style="text-align:right">Refs</th></tr></thead><tbody>';
+      for (var j = 0; j < h.topCitedLast30d.length; j++) {
+        var t = h.topCitedLast30d[j];
+        html += '<tr><td>' + esc(t.sourceFile || '—') + '</td><td>' + esc(t.section || '—')
+          + '</td><td style="text-align:right">' + t.refCount + '</td></tr>';
+      }
+      html += '</tbody></table>';
+    }
+    html += '</div></div>';
+
+    html += '</div>';
+
+    // Staleness section — high-salience drift + user-model age.
+    var staleSlots = h.staleUserModelSlots || [];
+    var staleChunks = h.staleHighSalienceChunks || [];
+    if (staleSlots.length > 0 || staleChunks.length > 0) {
+      html += '<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:16px">';
+
+      html += '<div class="card"><div class="card-header"><h3>Stale User-Model Slots</h3></div><div class="card-body">';
+      if (staleSlots.length === 0) {
+        html += '<div class="empty-state">All slots fresh.</div>';
+      } else {
+        html += '<table class="data-table"><thead><tr><th>Slot</th><th>Agent</th><th style="text-align:right">Age (days)</th></tr></thead><tbody>';
+        for (var ss = 0; ss < staleSlots.length; ss++) {
+          var s = staleSlots[ss];
+          html += '<tr><td>' + esc(s.slot) + '</td><td>' + esc(s.agentSlug || 'global') + '</td><td style="text-align:right">' + s.ageDays + '</td></tr>';
+        }
+        html += '</tbody></table>';
+      }
+      html += '</div></div>';
+
+      html += '<div class="card"><div class="card-header"><h3>Stale High-Salience Chunks</h3><div style="font-size:11px;color:var(--text-muted)">High salience but EMA gone negative &mdash; ranked but not cited</div></div><div class="card-body">';
+      if (staleChunks.length === 0) {
+        html += '<div class="empty-state">No drift detected.</div>';
+      } else {
+        html += '<table class="data-table"><thead><tr><th>Source</th><th>Section</th><th style="text-align:right">Salience</th><th style="text-align:right">EMA</th></tr></thead><tbody>';
+        for (var sc = 0; sc < staleChunks.length; sc++) {
+          var sk = staleChunks[sc];
+          html += '<tr><td>' + esc(sk.sourceFile || '') + '</td><td>' + esc(sk.section || '') + '</td><td style="text-align:right">' + sk.salience.toFixed(2) + '</td><td style="text-align:right">' + sk.lastOutcomeScore.toFixed(2) + '</td></tr>';
+        }
+        html += '</tbody></table>';
+      }
+      html += '</div></div>';
+      html += '</div>';
+    }
+
+    // Cache + write queue + integrity row.
+    html += '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:16px;margin-top:16px">';
+
+    if (h.chunkCacheStats) {
+      var cs = h.chunkCacheStats;
+      var hitRatePct = (cs.hitRate * 100).toFixed(1);
+      html += '<div class="card"><div class="card-header"><h3>Hot Chunk Cache</h3></div><div class="card-body">';
+      html += '<div style="display:flex;gap:18px;flex-wrap:wrap;font-size:13px">';
+      html += '<div><strong>' + hitRatePct + '%</strong> hit rate</div>';
+      html += '<div><strong>' + cs.hits + '</strong> hits</div>';
+      html += '<div><strong>' + cs.misses + '</strong> misses</div>';
+      html += '<div><strong>' + cs.size + ' / ' + cs.capacity + '</strong> entries</div>';
+      html += '<div><strong>' + cs.evictions + '</strong> evictions</div>';
+      html += '</div></div></div>';
+    }
+
+    // Async write queue status.
+    var wq = h.writeQueue;
+    html += '<div class="card"><div class="card-header"><h3>Async Write Queue</h3></div><div class="card-body">';
+    if (!wq) {
+      html += '<div style="font-size:13px;color:var(--text-muted)">Sync mode (queue disabled)</div>';
+    } else {
+      html += '<div style="display:flex;gap:18px;flex-wrap:wrap;font-size:13px">';
+      html += '<div><strong>' + wq.size + '</strong> pending</div>';
+      html += '<div><strong>' + wq.dropped + '</strong> dropped (back-pressure)</div>';
+      html += '</div>';
+    }
+    html += '</div></div>';
+
+    // Integrity report.
+    var ir = h.lastIntegrityReport;
+    html += '<div class="card"><div class="card-header"><h3>Integrity</h3></div><div class="card-body">';
+    if (!ir) {
+      html += '<div style="font-size:13px;color:var(--text-muted)">No probes have run yet.</div>';
+    } else {
+      var ftsLabel = ir.ftsOk
+        ? '<span style="color:var(--green,#3a3)">ok</span>'
+        : (ir.ftsRebuilt ? '<span style="color:var(--orange,#f80)">rebuilt</span>' : '<span style="color:var(--red,#c33)">failing</span>');
+      html += '<div style="display:flex;gap:18px;flex-wrap:wrap;font-size:13px">';
+      html += '<div>FTS5: ' + ftsLabel + '</div>';
+      html += '<div><strong>' + ir.orphanRefsNulled + '</strong> orphan refs nulled</div>';
+      html += '<div><strong>' + ir.missingEmbeddings + '</strong> missing embeddings</div>';
+      html += '<div style="color:var(--text-muted)">last: ' + esc(ir.ranAt || '') + '</div>';
+      html += '</div>';
+    }
+    html += '</div></div>';
+
+    html += '</div>';
+
+    // Table row counts (full width).
+    html += '<div class="card" style="margin-top:16px"><div class="card-header"><h3>Table Sizes</h3></div><div class="card-body">';
+    var tableRows = Object.keys(h.tableRowCounts || {}).sort(function(a, b) {
+      return (h.tableRowCounts[b] || 0) - (h.tableRowCounts[a] || 0);
+    });
+    if (tableRows.length === 0) {
+      html += '<div class="empty-state">No table data.</div>';
+    } else {
+      html += '<table class="data-table"><thead><tr><th>Table</th><th style="text-align:right">Rows</th></tr></thead><tbody>';
+      for (var k = 0; k < tableRows.length; k++) {
+        var tn = tableRows[k];
+        var rowCount = h.tableRowCounts[tn];
+        var label = rowCount === -1 ? '<span style="color:var(--text-muted)">missing</span>' : String(rowCount);
+        html += '<tr><td>' + esc(tn) + '</td><td style="text-align:right">' + label + '</td></tr>';
+      }
+      html += '</tbody></table>';
+    }
+    html += '</div></div>';
+
+    el.innerHTML = html;
+  } catch (err) {
+    el.innerHTML = '<div class="empty-state">Failed to load: ' + esc(String(err)) + '</div>';
+  }
 }
 
 async function refreshMetrics() {

@@ -29,6 +29,8 @@ import * as embeddingsModule from './embeddings.js';
 import { chunkFile } from './chunker.js';
 import { mmrRerank } from './mmr.js';
 import { deduplicateResults } from './search.js';
+import { HotCache } from './hot-cache.js';
+import { WriteQueue, type WriteQueueOpts } from './write-queue.js';
 
 const WIKILINK_RE = /\[\[([^\]|]+)(?:\|[^\]]+)?\]\]/g;
 
@@ -41,6 +43,28 @@ export class MemoryStore {
   private _stmtChunkCount: Database.Statement | null = null;
   private _stmtInsertTranscript: Database.Statement | null = null;
   private _stmtInsertUsage: Database.Statement | null = null;
+
+  // In-process LRU for chunk-row reads. Hit on every retrieval that calls
+  // getChunksByIds; invalidated on softDeleteChunk, restoreChunk, setPinned,
+  // updateFile, and bulk fullSync. Capacity tunable; default 1000 chunks.
+  private chunkRowCache = new HotCache<number, {
+    id: number;
+    sourceFile: string;
+    section: string;
+    content: string;
+    chunkType: string;
+    agentSlug: string | null;
+    pinned: boolean;
+    consolidated: boolean;
+    derivedFrom: number[] | null;
+    salience: number;
+    updatedAt: string;
+  }>(1000);
+
+  // Async write-behind queue for non-critical writes (transcripts, recall
+  // traces, outcomes, access log). Null = sync mode (default; tests rely on
+  // immediate persistence). Enabled via enableWriteQueue() at daemon boot.
+  private writeQueue: WriteQueue | null = null;
 
   constructor(dbPath: string, vaultDir: string) {
     this.dbPath = dbPath;
@@ -815,6 +839,17 @@ export class MemoryStore {
       CREATE UNIQUE INDEX IF NOT EXISTS idx_user_model_slot_agent
         ON user_model_blocks(slot, COALESCE(agent_slug, ''));
     `);
+
+    // Persistent key/value scratch for the memory janitor — last vacuum
+    // timestamp, last janitor run, etc. Survives daemon restarts so we
+    // don't VACUUM on every boot.
+    this.conn.exec(`
+      CREATE TABLE IF NOT EXISTS maintenance_meta (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL,
+        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+    `);
   }
 
   // ── Skill usage telemetry ─────────────────────────────────────────
@@ -920,6 +955,7 @@ export class MemoryStore {
 
   /** Toggle the manual pin flag on a chunk. Pinned chunks get a 2x score boost in recall. */
   setPinned(chunkId: number, pinned: boolean): boolean {
+    this.chunkRowCache.delete(chunkId);
     try {
       const result = this.conn.prepare('UPDATE chunks SET pinned = ? WHERE id = ?')
         .run(pinned ? 1 : 0, chunkId);
@@ -1085,7 +1121,9 @@ export class MemoryStore {
       ).run(row.id, row.source_file, row.section, row.content);
       return true;
     });
-    return tx(chunkId) as boolean;
+    const ok = tx(chunkId) as boolean;
+    if (ok) this.chunkRowCache.delete(chunkId);
+    return ok;
   }
 
   /** Restore a soft-deleted chunk. Removes the chunk_soft_deletes row and
@@ -1107,7 +1145,9 @@ export class MemoryStore {
       ).run(row.id, row.source_file, row.section, row.content);
       return true;
     });
-    return tx(chunkId) as boolean;
+    const ok = tx(chunkId) as boolean;
+    if (ok) this.chunkRowCache.delete(chunkId);
+    return ok;
   }
 
   /** Recent edit history for a chunk (newest first). */
@@ -1764,6 +1804,136 @@ export class MemoryStore {
   // ── Search: Context (Layer 3) ─────────────────────────────────────
 
   /**
+   * 1-hop wikilink expansion: for each seed chunk's source_file, find files
+   * that link to it or that it links to, and pull their top chunks. Returns
+   * SearchResult-shaped rows with a fractional boost so they enter the
+   * candidate pool below the seed scores but above pure noise.
+   *
+   * Pattern: 2026-frontier agent memory uses graph expansion (Mem0g, Zep
+   * Graphiti) to surface chunks that share an entity but miss the lexical
+   * match. Wikilinks are the cheapest available edge — Clementine already
+   * extracts them on every vault sync. The richer FalkorDB graph adds
+   * temporal validity and entity types but isn't required for this lift.
+   */
+  expandViaWikilinks(
+    seeds: SearchResult[],
+    opts: {
+      boost?: number;
+      limitPerFile?: number;
+      maxNeighbors?: number;
+      agentSlug?: string;
+      strict?: boolean;
+    } = {},
+  ): SearchResult[] {
+    const boost = opts.boost ?? 0.7;
+    const limitPerFile = opts.limitPerFile ?? 1;
+    const maxNeighbors = opts.maxNeighbors ?? 10;
+    if (seeds.length === 0) return [];
+
+    const seedFiles = new Set<string>(seeds.map((s) => s.sourceFile));
+    const seedFilesArr = [...seedFiles];
+    if (seedFilesArr.length === 0) return [];
+    // Wikilinks store the raw bracket text (e.g. "hub" from "[[hub]]"), not
+    // the resolved path "hub.md". Match against both forms when looking up
+    // backlinks so a seed of "hub.md" finds rows where target_file = "hub".
+    const seedBasenames = seedFilesArr.map((f) => path.basename(f, '.md'));
+    const fwdMatchSet = new Set([...seedFilesArr]);
+    const backMatchSet = new Set([...seedFilesArr, ...seedBasenames]);
+    const fwdArr = [...fwdMatchSet];
+    const backArr = [...backMatchSet];
+    const fwdPh = fwdArr.map(() => '?').join(',');
+    const backPh = backArr.map(() => '?').join(',');
+
+    const neighborFiles = new Set<string>();
+    try {
+      const fwdRows = this.conn
+        .prepare(`SELECT DISTINCT target_file FROM wikilinks WHERE source_file IN (${fwdPh})`)
+        .all(...fwdArr) as Array<{ target_file: string }>;
+      for (const r of fwdRows) {
+        // target_file may be a basename — try both with and without .md.
+        const candidates = [r.target_file, `${r.target_file}.md`];
+        for (const c of candidates) {
+          if (!seedFiles.has(c)) neighborFiles.add(c);
+        }
+      }
+      const backRows = this.conn
+        .prepare(`SELECT DISTINCT source_file FROM wikilinks WHERE target_file IN (${backPh})`)
+        .all(...backArr) as Array<{ source_file: string }>;
+      for (const r of backRows) {
+        if (!seedFiles.has(r.source_file)) neighborFiles.add(r.source_file);
+      }
+    } catch {
+      // wikilinks lookup failure — graph expansion is optional.
+      return [];
+    }
+    if (neighborFiles.size === 0) return [];
+
+    const neighborFilesArr = [...neighborFiles].slice(0, maxNeighbors * 2);
+    const filePh = neighborFilesArr.map(() => '?').join(',');
+    const args: unknown[] = [...neighborFilesArr];
+    let agentClause = '';
+    if (opts.agentSlug && opts.strict) {
+      agentClause = 'AND (c.agent_slug = ? OR c.agent_slug IS NULL)';
+      args.push(opts.agentSlug);
+    }
+
+    const chunkRows = this.conn
+      .prepare(
+        `SELECT c.id, c.source_file, c.section, c.content, c.chunk_type,
+                c.salience, c.agent_slug, c.category, c.topic, c.updated_at,
+                c.last_outcome_score, c.pinned
+         FROM chunks c
+         LEFT JOIN chunk_soft_deletes sd ON sd.chunk_id = c.id
+         WHERE c.source_file IN (${filePh})
+           AND c.chunk_type != 'frontmatter'
+           AND sd.chunk_id IS NULL
+           ${agentClause}
+         ORDER BY c.salience DESC, c.updated_at DESC`,
+      )
+      .all(...args) as Array<{
+      id: number;
+      source_file: string;
+      section: string;
+      content: string;
+      chunk_type: string;
+      salience: number | null;
+      agent_slug: string | null;
+      category: string | null;
+      topic: string | null;
+      updated_at: string;
+      last_outcome_score: number | null;
+      pinned: number | null;
+    }>;
+
+    const seedScoreMax = Math.max(...seeds.map((s) => s.score), 1);
+    const perFile = new Map<string, number>();
+    const out: SearchResult[] = [];
+    for (const r of chunkRows) {
+      const count = perFile.get(r.source_file) ?? 0;
+      if (count >= limitPerFile) continue;
+      perFile.set(r.source_file, count + 1);
+      out.push({
+        sourceFile: r.source_file,
+        section: r.section,
+        content: r.content,
+        score: seedScoreMax * boost * (1 + (r.salience ?? 0)),
+        chunkType: r.chunk_type,
+        matchType: 'graph',
+        lastUpdated: r.updated_at,
+        chunkId: r.id,
+        salience: r.salience ?? 0,
+        lastOutcomeScore: r.last_outcome_score ?? 0,
+        agentSlug: r.agent_slug ?? undefined,
+        category: r.category,
+        topic: r.topic,
+        pinned: !!r.pinned,
+      });
+      if (out.length >= maxNeighbors) break;
+    }
+    return out;
+  }
+
+  /**
    * Combined FTS5 relevance + recency search for context injection.
    *
    * Layer 3 of the memory architecture:
@@ -1771,6 +1941,7 @@ export class MemoryStore {
    * 2. Recency fetch -> N most recent chunks
    * 3. Deduplicate by (source_file, section)
    * 4. Apply salience boost to FTS results
+   * 5. Wikilink graph expansion -> 1-hop neighbors of top seeds (boost 0.7×)
    */
   searchContext(
     query: string,
@@ -1889,8 +2060,23 @@ export class MemoryStore {
     // 3. Recency
     const recentResults = this.getRecentChunks(recencyLimit, agentSlug, tagFilters, strict);
 
-    // 4. Merge and deduplicate (FTS results first, then vector, then recency)
-    const merged = [...ftsResults, ...vectorResults, ...recentResults];
+    // 3b. 1-hop wikilink expansion. Only run when we have seed candidates so
+    // we don't blow up on empty queries; bounded to keep MMR cost flat.
+    let graphResults: SearchResult[] = [];
+    try {
+      const seeds = [...ftsResults.slice(0, 5), ...vectorResults.slice(0, 5)];
+      if (seeds.length > 0) {
+        graphResults = this.expandViaWikilinks(seeds, {
+          agentSlug,
+          strict,
+          maxNeighbors: 5,
+          limitPerFile: 1,
+        });
+      }
+    } catch { /* graph expansion is optional — never fail the whole retrieval */ }
+
+    // 4. Merge and deduplicate (FTS first, then vector, then graph, then recency)
+    const merged = [...ftsResults, ...vectorResults, ...graphResults, ...recentResults];
     const finalResults = mmrRerank(deduplicateResults(merged), 0.7, limit + recencyLimit);
 
     // 5. Log recall trace if session context provided. Skipped for internal
@@ -1915,6 +2101,31 @@ export class MemoryStore {
    * Non-fatal: errors are swallowed so retrieval never fails on logging issues.
    */
   logRecallTrace(opts: {
+    sessionKey: string;
+    messageId?: string | null;
+    query: string;
+    chunkIds: number[];
+    scores: number[];
+    agentSlug?: string | null;
+  }): void {
+    if (opts.chunkIds.length === 0) return;
+    if (this.writeQueue) {
+      this.writeQueue.enqueue({
+        kind: 'recall',
+        sessionKey: opts.sessionKey,
+        messageId: opts.messageId ?? null,
+        query: opts.query,
+        chunkIds: [...opts.chunkIds],
+        scores: [...opts.scores],
+        agentSlug: opts.agentSlug ?? null,
+      });
+      return;
+    }
+    this._logRecallTraceSync(opts);
+  }
+
+  /** Internal sync recall_trace insert. Called by the WriteQueue. */
+  _logRecallTraceSync(opts: {
     sessionKey: string;
     messageId?: string | null;
     query: string;
@@ -2062,12 +2273,35 @@ export class MemoryStore {
     updatedAt: string;
   }> {
     if (chunkIds.length === 0) return [];
-    const placeholders = chunkIds.map(() => '?').join(',');
+
+    // Hot-cache pass — split into hits (return as-is) and misses (need SQL).
+    const out: Array<{
+      id: number;
+      sourceFile: string;
+      section: string;
+      content: string;
+      chunkType: string;
+      agentSlug: string | null;
+      pinned: boolean;
+      consolidated: boolean;
+      derivedFrom: number[] | null;
+      salience: number;
+      updatedAt: string;
+    }> = [];
+    const misses: number[] = [];
+    for (const id of chunkIds) {
+      const cached = this.chunkRowCache.get(id);
+      if (cached) out.push(cached);
+      else misses.push(id);
+    }
+    if (misses.length === 0) return out;
+
+    const placeholders = misses.map(() => '?').join(',');
     const rows = this.conn.prepare(
       `SELECT id, source_file, section, content, chunk_type, agent_slug,
               pinned, consolidated, derived_from, salience, updated_at
        FROM chunks WHERE id IN (${placeholders})`,
-    ).all(...chunkIds) as Array<{
+    ).all(...misses) as Array<{
       id: number;
       source_file: string;
       section: string;
@@ -2081,19 +2315,64 @@ export class MemoryStore {
       updated_at: string;
     }>;
 
-    return rows.map((r) => ({
-      id: r.id,
-      sourceFile: r.source_file,
-      section: r.section,
-      content: r.content,
-      chunkType: r.chunk_type,
-      agentSlug: r.agent_slug,
-      pinned: !!r.pinned,
-      consolidated: !!r.consolidated,
-      derivedFrom: r.derived_from ? this._parseJsonArray<number>(r.derived_from) : null,
-      salience: r.salience,
-      updatedAt: r.updated_at,
-    }));
+    for (const r of rows) {
+      const shaped = {
+        id: r.id,
+        sourceFile: r.source_file,
+        section: r.section,
+        content: r.content,
+        chunkType: r.chunk_type,
+        agentSlug: r.agent_slug,
+        pinned: !!r.pinned,
+        consolidated: !!r.consolidated,
+        derivedFrom: r.derived_from ? this._parseJsonArray<number>(r.derived_from) : null,
+        salience: r.salience,
+        updatedAt: r.updated_at,
+      };
+      this.chunkRowCache.set(r.id, shaped);
+      out.push(shaped);
+    }
+    return out;
+  }
+
+  /** Cache stats for the dashboard / debugging. */
+  getChunkCacheStats(): ReturnType<HotCache<number, unknown>['stats']> {
+    return this.chunkRowCache.stats();
+  }
+
+  // ── Async write queue lifecycle ─────────────────────────────────
+
+  /**
+   * Enable the write-behind queue. After this call, saveTurn / recordAccess /
+   * recordOutcome / logRecallTrace enqueue instead of running SQL on the
+   * caller's thread. Idempotent. Tests leave this off and rely on the sync path.
+   */
+  enableWriteQueue(opts: WriteQueueOpts = {}): void {
+    if (this.writeQueue) return;
+    this.writeQueue = new WriteQueue(this, opts);
+    this.writeQueue.start();
+  }
+
+  /** Drain and stop the write queue. Call on graceful shutdown. */
+  async flushWrites(): Promise<void> {
+    if (!this.writeQueue) return;
+    await this.writeQueue.drain();
+    this.writeQueue = null;
+  }
+
+  /** Stats for the dashboard / debugging. Returns null when queue disabled. */
+  getWriteQueueStats(): { size: number; dropped: number } | null {
+    return this.writeQueue ? this.writeQueue.stats() : null;
+  }
+
+  /** Drop a single cache entry — called from mutations that touch a chunk. */
+  invalidateChunkCache(chunkId: number): void {
+    this.chunkRowCache.delete(chunkId);
+  }
+
+  /** Drop the whole cache — fullSync and similar bulk operations call this. */
+  clearChunkCache(): void {
+    this.chunkRowCache.clear();
   }
 
   private _parseJsonArray<T>(json: string): T[] {
@@ -2429,6 +2708,55 @@ export class MemoryStore {
   }
 
   /**
+   * Pre-embed the top N most-cited chunks at startup. Eliminates cold-start
+   * latency for the chunks the agent is most likely to retrieve next. Skips
+   * chunks that already have a current-model dense embedding.
+   *
+   * Ranking: by outcome citation count in the last 30d (chunks the agent
+   * actually used), tiebroken by recency. Soft-deleted excluded.
+   */
+  async warmDenseEmbeddings(topN: number = 200): Promise<{ warmed: number; skipped: number; failed: number }> {
+    const currentModel = embeddingsModule.currentDenseModel();
+    const candidates = this.conn.prepare(
+      `SELECT c.id, c.content, COUNT(o.id) AS refs
+       FROM chunks c
+       LEFT JOIN chunk_soft_deletes sd ON sd.chunk_id = c.id
+       LEFT JOIN outcomes o ON o.chunk_id = c.id
+                            AND o.referenced = 1
+                            AND o.created_at > datetime('now', '-30 days')
+       WHERE sd.chunk_id IS NULL
+         AND length(c.content) >= 1
+         AND (c.embedding_dense IS NULL OR c.embedding_dense_model IS NULL OR c.embedding_dense_model != ?)
+       GROUP BY c.id
+       HAVING refs > 0
+       ORDER BY refs DESC, c.updated_at DESC
+       LIMIT ?`,
+    ).all(currentModel, topN) as Array<{ id: number; content: string; refs: number }>;
+
+    let warmed = 0;
+    let failed = 0;
+    if (candidates.length === 0) return { warmed: 0, skipped: 0, failed: 0 };
+
+    const updateStmt = this.conn.prepare(
+      `UPDATE chunks SET embedding_dense = ?, embedding_dense_model = ? WHERE id = ?`,
+    );
+    for (const c of candidates) {
+      try {
+        const vec = await embeddingsModule.embedDense(c.content, false);
+        if (vec) {
+          updateStmt.run(embeddingsModule.serializeEmbedding(vec), currentModel, c.id);
+          warmed++;
+        } else {
+          failed++;
+        }
+      } catch {
+        failed++;
+      }
+    }
+    return { warmed, skipped: 0, failed };
+  }
+
+  /**
    * Backfill dense embeddings on chunks that don't yet have one (or that
    * were embedded by an older model). Async because the dense model itself
    * is async. Yields progress via callback so the CLI can show a counter.
@@ -2569,7 +2897,8 @@ export class MemoryStore {
   // ── Transcripts ───────────────────────────────────────────────────
 
   /**
-   * Save a conversation turn to the transcripts table.
+   * Save a conversation turn to the transcripts table. Routes through the
+   * write queue when enabled so the request thread doesn't block on SQL.
    */
   saveTurn(
     sessionKey: string,
@@ -2577,6 +2906,15 @@ export class MemoryStore {
     content: string,
     model: string = '',
   ): void {
+    if (this.writeQueue) {
+      this.writeQueue.enqueue({ kind: 'transcript-turn', sessionKey, role, content, model });
+      return;
+    }
+    this._saveTurnSync(sessionKey, role, content, model);
+  }
+
+  /** Internal sync transcript insert. Called directly by the WriteQueue. */
+  _saveTurnSync(sessionKey: string, role: string, content: string, model: string): void {
     if (!this._stmtInsertTranscript) {
       this._stmtInsertTranscript = this.conn.prepare(
         'INSERT INTO transcripts (session_key, role, content, model) VALUES (?, ?, ?, ?)',
@@ -2734,11 +3072,21 @@ export class MemoryStore {
   // ── Salience Tracking ─────────────────────────────────────────────
 
   /**
-   * Record that chunks were accessed (retrieved/displayed).
+   * Record that chunks were accessed (retrieved/displayed). Routes through
+   * the write queue when enabled.
    */
   recordAccess(chunkIds: number[], accessType: string = 'retrieval'): void {
     if (chunkIds.length === 0) return;
+    if (this.writeQueue) {
+      this.writeQueue.enqueue({ kind: 'access', chunkIds: [...chunkIds], accessType });
+      return;
+    }
+    this._recordAccessSync(chunkIds, accessType);
+  }
 
+  /** Internal sync access log insert. Called directly by the WriteQueue. */
+  _recordAccessSync(chunkIds: number[], accessType: string): void {
+    if (chunkIds.length === 0) return;
     const insertStmt = this.conn.prepare(
       'INSERT INTO access_log (chunk_id, access_type) VALUES (?, ?)',
     );
@@ -2800,6 +3148,23 @@ export class MemoryStore {
    * can't dominate salience + BM25 + vector score.
    */
   recordOutcome(
+    outcomes: Array<{ chunkId: number; referenced: boolean }>,
+    sessionKey?: string | null,
+  ): void {
+    if (outcomes.length === 0) return;
+    if (this.writeQueue) {
+      this.writeQueue.enqueue({
+        kind: 'outcome',
+        outcomes: outcomes.map((o) => ({ ...o })),
+        sessionKey: sessionKey ?? null,
+      });
+      return;
+    }
+    this._recordOutcomeSync(outcomes, sessionKey);
+  }
+
+  /** Internal sync outcome insert + EMA update. Called by the WriteQueue. */
+  _recordOutcomeSync(
     outcomes: Array<{ chunkId: number; referenced: boolean }>,
     sessionKey?: string | null,
   ): void {
@@ -3570,6 +3935,409 @@ export class MemoryStore {
       usageLogPruned: usageResult.changes,
       recallTracesPruned,
     };
+  }
+
+  // ── Staleness detection ─────────────────────────────────────────
+
+  /**
+   * User-model slots whose `updated_at` is older than maxAgeDays. These are
+   * candidates for the "verify or refresh" nudge — high-relevance memories
+   * that may have become silently wrong (Mem0 2026 calls this out as an
+   * open problem; we surface it via observability rather than auto-decay).
+   *
+   * Empty content is skipped (an empty slot has no claim to verify).
+   */
+  findStaleUserModelSlots(opts: { maxAgeDays?: number; agentSlug?: string | null } = {}): Array<{
+    slot: string;
+    ageDays: number;
+    agentSlug: string | null;
+  }> {
+    const maxAge = opts.maxAgeDays ?? 90;
+    const rows = this.conn
+      .prepare(
+        `SELECT slot, agent_slug,
+                CAST(strftime('%s', 'now') - strftime('%s', updated_at) AS INTEGER) AS age_seconds
+         FROM user_model_blocks
+         WHERE length(content) > 0
+           AND updated_at < datetime('now', ?)
+           AND COALESCE(agent_slug, '') = COALESCE(?, '')`,
+      )
+      .all(`-${maxAge} days`, opts.agentSlug ?? null) as Array<{
+      slot: string;
+      agent_slug: string | null;
+      age_seconds: number;
+    }>;
+    return rows.map((r) => ({
+      slot: r.slot,
+      agentSlug: r.agent_slug,
+      ageDays: Math.round(r.age_seconds / 86400),
+    }));
+  }
+
+  /**
+   * High-salience chunks whose outcome EMA has drifted negative — i.e., we
+   * keep ranking them high but the agent stopped citing them. Strong signal
+   * that the chunk is stale or wrong even though salience hasn't decayed.
+   *
+   * Conservative threshold: salience > 0.8 AND last_outcome_score < 0.
+   * Soft-deleted excluded.
+   */
+  findStaleHighSalienceChunks(opts: {
+    salienceFloor?: number;
+    outcomeCeiling?: number;
+    limit?: number;
+  } = {}): Array<{
+    chunkId: number;
+    sourceFile: string;
+    section: string;
+    salience: number;
+    lastOutcomeScore: number;
+  }> {
+    const salienceFloor = opts.salienceFloor ?? 0.8;
+    const outcomeCeiling = opts.outcomeCeiling ?? 0;
+    const limit = opts.limit ?? 25;
+    const rows = this.conn
+      .prepare(
+        `SELECT c.id, c.source_file, c.section, c.salience, c.last_outcome_score
+         FROM chunks c
+         LEFT JOIN chunk_soft_deletes sd ON sd.chunk_id = c.id
+         WHERE sd.chunk_id IS NULL
+           AND c.salience > ?
+           AND COALESCE(c.last_outcome_score, 0) < ?
+         ORDER BY c.salience DESC
+         LIMIT ?`,
+      )
+      .all(salienceFloor, outcomeCeiling, limit) as Array<{
+      id: number;
+      source_file: string;
+      section: string;
+      salience: number;
+      last_outcome_score: number | null;
+    }>;
+    return rows.map((r) => ({
+      chunkId: r.id,
+      sourceFile: r.source_file,
+      section: r.section,
+      salience: r.salience,
+      lastOutcomeScore: r.last_outcome_score ?? 0,
+    }));
+  }
+
+  /**
+   * Format staleness findings into ready-to-inject prompt text. Heartbeat
+   * builders can drop this into the system prompt verbatim. Returns null
+   * if there's nothing to nudge about — caller should not inject empty text.
+   */
+  getStalenessNudges(opts: { agentSlug?: string | null; maxSlotAgeDays?: number } = {}): string | null {
+    const stale = this.findStaleUserModelSlots({
+      maxAgeDays: opts.maxSlotAgeDays,
+      agentSlug: opts.agentSlug,
+    });
+    if (stale.length === 0) return null;
+    const lines = stale.map((s) => `- \`${s.slot}\` is ${s.ageDays}d old`);
+    return [
+      'User-model maintenance:',
+      ...lines,
+      'Verify or refresh these during the next natural turn — do not force a check-in.',
+    ].join('\n');
+  }
+
+  // ── Procedural memory ───────────────────────────────────────────
+
+  /**
+   * Find procedure chunks whose frontmatter `triggers` overlap with words
+   * in the query. Used to surface learned workflows ("how Nate ships a
+   * release", "how to handle inbound replies") above generic facts when
+   * the user's intent matches.
+   *
+   * Match rule: case-insensitive substring of any trigger phrase appears
+   * in the query. Empty result if no procedure chunks exist or no triggers
+   * match — caller should treat this as additive context, not the whole
+   * answer.
+   */
+  findRelevantProcedures(
+    query: string,
+    opts: { limit?: number; agentSlug?: string | null } = {},
+  ): Array<{
+    id: number;
+    sourceFile: string;
+    section: string;
+    content: string;
+    triggers: string[];
+    matched: string[];
+  }> {
+    const limit = opts.limit ?? 5;
+    const q = query.toLowerCase();
+    // Exclude the frontmatter chunk — chunker emits one per file (a key:val
+    // dump) which inherits category=procedure from the parent. Only the body
+    // chunks contain the actual procedure content the agent wants to recall.
+    const rows = this.conn
+      .prepare(
+        `SELECT c.id, c.source_file, c.section, c.content, c.frontmatter_json
+         FROM chunks c
+         LEFT JOIN chunk_soft_deletes sd ON sd.chunk_id = c.id
+         WHERE c.category = 'procedure'
+           AND c.chunk_type != 'frontmatter'
+           AND sd.chunk_id IS NULL
+           AND (c.agent_slug IS NULL OR c.agent_slug = COALESCE(?, c.agent_slug))`,
+      )
+      .all(opts.agentSlug ?? null) as Array<{
+      id: number;
+      source_file: string;
+      section: string;
+      content: string;
+      frontmatter_json: string;
+    }>;
+
+    const matches: Array<{
+      id: number;
+      sourceFile: string;
+      section: string;
+      content: string;
+      triggers: string[];
+      matched: string[];
+    }> = [];
+    for (const row of rows) {
+      let triggers: string[] = [];
+      try {
+        const fm = row.frontmatter_json ? JSON.parse(row.frontmatter_json) : {};
+        if (Array.isArray(fm.triggers)) {
+          triggers = fm.triggers.map((t: unknown) => String(t).toLowerCase()).filter(Boolean);
+        }
+      } catch { /* malformed frontmatter — skip */ }
+      if (triggers.length === 0) continue;
+      const matched = triggers.filter((t) => q.includes(t));
+      if (matched.length === 0) continue;
+      matches.push({
+        id: row.id,
+        sourceFile: row.source_file,
+        section: row.section,
+        content: row.content,
+        triggers,
+        matched,
+      });
+    }
+    // Most-matched first, then most-specific (longest matched trigger).
+    matches.sort((a, b) => {
+      if (b.matched.length !== a.matched.length) return b.matched.length - a.matched.length;
+      const aMax = Math.max(...a.matched.map((m) => m.length));
+      const bMax = Math.max(...b.matched.map((m) => m.length));
+      return bMax - aMax;
+    });
+    return matches.slice(0, limit);
+  }
+
+  // ── Janitor: bounded growth ─────────────────────────────────────
+
+  /** Persistent key/value for janitor state (last vacuum, etc.). */
+  getMaintenanceMeta(key: string): string | null {
+    const row = this.conn
+      .prepare('SELECT value FROM maintenance_meta WHERE key = ?')
+      .get(key) as { value: string } | undefined;
+    return row?.value ?? null;
+  }
+
+  setMaintenanceMeta(key: string, value: string): void {
+    this.conn
+      .prepare(
+        `INSERT INTO maintenance_meta (key, value) VALUES (?, ?)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = datetime('now')`,
+      )
+      .run(key, value);
+  }
+
+  /**
+   * Two-phase delete for consolidated, low-salience, unused chunks.
+   *
+   * Phase 1: soft-delete chunks where consolidated=1, not pinned, salience
+   *          below floor, and never accessed (or last access older than
+   *          expireDays).
+   * Phase 2: physically delete chunks that have been in chunk_soft_deletes
+   *          for graceDays. Cascades to access_log, outcomes, chunk_history
+   *          for the same chunk_id.
+   *
+   * Summary chunks whose `derived_from` references the deleted IDs are
+   * intentionally NOT propagate-deleted — the summary still encodes signal.
+   */
+  expireConsolidated(opts: {
+    expireDays?: number;
+    salienceFloor?: number;
+    graceDays?: number;
+  } = {}): { softDeleted: number; physicallyDeleted: number } {
+    const expireDays = opts.expireDays ?? 60;
+    const salienceFloor = opts.salienceFloor ?? 0.2;
+    const graceDays = opts.graceDays ?? 14;
+
+    // Phase 1 — soft-delete candidates.
+    const candidates = this.conn
+      .prepare(
+        `SELECT c.id
+         FROM chunks c
+         LEFT JOIN chunk_soft_deletes sd ON sd.chunk_id = c.id
+         LEFT JOIN (
+           SELECT chunk_id, MAX(accessed_at) as last_access
+           FROM access_log GROUP BY chunk_id
+         ) a ON a.chunk_id = c.id
+         WHERE c.consolidated = 1
+           AND COALESCE(c.pinned, 0) = 0
+           AND COALESCE(c.salience, 0) < ?
+           AND sd.chunk_id IS NULL
+           AND (a.last_access IS NULL OR a.last_access < datetime('now', ?))
+           AND c.created_at < datetime('now', ?)`,
+      )
+      .all(
+        salienceFloor,
+        `-${expireDays} days`,
+        `-${expireDays} days`,
+      ) as Array<{ id: number }>;
+
+    let softDeleted = 0;
+    for (const row of candidates) {
+      if (this.softDeleteChunk(row.id, 'janitor')) softDeleted++;
+    }
+
+    // Phase 2 — physical delete after grace period.
+    const stale = this.conn
+      .prepare(
+        `SELECT chunk_id FROM chunk_soft_deletes
+         WHERE deleted_at < datetime('now', ?)`,
+      )
+      .all(`-${graceDays} days`) as Array<{ chunk_id: number }>;
+
+    let physicallyDeleted = 0;
+    if (stale.length > 0) {
+      // softDeleteChunk removed these rows from chunks_fts. The chunks_ad
+      // trigger fires on DELETE FROM chunks and tries to remove them again —
+      // FTS5 contentless tables corrupt ("database disk image is malformed")
+      // when you delete a docid that's already gone. Re-add the row to FTS
+      // first so the trigger can do a clean delete.
+      const fetchRow = this.conn.prepare(
+        `SELECT id, source_file, section, content FROM chunks WHERE id = ?`,
+      );
+      const reAddFts = this.conn.prepare(
+        `INSERT INTO chunks_fts (rowid, source_file, section, content) VALUES (?, ?, ?, ?)`,
+      );
+      const delChunk = this.conn.prepare('DELETE FROM chunks WHERE id = ?');
+      const delSoft = this.conn.prepare('DELETE FROM chunk_soft_deletes WHERE chunk_id = ?');
+      const delAccess = this.conn.prepare('DELETE FROM access_log WHERE chunk_id = ?');
+      const delOutcomes = this.conn.prepare('DELETE FROM outcomes WHERE chunk_id = ?');
+      const delHistory = this.conn.prepare('DELETE FROM chunk_history WHERE chunk_id = ?');
+      const tx = this.conn.transaction((rows: Array<{ chunk_id: number }>) => {
+        for (const r of rows) {
+          delAccess.run(r.chunk_id);
+          delOutcomes.run(r.chunk_id);
+          delHistory.run(r.chunk_id);
+          delSoft.run(r.chunk_id);
+          const chunkRow = fetchRow.get(r.chunk_id) as
+            | { id: number; source_file: string; section: string; content: string }
+            | undefined;
+          if (chunkRow) {
+            try {
+              reAddFts.run(chunkRow.id, chunkRow.source_file, chunkRow.section, chunkRow.content);
+            } catch {
+              // Already in FTS (chunk was never soft-removed from FTS) — fine.
+            }
+            const result = delChunk.run(r.chunk_id);
+            if (result.changes > 0) physicallyDeleted++;
+          }
+        }
+      });
+      tx(stale);
+      // Invalidate cache for all physically-deleted ids.
+      for (const r of stale) this.chunkRowCache.delete(r.chunk_id);
+    }
+
+    return { softDeleted, physicallyDeleted };
+  }
+
+  /** Trim outcomes table to a rolling window. Append-only, can grow fast. */
+  pruneOutcomes(retentionDays: number = 30): number {
+    const result = this.conn
+      .prepare(`DELETE FROM outcomes WHERE created_at < datetime('now', ?)`)
+      .run(`-${retentionDays} days`);
+    return result.changes;
+  }
+
+  /**
+   * Cap memory_extractions to maxRows. Deletes oldest non-active rows first;
+   * 'active' extractions are preserved regardless of count to protect the
+   * audit trail for in-flight work.
+   */
+  capExtractions(maxRows: number = 50000): number {
+    let count: number;
+    try {
+      count = (this.conn.prepare('SELECT COUNT(*) as c FROM memory_extractions').get() as { c: number }).c;
+    } catch {
+      return 0; // table missing on first boot
+    }
+    if (count <= maxRows) return 0;
+    const overflow = count - maxRows;
+    const result = this.conn
+      .prepare(
+        `DELETE FROM memory_extractions
+         WHERE id IN (
+           SELECT id FROM memory_extractions
+           WHERE status != 'active'
+           ORDER BY extracted_at ASC
+           LIMIT ?
+         )`,
+      )
+      .run(overflow);
+    return result.changes;
+  }
+
+  /** Approximate SQLite database file size on disk, in bytes. */
+  dbSizeBytes(): number {
+    try {
+      return statSync(this.dbPath).size;
+    } catch {
+      return 0;
+    }
+  }
+
+  /**
+   * VACUUM the database. Reclaims space from deleted rows. Holds an
+   * exclusive lock for the duration — caller is expected to gate on
+   * idleness (see lastActivityAt).
+   */
+  vacuum(): { sizeBeforeBytes: number; sizeAfterBytes: number; durationMs: number } {
+    const sizeBeforeBytes = this.dbSizeBytes();
+    const start = Date.now();
+    this.conn.exec('VACUUM');
+    return {
+      sizeBeforeBytes,
+      sizeAfterBytes: this.dbSizeBytes(),
+      durationMs: Date.now() - start,
+    };
+  }
+
+  /**
+   * Most recent timestamp across the high-write activity tables, as a Unix
+   * milliseconds value. Returns null if all tables are empty. Used by the
+   * janitor's idle gate.
+   *
+   * Implementation note: SQLite's datetime() returns "YYYY-MM-DD HH:MM:SS"
+   * in UTC with no timezone marker — JS Date.parse interprets that as local
+   * time and skews by the offset. We compute the unix epoch in SQL to avoid
+   * the bug entirely.
+   */
+  lastActivityAt(): number | null {
+    try {
+      const row = this.conn
+        .prepare(
+          `SELECT MAX(unix_t) as last FROM (
+             SELECT CAST(strftime('%s', retrieved_at) AS INTEGER) as unix_t FROM recall_traces
+             UNION ALL
+             SELECT CAST(strftime('%s', accessed_at) AS INTEGER) as unix_t FROM access_log
+             UNION ALL
+             SELECT CAST(strftime('%s', created_at) AS INTEGER) as unix_t FROM transcripts
+           )`,
+        )
+        .get() as { last: number | null };
+      return row.last !== null && row.last !== undefined ? row.last * 1000 : null;
+    } catch {
+      return null;
+    }
   }
 
   // ── Timeline Query ─────────────────────────────────────────────
@@ -4421,6 +5189,136 @@ export class MemoryStore {
   }
 
   /**
+   * Aggregate memory-health snapshot for the dashboard.
+   *
+   * Single-pass queries over each table; cheap enough to call on every
+   * dashboard tab visit without caching. Adds graph stats only if a
+   * graphStore is supplied and reachable.
+   */
+  getMemoryHealth(opts: {
+    graphStore?: { isAvailable(): boolean; nodeCount?(): Promise<number>; edgeCount?(): Promise<number> };
+    topCitedLimit?: number;
+  } = {}): {
+    chunks: { total: number; consolidated: number; pinned: number; softDeleted: number; zombieCount: number };
+    chunksByCategory: Array<{ category: string | null; count: number }>;
+    tableRowCounts: Record<string, number>;
+    topCitedLast30d: Array<{ chunkId: number; sourceFile: string; section: string; refCount: number }>;
+    staleUserModelSlots: Array<{ slot: string; ageDays: number; agentSlug: string | null }>;
+    staleHighSalienceChunks: Array<{ chunkId: number; sourceFile: string; section: string; salience: number; lastOutcomeScore: number }>;
+    chunkCacheStats: ReturnType<HotCache<number, unknown>['stats']>;
+    writeQueue: { size: number; dropped: number } | null;
+    lastIntegrityReport: { ftsOk: boolean; ftsRebuilt: boolean; orphanRefsNulled: number; missingEmbeddings: number; ranAt: string } | null;
+    dbSizeBytes: number;
+    lastVacuumAt: string | null;
+  } {
+    const topLimit = opts.topCitedLimit ?? 10;
+
+    const chunkAgg = this.conn
+      .prepare(
+        `SELECT
+           COUNT(*) AS total,
+           COALESCE(SUM(CASE WHEN consolidated = 1 THEN 1 ELSE 0 END), 0) AS consolidated,
+           COALESCE(SUM(CASE WHEN pinned = 1 THEN 1 ELSE 0 END), 0) AS pinned
+         FROM chunks`,
+      )
+      .get() as { total: number; consolidated: number; pinned: number };
+
+    const softDeletedRow = this.conn
+      .prepare('SELECT COUNT(*) AS c FROM chunk_soft_deletes')
+      .get() as { c: number };
+
+    // Zombies: consolidated AND no access in last 30d (or never accessed at all).
+    const zombieRow = this.conn
+      .prepare(
+        `SELECT COUNT(*) AS c
+         FROM chunks c
+         LEFT JOIN (
+           SELECT chunk_id, MAX(accessed_at) AS la
+           FROM access_log GROUP BY chunk_id
+         ) a ON a.chunk_id = c.id
+         LEFT JOIN chunk_soft_deletes sd ON sd.chunk_id = c.id
+         WHERE c.consolidated = 1
+           AND sd.chunk_id IS NULL
+           AND (a.la IS NULL OR a.la < datetime('now', '-30 days'))`,
+      )
+      .get() as { c: number };
+
+    const byCategory = this.conn
+      .prepare(
+        `SELECT COALESCE(category, '(uncategorized)') AS category, COUNT(*) AS count
+         FROM chunks GROUP BY category ORDER BY count DESC`,
+      )
+      .all() as Array<{ category: string | null; count: number }>;
+
+    // Row counts for the high-write tables (cheap COUNT(*) per table).
+    const trackedTables = [
+      'chunks',
+      'chunks_fts',
+      'recall_traces',
+      'access_log',
+      'outcomes',
+      'transcripts',
+      'session_summaries',
+      'memory_extractions',
+      'chunk_soft_deletes',
+      'chunk_history',
+      'sdk_session_entries',
+      'wikilinks',
+    ];
+    const tableRowCounts: Record<string, number> = {};
+    for (const t of trackedTables) {
+      try {
+        const row = this.conn.prepare(`SELECT COUNT(*) AS c FROM ${t}`).get() as { c: number };
+        tableRowCounts[t] = row.c;
+      } catch {
+        tableRowCounts[t] = -1;
+      }
+    }
+
+    const topCited = this.conn
+      .prepare(
+        `SELECT o.chunk_id, c.source_file, c.section, COUNT(*) AS ref_count
+         FROM outcomes o
+         JOIN chunks c ON c.id = o.chunk_id
+         WHERE o.referenced = 1
+           AND o.created_at > datetime('now', '-30 days')
+         GROUP BY o.chunk_id
+         ORDER BY ref_count DESC
+         LIMIT ?`,
+      )
+      .all(topLimit) as Array<{ chunk_id: number; source_file: string; section: string; ref_count: number }>;
+
+    return {
+      chunks: {
+        total: chunkAgg.total,
+        consolidated: chunkAgg.consolidated,
+        pinned: chunkAgg.pinned,
+        softDeleted: softDeletedRow.c,
+        zombieCount: zombieRow.c,
+      },
+      chunksByCategory: byCategory,
+      tableRowCounts,
+      topCitedLast30d: topCited.map((r) => ({
+        chunkId: r.chunk_id,
+        sourceFile: r.source_file,
+        section: r.section,
+        refCount: r.ref_count,
+      })),
+      staleUserModelSlots: this.findStaleUserModelSlots(),
+      staleHighSalienceChunks: this.findStaleHighSalienceChunks({ limit: 10 }),
+      chunkCacheStats: this.chunkRowCache.stats(),
+      writeQueue: this.getWriteQueueStats(),
+      lastIntegrityReport: (() => {
+        const raw = this.getMaintenanceMeta('last_integrity_report');
+        if (!raw) return null;
+        try { return JSON.parse(raw); } catch { return null; }
+      })(),
+      dbSizeBytes: this.dbSizeBytes(),
+      lastVacuumAt: this.getMaintenanceMeta('last_vacuum_at'),
+    };
+  }
+
+  /**
    * Get consolidation stats for monitoring.
    */
   getConsolidationStats(): { totalChunks: number; consolidated: number; unconsolidated: number } {
@@ -4901,6 +5799,10 @@ export class MemoryStore {
    * Delete all chunks, wikilinks, file hash, and access log for a given file.
    */
   private deleteFileChunks(relPath: string): void {
+    // Capture chunk ids first so we can invalidate the LRU after the deletes.
+    const ids = this.conn
+      .prepare('SELECT id FROM chunks WHERE source_file = ?')
+      .all(relPath) as Array<{ id: number }>;
     // Delete access_log entries for chunks being removed (prevent orphans)
     this.conn
       .prepare('DELETE FROM access_log WHERE chunk_id IN (SELECT id FROM chunks WHERE source_file = ?)')
@@ -4908,6 +5810,7 @@ export class MemoryStore {
     this.conn.prepare('DELETE FROM chunks WHERE source_file = ?').run(relPath);
     this.conn.prepare('DELETE FROM wikilinks WHERE source_file = ?').run(relPath);
     this.conn.prepare('DELETE FROM file_hashes WHERE rel_path = ?').run(relPath);
+    for (const r of ids) this.chunkRowCache.delete(r.id);
   }
 
   /**

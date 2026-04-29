@@ -233,6 +233,21 @@ export const BUDGET = {
   reflection: undefined,
 };
 
+// ── Memory janitor (bounded-growth maintenance) ─────────────────────
+// Two-phase delete: consolidated chunks with low salience and no recent
+// access get soft-deleted, then physically deleted after a grace period.
+// Aux tables (recall_traces, access_log, outcomes) cap at a rolling window.
+// VACUUM runs at most once per N days, only when daemon is idle.
+export const MEMORY_JANITOR = {
+  consolidatedExpireDays: getEnvOrJsonNumber('MEMORY_CONSOLIDATED_EXPIRE_DAYS', undefined, 60),
+  consolidatedSalienceFloor: getEnvOrJsonNumber('MEMORY_CONSOLIDATED_SALIENCE_FLOOR', undefined, 0.2),
+  softDeleteGraceDays: getEnvOrJsonNumber('MEMORY_SOFT_DELETE_GRACE_DAYS', undefined, 14),
+  auxRetentionDays: getEnvOrJsonNumber('MEMORY_AUX_RETENTION_DAYS', undefined, 30),
+  extractionsMaxRows: getEnvOrJsonNumber('MEMORY_EXTRACTIONS_MAX_ROWS', undefined, 50000),
+  vacuumIntervalDays: getEnvOrJsonNumber('MEMORY_VACUUM_INTERVAL_DAYS', undefined, 7),
+  vacuumIdleSeconds: getEnvOrJsonNumber('MEMORY_VACUUM_IDLE_SECONDS', undefined, 300),
+};
+
 // ── Task budget caps (tokens per query) ──────────────────────────────
 // Passed to the Claude Agent SDK as `taskBudget: { total }`. The model is
 // told its remaining token budget so it can pace tool use and wrap up

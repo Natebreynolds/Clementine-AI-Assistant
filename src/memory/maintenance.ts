@@ -4,15 +4,95 @@
  * Runs startup and periodic maintenance so the memory store stays healthy
  * without manual intervention. New users get this out of the box.
  *
- * Startup: decay salience, prune stale data, backfill embeddings
- * Periodic (every 6h): full consolidation cycle + embedding rebuild
+ * Startup: decay salience, prune stale data, backfill embeddings, run janitor
+ * Periodic (every 6h): full consolidation cycle + embedding rebuild + janitor
+ *                      + idle-gated VACUUM at most once per week
  */
 
 import pino from 'pino';
+import { MEMORY_JANITOR } from '../config.js';
+import { runIntegrityProbes } from './integrity.js';
 
 const logger = pino({ name: 'clementine.maintenance' });
 
 const PERIODIC_INTERVAL_MS = 6 * 60 * 60 * 1000; // 6 hours
+const VACUUM_META_KEY = 'last_vacuum_at';
+
+/**
+ * Janitor pass — keeps the store bounded. Safe to call repeatedly.
+ * Idempotent within a single run; surfaces totals for logging.
+ */
+export function runJanitor(store: any): {
+  softDeleted: number;
+  physicallyDeleted: number;
+  outcomesPruned: number;
+  extractionsCapped: number;
+} {
+  let softDeleted = 0;
+  let physicallyDeleted = 0;
+  try {
+    const result = store.expireConsolidated?.({
+      expireDays: MEMORY_JANITOR.consolidatedExpireDays,
+      salienceFloor: MEMORY_JANITOR.consolidatedSalienceFloor,
+      graceDays: MEMORY_JANITOR.softDeleteGraceDays,
+    });
+    if (result) {
+      softDeleted = result.softDeleted;
+      physicallyDeleted = result.physicallyDeleted;
+    }
+  } catch (err) {
+    logger.warn({ err }, 'expireConsolidated failed');
+  }
+
+  let outcomesPruned = 0;
+  try {
+    outcomesPruned = store.pruneOutcomes?.(MEMORY_JANITOR.auxRetentionDays) ?? 0;
+  } catch (err) {
+    logger.warn({ err }, 'pruneOutcomes failed');
+  }
+
+  let extractionsCapped = 0;
+  try {
+    extractionsCapped = store.capExtractions?.(MEMORY_JANITOR.extractionsMaxRows) ?? 0;
+  } catch (err) {
+    logger.warn({ err }, 'capExtractions failed');
+  }
+
+  return { softDeleted, physicallyDeleted, outcomesPruned, extractionsCapped };
+}
+
+/**
+ * Run VACUUM if (a) it's been more than vacuumIntervalDays since the last
+ * one and (b) the store has been idle for at least vacuumIdleSeconds.
+ * Returns null when skipped, otherwise the size delta.
+ */
+export function maybeVacuum(store: any): {
+  sizeBeforeBytes: number;
+  sizeAfterBytes: number;
+  durationMs: number;
+} | null {
+  try {
+    const lastIso = store.getMaintenanceMeta?.(VACUUM_META_KEY) as string | null;
+    if (lastIso) {
+      const last = new Date(lastIso).getTime();
+      const ageMs = Date.now() - last;
+      if (ageMs < MEMORY_JANITOR.vacuumIntervalDays * 86_400_000) return null;
+    }
+
+    const lastActivity = store.lastActivityAt?.() as number | null;
+    if (lastActivity !== null && lastActivity !== undefined) {
+      const idleMs = Date.now() - lastActivity;
+      if (idleMs < MEMORY_JANITOR.vacuumIdleSeconds * 1000) return null;
+    }
+
+    const result = store.vacuum?.();
+    store.setMaintenanceMeta?.(VACUUM_META_KEY, new Date().toISOString());
+    return result ?? null;
+  } catch (err) {
+    logger.warn({ err }, 'VACUUM failed');
+    return null;
+  }
+}
 
 /**
  * Run one-time maintenance at daemon startup.
@@ -60,6 +140,32 @@ export async function runStartupMaintenance(store: any): Promise<void> {
     // Table may not exist yet — non-fatal
   }
 
+  // Janitor — bounded growth pass.
+  try {
+    const result = runJanitor(store);
+    if (result.softDeleted || result.physicallyDeleted || result.outcomesPruned || result.extractionsCapped) {
+      logger.info(result, 'Janitor pass complete');
+    }
+  } catch (err) {
+    logger.warn({ err }, 'Startup janitor failed');
+  }
+
+  // Embedding warm-up — pre-embed the most-cited chunks in the background so
+  // the first retrievals after startup don't pay cold-start latency. Fire
+  // and forget; never blocks startup.
+  if (typeof store.warmDenseEmbeddings === 'function') {
+    void (async () => {
+      try {
+        const result = await store.warmDenseEmbeddings(200);
+        if (result.warmed > 0) {
+          logger.info(result, 'Embedding warm-up complete');
+        }
+      } catch (err) {
+        logger.warn({ err }, 'Embedding warm-up failed');
+      }
+    })();
+  }
+
   logger.info({ durationMs: Date.now() - start }, 'Startup maintenance complete');
 }
 
@@ -96,7 +202,7 @@ export function startPeriodicMaintenance(
       try { store.buildEmbeddings?.(); } catch (err) { logger.warn({ err }, 'Post-consolidation embedding build failed'); }
     }
 
-    // 5. Extraction log pruning
+    // 5. Extraction log pruning (legacy 90-day rule retained alongside cap)
     try {
       const conn = store.conn;
       if (conn) {
@@ -107,6 +213,52 @@ export function startPeriodicMaintenance(
         ).run();
       }
     } catch { /* non-fatal */ }
+
+    // 6. Janitor — bounded growth.
+    try {
+      const result = runJanitor(store);
+      if (result.softDeleted || result.physicallyDeleted || result.outcomesPruned || result.extractionsCapped) {
+        logger.info(result, 'Janitor pass complete');
+      }
+    } catch (err) {
+      logger.warn({ err }, 'Periodic janitor failed');
+    }
+
+    // 6b. Integrity probes — FTS health, orphan derived_from, embedding gaps.
+    try {
+      const report = runIntegrityProbes(store);
+      // Persist for the dashboard so the "last integrity check" surface
+      // doesn't depend on log scraping.
+      try {
+        store.setMaintenanceMeta?.(
+          'last_integrity_report',
+          JSON.stringify({ ...report, ranAt: new Date().toISOString() }),
+        );
+      } catch { /* meta write is best-effort */ }
+      if (!report.ftsOk || report.ftsRebuilt || report.orphanRefsNulled > 0 || report.missingEmbeddings > 0) {
+        logger.info(report, 'Integrity probes complete');
+      }
+    } catch (err) {
+      logger.warn({ err }, 'Integrity probes failed');
+    }
+
+    // 7. VACUUM — idle-gated, at most once per vacuumIntervalDays.
+    try {
+      const vac = maybeVacuum(store);
+      if (vac) {
+        logger.info(
+          {
+            sizeBeforeBytes: vac.sizeBeforeBytes,
+            sizeAfterBytes: vac.sizeAfterBytes,
+            reclaimedBytes: vac.sizeBeforeBytes - vac.sizeAfterBytes,
+            durationMs: vac.durationMs,
+          },
+          'VACUUM complete',
+        );
+      }
+    } catch (err) {
+      logger.warn({ err }, 'Periodic VACUUM failed');
+    }
 
     logger.info({ durationMs: Date.now() - start }, 'Periodic maintenance complete');
   };
