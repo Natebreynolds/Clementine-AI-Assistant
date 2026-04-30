@@ -21135,8 +21135,8 @@ async function refreshMemoryHealth() {
       html += '<div style="font-weight:600;margin-bottom:4px">Retrieval running on sparse vectors for ' + missing.toLocaleString() + ' chunks</div>';
       html += '<div style="font-size:12px;color:var(--text-muted)">Backfill builds 768-dim neural embeddings for semantic search. First run downloads ~440MB.</div>';
       html += '</div>';
-      html += '<button class="btn-sm" onclick="memoryHealthAction(\'reembed-dense\', { limit: 200 })" title="Embed up to 200 chunks now">Backfill 200</button>';
-      html += '<button class="btn-sm" onclick="memoryHealthAction(\'reembed-dense\', { limit: 2000 })" title="Embed up to 2000 chunks now (slower)">Backfill 2000</button>';
+      html += '<button class="btn-sm" onclick="memoryHealthAction(\\'reembed-dense\\', { limit: 200 })" title="Embed up to 200 chunks now">Backfill 200</button>';
+      html += '<button class="btn-sm" onclick="memoryHealthAction(\\'reembed-dense\\', { limit: 2000 })" title="Embed up to 2000 chunks now (slower)">Backfill 2000</button>';
       html += '</div></div>';
     }
 
