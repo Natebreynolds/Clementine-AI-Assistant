@@ -4270,8 +4270,15 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
       // This replaces the hardcoded CURATED_TOOLKITS — slug typos are now
       // impossible because we render directly from Composio's data, and
       // newly-added services appear automatically.
-      const [catalog, connected, configured] = await Promise.all([
-        c.listAllToolkits(),
+      let catalog: Awaited<ReturnType<typeof c.listAllToolkits>> = [];
+      let catalogError: string | null = null;
+      try {
+        catalog = await c.listAllToolkits();
+      } catch (err) {
+        catalogError = (err as { message?: string })?.message ?? String(err);
+        console.error('[composio] catalog fetch failed:', catalogError);
+      }
+      const [connected, configured] = await Promise.all([
         c.listConnectedToolkits(),
         c.listToolkitSlugsWithAuthConfig(),
       ]);
@@ -4345,6 +4352,7 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
         toolkits,
         featured: featured.map(t => t.slug),
         totalCount: toolkits.length,
+        catalogError,
       });
     } catch (err) {
       res.status(500).json({ error: String(err) });
@@ -25642,7 +25650,18 @@ async function refreshComposioConnections() {
     }
     var toolkits = d.toolkits || [];
     if (toolkits.length === 0) {
-      container.innerHTML = '<div class="empty-state" style="padding:16px">No toolkits available. Check that your Composio API key is valid.</div>';
+      // Distinguish "catalog fetch failed" from "user has nothing connected".
+      // Surfacing d.catalogError tells us if Composio rejected the catalog
+      // call (different permission than connectedAccounts.list, etc.).
+      var msg = d.catalogError
+        ? 'Could not load toolkits from Composio: <code style="color:var(--red);font-size:11px">' + esc(d.catalogError) + '</code>'
+        : 'Composio returned an empty toolkit catalog. This is unusual — try refreshing.';
+      container.innerHTML =
+        '<div style="padding:16px">' +
+        '<div style="margin-bottom:12px;font-size:13px">' + msg + '</div>' +
+        '<div style="font-size:11px;color:var(--text-muted);margin-bottom:12px">If your existing connections (e.g. Outlook) work via the agent, your API key is valid — the catalog endpoint may require a different permission tier or there\\'s a transient API issue.</div>' +
+        '<button class="btn btn-sm btn-primary" onclick="refreshComposioConnections()">Retry</button>' +
+        '</div>';
       return;
     }
     // Stash full catalog in a closure so the search input can re-render

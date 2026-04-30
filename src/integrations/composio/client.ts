@@ -446,70 +446,110 @@ const CATALOG_TTL_MS = 60 * 60 * 1000; // 1h — catalog drifts very slowly
  * static CURATED_TOOLKITS array as the source of truth for the dashboard
  * Connections panel — slug typos are now impossible because we render from
  * Composio's own data, and new services appear automatically as they're
- * added. Cached at module level for 1 hour; resetComposioClient() clears
- * the cache when the API key changes.
+ * added. Cached at module level for 1 hour on success; failures don't
+ * cache (so the next request retries instead of returning stale empty).
  */
 export async function listAllToolkits(): Promise<CatalogToolkit[]> {
   const now = Date.now();
-  if (catalogCache && now - catalogCache.at < CATALOG_TTL_MS) {
+  if (catalogCache && catalogCache.data.length > 0 && now - catalogCache.at < CATALOG_TTL_MS) {
     return catalogCache.data;
   }
   const composio = getComposio();
   if (!composio) return [];
 
-  const out: CatalogToolkit[] = [];
-  let cursor: string | undefined;
-  // Bounded loop — 30 pages × 500 items = 15K ceiling, far more than any
-  // realistic catalog. Composio currently returns ~1.5K items across 3
-  // pages, but the cap makes a runaway impossible.
-  for (let page = 0; page < 30; page++) {
+  // Try the raw client first — supports cursor pagination so we get the full
+  // 1000+ catalog. If that errors (some API keys / plans restrict it), fall
+  // back to the high-level wrapper which returns up to 500 in one shot.
+  let result: CatalogToolkit[] = [];
+  let lastError: unknown = null;
+  try {
+    result = await fetchCatalogViaRawClient(composio);
+  } catch (err) {
+    lastError = err;
+    logger.warn({ err }, 'Raw-client toolkit list failed — falling back to high-level wrapper');
+  }
+  if (result.length === 0) {
     try {
-      const rawClient = (composio as any).client;
-      const resp = await rawClient.toolkits.list({
-        limit: 500,
-        ...(cursor ? { cursor } : {}),
-      });
-      const items = (resp?.items ?? []) as Array<{
-        slug: string;
-        name: string;
-        meta?: {
-          logo?: string;
-          description?: string;
-          toolsCount?: number;
-          tools_count?: number;
-          categories?: Array<{ slug: string; name: string }>;
-        };
-        composioManagedAuthSchemes?: string[];
-        composio_managed_auth_schemes?: string[];
-        authSchemes?: string[];
-        auth_schemes?: string[];
-        noAuth?: boolean;
-        no_auth?: boolean;
-      }>;
-      for (const it of items) {
-        const managed = (it.composioManagedAuthSchemes ?? it.composio_managed_auth_schemes ?? []) as string[];
-        const schemes = (it.authSchemes ?? it.auth_schemes ?? []) as string[];
-        const noAuth = it.noAuth ?? it.no_auth ?? false;
-        out.push({
-          slug: it.slug,
-          name: it.name,
-          logoUrl: it.meta?.logo,
-          description: it.meta?.description,
-          toolsCount: it.meta?.toolsCount ?? it.meta?.tools_count,
-          authMode: noAuth ? 'none' : (managed.length > 0 ? 'managed' : (schemes.length > 0 ? 'byo' : 'none')),
-          categories: it.meta?.categories ?? [],
-        });
-      }
-      cursor = resp?.next_cursor ?? resp?.nextCursor;
-      if (!cursor || items.length === 0) break;
+      result = await fetchCatalogViaWrapper(composio);
     } catch (err) {
-      logger.warn({ err, page }, 'listAllToolkits page failed — stopping pagination');
-      break;
+      lastError = err;
+      logger.error({ err }, 'High-level toolkit list also failed');
     }
   }
-  catalogCache = { at: now, data: out };
-  logger.info({ count: out.length }, 'Composio catalog fetched');
+
+  if (result.length === 0) {
+    // Surface whichever error we hit so the dashboard can render something
+    // actionable instead of "no toolkits available".
+    const detail = (lastError as { message?: string })?.message ?? 'Unknown error';
+    throw new Error(`Composio catalog fetch failed: ${detail}`);
+  }
+
+  catalogCache = { at: now, data: result };
+  logger.info({ count: result.length }, 'Composio catalog fetched');
+  return result;
+}
+
+interface RawCatalogItem {
+  slug: string;
+  name: string;
+  meta?: {
+    logo?: string;
+    description?: string;
+    toolsCount?: number;
+    tools_count?: number;
+    categories?: Array<{ slug: string; name: string }>;
+  };
+  composioManagedAuthSchemes?: string[];
+  composio_managed_auth_schemes?: string[];
+  authSchemes?: string[];
+  auth_schemes?: string[];
+  noAuth?: boolean;
+  no_auth?: boolean;
+}
+
+function normalizeCatalogItem(it: RawCatalogItem): CatalogToolkit {
+  const managed = (it.composioManagedAuthSchemes ?? it.composio_managed_auth_schemes ?? []) as string[];
+  const schemes = (it.authSchemes ?? it.auth_schemes ?? []) as string[];
+  const noAuth = it.noAuth ?? it.no_auth ?? false;
+  return {
+    slug: it.slug,
+    name: it.name,
+    logoUrl: it.meta?.logo,
+    description: it.meta?.description,
+    toolsCount: it.meta?.toolsCount ?? it.meta?.tools_count,
+    authMode: noAuth ? 'none' : (managed.length > 0 ? 'managed' : (schemes.length > 0 ? 'byo' : 'none')),
+    categories: it.meta?.categories ?? [],
+  };
+}
+
+async function fetchCatalogViaRawClient(
+  composio: NonNullable<ReturnType<typeof getComposio>>,
+): Promise<CatalogToolkit[]> {
+  const out: CatalogToolkit[] = [];
+  let cursor: string | undefined;
+  // Bounded loop — 30 pages × 500 items = 15K ceiling.
+  for (let page = 0; page < 30; page++) {
+    const rawClient = (composio as any).client;
+    const resp = await rawClient.toolkits.list({
+      limit: 500,
+      ...(cursor ? { cursor } : {}),
+    });
+    const items = (resp?.items ?? []) as RawCatalogItem[];
+    for (const it of items) out.push(normalizeCatalogItem(it));
+    cursor = resp?.next_cursor ?? resp?.nextCursor;
+    if (!cursor || items.length === 0) break;
+  }
   return out;
+}
+
+async function fetchCatalogViaWrapper(
+  composio: NonNullable<ReturnType<typeof getComposio>>,
+): Promise<CatalogToolkit[]> {
+  // High-level wrapper returns an array (up to limit). No cursor support
+  // through this path, so we cap at the documented max. Better than zero.
+  const resp = await composio.toolkits.get({ limit: 500 });
+  const items = (Array.isArray(resp) ? resp : ((resp as { items?: unknown[] })?.items ?? [])) as RawCatalogItem[];
+  return items.map(normalizeCatalogItem);
 }
 
 async function fetchAllToolkitMeta(): Promise<Map<string, ToolkitMeta>> {
