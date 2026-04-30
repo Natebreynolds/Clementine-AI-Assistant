@@ -12536,8 +12536,8 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
 
         <!-- User Model — MemGPT-style core memory blocks always loaded into context -->
         <div class="tab-pane" id="tab-intelligence-user-model">
-          <div style="color:var(--muted,#888);margin-bottom:12px;font-size:13px">
-            What the agent always knows about you. These slots load into every conversation's context (above retrieved memory). Edit directly to correct or steer.
+          <div style="color:var(--muted,#888);margin-bottom:12px;font-size:13px;max-width:760px">
+            <strong style="color:var(--text)">Always-in-context core memory.</strong> Four small slots (capped at 2000 chars each) that load into <em>every</em> conversation — distinct from MEMORY.md and the chunk store. The agent appends here automatically as you talk; you can also edit directly to correct or steer. Use the Scope dropdown to view per-agent slots (each hired agent maintains their own).
           </div>
           <div style="display:flex;gap:8px;margin-bottom:12px;align-items:center;flex-wrap:wrap">
             <label style="font-size:13px;color:var(--text-secondary)">Scope:</label>
@@ -18998,7 +18998,20 @@ async function loadUserModel() {
       relationships: 'People, projects, channels they regularly interact with.',
       agent_persona: 'For multi-agent: this agent\\'s self-identity in its working relationship with the user.',
     };
+    // First-run hint: when every slot is empty, show a single explainer
+    // banner above the (still editable) textareas so the user understands
+    // both what this is and how to populate it. Suppressed once anything
+    // is in place — at that point the metadata on each card is enough.
+    var allEmpty = d.blocks.every(function(b) { return !(b.content || '').trim(); });
     var html = '<div style="display:flex;flex-direction:column;gap:14px">';
+    if (allEmpty) {
+      html += '<div class="card" style="padding:14px;border-left:3px solid var(--accent,#f59e0b);background:var(--bg-input,#1a1a1a)">' +
+        '<div style="font-weight:600;margin-bottom:6px">No core memory yet for this scope</div>' +
+        '<div style="font-size:12px;color:var(--text-secondary);line-height:1.5">' +
+          'These slots auto-populate as you chat — the agent extracts durable facts about you (your role, active goals, recurring people/projects) and appends them after each exchange. ' +
+          'You can also seed from existing memory in one click, or type directly into any slot below and click Save.' +
+        '</div></div>';
+    }
     for (var i = 0; i < d.blocks.length; i++) {
       var b = d.blocks[i];
       var label = labelMap[b.slot] || b.slot;

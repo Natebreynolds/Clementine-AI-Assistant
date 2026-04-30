@@ -444,13 +444,20 @@ const AUTO_MEMORY_PROMPT = `You are a memory extraction agent. Your ONLY job is 
 
 {current_memory}
 
+## Current User Model (already known — DO NOT re-extract these)
+
+{current_user_model}
+
 ## Where to save what (memory routing):
 
 **Always-in-context core memory** (use the user_model tool — these stay top-of-mind in every future session):
 - **Lasting facts about ${OWNER}** (role, location, identifiers, durable preferences, communication style) → user_model(action="append", slot="user_facts", content=...)
 - **Active goals/intents** (what ${OWNER} is trying to accomplish right now) → user_model(action="append", slot="goals", content=...)
 - **Key people/projects** (recurring relationships) → user_model(action="append", slot="relationships", content=...)
-- Use action="replace" instead of "append" if you're updating an existing fact rather than adding a new one. Slots are capped at 2000 chars — older content rolls off on append.
+- **DEFAULT to action="append"** — it adds the new fact alongside what's already there.
+- Only use action="replace" when CORRECTING an existing fact, and you MUST include the FULL slot content (everything from "Current User Model" above, with the correction applied). \`replace\` overwrites the entire slot — passing only the new fact wipes everything else.
+- Never use action="clear" from this extractor. Clearing is a deliberate user action, not a memory-extraction outcome.
+- Slots are capped at 2000 chars — older content rolls off on append automatically.
 
 **Vault notes** (use memory_write/note_create — durable but retrieved on demand):
 - **People mentioned** — names, relationships, context → create or update person notes in 02-People/
@@ -1850,6 +1857,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
       'Read', 'Write', 'Edit', 'Bash', 'Glob', 'Grep',
       'WebSearch', 'WebFetch',
       mcpTool('working_memory'),
+      mcpTool('user_model'),
       mcpTool('memory_read'),
       mcpTool('memory_write'),
       mcpTool('memory_search'),
@@ -4005,10 +4013,22 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
         }
       }
 
+      // Render current user_model state so the extractor can: (a) skip
+      // re-extracting facts already there, (b) safely use action="replace"
+      // by passing the full slot content with a correction applied. Scoped
+      // to the active agent — Clementine sees global slots, hired agents
+      // see their own per-agent slots.
+      let currentUserModel = '(empty — no slots populated yet)';
+      try {
+        const rendered = this.memoryStore?.renderUserModel?.(profile?.slug ?? null);
+        if (rendered && rendered.trim()) currentUserModel = rendered;
+      } catch { /* non-fatal */ }
+
       const memPrompt = AUTO_MEMORY_PROMPT
         .replace('{user_message}', userMessage)
         .replace('{assistant_response}', truncatedResponse)
         .replace('{current_memory}', currentMemory || '(empty — no existing memory yet)')
+        .replace('{current_user_model}', currentUserModel)
         .replace('{recent_corrections}', correctionsText);
 
       const userMessageSnippet = userMessage.slice(0, 500);
@@ -4030,6 +4050,13 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
             mcpTool('task_add'),
             mcpTool('note_take'),
             mcpTool('memory_read'),
+            // Auto-extractor needs user_model to populate the always-in-context
+            // core slots (user_facts, goals, relationships, agent_persona).
+            // The MCP server boots with CLEMENTINE_TEAM_AGENT=<slug>, so writes
+            // are scoped to the active agent automatically — Clementine's
+            // sessions populate global slots, hired-agent sessions populate
+            // that agent's per-agent slots.
+            mcpTool('user_model'),
           ],
           mcpServers: {
             [TOOLS_SERVER]: {
