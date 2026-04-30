@@ -103,7 +103,7 @@ function maybeResolveRef(value: string | undefined): string | undefined {
  * Keychain refs in either source are resolved lazily; failed resolution
  * falls through to the fallback rather than returning the literal stub.
  */
-function getEnv(key: string, fallback = ''): string {
+export function getEnv(key: string, fallback = ''): string {
   const fromLocal = maybeResolveRef(env[key]);
   if (fromLocal !== undefined && fromLocal !== '') return fromLocal;
   const fromProcess = maybeResolveRef(process.env[key]);

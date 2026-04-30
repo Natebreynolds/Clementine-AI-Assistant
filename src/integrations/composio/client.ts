@@ -16,8 +16,20 @@
 import { Composio } from '@composio/core';
 import { ClaudeAgentSDKProvider } from '@composio/claude-agent-sdk';
 import pino from 'pino';
+import { getEnv } from '../../config.js';
 
 const logger = pino({ name: 'clementine.composio' });
+
+// `process.env` is intentionally NOT populated from .env (config.ts keeps
+// secrets out of the SDK subprocess). Reading process.env.COMPOSIO_API_KEY
+// directly works during the dashboard's hot-reload (PUT handler mutates
+// process.env), but is empty after a fresh daemon restart even if the key
+// is in .env. Use this helper everywhere we read Composio env vars: it
+// prefers process.env (hot-reload from dashboard) and falls back to the
+// .env file via getEnv (survives restarts).
+function readComposioEnv(key: string): string {
+  return process.env[key] || getEnv(key, '');
+}
 
 export type ToolkitAuthMode = 'managed' | 'byo';
 
@@ -66,7 +78,7 @@ let singleton: Composio<ClaudeAgentSDKProvider> | null = null;
 
 export function getComposio(): Composio<ClaudeAgentSDKProvider> | null {
   if (singleton) return singleton;
-  const apiKey = process.env.COMPOSIO_API_KEY;
+  const apiKey = readComposioEnv('COMPOSIO_API_KEY');
   if (!apiKey) return null;
   singleton = new Composio<ClaudeAgentSDKProvider>({
     apiKey,
@@ -76,7 +88,7 @@ export function getComposio(): Composio<ClaudeAgentSDKProvider> | null {
 }
 
 export function isComposioEnabled(): boolean {
-  return Boolean(process.env.COMPOSIO_API_KEY);
+  return Boolean(readComposioEnv('COMPOSIO_API_KEY'));
 }
 
 /**
@@ -108,7 +120,7 @@ export async function getPreferredUserId(): Promise<string> {
 const DEFAULT_NEW_CONNECTION_USER_ID = 'default';
 
 export function clementineUserId(): string {
-  return process.env.COMPOSIO_USER_ID ?? DEFAULT_NEW_CONNECTION_USER_ID;
+  return readComposioEnv('COMPOSIO_USER_ID') || DEFAULT_NEW_CONNECTION_USER_ID;
 }
 
 // Cached after first detection — avoids extra API calls per authorize.
@@ -117,7 +129,8 @@ let detectedPreferredUserId: string | null = null;
 async function detectPreferredUserId(
   composio: NonNullable<ReturnType<typeof getComposio>>,
 ): Promise<string> {
-  if (process.env.COMPOSIO_USER_ID) return process.env.COMPOSIO_USER_ID;
+  const explicit = readComposioEnv('COMPOSIO_USER_ID');
+  if (explicit) return explicit;
   if (detectedPreferredUserId) return detectedPreferredUserId;
   try {
     const resp = await composio.connectedAccounts.list({ limit: 100 });
