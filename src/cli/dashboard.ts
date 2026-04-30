@@ -3008,13 +3008,14 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
 
   app.post('/api/builder/workflows', async (req, res) => {
     try {
-      const body = req.body as { name?: string; description?: string; schedule?: string; initialPrompt?: string };
+      const body = req.body as { name?: string; description?: string; schedule?: string; initialPrompt?: string; agent?: string };
       if (!body || !body.name) { res.status(400).json({ error: 'name required' }); return; }
       const [{ saveWorkflow, workflowId }, { emitBuilderEvent }] = await Promise.all([
         import('../dashboard/builder/serializer.js'),
         import('../dashboard/builder/events.js'),
       ]);
       const slug = body.name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 64) || 'workflow';
+      const agentSlug = body.agent ? (String(body.agent).trim() || undefined) : undefined;
       const wf = {
         name: body.name,
         description: body.description ?? '',
@@ -3029,8 +3030,9 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
           maxTurns: 15,
         }],
         sourceFile: '',
+        agentSlug,
       };
-      const id = workflowId(slug);
+      const id = workflowId(slug, agentSlug);
       const result = saveWorkflow(id, wf);
       if (!result.ok) { res.status(400).json({ error: result.error }); return; }
       emitBuilderEvent({ type: 'workflow:created', workflowId: id, payload: { workflow: wf } });
@@ -12243,6 +12245,10 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
           <option value="agent">agent</option>
           <option value="workflow">workflow</option>
         </select>
+        <label style="font-size:11px;color:var(--text-muted);font-weight:500;letter-spacing:0.04em;text-transform:uppercase">Owner</label>
+        <select id="builder-owner" onchange="onBuilderOwnerChange()" title="Filter and create scoped to this owner" style="padding:4px 8px;border:1px solid var(--border);border-radius:6px;background:var(--bg-secondary);color:var(--text-primary);font-size:12px;min-width:160px">
+          <option value="">Clementine (global)</option>
+        </select>
         <span id="builder-agent-label" style="padding:0;font-size:13px;color:var(--text-secondary);font-weight:500"></span>
         <input type="hidden" id="builder-agent" value="">
         <span style="flex:1"></span>
@@ -15092,6 +15098,12 @@ function switchBuildTab(tab) {
     if (typeof _ensureDrawflowLoaded === 'function') {
       _ensureDrawflowLoaded().catch(function() { /* */ });
     }
+    // Populate the Owner picker once per session — agents rarely change
+    // mid-session, so the cost is minimal and the dropdown is ready by
+    // the time the user clicks New.
+    if (typeof populateBuilderOwnerPicker === 'function') {
+      populateBuilderOwnerPicker().catch(function() { /* */ });
+    }
     // Focus chat input
     setTimeout(function() {
       var bi = document.getElementById('builder-input');
@@ -15100,10 +15112,10 @@ function switchBuildTab(tab) {
   }
 }
 
-// "New" button in the Build header strip — context-aware: prompts for a
-// name and creates the right artifact for the active tab. Workflows + Crons
-// route through the workflow_create surface; Skills falls back to the
-// existing chat-based Skill Studio reset.
+// "New" button in the Build header strip — context-aware. Crons open the
+// dedicated cron modal so the entry lands in CRON.md (not as a one-step
+// workflow file). Workflows route through /api/builder/workflows. Owner is
+// read from the header's Owner picker — empty string means global.
 async function newFromBuildHeader() {
   var activeTab = document.querySelector('#build-tabs button.active')?.getAttribute('data-build-tab') || 'workflows';
   if (activeTab === 'skills') {
@@ -15116,20 +15128,70 @@ async function newFromBuildHeader() {
     toast('Pick a template to fork from the cards.', 'info');
     return;
   }
-  var noun = activeTab === 'crons' ? 'cron' : 'workflow';
-  var name = prompt('Name your new ' + noun + ':');
+  var owner = (document.getElementById('builder-owner') || {}).value || '';
+  if (activeTab === 'crons') {
+    if (typeof openCreateCronModal === 'function') {
+      openCreateCronModal(owner);
+      return;
+    }
+  }
+  var name = prompt('Name your new workflow:');
   if (!name || !name.trim()) return;
   try {
     var body = { name: name.trim() };
-    if (activeTab === 'crons') body.schedule = '0 9 * * *';  // sensible default; user edits in canvas
+    if (owner) body.agent = owner;
     var r = await apiJson('POST', '/api/builder/workflows', body);
     if (r && r.error) { toast('Create failed: ' + r.error, 'error'); return; }
     if (r && r.id) {
-      await refreshBuilderCanvasPicker(activeTab === 'crons' ? 'cron' : 'workflow');
+      await refreshBuilderCanvasPicker('workflow');
       await openBuilderWorkflow(r.id);
-      toast('Created ' + noun + ': ' + name, 'success');
+      toast('Created workflow: ' + name + (owner ? ' (' + owner + ')' : ''), 'success');
     }
   } catch (err) { toast('Create error: ' + err, 'error'); }
+}
+
+// Owner picker — populated from /api/agents on first build-tab activation
+// and refreshed on demand. Empty value = Clementine/global; any other value
+// is the agent slug for scoped reads/writes.
+var _builderOwnerPickerLoaded = false;
+async function populateBuilderOwnerPicker(force) {
+  if (_builderOwnerPickerLoaded && !force) return;
+  var sel = document.getElementById('builder-owner');
+  if (!sel) return;
+  try {
+    var r = await apiFetch('/api/agents');
+    var agents = r.ok ? await r.json() : [];
+    var prev = sel.value;
+    var opts = '<option value="">Clementine (global)</option>';
+    if (Array.isArray(agents)) {
+      for (var i = 0; i < agents.length; i++) {
+        var slug = agents[i] && agents[i].slug;
+        if (!slug) continue;
+        var label = agents[i].name ? (agents[i].name + ' (' + slug + ')') : slug;
+        opts += '<option value="' + esc(slug) + '">' + esc(label) + '</option>';
+      }
+    }
+    sel.innerHTML = opts;
+    if (prev) sel.value = prev;
+    _builderOwnerPickerLoaded = true;
+  } catch (err) {
+    // Leave the default global option in place; not fatal.
+  }
+}
+
+// Mirror the visible owner selection into the legacy hidden builder-agent
+// input + label so chat/skill/agent flows that already read those keep
+// working, then refresh the canvas picker so the list re-filters.
+async function onBuilderOwnerChange() {
+  var sel = document.getElementById('builder-owner');
+  var owner = sel ? sel.value : '';
+  var hidden = document.getElementById('builder-agent');
+  var label = document.getElementById('builder-agent-label');
+  if (hidden) hidden.value = owner || '';
+  if (label) label.textContent = owner ? 'Owner: ' + owner : '';
+  var typeSel = document.getElementById('builder-type');
+  var type = typeSel && typeSel.value === 'cron' ? 'cron' : 'workflow';
+  await refreshBuilderCanvasPicker(type);
 }
 
 // ── Build templates: fork a starter pattern into a new workflow ─────
@@ -19340,10 +19402,19 @@ async function refreshBuilderCanvasPicker(type) {
   var picker = document.getElementById('builder-canvas-picker');
   if (!picker) return;
   try {
+    var owner = (document.getElementById('builder-owner') || {}).value || '';
     var r = await apiFetch('/api/builder/workflows');
     var d = await r.json();
-    var items = (d.workflows || []).filter(function(w) { return w.origin === type; });
-    var opts = '<option value="">' + (items.length ? '— pick a ' + type + ' —' : '(none yet)') + '</option>';
+    var items = (d.workflows || []).filter(function(w) {
+      if (w.origin !== type) return false;
+      // Owner filter: empty owner = Clementine/global only; named owner =
+      // agent-scoped entries for that slug only. The serializer reports
+      // scope='agent' for entries living under <AGENTS_DIR>/<slug>/.
+      if (owner) return w.scope === 'agent' && w.agentSlug === owner;
+      return w.scope !== 'agent';
+    });
+    var ownerLabel = owner ? '@' + owner : 'global';
+    var opts = '<option value="">' + (items.length ? '— pick a ' + type + ' (' + ownerLabel + ') —' : '(none yet for ' + ownerLabel + ')') + '</option>';
     for (var i = 0; i < items.length; i++) {
       var w = items[i];
       var lbl = w.name + (w.schedule ? '  ·  ' + w.schedule : '') + (w.enabled ? '' : '  · off');

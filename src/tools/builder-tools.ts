@@ -62,18 +62,26 @@ export function registerBuilderTools(server: McpServer): void {
 
 server.tool(
   'workflow_list',
-  'List all workflows and crons visible in the Builder. Returns one per line: id|name|origin|enabled|schedule|stepCount.',
+  'List all workflows and crons visible in the Builder. Returns one per line: id|name|origin|owner|enabled|schedule|stepCount. Owner is "global" or "@<agentSlug>".',
   {
     enabledOnly: z.boolean().optional().describe('If true, return only enabled workflows'),
+    owner: z.string().optional().describe('Filter by owner: "global", "<agentSlug>", or "@<agentSlug>". Omit to include all.'),
     verbose: z.boolean().optional(),
   },
-  async ({ enabledOnly, verbose }) => {
-    const items = listAllForBuilder().filter(i => !enabledOnly || i.enabled);
+  async ({ enabledOnly, owner, verbose }) => {
+    const ownerFilter = owner ? owner.replace(/^@/, '') : null;
+    const items = listAllForBuilder().filter(i => {
+      if (enabledOnly && !i.enabled) return false;
+      if (ownerFilter == null) return true;
+      if (ownerFilter === 'global') return i.scope === 'global';
+      return i.scope === 'agent' && i.agentSlug === ownerFilter;
+    });
     if (verbose) return textResult(JSON.stringify(items, null, 2));
     if (items.length === 0) return textResult('(no workflows or crons found)');
-    return textResult(items.map(i =>
-      `${i.id}|${i.name}|${i.origin}|${i.enabled ? 'on' : 'off'}|${i.schedule ?? '-'}|${i.stepCount}step${i.stepCount === 1 ? '' : 's'}`
-    ).join('\n'));
+    return textResult(items.map(i => {
+      const ownerCol = i.scope === 'agent' ? '@' + (i.agentSlug ?? '?') : 'global';
+      return `${i.id}|${i.name}|${i.origin}|${ownerCol}|${i.enabled ? 'on' : 'off'}|${i.schedule ?? '-'}|${i.stepCount}step${i.stepCount === 1 ? '' : 's'}`;
+    }).join('\n'));
   },
 );
 
