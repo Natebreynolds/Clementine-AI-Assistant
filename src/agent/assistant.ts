@@ -1243,8 +1243,13 @@ export class PersonalAssistant {
     model?: string | null;
     verboseLevel?: VerboseLevel;
     intentClassification?: IntentClassification | null;
+    /** Slugs of Composio toolkits with at least one active connection. The
+     *  agent gets a preference rule pointing it to these tools over the
+     *  Claude Desktop counterparts (mcp__claude_ai_*) for overlapping
+     *  services like Outlook/M365, Gmail, Google Drive, Slack, etc. */
+    composioConnectedSlugs?: string[];
   } = {}): { stable: string; volatile: string } {
-    const { isHeartbeat = false, cronTier = null, retrievalContext = '', profile = null, sessionKey = null, model = null, verboseLevel, intentClassification = null } = opts;
+    const { isHeartbeat = false, cronTier = null, retrievalContext = '', profile = null, sessionKey = null, model = null, verboseLevel, intentClassification = null, composioConnectedSlugs = [] } = opts;
     const isAutonomous = isHeartbeat || cronTier !== null;
     // `parts` = stable prefix (cacheable across turns). `volatileParts` =
     // suffix that changes per-turn (date/time, live integration status).
@@ -1727,6 +1732,28 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
       } catch { /* non-fatal */ }
     }
 
+    // Composio tool preference — when a Composio toolkit has an active
+    // connection AND a Claude Desktop equivalent exists, the agent tends to
+    // default to the Claude Desktop tool (mcp__claude_ai_*) because those
+    // names appear in Claude's training and feel familiar. The Composio
+    // versions (mcp__<slug>__*) usually have broader scope (full inbox vs.
+    // limited preview, write access vs. read-only, etc.), so we explicitly
+    // steer toward them when present. Only emitted when at least one
+    // connection is live — otherwise it's noise.
+    if (composioConnectedSlugs.length > 0) {
+      const slugs = composioConnectedSlugs.slice().sort().join(', ');
+      volatileParts.push(
+        `## Composio Tools (Preferred)\n\n` +
+        `Connected Composio toolkits: ${slugs}.\n\n` +
+        `**Always prefer the Composio tool over the Claude Desktop equivalent** when both are available for the same service:\n` +
+        `- For Outlook/email: use \`mcp__outlook__*\` (NOT \`mcp__claude_ai_Microsoft_365__*\`)\n` +
+        `- For Gmail: use \`mcp__gmail__*\` (NOT \`mcp__claude_ai_Gmail__*\`)\n` +
+        `- For Google Drive: use \`mcp__googledrive__*\` (NOT \`mcp__claude_ai_Google_Drive__*\`)\n` +
+        `- For Google Calendar/Sheets/Docs/Slack/Notion/etc.: same pattern — Composio first.\n\n` +
+        `Why: Composio tools have broader scope (full inbox/file access, write capabilities) and are tied to OAuth tokens you control directly. Use Claude Desktop tools only as fallback when no Composio equivalent is connected.`,
+      );
+    }
+
     // Conversational context — same signals the insight engine surfaces
     // proactively (Phase 10), but injected directly into the agent's prompt
     // so it can adjust its own approach. Scoped to chat sessions because
@@ -2065,8 +2092,28 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
     // (added in @anthropic-ai/claude-agent-sdk 0.2.119) tells the prompt
     // cache exactly where the boundary is, so cross-turn cache hits work
     // even when our per-turn goals/memory block changes.
+    // Composio toolkits — build first so we can pass connected slugs into
+    // buildSystemPrompt for the "prefer Composio over claude.ai" rule.
+    // Each connected toolkit becomes an in-process MCP server
+    // (mcp__gmail__*, mcp__slack__*, …). Profile-level allowlist
+    // (profile.allowedComposioToolkits) constrains which toolkits this
+    // agent sees; omit to surface every active connection.
+    let composioMcpServers: Record<string, any> = {};
+    if (!disableAllTools && !isPlanStep) {
+      try {
+        const { buildComposioMcpServers } = await import('../integrations/composio/mcp-bridge.js');
+        const allowList = (profile as { allowedComposioToolkits?: string[] } | null | undefined)?.allowedComposioToolkits;
+        composioMcpServers = await buildComposioMcpServers(allowList);
+      } catch (err) {
+        // Composio is purely additive — never block the agent if it fails.
+        logger.debug({ err }, 'Composio MCP servers unavailable');
+      }
+    }
+    const composioConnectedSlugs = Object.keys(composioMcpServers);
+
     const { stable, volatile: volatilePromptPart } = this.buildSystemPrompt({
       isHeartbeat, cronTier: isPlanStep ? null : cronTier, retrievalContext, profile, sessionKey, model, verboseLevel, intentClassification,
+      composioConnectedSlugs,
     });
 
     const stablePrefixParts = [stable, securityPrompt]
@@ -2155,22 +2202,6 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
         externalMcpServers = _mcpBridge.getMcpServersForAgent(profile?.allowedMcpServers);
       }
     } catch { /* non-fatal — run with just Clementine's own server */ }
-
-    // Composio toolkits — each connected toolkit becomes an in-process MCP
-    // server (mcp__gmail__*, mcp__slack__*, …). Profile-level allowlist
-    // (profile.allowedComposioToolkits) constrains which toolkits this agent
-    // sees; omit it to surface every active connection.
-    let composioMcpServers: Record<string, any> = {};
-    if (!disableAllTools && !isPlanStep) {
-      try {
-        const { buildComposioMcpServers } = await import('../integrations/composio/mcp-bridge.js');
-        const allowList = (profile as { allowedComposioToolkits?: string[] } | null | undefined)?.allowedComposioToolkits;
-        composioMcpServers = await buildComposioMcpServers(allowList);
-      } catch (err) {
-        // Composio is purely additive — never block the agent if it fails.
-        logger.debug({ err }, 'Composio MCP servers unavailable');
-      }
-    }
 
     // Permission mode: always 'bypassPermissions' — this is a daemon/harness with no interactive
     // terminal, so 'auto' mode (which requires plan support + human approval) doesn't apply.
