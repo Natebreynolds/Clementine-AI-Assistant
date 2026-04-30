@@ -25696,9 +25696,10 @@ async function saveComposioApiKey() {
 
 async function connectComposio(slug) {
   try {
-    var res = await fetch('/api/composio/toolkits/' + encodeURIComponent(slug) + '/authorize', {
+    // Use apiFetch (not raw fetch) so the Authorization: Bearer header is
+    // attached — the /api/* middleware rejects unauth'd POSTs with 401.
+    var res = await apiFetch('/api/composio/toolkits/' + encodeURIComponent(slug) + '/authorize', {
       method: 'POST',
-      credentials: 'same-origin',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({}),
     });
@@ -25731,9 +25732,8 @@ async function connectComposio(slug) {
 async function disconnectComposio(slug, connectionId) {
   if (!confirm('Disconnect this ' + slug + ' account?')) return;
   try {
-    var res = await fetch('/api/composio/toolkits/' + encodeURIComponent(slug) + '/disconnect', {
+    var res = await apiFetch('/api/composio/toolkits/' + encodeURIComponent(slug) + '/disconnect', {
       method: 'POST',
-      credentials: 'same-origin',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ connectionId: connectionId }),
     });
