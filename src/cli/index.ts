@@ -38,7 +38,7 @@ import { cmdCronList, cmdCronRun, cmdCronRunDue, cmdCronRuns, cmdCronAdd, cmdCro
 import { cmdDashboard } from './dashboard.js';
 import { cmdChat } from './chat.js';
 import { cmdIngestSeed, cmdIngestRun, cmdIngestList, cmdIngestStatus } from './ingest.js';
-import { cmdBrowserStatus, cmdBrowserInstall, cmdBrowserEnable, cmdBrowserDisable } from './browser.js';
+import { cmdBrowserStatus, cmdBrowserInstall, cmdBrowserEnable, cmdBrowserDisable, maybePromptBrowserHarness } from './browser.js';
 import { isSensitiveEnvKey } from '../secrets/sensitivity.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -3293,6 +3293,8 @@ async function cmdUpdate(options: { restart?: boolean; dryRun?: boolean }): Prom
       console.log(`  ${DIM}Restart your daemon to pick up the new code:${RESET}`);
       console.log(`    clementine restart`);
     }
+    // Surface new opt-in integrations (silent unless action needed)
+    await maybePromptBrowserHarness();
     return;
   }
 
@@ -3948,6 +3950,9 @@ async function cmdUpdate(options: { restart?: boolean; dryRun?: boolean }): Prom
 
   console.log(`  ${DIM}Config backup: ${backupDir}${RESET}`);
   console.log();
+
+  // Surface new opt-in integrations (silent unless action needed)
+  await maybePromptBrowserHarness();
 }
 
 // ── Cron commands ───────────────────────────────────────────────────
