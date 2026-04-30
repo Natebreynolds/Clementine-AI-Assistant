@@ -19,6 +19,17 @@ const PERIODIC_INTERVAL_MS = 6 * 60 * 60 * 1000; // 6 hours
 const VACUUM_META_KEY = 'last_vacuum_at';
 
 /**
+ * Number of chunks to dense-embed per periodic cycle. With 4 cycles/day
+ * that's 400 chunks/day — fast enough to cover a 3,500-chunk vault in
+ * ~9 days, slow enough that the GPU/CPU load barely registers. Override
+ * via env for power users with very large vaults.
+ */
+const PERIODIC_DENSE_BATCH = (() => {
+  const raw = parseInt(process.env.CLEMENTINE_DENSE_BATCH ?? '', 10);
+  return Number.isFinite(raw) && raw > 0 ? raw : 100;
+})();
+
+/**
  * Janitor pass — keeps the store bounded. Safe to call repeatedly.
  * Idempotent within a single run; surfaces totals for logging.
  */
@@ -170,14 +181,14 @@ export async function runStartupMaintenance(store: any): Promise<void> {
 }
 
 /**
- * Start periodic maintenance on a 6-hour interval.
- * Returns the interval handle for cleanup on shutdown.
+ * Run one full periodic-maintenance cycle. Exported so tests can drive it
+ * without waiting on setInterval. `startPeriodicMaintenance` schedules
+ * this on the 6h cadence.
  */
-export function startPeriodicMaintenance(
+export async function runPeriodicCycle(
   store: any,
   llmCall?: (prompt: string) => Promise<string>,
-): ReturnType<typeof setInterval> {
-  const runCycle = async () => {
+): Promise<void> {
     const start = Date.now();
     logger.info('Starting periodic memory maintenance');
 
@@ -187,6 +198,23 @@ export function startPeriodicMaintenance(
 
     // 2. Rebuild vocab + backfill embeddings
     try { store.buildEmbeddings?.(); } catch (err) { logger.warn({ err }, 'Periodic embedding build failed'); }
+
+    // 2b. Idle dense-embedding backfill — process up to PERIODIC_DENSE_BATCH
+    // chunks per cycle so coverage drifts toward 100% without anyone running
+    // the CLI. The first time the dense model loads inside this process it
+    // pulls ~440MB; subsequent cycles reuse the loaded model. Failures
+    // (network, missing model dir, etc.) fall through silently because the
+    // backfill is best-effort — query-time still has TF-IDF as fallback.
+    if (typeof store.backfillDenseEmbeddings === 'function') {
+      try {
+        const result = await store.backfillDenseEmbeddings({ limit: PERIODIC_DENSE_BATCH });
+        if (result.embedded > 0) {
+          logger.info(result, 'Periodic dense embedding backfill');
+        }
+      } catch (err) {
+        logger.warn({ err }, 'Periodic dense embedding backfill failed');
+      }
+    }
 
     // 3. Consolidation (dedup, summarize, extract principles)
     if (llmCall) {
@@ -261,7 +289,19 @@ export function startPeriodicMaintenance(
     }
 
     logger.info({ durationMs: Date.now() - start }, 'Periodic maintenance complete');
-  };
+}
 
-  return setInterval(runCycle, PERIODIC_INTERVAL_MS);
+/**
+ * Start periodic maintenance on a 6-hour interval. Returns the interval
+ * handle for cleanup on shutdown.
+ */
+export function startPeriodicMaintenance(
+  store: any,
+  llmCall?: (prompt: string) => Promise<string>,
+): ReturnType<typeof setInterval> {
+  return setInterval(() => {
+    runPeriodicCycle(store, llmCall).catch(err =>
+      logger.warn({ err }, 'Periodic maintenance cycle threw — continuing'),
+    );
+  }, PERIODIC_INTERVAL_MS);
 }

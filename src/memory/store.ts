@@ -5096,6 +5096,70 @@ export class MemoryStore {
   }
 
   /**
+   * Get a compact "recent feedback signal" snapshot for prompt injection.
+   * Closes the feedback → behavior loop: the agent sees the last week's
+   * negative pattern in its system prompt instead of feedback being
+   * write-only.
+   *
+   * - `negative` / `positive`: counts in the window
+   * - `negativesWithComments`: up to `limit` most recent negatives that
+   *   carry a non-empty comment (these are the actionable ones — silent
+   *   👎 reactions don't tell the agent what to fix)
+   * - `behavioralChannel` is excluded because behavioral-corrections are
+   *   already pushed to hotCorrections directly
+   */
+  getRecentFeedbackSignals(opts: { days?: number; limit?: number } = {}): {
+    negative: number;
+    positive: number;
+    negativesWithComments: Array<{ comment: string; channel: string; createdAt: string }>;
+  } {
+    const days = Math.max(1, opts.days ?? 14);
+    const limit = Math.max(1, Math.min(opts.limit ?? 3, 10));
+    const since = `datetime('now', '-${days} days')`;
+
+    let negative = 0;
+    let positive = 0;
+    let negativesWithComments: Array<{ comment: string; channel: string; createdAt: string }> = [];
+    try {
+      const rows = this.conn
+        .prepare(
+          `SELECT rating, COUNT(*) as cnt FROM feedback
+           WHERE created_at >= ${since}
+             AND channel != 'behavioral-correction'
+             AND channel != 'preference-learned'
+           GROUP BY rating`,
+        )
+        .all() as Array<{ rating: string; cnt: number }>;
+      for (const row of rows) {
+        if (row.rating === 'negative') negative = row.cnt;
+        else if (row.rating === 'positive') positive = row.cnt;
+      }
+
+      const commented = this.conn
+        .prepare(
+          `SELECT comment, channel, created_at
+           FROM feedback
+           WHERE rating = 'negative'
+             AND comment IS NOT NULL
+             AND TRIM(comment) != ''
+             AND channel != 'behavioral-correction'
+             AND created_at >= ${since}
+           ORDER BY created_at DESC, id DESC
+           LIMIT ?`,
+        )
+        .all(limit) as Array<{ comment: string; channel: string; created_at: string }>;
+      negativesWithComments = commented.map((r) => ({
+        comment: r.comment,
+        channel: r.channel,
+        createdAt: r.created_at,
+      }));
+    } catch {
+      // Empty / legacy schema — return zeros
+    }
+    return { negative, positive, negativesWithComments };
+  }
+
+  /**
    * Get aggregate feedback statistics.
    */
   getFeedbackStats(): { positive: number; negative: number; mixed: number; total: number } {

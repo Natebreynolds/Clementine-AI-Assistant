@@ -241,6 +241,107 @@ describe('SelfImproveLoop.tick — end-to-end', () => {
     }
   });
 
+  it('auto-fixes a job defined in agents/{slug}/CRON.md when trigger names slug+bareName', async () => {
+    // Simulate cron-scheduler's view: central CRON.md has no per-agent jobs;
+    // agent-scoped CRON.md does. Trigger carries agentSlug + bareName.
+    writeCronFile([]); // empty central
+    const agentsDir = path.join(baseDir, 'agents');
+    mkdirSync(path.join(agentsDir, 'ross-the-sdr'), { recursive: true });
+    const agentCronPath = path.join(agentsDir, 'ross-the-sdr', 'CRON.md');
+    writeFileSync(
+      agentCronPath,
+      matter.stringify('# Ross crons\n', {
+        jobs: [{ name: 'tradeshow-outreach-am', schedule: '0 9 * * *', tier: 1 }],
+      }),
+    );
+    writeFileSync(
+      path.join(triggersDir, 'ross-the-sdr_tradeshow-outreach-am.json'),
+      JSON.stringify({
+        jobName: 'ross-the-sdr:tradeshow-outreach-am',
+        bareName: 'tradeshow-outreach-am',
+        agentSlug: 'ross-the-sdr',
+        consecutiveErrors: 5,
+        recentErrors: ['Reached maximum number of turns (8)'],
+        triggeredAt: new Date().toISOString(),
+      }),
+    );
+
+    const send = vi.fn(async () => ({ delivered: true, channelErrors: {} }));
+    const loop = new SelfImproveLoop({ send }, { triggersDir, pendingDir, cronPath, agentsDir, disableWatch: true });
+    const result = await loop.tick();
+
+    expect(result.applied).toBe(1);
+    // Edit landed in agent-scoped file, not central
+    const updatedAgent = matter(readFileSync(agentCronPath, 'utf-8'));
+    const job = (updatedAgent.data.jobs as Array<Record<string, unknown>>)[0];
+    expect(job.mode).toBe('unleashed');
+    expect(job.max_hours).toBe(1);
+    // Central CRON.md untouched
+    const centralJobs = (matter(readFileSync(cronPath, 'utf-8')).data.jobs ?? []) as Array<unknown>;
+    expect(centralJobs.length).toBe(0);
+    // DM routed to the agent
+    const [text, ctx] = send.mock.calls[0];
+    expect(ctx?.agentSlug).toBe('ross-the-sdr');
+    expect(text).toMatch(/agents\/ross-the-sdr\/CRON\.md/);
+  });
+
+  it('recovers agent slug from prefixed jobName when older trigger lacks agentSlug field', async () => {
+    writeCronFile([]);
+    const agentsDir = path.join(baseDir, 'agents');
+    mkdirSync(path.join(agentsDir, 'sasha-the-cmo'), { recursive: true });
+    const agentCronPath = path.join(agentsDir, 'sasha-the-cmo', 'CRON.md');
+    writeFileSync(
+      agentCronPath,
+      matter.stringify('', { jobs: [{ name: 'weekly-content', schedule: '0 9 * * 1' }] }),
+    );
+    // Old-format trigger: no agentSlug, no bareName, but jobName is prefixed.
+    writeFileSync(
+      path.join(triggersDir, 'sasha-the-cmo_weekly-content.json'),
+      JSON.stringify({
+        jobName: 'sasha-the-cmo:weekly-content',
+        consecutiveErrors: 4,
+        recentErrors: ['Autocompact is thrashing'],
+        triggeredAt: new Date().toISOString(),
+      }),
+    );
+
+    const send = vi.fn(async () => ({ delivered: true, channelErrors: {} }));
+    const loop = new SelfImproveLoop({ send }, { triggersDir, pendingDir, cronPath, agentsDir, disableWatch: true });
+    const result = await loop.tick();
+
+    expect(result.applied).toBe(1);
+    const updated = matter(readFileSync(agentCronPath, 'utf-8'));
+    expect((updated.data.jobs as Array<Record<string, unknown>>)[0].mode).toBe('unleashed');
+    const [, ctx] = send.mock.calls[0];
+    expect(ctx?.agentSlug).toBe('sasha-the-cmo');
+  });
+
+  it('escalates as no-op when trigger names a job that no longer exists anywhere', async () => {
+    writeCronFile([]);
+    const agentsDir = path.join(baseDir, 'agents');
+    writeFileSync(
+      path.join(triggersDir, 'ghost.json'),
+      JSON.stringify({
+        jobName: 'ross-the-sdr:deleted-job',
+        bareName: 'deleted-job',
+        agentSlug: 'ross-the-sdr',
+        consecutiveErrors: 3,
+        recentErrors: ['Reached maximum number of turns (8)'],
+        triggeredAt: new Date().toISOString(),
+      }),
+    );
+
+    const send = vi.fn(async () => ({ delivered: true, channelErrors: {} }));
+    const loop = new SelfImproveLoop({ send }, { triggersDir, pendingDir, cronPath, agentsDir, disableWatch: true });
+    const result = await loop.tick();
+
+    expect(result.applied).toBe(0);
+    expect(result.noop).toBe(1);
+    expect(send).not.toHaveBeenCalled();
+    // Trigger still cleared so we don't loop on it
+    expect(existsSync(path.join(triggersDir, 'ghost.json'))).toBe(false);
+  });
+
   it('processes multiple triggers in one tick', async () => {
     writeCronFile([
       { name: 'a', agentSlug: 'ross-the-sdr' },

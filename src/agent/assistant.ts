@@ -1489,6 +1489,32 @@ Never spawn a sub-agent with vague instructions like "handle this brief."
       }
     }
 
+    // Inject recent feedback signals (closes the feedback → behavior loop).
+    // Without this block, user thumbs-down + comments live in the feedback
+    // table and never reach the agent's awareness — only the skill-suppress
+    // filter consumed them. We surface aggregates + the last few commented
+    // negatives so the agent can self-adjust on the next turn. Skipped when
+    // there's nothing to report (no noise).
+    if (this.memoryStore?.getRecentFeedbackSignals) {
+      try {
+        const sig = this.memoryStore.getRecentFeedbackSignals({ days: 14, limit: 3 });
+        if (sig.negative > 0) {
+          const lines: string[] = [];
+          const total = sig.positive + sig.negative;
+          const ratio = total > 0 ? Math.round((sig.negative / total) * 100) : 0;
+          lines.push(`Last 14 days: ${sig.negative} negative / ${sig.positive} positive (${ratio}% negative).`);
+          if (sig.negativesWithComments.length > 0) {
+            lines.push('Recent negative comments — adjust accordingly:');
+            for (const n of sig.negativesWithComments) {
+              const comment = n.comment.length > 200 ? n.comment.slice(0, 200) + '…' : n.comment;
+              lines.push(`- (${n.channel}) ${comment}`);
+            }
+          }
+          parts.push(`## Recent feedback signals\n\n${lines.join('\n')}`);
+        }
+      } catch { /* non-fatal */ }
+    }
+
     // Proactive skill injection: match user message against skill triggers
     if (this._lastUserMessage && !isAutonomous) {
       try {

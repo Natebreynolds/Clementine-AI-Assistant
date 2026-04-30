@@ -1346,19 +1346,27 @@ export class CronScheduler {
         this.logAdvisorEvent('escalation', job.name, advice.escalationReason ?? 'Escalated to unleashed');
       }
 
-      // Write targeted self-improvement trigger when consecutive errors are high
+      // Write targeted self-improvement trigger when consecutive errors are high.
+      // Include agentSlug + bareName so the self-improve loop can locate jobs
+      // defined in per-agent CRON.md files (vault/00-System/agents/{slug}/CRON.md)
+      // rather than only the central one.
       if (consErrors >= 3) {
         try {
           const triggerDir = path.join(BASE_DIR, 'self-improve', 'triggers');
           mkdirSync(triggerDir, { recursive: true });
           const triggerPath = path.join(triggerDir, `${job.name.replace(/[^a-zA-Z0-9_-]/g, '_')}.json`);
+          const bareName = job.agentSlug && job.name.startsWith(`${job.agentSlug}:`)
+            ? job.name.slice(job.agentSlug.length + 1)
+            : job.name;
           writeFileSync(triggerPath, JSON.stringify({
             jobName: job.name,
+            bareName,
+            agentSlug: job.agentSlug,
             consecutiveErrors: consErrors,
             recentErrors: this.runLog.readRecent(job.name, 3).map(e => e.error?.slice(0, 200)),
             triggeredAt: new Date().toISOString(),
           }, null, 2));
-          logger.info({ job: job.name, consErrors }, 'Wrote self-improvement trigger for failing job');
+          logger.info({ job: job.name, agentSlug: job.agentSlug, consErrors }, 'Wrote self-improvement trigger for failing job');
         } catch { /* non-fatal */ }
       }
 

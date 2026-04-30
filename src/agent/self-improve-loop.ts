@@ -38,7 +38,7 @@ import {
 import path from 'node:path';
 import matter from 'gray-matter';
 import pino from 'pino';
-import { BASE_DIR, SYSTEM_DIR } from '../config.js';
+import { AGENTS_DIR, BASE_DIR, SYSTEM_DIR } from '../config.js';
 
 const logger = pino({ name: 'clementine.self-improve-loop' });
 
@@ -59,11 +59,25 @@ const WATCH_DEBOUNCE_MS = 2000;
 const TRIGGERS_DIR = path.join(BASE_DIR, 'self-improve', 'triggers');
 const PENDING_CHANGES_DIR = path.join(BASE_DIR, 'self-improve', 'pending-changes');
 const CRON_PATH = path.join(SYSTEM_DIR, 'CRON.md');
+const AGENTS_ROOT = AGENTS_DIR;
 
 // ── Types ────────────────────────────────────────────────────────────
 
 export interface TriggerFile {
   jobName: string;
+  /**
+   * Bare job name (without `{agentSlug}:` prefix). Set by cron-scheduler
+   * for agent-scoped jobs so the loop can look the job up in
+   * agents/{agentSlug}/CRON.md. Optional for backward compat with
+   * triggers written before this field existed.
+   */
+  bareName?: string;
+  /**
+   * Owning agent slug, set by cron-scheduler. When present, the loop
+   * applies fixes to vault/00-System/agents/{agentSlug}/CRON.md instead
+   * of the central CRON.md. Falls back to scanning if absent (older triggers).
+   */
+  agentSlug?: string;
   consecutiveErrors: number;
   recentErrors: string[];
   triggeredAt: string;
@@ -79,6 +93,13 @@ export interface FixRecipe {
   category: FixCategory;
   /** Description of what this fix does, for DMs. */
   description: string;
+  /**
+   * Frontmatter keys this recipe may touch. Used to snapshot prior values
+   * before apply() runs so an ineffective fix can be reverted by post-fix
+   * verification without restoring fields the recipe never owned. Required
+   * for safe-cron-config recipes that participate in autoApply verification.
+   */
+  fields?: readonly string[];
   /**
    * For safe-cron-config: a function that mutates the job's frontmatter
    * entry in-place. Returns true if any change was made (false = idempotent
@@ -106,6 +127,11 @@ export interface SelfImproveLoopOptions {
   pendingDir?: string;
   cronPath?: string;
   /**
+   * Override the agents root (vault/00-System/agents). When a trigger
+   * has agentSlug, the loop reads/writes `${agentsDir}/${agentSlug}/CRON.md`.
+   */
+  agentsDir?: string;
+  /**
    * Disable the fs.watch event-driven path. Tests use this so they can
    * call tick() directly without racing the watcher.
    */
@@ -124,6 +150,7 @@ const PATTERNS: Array<{
     recipe: () => ({
       category: 'safe-cron-config',
       description: 'Hit max-turns ceiling repeatedly. Switching to unleashed mode (multi-phase) so the job can complete its workflow.',
+      fields: ['mode', 'max_hours'] as const,
       apply: (job) => {
         let changed = false;
         if (job.mode !== 'unleashed') {
@@ -183,39 +210,142 @@ export function classifyFailure(recentErrors: string[]): FixRecipe {
 
 interface CronJobLookup {
   agentSlug?: string;
+  /** Path to the CRON.md the job was found in (central or agent-scoped). */
+  cronPath: string;
+  /** The bare name as written in that file (no agent prefix). */
+  bareName: string;
   job: Record<string, unknown>;
   raw: string;
   parsed: ReturnType<typeof matter>;
 }
 
-function loadCronJob(jobName: string, cronPath: string): CronJobLookup | null {
+function readJobsFromFile(cronPath: string): {
+  raw: string;
+  parsed: ReturnType<typeof matter>;
+  jobs: Array<Record<string, unknown>>;
+} | null {
   if (!existsSync(cronPath)) return null;
   const raw = readFileSync(cronPath, 'utf-8');
   const parsed = matter(raw);
   const jobs = (parsed.data.jobs ?? []) as Array<Record<string, unknown>>;
-  const job = jobs.find((j) => String(j.name ?? '') === jobName);
-  if (!job) return null;
-  const agentSlug = typeof job.agentSlug === 'string' ? job.agentSlug : (typeof job.agent_slug === 'string' ? job.agent_slug : undefined);
-  return { agentSlug, job, raw, parsed };
+  return { raw, parsed, jobs };
+}
+
+function readAgentSlug(job: Record<string, unknown>): string | undefined {
+  if (typeof job.agentSlug === 'string') return job.agentSlug;
+  if (typeof job.agent_slug === 'string') return job.agent_slug;
+  return undefined;
 }
 
 /**
- * Apply the recipe's mutator to the job's frontmatter and write CRON.md
- * back atomically. Returns true if a change was actually written.
+ * Locate a job's frontmatter entry in either the central CRON.md or an
+ * agent-scoped CRON.md. Search priority:
+ *
+ *   1. If trigger.agentSlug is set, look in agents/{slug}/CRON.md by bareName.
+ *   2. Otherwise look in central CRON.md by exact name.
+ *   3. Fall back to scanning agents/* for the bareName (covers older triggers
+ *      that lack agentSlug — the cron-scheduler-prefixed jobName like
+ *      `slug:name` lets us recover the slug).
  */
-function applyCronEdit(jobName: string, recipe: FixRecipe, cronPath: string): boolean {
-  if (!recipe.apply) return false;
-  const lookup = loadCronJob(jobName, cronPath);
-  if (!lookup) {
-    logger.warn({ jobName }, 'Job not found in CRON.md — cannot apply fix');
-    return false;
+function loadCronJob(
+  trigger: Pick<TriggerFile, 'jobName' | 'bareName' | 'agentSlug'>,
+  cronPath: string,
+  agentsDir: string,
+): CronJobLookup | null {
+  const explicitSlug = trigger.agentSlug;
+  const bare = trigger.bareName ?? (
+    explicitSlug && trigger.jobName.startsWith(`${explicitSlug}:`)
+      ? trigger.jobName.slice(explicitSlug.length + 1)
+      : trigger.jobName
+  );
+
+  // 1. Agent-scoped file when slug is known
+  if (explicitSlug) {
+    const agentCronPath = path.join(agentsDir, explicitSlug, 'CRON.md');
+    const file = readJobsFromFile(agentCronPath);
+    if (file) {
+      const job = file.jobs.find((j) => String(j.name ?? '') === bare);
+      if (job) {
+        return {
+          agentSlug: explicitSlug,
+          cronPath: agentCronPath,
+          bareName: bare,
+          job,
+          raw: file.raw,
+          parsed: file.parsed,
+        };
+      }
+    }
+  }
+
+  // 2. Central CRON.md by full jobName (handles globally-defined jobs and
+  //    legacy jobs tagged with agentSlug field directly in the central file)
+  const central = readJobsFromFile(cronPath);
+  if (central) {
+    const job = central.jobs.find((j) => String(j.name ?? '') === trigger.jobName);
+    if (job) {
+      return {
+        agentSlug: explicitSlug ?? readAgentSlug(job),
+        cronPath,
+        bareName: String(job.name ?? ''),
+        job,
+        raw: central.raw,
+        parsed: central.parsed,
+      };
+    }
+  }
+
+  // 3. Recover via scan: trigger jobName follows `{slug}:{bareName}` for
+  //    agent-scoped jobs even when older triggers omit agentSlug.
+  if (!explicitSlug && trigger.jobName.includes(':')) {
+    const [slug, ...rest] = trigger.jobName.split(':');
+    const inferredBare = rest.join(':');
+    if (slug && inferredBare) {
+      const agentCronPath = path.join(agentsDir, slug, 'CRON.md');
+      const file = readJobsFromFile(agentCronPath);
+      if (file) {
+        const job = file.jobs.find((j) => String(j.name ?? '') === inferredBare);
+        if (job) {
+          return {
+            agentSlug: slug,
+            cronPath: agentCronPath,
+            bareName: inferredBare,
+            job,
+            raw: file.raw,
+            parsed: file.parsed,
+          };
+        }
+      }
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Apply the recipe's mutator to the job's frontmatter and write the CRON.md
+ * (central or agent-scoped, whichever the lookup resolved to) back atomically.
+ * Returns the captured prevFields snapshot when a change was written, or
+ * null when no change was needed (idempotent re-apply). prevFields uses
+ * `null` to represent "field was absent before the fix" — the revert path
+ * deletes the key in that case.
+ */
+function applyCronEdit(
+  lookup: CronJobLookup,
+  recipe: FixRecipe,
+): Record<string, unknown> | null {
+  if (!recipe.apply) return null;
+  // Snapshot only the fields the recipe declared it would touch — over-broad
+  // snapshots would clobber concurrent edits during a revert.
+  const prevFields: Record<string, unknown> = {};
+  for (const key of recipe.fields ?? []) {
+    prevFields[key] = key in lookup.job ? lookup.job[key] : null;
   }
   const changed = recipe.apply(lookup.job);
-  if (!changed) return false;
-  // Re-stringify with the existing content body preserved.
+  if (!changed) return null;
   const updated = matter.stringify(lookup.parsed.content, lookup.parsed.data);
-  writeFileSync(cronPath, updated);
-  return true;
+  writeFileSync(lookup.cronPath, updated);
+  return prevFields;
 }
 
 // ── Pending-change record (for risky/unknown) ────────────────────────
@@ -245,6 +375,7 @@ export class SelfImproveLoop {
   private readonly triggersDir: string;
   private readonly pendingDir: string;
   private readonly cronPath: string;
+  private readonly agentsDir: string;
   private readonly dispatcher: SelfImproveDispatcher;
   private readonly watchEnabled: boolean;
   private timer: ReturnType<typeof setInterval> | null = null;
@@ -259,6 +390,7 @@ export class SelfImproveLoop {
     this.triggersDir = opts.triggersDir ?? TRIGGERS_DIR;
     this.pendingDir = opts.pendingDir ?? PENDING_CHANGES_DIR;
     this.cronPath = opts.cronPath ?? CRON_PATH;
+    this.agentsDir = opts.agentsDir ?? AGENTS_ROOT;
     this.watchEnabled = opts.disableWatch !== true;
   }
 
@@ -377,23 +509,49 @@ export class SelfImproveLoop {
     counts: { processed: number; applied: number; pending: number; noop: number },
   ): Promise<void> {
     const recipe = classifyFailure(trigger.recentErrors);
-    const lookup = loadCronJob(trigger.jobName, this.cronPath);
-    const agentSlug = lookup?.agentSlug;
+    const lookup = loadCronJob(trigger, this.cronPath, this.agentsDir);
+    const agentSlug = trigger.agentSlug ?? lookup?.agentSlug;
 
     if (recipe.category === 'safe-cron-config') {
-      const applied = applyCronEdit(trigger.jobName, recipe, this.cronPath);
-      if (applied) {
+      if (!lookup) {
+        // Job vanished from CRON files (renamed/deleted). Nothing to fix.
+        counts.noop++;
+        logger.warn({ jobName: trigger.jobName, agentSlug }, 'Job not found in any CRON.md — cannot apply fix');
+        return;
+      }
+      const prevFields = applyCronEdit(lookup, recipe);
+      if (prevFields) {
         counts.applied++;
+
+        // Register the edit for post-fix verification. The verifier watches
+        // the next AUTOAPPLY_VERDICT_WINDOW non-skipped runs and reverts
+        // prevFields if 0 succeed. Lazy import avoids pulling the gateway
+        // graph into the agent layer at module-load time.
+        try {
+          const { recordAutoApplyForVerification } = await import('../gateway/fix-verification.js');
+          recordAutoApplyForVerification(trigger.jobName, {
+            kind: 'cron-config',
+            file: lookup.cronPath,
+            bareName: lookup.bareName,
+            prevFields,
+          });
+        } catch (err) {
+          logger.warn({ err, jobName: trigger.jobName }, 'Failed to register cron-config autoApply for verification (non-fatal)');
+        }
+
+        const where = lookup.agentSlug
+          ? `\`agents/${lookup.agentSlug}/CRON.md\``
+          : '`CRON.md`';
         await this.notifyAgent(agentSlug, [
           `🔧 **Auto-fixed** \`${trigger.jobName}\` after ${trigger.consecutiveErrors} consecutive failures.`,
           '',
           recipe.description,
           '',
-          'I\'ll watch the next run to confirm it lands cleanly.',
+          `Edit applied to ${where}. Verifying over the next 3 runs — I'll revert automatically if it doesn't help.`,
         ].join('\n'));
       } else {
         counts.noop++;
-        logger.info({ jobName: trigger.jobName }, 'Fix recipe applied is already in place — trigger removed without further action');
+        logger.info({ jobName: trigger.jobName, agentSlug }, 'Fix recipe applied is already in place — trigger removed without further action');
       }
       return;
     }

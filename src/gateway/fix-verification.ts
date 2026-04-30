@@ -46,9 +46,13 @@ interface PendingVerification {
 /**
  * Tracks an autoApply that's currently being verified. When the verdict
  * window closes negatively, revertFix() uses these fields to undo.
+ *
+ * - `advisor-rule` and `prompt-override` revert by deleting the written file.
+ * - `cron-config` reverts by re-applying the captured `prevFields` to the
+ *   named job inside CRON.md (deleting CRON.md would be catastrophic).
  */
 export interface AutoApplyTracker {
-  kind: 'advisor-rule' | 'prompt-override';
+  kind: 'advisor-rule' | 'prompt-override' | 'cron-config';
   /** Absolute path of the file the apply wrote. */
   file: string;
   /** advisor-rule only: the rule's id, used by the loader's hot-reload. */
@@ -56,6 +60,11 @@ export interface AutoApplyTracker {
   /** prompt-override only: scope label for the verdict message. */
   scope?: 'global' | 'agent' | 'job';
   scopeKey?: string;
+  /** cron-config only: bare job name as written in the CRON.md frontmatter. */
+  bareName?: string;
+  /** cron-config only: original values for the fields that were mutated.
+   * Use null for "field was absent (delete on revert)". */
+  prevFields?: Record<string, unknown>;
 }
 
 interface State {
@@ -203,11 +212,19 @@ export function recordAutoApplyForVerification(
 }
 
 /**
- * Undo an autoApply by deleting the file the apply wrote. Best-effort:
- * a missing file is not an error (might have been hand-deleted). Returns
- * true if a file was actually removed.
+ * Undo an autoApply. Dispatches on `tracker.kind`:
+ *
+ *   - advisor-rule / prompt-override: delete the file the apply wrote.
+ *   - cron-config: re-apply the captured `prevFields` to the named job
+ *     in CRON.md (never delete CRON.md).
+ *
+ * Best-effort throughout: a missing file or vanished job is not an error.
+ * Returns true if a meaningful change was made.
  */
 function revertAutoApply(tracker: AutoApplyTracker): boolean {
+  if (tracker.kind === 'cron-config') {
+    return revertCronConfig(tracker);
+  }
   try {
     if (existsSync(tracker.file)) {
       // Use unlinkSync from fs — kept dynamic to avoid a top-of-file import
@@ -221,6 +238,53 @@ function revertAutoApply(tracker: AutoApplyTracker): boolean {
     logger.warn({ err, file: tracker.file }, 'Failed to delete autoApply file during revert');
   }
   return false;
+}
+
+/**
+ * Restore the previous values of the fields the cron-config autoApply mutated.
+ * A `null` in `prevFields` means the field was absent before the fix and
+ * should be deleted on revert.
+ */
+function revertCronConfig(tracker: AutoApplyTracker): boolean {
+  if (!tracker.bareName || !tracker.prevFields) {
+    logger.warn({ tracker }, 'cron-config revert missing bareName/prevFields — skipping');
+    return false;
+  }
+  try {
+    if (!existsSync(tracker.file)) {
+      logger.warn({ file: tracker.file }, 'cron-config revert: file missing — skipping');
+      return false;
+    }
+    const { readFileSync, writeFileSync } = require('node:fs') as typeof import('node:fs');
+    const matter = require('gray-matter') as typeof import('gray-matter');
+    const raw = readFileSync(tracker.file, 'utf-8');
+    const parsed = matter(raw);
+    const jobs = (parsed.data.jobs ?? []) as Array<Record<string, unknown>>;
+    const job = jobs.find((j) => String(j.name ?? '') === tracker.bareName);
+    if (!job) {
+      logger.warn({ file: tracker.file, bareName: tracker.bareName }, 'cron-config revert: job not found — already removed/renamed');
+      return false;
+    }
+    let mutated = false;
+    for (const [key, prev] of Object.entries(tracker.prevFields)) {
+      if (prev === null || prev === undefined) {
+        if (key in job) {
+          delete (job as Record<string, unknown>)[key];
+          mutated = true;
+        }
+      } else if (job[key] !== prev) {
+        job[key] = prev;
+        mutated = true;
+      }
+    }
+    if (!mutated) return false;
+    writeFileSync(tracker.file, matter.stringify(parsed.content, parsed.data));
+    logger.warn({ file: tracker.file, bareName: tracker.bareName }, 'Reverted cron-config autoApply — fix did not help');
+    return true;
+  } catch (err) {
+    logger.warn({ err, file: tracker.file }, 'Failed to revert cron-config autoApply');
+    return false;
+  }
 }
 
 /**

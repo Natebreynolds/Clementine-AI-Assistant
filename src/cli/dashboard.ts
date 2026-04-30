@@ -6469,6 +6469,15 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
     const stateFile = path.join(siDir, 'state.json');
     const logFile = path.join(siDir, 'experiment-log.jsonl');
     const pendingDir = path.join(siDir, 'pending-changes');
+    // Active failure triggers — written by cron-scheduler when a job hits
+    // 3+ consecutive errors; consumed by self-improve-loop on its next tick.
+    // Surfacing them here gives the user a "work in progress" view between
+    // tick boundaries (event-driven debounce + 1h fallback).
+    const triggersDir = path.join(siDir, 'triggers');
+    // Pending fix verifications — auto-applied fixes that are soaking
+    // through the 3-run verdict window (cron-config / advisor-rule /
+    // prompt-override). Reverts automatically if 0 succeed.
+    const verificationsFile = path.join(BASE_DIR, 'cron', 'fix-verifications.json');
 
     let state = null;
     if (existsSync(stateFile)) {
@@ -6492,7 +6501,24 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
       } catch { /* ignore */ }
     }
 
-    res.json({ state, experiments, pending });
+    let triggers: unknown[] = [];
+    if (existsSync(triggersDir)) {
+      try {
+        triggers = readdirSync(triggersDir).filter(f => f.endsWith('.json'))
+          .map(f => { try { return JSON.parse(readFileSync(path.join(triggersDir, f), 'utf-8')); } catch { return null; } })
+          .filter(Boolean);
+      } catch { /* ignore */ }
+    }
+
+    let verifications: unknown[] = [];
+    if (existsSync(verificationsFile)) {
+      try {
+        const raw = JSON.parse(readFileSync(verificationsFile, 'utf-8')) as { pending?: Record<string, unknown> };
+        verifications = Object.values(raw.pending ?? {});
+      } catch { /* ignore */ }
+    }
+
+    res.json({ state, experiments, pending, triggers, verifications });
   });
 
   app.post('/api/self-improve/run', async (_req, res) => {
@@ -12773,13 +12799,33 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
           </div>
         </div>
         <div class="tab-pane" id="tab-intelligence-learning">
-          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
-            <div style="font-size:13px;color:var(--text-secondary)">Self-improvement runs nightly at 1 AM. You can also trigger it manually.</div>
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;gap:12px;flex-wrap:wrap">
+            <div style="font-size:13px;color:var(--text-secondary);max-width:680px">
+              Self-improvement runs nightly at 1 AM. The autonomous loop also auto-fixes failing crons (3+ consecutive errors) and verifies each fix over the next 3 runs &mdash; reverting automatically if it doesn't help.
+            </div>
             <button class="btn-sm btn-primary" onclick="siRunCycle()" id="si-run-btn">Run Now</button>
           </div>
           <div class="grid-2" id="si-status-cards">
             <div class="skel-block"><div class="skel-row med"></div><div class="skel-row short"></div></div>
             <div class="skel-block"><div class="skel-row med"></div><div class="skel-row short"></div></div>
+          </div>
+          <div class="card" style="margin-top:16px">
+            <div class="card-header" style="display:flex;align-items:center;justify-content:space-between">
+              <span>Active failures</span>
+              <span class="tab-badge" id="tab-si-triggers" style="display:none;background:#ef4444;color:#fff">0</span>
+            </div>
+            <div class="card-body" id="si-triggers-list" style="padding:0">
+              <div class="empty-state" style="padding:14px">No active failures &mdash; nothing has tripped 3+ consecutive errors.</div>
+            </div>
+          </div>
+          <div class="card" style="margin-top:16px">
+            <div class="card-header" style="display:flex;align-items:center;justify-content:space-between">
+              <span>Verifying fixes</span>
+              <span class="tab-badge" id="tab-si-verifying" style="display:none;background:#f59e0b;color:#000">0</span>
+            </div>
+            <div class="card-body" id="si-verifying-list" style="padding:0">
+              <div class="empty-state" style="padding:14px">No fixes currently soaking. Auto-fixes are verified over 3 runs and reverted if 0 succeed.</div>
+            </div>
           </div>
           <div class="card" style="margin-top:16px">
             <div class="card-header" style="display:flex;align-items:center;justify-content:space-between">
@@ -21134,6 +21180,7 @@ async function refreshMemoryHealth() {
       html += '<div style="flex:1;min-width:240px">';
       html += '<div style="font-weight:600;margin-bottom:4px">Retrieval running on sparse vectors for ' + missing.toLocaleString() + ' chunks</div>';
       html += '<div style="font-size:12px;color:var(--text-muted)">Backfill builds 768-dim neural embeddings for semantic search. First run downloads ~440MB.</div>';
+      html += '<div style="font-size:11px;color:var(--text-muted);margin-top:4px">Auto-backfill runs every 6h (~100 chunks/cycle). Use the buttons below to push faster.</div>';
       html += '</div>';
       html += '<button class="btn-sm" onclick="memoryHealthAction(\\'reembed-dense\\', { limit: 200 })" title="Embed up to 200 chunks now">Backfill 200</button>';
       html += '<button class="btn-sm" onclick="memoryHealthAction(\\'reembed-dense\\', { limit: 2000 })" title="Embed up to 2000 chunks now (slower)">Backfill 2000</button>';
@@ -24252,12 +24299,77 @@ async function refreshSelfImprove() {
     const state = d.state;
     const experiments = d.experiments || [];
     const pending = d.pending || [];
+    const triggers = d.triggers || [];
+    const verifications = d.verifications || [];
 
-    // Update tab badge
+    // Update tab badge — combine human-attention queues so the sidebar
+    // count reflects "things that need you to look at", not just proposals.
+    const attentionCount = pending.length + triggers.length;
     const badge = document.getElementById('nav-si-pending');
-    if (badge) badge.textContent = pending.length || '0';
+    if (badge) badge.textContent = attentionCount || '0';
     var _sib = document.getElementById('tab-si-pending');
     if (_sib) { _sib.textContent = pending.length || '0'; _sib.style.display = pending.length > 0 ? '' : 'none'; }
+    var _sit = document.getElementById('tab-si-triggers');
+    if (_sit) { _sit.textContent = triggers.length || '0'; _sit.style.display = triggers.length > 0 ? '' : 'none'; }
+    var _siv = document.getElementById('tab-si-verifying');
+    if (_siv) { _siv.textContent = verifications.length || '0'; _siv.style.display = verifications.length > 0 ? '' : 'none'; }
+
+    // Active failure triggers — jobs at 3+ consecutive errors; the loop
+    // will pick these up on its next tick (event-driven; ~2s debounce).
+    const triggersEl = document.getElementById('si-triggers-list');
+    if (triggersEl) {
+      if (triggers.length === 0) {
+        triggersEl.innerHTML = '<div class="empty-state" style="padding:14px">No active failures &mdash; nothing has tripped 3+ consecutive errors.</div>';
+      } else {
+        triggersEl.innerHTML = triggers.map(function(t) {
+          var owner = t.agentSlug ? '@' + esc(t.agentSlug) : 'global';
+          var when = t.triggeredAt ? new Date(t.triggeredAt).toLocaleString() : '—';
+          var firstError = (t.recentErrors && t.recentErrors[0]) ? String(t.recentErrors[0]).slice(0, 200) : '';
+          return '<div style="padding:12px;border-bottom:1px solid var(--border)">' +
+            '<div style="display:flex;justify-content:space-between;align-items:baseline;gap:8px;flex-wrap:wrap">' +
+              '<div><strong>' + esc(t.jobName || '—') + '</strong> ' +
+              '<span style="font-size:11px;color:var(--text-muted)">&middot; owner: ' + owner + '</span> ' +
+              '<span style="font-size:11px;color:var(--danger,#ef4444)">&middot; ' + (t.consecutiveErrors || 0) + ' consecutive errors</span></div>' +
+              '<span style="font-size:11px;color:var(--text-muted)">' + esc(when) + '</span>' +
+            '</div>' +
+            (firstError ? '<div style="margin-top:6px;font-size:12px;color:var(--text-secondary);font-family:ui-monospace,monospace">' + esc(firstError) + '</div>' : '') +
+          '</div>';
+        }).join('');
+      }
+    }
+
+    // Pending fix verifications — auto-fixes soaking through the 3-run window.
+    const verifyEl = document.getElementById('si-verifying-list');
+    if (verifyEl) {
+      if (verifications.length === 0) {
+        verifyEl.innerHTML = '<div class="empty-state" style="padding:14px">No fixes currently soaking. Auto-fixes are verified over 3 runs and reverted if 0 succeed.</div>';
+      } else {
+        verifyEl.innerHTML = verifications.map(function(v) {
+          var outcomes = v.postRunOutcomes || [];
+          var dots = '';
+          for (var i = 0; i < 3; i++) {
+            var o = outcomes[i];
+            var color = o === 'ok' ? 'var(--success,#10b981)' : o === 'error' || o === 'retried' ? 'var(--danger,#ef4444)' : 'var(--border)';
+            dots += '<span title="' + (o || 'pending') + '" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:' + color + ';margin-right:4px"></span>';
+          }
+          var kind = v.autoApply && v.autoApply.kind ? v.autoApply.kind : 'hand-edit';
+          var when = v.recordedAt ? new Date(v.recordedAt).toLocaleString() : '—';
+          var fileLabel = v.autoApply && v.autoApply.file ? v.autoApply.file.split('/').slice(-3).join('/') : '';
+          return '<div style="padding:12px;border-bottom:1px solid var(--border)">' +
+            '<div style="display:flex;justify-content:space-between;align-items:baseline;gap:8px;flex-wrap:wrap">' +
+              '<div><strong>' + esc(v.jobName || '—') + '</strong> ' +
+              '<span style="font-size:11px;color:var(--text-muted)">&middot; ' + esc(kind) + '</span></div>' +
+              '<div style="font-size:11px;color:var(--text-muted)">' + esc(when) + '</div>' +
+            '</div>' +
+            '<div style="margin-top:8px;display:flex;align-items:center;gap:10px;font-size:12px;color:var(--text-secondary)">' +
+              '<span>' + dots + '</span>' +
+              '<span>' + outcomes.length + ' / 3 runs sampled</span>' +
+              (fileLabel ? '<span style="font-family:ui-monospace,monospace;color:var(--text-muted)">' + esc(fileLabel) + '</span>' : '') +
+            '</div>' +
+          '</div>';
+        }).join('');
+      }
+    }
 
     // Status cards
     const cards = document.getElementById('si-status-cards');
