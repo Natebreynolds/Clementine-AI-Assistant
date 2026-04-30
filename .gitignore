@@ -37,3 +37,7 @@ logs/
 
 # Local dev screenshots (Playwright/manual captures at repo root)
 *.png
+
+# Python bytecode (browser-harness MCP wrapper)
+__pycache__/
+*.pyc
