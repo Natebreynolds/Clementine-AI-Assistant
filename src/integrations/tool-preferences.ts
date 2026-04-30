@@ -126,13 +126,15 @@ export function computeAvailability(
 
 /**
  * Build the system-prompt instruction listing which tool source the agent
- * should use for each service. Only includes services where:
- *   - There IS a conflict (both sources connected), AND
- *   - The user has explicitly picked a non-default preference, OR
- *   - The user picked 'off' (so we tell the agent NOT to use it)
+ * should use for each service. Output ONLY for services with a real
+ * conflict (both sources connected). Includes the silent-default state
+ * too, so the agent knows the current rule without falling back to
+ * memory recall (which can hold stale preferences from past conversations).
  *
- * Returns empty string when no instruction is needed — that's the goal:
- * silent default, zero prompt overhead, until the user actually configures.
+ * Token shape:
+ *   - 0 conflicts → empty string (zero overhead)
+ *   - N conflicts → ~70 char header + ~50 chars per conflict
+ *   Compare to the previous always-on hardcoded block which was ~700 chars.
  */
 export function buildPromptInstruction(
   availability: ServiceAvailability[],
@@ -142,16 +144,20 @@ export function buildPromptInstruction(
   for (const a of availability) {
     if (!a.hasConflict) continue;
     const userPref = preferences[a.service.id];
-    if (!userPref) continue; // no explicit pref → silent default, no prompt cost
+    // Effective rule when no explicit preference: default to Composio.
+    // We surface this in the prompt anyway so the agent has a deterministic
+    // rule and doesn't recall a contradicting preference from memory.
+    const effective = userPref ?? 'composio';
 
-    if (userPref === 'off') {
+    if (effective === 'off') {
       lines.push(`- ${a.service.label}: do NOT use any of its tools (user disabled)`);
-    } else if (userPref === 'composio' && a.service.composioSlug) {
-      lines.push(`- ${a.service.label}: use \`mcp__${a.service.composioSlug}__*\` (NOT \`mcp__claude_ai_${a.service.claudeDesktopName}__*\`)`);
-    } else if (userPref === 'claude-desktop' && a.service.claudeDesktopName) {
-      lines.push(`- ${a.service.label}: use \`mcp__claude_ai_${a.service.claudeDesktopName}__*\` (NOT \`mcp__${a.service.composioSlug}__*\`)`);
+    } else if (effective === 'composio' && a.service.composioSlug) {
+      const note = userPref ? '' : ' [default]';
+      lines.push(`- ${a.service.label}: \`mcp__${a.service.composioSlug}__*\` (NOT \`mcp__claude_ai_${a.service.claudeDesktopName}__*\`)${note}`);
+    } else if (effective === 'claude-desktop' && a.service.claudeDesktopName) {
+      lines.push(`- ${a.service.label}: \`mcp__claude_ai_${a.service.claudeDesktopName}__*\` (NOT \`mcp__${a.service.composioSlug}__*\`)`);
     }
   }
   if (lines.length === 0) return '';
-  return `## Tool Source Preferences\n\n${lines.join('\n')}`;
+  return `## Tool Source Preferences\n\nThese rules OVERRIDE any tool-source preference you may recall from memory. Do not consult memory for this — the canonical source is the dashboard's Tool Source Preferences (Settings → Integrations).\n\n${lines.join('\n')}`;
 }
