@@ -67,7 +67,7 @@ export const CURATED_TOOLKITS: CuratedToolkit[] = [
   { slug: 'supabase', displayName: 'Supabase', authMode: 'managed' },
   { slug: 'linkedin', displayName: 'LinkedIn', authMode: 'managed' },
   { slug: 'outlook', displayName: 'Outlook', authMode: 'managed' },
-  { slug: 'onedrive', displayName: 'OneDrive', authMode: 'managed' },
+  { slug: 'one_drive', displayName: 'OneDrive', authMode: 'managed' },
   { slug: 'zoom', displayName: 'Zoom', authMode: 'managed' },
   { slug: 'twitter', displayName: 'Twitter / X', authMode: 'byo' },
 ];
@@ -518,7 +518,18 @@ export async function authorizeToolkit(
     return { redirectUrl: conn.redirectUrl ?? null, connectionId: conn.id };
   } catch (err) {
     const status = (err as { status?: number })?.status;
+    const message = (err as { message?: string })?.message ?? '';
     logger.error({ err, slug, userId, status, step: 'toolkits.authorize' }, 'Composio authorize failed');
+    // 404 + "Couldn't fetch Toolkit with slug" = our curated list has a typo
+    // or Composio renamed/removed the slug. Surface a clear, actionable
+    // message instead of the raw API error.
+    if (message.includes("fetch Toolkit with slug") || status === 404) {
+      throw new Error(
+        `Toolkit "${slug}" was not found in Composio's catalog. ` +
+        `The slug may have been renamed or removed. Try the closest match at ` +
+        `https://app.composio.dev/apps, or report this to the Clementine maintainer.`,
+      );
+    }
     // Translate the documented "no managed auth available" error codes into
     // the friendly BYO-setup banner the dashboard already renders.
     if (status === 400 || status === 401 || status === 403) {
