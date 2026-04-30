@@ -15789,7 +15789,7 @@ function switchTab(group, tab) {
   }
   if (group === 'settings') {
     if (tab === 'general' && typeof refreshSettings === 'function') refreshSettings();
-    if (tab === 'integrations') { refreshSalesforce(); refreshComposioConnections(); refreshToolPreferences(); }
+    if (tab === 'integrations') { refreshSalesforce(); refreshComposioConnections(); refreshToolPreferences(); refreshMcpServers(); refreshClaudeIntegrations(); }
     if (tab === 'remote') refreshRemoteAccess();
     if (tab === 'security') refreshAuthSessions();
     if (tab === 'projects' && typeof refreshProjects === 'function') refreshProjects();
