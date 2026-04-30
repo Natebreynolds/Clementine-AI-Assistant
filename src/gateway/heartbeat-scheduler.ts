@@ -82,6 +82,7 @@ export class HeartbeatScheduler {
   private lastDenseBackfillAt = 0;
   private denseBackfillInFlight = false;
   private lastSalienceDecayDate = '';
+  private lastMemoryPulseDate = '';
 
   /** Wire up the cron scheduler so daily plan suggestions can be applied. */
   setCronScheduler(cs: CronScheduler): void { this.cronScheduler = cs; }
@@ -104,6 +105,7 @@ export class HeartbeatScheduler {
     if (this.lastState.lastSelfImproveDate) this.lastSelfImproveDate = this.lastState.lastSelfImproveDate;
     if (this.lastState.lastConsolidationDate) this.lastConsolidationDate = this.lastState.lastConsolidationDate;
     if (this.lastState.lastSalienceDecayDate) this.lastSalienceDecayDate = this.lastState.lastSalienceDecayDate;
+    if (this.lastState.lastMemoryPulseDate) this.lastMemoryPulseDate = this.lastState.lastMemoryPulseDate;
     if (this.lastState.lastAgentSiRuns) {
       this.lastAgentSiRuns = new Map(Object.entries(this.lastState.lastAgentSiRuns));
     }
@@ -398,6 +400,10 @@ export class HeartbeatScheduler {
       }).catch(err => {
         logger.warn({ err }, 'Weekly review failed');
       });
+
+      // Memory Pulse — weekly observability report on the 5-phase memory
+      // system. Skipped if nothing happened (avoids empty noise on quiet weeks).
+      this.maybeSendMemoryPulse();
     }
 
     // First Monday of month: monthly assessment (between 8-9 PM)
@@ -950,6 +956,88 @@ export class HeartbeatScheduler {
       if (decayed > 0) logger.info({ decayed }, 'Daily salience decay sweep complete');
     } catch (err) {
       logger.debug({ err }, 'Salience decay sweep failed (non-fatal)');
+    }
+  }
+
+  /**
+   * Weekly Memory Pulse — once-per-week observability report on the memory
+   * subsystem. Aggregates the same signals visible on Brain → Health
+   * (coverage, recent writes, supersedes, recall contribution) into a
+   * compact message and dispatches it. Skipped if nothing meaningful
+   * happened this week (avoids empty noise on quiet weeks).
+   */
+  private maybeSendMemoryPulse(): void {
+    const today = todayISO();
+    if (this.lastMemoryPulseDate === today) return;
+
+    const store = this.gateway.getMemoryStore();
+    if (!store) return;
+
+    try {
+      const stats = (store as { getMemoryStats: () => {
+        totalChunks: number;
+        chunksWithDenseEmbeddings: number;
+      } }).getMemoryStats();
+
+      const supersedeStats = typeof (store as { getSupersedeStats?: unknown }).getSupersedeStats === 'function'
+        ? (store as { getSupersedeStats: () => { superseded: number } }).getSupersedeStats()
+        : { superseded: 0 };
+
+      const graphStats = typeof (store as { getGraphStats?: unknown }).getGraphStats === 'function'
+        ? (store as { getGraphStats: (opts?: { lookbackHours?: number }) => {
+            wikilinkCount: number;
+            recallContributionByType: Record<string, number>;
+            tracesAnalyzed: number;
+          } }).getGraphStats({ lookbackHours: 24 * 7 })
+        : { wikilinkCount: 0, recallContributionByType: {}, tracesAnalyzed: 0 };
+
+      const recentWrites = typeof (store as { getRecentWrites?: unknown }).getRecentWrites === 'function'
+        ? (store as { getRecentWrites: (limit: number) => Array<{ extractedAt: string; status: string; salienceHint: number | null }> })
+            .getRecentWrites(500)
+        : [];
+      const weekAgoIso = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+      const writesThisWeek = recentWrites.filter(w => w.extractedAt > weekAgoIso);
+      const supersedesThisWeek = writesThisWeek.filter(w => w.status === 'superseded').length;
+      const dedupedThisWeek = writesThisWeek.filter(w => w.status === 'dedup_skipped').length;
+      const writesWithSalience = writesThisWeek.filter(w => w.salienceHint != null).length;
+
+      // Skip if nothing happened (no writes, no traces) — don't spam empty reports
+      if (writesThisWeek.length === 0 && graphStats.tracesAnalyzed === 0) return;
+
+      const coveragePct = stats.totalChunks > 0
+        ? Math.round((stats.chunksWithDenseEmbeddings / stats.totalChunks) * 100)
+        : 0;
+
+      const cb = graphStats.recallContributionByType;
+      const totalMatches = Object.values(cb).reduce((a, b) => a + b, 0);
+      const pctOf = (n: number) => totalMatches > 0 ? Math.round((n / totalMatches) * 100) : 0;
+
+      const lines = [
+        `**Memory Pulse — last 7 days**`,
+        ``,
+        `**Coverage:** ${coveragePct}% semantic (${stats.chunksWithDenseEmbeddings.toLocaleString()}/${stats.totalChunks.toLocaleString()} chunks)`,
+      ];
+      if (writesThisWeek.length > 0) {
+        lines.push(`**Writes:** ${writesThisWeek.length} captured`
+          + (writesWithSalience > 0 ? `, ${writesWithSalience} with salience hint` : '')
+          + (dedupedThisWeek > 0 ? `, ${dedupedThisWeek} reinforced` : ''));
+      }
+      if (supersedesThisWeek > 0 || supersedeStats.superseded > 0) {
+        lines.push(`**Self-correction:** ${supersedesThisWeek} this week, ${supersedeStats.superseded} all-time`);
+      }
+      if (graphStats.tracesAnalyzed > 0 && totalMatches > 0) {
+        lines.push(`**Recall mix:** ${pctOf(cb.fts ?? 0)}% lexical · ${pctOf(cb.vector ?? 0)}% semantic · ${pctOf(cb.graph ?? 0)}% graph · ${pctOf(cb.recency ?? 0)}% recent`);
+      }
+      lines.push(``);
+      lines.push(`Full breakdown on the dashboard: Brain → Health.`);
+
+      this.dispatcher.send(lines.join('\n')).catch(err => logger.debug({ err }, 'Failed to send memory pulse'));
+      this.lastMemoryPulseDate = today;
+      this.lastState.lastMemoryPulseDate = today;
+      this.saveState();
+      logger.info({ coveragePct, writesThisWeek: writesThisWeek.length, supersedesThisWeek }, 'Memory Pulse sent');
+    } catch (err) {
+      logger.debug({ err }, 'Memory Pulse failed (non-fatal)');
     }
   }
 
