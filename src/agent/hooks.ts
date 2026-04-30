@@ -166,6 +166,19 @@ export function setHeartbeatMode(active: boolean, tier2Allowed = false): void {
   heartbeatTier2Allowed = tier2Allowed;
 }
 
+// Session-scoped approval for browser harness T3 actions. Once the user
+// approves a session, subsequent T3 calls within that session auto-allow.
+// Resets on daemon restart (in-memory) and on explicit revoke.
+let browserHarnessSessionApproved = false;
+
+export function resetBrowserHarnessApproval(): void {
+  browserHarnessSessionApproved = false;
+}
+
+export function isBrowserHarnessApproved(): boolean {
+  return browserHarnessSessionApproved;
+}
+
 export function setApprovalCallback(cb: ((desc: string) => Promise<boolean>) | null): void {
   approvalCallback = cb;
 }
@@ -260,11 +273,24 @@ export function logToolUse(toolName: string, toolInput: Record<string, unknown>)
 
 const HEARTBEAT_DISALLOWED_TIER2 = ['Write', 'Edit', 'Bash'];
 
+// Browser harness write-class tools — drive the user's real Chrome with their
+// live cookies/sessions. NEVER run these without interactive approval. The
+// MCP server name is "browser-harness" so the SDK exposes them as
+// mcp__browser-harness__<tool>.
+const BROWSER_HARNESS_T3_TOOLS = [
+  'mcp__browser-harness__browser_click_xy',
+  'mcp__browser-harness__browser_type_text',
+  'mcp__browser-harness__browser_press_key',
+  'mcp__browser-harness__browser_scroll',
+  'mcp__browser-harness__browser_run_python',
+];
+
 const HEARTBEAT_DISALLOWED_ALWAYS = [
   'Bash',      // No raw shell in low-tier autonomous mode
   'Task',      // No sub-agents in heartbeats (too short to benefit)
   'Skill',     // Skill packs load heavy context and waste turns
   'TodoWrite', // Internal bookkeeping wastes autonomous turns
+  ...BROWSER_HARNESS_T3_TOOLS, // Browser writes never run unsupervised
 ];
 
 export function getHeartbeatDisallowedTools(): string[] {
@@ -401,6 +427,44 @@ export async function enforceToolPermissions(
         behavior: 'deny',
         message: `${toolName} is not allowed during autonomous execution.`,
       };
+    }
+  }
+
+  // ── Browser harness T3 — never autonomous, approve once per session ─
+  // These tools click/type/scroll/run-python in the user's REAL Chrome
+  // with their live cookies. They must never run without explicit consent.
+  const effectiveSourceForBrowser = sourceOverride ?? interactionSource;
+  if (BROWSER_HARNESS_T3_TOOLS.includes(toolName)) {
+    // Hard block during any autonomous context (cron tier-2, unleashed,
+    // heartbeat, member-channel sources). Heartbeat block is also handled
+    // above via getHeartbeatDisallowedTools, but this catches tier-2 cron
+    // and unleashed where heartbeatActive=false.
+    if (heartbeatActive || effectiveSourceForBrowser === 'autonomous') {
+      appendAuditFile(`[BROWSER-HARNESS] DENIED autonomous: ${toolName}`);
+      return {
+        behavior: 'deny',
+        message: `${toolName} controls your live browser — blocked during autonomous execution. Run interactively instead.`,
+      };
+    }
+    // Interactive: ask once per session. Subsequent T3 calls auto-allow
+    // until daemon restart (or explicit revoke via resetBrowserHarnessApproval).
+    if (!browserHarnessSessionApproved) {
+      if (approvalCallback) {
+        const approved = await approvalCallback(
+          'Allow Clementine to control your browser this session? Clicks, types, and key presses will run in your real Chrome with your live cookies and logins.',
+        );
+        if (!approved) {
+          return { behavior: 'deny', message: 'Browser control denied by user.' };
+        }
+        browserHarnessSessionApproved = true;
+        appendAuditFile('[BROWSER-HARNESS] Session approval granted');
+      } else {
+        // No approval callback wired — be safe, deny.
+        return {
+          behavior: 'deny',
+          message: 'Browser control requires interactive approval, but no approval callback is set in this context.',
+        };
+      }
     }
   }
 
