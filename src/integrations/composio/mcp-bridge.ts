@@ -65,33 +65,23 @@ export async function buildComposioMcpServers(
 async function buildOne(
   composio: NonNullable<ReturnType<typeof getComposio>>,
   slug: string,
-  connected: Awaited<ReturnType<typeof listConnectedToolkits>>,
+  _connected: Awaited<ReturnType<typeof listConnectedToolkits>>,
 ): Promise<McpSdkServerConfigWithInstance> {
-  // If 2+ active connections for this toolkit, force Composio to require
-  // explicit account selection per tool call — otherwise it silently picks
-  // the default (newest) account.
-  const activeCount = connected.filter(
-    c => c.slug === slug && c.status === 'ACTIVE',
-  ).length;
-
-  // Look up auth config explicitly. Without this, composio.create() tries to
-  // auto-create one and 400s for BYO toolkits (Twitter etc.) that don't have
-  // a managed OAuth app available.
-  const authConfig = (await composio.authConfigs.list({ toolkit: slug })).items[0];
-
+  // composio.tools.get() returns the FLAT toolkit tools (OUTLOOK_LIST_MESSAGES,
+  // GMAIL_SEND_EMAIL, …) — exactly the namespacing the agent expects as
+  // mcp__outlook__OUTLOOK_LIST_MESSAGES. The alternative, composio.create()
+  // + session.tools(), uses Composio's tool-router pattern and only returns
+  // 5 meta-tools (COMPOSIO_SEARCH_TOOLS, COMPOSIO_MULTI_EXECUTE_TOOL, …),
+  // which doesn't match what the agent calls. Verified empirically:
+  // tools.get returns 50+ actual Outlook tools.
   const userId = await getPreferredUserId();
-  const session = await composio.create(userId, {
-    toolkits: [slug],
-    manageConnections: false,
-    ...(authConfig ? { authConfigs: { [slug]: authConfig.id } } : {}),
-    ...(activeCount >= 2
-      ? { multiAccount: { enable: true, requireExplicitSelection: true } }
-      : {}),
-  });
-  const tools = await session.tools();
+  const toolsRaw = await composio.tools.get(userId, { toolkits: [slug], limit: 200 });
+  // tools.get can return an array OR an object depending on provider; normalise.
+  const toolsArr = Array.isArray(toolsRaw) ? toolsRaw : Object.values(toolsRaw);
+  const tools = toolsArr.filter((t: any) => t && typeof t.name === 'string' && typeof t.handler === 'function');
   return createSdkMcpServer({
     name: slug,
     version: '0.1.0',
-    tools,
+    tools: tools as any,
   });
 }

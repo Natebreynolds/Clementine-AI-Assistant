@@ -117,11 +117,11 @@ export async function getPreferredUserId(): Promise<string> {
 // calls have to pass *some* user_id, and we want it to match whatever the
 // user already has if possible. detectPreferredUserId() picks the user_id
 // with the most existing connections, falling back to this constant.
-// Empty string matches Composio's web-UI default user_id (verified by
-// probing — connections created via dashboard.composio.dev land under '').
-// Using the same value here keeps Clementine-authorized connections in the
-// same bucket as anything the user already has from the web UI.
-const DEFAULT_NEW_CONNECTION_USER_ID = '';
+// Used only when there are no existing connections to learn from. The real
+// path is detectPreferredUserId() reading the user_id off existing records
+// via the raw client — that's how we match Composio's web-UI auto-generated
+// IDs like `pg-test-<uuid>`.
+const DEFAULT_NEW_CONNECTION_USER_ID = 'default';
 
 export function clementineUserId(): string {
   return readComposioEnv('COMPOSIO_USER_ID') || DEFAULT_NEW_CONNECTION_USER_ID;
@@ -137,35 +137,40 @@ async function detectPreferredUserId(
   if (explicit) return explicit;
   if (detectedPreferredUserId !== null) return detectedPreferredUserId;
 
-  // The list response doesn't expose userId on records (verified empirically),
-  // so we can't read it from the data. Instead, probe each candidate user_id
-  // with a filtered list and pick whichever returns connections. This matches
-  // however the connections were originally created — including empty string,
-  // which is what Composio's web UI uses by default for new accounts.
-  const candidates = ['', 'default', 'user', 'me'];
-  let totalUnscoped = 0;
+  // The high-level wrapper's list() drops the snake_case `user_id` field
+  // during its camelCase transformation, so connections look like they have
+  // no user_id. Use the raw client (snake_case shape) to actually read the
+  // user_id Composio's web UI assigned (typically `pg-test-<uuid>` for
+  // dashboard-created connections). Without this, we'd default to "default"
+  // and composio.create() / toolkits.authorize() would never see existing
+  // connections — every tool call would 401.
   try {
-    const all = await composio.connectedAccounts.list({ limit: 1 });
-    totalUnscoped = all.items.length;
-  } catch { /* non-fatal */ }
-
-  if (totalUnscoped > 0) {
-    for (const uid of candidates) {
-      try {
-        const resp = await composio.connectedAccounts.list({ userIds: [uid], limit: 1 });
-        if (resp.items.length > 0) {
-          logger.info({ userId: uid }, 'Detected Composio user_id via probe');
-          detectedPreferredUserId = uid;
-          return uid;
-        }
-      } catch { /* try next */ }
+    const rawClient = (composio as any).client;
+    const resp = await rawClient.connectedAccounts.list({});
+    const items = (resp?.items ?? []) as Array<{ user_id?: string; status?: string }>;
+    const counts = new Map<string, number>();
+    for (const it of items) {
+      // Prefer ACTIVE connections — expired ones often outnumber active ones
+      // (3 outlooks: 1 ACTIVE + 2 EXPIRED in real data).
+      if (it.status === 'ACTIVE' && typeof it.user_id === 'string' && it.user_id.length > 0) {
+        counts.set(it.user_id, (counts.get(it.user_id) ?? 0) + 2); // weight active higher
+      } else if (typeof it.user_id === 'string' && it.user_id.length > 0) {
+        counts.set(it.user_id, (counts.get(it.user_id) ?? 0) + 1);
+      }
     }
+    if (counts.size > 0) {
+      const top = [...counts.entries()].sort((a, b) => b[1] - a[1])[0]![0];
+      logger.info({ userId: top, candidates: counts.size }, 'Detected Composio user_id from existing connections');
+      detectedPreferredUserId = top;
+      return top;
+    }
+  } catch (err) {
+    logger.warn({ err }, 'Raw client user_id probe failed — using fallback');
   }
 
-  // No connections yet, or none of the common user_ids match. Fall back to
-  // empty string, which is what Composio's web UI uses by default — keeps
-  // future Clementine-authorized connections in the same bucket as anything
-  // the user creates in Composio's dashboard.
+  // No existing connections. Fall back to "default" — composio.create()
+  // requires a non-empty string, and "default" is the conventional
+  // single-tenant value that Composio's quickstart uses.
   detectedPreferredUserId = DEFAULT_NEW_CONNECTION_USER_ID;
   return DEFAULT_NEW_CONNECTION_USER_ID;
 }
