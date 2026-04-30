@@ -38,7 +38,7 @@ import { cmdCronList, cmdCronRun, cmdCronRunDue, cmdCronRuns, cmdCronAdd, cmdCro
 import { cmdDashboard } from './dashboard.js';
 import { cmdChat } from './chat.js';
 import { cmdIngestSeed, cmdIngestRun, cmdIngestList, cmdIngestStatus } from './ingest.js';
-import { cmdBrowserStatus, cmdBrowserInstall, cmdBrowserEnable, cmdBrowserDisable, maybePromptBrowserHarness } from './browser.js';
+import { cmdBrowserStatus, cmdBrowserInstall, cmdBrowserEnable, cmdBrowserDisable, cmdBrowserConnect, maybePromptBrowserHarness } from './browser.js';
 import { isSensitiveEnvKey } from '../secrets/sensitivity.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -4750,6 +4750,11 @@ browserCmd
   .command('enable')
   .description('Register the browser harness MCP server in mcp-servers.json')
   .action(cmdBrowserEnable);
+
+browserCmd
+  .command('connect')
+  .description('Quit Chrome and relaunch it with --remote-debugging-port=9222 (one-shot)')
+  .action(cmdBrowserConnect);
 
 browserCmd
   .command('disable')

@@ -20,6 +20,7 @@
 
 import { execSync, spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -52,6 +53,32 @@ function commandExists(cmd: string): boolean {
   return result.status === 0;
 }
 
+/** Probe the CDP socket — returns true if Chrome is listening on :9222. */
+function probeCdp(): Promise<boolean> {
+  return new Promise(resolve => {
+    const req = http.get('http://localhost:9222/json/version', { timeout: 1500 }, res => {
+      resolve(res.statusCode === 200);
+      res.resume();
+    });
+    req.on('error', () => resolve(false));
+    req.on('timeout', () => { req.destroy(); resolve(false); });
+  });
+}
+
+/** True if a Google Chrome process is currently running. */
+function isChromeRunning(): boolean {
+  if (process.platform === 'darwin') {
+    const r = spawnSync('pgrep', ['-x', 'Google Chrome'], { stdio: 'pipe' });
+    return r.status === 0;
+  }
+  // Linux: chrome / chromium / google-chrome
+  for (const name of ['google-chrome', 'chromium', 'chrome']) {
+    const r = spawnSync('pgrep', ['-x', name], { stdio: 'pipe' });
+    if (r.status === 0) return true;
+  }
+  return false;
+}
+
 function pythonVersion(): string | null {
   try {
     const out = execSync('python3 --version', { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] });
@@ -82,6 +109,7 @@ export async function cmdBrowserStatus(): Promise<void> {
   const harnessOk = existsSync(path.join(HARNESS_HOME, 'src'));
   const servers = loadMcpServers();
   const enabled = Object.prototype.hasOwnProperty.call(servers, SERVER_NAME);
+  const cdpOk = await probeCdp();
 
   console.log();
   console.log(`  ${BOLD}Browser Harness${RESET} ${DIM}(beta)${RESET}`);
@@ -91,6 +119,7 @@ export async function cmdBrowserStatus(): Promise<void> {
   console.log(`  ${venvOk ? GREEN + '✓' : YELLOW + '○'}${RESET} venv installed    ${DIM}${VENV_DIR}${RESET}`);
   console.log(`  ${harnessOk ? GREEN + '✓' : YELLOW + '○'}${RESET} harness cloned    ${DIM}${HARNESS_HOME}${RESET}`);
   console.log(`  ${enabled ? GREEN + '✓' : DIM + '○'}${RESET} MCP entry         ${DIM}${enabled ? 'enabled' : 'disabled'} in mcp-servers.json${RESET}`);
+  console.log(`  ${cdpOk ? GREEN + '✓' : YELLOW + '○'}${RESET} Chrome CDP        ${DIM}${cdpOk ? 'connected on :9222' : 'not connected — run: clementine browser connect'}${RESET}`);
   console.log();
   if (!py) {
     console.log(`  ${YELLOW}Install Python 3.10+ first:${RESET}`);
@@ -102,8 +131,11 @@ export async function cmdBrowserStatus(): Promise<void> {
   } else if (!enabled) {
     console.log(`  Next: ${BOLD}clementine browser enable${RESET}`);
     console.log();
+  } else if (!cdpOk) {
+    console.log(`  Next: ${BOLD}clementine browser connect${RESET}`);
+    console.log();
   } else {
-    console.log(`  ${GREEN}Ready.${RESET} ${DIM}Restart the daemon to pick up changes: clementine restart${RESET}`);
+    console.log(`  ${GREEN}Ready.${RESET} ${DIM}Browser harness is fully connected.${RESET}`);
     console.log();
   }
 }
@@ -218,12 +250,8 @@ export async function cmdBrowserInstall(): Promise<void> {
   const ok = await runInstall();
   if (!ok) process.exit(1);
   console.log();
-  console.log(`  ${BOLD}Next steps:${RESET}`);
-  console.log(`  1. Enable Chrome remote debugging — open Chrome with:`);
-  console.log(`       ${CYAN}/Applications/Google\\ Chrome.app/Contents/MacOS/Google\\ Chrome \\${RESET}`);
-  console.log(`         ${CYAN}--remote-debugging-port=9222${RESET}`);
-  console.log(`  2. Enable the MCP server:  ${BOLD}clementine browser enable${RESET}`);
-  console.log(`  3. Restart the daemon:     ${BOLD}clementine restart${RESET}`);
+  console.log(`  ${BOLD}Next:${RESET} ${BOLD}clementine browser enable${RESET} — register the MCP server`);
+  console.log(`  ${DIM}Then connect Chrome with: clementine browser connect${RESET}`);
   console.log();
 }
 
@@ -296,8 +324,26 @@ export async function maybePromptBrowserHarness(): Promise<void> {
   }
   console.log();
   console.log(`  ${GREEN}✓${RESET} Browser Harness installed and enabled.`);
-  console.log(`  ${DIM}Open Chrome with --remote-debugging-port=9222 to connect.${RESET}`);
   console.log();
+
+  // Offer to connect Chrome right now
+  let connectNow = false;
+  try {
+    connectNow = await confirm({
+      message: 'Connect Chrome now? (relaunches Chrome with debugging — will close current windows)',
+      default: false,
+    });
+  } catch {
+    // Ctrl+C — bail without dismissing
+    return;
+  }
+
+  if (connectNow) {
+    await runConnect({ confirmQuit: false });
+  } else {
+    console.log(`  ${DIM}Connect later with: ${BOLD}clementine browser connect${RESET}`);
+    console.log();
+  }
 }
 
 export async function cmdBrowserDisable(): Promise<void> {
@@ -316,4 +362,118 @@ export async function cmdBrowserDisable(): Promise<void> {
   console.log(`    ${CYAN}rm -rf "${VENV_DIR}" "${HARNESS_HOME}"${RESET}`);
   console.log(`  ${DIM}Restart the daemon: clementine restart${RESET}`);
   console.log();
+}
+
+/**
+ * Core connect logic — quits any running Chrome and relaunches with
+ * --remote-debugging-port=9222 so browser-harness can connect.
+ *
+ * Returns true when CDP is reachable on :9222 at the end, false otherwise.
+ * Never calls process.exit so it's safe to call from the auto-prompt flow.
+ */
+async function runConnect(opts: { confirmQuit?: boolean } = {}): Promise<boolean> {
+  // 1. Already connected? Done.
+  if (await probeCdp()) {
+    console.log();
+    console.log(`  ${GREEN}✓${RESET} Already connected — Chrome is running with remote debugging on :9222`);
+    console.log();
+    return true;
+  }
+
+  // 2. Platform check — auto-launch is currently macOS only
+  if (process.platform !== 'darwin' && process.platform !== 'linux') {
+    console.error();
+    console.error(`  ${YELLOW}Auto-connect is only supported on macOS and Linux.${RESET}`);
+    console.error(`  Launch Chrome manually with the flag: ${BOLD}--remote-debugging-port=9222${RESET}`);
+    console.error();
+    return false;
+  }
+
+  // 3. Chrome already running without the flag? Need to quit first.
+  if (isChromeRunning()) {
+    console.log();
+    console.log(`  ${YELLOW}Chrome is running, but without remote debugging.${RESET}`);
+    console.log(`  ${DIM}To connect, Chrome needs to be quit and relaunched with the flag.${RESET}`);
+    console.log(`  ${DIM}This will close your current Chrome windows.${RESET}`);
+    console.log();
+    let confirmed = !opts.confirmQuit; // skip prompt when caller already confirmed
+    if (opts.confirmQuit) {
+      try {
+        confirmed = await confirm({
+          message: 'Quit Chrome and relaunch with debugging?',
+          default: false,
+        });
+      } catch {
+        return false;
+      }
+    }
+    if (!confirmed) {
+      console.log(`  ${DIM}Skipped. To do it yourself: quit Chrome (Cmd+Q), then run:${RESET}`);
+      console.log(`    ${BOLD}clementine browser connect${RESET}`);
+      console.log();
+      return false;
+    }
+    console.log(`  ${DIM}→ quitting Chrome...${RESET}`);
+    try {
+      if (process.platform === 'darwin') {
+        execSync('osascript -e \'tell application "Google Chrome" to quit\'', { stdio: 'pipe' });
+      } else {
+        // Linux: graceful TERM, then KILL if needed
+        try { execSync('pkill -TERM -x "google-chrome|chromium|chrome"', { stdio: 'pipe' }); } catch { /* ok */ }
+      }
+      // Wait briefly for Chrome to actually exit
+      for (let i = 0; i < 15; i++) {
+        if (!isChromeRunning()) break;
+        await new Promise(r => setTimeout(r, 300));
+      }
+    } catch {
+      console.error(`  ${RED}Failed to quit Chrome.${RESET} Please quit it manually and re-run.`);
+      return false;
+    }
+  }
+
+  // 4. Launch Chrome with the debugging flag
+  console.log(`  ${DIM}→ launching Chrome with --remote-debugging-port=9222${RESET}`);
+  try {
+    if (process.platform === 'darwin') {
+      execSync('open -na "Google Chrome" --args --remote-debugging-port=9222', { stdio: 'pipe' });
+    } else {
+      // Linux — find a chrome binary in PATH
+      const candidates = ['google-chrome', 'chromium', 'chrome'];
+      const bin = candidates.find(commandExists);
+      if (!bin) {
+        console.error(`  ${RED}No Chrome / Chromium binary found in PATH.${RESET}`);
+        return false;
+      }
+      // Launch detached so this command returns immediately
+      execSync(`nohup ${bin} --remote-debugging-port=9222 >/dev/null 2>&1 &`, { stdio: 'pipe' });
+    }
+  } catch (e) {
+    console.error(`  ${RED}Failed to launch Chrome:${RESET} ${String(e).slice(0, 200)}`);
+    return false;
+  }
+
+  // 5. Poll for CDP availability (up to ~6s)
+  for (let i = 0; i < 24; i++) {
+    await new Promise(r => setTimeout(r, 250));
+    if (await probeCdp()) {
+      console.log();
+      console.log(`  ${GREEN}✓${RESET} Connected — Chrome is running with remote debugging on :9222`);
+      console.log(`  ${DIM}Browser harness can now control your live session.${RESET}`);
+      console.log();
+      return true;
+    }
+  }
+
+  console.error();
+  console.error(`  ${YELLOW}Chrome launched, but CDP socket isn't responding yet.${RESET}`);
+  console.error(`  ${DIM}Check that Chrome started, then verify with:${RESET}`);
+  console.error(`    ${CYAN}curl http://localhost:9222/json/version${RESET}`);
+  console.error();
+  return false;
+}
+
+export async function cmdBrowserConnect(): Promise<void> {
+  const ok = await runConnect({ confirmQuit: true });
+  if (!ok) process.exit(1);
 }
