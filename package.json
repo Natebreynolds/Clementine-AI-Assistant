@@ -86,6 +86,7 @@
     "dist/",
     "vault/",
     "scripts/",
+    "vendor/",
     "install.sh",
     "README.md",
     ".env.example"

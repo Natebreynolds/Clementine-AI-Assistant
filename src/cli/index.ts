@@ -38,6 +38,7 @@ import { cmdCronList, cmdCronRun, cmdCronRunDue, cmdCronRuns, cmdCronAdd, cmdCro
 import { cmdDashboard } from './dashboard.js';
 import { cmdChat } from './chat.js';
 import { cmdIngestSeed, cmdIngestRun, cmdIngestList, cmdIngestStatus } from './ingest.js';
+import { cmdBrowserStatus, cmdBrowserInstall, cmdBrowserEnable, cmdBrowserDisable } from './browser.js';
 import { isSensitiveEnvKey } from '../secrets/sensitivity.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -4723,5 +4724,31 @@ ingestCmd
   .command('status <slug>')
   .description('Show recent runs and metadata for a source')
   .action(cmdIngestStatus);
+
+// ── Browser harness (beta) ──────────────────────────────────────────
+
+const browserCmd = program
+  .command('browser')
+  .description('Browser harness — drive your real Chrome via CDP (beta, opt-in)');
+
+browserCmd
+  .command('status')
+  .description('Show install and enable state of the browser harness MCP')
+  .action(cmdBrowserStatus);
+
+browserCmd
+  .command('install')
+  .description('Clone browser-harness and install Python deps into a private venv')
+  .action(cmdBrowserInstall);
+
+browserCmd
+  .command('enable')
+  .description('Register the browser harness MCP server in mcp-servers.json')
+  .action(cmdBrowserEnable);
+
+browserCmd
+  .command('disable')
+  .description('Remove the browser harness MCP entry (keeps installed files)')
+  .action(cmdBrowserDisable);
 
 program.parse();
