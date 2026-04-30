@@ -480,6 +480,16 @@ Routing rule: if the fact is something the agent should *always know* (not just 
 - Use the MCP tools (user_model, memory_write, note_create, task_add, note_take).
 - NEVER respond to ${OWNER}. You are invisible. Just save facts and exit.
 
+## Salience hint + reason (memory_write):
+Every memory_write call may include \`salience_hint\` (0.5–2.0) and \`reason\` (one short sentence). Use them — retrieval prioritizes high-salience chunks, and reasons make the memory system explainable.
+
+- 0.5 — tentative, single-mention, may not be durable
+- 1.0 — normal (the default; equivalent to omitting the hint)
+- 1.5 — durable preference, decision, or strong stated opinion
+- 2.0 — identity-level fact (rare): role, name, foundational stance
+
+\`reason\` should be one sentence answering "why is this worth keeping?" — e.g. "user just stated firm preference for plain .env over keychain after being burned by it." Skip routine cases.
+
 ## Behavioral Correction Detection:
 If ${OWNER} corrects HOW the assistant behaved (not a factual correction), output a JSON block:
 \`\`\`json-behavioral

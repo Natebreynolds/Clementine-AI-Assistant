@@ -79,6 +79,8 @@ export class HeartbeatScheduler {
   private lastAgentSiRuns = new Map<string, string>();
   private cronScheduler: CronScheduler | null = null;
   private runLog = new CronRunLog();
+  private lastDenseBackfillAt = 0;
+  private denseBackfillInFlight = false;
 
   /** Wire up the cron scheduler so daily plan suggestions can be applied. */
   setCronScheduler(cs: CronScheduler): void { this.cronScheduler = cs; }
@@ -177,6 +179,14 @@ export class HeartbeatScheduler {
         logger.warn({ err }, 'Failure sweep failed');
       });
     }).catch(err => logger.warn({ err }, 'Failure sweep import failed'));
+
+    // Idle dense-embedding backfill. Retrieval quality silently degrades when
+    // chunks are stuck on TF-IDF only — this self-healing loop keeps coverage
+    // climbing during quiet periods. Skipped when chat lane is busy (CPU
+    // would compete with response latency) or already on cooldown.
+    this.maybeIdleDenseBackfill().catch(err => {
+      logger.debug({ err }, 'Idle dense backfill failed (non-fatal)');
+    });
 
     // Claim verification sweep — auto-verify pending claims whose due
     // times have passed (e.g. "I scheduled X for 8am" → check at 9am).
@@ -858,6 +868,59 @@ export class HeartbeatScheduler {
    * Proactive insight check — gather signals, evaluate urgency, send if warranted.
    * Runs as a lightweight Haiku call, separate from the main heartbeat LLM invocation.
    */
+
+  /**
+   * Self-healing dense embedding backfill. Runs a small batch each tick when:
+   *  - chat lane has 0 active sessions (don't compete with response latency)
+   *  - dense model is available
+   *  - >= 10 minutes since last backfill (cooldown)
+   *  - not already running
+   *
+   * Per-pass cap (50 chunks) keeps each tick under ~30s on Apple Silicon CPU.
+   * Coverage climbs over hours/days without user action.
+   */
+  private async maybeIdleDenseBackfill(): Promise<void> {
+    if (this.denseBackfillInFlight) return;
+    const sinceLastMs = Date.now() - this.lastDenseBackfillAt;
+    if (sinceLastMs < 10 * 60 * 1000) return;
+
+    const { lanes } = await import('./lanes.js');
+    if (lanes.status().chat.active > 0) return;
+
+    const store = this.gateway.getMemoryStore();
+    if (!store) return;
+
+    const stats = store.getMemoryStats();
+    if (stats.totalChunks === 0) return;
+    if (stats.chunksWithDenseEmbeddings >= stats.totalChunks) return;
+
+    const embeddings = await import('../memory/embeddings.js');
+    if (!embeddings.isDenseReady()) {
+      // First time: try to load the model in the background. Don't block the
+      // tick — if download is needed (~440MB), it can take a while.
+      embeddings.probeDenseReady().catch(() => { /* logged inside */ });
+      return;
+    }
+
+    this.denseBackfillInFlight = true;
+    this.lastDenseBackfillAt = Date.now();
+    try {
+      const result = await store.backfillDenseEmbeddings({ limit: 50 });
+      if (result.embedded > 0) {
+        const after = store.getMemoryStats();
+        const pct = after.totalChunks > 0
+          ? Math.round((after.chunksWithDenseEmbeddings / after.totalChunks) * 100)
+          : 0;
+        logger.info(
+          { embedded: result.embedded, failed: result.failed, coveragePct: pct, model: result.model },
+          'Idle dense backfill batch complete',
+        );
+      }
+    } finally {
+      this.denseBackfillInFlight = false;
+    }
+  }
+
   private async runInsightCheck(): Promise<void> {
     // Initialize insight state if needed
     if (!this.lastState.insightState) {

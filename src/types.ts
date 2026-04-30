@@ -621,9 +621,12 @@ export interface WorkflowDefinition {
 
 export type WorkflowOriginKind = 'workflow' | 'cron';
 
+export type WorkflowOwnerScope = 'global' | 'agent';
+
 export interface BuilderWorkflowSummary {
   id: string;
   origin: WorkflowOriginKind;
+  scope: WorkflowOwnerScope;
   name: string;
   description: string;
   enabled: boolean;

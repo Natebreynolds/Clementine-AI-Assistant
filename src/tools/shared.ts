@@ -95,6 +95,9 @@ export type MemoryStoreType = {
   correctExtraction(id: number, correction: string): void;
   dismissExtraction(id: number): void;
   bumpChunkSalience(chunkId: number, boost?: number): void;
+  applyWriteSalience(sourceFile: string, section: string | null, hint: number): number;
+  markChunkSuperseded(oldChunkId: number, newChunkId: number, opts?: { reason?: string; agent?: string }): boolean;
+  getChunkBySection(sourceFile: string, section: string): { id: number } | null;
   getRecentCorrections(limit?: number): Array<{ toolInput: string; correction: string }>;
   getConsolidationCandidates(minAgeDays?: number): Array<{
     topic: string; chunkIds: number[]; contents: string[]; totalChars: number;
