@@ -19,11 +19,13 @@ import path from 'node:path';
 let TMP_DIR = '';
 const TMP_CRON = () => path.join(TMP_DIR, 'CRON.md');
 const TMP_WORKFLOWS = () => path.join(TMP_DIR, 'workflows');
+const TMP_AGENTS = () => path.join(TMP_DIR, 'agents');
 
 vi.mock('../src/config.js', () => ({
   get CRON_FILE() { return TMP_CRON(); },
   get WORKFLOWS_DIR() { return TMP_WORKFLOWS(); },
-  // The serializer only needs these two.
+  get AGENTS_DIR() { return TMP_AGENTS(); },
+  // The serializer only needs these path constants.
   BASE_DIR: '/tmp',
 }));
 
@@ -55,6 +57,7 @@ describe('Builder serializer', () => {
     it('cronId/parseBuilderId round-trip', () => {
       expect(parseBuilderId(cronId('morning-briefing'))).toEqual({
         origin: 'cron',
+        scope: 'global',
         key: 'morning-briefing',
       });
     });
@@ -62,7 +65,23 @@ describe('Builder serializer', () => {
     it('workflowId strips .md and parseBuilderId round-trips', () => {
       expect(parseBuilderId(workflowId('daily-digest.md'))).toEqual({
         origin: 'workflow',
+        scope: 'global',
         key: 'daily-digest',
+      });
+    });
+
+    it('scoped ids round-trip with agent owner', () => {
+      expect(parseBuilderId(cronId('daily-leads', 'sdr'))).toEqual({
+        origin: 'cron',
+        scope: 'agent',
+        agentSlug: 'sdr',
+        key: 'daily-leads',
+      });
+      expect(parseBuilderId(workflowId('lead-pipeline.md', 'sdr'))).toEqual({
+        origin: 'workflow',
+        scope: 'agent',
+        agentSlug: 'sdr',
+        key: 'lead-pipeline',
       });
     });
 
@@ -262,6 +281,48 @@ describe('Builder serializer', () => {
       expect(wfX?.description).toBe('test workflow');
     });
 
+    it('returns agent-scoped crons and workflows', () => {
+      const agentDir = path.join(TMP_AGENTS(), 'sdr');
+      mkdirSync(path.join(agentDir, 'workflows'), { recursive: true });
+      writeFileSync(path.join(agentDir, 'CRON.md'), [
+        '---',
+        'jobs:',
+        '  - name: daily-leads',
+        "    schedule: '0 8 * * 1-5'",
+        '    prompt: find leads',
+        '    enabled: true',
+        '    tier: 2',
+        '---',
+      ].join('\n'), 'utf-8');
+      writeFileSync(path.join(agentDir, 'workflows', 'lead-pipeline.md'), [
+        '---',
+        'type: workflow',
+        'name: lead pipeline',
+        'description: agent workflow',
+        'enabled: true',
+        'trigger:',
+        '  manual: true',
+        'steps:',
+        '  - id: s1',
+        '    prompt: do it',
+        '    dependsOn: []',
+        '    tier: 1',
+        '    maxTurns: 15',
+        '---',
+      ].join('\n'), 'utf-8');
+
+      const list = listAllForBuilder();
+      const cron = list.find(l => l.id === cronId('daily-leads', 'sdr'));
+      expect(cron?.origin).toBe('cron');
+      expect(cron?.agentSlug).toBe('sdr');
+      expect(cron?.scope).toBe('agent');
+
+      const wf = list.find(l => l.id === workflowId('lead-pipeline', 'sdr'));
+      expect(wf?.origin).toBe('workflow');
+      expect(wf?.agentSlug).toBe('sdr');
+      expect(wf?.scope).toBe('agent');
+    });
+
     it('returns empty array when neither file/dir exists', () => {
       // No setup beyond beforeEach (which mkdir's the workflows dir but not CRON.md)
       const list = listAllForBuilder();
@@ -287,6 +348,26 @@ describe('Builder serializer', () => {
       expect(wf!.steps).toHaveLength(1);
       expect(wf!.steps[0].prompt).toBe('brief me');
       expect(isCronShape(wf!)).toBe(true);
+    });
+
+    it('reads an agent cron entry as a virtual single-step workflow', () => {
+      const agentDir = path.join(TMP_AGENTS(), 'sdr');
+      mkdirSync(agentDir, { recursive: true });
+      writeFileSync(path.join(agentDir, 'CRON.md'), [
+        '---',
+        'jobs:',
+        '  - name: daily-leads',
+        "    schedule: '0 8 * * 1-5'",
+        '    prompt: find leads',
+        '    enabled: true',
+        '    tier: 2',
+        '---',
+      ].join('\n'), 'utf-8');
+
+      const wf = readWorkflow(cronId('daily-leads', 'sdr'));
+      expect(wf).not.toBeNull();
+      expect(wf!.agentSlug).toBe('sdr');
+      expect(wf!.steps[0].prompt).toBe('find leads');
     });
 
     it('returns null for missing cron name', () => {
@@ -369,6 +450,34 @@ describe('Builder serializer', () => {
       expect(back!.steps[1].kind).toBe('mcp');
       expect(back!.steps[1].mcp).toEqual({ server: 'gh', tool: 'list_prs' });
       expect(back!.steps[1].dependsOn).toEqual(['s1']);
+    });
+
+    it('saves an agent cron back to the agent CRON.md without prefixing the stored name', () => {
+      const agentDir = path.join(TMP_AGENTS(), 'sdr');
+      mkdirSync(agentDir, { recursive: true });
+      const cronFile = path.join(agentDir, 'CRON.md');
+      writeFileSync(cronFile, [
+        '---',
+        'jobs:',
+        '  - name: daily-leads',
+        "    schedule: '0 8 * * 1-5'",
+        '    prompt: old prompt',
+        '    enabled: true',
+        '    tier: 2',
+        '---',
+      ].join('\n'), 'utf-8');
+
+      const id = cronId('daily-leads', 'sdr');
+      const wf = readWorkflow(id)!;
+      wf.name = 'sdr:daily-leads';
+      wf.steps[0].prompt = 'new prompt';
+      const result = saveWorkflow(id, wf);
+      expect(result.ok).toBe(true);
+
+      const written = readFileSync(cronFile, 'utf-8');
+      expect(written).toContain('name: daily-leads');
+      expect(written).not.toContain('name: sdr:daily-leads');
+      expect(written).toContain('new prompt');
     });
   });
 });

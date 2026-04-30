@@ -20,7 +20,7 @@ import path from 'node:path';
 import matter from 'gray-matter';
 import yaml from 'js-yaml';
 
-import { CRON_FILE, WORKFLOWS_DIR } from '../../config.js';
+import { CRON_FILE, WORKFLOWS_DIR, AGENTS_DIR } from '../../config.js';
 import { snapshotWorkflow } from './snapshots.js';
 import type {
   WorkflowDefinition,
@@ -32,23 +32,70 @@ import type {
 } from '../../types.js';
 
 // ── ID scheme ───────────────────────────────────────────────────────
+//
+// Global:        `cron:<key>` / `workflow:<key>`
+// Agent-scoped:  `cron@<slug>:<key>` / `workflow@<slug>:<key>`
+// `@` is reserved (slugs and workflow keys are kebab-case `[a-z0-9-]+`),
+// so it cleanly distinguishes scoped ids from global ones without
+// breaking any existing global id parser.
 
 const CRON_ID_PREFIX = 'cron:';
 const WORKFLOW_ID_PREFIX = 'workflow:';
+const CRON_AGENT_PREFIX = 'cron@';
+const WORKFLOW_AGENT_PREFIX = 'workflow@';
 
-export function cronId(name: string): string {
+export function cronId(name: string, agentSlug?: string): string {
+  if (agentSlug) return CRON_AGENT_PREFIX + agentSlug + ':' + name;
   return CRON_ID_PREFIX + name;
 }
 
-export function workflowId(filename: string): string {
+export function workflowId(filename: string, agentSlug?: string): string {
   const base = filename.endsWith('.md') ? filename.slice(0, -3) : filename;
+  if (agentSlug) return WORKFLOW_AGENT_PREFIX + agentSlug + ':' + base;
   return WORKFLOW_ID_PREFIX + base;
 }
 
-export function parseBuilderId(id: string): { origin: WorkflowOriginKind; key: string } | null {
-  if (id.startsWith(CRON_ID_PREFIX)) return { origin: 'cron', key: id.slice(CRON_ID_PREFIX.length) };
-  if (id.startsWith(WORKFLOW_ID_PREFIX)) return { origin: 'workflow', key: id.slice(WORKFLOW_ID_PREFIX.length) };
+export type ParsedBuilderId =
+  | { origin: WorkflowOriginKind; scope: 'global'; key: string }
+  | { origin: WorkflowOriginKind; scope: 'agent'; agentSlug: string; key: string };
+
+export function parseBuilderId(id: string): ParsedBuilderId | null {
+  if (id.startsWith(CRON_AGENT_PREFIX)) {
+    const rest = id.slice(CRON_AGENT_PREFIX.length);
+    const colon = rest.indexOf(':');
+    if (colon < 1 || colon === rest.length - 1) return null;
+    return { origin: 'cron', scope: 'agent', agentSlug: rest.slice(0, colon), key: rest.slice(colon + 1) };
+  }
+  if (id.startsWith(WORKFLOW_AGENT_PREFIX)) {
+    const rest = id.slice(WORKFLOW_AGENT_PREFIX.length);
+    const colon = rest.indexOf(':');
+    if (colon < 1 || colon === rest.length - 1) return null;
+    return { origin: 'workflow', scope: 'agent', agentSlug: rest.slice(0, colon), key: rest.slice(colon + 1) };
+  }
+  if (id.startsWith(CRON_ID_PREFIX)) return { origin: 'cron', scope: 'global', key: id.slice(CRON_ID_PREFIX.length) };
+  if (id.startsWith(WORKFLOW_ID_PREFIX)) return { origin: 'workflow', scope: 'global', key: id.slice(WORKFLOW_ID_PREFIX.length) };
   return null;
+}
+
+// ── Agent path helpers ──────────────────────────────────────────────
+
+function agentCronFile(slug: string): string {
+  return path.join(AGENTS_DIR, slug, 'CRON.md');
+}
+
+function agentWorkflowsDir(slug: string): string {
+  return path.join(AGENTS_DIR, slug, 'workflows');
+}
+
+function listAgentSlugs(): string[] {
+  if (!existsSync(AGENTS_DIR)) return [];
+  try {
+    return readdirSync(AGENTS_DIR, { withFileTypes: true })
+      .filter(d => d.isDirectory())
+      .map(d => d.name);
+  } catch {
+    return [];
+  }
 }
 
 // ── List ────────────────────────────────────────────────────────────
@@ -56,11 +103,12 @@ export function parseBuilderId(id: string): { origin: WorkflowOriginKind; key: s
 export function listAllForBuilder(): BuilderWorkflowSummary[] {
   const out: BuilderWorkflowSummary[] = [];
 
-  // Crons from CRON.md
-  for (const job of readCronJobs()) {
+  // Global crons from CRON.md
+  for (const job of readCronJobsFromFile(CRON_FILE)) {
     out.push({
       id: cronId(job.name),
       origin: 'cron',
+      scope: 'global',
       name: job.name,
       description: '',
       enabled: job.enabled,
@@ -71,7 +119,7 @@ export function listAllForBuilder(): BuilderWorkflowSummary[] {
     });
   }
 
-  // Workflows from workflows dir
+  // Global workflows from workflows dir
   if (existsSync(WORKFLOWS_DIR)) {
     for (const file of readdirSync(WORKFLOWS_DIR).filter(f => f.endsWith('.md'))) {
       try {
@@ -79,6 +127,7 @@ export function listAllForBuilder(): BuilderWorkflowSummary[] {
         out.push({
           id: workflowId(file),
           origin: 'workflow',
+          scope: 'global',
           name: wf.name,
           description: wf.description,
           enabled: wf.enabled,
@@ -93,6 +142,48 @@ export function listAllForBuilder(): BuilderWorkflowSummary[] {
     }
   }
 
+  // Agent-scoped crons + workflows from <AGENTS_DIR>/<slug>/...
+  for (const slug of listAgentSlugs()) {
+    const cronFile = agentCronFile(slug);
+    for (const job of readCronJobsFromFile(cronFile)) {
+      out.push({
+        id: cronId(job.name, slug),
+        origin: 'cron',
+        scope: 'agent',
+        name: job.name,
+        description: '',
+        enabled: job.enabled,
+        schedule: job.schedule,
+        stepCount: 1,
+        sourceFile: cronFile,
+        agentSlug: slug,
+      });
+    }
+
+    const wfDir = agentWorkflowsDir(slug);
+    if (existsSync(wfDir)) {
+      for (const file of readdirSync(wfDir).filter(f => f.endsWith('.md'))) {
+        try {
+          const wf = parseWorkflowFile(path.join(wfDir, file));
+          out.push({
+            id: workflowId(file, slug),
+            origin: 'workflow',
+            scope: 'agent',
+            name: wf.name,
+            description: wf.description,
+            enabled: wf.enabled,
+            schedule: wf.trigger.schedule,
+            stepCount: wf.steps.length,
+            sourceFile: wf.sourceFile,
+            agentSlug: slug,
+          });
+        } catch {
+          // Skip unparseable workflow files
+        }
+      }
+    }
+  }
+
   return out.sort((a, b) => a.name.localeCompare(b.name));
 }
 
@@ -103,23 +194,28 @@ export function readWorkflow(id: string): WorkflowDefinition | null {
   if (!parsed) return null;
 
   if (parsed.origin === 'cron') {
-    const job = readCronJobs().find(j => j.name === parsed.key);
+    const cronFile = parsed.scope === 'agent' ? agentCronFile(parsed.agentSlug) : CRON_FILE;
+    const slug = parsed.scope === 'agent' ? parsed.agentSlug : undefined;
+    const job = readCronJobsFromFile(cronFile).find(j => j.name === parsed.key);
     if (!job) return null;
-    return cronJobToWorkflow(job);
+    return cronJobToWorkflow(slug ? { ...job, agentSlug: slug } : job, { sourceFile: cronFile });
   }
 
-  const file = path.join(WORKFLOWS_DIR, parsed.key + '.md');
+  const wfDir = parsed.scope === 'agent' ? agentWorkflowsDir(parsed.agentSlug) : WORKFLOWS_DIR;
+  const file = path.join(wfDir, parsed.key + '.md');
   if (!existsSync(file)) return null;
   try {
-    return parseWorkflowFile(file);
+    const wf = parseWorkflowFile(file);
+    if (parsed.scope === 'agent' && !wf.agentSlug) wf.agentSlug = parsed.agentSlug;
+    return wf;
   } catch {
     return null;
   }
 }
 
-function readCronJobs(): CronJobDefinition[] {
-  if (!existsSync(CRON_FILE)) return [];
-  const raw = readFileSync(CRON_FILE, 'utf-8');
+function readCronJobsFromFile(cronFile: string): CronJobDefinition[] {
+  if (!existsSync(cronFile)) return [];
+  const raw = readFileSync(cronFile, 'utf-8');
   let parsed;
   try {
     parsed = matter(raw);
@@ -236,7 +332,10 @@ function parseWorkflowFile(filePath: string): WorkflowDefinition {
 
 // ── Cron ⇄ Workflow ─────────────────────────────────────────────────
 
-export function cronJobToWorkflow(job: CronJobDefinition): WorkflowDefinition {
+export function cronJobToWorkflow(
+  job: CronJobDefinition,
+  opts: { sourceFile?: string } = {},
+): WorkflowDefinition {
   const step: WorkflowStep = {
     id: 'main',
     prompt: job.prompt,
@@ -254,7 +353,7 @@ export function cronJobToWorkflow(job: CronJobDefinition): WorkflowDefinition {
     trigger: { schedule: job.schedule, manual: false },
     inputs: {},
     steps: [step],
-    sourceFile: CRON_FILE,
+    sourceFile: opts.sourceFile ?? CRON_FILE,
     agentSlug: job.agentSlug,
   };
 }
@@ -285,23 +384,46 @@ export function saveWorkflow(id: string, wf: WorkflowDefinition): { ok: true } |
     if (!isCronShape(wf)) {
       return { ok: false, error: 'Cron entry must remain a single prompt step with a cron schedule' };
     }
-    return saveCronEntry(parsed.key, wf);
+    const cronFile = parsed.scope === 'agent' ? agentCronFile(parsed.agentSlug) : CRON_FILE;
+    const slug = parsed.scope === 'agent' ? parsed.agentSlug : undefined;
+    return saveCronEntry(parsed.key, wf, { cronFile, agentSlug: slug });
   }
 
-  return saveWorkflowFile(parsed.key, wf);
+  const wfDir = parsed.scope === 'agent' ? agentWorkflowsDir(parsed.agentSlug) : WORKFLOWS_DIR;
+  const slug = parsed.scope === 'agent' ? parsed.agentSlug : undefined;
+  return saveWorkflowFile(parsed.key, wf, { dir: wfDir, agentSlug: slug });
 }
 
-/** Resolve the on-disk file path for a builder id (cron entries all share CRON_FILE). */
-export function sourceFileForId(id: string, parsedHint?: { origin: WorkflowOriginKind; key: string }): string | null {
+/** Resolve the on-disk file path for a builder id. */
+export function sourceFileForId(id: string, parsedHint?: ParsedBuilderId): string | null {
   const parsed = parsedHint ?? parseBuilderId(id);
   if (!parsed) return null;
-  if (parsed.origin === 'cron') return CRON_FILE;
-  return path.join(WORKFLOWS_DIR, parsed.key + '.md');
+  if (parsed.origin === 'cron') {
+    return parsed.scope === 'agent' ? agentCronFile(parsed.agentSlug) : CRON_FILE;
+  }
+  const dir = parsed.scope === 'agent' ? agentWorkflowsDir(parsed.agentSlug) : WORKFLOWS_DIR;
+  return path.join(dir, parsed.key + '.md');
 }
 
-function saveCronEntry(originalName: string, wf: WorkflowDefinition): { ok: true } | { ok: false; error: string } {
-  if (!existsSync(CRON_FILE)) return { ok: false, error: 'CRON.md does not exist' };
-  const raw = readFileSync(CRON_FILE, 'utf-8');
+/**
+ * Strip an `<agentSlug>:` prefix the UI may have stored in `wf.name` when
+ * editing an agent-scoped entity. The on-disk name is always the bare key —
+ * the slug lives in the file path, not the name.
+ */
+function stripAgentPrefix(name: string, agentSlug: string | undefined): string {
+  if (!agentSlug) return name;
+  const prefix = agentSlug + ':';
+  return name.startsWith(prefix) ? name.slice(prefix.length) : name;
+}
+
+function saveCronEntry(
+  originalName: string,
+  wf: WorkflowDefinition,
+  opts: { cronFile: string; agentSlug?: string },
+): { ok: true } | { ok: false; error: string } {
+  const { cronFile, agentSlug } = opts;
+  if (!existsSync(cronFile)) return { ok: false, error: 'CRON.md does not exist: ' + cronFile };
+  const raw = readFileSync(cronFile, 'utf-8');
   let parsed;
   try {
     parsed = matter(raw);
@@ -316,7 +438,7 @@ function saveCronEntry(originalName: string, wf: WorkflowDefinition): { ok: true
   const prev = jobs[idx];
   const updated: Record<string, unknown> = {
     ...prev,
-    name: wf.name,
+    name: stripAgentPrefix(wf.name, agentSlug),
     schedule: wf.trigger.schedule,
     prompt: step.prompt,
     enabled: wf.enabled,
@@ -325,18 +447,25 @@ function saveCronEntry(originalName: string, wf: WorkflowDefinition): { ok: true
   if (step.maxTurns != null) updated.max_turns = step.maxTurns;
   if (step.model != null) updated.model = step.model;
   if (step.workDir != null) updated.work_dir = step.workDir;
-  if (wf.agentSlug) updated.agentSlug = wf.agentSlug;
+  // Agent slug for global crons that are bound to a specific agent (legacy
+  // shape). For agent-dir crons the slug lives in the path, not the entry.
+  if (!agentSlug && wf.agentSlug) updated.agentSlug = wf.agentSlug;
 
   jobs[idx] = updated;
   parsed.data.jobs = jobs;
   const out = matter.stringify(parsed.content ?? '', parsed.data);
-  writeFileSync(CRON_FILE, out, 'utf-8');
+  writeFileSync(cronFile, out, 'utf-8');
   return { ok: true };
 }
 
-function saveWorkflowFile(key: string, wf: WorkflowDefinition): { ok: true } | { ok: false; error: string } {
-  if (!existsSync(WORKFLOWS_DIR)) mkdirSync(WORKFLOWS_DIR, { recursive: true });
-  const file = path.join(WORKFLOWS_DIR, key + '.md');
+function saveWorkflowFile(
+  key: string,
+  wf: WorkflowDefinition,
+  opts: { dir: string; agentSlug?: string },
+): { ok: true } | { ok: false; error: string } {
+  const { dir, agentSlug } = opts;
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+  const file = path.join(dir, key + '.md');
 
   // Preserve body content if the file exists; otherwise empty body.
   let body = '';
@@ -351,12 +480,14 @@ function saveWorkflowFile(key: string, wf: WorkflowDefinition): { ok: true } | {
 
   const data: Record<string, unknown> = {
     type: 'workflow',
-    name: wf.name,
+    name: stripAgentPrefix(wf.name, agentSlug),
     description: wf.description,
     enabled: wf.enabled,
     trigger: wf.trigger,
   };
-  if (wf.agentSlug) data.agentSlug = wf.agentSlug;
+  // Agent slug for legacy global workflows that target a specific agent.
+  // For agent-dir workflows the slug lives in the path, not the frontmatter.
+  if (!agentSlug && wf.agentSlug) data.agentSlug = wf.agentSlug;
   if (Object.keys(wf.inputs).length > 0) data.inputs = wf.inputs;
   data.steps = wf.steps.map(serializeStep);
   if (wf.synthesis) data.synthesis = wf.synthesis;
