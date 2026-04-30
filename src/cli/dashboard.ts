@@ -4346,7 +4346,19 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
         });
         return;
       }
-      res.status(500).json({ error: String(err) });
+      // Composio errors carry useful detail in `.error`, `.message`, and
+      // `.status`; serializing with String() drops everything except the name.
+      // Pull whatever's there and log server-side so we have a paper trail.
+      const e = err as { message?: string; status?: number; error?: { message?: string } | string; stack?: string };
+      const detail = e?.error
+        ? (typeof e.error === 'string' ? e.error : (e.error.message ?? JSON.stringify(e.error)))
+        : (e?.message ?? String(err));
+      console.error(`[composio] authorize ${slug} failed:`, detail, e?.stack ?? '');
+      res.status(500).json({
+        error: detail,
+        toolkit: slug,
+        statusCode: e?.status,
+      });
     }
   });
 
@@ -25686,7 +25698,12 @@ async function connectComposio(slug) {
       window.open(d.setupUrl, '_blank');
       return;
     }
-    if (!res.ok) { toast('Connect failed: ' + (d.error || res.status), 'error'); return; }
+    if (!res.ok) {
+      var reason = d.error || ('HTTP ' + res.status);
+      toast('Connect failed: ' + reason, 'error');
+      console.error('[composio] connect failed', { slug: slug, status: res.status, body: d });
+      return;
+    }
     if (d.redirectUrl) {
       window.open(d.redirectUrl, '_blank');
       toast('Opened ' + slug + ' authorization in a new tab. Refresh after approving.', 'info');

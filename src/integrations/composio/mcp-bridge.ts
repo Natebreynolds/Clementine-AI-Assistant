@@ -20,8 +20,8 @@ import type { McpSdkServerConfigWithInstance } from '@anthropic-ai/claude-agent-
 import { createSdkMcpServer } from '@anthropic-ai/claude-agent-sdk';
 import pino from 'pino';
 import {
-  clementineUserId,
   getComposio,
+  getPreferredUserId,
   listConnectedToolkits,
 } from './client.js';
 
@@ -79,7 +79,8 @@ async function buildOne(
   // a managed OAuth app available.
   const authConfig = (await composio.authConfigs.list({ toolkit: slug })).items[0];
 
-  const session = await composio.create(clementineUserId(), {
+  const userId = await getPreferredUserId();
+  const session = await composio.create(userId, {
     toolkits: [slug],
     manageConnections: false,
     ...(authConfig ? { authConfigs: { [slug]: authConfig.id } } : {}),

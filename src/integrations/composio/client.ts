@@ -54,6 +54,9 @@ export const CURATED_TOOLKITS: CuratedToolkit[] = [
   { slug: 'stripe', displayName: 'Stripe', authMode: 'managed' },
   { slug: 'supabase', displayName: 'Supabase', authMode: 'managed' },
   { slug: 'linkedin', displayName: 'LinkedIn', authMode: 'managed' },
+  { slug: 'outlook', displayName: 'Outlook', authMode: 'managed' },
+  { slug: 'onedrive', displayName: 'OneDrive', authMode: 'managed' },
+  { slug: 'zoom', displayName: 'Zoom', authMode: 'managed' },
   { slug: 'twitter', displayName: 'Twitter / X', authMode: 'byo' },
 ];
 
@@ -85,12 +88,56 @@ export function resetComposioClient(): void {
   singleton = null;
   identityCache.clear();
   toolkitMetaCache = null;
+  detectedPreferredUserId = null;
 }
 
-// Single-tenant by default. All connections are keyed under COMPOSIO_USER_ID;
-// override if the same Composio account is shared with another tool.
+// Public: same logic as the internal detector, exposed for the MCP bridge so
+// agent sessions land on the right user_id.
+export async function getPreferredUserId(): Promise<string> {
+  const composio = getComposio();
+  if (!composio) return clementineUserId();
+  return detectPreferredUserId(composio);
+}
+
+// Default user_id for *new* connections. We list connections without filtering
+// so existing accounts (set up in Composio's web UI under the platform default
+// "default" user_id, or any other label) still surface — but new authorize()
+// calls have to pass *some* user_id, and we want it to match whatever the
+// user already has if possible. detectPreferredUserId() picks the user_id
+// with the most existing connections, falling back to this constant.
+const DEFAULT_NEW_CONNECTION_USER_ID = 'default';
+
 export function clementineUserId(): string {
-  return process.env.COMPOSIO_USER_ID ?? 'clementine-default';
+  return process.env.COMPOSIO_USER_ID ?? DEFAULT_NEW_CONNECTION_USER_ID;
+}
+
+// Cached after first detection — avoids extra API calls per authorize.
+let detectedPreferredUserId: string | null = null;
+
+async function detectPreferredUserId(
+  composio: NonNullable<ReturnType<typeof getComposio>>,
+): Promise<string> {
+  if (process.env.COMPOSIO_USER_ID) return process.env.COMPOSIO_USER_ID;
+  if (detectedPreferredUserId) return detectedPreferredUserId;
+  try {
+    const resp = await composio.connectedAccounts.list({ limit: 100 });
+    const counts = new Map<string, number>();
+    for (const it of resp.items as Array<{ userId?: string; user_id?: string }>) {
+      const uid = it.userId ?? it.user_id;
+      if (typeof uid === 'string' && uid.length > 0) {
+        counts.set(uid, (counts.get(uid) ?? 0) + 1);
+      }
+    }
+    if (counts.size > 0) {
+      const top = [...counts.entries()].sort((a, b) => b[1] - a[1])[0]![0];
+      detectedPreferredUserId = top;
+      return top;
+    }
+  } catch (err) {
+    logger.debug({ err }, 'detectPreferredUserId failed — using default');
+  }
+  detectedPreferredUserId = DEFAULT_NEW_CONNECTION_USER_ID;
+  return DEFAULT_NEW_CONNECTION_USER_ID;
 }
 
 export function displayNameFor(slug: string): string {
@@ -292,7 +339,11 @@ export async function listConnectedToolkits(): Promise<ConnectedToolkit[]> {
   const composio = getComposio();
   if (!composio) return [];
   try {
-    const resp = await composio.connectedAccounts.list({ userIds: [clementineUserId()] });
+    // No userIds filter: a Composio API key is account-scoped, and a personal
+    // agent should see every connection on the account regardless of which
+    // user_id label it was created under. This is the fix for "I connected X
+    // in Composio but it doesn't show up in Clementine."
+    const resp = await composio.connectedAccounts.list({ limit: 100 });
     const enriched = await Promise.all(
       resp.items.map(async it => {
         const seed = extractAccountIdentity(
@@ -445,7 +496,11 @@ export async function authorizeToolkit(
   const existing = (await listConnectedToolkits()).filter(
     c => c.slug === slug && c.status === 'ACTIVE',
   );
-  const conn = await composio.connectedAccounts.initiate(clementineUserId(), authConfigId, {
+  // Reuse whichever user_id already owns connections in this account, so a
+  // freshly authorized Gmail lands next to the existing Outlook (etc.) under
+  // the same user_id. Falls back to env override or "default".
+  const userId = await detectPreferredUserId(composio);
+  const conn = await composio.connectedAccounts.initiate(userId, authConfigId, {
     ...(existing.length > 0 ? { allowMultiple: true } : {}),
     ...(opts?.callbackUrl ? { callbackUrl: opts.callbackUrl } : {}),
     ...(opts?.alias ? { alias: opts.alias } : {}),
