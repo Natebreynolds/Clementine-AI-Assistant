@@ -117,7 +117,11 @@ export async function getPreferredUserId(): Promise<string> {
 // calls have to pass *some* user_id, and we want it to match whatever the
 // user already has if possible. detectPreferredUserId() picks the user_id
 // with the most existing connections, falling back to this constant.
-const DEFAULT_NEW_CONNECTION_USER_ID = 'default';
+// Empty string matches Composio's web-UI default user_id (verified by
+// probing — connections created via dashboard.composio.dev land under '').
+// Using the same value here keeps Clementine-authorized connections in the
+// same bucket as anything the user already has from the web UI.
+const DEFAULT_NEW_CONNECTION_USER_ID = '';
 
 export function clementineUserId(): string {
   return readComposioEnv('COMPOSIO_USER_ID') || DEFAULT_NEW_CONNECTION_USER_ID;
@@ -131,24 +135,37 @@ async function detectPreferredUserId(
 ): Promise<string> {
   const explicit = readComposioEnv('COMPOSIO_USER_ID');
   if (explicit) return explicit;
-  if (detectedPreferredUserId) return detectedPreferredUserId;
+  if (detectedPreferredUserId !== null) return detectedPreferredUserId;
+
+  // The list response doesn't expose userId on records (verified empirically),
+  // so we can't read it from the data. Instead, probe each candidate user_id
+  // with a filtered list and pick whichever returns connections. This matches
+  // however the connections were originally created — including empty string,
+  // which is what Composio's web UI uses by default for new accounts.
+  const candidates = ['', 'default', 'user', 'me'];
+  let totalUnscoped = 0;
   try {
-    const resp = await composio.connectedAccounts.list({ limit: 100 });
-    const counts = new Map<string, number>();
-    for (const it of resp.items as Array<{ userId?: string; user_id?: string }>) {
-      const uid = it.userId ?? it.user_id;
-      if (typeof uid === 'string' && uid.length > 0) {
-        counts.set(uid, (counts.get(uid) ?? 0) + 1);
-      }
+    const all = await composio.connectedAccounts.list({ limit: 1 });
+    totalUnscoped = all.items.length;
+  } catch { /* non-fatal */ }
+
+  if (totalUnscoped > 0) {
+    for (const uid of candidates) {
+      try {
+        const resp = await composio.connectedAccounts.list({ userIds: [uid], limit: 1 });
+        if (resp.items.length > 0) {
+          logger.info({ userId: uid }, 'Detected Composio user_id via probe');
+          detectedPreferredUserId = uid;
+          return uid;
+        }
+      } catch { /* try next */ }
     }
-    if (counts.size > 0) {
-      const top = [...counts.entries()].sort((a, b) => b[1] - a[1])[0]![0];
-      detectedPreferredUserId = top;
-      return top;
-    }
-  } catch (err) {
-    logger.debug({ err }, 'detectPreferredUserId failed — using default');
   }
+
+  // No connections yet, or none of the common user_ids match. Fall back to
+  // empty string, which is what Composio's web UI uses by default — keeps
+  // future Clementine-authorized connections in the same bucket as anything
+  // the user creates in Composio's dashboard.
   detectedPreferredUserId = DEFAULT_NEW_CONNECTION_USER_ID;
   return DEFAULT_NEW_CONNECTION_USER_ID;
 }
@@ -475,66 +492,33 @@ export class ComposioNeedsAuthConfigError extends Error {
 
 export async function authorizeToolkit(
   slug: string,
-  opts?: { callbackUrl?: string; alias?: string },
+  // Reserved for future per-call overrides (callbackUrl / alias). Currently
+  // unused because composio.toolkits.authorize doesn't surface those options
+  // — alias is set later via patch, callback uses Composio's hosted page.
+  _opts?: { callbackUrl?: string; alias?: string },
 ): Promise<{ redirectUrl: string | null; connectionId: string }> {
   const composio = getComposio();
   if (!composio) throw new Error('COMPOSIO_API_KEY not set');
 
-  // 1. Find or create an auth config. session.authorize() doesn't auto-create
-  //    so we have to pass authConfigId explicitly to connectedAccounts.initiate.
-  let authConfigId: string;
-  let existingConfig;
-  try {
-    existingConfig = (await composio.authConfigs.list({ toolkit: slug })).items[0];
-  } catch (err) {
-    logger.error({ err, slug, step: 'authConfigs.list' }, 'Composio authorize failed');
-    throw err;
-  }
-  if (existingConfig) {
-    authConfigId = existingConfig.id;
-    logger.debug({ slug, authConfigId }, 'Reusing existing auth config');
-  } else {
-    try {
-      const created = await composio.authConfigs.create(slug, {
-        type: 'use_composio_managed_auth',
-        name: `${displayNameFor(slug)} Auth Config`,
-      });
-      authConfigId = created.id;
-      logger.debug({ slug, authConfigId }, 'Created managed auth config');
-    } catch (err) {
-      const status = (err as { status?: number })?.status;
-      logger.warn({ err, slug, status, step: 'authConfigs.create' }, 'authConfigs.create rejected — likely needs BYO setup');
-      // 400 → Composio doesn't host a managed OAuth app for this toolkit.
-      // 401/403 → key lacks permission to create managed auth configs (common
-      //   for Google services where Composio's plan tier requires you to
-      //   register your own Google OAuth project). Either way, the user fix
-      //   is the same: set it up once in Composio's auth-configs dashboard.
-      if (status === 400 || status === 401 || status === 403) {
-        throw new ComposioNeedsAuthConfigError(slug, String(err));
-      }
-      throw err;
-    }
-  }
-
-  // 2. Initiate the connection. allowMultiple if there's already an active
-  //    connection so we add another account instead of replacing.
-  const existing = (await listConnectedToolkits()).filter(
-    c => c.slug === slug && c.status === 'ACTIVE',
-  );
-  // Reuse whichever user_id already owns connections in this account, so a
-  // freshly authorized Gmail lands next to the existing Outlook (etc.) under
-  // the same user_id. Falls back to env override or "default".
+  // Use the SDK's blessed one-liner — handles auth config discovery
+  // (reuses existing managed config if present) AND new-config creation
+  // automatically. Source: README + composio-B75SFMkx.d.cts. Replaces our
+  // older two-step `authConfigs.list/create + connectedAccounts.initiate`
+  // flow which tripped 401s on plans that don't allow programmatic
+  // authConfigs.create even when a managed app exists.
   const userId = await detectPreferredUserId(composio);
   try {
-    const conn = await composio.connectedAccounts.initiate(userId, authConfigId, {
-      ...(existing.length > 0 ? { allowMultiple: true } : {}),
-      ...(opts?.callbackUrl ? { callbackUrl: opts.callbackUrl } : {}),
-      ...(opts?.alias ? { alias: opts.alias } : {}),
-    });
-    logger.debug({ slug, userId, connectionId: conn.id }, 'Initiated connection');
+    const conn = await composio.toolkits.authorize(userId, slug);
+    logger.info({ slug, userId, connectionId: conn.id }, 'Composio authorize OK');
     return { redirectUrl: conn.redirectUrl ?? null, connectionId: conn.id };
   } catch (err) {
-    logger.error({ err, slug, userId, authConfigId, step: 'connectedAccounts.initiate' }, 'Composio initiate failed');
+    const status = (err as { status?: number })?.status;
+    logger.error({ err, slug, userId, status, step: 'toolkits.authorize' }, 'Composio authorize failed');
+    // Translate the documented "no managed auth available" error codes into
+    // the friendly BYO-setup banner the dashboard already renders.
+    if (status === 400 || status === 401 || status === 403) {
+      throw new ComposioNeedsAuthConfigError(slug, String(err));
+    }
     throw err;
   }
 }
