@@ -1806,7 +1806,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
 
   // ── Build SDK Options ─────────────────────────────────────────────
 
-  private buildOptions(opts: {
+  private async buildOptions(opts: {
     isHeartbeat?: boolean;
     cronTier?: number | null;
     maxTurns?: number | null;
@@ -1828,7 +1828,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
     outputFormat?: { type: 'json_schema'; schema: Record<string, unknown> };
     stallGuard?: StallGuard;
     intentClassification?: IntentClassification;
-  } = {}): SDKOptions {
+  } = {}): Promise<SDKOptions> {
     const {
       isHeartbeat = false,
       cronTier = null,
@@ -2156,6 +2156,22 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
       }
     } catch { /* non-fatal — run with just Clementine's own server */ }
 
+    // Composio toolkits — each connected toolkit becomes an in-process MCP
+    // server (mcp__gmail__*, mcp__slack__*, …). Profile-level allowlist
+    // (profile.allowedComposioToolkits) constrains which toolkits this agent
+    // sees; omit it to surface every active connection.
+    let composioMcpServers: Record<string, any> = {};
+    if (!disableAllTools && !isPlanStep) {
+      try {
+        const { buildComposioMcpServers } = await import('../integrations/composio/mcp-bridge.js');
+        const allowList = (profile as { allowedComposioToolkits?: string[] } | null | undefined)?.allowedComposioToolkits;
+        composioMcpServers = await buildComposioMcpServers(allowList);
+      } catch (err) {
+        // Composio is purely additive — never block the agent if it fails.
+        logger.debug({ err }, 'Composio MCP servers unavailable');
+      }
+    }
+
     // Permission mode: always 'bypassPermissions' — this is a daemon/harness with no interactive
     // terminal, so 'auto' mode (which requires plan support + human approval) doesn't apply.
     const effectivePermissionMode = 'bypassPermissions';
@@ -2203,6 +2219,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
           },
         },
         ...externalMcpServers,
+        ...composioMcpServers,
       },
       ...(abortController ? { abortController } : {}),
       maxTurns: effectiveMaxTurns,
@@ -2901,7 +2918,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
 
     try {
       for (let attempt = 0; attempt <= PersonalAssistant.RATE_LIMIT_MAX_RETRIES; attempt++) {
-        const sdkOptions = this.buildOptions({ model, maxTurns: maxTurnsOverride ?? null, retrievalContext, profile, sessionKey, streaming: !!onText, verboseLevel, abortController, stallGuard, intentClassification, effort: intentClassification?.suggestedEffort });
+        const sdkOptions = await this.buildOptions({ model, maxTurns: maxTurnsOverride ?? null, retrievalContext, profile, sessionKey, streaming: !!onText, verboseLevel, abortController, stallGuard, intentClassification, effort: intentClassification?.suggestedEffort });
 
         // If a project matched, switch cwd so the agent gets its tools/CLAUDE.md
         if (matchedProject) {
@@ -4180,7 +4197,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
     profile?: AgentProfile | null,
   ): Promise<string> {
     setInteractionSource('autonomous');
-    const sdkOptions = this.buildOptions({
+    const sdkOptions = await this.buildOptions({
       isHeartbeat: true,
       enableTeams: false,
       model: MODELS.haiku,
@@ -4256,7 +4273,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
     // Don't mutate the global — pass source through the closure instead
     // Per-step stall guard so concurrent steps don't cross-contaminate
     const stepGuard = new StallGuard();
-    const sdkOptions = this.buildOptions({
+    const sdkOptions = await this.buildOptions({
       isHeartbeat: false,
       cronTier: tier,
       maxTurns,
@@ -4334,7 +4351,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
     // not chat text — pass mode='cron' so high_effort_low_output guard is
     // disabled. Loop detection and circular-reasoning checks stay active.
     const cronGuard = new StallGuard('cron');
-    const sdkOptions = this.buildOptions({
+    const sdkOptions = await this.buildOptions({
       isHeartbeat: true,
       cronTier: tier,
       maxTurns: maxTurns ?? (tier >= 2 ? 30 : 15),
@@ -4847,7 +4864,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
 
       // Unleashed phases run side-effect-heavy work; same logic as cron mode.
       const phaseGuard = new StallGuard('unleashed');
-      const sdkOptions = this.buildOptions({
+      const sdkOptions = await this.buildOptions({
         isHeartbeat: true,
         cronTier: tier,
         maxTurns: turnsPerPhase,
@@ -5211,7 +5228,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
       setInteractionSource('autonomous');
 
       const teamGuard = new StallGuard();
-      const sdkOptions = this.buildOptions({
+      const sdkOptions = await this.buildOptions({
         isHeartbeat: true,
         cronTier: 2, // Give full tool access (Bash, Write, Edit)
         maxTurns: turnsPerPhase,

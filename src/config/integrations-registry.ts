@@ -230,6 +230,20 @@ export const INTEGRATIONS: IntegrationDefinition[] = [
     ],
   },
 
+  // ── Multi-service broker ──────────────────────────────────────────
+  {
+    slug: 'composio',
+    label: 'Composio',
+    description: 'OAuth + tool execution for 1000+ services (Gmail, Slack, Notion, GitHub, …). Connect toolkits in Settings → Integrations.',
+    kind: 'api-key',
+    docUrl: 'https://app.composio.dev/developers',
+    capabilities: ['Gmail', 'Google Calendar/Drive/Docs', 'Slack', 'Notion', 'GitHub', 'Linear', 'HubSpot', 'Salesforce', 'and 1000+ more'],
+    requirements: [
+      { envVar: 'COMPOSIO_API_KEY', label: 'Composio API key', required: true, docUrl: 'https://app.composio.dev/developers', persistent: true },
+      { envVar: 'COMPOSIO_USER_ID', label: 'User ID for Composio connections (defaults to clementine-default)', required: false, persistent: true },
+    ],
+  },
+
   // ── Payments ──────────────────────────────────────────────────────
   {
     slug: 'stripe',

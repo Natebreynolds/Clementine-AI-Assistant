@@ -207,6 +207,18 @@ const FEATURES: FeatureDef[] = [
     ],
   },
   {
+    value: 'composio',
+    name: 'Composio (1000+ services — Gmail, Slack, Notion, GitHub, …)',
+    credentials: [
+      {
+        key: 'COMPOSIO_API_KEY',
+        label: 'Composio API key',
+        help: `Sign up at ${CYAN}https://app.composio.dev${DIM} (free tier) and copy your key from Developers > API Keys.\n  After setup, manage connections in the dashboard: Settings > Integrations.`,
+        masked: true,
+      },
+    ],
+  },
+  {
     value: 'outlook',
     name: 'Outlook (Microsoft Graph — email + calendar)',
     credentials: [
@@ -691,6 +703,7 @@ export async function runSetup(): Promise<void> {
     { header: 'Voice', keys: ['GROQ_API_KEY', 'ELEVENLABS_API_KEY', 'ELEVENLABS_VOICE_ID'] },
     { header: 'Video', keys: ['GOOGLE_API_KEY'] },
     { header: 'Outlook (Microsoft Graph)', keys: ['MS_TENANT_ID', 'MS_CLIENT_ID', 'MS_CLIENT_SECRET', 'MS_USER_EMAIL'] },
+    { header: 'Composio (1000+ services broker)', keys: ['COMPOSIO_API_KEY', 'COMPOSIO_USER_ID'] },
     { header: 'Workspace', keys: ['WORKSPACE_DIRS'] },
     { header: 'Security', keys: ['ALLOW_ALL_USERS'] },
   ];

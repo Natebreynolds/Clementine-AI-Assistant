@@ -4248,6 +4248,139 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
     }
   });
 
+  // ── Composio (1000+ third-party services via OAuth broker) ────
+
+  app.get('/api/composio/status', (_req, res) => {
+    res.json({ enabled: Boolean(process.env.COMPOSIO_API_KEY) });
+  });
+
+  app.get('/api/composio/toolkits', async (_req, res) => {
+    try {
+      if (!process.env.COMPOSIO_API_KEY) {
+        res.json({ enabled: false, toolkits: [] });
+        return;
+      }
+      const c = await import('../integrations/composio/client.js');
+      const [connected, configured, meta] = await Promise.all([
+        c.listConnectedToolkits(),
+        c.listToolkitSlugsWithAuthConfig(),
+        c.listToolkitMeta(),
+      ]);
+
+      const connectionsBySlug = new Map<string, typeof connected>();
+      for (const conn of connected) {
+        const arr = connectionsBySlug.get(conn.slug) ?? [];
+        arr.push(conn);
+        connectionsBySlug.set(conn.slug, arr);
+      }
+      for (const arr of connectionsBySlug.values()) {
+        arr.sort((a, b) => (a.createdAt ?? '').localeCompare(b.createdAt ?? ''));
+      }
+
+      const toView = (conn: (typeof connected)[number]) => ({
+        id: conn.connectionId,
+        status: conn.status,
+        alias: conn.alias ?? null,
+        accountLabel: conn.accountLabel ?? null,
+        accountEmail: conn.accountEmail ?? null,
+        accountName: conn.accountName ?? null,
+        accountAvatarUrl: conn.accountAvatarUrl ?? null,
+        createdAt: conn.createdAt ?? null,
+      });
+
+      const curated = c.CURATED_TOOLKITS.map(t => {
+        const m = meta.get(t.slug);
+        const conns = connectionsBySlug.get(t.slug) ?? [];
+        return {
+          slug: t.slug,
+          displayName: t.displayName,
+          authMode: t.authMode,
+          hasAuthConfig: configured.has(t.slug),
+          logoUrl: m?.logo ?? null,
+          description: m?.description ?? null,
+          toolCount: m?.toolsCount ?? null,
+          connections: conns.map(toView),
+        };
+      });
+
+      const extras = [...connectionsBySlug.entries()]
+        .filter(([slug]) => !c.CURATED_TOOLKITS.some(t => t.slug === slug))
+        .map(([slug, conns]) => {
+          const m = meta.get(slug);
+          // Non-curated: infer auth mode. If a custom auth config exists,
+          // user set it up themselves (BYO). Otherwise it must be managed.
+          const authMode: 'managed' | 'byo' = configured.has(slug) ? 'byo' : 'managed';
+          return {
+            slug,
+            displayName: m?.name ?? c.displayNameFor(slug),
+            authMode,
+            hasAuthConfig: configured.has(slug),
+            logoUrl: m?.logo ?? null,
+            description: m?.description ?? null,
+            toolCount: m?.toolsCount ?? null,
+            connections: conns.map(toView),
+          };
+        });
+
+      res.json({ enabled: true, toolkits: [...curated, ...extras] });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  app.post('/api/composio/toolkits/:slug/authorize', async (req, res) => {
+    const slug = req.params.slug;
+    const alias = typeof req.body?.alias === 'string' ? req.body.alias : undefined;
+    try {
+      const c = await import('../integrations/composio/client.js');
+      const result = await c.authorizeToolkit(slug, alias ? { alias } : undefined);
+      res.json(result);
+    } catch (err) {
+      const c = await import('../integrations/composio/client.js');
+      if (err instanceof c.ComposioNeedsAuthConfigError) {
+        res.status(409).json({
+          error: err.message,
+          needsAuthConfig: true,
+          toolkit: slug,
+          setupUrl: 'https://platform.composio.dev/auth-configs',
+        });
+        return;
+      }
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  app.post('/api/composio/toolkits/:slug/disconnect', async (req, res) => {
+    const connectionId = typeof req.body?.connectionId === 'string' ? req.body.connectionId : '';
+    if (!connectionId) {
+      res.status(400).json({ error: 'connectionId required in body' });
+      return;
+    }
+    try {
+      const c = await import('../integrations/composio/client.js');
+      await c.disconnectToolkit(connectionId);
+      res.json({ ok: true });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  app.post('/api/composio/connections/:id/rename', async (req, res) => {
+    const id = req.params.id;
+    const alias = typeof req.body?.alias === 'string' ? req.body.alias.trim() : '';
+    if (!alias) {
+      res.status(400).json({ error: 'alias required in body' });
+      return;
+    }
+    try {
+      const c = await import('../integrations/composio/client.js');
+      await c.renameConnection(id, alias);
+      res.json({ ok: true });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
   // ── CRON CRUD routes ──────────────────────────────────────────
 
   app.get('/api/projects', (_req, res) => {
@@ -4816,6 +4949,13 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
       ],
     },
     {
+      label: 'Composio',
+      keys: [
+        { key: 'COMPOSIO_API_KEY', label: 'API Key', hint: 'Get one at https://app.composio.dev → Developers. Unlocks 1000+ services (Gmail, Slack, Notion, …) for the agent.', type: 'password' },
+        { key: 'COMPOSIO_USER_ID', label: 'User ID', hint: 'Optional — keys all connections under this Composio user. Defaults to "clementine-default".' },
+      ],
+    },
+    {
       label: 'Salesforce',
       keys: [
         { key: 'SF_INSTANCE_URL', label: 'Instance URL', hint: 'e.g., https://yourorg.my.salesforce.com' },
@@ -4937,6 +5077,15 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
         const { setEnable1MContext } = await import('../config.js');
         setEnable1MContext(value.toLowerCase() === 'true');
       }
+      // Composio: mutate process.env in-place + drop singleton so the very
+      // next /api/composio/* call picks up the new key without a daemon
+      // restart. Without this, "Save key → Connect Gmail" would 503 until
+      // the user restarted, which defeats the dashboard-config UX.
+      if (key === 'COMPOSIO_API_KEY' || key === 'COMPOSIO_USER_ID') {
+        process.env[key] = value;
+        const { resetComposioClient } = await import('../integrations/composio/client.js');
+        resetComposioClient();
+      }
 
       res.json({ ok: true, message: `Updated ${key}` });
     } catch (err) {
@@ -4944,7 +5093,7 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
     }
   });
 
-  app.delete('/api/settings/:key', (req, res) => {
+  app.delete('/api/settings/:key', async (req, res) => {
     try {
       const { key } = req.params;
       if (!existsSync(ENV_PATH)) {
@@ -4955,6 +5104,15 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
       const re = new RegExp(`^${key}=.*\n?`, 'm');
       content = content.replace(re, '');
       writeFileSync(ENV_PATH, content);
+
+      // Hot-reload mirror of the PUT handler — drop process.env entry +
+      // reset Composio client so removal takes effect without a restart.
+      if (key === 'COMPOSIO_API_KEY' || key === 'COMPOSIO_USER_ID') {
+        delete process.env[key];
+        const { resetComposioClient } = await import('../integrations/composio/client.js');
+        resetComposioClient();
+      }
+
       res.json({ ok: true, message: `Removed ${key}` });
     } catch (err) {
       res.status(500).json({ error: String(err) });
@@ -14165,6 +14323,15 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
         <div class="tab-pane" id="tab-settings-integrations">
           <div class="card" style="margin-bottom:20px">
             <div class="card-header" style="display:flex;align-items:center;justify-content:space-between">
+              <span>Connections (via Composio)</span>
+              <span style="font-size:11px;color:var(--text-muted)">1000+ services — OAuth handled by Composio</span>
+            </div>
+            <div class="card-body" style="padding:16px" id="composio-connections">
+              <div class="empty-state">Loading...</div>
+            </div>
+          </div>
+          <div class="card" style="margin-bottom:20px">
+            <div class="card-header" style="display:flex;align-items:center;justify-content:space-between">
               <span>Claude Desktop Integrations</span>
               <span style="font-size:11px;color:var(--text-muted)">OAuth connections from Claude Desktop</span>
             </div>
@@ -15478,7 +15645,7 @@ function switchTab(group, tab) {
     if (tab === 'learning' && typeof refreshSelfImprove === 'function') refreshSelfImprove();
   }
   if (group === 'settings') {
-    if (tab === 'integrations') refreshSalesforce();
+    if (tab === 'integrations') { refreshSalesforce(); refreshComposioConnections(); }
     if (tab === 'remote') refreshRemoteAccess();
     if (tab === 'security') refreshAuthSessions();
     if (tab === 'projects' && typeof refreshProjects === 'function') refreshProjects();
@@ -25410,6 +25577,147 @@ async function refreshClaudeIntegrations(preloaded) {
     if (container) container.innerHTML = '<div class="empty-state" style="color:var(--red)">Failed to load integrations</div>';
     if (widget) widget.style.display = 'none';
   }
+}
+
+async function refreshComposioConnections() {
+  var container = document.getElementById('composio-connections');
+  if (!container) return;
+  try {
+    var r = await apiFetch('/api/composio/toolkits');
+    var d = await r.json();
+    if (!d.enabled) {
+      container.innerHTML =
+        '<div style="padding:8px 4px">' +
+        '<div style="font-size:13px;margin-bottom:12px">Composio gives Clementine OAuth access to 1000+ services (Gmail, Slack, Notion, GitHub, …) from any channel — Telegram, Discord, dashboard chat. The agent never sees the credentials.</div>' +
+        '<div style="font-size:12px;color:var(--text-secondary);margin-bottom:8px">Get your free API key at <a href="https://app.composio.dev/developers" target="_blank" style="color:var(--accent)">app.composio.dev/developers</a>, then paste it here:</div>' +
+        '<div style="display:flex;gap:8px;align-items:center">' +
+        '<input type="password" id="composio-key-input" placeholder="cak_..." style="flex:1;padding:8px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg-input);color:var(--text-primary);font-size:13px;font-family:monospace">' +
+        '<button class="btn btn-sm btn-primary" onclick="saveComposioApiKey()" style="font-size:12px">Save & Activate</button>' +
+        '</div>' +
+        '<div id="composio-key-status" style="font-size:11px;color:var(--text-muted);margin-top:8px"></div>' +
+        '</div>';
+      var input = document.getElementById('composio-key-input');
+      if (input) input.addEventListener('keydown', function(e) { if (e.key === 'Enter') saveComposioApiKey(); });
+      return;
+    }
+    var toolkits = d.toolkits || [];
+    if (toolkits.length === 0) {
+      container.innerHTML = '<div class="empty-state" style="padding:16px">No toolkits available. Check that your Composio API key is valid.</div>';
+      return;
+    }
+
+    var html = '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:12px">';
+    toolkits.forEach(function(t) {
+      var connected = (t.connections || []).filter(function(c) { return c.status === 'ACTIVE'; });
+      var pending = (t.connections || []).filter(function(c) { return c.status !== 'ACTIVE'; });
+      var isConnected = connected.length > 0;
+      var statusColor = isConnected ? 'var(--green)' : (pending.length > 0 ? 'var(--yellow,#f59e0b)' : 'var(--text-muted)');
+      var byo = t.authMode === 'byo' && !t.hasAuthConfig;
+
+      html += '<div style="border:1px solid var(--border);border-radius:8px;padding:12px;background:var(--bg-secondary);display:flex;flex-direction:column;gap:8px">';
+      html += '<div style="display:flex;align-items:center;gap:10px">';
+      if (t.logoUrl) {
+        html += '<img src="' + esc(t.logoUrl) + '" alt="" style="width:24px;height:24px;border-radius:4px;background:#fff;padding:2px;flex-shrink:0;object-fit:contain">';
+      } else {
+        html += '<div style="width:24px;height:24px;border-radius:4px;background:var(--bg-tertiary);flex-shrink:0"></div>';
+      }
+      html += '<div style="flex:1;min-width:0">';
+      html += '<div style="font-size:13px;font-weight:600;color:var(--text-primary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">' + esc(t.displayName) + '</div>';
+      html += '<div style="font-size:10px;color:var(--text-muted)">' + (isConnected ? connected.length + ' account' + (connected.length !== 1 ? 's' : '') : 'Not connected') + '</div>';
+      html += '</div>';
+      html += '<span style="width:8px;height:8px;border-radius:50%;background:' + statusColor + ';flex-shrink:0"></span>';
+      html += '</div>';
+
+      if (connected.length > 0) {
+        html += '<div style="display:flex;flex-direction:column;gap:4px">';
+        connected.forEach(function(c) {
+          var label = c.alias || c.accountLabel || c.accountEmail || c.accountName || 'connected';
+          html += '<div style="display:flex;align-items:center;gap:6px;font-size:11px">';
+          html += '<span style="flex:1;color:var(--text-secondary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">' + esc(label) + '</span>';
+          html += '<button class="btn-sm" onclick="disconnectComposio(\\'' + esc(t.slug) + '\\',\\'' + esc(c.id) + '\\')" style="font-size:10px;padding:2px 6px;background:transparent;border:1px solid var(--border);color:var(--text-muted);border-radius:4px;cursor:pointer">Disconnect</button>';
+          html += '</div>';
+        });
+        html += '</div>';
+      }
+
+      if (byo) {
+        html += '<div style="font-size:10px;color:var(--yellow,#f59e0b);background:rgba(245,158,11,0.08);padding:6px 8px;border-radius:4px;line-height:1.4">Needs a BYO OAuth app — <a href="https://platform.composio.dev/auth-configs" target="_blank" style="color:inherit;text-decoration:underline">set up in Composio</a> first.</div>';
+      }
+
+      html += '<button class="btn btn-sm btn-primary" onclick="connectComposio(\\'' + esc(t.slug) + '\\')" style="font-size:11px">' + (isConnected ? '+ Add another account' : 'Connect') + '</button>';
+      html += '</div>';
+    });
+    html += '</div>';
+    container.innerHTML = html;
+  } catch (e) {
+    container.innerHTML = '<div class="empty-state" style="color:var(--red);padding:16px">Failed to load Composio toolkits: ' + esc(String(e)) + '</div>';
+  }
+}
+
+async function saveComposioApiKey() {
+  var input = document.getElementById('composio-key-input');
+  var status = document.getElementById('composio-key-status');
+  if (!input) return;
+  var key = (input.value || '').trim();
+  if (!key) { if (status) { status.textContent = 'Enter a key first.'; status.style.color = 'var(--red)'; } return; }
+  if (status) { status.textContent = 'Saving…'; status.style.color = 'var(--text-muted)'; }
+  try {
+    await apiJson('PUT', '/api/settings/COMPOSIO_API_KEY', { value: key });
+    if (status) { status.textContent = 'Saved. Loading toolkits…'; status.style.color = 'var(--green)'; }
+    toast('Composio API key saved', 'success');
+    setTimeout(refreshComposioConnections, 400);
+  } catch (e) {
+    if (status) { status.textContent = 'Failed to save: ' + e; status.style.color = 'var(--red)'; }
+    toast('Failed to save key: ' + e, 'error');
+  }
+}
+
+async function connectComposio(slug) {
+  try {
+    var res = await fetch('/api/composio/toolkits/' + encodeURIComponent(slug) + '/authorize', {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({}),
+    });
+    var d = await res.json();
+    if (res.status === 409 && d.needsAuthConfig) {
+      toast('This toolkit needs a BYO OAuth app — opening Composio dashboard.', 'warn');
+      window.open(d.setupUrl, '_blank');
+      return;
+    }
+    if (!res.ok) { toast('Connect failed: ' + (d.error || res.status), 'error'); return; }
+    if (d.redirectUrl) {
+      window.open(d.redirectUrl, '_blank');
+      toast('Opened ' + slug + ' authorization in a new tab. Refresh after approving.', 'info');
+      // Soft poll to catch the new connection without forcing a manual refresh.
+      setTimeout(refreshComposioConnections, 5000);
+      setTimeout(refreshComposioConnections, 15000);
+      setTimeout(refreshComposioConnections, 30000);
+    } else {
+      toast('Connected ' + slug, 'success');
+      refreshComposioConnections();
+    }
+  } catch (e) { toast('Connect failed: ' + e, 'error'); }
+}
+
+async function disconnectComposio(slug, connectionId) {
+  if (!confirm('Disconnect this ' + slug + ' account?')) return;
+  try {
+    var res = await fetch('/api/composio/toolkits/' + encodeURIComponent(slug) + '/disconnect', {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ connectionId: connectionId }),
+    });
+    if (!res.ok) {
+      var d = await res.json().catch(function() { return {}; });
+      toast('Disconnect failed: ' + (d.error || res.status), 'error');
+      return;
+    }
+    toast('Disconnected', 'success');
+    refreshComposioConnections();
+  } catch (e) { toast('Disconnect failed: ' + e, 'error'); }
 }
 
 async function refreshMcpServers() {
