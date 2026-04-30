@@ -2234,5 +2234,20 @@ server.tool(
   },
 );
 
+// ── Browser harness — chat-driven Chrome connect ────────────────────
+
+server.tool(
+  'browser_connect',
+  'Connect Chrome to the browser harness via CDP. Idempotent — if Chrome is already running with remote debugging on :9222 this is a no-op. If no Chrome is running, launches Chrome with --remote-debugging-port=9222. If Chrome is running normally without the flag, refuses unless force_quit=true (which closes the user\'s open tabs). Use this so the user can connect from any chat channel without dropping to the terminal.',
+  {
+    force_quit: z.boolean().optional().describe('If true, quit any running Chrome before relaunching with the debug flag. DESTRUCTIVE — closes the user\'s open tabs. Only set after the user has explicitly confirmed they want this. Defaults to false.'),
+  },
+  async ({ force_quit }) => {
+    const { runConnectNonInteractive } = await import('../cli/browser.js');
+    const result = await runConnectNonInteractive({ allowQuitChrome: !!force_quit });
+    return textResult(result.message);
+  },
+);
+
 
 }

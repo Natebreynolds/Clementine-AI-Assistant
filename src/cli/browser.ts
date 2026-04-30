@@ -365,11 +365,87 @@ export async function cmdBrowserDisable(): Promise<void> {
 }
 
 /**
- * Core connect logic — quits any running Chrome and relaunches with
- * --remote-debugging-port=9222 so browser-harness can connect.
+ * Non-interactive connect — meant for callers that aren't a TTY (MCP tool,
+ * daemon-internal callers). Returns a structured result instead of prompting
+ * or printing decorative output. Caller decides how to surface failures.
  *
- * Returns true when CDP is reachable on :9222 at the end, false otherwise.
- * Never calls process.exit so it's safe to call from the auto-prompt flow.
+ * Behavior:
+ *   - CDP already up → { ok: true, alreadyConnected: true }
+ *   - No Chrome running → launch with flag, poll, return result
+ *   - Chrome running without flag → if allowQuitChrome=false, refuse with
+ *     a clear message; if true, quit + relaunch (DESTRUCTIVE — closes tabs).
+ */
+export async function runConnectNonInteractive(
+  opts: { allowQuitChrome?: boolean } = {},
+): Promise<{ ok: boolean; message: string; alreadyConnected?: boolean; needsForceQuit?: boolean }> {
+  if (await probeCdp()) {
+    return { ok: true, alreadyConnected: true, message: 'Already connected — Chrome is running with remote debugging on :9222.' };
+  }
+
+  if (process.platform !== 'darwin' && process.platform !== 'linux') {
+    return {
+      ok: false,
+      message: 'Auto-connect is only supported on macOS and Linux. Launch Chrome manually with --remote-debugging-port=9222.',
+    };
+  }
+
+  if (isChromeRunning() && !opts.allowQuitChrome) {
+    return {
+      ok: false,
+      needsForceQuit: true,
+      message:
+        'Chrome is running without remote debugging. Connecting requires quitting Chrome and relaunching with --remote-debugging-port=9222 (this closes your current Chrome windows). Re-run with force_quit=true to proceed, or quit Chrome yourself first and call this again.',
+    };
+  }
+
+  if (isChromeRunning() && opts.allowQuitChrome) {
+    try {
+      if (process.platform === 'darwin') {
+        execSync('osascript -e \'tell application "Google Chrome" to quit\'', { stdio: 'pipe' });
+      } else {
+        try { execSync('pkill -TERM -x "google-chrome|chromium|chrome"', { stdio: 'pipe' }); } catch { /* ok */ }
+      }
+      for (let i = 0; i < 15; i++) {
+        if (!isChromeRunning()) break;
+        await new Promise(r => setTimeout(r, 300));
+      }
+    } catch {
+      return { ok: false, message: 'Failed to quit Chrome. Quit it manually and try again.' };
+    }
+  }
+
+  try {
+    if (process.platform === 'darwin') {
+      execSync('open -na "Google Chrome" --args --remote-debugging-port=9222', { stdio: 'pipe' });
+    } else {
+      const candidates = ['google-chrome', 'chromium', 'chrome'];
+      const bin = candidates.find(commandExists);
+      if (!bin) {
+        return { ok: false, message: 'No Chrome / Chromium binary found in PATH.' };
+      }
+      execSync(`nohup ${bin} --remote-debugging-port=9222 >/dev/null 2>&1 &`, { stdio: 'pipe' });
+    }
+  } catch (e) {
+    return { ok: false, message: `Failed to launch Chrome: ${String(e).slice(0, 200)}` };
+  }
+
+  for (let i = 0; i < 24; i++) {
+    await new Promise(r => setTimeout(r, 250));
+    if (await probeCdp()) {
+      return { ok: true, message: 'Connected — Chrome is running with remote debugging on :9222.' };
+    }
+  }
+
+  return {
+    ok: false,
+    message: 'Chrome launched, but CDP socket isn\'t responding yet. Check that Chrome started successfully, then verify with: curl http://localhost:9222/json/version',
+  };
+}
+
+/**
+ * Interactive CLI connect — wraps runConnectNonInteractive with TTY prompts
+ * and decorative output. Used by `clementine browser connect` and the auto-
+ * prompt flow.
  */
 async function runConnect(opts: { confirmQuit?: boolean } = {}): Promise<boolean> {
   // 1. Already connected? Done.
