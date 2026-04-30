@@ -39,6 +39,7 @@ export type QueueOp =
       chunkIds: number[];
       scores: number[];
       agentSlug: string | null;
+      matchTypes?: string[];
     }
   | {
       kind: 'outcome';
@@ -177,6 +178,7 @@ export class WriteQueue {
           chunkIds: op.chunkIds,
           scores: op.scores,
           agentSlug: op.agentSlug,
+          matchTypes: op.matchTypes,
         });
         break;
       case 'outcome':

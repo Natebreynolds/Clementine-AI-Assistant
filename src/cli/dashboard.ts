@@ -5255,6 +5255,63 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
 
   // Memory Health snapshot — single endpoint feeding the dashboard tab.
   // Read-only aggregate over the existing tables; no caching needed (cheap).
+  // Self-correction stats — supersession provenance. Powers the
+  // "Self-correction (supersedes)" card on Brain → Health.
+  app.get('/api/memory/supersedes', async (_req, res) => {
+    try {
+      const gateway = await getGateway();
+      const store = (gateway as any).assistant?.memoryStore;
+      if (!store?.getSupersedeStats) { res.status(503).json({ error: 'Memory store not available' }); return; }
+      res.json({ ok: true, stats: store.getSupersedeStats() });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  // Knowledge graph signals — wikilink density + per-match-type recall
+  // contribution. Powers the "Knowledge graph signals" card.
+  app.get('/api/memory/graph-stats', async (_req, res) => {
+    try {
+      const gateway = await getGateway();
+      const store = (gateway as any).assistant?.memoryStore;
+      if (!store?.getGraphStats) { res.status(503).json({ error: 'Memory store not available' }); return; }
+      res.json({ ok: true, stats: store.getGraphStats({ topN: 12, lookbackHours: 24 * 7 }) });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  // Cross-channel session bridge — recent session summaries grouped by
+  // channel. Powers the "Cross-channel handoff" card.
+  app.get('/api/memory/session-bridge', async (_req, res) => {
+    try {
+      const gateway = await getGateway();
+      const store = (gateway as any).assistant?.memoryStore;
+      if (!store?.getRecentSummariesByChannel) { res.status(503).json({ error: 'Memory store not available' }); return; }
+      res.json({ ok: true, grouped: store.getRecentSummariesByChannel(3) });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  // Recent writes — what the agent has been capturing, including reason and
+  // salience hint when supplied. Powers the Brain → Health "Recent writes" panel.
+  app.get('/api/memory/writes/recent', async (req, res) => {
+    try {
+      const limit = Math.min(Number(req.query.limit) || 50, 200);
+      const gateway = await getGateway();
+      const store = (gateway as any).assistant?.memoryStore;
+      if (!store?.getRecentWrites) {
+        res.status(503).json({ error: 'Memory store not available' });
+        return;
+      }
+      const writes = store.getRecentWrites(limit);
+      res.json({ ok: true, writes });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
   app.get('/api/memory/health', async (_req, res) => {
     try {
       const gateway = await getGateway();
@@ -5287,6 +5344,25 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
         const { runIntegrityProbes } = await import('../memory/integrity.js');
         const report = runIntegrityProbes(store);
         res.json({ ok: true, action, report });
+        return;
+      }
+      if (action === 'reembed-dense') {
+        // Run backfill in the background — first call also pays the model
+        // load cost (~440MB download on first ever run). We respond immediately
+        // so the UI doesn't time out; the user re-polls /api/memory/health.
+        const limit = Number(req.body?.limit) > 0 ? Number(req.body.limit) : 200;
+        const embeddings = await import('../memory/embeddings.js');
+        const ready = await embeddings.probeDenseReady();
+        if (!ready) {
+          res.status(503).json({ error: 'Dense embedding model failed to load' });
+          return;
+        }
+        // Fire-and-forget; surface progress via subsequent /api/memory/health polls.
+        store.backfillDenseEmbeddings({ limit }).catch((err: unknown) => {
+          // eslint-disable-next-line no-console
+          console.error('[dashboard] reembed-dense failed', err);
+        });
+        res.json({ ok: true, action, started: true, limit });
         return;
       }
       res.status(400).json({ error: 'Unknown action: ' + action });
@@ -12625,6 +12701,42 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
           </div>
           <div class="card" style="margin-top:18px">
             <div class="card-header" style="display:flex;align-items:center;justify-content:space-between">
+              <span>Recent writes</span>
+              <span style="font-size:11px;color:var(--text-muted)">What the agent captured, with reason &amp; salience</span>
+            </div>
+            <div class="card-body" id="panel-recent-writes" style="padding:0">
+              <div class="skel-block" style="padding:14px"><div class="skel-row med"></div><div class="skel-row short"></div></div>
+            </div>
+          </div>
+          <div class="card" style="margin-top:18px">
+            <div class="card-header" style="display:flex;align-items:center;justify-content:space-between">
+              <span>Self-correction (supersedes)</span>
+              <span style="font-size:11px;color:var(--text-muted)">Old facts the agent has explicitly replaced</span>
+            </div>
+            <div class="card-body" id="panel-supersedes" style="padding:0">
+              <div class="skel-block" style="padding:14px"><div class="skel-row med"></div><div class="skel-row short"></div></div>
+            </div>
+          </div>
+          <div class="card" style="margin-top:18px">
+            <div class="card-header" style="display:flex;align-items:center;justify-content:space-between">
+              <span>Knowledge graph signals</span>
+              <span style="font-size:11px;color:var(--text-muted)">Wikilink density &amp; which retrieval signal earns its keep (last 7d)</span>
+            </div>
+            <div class="card-body" id="panel-graph-stats" style="padding:0">
+              <div class="skel-block" style="padding:14px"><div class="skel-row med"></div><div class="skel-row short"></div></div>
+            </div>
+          </div>
+          <div class="card" style="margin-top:18px">
+            <div class="card-header" style="display:flex;align-items:center;justify-content:space-between">
+              <span>Cross-channel handoff</span>
+              <span style="font-size:11px;color:var(--text-muted)">Recent session summaries by channel — proves continuity</span>
+            </div>
+            <div class="card-body" id="panel-session-bridge" style="padding:0">
+              <div class="skel-block" style="padding:14px"><div class="skel-row med"></div><div class="skel-row short"></div></div>
+            </div>
+          </div>
+          <div class="card" style="margin-top:18px">
+            <div class="card-header" style="display:flex;align-items:center;justify-content:space-between">
               <span>Trust &amp; claim verification</span>
               <span id="trust-score-detail" style="font-size:11px;color:var(--text-muted)">Rolling 30-claim score</span>
             </div>
@@ -14902,6 +15014,10 @@ function navigateTo(page, opts) {
       try { switchTab('intelligence', intelTab); } catch (e) { /* */ }
       if (bt === 'health') {
         if (typeof refreshMemoryHealth === 'function') refreshMemoryHealth();
+        if (typeof refreshRecentWrites === 'function') refreshRecentWrites();
+        if (typeof refreshSupersedes === 'function') refreshSupersedes();
+        if (typeof refreshGraphStats === 'function') refreshGraphStats();
+        if (typeof refreshSessionBridge === 'function') refreshSessionBridge();
         if (typeof refreshClaims === 'function') refreshClaims();
         if (typeof refreshRoutingAudit === 'function') refreshRoutingAudit();
       }
@@ -15244,6 +15360,10 @@ function switchTab(group, tab) {
     if (tab === 'files' && typeof refreshVaultFiles === 'function') refreshVaultFiles();
     if (tab === 'health') {
       if (typeof refreshMemoryHealth === 'function') refreshMemoryHealth();
+      if (typeof refreshRecentWrites === 'function') refreshRecentWrites();
+      if (typeof refreshSupersedes === 'function') refreshSupersedes();
+      if (typeof refreshGraphStats === 'function') refreshGraphStats();
+      if (typeof refreshSessionBridge === 'function') refreshSessionBridge();
       if (typeof refreshClaims === 'function') refreshClaims();
       if (typeof refreshRoutingAudit === 'function') refreshRoutingAudit();
     }
@@ -20477,12 +20597,220 @@ function formatBytes(n) {
   return (n / 1024 / 1024 / 1024).toFixed(2) + ' GB';
 }
 
-async function memoryHealthAction(action) {
-  var labels = { 'janitor': 'cleanup', 'rebuild-fts': 'FTS rebuild', 'fix-orphans': 'orphan fix' };
+async function refreshSupersedes() {
+  var el = document.getElementById('panel-supersedes');
+  if (!el) return;
+  try {
+    var r = await apiFetch('/api/memory/supersedes');
+    var d = await r.json();
+    if (!d.ok || !d.stats) {
+      el.innerHTML = '<div class="empty-state" style="padding:14px">' + esc(d.error || 'No data') + '</div>';
+      return;
+    }
+    var s = d.stats;
+    if (!s.recent || s.recent.length === 0) {
+      el.innerHTML = '<div class="empty-state" style="padding:14px">No supersedes yet. The agent will record corrections here when it explicitly replaces a stale fact.</div>';
+      return;
+    }
+    var html = '<div style="padding:10px 14px;font-size:12px;color:var(--text-muted)">Total: <b>' + (s.superseded || 0) + '</b> chunks superseded.</div>';
+    html += '<table class="data-table" style="width:100%"><thead><tr>'
+      + '<th style="width:140px">When</th>'
+      + '<th style="width:90px">Old → New</th>'
+      + '<th>Reason</th></tr></thead><tbody>';
+    for (var i = 0; i < s.recent.length; i++) {
+      var sup = s.recent[i];
+      var when = '';
+      try { when = new Date(sup.supersededAt + 'Z').toLocaleString(); } catch { when = sup.supersededAt; }
+      html += '<tr>'
+        + '<td style="font-size:11px;color:var(--text-muted)">' + esc(when) + '</td>'
+        + '<td style="font-size:12px"><code>#' + sup.oldId + '</code> → <code>#' + sup.newId + '</code></td>'
+        + '<td style="font-size:12px">' + (sup.reason ? esc(sup.reason) : '<span style="color:var(--text-muted);opacity:0.6">no reason recorded</span>') + '</td>'
+        + '</tr>';
+    }
+    html += '</tbody></table>';
+    el.innerHTML = html;
+  } catch (err) {
+    el.innerHTML = '<div class="empty-state" style="padding:14px">Failed to load: ' + esc(String(err)) + '</div>';
+  }
+}
+
+async function refreshGraphStats() {
+  var el = document.getElementById('panel-graph-stats');
+  if (!el) return;
+  try {
+    var r = await apiFetch('/api/memory/graph-stats');
+    var d = await r.json();
+    if (!d.ok || !d.stats) {
+      el.innerHTML = '<div class="empty-state" style="padding:14px">' + esc(d.error || 'No data') + '</div>';
+      return;
+    }
+    var s = d.stats;
+    var cb = s.recallContributionByType || {};
+    var totalMatches = 0;
+    for (var k in cb) totalMatches += (cb[k] || 0);
+
+    var html = '<div style="padding:12px 14px;display:grid;grid-template-columns:1fr 1fr;gap:14px">';
+    html += '<div>';
+    html += '<div style="font-size:12px;color:var(--text-muted);margin-bottom:8px">Wikilinks</div>';
+    html += '<div style="font-size:24px;font-weight:700;margin-bottom:8px">' + (s.wikilinkCount || 0).toLocaleString() + '</div>';
+    if (s.topLinkedTargets && s.topLinkedTargets.length > 0) {
+      html += '<div style="font-size:11px;color:var(--text-muted);margin-bottom:4px">Top-linked entities</div>';
+      html += '<table style="width:100%;font-size:12px"><tbody>';
+      for (var i = 0; i < s.topLinkedTargets.length; i++) {
+        var t = s.topLinkedTargets[i];
+        html += '<tr><td style="padding:2px 0">' + esc(t.target) + '</td><td style="text-align:right;color:var(--text-muted);padding:2px 0">' + t.count + '</td></tr>';
+      }
+      html += '</tbody></table>';
+    } else {
+      html += '<div class="empty-state" style="font-size:12px">No wikilinks yet — add [[Name]] refs in vault notes to grow the graph.</div>';
+    }
+    html += '</div>';
+
+    html += '<div>';
+    html += '<div style="font-size:12px;color:var(--text-muted);margin-bottom:8px">Recall contribution (last 7d, ' + (s.tracesAnalyzed || 0) + ' traces)</div>';
+    if (totalMatches === 0) {
+      html += '<div class="empty-state" style="font-size:12px">No recall traces yet. Run a chat to populate.</div>';
+    } else {
+      var order = ['fts', 'vector', 'graph', 'recency'];
+      var labels = { fts: 'Lexical (FTS5)', vector: 'Semantic (dense)', graph: 'Graph (wikilinks)', recency: 'Recency' };
+      var colors = { fts: '#60a5fa', vector: '#10b981', graph: '#f59e0b', recency: '#9ca3af' };
+      html += '<table style="width:100%;font-size:12px"><tbody>';
+      for (var j = 0; j < order.length; j++) {
+        var key = order[j];
+        var cnt = cb[key] || 0;
+        var pct = totalMatches > 0 ? Math.round((cnt / totalMatches) * 100) : 0;
+        html += '<tr><td style="padding:3px 8px 3px 0;width:140px">' + labels[key] + '</td>'
+          + '<td style="padding:3px 0">'
+          + '<div style="display:flex;align-items:center;gap:8px">'
+          + '<div style="flex:1;background:var(--bg-secondary, #1a1a1a);border-radius:3px;overflow:hidden;height:14px">'
+          + '<div style="width:' + pct + '%;background:' + colors[key] + ';height:100%"></div>'
+          + '</div>'
+          + '<span style="font-variant-numeric:tabular-nums;width:50px;text-align:right;color:var(--text-muted)">' + pct + '%</span>'
+          + '</div>'
+          + '</td></tr>';
+      }
+      html += '</tbody></table>';
+    }
+    html += '</div></div>';
+    el.innerHTML = html;
+  } catch (err) {
+    el.innerHTML = '<div class="empty-state" style="padding:14px">Failed to load: ' + esc(String(err)) + '</div>';
+  }
+}
+
+async function refreshSessionBridge() {
+  var el = document.getElementById('panel-session-bridge');
+  if (!el) return;
+  try {
+    var r = await apiFetch('/api/memory/session-bridge');
+    var d = await r.json();
+    if (!d.ok || !d.grouped) {
+      el.innerHTML = '<div class="empty-state" style="padding:14px">' + esc(d.error || 'No data') + '</div>';
+      return;
+    }
+    var channels = Object.keys(d.grouped).sort();
+    if (channels.length === 0) {
+      el.innerHTML = '<div class="empty-state" style="padding:14px">No session summaries yet. They populate as conversations end.</div>';
+      return;
+    }
+    var html = '<div style="padding:12px 14px;display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:14px">';
+    for (var ci = 0; ci < channels.length; ci++) {
+      var ch = channels[ci];
+      var summaries = d.grouped[ch] || [];
+      html += '<div style="border:1px solid var(--border);border-radius:6px;padding:10px;background:var(--bg-secondary, transparent)">';
+      html += '<div style="font-size:11px;color:var(--text-muted);margin-bottom:6px;text-transform:uppercase;letter-spacing:0.05em">' + esc(ch) + ' &middot; ' + summaries.length + ' recent</div>';
+      for (var si = 0; si < summaries.length; si++) {
+        var ss = summaries[si];
+        var when = '';
+        try { when = new Date(ss.createdAt + 'Z').toLocaleString(); } catch { when = ss.createdAt; }
+        var preview = (ss.summary || '').slice(0, 200);
+        html += '<div style="font-size:12px;margin-bottom:8px;padding-bottom:8px;border-bottom:1px solid var(--border)">'
+          + '<div style="color:var(--text-muted);font-size:10px;margin-bottom:2px">' + esc(when) + ' &middot; ' + ss.exchangeCount + ' exchanges</div>'
+          + esc(preview) + (ss.summary && ss.summary.length > 200 ? '…' : '')
+          + '</div>';
+      }
+      html += '</div>';
+    }
+    html += '</div>';
+    el.innerHTML = html;
+  } catch (err) {
+    el.innerHTML = '<div class="empty-state" style="padding:14px">Failed to load: ' + esc(String(err)) + '</div>';
+  }
+}
+
+async function refreshRecentWrites() {
+  var el = document.getElementById('panel-recent-writes');
+  if (!el) return;
+  try {
+    var r = await apiFetch('/api/memory/writes/recent?limit=30');
+    var d = await r.json();
+    if (!d.ok || !Array.isArray(d.writes)) {
+      el.innerHTML = '<div class="empty-state" style="padding:14px">' + esc(d.error || 'No data') + '</div>';
+      return;
+    }
+    if (d.writes.length === 0) {
+      el.innerHTML = '<div class="empty-state" style="padding:14px">No writes captured yet. The agent will start logging memory_write activity here once Phase 2 reaches her.</div>';
+      return;
+    }
+    var html = '<table class="data-table" style="width:100%">';
+    html += '<thead><tr>'
+      + '<th style="width:120px">When</th>'
+      + '<th style="width:80px">Agent</th>'
+      + '<th style="width:120px">Action</th>'
+      + '<th>Where</th>'
+      + '<th style="width:60px;text-align:right">Sal</th>'
+      + '<th>Reason</th>'
+      + '<th style="width:90px">Status</th>'
+      + '</tr></thead><tbody>';
+    for (var i = 0; i < d.writes.length; i++) {
+      var w = d.writes[i];
+      var when = '';
+      try { when = new Date(w.extractedAt + 'Z').toLocaleString(); } catch { when = w.extractedAt; }
+      var where = w.section ? esc(w.section) : (w.filePath ? esc(w.filePath) : '—');
+      var sal = (w.salienceHint != null) ? Number(w.salienceHint).toFixed(1) : '—';
+      var salColor = (w.salienceHint != null && w.salienceHint > 1.0) ? 'var(--success, #10b981)'
+        : (w.salienceHint != null && w.salienceHint < 1.0) ? 'var(--text-muted)' : 'var(--text-primary)';
+      var statusBadge = w.status === 'dedup_skipped'
+        ? '<span style="color:var(--text-muted);font-size:11px">deduped</span>'
+        : w.status === 'active'
+        ? '<span style="color:var(--success, #10b981);font-size:11px">written</span>'
+        : '<span style="font-size:11px">' + esc(w.status) + '</span>';
+      html += '<tr>'
+        + '<td style="font-size:11px;color:var(--text-muted)">' + esc(when) + '</td>'
+        + '<td style="font-size:11px">' + esc(w.agentSlug || 'global') + '</td>'
+        + '<td style="font-size:12px"><code>' + esc(w.action || w.toolName) + '</code></td>'
+        + '<td style="font-size:12px">' + where + '</td>'
+        + '<td style="text-align:right;font-weight:600;color:' + salColor + '">' + sal + '</td>'
+        + '<td style="font-size:12px;color:var(--text-muted)">' + (w.reason ? esc(w.reason) : '<span style="opacity:0.5">no reason given</span>') + '</td>'
+        + '<td>' + statusBadge + '</td>'
+        + '</tr>';
+    }
+    html += '</tbody></table>';
+    el.innerHTML = html;
+  } catch (err) {
+    el.innerHTML = '<div class="empty-state" style="padding:14px">Failed to load: ' + esc(String(err)) + '</div>';
+  }
+}
+
+async function memoryHealthAction(action, extra) {
+  var labels = { 'janitor': 'cleanup', 'rebuild-fts': 'FTS rebuild', 'fix-orphans': 'orphan fix', 'reembed-dense': 'dense embedding backfill' };
   if (!confirm('Run ' + (labels[action] || action) + ' now?')) return;
   try {
-    var r = await apiJson('POST', '/api/memory/health/action', { action: action });
+    var body = Object.assign({ action: action }, extra || {});
+    var r = await apiJson('POST', '/api/memory/health/action', body);
     if (r.error) { toast('Action failed: ' + r.error, 'error'); return; }
+    if (action === 'reembed-dense' && r.started) {
+      toast('Backfill started in background (' + (r.limit || '?') + ' chunks). Refreshing every 10s…', 'info');
+      // Poll coverage updates so the user sees progress without manually refreshing.
+      var pollCount = 0;
+      var poll = setInterval(function() {
+        refreshMemoryHealth();
+        pollCount++;
+        if (pollCount >= 12) clearInterval(poll); // ~2 minutes
+      }, 10000);
+      refreshMemoryHealth();
+      return;
+    }
     var detail = '';
     if (r.result) detail = ' — ' + Object.entries(r.result).slice(0, 4).map(function(p) { return p[0] + ':' + p[1]; }).join(', ');
     if (r.report) detail = ' — orphans nulled: ' + (r.report.orphanRefsNulled || 0) + ', FTS rebuilds: ' + (r.report.ftsRebuilds || 0);
@@ -20709,7 +21037,37 @@ async function refreshMemoryHealth() {
     html += '<div class="metric-hero"><div class="metric-hero-value">' + formatBytes(h.dbSizeBytes)
       + '</div><div class="metric-hero-label">DB File Size</div>'
       + '<div class="metric-hero-sub">last vacuum: ' + esc(h.lastVacuumAt || 'never') + '</div></div>';
+
+    // Dense embedding coverage — the leading indicator for retrieval quality.
+    // <50% means the agent is mostly searching on TF-IDF and missing semantic matches.
+    var de = h.denseEmbeddings || { withDense: 0, total: 0, models: [], currentModel: '', ready: false };
+    var densePct = de.total > 0 ? ((de.withDense / de.total) * 100).toFixed(1) : '0.0';
+    var denseColor = de.total === 0 ? 'var(--text-muted)'
+      : (de.withDense / Math.max(1, de.total)) >= 0.95 ? 'var(--success, #10b981)'
+      : (de.withDense / Math.max(1, de.total)) >= 0.5 ? 'var(--warning, #f59e0b)'
+      : 'var(--danger, #ef4444)';
+    var modelLabel = de.currentModel ? de.currentModel.split('/').pop() : '—';
+    html += '<div class="metric-hero" style="border-left:3px solid ' + denseColor + '">'
+      + '<div class="metric-hero-value" style="color:' + denseColor + '">' + densePct + '%</div>'
+      + '<div class="metric-hero-label">Semantic Coverage</div>'
+      + '<div class="metric-hero-sub">' + (de.withDense || 0) + ' of ' + (de.total || 0)
+      + ' chunks &middot; ' + esc(modelLabel) + '</div></div>';
+
     html += '</div>';
+
+    // Coverage call-to-action — only render when there's work to do.
+    if (de.total > 0 && de.withDense < de.total) {
+      var missing = de.total - de.withDense;
+      html += '<div class="card" style="margin-bottom:16px;border-left:3px solid ' + denseColor + '">';
+      html += '<div class="card-body" style="padding:14px;display:flex;align-items:center;gap:14px;flex-wrap:wrap">';
+      html += '<div style="flex:1;min-width:240px">';
+      html += '<div style="font-weight:600;margin-bottom:4px">Retrieval running on sparse vectors for ' + missing.toLocaleString() + ' chunks</div>';
+      html += '<div style="font-size:12px;color:var(--text-muted)">Backfill builds 768-dim neural embeddings for semantic search. First run downloads ~440MB.</div>';
+      html += '</div>';
+      html += '<button class="btn-sm" onclick="memoryHealthAction(\'reembed-dense\', { limit: 200 })" title="Embed up to 200 chunks now">Backfill 200</button>';
+      html += '<button class="btn-sm" onclick="memoryHealthAction(\'reembed-dense\', { limit: 2000 })" title="Embed up to 2000 chunks now (slower)">Backfill 2000</button>';
+      html += '</div></div>';
+    }
 
     // Two-column layout: categories + table sizes on left, top cited on right.
     html += '<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">';

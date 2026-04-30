@@ -253,6 +253,34 @@ export class MemoryStore {
       this.conn.exec('CREATE INDEX idx_chunks_has_embedding ON chunks(id) WHERE embedding IS NOT NULL');
     } catch { /* already exists */ }
 
+    // Confidence column — orthogonal to salience. Salience = "how important
+    // is this if true?", confidence = "how certain am I this is still true?"
+    // Decays via the daily heartbeat sweep on chunks that haven't been
+    // accessed or reinforced. Used in Phase 3 for fading stale facts and as
+    // input to the supersession decision.
+    try {
+      this.conn.exec('ALTER TABLE chunks ADD COLUMN confidence REAL DEFAULT 1.0');
+    } catch { /* already exists */ }
+
+    // Supersede graph — explicit "this old chunk is replaced by this new
+    // chunk." Distinct from soft-delete because supersedes carries provenance
+    // (which fact replaced which) and lets us reconstruct corrections later.
+    // Search joins LEFT JOIN this table and excludes rows where the chunk
+    // appears as `old_chunk_id`, mirroring the soft-delete pattern.
+    this.conn.exec(`
+      CREATE TABLE IF NOT EXISTS chunk_supersedes (
+        old_chunk_id INTEGER PRIMARY KEY,
+        new_chunk_id INTEGER NOT NULL,
+        reason TEXT,
+        superseded_at TEXT DEFAULT (datetime('now')),
+        superseded_by_agent TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_chunk_supersedes_new ON chunk_supersedes(new_chunk_id);
+    `);
+
+    // Maintenance meta key for the salience decay sweep — last run timestamp.
+    // (maintenance_meta table itself is created elsewhere if not yet present.)
+
     // Access log table for salience tracking
     this.conn.exec(`
       CREATE TABLE IF NOT EXISTS access_log (
@@ -758,6 +786,11 @@ export class MemoryStore {
       CREATE INDEX IF NOT EXISTS idx_recall_traces_retrieved
         ON recall_traces(retrieved_at);
     `);
+    // Phase 4 migration: per-result match types stored alongside chunk_ids/scores
+    // so we can aggregate "which retrieval signal earned the recall" over time.
+    try {
+      this.conn.exec('ALTER TABLE recall_traces ADD COLUMN match_types TEXT DEFAULT NULL');
+    } catch { /* column already exists */ }
 
     // Dense neural embeddings (transformers.js — arctic-embed-m by default).
     // Parallel to the existing chunks.embedding (TF-IDF, 512-dim) so we can
@@ -2089,6 +2122,7 @@ export class MemoryStore {
         chunkIds: finalResults.map(r => r.chunkId),
         scores: finalResults.map(r => r.score),
         agentSlug: agentSlug ?? null,
+        matchTypes: finalResults.map(r => r.matchType),
       });
     }
 
@@ -2107,6 +2141,7 @@ export class MemoryStore {
     chunkIds: number[];
     scores: number[];
     agentSlug?: string | null;
+    matchTypes?: string[];
   }): void {
     if (opts.chunkIds.length === 0) return;
     if (this.writeQueue) {
@@ -2118,6 +2153,7 @@ export class MemoryStore {
         chunkIds: [...opts.chunkIds],
         scores: [...opts.scores],
         agentSlug: opts.agentSlug ?? null,
+        matchTypes: opts.matchTypes ? [...opts.matchTypes] : undefined,
       });
       return;
     }
@@ -2132,12 +2168,13 @@ export class MemoryStore {
     chunkIds: number[];
     scores: number[];
     agentSlug?: string | null;
+    matchTypes?: string[];
   }): void {
     if (opts.chunkIds.length === 0) return;
     try {
       this.conn.prepare(
-        `INSERT INTO recall_traces (session_key, message_id, query, chunk_ids, scores, agent_slug)
-         VALUES (?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO recall_traces (session_key, message_id, query, chunk_ids, scores, agent_slug, match_types)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
       ).run(
         opts.sessionKey,
         opts.messageId ?? null,
@@ -2145,6 +2182,7 @@ export class MemoryStore {
         JSON.stringify(opts.chunkIds),
         JSON.stringify(opts.scores),
         opts.agentSlug ?? null,
+        opts.matchTypes ? JSON.stringify(opts.matchTypes) : null,
       );
     } catch {
       // Non-fatal — recall trace logging never breaks retrieval
@@ -2566,7 +2604,7 @@ export class MemoryStore {
     // least strict mode no longer scans foreign-agent chunks.
     let sql = `SELECT c.id, c.source_file, c.section, c.content, c.chunk_type,
                       c.embedding, c.salience, c.last_outcome_score, c.agent_slug,
-                      c.updated_at, c.category, c.topic
+                      c.updated_at, c.category, c.topic, c.confidence
                  FROM chunks c
                  LEFT JOIN chunk_soft_deletes sd ON sd.chunk_id = c.id
                  WHERE c.embedding IS NOT NULL AND sd.chunk_id IS NULL`;
@@ -2588,6 +2626,7 @@ export class MemoryStore {
       updated_at: string;
       category: string | null;
       topic: string | null;
+      confidence: number | null;
     }>;
 
     const scored: SearchResult[] = [];
@@ -2602,6 +2641,8 @@ export class MemoryStore {
         if (row.salience > 0) score *= (1.0 + row.salience);
         const outcome = row.last_outcome_score ?? 0;
         if (outcome !== 0) score *= 1.0 + 0.3 * outcome;
+        const conf = row.confidence ?? 1;
+        if (conf < 1) score *= (0.5 + 0.5 * conf);
         // Soft isolation: apply boost (only when not strict)
         if (!strict && agentSlug && row.agent_slug === agentSlug) score *= 1.4;
         // Temporal decay — same policy as FTS scoring (Phase 9d). Without
@@ -2647,7 +2688,7 @@ export class MemoryStore {
   private searchByDenseEmbedding(queryVec: Float32Array, limit: number, agentSlug?: string, strict = false): SearchResult[] {
     let sql = `SELECT c.id, c.source_file, c.section, c.content, c.chunk_type,
                       c.embedding_dense, c.salience, c.last_outcome_score, c.agent_slug,
-                      c.updated_at, c.category, c.topic
+                      c.updated_at, c.category, c.topic, c.confidence
                  FROM chunks c
                  LEFT JOIN chunk_soft_deletes sd ON sd.chunk_id = c.id
                  WHERE c.embedding_dense IS NOT NULL AND sd.chunk_id IS NULL`;
@@ -2669,6 +2710,7 @@ export class MemoryStore {
       updated_at: string;
       category: string | null;
       topic: string | null;
+      confidence: number | null;
     }>;
 
     const scored: SearchResult[] = [];
@@ -2679,6 +2721,10 @@ export class MemoryStore {
         const sim = embeddingsModule.cosineSimilarity(queryVec, vec);
         if (sim < 0.3) continue; // dense models produce more confident similarities; raise threshold from 0.15
         let score = sim * 10;
+        // Confidence multiplier: tentative chunks (low confidence) lose ranking
+        // weight without being hidden. confidence=1.0 → no effect, 0.5 → 0.75×.
+        const conf = row.confidence ?? 1;
+        if (conf < 1) score *= (0.5 + 0.5 * conf);
         if (row.salience > 0) score *= (1.0 + row.salience);
         const outcome = row.last_outcome_score ?? 0;
         if (outcome !== 0) score *= 1.0 + 0.3 * outcome;
@@ -4514,6 +4560,275 @@ export class MemoryStore {
       .run(boost, chunkId);
   }
 
+  /**
+   * Mark a chunk as superseded by a newer one. The old chunk becomes
+   * invisible to retrieval but stays in the DB for provenance. Idempotent:
+   * supersede(A, B) followed by supersede(A, C) records C as the new
+   * pointer. Won't link a chunk to itself or to a missing chunk.
+   */
+  markChunkSuperseded(oldChunkId: number, newChunkId: number, opts: { reason?: string; agent?: string } = {}): boolean {
+    if (!Number.isFinite(oldChunkId) || !Number.isFinite(newChunkId)) return false;
+    if (oldChunkId === newChunkId) return false;
+    const exists = this.conn.prepare('SELECT 1 FROM chunks WHERE id IN (?, ?)').all(oldChunkId, newChunkId) as Array<unknown>;
+    if (exists.length < 2) return false;
+    this.conn
+      .prepare(
+        `INSERT INTO chunk_supersedes (old_chunk_id, new_chunk_id, reason, superseded_at, superseded_by_agent)
+         VALUES (?, ?, ?, datetime('now'), ?)
+         ON CONFLICT(old_chunk_id) DO UPDATE SET
+           new_chunk_id = excluded.new_chunk_id,
+           reason = excluded.reason,
+           superseded_at = excluded.superseded_at,
+           superseded_by_agent = excluded.superseded_by_agent`,
+      )
+      .run(oldChunkId, newChunkId, opts.reason ?? null, opts.agent ?? null);
+    // Piggyback on chunk_soft_deletes so every existing search path (FTS,
+    // dense, sparse, recency) excludes the old chunk without needing edits.
+    // The supersede table retains provenance; soft-delete just hides it.
+    this.conn
+      .prepare(
+        `INSERT OR IGNORE INTO chunk_soft_deletes (chunk_id, deleted_at, deleted_by)
+         VALUES (?, datetime('now'), ?)`,
+      )
+      .run(oldChunkId, opts.agent ? `superseded:${opts.agent}` : 'superseded');
+    return true;
+  }
+
+  /**
+   * Daily salience-decay sweep. Multiplies salience by `decayFactor` (default
+   * 0.95) on chunks that haven't been accessed or written-to in `staleDays`.
+   * Pinned chunks are exempt — pinning is the user's explicit "keep this hot."
+   * Soft-deleted and superseded chunks are also skipped (they're already out
+   * of circulation). Returns count of rows updated.
+   */
+  decayStaleSalience(opts: { staleDays?: number; decayFactor?: number; floor?: number } = {}): number {
+    const staleDays = opts.staleDays ?? 30;
+    const decay = Math.max(0, Math.min(1, opts.decayFactor ?? 0.95));
+    const floor = Math.max(0, opts.floor ?? 0);
+    const result = this.conn
+      .prepare(
+        `UPDATE chunks
+         SET salience = MAX(?, salience * ?)
+         WHERE pinned = 0
+           AND salience > ?
+           AND (
+             SELECT MAX(accessed_at) FROM access_log WHERE chunk_id = chunks.id
+           ) < datetime('now', ?)
+           AND id NOT IN (SELECT chunk_id FROM chunk_soft_deletes)
+           AND id NOT IN (SELECT old_chunk_id FROM chunk_supersedes)`,
+      )
+      .run(floor, decay, floor, `-${staleDays} days`);
+    return Number(result.changes ?? 0);
+  }
+
+  /**
+   * Composition / graph stats — wikilink density + per-match-type recall
+   * contribution over a recent window. Surfaces whether entity linking is
+   * paying off in retrieval.
+   */
+  getGraphStats(opts: { topN?: number; lookbackHours?: number } = {}): {
+    wikilinkCount: number;
+    topLinkedTargets: Array<{ target: string; count: number }>;
+    recallContributionByType: Record<string, number>;
+    tracesAnalyzed: number;
+  } {
+    const topN = opts.topN ?? 12;
+    const lookbackHours = opts.lookbackHours ?? 24 * 7;
+
+    const wikilinkCount = (this.conn
+      .prepare('SELECT COUNT(*) as c FROM wikilinks')
+      .get() as { c: number } | undefined)?.c ?? 0;
+
+    const topLinkedTargets = this.conn
+      .prepare(
+        `SELECT target_file as target, COUNT(*) as count
+         FROM wikilinks GROUP BY target_file
+         ORDER BY count DESC LIMIT ?`,
+      )
+      .all(topN) as Array<{ target: string; count: number }>;
+
+    const traceRows = this.conn
+      .prepare(
+        `SELECT match_types FROM recall_traces
+         WHERE retrieved_at > datetime('now', ?)
+           AND match_types IS NOT NULL`,
+      )
+      .all(`-${lookbackHours} hours`) as Array<{ match_types: string }>;
+
+    const counts: Record<string, number> = {};
+    for (const row of traceRows) {
+      try {
+        const arr = JSON.parse(row.match_types) as string[];
+        for (const t of arr) counts[t] = (counts[t] ?? 0) + 1;
+      } catch { /* skip */ }
+    }
+    return { wikilinkCount, topLinkedTargets, recallContributionByType: counts, tracesAnalyzed: traceRows.length };
+  }
+
+  /**
+   * Cross-channel session bridge — the most recent N session summaries per
+   * channel (Discord / dashboard / cron / etc). Channel inferred from the
+   * sessionKey prefix (everything before first ':'). Powers the dashboard
+   * "Cross-channel handoff" panel so we can see whether continuity is
+   * actually flowing between sources.
+   */
+  getRecentSummariesByChannel(limitPerChannel: number = 3): Record<string, SessionSummary[]> {
+    const rows = this.conn
+      .prepare(
+        `SELECT session_key, summary, exchange_count, created_at
+         FROM session_summaries ORDER BY created_at DESC LIMIT 200`,
+      )
+      .all() as Array<{ session_key: string; summary: string; exchange_count: number; created_at: string }>;
+
+    const grouped: Record<string, SessionSummary[]> = {};
+    for (const row of rows) {
+      const colonIdx = row.session_key.indexOf(':');
+      const channel = colonIdx > 0 ? row.session_key.slice(0, colonIdx) : 'other';
+      if (!grouped[channel]) grouped[channel] = [];
+      if (grouped[channel].length >= limitPerChannel) continue;
+      grouped[channel].push({
+        sessionKey: row.session_key,
+        summary: row.summary,
+        exchangeCount: row.exchange_count,
+        createdAt: row.created_at,
+      });
+    }
+    return grouped;
+  }
+
+  /**
+   * Stats for the supersede graph — count of superseded chunks (excluded
+   * from retrieval) for the dashboard.
+   */
+  getSupersedeStats(): { superseded: number; recent: Array<{ oldId: number; newId: number; reason: string | null; supersededAt: string }> } {
+    const total = (this.conn
+      .prepare('SELECT COUNT(*) as c FROM chunk_supersedes')
+      .get() as { c: number } | undefined)?.c ?? 0;
+    const recent = this.conn
+      .prepare(
+        `SELECT old_chunk_id as oldId, new_chunk_id as newId, reason, superseded_at as supersededAt
+         FROM chunk_supersedes
+         ORDER BY superseded_at DESC
+         LIMIT 20`,
+      )
+      .all() as Array<{ oldId: number; newId: number; reason: string | null; supersededAt: string }>;
+    return { superseded: total, recent };
+  }
+
+  /**
+   * Apply an agent-supplied salience hint to chunks freshly written by
+   * memory_write. Called after incrementalSync so the new chunks exist.
+   * Sets salience to MAX(existing, hint) — a higher hint wins, but we
+   * never trample reinforcement that already accumulated. Allowed range
+   * 0.5–2.0; values >1.0 are reserved for explicit "this is critical"
+   * signals from the agent (e.g. user identity, hard preferences,
+   * irreversible decisions).
+   */
+  applyWriteSalience(sourceFile: string, section: string | null, hint: number): number {
+    if (!Number.isFinite(hint)) return 0;
+    const clamped = Math.max(0.5, Math.min(2.0, hint));
+    const sql = section
+      ? `UPDATE chunks SET salience = MAX(salience, ?), updated_at = datetime('now')
+         WHERE source_file = ? AND section = ?`
+      : `UPDATE chunks SET salience = MAX(salience, ?), updated_at = datetime('now')
+         WHERE source_file = ?`;
+    const params = section ? [clamped, sourceFile, section] : [clamped, sourceFile];
+    const result = this.conn.prepare(sql).run(...params);
+    return Number(result.changes ?? 0);
+  }
+
+  /**
+   * Apply an agent-supplied confidence value to chunks freshly written by
+   * memory_write. Confidence (0.0–1.0) is orthogonal to salience: salience
+   * = "how important if true," confidence = "how certain it's still true."
+   * Defaults to 1.0 on insert; agents lower it for tentative facts. Used as
+   * a multiplier in retrieval scoring so uncertain chunks lose ranking.
+   */
+  applyWriteConfidence(sourceFile: string, section: string | null, confidence: number): number {
+    if (!Number.isFinite(confidence)) return 0;
+    const clamped = Math.max(0, Math.min(1, confidence));
+    const sql = section
+      ? `UPDATE chunks SET confidence = ?, updated_at = datetime('now')
+         WHERE source_file = ? AND section = ?`
+      : `UPDATE chunks SET confidence = ?, updated_at = datetime('now')
+         WHERE source_file = ?`;
+    const params = section ? [clamped, sourceFile, section] : [clamped, sourceFile];
+    const result = this.conn.prepare(sql).run(...params);
+    return Number(result.changes ?? 0);
+  }
+
+  /**
+   * Recent writes panel — surfaces what the agent has been capturing and why.
+   * Joins memory_extractions to chunks (best-effort match by source_file +
+   * section if the tool_input carries those). Limit defaults to 50 since this
+   * powers a dashboard panel, not analytics.
+   */
+  getRecentWrites(limit: number = 50): Array<{
+    id: number;
+    extractedAt: string;
+    sessionKey: string;
+    agentSlug: string | null;
+    toolName: string;
+    action: string | null;
+    section: string | null;
+    filePath: string | null;
+    reason: string | null;
+    salienceHint: number | null;
+    status: string;
+    userMessage: string;
+  }> {
+    const rows = this.conn
+      .prepare(
+        `SELECT id, session_key, user_message, tool_name, tool_input,
+                extracted_at, status, agent_slug
+         FROM memory_extractions
+         WHERE tool_name LIKE 'memory_%' OR tool_name = 'note_create'
+         ORDER BY extracted_at DESC
+         LIMIT ?`,
+      )
+      .all(limit) as Array<{
+        id: number;
+        session_key: string;
+        user_message: string;
+        tool_name: string;
+        tool_input: string;
+        extracted_at: string;
+        status: string;
+        agent_slug: string | null;
+      }>;
+
+    return rows.map((r) => {
+      let action: string | null = null;
+      let section: string | null = null;
+      let filePath: string | null = null;
+      let reason: string | null = null;
+      let salienceHint: number | null = null;
+      try {
+        const parsed = JSON.parse(r.tool_input ?? '{}') as Record<string, unknown>;
+        if (typeof parsed.action === 'string') action = parsed.action;
+        if (typeof parsed.section === 'string') section = parsed.section;
+        if (typeof parsed.file_path === 'string') filePath = parsed.file_path;
+        if (typeof parsed.reason === 'string') reason = parsed.reason;
+        const sh = parsed.salience_hint;
+        if (typeof sh === 'number' && Number.isFinite(sh)) salienceHint = sh;
+      } catch { /* tool_input wasn't JSON — fall back to nulls */ }
+      return {
+        id: r.id,
+        extractedAt: r.extracted_at,
+        sessionKey: r.session_key,
+        agentSlug: r.agent_slug,
+        toolName: r.tool_name,
+        action,
+        section,
+        filePath,
+        reason,
+        salienceHint,
+        status: r.status,
+        userMessage: r.user_message,
+      };
+    });
+  }
+
   // ── Memory Extractions ──────────────────────────────────────────
 
   /**
@@ -5210,6 +5525,13 @@ export class MemoryStore {
     lastIntegrityReport: { ftsOk: boolean; ftsRebuilt: boolean; orphanRefsNulled: number; missingEmbeddings: number; ranAt: string } | null;
     dbSizeBytes: number;
     lastVacuumAt: string | null;
+    denseEmbeddings: {
+      withDense: number;
+      total: number;
+      models: Array<{ model: string; count: number }>;
+      currentModel: string;
+      ready: boolean;
+    };
   } {
     const topLimit = opts.topCitedLimit ?? 10;
 
@@ -5315,6 +5637,23 @@ export class MemoryStore {
       })(),
       dbSizeBytes: this.dbSizeBytes(),
       lastVacuumAt: this.getMaintenanceMeta('last_vacuum_at'),
+      denseEmbeddings: (() => {
+        const withDense = (this.conn
+          .prepare('SELECT COUNT(*) as cnt FROM chunks WHERE embedding_dense IS NOT NULL')
+          .get() as { cnt: number } | undefined)?.cnt ?? 0;
+        const models = (this.conn
+          .prepare(`SELECT COALESCE(embedding_dense_model, '(unknown)') as model, COUNT(*) as count
+                    FROM chunks WHERE embedding_dense IS NOT NULL
+                    GROUP BY embedding_dense_model ORDER BY count DESC`)
+          .all() as Array<{ model: string; count: number }>);
+        return {
+          withDense,
+          total: chunkAgg.total,
+          models,
+          currentModel: embeddingsModule.currentDenseModel(),
+          ready: embeddingsModule.isDenseReady(),
+        };
+      })(),
     };
   }
 

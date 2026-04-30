@@ -257,6 +257,7 @@ export interface HeartbeatState {
   lastConsolidationDate?: string;
   lastAgentSiRuns?: Record<string, string>;
   lastSkillDecayDate?: string;
+  lastSalienceDecayDate?: string;
   /** Proactive insight engine state */
   insightState?: {
     sentToday: string[];

@@ -275,14 +275,18 @@ server.tool(
 
 server.tool(
   'memory_write',
-  getToolDescription('memory_write') ?? "Write or append to a vault note. Actions: 'append_daily' (add to today's log), 'update_memory' (update MEMORY.md section), 'write_note' (write/overwrite a note), 'update_identity' (set identity seed — who you are, your role, key context).",
+  getToolDescription('memory_write') ?? "Write or append to a vault note. Actions: 'append_daily' (add to today's log), 'update_memory' (update MEMORY.md section), 'write_note' (write/overwrite a note), 'update_identity' (set identity seed), 'supersede' (replace a stale fact: requires supersedes_chunk_id). Optional `salience_hint` (0.5–2.0; >1.0 = critical) and `reason` (one-sentence WHY) help the system remember the right things and explain itself later.",
   {
-    action: z.enum(['append_daily', 'update_memory', 'write_note', 'update_identity']).describe('Write action'),
+    action: z.enum(['append_daily', 'update_memory', 'write_note', 'update_identity', 'supersede']).describe('Write action'),
     content: z.string().describe('Text to write/append'),
-    section: z.string().optional().describe('Section for append_daily or update_memory'),
+    section: z.string().optional().describe('Section for append_daily, update_memory, or supersede'),
     file_path: z.string().optional().describe('Relative vault path for write_note action'),
+    salience_hint: z.number().min(0.5).max(2.0).optional().describe('How important is this fact? 0.5=tentative, 1.0=normal (default), 1.5=durable preference/decision, 2.0=identity-level (rare). Sets the chunk salience floor so retrieval prioritizes it.'),
+    confidence: z.number().min(0).max(1).optional().describe('How certain is this fact still true? 1.0=certain (default), 0.7=probable, 0.5=uncertain/heard secondhand, 0.3=tentative. Lowers retrieval ranking without hiding — orthogonal to salience.'),
+    reason: z.string().max(200).optional().describe('One-sentence WHY this is worth keeping (e.g. "user just stated firm preference for X over Y"). Stored for observability and future supersession decisions.'),
+    supersedes_chunk_id: z.number().int().positive().optional().describe('Chunk ID of the old fact this write replaces. Required for action="supersede". The old chunk becomes invisible to retrieval; provenance is preserved.'),
   },
-  async ({ action, content, section, file_path }) => {
+  async ({ action, content, section, file_path, salience_hint, confidence, reason, supersedes_chunk_id }) => {
     if (action === 'append_daily') {
       const sec = section ?? 'Interactions';
       const dailyPath = ensureDailyNote();
@@ -302,6 +306,22 @@ server.tool(
       writeFileSync(dailyPath, body, 'utf-8');
       const rel = path.relative(VAULT_DIR, dailyPath);
       await incrementalSync(rel, ACTIVE_AGENT_SLUG ?? undefined);
+      try {
+        const store = await getStore();
+        if (typeof salience_hint === 'number') {
+          store.applyWriteSalience(rel, sec, salience_hint);
+        }
+        if (typeof confidence === 'number') {
+          store.applyWriteConfidence(rel, sec, confidence);
+        }
+        store.logExtraction({
+          sessionKey: 'mcp', userMessage: content.slice(0, 200),
+          toolName: 'memory_write',
+          toolInput: JSON.stringify({ action, section: sec, reason, salience_hint, confidence }),
+          extractedAt: new Date().toISOString(), status: 'active',
+          agentSlug: ACTIVE_AGENT_SLUG ?? undefined,
+        });
+      } catch { /* observability is best-effort */ }
       return textResult(`Appended to ${path.basename(dailyPath)} > ${sec}`);
     }
 
@@ -325,11 +345,14 @@ server.tool(
         const store = await getStore();
         const dup = store.checkDuplicate(content, path.relative(VAULT_DIR, targetMemFile));
         if (dup.isDuplicate && dup.matchId) {
-          // Reinforce the existing chunk — the fact was mentioned again, so it's important
-          store.bumpChunkSalience(dup.matchId, 0.1);
+          // Reinforce the existing chunk — the fact was mentioned again, so it's important.
+          // If the agent provided a salience hint higher than usual reinforcement, use it instead.
+          const boost = typeof salience_hint === 'number' && salience_hint > 1.0 ? 0.2 : 0.1;
+          store.bumpChunkSalience(dup.matchId, boost);
           store.logExtraction({
             sessionKey: 'mcp', userMessage: content.slice(0, 200),
-            toolName: 'memory_write', toolInput: JSON.stringify({ action, section: sec }),
+            toolName: 'memory_write',
+            toolInput: JSON.stringify({ action, section: sec, reason, salience_hint }),
             extractedAt: new Date().toISOString(), status: 'dedup_skipped',
             agentSlug: ACTIVE_AGENT_SLUG ?? undefined,
           });
@@ -382,6 +405,22 @@ server.tool(
       writeFileSync(targetMemFile, body, 'utf-8');
       const rel = path.relative(VAULT_DIR, targetMemFile);
       await incrementalSync(rel, ACTIVE_AGENT_SLUG ?? undefined);
+      try {
+        const store = await getStore();
+        if (typeof salience_hint === 'number') {
+          store.applyWriteSalience(rel, sec, salience_hint);
+        }
+        if (typeof confidence === 'number') {
+          store.applyWriteConfidence(rel, sec, confidence);
+        }
+        store.logExtraction({
+          sessionKey: 'mcp', userMessage: content.slice(0, 200),
+          toolName: 'memory_write',
+          toolInput: JSON.stringify({ action, section: sec, reason, salience_hint, confidence }),
+          extractedAt: new Date().toISOString(), status: 'active',
+          agentSlug: ACTIVE_AGENT_SLUG ?? undefined,
+        });
+      } catch { /* observability is best-effort */ }
       const label = ACTIVE_AGENT_SLUG ? `${ACTIVE_AGENT_SLUG}/MEMORY.md` : 'MEMORY.md';
       return textResult(`Updated ${label} > ${sec}`);
     }
@@ -391,6 +430,22 @@ server.tool(
       writeFileSync(IDENTITY_FILE, content, 'utf-8');
       const rel = path.relative(VAULT_DIR, IDENTITY_FILE);
       await incrementalSync(rel, ACTIVE_AGENT_SLUG ?? undefined);
+      try {
+        const store = await getStore();
+        // Identity is intrinsically high-salience — default to 1.5 if no hint.
+        const effectiveHint = typeof salience_hint === 'number' ? salience_hint : 1.5;
+        store.applyWriteSalience(rel, null, effectiveHint);
+        if (typeof confidence === 'number') {
+          store.applyWriteConfidence(rel, null, confidence);
+        }
+        store.logExtraction({
+          sessionKey: 'mcp', userMessage: content.slice(0, 200),
+          toolName: 'memory_write',
+          toolInput: JSON.stringify({ action, reason, salience_hint: effectiveHint, confidence }),
+          extractedAt: new Date().toISOString(), status: 'active',
+          agentSlug: ACTIVE_AGENT_SLUG ?? undefined,
+        });
+      } catch { /* observability is best-effort */ }
       return textResult('Updated identity seed (IDENTITY.md)');
     }
 
@@ -402,7 +457,98 @@ server.tool(
       mkdirSync(path.dirname(full), { recursive: true });
       writeFileSync(full, content, 'utf-8');
       await incrementalSync(relPath, ACTIVE_AGENT_SLUG ?? undefined);
+      try {
+        const store = await getStore();
+        if (typeof salience_hint === 'number') {
+          store.applyWriteSalience(relPath, null, salience_hint);
+        }
+        if (typeof confidence === 'number') {
+          store.applyWriteConfidence(relPath, null, confidence);
+        }
+        store.logExtraction({
+          sessionKey: 'mcp', userMessage: content.slice(0, 200),
+          toolName: 'memory_write',
+          toolInput: JSON.stringify({ action, file_path: relPath, reason, salience_hint, confidence }),
+          extractedAt: new Date().toISOString(), status: 'active',
+          agentSlug: ACTIVE_AGENT_SLUG ?? undefined,
+        });
+      } catch { /* observability is best-effort */ }
       return textResult(`Wrote: ${relPath}`);
+    }
+
+    if (action === 'supersede') {
+      // Explicit replacement: write the new content the same way as
+      // update_memory (or write_note if file_path given), then mark the old
+      // chunk as superseded. Reason is required — supersession is a strong
+      // signal that should always be explainable.
+      if (!supersedes_chunk_id) return textResult("Error: 'supersedes_chunk_id' required for supersede");
+      if (!reason) return textResult("Error: 'reason' required for supersede — explain why the old fact is wrong/stale");
+
+      const store = await getStore();
+      // Resolve old chunk for routing the new write to the same location.
+      const oldChunk = store.getChunkDetail?.(supersedes_chunk_id) as
+        | { id: number; sourceFile: string; section: string } | undefined;
+      if (!oldChunk) return textResult(`Error: chunk ${supersedes_chunk_id} not found`);
+
+      // Route by old chunk's location: MEMORY.md → update_memory style, other → write_note overwrite.
+      const targetRel = oldChunk.sourceFile;
+      const targetSection = section ?? oldChunk.section;
+      const fullPath = path.join(VAULT_DIR, targetRel);
+
+      if (existsSync(fullPath) && targetRel.endsWith('MEMORY.md')) {
+        // MEMORY.md path: replace the section content with new content.
+        let body = readFileSync(fullPath, 'utf-8');
+        const pattern = new RegExp(`(## ${targetSection.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\n)(.*?)(\\n## |$)`, 's');
+        const match = pattern.exec(body);
+        if (match) {
+          body = body.slice(0, match.index + match[1].length) + content.trim() + '\n' + body.slice(match.index + match[1].length + match[2].length);
+        } else {
+          body += `\n\n## ${targetSection}\n\n${content.trim()}\n`;
+        }
+        writeFileSync(fullPath, body, 'utf-8');
+      } else if (existsSync(fullPath)) {
+        writeFileSync(fullPath, content, 'utf-8');
+      } else {
+        return textResult(`Error: target file ${targetRel} not found — cannot supersede`);
+      }
+
+      await incrementalSync(targetRel, ACTIVE_AGENT_SLUG ?? undefined);
+
+      // Find the new chunk that just landed (same source_file + section as old).
+      let newChunkId: number | null = null;
+      try {
+        const row = store.getChunkBySection?.(targetRel, targetSection) as
+          | { id: number } | undefined;
+        if (row) newChunkId = row.id;
+      } catch { /* fall through */ }
+
+      const marked = newChunkId
+        ? store.markChunkSuperseded(supersedes_chunk_id, newChunkId, { reason, agent: ACTIVE_AGENT_SLUG ?? undefined })
+        : false;
+
+      if (typeof salience_hint === 'number' && newChunkId) {
+        store.applyWriteSalience(targetRel, targetSection, salience_hint);
+      }
+      if (typeof confidence === 'number' && newChunkId) {
+        store.applyWriteConfidence(targetRel, targetSection, confidence);
+      }
+
+      try {
+        store.logExtraction({
+          sessionKey: 'mcp', userMessage: content.slice(0, 200),
+          toolName: 'memory_write',
+          toolInput: JSON.stringify({ action, supersedes_chunk_id, new_chunk_id: newChunkId, reason, salience_hint, confidence, section: targetSection }),
+          extractedAt: new Date().toISOString(),
+          status: marked ? 'superseded' : 'supersede_failed',
+          agentSlug: ACTIVE_AGENT_SLUG ?? undefined,
+        });
+      } catch { /* best-effort */ }
+
+      return textResult(
+        marked
+          ? `Superseded chunk #${supersedes_chunk_id} → #${newChunkId} (${targetRel} > ${targetSection}). Reason: ${reason}`
+          : `Wrote new content but failed to mark old chunk superseded (new chunk not found after sync — file may not have re-chunked yet).`,
+      );
     }
 
     return textResult(`Unknown action: ${action}`);
