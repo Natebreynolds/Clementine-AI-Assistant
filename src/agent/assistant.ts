@@ -1732,26 +1732,34 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
       } catch { /* non-fatal */ }
     }
 
-    // Composio tool preference — when a Composio toolkit has an active
-    // connection AND a Claude Desktop equivalent exists, the agent tends to
-    // default to the Claude Desktop tool (mcp__claude_ai_*) because those
-    // names appear in Claude's training and feel familiar. The Composio
-    // versions (mcp__<slug>__*) usually have broader scope (full inbox vs.
-    // limited preview, write access vs. read-only, etc.), so we explicitly
-    // steer toward them when present. Only emitted when at least one
-    // connection is live — otherwise it's noise.
-    if (composioConnectedSlugs.length > 0) {
-      const slugs = composioConnectedSlugs.slice().sort().join(', ');
-      volatileParts.push(
-        `## Composio Tools (Preferred)\n\n` +
-        `Connected Composio toolkits: ${slugs}.\n\n` +
-        `**Always prefer the Composio tool over the Claude Desktop equivalent** when both are available for the same service:\n` +
-        `- For Outlook/email: use \`mcp__outlook__*\` (NOT \`mcp__claude_ai_Microsoft_365__*\`)\n` +
-        `- For Gmail: use \`mcp__gmail__*\` (NOT \`mcp__claude_ai_Gmail__*\`)\n` +
-        `- For Google Drive: use \`mcp__googledrive__*\` (NOT \`mcp__claude_ai_Google_Drive__*\`)\n` +
-        `- For Google Calendar/Sheets/Docs/Slack/Notion/etc.: same pattern — Composio first.\n\n` +
-        `Why: Composio tools have broader scope (full inbox/file access, write capabilities) and are tied to OAuth tokens you control directly. Use Claude Desktop tools only as fallback when no Composio equivalent is connected.`,
-      );
+    // Tool source preferences — only emit a prompt instruction when:
+    //   1. A service has BOTH Composio AND Claude Desktop sources connected
+    //      (a real conflict the agent could disambiguate the wrong way), AND
+    //   2. The user has explicitly picked a preference for that service.
+    //
+    // No conflict → 0 chars. Conflict but no user preference → silent
+    // default (Composio), still 0 chars. Only configured preferences cost
+    // tokens, and only the affected services are listed (~50 chars each).
+    // Compare to the previous hardcoded block which was ~700 chars on
+    // every turn regardless.
+    if (!isAutonomous) {
+      try {
+        const { loadToolPreferences, computeAvailability, buildPromptInstruction } =
+          require('../integrations/tool-preferences.js') as typeof import('../integrations/tool-preferences.js');
+        const { loadClaudeIntegrations } =
+          require('./mcp-bridge.js') as typeof import('./mcp-bridge.js');
+
+        const composioSet = new Set(composioConnectedSlugs);
+        const cdIntegrations = loadClaudeIntegrations();
+        const cdActive = new Set(
+          Object.values(cdIntegrations).filter(i => i.connected).map(i => i.name),
+        );
+
+        const prefs = loadToolPreferences();
+        const availability = computeAvailability(composioSet, cdActive, prefs.preferences);
+        const instruction = buildPromptInstruction(availability, prefs.preferences);
+        if (instruction) volatileParts.push(instruction);
+      } catch { /* non-fatal — agent runs without the preference rule */ }
     }
 
     // Conversational context — same signals the insight engine surfaces

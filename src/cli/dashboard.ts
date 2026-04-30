@@ -4439,6 +4439,70 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
     }
   });
 
+  // ── Tool source preferences ─────────────────────────────────
+  // When a service is reachable from multiple MCP sources (Composio + Claude
+  // Desktop), let the user pick which one. See src/integrations/tool-preferences.ts
+  // for design notes.
+
+  app.get('/api/tool-preferences', async (_req, res) => {
+    try {
+      const tp = await import('../integrations/tool-preferences.js');
+      const composio = await import('../integrations/composio/client.js');
+      const mcp = await import('../agent/mcp-bridge.js');
+
+      const prefs = tp.loadToolPreferences();
+      const composioSlugs = composio.isComposioEnabled()
+        ? new Set((await composio.listConnectedToolkits()).filter(c => c.status === 'ACTIVE').map(c => c.slug))
+        : new Set<string>();
+      const cdActive = new Set(
+        Object.values(mcp.loadClaudeIntegrations()).filter(i => i.connected).map(i => i.name),
+      );
+      const availability = tp.computeAvailability(composioSlugs, cdActive, prefs.preferences);
+
+      res.json({
+        preferences: prefs.preferences,
+        services: availability.map(a => ({
+          id: a.service.id,
+          label: a.service.label,
+          composio: a.service.composioSlug
+            ? { slug: a.service.composioSlug, available: a.composioAvailable }
+            : null,
+          claudeDesktop: a.service.claudeDesktopName
+            ? { name: a.service.claudeDesktopName, available: a.claudeDesktopAvailable }
+            : null,
+          hasConflict: a.hasConflict,
+          effective: a.effective,
+        })),
+      });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  app.put('/api/tool-preferences', async (req, res) => {
+    try {
+      const body = req.body as { preferences?: Record<string, string> } | undefined;
+      const incoming = body?.preferences;
+      if (!incoming || typeof incoming !== 'object') {
+        res.status(400).json({ error: 'preferences (object) required in body' });
+        return;
+      }
+      const tp = await import('../integrations/tool-preferences.js');
+      const valid: Record<string, 'composio' | 'claude-desktop' | 'off'> = {};
+      const knownIds = new Set(tp.KNOWN_SERVICES.map(s => s.id));
+      for (const [id, source] of Object.entries(incoming)) {
+        if (!knownIds.has(id)) continue;
+        if (source === 'composio' || source === 'claude-desktop' || source === 'off') {
+          valid[id] = source;
+        }
+      }
+      tp.saveToolPreferences({ preferences: valid });
+      res.json({ ok: true, preferences: valid });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
   // ── CRON CRUD routes ──────────────────────────────────────────
 
   app.get('/api/projects', (_req, res) => {
@@ -14395,6 +14459,15 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
           </div>
           <div class="card" style="margin-bottom:20px">
             <div class="card-header" style="display:flex;align-items:center;justify-content:space-between">
+              <span>Tool Source Preferences</span>
+              <span style="font-size:11px;color:var(--text-muted)">Pick which source the agent uses when a service has multiple</span>
+            </div>
+            <div class="card-body" style="padding:16px" id="tool-preferences">
+              <div class="empty-state">Loading...</div>
+            </div>
+          </div>
+          <div class="card" style="margin-bottom:20px">
+            <div class="card-header" style="display:flex;align-items:center;justify-content:space-between">
               <span>Claude Desktop Integrations</span>
               <span style="font-size:11px;color:var(--text-muted)">OAuth connections from Claude Desktop</span>
             </div>
@@ -15716,7 +15789,7 @@ function switchTab(group, tab) {
   }
   if (group === 'settings') {
     if (tab === 'general' && typeof refreshSettings === 'function') refreshSettings();
-    if (tab === 'integrations') { refreshSalesforce(); refreshComposioConnections(); }
+    if (tab === 'integrations') { refreshSalesforce(); refreshComposioConnections(); refreshToolPreferences(); }
     if (tab === 'remote') refreshRemoteAccess();
     if (tab === 'security') refreshAuthSessions();
     if (tab === 'projects' && typeof refreshProjects === 'function') refreshProjects();
@@ -25785,6 +25858,89 @@ function renderComposioCatalog(query) {
   container.innerHTML = html;
   // Restore focus to the search input after re-render so users can keep typing.
   setTimeout(function() { var s = document.getElementById('composio-search'); if (s) { s.focus(); s.setSelectionRange(s.value.length, s.value.length); } }, 0);
+}
+
+async function refreshToolPreferences() {
+  var container = document.getElementById('tool-preferences');
+  if (!container) return;
+  try {
+    var r = await apiFetch('/api/tool-preferences');
+    var d = await r.json();
+    var services = d.services || [];
+    var prefs = d.preferences || {};
+    // Seed the click-handler's working copy with what's currently saved,
+    // so single-click edits merge instead of replacing the whole object.
+    window._toolPrefs = Object.assign({}, prefs);
+
+    var conflicts = services.filter(function(s) { return s.hasConflict; });
+    var single = services.filter(function(s) { return !s.hasConflict && s.effective; });
+    var none = services.filter(function(s) { return !s.effective; });
+
+    var html = '';
+    if (conflicts.length === 0 && single.length === 0) {
+      html += '<div style="font-size:13px;color:var(--text-muted);line-height:1.6">No services connected yet from either Composio or Claude Desktop. Once you connect something, it\\'ll appear here.</div>';
+      container.innerHTML = html;
+      return;
+    }
+
+    if (conflicts.length > 0) {
+      html += '<div style="font-size:12px;color:var(--text-secondary);margin-bottom:12px;line-height:1.5">'
+        + '<strong>' + conflicts.length + ' service' + (conflicts.length === 1 ? ' has' : 's have') + ' multiple sources connected.</strong> '
+        + 'Pick which one the agent should use. Default (no selection) = Composio.'
+        + '</div>';
+      html += '<div style="display:flex;flex-direction:column;gap:10px;margin-bottom:14px">';
+      conflicts.forEach(function(s) {
+        var picked = prefs[s.id] || 'composio';
+        html += '<div style="display:flex;align-items:center;gap:12px;padding:10px 12px;border:1px solid var(--border);border-radius:6px;background:var(--bg-secondary)">';
+        html += '<div style="flex:1;font-size:13px;font-weight:500">' + esc(s.label) + '</div>';
+        html += '<div style="display:flex;gap:6px">';
+        ['composio','claude-desktop','off'].forEach(function(opt) {
+          var selected = picked === opt;
+          var label = opt === 'composio' ? 'Composio' : (opt === 'claude-desktop' ? 'Claude Desktop' : 'Off');
+          html += '<button onclick="setToolPreference(\\'' + esc(s.id) + '\\',\\'' + opt + '\\')" '
+            + 'style="padding:4px 10px;font-size:11px;border-radius:4px;cursor:pointer;border:1px solid '
+            + (selected ? 'var(--accent)' : 'var(--border)') + ';'
+            + 'background:' + (selected ? 'var(--accent)' : 'transparent') + ';'
+            + 'color:' + (selected ? '#fff' : 'var(--text-secondary)') + '">' + esc(label) + '</button>';
+        });
+        html += '</div>';
+        html += '</div>';
+      });
+      html += '</div>';
+    }
+
+    if (single.length > 0) {
+      html += '<div style="font-size:11px;color:var(--text-muted);margin-bottom:6px;text-transform:uppercase;letter-spacing:0.5px">Single source — using automatically</div>';
+      html += '<div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px">';
+      single.forEach(function(s) {
+        var srcLabel = s.effective === 'composio' ? 'Composio' : (s.effective === 'claude-desktop' ? 'Claude Desktop' : 'Off');
+        html += '<span style="display:inline-flex;align-items:center;gap:6px;padding:4px 10px;font-size:11px;background:var(--bg-secondary);border:1px solid var(--border);border-radius:12px">'
+          + esc(s.label) + ' <span style="color:var(--text-muted);font-size:10px">via ' + esc(srcLabel) + '</span>'
+          + '</span>';
+      });
+      html += '</div>';
+    }
+
+    container.innerHTML = html;
+  } catch (e) {
+    container.innerHTML = '<div class="empty-state" style="color:var(--red);padding:8px">Failed to load tool preferences: ' + esc(String(e)) + '</div>';
+  }
+}
+
+async function setToolPreference(serviceId, source) {
+  try {
+    // Get current prefs, merge in the change, send back. Server validates
+    // each entry, so we don't need to pre-filter unknown IDs.
+    var current = window._toolPrefs || {};
+    current[serviceId] = source;
+    window._toolPrefs = current;
+    await apiFetch('/api/tool-preferences', {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ preferences: current }),
+    });
+    refreshToolPreferences();
+  } catch (e) { toast('Failed to save preference: ' + e, 'error'); }
 }
 
 async function saveComposioApiKey() {
