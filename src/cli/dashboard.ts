@@ -4266,10 +4266,14 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
         res.json({ enabled: false, toolkits: [] });
         return;
       }
-      const [connected, configured, meta] = await Promise.all([
+      // Fetch live: full catalog + user's connections + auth-config slugs.
+      // This replaces the hardcoded CURATED_TOOLKITS — slug typos are now
+      // impossible because we render directly from Composio's data, and
+      // newly-added services appear automatically.
+      const [catalog, connected, configured] = await Promise.all([
+        c.listAllToolkits(),
         c.listConnectedToolkits(),
         c.listToolkitSlugsWithAuthConfig(),
-        c.listToolkitMeta(),
       ]);
 
       const connectionsBySlug = new Map<string, typeof connected>();
@@ -4293,41 +4297,55 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
         createdAt: conn.createdAt ?? null,
       });
 
-      const curated = c.CURATED_TOOLKITS.map(t => {
-        const m = meta.get(t.slug);
-        const conns = connectionsBySlug.get(t.slug) ?? [];
-        return {
+      // Merge: every catalog entry, plus any connection whose slug isn't in
+      // the catalog (defensive — catalog dedupes are rare but possible).
+      const catalogBySlug = new Map(catalog.map(t => [t.slug, t]));
+      const orphanSlugs = [...connectionsBySlug.keys()].filter(s => !catalogBySlug.has(s));
+
+      const toolkits = [
+        ...catalog.map(t => ({
           slug: t.slug,
-          displayName: t.displayName,
+          displayName: t.name,
           authMode: t.authMode,
           hasAuthConfig: configured.has(t.slug),
-          logoUrl: m?.logo ?? null,
-          description: m?.description ?? null,
-          toolCount: m?.toolsCount ?? null,
-          connections: conns.map(toView),
-        };
+          logoUrl: t.logoUrl ?? null,
+          description: t.description ?? null,
+          toolCount: t.toolsCount ?? null,
+          categories: t.categories,
+          connections: (connectionsBySlug.get(t.slug) ?? []).map(toView),
+        })),
+        ...orphanSlugs.map(slug => ({
+          slug,
+          displayName: c.displayNameFor(slug),
+          authMode: 'managed' as const,
+          hasAuthConfig: configured.has(slug),
+          logoUrl: null,
+          description: null,
+          toolCount: null,
+          categories: [],
+          connections: (connectionsBySlug.get(slug) ?? []).map(toView),
+        })),
+      ];
+
+      // Featured set = toolkits with active connections (highest signal),
+      // then top toolkits by tool count. Cap at 30 to keep the default
+      // grid focused; the search box covers the rest.
+      const FEATURED_LIMIT = 30;
+      const connectedSlugs = new Set(connectionsBySlug.keys());
+      const featured = [
+        ...toolkits.filter(t => connectedSlugs.has(t.slug)),
+        ...toolkits
+          .filter(t => !connectedSlugs.has(t.slug))
+          .sort((a, b) => (b.toolCount ?? 0) - (a.toolCount ?? 0))
+          .slice(0, Math.max(0, FEATURED_LIMIT - connectedSlugs.size)),
+      ];
+
+      res.json({
+        enabled: true,
+        toolkits,
+        featured: featured.map(t => t.slug),
+        totalCount: toolkits.length,
       });
-
-      const extras = [...connectionsBySlug.entries()]
-        .filter(([slug]) => !c.CURATED_TOOLKITS.some(t => t.slug === slug))
-        .map(([slug, conns]) => {
-          const m = meta.get(slug);
-          // Non-curated: infer auth mode. If a custom auth config exists,
-          // user set it up themselves (BYO). Otherwise it must be managed.
-          const authMode: 'managed' | 'byo' = configured.has(slug) ? 'byo' : 'managed';
-          return {
-            slug,
-            displayName: m?.name ?? c.displayNameFor(slug),
-            authMode,
-            hasAuthConfig: configured.has(slug),
-            logoUrl: m?.logo ?? null,
-            description: m?.description ?? null,
-            toolCount: m?.toolsCount ?? null,
-            connections: conns.map(toView),
-          };
-        });
-
-      res.json({ enabled: true, toolkits: [...curated, ...extras] });
     } catch (err) {
       res.status(500).json({ error: String(err) });
     }
@@ -25627,53 +25645,104 @@ async function refreshComposioConnections() {
       container.innerHTML = '<div class="empty-state" style="padding:16px">No toolkits available. Check that your Composio API key is valid.</div>';
       return;
     }
-
-    var html = '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:12px">';
-    toolkits.forEach(function(t) {
-      var connected = (t.connections || []).filter(function(c) { return c.status === 'ACTIVE'; });
-      var pending = (t.connections || []).filter(function(c) { return c.status !== 'ACTIVE'; });
-      var isConnected = connected.length > 0;
-      var statusColor = isConnected ? 'var(--green)' : (pending.length > 0 ? 'var(--yellow,#f59e0b)' : 'var(--text-muted)');
-      var byo = t.authMode === 'byo' && !t.hasAuthConfig;
-
-      html += '<div style="border:1px solid var(--border);border-radius:8px;padding:12px;background:var(--bg-secondary);display:flex;flex-direction:column;gap:8px">';
-      html += '<div style="display:flex;align-items:center;gap:10px">';
-      if (t.logoUrl) {
-        html += '<img src="' + esc(t.logoUrl) + '" alt="" style="width:24px;height:24px;border-radius:4px;background:#fff;padding:2px;flex-shrink:0;object-fit:contain">';
-      } else {
-        html += '<div style="width:24px;height:24px;border-radius:4px;background:var(--bg-tertiary);flex-shrink:0"></div>';
-      }
-      html += '<div style="flex:1;min-width:0">';
-      html += '<div style="font-size:13px;font-weight:600;color:var(--text-primary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">' + esc(t.displayName) + '</div>';
-      html += '<div style="font-size:10px;color:var(--text-muted)">' + (isConnected ? connected.length + ' account' + (connected.length !== 1 ? 's' : '') : 'Not connected') + '</div>';
-      html += '</div>';
-      html += '<span style="width:8px;height:8px;border-radius:50%;background:' + statusColor + ';flex-shrink:0"></span>';
-      html += '</div>';
-
-      if (connected.length > 0) {
-        html += '<div style="display:flex;flex-direction:column;gap:4px">';
-        connected.forEach(function(c) {
-          var label = c.alias || c.accountLabel || c.accountEmail || c.accountName || 'connected';
-          html += '<div style="display:flex;align-items:center;gap:6px;font-size:11px">';
-          html += '<span style="flex:1;color:var(--text-secondary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">' + esc(label) + '</span>';
-          html += '<button class="btn-sm" onclick="disconnectComposio(\\'' + esc(t.slug) + '\\',\\'' + esc(c.id) + '\\')" style="font-size:10px;padding:2px 6px;background:transparent;border:1px solid var(--border);color:var(--text-muted);border-radius:4px;cursor:pointer">Disconnect</button>';
-          html += '</div>';
-        });
-        html += '</div>';
-      }
-
-      if (byo) {
-        html += '<div style="font-size:10px;color:var(--yellow,#f59e0b);background:rgba(245,158,11,0.08);padding:6px 8px;border-radius:4px;line-height:1.4">Needs a BYO OAuth app — <a href="https://platform.composio.dev/auth-configs" target="_blank" style="color:inherit;text-decoration:underline">set up in Composio</a> first.</div>';
-      }
-
-      html += '<button class="btn btn-sm btn-primary" onclick="connectComposio(\\'' + esc(t.slug) + '\\')" style="font-size:11px">' + (isConnected ? '+ Add another account' : 'Connect') + '</button>';
-      html += '</div>';
-    });
-    html += '</div>';
-    container.innerHTML = html;
+    // Stash full catalog in a closure so the search input can re-render
+    // without refetching. Source of truth lives on the window object so
+    // the input's oninput handler can find it.
+    window._composioCatalog = {
+      toolkits: toolkits,
+      featured: new Set(d.featured || []),
+      total: d.totalCount || toolkits.length,
+    };
+    renderComposioCatalog('');
   } catch (e) {
     container.innerHTML = '<div class="empty-state" style="color:var(--red);padding:16px">Failed to load Composio toolkits: ' + esc(String(e)) + '</div>';
   }
+}
+
+function renderComposioCatalog(query) {
+  var container = document.getElementById('composio-connections');
+  if (!container) return;
+  var cat = window._composioCatalog;
+  if (!cat) return;
+  var q = (query || '').trim().toLowerCase();
+  var visible;
+  if (q.length === 0) {
+    // Default view: featured set (connected toolkits + most-popular ones).
+    visible = cat.toolkits.filter(function(t) { return cat.featured.has(t.slug); });
+  } else {
+    // Search across slug, name, and description. Cap to 80 to keep DOM
+    // size reasonable when the query matches a generic word.
+    visible = cat.toolkits.filter(function(t) {
+      return t.slug.toLowerCase().indexOf(q) !== -1
+          || (t.displayName||'').toLowerCase().indexOf(q) !== -1
+          || (t.description||'').toLowerCase().indexOf(q) !== -1;
+    }).slice(0, 80);
+  }
+  // Always show connected toolkits first within the visible set.
+  visible.sort(function(a, b) {
+    var aConn = (a.connections||[]).some(function(c){ return c.status==='ACTIVE'; }) ? 0 : 1;
+    var bConn = (b.connections||[]).some(function(c){ return c.status==='ACTIVE'; }) ? 0 : 1;
+    if (aConn !== bConn) return aConn - bConn;
+    return (b.toolCount||0) - (a.toolCount||0);
+  });
+
+  var header = '<div style="display:flex;align-items:center;gap:10px;margin-bottom:14px">'
+    + '<input type="search" id="composio-search" value="' + esc(q) + '" placeholder="Search ' + cat.total + ' toolkits — Gmail, Slack, Notion, …" oninput="renderComposioCatalog(this.value)"'
+    + ' style="flex:1;padding:8px 12px;border:1px solid var(--border);border-radius:6px;background:var(--bg-input);color:var(--text-primary);font-size:13px">'
+    + '<span style="font-size:11px;color:var(--text-muted);white-space:nowrap">' + visible.length + (q.length === 0 ? ' featured' : ' match' + (visible.length !== 1 ? 'es' : '')) + ' / ' + cat.total + ' total</span>'
+    + '</div>';
+
+  if (visible.length === 0) {
+    container.innerHTML = header + '<div class="empty-state" style="padding:16px">No toolkits match "' + esc(q) + '". Try a different search.</div>';
+    setTimeout(function() { var s = document.getElementById('composio-search'); if (s) { s.focus(); s.setSelectionRange(s.value.length, s.value.length); } }, 0);
+    return;
+  }
+
+  var html = header + '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:12px">';
+  visible.forEach(function(t) {
+    var connected = (t.connections || []).filter(function(c) { return c.status === 'ACTIVE'; });
+    var pending = (t.connections || []).filter(function(c) { return c.status !== 'ACTIVE'; });
+    var isConnected = connected.length > 0;
+    var statusColor = isConnected ? 'var(--green)' : (pending.length > 0 ? 'var(--yellow,#f59e0b)' : 'var(--text-muted)');
+    var byo = t.authMode === 'byo' && !t.hasAuthConfig;
+
+    html += '<div style="border:1px solid var(--border);border-radius:8px;padding:12px;background:var(--bg-secondary);display:flex;flex-direction:column;gap:8px">';
+    html += '<div style="display:flex;align-items:center;gap:10px">';
+    if (t.logoUrl) {
+      html += '<img src="' + esc(t.logoUrl) + '" alt="" style="width:24px;height:24px;border-radius:4px;background:#fff;padding:2px;flex-shrink:0;object-fit:contain">';
+    } else {
+      html += '<div style="width:24px;height:24px;border-radius:4px;background:var(--bg-tertiary);flex-shrink:0"></div>';
+    }
+    html += '<div style="flex:1;min-width:0">';
+    html += '<div style="font-size:13px;font-weight:600;color:var(--text-primary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">' + esc(t.displayName) + '</div>';
+    html += '<div style="font-size:10px;color:var(--text-muted)">' + (isConnected ? connected.length + ' account' + (connected.length !== 1 ? 's' : '') : ((t.toolCount||0) + ' tools')) + '</div>';
+    html += '</div>';
+    html += '<span style="width:8px;height:8px;border-radius:50%;background:' + statusColor + ';flex-shrink:0"></span>';
+    html += '</div>';
+
+    if (connected.length > 0) {
+      html += '<div style="display:flex;flex-direction:column;gap:4px">';
+      connected.forEach(function(c) {
+        var label = c.alias || c.accountLabel || c.accountEmail || c.accountName || 'connected';
+        html += '<div style="display:flex;align-items:center;gap:6px;font-size:11px">';
+        html += '<span style="flex:1;color:var(--text-secondary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">' + esc(label) + '</span>';
+        html += '<button class="btn-sm" onclick="disconnectComposio(\\'' + esc(t.slug) + '\\',\\'' + esc(c.id) + '\\')" style="font-size:10px;padding:2px 6px;background:transparent;border:1px solid var(--border);color:var(--text-muted);border-radius:4px;cursor:pointer">Disconnect</button>';
+        html += '</div>';
+      });
+      html += '</div>';
+    }
+
+    if (byo) {
+      html += '<div style="font-size:10px;color:var(--yellow,#f59e0b);background:rgba(245,158,11,0.08);padding:6px 8px;border-radius:4px;line-height:1.4">Needs a BYO OAuth app — <a href="https://platform.composio.dev/auth-configs" target="_blank" style="color:inherit;text-decoration:underline">set up in Composio</a> first.</div>';
+    }
+
+    html += '<button class="btn btn-sm btn-primary" onclick="connectComposio(\\'' + esc(t.slug) + '\\')" style="font-size:11px">' + (isConnected ? '+ Add account' : 'Connect') + '</button>';
+    html += '</div>';
+  });
+  html += '</div>';
+  container.innerHTML = html;
+  // Restore focus to the search input after re-render so users can keep typing.
+  setTimeout(function() { var s = document.getElementById('composio-search'); if (s) { s.focus(); s.setSelectionRange(s.value.length, s.value.length); } }, 0);
 }
 
 async function saveComposioApiKey() {

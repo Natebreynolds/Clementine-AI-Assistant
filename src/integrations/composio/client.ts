@@ -100,6 +100,7 @@ export function resetComposioClient(): void {
   singleton = null;
   identityCache.clear();
   toolkitMetaCache = null;
+  catalogCache = null;
   detectedPreferredUserId = null;
 }
 
@@ -418,7 +419,98 @@ export interface ToolkitMeta {
   toolsCount?: number;
 }
 
+/**
+ * Full catalog entry — derived directly from Composio's API. Replaces the
+ * hardcoded CURATED_TOOLKITS for UI rendering. The dashboard uses this so
+ * users can browse/search the entire catalog (1000+ services) instead of
+ * being limited to whatever slugs are pinned in code.
+ */
+export interface CatalogToolkit {
+  slug: string;
+  name: string;
+  logoUrl?: string;
+  description?: string;
+  toolsCount?: number;
+  /** managed = Composio hosts the OAuth app; byo = user must register their
+   *  own; none = no auth required. Derived from composioManagedAuthSchemes. */
+  authMode: 'managed' | 'byo' | 'none';
+  categories: { slug: string; name: string }[];
+}
+
 let toolkitMetaCache: Promise<Map<string, ToolkitMeta>> | null = null;
+let catalogCache: { at: number; data: CatalogToolkit[] } | null = null;
+const CATALOG_TTL_MS = 60 * 60 * 1000; // 1h — catalog drifts very slowly
+
+/**
+ * Fetch the full Composio toolkit catalog (1000+ services). Replaces the
+ * static CURATED_TOOLKITS array as the source of truth for the dashboard
+ * Connections panel — slug typos are now impossible because we render from
+ * Composio's own data, and new services appear automatically as they're
+ * added. Cached at module level for 1 hour; resetComposioClient() clears
+ * the cache when the API key changes.
+ */
+export async function listAllToolkits(): Promise<CatalogToolkit[]> {
+  const now = Date.now();
+  if (catalogCache && now - catalogCache.at < CATALOG_TTL_MS) {
+    return catalogCache.data;
+  }
+  const composio = getComposio();
+  if (!composio) return [];
+
+  const out: CatalogToolkit[] = [];
+  let cursor: string | undefined;
+  // Bounded loop — 30 pages × 500 items = 15K ceiling, far more than any
+  // realistic catalog. Composio currently returns ~1.5K items across 3
+  // pages, but the cap makes a runaway impossible.
+  for (let page = 0; page < 30; page++) {
+    try {
+      const rawClient = (composio as any).client;
+      const resp = await rawClient.toolkits.list({
+        limit: 500,
+        ...(cursor ? { cursor } : {}),
+      });
+      const items = (resp?.items ?? []) as Array<{
+        slug: string;
+        name: string;
+        meta?: {
+          logo?: string;
+          description?: string;
+          toolsCount?: number;
+          tools_count?: number;
+          categories?: Array<{ slug: string; name: string }>;
+        };
+        composioManagedAuthSchemes?: string[];
+        composio_managed_auth_schemes?: string[];
+        authSchemes?: string[];
+        auth_schemes?: string[];
+        noAuth?: boolean;
+        no_auth?: boolean;
+      }>;
+      for (const it of items) {
+        const managed = (it.composioManagedAuthSchemes ?? it.composio_managed_auth_schemes ?? []) as string[];
+        const schemes = (it.authSchemes ?? it.auth_schemes ?? []) as string[];
+        const noAuth = it.noAuth ?? it.no_auth ?? false;
+        out.push({
+          slug: it.slug,
+          name: it.name,
+          logoUrl: it.meta?.logo,
+          description: it.meta?.description,
+          toolsCount: it.meta?.toolsCount ?? it.meta?.tools_count,
+          authMode: noAuth ? 'none' : (managed.length > 0 ? 'managed' : (schemes.length > 0 ? 'byo' : 'none')),
+          categories: it.meta?.categories ?? [],
+        });
+      }
+      cursor = resp?.next_cursor ?? resp?.nextCursor;
+      if (!cursor || items.length === 0) break;
+    } catch (err) {
+      logger.warn({ err, page }, 'listAllToolkits page failed — stopping pagination');
+      break;
+    }
+  }
+  catalogCache = { at: now, data: out };
+  logger.info({ count: out.length }, 'Composio catalog fetched');
+  return out;
+}
 
 async function fetchAllToolkitMeta(): Promise<Map<string, ToolkitMeta>> {
   const composio = getComposio();
