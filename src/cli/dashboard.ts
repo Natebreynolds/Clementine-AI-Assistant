@@ -4424,6 +4424,21 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
     }
   });
 
+  // Force-refresh the Composio caches. Useful when the user just made a
+  // connection in Composio's web UI and wants the agent to pick it up
+  // immediately instead of waiting up to 60s for the user_id cache to
+  // expire. Agents can also call this after surfacing a "needs OAuth"
+  // error to retry cleanly.
+  app.post('/api/composio/refresh', async (_req, res) => {
+    try {
+      const c = await import('../integrations/composio/client.js');
+      c.resetComposioClient();
+      res.json({ ok: true, message: 'Composio caches cleared — next query will re-detect.' });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
   // ── CRON CRUD routes ──────────────────────────────────────────
 
   app.get('/api/projects', (_req, res) => {

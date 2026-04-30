@@ -129,14 +129,24 @@ export function clementineUserId(): string {
 }
 
 // Cached after first detection — avoids extra API calls per authorize.
+// Cache the detected user_id but only briefly. New connections made via
+// Composio's web UI (outside Clementine) need to be picked up without a
+// daemon restart — long-lived caching breaks that. 60s is short enough
+// for "hit dashboard → connect in Composio web → use it from agent" to
+// work without explicit invalidation, and long enough that within-burst
+// queries don't hammer the API.
 let detectedPreferredUserId: string | null = null;
+let detectedAt = 0;
+const USER_ID_CACHE_TTL_MS = 60_000;
 
 async function detectPreferredUserId(
   composio: NonNullable<ReturnType<typeof getComposio>>,
 ): Promise<string> {
   const explicit = readComposioEnv('COMPOSIO_USER_ID');
   if (explicit) return explicit;
-  if (detectedPreferredUserId !== null) return detectedPreferredUserId;
+  if (detectedPreferredUserId !== null && Date.now() - detectedAt < USER_ID_CACHE_TTL_MS) {
+    return detectedPreferredUserId;
+  }
 
   // The high-level wrapper's list() drops the snake_case `user_id` field
   // during its camelCase transformation, so connections look like they have
@@ -163,6 +173,7 @@ async function detectPreferredUserId(
       const top = [...counts.entries()].sort((a, b) => b[1] - a[1])[0]![0];
       logger.info({ userId: top, candidates: counts.size }, 'Detected Composio user_id from existing connections');
       detectedPreferredUserId = top;
+      detectedAt = Date.now();
       return top;
     }
   } catch (err) {
@@ -173,6 +184,7 @@ async function detectPreferredUserId(
   // requires a non-empty string, and "default" is the conventional
   // single-tenant value that Composio's quickstart uses.
   detectedPreferredUserId = DEFAULT_NEW_CONNECTION_USER_ID;
+  detectedAt = Date.now();
   return DEFAULT_NEW_CONNECTION_USER_ID;
 }
 
@@ -647,6 +659,10 @@ export async function authorizeToolkit(
   try {
     const conn = await composio.toolkits.authorize(userId, slug);
     logger.info({ slug, userId, connectionId: conn.id }, 'Composio authorize OK');
+    // Force re-detect on the next query so the new connection (and any
+    // others created in parallel via Composio's web UI) get picked up
+    // immediately, even within the 60s TTL window.
+    detectedPreferredUserId = null;
     return { redirectUrl: conn.redirectUrl ?? null, connectionId: conn.id };
   } catch (err) {
     const status = (err as { status?: number })?.status;
