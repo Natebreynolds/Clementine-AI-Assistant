@@ -15291,7 +15291,14 @@ function navigateTo(page, opts) {
       if (bt === 'learning' && typeof refreshSelfImprove === 'function') refreshSelfImprove();
       break;
     case 'settings':
-      switchDestTab('settings', opts.tab || 'channels');
+      // Settings tabs use the switchTab() system (id="tab-settings-<tab>"),
+      // not switchDestTab's [data-tab] selector. Default tab name is
+      // 'general' (the "Channels & Env" pane) to match the HTML id.
+      switchTab('settings', opts.tab || 'general');
+      // 'general' has no auto-refresh in switchTab — kick it manually so
+      // the Channels & Env card actually loads from /api/settings instead
+      // of stalling on "Loading settings…".
+      if ((opts.tab || 'general') === 'general' && typeof refreshSettings === 'function') refreshSettings();
       break;
   }
 
@@ -15693,6 +15700,7 @@ function switchTab(group, tab) {
     if (tab === 'learning' && typeof refreshSelfImprove === 'function') refreshSelfImprove();
   }
   if (group === 'settings') {
+    if (tab === 'general' && typeof refreshSettings === 'function') refreshSettings();
     if (tab === 'integrations') { refreshSalesforce(); refreshComposioConnections(); }
     if (tab === 'remote') refreshRemoteAccess();
     if (tab === 'security') refreshAuthSessions();
@@ -25783,9 +25791,13 @@ async function saveComposioApiKey() {
 }
 
 async function connectComposio(slug) {
+  // Open a blank popup SYNCHRONOUSLY inside the click handler. Browsers
+  // only let popups through if they're a direct user gesture — once we
+  // hit the await below, the gesture is "consumed" and any later
+  // window.open() gets silently blocked by Chrome/Safari/Firefox.
+  // We'll redirect this blank window to the OAuth URL once we have it.
+  var popup = window.open('about:blank', '_blank');
   try {
-    // Use apiFetch (not raw fetch) so the Authorization: Bearer header is
-    // attached — the /api/* middleware rejects unauth'd POSTs with 401.
     var res = await apiFetch('/api/composio/toolkits/' + encodeURIComponent(slug) + '/authorize', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -25794,27 +25806,61 @@ async function connectComposio(slug) {
     var d = await res.json();
     if (res.status === 409 && d.needsAuthConfig) {
       toast('This toolkit needs a BYO OAuth app — opening Composio dashboard.', 'warn');
-      window.open(d.setupUrl, '_blank');
+      if (popup && !popup.closed) popup.location.href = d.setupUrl;
+      else showOAuthLinkPrompt(slug, d.setupUrl);
       return;
     }
     if (!res.ok) {
+      if (popup && !popup.closed) popup.close();
       var reason = d.error || ('HTTP ' + res.status);
       toast('Connect failed: ' + reason, 'error');
       console.error('[composio] connect failed', { slug: slug, status: res.status, body: d });
       return;
     }
     if (d.redirectUrl) {
-      window.open(d.redirectUrl, '_blank');
-      toast('Opened ' + slug + ' authorization in a new tab. Refresh after approving.', 'info');
-      // Soft poll to catch the new connection without forcing a manual refresh.
+      if (popup && !popup.closed) {
+        popup.location.href = d.redirectUrl;
+        toast('Authorize ' + slug + ' in the new tab, then come back here.', 'info');
+      } else {
+        // Popup got blocked even with the synchronous-open trick (some
+        // browsers / extensions block about:blank too). Fall back to a
+        // visible "click to open" dialog — that click is a direct gesture
+        // and reliably bypasses the blocker.
+        showOAuthLinkPrompt(slug, d.redirectUrl);
+      }
       setTimeout(refreshComposioConnections, 5000);
       setTimeout(refreshComposioConnections, 15000);
       setTimeout(refreshComposioConnections, 30000);
     } else {
+      if (popup && !popup.closed) popup.close();
       toast('Connected ' + slug, 'success');
       refreshComposioConnections();
     }
-  } catch (e) { toast('Connect failed: ' + e, 'error'); }
+  } catch (e) {
+    if (popup && !popup.closed) popup.close();
+    toast('Connect failed: ' + e, 'error');
+  }
+}
+
+function showOAuthLinkPrompt(slug, url) {
+  // Renders a modal with a clickable link. User clicking the link is a
+  // direct gesture, so the new tab will open even when popup blockers are
+  // aggressive. Used as the fallback when window.open returns null.
+  var existing = document.getElementById('composio-oauth-prompt');
+  if (existing) existing.remove();
+  var overlay = document.createElement('div');
+  overlay.id = 'composio-oauth-prompt';
+  overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:9999;display:flex;align-items:center;justify-content:center';
+  overlay.innerHTML =
+    '<div style="background:var(--bg-primary,#1e1e1e);border:1px solid var(--border);border-radius:8px;padding:20px;max-width:480px;width:90%;box-shadow:0 8px 32px rgba(0,0,0,0.4)">' +
+    '<div style="font-size:14px;font-weight:600;margin-bottom:8px">Authorize ' + esc(slug) + '</div>' +
+    '<div style="font-size:12px;color:var(--text-muted);margin-bottom:14px;line-height:1.5">Your browser blocked the popup. Click below to open the authorization page in a new tab — after approving, come back here and the connection will show up within a few seconds.</div>' +
+    '<div style="display:flex;gap:8px;justify-content:flex-end">' +
+    '<button class="btn-sm" onclick="document.getElementById(\\'composio-oauth-prompt\\').remove()" style="padding:6px 12px;background:transparent;border:1px solid var(--border);color:var(--text-primary);border-radius:4px;cursor:pointer;font-size:12px">Cancel</button>' +
+    '<a href="' + esc(url) + '" target="_blank" rel="noopener" onclick="setTimeout(function(){var e=document.getElementById(\\'composio-oauth-prompt\\');if(e)e.remove();},500)" class="btn btn-sm btn-primary" style="text-decoration:none;padding:6px 14px;display:inline-block;font-size:12px">Open authorization</a>' +
+    '</div>' +
+    '</div>';
+  document.body.appendChild(overlay);
 }
 
 async function disconnectComposio(slug, connectionId) {
