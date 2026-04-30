@@ -483,9 +483,16 @@ export async function authorizeToolkit(
   // 1. Find or create an auth config. session.authorize() doesn't auto-create
   //    so we have to pass authConfigId explicitly to connectedAccounts.initiate.
   let authConfigId: string;
-  const existingConfig = (await composio.authConfigs.list({ toolkit: slug })).items[0];
+  let existingConfig;
+  try {
+    existingConfig = (await composio.authConfigs.list({ toolkit: slug })).items[0];
+  } catch (err) {
+    logger.error({ err, slug, step: 'authConfigs.list' }, 'Composio authorize failed');
+    throw err;
+  }
   if (existingConfig) {
     authConfigId = existingConfig.id;
+    logger.debug({ slug, authConfigId }, 'Reusing existing auth config');
   } else {
     try {
       const created = await composio.authConfigs.create(slug, {
@@ -493,11 +500,16 @@ export async function authorizeToolkit(
         name: `${displayNameFor(slug)} Auth Config`,
       });
       authConfigId = created.id;
+      logger.debug({ slug, authConfigId }, 'Created managed auth config');
     } catch (err) {
-      // 400 → Composio doesn't host a managed OAuth app for this toolkit;
-      // user must register their own via the Composio dashboard.
       const status = (err as { status?: number })?.status;
-      if (status === 400) {
+      logger.warn({ err, slug, status, step: 'authConfigs.create' }, 'authConfigs.create rejected — likely needs BYO setup');
+      // 400 → Composio doesn't host a managed OAuth app for this toolkit.
+      // 401/403 → key lacks permission to create managed auth configs (common
+      //   for Google services where Composio's plan tier requires you to
+      //   register your own Google OAuth project). Either way, the user fix
+      //   is the same: set it up once in Composio's auth-configs dashboard.
+      if (status === 400 || status === 401 || status === 403) {
         throw new ComposioNeedsAuthConfigError(slug, String(err));
       }
       throw err;
@@ -513,12 +525,18 @@ export async function authorizeToolkit(
   // freshly authorized Gmail lands next to the existing Outlook (etc.) under
   // the same user_id. Falls back to env override or "default".
   const userId = await detectPreferredUserId(composio);
-  const conn = await composio.connectedAccounts.initiate(userId, authConfigId, {
-    ...(existing.length > 0 ? { allowMultiple: true } : {}),
-    ...(opts?.callbackUrl ? { callbackUrl: opts.callbackUrl } : {}),
-    ...(opts?.alias ? { alias: opts.alias } : {}),
-  });
-  return { redirectUrl: conn.redirectUrl ?? null, connectionId: conn.id };
+  try {
+    const conn = await composio.connectedAccounts.initiate(userId, authConfigId, {
+      ...(existing.length > 0 ? { allowMultiple: true } : {}),
+      ...(opts?.callbackUrl ? { callbackUrl: opts.callbackUrl } : {}),
+      ...(opts?.alias ? { alias: opts.alias } : {}),
+    });
+    logger.debug({ slug, userId, connectionId: conn.id }, 'Initiated connection');
+    return { redirectUrl: conn.redirectUrl ?? null, connectionId: conn.id };
+  } catch (err) {
+    logger.error({ err, slug, userId, authConfigId, step: 'connectedAccounts.initiate' }, 'Composio initiate failed');
+    throw err;
+  }
 }
 
 export async function disconnectToolkit(connectionId: string): Promise<void> {

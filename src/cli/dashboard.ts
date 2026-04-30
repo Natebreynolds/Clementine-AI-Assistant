@@ -5072,11 +5072,16 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
   app.put('/api/settings/:key', async (req, res) => {
     try {
       const { key } = req.params;
-      const { value } = req.body;
+      let { value } = req.body;
       if (typeof value !== 'string') {
         res.status(400).json({ error: 'value must be a string' });
         return;
       }
+      // Strip whitespace + invisible chars that commonly hitchhike when users
+      // paste from a website. Without this, Composio's API rejects the key as
+      // 401 even though the visible characters look right. Trim covers
+      // newlines, tabs, regular spaces, and zero-width chars.
+      value = value.trim().replace(/[​-‍﻿]/g, '');
       // Allow known keys + any valid env var name (A-Z, 0-9, _)
       if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) {
         res.status(400).json({ error: `Invalid key format: ${key}` });
