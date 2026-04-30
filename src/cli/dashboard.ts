@@ -4250,17 +4250,22 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
 
   // ── Composio (1000+ third-party services via OAuth broker) ────
 
-  app.get('/api/composio/status', (_req, res) => {
-    res.json({ enabled: Boolean(process.env.COMPOSIO_API_KEY) });
+  app.get('/api/composio/status', async (_req, res) => {
+    // Use isComposioEnabled — checks both process.env (dashboard hot-reload)
+    // and the .env file (survives daemon restart). Reading process.env
+    // directly here was the bug: after restart, .env had the key but
+    // process.env was empty, so the dashboard reported the key as unset.
+    const c = await import('../integrations/composio/client.js');
+    res.json({ enabled: c.isComposioEnabled() });
   });
 
   app.get('/api/composio/toolkits', async (_req, res) => {
     try {
-      if (!process.env.COMPOSIO_API_KEY) {
+      const c = await import('../integrations/composio/client.js');
+      if (!c.isComposioEnabled()) {
         res.json({ enabled: false, toolkits: [] });
         return;
       }
-      const c = await import('../integrations/composio/client.js');
       const [connected, configured, meta] = await Promise.all([
         c.listConnectedToolkits(),
         c.listToolkitSlugsWithAuthConfig(),
