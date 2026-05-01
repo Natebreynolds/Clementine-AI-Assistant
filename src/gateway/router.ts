@@ -1709,9 +1709,16 @@ export class Gateway {
         // Register provenance for the orchestrator session
         this.ensureProvenance(sessionKey);
 
+        // Register a session AbortController so a follow-up message ("stop", or
+        // any new prompt) can interrupt the plan via acquireSessionLock — which
+        // calls abortController.abort('interrupted-by-new-message') when it
+        // sees an in-flight query on this session.
+        const planAc = new AbortController();
+        this.getSession(sessionKey).abortController = planAc;
+
         const { PlanOrchestrator } = await import('../agent/orchestrator.js');
         const orchestrator = new PlanOrchestrator(this.assistant);
-        const result = await orchestrator.run(taskDescription, onProgress, onApproval);
+        const result = await orchestrator.run(taskDescription, onProgress, onApproval, undefined, planAc.signal);
 
         scanner.refreshIntegrity();
         this.assistant.injectContext(sessionKey, `[Plan: ${taskDescription}]`, result);

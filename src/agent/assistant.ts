@@ -4429,13 +4429,20 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
   async runPlanStep(
     stepId: string,
     prompt: string,
-    opts: { tier?: number; maxTurns?: number; model?: string; disableTools?: boolean; outputFormat?: { type: 'json_schema'; schema: Record<string, unknown> }; delegateProfile?: AgentProfile } = {},
+    opts: { tier?: number; maxTurns?: number; model?: string; disableTools?: boolean; outputFormat?: { type: 'json_schema'; schema: Record<string, unknown> }; delegateProfile?: AgentProfile; abortSignal?: AbortSignal } = {},
   ): Promise<string> {
-    const { tier = 2, maxTurns = 15, model, disableTools = false, outputFormat, delegateProfile } = opts;
+    const { tier = 2, maxTurns = 15, model, disableTools = false, outputFormat, delegateProfile, abortSignal } = opts;
 
     // Don't mutate the global — pass source through the closure instead
     // Per-step stall guard so concurrent steps don't cross-contaminate
     const stepGuard = new StallGuard();
+    // Per-step AbortController, mirroring the parent signal so the orchestrator
+    // (or gateway, via the session AC) can stop in-flight SDK streams.
+    const stepAc = new AbortController();
+    if (abortSignal) {
+      if (abortSignal.aborted) stepAc.abort(abortSignal.reason);
+      else abortSignal.addEventListener('abort', () => stepAc.abort(abortSignal.reason), { once: true });
+    }
     const sdkOptions = await this.buildOptions({
       isHeartbeat: false,
       cronTier: tier,
@@ -4448,6 +4455,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
       outputFormat,
       stallGuard: stepGuard,
       profile: delegateProfile ?? null,
+      abortController: stepAc,
     });
 
     const trace: TraceEntry[] = [];

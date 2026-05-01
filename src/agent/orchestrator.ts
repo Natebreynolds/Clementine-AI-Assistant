@@ -164,6 +164,7 @@ export class PlanOrchestrator {
   private startTime = 0;
   private stateId: string;
   private agentProfiles = new Map<string, AgentProfile>();
+  private abortSignal?: AbortSignal;
 
   constructor(assistant: PersonalAssistant) {
     this.assistant = assistant;
@@ -216,18 +217,24 @@ export class PlanOrchestrator {
 
   /**
    * Main entry: plan → approve → execute → synthesize → return final response.
+   *
+   * `abortSignal` (typically the gateway session controller) lets the user stop
+   * a running plan: the orchestrator checks it between waves and forwards it to
+   * every `runPlanStep` call so in-flight SDK streams abort immediately.
    */
   async run(
     taskDescription: string,
     onProgress?: (updates: PlanProgressUpdate[]) => Promise<void>,
     onApproval?: (planSummary: string, steps: PlanStep[]) => Promise<boolean | string>,
     availableAgents?: AgentProfile[],
+    abortSignal?: AbortSignal,
   ): Promise<string> {
     // Reset instance state for reuse safety
     this.stepStatuses.clear();
     this.stepStartTimes.clear();
     this.agentProfiles.clear();
     this.startTime = Date.now();
+    this.abortSignal = abortSignal;
 
     // Index available agents for delegation lookups
     if (availableAgents) {
@@ -341,6 +348,16 @@ export class PlanOrchestrator {
     this.saveState(state);
 
     for (const wave of waves) {
+      // User-initiated cancellation: bail before starting the next wave so we
+      // don't kick off SDK streams the user already asked to stop.
+      if (this.abortSignal?.aborted) {
+        logger.info({ goal: taskDescription, wavesCompleted: state.wavesCompleted }, 'Plan cancelled by user');
+        state.status = 'failed';
+        this.saveState(state);
+        this.logAutonomy('plan_aborted', { reason: 'user_cancelled', wavesCompleted: state.wavesCompleted });
+        return 'Plan cancelled.';
+      }
+
       // Mark running
       for (const step of wave) {
         this.stepStatuses.set(step.id, {
@@ -365,6 +382,7 @@ export class PlanOrchestrator {
             maxTurns: step.maxTurns ?? 15,
             model: step.model,
             delegateProfile,
+            abortSignal: this.abortSignal,
           });
           return { stepId: step.id, result };
         }),
@@ -407,6 +425,17 @@ export class PlanOrchestrator {
       }
       await safeProgress(this.getAllUpdates());
 
+      // If the user aborted mid-wave, the SDK calls above already threw and
+      // `outcome.reason` will reflect the abort. Surface that as a clean
+      // cancellation instead of falling through to spot-check / repair / synthesis.
+      if (this.abortSignal?.aborted) {
+        logger.info({ goal: taskDescription, wavesCompleted: state.wavesCompleted }, 'Plan cancelled by user mid-wave');
+        state.status = 'failed';
+        this.saveState(state);
+        this.logAutonomy('plan_aborted', { reason: 'user_cancelled', wavesCompleted: state.wavesCompleted });
+        return 'Plan cancelled.';
+      }
+
       // Inter-wave spot-check with severity levels: critical issues trigger repair
       const spotCheckIssues = this.spotCheckWaveResults(wave, results);
       if (spotCheckIssues.length > 0) {
@@ -429,6 +458,7 @@ export class PlanOrchestrator {
                     tier: step.tier ?? 2,
                     maxTurns: step.maxTurns ?? 15,
                     model: step.model,
+                    abortSignal: this.abortSignal,
                   });
                   results.set(step.id, retryResult || '[No output on retry]');
                   this.stepStatuses.set(step.id, {
@@ -519,6 +549,7 @@ export class PlanOrchestrator {
         tier: 2,
         maxTurns: 5,
         disableTools: true,
+        abortSignal: this.abortSignal,
       });
     } catch (err) {
       logger.error({ err }, 'Synthesis step failed');
@@ -713,6 +744,7 @@ export class PlanOrchestrator {
         maxTurns: 1,
         model: 'haiku',
         disableTools: true,
+        abortSignal: this.abortSignal,
       });
 
       const cleaned = decision.trim().toLowerCase();
@@ -743,7 +775,7 @@ export class PlanOrchestrator {
     const plannerResult = await this.assistant.runPlanStep(
       'planner',
       PLANNER_PROMPT + agentContext + task + PLANNER_PROMPT_SUFFIX,
-      { tier: 2, maxTurns: 1, model: 'sonnet', disableTools: true },
+      { tier: 2, maxTurns: 1, model: 'sonnet', disableTools: true, abortSignal: this.abortSignal },
     );
 
     // Parse JSON from the planner response
@@ -916,6 +948,7 @@ Work through this task narrating your reasoning:
     return this.assistant.runPlanStep('fallback', task, {
       tier: 2,
       maxTurns: 25,
+      abortSignal: this.abortSignal,
     });
   }
 
