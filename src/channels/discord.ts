@@ -50,7 +50,6 @@ import {
   VAULT_DIR,
   BASE_DIR,
   DEFAULT_MODEL_TIER,
-  ENABLE_1M_CONTEXT,
 } from '../config.js';
 import type { HeartbeatScheduler, CronScheduler } from '../gateway/heartbeat.js';
 import type { NotificationDispatcher } from '../gateway/notifications.js';
@@ -664,8 +663,7 @@ export async function startDiscord(
 
     // ── System info ──────────────────────────────────────────────
     const modelLabel = (DEFAULT_MODEL_TIER as string).charAt(0).toUpperCase() + (DEFAULT_MODEL_TIER as string).slice(1);
-    const contextTag = ENABLE_1M_CONTEXT ? ' \u00b7 1M context' : '';
-    embed.addFields({ name: '\u{2699}\u{FE0F} System', value: `${modelLabel}${contextTag}`, inline: true });
+    embed.addFields({ name: '\u{2699}\u{FE0F} System', value: modelLabel, inline: true });
 
     return embed;
   }

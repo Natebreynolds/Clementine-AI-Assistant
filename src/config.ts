@@ -214,7 +214,7 @@ function getSecret(envKey: string, keychainService?: string): string {
 export const MODELS: Models = {
   haiku: getEnvOrJson('HAIKU_MODEL', json.models?.haiku, 'claude-haiku-4-5-20251001'),
   sonnet: getEnvOrJson('SONNET_MODEL', json.models?.sonnet, 'claude-sonnet-4-6'),
-  opus: getEnvOrJson('OPUS_MODEL', json.models?.opus, 'claude-opus-4-6'),
+  opus: getEnvOrJson('OPUS_MODEL', json.models?.opus, 'claude-opus-4-7'),
 };
 
 // ── Budget caps (USD per query) ──────────────────────────────────────
@@ -276,14 +276,6 @@ export const TASK_BUDGET_TOKENS = {
 
 export const DEFAULT_MODEL_TIER = (getEnvOrJson('DEFAULT_MODEL_TIER', json.models?.default, 'sonnet')) as keyof Models;
 export const MODEL = MODELS[DEFAULT_MODEL_TIER] ?? MODELS.sonnet;
-
-/** Enable 1M context window for Sonnet (beta). Toggle via ENABLE_1M_CONTEXT=true in .env or dashboard. */
-export let ENABLE_1M_CONTEXT = getEnv('ENABLE_1M_CONTEXT', 'false').toLowerCase() === 'true';
-
-/** Update 1M context flag at runtime (called from dashboard settings API). */
-export function setEnable1MContext(value: boolean): void {
-  ENABLE_1M_CONTEXT = value;
-}
 
 // ── Discord ──────────────────────────────────────────────────────────
 

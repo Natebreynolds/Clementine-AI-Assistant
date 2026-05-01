@@ -5023,7 +5023,6 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
       label: 'Model',
       keys: [
         { key: 'DEFAULT_MODEL_TIER', label: 'Default Tier', hint: 'haiku, sonnet, or opus', type: 'select:haiku,sonnet,opus' },
-        { key: 'ENABLE_1M_CONTEXT', label: '1M Context', hint: 'Enable 1M token context window for Sonnet (beta)', type: 'toggle' },
       ],
     },
     {
@@ -5223,10 +5222,6 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
       writeEnvValue(key, value);
 
       // Apply runtime-hot settings immediately (no restart needed)
-      if (key === 'ENABLE_1M_CONTEXT') {
-        const { setEnable1MContext } = await import('../config.js');
-        setEnable1MContext(value.toLowerCase() === 'true');
-      }
       // Composio: mutate process.env in-place + drop singleton so the very
       // next /api/composio/* call picks up the new key without a daemon
       // restart. Without this, "Save key → Connect Gmail" would 503 until

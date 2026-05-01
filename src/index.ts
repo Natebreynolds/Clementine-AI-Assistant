@@ -283,7 +283,6 @@ function printBanner(channels: string[], profiles: number, cronJobs: number, gra
 
   // Feature tags
   const tags: string[] = [];
-  if (config.ENABLE_1M_CONTEXT) tags.push('1M context');
   if (config.GROQ_API_KEY) tags.push('voice');
   if (config.GOOGLE_API_KEY) tags.push('video');
   if (config.CHANNEL_OUTLOOK) tags.push('outlook');

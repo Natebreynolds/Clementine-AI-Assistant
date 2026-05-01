@@ -53,7 +53,6 @@ import {
   HANDOFFS_DIR,
   BUDGET,
   TASK_BUDGET_TOKENS,
-  ENABLE_1M_CONTEXT,
   IDENTITY_FILE,
   CLAUDE_CODE_OAUTH_TOKEN,
   ANTHROPIC_API_KEY as CONFIG_ANTHROPIC_API_KEY,
@@ -2195,12 +2194,6 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
     // never passed into sdkOptions.
     const supportsTaskBudget = false;
 
-    // 1M context beta: enable for Sonnet when toggled and context-heavy work benefits
-    const isSonnet = resolvedModel.includes('sonnet');
-    const computedBetas = ENABLE_1M_CONTEXT && isSonnet
-      ? ['context-1m-2025-08-07' as const]
-      : undefined;
-
     // Merge external MCP servers (Claude Desktop, Claude Code, user-managed).
     // Skip when tools are disabled (no point connecting to servers we won't use)
     // or for internal plan steps that only need Clementine's own tools.
@@ -2276,7 +2269,6 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
       ...(computedEffort ? { effort: computedEffort } : {}),
       // maxBudgetUsd intentionally omitted — see comment above.
       ...(computedThinking ? { thinking: computedThinking } : {}),
-      ...(computedBetas ? { betas: computedBetas } : {}),
       ...(outputFormat ? { outputFormat } : {}),
       canUseTool: async (toolName: string, toolInput: Record<string, unknown>, _options: { signal: AbortSignal; toolUseID: string }) => {
         // Per-query stall guard (no global state — scoped to this query)

@@ -307,9 +307,6 @@ WORKSPACE_DIRS=~/projects,~/work
 
 # Security
 ALLOW_ALL_USERS=false      # true = skip owner checks
-
-# Beta Features
-ENABLE_1M_CONTEXT=false    # Enable 1M token context for Sonnet (toggle in dashboard)
 ```
 
 Secrets can also be stored in macOS Keychain (`security find-generic-password`) — Clementine checks Keychain as a fallback for any missing `.env` value.
@@ -336,7 +333,6 @@ Your overrides live in `~/.clementine/.env` — **they survive every `npm update
 | `BUDGET_CRON_T2_USD` | `5.00` | Max spend per tier-2 cron job |
 | `BUDGET_HEARTBEAT_USD` | `0.50` | Max spend per heartbeat tick |
 | `DEFAULT_MODEL_TIER` | `sonnet` | Default model: `haiku` / `sonnet` / `opus` |
-| `ENABLE_1M_CONTEXT` | `false` | Enable Sonnet 1M-token context (beta) |
 | `HEARTBEAT_INTERVAL_MINUTES` | `30` | How often the agent auto-checks in |
 | `HEARTBEAT_ACTIVE_START` | `8` | First hour of the active window (0–23) |
 | `HEARTBEAT_ACTIVE_END` | `22` | Last hour of the active window |

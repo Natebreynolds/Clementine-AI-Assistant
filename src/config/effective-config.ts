@@ -62,7 +62,7 @@ const SPECS: KeySpec[] = [
   { key: 'DEFAULT_MODEL_TIER', group: 'models', jsonPath: 'models.default', default: 'sonnet' },
   { key: 'HAIKU_MODEL', group: 'models', jsonPath: 'models.haiku', default: 'claude-haiku-4-5-20251001' },
   { key: 'SONNET_MODEL', group: 'models', jsonPath: 'models.sonnet', default: 'claude-sonnet-4-6' },
-  { key: 'OPUS_MODEL', group: 'models', jsonPath: 'models.opus', default: 'claude-opus-4-6' },
+  { key: 'OPUS_MODEL', group: 'models', jsonPath: 'models.opus', default: 'claude-opus-4-7' },
 
   // Budgets
   { key: 'BUDGET_HEARTBEAT_USD', group: 'budgets', jsonPath: 'budgets.heartbeat', default: 0.50 },

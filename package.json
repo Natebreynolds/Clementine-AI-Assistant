@@ -1,6 +1,6 @@
 {
   "name": "clementine-agent",
-  "version": "1.14.2",
+  "version": "1.15.0",
   "description": "Clementine — Personal AI Assistant (TypeScript)",
   "type": "module",
   "main": "dist/index.js",
@@ -21,7 +21,7 @@
     "postinstall": "node scripts/postinstall.js 2>/dev/null || true"
   },
   "dependencies": {
-    "@anthropic-ai/claude-agent-sdk": "^0.2.119",
+    "@anthropic-ai/claude-agent-sdk": "^0.2.126",
     "@anthropic-ai/sdk": "^0.91.0",
     "@composio/claude-agent-sdk": "^0.8.1",
     "@composio/core": "^0.8.1",
