@@ -195,57 +195,6 @@ server.tool(
 );
 
 
-// ── 0b. team_scratchpad ────────────────────────────────────────────────
-//
-// Cross-agent shared scratchpad. Unlike working_memory (per-agent), this
-// is a single shared markdown file every agent can read and append to.
-// Use cases: live coordination ("Sasha is drafting the brief, Ross hold
-// outbound for 30m"), cross-agent context drops, async hand-offs that
-// don't warrant a full goal_create or task_add. Append tags every entry
-// with the author's agent slug + ISO timestamp so the trail stays clear.
-
-const TEAM_SCRATCHPAD_FILE = path.join(BASE_DIR, 'team-scratchpad.md');
-
-server.tool(
-  'team_scratchpad',
-  getToolDescription('team_scratchpad') ?? 'Cross-agent shared scratchpad for live team coordination. All agents read/write the same file. Use for hand-offs, "I am working on X", short-term context drops. For durable facts, use memory_write/MEMORY.md instead.',
-  {
-    action: z.enum(['read', 'append', 'replace', 'clear']).describe('What to do with the team scratchpad'),
-    content: z.string().optional().describe('Text to append or replace with (required for append/replace)'),
-  },
-  async ({ action, content }) => {
-    const author = ACTIVE_AGENT_SLUG ?? 'clementine';
-    switch (action) {
-      case 'read': {
-        if (!existsSync(TEAM_SCRATCHPAD_FILE)) {
-          return textResult('Team scratchpad is empty.');
-        }
-        return textResult(readFileSync(TEAM_SCRATCHPAD_FILE, 'utf-8'));
-      }
-      case 'append': {
-        if (!content) return textResult('Error: content is required for append.');
-        const stamp = new Date().toISOString();
-        const entry = `\n- **[${author}@${stamp}]** ${content}\n`;
-        const existing = existsSync(TEAM_SCRATCHPAD_FILE) ? readFileSync(TEAM_SCRATCHPAD_FILE, 'utf-8') : '# Team Scratchpad\n\nShared across all agents. Append tags entries with author + timestamp.\n';
-        writeFileSync(TEAM_SCRATCHPAD_FILE, existing + entry);
-        return textResult(`Appended to team scratchpad as ${author}.`);
-      }
-      case 'replace': {
-        if (!content) return textResult('Error: content is required for replace.');
-        const stamp = new Date().toISOString();
-        const header = `# Team Scratchpad\n\n_Replaced by ${author} at ${stamp}._\n\n`;
-        writeFileSync(TEAM_SCRATCHPAD_FILE, header + content + '\n');
-        return textResult(`Team scratchpad replaced by ${author}.`);
-      }
-      case 'clear': {
-        if (existsSync(TEAM_SCRATCHPAD_FILE)) unlinkSync(TEAM_SCRATCHPAD_FILE);
-        return textResult('Team scratchpad cleared.');
-      }
-    }
-  },
-);
-
-
 // ── 1. memory_read ─────────────────────────────────────────────────────
 
 server.tool(
@@ -555,49 +504,6 @@ server.tool(
   },
 );
 
-
-// ── 2b. memory_record_procedure ────────────────────────────────────────
-
-server.tool(
-  'memory_record_procedure',
-  getToolDescription('memory_record_procedure') ?? 'Record a learned workflow as a durable procedure. Use when you notice a repeating multi-step task ("how Nate ships a release", "how to handle inbound replies"). Stored under 00-System/procedures/ with category=procedure and trigger verbs that surface it later. Different from memory_write/MEMORY.md: those store facts, this stores reusable HOW-TO. From Mem0\'s 2026 procedural-memory pattern.',
-  {
-    title: z.string().describe('Short procedure title (becomes filename slug)'),
-    steps: z.string().describe('Numbered steps or markdown body describing how to perform the task'),
-    triggers: z.array(z.string()).min(1).describe('Verb phrases (e.g. ["ship release", "publish to npm"]) that should surface this procedure when the user query contains them. Lowercase preferred.'),
-    notes: z.string().optional().describe('Optional context: when to use, when NOT to use, gotchas'),
-  },
-  async ({ title, steps, triggers, notes }) => {
-    const slug = title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 80);
-    if (!slug) return textResult('Error: title must contain alphanumerics');
-    const proceduresDir = path.join(SYSTEM_DIR, 'procedures');
-    mkdirSync(proceduresDir, { recursive: true });
-    const filePath = path.join(proceduresDir, `${slug}.md`);
-    const triggersYaml = triggers.map((t) => `  - ${JSON.stringify(t.toLowerCase())}`).join('\n');
-    const body = [
-      '---',
-      `title: ${JSON.stringify(title)}`,
-      'category: procedure',
-      'triggers:',
-      triggersYaml,
-      `created_at: ${new Date().toISOString()}`,
-      ACTIVE_AGENT_SLUG ? `agent_slug: ${JSON.stringify(ACTIVE_AGENT_SLUG)}` : '',
-      '---',
-      '',
-      `# ${title}`,
-      '',
-      '## Steps',
-      '',
-      steps.trim(),
-      '',
-      ...(notes ? ['## Notes', '', notes.trim(), ''] : []),
-    ].filter((line) => line !== '').join('\n') + '\n';
-    writeFileSync(filePath, body, 'utf-8');
-    const rel = path.relative(VAULT_DIR, filePath);
-    await incrementalSync(rel, ACTIVE_AGENT_SLUG ?? undefined);
-    return textResult(`Recorded procedure: ${rel} (triggers: ${triggers.join(', ')})`);
-  },
-);
 
 // ── 3. memory_search ───────────────────────────────────────────────────
 

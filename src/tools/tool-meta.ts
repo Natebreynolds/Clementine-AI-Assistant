@@ -25,15 +25,9 @@ const TOOL_META: Record<string, ToolMeta> = {
   // ── Memory & Vault ────────────────────────────────────────────────
 
   working_memory: {
-    description: 'Per-agent persistent scratchpad — only YOU see it. Survives across conversations. Use for current project context, TODOs, reminders, or anything you need to remember for next time. Actions: read, append, replace, clear. ALWAYS read before replacing. For cross-agent coordination, use team_scratchpad instead.',
+    description: 'Per-agent persistent scratchpad — only YOU see it. Survives across conversations. Use for current project context, TODOs, reminders, or anything you need to remember for next time. Actions: read, append, replace, clear. ALWAYS read before replacing.',
     exampleUsage: 'Before starting complex work, read working_memory to check for context from prior sessions.',
     returnHint: 'Full working memory contents (markdown text).',
-  },
-
-  team_scratchpad: {
-    description: 'Cross-agent shared scratchpad — every agent on the team reads and writes the same file. Use for live coordination, hand-offs, "I am working on X — back off until Y", short-lived context drops. For durable facts that should outlive coordination noise, use memory_write to MEMORY.md instead. Append tags entries with author slug + timestamp.',
-    exampleUsage: 'Before starting outbound work, read team_scratchpad to see if another agent has already claimed a prospect or paused outreach.',
-    returnHint: 'Full scratchpad contents with per-entry author + ISO timestamp.',
   },
 
   memory_search: {
