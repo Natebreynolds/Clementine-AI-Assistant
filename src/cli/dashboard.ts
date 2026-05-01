@@ -5615,6 +5615,52 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
     }
   });
 
+  // Quick-add: append a sentence to today's daily note from the dashboard.
+  // Mirrors the agent's memory_write({action:'append_daily'}) path so the
+  // note gets indexed identically.
+  app.post('/api/memory/quick-add', async (req, res) => {
+    try {
+      const content = String(req.body?.content ?? '').trim();
+      const section = (req.body?.section ? String(req.body.section) : 'Interactions').trim() || 'Interactions';
+      const salienceHint = req.body?.salience_hint != null ? Number(req.body.salience_hint) : undefined;
+      if (!content) { res.status(400).json({ error: 'content required' }); return; }
+      if (content.length > 4000) { res.status(400).json({ error: 'content too long (max 4000 chars)' }); return; }
+
+      const sharedMod = await import('../tools/shared.js');
+      const dailyPath = sharedMod.ensureDailyNote();
+      const timestamp = sharedMod.nowTime();
+      let body = readFileSync(dailyPath, 'utf-8');
+      const entry = `\n- **${timestamp}** — ${content}`;
+      const pattern = new RegExp(`(## ${section.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\$&')}.*?)(\\n## |$)`, 's');
+      const match = pattern.exec(body);
+      if (match) {
+        body = body.slice(0, match.index + match[1].length) + entry + body.slice(match.index + match[1].length);
+      } else {
+        body += `\n\n## ${section}${entry}`;
+      }
+      writeFileSync(dailyPath, body, 'utf-8');
+      const rel = path.relative(VAULT_DIR, dailyPath);
+      await sharedMod.incrementalSync(rel);
+
+      try {
+        const store = await sharedMod.getStore();
+        if (typeof salienceHint === 'number' && Number.isFinite(salienceHint)) {
+          store.applyWriteSalience(rel, section, salienceHint);
+        }
+        store.logExtraction({
+          sessionKey: 'dashboard:quick-add', userMessage: content.slice(0, 200),
+          toolName: 'memory_write',
+          toolInput: JSON.stringify({ action: 'append_daily', section, salience_hint: salienceHint, source: 'dashboard' }),
+          extractedAt: new Date().toISOString(), status: 'active',
+        });
+      } catch { /* observability best-effort */ }
+
+      res.json({ ok: true, file: rel, section });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
   app.post('/api/memory/health/action', async (req, res) => {
     try {
       const action = (req.body?.action ?? '') as string;
@@ -12769,9 +12815,38 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
           <h1>Brain</h1>
           <p class="desc">Query what you know, feed new knowledge in, and watch the system learn.</p>
         </div>
-        <div class="actions" style="flex:1;max-width:480px;display:flex;gap:8px">
+        <div class="actions" style="flex:1;max-width:560px;display:flex;gap:8px">
           <input type="text" id="memory-search-input" placeholder="Search vault, notes, memory..." style="flex:1;padding:6px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg-input);color:var(--text-primary);font-size:13px" onkeydown="if(event.key==='Enter')runMemorySearch()">
           <button class="btn-primary btn-sm" onclick="runMemorySearch()">Search</button>
+          <button class="btn-sm" onclick="openQuickAddMemory()" title="Append a quick note to today's daily log">+ Add memory</button>
+        </div>
+      </div>
+
+      <!-- Quick-add memory modal: type a sentence, hit save. Posts to memory_write
+           append_daily so the note lands in today's vault log and gets indexed. -->
+      <div id="quick-add-memory-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:1000;align-items:center;justify-content:center" onclick="if(event.target===this)closeQuickAddMemory()">
+        <div style="background:var(--bg-primary);border:1px solid var(--border);border-radius:10px;padding:20px;width:520px;max-width:90vw">
+          <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px">
+            <h3 style="margin:0;font-size:16px">Add a memory</h3>
+            <button class="btn-icon btn-sm" onclick="closeQuickAddMemory()" title="Close">×</button>
+          </div>
+          <div style="font-size:12px;color:var(--text-muted);margin-bottom:10px">
+            Appends to today's daily note. The agent will see this on its next search.
+          </div>
+          <textarea id="quick-add-memory-text" placeholder="What should Clementine remember?" rows="5" style="width:100%;padding:10px;border:1px solid var(--border);border-radius:6px;background:var(--bg-input);color:var(--text-primary);font-size:13px;font-family:inherit;resize:vertical" autofocus></textarea>
+          <div style="display:flex;gap:8px;align-items:center;margin-top:10px">
+            <label style="font-size:12px;color:var(--text-muted)">Salience:</label>
+            <select id="quick-add-memory-salience" style="padding:5px 8px;border:1px solid var(--border);border-radius:6px;background:var(--bg-input);color:var(--text-primary);font-size:12px">
+              <option value="0.5">0.5 — tentative</option>
+              <option value="1.0" selected>1.0 — normal</option>
+              <option value="1.5">1.5 — durable</option>
+              <option value="2.0">2.0 — identity-level</option>
+            </select>
+            <span style="flex:1"></span>
+            <span id="quick-add-memory-status" style="font-size:12px;color:var(--text-muted)"></span>
+            <button class="btn-sm" onclick="closeQuickAddMemory()">Cancel</button>
+            <button class="btn-primary btn-sm" onclick="submitQuickAddMemory()">Save</button>
+          </div>
         </div>
       </div>
       <div class="tab-bar" id="intelligence-tabs" style="margin:0 0 0 18px">
@@ -12782,13 +12857,41 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
         <button data-icon="zap" onclick="switchTab('intelligence','health')"><span class="icon-slot"></span> Health <span class="tab-badge" id="brain-health-badge" style="display:none;background:#ef4444;color:#fff">0</span></button>
         <button data-icon="users" onclick="switchTab('intelligence','user-model')"><span class="icon-slot"></span> User Model</button>
         <button data-icon="brain" onclick="switchTab('intelligence','learning')"><span class="icon-slot"></span> Learning <span class="tab-badge" id="brain-learning-badge" style="display:none;background:#f59e0b;color:#000">0</span></button>
-        <button onclick="switchTab('intelligence','memory')">Stats</button>
         <button onclick="switchTab('intelligence','seed')">Seed</button>
         <button onclick="switchTab('intelligence','runs')">Runs</button>
       </div>
       <div id="intelligence-tab-content">
         <div class="tab-pane active" id="tab-intelligence-search">
+          <div id="memory-coverage-strip" style="margin-bottom:14px"></div>
           <div id="memory-search-results"></div>
+          <div id="memory-overview" style="margin-top:18px">
+            <div class="grid-2" id="memory-stats" style="margin-bottom:14px"></div>
+            <div class="card" style="margin-bottom:14px">
+              <div class="card-header" style="display:flex;align-items:center;justify-content:space-between">
+                <span>MEMORY.md</span>
+                <span style="font-size:11px;color:var(--text-muted)">Curated facts loaded into every session</span>
+              </div>
+              <div class="card-body" id="panel-memory"><div class="empty-state">Loading...</div></div>
+            </div>
+            <div class="card" style="margin-bottom:14px">
+              <div class="card-header" style="display:flex;align-items:center;justify-content:space-between">
+                <span>Recent writes</span>
+                <span style="font-size:11px;color:var(--text-muted)">What the agent captured, with reason &amp; salience</span>
+              </div>
+              <div class="card-body" id="panel-recent-writes" style="padding:0">
+                <div class="skel-block" style="padding:14px"><div class="skel-row med"></div><div class="skel-row short"></div></div>
+              </div>
+            </div>
+            <div class="card">
+              <div class="card-header" style="display:flex;align-items:center;justify-content:space-between">
+                <span>Self-correction (supersedes)</span>
+                <span style="font-size:11px;color:var(--text-muted)">Old facts the agent has explicitly replaced</span>
+              </div>
+              <div class="card-body" id="panel-supersedes" style="padding:0">
+                <div class="skel-block" style="padding:14px"><div class="skel-row med"></div><div class="skel-row short"></div></div>
+              </div>
+            </div>
+          </div>
         </div>
         <div class="tab-pane" id="tab-intelligence-graph">
           <div style="display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap">
@@ -12807,18 +12910,6 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
           <div id="graph-legend" style="display:flex;gap:16px;margin-top:8px;flex-wrap:wrap"></div>
           <div id="graph-detail-panel" style="margin-top:12px"></div>
         </div>
-        <div class="tab-pane" id="tab-intelligence-memory">
-          <div style="margin-bottom:12px;font-size:13px;color:var(--text-muted)">
-            Stats and content browsing. For janitor, integrity, write queue, and staleness diagnostics see
-            <a href="#" onclick="navigateTo('memory-health');return false" style="color:var(--accent)">Memory Health &rarr;</a>
-          </div>
-          <div class="grid-2" id="memory-stats"></div>
-          <div class="card">
-            <div class="card-header">MEMORY.md</div>
-            <div class="card-body" id="panel-memory"><div class="empty-state">Loading...</div></div>
-          </div>
-        </div>
-
         <!-- User Model — MemGPT-style core memory blocks always loaded into context -->
         <div class="tab-pane" id="tab-intelligence-user-model">
           <div style="color:var(--muted,#888);margin-bottom:12px;font-size:13px;max-width:760px">
@@ -13015,24 +13106,6 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
           </div>
           <div id="memory-health-content">
             <div class="skel-block"><div class="skel-row med"></div><div class="skel-row"></div><div class="skel-row short"></div></div>
-          </div>
-          <div class="card" style="margin-top:18px">
-            <div class="card-header" style="display:flex;align-items:center;justify-content:space-between">
-              <span>Recent writes</span>
-              <span style="font-size:11px;color:var(--text-muted)">What the agent captured, with reason &amp; salience</span>
-            </div>
-            <div class="card-body" id="panel-recent-writes" style="padding:0">
-              <div class="skel-block" style="padding:14px"><div class="skel-row med"></div><div class="skel-row short"></div></div>
-            </div>
-          </div>
-          <div class="card" style="margin-top:18px">
-            <div class="card-header" style="display:flex;align-items:center;justify-content:space-between">
-              <span>Self-correction (supersedes)</span>
-              <span style="font-size:11px;color:var(--text-muted)">Old facts the agent has explicitly replaced</span>
-            </div>
-            <div class="card-body" id="panel-supersedes" style="padding:0">
-              <div class="skel-block" style="padding:14px"><div class="skel-row med"></div><div class="skel-row short"></div></div>
-            </div>
           </div>
           <div class="card" style="margin-top:18px">
             <div class="card-header" style="display:flex;align-items:center;justify-content:space-between">
@@ -15356,7 +15429,6 @@ function navigateTo(page, opts) {
       }
       break;
     case 'brain':
-      if (typeof refreshMemory === 'function') refreshMemory();
       var bt = opts.tab || 'memory';
       // Spec tab names → internal intelligence-tab ids
       var intelTab = bt === 'memory' ? 'search'
@@ -15367,16 +15439,7 @@ function navigateTo(page, opts) {
         : bt === 'learning' ? 'learning'
         : bt;
       try { switchTab('intelligence', intelTab); } catch (e) { /* */ }
-      if (bt === 'health') {
-        if (typeof refreshMemoryHealth === 'function') refreshMemoryHealth();
-        if (typeof refreshRecentWrites === 'function') refreshRecentWrites();
-        if (typeof refreshSupersedes === 'function') refreshSupersedes();
-        if (typeof refreshGraphStats === 'function') refreshGraphStats();
-        if (typeof refreshSessionBridge === 'function') refreshSessionBridge();
-        if (typeof refreshClaims === 'function') refreshClaims();
-        if (typeof refreshRoutingAudit === 'function') refreshRoutingAudit();
-      }
-      if (bt === 'learning' && typeof refreshSelfImprove === 'function') refreshSelfImprove();
+      // switchTab() above already fires the per-tab refreshers; nothing to do here.
       break;
     case 'settings':
       // Settings tabs use the switchTab() system (id="tab-settings-<tab>"),
@@ -15774,12 +15837,16 @@ function switchTab(group, tab) {
   // Tab-specific refresh
   if (group === 'intelligence') {
     if (tab === 'graph') refreshGraph();
-    if (tab === 'memory') refreshMemory();
+    if (tab === 'search') {
+      // Consolidated Memory tab: search results + stats + MEMORY.md + recent writes + supersedes + coverage strip.
+      refreshMemory();
+      if (typeof refreshRecentWrites === 'function') refreshRecentWrites();
+      if (typeof refreshSupersedes === 'function') refreshSupersedes();
+      if (typeof refreshCoverageStrip === 'function') refreshCoverageStrip();
+    }
     if (tab === 'files' && typeof refreshVaultFiles === 'function') refreshVaultFiles();
     if (tab === 'health') {
       if (typeof refreshMemoryHealth === 'function') refreshMemoryHealth();
-      if (typeof refreshRecentWrites === 'function') refreshRecentWrites();
-      if (typeof refreshSupersedes === 'function') refreshSupersedes();
       if (typeof refreshGraphStats === 'function') refreshGraphStats();
       if (typeof refreshSessionBridge === 'function') refreshSessionBridge();
       if (typeof refreshClaims === 'function') refreshClaims();
@@ -21176,6 +21243,90 @@ async function refreshSessionBridge() {
     el.innerHTML = html;
   } catch (err) {
     el.innerHTML = '<div class="empty-state" style="padding:14px">Failed to load: ' + esc(String(err)) + '</div>';
+  }
+}
+
+// Quick-add memory modal — type a sentence, hit save, lands in today's daily note.
+function openQuickAddMemory() {
+  var m = document.getElementById('quick-add-memory-modal');
+  if (!m) return;
+  m.style.display = 'flex';
+  var ta = document.getElementById('quick-add-memory-text');
+  if (ta) { ta.value = ''; setTimeout(function(){ ta.focus(); }, 50); }
+  var st = document.getElementById('quick-add-memory-status');
+  if (st) st.textContent = '';
+}
+
+function closeQuickAddMemory() {
+  var m = document.getElementById('quick-add-memory-modal');
+  if (m) m.style.display = 'none';
+}
+
+async function submitQuickAddMemory() {
+  var ta = document.getElementById('quick-add-memory-text');
+  var sel = document.getElementById('quick-add-memory-salience');
+  var st = document.getElementById('quick-add-memory-status');
+  if (!ta) return;
+  var content = ta.value.trim();
+  if (!content) { if (st) { st.textContent = 'Type something first'; st.style.color = '#ef4444'; } return; }
+  if (st) { st.textContent = 'Saving…'; st.style.color = 'var(--text-muted)'; }
+  try {
+    var r = await apiFetch('/api/memory/quick-add', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content: content, salience_hint: sel ? Number(sel.value) : 1.0 }),
+    });
+    var d = await r.json();
+    if (!r.ok || !d.ok) { if (st) { st.textContent = d.error || 'Failed'; st.style.color = '#ef4444'; } return; }
+    if (st) { st.textContent = 'Saved to ' + d.file; st.style.color = '#10b981'; }
+    setTimeout(function() {
+      closeQuickAddMemory();
+      if (typeof refreshRecentWrites === 'function') refreshRecentWrites();
+      if (typeof refreshMemory === 'function') refreshMemory();
+    }, 600);
+  } catch (err) {
+    if (st) { st.textContent = String(err); st.style.color = '#ef4444'; }
+  }
+}
+
+// Compact coverage strip at the top of the Memory tab. Shows BM25 (always
+// available), sparse TF-IDF coverage, and dense neural coverage with a
+// one-click backfill when coverage is incomplete. Pulls from /api/memory/health.
+async function refreshCoverageStrip() {
+  var el = document.getElementById('memory-coverage-strip');
+  if (!el) return;
+  try {
+    var r = await apiFetch('/api/memory/health');
+    var d = await r.json();
+    if (!d.ok || !d.health) { el.innerHTML = ''; return; }
+    var h = d.health;
+    var total = (h.chunks && h.chunks.total) || 0;
+    var de = h.denseEmbeddings || { withDense: 0, total: total, currentModel: '', ready: false };
+    var sparseCovered = (h.chunks && h.chunks.withSparseEmbedding != null) ? h.chunks.withSparseEmbedding : null;
+    var densePct = de.total > 0 ? Math.round((de.withDense / de.total) * 100) : 0;
+    var sparsePct = (sparseCovered != null && total > 0) ? Math.round((sparseCovered / total) * 100) : null;
+    var denseColor = densePct >= 95 ? '#10b981' : densePct >= 50 ? '#f59e0b' : '#ef4444';
+    var modelLabel = de.currentModel ? de.currentModel.split('/').pop() : '';
+    var html = '<div style="display:flex;align-items:center;gap:14px;padding:10px 14px;background:var(--bg-secondary);border:1px solid var(--border);border-radius:8px;flex-wrap:wrap;font-size:12px">';
+    html += '<span style="color:var(--text-muted)">Coverage:</span>';
+    html += '<span><span style="color:#10b981">●</span> BM25 ' + total.toLocaleString() + '</span>';
+    if (sparsePct != null) html += '<span><span style="color:#10b981">●</span> Sparse ' + sparsePct + '%</span>';
+    html += '<span><span style="color:' + denseColor + '">●</span> Dense ' + densePct + '%'
+      + (modelLabel ? ' <span style="color:var(--text-muted)">(' + esc(modelLabel) + ')</span>' : '') + '</span>';
+    if (de.total > 0 && de.withDense < de.total) {
+      var missing = de.total - de.withDense;
+      html += '<span style="margin-left:auto;display:flex;gap:6px">'
+        + '<span style="color:var(--text-muted)">' + missing.toLocaleString() + ' missing</span>'
+        + '<button class="btn-sm" onclick="memoryHealthAction(\\'reembed-dense\\', { limit: 200 })">Backfill 200</button>'
+        + '<button class="btn-sm" onclick="memoryHealthAction(\\'reembed-dense\\', { limit: 2000 })">Backfill 2000</button>'
+        + '</span>';
+    } else if (de.total > 0) {
+      html += '<span style="margin-left:auto;color:var(--text-muted)">All chunks indexed</span>';
+    }
+    html += '</div>';
+    el.innerHTML = html;
+  } catch (err) {
+    el.innerHTML = '';
   }
 }
 
