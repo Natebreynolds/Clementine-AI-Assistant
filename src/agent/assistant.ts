@@ -1743,7 +1743,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
     // every turn regardless.
     if (!isAutonomous) {
       try {
-        const { loadToolPreferences, computeAvailability, buildPromptInstruction } =
+        const { loadToolPreferences, computeAvailability, buildPromptInstruction, buildComposioStatusBlock } =
           require('../integrations/tool-preferences.js') as typeof import('../integrations/tool-preferences.js');
         const { loadClaudeIntegrations } =
           require('./mcp-bridge.js') as typeof import('./mcp-bridge.js');
@@ -1753,6 +1753,12 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
         const cdActive = new Set(
           Object.values(cdIntegrations).filter(i => i.connected).map(i => i.name),
         );
+
+        // Status block first — gives the model ground truth that Composio
+        // is configured and which toolkits are live, so it stops guessing
+        // whether `mcp__<slug>__*` tools are Composio or something else.
+        const statusBlock = buildComposioStatusBlock(composioConnectedSlugs);
+        if (statusBlock) volatileParts.push(statusBlock);
 
         const prefs = loadToolPreferences();
         const availability = computeAvailability(composioSet, cdActive, prefs.preferences);

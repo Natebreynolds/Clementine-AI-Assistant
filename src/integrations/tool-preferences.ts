@@ -161,3 +161,19 @@ export function buildPromptInstruction(
   if (lines.length === 0) return '';
   return `## Tool Source Preferences\n\nThese rules OVERRIDE any tool-source preference you may recall from memory. Do not consult memory for this — the canonical source is the dashboard's Tool Source Preferences (Settings → Integrations).\n\n${lines.join('\n')}`;
 }
+
+/**
+ * Ground-truth header naming the Composio toolkits currently connected.
+ * Without this, the model has to guess what `mcp__<slug>__*` tools are
+ * (often misattributing them to claude.ai integrations or "extensions"),
+ * because Composio's slug-prefixed naming is ambiguous in isolation.
+ *
+ * Emits an empty string when no toolkits are connected — zero overhead
+ * for users who haven't set up Composio.
+ */
+export function buildComposioStatusBlock(connectedSlugs: string[]): string {
+  if (!connectedSlugs.length) return '';
+  const sorted = [...connectedSlugs].sort();
+  const example = sorted[0];
+  return `## Composio Integration\n\nComposio is configured. Connected toolkits: ${sorted.join(', ')}.\n\nTools from these toolkits are namespaced as \`mcp__<slug>__<TOOL_NAME>\` (e.g., \`mcp__${example}__*\`). These are local Composio MCP servers, NOT claude.ai integrations (which use \`mcp__claude_ai_*\`).`;
+}
