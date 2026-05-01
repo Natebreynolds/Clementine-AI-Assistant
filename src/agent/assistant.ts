@@ -2639,13 +2639,22 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
     if (key && this.restoredSessions.has(key)) {
       const exchanges = this.lastExchanges.get(key) ?? [];
       if (exchanges.length > 0) {
+        const olderSummary = this.buildOlderTurnsContext(key, exchanges);
+
         const historyLines: string[] = [];
         for (const ex of exchanges.slice(-5)) {
           historyLines.push(`You said: ${ex.user.slice(0, 800)}`);
           historyLines.push(`I replied: ${ex.assistant.slice(0, 800)}`);
         }
-        effectivePrompt =
-          `[Conversation context from before restart (our recent messages):\n${historyLines.join('\n')}]\n\n${effectivePrompt}`;
+
+        const blocks: string[] = [];
+        if (olderSummary) blocks.push(`[Older session summary: ${olderSummary}]`);
+        blocks.push(
+          `[Conversation context from before restart (our recent messages):\n${historyLines.join('\n')}]`,
+        );
+        const prefix = blocks.join('\n\n');
+        logger.debug({ sessionKey: key, prefixLen: prefix.length, hasOlder: !!olderSummary }, 'Restart restore prefix assembled');
+        effectivePrompt = `${prefix}\n\n${effectivePrompt}`;
       }
       this.restoredSessions.delete(key); // Only inject once per restored session
     }
@@ -3137,10 +3146,11 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
                     contextRecovery = true;
                     break;
                   } else if (lower.includes('no conversation found') || lower.includes('conversation not found') || lower.includes('session not found')) {
-                    // Stale session — clear and retry with fresh session
-                    logger.warn({ sessionKey }, 'Stale session ID — clearing and retrying');
+                    // Stale session — clear and reconstruct context from transcripts before retrying
+                    logger.warn({ sessionKey }, 'Stale session ID — reconstructing context from transcripts');
                     if (sessionKey) {
                       this.sessions.delete(sessionKey);
+                      prompt = this.buildSessionDeathRecoveryPrompt(prompt, sessionKey);
                     }
                     staleSession = true;
                     break; // Break inner stream loop — staleSession flag triggers retry
@@ -3233,10 +3243,11 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
               "I've reset the session. Try again — I'll keep result sets smaller this time."
             );
           } else if (errStr.includes('no conversation found') || errStr.includes('conversation not found') || errStr.includes('session not found')) {
-            // Stale session — clear and retry
-            logger.warn({ sessionKey }, 'Stale session ID (exception) — clearing and retrying');
+            // Stale session — clear and reconstruct context from transcripts before retrying
+            logger.warn({ sessionKey }, 'Stale session ID (exception) — reconstructing context from transcripts');
             if (sessionKey) {
               this.sessions.delete(sessionKey);
+              prompt = this.buildSessionDeathRecoveryPrompt(prompt, sessionKey);
             }
             continue; // Retry with fresh session
           } else if (errStr.includes('maximum number of turns') || errStr.includes('max_turns')) {
@@ -3607,16 +3618,132 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
    * to avoid blocking the user's query.
    */
   private buildLocalSummary(sessionKey: string): string {
-    const exchanges = this.lastExchanges.get(sessionKey) ?? [];
-    if (exchanges.length === 0) return '';
+    return this.buildLocalSummaryFromTurns(this.lastExchanges.get(sessionKey) ?? []);
+  }
 
-    const recent = exchanges.slice(-5);
+  private buildLocalSummaryFromTurns(
+    turns: Array<{ user: string; assistant: string }>,
+    opts?: { take?: number; userMax?: number; assistantMax?: number; startIndex?: number },
+  ): string {
+    if (turns.length === 0) return '';
+    const take = opts?.take ?? 5;
+    const userMax = opts?.userMax ?? 200;
+    const assistantMax = opts?.assistantMax ?? 300;
+    const recent = turns.slice(-take);
+    const baseIndex = opts?.startIndex ?? (turns.length - recent.length);
     const lines = recent.map((ex, i) => {
-      const userSnippet = ex.user.slice(0, 200).replace(/\n/g, ' ');
-      const assistantSnippet = ex.assistant.slice(0, 300).replace(/\n/g, ' ');
-      return `- Exchange ${exchanges.length - recent.length + i + 1}: User asked about "${userSnippet}" / I responded "${assistantSnippet}"`;
+      const userSnippet = ex.user.slice(0, userMax).replace(/\n/g, ' ');
+      const assistantSnippet = ex.assistant.slice(0, assistantMax).replace(/\n/g, ' ');
+      return `- Exchange ${baseIndex + i + 1}: User asked about "${userSnippet}" / I responded "${assistantSnippet}"`;
     });
     return lines.join('\n');
+  }
+
+  /**
+   * Walk a chronological list of transcript turns and pair adjacent
+   * user→assistant rows. Drops 'system' rows and orphan tail user turns
+   * (which represent in-flight messages with no reply yet).
+   */
+  private pairTranscriptTurns(
+    turns: Array<{ role: string; content: string }>,
+  ): Array<{ user: string; assistant: string }> {
+    const pairs: Array<{ user: string; assistant: string }> = [];
+    let pendingUser: string | null = null;
+    for (const turn of turns) {
+      if (turn.role === 'user') {
+        pendingUser = turn.content;
+      } else if (turn.role === 'assistant' && pendingUser !== null) {
+        pairs.push({ user: pendingUser, assistant: turn.content });
+        pendingUser = null;
+      }
+    }
+    return pairs;
+  }
+
+  /**
+   * Build a short summary of older turns (older than what's already cached
+   * in `lastExchanges`) for restart-restore prompt injection. Returns ''
+   * if there's nothing older or no memory store. Capped at 600 chars.
+   */
+  private buildOlderTurnsContext(
+    sessionKey: string,
+    cachedExchanges: Array<{ user: string; assistant: string }>,
+  ): string {
+    if (cachedExchanges.length === 0) return '';
+    if (!this.memoryStore || typeof this.memoryStore.getTranscriptTail !== 'function') return '';
+
+    try {
+      const skipTurns = cachedExchanges.length * 2;
+      const older = this.memoryStore.getTranscriptTail(sessionKey, skipTurns, 40) as Array<{
+        role: string;
+        content: string;
+      }>;
+      if (!older || older.length === 0) return '';
+
+      const pairs = this.pairTranscriptTurns(older);
+      if (pairs.length === 0) return '';
+
+      const summary = this.buildLocalSummaryFromTurns(pairs, {
+        take: pairs.length,
+        userMax: 120,
+        assistantMax: 180,
+      });
+      return summary.slice(0, 600);
+    } catch (err) {
+      logger.debug({ err, sessionKey }, 'buildOlderTurnsContext failed — non-fatal');
+      return '';
+    }
+  }
+
+  /**
+   * Reconstruct context after the SDK reports the session is dead
+   * ("no conversation found"). Pulls last N turns from the transcripts
+   * table (hydrating `lastExchanges` if the cache is too thin) and
+   * builds a recovery prefix that gets prepended to the retry prompt.
+   * Mirrors the buildContextRecoveredPrompt pattern used by autocompact.
+   */
+  private buildSessionDeathRecoveryPrompt(prompt: string, sessionKey: string): string {
+    if (!sessionKey || !this.memoryStore) return prompt;
+
+    try {
+      let exchanges = this.lastExchanges.get(sessionKey) ?? [];
+
+      // Hydrate from transcripts if the cache is too thin
+      if (exchanges.length < 3 && typeof this.memoryStore.getTranscriptTail === 'function') {
+        const recent = this.memoryStore.getTranscriptTail(
+          sessionKey,
+          0,
+          SESSION_EXCHANGE_HISTORY_SIZE * 2,
+        ) as Array<{ role: string; content: string }>;
+        const hydrated = this.pairTranscriptTurns(recent ?? []);
+        if (hydrated.length > exchanges.length) {
+          exchanges = hydrated;
+          this.lastExchanges.set(sessionKey, hydrated.slice(-SESSION_EXCHANGE_HISTORY_SIZE));
+        }
+      }
+
+      const olderSummary = this.buildOlderTurnsContext(sessionKey, exchanges);
+
+      const recentLines: string[] = [];
+      for (const ex of exchanges.slice(-5)) {
+        recentLines.push(`You said: ${ex.user.slice(0, 800)}`);
+        recentLines.push(`I replied: ${ex.assistant.slice(0, 800)}`);
+      }
+
+      if (!olderSummary && recentLines.length === 0) return prompt;
+
+      const blocks: string[] = ['[Recovering context after session expired.'];
+      if (olderSummary) blocks.push(`Older session summary: ${olderSummary}`);
+      if (recentLines.length > 0) {
+        blocks.push(`Recent messages:\n${recentLines.join('\n')}`);
+      }
+      const prefix = blocks.join('\n') + ']';
+      logger.debug({ sessionKey, prefixLen: prefix.length }, 'Session-death recovery prefix assembled');
+      return `${prefix}\n\n${prompt}`;
+    } catch (err) {
+      logger.debug({ err, sessionKey }, 'buildSessionDeathRecoveryPrompt failed — non-fatal');
+      return prompt;
+    }
   }
 
   /**

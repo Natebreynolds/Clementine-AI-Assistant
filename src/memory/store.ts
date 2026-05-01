@@ -2996,6 +2996,40 @@ export class MemoryStore {
   }
 
   /**
+   * Get user/assistant transcript turns from the tail of a session, skipping
+   * the most recent `skipFromTail` turns. Returned chronologically. Used to
+   * reconstruct context older than what's already in the in-memory cache,
+   * for restart restore and SDK session-death recovery.
+   */
+  getTranscriptTail(sessionKey: string, skipFromTail: number, limit: number = 40): TranscriptTurn[] {
+    const rows = this.conn
+      .prepare(
+        `SELECT session_key, role, content, model, created_at
+         FROM transcripts
+         WHERE session_key = ? AND role IN ('user','assistant')
+         ORDER BY created_at DESC, id DESC
+         LIMIT ? OFFSET ?`,
+      )
+      .all(sessionKey, limit, Math.max(0, skipFromTail)) as Array<{
+      session_key: string;
+      role: string;
+      content: string;
+      model: string;
+      created_at: string;
+    }>;
+
+    return rows
+      .map((row) => ({
+        sessionKey: row.session_key,
+        role: row.role,
+        content: row.content,
+        model: row.model,
+        createdAt: row.created_at,
+      }))
+      .reverse();
+  }
+
+  /**
    * Get recent transcript activity across all sessions since a given timestamp.
    * Returns a compact summary of what happened (sessions, message counts, snippets).
    */
