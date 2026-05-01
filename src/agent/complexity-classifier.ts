@@ -68,6 +68,22 @@ const CHAIN_MARKERS = [
 ];
 
 /**
+ * Patterns that look like a pasted error message or stack trace.
+ * Error pastes are long and entity-heavy (file paths, quoted strings,
+ * "Error:" prefixes), which previously tripped the deepWorthy gate
+ * even when the user was just asking "what's wrong with this?". We
+ * still allow the plan-first directive to fire; we just don't auto-spawn
+ * an expensive multi-phase background task on a debug request.
+ */
+const ERROR_PASTE_MARKERS = [
+  /\b(Error|Exception|Traceback|Stack ?trace):\s/i,
+  /^\s*at\s+[\w.$<>]+\s*\(/m,            // JS/TS stack frame: "at foo.bar (file:line)"
+  /\bfailed:\s*Error\b/i,
+  /Reached maximum number of turns/i,
+  /\bENOENT\b|\bECONNREFUSED\b|\bETIMEDOUT\b/,
+];
+
+/**
  * Phrasings that explicitly ask for plan-first behavior. Triggers
  * regardless of other heuristics.
  */
@@ -166,7 +182,14 @@ export function classifyComplexity(text: string): ComplexityVerdict {
     isLong,
     entities >= 3,
   ].filter(Boolean).length;
-  const deepWorthy = strongCount >= 2;
+
+  // Suppress deepWorthy on pasted error messages. They're long and
+  // entity-heavy (file paths, quoted strings) but the user is asking
+  // "what's wrong here?", not requesting sustained autonomous work.
+  // The plan-first path still fires when complex=true.
+  const looksLikeErrorPaste = ERROR_PASTE_MARKERS.some((re) => re.test(trimmed));
+  if (looksLikeErrorPaste) signals.push('error-paste');
+  const deepWorthy = strongCount >= 2 && !looksLikeErrorPaste;
 
   if (complex) {
     return {

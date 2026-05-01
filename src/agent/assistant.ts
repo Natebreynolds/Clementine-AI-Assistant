@@ -5171,13 +5171,27 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
       // Periodic progress beacon — sends a status update every 5 minutes
       // so the user knows the task is still alive during long phases.
       // Capped at 3 messages per phase to prevent notification spam.
+      // Also refreshes status.json so dashboard polls see liveness even
+      // when the SDK stream hasn't emitted a result yet.
       const BEACON_INTERVAL_MS = 5 * 60 * 1000;
       const MAX_BEACONS_PER_PHASE = 3;
       let beaconCount = 0;
       const beaconTimer = setInterval(() => {
+        const mins = Math.round((Date.now() - phaseStart) / 60_000);
+        try {
+          writeStatus({
+            jobName,
+            status: 'running',
+            phase,
+            startedAt,
+            maxHours: effectiveMaxHours,
+            phaseStartedAt: new Date(phaseStart).toISOString(),
+            phaseElapsedMin: mins,
+            toolCallsThisPhase: phaseToolCount,
+          });
+        } catch { /* non-fatal */ }
         if (this.onPhaseProgress && beaconCount < MAX_BEACONS_PER_PHASE) {
           beaconCount++;
-          const mins = Math.round((Date.now() - phaseStart) / 60_000);
           try {
             // Conversational beacon — no technical jargon
             const msg = mins < 3
@@ -5225,6 +5239,21 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
             // Capture terminal reason for execution advisor
             this._lastTerminalReason = (result as any).terminal_reason ?? undefined;
             this.logQueryResult(result, 'unleashed', `unleashed:${jobName}`, jobName);
+            // Refresh status.json the moment the SDK reports result —
+            // even if the underlying stream stalls afterward, the dashboard
+            // sees liveness instead of a frozen "phase 0 / running" row.
+            try {
+              writeStatus({
+                jobName,
+                status: 'running',
+                phase,
+                startedAt,
+                maxHours: effectiveMaxHours,
+                lastResultAt: new Date().toISOString(),
+                lastResultIsError: !!result.is_error,
+                toolCallsThisPhase: phaseToolCount,
+              });
+            } catch { /* non-fatal */ }
             // Detect dollar-budget exceeded (strict marker — see cron
             // handler above for the reasoning).
             if (result.is_error && 'result' in result) {
