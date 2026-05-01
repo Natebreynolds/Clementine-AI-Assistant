@@ -8,10 +8,11 @@
  *     chunks.embedding (BLOB).
  *
  *  2. Dense neural (preferred when available, async). Uses
- *     `@xenova/transformers` to run a local sentence-embedding model
- *     (default: Snowflake/snowflake-arctic-embed-m-v1.5, 768-dim) entirely
- *     on-device. Stored in chunks.embedding_dense (BLOB) with
- *     chunks.embedding_dense_model tracking which model produced it.
+ *     `@huggingface/transformers` (v4+) to run a local sentence-embedding
+ *     model (default: Snowflake/snowflake-arctic-embed-m-v1.5, 768-dim)
+ *     entirely on-device via onnxruntime-node. Stored in
+ *     chunks.embedding_dense (BLOB) with chunks.embedding_dense_model
+ *     tracking which model produced it.
  *
  * Runtime behavior:
  *  - At store insert time, sync TF-IDF is computed (cheap, no I/O).
@@ -242,15 +243,19 @@ async function getDensePipeline(): Promise<unknown> {
     try {
       mkdirSync(MODEL_CACHE_DIR, { recursive: true });
     } catch { /* non-fatal */ }
-    const transformers = (await import('@xenova/transformers')) as unknown as {
-      pipeline: (task: string, model: string) => Promise<unknown>;
-      env: { cacheDir?: string; localURL?: string; allowLocalModels?: boolean };
+    const transformers = (await import('@huggingface/transformers')) as unknown as {
+      pipeline: (task: string, model: string, opts?: { dtype?: string }) => Promise<unknown>;
+      env: { cacheDir?: string; localModelPath?: string; allowLocalModels?: boolean; allowRemoteModels?: boolean };
     };
     transformers.env.cacheDir = MODEL_CACHE_DIR;
     transformers.env.allowLocalModels = true;
+    transformers.env.allowRemoteModels = true;
     const modelId = getDenseModelId();
-    logger.info({ modelId, cacheDir: MODEL_CACHE_DIR }, 'Loading dense embedding model (first use downloads ~440MB)');
-    const pipe = await transformers.pipeline('feature-extraction', modelId);
+    // dtype: 'q8' uses the int8-quantized ONNX file (model_quantized.onnx,
+    // ~110MB) instead of the fp32 file (~440MB). Quality loss is negligible
+    // for retrieval and load is dramatically faster on CPU.
+    logger.info({ modelId, cacheDir: MODEL_CACHE_DIR, dtype: 'q8' }, 'Loading dense embedding model');
+    const pipe = await transformers.pipeline('feature-extraction', modelId, { dtype: 'q8' });
     denseLoadState = true;
     logger.info({ modelId }, 'Dense embedding model loaded');
     return pipe;

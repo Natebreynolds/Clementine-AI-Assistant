@@ -765,6 +765,23 @@ async function asyncMain(): Promise<void> {
   const cronScheduler = new CronScheduler(gateway, dispatcher);
   heartbeat.setCronScheduler(cronScheduler);
 
+  // Warm the dense embedding model in the background at boot so the first
+  // search/backfill doesn't pay the load cost. Failure here is non-fatal —
+  // search degrades to BM25 + sparse TF-IDF.
+  void (async () => {
+    try {
+      const embeddings = await import('./memory/embeddings.js');
+      const ready = await embeddings.probeDenseReady();
+      if (ready) {
+        logger.info('Dense embedding model warmed at boot');
+      } else {
+        logger.warn('Dense embedding model failed to warm — search will use BM25 + sparse TF-IDF only');
+      }
+    } catch (err) {
+      logger.warn({ err }, 'Dense embedding warmup threw');
+    }
+  })();
+
   // Builder runner — wire MCP invoke handler so canvas test runs can hit
   // real read-only MCP tools (gmail.list_unread, github.list_prs, etc.).
   // Stdio clients are pooled per server with idle teardown.
