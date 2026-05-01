@@ -44,7 +44,7 @@ interface KeySpec {
   group: string;
   /** dotted path into clementine.json (e.g. "models.haiku") */
   jsonPath?: string;
-  default?: string | number;
+  default?: string | number | boolean;
   /** "system" provenance label when the default is computed at runtime, not hardcoded. */
   systemDefault?: () => string | number;
   /** Sensitive keys are masked in human output. */
@@ -63,6 +63,9 @@ const SPECS: KeySpec[] = [
   { key: 'HAIKU_MODEL', group: 'models', jsonPath: 'models.haiku', default: 'claude-haiku-4-5-20251001' },
   { key: 'SONNET_MODEL', group: 'models', jsonPath: 'models.sonnet', default: 'claude-sonnet-4-6' },
   { key: 'OPUS_MODEL', group: 'models', jsonPath: 'models.opus', default: 'claude-opus-4-7' },
+
+  // Team routing
+  { key: 'AUTO_DELEGATE_ENABLED', group: 'team', default: false },
 
   // Budgets
   { key: 'BUDGET_HEARTBEAT_USD', group: 'budgets', jsonPath: 'budgets.heartbeat', default: 0.50 },

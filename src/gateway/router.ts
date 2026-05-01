@@ -12,7 +12,7 @@ import { PersonalAssistant, type ProjectMeta } from '../agent/assistant.js';
 import { runWithTrace, logAuditJsonl } from '../agent/hooks.js';
 import type { OnProgressCallback, OnTextCallback, OnToolActivityCallback, PlanProgressUpdate, PlanStep, SelfImproveConfig, SelfImproveExperiment, SessionProvenance, TeamMessage, VerboseLevel, WorkflowDefinition } from '../types.js';
 import { SelfImproveLoop } from '../agent/self-improve.js';
-import { MODELS, AGENTS_DIR, TEAM_COMMS_LOG, BASE_DIR, SEEN_CHANNELS_FILE } from '../config.js';
+import { MODELS, AGENTS_DIR, TEAM_COMMS_LOG, BASE_DIR, SEEN_CHANNELS_FILE, AUTO_DELEGATE_ENABLED } from '../config.js';
 import { scanner } from '../security/scanner.js';
 import { lanes } from './lanes.js';
 import { AgentManager } from '../agent/agent-manager.js';
@@ -294,8 +294,10 @@ export class Gateway {
       const targetProfile = agents.find(a => a.slug === decision.targetAgent);
       if (!targetProfile) return null;
 
-      // Auto-delegate at high confidence
-      if (decision.confidence >= 0.8) {
+      // Auto-delegate at high confidence — only when the user has explicitly
+      // opted in via AUTO_DELEGATE_ENABLED. Default behavior is to demote
+      // every routing to a soft-suggest so the user controls every handoff.
+      if (decision.confidence >= 0.8 && AUTO_DELEGATE_ENABLED) {
         // Fire the team task in the background; ack immediately.
         const ackMessage = `Routing this to **${targetProfile.name}** (${decision.reasoning.toLowerCase()}). I'll post their response back here when done.`;
         onText?.(ackMessage).catch(() => { /* non-fatal */ });
@@ -306,7 +308,34 @@ export class Gateway {
         if (!sess.teamTaskControllers) sess.teamTaskControllers = new Set();
         sess.teamTaskControllers.add(teamAbortController);
 
-        this.handleTeamTask('Clementine', 'clementine', text, targetProfile, undefined, teamAbortController)
+        // Progress visibility — without this the channel goes dark from
+        // ack to final result, which can be many minutes on research-style
+        // tasks. We batch the delegated agent's tool announcements and
+        // flush every PROGRESS_INTERVAL_MS so the user sees what's
+        // happening without a token firehose.
+        const recentTools: string[] = [];
+        let progressTimer: NodeJS.Timeout | undefined;
+        const PROGRESS_INTERVAL_MS = 30_000;
+        const dispatcher = this._dispatcher;
+        const flushProgress = () => {
+          progressTimer = undefined;
+          if (recentTools.length === 0) return;
+          const tools = recentTools.slice(-5).join(', ');
+          recentTools.length = 0;
+          void dispatcher?.send(
+            `_${targetProfile.name} is working — recent actions: ${tools}_`,
+            { sessionKey, agentSlug: targetProfile.slug },
+          );
+        };
+        const onTeamProgress = (chunk: string) => {
+          const m = chunk.match(/\[using ([^\]]+?)\.\.\.\]/);
+          if (m && m[1]) recentTools.push(m[1]);
+          if (!progressTimer && recentTools.length > 0) {
+            progressTimer = setTimeout(flushProgress, PROGRESS_INTERVAL_MS);
+          }
+        };
+
+        this.handleTeamTask('Clementine', 'clementine', text, targetProfile, onTeamProgress, teamAbortController)
           .then(response => {
             if (!response) return;
             const delivery = `**${targetProfile.name}**: ${response}`;
@@ -324,6 +353,10 @@ export class Gateway {
             );
           })
           .finally(() => {
+            if (progressTimer) {
+              clearTimeout(progressTimer);
+              progressTimer = undefined;
+            }
             const s = this.sessions.get(sessionKey);
             s?.teamTaskControllers?.delete(teamAbortController);
           });

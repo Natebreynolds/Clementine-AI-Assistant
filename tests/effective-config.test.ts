@@ -128,6 +128,26 @@ describe('computeEffectiveConfig', () => {
     expect(ownerName.source).toBe('default');
   });
 
+  it('AUTO_DELEGATE_ENABLED defaults to false and is registered in the config registry', () => {
+    const cfg = computeEffectiveConfig(baseDir);
+    const flag = cfg.entries.find(e => e.key === 'AUTO_DELEGATE_ENABLED');
+    expect(flag).toBeDefined();
+    expect(flag!.value).toBe(false);
+    expect(flag!.source).toBe('default');
+    expect(flag!.group).toBe('team');
+  });
+
+  it('AUTO_DELEGATE_ENABLED reports .env override and provenance', () => {
+    writeFileSync(
+      path.join(baseDir, '.env'),
+      'AUTO_DELEGATE_ENABLED=true\n',
+    );
+    const cfg = computeEffectiveConfig(baseDir);
+    const flag = cfg.entries.find(e => e.key === 'AUTO_DELEGATE_ENABLED')!;
+    expect(flag.value).toBe('true');
+    expect(flag.source).toBe('.env');
+  });
+
   it('marks unresolvable keychain refs and surfaces fallback', () => {
     // Stub a non-existent account — `security` will exit non-zero, resolver
     // returns undefined, inspector should fall through to default and flag

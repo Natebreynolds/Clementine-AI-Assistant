@@ -277,6 +277,14 @@ export const TASK_BUDGET_TOKENS = {
 export const DEFAULT_MODEL_TIER = (getEnvOrJson('DEFAULT_MODEL_TIER', json.models?.default, 'sonnet')) as keyof Models;
 export const MODEL = MODELS[DEFAULT_MODEL_TIER] ?? MODELS.sonnet;
 
+// ── Team routing ─────────────────────────────────────────────────────
+// When false (default), the gateway never auto-delegates a Clementine-
+// owned message to a sub-agent without explicit user opt-in. High-
+// confidence routing is demoted to a soft-suggest so the user can
+// confirm ("send to Ross") or override before any handoff happens.
+// Flip via dashboard or `clementine config set AUTO_DELEGATE_ENABLED true`.
+export const AUTO_DELEGATE_ENABLED = getEnv('AUTO_DELEGATE_ENABLED', 'false').toLowerCase() === 'true';
+
 // ── Discord ──────────────────────────────────────────────────────────
 
 export const DISCORD_TOKEN = getSecret('DISCORD_TOKEN');
