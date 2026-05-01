@@ -72,10 +72,15 @@ async function buildOne(
   // mcp__outlook__OUTLOOK_LIST_MESSAGES. The alternative, composio.create()
   // + session.tools(), uses Composio's tool-router pattern and only returns
   // 5 meta-tools (COMPOSIO_SEARCH_TOOLS, COMPOSIO_MULTI_EXECUTE_TOOL, …),
-  // which doesn't match what the agent calls. Verified empirically:
-  // tools.get returns 50+ actual Outlook tools.
+  // which doesn't match what the agent calls.
+  //
+  // Limit MUST be high enough to include every alphabetically-late tool.
+  // Outlook has ~400+ tools; capping at 200 silently dropped the message-
+  // reading tools (OUTLOOK_LIST_MESSAGES, OUTLOOK_GET_MESSAGES, etc.) which
+  // alphabetically come after OUTLOOK_LIST_CALENDAR_GROUP_*. GitHub has
+  // 800+. Set 1000 — comfortable headroom for any single toolkit.
   const userId = await getPreferredUserId();
-  const toolsRaw = await composio.tools.get(userId, { toolkits: [slug], limit: 200 });
+  const toolsRaw = await composio.tools.get(userId, { toolkits: [slug], limit: 1000 });
   // tools.get can return an array OR an object depending on provider; normalise.
   const toolsArr = Array.isArray(toolsRaw) ? toolsRaw : Object.values(toolsRaw);
   const tools = toolsArr.filter((t: any) => t && typeof t.name === 'string' && typeof t.handler === 'function');
