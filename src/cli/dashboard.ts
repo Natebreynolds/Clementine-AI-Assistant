@@ -249,7 +249,9 @@ function startDaemonWatcher(broadcastFn: (event: { type: string; data?: unknown 
 
 // ── Memory search (direct DB access, read-only) ─────────────────────
 
-async function searchMemory(query: string, limit = 20): Promise<{ results: Array<Record<string, unknown>>; error?: string; dbExists: boolean }> {
+type SearchFilters = { chunkType?: string; sinceDays?: number; pinnedOnly?: boolean };
+
+async function searchMemory(query: string, limit = 20, filters: SearchFilters = {}): Promise<{ results: Array<Record<string, unknown>>; error?: string; dbExists: boolean }> {
   if (!existsSync(MEMORY_DB_PATH)) {
     return { results: [], dbExists: false, error: `Memory DB not found at ${MEMORY_DB_PATH}` };
   }
@@ -257,19 +259,40 @@ async function searchMemory(query: string, limit = 20): Promise<{ results: Array
   const db = new Database(MEMORY_DB_PATH, { readonly: true });
   try {
     const words = query.split(/\s+/).filter((w) => w.length > 0);
-    if (words.length === 0) { db.close(); return { results: [], dbExists: true }; }
-    const ftsQuery = words.map((w) => `"${w.replace(/"/g, '')}"`).join(' OR ');
-    const rows = db.prepare(
-      `SELECT c.id, c.source_file, c.section, c.content, c.chunk_type,
-              c.updated_at, c.salience, c.pinned, bm25(chunks_fts) as score
-       FROM chunks_fts f
-       JOIN chunks c ON c.id = f.rowid
-       LEFT JOIN chunk_soft_deletes sd ON sd.chunk_id = c.id
-       WHERE chunks_fts MATCH ?
-         AND sd.chunk_id IS NULL
-       ORDER BY bm25(chunks_fts)
-       LIMIT ?`,
-    ).all(ftsQuery, limit) as Array<Record<string, unknown>>;
+    const where: string[] = ['sd.chunk_id IS NULL'];
+    const params: unknown[] = [];
+    let orderBy = 'c.updated_at DESC';
+    let fromClause = 'chunks c LEFT JOIN chunk_soft_deletes sd ON sd.chunk_id = c.id';
+
+    if (words.length > 0) {
+      const ftsQuery = words.map((w) => `"${w.replace(/"/g, '')}"`).join(' OR ');
+      fromClause = 'chunks_fts f JOIN chunks c ON c.id = f.rowid LEFT JOIN chunk_soft_deletes sd ON sd.chunk_id = c.id';
+      where.unshift('chunks_fts MATCH ?');
+      params.push(ftsQuery);
+      orderBy = 'bm25(chunks_fts)';
+    }
+    if (filters.chunkType) {
+      where.push('c.chunk_type = ?');
+      params.push(filters.chunkType);
+    }
+    if (filters.sinceDays && filters.sinceDays > 0) {
+      where.push("c.updated_at >= datetime('now', ?)");
+      params.push(`-${filters.sinceDays} days`);
+    }
+    if (filters.pinnedOnly) {
+      where.push('c.pinned = 1');
+    }
+    if (words.length === 0 && !filters.chunkType && !filters.sinceDays && !filters.pinnedOnly) {
+      db.close();
+      return { results: [], dbExists: true };
+    }
+    const sql = `SELECT c.id, c.source_file, c.section, c.content, c.chunk_type,
+              c.updated_at, c.salience, c.pinned${words.length > 0 ? ', bm25(chunks_fts) as score' : ', 0 as score'}
+       FROM ${fromClause}
+       WHERE ${where.join(' AND ')}
+       ORDER BY ${orderBy}
+       LIMIT ?`;
+    const rows = db.prepare(sql).all(...params, limit) as Array<Record<string, unknown>>;
     return { results: rows, dbExists: true };
   } catch (err) {
     return { results: [], dbExists: true, error: String(err) };
@@ -6169,12 +6192,15 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
 
   app.get('/api/memory/search', async (req, res) => {
     const q = String(req.query.q ?? '');
-    if (!q.trim()) {
+    const chunkType = req.query.type ? String(req.query.type) : undefined;
+    const sinceDays = req.query.since ? Number(req.query.since) : undefined;
+    const pinnedOnly = String(req.query.pinned ?? '') === 'true';
+    if (!q.trim() && !chunkType && !sinceDays && !pinnedOnly) {
       res.json({ results: [] });
       return;
     }
     try {
-      const data = await searchMemory(q, 20);
+      const data = await searchMemory(q, 20, { chunkType, sinceDays, pinnedOnly });
 
       // Enrich with graph relationships for entities found in results
       let graphContext: Array<{ from: string; rel: string; to: string }> = [];
@@ -21023,16 +21049,39 @@ async function loadBuilderAttachments(jobName) {
 }
 
 // ── Memory Search ─────────────────────────
+// Parse inline filter syntax from a query string. Supported:
+//   type:procedure          → ?type=procedure
+//   since:7d / since:30d    → ?since=7
+//   pinned:true             → ?pinned=true
+// Returns the cleaned query (filters stripped) plus the filter params.
+function parseSearchFilters(raw) {
+  var filters = {};
+  var cleaned = raw.replace(/\b(type|since|pinned):(\S+)/g, function(_m, key, val) {
+    if (key === 'type') filters.type = val;
+    else if (key === 'since') {
+      var m = /^(\d+)d?$/.exec(val);
+      if (m) filters.since = m[1];
+    }
+    else if (key === 'pinned' && val === 'true') filters.pinned = 'true';
+    return '';
+  }).replace(/\s+/g, ' ').trim();
+  return { q: cleaned, filters: filters };
+}
+
 async function runMemorySearch() {
   const input = document.getElementById('memory-search-input');
-  const q = input.value.trim();
-  if (!q) return;
+  const raw = input.value.trim();
+  if (!raw) return;
 
+  const parsed = parseSearchFilters(raw);
   const container = document.getElementById('memory-search-results');
   container.innerHTML = '<div class="empty-state">Searching...</div>';
 
   try {
-    const r = await apiFetch('/api/memory/search?q=' + encodeURIComponent(q));
+    var qs = 'q=' + encodeURIComponent(parsed.q);
+    var fkeys = Object.keys(parsed.filters);
+    for (var i = 0; i < fkeys.length; i++) qs += '&' + fkeys[i] + '=' + encodeURIComponent(parsed.filters[fkeys[i]]);
+    const r = await apiFetch('/api/memory/search?' + qs);
     const d = await r.json();
 
     if (d.error) {
@@ -21044,11 +21093,16 @@ async function runMemorySearch() {
     }
 
     if (!d.results || d.results.length === 0) {
-      container.innerHTML = '<div class="empty-state">No results found for "' + esc(q) + '"</div>';
+      container.innerHTML = '<div class="empty-state">No results found for "' + esc(raw) + '"</div>';
       return;
     }
 
-    let html = '<div style="font-size:12px;color:var(--text-muted);margin-bottom:12px">' + d.results.length + ' result(s)</div>';
+    var filterChips = '';
+    var fkeys2 = Object.keys(parsed.filters);
+    for (var fi = 0; fi < fkeys2.length; fi++) {
+      filterChips += '<span style="display:inline-block;padding:2px 8px;margin-right:4px;background:var(--bg-secondary);border:1px solid var(--border);border-radius:10px;font-size:11px">' + esc(fkeys2[fi]) + ': ' + esc(parsed.filters[fkeys2[fi]]) + '</span>';
+    }
+    let html = '<div style="font-size:12px;color:var(--text-muted);margin-bottom:12px">' + d.results.length + ' result(s)' + (filterChips ? ' &middot; ' + filterChips : '') + '</div>';
 
     // Show graph relationships if any
     if (d.graphContext && d.graphContext.length > 0) {
@@ -21067,20 +21121,24 @@ async function runMemorySearch() {
       const score = Math.abs(r.score || 0).toFixed(2);
       const pinned = r.pinned ? ' 📌' : '';
       const idAttr = r.id ? String(r.id) : '';
+      const previewSnippet = (r.content || '').slice(0, 200).replace(/\s+/g, ' ').trim();
       html += '<div class="search-result" data-chunk-id="' + esc(idAttr) + '" id="chunk-row-' + esc(idAttr) + '">'
         + '<div class="search-result-header" style="display:flex;justify-content:space-between;align-items:center">'
         + '<span class="search-result-file">' + esc(r.source_file) + pinned + '</span>'
-        + '<div style="display:flex;gap:6px;align-items:center">'
+        + '<div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">'
         + '<span class="search-result-score" style="font-size:11px;color:var(--text-muted)">score ' + score + '</span>'
         + (idAttr ? (
           '<button class="btn" style="font-size:11px;padding:2px 8px" onclick="editChunk(' + idAttr + ')">Edit</button>'
           + '<button class="btn" style="font-size:11px;padding:2px 8px" onclick="togglePinChunk(' + idAttr + ',' + (r.pinned ? 'false' : 'true') + ')">' + (r.pinned ? 'Unpin' : 'Pin') + '</button>'
           + '<button class="btn" style="font-size:11px;padding:2px 8px;color:var(--red,#ef4444)" onclick="deleteChunk(' + idAttr + ')">Delete</button>'
+          + '<button class="btn" style="font-size:11px;padding:2px 8px" data-snippet="' + esc(previewSnippet) + '" onclick="findSimilarFromButton(this)" title="Search using this chunk\\'s content">Find similar</button>'
+          + '<button class="btn" style="font-size:11px;padding:2px 8px" onclick="toggleTrace(' + idAttr + ')" id="trace-toggle-' + idAttr + '">Trace ▾</button>'
         ) : '')
         + '</div>'
         + '</div>'
         + '<div class="search-result-section">' + esc(r.section || '') + ' &middot; ' + esc(r.chunk_type || '') + '</div>'
         + '<div class="search-result-content" id="chunk-content-' + esc(idAttr) + '">' + esc((r.content || '').slice(0, 500)) + '</div>'
+        + (idAttr ? '<div id="trace-' + idAttr + '" style="display:none;margin-top:8px;padding:10px;background:var(--bg-secondary);border:1px solid var(--border);border-radius:6px;font-size:12px"></div>' : '')
         + '</div>';
     }
     container.innerHTML = html;
@@ -21243,6 +21301,72 @@ async function refreshSessionBridge() {
     el.innerHTML = html;
   } catch (err) {
     el.innerHTML = '<div class="empty-state" style="padding:14px">Failed to load: ' + esc(String(err)) + '</div>';
+  }
+}
+
+// Re-run search using the selected chunk's content as the query. With dense
+// embeddings populated, this becomes a true semantic "more like this" lookup.
+// Reads the snippet from the button's data-snippet attribute to avoid HTML/JS
+// escaping issues with quotes inside chunk content.
+function findSimilarFromButton(btn) {
+  var snippet = (btn && btn.dataset && btn.dataset.snippet) ? btn.dataset.snippet : '';
+  if (!snippet) return;
+  var input = document.getElementById('memory-search-input');
+  if (!input) return;
+  input.value = snippet;
+  runMemorySearch();
+}
+
+// Toggle the inline Trace disclosure on a search result. Loads chunk metadata
+// and edit/supersede history from /api/memory/chunks/:id and /history.
+async function toggleTrace(id) {
+  var box = document.getElementById('trace-' + id);
+  var btn = document.getElementById('trace-toggle-' + id);
+  if (!box) return;
+  if (box.style.display !== 'none') {
+    box.style.display = 'none';
+    if (btn) btn.textContent = 'Trace ▾';
+    return;
+  }
+  box.style.display = 'block';
+  if (btn) btn.textContent = 'Trace ▴';
+  box.innerHTML = '<div style="color:var(--text-muted)">Loading…</div>';
+  try {
+    var chunkResp = await apiFetch('/api/memory/chunks/' + id);
+    var chunkData = await chunkResp.json();
+    var historyResp = await apiFetch('/api/memory/chunks/' + id + '/history');
+    var historyData = await historyResp.json();
+    if (!chunkData.ok || !chunkData.chunk) {
+      box.innerHTML = '<div style="color:#ef4444">' + esc(chunkData.error || 'Failed to load') + '</div>';
+      return;
+    }
+    var c = chunkData.chunk;
+    var meta = '<div style="display:grid;grid-template-columns:auto 1fr;gap:4px 12px;margin-bottom:8px">'
+      + '<span style="color:var(--text-muted)">ID:</span><span>' + esc(String(c.id || id)) + '</span>'
+      + '<span style="color:var(--text-muted)">Source:</span><span>' + esc(c.sourceFile || c.source_file || '—') + '</span>'
+      + '<span style="color:var(--text-muted)">Section:</span><span>' + esc(c.section || '—') + '</span>'
+      + '<span style="color:var(--text-muted)">Type:</span><span>' + esc(c.chunkType || c.chunk_type || '—') + '</span>'
+      + '<span style="color:var(--text-muted)">Salience:</span><span>' + esc(String(c.salience != null ? Number(c.salience).toFixed(2) : '—')) + (c.pinned ? ' (pinned)' : '') + '</span>'
+      + '<span style="color:var(--text-muted)">Confidence:</span><span>' + esc(String(c.confidence != null ? Number(c.confidence).toFixed(2) : '—')) + '</span>'
+      + '<span style="color:var(--text-muted)">Created:</span><span>' + esc(c.createdAt || c.created_at || '—') + '</span>'
+      + '<span style="color:var(--text-muted)">Updated:</span><span>' + esc(c.lastUpdated || c.updated_at || '—') + '</span>'
+      + '<span style="color:var(--text-muted)">Agent:</span><span>' + esc(c.agentSlug || c.agent_slug || 'global') + '</span>'
+      + '</div>';
+    var history = '';
+    if (historyData.ok && Array.isArray(historyData.history) && historyData.history.length > 0) {
+      history += '<div style="margin-top:8px"><b style="font-size:11px;color:var(--text-muted)">HISTORY</b>';
+      for (var i = 0; i < historyData.history.length; i++) {
+        var h = historyData.history[i];
+        history += '<div style="padding:4px 0;border-top:1px solid var(--border);font-size:11px">'
+          + esc(h.timestamp || h.at || '') + ' &middot; ' + esc(h.kind || h.action || 'edit')
+          + (h.reason ? ' &middot; ' + esc(h.reason) : '')
+          + '</div>';
+      }
+      history += '</div>';
+    }
+    box.innerHTML = meta + history;
+  } catch (err) {
+    box.innerHTML = '<div style="color:#ef4444">' + esc(String(err)) + '</div>';
   }
 }
 
