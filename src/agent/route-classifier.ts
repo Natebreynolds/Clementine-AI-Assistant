@@ -355,6 +355,13 @@ export async function classifyRoute(
       1,        // tier 1
       3,        // maxTurns — classifier doesn't need tools
       'haiku',  // cheap
+      undefined, // workDir
+      'standard', // mode
+      undefined, // maxHours
+      undefined, // timeoutMs
+      undefined, // successCriteria
+      undefined, // agentSlug
+      { disableAllTools: true },
     );
   } catch (err) {
     logger.warn({ err }, 'Route classifier call failed');

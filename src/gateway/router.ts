@@ -1603,6 +1603,7 @@ export class Gateway {
     timeoutMs?: number,
     successCriteria?: string[],
     agentSlug?: string,
+    opts?: { disableAllTools?: boolean },
   ): Promise<string> {
     const releaseLane = await lanes.acquire('cron');
     try {
@@ -1614,7 +1615,7 @@ export class Gateway {
         if (mode === 'unleashed') {
           response = await this.assistant.runUnleashedTask(jobName, jobPrompt, tier, maxTurns, model, workDir, maxHours, agentSlug);
         } else {
-          response = await this.assistant.runCronJob(jobName, jobPrompt, tier, maxTurns, model, workDir, timeoutMs, successCriteria, agentSlug);
+          response = await this.assistant.runCronJob(jobName, jobPrompt, tier, maxTurns, model, workDir, timeoutMs, successCriteria, agentSlug, opts);
         }
 
         // Re-baseline integrity checksums after cron job (may write to vault)

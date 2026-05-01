@@ -4236,9 +4236,14 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
     profile?: AgentProfile | null,
   ): Promise<string> {
     setInteractionSource('autonomous');
+    // Heartbeat speaks text only — the prompt below explicitly forbids tool
+    // calls. Skipping MCP server load + tool inventory cuts the prompt by
+    // hundreds of thousands of tokens on installs with many integrations,
+    // which is what kept Haiku exceeding its 200K context window.
     const sdkOptions = await this.buildOptions({
       isHeartbeat: true,
       enableTeams: false,
+      disableAllTools: true,
       model: MODELS.haiku,
       profile: profile ?? undefined,
     });
@@ -4363,6 +4368,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
     timeoutMs?: number,
     successCriteria?: string[],
     agentSlug?: string,
+    opts?: { disableAllTools?: boolean },
   ): Promise<string> {
     setInteractionSource('autonomous');
     // Tag every tool_use audit event with the cron job name + agent so
@@ -4398,6 +4404,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
       enableTeams: true,
       stallGuard: cronGuard,
       profile: cronProfile,
+      disableAllTools: opts?.disableAllTools ?? false,
     });
 
     // Override cwd if a project workDir is specified

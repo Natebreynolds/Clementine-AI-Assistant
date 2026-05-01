@@ -164,6 +164,13 @@ export async function gradeRun(
       1,        // tier 1
       3,        // maxTurns — tight
       'haiku',
+      undefined, // workDir
+      'standard', // mode
+      undefined, // maxHours
+      undefined, // timeoutMs
+      undefined, // successCriteria
+      undefined, // agentSlug
+      { disableAllTools: true },
     );
   } catch (err) {
     logger.warn({ err, jobName: entry.jobName }, 'Outcome grader LLM call failed');
