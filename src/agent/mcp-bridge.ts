@@ -11,10 +11,15 @@ import { existsSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import pino from 'pino';
-import { BASE_DIR } from '../config.js';
+import { ASSISTANT_NAME, BASE_DIR, PKG_DIR } from '../config.js';
 import type { ManagedMcpServer } from '../types.js';
 
 const logger = pino({ name: 'clementine.mcp-bridge' });
+
+/** Path to clementine's own MCP stdio server (built JS entry point). */
+const CLEMENTINE_MCP_SERVER_SCRIPT = path.join(PKG_DIR, 'dist', 'tools', 'mcp-server.js');
+/** Server name clementine registers itself under — matches TOOLS_SERVER in assistant.ts. */
+const CLEMENTINE_TOOLS_SERVER = `${ASSISTANT_NAME.toLowerCase()}-tools`;
 
 const MCP_SERVERS_FILE = path.join(BASE_DIR, 'mcp-servers.json');
 const INTEGRATIONS_FILE = path.join(BASE_DIR, 'claude-integrations.json');
@@ -500,7 +505,23 @@ export async function probeAvailableTools(force = false): Promise<ToolInventory>
         model: 'claude-haiku-4-5',
         permissionMode: 'bypassPermissions',
         allowDangerouslySkipPermissions: true,
-        mcpServers: externalMcpServers,
+        mcpServers: {
+          // Include clementine's own MCP server so the inventory probe
+          // sees the 140+ tools registered by mcp-server.ts (task_*,
+          // goal_*, memory_*, note_*, workflow_*, etc.). Without this
+          // entry, allowedTools listings like 'task_add' resolve to
+          // mcp__<name>-tools__task_add but the SDK rejects them with
+          // "No such tool available" because init.tools never saw the
+          // clementine-tools server. Mirrors the wiring at
+          // assistant.ts:2243 and assistant.ts:4244.
+          [CLEMENTINE_TOOLS_SERVER]: {
+            type: 'stdio' as const,
+            command: 'node',
+            args: [CLEMENTINE_MCP_SERVER_SCRIPT],
+            env: { ...process.env, CLEMENTINE_HOME: BASE_DIR },
+          },
+          ...externalMcpServers,
+        },
       },
     });
     let tools: string[] = [];
