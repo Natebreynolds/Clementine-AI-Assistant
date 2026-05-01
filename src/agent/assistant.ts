@@ -56,7 +56,17 @@ import {
   IDENTITY_FILE,
   CLAUDE_CODE_OAUTH_TOKEN,
   ANTHROPIC_API_KEY as CONFIG_ANTHROPIC_API_KEY,
+  envSnapshot,
 } from '../config.js';
+import { summarizeIntegrationStatus } from '../config/integrations-registry.js';
+import {
+  loadToolPreferences,
+  computeAvailability,
+  buildPromptInstruction,
+  buildComposioStatusBlock,
+} from '../integrations/tool-preferences.js';
+import { loadClaudeIntegrations } from './mcp-bridge.js';
+import { detectFrustrationSignals, detectRepeatedTopics } from './insight-engine.js';
 import type { AgentProfile, ChannelCapabilities, OnTextCallback, OnToolActivityCallback, SessionData, VerboseLevel } from '../types.js';
 import { DEFAULT_CHANNEL_CAPABILITIES } from '../types.js';
 import {
@@ -1724,8 +1734,6 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
     // Integration status — changes as owner adds credentials.
     if (!isAutonomous) {
       try {
-        const { summarizeIntegrationStatus } = require('../config/integrations-registry.js') as typeof import('../config/integrations-registry.js');
-        const { envSnapshot } = require('../config.js') as typeof import('../config.js');
         const summary = summarizeIntegrationStatus(envSnapshot());
         if (summary) volatileParts.push(`## Integration Status\n\n${summary}\n\nCall \`integration_status\`, \`list_integrations\`, or \`setup_integration\` for details.`);
       } catch { /* non-fatal */ }
@@ -1743,11 +1751,6 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
     // every turn regardless.
     if (!isAutonomous) {
       try {
-        const { loadToolPreferences, computeAvailability, buildPromptInstruction, buildComposioStatusBlock } =
-          require('../integrations/tool-preferences.js') as typeof import('../integrations/tool-preferences.js');
-        const { loadClaudeIntegrations } =
-          require('./mcp-bridge.js') as typeof import('./mcp-bridge.js');
-
         const composioSet = new Set(composioConnectedSlugs);
         const cdIntegrations = loadClaudeIntegrations();
         const cdActive = new Set(
@@ -1775,8 +1778,6 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
     // one signal fires — keeps the prompt clean during normal sessions.
     if (!isAutonomous) {
       try {
-        const { detectFrustrationSignals, detectRepeatedTopics } =
-          require('./insight-engine.js') as typeof import('./insight-engine.js');
         const since24h = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
         const since7d = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
         let recent = this.getRecentActivity(since24h, 50);
