@@ -1320,7 +1320,81 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
   }));
 
   // Health check — always responds, no auth, no middleware dependency
-  app.get('/health', (_req, res) => { res.json({ ok: true, ts: Date.now() }); });
+  app.get('/health', async (_req, res) => {
+    const checks: Record<string, 'ok' | 'degraded' | 'unavailable'> = {};
+    let overall: 'healthy' | 'degraded' | 'unhealthy' = 'healthy';
+
+    // 1. Daemon process liveness
+    const pid = readPid();
+    const daemonAlive = pid ? isProcessAlive(pid) : false;
+    checks.daemon = daemonAlive ? 'ok' : 'unavailable';
+    if (!daemonAlive) overall = 'unhealthy';
+
+    // 2. SQLite + memory health
+    try {
+      const { getStore } = await import('../tools/shared.js');
+      const store = await getStore();
+      const health = store.getMemoryHealth();
+      checks.sqlite = 'ok';
+      checks.fts5 = health.lastIntegrityReport?.ftsOk ? 'ok' : 'degraded';
+      checks.writeQueue = (health.writeQueue?.size ?? 0) > 100 ? 'degraded' : 'ok';
+      if (checks.fts5 === 'degraded' || checks.writeQueue === 'degraded') {
+        overall = overall === 'unhealthy' ? 'unhealthy' : 'degraded';
+      }
+    } catch {
+      checks.sqlite = 'unavailable';
+      overall = 'unhealthy';
+    }
+
+    // 3. Graph store availability
+    try {
+      const { getSharedGraphStore } = await import('../memory/graph-store.js');
+      const graphDbDir = path.join(BASE_DIR, '.graph.db');
+      const gs = await getSharedGraphStore(graphDbDir);
+      checks.graphStore = gs?.isAvailable() ? 'ok' : 'unavailable';
+      if (checks.graphStore === 'unavailable' && overall !== 'unhealthy') {
+        overall = 'degraded';
+      }
+    } catch {
+      checks.graphStore = 'unavailable';
+      if (overall !== 'unhealthy') overall = 'degraded';
+    }
+
+    // 4. Recent cron failures (last 24h)
+    try {
+      const runsDir = path.join(BASE_DIR, 'cron', 'runs');
+      let recentFailures = 0;
+      let recentRuns = 0;
+      const dayAgo = Date.now() - 24 * 60 * 60 * 1000;
+      if (existsSync(runsDir)) {
+        for (const file of readdirSync(runsDir).filter(f => f.endsWith('.jsonl'))) {
+          const lines = readFileSync(path.join(runsDir, file), 'utf-8').trim().split('\n').filter(Boolean);
+          for (const line of lines.slice(-50)) {
+            try {
+              const entry = JSON.parse(line) as { startedAt?: string; status?: string };
+              const ts = entry.startedAt ? new Date(entry.startedAt).getTime() : 0;
+              if (ts > dayAgo) {
+                recentRuns++;
+                if (entry.status === 'failed' || entry.status === 'error') recentFailures++;
+              }
+            } catch { /* ignore parse errors */ }
+          }
+        }
+      }
+      checks.cron = recentFailures > 3 ? 'degraded' : recentFailures > 0 ? 'degraded' : 'ok';
+      if (checks.cron === 'degraded' && overall !== 'unhealthy') overall = 'degraded';
+    } catch {
+      checks.cron = 'unavailable';
+    }
+
+    const statusCode = overall === 'healthy' ? 200 : overall === 'degraded' ? 503 : 503;
+    res.status(statusCode).json({
+      status: overall,
+      checks,
+      daemon: { pid: pid ?? null, alive: daemonAlive },
+      timestamp: new Date().toISOString(),
+    });
+  });
 
   // ── Webhook ingestion (raw-body, HMAC-authed) ─────────────────────
   // MUST be registered BEFORE the generic json parser below — otherwise
@@ -2151,6 +2225,23 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
         };
       });
       res.json(out);
+    } catch (err) {
+      res.status(500).json({ error: String(err).slice(0, 200) });
+    }
+  });
+
+  app.get('/api/autonomy', async (req, res) => {
+    try {
+      const { getStore } = await import('../tools/shared.js');
+      const store = await getStore();
+      const logs = store.queryAutonomyLog({
+        component: typeof req.query.component === 'string' ? req.query.component : undefined,
+        event: typeof req.query.event === 'string' ? req.query.event : undefined,
+        agentSlug: typeof req.query.agentSlug === 'string' ? req.query.agentSlug : undefined,
+        limit: typeof req.query.limit === 'string' ? parseInt(req.query.limit, 10) : 100,
+        since: typeof req.query.since === 'string' ? req.query.since : undefined,
+      });
+      res.json({ logs });
     } catch (err) {
       res.status(500).json({ error: String(err).slice(0, 200) });
     }

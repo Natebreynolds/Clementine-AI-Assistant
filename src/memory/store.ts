@@ -883,6 +883,24 @@ export class MemoryStore {
         updated_at TEXT NOT NULL DEFAULT (datetime('now'))
       );
     `);
+
+    // Autonomy log — structured event stream for the self-improving,
+    // proactive, and planning layers. Makes the autonomous subsystem
+    // observable without grepping logs.
+    this.conn.exec(`
+      CREATE TABLE IF NOT EXISTS autonomy_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        component TEXT NOT NULL,
+        event TEXT NOT NULL,
+        agent_slug TEXT,
+        details_json TEXT DEFAULT '{}',
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_autonomy_component ON autonomy_log(component, created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_autonomy_event ON autonomy_log(event, created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_autonomy_agent ON autonomy_log(agent_slug, created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_autonomy_created ON autonomy_log(created_at DESC);
+    `);
   }
 
   // ── Skill usage telemetry ─────────────────────────────────────────
@@ -5599,6 +5617,98 @@ export class MemoryStore {
          WHERE id IN (${placeholders})`,
       )
       .run(...chunkIds);
+  }
+
+  // ── Autonomy log ───────────────────────────────────────────────────
+
+  private _stmtLogAutonomy: Database.Statement | null = null;
+  private _stmtQueryAutonomy: Database.Statement | null = null;
+
+  logAutonomyEvent(row: {
+    component: string;
+    event: string;
+    agentSlug?: string | null;
+    details?: Record<string, unknown>;
+  }): void {
+    try {
+      if (!this._stmtLogAutonomy) {
+        this._stmtLogAutonomy = this.conn.prepare(
+          'INSERT INTO autonomy_log (component, event, agent_slug, details_json) VALUES (?, ?, ?, ?)',
+        );
+      }
+      this._stmtLogAutonomy.run(
+        row.component,
+        row.event,
+        row.agentSlug ?? null,
+        JSON.stringify(row.details ?? {}),
+      );
+    } catch {
+      // Best-effort — autonomy telemetry must never break the system.
+    }
+  }
+
+  queryAutonomyLog(opts: {
+    component?: string;
+    event?: string;
+    agentSlug?: string;
+    limit?: number;
+    since?: string;
+  } = {}): Array<{
+    id: number;
+    component: string;
+    event: string;
+    agentSlug: string | null;
+    details: Record<string, unknown>;
+    createdAt: string;
+  }> {
+    const conditions: string[] = [];
+    const params: (string | number)[] = [];
+    if (opts.component) {
+      conditions.push('component = ?');
+      params.push(opts.component);
+    }
+    if (opts.event) {
+      conditions.push('event = ?');
+      params.push(opts.event);
+    }
+    if (opts.agentSlug) {
+      conditions.push('agent_slug = ?');
+      params.push(opts.agentSlug);
+    }
+    if (opts.since) {
+      conditions.push('created_at >= ?');
+      params.push(opts.since);
+    }
+    const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
+    const limit = opts.limit ?? 100;
+    if (!this._stmtQueryAutonomy || conditions.length) {
+      // Ad-hoc query — conditions vary, use generic runner
+      return this.conn
+        .prepare(`SELECT * FROM autonomy_log ${where} ORDER BY created_at DESC LIMIT ?`)
+        .all(...params, limit)
+        .map((row: unknown) => {
+          const r = row as Record<string, unknown>;
+          return {
+            id: r.id as number,
+            component: r.component as string,
+            event: r.event as string,
+            agentSlug: r.agent_slug as string | null,
+            details: JSON.parse((r.details_json as string) || '{}'),
+            createdAt: r.created_at as string,
+          };
+        });
+    }
+    return this._stmtQueryAutonomy.all(limit).map((row: unknown) => {
+      const r = row as Record<string, unknown>;
+      return {
+        id: r.id as number,
+        component: r.component as string,
+        event: r.event as string,
+        agentSlug: r.agent_slug as string | null,
+        details: JSON.parse((r.details_json as string) || '{}'),
+        createdAt: r.created_at as string,
+      };
+    });
   }
 
   /**

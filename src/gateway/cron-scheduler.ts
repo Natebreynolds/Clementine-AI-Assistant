@@ -503,6 +503,17 @@ export class CronScheduler {
     this.loadJobDefinitions();
   }
 
+  /** Fire-and-forget autonomy telemetry — must never throw. */
+  private async logAutonomy(event: string, job: CronJobDefinition, details?: Record<string, unknown>): Promise<void> {
+    try {
+      const { getStore } = await import('../tools/shared.js');
+      const store = await getStore();
+      store.logAutonomyEvent({ component: 'cron', event, agentSlug: job.agentSlug ?? null, details });
+    } catch {
+      // Best-effort — telemetry must never break cron execution.
+    }
+  }
+
   /**
    * Atomically persist the current runningJobs set to disk. Uses write-then-
    * rename so a crash mid-write cannot corrupt the file.
@@ -1093,6 +1104,7 @@ export class CronScheduler {
     });
     this.persistRunningJobs(this.runMetadata);
     this.emitStatusChange();
+    this.logAutonomy('started', job, { model: job.model, mode: job.mode, tier: job.tier });
 
     try {
       logger.info(`Running cron job: ${job.name}${job.agentSlug ? ` (agent: ${job.agentSlug})` : ''}`);
@@ -1236,6 +1248,7 @@ export class CronScheduler {
           }
 
           this._logRun(entry);
+          this.logAutonomy('completed', job, { durationMs: entry.durationMs, deliveryFailed: entry.deliveryFailed, advisorApplied: !!advisorApplied });
 
           // Fire-and-forget: extract procedural skill from successful long-running cron jobs
           if (entry.status === 'ok' && entry.durationMs > 30_000 && response && response.length > 500) {
@@ -1295,6 +1308,7 @@ export class CronScheduler {
             await sleep(backoffMs);
           } else {
             logger.error({ err, job: job.name }, `Cron job '${job.name}' failed after ${attempt} attempt(s)`);
+            this.logAutonomy('failed', job, { errorType, attempts: attempt, error: String(err).slice(0, 500) });
             await this.dispatcher.send(CronScheduler.formatCronError(job.name, err), { agentSlug: job.agentSlug });
           }
         }
@@ -1331,6 +1345,7 @@ export class CronScheduler {
       const consErrors = this.runLog.consecutiveErrors(job.name);
       if (consErrors === 5) {
         // Circuit breaker just engaged — notify
+        this.logAutonomy('circuit_breaker', job, { consecutiveErrors: consErrors });
         this.logAdvisorEvent('circuit-breaker', job.name, `Circuit breaker engaged after ${consErrors} consecutive errors`);
         this.dispatcher.send(`⚡ **Circuit breaker engaged** for \`${job.name}\` — ${consErrors} consecutive errors. Will retry in 1 hour.`, { agentSlug: job.agentSlug }).catch(err => logger.debug({ err }, 'Failed to send circuit breaker notification'));
       } else if (consErrors >= 5) {
@@ -1351,6 +1366,7 @@ export class CronScheduler {
       // defined in per-agent CRON.md files (vault/00-System/agents/{slug}/CRON.md)
       // rather than only the central one.
       if (consErrors >= 3) {
+        this.logAutonomy('self_improve_triggered', job, { consecutiveErrors: consErrors });
         try {
           const triggerDir = path.join(BASE_DIR, 'self-improve', 'triggers');
           mkdirSync(triggerDir, { recursive: true });
@@ -1380,6 +1396,7 @@ export class CronScheduler {
           this.scheduledTasks.delete(job.name);
         }
         logger.error({ job: job.name, consErrors }, `Auto-disabled cron after ${consErrors} consecutive failures`);
+        this.logAutonomy('auto_disabled', job, { consecutiveErrors: consErrors });
         this.logAdvisorEvent('auto-disabled', job.name, `Auto-disabled after ${consErrors} consecutive failures`);
         this.dispatcher.send(
           `🛑 **Cron auto-disabled** — \`${job.name}\` failed ${consErrors} times in a row. Fix the job and re-enable it from the dashboard.`,

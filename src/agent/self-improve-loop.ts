@@ -456,6 +456,17 @@ export class SelfImproveLoop {
     }, WATCH_DEBOUNCE_MS);
   }
 
+  /** Fire-and-forget autonomy telemetry — must never throw. */
+  private async logAutonomy(event: string, trigger: TriggerFile, details?: Record<string, unknown>): Promise<void> {
+    try {
+      const { getStore } = await import('../tools/shared.js');
+      const store = await getStore();
+      store.logAutonomyEvent({ component: 'self_improve', event, agentSlug: trigger.agentSlug ?? null, details });
+    } catch {
+      // Best-effort — telemetry must never break the self-improve loop.
+    }
+  }
+
   /**
    * Process all pending triggers. Public so tests + manual invocations
    * (e.g., a `clementine self-improve tick` CLI command) can call it.
@@ -484,10 +495,13 @@ export class SelfImproveLoop {
           continue;
         }
 
+        this.logAutonomy('trigger_detected', trigger, { consecutiveErrors: trigger.consecutiveErrors });
+
         try {
           await this.processOne(trigger, counts);
         } catch (err) {
           logger.warn({ err, jobName: trigger.jobName }, 'Failed to process trigger — leaving in place for next tick');
+          this.logAutonomy('process_failed', trigger, { error: String(err).slice(0, 500) });
           continue;
         }
 
@@ -559,6 +573,7 @@ export class SelfImproveLoop {
     if (recipe.category === 'noop') {
       counts.noop++;
       logger.info({ jobName: trigger.jobName, reason: recipe.description }, 'Self-improve: no-op');
+      this.logAutonomy('fix_noop', trigger, { reason: recipe.description });
       return;
     }
 
@@ -576,6 +591,7 @@ export class SelfImproveLoop {
     };
     const file = writePendingChange(record, this.pendingDir);
     counts.pending++;
+    this.logAutonomy('proposal_written', trigger, { category: recipe.category, proposalId: id });
     await this.notifyAgent(agentSlug, [
       `⚠️ **${trigger.jobName}** has failed ${trigger.consecutiveErrors} times in a row.`,
       '',

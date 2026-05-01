@@ -170,6 +170,17 @@ export class PlanOrchestrator {
     this.stateId = `plan-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
   }
 
+  /** Fire-and-forget autonomy telemetry — must never throw. */
+  private async logAutonomy(event: string, details?: Record<string, unknown>): Promise<void> {
+    try {
+      const { getStore } = await import('../tools/shared.js');
+      const store = await getStore();
+      store.logAutonomyEvent({ component: 'orchestrator', event, details });
+    } catch {
+      // Best-effort — telemetry must never break plan execution.
+    }
+  }
+
   // ── State persistence ────────────────────────────────────────────────
 
   private saveState(state: PlanState): void {
@@ -260,6 +271,7 @@ export class PlanOrchestrator {
         { goal: effectiveTask, stepCount: plan.steps.length, steps: plan.steps.map(s => s.id), revision: revisionCount },
         'Plan generated',
       );
+      this.logAutonomy('plan_created', { stepCount: plan.steps.length, revision: revisionCount });
 
       // 2. Initialize statuses
       this.stepStatuses.clear();
@@ -378,6 +390,7 @@ export class PlanOrchestrator {
             durationMs: elapsed,
             resultPreview: resultText.slice(0, 100),
           });
+          this.logAutonomy('step_completed', { stepId: step.id, description: step.description, durationMs: elapsed, model: step.model });
         } else {
           const errMsg = `[FAILED: ${outcome.reason}]`;
           results.set(step.id, errMsg);
@@ -389,6 +402,7 @@ export class PlanOrchestrator {
             resultPreview: errMsg.slice(0, 100),
           });
           logger.error({ stepId: step.id, err: outcome.reason }, 'Plan step failed');
+          this.logAutonomy('step_failed', { stepId: step.id, description: step.description, error: String(outcome.reason).slice(0, 500) });
         }
       }
       await safeProgress(this.getAllUpdates());
@@ -432,6 +446,7 @@ export class PlanOrchestrator {
                 logger.warn({ stepId: issue.stepId }, 'Repair decision: abort plan');
                 state.status = 'failed';
                 this.saveState(state);
+                this.logAutonomy('plan_aborted', { stepId: issue.stepId, reason: issue.issue });
                 return `Plan aborted — step "${this.stepStatuses.get(issue.stepId)?.description ?? issue.stepId}" failed critically and could not be repaired.`;
               }
               // 'skip' falls through — annotate and continue
@@ -507,6 +522,7 @@ export class PlanOrchestrator {
       });
     } catch (err) {
       logger.error({ err }, 'Synthesis step failed');
+      this.logAutonomy('synthesis_failed', { error: String(err).slice(0, 500) });
       // Fallback: concatenate results
       finalResult = Array.from(results.entries())
         .map(([id, r]) => `**${this.stepStatuses.get(id)?.description ?? id}:**\n${r}`)
@@ -524,6 +540,7 @@ export class PlanOrchestrator {
 
     const totalMs = Date.now() - this.startTime;
     logger.info({ totalMs, steps: plan.steps.length }, 'Plan execution complete');
+    this.logAutonomy('plan_completed', { totalMs, steps: plan.steps.length, errors: state.errors.length });
 
     // Mark state as complete and clean up
     state.status = 'complete';

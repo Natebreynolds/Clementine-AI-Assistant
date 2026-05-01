@@ -291,6 +291,43 @@ export type MemoryStoreType = {
     newestUpdated: string | null;
   };
   db: unknown;
+  getMemoryHealth(opts?: {
+    graphStore?: { isAvailable(): boolean; nodeCount?(): Promise<number>; edgeCount?(): Promise<number> };
+    topCitedLimit?: number;
+  }): {
+    chunks: { total: number; consolidated: number; pinned: number; softDeleted: number; zombieCount: number };
+    chunksByCategory: Array<{ category: string | null; count: number }>;
+    tableRowCounts: Record<string, number>;
+    topCitedLast30d: Array<{ chunkId: number; sourceFile: string; section: string; refCount: number }>;
+    staleUserModelSlots: Array<{ slot: string; ageDays: number; agentSlug: string | null }>;
+    staleHighSalienceChunks: Array<{ chunkId: number; sourceFile: string; section: string; salience: number; lastOutcomeScore: number }>;
+    chunkCacheStats: { hits: number; misses: number; evictions: number; size: number };
+    writeQueue: { size: number; dropped: number } | null;
+    lastIntegrityReport: { ftsOk: boolean; ftsRebuilt: boolean; orphanRefsNulled: number; missingEmbeddings: number; ranAt: string } | null;
+    dbSizeBytes: number;
+    lastVacuumAt: string | null;
+    denseEmbeddings: { withDense: number; total: number; models: Array<{ model: string; count: number }>; currentModel: string; ready: boolean };
+  };
+  logAutonomyEvent(row: {
+    component: string;
+    event: string;
+    agentSlug?: string | null;
+    details?: Record<string, unknown>;
+  }): void;
+  queryAutonomyLog(opts?: {
+    component?: string;
+    event?: string;
+    agentSlug?: string;
+    limit?: number;
+    since?: string;
+  }): Array<{
+    id: number;
+    component: string;
+    event: string;
+    agentSlug: string | null;
+    details: Record<string, unknown>;
+    createdAt: string;
+  }>;
 };
 
 let _store: MemoryStoreType | null = null;
