@@ -37,6 +37,32 @@ function readEnvFile(): Record<string, string> {
 
 const env = readEnvFile();
 
+// ── Claude Code CLI runtime env propagation ─────────────────────────
+//
+// The Claude Code CLI binary bundled inside @anthropic-ai/claude-agent-sdk
+// auto-attaches the `context-1m-2025-08-07` beta header for any model that
+// supports a 1M context (Sonnet 4.6, Opus 4.6/4.7, etc.). On accounts
+// without the "extra usage" entitlement, every API call then fails with
+// "Extra usage is required for 1M context."
+//
+// We don't ask for 1M anywhere in our code, but the CLI does on its own.
+// The CLI honors CLAUDE_CODE_DISABLE_1M_CONTEXT — when truthy, the auto-
+// enable path is skipped and the standard 200K context is used.
+//
+// Default to disabled here so users without extra usage stop hitting the
+// gate. Anyone who has paid for / been entitled to 1M can opt back in by
+// setting CLAUDE_CODE_DISABLE_1M_CONTEXT=0 in their .env.
+{
+  const userPref = env['CLAUDE_CODE_DISABLE_1M_CONTEXT'] ?? process.env.CLAUDE_CODE_DISABLE_1M_CONTEXT;
+  if (userPref === undefined || userPref === '') {
+    process.env.CLAUDE_CODE_DISABLE_1M_CONTEXT = '1';
+  } else {
+    // Propagate the user's explicit choice from .env into process.env so the
+    // spawned CLI subprocess inherits it.
+    process.env.CLAUDE_CODE_DISABLE_1M_CONTEXT = userPref;
+  }
+}
+
 // ── Keychain-ref resolution (lazy, cached) ──────────────────────────
 //
 // `.env` may store keychain stubs ("keychain:clementine-agent-FOO") in place
