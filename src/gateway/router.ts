@@ -30,6 +30,7 @@ import type { NotificationDispatcher } from './notifications.js';
 import { listBackgroundTasks } from '../agent/background-tasks.js';
 import { applyAssistantExperienceUpdate, detectLocalTurn, type AssistantExperienceUpdate } from '../agent/local-turn.js';
 import { updateClementineJson } from '../config/clementine-json.js';
+import { buildCronDiagnosticResponse } from './cron-diagnostic-turn.js';
 
 const logger = pino({ name: 'clementine.gateway' });
 const INTERACTIVE_FAILURE_LOG = path.join(BASE_DIR, 'self-improve', 'interactive-failures.jsonl');
@@ -1169,6 +1170,31 @@ export class Gateway {
         responseLen: localResponse.length,
       }, 'chat:latency');
       return localResponse;
+    }
+
+    // Cron "what broke / fix this job" asks should not spin up a broad SDK
+    // session. They are bounded local diagnostics over run summaries and scalar
+    // config only, and they intentionally do not execute the cron job.
+    if (this.isTrustedPersonalSession(sessionKey)) {
+      const cronDiagnostic = buildCronDiagnosticResponse(text, { baseDir: BASE_DIR });
+      if (cronDiagnostic) {
+        const current = this.sessions.get(sessionKey);
+        if (current?.abortController && !current.abortController.signal.aborted) {
+          current.abortController.abort('replaced-by-cron-diagnostic');
+          logger.info({ sessionKey }, 'Interrupted active chat for local cron diagnostic');
+        }
+        if (onText) {
+          try { await onText(cronDiagnostic); } catch { /* channel streaming is best-effort */ }
+        }
+        logger.info({
+          sessionKey,
+          totalMs: Date.now() - tInnerStart,
+          chatMs: Date.now() - localTurnStarted,
+          localCronDiagnostic: true,
+          responseLen: cronDiagnostic.length,
+        }, 'chat:latency');
+        return cronDiagnostic;
+      }
     }
 
     // Show "queued" status if either lane or session lock is contended,

@@ -288,6 +288,8 @@ async function cmdLaunch(options: { foreground?: boolean; install?: boolean; uni
     <string>${buildLaunchdPath()}</string>
     <key>CLEMENTINE_HOME</key>
     <string>${BASE_DIR}</string>
+    <key>CLEMENTINE_LAUNCHD_MANAGED</key>
+    <string>1</string>
   </dict>
 </dict>
 </plist>`;

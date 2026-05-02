@@ -64,6 +64,9 @@ function killPid(pid: number): void {
 
 function stopLaunchdService(): boolean {
   if (process.platform !== 'darwin') return false;
+  if (process.env.XPC_SERVICE_NAME === LAUNCHD_LABEL || process.env.CLEMENTINE_LAUNCHD_MANAGED === '1') {
+    return false;
+  }
   const home = process.env.HOME ?? '';
   const plist = path.join(home, 'Library', 'LaunchAgents', `${LAUNCHD_LABEL}.plist`);
   if (!existsSync(plist)) return false;

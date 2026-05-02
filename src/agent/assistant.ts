@@ -2212,11 +2212,18 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
         reason: bundles.length > 0 ? 'matched' : 'empty',
       };
     };
+    const autonomousToolRun = isHeartbeat || isCron || isPlanStep || isUnleashed;
     const promptToolRoute = routeToolSurface(promptScopeText);
     const profileToolRoute = routeToolSurface(profileScopeText);
     const contextToolRoute = routeToolSurface(contextRoutingText);
+    const promptHasToolRoute = promptToolRoute.fullSurface || promptToolRoute.bundles.length > 0;
+    const directFollowupNeedsContextTools = intentClassification?.type === 'followup'
+      || /^(yes|yep|yeah|go|go ahead|do it|continue|pick up|use that|run it|send it|same thing)\b/i.test(promptScopeText.trim());
+    const allowContextToolRoute = autonomousToolRun || (!promptHasToolRoute && directFollowupNeedsContextTools);
     const safeProfileToolRoute = profileToolRoute.fullSurface ? emptyToolRoute() : profileToolRoute;
-    const safeContextToolRoute = contextToolRoute.fullSurface ? emptyToolRoute() : contextToolRoute;
+    const safeContextToolRoute = allowContextToolRoute && !contextToolRoute.fullSurface
+      ? contextToolRoute
+      : emptyToolRoute();
     const toolRoute = mergeToolRoutes(
       promptToolRoute,
       mergeToolRoutes(safeProfileToolRoute, safeContextToolRoute),
@@ -2234,10 +2241,9 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
 
     const scopeText = [
       directScopeText,
-      contextRoutingText,
+      allowContextToolRoute ? contextRoutingText : '',
     ].filter(Boolean).join('\n').toLowerCase();
     const promptScopeLower = promptScopeText.toLowerCase();
-    const autonomousToolRun = isHeartbeat || isCron || isPlanStep || isUnleashed;
     const taskIntent = intentClassification?.type === 'task' || autonomousToolRun;
     const memoryNeeded = autonomousToolRun
       || retrievalContext.trim().length > 0
@@ -3455,6 +3461,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
     // Flipped true on the first intervention; subsequent replies go through
     // un-validated (but still logged).
     let contradictionRetried = false;
+    let contextRecoveryRetries = 0;
 
     try {
       for (let attempt = 0; attempt <= PersonalAssistant.RATE_LIMIT_MAX_RETRIES; attempt++) {
@@ -3822,7 +3829,8 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
               this.exchangeCounts.set(sessionKey, 0);
               this._compactedSessions.delete(sessionKey);
             }
-            if (attempt < PersonalAssistant.RATE_LIMIT_MAX_RETRIES) {
+            if (attempt < PersonalAssistant.RATE_LIMIT_MAX_RETRIES && contextRecoveryRetries < 1) {
+              contextRecoveryRetries++;
               prompt = buildContextRecoveredPrompt(prompt, preRotationSnapshot);
               preRotationSnapshot = null;
               responseText = '';
@@ -3871,11 +3879,20 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
         if (staleSession && attempt < PersonalAssistant.RATE_LIMIT_MAX_RETRIES) {
           responseText = '';
           if (contextRecovery) {
-            prompt = buildContextRecoveredPrompt(prompt, preRotationSnapshot);
-            preRotationSnapshot = null;
-            contextRecovery = false;
+            if (contextRecoveryRetries >= 1) {
+              responseText = contextThrashRecoveryNotice();
+              staleSession = false;
+              contextRecovery = false;
+            } else {
+              contextRecoveryRetries++;
+              prompt = buildContextRecoveredPrompt(prompt, preRotationSnapshot);
+              preRotationSnapshot = null;
+              contextRecovery = false;
+              continue;
+            }
+          } else {
+            continue;
           }
-          continue;
         }
         if (staleSession && contextRecovery && !responseText.trim()) {
           responseText = contextThrashRecoveryNotice();
@@ -3907,11 +3924,10 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
             this.exchangeCounts.set(sessionKey, 0);
             this._compactedSessions.delete(sessionKey);
           }
-          if (attempt < PersonalAssistant.RATE_LIMIT_MAX_RETRIES) {
-            prompt = buildContextRecoveredPrompt(prompt, {
-              toolCalls: stallGuard?.getToolCalls() ?? [],
-              partialText: '',
-            });
+          if (attempt < PersonalAssistant.RATE_LIMIT_MAX_RETRIES && contextRecoveryRetries < 1) {
+            contextRecoveryRetries++;
+            prompt = buildContextRecoveredPrompt(prompt, preRotationSnapshot);
+            preRotationSnapshot = null;
             responseText = '';
             continue;
           }

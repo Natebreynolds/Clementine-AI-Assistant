@@ -144,14 +144,17 @@ function readJobDefinition(jobName: string): string | null {
     if (!existsSync(file)) continue;
     try {
       const raw = readFileSync(file, 'utf-8');
-      // Find the YAML block for "- name: bareName" and return until the next
-      // "- name:" at the same indent or end of file.
-      const pattern = new RegExp(
-        `^(  - name: ${bareName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*$[\\s\\S]*?)(?=^  - name: |\\z)`,
-        'm',
-      );
-      const m = raw.match(pattern);
-      if (m) return m[1]!.slice(0, 6000);
+      const lines = raw.split('\n');
+      const start = lines.findIndex((line) => line.trim() === `- name: ${bareName}`);
+      if (start === -1) continue;
+      let end = lines.length;
+      for (let i = start + 1; i < lines.length; i++) {
+        if (/^  - name:\s+/.test(lines[i] ?? '')) {
+          end = i;
+          break;
+        }
+      }
+      return lines.slice(start, end).join('\n').slice(0, 6000);
     } catch { /* skip */ }
   }
   return null;
@@ -187,12 +190,15 @@ function readRecentRuns(jobName: string, limit = 10): string {
           durationMs: number;
           error?: string;
           outputPreview?: string;
+          terminalReason?: string;
           attempt?: number;
         };
-        const detail = d.status === 'ok'
-          ? `preview="${(d.outputPreview ?? '').slice(0, 120).replace(/\n/g, ' ')}"`
-          : `error="${(d.error ?? '').split('\n')[0]!.slice(0, 160)}"`;
-        return `${d.startedAt} ${d.status} (${Math.round(d.durationMs / 1000)}s) ${detail}`;
+        const detailParts = [
+          d.terminalReason ? `terminal=${d.terminalReason}` : '',
+          d.error ? `error="${d.error.split('\n')[0]!.slice(0, 160)}"` : '',
+          d.outputPreview ? `preview="${d.outputPreview.slice(0, 160).replace(/\n/g, ' ')}"` : '',
+        ].filter(Boolean);
+        return `${d.startedAt} ${d.status} (${Math.round(d.durationMs / 1000)}s) ${detailParts.join(' ')}`;
       } catch {
         return line.slice(0, 160);
       }
@@ -285,6 +291,113 @@ function buildPrompt(broken: BrokenJob, jobDef: string | null, agentProfile: str
     '  "riskLevel": "low|medium|high"',
     '}',
   ].filter(Boolean).join('\n');
+}
+
+function bareJobName(jobName: string): string {
+  return jobName.includes(':') ? jobName.split(':').slice(1).join(':') : jobName;
+}
+
+function promptOverrideForContextOverflow(jobName: string): AutoApplyPromptOverride {
+  return {
+    kind: 'prompt-override',
+    scope: 'job',
+    scopeKey: bareJobName(jobName),
+    content: [
+      '# Bounded Run Guidance',
+      '',
+      'Keep this job inside the context window.',
+      '- Do not read full CRON.md, full run histories, or raw integration exports.',
+      '- Pull records in batches of 20 or fewer unless the job prompt gives a smaller cap.',
+      '- Redirect large command/API output to temp files and summarize IDs, counts, names, statuses, and next actions only.',
+      '- Never paste raw integration, email, browser, tool, or other large JSON output into the conversation.',
+      '- If context starts filling, stop with a concise partial summary and pending list instead of retrying broad reads.',
+    ].join('\n'),
+  };
+}
+
+export function diagnoseKnownFailurePattern(
+  broken: BrokenJob,
+  jobDef: string | null,
+  recentRuns: string,
+): Diagnosis | null {
+  const haystack = [
+    broken.jobName,
+    broken.lastAdvisorOpinion ?? '',
+    ...broken.lastErrors,
+    recentRuns,
+  ].join('\n').toLowerCase();
+
+  if (/rapid_refill_breaker|autocompact.*thrash|context refilled|prompt is too long|prompt too long|context.?length|maximum context|input is too long/.test(haystack)) {
+    const autoApply = jobDef ? promptOverrideForContextOverflow(broken.jobName) : undefined;
+    return {
+      rootCause: 'The job is overflowing the Claude context window. This is usually caused by broad file reads, full run-history reads, or raw integration output being pulled into the prompt.',
+      confidence: 'high',
+      proposedFix: {
+        type: autoApply ? 'prompt_override' : 'prompt_change',
+        details: 'Bound the job/diagnostic prompt: read tight chunks, cap batches at 20 records, summarize raw API output from temp files, and stop with a partial summary instead of retrying when context gets tight.',
+        ...(autoApply ? { autoApply } : {}),
+      },
+      riskLevel: 'low',
+      generatedAt: new Date().toISOString(),
+    };
+  }
+
+  const maxTurns = haystack.match(/maximum number of turns\s*\(?(\d+)?\)?|max_turns/i);
+  if (maxTurns) {
+    const observed = Number(maxTurns[1]);
+    const next = Number.isFinite(observed) && observed > 0 ? Math.min(90, Math.max(15, observed * 3)) : 30;
+    return {
+      rootCause: 'The job reached its turn cap before finishing.',
+      confidence: 'high',
+      proposedFix: {
+        type: 'config_change',
+        details: `Raise max_turns to ${next} only if the prompt already keeps tool output bounded. If output is large, add bounded-output guidance first.`,
+        ...(jobDef ? {
+          autoApply: {
+            kind: 'cron',
+            operations: [{ op: 'set', field: 'max_turns', value: next }],
+          } satisfies AutoApplyCron,
+        } : {}),
+      },
+      riskLevel: 'medium',
+      generatedAt: new Date().toISOString(),
+    };
+  }
+
+  if (/\b(401|403)\b|not authenticated|invalid api key|credential|please run \/login|does not have access/.test(haystack)) {
+    return {
+      rootCause: 'The latest failures look credential-related.',
+      confidence: 'high',
+      proposedFix: {
+        type: 'credential_refresh',
+        details: 'Refresh the affected integration credentials, then run a small probe before re-enabling full job volume.',
+      },
+      riskLevel: 'low',
+      generatedAt: new Date().toISOString(),
+    };
+  }
+
+  if (/no local bash|permission denied|blocked|task_blocked/.test(haystack)) {
+    const autoApply: AutoApplyPromptOverride | undefined = jobDef ? {
+      kind: 'prompt-override',
+      scope: 'job',
+      scopeKey: bareJobName(broken.jobName),
+      content: 'Use only tools available to this agent. If local shell access is unavailable, report BLOCKED with the missing capability and do not retry the same unavailable tool.',
+    } : undefined;
+    return {
+      rootCause: 'The job appears to be selecting a tool or capability that is unavailable in its current agent scope.',
+      confidence: 'medium',
+      proposedFix: {
+        type: autoApply ? 'prompt_override' : 'agent_scope',
+        details: 'Tighten the job prompt or agent scope so it only uses available tools, and make unavailable-tool failures stop instead of looping.',
+        ...(autoApply ? { autoApply } : {}),
+      },
+      riskLevel: 'medium',
+      generatedAt: new Date().toISOString(),
+    };
+  }
+
+  return null;
 }
 
 function parseResponse(raw: string): Diagnosis | null {
@@ -418,6 +531,19 @@ export async function diagnoseBrokenJob(
   const jobDef = readJobDefinition(broken.jobName);
   const agentProfile = broken.agentSlug ? readAgentProfile(broken.agentSlug) : null;
   const recentRuns = readRecentRuns(broken.jobName, 10);
+
+  const knownDiagnosis = diagnoseKnownFailurePattern(broken, jobDef, recentRuns);
+  if (knownDiagnosis) {
+    cache[broken.jobName] = knownDiagnosis;
+    saveCache(cache);
+    logger.info({
+      job: broken.jobName,
+      confidence: knownDiagnosis.confidence,
+      fixType: knownDiagnosis.proposedFix.type,
+    }, 'Broken-job diagnosis generated from known pattern');
+    return knownDiagnosis;
+  }
+
   const prompt = buildPrompt(broken, jobDef, agentProfile, recentRuns);
 
   let rawResponse: string;
@@ -428,6 +554,13 @@ export async function diagnoseBrokenJob(
       1,        // tier 1 — cheap
       5,        // maxTurns — diagnosis doesn't need tools typically
       'haiku',  // model — keep cost negligible
+      undefined,
+      'standard',
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      { disableAllTools: true },
     );
   } catch (err) {
     logger.warn({ err, job: broken.jobName }, 'Diagnostic LLM call failed');
