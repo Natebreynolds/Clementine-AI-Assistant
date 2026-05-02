@@ -98,6 +98,7 @@ import { classifyIntent, getStrategyGuidance, type IntentClassification } from '
 import { getEventLog } from './session-event-log.js';
 import { routeToolSurface, TOOL_SURFACE_WARN_THRESHOLD, type ToolRouteDecision } from './tool-router.js';
 import { decideTurnPolicy, type RetrievalTier, type TurnPolicy } from './turn-policy.js';
+import { loadClementineJson } from '../config/clementine-json.js';
 
 // ── Channel capabilities ────────────────────────────────────────────
 
@@ -1800,6 +1801,55 @@ Never spawn a sub-agent with vague instructions like "handle this brief."
 When ${owner} expresses satisfaction ("nice", "perfect", "great job", "thanks") or dissatisfaction ("no", "wrong", "that's not right", "ugh"), call \`feedback_log\` with an appropriate rating ('positive' or 'negative') and a brief comment summarizing the context. This helps me learn from interactions.`);
       }
 
+      try {
+        const jsonExperience = loadClementineJson(BASE_DIR).assistant ?? {};
+        const pick = <T extends string>(value: string | undefined, allowed: readonly T[]): T | undefined =>
+          allowed.includes(value as T) ? value as T : undefined;
+        const experience = {
+          proactivity: pick(process.env.ASSISTANT_PROACTIVITY, ['quiet', 'balanced', 'proactive', 'operator'] as const) ?? jsonExperience.proactivity,
+          responseStyle: pick(process.env.ASSISTANT_RESPONSE_STYLE, ['concise', 'balanced', 'detailed'] as const) ?? jsonExperience.responseStyle,
+          progressVisibility: pick(process.env.ASSISTANT_PROGRESS_VISIBILITY, ['quiet', 'normal', 'detailed'] as const) ?? jsonExperience.progressVisibility,
+          autonomy: pick(process.env.ASSISTANT_AUTONOMY, ['ask_first', 'balanced', 'act_when_safe'] as const) ?? jsonExperience.autonomy,
+        };
+        const lines: string[] = [];
+        if (experience.proactivity) {
+          const guidance: Record<string, string> = {
+            quiet: 'Only interrupt for urgent or explicitly requested work. Avoid unsolicited next steps.',
+            balanced: 'Offer useful next steps when natural, but do not create extra work without a clear reason.',
+            proactive: 'Surface likely next actions, risks, and background-work opportunities before the owner has to ask.',
+            operator: 'Operate forward: propose plans, queue safe background work, monitor progress, and keep the owner informed.',
+          };
+          lines.push(`- Proactivity: ${experience.proactivity}. ${guidance[experience.proactivity]}`);
+        }
+        if (experience.responseStyle) {
+          const guidance: Record<string, string> = {
+            concise: 'Default to short, direct answers. Expand only when the task needs it.',
+            balanced: 'Match detail to task complexity.',
+            detailed: 'Include more reasoning, context, and verification detail for substantive work.',
+          };
+          lines.push(`- Response style: ${experience.responseStyle}. ${guidance[experience.responseStyle]}`);
+        }
+        if (experience.progressVisibility) {
+          const guidance: Record<string, string> = {
+            quiet: 'Minimize process narration unless work is slow, blocked, or risky.',
+            normal: 'Share important progress and decision points.',
+            detailed: 'Keep the owner posted during background or multi-tool work, including failures and recoveries.',
+          };
+          lines.push(`- Progress visibility: ${experience.progressVisibility}. ${guidance[experience.progressVisibility]}`);
+        }
+        if (experience.autonomy) {
+          const guidance: Record<string, string> = {
+            ask_first: 'Ask before taking actions that change external systems or user data.',
+            balanced: 'Act on low-risk reversible steps; ask on irreversible, costly, or ambiguous steps.',
+            act_when_safe: 'Use judgment and proceed on safe, reversible, clearly beneficial work.',
+          };
+          lines.push(`- Autonomy: ${experience.autonomy}. ${guidance[experience.autonomy]}`);
+        }
+        if (lines.length > 0) {
+          parts.push(`## Owner Experience Preferences\n\n${lines.join('\n')}`);
+        }
+      } catch { /* config preferences are optional */ }
+
       // Verbose level overrides
       if (verboseLevel === 'quiet') {
         parts.push(`## Verbosity: Quiet\n\nGive results directly. Skip reasoning and progress updates unless asked.`);
@@ -2973,9 +3023,24 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
 
     // Lone-surrogate sanitization happens at the SDK boundary (see query() wrapper).
     let effectivePrompt = text;
+    const recentExchangesForIntent = key ? this.lastExchanges.get(key) : undefined;
+    const intent = classifyIntent(text, recentExchangesForIntent);
+    const turnPolicy = decideTurnPolicy({
+      text,
+      intent,
+      hasRecentContext: !!(recentExchangesForIntent?.length || (key && this.sessions.has(key))),
+    });
+    const suppressContextInjection = turnPolicy.suppressContextInjection === true;
+
+    if (key && turnPolicy.suppressSessionResume) {
+      this.sessions.delete(key);
+      this.exchangeCounts.set(key, 0);
+      this.restoredSessions.delete(key);
+      this._compactedSessions.delete(key);
+    }
 
     // If session rotated, use instant local summary + handoff + kick off LLM summary in background
-    if (sessionRotated && key) {
+    if (sessionRotated && key && !suppressContextInjection) {
       const summary = this.buildLocalSummary(key);
       const handoff = this.loadHandoff(key);
       const contextParts: string[] = [];
@@ -2995,7 +3060,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
     }
 
     // Resilience: inject exchange history if no session_id stored
-    if (key && !this.sessions.has(key) && !sessionRotated) {
+    if (key && !suppressContextInjection && !this.sessions.has(key) && !sessionRotated) {
       const exchanges = this.lastExchanges.get(key) ?? [];
       if (exchanges.length > 0) {
         const historyLines: string[] = [];
@@ -3009,7 +3074,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
     }
 
     // Inject context on first message after a daemon restart (session restored from disk)
-    if (key && this.restoredSessions.has(key)) {
+    if (key && !suppressContextInjection && this.restoredSessions.has(key)) {
       const exchanges = this.lastExchanges.get(key) ?? [];
       if (exchanges.length > 0) {
         const olderSummary = this.buildOlderTurnsContext(key, exchanges);
@@ -3033,7 +3098,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
     }
 
     // Fresh session with no history — inject last conversation context
-    if (key && !sessionRotated && !this.restoredSessions.has(key)) {
+    if (key && !suppressContextInjection && !sessionRotated && !this.restoredSessions.has(key)) {
       const exchanges = this.lastExchanges.get(key) ?? [];
       if (exchanges.length === 0 && this.memoryStore) {
         try {
@@ -3054,7 +3119,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
     }
 
     // Time-gap awareness: let the agent know how long it's been
-    if (key && this.sessionTimestamps.has(key)) {
+    if (key && !suppressContextInjection && this.sessionTimestamps.has(key)) {
       const gapMs = Date.now() - this.sessionTimestamps.get(key)!.getTime();
       const gapHours = Math.round(gapMs / 3_600_000);
       if (gapHours >= 8) {
@@ -3067,7 +3132,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
     // injectContext uses the base session key (e.g. discord:user:123) but
     // chat may use a profile-suffixed key (discord:user:123:sales-agent),
     // so also check any pending key that the current key starts with.
-    if (key) {
+    if (key && !suppressContextInjection) {
       const allPending: Array<{ user: string; assistant: string }> = [];
 
       for (const [pendingKey, pending] of this.pendingContext) {
@@ -3088,7 +3153,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
     }
 
     // Inject stall nudge if the previous query for this session showed stall signals
-    if (key && this.stallNudges.has(key)) {
+    if (key && !suppressContextInjection && this.stallNudges.has(key)) {
       const nudge = this.stallNudges.get(key)!;
       this.stallNudges.delete(key);
       effectivePrompt =
@@ -3098,16 +3163,6 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
         `If a file can't be read, say so. If you're stuck, say so. Never stall silently.]\n\n${effectivePrompt}`;
     }
 
-    // ── Intent classification ─────────────────────────────────────
-    // Classify intent before the main query to dynamically tune response
-    // strategy, maxTurns, and effort level
-    const recentExchanges = key ? this.lastExchanges.get(key) : undefined;
-    const intent = classifyIntent(text, recentExchanges);
-    const turnPolicy = decideTurnPolicy({
-      text,
-      intent,
-      hasRecentContext: !!(recentExchanges?.length || (key && this.sessions.has(key))),
-    });
     logger.debug({
       intent: intent.type,
       confidence: intent.confidence,
@@ -3159,7 +3214,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
     if (key && !isApiError) {
       this.exchangeCounts.set(key, (this.exchangeCounts.get(key) ?? 0) + 1);
       this.sessionTimestamps.set(key, new Date());
-      const history = this.lastExchanges.get(key) ?? [];
+      const history = turnPolicy.suppressContextInjection ? [] : (this.lastExchanges.get(key) ?? []);
       history.push({ user: text, assistant: responseText });
       if (history.length > SESSION_EXCHANGE_HISTORY_SIZE) {
         this.lastExchanges.set(key, history.slice(-SESSION_EXCHANGE_HISTORY_SIZE));
@@ -3382,7 +3437,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
         }
 
         // Set resume session if available
-        if (sessionKey && this.sessions.has(sessionKey)) {
+        if (sessionKey && this.sessions.has(sessionKey) && !effectiveTurnPolicy?.suppressSessionResume) {
           sdkOptions.resume = this.sessions.get(sessionKey);
         }
 

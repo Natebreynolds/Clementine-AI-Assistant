@@ -58,6 +58,12 @@ const SPECS: KeySpec[] = [
   { key: 'ASSISTANT_NICKNAME', group: 'identity', default: 'Clemmy' },
   { key: 'TIMEZONE', group: 'identity', jsonPath: 'timezone', systemDefault: () => Intl.DateTimeFormat().resolvedOptions().timeZone },
 
+  // Assistant experience
+  { key: 'ASSISTANT_PROACTIVITY', group: 'assistant', jsonPath: 'assistant.proactivity', default: 'balanced' },
+  { key: 'ASSISTANT_RESPONSE_STYLE', group: 'assistant', jsonPath: 'assistant.responseStyle', default: 'balanced' },
+  { key: 'ASSISTANT_PROGRESS_VISIBILITY', group: 'assistant', jsonPath: 'assistant.progressVisibility', default: 'normal' },
+  { key: 'ASSISTANT_AUTONOMY', group: 'assistant', jsonPath: 'assistant.autonomy', default: 'balanced' },
+
   // Models
   { key: 'DEFAULT_MODEL_TIER', group: 'models', jsonPath: 'models.default', default: 'sonnet' },
   { key: 'HAIKU_MODEL', group: 'models', jsonPath: 'models.haiku', default: 'claude-haiku-4-5-20251001' },

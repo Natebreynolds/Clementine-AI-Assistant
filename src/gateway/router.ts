@@ -6,7 +6,7 @@
  */
 
 import path from 'node:path';
-import { appendFileSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import pino from 'pino';
 import { PersonalAssistant, type ProjectMeta } from '../agent/assistant.js';
 import { runWithTrace, logAuditJsonl } from '../agent/hooks.js';
@@ -20,8 +20,12 @@ import { TeamRouter } from '../agent/team-router.js';
 import { TeamBus } from '../agent/team-bus.js';
 import { events } from '../events/bus.js';
 import type { NotificationDispatcher } from './notifications.js';
+import { listBackgroundTasks } from '../agent/background-tasks.js';
+import { applyAssistantExperienceUpdate, detectLocalTurn, type AssistantExperienceUpdate } from '../agent/local-turn.js';
+import { updateClementineJson } from '../config/clementine-json.js';
 
 const logger = pino({ name: 'clementine.gateway' });
+const INTERACTIVE_FAILURE_LOG = path.join(BASE_DIR, 'self-improve', 'interactive-failures.jsonl');
 
 /** Idle timeout for interactive chat messages (10 minutes).
  *  Resets on agent activity (text/tool calls). Only kills if truly stuck.
@@ -160,6 +164,178 @@ export class Gateway {
       return true;
     }
     return false;
+  }
+
+  private isTrustedPersonalSession(sessionKey: string): boolean {
+    return sessionKey.startsWith('dashboard:')
+      || sessionKey.startsWith('cli:')
+      || sessionKey.startsWith('discord:user:')
+      || sessionKey.startsWith('discord:agent:')
+      || sessionKey.startsWith('slack:agent:')
+      || sessionKey.startsWith('slack:dm:')
+      || /^slack:team:[^:]+:(user|dm):/.test(sessionKey)
+      || sessionKey.startsWith('telegram:');
+  }
+
+  private runningUnleashedTasks(limit = 5): Array<{ name: string; status: string; phase?: unknown; updatedAt?: string }> {
+    const dir = path.join(BASE_DIR, 'unleashed');
+    if (!existsSync(dir)) return [];
+    const out: Array<{ name: string; status: string; phase?: unknown; updatedAt?: string }> = [];
+    try {
+      const names = readdirSync(dir)
+        .filter((name) => {
+          try { return statSync(path.join(dir, name)).isDirectory(); } catch { return false; }
+        });
+      for (const name of names) {
+        try {
+          const statusPath = path.join(dir, name, 'status.json');
+          if (!existsSync(statusPath)) continue;
+          const status = JSON.parse(readFileSync(statusPath, 'utf-8')) as Record<string, unknown>;
+          const state = String(status.status ?? 'running');
+          if (!['pending', 'running', 'active'].includes(state)) continue;
+          out.push({
+            name,
+            status: state,
+            phase: status.phase,
+            updatedAt: String(status.updatedAt ?? status.startedAt ?? ''),
+          });
+        } catch { /* skip malformed task */ }
+      }
+    } catch {
+      return [];
+    }
+    out.sort((a, b) => (b.updatedAt ?? '').localeCompare(a.updatedAt ?? ''));
+    return out.slice(0, limit);
+  }
+
+  private describeSessionStatus(sessionKey: string): string {
+    const sess = this.sessions.get(sessionKey);
+    const lines: string[] = [];
+
+    if (sess?.abortController && !sess.abortController.signal.aborted) {
+      lines.push('Foreground chat work is currently running for this conversation.');
+    }
+    if (sess?.lock) {
+      lines.push('This chat session is busy. A new message will interrupt and redirect it.');
+    }
+    if (sess?.deepTask) {
+      const elapsedMin = Math.max(0, Math.round((Date.now() - new Date(sess.deepTask.startedAt).getTime()) / 60_000));
+      lines.push(`Background task: ${sess.deepTask.taskDesc} (${elapsedMin} min, job ${sess.deepTask.jobName}).`);
+    }
+
+    const bgTasks = listBackgroundTasks({})
+      .filter((task) => task.status === 'pending' || task.status === 'running')
+      .slice(0, 5);
+    for (const task of bgTasks) {
+      lines.push(`Queued task ${task.id}: ${task.status}, from ${task.fromAgent}, max ${task.maxMinutes} min.`);
+    }
+
+    for (const task of this.runningUnleashedTasks(5)) {
+      const phase = task.phase == null ? '' : `, phase ${String(task.phase)}`;
+      lines.push(`Unleashed task ${task.name}: ${task.status}${phase}.`);
+    }
+
+    if (lines.length === 0) {
+      return 'Nothing is currently running for this chat. I am ready.';
+    }
+    return lines.join('\n');
+  }
+
+  private summarizeExperienceUpdates(updates: AssistantExperienceUpdate): string {
+    const labels: string[] = [];
+    if (updates.proactivity) labels.push(`proactivity = ${updates.proactivity}`);
+    if (updates.responseStyle) labels.push(`response style = ${updates.responseStyle}`);
+    if (updates.progressVisibility) labels.push(`progress updates = ${updates.progressVisibility}`);
+    if (updates.autonomy) labels.push(`autonomy = ${updates.autonomy}`);
+    return labels.join(', ');
+  }
+
+  private applyExperiencePreference(sessionKey: string, updates: AssistantExperienceUpdate): string {
+    const next = updateClementineJson(BASE_DIR, (current) => applyAssistantExperienceUpdate(current, updates));
+    const summary = this.summarizeExperienceUpdates(next.assistant ?? updates);
+    try {
+      const store = this.assistant.getMemoryStore?.();
+      const content = `- Assistant experience preference (${new Date().toISOString()}): ${summary}`;
+      store?.appendUserModelBlock?.({ slot: 'user_facts', content });
+      store?.logFeedback?.({
+        sessionKey,
+        channel: 'preference-learned',
+        rating: 'positive',
+        comment: `[high] ${summary}`,
+      });
+    } catch { /* best-effort memory signal */ }
+    return `Got it. I updated your assistant preferences: ${summary}.`;
+  }
+
+  private async handleLocalTurn(
+    sessionKey: string,
+    text: string,
+    onText?: OnTextCallback,
+  ): Promise<string | null> {
+    const intent = detectLocalTurn(text);
+    if (intent.kind === 'none') return null;
+    if (!this.isTrustedPersonalSession(sessionKey) && intent.kind !== 'stop') return null;
+
+    let response: string | null = null;
+    if (intent.kind === 'stop') {
+      const stopped = this.stopSession(sessionKey);
+      response = stopped ? 'Stopping the running work now.' : 'Nothing is currently running for this chat.';
+    } else if (intent.kind === 'ack') {
+      response = /^thanks|thank you|thx|ty$/i.test(text.trim()) ? 'Anytime.' : 'Got it.';
+    } else if (intent.kind === 'status') {
+      response = this.describeSessionStatus(sessionKey);
+    } else if (intent.kind === 'greeting') {
+      const status = this.describeSessionStatus(sessionKey);
+      response = status.startsWith('Nothing is currently running')
+        ? 'Hey. I am here and ready.'
+        : `Hey. I am here.\n${status}`;
+    } else if (intent.kind === 'preference_update') {
+      if (!this.isTrustedPersonalSession(sessionKey)) {
+        return null;
+      }
+      response = this.applyExperiencePreference(sessionKey, intent.updates);
+    }
+
+    if (!response) return null;
+    if (onText) {
+      try { await onText(response); } catch { /* channel streaming is best-effort */ }
+    }
+    return response;
+  }
+
+  private recordInteractiveFailure(
+    sessionKey: string,
+    text: string,
+    err: unknown,
+    stage: string,
+    details: Record<string, unknown> = {},
+  ): void {
+    const error = String(err).slice(0, 2000);
+    try {
+      mkdirSync(path.dirname(INTERACTIVE_FAILURE_LOG), { recursive: true });
+      appendFileSync(INTERACTIVE_FAILURE_LOG, JSON.stringify({
+        type: 'interactive_failure',
+        stage,
+        sessionKey,
+        channel: sessionKey.split(':')[0] ?? 'unknown',
+        textPreview: text.slice(0, 500),
+        error,
+        details,
+        createdAt: new Date().toISOString(),
+      }) + '\n');
+    } catch { /* evidence logging must not break chat */ }
+
+    try {
+      const store = this.assistant.getMemoryStore?.();
+      store?.logFeedback?.({
+        sessionKey,
+        channel: 'chat-failure',
+        messageSnippet: text.slice(0, 500),
+        responseSnippet: error.slice(0, 500),
+        rating: 'negative',
+        comment: `${stage}: ${error.slice(0, 500)}`,
+      });
+    } catch { /* memory may be unavailable */ }
   }
 
   // Notification dispatcher — set via setDispatcher() after startup
@@ -870,6 +1046,7 @@ export class Gateway {
           });
           return result;
         } catch (err) {
+          this.recordInteractiveFailure(sessionKey, text, err, 'message_failed');
           logAuditJsonl({
             event_type: 'message_failed',
             duration_ms: Date.now() - traceStart,
@@ -911,6 +1088,23 @@ export class Gateway {
       }
       // Allow this one message through as a probe to see if auth recovered
       logger.info({ sessionKey }, 'Auth circuit open — allowing probe message');
+    }
+
+    // Local control/status/preference turns must not wait behind a long SDK
+    // query. This is intentionally before the chat lane and session lock so
+    // Discord/Slack/dashboard users can stop work or ask what is running while
+    // another turn is active.
+    const localTurnStarted = Date.now();
+    const localResponse = await this.handleLocalTurn(sessionKey, text, onText);
+    if (localResponse !== null) {
+      logger.info({
+        sessionKey,
+        totalMs: Date.now() - tInnerStart,
+        chatMs: Date.now() - localTurnStarted,
+        localTurn: true,
+        responseLen: localResponse.length,
+      }, 'chat:latency');
+      return localResponse;
     }
 
     // Show "queued" status if either lane or session lock is contended,
@@ -1128,6 +1322,7 @@ export class Gateway {
                 }
               }).catch(async (err) => {
                 logger.error({ err, sessionKey, jobName }, 'Pre-flight deep-mode task failed');
+                this.recordInteractiveFailure(sessionKey, text, err, 'preflight_deep_mode_failed', { jobName });
                 const failMsg = `Background work failed: ${String(err).slice(0, 200)}`;
                 this.assistant.injectPendingContext(sessionKey, text, failMsg);
                 await this._deliverDeepResult(
@@ -1419,6 +1614,7 @@ export class Gateway {
               }
             }).catch(async (err) => {
               logger.error({ err, sessionKey, jobName }, 'Deep mode task failed');
+              this.recordInteractiveFailure(sessionKey, text, err, 'deep_mode_failed', { jobName, taskDesc });
               const failMsg = `Background work failed: ${String(err).slice(0, 200)}`;
               this.assistant.injectPendingContext(sessionKey, text, failMsg);
               await this._deliverDeepResult(
@@ -1467,6 +1663,7 @@ export class Gateway {
               }
             }).catch(async (err) => {
               logger.error({ err, sessionKey, jobName }, 'Auto-escalated deep mode failed');
+              this.recordInteractiveFailure(sessionKey, text, err, 'auto_escalated_deep_mode_failed', { jobName, toolActivityCount });
               const failMsg = `Background work failed: ${String(err).slice(0, 200)}`;
               this.assistant.injectPendingContext(sessionKey, text, failMsg);
               await this._deliverDeepResult(
@@ -1541,6 +1738,7 @@ export class Gateway {
               }
             }).catch(async (deepErr) => {
               logger.error({ err: deepErr, sessionKey, jobName }, 'Max-turns deep mode failed');
+              this.recordInteractiveFailure(sessionKey, text, deepErr, 'max_turns_deep_mode_failed', { jobName, toolActivityCount });
               const failMsg = `Background work failed: ${String(deepErr).slice(0, 200)}`;
               this.assistant.injectPendingContext(sessionKey, text, failMsg);
               await this._deliverDeepResult(

@@ -210,6 +210,12 @@ function getEnvOrJsonNumber(envKey: string, jsonValue: number | undefined, fallb
 export const ASSISTANT_NAME = getEnvOrJson('ASSISTANT_NAME', json.assistantName, 'Clementine');
 export const ASSISTANT_NICKNAME = getEnv('ASSISTANT_NICKNAME', 'Clemmy');
 export const OWNER_NAME = getEnvOrJson('OWNER_NAME', json.ownerName, '');
+export const ASSISTANT_EXPERIENCE = {
+  proactivity: getEnvOrJson('ASSISTANT_PROACTIVITY', json.assistant?.proactivity, 'balanced') as 'quiet' | 'balanced' | 'proactive' | 'operator',
+  responseStyle: getEnvOrJson('ASSISTANT_RESPONSE_STYLE', json.assistant?.responseStyle, 'balanced') as 'concise' | 'balanced' | 'detailed',
+  progressVisibility: getEnvOrJson('ASSISTANT_PROGRESS_VISIBILITY', json.assistant?.progressVisibility, 'normal') as 'quiet' | 'normal' | 'detailed',
+  autonomy: getEnvOrJson('ASSISTANT_AUTONOMY', json.assistant?.autonomy, 'balanced') as 'ask_first' | 'balanced' | 'act_when_safe',
+};
 
 // ── Secrets (with macOS Keychain fallback) ───────────────────────────
 

@@ -39,6 +39,7 @@ import { goalsRouter } from './routes/goals.js';
 import { delegationsRouter } from './routes/delegations.js';
 import { workflowsRouter } from './routes/workflows.js';
 import { digestRouter } from './routes/digest.js';
+import { loadClementineJson, updateClementineJson } from '../config/clementine-json.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -5102,16 +5103,16 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
   }
 
   const CONFIG_GROUPS: Array<{ label: string; keys: Array<{ key: string; label: string; hint?: string; type?: string }> }> = [
-    {
-      label: 'Assistant Identity',
-      keys: [
-        { key: 'ASSISTANT_NAME', label: 'Name', hint: 'Display name for the assistant' },
-        { key: 'ASSISTANT_NICKNAME', label: 'Nickname', hint: 'Short name / alias' },
-        { key: 'OWNER_NAME', label: 'Owner Name', hint: 'Your name (used in prompts)' },
-      ],
-    },
-    {
-      label: 'Model',
+	    {
+	      label: 'Assistant Identity',
+	      keys: [
+	        { key: 'ASSISTANT_NAME', label: 'Name', hint: 'Display name for the assistant' },
+	        { key: 'ASSISTANT_NICKNAME', label: 'Nickname', hint: 'Short name / alias' },
+	        { key: 'OWNER_NAME', label: 'Owner Name', hint: 'Your name (used in prompts)' },
+	      ],
+	    },
+	    {
+	      label: 'Model',
       keys: [
         { key: 'DEFAULT_MODEL_TIER', label: 'Default Tier', hint: 'haiku, sonnet, or opus', type: 'select:haiku,sonnet,opus' },
       ],
@@ -5238,18 +5239,72 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
     return result;
   }
 
-  function writeEnvValue(key: string, value: string): void {
-    let content = existsSync(ENV_PATH) ? readFileSync(ENV_PATH, 'utf-8') : '';
-    const re = new RegExp(`^${key}=.*$`, 'm');
+	  function writeEnvValue(key: string, value: string): void {
+	    let content = existsSync(ENV_PATH) ? readFileSync(ENV_PATH, 'utf-8') : '';
+	    const re = new RegExp(`^${key}=.*$`, 'm');
     if (re.test(content)) {
       content = content.replace(re, `${key}=${value}`);
     } else {
       content = content.trimEnd() + `\n${key}=${value}\n`;
     }
-    writeFileSync(ENV_PATH, content);
-  }
+	    writeFileSync(ENV_PATH, content);
+	  }
 
-  app.get('/api/settings', (_req, res) => {
+	  const ASSISTANT_PREF_OPTIONS = {
+	    proactivity: ['quiet', 'balanced', 'proactive', 'operator'],
+	    responseStyle: ['concise', 'balanced', 'detailed'],
+	    progressVisibility: ['quiet', 'normal', 'detailed'],
+	    autonomy: ['ask_first', 'balanced', 'act_when_safe'],
+	  } as const;
+
+	  app.get('/api/assistant-preferences', (_req, res) => {
+	    try {
+	      const assistant = loadClementineJson(BASE_DIR).assistant ?? {};
+	      res.json({
+	        ok: true,
+	        preferences: {
+	          proactivity: assistant.proactivity ?? 'balanced',
+	          responseStyle: assistant.responseStyle ?? 'balanced',
+	          progressVisibility: assistant.progressVisibility ?? 'normal',
+	          autonomy: assistant.autonomy ?? 'balanced',
+	        },
+	      });
+	    } catch (err) {
+	      res.status(500).json({ error: String(err) });
+	    }
+	  });
+
+	  app.put('/api/assistant-preferences', (req, res) => {
+	    try {
+	      const body = req.body as Record<string, unknown>;
+	      const nextPrefs: Record<string, string> = {};
+	      for (const [key, allowed] of Object.entries(ASSISTANT_PREF_OPTIONS)) {
+	        const value = body?.[key];
+	        if (value === undefined || value === '') continue;
+	        if (typeof value !== 'string' || !(allowed as readonly string[]).includes(value)) {
+	          res.status(400).json({ error: `Invalid ${key}` });
+	          return;
+	        }
+	        nextPrefs[key] = value;
+	      }
+	      const next = updateClementineJson(BASE_DIR, (current) => ({
+	        ...current,
+	        assistant: {
+	          ...(current.assistant ?? {}),
+	          ...nextPrefs,
+	        },
+	      }));
+	      if (next.assistant?.proactivity) process.env.ASSISTANT_PROACTIVITY = next.assistant.proactivity;
+	      if (next.assistant?.responseStyle) process.env.ASSISTANT_RESPONSE_STYLE = next.assistant.responseStyle;
+	      if (next.assistant?.progressVisibility) process.env.ASSISTANT_PROGRESS_VISIBILITY = next.assistant.progressVisibility;
+	      if (next.assistant?.autonomy) process.env.ASSISTANT_AUTONOMY = next.assistant.autonomy;
+	      res.json({ ok: true, preferences: next.assistant });
+	    } catch (err) {
+	      res.status(500).json({ error: String(err) });
+	    }
+	  });
+
+	  app.get('/api/settings', (_req, res) => {
     try {
       const env = parseEnvFile();
       const groups = CONFIG_GROUPS.map(g => ({
@@ -5317,11 +5372,14 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
       // next /api/composio/* call picks up the new key without a daemon
       // restart. Without this, "Save key → Connect Gmail" would 503 until
       // the user restarted, which defeats the dashboard-config UX.
-      if (key === 'COMPOSIO_API_KEY' || key === 'COMPOSIO_USER_ID') {
-        process.env[key] = value;
-        const { resetComposioClient } = await import('../integrations/composio/client.js');
-        resetComposioClient();
-      }
+	      if (key === 'COMPOSIO_API_KEY' || key === 'COMPOSIO_USER_ID') {
+	        process.env[key] = value;
+	        const { resetComposioClient } = await import('../integrations/composio/client.js');
+	        resetComposioClient();
+	      }
+	      if (key.startsWith('ASSISTANT_')) {
+	        process.env[key] = value;
+	      }
 
       res.json({ ok: true, message: `Updated ${key}` });
     } catch (err) {
@@ -5343,13 +5401,16 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
 
       // Hot-reload mirror of the PUT handler — drop process.env entry +
       // reset Composio client so removal takes effect without a restart.
-      if (key === 'COMPOSIO_API_KEY' || key === 'COMPOSIO_USER_ID') {
-        delete process.env[key];
-        const { resetComposioClient } = await import('../integrations/composio/client.js');
-        resetComposioClient();
-      }
+	      if (key === 'COMPOSIO_API_KEY' || key === 'COMPOSIO_USER_ID') {
+	        delete process.env[key];
+	        const { resetComposioClient } = await import('../integrations/composio/client.js');
+	        resetComposioClient();
+	      }
+	      if (key.startsWith('ASSISTANT_')) {
+	        delete process.env[key];
+	      }
 
-      res.json({ ok: true, message: `Removed ${key}` });
+	      res.json({ ok: true, message: `Removed ${key}` });
     } catch (err) {
       res.status(500).json({ error: String(err) });
     }
@@ -5473,6 +5534,83 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
       res.json({ ok: true, response: redacted, trace });
     } catch (err) {
       res.status(500).json({ error: String(err) });
+    }
+  });
+
+  app.post('/api/chat/stream', async (req, res) => {
+    const { message } = req.body;
+    if (!message || typeof message !== 'string') {
+      res.status(400).json({ error: 'message is required' });
+      return;
+    }
+
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      'Connection': 'keep-alive',
+    });
+
+    let closed = false;
+    req.on('close', () => { closed = true; });
+    const writeEvent = (type: string, data: Record<string, unknown> = {}) => {
+      if (closed) return;
+      try {
+        res.write(`data: ${JSON.stringify({ type, ...data })}\n\n`);
+      } catch {
+        closed = true;
+      }
+    };
+
+    try {
+      writeEvent('progress', { status: 'connecting...' });
+      const gateway = await getGateway();
+      const { redactSecrets } = await import('../security/redact.js');
+      let lastText = '';
+      const response = await gateway.handleMessage(
+        'dashboard:web',
+        message,
+        async (text) => {
+          const { text: redacted } = redactSecrets(text ?? '');
+          lastText = redacted;
+          writeEvent('text', { text: redacted });
+        },
+        undefined,
+        undefined,
+        async (toolName) => {
+          writeEvent('tool', { name: toolName });
+        },
+        async (status) => {
+          writeEvent('progress', { status });
+        },
+      );
+      const { text: redactedFinal } = redactSecrets(response ?? lastText ?? '');
+
+      let trace: {
+        id: number;
+        query: string;
+        retrievedAt: string;
+        chunkCount: number;
+      } | null = null;
+      try {
+        const store = (gateway as any).assistant?.memoryStore;
+        if (store?.getRecentRecallTraces) {
+          const traces = store.getRecentRecallTraces('dashboard:web', 1);
+          if (traces.length > 0) {
+            trace = {
+              id: traces[0].id,
+              query: traces[0].query,
+              retrievedAt: traces[0].retrievedAt,
+              chunkCount: traces[0].chunkIds.length,
+            };
+          }
+        }
+      } catch { /* trace is optional */ }
+
+      writeEvent('done', { response: redactedFinal, trace });
+      if (!closed) res.end();
+    } catch (err) {
+      writeEvent('error', { error: String(err) });
+      if (!closed) res.end();
     }
   });
 
@@ -19035,8 +19173,30 @@ async function refreshSettings() {
   try {
     var r = await apiFetch('/api/settings');
     var d = await r.json();
+    var prefResp = await apiFetch('/api/assistant-preferences');
+    var prefData = await prefResp.json();
+    var prefs = prefData.preferences || {};
     var groups = d.groups || [];
     var html = '';
+    function prefSelect(id, value, options) {
+      var out = '<select id="' + id + '" onchange="saveAssistantPreferences()" style="width:100%;padding:6px 10px;border:1px solid var(--border);border-radius:4px;background:var(--bg-secondary);color:var(--text-primary);font-size:13px">';
+      for (var i = 0; i < options.length; i++) {
+        var opt = options[i];
+        out += '<option value="' + esc(opt) + '"' + (value === opt ? ' selected' : '') + '>' + esc(opt) + '</option>';
+      }
+      return out + '</select>';
+    }
+    html += '<div class="card" style="margin-bottom:16px">'
+      + '<div class="card-header" style="display:flex;align-items:center;justify-content:space-between">'
+      + '<span>Assistant Experience</span>'
+      + '<span id="assistant-pref-status" style="font-size:11px;color:var(--text-muted)"></span>'
+      + '</div><div class="card-body" style="padding:16px">'
+      + '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:12px">'
+      + '<div><label style="font-weight:600;font-size:12px;color:var(--text-secondary)">Proactivity</label>' + prefSelect('pref-proactivity', prefs.proactivity || 'balanced', ['quiet','balanced','proactive','operator']) + '</div>'
+      + '<div><label style="font-weight:600;font-size:12px;color:var(--text-secondary)">Response style</label>' + prefSelect('pref-response-style', prefs.responseStyle || 'balanced', ['concise','balanced','detailed']) + '</div>'
+      + '<div><label style="font-weight:600;font-size:12px;color:var(--text-secondary)">Progress updates</label>' + prefSelect('pref-progress-visibility', prefs.progressVisibility || 'normal', ['quiet','normal','detailed']) + '</div>'
+      + '<div><label style="font-weight:600;font-size:12px;color:var(--text-secondary)">Autonomy</label>' + prefSelect('pref-autonomy', prefs.autonomy || 'balanced', ['ask_first','balanced','act_when_safe']) + '</div>'
+      + '</div></div></div>';
     for (var g of groups) {
       var anySet = g.fields.some(function(f) { return f.isSet; });
       var isAnthropicGroup = g.label === 'Anthropic';
@@ -19172,6 +19332,22 @@ async function saveSettingValue(key, value) {
   var statusEl = document.getElementById('setting-' + key + '-status');
   try {
     await apiJson('PUT', '/api/settings/' + encodeURIComponent(key), { value: value });
+    if (statusEl) { statusEl.textContent = 'Saved'; statusEl.style.color = 'var(--green)'; setTimeout(function(){ statusEl.textContent = ''; }, 2000); }
+  } catch(e) {
+    if (statusEl) { statusEl.textContent = 'Error'; statusEl.style.color = 'var(--red)'; }
+  }
+}
+
+async function saveAssistantPreferences() {
+  var statusEl = document.getElementById('assistant-pref-status');
+  var body = {
+    proactivity: document.getElementById('pref-proactivity')?.value || 'balanced',
+    responseStyle: document.getElementById('pref-response-style')?.value || 'balanced',
+    progressVisibility: document.getElementById('pref-progress-visibility')?.value || 'normal',
+    autonomy: document.getElementById('pref-autonomy')?.value || 'balanced',
+  };
+  try {
+    await apiJson('PUT', '/api/assistant-preferences', body);
     if (statusEl) { statusEl.textContent = 'Saved'; statusEl.style.color = 'var(--green)'; setTimeout(function(){ statusEl.textContent = ''; }, 2000); }
   } catch(e) {
     if (statusEl) { statusEl.textContent = 'Error'; statusEl.style.color = 'var(--red)'; }
@@ -19354,46 +19530,95 @@ async function sendChat() {
   sendBtn.disabled = true;
   sendBtn.textContent = 'Thinking...';
 
-  try {
-    const r = await apiFetch('/api/chat', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ message: msg }),
-    });
-    const d = await r.json();
+	  try {
+	    var asstRow = document.createElement('div');
+	    asstRow.className = 'chat-assistant-row';
+	    var chatAv = document.createElement('div');
+	    chatAv.className = 'chat-avatar-sm';
+	    chatAv.innerHTML = (lastStatusData.name || 'C').charAt(0).toUpperCase();
+	    asstRow.appendChild(chatAv);
+	    var asstBubble = document.createElement('div');
+	    asstBubble.className = 'chat-bubble assistant';
+	    asstBubble.innerHTML = '<span style="color:var(--text-muted);font-style:italic">connecting...</span>';
+	    var asstMeta = document.createElement('div');
+	    asstMeta.className = 'chat-meta';
+	    asstMeta.textContent = new Date().toLocaleTimeString();
+	    asstRow.appendChild(asstBubble);
+	    container.appendChild(asstRow);
+	    typing.remove();
+	    container.scrollTop = container.scrollHeight;
 
-    typing.remove();
-
-    var asstRow = document.createElement('div');
-    asstRow.className = 'chat-assistant-row';
-    var chatAv = document.createElement('div');
-    chatAv.className = 'chat-avatar-sm';
-    chatAv.innerHTML = (lastStatusData.name || 'C').charAt(0).toUpperCase();
-    asstRow.appendChild(chatAv);
-    var asstBubble = document.createElement('div');
-    asstBubble.className = 'chat-bubble assistant';
-    asstBubble.innerHTML = renderMd(d.response || d.error || 'No response');
-    var asstMeta = document.createElement('div');
-    asstMeta.className = 'chat-meta';
-    asstMeta.textContent = new Date().toLocaleTimeString();
-    asstBubble.appendChild(asstMeta);
-    // Recall trace affordance — shows which memory chunks powered this answer.
-    if (d.trace && d.trace.chunkCount > 0) {
-      var traceLink = document.createElement('div');
-      traceLink.className = 'chat-trace-link';
-      traceLink.style.cssText = 'margin-top:6px;font-size:11px;color:var(--text-muted);cursor:pointer;user-select:none';
-      traceLink.textContent = '🧠 ' + d.trace.chunkCount + ' source' + (d.trace.chunkCount === 1 ? '' : 's');
-      traceLink.dataset.traceId = String(d.trace.id);
-      traceLink.dataset.expanded = 'false';
-      traceLink.onclick = function() { toggleRecallTrace(traceLink); };
-      asstBubble.appendChild(traceLink);
-    }
-    asstRow.appendChild(asstBubble);
-    container.appendChild(asstRow);
-  } catch(e) {
-    typing.remove();
-    const errBubble = document.createElement('div');
-    errBubble.className = 'chat-bubble assistant';
+	    var finalText = '';
+	    var finalTrace = null;
+	    var sawStream = false;
+	    var r = await fetch('/api/chat/stream', {
+	      method: 'POST',
+	      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + _dashToken },
+	      body: JSON.stringify({ message: msg }),
+	    });
+	    if (!r.ok || !r.body) {
+	      var fallback = await r.text();
+	      throw new Error(fallback || ('HTTP ' + r.status));
+	    }
+	    var reader = r.body.getReader();
+	    var decoder = new TextDecoder();
+	    var buffer = '';
+	    function renderAssistantText(text) {
+	      asstBubble.innerHTML = renderMd(text || 'Working...');
+	      container.scrollTop = container.scrollHeight;
+	    }
+	    function appendTrace(trace) {
+	      if (!trace || !trace.chunkCount) return;
+	      var traceLink = document.createElement('div');
+	      traceLink.className = 'chat-trace-link';
+	      traceLink.style.cssText = 'margin-top:6px;font-size:11px;color:var(--text-muted);cursor:pointer;user-select:none';
+	      traceLink.textContent = '🧠 ' + trace.chunkCount + ' source' + (trace.chunkCount === 1 ? '' : 's');
+	      traceLink.dataset.traceId = String(trace.id);
+	      traceLink.dataset.expanded = 'false';
+	      traceLink.onclick = function() { toggleRecallTrace(traceLink); };
+	      asstBubble.appendChild(traceLink);
+	    }
+	    function handleEvent(evt) {
+	      if (!evt) return;
+	      sawStream = true;
+	      if (evt.type === 'text') {
+	        finalText = evt.text || '';
+	        renderAssistantText(finalText);
+	      } else if (evt.type === 'progress') {
+	        if (!finalText) renderAssistantText('*' + (evt.status || 'working...') + '*');
+	      } else if (evt.type === 'tool') {
+	        if (!finalText) renderAssistantText('*using ' + (evt.name || 'a tool') + '...*');
+	      } else if (evt.type === 'done') {
+	        finalText = evt.response || finalText || 'No response';
+	        finalTrace = evt.trace || null;
+	        renderAssistantText(finalText);
+	      } else if (evt.type === 'error') {
+	        throw new Error(evt.error || 'Stream error');
+	      }
+	    }
+	    while (true) {
+	      var read = await reader.read();
+	      if (read.done) break;
+	      buffer += decoder.decode(read.value, { stream: true });
+	      var parts = buffer.split('\\n\\n');
+	      buffer = parts.pop() || '';
+	      for (var i = 0; i < parts.length; i++) {
+	        var line = parts[i].split('\\n').find(function(l) { return l.indexOf('data: ') === 0; });
+	        if (!line) continue;
+	        handleEvent(JSON.parse(line.slice(6)));
+	      }
+	    }
+	    if (buffer.trim()) {
+	      var line = buffer.split('\\n').find(function(l) { return l.indexOf('data: ') === 0; });
+	      if (line) handleEvent(JSON.parse(line.slice(6)));
+	    }
+	    if (!sawStream && !finalText) renderAssistantText('No response');
+	    asstBubble.appendChild(asstMeta);
+	    appendTrace(finalTrace);
+	  } catch(e) {
+	    if (typing.parentNode) typing.remove();
+	    const errBubble = document.createElement('div');
+	    errBubble.className = 'chat-bubble assistant';
     errBubble.style.borderLeft = '3px solid var(--red)';
     errBubble.textContent = 'Error: ' + String(e);
     container.appendChild(errBubble);

@@ -163,6 +163,7 @@ export async function startSlack(
         undefined, // model
         undefined, // maxTurns
         async (toolName, toolInput) => { streamer.setToolStatus(friendlyToolName(toolName, toolInput)); },
+        async (status) => { streamer.setToolStatus(status); },
       );
       await streamer.finalize(response);
 

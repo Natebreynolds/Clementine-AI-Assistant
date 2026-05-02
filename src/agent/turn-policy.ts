@@ -19,6 +19,10 @@ export interface TurnPolicy {
   effort: 'low' | 'medium' | 'high';
   allowProactiveGoals: boolean;
   fetchLinks: boolean;
+  /** Do not resume the prior Claude SDK session for this turn. */
+  suppressSessionResume?: boolean;
+  /** Do not inject restored/pending/background context for this turn. */
+  suppressContextInjection?: boolean;
   reason: string;
 }
 
@@ -35,6 +39,32 @@ const GOAL_REF_RE = /\b(goal|goals|objective|objectives|blocker|next action|next
 const LOCAL_TOOL_RE = /\b(repo|repository|code|file|files|folder|directory|path|log|logs|config|build|test|typecheck|lint|npm|git|commit|push|pull|branch|diff|patch|edit|write|implement|fix|refactor|run)\b/i;
 const COMPLEX_RE = /\b(multiple|several|many|bulk|batch|parallel|deep mode|background|research|analyze|audit|review|across|end to end|entire)\b/i;
 const ADMIN_RE = /\b(self[- ]?update|restart|daemon|npm publish|publish to npm|doctor|integration|credential|env var|environment variable|set up|setup|configure)\b/i;
+const STANDALONE_GREETINGS = new Set([
+  'hi',
+  'hey',
+  'hey there',
+  'hello',
+  'hello there',
+  'yo',
+  'sup',
+  "what's up",
+  'whats up',
+  'good morning',
+  'good afternoon',
+  'good evening',
+  'morning',
+  'gm',
+]);
+
+export function isStandaloneGreeting(text: string): boolean {
+  const normalized = text
+    .trim()
+    .toLowerCase()
+    .replace(/^[^\w']+|[^\w']+$/g, '')
+    .replace(/\s+/g, ' ');
+  const withoutName = normalized.replace(/\s+clementine$/i, '');
+  return STANDALONE_GREETINGS.has(normalized) || STANDALONE_GREETINGS.has(withoutName);
+}
 
 function wordCount(text: string): number {
   const trimmed = text.trim();
@@ -96,6 +126,21 @@ export function decideTurnPolicy(input: TurnPolicyInput): TurnPolicy {
       allowProactiveGoals: true,
       fetchLinks: hasUrl,
       reason: 'explicit-full-surface',
+    };
+  }
+
+  if (isStandaloneGreeting(text)) {
+    return {
+      retrievalTier: 'none',
+      disableAllTools: true,
+      enableTeams: false,
+      maxTurns: 2,
+      effort: 'low',
+      allowProactiveGoals: false,
+      fetchLinks: false,
+      suppressSessionResume: true,
+      suppressContextInjection: true,
+      reason: 'standalone-greeting',
     };
   }
 

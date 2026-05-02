@@ -17,7 +17,7 @@
  * Cached by mtime so subsequent reads are O(1) absent file changes.
  */
 
-import { existsSync, readFileSync, statSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import pino from 'pino';
 import { z } from 'zod';
@@ -31,6 +31,12 @@ export const clementineJsonSchema = z.object({
   ownerName: z.string().optional(),
   assistantName: z.string().optional(),
   timezone: z.string().optional(),
+  assistant: z.object({
+    proactivity: z.enum(['quiet', 'balanced', 'proactive', 'operator']).optional(),
+    responseStyle: z.enum(['concise', 'balanced', 'detailed']).optional(),
+    progressVisibility: z.enum(['quiet', 'normal', 'detailed']).optional(),
+    autonomy: z.enum(['ask_first', 'balanced', 'act_when_safe']).optional(),
+  }).optional(),
   models: z.object({
     default: z.string().optional(),
     haiku: z.string().optional(),
@@ -107,6 +113,40 @@ export function loadClementineJson(baseDir: string): ClementineJson {
 
   cache.set(filePath, { mtime, data: parsed.data });
   return parsed.data;
+}
+
+/**
+ * Update clementine.json while preserving the validated schema. Invalid or
+ * missing files are treated as a minimal config and overwritten with a valid
+ * file. Runtime readers that call loadClementineJson() see the change on the
+ * next mtime miss.
+ */
+export function updateClementineJson(
+  baseDir: string,
+  updater: (current: ClementineJson) => ClementineJson,
+): ClementineJson {
+  const filePath = clementineJsonPath(baseDir);
+  let current: ClementineJson = { schemaVersion: 1 };
+  try {
+    if (existsSync(filePath)) {
+      const raw = JSON.parse(readFileSync(filePath, 'utf-8'));
+      const parsed = clementineJsonSchema.safeParse(raw);
+      if (parsed.success) current = parsed.data;
+    }
+  } catch {
+    current = { schemaVersion: 1 };
+  }
+
+  const next = clementineJsonSchema.parse({ ...updater(current), schemaVersion: 1 });
+  mkdirSync(path.dirname(filePath), { recursive: true });
+  writeFileSync(filePath, JSON.stringify(next, null, 2) + '\n', 'utf-8');
+  try {
+    const mtime = statSync(filePath).mtimeMs;
+    cache.set(filePath, { mtime, data: next });
+  } catch {
+    cache.delete(filePath);
+  }
+  return next;
 }
 
 /** Test-only: clear the loader cache. */

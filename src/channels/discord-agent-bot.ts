@@ -1041,6 +1041,9 @@ export class AgentBotClient {
         async (toolName: string, toolInput: Record<string, unknown>) => {
           streamer.setToolStatus(friendlyToolName(toolName, toolInput));
         },
+        async (status: string) => {
+          streamer.setToolStatus(status);
+        },
       );
       await streamer.finalize(response);
     } catch (err) {

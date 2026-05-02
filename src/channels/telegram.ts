@@ -87,6 +87,13 @@ class TelegramStreamingMessage {
     }
   }
 
+  setStatus(status: string): void {
+    if (!this.pendingText) this.pendingText = `_${status}_`;
+    if (Date.now() - this.lastEdit >= STREAM_UPDATE_INTERVAL) {
+      this.flush().catch(() => { /* best-effort */ });
+    }
+  }
+
   async finalize(text: string): Promise<void> {
     this.isFinal = true;
     if (!text) text = '_(no response)_';
@@ -183,6 +190,10 @@ export async function startTelegram(
         sessionKey,
         text,
         (t) => streamer.update(t),
+        undefined,
+        undefined,
+        async (toolName) => { streamer.setStatus(`using ${toolName}...`); },
+        async (status) => { streamer.setStatus(status); },
       );
       await streamer.finalize(response);
     } catch (err) {
@@ -216,6 +227,10 @@ export async function startTelegram(
         sessionKey,
         text,
         (t) => streamer.update(t),
+        undefined,
+        undefined,
+        async (toolName) => { streamer.setStatus(`using ${toolName}...`); },
+        async (status) => { streamer.setStatus(status); },
       );
       await streamer.finalize(response);
     } catch (err) {
@@ -253,6 +268,10 @@ export async function startTelegram(
         sessionKey,
         text,
         (t) => streamer.update(t),
+        undefined,
+        undefined,
+        async (toolName) => { streamer.setStatus(`using ${toolName}...`); },
+        async (status) => { streamer.setStatus(status); },
       );
       await streamer.finalize(response);
     } catch (err) {

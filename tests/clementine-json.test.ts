@@ -7,6 +7,7 @@ import {
   loadClementineJson,
   resolveNumber,
   resolveString,
+  updateClementineJson,
 } from '../src/config/clementine-json.js';
 import { migration as migration0005 } from '../src/vault-migrations/0005-create-clementine-json.js';
 
@@ -86,6 +87,25 @@ describe('loadClementineJson', () => {
     const cfg = loadClementineJson(baseDir);
     expect(cfg.models?.default).toBe('sonnet');
     expect(cfg.budgets?.cronT2).toBe(5.0);
+  });
+
+  it('persists assistant experience preferences', () => {
+    const cfg = updateClementineJson(baseDir, (current) => ({
+      ...current,
+      assistant: {
+        ...(current.assistant ?? {}),
+        proactivity: 'proactive',
+        responseStyle: 'concise',
+        progressVisibility: 'detailed',
+        autonomy: 'act_when_safe',
+      },
+    }));
+    expect(cfg.assistant?.proactivity).toBe('proactive');
+
+    const reloaded = loadClementineJson(baseDir);
+    expect(reloaded.assistant?.responseStyle).toBe('concise');
+    expect(reloaded.assistant?.progressVisibility).toBe('detailed');
+    expect(reloaded.assistant?.autonomy).toBe('act_when_safe');
   });
 });
 

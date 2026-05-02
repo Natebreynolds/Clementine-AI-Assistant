@@ -20,6 +20,28 @@ describe('turn policy', () => {
     expect(p.maxTurns).toBeLessThanOrEqual(3);
   });
 
+  it('isolates standalone greetings from stale action context', () => {
+    const p = policy('hey', true);
+
+    expect(p.reason).toBe('standalone-greeting');
+    expect(p.retrievalTier).toBe('none');
+    expect(p.disableAllTools).toBe(true);
+    expect(p.suppressSessionResume).toBe(true);
+    expect(p.suppressContextInjection).toBe(true);
+  });
+
+  it('isolates common standalone greeting variants', () => {
+    expect(policy('hey there', true).reason).toBe('standalone-greeting');
+    expect(policy('hi Clementine!', true).reason).toBe('standalone-greeting');
+  });
+
+  it('does not isolate greetings that include an explicit task', () => {
+    const p = policy('hey can you check the logs', true);
+
+    expect(p.suppressSessionResume).toBeUndefined();
+    expect(p.disableAllTools).toBe(false);
+  });
+
   it('does not fast-path explicit memory continuity requests', () => {
     const p = policy('what did I say last time about the release?');
 
