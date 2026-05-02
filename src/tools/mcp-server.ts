@@ -43,20 +43,44 @@ import { registerBuilderTools } from './builder-tools.js';
 const serverName = (env['ASSISTANT_NAME'] ?? 'Clementine').toLowerCase() + '-tools';
 const server = new McpServer({ name: serverName, version: '1.0.0' });
 
+function parseToolAllowlist(): Set<string> | null {
+  const configured = process.env.CLEMENTINE_TOOL_ALLOWLIST;
+  if (configured === undefined) return null;
+  const raw = configured.trim();
+  if (raw === '*') return null;
+  if (!raw) return new Set();
+  const names = raw.split(',').map(s => s.trim()).filter(Boolean);
+  return new Set(names);
+}
+
+const toolAllowlist = parseToolAllowlist();
+const scopedServer = new Proxy(server, {
+  get(target, prop, receiver) {
+    if (prop !== 'tool') return Reflect.get(target, prop, receiver);
+    return (name: string, ...args: unknown[]) => {
+      if (toolAllowlist && !toolAllowlist.has(name)) {
+        logger.debug({ tool: name }, 'Skipped MCP tool outside scoped allowlist');
+        return undefined;
+      }
+      return (target.tool as any)(name, ...args);
+    };
+  },
+}) as McpServer;
+
 // Register all tool groups
-registerMemoryTools(server);
-registerVaultTools(server);
-registerExternalTools(server);
-registerAdminTools(server);
-registerGoalTools(server);
-registerTeamTools(server);
-registerSessionTools(server);
-registerArtifactTools(server);
-registerBrainTools(server);
-registerAgentHeartbeatTools(server);
-registerBackgroundTaskTools(server);
-registerDecisionReflectionTools(server);
-registerBuilderTools(server);
+registerMemoryTools(scopedServer);
+registerVaultTools(scopedServer);
+registerExternalTools(scopedServer);
+registerAdminTools(scopedServer);
+registerGoalTools(scopedServer);
+registerTeamTools(scopedServer);
+registerSessionTools(scopedServer);
+registerArtifactTools(scopedServer);
+registerBrainTools(scopedServer);
+registerAgentHeartbeatTools(scopedServer);
+registerBackgroundTaskTools(scopedServer);
+registerDecisionReflectionTools(scopedServer);
+registerBuilderTools(scopedServer);
 
 // ── Main ────────────────────────────────────────────────────────────────
 
@@ -113,7 +137,7 @@ async function main() {
       }
 
       try {
-        server.tool(toolName, desc, { args: z.string().optional().describe(argsDesc) }, async ({ args }) => {
+        scopedServer.tool(toolName, desc, { args: z.string().optional().describe(argsDesc) }, async ({ args }) => {
           const { execSync } = await import('node:child_process');
           try {
             const result = execSync(`"${filePath}" ${args || ''}`, {
@@ -139,7 +163,7 @@ async function main() {
       try {
         const plugin = await import(path.join(pluginsDir, file));
         if (typeof plugin.register === 'function') {
-          await plugin.register(server, z, { textResult, externalResult, getStore, BASE_DIR, VAULT_DIR, logger });
+          await plugin.register(scopedServer, z, { textResult, externalResult, getStore, BASE_DIR, VAULT_DIR, logger });
           logger.info({ plugin: file }, 'Loaded plugin');
         } else {
           logger.warn({ plugin: file }, 'Plugin missing register() export — skipped');

@@ -59,6 +59,12 @@ export interface AssemblerOptions {
   identityPath?: string | null;
   /** Pre-rendered user model block (MemGPT-style core memory). */
   userModelBlock?: string | null;
+  /** Optional per-call caps used by adaptive retrieval tiers. */
+  userModelMaxChars?: number;
+  workingMemoryMaxChars?: number;
+  memoryMaxChars?: number;
+  skillMaxChars?: number;
+  graphMaxChars?: number;
 }
 
 /**
@@ -88,7 +94,7 @@ export async function assembleContext(options: AssemblerOptions): Promise<Assemb
     slots.push({
       name: 'user-model',
       priority: -1,
-      maxChars: isAutonomous ? 4000 : 8000,
+      maxChars: options.userModelMaxChars ?? (isAutonomous ? 4000 : 8000),
       minRemainingBudget: 0,
       resolve: (budget) => umBlock.length > budget ? umBlock.slice(0, budget) : umBlock,
     });
@@ -120,7 +126,7 @@ export async function assembleContext(options: AssemblerOptions): Promise<Assemb
     slots.push({
       name: 'working-memory',
       priority: 1,
-      maxChars: isAutonomous ? 1000 : 2000,
+      maxChars: options.workingMemoryMaxChars ?? (isAutonomous ? 1000 : 2000),
       minRemainingBudget: 0,
       resolve: (budget) => {
         if (!fs.existsSync(wmPath)) return '';
@@ -140,7 +146,7 @@ export async function assembleContext(options: AssemblerOptions): Promise<Assemb
     slots.push({
       name: 'skills',
       priority: 2,
-      maxChars: isAutonomous ? 1000 : 2000,
+      maxChars: options.skillMaxChars ?? (isAutonomous ? 1000 : 2000),
       minRemainingBudget: 500,
       resolve: (budget) => skillCtx.length > budget ? skillCtx.slice(0, budget) : skillCtx,
     });
@@ -157,7 +163,7 @@ export async function assembleContext(options: AssemblerOptions): Promise<Assemb
     slots.push({
       name: 'memory-recall',
       priority: 3,
-      maxChars: isAutonomous ? 2000 : 8000,
+      maxChars: options.memoryMaxChars ?? (isAutonomous ? 2000 : 8000),
       minRemainingBudget: 200,
       resolve: (budget) => formatResultsForPrompt(results, budget),
     });
@@ -169,7 +175,7 @@ export async function assembleContext(options: AssemblerOptions): Promise<Assemb
     slots.push({
       name: 'graph',
       priority: 4,
-      maxChars: 2000,
+      maxChars: options.graphMaxChars ?? 2000,
       minRemainingBudget: 500,
       resolve: (budget) => graphCtx.length > budget ? graphCtx.slice(0, budget) : graphCtx,
     });

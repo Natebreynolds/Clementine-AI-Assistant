@@ -28,6 +28,8 @@ const logger = pino({ name: 'clementine.stall-guard' });
 // Only block SDK read tools — MCP tools (memory_read, etc.) are intentionally
 // left unblocked to give the agent some information access while forced to act.
 const READ_ONLY_TOOLS = new Set(['Read', 'Glob', 'Grep', 'WebSearch', 'WebFetch']);
+const EXACT_DUPLICATE_BLOCK_AFTER = 3;
+const IDEMPOTENT_TOOL_RE = /^(Read|Glob|Grep|WebSearch|WebFetch|mcp__.*__(?:.*(?:search|list|get|read|inbox|calendar|query|overview|ranked_keywords|batch_get|screenshot|fetch|stats|timeline|connections).*))$/i;
 
 // ── Types ───────────────────────────────────────────────────────────
 
@@ -46,6 +48,7 @@ export class StallGuard {
   private breakerActive = false;
   private breakerReason = '';
   private toolCallLog: string[] = [];
+  private exactCallCounts = new Map<string, number>();
 
   /**
    * @param mode 'chat' (default) keeps full output-text-driven heuristics.
@@ -62,7 +65,7 @@ export class StallGuard {
    * When the breaker is active, denies read-only tools to force the agent
    * to either act (Write/Edit/Bash) or respond to the user.
    */
-  shouldBlockTool(toolName: string): { block: boolean; message?: string } {
+  shouldBlockTool(toolName: string, input?: Record<string, unknown>): { block: boolean; message?: string } {
     if (this.breakerActive && READ_ONLY_TOOLS.has(toolName)) {
       return {
         block: true,
@@ -71,6 +74,18 @@ export class StallGuard {
           `STOP reading. Either perform a write/action tool call (Write, Edit, Bash, etc.) to complete the task, ` +
           `or respond to the user explaining what is blocking you. Do NOT call another read-only tool.`,
       };
+    }
+    if (input && IDEMPOTENT_TOOL_RE.test(toolName)) {
+      const key = this.callKey(toolName, input);
+      const seen = this.exactCallCounts.get(key) ?? 0;
+      if (seen >= EXACT_DUPLICATE_BLOCK_AFTER) {
+        return {
+          block: true,
+          message:
+            `Duplicate tool call blocked: ${toolName} has already been called ${seen} times with identical input in this turn. ` +
+            `Use the result you already have, change the query/input, or explain what remains uncertain.`,
+        };
+      }
     }
     return { block: false };
   }
@@ -92,6 +107,8 @@ export class StallGuard {
    */
   recordToolCall(toolName: string, input: Record<string, unknown>): void {
     const wasDenied = this.breakerActive && READ_ONLY_TOOLS.has(toolName);
+    const key = this.callKey(toolName, input);
+    this.exactCallCounts.set(key, (this.exactCallCounts.get(key) ?? 0) + 1);
 
     // Tool loop detector
     const loopCheck = this.loopDetector.recordCall(toolName, input);
@@ -151,5 +168,9 @@ export class StallGuard {
   private activate(reason: string): void {
     this.breakerActive = true;
     this.breakerReason = reason;
+  }
+
+  private callKey(toolName: string, input: Record<string, unknown>): string {
+    return `${toolName}:${JSON.stringify(input)}`;
   }
 }

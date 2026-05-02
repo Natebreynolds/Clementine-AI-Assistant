@@ -96,7 +96,8 @@ import { PromptCache } from './prompt-cache.js';
 import { searchSkills as searchSkillsSync } from './skill-extractor.js';
 import { classifyIntent, getStrategyGuidance, type IntentClassification } from './intent-classifier.js';
 import { getEventLog } from './session-event-log.js';
-import { routeToolSurface, TOOL_SURFACE_WARN_THRESHOLD } from './tool-router.js';
+import { routeToolSurface, TOOL_SURFACE_WARN_THRESHOLD, type ToolRouteDecision } from './tool-router.js';
+import { decideTurnPolicy, type RetrievalTier, type TurnPolicy } from './turn-policy.js';
 
 // ── Channel capabilities ────────────────────────────────────────────
 
@@ -370,6 +371,123 @@ function mcpTool(name: string): string {
   return `mcp__${TOOLS_SERVER}__${name}`;
 }
 
+const CLEMENTINE_CORE_TOOL_NAMES = [
+  'working_memory',
+  'user_model',
+  'memory_read',
+  'memory_search',
+  'memory_recall',
+  'transcript_search',
+  'vault_stats',
+  'daily_note',
+] as const;
+
+const CLEMENTINE_MEMORY_WRITE_TOOL_NAMES = [
+  'memory_write',
+  'note_create',
+  'note_take',
+  'task_list',
+  'task_add',
+  'task_update',
+] as const;
+
+const CLEMENTINE_RELATIONSHIP_TOOL_NAMES = [
+  'memory_connections',
+  'memory_timeline',
+] as const;
+
+const CLEMENTINE_INTEGRATION_TOOL_NAMES = [
+  'env_set',
+  'env_list',
+  'env_unset',
+  'integration_status',
+  'list_integrations',
+  'setup_integration',
+  'auth_profile_status',
+] as const;
+
+const CLEMENTINE_ADMIN_TOOL_NAMES = [
+  'allow_tool',
+  'list_allowed_tools',
+  'disallow_tool',
+  'refresh_tool_inventory',
+  'refresh_skills',
+  'self_restart',
+  'self_update',
+  'where_is_source',
+  'cron_list',
+  'add_cron_job',
+  'memory_report',
+  'memory_correct',
+  'feedback_log',
+  'feedback_report',
+] as const;
+
+const CLEMENTINE_TEAM_TOOL_NAMES = [
+  'team_list',
+  'team_message',
+  'create_agent',
+  'update_agent',
+  'delete_agent',
+  'delegate_task',
+  'check_delegation',
+] as const;
+
+const CLEMENTINE_GOAL_TOOL_NAMES = [
+  'goal_create',
+  'goal_update',
+  'goal_list',
+  'goal_get',
+  'goal_work',
+] as const;
+
+const CLEMENTINE_JOB_TOOL_NAMES = [
+  'cron_progress_read',
+  'cron_progress_write',
+  'session_pause',
+  'session_resume',
+  'heartbeat_queue_work',
+] as const;
+
+const CLEMENTINE_COMM_TOOL_NAMES = [
+  'set_timer',
+  'outlook_inbox',
+  'outlook_search',
+  'outlook_calendar',
+  'outlook_draft',
+  'outlook_send',
+  'outlook_read_email',
+  'discord_channel_send',
+] as const;
+
+const CLEMENTINE_RESEARCH_TOOL_NAMES = [
+  'rss_fetch',
+  'github_prs',
+  'browser_screenshot',
+  'analyze_image',
+  'web_search',
+] as const;
+
+const CLEMENTINE_WORKSPACE_TOOL_NAMES = [
+  'workspace_config',
+  'workspace_list',
+  'workspace_info',
+] as const;
+
+const CLEMENTINE_ALL_TOOL_NAMES = [
+  ...CLEMENTINE_CORE_TOOL_NAMES,
+  ...CLEMENTINE_MEMORY_WRITE_TOOL_NAMES,
+  ...CLEMENTINE_RELATIONSHIP_TOOL_NAMES,
+  ...CLEMENTINE_INTEGRATION_TOOL_NAMES,
+  ...CLEMENTINE_ADMIN_TOOL_NAMES,
+  ...CLEMENTINE_TEAM_TOOL_NAMES,
+  ...CLEMENTINE_GOAL_TOOL_NAMES,
+  ...CLEMENTINE_JOB_TOOL_NAMES,
+  ...CLEMENTINE_COMM_TOOL_NAMES,
+  ...CLEMENTINE_RESEARCH_TOOL_NAMES,
+  ...CLEMENTINE_WORKSPACE_TOOL_NAMES,
+] as const;
+
 // Lazy-load MCP bridge (sync after first import)
 let _mcpBridge: typeof import('./mcp-bridge.js') | null = null;
 import('./mcp-bridge.js').then(m => { _mcpBridge = m; }).catch(err => logger.debug({ err }, 'MCP bridge lazy-load failed'));
@@ -586,6 +704,15 @@ function extractText(blocks: ContentBlock[]): string {
     .join('');
 }
 
+function stringifyToolResultContent(content: unknown): string {
+  if (typeof content === 'string') return content;
+  try {
+    return JSON.stringify(content);
+  } catch {
+    return String(content);
+  }
+}
+
 // ── Date Helpers ────────────────────────────────────────────────────
 
 function formatDate(d: Date): string {
@@ -616,6 +743,14 @@ interface TraceEntry {
   type: string;
   timestamp: string;
   content: string;
+}
+
+interface RetrievedContext {
+  text: string;
+  tier: RetrievalTier;
+  charsUsed: number;
+  slotsIncluded: string[];
+  slotsSkipped: string[];
 }
 
 // ── Cron Output Extraction ──────────────────────────────────────────
@@ -1274,14 +1409,18 @@ export class PersonalAssistant {
     model?: string | null;
     verboseLevel?: VerboseLevel;
     intentClassification?: IntentClassification | null;
+    contextTier?: RetrievalTier;
+    toolsAvailable?: boolean;
     /** Slugs of Composio toolkits with at least one active connection. The
      *  agent gets a preference rule pointing it to these tools over the
      *  Claude Desktop counterparts (mcp__claude_ai_*) for overlapping
      *  services like Outlook/M365, Gmail, Google Drive, Slack, etc. */
     composioConnectedSlugs?: string[];
   } = {}): { stable: string; volatile: string } {
-    const { isHeartbeat = false, cronTier = null, retrievalContext = '', profile = null, sessionKey = null, model = null, verboseLevel, intentClassification = null, composioConnectedSlugs = [] } = opts;
+    const { isHeartbeat = false, cronTier = null, retrievalContext = '', profile = null, sessionKey = null, model = null, verboseLevel, intentClassification = null, contextTier = 'full', toolsAvailable = true, composioConnectedSlugs = [] } = opts;
     const isAutonomous = isHeartbeat || cronTier !== null;
+    const skipAmbientContext = contextTier === 'none';
+    const lightweightTurn = !toolsAvailable && !isAutonomous;
     // `parts` = stable prefix (cacheable across turns). `volatileParts` =
     // suffix that changes per-turn (date/time, live integration status).
     // Split is enforced so the SDK can attach a cache_control: ephemeral
@@ -1307,7 +1446,7 @@ export class PersonalAssistant {
       const soulEntry = this.promptCache.get(SOUL_FILE);
       if (soulEntry) {
         // Autonomous runs only need identity, not full personality guidance
-        parts.push(isAutonomous ? soulEntry.content.slice(0, 1500) : soulEntry.content);
+        parts.push(isAutonomous || lightweightTurn ? soulEntry.content.slice(0, 1500) : soulEntry.content);
       }
     }
 
@@ -1317,7 +1456,8 @@ export class PersonalAssistant {
     // responses filling the context window. The `[CONTEXT RECOVERED]`
     // prefix already tells agents these rules, but only AFTER thrash. This
     // block lands them in the cacheable prefix so they're active from turn 1.
-    parts.push(`## Output discipline (required to avoid context thrashing)
+    if (toolsAvailable) {
+      parts.push(`## Output discipline (required to avoid context thrashing)
 
 Large tool outputs blow the context window and rotate your session mid-task — you lose state and start over. Prevent it:
 
@@ -1328,9 +1468,10 @@ Large tool outputs blow the context window and rotate your session mid-task — 
 - **Summarize as you go**: if you've done 5+ tool calls in a turn, write a one-line progress note to working memory before the next call. That state survives if the session rotates.
 
 **If you see "[CONTEXT RECOVERED]"** in your next prompt: the session was just rotated mid-work because output ballooned. Read the "progress so far" notes, DO NOT repeat completed work, and continue from where you left off with tighter outputs.`);
+    }
 
     // Skip AGENTS.md for autonomous runs — not relevant for heartbeats/cron
-    if (!isAutonomous) {
+    if (!isAutonomous && !lightweightTurn) {
       const agentsEntry = this.promptCache.get(AGENTS_FILE);
       if (agentsEntry) parts.push(agentsEntry.content);
     }
@@ -1342,7 +1483,7 @@ Large tool outputs blow the context window and rotate your session mid-task — 
         `If the user mentions a person and memory shows their last known status or project, weave that in conversationally. ` +
         `Only reference if genuinely relevant — do not force callbacks to old context.*`,
       );
-    } else {
+    } else if (!skipAmbientContext) {
       // Fallback: inject working memory + MEMORY.md directly when no retrieval context
       const _wmFileFallback = agentWorkingMemoryFile(profile?.slug ?? null);
       if (fs.existsSync(_wmFileFallback)) {
@@ -1367,7 +1508,7 @@ Large tool outputs blow the context window and rotate your session mid-task — 
     }
 
     // Load agent-specific MEMORY.md if running as a team agent
-    if (profile?.agentDir) {
+    if (profile?.agentDir && !lightweightTurn) {
       const agentMemPath = path.join(profile.agentDir, 'MEMORY.md');
       // Start watching if not already watched
       this.promptCache.watch(agentMemPath);
@@ -1377,13 +1518,13 @@ Large tool outputs blow the context window and rotate your session mid-task — 
       }
     }
 
-    const todayEntry = this.promptCache.get(todayPath);
+    const todayEntry = !skipAmbientContext ? this.promptCache.get(todayPath) : null;
     if (todayEntry) {
       parts.push(`## Today's Notes (${todayISO()})\n\n${todayEntry.content}`);
     }
 
     // Skip yesterday's notes and recent conversation summaries for autonomous runs
-    if (!isAutonomous) {
+    if (!isAutonomous && !skipAmbientContext) {
       if (!retrievalContext) {
         const hour = new Date().getHours();
         const mentionsYesterday = this._lastUserMessage?.toLowerCase().includes('yesterday');
@@ -1435,6 +1576,10 @@ After 3 auto-fix attempts on a single issue, stop working on it. Document what y
       parts.push(`## Autonomous Execution
 
 Follow your Execution Framework pipeline even in autonomous mode. If a task is too large for a single run, break it into phases. Complete phase 1 fully before moving on. Document what's done and what's next in your output so the next run can continue.`);
+    } else if (lightweightTurn) {
+      parts.push(`## Lightweight Turn
+
+Tools and memory retrieval are intentionally not attached for this low-risk turn. Answer directly from the visible conversation and do not claim to have checked files, memory, or external services.`);
     } else {
       parts.push(`## Vault (\`${vault}\`)
 
@@ -1523,7 +1668,7 @@ Never spawn a sub-agent with vague instructions like "handle this brief."
     }
 
     // Inject hot corrections (explicit behavioral corrections from recent sessions)
-    if (this.hotCorrections.length > 0) {
+    if (this.hotCorrections.length > 0 && !lightweightTurn) {
       const recentCutoff = Date.now() - 24 * 60 * 60 * 1000; // last 24 hours
       const recent = this.hotCorrections.filter(c => new Date(c.timestamp).getTime() > recentCutoff);
       if (recent.length > 0) {
@@ -1538,7 +1683,7 @@ Never spawn a sub-agent with vague instructions like "handle this brief."
     // filter consumed them. We surface aggregates + the last few commented
     // negatives so the agent can self-adjust on the next turn. Skipped when
     // there's nothing to report (no noise).
-    if (this.memoryStore?.getRecentFeedbackSignals) {
+    if (this.memoryStore?.getRecentFeedbackSignals && !lightweightTurn) {
       try {
         const sig = this.memoryStore.getRecentFeedbackSignals({ days: 14, limit: 3 });
         if (sig.negative > 0) {
@@ -1559,7 +1704,7 @@ Never spawn a sub-agent with vague instructions like "handle this brief."
     }
 
     // Proactive skill injection: match user message against skill triggers
-    if (this._lastUserMessage && !isAutonomous) {
+    if (this._lastUserMessage && !isAutonomous && !lightweightTurn) {
       try {
         const suppressedNames = this.memoryStore?.getSkillsToSuppress?.(profile?.slug);
         const matchedSkills = searchSkillsSync(this._lastUserMessage, 1, profile?.slug, { suppressedNames });
@@ -1610,16 +1755,16 @@ Never spawn a sub-agent with vague instructions like "handle this brief."
     }
 
     // Skip communication preferences and agentic instructions for autonomous runs
-    if (!isAutonomous) {
+    if (!isAutonomous && !lightweightTurn) {
       // Shared communication preferences (all agents)
       const feedbackFile = path.join(VAULT_DIR, '00-System', 'FEEDBACK.md');
       const fbEntry = this.promptCache.get(feedbackFile);
-      if (fbEntry?.data?.patterns_summary) {
+      if (fbEntry?.data?.patterns_summary && !lightweightTurn) {
         parts.push(`## Communication Preferences\n\n${fbEntry.data.patterns_summary}`);
       }
 
       // Agent-specific preferences (per-agent overrides)
-      if (profile?.agentDir) {
+      if (profile?.agentDir && !lightweightTurn) {
         const agentPrefsFile = path.join(profile.agentDir, 'PREFERENCES.md');
         this.promptCache.watch(agentPrefsFile);
         const agentPrefs = this.promptCache.get(agentPrefsFile);
@@ -1632,7 +1777,7 @@ Never spawn a sub-agent with vague instructions like "handle this brief."
       const userModelFile = path.join(VAULT_DIR, '00-System', 'USER_MODEL.md');
       this.promptCache.watch(userModelFile);
       const userModel = this.promptCache.get(userModelFile);
-      if (userModel?.data) {
+      if (userModel?.data && !lightweightTurn) {
         const expertise = userModel.data.expertise ? `Expertise: ${Object.entries(userModel.data.expertise as Record<string, string>).map(([k, v]) => `${k}=${v}`).join(', ')}` : '';
         const priorities = userModel.data.priorities ? `Priorities: ${(userModel.data.priorities as string[]).slice(0, 3).join('; ')}` : '';
         const comm = userModel.data.communication ? `Communication: ${Object.entries(userModel.data.communication as Record<string, string>).map(([k, v]) => `${k}=${v}`).join(', ')}` : '';
@@ -1643,9 +1788,11 @@ Never spawn a sub-agent with vague instructions like "handle this brief."
       }
 
       // Proactive feedback capture
-      parts.push(`## Feedback Capture
+      if (!lightweightTurn) {
+        parts.push(`## Feedback Capture
 
 When ${owner} expresses satisfaction ("nice", "perfect", "great job", "thanks") or dissatisfaction ("no", "wrong", "that's not right", "ugh"), call \`feedback_log\` with an appropriate rating ('positive' or 'negative') and a brief comment summarizing the context. This helps me learn from interactions.`);
+      }
 
       // Verbose level overrides
       if (verboseLevel === 'quiet') {
@@ -1660,7 +1807,7 @@ When ${owner} expresses satisfaction ("nice", "perfect", "great job", "thanks") 
       }
 
       // Autonomous delegation and agent coaching (only for primary agent, not team agents)
-      if (!profile) {
+      if (!profile && !lightweightTurn) {
         parts.push(`## Autonomous Delegation
 
 You have team agents you can delegate to. Use \`delegate_task\` to assign work that falls in their domain:
@@ -1687,7 +1834,8 @@ When new team agents are loaded or existing agents produce subpar results:
       }
 
       // Orchestrator trigger mechanics (philosophy lives in SOUL.md's Execution Framework)
-      parts.push(`## Orchestrator Triggers
+      if (!lightweightTurn) {
+        parts.push(`## Orchestrator Triggers
 
 When a task is complex, output \`[PLAN_NEEDED: brief description]\` as the FIRST line of your response. The system will decompose it into parallel sub-steps with fresh context per worker.
 
@@ -1704,7 +1852,7 @@ When a task is complex, output \`[PLAN_NEEDED: brief description]\` as the FIRST
 **State persistence:** For complex inline work, use \`session_pause\` to save progress if work is getting heavy or might be interrupted. Resume later via \`session_resume\`.`);
 
       // Agentic work protocol — replaces the old "Execution Guard"
-      parts.push(`## Agentic Work Protocol
+        parts.push(`## Agentic Work Protocol
 
 ### Before Acting
 **Always respond to ${owner} first.** Before making tool calls, write a brief line about what you're doing and why:
@@ -1744,6 +1892,7 @@ If you're stuck after reading several files, tell ${owner} what's blocking you. 
 
 ### Pacing
 You have a cost budget per message — not a hard turn limit. Work until the task is done. For long tasks (10+ tool calls), narrate progress as you go so ${owner} can see you're making headway. If a task needs many database queries, keep result sets small (LIMIT 20) to avoid filling context.`);
+      }
     }
 
     // Security rules are now appended to systemPrompt in buildOptions()
@@ -1754,7 +1903,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
     // cacheable stable prefix above.
 
     // Integration status — changes as owner adds credentials.
-    if (!isAutonomous) {
+    if (!isAutonomous && toolsAvailable) {
       try {
         const summary = summarizeIntegrationStatus(envSnapshot());
         if (summary) volatileParts.push(`## Integration Status\n\n${summary}\n\nCall \`integration_status\`, \`list_integrations\`, or \`setup_integration\` for details.`);
@@ -1771,7 +1920,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
     // tokens, and only the affected services are listed (~50 chars each).
     // Compare to the previous hardcoded block which was ~700 chars on
     // every turn regardless.
-    if (!isAutonomous) {
+    if (!isAutonomous && toolsAvailable) {
       try {
         const composioSet = new Set(composioConnectedSlugs);
         const cdIntegrations = loadClaudeIntegrations();
@@ -1798,7 +1947,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
     // cron/heartbeat don't have a "user feeling frustrated" axis to react to,
     // and inflating their prompt doesn't help. Only injected when at least
     // one signal fires — keeps the prompt clean during normal sessions.
-    if (!isAutonomous) {
+    if (!isAutonomous && !lightweightTurn) {
       try {
         const since24h = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
         const since7d = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
@@ -1892,6 +2041,8 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
     outputFormat?: { type: 'json_schema'; schema: Record<string, unknown> };
     stallGuard?: StallGuard;
     intentClassification?: IntentClassification;
+    turnPolicy?: TurnPolicy;
+    contextRoutingText?: string;
   } = {}): Promise<SDKOptions> {
     const {
       isHeartbeat = false,
@@ -1916,170 +2067,149 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
       outputFormat,
       stallGuard,
       intentClassification,
+      turnPolicy,
+      contextRoutingText,
     } = opts;
 
     const isCron = cronTier !== null;
     const toolsDisabledForCall = disableAllTools || (isHeartbeat && !isCron);
-    const toolRoute = routeToolSurface(toolScopeText);
+    const promptScopeText = toolScopeText ?? '';
+    const profileScopeText = [profile?.description, profile?.systemPromptBody]
+      .filter(Boolean)
+      .join('\n');
+    const directScopeText = [promptScopeText, profileScopeText].filter(Boolean).join('\n');
+    const emptyToolRoute = (): ToolRouteDecision => ({
+        bundles: [],
+        externalMcpServers: [],
+        composioToolkits: [],
+        inheritFullClaudeEnv: false,
+        fullSurface: false,
+        reason: 'empty',
+      });
+    const mergeToolRoutes = (primary: ToolRouteDecision, secondary: ToolRouteDecision): ToolRouteDecision => {
+      if (primary.fullSurface) return primary;
+      const bundles = [...new Set([...primary.bundles, ...secondary.bundles])];
+      const externalMcpServers = [...new Set([
+        ...(primary.externalMcpServers ?? []),
+        ...(secondary.externalMcpServers ?? []),
+      ])];
+      const composioToolkits = [...new Set([
+        ...(primary.composioToolkits ?? []),
+        ...(secondary.composioToolkits ?? []),
+      ])];
+      return {
+        bundles,
+        externalMcpServers,
+        composioToolkits,
+        inheritFullClaudeEnv: primary.inheritFullClaudeEnv || secondary.inheritFullClaudeEnv,
+        fullSurface: false,
+        reason: bundles.length > 0 ? 'matched' : 'empty',
+      };
+    };
+    const promptToolRoute = routeToolSurface(promptScopeText);
+    const profileToolRoute = routeToolSurface(profileScopeText);
+    const contextToolRoute = routeToolSurface(contextRoutingText);
+    const safeProfileToolRoute = profileToolRoute.fullSurface ? emptyToolRoute() : profileToolRoute;
+    const safeContextToolRoute = contextToolRoute.fullSurface ? emptyToolRoute() : contextToolRoute;
+    const toolRoute = mergeToolRoutes(
+      promptToolRoute,
+      mergeToolRoutes(safeProfileToolRoute, safeContextToolRoute),
+    );
 
-    let allowedTools = [
-      'Read', 'Write', 'Edit', 'Bash', 'Glob', 'Grep',
-      'WebSearch', 'WebFetch',
-      mcpTool('working_memory'),
-      mcpTool('user_model'),
-      mcpTool('memory_read'),
-      mcpTool('memory_write'),
-      mcpTool('memory_search'),
-      mcpTool('memory_recall'),
-      mcpTool('note_create'),
-      mcpTool('task_list'),
-      mcpTool('task_add'),
-      mcpTool('task_update'),
-      mcpTool('note_take'),
-      mcpTool('memory_connections'),
-      mcpTool('memory_timeline'),
-      mcpTool('transcript_search'),
-      mcpTool('vault_stats'),
-      mcpTool('daily_note'),
-      mcpTool('rss_fetch'),
-      mcpTool('github_prs'),
-      mcpTool('browser_screenshot'),
-      mcpTool('set_timer'),
-      mcpTool('outlook_inbox'),
-      mcpTool('outlook_search'),
-      mcpTool('outlook_calendar'),
-      mcpTool('outlook_draft'),
-      mcpTool('outlook_send'),
-      mcpTool('outlook_read_email'),
-      mcpTool('analyze_image'),
-      mcpTool('discord_channel_send'),
-      mcpTool('workspace_config'),
-      mcpTool('workspace_list'),
-      mcpTool('workspace_info'),
-      // Env file self-management (owner-DM gated inside the tool)
-      mcpTool('env_set'),
-      mcpTool('env_list'),
-      mcpTool('env_unset'),
-      // Integration registry — proactive configuration
-      mcpTool('integration_status'),
-      mcpTool('list_integrations'),
-      mcpTool('setup_integration'),
-      mcpTool('auth_profile_status'),
-      // Self-service tool whitelist — Clementine can add tools she discovers
-      // in the SDK init inventory but that aren't in her baseline allowedTools
-      mcpTool('allow_tool'),
-      mcpTool('list_allowed_tools'),
-      mcpTool('disallow_tool'),
-      mcpTool('refresh_tool_inventory'),
-      mcpTool('refresh_skills'),
-      mcpTool('self_restart'),
-      mcpTool('self_update'),
-      mcpTool('where_is_source'),
-      mcpTool('cron_list'),
-      mcpTool('add_cron_job'),
-      mcpTool('memory_report'),
-      mcpTool('memory_correct'),
-      mcpTool('feedback_log'),
-      mcpTool('feedback_report'),
-      mcpTool('team_list'),
-      mcpTool('team_message'),
-      mcpTool('create_agent'),
-      mcpTool('update_agent'),
-      mcpTool('delete_agent'),
-      mcpTool('goal_create'),
-      mcpTool('goal_update'),
-      mcpTool('goal_list'),
-      mcpTool('goal_get'),
-      mcpTool('goal_work'),
-      mcpTool('cron_progress_read'),
-      mcpTool('cron_progress_write'),
-      mcpTool('delegate_task'),
-      mcpTool('check_delegation'),
-      mcpTool('session_pause'),
-      mcpTool('session_resume'),
-      mcpTool('web_search'),
-      mcpTool('heartbeat_queue_work'),
-    ];
+    let allowedTools: string[] = [];
+    const addAllowed = (...tools: string[]) => {
+      for (const tool of tools) {
+        if (tool && !allowedTools.includes(tool)) allowedTools.push(tool);
+      }
+    };
+    const addClementineTools = (tools: readonly string[]) => {
+      addAllowed(...tools.map(mcpTool));
+    };
 
-    if (enableTeams) {
-      allowedTools.push('Task', 'Agent');
-    }
+    const scopeText = [
+      directScopeText,
+      contextRoutingText,
+    ].filter(Boolean).join('\n').toLowerCase();
+    const promptScopeLower = promptScopeText.toLowerCase();
+    const autonomousToolRun = isHeartbeat || isCron || isPlanStep || isUnleashed;
+    const taskIntent = intentClassification?.type === 'task' || autonomousToolRun;
+    const memoryNeeded = autonomousToolRun
+      || retrievalContext.trim().length > 0
+      || (turnPolicy?.retrievalTier !== undefined && turnPolicy.retrievalTier !== 'none');
+    const localReadNeeded = taskIntent || /\b(repo|repository|code|file|files|folder|directory|path|log|logs|config|read|show|grep|diff|search)\b/i.test(promptScopeLower);
+    const localWriteNeeded = taskIntent || /\b(write|edit|fix|implement|refactor|build|test|run|npm|git|commit|push|pull|deploy|install|configure)\b/i.test(promptScopeLower);
+    const adminNeeded = toolRoute.fullSurface || /\b(self[- ]?update|restart|daemon|doctor|env|credential|integration|setup|set up|configure|npm publish|publish to npm)\b/i.test(promptScopeLower);
 
-    // Include dynamically registered tools (user scripts + plugins)
-    try {
-      const toolsDir = path.join(BASE_DIR, 'tools');
-      const pluginsDir = path.join(BASE_DIR, 'plugins');
-      if (fs.existsSync(toolsDir)) {
-        for (const f of fs.readdirSync(toolsDir).filter(f => f.endsWith('.sh') || f.endsWith('.py'))) {
-          const toolName = f.replace(/\.(sh|py)$/, '').replace(/[^a-z0-9_]/gi, '_');
-          allowedTools.push(mcpTool(toolName));
+    if (!toolsDisabledForCall) {
+      if (toolRoute.fullSurface) {
+        addAllowed('Read', 'Write', 'Edit', 'Bash', 'Glob', 'Grep', 'WebSearch', 'WebFetch');
+        addClementineTools(CLEMENTINE_ALL_TOOL_NAMES);
+      } else {
+        if (localReadNeeded) addAllowed('Read', 'Glob', 'Grep');
+        if (localWriteNeeded) addAllowed('Write', 'Edit', 'Bash');
+        if (toolRoute.bundles.includes('web_research') || toolRoute.bundles.includes('docs_lookup')) {
+          addAllowed('WebSearch', 'WebFetch');
+        }
+
+        if (memoryNeeded) {
+          addClementineTools(CLEMENTINE_CORE_TOOL_NAMES);
+          addClementineTools(CLEMENTINE_RELATIONSHIP_TOOL_NAMES);
+        }
+        if (taskIntent || intentClassification?.type === 'correction') {
+          addClementineTools(CLEMENTINE_MEMORY_WRITE_TOOL_NAMES);
+          addClementineTools(CLEMENTINE_WORKSPACE_TOOL_NAMES);
+        } else if (memoryNeeded) {
+          addAllowed(mcpTool('task_list'));
+        }
+        if (intentClassification?.type === 'feedback' || intentClassification?.type === 'correction') {
+          addAllowed(mcpTool('feedback_log'), mcpTool('memory_correct'));
+        }
+        if (turnPolicy?.allowProactiveGoals || autonomousToolRun || /\b(goal|goals|blocker|next action|priority)\b/i.test(scopeText)) {
+          addClementineTools(CLEMENTINE_GOAL_TOOL_NAMES);
+        }
+        if (adminNeeded) {
+          addClementineTools(CLEMENTINE_INTEGRATION_TOOL_NAMES);
+          addClementineTools(CLEMENTINE_ADMIN_TOOL_NAMES);
+        }
+        if (toolRoute.bundles.includes('email_outlook') || /\b(outlook|email|mailbox|inbox|calendar|follow-?up)\b/i.test(scopeText)) {
+          addClementineTools(CLEMENTINE_COMM_TOOL_NAMES);
+        }
+        if (toolRoute.bundles.includes('github') || toolRoute.bundles.includes('browser') || toolRoute.bundles.includes('web_research')) {
+          addClementineTools(CLEMENTINE_RESEARCH_TOOL_NAMES);
+        }
+        if (enableTeams) {
+          addAllowed('Task', 'Agent');
+          addClementineTools(CLEMENTINE_TEAM_TOOL_NAMES);
+          addClementineTools(CLEMENTINE_JOB_TOOL_NAMES);
         }
       }
-      if (fs.existsSync(pluginsDir)) {
-        for (const f of fs.readdirSync(pluginsDir).filter(f => f.endsWith('.js') || f.endsWith('.mjs'))) {
-          // Read manifest if available, otherwise skip (tools registered by plugins are auto-discovered)
-          const manifestPath = path.join(pluginsDir, f.replace(/\.(js|mjs)$/, '.json'));
-          if (fs.existsSync(manifestPath)) {
-            try {
-              const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf-8'));
-              if (Array.isArray(manifest.tools)) {
-                for (const t of manifest.tools) allowedTools.push(mcpTool(t));
+
+      // Include local user scripts/plugins for task-like or explicit full-surface turns.
+      if (taskIntent || toolRoute.fullSurface || adminNeeded) {
+        try {
+          const toolsDir = path.join(BASE_DIR, 'tools');
+          const pluginsDir = path.join(BASE_DIR, 'plugins');
+          if (fs.existsSync(toolsDir)) {
+            for (const f of fs.readdirSync(toolsDir).filter(f => f.endsWith('.sh') || f.endsWith('.py'))) {
+              const toolName = f.replace(/\.(sh|py)$/, '').replace(/[^a-z0-9_]/gi, '_');
+              addAllowed(mcpTool(toolName));
+            }
+          }
+          if (fs.existsSync(pluginsDir)) {
+            for (const f of fs.readdirSync(pluginsDir).filter(f => f.endsWith('.js') || f.endsWith('.mjs'))) {
+              const manifestPath = path.join(pluginsDir, f.replace(/\.(js|mjs)$/, '.json'));
+              if (fs.existsSync(manifestPath)) {
+                try {
+                  const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf-8'));
+                  if (Array.isArray(manifest.tools)) {
+                    for (const t of manifest.tools) if (typeof t === 'string') addAllowed(mcpTool(t));
+                  }
+                } catch { /* skip */ }
               }
-            } catch { /* skip */ }
+            }
           }
-        }
+        } catch { /* non-fatal — dynamic tools are supplementary */ }
       }
-    } catch { /* non-fatal — dynamic tools are supplementary */ }
-
-    // Merge the SDK's probed tool inventory. On daemon startup we run a
-    // one-shot query with no whitelist to discover every tool Claude Code
-    // surfaces (mcp__claude_ai_* connectors, plugins, custom MCP servers,
-    // built-ins). The inventory is cached 24h. This makes the whitelist
-    // match whatever the *current user* has connected — no per-install
-    // hardcoding of tool names in the system prompt or code.
-    try {
-      const inv = _mcpBridge?.loadToolInventory();
-      if (inv && Array.isArray(inv.tools)) {
-        for (const t of inv.tools) {
-          if (typeof t === 'string' && !allowedTools.includes(t)) allowedTools.push(t);
-        }
-      }
-    } catch { /* non-fatal */ }
-
-    // Self-service extension — Clementine can add tools to her own whitelist
-    // at runtime via the `allow_tool` MCP tool, writing to allowed-tools-
-    // extra.json. Covers the case where a user connects a new integration
-    // between daemon startup probes (< 24h window).
-    try {
-      const extraPath = path.join(BASE_DIR, 'allowed-tools-extra.json');
-      if (fs.existsSync(extraPath)) {
-        const extras = JSON.parse(fs.readFileSync(extraPath, 'utf-8')) as string[];
-        if (Array.isArray(extras)) {
-          for (const t of extras) {
-            if (typeof t === 'string' && !allowedTools.includes(t)) allowedTools.push(t);
-          }
-        }
-      }
-    } catch { /* non-fatal */ }
-
-    // Agent tool whitelist: filter down to only allowed tools
-    if (profile?.team?.allowedTools?.length) {
-      const whitelist = new Set(profile.team.allowedTools.flatMap(t => [t, mcpTool(t)]));
-      // Always allow core SDK tools
-      ['Read', 'Glob', 'Grep'].forEach(t => whitelist.add(t));
-      // Always allow team tools for team agents
-      whitelist.add(mcpTool('team_message'));
-      whitelist.add(mcpTool('team_list'));
-      // Always allow orchestration tools so agents can manage long-running work
-      whitelist.add(mcpTool('heartbeat_queue_work'));
-      whitelist.add(mcpTool('delegate_task'));
-      whitelist.add(mcpTool('check_delegation'));
-      whitelist.add(mcpTool('goal_create'));
-      whitelist.add(mcpTool('goal_update'));
-      whitelist.add(mcpTool('goal_list'));
-      whitelist.add(mcpTool('goal_get'));
-      whitelist.add(mcpTool('goal_work'));
-      allowedTools = allowedTools.filter(t => whitelist.has(t));
     }
 
     // Heartbeats get full restrictions. Cron jobs tier 2+ get Bash/Write/Edit.
@@ -2158,6 +2288,8 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
 
     const { stable, volatile: volatilePromptPart } = this.buildSystemPrompt({
       isHeartbeat, cronTier: isPlanStep ? null : cronTier, retrievalContext, profile, sessionKey, model, verboseLevel, intentClassification,
+      contextTier: turnPolicy?.retrievalTier ?? (retrievalContext ? 'full' : 'core'),
+      toolsAvailable: !toolsDisabledForCall,
       composioConnectedSlugs,
     });
 
@@ -2215,7 +2347,9 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
 
     // ── Compute adaptive thinking ─────────────────────────────────
     const supportsThinking = !resolvedModel.includes('haiku');
-    const needsThinking = !isHeartbeat && (isPlanStep || isUnleashed || !isCron);
+    const needsThinking = !isHeartbeat
+      && computedEffort !== 'low'
+      && (isPlanStep || isUnleashed || (!isCron && !toolsDisabledForCall));
     const computedThinking = thinking ?? (
       supportsThinking && needsThinking ? { type: 'adaptive' as const } : undefined
     );
@@ -2246,6 +2380,71 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
       }
     } catch { /* non-fatal — run with just Clementine's own server */ }
 
+    if (!toolsDisabledForCall) {
+      const mountedExternalServers = new Set([
+        ...Object.keys(externalMcpServers),
+        ...Object.keys(composioMcpServers),
+      ]);
+      const serverNameFromTool = (tool: string): string | null => {
+        if (!tool.startsWith('mcp__')) return null;
+        const rest = tool.slice('mcp__'.length);
+        const idx = rest.indexOf('__');
+        return idx > 0 ? rest.slice(0, idx) : null;
+      };
+
+      // Merge only the SDK inventory entries for the servers selected for
+      // this turn. The previous behavior merged every cached connector tool
+      // into every allowlist, which recreated a large schema surface even
+      // when MCP spawning had been routed down.
+      try {
+        const inv = _mcpBridge?.loadToolInventory();
+        if (inv && Array.isArray(inv.tools)) {
+          for (const t of inv.tools) {
+            if (typeof t !== 'string') continue;
+            if (toolRoute.fullSurface || !t.startsWith('mcp__')) {
+              addAllowed(t);
+              continue;
+            }
+            const server = serverNameFromTool(t);
+            if (server && mountedExternalServers.has(server)) addAllowed(t);
+          }
+        }
+      } catch { /* non-fatal */ }
+
+      // Self-service extras stay opt-in: explicit full-surface/admin turns can
+      // use newly allowed tools before the next inventory refresh, but routine
+      // chat does not inherit every historical extra.
+      if (toolRoute.fullSurface || adminNeeded) {
+        try {
+          const extraPath = path.join(BASE_DIR, 'allowed-tools-extra.json');
+          if (fs.existsSync(extraPath)) {
+            const extras = JSON.parse(fs.readFileSync(extraPath, 'utf-8')) as string[];
+            if (Array.isArray(extras)) {
+              for (const t of extras) if (typeof t === 'string') addAllowed(t);
+            }
+          }
+        } catch { /* non-fatal */ }
+      }
+
+      // Agent tool whitelist: filter down to only allowed tools after dynamic
+      // inventory is merged so profile constraints apply to every source.
+      if (profile?.team?.allowedTools?.length) {
+        const whitelist = new Set(profile.team.allowedTools.flatMap(t => [t, mcpTool(t)]));
+        ['Read', 'Glob', 'Grep'].forEach(t => whitelist.add(t));
+        whitelist.add(mcpTool('team_message'));
+        whitelist.add(mcpTool('team_list'));
+        whitelist.add(mcpTool('heartbeat_queue_work'));
+        whitelist.add(mcpTool('delegate_task'));
+        whitelist.add(mcpTool('check_delegation'));
+        whitelist.add(mcpTool('goal_create'));
+        whitelist.add(mcpTool('goal_update'));
+        whitelist.add(mcpTool('goal_list'));
+        whitelist.add(mcpTool('goal_get'));
+        whitelist.add(mcpTool('goal_work'));
+        allowedTools = allowedTools.filter(t => whitelist.has(t));
+      }
+    }
+
     // Permission mode: always 'bypassPermissions' — this is a daemon/harness with no interactive
     // terminal, so 'auto' mode (which requires plan support + human approval) doesn't apply.
     const effectivePermissionMode = 'bypassPermissions';
@@ -2260,6 +2459,26 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
     const mcpServerNames = toolsDisabledForCall
       ? []
       : [TOOLS_SERVER, ...Object.keys(externalMcpServers), ...Object.keys(composioMcpServers)];
+    const clementineToolPrefix = `mcp__${TOOLS_SERVER}__`;
+    const clementineToolAllowlist = toolRoute.fullSurface
+      ? '*'
+      : allowedTools
+        .filter(t => t.startsWith(clementineToolPrefix))
+        .map(t => t.slice(clementineToolPrefix.length))
+        .join(',');
+    const clementineToolAllowlistCount = clementineToolAllowlist === '*'
+      ? CLEMENTINE_ALL_TOOL_NAMES.length
+      : clementineToolAllowlist.split(',').filter(Boolean).length;
+    if (allowedTools.length > TOOL_SURFACE_WARN_THRESHOLD) {
+      logger.warn({
+        sessionKey,
+        allowedToolCount: allowedTools.length,
+        clementineToolAllowlistCount,
+        threshold: TOOL_SURFACE_WARN_THRESHOLD,
+        bundles: toolRoute.bundles,
+        fullSurface: toolRoute.fullSurface,
+      }, 'SDK allowed tool surface above warning threshold');
+    }
     logger.info({
       bundles: toolRoute.bundles,
       fullSurface: toolRoute.fullSurface,
@@ -2268,6 +2487,9 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
       externalMcpServers: toolRoute.externalMcpServers,
       composioToolkits: toolRoute.composioToolkits,
       mcpServerNames,
+      allowedToolCount: toolsDisabledForCall ? 0 : allowedTools.length,
+      clementineToolAllowlistCount: toolsDisabledForCall ? 0 : clementineToolAllowlistCount,
+      clementineToolAllowlistMode: clementineToolAllowlist === '*' ? 'all' : 'scoped',
       toolsDisabledForCall,
       isolateClaudeConfig,
       inheritFullClaudeEnv: shouldInheritClaudeEnv,
@@ -2289,11 +2511,13 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
       ...(computedTaskBudget && supportsTaskBudget ? { taskBudget: { total: computedTaskBudget } } : {}),
       // SDK field semantics (per node_modules/@anthropic-ai/claude-agent-sdk/sdk.d.ts):
       //   - `tools`        → which built-in tools the model can see (Read, Bash, Task, …)
-      //   - `mcpServers`   → MCP servers to spawn; all their declared tools are exposed automatically
-      //   - `allowedTools` → auto-allow list covering both built-ins AND MCP tool names
-      //                      (MCP names MUST live here, not in `tools` — that was the bug
-      //                      producing `<tool_use_error>No such tool available: mcp__*__*`
-      //                      for every Extension and custom stdio server).
+      //   - `mcpServers`   → MCP servers to spawn; schemas come from those servers.
+      //                      Clementine's own server is additionally scoped by
+      //                      CLEMENTINE_TOOL_ALLOWLIST so unneeded internal tools
+      //                      are never registered for lightweight turns.
+      //   - `allowedTools` → auto-allow list covering both built-ins AND MCP tool
+      //                      names; MCP names stay here so bypassPermissions has
+      //                      explicit grants for every exposed external server.
       //   - `disallowedTools` → blocklist, takes precedence.
       tools: toolsDisabledForCall ? [] : allowedTools.filter(t => !t.startsWith('mcp__')),
       allowedTools: toolsDisabledForCall ? [] : allowedTools,
@@ -2317,6 +2541,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
               CLEMENTINE_HOME: BASE_DIR,
               CLEMENTINE_TEAM_AGENT: profile?.slug ?? 'clementine',
               CLEMENTINE_INTERACTION_SOURCE: sourceOverride ?? inferInteractionSource(sessionKey),
+              CLEMENTINE_TOOL_ALLOWLIST: clementineToolAllowlist,
             },
           },
           ...externalMcpServers,
@@ -2343,7 +2568,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
       canUseTool: async (toolName: string, toolInput: Record<string, unknown>, _options: { signal: AbortSignal; toolUseID: string }) => {
         // Per-query stall guard (no global state — scoped to this query)
         if (stallGuard) {
-          const stallCheck = stallGuard.shouldBlockTool(toolName);
+          const stallCheck = stallGuard.shouldBlockTool(toolName, toolInput);
           if (stallCheck.block) {
             // When the breaker engages we also abort the whole query —
             // denying a single tool isn't enough for a runaway loop,
@@ -2372,8 +2597,16 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
     agentSlug?: string,
     isAutonomous?: boolean,
     strictIsolation?: boolean,
-  ): Promise<string> {
-    if (!this.memoryStore) return '';
+    tier: RetrievalTier = 'full',
+  ): Promise<RetrievedContext> {
+    const empty = (reasonTier: RetrievalTier = tier): RetrievedContext => ({
+      text: '',
+      tier: reasonTier,
+      charsUsed: 0,
+      slotsIncluded: [],
+      slotsSkipped: [],
+    });
+    if (!this.memoryStore || tier === 'none') return empty();
 
     try {
       const queryParts = [userMessage];
@@ -2392,29 +2625,35 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
         enrichedQuery = enrichedQuery.slice(0, 1000);
       }
 
+      const useSearch = tier === 'search' || tier === 'full';
+      const useDense = tier === 'full';
+      const useProceduralAndGraph = tier === 'full';
+
       // Pre-compute dense query embedding if the model is ready. Done outside
       // searchContext (which is sync) so the dense path doesn't force the
       // entire call chain to be async. If embedDense fails or isn't available,
       // searchContext falls back to TF-IDF.
       let queryDenseVec: Float32Array | undefined;
       try {
-        if (embeddingsModule.isDenseReady()) {
+        if (useDense && embeddingsModule.isDenseReady()) {
           const v = await embeddingsModule.embedDense(enrichedQuery, true);
           if (v) queryDenseVec = v;
         }
       } catch { /* fallback to sparse */ }
 
-      const results = this.memoryStore.searchContext(
-        enrichedQuery,
-        {
-          limit: SEARCH_CONTEXT_LIMIT,
-          recencyLimit: SEARCH_RECENCY_LIMIT,
-          agentSlug,
-          strict: strictIsolation,
-          sessionKey: sessionKey ?? undefined,
-          queryDenseVec,
-        },
-      );
+      const results = useSearch
+        ? this.memoryStore.searchContext(
+          enrichedQuery,
+          {
+            limit: tier === 'full' ? SEARCH_CONTEXT_LIMIT : Math.min(SEARCH_CONTEXT_LIMIT, 4),
+            recencyLimit: tier === 'full' ? SEARCH_RECENCY_LIMIT : Math.min(SEARCH_RECENCY_LIMIT, 2),
+            agentSlug,
+            strict: strictIsolation,
+            sessionKey: sessionKey ?? undefined,
+            queryDenseVec,
+          },
+        )
+        : [];
 
       if (results?.length > 0) {
         const accessedIds = results
@@ -2444,6 +2683,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
       const [skillContext, graphContext] = await Promise.all([
         // Skills
         (async (): Promise<string | undefined> => {
+          if (!useProceduralAndGraph) return undefined;
           try {
             const { searchSkills, recordSkillUse } = await import('./skill-extractor.js');
             const suppressedNames = this.memoryStore?.getSkillsToSuppress?.(agentSlug || undefined);
@@ -2467,6 +2707,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
         })(),
         // Graph relationships
         (async (): Promise<string | undefined> => {
+          if (!useProceduralAndGraph) return undefined;
           try {
             const { getSharedGraphStore } = await import('../memory/graph-store.js');
             const { GRAPH_DB_DIR } = await import('../config.js');
@@ -2511,8 +2752,29 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
       } catch { userModelBlock = null; }
 
       // Assemble context within a priority-based budget
+      const budgetByTier: Record<RetrievalTier, {
+        total: number;
+        userModel: number;
+        working: number;
+        memory: number;
+        skills: number;
+        graph: number;
+      }> = {
+        none: { total: 0, userModel: 0, working: 0, memory: 0, skills: 0, graph: 0 },
+        core: { total: 3000, userModel: 1800, working: 900, memory: 0, skills: 0, graph: 0 },
+        search: { total: 7000, userModel: 2500, working: 1200, memory: 3500, skills: 0, graph: 0 },
+        full: {
+          total: SYSTEM_PROMPT_MAX_CONTEXT_CHARS,
+          userModel: isAutonomous ? 4000 : 8000,
+          working: isAutonomous ? 1000 : 2000,
+          memory: isAutonomous ? 2000 : 8000,
+          skills: isAutonomous ? 1000 : 2000,
+          graph: 2000,
+        },
+      };
+      const budget = budgetByTier[tier];
       const assembled = await assembleContext({
-        totalBudget: SYSTEM_PROMPT_MAX_CONTEXT_CHARS,
+        totalBudget: budget.total,
         identityPath: IDENTITY_FILE,
         workingMemoryPath: agentWorkingMemoryFile(agentSlug ?? null),
         memoryResults: results,
@@ -2520,11 +2782,22 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
         graphContext,
         userModelBlock,
         isAutonomous: isAutonomous ?? false,
+        userModelMaxChars: budget.userModel,
+        workingMemoryMaxChars: budget.working,
+        memoryMaxChars: budget.memory,
+        skillMaxChars: budget.skills,
+        graphMaxChars: budget.graph,
       });
 
-      return assembled.text;
+      return {
+        text: assembled.text,
+        tier,
+        charsUsed: assembled.charsUsed,
+        slotsIncluded: assembled.slotsIncluded,
+        slotsSkipped: assembled.slotsSkipped,
+      };
     } catch {
-      return '';
+      return empty();
     }
   }
 
@@ -2800,17 +3073,29 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
     // strategy, maxTurns, and effort level
     const recentExchanges = key ? this.lastExchanges.get(key) : undefined;
     const intent = classifyIntent(text, recentExchanges);
-    logger.debug({ intent: intent.type, confidence: intent.confidence, strategy: intent.suggestedStrategy }, 'Intent classified');
+    const turnPolicy = decideTurnPolicy({
+      text,
+      intent,
+      hasRecentContext: !!(recentExchanges?.length || (key && this.sessions.has(key))),
+    });
+    logger.debug({
+      intent: intent.type,
+      confidence: intent.confidence,
+      strategy: intent.suggestedStrategy,
+      turnPolicy,
+    }, 'Intent classified');
 
     // If caller explicitly passed maxTurns (e.g. cron), respect it.
-    // Otherwise let the agent run — cost budget is the primary guardrail.
-    const effectiveMaxTurns = maxTurns;
+    // Otherwise apply the turn policy. Complex/routed turns still get their
+    // normal budget; lightweight turns get bounded maxTurns so they cannot
+    // wander into tool/setup loops.
+    const effectiveMaxTurns = maxTurns ?? turnPolicy.maxTurns;
 
     const CHAT_TIMEOUT_MS = 30 * 60 * 1000;
     const guard = new StallGuard();
 
     let [responseText, sessionId] = await this.runQuery(
-      effectivePrompt, key, onText, model, profile, securityAnnotation, effectiveMaxTurns, projectOverride, onToolActivity, verboseLevel, abortController, guard, CHAT_TIMEOUT_MS, intent,
+      effectivePrompt, key, onText, model, profile, securityAnnotation, effectiveMaxTurns, projectOverride, onToolActivity, verboseLevel, abortController, guard, CHAT_TIMEOUT_MS, intent, turnPolicy,
     );
 
     // If we got a context-length / prompt-too-long error, retry with a fresh session
@@ -2834,7 +3119,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
           `If this task involves pulling data for multiple entities, delegate each to a sub-agent using the Agent tool ` +
           `instead of calling data-heavy tools directly.\n\n${text}`;
       }
-      [responseText, sessionId] = await this.runQuery(retryPrompt, key, onText, model, profile, securityAnnotation, maxTurns, undefined, onToolActivity, verboseLevel, abortController);
+      [responseText, sessionId] = await this.runQuery(retryPrompt, key, onText, model, profile, securityAnnotation, maxTurns, undefined, onToolActivity, verboseLevel, abortController, undefined, CHAT_TIMEOUT_MS, intent, turnPolicy);
     }
 
     // Track exchange count, timestamp, and last exchange.
@@ -2947,14 +3232,23 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
     stallGuard?: StallGuard,
     timeoutMs?: number,
     intentClassification?: IntentClassification,
+    turnPolicy?: TurnPolicy,
   ): Promise<[string, string]> {
     // Parallelize context retrieval and project matching — they're independent
     // If a project override is set, skip auto-matching entirely
     const hasActiveSession = !!(sessionKey && this.sessions.has(sessionKey));
+    const effectiveTurnPolicy = turnPolicy ?? (intentClassification
+      ? decideTurnPolicy({
+        text: prompt,
+        intent: intentClassification,
+        hasRecentContext: hasActiveSession || ((sessionKey ? this.lastExchanges.get(sessionKey)?.length : 0) ?? 0) > 0,
+      })
+      : undefined);
+    const retrievalTier = effectiveTurnPolicy?.retrievalTier ?? 'full';
     const [rawContext, autoMatchedProject, linkContexts] = await Promise.all([
-      this.retrieveContext(prompt, sessionKey, profile?.slug, false, profile?.strictMemoryIsolation ?? (profile ? true : false)),
+      this.retrieveContext(prompt, sessionKey, profile?.slug, false, profile?.strictMemoryIsolation ?? (profile ? true : false), retrievalTier),
       Promise.resolve(projectOverride || hasActiveSession ? null : matchProject(prompt)),
-      extractLinks(prompt),
+      effectiveTurnPolicy?.fetchLinks === false ? Promise.resolve([]) : extractLinks(prompt),
     ]);
     // Resolve project: explicit override > auto-match > profile binding
     let matchedProject = projectOverride ?? autoMatchedProject;
@@ -2969,8 +3263,8 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
       }
     }
     let retrievalContext = securityAnnotation
-      ? `${securityAnnotation}\n\n${rawContext}`
-      : rawContext;
+      ? `${securityAnnotation}\n\n${rawContext.text}`
+      : rawContext.text;
 
     // Prepend fetched link content so the agent has it without a tool call
     if (linkContexts.length > 0) {
@@ -3004,7 +3298,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
     const goalContext = this.matchGoals(prompt);
     if (goalContext) {
       retrievalContext += goalContext;
-    } else {
+    } else if (effectiveTurnPolicy?.allowProactiveGoals ?? true) {
       const proactive = this.formatActiveGoalsBlock(profile?.slug);
       if (proactive) retrievalContext += proactive;
     }
@@ -3035,12 +3329,20 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
           profile,
           sessionKey,
           streaming: !!onText,
+          enableTeams: effectiveTurnPolicy?.enableTeams ?? true,
+          disableAllTools: effectiveTurnPolicy?.disableAllTools ?? false,
           verboseLevel,
           abortController,
           stallGuard,
           intentClassification,
-          effort: intentClassification?.suggestedEffort,
-          toolScopeText: [prompt, retrievalContext, profile?.description, profile?.systemPromptBody].filter(Boolean).join('\n\n'),
+          turnPolicy: effectiveTurnPolicy,
+          effort: effectiveTurnPolicy?.effort ?? intentClassification?.suggestedEffort,
+          // Route destructive/admin/local write decisions from the direct user
+          // request only. Retrieved memory may still contribute integration
+          // continuity via contextRoutingText, but stale memories should not
+          // broaden this turn into setup/admin/full-surface mode.
+          toolScopeText: prompt,
+          contextRoutingText: retrievalContext,
         });
 
         // If a project matched, switch cwd so the agent gets its tools/CLAUDE.md
@@ -3103,6 +3405,36 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
             }
           }
         }
+
+        try {
+          const allowedToolCount = Array.isArray((sdkOptions as { allowedTools?: unknown[] }).allowedTools)
+            ? ((sdkOptions as { allowedTools?: unknown[] }).allowedTools ?? []).length
+            : 0;
+          const clementineAllowedToolCount = Array.isArray((sdkOptions as { allowedTools?: unknown[] }).allowedTools)
+            ? (((sdkOptions as { allowedTools?: string[] }).allowedTools ?? [])
+              .filter(t => typeof t === 'string' && t.startsWith(`mcp__${TOOLS_SERVER}__`)).length)
+            : 0;
+          const serverCount = sdkOptions.mcpServers ? Object.keys(sdkOptions.mcpServers).length : 0;
+          logAuditJsonl({
+            event_type: 'turn_trace',
+            source: 'chat',
+            session_key: sessionKey,
+            intent: intentClassification?.type,
+            intent_confidence: intentClassification?.confidence,
+            policy_reason: effectiveTurnPolicy?.reason,
+            retrieval_tier: rawContext.tier,
+            retrieval_chars: rawContext.charsUsed,
+            retrieval_slots: rawContext.slotsIncluded,
+            retrieval_slots_skipped: rawContext.slotsSkipped,
+            allowed_tool_count: allowedToolCount,
+            clementine_allowed_tool_count: clementineAllowedToolCount,
+            mcp_server_count: serverCount,
+            estimated_tokens: totalEstimate,
+            remaining_tokens: remainingTokens,
+            max_turns: sdkOptions.maxTurns,
+            effort: (sdkOptions as { effort?: string }).effort,
+          });
+        } catch { /* telemetry only */ }
 
         let responseText = '';
         let sessionId = '';
@@ -3168,6 +3500,16 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
                   // StallGuard handles loop detection + metacognition + stall breaking
                   if (stallGuard) {
                     stallGuard.recordToolCall(block.name, (block.input ?? {}) as Record<string, unknown>);
+                  }
+                }
+              }
+            } else if (message.type === 'user') {
+              if (stallGuard) {
+                const content = (message as any).message?.content;
+                const blocks = Array.isArray(content) ? content : [];
+                for (const block of blocks) {
+                  if (block?.type === 'tool_result') {
+                    stallGuard.recordToolResult(stringifyToolResultContent(block.content).slice(0, 4000));
                   }
                 }
               }
