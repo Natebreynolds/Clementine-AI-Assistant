@@ -50,6 +50,8 @@ const DIST_ENTRY = path.join(PACKAGE_ROOT, 'dist', 'cli', 'index.js');
 const ENV_PATH = path.join(BASE_DIR, '.env');
 const VAULT_DIR = path.join(BASE_DIR, 'vault');
 const CRON_FILE = path.join(VAULT_DIR, '00-System', 'CRON.md');
+const HEARTBEAT_FILE = path.join(VAULT_DIR, '00-System', 'HEARTBEAT.md');
+const HEARTBEAT_WORK_QUEUE_FILE = path.join(BASE_DIR, 'heartbeat', 'work-queue.json');
 const MEMORY_DB_PATH = path.join(VAULT_DIR, '.memory.db');
 const PROJECTS_META_FILE = path.join(BASE_DIR, 'projects.json');
 const DASHBOARD_PID_FILE = path.join(BASE_DIR, '.dashboard.pid');
@@ -1100,6 +1102,68 @@ function getHeartbeat(): Record<string, unknown> {
   } catch {
     return {};
   }
+}
+
+function readHeartbeatWorkQueue(): Array<Record<string, unknown>> {
+  if (!existsSync(HEARTBEAT_WORK_QUEUE_FILE)) return [];
+  try {
+    const parsed = JSON.parse(readFileSync(HEARTBEAT_WORK_QUEUE_FILE, 'utf-8'));
+    return Array.isArray(parsed) ? parsed as Array<Record<string, unknown>> : [];
+  } catch {
+    return [];
+  }
+}
+
+function parseHeartbeatActiveHours(value: unknown): { start: number; end: number } {
+  if (typeof value !== 'string') return { start: 8, end: 22 };
+  const match = value.match(/(\d{1,2})(?::\d{2})?\s*-\s*(\d{1,2})(?::\d{2})?/);
+  if (!match) return { start: 8, end: 22 };
+  const start = Math.max(0, Math.min(23, Number(match[1])));
+  const end = Math.max(0, Math.min(23, Number(match[2])));
+  return { start, end };
+}
+
+function getHeartbeatControl(): Record<string, unknown> {
+  let parsed: ReturnType<typeof matter> | null = null;
+  if (existsSync(HEARTBEAT_FILE)) {
+    try {
+      parsed = matter(readFileSync(HEARTBEAT_FILE, 'utf-8'));
+    } catch { /* malformed file still gets surfaced below */ }
+  }
+
+  const json = loadClementineJson(BASE_DIR);
+  const frontmatter = parsed?.data ?? {};
+  const frontHours = parseHeartbeatActiveHours(frontmatter.active_hours);
+  const interval = Number(json.heartbeat?.intervalMinutes ?? frontmatter.interval ?? 30);
+  const activeStart = Number(json.heartbeat?.activeStart ?? frontHours.start);
+  const activeEnd = Number(json.heartbeat?.activeEnd ?? frontHours.end);
+  const state = getHeartbeat();
+  const queue = readHeartbeatWorkQueue();
+  const agents = getAgentHeartbeats();
+
+  return {
+    filePath: HEARTBEAT_FILE,
+    exists: existsSync(HEARTBEAT_FILE),
+    settings: {
+      intervalMinutes: Number.isFinite(interval) ? interval : 30,
+      activeStart: Number.isFinite(activeStart) ? activeStart : 8,
+      activeEnd: Number.isFinite(activeEnd) ? activeEnd : 22,
+      allowTier2: Boolean(frontmatter.allow_tier2),
+      webAllowed: frontmatter.web_allowed !== false,
+      restartRequired: true,
+    },
+    instructions: parsed?.content.trimStart() ?? '',
+    frontmatter,
+    state,
+    workQueue: {
+      items: queue,
+      pending: queue.filter((i) => i.status === 'pending').length,
+      running: queue.filter((i) => i.status === 'running').length,
+      completed: queue.filter((i) => i.status === 'completed').length,
+      failed: queue.filter((i) => i.status === 'failed').length,
+    },
+    agents,
+  };
 }
 
 /**
@@ -2176,6 +2240,73 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
     res.json(getHeartbeat());
   });
 
+  app.get('/api/heartbeat/control', (_req, res) => {
+    try {
+      res.json(getHeartbeatControl());
+    } catch (err) {
+      res.status(500).json({ error: String(err).slice(0, 300) });
+    }
+  });
+
+  app.put('/api/heartbeat/control', (req, res) => {
+    try {
+      const intervalMinutes = Math.max(5, Math.min(240, Math.floor(Number(req.body.intervalMinutes ?? 30))));
+      const activeStart = Math.max(0, Math.min(23, Math.floor(Number(req.body.activeStart ?? 8))));
+      const activeEnd = Math.max(0, Math.min(23, Math.floor(Number(req.body.activeEnd ?? 22))));
+      const allowTier2 = Boolean(req.body.allowTier2);
+      const webAllowed = req.body.webAllowed !== false;
+      const instructions = typeof req.body.instructions === 'string' ? req.body.instructions.trim() : '';
+      if (!instructions) {
+        res.status(400).json({ error: 'instructions are required' });
+        return;
+      }
+      if (instructions.length > 40_000) {
+        res.status(400).json({ error: 'instructions are too long' });
+        return;
+      }
+
+      const existing = existsSync(HEARTBEAT_FILE)
+        ? matter(readFileSync(HEARTBEAT_FILE, 'utf-8'))
+        : { data: {}, content: '' };
+      const existingData = (existing.data ?? {}) as Record<string, unknown>;
+      const data = {
+        ...existingData,
+        type: existingData.type ?? 'core-system',
+        role: existingData.role ?? 'heartbeat-config',
+        interval: intervalMinutes,
+        active_hours: `${String(activeStart).padStart(2, '0')}:00-${String(activeEnd).padStart(2, '0')}:00`,
+        allow_tier2: allowTier2,
+        web_allowed: webAllowed,
+        tags: Array.isArray(existingData.tags) ? existingData.tags : ['system', 'heartbeat'],
+      };
+      mkdirSync(path.dirname(HEARTBEAT_FILE), { recursive: true });
+      writeFileSync(HEARTBEAT_FILE, matter.stringify(instructions + '\n', data));
+
+      const next = updateClementineJson(BASE_DIR, (current) => ({
+        ...current,
+        heartbeat: {
+          ...(current.heartbeat ?? {}),
+          intervalMinutes,
+          activeStart,
+          activeEnd,
+        },
+      }));
+      process.env.HEARTBEAT_INTERVAL_MINUTES = String(intervalMinutes);
+      process.env.HEARTBEAT_ACTIVE_START = String(activeStart);
+      process.env.HEARTBEAT_ACTIVE_END = String(activeEnd);
+      responseCache.clear();
+
+      res.json({
+        ok: true,
+        message: 'Heartbeat controls saved. Restart the daemon for timing changes to apply.',
+        heartbeat: next.heartbeat,
+        control: getHeartbeatControl(),
+      });
+    } catch (err) {
+      res.status(500).json({ error: String(err).slice(0, 300) });
+    }
+  });
+
   app.get('/api/agent-heartbeats', (_req, res) => {
     res.json(getAgentHeartbeats());
   });
@@ -2253,15 +2384,18 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
     const state = getHeartbeat() as Record<string, unknown>;
     const reportedTopics = (state.reportedTopics ?? []) as Array<Record<string, unknown>>;
     const topics = reportedTopics.filter(
-      (t) => t.agentSlug === slug || (typeof t.topic === 'string' && t.topic.startsWith(slug + ':')),
+      (t) => slug === '__clementine__'
+        ? !t.agentSlug
+        : (t.agentSlug === slug || (typeof t.topic === 'string' && t.topic.startsWith(slug + ':'))),
     );
 
-    const queueFile = path.join(BASE_DIR, 'heartbeat', 'work-queue.json');
     let queue: Array<Record<string, unknown>> = [];
     try {
-      if (existsSync(queueFile)) queue = JSON.parse(readFileSync(queueFile, 'utf-8'));
+      if (existsSync(HEARTBEAT_WORK_QUEUE_FILE)) queue = JSON.parse(readFileSync(HEARTBEAT_WORK_QUEUE_FILE, 'utf-8'));
     } catch { /* empty */ }
-    const agentQueue = queue.filter((i) => i.agentSlug === slug);
+    const agentQueue = slug === '__clementine__'
+      ? queue.filter((i) => !i.agentSlug)
+      : queue.filter((i) => i.agentSlug === slug);
 
     res.json({
       topics,
@@ -2285,13 +2419,12 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
     if (!description || !prompt) {
       return res.status(400).json({ error: 'description and prompt are required' });
     }
-    const queueFile = path.join(BASE_DIR, 'heartbeat', 'work-queue.json');
-    const queueDir = path.dirname(queueFile);
+    const queueDir = path.dirname(HEARTBEAT_WORK_QUEUE_FILE);
     mkdirSync(queueDir, { recursive: true });
 
     let queue: Array<Record<string, unknown>> = [];
     try {
-      if (existsSync(queueFile)) queue = JSON.parse(readFileSync(queueFile, 'utf-8'));
+      if (existsSync(HEARTBEAT_WORK_QUEUE_FILE)) queue = JSON.parse(readFileSync(HEARTBEAT_WORK_QUEUE_FILE, 'utf-8'));
     } catch { /* start fresh */ }
 
     const id = randomBytes(4).toString('hex');
@@ -2308,7 +2441,7 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
     };
     if (agentSlug) item.agentSlug = agentSlug;
     queue.push(item);
-    writeFileSync(queueFile, JSON.stringify(queue, null, 2));
+    writeFileSync(HEARTBEAT_WORK_QUEUE_FILE, JSON.stringify(queue, null, 2));
     res.json({ ok: true, id });
   });
 
@@ -12646,6 +12779,9 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
         <span class="nav-icon"></span> Build
         <span class="nav-badge" id="nav-cron-count" style="display:none">0</span>
       </div>
+      <div class="nav-item" data-page="heartbeat" data-icon="bell" title="Heartbeat controls and queued work">
+        <span class="nav-icon"></span> Heartbeat
+      </div>
       <div class="nav-item" data-page="team" data-icon="users" title="Agents, activity, goals">
         <span class="nav-icon"></span> Team
       </div>
@@ -14724,6 +14860,24 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
     <!-- (Session 5) team-status / agent-detail / goals parking divs removed.
          Team's Roster / Activity / Goals tabs are the live homes. -->
 
+    <!-- ═══ Heartbeat Control Page ═══ -->
+    <div class="page" id="page-heartbeat">
+      <div class="page-head">
+        <div class="icon icon-slot" data-icon="bell"></div>
+        <div class="title-block">
+          <h1>Heartbeat</h1>
+          <p class="desc">Tune proactive check-ins, silence rules, and work queued for the next autonomous pulse.</p>
+        </div>
+        <div class="actions">
+          <button class="btn-sm" onclick="refreshHeartbeatControl()">Refresh</button>
+          <button class="btn-primary btn-sm" onclick="openHeartbeatQueueModal('')">Queue Work</button>
+        </div>
+      </div>
+      <div id="heartbeat-control-content" style="padding:18px">
+        <div class="skel-block"><div class="skel-row med"></div><div class="skel-row"></div><div class="skel-row short"></div></div>
+      </div>
+    </div>
+
     <!-- ═══ Settings Page (merged: General + Remote + Integrations + Projects) ═══ -->
     <div class="page" id="page-settings">
       <div class="page-title">Settings</div>
@@ -15594,7 +15748,7 @@ function lucide(name, cls) {
   return '<svg class="icn ' + (cls || '') + '" viewBox="0 0 24 24" aria-hidden="true">' + path + '</svg>';
 }
 
-var DESTINATIONS = ['home', 'build', 'team', 'brain', 'settings'];
+var DESTINATIONS = ['home', 'build', 'heartbeat', 'team', 'brain', 'settings'];
 
 var ROUTE_REDIRECTS = {
   // old hash → new {page, tab}
@@ -15607,6 +15761,7 @@ var ROUTE_REDIRECTS = {
   'unleashed': { page: 'build', tab: 'workflows' },
   'builder': { page: 'build', tab: 'workflows' },
   'skill-studio': { page: 'build', tab: 'skills' },
+  'heartbeats': { page: 'heartbeat' },
   'team-status': { page: 'team', tab: 'activity' },
   'agent-detail': { page: 'team', tab: 'roster' },
   'intelligence': { page: 'brain', tab: 'memory' },
@@ -15669,6 +15824,9 @@ function navigateTo(page, opts) {
       switchBuildTab(opts.tab || 'workflows');
       var bp = currentAgentSlug || '';
       refreshBuilderAgents(bp);
+      break;
+    case 'heartbeat':
+      refreshHeartbeatControl();
       break;
     case 'team':
       refreshTeam();
@@ -18017,6 +18175,124 @@ async function deleteDelegation(id) {
 }
 
 // ── Heartbeat Queue ──────────────────────
+
+async function refreshHeartbeatControl() {
+  var container = document.getElementById('heartbeat-control-content');
+  if (!container) return;
+  try {
+    var r = await apiFetch('/api/heartbeat/control');
+    var d = await r.json();
+    if (d.error) throw new Error(d.error);
+    var s = d.settings || {};
+    var state = d.state || {};
+    var queue = d.workQueue || { items: [] };
+    var agents = d.agents || [];
+    var topics = Array.isArray(state.reportedTopics) ? state.reportedTopics.slice(-8).reverse() : [];
+    var lastTick = state.timestamp ? fmtTimeAgo(state.timestamp) : 'Never';
+    var lastDiscord = state.lastDiscordMessageAt ? fmtTimeAgo(state.lastDiscordMessageAt) : 'None';
+    var silent = Number(state.consecutiveSilentBeats || 0);
+    var qItems = queue.items || [];
+
+    var html = '';
+    html += '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;margin-bottom:16px">';
+    html += '<div class="card"><div class="card-body" style="padding:14px;text-align:center"><div style="font-size:18px;font-weight:700;color:var(--accent)">' + esc(lastTick) + '</div><div style="font-size:11px;color:var(--text-muted)">Last heartbeat</div></div></div>';
+    html += '<div class="card"><div class="card-body" style="padding:14px;text-align:center"><div style="font-size:18px;font-weight:700;color:' + (silent > 0 ? 'var(--text-secondary)' : 'var(--green)') + '">' + silent + '</div><div style="font-size:11px;color:var(--text-muted)">Silent beats</div></div></div>';
+    html += '<div class="card"><div class="card-body" style="padding:14px;text-align:center"><div style="font-size:18px;font-weight:700;color:' + ((queue.pending || 0) > 0 ? 'var(--yellow)' : 'var(--green)') + '">' + (queue.pending || 0) + '</div><div style="font-size:11px;color:var(--text-muted)">Queued work</div></div></div>';
+    html += '<div class="card"><div class="card-body" style="padding:14px;text-align:center"><div style="font-size:18px;font-weight:700;color:var(--text-secondary)">' + esc(lastDiscord) + '</div><div style="font-size:11px;color:var(--text-muted)">Last Discord mention</div></div></div>';
+    html += '</div>';
+
+    html += '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:16px;align-items:start">';
+
+    html += '<div class="card"><div class="card-header">Controls</div><div class="card-body" style="padding:16px">';
+    html += '<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:12px">';
+    html += '<div><label style="font-size:12px;font-weight:600;color:var(--text-secondary)">Interval</label><input id="hb-control-interval" type="number" min="5" max="240" value="' + esc(String(s.intervalMinutes || 30)) + '" style="width:100%;padding:7px 9px;border:1px solid var(--border);border-radius:6px;background:var(--bg-input);color:var(--text-primary)"></div>';
+    html += '<div><label style="font-size:12px;font-weight:600;color:var(--text-secondary)">Start</label><input id="hb-control-start" type="number" min="0" max="23" value="' + esc(String(s.activeStart ?? 8)) + '" style="width:100%;padding:7px 9px;border:1px solid var(--border);border-radius:6px;background:var(--bg-input);color:var(--text-primary)"></div>';
+    html += '<div><label style="font-size:12px;font-weight:600;color:var(--text-secondary)">End</label><input id="hb-control-end" type="number" min="0" max="23" value="' + esc(String(s.activeEnd ?? 22)) + '" style="width:100%;padding:7px 9px;border:1px solid var(--border);border-radius:6px;background:var(--bg-input);color:var(--text-primary)"></div>';
+    html += '</div>';
+    html += '<label style="display:flex;align-items:center;gap:8px;margin-bottom:8px;font-size:13px;color:var(--text-primary)"><input id="hb-control-web" type="checkbox" ' + (s.webAllowed ? 'checked' : '') + '> Allow web checks during heartbeat</label>';
+    html += '<label style="display:flex;align-items:center;gap:8px;margin-bottom:12px;font-size:13px;color:var(--text-primary)"><input id="hb-control-tier2" type="checkbox" ' + (s.allowTier2 ? 'checked' : '') + '> Allow Tier 2 actions when explicitly useful</label>';
+    html += '<div style="display:flex;gap:8px;flex-wrap:wrap"><button class="btn-sm btn-primary" onclick="saveHeartbeatControl()">Save Controls</button><button class="btn-sm" onclick="apiPost(\\x27/api/restart\\x27)">Restart Daemon</button></div>';
+    html += '<div id="hb-control-status" style="font-size:11px;color:var(--text-muted);margin-top:8px">Timing changes apply after daemon restart.</div>';
+    html += '</div></div>';
+
+    html += '<div class="card"><div class="card-header" style="display:flex;justify-content:space-between;align-items:center"><span>Standing Instructions</span><span style="font-size:11px;color:var(--text-muted)">' + esc(d.filePath || '') + '</span></div>';
+    html += '<div class="card-body" style="padding:16px">';
+    html += '<textarea id="hb-control-instructions" rows="18" style="width:100%;padding:12px;border:1px solid var(--border);border-radius:6px;background:var(--bg-input);color:var(--text-primary);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;line-height:1.45;resize:vertical">' + esc(d.instructions || '') + '</textarea>';
+    html += '<div style="display:flex;gap:8px;justify-content:flex-end;margin-top:10px"><button class="btn-sm" onclick="refreshHeartbeatControl()">Discard</button><button class="btn-sm btn-primary" onclick="saveHeartbeatControl()">Save Instructions</button></div>';
+    html += '</div></div>';
+    html += '</div>';
+
+    html += '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:16px;margin-top:16px">';
+    html += '<div class="card"><div class="card-header" style="display:flex;justify-content:space-between;align-items:center"><span>Work Queue</span><button class="btn-sm btn-primary" onclick="openHeartbeatQueueModal(\\x27\\x27)">Queue Work</button></div><div class="card-body" style="padding:0">';
+    if (qItems.length === 0) {
+      html += '<div class="empty-state" style="padding:18px">No queued heartbeat work.</div>';
+    } else {
+      html += '<table style="width:100%;border-collapse:collapse"><thead><tr style="border-bottom:1px solid var(--border)"><th style="padding:8px 12px;text-align:left;font-size:11px;color:var(--text-muted)">Status</th><th style="padding:8px 12px;text-align:left;font-size:11px;color:var(--text-muted)">Work</th><th style="padding:8px 12px;text-align:left;font-size:11px;color:var(--text-muted)">Owner</th></tr></thead><tbody>';
+      qItems.slice().reverse().slice(0, 12).forEach(function(item) {
+        var cls = item.status === 'completed' ? 'badge-green' : item.status === 'failed' ? 'badge-red' : item.status === 'running' ? 'badge-orange' : 'badge-gray';
+        html += '<tr style="border-bottom:1px solid var(--border)"><td style="padding:8px 12px"><span class="badge ' + cls + '" style="font-size:10px">' + esc(item.status || 'pending') + '</span></td><td style="padding:8px 12px;font-size:13px">' + esc(item.description || '') + '<div style="font-size:11px;color:var(--text-muted)">' + esc(fmtTimeAgo(item.queuedAt)) + '</div></td><td style="padding:8px 12px;font-size:12px;color:var(--text-muted)">' + esc(item.agentSlug || 'Clementine') + '</td></tr>';
+      });
+      html += '</tbody></table>';
+    }
+    html += '</div></div>';
+
+    html += '<div class="card"><div class="card-header">Agent Heartbeats</div><div class="card-body" style="padding:0">';
+    if (agents.length === 0) {
+      html += '<div class="empty-state" style="padding:18px">No agent heartbeat state yet.</div>';
+    } else {
+      agents.slice(0, 12).forEach(function(a) {
+        html += '<div style="padding:10px 14px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:10px">';
+        var lastLabel = a.lastTickAgoMs != null ? formatMs(a.lastTickAgoMs) + ' ago' : 'never';
+        var nextLabel = a.nextCheckInMs != null ? (Number(a.nextCheckInMs) <= 0 ? 'due' : 'in ' + formatMs(a.nextCheckInMs)) : 'unknown';
+        html += '<div style="flex:1;min-width:0"><div style="font-size:13px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(a.slug || '') + '</div><div style="font-size:11px;color:var(--text-muted)">Last ' + esc(lastLabel) + ' · Next ' + esc(nextLabel) + '</div></div>';
+        html += '<span class="badge ' + (a.isDue ? 'badge-orange' : 'badge-gray') + '" style="font-size:10px">' + esc(a.lastTickKind || (a.isDue ? 'due' : 'waiting')) + '</span>';
+        html += '</div>';
+      });
+    }
+    html += '</div></div>';
+
+    html += '<div class="card"><div class="card-header">Recently Reported Topics</div><div class="card-body" style="padding:0">';
+    if (topics.length === 0) {
+      html += '<div class="empty-state" style="padding:18px">No reported heartbeat topics yet.</div>';
+    } else {
+      topics.forEach(function(t) {
+        html += '<div style="padding:10px 14px;border-bottom:1px solid var(--border)"><div style="font-size:13px;font-weight:600">' + esc(t.topic || 'topic') + '</div><div style="font-size:11px;color:var(--text-muted)">' + esc(t.reportedAt ? fmtTimeAgo(t.reportedAt) : '') + (t.agentSlug ? ' · ' + esc(t.agentSlug) : '') + '</div></div>';
+      });
+    }
+    html += '</div></div>';
+    html += '</div>';
+
+    container.innerHTML = html;
+  } catch(e) {
+    container.innerHTML = '<div class="empty-state" style="color:var(--red)">Failed to load heartbeat controls: ' + esc(String(e)) + '</div>';
+  }
+}
+
+async function saveHeartbeatControl() {
+  var statusEl = document.getElementById('hb-control-status');
+  var body = {
+    intervalMinutes: Number(document.getElementById('hb-control-interval')?.value || 30),
+    activeStart: Number(document.getElementById('hb-control-start')?.value || 8),
+    activeEnd: Number(document.getElementById('hb-control-end')?.value || 22),
+    allowTier2: !!document.getElementById('hb-control-tier2')?.checked,
+    webAllowed: !!document.getElementById('hb-control-web')?.checked,
+    instructions: document.getElementById('hb-control-instructions')?.value || '',
+  };
+  try {
+    var r = await apiFetch('/api/heartbeat/control', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    var d = await r.json();
+    if (!r.ok || d.error) throw new Error(d.error || 'Save failed');
+    if (statusEl) { statusEl.textContent = 'Saved. Restart daemon for schedule changes.'; statusEl.style.color = 'var(--green)'; }
+    toast('Heartbeat controls saved', 'success');
+  } catch(e) {
+    if (statusEl) { statusEl.textContent = 'Save failed'; statusEl.style.color = 'var(--red)'; }
+    toast(String(e), 'error');
+  }
+}
 
 function openHeartbeatQueueModal(agentSlug) {
   document.getElementById('hbq-agent-slug').value = agentSlug || '';
