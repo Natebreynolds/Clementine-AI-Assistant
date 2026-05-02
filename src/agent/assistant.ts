@@ -228,6 +228,40 @@ export function estimateTokens(text: string): number {
   return Math.ceil(text.length / 3.3);
 }
 
+export function looksLikeContextThrashText(value: unknown): boolean {
+  const text = String(value ?? '');
+  return /autocompact\s+is\s+thrashing|context\s+refilled\s+to\s+the\s+limit|refilled\s+to\s+the\s+limit\s+within/i.test(text);
+}
+
+export function contextThrashRecoveryNotice(): string {
+  return [
+    'I hit a context-size recovery issue while working on that.',
+    'I saved the request and reset the session so I can continue with smaller reads instead of repeating the same large-output path.',
+  ].join(' ');
+}
+
+export function buildContextThrashRecoveryPrompt(userRequest: string, priorFailureText = ''): string {
+  const parts = [
+    '[CONTEXT-THRASH RECOVERY]',
+    '',
+    'The previous interactive attempt failed because tool output filled the context window and SDK autocompact thrashed. Continue the user request, but use a small diagnostic pass.',
+    '',
+    'User request:',
+    userRequest,
+    '',
+    'Recovery rules:',
+    '- Do not repeat broad reads, full log dumps, full JSON dumps, or unbounded API/list commands.',
+    '- Prefer status files, summaries, indexes, `rg`, `tail -80`, `head -80`, and `sed -n` slices.',
+    '- For cron or unleashed jobs, inspect only `status.json`, the tail of `progress.jsonl`, and the latest run preview first. Do not read full run logs unless a short slice identifies the exact file and range.',
+    '- Preserve the user intent. Identify what failed, what you changed or verified, and the next action.',
+    '- Finish with `TASK_COMPLETE:` followed by a concise user-facing summary.',
+  ];
+  if (priorFailureText.trim()) {
+    parts.push('', 'Prior failure excerpt:', priorFailureText.trim().slice(0, 1200));
+  }
+  return parts.join('\n');
+}
+
 /**
  * Strip lone Unicode surrogates (U+D800–U+DFFF) from a string so it can be
  * safely serialized to JSON. Lone surrogates are valid in JS strings but
@@ -3669,7 +3703,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
                   } else if (lower.includes('does not have access') || lower.includes('please run /login') || lower.includes('not authenticated')) {
                     // Auth errors — throw so the gateway circuit breaker catches it
                     throw new Error(errorText);
-                  } else if (lower.includes('autocompact') || lower.includes('thrash') || lower.includes('context refilled to the limit')) {
+                  } else if (looksLikeContextThrashText(errorText)) {
                     // Autocompact thrashing — treat like the exception path
                     logger.warn({ sessionKey }, 'Autocompact thrashing (result error) — will rotate session');
                     // Capture mid-task state BEFORE rotating, so the retry
@@ -3703,6 +3737,22 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
               } else if ('result' in result && (result as any).result) {
                 // Success: use SDK result text if streaming didn't capture a substantive response
                 const sdkResult = (result as any).result as string;
+                if (looksLikeContextThrashText(sdkResult)) {
+                  logger.warn({ sessionKey }, 'Autocompact thrashing surfaced as SDK result text — rotating session');
+                  preRotationSnapshot = {
+                    toolCalls: stallGuard?.getToolCalls() ?? [],
+                    partialText: responseText.slice(-1000),
+                  };
+                  if (sessionKey) {
+                    try { this.compactContext(sessionKey); } catch { /* best-effort */ }
+                    this.sessions.delete(sessionKey);
+                    this.exchangeCounts.set(sessionKey, 0);
+                    this._compactedSessions.delete(sessionKey);
+                  }
+                  staleSession = true;
+                  contextRecovery = true;
+                  break;
+                }
                 logger.info({ sessionKey, streamedLen: responseText.length, resultLen: sdkResult.length }, 'SDK result text available');
                 if (!responseText.trim()) {
                   responseText = sdkResult;
@@ -3756,7 +3806,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
                 rateLimitRetryAfterMs = unit.startsWith('ms') || unit.startsWith('milli') ? n : n * 1000;
               }
             }
-          } else if (errStr.includes('autocompact') || errStr.includes('thrash') || errStr.includes('context refilled to the limit')) {
+          } else if (looksLikeContextThrashText(e)) {
             // SDK autocompact thrashing — tool outputs are too large for the context window.
             // Rotate session and retry with a fresh context so the agent can continue.
             logger.warn({ sessionKey }, 'Autocompact thrashing — rotating session and retrying');
@@ -3778,7 +3828,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
               responseText = '';
               continue;
             }
-            responseText = responseText || 'The conversation context filled up from large tool outputs. I\'ve reset the session — please try again, and I\'ll keep query results smaller this time.';
+            responseText = responseText || contextThrashRecoveryNotice();
           } else if (errStr.includes('prompt is too long') || errStr.includes('prompt too long') || errStr.includes('context_length')) {
             responseText = responseText || (
               'The conversation got too large to process (tool responses filled the context window). ' +
@@ -3827,6 +3877,9 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
           }
           continue;
         }
+        if (staleSession && contextRecovery && !responseText.trim()) {
+          responseText = contextThrashRecoveryNotice();
+        }
 
         if (hitRateLimit && attempt < PersonalAssistant.RATE_LIMIT_MAX_RETRIES) {
           const base = rateLimitRetryAfterMs
@@ -3844,6 +3897,25 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
 
         if (hitRateLimit && !responseText) {
           responseText = "I'm being rate limited right now. Give me a minute and try again.";
+        }
+
+        if (looksLikeContextThrashText(responseText)) {
+          logger.warn({ sessionKey }, 'Autocompact thrashing escaped into response text — rotating session before reply');
+          if (sessionKey) {
+            try { this.compactContext(sessionKey); } catch { /* best-effort */ }
+            this.sessions.delete(sessionKey);
+            this.exchangeCounts.set(sessionKey, 0);
+            this._compactedSessions.delete(sessionKey);
+          }
+          if (attempt < PersonalAssistant.RATE_LIMIT_MAX_RETRIES) {
+            prompt = buildContextRecoveredPrompt(prompt, {
+              toolCalls: stallGuard?.getToolCalls() ?? [],
+              partialText: '',
+            });
+            responseText = '';
+            continue;
+          }
+          responseText = contextThrashRecoveryNotice();
         }
 
         // ── Response guarantee ─────────────────────────────────────────

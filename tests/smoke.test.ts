@@ -7,7 +7,12 @@ import { describe, it, expect } from 'vitest';
 import { shellEscape } from '../src/config.js';
 import { classifyError, CronScheduler } from '../src/gateway/cron-scheduler.js';
 import { classifyChatError } from '../src/gateway/router.js';
-import { estimateTokens, isAutonomousNothingOutput } from '../src/agent/assistant.js';
+import {
+  buildContextThrashRecoveryPrompt,
+  estimateTokens,
+  isAutonomousNothingOutput,
+  looksLikeContextThrashText,
+} from '../src/agent/assistant.js';
 import { validateProposal } from '../src/agent/self-improve.js';
 
 // ── shellEscape ─────────────────────────────────────────────────────
@@ -97,6 +102,7 @@ describe('classifyChatError', () => {
     expect(classifyChatError('prompt too long')).toBe('context_overflow');
     expect(classifyChatError('maximum context length exceeded')).toBe('context_overflow');
     expect(classifyChatError('token limit reached')).toBe('context_overflow');
+    expect(classifyChatError('Autocompact is thrashing: the context refilled to the limit')).toBe('context_overflow');
   });
 
   it('classifies auth errors', () => {
@@ -114,6 +120,24 @@ describe('classifyChatError', () => {
   it('classifies unknown errors', () => {
     expect(classifyChatError('something broke')).toBe('unknown');
     expect(classifyChatError(new Error('TypeError'))).toBe('unknown');
+  });
+});
+
+// ── context-thrash recovery helpers ─────────────────────────────────
+
+describe('context-thrash recovery helpers', () => {
+  it('recognizes SDK autocompact thrash text', () => {
+    expect(looksLikeContextThrashText('Autocompact is thrashing: the context refilled to the limit')).toBe(true);
+    expect(looksLikeContextThrashText('regular context summary')).toBe(false);
+  });
+
+  it('builds a recovery prompt that preserves intent and narrows cron diagnostics', () => {
+    const prompt = buildContextThrashRecoveryPrompt('Fix Ross market leader follow up', 'Autocompact is thrashing');
+    expect(prompt).toContain('Fix Ross market leader follow up');
+    expect(prompt).toContain('tail -80');
+    expect(prompt).toContain('status.json');
+    expect(prompt).toContain('progress.jsonl');
+    expect(prompt).toContain('Do not read full run logs');
   });
 });
 

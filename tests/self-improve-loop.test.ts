@@ -15,6 +15,7 @@ describe('classifyFailure', () => {
   it('recognizes autocompact thrashing as safe-cron-config', () => {
     const r = classifyFailure(['Autocompact is thrashing: the context refilled to the limit']);
     expect(r.category).toBe('safe-cron-config');
+    expect(r.fields).toEqual(['mode', 'max_hours']);
   });
 
   it('recognizes the old taskBudget rejection as no-op (already fixed in code)', () => {

@@ -171,6 +171,7 @@ const PATTERNS: Array<{
     recipe: () => ({
       category: 'safe-cron-config',
       description: 'Context window blowing up mid-run. Switching to unleashed mode so each phase starts with a fresh context.',
+      fields: ['mode', 'max_hours'] as const,
       apply: (job) => {
         let changed = false;
         if (job.mode !== 'unleashed') {

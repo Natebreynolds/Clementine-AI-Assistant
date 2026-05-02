@@ -8,7 +8,14 @@
 import path from 'node:path';
 import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import pino from 'pino';
-import { isAutonomousNothingOutput, PersonalAssistant, type ProjectMeta } from '../agent/assistant.js';
+import {
+  buildContextThrashRecoveryPrompt,
+  contextThrashRecoveryNotice,
+  isAutonomousNothingOutput,
+  looksLikeContextThrashText,
+  PersonalAssistant,
+  type ProjectMeta,
+} from '../agent/assistant.js';
 import { runWithTrace, logAuditJsonl } from '../agent/hooks.js';
 import type { OnProgressCallback, OnTextCallback, OnToolActivityCallback, PlanProgressUpdate, PlanStep, SelfImproveConfig, SelfImproveExperiment, SessionProvenance, TeamMessage, VerboseLevel, WorkflowDefinition } from '../types.js';
 import { SelfImproveLoop } from '../agent/self-improve.js';
@@ -43,7 +50,7 @@ export type ChatErrorKind = 'rate_limit' | 'context_overflow' | 'auth' | 'transi
 export function classifyChatError(err: unknown): ChatErrorKind {
   const msg = String(err);
   if (/rate.?limit|\b429\b|too many requests|quota.?exceeded/i.test(msg)) return 'rate_limit';
-  if (/context.?length|token.?limit|maximum.?context|prompt.?too.?long/i.test(msg)) return 'context_overflow';
+  if (looksLikeContextThrashText(msg) || /context.?length|token.?limit|maximum.?context|prompt.?too.?long/i.test(msg)) return 'context_overflow';
   if (/\b401\b|\b403\b|auth|forbidden|invalid.?api.?key|permission|does not have access|please run \/login/i.test(msg)) return 'auth';
   if (/timeout|ECONNRESET|ECONNREFUSED|ETIMEDOUT|\b5\d\d\b|overloaded|service.?unavailable/i.test(msg)) return 'transient';
   return 'unknown';
@@ -433,6 +440,63 @@ export class Gateway {
           });
       }
     }
+  }
+
+  private startContextThrashRecovery(
+    sessionKey: string,
+    text: string,
+    priorFailureText: string,
+    details: Record<string, unknown> = {},
+  ): string {
+    const currentSess = this.getSession(sessionKey);
+    const jobName = `recovery-${Date.now()}`;
+    currentSess.deepTask = {
+      jobName,
+      taskDesc: `Recover after context overflow: ${text.slice(0, 160)}`,
+      startedAt: new Date().toISOString(),
+    };
+    const agentSlug = this._agentSlugFromSessionKey(sessionKey);
+
+    this.recordInteractiveFailure(sessionKey, text, priorFailureText, 'context_thrash', {
+      jobName,
+      ...details,
+    });
+
+    this.assistant.runUnleashedTask(
+      jobName,
+      buildContextThrashRecoveryPrompt(text, priorFailureText),
+      2,
+      undefined,
+      undefined,
+      undefined,
+      1,
+      agentSlug,
+    ).then(async (result) => {
+      logger.info({ sessionKey, jobName, resultLen: result?.length ?? 0 }, 'Context-thrash recovery completed');
+      if (result && !isAutonomousNothingOutput(result)) {
+        this.assistant.injectPendingContext(sessionKey, text, result);
+        await this._deliverDeepResult(
+          sessionKey,
+          `[CONTEXT_THRASH_RECOVERY_RESULT] You just completed the smaller recovery pass. Summarize the result conversationally and briefly. Lead with whether the original request is fixed, still blocked, or needs approval.\n\nOriginal request: ${text.slice(0, 500)}\n\nResult:\n${result.slice(0, 3000)}`,
+          result,
+        );
+      }
+    }).catch(async (err) => {
+      logger.error({ err, sessionKey, jobName }, 'Context-thrash recovery failed');
+      this.recordInteractiveFailure(sessionKey, text, err, 'context_thrash_recovery_failed', { jobName });
+      const failMsg = `Recovery pass failed: ${String(err).slice(0, 200)}`;
+      this.assistant.injectPendingContext(sessionKey, text, failMsg);
+      await this._deliverDeepResult(
+        sessionKey,
+        `[CONTEXT_THRASH_RECOVERY_RESULT] The smaller recovery pass failed: ${failMsg}. Tell the user briefly and suggest checking status/log slices, not full logs.`,
+        failMsg,
+      );
+    }).finally(() => {
+      const s = this.sessions.get(sessionKey);
+      if (s?.deepTask?.jobName === jobName) delete s.deepTask;
+    });
+
+    return `${contextThrashRecoveryNotice()} I restarted it as a smaller background recovery pass and will follow up here.`;
   }
 
   /**
@@ -1534,6 +1598,14 @@ export class Gateway {
           // Re-baseline integrity checksums after chat (auto-memory may write to vault)
           scanner.refreshIntegrity();
 
+          if (response && looksLikeContextThrashText(response)) {
+            logger.warn({ sessionKey, responsePreview: response.slice(0, 200) }, 'Context-thrash text returned from assistant — starting recovery pass');
+            return this.startContextThrashRecovery(sessionKey, text, response, {
+              toolActivityCount,
+              source: 'assistant_response',
+            });
+          }
+
           // ── Auto-plan detection ──────────────────────────────────────
           // If the agent signals a complex task, auto-route to the orchestrator
           const planMatch = response?.match(/^\[PLAN_NEEDED:\s*(.+?)\]\s*/);
@@ -1700,6 +1772,14 @@ export class Gateway {
           // If aborted by user (!stop) or our timeout, return a friendly message
           if (chatAc.signal.aborted) {
             return "Stopped. What would you like to do instead?";
+          }
+
+          if (looksLikeContextThrashText(err)) {
+            logger.warn({ sessionKey, err: String(err).slice(0, 300) }, 'Context-thrash exception — starting recovery pass');
+            return this.startContextThrashRecovery(sessionKey, text, String(err), {
+              toolActivityCount,
+              source: 'exception',
+            });
           }
 
           // ── Max turns hit — auto-escalate to deep mode instead of failing silently ──
