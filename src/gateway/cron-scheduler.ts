@@ -642,7 +642,7 @@ export class CronScheduler {
       if (isDeepMode(jobName)) return;                 // (1) deep-mode router
       if (jobName.startsWith('bg:')) return;           // (2) background-task dispatcher
       if (this.jobs.some(j => j.name === jobName)) return; // (3) registered cron job
-      if (result && result !== '__NOTHING__') {
+      if (result && !CronScheduler.isCronNoise(result)) {
         const slug = jobName.includes(':') ? jobName.split(':')[0] : undefined;
         // Strip system metadata for clean conversational delivery
         const cleanResult = result
@@ -657,10 +657,13 @@ export class CronScheduler {
     this.gateway.setPhaseCompleteCallback((jobName, phase, _total, output) => {
       if (phase <= 1) return; // Don't spam for the first phase — wait for real progress
       if (/TASK_COMPLETE:/i.test(output)) return; // Final delivery handled by unleashed complete callback
+      if (this.jobs.some(j => j.name === jobName)) return; // Registered cron jobs deliver through their run result path.
       const slug = jobName.includes(':') ? jobName.split(':')[0] : undefined;
       const cleanOutput = output
         .replace(/^STATUS SUMMARY:?\s*/im, '')
+        .trim()
         .slice(0, 500);
+      if (!cleanOutput || CronScheduler.isCronNoise(cleanOutput)) return;
       // For deep-mode runs, target the originating session so the progress
       // update lands in the same Discord DM / Slack thread / dashboard window.
       const deepSessionKey = isDeepMode(jobName) ? this.gateway.findDeepTaskSessionKey(jobName) : null;
@@ -676,6 +679,7 @@ export class CronScheduler {
       const now = Date.now();
       const lastSent = lastProgressSent.get(jobName) ?? 0;
       if (now - lastSent < 300_000) return; // throttle: 1 per 5 minutes
+      if (!summary.trim() || CronScheduler.isCronNoise(summary)) return;
       lastProgressSent.set(jobName, now);
       const slug = jobName.includes(':') ? jobName.split(':')[0] : undefined;
       const deepSessionKey = isDeepMode(jobName) ? this.gateway.findDeepTaskSessionKey(jobName) : null;
@@ -1555,7 +1559,7 @@ export class CronScheduler {
     return response;
   }
 
-  private static isCronNoise(response: string): boolean {
+  static isCronNoise(response: string): boolean {
     const trimmed = response.trim();
     if (trimmed === '__NOTHING__') return true;
 
@@ -1578,7 +1582,13 @@ export class CronScheduler {
       'no updates',
       'completing silently',
     ];
-    if (noisePatterns.some((p) => lower.startsWith(p) || lower === p)) return true;
+    for (const p of noisePatterns) {
+      if (lower === p) return true;
+      if (lower.startsWith(p)) {
+        const rest = lower.slice(p.length).trim();
+        if (!rest || /^[.!)]/.test(rest) || /^(today|right now|at this time|so far)\b/.test(rest)) return true;
+      }
+    }
 
     return false;
   }

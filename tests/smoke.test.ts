@@ -5,9 +5,9 @@
 
 import { describe, it, expect } from 'vitest';
 import { shellEscape } from '../src/config.js';
-import { classifyError } from '../src/gateway/cron-scheduler.js';
+import { classifyError, CronScheduler } from '../src/gateway/cron-scheduler.js';
 import { classifyChatError } from '../src/gateway/router.js';
-import { estimateTokens } from '../src/agent/assistant.js';
+import { estimateTokens, isAutonomousNothingOutput } from '../src/agent/assistant.js';
 import { validateProposal } from '../src/agent/self-improve.js';
 
 // ── shellEscape ─────────────────────────────────────────────────────
@@ -60,6 +60,28 @@ describe('classifyError', () => {
   it('classifies unknown errors as permanent', () => {
     expect(classifyError(new Error('TypeError: cannot read'))).toBe('permanent');
     expect(classifyError('invalid JSON')).toBe('permanent');
+  });
+});
+
+// ── autonomous no-op output ─────────────────────────────────────────
+
+describe('autonomous no-op output suppression', () => {
+  it('recognizes cron no-op sentinel variants', () => {
+    expect(isAutonomousNothingOutput('__NOTHING__')).toBe(true);
+    expect(isAutonomousNothingOutput('NOTHING')).toBe(true);
+    expect(isAutonomousNothingOutput('__NOTHING__\n\n[MONITORING]')).toBe(true);
+    expect(isAutonomousNothingOutput('nothing to report')).toBe(true);
+  });
+
+  it('does not suppress substantive output that mentions nothing', () => {
+    expect(isAutonomousNothingOutput('Nothing is blocked; I sent 3 emails and updated Salesforce.')).toBe(false);
+  });
+
+  it('matches cron scheduler notification noise handling', () => {
+    expect(CronScheduler.isCronNoise('NOTHING')).toBe(true);
+    expect(CronScheduler.isCronNoise('__NOTHING__\n\n[MONITORING]')).toBe(true);
+    expect(CronScheduler.isCronNoise('No updates')).toBe(true);
+    expect(CronScheduler.isCronNoise('No updates, but I did send the brief and saved it to the vault.')).toBe(false);
   });
 });
 

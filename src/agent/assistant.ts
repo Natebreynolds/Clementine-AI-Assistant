@@ -762,6 +762,22 @@ interface RetrievedContext {
 
 // ── Cron Output Extraction ──────────────────────────────────────────
 
+/** Autonomous jobs use this sentinel to mean "completed, but do not notify the owner." */
+export function isAutonomousNothingOutput(response: string): boolean {
+  const trimmed = response.trim();
+  if (!trimmed) return false;
+  if (trimmed === '__NOTHING__') return true;
+  if (/^_*NOTHING_*$/i.test(trimmed)) return true;
+  if (/^_*NOTHING_*\s*(\(|$)/im.test(trimmed)) return true;
+  if (/^(_*NOTHING_*\s*)?\[MONITORING\]\s*$/i.test(trimmed)) return true;
+  if (trimmed.length > 80) return false;
+  const lower = trimmed.toLowerCase();
+  return lower === 'nothing to report'
+    || lower === 'nothing new to report'
+    || lower === 'no updates'
+    || lower === 'all clear';
+}
+
 /** Return the last non-empty text block that came after the last tool call, or '' if nothing/sentinel. */
 function extractDeliverable(trace: TraceEntry[]): string {
   if (trace.length === 0) return '';
@@ -780,7 +796,7 @@ function extractDeliverable(trace: TraceEntry[]): string {
   for (let i = trace.length - 1; i > lastToolIdx; i--) {
     if (trace[i].type === 'text') {
       const text = trace[i].content.trim();
-      if (text === '__NOTHING__') return '';
+      if (isAutonomousNothingOutput(text)) return '';
       if (text.length > 0) return text;
     }
   }
@@ -5380,7 +5396,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
       if (cronGuard) {
         const summary = cronGuard.getSummary();
         const mc = summary.metacognition;
-        if (mc.confidenceFinal === 'low' && deliverable && deliverable !== '__NOTHING__') {
+        if (mc.confidenceFinal === 'low' && deliverable && !isAutonomousNothingOutput(deliverable)) {
           try {
             const escalationsFile = path.join(BASE_DIR, 'escalations.json');
             const escalations: Array<Record<string, unknown>> = fs.existsSync(escalationsFile)
@@ -5926,6 +5942,19 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
       });
 
       logger.info(`Unleashed task ${jobName}: phase ${phase} complete (${(phaseDurationMs / 1000).toFixed(0)}s)`);
+
+      // The job explicitly says there is nothing to report. Treat that as a
+      // clean terminal state instead of resuming the same no-op phase until
+      // the max-phase guard fires.
+      if (isAutonomousNothingOutput(lastOutput)) {
+        appendProgress({ event: 'completed_silent', phase });
+        writeStatus({ jobName, status: 'completed', phase, startedAt, finishedAt: new Date().toISOString(), silent: true });
+        logger.info(`Unleashed task ${jobName} completed silently at phase ${phase}`);
+        if (this.onUnleashedComplete) {
+          try { this.onUnleashedComplete(jobName, '__NOTHING__'); } catch { /* non-fatal */ }
+        }
+        return '__NOTHING__';
+      }
 
       // Notify phase progress callback
       if (this.onPhaseComplete) {

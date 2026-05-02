@@ -8,7 +8,7 @@
 import path from 'node:path';
 import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import pino from 'pino';
-import { PersonalAssistant, type ProjectMeta } from '../agent/assistant.js';
+import { isAutonomousNothingOutput, PersonalAssistant, type ProjectMeta } from '../agent/assistant.js';
 import { runWithTrace, logAuditJsonl } from '../agent/hooks.js';
 import type { OnProgressCallback, OnTextCallback, OnToolActivityCallback, PlanProgressUpdate, PlanStep, SelfImproveConfig, SelfImproveExperiment, SessionProvenance, TeamMessage, VerboseLevel, WorkflowDefinition } from '../types.js';
 import { SelfImproveLoop } from '../agent/self-improve.js';
@@ -1312,7 +1312,7 @@ export class Gateway {
                 preflightAgentSlug,
               ).then(async (result) => {
                 logger.info({ sessionKey, jobName, resultLen: result?.length ?? 0 }, 'Pre-flight deep-mode task completed');
-                if (result && result !== '__NOTHING__') {
+                if (result && !isAutonomousNothingOutput(result)) {
                   this.assistant.injectPendingContext(sessionKey, text, result);
                   await this._deliverDeepResult(
                     sessionKey,
@@ -1604,7 +1604,7 @@ export class Gateway {
               deepAgentSlug,   // preserve agent persona in deep mode
             ).then(async (result) => {
               logger.info({ sessionKey, jobName, resultLen: result?.length ?? 0 }, 'Deep mode task completed');
-              if (result && result !== '__NOTHING__') {
+              if (result && !isAutonomousNothingOutput(result)) {
                 this.assistant.injectPendingContext(sessionKey, text, result);
                 await this._deliverDeepResult(
                   sessionKey,
@@ -1653,7 +1653,7 @@ export class Gateway {
               escAgentSlug,
             ).then(async (result) => {
               logger.info({ sessionKey, jobName, resultLen: result?.length ?? 0 }, 'Auto-escalated deep mode completed');
-              if (result && result !== '__NOTHING__') {
+              if (result && !isAutonomousNothingOutput(result)) {
                 this.assistant.injectPendingContext(sessionKey, text, result);
                 await this._deliverDeepResult(
                   sessionKey,
@@ -1728,7 +1728,7 @@ export class Gateway {
               mtAgentSlug,
             ).then(async (result) => {
               logger.info({ sessionKey, jobName, resultLen: result?.length ?? 0 }, 'Max-turns deep mode completed');
-              if (result && result !== '__NOTHING__') {
+              if (result && !isAutonomousNothingOutput(result)) {
                 this.assistant.injectPendingContext(sessionKey, text, result);
                 await this._deliverDeepResult(
                   sessionKey,
