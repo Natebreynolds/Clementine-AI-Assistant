@@ -1,6 +1,6 @@
 {
   "name": "clementine-agent",
-  "version": "1.18.9",
+  "version": "1.18.10",
   "description": "Clementine — Personal AI Assistant (TypeScript)",
   "type": "module",
   "main": "dist/index.js",
@@ -68,7 +68,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/Natebreynolds/Clementine-AI-Assistant.git"
+    "url": "git+https://github.com/Natebreynolds/Clementine-AI-Assistant.git"
   },
   "homepage": "https://github.com/Natebreynolds/Clementine-AI-Assistant",
   "bugs": {
