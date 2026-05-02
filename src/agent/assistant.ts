@@ -2246,8 +2246,27 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
           ? getHeartbeatSecurityPrompt()
           : getSecurityPrompt();
 
-    // Fallback model: auto-fallback on rate limits (avoid self-referencing)
-    const resolvedModel = resolveModel(model) ?? MODEL;
+    // Model routing: keep default/profile/explicit model choices for normal
+    // work, but send no-tool/no-memory interactive fast-path turns to Haiku.
+    // This preserves Sonnet for memory/tool/task work while avoiding a 30s
+    // Sonnet round trip for "hey", "thanks", and simple acknowledgements.
+    const requestedModel = model ?? profile?.model ?? null;
+    const lightweightModelEligible = !requestedModel
+      && !isHeartbeat
+      && !isCron
+      && !isPlanStep
+      && !isUnleashed
+      && toolsDisabledForCall
+      && turnPolicy?.retrievalTier === 'none'
+      && turnPolicy.effort === 'low';
+    const resolvedModel = resolveModel(requestedModel) ?? (lightweightModelEligible ? MODELS.haiku : MODEL);
+    const modelRouteReason = model
+      ? 'explicit'
+      : profile?.model
+        ? 'profile'
+        : lightweightModelEligible
+          ? 'lightweight-fast-path'
+          : 'default';
     const fallback = resolvedModel !== MODELS.sonnet ? MODELS.sonnet : undefined;
 
     // Capture source at build time so concurrent queries don't race on the global
@@ -2287,7 +2306,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
     const composioConnectedSlugs = Object.keys(composioMcpServers);
 
     const { stable, volatile: volatilePromptPart } = this.buildSystemPrompt({
-      isHeartbeat, cronTier: isPlanStep ? null : cronTier, retrievalContext, profile, sessionKey, model, verboseLevel, intentClassification,
+      isHeartbeat, cronTier: isPlanStep ? null : cronTier, retrievalContext, profile, sessionKey, model: resolvedModel, verboseLevel, intentClassification,
       contextTier: turnPolicy?.retrievalTier ?? (retrievalContext ? 'full' : 'core'),
       toolsAvailable: !toolsDisabledForCall,
       composioConnectedSlugs,
@@ -2469,6 +2488,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
     const clementineToolAllowlistCount = clementineToolAllowlist === '*'
       ? CLEMENTINE_ALL_TOOL_NAMES.length
       : clementineToolAllowlist.split(',').filter(Boolean).length;
+    const loggedToolRoute = toolsDisabledForCall ? emptyToolRoute() : toolRoute;
     if (allowedTools.length > TOOL_SURFACE_WARN_THRESHOLD) {
       logger.warn({
         sessionKey,
@@ -2480,16 +2500,20 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
       }, 'SDK allowed tool surface above warning threshold');
     }
     logger.info({
-      bundles: toolRoute.bundles,
-      fullSurface: toolRoute.fullSurface,
-      allExternalMcpServers: toolRoute.externalMcpServers === undefined,
-      allComposioToolkits: toolRoute.composioToolkits === undefined,
-      externalMcpServers: toolRoute.externalMcpServers,
-      composioToolkits: toolRoute.composioToolkits,
+      bundles: loggedToolRoute.bundles,
+      candidateBundles: toolsDisabledForCall && toolRoute.bundles.length > 0 ? toolRoute.bundles : undefined,
+      fullSurface: loggedToolRoute.fullSurface,
+      candidateFullSurface: toolsDisabledForCall && toolRoute.fullSurface ? true : undefined,
+      allExternalMcpServers: !toolsDisabledForCall && toolRoute.externalMcpServers === undefined,
+      allComposioToolkits: !toolsDisabledForCall && toolRoute.composioToolkits === undefined,
+      externalMcpServers: toolsDisabledForCall ? [] : toolRoute.externalMcpServers,
+      composioToolkits: toolsDisabledForCall ? [] : toolRoute.composioToolkits,
       mcpServerNames,
       allowedToolCount: toolsDisabledForCall ? 0 : allowedTools.length,
       clementineToolAllowlistCount: toolsDisabledForCall ? 0 : clementineToolAllowlistCount,
-      clementineToolAllowlistMode: clementineToolAllowlist === '*' ? 'all' : 'scoped',
+      clementineToolAllowlistMode: toolsDisabledForCall ? 'disabled' : clementineToolAllowlist === '*' ? 'all' : 'scoped',
+      model: resolvedModel,
+      modelRouteReason,
       toolsDisabledForCall,
       isolateClaudeConfig,
       inheritFullClaudeEnv: shouldInheritClaudeEnv,
@@ -3414,6 +3438,19 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
             ? (((sdkOptions as { allowedTools?: string[] }).allowedTools ?? [])
               .filter(t => typeof t === 'string' && t.startsWith(`mcp__${TOOLS_SERVER}__`)).length)
             : 0;
+          const lightweightTraceEligible = !model
+            && !profile?.model
+            && sdkOptions.model === MODELS.haiku
+            && effectiveTurnPolicy?.disableAllTools
+            && rawContext.tier === 'none'
+            && effectiveTurnPolicy.effort === 'low';
+          const modelRouteReason = model
+            ? 'explicit'
+            : profile?.model
+              ? 'profile'
+              : lightweightTraceEligible
+                ? 'lightweight-fast-path'
+                : 'default';
           const serverCount = sdkOptions.mcpServers ? Object.keys(sdkOptions.mcpServers).length : 0;
           logAuditJsonl({
             event_type: 'turn_trace',
@@ -3432,6 +3469,8 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
             estimated_tokens: totalEstimate,
             remaining_tokens: remainingTokens,
             max_turns: sdkOptions.maxTurns,
+            model: sdkOptions.model,
+            model_route_reason: modelRouteReason,
             effort: (sdkOptions as { effort?: string }).effort,
           });
         } catch { /* telemetry only */ }
