@@ -42,9 +42,9 @@ export async function buildComposioMcpServers(
     connected.filter(c => c.status === 'ACTIVE').map(c => c.slug),
   );
 
-  const targetSlugs = slugs?.length
-    ? slugs.filter(s => activeSlugs.has(s))
-    : [...activeSlugs];
+  const targetSlugs = slugs === undefined
+    ? [...activeSlugs]
+    : slugs.filter(s => activeSlugs.has(s));
 
   if (targetSlugs.length === 0) return {};
 

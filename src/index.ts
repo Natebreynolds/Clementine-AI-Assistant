@@ -627,26 +627,23 @@ async function asyncMain(): Promise<void> {
 
   // ── Check MCP extension permissions ────────────────────────────
   try {
-    const { checkPermissionsOnStartup, bootstrapClaudeIntegrationsFromAuditLog, probeAvailableTools } = await import('./agent/mcp-bridge.js');
+    const { checkPermissionsOnStartup, bootstrapClaudeIntegrationsFromAuditLog, loadToolInventory } = await import('./agent/mcp-bridge.js');
     checkPermissionsOnStartup();
     bootstrapClaudeIntegrationsFromAuditLog(path.join(config.BASE_DIR, 'logs', 'audit.log'));
-    // Probe the SDK's full tool inventory so buildOptions knows everything
-    // Claude Code is surfacing (claude_ai_* connectors, plugins, etc.)
-    // without per-user hardcoding. Cached 1h. On fresh probe, log a short
-    // summary so the owner can verify which connectors were detected
-    // without having to ask the assistant.
-    // force=true on startup: the 1h cache from a prior daemon version may
-    // have been taken with a stale probe config (e.g. before we started
-    // passing mcpServers to the probe). Re-probe fresh so Extensions and
-    // per-query MCP servers are discovered and whitelisted immediately.
-    probeAvailableTools(true).then(async inv => {
+    // Do not probe Claude Code's full tool inventory on every daemon start.
+    // That one-shot query can still attach hundreds of plugins/connectors and
+    // burn cache tokens before the router ever sees a user request. Use the
+    // cached inventory for dashboard/auto-skill metadata; the owner can run
+    // refresh_tool_inventory after intentionally adding connectors.
+    const inv = loadToolInventory();
+    if (inv) {
       const integrations = new Set<string>();
       for (const t of inv.tools) {
         const m = t.match(/^mcp__claude_ai_([^_]+(?:_[^_]+)*)__/);
         if (m) integrations.add(m[1].replace(/_/g, ' '));
       }
       if (integrations.size > 0) {
-        logger.info({ integrations: [...integrations].sort(), toolCount: inv.tools.length }, '🦞 Claude Desktop integrations detected');
+        logger.info({ integrations: [...integrations].sort(), toolCount: inv.tools.length, probedAt: inv.probedAt }, '🦞 Cached Claude Desktop integrations loaded');
       }
       // After inventory is live, fetch canonical schemas from every stdio
       // MCP server we can reach, then synthesize auto-skills for every
@@ -661,7 +658,9 @@ async function asyncMain(): Promise<void> {
       } catch (err) {
         logger.warn({ err }, 'Auto-skill synthesis failed (non-fatal)');
       }
-    }).catch(() => { /* non-fatal, buildOptions falls back to baseline */ });
+    } else {
+      logger.info('No cached tool inventory found; skipping startup inventory probe');
+    }
   } catch { /* non-fatal */ }
 
   // ── Initialize layers ────────────────────────────────────────────

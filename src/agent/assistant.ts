@@ -96,6 +96,7 @@ import { PromptCache } from './prompt-cache.js';
 import { searchSkills as searchSkillsSync } from './skill-extractor.js';
 import { classifyIntent, getStrategyGuidance, type IntentClassification } from './intent-classifier.js';
 import { getEventLog } from './session-event-log.js';
+import { routeToolSurface, TOOL_SURFACE_WARN_THRESHOLD } from './tool-router.js';
 
 // ── Channel capabilities ────────────────────────────────────────────
 
@@ -438,6 +439,13 @@ function buildSafeEnv(): Record<string, string> {
     sanitized.ANTHROPIC_API_KEY = apiKeyVal;
   }
   // When all are absent: HOME lets the subprocess find Keychain OAuth automatically.
+
+  // Preserve trusted Claude Code runtime flags set by config.ts. In
+  // particular, CLAUDE_CODE_DISABLE_1M_CONTEXT defaults on so background
+  // helper queries do not silently re-enable the 1M context beta.
+  if (process.env.CLAUDE_CODE_DISABLE_1M_CONTEXT !== undefined) {
+    sanitized.CLAUDE_CODE_DISABLE_1M_CONTEXT = process.env.CLAUDE_CODE_DISABLE_1M_CONTEXT;
+  }
 
   // Step 3: Add trusted markers AFTER sanitization
   sanitized.CLEMENTINE_HOME = BASE_DIR;
@@ -996,13 +1004,27 @@ export class PersonalAssistant {
       // weirdness. Single-line grep target: 'SDK init — MCP servers'.
       try {
         const statuses = sysMsg.mcp_servers.map((s: any) => `${s.name}:${s.status}`);
-        logger.info({
+        const toolCount = Array.isArray(sysMsg.tools) ? sysMsg.tools.length : 0;
+        const payload = {
           statuses,
-          toolCount: Array.isArray(sysMsg.tools) ? sysMsg.tools.length : 0,
+          toolCount,
           sessionId: sysMsg.session_id,
           cwd: sysMsg.cwd,
           model: sysMsg.model,
-        }, 'SDK init — MCP servers');
+        };
+        if (toolCount > TOOL_SURFACE_WARN_THRESHOLD) {
+          logger.warn(payload, 'SDK init — MCP servers');
+          logAuditJsonl({
+            event_type: 'tool_surface_high',
+            tool_count: toolCount,
+            threshold: TOOL_SURFACE_WARN_THRESHOLD,
+            model: sysMsg.model,
+            cwd: sysMsg.cwd,
+            statuses,
+          });
+        } else {
+          logger.info(payload, 'SDK init — MCP servers');
+        }
       } catch { /* non-fatal */ }
     }
     // Auto-register Claude Desktop integrations from the authoritative tool
@@ -1865,6 +1887,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
     abortController?: AbortController;
     effort?: 'low' | 'medium' | 'high' | 'max';
     maxBudgetUsd?: number;
+    toolScopeText?: string;
     thinking?: { type: 'adaptive' };
     outputFormat?: { type: 'json_schema'; schema: Record<string, unknown> };
     stallGuard?: StallGuard;
@@ -1888,11 +1911,16 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
       abortController,
       effort,
       maxBudgetUsd,
+      toolScopeText,
       thinking,
       outputFormat,
       stallGuard,
       intentClassification,
     } = opts;
+
+    const isCron = cronTier !== null;
+    const toolsDisabledForCall = disableAllTools || (isHeartbeat && !isCron);
+    const toolRoute = routeToolSurface(toolScopeText);
 
     let allowedTools = [
       'Read', 'Write', 'Edit', 'Bash', 'Glob', 'Grep',
@@ -2056,7 +2084,6 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
 
     // Heartbeats get full restrictions. Cron jobs tier 2+ get Bash/Write/Edit.
     // Cron tier 1 gets heartbeat restrictions (read-only + vault writes).
-    const isCron = cronTier !== null;
     const disallowed = isHeartbeat && (!isCron || (cronTier ?? 0) < 2)
       ? [...getHeartbeatDisallowedTools()]
       : [];
@@ -2108,15 +2135,19 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
     // even when our per-turn goals/memory block changes.
     // Composio toolkits — build first so we can pass connected slugs into
     // buildSystemPrompt for the "prefer Composio over claude.ai" rule.
-    // Each connected toolkit becomes an in-process MCP server
+    // Each selected toolkit becomes an in-process MCP server
     // (mcp__gmail__*, mcp__slack__*, …). Profile-level allowlist
-    // (profile.allowedComposioToolkits) constrains which toolkits this
-    // agent sees; omit to surface every active connection.
+    // (profile.allowedComposioToolkits) wins; otherwise infer the smallest
+    // relevant set from the prompt/job text. An explicit "all integrations"
+    // request still surfaces every active connection.
     let composioMcpServers: Record<string, any> = {};
-    if (!disableAllTools && !isPlanStep) {
+    if (!toolsDisabledForCall && !isPlanStep) {
       try {
         const { buildComposioMcpServers } = await import('../integrations/composio/mcp-bridge.js');
-        const allowList = (profile as { allowedComposioToolkits?: string[] } | null | undefined)?.allowedComposioToolkits;
+        const profileAllowList = (profile as { allowedComposioToolkits?: string[] } | null | undefined)?.allowedComposioToolkits;
+        const allowList = Array.isArray(profileAllowList)
+          ? profileAllowList
+          : toolRoute.composioToolkits;
         composioMcpServers = await buildComposioMcpServers(allowList);
       } catch (err) {
         // Composio is purely additive — never block the agent if it fails.
@@ -2152,18 +2183,19 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
       : undefined
     );
 
-    // ── Compute budget (telemetry only) ───────────────────────────
-    // Cost is informational on a Claude subscription — killing a job
-    // mid-phase because it hit $5 in tokens is worse than the cost.
-    // We still compute the figure so dashboards/logs can show it, but
-    // do not pass it into the SDK as an enforcement knob.
+    // ── Compute cost budget ───────────────────────────────────────
+    // The SDK enforces maxBudgetUsd as a hard stop. This is the only
+    // reliable guardrail for schema-cache spikes because they happen inside
+    // the Claude Code process after options are handed off.
     const computedBudget: number | undefined = maxBudgetUsd ?? (
       isHeartbeat && !isCron ? BUDGET.heartbeat
       : isCron && (cronTier ?? 0) < 2 ? BUDGET.cronT1
       : isCron ? BUDGET.cronT2
       : BUDGET.chat
     );
-    void computedBudget; // reserved for future cost telemetry — not enforced
+    const enforcedBudget = computedBudget !== undefined && Number.isFinite(computedBudget) && computedBudget > 0
+      ? computedBudget
+      : undefined;
 
     // ── Task budget (tokens) ──────────────────────────────────────
     // Soft brake — the SDK tells the model its remaining token budget so it
@@ -2192,22 +2224,25 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
     // The Anthropic API now rejects `taskBudget` for both Haiku AND Sonnet
     // ("This model does not support user-configurable task budgets" — 400).
     // We previously gated by !haiku, but that left Sonnet crons failing on
-    // every run. Cost is informational on a Claude subscription anyway —
-    // `maxTurns` and the wall-clock cap (`maxHours` for unleashed) are the
-    // actual brakes.
+    // every run. `maxBudgetUsd`, `maxTurns`, and the wall-clock cap
+    // (`maxHours` for unleashed) are the actual brakes.
     //
     // computedTaskBudget is still computed below for any future telemetry
-    // path that wants to log "soft target" values, but it is intentionally
-    // never passed into sdkOptions.
+    // path that wants to log "soft target" values. Cost enforcement is done
+    // with maxBudgetUsd above.
     const supportsTaskBudget = false;
 
     // Merge external MCP servers (Claude Desktop, Claude Code, user-managed).
-    // Skip when tools are disabled (no point connecting to servers we won't use)
-    // or for internal plan steps that only need Clementine's own tools.
+    // Skip when tools are disabled, for plan steps, and for routine turns
+    // where the prompt/job text doesn't mention a matching tool surface.
     let externalMcpServers: Record<string, any> = {};
     try {
-      if (_mcpBridge && !disableAllTools && !isPlanStep) {
-        externalMcpServers = _mcpBridge.getMcpServersForAgent(profile?.allowedMcpServers);
+      if (_mcpBridge && !toolsDisabledForCall && !isPlanStep) {
+        const profileAllowList = Array.isArray(profile?.allowedMcpServers)
+          ? profile.allowedMcpServers
+          : undefined;
+        const allowList = profileAllowList ?? toolRoute.externalMcpServers;
+        externalMcpServers = _mcpBridge.getMcpServersForAgent(allowList);
       }
     } catch { /* non-fatal — run with just Clementine's own server */ }
 
@@ -2218,6 +2253,31 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
     // SessionStore adapter: mirror SDK transcripts into our SQLite store.
     // Resume then works from the durable store, not just local JSONL.
     const sessionStore = this.getSessionStore();
+    const shouldInheritClaudeEnv = !toolsDisabledForCall
+      && !isPlanStep
+      && (toolRoute.inheritFullClaudeEnv || toolRoute.fullSurface);
+    const isolateClaudeConfig = !toolRoute.fullSurface;
+    const mcpServerNames = toolsDisabledForCall
+      ? []
+      : [TOOLS_SERVER, ...Object.keys(externalMcpServers), ...Object.keys(composioMcpServers)];
+    logger.info({
+      bundles: toolRoute.bundles,
+      fullSurface: toolRoute.fullSurface,
+      allExternalMcpServers: toolRoute.externalMcpServers === undefined,
+      allComposioToolkits: toolRoute.composioToolkits === undefined,
+      externalMcpServers: toolRoute.externalMcpServers,
+      composioToolkits: toolRoute.composioToolkits,
+      mcpServerNames,
+      toolsDisabledForCall,
+      isolateClaudeConfig,
+      inheritFullClaudeEnv: shouldInheritClaudeEnv,
+      maxBudgetUsd: enforcedBudget,
+      isCron,
+      cronTier,
+      isPlanStep,
+      isUnleashed,
+      sessionKey,
+    }, 'SDK tool route selected');
 
     return {
       systemPrompt: fullSystemPrompt,
@@ -2235,46 +2295,49 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
       //                      producing `<tool_use_error>No such tool available: mcp__*__*`
       //                      for every Extension and custom stdio server).
       //   - `disallowedTools` → blocklist, takes precedence.
-      tools: disableAllTools ? [] : allowedTools.filter(t => !t.startsWith('mcp__')),
-      allowedTools: disableAllTools ? [] : allowedTools,
+      tools: toolsDisabledForCall ? [] : allowedTools.filter(t => !t.startsWith('mcp__')),
+      allowedTools: toolsDisabledForCall ? [] : allowedTools,
       disallowedTools: disallowed,
       ...(streaming ? { includePartialMessages: true } : {}),
-      mcpServers: {
-        [TOOLS_SERVER]: {
-          type: 'stdio',
-          command: 'node',
-          args: [MCP_SERVER_SCRIPT],
-          // Spread process.env so the MCP subprocess sees the full environment
-          // the daemon is running with — API keys hydrated from .env/Keychain,
-          // PATH, HOME, etc. Without this, tools that inspect env vars
-          // (integration_status, Outlook/Graph, Salesforce) see only the
-          // handful we pass and report everything as "missing." Our explicit
-          // keys come after the spread so we always win on overlaps.
-          env: {
-            ...process.env,
-            CLEMENTINE_HOME: BASE_DIR,
-            CLEMENTINE_TEAM_AGENT: profile?.slug ?? 'clementine',
-            CLEMENTINE_INTERACTION_SOURCE: sourceOverride ?? inferInteractionSource(sessionKey),
+      mcpServers: toolsDisabledForCall
+        ? {}
+        : {
+          [TOOLS_SERVER]: {
+            type: 'stdio',
+            command: 'node',
+            args: [MCP_SERVER_SCRIPT],
+            // Spread process.env so the MCP subprocess sees the full environment
+            // the daemon is running with — API keys hydrated from .env/Keychain,
+            // PATH, HOME, etc. Without this, tools that inspect env vars
+            // (integration_status, Outlook/Graph, Salesforce) see only the
+            // handful we pass and report everything as "missing." Our explicit
+            // keys come after the spread so we always win on overlaps.
+            env: {
+              ...process.env,
+              CLEMENTINE_HOME: BASE_DIR,
+              CLEMENTINE_TEAM_AGENT: profile?.slug ?? 'clementine',
+              CLEMENTINE_INTERACTION_SOURCE: sourceOverride ?? inferInteractionSource(sessionKey),
+            },
           },
+          ...externalMcpServers,
+          ...composioMcpServers,
         },
-        ...externalMcpServers,
-        ...composioMcpServers,
-      },
       ...(abortController ? { abortController } : {}),
       maxTurns: effectiveMaxTurns,
       cwd: BASE_DIR,
-      // NOTE: do NOT pass `env: SAFE_ENV` here. The SDK's `env` option
-      // replaces process.env for the claude CLI subprocess, and the CLI's
-      // claude.ai remote connector bootstrap (Drive, Gmail, Calendar, M365,
-      // Slack) silently drops when vars it expects aren't present. The
-      // probeAvailableTools() call doesn't pass `env`, inherits process.env,
-      // and correctly surfaces claude.ai connectors. Matching that behavior
-      // here is the fix for the week-long "No such tool available:
-      // mcp__claude_ai_Google_Drive__*" bug. Per-MCP-server env isolation
-      // still happens inside the mcpServers entries (line ~1855) — this
-      // change only affects the CLI subprocess's own env.
+      // Default to SAFE_ENV so Claude Code does not auto-attach every
+      // claude.ai remote connector on routine turns. Inherit the full daemon
+      // env only when the prompt/job mentions a connector-backed service.
+      // Per-MCP-server env isolation still happens inside each mcpServers
+      // entry; this only affects the Claude Code subprocess itself.
+      ...(shouldInheritClaudeEnv ? {} : { env: SAFE_ENV }),
+      // Avoid ambient Claude Code user/project/local settings and plugins by
+      // default. Those can silently attach hundreds of tools. Explicit MCP
+      // servers above still work; "all integrations/full tool surface" keeps
+      // the CLI defaults for admin/debug sessions.
+      ...(isolateClaudeConfig ? { settingSources: [], plugins: [], skills: [] } : {}),
       ...(computedEffort ? { effort: computedEffort } : {}),
-      // maxBudgetUsd intentionally omitted — see comment above.
+      ...(enforcedBudget !== undefined ? { maxBudgetUsd: enforcedBudget } : {}),
       ...(computedThinking ? { thinking: computedThinking } : {}),
       ...(outputFormat ? { outputFormat } : {}),
       canUseTool: async (toolName: string, toolInput: Record<string, unknown>, _options: { signal: AbortSignal; toolUseID: string }) => {
@@ -2965,7 +3028,20 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
 
     try {
       for (let attempt = 0; attempt <= PersonalAssistant.RATE_LIMIT_MAX_RETRIES; attempt++) {
-        const sdkOptions = await this.buildOptions({ model, maxTurns: maxTurnsOverride ?? null, retrievalContext, profile, sessionKey, streaming: !!onText, verboseLevel, abortController, stallGuard, intentClassification, effort: intentClassification?.suggestedEffort });
+        const sdkOptions = await this.buildOptions({
+          model,
+          maxTurns: maxTurnsOverride ?? null,
+          retrievalContext,
+          profile,
+          sessionKey,
+          streaming: !!onText,
+          verboseLevel,
+          abortController,
+          stallGuard,
+          intentClassification,
+          effort: intentClassification?.suggestedEffort,
+          toolScopeText: [prompt, retrievalContext, profile?.description, profile?.systemPromptBody].filter(Boolean).join('\n\n'),
+        });
 
         // If a project matched, switch cwd so the agent gets its tools/CLAUDE.md
         if (matchedProject) {
@@ -4539,6 +4615,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
       stallGuard: cronGuard,
       profile: cronProfile,
       disableAllTools: opts?.disableAllTools ?? false,
+      toolScopeText: [jobName, jobPrompt, cronProfile?.description, cronProfile?.systemPromptBody].filter(Boolean).join('\n\n'),
     });
 
     // Override cwd if a project workDir is specified
@@ -5051,12 +5128,10 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
         model: model ?? null,
         enableTeams: true,
         isUnleashed: true,
-        // buildOptions intentionally drops this before reaching the SDK
-        // (line ~2100 comment). Passing it here only matters if someone
-        // later re-enables the SDK knob.
         ...(BUDGET.unleashedPhase ? { maxBudgetUsd: BUDGET.unleashedPhase } : {}),
         stallGuard: phaseGuard,
         profile: unleashedProfile,
+        toolScopeText: [jobName, jobPrompt, unleashedProfile?.description, unleashedProfile?.systemPromptBody].filter(Boolean).join('\n\n'),
       });
 
       // Enable progress summaries for real-time status updates
@@ -5445,6 +5520,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
         enableTeams: true,
         profile,
         stallGuard: teamGuard,
+        toolScopeText: [taskName, content, profile.description, profile.systemPromptBody].filter(Boolean).join('\n\n'),
       });
 
       // Resolve project for cwd: single project binding or first from multi-project list

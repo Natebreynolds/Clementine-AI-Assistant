@@ -65,6 +65,7 @@ const ENUM_KEYS: Record<string, readonly string[]> = {
   WEBHOOK_ENABLED: ['true', 'false'],
   ALLOW_ALL_USERS: ['true', 'false'],
   CLEMENTINE_ALLOW_SOURCE_EDITS: ['true', 'false', '1', '0', 'yes', 'no'],
+  CLAUDE_CODE_DISABLE_1M_CONTEXT: ['true', 'false', '1', '0', 'yes', 'no'],
 };
 
 // Channel pairings: when channel.enableKey is truthy, the companion keys

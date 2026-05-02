@@ -63,6 +63,7 @@ const SPECS: KeySpec[] = [
   { key: 'HAIKU_MODEL', group: 'models', jsonPath: 'models.haiku', default: 'claude-haiku-4-5-20251001' },
   { key: 'SONNET_MODEL', group: 'models', jsonPath: 'models.sonnet', default: 'claude-sonnet-4-6' },
   { key: 'OPUS_MODEL', group: 'models', jsonPath: 'models.opus', default: 'claude-opus-4-7' },
+  { key: 'CLAUDE_CODE_DISABLE_1M_CONTEXT', group: 'models', default: true },
 
   // Team routing
   { key: 'AUTO_DELEGATE_ENABLED', group: 'team', default: false },
