@@ -2027,6 +2027,7 @@ export class Gateway {
             `Last run: ${state.lastRunAt || 'never'}\n` +
             `Total experiments: ${state.totalExperiments}\n` +
             `Pending approvals: ${state.pendingApprovals}\n` +
+            (state.lastDiagnostic ? `Diagnostic: ${state.lastDiagnostic}\n` : '') +
             `Baseline — Feedback: ${(m.feedbackPositiveRatio * 100).toFixed(0)}% positive, ` +
             `Cron: ${(m.cronSuccessRate * 100).toFixed(0)}% success, ` +
             `Quality: ${m.avgResponseQuality.toFixed(2)}`;

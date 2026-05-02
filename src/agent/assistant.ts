@@ -366,6 +366,12 @@ const AUTO_MEMORY_MODEL = MODELS.sonnet;
 const OWNER = OWNER_NAME || 'the user';
 const MCP_SERVER_SCRIPT = path.join(PKG_DIR, 'dist', 'tools', 'mcp-server.js');
 const TOOLS_SERVER = `${ASSISTANT_NAME.toLowerCase()}-tools`;
+type MemoryExtractionSkipReason =
+  | 'too_short'
+  | 'pure_greeting'
+  | 'rate_limited'
+  | 'injection_blocked'
+  | 'no_memory_store';
 
 function mcpTool(name: string): string {
   return `mcp__${TOOLS_SERVER}__${name}`;
@@ -3192,14 +3198,15 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
       }
     }
 
-    // Fire background memory extraction (non-blocking)
-    if (
-      text.length >= AUTO_MEMORY_MIN_LENGTH &&
-      responseText &&
-      !responseText.startsWith('Error:') &&
-      this.worthExtracting(text, responseText)
-    ) {
-      this.spawnMemoryExtraction(text, responseText, key, profile).catch(err => logger.debug({ err }, 'Memory extraction failed'));
+    // Fire background memory extraction (non-blocking). Skips are logged with
+    // structured reasons so memory gaps are diagnosable without reading chats.
+    if (responseText && !responseText.startsWith('Error:')) {
+      const extractionDecision = this.assessMemoryExtraction(text, responseText, key, profile);
+      if (extractionDecision.ok) {
+        this.spawnMemoryExtraction(text, responseText, key, profile).catch(err => logger.debug({ err }, 'Memory extraction failed'));
+      } else {
+        this.logMemoryExtractionSkip(extractionDecision.reason, text, responseText, key, profile);
+      }
     }
 
     // Score outcome-driven salience: for the chunks we retrieved this turn,
@@ -4554,15 +4561,22 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
 
   // ── Auto-Memory Extraction ────────────────────────────────────────
 
-  private lastExtractionTime = 0;
+  private lastExtractionTimes = new Map<string, number>();
 
-  private worthExtracting(prompt: string, response: string): boolean {
-    if (response.length < 100) return false;
+  private memoryExtractionKey(sessionKey?: string, profile?: AgentProfile): string {
+    return `${profile?.slug ?? 'global'}:${sessionKey ?? 'no-session'}`;
+  }
 
-    // Skip very short acknowledgment responses
-    if (response.length < 100) return false;
+  private assessMemoryExtraction(
+    prompt: string,
+    response: string,
+    sessionKey?: string,
+    profile?: AgentProfile,
+  ): { ok: true } | { ok: false; reason: MemoryExtractionSkipReason } {
+    if (!this.memoryStore) return { ok: false, reason: 'no_memory_store' };
 
-    // Only skip pure greetings with no substance at all
+    // Only skip pure greetings with no substance at all. Check this before
+    // length so "hey" is diagnosable as intent, not generic shortness.
     const pureGreetings = [
       'hello', 'hi', 'hey', 'thanks', 'thank you',
       'ok', 'okay', 'sure', 'got it', 'sounds good',
@@ -4570,15 +4584,55 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
     ];
     const lower = prompt.toLowerCase().trim();
     if (pureGreetings.some((g) => lower === g || lower === g + '!' || lower === g + '.')) {
-      return false;
+      return { ok: false, reason: 'pure_greeting' };
     }
 
-    // Rate limit: max 1 extraction per 45 seconds per session
-    const now = Date.now();
-    if (now - this.lastExtractionTime < 45_000) return false;
-    this.lastExtractionTime = now;
+    if (prompt.length < AUTO_MEMORY_MIN_LENGTH || response.length < 100) {
+      return { ok: false, reason: 'too_short' };
+    }
 
-    return true;
+    // Rate limit per session/agent. The old process-wide throttle meant one
+    // active chat could suppress memory extraction for unrelated agents.
+    const now = Date.now();
+    const key = this.memoryExtractionKey(sessionKey, profile);
+    const last = this.lastExtractionTimes.get(key) ?? 0;
+    if (now - last < 45_000) return { ok: false, reason: 'rate_limited' };
+    this.lastExtractionTimes.set(key, now);
+
+    return { ok: true };
+  }
+
+  private logMemoryExtractionSkip(
+    reason: MemoryExtractionSkipReason,
+    userMessage: string,
+    assistantResponse: string,
+    sessionKey?: string,
+    profile?: AgentProfile,
+  ): void {
+    logger.debug({
+      reason,
+      sessionKey,
+      agentSlug: profile?.slug,
+      promptChars: userMessage.length,
+      responseChars: assistantResponse.length,
+    }, 'Auto-memory extraction skipped');
+
+    if (!this.memoryStore) return;
+    try {
+      this.memoryStore.logExtraction({
+        sessionKey: sessionKey ?? 'unknown',
+        userMessage: userMessage.slice(0, 500),
+        toolName: 'auto_memory_skip',
+        toolInput: JSON.stringify({
+          reason,
+          promptChars: userMessage.length,
+          responseChars: assistantResponse.length,
+        }),
+        extractedAt: new Date().toISOString(),
+        status: `skipped:${reason}`,
+        agentSlug: profile?.slug,
+      });
+    } catch { /* telemetry only */ }
   }
 
   private async spawnMemoryExtraction(
@@ -4591,6 +4645,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
     const memScan = scanner.scan(userMessage);
     if (memScan.verdict === 'block') {
       logger.info('Skipping memory extraction — message was flagged as injection');
+      this.logMemoryExtractionSkip('injection_blocked', userMessage, assistantResponse, sessionKey, profile);
       return;
     }
 

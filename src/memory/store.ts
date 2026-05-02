@@ -5725,9 +5725,12 @@ export class MemoryStore {
     chunks: { total: number; consolidated: number; pinned: number; softDeleted: number; zombieCount: number };
     chunksByCategory: Array<{ category: string | null; count: number }>;
     tableRowCounts: Record<string, number>;
+    recentActivity: { recallTracesLast7d: number; recallTracesLast30d: number; extractionSkipsLast30d: number };
     topCitedLast30d: Array<{ chunkId: number; sourceFile: string; section: string; refCount: number }>;
+    userModelSlots: { total: number; populated: number; global: number; agentScoped: number };
     staleUserModelSlots: Array<{ slot: string; ageDays: number; agentSlug: string | null }>;
     staleHighSalienceChunks: Array<{ chunkId: number; sourceFile: string; section: string; salience: number; lastOutcomeScore: number }>;
+    selfImprovePlateausLast7d: number;
     chunkCacheStats: ReturnType<HotCache<number, unknown>['stats']>;
     writeQueue: { size: number; dropped: number } | null;
     lastIntegrityReport: { ftsOk: boolean; ftsRebuilt: boolean; orphanRefsNulled: number; missingEmbeddings: number; ranAt: string } | null;
@@ -5805,6 +5808,60 @@ export class MemoryStore {
       }
     }
 
+    const recentActivity = {
+      recallTracesLast7d: (this.conn
+        .prepare(`SELECT COUNT(*) AS c FROM recall_traces WHERE retrieved_at >= datetime('now', '-7 days')`)
+        .get() as { c: number }).c,
+      recallTracesLast30d: (this.conn
+        .prepare(`SELECT COUNT(*) AS c FROM recall_traces WHERE retrieved_at >= datetime('now', '-30 days')`)
+        .get() as { c: number }).c,
+      extractionSkipsLast30d: (this.conn
+        .prepare(`SELECT COUNT(*) AS c FROM memory_extractions WHERE status LIKE 'skipped:%' AND extracted_at >= datetime('now', '-30 days')`)
+        .get() as { c: number }).c,
+    };
+
+    const userModelSlots = this.conn
+      .prepare(
+        `SELECT
+           COUNT(*) AS total,
+           COALESCE(SUM(CASE WHEN length(trim(content)) > 0 THEN 1 ELSE 0 END), 0) AS populated,
+           COALESCE(SUM(CASE WHEN agent_slug IS NULL THEN 1 ELSE 0 END), 0) AS global,
+           COALESCE(SUM(CASE WHEN agent_slug IS NOT NULL THEN 1 ELSE 0 END), 0) AS agentScoped
+         FROM user_model_blocks`,
+      )
+      .get() as { total: number; populated: number; global: number; agentScoped: number };
+
+    const selfImprovePlateausLast7d = (() => {
+      const logPath = path.join(BASE_DIR, 'self-improve', 'experiment-log.jsonl');
+      if (!existsSync(logPath)) return 0;
+      const cutoff = Date.now() - 7 * 24 * 60 * 60 * 1000;
+      try {
+        return readFileSync(logPath, 'utf-8')
+          .trim()
+          .split('\n')
+          .filter(Boolean)
+          .reduce((count, line) => {
+            try {
+              const entry = JSON.parse(line) as {
+                startedAt?: string;
+                finishedAt?: string;
+                reason?: string;
+                hypothesis?: string;
+              };
+              const ts = Date.parse(entry.finishedAt ?? entry.startedAt ?? '');
+              if (!Number.isFinite(ts) || ts < cutoff) return count;
+              const plateau = entry.reason?.startsWith('Plateau')
+                || entry.hypothesis?.startsWith('No new hypothesis');
+              return plateau ? count + 1 : count;
+            } catch {
+              return count;
+            }
+          }, 0);
+      } catch {
+        return 0;
+      }
+    })();
+
     const topCited = this.conn
       .prepare(
         `SELECT o.chunk_id, c.source_file, c.section, COUNT(*) AS ref_count
@@ -5828,14 +5885,17 @@ export class MemoryStore {
       },
       chunksByCategory: byCategory,
       tableRowCounts,
+      recentActivity,
       topCitedLast30d: topCited.map((r) => ({
         chunkId: r.chunk_id,
         sourceFile: r.source_file,
         section: r.section,
         refCount: r.ref_count,
       })),
+      userModelSlots,
       staleUserModelSlots: this.findStaleUserModelSlots(),
       staleHighSalienceChunks: this.findStaleHighSalienceChunks({ limit: 10 }),
+      selfImprovePlateausLast7d,
       chunkCacheStats: this.chunkRowCache.stats(),
       writeQueue: this.getWriteQueueStats(),
       lastIntegrityReport: (() => {

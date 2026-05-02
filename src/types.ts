@@ -432,7 +432,16 @@ export interface MemoryExtraction {
   toolName: string;           // e.g., 'memory_write', 'note_create'
   toolInput: string;          // JSON stringified tool input
   extractedAt: string;        // ISO timestamp
-  status: 'active' | 'corrected' | 'dismissed' | 'dedup_skipped';
+  status:
+    | 'active'
+    | 'corrected'
+    | 'dismissed'
+    | 'dedup_skipped'
+    | 'skipped:too_short'
+    | 'skipped:pure_greeting'
+    | 'skipped:rate_limited'
+    | 'skipped:injection_blocked'
+    | 'skipped:no_memory_store';
   correction?: string;        // replacement fact if corrected
   agentSlug?: string;         // agent that triggered this extraction (null = default/global)
 }
@@ -707,6 +716,8 @@ export interface SelfImproveState {
     category: string;
     diagnostic: string;
   };
+  /** Last non-fatal state diagnostic, such as a stale run being reconciled. */
+  lastDiagnostic?: string;
 }
 
 export interface SelfImproveConfig {

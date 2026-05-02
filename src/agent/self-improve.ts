@@ -16,6 +16,7 @@ import {
   mkdirSync,
   readFileSync,
   readdirSync,
+  statSync,
   unlinkSync,
   writeFileSync,
 } from 'node:fs';
@@ -38,6 +39,7 @@ import {
   GOALS_DIR,
 } from '../config.js';
 import { listAllGoals } from '../tools/shared.js';
+import { MemoryStore } from '../memory/store.js';
 import type {
   CronRunEntry,
   EvolutionVersion,
@@ -265,6 +267,171 @@ interface PerformanceSnapshot {
   advisorInsights: string[];
 }
 
+export const USER_MODEL_SLOT_KEYS = ['user_facts', 'goals', 'relationships', 'agent_persona'] as const;
+export type UserModelSlotKey = typeof USER_MODEL_SLOT_KEYS[number];
+
+export interface SelfImproveEvidenceSnapshot {
+  feedbackCreatedAt?: string[];
+  reflectionCreatedAt?: string[];
+  cronErrorStartedAt?: string[];
+  cronReflectionAt?: string[];
+  triggerUpdatedAt?: string[];
+  triggerCount?: number;
+  userModelNeedsSeed?: boolean;
+}
+
+export function isPlateauExperiment(entry: Partial<SelfImproveExperiment>): boolean {
+  return entry.reason?.startsWith('Plateau') === true
+    || entry.hypothesis?.startsWith('No new hypothesis') === true;
+}
+
+function entryTimeMs(entry: Partial<SelfImproveExperiment>): number {
+  const ts = Date.parse(entry.finishedAt ?? entry.startedAt ?? '');
+  return Number.isFinite(ts) ? ts : 0;
+}
+
+export function latestPlateauTime(history: Array<Partial<SelfImproveExperiment>>): number {
+  let latest = 0;
+  for (const entry of history) {
+    if (!isPlateauExperiment(entry)) continue;
+    latest = Math.max(latest, entryTimeMs(entry));
+  }
+  return latest;
+}
+
+function latestIsoTime(values: Array<string | undefined | null> = []): number {
+  let latest = 0;
+  for (const value of values) {
+    const ts = Date.parse(value ?? '');
+    if (Number.isFinite(ts)) latest = Math.max(latest, ts);
+  }
+  return latest;
+}
+
+export function newestSelfImproveEvidenceTime(evidence: SelfImproveEvidenceSnapshot): number {
+  if (evidence.userModelNeedsSeed) return Date.now();
+  return Math.max(
+    latestIsoTime(evidence.feedbackCreatedAt),
+    latestIsoTime(evidence.reflectionCreatedAt),
+    latestIsoTime(evidence.cronErrorStartedAt),
+    latestIsoTime(evidence.cronReflectionAt),
+    latestIsoTime(evidence.triggerUpdatedAt),
+  );
+}
+
+export function shouldSkipSelfImproveForPlateau(
+  history: Array<Partial<SelfImproveExperiment>>,
+  evidence: SelfImproveEvidenceSnapshot,
+): { skip: boolean; reason?: string } {
+  const plateauAt = latestPlateauTime(history);
+  if (plateauAt === 0) return { skip: false };
+  const newestEvidenceAt = newestSelfImproveEvidenceTime(evidence);
+  if (newestEvidenceAt > plateauAt) return { skip: false };
+  return {
+    skip: true,
+    reason: `No new self-improvement evidence since latest plateau at ${new Date(plateauAt).toISOString()}`,
+  };
+}
+
+export function shouldAppendPlateauMarker(
+  history: Array<Partial<SelfImproveExperiment>>,
+  nowMs: number = Date.now(),
+  windowMs: number = 24 * 60 * 60 * 1000,
+): boolean {
+  const plateauAt = latestPlateauTime(history);
+  return plateauAt === 0 || nowMs - plateauAt > windowMs;
+}
+
+export function reconcileSelfImproveStateSnapshot(
+  state: SelfImproveState,
+  actualPending: number,
+  opts: { nowMs?: number; maxDurationMs?: number; graceMs?: number } = {},
+): { state: SelfImproveState; changed: boolean; diagnostics: string[] } {
+  const next: SelfImproveState = { ...state };
+  const diagnostics: string[] = [];
+  let changed = false;
+
+  if (next.pendingApprovals !== actualPending) {
+    next.pendingApprovals = actualPending;
+    diagnostics.push(`Pending approvals reconciled to ${actualPending}`);
+    changed = true;
+  }
+
+  if (next.status === 'running' && next.lastRunAt) {
+    const started = Date.parse(next.lastRunAt);
+    const now = opts.nowMs ?? Date.now();
+    const staleAfter = (opts.maxDurationMs ?? DEFAULT_CONFIG.maxDurationMs) + (opts.graceMs ?? 5 * 60 * 1000);
+    if (Number.isFinite(started) && now - started > staleAfter) {
+      next.status = 'failed';
+      next.currentIteration = 0;
+      next.lastDiagnostic = `Stale self-improve run cleared after ${Math.round((now - started) / 60_000)} minutes`;
+      diagnostics.push(next.lastDiagnostic);
+      changed = true;
+    }
+  }
+
+  return { state: next, changed, diagnostics };
+}
+
+export function normalizeUserModelSlots(slots: unknown): Partial<Record<UserModelSlotKey, string>> {
+  if (!slots || typeof slots !== 'object') return {};
+  const input = slots as Record<string, unknown>;
+  const out: Partial<Record<UserModelSlotKey, string>> = {};
+  for (const key of USER_MODEL_SLOT_KEYS) {
+    const value = input[key];
+    if (typeof value === 'string' && value.trim()) {
+      out[key] = value.trim();
+    } else if (Array.isArray(value)) {
+      const lines = value
+        .map(v => typeof v === 'string' ? v.trim() : '')
+        .filter(Boolean);
+      if (lines.length > 0) out[key] = lines.map(v => `- ${v.replace(/^[-*]\s*/, '')}`).join('\n');
+    }
+  }
+  return out;
+}
+
+export function sanitizeUserModelFrontmatter(frontmatterYaml: string): string {
+  const lines = frontmatterYaml
+    .trim()
+    .split(/\r?\n/)
+    .map(line => line.replace(/\s+$/, ''));
+
+  if (/^```(?:ya?ml)?\s*$/i.test(lines[0]?.trim() ?? '')) {
+    lines.shift();
+  }
+  if (/^```\s*$/.test(lines[lines.length - 1]?.trim() ?? '')) {
+    lines.pop();
+  }
+  while (lines[0]?.trim() === '---') {
+    lines.shift();
+  }
+  while (lines[lines.length - 1]?.trim() === '---') {
+    lines.pop();
+  }
+
+  const sanitized = lines
+    .filter(line => !/^\s*last_updated\s*:/i.test(line))
+    .join('\n')
+    .trim();
+
+  return sanitized || 'confidence_scores: {}';
+}
+
+export function buildUserModelMarkdown(
+  frontmatterYaml: string,
+  slots: Partial<Record<UserModelSlotKey, string>>,
+  updatedAt: string = new Date().toISOString(),
+): string {
+  const body = USER_MODEL_SLOT_KEYS
+    .filter(key => slots[key])
+    .map(key => `## ${key}\n\n${slots[key]}`)
+    .join('\n\n');
+  return `---\n${sanitizeUserModelFrontmatter(frontmatterYaml)}\nlast_updated: "${updatedAt}"\n---\n\n# User Model\n\n` +
+    `This file is auto-generated by the self-improvement loop. The DB-backed user_model_blocks table is the prompt source of truth.\n\n` +
+    `${body}\n`;
+}
+
 // ── SelfImproveLoop ──────────────────────────────────────────────────
 
 export class SelfImproveLoop {
@@ -323,6 +490,7 @@ export class SelfImproveLoop {
     state.status = 'running';
     state.lastRunAt = new Date().toISOString();
     state.currentIteration = 0;
+    delete state.lastDiagnostic;
     this.saveState(state);
 
     const loopStart = Date.now();
@@ -345,6 +513,19 @@ export class SelfImproveLoop {
         avgResponseQuality: 0, // Updated as we evaluate
       };
 
+      const plateauSkip = shouldSkipSelfImproveForPlateau(
+        history,
+        this.evidenceSnapshot(metrics),
+      );
+      if (plateauSkip.skip) {
+        logger.info({ reason: plateauSkip.reason }, 'Self-improve skipped after plateau — no new evidence');
+        state.status = 'completed';
+        state.currentIteration = 0;
+        state.lastDiagnostic = plateauSkip.reason;
+        this.saveState(state);
+        return state;
+      }
+
       // Synthesize feedback patterns and update user model before experiment loop
       await this.synthesizeFeedbackPatterns();
       await this.updateUserModel();
@@ -362,23 +543,30 @@ export class SelfImproveLoop {
           // Record the plateau in the experiment log so it's not silently
           // invisible. Helps the dashboard and failure monitor distinguish
           // "exhausted diverse hypotheses" from "crashed mid-run".
-          const plateauExperiment: SelfImproveExperiment = {
-            id: randomBytes(4).toString('hex'),
-            iteration: i,
-            startedAt: new Date(loopStart).toISOString(),
-            finishedAt: new Date().toISOString(),
-            durationMs: Date.now() - loopStart,
-            area: 'soul',
-            target: 'n/a',
-            hypothesis: 'No new hypothesis — diversity constraint exhausted',
-            proposedChange: '',
-            baselineScore: 0,
-            score: 0,
-            accepted: false,
-            approvalStatus: 'denied',
-            reason: 'Plateau: no novel improvement area remaining',
-          };
-          this.appendExperimentLog(plateauExperiment);
+          if (shouldAppendPlateauMarker(history)) {
+            const plateauExperiment: SelfImproveExperiment = {
+              id: randomBytes(4).toString('hex'),
+              iteration: i,
+              startedAt: new Date(loopStart).toISOString(),
+              finishedAt: new Date().toISOString(),
+              durationMs: Date.now() - loopStart,
+              area: 'soul',
+              target: 'n/a',
+              hypothesis: 'No new hypothesis — diversity constraint exhausted',
+              proposedChange: '',
+              baselineScore: 0,
+              score: 0,
+              accepted: false,
+              approvalStatus: 'denied',
+              reason: 'Plateau: no novel improvement area remaining',
+            };
+            this.appendExperimentLog(plateauExperiment);
+            history.push(plateauExperiment);
+            state.totalExperiments++;
+          } else {
+            logger.info('Recent plateau marker already exists — not appending duplicate');
+          }
+          state.lastDiagnostic = 'Plateau: no novel improvement area remaining';
           break;
         }
 
@@ -802,6 +990,55 @@ export class SelfImproveLoop {
     };
   }
 
+  private evidenceSnapshot(metrics: PerformanceSnapshot): SelfImproveEvidenceSnapshot {
+    const triggerEvidence = this.pendingTriggerEvidence();
+    return {
+      feedbackCreatedAt: metrics.negativeFeedback.map(f => f.createdAt).filter((v): v is string => !!v),
+      reflectionCreatedAt: metrics.cronReflections.map(r => r.timestamp).filter(Boolean),
+      cronErrorStartedAt: metrics.cronErrors.map(e => e.startedAt).filter((v): v is string => !!v),
+      cronReflectionAt: metrics.cronReflections.map(r => r.timestamp).filter(Boolean),
+      triggerUpdatedAt: triggerEvidence.updatedAt,
+      triggerCount: triggerEvidence.count,
+      userModelNeedsSeed: this.userModelNeedsSeed(metrics),
+    };
+  }
+
+  private pendingTriggerEvidence(): { count: number; updatedAt: string[] } {
+    const triggersDir = path.join(SELF_IMPROVE_DIR, 'triggers');
+    try {
+      if (!existsSync(triggersDir)) return { count: 0, updatedAt: [] };
+      const files = readdirSync(triggersDir).filter(f => f.endsWith('.json'));
+      return {
+        count: files.length,
+        updatedAt: files.map(f => {
+          try {
+            return statSync(path.join(triggersDir, f)).mtime.toISOString();
+          } catch {
+            return '';
+          }
+        }).filter(Boolean),
+      };
+    } catch {
+      return { count: 0, updatedAt: [] };
+    }
+  }
+
+  private userModelNeedsSeed(metrics: PerformanceSnapshot): boolean {
+    try {
+      const store = new MemoryStore(MEMORY_DB_PATH, VAULT_DIR);
+      store.initialize();
+      try {
+        const signalCount = store.getRecentReflections(30).length + store.getRecentFeedback(30).length;
+        if (signalCount < 5 && metrics.negativeFeedback.length + metrics.cronReflections.length < 5) return false;
+        return store.getAllUserModelBlocks().filter(b => b.content.trim()).length === 0;
+      } finally {
+        store.close();
+      }
+    } catch {
+      return false;
+    }
+  }
+
   // ── Steps 2-3: Diagnose + Hypothesize ────────────────────────────
 
   private async hypothesize(
@@ -1144,11 +1381,19 @@ export class SelfImproveLoop {
 
     if (opportunities.length === 0) return null;
 
-    // Pick the first opportunity that isn't over-targeted
-    const selected = opportunities.find((o: any) => {
+    // Pick the first opportunity that isn't over-targeted. Down-rank SOUL.md
+    // after plateau/denied loops unless feedback synthesis produced fresh
+    // SOUL candidates; most operational signals should become prompt
+    // overrides, advisor rules, agent changes, or cron fixes.
+    const isViableOpportunity = (o: any): boolean => {
       const key = `${o.area}:${o.target}`;
       return !overTargeted.includes(key) && !overTargetedAreas.includes(o.area);
-    }) ?? opportunities[0];
+    };
+    const hasSoulCandidates = !!soulCandidatesText && !/No candidates/i.test(soulCandidatesText);
+    const recentSoulPlateau = history.slice(-10).some(e => e.area === 'soul' && isPlateauExperiment(e));
+    const selected = opportunities.find((o: any) =>
+      isViableOpportunity(o) && (o.area !== 'soul' || hasSoulCandidates || !recentSoulPlateau)
+    ) ?? opportunities.find(isViableOpportunity) ?? opportunities[0];
 
     // ── Step 2: Proposal — load only the target file, generate specific change ──
     const currentContent = await this.readCurrentState(selected.area, selected.target);
@@ -1628,13 +1873,13 @@ export class SelfImproveLoop {
   /** Update the structured user model from interaction data. */
   private async updateUserModel(): Promise<void> {
     try {
-      const { MemoryStore } = await import('../memory/store.js');
       const store = new MemoryStore(MEMORY_DB_PATH, VAULT_DIR);
       store.initialize();
 
       const reflections = store.getRecentReflections(30);
       const feedback = store.getRecentFeedback(30);
       const patterns = store.getBehavioralPatterns(1);
+      const existingDbModel = store.renderUserModel();
       store.close();
 
       if (reflections.length + feedback.length < 5) {
@@ -1664,40 +1909,81 @@ export class SelfImproveLoop {
 
       const prompt =
         `You are updating a structured user model based on interaction data. The model tracks the owner's expertise, priorities, communication preferences, and behavioral patterns.\n\n` +
-        `## Current Model\n${existingModel || '(empty — first synthesis)'}\n\n` +
+        `## Current Markdown Model\n${existingModel || '(empty — first synthesis)'}\n\n` +
+        `## Current DB Slots\n${existingDbModel || '(empty — no user_model_blocks populated yet)'}\n\n` +
         `## Recent Session Reflections (${reflections.length})\n${reflectionSummary || '(none)'}\n\n` +
         `## Recent Feedback (${feedback.length})\n${feedbackSummary || '(none)'}\n\n` +
         `## Recurring Behavioral Patterns\n${patternSummary || '(none)'}\n\n` +
         `## Instructions\n` +
-        `Output a YAML frontmatter block for USER_MODEL.md. Include these sections:\n` +
-        `- expertise: map of domain → level (beginner/intermediate/expert) based on how they interact\n` +
-        `- priorities: list of current focus areas with priority level\n` +
-        `- communication: style, verbosity, decision_making, time_sensitivity\n` +
-        `- patterns: morning/afternoon/evening behavioral patterns\n` +
-        `- confidence_scores: how confident each section is (0-1)\n\n` +
-        `Preserve existing data that's still accurate. Only update fields where new evidence supports a change.\n` +
-        `Output ONLY the YAML frontmatter block (--- delimited), no other text.`;
+        `Return a JSON object with:\n` +
+        `- frontmatterYaml: YAML body for USER_MODEL.md, without --- delimiters. Include expertise, priorities, communication, patterns, confidence_scores.\n` +
+        `- slots: object with exactly these keys: user_facts, goals, relationships, agent_persona.\n\n` +
+        `Slot guidance:\n` +
+        `- user_facts: durable facts about the owner, expertise, working style, identifiers that should always be top-of-mind.\n` +
+        `- goals: active intents/priorities only; omit stale or weakly inferred goals.\n` +
+        `- relationships: people, companies, agents, projects, and how they relate to the owner.\n` +
+        `- agent_persona: durable guidance for Clementine's behavior with this owner.\n\n` +
+        `Keep each slot concise (prefer under 1200 chars). Preserve existing data that's still accurate. Only update fields where evidence supports a change. Use an empty string for a slot with no evidence.\n` +
+        `Output ONLY valid JSON, no markdown.`;
 
       const result = await this.assistant.runPlanStep('si-user-model', prompt, {
         tier: 1,
         maxTurns: 1,
         disableTools: true,
+        outputFormat: {
+          type: 'json_schema',
+          schema: {
+            type: 'object',
+            properties: {
+              frontmatterYaml: { type: 'string' },
+              slots: {
+                type: 'object',
+                properties: {
+                  user_facts: { type: 'string' },
+                  goals: { type: 'string' },
+                  relationships: { type: 'string' },
+                  agent_persona: { type: 'string' },
+                },
+                required: ['user_facts', 'goals', 'relationships', 'agent_persona'],
+              },
+            },
+            required: ['frontmatterYaml', 'slots'],
+          },
+        },
       });
 
-      // Extract YAML frontmatter from response
-      const yamlMatch = result.match(/---\s*\n([\s\S]*?)\n---/);
-      if (!yamlMatch) {
-        logger.warn('User model synthesis returned no YAML block');
+      const parsed = this.parseJsonResponse<{
+        frontmatterYaml?: string;
+        slots?: Record<string, unknown>;
+      }>(result);
+      const slots = normalizeUserModelSlots(parsed?.slots);
+      const frontmatterYaml = typeof parsed?.frontmatterYaml === 'string' && parsed.frontmatterYaml.trim()
+        ? parsed.frontmatterYaml.trim()
+        : 'confidence_scores: {}';
+
+      if (Object.keys(slots).length === 0) {
+        logger.warn('User model synthesis returned no populated DB slots');
         return;
       }
 
       const modelDir = path.join(VAULT_DIR, '00-System');
       if (!existsSync(modelDir)) mkdirSync(modelDir, { recursive: true });
 
-      const content = `---\n${yamlMatch[1].trim()}\nlast_updated: "${new Date().toISOString()}"\n---\n\n# User Model\n\nThis file is auto-generated by the self-improvement loop. It captures a structured understanding of the owner based on interaction patterns, feedback, and behavioral corrections.\n`;
+      const writeStore = new MemoryStore(MEMORY_DB_PATH, VAULT_DIR);
+      writeStore.initialize();
+      try {
+        for (const key of USER_MODEL_SLOT_KEYS) {
+          const content = slots[key];
+          if (content) writeStore.setUserModelBlock({ slot: key, content });
+        }
+      } finally {
+        writeStore.close();
+      }
+
+      const content = buildUserModelMarkdown(frontmatterYaml, slots);
       writeFileSync(modelFile, content);
 
-      logger.info('User model updated: USER_MODEL.md');
+      logger.info({ slots: Object.keys(slots) }, 'User model updated: DB slots + USER_MODEL.md');
     } catch (err) {
       logger.error({ err }, 'User model update failed');
     }
@@ -1763,15 +2049,17 @@ export class SelfImproveLoop {
   reconcileState(): SelfImproveState {
     const state = this.loadState();
     const actualPending = this.getPendingChanges().length;
-    if (state.pendingApprovals !== actualPending) {
+    const reconciled = reconcileSelfImproveStateSnapshot(state, actualPending, {
+      maxDurationMs: this.config.maxDurationMs,
+    });
+    if (reconciled.changed) {
       logger.warn(
-        { stored: state.pendingApprovals, actual: actualPending },
-        'Pending approvals counter drift — reconciling',
+        { diagnostics: reconciled.diagnostics, storedPending: state.pendingApprovals, actualPending },
+        'Self-improve state drift — reconciling',
       );
-      state.pendingApprovals = actualPending;
-      this.saveState(state);
+      this.saveState(reconciled.state);
     }
-    return state;
+    return reconciled.state;
   }
 
   /** Expire pending proposals older than APPROVAL_TTL_MS. */

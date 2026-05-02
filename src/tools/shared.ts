@@ -298,9 +298,12 @@ export type MemoryStoreType = {
     chunks: { total: number; consolidated: number; pinned: number; softDeleted: number; zombieCount: number };
     chunksByCategory: Array<{ category: string | null; count: number }>;
     tableRowCounts: Record<string, number>;
+    recentActivity: { recallTracesLast7d: number; recallTracesLast30d: number; extractionSkipsLast30d: number };
     topCitedLast30d: Array<{ chunkId: number; sourceFile: string; section: string; refCount: number }>;
+    userModelSlots: { total: number; populated: number; global: number; agentScoped: number };
     staleUserModelSlots: Array<{ slot: string; ageDays: number; agentSlug: string | null }>;
     staleHighSalienceChunks: Array<{ chunkId: number; sourceFile: string; section: string; salience: number; lastOutcomeScore: number }>;
+    selfImprovePlateausLast7d: number;
     chunkCacheStats: { hits: number; misses: number; evictions: number; size: number };
     writeQueue: { size: number; dropped: number } | null;
     lastIntegrityReport: { ftsOk: boolean; ftsRebuilt: boolean; orphanRefsNulled: number; missingEmbeddings: number; ranAt: string } | null;

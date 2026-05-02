@@ -45,6 +45,11 @@ describe('Memory Health snapshot', () => {
     expect(h.dbSizeBytes).toBeGreaterThan(0);
     expect(h.tableRowCounts).toHaveProperty('chunks', 0);
     expect(h.tableRowCounts).toHaveProperty('recall_traces', 0);
+    expect(h.recentActivity.recallTracesLast7d).toBe(0);
+    expect(h.recentActivity.recallTracesLast30d).toBe(0);
+    expect(h.recentActivity.extractionSkipsLast30d).toBe(0);
+    expect(h.userModelSlots.total).toBe(0);
+    expect(h.selfImprovePlateausLast7d).toBeGreaterThanOrEqual(0);
     expect(h.topCitedLast30d).toEqual([]);
   });
 
@@ -118,5 +123,40 @@ describe('Memory Health snapshot', () => {
     expect(h.topCitedLast30d.length).toBe(1);
     expect(h.topCitedLast30d[0].chunkId).toBe(id);
     expect(h.topCitedLast30d[0].refCount).toBe(3);
+  });
+
+  it('uses recall_traces.retrieved_at and extraction skip statuses for recent activity', () => {
+    store.fullSync();
+    withRaw((db) => {
+      db.prepare(
+        `INSERT INTO recall_traces (session_key, query, chunk_ids, scores, retrieved_at)
+         VALUES ('recent', 'q', '[]', '[]', datetime('now'))`,
+      ).run();
+      db.prepare(
+        `INSERT INTO recall_traces (session_key, query, chunk_ids, scores, retrieved_at)
+         VALUES ('old', 'q', '[]', '[]', datetime('now', '-40 days'))`,
+      ).run();
+      db.prepare(
+        `INSERT INTO memory_extractions (session_key, user_message, tool_name, tool_input, status, extracted_at)
+         VALUES ('s', 'short', 'auto_memory_skip', '{"reason":"too_short"}', 'skipped:too_short', datetime('now'))`,
+      ).run();
+    });
+
+    const h = store.getMemoryHealth();
+    expect(h.recentActivity.recallTracesLast7d).toBe(1);
+    expect(h.recentActivity.recallTracesLast30d).toBe(1);
+    expect(h.recentActivity.extractionSkipsLast30d).toBe(1);
+  });
+
+  it('reports user model slot counts', () => {
+    store.fullSync();
+    store.setUserModelBlock({ slot: 'user_facts', content: 'global facts' });
+    store.setUserModelBlock({ slot: 'goals', content: 'agent goal', agentSlug: 'sdr' });
+
+    const h = store.getMemoryHealth();
+    expect(h.userModelSlots.total).toBe(2);
+    expect(h.userModelSlots.populated).toBe(2);
+    expect(h.userModelSlots.global).toBe(1);
+    expect(h.userModelSlots.agentScoped).toBe(1);
   });
 });
