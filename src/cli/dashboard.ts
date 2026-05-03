@@ -5696,7 +5696,7 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
         message = 'Restored the standard spend caps. Restart Clementine to apply to running workers.';
       } else if (preset === 'uncapped' || preset === 'off' || preset === 'none') {
         writes = DASHBOARD_BUDGET_ROWS.map(row => ({ key: row.key, value: '0' }));
-        message = 'Removed spend caps by setting all budget values to 0. Restart Clementine to apply to running workers.';
+        message = 'Removed spend caps by setting all budget values to 0. This does not change 1M context mode; use Force 200K or Safe Recovery for 1M errors. Restart Clementine to apply to running workers.';
       } else {
         res.status(400).json({ error: 'preset must be defaults or uncapped' });
         return;
@@ -19950,7 +19950,7 @@ async function refreshBudgetHealth() {
       + '<div style="display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end">'
       + '<button class="btn-sm btn-primary" onclick="applySafeBudgetPreset()">Safe Recovery</button>'
       + '<button class="btn-sm" onclick="applyBudgetPreset(\\x27defaults\\x27)">Default Caps</button>'
-      + '<button class="btn-sm" onclick="applyBudgetPreset(\\x27uncapped\\x27)">No Caps</button>'
+      + '<button class="btn-sm" onclick="applyBudgetPreset(\\x27uncapped\\x27)">No Spend Caps</button>'
       + '<button class="btn-sm" onclick="setBudgetContextMode(\\x27auto\\x27)">Smart Auto</button>'
       + '<button class="btn-sm" onclick="setBudgetContextMode(\\x27off\\x27)">Force 200K</button>'
       + '<button class="btn-sm" onclick="forceBudgetOneMillion()">Force 1M</button>'
@@ -20041,7 +20041,7 @@ async function applySafeBudgetPreset() {
 }
 
 async function applyBudgetPreset(preset) {
-  if (preset === 'uncapped' && !confirm('Remove all spend caps? Clementine can still hit account limits or credits if a job runs long.')) return;
+  if (preset === 'uncapped' && !confirm('Remove spend caps only? This does not disable 1M context. For 1M errors, use Safe Recovery or Force 200K.')) return;
   var d = await postBudgetAction('/api/budgets/preset', { preset: preset });
   if (d && d.ok) markRestartRequired('Spend guard changes need a Clementine restart before running workers use the new caps.');
   refreshSettings();
