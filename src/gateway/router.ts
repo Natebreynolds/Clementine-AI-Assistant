@@ -27,10 +27,12 @@ import { TeamRouter } from '../agent/team-router.js';
 import { TeamBus } from '../agent/team-bus.js';
 import { events } from '../events/bus.js';
 import type { NotificationDispatcher } from './notifications.js';
-import { listBackgroundTasks } from '../agent/background-tasks.js';
+import { createBackgroundTask, listBackgroundTasks, markDone, markFailed, markRunning } from '../agent/background-tasks.js';
 import { applyAssistantExperienceUpdate, detectLocalTurn, type AssistantExperienceUpdate } from '../agent/local-turn.js';
 import { updateClementineJson } from '../config/clementine-json.js';
 import { buildCronDiagnosticResponse } from './cron-diagnostic-turn.js';
+import { classifyIntent } from '../agent/intent-classifier.js';
+import { decideTurn } from '../agent/turn-policy.js';
 
 const logger = pino({ name: 'clementine.gateway' });
 const INTERACTIVE_FAILURE_LOG = path.join(BASE_DIR, 'self-improve', 'interactive-failures.jsonl');
@@ -441,6 +443,95 @@ export class Gateway {
           });
       }
     }
+  }
+
+  private startInteractiveBackgroundTask(
+    sessionKey: string,
+    originalText: string,
+    opts: {
+      taskDesc: string;
+      jobPrompt: string;
+      stage: string;
+      ack?: string;
+      workDir?: string;
+      tier?: number;
+      maxTurns?: number;
+      model?: string;
+      maxHours?: number;
+      agentSlug?: string;
+      resultPrompt?: (result: string) => string;
+      failurePrompt?: (failure: string) => string;
+    },
+  ): string {
+    const agentSlug = opts.agentSlug ?? this._agentSlugFromSessionKey(sessionKey);
+    const maxHours = opts.maxHours ?? 1;
+    const task = createBackgroundTask({
+      fromAgent: agentSlug ?? 'clementine',
+      prompt: opts.taskDesc,
+      maxMinutes: Math.max(1, Math.ceil(maxHours * 60)),
+    });
+    markRunning(task.id);
+
+    const currentSess = this.getSession(sessionKey);
+    currentSess.deepTask = {
+      jobName: task.id,
+      taskDesc: opts.taskDesc.slice(0, 200),
+      startedAt: new Date().toISOString(),
+    };
+
+    events.emit('background:start', {
+      sessionKey,
+      taskId: task.id,
+      taskDesc: opts.taskDesc,
+      agentSlug,
+      stage: opts.stage,
+      timestamp: Date.now(),
+    });
+
+    this.assistant.runUnleashedTask(
+      task.id,
+      opts.jobPrompt,
+      opts.tier ?? 2,
+      opts.maxTurns,
+      opts.model,
+      opts.workDir,
+      maxHours,
+      agentSlug,
+    ).then(async (result) => {
+      logger.info({ sessionKey, taskId: task.id, resultLen: result?.length ?? 0, stage: opts.stage }, 'Interactive background task completed');
+      markDone(task.id, result ?? '');
+      events.emit('background:complete', { sessionKey, taskId: task.id, stage: opts.stage, timestamp: Date.now() });
+      if (result && !isAutonomousNothingOutput(result)) {
+        this.assistant.injectPendingContext(sessionKey, originalText, result);
+        await this._deliverDeepResult(
+          sessionKey,
+          opts.resultPrompt
+            ? opts.resultPrompt(result)
+            : `[DEEP_MODE_RESULT] You just completed background work for this user request. Summarize conversationally — lead with what matters.\n\nTask: ${opts.taskDesc.slice(0, 500)}\n\nResult:\n${result.slice(0, 3000)}`,
+          result,
+        );
+      }
+    }).catch(async (err) => {
+      logger.error({ err, sessionKey, taskId: task.id, stage: opts.stage }, 'Interactive background task failed');
+      this.recordInteractiveFailure(sessionKey, originalText, err, opts.stage, { taskId: task.id, taskDesc: opts.taskDesc });
+      const failMsg = `Background work failed: ${String(err).slice(0, 200)}`;
+      markFailed(task.id, failMsg, 'failed');
+      events.emit('background:failed', { sessionKey, taskId: task.id, stage: opts.stage, timestamp: Date.now() });
+      this.assistant.injectPendingContext(sessionKey, originalText, failMsg);
+      await this._deliverDeepResult(
+        sessionKey,
+        opts.failurePrompt
+          ? opts.failurePrompt(failMsg)
+          : `[DEEP_MODE_RESULT] The background task failed: ${failMsg}. Let the user know and suggest next steps. Be brief.`,
+        `Background task failed: ${failMsg}`,
+      );
+    }).finally(() => {
+      const s = this.sessions.get(sessionKey);
+      if (s?.deepTask?.jobName === task.id) delete s.deepTask;
+    });
+
+    return opts.ack
+      ?? `On it — running this in the background. I'll follow up when it's done. Task ${task.id}. Reply "status" to check in or "cancel" to stop.`;
   }
 
   private startContextThrashRecovery(
@@ -1376,6 +1467,26 @@ export class Gateway {
           || sessionKey.startsWith('cli:');
         if (isInteractive && !isInternalMsg && !text.startsWith('!') && !sess?.deepTask) {
           try {
+            const turnDecision = decideTurn({
+              text,
+              intent: classifyIntent(text),
+              hasRecentContext: this.sessions.has(sessionKey),
+            });
+            if (turnDecision.mode === 'background') {
+              logger.info({ sessionKey, reason: turnDecision.reason, bundles: turnDecision.toolRoute.bundles },
+                'Turn decision requested immediate background execution');
+              return this.startInteractiveBackgroundTask(sessionKey, text, {
+                taskDesc: text.slice(0, 500),
+                stage: 'turn_decision_background',
+                jobPrompt: [
+                  `The user asked: ${text}`,
+                  '',
+                  'This was routed straight to background execution because the user explicitly asked for sustained/background work.',
+                  'Complete the task thoroughly, use memory/tools as needed, keep outputs bounded, and return a concise conversational summary.',
+                ].join('\n'),
+              });
+            }
+
             const { classifyComplexity, planFirstDirective } = await import('../agent/complexity-classifier.js');
             const verdict = classifyComplexity(text);
 
@@ -1386,46 +1497,12 @@ export class Gateway {
             if (verdict.deepWorthy) {
               logger.info({ sessionKey, signals: verdict.signals, reason: verdict.reason },
                 'Pre-flight deep-mode gate fired — spawning background task');
-              const currentSess = this.getSession(sessionKey);
-              const jobName = `deep-${Date.now()}`;
-              currentSess.deepTask = { jobName, taskDesc: text.slice(0, 200), startedAt: new Date().toISOString() };
-              const preflightAgentSlug = this._agentSlugFromSessionKey(sessionKey);
-
-              this.assistant.runUnleashedTask(
-                jobName,
-                `The user asked: ${text}\n\nThis was routed straight to background execution because it looks like sustained multi-step work. Complete the task thoroughly and return a conversational summary.`,
-                2,                           // tier 2 (Bash/Write/Edit enabled)
-                undefined,                   // default maxTurns
-                undefined,                   // default model
-                undefined,                   // default work_dir
-                1,                           // maxHours
-                preflightAgentSlug,
-              ).then(async (result) => {
-                logger.info({ sessionKey, jobName, resultLen: result?.length ?? 0 }, 'Pre-flight deep-mode task completed');
-                if (result && !isAutonomousNothingOutput(result)) {
-                  this.assistant.injectPendingContext(sessionKey, text, result);
-                  await this._deliverDeepResult(
-                    sessionKey,
-                    `[DEEP_MODE_RESULT] You just completed background work for this user request. Summarize conversationally — lead with what matters.\n\nTask: ${text.slice(0, 500)}\n\nResult:\n${result.slice(0, 3000)}`,
-                    result,
-                  );
-                }
-              }).catch(async (err) => {
-                logger.error({ err, sessionKey, jobName }, 'Pre-flight deep-mode task failed');
-                this.recordInteractiveFailure(sessionKey, text, err, 'preflight_deep_mode_failed', { jobName });
-                const failMsg = `Background work failed: ${String(err).slice(0, 200)}`;
-                this.assistant.injectPendingContext(sessionKey, text, failMsg);
-                await this._deliverDeepResult(
-                  sessionKey,
-                  `[DEEP_MODE_RESULT] The background task failed: ${failMsg}. Let the user know and suggest next steps. Be brief.`,
-                  `Background task failed: ${failMsg}`,
-                );
-              }).finally(() => {
-                const s = this.sessions.get(sessionKey);
-                if (s?.deepTask?.jobName === jobName) delete s.deepTask;
+              return this.startInteractiveBackgroundTask(sessionKey, text, {
+                taskDesc: text.slice(0, 500),
+                stage: 'preflight_deep_mode',
+                jobPrompt: `The user asked: ${text}\n\nThis was routed straight to background execution because it looks like sustained multi-step work. Complete the task thoroughly and return a conversational summary.`,
+                ack: `On it — this looks like real work. Running it in the background; I'll follow up when it's done. Reply "cancel" to stop or "status" to check in.`,
               });
-
-              return `On it — this looks like real work. Running it in the background; I'll follow up when it's done. Reply "cancel" to stop or "status" to check in.`;
             }
 
             if (verdict.complex) {
@@ -1665,11 +1742,11 @@ export class Gateway {
           // a Claude Code project with its own CLAUDE.md / slash commands
           // (e.g. the proposal-builder project for audit-queue approvals).
           const deepMatch = response?.match(/^\[DEEP_MODE(?:\(([^)]+)\))?:\s*(.+?)\]\s*/s);
-          if (deepMatch) {
-            const paramsStr = deepMatch[1] ?? '';
-            const taskDesc = deepMatch[2].trim() || text;
-            const ack = response.replace(/^\[DEEP_MODE(?:\([^)]*\))?:[^\]]*\]\s*/s, '').trim();
-            logger.info({ sessionKey, task: taskDesc }, 'Deep mode triggered by agent');
+            if (deepMatch) {
+              const paramsStr = deepMatch[1] ?? '';
+              const taskDesc = deepMatch[2].trim() || text;
+              const ack = response.replace(/^\[DEEP_MODE(?:\([^)]*\))?:[^\]]*\]\s*/s, '').trim();
+              logger.info({ sessionKey, task: taskDesc }, 'Deep mode triggered by agent');
 
             // Parse optional work_dir parameter — strict: must be an absolute
             // path and must exist. Anything else falls back to default.
@@ -1682,50 +1759,20 @@ export class Gateway {
                 logger.info({ sessionKey, workDir: deepWorkDir }, 'Deep mode using custom work_dir');
               } else {
                 logger.warn({ sessionKey, candidate }, 'Deep mode work_dir rejected (not absolute or does not exist)');
+                }
               }
-            }
 
-            const currentSess = this.getSession(sessionKey);
-            const jobName = `deep-${Date.now()}`;
-            currentSess.deepTask = { jobName, taskDesc, startedAt: new Date().toISOString() };
-            const deepAgentSlug = this._agentSlugFromSessionKey(sessionKey);
-
-            // Spawn unleashed task in background — don't await
-            this.assistant.runUnleashedTask(
-              jobName,
-              `${taskDesc}\n\nOriginal request: ${text}`,
-              2,               // tier 2 (Bash/Write/Edit enabled)
-              undefined,       // default maxTurns (75/phase)
-              undefined,       // default model
-              deepWorkDir,     // honors [DEEP_MODE(work_dir=...)] if provided
-              1,               // maxHours
-              deepAgentSlug,   // preserve agent persona in deep mode
-            ).then(async (result) => {
-              logger.info({ sessionKey, jobName, resultLen: result?.length ?? 0 }, 'Deep mode task completed');
-              if (result && !isAutonomousNothingOutput(result)) {
-                this.assistant.injectPendingContext(sessionKey, text, result);
-                await this._deliverDeepResult(
-                  sessionKey,
+              return this.startInteractiveBackgroundTask(sessionKey, text, {
+                taskDesc,
+                stage: 'deep_mode',
+                jobPrompt: `${taskDesc}\n\nOriginal request: ${text}`,
+                workDir: deepWorkDir,
+                ack: ack || `On it — working on this now. I'll follow up when it's done.`,
+                resultPrompt: (result) =>
                   `[DEEP_MODE_RESULT] You just completed background work. Here are the results — summarize them conversationally for the user. Be natural, not robotic. Lead with what matters most.\n\nTask: ${taskDesc}\n\nResult:\n${result.slice(0, 3000)}`,
-                  result,
-                );
-              }
-            }).catch(async (err) => {
-              logger.error({ err, sessionKey, jobName }, 'Deep mode task failed');
-              this.recordInteractiveFailure(sessionKey, text, err, 'deep_mode_failed', { jobName, taskDesc });
-              const failMsg = `Background work failed: ${String(err).slice(0, 200)}`;
-              this.assistant.injectPendingContext(sessionKey, text, failMsg);
-              await this._deliverDeepResult(
-                sessionKey,
-                `[DEEP_MODE_RESULT] The background task "${taskDesc}" failed: ${failMsg}. Let the user know what happened and suggest next steps. Be brief.`,
-                `The background task failed: ${failMsg}`,
-              );
-            }).finally(() => {
-              const s = this.sessions.get(sessionKey);
-              if (s?.deepTask?.jobName === jobName) delete s.deepTask;
+                failurePrompt: (failMsg) =>
+                  `[DEEP_MODE_RESULT] The background task "${taskDesc}" failed: ${failMsg}. Let the user know what happened and suggest next steps. Be brief.`,
             });
-
-            return ack || `On it — working on this now. I'll follow up when it's done.`;
           }
 
           // ── Auto-escalation ──────────────────────────────────────────

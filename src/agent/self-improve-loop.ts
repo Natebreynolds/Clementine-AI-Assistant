@@ -7,8 +7,8 @@
  * when consecutiveErrors >= 3), classifies the failure pattern from
  * recentErrors, and either:
  *
- *   - Auto-applies a safe cron-config fix (mode, max_hours, max_turns)
- *     and DMs the OWNING agent via their bot
+ *   - Writes a proposal for safe cron-config fixes by default so the owner
+ *     can approve before Clementine edits CRON.md
  *   - Writes a proposal to self-improve/pending-changes/ and DMs the
  *     owning agent the diagnosis (full audit-inbox button approval is
  *     a separate Phase 8b ship)
@@ -84,7 +84,7 @@ export interface TriggerFile {
 }
 
 export type FixCategory =
-  | 'safe-cron-config'  // mode/max_hours/max_turns — auto-apply
+  | 'safe-cron-config'  // mode/max_hours/max_turns — proposal by default
   | 'risky'             // prompts, profile, code — escalate for approval
   | 'noop'              // pattern recognized but no action needed (already fixed)
   | 'unknown';          // unrecognized — escalate for owner inspection
@@ -136,6 +136,11 @@ export interface SelfImproveLoopOptions {
    * call tick() directly without racing the watcher.
    */
   disableWatch?: boolean;
+  /**
+   * Opt into the legacy behavior where recognized low-risk CRON.md scalar
+   * edits are applied immediately. Default false: write a pending proposal.
+   */
+  allowAutoApplySafeFixes?: boolean;
 }
 
 // ── Pattern recognition ──────────────────────────────────────────────
@@ -379,6 +384,7 @@ export class SelfImproveLoop {
   private readonly agentsDir: string;
   private readonly dispatcher: SelfImproveDispatcher;
   private readonly watchEnabled: boolean;
+  private readonly allowAutoApplySafeFixes: boolean;
   private timer: ReturnType<typeof setInterval> | null = null;
   private watcher: FSWatcher | null = null;
   private debounceTimer: ReturnType<typeof setTimeout> | null = null;
@@ -393,6 +399,7 @@ export class SelfImproveLoop {
     this.cronPath = opts.cronPath ?? CRON_PATH;
     this.agentsDir = opts.agentsDir ?? AGENTS_ROOT;
     this.watchEnabled = opts.disableWatch !== true;
+    this.allowAutoApplySafeFixes = opts.allowAutoApplySafeFixes === true;
   }
 
   start(): void {
@@ -534,6 +541,40 @@ export class SelfImproveLoop {
         logger.warn({ jobName: trigger.jobName, agentSlug }, 'Job not found in any CRON.md — cannot apply fix');
         return;
       }
+
+      const wouldChange = recipe.apply ? recipe.apply({ ...lookup.job }) : true;
+      if (!wouldChange) {
+        counts.noop++;
+        logger.info({ jobName: trigger.jobName, agentSlug }, 'Fix recipe is already in place — trigger removed without further action');
+        this.logAutonomy('fix_noop', trigger, { reason: 'already-applied' });
+        return;
+      }
+
+      if (!this.allowAutoApplySafeFixes) {
+        const id = `proposal-${Date.now()}-${trigger.jobName.replace(/[^a-z0-9-]/gi, '_')}`;
+        const record: PendingChangeRecord = {
+          id,
+          jobName: trigger.jobName,
+          ...(agentSlug ? { agentSlug } : {}),
+          category: recipe.category,
+          description: recipe.description,
+          recentErrors: trigger.recentErrors,
+          consecutiveErrors: trigger.consecutiveErrors,
+          proposedAt: new Date().toISOString(),
+        };
+        const file = writePendingChange(record, this.pendingDir);
+        counts.pending++;
+        this.logAutonomy('proposal_written', trigger, { category: recipe.category, proposalId: id, autoApplyAllowed: false });
+        await this.notifyAgent(agentSlug, [
+          `⚠️ **${trigger.jobName}** has failed ${trigger.consecutiveErrors} times in a row.`,
+          '',
+          recipe.description,
+          '',
+          `Fix proposal saved to \`${file}\`. Review and approve before editing CRON.md.`,
+        ].join('\n'));
+        return;
+      }
+
       const prevFields = applyCronEdit(lookup, recipe);
       if (prevFields) {
         counts.applied++;

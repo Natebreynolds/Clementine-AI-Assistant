@@ -51,6 +51,13 @@ describe('classifyComplexity — deepWorthy suppression on error pastes', () => 
     expect(verdict.signals).toContain('deep-mode-ask');
   });
 
+  it('treats keep-working phrasing as explicit background intent', () => {
+    const verdict = classifyComplexity('Keep working on the market leader follow-up until it is fixed.');
+
+    expect(verdict.deepWorthy).toBe(true);
+    expect(verdict.signals).toContain('deep-mode-ask');
+  });
+
   it('still flags complex (plan-first) on an error paste so the agent proposes a plan', () => {
     const text =
       'I keep seeing this and need to fix it permanently:\n\n' +

@@ -18,6 +18,7 @@ import {
   renameSync,
   writeFileSync,
 } from 'node:fs';
+import { createHash } from 'node:crypto';
 import path from 'node:path';
 import pino from 'pino';
 
@@ -97,6 +98,9 @@ export interface Diagnosis {
   };
   riskLevel: 'low' | 'medium' | 'high';
   generatedAt: string;
+  observedAt?: string;
+  lastRunAt?: string | null;
+  evidenceHash?: string;
 }
 
 interface DiagnosisCache {
@@ -207,6 +211,37 @@ function readRecentRuns(jobName: string, limit = 10): string {
   } catch {
     return '(failed to read run log)';
   }
+}
+
+function evidenceHashFor(broken: BrokenJob, jobDef: string | null, recentRuns: string): string {
+  const payload = JSON.stringify({
+    jobName: broken.jobName,
+    lastErrorAt: broken.lastErrorAt,
+    lastErrors: broken.lastErrors,
+    circuitBreakerEngagedAt: broken.circuitBreakerEngagedAt,
+    lastAdvisorOpinion: broken.lastAdvisorOpinion,
+    jobDef: jobDef?.slice(0, 3000) ?? null,
+    recentRuns,
+  });
+  return createHash('sha256').update(payload).digest('hex');
+}
+
+function annotateDiagnosis(diagnosis: Diagnosis, broken: BrokenJob, evidenceHash: string): Diagnosis {
+  return {
+    ...diagnosis,
+    generatedAt: new Date().toISOString(),
+    observedAt: new Date().toISOString(),
+    lastRunAt: broken.lastErrorAt,
+    evidenceHash,
+  };
+}
+
+function cachedDiagnosisMatches(diagnosis: Diagnosis, broken: BrokenJob, evidenceHash: string): boolean {
+  const age = Date.now() - Date.parse(diagnosis.generatedAt);
+  if (!Number.isFinite(age) || age >= CACHE_TTL_MS) return false;
+  if (diagnosis.lastRunAt !== broken.lastErrorAt) return false;
+  if (diagnosis.evidenceHash !== evidenceHash) return false;
+  return true;
 }
 
 function buildPrompt(broken: BrokenJob, jobDef: string | null, agentProfile: string | null, recentRuns: string): string {
@@ -518,30 +553,29 @@ export async function diagnoseBrokenJob(
   broken: BrokenJob,
   gateway: Gateway,
 ): Promise<Diagnosis | null> {
-  const cache = loadCache();
-  const cached = cache[broken.jobName];
-  if (cached) {
-    const age = Date.now() - Date.parse(cached.generatedAt);
-    if (Number.isFinite(age) && age < CACHE_TTL_MS) {
-      logger.debug({ job: broken.jobName, ageMin: Math.round(age / 60000) }, 'Using cached diagnosis');
-      return cached;
-    }
-  }
-
   const jobDef = readJobDefinition(broken.jobName);
   const agentProfile = broken.agentSlug ? readAgentProfile(broken.agentSlug) : null;
   const recentRuns = readRecentRuns(broken.jobName, 10);
+  const evidenceHash = evidenceHashFor(broken, jobDef, recentRuns);
+  const cache = loadCache();
+  const cached = cache[broken.jobName];
+  if (cached && cachedDiagnosisMatches(cached, broken, evidenceHash)) {
+    const age = Date.now() - Date.parse(cached.generatedAt);
+    logger.debug({ job: broken.jobName, ageMin: Math.round(age / 60000) }, 'Using cached diagnosis');
+    return cached;
+  }
 
   const knownDiagnosis = diagnoseKnownFailurePattern(broken, jobDef, recentRuns);
   if (knownDiagnosis) {
-    cache[broken.jobName] = knownDiagnosis;
+    const annotated = annotateDiagnosis(knownDiagnosis, broken, evidenceHash);
+    cache[broken.jobName] = annotated;
     saveCache(cache);
     logger.info({
       job: broken.jobName,
-      confidence: knownDiagnosis.confidence,
-      fixType: knownDiagnosis.proposedFix.type,
+      confidence: annotated.confidence,
+      fixType: annotated.proposedFix.type,
     }, 'Broken-job diagnosis generated from known pattern');
-    return knownDiagnosis;
+    return annotated;
   }
 
   const prompt = buildPrompt(broken, jobDef, agentProfile, recentRuns);
@@ -573,14 +607,15 @@ export async function diagnoseBrokenJob(
     return null;
   }
 
-  cache[broken.jobName] = diagnosis;
+  const annotated = annotateDiagnosis(diagnosis, broken, evidenceHash);
+  cache[broken.jobName] = annotated;
   saveCache(cache);
   logger.info({
     job: broken.jobName,
-    confidence: diagnosis.confidence,
-    fixType: diagnosis.proposedFix.type,
+    confidence: annotated.confidence,
+    fixType: annotated.proposedFix.type,
   }, 'Broken-job diagnosis generated');
-  return diagnosis;
+  return annotated;
 }
 
 /**

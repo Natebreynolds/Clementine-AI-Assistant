@@ -51,6 +51,7 @@ interface ToolBundleDefinition {
 }
 
 export const TOOL_SURFACE_WARN_THRESHOLD = 150;
+export const TOOL_SURFACE_HARD_LIMIT = 220;
 
 export const TOOL_BUNDLES: readonly ToolBundleDefinition[] = [
   {
@@ -123,7 +124,7 @@ export const TOOL_BUNDLES: readonly ToolBundleDefinition[] = [
   },
   {
     id: 'browser',
-    patterns: [/\b(browser|playwright|localhost|web page|webpage|screenshot|click|fill form|navigate)\b/i],
+    patterns: [/\b(playwright|localhost|127\.0\.0\.1|web\s?page|webpage|website|screenshot|click|fill(?: out)? form|navigate to|open .*browser|use .*browser|inspect .*page)\b/i],
     externalMcpServers: ['browser-harness', 'browsermcp', 'playwright', 'kernel', 'plugin:playwright:playwright'],
   },
   {
@@ -218,4 +219,3 @@ export function routeToolSurface(text: string | undefined): ToolRouteDecision {
     reason: bundles.size > 0 ? 'matched' : 'empty',
   };
 }
-

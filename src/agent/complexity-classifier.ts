@@ -36,6 +36,9 @@ const DEEP_MODE_ASKS = [
   /\brun\s+in\s+the\s+background\b/i,
   /\bdeep\s+(mode|dive|work)\b/i,
   /\bbackground\s+(task|work|job)\b/i,
+  /\bkeep\s+working\b/i,
+  /\bdon'?t\s+stop\b/i,
+  /\buntil\s+(it'?s\s+)?(done|finished|complete|fixed)\b/i,
   /\btake\s+your\s+time\b/i,
 ];
 

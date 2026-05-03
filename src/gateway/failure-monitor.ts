@@ -31,6 +31,7 @@ import pino from 'pino';
 import { BASE_DIR, MEMORY_DB_PATH } from '../config.js';
 import type { CronRunEntry } from '../types.js';
 import { logAuditJsonl } from '../agent/hooks.js';
+import { classifyRunHealth, isRunHealthFailure } from './job-health.js';
 
 const logger = pino({ name: 'clementine.failure-monitor' });
 
@@ -113,6 +114,7 @@ function readRunLog(filePath: string): CronRunEntry[] {
 }
 
 function isFailure(entry: CronRunEntry, gradeCache?: Map<string, boolean>): boolean {
+  if (isRunHealthFailure(entry)) return true;
   if (entry.status === 'error' || entry.status === 'retried') return true;
   if (isSemanticFailure(entry)) return true;
   // Outcome grader verdict, if we have one for this (job, time) tuple.
@@ -300,7 +302,12 @@ export function computeBrokenJobs(now = Date.now()): BrokenJob[] {
     const distinctErrors: string[] = [];
     const seen = new Set<string>();
     for (let i = errSource.length - 1; i >= 0 && distinctErrors.length < 3; i--) {
-      const err = (errSource[i]!.error ?? '').trim();
+      const entry = errSource[i]!;
+      const health = classifyRunHealth(entry);
+      const healthEvidence = health.status !== 'healthy' && health.evidence.length > 0
+        ? `${health.status}: ${health.evidence.join('; ')}`
+        : '';
+      const err = (entry.error ?? healthEvidence).trim();
       if (!err) continue;
       const key = err.slice(0, 120);
       if (seen.has(key)) continue;
@@ -352,7 +359,9 @@ function attachCachedDiagnoses(jobs: BrokenJob[], now: number): void {
       const d = cache[j.jobName];
       if (!d) continue;
       const age = now - Date.parse(d.generatedAt);
-      if (Number.isFinite(age) && age < DIAGNOSIS_TTL_MS) {
+      const sameRun = d.lastRunAt === j.lastErrorAt;
+      const hasEvidenceStamp = typeof d.evidenceHash === 'string' && d.evidenceHash.length > 0;
+      if (Number.isFinite(age) && age < DIAGNOSIS_TTL_MS && sameRun && hasEvidenceStamp) {
         j.diagnosis = d;
       }
     }

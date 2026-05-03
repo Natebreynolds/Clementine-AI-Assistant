@@ -96,8 +96,8 @@ import { PromptCache } from './prompt-cache.js';
 import { searchSkills as searchSkillsSync } from './skill-extractor.js';
 import { classifyIntent, getStrategyGuidance, type IntentClassification } from './intent-classifier.js';
 import { getEventLog } from './session-event-log.js';
-import { routeToolSurface, TOOL_SURFACE_WARN_THRESHOLD, type ToolRouteDecision } from './tool-router.js';
-import { decideTurnPolicy, type RetrievalTier, type TurnPolicy } from './turn-policy.js';
+import { routeToolSurface, TOOL_SURFACE_HARD_LIMIT, TOOL_SURFACE_WARN_THRESHOLD, type ToolRouteDecision } from './tool-router.js';
+import { decideTurn, type RetrievalTier, type TurnPolicy } from './turn-policy.js';
 import { loadClementineJson } from '../config/clementine-json.js';
 
 // ── Channel capabilities ────────────────────────────────────────────
@@ -2183,7 +2183,8 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
     const profileScopeText = [profile?.description, profile?.systemPromptBody]
       .filter(Boolean)
       .join('\n');
-    const directScopeText = [promptScopeText, profileScopeText].filter(Boolean).join('\n');
+    const autonomousToolRun = isHeartbeat || isCron || isPlanStep || isUnleashed;
+    const directScopeText = [promptScopeText, autonomousToolRun ? profileScopeText : ''].filter(Boolean).join('\n');
     const emptyToolRoute = (): ToolRouteDecision => ({
         bundles: [],
         externalMcpServers: [],
@@ -2212,7 +2213,6 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
         reason: bundles.length > 0 ? 'matched' : 'empty',
       };
     };
-    const autonomousToolRun = isHeartbeat || isCron || isPlanStep || isUnleashed;
     const promptToolRoute = routeToolSurface(promptScopeText);
     const profileToolRoute = routeToolSurface(profileScopeText);
     const contextToolRoute = routeToolSurface(contextRoutingText);
@@ -2220,7 +2220,9 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
     const directFollowupNeedsContextTools = intentClassification?.type === 'followup'
       || /^(yes|yep|yeah|go|go ahead|do it|continue|pick up|use that|run it|send it|same thing)\b/i.test(promptScopeText.trim());
     const allowContextToolRoute = autonomousToolRun || (!promptHasToolRoute && directFollowupNeedsContextTools);
-    const safeProfileToolRoute = profileToolRoute.fullSurface ? emptyToolRoute() : profileToolRoute;
+    const safeProfileToolRoute = autonomousToolRun && !profileToolRoute.fullSurface
+      ? profileToolRoute
+      : emptyToolRoute();
     const safeContextToolRoute = allowContextToolRoute && !contextToolRoute.fullSurface
       ? contextToolRoute
       : emptyToolRoute();
@@ -2573,6 +2575,27 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
         whitelist.add(mcpTool('goal_get'));
         whitelist.add(mcpTool('goal_work'));
         allowedTools = allowedTools.filter(t => whitelist.has(t));
+      }
+
+      if (!toolRoute.fullSurface
+        && !adminNeeded
+        && !autonomousToolRun
+        && allowedTools.length > TOOL_SURFACE_HARD_LIMIT) {
+        const beforeAllowedToolCount = allowedTools.length;
+        const coreSdkTools = new Set(['Read', 'Write', 'Edit', 'Bash', 'Glob', 'Grep', 'WebSearch', 'WebFetch']);
+        const clementineToolPrefixForCap = `mcp__${TOOLS_SERVER}__`;
+        allowedTools = allowedTools.filter(tool =>
+          coreSdkTools.has(tool) || tool.startsWith(clementineToolPrefixForCap),
+        );
+        externalMcpServers = {};
+        composioMcpServers = {};
+        logger.warn({
+          sessionKey,
+          beforeAllowedToolCount,
+          afterAllowedToolCount: allowedTools.length,
+          hardLimit: TOOL_SURFACE_HARD_LIMIT,
+          bundles: toolRoute.bundles,
+        }, 'SDK allowed tool surface exceeded hard limit; falling back to core Clementine tools for this interactive turn');
       }
     }
 
@@ -3081,11 +3104,12 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
     let effectivePrompt = text;
     const recentExchangesForIntent = key ? this.lastExchanges.get(key) : undefined;
     const intent = classifyIntent(text, recentExchangesForIntent);
-    const turnPolicy = decideTurnPolicy({
+    const turnDecision = decideTurn({
       text,
       intent,
       hasRecentContext: !!(recentExchangesForIntent?.length || (key && this.sessions.has(key))),
     });
+    const turnPolicy = turnDecision.policy;
     const suppressContextInjection = turnPolicy.suppressContextInjection === true;
 
     if (key && turnPolicy.suppressSessionResume) {
@@ -3223,7 +3247,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
       intent: intent.type,
       confidence: intent.confidence,
       strategy: intent.suggestedStrategy,
-      turnPolicy,
+      turnDecision,
     }, 'Intent classified');
 
     // If caller explicitly passed maxTurns (e.g. cron), respect it.
@@ -3380,11 +3404,11 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
     // If a project override is set, skip auto-matching entirely
     const hasActiveSession = !!(sessionKey && this.sessions.has(sessionKey));
     const effectiveTurnPolicy = turnPolicy ?? (intentClassification
-      ? decideTurnPolicy({
+      ? decideTurn({
         text: prompt,
         intent: intentClassification,
         hasRecentContext: hasActiveSession || ((sessionKey ? this.lastExchanges.get(sessionKey)?.length : 0) ?? 0) > 0,
-      })
+      }).policy
       : undefined);
     const retrievalTier = effectiveTurnPolicy?.retrievalTier ?? 'full';
     const [rawContext, autoMatchedProject, linkContexts] = await Promise.all([

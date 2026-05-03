@@ -6,10 +6,11 @@
  * promotes the request to a richer path.
  */
 
-import { routeToolSurface } from './tool-router.js';
+import { routeToolSurface, type ToolRouteDecision } from './tool-router.js';
 import type { IntentClassification } from './intent-classifier.js';
 
 export type RetrievalTier = 'none' | 'core' | 'search' | 'full';
+export type TurnExecutionMode = 'local' | 'lightweight_llm' | 'tool_llm' | 'background';
 
 export interface TurnPolicy {
   retrievalTier: RetrievalTier;
@@ -31,6 +32,14 @@ export interface TurnPolicyInput {
   intent: IntentClassification;
   hasRecentContext: boolean;
   isAutonomous?: boolean;
+}
+
+export interface TurnDecision {
+  mode: TurnExecutionMode;
+  policy: TurnPolicy;
+  toolRoute: ToolRouteDecision;
+  userVisibleStatus: string;
+  reason: string;
 }
 
 const URL_RE = /https?:\/\//i;
@@ -232,5 +241,40 @@ export function decideTurnPolicy(input: TurnPolicyInput): TurnPolicy {
     allowProactiveGoals: false,
     fetchLinks: false,
     reason: 'safe-core-default',
+  };
+}
+
+export function decideTurn(input: TurnPolicyInput): TurnDecision {
+  const policy = decideTurnPolicy(input);
+  const toolRoute = routeToolSurface(input.text);
+  const text = input.text.trim();
+  const wantsBackground = /\b(background|deep mode|keep working|don't stop|dont stop|run in the background|autonomous)\b/i.test(text);
+  const explicitWork = /\b(work|task|do|run|fix|implement|audit|research|analy[sz]e|review|build|ship|finish|complete|continue|handle)\b/i.test(text);
+  const needsTools = !policy.disableAllTools || toolRoute.fullSurface || toolRoute.bundles.length > 0;
+  const backgroundRequested = wantsBackground && needsTools && (explicitWork || policy.enableTeams || policy.retrievalTier === 'full');
+
+  let mode: TurnExecutionMode;
+  if (input.isAutonomous || backgroundRequested) {
+    mode = 'background';
+  } else if (policy.disableAllTools && policy.retrievalTier === 'none') {
+    mode = 'lightweight_llm';
+  } else {
+    mode = 'tool_llm';
+  }
+
+  const userVisibleStatus = mode === 'background'
+    ? 'working in background'
+    : mode === 'lightweight_llm'
+      ? 'answering'
+      : toolRoute.bundles.length > 0 || toolRoute.fullSurface
+        ? 'checking tools'
+        : 'thinking';
+
+  return {
+    mode,
+    policy,
+    toolRoute,
+    userVisibleStatus,
+    reason: policy.reason,
   };
 }

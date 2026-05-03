@@ -1,9 +1,17 @@
 import { describe, expect, it } from 'vitest';
 import { classifyIntent } from '../src/agent/intent-classifier.js';
-import { decideTurnPolicy } from '../src/agent/turn-policy.js';
+import { decideTurn, decideTurnPolicy } from '../src/agent/turn-policy.js';
 
 function policy(text: string, hasRecentContext = false) {
   return decideTurnPolicy({
+    text,
+    intent: classifyIntent(text, hasRecentContext ? [{ user: 'old', assistant: 'old answer' }] : undefined),
+    hasRecentContext,
+  });
+}
+
+function decision(text: string, hasRecentContext = false) {
+  return decideTurn({
     text,
     intent: classifyIntent(text, hasRecentContext ? [{ user: 'old', assistant: 'old answer' }] : undefined),
     hasRecentContext,
@@ -71,5 +79,28 @@ describe('turn policy', () => {
     expect(p.retrievalTier).toBe('full');
     expect(p.disableAllTools).toBe(false);
     expect(p.enableTeams).toBe(true);
+  });
+
+  it('classifies casual fast paths as lightweight LLM turns', () => {
+    const d = decision('thanks');
+
+    expect(d.mode).toBe('lightweight_llm');
+    expect(d.userVisibleStatus).toBe('answering');
+    expect(d.policy.disableAllTools).toBe(true);
+  });
+
+  it('surfaces routed tool turns explicitly', () => {
+    const d = decision('check the Outlook inbox for Ross follow-up replies');
+
+    expect(d.mode).toBe('tool_llm');
+    expect(d.userVisibleStatus).toBe('checking tools');
+    expect(d.toolRoute.bundles).toEqual(['email_outlook']);
+  });
+
+  it('routes explicit sustained-work requests to background mode', () => {
+    const d = decision('keep working on the repo audit in the background until it is done');
+
+    expect(d.mode).toBe('background');
+    expect(d.userVisibleStatus).toBe('working in background');
   });
 });

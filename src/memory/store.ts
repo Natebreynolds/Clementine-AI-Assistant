@@ -34,6 +34,36 @@ import { WriteQueue, type WriteQueueOpts } from './write-queue.js';
 
 const WIKILINK_RE = /\[\[([^\]|]+)(?:\|[^\]]+)?\]\]/g;
 
+export type MemoryPromotionDecision = 'pending' | 'promoted' | 'rejected' | 'superseded';
+
+export interface MemoryPromotionCandidate {
+  id: number;
+  candidateKind: string;
+  sourceTable: string;
+  sourceId: number | null;
+  sessionKey: string | null;
+  agentSlug: string | null;
+  contentPreview: string;
+  confidence: number;
+  salience: number;
+  reason: string | null;
+  decision: MemoryPromotionDecision;
+  createdAt: string;
+  decidedAt: string | null;
+}
+
+export interface MemoryPromotionCandidateInput {
+  candidateKind: string;
+  sourceTable?: string;
+  sourceId?: number | null;
+  sessionKey?: string | null;
+  agentSlug?: string | null;
+  contentPreview: string;
+  confidence?: number;
+  salience?: number;
+  reason?: string | null;
+}
+
 export class MemoryStore {
   private dbPath: string;
   private vaultDir: string;
@@ -406,6 +436,30 @@ export class MemoryStore {
       );
       CREATE INDEX IF NOT EXISTS idx_extractions_session ON memory_extractions(session_key);
       CREATE INDEX IF NOT EXISTS idx_extractions_status ON memory_extractions(status);
+    `);
+
+    this.conn.exec(`
+      CREATE TABLE IF NOT EXISTS memory_promotion_candidates (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        candidate_kind TEXT NOT NULL,
+        source_table TEXT NOT NULL DEFAULT 'memory_extractions',
+        source_id INTEGER,
+        session_key TEXT,
+        agent_slug TEXT,
+        content_preview TEXT NOT NULL,
+        confidence REAL DEFAULT 0.5,
+        salience REAL DEFAULT 1.0,
+        reason TEXT,
+        decision TEXT NOT NULL DEFAULT 'pending',
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        decided_at TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_memory_promotion_candidates_decision
+        ON memory_promotion_candidates(decision, created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_memory_promotion_candidates_session
+        ON memory_promotion_candidates(session_key);
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_promotion_candidates_source
+        ON memory_promotion_candidates(source_table, source_id) WHERE source_id IS NOT NULL;
     `);
 
     // Add agent_slug column to memory_extractions
@@ -4883,11 +4937,86 @@ export class MemoryStore {
 
   // ── Memory Extractions ──────────────────────────────────────────
 
+  private normalizeToolName(toolName: string): string {
+    return toolName.replace(/^mcp__.+?__/, '');
+  }
+
+  private clampScore(value: unknown, fallback: number): number {
+    if (typeof value !== 'number' || !Number.isFinite(value)) return fallback;
+    return Math.max(0, Math.min(1, value));
+  }
+
+  private previewFromToolInput(toolInput: string): {
+    contentPreview: string;
+    confidence: number;
+    salience: number;
+    reason: string | null;
+    action: string | null;
+  } | null {
+    try {
+      const parsed = JSON.parse(toolInput) as Record<string, unknown>;
+      const contentParts = [
+        parsed.content,
+        parsed.text,
+        parsed.memory,
+        parsed.summary,
+        parsed.title,
+        parsed.task,
+        parsed.name,
+      ].filter((v): v is string => typeof v === 'string' && v.trim().length > 0);
+      const contentPreview = contentParts.join(' - ').replace(/\s+/g, ' ').trim().slice(0, 600);
+      if (contentPreview.length < 12) return null;
+      const confidence = this.clampScore(parsed.confidence, 0.5);
+      const salienceRaw = typeof parsed.salience_hint === 'number' ? parsed.salience_hint : parsed.salience;
+      const salience = this.clampScore(salienceRaw, 0.6);
+      return {
+        contentPreview,
+        confidence,
+        salience,
+        reason: typeof parsed.reason === 'string' && parsed.reason.trim() ? parsed.reason.trim().slice(0, 400) : null,
+        action: typeof parsed.action === 'string' && parsed.action.trim() ? parsed.action.trim() : null,
+      };
+    } catch {
+      const contentPreview = toolInput.replace(/\s+/g, ' ').trim().slice(0, 600);
+      if (contentPreview.length < 12) return null;
+      return { contentPreview, confidence: 0.4, salience: 0.5, reason: null, action: null };
+    }
+  }
+
+  private classifyPromotionCandidate(toolName: string, contentPreview: string, action: string | null): string {
+    const lower = `${action ?? ''} ${contentPreview}`.toLowerCase();
+    if (toolName === 'task_add') return 'task';
+    if (toolName === 'note_create' || toolName === 'note_take') return 'note';
+    if (/\b(prefers?|preference|always|never|don't|dont|do not|likes?|wants?|style|tone)\b/.test(lower)) return 'preference';
+    if (/\b(client|customer|partner|team|teammate|manager|boss|friend|family|spouse|wife|husband|relationship|contact)\b/.test(lower)) return 'relationship';
+    if (/\b(process|procedure|workflow|checklist|playbook|steps?)\b/.test(lower)) return 'procedure';
+    return 'fact';
+  }
+
+  private maybeRecordPromotionCandidateFromExtraction(extraction: Omit<MemoryExtraction, 'id'>, sourceId: number): void {
+    if (extraction.status !== 'active') return;
+    const toolName = this.normalizeToolName(extraction.toolName);
+    if (!['memory_write', 'note_create', 'note_take', 'task_add', 'user_model'].includes(toolName)) return;
+    const parsed = this.previewFromToolInput(extraction.toolInput);
+    if (!parsed) return;
+    this.recordMemoryPromotionCandidate({
+      candidateKind: this.classifyPromotionCandidate(toolName, parsed.contentPreview, parsed.action),
+      sourceTable: 'memory_extractions',
+      sourceId,
+      sessionKey: extraction.sessionKey,
+      agentSlug: extraction.agentSlug ?? null,
+      contentPreview: parsed.contentPreview,
+      confidence: parsed.confidence,
+      salience: parsed.salience,
+      reason: parsed.reason ?? `Captured from ${toolName}`,
+    });
+  }
+
   /**
    * Log a memory extraction event for transparency tracking.
    */
   logExtraction(extraction: Omit<MemoryExtraction, 'id'>): void {
-    this.conn
+    const result = this.conn
       .prepare(
         `INSERT INTO memory_extractions
          (session_key, user_message, tool_name, tool_input, extracted_at, status, agent_slug)
@@ -4902,6 +5031,86 @@ export class MemoryStore {
         extraction.status,
         extraction.agentSlug ?? null,
       );
+    const sourceId = Number(result.lastInsertRowid);
+    if (Number.isFinite(sourceId) && sourceId > 0) {
+      this.maybeRecordPromotionCandidateFromExtraction(extraction, sourceId);
+    }
+  }
+
+  recordMemoryPromotionCandidate(input: MemoryPromotionCandidateInput): number {
+    const confidence = this.clampScore(input.confidence, 0.5);
+    const salience = this.clampScore(input.salience, 0.6);
+    const result = this.conn
+      .prepare(
+        `INSERT OR IGNORE INTO memory_promotion_candidates
+         (candidate_kind, source_table, source_id, session_key, agent_slug, content_preview, confidence, salience, reason)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        input.candidateKind,
+        input.sourceTable ?? 'memory_extractions',
+        input.sourceId ?? null,
+        input.sessionKey ?? null,
+        input.agentSlug ?? null,
+        input.contentPreview.slice(0, 600),
+        confidence,
+        salience,
+        input.reason ?? null,
+      );
+    return Number(result.lastInsertRowid);
+  }
+
+  listMemoryPromotionCandidates(limit: number = 50, decision: MemoryPromotionDecision = 'pending'): MemoryPromotionCandidate[] {
+    const rows = this.conn
+      .prepare(
+        `SELECT id, candidate_kind, source_table, source_id, session_key, agent_slug,
+                content_preview, confidence, salience, reason, decision, created_at, decided_at
+         FROM memory_promotion_candidates
+         WHERE decision = ?
+         ORDER BY salience DESC, confidence DESC, created_at DESC
+         LIMIT ?`,
+      )
+      .all(decision, limit) as Array<{
+        id: number;
+        candidate_kind: string;
+        source_table: string;
+        source_id: number | null;
+        session_key: string | null;
+        agent_slug: string | null;
+        content_preview: string;
+        confidence: number;
+        salience: number;
+        reason: string | null;
+        decision: MemoryPromotionDecision;
+        created_at: string;
+        decided_at: string | null;
+      }>;
+
+    return rows.map(row => ({
+      id: row.id,
+      candidateKind: row.candidate_kind,
+      sourceTable: row.source_table,
+      sourceId: row.source_id,
+      sessionKey: row.session_key,
+      agentSlug: row.agent_slug,
+      contentPreview: row.content_preview,
+      confidence: row.confidence,
+      salience: row.salience,
+      reason: row.reason,
+      decision: row.decision,
+      createdAt: row.created_at,
+      decidedAt: row.decided_at,
+    }));
+  }
+
+  decideMemoryPromotionCandidate(id: number, decision: Exclude<MemoryPromotionDecision, 'pending'>, reason?: string): void {
+    this.conn
+      .prepare(
+        `UPDATE memory_promotion_candidates
+         SET decision = ?, decided_at = datetime('now'), reason = COALESCE(?, reason)
+         WHERE id = ?`,
+      )
+      .run(decision, reason ?? null, id);
   }
 
   /**

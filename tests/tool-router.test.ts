@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { routeToolSurface, TOOL_SURFACE_WARN_THRESHOLD } from '../src/agent/tool-router.js';
+import { routeToolSurface, TOOL_SURFACE_HARD_LIMIT, TOOL_SURFACE_WARN_THRESHOLD } from '../src/agent/tool-router.js';
 
 describe('tool router', () => {
   it('defaults routine turns to the core Clementine tool surface', () => {
@@ -19,6 +19,19 @@ describe('tool router', () => {
     expect(route.externalMcpServers).toEqual(['Microsoft_365']);
     expect(route.composioToolkits).toEqual(['outlook']);
     expect(route.inheritFullClaudeEnv).toBe(true);
+  });
+
+  it('does not route browser just because profile text mentions browser context', () => {
+    const route = routeToolSurface('audit inbox check with browser automation mentioned as context');
+
+    expect(route.bundles).toEqual(['email_outlook']);
+  });
+
+  it('routes explicit browser inspection work to browser tools', () => {
+    const route = routeToolSurface('open localhost and take a screenshot');
+
+    expect(route.bundles).toEqual(['browser']);
+    expect(route.externalMcpServers).toContain('playwright');
   });
 
   it('routes Google Sheets without loading every Google toolkit', () => {
@@ -50,6 +63,6 @@ describe('tool router', () => {
   it('exposes a concrete high-surface warning threshold', () => {
     expect(TOOL_SURFACE_WARN_THRESHOLD).toBeGreaterThan(0);
     expect(TOOL_SURFACE_WARN_THRESHOLD).toBeLessThan(953);
+    expect(TOOL_SURFACE_HARD_LIMIT).toBeGreaterThan(TOOL_SURFACE_WARN_THRESHOLD);
   });
 });
-
