@@ -62,7 +62,7 @@ export interface ConnectorRecipe {
   description: string;
   /** Emoji shown next to the label. */
   icon: string;
-  /** Matches the key in ~/.clementine/claude-integrations.json */
+  /** Matches the tool source name; "*" recipes are offered for every source. */
   integration: string;
   /** Tools we rely on for this recipe. Used only to warn if the integration
    *  hasn't surfaced them yet in claude-integrations.json. */
@@ -88,6 +88,11 @@ function slugify(s: string): string {
     .slice(0, 40) || 'feed';
 }
 
+function inferToolServer(toolName: string): string {
+  const match = String(toolName).match(/^mcp__([^_]+(?:_[^_]+)*)__/);
+  return match?.[1] ?? 'tool';
+}
+
 const COMMIT_INSTRUCTIONS = `When you have the records collected, call the \`brain_ingest_folder\` MCP tool with:
 - \`slug\`: "{{slug}}"
 - \`records\`: an array of \`{title, externalId, content, metadata}\` objects (one per item). \`externalId\` should be the source provider's stable id so re-runs dedup. \`metadata\` can include any fields you want preserved (url, modifiedAt, author).
@@ -101,6 +106,103 @@ const MEMORY_DELTA_INSTRUCTIONS = `Before committing, call \`memory_recall\` for
 // ── Recipes ────────────────────────────────────────────────────────────
 
 export const RECIPES: ConnectorRecipe[] = [
+  {
+    id: 'tool-backed-memory-seed',
+    label: 'Any tool: call and seed memory',
+    description: 'Call a selected tool from this connector, compare results with current memory, and ingest new or changed findings.',
+    icon: '🔌',
+    integration: '*',
+    requiredTools: [],
+    fields: [
+      {
+        key: 'topic',
+        label: 'Memory topic',
+        placeholder: 'customers, calls, leads, deals, meetings...',
+        required: true,
+        help: 'Used for recall, deduping, and the generated feed slug.',
+      },
+      {
+        key: 'toolName',
+        label: 'Tool to call',
+        required: true,
+        help: 'Pick the exact tool this feed should call when it runs.',
+      },
+      {
+        key: 'callGoal',
+        label: 'What to pull',
+        placeholder: 'Fetch updated HubSpot contacts modified since the last run...',
+        required: true,
+        help: 'Describe the records to fetch, filters to apply, and any pagination bounds.',
+      },
+      {
+        key: 'variablesJson',
+        label: 'Variables JSON',
+        placeholder: '{"listId":"123","limit":100,"updatedAfter":"last_run"}',
+        help: 'Optional arguments, IDs, ranges, filters, or query variables the tool should use.',
+      },
+      {
+        key: 'recordStrategy',
+        label: 'Record strategy',
+        placeholder: 'One record per contact. Use email as stable id. Summarize lifecycle stage, owner, last activity, and new changes.',
+        help: 'Tell the agent how to convert the tool output into memory records.',
+      },
+      {
+        key: 'slug',
+        label: 'Slug override',
+        placeholder: 'hubspot-contacts',
+        help: 'Optional. Leave blank to derive one from the connector and topic.',
+      },
+      {
+        key: 'limit',
+        label: 'Max records per run',
+        placeholder: '100',
+        defaultValue: '100',
+      },
+    ],
+    defaultSchedule: '0 8 * * *',
+    tier: 2,
+    slugFromValues: (v) => `tool-${slugify(v.slug || `${v.toolSourceName || inferToolServer(v.toolName || '')}-${v.topic || v.toolName || 'feed'}`)}`,
+    buildPrompt: (v, ctx) => {
+      const sourceName = v.toolSourceName || inferToolServer(v.toolName || '');
+      const sourceKind = v.toolSourceKind || 'mcp';
+      const sourceLabel = v.toolSourceLabel || sourceName;
+      const topic = v.topic || 'tool-backed memory';
+      const limit = v.limit || '100';
+      return `You are running a generic tool-backed memory seed feed.
+
+Tool source:
+- Label: "${sourceLabel}"
+- Source name: "${sourceName}"
+- Source kind: "${sourceKind}"
+- Tool: \`${v.toolName}\`
+
+Goal: ${v.callGoal || `Call ${v.toolName} and ingest useful returned data into memory.`}
+
+Variables JSON:
+\`\`\`json
+${(v.variablesJson || '{}').trim() || '{}'}
+\`\`\`
+
+Record strategy:
+${v.recordStrategy || 'Convert the tool response into one memory record per returned entity or event. Use the provider stable id when available; otherwise use a deterministic hash of the source, topic, and meaningful record key.'}
+
+Steps:
+1. Call exactly this selected tool: \`${v.toolName}\`. Use the Variables JSON and the Goal above as the tool-call inputs. If the tool schema needs differently named arguments, map the provided variables to that schema. Do not switch to a different external tool unless this tool returns a clear instruction that another tool is required to read the selected records.
+2. If the tool supports pagination or modified-since filters, prefer new/updated records and stop after ${limit} records. If no modified-since filter is available, fetch the most relevant ${limit} records.
+3. Normalize the tool result into candidate records. Preserve stable ids, URLs, timestamps, owners/authors, status fields, and provider metadata. Skip empty or purely administrative records.
+4. ${MEMORY_DELTA_INSTRUCTIONS}
+   Use this recall query: \`source:${ctx.slug} ${topic} ${sourceLabel} ${v.toolName}\`.
+5. Compare the normalized candidates with recalled memory. Keep only candidates that are new, materially changed, or produce a new useful finding. Drop exact duplicates and trivial timestamp-only changes unless the timestamp itself is the useful fact.
+6. For each kept candidate, build one record:
+   - \`title\`: a compact human label including the topic and record name/id.
+   - \`externalId\`: \`${sourceName}:${topic}:<providerStableIdOrDeterministicHash>\`.
+   - \`content\`: markdown containing the current facts, the new/changed finding, and a "Source data" section with relevant returned fields.
+   - \`metadata\`: \`{provider:"${sourceName}", toolSource:"${sourceKind}", toolName:"${v.toolName}", topic:"${topic}", fetchedAt, sourceUrl, updatedAt}\` plus any provider-specific keys worth preserving.
+7. ${COMMIT_INSTRUCTIONS.replace(/{{slug}}/g, ctx.slug).replace(/{{targetFolder}}/g, ctx.targetFolder)}
+`;
+    },
+  },
+
   {
     id: 'gdrive-watch-folder',
     label: 'Google Drive: watch a folder',

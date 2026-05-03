@@ -3741,7 +3741,7 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
           const activeSlugs = [...new Set(
             connected
               .filter((c) => c.status === 'ACTIVE')
-              .filter((c) => recipeIntegrations.has(c.slug))
+              .filter((c) => recipeIntegrations.has('*') || recipeIntegrations.has(c.slug))
               .map((c) => c.slug),
           )];
           if (activeSlugs.length) {
@@ -13977,6 +13977,11 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
             for (const f of (s.recipe.fields || [])) {
               if (f.defaultValue) s.values[f.key] = f.defaultValue;
             }
+            if (s.recipe.integration === '*' && s.pick) {
+              s.values.toolSourceName = s.pick.name;
+              s.values.toolSourceKind = s.pick.kind;
+              s.values.toolSourceLabel = s.pick.label;
+            }
             s.schedule = s.recipe.defaultSchedule;
             s.step = 2;
           } else if (s.step === 2) {
@@ -14152,6 +14157,13 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
           if (field) await brainRenderFieldPicker(field, s.values);
         }
 
+        function brainFullToolNameForPick(pick, tool) {
+          if (!pick || !tool) return tool || '';
+          if (String(tool).startsWith('mcp__')) return tool;
+          const server = pick.kind === 'claude-desktop' ? ('claude_ai_' + pick.name) : pick.name;
+          return 'mcp__' + server + '__' + tool;
+        }
+
         function brainFeedWizardRender() {
           if (!brainFeedWizardState) return;
           const s = brainFeedWizardState;
@@ -14179,7 +14191,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
                 }).join('') + '</div>';
             }
           } else if (s.step === 1) {
-            const recipes = (s.catalog.recipes || []).filter(function(r) { return r.integration === s.pick.name; });
+            const recipes = (s.catalog.recipes || []).filter(function(r) { return r.integration === s.pick.name || r.integration === '*'; });
             if (!recipes.length) {
               html = '<div style="color:var(--muted)">No recipes for this connector yet.</div>';
             } else {
@@ -14208,6 +14220,25 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
                       '<div style="color:var(--muted);font-size:13px;padding:6px">Loading choices…</div>' +
                     '</div>' +
                     '<input type="hidden" data-field="' + f.key + '" value="' + escapeHtml(val) + '">';
+                  } else if (s.recipe.integration === '*' && f.key === 'toolName') {
+                    const tools = (s.pick && s.pick.tools) || [];
+                    if (!tools.length) {
+                      control = '<input type="text" data-field="' + f.key + '" value="' + escapeHtml(val) + '" placeholder="mcp__server__TOOL_NAME" style="width:100%">';
+                    } else {
+                      const options = tools.map(function(t) {
+                        const full = brainFullToolNameForPick(s.pick, t);
+                        const selected = full === val ? ' selected' : '';
+                        return '<option value="' + escapeHtml(full) + '"' + selected + '>' + escapeHtml(t) + '</option>';
+                      }).join('');
+                      control = '<select data-field="' + f.key + '" style="width:100%;padding:6px">' +
+                        '<option value="">— pick a tool —</option>' +
+                        options +
+                      '</select>' +
+                      '<div style="font-size:11px;color:var(--muted);margin-top:4px">The feed will call the selected tool exactly, then compare returned records with memory.</div>';
+                    }
+                  } else if (s.recipe.integration === '*' && ['callGoal', 'variablesJson', 'recordStrategy'].includes(f.key)) {
+                    const minHeight = f.key === 'variablesJson' ? '70px' : '92px';
+                    control = '<textarea data-field="' + f.key + '" placeholder="' + escapeHtml(f.placeholder || '') + '" style="width:100%;min-height:' + minHeight + ';resize:vertical">' + escapeHtml(val) + '</textarea>';
                   } else {
                     control = '<input type="text" data-field="' + f.key + '" value="' + escapeHtml(val) + '" placeholder="' + escapeHtml(f.placeholder || '') + '" style="width:100%">';
                   }
@@ -14249,6 +14280,11 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
         function brainFeedWizardPickRecipe(id) {
           const r = (brainFeedWizardState.catalog.recipes || []).find(function(x) { return x.id === id; });
           brainFeedWizardState.recipe = r;
+          if (r && r.integration === '*' && brainFeedWizardState.pick) {
+            brainFeedWizardState.values.toolSourceName = brainFeedWizardState.pick.name;
+            brainFeedWizardState.values.toolSourceKind = brainFeedWizardState.pick.kind;
+            brainFeedWizardState.values.toolSourceLabel = brainFeedWizardState.pick.label;
+          }
           brainFeedWizardRender();
         }
 

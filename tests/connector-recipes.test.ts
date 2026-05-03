@@ -2,6 +2,46 @@ import { describe, expect, it } from 'vitest';
 import { buildFeedSpec, recipeById, recipesForIntegration } from '../src/brain/connector-recipes.js';
 
 describe('connector feed recipes', () => {
+  it('exposes a generic tool-backed memory seed recipe for every connector', () => {
+    const recipe = recipeById('tool-backed-memory-seed');
+
+    expect(recipe?.integration).toBe('*');
+    expect(recipe?.fields.map((f) => f.key)).toEqual([
+      'topic',
+      'toolName',
+      'callGoal',
+      'variablesJson',
+      'recordStrategy',
+      'slug',
+      'limit',
+    ]);
+  });
+
+  it('builds generic tool-backed prompts that call the selected tool and ingest deltas', () => {
+    const recipe = recipeById('tool-backed-memory-seed');
+    expect(recipe).toBeTruthy();
+
+    const spec = buildFeedSpec(recipe!, {
+      topic: 'hubspot contacts',
+      toolName: 'mcp__hubspot__HUBSPOT_GET_CONTACTS',
+      toolSourceName: 'hubspot',
+      toolSourceKind: 'composio',
+      toolSourceLabel: 'HubSpot',
+      callGoal: 'Fetch contacts modified since the last run.',
+      variablesJson: '{"limit":50,"properties":["email","lifecyclestage"]}',
+      recordStrategy: 'One record per contact. Use email as the stable id.',
+      limit: '50',
+    });
+
+    expect(spec.slug).toBe('tool-hubspot-hubspot-contacts');
+    expect(spec.prompt).toContain('Call exactly this selected tool: `mcp__hubspot__HUBSPOT_GET_CONTACTS`');
+    expect(spec.prompt).toContain('"limit":50');
+    expect(spec.prompt).toContain('memory_recall');
+    expect(spec.prompt).toContain('source:tool-hubspot-hubspot-contacts hubspot contacts HubSpot mcp__hubspot__HUBSPOT_GET_CONTACTS');
+    expect(spec.prompt).toContain('brain_ingest_folder');
+    expect(spec.prompt).toContain('toolSource:"composio"');
+  });
+
   it('exposes a Composio Google Sheets seed recipe', () => {
     const recipes = recipesForIntegration('googlesheets');
     const recipe = recipeById('googlesheets-range');

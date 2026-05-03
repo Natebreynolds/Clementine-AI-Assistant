@@ -173,6 +173,16 @@ function uniqueStrings(values: Iterable<string | undefined>): string[] {
   return [...new Set([...values].filter((v): v is string => !!v && v.trim().length > 0))];
 }
 
+function explicitMcpServers(scopeText: string): string[] {
+  const servers = new Set<string>();
+  const re = /\bmcp__([A-Za-z0-9_-]+)__[A-Za-z0-9_.:-]+\b/g;
+  let match: RegExpExecArray | null;
+  while ((match = re.exec(scopeText)) !== null) {
+    servers.add(match[1]);
+  }
+  return uniqueStrings(servers);
+}
+
 export function routeToolSurface(text: string | undefined): ToolRouteDecision {
   const scopeText = text?.trim() ?? '';
   if (!scopeText) {
@@ -210,12 +220,25 @@ export function routeToolSurface(text: string | undefined): ToolRouteDecision {
     inheritFullClaudeEnv = inheritFullClaudeEnv || bundle.inheritFullClaudeEnv === true;
   }
 
+  for (const server of explicitMcpServers(scopeText)) {
+    if (server.startsWith('claude_ai_')) {
+      external.add(server.slice('claude_ai_'.length));
+    } else {
+      // Exact `mcp__<server>__<tool>` mentions are authoritative. Add the
+      // name as both a direct MCP server and a Composio toolkit; whichever
+      // source is actually connected will mount, and the other path no-ops.
+      external.add(server);
+      composio.add(server);
+    }
+    inheritFullClaudeEnv = true;
+  }
+
   return {
     bundles: uniqueStrings(bundles) as ToolBundleId[],
     externalMcpServers: uniqueStrings(external),
     composioToolkits: uniqueStrings(composio),
     inheritFullClaudeEnv,
     fullSurface: false,
-    reason: bundles.size > 0 ? 'matched' : 'empty',
+    reason: bundles.size > 0 || external.size > 0 || composio.size > 0 ? 'matched' : 'empty',
   };
 }

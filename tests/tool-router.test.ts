@@ -43,6 +43,24 @@ describe('tool router', () => {
     expect(route.fullSurface).toBe(false);
   });
 
+  it('routes exact Composio MCP tool mentions for generic seed feeds', () => {
+    const route = routeToolSurface('Call exactly this selected tool: `mcp__hubspot__HUBSPOT_GET_CONTACTS`');
+
+    expect(route.bundles).toEqual([]);
+    expect(route.externalMcpServers).toEqual(['hubspot']);
+    expect(route.composioToolkits).toEqual(['hubspot']);
+    expect(route.inheritFullClaudeEnv).toBe(true);
+    expect(route.reason).toBe('matched');
+  });
+
+  it('routes exact Claude Desktop tool mentions back to the integration name', () => {
+    const route = routeToolSurface('Call exactly this selected tool: `mcp__claude_ai_Google_Drive__search_files`');
+
+    expect(route.externalMcpServers).toEqual(['Google_Drive']);
+    expect(route.composioToolkits).toEqual([]);
+    expect(route.inheritFullClaudeEnv).toBe(true);
+  });
+
   it('combines multiple required bundles deterministically', () => {
     const route = routeToolSurface('find the lead in Google Drive and send a follow-up email');
 
