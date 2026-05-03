@@ -3673,7 +3673,8 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
   // the Intelligence → Sources tab composes recipe + field values + schedule
   // into a cron prompt that uses the user's authenticated tool source
   // (Claude Desktop connector, Composio toolkit, or local MCP server) to pull
-  // records and calls brain_ingest_folder to commit them.
+  // records, compare them with memory, and call brain_ingest_folder to commit
+  // distilled notes.
 
   app.get('/api/brain/connectors', async (_req, res) => {
     try {
@@ -3932,6 +3933,26 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
         res.status(400).json({ error: `missing required field(s): ${missing.join(', ')}` });
         return;
       }
+      if (recipe.id === 'tool-backed-memory-seed') {
+        const toolName = String(values.toolName ?? '').trim();
+        if (!/^mcp__.+__.+$/.test(toolName)) {
+          res.status(400).json({ error: 'toolName must be an exact MCP tool name like mcp__server__tool' });
+          return;
+        }
+        const rawVariables = String(values.variablesJson ?? '').trim();
+        if (rawVariables) {
+          try {
+            const parsedVariables = JSON.parse(rawVariables);
+            if (!parsedVariables || typeof parsedVariables !== 'object' || Array.isArray(parsedVariables)) {
+              res.status(400).json({ error: 'Tool variables must be a JSON object, for example {}' });
+              return;
+            }
+          } catch {
+            res.status(400).json({ error: 'Tool variables must be valid JSON, for example {}' });
+            return;
+          }
+        }
+      }
       const schedule = (body.schedule || recipe.defaultSchedule).trim();
       if (!cron.validate(schedule)) {
         res.status(400).json({ error: `invalid cron expression: ${schedule}` });
@@ -3970,7 +3991,7 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
             managed: 'connector-feed',
             recipeId: recipe.id,
             fields: values,
-            inputPath: path.join(VAULT_DIR, spec.targetFolder),
+            mode: 'direct-records',
           }),
           targetFolder: spec.targetFolder,
           intelligence: 'auto',
@@ -13411,11 +13432,11 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
           <!-- ═══ Auto-seed feeds (connected tools → cron → brain) ═══ -->
           <div class="card" style="padding:16px;margin-bottom:16px">
             <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px">
-              <div style="font-weight:600">Auto-seed feeds</div>
+              <div style="font-weight:600">Seed memory from connected apps</div>
               <button class="btn-primary" onclick="brainOpenFeedWizard()">+ Add feed</button>
             </div>
             <div style="color:var(--muted);font-size:13px;margin-bottom:12px">
-              One-click scheduled feeds that use authenticated tools (Composio, Claude Desktop connectors, or local MCP servers) to pull records and commit them to the brain.
+              Scheduled feeds use authenticated tools (Composio, Claude Desktop connectors, or local MCP servers) to fetch records, compare them with current memory, and save distilled notes to the brain.
             </div>
             <div id="brain-feeds-connectors" style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:12px"></div>
             <div id="brain-feeds-list"></div>
@@ -13423,7 +13444,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
 
           <!-- ═══ Auto-seed feed wizard (hidden by default) ═══ -->
           <div id="brain-feed-wizard" class="card" style="display:none;padding:16px;margin-bottom:16px">
-            <div style="font-weight:600;margin-bottom:4px">Add auto-seed feed</div>
+            <div style="font-weight:600;margin-bottom:4px">Add memory seed feed</div>
             <div id="brain-feed-wizard-breadcrumbs" style="color:var(--muted);font-size:12px;margin-bottom:12px"></div>
             <div id="brain-feed-wizard-step"></div>
             <div style="display:flex;gap:8px;margin-top:14px">
@@ -13990,6 +14011,27 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
             inputs.forEach(function(inp) { s.values[inp.dataset.field] = inp.value; });
             const missing = (s.recipe.fields || []).filter(function(f) { return f.required && !(s.values[f.key] || '').trim(); });
             if (missing.length) { document.getElementById('brain-feed-wizard-status').innerHTML = '<span style="color:#e66">Required: ' + missing.map(function(f) { return f.label; }).join(', ') + '</span>'; return; }
+            if (s.recipe && s.recipe.id === 'tool-backed-memory-seed') {
+              const toolName = String(s.values.toolName || '').trim();
+              if (!/^mcp__.+__.+$/.test(toolName)) {
+                document.getElementById('brain-feed-wizard-status').innerHTML = '<span style="color:#e66">Pick an exact tool before continuing.</span>';
+                return;
+              }
+              const rawVariables = String(s.values.variablesJson || '').trim();
+              if (rawVariables) {
+                try {
+                  const parsedVariables = JSON.parse(rawVariables);
+                  if (!parsedVariables || typeof parsedVariables !== 'object' || Array.isArray(parsedVariables)) {
+                    document.getElementById('brain-feed-wizard-status').innerHTML = '<span style="color:#e66">Tool variables must be a JSON object, for example {}.</span>';
+                    return;
+                  }
+                } catch (err) {
+                  void err;
+                  document.getElementById('brain-feed-wizard-status').innerHTML = '<span style="color:#e66">Tool variables must be valid JSON, for example {}.</span>';
+                  return;
+                }
+              }
+            }
             s.step = 3;
           } else if (s.step === 3) {
             brainFeedWizardSubmit();

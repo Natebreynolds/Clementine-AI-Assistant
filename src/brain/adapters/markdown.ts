@@ -28,8 +28,15 @@ export async function* parseMarkdown(filePath: string): AsyncIterable<RawRecord>
   let mtime = '';
   try { mtime = statSync(filePath).mtime.toISOString(); } catch { /* ignore */ }
 
+  const frontmatterExternalId =
+    typeof parsed.data?.externalId === 'string' && parsed.data.externalId.trim()
+      ? parsed.data.externalId.trim()
+      : typeof parsed.data?.external_id === 'string' && parsed.data.external_id.trim()
+        ? parsed.data.external_id.trim()
+        : null;
+
   yield {
-    externalId: `md-${hint}-${contentHash(body)}`,
+    externalId: frontmatterExternalId ?? `md-${hint}-${contentHash(body)}`,
     content: body,
     rawPayload: raw,
     metadata: {

@@ -3,8 +3,8 @@
  *
  * Each recipe is a blueprint for a one-click "auto-seed feed" that turns an
  * authenticated tool source (Claude Desktop connector, Composio toolkit, or
- * local MCP server) into a scheduled data feed that writes into the brain's
- * ingest folder.
+ * local MCP server) into a scheduled data feed that writes distilled notes
+ * into the brain's ingest folder.
  *
  * A feed materializes as:
  *   1. A CRON.md job entry with `managed: connector-feed` frontmatter
@@ -12,8 +12,8 @@
  *
  * The cron prompt tells the Claude Code agent to use the integration's MCP
  * tools to pull records, compare them with current memory when appropriate,
- * then call `brain_ingest_folder` to commit them — which writes markdown files
- * and runs the distillation pipeline in one step.
+ * then call `brain_ingest_folder` to commit them — which writes distilled
+ * markdown notes and indexes them in one step.
  *
  * Field syntax in prompt templates:
  *   {{fieldKey}}   — user-supplied value
@@ -97,19 +97,19 @@ const COMMIT_INSTRUCTIONS = `When you have the records collected, call the \`bra
 - \`slug\`: "{{slug}}"
 - \`records\`: an array of \`{title, externalId, content, metadata}\` objects (one per item). \`externalId\` should be the source provider's stable id so re-runs dedup. \`metadata\` can include any fields you want preserved (url, modifiedAt, author).
 
-That tool writes each record to \`{{targetFolder}}/\` and runs the brain's distillation pipeline. You do NOT need to use Write — brain_ingest_folder handles file creation. Finish by reporting a one-line summary like "Ingested N new records, M unchanged".
+That tool runs the brain's distillation pipeline and writes the final notes to \`{{targetFolder}}/\`. You do NOT need to use Write — brain_ingest_folder handles note creation and indexing. Finish by reporting a one-line summary like "Ingested N new records, M unchanged".
 
 If the tool returns an error, include the error text in your summary.`;
 
-const MEMORY_DELTA_INSTRUCTIONS = `Before committing, call \`memory_recall\` for the feed slug/topic and use the returned chunks as the current memory state for this source. Keep records that are new, materially changed, or contain a new finding. Drop exact duplicates and rows that add no useful information. The ingestion pipeline will write markdown and embeddings; do not call \`memory_write\` for these feed records.`;
+const MEMORY_DELTA_INSTRUCTIONS = `Before committing, call \`memory_recall\` for the feed slug/topic and use the returned chunks as the current memory state for this source. Keep records that are new, materially changed, or contain a new finding. Drop exact duplicates and rows that add no useful information. The ingestion pipeline will write markdown, chunk it, and index it for recall; do not call \`memory_write\` for these feed records.`;
 
 // ── Recipes ────────────────────────────────────────────────────────────
 
 export const RECIPES: ConnectorRecipe[] = [
   {
     id: 'tool-backed-memory-seed',
-    label: 'Any tool: call and seed memory',
-    description: 'Call a selected tool from this connector, compare results with current memory, and ingest new or changed findings.',
+    label: 'Seed memory from this tool',
+    description: 'Pick one tool, fetch records from it, compare them with current memory, and save only new or changed findings.',
     icon: '🔌',
     integration: '*',
     requiredTools: [],
@@ -119,36 +119,36 @@ export const RECIPES: ConnectorRecipe[] = [
         label: 'Memory topic',
         placeholder: 'customers, calls, leads, deals, meetings...',
         required: true,
-        help: 'Used for recall, deduping, and the generated feed slug.',
+        help: 'Used to search current memory and name this feed.',
       },
       {
         key: 'toolName',
         label: 'Tool to call',
         required: true,
-        help: 'Pick the exact tool this feed should call when it runs.',
+        help: 'Pick the exact tool this feed should call each time it runs.',
       },
       {
         key: 'callGoal',
-        label: 'What to pull',
+        label: 'What should Clementine fetch?',
         placeholder: 'Fetch updated HubSpot contacts modified since the last run...',
         required: true,
         help: 'Describe the records to fetch, filters to apply, and any pagination bounds.',
       },
       {
         key: 'variablesJson',
-        label: 'Variables JSON',
+        label: 'Tool variables (JSON)',
         placeholder: '{"listId":"123","limit":100,"updatedAfter":"last_run"}',
-        help: 'Optional arguments, IDs, ranges, filters, or query variables the tool should use.',
+        help: 'Optional. Use {} if the tool needs no arguments.',
       },
       {
         key: 'recordStrategy',
-        label: 'Record strategy',
+        label: 'How to save each result',
         placeholder: 'One record per contact. Use email as stable id. Summarize lifecycle stage, owner, last activity, and new changes.',
-        help: 'Tell the agent how to convert the tool output into memory records.',
+        help: 'Tell Clementine what counts as one memory record and which field is the stable id.',
       },
       {
         key: 'slug',
-        label: 'Slug override',
+        label: 'Memory bucket name (optional)',
         placeholder: 'hubspot-contacts',
         help: 'Optional. Leave blank to derive one from the connector and topic.',
       },
@@ -178,16 +178,16 @@ Tool source:
 
 Goal: ${v.callGoal || `Call ${v.toolName} and ingest useful returned data into memory.`}
 
-Variables JSON:
+Tool variables JSON:
 \`\`\`json
 ${(v.variablesJson || '{}').trim() || '{}'}
 \`\`\`
 
-Record strategy:
+How to save each result:
 ${v.recordStrategy || 'Convert the tool response into one memory record per returned entity or event. Use the provider stable id when available; otherwise use a deterministic hash of the source, topic, and meaningful record key.'}
 
 Steps:
-1. Call exactly this selected tool: \`${v.toolName}\`. Use the Variables JSON and the Goal above as the tool-call inputs. If the tool schema needs differently named arguments, map the provided variables to that schema. Do not switch to a different external tool unless this tool returns a clear instruction that another tool is required to read the selected records.
+1. Call exactly this selected tool: \`${v.toolName}\`. Use the Tool variables JSON and the Goal above as the tool-call inputs. If the tool schema needs differently named arguments, map the provided variables to that schema. Do not switch to a different external tool unless this tool returns a clear instruction that another tool is required to read the selected records.
 2. If the tool supports pagination or modified-since filters, prefer new/updated records and stop after ${limit} records. If no modified-since filter is available, fetch the most relevant ${limit} records.
 3. Normalize the tool result into candidate records. Preserve stable ids, URLs, timestamps, owners/authors, status fields, and provider metadata. Skip empty or purely administrative records.
 4. ${MEMORY_DELTA_INSTRUCTIONS}
