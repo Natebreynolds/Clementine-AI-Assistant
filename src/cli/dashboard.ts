@@ -5468,11 +5468,20 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
     writeFileSync(ENV_PATH, content, { mode: 0o600 });
   }
 
+  const DASHBOARD_BUDGET_ROWS = [
+    { key: 'BUDGET_CHAT_USD', value: '5', label: 'Chat', hint: 'Per interactive chat turn' },
+    { key: 'BUDGET_HEARTBEAT_USD', value: '0.25', label: 'Heartbeat', hint: 'Per proactive heartbeat tick' },
+    { key: 'BUDGET_CRON_T1_USD', value: '0.75', label: 'Tier 1 cron', hint: 'Per lightweight scheduled job' },
+    { key: 'BUDGET_CRON_T2_USD', value: '1.5', label: 'Tier 2 cron', hint: 'Per deeper scheduled job' },
+  ] as const;
+
   const SAFE_DASHBOARD_BUDGETS = [
     { key: 'BUDGET_HEARTBEAT_USD', value: '0.25', label: 'Heartbeat' },
     { key: 'BUDGET_CRON_T1_USD', value: '0.75', label: 'Tier 1 cron' },
     { key: 'BUDGET_CRON_T2_USD', value: '1.5', label: 'Tier 2 cron' },
   ] as const;
+
+  const DASHBOARD_BUDGET_KEYS = new Set(DASHBOARD_BUDGET_ROWS.map(row => row.key));
 
   type DashboardOneMillionMode = 'auto' | 'off' | 'on';
 
@@ -5496,7 +5505,25 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
   function formatDashboardBudgetValue(value: unknown): string {
     const n = Number(value);
     if (!Number.isFinite(n)) return String(value ?? '');
+    if (n === 0) return 'No cap';
     return `$${n.toFixed(2)}`;
+  }
+
+  function writeDashboardBudgetCap(key: string, value: unknown): { ok: true; value: string } | { ok: false; error: string } {
+    if (!DASHBOARD_BUDGET_KEYS.has(key as typeof DASHBOARD_BUDGET_ROWS[number]['key'])) {
+      return { ok: false, error: 'Unknown budget key' };
+    }
+    const n = Number(value);
+    if (!Number.isFinite(n) || n < 0) {
+      return { ok: false, error: 'Budget must be a non-negative dollar amount. Use 0 for no cap.' };
+    }
+    if (n > 1000) {
+      return { ok: false, error: 'Budget cap is too high for the dashboard. Use the CLI if you really need a cap above $1000.' };
+    }
+    const normalized = n === 0 ? '0' : String(Math.round(n * 100) / 100);
+    writeEnvValue(key, normalized);
+    process.env[key] = normalized;
+    return { ok: true, value: normalized };
   }
 
 	  const ASSISTANT_PREF_OPTIONS = {
@@ -5562,12 +5589,6 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
       const cfg = computeEffectiveConfig(BASE_DIR);
       const doctor = runDoctor(BASE_DIR);
       const byKey = new Map(cfg.entries.map(e => [e.key, e]));
-      const rows = [
-        { label: 'Chat', key: 'BUDGET_CHAT_USD' },
-        { label: 'Heartbeat', key: 'BUDGET_HEARTBEAT_USD' },
-        { label: 'Tier 1 cron', key: 'BUDGET_CRON_T1_USD' },
-        { label: 'Tier 2 cron', key: 'BUDGET_CRON_T2_USD' },
-      ];
       const oneMModeEntry = byKey.get('CLEMENTINE_1M_CONTEXT_MODE');
       const legacyEntry = byKey.get('CLAUDE_CODE_DISABLE_1M_CONTEXT');
       const legacyMode = legacyDisableToDashboardMode(legacyEntry?.value);
@@ -5599,10 +5620,11 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
       res.json({
         ok: true,
         baseDir: cfg.baseDir,
-        budgets: rows.map(row => {
+        budgets: DASHBOARD_BUDGET_ROWS.map(row => {
           const entry = byKey.get(row.key);
           return {
             label: row.label,
+            hint: row.hint,
             key: row.key,
             value: entry?.value ?? '',
             displayValue: formatDashboardBudgetValue(entry?.value),
@@ -5626,11 +5648,60 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
     }
   });
 
+  app.post('/api/budgets/set', (req, res) => {
+    try {
+      const body = req.body as Record<string, unknown>;
+      const key = String(body?.key ?? '');
+      const result = writeDashboardBudgetCap(key, body?.value);
+      if (!result.ok) {
+        res.status(400).json({ error: result.error });
+        return;
+      }
+      res.json({
+        ok: true,
+        message: `${key} set to ${formatDashboardBudgetValue(result.value)}. Restart Clementine to apply to running workers.`,
+      });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  app.post('/api/budgets/preset', (req, res) => {
+    try {
+      const preset = String((req.body as Record<string, unknown>)?.preset ?? '').trim().toLowerCase();
+      let writes: Array<{ key: string; value: string }>;
+      let message: string;
+      if (preset === 'defaults' || preset === 'standard') {
+        writes = DASHBOARD_BUDGET_ROWS.map(row => ({ key: row.key, value: row.value }));
+        message = 'Restored the standard spend caps. Restart Clementine to apply to running workers.';
+      } else if (preset === 'uncapped' || preset === 'off' || preset === 'none') {
+        writes = DASHBOARD_BUDGET_ROWS.map(row => ({ key: row.key, value: '0' }));
+        message = 'Removed spend caps by setting all budget values to 0. Restart Clementine to apply to running workers.';
+      } else {
+        res.status(400).json({ error: 'preset must be defaults or uncapped' });
+        return;
+      }
+      for (const item of writes) {
+        const result = writeDashboardBudgetCap(item.key, item.value);
+        if (!result.ok) {
+          res.status(400).json({ error: result.error });
+          return;
+        }
+      }
+      res.json({ ok: true, message });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
   app.post('/api/budgets/safe', (_req, res) => {
     try {
       for (const item of SAFE_DASHBOARD_BUDGETS) {
-        writeEnvValue(item.key, item.value);
-        process.env[item.key] = item.value;
+        const result = writeDashboardBudgetCap(item.key, item.value);
+        if (!result.ok) {
+          res.status(400).json({ error: result.error });
+          return;
+        }
       }
       writeEnvValue('CLEMENTINE_1M_CONTEXT_MODE', 'off');
       writeEnvValue('CLAUDE_CODE_DISABLE_1M_CONTEXT', '1');
@@ -19770,22 +19841,37 @@ async function refreshBudgetHealth() {
     var findings = d.findings || [];
     var html = '<div class="card">'
       + '<div class="card-header" style="display:flex;align-items:center;justify-content:space-between;gap:12px">'
-      + '<div style="display:flex;align-items:center;gap:8px"><span>Budget &amp; Context Health</span><span class="badge ' + modeClass + '" style="font-size:10px">1M ' + esc(mode) + '</span></div>'
+      + '<div style="display:flex;align-items:center;gap:8px"><span>Spend Guards &amp; Context Health</span><span class="badge ' + modeClass + '" style="font-size:10px">1M ' + esc(mode) + '</span></div>'
       + '<div style="display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end">'
       + '<button class="btn-sm btn-primary" onclick="applySafeBudgetPreset()">Safe Recovery</button>'
+      + '<button class="btn-sm" onclick="applyBudgetPreset(\\x27defaults\\x27)">Default Caps</button>'
+      + '<button class="btn-sm" onclick="applyBudgetPreset(\\x27uncapped\\x27)">No Caps</button>'
       + '<button class="btn-sm" onclick="setBudgetContextMode(\\x27auto\\x27)">Smart Auto</button>'
       + '<button class="btn-sm" onclick="setBudgetContextMode(\\x27off\\x27)">Force 200K</button>'
       + '<button class="btn-sm" onclick="forceBudgetOneMillion()">Force 1M</button>'
       + '<button class="btn-sm" onclick="applyBudgetDoctorFix()">Doctor Fix</button>'
       + '</div></div>'
       + '<div class="card-body" style="padding:16px">';
-    html += '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-bottom:12px">';
+    html += '<div style="font-size:12px;color:var(--text-secondary);margin-bottom:12px">Spend guards are per-run dollar caps. They prevent runaway background work, but setting a cap to 0 removes that guard.</div>';
+    html += '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:10px;margin-bottom:12px">';
     for (var i = 0; i < rows.length; i++) {
       var row = rows[i];
+      var inputId = 'budget-cap-' + String(row.key).replace(/[^A-Za-z0-9_-]/g, '-');
+      var rawValue = Number(row.value);
+      var inputValue = Number.isFinite(rawValue) ? String(rawValue) : '';
       html += '<div style="border:1px solid var(--border);border-radius:8px;padding:10px;background:var(--bg-secondary)">'
-        + '<div style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0">' + esc(row.label) + '</div>'
-        + '<div style="font-weight:700;font-size:18px;margin-top:4px">' + esc(row.displayValue || row.value || '') + '</div>'
-        + '<div style="font-size:11px;color:var(--text-muted);margin-top:2px">' + esc(row.key) + ' from ' + esc(row.source || 'unknown') + '</div>'
+        + '<div style="display:flex;justify-content:space-between;gap:8px;align-items:flex-start">'
+        + '<div><div style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0">' + esc(row.label) + '</div>'
+        + '<div style="font-size:11px;color:var(--text-muted);margin-top:2px">' + esc(row.hint || row.key) + '</div></div>'
+        + '<span class="badge badge-gray" style="font-size:10px">' + esc(row.source || 'unknown') + '</span>'
+        + '</div>'
+        + '<div style="display:flex;gap:6px;align-items:center;margin-top:10px">'
+        + '<span style="font-size:13px;color:var(--text-muted)">$</span>'
+        + '<input id="' + inputId + '" type="number" min="0" step="0.05" value="' + esc(inputValue) + '" data-budget-key="' + esc(row.key) + '"'
+        + ' style="flex:1;min-width:0;padding:6px 8px;border:1px solid var(--border);border-radius:4px;background:var(--bg-primary);color:var(--text-primary);font-size:13px">'
+        + '<button class="btn-sm" onclick="saveBudgetCap(\\x27' + esc(row.key) + '\\x27)">Save</button>'
+        + '</div>'
+        + '<div style="font-size:11px;color:var(--text-muted);margin-top:6px">' + esc(row.key) + ' - ' + esc(row.displayValue || row.value || '') + '</div>'
         + '</div>';
     }
     html += '</div>';
@@ -19845,6 +19931,25 @@ async function postBudgetAction(url, body) {
 
 async function applySafeBudgetPreset() {
   await postBudgetAction('/api/budgets/safe', {});
+  refreshSettings();
+}
+
+async function applyBudgetPreset(preset) {
+  if (preset === 'uncapped' && !confirm('Remove all spend caps? Clementine can still hit account limits or credits if a job runs long.')) return;
+  await postBudgetAction('/api/budgets/preset', { preset: preset });
+  refreshSettings();
+}
+
+async function saveBudgetCap(key) {
+  var inputId = 'budget-cap-' + String(key).replace(/[^A-Za-z0-9_-]/g, '-');
+  var input = document.getElementById(inputId);
+  if (!input) return;
+  var value = Number(input.value);
+  if (!Number.isFinite(value) || value < 0) {
+    toast('Budget must be a non-negative dollar amount. Use 0 for no cap.', 'error');
+    return;
+  }
+  await postBudgetAction('/api/budgets/set', { key: key, value: value });
   refreshSettings();
 }
 

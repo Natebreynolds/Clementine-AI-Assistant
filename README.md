@@ -324,6 +324,10 @@ clementine restart                    # apply changes
 
 Your overrides live in `~/.clementine/.env` — **they survive every `npm update -g` / `clementine update`** because they're in your data home, not the package directory.
 
+The dashboard exposes these spend controls in Settings -> Channels & Env ->
+Spend Guards & Context Health, including direct dollar-cap editing, Default
+Caps, Safe Recovery, and No Caps presets.
+
 For spend/context tuning, `clementine budgets` gives a safer shortcut:
 
 ```bash
@@ -333,6 +337,7 @@ clementine budgets 1m auto      # allow included Opus 1M, keep Sonnet on 200K
 clementine budgets 1m on        # force 1M context for Extra Usage/API users
 clementine budgets 1m off       # disable 1M context for maximum compatibility
 clementine budgets set chat 10  # raise one budget cap
+clementine budgets set chat 0   # remove one cap
 ```
 
 **Commonly tuned knobs:**
