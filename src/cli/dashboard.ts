@@ -5873,8 +5873,9 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
   // proposed values for each slot; the dashboard UI shows them in an
   // editable review panel before applying. Nothing is written to
   // user_model_blocks until the user clicks "Apply" on a slot.
-  app.post('/api/user-model/seed', async (_req, res) => {
+  app.post('/api/user-model/seed', async (req, res) => {
     try {
+      const agentSlug = req.body?.agentSlug ? String(req.body.agentSlug) : null;
       const gateway = await getGateway();
       const store = (gateway as any).assistant?.memoryStore;
       if (!store) {
@@ -5907,7 +5908,7 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
       };
 
       const { seedUserModelFromMemory } = await import('../memory/seed-user-model.js');
-      const proposals = await seedUserModelFromMemory(store, llmCall);
+      const proposals = await seedUserModelFromMemory(store, llmCall, { agentSlug });
       res.json({ ok: true, proposals });
     } catch (err) {
       res.status(500).json({ error: String(err) });
@@ -20056,6 +20057,8 @@ async function saveUserModelSlot(slot) {
 async function seedUserModel() {
   var seedPanel = document.getElementById('user-model-seed-panel');
   if (!seedPanel) return;
+  var scope = document.getElementById('user-model-scope');
+  var agentSlug = scope && scope.value ? scope.value : null;
   seedPanel.style.display = 'block';
   seedPanel.innerHTML =
     '<div class="card" style="padding:14px;border-left:3px solid var(--accent,#f59e0b)">'
@@ -20066,7 +20069,7 @@ async function seedUserModel() {
     var r = await apiFetch('/api/user-model/seed', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: '{}',
+      body: JSON.stringify({ agentSlug: agentSlug }),
     });
     var d = await r.json();
     if (!d.ok || !d.proposals) {

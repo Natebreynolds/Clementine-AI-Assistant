@@ -91,7 +91,6 @@ import { StallGuard } from './stall-guard.js';
 import { collectToolCalls, detectContradiction, buildCorrectionPrompt } from './contradiction-validator.js';
 import { recordToolOutcome as recordMcpToolOutcome } from './mcp-circuit-breaker.js';
 import { assembleContext } from '../memory/context-assembler.js';
-import * as embeddingsModule from '../memory/embeddings.js';
 import { PromptCache } from './prompt-cache.js';
 import { searchSkills as searchSkillsSync } from './skill-extractor.js';
 import { classifyIntent, getStrategyGuidance, type IntentClassification } from './intent-classifier.js';
@@ -2788,30 +2787,18 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
       const useDense = tier === 'full';
       const useProceduralAndGraph = tier === 'full';
 
-      // Pre-compute dense query embedding if the model is ready. Done outside
-      // searchContext (which is sync) so the dense path doesn't force the
-      // entire call chain to be async. If embedDense fails or isn't available,
-      // searchContext falls back to TF-IDF.
-      let queryDenseVec: Float32Array | undefined;
-      try {
-        if (useDense && embeddingsModule.isDenseReady()) {
-          const v = await embeddingsModule.embedDense(enrichedQuery, true);
-          if (v) queryDenseVec = v;
-        }
-      } catch { /* fallback to sparse */ }
-
+      const searchOpts = {
+        limit: tier === 'full' ? SEARCH_CONTEXT_LIMIT : Math.min(SEARCH_CONTEXT_LIMIT, 4),
+        recencyLimit: tier === 'full' ? SEARCH_RECENCY_LIMIT : Math.min(SEARCH_RECENCY_LIMIT, 2),
+        agentSlug,
+        strict: strictIsolation,
+        sessionKey: sessionKey ?? undefined,
+        useDense,
+      };
       const results = useSearch
-        ? this.memoryStore.searchContext(
-          enrichedQuery,
-          {
-            limit: tier === 'full' ? SEARCH_CONTEXT_LIMIT : Math.min(SEARCH_CONTEXT_LIMIT, 4),
-            recencyLimit: tier === 'full' ? SEARCH_RECENCY_LIMIT : Math.min(SEARCH_RECENCY_LIMIT, 2),
-            agentSlug,
-            strict: strictIsolation,
-            sessionKey: sessionKey ?? undefined,
-            queryDenseVec,
-          },
-        )
+        ? await (this.memoryStore.searchContextAsync
+          ? this.memoryStore.searchContextAsync(enrichedQuery, searchOpts)
+          : Promise.resolve(this.memoryStore.searchContext(enrichedQuery, searchOpts)))
         : [];
 
       if (results?.length > 0) {

@@ -19,6 +19,7 @@ export interface SearchResult {
   category?: string | null;
   topic?: string | null;
   pinned?: boolean;
+  confidence?: number;
 }
 
 export type ChunkCategory = 'facts' | 'events' | 'discoveries' | 'preferences' | 'advice' | 'procedure';

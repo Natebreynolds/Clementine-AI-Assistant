@@ -63,7 +63,8 @@ export type MemoryStoreType = {
     salience: number; agentSlug?: string | null; category?: string | null; topic?: string | null;
   }>;
   getRecentChunks(limit: number, agentSlug?: string, filters?: { category?: string; topic?: string }): unknown[];
-  searchContext(query: string, limitOrOpts?: number | { limit?: number; recencyLimit?: number; agentSlug?: string; category?: string; topic?: string }, recencyLimit?: number): unknown[];
+  searchContext(query: string, limitOrOpts?: number | { limit?: number; recencyLimit?: number; agentSlug?: string; category?: string; topic?: string; strict?: boolean; sessionKey?: string; messageId?: string; skipTrace?: boolean; queryDenseVec?: Float32Array; useDense?: boolean }, recencyLimit?: number): unknown[];
+  searchContextAsync?(query: string, limitOrOpts?: number | { limit?: number; recencyLimit?: number; agentSlug?: string; category?: string; topic?: string; strict?: boolean; sessionKey?: string; messageId?: string; skipTrace?: boolean; queryDenseVec?: Float32Array; useDense?: boolean }, recencyLimit?: number): Promise<unknown[]>;
   getConnections(noteName: string): Array<{ direction: string; file: string; context: string }>;
   getTimeline(startDate: string, endDate: string, limit?: number): unknown[];
   searchTranscripts(query: string, limit?: number, sessionKey?: string): Array<{

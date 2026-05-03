@@ -64,6 +64,22 @@ export interface MemoryPromotionCandidateInput {
   reason?: string | null;
 }
 
+export interface SearchContextOptions {
+  limit?: number;
+  recencyLimit?: number;
+  agentSlug?: string;
+  category?: string;
+  topic?: string;
+  strict?: boolean;
+  sessionKey?: string;
+  messageId?: string;
+  skipTrace?: boolean;
+  /** Pre-computed dense query vector. When omitted, searchContextAsync may compute one. */
+  queryDenseVec?: Float32Array;
+  /** Set false to keep retrieval on FTS/sparse/recency only even when dense is warm. */
+  useDense?: boolean;
+}
+
 export class MemoryStore {
   private dbPath: string;
   private vaultDir: string;
@@ -99,6 +115,11 @@ export class MemoryStore {
   constructor(dbPath: string, vaultDir: string) {
     this.dbPath = dbPath;
     this.vaultDir = vaultDir;
+  }
+
+  private static confidenceMultiplier(confidence: number | null | undefined): number {
+    const conf = Math.max(0, Math.min(1, confidence ?? 1));
+    return conf >= 1 ? 1 : 0.5 + 0.5 * conf;
   }
 
   // ── Lifecycle ──────────────────────────────────────────────────────
@@ -1731,7 +1752,7 @@ export class MemoryStore {
     try {
       let sql = `SELECT c.id, c.source_file, c.section, c.content, c.chunk_type,
                   c.updated_at, c.salience, c.last_outcome_score, c.agent_slug, c.category, c.topic,
-                  c.pinned, bm25(chunks_fts) as score
+                  c.pinned, c.confidence, bm25(chunks_fts) as score
            FROM chunks_fts f
            JOIN chunks c ON c.id = f.rowid
            LEFT JOIN chunk_soft_deletes sd ON sd.chunk_id = c.id
@@ -1768,6 +1789,7 @@ export class MemoryStore {
         category: string | null;
         topic: string | null;
         pinned: number | null;
+        confidence: number | null;
         score: number;
       }>;
 
@@ -1786,6 +1808,7 @@ export class MemoryStore {
         category: row.category,
         topic: row.topic,
         pinned: row.pinned === 1,
+        confidence: row.confidence ?? 1,
       }));
     } catch {
       return [];
@@ -1815,6 +1838,7 @@ export class MemoryStore {
       agent_slug: string | null;
       category: string | null;
       topic: string | null;
+      confidence: number | null;
     };
 
     const now = Date.now();
@@ -1825,7 +1849,7 @@ export class MemoryStore {
       // chunk were indistinguishable. Decay lets recent results actually
       // compete with FTS and vector matches during rerank.
       const daysOld = row.updated_at ? (now - Date.parse(row.updated_at)) / 86_400_000 : 0;
-      const decayed = temporalDecay(daysOld);
+      const decayed = temporalDecay(daysOld) * MemoryStore.confidenceMultiplier(row.confidence);
       return {
         sourceFile: row.source_file,
         section: row.section,
@@ -1840,6 +1864,7 @@ export class MemoryStore {
         agentSlug: row.agent_slug ?? null,
         category: row.category,
         topic: row.topic,
+        confidence: row.confidence ?? 1,
       };
     };
 
@@ -1865,7 +1890,7 @@ export class MemoryStore {
       if (strict) {
         const rows = this.conn.prepare(
           `SELECT c.id, c.source_file, c.section, c.content, c.chunk_type,
-                  c.updated_at, c.salience, c.last_outcome_score, c.agent_slug, c.category, c.topic
+                  c.updated_at, c.salience, c.last_outcome_score, c.agent_slug, c.category, c.topic, c.confidence
            FROM chunks c${sdJoin}
            WHERE (c.agent_slug = ? OR c.agent_slug IS NULL)${sdFilter}${filterSql.replace(/(?<!c\.)agent_slug|(?<!c\.)category|(?<!c\.)topic/g, m => 'c.' + m)}
            ORDER BY c.updated_at DESC LIMIT ?`,
@@ -1875,7 +1900,7 @@ export class MemoryStore {
 
       const agentRows = this.conn.prepare(
         `SELECT c.id, c.source_file, c.section, c.content, c.chunk_type,
-                c.updated_at, c.salience, c.last_outcome_score, c.agent_slug, c.category, c.topic
+                c.updated_at, c.salience, c.last_outcome_score, c.agent_slug, c.category, c.topic, c.confidence
          FROM chunks c${sdJoin}
          WHERE c.agent_slug = ?${sdFilter}${filterSql.replace(/(?<!c\.)agent_slug|(?<!c\.)category|(?<!c\.)topic/g, m => 'c.' + m)}
          ORDER BY c.updated_at DESC LIMIT ?`,
@@ -1883,7 +1908,7 @@ export class MemoryStore {
 
       const globalRows = this.conn.prepare(
         `SELECT c.id, c.source_file, c.section, c.content, c.chunk_type,
-                c.updated_at, c.salience, c.last_outcome_score, c.agent_slug, c.category, c.topic
+                c.updated_at, c.salience, c.last_outcome_score, c.agent_slug, c.category, c.topic, c.confidence
          FROM chunks c${sdJoin}
          WHERE c.agent_slug IS NULL${sdFilter}${filterSql.replace(/(?<!c\.)agent_slug|(?<!c\.)category|(?<!c\.)topic/g, m => 'c.' + m)}
          ORDER BY c.updated_at DESC LIMIT ?`,
@@ -1895,7 +1920,7 @@ export class MemoryStore {
     const rows = this.conn
       .prepare(
         `SELECT c.id, c.source_file, c.section, c.content, c.chunk_type,
-                c.updated_at, c.salience, c.last_outcome_score, c.agent_slug, c.category, c.topic
+                c.updated_at, c.salience, c.last_outcome_score, c.agent_slug, c.category, c.topic, c.confidence
          FROM chunks c${sdJoin}
          WHERE 1=1${sdFilter}${filterSql.replace(/(?<!c\.)agent_slug|(?<!c\.)category|(?<!c\.)topic/g, m => 'c.' + m)}
          ORDER BY c.updated_at DESC
@@ -1986,7 +2011,7 @@ export class MemoryStore {
       .prepare(
         `SELECT c.id, c.source_file, c.section, c.content, c.chunk_type,
                 c.salience, c.agent_slug, c.category, c.topic, c.updated_at,
-                c.last_outcome_score, c.pinned
+                c.last_outcome_score, c.pinned, c.confidence
          FROM chunks c
          LEFT JOIN chunk_soft_deletes sd ON sd.chunk_id = c.id
          WHERE c.source_file IN (${filePh})
@@ -2008,6 +2033,7 @@ export class MemoryStore {
       updated_at: string;
       last_outcome_score: number | null;
       pinned: number | null;
+      confidence: number | null;
     }>;
 
     const seedScoreMax = Math.max(...seeds.map((s) => s.score), 1);
@@ -2021,7 +2047,7 @@ export class MemoryStore {
         sourceFile: r.source_file,
         section: r.section,
         content: r.content,
-        score: seedScoreMax * boost * (1 + (r.salience ?? 0)),
+        score: seedScoreMax * boost * (1 + (r.salience ?? 0)) * MemoryStore.confidenceMultiplier(r.confidence),
         chunkType: r.chunk_type,
         matchType: 'graph',
         lastUpdated: r.updated_at,
@@ -2032,6 +2058,7 @@ export class MemoryStore {
         category: r.category,
         topic: r.topic,
         pinned: !!r.pinned,
+        confidence: r.confidence ?? 1,
       });
       if (out.length >= maxNeighbors) break;
     }
@@ -2050,21 +2077,7 @@ export class MemoryStore {
    */
   searchContext(
     query: string,
-    limitOrOpts: number | {
-      limit?: number;
-      recencyLimit?: number;
-      agentSlug?: string;
-      category?: string;
-      topic?: string;
-      strict?: boolean;
-      sessionKey?: string;
-      messageId?: string;
-      skipTrace?: boolean;
-      /** Pre-computed dense query vector. When provided, use the dense
-       *  embedding column for vector search. Caller computes this via
-       *  embedDense() (async) so this method can stay sync. */
-      queryDenseVec?: Float32Array;
-    } = 3,
+    limitOrOpts: number | SearchContextOptions = 3,
     recencyLimitArg: number = 5,
   ): SearchResult[] {
     let limit: number;
@@ -2119,6 +2132,7 @@ export class MemoryStore {
       if (outcome !== 0) {
         r.score *= 1.0 + 0.3 * outcome;
       }
+      r.score *= MemoryStore.confidenceMultiplier(r.confidence);
       // Temporal decay — without this, a 2-year-old chunk with the same BM25
       // score ranks identically to one from yesterday. Half-life of 30 days
       // (matches TEMPORAL_DECAY_HALF_LIFE_DAYS in config). Applied to a
@@ -2199,6 +2213,34 @@ export class MemoryStore {
     }
 
     return finalResults;
+  }
+
+  /**
+   * Dense-aware wrapper around searchContext. The core search method stays
+   * synchronous for existing callers/tests; this async entry point computes
+   * the dense query embedding when the model is already warm.
+   */
+  async searchContextAsync(
+    query: string,
+    limitOrOpts: number | SearchContextOptions = 3,
+    recencyLimitArg: number = 5,
+  ): Promise<SearchResult[]> {
+    const opts: SearchContextOptions = typeof limitOrOpts === 'object'
+      ? { ...limitOrOpts }
+      : { limit: limitOrOpts, recencyLimit: recencyLimitArg };
+
+    if (opts.useDense !== false && !opts.queryDenseVec) {
+      try {
+        if (embeddingsModule.isDenseReady()) {
+          const denseVec = await embeddingsModule.embedDense(query, true);
+          if (denseVec) opts.queryDenseVec = denseVec;
+        }
+      } catch {
+        // Dense recall is opportunistic; searchContext still has FTS/sparse fallback.
+      }
+    }
+
+    return this.searchContext(query, opts);
   }
 
   /**
@@ -2714,7 +2756,7 @@ export class MemoryStore {
         const outcome = row.last_outcome_score ?? 0;
         if (outcome !== 0) score *= 1.0 + 0.3 * outcome;
         const conf = row.confidence ?? 1;
-        if (conf < 1) score *= (0.5 + 0.5 * conf);
+        score *= MemoryStore.confidenceMultiplier(conf);
         // Soft isolation: apply boost (only when not strict)
         if (!strict && agentSlug && row.agent_slug === agentSlug) score *= 1.4;
         // Temporal decay — same policy as FTS scoring (Phase 9d). Without
@@ -2742,6 +2784,7 @@ export class MemoryStore {
           agentSlug: row.agent_slug ?? undefined,
           category: row.category,
           topic: row.topic,
+          confidence: conf,
         });
       } catch { continue; }
     }
@@ -2796,7 +2839,7 @@ export class MemoryStore {
         // Confidence multiplier: tentative chunks (low confidence) lose ranking
         // weight without being hidden. confidence=1.0 → no effect, 0.5 → 0.75×.
         const conf = row.confidence ?? 1;
-        if (conf < 1) score *= (0.5 + 0.5 * conf);
+        score *= MemoryStore.confidenceMultiplier(conf);
         if (row.salience > 0) score *= (1.0 + row.salience);
         const outcome = row.last_outcome_score ?? 0;
         if (outcome !== 0) score *= 1.0 + 0.3 * outcome;
@@ -2819,6 +2862,7 @@ export class MemoryStore {
           agentSlug: row.agent_slug ?? undefined,
           category: row.category,
           topic: row.topic,
+          confidence: conf,
         });
       } catch { continue; }
     }

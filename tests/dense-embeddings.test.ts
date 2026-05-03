@@ -11,7 +11,7 @@
  *   5. Verify getMemoryStats reports dense coverage
  */
 
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdirSync, rmSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
@@ -32,6 +32,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  vi.restoreAllMocks();
   rmSync(testDir, { recursive: true, force: true });
 });
 
@@ -95,6 +96,21 @@ describe('schema for dense embeddings', () => {
 });
 
 describe('searchContext with queryDenseVec', () => {
+  it('searchContextAsync computes a dense query vector when the model is warm', async () => {
+    const id = insertChunkWithDenseEmbedding('dense-only project memory', unitVec(7));
+    vi.spyOn(embeddings, 'isDenseReady').mockReturnValue(true);
+    vi.spyOn(embeddings, 'embedDense').mockResolvedValue(unitVec(7));
+
+    const results = await store.searchContextAsync('semantic project query', {
+      limit: 5,
+      recencyLimit: 0,
+    });
+
+    expect(embeddings.embedDense).toHaveBeenCalledWith('semantic project query', true);
+    expect(results[0]?.chunkId).toBe(id);
+    expect(results[0]?.matchType).toBe('vector');
+  });
+
   it('returns chunks ranked by dense cosine similarity', () => {
     // Three chunks with vectors pointing in different directions.
     const id1 = insertChunkWithDenseEmbedding('apple content', unitVec(0));

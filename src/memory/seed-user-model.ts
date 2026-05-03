@@ -24,7 +24,7 @@ interface SeedSourceStore {
     content: string;
     salience: number;
   }>;
-  getRecentSummaries(limit?: number): Array<{ summary: string; createdAt: string }>;
+  getRecentSummaries(limit?: number): Array<{ sessionKey?: string; summary: string; createdAt: string }>;
   db: unknown;
 }
 
@@ -45,7 +45,13 @@ const MAX_MEMORY_MD_CHARS = 4000;
 const MAX_CHUNK_CHARS = 4000;
 const MAX_SUMMARIES_CHARS = 1500;
 
-function gatherCorpus(store: SeedSourceStore, memoryFilePath: string): { corpus: string; sourceCount: number } {
+function summaryInScope(sessionKey: string | undefined, agentSlug?: string | null): boolean {
+  const key = sessionKey ?? '';
+  if (agentSlug) return key.includes(`:agent:${agentSlug}:`) || key === `agent:${agentSlug}` || key.startsWith(`team:${agentSlug}`);
+  return !key.includes(':agent:');
+}
+
+function gatherCorpus(store: SeedSourceStore, memoryFilePath: string, agentSlug?: string | null): { corpus: string; sourceCount: number } {
   const parts: string[] = [];
   let sourceCount = 0;
 
@@ -66,14 +72,17 @@ function gatherCorpus(store: SeedSourceStore, memoryFilePath: string): { corpus:
   // a coarse top-N proxy. Better: query the underlying db handle.
   try {
     const db = store.db as { prepare: (sql: string) => { all: (...args: unknown[]) => unknown } };
+    const scopeWhere = agentSlug ? 'AND (c.agent_slug IS NULL OR c.agent_slug = ?)' : 'AND c.agent_slug IS NULL';
+    const params = agentSlug ? [agentSlug] : [];
     const rows = db.prepare(
       `SELECT c.source_file, c.section, c.content, c.salience
        FROM chunks c
        LEFT JOIN chunk_soft_deletes sd ON sd.chunk_id = c.id
        WHERE sd.chunk_id IS NULL AND length(c.content) > 50
+         ${scopeWhere}
        ORDER BY c.salience DESC, c.last_outcome_score DESC, c.updated_at DESC
        LIMIT 40`,
-    ).all() as Array<{ source_file: string; section: string; content: string; salience: number }>;
+    ).all(...params) as Array<{ source_file: string; section: string; content: string; salience: number }>;
     if (rows.length > 0) {
       let chunkBlock = '## High-salience memory chunks\n';
       let used = 0;
@@ -92,7 +101,7 @@ function gatherCorpus(store: SeedSourceStore, memoryFilePath: string): { corpus:
 
   // 3. Recent session summaries — surfaces current goals and active context
   try {
-    const summaries = store.getRecentSummaries(8);
+    const summaries = store.getRecentSummaries(16).filter(s => summaryInScope((s as { sessionKey?: string }).sessionKey, agentSlug)).slice(0, 8);
     if (summaries.length > 0) {
       let block = '## Recent session summaries\n';
       let used = 0;
@@ -185,10 +194,10 @@ function parseProposals(raw: string): {
 export async function seedUserModelFromMemory(
   store: SeedSourceStore,
   llmCall: (prompt: string) => Promise<string>,
-  opts: { memoryFilePath?: string } = {},
+  opts: { memoryFilePath?: string; agentSlug?: string | null } = {},
 ): Promise<UserModelProposals> {
   const memFile = opts.memoryFilePath ?? MEMORY_FILE;
-  const { corpus, sourceCount } = gatherCorpus(store, memFile);
+  const { corpus, sourceCount } = gatherCorpus(store, memFile, opts.agentSlug ?? null);
 
   if (!corpus.trim() || sourceCount === 0) {
     return {

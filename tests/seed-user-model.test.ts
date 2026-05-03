@@ -28,16 +28,16 @@ afterEach(() => {
   rmSync(testDir, { recursive: true, force: true });
 });
 
-function insertChunk(content: string, salience = 0.5): number {
+function insertChunk(content: string, salience = 0.5, agentSlug: string | null = null): number {
   // gatherCorpus filters chunks shorter than 50 chars — pad short test inputs
   // so they survive the filter. Tests that care about exact content can pass
   // longer strings directly.
   const padded = content.length >= 50 ? content : content + ' ' + '.'.repeat(60);
   const db = new Database(dbPath);
   const info = db.prepare(
-    `INSERT INTO chunks (source_file, section, content, chunk_type, content_hash, salience)
-     VALUES (?, ?, ?, ?, ?, ?)`,
-  ).run('test.md', 'sec', padded, 'preamble', 'h-' + Math.random(), salience);
+    `INSERT INTO chunks (source_file, section, content, chunk_type, content_hash, salience, agent_slug)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+  ).run('test.md', 'sec', padded, 'preamble', 'h-' + Math.random(), salience, agentSlug);
   db.close();
   return info.lastInsertRowid as number;
 }
@@ -162,5 +162,63 @@ short`;
     expect(hi).toBeGreaterThan(-1);
     expect(lo).toBeGreaterThan(-1);
     expect(hi).toBeLessThan(lo);
+  });
+
+  it('global seed corpus excludes agent-scoped chunks', async () => {
+    insertChunk('GLOBAL profile fact that should be visible to the main user model', 0.9, null);
+    insertChunk('PRIVATE SDR fact that should not leak into global seed proposals', 0.95, 'sdr');
+
+    let capturedPrompt = '';
+    const llm = async (prompt: string) => {
+      capturedPrompt = prompt;
+      return '## user_facts\n- test\n## goals\n## relationships\n## agent_persona';
+    };
+    await seedUserModelFromMemory(store as any, llm, NO_MEM_FILE);
+
+    expect(capturedPrompt).toContain('GLOBAL profile fact');
+    expect(capturedPrompt).not.toContain('PRIVATE SDR fact');
+  });
+
+  it('agent-scoped seed corpus includes global plus selected agent chunks', async () => {
+    insertChunk('GLOBAL profile fact visible to every agent seed pass', 0.9, null);
+    insertChunk('SDR scoped fact visible to the SDR agent seed pass with enough detail', 0.95, 'sdr');
+    insertChunk('RESEARCH scoped fact not visible to SDR seed pass', 0.99, 'research');
+
+    let capturedPrompt = '';
+    const llm = async (prompt: string) => {
+      capturedPrompt = prompt;
+      return '## user_facts\n- test\n## goals\n## relationships\n## agent_persona';
+    };
+    await seedUserModelFromMemory(store as any, llm, { ...NO_MEM_FILE, agentSlug: 'sdr' });
+
+    expect(capturedPrompt).toContain('GLOBAL profile fact');
+    expect(capturedPrompt).toContain('SDR scoped fact');
+    expect(capturedPrompt).not.toContain('RESEARCH scoped fact');
+  });
+
+  it('seed proposals can be applied into renderUserModel for prompt injection', async () => {
+    insertChunk('Nathan prefers concise implementation summaries after tests pass.', 0.9);
+    const fakeResponse = `## user_facts
+- Nathan prefers concise implementation summaries
+
+## goals
+- Keep Clementine memory retrieval tight
+
+## relationships
+(no clear signal)
+
+## agent_persona
+(no clear signal)`;
+    const llm = async () => fakeResponse;
+    const result = await seedUserModelFromMemory(store as any, llm, NO_MEM_FILE);
+
+    store.setUserModelBlock({ slot: 'user_facts', content: result.user_facts });
+    store.setUserModelBlock({ slot: 'goals', content: result.goals });
+
+    const rendered = store.renderUserModel();
+    expect(rendered).toContain('User Facts');
+    expect(rendered).toContain('Nathan prefers concise implementation summaries');
+    expect(rendered).toContain('Active Goals');
+    expect(rendered).toContain('Keep Clementine memory retrieval tight');
   });
 });

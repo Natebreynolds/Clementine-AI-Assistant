@@ -2796,6 +2796,129 @@ memoryCmd
   });
 
 memoryCmd
+  .command('diagnose')
+  .description('Read-only memory diagnostics: core-memory population, retrieval traces, dense coverage, supersession, and match-type signals')
+  .option('--json', 'Emit machine-readable JSON')
+  .action(async (opts: { json?: boolean }) => {
+    const BOLD = '\x1b[1m';
+    const DIM = '\x1b[0;90m';
+    const GREEN = '\x1b[0;32m';
+    const YELLOW = '\x1b[0;33m';
+    const RED = '\x1b[0;31m';
+    const CYAN = '\x1b[0;36m';
+    const RESET = '\x1b[0m';
+    try {
+      const { MemoryStore } = await import('../memory/store.js');
+      const VAULT_DIR = path.join(BASE_DIR, 'vault');
+      const DB_PATH = path.join(VAULT_DIR, '.memory.db');
+      if (!existsSync(DB_PATH)) {
+        const diagnosis = {
+          generatedAt: new Date().toISOString(),
+          dbPath: DB_PATH,
+          dbExists: false,
+          recommendations: ['Start Clementine or run a vault sync so the memory database is created.'],
+        };
+        if (opts.json) {
+          console.log(JSON.stringify(diagnosis, null, 2));
+        } else {
+          console.log();
+          console.log(`  ${BOLD}Memory diagnostics${RESET}  ${DIM}${DB_PATH}${RESET}`);
+          console.log(`  ${YELLOW}memory database not found${RESET}`);
+          console.log(`  ${DIM}Start Clementine or run a vault sync so the memory database is created.${RESET}`);
+          console.log();
+        }
+        return;
+      }
+      const store = new MemoryStore(DB_PATH, VAULT_DIR);
+      const stats = store.getMemoryStats();
+      const health = store.getMemoryHealth({ topCitedLimit: 5 });
+      const graphStats = store.getGraphStats({ topN: 8, lookbackHours: 24 * 7 });
+      const supersedes = store.getSupersedeStats();
+      const denseCoverage = stats.totalChunks > 0 ? stats.chunksWithDenseEmbeddings / stats.totalChunks : 0;
+      const missingDense = health.lastIntegrityReport?.missingEmbeddings ?? Math.max(0, stats.totalChunks - stats.chunksWithDenseEmbeddings);
+      const recommendations: string[] = [];
+      if (stats.totalChunks > 0 && denseCoverage < 0.95) {
+        recommendations.push('Run `clementine memory reembed` or use Brain -> Health backfill to improve dense recall coverage.');
+      }
+      if (health.userModelSlots.populated === 0) {
+        recommendations.push('Seed or edit the User Model so core facts load into every conversation.');
+      }
+      if (health.recentActivity.recallTracesLast7d === 0) {
+        recommendations.push('No recall traces in the last 7 days; verify chat retrieval is enabled and recent turns are logging traces.');
+      }
+      if (!health.lastIntegrityReport) {
+        recommendations.push('No recent integrity report found; run Brain -> Health cleanup or wait for the janitor cycle.');
+      }
+
+      const diagnosis = {
+        generatedAt: new Date().toISOString(),
+        dbPath: DB_PATH,
+        chunks: {
+          total: stats.totalChunks,
+          pinned: stats.pinnedChunks,
+          softDeleted: health.chunks.softDeleted,
+          superseded: supersedes.superseded,
+          avgSalience: stats.avgSalience,
+        },
+        denseEmbeddings: {
+          withDense: stats.chunksWithDenseEmbeddings,
+          total: stats.totalChunks,
+          coverage: denseCoverage,
+          missingDense,
+          models: stats.denseEmbeddingModels,
+          ready: health.denseEmbeddings.ready,
+          currentModel: health.denseEmbeddings.currentModel,
+        },
+        userModel: health.userModelSlots,
+        recallActivity: health.recentActivity,
+        retrievalSignals: {
+          lookbackHours: 24 * 7,
+          tracesAnalyzed: graphStats.tracesAnalyzed,
+          contributionByType: graphStats.recallContributionByType,
+          wikilinkCount: graphStats.wikilinkCount,
+        },
+        integrity: health.lastIntegrityReport,
+        recommendations,
+      };
+
+      if (opts.json) {
+        console.log(JSON.stringify(diagnosis, null, 2));
+        return;
+      }
+
+      const densePct = `${(denseCoverage * 100).toFixed(1)}%`;
+      const denseColor = denseCoverage >= 0.95 ? GREEN : denseCoverage >= 0.5 ? YELLOW : RED;
+      console.log();
+      console.log(`  ${BOLD}Memory diagnostics${RESET}  ${DIM}${DB_PATH}${RESET}`);
+      console.log();
+      console.log(`  Chunks:              ${BOLD}${stats.totalChunks.toLocaleString()}${RESET} total · ${health.chunks.softDeleted} soft-deleted · ${supersedes.superseded} superseded · ${stats.pinnedChunks} pinned`);
+      console.log(`  Dense coverage:      ${denseColor}${densePct}${RESET} ${DIM}(${stats.chunksWithDenseEmbeddings.toLocaleString()}/${stats.totalChunks.toLocaleString()}, missing ${missingDense.toLocaleString()})${RESET}`);
+      console.log(`  Dense model ready:   ${health.denseEmbeddings.ready ? `${GREEN}yes${RESET}` : `${YELLOW}no${RESET}`} ${DIM}${health.denseEmbeddings.currentModel}${RESET}`);
+      console.log(`  User model:          ${health.userModelSlots.populated}/${health.userModelSlots.total} populated ${DIM}(${health.userModelSlots.global} global, ${health.userModelSlots.agentScoped} agent-scoped)${RESET}`);
+      console.log(`  Recall traces:       ${health.recentActivity.recallTracesLast7d} last 7d · ${health.recentActivity.recallTracesLast30d} last 30d`);
+      const contribution = Object.entries(graphStats.recallContributionByType)
+        .sort((a, b) => b[1] - a[1])
+        .map(([k, v]) => `${k}:${v}`)
+        .join(', ') || 'none yet';
+      console.log(`  Retrieval signals:   ${CYAN}${contribution}${RESET} ${DIM}(${graphStats.tracesAnalyzed} traces analyzed)${RESET}`);
+      if (health.lastIntegrityReport) {
+        console.log(`  Integrity:           ${health.lastIntegrityReport.ftsOk ? `${GREEN}FTS ok${RESET}` : `${RED}FTS issue${RESET}`} · orphans nulled ${health.lastIntegrityReport.orphanRefsNulled} · ran ${health.lastIntegrityReport.ranAt}`);
+      } else {
+        console.log(`  Integrity:           ${YELLOW}no recent report${RESET}`);
+      }
+      if (recommendations.length > 0) {
+        console.log();
+        console.log(`  ${BOLD}Recommendations${RESET}`);
+        for (const r of recommendations) console.log(`    - ${r}`);
+      }
+      console.log();
+    } catch (err) {
+      console.error(`  Error diagnosing memory: ${err}`);
+      process.exit(1);
+    }
+  });
+
+memoryCmd
   .command('pin <chunkId>')
   .description('Pin a chunk — gives its score a 2x boost in recall (use chunk IDs from `memory search`)')
   .action(async (chunkIdStr: string) => {

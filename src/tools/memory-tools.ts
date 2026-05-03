@@ -585,10 +585,11 @@ server.tool(
   },
   async ({ query, category, topic }) => {
     const store = await getStore();
-    const results = store.searchContext(
-      query,
-      { agentSlug: ACTIVE_AGENT_SLUG ?? undefined, category, topic },
-    ) as Array<{
+    const recallOpts = { agentSlug: ACTIVE_AGENT_SLUG ?? undefined, category, topic };
+    const rawResults = store.searchContextAsync
+      ? await store.searchContextAsync(query, recallOpts)
+      : store.searchContext(query, recallOpts);
+    const results = rawResults as Array<{
       sourceFile: string; section: string; content: string; score: number;
       matchType: string; chunkId: number; agentSlug?: string | null;
     }>;
@@ -637,10 +638,11 @@ server.tool(
   async ({ query, category, topic, limit }) => {
     const store = await getStore();
     // Intentionally omit agentSlug — we want the unscoped, cross-agent view.
-    const results = store.searchContext(
-      query,
-      { category, topic, limit: limit ?? 12 },
-    ) as Array<{
+    const recallOpts = { category, topic, limit: limit ?? 12 };
+    const rawResults = store.searchContextAsync
+      ? await store.searchContextAsync(query, recallOpts)
+      : store.searchContext(query, recallOpts);
+    const results = rawResults as Array<{
       sourceFile: string; section: string; content: string; score: number;
       matchType: string; chunkId: number; agentSlug?: string | null;
     }>;
