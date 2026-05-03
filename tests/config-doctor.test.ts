@@ -6,11 +6,11 @@
  * (clean restore in afterEach).
  */
 
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { runDoctor } from '../src/config/config-doctor.js';
+import { applyDoctorFixes, runDoctor } from '../src/config/config-doctor.js';
 import { _resetClementineJsonCache } from '../src/config/clementine-json.js';
 import { listKnownConfigKeys } from '../src/config/effective-config.js';
 
@@ -102,6 +102,55 @@ describe('runDoctor', () => {
     );
     const r = runDoctor(baseDir);
     expect(r.findings.find(f => f.message.includes('exceeds BUDGET_CRON_T2_USD'))).toBeDefined();
+  });
+
+  it('flags explicit 1M context enablement', () => {
+    writeFileSync(path.join(baseDir, '.env'), 'CLAUDE_CODE_DISABLE_1M_CONTEXT=0\n');
+    const r = runDoctor(baseDir);
+    const finding = r.findings.find(f => f.key === 'CLAUDE_CODE_DISABLE_1M_CONTEXT');
+    expect(finding).toBeDefined();
+    expect(finding!.severity).toBe('warning');
+    expect(finding!.message).toContain('1M context is explicitly enabled');
+  });
+
+  it('flags stale high background budgets', () => {
+    writeFileSync(
+      path.join(baseDir, '.env'),
+      'BUDGET_HEARTBEAT_USD=0.5\nBUDGET_CRON_T1_USD=2\nBUDGET_CRON_T2_USD=5\n',
+    );
+    const r = runDoctor(baseDir);
+    expect(r.findings.find(f => f.key === 'BUDGET_HEARTBEAT_USD' && f.message.includes('safe default'))).toBeDefined();
+    expect(r.findings.find(f => f.key === 'BUDGET_CRON_T1_USD' && f.message.includes('safe default'))).toBeDefined();
+    expect(r.findings.find(f => f.key === 'BUDGET_CRON_T2_USD' && f.message.includes('safe default'))).toBeDefined();
+  });
+
+  it('auto-fixes safe local stability overrides', () => {
+    writeFileSync(
+      path.join(baseDir, '.env'),
+      'CLAUDE_CODE_DISABLE_1M_CONTEXT=0\nBUDGET_CRON_T1_USD=2\nBUDGET_CRON_T2_USD=5\n',
+    );
+    const result = applyDoctorFixes(baseDir);
+    expect(result.changed.map(f => f.key)).toEqual([
+      'CLAUDE_CODE_DISABLE_1M_CONTEXT',
+      'BUDGET_CRON_T1_USD',
+      'BUDGET_CRON_T2_USD',
+    ]);
+    const env = readFileSync(path.join(baseDir, '.env'), 'utf-8');
+    expect(env).toContain('CLAUDE_CODE_DISABLE_1M_CONTEXT=1');
+    expect(env).toContain('BUDGET_CRON_T1_USD=0.75');
+    expect(env).toContain('BUDGET_CRON_T2_USD=1.5');
+  });
+
+  it('auto-fixes 1M when the runtime env mirrors the persisted .env value', () => {
+    writeFileSync(path.join(baseDir, '.env'), 'CLAUDE_CODE_DISABLE_1M_CONTEXT=0\n');
+    process.env.CLAUDE_CODE_DISABLE_1M_CONTEXT = '0';
+
+    const result = applyDoctorFixes(baseDir);
+
+    expect(result.skipped).toEqual([]);
+    expect(result.changed.map(f => f.key)).toContain('CLAUDE_CODE_DISABLE_1M_CONTEXT');
+    const env = readFileSync(path.join(baseDir, '.env'), 'utf-8');
+    expect(env).toContain('CLAUDE_CODE_DISABLE_1M_CONTEXT=1');
   });
 
   it('does NOT warn about plaintext credentials in .env (v1.1.4+ policy: .env IS the default)', () => {

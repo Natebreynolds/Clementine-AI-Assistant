@@ -65,6 +65,14 @@ describe('turn policy', () => {
     expect(p.enableTeams).toBe(false);
   });
 
+  it('keeps operational diagnostics tool-enabled even when phrased as a short question', () => {
+    const p = policy('Can you diagnose what is happening with the Cron lease');
+
+    expect(p.reason).toBe('task-or-tool-request');
+    expect(p.retrievalTier).toBe('search');
+    expect(p.disableAllTools).toBe(false);
+  });
+
   it('promotes broad analysis to the full context path with teams enabled', () => {
     const p = policy('analyze the entire agentic flow across all conversations and recommend improvements');
 

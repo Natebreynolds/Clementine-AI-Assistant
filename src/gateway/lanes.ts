@@ -14,7 +14,7 @@ export type Lane = 'chat' | 'cron' | 'heartbeat' | 'self-improve' | 'team';
 class LaneController {
   private limits: Record<Lane, number> = {
     chat: 3,            // Up to 3 concurrent chat sessions
-    cron: 2,            // Up to 2 concurrent cron jobs
+    cron: 1,            // Serialize cron jobs so background work can't burn credits in parallel
     heartbeat: 1,       // Only 1 heartbeat at a time
     'self-improve': 1,  // Only 1 self-improvement cycle at a time
     team: 2,            // Up to 2 concurrent inter-agent messages

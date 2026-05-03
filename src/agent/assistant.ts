@@ -98,6 +98,7 @@ import { getEventLog } from './session-event-log.js';
 import { routeToolSurface, TOOL_SURFACE_HARD_LIMIT, TOOL_SURFACE_WARN_THRESHOLD, type ToolRouteDecision } from './tool-router.js';
 import { decideTurn, type RetrievalTier, type TurnPolicy } from './turn-policy.js';
 import { loadClementineJson } from '../config/clementine-json.js';
+import { isCreditBalanceError, markBackgroundCreditBlocked } from '../gateway/credit-guard.js';
 
 // ── Channel capabilities ────────────────────────────────────────────
 
@@ -374,6 +375,8 @@ function formatTimeAgo(ms: number): string {
 const CONTEXT_GUARD_MIN_TOKENS = 16_000;
 /** Warn threshold — context is getting tight. */
 const CONTEXT_GUARD_WARN_TOKENS = 32_000;
+/** Rotate SDK sessions before hidden resume history approaches the 200K cap. */
+const SESSION_ROTATE_INPUT_TOKENS = 140_000;
 /** Approximate context window sizes by model family. */
 const MODEL_CONTEXT_WINDOWS: Record<string, number> = {
   'haiku': 200_000,
@@ -386,6 +389,33 @@ function getContextWindow(model: string): number {
     if (model.includes(family)) return size;
   }
   return 200_000; // safe default
+}
+
+function resultInputTokens(result: SDKResultMessage): number {
+  let total = 0;
+  const modelUsage = (result as { modelUsage?: Record<string, { inputTokens?: number; cacheReadInputTokens?: number; cacheCreationInputTokens?: number }> }).modelUsage;
+  if (!modelUsage) return 0;
+  for (const usage of Object.values(modelUsage)) {
+    total += usage.inputTokens ?? 0;
+    total += usage.cacheReadInputTokens ?? 0;
+    total += usage.cacheCreationInputTokens ?? 0;
+  }
+  return total;
+}
+
+function oneMillionContextDisabled(): boolean {
+  const value = process.env.CLAUDE_CODE_DISABLE_1M_CONTEXT;
+  return value === undefined || !/^(0|false|no)$/i.test(value);
+}
+
+export function looksLikeOneMillionContextError(value: unknown): boolean {
+  const text = String(value ?? '');
+  return /extra usage.*1m context|1m context.*extra usage|context-1m/i.test(text);
+}
+
+export function looksLikeNoResponseRequested(value: unknown): boolean {
+  const text = String(value ?? '').trim();
+  return /^no response requested\.?$/i.test(text);
 }
 
 // ── Constants ────────────────────────────────────────────────────────
@@ -803,6 +833,7 @@ export function isAutonomousNothingOutput(response: string): boolean {
   if (/^_*NOTHING_*$/i.test(trimmed)) return true;
   if (/^_*NOTHING_*\s*(\(|$)/im.test(trimmed)) return true;
   if (/^(_*NOTHING_*\s*)?\[MONITORING\]\s*$/i.test(trimmed)) return true;
+  if (looksLikeNoResponseRequested(trimmed)) return true;
   if (trimmed.length > 80) return false;
   const lower = trimmed.toLowerCase();
   return lower === 'nothing to report'
@@ -2663,6 +2694,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
       systemPrompt: fullSystemPrompt,
       model: resolvedModel,
       ...(fallback ? { fallbackModel: fallback } : {}),
+      ...(oneMillionContextDisabled() ? { betas: [] } : {}),
       permissionMode: effectivePermissionMode as 'bypassPermissions' | 'auto',
       allowDangerouslySkipPermissions: true,
       ...(sessionStore ? { sessionStore } : {}),
@@ -2713,7 +2745,14 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
       // env only when the prompt/job mentions a connector-backed service.
       // Per-MCP-server env isolation still happens inside each mcpServers
       // entry; this only affects the Claude Code subprocess itself.
-      ...(shouldInheritClaudeEnv ? {} : { env: SAFE_ENV }),
+      ...(shouldInheritClaudeEnv ? {} : {
+        env: {
+          ...SAFE_ENV,
+          ...(process.env.CLAUDE_CODE_DISABLE_1M_CONTEXT !== undefined
+            ? { CLAUDE_CODE_DISABLE_1M_CONTEXT: process.env.CLAUDE_CODE_DISABLE_1M_CONTEXT }
+            : {}),
+        },
+      }),
       // Avoid ambient Claude Code user/project/local settings and plugins by
       // default. Those can silently attach hundreds of tools. Explicit MCP
       // servers above still work; "all integrations/full tool surface" keeps
@@ -3473,6 +3512,8 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
     // un-validated (but still logged).
     let contradictionRetried = false;
     let contextRecoveryRetries = 0;
+    let noResponseRetried = false;
+    let rotateSessionAfterTurn = false;
 
     try {
       for (let attempt = 0; attempt <= PersonalAssistant.RATE_LIMIT_MAX_RETRIES; attempt++) {
@@ -3696,6 +3737,15 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
               sessionId = result.session_id;
               this._lastTerminalReason = (result as any).terminal_reason ?? undefined;
               this.logQueryResult(result, 'chat', sessionKey ?? 'unknown', undefined, profile?.slug);
+              const hiddenSessionTokens = resultInputTokens(result);
+              if (sessionKey && hiddenSessionTokens >= SESSION_ROTATE_INPUT_TOKENS) {
+                rotateSessionAfterTurn = true;
+                logger.warn({
+                  sessionKey,
+                  inputTokens: hiddenSessionTokens,
+                  threshold: SESSION_ROTATE_INPUT_TOKENS,
+                }, 'SDK session near context ceiling — will rotate after this turn');
+              }
               if (result.is_error) {
                 // Error subtypes have `errors` array; success subtype has `result` string
                 const errorText = 'errors' in result ? result.errors.join('; ') : ('result' in result ? result.result : '');
@@ -3712,6 +3762,21 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
                       `• Break it into smaller requests\n` +
                       `• Reply "deep mode" to queue this as a background task with a bigger budget\n` +
                       `• Raise the cap permanently: \`clementine config set BUDGET_CHAT_USD 10\` then \`clementine restart\``
+                    );
+                  } else if (isCreditBalanceError(errorText)) {
+                    markBackgroundCreditBlocked(errorText);
+                    responseText = responseText || (
+                      'Claude says the account credit balance is too low. I paused background jobs for a few hours so they stop draining/retrying, but interactive chat will also fail until credits are available again.'
+                    );
+                  } else if (looksLikeOneMillionContextError(errorText)) {
+                    process.env.CLAUDE_CODE_DISABLE_1M_CONTEXT = '1';
+                    if (sessionKey) {
+                      this.sessions.delete(sessionKey);
+                      this.exchangeCounts.set(sessionKey, 0);
+                      this._compactedSessions.delete(sessionKey);
+                    }
+                    responseText = responseText || (
+                      "Claude rejected the 1M context beta for this account. I've disabled 1M context for this process and reset the session. To persist the fix across restarts, run `clementine config doctor --fix`, then `clementine restart`."
                     );
                   } else if (lower.includes('rate') && lower.includes('limit')) {
                     hitRateLimit = true;
@@ -3812,6 +3877,21 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
             } else {
               responseText += '\n\nI ran out of time but here\'s what I have so far. Want me to continue?';
             }
+          } else if (isCreditBalanceError(e)) {
+            markBackgroundCreditBlocked(e);
+            responseText = responseText || (
+              'Claude says the account credit balance is too low. I paused background jobs for a few hours so they stop draining/retrying, but interactive chat will also fail until credits are available again.'
+            );
+          } else if (looksLikeOneMillionContextError(e)) {
+            process.env.CLAUDE_CODE_DISABLE_1M_CONTEXT = '1';
+            if (sessionKey) {
+              this.sessions.delete(sessionKey);
+              this.exchangeCounts.set(sessionKey, 0);
+              this._compactedSessions.delete(sessionKey);
+            }
+            responseText = responseText || (
+              "Claude rejected the 1M context beta for this account. I've disabled 1M context for this process and reset the session. To persist the fix across restarts, run `clementine config doctor --fix`, then `clementine restart`."
+            );
           } else if (errStr.includes('rate') && (errStr.includes('limit') || errStr.includes('rate_limit'))) {
             hitRateLimit = true;
             // Try to respect any retry hint the server surfaced in the error text.
@@ -3945,6 +4025,28 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
           responseText = contextThrashRecoveryNotice();
         }
 
+        if (looksLikeNoResponseRequested(responseText)) {
+          logger.warn({ sessionKey, attempt }, 'SDK/model returned no-response sentinel during interactive chat');
+          if (!noResponseRetried && attempt < PersonalAssistant.RATE_LIMIT_MAX_RETRIES) {
+            noResponseRetried = true;
+            if (sessionKey) {
+              this.sessions.delete(sessionKey);
+              this.exchangeCounts.set(sessionKey, 0);
+              this._compactedSessions.delete(sessionKey);
+            }
+            prompt =
+              `[RESPONSE REQUIRED]\n` +
+              `This is an interactive user message. The previous attempt returned "No response requested", which is invalid for a direct chat turn.\n\n` +
+              `Answer the user's message directly and briefly. If you need more information, ask one clear question.\n\n` +
+              `User message:\n${prompt}`;
+            responseText = '';
+            sessionId = '';
+            rotateSessionAfterTurn = false;
+            continue;
+          }
+          responseText = "I'm here. What would you like me to do?";
+        }
+
         // ── Response guarantee ─────────────────────────────────────────
         // The model often generates 30+ tool calls with minimal/no text. Ensure
         // the user always gets a substantive response after real work is done.
@@ -3967,8 +4069,13 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
           }
         }
 
-        if (sessionKey && sessionId) {
+        if (sessionKey && sessionId && !rotateSessionAfterTurn) {
           this.sessions.set(sessionKey, sessionId);
+        } else if (sessionKey && rotateSessionAfterTurn) {
+          this.sessions.delete(sessionKey);
+          this.exchangeCounts.set(sessionKey, 0);
+          this._compactedSessions.delete(sessionKey);
+          logger.info({ sessionKey }, 'Rotated SDK session after high-token turn');
         }
 
         // Log tool calls to transcript for audit trail
@@ -5102,7 +5209,21 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
           }
         }
       } else if (message.type === 'result') {
-        this.logQueryResult(message as SDKResultMessage, 'heartbeat', 'heartbeat');
+        const result = message as SDKResultMessage;
+        if (result.is_error) {
+          const errText = 'errors' in result
+            ? result.errors.join('; ')
+            : String((result as any).result ?? '');
+          if (isCreditBalanceError(errText)) {
+            markBackgroundCreditBlocked(errText);
+            throw new Error(errText);
+          }
+          if (looksLikeOneMillionContextError(errText)) {
+            process.env.CLAUDE_CODE_DISABLE_1M_CONTEXT = '1';
+            throw new Error(errText);
+          }
+        }
+        this.logQueryResult(result, 'heartbeat', 'heartbeat');
       } else if (message.type === 'system') {
         this.captureMcpStatus(message);
       } else if (message.type === 'stream_event') {
@@ -5453,11 +5574,21 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
             // "budget" was catching Anthropic's unrelated "does not support
             // user-configurable task budgets" error and pinning perfectly
             // healthy Haiku jobs as permanent failures.
-            if (result.is_error && 'result' in result) {
-              const exitText = String((result as any).result ?? '');
+            if (result.is_error) {
+              const exitText = 'errors' in result
+                ? result.errors.join('; ')
+                : String((result as any).result ?? '');
               if (exitText.includes('max_budget_usd')) {
                 logger.warn({ job: jobName }, 'Cron job hit dollar budget cap — treating as permanent error');
                 throw new Error(`Budget exceeded for cron job '${jobName}'`);
+              }
+              if (isCreditBalanceError(exitText)) {
+                markBackgroundCreditBlocked(exitText);
+                throw new Error(exitText);
+              }
+              if (looksLikeOneMillionContextError(exitText)) {
+                process.env.CLAUDE_CODE_DISABLE_1M_CONTEXT = '1';
+                throw new Error(exitText);
               }
             }
             this.logQueryResult(result, 'cron', `cron:${jobName}`, jobName, sdkOptions.env?.CLEMENTINE_TEAM_AGENT || undefined);

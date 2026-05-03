@@ -39,6 +39,7 @@ import { cmdDashboard } from './dashboard.js';
 import { cmdChat } from './chat.js';
 import { cmdIngestSeed, cmdIngestRun, cmdIngestList, cmdIngestStatus } from './ingest.js';
 import { cmdBrowserStatus, cmdBrowserInstall, cmdBrowserEnable, cmdBrowserDisable, cmdBrowserConnect, maybePromptBrowserHarness } from './browser.js';
+import { parseEnvText } from '../config/env-parser.js';
 import { isSensitiveEnvKey } from '../secrets/sensitivity.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -951,7 +952,7 @@ function cmdDoctor(opts: { fix?: boolean } = {}): void {
   console.log();
 }
 
-function cmdConfigSet(key: string, value: string): void {
+function upsertEnvValue(key: string, value: string): void {
   ensureDataHome();
 
   let content = '';
@@ -972,6 +973,11 @@ function cmdConfigSet(key: string, value: string): void {
   // hardening also fixes pre-existing .env files via `clementine config
   // harden-permissions`.
   writeFileSync(ENV_PATH, content, { mode: 0o600 });
+}
+
+function cmdConfigSet(key: string, value: string): void {
+  const upperKey = key.toUpperCase();
+  upsertEnvValue(upperKey, value);
   console.log(`  Set ${upperKey}=${value}`);
 }
 
@@ -1021,6 +1027,191 @@ function cmdConfigList(): void {
     }
   }
   console.log();
+}
+
+// ── Budgets ─────────────────────────────────────────────────────────
+
+const SAFE_BACKGROUND_BUDGETS = [
+  { key: 'BUDGET_HEARTBEAT_USD', value: '0.25', label: 'heartbeat' },
+  { key: 'BUDGET_CRON_T1_USD', value: '0.75', label: 'tier-1 cron' },
+  { key: 'BUDGET_CRON_T2_USD', value: '1.5', label: 'tier-2 cron' },
+] as const;
+
+const BUDGET_ALIASES: Record<string, string> = {
+  chat: 'BUDGET_CHAT_USD',
+  heartbeat: 'BUDGET_HEARTBEAT_USD',
+  hb: 'BUDGET_HEARTBEAT_USD',
+  cron1: 'BUDGET_CRON_T1_USD',
+  'cron-1': 'BUDGET_CRON_T1_USD',
+  cront1: 'BUDGET_CRON_T1_USD',
+  'cron-t1': 'BUDGET_CRON_T1_USD',
+  t1: 'BUDGET_CRON_T1_USD',
+  cron2: 'BUDGET_CRON_T2_USD',
+  'cron-2': 'BUDGET_CRON_T2_USD',
+  cront2: 'BUDGET_CRON_T2_USD',
+  'cron-t2': 'BUDGET_CRON_T2_USD',
+  t2: 'BUDGET_CRON_T2_USD',
+};
+
+function isOneMillionContextEnabled(value: unknown): boolean {
+  return /^(0|false|no)$/i.test(String(value).trim());
+}
+
+function normalizeBudgetKey(name: string): string | null {
+  const raw = name.trim();
+  const upper = raw.toUpperCase();
+  if (upper === 'BUDGET_CHAT_USD' || upper === 'BUDGET_HEARTBEAT_USD' || upper === 'BUDGET_CRON_T1_USD' || upper === 'BUDGET_CRON_T2_USD') {
+    return upper;
+  }
+  return BUDGET_ALIASES[raw.toLowerCase()] ?? null;
+}
+
+function formatBudgetValue(value: unknown): string {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return String(value);
+  return `$${n.toFixed(2)}`;
+}
+
+function readPersistedEnvValue(key: string): string | undefined {
+  if (!existsSync(ENV_PATH)) return undefined;
+  try {
+    return parseEnvText(readFileSync(ENV_PATH, 'utf-8'))[key];
+  } catch {
+    return undefined;
+  }
+}
+
+async function cmdBudgetsShow(): Promise<void> {
+  const { computeEffectiveConfig } = await import('../config/effective-config.js');
+  const cfg = computeEffectiveConfig(BASE_DIR);
+  const byKey = new Map(cfg.entries.map(e => [e.key, e]));
+
+  const DIM = '\x1b[0;90m';
+  const BOLD = '\x1b[1m';
+  const GREEN = '\x1b[0;32m';
+  const YELLOW = '\x1b[0;33m';
+  const RESET = '\x1b[0m';
+
+  const rows = [
+    ['chat', 'BUDGET_CHAT_USD'],
+    ['heartbeat', 'BUDGET_HEARTBEAT_USD'],
+    ['tier-1 cron', 'BUDGET_CRON_T1_USD'],
+    ['tier-2 cron', 'BUDGET_CRON_T2_USD'],
+  ] as const;
+
+  console.log();
+  console.log(`  ${BOLD}Clementine budgets${RESET}`);
+  console.log(`  ${DIM}Data home: ${cfg.baseDir}${RESET}`);
+  console.log();
+
+  for (const [label, key] of rows) {
+    const entry = byKey.get(key);
+    const source = entry?.source ?? 'unknown';
+    console.log(`  ${label.padEnd(12)} ${BOLD}${formatBudgetValue(entry?.value).padEnd(8)}${RESET} ${DIM}${key} from ${source}${RESET}`);
+  }
+
+  const oneM = byKey.get('CLAUDE_CODE_DISABLE_1M_CONTEXT');
+  const persistedOneM = readPersistedEnvValue('CLAUDE_CODE_DISABLE_1M_CONTEXT');
+  const oneMValue = persistedOneM ?? oneM?.value;
+  const oneMSource = persistedOneM !== undefined ? '.env' : oneM?.source ?? 'unknown';
+  const oneMEnabled = isOneMillionContextEnabled(oneMValue);
+  console.log();
+  console.log(`  1M context   ${oneMEnabled ? `${YELLOW}enabled${RESET}` : `${GREEN}disabled${RESET}`} ${DIM}CLAUDE_CODE_DISABLE_1M_CONTEXT=${String(oneMValue ?? '')} from ${oneMSource}${RESET}`);
+  if (oneMEnabled) {
+    console.log(`  ${YELLOW}Note:${RESET} 1M context requires an eligible plan or Claude Extra Usage; accounts without it will fail calls.`);
+  }
+  console.log();
+  console.log(`  ${DIM}Useful commands:${RESET}`);
+  console.log(`    clementine budgets safe        ${DIM}lower background budgets and disable 1M context${RESET}`);
+  console.log(`    clementine budgets 1m on       ${DIM}enable 1M context for accounts with entitlement/Extra Usage${RESET}`);
+  console.log(`    clementine budgets 1m off      ${DIM}disable 1M context for maximum compatibility${RESET}`);
+  console.log(`    clementine budgets set chat 10 ${DIM}raise one budget cap${RESET}`);
+  console.log();
+}
+
+async function cmdBudgetsSafe(): Promise<void> {
+  const { computeEffectiveConfig } = await import('../config/effective-config.js');
+  const cfg = computeEffectiveConfig(BASE_DIR);
+  const byKey = new Map(cfg.entries.map(e => [e.key, e]));
+
+  const DIM = '\x1b[0;90m';
+  const BOLD = '\x1b[1m';
+  const YELLOW = '\x1b[0;33m';
+  const GREEN = '\x1b[0;32m';
+  const RESET = '\x1b[0m';
+
+  const writes = [
+    ...SAFE_BACKGROUND_BUDGETS,
+    { key: 'CLAUDE_CODE_DISABLE_1M_CONTEXT', value: '1', label: '1M context disabled' },
+  ];
+
+  for (const item of writes) {
+    upsertEnvValue(item.key, item.value);
+  }
+
+  console.log();
+  console.log(`  ${GREEN}Applied safe budget preset.${RESET}`);
+  for (const item of writes) {
+    const entry = byKey.get(item.key);
+    const runtimeOverride = entry?.source === 'process.env' && String(entry.value) !== item.value
+      ? ` ${YELLOW}(process.env still overrides until unset)${RESET}`
+      : '';
+    console.log(`  ${BOLD}${item.key}${RESET}=${item.value} ${DIM}${item.label}${RESET}${runtimeOverride}`);
+  }
+  console.log(`  ${DIM}Interactive chat budget is left unchanged. Restart Clementine for running daemons to pick this up.${RESET}`);
+  console.log();
+}
+
+function cmdBudgetsOneMillion(mode: string): void {
+  const normalized = mode.trim().toLowerCase();
+  const on = new Set(['on', 'enable', 'enabled', 'yes', 'true', '1']);
+  const off = new Set(['off', 'disable', 'disabled', 'no', 'false', '0']);
+
+  if (!on.has(normalized) && !off.has(normalized)) {
+    console.error('  Usage: clementine budgets 1m <on|off>');
+    process.exitCode = 1;
+    return;
+  }
+
+  const enable = on.has(normalized);
+  upsertEnvValue('CLAUDE_CODE_DISABLE_1M_CONTEXT', enable ? '0' : '1');
+
+  if (enable) {
+    console.log();
+    console.log('  Enabled Claude 1M context for Clementine.');
+    console.log('  Requires an eligible account or Claude Extra Usage; restart Clementine to apply.');
+    console.log();
+  } else {
+    console.log();
+    console.log('  Disabled Claude 1M context for Clementine.');
+    console.log('  This is the safest default for users without Claude Extra Usage. Restart Clementine to apply.');
+    console.log();
+  }
+}
+
+function cmdBudgetsSet(name: string, value: string): void {
+  if (['1m', 'context', 'context1m'].includes(name.trim().toLowerCase())) {
+    cmdBudgetsOneMillion(value);
+    return;
+  }
+
+  const key = normalizeBudgetKey(name);
+  if (!key) {
+    console.error('  Unknown budget. Use: chat, heartbeat, cron1, or cron2.');
+    process.exitCode = 1;
+    return;
+  }
+
+  const amount = Number(value);
+  if (!Number.isFinite(amount) || amount < 0) {
+    console.error('  Budget value must be a non-negative number, for example: clementine budgets set chat 10');
+    process.exitCode = 1;
+    return;
+  }
+
+  upsertEnvValue(key, String(amount));
+  console.log(`  Set ${key}=${amount}`);
+  console.log('  Restart Clementine to apply this to a running daemon.');
 }
 
 // ── Config show ──────────────────────────────────────────────────────
@@ -1105,12 +1296,13 @@ async function cmdConfigShow(opts: { json?: boolean; group?: string }): Promise<
 
 // ── Config doctor ────────────────────────────────────────────────────
 
-async function cmdConfigDoctor(opts: { json?: boolean }): Promise<void> {
-  const { runDoctor } = await import('../config/config-doctor.js');
+async function cmdConfigDoctor(opts: { json?: boolean; fix?: boolean }): Promise<void> {
+  const { applyDoctorFixes, runDoctor } = await import('../config/config-doctor.js');
+  const fixResult = opts.fix ? applyDoctorFixes(BASE_DIR) : { changed: [], skipped: [] };
   const report = runDoctor(BASE_DIR);
 
   if (opts.json) {
-    console.log(JSON.stringify(report, null, 2));
+    console.log(JSON.stringify({ ...report, appliedFixes: fixResult }, null, 2));
     process.exit(report.exitCode);
   }
 
@@ -1129,6 +1321,16 @@ async function cmdConfigDoctor(opts: { json?: boolean }): Promise<void> {
   console.log(`  ${BOLD}.env present:${RESET}     ${report.hasEnvFile ? GREEN + 'yes' : DIM + 'no'}${RESET}`);
   console.log(`  ${BOLD}clementine.json:${RESET}  ${report.hasJsonFile ? GREEN + 'present' : DIM + 'missing'}${RESET}`);
   console.log();
+
+  if (opts.fix) {
+    for (const f of fixResult.changed) {
+      console.log(`  ${GREEN}✓${RESET} Set ${BOLD}${f.key}${RESET}=${f.value} ${DIM}— ${f.reason}${RESET}`);
+    }
+    for (const f of fixResult.skipped) {
+      console.log(`  ${YELLOW}⚠${RESET} ${BOLD}${f.key}${RESET} not auto-fixed: ${f.reason}`);
+    }
+    if (fixResult.changed.length > 0 || fixResult.skipped.length > 0) console.log();
+  }
 
   if (report.findings.length === 0) {
     console.log(`  ${GREEN}✓ All checks passed.${RESET}`);
@@ -2234,7 +2436,8 @@ configCmd
   .command('doctor')
   .description('Validate config: stale keychain refs, type errors, missing channel deps')
   .option('--json', 'Emit machine-readable JSON instead of a checklist')
-  .action(async (opts: { json?: boolean }) => {
+  .option('--fix', 'Apply safe local config fixes for common broken overrides')
+  .action(async (opts: { json?: boolean; fix?: boolean }) => {
     await cmdConfigDoctor(opts);
   });
 
@@ -2288,6 +2491,37 @@ configCmd
       console.error(`  Failed to open editor: ${editor}`);
     }
   });
+
+const budgetsCmd = program
+  .command('budgets')
+  .description('View and tune spend budgets and Claude 1M context behavior')
+  .action(async () => {
+    await cmdBudgetsShow();
+  });
+
+budgetsCmd
+  .command('show')
+  .description('Show budget caps, 1M context state, and config provenance')
+  .action(async () => {
+    await cmdBudgetsShow();
+  });
+
+budgetsCmd
+  .command('safe')
+  .description('Apply the stable local-safe preset: lower background budgets and disable 1M context')
+  .action(async () => {
+    await cmdBudgetsSafe();
+  });
+
+budgetsCmd
+  .command('1m <mode>')
+  .description('Toggle Claude 1M context for Clementine (on | off)')
+  .action(cmdBudgetsOneMillion);
+
+budgetsCmd
+  .command('set <name> <value>')
+  .description('Set a budget cap: chat, heartbeat, cron1, or cron2')
+  .action(cmdBudgetsSet);
 
 // ── Skills commands ─────────────────────────────────────────────────
 //

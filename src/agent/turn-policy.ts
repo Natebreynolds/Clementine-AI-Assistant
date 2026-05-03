@@ -45,7 +45,7 @@ export interface TurnDecision {
 const URL_RE = /https?:\/\//i;
 const MEMORY_REF_RE = /\b(remember|memory|memories|previous|last time|earlier|we discussed|where were we|pick up|continue|you know about me|my preference|preferences|what did i say|what do i like)\b/i;
 const GOAL_REF_RE = /\b(goal|goals|objective|objectives|blocker|next action|next step|roadmap|priority|priorities)\b/i;
-const LOCAL_TOOL_RE = /\b(repo|repository|code|file|files|folder|directory|path|log|logs|config|build|test|typecheck|lint|npm|git|commit|push|pull|branch|diff|patch|edit|write|implement|fix|refactor|run)\b/i;
+const LOCAL_TOOL_RE = /\b(repo|repository|code|file|files|folder|directory|path|log|logs|config|build|test|typecheck|lint|npm|git|commit|push|pull|branch|diff|patch|edit|write|implement|fix|refactor|run|diagnose|investigate|troubleshoot|cron|scheduler|lease)\b/i;
 const COMPLEX_RE = /\b(multiple|several|many|bulk|batch|parallel|deep mode|background|research|analyze|audit|review|across|end to end|entire)\b/i;
 const ADMIN_RE = /\b(self[- ]?update|restart|daemon|npm publish|publish to npm|doctor|integration|credential|env var|environment variable|set up|setup|configure)\b/i;
 const STANDALONE_GREETINGS = new Set([

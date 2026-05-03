@@ -160,7 +160,7 @@ describe('computeEffectiveConfig', () => {
     const cfg = computeEffectiveConfig(baseDir);
     const budget = cfg.entries.find(e => e.key === 'BUDGET_HEARTBEAT_USD')!;
     expect(budget.source).toBe('default');
-    expect(budget.value).toBe(0.50);
+    expect(budget.value).toBe(0.25);
     expect(budget.unresolvedRef).toMatch(/^keychain:nonexistent-account-/);
   });
 });

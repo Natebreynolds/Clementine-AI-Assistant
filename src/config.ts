@@ -255,9 +255,9 @@ export const MODELS: Models = {
 // `budgets.*` keys in clementine.json.
 
 export const BUDGET = {
-  heartbeat: getEnvOrJsonNumber('BUDGET_HEARTBEAT_USD', json.budgets?.heartbeat, 0.50), // per heartbeat (Haiku)
-  cronT1: getEnvOrJsonNumber('BUDGET_CRON_T1_USD', json.budgets?.cronT1, 2.00),         // per tier-1 cron job
-  cronT2: getEnvOrJsonNumber('BUDGET_CRON_T2_USD', json.budgets?.cronT2, 5.00),         // per tier-2 cron job
+  heartbeat: getEnvOrJsonNumber('BUDGET_HEARTBEAT_USD', json.budgets?.heartbeat, 0.25), // per heartbeat (Haiku)
+  cronT1: getEnvOrJsonNumber('BUDGET_CRON_T1_USD', json.budgets?.cronT1, 0.75),         // per tier-1 cron job
+  cronT2: getEnvOrJsonNumber('BUDGET_CRON_T2_USD', json.budgets?.cronT2, 1.50),         // per tier-2 cron job
   chat: getEnvOrJsonNumber('BUDGET_CHAT_USD', json.budgets?.chat, 5.00),                // per interactive chat
   unleashedPhase: undefined,
   memoryExtraction: undefined,

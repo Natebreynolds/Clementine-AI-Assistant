@@ -39,6 +39,7 @@ import {
   recordProactiveNotificationEvent,
   type ProactiveNotificationInput,
 } from './notification-context.js';
+import { getBackgroundCreditBlock, isCreditBalanceError, markBackgroundCreditBlocked } from './credit-guard.js';
 
 const logger = pino({ name: 'clementine.gateway' });
 const INTERACTIVE_FAILURE_LOG = path.join(BASE_DIR, 'self-improve', 'interactive-failures.jsonl');
@@ -54,12 +55,13 @@ const CHAT_TIMEOUT_MS = 10 * 60 * 1000;
  *  Primary guardrail is cost budget (maxBudgetUsd), not this timer. */
 const CHAT_MAX_WALL_MS = 30 * 60 * 1000;
 
-export type ChatErrorKind = 'rate_limit' | 'context_overflow' | 'auth' | 'transient' | 'unknown';
+export type ChatErrorKind = 'rate_limit' | 'context_overflow' | 'auth' | 'billing' | 'transient' | 'unknown';
 
 export function classifyChatError(err: unknown): ChatErrorKind {
   const msg = String(err);
+  if (isCreditBalanceError(msg)) return 'billing';
   if (/rate.?limit|\b429\b|too many requests|quota.?exceeded/i.test(msg)) return 'rate_limit';
-  if (looksLikeContextThrashText(msg) || /context.?length|token.?limit|maximum.?context|prompt.?too.?long/i.test(msg)) return 'context_overflow';
+  if (looksLikeContextThrashText(msg) || /extra usage.*1m context|1m context.*extra usage|context-1m|context.?length|token.?limit|maximum.?context|prompt.?too.?long/i.test(msg)) return 'context_overflow';
   if (/\b401\b|\b403\b|auth|forbidden|invalid.?api.?key|permission|does not have access|please run \/login/i.test(msg)) return 'auth';
   if (/timeout|ECONNRESET|ECONNREFUSED|ETIMEDOUT|\b5\d\d\b|overloaded|service.?unavailable/i.test(msg)) return 'transient';
   return 'unknown';
@@ -1962,6 +1964,9 @@ export class Gateway {
             case 'auth':
               this.recordAuthFailure();
               return "I'm temporarily offline due to an authentication issue. The owner needs to re-authenticate — I'll recover automatically once it's resolved.";
+            case 'billing':
+              markBackgroundCreditBlocked(err);
+              return 'Claude says the account credit balance is too low. I paused background jobs for a few hours so they stop retrying, but chat will need credits available before I can answer normally.';
             case 'transient':
               return "I hit a temporary connection issue. Please try again in a moment.";
             default:
@@ -1986,6 +1991,11 @@ export class Gateway {
     const releaseLane = await lanes.acquire('heartbeat');
     try {
       const agent = profile?.slug ?? 'clementine';
+      const creditBlock = getBackgroundCreditBlock();
+      if (creditBlock) {
+        logger.warn({ agent, until: creditBlock.until }, 'Heartbeat skipped — Claude credit block active');
+        return '__NOTHING__';
+      }
       logger.info({ agent }, 'Running heartbeat...');
       events.emit('heartbeat:start', { agent, timestamp: Date.now() });
       const hbStart = Date.now();

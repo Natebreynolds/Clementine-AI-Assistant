@@ -324,14 +324,25 @@ clementine restart                    # apply changes
 
 Your overrides live in `~/.clementine/.env` — **they survive every `npm update -g` / `clementine update`** because they're in your data home, not the package directory.
 
+For spend/context tuning, `clementine budgets` gives a safer shortcut:
+
+```bash
+clementine budgets              # show chat/cron/heartbeat caps and 1M context state
+clementine budgets safe         # lower background budgets and disable Claude 1M context
+clementine budgets 1m on        # enable 1M context for eligible accounts / Extra Usage
+clementine budgets 1m off       # disable 1M context for maximum compatibility
+clementine budgets set chat 10  # raise one budget cap
+```
+
 **Commonly tuned knobs:**
 
 | Key | Default | What it does |
 |-----|---------|--------------|
 | `BUDGET_CHAT_USD` | `5.00` | Max spend per interactive chat message |
-| `BUDGET_CRON_T1_USD` | `2.00` | Max spend per tier-1 cron job |
-| `BUDGET_CRON_T2_USD` | `5.00` | Max spend per tier-2 cron job |
-| `BUDGET_HEARTBEAT_USD` | `0.50` | Max spend per heartbeat tick |
+| `BUDGET_CRON_T1_USD` | `0.75` | Max spend per tier-1 cron job |
+| `BUDGET_CRON_T2_USD` | `1.50` | Max spend per tier-2 cron job |
+| `BUDGET_HEARTBEAT_USD` | `0.25` | Max spend per heartbeat tick |
+| `CLAUDE_CODE_DISABLE_1M_CONTEXT` | `true` | `true`/`1` keeps Claude Code on 200K context unless the user explicitly enables 1M |
 | `DEFAULT_MODEL_TIER` | `sonnet` | Default model: `haiku` / `sonnet` / `opus` |
 | `HEARTBEAT_INTERVAL_MINUTES` | `30` | How often the agent auto-checks in |
 | `HEARTBEAT_ACTIVE_START` | `8` | First hour of the active window (0–23) |

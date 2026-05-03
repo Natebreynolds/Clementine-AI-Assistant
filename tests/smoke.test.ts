@@ -12,8 +12,11 @@ import {
   estimateTokens,
   isAutonomousNothingOutput,
   looksLikeContextThrashText,
+  looksLikeNoResponseRequested,
+  looksLikeOneMillionContextError,
 } from '../src/agent/assistant.js';
 import { validateProposal } from '../src/agent/self-improve.js';
+import { isCreditBalanceError } from '../src/gateway/credit-guard.js';
 
 // ── shellEscape ─────────────────────────────────────────────────────
 
@@ -66,6 +69,10 @@ describe('classifyError', () => {
     expect(classifyError(new Error('TypeError: cannot read'))).toBe('permanent');
     expect(classifyError('invalid JSON')).toBe('permanent');
   });
+
+  it('classifies Claude credit exhaustion as permanent for cron', () => {
+    expect(classifyError('Credit balance is too low')).toBe('permanent');
+  });
 });
 
 // ── autonomous no-op output ─────────────────────────────────────────
@@ -76,6 +83,7 @@ describe('autonomous no-op output suppression', () => {
     expect(isAutonomousNothingOutput('NOTHING')).toBe(true);
     expect(isAutonomousNothingOutput('__NOTHING__\n\n[MONITORING]')).toBe(true);
     expect(isAutonomousNothingOutput('nothing to report')).toBe(true);
+    expect(isAutonomousNothingOutput('No response requested')).toBe(true);
   });
 
   it('does not suppress substantive output that mentions nothing', () => {
@@ -86,7 +94,26 @@ describe('autonomous no-op output suppression', () => {
     expect(CronScheduler.isCronNoise('NOTHING')).toBe(true);
     expect(CronScheduler.isCronNoise('__NOTHING__\n\n[MONITORING]')).toBe(true);
     expect(CronScheduler.isCronNoise('No updates')).toBe(true);
+    expect(CronScheduler.isCronNoise('No response requested')).toBe(true);
     expect(CronScheduler.isCronNoise('No updates, but I did send the brief and saved it to the vault.')).toBe(false);
+  });
+});
+
+describe('response and provider error sentinels', () => {
+  it('detects interactive no-response sentinel text', () => {
+    expect(looksLikeNoResponseRequested('No response requested')).toBe(true);
+    expect(looksLikeNoResponseRequested('No response requested.')).toBe(true);
+    expect(looksLikeNoResponseRequested('No response requested, but I checked it.')).toBe(false);
+  });
+
+  it('detects 1M context entitlement errors', () => {
+    expect(looksLikeOneMillionContextError('Extra usage is required for 1M context')).toBe(true);
+    expect(looksLikeOneMillionContextError('context-1m-2025-08-07')).toBe(true);
+  });
+
+  it('detects Claude credit exhaustion errors', () => {
+    expect(isCreditBalanceError('Credit balance is too low')).toBe(true);
+    expect(isCreditBalanceError('Your account has insufficient credits')).toBe(true);
   });
 });
 
@@ -103,12 +130,17 @@ describe('classifyChatError', () => {
     expect(classifyChatError('maximum context length exceeded')).toBe('context_overflow');
     expect(classifyChatError('token limit reached')).toBe('context_overflow');
     expect(classifyChatError('Autocompact is thrashing: the context refilled to the limit')).toBe('context_overflow');
+    expect(classifyChatError('Extra usage is required for 1M context')).toBe('context_overflow');
   });
 
   it('classifies auth errors', () => {
     expect(classifyChatError(new Error('401 Unauthorized'))).toBe('auth');
     expect(classifyChatError('403 Forbidden')).toBe('auth');
     expect(classifyChatError('invalid api key')).toBe('auth');
+  });
+
+  it('classifies billing/credit errors', () => {
+    expect(classifyChatError('Credit balance is too low')).toBe('billing');
   });
 
   it('classifies transient errors', () => {

@@ -14,9 +14,10 @@
  * computeEffectiveConfig already does (lazy keychain resolution).
  */
 
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { computeEffectiveConfig, type EffectiveConfig } from './effective-config.js';
+import { parseEnvText } from './env-parser.js';
 
 export type Severity = 'error' | 'warning' | 'info';
 
@@ -37,6 +38,11 @@ export interface DoctorReport {
   counts: Record<Severity, number>;
   /** Suggested process exit code: 1 if any errors, 0 otherwise. */
   exitCode: 0 | 1;
+}
+
+export interface DoctorFixResult {
+  changed: Array<{ key: string; value: string; reason: string }>;
+  skipped: Array<{ key: string; reason: string }>;
 }
 
 // ── Type expectations ───────────────────────────────────────────────
@@ -66,6 +72,12 @@ const ENUM_KEYS: Record<string, readonly string[]> = {
   ALLOW_ALL_USERS: ['true', 'false'],
   CLEMENTINE_ALLOW_SOURCE_EDITS: ['true', 'false', '1', '0', 'yes', 'no'],
   CLAUDE_CODE_DISABLE_1M_CONTEXT: ['true', 'false', '1', '0', 'yes', 'no'],
+};
+
+const SAFE_BACKGROUND_DEFAULTS: Record<string, number> = {
+  BUDGET_HEARTBEAT_USD: 0.25,
+  BUDGET_CRON_T1_USD: 0.75,
+  BUDGET_CRON_T2_USD: 1.50,
 };
 
 // Channel pairings: when channel.enableKey is truthy, the companion keys
@@ -108,6 +120,7 @@ export function runDoctor(baseDir: string): DoctorReport {
   checkChannelRequirements(cfg, findings);
   checkPlaintextSecretsInEnv(cfg, baseDir, findings);
   checkRangeSanity(cfg, findings);
+  checkOperationalOverrides(cfg, baseDir, findings);
   checkSchemaVersion(baseDir, findings);
 
   const counts: Record<Severity, number> = { error: 0, warning: 0, info: 0 };
@@ -121,6 +134,53 @@ export function runDoctor(baseDir: string): DoctorReport {
     counts,
     exitCode: counts.error > 0 ? 1 : 0,
   };
+}
+
+export function applyDoctorFixes(baseDir: string): DoctorFixResult {
+  const cfg = computeEffectiveConfig(baseDir);
+  const byKey = new Map(cfg.entries.map(e => [e.key, e]));
+  const persistedEnv = readEnvValues(baseDir);
+  const changed: DoctorFixResult['changed'] = [];
+  const skipped: DoctorFixResult['skipped'] = [];
+
+  const setSafeValue = (key: string, value: string, reason: string): void => {
+    const entry = byKey.get(key);
+    if (entry?.source === 'process.env' && persistedEnv[key] === undefined) {
+      skipped.push({
+        key,
+        reason: `${key} is coming from process.env, which .env cannot override. Update the launch environment or unset it.`,
+      });
+      return;
+    }
+    upsertEnvValue(baseDir, key, value);
+    if (entry?.source === 'process.env') {
+      process.env[key] = value;
+    }
+    changed.push({ key, value, reason });
+  };
+
+  const oneM = byKey.get('CLAUDE_CODE_DISABLE_1M_CONTEXT');
+  if (oneM && isFalseyToggle(oneM.value)) {
+    setSafeValue(
+      'CLAUDE_CODE_DISABLE_1M_CONTEXT',
+      '1',
+      'Disable Claude Code 1M context beta unless the account explicitly has Extra Usage.',
+    );
+  }
+
+  for (const [key, recommended] of Object.entries(SAFE_BACKGROUND_DEFAULTS)) {
+    const entry = byKey.get(key);
+    const value = Number(entry?.value);
+    if (entry && entry.source !== 'default' && Number.isFinite(value) && value > recommended) {
+      setSafeValue(
+        key,
+        String(recommended),
+        'Lower background budget to the stable default so cron/heartbeat cannot exhaust credits before chat.',
+      );
+    }
+  }
+
+  return { changed, skipped };
 }
 
 function checkBootstrap(cfg: EffectiveConfig, findings: Finding[]): void {
@@ -270,6 +330,65 @@ function checkRangeSanity(cfg: EffectiveConfig, findings: Finding[]): void {
       });
     }
   }
+}
+
+function checkOperationalOverrides(cfg: EffectiveConfig, baseDir: string, findings: Finding[]): void {
+  const byKey = new Map(cfg.entries.map(e => [e.key, e]));
+  const persistedEnv = readEnvValues(baseDir);
+
+  const oneM = byKey.get('CLAUDE_CODE_DISABLE_1M_CONTEXT');
+  if (oneM && oneM.source !== 'default' && isFalseyToggle(oneM.value)) {
+    const source = oneM.source === 'process.env' && persistedEnv.CLAUDE_CODE_DISABLE_1M_CONTEXT !== undefined
+      ? '.env'
+      : oneM.source;
+    findings.push({
+      severity: 'warning',
+      key: 'CLAUDE_CODE_DISABLE_1M_CONTEXT',
+      message: `1M context is explicitly enabled from ${source}. Accounts without Claude Extra Usage will fail every call with "Extra usage is required for 1M context."`,
+      fix: 'clementine config doctor --fix   # sets CLAUDE_CODE_DISABLE_1M_CONTEXT=1',
+    });
+  }
+
+  for (const [key, recommended] of Object.entries(SAFE_BACKGROUND_DEFAULTS)) {
+    const entry = byKey.get(key);
+    if (!entry || entry.source === 'default') continue;
+    const value = Number(entry.value);
+    if (!Number.isFinite(value) || value <= recommended) continue;
+    findings.push({
+      severity: 'warning',
+      key,
+      message: `${key} is $${value.toFixed(2)} from ${entry.source}; the safe default is $${recommended.toFixed(2)}. High background budgets can drain Claude credits before the user chats.`,
+      fix: `clementine config set ${key} ${recommended}`,
+    });
+  }
+}
+
+function isFalseyToggle(value: unknown): boolean {
+  return /^(0|false|no)$/i.test(String(value).trim());
+}
+
+function readEnvValues(baseDir: string): Record<string, string> {
+  const envPath = path.join(baseDir, '.env');
+  if (!existsSync(envPath)) return {};
+  try {
+    return parseEnvText(readFileSync(envPath, 'utf-8'));
+  } catch {
+    return {};
+  }
+}
+
+function upsertEnvValue(baseDir: string, key: string, value: string): void {
+  mkdirSync(baseDir, { recursive: true });
+  const envPath = path.join(baseDir, '.env');
+  const upperKey = key.toUpperCase();
+  let content = existsSync(envPath) ? readFileSync(envPath, 'utf-8') : '';
+  const re = new RegExp(`^${upperKey}=.*$`, 'm');
+  if (re.test(content)) {
+    content = content.replace(re, `${upperKey}=${value}`);
+  } else {
+    content = content.trimEnd() + `\n${upperKey}=${value}\n`;
+  }
+  writeFileSync(envPath, content, { mode: 0o600 });
 }
 
 function checkSchemaVersion(baseDir: string, findings: Finding[]): void {

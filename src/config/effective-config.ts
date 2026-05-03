@@ -75,9 +75,9 @@ const SPECS: KeySpec[] = [
   { key: 'AUTO_DELEGATE_ENABLED', group: 'team', default: false },
 
   // Budgets
-  { key: 'BUDGET_HEARTBEAT_USD', group: 'budgets', jsonPath: 'budgets.heartbeat', default: 0.50 },
-  { key: 'BUDGET_CRON_T1_USD', group: 'budgets', jsonPath: 'budgets.cronT1', default: 2.00 },
-  { key: 'BUDGET_CRON_T2_USD', group: 'budgets', jsonPath: 'budgets.cronT2', default: 5.00 },
+  { key: 'BUDGET_HEARTBEAT_USD', group: 'budgets', jsonPath: 'budgets.heartbeat', default: 0.25 },
+  { key: 'BUDGET_CRON_T1_USD', group: 'budgets', jsonPath: 'budgets.cronT1', default: 0.75 },
+  { key: 'BUDGET_CRON_T2_USD', group: 'budgets', jsonPath: 'budgets.cronT2', default: 1.50 },
   { key: 'BUDGET_CHAT_USD', group: 'budgets', jsonPath: 'budgets.chat', default: 5.00 },
 
   // Heartbeat

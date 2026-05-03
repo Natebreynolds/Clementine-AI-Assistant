@@ -58,6 +58,12 @@ import {
   recentDecisions,
   recordDecisionOutcome,
 } from '../agent/proactive-ledger.js';
+import {
+  formatCreditBlock,
+  getBackgroundCreditBlock,
+  isCreditBalanceError,
+  markBackgroundCreditBlocked,
+} from './credit-guard.js';
 
 const logger = pino({ name: 'clementine.cron' });
 
@@ -339,6 +345,7 @@ const TRANSIENT_PATTERNS = [
 ];
 
 export function classifyError(err: unknown): 'transient' | 'permanent' {
+  if (isCreditBalanceError(err)) return 'permanent';
   const msg = String(err);
   return TRANSIENT_PATTERNS.some((re) => re.test(msg)) ? 'transient' : 'permanent';
 }
@@ -893,6 +900,21 @@ export class CronScheduler {
   }
 
   private async runJob(job: CronJobDefinition): Promise<void> {
+    const creditBlock = getBackgroundCreditBlock();
+    if (creditBlock) {
+      logger.warn({ job: job.name, until: creditBlock.until }, 'Cron job skipped — Claude credit block active');
+      this._logRun({
+        jobName: job.name,
+        startedAt: new Date().toISOString(),
+        finishedAt: new Date().toISOString(),
+        status: 'skipped',
+        durationMs: 0,
+        attempt: 0,
+        outputPreview: formatCreditBlock(creditBlock),
+      });
+      return;
+    }
+
     // Agent status check — skip if agent is paused/terminated
     if (job.agentSlug) {
       const agentMgr = this.gateway?.getAgentManager?.();
@@ -1295,6 +1317,18 @@ export class CronScheduler {
             advisorApplied,
           });
 
+          if (isCreditBalanceError(err)) {
+            const { block, created } = markBackgroundCreditBlocked(err);
+            logger.error({ err, job: job.name, until: block.until }, 'Cron hit Claude credit exhaustion — pausing background jobs');
+            if (created) {
+              await this.dispatcher.send(
+                `${job.name} hit Claude credit exhaustion. Background jobs are paused until ${block.until} so they stop draining/retrying. Interactive chat may also fail until credits are available.`,
+                { agentSlug: job.agentSlug },
+              );
+            }
+            return;
+          }
+
           // Permanent error — stop immediately
           if (errorType === 'permanent') {
             logger.error({ err, job: job.name }, `Cron job '${job.name}' permanent error — not retrying`);
@@ -1580,6 +1614,7 @@ export class CronScheduler {
       'nothing new to report',
       'all clear',
       'no updates',
+      'no response requested',
       'completing silently',
     ];
     for (const p of noisePatterns) {
