@@ -328,8 +328,9 @@ For spend/context tuning, `clementine budgets` gives a safer shortcut:
 
 ```bash
 clementine budgets              # show chat/cron/heartbeat caps and 1M context state
-clementine budgets safe         # lower background budgets and disable Claude 1M context
-clementine budgets 1m on        # enable 1M context for eligible accounts / Extra Usage
+clementine budgets safe         # lower background budgets and force standard 200K context
+clementine budgets 1m auto      # allow included Opus 1M, keep Sonnet on 200K
+clementine budgets 1m on        # force 1M context for Extra Usage/API users
 clementine budgets 1m off       # disable 1M context for maximum compatibility
 clementine budgets set chat 10  # raise one budget cap
 ```
@@ -342,7 +343,8 @@ clementine budgets set chat 10  # raise one budget cap
 | `BUDGET_CRON_T1_USD` | `0.75` | Max spend per tier-1 cron job |
 | `BUDGET_CRON_T2_USD` | `1.50` | Max spend per tier-2 cron job |
 | `BUDGET_HEARTBEAT_USD` | `0.25` | Max spend per heartbeat tick |
-| `CLAUDE_CODE_DISABLE_1M_CONTEXT` | `true` | `true`/`1` keeps Claude Code on 200K context unless the user explicitly enables 1M |
+| `CLEMENTINE_1M_CONTEXT_MODE` | `auto` | `auto` allows included Opus 1M on Max/Team/Enterprise while keeping Sonnet on 200K; `off` forces 200K; `on` forces 1M |
+| `CLAUDE_CODE_DISABLE_1M_CONTEXT` | legacy | Backward-compatible Claude Code switch; `budgets safe` writes `1`, `budgets 1m auto` removes it |
 | `DEFAULT_MODEL_TIER` | `sonnet` | Default model: `haiku` / `sonnet` / `opus` |
 | `HEARTBEAT_INTERVAL_MINUTES` | `30` | How often the agent auto-checks in |
 | `HEARTBEAT_ACTIVE_START` | `8` | First hour of the active window (0–23) |

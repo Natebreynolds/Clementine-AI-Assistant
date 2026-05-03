@@ -975,6 +975,14 @@ function upsertEnvValue(key: string, value: string): void {
   writeFileSync(ENV_PATH, content, { mode: 0o600 });
 }
 
+function removeEnvValue(key: string): void {
+  if (!existsSync(ENV_PATH)) return;
+  const upperKey = key.toUpperCase();
+  const content = readFileSync(ENV_PATH, 'utf-8');
+  const lines = content.split(/\r?\n/).filter(line => !new RegExp(`^${upperKey}=`).test(line));
+  writeFileSync(ENV_PATH, lines.join('\n').trimEnd() + '\n', { mode: 0o600 });
+}
+
 function cmdConfigSet(key: string, value: string): void {
   const upperKey = key.toUpperCase();
   upsertEnvValue(upperKey, value);
@@ -1053,8 +1061,23 @@ const BUDGET_ALIASES: Record<string, string> = {
   t2: 'BUDGET_CRON_T2_USD',
 };
 
-function isOneMillionContextEnabled(value: unknown): boolean {
-  return /^(0|false|no)$/i.test(String(value).trim());
+type OneMillionCliMode = 'auto' | 'off' | 'on';
+
+function normalizeOneMillionCliMode(value: unknown): OneMillionCliMode | null {
+  const v = String(value ?? '').trim().toLowerCase();
+  if (!v) return null;
+  if (v === 'auto') return 'auto';
+  if (['off', 'disable', 'disabled', 'safe', '200k', 'standard'].includes(v)) return 'off';
+  if (['on', 'enable', 'enabled', 'yes', 'true', '1'].includes(v)) return 'on';
+  return null;
+}
+
+function legacyDisableToOneMillionCliMode(value: unknown): OneMillionCliMode | null {
+  const v = String(value ?? '').trim().toLowerCase();
+  if (!v) return null;
+  if (['1', 'true', 'yes', 'on'].includes(v)) return 'off';
+  if (['0', 'false', 'no', 'off'].includes(v)) return 'on';
+  return null;
 }
 
 function normalizeBudgetKey(name: string): string | null {
@@ -1110,20 +1133,33 @@ async function cmdBudgetsShow(): Promise<void> {
     console.log(`  ${label.padEnd(12)} ${BOLD}${formatBudgetValue(entry?.value).padEnd(8)}${RESET} ${DIM}${key} from ${source}${RESET}`);
   }
 
+  const oneMModeEntry = byKey.get('CLEMENTINE_1M_CONTEXT_MODE');
+  const persistedOneMMode = readPersistedEnvValue('CLEMENTINE_1M_CONTEXT_MODE');
+  const oneMMode = normalizeOneMillionCliMode(persistedOneMMode ?? oneMModeEntry?.value)
+    ?? 'auto';
+  const oneMModeSource = persistedOneMMode !== undefined ? '.env' : oneMModeEntry?.source ?? 'default';
+
   const oneM = byKey.get('CLAUDE_CODE_DISABLE_1M_CONTEXT');
   const persistedOneM = readPersistedEnvValue('CLAUDE_CODE_DISABLE_1M_CONTEXT');
   const oneMValue = persistedOneM ?? oneM?.value;
   const oneMSource = persistedOneM !== undefined ? '.env' : oneM?.source ?? 'unknown';
-  const oneMEnabled = isOneMillionContextEnabled(oneMValue);
+  const legacyMode = legacyDisableToOneMillionCliMode(oneMValue);
   console.log();
-  console.log(`  1M context   ${oneMEnabled ? `${YELLOW}enabled${RESET}` : `${GREEN}disabled${RESET}`} ${DIM}CLAUDE_CODE_DISABLE_1M_CONTEXT=${String(oneMValue ?? '')} from ${oneMSource}${RESET}`);
-  if (oneMEnabled) {
-    console.log(`  ${YELLOW}Note:${RESET} 1M context requires an eligible plan or Claude Extra Usage; accounts without it will fail calls.`);
+  const modeColor = oneMMode === 'off' ? GREEN : oneMMode === 'on' ? YELLOW : BOLD;
+  console.log(`  1M context   ${modeColor}${oneMMode}${RESET} ${DIM}CLEMENTINE_1M_CONTEXT_MODE=${String(persistedOneMMode ?? oneMModeEntry?.value ?? 'auto')} from ${oneMModeSource}${RESET}`);
+  if (legacyMode && oneMModeEntry?.source === 'default') {
+    console.log(`               ${DIM}legacy CLAUDE_CODE_DISABLE_1M_CONTEXT=${String(oneMValue ?? '')} from ${oneMSource} maps to mode=${legacyMode}${RESET}`);
+  }
+  if (oneMMode === 'auto') {
+    console.log(`               ${DIM}allows included Opus 1M on Max/Team/Enterprise; keeps Sonnet on 200K unless mode=on${RESET}`);
+  } else if (oneMMode === 'on') {
+    console.log(`  ${YELLOW}Note:${RESET} forced 1M requires Extra Usage for Sonnet and for Pro subscriptions.`);
   }
   console.log();
   console.log(`  ${DIM}Useful commands:${RESET}`);
-  console.log(`    clementine budgets safe        ${DIM}lower background budgets and disable 1M context${RESET}`);
-  console.log(`    clementine budgets 1m on       ${DIM}enable 1M context for accounts with entitlement/Extra Usage${RESET}`);
+  console.log(`    clementine budgets safe        ${DIM}lower background budgets and force 200K context${RESET}`);
+  console.log(`    clementine budgets 1m auto     ${DIM}allow included Opus 1M, keep Sonnet safe${RESET}`);
+  console.log(`    clementine budgets 1m on       ${DIM}force 1M context for Extra Usage/API users${RESET}`);
   console.log(`    clementine budgets 1m off      ${DIM}disable 1M context for maximum compatibility${RESET}`);
   console.log(`    clementine budgets set chat 10 ${DIM}raise one budget cap${RESET}`);
   console.log();
@@ -1142,6 +1178,7 @@ async function cmdBudgetsSafe(): Promise<void> {
 
   const writes = [
     ...SAFE_BACKGROUND_BUDGETS,
+    { key: 'CLEMENTINE_1M_CONTEXT_MODE', value: 'off', label: '1M context mode' },
     { key: 'CLAUDE_CODE_DISABLE_1M_CONTEXT', value: '1', label: '1M context disabled' },
   ];
 
@@ -1166,25 +1203,37 @@ function cmdBudgetsOneMillion(mode: string): void {
   const normalized = mode.trim().toLowerCase();
   const on = new Set(['on', 'enable', 'enabled', 'yes', 'true', '1']);
   const off = new Set(['off', 'disable', 'disabled', 'no', 'false', '0']);
+  const auto = new Set(['auto', 'smart', 'default']);
 
-  if (!on.has(normalized) && !off.has(normalized)) {
-    console.error('  Usage: clementine budgets 1m <on|off>');
+  if (!on.has(normalized) && !off.has(normalized) && !auto.has(normalized)) {
+    console.error('  Usage: clementine budgets 1m <auto|on|off>');
     process.exitCode = 1;
     return;
   }
 
+  if (auto.has(normalized)) {
+    upsertEnvValue('CLEMENTINE_1M_CONTEXT_MODE', 'auto');
+    removeEnvValue('CLAUDE_CODE_DISABLE_1M_CONTEXT');
+    console.log();
+    console.log('  Set Claude 1M context mode to auto.');
+    console.log('  Opus can use included 1M on Max/Team/Enterprise; Sonnet stays on 200K unless you force mode=on. Restart Clementine to apply.');
+    console.log();
+    return;
+  }
+
   const enable = on.has(normalized);
+  upsertEnvValue('CLEMENTINE_1M_CONTEXT_MODE', enable ? 'on' : 'off');
   upsertEnvValue('CLAUDE_CODE_DISABLE_1M_CONTEXT', enable ? '0' : '1');
 
   if (enable) {
     console.log();
-    console.log('  Enabled Claude 1M context for Clementine.');
-    console.log('  Requires an eligible account or Claude Extra Usage; restart Clementine to apply.');
+    console.log('  Forced Claude 1M context on for Clementine.');
+    console.log('  Requires Extra Usage for Sonnet and Pro subscriptions, or API/PAYG billing. Restart Clementine to apply.');
     console.log();
   } else {
     console.log();
     console.log('  Disabled Claude 1M context for Clementine.');
-    console.log('  This is the safest default for users without Claude Extra Usage. Restart Clementine to apply.');
+    console.log('  This is the safest recovery mode for users hitting 1M entitlement errors. Restart Clementine to apply.');
     console.log();
   }
 }
@@ -2508,14 +2557,14 @@ budgetsCmd
 
 budgetsCmd
   .command('safe')
-  .description('Apply the stable local-safe preset: lower background budgets and disable 1M context')
+  .description('Apply the stable local-safe preset: lower background budgets and force 200K context')
   .action(async () => {
     await cmdBudgetsSafe();
   });
 
 budgetsCmd
   .command('1m <mode>')
-  .description('Toggle Claude 1M context for Clementine (on | off)')
+  .description('Set Claude 1M context mode for Clementine (auto | on | off)')
   .action(cmdBudgetsOneMillion);
 
 budgetsCmd

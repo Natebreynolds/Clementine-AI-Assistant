@@ -104,13 +104,22 @@ describe('runDoctor', () => {
     expect(r.findings.find(f => f.message.includes('exceeds BUDGET_CRON_T2_USD'))).toBeDefined();
   });
 
-  it('flags explicit 1M context enablement', () => {
+  it('flags legacy explicit 1M context enablement', () => {
     writeFileSync(path.join(baseDir, '.env'), 'CLAUDE_CODE_DISABLE_1M_CONTEXT=0\n');
     const r = runDoctor(baseDir);
     const finding = r.findings.find(f => f.key === 'CLAUDE_CODE_DISABLE_1M_CONTEXT');
     expect(finding).toBeDefined();
     expect(finding!.severity).toBe('warning');
-    expect(finding!.message).toContain('1M context is explicitly enabled');
+    expect(finding!.message).toContain('Legacy 1M context is explicitly enabled');
+  });
+
+  it('flags forced 1M mode', () => {
+    writeFileSync(path.join(baseDir, '.env'), 'CLEMENTINE_1M_CONTEXT_MODE=on\n');
+    const r = runDoctor(baseDir);
+    const finding = r.findings.find(f => f.key === 'CLEMENTINE_1M_CONTEXT_MODE');
+    expect(finding).toBeDefined();
+    expect(finding!.severity).toBe('warning');
+    expect(finding!.message).toContain('1M context is forced on');
   });
 
   it('flags stale high background budgets', () => {
@@ -131,11 +140,13 @@ describe('runDoctor', () => {
     );
     const result = applyDoctorFixes(baseDir);
     expect(result.changed.map(f => f.key)).toEqual([
+      'CLEMENTINE_1M_CONTEXT_MODE',
       'CLAUDE_CODE_DISABLE_1M_CONTEXT',
       'BUDGET_CRON_T1_USD',
       'BUDGET_CRON_T2_USD',
     ]);
     const env = readFileSync(path.join(baseDir, '.env'), 'utf-8');
+    expect(env).toContain('CLEMENTINE_1M_CONTEXT_MODE=off');
     expect(env).toContain('CLAUDE_CODE_DISABLE_1M_CONTEXT=1');
     expect(env).toContain('BUDGET_CRON_T1_USD=0.75');
     expect(env).toContain('BUDGET_CRON_T2_USD=1.5');
@@ -148,8 +159,10 @@ describe('runDoctor', () => {
     const result = applyDoctorFixes(baseDir);
 
     expect(result.skipped).toEqual([]);
+    expect(result.changed.map(f => f.key)).toContain('CLEMENTINE_1M_CONTEXT_MODE');
     expect(result.changed.map(f => f.key)).toContain('CLAUDE_CODE_DISABLE_1M_CONTEXT');
     const env = readFileSync(path.join(baseDir, '.env'), 'utf-8');
+    expect(env).toContain('CLEMENTINE_1M_CONTEXT_MODE=off');
     expect(env).toContain('CLAUDE_CODE_DISABLE_1M_CONTEXT=1');
   });
 

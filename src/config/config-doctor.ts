@@ -68,6 +68,7 @@ const NUMERIC_KEYS = new Set([
 const ENUM_KEYS: Record<string, readonly string[]> = {
   CLEMENTINE_ADVISOR_RULES_LOADER: ['off', 'shadow', 'primary'],
   DEFAULT_MODEL_TIER: ['haiku', 'sonnet', 'opus'],
+  CLEMENTINE_1M_CONTEXT_MODE: ['auto', 'off', 'on'],
   WEBHOOK_ENABLED: ['true', 'false'],
   ALLOW_ALL_USERS: ['true', 'false'],
   CLEMENTINE_ALLOW_SOURCE_EDITS: ['true', 'false', '1', '0', 'yes', 'no'],
@@ -159,12 +160,18 @@ export function applyDoctorFixes(baseDir: string): DoctorFixResult {
     changed.push({ key, value, reason });
   };
 
+  const oneMMode = byKey.get('CLEMENTINE_1M_CONTEXT_MODE');
   const oneM = byKey.get('CLAUDE_CODE_DISABLE_1M_CONTEXT');
-  if (oneM && isFalseyToggle(oneM.value)) {
+  if ((oneMMode && String(oneMMode.value).toLowerCase() === 'on') || (oneM && isFalseyToggle(oneM.value))) {
+    setSafeValue(
+      'CLEMENTINE_1M_CONTEXT_MODE',
+      'off',
+      'Force standard 200K context until the account is confirmed stable.',
+    );
     setSafeValue(
       'CLAUDE_CODE_DISABLE_1M_CONTEXT',
       '1',
-      'Disable Claude Code 1M context beta unless the account explicitly has Extra Usage.',
+      'Disable Claude Code 1M context for backward compatibility with older Claude Code versions.',
     );
   }
 
@@ -336,16 +343,29 @@ function checkOperationalOverrides(cfg: EffectiveConfig, baseDir: string, findin
   const byKey = new Map(cfg.entries.map(e => [e.key, e]));
   const persistedEnv = readEnvValues(baseDir);
 
+  const oneMMode = byKey.get('CLEMENTINE_1M_CONTEXT_MODE');
+  if (oneMMode && oneMMode.source !== 'default' && String(oneMMode.value).toLowerCase() === 'on') {
+    findings.push({
+      severity: 'warning',
+      key: 'CLEMENTINE_1M_CONTEXT_MODE',
+      message: `1M context is forced on from ${oneMMode.source}. Sonnet 1M requires Claude Extra Usage, and Pro subscriptions require Extra Usage for both Sonnet and Opus 1M.`,
+      fix: 'clementine budgets 1m auto   # smart mode, or clementine budgets safe for recovery',
+    });
+  }
+
   const oneM = byKey.get('CLAUDE_CODE_DISABLE_1M_CONTEXT');
-  if (oneM && oneM.source !== 'default' && isFalseyToggle(oneM.value)) {
+  if (oneM
+    && oneM.source !== 'default'
+    && isFalseyToggle(oneM.value)
+    && (!oneMMode || oneMMode.source === 'default')) {
     const source = oneM.source === 'process.env' && persistedEnv.CLAUDE_CODE_DISABLE_1M_CONTEXT !== undefined
       ? '.env'
       : oneM.source;
     findings.push({
       severity: 'warning',
       key: 'CLAUDE_CODE_DISABLE_1M_CONTEXT',
-      message: `1M context is explicitly enabled from ${source}. Accounts without Claude Extra Usage will fail every call with "Extra usage is required for 1M context."`,
-      fix: 'clementine config doctor --fix   # sets CLAUDE_CODE_DISABLE_1M_CONTEXT=1',
+      message: `Legacy 1M context is explicitly enabled from ${source}. Sonnet 1M requires Extra Usage and can fail calls with "Extra usage is required for 1M context."`,
+      fix: 'clementine budgets 1m auto   # smart mode, or clementine budgets safe for recovery',
     });
   }
 

@@ -37,30 +37,103 @@ function readEnvFile(): Record<string, string> {
 
 const env = readEnvFile();
 
-// ── Claude Code CLI runtime env propagation ─────────────────────────
+// ── Claude Code 1M context mode ─────────────────────────────────────
 //
-// The Claude Code CLI binary bundled inside @anthropic-ai/claude-agent-sdk
-// auto-attaches the `context-1m-2025-08-07` beta header for any model that
-// supports a 1M context (Sonnet 4.6, Opus 4.6/4.7, etc.). On accounts
-// without the "extra usage" entitlement, every API call then fails with
-// "Extra usage is required for 1M context."
+// Claude Code's May 2026 behavior is plan/model-specific:
+//   - Opus 1M is included for Max, Team, and Enterprise subscription auth.
+//   - Sonnet 1M requires Extra Usage on subscription auth.
+//   - API/PAYG can use 1M through API billing.
 //
-// We don't ask for 1M anywhere in our code, but the CLI does on its own.
-// The CLI honors CLAUDE_CODE_DISABLE_1M_CONTEXT — when truthy, the auto-
-// enable path is skipped and the standard 200K context is used.
+// Clementine therefore uses a higher-level mode instead of blindly forcing
+// CLAUDE_CODE_DISABLE_1M_CONTEXT for every SDK subprocess:
+//   auto  (default): allow Opus to receive Claude Code's included 1M upgrade,
+//                    but keep Sonnet/Haiku on the standard 200K path.
+//   off:              force 200K everywhere; best recovery/safe mode.
+//   on:               allow 1M everywhere; only for Extra Usage/API users.
 //
-// Default to disabled here so users without extra usage stop hitting the
-// gate. Anyone who has paid for / been entitled to 1M can opt back in by
-// setting CLAUDE_CODE_DISABLE_1M_CONTEXT=0 in their .env.
-{
-  const userPref = env['CLAUDE_CODE_DISABLE_1M_CONTEXT'] ?? process.env.CLAUDE_CODE_DISABLE_1M_CONTEXT;
-  if (userPref === undefined || userPref === '') {
-    process.env.CLAUDE_CODE_DISABLE_1M_CONTEXT = '1';
-  } else {
-    // Propagate the user's explicit choice from .env into process.env so the
-    // spawned CLI subprocess inherits it.
-    process.env.CLAUDE_CODE_DISABLE_1M_CONTEXT = userPref;
-  }
+// The legacy CLAUDE_CODE_DISABLE_1M_CONTEXT key is still honored when the new
+// mode is absent, so existing installs keep their previous behavior.
+export type OneMillionContextMode = 'auto' | 'off' | 'on';
+
+function normalizeOneMillionContextMode(value: unknown): OneMillionContextMode | null {
+  const v = String(value ?? '').trim().toLowerCase();
+  if (!v) return null;
+  if (v === 'auto') return 'auto';
+  if (['off', 'disable', 'disabled', 'safe', '200k', 'standard'].includes(v)) return 'off';
+  if (['on', 'enable', 'enabled', 'yes', 'true', '1'].includes(v)) return 'on';
+  return null;
+}
+
+function legacyDisableToOneMillionContextMode(value: unknown): OneMillionContextMode | null {
+  const v = String(value ?? '').trim().toLowerCase();
+  if (!v) return null;
+  if (['1', 'true', 'yes', 'on'].includes(v)) return 'off';
+  if (['0', 'false', 'no', 'off'].includes(v)) return 'on';
+  return null;
+}
+
+const oneMillionModePref = env['CLEMENTINE_1M_CONTEXT_MODE'] ?? process.env.CLEMENTINE_1M_CONTEXT_MODE;
+const legacyOneMillionPref = env['CLAUDE_CODE_DISABLE_1M_CONTEXT'] ?? process.env.CLAUDE_CODE_DISABLE_1M_CONTEXT;
+
+export const CLEMENTINE_1M_CONTEXT_MODE: OneMillionContextMode =
+  normalizeOneMillionContextMode(oneMillionModePref)
+  ?? legacyDisableToOneMillionContextMode(legacyOneMillionPref)
+  ?? 'auto';
+
+if (CLEMENTINE_1M_CONTEXT_MODE === 'off') {
+  process.env.CLAUDE_CODE_DISABLE_1M_CONTEXT = '1';
+} else if (CLEMENTINE_1M_CONTEXT_MODE === 'on') {
+  process.env.CLAUDE_CODE_DISABLE_1M_CONTEXT = '0';
+} else if (oneMillionModePref !== undefined) {
+  // Explicit auto mode should override stale shell/package env inherited from
+  // older installs. Per-query SDK options decide whether to disable 1M.
+  delete process.env.CLAUDE_CODE_DISABLE_1M_CONTEXT;
+}
+
+function modelFamily(model: string | null | undefined): 'opus' | 'sonnet' | 'haiku' | 'opusplan' | 'other' {
+  const m = String(model ?? '').toLowerCase();
+  if (m.includes('opusplan')) return 'opusplan';
+  if (m.includes('opus')) return 'opus';
+  if (m.includes('sonnet')) return 'sonnet';
+  if (m.includes('haiku')) return 'haiku';
+  return 'other';
+}
+
+export function currentOneMillionContextMode(): OneMillionContextMode {
+  return normalizeOneMillionContextMode(process.env.CLEMENTINE_1M_CONTEXT_MODE)
+    ?? CLEMENTINE_1M_CONTEXT_MODE;
+}
+
+export function claudeCodeDisableOneMillionForModel(
+  model: string | null | undefined,
+  mode: OneMillionContextMode = currentOneMillionContextMode(),
+): '1' | '0' | undefined {
+  if (mode === 'off') return '1';
+  if (mode === 'on') return '0';
+  return modelFamily(model) === 'opus' ? undefined : '1';
+}
+
+export function normalizeClaudeModelForOneMillionContext(
+  model: string,
+  mode: OneMillionContextMode = currentOneMillionContextMode(),
+): string {
+  if (mode === 'on') return model;
+  const family = modelFamily(model);
+  const shouldStrip = mode === 'off'
+    || family === 'sonnet'
+    || family === 'haiku'
+    || family === 'opusplan';
+  return shouldStrip ? model.replace(/\[1m\]/ig, '') : model;
+}
+
+export function usesOneMillionContext(
+  model: string | null | undefined,
+  mode: OneMillionContextMode = currentOneMillionContextMode(),
+): boolean {
+  if (mode === 'off') return false;
+  const family = modelFamily(model);
+  if (mode === 'on') return family === 'opus' || family === 'sonnet';
+  return family === 'opus';
 }
 
 // ── Keychain-ref resolution (lazy, cached) ──────────────────────────

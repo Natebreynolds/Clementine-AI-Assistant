@@ -5319,10 +5319,12 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
 	        { key: 'OWNER_NAME', label: 'Owner Name', hint: 'Your name (used in prompts)' },
 	      ],
 	    },
-	    {
+    {
 	      label: 'Model',
       keys: [
         { key: 'DEFAULT_MODEL_TIER', label: 'Default Tier', hint: 'haiku, sonnet, or opus', type: 'select:haiku,sonnet,opus' },
+        { key: 'CLEMENTINE_1M_CONTEXT_MODE', label: '1M Context Mode', hint: 'auto allows included Opus 1M where available; off forces 200K; on forces 1M', type: 'select:auto,off,on' },
+        { key: 'CLAUDE_CODE_DISABLE_1M_CONTEXT', label: 'Legacy 1M Disable', hint: 'Backward-compatible Claude Code switch. Prefer CLEMENTINE_1M_CONTEXT_MODE.', type: 'select:,1,0,true,false' },
       ],
     },
     {
@@ -5447,16 +5449,55 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
     return result;
   }
 
-	  function writeEnvValue(key: string, value: string): void {
-	    let content = existsSync(ENV_PATH) ? readFileSync(ENV_PATH, 'utf-8') : '';
-	    const re = new RegExp(`^${key}=.*$`, 'm');
+  function writeEnvValue(key: string, value: string): void {
+    mkdirSync(BASE_DIR, { recursive: true });
+    let content = existsSync(ENV_PATH) ? readFileSync(ENV_PATH, 'utf-8') : '';
+    const re = new RegExp(`^${key}=.*$`, 'm');
     if (re.test(content)) {
       content = content.replace(re, `${key}=${value}`);
     } else {
       content = content.trimEnd() + `\n${key}=${value}\n`;
     }
-	    writeFileSync(ENV_PATH, content);
-	  }
+    writeFileSync(ENV_PATH, content, { mode: 0o600 });
+  }
+
+  function deleteEnvValue(key: string): void {
+    if (!existsSync(ENV_PATH)) return;
+    const re = new RegExp(`^${key}=.*\n?`, 'm');
+    const content = readFileSync(ENV_PATH, 'utf-8').replace(re, '');
+    writeFileSync(ENV_PATH, content, { mode: 0o600 });
+  }
+
+  const SAFE_DASHBOARD_BUDGETS = [
+    { key: 'BUDGET_HEARTBEAT_USD', value: '0.25', label: 'Heartbeat' },
+    { key: 'BUDGET_CRON_T1_USD', value: '0.75', label: 'Tier 1 cron' },
+    { key: 'BUDGET_CRON_T2_USD', value: '1.5', label: 'Tier 2 cron' },
+  ] as const;
+
+  type DashboardOneMillionMode = 'auto' | 'off' | 'on';
+
+  function normalizeDashboardOneMillionMode(value: unknown): DashboardOneMillionMode | null {
+    const v = String(value ?? '').trim().toLowerCase();
+    if (!v) return null;
+    if (v === 'auto') return 'auto';
+    if (['off', 'disable', 'disabled', 'safe', '200k', 'standard'].includes(v)) return 'off';
+    if (['on', 'enable', 'enabled', 'yes', 'true', '1'].includes(v)) return 'on';
+    return null;
+  }
+
+  function legacyDisableToDashboardMode(value: unknown): DashboardOneMillionMode | null {
+    const v = String(value ?? '').trim().toLowerCase();
+    if (!v) return null;
+    if (['1', 'true', 'yes', 'on'].includes(v)) return 'off';
+    if (['0', 'false', 'no', 'off'].includes(v)) return 'on';
+    return null;
+  }
+
+  function formatDashboardBudgetValue(value: unknown): string {
+    const n = Number(value);
+    if (!Number.isFinite(n)) return String(value ?? '');
+    return `$${n.toFixed(2)}`;
+  }
 
 	  const ASSISTANT_PREF_OPTIONS = {
 	    proactivity: ['quiet', 'balanced', 'proactive', 'operator'],
@@ -5511,6 +5552,142 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
 	      res.status(500).json({ error: String(err) });
 	    }
 	  });
+
+  app.get('/api/budgets', async (_req, res) => {
+    try {
+      const [{ computeEffectiveConfig }, { runDoctor }] = await Promise.all([
+        import('../config/effective-config.js'),
+        import('../config/config-doctor.js'),
+      ]);
+      const cfg = computeEffectiveConfig(BASE_DIR);
+      const doctor = runDoctor(BASE_DIR);
+      const byKey = new Map(cfg.entries.map(e => [e.key, e]));
+      const rows = [
+        { label: 'Chat', key: 'BUDGET_CHAT_USD' },
+        { label: 'Heartbeat', key: 'BUDGET_HEARTBEAT_USD' },
+        { label: 'Tier 1 cron', key: 'BUDGET_CRON_T1_USD' },
+        { label: 'Tier 2 cron', key: 'BUDGET_CRON_T2_USD' },
+      ];
+      const oneMModeEntry = byKey.get('CLEMENTINE_1M_CONTEXT_MODE');
+      const legacyEntry = byKey.get('CLAUDE_CODE_DISABLE_1M_CONTEXT');
+      const legacyMode = legacyDisableToDashboardMode(legacyEntry?.value);
+      const mode = normalizeDashboardOneMillionMode(oneMModeEntry?.value)
+        ?? legacyMode
+        ?? 'auto';
+      const source = oneMModeEntry?.source !== 'default'
+        ? oneMModeEntry?.source
+        : legacyMode
+          ? legacyEntry?.source ?? 'default'
+          : oneMModeEntry?.source ?? 'default';
+      const summary = mode === 'off'
+        ? 'Recovery mode: all models stay on standard 200K context.'
+        : mode === 'on'
+          ? 'Forced 1M: Sonnet and Pro subscriptions may require Claude Extra Usage.'
+          : 'Smart auto: Opus can use included 1M on eligible Max/Team/Enterprise accounts; Sonnet stays on 200K.';
+      const relevantKeys = new Set([
+        'BUDGET_CHAT_USD',
+        'BUDGET_HEARTBEAT_USD',
+        'BUDGET_CRON_T1_USD',
+        'BUDGET_CRON_T2_USD',
+        'CLEMENTINE_1M_CONTEXT_MODE',
+        'CLAUDE_CODE_DISABLE_1M_CONTEXT',
+      ]);
+      const findings = doctor.findings
+        .filter(f => (f.key && relevantKeys.has(f.key)) || /budget|credit|1m|context/i.test(f.message))
+        .slice(0, 8);
+
+      res.json({
+        ok: true,
+        baseDir: cfg.baseDir,
+        budgets: rows.map(row => {
+          const entry = byKey.get(row.key);
+          return {
+            label: row.label,
+            key: row.key,
+            value: entry?.value ?? '',
+            displayValue: formatDashboardBudgetValue(entry?.value),
+            source: entry?.source ?? 'unknown',
+          };
+        }),
+        context: {
+          mode,
+          source,
+          summary,
+          modeValue: oneMModeEntry?.value ?? 'auto',
+          legacyValue: legacyEntry?.value ?? '',
+          legacySource: legacyEntry?.source ?? 'default',
+          legacyMode,
+        },
+        findings,
+        counts: doctor.counts,
+      });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  app.post('/api/budgets/safe', (_req, res) => {
+    try {
+      for (const item of SAFE_DASHBOARD_BUDGETS) {
+        writeEnvValue(item.key, item.value);
+        process.env[item.key] = item.value;
+      }
+      writeEnvValue('CLEMENTINE_1M_CONTEXT_MODE', 'off');
+      writeEnvValue('CLAUDE_CODE_DISABLE_1M_CONTEXT', '1');
+      process.env.CLEMENTINE_1M_CONTEXT_MODE = 'off';
+      process.env.CLAUDE_CODE_DISABLE_1M_CONTEXT = '1';
+      res.json({
+        ok: true,
+        message: 'Applied safe budgets and 200K recovery mode. Restart Clementine to apply to running chat workers.',
+      });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  app.post('/api/budgets/1m', (req, res) => {
+    try {
+      const mode = normalizeDashboardOneMillionMode((req.body as Record<string, unknown>)?.mode);
+      if (!mode) {
+        res.status(400).json({ error: 'mode must be auto, off, or on' });
+        return;
+      }
+      writeEnvValue('CLEMENTINE_1M_CONTEXT_MODE', mode);
+      process.env.CLEMENTINE_1M_CONTEXT_MODE = mode;
+      if (mode === 'auto') {
+        deleteEnvValue('CLAUDE_CODE_DISABLE_1M_CONTEXT');
+        delete process.env.CLAUDE_CODE_DISABLE_1M_CONTEXT;
+      } else {
+        const legacyValue = mode === 'on' ? '0' : '1';
+        writeEnvValue('CLAUDE_CODE_DISABLE_1M_CONTEXT', legacyValue);
+        process.env.CLAUDE_CODE_DISABLE_1M_CONTEXT = legacyValue;
+      }
+      const message = mode === 'auto'
+        ? 'Set 1M context to smart auto. Restart Clementine to apply everywhere.'
+        : mode === 'off'
+          ? 'Disabled 1M context for recovery. Restart Clementine to apply everywhere.'
+          : 'Forced 1M context on. Sonnet and Pro subscriptions may require Claude Extra Usage.';
+      res.json({ ok: true, message });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  app.post('/api/budgets/doctor-fix', async (_req, res) => {
+    try {
+      const { applyDoctorFixes } = await import('../config/config-doctor.js');
+      const result = applyDoctorFixes(BASE_DIR);
+      for (const item of result.changed) {
+        process.env[item.key] = item.value;
+      }
+      const message = result.changed.length
+        ? `Applied ${result.changed.length} config fix${result.changed.length === 1 ? '' : 'es'}. Restart Clementine to apply everywhere.`
+        : 'No budget or context fixes were needed.';
+      res.json({ ok: true, message, result });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
 
 	  app.get('/api/settings', (_req, res) => {
     try {
@@ -5602,10 +5779,7 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
         res.status(404).json({ error: '.env file not found' });
         return;
       }
-      let content = readFileSync(ENV_PATH, 'utf-8');
-      const re = new RegExp(`^${key}=.*\n?`, 'm');
-      content = content.replace(re, '');
-      writeFileSync(ENV_PATH, content);
+      deleteEnvValue(key);
 
       // Hot-reload mirror of the PUT handler — drop process.env entry +
       // reset Composio client so removal takes effect without a restart.
@@ -15030,6 +15204,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
             <p style="color:var(--text-muted);margin:0">Manage API keys and configuration. Changes are saved to <code>~/.clementine/.env</code>.</p>
             <button class="btn-sm" style="white-space:nowrap;background:var(--bg-tertiary);border:1px solid var(--border);color:var(--text-primary);padding:6px 12px;border-radius:6px;cursor:pointer" onclick="restartDashboard()">Restart Dashboard</button>
           </div>
+          <div id="budget-health-content" style="margin-bottom:16px"><div class="empty-state">Loading budget health...</div></div>
           <div id="settings-content"><div class="empty-state">Loading settings...</div></div>
         </div>
         <div class="tab-pane" id="tab-settings-remote">
@@ -19578,8 +19753,119 @@ async function listenToDigest() {
   } catch(e) { toast(String(e), 'error'); }
 }
 
+async function refreshBudgetHealth() {
+  var container = document.getElementById('budget-health-content');
+  if (!container) return;
+  try {
+    var r = await apiFetch('/api/budgets');
+    var d = await r.json();
+    if (!d.ok) {
+      container.innerHTML = '<div class="empty-state" style="color:var(--red)">Failed to load budget health: ' + esc(d.error || 'Unknown error') + '</div>';
+      return;
+    }
+    var context = d.context || {};
+    var mode = context.mode || 'auto';
+    var modeClass = mode === 'off' ? 'badge-green' : mode === 'on' ? 'badge-yellow' : 'badge-blue';
+    var rows = d.budgets || [];
+    var findings = d.findings || [];
+    var html = '<div class="card">'
+      + '<div class="card-header" style="display:flex;align-items:center;justify-content:space-between;gap:12px">'
+      + '<div style="display:flex;align-items:center;gap:8px"><span>Budget &amp; Context Health</span><span class="badge ' + modeClass + '" style="font-size:10px">1M ' + esc(mode) + '</span></div>'
+      + '<div style="display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end">'
+      + '<button class="btn-sm btn-primary" onclick="applySafeBudgetPreset()">Safe Recovery</button>'
+      + '<button class="btn-sm" onclick="setBudgetContextMode(\\x27auto\\x27)">Smart Auto</button>'
+      + '<button class="btn-sm" onclick="setBudgetContextMode(\\x27off\\x27)">Force 200K</button>'
+      + '<button class="btn-sm" onclick="forceBudgetOneMillion()">Force 1M</button>'
+      + '<button class="btn-sm" onclick="applyBudgetDoctorFix()">Doctor Fix</button>'
+      + '</div></div>'
+      + '<div class="card-body" style="padding:16px">';
+    html += '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-bottom:12px">';
+    for (var i = 0; i < rows.length; i++) {
+      var row = rows[i];
+      html += '<div style="border:1px solid var(--border);border-radius:8px;padding:10px;background:var(--bg-secondary)">'
+        + '<div style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0">' + esc(row.label) + '</div>'
+        + '<div style="font-weight:700;font-size:18px;margin-top:4px">' + esc(row.displayValue || row.value || '') + '</div>'
+        + '<div style="font-size:11px;color:var(--text-muted);margin-top:2px">' + esc(row.key) + ' from ' + esc(row.source || 'unknown') + '</div>'
+        + '</div>';
+    }
+    html += '</div>';
+    html += '<div style="display:flex;gap:10px;align-items:flex-start;flex-wrap:wrap;margin-bottom:12px">'
+      + '<div style="flex:1;min-width:240px;border:1px solid var(--border);border-radius:8px;padding:10px;background:var(--bg-primary)">'
+      + '<div style="font-weight:600;font-size:13px">1M context mode</div>'
+      + '<div style="font-size:12px;color:var(--text-secondary);margin-top:4px">' + esc(context.summary || '') + '</div>'
+      + '<div style="font-size:11px;color:var(--text-muted);margin-top:6px">Source: ' + esc(context.source || 'default')
+      + (context.legacyValue ? ' | legacy CLAUDE_CODE_DISABLE_1M_CONTEXT=' + esc(context.legacyValue) + ' from ' + esc(context.legacySource || 'default') : '')
+      + '</div></div>'
+      + '<div style="flex:1;min-width:240px;border:1px solid var(--border);border-radius:8px;padding:10px;background:var(--bg-primary)">'
+      + '<div style="font-weight:600;font-size:13px">What this protects</div>'
+      + '<div style="font-size:12px;color:var(--text-secondary);margin-top:4px">Safe Recovery lowers autonomous spend and disables 1M context for accounts seeing credit or entitlement errors.</div>'
+      + '<div style="font-size:11px;color:var(--text-muted);margin-top:6px">Restart the daemon after changing budgets or context mode.</div>'
+      + '</div></div>';
+    if (findings.length) {
+      html += '<div style="border-top:1px solid var(--border);padding-top:10px">'
+        + '<div style="font-weight:600;font-size:13px;margin-bottom:6px">Potential causes</div>';
+      for (var j = 0; j < findings.length; j++) {
+        var f = findings[j];
+        var cls = f.severity === 'error' ? 'badge-red' : f.severity === 'warning' ? 'badge-yellow' : 'badge-gray';
+        html += '<div style="display:flex;gap:8px;align-items:flex-start;padding:6px 0;border-bottom:1px solid rgba(127,127,127,0.12)">'
+          + '<span class="badge ' + cls + '" style="font-size:10px;min-width:54px;text-align:center">' + esc(f.severity || 'info') + '</span>'
+          + '<div style="font-size:12px;color:var(--text-secondary);line-height:1.4">'
+          + (f.key ? '<code>' + esc(f.key) + '</code>: ' : '') + esc(f.message || '')
+          + (f.fix ? '<div style="font-size:11px;color:var(--text-muted);margin-top:2px">Fix: <code>' + esc(f.fix) + '</code></div>' : '')
+          + '</div></div>';
+      }
+      html += '</div>';
+    } else {
+      html += '<div style="font-size:12px;color:var(--text-muted);border-top:1px solid var(--border);padding-top:10px">No budget or context warnings found.</div>';
+    }
+    html += '</div></div>';
+    container.innerHTML = html;
+  } catch(e) {
+    container.innerHTML = '<div class="empty-state" style="color:var(--red)">Failed to load budget health: ' + esc(String(e)) + '</div>';
+  }
+}
+
+async function postBudgetAction(url, body) {
+  try {
+    var r = await apiFetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body || {}),
+    });
+    var d = await r.json();
+    if (d.ok) toast(d.message || 'Updated', 'success');
+    else toast(d.error || 'Error', 'error');
+    await refreshBudgetHealth();
+    return d;
+  } catch(e) {
+    toast(String(e), 'error');
+    return null;
+  }
+}
+
+async function applySafeBudgetPreset() {
+  await postBudgetAction('/api/budgets/safe', {});
+  refreshSettings();
+}
+
+async function setBudgetContextMode(mode) {
+  await postBudgetAction('/api/budgets/1m', { mode: mode });
+  refreshSettings();
+}
+
+async function forceBudgetOneMillion() {
+  if (!confirm('Force 1M context on? Sonnet and Pro subscriptions may require Claude Extra Usage.')) return;
+  await setBudgetContextMode('on');
+}
+
+async function applyBudgetDoctorFix() {
+  await postBudgetAction('/api/budgets/doctor-fix', {});
+  refreshSettings();
+}
+
 async function refreshSettings() {
   var container = document.getElementById('settings-content');
+  refreshBudgetHealth();
   try {
     var r = await apiFetch('/api/settings');
     var d = await r.json();

@@ -56,6 +56,10 @@ import {
   IDENTITY_FILE,
   CLAUDE_CODE_OAUTH_TOKEN,
   ANTHROPIC_API_KEY as CONFIG_ANTHROPIC_API_KEY,
+  claudeCodeDisableOneMillionForModel,
+  currentOneMillionContextMode,
+  normalizeClaudeModelForOneMillionContext,
+  usesOneMillionContext,
   envSnapshot,
 } from '../config.js';
 import { summarizeIntegrationStatus } from '../config/integrations-registry.js';
@@ -385,6 +389,7 @@ const MODEL_CONTEXT_WINDOWS: Record<string, number> = {
 };
 
 function getContextWindow(model: string): number {
+  if (usesOneMillionContext(model)) return 1_000_000;
   for (const [family, size] of Object.entries(MODEL_CONTEXT_WINDOWS)) {
     if (model.includes(family)) return size;
   }
@@ -401,11 +406,6 @@ function resultInputTokens(result: SDKResultMessage): number {
     total += usage.cacheCreationInputTokens ?? 0;
   }
   return total;
-}
-
-function oneMillionContextDisabled(): boolean {
-  const value = process.env.CLAUDE_CODE_DISABLE_1M_CONTEXT;
-  return value === undefined || !/^(0|false|no)$/i.test(value);
 }
 
 export function looksLikeOneMillionContextError(value: unknown): boolean {
@@ -627,13 +627,6 @@ function buildSafeEnv(): Record<string, string> {
     sanitized.ANTHROPIC_API_KEY = apiKeyVal;
   }
   // When all are absent: HOME lets the subprocess find Keychain OAuth automatically.
-
-  // Preserve trusted Claude Code runtime flags set by config.ts. In
-  // particular, CLAUDE_CODE_DISABLE_1M_CONTEXT defaults on so background
-  // helper queries do not silently re-enable the 1M context beta.
-  if (process.env.CLAUDE_CODE_DISABLE_1M_CONTEXT !== undefined) {
-    sanitized.CLAUDE_CODE_DISABLE_1M_CONTEXT = process.env.CLAUDE_CODE_DISABLE_1M_CONTEXT;
-  }
 
   // Step 3: Add trusted markers AFTER sanitization
   sanitized.CLEMENTINE_HOME = BASE_DIR;
@@ -2403,7 +2396,10 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
       && toolsDisabledForCall
       && turnPolicy?.retrievalTier === 'none'
       && turnPolicy.effort === 'low';
-    const resolvedModel = resolveModel(requestedModel) ?? (lightweightModelEligible ? MODELS.haiku : MODEL);
+    const rawResolvedModel = resolveModel(requestedModel) ?? (lightweightModelEligible ? MODELS.haiku : MODEL);
+    const resolvedModel = normalizeClaudeModelForOneMillionContext(rawResolvedModel);
+    const oneMillionModeValue = currentOneMillionContextMode();
+    const oneMillionDisableValue = claudeCodeDisableOneMillionForModel(resolvedModel);
     const modelRouteReason = model
       ? 'explicit'
       : profile?.model
@@ -2694,7 +2690,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
       systemPrompt: fullSystemPrompt,
       model: resolvedModel,
       ...(fallback ? { fallbackModel: fallback } : {}),
-      ...(oneMillionContextDisabled() ? { betas: [] } : {}),
+      ...(oneMillionDisableValue === '1' ? { betas: [] } : {}),
       permissionMode: effectivePermissionMode as 'bypassPermissions' | 'auto',
       allowDangerouslySkipPermissions: true,
       ...(sessionStore ? { sessionStore } : {}),
@@ -2732,6 +2728,10 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
               CLEMENTINE_TEAM_AGENT: profile?.slug ?? 'clementine',
               CLEMENTINE_INTERACTION_SOURCE: sourceOverride ?? inferInteractionSource(sessionKey),
               CLEMENTINE_TOOL_ALLOWLIST: clementineToolAllowlist,
+              CLEMENTINE_1M_CONTEXT_MODE: oneMillionModeValue,
+              ...(oneMillionDisableValue !== undefined
+                ? { CLAUDE_CODE_DISABLE_1M_CONTEXT: oneMillionDisableValue }
+                : {}),
             },
           },
           ...externalMcpServers,
@@ -2745,14 +2745,21 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
       // env only when the prompt/job mentions a connector-backed service.
       // Per-MCP-server env isolation still happens inside each mcpServers
       // entry; this only affects the Claude Code subprocess itself.
-      ...(shouldInheritClaudeEnv ? {} : {
-        env: {
+      env: shouldInheritClaudeEnv
+        ? {
+          ...process.env,
+          CLEMENTINE_1M_CONTEXT_MODE: oneMillionModeValue,
+          ...(oneMillionDisableValue !== undefined
+            ? { CLAUDE_CODE_DISABLE_1M_CONTEXT: oneMillionDisableValue }
+            : {}),
+        }
+        : {
           ...SAFE_ENV,
-          ...(process.env.CLAUDE_CODE_DISABLE_1M_CONTEXT !== undefined
-            ? { CLAUDE_CODE_DISABLE_1M_CONTEXT: process.env.CLAUDE_CODE_DISABLE_1M_CONTEXT }
+          CLEMENTINE_1M_CONTEXT_MODE: oneMillionModeValue,
+          ...(oneMillionDisableValue !== undefined
+            ? { CLAUDE_CODE_DISABLE_1M_CONTEXT: oneMillionDisableValue }
             : {}),
         },
-      }),
       // Avoid ambient Claude Code user/project/local settings and plugins by
       // default. Those can silently attach hundreds of tools. Explicit MCP
       // servers above still work; "all integrations/full tool surface" keeps
@@ -3769,6 +3776,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
                       'Claude says the account credit balance is too low. I paused background jobs for a few hours so they stop draining/retrying, but interactive chat will also fail until credits are available again.'
                     );
                   } else if (looksLikeOneMillionContextError(errorText)) {
+                    process.env.CLEMENTINE_1M_CONTEXT_MODE = 'off';
                     process.env.CLAUDE_CODE_DISABLE_1M_CONTEXT = '1';
                     if (sessionKey) {
                       this.sessions.delete(sessionKey);
@@ -3776,7 +3784,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
                       this._compactedSessions.delete(sessionKey);
                     }
                     responseText = responseText || (
-                      "Claude rejected the 1M context beta for this account. I've disabled 1M context for this process and reset the session. To persist the fix across restarts, run `clementine config doctor --fix`, then `clementine restart`."
+                      "Claude rejected 1M context for this account. I've switched this process to 200K recovery mode and reset the session. To persist the fix across restarts, run `clementine budgets safe`, then `clementine restart`."
                     );
                   } else if (lower.includes('rate') && lower.includes('limit')) {
                     hitRateLimit = true;
@@ -3883,6 +3891,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
               'Claude says the account credit balance is too low. I paused background jobs for a few hours so they stop draining/retrying, but interactive chat will also fail until credits are available again.'
             );
           } else if (looksLikeOneMillionContextError(e)) {
+            process.env.CLEMENTINE_1M_CONTEXT_MODE = 'off';
             process.env.CLAUDE_CODE_DISABLE_1M_CONTEXT = '1';
             if (sessionKey) {
               this.sessions.delete(sessionKey);
@@ -3890,7 +3899,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
               this._compactedSessions.delete(sessionKey);
             }
             responseText = responseText || (
-              "Claude rejected the 1M context beta for this account. I've disabled 1M context for this process and reset the session. To persist the fix across restarts, run `clementine config doctor --fix`, then `clementine restart`."
+              "Claude rejected 1M context for this account. I've switched this process to 200K recovery mode and reset the session. To persist the fix across restarts, run `clementine budgets safe`, then `clementine restart`."
             );
           } else if (errStr.includes('rate') && (errStr.includes('limit') || errStr.includes('rate_limit'))) {
             hitRateLimit = true;
@@ -5219,6 +5228,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
             throw new Error(errText);
           }
           if (looksLikeOneMillionContextError(errText)) {
+            process.env.CLEMENTINE_1M_CONTEXT_MODE = 'off';
             process.env.CLAUDE_CODE_DISABLE_1M_CONTEXT = '1';
             throw new Error(errText);
           }
@@ -5587,6 +5597,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
                 throw new Error(exitText);
               }
               if (looksLikeOneMillionContextError(exitText)) {
+                process.env.CLEMENTINE_1M_CONTEXT_MODE = 'off';
                 process.env.CLAUDE_CODE_DISABLE_1M_CONTEXT = '1';
                 throw new Error(exitText);
               }
