@@ -13,13 +13,24 @@ import {
   contextThrashRecoveryNotice,
   isAutonomousNothingOutput,
   looksLikeContextThrashText,
+  looksLikeProviderApiErrorResponse,
+  oneMillionContextRecoveryMessage,
   PersonalAssistant,
   type ProjectMeta,
 } from '../agent/assistant.js';
 import { runWithTrace, logAuditJsonl } from '../agent/hooks.js';
 import type { OnProgressCallback, OnTextCallback, OnToolActivityCallback, PlanProgressUpdate, PlanStep, SelfImproveConfig, SelfImproveExperiment, SessionProvenance, TeamMessage, VerboseLevel, WorkflowDefinition } from '../types.js';
 import { SelfImproveLoop } from '../agent/self-improve.js';
-import { MODELS, AGENTS_DIR, TEAM_COMMS_LOG, BASE_DIR, SEEN_CHANNELS_FILE, AUTO_DELEGATE_ENABLED } from '../config.js';
+import {
+  MODELS,
+  AGENTS_DIR,
+  TEAM_COMMS_LOG,
+  BASE_DIR,
+  SEEN_CHANNELS_FILE,
+  AUTO_DELEGATE_ENABLED,
+  applyOneMillionContextRecovery,
+  looksLikeClaudeOneMillionContextError,
+} from '../config.js';
 import { scanner } from '../security/scanner.js';
 import { lanes } from './lanes.js';
 import { AgentManager } from '../agent/agent-manager.js';
@@ -55,13 +66,14 @@ const CHAT_TIMEOUT_MS = 10 * 60 * 1000;
  *  Primary guardrail is cost budget (maxBudgetUsd), not this timer. */
 const CHAT_MAX_WALL_MS = 30 * 60 * 1000;
 
-export type ChatErrorKind = 'rate_limit' | 'context_overflow' | 'auth' | 'billing' | 'transient' | 'unknown';
+export type ChatErrorKind = 'rate_limit' | 'one_million_context' | 'context_overflow' | 'auth' | 'billing' | 'transient' | 'unknown';
 
 export function classifyChatError(err: unknown): ChatErrorKind {
   const msg = String(err);
   if (isCreditBalanceError(msg)) return 'billing';
   if (/rate.?limit|\b429\b|too many requests|quota.?exceeded/i.test(msg)) return 'rate_limit';
-  if (looksLikeContextThrashText(msg) || /extra usage.*1m context|1m context.*extra usage|context-1m|context.?length|token.?limit|maximum.?context|prompt.?too.?long/i.test(msg)) return 'context_overflow';
+  if (looksLikeClaudeOneMillionContextError(msg)) return 'one_million_context';
+  if (looksLikeContextThrashText(msg) || /context.?length|token.?limit|maximum.?context|prompt.?too.?long/i.test(msg)) return 'context_overflow';
   if (/\b401\b|\b403\b|auth|forbidden|invalid.?api.?key|permission|does not have access|please run \/login/i.test(msg)) return 'auth';
   if (/timeout|ECONNRESET|ECONNREFUSED|ETIMEDOUT|\b5\d\d\b|overloaded|service.?unavailable/i.test(msg)) return 'transient';
   return 'unknown';
@@ -1741,6 +1753,21 @@ export class Gateway {
           // Re-baseline integrity checksums after chat (auto-memory may write to vault)
           scanner.refreshIntegrity();
 
+          if (response && looksLikeClaudeOneMillionContextError(response)) {
+            logger.warn({ sessionKey, responsePreview: response.slice(0, 200) }, '1M context error returned as assistant text — forcing recovery');
+            this.recordInteractiveFailure(sessionKey, text, response, 'one_million_context_result_text', { effectiveSessionKey });
+            applyOneMillionContextRecovery();
+            this.clearSession(effectiveSessionKey);
+            return oneMillionContextRecoveryMessage();
+          }
+
+          if (response && looksLikeProviderApiErrorResponse(response)) {
+            logger.warn({ sessionKey, responsePreview: response.slice(0, 200) }, 'Provider API error returned as assistant text — clearing session');
+            this.recordInteractiveFailure(sessionKey, text, response, 'provider_api_result_text', { effectiveSessionKey });
+            this.clearSession(effectiveSessionKey);
+            return "Claude returned a provider API error instead of a normal answer. I've reset this session so the error does not get replayed into future context. Please try that question again.";
+          }
+
           if (response && looksLikeContextThrashText(response)) {
             logger.warn({ sessionKey, responsePreview: response.slice(0, 200) }, 'Context-thrash text returned from assistant — starting recovery pass');
             return this.startContextThrashRecovery(sessionKey, text, response, {
@@ -1957,6 +1984,11 @@ export class Gateway {
           switch (errKind) {
             case 'rate_limit':
               return "I'm being rate-limited by the API right now. Please wait a minute and try again.";
+            case 'one_million_context':
+              this.recordInteractiveFailure(sessionKey, text, err, 'one_million_context_exception', { effectiveSessionKey });
+              applyOneMillionContextRecovery();
+              this.clearSession(effectiveSessionKey);
+              return oneMillionContextRecoveryMessage();
             case 'context_overflow':
               logger.info({ sessionKey }, 'Context overflow — rotating session');
               this.assistant.clearSession(effectiveSessionKey);

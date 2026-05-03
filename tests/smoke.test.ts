@@ -14,6 +14,7 @@ import {
   looksLikeContextThrashText,
   looksLikeNoResponseRequested,
   looksLikeOneMillionContextError,
+  looksLikeProviderApiErrorResponse,
 } from '../src/agent/assistant.js';
 import { validateProposal } from '../src/agent/self-improve.js';
 import { isCreditBalanceError } from '../src/gateway/credit-guard.js';
@@ -111,6 +112,12 @@ describe('response and provider error sentinels', () => {
     expect(looksLikeOneMillionContextError('context-1m-2025-08-07')).toBe(true);
   });
 
+  it('detects provider API errors returned as assistant text', () => {
+    expect(looksLikeProviderApiErrorResponse('API Error: Extra usage is required for 1M context')).toBe(true);
+    expect(looksLikeProviderApiErrorResponse('Error: API Error: bad request')).toBe(true);
+    expect(looksLikeProviderApiErrorResponse('Normal answer about API design')).toBe(false);
+  });
+
   it('detects Claude credit exhaustion errors', () => {
     expect(isCreditBalanceError('Credit balance is too low')).toBe(true);
     expect(isCreditBalanceError('Your account has insufficient credits')).toBe(true);
@@ -130,7 +137,11 @@ describe('classifyChatError', () => {
     expect(classifyChatError('maximum context length exceeded')).toBe('context_overflow');
     expect(classifyChatError('token limit reached')).toBe('context_overflow');
     expect(classifyChatError('Autocompact is thrashing: the context refilled to the limit')).toBe('context_overflow');
-    expect(classifyChatError('Extra usage is required for 1M context')).toBe('context_overflow');
+  });
+
+  it('classifies 1M entitlement errors separately from normal context overflow', () => {
+    expect(classifyChatError('Extra usage is required for 1M context')).toBe('one_million_context');
+    expect(classifyChatError('API Error: Extra usage is required for 1M context')).toBe('one_million_context');
   });
 
   it('classifies auth errors', () => {

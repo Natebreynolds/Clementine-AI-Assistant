@@ -61,6 +61,7 @@ const HEARTBEAT_WORK_QUEUE_FILE = path.join(BASE_DIR, 'heartbeat', 'work-queue.j
 const MEMORY_DB_PATH = path.join(VAULT_DIR, '.memory.db');
 const PROJECTS_META_FILE = path.join(BASE_DIR, 'projects.json');
 const DASHBOARD_PID_FILE = path.join(BASE_DIR, '.dashboard.pid');
+const INTERACTIVE_FAILURE_LOG = path.join(BASE_DIR, 'self-improve', 'interactive-failures.jsonl');
 
 /**
  * Kill all existing dashboard processes before starting a new one.
@@ -5546,6 +5547,39 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
     return { ok: true, value: normalized };
   }
 
+  function readRecentDashboardChatFailures(limit = 5): Array<Record<string, string>> {
+    try {
+      if (!existsSync(INTERACTIVE_FAILURE_LOG)) return [];
+      const lines = readFileSync(INTERACTIVE_FAILURE_LOG, 'utf-8')
+        .trim()
+        .split('\n')
+        .filter(Boolean)
+        .slice(-80)
+        .reverse();
+      const out: Array<Record<string, string>> = [];
+      for (const line of lines) {
+        try {
+          const item = JSON.parse(line) as Record<string, unknown>;
+          const error = String(item.error ?? '');
+          const stage = String(item.stage ?? '');
+          const haystack = `${stage} ${error}`;
+          if (!/1m|context|budget|credit|api error|rate.?limit/i.test(haystack)) continue;
+          out.push({
+            createdAt: String(item.createdAt ?? ''),
+            stage,
+            sessionKey: String(item.sessionKey ?? ''),
+            textPreview: String(item.textPreview ?? '').slice(0, 220),
+            error: error.slice(0, 500),
+          });
+          if (out.length >= limit) break;
+        } catch { /* skip malformed lines */ }
+      }
+      return out;
+    } catch {
+      return [];
+    }
+  }
+
 	  const ASSISTANT_PREF_OPTIONS = {
 	    proactivity: ['quiet', 'balanced', 'proactive', 'operator'],
 	    responseStyle: ['concise', 'balanced', 'detailed'],
@@ -5661,6 +5695,7 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
           legacyMode,
         },
         findings,
+        recentFailures: readRecentDashboardChatFailures(),
         counts: doctor.counts,
       });
     } catch (err) {
@@ -19944,6 +19979,7 @@ async function refreshBudgetHealth() {
     var modeClass = mode === 'off' ? 'badge-green' : mode === 'on' ? 'badge-yellow' : 'badge-blue';
     var rows = d.budgets || [];
     var findings = d.findings || [];
+    var recentFailures = d.recentFailures || [];
     var html = '<div class="card">'
       + '<div class="card-header" style="display:flex;align-items:center;justify-content:space-between;gap:12px">'
       + '<div style="display:flex;align-items:center;gap:8px"><span>Spend Guards &amp; Context Health</span><span class="badge ' + modeClass + '" style="font-size:10px">1M ' + esc(mode) + '</span></div>'
@@ -19992,6 +20028,22 @@ async function refreshBudgetHealth() {
       + '<div style="font-size:12px;color:var(--text-secondary);margin-top:4px">Safe Recovery lowers autonomous spend and disables 1M context for accounts seeing credit or entitlement errors.</div>'
       + '<div style="font-size:11px;color:var(--text-muted);margin-top:6px">Restart the daemon after changing budgets or context mode.</div>'
       + '</div></div>';
+    if (recentFailures.length) {
+      html += '<div style="border-top:1px solid var(--border);padding-top:10px;margin-bottom:10px">'
+        + '<div style="font-weight:600;font-size:13px;margin-bottom:6px">Recent chat failures</div>';
+      for (var rf = 0; rf < recentFailures.length; rf++) {
+        var fail = recentFailures[rf] || {};
+        html += '<div style="padding:8px 0;border-bottom:1px solid rgba(127,127,127,0.12)">'
+          + '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">'
+          + '<span class="badge badge-yellow" style="font-size:10px">' + esc(fail.stage || 'failure') + '</span>'
+          + '<span style="font-size:11px;color:var(--text-muted)">' + esc(fail.createdAt || '') + '</span>'
+          + '</div>'
+          + '<div style="font-size:12px;color:var(--text-secondary);margin-top:4px">' + esc(fail.error || '') + '</div>'
+          + (fail.textPreview ? '<div style="font-size:11px;color:var(--text-muted);margin-top:3px">Prompt: ' + esc(fail.textPreview) + '</div>' : '')
+          + '</div>';
+      }
+      html += '</div>';
+    }
     if (findings.length) {
       html += '<div style="border-top:1px solid var(--border);padding-top:10px">'
         + '<div style="font-weight:600;font-size:13px;margin-bottom:6px">Potential causes</div>';

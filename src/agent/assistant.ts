@@ -415,6 +415,17 @@ export function looksLikeOneMillionContextError(value: unknown): boolean {
   return looksLikeClaudeOneMillionContextError(value);
 }
 
+export function oneMillionContextRecoveryMessage(): string {
+  return "Claude rejected 1M context for this account. I've switched Clementine to persistent 200K recovery mode and reset the session. Restart Clementine once so every background worker starts with the same safe setting.";
+}
+
+export function looksLikeProviderApiErrorResponse(value: unknown): boolean {
+  const text = String(value ?? '').trim();
+  return /^api error:/i.test(text)
+    || /^error:\s*api error:/i.test(text)
+    || looksLikeOneMillionContextError(text);
+}
+
 export function looksLikeNoResponseRequested(value: unknown): boolean {
   const text = String(value ?? '').trim();
   return /^no response requested\.?$/i.test(text);
@@ -3325,7 +3336,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
     // Track exchange count, timestamp, and last exchange.
     // Never store API error responses — they poison session history and create
     // a self-reinforcing loop where every subsequent request replays the errors.
-    const isApiError = responseText.startsWith('Error:') && responseText.includes('API Error:');
+    const isApiError = looksLikeProviderApiErrorResponse(responseText);
     if (key && !isApiError) {
       this.exchangeCounts.set(key, (this.exchangeCounts.get(key) ?? 0) + 1);
       this.sessionTimestamps.set(key, new Date());
@@ -3785,7 +3796,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
                       this._compactedSessions.delete(sessionKey);
                     }
                     responseText = responseText || (
-                      "Claude rejected 1M context for this account. I've switched Clementine to persistent 200K recovery mode and reset the session. Restart Clementine once so every background worker starts with the same safe setting."
+                      oneMillionContextRecoveryMessage()
                     );
                   } else if (lower.includes('rate') && lower.includes('limit')) {
                     hitRateLimit = true;
@@ -3829,7 +3840,17 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
               } else if ('result' in result && (result as any).result) {
                 // Success: use SDK result text if streaming didn't capture a substantive response
                 const sdkResult = (result as any).result as string;
-                if (looksLikeContextThrashText(sdkResult)) {
+                if (looksLikeOneMillionContextError(sdkResult)) {
+                  logger.warn({ sessionKey }, '1M context error surfaced as SDK result text — forcing recovery');
+                  applyOneMillionContextRecovery();
+                  if (sessionKey) {
+                    this.sessions.delete(sessionKey);
+                    this.exchangeCounts.set(sessionKey, 0);
+                    this._compactedSessions.delete(sessionKey);
+                  }
+                  responseText = oneMillionContextRecoveryMessage();
+                  if (onText) await onText(responseText);
+                } else if (looksLikeContextThrashText(sdkResult)) {
                   logger.warn({ sessionKey }, 'Autocompact thrashing surfaced as SDK result text — rotating session');
                   preRotationSnapshot = {
                     toolCalls: stallGuard?.getToolCalls() ?? [],
@@ -3899,7 +3920,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
               this._compactedSessions.delete(sessionKey);
             }
             responseText = responseText || (
-              "Claude rejected 1M context for this account. I've switched Clementine to persistent 200K recovery mode and reset the session. Restart Clementine once so every background worker starts with the same safe setting."
+              oneMillionContextRecoveryMessage()
             );
           } else if (errStr.includes('rate') && (errStr.includes('limit') || errStr.includes('rate_limit'))) {
             hitRateLimit = true;
