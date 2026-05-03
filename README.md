@@ -326,7 +326,9 @@ Your overrides live in `~/.clementine/.env` — **they survive every `npm update
 
 The dashboard exposes these spend controls in Settings -> Channels & Env ->
 Spend Guards & Context Health, including direct dollar-cap editing, Default
-Caps, Safe Recovery, and No Caps presets.
+Caps, Safe Recovery, and No Caps presets. When a dashboard change needs the
+daemon to reload, Clementine shows a Restart Clementine prompt and handles the
+restart from the browser.
 
 For spend/context tuning, `clementine budgets` gives a safer shortcut:
 

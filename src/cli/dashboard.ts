@@ -15273,7 +15273,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
         <div class="tab-pane active" id="tab-settings-general">
           <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px">
             <p style="color:var(--text-muted);margin:0">Manage API keys and configuration. Changes are saved to <code>~/.clementine/.env</code>.</p>
-            <button class="btn-sm" style="white-space:nowrap;background:var(--bg-tertiary);border:1px solid var(--border);color:var(--text-primary);padding:6px 12px;border-radius:6px;cursor:pointer" onclick="restartDashboard()">Restart Dashboard</button>
+            <button class="btn-sm btn-primary" style="white-space:nowrap;padding:6px 12px;border-radius:6px;cursor:pointer" onclick="restartDaemonFromDashboard()">Restart Clementine</button>
           </div>
           <div id="budget-health-content" style="margin-bottom:16px"><div class="empty-state">Loading budget health...</div></div>
           <div id="settings-content"><div class="empty-state">Loading settings...</div></div>
@@ -15438,8 +15438,8 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
           <div class="card" style="margin-bottom:16px">
             <div class="card-header">Diagnostics &amp; maintenance</div>
             <div class="card-body" style="padding:16px;display:flex;gap:8px;flex-wrap:wrap">
+              <button class="btn-sm btn-primary" onclick="restartDaemonFromDashboard()">Restart Clementine</button>
               <button class="btn-sm" onclick="restartDashboard()">Restart Dashboard</button>
-              <button class="btn-sm" onclick="if(confirm('Restart the daemon? Active sessions drain first.')) apiPost('/api/restart')">Restart Daemon</button>
               <button class="btn-sm" onclick="apiFetch('/api/doctor').then(function(r){return r.text()}).then(function(t){alert(t)})">Run Doctor</button>
               <button class="btn-sm" onclick="apiFetch('/api/version').then(function(r){return r.json()}).then(function(d){alert('Version: '+(d.version||'?')+'\\nNode: '+(d.node||'?'))})">Build info</button>
             </div>
@@ -17492,6 +17492,7 @@ async function apiPost(url) {
     if (d.ok) toast(d.message, 'success');
     else toast(d.error || 'Error', 'error');
     setTimeout(refreshAll, 1000);
+    return d;
   } catch(e) { toast(String(e), 'error'); }
 }
 async function apiJson(method, url, body) {
@@ -17515,7 +17516,82 @@ async function apiDelete(url) {
     if (d.ok) toast(d.message, 'success');
     else toast(d.error || 'Error', 'error');
     setTimeout(refreshAll, 500);
+    return d;
   } catch(e) { toast(String(e), 'error'); }
+}
+
+function settingRequiresDaemonRestart(key) {
+  if (!key) return true;
+  if (key === 'COMPOSIO_API_KEY' || key === 'COMPOSIO_USER_ID') return false;
+  if (key.indexOf('ASSISTANT_') === 0) return false;
+  return true;
+}
+
+function renderRestartRequiredBanner() {
+  var reason = '';
+  try { reason = localStorage.getItem('clem-restart-required') || ''; } catch(e) { reason = ''; }
+  var existing = document.getElementById('restart-required-banner');
+  if (!reason) {
+    if (existing) existing.remove();
+    return;
+  }
+  if (!existing) {
+    existing = document.createElement('div');
+    existing.id = 'restart-required-banner';
+    existing.style.cssText = 'position:fixed;left:18px;right:18px;bottom:18px;z-index:9999;display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;border:1px solid var(--border);border-radius:8px;background:var(--bg-secondary);box-shadow:0 8px 28px rgba(0,0,0,0.28);padding:12px 14px;color:var(--text-primary)';
+    document.body.appendChild(existing);
+  }
+  existing.innerHTML = '<div style="min-width:220px;flex:1"><div style="font-weight:700;font-size:13px">Restart required</div>'
+    + '<div style="font-size:12px;color:var(--text-secondary);margin-top:2px">' + esc(reason) + '</div></div>'
+    + '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">'
+    + '<button class="btn-sm btn-primary" onclick="restartDaemonFromDashboard()">Restart Clementine</button>'
+    + '<button class="btn-sm" onclick="dismissRestartRequiredBanner()">Later</button>'
+    + '</div>';
+}
+
+function markRestartRequired(reason) {
+  var msg = reason || 'This change needs a Clementine restart before the daemon and channel workers use it.';
+  try { localStorage.setItem('clem-restart-required', msg); } catch(e) { /* ignore */ }
+  renderRestartRequiredBanner();
+}
+
+function clearRestartRequired() {
+  try { localStorage.removeItem('clem-restart-required'); } catch(e) { /* ignore */ }
+  var existing = document.getElementById('restart-required-banner');
+  if (existing) existing.remove();
+}
+
+function dismissRestartRequiredBanner() {
+  var existing = document.getElementById('restart-required-banner');
+  if (existing) existing.remove();
+}
+
+async function restartDaemonFromDashboard(skipConfirm) {
+  if (!skipConfirm && !confirm('Restart Clementine now? Active work may pause briefly while the daemon reloads.')) return;
+  toast('Restarting Clementine...', 'info');
+  try {
+    var r = await apiFetch('/api/restart', { method: 'POST' });
+    var d = {};
+    try { d = await r.json(); } catch(e) { d = {}; }
+    if (!r.ok || d.error) {
+      var err = String(d.error || 'Restart failed');
+      if (/not running/i.test(err)) {
+        var launch = await apiFetch('/api/launch', { method: 'POST' });
+        var launchData = await launch.json();
+        if (!launch.ok || launchData.error) throw new Error(launchData.error || 'Launch failed');
+        clearRestartRequired();
+        toast('Clementine started', 'success');
+        setTimeout(refreshAll, 2000);
+        return;
+      }
+      throw new Error(err);
+    }
+    clearRestartRequired();
+    toast('Clementine restart requested', 'success');
+    setTimeout(refreshAll, 2500);
+  } catch(e) {
+    toast('Restart failed: ' + String(e), 'error');
+  }
 }
 
 // ── Status + Overview ─────────────────────
@@ -18668,6 +18744,7 @@ async function saveHeartbeatControl() {
     if (!r.ok || d.error) throw new Error(d.error || 'Save failed');
     if (statusEl) { statusEl.textContent = 'Saved. Restart daemon for schedule changes.'; statusEl.style.color = 'var(--green)'; }
     toast('Heartbeat controls saved', 'success');
+    markRestartRequired('Heartbeat control changes need a Clementine restart before the schedule uses them.');
   } catch(e) {
     if (statusEl) { statusEl.textContent = 'Save failed'; statusEl.style.color = 'var(--red)'; }
     toast(String(e), 'error');
@@ -19930,13 +20007,15 @@ async function postBudgetAction(url, body) {
 }
 
 async function applySafeBudgetPreset() {
-  await postBudgetAction('/api/budgets/safe', {});
+  var d = await postBudgetAction('/api/budgets/safe', {});
+  if (d && d.ok) markRestartRequired('Safe Recovery changed spend/context settings. Restart Clementine to apply them to chat and background workers.');
   refreshSettings();
 }
 
 async function applyBudgetPreset(preset) {
   if (preset === 'uncapped' && !confirm('Remove all spend caps? Clementine can still hit account limits or credits if a job runs long.')) return;
-  await postBudgetAction('/api/budgets/preset', { preset: preset });
+  var d = await postBudgetAction('/api/budgets/preset', { preset: preset });
+  if (d && d.ok) markRestartRequired('Spend guard changes need a Clementine restart before running workers use the new caps.');
   refreshSettings();
 }
 
@@ -19949,12 +20028,14 @@ async function saveBudgetCap(key) {
     toast('Budget must be a non-negative dollar amount. Use 0 for no cap.', 'error');
     return;
   }
-  await postBudgetAction('/api/budgets/set', { key: key, value: value });
+  var d = await postBudgetAction('/api/budgets/set', { key: key, value: value });
+  if (d && d.ok) markRestartRequired('Budget cap changes need a Clementine restart before running workers use the new value.');
   refreshSettings();
 }
 
 async function setBudgetContextMode(mode) {
-  await postBudgetAction('/api/budgets/1m', { mode: mode });
+  var d = await postBudgetAction('/api/budgets/1m', { mode: mode });
+  if (d && d.ok) markRestartRequired('1M context changes need a Clementine restart before new Claude calls use the setting.');
   refreshSettings();
 }
 
@@ -19964,7 +20045,10 @@ async function forceBudgetOneMillion() {
 }
 
 async function applyBudgetDoctorFix() {
-  await postBudgetAction('/api/budgets/doctor-fix', {});
+  var d = await postBudgetAction('/api/budgets/doctor-fix', {});
+  if (d && d.ok && d.result && d.result.changed && d.result.changed.length) {
+    markRestartRequired('Doctor Fix changed Clementine configuration. Restart Clementine to apply the fixes.');
+  }
   refreshSettings();
 }
 
@@ -20068,8 +20152,7 @@ async function refreshSettings() {
       + '</div></div>';
 
     html += '<div style="padding:12px;color:var(--text-muted);font-size:12px">'
-      + '<strong>Note:</strong> Changes to API keys require a daemon restart to take effect. '
-      + 'Use <code>clementine restart</code> after updating channel tokens.'
+      + '<strong>Note:</strong> Changes that require a daemon restart show a Restart Clementine prompt here in the dashboard.'
       + '</div>';
     container.innerHTML = html;
 
@@ -20132,8 +20215,11 @@ async function toggleSetting(el) {
 async function saveSettingValue(key, value) {
   var statusEl = document.getElementById('setting-' + key + '-status');
   try {
-    await apiJson('PUT', '/api/settings/' + encodeURIComponent(key), { value: value });
+    var result = await apiJson('PUT', '/api/settings/' + encodeURIComponent(key), { value: value });
     if (statusEl) { statusEl.textContent = 'Saved'; statusEl.style.color = 'var(--green)'; setTimeout(function(){ statusEl.textContent = ''; }, 2000); }
+    if (result && result.ok && settingRequiresDaemonRestart(key)) {
+      markRestartRequired(key + ' changed. Restart Clementine so the daemon and channel workers use the new value.');
+    }
   } catch(e) {
     if (statusEl) { statusEl.textContent = 'Error'; statusEl.style.color = 'var(--red)'; }
   }
@@ -20158,8 +20244,11 @@ async function saveAssistantPreferences() {
 async function removeSetting(key) {
   if (!confirm('Remove ' + key + ' from .env?')) return;
   try {
-    await apiDelete('/api/settings/' + encodeURIComponent(key));
+    var result = await apiDelete('/api/settings/' + encodeURIComponent(key));
     toast(key + ' removed', 'success');
+    if (result && result.ok && settingRequiresDaemonRestart(key)) {
+      markRestartRequired(key + ' was removed. Restart Clementine so running workers stop using the old value.');
+    }
     refreshSettings();
   } catch(e) { toast('Failed: ' + e, 'error'); }
 }
@@ -20189,8 +20278,11 @@ async function addCustomEnv() {
   if (!key || !value) { toast('Both key and value are required', 'error'); return; }
   if (!/^[A-Z_][A-Z0-9_]*$/.test(key)) { toast('Invalid key format — use UPPER_SNAKE_CASE', 'error'); return; }
   try {
-    await apiJson('PUT', '/api/settings/' + encodeURIComponent(key), { value: value });
+    var result = await apiJson('PUT', '/api/settings/' + encodeURIComponent(key), { value: value });
     toast(key + ' added', 'success');
+    if (result && result.ok && settingRequiresDaemonRestart(key)) {
+      markRestartRequired(key + ' was added. Restart Clementine so the daemon and channel workers can use it.');
+    }
     keyInput.value = '';
     valInput.value = '';
     refreshSettings();
@@ -27560,6 +27652,7 @@ async function refreshSalesforce() {
 
 // ── Initial load — single batch request instead of 12+ parallel fetches ──
 (async function initDashboard() {
+  renderRestartRequiredBanner();
   try {
     var r = await apiFetch('/api/init');
     var d = await r.json();
@@ -27631,6 +27724,7 @@ try {
         if (currentPage === 'home') refreshSessions();
       }
       if (evt.type === 'daemon_restarted') {
+        clearRestartRequired();
         toast('Daemon restarted \u2014 refreshing data...', 'info');
         setTimeout(function() { refreshAll(); }, 1500);
       }
