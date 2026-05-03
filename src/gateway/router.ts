@@ -33,6 +33,12 @@ import { updateClementineJson } from '../config/clementine-json.js';
 import { buildCronDiagnosticResponse } from './cron-diagnostic-turn.js';
 import { classifyIntent } from '../agent/intent-classifier.js';
 import { decideTurn } from '../agent/turn-policy.js';
+import {
+  buildNotificationContextPrompt,
+  findRecentNotificationContext,
+  recordProactiveNotificationEvent,
+  type ProactiveNotificationInput,
+} from './notification-context.js';
 
 const logger = pino({ name: 'clementine.gateway' });
 const INTERACTIVE_FAILURE_LOG = path.join(BASE_DIR, 'self-improve', 'interactive-failures.jsonl');
@@ -1008,6 +1014,25 @@ export class Gateway {
     });
   }
 
+  /**
+   * Record a proactive notification and inject it into the target session so
+   * replies like "fix this" have concrete context even though the notification
+   * was sent outside the active chat turn.
+   */
+  recordProactiveEvent(input: ProactiveNotificationInput): void {
+    const event = recordProactiveNotificationEvent(input);
+    if (!input.sessionKey) return;
+
+    const userText = `[Proactive notification: ${input.title}]`;
+    const assistantText = [
+      input.summary || input.text,
+      input.jobNames?.length ? `\nAction handles: ${input.jobNames.map((name) => `fix ${name}`).join(', ')}` : '',
+      `\nEvent id: ${event.id}`,
+    ].join('').slice(0, 3000);
+
+    this.injectContext(input.sessionKey, userText, assistantText);
+  }
+
   // ── Skill management ──────────────────────────────────────────────
 
   async handleSkill(action: string, args?: { name?: string }): Promise<string> {
@@ -1286,6 +1311,19 @@ export class Gateway {
         }, 'chat:latency');
         return cronDiagnostic;
       }
+    }
+
+    const recentNotification = this.isTrustedPersonalSession(sessionKey)
+      ? findRecentNotificationContext(sessionKey, text)
+      : null;
+    if (recentNotification) {
+      logger.info({
+        sessionKey,
+        eventId: recentNotification.id,
+        type: recentNotification.type,
+        jobs: recentNotification.jobNames,
+      }, 'Resolved vague reply to recent proactive notification');
+      text = buildNotificationContextPrompt(recentNotification, text);
     }
 
     // Show "queued" status if either lane or session lock is contended,

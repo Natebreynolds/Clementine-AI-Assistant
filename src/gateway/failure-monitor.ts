@@ -489,7 +489,28 @@ function formatReport(jobs: BrokenJob[]): string {
     }
   }
   lines.push('');
+  if (jobs.length === 1) {
+    lines.push(`Reply \`fix ${jobs[0]!.jobName}\` for a bounded diagnosis without running the job.`);
+  } else {
+    lines.push(`Reply \`fix <job name>\` for a bounded diagnosis without running the job.`);
+    lines.push(`Jobs: ${jobs.map(j => `\`${j.jobName}\``).join(', ')}`);
+  }
   lines.push('Open the dashboard → Broken Jobs panel for the full picture.');
+  return lines.join('\n');
+}
+
+function summarizeFailureNotification(jobs: BrokenJob[]): string {
+  const lines: string[] = [];
+  lines.push(`${jobs.length} cron job${jobs.length === 1 ? '' : 's'} repeatedly failing.`);
+  for (const job of jobs.slice(0, 6)) {
+    const parts = [
+      `${job.jobName}: ${job.errorCount48h}/${job.totalRuns48h} recent runs failed`,
+    ];
+    if (job.diagnosis?.rootCause) parts.push(`cause: ${job.diagnosis.rootCause.slice(0, 220)}`);
+    if (job.diagnosis?.proposedFix?.details) parts.push(`proposed fix: ${job.diagnosis.proposedFix.details.slice(0, 220)}`);
+    if (!job.diagnosis && job.lastErrors[0]) parts.push(`last error: ${job.lastErrors[0].split('\n')[0]!.slice(0, 220)}`);
+    lines.push(`- ${parts.join(' | ')}`);
+  }
   return lines.join('\n');
 }
 
@@ -508,6 +529,7 @@ export async function runFailureSweep(
   send: (text: string) => Promise<unknown>,
   gateway?: import('./router.js').Gateway,
   now = Date.now(),
+  options: { replySessionKey?: string } = {},
 ): Promise<BrokenJob[]> {
   // Opportunistically grade suspicious ok runs BEFORE computing broken
   // jobs, so fresh grades feed into this same sweep's detection.
@@ -587,7 +609,19 @@ export async function runFailureSweep(
   }
 
   try {
-    await send(formatReport(fresh));
+    const report = formatReport(fresh);
+    if (gateway && options.replySessionKey) {
+      gateway.recordProactiveEvent({
+        type: 'cron_failure',
+        sessionKey: options.replySessionKey,
+        title: `${fresh.length} cron job${fresh.length === 1 ? '' : 's'} failing`,
+        summary: summarizeFailureNotification(fresh),
+        text: report,
+        jobNames: fresh.map(j => j.jobName),
+        sentAt: new Date(now).toISOString(),
+      });
+    }
+    await send(report);
     const stamp = new Date(now).toISOString();
     for (const job of fresh) {
       state.notified[job.jobName] = { lastNotifiedAt: stamp, lastErrorCount: job.errorCount48h };

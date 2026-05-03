@@ -179,7 +179,10 @@ export class HeartbeatScheduler {
     // Passes the gateway so freshly-broken jobs get a diagnostic LLM call
     // (cached 24h) before the DM goes out.
     import('./failure-monitor.js').then(({ runFailureSweep }) => {
-      runFailureSweep((text) => this.dispatcher.send(text, {}), this.gateway).catch(err => {
+      const replySessionKey = DISCORD_OWNER_ID && DISCORD_OWNER_ID !== '0'
+        ? `discord:user:${DISCORD_OWNER_ID}`
+        : undefined;
+      runFailureSweep((text) => this.dispatcher.send(text, {}), this.gateway, Date.now(), { replySessionKey }).catch(err => {
         logger.warn({ err }, 'Failure sweep failed');
       });
     }).catch(err => logger.warn({ err }, 'Failure sweep import failed'));
@@ -1113,15 +1116,38 @@ export class HeartbeatScheduler {
     // Urgency-based delivery
     const hour = new Date().getHours();
     const inActiveHours = hour >= HEARTBEAT_ACTIVE_START && hour < HEARTBEAT_ACTIVE_END;
+    const ownerSessionKey = DISCORD_OWNER_ID && DISCORD_OWNER_ID !== '0'
+      ? `discord:user:${DISCORD_OWNER_ID}`
+      : undefined;
 
     if (insight.urgency >= 5) {
       // Critical: send immediately regardless of hours
-      await this.dispatcher.send(`**[Proactive alert]** ${insight.message}`);
+      const text = `**[Proactive alert]** ${insight.message}`;
+      if (ownerSessionKey) {
+        this.gateway.recordProactiveEvent({
+          type: 'insight',
+          sessionKey: ownerSessionKey,
+          title: 'Proactive alert',
+          summary: insight.message,
+          text,
+        });
+      }
+      await this.dispatcher.send(text);
       recordInsightSent(insightState);
       this.saveState();
     } else if (insight.urgency >= 4 && inActiveHours) {
       // Important: send during active hours
-      await this.dispatcher.send(`**[Heads up]** ${insight.message}`);
+      const text = `**[Heads up]** ${insight.message}`;
+      if (ownerSessionKey) {
+        this.gateway.recordProactiveEvent({
+          type: 'insight',
+          sessionKey: ownerSessionKey,
+          title: 'Heads up',
+          summary: insight.message,
+          text,
+        });
+      }
+      await this.dispatcher.send(text);
       recordInsightSent(insightState);
       this.saveState();
     }
