@@ -3671,14 +3671,21 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
   // a source-registry row pointing at the feed's target folder. Feeds are
   // built from recipes in src/brain/connector-recipes.ts — the wizard in
   // the Intelligence → Sources tab composes recipe + field values + schedule
-  // into a cron prompt that uses the user's authenticated Claude Desktop
-  // connectors (Google Drive, Gmail, Outlook, etc.) to pull records and
-  // calls brain_ingest_folder to commit them.
+  // into a cron prompt that uses the user's authenticated tool source
+  // (Claude Desktop connector, Composio toolkit, or local MCP server) to pull
+  // records and calls brain_ingest_folder to commit them.
 
   app.get('/api/brain/connectors', async (_req, res) => {
     try {
       const { getClaudeIntegrations, loadToolInventory } = await import('../agent/mcp-bridge.js');
       const { RECIPES } = await import('../brain/connector-recipes.js');
+      const { KNOWN_SERVICES } = await import('../integrations/tool-preferences.js');
+      const serviceLabelByComposioSlug = new Map(
+        KNOWN_SERVICES
+          .filter((s) => s.composioSlug)
+          .map((s) => [s.composioSlug!, s.label]),
+      );
+      const recipeIntegrations = new Set(RECIPES.map((r) => r.integration));
 
       // Claude Desktop integrations carry richer metadata (label, connected
       // state, firstSeen/lastUsed). Everything else we infer from the SDK
@@ -3702,7 +3709,7 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
       const integrations: Array<{
         name: string;
         label: string;
-        kind: 'claude-desktop' | 'mcp-server';
+        kind: 'claude-desktop' | 'composio' | 'mcp-server';
         tools: string[];
         connected: boolean;
         hasFeedReadyTools: boolean;
@@ -3723,10 +3730,47 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
         });
       }
 
+      // Composio toolkits are mounted in-process at agent runtime, so they do
+      // not necessarily appear in the cached SDK inventory. Pull the connected
+      // toolkit/tool list directly from Composio so feed recipes like
+      // googlesheets can be offered even before a full inventory refresh.
+      try {
+        const composio = await import('../integrations/composio/client.js');
+        if (composio.isComposioEnabled()) {
+          const connected = await composio.listConnectedToolkits();
+          const activeSlugs = [...new Set(
+            connected
+              .filter((c) => c.status === 'ACTIVE')
+              .filter((c) => recipeIntegrations.has(c.slug))
+              .map((c) => c.slug),
+          )];
+          if (activeSlugs.length) {
+            const { listComposioToolkitTools } = await import('../integrations/composio/mcp-bridge.js');
+            const toolMap = await listComposioToolkitTools(activeSlugs);
+            for (const slug of activeSlugs) {
+              const tools = toolMap[slug] ?? [];
+              const label = serviceLabelByComposioSlug.get(slug)
+                ?? slug.replace(/[-_]/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
+              integrations.push({
+                name: slug,
+                label,
+                kind: 'composio',
+                tools,
+                connected: true,
+                hasFeedReadyTools: tools.length > 0,
+              });
+            }
+          }
+        }
+      } catch (err) {
+        console.warn('[feeds] Composio connector listing failed, continuing:', err);
+      }
+
       // Then, every other MCP server. These are directly reachable through
       // the Agent SDK because probeAvailableTools() saw them in init.tools.
       for (const [server, tools] of mcpByServer.entries()) {
         if (server.startsWith('claude_ai_')) continue;
+        if (integrations.some((i) => i.name === server)) continue;
         integrations.push({
           name: server,
           label: server.replace(/[-_]/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase()),
@@ -3790,6 +3834,16 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
       // Without this the SDK only sees built-in + claude_ai_* tools
       // and every Extension tool call is silently rejected at runtime.
       const mcpServers = getMcpServersForAgent();
+      try {
+        const match = tool.match(/^mcp__([^_]+(?:_[^_]+)*)__/);
+        const serverName = match?.[1];
+        if (serverName && !serverName.startsWith('claude_ai_')) {
+          const { buildComposioMcpServers } = await import('../integrations/composio/mcp-bridge.js');
+          Object.assign(mcpServers, await buildComposioMcpServers([serverName]));
+        }
+      } catch (err) {
+        console.warn('[feeds] Composio probe server unavailable, continuing:', err);
+      }
 
       // Strict prompt: force JSON-only output. The tool lookup goes through
       // the SDK so claude_ai_* and regular MCP servers work uniformly.
@@ -13354,14 +13408,14 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
         <!-- Sources -->
         <div class="tab-pane" id="tab-intelligence-sources">
 
-          <!-- ═══ Auto-seed feeds (Claude Desktop connectors → cron → brain) ═══ -->
+          <!-- ═══ Auto-seed feeds (connected tools → cron → brain) ═══ -->
           <div class="card" style="padding:16px;margin-bottom:16px">
             <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px">
               <div style="font-weight:600">Auto-seed feeds</div>
               <button class="btn-primary" onclick="brainOpenFeedWizard()">+ Add feed</button>
             </div>
             <div style="color:var(--muted);font-size:13px;margin-bottom:12px">
-              One-click scheduled feeds that use your authenticated Claude Desktop connectors (Google Drive, Outlook, Gmail, Slack…) to pull records and commit them to the brain. No API keys required.
+              One-click scheduled feeds that use authenticated tools (Composio, Claude Desktop connectors, or local MCP servers) to pull records and commit them to the brain.
             </div>
             <div id="brain-feeds-connectors" style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:12px"></div>
             <div id="brain-feeds-list"></div>
@@ -13833,7 +13887,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
             const el = document.getElementById('brain-feeds-connectors');
             if (!el) return data;
             if (!data.integrations || !data.integrations.length) {
-              el.innerHTML = '<div style="color:var(--muted);font-size:13px">No Claude Desktop connectors detected yet. Open Claude Desktop → Connectors to sign into Google Drive, Outlook, Gmail, etc.</div>';
+              el.innerHTML = '<div style="color:var(--muted);font-size:13px">No seed-ready tools detected yet. Connect Composio or open Claude Desktop → Connectors to sign into Google Drive, Outlook, Gmail, etc.</div>';
               return data;
             }
             el.innerHTML = data.integrations.map(function(i) {
@@ -13841,7 +13895,8 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
               const color = ok ? '#2f7d32' : '#8a5a00';
               const bg = ok ? '#e8f5e9' : '#fff3cd';
               const dot = ok ? '✓' : '⚠';
-              const label = ok ? i.label : i.label + ' (incomplete in Claude Desktop)';
+              const source = i.kind === 'composio' ? 'Composio' : (i.kind === 'claude-desktop' ? 'Claude Desktop' : 'MCP');
+              const label = ok ? i.label + ' · ' + source : i.label + ' (incomplete in ' + source + ')';
               return '<span style="padding:3px 10px;border-radius:12px;background:' + bg + ';color:' + color + ';font-size:12px;font-weight:500">' + dot + ' ' + escapeHtml(label) + '</span>';
             }).join('');
             return data;
@@ -14112,7 +14167,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
           let html = '';
           if (s.step === 0) {
             if (!s.connected.length) {
-              html = '<div style="color:#8a5a00">No connectors have feed-ready tools. Open Claude Desktop → Connectors and sign into Google Drive, Outlook, Gmail, or Slack first.</div>';
+              html = '<div style="color:#8a5a00">No connectors have feed-ready tools. Connect Composio or open Claude Desktop → Connectors and sign into Google Drive, Outlook, Gmail, or Slack first.</div>';
             } else {
               html = '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:8px">' +
                 s.connected.map(function(i) {

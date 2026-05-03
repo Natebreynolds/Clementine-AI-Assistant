@@ -62,6 +62,33 @@ export async function buildComposioMcpServers(
   return out;
 }
 
+export async function listComposioToolkitTools(
+  slugs?: string[],
+): Promise<Record<string, string[]>> {
+  const composio = getComposio();
+  if (!composio) return {};
+
+  const connected = await listConnectedToolkits();
+  const activeSlugs = new Set(
+    connected.filter(c => c.status === 'ACTIVE').map(c => c.slug),
+  );
+
+  const targetSlugs = slugs === undefined
+    ? [...activeSlugs]
+    : slugs.filter(s => activeSlugs.has(s));
+
+  const out: Record<string, string[]> = {};
+  for (const slug of targetSlugs) {
+    try {
+      const tools = await fetchToolkitTools(composio, slug);
+      out[slug] = tools.map((t: any) => t.name).filter((name: unknown): name is string => typeof name === 'string');
+    } catch (err) {
+      logger.warn({ err, slug }, 'failed to list Composio toolkit tools');
+    }
+  }
+  return out;
+}
+
 async function buildOne(
   composio: NonNullable<ReturnType<typeof getComposio>>,
   slug: string,
@@ -79,14 +106,21 @@ async function buildOne(
   // reading tools (OUTLOOK_LIST_MESSAGES, OUTLOOK_GET_MESSAGES, etc.) which
   // alphabetically come after OUTLOOK_LIST_CALENDAR_GROUP_*. GitHub has
   // 800+. Set 1000 — comfortable headroom for any single toolkit.
-  const userId = await getPreferredUserId();
-  const toolsRaw = await composio.tools.get(userId, { toolkits: [slug], limit: 1000 });
-  // tools.get can return an array OR an object depending on provider; normalise.
-  const toolsArr = Array.isArray(toolsRaw) ? toolsRaw : Object.values(toolsRaw);
-  const tools = toolsArr.filter((t: any) => t && typeof t.name === 'string' && typeof t.handler === 'function');
+  const tools = await fetchToolkitTools(composio, slug);
   return createSdkMcpServer({
     name: slug,
     version: '0.1.0',
     tools: tools as any,
   });
+}
+
+async function fetchToolkitTools(
+  composio: NonNullable<ReturnType<typeof getComposio>>,
+  slug: string,
+): Promise<any[]> {
+  const userId = await getPreferredUserId();
+  const toolsRaw = await composio.tools.get(userId, { toolkits: [slug], limit: 1000 });
+  // tools.get can return an array OR an object depending on provider; normalise.
+  const toolsArr = Array.isArray(toolsRaw) ? toolsRaw : Object.values(toolsRaw);
+  return toolsArr.filter((t: any) => t && typeof t.name === 'string' && typeof t.handler === 'function');
 }

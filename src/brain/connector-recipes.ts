@@ -2,16 +2,18 @@
  * Clementine — Connector Feed recipes.
  *
  * Each recipe is a blueprint for a one-click "auto-seed feed" that turns an
- * authenticated Claude Desktop connector (Google Drive, Gmail, Outlook, etc.)
- * into a scheduled data feed that writes into the brain's ingest folder.
+ * authenticated tool source (Claude Desktop connector, Composio toolkit, or
+ * local MCP server) into a scheduled data feed that writes into the brain's
+ * ingest folder.
  *
  * A feed materializes as:
  *   1. A CRON.md job entry with `managed: connector-feed` frontmatter
  *   2. (optional) A source registry row tying the target folder to the run
  *
  * The cron prompt tells the Claude Code agent to use the integration's MCP
- * tools to pull records, then call `brain_ingest_folder` to commit them —
- * which writes markdown files and runs the distillation pipeline in one step.
+ * tools to pull records, compare them with current memory when appropriate,
+ * then call `brain_ingest_folder` to commit them — which writes markdown files
+ * and runs the distillation pipeline in one step.
  *
  * Field syntax in prompt templates:
  *   {{fieldKey}}   — user-supplied value
@@ -93,6 +95,8 @@ const COMMIT_INSTRUCTIONS = `When you have the records collected, call the \`bra
 That tool writes each record to \`{{targetFolder}}/\` and runs the brain's distillation pipeline. You do NOT need to use Write — brain_ingest_folder handles file creation. Finish by reporting a one-line summary like "Ingested N new records, M unchanged".
 
 If the tool returns an error, include the error text in your summary.`;
+
+const MEMORY_DELTA_INSTRUCTIONS = `Before committing, call \`memory_recall\` for the feed slug/topic and use the returned chunks as the current memory state for this source. Keep records that are new, materially changed, or contain a new finding. Drop exact duplicates and rows that add no useful information. The ingestion pipeline will write markdown and embeddings; do not call \`memory_write\` for these feed records.`;
 
 // ── Recipes ────────────────────────────────────────────────────────────
 
@@ -205,6 +209,76 @@ Steps:
    - \`content\`: a markdown bullet list of each event (time, title, attendees, location)
    - \`metadata\`: \`{date, eventCount}\`
 3. ${COMMIT_INSTRUCTIONS.replace(/{{slug}}/g, ctx.slug).replace(/{{targetFolder}}/g, ctx.targetFolder)}
+`,
+  },
+
+  {
+    id: 'googlesheets-range',
+    label: 'Google Sheets: range to memory',
+    description: 'Pull rows from a Google Sheet range through Composio, compare with current memory, and ingest new findings.',
+    icon: '📊',
+    integration: 'googlesheets',
+    requiredTools: ['GOOGLESHEETS'],
+    fields: [
+      {
+        key: 'spreadsheet',
+        label: 'Spreadsheet ID or URL',
+        placeholder: 'https://docs.google.com/spreadsheets/d/... or spreadsheet id',
+        required: true,
+        help: 'Use the stable spreadsheet ID or full Sheets URL. Names are less reliable because they require a Drive search first.',
+      },
+      {
+        key: 'range',
+        label: 'Range',
+        placeholder: 'Sheet1!A:Z',
+        defaultValue: 'Sheet1!A:Z',
+        required: true,
+      },
+      {
+        key: 'topic',
+        label: 'Memory topic',
+        placeholder: 'customers, leads, roadmap, finance...',
+        defaultValue: 'sheet findings',
+        help: 'Used for recall and the feed slug so this sheet compares against the right memory.',
+      },
+      {
+        key: 'keyColumn',
+        label: 'Stable key column (optional)',
+        placeholder: 'email, company, id',
+        help: 'If present in the header row, use this column as the stable row id; otherwise use row number plus row hash.',
+      },
+      {
+        key: 'limit',
+        label: 'Max rows per run',
+        placeholder: '500',
+        defaultValue: '500',
+      },
+    ],
+    defaultSchedule: '0 8 * * *',
+    tier: 2,
+    slugFromValues: (v) => `gsheet-${slugify(v.topic || v.spreadsheet || 'range')}`,
+    buildPrompt: (v, ctx) => `You are running the Composio Google Sheets feed for topic "${v.topic || 'sheet findings'}".
+
+Inputs:
+- Spreadsheet: "${v.spreadsheet}"
+- Range: "${v.range || 'Sheet1!A:Z'}"
+- Stable key column: "${v.keyColumn || '(none)'}"
+- Max rows: ${v.limit || '500'}
+
+Goal: read this Google Sheet through the authenticated Composio Google Sheets tools (\`mcp__googlesheets__*\`), compare the sheet data with existing memory for slug "${ctx.slug}", and ingest only rows/findings that are new or materially changed.
+
+Steps:
+1. Resolve the spreadsheet id. If the input is a Google Sheets URL, extract the id from \`/d/<id>/\`; otherwise treat the input as the id. If it is only a title/name, use available Google Drive/Sheets search tools to resolve it, but do not guess if multiple sheets match.
+2. Call the most specific Google Sheets read/get-values tool exposed in this session to fetch range "${v.range || 'Sheet1!A:Z'}". Limit to ${v.limit || '500'} data rows when the tool supports a limit.
+3. Treat the first row as headers. Normalize each following row into an object keyed by those headers. Skip blank rows.
+4. ${MEMORY_DELTA_INSTRUCTIONS}
+   Use this recall query: \`source:${ctx.slug} ${v.topic || 'sheet findings'} Google Sheet ${v.range || 'Sheet1!A:Z'}\`.
+5. For each kept row, build one record:
+   - \`title\`: "${v.topic || 'Sheet finding'} — " plus the stable key value or row number.
+   - \`externalId\`: \`gsheet:<spreadsheetId>:${v.range || 'Sheet1!A:Z'}:<stableKeyOrRowHash>\`.
+   - \`content\`: a concise markdown summary of the row's current facts and the new/changed finding. Include the source row fields under a "Row data" section.
+   - \`metadata\`: \`{provider:"google_sheets", toolSource:"composio", spreadsheetId, range, topic, keyColumn, rowNumber}\`.
+6. ${COMMIT_INSTRUCTIONS.replace(/{{slug}}/g, ctx.slug).replace(/{{targetFolder}}/g, ctx.targetFolder)}
 `,
   },
 
