@@ -14,7 +14,12 @@
  */
 
 import { query } from '@anthropic-ai/claude-agent-sdk';
-import { MODELS } from '../config.js';
+import {
+  MODELS,
+  applyOneMillionContextRecovery,
+  looksLikeClaudeOneMillionContextError,
+  normalizeClaudeSdkOptionsForOneMillionContext,
+} from '../config.js';
 
 export interface LLMCallOpts {
   model?: string;
@@ -47,20 +52,21 @@ export async function callLLM(prompt: string, opts: LLMCallOpts = {}): Promise<s
     );
   }
 
+  const model = opts.model ?? MODELS.haiku;
   const stream = query({
     prompt,
-    options: {
-      model: opts.model ?? MODELS.haiku,
+    options: normalizeClaudeSdkOptionsForOneMillionContext({
+      model,
       maxTurns: 1,
       systemPrompt: systemParts.join('\n\n') || undefined,
       // No built-in tools: brain calls are pure completions
       tools: [],
-      permissionMode: 'bypassPermissions',
+      permissionMode: 'bypassPermissions' as const,
       // Don't inherit user ~/.claude settings — those pull in hooks,
       // allowed-tool lists, and statusline config that can slow or
       // fail our minimal call.
       settingSources: [],
-    },
+    }),
   });
 
   let assistantText = '';
@@ -74,6 +80,12 @@ export async function callLLM(prompt: string, opts: LLMCallOpts = {}): Promise<s
         }
       }
     } else if (message.type === 'result') {
+      const result = message as { is_error?: boolean; errors?: string[]; result?: string };
+      if (result.is_error) {
+        const errorText = Array.isArray(result.errors) ? result.errors.join('; ') : String(result.result ?? '');
+        if (looksLikeClaudeOneMillionContextError(errorText)) applyOneMillionContextRecovery();
+        throw new Error(errorText || 'Claude SDK query failed');
+      }
       break; // Single-turn done
     }
   }

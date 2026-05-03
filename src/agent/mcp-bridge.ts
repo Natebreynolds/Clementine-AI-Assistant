@@ -11,7 +11,12 @@ import { existsSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import pino from 'pino';
-import { BASE_DIR } from '../config.js';
+import {
+  BASE_DIR,
+  applyOneMillionContextRecovery,
+  looksLikeClaudeOneMillionContextError,
+  normalizeClaudeSdkOptionsForOneMillionContext,
+} from '../config.js';
 import type { ManagedMcpServer } from '../types.js';
 
 const logger = pino({ name: 'clementine.mcp-bridge' });
@@ -495,13 +500,13 @@ export async function probeAvailableTools(force = false): Promise<ToolInventory>
     const externalMcpServers = getMcpServersForAgent();
     const stream = query({
       prompt: 'ok',
-      options: {
+      options: normalizeClaudeSdkOptionsForOneMillionContext({
         systemPrompt: 'Reply ok.',
         model: 'claude-haiku-4-5',
-        permissionMode: 'bypassPermissions',
+        permissionMode: 'bypassPermissions' as const,
         allowDangerouslySkipPermissions: true,
         mcpServers: externalMcpServers,
-      },
+      }),
     });
     let tools: string[] = [];
     for await (const msg of stream as AsyncIterable<any>) {
@@ -509,7 +514,13 @@ export async function probeAvailableTools(force = false): Promise<ToolInventory>
         tools = msg.tools as string[];
         break;
       }
-      if (msg?.type === 'result') break;
+      if (msg?.type === 'result') {
+        if (msg.is_error) {
+          const errorText = Array.isArray(msg.errors) ? msg.errors.join('; ') : String(msg.result ?? '');
+          if (looksLikeClaudeOneMillionContextError(errorText)) applyOneMillionContextRecovery();
+        }
+        break;
+      }
     }
     const inv: ToolInventory = { probedAt: new Date().toISOString(), tools };
     saveToolInventory(inv);
@@ -528,6 +539,7 @@ export async function probeAvailableTools(force = false): Promise<ToolInventory>
     logger.info({ toolCount: tools.length }, 'Tool inventory probed');
     return inv;
   } catch (err) {
+    if (looksLikeClaudeOneMillionContextError(err)) applyOneMillionContextRecovery();
     logger.warn({ err }, 'Tool inventory probe failed — using cached or empty');
     return cached ?? { probedAt: new Date(0).toISOString(), tools: [] };
   }

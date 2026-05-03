@@ -15,6 +15,9 @@ import {
   TASKS_FILE,
   INBOX_DIR,
   MODELS,
+  applyOneMillionContextRecovery,
+  looksLikeClaudeOneMillionContextError,
+  normalizeClaudeSdkOptionsForOneMillionContext,
 } from '../config.js';
 import { listAllGoals } from '../tools/shared.js';
 import type { PersistentGoal, DailyPlan, DailyPlanPriority } from '../types.js';
@@ -264,14 +267,23 @@ Rules:
       let text = '';
       const stream = query({
         prompt,
-        options: {
+        options: normalizeClaudeSdkOptionsForOneMillionContext({
           model: MODELS.haiku,
           maxTurns: 1,
           systemPrompt: 'You are a planning assistant. Analyze the context and produce a prioritized daily plan as JSON. Return only valid JSON, no markdown fencing.',
-        },
+        }),
       });
       for await (const msg of stream) {
-        if (msg.type === 'result') text = (msg as any).result ?? '';
+        if (msg.type === 'result') {
+          if ((msg as any).is_error) {
+            const errorText = Array.isArray((msg as any).errors)
+              ? (msg as any).errors.join('; ')
+              : String((msg as any).result ?? '');
+            if (looksLikeClaudeOneMillionContextError(errorText)) applyOneMillionContextRecovery();
+            throw new Error(errorText || 'Claude SDK query failed');
+          }
+          text = (msg as any).result ?? '';
+        }
       }
 
       if (!text) {
@@ -290,6 +302,7 @@ Rules:
 
       return plan;
     } catch (err) {
+      if (looksLikeClaudeOneMillionContextError(err)) applyOneMillionContextRecovery();
       logger.warn({ err }, 'LLM plan generation failed — using fallback');
       return this.fallbackPlan(today);
     }

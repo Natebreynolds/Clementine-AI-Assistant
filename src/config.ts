@@ -113,6 +113,98 @@ export function claudeCodeDisableOneMillionForModel(
   return modelFamily(model) === 'opus' ? undefined : '1';
 }
 
+function upsertRuntimeEnvValue(baseDir: string, key: string, value: string): void {
+  const envPath = path.join(baseDir, '.env');
+  let text = '';
+  if (existsSync(envPath)) {
+    text = readFileSync(envPath, 'utf-8');
+  } else {
+    fs.mkdirSync(baseDir, { recursive: true });
+  }
+
+  const line = `${key}=${value}`;
+  const re = new RegExp(`^${key}=.*$`, 'm');
+  const next = re.test(text)
+    ? text.replace(re, line)
+    : `${text}${text && !text.endsWith('\n') ? '\n' : ''}${line}\n`;
+  fs.writeFileSync(envPath, next, { mode: 0o600 });
+}
+
+export function looksLikeClaudeOneMillionContextError(value: unknown): boolean {
+  const text = String(value ?? '');
+  return /extra usage.*1m context|1m context.*extra usage|context-1m|1m.*extra usage|requires?.*1m/i.test(text);
+}
+
+export function applyOneMillionContextRecovery(baseDir: string = BASE_DIR): void {
+  process.env.CLEMENTINE_1M_CONTEXT_MODE = 'off';
+  process.env.CLAUDE_CODE_DISABLE_1M_CONTEXT = '1';
+  try {
+    upsertRuntimeEnvValue(baseDir, 'CLEMENTINE_1M_CONTEXT_MODE', 'off');
+    upsertRuntimeEnvValue(baseDir, 'CLAUDE_CODE_DISABLE_1M_CONTEXT', '1');
+  } catch {
+    // Runtime env is already safe. Persisting is best-effort because this path
+    // is often called while handling an SDK failure.
+  }
+}
+
+export function claudeOneMillionEnvForModel(
+  model: string | null | undefined,
+  mode: OneMillionContextMode = currentOneMillionContextMode(),
+): Record<string, string> {
+  const disableValue = claudeCodeDisableOneMillionForModel(model, mode);
+  return {
+    CLEMENTINE_1M_CONTEXT_MODE: mode,
+    ...(disableValue !== undefined ? { CLAUDE_CODE_DISABLE_1M_CONTEXT: disableValue } : {}),
+  };
+}
+
+type ClaudeSdkOptionsLike = {
+  model?: string;
+  env?: Record<string, string | undefined>;
+  betas?: unknown[];
+  mcpServers?: Record<string, unknown>;
+  [key: string]: unknown;
+};
+
+export function normalizeClaudeSdkOptionsForOneMillionContext<T extends ClaudeSdkOptionsLike>(options: T): T {
+  const rawModel = typeof options.model === 'string' ? options.model : '';
+  const model = rawModel ? normalizeClaudeModelForOneMillionContext(rawModel) : rawModel;
+  const oneMillionEnv = claudeOneMillionEnvForModel(model || rawModel || null);
+  const disableValue = oneMillionEnv.CLAUDE_CODE_DISABLE_1M_CONTEXT;
+  const next: ClaudeSdkOptionsLike = {
+    ...options,
+    ...(rawModel ? { model } : {}),
+    env: { ...(options.env ?? {}), ...oneMillionEnv },
+    ...(disableValue === '1' ? { betas: [] } : {}),
+  };
+
+  if (options.mcpServers && typeof options.mcpServers === 'object') {
+    const servers: Record<string, unknown> = {};
+    for (const [name, server] of Object.entries(options.mcpServers)) {
+      if (server && typeof server === 'object' && !Array.isArray(server)) {
+        const serverObj = server as Record<string, unknown>;
+        const supportsEnv = serverObj.type === 'stdio' || 'env' in serverObj;
+        if (!supportsEnv) {
+          servers[name] = server;
+          continue;
+        }
+        const serverEnv = serverObj.env && typeof serverObj.env === 'object' && !Array.isArray(serverObj.env)
+          ? serverObj.env as Record<string, string | undefined>
+          : {};
+        servers[name] = {
+          ...serverObj,
+          env: { ...serverEnv, ...oneMillionEnv },
+        };
+      } else {
+        servers[name] = server;
+      }
+    }
+    next.mcpServers = servers;
+  }
+
+  return next as T;
+}
+
 export function normalizeClaudeModelForOneMillionContext(
   model: string,
   mode: OneMillionContextMode = currentOneMillionContextMode(),

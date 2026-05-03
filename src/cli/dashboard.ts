@@ -32,7 +32,13 @@ import { TunnelManager } from './tunnel.js';
 import type { RemoteAccessConfig, SessionRecord } from '../types.js';
 import { AgentManager } from '../agent/agent-manager.js';
 import { discoverMcpServers, getClaudeIntegrations } from '../agent/mcp-bridge.js';
-import { AGENTS_DIR, SESSIONS_FILE } from '../config.js';
+import {
+  AGENTS_DIR,
+  SESSIONS_FILE,
+  applyOneMillionContextRecovery,
+  looksLikeClaudeOneMillionContextError,
+  normalizeClaudeSdkOptionsForOneMillionContext,
+} from '../config.js';
 import { parseTasks } from '../tools/shared.js';
 import { todayISO } from '../gateway/cron-scheduler.js';
 import { goalsRouter } from './routes/goals.js';
@@ -2039,7 +2045,14 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
       const { query: sdkQuery } = await import('@anthropic-ai/claude-agent-sdk');
       // Close any previous auth query
       if (oauthQuery) { try { oauthQuery.close(); } catch { /* ignore */ } }
-      oauthQuery = sdkQuery({ prompt: '', options: { permissionMode: 'bypassPermissions' as any, allowDangerouslySkipPermissions: true, maxTurns: 0 } });
+      oauthQuery = sdkQuery({
+        prompt: '',
+        options: normalizeClaudeSdkOptionsForOneMillionContext({
+          permissionMode: 'bypassPermissions' as any,
+          allowDangerouslySkipPermissions: true,
+          maxTurns: 0,
+        }),
+      });
       const result = await (oauthQuery as any).claudeAuthenticate(true);
       res.json({ ok: true, result });
     } catch (err) {
@@ -3853,15 +3866,15 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
 Return ONLY a JSON array. Each element must be an object with shape \`{"id": string, "label": string, "sublabel"?: string}\`. Use the source system's stable id for \`id\` (so the feed can reference it later). Use a short human-readable title for \`label\`. Optional \`sublabel\` can include path, email, date, or any disambiguating detail.
 Do NOT include prose, markdown, code fences, or explanation. Just the JSON array.
 If the tool returns nothing or errors, return an empty array \`[]\`.`,
-        options: {
+        options: normalizeClaudeSdkOptionsForOneMillionContext({
           model: MODELS.haiku,
           maxTurns: 3,
           systemPrompt: 'You are a data enumerator. You call the given tool once, extract the items from its response, and emit a strict JSON array. No commentary.',
           allowedTools: [tool],
           mcpServers,
-          permissionMode: 'bypassPermissions',
+          permissionMode: 'bypassPermissions' as const,
           settingSources: [],
-        },
+        }),
       });
 
       let text = '';
@@ -3872,6 +3885,12 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
             if (block.type === 'text' && typeof block.text === 'string') text += block.text;
           }
         } else if ((msg as any).type === 'result') {
+          if ((msg as any).is_error) {
+            const errorText = Array.isArray((msg as any).errors)
+              ? (msg as any).errors.join('; ')
+              : String((msg as any).result ?? '');
+            if (looksLikeClaudeOneMillionContextError(errorText)) applyOneMillionContextRecovery();
+          }
           break;
         }
       }
@@ -3889,6 +3908,7 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
       // returned nothing matching, agent refused in prose).
       res.json({ items, cached: false, rawPreview: text.slice(0, 400) });
     } catch (err) {
+      if (looksLikeClaudeOneMillionContextError(err)) applyOneMillionContextRecovery();
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }
   });
@@ -6210,19 +6230,27 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
           let result = '';
           const stream = query({
             prompt,
-            options: {
+            options: normalizeClaudeSdkOptionsForOneMillionContext({
               model: 'claude-haiku-4-5-20251001',
               maxTurns: 1,
               systemPrompt: 'You are a memory consolidation assistant. Extract only facts directly evidenced by the corpus. Be terse. Output exactly the requested format.',
-            },
+            }),
           });
           for await (const msg of stream) {
             if ((msg as { type?: string }).type === 'result') {
+              if ((msg as { is_error?: boolean }).is_error) {
+                const errorText = Array.isArray((msg as { errors?: string[] }).errors)
+                  ? ((msg as { errors?: string[] }).errors ?? []).join('; ')
+                  : String((msg as { result?: string }).result ?? '');
+                if (looksLikeClaudeOneMillionContextError(errorText)) applyOneMillionContextRecovery();
+                return '';
+              }
               result = (msg as { result?: string }).result ?? '';
             }
           }
           return result;
-        } catch {
+        } catch (err) {
+          if (looksLikeClaudeOneMillionContextError(err)) applyOneMillionContextRecovery();
           return '';
         }
       };

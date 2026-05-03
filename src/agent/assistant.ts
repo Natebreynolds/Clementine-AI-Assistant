@@ -59,6 +59,9 @@ import {
   claudeCodeDisableOneMillionForModel,
   currentOneMillionContextMode,
   normalizeClaudeModelForOneMillionContext,
+  normalizeClaudeSdkOptionsForOneMillionContext,
+  applyOneMillionContextRecovery,
+  looksLikeClaudeOneMillionContextError,
   usesOneMillionContext,
   envSnapshot,
 } from '../config.js';
@@ -357,7 +360,7 @@ const query: typeof rawQuery = ((args: Parameters<typeof rawQuery>[0]) => {
       if (typeof opts.appendSystemPrompt === 'string') {
         newOpts.appendSystemPrompt = stripLoneSurrogates(opts.appendSystemPrompt);
       }
-      cleaned.options = newOpts;
+      cleaned.options = normalizeClaudeSdkOptionsForOneMillionContext(newOpts);
     }
     return rawQuery(cleaned);
   }
@@ -409,8 +412,7 @@ function resultInputTokens(result: SDKResultMessage): number {
 }
 
 export function looksLikeOneMillionContextError(value: unknown): boolean {
-  const text = String(value ?? '');
-  return /extra usage.*1m context|1m context.*extra usage|context-1m/i.test(text);
+  return looksLikeClaudeOneMillionContextError(value);
 }
 
 export function looksLikeNoResponseRequested(value: unknown): boolean {
@@ -3776,15 +3778,14 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
                       'Claude says the account credit balance is too low. I paused background jobs for a few hours so they stop draining/retrying, but interactive chat will also fail until credits are available again.'
                     );
                   } else if (looksLikeOneMillionContextError(errorText)) {
-                    process.env.CLEMENTINE_1M_CONTEXT_MODE = 'off';
-                    process.env.CLAUDE_CODE_DISABLE_1M_CONTEXT = '1';
+                    applyOneMillionContextRecovery();
                     if (sessionKey) {
                       this.sessions.delete(sessionKey);
                       this.exchangeCounts.set(sessionKey, 0);
                       this._compactedSessions.delete(sessionKey);
                     }
                     responseText = responseText || (
-                      "Claude rejected 1M context for this account. I've switched this process to 200K recovery mode and reset the session. To persist the fix across restarts, run `clementine budgets safe`, then `clementine restart`."
+                      "Claude rejected 1M context for this account. I've switched Clementine to persistent 200K recovery mode and reset the session. Restart Clementine once so every background worker starts with the same safe setting."
                     );
                   } else if (lower.includes('rate') && lower.includes('limit')) {
                     hitRateLimit = true;
@@ -3891,15 +3892,14 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
               'Claude says the account credit balance is too low. I paused background jobs for a few hours so they stop draining/retrying, but interactive chat will also fail until credits are available again.'
             );
           } else if (looksLikeOneMillionContextError(e)) {
-            process.env.CLEMENTINE_1M_CONTEXT_MODE = 'off';
-            process.env.CLAUDE_CODE_DISABLE_1M_CONTEXT = '1';
+            applyOneMillionContextRecovery();
             if (sessionKey) {
               this.sessions.delete(sessionKey);
               this.exchangeCounts.set(sessionKey, 0);
               this._compactedSessions.delete(sessionKey);
             }
             responseText = responseText || (
-              "Claude rejected 1M context for this account. I've switched this process to 200K recovery mode and reset the session. To persist the fix across restarts, run `clementine budgets safe`, then `clementine restart`."
+              "Claude rejected 1M context for this account. I've switched Clementine to persistent 200K recovery mode and reset the session. Restart Clementine once so every background worker starts with the same safe setting."
             );
           } else if (errStr.includes('rate') && (errStr.includes('limit') || errStr.includes('rate_limit'))) {
             hitRateLimit = true;
@@ -5228,8 +5228,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
             throw new Error(errText);
           }
           if (looksLikeOneMillionContextError(errText)) {
-            process.env.CLEMENTINE_1M_CONTEXT_MODE = 'off';
-            process.env.CLAUDE_CODE_DISABLE_1M_CONTEXT = '1';
+            applyOneMillionContextRecovery();
             throw new Error(errText);
           }
         }
@@ -5597,8 +5596,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
                 throw new Error(exitText);
               }
               if (looksLikeOneMillionContextError(exitText)) {
-                process.env.CLEMENTINE_1M_CONTEXT_MODE = 'off';
-                process.env.CLAUDE_CODE_DISABLE_1M_CONTEXT = '1';
+                applyOneMillionContextRecovery();
                 throw new Error(exitText);
               }
             }

@@ -16,7 +16,12 @@ import path from 'node:path';
 import pdfParse from 'pdf-parse';
 import type { RawRecord } from '../../types.js';
 import { contentHash } from './common.js';
-import { MODELS } from '../../config.js';
+import {
+  MODELS,
+  applyOneMillionContextRecovery,
+  looksLikeClaudeOneMillionContextError,
+  normalizeClaudeSdkOptionsForOneMillionContext,
+} from '../../config.js';
 
 export async function* parsePdf(filePath: string): AsyncIterable<RawRecord> {
   let buf: Buffer;
@@ -93,15 +98,15 @@ async function ocrPdfViaClaude(filePath: string): Promise<string[]> {
     const { query } = await import('@anthropic-ai/claude-agent-sdk');
     const stream = query({
       prompt: `Read the PDF at ${JSON.stringify(filePath)} using the Read tool. Transcribe every page's text verbatim — preserve the reading order, headings, lists, and paragraphs exactly as they appear. Separate pages with the form-feed character (\\f). Do NOT summarize, paraphrase, add commentary, or wrap in code fences. Output only the transcribed text.`,
-      options: {
+      options: normalizeClaudeSdkOptionsForOneMillionContext({
         model: MODELS.haiku,
         maxTurns: 4, // Read tool call + response (a few turns of thinking is fine)
         systemPrompt: 'You are a faithful OCR transcriber. Copy text exactly as written. When the PDF has images or scans, read the text from them using vision. Never invent content.',
         // Claude Code's built-in Read tool handles PDFs (text + vision)
         allowedTools: ['Read'],
-        permissionMode: 'bypassPermissions',
+        permissionMode: 'bypassPermissions' as const,
         settingSources: [],
-      },
+      }),
     });
     let text = '';
     for await (const message of stream) {
@@ -114,13 +119,20 @@ async function ocrPdfViaClaude(filePath: string): Promise<string[]> {
           }
         }
       } else if (message.type === 'result') {
+        const result = message as { is_error?: boolean; errors?: string[]; result?: string };
+        if (result.is_error) {
+          const errorText = Array.isArray(result.errors) ? result.errors.join('; ') : String(result.result ?? '');
+          if (looksLikeClaudeOneMillionContextError(errorText)) applyOneMillionContextRecovery();
+          return [];
+        }
         break;
       }
     }
     const cleaned = text.trim();
     if (cleaned.length < 20) return [];
     return splitPages(cleaned);
-  } catch {
+  } catch (err) {
+    if (looksLikeClaudeOneMillionContextError(err)) applyOneMillionContextRecovery();
     return [];
   }
 }

@@ -13,7 +13,14 @@
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import pino from 'pino';
-import { BASE_DIR, GOALS_DIR, MODELS } from '../config.js';
+import {
+  BASE_DIR,
+  GOALS_DIR,
+  MODELS,
+  applyOneMillionContextRecovery,
+  looksLikeClaudeOneMillionContextError,
+  normalizeClaudeSdkOptionsForOneMillionContext,
+} from '../config.js';
 import { listAllGoals } from '../tools/shared.js';
 import type { DailyPlan, PersistentGoal } from '../types.js';
 
@@ -49,14 +56,23 @@ async function llmJsonCall(prompt: string, systemPrompt: string): Promise<string
   let text = '';
   const stream = query({
     prompt,
-    options: {
+    options: normalizeClaudeSdkOptionsForOneMillionContext({
       model: MODELS.haiku,
       maxTurns: 1,
       systemPrompt,
-    },
+    }),
   });
   for await (const msg of stream) {
-    if (msg.type === 'result') text = (msg as any).result ?? '';
+    if (msg.type === 'result') {
+      if ((msg as any).is_error) {
+        const errorText = Array.isArray((msg as any).errors)
+          ? (msg as any).errors.join('; ')
+          : String((msg as any).result ?? '');
+        if (looksLikeClaudeOneMillionContextError(errorText)) applyOneMillionContextRecovery();
+        throw new Error(errorText || 'Claude SDK query failed');
+      }
+      text = (msg as any).result ?? '';
+    }
   }
   return text;
 }
