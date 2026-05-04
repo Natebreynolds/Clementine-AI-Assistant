@@ -13857,7 +13857,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
     <div class="page" id="page-build">
       <div class="tab-bar" id="build-tabs" style="margin:0;padding:0 18px;background:var(--bg-secondary);border-bottom:1px solid var(--border)">
         <button class="active" data-build-tab="workflows" data-icon="workflow" onclick="switchBuildTab('workflows')"><span class="icon-slot"></span> Workflows</button>
-        <button data-build-tab="crons" data-icon="clock" onclick="switchBuildTab('crons')"><span class="icon-slot"></span> Crons <span class="tab-badge" id="build-tab-cron-count" style="display:none">0</span></button>
+        <button data-build-tab="crons" data-icon="clock" onclick="switchBuildTab('crons')"><span class="icon-slot"></span> Scheduled Tasks <span class="tab-badge" id="build-tab-cron-count" style="display:none">0</span></button>
         <button data-build-tab="skills" data-icon="shield" onclick="switchBuildTab('skills')"><span class="icon-slot"></span> Skills <span class="tab-badge" id="build-tab-skill-count" style="display:none">0</span></button>
         <button data-build-tab="templates" data-icon="fileText" onclick="switchBuildTab('templates')"><span class="icon-slot"></span> Templates</button>
       </div>
@@ -13888,10 +13888,10 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
             <div class="empty-state" id="builder-empty-state" style="margin-top:40px">
               <p style="color:var(--text-muted);margin-bottom:12px">Describe what you want to build.</p>
               <div style="display:flex;flex-wrap:wrap;gap:8px;justify-content:center">
-                <button class="btn btn-sm quick-pill" onclick="builderQuick('Create a cron job that checks my email every morning and sends me a summary')">Email summary cron</button>
-                <button class="btn btn-sm quick-pill" onclick="builderQuick('Create an SDR agent that researches leads and drafts outreach emails')">SDR agent</button>
-                <button class="btn btn-sm quick-pill" onclick="builderQuick('Build a weekly analytics report that checks SEO rankings')">Weekly SEO report</button>
                 <button class="btn btn-sm quick-pill" onclick="builderQuick('Create a workflow that researches a topic, writes a draft, and sends it for review')">Research workflow</button>
+                <button class="btn btn-sm quick-pill" onclick="builderQuick('Create a workflow that reviews open PRs, summarizes risk, and sends a digest')">PR review digest</button>
+                <button class="btn btn-sm quick-pill" onclick="builderQuick('Create a workflow that collects leads, scores them against my ICP, and prepares outreach drafts')">Lead research flow</button>
+                <button class="btn btn-sm quick-pill" onclick="builderQuick('Create a workflow that reviews recent notes, extracts open items, and drafts next priorities')">Weekly review workflow</button>
               </div>
             </div>
           </div>
@@ -13941,8 +13941,6 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
               <div onclick="_builderAddNodeOfKind('mcp')" class="builder-palette-item" data-kind="mcp">mcp tool</div>
               <div onclick="_builderAddNodeOfKind('channel')" class="builder-palette-item" data-kind="channel">channel</div>
               <div onclick="_builderAddNodeOfKind('transform')" class="builder-palette-item" data-kind="transform">transform</div>
-              <div onclick="_builderAddNodeOfKind('conditional')" class="builder-palette-item" data-kind="conditional">conditional</div>
-              <div onclick="_builderAddNodeOfKind('loop')" class="builder-palette-item" data-kind="loop">loop</div>
             </div>
             <!-- Slide-out config panel -->
             <div id="builder-config-panel" style="display:none;position:absolute;right:0;top:0;bottom:0;width:340px;background:var(--bg-secondary);border-left:1px solid var(--border);box-shadow:-4px 0 16px rgba(0,0,0,0.15);z-index:12;flex-direction:column"></div>
@@ -13972,6 +13970,18 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
         </div>
       </div>
 
+      <!-- Scheduled Tasks tab — simple recurring-task management. The visual canvas is for workflows. -->
+      <div id="build-tab-crons" data-build-tabpane="crons" style="display:none;flex:1;min-height:0;overflow-y:auto;padding:18px;background:var(--bg-primary)">
+        <div style="display:flex;align-items:flex-start;gap:14px;margin-bottom:16px;flex-wrap:wrap">
+          <div style="flex:1;min-width:260px">
+            <h2 style="font-size:18px;font-weight:600;margin:0 0 4px;color:var(--text-primary)">Scheduled Tasks</h2>
+            <p style="font-size:13px;color:var(--text-muted);margin:0;line-height:1.45">Create and tune recurring agent jobs. Use workflows only when the job needs an explicit multi-step canvas.</p>
+          </div>
+          <button class="btn-sm btn-primary" onclick="newFromBuildHeader()" style="padding:7px 14px;border-radius:6px;cursor:pointer;font-size:12px">New Scheduled Task</button>
+        </div>
+        <div id="panel-cron"></div>
+      </div>
+
       <!-- Templates tab — starter patterns -->
       <div id="build-tab-templates" data-build-tabpane="templates" style="display:none;padding:24px;overflow-y:auto">
         <div style="max-width:920px;margin:0 auto">
@@ -13981,8 +13991,8 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
             <div class="card clickable-row" onclick="forkBuildTemplate('daily-news-digest')" style="padding:18px">
               <div style="font-size:24px;margin-bottom:8px">&#128240;</div>
               <div style="font-weight:600;font-size:14px;margin-bottom:4px">Daily news digest</div>
-              <div style="font-size:12px;color:var(--text-muted);line-height:1.4">Cron 7am: pull RSS sources, summarize, send to Slack/email.</div>
-              <div style="margin-top:10px;font-size:11px;color:var(--clementine);font-weight:500">cron · 4 steps</div>
+              <div style="font-size:12px;color:var(--text-muted);line-height:1.4">Scheduled 7am: pull RSS sources, summarize, send to Slack/email.</div>
+              <div style="margin-top:10px;font-size:11px;color:var(--clementine);font-weight:500">scheduled workflow · 4 steps</div>
             </div>
             <div class="card clickable-row" onclick="forkBuildTemplate('lead-picker')" style="padding:18px">
               <div style="font-size:24px;margin-bottom:8px">&#128202;</div>
@@ -13993,20 +14003,20 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
             <div class="card clickable-row" onclick="forkBuildTemplate('pr-review-queue')" style="padding:18px">
               <div style="font-size:24px;margin-bottom:8px">&#128221;</div>
               <div style="font-weight:600;font-size:14px;margin-bottom:4px">PR review queue</div>
-              <div style="font-size:12px;color:var(--text-muted);line-height:1.4">Cron 9am M-F: list open PRs, summarize risk, message to Slack.</div>
-              <div style="margin-top:10px;font-size:11px;color:var(--clementine);font-weight:500">cron · 3 steps</div>
+              <div style="font-size:12px;color:var(--text-muted);line-height:1.4">Scheduled 9am M-F: list open PRs, summarize risk, message to Slack.</div>
+              <div style="margin-top:10px;font-size:11px;color:var(--clementine);font-weight:500">scheduled workflow · 3 steps</div>
             </div>
             <div class="card clickable-row" onclick="forkBuildTemplate('email-triage')" style="padding:18px">
               <div style="font-size:24px;margin-bottom:8px">&#128231;</div>
               <div style="font-weight:600;font-size:14px;margin-bottom:4px">Email triage</div>
-              <div style="font-size:12px;color:var(--text-muted);line-height:1.4">Cron 8am: list unread emails, classify by intent, draft replies for review.</div>
-              <div style="margin-top:10px;font-size:11px;color:var(--clementine);font-weight:500">cron · 4 steps</div>
+              <div style="font-size:12px;color:var(--text-muted);line-height:1.4">Scheduled 8am: list unread emails, classify by intent, draft replies for review.</div>
+              <div style="margin-top:10px;font-size:11px;color:var(--clementine);font-weight:500">scheduled workflow · 4 steps</div>
             </div>
             <div class="card clickable-row" onclick="forkBuildTemplate('weekly-review')" style="padding:18px">
               <div style="font-size:24px;margin-bottom:8px">&#128197;</div>
               <div style="font-weight:600;font-size:14px;margin-bottom:4px">Weekly review</div>
-              <div style="font-size:12px;color:var(--text-muted);line-height:1.4">Cron Fri 6pm: review the week's daily notes, generate review note.</div>
-              <div style="margin-top:10px;font-size:11px;color:var(--clementine);font-weight:500">cron · 3 steps</div>
+              <div style="font-size:12px;color:var(--text-muted);line-height:1.4">Scheduled Fri 6pm: review the week's daily notes, generate review note.</div>
+              <div style="margin-top:10px;font-size:11px;color:var(--clementine);font-weight:500">scheduled workflow · 3 steps</div>
             </div>
             <div class="card clickable-row" onclick="forkBuildTemplate('blank-workflow')" style="padding:18px;border-style:dashed">
               <div style="font-size:24px;margin-bottom:8px">&#10133;</div>
@@ -14027,7 +14037,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
          si-* status cards/proposals/history, teach-skill-form, panel-skills,
          pending-skills-card, panel-workflows, advisor-analytics-content.) -->
     <!-- (Session 5) page-automations parking removed. Self-Improve now lives in
-         Brain → Learning; Build (Workflows/Crons/Skills/Templates) is the home for
+         Brain → Learning; Build (Workflows/Scheduled Tasks/Skills/Templates) is the home for
          everything else that was here. -->
 
     <!-- page-team-status merged into Team → Activity tab.
@@ -17281,7 +17291,7 @@ function switchDestTab(page, tab) {
 
 // (Session 5) openAutomationsTab compat shim removed — all callers route via navigateTo + ROUTE_REDIRECTS.
 
-// ── Build (Workflows / Crons / Skills / Templates) tabs ─────────────
+// ── Build (Workflows / Scheduled Tasks / Skills / Templates) tabs ─────────────
 function switchBuildTab(tab) {
   if (!tab) tab = 'workflows';
   // Update tab-bar active state
@@ -17290,6 +17300,7 @@ function switchBuildTab(tab) {
   });
   // Show/hide tab panes
   var workPane = document.getElementById('build-tab-workflows');
+  var cronPane = document.getElementById('build-tab-crons');
   var tplPane = document.getElementById('build-tab-templates');
   var headerStrip = document.getElementById('build-header-strip');
   // Always close any open workflow when changing tabs — switching context
@@ -17297,10 +17308,29 @@ function switchBuildTab(tab) {
   if (typeof closeBuilderCanvas === 'function') closeBuilderCanvas();
   if (tab === 'templates') {
     if (workPane) workPane.style.display = 'none';
+    if (cronPane) cronPane.style.display = 'none';
     if (tplPane) tplPane.style.display = '';
     if (headerStrip) headerStrip.style.display = 'none';
+  } else if (tab === 'crons') {
+    if (workPane) workPane.style.display = 'none';
+    if (cronPane) cronPane.style.display = 'block';
+    if (tplPane) tplPane.style.display = 'none';
+    if (headerStrip) headerStrip.style.display = 'flex';
+    var typeSelCron = document.getElementById('builder-type');
+    if (typeSelCron) typeSelCron.value = 'cron';
+    var saveBtnCron = document.getElementById('builder-save-btn');
+    var testBtnCron = document.getElementById('builder-test-btn');
+    var statusCron = document.getElementById('builder-preview-status');
+    if (saveBtnCron) saveBtnCron.style.display = 'none';
+    if (testBtnCron) testBtnCron.style.display = 'none';
+    if (statusCron) statusCron.textContent = '';
+    if (typeof populateBuilderOwnerPicker === 'function') {
+      populateBuilderOwnerPicker().catch(function() { /* */ });
+    }
+    if (typeof refreshCron === 'function') refreshCron();
   } else {
     if (workPane) workPane.style.display = 'flex';
+    if (cronPane) cronPane.style.display = 'none';
     if (tplPane) tplPane.style.display = 'none';
     if (headerStrip) headerStrip.style.display = 'flex';
     // Map build-tab → builder-type so the canvas + chat reflect the tab.
@@ -17334,8 +17364,8 @@ function switchBuildTab(tab) {
   }
 }
 
-// "New" button in the Build header strip — context-aware. Crons open the
-// dedicated cron modal so the entry lands in CRON.md (not as a one-step
+// "New" button in the Build header strip — context-aware. Scheduled Tasks
+// open the dedicated cron modal so the entry lands in CRON.md (not as a one-step
 // workflow file). Workflows route through /api/builder/workflows. Owner is
 // read from the header's Owner picker — empty string means global.
 async function newFromBuildHeader() {
@@ -17411,6 +17441,11 @@ async function onBuilderOwnerChange() {
   var label = document.getElementById('builder-agent-label');
   if (hidden) hidden.value = owner || '';
   if (label) label.textContent = owner ? 'Owner: ' + owner : '';
+  var activeTab = document.querySelector('#build-tabs button.active')?.getAttribute('data-build-tab') || 'workflows';
+  if (activeTab === 'crons') {
+    if (typeof refreshCron === 'function') refreshCron();
+    return;
+  }
   var typeSel = document.getElementById('builder-type');
   var type = typeSel && typeSel.value === 'cron' ? 'cron' : 'workflow';
   await refreshBuilderCanvasPicker(type);
@@ -17469,8 +17504,8 @@ async function forkBuildTemplate(templateId) {
     });
     if (r && r.error) { toast('Create failed: ' + r.error, 'error'); return; }
     if (r && r.id) {
-      switchBuildTab(tpl.schedule ? 'crons' : 'workflows');
-      refreshBuilderCanvasPicker(tpl.schedule ? 'cron' : 'workflow');
+      switchBuildTab('workflows');
+      refreshBuilderCanvasPicker('workflow');
       setTimeout(function() { openBuilderWorkflow(r.id); }, 200);
       toast('Forked template: ' + name, 'success');
     }
@@ -17501,7 +17536,7 @@ function openCommandK() {
     { kw: 'home today plan',    page: 'home',     tab: 'today',        label: 'Home · Today' },
     { kw: 'home activity',      page: 'home',     tab: 'activity',     label: 'Home · Activity' },
     { kw: 'build workflows',    page: 'build',    tab: 'workflows',    label: 'Build · Workflows' },
-    { kw: 'build crons',        page: 'build',    tab: 'crons',        label: 'Build · Crons' },
+    { kw: 'build crons scheduled tasks', page: 'build', tab: 'crons', label: 'Build · Scheduled Tasks' },
     { kw: 'build skills',       page: 'build',    tab: 'skills',       label: 'Build · Skills' },
     { kw: 'build templates',    page: 'build',    tab: 'templates',    label: 'Build · Templates' },
     { kw: 'team roster',        page: 'team',     tab: 'roster',       label: 'Team · Roster' },
@@ -18980,16 +19015,35 @@ async function refreshCron() {
     const r = await apiFetch('/api/cron');
     const d = await r.json();
     cronJobsData = d.jobs || [];
-    document.getElementById('nav-cron-count').textContent = cronJobsData.length;
+    var navCount = document.getElementById('nav-cron-count');
+    if (navCount) navCount.textContent = cronJobsData.length;
+    var tabCount = document.getElementById('build-tab-cron-count');
+    if (tabCount) {
+      tabCount.textContent = cronJobsData.length;
+      tabCount.style.display = cronJobsData.length > 0 ? '' : 'none';
+    }
 
-    if (cronJobsData.length === 0) {
-      document.getElementById('panel-cron').innerHTML = '<div class="task-grid"><div class="task-card-add" onclick="openCreateCronModal()">+ New Task</div></div>';
+    var panel = document.getElementById('panel-cron');
+    if (!panel) return;
+
+    var activeBuildTab = document.querySelector('#build-tabs button.active')?.getAttribute('data-build-tab') || '';
+    var ownerFilter = currentPage === 'build' && activeBuildTab === 'crons'
+      ? ((document.getElementById('builder-owner') || {}).value || '')
+      : '';
+    var visibleJobs = currentPage === 'build' && activeBuildTab === 'crons'
+      ? cronJobsData.filter(function(j) { return ownerFilter ? j.agent === ownerFilter : !j.agent; })
+      : cronJobsData;
+
+    if (visibleJobs.length === 0) {
+      var emptyLabel = ownerFilter ? 'No scheduled tasks for ' + ownerFilter : 'No global scheduled tasks';
+      panel.innerHTML = '<div class="task-grid"><div class="task-card-add" onclick="openCreateCronModal((document.getElementById(\\x27builder-owner\\x27)||{}).value||\\x27\\x27)">+ New Task</div></div>'
+        + '<div class="empty-state" style="padding:18px;color:var(--text-muted);font-size:13px">' + esc(emptyLabel) + '</div>';
       return;
     }
 
     // Group jobs: main (no agent) first, then by agent slug
     var groups = {};
-    for (const job of cronJobsData) {
+    for (const job of visibleJobs) {
       var g = job.agent || '_main';
       if (!groups[g]) groups[g] = [];
       groups[g].push(job);
@@ -19064,7 +19118,7 @@ async function refreshCron() {
       }
       // Add "new task" card only to the main group
       if (groupKey === '_main') {
-        html += '<div class="task-card-add" onclick="openCreateCronModal()">+ New Task</div>';
+        html += '<div class="task-card-add" onclick="openCreateCronModal((document.getElementById(\\x27builder-owner\\x27)||{}).value||\\x27\\x27)">+ New Task</div>';
       }
       html += '</div>';
     }
@@ -19107,10 +19161,10 @@ async function refreshCron() {
       }
     } catch(ue) { /* unleashed status is optional */ }
 
-    document.getElementById('panel-cron').innerHTML = html;
+    panel.innerHTML = html;
 
     // Attach trace button handlers via delegation
-    document.getElementById('panel-cron').onclick = function(ev) {
+    panel.onclick = function(ev) {
       var target = ev.target;
       while (target && target.id !== 'panel-cron') {
         if (target.dataset && target.dataset.traceJob) {
@@ -22024,7 +22078,7 @@ function openSkillStudio() {
   // Pre-set type to skill before navigating
   var typeSelect = document.getElementById('builder-type');
   if (typeSelect) typeSelect.value = 'skill';
-  navigateTo('builder');
+  navigateTo('build', { tab: 'skills' });
   // Update the UI for skill mode
   updateBuilderMode();
   // Show skill-specific empty state
@@ -22072,7 +22126,7 @@ function updateBuilderMode() {
     if (validateBtn) validateBtn.style.display = '';
     if (dryrunBtn) dryrunBtn.style.display = '';
     if (testBtn) testBtn.style.display = '';
-    if (paneTitle) paneTitle.textContent = (type === 'cron' ? 'Crons' : 'Workflows');
+    if (paneTitle) paneTitle.textContent = (type === 'cron' ? 'Scheduled Tasks' : 'Workflows');
     refreshBuilderCanvasPicker(type);
   } else {
     if (preview) preview.style.display = '';
@@ -22360,7 +22414,7 @@ async function validateBuilderCanvas() {
 async function deleteCurrentBuilderWorkflow() {
   if (!_builderCanvasOpenId) return;
   if (!_builderCanvasOpenId.startsWith('workflow:')) {
-    toast('Cron entries can\\x27t be deleted from here — disable instead.', 'info');
+    toast('Scheduled tasks can\\x27t be deleted from here — disable instead.', 'info');
     return;
   }
   var name = _builderCanvasOpenId.replace(/^workflow:/, '');
@@ -22834,7 +22888,7 @@ async function editSkillInBuilder(name, agentSlug) {
     if (d.error) { toast(d.error, 'error'); return; }
 
     // Switch to builder page
-    navigateTo('builder');
+    navigateTo('build', { tab: 'skills' });
 
     // Set type to skill
     var typeSelect = document.getElementById('builder-type');
@@ -22887,12 +22941,35 @@ async function editSkillInBuilder(name, agentSlug) {
   }
 }
 
+function builderEmptyStateHtml(type) {
+  if (type === 'skill') {
+    return '<div class="empty-state" style="margin-top:40px">'
+      + '<p style="color:var(--text-muted);margin-bottom:8px;font-size:15px;font-weight:600">Skill Studio</p>'
+      + '<p style="color:var(--text-muted);margin-bottom:16px;font-size:13px">Teach a new skill by describing it, attach reference files, link tools, test it, then save.</p>'
+      + '<div style="display:flex;flex-wrap:wrap;gap:8px;justify-content:center">'
+      + '<button class="btn btn-sm quick-pill" onclick="builderQuick(\\x27Teach a skill for deploying to production — run tests, build, push, verify\\x27)">Deploy to prod</button>'
+      + '<button class="btn btn-sm quick-pill" onclick="builderQuick(\\x27Teach a skill for writing a weekly status report from git commits and calendar\\x27)">Weekly status report</button>'
+      + '<button class="btn btn-sm quick-pill" onclick="builderQuick(\\x27Teach a skill for onboarding a new team member — set up accounts, send welcome email\\x27)">Onboard team member</button>'
+      + '<button class="btn btn-sm quick-pill" onclick="builderQuick(\\x27Teach a skill for researching a company before a sales call\\x27)">Company research</button>'
+      + '</div></div>';
+  }
+  return '<div class="empty-state" style="margin-top:40px">'
+    + '<p style="color:var(--text-muted);margin-bottom:12px">Describe the workflow you want to build.</p>'
+    + '<div style="display:flex;flex-wrap:wrap;gap:8px;justify-content:center">'
+    + '<button class="btn btn-sm quick-pill" onclick="builderQuick(\\x27Create a workflow that researches a topic, writes a draft, and sends it for review\\x27)">Research workflow</button>'
+    + '<button class="btn btn-sm quick-pill" onclick="builderQuick(\\x27Create a workflow that reviews open PRs, summarizes risk, and sends a digest\\x27)">PR review digest</button>'
+    + '<button class="btn btn-sm quick-pill" onclick="builderQuick(\\x27Create a workflow that collects leads, scores them against my ICP, and prepares outreach drafts\\x27)">Lead research flow</button>'
+    + '<button class="btn btn-sm quick-pill" onclick="builderQuick(\\x27Create a workflow that reviews recent notes, extracts open items, and drafts next priorities\\x27)">Weekly review workflow</button>'
+    + '</div></div>';
+}
+
 function resetBuilder() {
   builderArtifact = null;
   builderSending = false;
   _builderLinkedTools = [];
+  var type = (document.getElementById('builder-type') || {}).value || 'workflow';
   var msgs = document.getElementById('builder-messages');
-  if (msgs) msgs.innerHTML = '<div class="empty-state" style="margin-top:40px"><p style="color:var(--text-muted);margin-bottom:12px">Describe what you want to build.</p><div style="display:flex;flex-wrap:wrap;gap:8px;justify-content:center"><button class="btn btn-sm quick-pill" onclick="builderQuick(\\x27Create a cron job that checks my email every morning and sends me a summary\\x27)">Email summary cron</button><button class="btn btn-sm quick-pill" onclick="builderQuick(\\x27Create an SDR agent that researches leads and drafts outreach emails\\x27)">SDR agent</button><button class="btn btn-sm quick-pill" onclick="builderQuick(\\x27Build a weekly analytics report that checks SEO rankings\\x27)">Weekly SEO report</button><button class="btn btn-sm quick-pill" onclick="builderQuick(\\x27Create a workflow that researches a topic, writes a draft, and sends it for review\\x27)">Research workflow</button></div></div>';
+  if (msgs) msgs.innerHTML = builderEmptyStateHtml(type);
   var preview = document.getElementById('builder-preview');
   if (preview) preview.innerHTML = '<div class="empty-state" style="font-size:13px;color:var(--text-muted)">The artifact will appear here as you build it</div>';
   var saveBtn = document.getElementById('builder-save-btn');
@@ -22906,24 +22983,19 @@ function resetBuilder() {
   _builderAttachments = [];
   renderBuilderAttachments();
   // Tell server to reset session so next message gets the full prefix
-  var type = (document.getElementById('builder-type') || {}).value;
   var agent = (document.getElementById('builder-agent') || {}).value;
   apiJson('POST', '/api/builder/reset', { artifactType: type, agentSlug: agent || undefined }).catch(function(){});
 }
 
 function builderQuick(text) {
   var sel = document.getElementById('builder-type');
-  var lower = text.toLowerCase();
-  if (lower.includes('agent') || lower.includes('hire') || lower.includes('team member') || lower.includes('sdr')) {
-    sel.value = 'agent';
-  } else if (lower.includes('workflow') || lower.includes('pipeline') || lower.includes('multi-step')) {
-    sel.value = 'workflow';
-  } else if (lower.includes('cron') || lower.includes('scheduled') || lower.includes('every')) {
-    sel.value = 'cron';
-  } else {
-    sel.value = 'skill';
+  var activeTab = document.querySelector('#build-tabs button.active')?.getAttribute('data-build-tab') || 'workflows';
+  if (sel) {
+    sel.value = activeTab === 'skills' ? 'skill' : activeTab === 'crons' ? 'cron' : 'workflow';
   }
-  document.getElementById('builder-input').value = text;
+  if (typeof updateBuilderMode === 'function') updateBuilderMode();
+  var input = document.getElementById('builder-input');
+  if (input) input.value = text;
   sendBuilderChat();
 }
 
@@ -23970,7 +24042,7 @@ async function submitNewGoal() {
 
 // ── Workflows: open Builder for a brand-new workflow ─────────────
 function openBuilderForNewWorkflow() {
-  navigateTo('builder');
+  navigateTo('build', { tab: 'workflows' });
   setTimeout(function() {
     var typeSel = document.getElementById('builder-type');
     if (typeSel) { typeSel.value = 'workflow'; updateBuilderMode(); }
@@ -23990,9 +24062,8 @@ function openBuilderForNewWorkflow() {
 // ── Unleashed: open the start-task picker ────────────────────────
 function openStartUnleashedTask() {
   // Reuse the existing cron list — pick a cron job, run it in unleashed mode.
-  // For v1 just route to Automations where the existing controls live.
-  navigateTo('automations');
-  toast('Pick a cron job and click "Run unleashed" — kicks off long-running mode.', 'info');
+  navigateTo('build', { tab: 'crons' });
+  toast('Open a scheduled task, set Mode to Unleashed, then run it.', 'info');
 }
 
 async function refreshMemoryHealth() {
@@ -24830,7 +24901,7 @@ async function refreshHomeDigest() {
     if (runsBody) {
       var runs = d.todayRuns || [];
       if (!runs.length) {
-        runsBody.innerHTML = '<div style="padding:14px 18px;color:var(--text-muted);font-size:var(--text-sm)">No scheduled runs configured. <a href="#" onclick="navigateTo(\\x27build\\x27,{tab:\\x27crons\\x27});return false" style="color:var(--clementine)">Add one in Build &rarr; Crons</a>.</div>';
+        runsBody.innerHTML = '<div style="padding:14px 18px;color:var(--text-muted);font-size:var(--text-sm)">No scheduled runs configured. <a href="#" onclick="navigateTo(\\x27build\\x27,{tab:\\x27crons\\x27});return false" style="color:var(--clementine)">Add one in Build &rarr; Scheduled Tasks</a>.</div>';
       } else {
         var html2 = '';
         for (var n = 0; n < runs.length; n++) {
