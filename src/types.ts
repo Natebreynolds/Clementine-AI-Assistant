@@ -1072,6 +1072,8 @@ export interface IngestionRun {
   recordsWritten: number;
   recordsSkipped: number;
   recordsFailed: number;
+  recordsUnchanged?: number;
+  recallCheckStatus?: string | null;
   overviewNotePath?: string | null;
   errorsJson?: string | null;      // JSON array of {record, error}
   status: 'running' | 'ok' | 'error' | 'partial';

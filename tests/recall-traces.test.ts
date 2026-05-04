@@ -56,6 +56,15 @@ describe('recall_traces schema', () => {
     db.close();
     expect(cols.some(c => c.name === 'derived_from')).toBe(true);
   });
+
+  it('adds retrieval-proof columns to recall_traces', () => {
+    const db = new Database(dbPath);
+    const cols = db.prepare('PRAGMA table_info(recall_traces)').all() as Array<{ name: string }>;
+    db.close();
+    for (const col of ['backend_counts', 'evidence_json', 'confidence', 'empty_reason']) {
+      expect(cols.some(c => c.name === col)).toBe(true);
+    }
+  });
 });
 
 describe('logRecallTrace + getRecentRecallTraces', () => {
@@ -98,6 +107,24 @@ describe('logRecallTrace + getRecentRecallTraces', () => {
     store.logRecallTrace({ sessionKey: 'empty', query: 'nothing matches', chunkIds: [], scores: [] });
     expect(store.getRecentRecallTraces('empty', 10)).toHaveLength(0);
   });
+
+  it('can log empty retrieval attempts when explicitly allowed', () => {
+    store.logRecallTrace({
+      sessionKey: 'empty:allowed',
+      query: 'nothing matches',
+      chunkIds: [],
+      scores: [],
+      backendCounts: { fts: 0, vector: 0, graph: 0, recency: 0 },
+      confidence: 0,
+      emptyReason: 'no_backend_matches',
+      allowEmpty: true,
+    });
+    const [trace] = store.getRecentRecallTraces('empty:allowed', 10);
+    expect(trace.chunkIds).toEqual([]);
+    expect(trace.backendCounts).toEqual({ fts: 0, vector: 0, graph: 0, recency: 0 });
+    expect(trace.confidence).toBe(0);
+    expect(trace.emptyReason).toBe('no_backend_matches');
+  });
 });
 
 describe('getRecallTrace hydration', () => {
@@ -124,6 +151,7 @@ describe('getRecallTrace hydration', () => {
     if (!trace) return;
 
     expect(trace.query).toBe('beverages');
+    expect(trace.backendCounts).toBeNull();
     expect(trace.chunks).toHaveLength(3);
     // Order should match the original chunkIds order, not insertion order
     expect(trace.chunks[0].id).toBe(id3);
@@ -186,6 +214,22 @@ describe('searchContext auto-logging', () => {
     expect(traces.length).toBeGreaterThan(0);
     expect(traces[0].messageId).toBe('msg-auto');
     expect(traces[0].query).toBe('preferences typescript');
+    expect(traces[0].backendCounts).not.toBeNull();
+    expect(traces[0].evidence.length).toBeGreaterThan(0);
+    expect(typeof traces[0].confidence).toBe('number');
+  });
+
+  it('logs an empty trace when retrieval ran but found no chunks', () => {
+    store.searchContext('wordthatdoesnotexistanywhere', {
+      limit: 5,
+      recencyLimit: 0,
+      sessionKey: 'auto:empty:test',
+    });
+    const traces = store.getRecentRecallTraces('auto:empty:test', 10);
+    expect(traces).toHaveLength(1);
+    expect(traces[0].chunkIds).toEqual([]);
+    expect(traces[0].confidence).toBe(0);
+    expect(traces[0].emptyReason).toBeTruthy();
   });
 
   it('skips logging when sessionKey is omitted', () => {

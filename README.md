@@ -216,8 +216,25 @@ clementine login | auth              Authenticate Claude Code / OAuth providers
 clementine chat                      Interactive REPL
 clementine memory status             Index size, recent activity
 clementine memory search <q>         FTS5 search
+clementine memory model status       Local dense embedding model cache
+clementine memory model install      Pre-cache the local embedding model
 clementine memory dedup | reembed    Maintenance
 clementine brain digest              Run the brain digest pipeline
+```
+
+Dense neural recall uses a local Transformers.js embedding model. Model
+weights are not bundled into the npm tarball; the first install caches them
+under `~/.clementine/models/`. To make repo or npm updates prefetch the model
+automatically, set this once in `~/.clementine/.env`:
+
+```
+CLEMENTINE_PREFETCH_EMBEDDINGS=1
+```
+
+You can also opt in for a single install/update command:
+
+```
+CLEMENTINE_INSTALL_EMBEDDINGS=1 npm install -g clementine-agent
 ```
 
 **Projects & agents**

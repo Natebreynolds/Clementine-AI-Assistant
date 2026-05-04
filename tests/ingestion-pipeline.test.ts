@@ -85,7 +85,10 @@ describe('ingestion pipeline — CSV end-to-end', () => {
       const result = await runIngestion({ source: source!, inputPath: csvPath });
       expect(result.recordsIn).toBe(3);
       expect(result.recordsWritten).toBe(3);
+      expect(result.recordsUnchanged).toBe(0);
       expect(result.recordsFailed).toBe(0);
+      expect(result.recallCheckStatus).toBe('ok');
+      expect(result.recallCheck?.hits).toBe(3);
       expect(schemaInferCalls).toBeGreaterThanOrEqual(1);
       expect(overviewCalls).toBeGreaterThanOrEqual(1);
       expect(result.overviewNotePath).toBeTruthy();
@@ -105,6 +108,8 @@ describe('ingestion pipeline — CSV end-to-end', () => {
       expect(runs.length).toBe(1);
       expect(runs[0].status).toBe('ok');
       expect(runs[0].recordsWritten).toBe(3);
+      expect(runs[0].recordsUnchanged).toBe(0);
+      expect(runs[0].recallCheckStatus).toBe('ok');
       expect(runs[0].overviewNotePath).toBeTruthy();
 
       // Structured rows with aggregate-ready columns
@@ -134,12 +139,15 @@ describe('ingestion pipeline — CSV end-to-end', () => {
       if (opts?.system?.includes('data-schema analyst')) {
         return JSON.stringify({
           title_template: '{{name}}',
-          summary_template: '{{name}}',
-          tag_templates: [],
-          frontmatter_keys: [],
-          structured_columns: [{ name: 'amount', type: 'REAL' }],
+          summary_template: '{{name}} in {{industry}} paid ${{amount}}',
+          tag_templates: ['industry:{{industry}}'],
+          frontmatter_keys: ['email', 'industry'],
+          structured_columns: [
+            { name: 'amount', type: 'REAL' },
+            { name: 'industry', type: 'TEXT' },
+          ],
           target_folder: '04-Ingest/customers-test',
-          entity_hints: [],
+          entity_hints: ['name'],
         });
       }
       return 'overview text';
@@ -151,11 +159,18 @@ describe('ingestion pipeline — CSV end-to-end', () => {
       const csvPath = path.join(TMP_HOME, 'customers.csv');
       const result = await runIngestion({ source: source!, inputPath: csvPath });
       expect(result.recordsIn).toBe(3);
+      expect(result.recordsWritten).toBe(0);
+      expect(result.recordsSkipped).toBe(3);
+      expect(result.recordsUnchanged).toBe(3);
+      expect(result.recallCheckStatus).toBe('ok');
 
       const store = await getStore();
       const rows = store.queryIngestedRows('SELECT COUNT(*) AS n FROM ingested_rows') as any[];
       // Still 3 (upserted in place, not duplicated)
       expect(Number(rows[0].n)).toBe(3);
+      const runs = store.listIngestionRuns('customers-test', 1);
+      expect(runs[0].recordsUnchanged).toBe(3);
+      expect(runs[0].recallCheckStatus).toBe('ok');
     } finally {
       setLLMOverride(null);
     }

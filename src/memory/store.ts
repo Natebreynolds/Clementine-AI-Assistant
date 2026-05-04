@@ -81,6 +81,16 @@ export interface SearchContextOptions {
   useDense?: boolean;
 }
 
+export type RecallBackendCounts = { fts: number; vector: number; graph: number; recency: number };
+
+export interface RecallEvidence {
+  chunkId: number;
+  matchType: string;
+  score: number;
+  sourceFile?: string;
+  section?: string;
+}
+
 export class MemoryStore {
   private dbPath: string;
   private vaultDir: string;
@@ -121,6 +131,29 @@ export class MemoryStore {
   private static confidenceMultiplier(confidence: number | null | undefined): number {
     const conf = Math.max(0, Math.min(1, confidence ?? 1));
     return conf >= 1 ? 1 : 0.5 + 0.5 * conf;
+  }
+
+  private static formatBytes(n: number): string {
+    if (!Number.isFinite(n) || n < 0) return '0 B';
+    if (n < 1024) return `${n} B`;
+    if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+    if (n < 1024 * 1024 * 1024) return `${(n / 1024 / 1024).toFixed(1)} MB`;
+    return `${(n / 1024 / 1024 / 1024).toFixed(2)} GB`;
+  }
+
+  private static dirSizeBytes(dir: string): number {
+    if (!existsSync(dir)) return 0;
+    let total = 0;
+    try {
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory()) total += MemoryStore.dirSizeBytes(full);
+        else if (entry.isFile()) total += statSync(full).size;
+      }
+    } catch {
+      return total;
+    }
+    return total;
   }
 
   // ── Lifecycle ──────────────────────────────────────────────────────
@@ -508,6 +541,30 @@ export class MemoryStore {
       CREATE INDEX IF NOT EXISTS idx_extractions_status ON memory_extractions(status);
     `);
 
+    // Memory event ledger — compact proof that each major input stream has
+    // crossed into the memory system. This is intentionally smaller than the
+    // source payload tables; it powers health checks and lets us spot gaps
+    // like "transcripts are saved but never indexed".
+    this.conn.exec(`
+      CREATE TABLE IF NOT EXISTS memory_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        source_type TEXT NOT NULL,
+        source_id INTEGER,
+        session_key TEXT,
+        agent_slug TEXT,
+        content_hash TEXT NOT NULL,
+        content_preview TEXT NOT NULL,
+        indexed_at TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_memory_events_source
+        ON memory_events(source_type, source_id);
+      CREATE INDEX IF NOT EXISTS idx_memory_events_session
+        ON memory_events(session_key, created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_memory_events_created
+        ON memory_events(created_at DESC);
+    `);
+
     this.conn.exec(`
       CREATE TABLE IF NOT EXISTS memory_promotion_candidates (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -856,6 +913,12 @@ export class MemoryStore {
       CREATE INDEX IF NOT EXISTS idx_ingestion_runs_source ON ingestion_runs(source_slug, started_at DESC);
       CREATE INDEX IF NOT EXISTS idx_ingestion_runs_status ON ingestion_runs(status);
     `);
+    try {
+      this.conn.exec('ALTER TABLE ingestion_runs ADD COLUMN records_unchanged INTEGER NOT NULL DEFAULT 0');
+    } catch { /* already exists */ }
+    try {
+      this.conn.exec('ALTER TABLE ingestion_runs ADD COLUMN recall_check_status TEXT DEFAULT NULL');
+    } catch { /* already exists */ }
 
     // Ingested rows — structured overlay on chunks for SQL aggregates.
     // chunk_id FK makes this an INDEX on top of chunks, not a silo.
@@ -914,6 +977,18 @@ export class MemoryStore {
     // so we can aggregate "which retrieval signal earned the recall" over time.
     try {
       this.conn.exec('ALTER TABLE recall_traces ADD COLUMN match_types TEXT DEFAULT NULL');
+    } catch { /* column already exists */ }
+    try {
+      this.conn.exec('ALTER TABLE recall_traces ADD COLUMN backend_counts TEXT DEFAULT NULL');
+    } catch { /* column already exists */ }
+    try {
+      this.conn.exec('ALTER TABLE recall_traces ADD COLUMN evidence_json TEXT DEFAULT NULL');
+    } catch { /* column already exists */ }
+    try {
+      this.conn.exec('ALTER TABLE recall_traces ADD COLUMN confidence REAL DEFAULT NULL');
+    } catch { /* column already exists */ }
+    try {
+      this.conn.exec('ALTER TABLE recall_traces ADD COLUMN empty_reason TEXT DEFAULT NULL');
     } catch { /* column already exists */ }
 
     // Dense neural embeddings (transformers.js — arctic-embed-m by default).
@@ -2249,7 +2324,24 @@ export class MemoryStore {
 
     // 5. Log recall trace if session context provided. Skipped for internal
     // calls (e.g. consolidation, dedup checks) by passing skipTrace=true.
-    if (sessionKey && !skipTrace && finalResults.length > 0) {
+    if (sessionKey && !skipTrace) {
+      const backendCounts: RecallBackendCounts = {
+        fts: ftsResults.length,
+        vector: vectorResults.length,
+        graph: graphResults.length,
+        recency: recentResults.length,
+      };
+      const evidence: RecallEvidence[] = finalResults.slice(0, 8).map((r) => ({
+        chunkId: r.chunkId,
+        matchType: r.matchType,
+        score: r.score,
+        sourceFile: r.sourceFile,
+        section: r.section,
+      }));
+      const topScore = finalResults[0]?.score ?? 0;
+      const confidence = finalResults.length > 0
+        ? Math.max(0.1, Math.min(1, topScore / (Math.abs(topScore) + 1)))
+        : 0;
       this.logRecallTrace({
         sessionKey,
         messageId: messageId ?? null,
@@ -2258,6 +2350,11 @@ export class MemoryStore {
         scores: finalResults.map(r => r.score),
         agentSlug: agentSlug ?? null,
         matchTypes: finalResults.map(r => r.matchType),
+        backendCounts,
+        evidence,
+        confidence,
+        emptyReason: finalResults.length === 0 ? 'no_backend_matches' : null,
+        allowEmpty: finalResults.length === 0,
       });
     }
 
@@ -2305,8 +2402,13 @@ export class MemoryStore {
     scores: number[];
     agentSlug?: string | null;
     matchTypes?: string[];
+    backendCounts?: RecallBackendCounts | null;
+    evidence?: RecallEvidence[];
+    confidence?: number | null;
+    emptyReason?: string | null;
+    allowEmpty?: boolean;
   }): void {
-    if (opts.chunkIds.length === 0) return;
+    if (opts.chunkIds.length === 0 && !opts.allowEmpty) return;
     if (this.writeQueue) {
       this.writeQueue.enqueue({
         kind: 'recall',
@@ -2317,6 +2419,11 @@ export class MemoryStore {
         scores: [...opts.scores],
         agentSlug: opts.agentSlug ?? null,
         matchTypes: opts.matchTypes ? [...opts.matchTypes] : undefined,
+        backendCounts: opts.backendCounts ?? undefined,
+        evidence: opts.evidence ? [...opts.evidence] : undefined,
+        confidence: opts.confidence ?? undefined,
+        emptyReason: opts.emptyReason ?? undefined,
+        allowEmpty: opts.allowEmpty,
       });
       return;
     }
@@ -2332,12 +2439,19 @@ export class MemoryStore {
     scores: number[];
     agentSlug?: string | null;
     matchTypes?: string[];
+    backendCounts?: RecallBackendCounts | null;
+    evidence?: RecallEvidence[];
+    confidence?: number | null;
+    emptyReason?: string | null;
+    allowEmpty?: boolean;
   }): void {
-    if (opts.chunkIds.length === 0) return;
+    if (opts.chunkIds.length === 0 && !opts.allowEmpty) return;
     try {
       this.conn.prepare(
-        `INSERT INTO recall_traces (session_key, message_id, query, chunk_ids, scores, agent_slug, match_types)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO recall_traces
+         (session_key, message_id, query, chunk_ids, scores, agent_slug, match_types,
+          backend_counts, evidence_json, confidence, empty_reason)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       ).run(
         opts.sessionKey,
         opts.messageId ?? null,
@@ -2346,6 +2460,10 @@ export class MemoryStore {
         JSON.stringify(opts.scores),
         opts.agentSlug ?? null,
         opts.matchTypes ? JSON.stringify(opts.matchTypes) : null,
+        opts.backendCounts ? JSON.stringify(opts.backendCounts) : null,
+        opts.evidence ? JSON.stringify(opts.evidence) : null,
+        opts.confidence ?? null,
+        opts.emptyReason ?? null,
       );
     } catch {
       // Non-fatal — recall trace logging never breaks retrieval
@@ -2362,10 +2480,15 @@ export class MemoryStore {
     query: string;
     chunkIds: number[];
     scores: number[];
+    backendCounts: RecallBackendCounts | null;
+    evidence: RecallEvidence[];
+    confidence: number | null;
+    emptyReason: string | null;
     retrievedAt: string;
   }> {
     const rows = this.conn.prepare(
-      `SELECT id, message_id, query, chunk_ids, scores, retrieved_at
+      `SELECT id, message_id, query, chunk_ids, scores, backend_counts,
+              evidence_json, confidence, empty_reason, retrieved_at
        FROM recall_traces
        WHERE session_key = ?
        ORDER BY retrieved_at DESC, id DESC
@@ -2376,6 +2499,10 @@ export class MemoryStore {
       query: string;
       chunk_ids: string;
       scores: string;
+      backend_counts: string | null;
+      evidence_json: string | null;
+      confidence: number | null;
+      empty_reason: string | null;
       retrieved_at: string;
     }>;
 
@@ -2385,6 +2512,10 @@ export class MemoryStore {
       query: r.query,
       chunkIds: this._parseJsonArray<number>(r.chunk_ids),
       scores: this._parseJsonArray<number>(r.scores),
+      backendCounts: this._parseJsonObject<RecallBackendCounts>(r.backend_counts),
+      evidence: this._parseJsonArray<RecallEvidence>(r.evidence_json ?? '[]'),
+      confidence: r.confidence,
+      emptyReason: r.empty_reason,
       retrievedAt: r.retrieved_at,
     }));
   }
@@ -2399,6 +2530,10 @@ export class MemoryStore {
     messageId: string | null;
     query: string;
     retrievedAt: string;
+    backendCounts: RecallBackendCounts | null;
+    evidence: RecallEvidence[];
+    confidence: number | null;
+    emptyReason: string | null;
     chunks: Array<{
       id: number;
       sourceFile: string;
@@ -2412,7 +2547,8 @@ export class MemoryStore {
     }>;
   } | null {
     const trace = this.conn.prepare(
-      `SELECT id, session_key, message_id, query, chunk_ids, scores, retrieved_at
+      `SELECT id, session_key, message_id, query, chunk_ids, scores,
+              backend_counts, evidence_json, confidence, empty_reason, retrieved_at
        FROM recall_traces WHERE id = ?`,
     ).get(traceId) as {
       id: number;
@@ -2421,6 +2557,10 @@ export class MemoryStore {
       query: string;
       chunk_ids: string;
       scores: string;
+      backend_counts: string | null;
+      evidence_json: string | null;
+      confidence: number | null;
+      empty_reason: string | null;
       retrieved_at: string;
     } | undefined;
     if (!trace) return null;
@@ -2452,6 +2592,10 @@ export class MemoryStore {
       messageId: trace.message_id,
       query: trace.query,
       retrievedAt: trace.retrieved_at,
+      backendCounts: this._parseJsonObject<RecallBackendCounts>(trace.backend_counts),
+      evidence: this._parseJsonArray<RecallEvidence>(trace.evidence_json ?? '[]'),
+      confidence: trace.confidence,
+      emptyReason: trace.empty_reason,
       chunks: ordered,
     };
   }
@@ -2582,6 +2726,16 @@ export class MemoryStore {
       return Array.isArray(parsed) ? (parsed as T[]) : [];
     } catch {
       return [];
+    }
+  }
+
+  private _parseJsonObject<T>(json: string | null | undefined): T | null {
+    if (!json) return null;
+    try {
+      const parsed = JSON.parse(json);
+      return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? (parsed as T) : null;
+    } catch {
+      return null;
     }
   }
 
@@ -3131,7 +3285,15 @@ export class MemoryStore {
         'INSERT INTO transcripts (session_key, role, content, model) VALUES (?, ?, ?, ?)',
       );
     }
-    this._stmtInsertTranscript.run(sessionKey, role, content, model);
+    const info = this._stmtInsertTranscript.run(sessionKey, role, content, model);
+    this.recordMemoryEvent({
+      sourceType: 'transcript',
+      sourceId: info.lastInsertRowid as number,
+      sessionKey,
+      agentSlug: null,
+      content: `${role}: ${content}`,
+      indexed: true,
+    });
   }
 
   /**
@@ -3741,7 +3903,59 @@ export class MemoryStore {
       input.content,
       input.tags ?? '',
     );
-    return info.lastInsertRowid as number;
+    const id = info.lastInsertRowid as number;
+    this.recordMemoryEvent({
+      sourceType: 'artifact',
+      sourceId: id,
+      sessionKey: input.sessionKey ?? null,
+      agentSlug: input.agentSlug ?? null,
+      content: `${input.toolName}\n${input.summary}\n${input.content}`,
+      indexed: true,
+    });
+    return id;
+  }
+
+  recordMemoryEvent(input: {
+    sourceType: string;
+    sourceId?: number | null;
+    sessionKey?: string | null;
+    agentSlug?: string | null;
+    content: string;
+    indexed?: boolean;
+  }): void {
+    try {
+      const content = String(input.content ?? '');
+      const contentHash = createHash('sha256').update(content).digest('hex').slice(0, 16);
+      const preview = content.replace(/\s+/g, ' ').trim().slice(0, 500);
+      this.conn.prepare(
+        `INSERT INTO memory_events
+         (source_type, source_id, session_key, agent_slug, content_hash, content_preview, indexed_at)
+         VALUES (?, ?, ?, ?, ?, ?, ${input.indexed === false ? 'NULL' : "datetime('now')"})`,
+      ).run(
+        input.sourceType,
+        input.sourceId ?? null,
+        input.sessionKey ?? null,
+        input.agentSlug ?? null,
+        contentHash,
+        preview,
+      );
+    } catch {
+      // Ledger writes are observability only; never fail the source write.
+    }
+  }
+
+  getMemoryEventStats(): {
+    total: number;
+    indexed: number;
+    bySourceType: Array<{ sourceType: string; count: number }>;
+  } {
+    const total = (this.conn.prepare('SELECT COUNT(*) AS c FROM memory_events').get() as { c: number }).c;
+    const indexed = (this.conn.prepare('SELECT COUNT(*) AS c FROM memory_events WHERE indexed_at IS NOT NULL').get() as { c: number }).c;
+    const bySourceType = this.conn
+      .prepare(`SELECT source_type AS sourceType, COUNT(*) AS count
+                FROM memory_events GROUP BY source_type ORDER BY count DESC`)
+      .all() as Array<{ sourceType: string; count: number }>;
+    return { total, indexed, bySourceType };
   }
 
   /**
@@ -3983,6 +4197,8 @@ export class MemoryStore {
     recordsWritten?: number;
     recordsSkipped?: number;
     recordsFailed?: number;
+    recordsUnchanged?: number;
+    recallCheckStatus?: string | null;
     overviewNotePath?: string | null;
     errorsJson?: string | null;
     status?: 'running' | 'ok' | 'error' | 'partial';
@@ -3994,6 +4210,8 @@ export class MemoryStore {
     if (patch.recordsWritten !== undefined) { sets.push('records_written = ?'); params.push(patch.recordsWritten); }
     if (patch.recordsSkipped !== undefined) { sets.push('records_skipped = ?'); params.push(patch.recordsSkipped); }
     if (patch.recordsFailed !== undefined) { sets.push('records_failed = ?'); params.push(patch.recordsFailed); }
+    if (patch.recordsUnchanged !== undefined) { sets.push('records_unchanged = ?'); params.push(patch.recordsUnchanged); }
+    if (patch.recallCheckStatus !== undefined) { sets.push('recall_check_status = ?'); params.push(patch.recallCheckStatus); }
     if (patch.overviewNotePath !== undefined) { sets.push('overview_note_path = ?'); params.push(patch.overviewNotePath); }
     if (patch.errorsJson !== undefined) { sets.push('errors_json = ?'); params.push(patch.errorsJson); }
     if (patch.status !== undefined) { sets.push('status = ?'); params.push(patch.status); }
@@ -4006,20 +4224,23 @@ export class MemoryStore {
   listIngestionRuns(sourceSlug?: string, limit = 50): Array<{
     id: number; sourceSlug: string; startedAt: string; finishedAt: string | null;
     recordsIn: number; recordsWritten: number; recordsSkipped: number; recordsFailed: number;
+    recordsUnchanged: number; recallCheckStatus: string | null;
     overviewNotePath: string | null; errorsJson: string | null; status: string;
   }> {
     let sql = `SELECT id, source_slug, started_at, finished_at, records_in, records_written,
-                      records_skipped, records_failed, overview_note_path, errors_json, status
+                      records_skipped, records_failed, records_unchanged, recall_check_status,
+                      overview_note_path, errors_json, status
                FROM ingestion_runs`;
     const params: any[] = [];
     if (sourceSlug) { sql += ` WHERE source_slug = ?`; params.push(sourceSlug); }
-    sql += ` ORDER BY started_at DESC LIMIT ?`;
+    sql += ` ORDER BY started_at DESC, id DESC LIMIT ?`;
     params.push(limit);
     const rows = this.conn.prepare(sql).all(...params) as any[];
     return rows.map((r) => ({
       id: r.id, sourceSlug: r.source_slug, startedAt: r.started_at, finishedAt: r.finished_at,
       recordsIn: r.records_in, recordsWritten: r.records_written,
       recordsSkipped: r.records_skipped, recordsFailed: r.records_failed,
+      recordsUnchanged: r.records_unchanged ?? 0, recallCheckStatus: r.recall_check_status ?? null,
       overviewNotePath: r.overview_note_path, errorsJson: r.errors_json, status: r.status,
     }));
   }
@@ -4197,6 +4418,7 @@ export class MemoryStore {
     transcriptRetentionDays?: number;
     behavioralRetentionDays?: number;
     recallTraceRetentionDays?: number;
+    memoryEventRetentionDays?: number;
   } = {}): {
     episodicPruned: number;
     accessLogPruned: number;
@@ -4206,6 +4428,7 @@ export class MemoryStore {
     reflectionsPruned: number;
     usageLogPruned: number;
     recallTracesPruned: number;
+    memoryEventsPruned: number;
   } {
     const maxAge = opts.maxAgeDays ?? 90;
     const threshold = opts.salienceThreshold ?? 0.01;
@@ -4219,6 +4442,7 @@ export class MemoryStore {
     // 90-day window is enough to debug "why did the agent answer that way last
     // week" without letting the table grow unbounded.
     const recallRetention = opts.recallTraceRetentionDays ?? 90;
+    const memoryEventRetention = opts.memoryEventRetentionDays ?? 180;
 
     // Prune stale episodic chunks (not vault-sourced content)
     const episodicResult = this.conn
@@ -4279,6 +4503,16 @@ export class MemoryStore {
       // Table may not exist on first boot before initialize() runs the new schema
     }
 
+    let memoryEventsPruned = 0;
+    try {
+      const memoryEventsResult = this.conn
+        .prepare(`DELETE FROM memory_events WHERE created_at < datetime('now', ?)`)
+        .run(`-${memoryEventRetention} days`);
+      memoryEventsPruned = memoryEventsResult.changes;
+    } catch {
+      // Table may not exist on first boot before initialize() runs the new schema
+    }
+
     return {
       episodicPruned: episodicResult.changes,
       accessLogPruned: accessResult.changes,
@@ -4288,6 +4522,7 @@ export class MemoryStore {
       reflectionsPruned: reflectionsResult.changes,
       usageLogPruned: usageResult.changes,
       recallTracesPruned,
+      memoryEventsPruned,
     };
   }
 
@@ -6141,6 +6376,8 @@ export class MemoryStore {
     chunksByCategory: Array<{ category: string | null; count: number }>;
     tableRowCounts: Record<string, number>;
     recentActivity: { recallTracesLast7d: number; recallTracesLast30d: number; extractionSkipsLast30d: number };
+    retrievalProof: { tracesLast7d: number; emptyTracesLast7d: number; tracedChunksLast7d: number };
+    memoryEvents: { total: number; indexed: number; bySourceType: Array<{ sourceType: string; count: number }> };
     topCitedLast30d: Array<{ chunkId: number; sourceFile: string; section: string; refCount: number }>;
     userModelSlots: { total: number; populated: number; global: number; agentScoped: number };
     staleUserModelSlots: Array<{ slot: string; ageDays: number; agentSlug: string | null }>;
@@ -6157,6 +6394,11 @@ export class MemoryStore {
       models: Array<{ model: string; count: number }>;
       currentModel: string;
       ready: boolean;
+      cacheDir: string;
+      cacheExists: boolean;
+      cacheBytes: number;
+      cacheSize: string;
+      installed: boolean;
     };
   } {
     const topLimit = opts.topCitedLimit ?? 10;
@@ -6208,6 +6450,7 @@ export class MemoryStore {
       'transcripts',
       'session_summaries',
       'memory_extractions',
+      'memory_events',
       'chunk_soft_deletes',
       'chunk_history',
       'sdk_session_entries',
@@ -6232,6 +6475,19 @@ export class MemoryStore {
         .get() as { c: number }).c,
       extractionSkipsLast30d: (this.conn
         .prepare(`SELECT COUNT(*) AS c FROM memory_extractions WHERE status LIKE 'skipped:%' AND extracted_at >= datetime('now', '-30 days')`)
+        .get() as { c: number }).c,
+    };
+
+    const retrievalProof = {
+      tracesLast7d: recentActivity.recallTracesLast7d,
+      emptyTracesLast7d: (this.conn
+        .prepare(`SELECT COUNT(*) AS c FROM recall_traces
+                  WHERE retrieved_at >= datetime('now', '-7 days')
+                    AND json_array_length(chunk_ids) = 0`)
+        .get() as { c: number }).c,
+      tracedChunksLast7d: (this.conn
+        .prepare(`SELECT COALESCE(SUM(json_array_length(chunk_ids)), 0) AS c
+                  FROM recall_traces WHERE retrieved_at >= datetime('now', '-7 days')`)
         .get() as { c: number }).c,
     };
 
@@ -6301,6 +6557,8 @@ export class MemoryStore {
       chunksByCategory: byCategory,
       tableRowCounts,
       recentActivity,
+      retrievalProof,
+      memoryEvents: this.getMemoryEventStats(),
       topCitedLast30d: topCited.map((r) => ({
         chunkId: r.chunk_id,
         sourceFile: r.source_file,
@@ -6329,12 +6587,19 @@ export class MemoryStore {
                     FROM chunks WHERE embedding_dense IS NOT NULL
                     GROUP BY embedding_dense_model ORDER BY count DESC`)
           .all() as Array<{ model: string; count: number }>);
+        const cacheDir = embeddingsModule.denseModelCacheDir();
+        const cacheBytes = MemoryStore.dirSizeBytes(cacheDir);
         return {
           withDense,
           total: chunkAgg.total,
           models,
           currentModel: embeddingsModule.currentDenseModel(),
           ready: embeddingsModule.isDenseReady(),
+          cacheDir,
+          cacheExists: existsSync(cacheDir),
+          cacheBytes,
+          cacheSize: MemoryStore.formatBytes(cacheBytes),
+          installed: cacheBytes >= 1024 * 1024,
         };
       })(),
     };

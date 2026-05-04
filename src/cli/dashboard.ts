@@ -6443,6 +6443,22 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
         res.json({ ok: true, action, report });
         return;
       }
+      if (action === 'install-dense-model') {
+        const embeddings = await import('../memory/embeddings.js');
+        const ready = await embeddings.probeDenseReady();
+        if (!ready) {
+          res.status(503).json({ error: 'Dense embedding model failed to load' });
+          return;
+        }
+        res.json({
+          ok: true,
+          action,
+          model: embeddings.currentDenseModel(),
+          dimension: embeddings.denseDimension(),
+          cacheDir: embeddings.denseModelCacheDir(),
+        });
+        return;
+      }
       if (action === 'reembed-dense') {
         // Run backfill in the background — first call also pays the model
         // load cost (~440MB download on first ever run). We respond immediately
@@ -22711,7 +22727,7 @@ async function refreshCoverageStrip() {
     if (!d.ok || !d.health) { el.innerHTML = ''; return; }
     var h = d.health;
     var total = (h.chunks && h.chunks.total) || 0;
-    var de = h.denseEmbeddings || { withDense: 0, total: total, currentModel: '', ready: false };
+    var de = h.denseEmbeddings || { withDense: 0, total: total, currentModel: '', ready: false, installed: false, cacheSize: '0 B' };
     var sparseCovered = (h.chunks && h.chunks.withSparseEmbedding != null) ? h.chunks.withSparseEmbedding : null;
     var densePct = de.total > 0 ? Math.round((de.withDense / de.total) * 100) : 0;
     var sparsePct = (sparseCovered != null && total > 0) ? Math.round((sparseCovered / total) * 100) : null;
@@ -22723,7 +22739,26 @@ async function refreshCoverageStrip() {
     if (sparsePct != null) html += '<span><span style="color:#10b981">●</span> Sparse ' + sparsePct + '%</span>';
     html += '<span><span style="color:' + denseColor + '">●</span> Dense ' + densePct + '%'
       + (modelLabel ? ' <span style="color:var(--text-muted)">(' + esc(modelLabel) + ')</span>' : '') + '</span>';
-    if (de.total > 0 && de.withDense < de.total) {
+    if (!de.installed) {
+      html += '<span style="margin-left:auto;display:flex;align-items:center;gap:8px">'
+        + '<span style="color:#f59e0b">Model not installed</span>'
+        + '<button class="btn-sm" onclick="memoryHealthAction(\\'install-dense-model\\')">Install model</button>'
+        + '</span>';
+    } else if (!de.ready) {
+      html += '<span style="margin-left:auto;display:flex;align-items:center;gap:8px">'
+        + '<span style="color:#f59e0b">Model not verified</span>'
+        + '<button class="btn-sm" onclick="memoryHealthAction(\\'install-dense-model\\')">Verify model</button>'
+        + '</span>';
+    } else if (!de.ready) {
+      html += '<div class="card" style="margin-bottom:16px;border-left:3px solid #f59e0b">';
+      html += '<div class="card-body" style="padding:14px;display:flex;align-items:center;gap:14px;flex-wrap:wrap">';
+      html += '<div style="flex:1;min-width:240px">';
+      html += '<div style="font-weight:600;margin-bottom:4px">Embedding model is cached but has not been verified in this daemon</div>';
+      html += '<div style="font-size:12px;color:var(--text-muted)">Run a quick load check to confirm the local model is usable before relying on dense recall.</div>';
+      html += '</div>';
+      html += '<button class="btn-sm" onclick="memoryHealthAction(\\'install-dense-model\\')" title="Load and verify the cached model">Verify model</button>';
+      html += '</div></div>';
+    } else if (de.total > 0 && de.withDense < de.total) {
       var missing = de.total - de.withDense;
       html += '<span style="margin-left:auto;display:flex;gap:6px">'
         + '<span style="color:var(--text-muted)">' + missing.toLocaleString() + ' missing</span>'
@@ -22795,12 +22830,17 @@ async function refreshRecentWrites() {
 }
 
 async function memoryHealthAction(action, extra) {
-  var labels = { 'janitor': 'cleanup', 'rebuild-fts': 'FTS rebuild', 'fix-orphans': 'orphan fix', 'reembed-dense': 'dense embedding backfill' };
+  var labels = { 'janitor': 'cleanup', 'rebuild-fts': 'FTS rebuild', 'fix-orphans': 'orphan fix', 'install-dense-model': 'local embedding model install/verify', 'reembed-dense': 'dense embedding backfill' };
   if (!confirm('Run ' + (labels[action] || action) + ' now?')) return;
   try {
     var body = Object.assign({ action: action }, extra || {});
     var r = await apiJson('POST', '/api/memory/health/action', body);
     if (r.error) { toast('Action failed: ' + r.error, 'error'); return; }
+    if (action === 'install-dense-model') {
+      toast('Embedding model verified: ' + (r.model || 'local model'), 'success');
+      refreshMemoryHealth();
+      return;
+    }
     if (action === 'reembed-dense' && r.started) {
       toast('Backfill started in background (' + (r.limit || '?') + ' chunks). Refreshing every 10s…', 'info');
       // Poll coverage updates so the user sees progress without manually refreshing.
@@ -23042,7 +23082,7 @@ async function refreshMemoryHealth() {
 
     // Dense embedding coverage — the leading indicator for retrieval quality.
     // <50% means the agent is mostly searching on TF-IDF and missing semantic matches.
-    var de = h.denseEmbeddings || { withDense: 0, total: 0, models: [], currentModel: '', ready: false };
+    var de = h.denseEmbeddings || { withDense: 0, total: 0, models: [], currentModel: '', ready: false, installed: false, cacheSize: '0 B' };
     var densePct = de.total > 0 ? ((de.withDense / de.total) * 100).toFixed(1) : '0.0';
     var denseColor = de.total === 0 ? 'var(--text-muted)'
       : (de.withDense / Math.max(1, de.total)) >= 0.95 ? 'var(--success, #10b981)'
@@ -23053,12 +23093,22 @@ async function refreshMemoryHealth() {
       + '<div class="metric-hero-value" style="color:' + denseColor + '">' + densePct + '%</div>'
       + '<div class="metric-hero-label">Semantic Coverage</div>'
       + '<div class="metric-hero-sub">' + (de.withDense || 0) + ' of ' + (de.total || 0)
-      + ' chunks &middot; ' + esc(modelLabel) + '</div></div>';
+      + ' chunks &middot; ' + esc(modelLabel) + ' &middot; model ' + (de.installed ? esc(de.cacheSize || 'cached') : 'not installed') + '</div></div>';
 
     html += '</div>';
 
     // Coverage call-to-action — only render when there's work to do.
-    if (de.total > 0 && de.withDense < de.total) {
+    if (!de.installed) {
+      html += '<div class="card" style="margin-bottom:16px;border-left:3px solid #f59e0b">';
+      html += '<div class="card-body" style="padding:14px;display:flex;align-items:center;gap:14px;flex-wrap:wrap">';
+      html += '<div style="flex:1;min-width:240px">';
+      html += '<div style="font-weight:600;margin-bottom:4px">Local embedding model is not installed yet</div>';
+      html += '<div style="font-size:12px;color:var(--text-muted)">Install once to enable dense semantic recall without waiting for the first chat or backfill to download it.</div>';
+      if (de.cacheDir) html += '<div style="font-size:11px;color:var(--text-muted);margin-top:4px;font-family:\\x27JetBrains Mono\\x27,monospace">' + esc(de.cacheDir) + '</div>';
+      html += '</div>';
+      html += '<button class="btn-sm" onclick="memoryHealthAction(\\'install-dense-model\\')" title="Download and verify the local dense embedding model">Install model</button>';
+      html += '</div></div>';
+    } else if (de.total > 0 && de.withDense < de.total) {
       var missing = de.total - de.withDense;
       html += '<div class="card" style="margin-bottom:16px;border-left:3px solid ' + denseColor + '">';
       html += '<div class="card-body" style="padding:14px;display:flex;align-items:center;gap:14px;flex-wrap:wrap">';

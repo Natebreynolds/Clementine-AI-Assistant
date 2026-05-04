@@ -77,10 +77,11 @@ export type MemoryStoreType = {
   pruneStaleData(opts?: {
     maxAgeDays?: number; salienceThreshold?: number;
     accessLogRetentionDays?: number; transcriptRetentionDays?: number;
-    behavioralRetentionDays?: number;
+    behavioralRetentionDays?: number; recallTraceRetentionDays?: number; memoryEventRetentionDays?: number;
   }): {
     episodicPruned: number; accessLogPruned: number; transcriptsPruned: number;
     skillUsagePruned: number; feedbackPruned: number; reflectionsPruned: number; usageLogPruned: number;
+    recallTracesPruned: number; memoryEventsPruned: number;
   };
   checkDuplicate(content: string, sourceFile?: string): {
     isDuplicate: boolean; matchType: 'exact' | 'near' | null; matchId?: number;
@@ -189,13 +190,15 @@ export type MemoryStoreType = {
   createIngestionRun(sourceSlug: string): number;
   updateIngestionRun(id: number, patch: {
     recordsIn?: number; recordsWritten?: number; recordsSkipped?: number;
-    recordsFailed?: number; overviewNotePath?: string | null;
+    recordsFailed?: number; recordsUnchanged?: number; recallCheckStatus?: string | null;
+    overviewNotePath?: string | null;
     errorsJson?: string | null; status?: 'running' | 'ok' | 'error' | 'partial';
     finished?: boolean;
   }): void;
   listIngestionRuns(sourceSlug?: string, limit?: number): Array<{
     id: number; sourceSlug: string; startedAt: string; finishedAt: string | null;
-    recordsIn: number; recordsWritten: number; recordsSkipped: number; recordsFailed: number;
+    recordsIn: number; recordsWritten: number; recordsSkipped: number; recordsFailed: number; recordsUnchanged: number;
+    recallCheckStatus: string | null;
     overviewNotePath: string | null; errorsJson: string | null; status: string;
   }>;
   findChunkByExternalId(sourceSlug: string, externalId: string): {
@@ -231,15 +234,24 @@ export type MemoryStoreType = {
   // ── Recall traces (per-message retrieval audit) ───────────────
   logRecallTrace(opts: {
     sessionKey: string; messageId?: string | null; query: string;
-    chunkIds: number[]; scores: number[]; agentSlug?: string | null;
+    chunkIds: number[]; scores: number[]; agentSlug?: string | null; matchTypes?: string[];
+    backendCounts?: { fts: number; vector: number; graph: number; recency: number } | null;
+    evidence?: Array<{ chunkId: number; matchType: string; score: number; sourceFile?: string; section?: string }>;
+    confidence?: number | null; emptyReason?: string | null; allowEmpty?: boolean;
   }): void;
   getRecentRecallTraces(sessionKey: string, limit?: number): Array<{
     id: number; messageId: string | null; query: string;
-    chunkIds: number[]; scores: number[]; retrievedAt: string;
+    chunkIds: number[]; scores: number[];
+    backendCounts: { fts: number; vector: number; graph: number; recency: number } | null;
+    evidence: Array<{ chunkId: number; matchType: string; score: number; sourceFile?: string; section?: string }>;
+    confidence: number | null; emptyReason: string | null; retrievedAt: string;
   }>;
   getRecallTrace(traceId: number): {
     id: number; sessionKey: string | null; messageId: string | null;
     query: string; retrievedAt: string;
+    backendCounts: { fts: number; vector: number; graph: number; recency: number } | null;
+    evidence: Array<{ chunkId: number; matchType: string; score: number; sourceFile?: string; section?: string }>;
+    confidence: number | null; emptyReason: string | null;
     chunks: Array<{
       id: number; sourceFile: string; section: string; content: string;
       chunkType: string; score: number; pinned: boolean; consolidated: boolean;
@@ -300,6 +312,8 @@ export type MemoryStoreType = {
     chunksByCategory: Array<{ category: string | null; count: number }>;
     tableRowCounts: Record<string, number>;
     recentActivity: { recallTracesLast7d: number; recallTracesLast30d: number; extractionSkipsLast30d: number };
+    retrievalProof: { tracesLast7d: number; emptyTracesLast7d: number; tracedChunksLast7d: number };
+    memoryEvents: { total: number; indexed: number; bySourceType: Array<{ sourceType: string; count: number }> };
     topCitedLast30d: Array<{ chunkId: number; sourceFile: string; section: string; refCount: number }>;
     userModelSlots: { total: number; populated: number; global: number; agentScoped: number };
     staleUserModelSlots: Array<{ slot: string; ageDays: number; agentSlug: string | null }>;
@@ -310,8 +324,16 @@ export type MemoryStoreType = {
     lastIntegrityReport: { ftsOk: boolean; ftsRebuilt: boolean; orphanRefsNulled: number; missingEmbeddings: number; ranAt: string } | null;
     dbSizeBytes: number;
     lastVacuumAt: string | null;
-    denseEmbeddings: { withDense: number; total: number; models: Array<{ model: string; count: number }>; currentModel: string; ready: boolean };
+    denseEmbeddings: {
+      withDense: number; total: number; models: Array<{ model: string; count: number }>; currentModel: string; ready: boolean;
+      cacheDir: string; cacheExists: boolean; cacheBytes: number; cacheSize: string; installed: boolean;
+    };
   };
+  recordMemoryEvent?(input: {
+    sourceType: string; sourceId?: number | null; sessionKey?: string | null;
+    agentSlug?: string | null; content: string; indexed?: boolean;
+  }): void;
+  getMemoryEventStats(): { total: number; indexed: number; bySourceType: Array<{ sourceType: string; count: number }> };
   logAutonomyEvent(row: {
     component: string;
     event: string;

@@ -6,14 +6,15 @@
  *   1. Rebuild native modules (better-sqlite3) for the current Node version
  *   2. Initialize ~/.clementine/ directory structure if it doesn't exist
  *   3. Copy default vault templates from package to data home
- *   4. Check for `claude` CLI on PATH (needed for OAuth login)
- *   5. Print first-run instructions
+ *   4. Optionally prefetch the local dense embedding model
+ *   5. Check for `claude` CLI on PATH (needed for OAuth login)
+ *   6. Print first-run instructions
  *
  * Safe to re-run — skips steps already completed.
  */
 
-import { execSync } from 'node:child_process';
-import { cpSync, existsSync, mkdirSync, readdirSync } from 'node:fs';
+import { execFileSync, execSync } from 'node:child_process';
+import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -21,6 +22,30 @@ import { fileURLToPath } from 'node:url';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PKG_DIR = path.resolve(__dirname, '..');
 const DATA_HOME = process.env.CLEMENTINE_HOME || path.join(os.homedir(), '.clementine');
+
+function readDataEnv() {
+  const envPath = path.join(DATA_HOME, '.env');
+  if (!existsSync(envPath)) return {};
+  try {
+    return Object.fromEntries(
+      readFileSync(envPath, 'utf-8')
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter((line) => line && !line.startsWith('#') && line.includes('='))
+        .map((line) => {
+          const idx = line.indexOf('=');
+          return [line.slice(0, idx).trim(), line.slice(idx + 1).trim().replace(/^["']|["']$/g, '')];
+        }),
+    );
+  } catch {
+    return {};
+  }
+}
+
+function flagEnabled(name, envFile) {
+  const raw = process.env[name] ?? envFile[name];
+  return /^(1|true|yes|on)$/i.test(String(raw ?? ''));
+}
 
 // ── Step 1: Rebuild better-sqlite3 ─────────────────────────────────
 try {
@@ -80,14 +105,39 @@ if (existsSync(srcVault)) {
   }
 }
 
-// ── Step 4: Check for claude CLI ────────────────────────────────────
+// ── Step 4: Optional local embedding model prefetch ─────────────────
+// Model weights are intentionally not bundled into the npm tarball. Users
+// who want repo/npm updates to keep the local dense model warm can opt in:
+//   CLEMENTINE_INSTALL_EMBEDDINGS=1 npm install -g clementine-agent
+// or put CLEMENTINE_PREFETCH_EMBEDDINGS=1 in ~/.clementine/.env.
+const dataEnv = readDataEnv();
+if (flagEnabled('CLEMENTINE_INSTALL_EMBEDDINGS', dataEnv) || flagEnabled('CLEMENTINE_PREFETCH_EMBEDDINGS', dataEnv)) {
+  const cliPath = path.join(PKG_DIR, 'dist', 'cli', 'index.js');
+  if (existsSync(cliPath)) {
+    try {
+      console.log('Prefetching Clementine local embedding model...');
+      execFileSync(process.execPath, [cliPath, 'memory', 'model', 'install'], {
+        cwd: PKG_DIR,
+        stdio: 'inherit',
+        env: { ...process.env, CLEMENTINE_HOME: DATA_HOME },
+        timeout: 10 * 60_000,
+      });
+    } catch {
+      console.log('Embedding model prefetch skipped/failed. Run `clementine memory model install` later.');
+    }
+  } else {
+    console.log('Embedding model prefetch skipped: built CLI not found yet.');
+  }
+}
+
+// ── Step 5: Check for claude CLI ────────────────────────────────────
 let claudeOnPath = false;
 try {
   execSync('claude --version', { stdio: 'pipe' });
   claudeOnPath = true;
 } catch { /* not on PATH */ }
 
-// ── Step 5: Print instructions ──────────────────────────────────────
+// ── Step 6: Print instructions ──────────────────────────────────────
 const alreadyConfigured = existsSync(path.join(DATA_HOME, '.env'));
 
 if (alreadyConfigured) {

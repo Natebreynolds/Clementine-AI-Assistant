@@ -31,7 +31,10 @@ import pino from 'pino';
 
 import { BASE_DIR } from '../config.js';
 
-const logger = pino({ name: 'clementine.embeddings' });
+const logger = pino({
+  name: 'clementine.embeddings',
+  level: process.env.CLEMENTINE_EMBEDDINGS_LOG_LEVEL || 'warn',
+});
 
 /** Dimension of the TF-IDF embedding vectors. */
 const EMBEDDING_DIM = 512;
@@ -220,6 +223,11 @@ const DEFAULT_DENSE_MODEL = 'Snowflake/snowflake-arctic-embed-m-v1.5';
 const DENSE_DIMENSION = 768;
 /** Where transformers.js caches model weights. */
 const MODEL_CACHE_DIR = path.join(BASE_DIR, 'models');
+
+/** Expose the dense model cache location for doctor/dashboard install checks. */
+export function denseModelCacheDir(): string {
+  return MODEL_CACHE_DIR;
+}
 
 /** Configured model id (lazy-resolved). */
 function getDenseModelId(): string {

@@ -11,7 +11,7 @@
  *     → graph extractor → ingestion_runs audit
  */
 
-import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { VAULT_DIR } from '../config.js';
 import { getStore } from '../tools/shared.js';
@@ -58,6 +58,9 @@ export interface IngestResult {
   recordsWritten: number;
   recordsSkipped: number;
   recordsFailed: number;
+  recordsUnchanged: number;
+  recallCheckStatus?: 'ok' | 'partial' | 'skipped';
+  recallCheck?: { checked: number; hits: number; missing: string[] };
   errors: Array<{ externalId?: string; error: string }>;
   plannedRecords?: IngestedRecord[];  // dry-run only
   overviewNotePath?: string | null;
@@ -78,6 +81,8 @@ export async function runIngestion(opts: IngestOptions): Promise<IngestResult> {
   let recordsWritten = 0;
   let recordsSkipped = 0;
   let recordsFailed = 0;
+  let recordsUnchanged = 0;
+  const touchedExternalIds = new Set<string>();
 
   const report = (stage: IngestionProgress['stage'], message?: string) => {
     opts.onProgress?.({
@@ -98,6 +103,12 @@ export async function runIngestion(opts: IngestOptions): Promise<IngestResult> {
     onWrite: (sum) => {
       recordsWritten += 1;
       if (sum) writtenSummaries.push(sum);
+      if (sum?.externalId) touchedExternalIds.add(sum.externalId);
+    },
+    onUnchanged: (sum) => {
+      recordsSkipped += 1;
+      recordsUnchanged += 1;
+      if (sum?.externalId) touchedExternalIds.add(sum.externalId);
     },
     onSkip: () => { recordsSkipped += 1; },
     onFail: (err) => { recordsFailed += 1; errors.push(err); },
@@ -195,6 +206,21 @@ export async function runIngestion(opts: IngestOptions): Promise<IngestResult> {
       }
     }
 
+    let recallCheckStatus: 'ok' | 'partial' | 'skipped' = 'skipped';
+    let recallCheck: { checked: number; hits: number; missing: string[] } | undefined;
+    if (!opts.dryRun && touchedExternalIds.size > 0) {
+      const missing: string[] = [];
+      for (const externalId of touchedExternalIds) {
+        if (!store.findChunkByExternalId(source.slug, externalId)) missing.push(externalId);
+      }
+      recallCheck = {
+        checked: touchedExternalIds.size,
+        hits: touchedExternalIds.size - missing.length,
+        missing,
+      };
+      recallCheckStatus = missing.length === 0 ? 'ok' : 'partial';
+    }
+
     // Finalize
     const status: 'ok' | 'partial' | 'error' =
       recordsFailed > 0 && recordsWritten === 0 ? 'error' :
@@ -202,7 +228,8 @@ export async function runIngestion(opts: IngestOptions): Promise<IngestResult> {
 
     if (runId !== null) {
       store.updateIngestionRun(runId, {
-        recordsIn, recordsWritten, recordsSkipped, recordsFailed,
+        recordsIn, recordsWritten, recordsSkipped, recordsFailed, recordsUnchanged,
+        recallCheckStatus,
         errorsJson: errors.length ? JSON.stringify(errors.slice(0, 50)) : null,
         overviewNotePath,
         status,
@@ -219,6 +246,9 @@ export async function runIngestion(opts: IngestOptions): Promise<IngestResult> {
       recordsWritten,
       recordsSkipped,
       recordsFailed,
+      recordsUnchanged,
+      recallCheckStatus,
+      recallCheck,
       errors,
       plannedRecords: opts.dryRun ? plannedRecords : undefined,
       overviewNotePath,
@@ -229,6 +259,7 @@ export async function runIngestion(opts: IngestOptions): Promise<IngestResult> {
     if (runId !== null) {
       store.updateIngestionRun(runId, {
         recordsIn, recordsWritten, recordsSkipped, recordsFailed: recordsFailed + 1,
+        recordsUnchanged,
         errorsJson: JSON.stringify(errors),
         status: 'error',
         finished: true,
@@ -242,6 +273,8 @@ export async function runIngestion(opts: IngestOptions): Promise<IngestResult> {
       recordsWritten,
       recordsSkipped,
       recordsFailed: recordsFailed + 1,
+      recordsUnchanged,
+      recallCheckStatus: 'skipped',
       errors,
       plannedRecords: opts.dryRun ? plannedRecords : undefined,
     };
@@ -252,6 +285,7 @@ export async function runIngestion(opts: IngestOptions): Promise<IngestResult> {
 
 interface Counters {
   onWrite: (summary?: { title: string; summary: string; tags: string[]; externalId: string }) => void;
+  onUnchanged: (summary?: { title: string; summary: string; tags: string[]; externalId: string }) => void;
   onSkip: () => void;
   onFail: (err: { externalId?: string; error: string }) => void;
 }
@@ -280,8 +314,9 @@ async function processStructured(
       counters.onWrite(summaryBundle);
       return;
     }
-    await writeRecord(ingested, source, store);
-    counters.onWrite(summaryBundle);
+    const outcome = await writeRecord(ingested, source, store);
+    if (outcome === 'unchanged') counters.onUnchanged(summaryBundle);
+    else counters.onWrite(summaryBundle);
   } catch (err) {
     counters.onFail({ externalId: record.externalId, error: err instanceof Error ? err.message : String(err) });
   }
@@ -323,8 +358,9 @@ async function processFreeForm(
       counters.onWrite(summaryBundle);
       return;
     }
-    await writeRecord(ingested, source, store);
-    counters.onWrite(summaryBundle);
+    const outcome = await writeRecord(ingested, source, store);
+    if (outcome === 'unchanged') counters.onUnchanged(summaryBundle);
+    else counters.onWrite(summaryBundle);
   } catch (err) {
     counters.onFail({ externalId: record.externalId, error: err instanceof Error ? err.message : String(err) });
   }
@@ -334,7 +370,7 @@ async function processFreeForm(
  * Persist one fully-distilled record: artifact → vault note → chunks/FTS →
  * provenance tags → ingested_rows overlay → graph.
  */
-async function writeRecord(record: IngestedRecord, source: Source, store: any): Promise<void> {
+async function writeRecord(record: IngestedRecord, source: Source, store: any): Promise<'written' | 'unchanged'> {
   const nowIso = new Date().toISOString();
   const sourceType: string = source.kind; // 'seed' | 'poll' | 'webhook'
 
@@ -349,7 +385,53 @@ async function writeRecord(record: IngestedRecord, source: Source, store: any): 
     }
   }
 
-  // 1) Raw payload → artifact store
+  // 1) Vault note content. Build this before artifact writes so exact re-runs
+  // can be classified as unchanged without duplicating audit blobs.
+  const abs = path.join(VAULT_DIR, record.targetRelPath);
+  const dir = path.dirname(abs);
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+  if (existsSync(abs) && record.frontmatter && 'ingested_at' in record.frontmatter) {
+    try {
+      const current = readFileSync(abs, 'utf-8');
+      const match = current.match(/^ingested_at:\s*(.+)$/m);
+      if (match?.[1]) {
+        const raw = match[1].trim();
+        try {
+          record.frontmatter.ingested_at = JSON.parse(raw);
+        } catch {
+          record.frontmatter.ingested_at = raw.replace(/^['"]|['"]$/g, '');
+        }
+      }
+    } catch {
+      // Fall through with a fresh timestamp if the old note can't be read.
+    }
+  }
+  const fm = { title: record.title, ...record.frontmatter };
+  const frontmatterBlock = Object.entries(fm)
+    .map(([k, v]) => `${k}: ${serializeYaml(v)}`)
+    .join('\n');
+  const fileContent = `---\n${frontmatterBlock}\n---\n\n# ${record.title}\n\n${record.body}\n`;
+
+  if (existsSync(abs)) {
+    try {
+      const current = readFileSync(abs, 'utf-8');
+      if (current === fileContent && store.findChunkByExternalId(record.sourceSlug, record.externalId)) {
+        store.recordMemoryEvent?.({
+          sourceType: 'ingestion',
+          sourceId: null,
+          sessionKey: null,
+          agentSlug: source.agentSlug ?? null,
+          content: `${record.sourceSlug}:${record.externalId}\nunchanged\n${record.summary}`,
+          indexed: true,
+        });
+        return 'unchanged';
+      }
+    } catch {
+      // If the existing file can't be read, fall through and rewrite.
+    }
+  }
+
+  // 2) Raw payload → artifact store
   const artifactId = store.storeArtifact({
     toolName: `ingest:${source.slug}`,
     summary: record.title || record.externalId,
@@ -360,22 +442,13 @@ async function writeRecord(record: IngestedRecord, source: Source, store: any): 
   });
   record.artifactId = artifactId;
 
-  // 2) Vault note: write markdown file with frontmatter + body
-  const abs = path.join(VAULT_DIR, record.targetRelPath);
-  const dir = path.dirname(abs);
-  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-
-  const fm = { title: record.title, ...record.frontmatter };
-  const frontmatterBlock = Object.entries(fm)
-    .map(([k, v]) => `${k}: ${serializeYaml(v)}`)
-    .join('\n');
-  const fileContent = `---\n${frontmatterBlock}\n---\n\n# ${record.title}\n\n${record.body}\n`;
+  // 3) Vault note: write markdown file with frontmatter + body
   writeFileSync(abs, fileContent, 'utf-8');
 
-  // 3) Re-index via existing vault pipeline (chunks, FTS, wikilinks)
+  // 4) Re-index via existing vault pipeline (chunks, FTS, wikilinks)
   store.updateFile(record.targetRelPath, source.agentSlug ?? undefined);
 
-  // 4) Tag provenance on the chunks we just wrote
+  // 5) Tag provenance on the chunks we just wrote
   store.tagChunksForSource(record.targetRelPath, {
     sourceSlug: record.sourceSlug,
     externalId: record.externalId,
@@ -383,7 +456,16 @@ async function writeRecord(record: IngestedRecord, source: Source, store: any): 
     lastSyncedAt: nowIso,
   });
 
-  // 5) Structured overlay for SQL aggregates
+  store.recordMemoryEvent?.({
+    sourceType: 'ingestion',
+    sourceId: artifactId,
+    sessionKey: null,
+    agentSlug: source.agentSlug ?? null,
+    content: `${record.sourceSlug}:${record.externalId}\n${record.title}\n${record.summary}`,
+    indexed: true,
+  });
+
+  // 6) Structured overlay for SQL aggregates
   if (record.structuredRow) {
     const chunkRef = store.findChunkByExternalId(record.sourceSlug, record.externalId);
     store.insertIngestedRow({
@@ -398,8 +480,9 @@ async function writeRecord(record: IngestedRecord, source: Source, store: any): 
     });
   }
 
-  // 6) Graph (best-effort, no-op if graph unavailable)
+  // 7) Graph (best-effort, no-op if graph unavailable)
   await writeGraphForRecord(record);
+  return 'written';
 }
 
 async function applyStructuredColumns(mapping: SchemaMapping): Promise<void> {

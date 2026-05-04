@@ -40,6 +40,11 @@ export type QueueOp =
       scores: number[];
       agentSlug: string | null;
       matchTypes?: string[];
+      backendCounts?: { fts: number; vector: number; graph: number; recency: number } | null;
+      evidence?: Array<{ chunkId: number; matchType: string; score: number; sourceFile?: string; section?: string }>;
+      confidence?: number | null;
+      emptyReason?: string | null;
+      allowEmpty?: boolean;
     }
   | {
       kind: 'outcome';
@@ -179,6 +184,11 @@ export class WriteQueue {
           scores: op.scores,
           agentSlug: op.agentSlug,
           matchTypes: op.matchTypes,
+          backendCounts: op.backendCounts,
+          evidence: op.evidence,
+          confidence: op.confidence,
+          emptyReason: op.emptyReason,
+          allowEmpty: op.allowEmpty,
         });
         break;
       case 'outcome':

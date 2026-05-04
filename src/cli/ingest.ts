@@ -69,7 +69,11 @@ export async function cmdIngestSeed(inputPath: string, opts: { slug?: string; in
   console.log(`  Records in:      ${result.recordsIn}`);
   console.log(`  Records written: ${result.recordsWritten}`);
   console.log(`  Records skipped: ${result.recordsSkipped}`);
+  console.log(`  Records unchanged: ${result.recordsUnchanged}`);
   console.log(`  Records failed:  ${result.recordsFailed}`);
+  if (result.recallCheckStatus) {
+    console.log(`  Recall check:    ${result.recallCheckStatus}${result.recallCheck ? ` (${result.recallCheck.hits}/${result.recallCheck.checked})` : ''}`);
+  }
   if (result.overviewNotePath) {
     console.log(`  Overview note:   ${result.overviewNotePath}`);
   }
@@ -102,7 +106,8 @@ export async function cmdIngestRun(slug: string): Promise<void> {
     },
   });
   process.stdout.write('\n');
-  console.log(`  written=${result.recordsWritten} skipped=${result.recordsSkipped} failed=${result.recordsFailed}`);
+  console.log(`  written=${result.recordsWritten} unchanged=${result.recordsUnchanged} skipped=${result.recordsSkipped} failed=${result.recordsFailed}`);
+  if (result.recallCheckStatus) console.log(`  recall=${result.recallCheckStatus}`);
   if (result.overviewNotePath) {
     console.log(`  overview: ${result.overviewNotePath}`);
   }
@@ -140,7 +145,7 @@ export async function cmdIngestStatus(slug: string): Promise<void> {
   }
   console.log(`\nRecent runs (${runs.length}):\n`);
   for (const r of runs) {
-    console.log(`  #${r.id}  ${r.startedAt}  ${r.status.padEnd(8)}  in=${r.recordsIn} written=${r.recordsWritten} skipped=${r.recordsSkipped} failed=${r.recordsFailed}`);
+    console.log(`  #${r.id}  ${r.startedAt}  ${r.status.padEnd(8)}  in=${r.recordsIn} written=${r.recordsWritten} unchanged=${r.recordsUnchanged} skipped=${r.recordsSkipped} failed=${r.recordsFailed} recall=${r.recallCheckStatus ?? '—'}`);
     if (r.overviewNotePath) console.log(`         overview: ${r.overviewNotePath}`);
   }
 }

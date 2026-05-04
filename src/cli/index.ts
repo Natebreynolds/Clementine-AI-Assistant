@@ -90,6 +90,39 @@ function getSystemdServiceName(): string {
   return `${getAssistantName().toLowerCase()}.service`;
 }
 
+function formatBytes(n: number): string {
+  if (!Number.isFinite(n) || n < 0) return '0 B';
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  if (n < 1024 * 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(n / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+}
+
+function dirSizeBytes(dir: string): number {
+  if (!existsSync(dir)) return 0;
+  let total = 0;
+  try {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) total += dirSizeBytes(full);
+      else if (entry.isFile()) total += statSync(full).size;
+    }
+  } catch {
+    return total;
+  }
+  return total;
+}
+
+async function suppressStdout<T>(fn: () => Promise<T>): Promise<T> {
+  const originalWrite = process.stdout.write.bind(process.stdout);
+  (process.stdout.write as unknown as (chunk: unknown, encoding?: unknown, cb?: unknown) => boolean) = () => true;
+  try {
+    return await fn();
+  } finally {
+    process.stdout.write = originalWrite as typeof process.stdout.write;
+  }
+}
+
 function getSystemdServicePath(): string {
   const home = process.env.HOME ?? '';
   return path.join(home, '.config', 'systemd', 'user', getSystemdServiceName());
@@ -824,6 +857,24 @@ function cmdDoctor(opts: { fix?: boolean } = {}): void {
     console.log(`  ${GREEN}OK${RESET}  memory database (${sizeKb} KB)`);
   } else {
     console.log(`  ${DIM}  ○  memory database (created on first launch)${RESET}`);
+  }
+
+  // Local dense embedding model cache. Doctor does a cheap filesystem check;
+  // `--fix` runs the real model probe/installer so users can verify the model
+  // without needing to know the hidden Transformers.js cache mechanics.
+  const modelCacheDir = path.join(BASE_DIR, 'models');
+  const modelCacheBytes = dirSizeBytes(modelCacheDir);
+  if (modelCacheBytes >= 1024 * 1024) {
+    console.log(`  ${GREEN}OK${RESET}  local embedding model cache (${formatBytes(modelCacheBytes)})`);
+    console.log(`       ${DIM}Verify load: clementine memory model status --probe${RESET}`);
+  } else {
+    console.log(`  ${YELLOW}WARN${RESET}  local embedding model not installed/verified`);
+    const installCmd = `"${process.execPath}" "${path.join(PACKAGE_ROOT, 'dist', 'cli', 'index.js')}" memory model install`;
+    if (!tryFix('local embedding model', installCmd, { cwd: PACKAGE_ROOT, timeout: 10 * 60_000 })) {
+      console.log(`       Install: ${CYAN}clementine memory model install${RESET}`);
+      console.log(`       Auto-prefetch on updates: ${CYAN}clementine config set CLEMENTINE_PREFETCH_EMBEDDINGS 1${RESET}`);
+      issues++;
+    }
   }
 
   // Channel tokens (informational)
@@ -3255,6 +3306,122 @@ memoryCmd
       console.log(`  ${GREEN}✓${RESET} Unpinned chunk ${chunkId}.`);
     } catch (err) {
       console.error(`  Error unpinning chunk: ${err}`);
+      process.exit(1);
+    }
+  });
+
+const memoryModelCmd = memoryCmd
+  .command('model')
+  .description('Inspect or install the local dense embedding model used for semantic recall');
+
+memoryModelCmd
+  .command('status')
+  .description('Show whether the local dense embedding model is cached and optionally verify it loads')
+  .option('--probe', 'Load the model to verify the cache is usable; first run may download weights')
+  .option('--json', 'Emit machine-readable JSON')
+  .action(async (opts: { probe?: boolean; json?: boolean }) => {
+    const BOLD = '\x1b[1m';
+    const DIM = '\x1b[0;90m';
+    const GREEN = '\x1b[0;32m';
+    const YELLOW = '\x1b[0;33m';
+    const RED = '\x1b[0;31m';
+    const RESET = '\x1b[0m';
+    try {
+      if (opts.json) process.env.CLEMENTINE_EMBEDDINGS_LOG_LEVEL = process.env.CLEMENTINE_EMBEDDINGS_LOG_LEVEL || 'silent';
+      const embeddings = await import('../memory/embeddings.js');
+      const cacheDir = embeddings.denseModelCacheDir();
+      const cacheBytes = dirSizeBytes(cacheDir);
+      const probeRan = !!opts.probe;
+      let ready = embeddings.isDenseReady();
+      if (opts.probe) {
+        ready = opts.json
+          ? await suppressStdout(() => embeddings.probeDenseReady())
+          : await embeddings.probeDenseReady();
+      }
+      const status = {
+        model: embeddings.currentDenseModel(),
+        dimension: embeddings.denseDimension(),
+        cacheDir,
+        cacheExists: existsSync(cacheDir),
+        cacheBytes,
+        cacheSize: formatBytes(cacheBytes),
+        readyInThisProcess: embeddings.isDenseReady(),
+        verified: probeRan ? ready : false,
+        probeRan,
+      };
+      if (opts.json) {
+        console.log(JSON.stringify(status, null, 2));
+        return;
+      }
+      console.log();
+      console.log(`  ${BOLD}Local embedding model${RESET}`);
+      console.log(`  Model:       ${status.model}`);
+      console.log(`  Dimension:   ${status.dimension}`);
+      console.log(`  Cache:       ${status.cacheExists ? `${GREEN}${status.cacheSize}${RESET}` : `${YELLOW}missing${RESET}`} ${DIM}${cacheDir}${RESET}`);
+      if (probeRan) {
+        console.log(`  Load check:  ${ready ? `${GREEN}verified${RESET}` : `${RED}failed${RESET}`}`);
+      } else {
+        console.log(`  Load check:  ${DIM}not run (use --probe to verify)${RESET}`);
+      }
+      if (!status.cacheExists || status.cacheBytes < 1024 * 1024) {
+        console.log();
+        console.log(`  ${DIM}Install with: clementine memory model install${RESET}`);
+      }
+      console.log();
+    } catch (err) {
+      console.error(`  ${RED}Error reading model status${RESET}: ${err}`);
+      process.exit(1);
+    }
+  });
+
+memoryModelCmd
+  .command('install')
+  .description('Download/cache and verify the local dense embedding model; optionally backfill memory chunks')
+  .option('--model <id>', 'Override embedding model id (default: Snowflake/snowflake-arctic-embed-m-v1.5)')
+  .option('--backfill', 'After installing, backfill dense embeddings for existing chunks')
+  .option('--limit <n>', 'Backfill at most N chunks when --backfill is used')
+  .action(async (opts: { model?: string; backfill?: boolean; limit?: string }) => {
+    const BOLD = '\x1b[1m';
+    const DIM = '\x1b[0;90m';
+    const GREEN = '\x1b[0;32m';
+    const YELLOW = '\x1b[0;33m';
+    const RED = '\x1b[0;31m';
+    const RESET = '\x1b[0m';
+    try {
+      if (opts.model) process.env.EMBEDDING_DENSE_MODEL = opts.model;
+      const embeddings = await import('../memory/embeddings.js');
+      console.log();
+      console.log(`  ${BOLD}Installing local embedding model${RESET}`);
+      console.log(`  Model: ${embeddings.currentDenseModel()}`);
+      console.log(`  Cache: ${embeddings.denseModelCacheDir()}`);
+      console.log(`  ${DIM}First run may download model weights; later runs use the local cache.${RESET}`);
+      const ready = await embeddings.probeDenseReady();
+      if (!ready) {
+        console.error(`  ${RED}Failed to load dense embedding model.${RESET}`);
+        console.error(`  ${DIM}Check network access for the first download, then re-run this command.${RESET}`);
+        process.exit(1);
+      }
+      const cacheBytes = dirSizeBytes(embeddings.denseModelCacheDir());
+      console.log(`  ${GREEN}✓${RESET} Model ready (${embeddings.denseDimension()}-dim, ${formatBytes(cacheBytes)} cached).`);
+
+      if (opts.backfill) {
+        const limit = opts.limit ? parseInt(opts.limit, 10) : undefined;
+        const { MemoryStore } = await import('../memory/store.js');
+        const VAULT_DIR = path.join(BASE_DIR, 'vault');
+        const DB_PATH = path.join(VAULT_DIR, '.memory.db');
+        const store = new MemoryStore(DB_PATH, VAULT_DIR);
+        store.initialize();
+        console.log();
+        console.log(`  ${BOLD}Backfilling memory chunks${RESET}${limit ? ` ${DIM}(limit ${limit})${RESET}` : ''}`);
+        const result = await store.backfillDenseEmbeddings({ limit });
+        console.log(`  ${GREEN}✓${RESET} Embedded ${result.embedded.toLocaleString()} chunk${result.embedded === 1 ? '' : 's'}.`);
+        if (result.failed > 0) {
+          console.log(`  ${YELLOW}!${RESET} Failed ${result.failed.toLocaleString()} chunk${result.failed === 1 ? '' : 's'}.`);
+        }
+      }
+      console.log();
+    } catch (err) {
+      console.error(`  ${RED}Error installing model${RESET}: ${err}`);
       process.exit(1);
     }
   });

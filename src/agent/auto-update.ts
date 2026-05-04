@@ -6,8 +6,8 @@
  * so git pull is always clean. After pulling, source mods are reconciled.
  */
 
-import { execSync } from 'node:child_process';
-import { writeFileSync } from 'node:fs';
+import { execFileSync, execSync } from 'node:child_process';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import pino from 'pino';
 
@@ -18,6 +18,36 @@ import type { RestartSentinel } from '../types.js';
 const logger = pino({ name: 'clementine.auto-update' });
 
 const SENTINEL_PATH = path.join(BASE_DIR, '.restart-sentinel.json');
+
+function readDataEnv(): Record<string, string> {
+  const envPath = path.join(BASE_DIR, '.env');
+  if (!existsSync(envPath)) return {};
+  try {
+    return Object.fromEntries(
+      readFileSync(envPath, 'utf-8')
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter((line) => line && !line.startsWith('#') && line.includes('='))
+        .map((line) => {
+          const idx = line.indexOf('=');
+          return [line.slice(0, idx).trim(), line.slice(idx + 1).trim().replace(/^["']|["']$/g, '')];
+        }),
+    );
+  } catch {
+    return {};
+  }
+}
+
+function flagEnabled(name: string, envFile: Record<string, string>): boolean {
+  const raw = process.env[name] ?? envFile[name];
+  return /^(1|true|yes|on)$/i.test(String(raw ?? ''));
+}
+
+function shouldPrefetchEmbeddings(): boolean {
+  const envFile = readDataEnv();
+  return flagEnabled('CLEMENTINE_INSTALL_EMBEDDINGS', envFile)
+    || flagEnabled('CLEMENTINE_PREFETCH_EMBEDDINGS', envFile);
+}
 
 export interface UpdateCheckResult {
   available: boolean;
@@ -141,6 +171,23 @@ export async function applyUpdate(pkgDir: string): Promise<UpdateApplyResult> {
     } catch (err) {
       logger.error({ err }, 'Build failed after update');
       return { success: false, error: `Build failed after update: ${String(err)}` };
+    }
+
+    // 4b. Optional embedding model prefetch. npm postinstall may run before
+    // the freshly pulled TypeScript has been built; this second pass uses the
+    // just-built CLI so repo updates and npm-style updates behave the same.
+    if (shouldPrefetchEmbeddings()) {
+      try {
+        execFileSync(process.execPath, [path.join(pkgDir, 'dist', 'cli', 'index.js'), 'memory', 'model', 'install'], {
+          cwd: pkgDir,
+          stdio: 'pipe',
+          env: { ...process.env, CLEMENTINE_HOME: BASE_DIR },
+          timeout: 10 * 60_000,
+        });
+        logger.info('Local embedding model prefetch succeeded after update');
+      } catch (err) {
+        logger.warn({ err }, 'Local embedding model prefetch failed after update');
+      }
     }
 
     // 5. Reconcile source modifications

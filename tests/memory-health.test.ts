@@ -45,9 +45,13 @@ describe('Memory Health snapshot', () => {
     expect(h.dbSizeBytes).toBeGreaterThan(0);
     expect(h.tableRowCounts).toHaveProperty('chunks', 0);
     expect(h.tableRowCounts).toHaveProperty('recall_traces', 0);
+    expect(h.tableRowCounts).toHaveProperty('memory_events', 0);
     expect(h.recentActivity.recallTracesLast7d).toBe(0);
     expect(h.recentActivity.recallTracesLast30d).toBe(0);
     expect(h.recentActivity.extractionSkipsLast30d).toBe(0);
+    expect(h.retrievalProof.tracesLast7d).toBe(0);
+    expect(h.retrievalProof.emptyTracesLast7d).toBe(0);
+    expect(h.memoryEvents.total).toBe(0);
     expect(h.userModelSlots.total).toBe(0);
     expect(h.selfImprovePlateausLast7d).toBeGreaterThanOrEqual(0);
     expect(h.topCitedLast30d).toEqual([]);
@@ -146,6 +150,37 @@ describe('Memory Health snapshot', () => {
     expect(h.recentActivity.recallTracesLast7d).toBe(1);
     expect(h.recentActivity.recallTracesLast30d).toBe(1);
     expect(h.recentActivity.extractionSkipsLast30d).toBe(1);
+    expect(h.retrievalProof.tracesLast7d).toBe(1);
+  });
+
+  it('records memory events for transcript turns and artifacts', () => {
+    store.fullSync();
+    store.saveTurn('session-1', 'user', 'remember the backend memory bus', 'test-model');
+    store.storeArtifact({
+      toolName: 'diagnostic',
+      summary: 'memory probe',
+      content: 'retrieval proof artifact',
+      sessionKey: 'session-1',
+    });
+
+    const stats = store.getMemoryEventStats();
+    expect(stats.total).toBe(2);
+    expect(stats.indexed).toBe(2);
+    expect(stats.bySourceType.map((r) => r.sourceType).sort()).toEqual(['artifact', 'transcript']);
+    const h = store.getMemoryHealth();
+    expect(h.memoryEvents.total).toBe(2);
+    expect(h.tableRowCounts.memory_events).toBe(2);
+  });
+
+  it('prunes old memory events independently from transcripts', () => {
+    store.fullSync();
+    store.saveTurn('session-1', 'user', 'old ledger event', 'test-model');
+    withRaw((db) => {
+      db.prepare(`UPDATE memory_events SET created_at = datetime('now', '-200 days')`).run();
+    });
+    const pruned = store.pruneStaleData({ memoryEventRetentionDays: 180 });
+    expect(pruned.memoryEventsPruned).toBe(1);
+    expect(store.getMemoryEventStats().total).toBe(0);
   });
 
   it('reports user model slot counts', () => {
