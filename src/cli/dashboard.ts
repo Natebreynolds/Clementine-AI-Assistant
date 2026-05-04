@@ -311,6 +311,254 @@ async function searchMemory(query: string, limit = 20, filters: SearchFilters = 
   }
 }
 
+type BrainLibraryScope = 'all' | 'memory' | 'files' | 'artifacts';
+
+type BrainLibraryResult = {
+  id: string;
+  kind: 'memory' | 'file' | 'artifact';
+  title: string;
+  subtitle: string;
+  preview: string;
+  timestamp?: string | null;
+  score?: number;
+  badges?: string[];
+  chunkId?: number;
+  artifactId?: number;
+  relPath?: string;
+  source?: string;
+};
+
+function quotedFtsQuery(query: string): string {
+  return query
+    .split(/\s+/)
+    .map((w) => w.replace(/"/g, '').trim())
+    .filter((w) => w.length > 0)
+    .map((w) => `"${w}"`)
+    .join(' OR ');
+}
+
+function textPreview(raw: string, query = '', max = 520): string {
+  const compact = String(raw ?? '').replace(/\s+/g, ' ').trim();
+  if (!compact) return '';
+  const q = query.trim().toLowerCase();
+  if (!q) return compact.slice(0, max);
+  const idx = compact.toLowerCase().indexOf(q);
+  if (idx < 0) return compact.slice(0, max);
+  const start = Math.max(0, idx - 120);
+  const end = Math.min(compact.length, start + max);
+  return (start > 0 ? '…' : '') + compact.slice(start, end) + (end < compact.length ? '…' : '');
+}
+
+function classifyVaultOrigin(relPath: string): string {
+  if (relPath.startsWith('04-Ingest/')) return 'Seeded';
+  if (relPath.startsWith('00-System/skills/') || relPath.startsWith('00-System/workflows/') || relPath.startsWith('00-System/agents/')) {
+    return 'Agent-created';
+  }
+  if (relPath.startsWith('01-Daily/')) return 'Conversation';
+  return 'Vault';
+}
+
+async function searchBrainLibrary(query: string, limit = 30, scope: BrainLibraryScope = 'all'): Promise<{
+  results: BrainLibraryResult[];
+  totalByType: Record<string, number>;
+  dbExists: boolean;
+}> {
+  const trimmed = query.trim();
+  const lowered = trimmed.toLowerCase();
+  const qWords = lowered.split(/\s+/).filter(Boolean);
+  const perTypeLimit = Math.max(8, Math.ceil(limit / 2));
+  const results: BrainLibraryResult[] = [];
+  const totalByType: Record<string, number> = { memory: 0, files: 0, artifacts: 0 };
+  const include = (kind: BrainLibraryScope) => scope === 'all' || scope === kind;
+  const dbExists = existsSync(MEMORY_DB_PATH);
+
+  if (include('memory') && dbExists) {
+    const Database = (await import('better-sqlite3')).default;
+    const db = new Database(MEMORY_DB_PATH, { readonly: true });
+    try {
+      let rows: Array<Record<string, unknown>> = [];
+      if (trimmed) {
+        const ftsQuery = quotedFtsQuery(trimmed);
+        if (ftsQuery) {
+          rows = db.prepare(
+            `SELECT c.id, c.source_file, c.section, c.content, c.chunk_type,
+                    c.updated_at, c.source_slug, c.source_type, c.agent_slug, c.pinned,
+                    bm25(chunks_fts) AS score
+             FROM chunks_fts f
+             JOIN chunks c ON c.id = f.rowid
+             LEFT JOIN chunk_soft_deletes sd ON sd.chunk_id = c.id
+             WHERE chunks_fts MATCH ? AND sd.chunk_id IS NULL
+             ORDER BY bm25(chunks_fts)
+             LIMIT ?`,
+          ).all(ftsQuery, perTypeLimit) as Array<Record<string, unknown>>;
+        }
+      } else {
+        rows = db.prepare(
+          `SELECT c.id, c.source_file, c.section, c.content, c.chunk_type,
+                  c.updated_at, c.source_slug, c.source_type, c.agent_slug, c.pinned,
+                  0 AS score
+           FROM chunks c
+           LEFT JOIN chunk_soft_deletes sd ON sd.chunk_id = c.id
+           WHERE sd.chunk_id IS NULL
+           ORDER BY c.updated_at DESC, c.id DESC
+           LIMIT ?`,
+        ).all(perTypeLimit) as Array<Record<string, unknown>>;
+      }
+      totalByType.memory = rows.length;
+      for (const row of rows) {
+        const sourceFile = String(row.source_file ?? '');
+        const sourceSlug = row.source_slug ? String(row.source_slug) : '';
+        const section = String(row.section ?? '');
+        const score = Number(row.score ?? 0);
+        const badges = [
+          row.chunk_type ? String(row.chunk_type) : 'chunk',
+          sourceSlug ? `source:${sourceSlug}` : classifyVaultOrigin(sourceFile),
+          row.pinned ? 'pinned' : '',
+        ].filter(Boolean);
+        results.push({
+          id: `memory:${row.id}`,
+          kind: 'memory',
+          title: section || path.basename(sourceFile) || `Chunk #${row.id}`,
+          subtitle: sourceFile,
+          preview: textPreview(String(row.content ?? ''), trimmed),
+          timestamp: row.updated_at ? String(row.updated_at) : null,
+          score: trimmed ? 100 - Math.abs(score) : 0,
+          badges,
+          chunkId: Number(row.id),
+          source: sourceSlug || sourceFile,
+        });
+      }
+    } catch {
+      // Missing legacy tables should not break dashboard search.
+    } finally {
+      db.close();
+    }
+  }
+
+  if (include('artifacts') && dbExists) {
+    const Database = (await import('better-sqlite3')).default;
+    const db = new Database(MEMORY_DB_PATH, { readonly: true });
+    try {
+      let rows: Array<Record<string, unknown>> = [];
+      if (trimmed) {
+        const ftsQuery = quotedFtsQuery(trimmed);
+        if (ftsQuery) {
+          rows = db.prepare(
+            `SELECT a.id, a.tool_name, a.summary, substr(a.content, 1, 900) AS preview,
+                    a.tags, a.stored_at, a.session_key, a.agent_slug, bm25(tool_artifacts_fts) AS score
+             FROM tool_artifacts_fts f
+             JOIN tool_artifacts a ON a.id = f.rowid
+             WHERE tool_artifacts_fts MATCH ?
+             ORDER BY bm25(tool_artifacts_fts)
+             LIMIT ?`,
+          ).all(ftsQuery, perTypeLimit) as Array<Record<string, unknown>>;
+        }
+      } else {
+        rows = db.prepare(
+          `SELECT id, tool_name, summary, substr(content, 1, 900) AS preview,
+                  tags, stored_at, session_key, agent_slug, 0 AS score
+           FROM tool_artifacts
+           ORDER BY stored_at DESC, id DESC
+           LIMIT ?`,
+        ).all(perTypeLimit) as Array<Record<string, unknown>>;
+      }
+      totalByType.artifacts = rows.length;
+      for (const row of rows) {
+        const tags = String(row.tags ?? '').split(',').map((t) => t.trim()).filter(Boolean).slice(0, 4);
+        results.push({
+          id: `artifact:${row.id}`,
+          kind: 'artifact',
+          title: String(row.summary ?? '').trim() || String(row.tool_name ?? 'Tool artifact'),
+          subtitle: `Tool output · ${String(row.tool_name ?? 'unknown')}`,
+          preview: textPreview(`${row.summary ?? ''}\n${row.preview ?? ''}`, trimmed),
+          timestamp: row.stored_at ? String(row.stored_at) : null,
+          score: trimmed ? 100 - Math.abs(Number(row.score ?? 0)) : 0,
+          badges: ['artifact', ...tags],
+          artifactId: Number(row.id),
+          source: row.session_key ? String(row.session_key) : undefined,
+        });
+      }
+    } catch {
+      // Artifact memory may not exist on older DBs.
+    } finally {
+      db.close();
+    }
+  }
+
+  if (include('files')) {
+    const vaultRoot = VAULT_DIR;
+    const files: BrainLibraryResult[] = [];
+    const maxScan = trimmed ? 5000 : 500;
+    let scanned = 0;
+    function walk(dir: string): void {
+      if (scanned >= maxScan) return;
+      let entries: string[] = [];
+      try { entries = readdirSync(dir); } catch { return; }
+      for (const entry of entries) {
+        if (scanned >= maxScan) break;
+        if (entry.startsWith('.')) continue;
+        const full = path.join(dir, entry);
+        let stat;
+        try { stat = statSync(full); } catch { continue; }
+        if (stat.isDirectory()) {
+          if (entry === 'node_modules' || entry === '.git') continue;
+          walk(full);
+          continue;
+        }
+        if (!entry.endsWith('.md') || entry.endsWith('.md.bak')) continue;
+        scanned += 1;
+        const relPath = path.relative(vaultRoot, full);
+        let raw = '';
+        try { raw = readFileSync(full, 'utf-8'); } catch { continue; }
+        let title = path.basename(entry, '.md');
+        let typeTag = '';
+        let content = raw;
+        try {
+          const parsed = matter(raw.slice(0, 80_000));
+          content = parsed.content || raw;
+          const data = parsed.data as Record<string, unknown>;
+          if (typeof data.title === 'string') title = data.title;
+          else if (typeof data.name === 'string') title = data.name;
+          else {
+            const h1 = content.match(/^#\s+(.+)$/m);
+            if (h1) title = h1[1].trim();
+          }
+          if (typeof data.type === 'string') typeTag = data.type;
+        } catch { /* keep filename */ }
+        const hay = `${title}\n${relPath}\n${content.slice(0, 80_000)}`.toLowerCase();
+        const match = !trimmed || qWords.every((word) => hay.includes(word)) || hay.includes(lowered);
+        if (!match) continue;
+        const titleHit = lowered && title.toLowerCase().includes(lowered) ? 30 : 0;
+        const pathHit = lowered && relPath.toLowerCase().includes(lowered) ? 18 : 0;
+        const contentHit = lowered && content.toLowerCase().includes(lowered) ? 10 : 0;
+        files.push({
+          id: `file:${relPath}`,
+          kind: 'file',
+          title,
+          subtitle: relPath,
+          preview: textPreview(content, trimmed),
+          timestamp: stat.mtime.toISOString(),
+          score: trimmed ? titleHit + pathHit + contentHit : stat.mtimeMs / 1_000_000_000,
+          badges: [typeTag || 'note', classifyVaultOrigin(relPath)].filter(Boolean),
+          relPath,
+          source: relPath,
+        });
+      }
+    }
+    if (existsSync(vaultRoot)) walk(vaultRoot);
+    files.sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
+    totalByType.files = files.length;
+    results.push(...files.slice(0, perTypeLimit));
+  }
+
+  results.sort((a, b) => {
+    if (trimmed) return (b.score ?? 0) - (a.score ?? 0);
+    return String(b.timestamp ?? '').localeCompare(String(a.timestamp ?? ''));
+  });
+
+  return { results: results.slice(0, limit), totalByType, dbExists };
+}
+
 // ── Remote access config ────────────────────────────────────────────
 
 const REMOTE_CONFIG_PATH = path.join(BASE_DIR, 'remote-access.json');
@@ -4195,7 +4443,8 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
       const { getStore } = await import('../tools/shared.js');
       const store = await getStore();
       const slug = typeof req.query.slug === 'string' ? req.query.slug : undefined;
-      const runs = store.listIngestionRuns(slug, 50);
+      const limit = Math.min(Math.max(Number(req.query.limit) || 50, 1), 200);
+      const runs = store.listIngestionRuns(slug, limit);
       res.json({ runs });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
@@ -6624,6 +6873,30 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
     }
   });
 
+  app.get('/api/brain/artifacts/:id', async (req, res) => {
+    try {
+      const id = Number(req.params.id);
+      if (!Number.isFinite(id) || id <= 0) {
+        res.status(400).json({ error: 'invalid artifact id' });
+        return;
+      }
+      const { getStore } = await import('../tools/shared.js');
+      const store = await getStore();
+      if (!store?.getArtifact) {
+        res.status(503).json({ error: 'Artifact memory not available' });
+        return;
+      }
+      const artifact = store.getArtifact(id);
+      if (!artifact) {
+        res.status(404).json({ error: 'artifact not found' });
+        return;
+      }
+      res.json({ ok: true, artifact });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
   // ── Cron training chat endpoint ─────────────────────────────────────
 
   app.post('/api/cron/train', async (req, res) => {
@@ -6996,6 +7269,19 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
       res.json({ ...data, graphContext });
     } catch (err) {
       res.status(500).json({ results: [], error: String(err) });
+    }
+  });
+
+  app.get('/api/brain/library/search', async (req, res) => {
+    try {
+      const q = String(req.query.q ?? '');
+      const rawScope = String(req.query.scope ?? 'all') as BrainLibraryScope;
+      const scope: BrainLibraryScope = ['all', 'memory', 'files', 'artifacts'].includes(rawScope) ? rawScope : 'all';
+      const limit = Math.min(Math.max(Number(req.query.limit) || 30, 1), 80);
+      const data = await searchBrainLibrary(q, limit, scope);
+      res.json({ ok: true, query: q, scope, ...data });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: String(err), results: [] });
     }
   });
 
@@ -11169,6 +11455,201 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
     overflow-y: auto;
   }
 
+  /* ── Brain command center ──────────────── */
+  .brain-command-shell {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+  }
+  .brain-hero-panel {
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--bg-card);
+    padding: 18px;
+  }
+  .brain-pillar-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 12px;
+  }
+  .brain-pillar-card {
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--bg-card);
+    padding: 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    min-height: 178px;
+  }
+  .brain-pillar-card strong {
+    font-size: 14px;
+    color: var(--text-primary);
+  }
+  .brain-pillar-card p {
+    margin: 0;
+    color: var(--text-secondary);
+    font-size: 12px;
+    line-height: 1.5;
+  }
+  .brain-pillar-actions {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+    margin-top: auto;
+  }
+  .brain-kpi-row {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+    gap: 10px;
+  }
+  .brain-kpi {
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--bg-secondary);
+    padding: 12px;
+  }
+  .brain-kpi .value {
+    font-size: 22px;
+    font-weight: 700;
+    color: var(--text-primary);
+    line-height: 1.1;
+  }
+  .brain-kpi .label {
+    font-size: 11px;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    margin-top: 4px;
+  }
+  .brain-library-toolbar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+  .brain-library-toolbar input {
+    flex: 1;
+    min-width: 220px;
+  }
+  .brain-result-row {
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--bg-card);
+    padding: 13px 15px;
+    margin-bottom: 10px;
+  }
+  .brain-result-row:hover { border-color: var(--accent); }
+  .brain-result-top {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: 12px;
+  }
+  .brain-result-title {
+    font-weight: 600;
+    font-size: 13px;
+    color: var(--text-primary);
+    overflow-wrap: anywhere;
+  }
+  .brain-result-subtitle {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    color: var(--text-muted);
+    margin-top: 3px;
+    overflow-wrap: anywhere;
+  }
+  .brain-result-preview {
+    font-size: 12px;
+    color: var(--text-secondary);
+    line-height: 1.55;
+    margin-top: 8px;
+    white-space: pre-wrap;
+    max-height: 112px;
+    overflow: hidden;
+  }
+  .brain-badge {
+    display: inline-flex;
+    align-items: center;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    padding: 2px 7px;
+    font-size: 10px;
+    color: var(--text-secondary);
+    background: var(--bg-secondary);
+    white-space: nowrap;
+  }
+  .brain-flow-list {
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--bg-card);
+    overflow: hidden;
+  }
+  .brain-flow-row {
+    display: grid;
+    grid-template-columns: minmax(140px, 1.2fr) 100px repeat(4, 72px) minmax(120px, 1fr);
+    gap: 8px;
+    align-items: center;
+    padding: 10px 12px;
+    border-bottom: 1px solid var(--border-light);
+    font-size: 12px;
+  }
+  .brain-flow-row:last-child { border-bottom: none; }
+  .brain-source-card {
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--bg-card);
+    padding: 12px;
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 12px;
+    margin-bottom: 10px;
+  }
+  .brain-drop-zone {
+    border: 1px dashed var(--border-light);
+    border-radius: var(--radius);
+    background: var(--bg-secondary);
+    padding: 18px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 14px;
+    flex-wrap: wrap;
+  }
+  .brain-drop-zone.dragover {
+    border-color: var(--accent);
+    background: var(--accent-glow);
+  }
+  .brain-kv-builder {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    min-width: 0;
+  }
+  .brain-kv-row {
+    display: grid;
+    grid-template-columns: minmax(120px, 1fr) minmax(160px, 1.5fr) 30px;
+    gap: 6px;
+    align-items: center;
+  }
+  .brain-kv-row input {
+    padding: 7px 9px;
+    font-size: 12px;
+  }
+  @media (max-width: 760px) {
+    .brain-flow-row {
+      grid-template-columns: 1fr;
+      gap: 3px;
+    }
+    .brain-result-top {
+      flex-direction: column;
+    }
+    .brain-kv-row {
+      grid-template-columns: 1fr;
+    }
+  }
+
   /* ── Toast ──────────────────────────────── */
   .toast-container {
     position: fixed;
@@ -13601,9 +14082,10 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
           <h1>Brain</h1>
           <p class="desc">Query what you know, feed new knowledge in, and watch the system learn.</p>
         </div>
-        <div class="actions" style="flex:1;max-width:560px;display:flex;gap:8px">
-          <input type="text" id="memory-search-input" placeholder="Search vault, notes, memory..." style="flex:1;padding:6px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg-input);color:var(--text-primary);font-size:13px" onkeydown="if(event.key==='Enter')runMemorySearch()">
-          <button class="btn-primary btn-sm" onclick="runMemorySearch()">Search</button>
+        <div class="actions" style="flex:1;max-width:640px;display:flex;gap:8px">
+          <input type="text" id="memory-search-input" placeholder="Find seeded files, memories, notes, and artifacts..." style="flex:1;padding:6px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg-input);color:var(--text-primary);font-size:13px" onkeydown="if(event.key==='Enter')brainUnifiedSearchFromHeader()">
+          <button class="btn-primary btn-sm" onclick="brainUnifiedSearchFromHeader()" title="Search the whole brain"><span class="icon-slot" data-icon="search"></span> Find</button>
+          <button class="btn-sm" onclick="switchTab('intelligence','seed')" title="Upload a local file or folder"><span class="icon-slot" data-icon="upload"></span> Seed</button>
           <button class="btn-sm" onclick="openQuickAddMemory()" title="Append a quick note to today's daily log">+ Add memory</button>
         </div>
       </div>
@@ -13636,18 +14118,109 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
         </div>
       </div>
       <div class="tab-bar" id="intelligence-tabs" style="margin:0 0 0 18px">
-        <button class="active" data-icon="database" onclick="switchTab('intelligence','search')"><span class="icon-slot"></span> Memory</button>
+        <button class="active" data-icon="layoutDashboard" onclick="switchTab('intelligence','overview')"><span class="icon-slot"></span> Overview</button>
+        <button data-icon="database" onclick="switchTab('intelligence','search')"><span class="icon-slot"></span> Memory</button>
+        <button data-icon="upload" onclick="switchTab('intelligence','seed')"><span class="icon-slot"></span> Seed</button>
+        <button data-icon="repeat" onclick="switchTab('intelligence','sources')"><span class="icon-slot"></span> Automate</button>
+        <button data-icon="listChecks" onclick="switchTab('intelligence','runs')"><span class="icon-slot"></span> Runs</button>
         <button data-icon="sparkles" onclick="switchTab('intelligence','graph')"><span class="icon-slot"></span> Knowledge</button>
         <button data-icon="fileText" onclick="switchTab('intelligence','files')"><span class="icon-slot"></span> Files</button>
-        <button data-icon="folder" onclick="switchTab('intelligence','sources')"><span class="icon-slot"></span> Ingestion</button>
         <button data-icon="zap" onclick="switchTab('intelligence','health')"><span class="icon-slot"></span> Health <span class="tab-badge" id="brain-health-badge" style="display:none;background:#ef4444;color:#fff">0</span></button>
         <button data-icon="users" onclick="switchTab('intelligence','user-model')"><span class="icon-slot"></span> User Model</button>
         <button data-icon="brain" onclick="switchTab('intelligence','learning')"><span class="icon-slot"></span> Learning <span class="tab-badge" id="brain-learning-badge" style="display:none;background:#f59e0b;color:#000">0</span></button>
-        <button onclick="switchTab('intelligence','seed')">Seed</button>
-        <button onclick="switchTab('intelligence','runs')">Runs</button>
       </div>
       <div id="intelligence-tab-content">
-        <div class="tab-pane active" id="tab-intelligence-search">
+        <div class="tab-pane active" id="tab-intelligence-overview">
+          <div class="brain-command-shell">
+            <div class="brain-hero-panel">
+              <div style="display:flex;justify-content:space-between;gap:16px;align-items:flex-start;flex-wrap:wrap;margin-bottom:14px">
+                <div style="max-width:720px">
+                  <div style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.06em;margin-bottom:5px">Brain command center</div>
+                  <div style="font-size:18px;font-weight:700;margin-bottom:5px">Find anything Clementine knows, then prove how it got there.</div>
+                  <div style="font-size:13px;color:var(--text-secondary);line-height:1.5">Use this page to seed local data, keep connected sources refreshed on a schedule, search agent-created artifacts, and verify retrieval coverage.</div>
+                </div>
+                <div style="display:flex;gap:8px;flex-wrap:wrap">
+                  <button class="btn-primary btn-sm" onclick="switchTab('intelligence','seed')"><span class="icon-slot" data-icon="upload"></span> Seed local data</button>
+                  <button class="btn-sm" onclick="switchTab('intelligence','sources')"><span class="icon-slot" data-icon="repeat"></span> Add scheduled feed</button>
+                  <button class="btn-sm" onclick="switchTab('intelligence','health')"><span class="icon-slot" data-icon="activity"></span> Verify health</button>
+                </div>
+              </div>
+              <div id="brain-command-kpis" class="brain-kpi-row">
+                <div class="skel-block"><div class="skel-row med"></div><div class="skel-row short"></div></div>
+                <div class="skel-block"><div class="skel-row med"></div><div class="skel-row short"></div></div>
+                <div class="skel-block"><div class="skel-row med"></div><div class="skel-row short"></div></div>
+              </div>
+            </div>
+
+            <div class="brain-pillar-grid">
+              <div class="brain-pillar-card">
+                <strong>Find</strong>
+                <p>Search memories, seeded records, vault files, and saved tool artifacts in one place.</p>
+                <div class="brain-pillar-actions">
+                  <button class="btn-sm btn-primary" onclick="focusBrainLibrarySearch()">Search library</button>
+                  <button class="btn-sm" onclick="switchTab('intelligence','files')">Browse files</button>
+                </div>
+              </div>
+              <div class="brain-pillar-card">
+                <strong>Seed</strong>
+                <p>Choose files or folders from the local machine, preview what will be written, then commit to memory.</p>
+                <div class="brain-pillar-actions">
+                  <button class="btn-sm btn-primary" onclick="switchTab('intelligence','seed')">Upload data</button>
+                  <button class="btn-sm" onclick="document.getElementById('brain-file-input')?.click()">Choose files</button>
+                </div>
+              </div>
+              <div class="brain-pillar-card">
+                <strong>Automate</strong>
+                <p>Create scheduled feeds for REST endpoints or connected apps so the brain keeps learning without manual uploads.</p>
+                <div class="brain-pillar-actions">
+                  <button class="btn-sm btn-primary" onclick="switchTab('intelligence','sources');setTimeout(brainShowPollForm,80)">REST feed</button>
+                  <button class="btn-sm" onclick="switchTab('intelligence','sources');setTimeout(brainOpenFeedWizard,80)">Connected app</button>
+                </div>
+              </div>
+              <div class="brain-pillar-card">
+                <strong>Verify</strong>
+                <p>Check dense model readiness, retrieval coverage, ingestion runs, and whether new data is actually searchable.</p>
+                <div class="brain-pillar-actions">
+                  <button class="btn-sm btn-primary" onclick="switchTab('intelligence','health')">Open health</button>
+                  <button class="btn-sm" onclick="switchTab('intelligence','runs')">View runs</button>
+                </div>
+              </div>
+            </div>
+
+            <div class="brain-hero-panel">
+              <div class="brain-library-toolbar" style="margin-bottom:12px">
+                <input id="brain-library-search-input" type="text" placeholder="Search the whole brain..." onkeydown="if(event.key==='Enter')runBrainLibrarySearch()">
+                <select id="brain-library-scope" onchange="runBrainLibrarySearch()" style="width:150px">
+                  <option value="all">Everything</option>
+                  <option value="memory">Memory</option>
+                  <option value="files">Files</option>
+                  <option value="artifacts">Artifacts</option>
+                </select>
+                <button class="btn-primary btn-sm" onclick="runBrainLibrarySearch()">Search</button>
+                <button class="btn-sm" onclick="runBrainLibrarySearch('')">Recent</button>
+              </div>
+              <div id="brain-library-summary" style="font-size:12px;color:var(--text-muted);margin-bottom:10px"></div>
+              <div id="brain-library-results">
+                <div class="empty-state" style="padding:20px">Search the whole brain, or click Recent to inspect the latest remembered items.</div>
+              </div>
+            </div>
+
+            <div>
+              <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+                <div style="font-weight:600">Recent knowledge flow</div>
+                <button class="btn-sm" onclick="refreshBrainOverview()">Refresh</button>
+              </div>
+              <div id="brain-overview-flow"><div class="skel-block"><div class="skel-row med"></div><div class="skel-row"></div></div></div>
+            </div>
+          </div>
+        </div>
+        <div class="tab-pane" id="tab-intelligence-search">
+          <div style="display:flex;gap:8px;align-items:center;margin-bottom:12px;flex-wrap:wrap">
+            <input type="text" id="memory-detail-search-input" placeholder="Search editable memory chunks..." style="flex:1;min-width:220px" onkeydown="if(event.key==='Enter')runMemoryDetailSearch()">
+            <button class="btn-primary btn-sm" onclick="runMemoryDetailSearch()">Search chunks</button>
+            <button class="btn-sm" onclick="document.getElementById('memory-detail-search-input').value='pinned:true';runMemoryDetailSearch()">Pinned</button>
+            <button class="btn-sm" onclick="document.getElementById('memory-detail-search-input').value='since:7d';runMemoryDetailSearch()">Last 7d</button>
+          </div>
           <div id="memory-coverage-strip" style="margin-bottom:14px"></div>
           <div id="memory-search-results"></div>
           <div id="memory-overview" style="margin-top:18px">
@@ -13718,18 +14291,24 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
           <div class="card" style="padding:20px;margin-bottom:16px">
             <div style="font-weight:600;margin-bottom:8px">Drop a file or folder into the brain</div>
             <div style="color:var(--muted);margin-bottom:12px;font-size:13px">
-              Supports CSV, JSON, JSONL, Markdown, PDF, email (.eml / .mbox), DOCX. Preview runs the first 10 records through the full pipeline without writing anything; Commit ingests everything.
+              Supports CSV, JSON, JSONL, Markdown, PDF, email (.eml / .mbox), DOCX. Preview runs the first 10 records through the full pipeline without writing anything; Save to brain writes the full source.
             </div>
 
             <!-- Primary: native file/folder pickers -->
-            <div style="display:flex;gap:8px;margin-bottom:8px;flex-wrap:wrap">
-              <button class="btn-primary" onclick="document.getElementById('brain-file-input').click()">📄 Choose file(s)…</button>
-              <button class="btn-primary" onclick="document.getElementById('brain-folder-input').click()">📁 Choose folder…</button>
-              <input type="text" id="brain-seed-slug" placeholder="slug (auto if blank)" style="width:220px">
+            <div id="brain-drop-zone" class="brain-drop-zone" ondragover="brainHandleDrag(event, true)" ondragleave="brainHandleDrag(event, false)" ondrop="brainHandleDrop(event)">
+              <div style="min-width:220px;flex:1">
+                <div style="font-weight:600;margin-bottom:4px">Upload local knowledge</div>
+                <div style="font-size:12px;color:var(--text-muted);line-height:1.5">Drop files here, choose a folder, or use the advanced path option for data already on this machine. Clementine previews records before writing anything.</div>
+              </div>
+              <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+                <button class="btn-primary" onclick="document.getElementById('brain-file-input').click()" type="button"><span class="icon-slot" data-icon="fileText"></span> Choose files</button>
+                <button class="btn-primary" onclick="document.getElementById('brain-folder-input').click()" type="button"><span class="icon-slot" data-icon="folder"></span> Choose folder</button>
+                <input type="text" id="brain-seed-slug" placeholder="source name (optional)" style="width:220px">
+              </div>
             </div>
             <input type="file" id="brain-file-input" multiple style="display:none" onchange="brainHandleFilesChosen(this.files, false)">
             <input type="file" id="brain-folder-input" webkitdirectory directory multiple style="display:none" onchange="brainHandleFilesChosen(this.files, true)">
-            <div id="brain-upload-status" style="margin-bottom:8px;color:var(--muted);font-size:13px"></div>
+            <div id="brain-upload-status" style="margin:8px 0;color:var(--muted);font-size:13px"></div>
 
             <!-- Secondary: for power users who want to point at an existing on-disk path -->
             <details style="margin-bottom:8px">
@@ -13740,8 +14319,8 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
             </details>
 
             <div style="display:flex;gap:8px;margin-top:8px">
-              <button class="btn-primary" onclick="brainPreviewSeed()">Preview</button>
-              <button class="btn-primary" id="brain-commit-btn" onclick="brainCommitSeed()" style="display:none">Commit ingestion</button>
+              <button class="btn-primary" onclick="brainPreviewSeed()">Preview records</button>
+              <button class="btn-primary" id="brain-commit-btn" onclick="brainCommitSeed()" style="display:none">Save to brain</button>
             </div>
 
             <div id="brain-seed-manifest" style="margin-top:16px"></div>
@@ -13819,14 +14398,25 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
               <input type="text" id="brain-poll-url" placeholder="https://api.example.com/v1/items">
               <label>Method</label>
               <select id="brain-poll-method"><option>GET</option><option>POST</option></select>
-              <label>Headers (JSON)</label>
-              <input type="text" id="brain-poll-headers" placeholder='{"Authorization":"Bearer $\{stripe_api_key}"}'>
-              <label>Query params (JSON)</label>
-              <input type="text" id="brain-poll-params" placeholder='{"limit":"100"}'>
-              <label>Records JSON path</label>
-              <input type="text" id="brain-poll-recordspath" placeholder="data">
+              <label>Headers</label>
+              <div class="brain-kv-builder">
+                <div id="brain-poll-headers-rows"></div>
+                <button class="btn-sm" type="button" onclick="brainAddKvRow('headers')">Add header</button>
+                <input type="hidden" id="brain-poll-headers">
+              </div>
+              <label>Query params</label>
+              <div class="brain-kv-builder">
+                <div id="brain-poll-params-rows"></div>
+                <button class="btn-sm" type="button" onclick="brainAddKvRow('params')">Add param</button>
+                <input type="hidden" id="brain-poll-params">
+              </div>
+              <label>Record list field</label>
+              <input type="text" id="brain-poll-recordspath" placeholder="data, items, results">
               <label>Cron schedule</label>
-              <input type="text" id="brain-poll-cron" placeholder="0 * * * *  (hourly)">
+              <div>
+                <input type="text" id="brain-poll-cron" placeholder="0 * * * *  (hourly)">
+                <div id="brain-poll-schedule-chips" style="display:flex;gap:6px;flex-wrap:wrap;margin-top:6px"></div>
+              </div>
               <label>Target folder</label>
               <input type="text" id="brain-poll-folder" placeholder="04-Ingest/stripe">
               <label>Project (optional)</label>
@@ -14038,6 +14628,269 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
           error: 'Error',
         };
 
+        function brainTypeLabel(kind) {
+          if (kind === 'memory') return 'Memory';
+          if (kind === 'file') return 'File';
+          if (kind === 'artifact') return 'Artifact';
+          return kind || 'Item';
+        }
+
+        function brainStatusBadge(status) {
+          var s = String(status || 'unknown');
+          var color = s === 'ok' ? 'var(--green)' : (s === 'partial' ? 'var(--yellow)' : (s === 'error' ? 'var(--red)' : 'var(--text-muted)'));
+          return '<span class="brain-badge" style="color:' + color + ';border-color:' + color + '33">' + escapeHtml(s) + '</span>';
+        }
+
+        function brainUnifiedSearchFromHeader() {
+          var header = document.getElementById('memory-search-input');
+          var q = header ? header.value.trim() : '';
+          switchTab('intelligence', 'overview');
+          setTimeout(function() {
+            var input = document.getElementById('brain-library-search-input');
+            if (input) input.value = q;
+            runBrainLibrarySearch(q);
+          }, 60);
+        }
+
+        function focusBrainLibrarySearch() {
+          switchTab('intelligence', 'overview');
+          setTimeout(function() {
+            var input = document.getElementById('brain-library-search-input');
+            if (input) input.focus();
+          }, 80);
+        }
+
+        async function runBrainLibrarySearch(forceQuery) {
+          var input = document.getElementById('brain-library-search-input');
+          var header = document.getElementById('memory-search-input');
+          var scopeEl = document.getElementById('brain-library-scope');
+          var q = forceQuery !== undefined ? String(forceQuery || '') : (input ? input.value.trim() : '');
+          if (input && forceQuery !== undefined) input.value = q;
+          if (header && q) header.value = q;
+          var scope = scopeEl ? scopeEl.value : 'all';
+          var resultsEl = document.getElementById('brain-library-results');
+          var summaryEl = document.getElementById('brain-library-summary');
+          if (!resultsEl) return;
+          resultsEl.innerHTML = '<div class="empty-state" style="padding:20px">Searching…</div>';
+          if (summaryEl) summaryEl.textContent = '';
+          try {
+            var r = await apiFetch('/api/brain/library/search?q=' + encodeURIComponent(q) + '&scope=' + encodeURIComponent(scope) + '&limit=36');
+            var d = await r.json();
+            if (!r.ok || !d.ok) {
+              resultsEl.innerHTML = '<div class="empty-state" style="color:var(--red)">Search failed: ' + escapeHtml(d.error || r.status) + '</div>';
+              return;
+            }
+            var counts = d.totalByType || {};
+            if (summaryEl) {
+              var label = q ? ('Results for "' + q + '"') : 'Recent brain items';
+              summaryEl.innerHTML = escapeHtml(label) + ' · '
+                + (counts.memory || 0) + ' memory · '
+                + (counts.files || 0) + ' files · '
+                + (counts.artifacts || 0) + ' artifacts';
+            }
+            if (!d.results || d.results.length === 0) {
+              resultsEl.innerHTML = '<div class="empty-state" style="padding:20px">No matches. Try fewer words or switch the scope to Everything.</div>';
+              return;
+            }
+            var html = '';
+            for (var i = 0; i < d.results.length; i++) {
+              var item = d.results[i];
+              var badges = ['<span class="brain-badge">' + escapeHtml(brainTypeLabel(item.kind)) + '</span>'];
+              (item.badges || []).slice(0, 4).forEach(function(b) {
+                badges.push('<span class="brain-badge">' + escapeHtml(b) + '</span>');
+              });
+              var actions = '';
+              if (item.kind === 'file' && item.relPath) {
+                actions = '<button class="btn-sm" onclick="openVaultFile(\\'' + escapeHtml(item.relPath) + '\\')">Open</button>';
+              } else if (item.kind === 'memory' && item.chunkId) {
+                actions = '<button class="btn-sm" onclick="editChunk(' + item.chunkId + ')">Edit</button>'
+                  + '<button class="btn-sm" onclick="openBrainChunkTrace(' + item.chunkId + ')">Trace</button>';
+              } else if (item.kind === 'artifact' && item.artifactId) {
+                actions = '<button class="btn-sm" onclick="openBrainArtifact(' + item.artifactId + ')">Open</button>';
+              }
+              html += '<div class="brain-result-row">'
+                + '<div class="brain-result-top">'
+                  + '<div style="min-width:0;flex:1">'
+                    + '<div class="brain-result-title">' + escapeHtml(item.title || '(untitled)') + '</div>'
+                    + '<div class="brain-result-subtitle">' + escapeHtml(item.subtitle || item.source || '') + '</div>'
+                  + '</div>'
+                  + '<div style="display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end;align-items:center">' + badges.join('') + actions + '</div>'
+                + '</div>'
+                + (item.preview ? '<div class="brain-result-preview">' + escapeHtml(item.preview) + '</div>' : '')
+                + (item.timestamp ? '<div style="font-size:11px;color:var(--text-muted);margin-top:8px">' + escapeHtml(timeAgo(item.timestamp)) + '</div>' : '')
+                + '</div>';
+            }
+            resultsEl.innerHTML = html;
+          } catch (err) {
+            resultsEl.innerHTML = '<div class="empty-state" style="color:var(--red)">Search error: ' + escapeHtml(String(err)) + '</div>';
+          }
+        }
+
+        async function openBrainChunkTrace(id) {
+          var drawer = document.getElementById('brain-chunk-trace-drawer');
+          if (!drawer) {
+            drawer = document.createElement('div');
+            drawer.id = 'brain-chunk-trace-drawer';
+            drawer.style.cssText = 'position:fixed;right:0;top:0;bottom:0;width:620px;max-width:94vw;background:var(--bg-secondary);border-left:1px solid var(--border);box-shadow:-8px 0 32px rgba(0,0,0,0.18);z-index:221;display:flex;flex-direction:column;transform:translateX(100%);transition:transform 200ms ease';
+            drawer.innerHTML =
+              '<div style="display:flex;align-items:center;gap:10px;padding:14px 18px;border-bottom:1px solid var(--border);flex-shrink:0">'
+                + '<div style="flex:1;min-width:0">'
+                  + '<div id="brain-chunk-title" style="font-weight:600;font-size:15px"></div>'
+                  + '<div id="brain-chunk-subtitle" style="font-size:11px;color:var(--text-muted);font-family:\\x27JetBrains Mono\\x27,monospace;margin-top:2px"></div>'
+                + '</div>'
+                + '<button class="btn-icon btn-sm" onclick="closeBrainChunkTrace()" title="Close">' + lucide('x', 'icn-sm') + '</button>'
+              + '</div>'
+              + '<div id="brain-chunk-body" style="flex:1;overflow:auto;padding:18px 22px;font-size:12px;line-height:1.55"></div>';
+            document.body.appendChild(drawer);
+          }
+          drawer.style.transform = 'translateX(0)';
+          document.getElementById('brain-chunk-title').textContent = 'Memory chunk #' + id;
+          document.getElementById('brain-chunk-subtitle').textContent = 'Loading…';
+          document.getElementById('brain-chunk-body').innerHTML = '<div class="skel-block"><div class="skel-row med"></div><div class="skel-row"></div></div>';
+          try {
+            var chunkResp = await apiFetch('/api/memory/chunks/' + id);
+            var chunkData = await chunkResp.json();
+            var historyResp = await apiFetch('/api/memory/chunks/' + id + '/history');
+            var historyData = await historyResp.json();
+            if (!chunkResp.ok || !chunkData.ok || !chunkData.chunk) throw new Error(chunkData.error || 'chunk not found');
+            var c = chunkData.chunk;
+            document.getElementById('brain-chunk-title').textContent = c.section || ('Memory chunk #' + id);
+            document.getElementById('brain-chunk-subtitle').textContent = c.sourceFile || c.source_file || '';
+            var metaRows = [
+              ['ID', c.id || id],
+              ['Type', c.chunkType || c.chunk_type || '—'],
+              ['Source', c.sourceFile || c.source_file || '—'],
+              ['Agent', c.agentSlug || c.agent_slug || 'global'],
+              ['Salience', c.salience != null ? Number(c.salience).toFixed(2) : '—'],
+              ['Confidence', c.confidence != null ? Number(c.confidence).toFixed(2) : '—'],
+              ['Updated', c.lastUpdated || c.updated_at || '—'],
+            ];
+            var html = '<div style="display:grid;grid-template-columns:110px 1fr;gap:6px 12px;margin-bottom:14px">';
+            metaRows.forEach(function(row) {
+              html += '<div style="color:var(--text-muted)">' + escapeHtml(row[0]) + '</div><div style="overflow-wrap:anywhere">' + escapeHtml(row[1]) + '</div>';
+            });
+            html += '</div>';
+            html += '<div style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.05em;margin-bottom:6px">Stored content</div>';
+            html += '<div style="white-space:pre-wrap;background:var(--bg-input);border:1px solid var(--border);border-radius:var(--radius-sm);padding:12px;margin-bottom:14px">' + escapeHtml(c.content || '') + '</div>';
+            var history = historyData.ok && Array.isArray(historyData.history) ? historyData.history : [];
+            html += '<div style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.05em;margin-bottom:6px">Change history</div>';
+            if (!history.length) {
+              html += '<div class="empty-state" style="padding:16px;text-align:left">No edits or supersedes recorded.</div>';
+            } else {
+              html += '<div style="border:1px solid var(--border);border-radius:var(--radius-sm);overflow:hidden">';
+              history.forEach(function(h) {
+                html += '<div style="padding:8px 10px;border-bottom:1px solid var(--border-light);font-size:12px">'
+                  + '<div style="color:var(--text-muted);font-size:11px">' + escapeHtml(h.timestamp || h.at || '') + '</div>'
+                  + '<div>' + escapeHtml(h.kind || h.action || 'edit') + (h.reason ? ' · ' + escapeHtml(h.reason) : '') + '</div>'
+                  + '</div>';
+              });
+              html += '</div>';
+            }
+            document.getElementById('brain-chunk-body').innerHTML = html;
+          } catch (err) {
+            document.getElementById('brain-chunk-subtitle').textContent = 'Failed';
+            document.getElementById('brain-chunk-body').innerHTML = '<div style="color:var(--red)">' + escapeHtml(String(err)) + '</div>';
+          }
+        }
+
+        function closeBrainChunkTrace() {
+          var drawer = document.getElementById('brain-chunk-trace-drawer');
+          if (drawer) drawer.style.transform = 'translateX(100%)';
+        }
+
+        async function openBrainArtifact(id) {
+          var drawer = document.getElementById('brain-artifact-drawer');
+          if (!drawer) {
+            drawer = document.createElement('div');
+            drawer.id = 'brain-artifact-drawer';
+            drawer.style.cssText = 'position:fixed;right:0;top:0;bottom:0;width:620px;max-width:94vw;background:var(--bg-secondary);border-left:1px solid var(--border);box-shadow:-8px 0 32px rgba(0,0,0,0.18);z-index:220;display:flex;flex-direction:column;transform:translateX(100%);transition:transform 200ms ease';
+            drawer.innerHTML =
+              '<div style="display:flex;align-items:center;gap:10px;padding:14px 18px;border-bottom:1px solid var(--border);flex-shrink:0">'
+                + '<div style="flex:1;min-width:0">'
+                  + '<div id="brain-artifact-title" style="font-weight:600;font-size:15px"></div>'
+                  + '<div id="brain-artifact-subtitle" style="font-size:11px;color:var(--text-muted);font-family:\\x27JetBrains Mono\\x27,monospace;margin-top:2px"></div>'
+                + '</div>'
+                + '<button class="btn-icon btn-sm" onclick="closeBrainArtifact()" title="Close">' + lucide('x', 'icn-sm') + '</button>'
+              + '</div>'
+              + '<div id="brain-artifact-body" style="flex:1;overflow:auto;padding:18px 22px;font-size:12px;line-height:1.55;white-space:pre-wrap;font-family:\\x27JetBrains Mono\\x27,monospace"></div>';
+            document.body.appendChild(drawer);
+          }
+          drawer.style.transform = 'translateX(0)';
+          document.getElementById('brain-artifact-title').textContent = 'Artifact #' + id;
+          document.getElementById('brain-artifact-subtitle').textContent = 'Loading…';
+          document.getElementById('brain-artifact-body').textContent = '';
+          try {
+            var r = await apiFetch('/api/brain/artifacts/' + encodeURIComponent(id));
+            var d = await r.json();
+            if (!r.ok || !d.ok || !d.artifact) throw new Error(d.error || 'not found');
+            var a = d.artifact;
+            document.getElementById('brain-artifact-title').textContent = a.summary || ('Artifact #' + id);
+            document.getElementById('brain-artifact-subtitle').textContent = (a.toolName || 'tool') + ' · ' + (a.storedAt || '');
+            document.getElementById('brain-artifact-body').textContent = a.content || a.summary || '';
+          } catch (err) {
+            document.getElementById('brain-artifact-subtitle').textContent = 'Failed';
+            document.getElementById('brain-artifact-body').textContent = String(err);
+          }
+        }
+
+        function closeBrainArtifact() {
+          var drawer = document.getElementById('brain-artifact-drawer');
+          if (drawer) drawer.style.transform = 'translateX(100%)';
+        }
+
+        async function refreshBrainOverview() {
+          var kpis = document.getElementById('brain-command-kpis');
+          var flow = document.getElementById('brain-overview-flow');
+          try {
+            var all = await Promise.all([
+              apiFetch('/api/memory/health').then(function(r) { return r.json(); }).catch(function() { return {}; }),
+              apiFetch('/api/brain/sources').then(function(r) { return r.json(); }).catch(function() { return {}; }),
+              apiFetch('/api/brain/runs?limit=8').then(function(r) { return r.json(); }).catch(function() { return {}; }),
+            ]);
+            var h = (all[0] && all[0].health) || {};
+            var sources = (all[1] && all[1].sources) || [];
+            var runs = (all[2] && all[2].runs) || [];
+            var dense = h.denseEmbeddings || {};
+            var densePct = dense.total > 0 ? Math.round((dense.withDense / Math.max(1, dense.total)) * 100) + '%' : '0%';
+            var activeSources = sources.filter(function(s) { return s.enabled; }).length;
+            var scheduledSources = sources.filter(function(s) { return s.enabled && s.scheduleCron; }).length;
+            var lastRun = runs.length ? runs[0] : null;
+            if (kpis) {
+              kpis.innerHTML =
+                '<div class="brain-kpi"><div class="value">' + ((h.chunks && h.chunks.total) || 0).toLocaleString() + '</div><div class="label">Searchable chunks</div></div>'
+                + '<div class="brain-kpi"><div class="value">' + densePct + '</div><div class="label">Semantic coverage</div></div>'
+                + '<div class="brain-kpi"><div class="value">' + activeSources + '</div><div class="label">Active sources</div></div>'
+                + '<div class="brain-kpi"><div class="value">' + scheduledSources + '</div><div class="label">Scheduled feeds</div></div>'
+                + '<div class="brain-kpi"><div class="value">' + (lastRun ? escapeHtml(lastRun.status) : 'none') + '</div><div class="label">Latest ingestion</div></div>';
+            }
+            if (flow) {
+              if (!runs.length) {
+                flow.innerHTML = '<div class="empty-cta"><div class="label">No ingestion runs yet</div><div class="hint">Seed local data or add a scheduled feed to start the knowledge flow.</div></div>';
+              } else {
+                var html = '<div class="brain-flow-list">';
+                html += '<div class="brain-flow-row" style="color:var(--text-muted);font-size:11px;text-transform:uppercase;letter-spacing:0.04em"><div>Source</div><div>Status</div><div>In</div><div>Written</div><div>Same</div><div>Failed</div><div>When</div></div>';
+                for (var i = 0; i < runs.length; i++) {
+                  var run = runs[i];
+                  html += '<div class="brain-flow-row">'
+                    + '<div style="font-weight:600;min-width:0;overflow:hidden;text-overflow:ellipsis">' + escapeHtml(run.sourceSlug || '—') + '</div>'
+                    + '<div>' + brainStatusBadge(run.status) + '</div>'
+                    + '<div>' + (run.recordsIn || 0) + '</div>'
+                    + '<div>' + (run.recordsWritten || 0) + '</div>'
+                    + '<div>' + (run.recordsUnchanged || 0) + '</div>'
+                    + '<div>' + (run.recordsFailed || 0) + '</div>'
+                    + '<div style="color:var(--text-muted)">' + escapeHtml(timeAgo(run.finishedAt || run.startedAt)) + '</div>'
+                    + '</div>';
+                }
+                html += '</div>';
+                flow.innerHTML = html;
+              }
+            }
+            if (document.getElementById('brain-library-results')) runBrainLibrarySearch('');
+          } catch (err) {
+            if (kpis) kpis.innerHTML = '<div class="empty-state" style="color:var(--red)">Failed to load overview: ' + escapeHtml(String(err)) + '</div>';
+          }
+        }
+
         function brainRenderProgress(el, opts) {
           const label = BRAIN_STAGE_LABELS[opts.stage] || opts.stage || 'Working';
           const elapsed = Math.floor((Date.now() - opts.startedAt) / 1000);
@@ -14225,6 +15078,55 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
           ];
         }
 
+        function brainSetPollCron(expr) {
+          var input = document.getElementById('brain-poll-cron');
+          if (input) input.value = expr;
+        }
+
+        function brainRenderPollScheduleChips() {
+          var el = document.getElementById('brain-poll-schedule-chips');
+          if (!el) return;
+          el.innerHTML = brainScheduleChips().map(function(c) {
+            return '<button class="btn-sm" type="button" onclick="brainSetPollCron(\\'' + escapeHtml(c.cron) + '\\')">' + escapeHtml(c.label) + '</button>';
+          }).join('');
+        }
+
+        function brainAddKvRow(kind, key, value) {
+          var el = document.getElementById(kind === 'params' ? 'brain-poll-params-rows' : 'brain-poll-headers-rows');
+          if (!el) return;
+          var row = document.createElement('div');
+          row.className = 'brain-kv-row';
+          row.innerHTML =
+            '<input type="text" class="brain-kv-key" placeholder="' + (kind === 'params' ? 'limit' : 'Authorization') + '">'
+            + '<input type="text" class="brain-kv-value" placeholder="' + (kind === 'params' ? '100' : 'Bearer ${"${"}ref}') + '">'
+            + '<button class="btn-icon btn-sm" type="button" onclick="this.closest(\\'.brain-kv-row\\').remove()" title="Remove">' + lucide('x', 'icn-sm') + '</button>';
+          el.appendChild(row);
+          row.querySelector('.brain-kv-key').value = key || '';
+          row.querySelector('.brain-kv-value').value = value || '';
+        }
+
+        function brainEnsureKvRows() {
+          var h = document.getElementById('brain-poll-headers-rows');
+          var p = document.getElementById('brain-poll-params-rows');
+          if (h && h.children.length === 0) brainAddKvRow('headers', 'Authorization', 'Bearer ${"${"}api_key}');
+          if (p && p.children.length === 0) brainAddKvRow('params', 'limit', '100');
+          brainRenderPollScheduleChips();
+        }
+
+        function brainCollectKv(kind) {
+          var el = document.getElementById(kind === 'params' ? 'brain-poll-params-rows' : 'brain-poll-headers-rows');
+          var out = {};
+          if (!el) return out;
+          el.querySelectorAll('.brain-kv-row').forEach(function(row) {
+            var keyEl = row.querySelector('.brain-kv-key');
+            var valEl = row.querySelector('.brain-kv-value');
+            var key = keyEl ? keyEl.value.trim() : '';
+            var val = valEl ? valEl.value.trim() : '';
+            if (key) out[key] = val;
+          });
+          return out;
+        }
+
         async function brainLoadFeedConnectors() {
           try {
             const resp = await apiFetch('/api/brain/connectors');
@@ -14274,7 +15176,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
                 '<div style="font-size:12px;margin-top:4px">' + fieldsLine + '</div>' +
                 '</div>' +
                 '<button class="btn-primary" onclick="brainRunFeed(\\'' + f.name.replace(/"/g, '') + '\\')">Run now</button> ' +
-                '<button class="btn" onclick="brainDeleteFeed(\\'' + f.name.replace(/"/g, '') + '\\')">🗑</button>' +
+                '<button class="btn" onclick="brainDeleteFeed(\\'' + f.name.replace(/"/g, '') + '\\')">Delete</button>' +
                 '</div>';
             }).join('');
           } catch (err) {
@@ -14703,25 +15605,44 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
           const data = await resp.json();
           const el = document.getElementById('brain-sources-list');
           if (!data.sources || !data.sources.length) {
-            el.innerHTML = '<div style="color:var(--muted);padding:20px">No sources yet. Seed a local file/folder in the <a href="#" onclick="switchTab(\\'intelligence\\',\\'seed\\');return false">Seed Upload</a> tab, or register a scheduled REST poll above.</div>';
+            el.innerHTML = '<div class="empty-cta"><div class="label">No ingestion sources yet</div><div class="hint">Seed a local file/folder or create a scheduled feed. Ingested data remains searchable even if a source is later disabled.</div></div>';
             return;
           }
-          el.innerHTML = '<table class="data-table"><thead><tr><th>Slug</th><th>Kind</th><th>Adapter</th><th>Schedule</th><th>Target</th><th>Project</th><th>Enabled</th><th>Last run</th><th>Status</th><th>Actions</th></tr></thead><tbody>' +
-            data.sources.map((s) => {
-              const projTag = s.project
-                ? '<code style="font-size:11px">' + escapeHtml(s.project.split('/').filter(Boolean).pop() || s.project) + '</code>'
-                : '—';
-              return '<tr><td>' + escapeHtml(s.slug) + '</td><td>' + escapeHtml(s.kind) + '</td><td>' + escapeHtml(s.adapter) + '</td>' +
-                '<td><code style="font-size:11px">' + escapeHtml(s.scheduleCron || '—') + '</code></td>' +
-                '<td>' + escapeHtml(s.targetFolder || '—') + '</td>' +
-                '<td>' + projTag + '</td>' +
-                '<td>' + (s.enabled ? 'yes' : 'no') + '</td>' +
-                '<td>' + escapeHtml(s.lastRunAt || '—') + '</td>' +
-                '<td>' + escapeHtml(s.lastStatus || '—') + '</td>' +
-                '<td><button class="btn" onclick="brainRunSource(\\'' + escapeHtml(s.slug) + '\\')">Run</button> ' +
-                '<button class="btn" onclick="brainDeleteSource(\\'' + escapeHtml(s.slug) + '\\')">🗑</button></td></tr>';
-            }).join('') +
-            '</tbody></table>';
+          var html = '<div style="display:flex;flex-direction:column;gap:10px">';
+          data.sources.forEach(function(s) {
+            const projTag = s.project
+              ? '<span class="brain-badge">' + escapeHtml(s.project.split('/').filter(Boolean).pop() || s.project) + '</span>'
+              : '';
+            const schedule = s.scheduleCron ? '<span class="brain-badge">' + escapeHtml(s.scheduleCron) + '</span>' : '<span class="brain-badge">manual</span>';
+            const enabled = s.enabled ? '<span class="brain-badge" style="color:var(--green);border-color:var(--green)33">enabled</span>' : '<span class="brain-badge">disabled</span>';
+            html += '<div class="brain-source-card">'
+              + '<div style="min-width:0;flex:1">'
+                + '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:5px">'
+                  + '<strong style="font-size:14px">' + escapeHtml(s.slug) + '</strong>'
+                  + '<span class="brain-badge">' + escapeHtml(s.kind) + '</span>'
+                  + '<span class="brain-badge">' + escapeHtml(s.adapter) + '</span>'
+                  + schedule + enabled + projTag
+                + '</div>'
+                + '<div style="font-size:12px;color:var(--text-secondary);line-height:1.5">'
+                  + 'Target: <code>' + escapeHtml(s.targetFolder || 'default') + '</code>'
+                  + ' · Last run: ' + escapeHtml(s.lastRunAt ? timeAgo(s.lastRunAt) : 'never')
+                  + ' · Status: ' + escapeHtml(s.lastStatus || 'none')
+                + '</div>'
+              + '</div>'
+              + '<div style="display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end">'
+                + '<button class="btn-sm brain-run-source" data-slug="' + escapeHtml(s.slug) + '">Run now</button>'
+                + '<button class="btn-sm brain-delete-source" data-slug="' + escapeHtml(s.slug) + '" title="Delete source">Delete</button>'
+              + '</div>'
+              + '</div>';
+          });
+          html += '</div>';
+          el.innerHTML = html;
+          el.querySelectorAll('.brain-run-source').forEach(function(btn) {
+            btn.onclick = function() { brainRunSource(btn.getAttribute('data-slug') || ''); };
+          });
+          el.querySelectorAll('.brain-delete-source').forEach(function(btn) {
+            btn.onclick = function() { brainDeleteSource(btn.getAttribute('data-slug') || ''); };
+          });
         }
 
         async function brainRunSource(slug) {
@@ -14759,6 +15680,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
           document.getElementById('brain-creds-form').style.display = 'none';
           const wf = document.getElementById('brain-webhook-form'); if (wf) wf.style.display = 'none';
           brainLoadProjects(['brain-poll-project']);
+          brainEnsureKvRows();
         }
 
         function brainShowWebhookForm() {
@@ -14829,17 +15751,14 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
           const slug = document.getElementById('brain-poll-slug').value.trim();
           const url = document.getElementById('brain-poll-url').value.trim();
           const method = document.getElementById('brain-poll-method').value;
-          const headersText = document.getElementById('brain-poll-headers').value.trim();
-          const paramsText = document.getElementById('brain-poll-params').value.trim();
           const recordsPath = document.getElementById('brain-poll-recordspath').value.trim();
           const cronExpr = document.getElementById('brain-poll-cron').value.trim();
           const folder = document.getElementById('brain-poll-folder').value.trim();
           const statusEl = document.getElementById('brain-poll-status');
           if (!slug || !url) { statusEl.innerHTML = '<span style="color:#e66">slug and URL required</span>'; return; }
 
-          let headers = {}, params = {};
-          try { if (headersText) headers = JSON.parse(headersText); } catch (e) { statusEl.innerHTML = '<span style="color:#e66">Invalid headers JSON</span>'; return; }
-          try { if (paramsText) params = JSON.parse(paramsText); } catch (e) { statusEl.innerHTML = '<span style="color:#e66">Invalid params JSON</span>'; return; }
+          const headers = brainCollectKv('headers');
+          const params = brainCollectKv('params');
 
           const cfg = { url, method, headers, params };
           if (recordsPath) cfg.recordsJsonPath = recordsPath;
@@ -14875,6 +15794,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
         async function brainShowCredsForm() {
           document.getElementById('brain-creds-form').style.display = '';
           document.getElementById('brain-poll-form').style.display = 'none';
+          const wf = document.getElementById('brain-webhook-form'); if (wf) wf.style.display = 'none';
           const resp = await apiFetch('/api/brain/credentials');
           const data = await resp.json();
           const refs = data.refs || [];
@@ -14902,20 +15822,21 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
         }
 
         async function brainLoadRuns() {
-          const resp = await apiFetch('/api/brain/runs');
+          const resp = await apiFetch('/api/brain/runs?limit=80');
           const data = await resp.json();
           const el = document.getElementById('brain-runs-list');
           if (!data.runs || !data.runs.length) {
-            el.innerHTML = '<div style="color:var(--muted);padding:20px">No ingestion runs yet.</div>';
+            el.innerHTML = '<div class="empty-cta"><div class="label">No ingestion runs yet</div><div class="hint">Preview and commit a seed, or run a scheduled source.</div></div>';
             return;
           }
-          el.innerHTML = '<table class="data-table"><thead><tr><th>#</th><th>Source</th><th>Started</th><th>Status</th><th>In</th><th>Written</th><th>Skipped</th><th>Failed</th><th>Overview</th></tr></thead><tbody>' +
+          el.innerHTML = '<table class="data-table"><thead><tr><th>#</th><th>Source</th><th>Started</th><th>Status</th><th>In</th><th>Written</th><th>Same</th><th>Skipped</th><th>Failed</th><th>Recall check</th><th>Overview</th></tr></thead><tbody>' +
             data.runs.map((r) =>
               '<tr><td>' + r.id + '</td><td>' + escapeHtml(r.sourceSlug) + '</td>' +
               '<td>' + escapeHtml(r.startedAt) + '</td>' +
-              '<td>' + escapeHtml(r.status) + '</td>' +
+              '<td>' + brainStatusBadge(r.status) + '</td>' +
               '<td>' + r.recordsIn + '</td><td>' + r.recordsWritten + '</td>' +
-              '<td>' + r.recordsSkipped + '</td><td>' + r.recordsFailed + '</td>' +
+              '<td>' + (r.recordsUnchanged || 0) + '</td><td>' + r.recordsSkipped + '</td><td>' + r.recordsFailed + '</td>' +
+              '<td>' + escapeHtml(r.recallCheckStatus || '—') + '</td>' +
               '<td>' + (r.overviewNotePath ? '<code style="font-size:12px">' + escapeHtml(r.overviewNotePath) + '</code>' : '—') + '</td></tr>').join('') +
             '</tbody></table>';
         }
@@ -14934,6 +15855,23 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
         // structure) to ~/.clementine/uploads/<id>/ → backend returns
         // the on-disk path, which we feed into the existing preview/
         // commit pipeline.
+
+        function brainHandleDrag(event, over) {
+          event.preventDefault();
+          var zone = document.getElementById('brain-drop-zone');
+          if (!zone) return;
+          if (over) zone.classList.add('dragover');
+          else zone.classList.remove('dragover');
+        }
+
+        async function brainHandleDrop(event) {
+          event.preventDefault();
+          var zone = document.getElementById('brain-drop-zone');
+          if (zone) zone.classList.remove('dragover');
+          var files = event.dataTransfer && event.dataTransfer.files ? event.dataTransfer.files : null;
+          if (!files || files.length === 0) return;
+          await brainHandleFilesChosen(files, false);
+        }
 
         async function brainHandleFilesChosen(fileList, isFolder) {
           const statusEl = document.getElementById('brain-upload-status');
@@ -14983,15 +15921,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
           }
         }
 
-        // Wire tab refresh on switchTab → brain tabs
-        (function() {
-          const origSwitch = window.switchTab;
-          window.switchTab = function(page, tab) {
-            origSwitch(page, tab);
-            if (page === 'intelligence' && tab === 'sources') { brainLoadSources(); brainLoadFeedConnectors(); brainLoadFeeds(); }
-            if (page === 'intelligence' && tab === 'runs') brainLoadRuns();
-          };
-        })();
+        // Brain tab refresh is handled by the global switchTab dispatcher.
       </script>
     </div>
 
@@ -16200,6 +17130,11 @@ var LUCIDE = {
   send:        '<path d="m22 2-7 20-4-9-9-4Z"/><path d="M22 2 11 13"/>',
   arrowRight:  '<path d="M5 12h14"/><path d="m12 5 7 7-7 7"/>',
   tool:        '<path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/>',
+  upload:      '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" x2="12" y1="3" y2="15"/>',
+  repeat:      '<path d="m17 2 4 4-4 4"/><path d="M3 11v-1a4 4 0 0 1 4-4h14"/><path d="m7 22-4-4 4-4"/><path d="M21 13v1a4 4 0 0 1-4 4H3"/>',
+  listChecks:  '<path d="m3 17 2 2 4-4"/><path d="m3 7 2 2 4-4"/><path d="M13 6h8"/><path d="M13 12h8"/><path d="M13 18h8"/>',
+  activity:    '<path d="M22 12h-4l-3 9L9 3l-3 9H2"/>',
+  layoutDashboard:'<rect width="7" height="9" x="3" y="3" rx="1"/><rect width="7" height="5" x="14" y="3" rx="1"/><rect width="7" height="9" x="14" y="12" rx="1"/><rect width="7" height="5" x="3" y="16" rx="1"/>',
   database:    '<ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14a9 3 0 0 0 18 0V5"/><path d="M3 12a9 3 0 0 0 18 0"/>',
 };
 function lucide(name, cls) {
@@ -16223,7 +17158,7 @@ var ROUTE_REDIRECTS = {
   'heartbeats': { page: 'heartbeat' },
   'team-status': { page: 'team', tab: 'activity' },
   'agent-detail': { page: 'team', tab: 'roster' },
-  'intelligence': { page: 'brain', tab: 'memory' },
+  'intelligence': { page: 'brain', tab: 'overview' },
   'memory-health': { page: 'brain', tab: 'health' },
   'claims': { page: 'brain', tab: 'health' },
   'metrics': { page: 'team', tab: 'activity' },
@@ -16296,9 +17231,10 @@ function navigateTo(page, opts) {
       }
       break;
     case 'brain':
-      var bt = opts.tab || 'memory';
+      var bt = opts.tab || 'overview';
       // Spec tab names → internal intelligence-tab ids
-      var intelTab = bt === 'memory' ? 'search'
+      var intelTab = bt === 'overview' ? 'overview'
+        : bt === 'memory' ? 'search'
         : bt === 'knowledge' ? 'graph'
         : bt === 'ingestion' ? 'sources'
         : bt === 'health' ? 'health'
@@ -16703,6 +17639,7 @@ function switchTab(group, tab) {
   }
   // Tab-specific refresh
   if (group === 'intelligence') {
+    if (tab === 'overview' && typeof refreshBrainOverview === 'function') refreshBrainOverview();
     if (tab === 'graph') refreshGraph();
     if (tab === 'search') {
       // Consolidated Memory tab: search results + stats + MEMORY.md + recent writes + supersedes + coverage strip.
@@ -16712,6 +17649,12 @@ function switchTab(group, tab) {
       if (typeof refreshCoverageStrip === 'function') refreshCoverageStrip();
     }
     if (tab === 'files' && typeof refreshVaultFiles === 'function') refreshVaultFiles();
+    if (tab === 'sources') {
+      if (typeof brainLoadSources === 'function') brainLoadSources();
+      if (typeof brainLoadFeedConnectors === 'function') brainLoadFeedConnectors();
+      if (typeof brainLoadFeeds === 'function') brainLoadFeeds();
+    }
+    if (tab === 'runs' && typeof brainLoadRuns === 'function') brainLoadRuns();
     if (tab === 'health') {
       if (typeof refreshMemoryHealth === 'function') refreshMemoryHealth();
       if (typeof refreshGraphStats === 'function') refreshGraphStats();
@@ -22368,6 +23311,13 @@ function parseSearchFilters(raw) {
     return '';
   }).replace(/\s+/g, ' ').trim();
   return { q: cleaned, filters: filters };
+}
+
+function runMemoryDetailSearch() {
+  var detail = document.getElementById('memory-detail-search-input');
+  var header = document.getElementById('memory-search-input');
+  if (header && detail) header.value = detail.value;
+  runMemorySearch();
 }
 
 async function runMemorySearch() {
