@@ -32,6 +32,7 @@ function normalize(text: string): string {
   return text
     .trim()
     .toLowerCase()
+    .replace(/[‘’`]/g, "'")
     .replace(/[.!?]+$/g, '')
     .replace(/\s+/g, ' ');
 }
@@ -50,7 +51,7 @@ export function isStopRequest(text: string): boolean {
 export function isStatusRequest(text: string): boolean {
   const n = normalize(text);
   if (wordCount(n) > 8) return false;
-  return /^(status|task status|deep status|progress|what'?s happening|what'?s going on|what are you doing|are you working|anything running|what'?s running|background status|check status|where are we)$/.test(n);
+  return /^(status|task status|deep status|progress|what'?s happening|what'?s going on|what are you doing|what are you working on|what are you running|are you working|anything running|what'?s runnin?g?(?: now| right now)?|what is runnin?g?(?: now| right now)?|background status|check status|where are we)$/.test(n);
 }
 
 export function isLastActionRequest(text: string): boolean {

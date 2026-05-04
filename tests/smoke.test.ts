@@ -6,7 +6,7 @@
 import { describe, it, expect } from 'vitest';
 import { shellEscape } from '../src/config.js';
 import { classifyError, CronScheduler } from '../src/gateway/cron-scheduler.js';
-import { classifyChatError } from '../src/gateway/router.js';
+import { classifyChatError, isLiveUnleashedStatus } from '../src/gateway/router.js';
 import {
   buildContextThrashRecoveryPrompt,
   estimateTokens,
@@ -163,6 +163,32 @@ describe('classifyChatError', () => {
   it('classifies unknown errors', () => {
     expect(classifyChatError('something broke')).toBe('unknown');
     expect(classifyChatError(new Error('TypeError'))).toBe('unknown');
+  });
+});
+
+describe('isLiveUnleashedStatus', () => {
+  const now = Date.parse('2026-05-04T06:37:00.000Z');
+
+  it('keeps currently running unleashed status files visible', () => {
+    expect(isLiveUnleashedStatus({
+      status: 'running',
+      startedAt: '2026-05-04T06:00:00.000Z',
+      updatedAt: '2026-05-04T06:30:00.000Z',
+      maxHours: 1,
+    }, now)).toBe(true);
+  });
+
+  it('hides stale running statuses after their deadline grace period', () => {
+    expect(isLiveUnleashedStatus({
+      status: 'running',
+      startedAt: '2026-05-02T19:58:06.972Z',
+      updatedAt: '2026-05-02T20:08:07.396Z',
+      maxHours: 1,
+    }, now)).toBe(false);
+  });
+
+  it('does not treat terminal statuses as live work', () => {
+    expect(isLiveUnleashedStatus({ status: 'completed' }, now)).toBe(false);
   });
 });
 

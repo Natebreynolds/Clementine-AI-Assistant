@@ -11,6 +11,8 @@ describe('local turn detection', () => {
   it('detects status requests', () => {
     expect(detectLocalTurn("what's going on").kind).toBe('status');
     expect(detectLocalTurn('anything running?').kind).toBe('status');
+    expect(detectLocalTurn('What’s runnin').kind).toBe('status');
+    expect(detectLocalTurn('what is running right now').kind).toBe('status');
   });
 
   it('detects last-action diagnostics', () => {
