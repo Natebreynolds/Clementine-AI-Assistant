@@ -62,6 +62,9 @@ import { getBackgroundCreditBlock, isCreditBalanceError, markBackgroundCreditBlo
 import { appendTurnLedger, estimateTokensApprox, formatLastTurnLedger, readRecentTurnLedger } from './turn-ledger.js';
 import { assessGatewayContextHygiene, formatGatewayHygieneAnnotation } from './context-hygiene.js';
 import { getToolsetPreset, type ToolsetName } from '../agent/toolsets.js';
+import { isLiveUnleashedStatus } from './unleashed-status.js';
+
+export { isLiveUnleashedStatus } from './unleashed-status.js';
 
 const logger = pino({ name: 'clementine.gateway' });
 const INTERACTIVE_FAILURE_LOG = path.join(BASE_DIR, 'self-improve', 'interactive-failures.jsonl');
@@ -76,7 +79,6 @@ const CHAT_TIMEOUT_MS = 10 * 60 * 1000;
  *  Safety net so no session runs forever, even if active.
  *  Primary guardrail is cost budget (maxBudgetUsd), not this timer. */
 const CHAT_MAX_WALL_MS = 30 * 60 * 1000;
-const UNLEASHED_STATUS_STALE_GRACE_MS = 15 * 60 * 1000;
 const BACKGROUND_TASK_ID_RE = /\bbg-[a-z0-9]+-[a-f0-9]{6}\b/i;
 
 export type ChatErrorKind = 'rate_limit' | 'one_million_context' | 'context_overflow' | 'auth' | 'billing' | 'transient' | 'unknown';
@@ -95,27 +97,6 @@ export function classifyChatError(err: unknown): ChatErrorKind {
 /** Detect auth-like errors in response text that the SDK returned as "successful" results. */
 export function looksLikeAuthError(text: string): boolean {
   return /does not have access|please run \/login|not authenticated|invalid.*api.*key/i.test(text);
-}
-
-export function isLiveUnleashedStatus(status: Record<string, unknown>, nowMs = Date.now()): boolean {
-  const state = String(status.status ?? 'running');
-  if (!['pending', 'running', 'active'].includes(state)) return false;
-
-  const maxHoursRaw = Number(status.maxHours);
-  const maxHours = Number.isFinite(maxHoursRaw) && maxHoursRaw > 0 ? maxHoursRaw : null;
-  const startedMs = typeof status.startedAt === 'string' ? Date.parse(status.startedAt) : NaN;
-  if (maxHours !== null && Number.isFinite(startedMs)) {
-    const deadlineMs = startedMs + maxHours * 60 * 60 * 1000 + UNLEASHED_STATUS_STALE_GRACE_MS;
-    if (nowMs > deadlineMs) return false;
-  }
-
-  const updatedMs = typeof status.updatedAt === 'string' ? Date.parse(status.updatedAt) : NaN;
-  if (maxHours === null && Number.isFinite(updatedMs)) {
-    const staleMs = 24 * 60 * 60 * 1000;
-    if (nowMs - updatedMs > staleMs) return false;
-  }
-
-  return true;
 }
 
 /** Per-session state consolidated into a single structure. */

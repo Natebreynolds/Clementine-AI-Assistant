@@ -7,6 +7,7 @@ import { describe, it, expect } from 'vitest';
 import { shellEscape } from '../src/config.js';
 import { classifyError, CronScheduler } from '../src/gateway/cron-scheduler.js';
 import { classifyChatError, isLiveUnleashedStatus } from '../src/gateway/router.js';
+import { annotateUnleashedStatus, classifyUnleashedRuntimeState } from '../src/gateway/unleashed-status.js';
 import {
   buildContextThrashRecoveryPrompt,
   estimateTokens,
@@ -189,6 +190,27 @@ describe('isLiveUnleashedStatus', () => {
 
   it('does not treat terminal statuses as live work', () => {
     expect(isLiveUnleashedStatus({ status: 'completed' }, now)).toBe(false);
+  });
+
+  it('annotates stale running statuses for dashboard cleanup', () => {
+    const annotated = annotateUnleashedStatus({
+      status: 'running',
+      startedAt: '2026-05-02T19:58:06.972Z',
+      updatedAt: '2026-05-02T20:08:07.396Z',
+      maxHours: 1,
+    }, 'deep-old', now);
+    expect(annotated.live).toBe(false);
+    expect(annotated.stale).toBe(true);
+    expect(annotated.runtimeState).toBe('stale');
+    expect(annotated.effectiveStatus).toBe('stale');
+    expect(annotated.runtimeName).toBe('deep-old');
+  });
+
+  it('falls back to update age when no max runtime is present', () => {
+    expect(classifyUnleashedRuntimeState({
+      status: 'running',
+      updatedAt: '2026-05-02T06:36:00.000Z',
+    }, now)).toBe('stale');
   });
 });
 

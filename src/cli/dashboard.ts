@@ -46,6 +46,7 @@ import { delegationsRouter } from './routes/delegations.js';
 import { workflowsRouter } from './routes/workflows.js';
 import { digestRouter } from './routes/digest.js';
 import { loadClementineJson, updateClementineJson } from '../config/clementine-json.js';
+import { annotateUnleashedStatus } from '../gateway/unleashed-status.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -2834,7 +2835,7 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
             if (existsSync(statusFile)) {
               try {
                 const s = JSON.parse(readFileSync(statusFile, 'utf-8'));
-                if (s.status === 'running') kpis.activeRuns++;
+                if (annotateUnleashedStatus(s, d.name).live) kpis.activeRuns++;
               } catch { /* */ }
             }
           }
@@ -3474,10 +3475,31 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
       const { readWorkflow } = await import('../dashboard/builder/serializer.js');
       const wf = readWorkflow(id);
       if (!wf) { res.status(404).json({ error: 'Not found' }); return; }
+      const body = (req.body ?? {}) as { inputs?: Record<string, string>; approvedSideEffects?: boolean };
+      const sideEffects = wf.steps
+        .filter(step => {
+          const kind = step.kind ?? 'prompt';
+          if (kind === 'channel' || kind === 'mcp') return true;
+          return /\b(send|post|publish|email|webhook|delete|write|update|create)\b/i.test(step.prompt || '');
+        })
+        .map(step => ({
+          id: step.id,
+          kind: step.kind ?? 'prompt',
+          label: step.channel ? `${step.channel.channel}:${step.channel.target}` : step.mcp ? `${step.mcp.server}.${step.mcp.tool}` : step.prompt.slice(0, 80),
+        }));
+      if (sideEffects.length > 0 && body.approvedSideEffects !== true) {
+        res.status(409).json({
+          ok: false,
+          error: 'approval_required',
+          message: 'This workflow may send, write, post, or call external tools. Approve side effects before running it.',
+          sideEffects,
+        });
+        return;
+      }
       res.json({ ok: true, message: `Workflow "${wf.name}" triggered` });
       broadcastEvent({ type: 'workflow_triggered', data: { id, name: wf.name } });
 
-      getGateway().then(gw => gw.handleWorkflow(wf, req.body?.inputs || {})).then(result => {
+      getGateway().then(gw => gw.handleWorkflow(wf, body.inputs || {})).then(result => {
         broadcastEvent({ type: 'workflow_complete', data: { id, name: wf.name, status: 'ok', preview: (result || '').slice(0, 300) } });
       }).catch(err => {
         broadcastEvent({ type: 'workflow_complete', data: { id, name: wf.name, status: 'error', error: String(err) } });
@@ -5647,7 +5669,7 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
         if (existsSync(statusFile)) {
           try {
             const status = JSON.parse(readFileSync(statusFile, 'utf-8'));
-            tasks.push(status);
+            tasks.push(annotateUnleashedStatus(status, dir));
           } catch { /* skip corrupt */ }
         }
       }
@@ -5669,6 +5691,21 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
     try {
       writeFileSync(cancelFile, new Date().toISOString());
       res.json({ ok: true, message: `Cancel signal sent to "${req.params.name}"` });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  app.delete('/api/unleashed/:name', (req, res) => {
+    const taskName = req.params.name.replace(/[^a-zA-Z0-9_-]/g, '_');
+    const taskDir = path.join(BASE_DIR, 'unleashed', taskName);
+    if (!existsSync(taskDir)) {
+      res.status(404).json({ error: 'Unleashed task not found' });
+      return;
+    }
+    try {
+      rmSync(taskDir, { recursive: true, force: true });
+      res.json({ ok: true, message: `Removed runtime record "${req.params.name}"` });
     } catch (err) {
       res.status(500).json({ error: String(err) });
     }
@@ -6307,7 +6344,7 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
         ? Math.max(0, Math.round(status.maxHours * 60 - elapsed))
         : null;
 
-      res.json({ ...status, elapsed, remaining, progress: progressEntries });
+      res.json({ ...annotateUnleashedStatus(status, taskName), elapsed, remaining, progress: progressEntries });
     } catch (err) {
       res.status(500).json({ error: String(err) });
     }
@@ -7540,6 +7577,9 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
         totalCostCents: 0,
         sessions: [],
         tasks: [],
+        taskTotals: { totalTokens: 0, totalInput: 0, totalOutput: 0, costCents: 0, queries: 0 },
+        taskAgents: [],
+        agents: [],
         sources: [],
       });
       return;
@@ -7552,7 +7592,7 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
         "SELECT name FROM sqlite_master WHERE type='table' AND name='usage_log'",
       ).get();
       if (!tableExists) {
-        res.json({ ok: true, hours, sinceIso, totalTokens: 0, totalInput: 0, totalOutput: 0, totalCacheRead: 0, totalCacheCreation: 0, totalCostCents: 0, sessions: [], tasks: [], sources: [] });
+        res.json({ ok: true, hours, sinceIso, totalTokens: 0, totalInput: 0, totalOutput: 0, totalCacheRead: 0, totalCacheCreation: 0, totalCostCents: 0, sessions: [], tasks: [], taskTotals: { totalTokens: 0, totalInput: 0, totalOutput: 0, costCents: 0, queries: 0 }, taskAgents: [], agents: [], sources: [] });
         return;
       }
 
@@ -7598,9 +7638,8 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
          FROM usage_log
          WHERE datetime(created_at) >= datetime(?)
          GROUP BY session_key, source, ${agentExpr}
-         ORDER BY COALESCE(SUM(input_tokens), 0) + COALESCE(SUM(output_tokens), 0) DESC
-         LIMIT ?`,
-      ).all(sinceIso, limit) as Array<{
+         ORDER BY COALESCE(SUM(input_tokens), 0) + COALESCE(SUM(output_tokens), 0) DESC`,
+      ).all(sinceIso) as Array<{
         sessionKey: string;
         source: string;
         agentSlug: string;
@@ -7615,7 +7654,7 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
         lastAt: string;
       }>;
 
-      const sessions = sessionRows.map(row => {
+      const allSessions = sessionRows.map(row => {
         const identity = classifySession(row.sessionKey, row.source, row.agentSlug);
         return {
           ...identity,
@@ -7633,6 +7672,38 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
           lastAt: row.lastAt,
         };
       });
+      const sessions = allSessions.slice(0, limit);
+
+      const agentMap = new Map<string, {
+        agentSlug: string | null;
+        label: string;
+        totalInput: number;
+        totalOutput: number;
+        totalTokens: number;
+        costCents: number;
+        queries: number;
+      }>();
+      for (const s of allSessions) {
+        const key = s.agentSlug || '';
+        const existing = agentMap.get(key);
+        if (existing) {
+          existing.totalInput += s.totalInput;
+          existing.totalOutput += s.totalOutput;
+          existing.totalTokens += s.totalTokens;
+          existing.costCents += s.costCents || 0;
+          existing.queries += s.queries;
+        } else {
+          agentMap.set(key, {
+            agentSlug: s.agentSlug,
+            label: s.agentSlug || 'global',
+            totalInput: s.totalInput,
+            totalOutput: s.totalOutput,
+            totalTokens: s.totalTokens,
+            costCents: s.costCents || 0,
+            queries: s.queries,
+          });
+        }
+      }
 
       const taskMap = new Map<string, {
         taskKey: string;
@@ -7648,7 +7719,7 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
         queries: number;
         lastAt: string;
       }>();
-      for (const s of sessions) {
+      for (const s of allSessions) {
         if (s.kind === 'chat session') continue;
         const mapKey = `${s.kind}:${s.taskKey}:${s.agentSlug || ''}`;
         const existing = taskMap.get(mapKey);
@@ -7677,9 +7748,37 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
         }
       }
 
-      const tasks = Array.from(taskMap.values())
-        .sort((a, b) => b.totalTokens - a.totalTokens)
-        .slice(0, limit);
+      const allTasks = Array.from(taskMap.values()).sort((a, b) => b.totalTokens - a.totalTokens);
+      const taskAgentMap = new Map<string, { agentSlug: string | null; totalTokens: number; totalInput: number; totalOutput: number; costCents: number; queries: number }>();
+      for (const t of allTasks) {
+        const key = t.agentSlug || '';
+        const existing = taskAgentMap.get(key);
+        if (existing) {
+          existing.totalTokens += t.totalTokens;
+          existing.totalInput += t.totalInput;
+          existing.totalOutput += t.totalOutput;
+          existing.costCents += t.costCents;
+          existing.queries += t.queries;
+        } else {
+          taskAgentMap.set(key, {
+            agentSlug: t.agentSlug,
+            totalTokens: t.totalTokens,
+            totalInput: t.totalInput,
+            totalOutput: t.totalOutput,
+            costCents: t.costCents,
+            queries: t.queries,
+          });
+        }
+      }
+      const taskTotals = allTasks.reduce((acc, t) => {
+        acc.totalTokens += t.totalTokens;
+        acc.totalInput += t.totalInput;
+        acc.totalOutput += t.totalOutput;
+        acc.costCents += t.costCents;
+        acc.queries += t.queries;
+        return acc;
+      }, { totalTokens: 0, totalInput: 0, totalOutput: 0, costCents: 0, queries: 0 });
+      const tasks = allTasks.slice(0, limit);
 
       res.json({
         ok: true,
@@ -7693,13 +7792,16 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
         totalTokens: totals.ti + totals.to_,
         sessions,
         tasks,
+        taskTotals,
+        taskAgents: Array.from(taskAgentMap.values()).sort((a, b) => b.totalTokens - a.totalTokens),
+        agents: Array.from(agentMap.values()).sort((a, b) => b.totalTokens - a.totalTokens),
         sources: sourceRows.map(s => ({
           ...s,
           totalTokens: (s.totalInput || 0) + (s.totalOutput || 0),
         })),
       });
     } catch (err) {
-      res.json({ ok: false, error: String(err), hours, sinceIso, totalTokens: 0, sessions: [], tasks: [], sources: [] });
+      res.json({ ok: false, error: String(err), hours, sinceIso, totalTokens: 0, sessions: [], tasks: [], taskTotals: { totalTokens: 0, totalInput: 0, totalOutput: 0, costCents: 0, queries: 0 }, taskAgents: [], agents: [], sources: [] });
     } finally {
       db.close();
     }
@@ -14195,8 +14297,8 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
     <!-- ═══ Builder Page — Conversational Artifact Creation ═══ -->
     <div class="page" id="page-build">
       <div class="tab-bar" id="build-tabs" style="margin:0;padding:0 18px;background:var(--bg-secondary);border-bottom:1px solid var(--border)">
-        <button class="active" data-build-tab="workflows" data-icon="workflow" onclick="switchBuildTab('workflows')"><span class="icon-slot"></span> Workflow Builder</button>
-        <button data-build-tab="crons" data-icon="clock" onclick="switchBuildTab('crons')"><span class="icon-slot"></span> Scheduled Tasks <span class="tab-badge" id="build-tab-cron-count" style="display:none">0</span></button>
+        <button class="active" data-build-tab="crons" data-icon="clock" onclick="switchBuildTab('crons')"><span class="icon-slot"></span> Automation <span class="tab-badge" id="build-tab-cron-count" style="display:none">0</span></button>
+        <button data-build-tab="workflows" data-icon="workflow" onclick="switchBuildTab('workflows')"><span class="icon-slot"></span> Workflow Builder</button>
         <button data-build-tab="skills" data-icon="shield" onclick="switchBuildTab('skills')"><span class="icon-slot"></span> Skills <span class="tab-badge" id="build-tab-skill-count" style="display:none">0</span></button>
         <button data-build-tab="templates" data-icon="fileText" onclick="switchBuildTab('templates')"><span class="icon-slot"></span> Templates</button>
       </div>
@@ -14210,6 +14312,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
         </select>
         <label style="font-size:11px;color:var(--text-muted);font-weight:500;letter-spacing:0.04em;text-transform:uppercase">Owner</label>
         <select id="builder-owner" onchange="onBuilderOwnerChange()" title="Filter and create scoped to this owner" style="padding:4px 8px;border:1px solid var(--border);border-radius:6px;background:var(--bg-secondary);color:var(--text-primary);font-size:12px;min-width:160px">
+          <option value="__all__">All agents</option>
           <option value="">Clementine (global)</option>
         </select>
         <span id="builder-agent-label" style="padding:0;font-size:13px;color:var(--text-secondary);font-weight:500"></span>
@@ -14223,7 +14326,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
         <div class="skel-block"><div class="skel-row med"></div><div class="skel-row short"></div></div>
       </div>
       <!-- Build tab content area: canvas DOMINATES, chat is a sidebar -->
-      <div id="build-tab-workflows" data-build-tabpane="workflows" style="display:flex;flex:1;min-height:0;overflow:hidden">
+      <div id="build-tab-workflows" data-build-tabpane="workflows" style="display:none;flex:1;min-height:0;overflow:hidden">
         <!-- Left: Chat sidebar (compact) -->
         <div id="builder-chat-sidebar" style="width:360px;flex-shrink:0;display:flex;flex-direction:column;border-right:1px solid var(--border);background:var(--bg-secondary)">
           <div id="builder-messages" style="flex:1;overflow-y:auto;padding:16px">
@@ -14267,7 +14370,8 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
             </select>
             <button id="builder-canvas-validate-btn" onclick="validateBuilderCanvas()" title="Static checks (cycles, missing fields, deps)" style="display:none;background:var(--bg-tertiary);border:1px solid var(--border);color:var(--text-secondary);padding:3px 8px;border-radius:4px;cursor:pointer;font-size:11px">Validate</button>
             <button id="builder-canvas-dryrun-btn" onclick="dryRunBuilderCanvas()" title="Describe what each step would do (no execution)" style="display:none;background:var(--bg-tertiary);border:1px solid var(--border);color:var(--text-secondary);padding:3px 8px;border-radius:4px;cursor:pointer;font-size:11px">Dry-run</button>
-            <button id="builder-canvas-test-btn" onclick="testBuilderCanvas()" title="Test run (mock-safe by default)" style="display:none;background:var(--clementine);border:none;color:#fff;padding:3px 10px;border-radius:4px;cursor:pointer;font-size:11px">Test</button>
+            <button id="builder-canvas-test-btn" onclick="testBuilderCanvas()" title="Mock-safe validation run; prompt steps are stubbed" style="display:none;background:var(--clementine);border:none;color:#fff;padding:3px 10px;border-radius:4px;cursor:pointer;font-size:11px">Mock Test</button>
+            <button id="builder-canvas-real-run-btn" onclick="runBuilderCanvasReal()" title="Run through the real workflow engine; side effects require approval" style="display:none;background:var(--green);border:none;color:#fff;padding:3px 10px;border-radius:4px;cursor:pointer;font-size:11px">Run Real</button>
             <button id="builder-canvas-cancel-btn" onclick="cancelBuilderTest()" title="Cancel test run" style="display:none;background:var(--red);border:none;color:#fff;padding:3px 10px;border-radius:4px;cursor:pointer;font-size:11px">Cancel</button>
           </div>
           <div id="builder-preview" style="flex:1;overflow-y:auto;padding:16px">
@@ -14313,14 +14417,14 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
       </div>
 
       <!-- Scheduled Tasks tab — simple recurring-task management. The visual canvas is for workflows. -->
-      <div id="build-tab-crons" data-build-tabpane="crons" style="display:none;flex:1;min-height:0;overflow-y:auto;padding:18px;background:var(--bg-primary)">
+      <div id="build-tab-crons" data-build-tabpane="crons" style="display:block;flex:1;min-height:0;overflow-y:auto;padding:18px;background:var(--bg-primary)">
         <div style="display:flex;align-items:flex-start;gap:14px;margin-bottom:16px;flex-wrap:wrap">
           <div style="flex:1;min-width:260px">
-            <h2 style="font-size:18px;font-weight:600;margin:0 0 4px;color:var(--text-primary)">Scheduled Tasks</h2>
-            <p style="font-size:13px;color:var(--text-muted);margin:0;line-height:1.45">Recurring jobs that can run automatically. Cards here are the turn-on, turn-off, run-now surface.</p>
+            <h2 style="font-size:18px;font-weight:600;margin:0 0 4px;color:var(--text-primary)">Automation</h2>
+            <p style="font-size:13px;color:var(--text-muted);margin:0;line-height:1.45">Scheduled tasks, scheduled workflows, and live runtime work. Cards here are the turn-on, turn-off, run-now surface.</p>
           </div>
           <div style="display:flex;gap:8px;flex-wrap:wrap">
-            <button class="btn-sm btn-primary" onclick="openCreateCronModal((document.getElementById(\\x27builder-owner\\x27)||{}).value||\\x27\\x27)" style="padding:7px 14px;border-radius:6px;cursor:pointer;font-size:12px">New Scheduled Task</button>
+            <button class="btn-sm btn-primary" onclick="openCreateCronModal(getBuildCreateOwner())" style="padding:7px 14px;border-radius:6px;cursor:pointer;font-size:12px">New Scheduled Task</button>
             <button class="btn-sm" onclick="createScheduledWorkflowFromBuild()" style="padding:7px 14px;border-radius:6px;cursor:pointer;font-size:12px">New Scheduled Workflow</button>
           </div>
         </div>
@@ -17507,7 +17611,7 @@ var ROUTE_REDIRECTS = {
   'goals': { page: 'team', tab: 'goals' },
   'workflows': { page: 'build', tab: 'workflows' },
   'automations': { page: 'build', tab: 'crons' },
-  'unleashed': { page: 'build', tab: 'workflows' },
+  'unleashed': { page: 'build', tab: 'crons' },
   'builder': { page: 'build', tab: 'workflows' },
   'skill-studio': { page: 'build', tab: 'skills' },
   'heartbeats': { page: 'heartbeat' },
@@ -17570,7 +17674,7 @@ function navigateTo(page, opts) {
       }, 80);
       break;
     case 'build':
-      switchBuildTab(opts.tab || 'workflows');
+      switchBuildTab(opts.tab || 'crons');
       var bp = currentAgentSlug || '';
       refreshBuilderAgents(bp);
       break;
@@ -17636,9 +17740,34 @@ function switchDestTab(page, tab) {
 
 // (Session 5) openAutomationsTab compat shim removed — all callers route via navigateTo + ROUTE_REDIRECTS.
 
-// ── Build (Workflows / Scheduled Tasks / Skills / Templates) tabs ─────────────
+// ── Build (Automation / Workflow Builder / Skills / Templates) tabs ─────────────
+var BUILD_OWNER_ALL = '__all__';
+
+function getBuildOwnerFilter() {
+  var sel = document.getElementById('builder-owner');
+  return sel ? sel.value : BUILD_OWNER_ALL;
+}
+
+function getBuildCreateOwner() {
+  var owner = getBuildOwnerFilter();
+  return owner === BUILD_OWNER_ALL ? '' : owner;
+}
+
+function buildOwnerMatches(agentSlug) {
+  var owner = getBuildOwnerFilter();
+  if (owner === BUILD_OWNER_ALL) return true;
+  if (owner) return agentSlug === owner;
+  return !agentSlug;
+}
+
+function buildOwnerScopeLabel() {
+  var owner = getBuildOwnerFilter();
+  if (owner === BUILD_OWNER_ALL) return 'all agents';
+  return owner || 'global';
+}
+
 function switchBuildTab(tab) {
-  if (!tab) tab = 'workflows';
+  if (!tab) tab = 'crons';
   // Update tab-bar active state
   document.querySelectorAll('#build-tabs button').forEach(function(b) {
     b.classList.toggle('active', b.getAttribute('data-build-tab') === tab);
@@ -17726,7 +17855,7 @@ function switchBuildTab(tab) {
 // workflow file). Workflows route through /api/builder/workflows. Owner is
 // read from the header's Owner picker — empty string means global.
 async function newFromBuildHeader() {
-  var activeTab = document.querySelector('#build-tabs button.active')?.getAttribute('data-build-tab') || 'workflows';
+  var activeTab = document.querySelector('#build-tabs button.active')?.getAttribute('data-build-tab') || 'crons';
   if (activeTab === 'skills') {
     if (typeof resetBuilder === 'function') resetBuilder();
     var bi = document.getElementById('builder-input');
@@ -17737,7 +17866,7 @@ async function newFromBuildHeader() {
     toast('Pick a template to fork from the cards.', 'info');
     return;
   }
-  var owner = (document.getElementById('builder-owner') || {}).value || '';
+  var owner = getBuildCreateOwner();
   if (activeTab === 'crons') {
     if (typeof openCreateCronModal === 'function') {
       openCreateCronModal(owner);
@@ -17760,7 +17889,7 @@ async function newFromBuildHeader() {
 }
 
 async function createScheduledWorkflowFromBuild() {
-  var owner = (document.getElementById('builder-owner') || {}).value || '';
+  var owner = getBuildCreateOwner();
   var name = prompt('Scheduled workflow name:');
   if (!name || !name.trim()) return;
   var schedule = prompt('Cron schedule:', '0 9 * * 1-5');
@@ -17785,8 +17914,8 @@ async function createScheduledWorkflowFromBuild() {
 }
 
 // Owner picker — populated from /api/agents on first build-tab activation
-// and refreshed on demand. Empty value = Clementine/global; any other value
-// is the agent slug for scoped reads/writes.
+// and refreshed on demand. "__all__" means aggregate view, empty string means
+// Clementine/global, any other value is the agent slug for scoped reads/writes.
 var _builderOwnerPickerLoaded = false;
 async function populateBuilderOwnerPicker(force) {
   if (_builderOwnerPickerLoaded && !force) return;
@@ -17795,8 +17924,8 @@ async function populateBuilderOwnerPicker(force) {
   try {
     var r = await apiFetch('/api/agents');
     var agents = r.ok ? await r.json() : [];
-    var prev = sel.value;
-    var opts = '<option value="">Clementine (global)</option>';
+    var prev = sel.value || BUILD_OWNER_ALL;
+    var opts = '<option value="' + BUILD_OWNER_ALL + '">All agents</option><option value="">Clementine (global)</option>';
     if (Array.isArray(agents)) {
       for (var i = 0; i < agents.length; i++) {
         var slug = agents[i] && agents[i].slug;
@@ -17806,8 +17935,10 @@ async function populateBuilderOwnerPicker(force) {
       }
     }
     sel.innerHTML = opts;
-    if (prev) sel.value = prev;
+    sel.value = prev;
+    if (sel.value !== prev) sel.value = BUILD_OWNER_ALL;
     _builderOwnerPickerLoaded = true;
+    if (typeof onBuilderOwnerChange === 'function') onBuilderOwnerChange();
   } catch (err) {
     // Leave the default global option in place; not fatal.
   }
@@ -17818,12 +17949,13 @@ async function populateBuilderOwnerPicker(force) {
 // working, then refresh the canvas picker so the list re-filters.
 async function onBuilderOwnerChange() {
   var sel = document.getElementById('builder-owner');
-  var owner = sel ? sel.value : '';
+  var owner = sel ? sel.value : BUILD_OWNER_ALL;
+  var createOwner = getBuildCreateOwner();
   var hidden = document.getElementById('builder-agent');
   var label = document.getElementById('builder-agent-label');
-  if (hidden) hidden.value = owner || '';
-  if (label) label.textContent = owner ? 'Owner: ' + owner : '';
-  var activeTab = document.querySelector('#build-tabs button.active')?.getAttribute('data-build-tab') || 'workflows';
+  if (hidden) hidden.value = createOwner || '';
+  if (label) label.textContent = owner === BUILD_OWNER_ALL ? 'Viewing: all agents' : (owner ? 'Owner: ' + owner : 'Owner: global');
+  var activeTab = document.querySelector('#build-tabs button.active')?.getAttribute('data-build-tab') || 'crons';
   if (typeof refreshBuildUsage === 'function') refreshBuildUsage();
   if (activeTab === 'crons') {
     if (typeof refreshCron === 'function') refreshCron();
@@ -17879,12 +18011,15 @@ async function forkBuildTemplate(templateId) {
   var name = prompt('Name for the new workflow:', tpl.name);
   if (!name) return;
   try {
-    var r = await apiJson('POST', '/api/builder/workflows', {
+    var body = {
       name: name,
       description: tpl.description,
       schedule: tpl.schedule,
       initialPrompt: tpl.initialPrompt,
-    });
+    };
+    var owner = getBuildCreateOwner();
+    if (owner) body.agent = owner;
+    var r = await apiJson('POST', '/api/builder/workflows', body);
     if (r && r.error) { toast('Create failed: ' + r.error, 'error'); return; }
     if (r && r.id) {
       switchBuildTab('workflows');
@@ -17919,7 +18054,7 @@ function openCommandK() {
     { kw: 'home today plan',    page: 'home',     tab: 'today',        label: 'Home · Today' },
     { kw: 'home activity',      page: 'home',     tab: 'activity',     label: 'Home · Activity' },
     { kw: 'build workflows workflow builder', page: 'build', tab: 'workflows', label: 'Build · Workflow Builder' },
-    { kw: 'build crons scheduled tasks', page: 'build', tab: 'crons', label: 'Build · Scheduled Tasks' },
+    { kw: 'build crons scheduled tasks automation', page: 'build', tab: 'crons', label: 'Build · Automation' },
     { kw: 'build skills',       page: 'build',    tab: 'skills',       label: 'Build · Skills' },
     { kw: 'build templates',    page: 'build',    tab: 'templates',    label: 'Build · Templates' },
     { kw: 'team roster',        page: 'team',     tab: 'roster',       label: 'Team · Roster' },
@@ -17983,7 +18118,7 @@ async function refreshUnleashed() {
     var tasks = d.tasks || [];
     var badge = document.getElementById('nav-unleashed-count');
     if (badge) {
-      var running = tasks.filter(function(t) { return t.status === 'running'; }).length;
+      var running = tasks.filter(function(t) { return t.live === true || t.runtimeState === 'active'; }).length;
       if (running > 0) { badge.style.display = ''; badge.textContent = String(running); }
       else { badge.style.display = 'none'; }
     }
@@ -17999,15 +18134,18 @@ async function refreshUnleashed() {
     html += '<th style="padding:8px 12px;text-align:right;color:var(--text-muted);font-weight:600">Action</th>';
     html += '</tr></thead><tbody>';
     tasks.forEach(function(t) {
-      var statusColor = t.status === 'running' ? 'var(--green)' : t.status === 'completed' ? 'var(--blue)' : t.status === 'cancelled' ? 'var(--text-muted)' : 'var(--orange)';
+      var effectiveStatus = t.effectiveStatus || t.status || 'unknown';
+      var statusColor = t.live ? 'var(--green)' : t.status === 'completed' ? 'var(--blue)' : t.status === 'cancelled' ? 'var(--text-muted)' : 'var(--orange)';
       html += '<tr style="border-bottom:1px solid var(--border)">';
       html += '<td style="padding:10px 12px;font-weight:600">' + esc(t.name || '—') + '</td>';
-      html += '<td style="padding:10px 12px"><span style="color:' + statusColor + ';font-size:11px;font-weight:600;text-transform:uppercase">' + esc(t.status || 'unknown') + '</span></td>';
+      html += '<td style="padding:10px 12px"><span style="color:' + statusColor + ';font-size:11px;font-weight:600;text-transform:uppercase">' + esc(effectiveStatus) + '</span></td>';
       html += '<td style="padding:10px 12px;color:var(--text-muted)">' + esc(t.phase != null ? String(t.phase) : '—') + '</td>';
       html += '<td style="padding:10px 12px;color:var(--text-muted)">' + esc(t.startedAt || '—') + '</td>';
       html += '<td style="padding:10px 12px;text-align:right">';
-      if (t.status === 'running') {
-        html += '<button class="btn-sm" style="font-size:11px;color:#ef4444" onclick="cancelUnleashed(\\'' + esc(t.name) + '\\')">Cancel</button>';
+      if (t.live === true || t.runtimeState === 'active') {
+        html += '<button class="btn-sm" style="font-size:11px;color:#ef4444" onclick="cancelUnleashed(\\'' + esc(t.runtimeName || t.name) + '\\')">Cancel</button>';
+      } else if (t.stale === true || t.runtimeState === 'stale') {
+        html += '<button class="btn-sm" style="font-size:11px" onclick="deleteUnleashedRuntime(\\'' + esc(t.runtimeName || t.name) + '\\')">Clean up</button>';
       }
       html += '</td></tr>';
     });
@@ -18922,9 +19060,43 @@ async function toggleScheduledWorkflow(id) {
 
 async function runScheduledWorkflow(id) {
   try {
-    await apiPost('/api/builder/workflows/' + encodeURIComponent(id) + '/run');
+    await triggerWorkflowRun(id);
     setTimeout(refreshCron, 1000);
   } catch(e) { toast('Failed to run workflow: ' + e, 'error'); }
+}
+
+async function triggerWorkflowRun(id, approvedSideEffects) {
+  var payload = {};
+  if (approvedSideEffects) payload.approvedSideEffects = true;
+  var r = await apiFetch('/api/builder/workflows/' + encodeURIComponent(id) + '/run', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  var d = await r.json();
+  if (r.status === 409 && d && d.error === 'approval_required') {
+    var sideEffects = (d.sideEffects || []).slice(0, 5).map(function(s) {
+      return '- ' + (s.id || 'step') + ' · ' + (s.kind || 'step') + (s.label ? ' · ' + s.label : '');
+    }).join('\\n');
+    if (!confirm((d.message || 'This workflow needs approval before side effects run.') + '\\n\\n' + sideEffects + '\\n\\nRun it now?')) {
+      toast('Workflow run cancelled before side effects.', 'info');
+      return null;
+    }
+    return triggerWorkflowRun(id, true);
+  }
+  if (d && d.ok) {
+    toast(d.message || 'Workflow triggered', 'success');
+    return d;
+  }
+  toast((d && (d.error || d.message)) || 'Workflow run failed', 'error');
+  return d;
+}
+
+async function runBuilderCanvasReal() {
+  if (!_builderCanvasOpenId) { toast('Open a workflow first', 'info'); return; }
+  if (_builderSaveTimer) { clearTimeout(_builderSaveTimer); _builderSaveTimer = null; await _flushBuilderSave(); }
+  if (!confirm('Run this workflow through the real agent engine now? Mock Test is safer for validation; real runs can spend tokens and may request approval for side effects.')) return;
+  await triggerWorkflowRun(_builderCanvasOpenId);
 }
 
 function openScheduledWorkflow(id) {
@@ -19466,8 +19638,9 @@ function durationLabel(ms) {
 function mergeBuildUsageTasks(tasks) {
   buildUsageByTask = {};
   (tasks || []).forEach(function(t) {
-    var key = t.taskKey || t.label;
-    if (!key) return;
+    var rawKey = t.taskKey || t.label;
+    if (!rawKey) return;
+    var key = (t.agentSlug ? (t.agentSlug + ':') : '') + rawKey;
     if (!buildUsageByTask[key]) {
       buildUsageByTask[key] = {
         totalTokens: 0,
@@ -19487,8 +19660,9 @@ function mergeBuildUsageTasks(tasks) {
   });
 }
 
-function buildUsageBadge(key) {
-  var usage = buildUsageByTask[key];
+function buildUsageBadge(key, agentSlug) {
+  var usageKey = (agentSlug ? (agentSlug + ':') : '') + key;
+  var usage = buildUsageByTask[usageKey] || buildUsageByTask[key];
   if (!usage || !usage.totalTokens) return '';
   return '<span class="badge badge-blue" title="' + esc(formatTokens(usage.totalInput || 0)) + ' input, ' + esc(formatTokens(usage.totalOutput || 0)) + ' output">' + esc(formatTokens(usage.totalTokens)) + ' tok 7d</span>';
 }
@@ -19497,35 +19671,53 @@ async function refreshBuildUsage() {
   var host = document.getElementById('build-usage-panel');
   if (!host) return;
   try {
-    var r = await apiFetch('/api/build/usage?hours=168&limit=12');
+    var r = await apiFetch('/api/build/usage?hours=168&limit=50');
     var d = await r.json();
     if (!d || d.ok === false) {
       host.innerHTML = '<div class="empty-state" style="padding:10px;color:var(--text-muted)">Usage unavailable</div>';
       return;
     }
 
-    var owner = (document.getElementById('builder-owner') || {}).value || '';
-    var sessions = (d.sessions || []).filter(function(s) { return owner ? s.agentSlug === owner : !s.agentSlug; });
-    var tasks = (d.tasks || []).filter(function(t) { return owner ? t.agentSlug === owner : !t.agentSlug; });
+    var owner = getBuildOwnerFilter();
+    var sessions = (d.sessions || []).filter(function(s) { return buildOwnerMatches(s.agentSlug || ''); });
+    var tasks = (d.tasks || []).filter(function(t) { return buildOwnerMatches(t.agentSlug || ''); });
     mergeBuildUsageTasks(d.tasks || []);
 
-    var visibleTokenTotal = sessions.reduce(function(sum, s) { return sum + (s.totalTokens || 0); }, 0);
-    var automationTokens = tasks.reduce(function(sum, t) { return sum + (t.totalTokens || 0); }, 0);
+    function totalForOwner(rows, fallbackAll) {
+      if (owner === BUILD_OWNER_ALL) return fallbackAll || 0;
+      var match = (rows || []).filter(function(row) {
+        return owner ? row.agentSlug === owner : !row.agentSlug;
+      })[0];
+      return match ? (match.totalTokens || 0) : 0;
+    }
+    var visibleTokenTotal = totalForOwner(d.agents || [], d.totalTokens || 0);
+    var automationTokens = totalForOwner(d.taskAgents || [], (d.taskTotals && d.taskTotals.totalTokens) || 0);
     var topSession = sessions[0] || null;
+    var scopeLabel = buildOwnerScopeLabel();
+    var agentTotals = {};
+    (d.agents || []).forEach(function(s) {
+      var key = s.agentSlug || 'global';
+      agentTotals[key] = s.totalTokens || 0;
+    });
+    var agentBreakdown = Object.keys(agentTotals).sort(function(a, b) { return agentTotals[b] - agentTotals[a]; }).slice(0, 4);
+    var agentBreakdownHtml = owner === BUILD_OWNER_ALL && agentBreakdown.length
+      ? '<div style="font-size:11px;color:var(--text-muted);margin-top:4px">' + agentBreakdown.map(function(k) { return esc(k) + ': ' + esc(formatTokens(agentTotals[k])); }).join(' · ') + '</div>'
+      : '';
 
     var html = '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px;margin-bottom:10px">'
       + '<div style="border:1px solid var(--border);border-radius:8px;background:var(--bg-secondary);padding:12px">'
-      + '<div style="display:flex;align-items:center;justify-content:space-between;gap:8px"><strong style="font-size:13px">Workflow Builder</strong><span class="badge badge-purple">manual/test</span></div>'
-      + '<div style="font-size:12px;color:var(--text-muted);margin-top:6px;line-height:1.4">Multi-step canvas. Test or run manually; schedule it when it should recur.</div>'
+      + '<div style="display:flex;align-items:center;justify-content:space-between;gap:8px"><strong style="font-size:13px">Workflow Builder</strong><span class="badge badge-purple">manual/mock</span></div>'
+      + '<div style="font-size:12px;color:var(--text-muted);margin-top:6px;line-height:1.4">Canvas tests are mock-safe. Use Run Real or schedule the workflow when it should execute.</div>'
       + '</div>'
       + '<div style="border:1px solid var(--border);border-radius:8px;background:var(--bg-secondary);padding:12px">'
-      + '<div style="display:flex;align-items:center;justify-content:space-between;gap:8px"><strong style="font-size:13px">Scheduled Tasks</strong><span class="badge badge-green">recurring</span></div>'
-      + '<div style="font-size:12px;color:var(--text-muted);margin-top:6px;line-height:1.4">Enabled cards here can spend tokens automatically and can be toggled or deleted.</div>'
+      + '<div style="display:flex;align-items:center;justify-content:space-between;gap:8px"><strong style="font-size:13px">Automation</strong><span class="badge badge-green">recurring</span></div>'
+      + '<div style="font-size:12px;color:var(--text-muted);margin-top:6px;line-height:1.4">Enabled cards can spend tokens automatically. Toggle, run, or delete them here.</div>'
       + '</div>'
       + '<div style="border:1px solid var(--border);border-radius:8px;background:var(--bg-secondary);padding:12px">'
-      + '<div style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:.04em">Token Usage · 7d</div>'
+      + '<div style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:.04em">Token Usage · 7d · ' + esc(scopeLabel) + '</div>'
       + '<div style="display:flex;align-items:baseline;gap:10px;margin-top:4px"><strong style="font-size:22px">' + esc(formatTokens(visibleTokenTotal)) + '</strong><span style="font-size:12px;color:var(--text-muted)">' + esc(formatTokens(automationTokens)) + ' automation</span></div>'
-      + (topSession ? '<div style="font-size:11px;color:var(--text-muted);margin-top:4px">Top: ' + esc(topSession.label) + '</div>' : '<div style="font-size:11px;color:var(--text-muted);margin-top:4px">No usage logged for this owner.</div>')
+      + (topSession ? '<div style="font-size:11px;color:var(--text-muted);margin-top:4px">Top: ' + esc(topSession.label) + '</div>' : '<div style="font-size:11px;color:var(--text-muted);margin-top:4px">No usage logged for this scope.</div>')
+      + agentBreakdownHtml
       + '</div>'
       + '</div>';
 
@@ -19547,7 +19739,7 @@ async function refreshBuildUsage() {
     html += '</div>';
 
     html += '<div style="border:1px solid var(--border);border-radius:8px;background:var(--bg-secondary);overflow:hidden">'
-      + '<div style="padding:10px 12px;border-bottom:1px solid var(--border);font-size:12px;font-weight:600">Task Spend</div>';
+      + '<div style="padding:10px 12px;border-bottom:1px solid var(--border);font-size:12px;font-weight:600">Automation Spend</div>';
     if (tasks.length === 0) {
       html += '<div style="padding:12px;color:var(--text-muted);font-size:12px">No scheduled or long-running task usage in the last 7 days.</div>';
     } else {
@@ -19602,14 +19794,12 @@ async function refreshCron() {
     if (!panel) return;
 
     var activeBuildTab = document.querySelector('#build-tabs button.active')?.getAttribute('data-build-tab') || '';
-    var ownerFilter = currentPage === 'build' && activeBuildTab === 'crons'
-      ? ((document.getElementById('builder-owner') || {}).value || '')
-      : '';
+    var ownerFilter = currentPage === 'build' && activeBuildTab === 'crons' ? getBuildOwnerFilter() : BUILD_OWNER_ALL;
     var visibleJobs = currentPage === 'build' && activeBuildTab === 'crons'
-      ? cronJobsData.filter(function(j) { return ownerFilter ? j.agent === ownerFilter : !j.agent; })
+      ? cronJobsData.filter(function(j) { return buildOwnerMatches(j.agent || ''); })
       : cronJobsData;
     var visibleWorkflows = currentPage === 'build' && activeBuildTab === 'crons'
-      ? scheduledWorkflowData.filter(function(w) { return ownerFilter ? w.scope === 'agent' && w.agentSlug === ownerFilter : w.scope !== 'agent'; })
+      ? scheduledWorkflowData.filter(function(w) { return buildOwnerMatches(w.agentSlug || ''); })
       : scheduledWorkflowData;
 
     var noScheduledDefinitions = visibleJobs.length === 0 && visibleWorkflows.length === 0;
@@ -19643,8 +19833,8 @@ async function refreshCron() {
       + '</div>';
 
     if (noScheduledDefinitions) {
-      var emptyLabel = ownerFilter ? 'No scheduled definitions for ' + ownerFilter : 'No global scheduled definitions';
-      html += '<div class="task-grid"><div class="task-card-add" onclick="openCreateCronModal((document.getElementById(\\x27builder-owner\\x27)||{}).value||\\x27\\x27)">+ New Task</div></div>'
+      var emptyLabel = ownerFilter === BUILD_OWNER_ALL ? 'No scheduled definitions across any agent' : (ownerFilter ? 'No scheduled definitions for ' + ownerFilter : 'No global scheduled definitions');
+      html += '<div class="task-grid"><div class="task-card-add" onclick="openCreateCronModal(getBuildCreateOwner())">+ New Task</div></div>'
         + '<div class="empty-state" style="padding:18px;color:var(--text-muted);font-size:13px">' + esc(emptyLabel) + '</div>';
     }
 
@@ -19675,7 +19865,7 @@ async function refreshCron() {
           if (wf.agentSlug) wfBadges += '<span class="badge badge-orange">' + esc(wf.agentSlug) + '</span>';
           wfBadges += '<span class="badge badge-purple">workflow</span>';
           wfBadges += '<span class="badge badge-gray">' + (wf.stepCount || 0) + ' steps</span>';
-          wfBadges += buildUsageBadge(wf.name);
+          wfBadges += buildUsageBadge(wf.name, wf.agentSlug || '');
           wfBadges += '<span class="badge ' + (wfEnabled ? 'badge-green' : 'badge-gray') + '">' + (wfEnabled ? 'Enabled' : 'Disabled') + '</span>';
           var wfId = jsStr(wf.id);
           var wfName = jsStr(wf.name);
@@ -19721,7 +19911,7 @@ async function refreshCron() {
         if (job.mode === 'unleashed') badgesHtml += '<span class="badge badge-purple">unleashed</span>';
         if (job.after) badgesHtml += '<span class="badge badge-yellow" title="Triggered after ' + esc(job.after) + '">\\u2192 ' + esc(job.after) + '</span>';
         if (job.max_retries != null) badgesHtml += '<span class="badge badge-gray">' + job.max_retries + ' retries</span>';
-        badgesHtml += buildUsageBadge(job.name);
+        badgesHtml += buildUsageBadge(job.name, job.agent || '');
         badgesHtml += '<span class="badge ' + (enabled ? 'badge-green' : 'badge-gray') + '">' + (enabled ? 'Enabled' : 'Disabled') + '</span>';
 
         var safeName = jsStr(job.name);
@@ -19745,21 +19935,37 @@ async function refreshCron() {
           + '</div></div>';
       }
       if (groupKey === '_main' || ownerFilter === groupKey) {
-        html += '<div class="task-card-add" onclick="openCreateCronModal((document.getElementById(\\x27builder-owner\\x27)||{}).value||\\x27\\x27)">+ New Task</div>';
+        html += '<div class="task-card-add" onclick="openCreateCronModal(getBuildCreateOwner())">+ New Task</div>';
       }
       html += '</div>';
     }
 
     var activeBackground = (Array.isArray(backgroundPayload) ? backgroundPayload : []).filter(function(t) {
       if (t.status !== 'pending' && t.status !== 'running') return false;
-      return ownerFilter ? t.fromAgent === ownerFilter : (!t.fromAgent || t.fromAgent === 'clementine');
+      var fromAgent = t.fromAgent && t.fromAgent !== 'clementine' ? t.fromAgent : '';
+      return ownerFilter === BUILD_OWNER_ALL ? true : buildOwnerMatches(fromAgent || '');
     });
-    var activeUnleashed = (unleashedPayload.tasks || []).filter(function(t) {
-      var status = String(t.status || '');
+    function runtimeOwner(t) {
+      if (t.agentSlug) return String(t.agentSlug);
       var jobName = String(t.jobName || '');
-      if (status !== 'pending' && status !== 'running') return false;
+      var idx = jobName.indexOf(':');
+      return idx > 0 ? jobName.slice(0, idx) : '';
+    }
+    function runtimeOwnerMatches(t) {
+      return ownerFilter === BUILD_OWNER_ALL ? true : buildOwnerMatches(runtimeOwner(t));
+    }
+    var activeUnleashed = (unleashedPayload.tasks || []).filter(function(t) {
+      var jobName = String(t.jobName || '');
       if (jobName.indexOf('bg:') === 0) return false;
-      return ownerFilter ? jobName.indexOf(ownerFilter + ':') === 0 : jobName.indexOf(':') === -1;
+      if (t.live !== true && t.runtimeState !== 'active') return false;
+      return runtimeOwnerMatches(t);
+    });
+    var attentionUnleashed = (unleashedPayload.tasks || []).filter(function(t) {
+      var jobName = String(t.jobName || '');
+      if (jobName.indexOf('bg:') === 0) return false;
+      if (!runtimeOwnerMatches(t)) return false;
+      var status = String(t.status || '');
+      return t.stale === true || t.runtimeState === 'stale' || status === 'error' || status === 'failed' || status === 'timeout';
     });
 
     var activeTotal = activeBackground.length + activeUnleashed.length;
@@ -19782,7 +19988,7 @@ async function refreshCron() {
           + '<div class="task-card-schedule">' + esc(bg.fromAgent || 'clementine') + ' · max ' + esc(bg.maxMinutes || '') + 'm' + (bg.status === 'running' ? ' · running ' + esc(durationLabel(bgRunningMs)) : '') + '</div>'
           + '<div class="task-card-prompt">' + esc(bg.prompt || '') + '</div>'
           + '<div class="task-card-status">Created ' + esc(timeAgo(bg.createdAt)) + '</div>'
-          + '<div class="task-card-badges"><span class="badge badge-purple">background</span>' + buildUsageBadge('bg:' + bg.id) + '</div>'
+          + '<div class="task-card-badges"><span class="badge badge-purple">background</span>' + buildUsageBadge('bg:' + bg.id, bg.fromAgent && bg.fromAgent !== 'clementine' ? bg.fromAgent : '') + '</div>'
           + '<div class="task-card-actions">'
           + '<button class="btn-sm btn-danger" onclick="cancelBackgroundTask(\\x27' + jsStr(bg.id) + '\\x27)">Cancel</button>'
           + '</div></div>';
@@ -19790,6 +19996,7 @@ async function refreshCron() {
 
       for (var ui = 0; ui < activeUnleashed.length && shown < 8; ui++, shown++) {
         var ut = activeUnleashed[ui];
+        var utRuntimeName = ut.runtimeName || ut.name || ut.jobName || '';
         var uDuration = '';
         if (ut.startedAt) {
           var uEnd = ut.finishedAt ? new Date(ut.finishedAt).getTime() : Date.now();
@@ -19800,13 +20007,49 @@ async function refreshCron() {
           + '<div class="task-card-schedule">Phase ' + esc(ut.phase || 0) + (uDuration ? ' · running ' + esc(uDuration) : '') + (ut.maxHours ? ' / ' + esc(ut.maxHours) + 'h cap' : '') + '</div>'
           + '<div class="task-card-prompt">' + esc((ut.lastPhaseOutputPreview || '').slice(0, 180)) + '</div>'
           + '<div class="task-card-status">Runtime task spawned by a scheduled definition</div>'
-          + '<div class="task-card-badges"><span class="badge badge-purple">unleashed</span>' + buildUsageBadge(ut.jobName || '') + '</div>'
+          + '<div class="task-card-badges"><span class="badge badge-purple">unleashed</span>' + buildUsageBadge(ut.jobName || '', runtimeOwner(ut)) + '</div>'
           + '<div class="task-card-actions">'
-          + '<button class="btn-sm btn-danger" onclick="cancelUnleashed(\\x27' + jsStr(ut.jobName || '') + '\\x27)">Cancel</button>'
+          + '<button class="btn-sm btn-danger" onclick="cancelUnleashed(\\x27' + jsStr(utRuntimeName) + '\\x27)">Cancel</button>'
           + '</div></div>';
       }
       if (activeTotal > shown) {
         html += '<div class="empty-state" style="padding:18px;color:var(--text-muted);font-size:13px">Showing ' + shown + ' of ' + activeTotal + ' active tasks. Use the Owner filter to narrow this list.</div>';
+      }
+      html += '</div>';
+    }
+
+    if (attentionUnleashed.length > 0) {
+      html += '<div style="display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin:28px 0 12px;flex-wrap:wrap">'
+        + '<div>'
+        + '<h3 style="font-size:15px;font-weight:600;color:var(--text-primary);margin:0 0 4px">Needs attention</h3>'
+        + '<div style="font-size:12px;color:var(--text-muted)">Expired or failed runtime records. These are not counted as actively running token spend.</div>'
+        + '</div>'
+        + '<span class="badge badge-yellow">' + attentionUnleashed.length + ' review</span>'
+        + '</div><div class="task-grid">';
+
+      for (var ai = 0; ai < attentionUnleashed.length && ai < 8; ai++) {
+        var at = attentionUnleashed[ai];
+        var atRuntimeName = at.runtimeName || at.name || at.jobName || '';
+        var atStatus = at.effectiveStatus || at.status || 'unknown';
+        var atDuration = '';
+        if (at.startedAt) {
+          var atEnd = at.finishedAt ? new Date(at.finishedAt).getTime() : Date.now();
+          atDuration = durationLabel(atEnd - new Date(at.startedAt).getTime());
+        }
+        var canCancel = at.stale === true || at.runtimeState === 'stale' || at.status === 'running' || at.status === 'pending';
+        html += '<div class="task-card disabled">'
+          + '<div class="task-card-header"><strong>' + esc(at.jobName || atRuntimeName || 'runtime task') + '</strong><span class="badge badge-yellow">' + esc(atStatus) + '</span></div>'
+          + '<div class="task-card-schedule">' + (atDuration ? esc(atDuration) + ' elapsed · ' : '') + 'updated ' + esc(timeAgo(at.updatedAt || at.startedAt || '')) + '</div>'
+          + '<div class="task-card-prompt">' + esc((at.lastPhaseOutputPreview || at.error || '').slice(0, 180)) + '</div>'
+          + '<div class="task-card-status">Review or clean up this runtime record. It is not live work.</div>'
+          + '<div class="task-card-badges"><span class="badge badge-purple">unleashed</span>' + buildUsageBadge(at.jobName || '', runtimeOwner(at)) + '</div>'
+          + '<div class="task-card-actions">'
+          + (canCancel ? '<button class="btn-sm btn-danger" onclick="cancelUnleashed(\\x27' + jsStr(atRuntimeName) + '\\x27)">Cancel</button>' : '')
+          + '<button class="btn-sm" onclick="deleteUnleashedRuntime(\\x27' + jsStr(atRuntimeName) + '\\x27)">Clean up</button>'
+          + '</div></div>';
+      }
+      if (attentionUnleashed.length > 8) {
+        html += '<div class="empty-state" style="padding:18px;color:var(--text-muted);font-size:13px">Showing 8 of ' + attentionUnleashed.length + ' records. Use the Owner filter to narrow this list.</div>';
       }
       html += '</div>';
     }
@@ -19952,6 +20195,15 @@ async function cancelUnleashed(jobName) {
     if (typeof refreshUnleashed === 'function') refreshUnleashed();
     setTimeout(refreshCron, 1000);
   } catch(e) { toast('Failed to cancel: ' + e, 'error'); }
+}
+
+async function deleteUnleashedRuntime(jobName) {
+  if (!confirm('Remove runtime record "' + jobName + '" from the dashboard? This does not delete the scheduled task definition.')) return;
+  try {
+    await apiDelete('/api/unleashed/' + encodeURIComponent(jobName));
+    if (typeof refreshUnleashed === 'function') refreshUnleashed();
+    setTimeout(refreshCron, 500);
+  } catch(e) { toast('Failed to clean up: ' + e, 'error'); }
 }
 
 var unleashedDetailTimers = {};
@@ -22756,6 +23008,7 @@ function updateBuilderMode() {
   var validateBtn = document.getElementById('builder-canvas-validate-btn');
   var dryrunBtn = document.getElementById('builder-canvas-dryrun-btn');
   var paneTitle = document.getElementById('builder-right-pane-title');
+  var realRunBtn = document.getElementById('builder-canvas-real-run-btn');
 
   if (type === 'skill') {
     if (title) title.textContent = 'Skill Studio';
@@ -22777,6 +23030,7 @@ function updateBuilderMode() {
     if (validateBtn) validateBtn.style.display = '';
     if (dryrunBtn) dryrunBtn.style.display = '';
     if (testBtn) testBtn.style.display = '';
+    if (realRunBtn) realRunBtn.style.display = type === 'workflow' ? '' : 'none';
     if (paneTitle) paneTitle.textContent = (type === 'cron' ? 'Scheduled Tasks' : 'Workflow Builder');
     refreshBuilderCanvasPicker(type);
   } else {
@@ -22786,6 +23040,7 @@ function updateBuilderMode() {
     if (validateBtn) validateBtn.style.display = 'none';
     if (dryrunBtn) dryrunBtn.style.display = 'none';
     if (testBtn) testBtn.style.display = 'none';
+    if (realRunBtn) realRunBtn.style.display = 'none';
     if (paneTitle) paneTitle.textContent = 'Live Preview';
     closeBuilderCanvas();
   }
@@ -22815,18 +23070,14 @@ async function refreshBuilderCanvasPicker(type) {
   var picker = document.getElementById('builder-canvas-picker');
   if (!picker) return;
   try {
-    var owner = (document.getElementById('builder-owner') || {}).value || '';
+    var owner = getBuildOwnerFilter();
     var r = await apiFetch('/api/builder/workflows');
     var d = await r.json();
     var items = (d.workflows || []).filter(function(w) {
       if (w.origin !== type) return false;
-      // Owner filter: empty owner = Clementine/global only; named owner =
-      // agent-scoped entries for that slug only. The serializer reports
-      // scope='agent' for entries living under <AGENTS_DIR>/<slug>/.
-      if (owner) return w.scope === 'agent' && w.agentSlug === owner;
-      return w.scope !== 'agent';
+      return buildOwnerMatches(w.agentSlug || '');
     });
-    var ownerLabel = owner ? '@' + owner : 'global';
+    var ownerLabel = owner === BUILD_OWNER_ALL ? 'all agents' : (owner ? '@' + owner : 'global');
     var opts = '<option value="">' + (items.length ? '— pick a ' + type + ' (' + ownerLabel + ') —' : '(none yet for ' + ownerLabel + ')') + '</option>';
     for (var i = 0; i < items.length; i++) {
       var w = items[i];
@@ -23359,7 +23610,7 @@ var _builderRunStepResults = {};
 
 async function testBuilderCanvas() {
   if (!_builderCanvasOpenId) { toast('Open a workflow first', 'info'); return; }
-  if (_builderActiveRunId) { toast('A test is already running', 'info'); return; }
+  if (_builderActiveRunId) { toast('A mock test is already running', 'info'); return; }
   // Always flush any pending save so the test sees the latest graph
   if (_builderSaveTimer) { clearTimeout(_builderSaveTimer); _builderSaveTimer = null; await _flushBuilderSave(); }
   _clearRunVisualState();
@@ -23371,9 +23622,9 @@ async function testBuilderCanvas() {
     var cancel = document.getElementById('builder-canvas-cancel-btn');
     if (cancel) cancel.style.display = '';
     _setBuilderSaveStatus('saved');  // override status with a more useful one below
-    _setRunFooter('Running test… (' + r.runId.slice(0, 8) + ')');
+    _setRunFooter('Running mock test… (' + r.runId.slice(0, 8) + ')');
   } catch (err) {
-    toast('Test failed to start: ' + err, 'error');
+    toast('Mock test failed to start: ' + err, 'error');
   }
 }
 
@@ -23409,7 +23660,7 @@ function _findNodeElForStepId(stepId) {
 function _onRunEvent(evt) {
   if (!evt || !evt.runId || evt.workflowId !== _builderCanvasOpenId) return;
   if (evt.type === 'run:started') {
-    _setRunFooter('Running test… (' + evt.runId.slice(0, 8) + ')');
+    _setRunFooter('Running mock test… (' + evt.runId.slice(0, 8) + ')');
     return;
   }
   if (evt.type === 'run:step-status') {
@@ -23432,7 +23683,7 @@ function _onRunEvent(evt) {
     _builderActiveRunId = null;
     var cancel = document.getElementById('builder-canvas-cancel-btn');
     if (cancel) cancel.style.display = 'none';
-    _setRunFooter('Test ' + ec + ' in ' + dur + 'ms — click a node for output');
+    _setRunFooter('Mock test ' + ec + ' in ' + dur + 'ms — click a node for output');
     return;
   }
 }
@@ -23896,18 +24147,12 @@ function refreshBuilderAgents(preselect) {
   var hidden = document.getElementById('builder-agent');
   var label = document.getElementById('builder-agent-label');
   if (!hidden || !label) return;
-  hidden.value = preselect || '';
-  if (!preselect) {
-    label.textContent = 'Clementine (global)';
+  if (typeof onBuilderOwnerChange === 'function') {
+    onBuilderOwnerChange();
     return;
   }
-  // Look up agent name from sidebar
-  var teamItem = document.querySelector('.team-nav-item[data-slug="' + preselect + '"] span');
-  if (teamItem) {
-    label.textContent = teamItem.textContent;
-  } else {
-    label.textContent = preselect;
-  }
+  hidden.value = preselect || '';
+  label.textContent = preselect || 'Clementine (global)';
 }
 
 // ── Builder Linked Tools ──────────────────
@@ -25704,7 +25949,7 @@ async function refreshHomeRail() {
   try {
     var ru = await apiFetch('/api/unleashed');
     var du = await ru.json();
-    var active = (du.tasks || []).filter(function(t) { return t.status === 'running'; });
+    var active = (du.tasks || []).filter(function(t) { return t.live === true || t.runtimeState === 'active'; });
     var ae = document.getElementById('rail-active');
     var ac = document.getElementById('rail-active-count');
     if (ac) {
