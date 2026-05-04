@@ -25,6 +25,7 @@ import pino from 'pino';
 import { AGENTS_DIR, BASE_DIR, CRON_FILE } from '../config.js';
 import type { Gateway } from './router.js';
 import type { BrokenJob } from './failure-monitor.js';
+import { loadPromptOverrides, loadPromptOverridesForJob } from '../agent/prompt-overrides/loader.js';
 
 const logger = pino({ name: 'clementine.failure-diagnostics' });
 
@@ -213,7 +214,16 @@ function readRecentRuns(jobName: string, limit = 10): string {
   }
 }
 
-function evidenceHashFor(broken: BrokenJob, jobDef: string | null, recentRuns: string): string {
+function activePromptOverrideText(jobName: string, agentSlug?: string, opts?: { baseDir?: string }): string {
+  try {
+    loadPromptOverrides(opts);
+    return loadPromptOverridesForJob(jobName, agentSlug, opts);
+  } catch {
+    return '';
+  }
+}
+
+function evidenceHashFor(broken: BrokenJob, jobDef: string | null, recentRuns: string, promptOverrides: string): string {
   const payload = JSON.stringify({
     jobName: broken.jobName,
     lastErrorAt: broken.lastErrorAt,
@@ -222,6 +232,7 @@ function evidenceHashFor(broken: BrokenJob, jobDef: string | null, recentRuns: s
     lastAdvisorOpinion: broken.lastAdvisorOpinion,
     jobDef: jobDef?.slice(0, 3000) ?? null,
     recentRuns,
+    promptOverrides: promptOverrides.slice(0, 3000),
   });
   return createHash('sha256').update(payload).digest('hex');
 }
@@ -350,10 +361,20 @@ function promptOverrideForContextOverflow(jobName: string): AutoApplyPromptOverr
   };
 }
 
+function hasContextOverflowPromptOverride(
+  jobName: string,
+  agentSlug?: string,
+  opts?: { baseDir?: string },
+): boolean {
+  const override = activePromptOverrideText(jobName, agentSlug, opts).toLowerCase();
+  return /bounded run guidance|context window|full run histories|raw integration exports|large json output/.test(override);
+}
+
 export function diagnoseKnownFailurePattern(
   broken: BrokenJob,
   jobDef: string | null,
   recentRuns: string,
+  opts?: { baseDir?: string },
 ): Diagnosis | null {
   const haystack = [
     broken.jobName,
@@ -363,6 +384,18 @@ export function diagnoseKnownFailurePattern(
   ].join('\n').toLowerCase();
 
   if (/rapid_refill_breaker|autocompact.*thrash|context refilled|prompt is too long|prompt too long|context.?length|maximum context|input is too long/.test(haystack)) {
+    if (hasContextOverflowPromptOverride(broken.jobName, broken.agentSlug, opts)) {
+      return {
+        rootCause: 'The job is still overflowing the Claude context window even though bounded-run prompt guidance is already active.',
+        confidence: 'high',
+        proposedFix: {
+          type: 'escalate_to_owner',
+          details: 'Do not apply another prompt override. Treat this as an engine/tool-surface issue: stop retrying the same broad unleashed phase, reduce the active tool surface or split the job, and inspect the latest phase trace.',
+        },
+        riskLevel: 'medium',
+        generatedAt: new Date().toISOString(),
+      };
+    }
     const autoApply = jobDef ? promptOverrideForContextOverflow(broken.jobName) : undefined;
     return {
       rootCause: 'The job is overflowing the Claude context window. This is usually caused by broad file reads, full run-history reads, or raw integration output being pulled into the prompt.',
@@ -556,7 +589,8 @@ export async function diagnoseBrokenJob(
   const jobDef = readJobDefinition(broken.jobName);
   const agentProfile = broken.agentSlug ? readAgentProfile(broken.agentSlug) : null;
   const recentRuns = readRecentRuns(broken.jobName, 10);
-  const evidenceHash = evidenceHashFor(broken, jobDef, recentRuns);
+  const activeOverrides = activePromptOverrideText(broken.jobName, broken.agentSlug);
+  const evidenceHash = evidenceHashFor(broken, jobDef, recentRuns, activeOverrides);
   const cache = loadCache();
   const cached = cache[broken.jobName];
   if (cached && cachedDiagnosisMatches(cached, broken, evidenceHash)) {

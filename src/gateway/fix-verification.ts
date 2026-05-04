@@ -22,6 +22,7 @@ import pino from 'pino';
 import { BASE_DIR } from '../config.js';
 import type { CronJobDefinition, CronRunEntry } from '../types.js';
 import { computeBrokenJobs } from './failure-monitor.js';
+import { classifyRunHealth } from './job-health.js';
 
 const logger = pino({ name: 'clementine.fix-verification' });
 
@@ -98,6 +99,15 @@ function saveState(state: State): void {
   } catch (err) {
     logger.warn({ err }, 'Failed to persist fix-verification state');
   }
+}
+
+function verificationSucceeded(entry: CronRunEntry): boolean {
+  return entry.status === 'ok' && classifyRunHealth(entry).status === 'healthy';
+}
+
+function verificationOutcome(entry: CronRunEntry): 'ok' | 'error' | 'retried' {
+  if (verificationSucceeded(entry)) return 'ok';
+  return entry.status === 'retried' ? 'retried' : 'error';
 }
 
 /**
@@ -313,10 +323,11 @@ export async function checkAndDeliverVerification(
   if (!pending.autoApply) {
     delete state.pending[entry.jobName];
     saveState(state);
-    const ok = entry.status === 'ok';
+    const ok = verificationSucceeded(entry);
+    const health = classifyRunHealth(entry);
     const verdict = ok ? '✅ succeeded' : '⚠️ still failing';
     const ageMin = Math.max(1, Math.round((Date.now() - Date.parse(pending.recordedAt)) / 60000));
-    const detail = ok ? '' : `\nError: ${(entry.error ?? 'unknown').split('\n')[0]!.slice(0, 200)}`;
+    const detail = ok ? '' : `\nError: ${(entry.error ?? health.evidence[0] ?? health.status).split('\n')[0]!.slice(0, 200)}`;
     const msg = `**[Fix verification]** \`${entry.jobName}\` ${verdict} on its first run after edit (${ageMin}m later).${detail}`;
     try { await send(msg); } catch (err) {
       logger.warn({ err, job: entry.jobName }, 'Failed to send fix verification DM');
@@ -326,7 +337,7 @@ export async function checkAndDeliverVerification(
 
   // AutoApply flow — accumulate the sample first.
   const outcomes = pending.postRunOutcomes ?? [];
-  outcomes.push(entry.status as 'ok' | 'error' | 'retried');
+  outcomes.push(verificationOutcome(entry));
   pending.postRunOutcomes = outcomes;
 
   if (outcomes.length < AUTOAPPLY_VERDICT_WINDOW) {

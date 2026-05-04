@@ -55,6 +55,12 @@ describe('prompt overrides loader', () => {
     expect(unmatched).toBe('');
   });
 
+  it('job-scoped override for an agent cron matches the bare job name', () => {
+    writeOverride('jobs/content-intel-brief.md', 'Use batches of 20.');
+    const matched = loadPromptOverridesForJob('sasha-the-cmo:content-intel-brief', 'sasha-the-cmo', { baseDir });
+    expect(matched).toBe('Use batches of 20.');
+  });
+
   it('concatenates global + agent + job in priority order (lower first)', () => {
     writeOverride('_global.md', 'GLOBAL');
     writeOverride('agents/ross.md', 'AGENT');

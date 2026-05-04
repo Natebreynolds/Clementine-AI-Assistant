@@ -139,6 +139,31 @@ describe('Phase 8.1 — autoApply multi-run verification', () => {
     expect(existsSync(file)).toBe(true);
   });
 
+  it('auto-reverts when raw ok runs are health-classified failures', async () => {
+    const file = path.join(TMP_HOME, 'prompt-overrides', 'jobs', 'legacy-ok.md');
+    mkdirSync(path.dirname(file), { recursive: true });
+    writeFileSync(file, 'Keep tool output bounded.\n');
+
+    recordAutoApplyForVerification('legacy-ok-job', {
+      kind: 'prompt-override', file, scope: 'job', scopeKey: 'legacy-ok',
+    });
+
+    const sent: string[] = [];
+    const send = async (text: string) => { sent.push(text); };
+    const badOk = () => ({
+      ...makeRun('legacy-ok-job', 'ok'),
+      outputPreview: 'Task "legacy-ok-job" aborted after 3 consecutive phase errors.',
+    });
+
+    await checkAndDeliverVerification(badOk(), send);
+    await checkAndDeliverVerification(badOk(), send);
+    await checkAndDeliverVerification(badOk(), send);
+
+    expect(sent).toHaveLength(1);
+    expect(sent[0]).toContain('REVERTED');
+    expect(existsSync(file)).toBe(false);
+  });
+
   it('all runs succeed — verified, fix kept', async () => {
     const file = path.join(TMP_HOME, 'advisor-rules', 'user', 'good-rule.yaml');
     mkdirSync(path.dirname(file), { recursive: true });

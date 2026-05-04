@@ -132,12 +132,16 @@ export function loadPromptOverridesForJob(
   const applicable = cached.filter(o => {
     if (o.scope === 'global') return true;
     if (o.scope === 'agent') return agentSlug != null && o.scopeKey === agentSlug;
-    if (o.scope === 'job') return o.scopeKey === jobName;
+    if (o.scope === 'job') return o.scopeKey === jobName || o.scopeKey === bareJobName(jobName);
     return false;
   });
   if (applicable.length === 0) return '';
   applicable.sort((a, b) => a.priority - b.priority);
   return applicable.map(o => o.body).join('\n\n');
+}
+
+function bareJobName(jobName: string): string {
+  return jobName.includes(':') ? jobName.split(':').slice(1).join(':') : jobName;
 }
 
 /** Install fs.watch on the overrides directory tree. Safe to call multiple times. */

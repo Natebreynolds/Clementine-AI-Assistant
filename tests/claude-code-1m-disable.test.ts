@@ -16,15 +16,30 @@ describe('Claude Code 1M context mode', () => {
     delete process.env.CLAUDE_CODE_DISABLE_1M_CONTEXT;
   });
 
-  it('allows Opus 1M in auto mode while forcing Sonnet to standard context', () => {
-    expect(claudeCodeDisableOneMillionForModel('claude-opus-4-7', 'auto')).toBeUndefined();
-    expect(claudeCodeDisableOneMillionForModel('claude-sonnet-4-6', 'auto')).toBe('1');
-    expect(usesOneMillionContext('claude-opus-4-7', 'auto')).toBe(true);
-    expect(usesOneMillionContext('claude-sonnet-4-6', 'auto')).toBe(false);
+  it('allows Opus long context in auto mode for included subscription plans', () => {
+    expect(claudeCodeDisableOneMillionForModel('claude-opus-4-7', 'auto', 'max')).toBe('0');
+    expect(usesOneMillionContext('claude-opus-4-7', 'auto', 'max')).toBe(true);
+    expect(usesOneMillionContext('claude-opus-4-7', 'auto', 'team')).toBe(true);
+    expect(usesOneMillionContext('claude-opus-4-7', 'auto', 'enterprise')).toBe(true);
   });
 
-  it('strips accidental Sonnet [1m] suffixes in auto mode', () => {
-    expect(normalizeClaudeModelForOneMillionContext('claude-sonnet-4-6[1m]', 'auto')).toBe('claude-sonnet-4-6');
+  it('does not silently enable Opus 1M for Pro or unknown plans', () => {
+    expect(claudeCodeDisableOneMillionForModel('claude-opus-4-7', 'auto', 'pro')).toBe('1');
+    expect(claudeCodeDisableOneMillionForModel('claude-opus-4-7', 'auto', 'unknown')).toBe('1');
+    expect(usesOneMillionContext('claude-opus-4-7', 'auto', 'pro')).toBe(false);
+    expect(usesOneMillionContext('claude-opus-4-7', 'auto', 'unknown')).toBe(false);
+    expect(usesOneMillionContext('claude-opus-4-7[1m]', 'auto', 'unknown')).toBe(true);
+  });
+
+  it('keeps Sonnet 1M explicit because it can require extra usage', () => {
+    expect(claudeCodeDisableOneMillionForModel('claude-sonnet-4-6', 'auto', 'max')).toBe('1');
+    expect(usesOneMillionContext('claude-sonnet-4-6', 'auto', 'max')).toBe(false);
+    expect(claudeCodeDisableOneMillionForModel('claude-sonnet-4-6[1m]', 'auto', 'max')).toBe('0');
+    expect(usesOneMillionContext('claude-sonnet-4-6[1m]', 'auto', 'max')).toBe(true);
+  });
+
+  it('preserves explicit Sonnet and Opus [1m] suffixes in auto mode', () => {
+    expect(normalizeClaudeModelForOneMillionContext('claude-sonnet-4-6[1m]', 'auto')).toBe('claude-sonnet-4-6[1m]');
     expect(normalizeClaudeModelForOneMillionContext('claude-opus-4-7[1m]', 'auto')).toBe('claude-opus-4-7[1m]');
   });
 
@@ -34,7 +49,11 @@ describe('Claude Code 1M context mode', () => {
     expect(usesOneMillionContext('claude-opus-4-7', 'off')).toBe(false);
   });
 
-  it('normalizes SDK options and MCP subprocess env for standard-context models', () => {
+  it('preserves explicit Opus [1m] when 1M mode is forced on', () => {
+    expect(normalizeClaudeModelForOneMillionContext('claude-opus-4-7[1m]', 'on')).toBe('claude-opus-4-7[1m]');
+  });
+
+  it('normalizes SDK options and MCP subprocess env for explicit Sonnet 1M models', () => {
     process.env.CLEMENTINE_1M_CONTEXT_MODE = 'auto';
     const options = normalizeClaudeSdkOptionsForOneMillionContext({
       model: 'claude-sonnet-4-6[1m]',
@@ -49,17 +68,17 @@ describe('Claude Code 1M context mode', () => {
       },
     });
 
-    expect(options.model).toBe('claude-sonnet-4-6');
-    expect(options.betas).toEqual([]);
+    expect(options.model).toBe('claude-sonnet-4-6[1m]');
+    expect(options.betas).toEqual(['context-1m-2025-08-07']);
     expect(options.env).toMatchObject({
       EXISTING: 'yes',
       CLEMENTINE_1M_CONTEXT_MODE: 'auto',
-      CLAUDE_CODE_DISABLE_1M_CONTEXT: '1',
+      CLAUDE_CODE_DISABLE_1M_CONTEXT: '0',
     });
     expect((options.mcpServers.local as any).env).toMatchObject({
       TOOL_ENV: 'ok',
       CLEMENTINE_1M_CONTEXT_MODE: 'auto',
-      CLAUDE_CODE_DISABLE_1M_CONTEXT: '1',
+      CLAUDE_CODE_DISABLE_1M_CONTEXT: '0',
     });
   });
 

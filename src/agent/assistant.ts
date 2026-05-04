@@ -74,7 +74,7 @@ import {
 } from '../integrations/tool-preferences.js';
 import { loadClaudeIntegrations } from './mcp-bridge.js';
 import { detectFrustrationSignals, detectRepeatedTopics } from './insight-engine.js';
-import type { AgentProfile, ChannelCapabilities, OnTextCallback, OnToolActivityCallback, SessionData, VerboseLevel } from '../types.js';
+import type { AgentProfile, ChannelCapabilities, OnTextCallback, OnToolActivityCallback, SessionData, TerminalReason, VerboseLevel } from '../types.js';
 import { DEFAULT_CHANNEL_CAPABILITIES } from '../types.js';
 import {
   enforceToolPermissions,
@@ -240,6 +240,27 @@ export function estimateTokens(text: string): number {
 export function looksLikeContextThrashText(value: unknown): boolean {
   const text = String(value ?? '');
   return /autocompact\s+is\s+thrashing|context\s+refilled\s+to\s+the\s+limit|refilled\s+to\s+the\s+limit\s+within/i.test(text);
+}
+
+function inferTerminalReasonFromFailure(value: unknown): TerminalReason | undefined {
+  const text = String(value ?? '').toLowerCase();
+  if (looksLikeContextThrashText(text) || /rapid_refill_breaker|maximum context|context.?length/.test(text)) {
+    return 'rapid_refill_breaker';
+  }
+  if (/prompt is too long|prompt too long|input is too long|request too large/.test(text)) {
+    return 'prompt_too_long';
+  }
+  if (/maximum number of turns|max_turns/.test(text)) {
+    return 'max_turns';
+  }
+  return undefined;
+}
+
+class UnleashedTaskFailedError extends Error {
+  constructor(message: string, readonly terminalReason?: TerminalReason) {
+    super(message);
+    this.name = 'UnleashedTaskFailedError';
+  }
 }
 
 export function contextThrashRecoveryNotice(): string {
@@ -1148,7 +1169,7 @@ export class PersonalAssistant {
   private _lastMcpStatus: Array<{ name: string; status: string }> = [];
   private _lastMcpStatusTime: string = '';
   /** Terminal reason from the last SDK query — consumed by cron scheduler for precise error classification. */
-  private _lastTerminalReason?: string;
+  private _lastTerminalReason?: TerminalReason;
   /** Per-session stall nudge — set after a query shows stall signals, consumed on the next query. */
   private stallNudges = new Map<string, string>();
   /** Last contradiction finding per session, consumed by the session transcript writer to splice a correction note. */
@@ -5998,6 +6019,12 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
     let lastOutput = '';
     let consecutiveErrors = 0;
     const MAX_CONSECUTIVE_ERRORS = 3;
+    const unleashedContextSafety = [
+      'CONTEXT SAFETY:',
+      '- Keep each phase bounded. Do not read full run logs, full CRON.md, raw exports, or large integration responses.',
+      '- Pull records in small batches, summarize IDs/counts/statuses, and write bulky intermediate data to files instead of pasting it into the conversation.',
+      '- If the task looks too broad for the remaining context, stop with a compact status summary and pending list rather than retrying broader reads.',
+    ].join('\n');
 
     while (phase < UNLEASHED_MAX_PHASES) {
       // Check cancellation
@@ -6115,6 +6142,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
           `After each phase completes, your session will be resumed with fresh context.\n\n` +
           `TASK:\n${jobPrompt}\n\n` +
           unleashedSkillContext +
+          `${unleashedContextSafety}\n\n` +
           `IMPORTANT:\n` +
           `- Work methodically through the task in phases\n` +
           `- At the end of this phase, output a STATUS SUMMARY of what you accomplished and what remains\n` +
@@ -6147,6 +6175,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
             `Continuing unleashed task. This is phase ${phase}.\n` +
             `Time remaining: ${remainingHours} hours. You have ${turnsPerPhase} turns this phase.\n` +
             checkpointContext +
+            `\n${unleashedContextSafety}\n` +
             `\nContinue working on the task. Pick up where you left off.\n` +
             `If the task is COMPLETE, output "TASK_COMPLETE:" followed by a final summary.\n\n` +
             `IMPORTANT: Output a STATUS SUMMARY at the end of this phase.`;
@@ -6159,6 +6188,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
             `Previous phases encountered an error and the session was reset.\n\n` +
             `TASK:\n${jobPrompt}\n` +
             checkpointContext +
+            `\n${unleashedContextSafety}\n` +
             `\nCheck any files or progress from prior phases, then continue the work.\n` +
             `If the task is COMPLETE, output "TASK_COMPLETE:" followed by a final summary.\n\n` +
             `IMPORTANT: Output a STATUS SUMMARY at the end of this phase.`;
@@ -6283,8 +6313,31 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
       } catch (err) {
         clearTimeout(phaseTimer);
         clearInterval(beaconTimer);
+        const terminalReason = inferTerminalReasonFromFailure(err);
+        if (terminalReason && !this._lastTerminalReason) {
+          this._lastTerminalReason = terminalReason;
+        }
         logger.error({ err, jobName, phase }, `Unleashed task phase ${phase} error`);
-        appendProgress({ event: 'phase_error', phase, error: String(err) });
+        appendProgress({ event: 'phase_error', phase, error: String(err), terminalReason });
+
+        if (terminalReason === 'rapid_refill_breaker' || terminalReason === 'prompt_too_long') {
+          appendProgress({ event: 'aborted', phase, reason: terminalReason });
+          writeStatus({
+            jobName,
+            status: 'error',
+            phase,
+            startedAt,
+            finishedAt: new Date().toISOString(),
+            terminalReason,
+          });
+          const message = (
+            `Task "${jobName}" aborted in phase ${phase}: ${terminalReason}. ` +
+            `The phase exceeded the context window, so Clementine stopped instead of retrying the same broad task shape.`
+          );
+          logger.error({ jobName, phase, terminalReason }, 'Unleashed task aborted on context-size failure');
+          throw new UnleashedTaskFailedError(message, terminalReason);
+        }
+
         consecutiveErrors++;
 
         if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
@@ -6296,10 +6349,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
             `Check \`clementine cron runs ${jobName}\` for the failing phase, or retry with ` +
             `\`clementine cron run ${jobName}\`.`
           );
-          if (this.onUnleashedComplete) {
-            try { this.onUnleashedComplete(jobName, errorResult); } catch { /* non-fatal */ }
-          }
-          return errorResult;
+          throw new UnleashedTaskFailedError(errorResult, this._lastTerminalReason);
         }
 
         // On error, try to continue with a fresh session
@@ -6390,10 +6440,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
     writeStatus({ jobName, status: 'max_phases', phase, startedAt, finishedAt: new Date().toISOString() });
     logger.warn(`Unleashed task ${jobName} hit max phases (${UNLEASHED_MAX_PHASES})`);
     const maxPhasesResult = lastOutput || `Task "${jobName}" reached maximum phase limit (${UNLEASHED_MAX_PHASES}).`;
-    if (this.onUnleashedComplete) {
-      try { this.onUnleashedComplete(jobName, maxPhasesResult); } catch { /* non-fatal */ }
-    }
-    return maxPhasesResult;
+    throw new UnleashedTaskFailedError(maxPhasesResult, this._lastTerminalReason);
   }
 
   // ── Team Task Execution (Unleashed for Team Messages) ────────────

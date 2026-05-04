@@ -39,21 +39,23 @@ const env = readEnvFile();
 
 // ── Claude Code 1M context mode ─────────────────────────────────────
 //
-// Claude Code's May 2026 behavior is plan/model-specific:
-//   - Opus 1M is included for Max, Team, and Enterprise subscription auth.
-//   - Sonnet 1M requires Extra Usage on subscription auth.
-//   - API/PAYG can use 1M through API billing.
+// Claude Code's long-context behavior is plan/auth/model-specific:
+//   - Claude Code subscription auth can expose long context on Opus without
+//     the Sonnet [1m] Extra Usage path.
+//   - Console/API Sonnet 1M is requested with the [1m] suffix and may have
+//     different pricing/eligibility.
 //
 // Clementine therefore uses a higher-level mode instead of blindly forcing
 // CLAUDE_CODE_DISABLE_1M_CONTEXT for every SDK subprocess:
-//   auto  (default): allow Opus to receive Claude Code's included 1M upgrade,
-//                    but keep Sonnet/Haiku on the standard 200K path.
+//   auto  (default): allow Opus long-context routing, but keep Sonnet/Haiku
+//                    on the standard path unless Sonnet [1m] is explicit.
 //   off:              force 200K everywhere; best recovery/safe mode.
-//   on:               allow 1M everywhere; only for Extra Usage/API users.
+//   on:               allow long-context routing; only for eligible users.
 //
 // The legacy CLAUDE_CODE_DISABLE_1M_CONTEXT key is still honored when the new
 // mode is absent, so existing installs keep their previous behavior.
 export type OneMillionContextMode = 'auto' | 'off' | 'on';
+export type ClaudePlan = 'pro' | 'max' | 'team' | 'enterprise' | 'api' | 'unknown';
 
 function normalizeOneMillionContextMode(value: unknown): OneMillionContextMode | null {
   const v = String(value ?? '').trim().toLowerCase();
@@ -72,13 +74,28 @@ function legacyDisableToOneMillionContextMode(value: unknown): OneMillionContext
   return null;
 }
 
+function normalizeClaudePlan(value: unknown): ClaudePlan | null {
+  const v = String(value ?? '').trim().toLowerCase().replace(/[_\s]+/g, '-');
+  if (!v) return null;
+  if (v === 'pro') return 'pro';
+  if (v === 'max') return 'max';
+  if (['team', 'team-standard', 'team-premium'].includes(v)) return 'team';
+  if (['enterprise', 'ent'].includes(v)) return 'enterprise';
+  if (['api', 'payg', 'pay-as-you-go', 'usage-based'].includes(v)) return 'api';
+  if (v === 'unknown') return 'unknown';
+  return null;
+}
+
 const oneMillionModePref = env['CLEMENTINE_1M_CONTEXT_MODE'] ?? process.env.CLEMENTINE_1M_CONTEXT_MODE;
 const legacyOneMillionPref = env['CLAUDE_CODE_DISABLE_1M_CONTEXT'] ?? process.env.CLAUDE_CODE_DISABLE_1M_CONTEXT;
+const claudePlanPref = env['CLEMENTINE_CLAUDE_PLAN'] ?? process.env.CLEMENTINE_CLAUDE_PLAN;
 
 export const CLEMENTINE_1M_CONTEXT_MODE: OneMillionContextMode =
   normalizeOneMillionContextMode(oneMillionModePref)
   ?? legacyDisableToOneMillionContextMode(legacyOneMillionPref)
   ?? 'auto';
+export const CLEMENTINE_CLAUDE_PLAN: ClaudePlan =
+  normalizeClaudePlan(claudePlanPref) ?? 'unknown';
 
 if (CLEMENTINE_1M_CONTEXT_MODE === 'off') {
   process.env.CLAUDE_CODE_DISABLE_1M_CONTEXT = '1';
@@ -104,13 +121,23 @@ export function currentOneMillionContextMode(): OneMillionContextMode {
     ?? CLEMENTINE_1M_CONTEXT_MODE;
 }
 
+export function currentClaudePlan(): ClaudePlan {
+  return normalizeClaudePlan(process.env.CLEMENTINE_CLAUDE_PLAN)
+    ?? CLEMENTINE_CLAUDE_PLAN;
+}
+
+export function planIncludesSubscriptionOpusOneMillion(plan: ClaudePlan = currentClaudePlan()): boolean {
+  return plan === 'max' || plan === 'team' || plan === 'enterprise';
+}
+
 export function claudeCodeDisableOneMillionForModel(
   model: string | null | undefined,
   mode: OneMillionContextMode = currentOneMillionContextMode(),
+  plan: ClaudePlan = currentClaudePlan(),
 ): '1' | '0' | undefined {
   if (mode === 'off') return '1';
-  if (mode === 'on') return '0';
-  return modelFamily(model) === 'opus' ? undefined : '1';
+  if (usesOneMillionContext(model, mode, plan)) return '0';
+  return '1';
 }
 
 function upsertRuntimeEnvValue(baseDir: string, key: string, value: string): void {
@@ -150,8 +177,9 @@ export function applyOneMillionContextRecovery(baseDir: string = BASE_DIR): void
 export function claudeOneMillionEnvForModel(
   model: string | null | undefined,
   mode: OneMillionContextMode = currentOneMillionContextMode(),
+  plan: ClaudePlan = currentClaudePlan(),
 ): Record<string, string> {
-  const disableValue = claudeCodeDisableOneMillionForModel(model, mode);
+  const disableValue = claudeCodeDisableOneMillionForModel(model, mode, plan);
   return {
     CLEMENTINE_1M_CONTEXT_MODE: mode,
     ...(disableValue !== undefined ? { CLAUDE_CODE_DISABLE_1M_CONTEXT: disableValue } : {}),
@@ -209,10 +237,10 @@ export function normalizeClaudeModelForOneMillionContext(
   model: string,
   mode: OneMillionContextMode = currentOneMillionContextMode(),
 ): string {
-  if (mode === 'on') return model;
   const family = modelFamily(model);
+  if (mode === 'on') return family === 'sonnet' || family === 'opus' ? model : model.replace(/\[1m\]/ig, '');
   const shouldStrip = mode === 'off'
-    || family === 'sonnet'
+    || (family === 'sonnet' && !/\[1m\]/i.test(model))
     || family === 'haiku'
     || family === 'opusplan';
   return shouldStrip ? model.replace(/\[1m\]/ig, '') : model;
@@ -221,11 +249,17 @@ export function normalizeClaudeModelForOneMillionContext(
 export function usesOneMillionContext(
   model: string | null | undefined,
   mode: OneMillionContextMode = currentOneMillionContextMode(),
+  plan: ClaudePlan = currentClaudePlan(),
 ): boolean {
   if (mode === 'off') return false;
   const family = modelFamily(model);
-  if (mode === 'on') return family === 'opus' || family === 'sonnet';
-  return family === 'opus';
+  if (family === 'opus') {
+    return mode === 'on'
+      || /\[1m\]/i.test(String(model ?? ''))
+      || (mode === 'auto' && planIncludesSubscriptionOpusOneMillion(plan));
+  }
+  if (family !== 'sonnet') return false;
+  return mode === 'on' || /\[1m\]/i.test(String(model ?? ''));
 }
 
 // ── Keychain-ref resolution (lazy, cached) ──────────────────────────

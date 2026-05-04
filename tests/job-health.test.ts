@@ -15,26 +15,33 @@ function run(overrides: Partial<CronRunEntry>): CronRunEntry {
 }
 
 describe('job health classification', () => {
-  it('treats ok rapid_refill_breaker runs as context-overflow failures', () => {
-    const entry = run({ status: 'ok', terminalReason: 'rapid_refill_breaker' });
+  it('treats rapid_refill_breaker as context overflow even when raw status is ok', () => {
+    const entry = run({ terminalReason: 'rapid_refill_breaker', outputPreview: 'Task aborted.' });
     const health = classifyRunHealth(entry);
-
     expect(health.status).toBe('context_overflow');
     expect(health.requiresApproval).toBe(true);
     expect(isRunHealthFailure(entry)).toBe(true);
   });
 
-  it('classifies prompt-too-long as prompt_too_large', () => {
-    const entry = run({ status: 'error', terminalReason: 'prompt_too_long', error: 'Prompt is too long' });
+  it('treats prompt-too-long text as a failure even when raw status is ok', () => {
+    const entry = run({ outputPreview: 'Prompt is too long' });
     const health = classifyRunHealth(entry);
-
     expect(health.status).toBe('prompt_too_large');
     expect(health.recommendedAction).toMatch(/Reduce injected context/);
+    expect(isRunHealthFailure(entry)).toBe(true);
+  });
+
+  it('treats unleashed phase abort text as a failure even when raw status is ok', () => {
+    const entry = run({
+      outputPreview: 'Task "market-leader-followup" aborted after 3 consecutive phase errors.',
+    });
+    const health = classifyRunHealth(entry);
+    expect(health.status).toBe('failed');
+    expect(isRunHealthFailure(entry)).toBe(true);
   });
 
   it('leaves ordinary ok runs healthy', () => {
-    const entry = run({ status: 'ok', outputPreview: 'No new replies found.' });
-
+    const entry = run({ outputPreview: 'No new replies found.' });
     expect(classifyRunHealth(entry).status).toBe('healthy');
     expect(isRunHealthFailure(entry)).toBe(false);
   });

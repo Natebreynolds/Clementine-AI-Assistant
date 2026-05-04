@@ -1,4 +1,7 @@
 import { describe, expect, it } from 'vitest';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 import { diagnoseKnownFailurePattern } from '../src/gateway/failure-diagnostics.js';
 import type { BrokenJob } from '../src/gateway/failure-monitor.js';
 
@@ -17,31 +20,65 @@ function brokenJob(overrides: Partial<BrokenJob>): BrokenJob {
 
 describe('known failure diagnostics', () => {
   it('diagnoses context overflow without requiring an LLM diagnostic job', () => {
-    const diagnosis = diagnoseKnownFailurePattern(
-      brokenJob({}),
-      '  - name: market-leader-followup\n    mode: unleashed',
-      '2026-05-02T15:30:00.655Z ok (961s) terminal=rapid_refill_breaker preview="Autocompact is thrashing"',
-    );
+    const baseDir = mkdtempSync(path.join(tmpdir(), 'clementine-known-pattern-'));
+    try {
+      const diagnosis = diagnoseKnownFailurePattern(
+        brokenJob({}),
+        '  - name: market-leader-followup\n    mode: unleashed',
+        '2026-05-02T15:30:00.655Z ok (961s) terminal=rapid_refill_breaker preview="Autocompact is thrashing"',
+        { baseDir },
+      );
 
-    expect(diagnosis?.confidence).toBe('high');
-    expect(diagnosis?.rootCause).toContain('context window');
-    expect(diagnosis?.proposedFix.type).toBe('prompt_override');
-    expect(diagnosis?.proposedFix.details).toContain('cap batches at 20');
-    expect(diagnosis?.proposedFix.autoApply).toMatchObject({
-      kind: 'prompt-override',
-      scope: 'job',
-      scopeKey: 'market-leader-followup',
-    });
+      expect(diagnosis?.confidence).toBe('high');
+      expect(diagnosis?.rootCause).toContain('context window');
+      expect(diagnosis?.proposedFix.type).toBe('prompt_override');
+      expect(diagnosis?.proposedFix.details).toContain('cap batches at 20');
+      expect(diagnosis?.proposedFix.autoApply).toMatchObject({
+        kind: 'prompt-override',
+        scope: 'job',
+        scopeKey: 'market-leader-followup',
+      });
+    } finally {
+      rmSync(baseDir, { recursive: true, force: true });
+    }
   });
 
   it('does not propose a prompt override for pseudo-jobs without a cron definition', () => {
-    const diagnosis = diagnoseKnownFailurePattern(
-      brokenJob({ jobName: 'insight-check' }),
-      null,
-      '2026-05-02T13:02:00.000Z error (1s) error="Prompt is too long"',
-    );
+    const baseDir = mkdtempSync(path.join(tmpdir(), 'clementine-known-pattern-'));
+    try {
+      const diagnosis = diagnoseKnownFailurePattern(
+        brokenJob({ jobName: 'insight-check' }),
+        null,
+        '2026-05-02T13:02:00.000Z error (1s) error="Prompt is too long"',
+        { baseDir },
+      );
 
-    expect(diagnosis?.proposedFix.type).toBe('prompt_change');
-    expect(diagnosis?.proposedFix.autoApply).toBeUndefined();
+      expect(diagnosis?.proposedFix.type).toBe('prompt_change');
+      expect(diagnosis?.proposedFix.autoApply).toBeUndefined();
+    } finally {
+      rmSync(baseDir, { recursive: true, force: true });
+    }
+  });
+
+  it('does not propose the same context-overflow prompt override when one is already active', () => {
+    const baseDir = mkdtempSync(path.join(tmpdir(), 'clementine-known-pattern-'));
+    try {
+      const overridePath = path.join(baseDir, 'prompt-overrides', 'jobs', 'market-leader-followup.md');
+      mkdirSync(path.dirname(overridePath), { recursive: true });
+      writeFileSync(overridePath, '# Bounded Run Guidance\n\nKeep this job inside the context window.');
+
+      const diagnosis = diagnoseKnownFailurePattern(
+        brokenJob({}),
+        '  - name: market-leader-followup\n    mode: unleashed',
+        '2026-05-02T15:30:00.655Z ok (961s) terminal=rapid_refill_breaker preview="Autocompact is thrashing"',
+        { baseDir },
+      );
+
+      expect(diagnosis?.confidence).toBe('high');
+      expect(diagnosis?.proposedFix.type).toBe('escalate_to_owner');
+      expect(diagnosis?.proposedFix.autoApply).toBeUndefined();
+    } finally {
+      rmSync(baseDir, { recursive: true, force: true });
+    }
   });
 });

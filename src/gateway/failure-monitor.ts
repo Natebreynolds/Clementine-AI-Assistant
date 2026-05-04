@@ -259,7 +259,7 @@ export function computeBrokenJobs(now = Date.now()): BrokenJob[] {
     if (cb.engagedAt) {
       const engagedMs = Date.parse(cb.engagedAt);
       const hasOkSinceBreaker = entries.some(e =>
-        e.status === 'ok' && Date.parse(e.startedAt) > engagedMs,
+        !isRunHealthFailure(e) && Date.parse(e.startedAt) > engagedMs,
       );
       if (hasOkSinceBreaker) {
         cb = { engagedAt: null, lastOpinion: cb.lastOpinion };

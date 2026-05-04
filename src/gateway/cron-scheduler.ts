@@ -64,6 +64,12 @@ import {
   isCreditBalanceError,
   markBackgroundCreditBlocked,
 } from './credit-guard.js';
+import { isRunHealthFailure } from './job-health.js';
+import {
+  analyzeLongTaskPreflight,
+  compactLongTaskPreflight,
+  formatLongTaskPromptPrefix,
+} from './long-task-preflight.js';
 
 const logger = pino({ name: 'clementine.cron' });
 
@@ -444,7 +450,8 @@ export class CronRunLog {
     const recent = this.readRecent(jobName, 10);
     let count = 0;
     for (const entry of recent) {
-      if (entry.status === 'ok') break;
+      if (entry.status === 'skipped') continue;
+      if (!isRunHealthFailure(entry)) break;
       count++;
     }
     return count;
@@ -1104,11 +1111,6 @@ export class CronScheduler {
       logger.debug({ job: job.name, overrideLen: userOverride.length }, 'Applied user prompt overrides');
     }
 
-    // Compute effective timeout: advisor override > standard default
-    const effectiveTimeoutMs = job.mode !== 'unleashed'
-      ? (advice.adjustedTimeoutMs ?? CRON_STANDARD_TIMEOUT_MS)
-      : undefined;
-
     // Persist advisor decision for analytics
     if (advisorApplied) {
       try {
@@ -1130,7 +1132,6 @@ export class CronScheduler {
     });
     this.persistRunningJobs(this.runMetadata);
     this.emitStatusChange();
-    this.logAutonomy('started', job, { model: job.model, mode: job.mode, tier: job.tier });
 
     try {
       logger.info(`Running cron job: ${job.name}${job.agentSlug ? ` (agent: ${job.agentSlug})` : ''}`);
@@ -1140,12 +1141,6 @@ export class CronScheduler {
       if (job.agentSlug) {
         this.gateway.setSessionProfile(cronSessionKey, job.agentSlug);
       }
-
-      // Unleashed tasks handle their own retries/phases internally — never retry the whole task
-      const priorErrors = this.runLog.consecutiveErrors(job.name);
-      const maxAttempts = job.mode === 'unleashed'
-        ? 1
-        : 1 + (job.maxRetries ?? Math.min(priorErrors, BACKOFF_MS.length));
 
       // ── Inject context field if present ──
       let jobPrompt = job.prompt;
@@ -1183,6 +1178,137 @@ export class CronScheduler {
           }
         } catch { /* non-fatal */ }
       }
+
+      let longTaskPreflight: CronRunEntry['longTaskPreflight'] | undefined;
+      const preflight = analyzeLongTaskPreflight(job, jobPrompt, this.runLog.readRecent(job.name, 5));
+      if (preflight.risk !== 'normal') {
+        job = { ...job };
+        if (preflight.modelOverride) job.model = preflight.modelOverride;
+        if (preflight.modeOverride) job.mode = preflight.modeOverride;
+        if (preflight.maxHoursOverride) job.maxHours = preflight.maxHoursOverride;
+        longTaskPreflight = compactLongTaskPreflight(preflight);
+        let promptPreflight = preflight;
+        let approvalPromptPrefix: string | undefined;
+        logger.warn({
+          job: job.name,
+          risk: preflight.risk,
+          route: preflight.route,
+          estimatedInputTokens: preflight.estimatedInputTokens,
+          projectedContextTokens: preflight.projectedContextTokens,
+          model: job.model,
+          mode: job.mode,
+          reasons: preflight.reasons,
+        }, 'Long-task preflight routed cron job');
+        this.logAutonomy('long_task_preflight', job, {
+          risk: preflight.risk,
+          route: preflight.route,
+          estimatedInputTokens: preflight.estimatedInputTokens,
+          projectedContextTokens: preflight.projectedContextTokens,
+          model: job.model,
+          mode: job.mode,
+          requiresUserRefinement: preflight.requiresUserRefinement,
+        });
+
+        if (preflight.shouldSkipBeforeRun) {
+          let approvedLongContext = false;
+          if (preflight.approvalModelOverride) {
+            const approvalId = `long-task-preflight-${job.name.replace(/[^a-zA-Z0-9_-]/g, '_')}-${Date.now()}`;
+            const approvalMessage = [
+              `**Long task needs approval:** \`${job.name}\``,
+              '',
+              `Preflight estimates ${preflight.estimatedInputTokens.toLocaleString()} initial tokens and ${Math.round(preflight.projectedContextTokens).toLocaleString()} working-context tokens.`,
+              `Current route would exceed the 200K-safe path, but Clementine can try a one-time run on \`${preflight.approvalModelOverride}\`.`,
+              '',
+              `Reply \`yes\` or \`go\` to approve this one run, or \`no\` to skip and refine/split the task.`,
+              `Reason: ${preflight.approvalReason}`,
+            ].join('\n');
+            await this.dispatcher.send(approvalMessage, {})
+              .catch(err => logger.debug({ err, job: job.name }, 'Failed to send long-task approval request'));
+            const approvalResult = await this.gateway.requestApproval(`Run ${job.name} on ${preflight.approvalModelOverride}?`, approvalId)
+              .catch(() => false);
+            const normalizedApproval = String(approvalResult).trim().toLowerCase();
+            approvedLongContext = approvalResult === true
+              || ['yes', 'y', 'go', 'approve', 'approved', 'true'].includes(normalizedApproval);
+            if (approvedLongContext) {
+              job.model = preflight.approvalModelOverride;
+              job.mode = 'unleashed';
+              job.maxHours = preflight.maxHoursOverride ?? job.maxHours ?? 2;
+              longTaskPreflight = {
+                ...longTaskPreflight,
+                route: 'opus_1m',
+                contextWindowTokens: 1_000_000,
+                modelAfter: preflight.approvalModelOverride,
+                modeAfter: 'unleashed',
+                requiresUserRefinement: false,
+                canProceedWithApproval: false,
+                approvalReason: 'Owner approved one-time long-context execution.',
+              };
+              promptPreflight = {
+                ...preflight,
+                route: 'opus_1m',
+                contextWindowTokens: 1_000_000,
+                modelAfter: preflight.approvalModelOverride,
+                modeAfter: 'unleashed',
+                requiresUserRefinement: false,
+                canProceedWithApproval: false,
+                approvalReason: 'Owner approved one-time long-context execution.',
+                approvalModel: preflight.approvalModelOverride,
+                approvalModelOverride: undefined,
+                shouldSkipBeforeRun: false,
+              };
+              approvalPromptPrefix = `## Long Task Approval\nOwner approved this one-time run on ${preflight.approvalModelOverride}. Continue with strict checkpoints and bounded tool output.`;
+              logger.warn({ job: job.name, model: job.model }, 'Long-task preflight approved for one-time long-context run');
+            }
+          }
+
+          if (!approvedLongContext) {
+            const now = new Date().toISOString();
+            const message = (
+              `Long-task preflight blocked ${job.name}: estimated ${preflight.estimatedInputTokens.toLocaleString()} input tokens ` +
+              `on a ${preflight.contextWindowTokens.toLocaleString()} token route. ` +
+              `${preflight.recommendations[0]}`
+            );
+            this._logRun({
+              jobName: job.name,
+              startedAt: now,
+              finishedAt: now,
+              status: 'skipped',
+              durationMs: 0,
+              attempt: 0,
+              outputPreview: message,
+              longTaskPreflight,
+            });
+            await this.dispatcher.send(message, { agentSlug: job.agentSlug });
+            return;
+          }
+        }
+        jobPrompt = [
+          approvalPromptPrefix,
+          formatLongTaskPromptPrefix(promptPreflight),
+          jobPrompt,
+        ].filter(Boolean).join('\n\n');
+      }
+
+      // Compute effective timeout after preflight because it may promote a
+      // large standard job into checkpointed unleashed mode.
+      const effectiveTimeoutMs = job.mode !== 'unleashed'
+        ? (advice.adjustedTimeoutMs ?? CRON_STANDARD_TIMEOUT_MS)
+        : undefined;
+
+      // Unleashed tasks handle their own retries/phases internally — never retry the whole task.
+      // Compute this after preflight because preflight may promote a standard
+      // long task into unleashed mode.
+      const priorErrors = this.runLog.consecutiveErrors(job.name);
+      const maxAttempts = job.mode === 'unleashed'
+        ? 1
+        : 1 + (job.maxRetries ?? Math.min(priorErrors, BACKOFF_MS.length));
+
+      this.logAutonomy('started', job, {
+        model: job.model,
+        mode: job.mode,
+        tier: job.tier,
+        longTaskPreflight,
+      });
 
       for (let attempt = 1; attempt <= maxAttempts; attempt++) {
         const startedAt = new Date();
@@ -1244,6 +1370,7 @@ export class CronScheduler {
             outputPreview: response ? response.slice(0, 200) : undefined,
             advisorApplied,
             terminalReason,
+            longTaskPreflight,
           };
 
           if (response && !CronScheduler.isCronNoise(response)) {
@@ -1315,6 +1442,7 @@ export class CronScheduler {
             terminalReason: errTerminalReason,
             attempt,
             advisorApplied,
+            longTaskPreflight,
           });
 
           if (isCreditBalanceError(err)) {
@@ -1389,7 +1517,7 @@ export class CronScheduler {
       } else if (consErrors >= 5) {
         // Check if recovery probe just succeeded
         const lastRun = this.runLog.readRecent(job.name, 1)[0];
-        if (lastRun?.status === 'ok') {
+        if (lastRun && !isRunHealthFailure(lastRun)) {
           this.logAdvisorEvent('circuit-recovery', job.name, `Circuit breaker recovered after ${consErrors} errors`);
           this.dispatcher.send(`✅ **Circuit breaker recovered** — \`${job.name}\` succeeded after ${consErrors} prior errors.`, { agentSlug: job.agentSlug }).catch(err => logger.debug({ err }, 'Failed to send circuit recovery notification'));
         }

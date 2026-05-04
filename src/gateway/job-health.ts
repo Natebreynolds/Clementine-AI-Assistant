@@ -61,6 +61,16 @@ export function classifyRunHealth(entry: CronRunEntry): JobHealthStatus {
     };
   }
 
+  if (/aborted after \d+ consecutive phase errors|consecutive phase errors|reached maximum phase limit|max phases|max_phases/.test(blob)) {
+    return {
+      ...base,
+      status: 'failed',
+      evidence: compactEvidence(entry.error, entry.outputPreview, terminalReason ? `terminalReason=${terminalReason}` : undefined),
+      recommendedAction: 'Treat the unleashed task as failed. Inspect phase errors and fix the root cause before retrying.',
+      requiresApproval: true,
+    };
+  }
+
   if (terminalReason === 'prompt_too_long' || /prompt is too long|prompt too long|input is too long|request too large/.test(blob)) {
     return {
       ...base,

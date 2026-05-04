@@ -365,6 +365,25 @@ export interface CronJobDefinition {
   confirmationTimeoutMin?: number; // Minutes to wait for confirmation before auto-proceeding (default: 5)
 }
 
+export type LongTaskRisk = 'normal' | 'long' | 'huge' | 'unsafe';
+export type LongTaskRoute = 'standard' | 'checkpointed' | 'opus_1m' | 'sonnet_1m' | 'split_required';
+
+export interface LongTaskPreflightSnapshot {
+  risk: LongTaskRisk;
+  route: LongTaskRoute;
+  estimatedInputTokens: number;
+  contextWindowTokens: number;
+  modelBefore?: string;
+  modelAfter?: string;
+  modeBefore?: CronJobDefinition['mode'];
+  modeAfter?: CronJobDefinition['mode'];
+  requiresUserRefinement: boolean;
+  canProceedWithApproval?: boolean;
+  approvalReason?: string;
+  approvalModel?: string;
+  reasons: string[];
+}
+
 export type TerminalReason =
   | 'blocking_limit' | 'rapid_refill_breaker' | 'prompt_too_long'
   | 'image_error' | 'model_error' | 'aborted_streaming' | 'aborted_tools'
@@ -384,6 +403,7 @@ export interface CronRunEntry {
   outputPreview?: string;
   deliveryFailed?: boolean;
   deliveryError?: string;
+  longTaskPreflight?: LongTaskPreflightSnapshot;
   advisorApplied?: {
     adjustedMaxTurns?: number;
     adjustedModel?: string;
