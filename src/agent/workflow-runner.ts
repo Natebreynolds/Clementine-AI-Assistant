@@ -293,6 +293,10 @@ export class WorkflowRunner {
             tier: resolvedStep.tier,
             maxTurns: resolvedStep.maxTurns,
             model: resolvedStep.model,
+            usageSource: 'workflow_step',
+            usageSessionKey: `workflow:${workflow.name}:${step.id}`,
+            usageLabel: `${workflow.name}:${step.id}`,
+            usageAgentSlug: workflow.agentSlug,
           });
           return { stepId: step.id, result, durationMs: Date.now() - stepStart };
         }),
@@ -336,6 +340,10 @@ export class WorkflowRunner {
       try {
         finalOutput = await this.assistant.runPlanStep('__synthesis__', synthPrompt, {
           tier: 2, maxTurns: 5, disableTools: true,
+          usageSource: 'workflow_step',
+          usageSessionKey: `workflow:${workflow.name}:__synthesis__`,
+          usageLabel: `${workflow.name}:__synthesis__`,
+          usageAgentSlug: workflow.agentSlug,
         });
       } catch (err) {
         logger.warn({ err }, 'Workflow synthesis failed — concatenating results');

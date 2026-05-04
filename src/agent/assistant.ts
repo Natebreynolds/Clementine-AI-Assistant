@@ -5435,9 +5435,33 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
   async runPlanStep(
     stepId: string,
     prompt: string,
-    opts: { tier?: number; maxTurns?: number; model?: string; disableTools?: boolean; outputFormat?: { type: 'json_schema'; schema: Record<string, unknown> }; delegateProfile?: AgentProfile; abortSignal?: AbortSignal } = {},
+    opts: {
+      tier?: number;
+      maxTurns?: number;
+      model?: string;
+      disableTools?: boolean;
+      outputFormat?: { type: 'json_schema'; schema: Record<string, unknown> };
+      delegateProfile?: AgentProfile;
+      abortSignal?: AbortSignal;
+      usageSource?: string;
+      usageSessionKey?: string;
+      usageLabel?: string;
+      usageAgentSlug?: string;
+    } = {},
   ): Promise<string> {
-    const { tier = 2, maxTurns = 15, model, disableTools = false, outputFormat, delegateProfile, abortSignal } = opts;
+    const {
+      tier = 2,
+      maxTurns = 15,
+      model,
+      disableTools = false,
+      outputFormat,
+      delegateProfile,
+      abortSignal,
+      usageSource = 'plan_step',
+      usageSessionKey,
+      usageLabel,
+      usageAgentSlug,
+    } = opts;
 
     // Don't mutate the global — pass source through the closure instead
     // Per-step stall guard so concurrent steps don't cross-contaminate
@@ -5483,7 +5507,13 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
           }
         }
       } else if (message.type === 'result') {
-        this.logQueryResult(message as SDKResultMessage, 'plan_step', `plan:${stepId}`, stepId);
+        this.logQueryResult(
+          message as SDKResultMessage,
+          usageSource,
+          usageSessionKey ?? `plan:${stepId}`,
+          usageLabel ?? stepId,
+          usageAgentSlug,
+        );
       }
     }
 

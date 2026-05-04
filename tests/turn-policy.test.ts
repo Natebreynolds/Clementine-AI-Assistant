@@ -73,6 +73,14 @@ describe('turn policy', () => {
     expect(p.disableAllTools).toBe(false);
   });
 
+  it('keeps background status follow-ups off the lightweight path when context exists', () => {
+    const p = policy("How's it coming along?", true);
+
+    expect(p.reason).toBe('background-status-followup');
+    expect(p.retrievalTier).toBe('search');
+    expect(p.disableAllTools).toBe(false);
+  });
+
   it('promotes broad analysis to the full context path with teams enabled', () => {
     const p = policy('analyze the entire agentic flow across all conversations and recommend improvements');
 

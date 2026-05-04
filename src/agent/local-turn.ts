@@ -44,14 +44,18 @@ function wordCount(text: string): number {
 
 export function isStopRequest(text: string): boolean {
   const n = normalize(text);
+  if (/\bbg-[a-z0-9]+-[a-f0-9]{6}\b/i.test(n) && /^(stop|cancel|abort)\b/.test(n)) return true;
   if (wordCount(n) > 5) return false;
-  return /^(stop|cancel|abort|halt|pause|nevermind|never mind|wait stop|stop please|cancel that|stop that)$/.test(n);
+  return /^(stop|cancel|abort|halt|pause|nevermind|never mind|wait stop|stop please|cancel that|stop that|cancel it|stop it|cancel task|stop task|cancel the task|stop the task|cancel background|stop background)$/.test(n);
 }
 
 export function isStatusRequest(text: string): boolean {
   const n = normalize(text);
-  if (wordCount(n) > 8) return false;
-  return /^(status|task status|deep status|progress|what'?s happening|what'?s going on|what are you doing|what are you working on|what are you running|are you working|anything running|what'?s runnin?g?(?: now| right now)?|what is runnin?g?(?: now| right now)?|background status|check status|where are we)$/.test(n);
+  if (wordCount(n) > 12) return false;
+  if (/\bbg-[a-z0-9]+-[a-f0-9]{6}\b/i.test(n) && /\b(status|progress|check|update|running|done|finished)\b/.test(n)) {
+    return true;
+  }
+  return /^(status|task status|deep status|progress|progress update|what'?s happening|what'?s going on|what are you doing|what are you working on|what are you running|are you working|anything running|what'?s runnin?g?(?: now| right now)?|what is runnin?g?(?: now| right now)?|background status|check status|where are we|any update|any updates|can i get an update|do you have an update|update me|is it done|is it done yet|is it finished|is it finished yet|done yet|did it finish|still running|is it still running|are we done|how'?s (?:it|that|this|the task|the job|the run|the background task) (?:coming along|progressing)|how is (?:it|that|this|the task|the job|the run|the background task) (?:coming along|progressing)|how'?s (?:the task|the job|the run|the background task) going|how is (?:the task|the job|the run|the background task) going)$/.test(n);
 }
 
 export function isLastActionRequest(text: string): boolean {

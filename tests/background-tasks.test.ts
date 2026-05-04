@@ -24,18 +24,20 @@ describe('background-tasks persistence helper', () => {
 
   it('creates a pending task with a sortable id and persists to disk', () => {
     const t = createBackgroundTask(
-      { fromAgent: 'ross-the-sdr', prompt: 'Research the Acme account', maxMinutes: 15 },
+      { fromAgent: 'ross-the-sdr', prompt: 'Research the Acme account', maxMinutes: 15, sessionKey: 'discord:member-dm:ross-the-sdr:user-1' },
       { dir },
     );
     expect(t.id).toMatch(/^bg-[a-z0-9]+-[a-f0-9]{6}$/);
     expect(t.status).toBe('pending');
     expect(t.fromAgent).toBe('ross-the-sdr');
     expect(t.maxMinutes).toBe(15);
+    expect(t.sessionKey).toBe('discord:member-dm:ross-the-sdr:user-1');
     expect(existsSync(path.join(dir, `${t.id}.json`))).toBe(true);
 
     const onDisk = JSON.parse(readFileSync(path.join(dir, `${t.id}.json`), 'utf-8'));
     expect(onDisk.id).toBe(t.id);
     expect(onDisk.status).toBe('pending');
+    expect(onDisk.sessionKey).toBe('discord:member-dm:ross-the-sdr:user-1');
   });
 
   it('clamps maxMinutes to [1, 240]', () => {
@@ -70,6 +72,50 @@ describe('background-tasks persistence helper', () => {
     const f = loadBackgroundTask(t.id, { dir });
     expect(f?.status).toBe('failed');
     expect(f?.error).toBe('something broke');
+  });
+
+  it('does not overwrite an aborted task when late work completes', () => {
+    const t = createBackgroundTask({ fromAgent: 'a', prompt: 'p', maxMinutes: 5 }, { dir });
+    markRunning(t.id, { dir });
+    markFailed(t.id, 'cancelled from dashboard', 'aborted', { dir });
+    markDone(t.id, 'late result', undefined, { dir });
+    const saved = loadBackgroundTask(t.id, { dir });
+    expect(saved?.status).toBe('aborted');
+    expect(saved?.error).toBe('cancelled from dashboard');
+    expect(saved?.result).toBeUndefined();
+  });
+
+  it('does not revive an aborted pending task when the scheduler races', () => {
+    const t = createBackgroundTask({ fromAgent: 'a', prompt: 'p', maxMinutes: 5 }, { dir });
+    markFailed(t.id, 'cancelled before pickup', 'aborted', { dir });
+    const started = markRunning(t.id, { dir });
+    const saved = loadBackgroundTask(t.id, { dir });
+    expect(started).toBeNull();
+    expect(saved?.status).toBe('aborted');
+    expect(saved?.startedAt).toBeUndefined();
+  });
+
+  it('does not overwrite terminal states with late failures', () => {
+    const aborted = createBackgroundTask({ fromAgent: 'a', prompt: 'p', maxMinutes: 5 }, { dir });
+    markRunning(aborted.id, { dir });
+    markFailed(aborted.id, 'cancelled', 'aborted', { dir });
+    markFailed(aborted.id, 'late failure', 'failed', { dir });
+    expect(loadBackgroundTask(aborted.id, { dir })?.status).toBe('aborted');
+    expect(loadBackgroundTask(aborted.id, { dir })?.error).toBe('cancelled');
+
+    const done = createBackgroundTask({ fromAgent: 'a', prompt: 'p', maxMinutes: 5 }, { dir });
+    markRunning(done.id, { dir });
+    markDone(done.id, 'ok', undefined, { dir });
+    markFailed(done.id, 'late failure', 'failed', { dir });
+    expect(loadBackgroundTask(done.id, { dir })?.status).toBe('done');
+    expect(loadBackgroundTask(done.id, { dir })?.result).toBe('ok');
+
+    const failed = createBackgroundTask({ fromAgent: 'a', prompt: 'p', maxMinutes: 5 }, { dir });
+    markRunning(failed.id, { dir });
+    markFailed(failed.id, 'first failure', 'failed', { dir });
+    markFailed(failed.id, 'late cancel', 'aborted', { dir });
+    expect(loadBackgroundTask(failed.id, { dir })?.status).toBe('failed');
+    expect(loadBackgroundTask(failed.id, { dir })?.error).toBe('first failure');
   });
 
   it('truncates result over 3KB to keep files bounded', () => {

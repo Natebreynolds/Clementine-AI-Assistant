@@ -304,6 +304,7 @@ export interface HeartbeatWorkItem {
 export interface BackgroundTask {
   id: string;
   fromAgent: string;          // Slug of the agent that initiated the task
+  sessionKey?: string;        // Chat/session that requested the task, when user-visible
   prompt: string;             // The full task prompt
   maxMinutes: number;         // Hard wall-clock cap
   status: 'pending' | 'running' | 'done' | 'failed' | 'aborted';

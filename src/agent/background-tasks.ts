@@ -68,7 +68,7 @@ function safeWrite(file: string, task: BackgroundTask): void {
  * doesn't await execution — the daemon picks the task up asynchronously.
  */
 export function createBackgroundTask(
-  input: { fromAgent: string; prompt: string; maxMinutes: number },
+  input: { fromAgent: string; prompt: string; maxMinutes: number; sessionKey?: string },
   opts?: BackgroundTaskOptions,
 ): BackgroundTask {
   const now = new Date();
@@ -80,6 +80,7 @@ export function createBackgroundTask(
     status: 'pending',
     createdAt: now.toISOString(),
   };
+  if (input.sessionKey) task.sessionKey = input.sessionKey;
   safeWrite(pathFor(task.id, opts), task);
   return task;
 }
@@ -126,6 +127,7 @@ export function listBackgroundTasks(
 export function markRunning(id: string, opts?: BackgroundTaskOptions): BackgroundTask | null {
   const task = loadBackgroundTask(id, opts);
   if (!task) return null;
+  if (task.status !== 'pending') return null;
   task.status = 'running';
   task.startedAt = new Date().toISOString();
   safeWrite(pathFor(id, opts), task);
@@ -141,6 +143,7 @@ export function markDone(
 ): BackgroundTask | null {
   const task = loadBackgroundTask(id, opts);
   if (!task) return null;
+  if (task.status !== 'running') return task;
   task.status = 'done';
   task.completedAt = new Date().toISOString();
   task.result = result;
@@ -158,6 +161,7 @@ export function markFailed(
 ): BackgroundTask | null {
   const task = loadBackgroundTask(id, opts);
   if (!task) return null;
+  if (task.status === 'done' || task.status === 'failed' || task.status === 'aborted') return task;
   task.status = reason;
   task.completedAt = new Date().toISOString();
   task.error = error.slice(0, 1000);
@@ -180,10 +184,13 @@ export function abortStaleRunningTasks(opts?: BackgroundTaskOptions): number {
   return aborted;
 }
 
-/** Test-only: delete a task file. Production code never deletes — history matters. */
-export function _deleteBackgroundTask(id: string, opts?: BackgroundTaskOptions): void {
+/** Delete a task file. Callers should avoid deleting active tasks. */
+export function deleteBackgroundTask(id: string, opts?: BackgroundTaskOptions): void {
   try {
     const file = pathFor(id, opts);
     if (existsSync(file)) unlinkSync(file);
   } catch { /* ignore */ }
 }
+
+/** Backward-compatible test helper alias. */
+export const _deleteBackgroundTask = deleteBackgroundTask;

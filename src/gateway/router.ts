@@ -19,7 +19,7 @@ import {
   type ProjectMeta,
 } from '../agent/assistant.js';
 import { runWithTrace, logAuditJsonl } from '../agent/hooks.js';
-import type { OnProgressCallback, OnTextCallback, OnToolActivityCallback, PlanProgressUpdate, PlanStep, SelfImproveConfig, SelfImproveExperiment, SessionProvenance, TeamMessage, VerboseLevel, WorkflowDefinition } from '../types.js';
+import type { BackgroundTask, OnProgressCallback, OnTextCallback, OnToolActivityCallback, PlanProgressUpdate, PlanStep, SelfImproveConfig, SelfImproveExperiment, SessionProvenance, TeamMessage, VerboseLevel, WorkflowDefinition } from '../types.js';
 import { SelfImproveLoop } from '../agent/self-improve.js';
 import {
   MODELS,
@@ -38,7 +38,7 @@ import { TeamRouter } from '../agent/team-router.js';
 import { TeamBus } from '../agent/team-bus.js';
 import { events } from '../events/bus.js';
 import type { NotificationDispatcher } from './notifications.js';
-import { createBackgroundTask, listBackgroundTasks, markDone, markFailed, markRunning } from '../agent/background-tasks.js';
+import { createBackgroundTask, listBackgroundTasks, loadBackgroundTask, markDone, markFailed, markRunning } from '../agent/background-tasks.js';
 import { applyAssistantExperienceUpdate, detectApprovalReply, detectLocalTurn, type AssistantExperienceUpdate } from '../agent/local-turn.js';
 import {
   assessActionResponse,
@@ -77,6 +77,7 @@ const CHAT_TIMEOUT_MS = 10 * 60 * 1000;
  *  Primary guardrail is cost budget (maxBudgetUsd), not this timer. */
 const CHAT_MAX_WALL_MS = 30 * 60 * 1000;
 const UNLEASHED_STATUS_STALE_GRACE_MS = 15 * 60 * 1000;
+const BACKGROUND_TASK_ID_RE = /\bbg-[a-z0-9]+-[a-f0-9]{6}\b/i;
 
 export type ChatErrorKind = 'rate_limit' | 'one_million_context' | 'context_overflow' | 'auth' | 'billing' | 'transient' | 'unknown';
 
@@ -272,6 +273,144 @@ export class Gateway {
     return out.slice(0, limit);
   }
 
+  private extractBackgroundTaskId(text: string): string | undefined {
+    return text.match(BACKGROUND_TASK_ID_RE)?.[0]?.toLowerCase();
+  }
+
+  private isAgentScopedSession(sessionKey: string): boolean {
+    return this._agentSlugFromSessionKey(sessionKey) !== undefined;
+  }
+
+  private readUnleashedStatus(jobName: string): Record<string, unknown> | null {
+    try {
+      const statusPath = path.join(BASE_DIR, 'unleashed', jobName, 'status.json');
+      if (!existsSync(statusPath)) return null;
+      return JSON.parse(readFileSync(statusPath, 'utf-8')) as Record<string, unknown>;
+    } catch {
+      return null;
+    }
+  }
+
+  private taskElapsedMinutes(task: BackgroundTask): number {
+    const start = Date.parse(task.startedAt ?? task.createdAt);
+    if (!Number.isFinite(start)) return 0;
+    return Math.max(0, Math.round((Date.now() - start) / 60_000));
+  }
+
+  private taskSummary(text: string, limit = 140): string {
+    const summary = text.trim().replace(/\s+/g, ' ');
+    if (summary.length <= limit) return summary;
+    return `${summary.slice(0, limit - 3)}...`;
+  }
+
+  private isSessionScopedBackgroundTask(sessionKey: string, task: BackgroundTask): boolean {
+    return task.sessionKey === sessionKey || this.sessions.get(sessionKey)?.deepTask?.jobName === task.id;
+  }
+
+  private canAccessBackgroundTask(sessionKey: string, task: BackgroundTask): boolean {
+    if (this.isSessionScopedBackgroundTask(sessionKey, task)) return true;
+    const agentSlug = this._agentSlugFromSessionKey(sessionKey);
+    if (this.isTrustedPersonalSession(sessionKey)) {
+      return !agentSlug || task.fromAgent === agentSlug;
+    }
+    return false;
+  }
+
+  private backgroundTasksForSession(
+    sessionKey: string,
+    statuses?: BackgroundTask['status'][],
+  ): BackgroundTask[] {
+    const wanted = statuses ? new Set<BackgroundTask['status']>(statuses) : null;
+    return listBackgroundTasks({})
+      .filter((task) => !wanted || wanted.has(task.status))
+      .filter((task) => this.canAccessBackgroundTask(sessionKey, task));
+  }
+
+  private formatBackgroundTaskLine(task: BackgroundTask): string {
+    const status = this.readUnleashedStatus(task.id);
+    const phase = status?.phase == null ? '' : `, phase ${String(status.phase)}`;
+    const elapsed = this.taskElapsedMinutes(task);
+    const cap = task.maxMinutes ? ` of ${task.maxMinutes} min cap` : '';
+    const taskText = this.taskSummary(task.prompt);
+    const terminalDetail = task.status === 'done' && task.result
+      ? ` Result: ${this.taskSummary(task.result, 120)}`
+      : (task.status === 'failed' || task.status === 'aborted') && task.error
+        ? ` Reason: ${this.taskSummary(task.error, 120)}`
+        : '';
+    return `- ${task.id}: ${task.status}${phase}, ${elapsed} min${cap}. ${taskText}${terminalDetail}`;
+  }
+
+  private writeUnleashedCancel(jobName: string): void {
+    const cancelDir = path.join(BASE_DIR, 'unleashed', jobName);
+    mkdirSync(cancelDir, { recursive: true });
+    writeFileSync(path.join(cancelDir, 'CANCEL'), '');
+  }
+
+  private cancelBackgroundJob(
+    sessionKey: string,
+    jobName: string,
+    taskDesc: string,
+    task?: BackgroundTask | null,
+  ): string {
+    if (task && (task.status === 'done' || task.status === 'failed' || task.status === 'aborted')) {
+      return `Background task ${task.id} is already ${task.status}.`;
+    }
+
+    try {
+      this.writeUnleashedCancel(jobName);
+    } catch { /* best-effort cancel marker */ }
+
+    if (task) {
+      markFailed(task.id, 'cancelled from chat', 'aborted');
+    }
+
+    const sess = this.sessions.get(sessionKey);
+    if (sess?.deepTask?.jobName === jobName) delete sess.deepTask;
+
+    const status = this.readUnleashedStatus(jobName);
+    const phase = status?.phase == null ? '' : ` at phase ${String(status.phase)}`;
+    const label = task ? `background task ${task.id}` : `deep mode task ${jobName}`;
+    const note = task?.status === 'pending'
+      ? 'It will not be picked up by the scheduler.'
+      : 'It will stop at the next phase boundary if it is already mid-phase.';
+    return `Cancelled ${label}${phase}: ${this.taskSummary(taskDesc, 120)}. ${note}`;
+  }
+
+  private cancelActiveBackgroundTask(sessionKey: string, text: string): string | null {
+    const explicitId = this.extractBackgroundTaskId(text);
+    const sess = this.sessions.get(sessionKey);
+
+    if (explicitId) {
+      const task = loadBackgroundTask(explicitId);
+      if (task) {
+        if (!this.canAccessBackgroundTask(sessionKey, task)) {
+          return `I found background task ${explicitId}, but it is not attached to this chat.`;
+        }
+        return this.cancelBackgroundJob(sessionKey, task.id, task.prompt, task);
+      }
+      if (sess?.deepTask?.jobName === explicitId) {
+        return this.cancelBackgroundJob(sessionKey, explicitId, sess.deepTask.taskDesc);
+      }
+      return `I could not find background task ${explicitId}.`;
+    }
+
+    if (sess?.deepTask) {
+      const task = loadBackgroundTask(sess.deepTask.jobName);
+      return this.cancelBackgroundJob(sessionKey, sess.deepTask.jobName, sess.deepTask.taskDesc, task);
+    }
+
+    const active = this.backgroundTasksForSession(sessionKey, ['pending', 'running']);
+    if (active.length === 0) return null;
+    if (active.length > 1) {
+      return [
+        'I found more than one active background task for this chat:',
+        ...active.slice(0, 5).map((task) => this.formatBackgroundTaskLine(task)),
+        'Reply `cancel <task id>` so I stop the right one.',
+      ].join('\n');
+    }
+    return this.cancelBackgroundJob(sessionKey, active[0]!.id, active[0]!.prompt, active[0]);
+  }
+
   private describeSessionStatus(sessionKey: string): string {
     const sess = this.sessions.get(sessionKey);
     const lines: string[] = [];
@@ -287,21 +426,41 @@ export class Gateway {
     if (sess?.lock) {
       lines.push('This chat session is busy. A new message will interrupt and redirect it.');
     }
+    const seenBackgroundTasks = new Set<string>();
     if (sess?.deepTask) {
+      seenBackgroundTasks.add(sess.deepTask.jobName);
       const elapsedMin = Math.max(0, Math.round((Date.now() - new Date(sess.deepTask.startedAt).getTime()) / 60_000));
-      lines.push(`Background task: ${sess.deepTask.taskDesc} (${elapsedMin} min, job ${sess.deepTask.jobName}).`);
+      const persistedTask = loadBackgroundTask(sess.deepTask.jobName);
+      if (persistedTask) {
+        lines.push(`Background task: ${this.formatBackgroundTaskLine(persistedTask).slice(2)}`);
+      } else {
+        const status = this.readUnleashedStatus(sess.deepTask.jobName);
+        const phase = status?.phase == null ? '' : `, phase ${String(status.phase)}`;
+        lines.push(`Background task: ${sess.deepTask.taskDesc} (${elapsedMin} min, job ${sess.deepTask.jobName}${phase}).`);
+      }
     }
 
-    const bgTasks = listBackgroundTasks({})
-      .filter((task) => task.status === 'pending' || task.status === 'running')
+    const bgTasks = this.backgroundTasksForSession(sessionKey, ['pending', 'running'])
+      .filter((task) => !seenBackgroundTasks.has(task.id))
       .slice(0, 5);
     for (const task of bgTasks) {
-      lines.push(`Queued task ${task.id}: ${task.status}, from ${task.fromAgent}, max ${task.maxMinutes} min.`);
+      seenBackgroundTasks.add(task.id);
+      lines.push(this.formatBackgroundTaskLine(task));
     }
 
-    for (const task of this.runningUnleashedTasks(5)) {
-      const phase = task.phase == null ? '' : `, phase ${String(task.phase)}`;
-      lines.push(`Unleashed task ${task.name}: ${task.status}${phase}.`);
+    if (this.isTrustedPersonalSession(sessionKey)) {
+      for (const task of this.runningUnleashedTasks(5)) {
+        if (seenBackgroundTasks.has(task.name)) continue;
+        const phase = task.phase == null ? '' : `, phase ${String(task.phase)}`;
+        lines.push(`Unleashed task ${task.name}: ${task.status}${phase}.`);
+      }
+    }
+
+    if (lines.length === 0) {
+      const recentTerminal = this.backgroundTasksForSession(sessionKey, ['done', 'failed', 'aborted'])[0];
+      if (recentTerminal) {
+        lines.push(`No background task is active for this chat. Last task:\n${this.formatBackgroundTaskLine(recentTerminal)}`);
+      }
     }
 
     if (lines.length === 0) {
@@ -365,12 +524,22 @@ export class Gateway {
 
     const intent = detectLocalTurn(text);
     if (intent.kind === 'none') return null;
-    if (!this.isTrustedPersonalSession(sessionKey) && intent.kind !== 'stop') return null;
+    const localIntentAllowed = this.isTrustedPersonalSession(sessionKey)
+      || intent.kind === 'stop'
+      || (intent.kind === 'status' && this.isAgentScopedSession(sessionKey));
+    if (!localIntentAllowed) return null;
 
     let response: string | null = null;
     if (intent.kind === 'stop') {
+      const backgroundCancel = this.cancelActiveBackgroundTask(sessionKey, text);
       const stopped = this.stopSession(sessionKey);
-      response = stopped ? 'Stopping the running work now.' : 'Nothing is currently running for this chat.';
+      if (backgroundCancel && stopped) {
+        response = `${backgroundCancel}\nForeground chat work is stopping too.`;
+      } else if (backgroundCancel) {
+        response = backgroundCancel;
+      } else {
+        response = stopped ? 'Stopping the running work now.' : 'Nothing is currently running for this chat.';
+      }
     } else if (intent.kind === 'ack') {
       response = /^thanks|thank you|thx|ty$/i.test(text.trim()) ? 'Anytime.' : 'Got it.';
     } else if (intent.kind === 'status') {
@@ -557,6 +726,7 @@ export class Gateway {
       fromAgent: agentSlug ?? 'clementine',
       prompt: opts.taskDesc,
       maxMinutes: Math.max(1, Math.ceil(maxHours * 60)),
+      sessionKey,
     });
     markRunning(task.id);
 
@@ -586,6 +756,10 @@ export class Gateway {
       maxHours,
       agentSlug,
     ).then(async (result) => {
+      if (loadBackgroundTask(task.id)?.status === 'aborted') {
+        logger.info({ sessionKey, taskId: task.id, stage: opts.stage }, 'Interactive background task resolved after cancellation; suppressing follow-up');
+        return;
+      }
       logger.info({ sessionKey, taskId: task.id, resultLen: result?.length ?? 0, stage: opts.stage }, 'Interactive background task completed');
       markDone(task.id, result ?? '');
       events.emit('background:complete', { sessionKey, taskId: task.id, stage: opts.stage, timestamp: Date.now() });
@@ -600,6 +774,10 @@ export class Gateway {
         );
       }
     }).catch(async (err) => {
+      if (loadBackgroundTask(task.id)?.status === 'aborted') {
+        logger.info({ sessionKey, taskId: task.id, stage: opts.stage }, 'Interactive background task failed after cancellation; suppressing failure follow-up');
+        return;
+      }
       logger.error({ err, sessionKey, taskId: task.id, stage: opts.stage }, 'Interactive background task failed');
       this.recordInteractiveFailure(sessionKey, originalText, err, opts.stage, { taskId: task.id, taskDesc: opts.taskDesc });
       const failMsg = `Background work failed: ${String(err).slice(0, 200)}`;
@@ -652,6 +830,10 @@ export class Gateway {
       1,
       agentSlug,
     ).then(async (result) => {
+      if (this.sessions.get(sessionKey)?.deepTask?.jobName !== jobName) {
+        logger.info({ sessionKey, jobName }, 'Context-thrash recovery resolved after cancellation/replacement; suppressing follow-up');
+        return;
+      }
       logger.info({ sessionKey, jobName, resultLen: result?.length ?? 0 }, 'Context-thrash recovery completed');
       if (result && !isAutonomousNothingOutput(result)) {
         this.assistant.injectPendingContext(sessionKey, text, result);
@@ -662,6 +844,10 @@ export class Gateway {
         );
       }
     }).catch(async (err) => {
+      if (this.sessions.get(sessionKey)?.deepTask?.jobName !== jobName) {
+        logger.info({ sessionKey, jobName }, 'Context-thrash recovery failed after cancellation/replacement; suppressing failure follow-up');
+        return;
+      }
       logger.error({ err, sessionKey, jobName }, 'Context-thrash recovery failed');
       this.recordInteractiveFailure(sessionKey, text, err, 'context_thrash_recovery_failed', { jobName });
       const failMsg = `Recovery pass failed: ${String(err).slice(0, 200)}`;
@@ -2123,6 +2309,10 @@ export class Gateway {
               1,
               escAgentSlug,
             ).then(async (result) => {
+              if (this.sessions.get(sessionKey)?.deepTask?.jobName !== jobName) {
+                logger.info({ sessionKey, jobName }, 'Auto-escalated deep mode resolved after cancellation/replacement; suppressing follow-up');
+                return;
+              }
               logger.info({ sessionKey, jobName, resultLen: result?.length ?? 0 }, 'Auto-escalated deep mode completed');
               if (result && !isAutonomousNothingOutput(result)) {
                 this.assistant.injectPendingContext(sessionKey, text, result);
@@ -2133,6 +2323,10 @@ export class Gateway {
                 );
               }
             }).catch(async (err) => {
+              if (this.sessions.get(sessionKey)?.deepTask?.jobName !== jobName) {
+                logger.info({ sessionKey, jobName }, 'Auto-escalated deep mode failed after cancellation/replacement; suppressing failure follow-up');
+                return;
+              }
               logger.error({ err, sessionKey, jobName }, 'Auto-escalated deep mode failed');
               this.recordInteractiveFailure(sessionKey, text, err, 'auto_escalated_deep_mode_failed', { jobName, toolActivityCount });
               const failMsg = `Background work failed: ${String(err).slice(0, 200)}`;
@@ -2206,6 +2400,10 @@ export class Gateway {
               1,
               mtAgentSlug,
             ).then(async (result) => {
+              if (this.sessions.get(sessionKey)?.deepTask?.jobName !== jobName) {
+                logger.info({ sessionKey, jobName }, 'Max-turns deep mode resolved after cancellation/replacement; suppressing follow-up');
+                return;
+              }
               logger.info({ sessionKey, jobName, resultLen: result?.length ?? 0 }, 'Max-turns deep mode completed');
               if (result && !isAutonomousNothingOutput(result)) {
                 this.assistant.injectPendingContext(sessionKey, text, result);
@@ -2216,6 +2414,10 @@ export class Gateway {
                 );
               }
             }).catch(async (deepErr) => {
+              if (this.sessions.get(sessionKey)?.deepTask?.jobName !== jobName) {
+                logger.info({ sessionKey, jobName }, 'Max-turns deep mode failed after cancellation/replacement; suppressing failure follow-up');
+                return;
+              }
               logger.error({ err: deepErr, sessionKey, jobName }, 'Max-turns deep mode failed');
               this.recordInteractiveFailure(sessionKey, text, deepErr, 'max_turns_deep_mode_failed', { jobName, toolActivityCount });
               const failMsg = `Background work failed: ${String(deepErr).slice(0, 200)}`;

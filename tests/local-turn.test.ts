@@ -5,6 +5,8 @@ describe('local turn detection', () => {
   it('detects stop requests without sending them through the SDK', () => {
     expect(detectLocalTurn('stop').kind).toBe('stop');
     expect(detectLocalTurn('never mind').kind).toBe('stop');
+    expect(detectLocalTurn('cancel bg-morq29h8-cf8c3a').kind).toBe('stop');
+    expect(detectLocalTurn('cancel the task').kind).toBe('stop');
     expect(detectLocalTurn('stop by the store later and get milk').kind).toBe('none');
   });
 
@@ -13,6 +15,10 @@ describe('local turn detection', () => {
     expect(detectLocalTurn('anything running?').kind).toBe('status');
     expect(detectLocalTurn('What’s runnin').kind).toBe('status');
     expect(detectLocalTurn('what is running right now').kind).toBe('status');
+    expect(detectLocalTurn("How's it coming along?").kind).toBe('status');
+    expect(detectLocalTurn('any updates?').kind).toBe('status');
+    expect(detectLocalTurn('is it done yet?').kind).toBe('status');
+    expect(detectLocalTurn('check status for bg-morq29h8-cf8c3a').kind).toBe('status');
   });
 
   it('detects last-action diagnostics', () => {

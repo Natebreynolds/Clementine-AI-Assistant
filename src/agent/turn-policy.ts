@@ -48,6 +48,7 @@ const GOAL_REF_RE = /\b(goal|goals|objective|objectives|blocker|next action|next
 const LOCAL_TOOL_RE = /\b(repo|repository|code|file|files|folder|directory|path|log|logs|config|build|test|typecheck|lint|npm|git|commit|push|pull|branch|diff|patch|edit|write|implement|fix|refactor|run|diagnose|investigate|troubleshoot|cron|scheduler|lease)\b/i;
 const COMPLEX_RE = /\b(multiple|several|many|bulk|batch|parallel|deep mode|background|research|analyze|audit|review|across|end to end|entire)\b/i;
 const ADMIN_RE = /\b(self[- ]?update|restart|daemon|npm publish|publish to npm|doctor|integration|credential|env var|environment variable|set up|setup|configure)\b/i;
+const BACKGROUND_STATUS_FOLLOWUP_RE = /\bbg-[a-z0-9]+-[a-f0-9]{6}\b|\b(status|progress|progress update|any updates?|done yet|did it finish|still running|coming along|background status)\b/i;
 const STANDALONE_GREETINGS = new Set([
   'hi',
   'hey',
@@ -135,6 +136,19 @@ export function decideTurnPolicy(input: TurnPolicyInput): TurnPolicy {
       allowProactiveGoals: true,
       fetchLinks: hasUrl,
       reason: 'explicit-full-surface',
+    };
+  }
+
+  if (input.hasRecentContext && BACKGROUND_STATUS_FOLLOWUP_RE.test(text)) {
+    return {
+      retrievalTier: 'search',
+      disableAllTools: false,
+      enableTeams: false,
+      maxTurns: Math.min(intent.suggestedMaxTurns, 6),
+      effort: 'low',
+      allowProactiveGoals: false,
+      fetchLinks: false,
+      reason: 'background-status-followup',
     };
   }
 

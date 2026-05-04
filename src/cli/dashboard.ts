@@ -2624,6 +2624,69 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
     }
   });
 
+  app.post('/api/background-tasks/:id/cancel', async (req, res) => {
+    try {
+      const id = req.params.id;
+      if (!/^bg-[a-z0-9]+-[a-f0-9]{6}$/.test(id)) {
+        res.status(400).json({ error: 'Invalid background task id' });
+        return;
+      }
+      const { loadBackgroundTask, markFailed } = await import('../agent/background-tasks.js');
+      const task = loadBackgroundTask(id);
+      if (!task) {
+        res.status(404).json({ error: 'Background task not found' });
+        return;
+      }
+      if (task.status === 'done' || task.status === 'failed' || task.status === 'aborted') {
+        res.json({ ok: true, message: `Background task ${id} is already ${task.status}` });
+        return;
+      }
+
+      const cancelled = markFailed(id, 'cancelled from dashboard', 'aborted');
+      if (!cancelled || cancelled.status !== 'aborted') {
+        res.json({ ok: true, message: `Background task ${id} is already ${cancelled?.status ?? 'not available'}` });
+        return;
+      }
+
+      // If the task is already running in unleashed mode, this is the cancel
+      // signal that runUnleashedTask checks at phase boundaries.
+      const safeJob = `bg:${id}`.replace(/[^a-zA-Z0-9_-]/g, '_');
+      const taskDir = path.join(BASE_DIR, 'unleashed', safeJob);
+      try {
+        mkdirSync(taskDir, { recursive: true });
+        writeFileSync(path.join(taskDir, 'CANCEL'), new Date().toISOString());
+      } catch { /* best-effort; the persisted abort still prevents pending pickup */ }
+
+      res.json({ ok: true, message: `Cancelled background task ${id}` });
+    } catch (err) {
+      res.status(500).json({ error: String(err).slice(0, 200) });
+    }
+  });
+
+  app.delete('/api/background-tasks/:id', async (req, res) => {
+    try {
+      const id = req.params.id;
+      if (!/^bg-[a-z0-9]+-[a-f0-9]{6}$/.test(id)) {
+        res.status(400).json({ error: 'Invalid background task id' });
+        return;
+      }
+      const { deleteBackgroundTask, loadBackgroundTask } = await import('../agent/background-tasks.js');
+      const task = loadBackgroundTask(id);
+      if (!task) {
+        res.status(404).json({ error: 'Background task not found' });
+        return;
+      }
+      if (task.status === 'pending' || task.status === 'running') {
+        res.status(409).json({ error: 'Cancel the task before clearing it.' });
+        return;
+      }
+      deleteBackgroundTask(id);
+      res.json({ ok: true, message: `Cleared background task ${id}` });
+    } catch (err) {
+      res.status(500).json({ error: String(err).slice(0, 200) });
+    }
+  });
+
   app.get('/api/autonomy', async (req, res) => {
     try {
       const { getStore } = await import('../tools/shared.js');
@@ -2758,6 +2821,7 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
         timeSavedMinutes: 0,
         pendingApprovals: 0,
         overdueTasks: 0,
+        tokens7d: 0,
       };
 
       // active unleashed runs
@@ -2837,6 +2901,27 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
           for (const line of lines) {
             const m = line.match(/@(\d{4}-\d{2}-\d{2})/);
             if (m && m[1] < todayStr) kpis.overdueTasks++;
+          }
+        }
+      } catch { /* */ }
+
+      // token usage this week
+      try {
+        if (existsSync(MEMORY_DB_PATH)) {
+          const Database = (await import('better-sqlite3')).default;
+          const db = new Database(MEMORY_DB_PATH, { readonly: true });
+          try {
+            const tableExists = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='usage_log'").get();
+            if (tableExists) {
+              const sinceIso = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+              const row = db.prepare(
+                `SELECT COALESCE(SUM(input_tokens), 0) + COALESCE(SUM(output_tokens), 0) as total
+                 FROM usage_log WHERE datetime(created_at) >= datetime(?)`,
+              ).get(sinceIso) as { total: number };
+              kpis.tokens7d = row.total || 0;
+            }
+          } finally {
+            db.close();
           }
         }
       } catch { /* */ }
@@ -2992,7 +3077,7 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
       if (kpis.activeRuns > 0) {
         briefing.needsReview.push({
           text: kpis.activeRuns + ' unleashed task' + (kpis.activeRuns === 1 ? '' : 's') + ' running',
-          href: '#build/workflows',
+          href: '#build/crons',
         });
       }
       // Broken jobs (consecutive failures)
@@ -3380,6 +3465,25 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
       res.json({ ok: true, validation: v });
     } catch (err) {
       res.status(500).json({ error: 'Failed to save workflow', detail: String(err) });
+    }
+  });
+
+  app.post('/api/builder/workflows/:id/run', async (req, res) => {
+    try {
+      const id = decodeURIComponent(req.params.id);
+      const { readWorkflow } = await import('../dashboard/builder/serializer.js');
+      const wf = readWorkflow(id);
+      if (!wf) { res.status(404).json({ error: 'Not found' }); return; }
+      res.json({ ok: true, message: `Workflow "${wf.name}" triggered` });
+      broadcastEvent({ type: 'workflow_triggered', data: { id, name: wf.name } });
+
+      getGateway().then(gw => gw.handleWorkflow(wf, req.body?.inputs || {})).then(result => {
+        broadcastEvent({ type: 'workflow_complete', data: { id, name: wf.name, status: 'ok', preview: (result || '').slice(0, 300) } });
+      }).catch(err => {
+        broadcastEvent({ type: 'workflow_complete', data: { id, name: wf.name, status: 'error', error: String(err) } });
+      });
+    } catch (err) {
+      res.status(500).json({ error: 'Failed to trigger workflow', detail: String(err) });
     }
   });
 
@@ -7366,6 +7470,236 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
       });
     } catch (err) {
       res.json({ error: String(err), totalTokens: 0, byModel: [], bySource: [], byDay: [] });
+    } finally {
+      db.close();
+    }
+  });
+
+  app.get('/api/build/usage', async (req, res) => {
+    const hoursRaw = parseInt(String(req.query.hours ?? '168'), 10);
+    const hours = Math.max(1, Math.min(Number.isFinite(hoursRaw) ? hoursRaw : 168, 24 * 90));
+    const limitRaw = parseInt(String(req.query.limit ?? '12'), 10);
+    const limit = Math.max(5, Math.min(Number.isFinite(limitRaw) ? limitRaw : 12, 50));
+    const sinceIso = new Date(Date.now() - hours * 60 * 60 * 1000).toISOString();
+
+    const classifySession = (sessionKey: string, source: string, agentSlug?: string | null) => {
+      let kind = source || 'chat';
+      let label = sessionKey || '(unknown)';
+      let taskKey = sessionKey || '(unknown)';
+      let controllable = false;
+      let targetTab: 'crons' | 'workflows' | 'sessions' = 'sessions';
+
+      if (sessionKey.startsWith('cron:')) {
+        const name = sessionKey.slice('cron:'.length);
+        kind = name.startsWith('goal:') ? 'goal task' : 'scheduled task';
+        label = name;
+        taskKey = name;
+        controllable = true;
+        targetTab = 'crons';
+      } else if (sessionKey.startsWith('unleashed:')) {
+        const name = sessionKey.slice('unleashed:'.length);
+        kind = name.startsWith('bg:') ? 'background task' : 'long-running task';
+        label = name.startsWith('bg:') ? `Deep task ${name.slice(3)}` : name;
+        taskKey = name;
+        controllable = true;
+        targetTab = 'crons';
+      } else if (sessionKey.startsWith('workflow:')) {
+        const rest = sessionKey.slice('workflow:'.length);
+        const splitAt = rest.lastIndexOf(':');
+        const workflowName = splitAt > 0 ? rest.slice(0, splitAt) : rest;
+        const stepName = splitAt > 0 ? rest.slice(splitAt + 1) : '';
+        kind = 'workflow step';
+        label = stepName ? `${workflowName} · ${stepName}` : workflowName;
+        taskKey = workflowName;
+        controllable = true;
+        targetTab = 'workflows';
+      } else if (sessionKey.startsWith('plan:')) {
+        const step = sessionKey.slice('plan:'.length);
+        kind = source === 'workflow_step' ? 'workflow step' : 'plan step';
+        label = step;
+        taskKey = step;
+        targetTab = 'workflows';
+      } else if (sessionKey.startsWith('discord:') || sessionKey.startsWith('chat:') || source === 'chat') {
+        kind = 'chat session';
+        targetTab = 'sessions';
+      }
+
+      return { kind, label, taskKey, controllable, targetTab, agentSlug: agentSlug || null };
+    };
+
+    if (!existsSync(MEMORY_DB_PATH)) {
+      res.json({
+        ok: true,
+        hours,
+        sinceIso,
+        totalTokens: 0,
+        totalInput: 0,
+        totalOutput: 0,
+        totalCacheRead: 0,
+        totalCacheCreation: 0,
+        totalCostCents: 0,
+        sessions: [],
+        tasks: [],
+        sources: [],
+      });
+      return;
+    }
+
+    const Database = (await import('better-sqlite3')).default;
+    const db = new Database(MEMORY_DB_PATH, { readonly: true });
+    try {
+      const tableExists = db.prepare(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='usage_log'",
+      ).get();
+      if (!tableExists) {
+        res.json({ ok: true, hours, sinceIso, totalTokens: 0, totalInput: 0, totalOutput: 0, totalCacheRead: 0, totalCacheCreation: 0, totalCostCents: 0, sessions: [], tasks: [], sources: [] });
+        return;
+      }
+
+      const columns = new Set((db.prepare('PRAGMA table_info(usage_log)').all() as Array<{ name: string }>).map(c => c.name));
+      const costExpr = columns.has('cost_cents') ? 'COALESCE(SUM(cost_cents), 0)' : '0';
+      const agentExpr = columns.has('agent_slug') ? 'COALESCE(agent_slug, \'\')' : '\'\'';
+
+      const totals = db.prepare(
+        `SELECT COALESCE(SUM(input_tokens), 0) as ti,
+                COALESCE(SUM(output_tokens), 0) as to_,
+                COALESCE(SUM(cache_read_tokens), 0) as tcr,
+                COALESCE(SUM(cache_creation_tokens), 0) as tcc,
+                ${costExpr} as cost
+         FROM usage_log
+         WHERE datetime(created_at) >= datetime(?)`,
+      ).get(sinceIso) as { ti: number; to_: number; tcr: number; tcc: number; cost: number };
+
+      const sourceRows = db.prepare(
+        `SELECT source,
+                COUNT(*) as queries,
+                COALESCE(SUM(input_tokens), 0) as totalInput,
+                COALESCE(SUM(output_tokens), 0) as totalOutput,
+                ${costExpr} as costCents
+         FROM usage_log
+         WHERE datetime(created_at) >= datetime(?)
+         GROUP BY source
+         ORDER BY COALESCE(SUM(input_tokens), 0) + COALESCE(SUM(output_tokens), 0) DESC`,
+      ).all(sinceIso) as Array<{ source: string; queries: number; totalInput: number; totalOutput: number; costCents: number }>;
+
+      const sessionRows = db.prepare(
+        `SELECT session_key as sessionKey,
+                source,
+                ${agentExpr} as agentSlug,
+                COUNT(*) as queries,
+                COALESCE(SUM(input_tokens), 0) as totalInput,
+                COALESCE(SUM(output_tokens), 0) as totalOutput,
+                COALESCE(SUM(cache_read_tokens), 0) as totalCacheRead,
+                COALESCE(SUM(cache_creation_tokens), 0) as totalCacheCreation,
+                ${costExpr} as costCents,
+                COALESCE(SUM(num_turns), 0) as turns,
+                COALESCE(AVG(duration_ms), 0) as avgDurationMs,
+                MAX(created_at) as lastAt
+         FROM usage_log
+         WHERE datetime(created_at) >= datetime(?)
+         GROUP BY session_key, source, ${agentExpr}
+         ORDER BY COALESCE(SUM(input_tokens), 0) + COALESCE(SUM(output_tokens), 0) DESC
+         LIMIT ?`,
+      ).all(sinceIso, limit) as Array<{
+        sessionKey: string;
+        source: string;
+        agentSlug: string;
+        queries: number;
+        totalInput: number;
+        totalOutput: number;
+        totalCacheRead: number;
+        totalCacheCreation: number;
+        costCents: number;
+        turns: number;
+        avgDurationMs: number;
+        lastAt: string;
+      }>;
+
+      const sessions = sessionRows.map(row => {
+        const identity = classifySession(row.sessionKey, row.source, row.agentSlug);
+        return {
+          ...identity,
+          sessionKey: row.sessionKey,
+          source: row.source,
+          queries: row.queries,
+          totalInput: row.totalInput,
+          totalOutput: row.totalOutput,
+          totalTokens: row.totalInput + row.totalOutput,
+          totalCacheRead: row.totalCacheRead,
+          totalCacheCreation: row.totalCacheCreation,
+          costCents: row.costCents,
+          turns: row.turns,
+          avgDurationMs: Math.round(row.avgDurationMs || 0),
+          lastAt: row.lastAt,
+        };
+      });
+
+      const taskMap = new Map<string, {
+        taskKey: string;
+        label: string;
+        kind: string;
+        targetTab: string;
+        controllable: boolean;
+        agentSlug: string | null;
+        totalInput: number;
+        totalOutput: number;
+        totalTokens: number;
+        costCents: number;
+        queries: number;
+        lastAt: string;
+      }>();
+      for (const s of sessions) {
+        if (s.kind === 'chat session') continue;
+        const mapKey = `${s.kind}:${s.taskKey}:${s.agentSlug || ''}`;
+        const existing = taskMap.get(mapKey);
+        if (existing) {
+          existing.totalInput += s.totalInput;
+          existing.totalOutput += s.totalOutput;
+          existing.totalTokens += s.totalTokens;
+          existing.costCents += s.costCents || 0;
+          existing.queries += s.queries;
+          if ((s.lastAt || '') > (existing.lastAt || '')) existing.lastAt = s.lastAt;
+        } else {
+          taskMap.set(mapKey, {
+            taskKey: s.taskKey,
+            label: s.taskKey,
+            kind: s.kind,
+            targetTab: s.targetTab,
+            controllable: s.controllable,
+            agentSlug: s.agentSlug,
+            totalInput: s.totalInput,
+            totalOutput: s.totalOutput,
+            totalTokens: s.totalTokens,
+            costCents: s.costCents || 0,
+            queries: s.queries,
+            lastAt: s.lastAt,
+          });
+        }
+      }
+
+      const tasks = Array.from(taskMap.values())
+        .sort((a, b) => b.totalTokens - a.totalTokens)
+        .slice(0, limit);
+
+      res.json({
+        ok: true,
+        hours,
+        sinceIso,
+        totalInput: totals.ti,
+        totalOutput: totals.to_,
+        totalCacheRead: totals.tcr,
+        totalCacheCreation: totals.tcc,
+        totalCostCents: totals.cost,
+        totalTokens: totals.ti + totals.to_,
+        sessions,
+        tasks,
+        sources: sourceRows.map(s => ({
+          ...s,
+          totalTokens: (s.totalInput || 0) + (s.totalOutput || 0),
+        })),
+      });
+    } catch (err) {
+      res.json({ ok: false, error: String(err), hours, sinceIso, totalTokens: 0, sessions: [], tasks: [], sources: [] });
     } finally {
       db.close();
     }
@@ -13780,7 +14114,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
 
         <!-- KPI strip -->
         <section class="kpi-strip" id="home-kpis">
-          <div class="kpi-tile" data-kpi="activeRuns" onclick="navigateTo('build',{tab:'workflows'})">
+          <div class="kpi-tile" data-kpi="activeRuns" onclick="navigateTo('build',{tab:'crons'})">
             <div class="kpi-icon" data-icon="zap"></div>
             <div class="kpi-value" id="kpi-active-runs">--</div>
             <div class="kpi-label">Active runs</div>
@@ -13794,6 +14128,11 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
             <div class="kpi-icon" data-icon="sparkles"></div>
             <div class="kpi-value" id="kpi-time-saved">--</div>
             <div class="kpi-label">Saved this week</div>
+          </div>
+          <div class="kpi-tile" data-kpi="tokens7d" onclick="navigateTo('build',{tab:'crons'})">
+            <div class="kpi-icon" data-icon="activity"></div>
+            <div class="kpi-value" id="kpi-tokens-7d">--</div>
+            <div class="kpi-label">Tokens 7d</div>
           </div>
           <div class="kpi-tile" data-kpi="approvals" onclick="navigateTo('brain',{tab:'learning'})">
             <div class="kpi-icon" data-icon="check"></div>
@@ -13856,7 +14195,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
     <!-- ═══ Builder Page — Conversational Artifact Creation ═══ -->
     <div class="page" id="page-build">
       <div class="tab-bar" id="build-tabs" style="margin:0;padding:0 18px;background:var(--bg-secondary);border-bottom:1px solid var(--border)">
-        <button class="active" data-build-tab="workflows" data-icon="workflow" onclick="switchBuildTab('workflows')"><span class="icon-slot"></span> Workflows</button>
+        <button class="active" data-build-tab="workflows" data-icon="workflow" onclick="switchBuildTab('workflows')"><span class="icon-slot"></span> Workflow Builder</button>
         <button data-build-tab="crons" data-icon="clock" onclick="switchBuildTab('crons')"><span class="icon-slot"></span> Scheduled Tasks <span class="tab-badge" id="build-tab-cron-count" style="display:none">0</span></button>
         <button data-build-tab="skills" data-icon="shield" onclick="switchBuildTab('skills')"><span class="icon-slot"></span> Skills <span class="tab-badge" id="build-tab-skill-count" style="display:none">0</span></button>
         <button data-build-tab="templates" data-icon="fileText" onclick="switchBuildTab('templates')"><span class="icon-slot"></span> Templates</button>
@@ -13876,9 +14215,12 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
         <span id="builder-agent-label" style="padding:0;font-size:13px;color:var(--text-secondary);font-weight:500"></span>
         <input type="hidden" id="builder-agent" value="">
         <span style="flex:1"></span>
-        <button class="btn-sm btn-primary" onclick="newFromBuildHeader()" title="Create a new artifact for this tab" style="padding:4px 14px;border-radius:6px;cursor:pointer;font-size:12px">New</button>
+        <button class="btn-sm btn-primary" id="builder-new-btn" onclick="newFromBuildHeader()" title="Create a new artifact for this tab" style="padding:4px 14px;border-radius:6px;cursor:pointer;font-size:12px">New Workflow</button>
         <button class="btn-sm" id="builder-test-btn" onclick="testBuilderSkill()" style="background:var(--bg-tertiary);border:1px solid var(--border);color:var(--text-secondary);padding:4px 12px;border-radius:6px;cursor:pointer;font-size:12px;display:none">Test</button>
         <button class="btn-sm btn-primary" id="builder-save-btn" onclick="saveBuilderArtifact()" style="padding:4px 16px;font-size:12px;display:none">Save</button>
+      </div>
+      <div id="build-usage-panel" style="padding:12px 18px;border-bottom:1px solid var(--border);background:var(--bg-primary)">
+        <div class="skel-block"><div class="skel-row med"></div><div class="skel-row short"></div></div>
       </div>
       <!-- Build tab content area: canvas DOMINATES, chat is a sidebar -->
       <div id="build-tab-workflows" data-build-tabpane="workflows" style="display:flex;flex:1;min-height:0;overflow:hidden">
@@ -13917,7 +14259,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
         <!-- Right: Canvas (dominant) + Existing Skills drawer -->
         <div id="builder-right-pane" style="flex:1;min-width:0;display:flex;flex-direction:column;background:var(--bg-primary)">
           <div style="padding:12px 16px;border-bottom:1px solid var(--border);font-weight:600;font-size:13px;color:var(--text-secondary);display:flex;align-items:center;gap:10px;flex-wrap:wrap">
-            <span id="builder-right-pane-title">Live Preview</span>
+            <span id="builder-right-pane-title">Workflow Builder</span>
             <span id="builder-preview-status" style="font-size:11px;color:var(--text-muted)"></span>
             <span style="flex:1"></span>
             <select id="builder-canvas-picker" onchange="openBuilderWorkflow(this.value)" style="display:none;padding:4px 8px;border:1px solid var(--border);border-radius:6px;background:var(--bg-secondary);color:var(--text-primary);font-size:12px;max-width:240px">
@@ -13975,9 +14317,12 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
         <div style="display:flex;align-items:flex-start;gap:14px;margin-bottom:16px;flex-wrap:wrap">
           <div style="flex:1;min-width:260px">
             <h2 style="font-size:18px;font-weight:600;margin:0 0 4px;color:var(--text-primary)">Scheduled Tasks</h2>
-            <p style="font-size:13px;color:var(--text-muted);margin:0;line-height:1.45">Create and tune recurring agent jobs. Use workflows only when the job needs an explicit multi-step canvas.</p>
+            <p style="font-size:13px;color:var(--text-muted);margin:0;line-height:1.45">Recurring jobs that can run automatically. Cards here are the turn-on, turn-off, run-now surface.</p>
           </div>
-          <button class="btn-sm btn-primary" onclick="newFromBuildHeader()" style="padding:7px 14px;border-radius:6px;cursor:pointer;font-size:12px">New Scheduled Task</button>
+          <div style="display:flex;gap:8px;flex-wrap:wrap">
+            <button class="btn-sm btn-primary" onclick="openCreateCronModal((document.getElementById(\\x27builder-owner\\x27)||{}).value||\\x27\\x27)" style="padding:7px 14px;border-radius:6px;cursor:pointer;font-size:12px">New Scheduled Task</button>
+            <button class="btn-sm" onclick="createScheduledWorkflowFromBuild()" style="padding:7px 14px;border-radius:6px;cursor:pointer;font-size:12px">New Scheduled Workflow</button>
+          </div>
         </div>
         <div id="panel-cron"></div>
       </div>
@@ -17303,6 +17648,8 @@ function switchBuildTab(tab) {
   var cronPane = document.getElementById('build-tab-crons');
   var tplPane = document.getElementById('build-tab-templates');
   var headerStrip = document.getElementById('build-header-strip');
+  var usagePanel = document.getElementById('build-usage-panel');
+  var newBtn = document.getElementById('builder-new-btn');
   // Always close any open workflow when changing tabs — switching context
   // is a clean slate, not a stale node hanging on the canvas.
   if (typeof closeBuilderCanvas === 'function') closeBuilderCanvas();
@@ -17311,11 +17658,14 @@ function switchBuildTab(tab) {
     if (cronPane) cronPane.style.display = 'none';
     if (tplPane) tplPane.style.display = '';
     if (headerStrip) headerStrip.style.display = 'none';
+    if (usagePanel) usagePanel.style.display = 'none';
   } else if (tab === 'crons') {
     if (workPane) workPane.style.display = 'none';
     if (cronPane) cronPane.style.display = 'block';
     if (tplPane) tplPane.style.display = 'none';
     if (headerStrip) headerStrip.style.display = 'flex';
+    if (usagePanel) usagePanel.style.display = '';
+    if (newBtn) newBtn.style.display = 'none';
     var typeSelCron = document.getElementById('builder-type');
     if (typeSelCron) typeSelCron.value = 'cron';
     var saveBtnCron = document.getElementById('builder-save-btn');
@@ -17328,11 +17678,17 @@ function switchBuildTab(tab) {
       populateBuilderOwnerPicker().catch(function() { /* */ });
     }
     if (typeof refreshCron === 'function') refreshCron();
+    if (typeof refreshBuildUsage === 'function') refreshBuildUsage();
   } else {
     if (workPane) workPane.style.display = 'flex';
     if (cronPane) cronPane.style.display = 'none';
     if (tplPane) tplPane.style.display = 'none';
     if (headerStrip) headerStrip.style.display = 'flex';
+    if (usagePanel) usagePanel.style.display = '';
+    if (newBtn) {
+      newBtn.style.display = '';
+      newBtn.textContent = tab === 'skills' ? 'New Skill' : 'New Workflow';
+    }
     // Map build-tab → builder-type so the canvas + chat reflect the tab.
     var typeSel = document.getElementById('builder-type');
     if (typeSel) {
@@ -17356,6 +17712,7 @@ function switchBuildTab(tab) {
     if (typeof populateBuilderOwnerPicker === 'function') {
       populateBuilderOwnerPicker().catch(function() { /* */ });
     }
+    if (typeof refreshBuildUsage === 'function') refreshBuildUsage();
     // Focus chat input
     setTimeout(function() {
       var bi = document.getElementById('builder-input');
@@ -17402,6 +17759,31 @@ async function newFromBuildHeader() {
   } catch (err) { toast('Create error: ' + err, 'error'); }
 }
 
+async function createScheduledWorkflowFromBuild() {
+  var owner = (document.getElementById('builder-owner') || {}).value || '';
+  var name = prompt('Scheduled workflow name:');
+  if (!name || !name.trim()) return;
+  var schedule = prompt('Cron schedule:', '0 9 * * 1-5');
+  if (!schedule || !schedule.trim()) return;
+  var initialPrompt = prompt('First step prompt:', 'Describe what this scheduled workflow should do.');
+  if (!initialPrompt || !initialPrompt.trim()) return;
+  try {
+    var body = {
+      name: name.trim(),
+      schedule: schedule.trim(),
+      initialPrompt: initialPrompt.trim(),
+      description: 'Scheduled workflow',
+    };
+    if (owner) body.agent = owner;
+    var r = await apiJson('POST', '/api/builder/workflows', body);
+    if (r && r.id) {
+      toast('Created scheduled workflow: ' + name.trim(), 'success');
+      refreshCron();
+      if (typeof refreshBuilderCanvasPicker === 'function') refreshBuilderCanvasPicker('workflow');
+    }
+  } catch (err) { toast('Create error: ' + err, 'error'); }
+}
+
 // Owner picker — populated from /api/agents on first build-tab activation
 // and refreshed on demand. Empty value = Clementine/global; any other value
 // is the agent slug for scoped reads/writes.
@@ -17442,6 +17824,7 @@ async function onBuilderOwnerChange() {
   if (hidden) hidden.value = owner || '';
   if (label) label.textContent = owner ? 'Owner: ' + owner : '';
   var activeTab = document.querySelector('#build-tabs button.active')?.getAttribute('data-build-tab') || 'workflows';
+  if (typeof refreshBuildUsage === 'function') refreshBuildUsage();
   if (activeTab === 'crons') {
     if (typeof refreshCron === 'function') refreshCron();
     return;
@@ -17535,7 +17918,7 @@ function openCommandK() {
     { kw: 'home chat',          page: 'home',     tab: 'chat',         label: 'Home · Chat' },
     { kw: 'home today plan',    page: 'home',     tab: 'today',        label: 'Home · Today' },
     { kw: 'home activity',      page: 'home',     tab: 'activity',     label: 'Home · Activity' },
-    { kw: 'build workflows',    page: 'build',    tab: 'workflows',    label: 'Build · Workflows' },
+    { kw: 'build workflows workflow builder', page: 'build', tab: 'workflows', label: 'Build · Workflow Builder' },
     { kw: 'build crons scheduled tasks', page: 'build', tab: 'crons', label: 'Build · Scheduled Tasks' },
     { kw: 'build skills',       page: 'build',    tab: 'skills',       label: 'Build · Skills' },
     { kw: 'build templates',    page: 'build',    tab: 'templates',    label: 'Build · Templates' },
@@ -18511,7 +18894,62 @@ async function toggleCronJob(name) {
   try {
     await apiFetch('/api/cron/' + encodeURIComponent(name) + '/toggle', { method: 'POST' });
     toast('Toggled ' + name, 'success');
+    refreshCron();
+    if (typeof refreshBuilderCanvasPicker === 'function') refreshBuilderCanvasPicker('cron');
   } catch(e) { toast('Failed to toggle: ' + e, 'error'); }
+}
+
+async function toggleScheduledWorkflow(id) {
+  try {
+    var r = await apiFetch('/api/builder/workflows/' + encodeURIComponent(id));
+    var d = await r.json();
+    if (!r.ok || !d.workflow) {
+      toast(d.error || 'Workflow not found', 'error');
+      refreshCron();
+      return;
+    }
+    d.workflow.enabled = d.workflow.enabled === false ? true : false;
+    var saved = await apiJson('PUT', '/api/builder/workflows/' + encodeURIComponent(id), { workflow: d.workflow, force: true });
+    if (saved && saved.ok !== false) {
+      refreshCron();
+      if (typeof refreshBuilderCanvasPicker === 'function') refreshBuilderCanvasPicker('workflow');
+    }
+  } catch(e) {
+    toast('Failed to toggle workflow: ' + e, 'error');
+    refreshCron();
+  }
+}
+
+async function runScheduledWorkflow(id) {
+  try {
+    await apiPost('/api/builder/workflows/' + encodeURIComponent(id) + '/run');
+    setTimeout(refreshCron, 1000);
+  } catch(e) { toast('Failed to run workflow: ' + e, 'error'); }
+}
+
+function openScheduledWorkflow(id) {
+  switchBuildTab('workflows');
+  setTimeout(function() { openBuilderWorkflow(id); }, 120);
+}
+
+function confirmDeleteScheduledWorkflow(id, name) {
+  document.getElementById('confirm-message').textContent = 'Delete scheduled workflow "' + name + '"? This cannot be undone.';
+  const btn = document.getElementById('confirm-action');
+  btn.onclick = async () => {
+    await apiDelete('/api/builder/workflows/' + encodeURIComponent(id));
+    closeConfirmModal();
+    refreshCron();
+    if (typeof refreshBuilderCanvasPicker === 'function') refreshBuilderCanvasPicker('workflow');
+  };
+  document.getElementById('confirm-modal').classList.add('show');
+}
+
+async function cancelBackgroundTask(id) {
+  if (!confirm('Cancel background task "' + id + '"? It will stop immediately if pending, or at the next phase boundary if already running.')) return;
+  try {
+    await apiPost('/api/background-tasks/' + encodeURIComponent(id) + '/cancel');
+    setTimeout(refreshCron, 1000);
+  } catch(e) { toast('Failed to cancel background task: ' + e, 'error'); }
 }
 
 // ── Theme ─────────────────────────────────
@@ -19010,17 +19448,154 @@ function closeSessionModal() {
 
 // ── Cron Jobs ─────────────────────────────
 let cronJobsData = [];
+let scheduledWorkflowData = [];
+let buildUsageByTask = {};
+
+function jsStr(s) {
+  return String(s ?? '').replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/\r/g, '\\r').replace(/\n/g, '\\n');
+}
+
+function durationLabel(ms) {
+  if (!ms || ms < 0) return '';
+  var mins = Math.floor(ms / 60000);
+  if (mins < 1) return '<1m';
+  if (mins < 60) return mins + 'm';
+  return Math.floor(mins / 60) + 'h ' + (mins % 60) + 'm';
+}
+
+function mergeBuildUsageTasks(tasks) {
+  buildUsageByTask = {};
+  (tasks || []).forEach(function(t) {
+    var key = t.taskKey || t.label;
+    if (!key) return;
+    if (!buildUsageByTask[key]) {
+      buildUsageByTask[key] = {
+        totalTokens: 0,
+        totalInput: 0,
+        totalOutput: 0,
+        costCents: 0,
+        queries: 0,
+        lastAt: '',
+      };
+    }
+    buildUsageByTask[key].totalTokens += t.totalTokens || 0;
+    buildUsageByTask[key].totalInput += t.totalInput || 0;
+    buildUsageByTask[key].totalOutput += t.totalOutput || 0;
+    buildUsageByTask[key].costCents += t.costCents || 0;
+    buildUsageByTask[key].queries += t.queries || 0;
+    if ((t.lastAt || '') > (buildUsageByTask[key].lastAt || '')) buildUsageByTask[key].lastAt = t.lastAt;
+  });
+}
+
+function buildUsageBadge(key) {
+  var usage = buildUsageByTask[key];
+  if (!usage || !usage.totalTokens) return '';
+  return '<span class="badge badge-blue" title="' + esc(formatTokens(usage.totalInput || 0)) + ' input, ' + esc(formatTokens(usage.totalOutput || 0)) + ' output">' + esc(formatTokens(usage.totalTokens)) + ' tok 7d</span>';
+}
+
+async function refreshBuildUsage() {
+  var host = document.getElementById('build-usage-panel');
+  if (!host) return;
+  try {
+    var r = await apiFetch('/api/build/usage?hours=168&limit=12');
+    var d = await r.json();
+    if (!d || d.ok === false) {
+      host.innerHTML = '<div class="empty-state" style="padding:10px;color:var(--text-muted)">Usage unavailable</div>';
+      return;
+    }
+
+    var owner = (document.getElementById('builder-owner') || {}).value || '';
+    var sessions = (d.sessions || []).filter(function(s) { return owner ? s.agentSlug === owner : !s.agentSlug; });
+    var tasks = (d.tasks || []).filter(function(t) { return owner ? t.agentSlug === owner : !t.agentSlug; });
+    mergeBuildUsageTasks(d.tasks || []);
+
+    var visibleTokenTotal = sessions.reduce(function(sum, s) { return sum + (s.totalTokens || 0); }, 0);
+    var automationTokens = tasks.reduce(function(sum, t) { return sum + (t.totalTokens || 0); }, 0);
+    var topSession = sessions[0] || null;
+
+    var html = '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px;margin-bottom:10px">'
+      + '<div style="border:1px solid var(--border);border-radius:8px;background:var(--bg-secondary);padding:12px">'
+      + '<div style="display:flex;align-items:center;justify-content:space-between;gap:8px"><strong style="font-size:13px">Workflow Builder</strong><span class="badge badge-purple">manual/test</span></div>'
+      + '<div style="font-size:12px;color:var(--text-muted);margin-top:6px;line-height:1.4">Multi-step canvas. Test or run manually; schedule it when it should recur.</div>'
+      + '</div>'
+      + '<div style="border:1px solid var(--border);border-radius:8px;background:var(--bg-secondary);padding:12px">'
+      + '<div style="display:flex;align-items:center;justify-content:space-between;gap:8px"><strong style="font-size:13px">Scheduled Tasks</strong><span class="badge badge-green">recurring</span></div>'
+      + '<div style="font-size:12px;color:var(--text-muted);margin-top:6px;line-height:1.4">Enabled cards here can spend tokens automatically and can be toggled or deleted.</div>'
+      + '</div>'
+      + '<div style="border:1px solid var(--border);border-radius:8px;background:var(--bg-secondary);padding:12px">'
+      + '<div style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:.04em">Token Usage · 7d</div>'
+      + '<div style="display:flex;align-items:baseline;gap:10px;margin-top:4px"><strong style="font-size:22px">' + esc(formatTokens(visibleTokenTotal)) + '</strong><span style="font-size:12px;color:var(--text-muted)">' + esc(formatTokens(automationTokens)) + ' automation</span></div>'
+      + (topSession ? '<div style="font-size:11px;color:var(--text-muted);margin-top:4px">Top: ' + esc(topSession.label) + '</div>' : '<div style="font-size:11px;color:var(--text-muted);margin-top:4px">No usage logged for this owner.</div>')
+      + '</div>'
+      + '</div>';
+
+    html += '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:10px">';
+    html += '<div style="border:1px solid var(--border);border-radius:8px;background:var(--bg-secondary);overflow:hidden">'
+      + '<div style="padding:10px 12px;border-bottom:1px solid var(--border);font-size:12px;font-weight:600">Highest Token Sessions</div>';
+    if (sessions.length === 0) {
+      html += '<div style="padding:12px;color:var(--text-muted);font-size:12px">No sessions in the last 7 days.</div>';
+    } else {
+      html += sessions.slice(0, 5).map(function(s) {
+        return '<div class="clickable-row" onclick="viewSessionModal(\\x27' + encodeURIComponent(s.sessionKey) + '\\x27)" style="display:grid;grid-template-columns:minmax(0,1fr) auto;gap:10px;padding:9px 12px;border-bottom:1px solid var(--border)">'
+          + '<div style="min-width:0"><div style="font-size:12px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">' + esc(s.label) + '</div>'
+          + '<div style="font-size:11px;color:var(--text-muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">' + esc(s.kind) + (s.agentSlug ? ' · ' + esc(s.agentSlug) : '') + ' · ' + esc(timeAgo(s.lastAt)) + '</div></div>'
+          + '<div style="text-align:right"><div style="font-size:12px;font-weight:700">' + esc(formatTokens(s.totalTokens || 0)) + '</div>'
+          + '<div style="font-size:10px;color:var(--text-muted)">' + esc(formatTokens(s.totalInput || 0)) + ' in</div></div>'
+          + '</div>';
+      }).join('');
+    }
+    html += '</div>';
+
+    html += '<div style="border:1px solid var(--border);border-radius:8px;background:var(--bg-secondary);overflow:hidden">'
+      + '<div style="padding:10px 12px;border-bottom:1px solid var(--border);font-size:12px;font-weight:600">Task Spend</div>';
+    if (tasks.length === 0) {
+      html += '<div style="padding:12px;color:var(--text-muted);font-size:12px">No scheduled or long-running task usage in the last 7 days.</div>';
+    } else {
+      html += tasks.slice(0, 5).map(function(t) {
+        var tab = t.targetTab === 'workflows' ? 'workflows' : 'crons';
+        return '<div class="clickable-row" onclick="navigateTo(\\x27build\\x27,{tab:\\x27' + tab + '\\x27})" style="display:grid;grid-template-columns:minmax(0,1fr) auto;gap:10px;padding:9px 12px;border-bottom:1px solid var(--border)">'
+          + '<div style="min-width:0"><div style="font-size:12px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">' + esc(t.label || t.taskKey) + '</div>'
+          + '<div style="font-size:11px;color:var(--text-muted)">' + esc(t.kind) + (t.controllable ? ' · controllable' : '') + '</div></div>'
+          + '<div style="text-align:right"><div style="font-size:12px;font-weight:700">' + esc(formatTokens(t.totalTokens || 0)) + '</div>'
+          + '<div style="font-size:10px;color:var(--text-muted)">' + esc(t.queries || 0) + ' calls</div></div>'
+          + '</div>';
+      }).join('');
+    }
+    html += '</div></div>';
+
+    host.innerHTML = html;
+  } catch(e) {
+    host.innerHTML = '<div class="empty-state" style="padding:10px;color:var(--text-muted)">Failed to load token usage</div>';
+  }
+}
+
 async function refreshCron() {
   try {
-    const r = await apiFetch('/api/cron');
-    const d = await r.json();
+    const [cronRes, workflowRes, unleashedRes, backgroundRes, usageRes] = await Promise.all([
+      apiFetch('/api/cron'),
+      apiFetch('/api/builder/workflows').catch(function() { return null; }),
+      apiFetch('/api/unleashed').catch(function() { return null; }),
+      apiFetch('/api/background-tasks').catch(function() { return null; }),
+      apiFetch('/api/build/usage?hours=168&limit=50').catch(function() { return null; }),
+    ]);
+    const d = await cronRes.json();
+    const workflowPayload = workflowRes && workflowRes.ok ? await workflowRes.json() : { workflows: [] };
+    const unleashedPayload = unleashedRes && unleashedRes.ok ? await unleashedRes.json() : { tasks: [] };
+    const backgroundPayload = backgroundRes && backgroundRes.ok ? await backgroundRes.json() : [];
+    const usagePayload = usageRes && usageRes.ok ? await usageRes.json() : { tasks: [] };
+    mergeBuildUsageTasks(usagePayload.tasks || []);
     cronJobsData = d.jobs || [];
+    scheduledWorkflowData = (workflowPayload.workflows || []).filter(function(w) {
+      return w.origin === 'workflow' && w.schedule;
+    });
+
+    var totalScheduled = cronJobsData.length + scheduledWorkflowData.length;
     var navCount = document.getElementById('nav-cron-count');
-    if (navCount) navCount.textContent = cronJobsData.length;
+    if (navCount) navCount.textContent = totalScheduled;
     var tabCount = document.getElementById('build-tab-cron-count');
     if (tabCount) {
-      tabCount.textContent = cronJobsData.length;
-      tabCount.style.display = cronJobsData.length > 0 ? '' : 'none';
+      tabCount.textContent = totalScheduled;
+      tabCount.style.display = totalScheduled > 0 ? '' : 'none';
     }
 
     var panel = document.getElementById('panel-cron');
@@ -19033,20 +19608,22 @@ async function refreshCron() {
     var visibleJobs = currentPage === 'build' && activeBuildTab === 'crons'
       ? cronJobsData.filter(function(j) { return ownerFilter ? j.agent === ownerFilter : !j.agent; })
       : cronJobsData;
+    var visibleWorkflows = currentPage === 'build' && activeBuildTab === 'crons'
+      ? scheduledWorkflowData.filter(function(w) { return ownerFilter ? w.scope === 'agent' && w.agentSlug === ownerFilter : w.scope !== 'agent'; })
+      : scheduledWorkflowData;
 
-    if (visibleJobs.length === 0) {
-      var emptyLabel = ownerFilter ? 'No scheduled tasks for ' + ownerFilter : 'No global scheduled tasks';
-      panel.innerHTML = '<div class="task-grid"><div class="task-card-add" onclick="openCreateCronModal((document.getElementById(\\x27builder-owner\\x27)||{}).value||\\x27\\x27)">+ New Task</div></div>'
-        + '<div class="empty-state" style="padding:18px;color:var(--text-muted);font-size:13px">' + esc(emptyLabel) + '</div>';
-      return;
-    }
+    var noScheduledDefinitions = visibleJobs.length === 0 && visibleWorkflows.length === 0;
 
-    // Group jobs: main (no agent) first, then by agent slug
     var groups = {};
     for (const job of visibleJobs) {
       var g = job.agent || '_main';
       if (!groups[g]) groups[g] = [];
-      groups[g].push(job);
+      groups[g].push({ kind: 'cron', item: job });
+    }
+    for (const wf of visibleWorkflows) {
+      var wg = wf.agentSlug || '_main';
+      if (!groups[wg]) groups[wg] = [];
+      groups[wg].push({ kind: 'workflow', item: wf });
     }
     var groupOrder = Object.keys(groups).sort(function(a, b) {
       if (a === '_main') return -1;
@@ -19054,22 +19631,72 @@ async function refreshCron() {
       return a.localeCompare(b);
     });
 
-    let html = '';
+    let html = '<div style="display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:14px;flex-wrap:wrap">'
+      + '<div>'
+      + '<h3 style="font-size:15px;font-weight:600;color:var(--text-primary);margin:0 0 4px">Scheduled definitions</h3>'
+      + '<div style="font-size:12px;color:var(--text-muted)">Recurring jobs from CRON.md plus workflow files with a schedule. Runtime deep work is separated below.</div>'
+      + '</div>'
+      + '<div style="display:flex;gap:8px;flex-wrap:wrap">'
+      + '<span class="badge badge-blue">' + visibleJobs.length + ' cron</span>'
+      + '<span class="badge badge-purple">' + visibleWorkflows.length + ' workflows</span>'
+      + '</div>'
+      + '</div>';
+
+    if (noScheduledDefinitions) {
+      var emptyLabel = ownerFilter ? 'No scheduled definitions for ' + ownerFilter : 'No global scheduled definitions';
+      html += '<div class="task-grid"><div class="task-card-add" onclick="openCreateCronModal((document.getElementById(\\x27builder-owner\\x27)||{}).value||\\x27\\x27)">+ New Task</div></div>'
+        + '<div class="empty-state" style="padding:18px;color:var(--text-muted);font-size:13px">' + esc(emptyLabel) + '</div>';
+    }
+
     for (var gi = 0; gi < groupOrder.length; gi++) {
       var groupKey = groupOrder[gi];
-      var groupJobs = groups[groupKey];
+      var groupItems = groups[groupKey];
       var groupLabel = groupKey === '_main' ? 'Clementine' : groupKey.replace(/-/g, ' ').replace(/\\b\\w/g, function(c) { return c.toUpperCase(); });
 
       if (groupOrder.length > 1) {
-        var enabledCount = groupJobs.filter(function(j) { return j.enabled !== false; }).length;
+        var enabledCount = groupItems.filter(function(entry) { return entry.item.enabled !== false; }).length;
         html += '<div style="display:flex;align-items:center;gap:10px;margin:' + (gi > 0 ? '28px' : '0') + ' 0 12px">'
           + '<h3 style="font-size:15px;font-weight:600;color:var(--text-primary);margin:0">' + esc(groupLabel) + '</h3>'
-          + '<span style="font-size:12px;color:var(--text-muted)">' + enabledCount + ' of ' + groupJobs.length + ' active</span>'
+          + '<span style="font-size:12px;color:var(--text-muted)">' + enabledCount + ' of ' + groupItems.length + ' active</span>'
           + '</div>';
       }
 
       html += '<div class="task-grid">';
-      for (const job of groupJobs) {
+      for (const entry of groupItems) {
+        if (entry.kind === 'workflow') {
+          var wf = entry.item;
+          var wfEnabled = wf.enabled !== false;
+          var wfCardCls = 'task-card' + (wfEnabled ? '' : ' disabled');
+          var wfDesc = describeCron(wf.schedule || '');
+          var wfSchedHtml = wfDesc
+            ? esc(wfDesc) + ' <code>' + esc(wf.schedule) + '</code>'
+            : '<code style="color:var(--accent)">' + esc(wf.schedule || '') + '</code>';
+          var wfBadges = '';
+          if (wf.agentSlug) wfBadges += '<span class="badge badge-orange">' + esc(wf.agentSlug) + '</span>';
+          wfBadges += '<span class="badge badge-purple">workflow</span>';
+          wfBadges += '<span class="badge badge-gray">' + (wf.stepCount || 0) + ' steps</span>';
+          wfBadges += buildUsageBadge(wf.name);
+          wfBadges += '<span class="badge ' + (wfEnabled ? 'badge-green' : 'badge-gray') + '">' + (wfEnabled ? 'Enabled' : 'Disabled') + '</span>';
+          var wfId = jsStr(wf.id);
+          var wfName = jsStr(wf.name);
+          html += '<div class="' + wfCardCls + '">'
+            + '<div class="task-card-header">'
+            + '<strong>' + esc(wf.name) + '</strong>'
+            + '<label class="toggle-switch"><input type="checkbox"' + (wfEnabled ? ' checked' : '') + ' onchange="toggleScheduledWorkflow(\\x27' + wfId + '\\x27)"><span class="toggle-slider"></span></label>'
+            + '</div>'
+            + '<div class="task-card-schedule">' + wfSchedHtml + '</div>'
+            + '<div class="task-card-prompt">' + esc(wf.description || ((wf.stepCount || 0) + ' step scheduled workflow')) + '</div>'
+            + '<div class="task-card-status"><span style="color:var(--text-muted)">Workflow definition</span></div>'
+            + '<div class="task-card-badges">' + wfBadges + '</div>'
+            + '<div class="task-card-actions">'
+            + '<button class="btn-sm btn-success" onclick="runScheduledWorkflow(\\x27' + wfId + '\\x27)">Run Now</button>'
+            + '<button class="btn-sm" onclick="openScheduledWorkflow(\\x27' + wfId + '\\x27)">Open</button>'
+            + '<button class="btn-sm btn-danger" onclick="confirmDeleteScheduledWorkflow(\\x27' + wfId + '\\x27,\\x27' + wfName + '\\x27)">Del</button>'
+            + '</div></div>';
+          continue;
+        }
+
+        var job = entry.item;
         var enabled = job.enabled !== false;
         var cardCls = 'task-card' + (enabled ? '' : ' disabled');
         if (job.recentRuns && job.recentRuns.length > 0 && job.recentRuns[0].startedAt && !job.recentRuns[0].finishedAt) {
@@ -19094,16 +19721,17 @@ async function refreshCron() {
         if (job.mode === 'unleashed') badgesHtml += '<span class="badge badge-purple">unleashed</span>';
         if (job.after) badgesHtml += '<span class="badge badge-yellow" title="Triggered after ' + esc(job.after) + '">\\u2192 ' + esc(job.after) + '</span>';
         if (job.max_retries != null) badgesHtml += '<span class="badge badge-gray">' + job.max_retries + ' retries</span>';
+        badgesHtml += buildUsageBadge(job.name);
         badgesHtml += '<span class="badge ' + (enabled ? 'badge-green' : 'badge-gray') + '">' + (enabled ? 'Enabled' : 'Disabled') + '</span>';
 
-        var safeName = esc(job.name).replace(/'/g, '');
+        var safeName = jsStr(job.name);
         // Display name without agent prefix for cleaner cards
         var displayName = job.agent ? job.name.replace(job.agent + ':', '') : job.name;
 
         html += '<div class="' + cardCls + '">'
           + '<div class="task-card-header">'
           + '<strong>' + esc(displayName) + '</strong>'
-          + '<label class="toggle-switch"><input type="checkbox"' + (enabled ? ' checked' : '') + ' onchange="toggleCronJob(\\x27' + esc(job.name) + '\\x27)"><span class="toggle-slider"></span></label>'
+          + '<label class="toggle-switch"><input type="checkbox"' + (enabled ? ' checked' : '') + ' onchange="toggleCronJob(\\x27' + safeName + '\\x27)"><span class="toggle-slider"></span></label>'
           + '</div>'
           + '<div class="task-card-schedule">' + schedHtml + '</div>'
           + '<div class="task-card-prompt">' + esc(job.prompt || '') + '</div>'
@@ -19116,50 +19744,72 @@ async function refreshCron() {
           + '<button class="btn-sm btn-danger" onclick="confirmDeleteCron(\\x27' + safeName + '\\x27)">Del</button>'
           + '</div></div>';
       }
-      // Add "new task" card only to the main group
-      if (groupKey === '_main') {
+      if (groupKey === '_main' || ownerFilter === groupKey) {
         html += '<div class="task-card-add" onclick="openCreateCronModal((document.getElementById(\\x27builder-owner\\x27)||{}).value||\\x27\\x27)">+ New Task</div>';
       }
       html += '</div>';
     }
 
-    // Fetch unleashed task status and append if any exist
-    try {
-      var ur = await apiFetch('/api/unleashed');
-      var ud = await ur.json();
-      var tasks = ud.tasks || [];
-      if (tasks.length > 0) {
-        html += '<h3 style="margin:24px 0 12px;font-size:14px;color:var(--text-secondary)">Unleashed Tasks</h3>';
-        html += '<table><tr><th>Task</th><th>Status</th><th>Phase</th><th>Duration</th><th style="width:80px"></th></tr>';
-        for (var ti = 0; ti < tasks.length; ti++) {
-          var t = tasks[ti];
-          var statusColors = { running: 'badge-blue', completed: 'badge-green', cancelled: 'badge-gray', timeout: 'badge-yellow', error: 'badge-red', max_phases: 'badge-yellow' };
-          var cls = statusColors[t.status] || 'badge-gray';
-          var badge = '<span class="badge ' + cls + '">' + esc(t.status) + '</span>';
-          var duration = '';
-          if (t.startedAt) {
-            var endTime = t.finishedAt ? new Date(t.finishedAt).getTime() : Date.now();
-            var mins = Math.round((endTime - new Date(t.startedAt).getTime()) / 60000);
-            duration = mins < 60 ? mins + 'm' : Math.floor(mins/60) + 'h ' + (mins%60) + 'm';
-          }
-          var cancelBtn = t.status === 'running'
-            ? '<button class="btn-sm btn-danger" onclick="cancelUnleashed(\\x27' + esc(t.jobName) + '\\x27)">Cancel</button> '
-            : '';
-          var detailBtn = '<button class="btn-sm" onclick="toggleUnleashedDetail(\\x27' + esc(t.jobName) + '\\x27, this)">Details</button>';
-          html += '<tr>'
-            + '<td><strong>' + esc(t.jobName) + '</strong>'
-            + (t.lastPhaseOutputPreview ? '<br><span style="font-size:11px;color:var(--text-muted)">' + esc(t.lastPhaseOutputPreview.slice(0,80)) + '...</span>' : '')
-            + '</td>'
-            + '<td>' + badge + '</td>'
-            + '<td>' + (t.phase || 0) + '</td>'
-            + '<td>' + esc(duration) + (t.maxHours ? ' / ' + t.maxHours + 'h max' : '') + '</td>'
-            + '<td>' + cancelBtn + detailBtn + '</td>'
-            + '</tr>'
-            + '<tr class="unleashed-detail-row" id="unleashed-detail-' + esc(t.jobName).replace(/[^a-zA-Z0-9_-]/g,'_') + '" style="display:none"><td colspan="5"></td></tr>';
-        }
-        html += '</table>';
+    var activeBackground = (Array.isArray(backgroundPayload) ? backgroundPayload : []).filter(function(t) {
+      if (t.status !== 'pending' && t.status !== 'running') return false;
+      return ownerFilter ? t.fromAgent === ownerFilter : (!t.fromAgent || t.fromAgent === 'clementine');
+    });
+    var activeUnleashed = (unleashedPayload.tasks || []).filter(function(t) {
+      var status = String(t.status || '');
+      var jobName = String(t.jobName || '');
+      if (status !== 'pending' && status !== 'running') return false;
+      if (jobName.indexOf('bg:') === 0) return false;
+      return ownerFilter ? jobName.indexOf(ownerFilter + ':') === 0 : jobName.indexOf(':') === -1;
+    });
+
+    var activeTotal = activeBackground.length + activeUnleashed.length;
+    if (activeTotal > 0) {
+      html += '<div style="display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin:28px 0 12px;flex-wrap:wrap">'
+        + '<div>'
+        + '<h3 style="font-size:15px;font-weight:600;color:var(--text-primary);margin:0 0 4px">Running now</h3>'
+        + '<div style="font-size:12px;color:var(--text-muted)">Active deep/background work only. Completed history is intentionally hidden here to keep token-cost risk readable.</div>'
+        + '</div>'
+        + '<span class="badge badge-blue">' + activeTotal + ' active</span>'
+        + '</div><div class="task-grid">';
+
+      var shown = 0;
+      for (var bi = 0; bi < activeBackground.length && shown < 8; bi++, shown++) {
+        var bg = activeBackground[bi];
+        var bgRunningMs = bg.runningForMs || (bg.startedAt ? Date.now() - new Date(bg.startedAt).getTime() : 0);
+        var bgStatusBadge = '<span class="badge ' + (bg.status === 'running' ? 'badge-blue' : 'badge-yellow') + '">' + esc(bg.status) + '</span>';
+        html += '<div class="task-card running">'
+          + '<div class="task-card-header"><strong>Deep task ' + esc(bg.id) + '</strong>' + bgStatusBadge + '</div>'
+          + '<div class="task-card-schedule">' + esc(bg.fromAgent || 'clementine') + ' · max ' + esc(bg.maxMinutes || '') + 'm' + (bg.status === 'running' ? ' · running ' + esc(durationLabel(bgRunningMs)) : '') + '</div>'
+          + '<div class="task-card-prompt">' + esc(bg.prompt || '') + '</div>'
+          + '<div class="task-card-status">Created ' + esc(timeAgo(bg.createdAt)) + '</div>'
+          + '<div class="task-card-badges"><span class="badge badge-purple">background</span>' + buildUsageBadge('bg:' + bg.id) + '</div>'
+          + '<div class="task-card-actions">'
+          + '<button class="btn-sm btn-danger" onclick="cancelBackgroundTask(\\x27' + jsStr(bg.id) + '\\x27)">Cancel</button>'
+          + '</div></div>';
       }
-    } catch(ue) { /* unleashed status is optional */ }
+
+      for (var ui = 0; ui < activeUnleashed.length && shown < 8; ui++, shown++) {
+        var ut = activeUnleashed[ui];
+        var uDuration = '';
+        if (ut.startedAt) {
+          var uEnd = ut.finishedAt ? new Date(ut.finishedAt).getTime() : Date.now();
+          uDuration = durationLabel(uEnd - new Date(ut.startedAt).getTime());
+        }
+        html += '<div class="task-card running">'
+          + '<div class="task-card-header"><strong>' + esc(ut.jobName || 'unleashed task') + '</strong><span class="badge badge-blue">' + esc(ut.status || 'running') + '</span></div>'
+          + '<div class="task-card-schedule">Phase ' + esc(ut.phase || 0) + (uDuration ? ' · running ' + esc(uDuration) : '') + (ut.maxHours ? ' / ' + esc(ut.maxHours) + 'h cap' : '') + '</div>'
+          + '<div class="task-card-prompt">' + esc((ut.lastPhaseOutputPreview || '').slice(0, 180)) + '</div>'
+          + '<div class="task-card-status">Runtime task spawned by a scheduled definition</div>'
+          + '<div class="task-card-badges"><span class="badge badge-purple">unleashed</span>' + buildUsageBadge(ut.jobName || '') + '</div>'
+          + '<div class="task-card-actions">'
+          + '<button class="btn-sm btn-danger" onclick="cancelUnleashed(\\x27' + jsStr(ut.jobName || '') + '\\x27)">Cancel</button>'
+          + '</div></div>';
+      }
+      if (activeTotal > shown) {
+        html += '<div class="empty-state" style="padding:18px;color:var(--text-muted);font-size:13px">Showing ' + shown + ' of ' + activeTotal + ' active tasks. Use the Owner filter to narrow this list.</div>';
+      }
+      html += '</div>';
+    }
 
     panel.innerHTML = html;
 
@@ -19299,6 +19949,7 @@ async function cancelUnleashed(jobName) {
   if (!confirm('Cancel unleashed task "' + jobName + '"?')) return;
   try {
     await apiPost('/api/unleashed/' + encodeURIComponent(jobName) + '/cancel');
+    if (typeof refreshUnleashed === 'function') refreshUnleashed();
     setTimeout(refreshCron, 1000);
   } catch(e) { toast('Failed to cancel: ' + e, 'error'); }
 }
@@ -22126,7 +22777,7 @@ function updateBuilderMode() {
     if (validateBtn) validateBtn.style.display = '';
     if (dryrunBtn) dryrunBtn.style.display = '';
     if (testBtn) testBtn.style.display = '';
-    if (paneTitle) paneTitle.textContent = (type === 'cron' ? 'Scheduled Tasks' : 'Workflows');
+    if (paneTitle) paneTitle.textContent = (type === 'cron' ? 'Scheduled Tasks' : 'Workflow Builder');
     refreshBuilderCanvasPicker(type);
   } else {
     if (preview) preview.style.display = '';
@@ -24860,6 +25511,17 @@ async function refreshHomeDigest() {
       savedEl.textContent = minutes >= 60 ? (minutes / 60).toFixed(1) + 'h' : (minutes + 'm');
       savedEl.classList.toggle('muted', minutes === 0);
     }
+    var tokenEl = document.getElementById('kpi-tokens-7d');
+    if (tokenEl) {
+      var token7d = k.tokens7d || 0;
+      tokenEl.textContent = formatTokens(token7d);
+      tokenEl.classList.toggle('muted', token7d === 0);
+      var tokenTile = tokenEl.closest('.kpi-tile');
+      if (tokenTile) {
+        tokenTile.classList.toggle('alert', token7d >= 1000000);
+        tokenTile.classList.toggle('muted', token7d === 0);
+      }
+    }
     setKpi('kpi-approvals', k.pendingApprovals || 0, (k.pendingApprovals || 0) > 0);
     setKpi('kpi-overdue', k.overdueTasks || 0, (k.overdueTasks || 0) > 0);
 
@@ -25051,7 +25713,7 @@ async function refreshHomeRail() {
     }
     if (ae) {
       ae.innerHTML = active.map(function(t) {
-        return '<div class="rail-row clickable-row" onclick="navigateTo(\\x27build\\x27,{tab:\\x27workflows\\x27})"><span class="label">' + esc(t.name) + '</span><span class="meta">' + esc(t.phase || '') + '</span></div>';
+        return '<div class="rail-row clickable-row" onclick="navigateTo(\\x27build\\x27,{tab:\\x27crons\\x27})"><span class="label">' + esc(t.name) + '</span><span class="meta">' + esc(t.phase || '') + '</span></div>';
       }).join('');
     }
     _setRailEmpty('rail-active', active.length === 0);

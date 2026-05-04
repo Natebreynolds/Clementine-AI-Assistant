@@ -36,4 +36,24 @@ describe('gateway local approval replies', () => {
 
     await expect(gateway.handleLocalTurn('discord:user:123', 'Perfect')).resolves.toBe('Got it.');
   });
+
+  it('answers agent-member background status check-ins locally', async () => {
+    const gateway = makeGateway(false) as any;
+    gateway.sessions = new Map();
+    gateway.describeSessionStatus = vi.fn(() => 'status ok');
+
+    await expect(gateway.handleLocalTurn('discord:member-dm:badando:user-1', "How's it coming along?"))
+      .resolves.toBe('status ok');
+    expect(gateway.describeSessionStatus).toHaveBeenCalledWith('discord:member-dm:badando:user-1');
+  });
+
+  it('routes cancel replies through background cancellation before stopping chat', async () => {
+    const gateway = makeGateway(false) as any;
+    gateway.cancelActiveBackgroundTask = vi.fn(() => 'Cancelled background task bg-test.');
+    gateway.stopSession = vi.fn(() => false);
+
+    await expect(gateway.handleLocalTurn('discord:member-dm:badando:user-1', 'cancel'))
+      .resolves.toBe('Cancelled background task bg-test.');
+    expect(gateway.cancelActiveBackgroundTask).toHaveBeenCalledWith('discord:member-dm:badando:user-1', 'cancel');
+  });
 });
