@@ -65,6 +65,42 @@ import { CronRunLog, logToDailyNote, todayISO } from './cron-scheduler.js';
 const logger = pino({ name: 'clementine.heartbeat' });
 const PROACTIVE_DECISION_DEDUPE_MS = 24 * 60 * 60 * 1000;
 
+export function buildInsightCheckCronCall(prompt: string): {
+  jobName: 'insight-check';
+  jobPrompt: string;
+  tier: 1;
+  maxTurns: 1;
+  model: 'haiku';
+  opts: { disableAllTools: true };
+} {
+  return {
+    jobName: 'insight-check',
+    jobPrompt: prompt,
+    tier: 1,
+    maxTurns: 1,
+    model: 'haiku',
+    opts: { disableAllTools: true },
+  };
+}
+
+export function buildConsolidationCronCall(prompt: string): {
+  jobName: 'consolidation-llm';
+  jobPrompt: string;
+  tier: 1;
+  maxTurns: 1;
+  model: 'haiku';
+  opts: { disableAllTools: true };
+} {
+  return {
+    jobName: 'consolidation-llm',
+    jobPrompt: prompt,
+    tier: 1,
+    maxTurns: 1,
+    model: 'haiku',
+    opts: { disableAllTools: true },
+  };
+}
+
 // ── HeartbeatScheduler ────────────────────────────────────────────────
 
 export class HeartbeatScheduler {
@@ -342,12 +378,20 @@ export class HeartbeatScheduler {
 
         // LLM callback for summarization/principle extraction
         const llmCall = async (prompt: string): Promise<string> => {
+          const cronCall = buildConsolidationCronCall(prompt);
           const result = await this.gateway.handleCronJob(
-            'consolidation-llm',
-            prompt,
-            1,
-            1,
-            'haiku',
+            cronCall.jobName,
+            cronCall.jobPrompt,
+            cronCall.tier,
+            cronCall.maxTurns,
+            cronCall.model,
+            undefined,
+            'standard',
+            undefined,
+            undefined,
+            undefined,
+            undefined,
+            cronCall.opts,
           );
           return result || '';
         };
@@ -1069,21 +1113,26 @@ export class HeartbeatScheduler {
     const prompt = buildInsightPrompt(signals);
     if (!prompt) return;
 
-    // Run lightweight LLM call via gateway. Log success AND failure to the
-    // cron run log so the failure monitor can see hourly breakage.
-    // maxTurns bumped 1 → 3 because the agent needs to fan out ~4 parallel
-    // tool calls (activity_history, outlook_inbox, goal_list, task_list)
-    // before composing its rating — at 1 turn it always crashes with
-    // "Reached maximum number of turns".
+    // Run a no-tool classifier call via gateway. gatherInsightSignals()
+    // already assembled the local signal list; attaching MCP schemas here can
+    // make the prompt too large before the model ever evaluates urgency.
     const icStartedAt = new Date();
     let response: string | null = null;
     try {
+      const cronCall = buildInsightCheckCronCall(prompt);
       response = await this.gateway.handleCronJob(
-        'insight-check',
-        prompt,
-        1,   // tier 1
-        3,   // max 3 turns (parallel tool fan-out + synthesis)
-        'haiku',
+        cronCall.jobName,
+        cronCall.jobPrompt,
+        cronCall.tier,
+        cronCall.maxTurns,
+        cronCall.model,
+        undefined,
+        'standard',
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        cronCall.opts,
       );
       this.runLog.append({
         jobName: 'insight-check',

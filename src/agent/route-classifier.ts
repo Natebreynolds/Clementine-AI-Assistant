@@ -113,6 +113,31 @@ export function isDirectImperative(userMessage: string): { match: boolean; patte
   return { match: false };
 }
 
+export function hasNoDelegationInstruction(userMessage: string): boolean {
+  return /\b(don't|dont|do not|don't you|please don't|please dont)\s+(delegate|route|send|pass|hand ?off|handoff)\b/i.test(userMessage)
+    || /\b(no|without)\s+(delegating|routing|sending|passing|handing ?off|handoff)\b/i.test(userMessage)
+    || /\bkeep (this|that|it)?\s*(with )?(clementine|you|yourself)\b/i.test(userMessage);
+}
+
+function isExplicitDelegationToAgent(text: string, firstName: string, slug: string): boolean {
+  const ident = `${firstName}|${slug}`;
+  const re = new RegExp(
+    `\\b(send|route|delegate|pass|hand\\s*off|handoff)\\b[\\s\\w']{0,40}?\\b(to\\s+)?(${ident})\\b`,
+    'i',
+  );
+  return re.test(text);
+}
+
+function isVocativeAgentAddress(text: string, firstName: string, slug: string): boolean {
+  const ident = `${firstName}|${slug}`;
+  const normalized = text.trim();
+  const openerRe = new RegExp(
+    `^(hey\\s+|hi\\s+|yo\\s+)?(${ident})(\\b|\\s*[,—-])`,
+    'i',
+  );
+  return openerRe.test(normalized);
+}
+
 /**
  * Decide whether the user is talking ABOUT an agent rather than to them.
  * The explicit-mention fast path otherwise routes a message like
@@ -133,10 +158,10 @@ export function isAskingAboutAgent(text: string, firstName: string, slug: string
   const possessiveRe = new RegExp(`\\b(${ident})('s|s')\\b`, 'i');
   if (possessiveRe.test(text)) return true;
   const askingRe = new RegExp(
-    `\\b(how|what|where|who|when|why|is|are|was|were|did|does|do|will|can|could|would|should|has|have|had|tell\\s+me|show\\s+me|let\\s+me\\s+know|any\\s+update|update\\s+on|status\\s+of|about)\\b[\\s\\w']{0,40}?\\b(${ident})\\b`,
+    `\\b(how|what|where|who|when|why|is|are|was|were|did|does|do|will|can|could|would|should|has|have|had|tell\\s+me|show\\s+me|let\\s+me\\s+know|any\\s+update|update\\s+on|status\\s+of|about|fix|check|review)\\b[\\s\\w']{0,80}?\\b(${ident})\\b`,
     'i',
   );
-  return askingRe.test(text);
+  return askingRe.test(text) || new RegExp(`\\b(for|about|on)\\s+(${ident})\\b`, 'i').test(text);
 }
 
 /**
@@ -282,6 +307,14 @@ export async function classifyRoute(
   const specialists = agents.filter(a => a.slug !== 'clementine');
   if (specialists.length === 0) return null;
 
+  if (hasNoDelegationInstruction(userMessage)) {
+    return {
+      targetAgent: 'clementine',
+      confidence: 0.95,
+      reasoning: 'User explicitly asked not to delegate or route this away from Clementine.',
+    };
+  }
+
   // Direct-imperative guardrail: user is instructing Clementine to act —
   // do not delegate, even if an agent is named.
   const imperative = isDirectImperative(userMessage);
@@ -301,7 +334,9 @@ export async function classifyRoute(
     if (firstName.length < 3) continue;
     const wordRe = new RegExp(`\\b(${firstName}|${a.slug})\\b`, 'i');
     if (!wordRe.test(trimmed)) continue;
-    if (isAskingAboutAgent(trimmed, firstName, a.slug)) {
+    const explicitDelegation = isExplicitDelegationToAgent(trimmed, firstName, a.slug);
+    const vocativeAddress = isVocativeAgentAddress(trimmed, firstName, a.slug);
+    if (!explicitDelegation && !vocativeAddress && isAskingAboutAgent(trimmed, firstName, a.slug)) {
       // The user is asking ABOUT the agent ("how is <agent> doing", "<agent>'s
       // tasks", "did <agent> handle that?") rather than addressing them. Fall
       // through to the LLM classifier, which has a system-prompt rule for
@@ -309,6 +344,7 @@ export async function classifyRoute(
       logger.debug({ slug: a.slug, trigger: 'meta-mention-bypass' }, 'Routing skipped — name appears as topic, not vocative');
       continue;
     }
+    if (!explicitDelegation && !vocativeAddress) continue;
     logger.debug({ slug: a.slug, trigger: 'explicit-mention' }, 'Fast-path routing decision');
     return {
       targetAgent: a.slug,

@@ -20,6 +20,7 @@ import type {
   Feedback,
   MemoryExtraction,
   SearchResult,
+  SessionLineageEntry,
   SessionSummary,
   SyncStats,
   TranscriptTurn,
@@ -205,6 +206,29 @@ export class MemoryStore {
       CREATE INDEX IF NOT EXISTS idx_transcripts_session ON transcripts(session_key);
       CREATE INDEX IF NOT EXISTS idx_transcripts_created ON transcripts(created_at);
 
+      CREATE VIRTUAL TABLE IF NOT EXISTS transcripts_fts USING fts5(
+        session_key, role, content, model, created_at,
+        content='transcripts', content_rowid='id',
+        tokenize='porter unicode61'
+      );
+
+      CREATE TRIGGER IF NOT EXISTS transcripts_ai AFTER INSERT ON transcripts BEGIN
+        INSERT INTO transcripts_fts(rowid, session_key, role, content, model, created_at)
+        VALUES (new.id, new.session_key, new.role, new.content, new.model, new.created_at);
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS transcripts_ad AFTER DELETE ON transcripts BEGIN
+        INSERT INTO transcripts_fts(transcripts_fts, rowid, session_key, role, content, model, created_at)
+        VALUES ('delete', old.id, old.session_key, old.role, old.content, old.model, old.created_at);
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS transcripts_au AFTER UPDATE ON transcripts BEGIN
+        INSERT INTO transcripts_fts(transcripts_fts, rowid, session_key, role, content, model, created_at)
+        VALUES ('delete', old.id, old.session_key, old.role, old.content, old.model, old.created_at);
+        INSERT INTO transcripts_fts(rowid, session_key, role, content, model, created_at)
+        VALUES (new.id, new.session_key, new.role, new.content, new.model, new.created_at);
+      END;
+
       CREATE TABLE IF NOT EXISTS session_summaries (
         id INTEGER PRIMARY KEY,
         session_key TEXT NOT NULL,
@@ -215,7 +239,32 @@ export class MemoryStore {
 
       CREATE INDEX IF NOT EXISTS idx_session_summaries_key ON session_summaries(session_key);
       CREATE INDEX IF NOT EXISTS idx_session_summaries_created ON session_summaries(created_at);
+
+      CREATE TABLE IF NOT EXISTS session_lineage (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_key TEXT NOT NULL,
+        parent_session_id TEXT,
+        child_session_id TEXT,
+        reason TEXT NOT NULL,
+        summary TEXT NOT NULL,
+        exchange_count INTEGER DEFAULT 0,
+        created_at TEXT DEFAULT (datetime('now'))
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_session_lineage_key ON session_lineage(session_key, created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_session_lineage_parent ON session_lineage(parent_session_id);
     `);
+
+    try {
+      this.conn.exec(`
+        INSERT INTO transcripts_fts(rowid, session_key, role, content, model, created_at)
+        SELECT id, session_key, role, content, model, created_at
+        FROM transcripts
+        WHERE id NOT IN (SELECT rowid FROM transcripts_fts)
+      `);
+    } catch {
+      // FTS backfill is best-effort; triggers keep new rows indexed.
+    }
 
     // ── Migrations ────────────────────────────────────────────────
     // Add salience column to chunks
@@ -3186,7 +3235,7 @@ export class MemoryStore {
     limit: number = 20,
     sessionKey: string = '',
   ): TranscriptTurn[] {
-    const queryLower = `%${query.toLowerCase()}%`;
+    const sanitized = MemoryStore.sanitizeFtsQuery(query);
     let rows: Array<{
       session_key: string;
       role: string;
@@ -3195,6 +3244,34 @@ export class MemoryStore {
       created_at: string;
     }>;
 
+    if (sanitized) {
+      try {
+        const params: unknown[] = [sanitized];
+        let sql = `SELECT t.session_key, t.role, t.content, t.model, t.created_at
+           FROM transcripts_fts f
+           JOIN transcripts t ON t.id = f.rowid
+           WHERE transcripts_fts MATCH ?`;
+        if (sessionKey) {
+          sql += ' AND t.session_key = ?';
+          params.push(sessionKey);
+        }
+        sql += ' ORDER BY t.created_at DESC, t.id DESC LIMIT ?';
+        params.push(limit);
+        rows = this.conn.prepare(sql).all(...params) as typeof rows;
+
+        return rows.map((row) => ({
+          sessionKey: row.session_key,
+          role: row.role,
+          content: row.content.slice(0, 2000),
+          model: row.model,
+          createdAt: row.created_at,
+        }));
+      } catch {
+        // Fall back to LIKE for malformed FTS queries or legacy SQLite builds.
+      }
+    }
+
+    const queryLower = `%${query.toLowerCase()}%`;
     if (sessionKey) {
       rows = this.conn
         .prepare(
@@ -3259,6 +3336,87 @@ export class MemoryStore {
 
     return rows.map((row) => ({
       sessionKey: row.session_key,
+      summary: row.summary,
+      exchangeCount: row.exchange_count,
+      createdAt: row.created_at,
+    }));
+  }
+
+  /**
+   * Get recent session summaries scoped to one conversation.
+   */
+  getRecentSummariesForSession(sessionKey: string, limit: number = 3): SessionSummary[] {
+    const rows = this.conn
+      .prepare(
+        `SELECT session_key, summary, exchange_count, created_at
+         FROM session_summaries
+         WHERE session_key = ?
+         ORDER BY created_at DESC
+         LIMIT ?`,
+      )
+      .all(sessionKey, limit) as Array<{
+      session_key: string;
+      summary: string;
+      exchange_count: number;
+      created_at: string;
+    }>;
+
+    return rows.map((row) => ({
+      sessionKey: row.session_key,
+      summary: row.summary,
+      exchangeCount: row.exchange_count,
+      createdAt: row.created_at,
+    }));
+  }
+
+  recordSessionLineage(input: {
+    sessionKey: string;
+    parentSessionId?: string | null;
+    childSessionId?: string | null;
+    reason: string;
+    summary: string;
+    exchangeCount?: number;
+  }): void {
+    this.conn
+      .prepare(
+        `INSERT INTO session_lineage
+           (session_key, parent_session_id, child_session_id, reason, summary, exchange_count)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        input.sessionKey,
+        input.parentSessionId ?? null,
+        input.childSessionId ?? null,
+        input.reason,
+        input.summary,
+        input.exchangeCount ?? 0,
+      );
+  }
+
+  getSessionLineage(sessionKey: string, limit: number = 5): SessionLineageEntry[] {
+    const rows = this.conn
+      .prepare(
+        `SELECT session_key, parent_session_id, child_session_id, reason, summary, exchange_count, created_at
+         FROM session_lineage
+         WHERE session_key = ?
+         ORDER BY created_at DESC
+         LIMIT ?`,
+      )
+      .all(sessionKey, limit) as Array<{
+      session_key: string;
+      parent_session_id: string | null;
+      child_session_id: string | null;
+      reason: string;
+      summary: string;
+      exchange_count: number;
+      created_at: string;
+    }>;
+
+    return rows.map((row) => ({
+      sessionKey: row.session_key,
+      parentSessionId: row.parent_session_id,
+      childSessionId: row.child_session_id,
+      reason: row.reason,
       summary: row.summary,
       exchangeCount: row.exchange_count,
       createdAt: row.created_at,
@@ -5862,14 +6020,18 @@ export class MemoryStore {
   markConsolidated(chunkIds: number[]): void {
     if (chunkIds.length === 0) return;
 
-    const placeholders = chunkIds.map(() => '?').join(',');
-    this.conn
-      .prepare(
-        `UPDATE chunks
-         SET consolidated = 1, salience = MAX(salience - 0.3, 0.0)
-         WHERE id IN (${placeholders})`,
-      )
-      .run(...chunkIds);
+    const batchSize = 500;
+    for (let i = 0; i < chunkIds.length; i += batchSize) {
+      const batch = chunkIds.slice(i, i + batchSize);
+      const placeholders = batch.map(() => '?').join(',');
+      this.conn
+        .prepare(
+          `UPDATE chunks
+           SET consolidated = 1, salience = MAX(salience - 0.3, 0.0)
+           WHERE id IN (${placeholders})`,
+        )
+        .run(...batch);
+    }
   }
 
   // ── Autonomy log ───────────────────────────────────────────────────

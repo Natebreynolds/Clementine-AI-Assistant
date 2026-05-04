@@ -418,6 +418,16 @@ export interface SessionSummary {
   createdAt: string;
 }
 
+export interface SessionLineageEntry {
+  sessionKey: string;
+  parentSessionId: string | null;
+  childSessionId: string | null;
+  reason: string;
+  summary: string;
+  exchangeCount: number;
+  createdAt: string;
+}
+
 export interface WikilinkConnection {
   direction: 'incoming' | 'outgoing';
   file: string;

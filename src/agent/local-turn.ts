@@ -1,5 +1,6 @@
 import type { ClementineJson } from '../config/clementine-json.js';
 import { isStandaloneGreeting } from './turn-policy.js';
+import { normalizeToolsetName, type ToolsetName } from './toolsets.js';
 
 export type ProactivityMode = 'quiet' | 'balanced' | 'proactive' | 'operator';
 export type ResponseStyle = 'concise' | 'balanced' | 'detailed';
@@ -19,7 +20,13 @@ export type LocalTurnIntent =
   | { kind: 'greeting' }
   | { kind: 'stop' }
   | { kind: 'status' }
+  | { kind: 'last_action' }
+  | { kind: 'compress_context' }
+  | { kind: 'debug_status' }
+  | { kind: 'toolset'; toolset: ToolsetName }
   | { kind: 'preference_update'; updates: AssistantExperienceUpdate; summary: string };
+
+export type ApprovalReply = true | false | 'always' | null;
 
 function normalize(text: string): string {
   return text
@@ -46,10 +53,52 @@ export function isStatusRequest(text: string): boolean {
   return /^(status|task status|deep status|progress|what'?s happening|what'?s going on|what are you doing|are you working|anything running|what'?s running|background status|check status|where are we)$/.test(n);
 }
 
+export function isLastActionRequest(text: string): boolean {
+  const n = normalize(text);
+  if (wordCount(n) > 10) return false;
+  return /^(last action|last turn|what happened last turn|what did you do|did you do it|did that actually run|did you actually do it|why didn'?t you do it|why did that not run|what happened)$/.test(n);
+}
+
+export function isCompressContextRequest(text: string): boolean {
+  const n = normalize(text);
+  if (wordCount(n) > 8) return false;
+  return /^(compress context|compact context|compress session|compact session|context compact|context compress|save and reset context|reset context but keep memory)$/.test(n);
+}
+
+export function isDebugStatusRequest(text: string): boolean {
+  const n = normalize(text);
+  if (wordCount(n) > 6) return false;
+  return /^(debug|debug status|session debug|agent debug|diagnostics|show diagnostics)$/.test(n);
+}
+
+function parseToolsetRequest(text: string): ToolsetName | null {
+  const n = normalize(text);
+  const match = n.match(/^(?:set |switch |use |enable )?(?:toolset|tool set|tools mode|tool mode)(?: to|:)? ([a-z _-]+)$/)
+    ?? n.match(/^toolset ([a-z _-]+)$/);
+  return match ? normalizeToolsetName(match[1]) : null;
+}
+
 export function isTinyAcknowledgment(text: string): boolean {
   const n = normalize(text);
   if (wordCount(n) > 4) return false;
   return /^(thanks|thank you|thx|ty|nice|great|perfect|awesome|cool|ok|okay|sounds good|got it|makes sense|love it)$/.test(n);
+}
+
+export function detectApprovalReply(text: string): ApprovalReply {
+  const n = normalize(text);
+  if (wordCount(n) > 4) return null;
+  if (/^(always)$/.test(n)) return 'always';
+  if (/^(no|nope|deny|denied|skip)$/.test(n)) return false;
+  if (/^(yes|y|yep|yeah|ok|okay|approve|approved|go|go ahead|do it|send it|perfect|sounds good|looks good|lgtm)$/.test(n)) {
+    return true;
+  }
+  return null;
+}
+
+export function looksLikeApprovalPrompt(text: string): boolean {
+  const n = normalize(text);
+  return /\b(good to go|okay to send|ok to send|ready to send|should i send|want me to send|approve|confirm|fire it off)\b/.test(n)
+    || /\b(send|email|message|post|publish|delete|change|update|run|execute)\b[\s\S]{0,120}\?$/i.test(text.trim());
 }
 
 function parseProactivity(text: string): ProactivityMode | undefined {
@@ -84,6 +133,11 @@ function parseAutonomy(text: string): AutonomyMode | undefined {
 export function detectLocalTurn(text: string): LocalTurnIntent {
   if (isStopRequest(text)) return { kind: 'stop' };
   if (isStatusRequest(text)) return { kind: 'status' };
+  if (isLastActionRequest(text)) return { kind: 'last_action' };
+  if (isCompressContextRequest(text)) return { kind: 'compress_context' };
+  if (isDebugStatusRequest(text)) return { kind: 'debug_status' };
+  const toolset = parseToolsetRequest(text);
+  if (toolset) return { kind: 'toolset', toolset };
   if (isStandaloneGreeting(text)) return { kind: 'greeting' };
   if (isTinyAcknowledgment(text)) return { kind: 'ack' };
 

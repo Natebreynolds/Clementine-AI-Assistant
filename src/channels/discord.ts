@@ -55,6 +55,8 @@ import type { HeartbeatScheduler, CronScheduler } from '../gateway/heartbeat.js'
 import type { NotificationDispatcher } from '../gateway/notifications.js';
 import type { Gateway } from '../gateway/router.js';
 import { findProjectByName, getLinkedProjects } from '../agent/assistant.js';
+import { detectApprovalReply } from '../agent/local-turn.js';
+import { normalizeToolsetName } from '../agent/toolsets.js';
 import * as cronParser from 'cron-parser';
 
 const logger = pino({ name: 'clementine.discord' });
@@ -90,6 +92,19 @@ const slashCommands = [
     .addStringOption(o => o.setName('job').setDescription('Job name (for run/enable/disable)').setAutocomplete(true)),
   new SlashCommandBuilder().setName('heartbeat').setDescription('Run heartbeat check manually'),
   new SlashCommandBuilder().setName('tools').setDescription('List available MCP tools'),
+  new SlashCommandBuilder().setName('toolset').setDescription('Set this chat tool mode')
+    .addStringOption(o => o.setName('mode').setDescription('Tool mode').setRequired(true)
+      .addChoices(
+        { name: 'Auto', value: 'auto' },
+        { name: 'Safe', value: 'safe' },
+        { name: 'Diagnostic', value: 'diagnostic' },
+        { name: 'Communications', value: 'communications' },
+        { name: 'Memory', value: 'memory' },
+        { name: 'Full', value: 'full' },
+      )),
+  new SlashCommandBuilder().setName('compress').setDescription('Compact this conversation context into memory'),
+  new SlashCommandBuilder().setName('usage').setDescription('Show recent turn/tool usage for this chat'),
+  new SlashCommandBuilder().setName('debug').setDescription('Show session diagnostics for this chat'),
   new SlashCommandBuilder().setName('project').setDescription('Set active project context')
     .addStringOption(o => o.setName('action').setDescription('Action').setRequired(true)
       .addChoices(
@@ -367,6 +382,8 @@ function handleHelp(): string {
     '`!self-improve run|status|history|pending|apply|deny` \u2014 Self-improvement',
     '`!team setup|list|status|messages|topology` \u2014 Manage agent team',
     '`!status [job]` \u2014 Check unleashed task progress',
+    '`/toolset` \u2014 Set tool mode \u00b7 `/compress` \u2014 Compact context \u00b7 `/usage` \u2014 Usage snapshot',
+    '`/debug` \u2014 Session diagnostics',
     '`!dashboard` \u2014 Send a fresh system status embed',
     '`!heartbeat` \u2014 Run heartbeat \u00b7 `!tools` \u2014 List tools \u00b7 `!clear` \u2014 Reset',
     '`!stop` \u2014 Interrupt current response',
@@ -1251,15 +1268,12 @@ export async function startDiscord(
     // ── Approval responses (DM only) ────────────────────────────────
 
     if (isDm) {
-      const lower = text.toLowerCase();
-      if (['yes', 'no', 'approve', 'deny', 'go', 'skip', 'always'].includes(lower)) {
+      const approvalReply = detectApprovalReply(text);
+      if (approvalReply !== null) {
         const approvals = gateway.getPendingApprovals();
         if (approvals.length > 0) {
-          // Pass 'always' as a string so the check-in gate can persist the channel
-          const result: boolean | string = lower === 'always' ? 'always' :
-            (lower === 'yes' || lower === 'approve' || lower === 'go');
-          gateway.resolveApproval(approvals[approvals.length - 1], result);
-          await message.react(lower === 'no' || lower === 'deny' || lower === 'skip' ? '\u274c' : '\u2705');
+          gateway.resolveApproval(approvals[approvals.length - 1], approvalReply);
+          await message.react(approvalReply === false ? '\u274c' : '\u2705');
           return;
         }
       }
@@ -1432,6 +1446,30 @@ export async function startDiscord(
       }
       if (name === 'tools') {
         await cmd.reply(formatToolsList());
+        return;
+      }
+      if (name === 'toolset') {
+        const mode = normalizeToolsetName(cmd.options.getString('mode', true));
+        if (!mode) {
+          await cmd.reply({ content: 'Unknown toolset.', ephemeral: true });
+          return;
+        }
+        gateway.setSessionToolset(sessionKey, mode);
+        await cmd.reply({ content: `Toolset set to **${mode}**.`, ephemeral: true });
+        updatePresence(sessionKey);
+        return;
+      }
+      if (name === 'compress') {
+        await cmd.reply({ content: gateway.compactSessionForUser(sessionKey), ephemeral: true });
+        updatePresence(sessionKey);
+        return;
+      }
+      if (name === 'usage') {
+        await cmd.reply({ content: gateway.describeSessionUsage(sessionKey), ephemeral: true });
+        return;
+      }
+      if (name === 'debug') {
+        await cmd.reply({ content: gateway.describeSessionDebug(sessionKey).slice(0, 1900), ephemeral: true });
         return;
       }
       if (name === 'status') {

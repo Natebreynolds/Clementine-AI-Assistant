@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { _resetRouteCache, classifyRoute, isAskingAboutAgent } from '../src/agent/route-classifier.js';
+import { _resetRouteCache, classifyRoute, hasNoDelegationInstruction, isAskingAboutAgent } from '../src/agent/route-classifier.js';
 import type { AgentProfile } from '../src/types.js';
 import type { Gateway } from '../src/gateway/router.js';
 
@@ -84,6 +84,30 @@ describe('route classifier — LRU cache', () => {
     expect(decision?.targetAgent).not.toBe('ross-the-sdr');
   });
 
+  it('honors explicit no-delegation instructions even when an agent is named', async () => {
+    const handleCronJob = vi.fn();
+    const gateway = { handleCronJob } as unknown as Gateway;
+    const agents = [makeAgent('ross-the-sdr', 'Ross', 'Outbound SDR')];
+
+    const msg = 'i thought Ross had the list can you just see if he saved it to a .md file somewhere please. dont delegate to him';
+    const decision = await classifyRoute(msg, agents, gateway);
+
+    expect(hasNoDelegationInstruction(msg)).toBe(true);
+    expect(decision?.targetAgent).toBe('clementine');
+    expect(handleCronJob).not.toHaveBeenCalled();
+  });
+
+  it('keeps work about an agent with Clementine instead of treating the name as vocative', async () => {
+    const handleCronJob = vi.fn(async () => JSON.stringify({ targetAgent: 'clementine', confidence: 0.9, reasoning: 'meta repair request' }));
+    const gateway = { handleCronJob } as unknown as Gateway;
+    const agents = [makeAgent('ross-the-sdr', 'Ross', 'Outbound SDR')];
+
+    const msg = 'Are you able to fix the market leader follow up for Ross?';
+    const decision = await classifyRoute(msg, agents, gateway);
+
+    expect(decision?.targetAgent).not.toBe('ross-the-sdr');
+  });
+
   it('still routes when the user addresses the agent vocatively', async () => {
     const handleCronJob = vi.fn();
     const gateway = { handleCronJob } as unknown as Gateway;
@@ -96,6 +120,17 @@ describe('route classifier — LRU cache', () => {
     expect(handleCronJob).not.toHaveBeenCalled(); // fast-path, no LLM
   });
 
+  it('still routes explicit handoff phrasing to the named agent', async () => {
+    const handleCronJob = vi.fn();
+    const gateway = { handleCronJob } as unknown as Gateway;
+    const agents = [makeAgent('ross-the-sdr', 'Ross', 'Outbound SDR')];
+
+    const decision = await classifyRoute('send this to Ross please', agents, gateway);
+    expect(decision?.targetAgent).toBe('ross-the-sdr');
+    expect(decision?.confidence).toBe(1.0);
+    expect(handleCronJob).not.toHaveBeenCalled();
+  });
+
   it('isAskingAboutAgent — recognizes meta shapes, not vocatives', () => {
     // Asking-about (true)
     expect(isAskingAboutAgent('how is ross crons looking', 'ross', 'ross-the-sdr')).toBe(true);
@@ -103,6 +138,7 @@ describe('route classifier — LRU cache', () => {
     expect(isAskingAboutAgent('did ross handle the followups', 'ross', 'ross-the-sdr')).toBe(true);
     expect(isAskingAboutAgent('any update on ross from yesterday', 'ross', 'ross-the-sdr')).toBe(true);
     expect(isAskingAboutAgent('what about ross', 'ross', 'ross-the-sdr')).toBe(true);
+    expect(isAskingAboutAgent('fix the market leader follow up for ross', 'ross', 'ross-the-sdr')).toBe(true);
     // Vocative (false)
     expect(isAskingAboutAgent('ross please draft a followup', 'ross', 'ross-the-sdr')).toBe(false);
     expect(isAskingAboutAgent('hey ross can you check Acme', 'ross', 'ross-the-sdr')).toBe(false);

@@ -91,7 +91,7 @@ import {
   logAuditJsonl,
 } from './hooks.js';
 import { scanner } from '../security/scanner.js';
-import { agentWorkingMemoryFile, listAllGoals } from '../tools/shared.js';
+import { agentWorkingMemoryFile, capOutput, listAllGoals } from '../tools/shared.js';
 import { AgentManager } from './agent-manager.js';
 import { extractLinks } from './link-extractor.js';
 import { StallGuard } from './stall-guard.js';
@@ -103,6 +103,8 @@ import { searchSkills as searchSkillsSync } from './skill-extractor.js';
 import { classifyIntent, getStrategyGuidance, type IntentClassification } from './intent-classifier.js';
 import { getEventLog } from './session-event-log.js';
 import { routeToolSurface, TOOL_SURFACE_HARD_LIMIT, TOOL_SURFACE_WARN_THRESHOLD, type ToolRouteDecision } from './tool-router.js';
+import { isRestrictedToolset, toolsetAllowsLocalWrites, type ToolsetName } from './toolsets.js';
+import { looksLikeApprovalPrompt } from './local-turn.js';
 import { decideTurn, type RetrievalTier, type TurnPolicy } from './turn-policy.js';
 import { loadClementineJson } from '../config/clementine-json.js';
 import { isCreditBalanceError, markBackgroundCreditBlocked } from '../gateway/credit-guard.js';
@@ -367,9 +369,22 @@ const query: typeof rawQuery = ((args: Parameters<typeof rawQuery>[0]) => {
   return rawQuery(args);
 }) as typeof rawQuery;
 
+function parseMemoryTimestampMs(value: unknown): number {
+  const text = String(value ?? '').trim();
+  if (!text) return NaN;
+  // SQLite datetime('now') returns UTC as "YYYY-MM-DD HH:mm:ss" with no zone.
+  // Parse it explicitly as UTC so summaries don't appear hours in the future.
+  if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(text)) {
+    return Date.parse(`${text.replace(' ', 'T')}Z`);
+  }
+  return Date.parse(text);
+}
+
 /** Format a millisecond duration as a human-friendly "X ago" string. */
-function formatTimeAgo(ms: number): string {
-  const minutes = Math.floor(ms / 60_000);
+export function formatTimeAgo(ms: number): string {
+  const safeMs = Number.isFinite(ms) ? Math.max(0, ms) : 0;
+  if (safeMs < 60_000) return 'just now';
+  const minutes = Math.floor(safeMs / 60_000);
   if (minutes < 60) return `${minutes}m ago`;
   const hours = Math.floor(minutes / 60);
   if (hours < 24) return `${hours}h ago`;
@@ -382,6 +397,11 @@ function formatTimeAgo(ms: number): string {
 const CONTEXT_GUARD_MIN_TOKENS = 16_000;
 /** Warn threshold — context is getting tight. */
 const CONTEXT_GUARD_WARN_TOKENS = 32_000;
+const PENDING_CONTEXT_USER_MAX_CHARS = 1000;
+const PENDING_CONTEXT_ASSISTANT_MAX_CHARS = 3000;
+const CRON_PROGRESS_NOTES_MAX_CHARS = 2000;
+const CRON_PROGRESS_PENDING_MAX_ITEMS = 20;
+const CRON_PROGRESS_ITEM_MAX_CHARS = 300;
 /** Rotate SDK sessions before hidden resume history approaches the 200K cap. */
 const SESSION_ROTATE_INPUT_TOKENS = 140_000;
 /** Approximate context window sizes by model family. */
@@ -397,6 +417,14 @@ function getContextWindow(model: string): number {
     if (model.includes(family)) return size;
   }
   return 200_000; // safe default
+}
+
+function capContextBlock(text: unknown, maxChars: number): string {
+  return capOutput(String(text ?? ''), maxChars);
+}
+
+function capContextItem(text: unknown): string {
+  return capContextBlock(text, CRON_PROGRESS_ITEM_MAX_CHARS).replace(/\s+/g, ' ').trim();
 }
 
 function resultInputTokens(result: SDKResultMessage): number {
@@ -1484,6 +1512,11 @@ export class PersonalAssistant {
     return this.exchangeCounts.get(sessionKey) ?? 0;
   }
 
+  hasRecentApprovalPrompt(sessionKey: string): boolean {
+    const lastAssistant = this.lastExchanges.get(sessionKey)?.at(-1)?.assistant ?? '';
+    return looksLikeApprovalPrompt(lastAssistant);
+  }
+
   getMemoryChunkCount(): number {
     if (!this.memoryStore) return 0;
     try {
@@ -2185,6 +2218,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
     intentClassification?: IntentClassification;
     turnPolicy?: TurnPolicy;
     contextRoutingText?: string;
+    toolset?: ToolsetName;
   } = {}): Promise<SDKOptions> {
     const {
       isHeartbeat = false,
@@ -2211,6 +2245,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
       intentClassification,
       turnPolicy,
       contextRoutingText,
+      toolset = 'auto',
     } = opts;
 
     const isCron = cronTier !== null;
@@ -2262,10 +2297,29 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
     const safeContextToolRoute = allowContextToolRoute && !contextToolRoute.fullSurface
       ? contextToolRoute
       : emptyToolRoute();
-    const toolRoute = mergeToolRoutes(
+    let toolRoute = mergeToolRoutes(
       promptToolRoute,
       mergeToolRoutes(safeProfileToolRoute, safeContextToolRoute),
     );
+    if (toolset === 'full') {
+      toolRoute = {
+        bundles: [],
+        externalMcpServers: undefined,
+        composioToolkits: undefined,
+        inheritFullClaudeEnv: true,
+        fullSurface: true,
+        reason: 'full_surface',
+      };
+    } else if (isRestrictedToolset(toolset)) {
+      toolRoute = {
+        ...toolRoute,
+        bundles: [],
+        externalMcpServers: [],
+        composioToolkits: [],
+        inheritFullClaudeEnv: false,
+        fullSurface: false,
+      };
+    }
 
     let allowedTools: string[] = [];
     const addAllowed = (...tools: string[]) => {
@@ -2286,9 +2340,13 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
     const memoryNeeded = autonomousToolRun
       || retrievalContext.trim().length > 0
       || (turnPolicy?.retrievalTier !== undefined && turnPolicy.retrievalTier !== 'none');
-    const localReadNeeded = taskIntent || /\b(repo|repository|code|file|files|folder|directory|path|log|logs|config|read|show|grep|diff|search)\b/i.test(promptScopeLower);
-    const localWriteNeeded = taskIntent || /\b(write|edit|fix|implement|refactor|build|test|run|npm|git|commit|push|pull|deploy|install|configure)\b/i.test(promptScopeLower);
-    const adminNeeded = toolRoute.fullSurface || /\b(self[- ]?update|restart|daemon|doctor|env|credential|integration|setup|set up|configure|npm publish|publish to npm)\b/i.test(promptScopeLower);
+    const localReadNeeded = taskIntent || toolset === 'diagnostic' || /\b(repo|repository|code|file|files|folder|directory|path|log|logs|config|read|show|grep|diff|search)\b/i.test(promptScopeLower);
+    const diagnosticCommandNeeded = toolset === 'diagnostic'
+      && /\b(run|test|npm|pnpm|yarn|node|git|logs?|tail|ps|status|diagnos(?:e|tic)|check)\b/i.test(promptScopeLower);
+    const localWriteNeeded = diagnosticCommandNeeded
+      || (toolsetAllowsLocalWrites(toolset) && (taskIntent || /\b(write|edit|fix|implement|refactor|build|test|run|npm|git|commit|push|pull|deploy|install|configure)\b/i.test(promptScopeLower)));
+    const adminNeeded = toolRoute.fullSurface
+      || (toolsetAllowsLocalWrites(toolset) && /\b(self[- ]?update|restart|daemon|doctor|env|credential|integration|setup|set up|configure|npm publish|publish to npm)\b/i.test(promptScopeLower));
 
     if (!toolsDisabledForCall) {
       if (toolRoute.fullSurface) {
@@ -2296,7 +2354,10 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
         addClementineTools(CLEMENTINE_ALL_TOOL_NAMES);
       } else {
         if (localReadNeeded) addAllowed('Read', 'Glob', 'Grep');
-        if (localWriteNeeded) addAllowed('Write', 'Edit', 'Bash');
+        if (localWriteNeeded) {
+          if (toolset === 'diagnostic') addAllowed('Bash');
+          else addAllowed('Write', 'Edit', 'Bash');
+        }
         if (toolRoute.bundles.includes('web_research') || toolRoute.bundles.includes('docs_lookup')) {
           addAllowed('WebSearch', 'WebFetch');
         }
@@ -2305,7 +2366,12 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
           addClementineTools(CLEMENTINE_CORE_TOOL_NAMES);
           addClementineTools(CLEMENTINE_RELATIONSHIP_TOOL_NAMES);
         }
-        if (taskIntent || intentClassification?.type === 'correction') {
+        const clementineMemoryWritesAllowed = toolset === 'auto'
+          || toolset === 'full'
+          || toolset === 'communications'
+          || intentClassification?.type === 'feedback'
+          || intentClassification?.type === 'correction';
+        if ((taskIntent || intentClassification?.type === 'correction') && clementineMemoryWritesAllowed) {
           addClementineTools(CLEMENTINE_MEMORY_WRITE_TOOL_NAMES);
           addClementineTools(CLEMENTINE_WORKSPACE_TOOL_NAMES);
         } else if (memoryNeeded) {
@@ -2321,13 +2387,15 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
           addClementineTools(CLEMENTINE_INTEGRATION_TOOL_NAMES);
           addClementineTools(CLEMENTINE_ADMIN_TOOL_NAMES);
         }
-        if (toolRoute.bundles.includes('email_outlook') || /\b(outlook|email|mailbox|inbox|calendar|follow-?up)\b/i.test(scopeText)) {
+        if ((toolset === 'auto' || toolset === 'full' || toolset === 'communications')
+          && (toolRoute.bundles.includes('email_outlook') || /\b(outlook|email|mailbox|inbox|calendar|follow-?up)\b/i.test(scopeText))) {
           addClementineTools(CLEMENTINE_COMM_TOOL_NAMES);
         }
-        if (toolRoute.bundles.includes('github') || toolRoute.bundles.includes('browser') || toolRoute.bundles.includes('web_research')) {
+        if ((toolset === 'auto' || toolset === 'full')
+          && (toolRoute.bundles.includes('github') || toolRoute.bundles.includes('browser') || toolRoute.bundles.includes('web_research'))) {
           addClementineTools(CLEMENTINE_RESEARCH_TOOL_NAMES);
         }
-        if (enableTeams) {
+        if (enableTeams && (toolset === 'auto' || toolset === 'full')) {
           addAllowed('Task', 'Agent');
           addClementineTools(CLEMENTINE_TEAM_TOOL_NAMES);
           addClementineTools(CLEMENTINE_JOB_TOOL_NAMES);
@@ -2335,7 +2403,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
       }
 
       // Include local user scripts/plugins for task-like or explicit full-surface turns.
-      if (taskIntent || toolRoute.fullSurface || adminNeeded) {
+      if (toolsetAllowsLocalWrites(toolset) && (taskIntent || toolRoute.fullSurface || adminNeeded)) {
         try {
           const toolsDir = path.join(BASE_DIR, 'tools');
           const pluginsDir = path.join(BASE_DIR, 'plugins');
@@ -2692,6 +2760,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
       isolateClaudeConfig,
       inheritFullClaudeEnv: shouldInheritClaudeEnv,
       maxBudgetUsd: enforcedBudget,
+      toolset,
       isCron,
       cronTier,
       isPlanStep,
@@ -3105,6 +3174,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
       projectOverride?: ProjectMeta;
       verboseLevel?: VerboseLevel;
       abortController?: AbortController;
+      toolset?: ToolsetName;
     },
   ): Promise<[string, string]> {
     const onText = options?.onText;
@@ -3116,6 +3186,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
     const projectOverride = options?.projectOverride;
     const verboseLevel = options?.verboseLevel;
     const abortController = options?.abortController;
+    const toolset = options?.toolset ?? 'auto';
     const key = sessionKey ?? undefined;
     this._lastUserMessage = text;
     let sessionRotated = false;
@@ -3228,11 +3299,14 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
       const exchanges = this.lastExchanges.get(key) ?? [];
       if (exchanges.length === 0 && this.memoryStore) {
         try {
-          const recentSummaries = this.memoryStore.getRecentSummaries(1);
+          const recentSummaries = typeof this.memoryStore.getRecentSummariesForSession === 'function'
+            ? this.memoryStore.getRecentSummariesForSession(key, 1)
+            : this.memoryStore.getRecentSummaries(5).filter((s: { sessionKey?: string }) => s.sessionKey === key).slice(0, 1);
           if (recentSummaries.length > 0) {
             const last = recentSummaries[0];
-            const ageMs = Date.now() - new Date(last.createdAt).getTime();
-            if (ageMs < 7 * 24 * 60 * 60 * 1000) { // within 7 days
+            const createdAtMs = parseMemoryTimestampMs(last.createdAt);
+            const ageMs = Date.now() - createdAtMs;
+            if (Number.isFinite(ageMs) && ageMs >= -5 * 60_000 && ageMs < 7 * 24 * 60 * 60 * 1000) { // within 7 days
               const ago = formatTimeAgo(ageMs);
               effectivePrompt =
                 `[Last conversation (${ago}):\n${last.summary.slice(0, 600)}]\n\n` +
@@ -3271,7 +3345,9 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
       if (allPending.length > 0) {
         const contextLines: string[] = [];
         for (const ctx of allPending) {
-          contextLines.push(`[${ctx.user}]\n${ctx.assistant}`);
+          const user = capContextBlock(ctx.user, PENDING_CONTEXT_USER_MAX_CHARS);
+          const assistant = capContextBlock(ctx.assistant, PENDING_CONTEXT_ASSISTANT_MAX_CHARS);
+          contextLines.push(`[${user}]\n${assistant}`);
         }
         effectivePrompt =
           `[Since we last talked, you did some background work. Naturally mention what happened — lead with anything that needs attention, briefly note routine completions. Don't dump raw tool calls or list job names. Be conversational.\nBackground:\n${contextLines.join('\n\n')}]\n\n${effectivePrompt}`;
@@ -3306,7 +3382,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
     const guard = new StallGuard();
 
     let [responseText, sessionId] = await this.runQuery(
-      effectivePrompt, key, onText, model, profile, securityAnnotation, effectiveMaxTurns, projectOverride, onToolActivity, verboseLevel, abortController, guard, CHAT_TIMEOUT_MS, intent, turnPolicy,
+      effectivePrompt, key, onText, model, profile, securityAnnotation, effectiveMaxTurns, projectOverride, onToolActivity, verboseLevel, abortController, guard, CHAT_TIMEOUT_MS, intent, turnPolicy, toolset,
     );
 
     // If we got a context-length / prompt-too-long error, retry with a fresh session
@@ -3330,7 +3406,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
           `If this task involves pulling data for multiple entities, delegate each to a sub-agent using the Agent tool ` +
           `instead of calling data-heavy tools directly.\n\n${text}`;
       }
-      [responseText, sessionId] = await this.runQuery(retryPrompt, key, onText, model, profile, securityAnnotation, maxTurns, undefined, onToolActivity, verboseLevel, abortController, undefined, CHAT_TIMEOUT_MS, intent, turnPolicy);
+      [responseText, sessionId] = await this.runQuery(retryPrompt, key, onText, model, profile, securityAnnotation, maxTurns, undefined, onToolActivity, verboseLevel, abortController, undefined, CHAT_TIMEOUT_MS, intent, turnPolicy, toolset);
     }
 
     // Track exchange count, timestamp, and last exchange.
@@ -3445,6 +3521,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
     timeoutMs?: number,
     intentClassification?: IntentClassification,
     turnPolicy?: TurnPolicy,
+    toolset: ToolsetName = 'auto',
   ): Promise<[string, string]> {
     // Parallelize context retrieval and project matching — they're independent
     // If a project override is set, skip auto-matching entirely
@@ -3552,6 +3629,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
           intentClassification,
           turnPolicy: effectiveTurnPolicy,
           effort: effectiveTurnPolicy?.effort ?? intentClassification?.suggestedEffort,
+          toolset,
           // Route destructive/admin/local write decisions from the direct user
           // request only. Retrieved memory may still contribute integration
           // continuity via contextRoutingText, but stale memories should not
@@ -4313,18 +4391,20 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
    *
    * No LLM call — uses buildLocalSummary for instant summarization.
    */
-  private compactContext(sessionKey: string): void {
-    const summary = this.buildLocalSummary(sessionKey);
-    if (!summary) return;
+  private compactContext(sessionKey: string, reason: string = 'context_guard'): string | null {
+    const summary = this.buildStructuredCompactionSummary(sessionKey);
+    if (!summary) return null;
 
     // Build compaction block for working memory
     const exchangeCount = this.exchangeCounts.get(sessionKey) ?? 0;
+    const parentSessionId = this.sessions.get(sessionKey) ?? null;
     const COMPACTION_START = '<!-- COMPACTION_START -->';
     const COMPACTION_END = '<!-- COMPACTION_END -->';
     const compactionBlock = [
       COMPACTION_START,
       `## Session Compaction (auto-generated)`,
       `Session ${sessionKey} compacted at ${exchangeCount} exchanges.`,
+      `Reason: ${reason}.`,
       ``,
       summary,
       ``,
@@ -4364,6 +4444,20 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
       // If working memory write fails, still rotate — better than hitting the hard limit
     }
 
+    try {
+      this.memoryStore?.saveSessionSummary?.(sessionKey, summary, exchangeCount);
+      this.memoryStore?.recordSessionLineage?.({
+        sessionKey,
+        parentSessionId,
+        childSessionId: null,
+        reason,
+        summary,
+        exchangeCount,
+      });
+    } catch {
+      // Durable lineage is helpful, not required for compaction safety.
+    }
+
     // Rotate session — clear the session ID so next query starts fresh
     // The working memory summary will provide continuity
     this.sessions.delete(sessionKey);
@@ -4372,6 +4466,20 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
     this.sessionTimestamps.delete(sessionKey);
     this.stallNudges.delete(sessionKey);
     this.saveSessions();
+    return summary;
+  }
+
+  compactSessionForGateway(sessionKey: string, reason: string = 'gateway_preflight'): {
+    compacted: boolean;
+    exchangeCount: number;
+    summary?: string;
+    reason: string;
+  } {
+    const exchangeCount = this.exchangeCounts.get(sessionKey) ?? 0;
+    const summary = this.compactContext(sessionKey, reason);
+    return summary
+      ? { compacted: true, exchangeCount, summary, reason }
+      : { compacted: false, exchangeCount, reason };
   }
 
   /**
@@ -4396,7 +4504,44 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
    * to avoid blocking the user's query.
    */
   private buildLocalSummary(sessionKey: string): string {
-    return this.buildLocalSummaryFromTurns(this.lastExchanges.get(sessionKey) ?? []);
+    let exchanges = this.lastExchanges.get(sessionKey) ?? [];
+    if (exchanges.length === 0 && this.memoryStore && typeof this.memoryStore.getTranscriptTail === 'function') {
+      try {
+        const recent = this.memoryStore.getTranscriptTail(
+          sessionKey,
+          0,
+          SESSION_EXCHANGE_HISTORY_SIZE * 2,
+        ) as Array<{ role: string; content: string }>;
+        exchanges = this.pairTranscriptTurns(recent ?? []);
+      } catch {
+        exchanges = [];
+      }
+    }
+    return this.buildLocalSummaryFromTurns(exchanges);
+  }
+
+  private buildStructuredCompactionSummary(sessionKey: string): string {
+    const exchanges = this.lastExchanges.get(sessionKey) ?? [];
+    const summary = this.buildLocalSummary(sessionKey);
+    if (!summary) return '';
+
+    const latest = exchanges.at(-1);
+    const lastUser = latest?.user
+      ? latest.user.slice(0, 400).replace(/\s+/g, ' ')
+      : '';
+    const continuity = [
+      '- Exact details remain in transcripts; use transcript_search before relying on this handoff for names, dates, IDs, files, or sent-message status.',
+      '- Keep tool outputs bounded and prefer targeted reads over full log dumps.',
+      lastUser ? `- Last visible user request: ${lastUser}` : '',
+    ].filter(Boolean);
+
+    return [
+      '### Recent Conversation',
+      summary,
+      '',
+      '### Continuity Notes',
+      continuity.join('\n'),
+    ].join('\n');
   }
 
   private buildLocalSummaryFromTurns(
@@ -5402,13 +5547,17 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
         const progress = JSON.parse(fs.readFileSync(progressFile, 'utf-8'));
         const parts: string[] = [`## Previous Progress (run #${progress.runCount}, ${progress.lastRunAt})`];
         if (progress.completedItems?.length > 0) {
-          parts.push(`Completed: ${progress.completedItems.slice(-10).join(', ')}`);
+          parts.push(`Completed: ${progress.completedItems.slice(-10).map(capContextItem).join(', ')}`);
         }
         if (progress.pendingItems?.length > 0) {
-          parts.push(`Pending: ${progress.pendingItems.join(', ')}`);
+          const pendingItems = progress.pendingItems.slice(0, CRON_PROGRESS_PENDING_MAX_ITEMS).map(capContextItem);
+          const suffix = progress.pendingItems.length > CRON_PROGRESS_PENDING_MAX_ITEMS
+            ? ` (${progress.pendingItems.length - CRON_PROGRESS_PENDING_MAX_ITEMS} more omitted)`
+            : '';
+          parts.push(`Pending: ${pendingItems.join(', ')}${suffix}`);
         }
         if (progress.notes) {
-          parts.push(`Notes: ${progress.notes}`);
+          parts.push(`Notes: ${capContextBlock(progress.notes, CRON_PROGRESS_NOTES_MAX_CHARS)}`);
         }
         progressContext = parts.join('\n') + '\n\n' +
           'Continue from where you left off. Use `cron_progress_write` at the end to save what you completed and what\'s pending.\n\n';
@@ -6455,8 +6604,8 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
    * so follow-up conversation has context.
    */
   injectContext(sessionKey: string, userText: string, assistantText: string): void {
-    const trimmedUser = userText.slice(0, INJECTED_CONTEXT_MAX_CHARS);
-    const trimmedAssistant = assistantText.slice(0, INJECTED_CONTEXT_MAX_CHARS);
+    const trimmedUser = capContextBlock(userText, INJECTED_CONTEXT_MAX_CHARS);
+    const trimmedAssistant = capContextBlock(assistantText, INJECTED_CONTEXT_MAX_CHARS);
 
     // Add to in-memory exchange history
     const history = this.lastExchanges.get(sessionKey) ?? [];

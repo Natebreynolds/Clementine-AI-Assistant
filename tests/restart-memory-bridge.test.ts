@@ -212,4 +212,30 @@ describe('MemoryStore wiring (sanity)', () => {
     const { assistant } = makeAssistantWithStore();
     expect(typeof (assistant as any).memoryStore.getTranscriptTail).toBe('function');
   });
+
+  it('batches markConsolidated so large consolidation sets do not exceed SQLite variable limits', () => {
+    const { store } = makeAssistantWithStore();
+    const ids = Array.from({ length: 1200 }, (_, i) => i + 1);
+
+    expect(() => store.markConsolidated(ids)).not.toThrow();
+  });
+});
+
+describe('session summary continuity', () => {
+  it('scopes recent summaries to the active conversation', () => {
+    const { store } = makeAssistantWithStore();
+    store.saveSessionSummary('discord:user:one', 'one-a', 1);
+    store.saveSessionSummary('discord:user:two', 'two-a', 1);
+    store.saveSessionSummary('discord:user:one', 'one-b', 2);
+
+    const scoped = store.getRecentSummariesForSession('discord:user:one', 5);
+
+    expect(scoped).toHaveLength(2);
+    expect(scoped.every((s: any) => s.sessionKey === 'discord:user:one')).toBe(true);
+    expect(scoped.map((s: any) => s.summary)).toEqual(expect.arrayContaining(['one-a', 'one-b']));
+  });
+
+  it('formats future-skewed age as just now instead of a negative duration', () => {
+    expect(assistantModule.formatTimeAgo(-144 * 60_000)).toBe('just now');
+  });
 });
