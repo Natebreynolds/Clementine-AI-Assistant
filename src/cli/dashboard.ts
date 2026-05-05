@@ -17527,18 +17527,27 @@ async function apiFetch(url, opts) {
     }
     // 401 means the dashboard was restarted and regenerated its token.
     // The page still in your browser has a stale one baked into <meta>,
-    // so every API call silently fails. Reload once to pick up the new
-    // HTML (and new token). Guard against reload loops with sessionStorage.
+    // so every API call silently fails. Reload to pick up the new HTML
+    // (and new token), but throttle by token so a tab cannot get stuck
+    // forever after one earlier restart.
     if (resp.status === 401) {
-      var key = '_dashReloadedOnce';
-      if (!sessionStorage.getItem(key)) {
-        sessionStorage.setItem(key, String(Date.now()));
+      var key = '_dashReloadedForToken:' + (_dashToken || 'missing').slice(0, 12);
+      var lastReload = Number(sessionStorage.getItem(key) || '0');
+      var now = Date.now();
+      if (!lastReload || now - lastReload > 5000) {
+        sessionStorage.setItem(key, String(now));
         console.warn('Dashboard token expired — reloading to refresh.');
         location.reload();
         // Let the reload kick in; return the 401 so any caller that
         // handles it sees a consistent result until the page unloads.
         return resp;
       }
+    } else if (resp.ok) {
+      try {
+        Object.keys(sessionStorage).forEach(function(k) {
+          if (k.indexOf('_dashReloadedForToken:') === 0) sessionStorage.removeItem(k);
+        });
+      } catch (_) { /* ignore */ }
     }
     return resp;
   }

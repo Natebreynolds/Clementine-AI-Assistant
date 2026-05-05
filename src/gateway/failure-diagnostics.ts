@@ -26,6 +26,7 @@ import { AGENTS_DIR, BASE_DIR, CRON_FILE } from '../config.js';
 import type { Gateway } from './router.js';
 import type { BrokenJob } from './failure-monitor.js';
 import { loadPromptOverrides, loadPromptOverridesForJob } from '../agent/prompt-overrides/loader.js';
+import { isCreditBalanceError } from './credit-guard.js';
 
 const logger = pino({ name: 'clementine.failure-diagnostics' });
 
@@ -382,6 +383,19 @@ export function diagnoseKnownFailurePattern(
     ...broken.lastErrors,
     recentRuns,
   ].join('\n').toLowerCase();
+
+  if (isCreditBalanceError(haystack)) {
+    return {
+      rootCause: 'Claude is blocked by an org usage or billing limit, so this is not a job-definition failure.',
+      confidence: 'high',
+      proposedFix: {
+        type: 'escalate_to_owner',
+        details: 'Keep background jobs paused until the Claude org usage limit resets or billing capacity is restored. Do not retry or auto-apply job fixes for this error.',
+      },
+      riskLevel: 'low',
+      generatedAt: new Date().toISOString(),
+    };
+  }
 
   if (/rapid_refill_breaker|autocompact.*thrash|context refilled|prompt is too long|prompt too long|context.?length|maximum context|input is too long/.test(haystack)) {
     if (hasContextOverflowPromptOverride(broken.jobName, broken.agentSlug, opts)) {

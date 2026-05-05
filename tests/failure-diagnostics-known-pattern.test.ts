@@ -19,6 +19,21 @@ function brokenJob(overrides: Partial<BrokenJob>): BrokenJob {
 }
 
 describe('known failure diagnostics', () => {
+  it('escalates org monthly usage limits without proposing a job fix', () => {
+    const diagnosis = diagnoseKnownFailurePattern(
+      brokenJob({
+        lastErrors: ["Cron claude-auth-healthcheck failed: Error: Claude Code returned an error result: You've hit your org's monthly usage limit"],
+      }),
+      '  - name: claude-auth-healthcheck\n    schedule: "*/15 * * * *"',
+      '2026-05-02T16:00:00.000Z error (1s) error="You\'ve hit your org\'s monthly usage limit"',
+    );
+
+    expect(diagnosis?.confidence).toBe('high');
+    expect(diagnosis?.proposedFix.type).toBe('escalate_to_owner');
+    expect(diagnosis?.proposedFix.autoApply).toBeUndefined();
+    expect(diagnosis?.proposedFix.details).toContain('Do not retry');
+  });
+
   it('diagnoses context overflow without requiring an LLM diagnostic job', () => {
     const baseDir = mkdtempSync(path.join(tmpdir(), 'clementine-known-pattern-'));
     try {

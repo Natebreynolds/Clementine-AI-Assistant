@@ -1,10 +1,12 @@
 import type { CronRunEntry } from '../types.js';
+import { isCreditBalanceError } from './credit-guard.js';
 
 export type JobHealthKind =
   | 'healthy'
   | 'recovered'
   | 'partial'
   | 'context_overflow'
+  | 'usage_blocked'
   | 'auth'
   | 'rate_limited'
   | 'tool_scope'
@@ -50,6 +52,16 @@ export function classifyRunHealth(entry: CronRunEntry): JobHealthStatus {
     lastRunAt: entry.startedAt,
     terminalReason,
   };
+
+  if (isCreditBalanceError(blob)) {
+    return {
+      ...base,
+      status: 'usage_blocked',
+      evidence: compactEvidence(entry.error, entry.outputPreview, terminalReason ? `terminalReason=${terminalReason}` : undefined),
+      recommendedAction: 'Resolve the Claude org usage or billing limit, or switch this job to an available provider/model before retrying.',
+      requiresApproval: false,
+    };
+  }
 
   if (terminalReason === 'rapid_refill_breaker' || /rapid_refill_breaker|autocompact|context refilled|maximum context|context.?length/.test(blob)) {
     return {
@@ -152,5 +164,5 @@ export function classifyRunHealth(entry: CronRunEntry): JobHealthStatus {
 
 export function isRunHealthFailure(entry: CronRunEntry): boolean {
   const health = classifyRunHealth(entry);
-  return !['healthy', 'recovered', 'unknown'].includes(health.status);
+  return !['healthy', 'recovered', 'unknown', 'usage_blocked'].includes(health.status);
 }

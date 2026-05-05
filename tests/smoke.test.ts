@@ -74,6 +74,7 @@ describe('classifyError', () => {
 
   it('classifies Claude credit exhaustion as permanent for cron', () => {
     expect(classifyError('Credit balance is too low')).toBe('permanent');
+    expect(classifyError("You've hit your org's monthly usage limit")).toBe('permanent');
   });
 });
 
@@ -122,6 +123,7 @@ describe('response and provider error sentinels', () => {
   it('detects Claude credit exhaustion errors', () => {
     expect(isCreditBalanceError('Credit balance is too low')).toBe(true);
     expect(isCreditBalanceError('Your account has insufficient credits')).toBe(true);
+    expect(isCreditBalanceError("You've hit your org's monthly usage limit")).toBe(true);
   });
 });
 
@@ -153,6 +155,7 @@ describe('classifyChatError', () => {
 
   it('classifies billing/credit errors', () => {
     expect(classifyChatError('Credit balance is too low')).toBe('billing');
+    expect(classifyChatError("You've hit your org's monthly usage limit")).toBe('billing');
   });
 
   it('classifies transient errors', () => {

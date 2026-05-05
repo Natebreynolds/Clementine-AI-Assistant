@@ -6350,6 +6350,24 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
         logger.error({ err, jobName, phase }, `Unleashed task phase ${phase} error`);
         appendProgress({ event: 'phase_error', phase, error: String(err), terminalReason });
 
+        if (isCreditBalanceError(err)) {
+          markBackgroundCreditBlocked(err);
+          appendProgress({ event: 'aborted', phase, reason: 'account_usage_limit' });
+          writeStatus({
+            jobName,
+            status: 'error',
+            phase,
+            startedAt,
+            finishedAt: new Date().toISOString(),
+          });
+          const message = (
+            `Task "${jobName}" stopped because Claude account usage or billing is blocked: ${String(err).slice(0, 500)}. ` +
+            'Background jobs have been paused so Clementine does not keep retrying against the same account limit.'
+          );
+          logger.error({ jobName, phase }, 'Unleashed task aborted on Claude account usage limit');
+          throw new UnleashedTaskFailedError(message, this._lastTerminalReason);
+        }
+
         if (terminalReason === 'rapid_refill_breaker' || terminalReason === 'prompt_too_long') {
           appendProgress({ event: 'aborted', phase, reason: terminalReason });
           writeStatus({

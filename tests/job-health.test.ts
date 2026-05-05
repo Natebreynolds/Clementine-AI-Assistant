@@ -40,6 +40,28 @@ describe('job health classification', () => {
     expect(isRunHealthFailure(entry)).toBe(true);
   });
 
+  it('classifies monthly usage limits as account blockers, not job fixes', () => {
+    const entry = run({
+      status: 'error',
+      error: "Claude Code returned an error result: You've hit your org's monthly usage limit",
+    });
+    const health = classifyRunHealth(entry);
+    expect(health.status).toBe('usage_blocked');
+    expect(health.recommendedAction).toContain('usage or billing limit');
+    expect(health.requiresApproval).toBe(false);
+  });
+
+  it('does not count credit-block skip entries as job health failures', () => {
+    const entry = run({
+      status: 'skipped',
+      attempt: 0,
+      durationMs: 0,
+      outputPreview: 'Claude account usage or credit limit is active. Background jobs are paused until 2026-05-02T20:00:00.000Z.',
+    });
+    expect(classifyRunHealth(entry).status).toBe('usage_blocked');
+    expect(isRunHealthFailure(entry)).toBe(false);
+  });
+
   it('leaves ordinary ok runs healthy', () => {
     const entry = run({ outputPreview: 'No new replies found.' });
     expect(classifyRunHealth(entry).status).toBe('healthy');

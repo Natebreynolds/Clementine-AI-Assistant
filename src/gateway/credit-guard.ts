@@ -12,7 +12,7 @@ const DEFAULT_BLOCK_MS = 6 * 60 * 60 * 1000;
 
 export function isCreditBalanceError(err: unknown): boolean {
   const msg = String(err ?? '');
-  return /credit balance is too low|credit balance.*too low|insufficient credits?|billing.*credits?|account.*credits?.*low/i.test(msg);
+  return /credit balance is too low|credit balance.*too low|insufficient credits?|billing.*credits?|account.*credits?.*low|monthly usage limit|org'?s monthly usage limit|organization'?s monthly usage limit|hit your .*usage limit|usage limit.*(?:reached|exceeded|hit|active)|usage or credit limit|credit limit is active|spending limit|billing limit/i.test(msg);
 }
 
 export function getBackgroundCreditBlock(nowMs = Date.now()): CreditBlock | null {
@@ -46,5 +46,5 @@ export function markBackgroundCreditBlocked(err: unknown, nowMs = Date.now()): {
 }
 
 export function formatCreditBlock(block: CreditBlock): string {
-  return `Claude credit balance is too low. Background jobs are paused until ${block.until}.`;
+  return `Claude account usage or credit limit is active. Background jobs are paused until ${block.until}.`;
 }
