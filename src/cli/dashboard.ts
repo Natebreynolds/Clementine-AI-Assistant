@@ -47,6 +47,7 @@ import { workflowsRouter } from './routes/workflows.js';
 import { digestRouter } from './routes/digest.js';
 import { loadClementineJson, updateClementineJson } from '../config/clementine-json.js';
 import { annotateUnleashedStatus } from '../gateway/unleashed-status.js';
+import { buildOperationsSnapshot, type BuildUsageTask } from '../dashboard/build-operations.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -1338,6 +1339,201 @@ function getCronJobs(): Record<string, unknown> {
   });
 
   return { jobs: enriched };
+}
+
+function getUnleashedTasksForDashboard(): Array<Record<string, unknown>> {
+  const unleashedDir = path.join(BASE_DIR, 'unleashed');
+  if (!existsSync(unleashedDir)) return [];
+  const tasks: Array<Record<string, unknown>> = [];
+  try {
+    for (const dir of readdirSync(unleashedDir)) {
+      const dirPath = path.join(unleashedDir, dir);
+      if (!statSync(dirPath).isDirectory()) continue;
+      const statusFile = path.join(dirPath, 'status.json');
+      if (!existsSync(statusFile)) continue;
+      try {
+        const status = JSON.parse(readFileSync(statusFile, 'utf-8'));
+        tasks.push(annotateUnleashedStatus(status, dir));
+      } catch { /* skip corrupt status */ }
+    }
+  } catch {
+    return [];
+  }
+  return tasks.sort((a, b) => String(b.updatedAt || '').localeCompare(String(a.updatedAt || '')));
+}
+
+function classifyBuildUsageSession(sessionKey: string, source: string, agentSlug?: string | null) {
+  let kind = source || 'chat';
+  let label = sessionKey || '(unknown)';
+  let taskKey = sessionKey || '(unknown)';
+  let controllable = false;
+  let targetTab: 'crons' | 'workflows' | 'sessions' = 'sessions';
+
+  if (sessionKey.startsWith('cron:')) {
+    const name = sessionKey.slice('cron:'.length);
+    kind = name.startsWith('goal:') ? 'goal task' : 'scheduled task';
+    label = name;
+    taskKey = name;
+    controllable = true;
+    targetTab = 'crons';
+  } else if (sessionKey.startsWith('unleashed:')) {
+    const name = sessionKey.slice('unleashed:'.length);
+    kind = name.startsWith('bg:') ? 'background task' : 'long-running task';
+    label = name.startsWith('bg:') ? `Deep task ${name.slice(3)}` : name;
+    taskKey = name;
+    controllable = true;
+    targetTab = 'crons';
+  } else if (sessionKey.startsWith('workflow:')) {
+    const rest = sessionKey.slice('workflow:'.length);
+    const splitAt = rest.lastIndexOf(':');
+    const workflowName = splitAt > 0 ? rest.slice(0, splitAt) : rest;
+    const stepName = splitAt > 0 ? rest.slice(splitAt + 1) : '';
+    kind = 'workflow step';
+    label = stepName ? `${workflowName} · ${stepName}` : workflowName;
+    taskKey = workflowName;
+    controllable = true;
+    targetTab = 'workflows';
+  } else if (sessionKey.startsWith('plan:')) {
+    const step = sessionKey.slice('plan:'.length);
+    kind = source === 'workflow_step' ? 'workflow step' : 'plan step';
+    label = step;
+    taskKey = step;
+    targetTab = 'workflows';
+  } else if (sessionKey.startsWith('discord:') || sessionKey.startsWith('chat:') || source === 'chat') {
+    kind = 'chat session';
+    targetTab = 'sessions';
+  }
+
+  return { kind, label, taskKey, controllable, targetTab, agentSlug: agentSlug || null };
+}
+
+async function getBuildUsageForOperations(hoursInput: unknown = 168, limitInput: unknown = 50): Promise<{
+  ok: boolean;
+  hours: number;
+  sinceIso: string;
+  totalTokens: number;
+  totalInput: number;
+  totalOutput: number;
+  totalCostCents: number;
+  tasks: BuildUsageTask[];
+  taskTotals: { totalTokens: number; totalInput: number; totalOutput: number; costCents: number; queries: number };
+  error?: string;
+}> {
+  const hoursRaw = parseInt(String(hoursInput ?? '168'), 10);
+  const hours = Math.max(1, Math.min(Number.isFinite(hoursRaw) ? hoursRaw : 168, 24 * 90));
+  const limitRaw = parseInt(String(limitInput ?? '50'), 10);
+  const limit = Math.max(5, Math.min(Number.isFinite(limitRaw) ? limitRaw : 50, 50));
+  const sinceIso = new Date(Date.now() - hours * 60 * 60 * 1000).toISOString();
+  const empty = {
+    ok: true,
+    hours,
+    sinceIso,
+    totalTokens: 0,
+    totalInput: 0,
+    totalOutput: 0,
+    totalCostCents: 0,
+    tasks: [] as BuildUsageTask[],
+    taskTotals: { totalTokens: 0, totalInput: 0, totalOutput: 0, costCents: 0, queries: 0 },
+  };
+
+  if (!existsSync(MEMORY_DB_PATH)) return empty;
+
+  const Database = (await import('better-sqlite3')).default;
+  const db = new Database(MEMORY_DB_PATH, { readonly: true });
+  try {
+    const tableExists = db.prepare(
+      "SELECT name FROM sqlite_master WHERE type='table' AND name='usage_log'",
+    ).get();
+    if (!tableExists) return empty;
+
+    const columns = new Set((db.prepare('PRAGMA table_info(usage_log)').all() as Array<{ name: string }>).map(c => c.name));
+    const costExpr = columns.has('cost_cents') ? 'COALESCE(SUM(cost_cents), 0)' : '0';
+    const agentExpr = columns.has('agent_slug') ? 'COALESCE(agent_slug, \'\')' : '\'\'';
+
+    const totals = db.prepare(
+      `SELECT COALESCE(SUM(input_tokens), 0) as ti,
+              COALESCE(SUM(output_tokens), 0) as to_,
+              ${costExpr} as cost
+       FROM usage_log
+       WHERE datetime(created_at) >= datetime(?)`,
+    ).get(sinceIso) as { ti: number; to_: number; cost: number };
+
+    const sessionRows = db.prepare(
+      `SELECT session_key as sessionKey,
+              source,
+              ${agentExpr} as agentSlug,
+              COUNT(*) as queries,
+              COALESCE(SUM(input_tokens), 0) as totalInput,
+              COALESCE(SUM(output_tokens), 0) as totalOutput,
+              ${costExpr} as costCents,
+              MAX(created_at) as lastAt
+       FROM usage_log
+       WHERE datetime(created_at) >= datetime(?)
+       GROUP BY session_key, source, ${agentExpr}
+       ORDER BY COALESCE(SUM(input_tokens), 0) + COALESCE(SUM(output_tokens), 0) DESC`,
+    ).all(sinceIso) as Array<{
+      sessionKey: string;
+      source: string;
+      agentSlug: string;
+      queries: number;
+      totalInput: number;
+      totalOutput: number;
+      costCents: number;
+      lastAt: string;
+    }>;
+
+    const taskMap = new Map<string, BuildUsageTask>();
+    for (const row of sessionRows) {
+      const identity = classifyBuildUsageSession(row.sessionKey, row.source, row.agentSlug);
+      if (identity.kind === 'chat session') continue;
+      const mapKey = `${identity.kind}:${identity.taskKey}:${identity.agentSlug || ''}`;
+      const existing = taskMap.get(mapKey);
+      if (existing) {
+        existing.totalInput = (existing.totalInput || 0) + row.totalInput;
+        existing.totalOutput = (existing.totalOutput || 0) + row.totalOutput;
+        existing.totalTokens = (existing.totalTokens || 0) + row.totalInput + row.totalOutput;
+        existing.costCents = (existing.costCents || 0) + (row.costCents || 0);
+        existing.queries = (existing.queries || 0) + row.queries;
+        if ((row.lastAt || '') > (existing.lastAt || '')) existing.lastAt = row.lastAt;
+      } else {
+        taskMap.set(mapKey, {
+          ...identity,
+          totalInput: row.totalInput,
+          totalOutput: row.totalOutput,
+          totalTokens: row.totalInput + row.totalOutput,
+          costCents: row.costCents || 0,
+          queries: row.queries,
+          lastAt: row.lastAt,
+        });
+      }
+    }
+
+    const allTasks = Array.from(taskMap.values()).sort((a, b) => (b.totalTokens || 0) - (a.totalTokens || 0));
+    const taskTotals = allTasks.reduce((acc, t) => {
+      acc.totalTokens += t.totalTokens || 0;
+      acc.totalInput += t.totalInput || 0;
+      acc.totalOutput += t.totalOutput || 0;
+      acc.costCents += t.costCents || 0;
+      acc.queries += t.queries || 0;
+      return acc;
+    }, { totalTokens: 0, totalInput: 0, totalOutput: 0, costCents: 0, queries: 0 });
+
+    return {
+      ok: true,
+      hours,
+      sinceIso,
+      totalInput: totals.ti,
+      totalOutput: totals.to_,
+      totalCostCents: totals.cost,
+      totalTokens: totals.ti + totals.to_,
+      tasks: allTasks.slice(0, limit),
+      taskTotals,
+    };
+  } catch (err) {
+    return { ...empty, ok: false, error: String(err) };
+  } finally {
+    db.close();
+  }
 }
 
 function getTimers(): unknown[] {
@@ -5655,26 +5851,8 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
   // ── Unleashed status/cancel routes ─────────────────────────────────
 
   app.get('/api/unleashed', (_req, res) => {
-    const unleashedDir = path.join(BASE_DIR, 'unleashed');
-    if (!existsSync(unleashedDir)) {
-      res.json({ tasks: [] });
-      return;
-    }
     try {
-      const tasks: Array<Record<string, unknown>> = [];
-      for (const dir of readdirSync(unleashedDir)) {
-        const dirPath = path.join(unleashedDir, dir);
-        if (!statSync(dirPath).isDirectory()) continue;
-        const statusFile = path.join(dirPath, 'status.json');
-        if (existsSync(statusFile)) {
-          try {
-            const status = JSON.parse(readFileSync(statusFile, 'utf-8'));
-            tasks.push(annotateUnleashedStatus(status, dir));
-          } catch { /* skip corrupt */ }
-        }
-      }
-      tasks.sort((a, b) => String(b.updatedAt || '').localeCompare(String(a.updatedAt || '')));
-      res.json({ tasks });
+      res.json({ tasks: getUnleashedTasksForDashboard() });
     } catch (err) {
       res.status(500).json({ error: String(err) });
     }
@@ -7804,6 +7982,30 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
       res.json({ ok: false, error: String(err), hours, sinceIso, totalTokens: 0, sessions: [], tasks: [], taskTotals: { totalTokens: 0, totalInput: 0, totalOutput: 0, costCents: 0, queries: 0 }, taskAgents: [], agents: [], sources: [] });
     } finally {
       db.close();
+    }
+  });
+
+  app.get('/api/build/operations', async (req, res) => {
+    try {
+      const [{ listAllForBuilder }, { computeBrokenJobs }, { listBackgroundTasks }] = await Promise.all([
+        import('../dashboard/builder/serializer.js'),
+        import('../gateway/failure-monitor.js'),
+        import('../agent/background-tasks.js'),
+      ]);
+      const cronPayload = getCronJobs() as { jobs?: Array<Record<string, unknown>> };
+      const usage = await getBuildUsageForOperations(req.query.hours ?? 168, req.query.limit ?? 50);
+      const snapshot = buildOperationsSnapshot({
+        cronJobs: cronPayload.jobs || [],
+        workflowSummaries: listAllForBuilder(),
+        brokenJobs: computeBrokenJobs() as unknown as Parameters<typeof buildOperationsSnapshot>[0]['brokenJobs'],
+        unleashedTasks: getUnleashedTasksForDashboard(),
+        backgroundTasks: await listBackgroundTasks() as unknown as Array<Record<string, unknown>>,
+        usageTasks: usage.tasks,
+        usageSummary: usage,
+      });
+      res.json({ ok: true, hours: usage.hours, sinceIso: usage.sinceIso, ...snapshot });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: String(err) });
     }
   });
 
@@ -14297,7 +14499,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
     <!-- ═══ Builder Page — Conversational Artifact Creation ═══ -->
     <div class="page" id="page-build">
       <div class="tab-bar" id="build-tabs" style="margin:0;padding:0 18px;background:var(--bg-secondary);border-bottom:1px solid var(--border)">
-        <button class="active" data-build-tab="crons" data-icon="clock" onclick="switchBuildTab('crons')"><span class="icon-slot"></span> Automation <span class="tab-badge" id="build-tab-cron-count" style="display:none">0</span></button>
+        <button class="active" data-build-tab="crons" data-icon="clock" onclick="switchBuildTab('crons')"><span class="icon-slot"></span> Operations <span class="tab-badge" id="build-tab-cron-count" style="display:none">0</span></button>
         <button data-build-tab="workflows" data-icon="workflow" onclick="switchBuildTab('workflows')"><span class="icon-slot"></span> Workflow Builder</button>
         <button data-build-tab="skills" data-icon="shield" onclick="switchBuildTab('skills')"><span class="icon-slot"></span> Skills <span class="tab-badge" id="build-tab-skill-count" style="display:none">0</span></button>
         <button data-build-tab="templates" data-icon="fileText" onclick="switchBuildTab('templates')"><span class="icon-slot"></span> Templates</button>
@@ -14420,7 +14622,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
       <div id="build-tab-crons" data-build-tabpane="crons" style="display:block;flex:1;min-height:0;overflow-y:auto;padding:18px;background:var(--bg-primary)">
         <div style="display:flex;align-items:flex-start;gap:14px;margin-bottom:16px;flex-wrap:wrap">
           <div style="flex:1;min-width:260px">
-            <h2 style="font-size:18px;font-weight:600;margin:0 0 4px;color:var(--text-primary)">Automation</h2>
+            <h2 style="font-size:18px;font-weight:600;margin:0 0 4px;color:var(--text-primary)">Build Operations</h2>
             <p style="font-size:13px;color:var(--text-muted);margin:0;line-height:1.45">Scheduled tasks, scheduled workflows, and live runtime work. Cards here are the turn-on, turn-off, run-now surface.</p>
           </div>
           <div style="display:flex;gap:8px;flex-wrap:wrap">
@@ -18063,7 +18265,7 @@ function openCommandK() {
     { kw: 'home today plan',    page: 'home',     tab: 'today',        label: 'Home · Today' },
     { kw: 'home activity',      page: 'home',     tab: 'activity',     label: 'Home · Activity' },
     { kw: 'build workflows workflow builder', page: 'build', tab: 'workflows', label: 'Build · Workflow Builder' },
-    { kw: 'build crons scheduled tasks automation', page: 'build', tab: 'crons', label: 'Build · Automation' },
+    { kw: 'build crons scheduled tasks operations automation', page: 'build', tab: 'crons', label: 'Build · Operations' },
     { kw: 'build skills',       page: 'build',    tab: 'skills',       label: 'Build · Skills' },
     { kw: 'build templates',    page: 'build',    tab: 'templates',    label: 'Build · Templates' },
     { kw: 'team roster',        page: 'team',     tab: 'roster',       label: 'Team · Roster' },
@@ -19133,6 +19335,14 @@ async function cancelBackgroundTask(id) {
   } catch(e) { toast('Failed to cancel background task: ' + e, 'error'); }
 }
 
+async function deleteBackgroundTask(id) {
+  if (!confirm('Remove background task "' + id + '" from the dashboard? This does not delete any scheduled task definition.')) return;
+  try {
+    await apiDelete('/api/background-tasks/' + encodeURIComponent(id));
+    setTimeout(refreshCron, 500);
+  } catch(e) { toast('Failed to clean up background task: ' + e, 'error'); }
+}
+
 // ── Theme ─────────────────────────────────
 function toggleTheme() {
   var isDark = document.documentElement.getAttribute('data-theme') === 'dark';
@@ -19719,12 +19929,12 @@ async function refreshBuildUsage() {
       + '<div style="font-size:12px;color:var(--text-muted);margin-top:6px;line-height:1.4">Canvas tests are mock-safe. Use Run Real or schedule the workflow when it should execute.</div>'
       + '</div>'
       + '<div style="border:1px solid var(--border);border-radius:8px;background:var(--bg-secondary);padding:12px">'
-      + '<div style="display:flex;align-items:center;justify-content:space-between;gap:8px"><strong style="font-size:13px">Automation</strong><span class="badge badge-green">recurring</span></div>'
+      + '<div style="display:flex;align-items:center;justify-content:space-between;gap:8px"><strong style="font-size:13px">Scheduled Work</strong><span class="badge badge-green">recurring</span></div>'
       + '<div style="font-size:12px;color:var(--text-muted);margin-top:6px;line-height:1.4">Enabled cards can spend tokens automatically. Toggle, run, or delete them here.</div>'
       + '</div>'
       + '<div style="border:1px solid var(--border);border-radius:8px;background:var(--bg-secondary);padding:12px">'
       + '<div style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:.04em">Token Usage · 7d · ' + esc(scopeLabel) + '</div>'
-      + '<div style="display:flex;align-items:baseline;gap:10px;margin-top:4px"><strong style="font-size:22px">' + esc(formatTokens(visibleTokenTotal)) + '</strong><span style="font-size:12px;color:var(--text-muted)">' + esc(formatTokens(automationTokens)) + ' automation</span></div>'
+      + '<div style="display:flex;align-items:baseline;gap:10px;margin-top:4px"><strong style="font-size:22px">' + esc(formatTokens(visibleTokenTotal)) + '</strong><span style="font-size:12px;color:var(--text-muted)">' + esc(formatTokens(automationTokens)) + ' scheduled work</span></div>'
       + (topSession ? '<div style="font-size:11px;color:var(--text-muted);margin-top:4px">Top: ' + esc(topSession.label) + '</div>' : '<div style="font-size:11px;color:var(--text-muted);margin-top:4px">No usage logged for this scope.</div>')
       + agentBreakdownHtml
       + '</div>'
@@ -19748,7 +19958,7 @@ async function refreshBuildUsage() {
     html += '</div>';
 
     html += '<div style="border:1px solid var(--border);border-radius:8px;background:var(--bg-secondary);overflow:hidden">'
-      + '<div style="padding:10px 12px;border-bottom:1px solid var(--border);font-size:12px;font-weight:600">Automation Spend</div>';
+      + '<div style="padding:10px 12px;border-bottom:1px solid var(--border);font-size:12px;font-weight:600">Scheduled Work Spend</div>';
     if (tasks.length === 0) {
       html += '<div style="padding:12px;color:var(--text-muted);font-size:12px">No scheduled or long-running task usage in the last 7 days.</div>';
     } else {
@@ -19770,27 +19980,171 @@ async function refreshBuildUsage() {
   }
 }
 
+function buildOpsOwnerMatches(owner) {
+  if (getBuildOwnerFilter() === BUILD_OWNER_ALL) return true;
+  return buildOwnerMatches(owner || '');
+}
+
+function operationUsageBadge(usage) {
+  if (!usage || !usage.totalTokens) return '';
+  return '<span class="badge badge-blue" title="' + esc(formatTokens(usage.totalInput || 0)) + ' input, ' + esc(formatTokens(usage.totalOutput || 0)) + ' output">' + esc(formatTokens(usage.totalTokens || 0)) + ' tok 7d</span>';
+}
+
+function operationScheduleHtml(schedule) {
+  var desc = describeCron(schedule || '');
+  return desc ? esc(desc) + ' <code>' + esc(schedule) + '</code>' : '<code style="color:var(--accent)">' + esc(schedule || '') + '</code>';
+}
+
+function operationSectionHeader(title, subtitle, badgeClass, badgeText, marginTop) {
+  return '<div style="display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin:' + (marginTop || '0') + ' 0 12px;flex-wrap:wrap">'
+    + '<div><h3 style="font-size:15px;font-weight:600;color:var(--text-primary);margin:0 0 4px">' + esc(title) + '</h3>'
+    + '<div style="font-size:12px;color:var(--text-muted);line-height:1.4">' + esc(subtitle) + '</div></div>'
+    + (badgeText ? '<span class="badge ' + badgeClass + '">' + esc(badgeText) + '</span>' : '')
+    + '</div>';
+}
+
+function renderOperationsSummary(ops) {
+  var s = ops.summary || {};
+  return '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-bottom:16px">'
+    + '<div style="border:1px solid var(--border);border-radius:8px;background:var(--bg-secondary);padding:10px 12px"><div style="font-size:11px;color:var(--text-muted)">Needs Attention</div><div style="font-size:20px;font-weight:700;color:' + ((s.needsAttention || 0) > 0 ? 'var(--red)' : 'var(--green)') + '">' + esc(s.needsAttention || 0) + '</div></div>'
+    + '<div style="border:1px solid var(--border);border-radius:8px;background:var(--bg-secondary);padding:10px 12px"><div style="font-size:11px;color:var(--text-muted)">Scheduled Tasks</div><div style="font-size:20px;font-weight:700">' + esc(s.enabledScheduledTasks || 0) + '/' + esc(s.scheduledTasks || 0) + '</div></div>'
+    + '<div style="border:1px solid var(--border);border-radius:8px;background:var(--bg-secondary);padding:10px 12px"><div style="font-size:11px;color:var(--text-muted)">Scheduled Workflows</div><div style="font-size:20px;font-weight:700">' + esc(s.enabledScheduledWorkflows || 0) + '/' + esc(s.scheduledWorkflows || 0) + '</div></div>'
+    + '<div style="border:1px solid var(--border);border-radius:8px;background:var(--bg-secondary);padding:10px 12px"><div style="font-size:11px;color:var(--text-muted)">Running Now</div><div style="font-size:20px;font-weight:700;color:' + ((s.runningNow || 0) > 0 ? 'var(--blue)' : 'var(--text-primary)') + '">' + esc(s.runningNow || 0) + '</div></div>'
+    + '<div style="border:1px solid var(--border);border-radius:8px;background:var(--bg-secondary);padding:10px 12px"><div style="font-size:11px;color:var(--text-muted)">Scheduled Tokens</div><div style="font-size:20px;font-weight:700">' + esc(formatTokens(s.automationTokens || 0)) + '</div></div>'
+    + '</div>';
+}
+
+function renderAttentionCard(item) {
+  var broken = item.brokenJob || null;
+  var runtime = item.runtime || {};
+  var jobName = broken ? broken.jobName : '';
+  var runtimeName = runtime.runtimeName || runtime.name || runtime.jobName || runtime.id || '';
+  var cardStyle = 'border-left:3px solid ' + (item.severity === 'critical' ? 'var(--red)' : 'var(--yellow)');
+  var title = item.title || jobName || runtimeName || 'Needs attention';
+  var detail = item.detail ? '<div class="task-card-prompt">' + esc(String(item.detail).slice(0, 240)) + '</div>' : '';
+  var diagnosisHtml = '';
+  if (broken && broken.diagnosis) {
+    var d = broken.diagnosis;
+    var proposed = d.proposedFix || {};
+    diagnosisHtml = '<div style="margin-top:8px;padding:8px;border-radius:6px;background:var(--bg-tertiary);font-size:12px;line-height:1.4">'
+      + '<strong>Diagnosis:</strong> ' + esc(d.rootCause || item.reason || '')
+      + (proposed.details ? '<br><strong>Fix:</strong> ' + esc(proposed.details) : '')
+      + '</div>';
+  }
+  var actions = '';
+  if (jobName) {
+    actions += '<button class="btn-sm" data-trace-job="' + esc(jobName) + '">Trace</button>';
+    if (item.type === 'broken_scheduled_task') {
+      actions += '<button class="btn-sm btn-success" onclick="apiPost(\\x27/api/cron/run/' + encodeURIComponent(jobName) + '\\x27)">Run Now</button>'
+        + '<button class="btn-sm" onclick="openEditCronModal(\\x27' + jsStr(jobName) + '\\x27)">Edit</button>'
+        + '<button class="btn-sm" onclick="toggleCronJob(\\x27' + jsStr(jobName) + '\\x27)">Disable</button>';
+    }
+    if (item.actions && item.actions.applyFix) actions += '<button class="btn-sm btn-primary" onclick="applyBrokenJobFix(\\x27' + jsStr(jobName) + '\\x27)">Apply Fix</button>';
+    if (item.actions && item.actions.dismissDiagnosis) actions += '<button class="btn-sm" onclick="dismissBrokenJobDiagnosis(\\x27' + jsStr(jobName) + '\\x27)">Dismiss</button>';
+  }
+  if (item.source === 'runtime') {
+    if (item.actions && item.actions.cancel && runtimeName) actions += '<button class="btn-sm btn-danger" onclick="cancelUnleashed(\\x27' + jsStr(runtimeName) + '\\x27)">Cancel</button>';
+    if (item.actions && item.actions.cleanup && item.type === 'failed_runtime' && runtime.id && !runtime.jobName) actions += '<button class="btn-sm" onclick="deleteBackgroundTask(\\x27' + jsStr(runtime.id) + '\\x27)">Clean up</button>';
+    else if (item.actions && item.actions.cleanup && runtimeName) actions += '<button class="btn-sm" onclick="deleteUnleashedRuntime(\\x27' + jsStr(runtimeName) + '\\x27)">Clean up</button>';
+  }
+  return '<div class="task-card disabled" style="' + cardStyle + '">'
+    + '<div class="task-card-header"><strong>' + esc(title) + '</strong><span class="badge ' + (item.severity === 'critical' ? 'badge-red' : 'badge-yellow') + '">' + esc(item.status || 'review') + '</span></div>'
+    + '<div class="task-card-schedule">' + esc(item.ownerLabel || 'Clementine') + (item.lastAt ? ' · last issue ' + esc(timeAgo(item.lastAt)) : '') + '</div>'
+    + detail
+    + diagnosisHtml
+    + '<div class="task-card-badges"><span class="badge badge-yellow">needs attention</span><span class="badge badge-gray">' + esc(item.source === 'runtime' ? 'runtime' : 'scheduled task') + '</span>' + operationUsageBadge(item.usage) + '</div>'
+    + (actions ? '<div class="task-card-actions">' + actions + '</div>' : '')
+    + '</div>';
+}
+
+function renderScheduledTaskCard(task) {
+  var enabled = task.enabled !== false;
+  var cardCls = 'task-card' + (enabled ? '' : ' disabled') + (task.health === 'running' ? ' running' : '');
+  var style = task.health === 'broken' ? 'border-left:3px solid var(--red)' : task.health === 'failed' ? 'border-left:3px solid var(--yellow)' : '';
+  var lastRunHtml = '<span style="color:var(--text-muted)">Never run</span>';
+  if (task.lastRun) {
+    var lr = task.lastRun;
+    var ok = lr.status === 'ok';
+    var statusIcon = ok ? '<span style="color:var(--green)">&#10003;</span>' : '<span style="color:var(--red)">&#10007;</span>';
+    lastRunHtml = statusIcon + ' ' + esc(lr.status || 'unknown') + ' · ' + esc(timeAgo(lr.finishedAt || lr.startedAt || ''));
+  }
+  if (task.broken) {
+    lastRunHtml = '<span style="color:var(--red)">Needs attention</span> · ' + esc(task.broken.errorCount48h || 0) + '/' + esc(task.broken.totalRuns48h || 0) + ' failures';
+  }
+  var badges = '';
+  if (task.owner) badges += '<span class="badge badge-orange">' + esc(task.owner) + '</span>';
+  if (task.mode === 'unleashed') badges += '<span class="badge badge-purple">long-running</span>';
+  if (task.after) badges += '<span class="badge badge-yellow" title="Triggered after ' + esc(task.after) + '">after ' + esc(task.after) + '</span>';
+  if (task.maxRetries != null) badges += '<span class="badge badge-gray">' + esc(task.maxRetries) + ' retries</span>';
+  badges += operationUsageBadge(task.usage);
+  badges += '<span class="badge ' + (enabled ? 'badge-green' : 'badge-gray') + '">' + (enabled ? 'Enabled' : 'Disabled') + '</span>';
+  badges += '<span class="badge ' + (task.health === 'broken' || task.health === 'failed' ? 'badge-yellow' : 'badge-gray') + '">' + esc(task.healthLabel || task.health) + '</span>';
+  var safeName = jsStr(task.name);
+  return '<div class="' + cardCls + '" style="' + style + '">'
+    + '<div class="task-card-header"><strong>' + esc(task.displayName || task.name) + '</strong>'
+    + '<label class="toggle-switch"><input type="checkbox"' + (enabled ? ' checked' : '') + ' onchange="toggleCronJob(\\x27' + safeName + '\\x27)"><span class="toggle-slider"></span></label></div>'
+    + '<div class="task-card-schedule">' + operationScheduleHtml(task.schedule) + '</div>'
+    + '<div class="task-card-prompt">' + esc(task.prompt || '') + '</div>'
+    + '<div class="task-card-status">' + lastRunHtml + '</div>'
+    + '<div class="task-card-badges">' + badges + '</div>'
+    + '<div class="task-card-actions">'
+    + '<button class="btn-sm btn-success" onclick="apiPost(\\x27/api/cron/run/' + encodeURIComponent(task.name) + '\\x27)">Run Now</button>'
+    + '<button class="btn-sm" data-trace-job="' + esc(task.name) + '">Trace</button>'
+    + '<button class="btn-sm" onclick="openEditCronModal(\\x27' + safeName + '\\x27)">Edit</button>'
+    + '<button class="btn-sm btn-danger" onclick="confirmDeleteCron(\\x27' + safeName + '\\x27)">Del</button>'
+    + '</div></div>';
+}
+
+function renderScheduledWorkflowCard(wf) {
+  var enabled = wf.enabled !== false;
+  var wfId = jsStr(wf.id);
+  var wfName = jsStr(wf.name);
+  var badges = '';
+  if (wf.owner) badges += '<span class="badge badge-orange">' + esc(wf.owner) + '</span>';
+  badges += '<span class="badge badge-purple">chained workflow</span>';
+  badges += '<span class="badge badge-gray">' + esc(wf.stepCount || 0) + ' steps</span>';
+  badges += operationUsageBadge(wf.usage);
+  badges += '<span class="badge ' + (enabled ? 'badge-green' : 'badge-gray') + '">' + (enabled ? 'Enabled' : 'Disabled') + '</span>';
+  return '<div class="task-card' + (enabled ? '' : ' disabled') + '">'
+    + '<div class="task-card-header"><strong>' + esc(wf.displayName || wf.name) + '</strong>'
+    + '<label class="toggle-switch"><input type="checkbox"' + (enabled ? ' checked' : '') + ' onchange="toggleScheduledWorkflow(\\x27' + wfId + '\\x27)"><span class="toggle-slider"></span></label></div>'
+    + '<div class="task-card-schedule">' + operationScheduleHtml(wf.schedule) + '</div>'
+    + '<div class="task-card-prompt">' + esc(wf.description || ((wf.stepCount || 0) + ' step chained workflow')) + '</div>'
+    + '<div class="task-card-status">Run Now executes the real workflow engine. Canvas tests are mock-safe and stub prompt steps.</div>'
+    + '<div class="task-card-badges">' + badges + '</div>'
+    + '<div class="task-card-actions">'
+    + '<button class="btn-sm btn-success" onclick="runScheduledWorkflow(\\x27' + wfId + '\\x27)">Run Now</button>'
+    + '<button class="btn-sm" onclick="openScheduledWorkflow(\\x27' + wfId + '\\x27)">Open</button>'
+    + '<button class="btn-sm btn-danger" onclick="confirmDeleteScheduledWorkflow(\\x27' + wfId + '\\x27,\\x27' + wfName + '\\x27)">Del</button>'
+    + '</div></div>';
+}
+
+function renderRunningCard(item) {
+  var runtime = item.runtime || {};
+  var runtimeName = runtime.runtimeName || runtime.name || runtime.jobName || runtime.id || '';
+  var elapsed = '';
+  if (item.startedAt) elapsed = durationLabel(Date.now() - new Date(item.startedAt).getTime());
+  var cap = item.maxMinutes ? ' · max ' + item.maxMinutes + 'm' : item.maxHours ? ' · max ' + item.maxHours + 'h' : '';
+  return '<div class="task-card running">'
+    + '<div class="task-card-header"><strong>' + esc(item.title || runtimeName || 'running task') + '</strong><span class="badge badge-blue">' + esc(item.status || 'running') + '</span></div>'
+    + '<div class="task-card-schedule">' + esc(item.ownerLabel || 'Clementine') + (elapsed ? ' · running ' + esc(elapsed) : '') + cap + '</div>'
+    + '<div class="task-card-prompt">' + esc(item.promptPreview || '') + '</div>'
+    + '<div class="task-card-badges"><span class="badge badge-purple">' + esc(item.type) + '</span>' + operationUsageBadge(item.usage) + '</div>'
+    + '<div class="task-card-actions">'
+    + (item.type === 'background' ? '<button class="btn-sm btn-danger" onclick="cancelBackgroundTask(\\x27' + jsStr(runtime.id || runtimeName) + '\\x27)">Cancel</button>' : '<button class="btn-sm btn-danger" onclick="cancelUnleashed(\\x27' + jsStr(runtimeName) + '\\x27)">Cancel</button>')
+    + '</div></div>';
+}
+
 async function refreshCron() {
   try {
-    const [cronRes, workflowRes, unleashedRes, backgroundRes, usageRes] = await Promise.all([
-      apiFetch('/api/cron'),
-      apiFetch('/api/builder/workflows').catch(function() { return null; }),
-      apiFetch('/api/unleashed').catch(function() { return null; }),
-      apiFetch('/api/background-tasks').catch(function() { return null; }),
-      apiFetch('/api/build/usage?hours=168&limit=50').catch(function() { return null; }),
-    ]);
-    const d = await cronRes.json();
-    const workflowPayload = workflowRes && workflowRes.ok ? await workflowRes.json() : { workflows: [] };
-    const unleashedPayload = unleashedRes && unleashedRes.ok ? await unleashedRes.json() : { tasks: [] };
-    const backgroundPayload = backgroundRes && backgroundRes.ok ? await backgroundRes.json() : [];
-    const usagePayload = usageRes && usageRes.ok ? await usageRes.json() : { tasks: [] };
-    mergeBuildUsageTasks(usagePayload.tasks || []);
-    cronJobsData = d.jobs || [];
-    scheduledWorkflowData = (workflowPayload.workflows || []).filter(function(w) {
-      return w.origin === 'workflow' && w.schedule;
-    });
+    var r = await apiFetch('/api/build/operations?hours=168&limit=50');
+    var ops = await r.json();
+    if (!r.ok || !ops || ops.ok === false) throw new Error((ops && ops.error) || 'Build operations unavailable');
+    mergeBuildUsageTasks(ops.usageTasks || []);
+    cronJobsData = (ops.scheduledTasks || []).map(function(t) { return t.definition || {}; });
+    scheduledWorkflowData = (ops.scheduledWorkflows || []).map(function(w) { return w.definition || w; });
 
-    var totalScheduled = cronJobsData.length + scheduledWorkflowData.length;
+    var totalScheduled = (ops.summary && (ops.summary.scheduledTasks + ops.summary.scheduledWorkflows)) || (cronJobsData.length + scheduledWorkflowData.length);
     var navCount = document.getElementById('nav-cron-count');
     if (navCount) navCount.textContent = totalScheduled;
     var tabCount = document.getElementById('build-tab-cron-count');
@@ -19803,269 +20157,46 @@ async function refreshCron() {
     if (!panel) return;
 
     var activeBuildTab = document.querySelector('#build-tabs button.active')?.getAttribute('data-build-tab') || '';
-    var ownerFilter = currentPage === 'build' && activeBuildTab === 'crons' ? getBuildOwnerFilter() : BUILD_OWNER_ALL;
-    var visibleJobs = currentPage === 'build' && activeBuildTab === 'crons'
-      ? cronJobsData.filter(function(j) { return buildOwnerMatches(j.agent || ''); })
-      : cronJobsData;
-    var visibleWorkflows = currentPage === 'build' && activeBuildTab === 'crons'
-      ? scheduledWorkflowData.filter(function(w) { return buildOwnerMatches(w.agentSlug || ''); })
-      : scheduledWorkflowData;
+    var ownerScoped = currentPage === 'build' && activeBuildTab === 'crons';
+    var visibleAttention = ownerScoped ? (ops.needsAttention || []).filter(function(i) { return buildOpsOwnerMatches(i.owner || ''); }) : (ops.needsAttention || []);
+    var visibleTasks = ownerScoped ? (ops.scheduledTasks || []).filter(function(t) { return buildOpsOwnerMatches(t.owner || ''); }) : (ops.scheduledTasks || []);
+    var visibleWorkflows = ownerScoped ? (ops.scheduledWorkflows || []).filter(function(w) { return buildOpsOwnerMatches(w.owner || ''); }) : (ops.scheduledWorkflows || []);
+    var visibleRunning = ownerScoped ? (ops.runningNow || []).filter(function(i) { return buildOpsOwnerMatches(i.owner || ''); }) : (ops.runningNow || []);
+    var ownerFilter = getBuildOwnerFilter();
 
-    var noScheduledDefinitions = visibleJobs.length === 0 && visibleWorkflows.length === 0;
-
-    var groups = {};
-    for (const job of visibleJobs) {
-      var g = job.agent || '_main';
-      if (!groups[g]) groups[g] = [];
-      groups[g].push({ kind: 'cron', item: job });
+    var html = renderOperationsSummary(ops);
+    if (visibleAttention.length > 0) {
+      html += operationSectionHeader('Needs Attention', 'Broken scheduled tasks and failed runtime work that can waste tokens or silently stop.', visibleAttention.length > 0 ? 'badge-yellow' : 'badge-gray', visibleAttention.length + ' review', '0')
+        + '<div class="task-grid">' + visibleAttention.slice(0, 12).map(renderAttentionCard).join('') + '</div>';
+      if (visibleAttention.length > 12) html += '<div class="empty-state" style="padding:18px;color:var(--text-muted);font-size:13px">Showing 12 of ' + visibleAttention.length + ' items. Use the Owner filter to narrow this list.</div>';
     }
-    for (const wf of visibleWorkflows) {
-      var wg = wf.agentSlug || '_main';
-      if (!groups[wg]) groups[wg] = [];
-      groups[wg].push({ kind: 'workflow', item: wf });
-    }
-    var groupOrder = Object.keys(groups).sort(function(a, b) {
-      if (a === '_main') return -1;
-      if (b === '_main') return 1;
-      return a.localeCompare(b);
-    });
 
-    let html = '<div style="display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:14px;flex-wrap:wrap">'
-      + '<div>'
-      + '<h3 style="font-size:15px;font-weight:600;color:var(--text-primary);margin:0 0 4px">Scheduled definitions</h3>'
-      + '<div style="font-size:12px;color:var(--text-muted)">Recurring jobs from CRON.md plus workflow files with a schedule. Runtime deep work is separated below.</div>'
-      + '</div>'
-      + '<div style="display:flex;gap:8px;flex-wrap:wrap">'
-      + '<span class="badge badge-blue">' + visibleJobs.length + ' cron</span>'
-      + '<span class="badge badge-purple">' + visibleWorkflows.length + ' workflows</span>'
-      + '</div>'
-      + '</div>';
-
-    if (noScheduledDefinitions) {
-      var emptyLabel = ownerFilter === BUILD_OWNER_ALL ? 'No scheduled definitions across any agent' : (ownerFilter ? 'No scheduled definitions for ' + ownerFilter : 'No global scheduled definitions');
-      html += '<div class="task-grid"><div class="task-card-add" onclick="openCreateCronModal(getBuildCreateOwner())">+ New Task</div></div>'
+    html += operationSectionHeader('Scheduled Tasks', 'Single recurring jobs from CRON.md. These are the default scheduled automation surface.', 'badge-blue', visibleTasks.length + ' task' + (visibleTasks.length === 1 ? '' : 's'), visibleAttention.length > 0 ? '28px' : '0')
+      + '<div class="task-grid">';
+    if (visibleTasks.length === 0) {
+      var emptyLabel = ownerFilter === BUILD_OWNER_ALL ? 'No scheduled tasks across any agent.' : (ownerFilter ? 'No scheduled tasks for ' + ownerFilter + '.' : 'No global scheduled tasks.');
+      html += '<div class="task-card-add" onclick="openCreateCronModal(getBuildCreateOwner())">+ New Scheduled Task</div>'
         + '<div class="empty-state" style="padding:18px;color:var(--text-muted);font-size:13px">' + esc(emptyLabel) + '</div>';
+    } else {
+      html += visibleTasks.map(renderScheduledTaskCard).join('');
+      html += '<div class="task-card-add" onclick="openCreateCronModal(getBuildCreateOwner())">+ New Scheduled Task</div>';
+    }
+    html += '</div>';
+
+    html += operationSectionHeader('Scheduled Workflows', 'A scheduled workflow is one scheduled trigger that runs chained steps. It is separate from CRON.md scheduled tasks.', 'badge-purple', visibleWorkflows.length + ' workflow' + (visibleWorkflows.length === 1 ? '' : 's'), '28px');
+    if (visibleWorkflows.length > 0) {
+      html += '<div class="task-grid">' + visibleWorkflows.map(renderScheduledWorkflowCard).join('') + '</div>';
+    } else {
+      html += '<div class="empty-state" style="padding:18px;color:var(--text-muted);font-size:13px">No scheduled workflows in this scope. Build and schedule chained workflows from the Workflow Builder when a multi-step run is needed.</div>';
     }
 
-    for (var gi = 0; gi < groupOrder.length; gi++) {
-      var groupKey = groupOrder[gi];
-      var groupItems = groups[groupKey];
-      var groupLabel = groupKey === '_main' ? 'Clementine' : groupKey.replace(/-/g, ' ').replace(/\\b\\w/g, function(c) { return c.toUpperCase(); });
-
-      if (groupOrder.length > 1) {
-        var enabledCount = groupItems.filter(function(entry) { return entry.item.enabled !== false; }).length;
-        html += '<div style="display:flex;align-items:center;gap:10px;margin:' + (gi > 0 ? '28px' : '0') + ' 0 12px">'
-          + '<h3 style="font-size:15px;font-weight:600;color:var(--text-primary);margin:0">' + esc(groupLabel) + '</h3>'
-          + '<span style="font-size:12px;color:var(--text-muted)">' + enabledCount + ' of ' + groupItems.length + ' active</span>'
-          + '</div>';
-      }
-
-      html += '<div class="task-grid">';
-      for (const entry of groupItems) {
-        if (entry.kind === 'workflow') {
-          var wf = entry.item;
-          var wfEnabled = wf.enabled !== false;
-          var wfCardCls = 'task-card' + (wfEnabled ? '' : ' disabled');
-          var wfDesc = describeCron(wf.schedule || '');
-          var wfSchedHtml = wfDesc
-            ? esc(wfDesc) + ' <code>' + esc(wf.schedule) + '</code>'
-            : '<code style="color:var(--accent)">' + esc(wf.schedule || '') + '</code>';
-          var wfBadges = '';
-          if (wf.agentSlug) wfBadges += '<span class="badge badge-orange">' + esc(wf.agentSlug) + '</span>';
-          wfBadges += '<span class="badge badge-purple">workflow</span>';
-          wfBadges += '<span class="badge badge-gray">' + (wf.stepCount || 0) + ' steps</span>';
-          wfBadges += buildUsageBadge(wf.name, wf.agentSlug || '');
-          wfBadges += '<span class="badge ' + (wfEnabled ? 'badge-green' : 'badge-gray') + '">' + (wfEnabled ? 'Enabled' : 'Disabled') + '</span>';
-          var wfId = jsStr(wf.id);
-          var wfName = jsStr(wf.name);
-          html += '<div class="' + wfCardCls + '">'
-            + '<div class="task-card-header">'
-            + '<strong>' + esc(wf.name) + '</strong>'
-            + '<label class="toggle-switch"><input type="checkbox"' + (wfEnabled ? ' checked' : '') + ' onchange="toggleScheduledWorkflow(\\x27' + wfId + '\\x27)"><span class="toggle-slider"></span></label>'
-            + '</div>'
-            + '<div class="task-card-schedule">' + wfSchedHtml + '</div>'
-            + '<div class="task-card-prompt">' + esc(wf.description || ((wf.stepCount || 0) + ' step scheduled workflow')) + '</div>'
-            + '<div class="task-card-status"><span style="color:var(--text-muted)">Workflow definition</span></div>'
-            + '<div class="task-card-badges">' + wfBadges + '</div>'
-            + '<div class="task-card-actions">'
-            + '<button class="btn-sm btn-success" onclick="runScheduledWorkflow(\\x27' + wfId + '\\x27)">Run Now</button>'
-            + '<button class="btn-sm" onclick="openScheduledWorkflow(\\x27' + wfId + '\\x27)">Open</button>'
-            + '<button class="btn-sm btn-danger" onclick="confirmDeleteScheduledWorkflow(\\x27' + wfId + '\\x27,\\x27' + wfName + '\\x27)">Del</button>'
-            + '</div></div>';
-          continue;
-        }
-
-        var job = entry.item;
-        var enabled = job.enabled !== false;
-        var cardCls = 'task-card' + (enabled ? '' : ' disabled');
-        if (job.recentRuns && job.recentRuns.length > 0 && job.recentRuns[0].startedAt && !job.recentRuns[0].finishedAt) {
-          cardCls += ' running';
-        }
-        var desc = describeCron(job.schedule || '');
-        var schedHtml = desc
-          ? esc(desc) + ' <code>' + esc(job.schedule) + '</code>'
-          : '<code style="color:var(--accent)">' + esc(job.schedule) + '</code>';
-
-        var lastRunHtml = '<span style="color:var(--text-muted)">Never run</span>';
-        if (job.recentRuns && job.recentRuns.length > 0) {
-          var lr = job.recentRuns[0];
-          var statusIcon = lr.status === 'ok' ? '<span style="color:var(--green)">&#10003;</span>' : '<span style="color:var(--red)">&#10007;</span>';
-          lastRunHtml = statusIcon + ' ' + esc(lr.status) + ' · ' + timeAgo(lr.finishedAt || lr.startedAt);
-        }
-
-        var badgesHtml = '';
-        var projectName = job.work_dir ? job.work_dir.split('/').pop() : '';
-        if (projectName) badgesHtml += '<span class="badge badge-blue">' + esc(projectName) + '</span>';
-        if (job.agent) badgesHtml += '<span class="badge badge-orange">' + esc(job.agent) + '</span>';
-        if (job.mode === 'unleashed') badgesHtml += '<span class="badge badge-purple">unleashed</span>';
-        if (job.after) badgesHtml += '<span class="badge badge-yellow" title="Triggered after ' + esc(job.after) + '">\\u2192 ' + esc(job.after) + '</span>';
-        if (job.max_retries != null) badgesHtml += '<span class="badge badge-gray">' + job.max_retries + ' retries</span>';
-        badgesHtml += buildUsageBadge(job.name, job.agent || '');
-        badgesHtml += '<span class="badge ' + (enabled ? 'badge-green' : 'badge-gray') + '">' + (enabled ? 'Enabled' : 'Disabled') + '</span>';
-
-        var safeName = jsStr(job.name);
-        // Display name without agent prefix for cleaner cards
-        var displayName = job.agent ? job.name.replace(job.agent + ':', '') : job.name;
-
-        html += '<div class="' + cardCls + '">'
-          + '<div class="task-card-header">'
-          + '<strong>' + esc(displayName) + '</strong>'
-          + '<label class="toggle-switch"><input type="checkbox"' + (enabled ? ' checked' : '') + ' onchange="toggleCronJob(\\x27' + safeName + '\\x27)"><span class="toggle-slider"></span></label>'
-          + '</div>'
-          + '<div class="task-card-schedule">' + schedHtml + '</div>'
-          + '<div class="task-card-prompt">' + esc(job.prompt || '') + '</div>'
-          + '<div class="task-card-status">' + lastRunHtml + '</div>'
-          + '<div class="task-card-badges">' + badgesHtml + '</div>'
-          + '<div class="task-card-actions">'
-          + '<button class="btn-sm btn-success" onclick="apiPost(\\x27/api/cron/run/' + encodeURIComponent(job.name) + '\\x27)">Run Now</button>'
-          + '<button class="btn-sm" data-trace-job="' + esc(job.name) + '">Trace</button>'
-          + '<button class="btn-sm" onclick="openEditCronModal(\\x27' + safeName + '\\x27)">Edit</button>'
-          + '<button class="btn-sm btn-danger" onclick="confirmDeleteCron(\\x27' + safeName + '\\x27)">Del</button>'
-          + '</div></div>';
-      }
-      if (groupKey === '_main' || ownerFilter === groupKey) {
-        html += '<div class="task-card-add" onclick="openCreateCronModal(getBuildCreateOwner())">+ New Task</div>';
-      }
-      html += '</div>';
-    }
-
-    var activeBackground = (Array.isArray(backgroundPayload) ? backgroundPayload : []).filter(function(t) {
-      if (t.status !== 'pending' && t.status !== 'running') return false;
-      var fromAgent = t.fromAgent && t.fromAgent !== 'clementine' ? t.fromAgent : '';
-      return ownerFilter === BUILD_OWNER_ALL ? true : buildOwnerMatches(fromAgent || '');
-    });
-    function runtimeOwner(t) {
-      if (t.agentSlug) return String(t.agentSlug);
-      var jobName = String(t.jobName || '');
-      var idx = jobName.indexOf(':');
-      return idx > 0 ? jobName.slice(0, idx) : '';
-    }
-    function runtimeOwnerMatches(t) {
-      return ownerFilter === BUILD_OWNER_ALL ? true : buildOwnerMatches(runtimeOwner(t));
-    }
-    var activeUnleashed = (unleashedPayload.tasks || []).filter(function(t) {
-      var jobName = String(t.jobName || '');
-      if (jobName.indexOf('bg:') === 0) return false;
-      if (t.live !== true && t.runtimeState !== 'active') return false;
-      return runtimeOwnerMatches(t);
-    });
-    var attentionUnleashed = (unleashedPayload.tasks || []).filter(function(t) {
-      var jobName = String(t.jobName || '');
-      if (jobName.indexOf('bg:') === 0) return false;
-      if (!runtimeOwnerMatches(t)) return false;
-      var status = String(t.status || '');
-      return t.stale === true || t.runtimeState === 'stale' || status === 'error' || status === 'failed' || status === 'timeout';
-    });
-
-    var activeTotal = activeBackground.length + activeUnleashed.length;
-    if (activeTotal > 0) {
-      html += '<div style="display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin:28px 0 12px;flex-wrap:wrap">'
-        + '<div>'
-        + '<h3 style="font-size:15px;font-weight:600;color:var(--text-primary);margin:0 0 4px">Running now</h3>'
-        + '<div style="font-size:12px;color:var(--text-muted)">Active deep/background work only. Completed history is intentionally hidden here to keep token-cost risk readable.</div>'
-        + '</div>'
-        + '<span class="badge badge-blue">' + activeTotal + ' active</span>'
-        + '</div><div class="task-grid">';
-
-      var shown = 0;
-      for (var bi = 0; bi < activeBackground.length && shown < 8; bi++, shown++) {
-        var bg = activeBackground[bi];
-        var bgRunningMs = bg.runningForMs || (bg.startedAt ? Date.now() - new Date(bg.startedAt).getTime() : 0);
-        var bgStatusBadge = '<span class="badge ' + (bg.status === 'running' ? 'badge-blue' : 'badge-yellow') + '">' + esc(bg.status) + '</span>';
-        html += '<div class="task-card running">'
-          + '<div class="task-card-header"><strong>Deep task ' + esc(bg.id) + '</strong>' + bgStatusBadge + '</div>'
-          + '<div class="task-card-schedule">' + esc(bg.fromAgent || 'clementine') + ' · max ' + esc(bg.maxMinutes || '') + 'm' + (bg.status === 'running' ? ' · running ' + esc(durationLabel(bgRunningMs)) : '') + '</div>'
-          + '<div class="task-card-prompt">' + esc(bg.prompt || '') + '</div>'
-          + '<div class="task-card-status">Created ' + esc(timeAgo(bg.createdAt)) + '</div>'
-          + '<div class="task-card-badges"><span class="badge badge-purple">background</span>' + buildUsageBadge('bg:' + bg.id, bg.fromAgent && bg.fromAgent !== 'clementine' ? bg.fromAgent : '') + '</div>'
-          + '<div class="task-card-actions">'
-          + '<button class="btn-sm btn-danger" onclick="cancelBackgroundTask(\\x27' + jsStr(bg.id) + '\\x27)">Cancel</button>'
-          + '</div></div>';
-      }
-
-      for (var ui = 0; ui < activeUnleashed.length && shown < 8; ui++, shown++) {
-        var ut = activeUnleashed[ui];
-        var utRuntimeName = ut.runtimeName || ut.name || ut.jobName || '';
-        var uDuration = '';
-        if (ut.startedAt) {
-          var uEnd = ut.finishedAt ? new Date(ut.finishedAt).getTime() : Date.now();
-          uDuration = durationLabel(uEnd - new Date(ut.startedAt).getTime());
-        }
-        html += '<div class="task-card running">'
-          + '<div class="task-card-header"><strong>' + esc(ut.jobName || 'unleashed task') + '</strong><span class="badge badge-blue">' + esc(ut.status || 'running') + '</span></div>'
-          + '<div class="task-card-schedule">Phase ' + esc(ut.phase || 0) + (uDuration ? ' · running ' + esc(uDuration) : '') + (ut.maxHours ? ' / ' + esc(ut.maxHours) + 'h cap' : '') + '</div>'
-          + '<div class="task-card-prompt">' + esc((ut.lastPhaseOutputPreview || '').slice(0, 180)) + '</div>'
-          + '<div class="task-card-status">Runtime task spawned by a scheduled definition</div>'
-          + '<div class="task-card-badges"><span class="badge badge-purple">unleashed</span>' + buildUsageBadge(ut.jobName || '', runtimeOwner(ut)) + '</div>'
-          + '<div class="task-card-actions">'
-          + '<button class="btn-sm btn-danger" onclick="cancelUnleashed(\\x27' + jsStr(utRuntimeName) + '\\x27)">Cancel</button>'
-          + '</div></div>';
-      }
-      if (activeTotal > shown) {
-        html += '<div class="empty-state" style="padding:18px;color:var(--text-muted);font-size:13px">Showing ' + shown + ' of ' + activeTotal + ' active tasks. Use the Owner filter to narrow this list.</div>';
-      }
-      html += '</div>';
-    }
-
-    if (attentionUnleashed.length > 0) {
-      html += '<div style="display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin:28px 0 12px;flex-wrap:wrap">'
-        + '<div>'
-        + '<h3 style="font-size:15px;font-weight:600;color:var(--text-primary);margin:0 0 4px">Needs attention</h3>'
-        + '<div style="font-size:12px;color:var(--text-muted)">Expired or failed runtime records. These are not counted as actively running token spend.</div>'
-        + '</div>'
-        + '<span class="badge badge-yellow">' + attentionUnleashed.length + ' review</span>'
-        + '</div><div class="task-grid">';
-
-      for (var ai = 0; ai < attentionUnleashed.length && ai < 8; ai++) {
-        var at = attentionUnleashed[ai];
-        var atRuntimeName = at.runtimeName || at.name || at.jobName || '';
-        var atStatus = at.effectiveStatus || at.status || 'unknown';
-        var atDuration = '';
-        if (at.startedAt) {
-          var atEnd = at.finishedAt ? new Date(at.finishedAt).getTime() : Date.now();
-          atDuration = durationLabel(atEnd - new Date(at.startedAt).getTime());
-        }
-        var canCancel = at.stale === true || at.runtimeState === 'stale' || at.status === 'running' || at.status === 'pending';
-        html += '<div class="task-card disabled">'
-          + '<div class="task-card-header"><strong>' + esc(at.jobName || atRuntimeName || 'runtime task') + '</strong><span class="badge badge-yellow">' + esc(atStatus) + '</span></div>'
-          + '<div class="task-card-schedule">' + (atDuration ? esc(atDuration) + ' elapsed · ' : '') + 'updated ' + esc(timeAgo(at.updatedAt || at.startedAt || '')) + '</div>'
-          + '<div class="task-card-prompt">' + esc((at.lastPhaseOutputPreview || at.error || '').slice(0, 180)) + '</div>'
-          + '<div class="task-card-status">Review or clean up this runtime record. It is not live work.</div>'
-          + '<div class="task-card-badges"><span class="badge badge-purple">unleashed</span>' + buildUsageBadge(at.jobName || '', runtimeOwner(at)) + '</div>'
-          + '<div class="task-card-actions">'
-          + (canCancel ? '<button class="btn-sm btn-danger" onclick="cancelUnleashed(\\x27' + jsStr(atRuntimeName) + '\\x27)">Cancel</button>' : '')
-          + '<button class="btn-sm" onclick="deleteUnleashedRuntime(\\x27' + jsStr(atRuntimeName) + '\\x27)">Clean up</button>'
-          + '</div></div>';
-      }
-      if (attentionUnleashed.length > 8) {
-        html += '<div class="empty-state" style="padding:18px;color:var(--text-muted);font-size:13px">Showing 8 of ' + attentionUnleashed.length + ' records. Use the Owner filter to narrow this list.</div>';
-      }
-      html += '</div>';
+    if (visibleRunning.length > 0) {
+      html += operationSectionHeader('Running Now', 'Live background, long-running, and unleashed work. These are executions, not scheduled definitions.', 'badge-blue', visibleRunning.length + ' active', '28px')
+        + '<div class="task-grid">' + visibleRunning.slice(0, 10).map(renderRunningCard).join('') + '</div>';
+      if (visibleRunning.length > 10) html += '<div class="empty-state" style="padding:18px;color:var(--text-muted);font-size:13px">Showing 10 of ' + visibleRunning.length + ' active runs. Use the Owner filter to narrow this list.</div>';
     }
 
     panel.innerHTML = html;
-
-    // Attach trace button handlers via delegation
     panel.onclick = function(ev) {
       var target = ev.target;
       while (target && target.id !== 'panel-cron') {
@@ -20076,7 +20207,10 @@ async function refreshCron() {
         target = target.parentElement;
       }
     };
-  } catch(e) { }
+  } catch(e) {
+    var panel = document.getElementById('panel-cron');
+    if (panel) panel.innerHTML = '<div class="empty-state" style="padding:24px;color:var(--red)">Failed to load Build operations: ' + esc(String(e)) + '</div>';
+  }
 }
 
 var traceData = [];
@@ -25776,6 +25910,23 @@ async function refreshHomeDigest() {
         tokenTile.classList.toggle('muted', token7d === 0);
       }
     }
+    try {
+      var opsRes = await apiFetch('/api/build/operations?hours=168&limit=10');
+      var ops = await opsRes.json();
+      if (ops && ops.ok !== false && ops.summary) {
+        var attentionCount = ops.summary.needsAttention || 0;
+        var runningCount = ops.summary.runningNow || 0;
+        var activeEl = document.getElementById('kpi-active-runs');
+        var activeTile = activeEl ? activeEl.closest('.kpi-tile') : null;
+        var activeLabel = activeTile ? activeTile.querySelector('.kpi-label') : null;
+        if (activeEl) activeEl.textContent = String(attentionCount > 0 ? attentionCount : runningCount);
+        if (activeLabel) activeLabel.textContent = attentionCount > 0 ? 'Needs attention' : 'Active runs';
+        if (activeTile) {
+          activeTile.classList.toggle('alert', attentionCount > 0 || runningCount > 0);
+          activeTile.classList.toggle('muted', attentionCount === 0 && runningCount === 0);
+        }
+      }
+    } catch(e) { /* Build operations signal is optional on home. */ }
     setKpi('kpi-approvals', k.pendingApprovals || 0, (k.pendingApprovals || 0) > 0);
     setKpi('kpi-overdue', k.overdueTasks || 0, (k.overdueTasks || 0) > 0);
 
@@ -27647,6 +27798,7 @@ async function applyBrokenJobFix(jobName) {
     if (res && res.ok) {
       toast('Applied ' + (res.appliedOps || []).length + ' op(s) to ' + jobName, 'success');
       refreshBrokenJobs();
+      if (typeof refreshCron === 'function') refreshCron();
     } else {
       toast('Apply failed: ' + ((res && (res.message || res.error)) || 'unknown'), 'error');
     }
@@ -27662,6 +27814,7 @@ async function dismissBrokenJobDiagnosis(jobName) {
     if (res && res.ok) {
       toast('Diagnosis dismissed', 'info');
       refreshBrokenJobs();
+      if (typeof refreshCron === 'function') refreshCron();
     } else {
       toast('Failed to dismiss: ' + ((res && res.error) || 'unknown'), 'error');
     }
