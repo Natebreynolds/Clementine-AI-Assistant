@@ -205,6 +205,7 @@ server.tool(
       synthesis: z.object({ prompt: z.string() }).optional(),
       agentSlug: z.string().optional(),
       project: z.string().optional().describe('Linked-project path; default cwd for CLI steps'),
+      model: z.string().optional().describe('Default model for prompt steps without their own'),
     }),
     force: z.boolean().optional().describe('Bypass validation errors (warnings always ignored)'),
   },

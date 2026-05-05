@@ -674,6 +674,8 @@ export interface WorkflowDefinition {
   /** Optional linked-project path. Becomes the default cwd for CLI steps and
    *  the fallback workDir for prompt/MCP steps that don't set one explicitly. */
   project?: string;
+  /** Default model for prompt steps that don't set their own. e.g. "claude-opus-4-7". */
+  model?: string;
 }
 
 export type WorkflowOriginKind = 'workflow' | 'cron';

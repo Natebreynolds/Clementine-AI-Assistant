@@ -29,7 +29,7 @@ import matter from 'gray-matter';
 import cron from 'node-cron';
 import type { Gateway } from '../gateway/router.js';
 import { TunnelManager } from './tunnel.js';
-import type { RemoteAccessConfig, SessionRecord } from '../types.js';
+import type { RemoteAccessConfig, SessionRecord, WorkflowDefinition } from '../types.js';
 import { AgentManager } from '../agent/agent-manager.js';
 import { discoverMcpServers, getClaudeIntegrations } from '../agent/mcp-bridge.js';
 import {
@@ -3317,12 +3317,15 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
       const folderFilter = typeof req.query.folder === 'string' ? req.query.folder : '';
       const search = typeof req.query.q === 'string' ? req.query.q.toLowerCase() : '';
       const includeAuto = req.query.includeAuto === '1';
+      const typeFilter = typeof req.query.type === 'string' ? req.query.type : '';
+      const tagFilter = typeof req.query.tag === 'string' ? req.query.tag : '';
       const cutoffMs = Date.now() - sinceDays * 24 * 60 * 60 * 1000;
       const vaultRoot = path.join(BASE_DIR, 'vault');
       const matter = (await import('gray-matter')).default;
       const files: Array<{
         path: string; relPath: string; title: string; folder: string;
-        agentSlug: string | null; mtime: string; sizeBytes: number; type: string | null;
+        agentSlug: string | null; mtime: string; sizeBytes: number;
+        type: string | null; category: string | null; tags: string[];
       }> = [];
       function walk(dir: string) {
         let entries: string[] = [];
@@ -3353,6 +3356,8 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
           // Skip system housekeeping files (their author will surface via mtime in agent's own dir)
           let title = path.basename(rel, '.md');
           let typeTag: string | null = null;
+          let categoryTag: string | null = null;
+          let tags: string[] = [];
           try {
             const head = readFileSync(full, 'utf-8').slice(0, 4000);
             const parsed = matter(head);
@@ -3364,6 +3369,12 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
               if (h1) title = h1[1].trim();
             }
             if (typeof data.type === 'string') typeTag = data.type;
+            if (typeof data.category === 'string') categoryTag = data.category;
+            if (Array.isArray(data.tags)) {
+              tags = data.tags.filter((t): t is string => typeof t === 'string');
+            } else if (typeof data.tags === 'string') {
+              tags = data.tags.split(/[,\s]+/).map(s => s.trim()).filter(Boolean);
+            }
           } catch { /* */ }
           files.push({
             path: full,
@@ -3374,6 +3385,8 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
             mtime: new Date(stat.mtimeMs).toISOString(),
             sizeBytes: stat.size,
             type: typeTag,
+            category: categoryTag,
+            tags,
           });
         }
       }
@@ -3384,17 +3397,30 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
           if (agentFilter === '__shared__' && f.agentSlug != null) return false;
           if (agentFilter && agentFilter !== '__shared__' && f.agentSlug !== agentFilter) return false;
           if (folderFilter && f.folder !== folderFilter) return false;
+          if (typeFilter && f.type !== typeFilter) return false;
+          if (tagFilter && !f.tags.includes(tagFilter)) return false;
           if (search) {
-            const hay = (f.title + ' ' + f.relPath).toLowerCase();
+            const hay = (
+              f.title + ' ' + f.relPath + ' ' +
+              (f.type || '') + ' ' + (f.category || '') + ' ' +
+              f.tags.join(' ')
+            ).toLowerCase();
             if (!hay.includes(search)) return false;
           }
           return true;
         })
         .slice(0, limit);
-      // Compute folder counts for filter chips
+      // Facet counts reflect the unfiltered set so the rail keeps the full
+      // vocabulary visible after a filter is applied.
       const folderCounts: Record<string, number> = {};
-      for (const f of files) folderCounts[f.folder] = (folderCounts[f.folder] || 0) + 1;
-      res.json({ files: filtered, total: files.length, folderCounts });
+      const typeCounts: Record<string, number> = {};
+      const tagCounts: Record<string, number> = {};
+      for (const f of files) {
+        folderCounts[f.folder] = (folderCounts[f.folder] || 0) + 1;
+        if (f.type) typeCounts[f.type] = (typeCounts[f.type] || 0) + 1;
+        for (const t of f.tags) tagCounts[t] = (tagCounts[t] || 0) + 1;
+      }
+      res.json({ files: filtered, total: files.length, folderCounts, typeCounts, tagCounts });
     } catch (err) {
       res.status(500).json({ error: String(err) });
     }
@@ -3406,6 +3432,22 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
       if (!relPath || relPath.includes('..')) { res.status(400).json({ error: 'Bad path' }); return; }
       const full = path.join(BASE_DIR, 'vault', relPath);
       if (!existsSync(full)) { res.status(404).json({ error: 'Not found' }); return; }
+      const headOnly = req.query.head === '1';
+      if (headOnly) {
+        const stat = statSync(full);
+        const head = readFileSync(full, 'utf-8').slice(0, 4000);
+        const matter = (await import('gray-matter')).default;
+        const parsed = matter(head);
+        const snippet = (parsed.content || '').replace(/^#+\s.*$/m, '').trim().slice(0, 400);
+        res.json({
+          path: relPath,
+          frontmatter: parsed.data,
+          snippet,
+          sizeBytes: stat.size,
+          mtime: new Date(stat.mtimeMs).toISOString(),
+        });
+        return;
+      }
       const content = readFileSync(full, 'utf-8');
       res.json({ path: relPath, content });
     } catch (err) {
@@ -3945,30 +3987,72 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
 
   app.post('/api/routines', async (req, res) => {
     try {
-      const body = req.body as { name?: string; description?: string; schedule?: string; initialPrompt?: string; agent?: string };
+      const body = req.body as {
+        name?: string;
+        description?: string;
+        schedule?: string;
+        initialPrompt?: string;
+        agent?: string;
+        model?: string;
+        // Chat-first builder may pass the agent's drafted steps as a YAML-ish
+        // string (top-level keys are step ids, values have prompt/dependsOn/etc).
+        draftYaml?: string;
+      };
       if (!body || !body.name) { res.status(400).json({ error: 'name required' }); return; }
-      const [{ saveWorkflow, workflowId: makeId }, { emitBuilderEvent }] = await Promise.all([
+      const [{ saveWorkflow, workflowId: makeId }, { emitBuilderEvent }, yamlMod] = await Promise.all([
         import('../dashboard/builder/serializer.js'),
         import('../dashboard/builder/events.js'),
+        import('js-yaml'),
       ]);
       const slug = body.name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 64) || 'routine';
       const agentSlug = body.agent ? (String(body.agent).trim() || undefined) : undefined;
+
+      // Parse the agent's draft if present; on any parse error fall back to the
+      // single-step stub so the user lands in the editor with something usable.
+      let steps: Array<Record<string, unknown>> | null = null;
+      if (body.draftYaml && typeof body.draftYaml === 'string') {
+        try {
+          const parsed = yamlMod.load(body.draftYaml) as Record<string, unknown> | null;
+          if (parsed && typeof parsed === 'object') {
+            steps = Object.entries(parsed).map(([id, raw]) => {
+              const r = (raw && typeof raw === 'object') ? raw as Record<string, unknown> : {};
+              const dependsOn = Array.isArray(r.dependsOn)
+                ? r.dependsOn.map(String)
+                : (typeof r.dependsOn === 'string' ? r.dependsOn.split(',').map(s => s.trim()).filter(Boolean) : []);
+              return {
+                id: String(id),
+                prompt: String(r.prompt ?? ''),
+                dependsOn,
+                tier: typeof r.tier === 'number' ? r.tier : 1,
+                maxTurns: typeof r.maxTurns === 'number' ? r.maxTurns : 15,
+                ...(typeof r.model === 'string' ? { model: r.model } : {}),
+                ...(typeof r.workDir === 'string' ? { workDir: r.workDir } : {}),
+                ...(typeof r.kind === 'string' && r.kind !== 'prompt' ? { kind: r.kind } : {}),
+              };
+            }).filter(s => s.id);
+            if (steps.length === 0) steps = null;
+          }
+        } catch {
+          steps = null;
+        }
+      }
       const wf = {
         name: body.name,
         description: body.description ?? '',
         enabled: true,
         trigger: body.schedule ? { schedule: body.schedule, manual: false } : { manual: true },
         inputs: {},
-        steps: [{
+        steps: (steps ?? [{
           id: 's1',
           prompt: body.initialPrompt ?? 'Describe what this trick should do.',
           dependsOn: [],
           tier: 1,
           maxTurns: 15,
-        }],
+        }]) as unknown as WorkflowDefinition['steps'],
         sourceFile: '',
         agentSlug,
-      };
+        ...(body.model ? { model: body.model } : {}),
+      } as WorkflowDefinition;
       const id = makeId(slug, agentSlug);
       const result = saveWorkflow(id, wf);
       if (!result.ok) { res.status(400).json({ error: result.error }); return; }
@@ -14955,8 +15039,8 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
           <option value="__global__">Clementine (global)</option>
         </select>
         <button id="routines-back-btn" style="display:none;padding:6px 12px;border-radius:6px;cursor:pointer;font-size:12px;background:var(--bg-tertiary);border:1px solid var(--border);color:var(--text-secondary)" onclick="window.RoutinesUI && RoutinesUI.closeEditor()">&larr; Back to list</button>
-        <button id="routines-assist-btn" class="btn-sm" onclick="window.RoutinesUI && RoutinesUI.openAssist()" title="Describe a trick in natural language" style="padding:6px 12px;border-radius:6px;cursor:pointer;font-size:12px;background:var(--bg-tertiary);border:1px solid var(--border);color:var(--text-secondary)">Generate from prompt</button>
-        <button id="routines-create-btn" class="btn-sm btn-primary" onclick="window.RoutinesUI && RoutinesUI.openCreate()" style="padding:6px 14px;border-radius:6px;cursor:pointer;font-size:12px">+ New Trick</button>
+        <button id="routines-assist-btn" class="btn-sm" onclick="window.RoutinesUI && RoutinesUI.openCreate()" title="Skip the chat and fill out a form yourself" style="padding:6px 12px;border-radius:6px;cursor:pointer;font-size:12px;background:var(--bg-tertiary);border:1px solid var(--border);color:var(--text-secondary)">Build manually</button>
+        <button id="routines-create-btn" class="btn-sm btn-primary" onclick="window.RoutinesUI && RoutinesUI.openChat()" style="padding:6px 14px;border-radius:6px;cursor:pointer;font-size:12px">+ New Trick</button>
       </div>
       <!-- List view (default) -->
       <div id="routines-list-pane" style="flex:1;min-height:0;overflow-y:auto;padding:18px;background:var(--bg-primary)">
@@ -14965,8 +15049,8 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
           <div style="font-size:15px;font-weight:500;color:var(--text-secondary);margin-bottom:6px">No tricks yet</div>
           <div style="font-size:12px;line-height:1.5;max-width:380px;margin:0 auto 16px">A Trick is a sequence of steps Clementine performs on cue &mdash; call MCP tools, run local CLIs, prompt the agent, branch on results &mdash; that runs on a schedule or on demand. Example: &ldquo;at 8am check email; if anything urgent, summarize and Slack me.&rdquo;</div>
           <div style="display:flex;gap:8px;justify-content:center;flex-wrap:wrap">
-            <button class="btn-sm btn-primary" onclick="window.RoutinesUI && RoutinesUI.openCreate()" style="padding:6px 14px">+ New Trick</button>
-            <button class="btn-sm" onclick="window.RoutinesUI && RoutinesUI.openAssist()" style="padding:6px 14px;background:var(--bg-tertiary);border:1px solid var(--border);color:var(--text-secondary)">Generate from prompt</button>
+            <button class="btn-sm btn-primary" onclick="window.RoutinesUI && RoutinesUI.openChat()" style="padding:6px 14px">+ New Trick</button>
+            <button class="btn-sm" onclick="window.RoutinesUI && RoutinesUI.openCreate()" style="padding:6px 14px;background:var(--bg-tertiary);border:1px solid var(--border);color:var(--text-secondary)">Build manually</button>
           </div>
         </div>
         <div id="routines-list-wrap" style="background:var(--bg-secondary);border:1px solid var(--border);border-radius:var(--radius);overflow:hidden">
@@ -15010,16 +15094,29 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
           </div>
         </div>
       </div>
-      <!-- Assist modal (Generate from prompt) -->
-      <div id="routines-assist-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.4);z-index:200;align-items:center;justify-content:center">
-        <div style="background:var(--bg-secondary);border:1px solid var(--border);border-radius:var(--radius);padding:22px;width:560px;max-width:92vw;max-height:80vh;display:flex;flex-direction:column;gap:14px">
-          <h3 style="margin:0;font-size:16px;font-weight:600;color:var(--text-primary)">Generate trick from prompt</h3>
-          <p style="margin:0;font-size:12px;color:var(--text-muted);line-height:1.5">Describe what the trick should do. The assistant will draft a starter sequence you can edit. Example: &ldquo;Every morning at 8am, check unread Gmail; if anything looks urgent, summarize and send to Slack #me.&rdquo;</p>
-          <textarea id="routines-assist-input" rows="6" placeholder="Describe the trick&hellip;" style="width:100%;padding:10px;border:1px solid var(--border);border-radius:6px;background:var(--bg-input);color:var(--text-primary);font-size:13px;font-family:inherit;resize:vertical;box-sizing:border-box"></textarea>
-          <div id="routines-assist-status" style="font-size:11px;color:var(--text-muted);min-height:14px"></div>
-          <div style="display:flex;gap:8px;justify-content:flex-end">
-            <button class="btn-sm" onclick="window.RoutinesUI && RoutinesUI.closeAssist()" style="padding:6px 14px;background:var(--bg-tertiary);border:1px solid var(--border);color:var(--text-secondary)">Cancel</button>
-            <button id="routines-assist-submit" class="btn-sm btn-primary" onclick="window.RoutinesUI && RoutinesUI.submitAssist()" style="padding:6px 14px">Generate</button>
+      <!-- Chat-first builder modal — multi-turn conversation that drafts a trick spec live -->
+      <div id="routines-chat-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.4);z-index:200;align-items:center;justify-content:center">
+        <div style="background:var(--bg-secondary);border:1px solid var(--border);border-radius:var(--radius);width:760px;max-width:96vw;max-height:88vh;display:flex;flex-direction:column;overflow:hidden">
+          <div style="padding:14px 18px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:10px">
+            <h3 style="margin:0;font-size:15px;font-weight:600;color:var(--text-primary)">Build a trick with Clementine</h3>
+            <span style="flex:1"></span>
+            <button class="btn-sm" onclick="window.RoutinesUI && RoutinesUI.closeChat()" style="padding:4px 10px;background:var(--bg-tertiary);border:1px solid var(--border);color:var(--text-secondary)">&times;</button>
+          </div>
+          <!-- Live spec preview -->
+          <div id="routines-chat-preview" style="display:none;padding:10px 18px;border-bottom:1px solid var(--border);background:var(--bg-tertiary);font-size:12px;color:var(--text-secondary)"></div>
+          <!-- Messages -->
+          <div id="routines-chat-messages" style="flex:1;min-height:240px;overflow-y:auto;padding:14px 18px;display:flex;flex-direction:column;gap:10px"></div>
+          <!-- Composer -->
+          <div style="padding:12px 18px;border-top:1px solid var(--border);background:var(--bg-secondary)">
+            <div style="display:flex;gap:8px;align-items:flex-end">
+              <textarea id="routines-chat-input" rows="2" placeholder="Tell Clementine what you want her to do…" style="flex:1;padding:8px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg-input);color:var(--text-primary);font-size:13px;font-family:inherit;resize:vertical;box-sizing:border-box" onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();window.RoutinesUI&&RoutinesUI.sendChat();}"></textarea>
+              <button id="routines-chat-send" class="btn-sm btn-primary" onclick="window.RoutinesUI && RoutinesUI.sendChat()" style="padding:8px 16px;align-self:flex-end">Send</button>
+            </div>
+            <div style="display:flex;align-items:center;gap:10px;margin-top:8px;font-size:11px">
+              <span id="routines-chat-status" style="color:var(--text-muted);flex:1;min-height:14px"></span>
+              <button id="routines-chat-save" class="btn-sm btn-primary" onclick="window.RoutinesUI && RoutinesUI.saveChatDraft()" style="display:none;padding:5px 12px;font-size:11px">Save trick</button>
+              <button class="btn-sm" onclick="window.RoutinesUI && RoutinesUI.closeChat(true);RoutinesUI.openCreate();" style="padding:4px 10px;background:transparent;border:none;color:var(--text-muted);font-size:11px;cursor:pointer;text-decoration:underline">Build manually instead</button>
+            </div>
           </div>
         </div>
       </div>
@@ -15204,8 +15301,11 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
               + '<label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--text-secondary)"><input type="checkbox" id="re-enabled" ' + (wf.enabled ? 'checked' : '') + ' onchange="window.RoutinesUI&&RoutinesUI.markDirty()"> Enabled</label>'
               + '</div>'
               + '<input type="text" id="re-description" value="' + R.esc(wf.description || '') + '" placeholder="Description (optional)" oninput="window.RoutinesUI&&RoutinesUI.markDirty()" style="width:100%;padding:6px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg-input);color:var(--text-primary);font-size:13px;margin-bottom:10px;box-sizing:border-box">'
-              + '<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap"><label style="font-size:11px;color:var(--text-muted);font-weight:500;text-transform:uppercase;letter-spacing:0.04em">Schedule</label>'
+              + '<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:8px"><label style="font-size:11px;color:var(--text-muted);font-weight:500;text-transform:uppercase;letter-spacing:0.04em;min-width:62px">Schedule</label>'
               + '<input type="text" id="re-schedule" value="' + R.esc(wf.trigger && wf.trigger.schedule || '') + '" placeholder="cron e.g. 0 8 * * * (blank = manual)" oninput="window.RoutinesUI&&RoutinesUI.markDirty()" style="flex:1;min-width:240px;padding:6px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg-input);color:var(--text-primary);font-size:12px;font-family:\\x27JetBrains Mono\\x27,monospace">'
+              + '</div>'
+              + '<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap"><label style="font-size:11px;color:var(--text-muted);font-weight:500;text-transform:uppercase;letter-spacing:0.04em;min-width:62px">Model</label>'
+              + R.modelSelect('re-model', wf.model || '', 'Default for prompt steps that don\\x27t override')
               + '</div></div>';
             // Steps
             html += '<div style="font-size:11px;color:var(--text-muted);font-weight:600;text-transform:uppercase;letter-spacing:0.04em;margin:18px 0 8px">Steps</div>';
@@ -15230,10 +15330,15 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
             var kind = step.kind || 'prompt';
             var kindColor = { prompt: '#5e72e4', mcp: '#2dce89', cli: '#fb6340', conditional: '#f5365c', channel: '#11cdef', transform: '#ffd600', loop: '#8965e0' }[kind] || '#888';
             var badge = '<span style="display:inline-block;background:' + kindColor + '22;color:' + kindColor + ';padding:2px 8px;border-radius:4px;font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:0.04em">' + kind + '</span>';
+            // Model picker is only meaningful for prompt steps (other kinds don't call the LLM directly).
+            var modelCtl = (kind === 'prompt')
+              ? R.modelSelect('', step.model || '', 'Use trick default', { idx: idx, small: true })
+              : '';
             var head = '<div style="display:flex;align-items:center;gap:10px;margin-bottom:10px">'
               + '<span style="font-size:11px;color:var(--text-muted);font-weight:600;min-width:24px">#' + (idx + 1) + '</span>'
               + badge
               + '<input type="text" value="' + R.esc(step.id) + '" onchange="window.RoutinesUI&&RoutinesUI.updateStep(' + idx + ',\\x27id\\x27,this.value)" style="font-family:\\x27JetBrains Mono\\x27,monospace;padding:3px 8px;border:1px solid var(--border);border-radius:4px;background:var(--bg-input);color:var(--text-primary);font-size:11px;min-width:120px">'
+              + modelCtl
               + '<span style="flex:1"></span>'
               + (idx > 0 ? '<button title="Move up" onclick="window.RoutinesUI&&RoutinesUI.moveStep(' + idx + ',-1)" style="background:none;border:none;color:var(--text-muted);cursor:pointer;font-size:14px">&uarr;</button>' : '')
               + (idx < (R.state.editing.routine.steps.length - 1) ? '<button title="Move down" onclick="window.RoutinesUI&&RoutinesUI.moveStep(' + idx + ',1)" style="background:none;border:none;color:var(--text-muted);cursor:pointer;font-size:14px">&darr;</button>' : '')
@@ -15320,6 +15425,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
               R.state.editing.routine.trigger = v ? { schedule: v, manual: false } : { manual: true };
             }
             var en = document.getElementById('re-enabled'); if (en) R.state.editing.routine.enabled = en.checked;
+            var md = document.getElementById('re-model'); if (md) R.state.editing.routine.model = md.value || undefined;
             R.setStatus('Unsaved changes');
           },
           updateStep: function(idx, field, value) {
@@ -15605,49 +15711,179 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
                 R.openEditor(res.body.id);
               }).catch(function(err){ alert('Create error: ' + err); });
           },
-          // ── assist (generate from prompt) ───────────────────────────
-          openAssist: function() {
-            var m = document.getElementById('routines-assist-modal'); if (!m) return;
-            document.getElementById('routines-assist-input').value = '';
-            document.getElementById('routines-assist-status').textContent = '';
+          // ── chat-first builder ──────────────────────────────────────
+          // Multi-turn conversation that asks clarifying questions and
+          // drafts a trick spec. The agent emits a fenced json-artifact
+          // block; we parse it for the live preview + Save button.
+          openChat: function() {
+            var m = document.getElementById('routines-chat-modal'); if (!m) return;
+            R.state.chatMessages = [];
+            R.state.chatArtifact = null;
+            R.state.chatBusy = false;
+            document.getElementById('routines-chat-input').value = '';
+            document.getElementById('routines-chat-status').textContent = '';
+            document.getElementById('routines-chat-save').style.display = 'none';
+            R.renderChatMessages();
+            R.renderChatPreview();
+            // Seed with a greeting from the assistant so the panel isn't empty.
+            R.appendChatMessage('assistant', 'Hi! Tell me what you want Clementine to do — a sentence is fine. I\\x27ll ask a couple of follow-ups (when it should run, which tools she needs, which model) and draft a trick you can save.');
             m.style.display = 'flex';
-            setTimeout(function(){ document.getElementById('routines-assist-input').focus(); }, 50);
+            setTimeout(function(){ document.getElementById('routines-chat-input').focus(); }, 50);
           },
-          closeAssist: function() {
-            var m = document.getElementById('routines-assist-modal'); if (m) m.style.display = 'none';
+          closeChat: function(silent) {
+            var m = document.getElementById('routines-chat-modal'); if (m) m.style.display = 'none';
+            if (!silent) R.refreshList();
           },
-          submitAssist: function() {
-            if (R.state.assistBusy) return;
-            var prompt = document.getElementById('routines-assist-input').value.trim();
-            if (!prompt) return;
-            R.state.assistBusy = true;
-            var btn = document.getElementById('routines-assist-submit');
-            var status = document.getElementById('routines-assist-status');
-            if (btn) { btn.textContent = 'Generating…'; btn.disabled = true; }
-            if (status) status.textContent = 'Asking the assistant to draft a trick…';
-            // Reuse the existing /api/builder/chat which is already wired and
-            // produces workflow drafts. We also pass mode hint so the agent
-            // knows to focus on building one routine.
+          appendChatMessage: function(role, text) {
+            R.state.chatMessages.push({ role: role, text: text });
+            R.renderChatMessages();
+          },
+          renderChatMessages: function() {
+            var box = document.getElementById('routines-chat-messages'); if (!box) return;
+            box.innerHTML = (R.state.chatMessages || []).map(function(m){
+              var isUser = m.role === 'user';
+              var bg = isUser ? 'var(--clementine,#ff8c21)' : 'var(--bg-tertiary)';
+              var color = isUser ? '#fff' : 'var(--text-primary)';
+              var align = isUser ? 'flex-end' : 'flex-start';
+              return '<div style="display:flex;justify-content:' + align + '"><div style="max-width:78%;padding:8px 12px;border-radius:10px;background:' + bg + ';color:' + color + ';font-size:13px;line-height:1.5;white-space:pre-wrap">' + R.esc(m.text) + '</div></div>';
+            }).join('');
+            box.scrollTop = box.scrollHeight;
+          },
+          renderChatPreview: function() {
+            var pv = document.getElementById('routines-chat-preview'); if (!pv) return;
+            var a = R.state.chatArtifact;
+            if (!a || !a.name) { pv.style.display = 'none'; return; }
+            pv.style.display = 'block';
+            var schedule = a.schedule ? '<code style="font-family:\\x27JetBrains Mono\\x27,monospace;font-size:11px">' + R.esc(a.schedule) + '</code>' : '<em style="color:var(--text-muted)">manual</em>';
+            var stepCount = (a.steps && typeof a.steps === 'string')
+              ? (a.steps.match(/^[a-zA-Z0-9_-]+:/gm) || []).length
+              : (Array.isArray(a.steps) ? a.steps.length : 0);
+            pv.innerHTML = '<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap"><strong style="color:var(--text-primary)">' + R.esc(a.name) + '</strong>'
+              + '<span style="color:var(--text-muted)">·</span><span>schedule ' + schedule + '</span>'
+              + '<span style="color:var(--text-muted)">·</span><span>' + stepCount + ' step' + (stepCount === 1 ? '' : 's') + '</span>'
+              + (a.model ? '<span style="color:var(--text-muted)">·</span><span>model <code>' + R.esc(a.model) + '</code></span>' : '')
+              + '</div>'
+              + (a.description ? '<div style="margin-top:4px;color:var(--text-muted);font-size:11px">' + R.esc(a.description) + '</div>' : '');
+            // Save button shows once we have a name + at least one step.
+            var saveBtn = document.getElementById('routines-chat-save');
+            if (saveBtn) saveBtn.style.display = (a.name && stepCount > 0) ? '' : 'none';
+          },
+          // Strip a fenced json-artifact block from an assistant response.
+          // The inline-JS rendered into HTML can't carry literal backticks
+          // (they'd close the outer template), so we build the regex via
+          // String.fromCharCode(96) and a string body.
+          extractArtifact: function(text) {
+            if (!text || typeof text !== 'string') return { cleaned: text, artifact: null };
+            var BT = String.fromCharCode(96);
+            var fence = BT + BT + BT;
+            var re = new RegExp(fence + 'json-artifact\\\\s*\\\\n([\\\\s\\\\S]*?)\\\\n' + fence);
+            var m = text.match(re);
+            if (!m) return { cleaned: text, artifact: null };
+            var parsed = null;
+            try { parsed = JSON.parse(m[1]); } catch (e) { /* leave artifact null on parse failure */ }
+            return { cleaned: text.replace(re, '').trim(), artifact: parsed };
+          },
+          sendChat: function() {
+            if (R.state.chatBusy) return;
+            var input = document.getElementById('routines-chat-input');
+            var text = input.value.trim();
+            if (!text) return;
+            input.value = '';
+            R.appendChatMessage('user', text);
+            R.state.chatBusy = true;
+            var sendBtn = document.getElementById('routines-chat-send');
+            var status = document.getElementById('routines-chat-status');
+            if (sendBtn) { sendBtn.textContent = 'Thinking…'; sendBtn.disabled = true; }
+            if (status) status.textContent = 'Clementine is drafting…';
             apiFetch('/api/builder/chat', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ message: prompt, mode: 'workflow' })
-            }).then(function(r){ return r.json(); }).then(function(d){
-              R.state.assistBusy = false;
-              if (btn) { btn.textContent = 'Generate'; btn.disabled = false; }
-              if (status) status.textContent = d && d.message ? 'Draft created. Refreshing list…' : 'Draft response received.';
-              R.refreshList();
-              setTimeout(function(){ R.closeAssist(); }, 800);
-            }).catch(function(err){
-              R.state.assistBusy = false;
-              if (btn) { btn.textContent = 'Generate'; btn.disabled = false; }
-              if (status) status.textContent = 'Assist failed: ' + err;
-            });
+              body: JSON.stringify({
+                message: text,
+                artifactType: 'workflow',
+                currentArtifact: R.state.chatArtifact || undefined,
+              })
+            }).then(function(r){ return r.json().then(function(j){ return { ok: r.ok, body: j }; }); })
+              .then(function(res){
+                R.state.chatBusy = false;
+                if (sendBtn) { sendBtn.textContent = 'Send'; sendBtn.disabled = false; }
+                if (!res.ok) {
+                  if (status) status.textContent = 'Error: ' + (res.body && res.body.error || 'unknown');
+                  return;
+                }
+                var raw = res.body && (res.body.message || res.body.response || res.body.text) || '';
+                var ext = R.extractArtifact(raw);
+                if (ext.artifact) R.state.chatArtifact = ext.artifact;
+                R.appendChatMessage('assistant', ext.cleaned || '(no reply)');
+                R.renderChatPreview();
+                if (status) status.textContent = ext.artifact ? 'Draft updated.' : '';
+              })
+              .catch(function(err){
+                R.state.chatBusy = false;
+                if (sendBtn) { sendBtn.textContent = 'Send'; sendBtn.disabled = false; }
+                if (status) status.textContent = 'Chat error: ' + err;
+              });
+          },
+          // Persist the current draft as a real trick. The artifact's steps
+          // field can come back as a YAML-ish string (per the agent's prompt
+          // template); we hand it off to /api/routines which parses it.
+          saveChatDraft: function() {
+            var a = R.state.chatArtifact;
+            if (!a || !a.name) return;
+            var btn = document.getElementById('routines-chat-save');
+            if (btn) { btn.textContent = 'Saving…'; btn.disabled = true; }
+            apiFetch('/api/routines', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                name: a.name,
+                description: a.description || '',
+                schedule: a.schedule || '',
+                model: a.model || undefined,
+                draftYaml: a.steps,
+              })
+            }).then(function(r){ return r.json().then(function(j){ return { ok: r.ok, body: j }; }); })
+              .then(function(res){
+                if (btn) { btn.textContent = 'Save trick'; btn.disabled = false; }
+                if (!res.ok) {
+                  alert('Save failed: ' + (res.body && res.body.error || 'unknown'));
+                  return;
+                }
+                R.closeChat();
+                if (res.body && res.body.id) R.openEditor(res.body.id);
+              }).catch(function(err){
+                if (btn) { btn.textContent = 'Save trick'; btn.disabled = false; }
+                alert('Save failed: ' + err);
+              });
           },
           // ── helpers ─────────────────────────────────────────────────
           esc: function(s) {
             if (s == null) return '';
             return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+          },
+          // Available Claude models for trick + step model pickers.
+          MODEL_OPTS: [
+            { id: 'claude-opus-4-7',           label: 'Opus 4.7 — most capable' },
+            { id: 'claude-sonnet-4-6',         label: 'Sonnet 4.6 — balanced' },
+            { id: 'claude-haiku-4-5-20251001', label: 'Haiku 4.5 — fastest' },
+          ],
+          // Render a model select. If opts.idx is set, this is a per-step
+          // picker and changes route through updateStep(idx, 'model', value);
+          // otherwise it's the trick-level picker (id=re-model) that
+          // markDirty reads.
+          modelSelect: function(id, current, defaultLabel, opts) {
+            var size = (opts && opts.small) ? 'padding:3px 6px;font-size:11px;min-width:140px' : 'padding:6px 10px;font-size:12px;min-width:200px';
+            var idAttr = id ? ' id="' + id + '"' : '';
+            var onchange = (opts && typeof opts.idx === 'number')
+              ? ' onchange="window.RoutinesUI&&RoutinesUI.updateStep(' + opts.idx + ',\\x27model\\x27,this.value)"'
+              : ' onchange="window.RoutinesUI&&RoutinesUI.markDirty()"';
+            var html = '<select' + idAttr + onchange + ' style="' + size + ';border:1px solid var(--border);border-radius:6px;background:var(--bg-input);color:var(--text-primary)" title="' + R.esc(defaultLabel || '') + '">';
+            html += '<option value=""' + (current ? '' : ' selected') + '>' + R.esc(defaultLabel || 'inherit') + '</option>';
+            R.MODEL_OPTS.forEach(function(m){
+              html += '<option value="' + R.esc(m.id) + '"' + (current === m.id ? ' selected' : '') + '>' + R.esc(m.label) + '</option>';
+            });
+            html += '</select>';
+            return html;
           },
         };
         window.RoutinesUI = R;
@@ -15768,12 +16004,12 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
       </div>
       <div class="tab-bar" id="intelligence-tabs" style="margin:0 0 0 18px">
         <button class="active" data-icon="layoutDashboard" onclick="switchTab('intelligence','overview')"><span class="icon-slot"></span> Overview</button>
-        <button data-icon="database" onclick="switchTab('intelligence','search')"><span class="icon-slot"></span> Memory</button>
+        <button data-icon="database" onclick="switchTab('intelligence','search')"><span class="icon-slot"></span> Chunks</button>
         <button data-icon="upload" onclick="switchTab('intelligence','seed')"><span class="icon-slot"></span> Seed</button>
         <button data-icon="repeat" onclick="switchTab('intelligence','sources')"><span class="icon-slot"></span> Automate</button>
         <button data-icon="listChecks" onclick="switchTab('intelligence','runs')"><span class="icon-slot"></span> Runs</button>
         <button data-icon="sparkles" onclick="switchTab('intelligence','graph')"><span class="icon-slot"></span> Knowledge</button>
-        <button data-icon="fileText" onclick="switchTab('intelligence','files')"><span class="icon-slot"></span> Files</button>
+        <button data-icon="fileText" onclick="switchTab('intelligence','files')"><span class="icon-slot"></span> Memory</button>
         <button data-icon="zap" onclick="switchTab('intelligence','health')"><span class="icon-slot"></span> Health <span class="tab-badge" id="brain-health-badge" style="display:none;background:#ef4444;color:#fff">0</span></button>
         <button data-icon="users" onclick="switchTab('intelligence','user-model')"><span class="icon-slot"></span> User Model</button>
         <button data-icon="brain" onclick="switchTab('intelligence','learning')"><span class="icon-slot"></span> Learning <span class="tab-badge" id="brain-learning-badge" style="display:none;background:#f59e0b;color:#000">0</span></button>

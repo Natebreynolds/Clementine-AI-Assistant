@@ -329,6 +329,7 @@ function parseWorkflowFile(filePath: string): WorkflowDefinition {
     sourceFile: filePath,
     agentSlug: typeof data.agentSlug === 'string' ? (data.agentSlug as string) : undefined,
     project: typeof data.project === 'string' ? (data.project as string) : undefined,
+    model: typeof data.model === 'string' ? (data.model as string) : undefined,
   };
 }
 
@@ -491,6 +492,7 @@ function saveWorkflowFile(
   // For agent-dir workflows the slug lives in the path, not the frontmatter.
   if (!agentSlug && wf.agentSlug) data.agentSlug = wf.agentSlug;
   if (wf.project) data.project = wf.project;
+  if (wf.model) data.model = wf.model;
   if (Object.keys(wf.inputs).length > 0) data.inputs = wf.inputs;
   data.steps = wf.steps.map(serializeStep);
   if (wf.synthesis) data.synthesis = wf.synthesis;
@@ -718,5 +720,6 @@ export function workflowFrontmatterString(wf: WorkflowDefinition): string {
   if (wf.synthesis) data.synthesis = wf.synthesis;
   if (wf.agentSlug) data.agentSlug = wf.agentSlug;
   if (wf.project) data.project = wf.project;
+  if (wf.model) data.model = wf.model;
   return yaml.dump(data);
 }
