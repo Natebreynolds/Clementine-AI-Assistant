@@ -8,6 +8,7 @@
  */
 
 import type { ActiveContextItem, ActiveContextSnapshot } from './active-context.js';
+import type { EntityMatch } from './entity-registry.js';
 
 export type ContextTurnIntent =
   | 'greeting'
@@ -29,11 +30,20 @@ export interface ContextPolicyDecision {
   requiredRetrieval: RequiredRetrieval;
   retrievalQueries: string[];
   debugReasons: string[];
+  triggeredEntities: EntityMatch[];
 }
 
 export interface ContextPolicyInput {
   text: string;
   activeContext?: ActiveContextSnapshot | null;
+  /**
+   * Pre-computed entity matches against the registry. Caller looks these
+   * up via entity-registry.findEntitiesInText so the policy module stays
+   * free of the store dependency. When matches arrive, the policy elevates
+   * recall to 'transcript' on non-trivial intents and seeds entity names
+   * into the retrieval queries.
+   */
+  entityMatches?: EntityMatch[];
 }
 
 const STOPWORDS = new Set([
@@ -122,6 +132,7 @@ function buildRetrievalQueries(intent: ContextTurnIntent, text: string, activeCo
 export function decideContextPolicy(input: ContextPolicyInput): ContextPolicyDecision {
   const intent = classifyContextTurn(input.text);
   const activeContext = input.activeContext ?? null;
+  const entityMatches = input.entityMatches ?? [];
   const debugReasons: string[] = [`intent:${intent}`];
   const proactiveSurface = (activeContext?.items ?? [])
     .filter((item) => item.greetingEligible && !item.alreadySurfaced && !item.resolved)
@@ -132,7 +143,20 @@ export function decideContextPolicy(input: ContextPolicyInput): ContextPolicyDec
   if (intent === 'repair_request' || intent === 'followup' || intent === 'memory_correction') {
     requiredRetrieval = 'transcript';
   }
+  // Entity-driven proactive recall: a known topic in the user's turn is a
+  // strong enough signal to pre-fetch related history without waiting for
+  // a vague-repair phrase. Skip on greeting/ack so a passing entity mention
+  // ("hey, how's the dashboard?") doesn't pull a wall of context into a
+  // friendly hello.
+  const elevatedByEntity = entityMatches.length > 0 && intent !== 'greeting' && intent !== 'ack';
+  if (elevatedByEntity && requiredRetrieval !== 'transcript') {
+    requiredRetrieval = 'transcript';
+    debugReasons.push('entity:elevated-retrieval');
+  }
   if (requiredRetrieval !== 'none') debugReasons.push(`retrieval:${requiredRetrieval}`);
+  if (entityMatches.length > 0) {
+    debugReasons.push(`entities:${entityMatches.map(e => e.name).join(',')}`);
+  }
 
   const silentContextBlocks: string[] = [];
   if (
@@ -150,14 +174,25 @@ export function decideContextPolicy(input: ContextPolicyInput): ContextPolicyDec
       : 'Hey. I am here.'
     : null;
 
+  const baseQueries = buildRetrievalQueries(intent, input.text, activeContext);
+  // Prepend entity display names so the recall search prioritizes them.
+  // Dedup against the base lexical queries so we don't pay twice for the
+  // same term.
+  const entityQueries = entityMatches.map(e => e.display);
+  const merged = [...new Set([...entityQueries, ...baseQueries])]
+    .map(q => q.trim())
+    .filter(Boolean)
+    .slice(0, 6);
+
   return {
     turnIntent: intent,
     silentContextBlocks,
     visibleOpening,
     proactiveSurface,
     requiredRetrieval,
-    retrievalQueries: buildRetrievalQueries(intent, input.text, activeContext),
+    retrievalQueries: merged,
     debugReasons,
+    triggeredEntities: entityMatches,
   };
 }
 

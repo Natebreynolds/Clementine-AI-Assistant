@@ -4037,6 +4037,90 @@ export class MemoryStore {
     }));
   }
 
+  // ── Entity registry ───────────────────────────────────────────────
+
+  /**
+   * Pull a flattened, deduplicated snapshot of named topics + entities the
+   * agent already knows about, ranked by mention frequency. Sources:
+   *   - chunks.topic         (curated knowledge — the strongest signal)
+   *   - episodes.topics      (LLM-extracted topic phrases per session)
+   *   - episodes.entities    (LLM-extracted named things)
+   *
+   * Used by the entity-registry module to detect when a user turn mentions
+   * something we have prior context on, so recall can fire proactively.
+   */
+  getEntityRegistrySnapshot(opts: { minCount?: number; maxItems?: number } = {}): Array<{
+    name: string;
+    display: string;
+    kind: 'topic' | 'entity';
+    count: number;
+  }> {
+    const minCount = Math.max(1, opts.minCount ?? 1);
+    const maxItems = Math.max(1, Math.min(opts.maxItems ?? 500, 5000));
+
+    const counts = new Map<string, { display: string; kind: 'topic' | 'entity'; count: number }>();
+    const accept = (raw: string, kind: 'topic' | 'entity') => {
+      if (!raw) return;
+      const display = raw.trim();
+      if (display.length < 3 || display.length > 80) return;
+      const name = display.toLowerCase();
+      const existing = counts.get(name);
+      if (existing) {
+        existing.count++;
+        // Topics from chunks outrank LLM-derived ones for kind classification.
+        if (kind === 'topic') existing.kind = 'topic';
+      } else {
+        counts.set(name, { display, kind, count: 1 });
+      }
+    };
+
+    try {
+      const topicRows = this.conn
+        .prepare(
+          `SELECT topic, COUNT(*) as cnt FROM chunks
+           WHERE topic IS NOT NULL AND length(trim(topic)) > 0
+           GROUP BY topic`,
+        )
+        .all() as Array<{ topic: string; cnt: number }>;
+      for (const r of topicRows) {
+        const existing = counts.get(r.topic.trim().toLowerCase());
+        if (existing) existing.count += r.cnt - 1; // already added 1 above
+        accept(r.topic, 'topic');
+        if (existing) {
+          // Increment with the SQL-derived count (offset by the 1 accept added).
+          const e = counts.get(r.topic.trim().toLowerCase());
+          if (e) e.count = Math.max(e.count, r.cnt);
+        }
+      }
+    } catch { /* chunks.topic column missing or query fails */ }
+
+    try {
+      const epRows = this.conn
+        .prepare(`SELECT topics, entities FROM episodes`)
+        .all() as Array<{ topics: string | null; entities: string | null }>;
+      for (const row of epRows) {
+        if (row.topics) {
+          try {
+            const arr = JSON.parse(row.topics);
+            if (Array.isArray(arr)) for (const t of arr) if (typeof t === 'string') accept(t, 'topic');
+          } catch { /* skip malformed JSON */ }
+        }
+        if (row.entities) {
+          try {
+            const arr = JSON.parse(row.entities);
+            if (Array.isArray(arr)) for (const e of arr) if (typeof e === 'string') accept(e, 'entity');
+          } catch { /* skip malformed JSON */ }
+        }
+      }
+    } catch { /* episodes table missing */ }
+
+    const all = [...counts.entries()]
+      .map(([name, v]) => ({ name, display: v.display, kind: v.kind, count: v.count }))
+      .filter(e => e.count >= minCount);
+    all.sort((a, b) => b.count - a.count || a.name.length - b.name.length);
+    return all.slice(0, maxItems);
+  }
+
   // ── Commitments ───────────────────────────────────────────────────
 
   /**

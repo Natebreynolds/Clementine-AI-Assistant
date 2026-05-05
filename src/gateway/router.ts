@@ -60,6 +60,7 @@ import { isInternalSyntheticPrompt, resolveRecentOperationalContext, type Recent
 import { decideContextPolicy, type ContextPolicyDecision } from './context-policy.js';
 import { persistConversationLearning } from './conversation-learning.js';
 import { detectCommitmentInTurn, recordDetectedCommitment } from './commitments.js';
+import { findEntitiesInText, getEntityRegistry } from './entity-registry.js';
 import { getBackgroundCreditBlock, isCreditBalanceError, markBackgroundCreditBlocked } from './credit-guard.js';
 import { appendTurnLedger, estimateTokensApprox, formatLastTurnLedger, readRecentTurnLedger } from './turn-ledger.js';
 import { assessGatewayContextHygiene, formatGatewayHygieneAnnotation } from './context-hygiene.js';
@@ -1852,7 +1853,22 @@ export class Gateway {
     const activeContext = this.isTrustedPersonalSession(sessionKey)
       ? buildActiveContextSnapshot(sessionKey, { baseDir: BASE_DIR, transcriptCoverage, openCommitments })
       : null;
-    const contextDecision = decideContextPolicy({ text, activeContext });
+    // Entity recall: if the user mentions something we already have context
+    // on (a chunk topic or an episode entity), elevate retrieval so the
+    // model gets the relevant history without waiting for a repair phrase.
+    let entityMatches: ReturnType<typeof findEntitiesInText> = [];
+    if (this.isTrustedPersonalSession(sessionKey)) {
+      try {
+        const store = this.assistant.getMemoryStore?.();
+        if (store) {
+          const registry = getEntityRegistry(store);
+          if (registry.length > 0) {
+            entityMatches = findEntitiesInText(text, registry);
+          }
+        }
+      } catch { /* entity registry probe is best-effort */ }
+    }
+    const contextDecision = decideContextPolicy({ text, activeContext, entityMatches });
     if (this.isTrustedPersonalSession(sessionKey)) {
       const learning = persistConversationLearning(sessionKey, text, this.assistant.getMemoryStore?.());
       if (learning?.corrections.length || learning?.preferences.length) {
