@@ -18,7 +18,7 @@ import { isLiveUnleashedStatus } from './unleashed-status.js';
 import { recordContextEvent, type ContextEventSeverity } from './context-events.js';
 
 export interface ActiveContextItem {
-  source: 'notification' | 'background-task' | 'unleashed' | 'turn-ledger';
+  source: 'notification' | 'background-task' | 'unleashed' | 'turn-ledger' | 'commitment';
   label: string;
   detail: string;
   priority: number;
@@ -49,6 +49,19 @@ export interface ActiveContextOptions {
    * carries an inline note so the model knows recall is degraded.
    */
   transcriptCoverage?: { embedded: number; total: number };
+  /**
+   * Open commitments tied to this session (or owner-wide). Caller looks
+   * these up via store.listCommitments and threads them through so
+   * active-context.ts stays free of the store dependency.
+   */
+  openCommitments?: Array<{
+    id: number;
+    owner: 'user' | 'clementine';
+    text: string;
+    dueAt: string | null;
+    dueHint: string | null;
+    sessionKey: string | null;
+  }>;
 }
 
 const RECENT_TASK_TTL_MS = 24 * 60 * 60 * 1000;
@@ -327,6 +340,33 @@ function turnLedgerItems(surfaceHistory: SurfaceHistory): ActiveContextItem[] {
     }));
 }
 
+function commitmentItems(opts: ActiveContextOptions): ActiveContextItem[] {
+  const list = opts.openCommitments ?? [];
+  if (list.length === 0) return [];
+  const nowMs = opts.now ?? Date.now();
+  const dayMs = 24 * 60 * 60 * 1000;
+  return list.slice(0, 10).map((c) => {
+    const dueMs = c.dueAt ? Date.parse(c.dueAt) : NaN;
+    const overdue = Number.isFinite(dueMs) && dueMs < nowMs;
+    const dueWithin24 = Number.isFinite(dueMs) && dueMs >= nowMs && dueMs - nowMs <= dayMs;
+    let priority = 60;
+    if (overdue) priority = 90;
+    else if (dueWithin24) priority = 80;
+    else if (c.dueHint) priority = 70;
+    const ownerLabel = c.owner === 'clementine' ? 'I committed' : 'You committed';
+    const dueLabel = overdue ? ' (overdue)' : dueWithin24 ? ' (due within 24h)' : c.dueHint ? ` (${c.dueHint})` : '';
+    return {
+      source: 'commitment',
+      label: `${ownerLabel}${dueLabel}`,
+      detail: cap(c.text),
+      priority,
+      timestamp: c.dueAt ?? undefined,
+      sourceId: `commitment:${c.id}`,
+      greetingEligible: overdue || dueWithin24,
+    };
+  });
+}
+
 function formatPromptBlock(
   items: ActiveContextItem[],
   coverage?: { embedded: number; total: number },
@@ -375,6 +415,7 @@ export function buildActiveContextSnapshot(
     ...notificationItems(sessionKey, opts),
     ...unleashedItems(opts, surfaceHistory),
     ...turnLedgerItems(surfaceHistory),
+    ...commitmentItems(opts),
   ]
     .sort((a, b) => {
       const priority = b.priority - a.priority;

@@ -59,6 +59,7 @@ import {
 import { isInternalSyntheticPrompt, resolveRecentOperationalContext, type RecentOperationalContext } from './recent-context.js';
 import { decideContextPolicy, type ContextPolicyDecision } from './context-policy.js';
 import { persistConversationLearning } from './conversation-learning.js';
+import { detectCommitmentInTurn, recordDetectedCommitment } from './commitments.js';
 import { getBackgroundCreditBlock, isCreditBalanceError, markBackgroundCreditBlocked } from './credit-guard.js';
 import { appendTurnLedger, estimateTokensApprox, formatLastTurnLedger, readRecentTurnLedger } from './turn-ledger.js';
 import { assessGatewayContextHygiene, formatGatewayHygieneAnnotation } from './context-hygiene.js';
@@ -1818,6 +1819,10 @@ export class Gateway {
     // another turn is active.
     const localTurnStarted = Date.now();
     let transcriptCoverage: { embedded: number; total: number } | undefined;
+    let openCommitments: Array<{
+      id: number; owner: 'user' | 'clementine'; text: string;
+      dueAt: string | null; dueHint: string | null; sessionKey: string | null;
+    }> | undefined;
     if (this.isTrustedPersonalSession(sessionKey)) {
       try {
         const store = this.assistant.getMemoryStore?.();
@@ -1825,10 +1830,27 @@ export class Gateway {
           const cov = (store as { getTranscriptDenseCoverage: () => { embedded: number; total: number } }).getTranscriptDenseCoverage();
           transcriptCoverage = { embedded: cov.embedded, total: cov.total };
         }
-      } catch { /* coverage probe is best-effort */ }
+        if (store && typeof (store as { listCommitments?: unknown }).listCommitments === 'function') {
+          // Pull session-scoped open commitments first, then pad with the
+          // wider open list so commitments captured in other sessions still
+          // surface in greetings (e.g. user said "remind me Friday" via
+          // Slack, then opens a Discord DM Saturday).
+          const list = (store as {
+            listCommitments: (o: { status: 'open'; sessionKey?: string; limit?: number }) => Array<{
+              id: number; owner: 'user' | 'clementine'; text: string;
+              dueAt: string | null; dueHint: string | null; sessionKey: string | null;
+            }>;
+          }).listCommitments;
+          const scoped = list({ status: 'open', sessionKey, limit: 10 });
+          const wider = scoped.length < 6 ? list({ status: 'open', limit: 10 }) : [];
+          const seen = new Set<number>();
+          const merged = [...scoped, ...wider].filter(c => !seen.has(c.id) && (seen.add(c.id), true));
+          openCommitments = merged.slice(0, 10);
+        }
+      } catch { /* probes are best-effort */ }
     }
     const activeContext = this.isTrustedPersonalSession(sessionKey)
-      ? buildActiveContextSnapshot(sessionKey, { baseDir: BASE_DIR, transcriptCoverage })
+      ? buildActiveContextSnapshot(sessionKey, { baseDir: BASE_DIR, transcriptCoverage, openCommitments })
       : null;
     const contextDecision = decideContextPolicy({ text, activeContext });
     if (this.isTrustedPersonalSession(sessionKey)) {
@@ -1839,6 +1861,25 @@ export class Gateway {
           corrections: learning.corrections.length,
           preferences: learning.preferences.length,
         }, 'Captured deterministic conversation learning signal');
+      }
+      // Best-effort: scan this user turn for an explicit commitment phrase
+      // ("I'll fix that tomorrow"). Detection runs synchronously and
+      // dedupes by fingerprint so re-running on the same text is a no-op.
+      try {
+        const detected = detectCommitmentInTurn(text, 'user');
+        if (detected) {
+          const store = this.assistant.getMemoryStore?.();
+          if (store) {
+            const recorded = recordDetectedCommitment(store, sessionKey, detected, { source: 'turn-detector' });
+            if (recorded?.created) {
+              logger.info({
+                sessionKey, owner: detected.owner, dueHint: detected.dueHint, hasDueAt: !!detected.dueAt,
+              }, 'Captured explicit user commitment');
+            }
+          }
+        }
+      } catch (err) {
+        logger.debug({ err }, 'Commitment detection failed (non-fatal)');
       }
     }
     const localResponse = await this.handleLocalTurn(sessionKey, text, onText, contextDecision);

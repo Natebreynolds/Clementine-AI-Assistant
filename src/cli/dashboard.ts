@@ -6947,6 +6947,59 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
     }
   });
 
+  // Commitments — durable promises tracked across sessions.
+  app.get('/api/memory/commitments', async (req, res) => {
+    try {
+      const gateway = await getGateway();
+      const store = (gateway as any).assistant?.memoryStore;
+      if (!store || typeof store.listCommitments !== 'function') {
+        res.status(503).json({ error: 'Commitments store not available' });
+        return;
+      }
+      const status = req.query.status ? String(req.query.status) : 'open';
+      const owner = req.query.owner ? String(req.query.owner) : undefined;
+      const overdueOnly = String(req.query.overdueOnly ?? '') === '1';
+      const limit = Math.min(parseInt(String(req.query.limit ?? '50'), 10) || 50, 500);
+      const commitments = store.listCommitments({
+        status: ['open', 'done', 'cancelled'].includes(status) ? status : 'open',
+        owner: owner === 'user' || owner === 'clementine' ? owner : undefined,
+        overdueOnly,
+        limit,
+      });
+      res.json({ ok: true, commitments });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  app.post('/api/memory/commitments/action', async (req, res) => {
+    try {
+      const gateway = await getGateway();
+      const store = (gateway as any).assistant?.memoryStore;
+      if (!store || typeof store.updateCommitmentStatus !== 'function') {
+        res.status(503).json({ error: 'Commitments store not available' });
+        return;
+      }
+      const id = Number(req.body?.id);
+      const action = String(req.body?.action ?? '');
+      if (!Number.isInteger(id) || id <= 0) { res.status(400).json({ error: 'id required' }); return; }
+      let updated = false;
+      if (action === 'done' || action === 'cancelled' || action === 'reopen') {
+        updated = store.updateCommitmentStatus(id, { status: action === 'reopen' ? 'open' : action });
+      } else if (action === 'snooze') {
+        const hours = Number(req.body?.hours ?? 24);
+        const until = new Date(Date.now() + Math.max(1, hours) * 3600_000).toISOString();
+        updated = store.updateCommitmentStatus(id, { snoozeUntilIso: until });
+      } else {
+        res.status(400).json({ error: 'invalid action' });
+        return;
+      }
+      res.json({ ok: updated });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
   // Recent episodes — durable consolidated session summaries.
   app.get('/api/memory/episodes', async (req, res) => {
     try {
@@ -14952,6 +15005,22 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
             </div>
             <div class="card" style="margin-bottom:14px">
               <div class="card-header" style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap">
+                <span>Open commitments</span>
+                <div style="display:flex;align-items:center;gap:8px">
+                  <select id="commitments-filter-status" onchange="refreshCommitments()" style="font-size:12px;padding:4px 6px;border:1px solid var(--border);border-radius:4px;background:var(--bg-input);color:var(--text)">
+                    <option value="open" selected>Open</option>
+                    <option value="done">Done</option>
+                    <option value="cancelled">Cancelled</option>
+                  </select>
+                  <span style="font-size:11px;color:var(--text-muted)">Promises tracked across sessions</span>
+                </div>
+              </div>
+              <div class="card-body" id="panel-commitments" style="padding:0">
+                <div class="skel-block" style="padding:14px"><div class="skel-row med"></div><div class="skel-row short"></div></div>
+              </div>
+            </div>
+            <div class="card" style="margin-bottom:14px">
+              <div class="card-header" style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap">
                 <span>Recent episodes</span>
                 <div style="display:flex;align-items:center;gap:8px">
                   <select id="episodes-filter-since" onchange="refreshRecentEpisodes()" style="font-size:12px;padding:4px 6px;border:1px solid var(--border);border-radius:4px;background:var(--bg-input);color:var(--text)">
@@ -18478,6 +18547,7 @@ function switchTab(group, tab) {
       refreshMemory();
       if (typeof refreshRecentWrites === 'function') refreshRecentWrites();
       if (typeof refreshRecentEpisodes === 'function') refreshRecentEpisodes();
+      if (typeof refreshCommitments === 'function') refreshCommitments();
       if (typeof refreshSupersedes === 'function') refreshSupersedes();
       if (typeof refreshCoverageStrip === 'function') refreshCoverageStrip();
     }
@@ -24836,6 +24906,7 @@ async function submitQuickAddMemory() {
       closeQuickAddMemory();
       if (typeof refreshRecentWrites === 'function') refreshRecentWrites();
       if (typeof refreshRecentEpisodes === 'function') refreshRecentEpisodes();
+      if (typeof refreshCommitments === 'function') refreshCommitments();
       if (typeof refreshMemory === 'function') refreshMemory();
     }, 600);
   } catch (err) {
@@ -24986,6 +25057,84 @@ async function refreshRecentWrites() {
     el.innerHTML = html;
   } catch (err) {
     el.innerHTML = '<div class="empty-state" style="padding:14px">Failed to load: ' + esc(String(err)) + '</div>';
+  }
+}
+
+async function refreshCommitments() {
+  var el = document.getElementById('panel-commitments');
+  if (!el) return;
+  try {
+    var sel = document.getElementById('commitments-filter-status');
+    var status = sel ? sel.value : 'open';
+    var r = await apiFetch('/api/memory/commitments?limit=50&status=' + encodeURIComponent(status));
+    var d = await r.json();
+    if (!d.ok || !Array.isArray(d.commitments)) {
+      el.innerHTML = '<div class="empty-state" style="padding:14px">' + esc(d.error || 'No data') + '</div>';
+      return;
+    }
+    if (d.commitments.length === 0) {
+      el.innerHTML = '<div class="empty-state" style="padding:14px">No commitments. They land automatically when you say things like "I\\'ll fix that tomorrow" or "remind me to call them Friday".</div>';
+      return;
+    }
+    var html = '<table class="data-table" style="width:100%">';
+    html += '<thead><tr>'
+      + '<th style="width:80px">Owner</th>'
+      + '<th>Promise</th>'
+      + '<th style="width:140px">Due</th>'
+      + '<th style="width:100px">Source</th>'
+      + '<th style="width:200px">Actions</th>'
+      + '</tr></thead><tbody>';
+    var nowMs = Date.now();
+    for (var i = 0; i < d.commitments.length; i++) {
+      var c = d.commitments[i];
+      var ownerLabel = c.owner === 'clementine' ? 'I' : 'You';
+      var ownerColor = c.owner === 'clementine' ? '#a78bfa' : '#10b981';
+      var dueText = '—';
+      var dueColor = 'var(--text-muted)';
+      if (c.dueAt) {
+        try {
+          var dueMs = new Date(c.dueAt).getTime();
+          var deltaMs = dueMs - nowMs;
+          dueText = new Date(c.dueAt).toLocaleString();
+          if (deltaMs < 0) { dueText = 'OVERDUE — ' + dueText; dueColor = '#ef4444'; }
+          else if (deltaMs < 86_400_000) { dueColor = '#f59e0b'; }
+        } catch { dueText = c.dueAt; }
+      } else if (c.dueHint) {
+        dueText = c.dueHint;
+      }
+      var actions = '';
+      if (c.status === 'open') {
+        actions = '<button class="btn-sm" onclick="commitmentAction(' + c.id + ', \\'done\\')">Done</button>'
+          + ' <button class="btn-sm" onclick="commitmentAction(' + c.id + ', \\'snooze\\', 24)" title="Snooze 24h">Snooze</button>'
+          + ' <button class="btn-sm" onclick="commitmentAction(' + c.id + ', \\'cancelled\\')">Cancel</button>';
+      } else {
+        actions = '<button class="btn-sm" onclick="commitmentAction(' + c.id + ', \\'reopen\\')">Reopen</button>';
+      }
+      html += '<tr>'
+        + '<td style="font-size:11px;color:' + ownerColor + ';font-weight:600">' + ownerLabel + '</td>'
+        + '<td style="font-size:12px">' + esc(c.text) + '</td>'
+        + '<td style="font-size:11px;color:' + dueColor + '">' + esc(dueText) + '</td>'
+        + '<td style="font-size:11px;color:var(--text-muted)">' + esc(c.source) + '</td>'
+        + '<td>' + actions + '</td>'
+        + '</tr>';
+    }
+    html += '</tbody></table>';
+    el.innerHTML = html;
+  } catch (err) {
+    el.innerHTML = '<div class="empty-state" style="padding:14px">Failed to load: ' + esc(String(err)) + '</div>';
+  }
+}
+
+async function commitmentAction(id, action, hours) {
+  try {
+    var body = { id: id, action: action };
+    if (hours) body.hours = hours;
+    var r = await apiJson('POST', '/api/memory/commitments/action', body);
+    if (r.error) { toast('Action failed: ' + r.error, 'error'); return; }
+    toast('Commitment ' + action, 'success');
+    refreshCommitments();
+  } catch (err) {
+    toast('Failed: ' + String(err), 'error');
   }
 }
 

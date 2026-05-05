@@ -1079,6 +1079,34 @@ export class MemoryStore {
       );
     `);
 
+    // Commitments — first-class promises in either direction. owner = 'user'
+    // for "I'll fix that tomorrow" turns, 'clementine' for things she
+    // committed to do. fingerprint = sha1(session_key|owner|normalized_text)
+    // makes the explicit detector and the LLM episode extractor share an
+    // idempotent insert path so one promise doesn't get double-recorded.
+    this.conn.exec(`
+      CREATE TABLE IF NOT EXISTS commitments (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        fingerprint TEXT NOT NULL UNIQUE,
+        source TEXT NOT NULL,
+        owner TEXT NOT NULL,
+        text TEXT NOT NULL,
+        session_key TEXT,
+        transcript_id INTEGER,
+        episode_id INTEGER,
+        due_at TEXT,
+        due_hint TEXT,
+        status TEXT NOT NULL DEFAULT 'open',
+        created_at TEXT DEFAULT (datetime('now')),
+        completed_at TEXT,
+        snoozed_until TEXT,
+        notes TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_commitments_status ON commitments(status, due_at);
+      CREATE INDEX IF NOT EXISTS idx_commitments_session ON commitments(session_key, status);
+      CREATE INDEX IF NOT EXISTS idx_commitments_owner ON commitments(owner, status);
+    `);
+
     // Soft-delete via a separate table — keeps the chunks_au trigger
     // out of the path so we don't have to fight with the FTS5 contentless
     // index's delete-then-insert semantics. Search query paths LEFT JOIN
@@ -4007,6 +4035,158 @@ export class MemoryStore {
       chunkId: row.chunk_id,
       createdAt: row.created_at,
     }));
+  }
+
+  // ── Commitments ───────────────────────────────────────────────────
+
+  /**
+   * Insert a commitment, deduping on the fingerprint. If a row with the
+   * same fingerprint already exists, the existing id is returned and no
+   * write occurs — keeps the regex detector + LLM extractor from creating
+   * duplicates of the same promise.
+   */
+  upsertCommitment(entry: {
+    fingerprint: string;
+    source: string;
+    owner: 'user' | 'clementine';
+    text: string;
+    sessionKey?: string | null;
+    transcriptId?: number | null;
+    episodeId?: number | null;
+    dueAt?: string | null;
+    dueHint?: string | null;
+  }): { id: number; created: boolean } {
+    const existing = this.conn
+      .prepare('SELECT id FROM commitments WHERE fingerprint = ?')
+      .get(entry.fingerprint) as { id: number } | undefined;
+    if (existing) {
+      return { id: existing.id, created: false };
+    }
+    const result = this.conn
+      .prepare(
+        `INSERT INTO commitments
+         (fingerprint, source, owner, text, session_key, transcript_id, episode_id, due_at, due_hint)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        entry.fingerprint,
+        entry.source,
+        entry.owner,
+        entry.text,
+        entry.sessionKey ?? null,
+        entry.transcriptId ?? null,
+        entry.episodeId ?? null,
+        entry.dueAt ?? null,
+        entry.dueHint ?? null,
+      );
+    return { id: result.lastInsertRowid as number, created: true };
+  }
+
+  /**
+   * List commitments with optional filters. Sorted by due_at ASC NULLS LAST
+   * so overdue + soon-due float to the top.
+   */
+  listCommitments(opts: {
+    status?: 'open' | 'done' | 'cancelled';
+    sessionKey?: string;
+    owner?: 'user' | 'clementine';
+    overdueOnly?: boolean;
+    dueBeforeIso?: string;
+    limit?: number;
+  } = {}): Array<{
+    id: number;
+    fingerprint: string;
+    source: string;
+    owner: 'user' | 'clementine';
+    text: string;
+    sessionKey: string | null;
+    transcriptId: number | null;
+    episodeId: number | null;
+    dueAt: string | null;
+    dueHint: string | null;
+    status: 'open' | 'done' | 'cancelled';
+    createdAt: string;
+    completedAt: string | null;
+    snoozedUntil: string | null;
+  }> {
+    const params: unknown[] = [];
+    const where: string[] = [];
+    if (opts.status) { where.push('status = ?'); params.push(opts.status); }
+    if (opts.sessionKey) { where.push('session_key = ?'); params.push(opts.sessionKey); }
+    if (opts.owner) { where.push('owner = ?'); params.push(opts.owner); }
+    if (opts.overdueOnly) {
+      where.push("due_at IS NOT NULL AND due_at < datetime('now') AND status = 'open'");
+    } else if (opts.dueBeforeIso) {
+      where.push('due_at IS NOT NULL AND due_at <= ?');
+      params.push(opts.dueBeforeIso);
+    }
+    // Suppress snoozed rows from "open" view unless caller asked for status explicitly.
+    // Wrapping both sides in datetime() so ISO-8601 strings (with T/Z/millis) and
+    // SQLite's space-separated `datetime('now')` format compare correctly.
+    if (opts.status === 'open' || (!opts.status && !opts.overdueOnly)) {
+      where.push("(snoozed_until IS NULL OR datetime(snoozed_until) <= datetime('now'))");
+    }
+    const limit = Math.max(1, Math.min(opts.limit ?? 50, 500));
+    const sql = `SELECT * FROM commitments
+                 ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
+                 ORDER BY (due_at IS NULL) ASC, due_at ASC, created_at DESC
+                 LIMIT ?`;
+    params.push(limit);
+    const rows = this.conn.prepare(sql).all(...params) as Array<{
+      id: number; fingerprint: string; source: string; owner: string;
+      text: string; session_key: string | null; transcript_id: number | null;
+      episode_id: number | null; due_at: string | null; due_hint: string | null;
+      status: string; created_at: string; completed_at: string | null;
+      snoozed_until: string | null;
+    }>;
+    return rows.map(r => ({
+      id: r.id,
+      fingerprint: r.fingerprint,
+      source: r.source,
+      owner: r.owner as 'user' | 'clementine',
+      text: r.text,
+      sessionKey: r.session_key,
+      transcriptId: r.transcript_id,
+      episodeId: r.episode_id,
+      dueAt: r.due_at,
+      dueHint: r.due_hint,
+      status: r.status as 'open' | 'done' | 'cancelled',
+      createdAt: r.created_at,
+      completedAt: r.completed_at,
+      snoozedUntil: r.snoozed_until,
+    }));
+  }
+
+  /**
+   * Update commitment status. 'done' / 'cancelled' set completed_at; 'snooze'
+   * (with snoozeIso) bumps snoozed_until without changing status so the row
+   * stays open but suppressed from greeting until the snooze expires.
+   */
+  updateCommitmentStatus(
+    id: number,
+    update: { status?: 'open' | 'done' | 'cancelled'; snoozeUntilIso?: string; notes?: string },
+  ): boolean {
+    const sets: string[] = [];
+    const vals: unknown[] = [];
+    if (update.status) {
+      sets.push('status = ?');
+      vals.push(update.status);
+      if (update.status === 'done' || update.status === 'cancelled') {
+        sets.push("completed_at = datetime('now')");
+      }
+    }
+    if (update.snoozeUntilIso !== undefined) {
+      sets.push('snoozed_until = ?');
+      vals.push(update.snoozeUntilIso);
+    }
+    if (update.notes !== undefined) {
+      sets.push('notes = ?');
+      vals.push(update.notes);
+    }
+    if (sets.length === 0) return false;
+    vals.push(id);
+    const result = this.conn.prepare(`UPDATE commitments SET ${sets.join(', ')} WHERE id = ?`).run(...vals);
+    return result.changes > 0;
   }
 
   /**

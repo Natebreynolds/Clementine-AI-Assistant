@@ -19,6 +19,11 @@ import pino from 'pino';
 
 import { MODELS } from '../config.js';
 import type { MemoryStore } from '../memory/store.js';
+import {
+  fingerprintCommitment,
+  parseRelativeDue,
+  type CommitmentOwner,
+} from './commitments.js';
 
 const logger = pino({
   name: 'clementine.episodic-consolidation',
@@ -42,12 +47,19 @@ export interface EpisodicConsolidationOptions {
   now?: () => Date;
 }
 
+export interface ExtractedCommitment {
+  text: string;
+  owner: CommitmentOwner;
+  dueHint?: string;
+}
+
 export interface EpisodeExtraction {
   summary: string;
   topics: string[];
   entities: string[];
   outcome: string;
   openLoops: string[];
+  commitments: ExtractedCommitment[];
 }
 
 interface CandidateRow {
@@ -76,7 +88,10 @@ const SYSTEM_PROMPT = [
   '  "topics": string[] (lowercase noun phrases, max 6),',
   '  "entities": string[] (named things: files, services, people; max 8),',
   '  "outcome": string (one short clause: decided / implemented / discussed / blocked / none),',
-  '  "openLoops": string[] (unresolved follow-ups; empty array if none, max 5)',
+  '  "openLoops": string[] (unresolved follow-ups; empty array if none, max 5),',
+  '  "commitments": Array<{ text: string, owner: "user" | "clementine", dueHint?: string }>',
+  '      (explicit promises only — "I\'ll do X", "remind me to Y", "by Friday".',
+  '       owner = whoever committed: user vs the assistant. Empty array if none, max 5.)',
   '}',
 ].join('\n');
 
@@ -110,12 +125,27 @@ export function parseEpisodeJson(raw: string): EpisodeExtraction | null {
   const arr = (v: unknown): string[] => Array.isArray(v) ? v.filter(x => typeof x === 'string').map(s => (s as string).trim()).filter(Boolean) : [];
   const summary = typeof obj.summary === 'string' ? obj.summary.trim() : '';
   if (!summary) return null;
+
+  const rawCommitments = Array.isArray(obj.commitments) ? obj.commitments : [];
+  const commitments: ExtractedCommitment[] = [];
+  for (const raw of rawCommitments) {
+    if (!raw || typeof raw !== 'object') continue;
+    const c = raw as Record<string, unknown>;
+    const text = typeof c.text === 'string' ? c.text.trim() : '';
+    const owner = c.owner === 'clementine' || c.owner === 'user' ? c.owner : null;
+    if (!text || !owner) continue;
+    const dueHint = typeof c.dueHint === 'string' && c.dueHint.trim() ? c.dueHint.trim() : undefined;
+    commitments.push({ text: text.slice(0, 220), owner, dueHint });
+    if (commitments.length >= 5) break;
+  }
+
   return {
     summary,
     topics: arr(obj.topics).slice(0, 6),
     entities: arr(obj.entities).slice(0, 8),
     outcome: typeof obj.outcome === 'string' ? obj.outcome.trim().slice(0, 200) : '',
     openLoops: arr(obj.openLoops).slice(0, 5),
+    commitments,
   };
 }
 
@@ -201,6 +231,33 @@ export async function consolidateOneSession(
     transcriptIds,
     chunkId,
   });
+
+  // Lift extracted commitments into first-class rows. Fingerprint dedupe
+  // keeps these from colliding with regex-detected commitments captured
+  // in real time on the same turns.
+  let commitmentsCreated = 0;
+  for (const c of extraction.commitments) {
+    try {
+      const normalized = c.text.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').replace(/\s+/g, ' ').trim().slice(0, 200);
+      if (!normalized) continue;
+      const fp = fingerprintCommitment(candidate.sessionKey, c.owner, normalized);
+      const dueAt = c.dueHint ? parseRelativeDue(c.dueHint) ?? null : null;
+      const result = store.upsertCommitment({
+        fingerprint: fp,
+        source: 'episode-extractor',
+        owner: c.owner,
+        text: c.text,
+        sessionKey: candidate.sessionKey,
+        episodeId: insert.episodeId,
+        dueAt,
+        dueHint: c.dueHint ?? null,
+      });
+      if (result.created) commitmentsCreated++;
+    } catch (err) {
+      logger.debug({ err }, 'Failed to persist extracted commitment');
+    }
+  }
+
   store.updateConsolidationCursor(candidate.sessionKey, {
     lastTranscriptId: candidate.endTranscriptId,
     success: true,
@@ -210,6 +267,7 @@ export async function consolidateOneSession(
     episodeId: insert.episodeId,
     chunkId,
     turns: turns.length,
+    commitmentsCreated,
   }, 'Consolidated episode');
   return { episodeId: insert.episodeId, chunkId };
 }

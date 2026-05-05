@@ -69,6 +69,9 @@ const STUB_EXTRACTION: EpisodeExtraction = {
   entities: ['session-token middleware', 'refresh tokens'],
   outcome: 'decided',
   openLoops: ['Implement refresh-token rotation by Friday'],
+  commitments: [
+    { text: "I'll wire the middleware tomorrow", owner: 'user', dueHint: 'tomorrow' },
+  ],
 };
 
 function stubClient(extraction: EpisodeExtraction = STUB_EXTRACTION) {
@@ -213,6 +216,13 @@ describe('consolidateOneSession', () => {
     const cursor = store.getConsolidationCursor('discord:dm:owner');
     expect(cursor?.lastTranscriptId).toBe(ids[ids.length - 1]);
     expect(cursor?.failCount).toBe(0);
+
+    // Extracted commitments should also be persisted via the shared
+    // fingerprint-deduped path.
+    const commitments = store.listCommitments({ status: 'open', sessionKey: 'discord:dm:owner' });
+    expect(commitments.length).toBe(1);
+    expect(commitments[0].source).toBe('episode-extractor');
+    expect(commitments[0].text.toLowerCase()).toContain('middleware');
   });
 
   it('returns null and the caller path will mark failure when JSON is malformed', async () => {
