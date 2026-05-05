@@ -1632,8 +1632,17 @@ Large tool outputs blow the context window and rotate your session mid-task — 
       if (agentsEntry) parts.push(agentsEntry.content);
     }
 
+    // ── Per-session-volatile content goes to volatileParts (post-cache-boundary) ──
+    // Anthropic's prompt-caching guidance is explicit: cache is a prefix
+    // hash, so anything that changes between turns must sit AFTER the
+    // breakpoint. The blocks below — retrieved context, working memory,
+    // MEMORY.md, today's notes, yesterday's summary, recent conversations —
+    // all change within a single 5-minute cache TTL window during an
+    // active session. Putting them in the stable prefix caused ~80 KB of
+    // cache_creation per session-content change. After this refactor the
+    // stable prefix stays byte-identical across calls.
     if (retrievalContext) {
-      parts.push(
+      volatileParts.push(
         `## Relevant Context (retrieved)\n\n${retrievalContext}\n\n` +
         `*When retrieved context contains information from previous conversations relevant to the current topic, naturally reference it. ` +
         `If the user mentions a person and memory shows their last known status or project, weave that in conversationally. ` +
@@ -1647,7 +1656,7 @@ Large tool outputs blow the context window and rotate your session mid-task — 
           const wmContent = fs.readFileSync(_wmFileFallback, 'utf-8').trim();
           if (wmContent) {
             const truncated = isAutonomous ? wmContent.slice(0, 1500) : wmContent;
-            parts.push(`## Working Memory (scratchpad)\n\n${truncated}`);
+            volatileParts.push(`## Working Memory (scratchpad)\n\n${truncated}`);
           }
         } catch { /* non-critical */ }
       }
@@ -1656,9 +1665,9 @@ Large tool outputs blow the context window and rotate your session mid-task — 
         // Autonomous runs get truncated memory — just enough for context
         if (isAutonomous) {
           const truncated = memoryEntry.content.slice(0, 2000);
-          parts.push(`## Current Memory\n\n${truncated}${memoryEntry.content.length > 2000 ? '\n...(truncated)' : ''}`);
+          volatileParts.push(`## Current Memory\n\n${truncated}${memoryEntry.content.length > 2000 ? '\n...(truncated)' : ''}`);
         } else {
-          parts.push(`## Current Memory\n\n${memoryEntry.content}`);
+          volatileParts.push(`## Current Memory\n\n${memoryEntry.content}`);
         }
       }
     }
@@ -1670,13 +1679,13 @@ Large tool outputs blow the context window and rotate your session mid-task — 
       this.promptCache.watch(agentMemPath);
       const agentMemEntry = this.promptCache.get(agentMemPath);
       if (agentMemEntry) {
-        parts.push(`## Agent Memory (${profile.slug})\n\n${agentMemEntry.content}`);
+        volatileParts.push(`## Agent Memory (${profile.slug})\n\n${agentMemEntry.content}`);
       }
     }
 
     const todayEntry = !skipAmbientContext ? this.promptCache.get(todayPath) : null;
     if (todayEntry) {
-      parts.push(`## Today's Notes (${todayISO()})\n\n${todayEntry.content}`);
+      volatileParts.push(`## Today's Notes (${todayISO()})\n\n${todayEntry.content}`);
     }
 
     // Skip yesterday's notes and recent conversation summaries for autonomous runs
@@ -1689,7 +1698,7 @@ Large tool outputs blow the context window and rotate your session mid-task — 
           const yEntry = this.promptCache.get(yPath);
           if (yEntry && yEntry.content.includes('## Summary')) {
             const summary = yEntry.content.slice(yEntry.content.indexOf('## Summary'));
-            parts.push(`## Yesterday's Summary (${yesterdayISO()})\n\n${summary}`);
+            volatileParts.push(`## Yesterday's Summary (${yesterdayISO()})\n\n${summary}`);
           }
         }
       }
@@ -1704,7 +1713,7 @@ Large tool outputs blow the context window and rotate your session mid-task — 
                 return `### ${ts}\n${s.summary}`;
               },
             );
-            parts.push('## Recent Conversations\n\n' + lines.join('\n\n'));
+            volatileParts.push('## Recent Conversations\n\n' + lines.join('\n\n'));
           }
         } catch {
           // Non-fatal
@@ -1713,8 +1722,10 @@ Large tool outputs blow the context window and rotate your session mid-task — 
     }
 
     if (isAutonomous) {
-      // Minimal vault reference for heartbeats/cron — they know their tools
-      parts.push(`Vault: \`${vault}\`. Key files: MEMORY.md, ${todayISO()}.md (today), TASKS.md. Use MCP tools (memory_read/write, task_list/add/update, note_take).`);
+      // Minimal vault reference for heartbeats/cron — they know their tools.
+      // No date reference here: today's date string in the stable prefix
+      // would invalidate the prompt cache once per day.
+      parts.push(`Vault: \`${vault}\`. Key files: MEMORY.md, today's daily note, TASKS.md. Use MCP tools (memory_read/write, task_list/add/update, note_take).`);
 
       // Deviation rules — tiered autonomy for handling unexpected work during cron/heartbeat
       parts.push(`## Deviation Rules (Tiered Autonomy)
@@ -1745,7 +1756,7 @@ Obsidian vault with YAML frontmatter, [[wikilinks]], #tags.
 **File tools:** Read, Write, Edit, Glob, Grep for direct access.
 
 **Folders:** 00-System (SOUL/MEMORY/AGENTS.md), 01-Daily-Notes (YYYY-MM-DD.md), 02-People, 03-Projects, 04-Topics, 05-Tasks/TASKS.md, 06-Templates, 07-Inbox.
-**Key files:** MEMORY.md (long-term), ${todayISO()}.md (today), TASKS.md (tasks).
+**Key files:** MEMORY.md (long-term), today's daily note, TASKS.md (tasks).
 
 **Task IDs:** \`{T-001}\`, subtasks \`{T-001.1}\`. Recurring tasks auto-create next copy on completion.
 
@@ -1823,22 +1834,20 @@ Never spawn a sub-agent with vague instructions like "handle this brief."
       }
     }
 
-    // Inject hot corrections (explicit behavioral corrections from recent sessions)
+    // Recent Corrections + feedback signals — both refresh as the user
+    // gives feedback during a session. Putting them in volatile keeps the
+    // stable prefix cache-stable across feedback turns. Same per-message
+    // anti-pattern that OpenClaw issue #20894 documented as a 100x cost
+    // amplifier.
     if (this.hotCorrections.length > 0 && !lightweightTurn) {
       const recentCutoff = Date.now() - 24 * 60 * 60 * 1000; // last 24 hours
       const recent = this.hotCorrections.filter(c => new Date(c.timestamp).getTime() > recentCutoff);
       if (recent.length > 0) {
         const lines = recent.map(c => `- [${c.category}] ${c.correction}`);
-        parts.push(`## Recent Corrections (apply immediately)\n\n${lines.join('\n')}`);
+        volatileParts.push(`## Recent Corrections (apply immediately)\n\n${lines.join('\n')}`);
       }
     }
 
-    // Inject recent feedback signals (closes the feedback → behavior loop).
-    // Without this block, user thumbs-down + comments live in the feedback
-    // table and never reach the agent's awareness — only the skill-suppress
-    // filter consumed them. We surface aggregates + the last few commented
-    // negatives so the agent can self-adjust on the next turn. Skipped when
-    // there's nothing to report (no noise).
     if (this.memoryStore?.getRecentFeedbackSignals && !lightweightTurn) {
       try {
         const sig = this.memoryStore.getRecentFeedbackSignals({ days: 14, limit: 3 });
@@ -1854,7 +1863,7 @@ Never spawn a sub-agent with vague instructions like "handle this brief."
               lines.push(`- (${n.channel}) ${comment}`);
             }
           }
-          parts.push(`## Recent feedback signals\n\n${lines.join('\n')}`);
+          volatileParts.push(`## Recent feedback signals\n\n${lines.join('\n')}`);
         }
       } catch { /* non-fatal */ }
     }
@@ -1905,7 +1914,9 @@ Never spawn a sub-agent with vague instructions like "handle this brief."
             }
           }
 
-          parts.push(skillBlock);
+          // Skill matches depend on the user's last message + the live
+          // suppression list; both refresh per turn. Volatile.
+          volatileParts.push(skillBlock);
         }
       } catch { /* non-fatal — skills dir may not exist */ }
     }
@@ -1929,7 +1940,9 @@ Never spawn a sub-agent with vague instructions like "handle this brief."
         }
       }
 
-      // User Theory of Mind — structured user model
+      // User Theory of Mind — structured user model. The model file
+      // updates as the user's preferences/priorities are learned, so
+      // its content is volatile within a session.
       const userModelFile = path.join(VAULT_DIR, '00-System', 'USER_MODEL.md');
       this.promptCache.watch(userModelFile);
       const userModel = this.promptCache.get(userModelFile);
@@ -1939,7 +1952,7 @@ Never spawn a sub-agent with vague instructions like "handle this brief."
         const comm = userModel.data.communication ? `Communication: ${Object.entries(userModel.data.communication as Record<string, string>).map(([k, v]) => `${k}=${v}`).join(', ')}` : '';
         const modelParts = [expertise, priorities, comm].filter(Boolean);
         if (modelParts.length > 0) {
-          parts.push(`## User Context\n\n${modelParts.join('\n')}`);
+          volatileParts.push(`## User Context\n\n${modelParts.join('\n')}`);
         }
       }
 
@@ -2571,6 +2584,27 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
       ? volatilePromptPart
       : '';
 
+    // Debug-mode: log a short hash of the stable prefix + volatile suffix
+    // per query. When CLEMENTINE_DEBUG_CACHE=1, mismatched stable hashes
+    // across consecutive turns of the same session indicate a regression
+    // where volatile content silently leaked back into the cached prefix.
+    // No-op (no allocation) in normal mode.
+    if (process.env.CLEMENTINE_DEBUG_CACHE === '1') {
+      const { createHash } = await import('node:crypto');
+      const stableHash = createHash('sha1').update(stablePrefixParts.join('\n\n---\n\n')).digest('hex').slice(0, 8);
+      const volatileHash = volatileSuffix
+        ? createHash('sha1').update(volatileSuffix).digest('hex').slice(0, 8)
+        : 'empty';
+      logger.info({
+        sessionKey,
+        stable_prefix_hash: stableHash,
+        volatile_suffix_hash: volatileHash,
+        stable_chars: stablePrefixParts.reduce((n, s) => n + s.length, 0),
+        volatile_chars: volatileSuffix.length,
+        allowed_tool_count: allowedTools.length,
+      }, 'cache_debug: prompt structure for this query');
+    }
+
     // If there is no volatile content, a plain string keeps the call simple
     // and behaves identically for the cache. Only use the array form when
     // we actually have dynamic content to split off.
@@ -2866,15 +2900,25 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
       && !isPlanStep
       && (toolRoute.inheritFullClaudeEnv || toolRoute.fullSurface);
     const isolateClaudeConfig = !toolRoute.fullSurface;
+    // Sort tool surface for deterministic cache key. The Anthropic prompt
+    // cache hashes the entire tools/system prefix; insertion-order
+    // serialization is fragile if routing logic ever pushes in a
+    // different order between calls — silent cache miss. Sorting also
+    // lets multiple jobs that arrived at the same tool set (via
+    // different routing paths) share a cache entry.
+    if (!toolsDisabledForCall) {
+      allowedTools.sort();
+    }
     const mcpServerNames = toolsDisabledForCall
       ? []
-      : [TOOLS_SERVER, ...Object.keys(externalMcpServers), ...Object.keys(composioMcpServers)];
+      : [TOOLS_SERVER, ...Object.keys(externalMcpServers).sort(), ...Object.keys(composioMcpServers).sort()];
     const clementineToolPrefix = `mcp__${TOOLS_SERVER}__`;
     const clementineToolAllowlist = toolRoute.fullSurface
       ? '*'
       : allowedTools
         .filter(t => t.startsWith(clementineToolPrefix))
         .map(t => t.slice(clementineToolPrefix.length))
+        .sort()
         .join(',');
     const clementineToolAllowlistCount = clementineToolAllowlist === '*'
       ? CLEMENTINE_ALL_TOOL_NAMES.length
