@@ -1041,6 +1041,44 @@ export class MemoryStore {
       CREATE INDEX IF NOT EXISTS idx_recall_telemetry_created ON recall_telemetry(created_at DESC);
     `);
 
+    // Episodes — durable, retrievable summaries of past sessions. Each
+    // episode is one chunked range of transcripts; the LLM extracts
+    // {summary, topics, entities, outcome, openLoops}. The summary text is
+    // also written into chunks so hybrid recall picks it up. transcript_ids
+    // is a JSON array; we don't normalize because the lineage is read-only.
+    this.conn.exec(`
+      CREATE TABLE IF NOT EXISTS episodes (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_key TEXT NOT NULL,
+        started_at TEXT NOT NULL,
+        ended_at TEXT NOT NULL,
+        summary TEXT NOT NULL,
+        topics TEXT,
+        entities TEXT,
+        outcome TEXT,
+        open_loops TEXT,
+        transcript_ids TEXT,
+        chunk_id INTEGER,
+        created_at TEXT DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_episodes_session ON episodes(session_key, started_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_episodes_created ON episodes(created_at DESC);
+    `);
+
+    // Per-session consolidation cursor — tracks how far the LLM has
+    // summarized so we don't re-consolidate the same turns. Failure tracking
+    // (fail_count + last_attempted_at) lets us back off cleanly when the
+    // model rejects a session repeatedly without spamming retries.
+    this.conn.exec(`
+      CREATE TABLE IF NOT EXISTS consolidation_cursors (
+        session_key TEXT PRIMARY KEY,
+        last_transcript_id INTEGER NOT NULL DEFAULT 0,
+        last_attempted_at TEXT,
+        last_success_at TEXT,
+        fail_count INTEGER NOT NULL DEFAULT 0
+      );
+    `);
+
     // Soft-delete via a separate table — keeps the chunks_au trigger
     // out of the path so we don't have to fight with the FTS5 contentless
     // index's delete-then-insert semantics. Search query paths LEFT JOIN
@@ -3710,6 +3748,296 @@ export class MemoryStore {
     } catch {
       return { total: 0, semanticOnly: 0, lexicalOnly: 0, bothModes: 0, avgTopScore: 0 };
     }
+  }
+
+  // ── Episodes (durable session summaries) ──────────────────────────
+
+  /**
+   * Find sessions whose latest turn is older than `idleMinutes` minutes,
+   * have at least `minExchanges` user/assistant turns combined since the
+   * last consolidation cursor, and aren't already up-to-date. Returns one
+   * row per session ranked oldest-idle first so we consolidate the
+   * least-fresh first when bounded by maxResults.
+   */
+  getIdleSessionsForEpisodicConsolidation(opts: {
+    idleMinutes: number;
+    minExchanges: number;
+    maxResults: number;
+    failBackoffMinutes?: number;
+  }): Array<{
+    sessionKey: string;
+    startTranscriptId: number;
+    endTranscriptId: number;
+    startedAt: string;
+    endedAt: string;
+    exchanges: number;
+  }> {
+    const idleMin = Math.max(1, opts.idleMinutes);
+    const minEx = Math.max(1, opts.minExchanges);
+    const max = Math.max(1, opts.maxResults);
+    const backoff = Math.max(0, opts.failBackoffMinutes ?? 60);
+    try {
+      // Per-session: last cursor (or 0), count of new turns, MIN/MAX(id)
+      // bounding the new range, and the timestamps. The fail-backoff
+      // suppresses sessions whose last_attempted_at is recent enough that
+      // the cursor's fail_count > 0 indicates we should wait.
+      const rows = this.conn.prepare(`
+        SELECT
+          t.session_key AS session_key,
+          MIN(t.id) AS start_id,
+          MAX(t.id) AS end_id,
+          MIN(t.created_at) AS started_at,
+          MAX(t.created_at) AS ended_at,
+          COUNT(*) AS exchanges
+        FROM transcripts t
+        LEFT JOIN consolidation_cursors c ON c.session_key = t.session_key
+        WHERE t.id > COALESCE(c.last_transcript_id, 0)
+          AND (
+            c.fail_count IS NULL
+            OR c.fail_count = 0
+            OR c.last_attempted_at IS NULL
+            OR c.last_attempted_at < datetime('now', ?)
+          )
+        GROUP BY t.session_key
+        HAVING COUNT(*) >= ?
+           AND MAX(t.created_at) < datetime('now', ?)
+        ORDER BY MAX(t.created_at) ASC
+        LIMIT ?
+      `).all(`-${backoff} minutes`, minEx, `-${idleMin} minutes`, max) as Array<{
+        session_key: string;
+        start_id: number;
+        end_id: number;
+        started_at: string;
+        ended_at: string;
+        exchanges: number;
+      }>;
+      return rows.map(r => ({
+        sessionKey: r.session_key,
+        startTranscriptId: r.start_id,
+        endTranscriptId: r.end_id,
+        startedAt: r.started_at,
+        endedAt: r.ended_at,
+        exchanges: r.exchanges,
+      }));
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * Persist a consolidated episode and bump the per-session cursor so the
+   * same range isn't re-consolidated on the next pass. The summary text is
+   * also indexed into chunks (returned as chunkId) so hybrid recall surfaces
+   * episodes alongside raw transcripts.
+   */
+  insertEpisode(entry: {
+    sessionKey: string;
+    startedAt: string;
+    endedAt: string;
+    summary: string;
+    topics: string[];
+    entities: string[];
+    outcome: string;
+    openLoops: string[];
+    transcriptIds: number[];
+    chunkId?: number | null;
+  }): { episodeId: number; chunkId: number | null } {
+    const result = this.conn
+      .prepare(
+        `INSERT INTO episodes
+         (session_key, started_at, ended_at, summary, topics, entities, outcome, open_loops, transcript_ids, chunk_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        entry.sessionKey,
+        entry.startedAt,
+        entry.endedAt,
+        entry.summary,
+        JSON.stringify(entry.topics ?? []),
+        JSON.stringify(entry.entities ?? []),
+        entry.outcome ?? '',
+        JSON.stringify(entry.openLoops ?? []),
+        JSON.stringify(entry.transcriptIds ?? []),
+        entry.chunkId ?? null,
+      );
+    return {
+      episodeId: result.lastInsertRowid as number,
+      chunkId: entry.chunkId ?? null,
+    };
+  }
+
+  /**
+   * Mark a consolidation pass result on the per-session cursor. On success
+   * we advance last_transcript_id and reset fail_count; on failure we bump
+   * fail_count + last_attempted_at so the backoff-aware idle scan skips
+   * this session for a while.
+   */
+  updateConsolidationCursor(
+    sessionKey: string,
+    update: { lastTranscriptId?: number; success: boolean },
+  ): void {
+    const existing = this.conn
+      .prepare('SELECT session_key FROM consolidation_cursors WHERE session_key = ?')
+      .get(sessionKey) as { session_key: string } | undefined;
+    if (!existing) {
+      this.conn
+        .prepare(
+          `INSERT INTO consolidation_cursors
+           (session_key, last_transcript_id, last_attempted_at, last_success_at, fail_count)
+           VALUES (?, ?, datetime('now'), ?, ?)`,
+        )
+        .run(
+          sessionKey,
+          update.success ? (update.lastTranscriptId ?? 0) : 0,
+          update.success ? new Date().toISOString() : null,
+          update.success ? 0 : 1,
+        );
+      return;
+    }
+    if (update.success) {
+      this.conn
+        .prepare(
+          `UPDATE consolidation_cursors
+           SET last_transcript_id = ?, last_attempted_at = datetime('now'),
+               last_success_at = datetime('now'), fail_count = 0
+           WHERE session_key = ?`,
+        )
+        .run(update.lastTranscriptId ?? 0, sessionKey);
+    } else {
+      this.conn
+        .prepare(
+          `UPDATE consolidation_cursors
+           SET last_attempted_at = datetime('now'), fail_count = fail_count + 1
+           WHERE session_key = ?`,
+        )
+        .run(sessionKey);
+    }
+  }
+
+  /** Read the consolidation cursor for a session — used in tests and for diagnostics. */
+  getConsolidationCursor(sessionKey: string): {
+    sessionKey: string;
+    lastTranscriptId: number;
+    lastAttemptedAt: string | null;
+    lastSuccessAt: string | null;
+    failCount: number;
+  } | null {
+    const row = this.conn
+      .prepare('SELECT * FROM consolidation_cursors WHERE session_key = ?')
+      .get(sessionKey) as
+      | { session_key: string; last_transcript_id: number; last_attempted_at: string | null; last_success_at: string | null; fail_count: number }
+      | undefined;
+    if (!row) return null;
+    return {
+      sessionKey: row.session_key,
+      lastTranscriptId: row.last_transcript_id,
+      lastAttemptedAt: row.last_attempted_at,
+      lastSuccessAt: row.last_success_at,
+      failCount: row.fail_count,
+    };
+  }
+
+  /**
+   * List recent episodes for the dashboard. JSON columns are parsed back
+   * into arrays so callers don't have to.
+   */
+  listRecentEpisodes(opts: { limit?: number; sessionKey?: string; sinceIso?: string } = {}): Array<{
+    id: number;
+    sessionKey: string;
+    startedAt: string;
+    endedAt: string;
+    summary: string;
+    topics: string[];
+    entities: string[];
+    outcome: string;
+    openLoops: string[];
+    transcriptIds: number[];
+    chunkId: number | null;
+    createdAt: string;
+  }> {
+    const limit = Math.max(1, Math.min(opts.limit ?? 30, 200));
+    const params: unknown[] = [];
+    let where = '';
+    if (opts.sessionKey) {
+      where += where ? ' AND' : ' WHERE';
+      where += ' session_key = ?';
+      params.push(opts.sessionKey);
+    }
+    if (opts.sinceIso) {
+      where += where ? ' AND' : ' WHERE';
+      where += ' created_at >= ?';
+      params.push(opts.sinceIso);
+    }
+    params.push(limit);
+    const rows = this.conn
+      .prepare(`SELECT * FROM episodes${where} ORDER BY created_at DESC LIMIT ?`)
+      .all(...params) as Array<{
+        id: number;
+        session_key: string;
+        started_at: string;
+        ended_at: string;
+        summary: string;
+        topics: string | null;
+        entities: string | null;
+        outcome: string | null;
+        open_loops: string | null;
+        transcript_ids: string | null;
+        chunk_id: number | null;
+        created_at: string;
+      }>;
+    const parseArray = (v: string | null): string[] => {
+      if (!v) return [];
+      try { const x = JSON.parse(v); return Array.isArray(x) ? x.map(String) : []; } catch { return []; }
+    };
+    const parseNumArray = (v: string | null): number[] => {
+      if (!v) return [];
+      try { const x = JSON.parse(v); return Array.isArray(x) ? x.filter(n => Number.isFinite(n)).map(Number) : []; } catch { return []; }
+    };
+    return rows.map(row => ({
+      id: row.id,
+      sessionKey: row.session_key,
+      startedAt: row.started_at,
+      endedAt: row.ended_at,
+      summary: row.summary,
+      topics: parseArray(row.topics),
+      entities: parseArray(row.entities),
+      outcome: row.outcome ?? '',
+      openLoops: parseArray(row.open_loops),
+      transcriptIds: parseNumArray(row.transcript_ids),
+      chunkId: row.chunk_id,
+      createdAt: row.created_at,
+    }));
+  }
+
+  /**
+   * Fetch a slice of transcripts by id range for consolidation. Used by
+   * the consolidation module to materialize the conversation it's about
+   * to summarize.
+   */
+  getTranscriptsByIdRange(sessionKey: string, startId: number, endId: number): TranscriptTurn[] {
+    const rows = this.conn
+      .prepare(
+        `SELECT id, session_key, role, content, model, created_at
+         FROM transcripts
+         WHERE session_key = ? AND id >= ? AND id <= ?
+         ORDER BY id ASC`,
+      )
+      .all(sessionKey, startId, endId) as Array<{
+        id: number;
+        session_key: string;
+        role: string;
+        content: string;
+        model: string;
+        created_at: string;
+      }>;
+    return rows.map(r => ({
+      id: r.id,
+      sessionKey: r.session_key,
+      role: r.role,
+      content: r.content,
+      model: r.model,
+      createdAt: r.created_at,
+    }));
   }
 
   // ── Session Summaries ─────────────────────────────────────────────
@@ -6882,7 +7210,7 @@ export class MemoryStore {
    * Stored as JSON in `chunks.derived_from` so the dashboard can show
    * "view source memories" — abstractions become auditable.
    */
-  insertSummaryChunk(sourceFile: string, section: string, content: string, derivedFromIds?: number[]): void {
+  insertSummaryChunk(sourceFile: string, section: string, content: string, derivedFromIds?: number[]): number {
     const hash = createHash('sha256').update(content).digest('hex').slice(0, 16);
     const derivedJson = derivedFromIds && derivedFromIds.length > 0 ? JSON.stringify(derivedFromIds) : null;
     const result = this.conn
@@ -6892,14 +7220,17 @@ export class MemoryStore {
       )
       .run(sourceFile, section, content, hash, derivedJson);
 
+    const chunkId = result.lastInsertRowid as number;
+
     // Immediately compute embedding so the summary is vector-searchable right away
     if (embeddingsModule.isReady()) {
       const vec = embeddingsModule.embed(content);
       if (vec) {
         this.conn.prepare('UPDATE chunks SET embedding = ? WHERE id = ?')
-          .run(embeddingsModule.serializeEmbedding(vec), result.lastInsertRowid);
+          .run(embeddingsModule.serializeEmbedding(vec), chunkId);
       }
     }
+    return chunkId;
   }
 
   // ── SDR Operational Data ─────────────────────────────────────────

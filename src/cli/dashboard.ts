@@ -6947,6 +6947,31 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
     }
   });
 
+  // Recent episodes — durable consolidated session summaries.
+  app.get('/api/memory/episodes', async (req, res) => {
+    try {
+      const gateway = await getGateway();
+      const store = (gateway as any).assistant?.memoryStore;
+      if (!store || typeof store.listRecentEpisodes !== 'function') {
+        res.status(503).json({ error: 'Episodes store not available' });
+        return;
+      }
+      const limit = Math.min(parseInt(String(req.query.limit ?? '30'), 10) || 30, 200);
+      const sessionKey = req.query.session ? String(req.query.session) : undefined;
+      const sinceParam = req.query.since ? String(req.query.since) : '';
+      // since: '24h' | '7d' | '30d' | '' (all) | ISO string
+      let sinceIso: string | undefined;
+      if (sinceParam === '24h') sinceIso = new Date(Date.now() - 24 * 3600_000).toISOString();
+      else if (sinceParam === '7d') sinceIso = new Date(Date.now() - 7 * 24 * 3600_000).toISOString();
+      else if (sinceParam === '30d') sinceIso = new Date(Date.now() - 30 * 24 * 3600_000).toISOString();
+      else if (sinceParam) sinceIso = sinceParam;
+      const episodes = store.listRecentEpisodes({ limit, sessionKey, sinceIso });
+      res.json({ ok: true, episodes });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
   // Coverage + recall telemetry for both chunks and transcripts. Powers the
   // Memory Coverage card showing whether dense recall is actually earning its
   // keep on the current corpus.
@@ -14925,6 +14950,23 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
                 <div class="skel-block" style="padding:14px"><div class="skel-row med"></div><div class="skel-row short"></div></div>
               </div>
             </div>
+            <div class="card" style="margin-bottom:14px">
+              <div class="card-header" style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap">
+                <span>Recent episodes</span>
+                <div style="display:flex;align-items:center;gap:8px">
+                  <select id="episodes-filter-since" onchange="refreshRecentEpisodes()" style="font-size:12px;padding:4px 6px;border:1px solid var(--border);border-radius:4px;background:var(--bg-input);color:var(--text)">
+                    <option value="24h">Last 24h</option>
+                    <option value="7d" selected>Last 7d</option>
+                    <option value="30d">Last 30d</option>
+                    <option value="">All</option>
+                  </select>
+                  <span style="font-size:11px;color:var(--text-muted)">Consolidated session summaries</span>
+                </div>
+              </div>
+              <div class="card-body" id="panel-recent-episodes" style="padding:0">
+                <div class="skel-block" style="padding:14px"><div class="skel-row med"></div><div class="skel-row short"></div></div>
+              </div>
+            </div>
             <div class="card">
               <div class="card-header" style="display:flex;align-items:center;justify-content:space-between">
                 <span>Self-correction (supersedes)</span>
@@ -18435,6 +18477,7 @@ function switchTab(group, tab) {
       // Consolidated Memory tab: search results + stats + MEMORY.md + recent writes + supersedes + coverage strip.
       refreshMemory();
       if (typeof refreshRecentWrites === 'function') refreshRecentWrites();
+      if (typeof refreshRecentEpisodes === 'function') refreshRecentEpisodes();
       if (typeof refreshSupersedes === 'function') refreshSupersedes();
       if (typeof refreshCoverageStrip === 'function') refreshCoverageStrip();
     }
@@ -24792,6 +24835,7 @@ async function submitQuickAddMemory() {
     setTimeout(function() {
       closeQuickAddMemory();
       if (typeof refreshRecentWrites === 'function') refreshRecentWrites();
+      if (typeof refreshRecentEpisodes === 'function') refreshRecentEpisodes();
       if (typeof refreshMemory === 'function') refreshMemory();
     }, 600);
   } catch (err) {
@@ -24936,6 +24980,55 @@ async function refreshRecentWrites() {
         + '<td style="text-align:right;font-weight:600;color:' + salColor + '">' + sal + '</td>'
         + '<td style="font-size:12px;color:var(--text-muted)">' + (w.reason ? esc(w.reason) : '<span style="opacity:0.5">no reason given</span>') + '</td>'
         + '<td>' + statusBadge + '</td>'
+        + '</tr>';
+    }
+    html += '</tbody></table>';
+    el.innerHTML = html;
+  } catch (err) {
+    el.innerHTML = '<div class="empty-state" style="padding:14px">Failed to load: ' + esc(String(err)) + '</div>';
+  }
+}
+
+async function refreshRecentEpisodes() {
+  var el = document.getElementById('panel-recent-episodes');
+  if (!el) return;
+  try {
+    var sel = document.getElementById('episodes-filter-since');
+    var since = sel ? sel.value : '7d';
+    var url = '/api/memory/episodes?limit=30' + (since ? '&since=' + encodeURIComponent(since) : '');
+    var r = await apiFetch(url);
+    var d = await r.json();
+    if (!d.ok || !Array.isArray(d.episodes)) {
+      el.innerHTML = '<div class="empty-state" style="padding:14px">' + esc(d.error || 'No data') + '</div>';
+      return;
+    }
+    if (d.episodes.length === 0) {
+      el.innerHTML = '<div class="empty-state" style="padding:14px">No episodes yet. They land automatically when a session has been idle for ~20 min with at least 3 exchanges.</div>';
+      return;
+    }
+    var html = '<table class="data-table" style="width:100%">';
+    html += '<thead><tr>'
+      + '<th style="width:120px">When</th>'
+      + '<th style="width:160px">Session</th>'
+      + '<th>Summary</th>'
+      + '<th style="width:140px">Topics</th>'
+      + '<th style="width:120px">Outcome</th>'
+      + '<th style="width:50px;text-align:right">Open</th>'
+      + '</tr></thead><tbody>';
+    for (var i = 0; i < d.episodes.length; i++) {
+      var ep = d.episodes[i];
+      var when = '';
+      try { when = new Date(ep.createdAt + 'Z').toLocaleString(); } catch { when = ep.createdAt; }
+      var topics = (ep.topics || []).slice(0, 3).map(esc).join(', ');
+      var openCount = (ep.openLoops || []).length;
+      var openColor = openCount > 0 ? '#f59e0b' : 'var(--text-muted)';
+      html += '<tr>'
+        + '<td style="font-size:11px;color:var(--text-muted)">' + esc(when) + '</td>'
+        + '<td style="font-size:11px">' + esc(ep.sessionKey) + '</td>'
+        + '<td style="font-size:12px">' + esc(ep.summary) + '</td>'
+        + '<td style="font-size:11px;color:var(--text-muted)">' + (topics || '—') + '</td>'
+        + '<td style="font-size:11px">' + esc(ep.outcome || '—') + '</td>'
+        + '<td style="text-align:right;font-weight:600;color:' + openColor + '">' + openCount + '</td>'
         + '</tr>';
     }
     html += '</tbody></table>';

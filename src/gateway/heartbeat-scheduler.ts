@@ -119,6 +119,8 @@ export class HeartbeatScheduler {
   private denseBackfillInFlight = false;
   private lastSalienceDecayDate = '';
   private lastMemoryPulseDate = '';
+  private lastEpisodicConsolidationAt = 0;
+  private episodicConsolidationInFlight = false;
 
   /** Wire up the cron scheduler so daily plan suggestions can be applied. */
   setCronScheduler(cs: CronScheduler): void { this.cronScheduler = cs; }
@@ -236,6 +238,13 @@ export class HeartbeatScheduler {
     // Pinned + soft-deleted + superseded chunks are exempt. One UPDATE per
     // day, gated by a date stamp on HeartbeatState.
     this.maybeRunSalienceDecay();
+
+    // Episodic consolidation — turn idle sessions' raw transcripts into
+    // durable, indexed episodes. ~5 min cooldown, capped at 3 sessions per
+    // pass to bound LLM cost. Best-effort; never blocks the tick.
+    this.maybeRunEpisodicConsolidation().catch(err => {
+      logger.debug({ err }, 'Episodic consolidation pass failed (non-fatal)');
+    });
 
     // Claim verification sweep — auto-verify pending claims whose due
     // times have passed (e.g. "I scheduled X for 8am" → check at 9am).
@@ -979,6 +988,42 @@ export class HeartbeatScheduler {
       }
     } finally {
       this.denseBackfillInFlight = false;
+    }
+  }
+
+  /**
+   * Episodic consolidation pass. Turns idle session transcript ranges into
+   * durable episodes via a small Haiku call per session. Same shape as
+   * maybeIdleDenseBackfill: in-flight guard, cooldown, chat-lane busy check,
+   * bounded work per pass. Skipped silently when there's nothing eligible
+   * (which is the common case).
+   */
+  private async maybeRunEpisodicConsolidation(): Promise<void> {
+    if (this.episodicConsolidationInFlight) return;
+    const sinceLastMs = Date.now() - this.lastEpisodicConsolidationAt;
+    if (sinceLastMs < 5 * 60 * 1000) return;
+
+    const { lanes } = await import('./lanes.js');
+    if (lanes.status().chat.active > 0) return;
+
+    const store = this.gateway.getMemoryStore();
+    if (!store) return;
+
+    this.episodicConsolidationInFlight = true;
+    this.lastEpisodicConsolidationAt = Date.now();
+    try {
+      const { runEpisodicConsolidationPass } = await import('./episodic-consolidation.js');
+      const result = await runEpisodicConsolidationPass(store, {
+        idleMinutes: 20,
+        minExchanges: 3,
+        maxSessionsPerPass: 3,
+        failBackoffMinutes: 60,
+      });
+      if (result.consolidated > 0 || result.failed > 0) {
+        logger.info(result, 'Episodic consolidation pass complete');
+      }
+    } finally {
+      this.episodicConsolidationInFlight = false;
     }
   }
 
