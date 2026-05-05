@@ -119,6 +119,16 @@ function validateStepConfig(step: WorkflowStep): ValidationIssue[] {
         if (!step.mcp.tool) issues.push({ severity: 'error', code: 'mcp-no-tool', stepId: step.id, message: `MCP step "${step.id}" missing tool` });
       }
       break;
+    case 'cli':
+      if (!step.cli) {
+        issues.push({ severity: 'error', code: 'cli-missing', stepId: step.id, message: `CLI step "${step.id}" has no config` });
+      } else {
+        if (!step.cli.cmd) issues.push({ severity: 'error', code: 'cli-no-cmd', stepId: step.id, message: `CLI step "${step.id}" missing cmd` });
+        if (step.cli.args && !Array.isArray(step.cli.args)) {
+          issues.push({ severity: 'error', code: 'cli-bad-args', stepId: step.id, message: `CLI step "${step.id}" args must be an array of strings` });
+        }
+      }
+      break;
     case 'channel':
       if (!step.channel) {
         issues.push({ severity: 'error', code: 'channel-missing', stepId: step.id, message: `Channel step "${step.id}" has no config` });

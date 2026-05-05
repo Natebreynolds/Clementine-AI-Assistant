@@ -302,6 +302,7 @@ function parseWorkflowFile(filePath: string): WorkflowDefinition {
     const kind = s.kind as WorkflowStepKind | undefined;
     if (kind && kind !== 'prompt') step.kind = kind;
     if (s.mcp && typeof s.mcp === 'object') step.mcp = s.mcp as WorkflowStep['mcp'];
+    if (s.cli && typeof s.cli === 'object') step.cli = s.cli as WorkflowStep['cli'];
     if (s.channel && typeof s.channel === 'object') step.channel = s.channel as WorkflowStep['channel'];
     if (s.transform && typeof s.transform === 'object') step.transform = s.transform as WorkflowStep['transform'];
     if (s.conditional && typeof s.conditional === 'object') step.conditional = s.conditional as WorkflowStep['conditional'];
@@ -510,6 +511,7 @@ function serializeStep(step: WorkflowStep): Record<string, unknown> {
   const kind = step.kind ?? 'prompt';
   if (kind !== 'prompt') out.kind = kind;
   if (step.mcp) out.mcp = step.mcp;
+  if (step.cli) out.cli = step.cli;
   if (step.channel) out.channel = step.channel;
   if (step.transform) out.transform = step.transform;
   if (step.conditional) out.conditional = step.conditional;

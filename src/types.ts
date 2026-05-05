@@ -597,6 +597,7 @@ export interface WorkflowInput {
 export type WorkflowStepKind =
   | 'prompt'
   | 'mcp'
+  | 'cli'
   | 'channel'
   | 'transform'
   | 'conditional'
@@ -606,6 +607,14 @@ export interface WorkflowStepMcpConfig {
   server: string;
   tool: string;
   inputs?: Record<string, unknown>;
+}
+
+export interface WorkflowStepCliConfig {
+  cmd: string;                   // CLI binary name as discovered (e.g. 'sf', 'gh', 'gcloud')
+  args?: string[];               // argv tokens; each token may include {{steps.x}} templates
+  workDir?: string;              // optional cwd; defaults to BASE_DIR
+  timeoutMs?: number;            // default 60_000
+  captureStderr?: boolean;       // include stderr in output (default false: stdout only)
 }
 
 export interface WorkflowStepChannelConfig {
@@ -644,6 +653,7 @@ export interface WorkflowStep {
   workDir?: string;
   kind?: WorkflowStepKind;
   mcp?: WorkflowStepMcpConfig;
+  cli?: WorkflowStepCliConfig;
   channel?: WorkflowStepChannelConfig;
   transform?: WorkflowStepTransformConfig;
   conditional?: WorkflowStepConditionalConfig;

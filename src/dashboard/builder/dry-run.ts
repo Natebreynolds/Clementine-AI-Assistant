@@ -85,6 +85,9 @@ function describeStep(step: WorkflowStep): string {
     case 'mcp':
       if (!step.mcp) return `MCP step "${step.id}"${deps}: misconfigured (no mcp config)`;
       return `MCP step "${step.id}"${deps}: would call ${step.mcp.server}.${step.mcp.tool}${step.mcp.inputs ? ` with inputs ${JSON.stringify(step.mcp.inputs)}` : ' (no inputs)'}`;
+    case 'cli':
+      if (!step.cli) return `CLI step "${step.id}"${deps}: misconfigured (no cli config)`;
+      return `CLI step "${step.id}"${deps}: would run \`${step.cli.cmd}${step.cli.args?.length ? ' ' + step.cli.args.join(' ') : ''}\` (timeout: ${step.cli.timeoutMs ?? 60000}ms)`;
     case 'channel':
       if (!step.channel) return `Channel step "${step.id}"${deps}: misconfigured`;
       return `Channel step "${step.id}"${deps}: would send to ${step.channel.channel} → ${step.channel.target}. Content preview: ${truncate(step.channel.content, 120)}`;
@@ -112,6 +115,12 @@ function stepWarnings(step: WorkflowStep): string[] {
   if (kind === 'mcp' && step.mcp) {
     if (/(create|delete|update|push|send|post|drop)/i.test(step.mcp.tool)) {
       warnings.push('Looks like a write/destructive MCP tool — confirm before running for real');
+    }
+  }
+  if (kind === 'cli' && step.cli) {
+    const fullArgs = (step.cli.args ?? []).join(' ');
+    if (/\b(rm|delete|drop|destroy|push --force|--force)\b/i.test(`${step.cli.cmd} ${fullArgs}`)) {
+      warnings.push('CLI command contains a destructive flag — confirm before running for real');
     }
   }
   if (kind === 'prompt' && step.prompt && step.prompt.length > 5000) {

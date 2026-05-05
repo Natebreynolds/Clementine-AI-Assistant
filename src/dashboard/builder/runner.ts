@@ -24,6 +24,7 @@
 
 import { performance } from 'node:perf_hooks';
 import vm from 'node:vm';
+import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 
 import type {
@@ -225,6 +226,8 @@ async function executeStep(
       return executePromptStep(step, mode);
     case 'mcp':
       return executeMcpStep(step, mode, ctx, signal);
+    case 'cli':
+      return executeCliStep(step, mode, ctx, signal);
     case 'channel':
       return executeChannelStep(step, ctx);
     case 'transform':
@@ -283,6 +286,77 @@ async function executeMcpStep(
   const inputs = resolveInputs(step.mcp.inputs ?? {}, ctx);
   const result = await handler({ server: step.mcp.server, tool: step.mcp.tool, inputs, signal });
   return { mocked: false, output: result };
+}
+
+async function executeCliStep(
+  step: WorkflowStep,
+  mode: RunMode,
+  ctx: ExecContext,
+  signal: AbortSignal,
+): Promise<StepOutput> {
+  if (!step.cli || !step.cli.cmd) throw new Error('CLI step missing cmd');
+  const cmd = step.cli.cmd;
+  const args = (step.cli.args ?? []).map(a => typeof a === 'string' ? templatize(a, ctx) : String(a));
+  const looksDestructive = /\b(rm|delete|drop|destroy|--force)\b/i.test(`${cmd} ${args.join(' ')}`);
+  if (mode === 'mock' && looksDestructive) {
+    return {
+      mocked: true,
+      output: `[mock-write] would run: ${cmd}${args.length ? ' ' + args.join(' ') : ''}`,
+    };
+  }
+
+  const timeoutMs = step.cli.timeoutMs ?? 60_000;
+  const captureStderr = step.cli.captureStderr === true;
+
+  return await new Promise<StepOutput>((resolve, reject) => {
+    let stdout = '';
+    let stderr = '';
+    let settled = false;
+    let child: ReturnType<typeof spawn> | null = null;
+    try {
+      child = spawn(cmd, args, {
+        cwd: step.cli!.workDir,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        env: process.env,
+      });
+    } catch (err) {
+      reject(err);
+      return;
+    }
+    const finish = (result: StepOutput) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      signal.removeEventListener('abort', onAbort);
+      try { child?.kill('SIGKILL'); } catch { /* */ }
+      resolve(result);
+    };
+    const fail = (err: unknown) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      signal.removeEventListener('abort', onAbort);
+      try { child?.kill('SIGKILL'); } catch { /* */ }
+      reject(err);
+    };
+    const timer = setTimeout(() => fail(Object.assign(new Error(`CLI ${cmd} timed out after ${timeoutMs}ms`), { name: 'TimeoutError' })), timeoutMs);
+    const onAbort = () => fail(Object.assign(new Error('Aborted'), { name: 'AbortError' }));
+    if (signal.aborted) { onAbort(); return; }
+    signal.addEventListener('abort', onAbort, { once: true });
+
+    child.stdout?.on('data', (chunk: Buffer) => { stdout += chunk.toString('utf-8'); if (stdout.length > 1_048_576) stdout = stdout.slice(0, 1_048_576) + '\n…[truncated]'; });
+    child.stderr?.on('data', (chunk: Buffer) => { stderr += chunk.toString('utf-8'); if (stderr.length > 65_536) stderr = stderr.slice(0, 65_536) + '\n…[truncated]'; });
+    child.on('error', err => fail(err));
+    child.on('exit', (code) => {
+      const output = captureStderr
+        ? { stdout, stderr, exitCode: code ?? -1 }
+        : { stdout, exitCode: code ?? -1, ...(code && code !== 0 ? { stderr: stderr.slice(0, 2000) } : {}) };
+      if (code !== 0) {
+        return fail(Object.assign(new Error(`CLI ${cmd} exited with code ${code}: ${stderr.slice(0, 300)}`), { exitCode: code, output }));
+      }
+      finish({ mocked: false, output });
+    });
+  });
 }
 
 function executeChannelStep(step: WorkflowStep, ctx: ExecContext): StepOutput {
