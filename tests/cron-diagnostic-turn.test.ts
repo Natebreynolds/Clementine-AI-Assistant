@@ -24,6 +24,12 @@ describe('cron diagnostic local turn', () => {
     writeFileSync(file, `${JSON.stringify(entry)}\n`, { flag: 'a' });
   }
 
+  function writeUnleashedStatus(jobName: string, status: Record<string, unknown>): void {
+    const file = path.join(baseDir, 'unleashed', jobName, 'status.json');
+    mkdirSync(path.dirname(file), { recursive: true });
+    writeFileSync(file, JSON.stringify(status, null, 2));
+  }
+
   function writeCronConfig(): void {
     const file = path.join(baseDir, 'vault', '00-System', 'CRON.md');
     mkdirSync(path.dirname(file), { recursive: true });
@@ -91,5 +97,43 @@ describe('cron diagnostic local turn', () => {
     expect(response).toContain('Current config: - name: customer-followup-review');
     expect(response).toContain('max_hours: 1');
     expect(response).toContain('config/prompt repair');
+  });
+
+  it('does not parse internal deep-mode result prompts as cron job names', () => {
+    const response = buildCronDiagnosticResponse(
+      '[DEEP_MODE_RESULT] The background task failed: Background work failed. Let the user know.',
+      { baseDir },
+    );
+
+    expect(response).toBeNull();
+    expect(detectCronDiagnosticRequest('[DEEP_MODE_RESULT] market-leader-followup failed', { baseDir })).toBeNull();
+  });
+
+  it('treats delivered abort notices as semantic failures even when wrapper status is ok', () => {
+    writeCronConfig();
+    writeRun({
+      jobName: 'customer-followup-review',
+      startedAt: '2026-05-04T23:00:00.478Z',
+      finishedAt: '2026-05-04T23:00:19.929Z',
+      status: 'ok',
+      durationMs: 19451,
+      outputPreview: 'Task "customer-followup-review" aborted after 3 consecutive phase errors.',
+      terminalReason: 'completed',
+    });
+    writeUnleashedStatus('customer-followup-review', {
+      jobName: 'customer-followup-review',
+      status: 'error',
+      phase: 3,
+      updatedAt: '2026-05-04T23:00:19.928Z',
+    });
+
+    const response = buildCronDiagnosticResponse(
+      'How do we fix customer-followup-review?',
+      { baseDir },
+    );
+
+    expect(response).toContain('Unleashed status: error, phase 3');
+    expect(response).toContain('Root cause from latest output');
+    expect(response).toContain('underlying phase failure');
   });
 });

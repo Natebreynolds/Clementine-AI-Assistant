@@ -6,6 +6,7 @@ type GatewayWithLocalTurn = Gateway & {
     sessionKey: string,
     text: string,
     onText?: (text: string) => void | Promise<void>,
+    activeContext?: any,
   ) => Promise<string | null>;
 };
 
@@ -55,5 +56,16 @@ describe('gateway local approval replies', () => {
     await expect(gateway.handleLocalTurn('discord:member-dm:badando:user-1', 'cancel'))
       .resolves.toBe('Cancelled background task bg-test.');
     expect(gateway.cancelActiveBackgroundTask).toHaveBeenCalledWith('discord:member-dm:badando:user-1', 'cancel');
+  });
+
+  it('uses active working set context for standalone greetings', async () => {
+    const gateway = makeGateway(false);
+
+    await expect(gateway.handleLocalTurn(
+      'discord:user:123',
+      'hey',
+      undefined,
+      { greetingLine: 'Hey. Main thing right now: audit-inbox-check error — phase 3 failed.' },
+    )).resolves.toBe('Hey. Main thing right now: audit-inbox-check error — phase 3 failed.');
   });
 });

@@ -61,6 +61,21 @@ describe('tool router', () => {
     expect(route.inheritFullClaudeEnv).toBe(true);
   });
 
+  it('does not route generic issue follow-ups to GitHub', () => {
+    const route = routeToolSurface('How do we fix that issue?');
+
+    expect(route.bundles).toEqual([]);
+    expect(route.externalMcpServers).toEqual([]);
+    expect(route.composioToolkits).toEqual([]);
+  });
+
+  it('still routes explicit repo issues to GitHub', () => {
+    const route = routeToolSurface('check the repo issue about the failing workflow');
+
+    expect(route.bundles).toEqual(['github']);
+    expect(route.externalMcpServers).toEqual(['github']);
+  });
+
   it('combines multiple required bundles deterministically', () => {
     const route = routeToolSurface('find the lead in Google Drive and send a follow-up email');
 

@@ -185,6 +185,24 @@ export function findRecentNotificationContext(
   return null;
 }
 
+export function listRecentNotificationEvents(
+  sessionKey: string,
+  options: NotificationContextOptions = {},
+  limit = 5,
+): ProactiveNotificationEvent[] {
+  const now = options.now ?? Date.now();
+  return readRecentEvents(options)
+    .filter((event) => sessionMatches(event.sessionKey, sessionKey))
+    .filter((event) => {
+      const expiresAt = Date.parse(event.expiresAt);
+      if (Number.isFinite(expiresAt)) return expiresAt >= now;
+      const sentAt = Date.parse(event.sentAt);
+      return Number.isFinite(sentAt) && now - sentAt <= DEFAULT_TTL_MS;
+    })
+    .sort((a, b) => Date.parse(b.sentAt) - Date.parse(a.sentAt))
+    .slice(0, Math.max(1, limit));
+}
+
 export function buildNotificationContextPrompt(
   event: ProactiveNotificationEvent,
   userText: string,

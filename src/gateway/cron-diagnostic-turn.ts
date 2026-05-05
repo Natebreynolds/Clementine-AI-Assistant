@@ -6,7 +6,7 @@ export interface CronDiagnosticRequest {
   wantsFix: boolean;
 }
 
-interface CronRunEntry {
+export interface CronRunEntry {
   jobName?: string;
   startedAt?: string;
   finishedAt?: string;
@@ -26,6 +26,12 @@ interface CronJobConfig {
 }
 
 const DIAGNOSTIC_RE = /\b(fix|repair|debug|diagnos(?:e|is|tic)?|what broke|why (?:did|is)|failed|failing|failure|broken|stuck|taking forever|too long|issue|problem)\b/i;
+
+export function isInternalSyntheticPrompt(text: string): boolean {
+  const trimmed = text.trim();
+  return /^\[(DEEP_MODE_RESULT|SYSTEM)\]/i.test(trimmed)
+    || /^\[Recent proactive notification context\][\s\S]*\[(?:\/Recent proactive notification context)\]/i.test(trimmed);
+}
 
 function normalizeText(text: string): string {
   return text.trim().toLowerCase().replace(/\s+/g, ' ');
@@ -148,6 +154,8 @@ export function detectCronDiagnosticRequest(
   text: string,
   opts: { baseDir?: string } = {},
 ): CronDiagnosticRequest | null {
+  if (isInternalSyntheticPrompt(text)) return null;
+
   const normalized = normalizeText(text);
   if (!DIAGNOSTIC_RE.test(normalized)) return null;
 
@@ -189,6 +197,16 @@ function readRecentRuns(baseDir: string, jobName: string, limit = 20): CronRunEn
   }
 }
 
+function readUnleashedStatus(baseDir: string, jobName: string): Record<string, unknown> | null {
+  const file = path.join(baseDir, 'unleashed', jobName, 'status.json');
+  if (!existsSync(file)) return null;
+  try {
+    return JSON.parse(readFileSync(file, 'utf-8')) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+}
+
 function summarizeDuration(ms: unknown): string {
   if (typeof ms !== 'number' || !Number.isFinite(ms) || ms < 0) return 'unknown duration';
   if (ms < 1000) return `${Math.round(ms)}ms`;
@@ -217,6 +235,12 @@ function isMaxTurnsRun(run: CronRunEntry | undefined): boolean {
   return /max_turns|maximum number of turns/i.test(text);
 }
 
+function isSemanticFailureRun(run: CronRunEntry | undefined): boolean {
+  if (!run) return false;
+  const text = `${run.error ?? ''} ${run.outputPreview ?? ''}`;
+  return /task\s+"[^"]+"\s+aborted|aborted after \d+ consecutive phase errors|background work failed|unleashedtaskfailederror|stopped because/i.test(text);
+}
+
 function readCronScalarConfig(baseDir: string, jobName: string): string[] {
   const bareName = jobName.includes(':') ? jobName.split(':').slice(1).join(':') : jobName;
   const config = collectCronJobConfigs(baseDir).find((entry) =>
@@ -224,17 +248,16 @@ function readCronScalarConfig(baseDir: string, jobName: string): string[] {
   return config?.scalarLines ?? [];
 }
 
-export function buildCronDiagnosticResponse(
-  text: string,
+export function buildCronDiagnosticResponseForRequest(
+  request: CronDiagnosticRequest,
   opts: { baseDir: string } = { baseDir: process.env.CLEMENTINE_HOME || '' },
 ): string | null {
-  const request = detectCronDiagnosticRequest(text, { baseDir: opts.baseDir });
   if (!request || !opts.baseDir) return null;
-
   const runs = readRecentRuns(opts.baseDir, request.jobName, 20);
   const latest = runs.at(-1);
   const previousSuccess = runs.slice(0, -1).reverse().find((run) => run.status === 'ok' && !isContextThrashRun(run));
   const config = readCronScalarConfig(opts.baseDir, request.jobName);
+  const unleashedStatus = readUnleashedStatus(opts.baseDir, request.jobName);
 
   const lines: string[] = [
     `I found ${request.jobName}. I am not running the job.`,
@@ -253,6 +276,12 @@ export function buildCronDiagnosticResponse(
     summarizeDuration(latest.durationMs),
   ].filter(Boolean).join(', ');
   lines.push(`Latest run: ${latestLabel}.`);
+
+  if (unleashedStatus) {
+    const phase = unleashedStatus.phase == null ? '' : `, phase ${String(unleashedStatus.phase)}`;
+    const updated = unleashedStatus.updatedAt ? `, updated ${String(unleashedStatus.updatedAt)}` : '';
+    lines.push(`Unleashed status: ${String(unleashedStatus.status ?? 'unknown')}${phase}${updated}.`);
+  }
 
   if (previousSuccess?.startedAt) {
     lines.push(`Last clean success I see: ${previousSuccess.startedAt} (${summarizeDuration(previousSuccess.durationMs)}).`);
@@ -273,6 +302,12 @@ export function buildCronDiagnosticResponse(
     lines.push(
       'Root cause: the job hit its turn cap before finishing. A max_turns bump can help only if the output is already bounded.',
     );
+  } else if (isSemanticFailureRun(latest)) {
+    const detail = oneLine(latest.outputPreview || latest.error);
+    lines.push(`Root cause from latest output: ${detail || 'the scheduler delivered a failure notice even though the wrapper logged the run.'}`);
+    lines.push(
+      'Safe fix: treat this as an underlying phase failure, not a clean cron success. Inspect the failing unleashed phase/status and repair that phase prompt/tool path before retrying.',
+    );
   } else if (latest.status === 'ok') {
     lines.push('The latest run is recorded as ok. I would not change the job unless the delivered result was wrong.');
   } else {
@@ -287,4 +322,13 @@ export function buildCronDiagnosticResponse(
   }
 
   return lines.join('\n');
+}
+
+export function buildCronDiagnosticResponse(
+  text: string,
+  opts: { baseDir: string } = { baseDir: process.env.CLEMENTINE_HOME || '' },
+): string | null {
+  const request = detectCronDiagnosticRequest(text, { baseDir: opts.baseDir });
+  if (!request || !opts.baseDir) return null;
+  return buildCronDiagnosticResponseForRequest(request, opts);
 }

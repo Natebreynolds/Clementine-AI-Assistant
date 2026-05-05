@@ -81,6 +81,14 @@ describe('turn policy', () => {
     expect(p.disableAllTools).toBe(false);
   });
 
+  it('keeps vague operational issue follow-ups interactive instead of background or GitHub-routed', () => {
+    const d = decision('How do we fix that issue?', true);
+
+    expect(d.mode).toBe('tool_llm');
+    expect(d.toolRoute.bundles).toEqual([]);
+    expect(d.policy.retrievalTier).toBe('search');
+  });
+
   it('promotes broad analysis to the full context path with teams enabled', () => {
     const p = policy('analyze the entire agentic flow across all conversations and recommend improvements');
 

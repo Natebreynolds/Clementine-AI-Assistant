@@ -112,7 +112,7 @@ export const TOOL_BUNDLES: readonly ToolBundleDefinition[] = [
   },
   {
     id: 'github',
-    patterns: [/\b(github|pull request|pull requests|prs?|issues?)\b/i],
+    patterns: [/\b(github|pull request|pull requests|prs?)\b/i, /\b(repo|github)\s+issues?\b/i],
     externalMcpServers: ['github'],
     composioToolkits: ['github'],
   },
