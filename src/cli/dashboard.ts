@@ -3961,7 +3961,7 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
         inputs: {},
         steps: [{
           id: 's1',
-          prompt: body.initialPrompt ?? 'Describe what this routine should do.',
+          prompt: body.initialPrompt ?? 'Describe what this trick should do.',
           dependsOn: [],
           tier: 1,
           maxTurns: 15,
@@ -4014,7 +4014,7 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
       const parsed = parseBuilderId(id);
       if (!parsed) { res.status(400).json({ error: 'Bad id' }); return; }
       if (parsed.origin === 'cron') {
-        res.status(400).json({ error: 'This routine came from a legacy cron entry — disable it instead, or edit CRON.md directly.' });
+        res.status(400).json({ error: 'This trick came from a legacy cron entry — disable it instead, or edit CRON.md directly.' });
         return;
       }
       const wf = readWorkflow(id);
@@ -4065,7 +4065,7 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
         });
         child.unref();
         broadcastEvent({ type: 'cron_triggered', data: { job: wf.name } });
-        res.json({ ok: true, message: `Triggered routine: ${wf.name}` });
+        res.json({ ok: true, message: `Triggered trick: ${wf.name}` });
         return;
       }
 
@@ -4091,12 +4091,12 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
         res.status(409).json({
           ok: false,
           error: 'approval_required',
-          message: 'This routine may send, write, post, or call external tools. Approve side effects before running it.',
+          message: 'This trick may send, write, post, or call external tools. Approve side effects before running it.',
           sideEffects,
         });
         return;
       }
-      res.json({ ok: true, message: `Routine "${wf.name}" triggered` });
+      res.json({ ok: true, message: `Trick "${wf.name}" triggered` });
       broadcastEvent({ type: 'workflow_triggered', data: { id, name: wf.name } });
       getGateway().then(gw => gw.handleWorkflow(wf, body.inputs || {})).then(result => {
         broadcastEvent({ type: 'workflow_complete', data: { id, name: wf.name, status: 'ok', preview: (result || '').slice(0, 300) } });
@@ -14739,7 +14739,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
       <div class="nav-item active" data-page="home" data-icon="home" title="Chat, today, activity">
         <span class="nav-icon"></span> Home
       </div>
-      <div class="nav-item" data-page="build" data-icon="workflow" title="Workflows, crons, skills">
+      <div class="nav-item" data-page="build" data-icon="workflow" title="Tricks Clementine knows">
         <span class="nav-icon"></span> Build
         <span class="nav-badge" id="nav-cron-count" style="display:none">0</span>
       </div>
@@ -14945,7 +14945,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
     <div class="page" id="page-build">
       <!-- Toolbar -->
       <div id="routines-toolbar" style="display:flex;align-items:center;gap:12px;padding:14px 18px;border-bottom:1px solid var(--border);background:var(--bg-secondary);flex-wrap:wrap">
-        <h2 style="margin:0;font-size:18px;font-weight:600;color:var(--text-primary);display:flex;align-items:center;gap:8px"><span data-icon="workflow" class="icon-slot"></span> Routines</h2>
+        <h2 style="margin:0;font-size:18px;font-weight:600;color:var(--text-primary);display:flex;align-items:center;gap:8px"><span data-icon="workflow" class="icon-slot"></span> Tricks</h2>
         <span id="routines-count" style="font-size:11px;color:var(--text-muted)"></span>
         <span id="routines-editor-breadcrumb" style="display:none;font-size:12px;color:var(--text-muted)"> &rsaquo; <span id="routines-editor-name" style="color:var(--text-primary);font-weight:500"></span></span>
         <span style="flex:1"></span>
@@ -14955,17 +14955,17 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
           <option value="__global__">Clementine (global)</option>
         </select>
         <button id="routines-back-btn" style="display:none;padding:6px 12px;border-radius:6px;cursor:pointer;font-size:12px;background:var(--bg-tertiary);border:1px solid var(--border);color:var(--text-secondary)" onclick="window.RoutinesUI && RoutinesUI.closeEditor()">&larr; Back to list</button>
-        <button id="routines-assist-btn" class="btn-sm" onclick="window.RoutinesUI && RoutinesUI.openAssist()" title="Describe a routine in natural language" style="padding:6px 12px;border-radius:6px;cursor:pointer;font-size:12px;background:var(--bg-tertiary);border:1px solid var(--border);color:var(--text-secondary)">Generate from prompt</button>
-        <button id="routines-create-btn" class="btn-sm btn-primary" onclick="window.RoutinesUI && RoutinesUI.openCreate()" style="padding:6px 14px;border-radius:6px;cursor:pointer;font-size:12px">+ New Routine</button>
+        <button id="routines-assist-btn" class="btn-sm" onclick="window.RoutinesUI && RoutinesUI.openAssist()" title="Describe a trick in natural language" style="padding:6px 12px;border-radius:6px;cursor:pointer;font-size:12px;background:var(--bg-tertiary);border:1px solid var(--border);color:var(--text-secondary)">Generate from prompt</button>
+        <button id="routines-create-btn" class="btn-sm btn-primary" onclick="window.RoutinesUI && RoutinesUI.openCreate()" style="padding:6px 14px;border-radius:6px;cursor:pointer;font-size:12px">+ New Trick</button>
       </div>
       <!-- List view (default) -->
       <div id="routines-list-pane" style="flex:1;min-height:0;overflow-y:auto;padding:18px;background:var(--bg-primary)">
         <div id="routines-list-empty" class="empty-state" style="display:none;padding:64px 18px;text-align:center;color:var(--text-muted)">
           <div style="font-size:38px;opacity:0.4;margin-bottom:14px">&#9881;</div>
-          <div style="font-size:15px;font-weight:500;color:var(--text-secondary);margin-bottom:6px">No routines yet</div>
-          <div style="font-size:12px;line-height:1.5;max-width:380px;margin:0 auto 16px">A Routine is a sequence of steps &mdash; call MCP tools, run local CLIs, prompt the agent, branch on results &mdash; that runs on a schedule or on demand. Example: &ldquo;at 8am check email; if anything urgent, summarize and Slack me.&rdquo;</div>
+          <div style="font-size:15px;font-weight:500;color:var(--text-secondary);margin-bottom:6px">No tricks yet</div>
+          <div style="font-size:12px;line-height:1.5;max-width:380px;margin:0 auto 16px">A Trick is a sequence of steps Clementine performs on cue &mdash; call MCP tools, run local CLIs, prompt the agent, branch on results &mdash; that runs on a schedule or on demand. Example: &ldquo;at 8am check email; if anything urgent, summarize and Slack me.&rdquo;</div>
           <div style="display:flex;gap:8px;justify-content:center;flex-wrap:wrap">
-            <button class="btn-sm btn-primary" onclick="window.RoutinesUI && RoutinesUI.openCreate()" style="padding:6px 14px">+ New Routine</button>
+            <button class="btn-sm btn-primary" onclick="window.RoutinesUI && RoutinesUI.openCreate()" style="padding:6px 14px">+ New Trick</button>
             <button class="btn-sm" onclick="window.RoutinesUI && RoutinesUI.openAssist()" style="padding:6px 14px;background:var(--bg-tertiary);border:1px solid var(--border);color:var(--text-secondary)">Generate from prompt</button>
           </div>
         </div>
@@ -14993,7 +14993,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
       <!-- Create modal -->
       <div id="routines-create-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.4);z-index:200;align-items:center;justify-content:center">
         <div style="background:var(--bg-secondary);border:1px solid var(--border);border-radius:var(--radius);padding:22px;width:480px;max-width:92vw;display:flex;flex-direction:column;gap:12px">
-          <h3 style="margin:0;font-size:16px;font-weight:600;color:var(--text-primary)">New routine</h3>
+          <h3 style="margin:0;font-size:16px;font-weight:600;color:var(--text-primary)">New trick</h3>
           <label style="font-size:11px;color:var(--text-muted);font-weight:500;text-transform:uppercase;letter-spacing:0.04em">Name</label>
           <input type="text" id="routines-create-name" placeholder="e.g. 8am Email Triage" style="padding:8px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg-input);color:var(--text-primary);font-size:13px">
           <label style="font-size:11px;color:var(--text-muted);font-weight:500;text-transform:uppercase;letter-spacing:0.04em">Description (optional)</label>
@@ -15013,9 +15013,9 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
       <!-- Assist modal (Generate from prompt) -->
       <div id="routines-assist-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.4);z-index:200;align-items:center;justify-content:center">
         <div style="background:var(--bg-secondary);border:1px solid var(--border);border-radius:var(--radius);padding:22px;width:560px;max-width:92vw;max-height:80vh;display:flex;flex-direction:column;gap:14px">
-          <h3 style="margin:0;font-size:16px;font-weight:600;color:var(--text-primary)">Generate routine from prompt</h3>
-          <p style="margin:0;font-size:12px;color:var(--text-muted);line-height:1.5">Describe what the routine should do. The assistant will draft a starter sequence you can edit. Example: &ldquo;Every morning at 8am, check unread Gmail; if anything looks urgent, summarize and send to Slack #me.&rdquo;</p>
-          <textarea id="routines-assist-input" rows="6" placeholder="Describe the routine&hellip;" style="width:100%;padding:10px;border:1px solid var(--border);border-radius:6px;background:var(--bg-input);color:var(--text-primary);font-size:13px;font-family:inherit;resize:vertical;box-sizing:border-box"></textarea>
+          <h3 style="margin:0;font-size:16px;font-weight:600;color:var(--text-primary)">Generate trick from prompt</h3>
+          <p style="margin:0;font-size:12px;color:var(--text-muted);line-height:1.5">Describe what the trick should do. The assistant will draft a starter sequence you can edit. Example: &ldquo;Every morning at 8am, check unread Gmail; if anything looks urgent, summarize and send to Slack #me.&rdquo;</p>
+          <textarea id="routines-assist-input" rows="6" placeholder="Describe the trick&hellip;" style="width:100%;padding:10px;border:1px solid var(--border);border-radius:6px;background:var(--bg-input);color:var(--text-primary);font-size:13px;font-family:inherit;resize:vertical;box-sizing:border-box"></textarea>
           <div id="routines-assist-status" style="font-size:11px;color:var(--text-muted);min-height:14px"></div>
           <div style="display:flex;gap:8px;justify-content:flex-end">
             <button class="btn-sm" onclick="window.RoutinesUI && RoutinesUI.closeAssist()" style="padding:6px 14px;background:var(--bg-tertiary);border:1px solid var(--border);color:var(--text-secondary)">Cancel</button>
@@ -15060,7 +15060,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
           // ── data ────────────────────────────────────────────────────
           loadOwners: function() {
             // Reuse the agent registry the rest of the dashboard uses.
-            fetch('/api/agents').then(function(r){ return r.json(); }).then(function(data){
+            apiFetch('/api/agents').then(function(r){ return r.json(); }).then(function(data){
               R.state.owners = (data.agents || []).map(function(a){ return { slug: a.slug, name: a.name || a.slug }; });
               R.populateOwnerSelects();
             }).catch(function(){ /* non-fatal */ });
@@ -15080,17 +15080,17 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
             }
           },
           loadMcpTools: function() {
-            fetch('/api/routines/mcp-tools').then(function(r){ return r.json(); }).then(function(data){
+            apiFetch('/api/routines/mcp-tools').then(function(r){ return r.json(); }).then(function(data){
               R.state.mcpTools = data && data.servers ? data : { servers: [] };
             }).catch(function(){ R.state.mcpTools = { servers: [] }; });
           },
           loadCliTools: function() {
-            fetch('/api/routines/cli-tools').then(function(r){ return r.json(); }).then(function(data){
+            apiFetch('/api/routines/cli-tools').then(function(r){ return r.json(); }).then(function(data){
               R.state.cliTools = (data && data.tools) || [];
             }).catch(function(){ R.state.cliTools = []; });
           },
           refreshList: function() {
-            fetch('/api/routines').then(function(r){ return r.json(); }).then(function(data){
+            apiFetch('/api/routines').then(function(r){ return r.json(); }).then(function(data){
               R.state.list = (data && data.routines) || [];
               R.renderList();
             }).catch(function(){ R.state.list = []; R.renderList(); });
@@ -15108,7 +15108,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
               if (filter === '__global__') return r.scope === 'global';
               return r.scope === 'agent' && r.agentSlug === filter;
             });
-            if (count) count.textContent = rows.length === 0 ? '' : rows.length + (rows.length === 1 ? ' routine' : ' routines');
+            if (count) count.textContent = rows.length === 0 ? '' : rows.length + (rows.length === 1 ? ' trick' : ' tricks');
             if (rows.length === 0) {
               empty.style.display = 'block';
               wrap.style.display = 'none';
@@ -15135,13 +15135,13 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
             }).join('');
           },
           toggle: function(id) {
-            fetch('/api/routines/' + encodeURIComponent(id) + '/toggle', { method: 'POST' })
+            apiFetch('/api/routines/' + encodeURIComponent(id) + '/toggle', { method: 'POST' })
               .then(function(r){ return r.json(); })
               .then(function(){ R.refreshList(); })
               .catch(function(err){ alert('Toggle failed: ' + err); });
           },
           run: function(id, approvedSideEffects) {
-            fetch('/api/routines/' + encodeURIComponent(id) + '/run', {
+            apiFetch('/api/routines/' + encodeURIComponent(id) + '/run', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({ approvedSideEffects: approvedSideEffects === true })
@@ -15149,7 +15149,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
               if (r.status === 409) {
                 return r.json().then(function(j){
                   var lines = (j.sideEffects || []).map(function(s){ return '  • ' + s.kind + ': ' + s.label; }).join('\\n');
-                  if (confirm('This routine has side effects:\\n\\n' + lines + '\\n\\nProceed?')) R.run(id, true);
+                  if (confirm('This trick has side effects:\\n\\n' + lines + '\\n\\nProceed?')) R.run(id, true);
                 });
               }
               return r.json().then(function(j){
@@ -15160,10 +15160,10 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
           },
           // ── editor ──────────────────────────────────────────────────
           openEditor: function(id) {
-            fetch('/api/routines/' + encodeURIComponent(id))
+            apiFetch('/api/routines/' + encodeURIComponent(id))
               .then(function(r){ return r.json(); })
               .then(function(data){
-                if (!data || !data.routine) { alert('Failed to load routine'); return; }
+                if (!data || !data.routine) { alert('Failed to load trick'); return; }
                 R.state.editing = { id: data.id, routine: data.routine, dirty: false, validation: data.validation };
                 R.showEditor();
               }).catch(function(err){ alert('Open failed: ' + err); });
@@ -15409,7 +15409,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
           },
           removeStep: function(idx) {
             if (!R.state.editing) return;
-            if (R.state.editing.routine.steps.length <= 1) { alert('A routine must have at least one step.'); return; }
+            if (R.state.editing.routine.steps.length <= 1) { alert('A trick must have at least one step.'); return; }
             if (!confirm('Remove this step?')) return;
             var removed = R.state.editing.routine.steps.splice(idx, 1)[0];
             // Strip lingering dependsOn references.
@@ -15466,7 +15466,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
             R.markDirty();  // capture latest header values
             var btn = document.getElementById('re-save-btn');
             if (btn) btn.textContent = 'Saving…';
-            fetch('/api/routines/' + encodeURIComponent(R.state.editing.id), {
+            apiFetch('/api/routines/' + encodeURIComponent(R.state.editing.id), {
               method: 'PUT',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({ routine: R.state.editing.routine })
@@ -15477,7 +15477,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
                   if (res.body.error === 'validation') {
                     var msg = (res.body.validation.issues || []).map(function(i){ return '• ' + i.severity + ': ' + i.message; }).join('\\n');
                     if (confirm('Validation issues:\\n\\n' + msg + '\\n\\nSave anyway?')) {
-                      fetch('/api/routines/' + encodeURIComponent(R.state.editing.id), {
+                      apiFetch('/api/routines/' + encodeURIComponent(R.state.editing.id), {
                         method: 'PUT',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({ routine: R.state.editing.routine, force: true })
@@ -15503,7 +15503,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
           },
           dryRunCurrent: function() {
             if (!R.state.editing) return;
-            fetch('/api/routines/' + encodeURIComponent(R.state.editing.id) + '/dry-run', { method: 'POST' })
+            apiFetch('/api/routines/' + encodeURIComponent(R.state.editing.id) + '/dry-run', { method: 'POST' })
               .then(function(r){ return r.json(); })
               .then(function(d){
                 var lines = ['Dry-run for ' + R.state.editing.routine.name + ':\\n'];
@@ -15514,7 +15514,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
           },
           testCurrent: function() {
             if (!R.state.editing) return;
-            fetch('/api/routines/' + encodeURIComponent(R.state.editing.id) + '/test', {
+            apiFetch('/api/routines/' + encodeURIComponent(R.state.editing.id) + '/test', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({ mode: 'mock' })
@@ -15526,7 +15526,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
           deleteCurrent: function() {
             if (!R.state.editing) return;
             if (!confirm('Delete routine "' + R.state.editing.routine.name + '"? This is permanent.')) return;
-            fetch('/api/routines/' + encodeURIComponent(R.state.editing.id), { method: 'DELETE' })
+            apiFetch('/api/routines/' + encodeURIComponent(R.state.editing.id), { method: 'DELETE' })
               .then(function(r){ return r.json(); })
               .then(function(j){
                 if (j.ok) { R.state.editing = null; R.closeEditor(); R.refreshList(); }
@@ -15549,7 +15549,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
             if (!drawer) return;
             drawer.innerHTML = '<div style="padding:18px"><div style="display:flex;align-items:center;gap:8px;margin-bottom:10px"><h3 style="margin:0;font-size:15px;font-weight:600;color:var(--text-primary)">Run history</h3><span style="flex:1"></span><button onclick="window.RoutinesUI&&RoutinesUI.closeRuns()" style="background:none;border:none;color:var(--text-muted);font-size:18px;cursor:pointer">&times;</button></div><div style="font-size:12px;color:var(--text-muted)">Loading…</div></div>';
             drawer.style.display = 'block';
-            fetch('/api/routines/' + encodeURIComponent(id) + '/runs').then(function(r){ return r.json(); }).then(function(d){
+            apiFetch('/api/routines/' + encodeURIComponent(id) + '/runs').then(function(r){ return r.json(); }).then(function(d){
               var runs = d.runs || [];
               var html = '<div style="padding:18px"><div style="display:flex;align-items:center;gap:8px;margin-bottom:14px"><h3 style="margin:0;font-size:15px;font-weight:600;color:var(--text-primary)">Run history</h3><span style="flex:1"></span><button onclick="window.RoutinesUI&&RoutinesUI.closeRuns()" style="background:none;border:none;color:var(--text-muted);font-size:18px;cursor:pointer">&times;</button></div>';
               if (runs.length === 0) {
@@ -15593,7 +15593,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
               schedule: document.getElementById('routines-create-schedule').value.trim() || undefined,
               agent: document.getElementById('routines-create-owner').value || undefined,
             };
-            fetch('/api/routines', {
+            apiFetch('/api/routines', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify(body)
@@ -15624,11 +15624,11 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
             var btn = document.getElementById('routines-assist-submit');
             var status = document.getElementById('routines-assist-status');
             if (btn) { btn.textContent = 'Generating…'; btn.disabled = true; }
-            if (status) status.textContent = 'Asking the assistant to draft a routine…';
+            if (status) status.textContent = 'Asking the assistant to draft a trick…';
             // Reuse the existing /api/builder/chat which is already wired and
             // produces workflow drafts. We also pass mode hint so the agent
             // knows to focus on building one routine.
-            fetch('/api/builder/chat', {
+            apiFetch('/api/builder/chat', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({ message: prompt, mode: 'workflow' })
@@ -20882,7 +20882,7 @@ let scheduledWorkflowData = [];
 let buildUsageByTask = {};
 
 function jsStr(s) {
-  return String(s ?? '').replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/\r/g, '\\r').replace(/\n/g, '\\n');
+  return String(s ?? '').replace(/\\\\/g, '\\\\\\\\').replace(/'/g, "\\\\'").replace(/\\r/g, '\\\\r').replace(/\\n/g, '\\\\n');
 }
 
 function durationLabel(ms) {
