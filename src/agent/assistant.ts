@@ -2713,25 +2713,76 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
         allowedTools = allowedTools.filter(t => whitelist.has(t));
       }
 
-      if (!toolRoute.fullSurface
-        && !adminNeeded
-        && !autonomousToolRun
-        && allowedTools.length > TOOL_SURFACE_HARD_LIMIT) {
+      // Tool-surface cap. Applies to chat AND to autonomous runs (cron,
+      // unleashed, heartbeat). Without this cap on cron, a single job got
+      // 300+ MCP tool schemas in the system prompt — leaving Sonnet's SDK
+      // autocompact no room to actually compact when tool responses came
+      // back. That manifested as `rapid_refill_breaker` ("context refilled
+      // to the limit within 3 turns"). The SDK's autocompact still works;
+      // we just have to give it room.
+      if (!adminNeeded && allowedTools.length > TOOL_SURFACE_HARD_LIMIT) {
         const beforeAllowedToolCount = allowedTools.length;
         const coreSdkTools = new Set(['Read', 'Write', 'Edit', 'Bash', 'Glob', 'Grep', 'WebSearch', 'WebFetch']);
         const clementineToolPrefixForCap = `mcp__${TOOLS_SERVER}__`;
-        allowedTools = allowedTools.filter(tool =>
-          coreSdkTools.has(tool) || tool.startsWith(clementineToolPrefixForCap),
-        );
-        externalMcpServers = {};
-        composioMcpServers = {};
-        logger.warn({
-          sessionKey,
-          beforeAllowedToolCount,
-          afterAllowedToolCount: allowedTools.length,
-          hardLimit: TOOL_SURFACE_HARD_LIMIT,
-          bundles: toolRoute.bundles,
-        }, 'SDK allowed tool surface exceeded hard limit; falling back to core Clementine tools for this interactive turn');
+
+        // Smart fallback: if the route matched specific bundles, keep
+        // those bundles' explicit servers/toolkits and drop everything
+        // else (including the fullSurface=true expansion to "all
+        // connected MCP servers"). Only fall all the way down to
+        // core+Clementine tools when there are no matched bundles to
+        // restrict to.
+        const matchedExternal = Array.isArray(toolRoute.externalMcpServers)
+          ? new Set(toolRoute.externalMcpServers)
+          : null;
+        const matchedComposio = Array.isArray(toolRoute.composioToolkits)
+          ? new Set(toolRoute.composioToolkits)
+          : null;
+        const hasMatchedBundles = !!matchedExternal && !!matchedComposio
+          && (matchedExternal.size > 0 || matchedComposio.size > 0);
+
+        if (hasMatchedBundles) {
+          const keepServers = new Set<string>([
+            TOOLS_SERVER,
+            ...(matchedExternal ?? []),
+            ...(matchedComposio ?? []),
+          ]);
+          allowedTools = allowedTools.filter(tool => {
+            if (coreSdkTools.has(tool)) return true;
+            if (!tool.startsWith('mcp__')) return true;
+            const serverName = tool.slice('mcp__'.length).split('__')[0]!;
+            return keepServers.has(serverName);
+          });
+          externalMcpServers = Object.fromEntries(
+            Object.entries(externalMcpServers).filter(([name]) => matchedExternal!.has(name)),
+          );
+          composioMcpServers = Object.fromEntries(
+            Object.entries(composioMcpServers).filter(([name]) => matchedComposio!.has(name)),
+          );
+          logger.warn({
+            sessionKey,
+            beforeAllowedToolCount,
+            afterAllowedToolCount: allowedTools.length,
+            hardLimit: TOOL_SURFACE_HARD_LIMIT,
+            bundles: toolRoute.bundles,
+            keptExternal: [...(matchedExternal ?? [])],
+            keptComposio: [...(matchedComposio ?? [])],
+            autonomous: autonomousToolRun,
+          }, 'Tool surface exceeded hard limit; trimmed to matched bundles');
+        } else {
+          allowedTools = allowedTools.filter(tool =>
+            coreSdkTools.has(tool) || tool.startsWith(clementineToolPrefixForCap),
+          );
+          externalMcpServers = {};
+          composioMcpServers = {};
+          logger.warn({
+            sessionKey,
+            beforeAllowedToolCount,
+            afterAllowedToolCount: allowedTools.length,
+            hardLimit: TOOL_SURFACE_HARD_LIMIT,
+            bundles: toolRoute.bundles,
+            autonomous: autonomousToolRun,
+          }, 'Tool surface exceeded hard limit with no matched bundles; falling back to core Clementine tools');
+        }
       }
     }
 

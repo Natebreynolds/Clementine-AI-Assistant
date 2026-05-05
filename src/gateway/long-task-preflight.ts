@@ -67,9 +67,14 @@ function broadTaskSignals(text: string): string[] {
   return signals.filter(([re]) => re.test(lower)).map(([, reason]) => reason);
 }
 
-function recentContextFailures(recentRuns: CronRunEntry[]): string[] {
+const RECENT_CONTEXT_FAILURE_WINDOW_MS = 48 * 60 * 60 * 1000;
+
+function recentContextFailures(recentRuns: CronRunEntry[], now: number = Date.now()): string[] {
   const reasons: string[] = [];
+  const cutoff = now - RECENT_CONTEXT_FAILURE_WINDOW_MS;
   for (const run of recentRuns.slice(0, 5)) {
+    const startedMs = Date.parse(run.startedAt);
+    if (Number.isFinite(startedMs) && startedMs < cutoff) continue;
     const health = classifyRunHealth(run);
     if (health.status === 'context_overflow') reasons.push('recent run hit context overflow');
     if (health.status === 'prompt_too_large') reasons.push('recent run hit prompt-too-large');

@@ -14,8 +14,15 @@ export interface GatewayContextHygieneDecision {
   estimatedTokens: number;
 }
 
-export const GATEWAY_CONTEXT_COMPACT_EXCHANGES = 30;
-export const GATEWAY_CONTEXT_COMPACT_TOKENS = 90_000;
+// Session-state pruning ceiling. Independent of the SDK's own autocompact —
+// this trims OUR in-memory record of the conversation so it doesn't grow
+// unbounded over a long-lived chat session. The SDK owns the actual
+// context-window dance; we just want a hard ceiling on session bookkeeping.
+// Thresholds were tightened earlier (30 / 90K) to compensate for autocompact
+// thrash, but the real cause was the over-broad tool surface, not session
+// state. With that fixed, this only needs to fire as a safety net.
+export const GATEWAY_CONTEXT_COMPACT_EXCHANGES = 100;
+export const GATEWAY_CONTEXT_COMPACT_TOKENS = 180_000;
 
 export function assessGatewayContextHygiene(snapshot: GatewayContextSnapshot): GatewayContextHygieneDecision {
   const totalChars = snapshot.textChars + (snapshot.pendingContextChars ?? 0) + (snapshot.recentTranscriptChars ?? 0);

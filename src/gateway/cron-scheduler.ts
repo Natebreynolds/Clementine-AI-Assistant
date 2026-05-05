@@ -1179,16 +1179,18 @@ export class CronScheduler {
         } catch { /* non-fatal */ }
       }
 
+      // Long-task preflight is ADVISORY ONLY. We log the risk + inject a
+      // checkpoint-discipline prompt prefix so the agent paces itself, but
+      // we do NOT auto-override the model/mode, never DM the owner asking
+      // to approve an Opus 1M upgrade, and never pre-block the run.
+      //
+      // Sonnet runs every job by default. Opus 1M is opt-in: set
+      // `model: claude-opus-4-7[1m]` in CRON.md per-job, or flip
+      // CLEMENTINE_1M_CONTEXT_MODE=on for global enable.
       let longTaskPreflight: CronRunEntry['longTaskPreflight'] | undefined;
       const preflight = analyzeLongTaskPreflight(job, jobPrompt, this.runLog.readRecent(job.name, 5));
       if (preflight.risk !== 'normal') {
-        job = { ...job };
-        if (preflight.modelOverride) job.model = preflight.modelOverride;
-        if (preflight.modeOverride) job.mode = preflight.modeOverride;
-        if (preflight.maxHoursOverride) job.maxHours = preflight.maxHoursOverride;
         longTaskPreflight = compactLongTaskPreflight(preflight);
-        let promptPreflight = preflight;
-        let approvalPromptPrefix: string | undefined;
         logger.warn({
           job: job.name,
           risk: preflight.risk,
@@ -1198,7 +1200,8 @@ export class CronScheduler {
           model: job.model,
           mode: job.mode,
           reasons: preflight.reasons,
-        }, 'Long-task preflight routed cron job');
+          advisory: true,
+        }, 'Long-task preflight (advisory) flagged cron job');
         this.logAutonomy('long_task_preflight', job, {
           risk: preflight.risk,
           route: preflight.route,
@@ -1206,85 +1209,11 @@ export class CronScheduler {
           projectedContextTokens: preflight.projectedContextTokens,
           model: job.model,
           mode: job.mode,
-          requiresUserRefinement: preflight.requiresUserRefinement,
+          requiresUserRefinement: false,
+          advisory: true,
         });
-
-        if (preflight.shouldSkipBeforeRun) {
-          let approvedLongContext = false;
-          if (preflight.approvalModelOverride) {
-            const approvalId = `long-task-preflight-${job.name.replace(/[^a-zA-Z0-9_-]/g, '_')}-${Date.now()}`;
-            const approvalMessage = [
-              `**Long task needs approval:** \`${job.name}\``,
-              '',
-              `Preflight estimates ${preflight.estimatedInputTokens.toLocaleString()} initial tokens and ${Math.round(preflight.projectedContextTokens).toLocaleString()} working-context tokens.`,
-              `Current route would exceed the 200K-safe path, but Clementine can try a one-time run on \`${preflight.approvalModelOverride}\`.`,
-              '',
-              `Reply \`yes\` or \`go\` to approve this one run, or \`no\` to skip and refine/split the task.`,
-              `Reason: ${preflight.approvalReason}`,
-            ].join('\n');
-            await this.dispatcher.send(approvalMessage, {})
-              .catch(err => logger.debug({ err, job: job.name }, 'Failed to send long-task approval request'));
-            const approvalResult = await this.gateway.requestApproval(`Run ${job.name} on ${preflight.approvalModelOverride}?`, approvalId)
-              .catch(() => false);
-            const normalizedApproval = String(approvalResult).trim().toLowerCase();
-            approvedLongContext = approvalResult === true
-              || ['yes', 'y', 'go', 'approve', 'approved', 'true'].includes(normalizedApproval);
-            if (approvedLongContext) {
-              job.model = preflight.approvalModelOverride;
-              job.mode = 'unleashed';
-              job.maxHours = preflight.maxHoursOverride ?? job.maxHours ?? 2;
-              longTaskPreflight = {
-                ...longTaskPreflight,
-                route: 'opus_1m',
-                contextWindowTokens: 1_000_000,
-                modelAfter: preflight.approvalModelOverride,
-                modeAfter: 'unleashed',
-                requiresUserRefinement: false,
-                canProceedWithApproval: false,
-                approvalReason: 'Owner approved one-time long-context execution.',
-              };
-              promptPreflight = {
-                ...preflight,
-                route: 'opus_1m',
-                contextWindowTokens: 1_000_000,
-                modelAfter: preflight.approvalModelOverride,
-                modeAfter: 'unleashed',
-                requiresUserRefinement: false,
-                canProceedWithApproval: false,
-                approvalReason: 'Owner approved one-time long-context execution.',
-                approvalModel: preflight.approvalModelOverride,
-                approvalModelOverride: undefined,
-                shouldSkipBeforeRun: false,
-              };
-              approvalPromptPrefix = `## Long Task Approval\nOwner approved this one-time run on ${preflight.approvalModelOverride}. Continue with strict checkpoints and bounded tool output.`;
-              logger.warn({ job: job.name, model: job.model }, 'Long-task preflight approved for one-time long-context run');
-            }
-          }
-
-          if (!approvedLongContext) {
-            const now = new Date().toISOString();
-            const message = (
-              `Long-task preflight blocked ${job.name}: estimated ${preflight.estimatedInputTokens.toLocaleString()} input tokens ` +
-              `on a ${preflight.contextWindowTokens.toLocaleString()} token route. ` +
-              `${preflight.recommendations[0]}`
-            );
-            this._logRun({
-              jobName: job.name,
-              startedAt: now,
-              finishedAt: now,
-              status: 'skipped',
-              durationMs: 0,
-              attempt: 0,
-              outputPreview: message,
-              longTaskPreflight,
-            });
-            await this.dispatcher.send(message, { agentSlug: job.agentSlug });
-            return;
-          }
-        }
         jobPrompt = [
-          approvalPromptPrefix,
-          formatLongTaskPromptPrefix(promptPreflight),
+          formatLongTaskPromptPrefix(preflight),
           jobPrompt,
         ].filter(Boolean).join('\n\n');
       }

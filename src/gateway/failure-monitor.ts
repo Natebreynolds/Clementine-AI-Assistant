@@ -174,10 +174,14 @@ function isSemanticFailure(entry: CronRunEntry): boolean {
 
   // Match on word boundaries so "BLOCKED" matches "Result: BLOCKED" but
   // "blockedBy" in a stray JSON fragment doesn't.
+  //
+  // __NOTHING__ is the explicit "nothing to report" sentinel from the cron
+  // prompt (assistant.ts runCronJob). It's a successful empty-result, not a
+  // failure — flagging it here made every quiet inbox check look broken to
+  // the proactive insight engine.
   const markerRegexes = [
     /\b(blocked|task_blocked|task_incomplete)\b/,
     /\b(failed|could not|unable to|no local bash|permission denied)\b/,
-    /__nothing__/,
   ];
   for (const re of markerRegexes) {
     if (re.test(previewLower)) return true;
