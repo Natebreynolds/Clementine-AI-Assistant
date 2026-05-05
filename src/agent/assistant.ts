@@ -5878,8 +5878,26 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
       }
     } catch { /* non-fatal — run without skills */ }
 
+    // ── Sub-agent fan-out directive (Vision 2) ──────────────────────
+    // Detect multi-item / broad-scope signals in the job spec and
+    // prepend a hard-line fan-out mandate when found. This is what
+    // keeps the parent context clean on long jobs: each slice of work
+    // runs in an Agent sub-agent (its own context window, big tool
+    // responses contained), and the parent only sees compact summaries.
+    const { buildAlwaysOnParallelizationHint, buildFanoutDirectiveForText } = await import('./fanout-policy.js');
+    const fanoutScope = `${jobName}\n${jobPrompt}\n${cronProfile?.description ?? ''}\n${cronProfile?.systemPromptBody ?? ''}`;
+    const { directive: fanoutDirective, report: fanoutReport } = buildFanoutDirectiveForText(fanoutScope);
+    if (fanoutReport.needsFanout) {
+      logger.info({
+        job: jobName,
+        signals: fanoutReport.signals.map(s => s.pattern),
+      }, 'Fanout policy: directive injected for cron job');
+    }
+
     const prompt =
       `[Scheduled task: ${jobName}]\n\n` +
+      (fanoutDirective ? fanoutDirective + '\n\n' : '') +
+      buildAlwaysOnParallelizationHint() + '\n\n' +
       progressContext +
       goalContext +
       skillContext +
@@ -6295,22 +6313,31 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
 
       let prompt: string;
       if (phase === 1) {
+        const { buildAlwaysOnParallelizationHint, buildFanoutDirectiveForText } = await import('./fanout-policy.js');
+        const unleashedFanoutScope = `${jobName}\n${jobPrompt}\n${unleashedProfile?.description ?? ''}\n${unleashedProfile?.systemPromptBody ?? ''}`;
+        const { directive: unleashedFanoutDirective, report: unleashedFanoutReport } = buildFanoutDirectiveForText(unleashedFanoutScope);
+        if (unleashedFanoutReport.needsFanout) {
+          logger.info({
+            job: jobName,
+            phase,
+            signals: unleashedFanoutReport.signals.map(s => s.pattern),
+          }, 'Fanout policy: directive injected for unleashed phase 1');
+        }
+
         prompt =
           `[UNLEASHED TASK: ${jobName} — Phase ${phase} — ${timestamp}]\n\n` +
           `You are running in unleashed mode — a long-running autonomous task.\n` +
           `Time remaining: ${remainingHours} hours. You have ${turnsPerPhase} turns per phase.\n` +
           `After each phase completes, your session will be resumed with fresh context.\n\n` +
+          (unleashedFanoutDirective ? unleashedFanoutDirective + '\n\n' : '') +
+          buildAlwaysOnParallelizationHint() + '\n\n' +
           `TASK:\n${jobPrompt}\n\n` +
           unleashedSkillContext +
           `${unleashedContextSafety}\n\n` +
           `IMPORTANT:\n` +
           `- Work methodically through the task in phases\n` +
           `- At the end of this phase, output a STATUS SUMMARY of what you accomplished and what remains\n` +
-          `- Save important intermediate results to files so they persist across phases\n\n` +
-          `PARALLELIZATION: When processing multiple items (prospects, accounts, emails, analyses), ` +
-          `use the Agent tool to spawn sub-agents that work in parallel. For example, if you need to ` +
-          `research 10 prospects, spawn 3-5 sub-agents that each handle a batch — don't process them ` +
-          `one at a time. Each sub-agent should receive specific items and return structured results.`;
+          `- Save important intermediate results to files so they persist across phases`;
       } else {
         // Phase 2+ — inject structured checkpoint from previous phase if available
         let checkpointContext = '';
@@ -6328,6 +6355,9 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
           }
         } catch { /* fall back to no checkpoint */ }
 
+        const { buildAlwaysOnParallelizationHint: hintFn } = await import('./fanout-policy.js');
+        const phaseParallelHint = hintFn();
+
         if (sessionId) {
           // Resuming existing session — agent has conversation history + structured checkpoint
           prompt =
@@ -6336,6 +6366,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
             `Time remaining: ${remainingHours} hours. You have ${turnsPerPhase} turns this phase.\n` +
             checkpointContext +
             `\n${unleashedContextSafety}\n` +
+            `\n${phaseParallelHint}\n` +
             `\nContinue working on the task. Pick up where you left off.\n` +
             `If the task is COMPLETE, output "TASK_COMPLETE:" followed by a final summary.\n\n` +
             `IMPORTANT: Output a STATUS SUMMARY at the end of this phase.`;
@@ -6349,6 +6380,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
             `TASK:\n${jobPrompt}\n` +
             checkpointContext +
             `\n${unleashedContextSafety}\n` +
+            `\n${phaseParallelHint}\n` +
             `\nCheck any files or progress from prior phases, then continue the work.\n` +
             `If the task is COMPLETE, output "TASK_COMPLETE:" followed by a final summary.\n\n` +
             `IMPORTANT: Output a STATUS SUMMARY at the end of this phase.`;
