@@ -14101,6 +14101,75 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
     font-weight: 500;
   }
 
+  /* Unified Memory tab — facet rail */
+  .vault-facet-list { display: flex; flex-direction: column; gap: 3px; }
+  .vault-facet-row {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 5px 8px; border-radius: 6px; cursor: pointer;
+    color: var(--text-secondary); font-size: 12px;
+    user-select: none; transition: background var(--motion);
+  }
+  .vault-facet-row:hover { background: var(--bg-hover); color: var(--text-primary); }
+  .vault-facet-row.active { background: var(--clementine-bg); color: var(--clementine); font-weight: 500; }
+  .vault-facet-row .vault-facet-count { font-size: 11px; opacity: 0.6; margin-left: 8px; }
+  .vault-facet-row.active .vault-facet-count { opacity: 0.85; }
+
+  /* Unified Memory tab — file list rows */
+  .vault-mem-row {
+    display: flex; flex-direction: column; gap: 3px;
+    padding: 10px 14px; border-bottom: 1px solid var(--border-light);
+    cursor: pointer; transition: background var(--motion);
+  }
+  .vault-mem-row:hover { background: var(--bg-hover); }
+  .vault-mem-row.active { background: var(--clementine-bg); }
+  .vault-mem-row.active .vault-mem-row-title { color: var(--clementine); }
+  .vault-mem-row-title {
+    font-weight: 500; color: var(--text-primary); font-size: 13px;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .vault-mem-row-meta {
+    font-size: 11px; color: var(--text-muted);
+    display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+  }
+  .vault-mem-row-path {
+    font-family: 'JetBrains Mono', monospace; font-size: 10px;
+    color: var(--text-muted); opacity: 0.75;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .vault-pill {
+    display: inline-block; padding: 1px 7px; border-radius: 10px;
+    font-size: 10px; line-height: 1.5; background: var(--bg-tertiary); color: var(--text-secondary);
+  }
+  .vault-pill.type { background: var(--clementine-bg); color: var(--clementine); }
+  .vault-pill.tag { background: var(--bg-tertiary); color: var(--text-secondary); }
+  .vault-pill.match { background: rgba(245,158,11,0.15); color: #d97706; }
+
+  /* Unified Memory tab — reader */
+  .vault-reader-fm {
+    background: var(--bg-secondary); border: 1px solid var(--border-light);
+    border-radius: var(--radius-sm); padding: 10px 14px; margin-bottom: 14px;
+    font-size: 12px; display: grid; grid-template-columns: max-content 1fr;
+    gap: 4px 12px; align-items: baseline;
+  }
+  .vault-reader-fm .k { color: var(--text-muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; }
+  .vault-reader-fm .v { color: var(--text-primary); word-break: break-word; }
+  .vault-reader-body { max-width: 760px; }
+  .vault-reader-body h1 { font-size: 22px; margin: 0 0 12px; }
+  .vault-reader-body h2 { font-size: 17px; margin: 22px 0 8px; padding-top: 8px; border-top: 1px solid var(--border-light); }
+  .vault-reader-body h3 { font-size: 14px; margin: 16px 0 6px; color: var(--text-secondary); }
+  .vault-reader-body p, .vault-reader-body li { font-size: 14px; line-height: 1.65; }
+  .vault-reader-body code { background: var(--bg-tertiary); padding: 1px 5px; border-radius: 3px; font-size: 12px; }
+  .vault-reader-body pre { background: var(--bg-tertiary); padding: 10px 12px; border-radius: 6px; overflow-x: auto; font-size: 12px; }
+  .vault-reader-toc {
+    margin-top: 18px; padding: 10px 14px;
+    background: var(--bg-secondary); border: 1px solid var(--border-light);
+    border-radius: var(--radius-sm); font-size: 12px;
+  }
+  .vault-reader-toc-title { font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-muted); margin-bottom: 6px; }
+  .vault-reader-toc a { display: block; color: var(--text-secondary); text-decoration: none; padding: 2px 0; }
+  .vault-reader-toc a:hover { color: var(--clementine); }
+  .vault-reader-toc a.lvl-3 { padding-left: 14px; font-size: 11px; }
+
   /* ── Task Cards ─────────────────────────── */
   .task-grid {
     display: grid;
@@ -16383,24 +16452,55 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
           <div id="brain-runs-list"></div>
         </div>
         <div class="tab-pane" id="tab-intelligence-files">
-          <div style="display:flex;align-items:center;gap:10px;margin-bottom:14px;flex-wrap:wrap">
-            <input type="text" id="vault-files-search" placeholder="Search title or path..." style="flex:1;min-width:200px;padding:7px 12px;border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--bg-input);color:var(--text-primary);font-size:13px" oninput="refreshVaultFiles()">
+          <div style="display:flex;align-items:center;gap:8px;margin-bottom:12px;flex-wrap:wrap">
+            <input type="text" id="vault-files-search" placeholder="Search title, frontmatter, or content..." style="flex:1;min-width:220px;padding:7px 12px;border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--bg-input);color:var(--text-primary);font-size:13px" oninput="refreshVaultFiles()">
             <select id="vault-files-agent-filter" onchange="refreshVaultFiles()" style="padding:7px 10px;border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--bg-secondary);color:var(--text-primary);font-size:12px">
               <option value="">All authors</option>
               <option value="__shared__">Shared (vault root)</option>
             </select>
             <select id="vault-files-since" onchange="refreshVaultFiles()" style="padding:7px 10px;border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--bg-secondary);color:var(--text-primary);font-size:12px">
               <option value="7">Past 7 days</option>
-              <option value="30" selected>Past 30 days</option>
+              <option value="30">Past 30 days</option>
               <option value="90">Past 90 days</option>
               <option value="365">Past year</option>
+              <option value="9999" selected>All time</option>
             </select>
-            <button class="btn-sm" onclick="refreshVaultFiles()">Refresh</button>
+            <button class="btn-sm" onclick="refreshVaultFiles()" title="Refresh"><span class="icon-slot" data-icon="refreshCw"></span></button>
           </div>
-          <div id="vault-files-folder-chips" style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:12px"></div>
-          <div id="vault-files-list">
-            <div class="skel-block"><div class="skel-row med"></div><div class="skel-row"></div><div class="skel-row short"></div></div>
+          <div class="vault-mem-grid" style="display:grid;grid-template-columns:240px minmax(280px,1fr) minmax(360px,1.4fr);gap:12px;align-items:stretch;height:calc(100vh - 240px);min-height:520px">
+
+            <!-- Left rail: facet chips (folder / type / tag) -->
+            <div class="vault-mem-rail" style="overflow-y:auto;padding:10px 8px;background:var(--bg-secondary);border:1px solid var(--border);border-radius:var(--radius-md);font-size:12px">
+              <div style="font-size:10px;text-transform:uppercase;letter-spacing:0.06em;color:var(--text-muted);margin:2px 4px 6px">Folders</div>
+              <div id="vault-files-folder-chips" class="vault-facet-list"></div>
+              <div style="font-size:10px;text-transform:uppercase;letter-spacing:0.06em;color:var(--text-muted);margin:14px 4px 6px">Type</div>
+              <div id="vault-files-type-chips" class="vault-facet-list"></div>
+              <div style="font-size:10px;text-transform:uppercase;letter-spacing:0.06em;color:var(--text-muted);margin:14px 4px 6px">Tags</div>
+              <div id="vault-files-tag-chips" class="vault-facet-list"></div>
+            </div>
+
+            <!-- Middle: file list -->
+            <div class="vault-mem-list" style="overflow-y:auto;border:1px solid var(--border);border-radius:var(--radius-md);background:var(--bg-card);display:flex;flex-direction:column;min-height:0">
+              <div id="vault-files-list-meta" style="font-size:11px;color:var(--text-muted);padding:10px 14px;border-bottom:1px solid var(--border-light);flex-shrink:0">Loading…</div>
+              <div id="vault-files-list" style="flex:1;overflow-y:auto;min-height:0">
+                <div class="skel-block" style="padding:14px"><div class="skel-row med"></div><div class="skel-row"></div><div class="skel-row short"></div></div>
+              </div>
+            </div>
+
+            <!-- Right: inline reader -->
+            <div class="vault-mem-reader" style="overflow-y:auto;border:1px solid var(--border);border-radius:var(--radius-md);background:var(--bg-card);display:flex;flex-direction:column;min-height:0">
+              <div id="vault-reader-header" style="padding:14px 18px;border-bottom:1px solid var(--border-light);flex-shrink:0">
+                <div style="font-weight:600;font-size:15px;color:var(--text-primary)">No file selected</div>
+                <div style="font-size:11px;color:var(--text-muted);margin-top:2px">Pick a file from the list to read it here.</div>
+              </div>
+              <div id="vault-reader-body" style="flex:1;overflow-y:auto;padding:18px 22px;font-size:14px;line-height:1.6;min-height:0">
+                <div style="color:var(--text-muted);font-size:13px">Tip: hover a row for a peek, click to open.</div>
+              </div>
+            </div>
           </div>
+
+          <!-- Hover preview popover (shared, repositioned per row) -->
+          <div id="vault-hover-popover" style="display:none;position:fixed;z-index:300;width:340px;max-width:90vw;background:var(--bg-secondary);border:1px solid var(--border);border-radius:var(--radius-md);box-shadow:0 10px 30px rgba(0,0,0,0.25);padding:12px 14px;font-size:12px;line-height:1.5;pointer-events:none"></div>
         </div>
         <div class="tab-pane" id="tab-intelligence-health">
           <div style="display:flex;align-items:center;gap:8px;margin-bottom:14px;flex-wrap:wrap">
@@ -19686,7 +19786,10 @@ function switchTab(group, tab) {
       if (typeof refreshSupersedes === 'function') refreshSupersedes();
       if (typeof refreshCoverageStrip === 'function') refreshCoverageStrip();
     }
-    if (tab === 'files' && typeof refreshVaultFiles === 'function') refreshVaultFiles();
+    if (tab === 'files' && typeof refreshVaultFiles === 'function') {
+      if (typeof vaultRestoreFromHash === 'function') vaultRestoreFromHash();
+      refreshVaultFiles();
+    }
     if (tab === 'sources') {
       if (typeof brainLoadSources === 'function') brainLoadSources();
       if (typeof brainLoadFeedConnectors === 'function') brainLoadFeedConnectors();
@@ -26422,28 +26525,118 @@ async function memoryHealthAction(action, extra) {
   }
 }
 
-// ── Vault Files (Brain → Files tab) ──────────────────────────────
-var _vaultFilesCache = null;
-var _vaultFilesFolder = '';   // current folder filter
+// ── Memory tab (Brain → Memory): unified file browser + reader ────
+// 3-pane layout (rail / list / reader). Search merges title+frontmatter
+// matches from /api/vault-files with content matches from /api/memory/search,
+// keyed by source_file. Filters and selected file persist in URL hash.
+var _vaultFilesCache = [];
+var _vaultFilesFolder = '';
+var _vaultFilesType = '';
+var _vaultFilesTag = '';
+var _vaultFilesActive = '';   // currently open relPath
+var _vaultContentMatches = {}; // relPath -> [chunkSnippets]
+var _vaultHoverTimer = null;
+var _vaultHoverCache = {};
+var _vaultSnippetCache = {};  // relPath -> snippet (from head=1)
+
+function vaultParseHash() {
+  var h = (location.hash || '').replace(/^#/, '');
+  var p = h.startsWith('mem/') ? h.slice(4) : '';
+  if (!p) return {};
+  var out = {};
+  p.split('&').forEach(function(kv) {
+    var i = kv.indexOf('=');
+    if (i < 0) return;
+    out[decodeURIComponent(kv.slice(0, i))] = decodeURIComponent(kv.slice(i + 1));
+  });
+  return out;
+}
+
+function vaultWriteHash() {
+  var parts = [];
+  if (_vaultFilesFolder) parts.push('folder=' + encodeURIComponent(_vaultFilesFolder));
+  if (_vaultFilesType) parts.push('type=' + encodeURIComponent(_vaultFilesType));
+  if (_vaultFilesTag) parts.push('tag=' + encodeURIComponent(_vaultFilesTag));
+  if (_vaultFilesActive) parts.push('file=' + encodeURIComponent(_vaultFilesActive));
+  var newHash = parts.length ? '#mem/' + parts.join('&') : '';
+  if (location.hash !== newHash) {
+    history.replaceState(null, '', location.pathname + location.search + newHash);
+  }
+}
+
+function vaultRestoreFromHash() {
+  var p = vaultParseHash();
+  if (!p || (!p.folder && !p.type && !p.tag && !p.file)) return false;
+  _vaultFilesFolder = p.folder || '';
+  _vaultFilesType = p.type || '';
+  _vaultFilesTag = p.tag || '';
+  _vaultFilesActive = p.file || '';
+  return true;
+}
 
 async function refreshVaultFiles() {
   var listEl = document.getElementById('vault-files-list');
   if (!listEl) return;
-  var q = document.getElementById('vault-files-search')?.value || '';
-  var agent = document.getElementById('vault-files-agent-filter')?.value || '';
-  var since = document.getElementById('vault-files-since')?.value || '30';
-  // Show skeleton while loading
-  listEl.innerHTML = '<div class="skel-block"><div class="skel-row med"></div><div class="skel-row"></div><div class="skel-row short"></div></div>';
+  var q = (document.getElementById('vault-files-search') || {}).value || '';
+  var agent = (document.getElementById('vault-files-agent-filter') || {}).value || '';
+  var since = (document.getElementById('vault-files-since') || {}).value || '9999';
+  listEl.innerHTML = '<div class="skel-block" style="padding:14px"><div class="skel-row med"></div><div class="skel-row"></div><div class="skel-row short"></div></div>';
   try {
     var url = '/api/vault-files?sinceDays=' + encodeURIComponent(since)
       + (q ? '&q=' + encodeURIComponent(q) : '')
       + (agent ? '&agent=' + encodeURIComponent(agent) : '')
-      + (_vaultFilesFolder ? '&folder=' + encodeURIComponent(_vaultFilesFolder) : '');
-    var r = await apiFetch(url);
-    var d = await r.json();
+      + (_vaultFilesFolder ? '&folder=' + encodeURIComponent(_vaultFilesFolder) : '')
+      + (_vaultFilesType ? '&type=' + encodeURIComponent(_vaultFilesType) : '')
+      + (_vaultFilesTag ? '&tag=' + encodeURIComponent(_vaultFilesTag) : '')
+      + '&limit=300';
+
+    // Run vault-files and content search in parallel when there is a query.
+    var promises = [apiFetch(url).then(function(r) { return r.json(); })];
+    if (q && q.length >= 2) {
+      promises.push(apiFetch('/api/memory/search?q=' + encodeURIComponent(q) + '&limit=40')
+        .then(function(r) { return r.json(); })
+        .catch(function() { return null; }));
+    }
+    var results = await Promise.all(promises);
+    var d = results[0];
+    var contentHits = results[1];
+
     var files = d.files || [];
     _vaultFilesCache = files;
-    // Populate agent filter from ALL files response (use server's full set, not filtered)
+    _vaultContentMatches = {};
+
+    // Bucket content-search hits by source_file. Keep up to 2 snippets per file.
+    if (contentHits && Array.isArray(contentHits.results)) {
+      contentHits.results.forEach(function(row) {
+        var sf = row.source_file || row.path || '';
+        if (!sf) return;
+        // source_file values often look like 'vault/02-People/Jordan.md' OR
+        // a bare relPath. Normalize to relPath.
+        var rel = sf.indexOf('vault/') === 0 ? sf.slice('vault/'.length) : sf;
+        if (!_vaultContentMatches[rel]) _vaultContentMatches[rel] = [];
+        if (_vaultContentMatches[rel].length < 2) {
+          var txt = (row.content || '').replace(/\\s+/g, ' ').slice(0, 200);
+          _vaultContentMatches[rel].push({ snippet: txt, section: row.section || '' });
+        }
+      });
+      // Inject any content-only matches (file did not surface via title/path)
+      // into the file list so the user can still open them.
+      var existing = {};
+      files.forEach(function(f) { existing[f.relPath] = true; });
+      Object.keys(_vaultContentMatches).forEach(function(rel) {
+        if (existing[rel]) return;
+        files.push({
+          path: '', relPath: rel,
+          title: rel.split('/').pop().replace(/\\.md$/, ''),
+          folder: rel.split('/')[0] || '',
+          agentSlug: null, mtime: '', sizeBytes: 0,
+          type: null, category: null, tags: [],
+          _contentOnly: true,
+        });
+      });
+    }
+
+    // Populate agent dropdown from cache (only first time)
     var agentSel = document.getElementById('vault-files-agent-filter');
     if (agentSel && agentSel.options.length <= 2) {
       var slugs = [...new Set(files.map(function(f) { return f.agentSlug; }).filter(Boolean))].sort();
@@ -26454,100 +26647,226 @@ async function refreshVaultFiles() {
         agentSel.appendChild(opt);
       });
     }
-    // Render folder filter chips (using folderCounts from server)
-    var chipsEl = document.getElementById('vault-files-folder-chips');
-    if (chipsEl && d.folderCounts) {
-      var folders = Object.entries(d.folderCounts).sort(function(a, b) { return b[1] - a[1]; });
-      var totalCount = folders.reduce(function(s, p) { return s + p[1]; }, 0);
-      var chipHtml = '<div class="vault-folder-chip' + (_vaultFilesFolder === '' ? ' active' : '') + '" data-folder="" onclick="setVaultFolderFilter(\\x27\\x27)">All <span style="opacity:0.6">' + totalCount + '</span></div>';
-      folders.forEach(function(p) {
-        var folder = p[0]; var count = p[1];
-        if (!folder) return;
-        chipHtml += '<div class="vault-folder-chip' + (_vaultFilesFolder === folder ? ' active' : '') + '" data-folder="' + esc(folder) + '" onclick="setVaultFolderFilter(\\x27' + esc(folder) + '\\x27)">' + esc(folder) + ' <span style="opacity:0.6">' + count + '</span></div>';
-      });
-      chipsEl.innerHTML = chipHtml;
+
+    // Render facet rails
+    renderFacetChips('vault-files-folder-chips', d.folderCounts || {}, _vaultFilesFolder, vaultSetFolder, 30);
+    renderFacetChips('vault-files-type-chips', d.typeCounts || {}, _vaultFilesType, vaultSetType, 20);
+    renderFacetChips('vault-files-tag-chips', d.tagCounts || {}, _vaultFilesTag, vaultSetTag, 20);
+
+    // Meta line
+    var metaEl = document.getElementById('vault-files-list-meta');
+    if (metaEl) {
+      var totalLabel = files.length === d.total ? files.length + ' files' : files.length + ' of ' + d.total + ' files';
+      metaEl.textContent = totalLabel + (q ? ' matching "' + q + '"' : '') + (since !== '9999' ? ' (last ' + since + 'd)' : '');
     }
+
     if (files.length === 0) {
-      listEl.innerHTML = '<div class="empty-cta"><div class="label">No recent files</div><div class="hint">Try a wider time window or different filter.</div></div>';
+      listEl.innerHTML = '<div class="empty-cta" style="padding:30px 14px"><div class="label">No matches</div><div class="hint">Try a wider time window, fewer filters, or a different search.</div></div>';
       return;
     }
-    var html = '<div style="font-size:11px;color:var(--text-muted);margin-bottom:10px">Showing ' + files.length + ' of ' + d.total + ' files modified in the last ' + since + ' days.</div>';
-    html += '<div style="display:flex;flex-direction:column;gap:1px;border:1px solid var(--border);border-radius:var(--radius-md);overflow:hidden;background:var(--bg-card)">';
+
+    var html = '';
     for (var i = 0; i < files.length; i++) {
       var f = files[i];
-      var agentBadge = f.agentSlug
-        ? '<span style="font-size:10px;background:var(--clementine-bg);color:var(--clementine);padding:2px 7px;border-radius:var(--radius-xs);font-weight:500">' + esc(f.agentSlug) + '</span>'
-        : '<span style="font-size:10px;background:var(--bg-tertiary);color:var(--text-muted);padding:2px 7px;border-radius:var(--radius-xs)">shared</span>';
-      var typeBadge = f.type ? '<span style="font-size:10px;color:var(--text-muted);margin-right:6px">' + esc(f.type) + '</span>' : '';
-      html += '<div class="vault-file-row clickable-row" data-path="' + esc(f.relPath) + '" style="display:flex;align-items:center;gap:12px;padding:10px 14px;background:var(--bg-secondary);border-bottom:1px solid var(--border-light);font-size:13px">'
-        + '<div style="flex:1;min-width:0">'
-          + '<div style="font-weight:500;color:var(--text-primary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">' + esc(f.title) + '</div>'
-          + '<div style="font-size:11px;color:var(--text-muted);font-family:\\x27JetBrains Mono\\x27,monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:2px">' + esc(f.relPath) + '</div>'
-        + '</div>'
-        + '<div style="display:flex;align-items:center;gap:8px;flex-shrink:0">'
-          + typeBadge + agentBadge
-          + '<span style="font-size:11px;color:var(--text-muted);min-width:60px;text-align:right">' + esc(timeAgo(f.mtime)) + '</span>'
-        + '</div>'
+      var matches = _vaultContentMatches[f.relPath];
+      var pills = '';
+      if (f.type) pills += '<span class="vault-pill type">' + esc(f.type) + '</span>';
+      (f.tags || []).slice(0, 3).forEach(function(t) {
+        pills += '<span class="vault-pill tag">' + esc(t) + '</span>';
+      });
+      if (matches && matches.length) pills += '<span class="vault-pill match">' + matches.length + ' match' + (matches.length > 1 ? 'es' : '') + '</span>';
+      var when = f.mtime ? esc(timeAgo(f.mtime)) : '';
+      var snippetHtml = '';
+      if (matches && matches.length) {
+        snippetHtml = '<div style="font-size:11px;color:var(--text-secondary);margin-top:4px;border-left:2px solid var(--clementine);padding-left:8px;line-height:1.5">' + esc(matches[0].snippet) + '…</div>';
+      }
+      html += '<div class="vault-mem-row' + (_vaultFilesActive === f.relPath ? ' active' : '') + '" data-path="' + esc(f.relPath) + '">'
+        + '<div class="vault-mem-row-title">' + esc(f.title) + '</div>'
+        + '<div class="vault-mem-row-meta">' + pills + (pills && when ? '<span style="opacity:0.5">·</span>' : '') + (when ? '<span>' + when + '</span>' : '') + '</div>'
+        + '<div class="vault-mem-row-path">' + esc(f.relPath) + '</div>'
+        + snippetHtml
         + '</div>';
     }
-    html += '</div>';
     listEl.innerHTML = html;
-    // Wire row clicks
-    listEl.querySelectorAll('.vault-file-row').forEach(function(row) {
-      row.onclick = function() { openVaultFile(row.getAttribute('data-path')); };
+    listEl.querySelectorAll('.vault-mem-row').forEach(function(row) {
+      row.addEventListener('click', function() { openVaultFile(row.getAttribute('data-path')); });
+      row.addEventListener('mouseenter', function(ev) { vaultStartHover(row.getAttribute('data-path'), ev); });
+      row.addEventListener('mouseleave', vaultEndHover);
     });
+
+    // Re-open the previously active file (or any file from hash on first load)
+    if (_vaultFilesActive && files.some(function(f) { return f.relPath === _vaultFilesActive; })) {
+      openVaultFile(_vaultFilesActive, true);
+    }
   } catch (err) {
     listEl.innerHTML = '<div style="padding:24px;color:var(--red);font-size:13px">Failed to load: ' + esc(String(err)) + '</div>';
   }
 }
 
-async function openVaultFile(relPath) {
+function renderFacetChips(elId, counts, current, onPick, maxItems) {
+  var el = document.getElementById(elId);
+  if (!el) return;
+  var entries = Object.entries(counts).sort(function(a, b) { return b[1] - a[1]; });
+  if (entries.length === 0) { el.innerHTML = '<div style="font-size:11px;color:var(--text-muted);padding:4px 8px">(none)</div>'; return; }
+  var totalCount = entries.reduce(function(s, p) { return s + p[1]; }, 0);
+  var html = '<div class="vault-facet-row' + (current === '' ? ' active' : '') + '" data-val="">All <span class="vault-facet-count">' + totalCount + '</span></div>';
+  entries.slice(0, maxItems).forEach(function(p) {
+    var k = p[0]; var c = p[1];
+    if (!k) return;
+    html += '<div class="vault-facet-row' + (current === k ? ' active' : '') + '" data-val="' + esc(k) + '">'
+      + '<span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(k) + '</span>'
+      + '<span class="vault-facet-count">' + c + '</span>'
+      + '</div>';
+  });
+  el.innerHTML = html;
+  el.querySelectorAll('.vault-facet-row').forEach(function(row) {
+    row.addEventListener('click', function() { onPick(row.getAttribute('data-val')); });
+  });
+}
+
+function vaultSetFolder(v) { _vaultFilesFolder = v || ''; vaultWriteHash(); refreshVaultFiles(); }
+function vaultSetType(v)   { _vaultFilesType   = v || ''; vaultWriteHash(); refreshVaultFiles(); }
+function vaultSetTag(v)    { _vaultFilesTag    = v || ''; vaultWriteHash(); refreshVaultFiles(); }
+// Backwards-compat name used elsewhere.
+function setVaultFolderFilter(folder) { vaultSetFolder(folder); }
+
+async function openVaultFile(relPath, skipHashUpdate) {
   if (!relPath) return;
-  // Build/reuse a slide-out drawer for content preview
-  var drawer = document.getElementById('vault-file-drawer');
-  if (!drawer) {
-    drawer = document.createElement('div');
-    drawer.id = 'vault-file-drawer';
-    drawer.style.cssText = 'position:fixed;right:0;top:0;bottom:0;width:560px;max-width:92vw;background:var(--bg-secondary);border-left:1px solid var(--border);box-shadow:-8px 0 32px rgba(0,0,0,0.18);z-index:200;display:flex;flex-direction:column;transform:translateX(100%);transition:transform 200ms ease';
-    drawer.innerHTML =
-      '<div style="display:flex;align-items:center;gap:10px;padding:14px 18px;border-bottom:1px solid var(--border);flex-shrink:0">'
-        + '<div style="flex:1;min-width:0">'
-          + '<div id="vault-file-drawer-title" style="font-weight:600;font-size:15px;letter-spacing:-0.01em"></div>'
-          + '<div id="vault-file-drawer-path" style="font-size:11px;color:var(--text-muted);font-family:\\x27JetBrains Mono\\x27,monospace;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis"></div>'
-        + '</div>'
-        + '<button class="btn-icon btn-sm" onclick="closeVaultFileDrawer()" title="Close">' + lucide('x', 'icn-sm') + '</button>'
-      + '</div>'
-      + '<div id="vault-file-drawer-body" style="flex:1;overflow-y:auto;padding:18px 22px;font-size:13px;line-height:1.55"></div>';
-    document.body.appendChild(drawer);
-  }
-  var titleEl = document.getElementById('vault-file-drawer-title');
-  var pathEl = document.getElementById('vault-file-drawer-path');
-  var body = document.getElementById('vault-file-drawer-body');
-  if (titleEl) titleEl.textContent = relPath.split('/').pop().replace(/\\.md$/, '');
-  if (pathEl) pathEl.textContent = relPath;
-  if (body) body.innerHTML = '<div class="skel-block"><div class="skel-row"></div><div class="skel-row med"></div><div class="skel-row short"></div></div>';
-  drawer.style.transform = 'translateX(0)';
+  _vaultFilesActive = relPath;
+  if (!skipHashUpdate) vaultWriteHash();
+  // Visually mark active row
+  document.querySelectorAll('#vault-files-list .vault-mem-row').forEach(function(r) {
+    r.classList.toggle('active', r.getAttribute('data-path') === relPath);
+  });
+  var headerEl = document.getElementById('vault-reader-header');
+  var bodyEl = document.getElementById('vault-reader-body');
+  if (!headerEl || !bodyEl) return;
+  headerEl.innerHTML = '<div style="font-weight:600;font-size:15px">' + esc(relPath.split('/').pop().replace(/\\.md$/, '')) + '</div>'
+    + '<div style="font-size:11px;color:var(--text-muted);font-family:\\x27JetBrains Mono\\x27,monospace;margin-top:2px">' + esc(relPath) + '</div>';
+  bodyEl.innerHTML = '<div class="skel-block"><div class="skel-row"></div><div class="skel-row med"></div><div class="skel-row short"></div></div>';
   try {
     var r = await apiFetch('/api/vault-file?path=' + encodeURIComponent(relPath));
     var d = await r.json();
-    if (d.error) {
-      body.innerHTML = '<div style="color:var(--red)">' + esc(d.error) + '</div>';
-      return;
-    }
-    body.innerHTML = renderMd(d.content);
+    if (d.error) { bodyEl.innerHTML = '<div style="color:var(--red)">' + esc(d.error) + '</div>'; return; }
+    var raw = d.content || '';
+    var fm = vaultExtractFrontmatter(raw);
+    var bodyMd = fm.body;
+    var fmCard = vaultRenderFmCard(fm.data);
+    var rendered = renderMd(bodyMd);
+    var toc = vaultBuildToc(bodyMd);
+    bodyEl.innerHTML = fmCard + '<div class="vault-reader-body">' + rendered + '</div>' + toc;
   } catch (err) {
-    body.innerHTML = '<div style="color:var(--red)">Failed: ' + esc(String(err)) + '</div>';
+    bodyEl.innerHTML = '<div style="color:var(--red)">Failed: ' + esc(String(err)) + '</div>';
   }
 }
 
+// Back-compat (legacy drawer-style call sites). The drawer is gone, but the
+// inline reader covers the same job.
 function closeVaultFileDrawer() {
-  var drawer = document.getElementById('vault-file-drawer');
-  if (drawer) drawer.style.transform = 'translateX(100%)';
+  _vaultFilesActive = '';
+  vaultWriteHash();
+  var headerEl = document.getElementById('vault-reader-header');
+  var bodyEl = document.getElementById('vault-reader-body');
+  if (headerEl) headerEl.innerHTML = '<div style="font-weight:600;font-size:15px">No file selected</div><div style="font-size:11px;color:var(--text-muted);margin-top:2px">Pick a file from the list to read it here.</div>';
+  if (bodyEl) bodyEl.innerHTML = '<div style="color:var(--text-muted);font-size:13px">Tip: hover a row for a peek, click to open.</div>';
+  document.querySelectorAll('#vault-files-list .vault-mem-row.active').forEach(function(r) { r.classList.remove('active'); });
 }
 
-function setVaultFolderFilter(folder) {
-  _vaultFilesFolder = folder || '';
-  refreshVaultFiles();
+function vaultExtractFrontmatter(raw) {
+  // Lightweight client-side YAML frontmatter parse — enough for display.
+  if (!raw || raw.indexOf('---') !== 0) return { data: {}, body: raw || '' };
+  var end = raw.indexOf('\\n---', 3);
+  if (end < 0) return { data: {}, body: raw };
+  var fmText = raw.slice(3, end).replace(/^\\n/, '');
+  var body = raw.slice(end + 4).replace(/^\\n/, '');
+  var data = {};
+  fmText.split(/\\n/).forEach(function(line) {
+    var m = line.match(/^([A-Za-z0-9_\\-]+)\\s*:\\s*(.*)$/);
+    if (!m) return;
+    var k = m[1]; var v = m[2].trim();
+    if (v.startsWith('[') && v.endsWith(']')) {
+      v = v.slice(1, -1).split(',').map(function(s) { return s.trim().replace(/^["\\x27]|["\\x27]$/g, ''); }).filter(Boolean);
+    } else {
+      v = v.replace(/^["\\x27]|["\\x27]$/g, '');
+    }
+    data[k] = v;
+  });
+  return { data: data, body: body };
+}
+
+function vaultRenderFmCard(data) {
+  var keys = Object.keys(data || {});
+  if (keys.length === 0) return '';
+  var html = '<div class="vault-reader-fm">';
+  keys.forEach(function(k) {
+    var v = data[k];
+    var display = Array.isArray(v)
+      ? v.map(function(x) { return '<span class="vault-pill tag" style="margin-right:4px">' + esc(String(x)) + '</span>'; }).join('')
+      : esc(String(v));
+    html += '<div class="k">' + esc(k) + '</div><div class="v">' + display + '</div>';
+  });
+  html += '</div>';
+  return html;
+}
+
+function vaultBuildToc(md) {
+  var lines = (md || '').split('\\n');
+  var headings = [];
+  for (var i = 0; i < lines.length; i++) {
+    var m = lines[i].match(/^(#{2,3})\\s+(.+?)\\s*$/);
+    if (!m) continue;
+    var lvl = m[1].length;
+    var txt = m[2];
+    var slug = txt.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+    headings.push({ lvl: lvl, txt: txt, slug: slug });
+  }
+  if (headings.length < 2) return '';
+  var html = '<div class="vault-reader-toc"><div class="vault-reader-toc-title">On this page</div>';
+  headings.forEach(function(h) {
+    html += '<a class="lvl-' + h.lvl + '" href="#' + esc(h.slug) + '">' + esc(h.txt) + '</a>';
+  });
+  html += '</div>';
+  return html;
+}
+
+function vaultStartHover(relPath, ev) {
+  if (!relPath || relPath === _vaultFilesActive) return;
+  clearTimeout(_vaultHoverTimer);
+  var x = ev.clientX, y = ev.clientY;
+  _vaultHoverTimer = setTimeout(async function() {
+    var pop = document.getElementById('vault-hover-popover');
+    if (!pop) return;
+    var data = _vaultHoverCache[relPath];
+    if (!data) {
+      try {
+        var r = await apiFetch('/api/vault-file?head=1&path=' + encodeURIComponent(relPath));
+        data = await r.json();
+        _vaultHoverCache[relPath] = data;
+      } catch { return; }
+    }
+    if (!data || data.error) return;
+    var fm = data.frontmatter || {};
+    var fmHtml = '';
+    Object.keys(fm).slice(0, 5).forEach(function(k) {
+      var v = fm[k];
+      var dv = Array.isArray(v) ? v.join(', ') : String(v);
+      fmHtml += '<div style="display:flex;gap:6px"><span style="color:var(--text-muted);min-width:60px">' + esc(k) + '</span><span>' + esc(dv) + '</span></div>';
+    });
+    pop.innerHTML = '<div style="font-weight:600;font-size:13px;margin-bottom:4px">' + esc(relPath.split('/').pop().replace(/\\.md$/, '')) + '</div>'
+      + (fmHtml ? '<div style="margin-bottom:6px">' + fmHtml + '</div>' : '')
+      + '<div style="color:var(--text-secondary)">' + esc(data.snippet || '(empty)') + '</div>';
+    var px = Math.min(window.innerWidth - 360, x + 16);
+    var py = Math.min(window.innerHeight - 200, y + 16);
+    pop.style.left = px + 'px';
+    pop.style.top = py + 'px';
+    pop.style.display = 'block';
+  }, 250);
+}
+
+function vaultEndHover() {
+  clearTimeout(_vaultHoverTimer);
+  var pop = document.getElementById('vault-hover-popover');
+  if (pop) pop.style.display = 'none';
 }
 
 // ── Goals: inline create form ────────────────────────────────────
