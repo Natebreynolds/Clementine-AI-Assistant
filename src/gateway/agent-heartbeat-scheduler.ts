@@ -220,7 +220,15 @@ export class AgentHeartbeatScheduler {
       signals.latestGoalUpdate = '';
     }
 
-    // 3. Latest cron run for any of this agent's crons (file mtime is enough)
+    // 3. Latest cron run for any of this agent's crons (file mtime is enough).
+    //
+    // INFO ONLY — kept in `signals` for the LLM prompt context, but NOT
+    // included in the fingerprint hash below. A cron firing is expected
+    // background activity, not a "wake up Sonnet" signal. Including it
+    // caused every cron run to bump the fingerprint → fire a $1+ Sonnet
+    // pass that just confirmed "yep, the cron ran, nothing else to do."
+    // Actionable wake-ups are pendingTasks growing and goal-state changes;
+    // those still trip the fingerprint below.
     try {
       const runsDir = path.join(this.baseDir, 'cron', 'runs');
       let latestMs = 0;
@@ -240,8 +248,15 @@ export class AgentHeartbeatScheduler {
       signals.latestCronRunMs = 0;
     }
 
+    // Fingerprint only includes ACTIONABLE signals. latestCronRunMs is
+    // info-only and explicitly excluded.
+    const fingerprintSource = {
+      slug: signals.slug,
+      pendingTasks: signals.pendingTasks,
+      latestGoalUpdate: signals.latestGoalUpdate,
+    };
     const fingerprint = createHash('sha1')
-      .update(JSON.stringify(signals))
+      .update(JSON.stringify(fingerprintSource))
       .digest('hex')
       .slice(0, 16);
     return { fingerprint, signals };

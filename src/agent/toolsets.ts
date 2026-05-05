@@ -4,6 +4,7 @@ export type ToolsetName =
   | 'diagnostic'
   | 'communications'
   | 'memory'
+  | 'none'
   | 'full';
 
 export interface ToolsetPreset {
@@ -45,6 +46,12 @@ export const TOOLSET_PRESETS: readonly ToolsetPreset[] = [
     directive: 'Toolset memory: use memory_read, memory_search, memory_recall, transcript_search, working_memory, and user_model. Avoid external integrations and local shell/file writes.',
   },
   {
+    name: 'none',
+    label: 'None',
+    description: 'No tools at all — pure-LLM conversation. Used by builders and JSON-generating chats where tool schemas are dead weight in the system prompt.',
+    directive: 'Toolset none: do not call any tools. Respond from the prompt context only. Generate JSON, summaries, or text directly.',
+  },
+  {
     name: 'full',
     label: 'Full',
     description: 'Explicit operator mode for broad integrations and admin work.',
@@ -77,9 +84,18 @@ export function formatToolsetChoices(): string {
 }
 
 export function isRestrictedToolset(name: ToolsetName): boolean {
-  return name === 'safe' || name === 'diagnostic' || name === 'memory';
+  return name === 'safe' || name === 'diagnostic' || name === 'memory' || name === 'none';
 }
 
 export function toolsetAllowsLocalWrites(name: ToolsetName): boolean {
   return name === 'auto' || name === 'full';
+}
+
+/**
+ * "none" toolset: not just restricted, but actively disables ALL tools
+ * including the core Clementine MCP server. Used by builder/JSON-gen
+ * chats where tool schemas in the system prompt are pure cost overhead.
+ */
+export function toolsetDisablesAllTools(name: ToolsetName): boolean {
+  return name === 'none';
 }

@@ -104,7 +104,7 @@ import { searchSkills as searchSkillsSync } from './skill-extractor.js';
 import { classifyIntent, getStrategyGuidance, type IntentClassification } from './intent-classifier.js';
 import { getEventLog } from './session-event-log.js';
 import { applyServiceDedup, routeToolSurface, TOOL_SURFACE_HARD_LIMIT, TOOL_SURFACE_WARN_THRESHOLD, type ToolRouteDecision } from './tool-router.js';
-import { isRestrictedToolset, toolsetAllowsLocalWrites, type ToolsetName } from './toolsets.js';
+import { isRestrictedToolset, toolsetAllowsLocalWrites, toolsetDisablesAllTools, type ToolsetName } from './toolsets.js';
 import { looksLikeApprovalPrompt } from './local-turn.js';
 import { decideTurn, type RetrievalTier, type TurnPolicy } from './turn-policy.js';
 import { loadClementineJson } from '../config/clementine-json.js';
@@ -2279,7 +2279,9 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
     } = opts;
 
     const isCron = cronTier !== null;
-    const toolsDisabledForCall = disableAllTools || (isHeartbeat && !isCron);
+    const toolsDisabledForCall = disableAllTools
+      || (isHeartbeat && !isCron)
+      || toolsetDisablesAllTools(toolset);
     const promptScopeText = toolScopeText ?? '';
     const profileScopeText = [profile?.description, profile?.systemPromptBody]
       .filter(Boolean)

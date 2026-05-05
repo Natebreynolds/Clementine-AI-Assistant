@@ -68,6 +68,7 @@ import { isRunHealthFailure } from './job-health.js';
 import {
   analyzeLongTaskPreflight,
   compactLongTaskPreflight,
+  shouldDowngradeUnleashed,
   formatLongTaskPromptPrefix,
 } from './long-task-preflight.js';
 
@@ -1187,6 +1188,35 @@ export class CronScheduler {
       // Sonnet runs every job by default. Opus 1M is opt-in: set
       // `model: claude-opus-4-7[1m]` in CRON.md per-job, or flip
       // CLEMENTINE_1M_CONTEXT_MODE=on for global enable.
+      // ── Auto-downgrade unleashed → standard ────────────────────────
+      // CRON.md `mode: unleashed` is a CEILING, not a floor. If the
+      // job's history shows it's a quiet probe that completes in 1
+      // phase with __NOTHING__ or short output, the multi-phase
+      // wrapper is wasteful overhead — each phase is a fresh SDK
+      // query with full system prompt + tool schemas in cache_creation.
+      // For a "did anything new come in?" cron firing every 2 hours,
+      // that's 12+ unleashed runs/day at ~$1/each instead of standard
+      // mode at ~$0.05/each.
+      if (job.mode === 'unleashed') {
+        const downgrade = shouldDowngradeUnleashed(this.runLog.readRecent(job.name, 5));
+        if (downgrade.downgrade) {
+          job = { ...job, mode: 'standard' };
+          logger.info({
+            job: job.name,
+            reason: downgrade.reason,
+            quietRatio: downgrade.quietRatio,
+            avgDurationMs: downgrade.avgDurationMs,
+          }, 'Cron mode downgraded unleashed → standard based on run history');
+          this.logAutonomy('mode_downgrade', job, {
+            from: 'unleashed',
+            to: 'standard',
+            reason: downgrade.reason,
+            quietRatio: downgrade.quietRatio,
+            avgDurationMs: downgrade.avgDurationMs,
+          });
+        }
+      }
+
       let longTaskPreflight: CronRunEntry['longTaskPreflight'] | undefined;
       const preflight = analyzeLongTaskPreflight(job, jobPrompt, this.runLog.readRecent(job.name, 5));
       if (preflight.risk !== 'normal') {

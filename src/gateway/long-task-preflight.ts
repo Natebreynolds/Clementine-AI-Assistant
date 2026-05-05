@@ -82,6 +82,105 @@ function recentContextFailures(recentRuns: CronRunEntry[], now: number = Date.no
   return [...new Set(reasons)];
 }
 
+// ── Auto-downgrade unleashed → standard for quiet/probe jobs ──────────
+//
+// `mode: unleashed` wraps a job in multi-phase machinery: each phase is a
+// fresh SDK query with the full system prompt + tool schemas, and the
+// orchestrator chains phases until TASK_COMPLETE or max-phases. That
+// machinery is essential for genuinely-long tasks (sasha briefs, market
+// outreach), but it's pure overhead on quiet probe jobs that finish in
+// 1 phase with `__NOTHING__` or a short output.
+//
+// Detect that pattern from history and downgrade the next run to
+// standard mode. Single SDK call, single cache write, fraction of the
+// cost. The user's CRON.md `mode: unleashed` becomes a "ceiling" rather
+// than a forced floor — actual mode chosen dynamically per-run.
+//
+// Conservative by design: requires 3+ prior runs of evidence, refuses
+// to downgrade if any recent run hit context overflow (the unleashed
+// wrapper might be actively saving us), and only triggers on jobs that
+// historically complete fast with short or empty output.
+
+const UNLEASHED_DOWNGRADE_SAMPLE_SIZE = 5;
+const UNLEASHED_DOWNGRADE_MIN_HISTORY = 3;
+const UNLEASHED_DOWNGRADE_QUIET_RATIO = 0.6;
+const UNLEASHED_DOWNGRADE_MAX_DURATION_MS = 90_000;
+const UNLEASHED_DOWNGRADE_AVG_DURATION_MS = 60_000;
+const UNLEASHED_DOWNGRADE_QUIET_PREVIEW_CHARS = 200;
+
+export interface UnleashedDowngradeDecision {
+  downgrade: boolean;
+  reason: string;
+  /** Quiet ratio observed in the sample (for telemetry). */
+  quietRatio?: number;
+  /** Average duration of recent runs in ms (for telemetry). */
+  avgDurationMs?: number;
+}
+
+export function shouldDowngradeUnleashed(
+  recentRuns: CronRunEntry[],
+  now: number = Date.now(),
+): UnleashedDowngradeDecision {
+  const sample = recentRuns
+    .slice(0, UNLEASHED_DOWNGRADE_SAMPLE_SIZE)
+    .filter(r => r.status === 'ok' || r.status === 'error');
+
+  if (sample.length < UNLEASHED_DOWNGRADE_MIN_HISTORY) {
+    return { downgrade: false, reason: 'insufficient_history' };
+  }
+
+  // Refuse to downgrade if any recent run hit a context-window failure —
+  // the unleashed multi-phase wrapper might be the only thing keeping
+  // this job from thrashing on a single huge SDK query. Pair this guard
+  // with the existing fanout-policy directive (1.18.35) so by the next
+  // few runs the agent has learned to fan out and the wrapper can be
+  // shed safely.
+  const cutoff = now - RECENT_CONTEXT_FAILURE_WINDOW_MS;
+  const hadOverflow = sample.some(r => {
+    const startedMs = Date.parse(r.startedAt);
+    if (!Number.isFinite(startedMs) || startedMs < cutoff) return false;
+    return r.terminalReason === 'rapid_refill_breaker'
+      || r.terminalReason === 'prompt_too_long';
+  });
+  if (hadOverflow) {
+    return { downgrade: false, reason: 'recent_context_overflow_protect_unleashed' };
+  }
+
+  // Quiet pattern: most recent runs returned __NOTHING__ or a short
+  // output. These jobs don't need multi-phase orchestration.
+  const quietCount = sample.filter(r => {
+    const preview = (r.outputPreview ?? '').trim();
+    if (!preview) return false;
+    if (/__nothing__/i.test(preview)) return true;
+    return preview.length < UNLEASHED_DOWNGRADE_QUIET_PREVIEW_CHARS;
+  }).length;
+  const quietRatio = quietCount / sample.length;
+  if (quietRatio >= UNLEASHED_DOWNGRADE_QUIET_RATIO) {
+    return {
+      downgrade: true,
+      reason: `quiet_pattern_${Math.round(quietRatio * 100)}pct`,
+      quietRatio,
+    };
+  }
+
+  // Fast-completion pattern: every run finishes well under the standard
+  // cron timeout, average is short. Multi-phase wrapper is overhead.
+  const durations = sample.map(r => r.durationMs || 0).filter(d => d > 0);
+  if (durations.length === sample.length) {
+    const avgDuration = durations.reduce((a, b) => a + b, 0) / durations.length;
+    const allFast = durations.every(d => d < UNLEASHED_DOWNGRADE_MAX_DURATION_MS);
+    if (allFast && avgDuration < UNLEASHED_DOWNGRADE_AVG_DURATION_MS) {
+      return {
+        downgrade: true,
+        reason: `fast_completion_avg_${Math.round(avgDuration / 1000)}s`,
+        avgDurationMs: Math.round(avgDuration),
+      };
+    }
+  }
+
+  return { downgrade: false, reason: 'workload_warrants_unleashed' };
+}
+
 function classifyRisk(args: {
   inputTokens: number;
   projectedTokens: number;

@@ -7895,6 +7895,12 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
 
     try {
       const gateway = await getGateway();
+      // Builder generates JSON artifacts — no tool calls. Pin the session
+      // toolset to 'none' so buildOptions strips all MCP servers and tool
+      // schemas from the system prompt. Without this, every tiny builder
+      // turn writes 60–280 KB of cache_creation for tool schemas the
+      // model never uses.
+      gateway.setSessionToolset(sessionKey, 'none');
       const response = await gateway.handleMessage(sessionKey, enrichedMessage);
 
       // Parse any json-artifact blocks from the response
@@ -8023,6 +8029,9 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
     try {
       writeEvent('progress', { status: 'thinking…' });
       const gateway = await getGateway();
+      // Builder generates JSON artifacts — no tool calls. Pin to 'none'
+      // toolset so the SDK system prompt drops the tool inventory.
+      gateway.setSessionToolset(sessionKey, 'none');
       let lastText = '';
       const response = await gateway.handleMessage(
         sessionKey,

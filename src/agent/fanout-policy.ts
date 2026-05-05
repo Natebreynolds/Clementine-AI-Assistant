@@ -102,6 +102,7 @@ export function buildAlwaysOnParallelizationHint(): string {
   return [
     '## Sub-agent fan-out',
     'When you process multiple items, spawn ONE Agent sub-agent per batch of 3–5 items. Sub-agents return ONE-LINE summaries (no raw tool output). Do not iterate sequentially in this conversation — that fills your context and aborts the run.',
+    'Cost: pass `model: "haiku"` to Agent for routine extraction, summarization, or per-item lookups. Use Sonnet only when the sub-agent must reason across many sources or write something durable.',
   ].join('\n');
 }
 
@@ -128,6 +129,7 @@ export function buildFanoutDirective(signals: FanoutSignal[]): string {
     'Use the `Agent` tool to spawn parallel sub-agents. Each sub-agent runs in its own isolated context, so big tool responses live and die there — your context only sees the summary.',
     '',
     '- **Batch size**: 3–5 items per sub-agent (or one slice of work per sub-agent for research tasks)',
+    '- **Sub-agent model**: pass `model: "haiku"` to the Agent tool by default — sub-agents that just extract fields, summarize a single email, or pull a single record do not need Sonnet. Reserve Sonnet for sub-agents that must reason across multiple sources or write something durable.',
     '- **Sub-agent prompt MUST include**: the narrow task, the exact return format (e.g. `Return ONE LINE: <id> | <status> | <next-action>`), and an explicit "do not include raw tool output" directive',
     '- **Parent context keeps**: only the sub-agent return strings, not their tool transcripts',
     '',

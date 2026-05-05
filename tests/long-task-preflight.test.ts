@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { analyzeLongTaskPreflight, formatLongTaskPromptPrefix } from '../src/gateway/long-task-preflight.js';
+import { analyzeLongTaskPreflight, formatLongTaskPromptPrefix, shouldDowngradeUnleashed } from '../src/gateway/long-task-preflight.js';
 import type { CronJobDefinition, CronRunEntry } from '../src/types.js';
 
 function job(overrides: Partial<CronJobDefinition> = {}): CronJobDefinition {
@@ -173,5 +173,123 @@ describe('long-task preflight', () => {
     expect(decision.canProceedWithApproval).toBe(true);
     expect(decision.approvalModelOverride).toBe('claude-opus-4-7[1m]');
     expect(decision.approvalReason).toContain('owner approves');
+  });
+});
+
+describe('shouldDowngradeUnleashed', () => {
+  function quietRun(when: string): CronRunEntry {
+    return {
+      jobName: 'audit-inbox-check',
+      startedAt: when,
+      finishedAt: when,
+      status: 'ok',
+      durationMs: 30_000,
+      outputPreview: '__NOTHING__',
+      terminalReason: 'completed',
+      attempt: 1,
+    };
+  }
+
+  function workRun(when: string, durationMs = 600_000): CronRunEntry {
+    return {
+      jobName: 'audit-inbox-check',
+      startedAt: when,
+      finishedAt: when,
+      status: 'ok',
+      durationMs,
+      // Long preview — over 200 chars — to avoid triggering the quiet pattern.
+      outputPreview: [
+        'Posted 4 audit requests to #audit-queue with full company details and competitor lists.',
+        'Marquardt Law (Las Vegas) — pre-discovery, services: SEO/PPC/Content, competitors: Sweet, Adams.',
+        'Finizio Law Group (Hartford) — post-discovery, services: SEO + Local Service Ads, competitors: Tinari Law.',
+        'Bromberg Insurance (Phoenix) — pre-discovery, services: Local SEO + Reviews.',
+        'Hawkins Construction (Boise) — post-discovery, services: full digital + GMB.',
+      ].join(' '),
+      terminalReason: 'completed',
+      attempt: 1,
+    };
+  }
+
+  function overflowRun(when: string): CronRunEntry {
+    return {
+      jobName: 'audit-inbox-check',
+      startedAt: when,
+      finishedAt: when,
+      status: 'error',
+      durationMs: 700_000,
+      outputPreview: '',
+      terminalReason: 'rapid_refill_breaker',
+      attempt: 1,
+    };
+  }
+
+  it('downgrades when 60%+ of recent runs returned __NOTHING__', () => {
+    const runs = [
+      quietRun('2026-05-05T16:00:00.000Z'),
+      quietRun('2026-05-05T14:00:00.000Z'),
+      quietRun('2026-05-05T12:00:00.000Z'),
+      quietRun('2026-05-05T10:00:00.000Z'),
+    ];
+    const decision = shouldDowngradeUnleashed(runs, Date.parse('2026-05-05T17:00:00.000Z'));
+    expect(decision.downgrade).toBe(true);
+    expect(decision.reason).toMatch(/^quiet_pattern_/);
+  });
+
+  it('downgrades when all runs complete fast (<60s avg, <90s max)', () => {
+    const runs = [
+      workRun('2026-05-05T16:00:00.000Z', 25_000),
+      workRun('2026-05-05T14:00:00.000Z', 30_000),
+      workRun('2026-05-05T12:00:00.000Z', 35_000),
+    ];
+    const decision = shouldDowngradeUnleashed(runs, Date.parse('2026-05-05T17:00:00.000Z'));
+    expect(decision.downgrade).toBe(true);
+    expect(decision.reason).toMatch(/^fast_completion_/);
+  });
+
+  it('refuses to downgrade when a recent run hit context overflow', () => {
+    const runs = [
+      quietRun('2026-05-05T16:00:00.000Z'),
+      overflowRun('2026-05-05T14:00:00.000Z'),
+      quietRun('2026-05-05T12:00:00.000Z'),
+      quietRun('2026-05-05T10:00:00.000Z'),
+    ];
+    const decision = shouldDowngradeUnleashed(runs, Date.parse('2026-05-05T17:00:00.000Z'));
+    expect(decision.downgrade).toBe(false);
+    expect(decision.reason).toBe('recent_context_overflow_protect_unleashed');
+  });
+
+  it('keeps unleashed when output is consistently substantive', () => {
+    const runs = [
+      workRun('2026-05-05T16:00:00.000Z'),
+      workRun('2026-05-05T14:00:00.000Z'),
+      workRun('2026-05-05T12:00:00.000Z'),
+      workRun('2026-05-05T10:00:00.000Z'),
+    ];
+    const decision = shouldDowngradeUnleashed(runs, Date.parse('2026-05-05T17:00:00.000Z'));
+    expect(decision.downgrade).toBe(false);
+    expect(decision.reason).toBe('workload_warrants_unleashed');
+  });
+
+  it('does not downgrade with insufficient history (less than 3 runs)', () => {
+    const runs = [
+      quietRun('2026-05-05T16:00:00.000Z'),
+      quietRun('2026-05-05T14:00:00.000Z'),
+    ];
+    const decision = shouldDowngradeUnleashed(runs, Date.parse('2026-05-05T17:00:00.000Z'));
+    expect(decision.downgrade).toBe(false);
+    expect(decision.reason).toBe('insufficient_history');
+  });
+
+  it('ignores overflow runs older than 48h (no longer "recent")', () => {
+    const runs = [
+      quietRun('2026-05-08T16:00:00.000Z'),
+      quietRun('2026-05-08T14:00:00.000Z'),
+      quietRun('2026-05-08T12:00:00.000Z'),
+      // 5 days ago — not recent.
+      overflowRun('2026-05-03T08:00:00.000Z'),
+    ];
+    const decision = shouldDowngradeUnleashed(runs, Date.parse('2026-05-08T17:00:00.000Z'));
+    expect(decision.downgrade).toBe(true);
+    expect(decision.reason).toMatch(/^quiet_pattern_/);
   });
 });
