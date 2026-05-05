@@ -14,6 +14,7 @@
  * consolidate up to a small bounded number per pass to keep LLM cost
  * predictable.
  */
+import { createHash } from 'node:crypto';
 import Anthropic from '@anthropic-ai/sdk';
 import pino from 'pino';
 
@@ -53,6 +54,14 @@ export interface ExtractedCommitment {
   dueHint?: string;
 }
 
+export interface ExtractedLearnedFact {
+  kind: 'preference' | 'fact' | 'goal' | 'workflow';
+  text: string;
+  /** Optional phrase that this fact supersedes — caller resolves to a
+   *  stored row id by fuzzy match against active learned_facts. */
+  supersedes?: string;
+}
+
 export interface EpisodeExtraction {
   summary: string;
   topics: string[];
@@ -60,6 +69,7 @@ export interface EpisodeExtraction {
   outcome: string;
   openLoops: string[];
   commitments: ExtractedCommitment[];
+  learnedFacts: ExtractedLearnedFact[];
 }
 
 interface CandidateRow {
@@ -92,17 +102,34 @@ const SYSTEM_PROMPT = [
   '  "commitments": Array<{ text: string, owner: "user" | "clementine", dueHint?: string }>',
   '      (explicit promises only — "I\'ll do X", "remind me to Y", "by Friday".',
   '       owner = whoever committed: user vs the assistant. Empty array if none, max 5.)',
+  '  "learnedFacts": Array<{ kind: "preference"|"fact"|"goal"|"workflow", text: string, supersedes?: string }>',
+  '      (durable beliefs that should outlive this session — the user\'s preferences,',
+  '       stated goals, stable facts about their work / setup, and procedural patterns',
+  '       like "deploy steps are X then Y". Skip ephemeral status. If a new fact contradicts',
+  '       one in the existing-facts context below, set supersedes to a phrase from the old',
+  '       fact so we can mark it superseded. Empty array if none, max 6.)',
   '}',
 ].join('\n');
 
-function buildUserPrompt(turns: Array<{ role: string; content: string; createdAt: string }>): string {
+function buildUserPrompt(
+  turns: Array<{ role: string; content: string; createdAt: string }>,
+  existingFacts: Array<{ kind: string; text: string }>,
+): string {
   const formatted = turns
     .map(t => `[${t.createdAt}] ${t.role}: ${t.content.replace(/\s+/g, ' ').slice(0, 1200)}`)
     .join('\n');
+  const factBlock = existingFacts.length
+    ? [
+        'Existing facts already learned (use to detect contradictions for `supersedes`):',
+        ...existingFacts.slice(0, 30).map(f => `- [${f.kind}] ${f.text}`),
+        '',
+      ].join('\n')
+    : '';
   return [
     'Consolidate the following conversation range into the JSON schema described.',
     'Only include facts present in the conversation. Use empty arrays for unknown fields.',
     '',
+    factBlock,
     formatted,
   ].join('\n');
 }
@@ -139,6 +166,20 @@ export function parseEpisodeJson(raw: string): EpisodeExtraction | null {
     if (commitments.length >= 5) break;
   }
 
+  const VALID_KINDS = new Set(['preference', 'fact', 'goal', 'workflow']);
+  const rawFacts = Array.isArray(obj.learnedFacts) ? obj.learnedFacts : [];
+  const learnedFacts: ExtractedLearnedFact[] = [];
+  for (const raw of rawFacts) {
+    if (!raw || typeof raw !== 'object') continue;
+    const f = raw as Record<string, unknown>;
+    const text = typeof f.text === 'string' ? f.text.trim() : '';
+    const kind = typeof f.kind === 'string' && VALID_KINDS.has(f.kind) ? f.kind as ExtractedLearnedFact['kind'] : null;
+    if (!text || !kind) continue;
+    const supersedes = typeof f.supersedes === 'string' && f.supersedes.trim() ? f.supersedes.trim() : undefined;
+    learnedFacts.push({ kind, text: text.slice(0, 280), supersedes });
+    if (learnedFacts.length >= 6) break;
+  }
+
   return {
     summary,
     topics: arr(obj.topics).slice(0, 6),
@@ -146,7 +187,15 @@ export function parseEpisodeJson(raw: string): EpisodeExtraction | null {
     outcome: typeof obj.outcome === 'string' ? obj.outcome.trim().slice(0, 200) : '',
     openLoops: arr(obj.openLoops).slice(0, 5),
     commitments,
+    learnedFacts,
   };
+}
+
+/** Stable fingerprint for a learned fact — matches the regex-detector
+ *  pattern so future ingest sources can dedupe through the same upsert. */
+export function fingerprintLearnedFact(kind: string, text: string): string {
+  const normalized = text.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').replace(/\s+/g, ' ').trim().slice(0, 200);
+  return createHash('sha1').update(`${kind}|${normalized}`).digest('hex').slice(0, 16);
 }
 
 function getAnthropicClient(opts: EpisodicConsolidationOptions): Pick<Anthropic, 'messages'> | null {
@@ -179,13 +228,31 @@ export async function consolidateOneSession(
     return null;
   }
 
+  // Pull a small snapshot of existing learned facts so the LLM can
+  // detect contradictions and emit supersedes hints. Best-effort —
+  // empty list is fine for first-ever consolidation.
+  let existingFactsForPrompt: Array<{ kind: string; text: string }> = [];
+  try {
+    if (typeof (store as { listActiveLearnedFacts?: unknown }).listActiveLearnedFacts === 'function') {
+      existingFactsForPrompt = (store as {
+        listActiveLearnedFacts: (o: { limit: number }) => Array<{ kind: string; text: string }>;
+      }).listActiveLearnedFacts({ limit: 30 });
+    }
+  } catch { /* fact snapshot is best-effort */ }
+
   let extraction: EpisodeExtraction | null = null;
   try {
     const response = await client.messages.create({
       model: opts.model ?? MODELS.haiku,
-      max_tokens: 1024,
+      max_tokens: 1500,
       system: SYSTEM_PROMPT,
-      messages: [{ role: 'user', content: buildUserPrompt(turns.map(t => ({ role: t.role, content: t.content, createdAt: t.createdAt }))) }],
+      messages: [{
+        role: 'user',
+        content: buildUserPrompt(
+          turns.map(t => ({ role: t.role, content: t.content, createdAt: t.createdAt })),
+          existingFactsForPrompt,
+        ),
+      }],
     });
     const text = (response.content ?? []).map((b: { type: string; text?: string }) => b.type === 'text' ? (b.text ?? '') : '').join('');
     extraction = parseEpisodeJson(text);
@@ -258,6 +325,41 @@ export async function consolidateOneSession(
     }
   }
 
+  // Lift extracted learned facts into durable, supersession-aware rows.
+  // For each fact: insert (idempotent on fingerprint). If the LLM emitted
+  // a `supersedes` phrase that fuzzy-matches an active fact, mark the old
+  // one superseded by the new one — that's how memory becomes learning.
+  let factsCreated = 0;
+  let factsSuperseded = 0;
+  if (typeof (store as { upsertLearnedFact?: unknown }).upsertLearnedFact === 'function') {
+    for (const fact of extraction.learnedFacts) {
+      try {
+        const fp = fingerprintLearnedFact(fact.kind, fact.text);
+        const upserted = (store as {
+          upsertLearnedFact: (e: {
+            fingerprint: string; kind: string; text: string; sourceEpisodeId?: number;
+          }) => { id: number; created: boolean };
+        }).upsertLearnedFact({
+          fingerprint: fp, kind: fact.kind, text: fact.text, sourceEpisodeId: insert.episodeId,
+        });
+        if (upserted.created) factsCreated++;
+        if (fact.supersedes && upserted.created
+          && typeof (store as { findActiveLearnedFactByPhrase?: unknown }).findActiveLearnedFactByPhrase === 'function'
+        ) {
+          const old = (store as {
+            findActiveLearnedFactByPhrase: (p: string) => { id: number; text: string; kind: string } | null;
+          }).findActiveLearnedFactByPhrase(fact.supersedes);
+          if (old && old.id !== upserted.id) {
+            const ok = (store as { supersedeLearnedFact: (oldId: number, newId: number) => boolean }).supersedeLearnedFact(old.id, upserted.id);
+            if (ok) factsSuperseded++;
+          }
+        }
+      } catch (err) {
+        logger.debug({ err }, 'Failed to persist learned fact');
+      }
+    }
+  }
+
   store.updateConsolidationCursor(candidate.sessionKey, {
     lastTranscriptId: candidate.endTranscriptId,
     success: true,
@@ -268,6 +370,8 @@ export async function consolidateOneSession(
     chunkId,
     turns: turns.length,
     commitmentsCreated,
+    factsCreated,
+    factsSuperseded,
   }, 'Consolidated episode');
   return { episodeId: insert.episodeId, chunkId };
 }

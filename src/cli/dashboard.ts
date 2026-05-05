@@ -3874,6 +3874,309 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
     }
   });
 
+  // ── Routines API (canonical surface for the Build tab) ─────────
+  // The "Routines" UI uses this surface exclusively. Workflows + cron
+  // jobs both flow through here as a single Routine concept; legacy
+  // /api/builder/* and /api/cron/* endpoints remain for one minor
+  // version, then are removed.
+
+  app.get('/api/routines', async (_req, res) => {
+    try {
+      const { listAllForBuilder } = await import('../dashboard/builder/serializer.js');
+      res.json({ routines: listAllForBuilder() });
+    } catch (err) {
+      res.status(500).json({ error: 'list failed', detail: String(err) });
+    }
+  });
+
+  app.get('/api/routines/mcp-tools', async (_req, res) => {
+    try {
+      const { discoverMcpServers, loadToolInventory } = await import('../agent/mcp-bridge.js');
+      const servers = discoverMcpServers();
+      const inv = loadToolInventory();
+      const allTools = inv?.tools ?? [];
+      // Group flat tool names of shape `mcp__<server>__<tool>` (server may
+      // contain underscores — split on the first `__` after the prefix).
+      const grouped: Record<string, { name: string; enabled: boolean; tools: string[] }> = {};
+      for (const s of servers) {
+        grouped[s.name] = { name: s.name, enabled: s.enabled !== false, tools: [] };
+      }
+      for (const t of allTools) {
+        if (!t.startsWith('mcp__')) continue;
+        const rest = t.slice(5);
+        const idx = rest.indexOf('__');
+        if (idx < 0) continue;
+        const server = rest.slice(0, idx);
+        const tool = rest.slice(idx + 2);
+        if (!grouped[server]) grouped[server] = { name: server, enabled: true, tools: [] };
+        if (!grouped[server].tools.includes(tool)) grouped[server].tools.push(tool);
+      }
+      const out = Object.values(grouped)
+        .filter(s => s.tools.length > 0 || s.enabled)
+        .sort((a, b) => a.name.localeCompare(b.name));
+      res.json({ servers: out });
+    } catch (err) {
+      res.status(500).json({ error: 'mcp-tools failed', detail: String(err) });
+    }
+  });
+
+  app.get('/api/routines/cli-tools', async (_req, res) => {
+    try {
+      // Reuse discoverCliTools() defined elsewhere in this file.
+      const tools = discoverCliTools().filter(t => t.installed && !t.blocked);
+      res.json({ tools: tools.map(t => ({ cmd: t.name, description: t.description, userDefined: !!t.userDefined })) });
+    } catch (err) {
+      res.status(500).json({ error: 'cli-tools failed', detail: String(err) });
+    }
+  });
+
+  app.get('/api/routines/:id', async (req, res) => {
+    try {
+      const id = decodeURIComponent(req.params.id);
+      const { readWorkflow } = await import('../dashboard/builder/serializer.js');
+      const { validateWorkflow } = await import('../dashboard/builder/validation.js');
+      const wf = readWorkflow(id);
+      if (!wf) { res.status(404).json({ error: 'Not found' }); return; }
+      res.json({ id, routine: wf, validation: validateWorkflow(wf) });
+    } catch (err) {
+      res.status(500).json({ error: 'read failed', detail: String(err) });
+    }
+  });
+
+  app.post('/api/routines', async (req, res) => {
+    try {
+      const body = req.body as { name?: string; description?: string; schedule?: string; initialPrompt?: string; agent?: string };
+      if (!body || !body.name) { res.status(400).json({ error: 'name required' }); return; }
+      const [{ saveWorkflow, workflowId: makeId }, { emitBuilderEvent }] = await Promise.all([
+        import('../dashboard/builder/serializer.js'),
+        import('../dashboard/builder/events.js'),
+      ]);
+      const slug = body.name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 64) || 'routine';
+      const agentSlug = body.agent ? (String(body.agent).trim() || undefined) : undefined;
+      const wf = {
+        name: body.name,
+        description: body.description ?? '',
+        enabled: true,
+        trigger: body.schedule ? { schedule: body.schedule, manual: false } : { manual: true },
+        inputs: {},
+        steps: [{
+          id: 's1',
+          prompt: body.initialPrompt ?? 'Describe what this routine should do.',
+          dependsOn: [],
+          tier: 1,
+          maxTurns: 15,
+        }],
+        sourceFile: '',
+        agentSlug,
+      };
+      const id = makeId(slug, agentSlug);
+      const result = saveWorkflow(id, wf);
+      if (!result.ok) { res.status(400).json({ error: result.error }); return; }
+      emitBuilderEvent({ type: 'workflow:created', workflowId: id, payload: { workflow: wf } });
+      res.json({ ok: true, id });
+    } catch (err) {
+      res.status(500).json({ error: 'create failed', detail: String(err) });
+    }
+  });
+
+  app.put('/api/routines/:id', async (req, res) => {
+    try {
+      const id = decodeURIComponent(req.params.id);
+      const body = req.body as { routine?: unknown; force?: boolean };
+      if (!body || typeof body.routine !== 'object') { res.status(400).json({ error: 'Missing routine body' }); return; }
+      const [{ readWorkflow, saveWorkflow }, { validateWorkflow }, { emitBuilderEvent }] = await Promise.all([
+        import('../dashboard/builder/serializer.js'),
+        import('../dashboard/builder/validation.js'),
+        import('../dashboard/builder/events.js'),
+      ]);
+      const existing = readWorkflow(id);
+      if (!existing) { res.status(404).json({ error: 'Not found' }); return; }
+      const incoming = body.routine as Record<string, unknown>;
+      const next = { ...(incoming as object), sourceFile: existing.sourceFile } as typeof existing;
+      const v = validateWorkflow(next);
+      if (!v.ok && !body.force) { res.status(400).json({ error: 'validation', validation: v }); return; }
+      const result = saveWorkflow(id, next);
+      if (!result.ok) { res.status(400).json({ error: result.error }); return; }
+      emitBuilderEvent({ type: 'workflow:patched', workflowId: id, payload: { workflow: next } });
+      res.json({ ok: true, validation: v });
+    } catch (err) {
+      res.status(500).json({ error: 'save failed', detail: String(err) });
+    }
+  });
+
+  app.delete('/api/routines/:id', async (req, res) => {
+    try {
+      const id = decodeURIComponent(req.params.id);
+      const [{ readWorkflow, parseBuilderId }, { emitBuilderEvent }] = await Promise.all([
+        import('../dashboard/builder/serializer.js'),
+        import('../dashboard/builder/events.js'),
+      ]);
+      const parsed = parseBuilderId(id);
+      if (!parsed) { res.status(400).json({ error: 'Bad id' }); return; }
+      if (parsed.origin === 'cron') {
+        res.status(400).json({ error: 'This routine came from a legacy cron entry — disable it instead, or edit CRON.md directly.' });
+        return;
+      }
+      const wf = readWorkflow(id);
+      if (!wf) { res.status(404).json({ error: 'Not found' }); return; }
+      if (wf.sourceFile && existsSync(wf.sourceFile)) unlinkSync(wf.sourceFile);
+      emitBuilderEvent({ type: 'workflow:deleted', workflowId: id });
+      res.json({ ok: true });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  app.post('/api/routines/:id/toggle', async (req, res) => {
+    try {
+      const id = decodeURIComponent(req.params.id);
+      const { readWorkflow, saveWorkflow } = await import('../dashboard/builder/serializer.js');
+      const wf = readWorkflow(id);
+      if (!wf) { res.status(404).json({ error: 'Not found' }); return; }
+      wf.enabled = !wf.enabled;
+      const result = saveWorkflow(id, wf);
+      if (!result.ok) { res.status(400).json({ error: result.error }); return; }
+      res.json({ ok: true, enabled: wf.enabled });
+    } catch (err) {
+      res.status(500).json({ error: 'toggle failed', detail: String(err) });
+    }
+  });
+
+  app.post('/api/routines/:id/run', async (req, res) => {
+    try {
+      const id = decodeURIComponent(req.params.id);
+      const { readWorkflow, parseBuilderId } = await import('../dashboard/builder/serializer.js');
+      const wf = readWorkflow(id);
+      if (!wf) { res.status(404).json({ error: 'Not found' }); return; }
+      const parsed = parseBuilderId(id);
+      const body = (req.body ?? {}) as { inputs?: Record<string, string>; approvedSideEffects?: boolean };
+
+      // Cron-origin routines: spawn the cli `cron run <name>` (single-step prompt path).
+      if (parsed?.origin === 'cron') {
+        const child = spawn('node', [DIST_ENTRY, 'cron', 'run', wf.name], {
+          detached: true,
+          stdio: ['ignore', 'pipe', 'pipe'],
+          cwd: BASE_DIR,
+          env: { ...process.env, CLEMENTINE_HOME: BASE_DIR },
+        });
+        child.on('exit', (code) => {
+          broadcastEvent({ type: 'cron_complete', data: { job: wf.name, code } });
+          responseCache.delete('activity:');
+        });
+        child.unref();
+        broadcastEvent({ type: 'cron_triggered', data: { job: wf.name } });
+        res.json({ ok: true, message: `Triggered routine: ${wf.name}` });
+        return;
+      }
+
+      // Workflow-origin routines: side-effect approval gate, then route through gateway.handleWorkflow.
+      const sideEffects = wf.steps
+        .filter(step => {
+          const kind = step.kind ?? 'prompt';
+          if (kind === 'channel' || kind === 'mcp' || kind === 'cli') return true;
+          return /\b(send|post|publish|email|webhook|delete|write|update|create)\b/i.test(step.prompt || '');
+        })
+        .map(step => ({
+          id: step.id,
+          kind: step.kind ?? 'prompt',
+          label: step.channel
+            ? `${step.channel.channel}:${step.channel.target}`
+            : step.mcp
+              ? `${step.mcp.server}.${step.mcp.tool}`
+              : step.cli
+                ? `${step.cli.cmd}${step.cli.args?.length ? ' ' + step.cli.args.join(' ') : ''}`
+                : step.prompt.slice(0, 80),
+        }));
+      if (sideEffects.length > 0 && body.approvedSideEffects !== true) {
+        res.status(409).json({
+          ok: false,
+          error: 'approval_required',
+          message: 'This routine may send, write, post, or call external tools. Approve side effects before running it.',
+          sideEffects,
+        });
+        return;
+      }
+      res.json({ ok: true, message: `Routine "${wf.name}" triggered` });
+      broadcastEvent({ type: 'workflow_triggered', data: { id, name: wf.name } });
+      getGateway().then(gw => gw.handleWorkflow(wf, body.inputs || {})).then(result => {
+        broadcastEvent({ type: 'workflow_complete', data: { id, name: wf.name, status: 'ok', preview: (result || '').slice(0, 300) } });
+      }).catch(err => {
+        broadcastEvent({ type: 'workflow_complete', data: { id, name: wf.name, status: 'error', error: String(err) } });
+      });
+    } catch (err) {
+      res.status(500).json({ error: 'run failed', detail: String(err) });
+    }
+  });
+
+  app.post('/api/routines/:id/dry-run', async (req, res) => {
+    try {
+      const id = decodeURIComponent(req.params.id);
+      const [{ readWorkflow }, { dryRunWorkflow }] = await Promise.all([
+        import('../dashboard/builder/serializer.js'),
+        import('../dashboard/builder/dry-run.js'),
+      ]);
+      const wf = readWorkflow(id);
+      if (!wf) { res.status(404).json({ error: 'Not found' }); return; }
+      res.json(dryRunWorkflow(wf));
+    } catch (err) {
+      res.status(500).json({ error: 'dry-run failed', detail: String(err) });
+    }
+  });
+
+  app.post('/api/routines/:id/test', async (req, res) => {
+    try {
+      const id = decodeURIComponent(req.params.id);
+      const body = (req.body ?? {}) as { mode?: 'mock' | 'real'; perStepTimeoutMs?: number; totalBudgetMs?: number };
+      const [{ readWorkflow }, { runWorkflowTest }] = await Promise.all([
+        import('../dashboard/builder/serializer.js'),
+        import('../dashboard/builder/runner.js'),
+      ]);
+      const wf = readWorkflow(id);
+      if (!wf) { res.status(404).json({ error: 'Not found' }); return; }
+      const runId = (await import('node:crypto')).randomUUID();
+      res.json({ ok: true, runId });
+      runWorkflowTest(wf, {
+        workflowId: id,
+        runId,
+        mode: body.mode ?? 'mock',
+        perStepTimeoutMs: body.perStepTimeoutMs,
+        totalBudgetMs: body.totalBudgetMs,
+      }).catch(() => { /* errors already streamed via events */ });
+    } catch (err) {
+      res.status(500).json({ error: 'test failed to start', detail: String(err) });
+    }
+  });
+
+  app.get('/api/routines/:id/runs', async (req, res) => {
+    try {
+      const id = decodeURIComponent(req.params.id);
+      const { readWorkflow } = await import('../dashboard/builder/serializer.js');
+      const wf = readWorkflow(id);
+      if (!wf) { res.status(404).json({ error: 'Not found' }); return; }
+      const safe = wf.name.replace(/[^a-zA-Z0-9_-]/g, '_');
+      const cronLogPath = path.join(BASE_DIR, 'cron-logs', `${safe}.jsonl`);
+      const workflowLogPath = path.join(BASE_DIR, 'workflows', 'runs', `${safe}.jsonl`);
+      const runs: Record<string, unknown>[] = [];
+      for (const file of [cronLogPath, workflowLogPath]) {
+        if (!existsSync(file)) continue;
+        try {
+          const lines = readFileSync(file, 'utf-8').split('\n').filter(l => l.trim());
+          for (const line of lines.slice(-50)) {
+            try { runs.push(JSON.parse(line) as Record<string, unknown>); } catch { /* skip malformed */ }
+          }
+        } catch { /* skip unreadable */ }
+      }
+      runs.sort((a, b) => {
+        const at = String((a.startedAt as string) || (a.timestamp as string) || '');
+        const bt = String((b.startedAt as string) || (b.timestamp as string) || '');
+        return bt.localeCompare(at);
+      });
+      res.json({ runs: runs.slice(0, 50) });
+    } catch (err) {
+      res.status(500).json({ error: 'runs read failed', detail: String(err) });
+    }
+  });
+
   // SSE events handler moved before auth middleware (see above)
 
   // ── POST routes (actions) ──────────────────────────────────────
@@ -6942,6 +7245,47 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
       const graphStore = (gateway as any).assistant?.graphStore;
       const health = store.getMemoryHealth({ graphStore, topCitedLimit: 10 });
       res.json({ ok: true, health });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  // Learned facts — durable cross-session beliefs with supersession lineage.
+  app.get('/api/memory/learnings', async (req, res) => {
+    try {
+      const gateway = await getGateway();
+      const store = (gateway as any).assistant?.memoryStore;
+      if (!store || typeof store.listAllLearnedFacts !== 'function') {
+        res.status(503).json({ error: 'Learnings store not available' });
+        return;
+      }
+      const limit = Math.min(parseInt(String(req.query.limit ?? '100'), 10) || 100, 1000);
+      const showAll = String(req.query.all ?? '') === '1';
+      const facts = showAll
+        ? store.listAllLearnedFacts({ limit })
+        : store.listActiveLearnedFacts({ limit });
+      res.json({ ok: true, facts });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  app.post('/api/memory/learnings/action', async (req, res) => {
+    try {
+      const gateway = await getGateway();
+      const store = (gateway as any).assistant?.memoryStore;
+      if (!store || typeof store.setLearnedFactStatus !== 'function') {
+        res.status(503).json({ error: 'Learnings store not available' });
+        return;
+      }
+      const id = Number(req.body?.id);
+      const action = String(req.body?.action ?? '');
+      if (!Number.isInteger(id) || id <= 0) { res.status(400).json({ error: 'id required' }); return; }
+      let updated = false;
+      if (action === 'cancel') updated = store.setLearnedFactStatus(id, 'cancelled');
+      else if (action === 'reinstate') updated = store.setLearnedFactStatus(id, 'active');
+      else { res.status(400).json({ error: 'invalid action' }); return; }
+      res.json({ ok: updated });
     } catch (err) {
       res.status(500).json({ error: String(err) });
     }
@@ -14597,189 +14941,732 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
       </div>
     </div>
 
-    <!-- ═══ Builder Page — Conversational Artifact Creation ═══ -->
+    <!-- ═══ Build Page — Routines (single unified surface) ═══ -->
     <div class="page" id="page-build">
-      <div class="tab-bar" id="build-tabs" style="margin:0;padding:0 18px;background:var(--bg-secondary);border-bottom:1px solid var(--border)">
-        <button class="active" data-build-tab="crons" data-icon="clock" onclick="switchBuildTab('crons')"><span class="icon-slot"></span> Operations <span class="tab-badge" id="build-tab-cron-count" style="display:none">0</span></button>
-        <button data-build-tab="workflows" data-icon="workflow" onclick="switchBuildTab('workflows')"><span class="icon-slot"></span> Workflow Builder</button>
-        <button data-build-tab="skills" data-icon="shield" onclick="switchBuildTab('skills')"><span class="icon-slot"></span> Skills <span class="tab-badge" id="build-tab-skill-count" style="display:none">0</span></button>
-        <button data-build-tab="templates" data-icon="fileText" onclick="switchBuildTab('templates')"><span class="icon-slot"></span> Templates</button>
-      </div>
-      <!-- Builder header strip — persists across tabs (except Templates) -->
-      <div id="build-header-strip" style="display:flex;align-items:center;gap:12px;padding:10px 18px;border-bottom:1px solid var(--border)">
-        <select id="builder-type" onchange="resetBuilder();updateBuilderMode()" style="display:none">
-          <option value="skill">skill</option>
-          <option value="cron">cron</option>
-          <option value="agent">agent</option>
-          <option value="workflow">workflow</option>
-        </select>
-        <label style="font-size:11px;color:var(--text-muted);font-weight:500;letter-spacing:0.04em;text-transform:uppercase">Owner</label>
-        <select id="builder-owner" onchange="onBuilderOwnerChange()" title="Filter and create scoped to this owner" style="padding:4px 8px;border:1px solid var(--border);border-radius:6px;background:var(--bg-secondary);color:var(--text-primary);font-size:12px;min-width:160px">
-          <option value="__all__">All agents</option>
-          <option value="">Clementine (global)</option>
-        </select>
-        <span id="builder-agent-label" style="padding:0;font-size:13px;color:var(--text-secondary);font-weight:500"></span>
-        <input type="hidden" id="builder-agent" value="">
+      <!-- Toolbar -->
+      <div id="routines-toolbar" style="display:flex;align-items:center;gap:12px;padding:14px 18px;border-bottom:1px solid var(--border);background:var(--bg-secondary);flex-wrap:wrap">
+        <h2 style="margin:0;font-size:18px;font-weight:600;color:var(--text-primary);display:flex;align-items:center;gap:8px"><span data-icon="workflow" class="icon-slot"></span> Routines</h2>
+        <span id="routines-count" style="font-size:11px;color:var(--text-muted)"></span>
+        <span id="routines-editor-breadcrumb" style="display:none;font-size:12px;color:var(--text-muted)"> &rsaquo; <span id="routines-editor-name" style="color:var(--text-primary);font-weight:500"></span></span>
         <span style="flex:1"></span>
-        <button class="btn-sm btn-primary" id="builder-new-btn" onclick="newFromBuildHeader()" title="Create a new artifact for this tab" style="padding:4px 14px;border-radius:6px;cursor:pointer;font-size:12px">New Workflow</button>
-        <button class="btn-sm" id="builder-test-btn" onclick="testBuilderSkill()" style="background:var(--bg-tertiary);border:1px solid var(--border);color:var(--text-secondary);padding:4px 12px;border-radius:6px;cursor:pointer;font-size:12px;display:none">Test</button>
-        <button class="btn-sm btn-primary" id="builder-save-btn" onclick="saveBuilderArtifact()" style="padding:4px 16px;font-size:12px;display:none">Save</button>
+        <label id="routines-owner-label" style="font-size:11px;color:var(--text-muted);font-weight:500;letter-spacing:0.04em;text-transform:uppercase">Owner</label>
+        <select id="routines-owner-filter" onchange="window.RoutinesUI && RoutinesUI.renderList()" style="padding:5px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg-secondary);color:var(--text-primary);font-size:12px;min-width:160px">
+          <option value="__all__">All</option>
+          <option value="__global__">Clementine (global)</option>
+        </select>
+        <button id="routines-back-btn" style="display:none;padding:6px 12px;border-radius:6px;cursor:pointer;font-size:12px;background:var(--bg-tertiary);border:1px solid var(--border);color:var(--text-secondary)" onclick="window.RoutinesUI && RoutinesUI.closeEditor()">&larr; Back to list</button>
+        <button id="routines-assist-btn" class="btn-sm" onclick="window.RoutinesUI && RoutinesUI.openAssist()" title="Describe a routine in natural language" style="padding:6px 12px;border-radius:6px;cursor:pointer;font-size:12px;background:var(--bg-tertiary);border:1px solid var(--border);color:var(--text-secondary)">Generate from prompt</button>
+        <button id="routines-create-btn" class="btn-sm btn-primary" onclick="window.RoutinesUI && RoutinesUI.openCreate()" style="padding:6px 14px;border-radius:6px;cursor:pointer;font-size:12px">+ New Routine</button>
       </div>
-      <div id="build-usage-panel" style="padding:12px 18px;border-bottom:1px solid var(--border);background:var(--bg-primary)">
-        <div class="skel-block"><div class="skel-row med"></div><div class="skel-row short"></div></div>
-      </div>
-      <!-- Build tab content area: canvas DOMINATES, chat is a sidebar -->
-      <div id="build-tab-workflows" data-build-tabpane="workflows" style="display:none;flex:1;min-height:0;overflow:hidden">
-        <!-- Left: Chat sidebar (compact) -->
-        <div id="builder-chat-sidebar" style="width:360px;flex-shrink:0;display:flex;flex-direction:column;border-right:1px solid var(--border);background:var(--bg-secondary)">
-          <div id="builder-messages" style="flex:1;overflow-y:auto;padding:16px">
-            <div class="empty-state" id="builder-empty-state" style="margin-top:40px">
-              <p style="color:var(--text-muted);margin-bottom:12px">Describe what you want to build.</p>
-              <div style="display:flex;flex-wrap:wrap;gap:8px;justify-content:center">
-                <button class="btn btn-sm quick-pill" onclick="builderQuick('Create a workflow that researches a topic, writes a draft, and sends it for review')">Research workflow</button>
-                <button class="btn btn-sm quick-pill" onclick="builderQuick('Create a workflow that reviews open PRs, summarizes risk, and sends a digest')">PR review digest</button>
-                <button class="btn btn-sm quick-pill" onclick="builderQuick('Create a workflow that collects leads, scores them against my ICP, and prepares outreach drafts')">Lead research flow</button>
-                <button class="btn btn-sm quick-pill" onclick="builderQuick('Create a workflow that reviews recent notes, extracts open items, and drafts next priorities')">Weekly review workflow</button>
-              </div>
-            </div>
-          </div>
-          <div id="builder-file-area" style="padding:8px 16px;border-top:1px solid var(--border);background:var(--bg-secondary)">
-            <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">
-              <span style="font-size:11px;font-weight:600;color:var(--text-secondary)">Reference Files</span>
-              <label style="cursor:pointer;display:inline-flex;align-items:center;gap:4px;background:var(--bg-tertiary);border:1px solid var(--border);border-radius:4px;padding:2px 8px;font-size:11px;color:var(--text-primary)">
-                + Add
-                <input type="file" multiple accept=".csv,.md,.txt,.json,.docx,.xlsx,.yaml,.yml,.xml,.html,.py,.js,.ts" style="display:none" onchange="handleBuilderFileUpload(event)">
-              </label>
-              <span style="font-size:10px;color:var(--text-muted)">Sent with each message so the AI can reference them</span>
-            </div>
-            <div id="builder-attachments-list"></div>
-          </div>
-          <div style="display:flex;gap:8px;padding:12px 16px;border-top:1px solid var(--border);align-items:center">
-            <label style="cursor:pointer;display:flex;align-items:center;color:var(--text-muted);font-size:18px" title="Attach file">
-              <input type="file" multiple accept=".csv,.md,.txt,.json,.docx,.xlsx,.yaml,.yml,.xml,.html,.py,.js,.ts" style="display:none" onchange="handleBuilderFileUpload(event)">&#x1F4CE;
-            </label>
-            <input type="text" id="builder-input" placeholder="Describe what you want to build..." onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendBuilderChat()}" style="flex:1;padding:10px 14px;border:1px solid var(--border);border-radius:8px;background:var(--bg-input);color:var(--text-primary);font-size:13px">
-            <button class="btn-primary" onclick="sendBuilderChat()" style="padding:10px 18px;border-radius:8px">Send</button>
+      <!-- List view (default) -->
+      <div id="routines-list-pane" style="flex:1;min-height:0;overflow-y:auto;padding:18px;background:var(--bg-primary)">
+        <div id="routines-list-empty" class="empty-state" style="display:none;padding:64px 18px;text-align:center;color:var(--text-muted)">
+          <div style="font-size:38px;opacity:0.4;margin-bottom:14px">&#9881;</div>
+          <div style="font-size:15px;font-weight:500;color:var(--text-secondary);margin-bottom:6px">No routines yet</div>
+          <div style="font-size:12px;line-height:1.5;max-width:380px;margin:0 auto 16px">A Routine is a sequence of steps &mdash; call MCP tools, run local CLIs, prompt the agent, branch on results &mdash; that runs on a schedule or on demand. Example: &ldquo;at 8am check email; if anything urgent, summarize and Slack me.&rdquo;</div>
+          <div style="display:flex;gap:8px;justify-content:center;flex-wrap:wrap">
+            <button class="btn-sm btn-primary" onclick="window.RoutinesUI && RoutinesUI.openCreate()" style="padding:6px 14px">+ New Routine</button>
+            <button class="btn-sm" onclick="window.RoutinesUI && RoutinesUI.openAssist()" style="padding:6px 14px;background:var(--bg-tertiary);border:1px solid var(--border);color:var(--text-secondary)">Generate from prompt</button>
           </div>
         </div>
-        <!-- Right: Canvas (dominant) + Existing Skills drawer -->
-        <div id="builder-right-pane" style="flex:1;min-width:0;display:flex;flex-direction:column;background:var(--bg-primary)">
-          <div style="padding:12px 16px;border-bottom:1px solid var(--border);font-weight:600;font-size:13px;color:var(--text-secondary);display:flex;align-items:center;gap:10px;flex-wrap:wrap">
-            <span id="builder-right-pane-title">Workflow Builder</span>
-            <span id="builder-preview-status" style="font-size:11px;color:var(--text-muted)"></span>
+        <div id="routines-list-wrap" style="background:var(--bg-secondary);border:1px solid var(--border);border-radius:var(--radius);overflow:hidden">
+          <table style="width:100%;border-collapse:collapse;font-size:13px">
+            <thead style="text-align:left;color:var(--text-muted);font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.04em;background:var(--bg-tertiary)">
+              <tr>
+                <th style="padding:11px 14px">Name</th>
+                <th style="padding:11px 14px">Owner</th>
+                <th style="padding:11px 14px">Schedule</th>
+                <th style="padding:11px 14px">Steps</th>
+                <th style="padding:11px 14px">Last run</th>
+                <th style="padding:11px 14px;text-align:center">Enabled</th>
+                <th style="padding:11px 14px;text-align:right">Actions</th>
+              </tr>
+            </thead>
+            <tbody id="routines-list-body"></tbody>
+          </table>
+        </div>
+      </div>
+      <!-- Editor pane (hidden by default; replaces list when a routine is opened) -->
+      <div id="routines-editor-pane" style="display:none;flex:1;min-height:0;overflow-y:auto;background:var(--bg-primary);padding:18px"></div>
+      <!-- Run history drawer (slide-out from right) -->
+      <div id="routines-runs-drawer" style="display:none;position:fixed;top:var(--header-h, 56px);right:0;bottom:0;width:520px;max-width:100vw;background:var(--bg-secondary);border-left:1px solid var(--border);box-shadow:-4px 0 24px rgba(0,0,0,0.18);z-index:120;overflow-y:auto"></div>
+      <!-- Create modal -->
+      <div id="routines-create-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.4);z-index:200;align-items:center;justify-content:center">
+        <div style="background:var(--bg-secondary);border:1px solid var(--border);border-radius:var(--radius);padding:22px;width:480px;max-width:92vw;display:flex;flex-direction:column;gap:12px">
+          <h3 style="margin:0;font-size:16px;font-weight:600;color:var(--text-primary)">New routine</h3>
+          <label style="font-size:11px;color:var(--text-muted);font-weight:500;text-transform:uppercase;letter-spacing:0.04em">Name</label>
+          <input type="text" id="routines-create-name" placeholder="e.g. 8am Email Triage" style="padding:8px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg-input);color:var(--text-primary);font-size:13px">
+          <label style="font-size:11px;color:var(--text-muted);font-weight:500;text-transform:uppercase;letter-spacing:0.04em">Description (optional)</label>
+          <input type="text" id="routines-create-description" placeholder="What does it do?" style="padding:8px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg-input);color:var(--text-primary);font-size:13px">
+          <label style="font-size:11px;color:var(--text-muted);font-weight:500;text-transform:uppercase;letter-spacing:0.04em">Schedule (optional cron expression)</label>
+          <input type="text" id="routines-create-schedule" placeholder="e.g. 0 8 * * *  (leave blank for manual)" style="padding:8px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg-input);color:var(--text-primary);font-size:13px;font-family:'JetBrains Mono',monospace">
+          <label style="font-size:11px;color:var(--text-muted);font-weight:500;text-transform:uppercase;letter-spacing:0.04em">Owner</label>
+          <select id="routines-create-owner" style="padding:8px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg-input);color:var(--text-primary);font-size:13px">
+            <option value="">Clementine (global)</option>
+          </select>
+          <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:6px">
+            <button class="btn-sm" onclick="window.RoutinesUI && RoutinesUI.closeCreate()" style="padding:6px 14px;background:var(--bg-tertiary);border:1px solid var(--border);color:var(--text-secondary)">Cancel</button>
+            <button class="btn-sm btn-primary" onclick="window.RoutinesUI && RoutinesUI.submitCreate()" style="padding:6px 14px">Create</button>
+          </div>
+        </div>
+      </div>
+      <!-- Assist modal (Generate from prompt) -->
+      <div id="routines-assist-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.4);z-index:200;align-items:center;justify-content:center">
+        <div style="background:var(--bg-secondary);border:1px solid var(--border);border-radius:var(--radius);padding:22px;width:560px;max-width:92vw;max-height:80vh;display:flex;flex-direction:column;gap:14px">
+          <h3 style="margin:0;font-size:16px;font-weight:600;color:var(--text-primary)">Generate routine from prompt</h3>
+          <p style="margin:0;font-size:12px;color:var(--text-muted);line-height:1.5">Describe what the routine should do. The assistant will draft a starter sequence you can edit. Example: &ldquo;Every morning at 8am, check unread Gmail; if anything looks urgent, summarize and send to Slack #me.&rdquo;</p>
+          <textarea id="routines-assist-input" rows="6" placeholder="Describe the routine&hellip;" style="width:100%;padding:10px;border:1px solid var(--border);border-radius:6px;background:var(--bg-input);color:var(--text-primary);font-size:13px;font-family:inherit;resize:vertical;box-sizing:border-box"></textarea>
+          <div id="routines-assist-status" style="font-size:11px;color:var(--text-muted);min-height:14px"></div>
+          <div style="display:flex;gap:8px;justify-content:flex-end">
+            <button class="btn-sm" onclick="window.RoutinesUI && RoutinesUI.closeAssist()" style="padding:6px 14px;background:var(--bg-tertiary);border:1px solid var(--border);color:var(--text-secondary)">Cancel</button>
+            <button id="routines-assist-submit" class="btn-sm btn-primary" onclick="window.RoutinesUI && RoutinesUI.submitAssist()" style="padding:6px 14px">Generate</button>
+          </div>
+        </div>
+      </div>
+      <!-- Step picker modal -->
+      <div id="routines-step-picker" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.4);z-index:200;align-items:center;justify-content:center">
+        <div style="background:var(--bg-secondary);border:1px solid var(--border);border-radius:var(--radius);padding:0;width:640px;max-width:94vw;max-height:80vh;display:flex;flex-direction:column;overflow:hidden">
+          <div style="padding:16px 20px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:10px">
+            <h3 style="margin:0;font-size:15px;font-weight:600;color:var(--text-primary)">Add step</h3>
             <span style="flex:1"></span>
-            <select id="builder-canvas-picker" onchange="openBuilderWorkflow(this.value)" style="display:none;padding:4px 8px;border:1px solid var(--border);border-radius:6px;background:var(--bg-secondary);color:var(--text-primary);font-size:12px;max-width:240px">
-              <option value="">— pick a workflow —</option>
-            </select>
-            <button id="builder-canvas-validate-btn" onclick="validateBuilderCanvas()" title="Static checks (cycles, missing fields, deps)" style="display:none;background:var(--bg-tertiary);border:1px solid var(--border);color:var(--text-secondary);padding:3px 8px;border-radius:4px;cursor:pointer;font-size:11px">Validate</button>
-            <button id="builder-canvas-dryrun-btn" onclick="dryRunBuilderCanvas()" title="Describe what each step would do (no execution)" style="display:none;background:var(--bg-tertiary);border:1px solid var(--border);color:var(--text-secondary);padding:3px 8px;border-radius:4px;cursor:pointer;font-size:11px">Dry-run</button>
-            <button id="builder-canvas-test-btn" onclick="testBuilderCanvas()" title="Mock-safe validation run; prompt steps are stubbed" style="display:none;background:var(--clementine);border:none;color:#fff;padding:3px 10px;border-radius:4px;cursor:pointer;font-size:11px">Mock Test</button>
-            <button id="builder-canvas-real-run-btn" onclick="runBuilderCanvasReal()" title="Run through the real workflow engine; side effects require approval" style="display:none;background:var(--green);border:none;color:#fff;padding:3px 10px;border-radius:4px;cursor:pointer;font-size:11px">Run Real</button>
-            <button id="builder-canvas-cancel-btn" onclick="cancelBuilderTest()" title="Cancel test run" style="display:none;background:var(--red);border:none;color:#fff;padding:3px 10px;border-radius:4px;cursor:pointer;font-size:11px">Cancel</button>
+            <button class="btn-sm" onclick="window.RoutinesUI && RoutinesUI.closeStepPicker()" style="padding:4px 10px;background:var(--bg-tertiary);border:1px solid var(--border);color:var(--text-secondary)">&times;</button>
           </div>
-          <div id="builder-preview" style="flex:1;overflow-y:auto;padding:16px">
-            <div class="empty-state" style="font-size:13px;color:var(--text-muted)">The artifact will appear here as you build it</div>
-          </div>
-          <div id="builder-canvas-host" style="display:none;flex:1;flex-direction:column;min-height:0;position:relative">
-            <div id="builder-canvas-banner" style="padding:8px 14px;background:var(--bg-tertiary);border-bottom:1px solid var(--border);font-size:11px;color:var(--text-muted);display:none"></div>
-            <div id="builder-canvas" style="flex:1;background:var(--bg-tertiary);position:relative;overflow:hidden"></div>
-            <!-- Floating add-node FAB + palette popover -->
-            <button id="builder-palette-btn" onclick="toggleBuilderPalette()" title="Add a step" style="position:absolute;left:14px;bottom:48px;width:40px;height:40px;border-radius:50%;background:var(--clementine);color:#fff;border:none;font-size:20px;font-weight:600;cursor:pointer;box-shadow:0 2px 8px rgba(0,0,0,0.25);z-index:10">+</button>
-            <div id="builder-palette-pop" style="display:none;position:absolute;left:60px;bottom:48px;background:var(--bg-secondary);border:1px solid var(--border);border-radius:8px;padding:6px;box-shadow:0 4px 16px rgba(0,0,0,0.2);z-index:11;min-width:160px">
-              <div onclick="_builderAddNodeOfKind('prompt')" class="builder-palette-item" data-kind="prompt">prompt</div>
-              <div onclick="_builderAddNodeOfKind('mcp')" class="builder-palette-item" data-kind="mcp">mcp tool</div>
-              <div onclick="_builderAddNodeOfKind('channel')" class="builder-palette-item" data-kind="channel">channel</div>
-              <div onclick="_builderAddNodeOfKind('transform')" class="builder-palette-item" data-kind="transform">transform</div>
-            </div>
-            <!-- Slide-out config panel -->
-            <div id="builder-config-panel" style="display:none;position:absolute;right:0;top:0;bottom:0;width:340px;background:var(--bg-secondary);border-left:1px solid var(--border);box-shadow:-4px 0 16px rgba(0,0,0,0.15);z-index:12;flex-direction:column"></div>
-            <!-- Empty-state CTA — visible when no workflow is open on the canvas -->
-            <div id="builder-canvas-empty" style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:14px;color:var(--text-muted);text-align:center;padding:32px;pointer-events:none">
-              <div style="font-size:38px;opacity:0.4">&#128279;</div>
-              <div style="font-size:14px;font-weight:500;color:var(--text-secondary)">No workflow open</div>
-              <div style="font-size:12px;line-height:1.5;max-width:280px">
-                Pick one from the dropdown above &mdash; or click <strong>New</strong> in the header to create one from scratch, or open the <strong>Templates</strong> tab for starter patterns.
-              </div>
-            </div>
-            <div id="builder-canvas-footer" style="padding:6px 14px;border-top:1px solid var(--border);font-size:11px;color:var(--text-muted);display:flex;gap:14px;align-items:center">
-              <span id="builder-canvas-status"></span>
-              <span style="flex:1"></span>
-              <button id="builder-delete-btn" onclick="deleteCurrentBuilderWorkflow()" title="Delete this workflow" style="display:none;background:none;border:1px solid transparent;color:var(--red);font-size:11px;cursor:pointer;padding:2px 8px;border-radius:var(--radius-xs)">Delete</button>
-              <span id="builder-canvas-id" style="font-family:'JetBrains Mono',monospace;opacity:0.6"></span>
-            </div>
-          </div>
-          <!-- Existing skills drawer (visible in skill mode) -->
-          <div id="builder-skills-drawer" style="display:none;border-top:2px solid var(--border);max-height:260px;overflow-y:auto">
-            <div style="padding:10px 16px;display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;background:var(--bg-secondary);z-index:1">
-              <span style="font-size:12px;font-weight:600;color:var(--text-secondary)">Existing Skills</span>
-              <span id="builder-skills-count" style="font-size:10px;color:var(--text-muted)"></span>
-            </div>
-            <div id="builder-skills-list" style="padding:0 12px 12px"></div>
-          </div>
-        </div>
-      </div>
-
-      <!-- Scheduled Tasks tab — simple recurring-task management. The visual canvas is for workflows. -->
-      <div id="build-tab-crons" data-build-tabpane="crons" style="display:block;flex:1;min-height:0;overflow-y:auto;padding:18px;background:var(--bg-primary)">
-        <div style="display:flex;align-items:flex-start;gap:14px;margin-bottom:16px;flex-wrap:wrap">
-          <div style="flex:1;min-width:260px">
-            <h2 style="font-size:18px;font-weight:600;margin:0 0 4px;color:var(--text-primary)">Build Operations</h2>
-            <p style="font-size:13px;color:var(--text-muted);margin:0;line-height:1.45">Scheduled tasks, scheduled workflows, and live runtime work. Cards here are the turn-on, turn-off, run-now surface.</p>
-          </div>
-          <div style="display:flex;gap:8px;flex-wrap:wrap">
-            <button class="btn-sm btn-primary" onclick="openCreateCronModal(getBuildCreateOwner())" style="padding:7px 14px;border-radius:6px;cursor:pointer;font-size:12px">New Scheduled Task</button>
-            <button class="btn-sm" onclick="createScheduledWorkflowFromBuild()" style="padding:7px 14px;border-radius:6px;cursor:pointer;font-size:12px">New Scheduled Workflow</button>
-          </div>
-        </div>
-        <div id="panel-cron"></div>
-      </div>
-
-      <!-- Templates tab — starter patterns -->
-      <div id="build-tab-templates" data-build-tabpane="templates" style="display:none;padding:24px;overflow-y:auto">
-        <div style="max-width:920px;margin:0 auto">
-          <h2 style="font-size:18px;font-weight:600;margin:0 0 6px;color:var(--text-primary)">Start from a template</h2>
-          <p style="font-size:13px;color:var(--text-muted);margin:0 0 18px">Pick a pre-built pattern to fork into a new editable workflow.</p>
-          <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:14px">
-            <div class="card clickable-row" onclick="forkBuildTemplate('daily-news-digest')" style="padding:18px">
-              <div style="font-size:24px;margin-bottom:8px">&#128240;</div>
-              <div style="font-weight:600;font-size:14px;margin-bottom:4px">Daily news digest</div>
-              <div style="font-size:12px;color:var(--text-muted);line-height:1.4">Scheduled 7am: pull RSS sources, summarize, send to Slack/email.</div>
-              <div style="margin-top:10px;font-size:11px;color:var(--clementine);font-weight:500">scheduled workflow · 4 steps</div>
-            </div>
-            <div class="card clickable-row" onclick="forkBuildTemplate('lead-picker')" style="padding:18px">
-              <div style="font-size:24px;margin-bottom:8px">&#128202;</div>
-              <div style="font-weight:600;font-size:14px;margin-bottom:4px">Lead picker → Salesforce</div>
-              <div style="font-size:12px;color:var(--text-muted);line-height:1.4">Manual workflow: search leads by ICP, review, push selected to SF.</div>
-              <div style="margin-top:10px;font-size:11px;color:var(--clementine);font-weight:500">manual · 3 steps</div>
-            </div>
-            <div class="card clickable-row" onclick="forkBuildTemplate('pr-review-queue')" style="padding:18px">
-              <div style="font-size:24px;margin-bottom:8px">&#128221;</div>
-              <div style="font-weight:600;font-size:14px;margin-bottom:4px">PR review queue</div>
-              <div style="font-size:12px;color:var(--text-muted);line-height:1.4">Scheduled 9am M-F: list open PRs, summarize risk, message to Slack.</div>
-              <div style="margin-top:10px;font-size:11px;color:var(--clementine);font-weight:500">scheduled workflow · 3 steps</div>
-            </div>
-            <div class="card clickable-row" onclick="forkBuildTemplate('email-triage')" style="padding:18px">
-              <div style="font-size:24px;margin-bottom:8px">&#128231;</div>
-              <div style="font-weight:600;font-size:14px;margin-bottom:4px">Email triage</div>
-              <div style="font-size:12px;color:var(--text-muted);line-height:1.4">Scheduled 8am: list unread emails, classify by intent, draft replies for review.</div>
-              <div style="margin-top:10px;font-size:11px;color:var(--clementine);font-weight:500">scheduled workflow · 4 steps</div>
-            </div>
-            <div class="card clickable-row" onclick="forkBuildTemplate('weekly-review')" style="padding:18px">
-              <div style="font-size:24px;margin-bottom:8px">&#128197;</div>
-              <div style="font-weight:600;font-size:14px;margin-bottom:4px">Weekly review</div>
-              <div style="font-size:12px;color:var(--text-muted);line-height:1.4">Scheduled Fri 6pm: review the week's daily notes, generate review note.</div>
-              <div style="margin-top:10px;font-size:11px;color:var(--clementine);font-weight:500">scheduled workflow · 3 steps</div>
-            </div>
-            <div class="card clickable-row" onclick="forkBuildTemplate('blank-workflow')" style="padding:18px;border-style:dashed">
-              <div style="font-size:24px;margin-bottom:8px">&#10133;</div>
-              <div style="font-weight:600;font-size:14px;margin-bottom:4px">Blank workflow</div>
-              <div style="font-size:12px;color:var(--text-muted);line-height:1.4">Start from scratch with a single prompt step.</div>
-              <div style="margin-top:10px;font-size:11px;color:var(--clementine);font-weight:500">manual · 1 step</div>
-            </div>
-          </div>
+          <div id="routines-step-picker-body" style="padding:16px 20px;overflow-y:auto;flex:1"></div>
         </div>
       </div>
     </div>
+    <script>
+      // ── Routines UI ─────────────────────────────────────────────────
+      // Vanilla JS module that drives the new Routines surface. State-light,
+      // re-fetches from /api/routines on most actions to stay correct without
+      // a client-side data store. Renders linear step lists; no canvas.
+      (function() {
+        var R = {
+          state: {
+            list: [],
+            owners: [],
+            mcpTools: null,        // { servers: [{name,enabled,tools:[]}, ...] }
+            cliTools: null,        // [{cmd,description,userDefined}, ...]
+            editing: null,         // { id, routine, dirty }
+            assistBusy: false,
+          },
+          init: function() {
+            // Load reference data lazily; trigger list render immediately.
+            this.loadOwners();
+            this.refreshList();
+            this.loadMcpTools();
+            this.loadCliTools();
+          },
+          // ── data ────────────────────────────────────────────────────
+          loadOwners: function() {
+            // Reuse the agent registry the rest of the dashboard uses.
+            fetch('/api/agents').then(function(r){ return r.json(); }).then(function(data){
+              R.state.owners = (data.agents || []).map(function(a){ return { slug: a.slug, name: a.name || a.slug }; });
+              R.populateOwnerSelects();
+            }).catch(function(){ /* non-fatal */ });
+          },
+          populateOwnerSelects: function() {
+            var filter = document.getElementById('routines-owner-filter');
+            var creator = document.getElementById('routines-create-owner');
+            var keepFilter = filter && filter.value;
+            if (filter) {
+              filter.innerHTML = '<option value="__all__">All</option><option value="__global__">Clementine (global)</option>'
+                + R.state.owners.map(function(o){ return '<option value="' + R.esc(o.slug) + '">@' + R.esc(o.name) + '</option>'; }).join('');
+              if (keepFilter) filter.value = keepFilter;
+            }
+            if (creator) {
+              creator.innerHTML = '<option value="">Clementine (global)</option>'
+                + R.state.owners.map(function(o){ return '<option value="' + R.esc(o.slug) + '">@' + R.esc(o.name) + '</option>'; }).join('');
+            }
+          },
+          loadMcpTools: function() {
+            fetch('/api/routines/mcp-tools').then(function(r){ return r.json(); }).then(function(data){
+              R.state.mcpTools = data && data.servers ? data : { servers: [] };
+            }).catch(function(){ R.state.mcpTools = { servers: [] }; });
+          },
+          loadCliTools: function() {
+            fetch('/api/routines/cli-tools').then(function(r){ return r.json(); }).then(function(data){
+              R.state.cliTools = (data && data.tools) || [];
+            }).catch(function(){ R.state.cliTools = []; });
+          },
+          refreshList: function() {
+            fetch('/api/routines').then(function(r){ return r.json(); }).then(function(data){
+              R.state.list = (data && data.routines) || [];
+              R.renderList();
+            }).catch(function(){ R.state.list = []; R.renderList(); });
+          },
+          // ── list view ───────────────────────────────────────────────
+          renderList: function() {
+            var body = document.getElementById('routines-list-body');
+            var empty = document.getElementById('routines-list-empty');
+            var wrap = document.getElementById('routines-list-wrap');
+            var count = document.getElementById('routines-count');
+            if (!body || !empty || !wrap) return;
+            var filter = (document.getElementById('routines-owner-filter') || {}).value || '__all__';
+            var rows = R.state.list.filter(function(r){
+              if (filter === '__all__') return true;
+              if (filter === '__global__') return r.scope === 'global';
+              return r.scope === 'agent' && r.agentSlug === filter;
+            });
+            if (count) count.textContent = rows.length === 0 ? '' : rows.length + (rows.length === 1 ? ' routine' : ' routines');
+            if (rows.length === 0) {
+              empty.style.display = 'block';
+              wrap.style.display = 'none';
+              return;
+            }
+            empty.style.display = 'none';
+            wrap.style.display = 'block';
+            body.innerHTML = rows.map(function(r){
+              var owner = r.scope === 'agent' ? '@' + R.esc(r.agentSlug || '?') : 'Clementine';
+              var schedule = r.schedule ? '<code style="font-family:\\x27JetBrains Mono\\x27,monospace;font-size:11px">' + R.esc(r.schedule) + '</code>' : '<span style="color:var(--text-muted)">manual</span>';
+              var enabledBadge = '<input type="checkbox" ' + (r.enabled ? 'checked' : '') + ' onchange="event.stopPropagation();window.RoutinesUI&&RoutinesUI.toggle(\\x27' + R.esc(r.id) + '\\x27)" style="cursor:pointer">';
+              var origin = r.origin === 'cron' ? '<span title="Legacy cron entry — single prompt step" style="font-size:10px;color:var(--text-muted);margin-left:6px">[cron]</span>' : '';
+              return '<tr style="border-top:1px solid var(--border);cursor:pointer" onclick="window.RoutinesUI&&RoutinesUI.openEditor(\\x27' + R.esc(r.id) + '\\x27)">'
+                + '<td style="padding:11px 14px;color:var(--text-primary);font-weight:500">' + R.esc(r.name) + origin + '</td>'
+                + '<td style="padding:11px 14px;color:var(--text-secondary);font-size:12px">' + R.esc(owner) + '</td>'
+                + '<td style="padding:11px 14px">' + schedule + '</td>'
+                + '<td style="padding:11px 14px;color:var(--text-secondary);font-size:12px">' + r.stepCount + '</td>'
+                + '<td style="padding:11px 14px;color:var(--text-muted);font-size:12px">&mdash;</td>'
+                + '<td style="padding:11px 14px;text-align:center" onclick="event.stopPropagation()">' + enabledBadge + '</td>'
+                + '<td style="padding:11px 14px;text-align:right;white-space:nowrap" onclick="event.stopPropagation()">'
+                + '<button class="btn-sm" title="Run now" onclick="window.RoutinesUI&&RoutinesUI.run(\\x27' + R.esc(r.id) + '\\x27)" style="padding:4px 10px;border:1px solid var(--border);background:var(--bg-tertiary);color:var(--text-primary);border-radius:4px;cursor:pointer;font-size:11px;margin-right:4px">&#9654; Run</button>'
+                + '<button class="btn-sm" title="Run history" onclick="window.RoutinesUI&&RoutinesUI.openRuns(\\x27' + R.esc(r.id) + '\\x27)" style="padding:4px 10px;border:1px solid var(--border);background:var(--bg-tertiary);color:var(--text-secondary);border-radius:4px;cursor:pointer;font-size:11px">History</button>'
+                + '</td></tr>';
+            }).join('');
+          },
+          toggle: function(id) {
+            fetch('/api/routines/' + encodeURIComponent(id) + '/toggle', { method: 'POST' })
+              .then(function(r){ return r.json(); })
+              .then(function(){ R.refreshList(); })
+              .catch(function(err){ alert('Toggle failed: ' + err); });
+          },
+          run: function(id, approvedSideEffects) {
+            fetch('/api/routines/' + encodeURIComponent(id) + '/run', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ approvedSideEffects: approvedSideEffects === true })
+            }).then(function(r){
+              if (r.status === 409) {
+                return r.json().then(function(j){
+                  var lines = (j.sideEffects || []).map(function(s){ return '  • ' + s.kind + ': ' + s.label; }).join('\\n');
+                  if (confirm('This routine has side effects:\\n\\n' + lines + '\\n\\nProceed?')) R.run(id, true);
+                });
+              }
+              return r.json().then(function(j){
+                if (j.ok) R.flash('Triggered.');
+                else alert('Run failed: ' + (j.error || 'unknown'));
+              });
+            }).catch(function(err){ alert('Run failed: ' + err); });
+          },
+          // ── editor ──────────────────────────────────────────────────
+          openEditor: function(id) {
+            fetch('/api/routines/' + encodeURIComponent(id))
+              .then(function(r){ return r.json(); })
+              .then(function(data){
+                if (!data || !data.routine) { alert('Failed to load routine'); return; }
+                R.state.editing = { id: data.id, routine: data.routine, dirty: false, validation: data.validation };
+                R.showEditor();
+              }).catch(function(err){ alert('Open failed: ' + err); });
+          },
+          showEditor: function() {
+            document.getElementById('routines-list-pane').style.display = 'none';
+            document.getElementById('routines-editor-pane').style.display = 'block';
+            document.getElementById('routines-back-btn').style.display = 'inline-block';
+            document.getElementById('routines-create-btn').style.display = 'none';
+            document.getElementById('routines-assist-btn').style.display = 'none';
+            document.getElementById('routines-owner-filter').style.display = 'none';
+            document.getElementById('routines-owner-label').style.display = 'none';
+            document.getElementById('routines-editor-breadcrumb').style.display = 'inline';
+            document.getElementById('routines-editor-name').textContent = R.state.editing.routine.name;
+            R.renderEditor();
+          },
+          closeEditor: function() {
+            if (R.state.editing && R.state.editing.dirty && !confirm('Discard unsaved changes?')) return;
+            R.state.editing = null;
+            document.getElementById('routines-list-pane').style.display = 'block';
+            document.getElementById('routines-editor-pane').style.display = 'none';
+            document.getElementById('routines-back-btn').style.display = 'none';
+            document.getElementById('routines-create-btn').style.display = 'inline-block';
+            document.getElementById('routines-assist-btn').style.display = 'inline-block';
+            document.getElementById('routines-owner-filter').style.display = 'inline-block';
+            document.getElementById('routines-owner-label').style.display = 'inline';
+            document.getElementById('routines-editor-breadcrumb').style.display = 'none';
+            R.refreshList();
+          },
+          renderEditor: function() {
+            var pane = document.getElementById('routines-editor-pane');
+            if (!pane || !R.state.editing) return;
+            var wf = R.state.editing.routine;
+            var html = '<div style="max-width:920px;margin:0 auto">';
+            html += '<div style="background:var(--bg-secondary);border:1px solid var(--border);border-radius:var(--radius);padding:16px 18px;margin-bottom:14px">'
+              + '<div style="display:flex;align-items:center;gap:12px;margin-bottom:10px">'
+              + '<input type="text" id="re-name" value="' + R.esc(wf.name) + '" oninput="window.RoutinesUI&&RoutinesUI.markDirty()" style="flex:1;padding:6px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg-input);color:var(--text-primary);font-size:14px;font-weight:600">'
+              + '<label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--text-secondary)"><input type="checkbox" id="re-enabled" ' + (wf.enabled ? 'checked' : '') + ' onchange="window.RoutinesUI&&RoutinesUI.markDirty()"> Enabled</label>'
+              + '</div>'
+              + '<input type="text" id="re-description" value="' + R.esc(wf.description || '') + '" placeholder="Description (optional)" oninput="window.RoutinesUI&&RoutinesUI.markDirty()" style="width:100%;padding:6px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg-input);color:var(--text-primary);font-size:13px;margin-bottom:10px;box-sizing:border-box">'
+              + '<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap"><label style="font-size:11px;color:var(--text-muted);font-weight:500;text-transform:uppercase;letter-spacing:0.04em">Schedule</label>'
+              + '<input type="text" id="re-schedule" value="' + R.esc(wf.trigger && wf.trigger.schedule || '') + '" placeholder="cron e.g. 0 8 * * * (blank = manual)" oninput="window.RoutinesUI&&RoutinesUI.markDirty()" style="flex:1;min-width:240px;padding:6px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg-input);color:var(--text-primary);font-size:12px;font-family:\\x27JetBrains Mono\\x27,monospace">'
+              + '</div></div>';
+            // Steps
+            html += '<div style="font-size:11px;color:var(--text-muted);font-weight:600;text-transform:uppercase;letter-spacing:0.04em;margin:18px 0 8px">Steps</div>';
+            html += '<div id="re-steps-list">' + (wf.steps || []).map(function(s, i){ return R.renderStepCard(s, i); }).join('') + '</div>';
+            html += '<button class="btn-sm" onclick="window.RoutinesUI&&RoutinesUI.openStepPicker()" style="margin-top:8px;padding:8px 14px;border:1px dashed var(--border);background:transparent;color:var(--text-secondary);border-radius:6px;cursor:pointer;font-size:12px;width:100%">+ Add step</button>';
+            // Action bar
+            html += '<div id="re-action-bar" style="position:sticky;bottom:0;background:var(--bg-primary);border-top:1px solid var(--border);padding:14px 0;margin-top:24px;display:flex;gap:8px;align-items:center">'
+              + '<button class="btn-sm" onclick="window.RoutinesUI&&RoutinesUI.dryRunCurrent()" style="padding:6px 12px;background:var(--bg-tertiary);border:1px solid var(--border);color:var(--text-secondary);border-radius:6px;cursor:pointer;font-size:12px">Dry-run</button>'
+              + '<button class="btn-sm" onclick="window.RoutinesUI&&RoutinesUI.testCurrent()" style="padding:6px 12px;background:var(--bg-tertiary);border:1px solid var(--border);color:var(--text-secondary);border-radius:6px;cursor:pointer;font-size:12px">Mock test</button>'
+              + '<button class="btn-sm" onclick="window.RoutinesUI&&RoutinesUI.openRuns(R.state && R.state.editing && R.state.editing.id)" style="padding:6px 12px;background:var(--bg-tertiary);border:1px solid var(--border);color:var(--text-secondary);border-radius:6px;cursor:pointer;font-size:12px">History</button>'
+              + '<span style="flex:1"></span>'
+              + (R.state.editing.routine.sourceFile && R.state.editing.id.indexOf("cron:") !== 0 ? '<button class="btn-sm" onclick="window.RoutinesUI&&RoutinesUI.deleteCurrent()" style="padding:6px 12px;background:transparent;border:1px solid var(--red);color:var(--red);border-radius:6px;cursor:pointer;font-size:12px">Delete</button>' : '')
+              + '<button class="btn-sm" onclick="window.RoutinesUI&&RoutinesUI.runCurrent()" style="padding:6px 14px;background:var(--green);border:none;color:#fff;border-radius:6px;cursor:pointer;font-size:12px">&#9654; Run now</button>'
+              + '<button class="btn-sm btn-primary" id="re-save-btn" onclick="window.RoutinesUI&&RoutinesUI.saveCurrent()" style="padding:6px 16px">Save</button>'
+              + '</div>';
+            html += '<div id="re-status" style="font-size:11px;color:var(--text-muted);min-height:14px;padding:6px 0"></div>';
+            html += '</div>';
+            pane.innerHTML = html;
+            if (window.hydrateLucideIcons) window.hydrateLucideIcons();
+          },
+          renderStepCard: function(step, idx) {
+            var kind = step.kind || 'prompt';
+            var kindColor = { prompt: '#5e72e4', mcp: '#2dce89', cli: '#fb6340', conditional: '#f5365c', channel: '#11cdef', transform: '#ffd600', loop: '#8965e0' }[kind] || '#888';
+            var badge = '<span style="display:inline-block;background:' + kindColor + '22;color:' + kindColor + ';padding:2px 8px;border-radius:4px;font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:0.04em">' + kind + '</span>';
+            var head = '<div style="display:flex;align-items:center;gap:10px;margin-bottom:10px">'
+              + '<span style="font-size:11px;color:var(--text-muted);font-weight:600;min-width:24px">#' + (idx + 1) + '</span>'
+              + badge
+              + '<input type="text" value="' + R.esc(step.id) + '" onchange="window.RoutinesUI&&RoutinesUI.updateStep(' + idx + ',\\x27id\\x27,this.value)" style="font-family:\\x27JetBrains Mono\\x27,monospace;padding:3px 8px;border:1px solid var(--border);border-radius:4px;background:var(--bg-input);color:var(--text-primary);font-size:11px;min-width:120px">'
+              + '<span style="flex:1"></span>'
+              + (idx > 0 ? '<button title="Move up" onclick="window.RoutinesUI&&RoutinesUI.moveStep(' + idx + ',-1)" style="background:none;border:none;color:var(--text-muted);cursor:pointer;font-size:14px">&uarr;</button>' : '')
+              + (idx < (R.state.editing.routine.steps.length - 1) ? '<button title="Move down" onclick="window.RoutinesUI&&RoutinesUI.moveStep(' + idx + ',1)" style="background:none;border:none;color:var(--text-muted);cursor:pointer;font-size:14px">&darr;</button>' : '')
+              + '<button title="Remove" onclick="window.RoutinesUI&&RoutinesUI.removeStep(' + idx + ')" style="background:none;border:none;color:var(--red);cursor:pointer;font-size:14px">&times;</button>'
+              + '</div>';
+            var body = R.renderStepBody(step, idx);
+            var depsList = (step.dependsOn || []).join(', ');
+            var depsRow = '<div style="display:flex;align-items:center;gap:8px;margin-top:8px"><label style="font-size:10px;color:var(--text-muted);font-weight:600;text-transform:uppercase;letter-spacing:0.04em;min-width:60px">After</label>'
+              + '<input type="text" value="' + R.esc(depsList) + '" placeholder="step ids, comma-separated (blank = independent)" onchange="window.RoutinesUI&&RoutinesUI.updateStepDeps(' + idx + ',this.value)" style="flex:1;padding:4px 8px;border:1px solid var(--border);border-radius:4px;background:var(--bg-input);color:var(--text-primary);font-size:11px;font-family:\\x27JetBrains Mono\\x27,monospace"></div>';
+            return '<div style="background:var(--bg-secondary);border:1px solid var(--border);border-radius:var(--radius);padding:12px 14px;margin-bottom:8px;border-left:3px solid ' + kindColor + '">' + head + body + depsRow + '</div>';
+          },
+          renderStepBody: function(step, idx) {
+            var kind = step.kind || 'prompt';
+            switch (kind) {
+              case 'prompt':
+                return '<textarea rows="3" placeholder="Prompt to send to the agent" oninput="window.RoutinesUI&&RoutinesUI.updateStep(' + idx + ',\\x27prompt\\x27,this.value)" style="width:100%;padding:8px;border:1px solid var(--border);border-radius:4px;background:var(--bg-input);color:var(--text-primary);font-size:12px;font-family:inherit;resize:vertical;box-sizing:border-box">' + R.esc(step.prompt || '') + '</textarea>';
+              case 'mcp':
+                var mcp = step.mcp || { server: '', tool: '', inputs: {} };
+                var serverOptions = '<option value="">— pick server —</option>' + (R.state.mcpTools && R.state.mcpTools.servers || []).map(function(s){ return '<option value="' + R.esc(s.name) + '" ' + (mcp.server === s.name ? 'selected' : '') + '>' + R.esc(s.name) + ' (' + s.tools.length + ')</option>'; }).join('');
+                var server = (R.state.mcpTools && R.state.mcpTools.servers || []).find(function(s){ return s.name === mcp.server; });
+                var toolOptions = '<option value="">— pick tool —</option>' + (server ? server.tools.map(function(t){ return '<option value="' + R.esc(t) + '" ' + (mcp.tool === t ? 'selected' : '') + '>' + R.esc(t) + '</option>'; }).join('') : '');
+                var inputsJson = JSON.stringify(mcp.inputs || {}, null, 2);
+                return '<div style="display:flex;gap:8px;margin-bottom:6px;flex-wrap:wrap">'
+                  + '<select onchange="window.RoutinesUI&&RoutinesUI.updateMcp(' + idx + ',\\x27server\\x27,this.value)" style="flex:1;min-width:160px;padding:6px 8px;border:1px solid var(--border);border-radius:4px;background:var(--bg-input);color:var(--text-primary);font-size:12px">' + serverOptions + '</select>'
+                  + '<select onchange="window.RoutinesUI&&RoutinesUI.updateMcp(' + idx + ',\\x27tool\\x27,this.value)" style="flex:1;min-width:160px;padding:6px 8px;border:1px solid var(--border);border-radius:4px;background:var(--bg-input);color:var(--text-primary);font-size:12px">' + toolOptions + '</select>'
+                  + '</div>'
+                  + '<label style="display:block;font-size:10px;color:var(--text-muted);margin-bottom:4px">Inputs (JSON; values may use {{steps.x}} or {{input.name}})</label>'
+                  + '<textarea rows="3" oninput="window.RoutinesUI&&RoutinesUI.updateMcpInputs(' + idx + ',this.value)" style="width:100%;padding:6px;border:1px solid var(--border);border-radius:4px;background:var(--bg-input);color:var(--text-primary);font-size:11px;font-family:\\x27JetBrains Mono\\x27,monospace;resize:vertical;box-sizing:border-box">' + R.esc(inputsJson) + '</textarea>';
+              case 'cli':
+                var cli = step.cli || { cmd: '', args: [] };
+                var cliOptions = '<option value="">— pick CLI —</option>' + (R.state.cliTools || []).map(function(c){ return '<option value="' + R.esc(c.cmd) + '" ' + (cli.cmd === c.cmd ? 'selected' : '') + '>' + R.esc(c.cmd) + ' &mdash; ' + R.esc(c.description) + '</option>'; }).join('');
+                if (cli.cmd && !(R.state.cliTools || []).some(function(c){ return c.cmd === cli.cmd; })) {
+                  cliOptions += '<option value="' + R.esc(cli.cmd) + '" selected>' + R.esc(cli.cmd) + ' (custom)</option>';
+                }
+                return '<div style="display:flex;gap:8px;margin-bottom:6px;flex-wrap:wrap">'
+                  + '<select onchange="window.RoutinesUI&&RoutinesUI.updateCli(' + idx + ',\\x27cmd\\x27,this.value)" style="flex:1;min-width:200px;padding:6px 8px;border:1px solid var(--border);border-radius:4px;background:var(--bg-input);color:var(--text-primary);font-size:12px">' + cliOptions + '</select>'
+                  + '<input type="number" value="' + (cli.timeoutMs || 60000) + '" onchange="window.RoutinesUI&&RoutinesUI.updateCli(' + idx + ',\\x27timeoutMs\\x27,parseInt(this.value,10))" placeholder="timeout ms" style="width:120px;padding:6px 8px;border:1px solid var(--border);border-radius:4px;background:var(--bg-input);color:var(--text-primary);font-size:12px" title="Timeout in milliseconds">'
+                  + '</div>'
+                  + '<label style="display:block;font-size:10px;color:var(--text-muted);margin-bottom:4px">Args (one per line; supports {{steps.x}} templates)</label>'
+                  + '<textarea rows="3" oninput="window.RoutinesUI&&RoutinesUI.updateCliArgs(' + idx + ',this.value)" placeholder="--json\\norg list" style="width:100%;padding:6px;border:1px solid var(--border);border-radius:4px;background:var(--bg-input);color:var(--text-primary);font-size:11px;font-family:\\x27JetBrains Mono\\x27,monospace;resize:vertical;box-sizing:border-box">' + R.esc((cli.args || []).join('\\n')) + '</textarea>'
+                  + '<label style="display:flex;align-items:center;gap:6px;margin-top:6px;font-size:11px;color:var(--text-secondary)"><input type="checkbox" ' + (cli.captureStderr ? 'checked' : '') + ' onchange="window.RoutinesUI&&RoutinesUI.updateCli(' + idx + ',\\x27captureStderr\\x27,this.checked)"> Include stderr in output</label>';
+              case 'conditional':
+                var cond = step.conditional || { condition: '', trueNext: [], falseNext: [] };
+                return '<label style="display:block;font-size:10px;color:var(--text-muted);margin-bottom:4px">Condition (JS expression — has access to <code>steps.&lt;id&gt;</code>)</label>'
+                  + '<input type="text" value="' + R.esc(cond.condition || '') + '" placeholder="e.g. steps.s1.messages.length > 0" oninput="window.RoutinesUI&&RoutinesUI.updateConditional(' + idx + ',\\x27condition\\x27,this.value)" style="width:100%;padding:6px 10px;border:1px solid var(--border);border-radius:4px;background:var(--bg-input);color:var(--text-primary);font-size:12px;font-family:\\x27JetBrains Mono\\x27,monospace;margin-bottom:6px;box-sizing:border-box">'
+                  + '<div style="display:flex;gap:8px"><div style="flex:1">'
+                  + '<label style="display:block;font-size:10px;color:var(--text-muted);margin-bottom:4px">If true → run these step ids (comma)</label>'
+                  + '<input type="text" value="' + R.esc((cond.trueNext || []).join(', ')) + '" oninput="window.RoutinesUI&&RoutinesUI.updateConditional(' + idx + ',\\x27trueNext\\x27,this.value)" style="width:100%;padding:6px 10px;border:1px solid var(--border);border-radius:4px;background:var(--bg-input);color:var(--text-primary);font-size:11px;font-family:\\x27JetBrains Mono\\x27,monospace;box-sizing:border-box">'
+                  + '</div><div style="flex:1">'
+                  + '<label style="display:block;font-size:10px;color:var(--text-muted);margin-bottom:4px">If false → run these step ids</label>'
+                  + '<input type="text" value="' + R.esc((cond.falseNext || []).join(', ')) + '" oninput="window.RoutinesUI&&RoutinesUI.updateConditional(' + idx + ',\\x27falseNext\\x27,this.value)" style="width:100%;padding:6px 10px;border:1px solid var(--border);border-radius:4px;background:var(--bg-input);color:var(--text-primary);font-size:11px;font-family:\\x27JetBrains Mono\\x27,monospace;box-sizing:border-box">'
+                  + '</div></div>';
+              case 'channel':
+                var ch = step.channel || { channel: 'discord', target: '', content: '' };
+                return '<div style="display:flex;gap:8px;margin-bottom:6px;flex-wrap:wrap">'
+                  + '<select onchange="window.RoutinesUI&&RoutinesUI.updateChannel(' + idx + ',\\x27channel\\x27,this.value)" style="padding:6px 8px;border:1px solid var(--border);border-radius:4px;background:var(--bg-input);color:var(--text-primary);font-size:12px">'
+                  + ['discord','slack','telegram','whatsapp','email','webhook'].map(function(c){ return '<option value="' + c + '"' + (ch.channel === c ? ' selected' : '') + '>' + c + '</option>'; }).join('')
+                  + '</select>'
+                  + '<input type="text" value="' + R.esc(ch.target || '') + '" placeholder="channel id, #channel, email, URL…" oninput="window.RoutinesUI&&RoutinesUI.updateChannel(' + idx + ',\\x27target\\x27,this.value)" style="flex:1;min-width:200px;padding:6px 10px;border:1px solid var(--border);border-radius:4px;background:var(--bg-input);color:var(--text-primary);font-size:12px">'
+                  + '</div>'
+                  + '<textarea rows="3" placeholder="Message content (supports {{steps.x}})" oninput="window.RoutinesUI&&RoutinesUI.updateChannel(' + idx + ',\\x27content\\x27,this.value)" style="width:100%;padding:8px;border:1px solid var(--border);border-radius:4px;background:var(--bg-input);color:var(--text-primary);font-size:12px;font-family:inherit;resize:vertical;box-sizing:border-box">' + R.esc(ch.content || '') + '</textarea>';
+              case 'transform':
+                var tr = step.transform || { expression: '' };
+                return '<label style="display:block;font-size:10px;color:var(--text-muted);margin-bottom:4px">Expression (sandboxed JS; returns the step output)</label>'
+                  + '<textarea rows="3" oninput="window.RoutinesUI&&RoutinesUI.updateTransform(' + idx + ',this.value)" placeholder="e.g. steps.s1.items.filter(x =&gt; x.urgent)" style="width:100%;padding:8px;border:1px solid var(--border);border-radius:4px;background:var(--bg-input);color:var(--text-primary);font-size:12px;font-family:\\x27JetBrains Mono\\x27,monospace;resize:vertical;box-sizing:border-box">' + R.esc(tr.expression || '') + '</textarea>';
+              case 'loop':
+                var lp = step.loop || { items: '', bodyStepIds: [] };
+                return '<label style="display:block;font-size:10px;color:var(--text-muted);margin-bottom:4px">Items expression (yields an array)</label>'
+                  + '<input type="text" value="' + R.esc(lp.items || '') + '" placeholder="e.g. steps.s1.results" oninput="window.RoutinesUI&&RoutinesUI.updateLoop(' + idx + ',\\x27items\\x27,this.value)" style="width:100%;padding:6px 10px;border:1px solid var(--border);border-radius:4px;background:var(--bg-input);color:var(--text-primary);font-size:12px;font-family:\\x27JetBrains Mono\\x27,monospace;margin-bottom:6px;box-sizing:border-box">'
+                  + '<label style="display:block;font-size:10px;color:var(--text-muted);margin-bottom:4px">Body step ids (comma-separated)</label>'
+                  + '<input type="text" value="' + R.esc((lp.bodyStepIds || []).join(', ')) + '" oninput="window.RoutinesUI&&RoutinesUI.updateLoop(' + idx + ',\\x27bodyStepIds\\x27,this.value)" style="width:100%;padding:6px 10px;border:1px solid var(--border);border-radius:4px;background:var(--bg-input);color:var(--text-primary);font-size:11px;font-family:\\x27JetBrains Mono\\x27,monospace;box-sizing:border-box">';
+              default:
+                return '<em style="font-size:11px;color:var(--text-muted)">Unknown step kind: ' + R.esc(kind) + '</em>';
+            }
+          },
+          markDirty: function() {
+            if (!R.state.editing) return;
+            R.state.editing.dirty = true;
+            // Sync header inputs back to the routine.
+            var nm = document.getElementById('re-name'); if (nm) R.state.editing.routine.name = nm.value;
+            var de = document.getElementById('re-description'); if (de) R.state.editing.routine.description = de.value;
+            var sc = document.getElementById('re-schedule'); if (sc) {
+              var v = sc.value.trim();
+              R.state.editing.routine.trigger = v ? { schedule: v, manual: false } : { manual: true };
+            }
+            var en = document.getElementById('re-enabled'); if (en) R.state.editing.routine.enabled = en.checked;
+            R.setStatus('Unsaved changes');
+          },
+          updateStep: function(idx, field, value) {
+            if (!R.state.editing) return;
+            R.state.editing.routine.steps[idx][field] = value;
+            R.markDirty();
+          },
+          updateStepDeps: function(idx, csv) {
+            if (!R.state.editing) return;
+            R.state.editing.routine.steps[idx].dependsOn = csv.split(',').map(function(s){ return s.trim(); }).filter(function(s){ return s; });
+            R.markDirty();
+          },
+          updateMcp: function(idx, field, value) {
+            if (!R.state.editing) return;
+            var s = R.state.editing.routine.steps[idx];
+            s.mcp = s.mcp || { server: '', tool: '', inputs: {} };
+            s.mcp[field] = value;
+            if (field === 'server') s.mcp.tool = '';  // reset tool when server changes
+            R.markDirty();
+            R.renderEditor();  // re-render so tool dropdown updates
+          },
+          updateMcpInputs: function(idx, json) {
+            if (!R.state.editing) return;
+            var s = R.state.editing.routine.steps[idx];
+            s.mcp = s.mcp || { server: '', tool: '', inputs: {} };
+            try { s.mcp.inputs = JSON.parse(json); R.setStatus(''); }
+            catch (e) { R.setStatus('Invalid JSON in step ' + s.id + ' inputs (will not save until fixed)'); return; }
+            R.markDirty();
+          },
+          updateCli: function(idx, field, value) {
+            if (!R.state.editing) return;
+            var s = R.state.editing.routine.steps[idx];
+            s.cli = s.cli || { cmd: '', args: [] };
+            s.cli[field] = value;
+            R.markDirty();
+          },
+          updateCliArgs: function(idx, txt) {
+            if (!R.state.editing) return;
+            var s = R.state.editing.routine.steps[idx];
+            s.cli = s.cli || { cmd: '', args: [] };
+            s.cli.args = txt.split('\\n').map(function(l){ return l.trim(); }).filter(function(l){ return l; });
+            R.markDirty();
+          },
+          updateConditional: function(idx, field, value) {
+            if (!R.state.editing) return;
+            var s = R.state.editing.routine.steps[idx];
+            s.conditional = s.conditional || { condition: '', trueNext: [], falseNext: [] };
+            if (field === 'trueNext' || field === 'falseNext') {
+              s.conditional[field] = String(value).split(',').map(function(x){ return x.trim(); }).filter(function(x){ return x; });
+            } else {
+              s.conditional[field] = value;
+            }
+            R.markDirty();
+          },
+          updateChannel: function(idx, field, value) {
+            if (!R.state.editing) return;
+            var s = R.state.editing.routine.steps[idx];
+            s.channel = s.channel || { channel: 'discord', target: '', content: '' };
+            s.channel[field] = value;
+            R.markDirty();
+          },
+          updateTransform: function(idx, value) {
+            if (!R.state.editing) return;
+            var s = R.state.editing.routine.steps[idx];
+            s.transform = { expression: value };
+            R.markDirty();
+          },
+          updateLoop: function(idx, field, value) {
+            if (!R.state.editing) return;
+            var s = R.state.editing.routine.steps[idx];
+            s.loop = s.loop || { items: '', bodyStepIds: [] };
+            if (field === 'bodyStepIds') {
+              s.loop.bodyStepIds = String(value).split(',').map(function(x){ return x.trim(); }).filter(function(x){ return x; });
+            } else {
+              s.loop.items = value;
+            }
+            R.markDirty();
+          },
+          moveStep: function(idx, dir) {
+            if (!R.state.editing) return;
+            var steps = R.state.editing.routine.steps;
+            var j = idx + dir;
+            if (j < 0 || j >= steps.length) return;
+            var t = steps[idx]; steps[idx] = steps[j]; steps[j] = t;
+            R.markDirty();
+            R.renderEditor();
+          },
+          removeStep: function(idx) {
+            if (!R.state.editing) return;
+            if (R.state.editing.routine.steps.length <= 1) { alert('A routine must have at least one step.'); return; }
+            if (!confirm('Remove this step?')) return;
+            var removed = R.state.editing.routine.steps.splice(idx, 1)[0];
+            // Strip lingering dependsOn references.
+            for (var i = 0; i < R.state.editing.routine.steps.length; i++) {
+              R.state.editing.routine.steps[i].dependsOn = (R.state.editing.routine.steps[i].dependsOn || []).filter(function(d){ return d !== removed.id; });
+            }
+            R.markDirty();
+            R.renderEditor();
+          },
+          // ── step picker ─────────────────────────────────────────────
+          openStepPicker: function() {
+            var modal = document.getElementById('routines-step-picker');
+            var body = document.getElementById('routines-step-picker-body');
+            if (!modal || !body) return;
+            var kinds = [
+              { kind: 'prompt', label: 'Prompt', desc: 'Send a prompt to the agent. Use this when the work needs reasoning or freeform tools.' },
+              { kind: 'mcp', label: 'MCP tool', desc: 'Call a specific MCP server tool (Composio, Claude integrations, local MCP).' },
+              { kind: 'cli', label: 'Local CLI', desc: 'Run an installed CLI (sf, gh, gcloud, …) and capture stdout.' },
+              { kind: 'conditional', label: 'If / Else', desc: 'Branch on a JS expression evaluated against prior step outputs.' },
+              { kind: 'channel', label: 'Channel send', desc: 'Send a message to Discord, Slack, Telegram, email, or webhook.' },
+              { kind: 'transform', label: 'Transform', desc: 'Sandboxed JS expression that reshapes prior step output.' },
+              { kind: 'loop', label: 'Loop', desc: 'Iterate over an array; runs the listed body steps for each item.' },
+            ];
+            body.innerHTML = kinds.map(function(k){
+              return '<div onclick="window.RoutinesUI&&RoutinesUI.addStep(\\x27' + k.kind + '\\x27)" style="padding:12px 14px;border:1px solid var(--border);border-radius:6px;margin-bottom:8px;cursor:pointer;background:var(--bg-tertiary)"><div style="font-weight:600;font-size:13px;color:var(--text-primary);margin-bottom:3px">' + k.label + '</div><div style="font-size:11px;color:var(--text-muted)">' + k.desc + '</div></div>';
+            }).join('');
+            modal.style.display = 'flex';
+          },
+          closeStepPicker: function() {
+            var m = document.getElementById('routines-step-picker'); if (m) m.style.display = 'none';
+          },
+          addStep: function(kind) {
+            if (!R.state.editing) return;
+            var steps = R.state.editing.routine.steps;
+            var n = steps.length + 1;
+            var nextId = 's' + n;
+            while (steps.some(function(s){ return s.id === nextId; })) { n++; nextId = 's' + n; }
+            var step = { id: nextId, prompt: '', dependsOn: steps.length ? [steps[steps.length - 1].id] : [], tier: 1, maxTurns: 15 };
+            if (kind !== 'prompt') step.kind = kind;
+            if (kind === 'mcp') step.mcp = { server: '', tool: '', inputs: {} };
+            if (kind === 'cli') step.cli = { cmd: '', args: [], timeoutMs: 60000 };
+            if (kind === 'conditional') step.conditional = { condition: '', trueNext: [], falseNext: [] };
+            if (kind === 'channel') step.channel = { channel: 'discord', target: '', content: '' };
+            if (kind === 'transform') step.transform = { expression: '' };
+            if (kind === 'loop') step.loop = { items: '', bodyStepIds: [] };
+            steps.push(step);
+            R.markDirty();
+            R.closeStepPicker();
+            R.renderEditor();
+          },
+          // ── editor actions ──────────────────────────────────────────
+          saveCurrent: function() {
+            if (!R.state.editing) return;
+            R.markDirty();  // capture latest header values
+            var btn = document.getElementById('re-save-btn');
+            if (btn) btn.textContent = 'Saving…';
+            fetch('/api/routines/' + encodeURIComponent(R.state.editing.id), {
+              method: 'PUT',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ routine: R.state.editing.routine })
+            }).then(function(r){ return r.json().then(function(j){ return { ok: r.ok, status: r.status, body: j }; }); })
+              .then(function(res){
+                if (btn) btn.textContent = 'Save';
+                if (!res.ok) {
+                  if (res.body.error === 'validation') {
+                    var msg = (res.body.validation.issues || []).map(function(i){ return '• ' + i.severity + ': ' + i.message; }).join('\\n');
+                    if (confirm('Validation issues:\\n\\n' + msg + '\\n\\nSave anyway?')) {
+                      fetch('/api/routines/' + encodeURIComponent(R.state.editing.id), {
+                        method: 'PUT',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ routine: R.state.editing.routine, force: true })
+                      }).then(function(){ R.state.editing.dirty = false; R.setStatus('Saved (with warnings)'); R.refreshList(); });
+                    }
+                    return;
+                  }
+                  R.setStatus('Save failed: ' + (res.body.error || res.body.detail || 'unknown'));
+                  return;
+                }
+                R.state.editing.dirty = false;
+                R.setStatus('Saved.');
+                R.refreshList();
+              }).catch(function(err){
+                if (btn) btn.textContent = 'Save';
+                R.setStatus('Save error: ' + err);
+              });
+          },
+          runCurrent: function() {
+            if (!R.state.editing) return;
+            if (R.state.editing.dirty && !confirm('You have unsaved changes. Run anyway (using last saved version)?')) return;
+            R.run(R.state.editing.id);
+          },
+          dryRunCurrent: function() {
+            if (!R.state.editing) return;
+            fetch('/api/routines/' + encodeURIComponent(R.state.editing.id) + '/dry-run', { method: 'POST' })
+              .then(function(r){ return r.json(); })
+              .then(function(d){
+                var lines = ['Dry-run for ' + R.state.editing.routine.name + ':\\n'];
+                (d.steps || []).forEach(function(s){ lines.push('• ' + s.description + (s.warnings.length ? '\\n   ⚠ ' + s.warnings.join('; ') : '')); });
+                if (d.notes && d.notes.length) lines.push('\\n' + d.notes.join('\\n'));
+                alert(lines.join('\\n'));
+              }).catch(function(err){ alert('Dry-run failed: ' + err); });
+          },
+          testCurrent: function() {
+            if (!R.state.editing) return;
+            fetch('/api/routines/' + encodeURIComponent(R.state.editing.id) + '/test', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ mode: 'mock' })
+            }).then(function(r){ return r.json(); }).then(function(d){
+              if (d.ok) R.setStatus('Mock test started (runId: ' + d.runId + '). See run history for output.');
+              else R.setStatus('Test failed to start: ' + (d.error || 'unknown'));
+            }).catch(function(err){ R.setStatus('Test error: ' + err); });
+          },
+          deleteCurrent: function() {
+            if (!R.state.editing) return;
+            if (!confirm('Delete routine "' + R.state.editing.routine.name + '"? This is permanent.')) return;
+            fetch('/api/routines/' + encodeURIComponent(R.state.editing.id), { method: 'DELETE' })
+              .then(function(r){ return r.json(); })
+              .then(function(j){
+                if (j.ok) { R.state.editing = null; R.closeEditor(); R.refreshList(); }
+                else alert('Delete failed: ' + (j.error || 'unknown'));
+              }).catch(function(err){ alert('Delete error: ' + err); });
+          },
+          setStatus: function(msg) {
+            var el = document.getElementById('re-status');
+            if (el) el.textContent = msg || '';
+          },
+          flash: function(msg) {
+            // Lightweight toast — reuse existing flash if available, else log.
+            if (window.flashMessage) window.flashMessage(msg);
+            else if (window.console) console.log('[routines]', msg);
+          },
+          // ── runs drawer ─────────────────────────────────────────────
+          openRuns: function(id) {
+            if (!id) return;
+            var drawer = document.getElementById('routines-runs-drawer');
+            if (!drawer) return;
+            drawer.innerHTML = '<div style="padding:18px"><div style="display:flex;align-items:center;gap:8px;margin-bottom:10px"><h3 style="margin:0;font-size:15px;font-weight:600;color:var(--text-primary)">Run history</h3><span style="flex:1"></span><button onclick="window.RoutinesUI&&RoutinesUI.closeRuns()" style="background:none;border:none;color:var(--text-muted);font-size:18px;cursor:pointer">&times;</button></div><div style="font-size:12px;color:var(--text-muted)">Loading…</div></div>';
+            drawer.style.display = 'block';
+            fetch('/api/routines/' + encodeURIComponent(id) + '/runs').then(function(r){ return r.json(); }).then(function(d){
+              var runs = d.runs || [];
+              var html = '<div style="padding:18px"><div style="display:flex;align-items:center;gap:8px;margin-bottom:14px"><h3 style="margin:0;font-size:15px;font-weight:600;color:var(--text-primary)">Run history</h3><span style="flex:1"></span><button onclick="window.RoutinesUI&&RoutinesUI.closeRuns()" style="background:none;border:none;color:var(--text-muted);font-size:18px;cursor:pointer">&times;</button></div>';
+              if (runs.length === 0) {
+                html += '<div style="font-size:12px;color:var(--text-muted);padding:24px 0;text-align:center">No runs yet.</div>';
+              } else {
+                html += runs.map(function(run){
+                  var when = run.startedAt || run.timestamp || '';
+                  var status = run.status || 'unknown';
+                  var color = { ok: 'var(--green)', error: 'var(--red)', partial: '#f5a623', skipped: 'var(--text-muted)', retried: '#f5a623' }[status] || 'var(--text-muted)';
+                  var dur = run.durationMs ? Math.round(run.durationMs / 100) / 10 + 's' : '';
+                  var preview = run.outputPreview || run.output_preview || run.outputPreview || '';
+                  return '<div style="background:var(--bg-tertiary);border:1px solid var(--border);border-radius:6px;padding:10px 14px;margin-bottom:8px"><div style="display:flex;align-items:center;gap:10px;font-size:12px"><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:' + color + '"></span><span style="color:var(--text-primary);font-weight:500">' + R.esc(status) + '</span><span style="color:var(--text-muted)">' + R.esc(when) + '</span><span style="flex:1"></span><span style="color:var(--text-muted);font-size:11px">' + dur + '</span></div>' + (preview ? '<div style="margin-top:8px;font-size:11px;color:var(--text-secondary);font-family:\\x27JetBrains Mono\\x27,monospace;white-space:pre-wrap;max-height:120px;overflow:auto">' + R.esc(String(preview).slice(0, 800)) + '</div>' : '') + '</div>';
+                }).join('');
+              }
+              html += '</div>';
+              drawer.innerHTML = html;
+            }).catch(function(err){
+              drawer.innerHTML = '<div style="padding:18px"><div style="display:flex;align-items:center;gap:8px"><h3 style="margin:0;font-size:15px;font-weight:600">Run history</h3><span style="flex:1"></span><button onclick="window.RoutinesUI&&RoutinesUI.closeRuns()" style="background:none;border:none;color:var(--text-muted);font-size:18px;cursor:pointer">&times;</button></div><div style="margin-top:14px;font-size:12px;color:var(--red)">Failed to load: ' + R.esc(String(err)) + '</div></div>';
+            });
+          },
+          closeRuns: function() {
+            var d = document.getElementById('routines-runs-drawer'); if (d) d.style.display = 'none';
+          },
+          // ── create modal ────────────────────────────────────────────
+          openCreate: function() {
+            var m = document.getElementById('routines-create-modal'); if (!m) return;
+            document.getElementById('routines-create-name').value = '';
+            document.getElementById('routines-create-description').value = '';
+            document.getElementById('routines-create-schedule').value = '';
+            m.style.display = 'flex';
+          },
+          closeCreate: function() {
+            var m = document.getElementById('routines-create-modal'); if (m) m.style.display = 'none';
+          },
+          submitCreate: function() {
+            var name = document.getElementById('routines-create-name').value.trim();
+            if (!name) { alert('Name is required'); return; }
+            var body = {
+              name: name,
+              description: document.getElementById('routines-create-description').value.trim(),
+              schedule: document.getElementById('routines-create-schedule').value.trim() || undefined,
+              agent: document.getElementById('routines-create-owner').value || undefined,
+            };
+            fetch('/api/routines', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(body)
+            }).then(function(r){ return r.json().then(function(j){ return { ok: r.ok, body: j }; }); })
+              .then(function(res){
+                if (!res.ok) { alert('Create failed: ' + (res.body.error || 'unknown')); return; }
+                R.closeCreate();
+                R.refreshList();
+                R.openEditor(res.body.id);
+              }).catch(function(err){ alert('Create error: ' + err); });
+          },
+          // ── assist (generate from prompt) ───────────────────────────
+          openAssist: function() {
+            var m = document.getElementById('routines-assist-modal'); if (!m) return;
+            document.getElementById('routines-assist-input').value = '';
+            document.getElementById('routines-assist-status').textContent = '';
+            m.style.display = 'flex';
+            setTimeout(function(){ document.getElementById('routines-assist-input').focus(); }, 50);
+          },
+          closeAssist: function() {
+            var m = document.getElementById('routines-assist-modal'); if (m) m.style.display = 'none';
+          },
+          submitAssist: function() {
+            if (R.state.assistBusy) return;
+            var prompt = document.getElementById('routines-assist-input').value.trim();
+            if (!prompt) return;
+            R.state.assistBusy = true;
+            var btn = document.getElementById('routines-assist-submit');
+            var status = document.getElementById('routines-assist-status');
+            if (btn) { btn.textContent = 'Generating…'; btn.disabled = true; }
+            if (status) status.textContent = 'Asking the assistant to draft a routine…';
+            // Reuse the existing /api/builder/chat which is already wired and
+            // produces workflow drafts. We also pass mode hint so the agent
+            // knows to focus on building one routine.
+            fetch('/api/builder/chat', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ message: prompt, mode: 'workflow' })
+            }).then(function(r){ return r.json(); }).then(function(d){
+              R.state.assistBusy = false;
+              if (btn) { btn.textContent = 'Generate'; btn.disabled = false; }
+              if (status) status.textContent = d && d.message ? 'Draft created. Refreshing list…' : 'Draft response received.';
+              R.refreshList();
+              setTimeout(function(){ R.closeAssist(); }, 800);
+            }).catch(function(err){
+              R.state.assistBusy = false;
+              if (btn) { btn.textContent = 'Generate'; btn.disabled = false; }
+              if (status) status.textContent = 'Assist failed: ' + err;
+            });
+          },
+          // ── helpers ─────────────────────────────────────────────────
+          esc: function(s) {
+            if (s == null) return '';
+            return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+          },
+        };
+        window.RoutinesUI = R;
+        // Compatibility shims for legacy callers in other parts of the dashboard.
+        // The old switchBuildTab(tab) is referenced from KPI tiles, getting-started cards,
+        // and the navigateTo dispatcher. Map them all to the unified Routines view.
+        if (typeof window.switchBuildTab !== 'function' || true) {
+          window.switchBuildTab = function() { try { R.init(); } catch (e) { /* */ } };
+        }
+        // Auto-init when the user lands on the build page.
+        document.addEventListener('DOMContentLoaded', function() {
+          var nav = document.querySelector('[data-page="build"]');
+          if (nav) nav.addEventListener('click', function() { setTimeout(function() { R.init(); }, 50); });
+          // If page-build is already active on load (deep-link), init now.
+          var page = document.getElementById('page-build');
+          if (page && page.classList.contains('active')) R.init();
+        });
+      })();
+    </script>
 
     <!-- page-agent-detail merged into Team page; click an agent in Roster to drill down. -->
 
@@ -15000,6 +15887,21 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
                 <span style="font-size:11px;color:var(--text-muted)">What the agent captured, with reason &amp; salience</span>
               </div>
               <div class="card-body" id="panel-recent-writes" style="padding:0">
+                <div class="skel-block" style="padding:14px"><div class="skel-row med"></div><div class="skel-row short"></div></div>
+              </div>
+            </div>
+            <div class="card" style="margin-bottom:14px">
+              <div class="card-header" style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap">
+                <span>Persistent learnings</span>
+                <div style="display:flex;align-items:center;gap:8px">
+                  <select id="learnings-filter-scope" onchange="refreshLearnings()" style="font-size:12px;padding:4px 6px;border:1px solid var(--border);border-radius:4px;background:var(--bg-input);color:var(--text)">
+                    <option value="active" selected>Active</option>
+                    <option value="all">Active + superseded + cancelled</option>
+                  </select>
+                  <span style="font-size:11px;color:var(--text-muted)">Distilled durable beliefs from past sessions</span>
+                </div>
+              </div>
+              <div class="card-body" id="panel-learnings" style="padding:0">
                 <div class="skel-block" style="padding:14px"><div class="skel-row med"></div><div class="skel-row short"></div></div>
               </div>
             </div>
@@ -18548,6 +19450,7 @@ function switchTab(group, tab) {
       if (typeof refreshRecentWrites === 'function') refreshRecentWrites();
       if (typeof refreshRecentEpisodes === 'function') refreshRecentEpisodes();
       if (typeof refreshCommitments === 'function') refreshCommitments();
+      if (typeof refreshLearnings === 'function') refreshLearnings();
       if (typeof refreshSupersedes === 'function') refreshSupersedes();
       if (typeof refreshCoverageStrip === 'function') refreshCoverageStrip();
     }
@@ -24907,6 +25810,7 @@ async function submitQuickAddMemory() {
       if (typeof refreshRecentWrites === 'function') refreshRecentWrites();
       if (typeof refreshRecentEpisodes === 'function') refreshRecentEpisodes();
       if (typeof refreshCommitments === 'function') refreshCommitments();
+      if (typeof refreshLearnings === 'function') refreshLearnings();
       if (typeof refreshMemory === 'function') refreshMemory();
     }, 600);
   } catch (err) {
@@ -25057,6 +25961,71 @@ async function refreshRecentWrites() {
     el.innerHTML = html;
   } catch (err) {
     el.innerHTML = '<div class="empty-state" style="padding:14px">Failed to load: ' + esc(String(err)) + '</div>';
+  }
+}
+
+async function refreshLearnings() {
+  var el = document.getElementById('panel-learnings');
+  if (!el) return;
+  try {
+    var sel = document.getElementById('learnings-filter-scope');
+    var scope = sel ? sel.value : 'active';
+    var url = '/api/memory/learnings?limit=100' + (scope === 'all' ? '&all=1' : '');
+    var r = await apiFetch(url);
+    var d = await r.json();
+    if (!d.ok || !Array.isArray(d.facts)) {
+      el.innerHTML = '<div class="empty-state" style="padding:14px">' + esc(d.error || 'No data') + '</div>';
+      return;
+    }
+    if (d.facts.length === 0) {
+      el.innerHTML = '<div class="empty-state" style="padding:14px">No persistent learnings yet. They land automatically when episode consolidation extracts a durable user preference, fact, goal, or workflow pattern.</div>';
+      return;
+    }
+    var html = '<table class="data-table" style="width:100%">';
+    html += '<thead><tr>'
+      + '<th style="width:90px">Kind</th>'
+      + '<th>Belief</th>'
+      + '<th style="width:120px">Status</th>'
+      + '<th style="width:140px">Captured</th>'
+      + '<th style="width:140px">Actions</th>'
+      + '</tr></thead><tbody>';
+    var kindColors = { preference: '#a78bfa', fact: '#10b981', goal: '#f59e0b', workflow: '#06b6d4' };
+    for (var i = 0; i < d.facts.length; i++) {
+      var f = d.facts[i];
+      var color = kindColors[f.kind] || 'var(--text-muted)';
+      var statusBadge = '';
+      if (f.status === 'active') statusBadge = '<span style="color:#10b981">active</span>';
+      else if (f.status === 'superseded') statusBadge = '<span style="color:var(--text-muted)">superseded → #' + (f.supersededById || '?') + '</span>';
+      else if (f.status === 'cancelled') statusBadge = '<span style="color:#ef4444">cancelled</span>';
+      else statusBadge = esc(f.status || '');
+      var when = '';
+      try { when = new Date(f.createdAt + 'Z').toLocaleString(); } catch { when = f.createdAt; }
+      var actions = '';
+      if (f.status === 'active') actions = '<button class="btn-sm" onclick="learningAction(' + f.id + ', \\'cancel\\')">Cancel</button>';
+      else if (f.status === 'cancelled') actions = '<button class="btn-sm" onclick="learningAction(' + f.id + ', \\'reinstate\\')">Reinstate</button>';
+      html += '<tr>'
+        + '<td style="font-size:11px;color:' + color + ';font-weight:600">' + esc(f.kind) + '</td>'
+        + '<td style="font-size:12px">' + esc(f.text) + '</td>'
+        + '<td style="font-size:11px">' + statusBadge + '</td>'
+        + '<td style="font-size:11px;color:var(--text-muted)">' + esc(when) + '</td>'
+        + '<td>' + actions + '</td>'
+        + '</tr>';
+    }
+    html += '</tbody></table>';
+    el.innerHTML = html;
+  } catch (err) {
+    el.innerHTML = '<div class="empty-state" style="padding:14px">Failed to load: ' + esc(String(err)) + '</div>';
+  }
+}
+
+async function learningAction(id, action) {
+  try {
+    var r = await apiJson('POST', '/api/memory/learnings/action', { id: id, action: action });
+    if (r.error) { toast('Action failed: ' + r.error, 'error'); return; }
+    toast('Learning ' + action, 'success');
+    refreshLearnings();
+  } catch (err) {
+    toast('Failed: ' + String(err), 'error');
   }
 }
 

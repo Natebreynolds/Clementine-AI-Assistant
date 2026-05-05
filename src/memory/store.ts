@@ -1079,6 +1079,40 @@ export class MemoryStore {
       );
     `);
 
+    // Learned facts — durable beliefs and preferences extracted from
+    // consolidated episodes. Distinct from chunks (which are vault-level
+    // knowledge) and from user_model_blocks (which is a free-form
+    // accumulation buffer). Supersession is first-class: when a new fact
+    // contradicts an old one, the old row's status becomes 'superseded'
+    // and superseded_by_id links to the replacement, so the dashboard can
+    // show the lineage and the prompt-injection path can filter to active.
+    this.conn.exec(`
+      CREATE TABLE IF NOT EXISTS learned_facts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        fingerprint TEXT NOT NULL UNIQUE,
+        kind TEXT NOT NULL,
+        text TEXT NOT NULL,
+        source_episode_id INTEGER,
+        status TEXT NOT NULL DEFAULT 'active',
+        created_at TEXT DEFAULT (datetime('now')),
+        superseded_at TEXT,
+        superseded_by_id INTEGER,
+        cancelled_at TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_learned_facts_active ON learned_facts(status, created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_learned_facts_kind ON learned_facts(kind, status);
+    `);
+
+    // Episode supersession — when a new episode replaces a prior one's
+    // conclusion (e.g., yesterday "decided X", today "actually switching
+    // to Y"). Lets recall prefer the canonical / current record.
+    try {
+      this.conn.exec('ALTER TABLE episodes ADD COLUMN superseded_by_id INTEGER');
+    } catch { /* column already exists */ }
+    try {
+      this.conn.exec('ALTER TABLE episodes ADD COLUMN superseded_at TEXT');
+    } catch { /* column already exists */ }
+
     // Commitments — first-class promises in either direction. owner = 'user'
     // for "I'll fix that tomorrow" turns, 'clementine' for things she
     // committed to do. fingerprint = sha1(session_key|owner|normalized_text)
@@ -4119,6 +4153,155 @@ export class MemoryStore {
       .filter(e => e.count >= minCount);
     all.sort((a, b) => b.count - a.count || a.name.length - b.name.length);
     return all.slice(0, maxItems);
+  }
+
+  // ── Learned facts (durable cross-session learnings) ──────────────
+
+  /**
+   * Insert a learned fact, deduping on fingerprint. Caller computes
+   * fingerprint deterministically (sha1 of kind|normalized_text) so the
+   * episode extractor can't double-record the same belief across passes.
+   */
+  upsertLearnedFact(entry: {
+    fingerprint: string;
+    kind: 'preference' | 'fact' | 'goal' | 'workflow';
+    text: string;
+    sourceEpisodeId?: number | null;
+  }): { id: number; created: boolean } {
+    const existing = this.conn
+      .prepare('SELECT id FROM learned_facts WHERE fingerprint = ?')
+      .get(entry.fingerprint) as { id: number } | undefined;
+    if (existing) return { id: existing.id, created: false };
+    const result = this.conn
+      .prepare(
+        `INSERT INTO learned_facts (fingerprint, kind, text, source_episode_id)
+         VALUES (?, ?, ?, ?)`,
+      )
+      .run(entry.fingerprint, entry.kind, entry.text, entry.sourceEpisodeId ?? null);
+    return { id: result.lastInsertRowid as number, created: true };
+  }
+
+  /**
+   * Mark `oldId` as superseded by `newId` and stamp the supersession time.
+   * Idempotent — re-running on an already-superseded row is a no-op.
+   */
+  supersedeLearnedFact(oldId: number, newId: number): boolean {
+    const result = this.conn
+      .prepare(
+        `UPDATE learned_facts
+         SET status = 'superseded', superseded_by_id = ?, superseded_at = datetime('now')
+         WHERE id = ? AND status = 'active'`,
+      )
+      .run(newId, oldId);
+    return result.changes > 0;
+  }
+
+  /** Cancel / reactivate a learned fact (dashboard action). */
+  setLearnedFactStatus(id: number, status: 'active' | 'cancelled'): boolean {
+    if (status === 'cancelled') {
+      const result = this.conn
+        .prepare(`UPDATE learned_facts SET status = 'cancelled', cancelled_at = datetime('now') WHERE id = ?`)
+        .run(id);
+      return result.changes > 0;
+    }
+    const result = this.conn
+      .prepare(`UPDATE learned_facts SET status = 'active', cancelled_at = NULL WHERE id = ?`)
+      .run(id);
+    return result.changes > 0;
+  }
+
+  /**
+   * List active (non-superseded, non-cancelled) learned facts. Used by the
+   * router to inject [Persistent learnings] into prompts and by the
+   * episode extractor to feed contradiction-detection context to the LLM.
+   */
+  listActiveLearnedFacts(opts: { kind?: string; limit?: number } = {}): Array<{
+    id: number;
+    fingerprint: string;
+    kind: 'preference' | 'fact' | 'goal' | 'workflow';
+    text: string;
+    sourceEpisodeId: number | null;
+    createdAt: string;
+  }> {
+    const params: unknown[] = [];
+    let where = "status = 'active'";
+    if (opts.kind) { where += ' AND kind = ?'; params.push(opts.kind); }
+    const limit = Math.max(1, Math.min(opts.limit ?? 50, 500));
+    params.push(limit);
+    const rows = this.conn
+      .prepare(`SELECT id, fingerprint, kind, text, source_episode_id, created_at
+                FROM learned_facts WHERE ${where}
+                ORDER BY created_at DESC LIMIT ?`)
+      .all(...params) as Array<{
+        id: number; fingerprint: string; kind: string; text: string;
+        source_episode_id: number | null; created_at: string;
+      }>;
+    return rows.map(r => ({
+      id: r.id,
+      fingerprint: r.fingerprint,
+      kind: r.kind as 'preference' | 'fact' | 'goal' | 'workflow',
+      text: r.text,
+      sourceEpisodeId: r.source_episode_id,
+      createdAt: r.created_at,
+    }));
+  }
+
+  /** List all (active + superseded + cancelled) for the dashboard. */
+  listAllLearnedFacts(opts: { limit?: number } = {}): Array<{
+    id: number; kind: string; text: string; status: string;
+    sourceEpisodeId: number | null; createdAt: string;
+    supersededAt: string | null; supersededById: number | null; cancelledAt: string | null;
+  }> {
+    const limit = Math.max(1, Math.min(opts.limit ?? 100, 1000));
+    const rows = this.conn
+      .prepare(`SELECT id, kind, text, status, source_episode_id, created_at,
+                       superseded_at, superseded_by_id, cancelled_at
+                FROM learned_facts ORDER BY created_at DESC LIMIT ?`)
+      .all(limit) as Array<{
+        id: number; kind: string; text: string; status: string;
+        source_episode_id: number | null; created_at: string;
+        superseded_at: string | null; superseded_by_id: number | null; cancelled_at: string | null;
+      }>;
+    return rows.map(r => ({
+      id: r.id,
+      kind: r.kind,
+      text: r.text,
+      status: r.status,
+      sourceEpisodeId: r.source_episode_id,
+      createdAt: r.created_at,
+      supersededAt: r.superseded_at,
+      supersededById: r.superseded_by_id,
+      cancelledAt: r.cancelled_at,
+    }));
+  }
+
+  /**
+   * Find an active learned fact whose text fuzzy-matches the supplied
+   * phrase. Used by the consolidation extractor to resolve `supersedes`
+   * hints emitted by the LLM ("user prefers detailed responses") to the
+   * actual stored row id, even if the wording isn't identical. Match is
+   * case-insensitive substring with a word-overlap bias.
+   */
+  findActiveLearnedFactByPhrase(phrase: string): { id: number; text: string; kind: string } | null {
+    const needle = phrase.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').replace(/\s+/g, ' ').trim();
+    if (!needle || needle.length < 4) return null;
+    const rows = this.conn
+      .prepare(`SELECT id, kind, text FROM learned_facts WHERE status = 'active' ORDER BY created_at DESC LIMIT 200`)
+      .all() as Array<{ id: number; kind: string; text: string }>;
+    let best: { id: number; text: string; kind: string; score: number } | null = null;
+    const needleTokens = new Set(needle.split(' ').filter(t => t.length >= 4));
+    for (const r of rows) {
+      const candidate = r.text.toLowerCase();
+      let score = 0;
+      if (candidate.includes(needle)) score += 5;
+      else if (needle.includes(candidate)) score += 4;
+      let overlap = 0;
+      for (const t of needleTokens) if (candidate.includes(t)) overlap++;
+      score += overlap;
+      if (overlap === 0 && score === 0) continue;
+      if (!best || score > best.score) best = { id: r.id, text: r.text, kind: r.kind, score };
+    }
+    return best && best.score >= 2 ? { id: best.id, text: best.text, kind: best.kind } : null;
   }
 
   // ── Commitments ───────────────────────────────────────────────────

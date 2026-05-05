@@ -2073,6 +2073,30 @@ export class Gateway {
           if (recallBlock) {
             securityAnnotation = (securityAnnotation ? `${securityAnnotation}\n\n` : '') + recallBlock;
           }
+          // Persistent learnings — durable cross-session beliefs distilled
+          // from prior episodes. Suppressed on greetings/acks to keep small
+          // talk light, like the rest of the context governance layer.
+          if (contextDecision.turnIntent !== 'greeting' && contextDecision.turnIntent !== 'ack'
+              && this.isTrustedPersonalSession(sessionKey)) {
+            try {
+              const store = this.assistant.getMemoryStore?.();
+              if (store && typeof (store as { listActiveLearnedFacts?: unknown }).listActiveLearnedFacts === 'function') {
+                const facts = (store as {
+                  listActiveLearnedFacts: (o: { limit: number }) => Array<{ kind: string; text: string }>;
+                }).listActiveLearnedFacts({ limit: 20 });
+                if (facts.length > 0) {
+                  const lines = facts.map(f => `- [${f.kind}] ${f.text}`);
+                  const block = [
+                    '[Context governance: persistent learnings]',
+                    'REFERENCE ONLY — durable beliefs distilled from prior conversations. Treat as authoritative for preferences and stable facts; if a learning here contradicts a recent message, ask before acting on the older belief.',
+                    ...lines,
+                    '[/Context governance: persistent learnings]',
+                  ].join('\n');
+                  securityAnnotation = (securityAnnotation ? `${securityAnnotation}\n\n` : '') + block;
+                }
+              }
+            } catch { /* persistent-learnings injection is best-effort */ }
+          }
         }
 
         const activeToolset = this.getSessionToolset(sessionKey);

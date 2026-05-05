@@ -72,6 +72,7 @@ const STUB_EXTRACTION: EpisodeExtraction = {
   commitments: [
     { text: "I'll wire the middleware tomorrow", owner: 'user', dueHint: 'tomorrow' },
   ],
+  learnedFacts: [],
 };
 
 function stubClient(extraction: EpisodeExtraction = STUB_EXTRACTION) {
