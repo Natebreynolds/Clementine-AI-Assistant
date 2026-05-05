@@ -2204,7 +2204,13 @@ export class Gateway {
         const isInteractive = isOwnerDm
           || sessionKey.startsWith('dashboard:')
           || sessionKey.startsWith('cli:');
-        if (isInteractive && !isInternalMsg && !recentContext?.suppressDeepMode && !text.startsWith('!') && !sess?.deepTask) {
+        // Builder sessions (dashboard chat-first trick builder) are
+        // conversational by contract — they author specs, they don't
+        // run them. Skip the deep-mode classifier so a "build a thing
+        // that does X and Y" prompt doesn't get hijacked into an async
+        // background task.
+        const isBuilderSession = sessionKey.startsWith('dashboard:builder:');
+        if (isInteractive && !isBuilderSession && !isInternalMsg && !recentContext?.suppressDeepMode && !text.startsWith('!') && !sess?.deepTask) {
           try {
             const turnDecision = decideTurn({
               text,

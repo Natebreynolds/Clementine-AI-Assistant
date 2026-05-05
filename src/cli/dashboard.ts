@@ -2354,7 +2354,12 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
     }
     // Response timeout — prevent hung handlers from blocking the connection pool.
     // Brain routes drive LLM calls + multi-file writes and need a longer budget.
-    const isLongRunning = req.path.startsWith('/brain/');
+    // SSE streaming endpoints (path ends in `/stream`) and the chat endpoints
+    // also drive LLM calls and would otherwise be killed mid-stream.
+    const isLongRunning = req.path.startsWith('/brain/')
+      || req.path.endsWith('/stream')
+      || req.path === '/chat'
+      || req.path === '/builder/chat';
     const timeoutMs = isLongRunning ? 10 * 60 * 1000 : 8000;
     const timeout = setTimeout(() => {
       if (!res.headersSent) {
@@ -7014,9 +7019,12 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
     });
 
     let closed = false;
-    req.on('close', () => { closed = true; });
+    // res.on('close') fires only on actual client disconnect or response
+    // teardown. req.on('close') fires once the request body finishes
+    // parsing, which would silently drop every event after the first.
+    res.on('close', () => { closed = true; });
     const writeEvent = (type: string, data: Record<string, unknown> = {}) => {
-      if (closed) return;
+      if (closed || res.writableEnded) return;
       try {
         res.write(`data: ${JSON.stringify({ type, ...data })}\n\n`);
       } catch {
@@ -7860,15 +7868,22 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
           `Help the user think about what makes a good agent: clear role, specific tools, focused personality. Keep it conversational — one question at a time.\n` +
           `When the user says "save" or approves, output the final artifact block.]\n\n`
         : type === 'workflow'
-        ? `[BUILDER MODE: You are helping the user build a "trick" — a (possibly multi-step) thing Clementine can do on a schedule or on demand. As you develop it, output the current state as a JSON block:\n` +
+        ? `[BUILDER MODE: You are helping the user DRAFT a "trick" — a (possibly multi-step) thing Clementine can do on a schedule or on demand. You are NOT executing the trick. You are not running anything in the background. You are only authoring a spec the user will save, then run later from the dashboard.\n` +
+          `\n` +
+          `Hard rules:\n` +
+          `  - NEVER say "on it", "running in the background", "I'll follow up", "working on it now", or anything else that implies you're executing the user's request. You are drafting a spec.\n` +
+          `  - Stay strictly conversational. One short question per turn. Update the artifact block on every turn.\n` +
+          `  - If the user describes "real work" (multi-step actions, scrapers, enrichments, reports), still just draft it — don't dispatch.\n` +
+          `\n` +
+          `As you develop the trick, output the current state as a JSON block:\n` +
           '```json-artifact\n{"type":"workflow","name":"...","description":"...","schedule":"","model":"","steps":"step1:\\n  prompt: ...\\nstep2:\\n  prompt: ...\\n  dependsOn: step1"}\n```\n' +
-          `Update this block in EVERY response. Keep it conversational — one question at a time. Ask about (in roughly this order):\n` +
-          `  1. The goal (one sentence is fine).\n` +
+          `Ask about (in roughly this order, one at a time):\n` +
+          `  1. The goal (one sentence is fine — confirm it back).\n` +
           `  2. When it should run — natural language is fine ("every weekday at 9"); convert to a cron expression in the schedule field. Empty schedule = manual.\n` +
           `  3. Which tools, projects, or channels she'll need (MCP servers, local CLIs like sf/gh/gcloud, Slack/Discord targets).\n` +
           `  4. Which model — claude-opus-4-7 (most capable), claude-sonnet-4-6 (balanced), or claude-haiku-4-5-20251001 (fastest). Leave model empty if the user doesn't care.\n` +
           `Most tricks need only one prompt step. Add steps only when the user explicitly wants a multi-step pipeline.\n` +
-          `When the user says "save" or approves, output the final artifact block.]\n\n`
+          `When the user says "save" or approves, output the final artifact block — don't try to save it yourself, the dashboard handles persistence.]\n\n`
         : `[BUILDER MODE: You are helping configure an artifact. Output structured JSON blocks as you build.]\n\n`;
 
       enrichedMessage = builderPrefix + fileContext + toolContext + artifactContext + message;
@@ -7895,6 +7910,152 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
       res.json({ ok: true, response: cleanResponse, artifact });
     } catch (err) {
       res.status(500).json({ error: String(err) });
+    }
+  });
+
+  // Streaming variant of /api/builder/chat. Same enrichment, SSE response.
+  // Emits `text` events for token chunks and a final `done` event with the
+  // cleaned response and parsed artifact. Mirrors /api/chat/stream's shape.
+  app.post('/api/builder/chat/stream', async (req, res) => {
+    const { message, artifactType, agentSlug, currentArtifact, attachments, linkedTools } = req.body;
+    if (!message || typeof message !== 'string') {
+      res.status(400).json({ error: 'message is required' });
+      return;
+    }
+
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      'Connection': 'keep-alive',
+    });
+
+    let closed = false;
+    // Use res.on('close') for client-disconnect detection. The req-level
+    // close event in Express fires once the request body has been read, even
+    // while the response is still open — using it to gate writes silently
+    // drops every event after the first.
+    res.on('close', () => { closed = true; });
+    const writeEvent = (eventType: string, data: Record<string, unknown> = {}) => {
+      if (closed || res.writableEnded) return;
+      try { res.write(`data: ${JSON.stringify({ type: eventType, ...data })}\n\n`); }
+      catch { closed = true; }
+    };
+    // Flush headers immediately so the client sees the connection open even
+    // before the gateway warms up (otherwise some HTTP intermediaries hold
+    // the response until first body byte).
+    writeEvent('progress', { status: 'connecting…' });
+
+    // ── Same enrichment as /api/builder/chat (system prefix on first turn,
+    //    artifact + files + tools on every turn). Inlined to keep the diff
+    //    contained; refactor into a helper if a third endpoint shows up.
+    const type = artifactType || 'skill';
+    const sessionKey = `dashboard:builder:${type}:${agentSlug || 'clementine'}`;
+    const isFirstMessage = !builderSessionInited.has(sessionKey);
+
+    const artifactContext = currentArtifact
+      ? `\n[CURRENT ARTIFACT STATE]\n\`\`\`json-artifact\n${JSON.stringify(currentArtifact)}\n\`\`\`\n`
+      : '';
+
+    let fileContext = '';
+    if (Array.isArray(attachments) && attachments.length > 0) {
+      const fileParts: string[] = [];
+      for (const att of attachments) {
+        if (att.filename && att.content) {
+          try {
+            const decoded = Buffer.from(att.content, 'base64').toString('utf-8');
+            const trimmed = decoded.length > 4000 ? decoded.slice(0, 4000) + '\n... (truncated)' : decoded;
+            fileParts.push(`### ${att.filename}\n\`\`\`\n${trimmed}\n\`\`\``);
+          } catch { /* skip binary files */ }
+        }
+      }
+      if (fileParts.length > 0) {
+        fileContext = `\n[REFERENCE FILES — the user attached these for context]\n${fileParts.join('\n\n')}\n`;
+      }
+    }
+
+    let toolContext = '';
+    if (Array.isArray(linkedTools) && linkedTools.length > 0) {
+      toolContext = `\n[LINKED TOOLS — this skill should use these tools: ${linkedTools.join(', ')}]\n`;
+    }
+
+    let enrichedMessage: string;
+    if (isFirstMessage) {
+      const agentContext = agentSlug ? `You are building this for the agent "${agentSlug}". The skill/cron will be scoped to this agent specifically.\n` : '';
+      const builderPrefix = type === 'skill'
+        ? `[BUILDER MODE: You are helping build a reusable skill. ${agentContext}As you develop the procedure, output the current state as a JSON block:\n` +
+          '```json-artifact\n{"type":"skill","title":"...","description":"...","triggers":["..."],"steps":"markdown procedure","toolsUsed":["tool1","tool2"]}\n```\n' +
+          `Update this block in EVERY response as the skill evolves. If the user has linked tools, include them in the toolsUsed array. Ask clarifying questions to refine the procedure. Keep it conversational — one question at a time. ` +
+          `When the user says "save" or approves, output the final artifact block.]\n\n`
+        : type === 'cron'
+        ? `[BUILDER MODE: You are helping build a scheduled cron job. As you develop the job, output the current state as a JSON block:\n` +
+          '```json-artifact\n{"type":"cron","name":"...","schedule":"cron expression","tier":1,"prompt":"the full job prompt","mode":"standard","enabled":true}\n```\n' +
+          `Update this block in EVERY response as the job evolves. Ask about schedule, what it should do, which tools/APIs it needs, what tier (1=read-only, 2=read-write), and whether it should run in unleashed mode.\n` +
+          `When the user says "save" or approves, output the final artifact block.]\n\n`
+        : type === 'agent'
+        ? `[BUILDER MODE: You are helping create a new AI agent team member. As you develop the agent config, output the current state as a JSON block:\n` +
+          '```json-artifact\n{"type":"agent","name":"...","description":"role description","model":"sonnet","personality":"system prompt / onboarding brief","tools":["tool1","tool2"],"channel":"","tier":2}\n```\n' +
+          `Update this block in EVERY response as the agent evolves. Ask about: the agent's role, what tools it needs, what model to use, its personality/system prompt, which channel it should operate in, and its security tier.\n` +
+          `Keep it conversational — one question at a time. When the user says "save" or approves, output the final artifact block.]\n\n`
+        : type === 'workflow'
+        ? `[BUILDER MODE: You are helping the user DRAFT a "trick" — a (possibly multi-step) thing Clementine can do on a schedule or on demand. You are NOT executing the trick. You are not running anything in the background. You are only authoring a spec the user will save, then run later from the dashboard.\n` +
+          `\n` +
+          `Hard rules:\n` +
+          `  - NEVER say "on it", "running in the background", "I'll follow up", "working on it now", or anything else that implies you're executing the user's request. You are drafting a spec.\n` +
+          `  - Stay strictly conversational. One short question per turn. Update the artifact block on every turn.\n` +
+          `  - If the user describes "real work" (multi-step actions, scrapers, enrichments, reports), still just draft it — don't dispatch.\n` +
+          `\n` +
+          `As you develop the trick, output the current state as a JSON block:\n` +
+          '```json-artifact\n{"type":"workflow","name":"...","description":"...","schedule":"","model":"","steps":"step1:\\n  prompt: ...\\nstep2:\\n  prompt: ...\\n  dependsOn: step1"}\n```\n' +
+          `Ask about (in roughly this order, one at a time):\n` +
+          `  1. The goal (one sentence is fine — confirm it back).\n` +
+          `  2. When it should run — natural language is fine ("every weekday at 9"); convert to a cron expression in the schedule field. Empty schedule = manual.\n` +
+          `  3. Which tools, projects, or channels she'll need (MCP servers, local CLIs like sf/gh/gcloud, Slack/Discord targets).\n` +
+          `  4. Which model — claude-opus-4-7 (most capable), claude-sonnet-4-6 (balanced), or claude-haiku-4-5-20251001 (fastest). Leave model empty if the user doesn't care.\n` +
+          `Most tricks need only one prompt step. Add steps only when the user explicitly wants a multi-step pipeline.\n` +
+          `When the user says "save" or approves, output the final artifact block — don't try to save it yourself, the dashboard handles persistence.]\n\n`
+        : `[BUILDER MODE: You are helping configure an artifact. Output structured JSON blocks as you build.]\n\n`;
+      enrichedMessage = builderPrefix + fileContext + toolContext + artifactContext + message;
+      builderSessionInited.add(sessionKey);
+    } else {
+      enrichedMessage = fileContext + toolContext + artifactContext + message;
+    }
+
+    try {
+      writeEvent('progress', { status: 'thinking…' });
+      const gateway = await getGateway();
+      let lastText = '';
+      const response = await gateway.handleMessage(
+        sessionKey,
+        enrichedMessage,
+        async (text) => {
+          lastText = text ?? '';
+          // Strip any in-progress json-artifact fence from the streamed token
+          // chunk so users don't see raw JSON scrolling past in the UI. The
+          // final artifact arrives in the `done` event.
+          const visible = lastText.replace(/```json-artifact[\s\S]*?(```|$)/g, '');
+          writeEvent('text', { text: visible });
+        },
+        undefined,
+        undefined,
+        async (toolName) => {
+          writeEvent('tool', { name: toolName });
+        },
+        async (status) => {
+          writeEvent('progress', { status });
+        },
+      );
+      const finalText = response ?? lastText ?? '';
+      let artifact = null;
+      const artifactMatch = finalText.match(/```json-artifact\s*\n([\s\S]*?)```/);
+      if (artifactMatch) {
+        try { artifact = JSON.parse(artifactMatch[1]); } catch { /* malformed */ }
+      }
+      const cleanResponse = finalText.replace(/```json-artifact\s*\n[\s\S]*?```/g, '').trim();
+      writeEvent('done', { response: cleanResponse, artifact });
+      if (!closed) res.end();
+    } catch (err) {
+      writeEvent('error', { error: String(err) });
+      if (!closed) res.end();
     }
   });
 
@@ -15167,29 +15328,45 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
           </div>
         </div>
       </div>
-      <!-- Chat-first builder modal — multi-turn conversation that drafts a trick spec live -->
+      <!-- Chat-first builder modal — two-pane: chat on the left, live spec preview on the right -->
+      <style>
+        .trick-chat-body { display:flex; flex-direction:row; flex:1; min-height:0; }
+        .trick-chat-pane { width:420px; flex-shrink:0; display:flex; flex-direction:column; min-height:0; }
+        .trick-spec-pane { flex:1; min-width:0; min-height:0; overflow-y:auto; padding:18px 20px; background:var(--bg-tertiary); border-left:1px solid var(--border); }
+        .trick-spec-card { background:var(--bg-secondary); border:1px solid var(--border); border-radius:var(--radius); padding:10px 12px; margin-bottom:8px; }
+        .trick-spec-skeleton-row { height:14px; background:var(--bg-secondary); border-radius:4px; margin:8px 0; opacity:0.6; }
+        @keyframes trickShimmer { 0% { opacity:0.45 } 50% { opacity:0.85 } 100% { opacity:0.45 } }
+        .trick-spec-streaming .trick-spec-card { animation:trickShimmer 1.4s ease-in-out infinite; }
+        @media (max-width: 900px) {
+          .trick-chat-body { flex-direction:column; }
+          .trick-chat-pane { width:100%; max-height:50vh; }
+          .trick-spec-pane { border-left:none; border-top:1px solid var(--border); }
+        }
+      </style>
       <div id="routines-chat-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.4);z-index:200;align-items:center;justify-content:center">
-        <div style="background:var(--bg-secondary);border:1px solid var(--border);border-radius:var(--radius);width:760px;max-width:96vw;max-height:88vh;display:flex;flex-direction:column;overflow:hidden">
-          <div style="padding:14px 18px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:10px">
+        <div style="background:var(--bg-secondary);border:1px solid var(--border);border-radius:var(--radius);width:1100px;max-width:96vw;height:88vh;max-height:88vh;display:flex;flex-direction:column;overflow:hidden">
+          <div style="padding:14px 18px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:10px;flex-shrink:0">
             <h3 style="margin:0;font-size:15px;font-weight:600;color:var(--text-primary)">Build a trick with Clementine</h3>
-            <span style="flex:1"></span>
+            <span id="routines-chat-status" style="color:var(--text-muted);flex:1;font-size:11px;min-height:14px"></span>
             <button class="btn-sm" onclick="window.RoutinesUI && RoutinesUI.closeChat()" style="padding:4px 10px;background:var(--bg-tertiary);border:1px solid var(--border);color:var(--text-secondary)">&times;</button>
           </div>
-          <!-- Live spec preview -->
-          <div id="routines-chat-preview" style="display:none;padding:10px 18px;border-bottom:1px solid var(--border);background:var(--bg-tertiary);font-size:12px;color:var(--text-secondary)"></div>
-          <!-- Messages -->
-          <div id="routines-chat-messages" style="flex:1;min-height:240px;overflow-y:auto;padding:14px 18px;display:flex;flex-direction:column;gap:10px"></div>
-          <!-- Composer -->
-          <div style="padding:12px 18px;border-top:1px solid var(--border);background:var(--bg-secondary)">
-            <div style="display:flex;gap:8px;align-items:flex-end">
-              <textarea id="routines-chat-input" rows="2" placeholder="Tell Clementine what you want her to do…" style="flex:1;padding:8px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg-input);color:var(--text-primary);font-size:13px;font-family:inherit;resize:vertical;box-sizing:border-box" onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();window.RoutinesUI&&RoutinesUI.sendChat();}"></textarea>
-              <button id="routines-chat-send" class="btn-sm btn-primary" onclick="window.RoutinesUI && RoutinesUI.sendChat()" style="padding:8px 16px;align-self:flex-end">Send</button>
+          <div class="trick-chat-body">
+            <!-- Left: chat pane -->
+            <div class="trick-chat-pane">
+              <div id="routines-chat-messages" style="flex:1;min-height:0;overflow-y:auto;padding:14px 18px;display:flex;flex-direction:column;gap:10px"></div>
+              <div style="padding:12px 18px;border-top:1px solid var(--border);background:var(--bg-secondary);flex-shrink:0">
+                <div style="display:flex;gap:8px;align-items:flex-end">
+                  <textarea id="routines-chat-input" rows="2" placeholder="Tell Clementine what you want her to do…" style="flex:1;padding:8px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg-input);color:var(--text-primary);font-size:13px;font-family:inherit;resize:vertical;box-sizing:border-box" onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();window.RoutinesUI&&RoutinesUI.sendChat();}"></textarea>
+                  <button id="routines-chat-send" class="btn-sm btn-primary" onclick="window.RoutinesUI && RoutinesUI.sendChat()" style="padding:8px 16px;align-self:flex-end">Send</button>
+                </div>
+              </div>
             </div>
-            <div style="display:flex;align-items:center;gap:10px;margin-top:8px;font-size:11px">
-              <span id="routines-chat-status" style="color:var(--text-muted);flex:1;min-height:14px"></span>
-              <button id="routines-chat-save" class="btn-sm btn-primary" onclick="window.RoutinesUI && RoutinesUI.saveChatDraft()" style="display:none;padding:5px 12px;font-size:11px">Save trick</button>
-              <button class="btn-sm" onclick="window.RoutinesUI && RoutinesUI.closeChat(true);RoutinesUI.openCreate();" style="padding:4px 10px;background:transparent;border:none;color:var(--text-muted);font-size:11px;cursor:pointer;text-decoration:underline">Build manually instead</button>
-            </div>
+            <!-- Right: live spec pane -->
+            <div class="trick-spec-pane" id="routines-chat-spec"></div>
+          </div>
+          <div style="padding:10px 18px;border-top:1px solid var(--border);background:var(--bg-secondary);display:flex;align-items:center;gap:10px;flex-shrink:0">
+            <span style="flex:1"></span>
+            <button class="btn-sm" onclick="window.RoutinesUI && RoutinesUI.closeChat(true);RoutinesUI.openCreate();" style="padding:4px 10px;background:transparent;border:none;color:var(--text-muted);font-size:11px;cursor:pointer;text-decoration:underline">Build manually instead</button>
           </div>
         </div>
       </div>
@@ -15793,9 +15970,9 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
             R.state.chatMessages = [];
             R.state.chatArtifact = null;
             R.state.chatBusy = false;
+            R.state.chatStreaming = false;
             document.getElementById('routines-chat-input').value = '';
             document.getElementById('routines-chat-status').textContent = '';
-            document.getElementById('routines-chat-save').style.display = 'none';
             // Reset the builder session so the prior conversation doesn't leak in.
             apiFetch('/api/builder/reset', {
               method: 'POST',
@@ -15803,7 +15980,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
               body: JSON.stringify({ artifactType: 'workflow' })
             }).catch(function(){ /* non-fatal */ });
             R.renderChatMessages();
-            R.renderChatPreview();
+            R.renderChatSpec();
             // Seed with a greeting from the assistant so the panel isn't empty.
             R.appendChatMessage('assistant', 'Hi! Tell me what you want Clementine to do — a sentence is fine. I\\x27ll ask a couple of follow-ups (when it should run, which tools she needs, which model) and draft a trick you can save.');
             m.style.display = 'flex';
@@ -15819,35 +15996,133 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
           },
           renderChatMessages: function() {
             var box = document.getElementById('routines-chat-messages'); if (!box) return;
-            box.innerHTML = (R.state.chatMessages || []).map(function(m){
+            var streaming = R.state.chatStreaming;
+            var msgs = R.state.chatMessages || [];
+            box.innerHTML = msgs.map(function(m, i){
               var isUser = m.role === 'user';
               var bg = isUser ? 'var(--clementine,#ff8c21)' : 'var(--bg-tertiary)';
               var color = isUser ? '#fff' : 'var(--text-primary)';
               var align = isUser ? 'flex-end' : 'flex-start';
-              return '<div style="display:flex;justify-content:' + align + '"><div style="max-width:78%;padding:8px 12px;border-radius:10px;background:' + bg + ';color:' + color + ';font-size:13px;line-height:1.5;white-space:pre-wrap">' + R.esc(m.text) + '</div></div>';
+              var isLastAssistant = !isUser && i === msgs.length - 1 && streaming;
+              var caret = isLastAssistant ? '<span style="display:inline-block;width:6px;height:14px;margin-left:2px;background:var(--text-primary);opacity:0.55;animation:trickShimmer 1s infinite"></span>' : '';
+              var bodyText = m.text || (isLastAssistant ? '' : '(thinking…)');
+              return '<div style="display:flex;justify-content:' + align + '"><div style="max-width:82%;padding:8px 12px;border-radius:10px;background:' + bg + ';color:' + color + ';font-size:13px;line-height:1.5;white-space:pre-wrap">' + R.esc(bodyText) + caret + '</div></div>';
             }).join('');
             box.scrollTop = box.scrollHeight;
           },
-          renderChatPreview: function() {
-            var pv = document.getElementById('routines-chat-preview'); if (!pv) return;
+          // Renders the right-hand spec pane. Skeleton state when the agent
+          // hasn't drafted anything yet; populated card view once it has a
+          // name + at least one step. Save button lives at the bottom.
+          renderChatSpec: function() {
+            var pane = document.getElementById('routines-chat-spec'); if (!pane) return;
+            pane.classList.toggle('trick-spec-streaming', !!R.state.chatStreaming);
             var a = R.state.chatArtifact;
-            if (!a || !a.name) { pv.style.display = 'none'; return; }
-            pv.style.display = 'block';
-            var schedule = a.schedule ? '<code style="font-family:\\x27JetBrains Mono\\x27,monospace;font-size:11px">' + R.esc(a.schedule) + '</code>' : '<em style="color:var(--text-muted)">manual</em>';
-            var stepCount = (a.steps && typeof a.steps === 'string')
-              ? (a.steps.match(/^[a-zA-Z0-9_-]+:/gm) || []).length
-              : (Array.isArray(a.steps) ? a.steps.length : 0);
-            pv.innerHTML = '<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap"><strong style="color:var(--text-primary)">' + R.esc(a.name) + '</strong>'
-              + '<span style="color:var(--text-muted)">·</span><span>schedule ' + schedule + '</span>'
-              + '<span style="color:var(--text-muted)">·</span><span>' + stepCount + ' step' + (stepCount === 1 ? '' : 's') + '</span>'
-              + (a.model ? '<span style="color:var(--text-muted)">·</span><span>model <code>' + R.esc(a.model) + '</code></span>' : '')
-              + '</div>'
-              + (a.description ? '<div style="margin-top:4px;color:var(--text-muted);font-size:11px">' + R.esc(a.description) + '</div>' : '');
-            // Save button shows once we have a name + at least one step.
-            var saveBtn = document.getElementById('routines-chat-save');
-            if (saveBtn) saveBtn.style.display = (a.name && stepCount > 0) ? '' : 'none';
+            if (!a || !a.name) {
+              pane.innerHTML = '<div style="font-size:11px;color:var(--text-muted);font-weight:600;text-transform:uppercase;letter-spacing:0.04em;margin-bottom:10px">Trick spec</div>'
+                + '<div class="trick-spec-card" style="opacity:0.7"><div class="trick-spec-skeleton-row" style="width:60%"></div><div class="trick-spec-skeleton-row" style="width:90%"></div><div class="trick-spec-skeleton-row" style="width:40%"></div></div>'
+                + '<div style="font-size:11px;color:var(--text-muted);line-height:1.5;margin-top:14px;font-style:italic">I\\x27ll fill this in as we chat. Each answer you give populates a field on the right — name, schedule, model, steps. When it\\x27s ready you\\x27ll see a Save trick button.</div>';
+              return;
+            }
+            // Parse the YAML-ish steps string into displayable cards.
+            var steps = R.parseStepsForSpec(a.steps);
+            var stepCount = steps.length;
+            var schedule = a.schedule ? R.humanizeCron(a.schedule) : 'manual';
+            var modelLabel = a.model ? R.modelLabel(a.model) : 'inherit';
+            var head = '<div style="display:flex;align-items:center;gap:10px;margin-bottom:14px"><div style="font-size:11px;color:var(--text-muted);font-weight:600;text-transform:uppercase;letter-spacing:0.04em">Trick spec</div><span style="flex:1"></span>'
+              + (R.state.chatStreaming ? '<span style="font-size:11px;color:var(--clementine)">drafting…</span>' : '')
+              + '</div>';
+            var meta = '<div class="trick-spec-card">'
+              + '<div style="font-size:15px;font-weight:600;color:var(--text-primary);margin-bottom:4px">' + R.esc(a.name) + '</div>'
+              + (a.description ? '<div style="font-size:12px;color:var(--text-secondary);margin-bottom:8px">' + R.esc(a.description) + '</div>' : '')
+              + '<div style="display:flex;flex-wrap:wrap;gap:14px;font-size:11px;color:var(--text-muted)">'
+              +   '<div><span style="text-transform:uppercase;letter-spacing:0.04em">Schedule</span><div style="margin-top:2px;color:var(--text-primary);font-size:12px;font-weight:500">' + R.esc(schedule) + (a.schedule ? ' <code style="font-family:\\x27JetBrains Mono\\x27,monospace;font-size:10px;color:var(--text-muted)" title="' + R.esc(a.schedule) + '">' + R.esc(a.schedule) + '</code>' : '') + '</div></div>'
+              +   '<div><span style="text-transform:uppercase;letter-spacing:0.04em">Model</span><div style="margin-top:2px;color:var(--text-primary);font-size:12px;font-weight:500">' + R.esc(modelLabel) + '</div></div>'
+              +   '<div><span style="text-transform:uppercase;letter-spacing:0.04em">Steps</span><div style="margin-top:2px;color:var(--text-primary);font-size:12px;font-weight:500">' + stepCount + '</div></div>'
+              + '</div></div>';
+            var stepsHtml = '';
+            if (steps.length > 0) {
+              stepsHtml = '<div style="font-size:11px;color:var(--text-muted);font-weight:600;text-transform:uppercase;letter-spacing:0.04em;margin:18px 0 8px">Steps</div>'
+                + steps.map(function(s, i){
+                  var kind = s.kind || 'prompt';
+                  var kindColor = { prompt: '#5e72e4', mcp: '#2dce89', cli: '#fb6340', conditional: '#f5365c', channel: '#11cdef', transform: '#ffd600', loop: '#8965e0' }[kind] || '#888';
+                  var badge = '<span style="display:inline-block;background:' + kindColor + '22;color:' + kindColor + ';padding:2px 8px;border-radius:4px;font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:0.04em">' + kind + '</span>';
+                  return '<div class="trick-spec-card" style="border-left:3px solid ' + kindColor + '">'
+                    + '<div style="display:flex;align-items:center;gap:8px;margin-bottom:4px"><span style="font-size:11px;color:var(--text-muted);font-weight:600">#' + (i + 1) + '</span>' + badge + '<code style="font-family:\\x27JetBrains Mono\\x27,monospace;font-size:11px;color:var(--text-secondary)">' + R.esc(s.id) + '</code></div>'
+                    + (s.preview ? '<div style="font-size:12px;color:var(--text-secondary);line-height:1.45">' + R.esc(s.preview) + '</div>' : '')
+                    + '</div>';
+                }).join('');
+            }
+            var ready = a.name && stepCount > 0;
+            var saveRow = ready
+              ? '<div style="margin-top:18px;padding-top:14px;border-top:1px solid var(--border);display:flex;align-items:center;gap:10px"><span style="font-size:12px;color:var(--green,#22c55e);font-weight:500">✓ Ready to save</span><span style="flex:1"></span><button class="btn-sm btn-primary" onclick="window.RoutinesUI&&RoutinesUI.saveChatDraft()" style="padding:6px 18px">Save trick</button></div>'
+              : '<div style="margin-top:18px;font-size:11px;color:var(--text-muted);font-style:italic">A few more details and I\\x27ll let you save.</div>';
+            pane.innerHTML = head + meta + stepsHtml + saveRow;
           },
-          sendChat: function() {
+          // Best-effort parser for the agent's YAML-ish steps string. Handles
+          // flat top-level "id:" keys with indented "prompt:", "kind:",
+          // "dependsOn:" children. Falls back gracefully on weird shapes.
+          parseStepsForSpec: function(stepsStr) {
+            if (!stepsStr) return [];
+            if (Array.isArray(stepsStr)) {
+              return stepsStr.map(function(s){ return { id: String(s.id || ''), kind: s.kind || 'prompt', preview: String(s.prompt || '').slice(0, 160) }; }).filter(function(s){ return s.id; });
+            }
+            if (typeof stepsStr !== 'string') return [];
+            var lines = stepsStr.split(/\\r?\\n/);
+            var steps = [];
+            var current = null;
+            lines.forEach(function(line){
+              var topMatch = line.match(/^([A-Za-z0-9_-]+)\\s*:\\s*$/);
+              if (topMatch && !line.startsWith(' ') && !line.startsWith('\\t')) {
+                if (current) steps.push(current);
+                current = { id: topMatch[1], kind: 'prompt', promptParts: [] };
+                return;
+              }
+              if (!current) return;
+              var promptM = line.match(/^\\s+prompt\\s*:\\s*(.*)$/);
+              if (promptM) { current.promptParts.push(promptM[1]); return; }
+              var kindM = line.match(/^\\s+kind\\s*:\\s*(\\w+)/);
+              if (kindM) { current.kind = kindM[1]; return; }
+              if (/^\\s+/.test(line) && line.trim().length) {
+                // Continuation of multi-line prompt or other field — capture for preview
+                current.promptParts.push(line.trim());
+              }
+            });
+            if (current) steps.push(current);
+            return steps.map(function(s){
+              return { id: s.id, kind: s.kind, preview: s.promptParts.join(' ').slice(0, 160) };
+            });
+          },
+          // Friendly cron string for the spec pane (and reusable in the list).
+          humanizeCron: function(expr) {
+            if (!expr) return 'manual';
+            var parts = String(expr).trim().split(/\\s+/);
+            if (parts.length !== 5) return expr;
+            var min = parts[0], hour = parts[1], dom = parts[2], mon = parts[3], dow = parts[4];
+            var dows = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+            var pad2 = function(n){ n = String(n); return n.length < 2 ? '0' + n : n; };
+            var fmt = function(h, m){
+              var hn = parseInt(h, 10), mn = parseInt(m, 10);
+              if (isNaN(hn) || isNaN(mn)) return '';
+              var ampm = hn >= 12 ? 'pm' : 'am';
+              var h12 = ((hn + 11) % 12) + 1;
+              return mn === 0 ? h12 + ampm : h12 + ':' + pad2(mn) + ampm;
+            };
+            if (min === '*' && hour === '*' && dom === '*' && mon === '*' && dow === '*') return 'every minute';
+            if (/^\\*\\/\\d+$/.test(min) && hour === '*' && dom === '*' && mon === '*' && dow === '*') return 'every ' + min.slice(2) + ' min';
+            if (min === '0' && hour === '*' && dom === '*' && mon === '*' && dow === '*') return 'hourly';
+            if (/^\\d+$/.test(min) && hour === '*' && dom === '*' && mon === '*' && dow === '*') return 'every hour at :' + pad2(min);
+            if (min === '0' && /^\\*\\/\\d+$/.test(hour) && dom === '*' && mon === '*' && dow === '*') return 'every ' + hour.slice(2) + ' hours';
+            if (/^\\d+$/.test(min) && /^\\d+$/.test(hour) && dom === '*' && mon === '*' && dow === '*') return 'daily at ' + fmt(hour, min);
+            if (/^\\d+$/.test(min) && /^\\d+$/.test(hour) && dom === '*' && mon === '*' && dow === '1-5') return 'weekdays at ' + fmt(hour, min);
+            if (/^\\d+$/.test(min) && /^\\d+$/.test(hour) && dom === '*' && mon === '*' && /^\\d$/.test(dow)) return 'every ' + dows[+dow] + ' at ' + fmt(hour, min);
+            if (/^\\d+$/.test(min) && /^\\d+$/.test(hour) && /^\\d+$/.test(dom) && mon === '*' && dow === '*') return 'monthly on day ' + dom + ' at ' + fmt(hour, min);
+            return expr;
+          },
+          modelLabel: function(id) {
+            var found = (R.MODEL_OPTS || []).find(function(o){ return o.id === id; });
+            return found ? found.label.split(' — ')[0] : id;
+          },
+          sendChat: async function() {
             if (R.state.chatBusy) return;
             var input = document.getElementById('routines-chat-input');
             var text = input.value.trim();
@@ -15855,39 +16130,69 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
             input.value = '';
             R.appendChatMessage('user', text);
             R.state.chatBusy = true;
+            R.state.chatStreaming = true;
             var sendBtn = document.getElementById('routines-chat-send');
             var status = document.getElementById('routines-chat-status');
             if (sendBtn) { sendBtn.textContent = 'Thinking…'; sendBtn.disabled = true; }
             if (status) status.textContent = 'Clementine is drafting…';
-            apiFetch('/api/builder/chat', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                message: text,
-                artifactType: 'workflow',
-                currentArtifact: R.state.chatArtifact || undefined,
-              })
-            }).then(function(r){ return r.json().then(function(j){ return { ok: r.ok, body: j }; }); })
-              .then(function(res){
-                R.state.chatBusy = false;
-                if (sendBtn) { sendBtn.textContent = 'Send'; sendBtn.disabled = false; }
-                if (!res.ok) {
-                  if (status) status.textContent = 'Error: ' + (res.body && res.body.error || 'unknown');
-                  return;
-                }
-                // Endpoint returns { ok, response, artifact } — server already
-                // strips the json-artifact fence and parses the JSON for us.
-                var reply = (res.body && res.body.response) || '(no reply)';
-                if (res.body && res.body.artifact) R.state.chatArtifact = res.body.artifact;
-                R.appendChatMessage('assistant', reply);
-                R.renderChatPreview();
-                if (status) status.textContent = (res.body && res.body.artifact) ? 'Draft updated.' : '';
-              })
-              .catch(function(err){
-                R.state.chatBusy = false;
-                if (sendBtn) { sendBtn.textContent = 'Send'; sendBtn.disabled = false; }
-                if (status) status.textContent = 'Chat error: ' + err;
+            // Push a placeholder assistant bubble that we'll fill from the stream.
+            R.state.chatMessages.push({ role: 'assistant', text: '' });
+            R.renderChatMessages();
+            R.renderChatSpec();
+            try {
+              var resp = await apiFetch('/api/builder/chat/stream', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  message: text,
+                  artifactType: 'workflow',
+                  currentArtifact: R.state.chatArtifact || undefined,
+                })
               });
+              if (!resp.ok || !resp.body) throw new Error('HTTP ' + resp.status);
+              var reader = resp.body.getReader();
+              var decoder = new TextDecoder();
+              var buf = '';
+              while (true) {
+                var chunk = await reader.read();
+                if (chunk.done) break;
+                buf += decoder.decode(chunk.value, { stream: true });
+                var idx;
+                while ((idx = buf.indexOf('\\n\\n')) >= 0) {
+                  var raw = buf.slice(0, idx); buf = buf.slice(idx + 2);
+                  if (!raw.startsWith('data:')) continue;
+                  var json = raw.replace(/^data:\\s*/, '').trim();
+                  var evt = null;
+                  try { evt = JSON.parse(json); } catch (e) { continue; }
+                  var lastIdx = R.state.chatMessages.length - 1;
+                  if (evt.type === 'text') {
+                    if (lastIdx >= 0 && R.state.chatMessages[lastIdx].role === 'assistant') {
+                      R.state.chatMessages[lastIdx].text = evt.text || '';
+                      R.renderChatMessages();
+                    }
+                  } else if (evt.type === 'done') {
+                    if (lastIdx >= 0 && R.state.chatMessages[lastIdx].role === 'assistant') {
+                      R.state.chatMessages[lastIdx].text = evt.response || R.state.chatMessages[lastIdx].text || '(no reply)';
+                    }
+                    if (evt.artifact) R.state.chatArtifact = evt.artifact;
+                    R.state.chatStreaming = false;
+                    R.renderChatMessages();
+                    R.renderChatSpec();
+                    if (status) status.textContent = evt.artifact ? 'Draft updated.' : '';
+                  } else if (evt.type === 'error') {
+                    if (status) status.textContent = 'Error: ' + (evt.error || 'unknown');
+                  }
+                }
+              }
+            } catch (err) {
+              if (status) status.textContent = 'Chat error: ' + err;
+            } finally {
+              R.state.chatBusy = false;
+              R.state.chatStreaming = false;
+              if (sendBtn) { sendBtn.textContent = 'Send'; sendBtn.disabled = false; }
+              R.renderChatMessages();
+              R.renderChatSpec();
+            }
           },
           // Persist the current draft as a real trick. The artifact's steps
           // field can come back as a YAML-ish string (per the agent's prompt
