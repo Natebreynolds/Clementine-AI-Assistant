@@ -7860,10 +7860,14 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
           `Help the user think about what makes a good agent: clear role, specific tools, focused personality. Keep it conversational — one question at a time.\n` +
           `When the user says "save" or approves, output the final artifact block.]\n\n`
         : type === 'workflow'
-        ? `[BUILDER MODE: You are helping build a multi-step workflow pipeline. As you develop the workflow, output the current state as a JSON block:\n` +
-          '```json-artifact\n{"type":"workflow","name":"...","description":"...","schedule":"","steps":"step1:\\n  prompt: ...\\nstep2:\\n  prompt: ...\\n  dependsOn: step1"}\n```\n' +
-          `Update this block in EVERY response as the workflow evolves. Ask about: what the workflow should accomplish, what steps are needed, which agents should run each step, dependencies between steps, and whether it should be triggered on a schedule or manually.\n` +
-          `Workflows are defined as markdown files with YAML frontmatter. Each step has an id, prompt, optional agent, and optional dependsOn array.\n` +
+        ? `[BUILDER MODE: You are helping the user build a "trick" — a (possibly multi-step) thing Clementine can do on a schedule or on demand. As you develop it, output the current state as a JSON block:\n` +
+          '```json-artifact\n{"type":"workflow","name":"...","description":"...","schedule":"","model":"","steps":"step1:\\n  prompt: ...\\nstep2:\\n  prompt: ...\\n  dependsOn: step1"}\n```\n' +
+          `Update this block in EVERY response. Keep it conversational — one question at a time. Ask about (in roughly this order):\n` +
+          `  1. The goal (one sentence is fine).\n` +
+          `  2. When it should run — natural language is fine ("every weekday at 9"); convert to a cron expression in the schedule field. Empty schedule = manual.\n` +
+          `  3. Which tools, projects, or channels she'll need (MCP servers, local CLIs like sf/gh/gcloud, Slack/Discord targets).\n` +
+          `  4. Which model — claude-opus-4-7 (most capable), claude-sonnet-4-6 (balanced), or claude-haiku-4-5-20251001 (fastest). Leave model empty if the user doesn't care.\n` +
+          `Most tricks need only one prompt step. Add steps only when the user explicitly wants a multi-step pipeline.\n` +
           `When the user says "save" or approves, output the final artifact block.]\n\n`
         : `[BUILDER MODE: You are helping configure an artifact. Output structured JSON blocks as you build.]\n\n`;
 
@@ -15723,6 +15727,12 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
             document.getElementById('routines-chat-input').value = '';
             document.getElementById('routines-chat-status').textContent = '';
             document.getElementById('routines-chat-save').style.display = 'none';
+            // Reset the builder session so the prior conversation doesn't leak in.
+            apiFetch('/api/builder/reset', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ artifactType: 'workflow' })
+            }).catch(function(){ /* non-fatal */ });
             R.renderChatMessages();
             R.renderChatPreview();
             // Seed with a greeting from the assistant so the panel isn't empty.
@@ -15768,21 +15778,6 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
             var saveBtn = document.getElementById('routines-chat-save');
             if (saveBtn) saveBtn.style.display = (a.name && stepCount > 0) ? '' : 'none';
           },
-          // Strip a fenced json-artifact block from an assistant response.
-          // The inline-JS rendered into HTML can't carry literal backticks
-          // (they'd close the outer template), so we build the regex via
-          // String.fromCharCode(96) and a string body.
-          extractArtifact: function(text) {
-            if (!text || typeof text !== 'string') return { cleaned: text, artifact: null };
-            var BT = String.fromCharCode(96);
-            var fence = BT + BT + BT;
-            var re = new RegExp(fence + 'json-artifact\\\\s*\\\\n([\\\\s\\\\S]*?)\\\\n' + fence);
-            var m = text.match(re);
-            if (!m) return { cleaned: text, artifact: null };
-            var parsed = null;
-            try { parsed = JSON.parse(m[1]); } catch (e) { /* leave artifact null on parse failure */ }
-            return { cleaned: text.replace(re, '').trim(), artifact: parsed };
-          },
           sendChat: function() {
             if (R.state.chatBusy) return;
             var input = document.getElementById('routines-chat-input');
@@ -15811,12 +15806,13 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
                   if (status) status.textContent = 'Error: ' + (res.body && res.body.error || 'unknown');
                   return;
                 }
-                var raw = res.body && (res.body.message || res.body.response || res.body.text) || '';
-                var ext = R.extractArtifact(raw);
-                if (ext.artifact) R.state.chatArtifact = ext.artifact;
-                R.appendChatMessage('assistant', ext.cleaned || '(no reply)');
+                // Endpoint returns { ok, response, artifact } — server already
+                // strips the json-artifact fence and parses the JSON for us.
+                var reply = (res.body && res.body.response) || '(no reply)';
+                if (res.body && res.body.artifact) R.state.chatArtifact = res.body.artifact;
+                R.appendChatMessage('assistant', reply);
                 R.renderChatPreview();
-                if (status) status.textContent = ext.artifact ? 'Draft updated.' : '';
+                if (status) status.textContent = (res.body && res.body.artifact) ? 'Draft updated.' : '';
               })
               .catch(function(err){
                 R.state.chatBusy = false;
