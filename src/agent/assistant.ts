@@ -71,6 +71,7 @@ import {
   computeAvailability,
   buildPromptInstruction,
   buildComposioStatusBlock,
+  KNOWN_SERVICES,
 } from '../integrations/tool-preferences.js';
 import { loadClaudeIntegrations } from './mcp-bridge.js';
 import { detectFrustrationSignals, detectRepeatedTopics } from './insight-engine.js';
@@ -102,7 +103,7 @@ import { PromptCache } from './prompt-cache.js';
 import { searchSkills as searchSkillsSync } from './skill-extractor.js';
 import { classifyIntent, getStrategyGuidance, type IntentClassification } from './intent-classifier.js';
 import { getEventLog } from './session-event-log.js';
-import { routeToolSurface, TOOL_SURFACE_HARD_LIMIT, TOOL_SURFACE_WARN_THRESHOLD, type ToolRouteDecision } from './tool-router.js';
+import { applyServiceDedup, routeToolSurface, TOOL_SURFACE_HARD_LIMIT, TOOL_SURFACE_WARN_THRESHOLD, type ToolRouteDecision } from './tool-router.js';
 import { isRestrictedToolset, toolsetAllowsLocalWrites, type ToolsetName } from './toolsets.js';
 import { looksLikeApprovalPrompt } from './local-turn.js';
 import { decideTurn, type RetrievalTier, type TurnPolicy } from './turn-policy.js';
@@ -2711,6 +2712,72 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
         whitelist.add(mcpTool('goal_get'));
         whitelist.add(mcpTool('goal_work'));
         allowedTools = allowedTools.filter(t => whitelist.has(t));
+      }
+
+      // ── Per-service dedup (intelligent routing) ───────────────────
+      // When a service has BOTH Composio + Claude Desktop sources
+      // connected (e.g. Composio outlook + claude.ai Microsoft 365),
+      // bundles in tool-router list both so either path can route to
+      // whichever is connected. But if BOTH are connected, today's
+      // behavior loaded both — and worse, claude.ai's auto-attach
+      // would pull in every other connector the user authorized
+      // (Drive, Gmail, Calendar, Slack…) via the env path. ~300+ tool
+      // schemas leak in this way and leave Sonnet's autocompact no
+      // room to work.
+      //
+      // Dedup walks each (Composio↔claude.ai) pair, picks ONE per
+      // user preference (default Composio), drops the loser from
+      // mcpServers + allowedTools, and turns inheritFullClaudeEnv off
+      // when no claude.ai service survived (so SAFE_ENV is used and
+      // the SDK can't auto-attach the other connectors).
+      if (!toolsDisabledForCall && !isPlanStep && !toolRoute.fullSurface) {
+        const composioConnected = new Set(Object.keys(composioMcpServers));
+        const cdIntegrationsForDedup = loadClaudeIntegrations();
+        const claudeDesktopActive = new Set(
+          Object.values(cdIntegrationsForDedup).filter(i => i.connected).map(i => i.name),
+        );
+        const prefs = loadToolPreferences();
+
+        const dedupResult = applyServiceDedup(toolRoute, {
+          composioConnected,
+          claudeDesktopActive,
+          preferences: prefs.preferences,
+          knownServices: KNOWN_SERVICES,
+        });
+
+        if (dedupResult.droppedClaudeAi.length > 0 || dedupResult.droppedComposio.length > 0) {
+          const beforeAllowed = allowedTools.length;
+          const beforeInherit = toolRoute.inheritFullClaudeEnv;
+          toolRoute = dedupResult.route;
+
+          for (const name of dedupResult.droppedClaudeAi) {
+            delete externalMcpServers[name];
+          }
+          for (const slug of dedupResult.droppedComposio) {
+            delete composioMcpServers[slug];
+          }
+
+          const droppedServers = new Set<string>([
+            ...dedupResult.droppedClaudeAi,
+            ...dedupResult.droppedComposio,
+          ]);
+          allowedTools = allowedTools.filter(tool => {
+            if (!tool.startsWith('mcp__')) return true;
+            const serverName = tool.slice('mcp__'.length).split('__')[0]!;
+            return !droppedServers.has(serverName);
+          });
+
+          logger.info({
+            sessionKey,
+            droppedClaudeAi: dedupResult.droppedClaudeAi,
+            droppedComposio: dedupResult.droppedComposio,
+            anyClaudeDesktopKept: dedupResult.anyClaudeDesktopKept,
+            inheritFullClaudeEnvBefore: beforeInherit,
+            inheritFullClaudeEnvAfter: toolRoute.inheritFullClaudeEnv,
+            allowedToolCountBefore: beforeAllowed,
+            allowedToolCountAfter: allowedTools.length,
+          }, 'Tool route deduped per user tool-preferences');
+        }
       }
 
       // Tool-surface cap. Applies to chat AND to autonomous runs (cron,

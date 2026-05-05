@@ -242,3 +242,144 @@ export function routeToolSurface(text: string | undefined): ToolRouteDecision {
     reason: bundles.size > 0 || external.size > 0 || composio.size > 0 ? 'matched' : 'empty',
   };
 }
+
+// ── Per-service dedup: pick ONE source per service ─────────────────────
+//
+// Bundles in TOOL_BUNDLES list both a Composio toolkit AND a Claude
+// Desktop integration (when Claude Desktop has a counterpart) so the
+// caller can route to whichever is connected. But when BOTH are connected
+// today's behavior loads both sets of schemas — duplicate work, doubled
+// system-prompt size, and (worst) Claude Desktop's auto-attach pulls in
+// every other claude.ai integration the user has authorized via the env
+// path. That's the immediate cause of Sonnet's autocompact thrash.
+//
+// Dedup walks the matched route's external + composio sets, looks up each
+// service in KNOWN_SERVICES (the canonical Composio↔claude.ai pairing
+// table from src/integrations/tool-preferences.ts), and drops the loser
+// per the user's preference (default: Composio when both connected). The
+// caller uses `droppedClaudeAi` to disable claude.ai-specific env
+// inheritance and add disallowedTools entries.
+
+import type { ServiceDefinition, ToolSource } from '../integrations/tool-preferences.js';
+
+export interface ServiceDedupOptions {
+  /** Composio toolkit slugs the user has actually connected. */
+  composioConnected: Set<string>;
+  /** Claude Desktop integration names the user has actually connected. */
+  claudeDesktopActive: Set<string>;
+  /** User-selected source per service id (from tool-preferences.json). */
+  preferences: Record<string, ToolSource>;
+  /** The KNOWN_SERVICES registry. Passed in so this module stays
+   *  decoupled from tool-preferences (and tests can stub the table). */
+  knownServices: readonly ServiceDefinition[];
+}
+
+export interface ServiceDedupResult {
+  /** The route with losing sources removed from external + composio sets. */
+  route: ToolRouteDecision;
+  /** Claude Desktop integration names that were dropped. Used by the
+   *  caller to add disallowedTools and decide whether the SDK subprocess
+   *  needs claude.ai env inheritance at all. */
+  droppedClaudeAi: string[];
+  /** Composio toolkit slugs that were dropped. Mirror of the above. */
+  droppedComposio: string[];
+  /** True if any claude.ai integration survived dedup. When false, the
+   *  caller can drop CLAUDE_CODE_OAUTH_TOKEN from the subprocess env so
+   *  Claude Code doesn't auto-attach claude.ai connectors. */
+  anyClaudeDesktopKept: boolean;
+}
+
+export function applyServiceDedup(
+  route: ToolRouteDecision,
+  opts: ServiceDedupOptions,
+): ServiceDedupResult {
+  const droppedClaudeAi: string[] = [];
+  const droppedComposio: string[] = [];
+
+  // fullSurface routes intentionally load everything — admin/debug paths.
+  // Skip dedup so behavior matches the user's explicit "all tools" intent.
+  if (route.fullSurface) {
+    return {
+      route,
+      droppedClaudeAi,
+      droppedComposio,
+      anyClaudeDesktopKept: true,
+    };
+  }
+
+  const externalSet = new Set(route.externalMcpServers ?? []);
+  const composioSet = new Set(route.composioToolkits ?? []);
+
+  for (const service of opts.knownServices) {
+    const cdName = service.claudeDesktopName;
+    const composioSlug = service.composioSlug;
+    if (!cdName || !composioSlug) continue;
+
+    const routeHasCd = externalSet.has(cdName);
+    const routeHasComposio = composioSet.has(composioSlug);
+    if (!routeHasCd || !routeHasComposio) continue;
+
+    // Both sources are in the route. Resolve based on availability + pref.
+    const cdAvailable = opts.claudeDesktopActive.has(cdName);
+    const composioAvailable = opts.composioConnected.has(composioSlug);
+
+    if (!cdAvailable && !composioAvailable) {
+      // Neither connected — drop both (the route lists them, but they'll
+      // fail at attach time). Cleaner to remove now.
+      externalSet.delete(cdName);
+      composioSet.delete(composioSlug);
+      droppedClaudeAi.push(cdName);
+      droppedComposio.push(composioSlug);
+      continue;
+    }
+    if (!cdAvailable) {
+      // Only Composio connected — drop the claude.ai entry.
+      externalSet.delete(cdName);
+      droppedClaudeAi.push(cdName);
+      continue;
+    }
+    if (!composioAvailable) {
+      composioSet.delete(composioSlug);
+      droppedComposio.push(composioSlug);
+      continue;
+    }
+
+    // Conflict: both connected. Pick per user preference, default Composio.
+    const userPref = opts.preferences[service.id];
+    const effective: ToolSource = userPref === 'off'
+      ? 'off'
+      : userPref ?? 'composio';
+
+    if (effective === 'off') {
+      externalSet.delete(cdName);
+      composioSet.delete(composioSlug);
+      droppedClaudeAi.push(cdName);
+      droppedComposio.push(composioSlug);
+    } else if (effective === 'composio') {
+      externalSet.delete(cdName);
+      droppedClaudeAi.push(cdName);
+    } else if (effective === 'claude-desktop') {
+      composioSet.delete(composioSlug);
+      droppedComposio.push(composioSlug);
+    }
+  }
+
+  // After dedup, the SDK subprocess needs claude.ai env inheritance ONLY
+  // if some claude.ai integration is still in the route. If everything
+  // routed to Composio, force inheritFullClaudeEnv off so Claude Code
+  // can't auto-attach the rest of the user's authorized integrations.
+  const anyClaudeDesktopKept = externalSet.size > 0
+    && [...externalSet].some(name => opts.claudeDesktopActive.has(name));
+
+  return {
+    route: {
+      ...route,
+      externalMcpServers: [...externalSet],
+      composioToolkits: [...composioSet],
+      inheritFullClaudeEnv: route.inheritFullClaudeEnv && anyClaudeDesktopKept,
+    },
+    droppedClaudeAi,
+    droppedComposio,
+    anyClaudeDesktopKept,
+  };
+}

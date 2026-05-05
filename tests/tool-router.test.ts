@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { routeToolSurface, TOOL_SURFACE_HARD_LIMIT, TOOL_SURFACE_WARN_THRESHOLD } from '../src/agent/tool-router.js';
+import { applyServiceDedup, routeToolSurface, TOOL_SURFACE_HARD_LIMIT, TOOL_SURFACE_WARN_THRESHOLD } from '../src/agent/tool-router.js';
+import { KNOWN_SERVICES } from '../src/integrations/tool-preferences.js';
 
 describe('tool router', () => {
   it('defaults routine turns to the core Clementine tool surface', () => {
@@ -97,5 +98,132 @@ describe('tool router', () => {
     expect(TOOL_SURFACE_WARN_THRESHOLD).toBeGreaterThan(0);
     expect(TOOL_SURFACE_WARN_THRESHOLD).toBeLessThan(953);
     expect(TOOL_SURFACE_HARD_LIMIT).toBeGreaterThan(TOOL_SURFACE_WARN_THRESHOLD);
+  });
+});
+
+describe('applyServiceDedup', () => {
+  // Outlook bundle's route shape — same as routeToolSurface('check Outlook')
+  const outlookRoute = {
+    bundles: ['email_outlook'] as any,
+    externalMcpServers: ['Microsoft_365'],
+    composioToolkits: ['outlook'],
+    inheritFullClaudeEnv: true,
+    fullSurface: false,
+    reason: 'matched' as const,
+  };
+
+  it('drops claude.ai source when both Composio + claude.ai connected, no preference set', () => {
+    const result = applyServiceDedup(outlookRoute, {
+      composioConnected: new Set(['outlook']),
+      claudeDesktopActive: new Set(['Microsoft_365']),
+      preferences: {},
+      knownServices: KNOWN_SERVICES,
+    });
+
+    expect(result.droppedClaudeAi).toEqual(['Microsoft_365']);
+    expect(result.droppedComposio).toEqual([]);
+    expect(result.route.externalMcpServers).toEqual([]);
+    expect(result.route.composioToolkits).toEqual(['outlook']);
+    expect(result.route.inheritFullClaudeEnv).toBe(false);
+    expect(result.anyClaudeDesktopKept).toBe(false);
+  });
+
+  it('drops Composio source when user explicitly prefers claude.ai', () => {
+    const result = applyServiceDedup(outlookRoute, {
+      composioConnected: new Set(['outlook']),
+      claudeDesktopActive: new Set(['Microsoft_365']),
+      preferences: { outlook: 'claude-desktop' },
+      knownServices: KNOWN_SERVICES,
+    });
+
+    expect(result.droppedClaudeAi).toEqual([]);
+    expect(result.droppedComposio).toEqual(['outlook']);
+    expect(result.route.externalMcpServers).toEqual(['Microsoft_365']);
+    expect(result.route.composioToolkits).toEqual([]);
+    expect(result.route.inheritFullClaudeEnv).toBe(true);
+    expect(result.anyClaudeDesktopKept).toBe(true);
+  });
+
+  it('drops nothing when only one source is available (no conflict)', () => {
+    const result = applyServiceDedup(outlookRoute, {
+      composioConnected: new Set(['outlook']),
+      claudeDesktopActive: new Set(),
+      preferences: {},
+      knownServices: KNOWN_SERVICES,
+    });
+
+    expect(result.droppedClaudeAi).toEqual(['Microsoft_365']);
+    expect(result.droppedComposio).toEqual([]);
+    expect(result.route.composioToolkits).toEqual(['outlook']);
+    expect(result.anyClaudeDesktopKept).toBe(false);
+  });
+
+  it('disables both sources when service preference is "off"', () => {
+    const result = applyServiceDedup(outlookRoute, {
+      composioConnected: new Set(['outlook']),
+      claudeDesktopActive: new Set(['Microsoft_365']),
+      preferences: { outlook: 'off' },
+      knownServices: KNOWN_SERVICES,
+    });
+
+    expect(result.droppedClaudeAi).toEqual(['Microsoft_365']);
+    expect(result.droppedComposio).toEqual(['outlook']);
+    expect(result.route.externalMcpServers).toEqual([]);
+    expect(result.route.composioToolkits).toEqual([]);
+    expect(result.route.inheritFullClaudeEnv).toBe(false);
+  });
+
+  it('skips dedup entirely for fullSurface routes', () => {
+    const fullRoute = {
+      bundles: [] as any,
+      externalMcpServers: undefined as string[] | undefined,
+      composioToolkits: undefined as string[] | undefined,
+      inheritFullClaudeEnv: true,
+      fullSurface: true,
+      reason: 'full_surface' as const,
+    };
+
+    const result = applyServiceDedup(fullRoute, {
+      composioConnected: new Set(['outlook', 'gmail']),
+      claudeDesktopActive: new Set(['Microsoft_365', 'Gmail']),
+      preferences: {},
+      knownServices: KNOWN_SERVICES,
+    });
+
+    // fullSurface = explicit "all tools" admin/debug request; honor user intent.
+    expect(result.droppedClaudeAi).toEqual([]);
+    expect(result.droppedComposio).toEqual([]);
+    expect(result.route).toBe(fullRoute);
+    expect(result.anyClaudeDesktopKept).toBe(true);
+  });
+
+  it('handles a multi-bundle route with mixed availability per service', () => {
+    // Route matched both email_outlook and drive_google. Only Composio
+    // connected for Outlook; only claude.ai connected for Drive.
+    const multiRoute = {
+      bundles: ['email_outlook', 'drive_google'] as any,
+      externalMcpServers: ['Microsoft_365', 'Google_Drive'],
+      composioToolkits: ['outlook', 'googledrive'],
+      inheritFullClaudeEnv: true,
+      fullSurface: false,
+      reason: 'matched' as const,
+    };
+
+    const result = applyServiceDedup(multiRoute, {
+      composioConnected: new Set(['outlook']),
+      claudeDesktopActive: new Set(['Google_Drive']),
+      preferences: {},
+      knownServices: KNOWN_SERVICES,
+    });
+
+    // Outlook: Composio only → drop claude.ai Microsoft_365
+    // Drive: claude.ai only → drop Composio googledrive
+    expect(result.droppedClaudeAi).toEqual(['Microsoft_365']);
+    expect(result.droppedComposio).toEqual(['googledrive']);
+    expect(result.route.externalMcpServers).toEqual(['Google_Drive']);
+    expect(result.route.composioToolkits).toEqual(['outlook']);
+    // Drive is claude.ai → still need full env
+    expect(result.route.inheritFullClaudeEnv).toBe(true);
+    expect(result.anyClaudeDesktopKept).toBe(true);
   });
 });
