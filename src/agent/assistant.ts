@@ -444,6 +444,14 @@ function capContextBlock(text: unknown, maxChars: number): string {
   return capOutput(String(text ?? ''), maxChars);
 }
 
+export function scrubInternalContextBlocks(text: string): string {
+  return text
+    .replace(/\[Context governance:[^\]]*\][\s\S]*?\[\/Context governance:[^\]]*\]\s*/gi, '')
+    .replace(/\[Active working set\][\s\S]*?\[\/Active working set\]\s*/gi, '')
+    .replace(/\[Recent proactive notification context\][\s\S]*?\[\/Recent proactive notification context\]\s*/gi, '')
+    .trim();
+}
+
 function capContextItem(text: unknown): string {
   return capContextBlock(text, CRON_PROGRESS_ITEM_MAX_CHARS).replace(/\s+/g, ' ').trim();
 }
@@ -1342,7 +1350,7 @@ export class PersonalAssistant {
     return { servers: this._lastMcpStatus, updatedAt: this._lastMcpStatusTime };
   }
 
-  /** Inject a background work result into the session so the next chat naturally references it. */
+  /** Inject a background work result into the session as silent follow-up context. */
   injectPendingContext(sessionKey: string, userPrompt: string, result: string): void {
     const pending = this.pendingContext.get(sessionKey) ?? [];
     pending.push({ user: userPrompt.slice(0, 500), assistant: result.slice(0, 2000) });
@@ -3371,7 +3379,10 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
           contextLines.push(`[${user}]\n${assistant}`);
         }
         effectivePrompt =
-          `[Since we last talked, you did some background work. Naturally mention what happened — lead with anything that needs attention, briefly note routine completions. Don't dump raw tool calls or list job names. Be conversational.\nBackground:\n${contextLines.join('\n\n')}]\n\n${effectivePrompt}`;
+          `[Background work context — REFERENCE ONLY, not new user input.\n` +
+          `Use this silently to understand follow-ups. Mention it only if the user asks about status, results, fixes, or what changed, or if it is a new urgent blocker. ` +
+          `Do not lead greetings or casual small talk with stale heartbeat, cron, or background-task details.\n` +
+          `Background:\n${contextLines.join('\n\n')}]\n\n${effectivePrompt}`;
       }
     }
 
@@ -3405,6 +3416,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
     let [responseText, sessionId] = await this.runQuery(
       effectivePrompt, key, onText, model, profile, securityAnnotation, effectiveMaxTurns, projectOverride, onToolActivity, verboseLevel, abortController, guard, CHAT_TIMEOUT_MS, intent, turnPolicy, toolset,
     );
+    responseText = scrubInternalContextBlocks(responseText);
 
     // If we got a context-length / prompt-too-long error, retry with a fresh session
     const errLower = responseText.toLowerCase();
@@ -6698,7 +6710,12 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
    * a query.  Used to give the DM session visibility of cron/heartbeat outputs
    * so follow-up conversation has context.
    */
-  injectContext(sessionKey: string, userText: string, assistantText: string): void {
+  injectContext(
+    sessionKey: string,
+    userText: string,
+    assistantText: string,
+    opts: { pending?: boolean } = {},
+  ): void {
     const trimmedUser = capContextBlock(userText, INJECTED_CONTEXT_MAX_CHARS);
     const trimmedAssistant = capContextBlock(assistantText, INJECTED_CONTEXT_MAX_CHARS);
 
@@ -6714,11 +6731,13 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
     // Queue as pending context so the next chat() prepends it even
     // when an active SDK session exists (session recovery alone won't
     // help because the SDK session has no knowledge of this exchange).
-    const pending = this.pendingContext.get(sessionKey) ?? [];
-    pending.push({ user: trimmedUser, assistant: trimmedAssistant });
-    // Keep at most 3 pending to avoid bloating the next prompt
-    if (pending.length > 3) pending.shift();
-    this.pendingContext.set(sessionKey, pending);
+    if (opts.pending !== false) {
+      const pending = this.pendingContext.get(sessionKey) ?? [];
+      pending.push({ user: trimmedUser, assistant: trimmedAssistant });
+      // Keep at most 3 pending to avoid bloating the next prompt
+      if (pending.length > 3) pending.shift();
+      this.pendingContext.set(sessionKey, pending);
+    }
 
     this.sessionTimestamps.set(sessionKey, new Date());
     this.saveSessions();

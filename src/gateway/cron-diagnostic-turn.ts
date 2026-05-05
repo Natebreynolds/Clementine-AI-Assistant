@@ -30,7 +30,8 @@ const DIAGNOSTIC_RE = /\b(fix|repair|debug|diagnos(?:e|is|tic)?|what broke|why (
 export function isInternalSyntheticPrompt(text: string): boolean {
   const trimmed = text.trim();
   return /^\[(DEEP_MODE_RESULT|SYSTEM)\]/i.test(trimmed)
-    || /^\[Recent proactive notification context\][\s\S]*\[(?:\/Recent proactive notification context)\]/i.test(trimmed);
+    || /^\[Recent proactive notification context\][\s\S]*\[(?:\/Recent proactive notification context)\]/i.test(trimmed)
+    || /^\[Context governance:[^\]]*\][\s\S]*?\[\/Context governance:[^\]]*\]/i.test(trimmed);
 }
 
 function normalizeText(text: string): string {

@@ -3428,10 +3428,11 @@ memoryModelCmd
 
 memoryCmd
   .command('reembed')
-  .description('Backfill dense neural embeddings for all chunks (or all stale chunks if model changed). Default model: Snowflake/snowflake-arctic-embed-m-v1.5 — first run downloads ~440MB to ~/.clementine/models/.')
-  .option('--limit <n>', 'Max chunks to embed in this run (default: all)')
+  .description('Backfill dense neural embeddings for chunks and/or transcripts. Default model: Snowflake/snowflake-arctic-embed-m-v1.5 — first run downloads ~440MB to ~/.clementine/models/.')
+  .option('--limit <n>', 'Max items to embed in this run (default: all)')
   .option('--model <id>', 'Override embedding model id (e.g. Xenova/bge-base-en-v1.5)')
-  .action(async (opts: { limit?: string; model?: string }) => {
+  .option('--target <kind>', 'What to backfill: chunks | transcripts | all', 'all')
+  .action(async (opts: { limit?: string; model?: string; target?: string }) => {
     const BOLD = '\x1b[1m';
     const DIM = '\x1b[0;90m';
     const GREEN = '\x1b[0;32m';
@@ -3442,6 +3443,11 @@ memoryCmd
       if (opts.model) {
         process.env.EMBEDDING_DENSE_MODEL = opts.model;
       }
+      const target = (opts.target ?? 'all').toLowerCase();
+      if (!['chunks', 'transcripts', 'all'].includes(target)) {
+        console.error(`  ${RED}Invalid --target${RESET}: "${opts.target}". Use chunks | transcripts | all.`);
+        process.exit(1);
+      }
       const limit = opts.limit ? parseInt(opts.limit, 10) : undefined;
       const { MemoryStore } = await import('../memory/store.js');
       const embeddings = await import('../memory/embeddings.js');
@@ -3451,7 +3457,7 @@ memoryCmd
       store.initialize();
 
       console.log();
-      console.log(`  ${BOLD}Dense embedding backfill${RESET}`);
+      console.log(`  ${BOLD}Dense embedding backfill${RESET} ${DIM}(target: ${target})${RESET}`);
       console.log(`  Model: ${embeddings.currentDenseModel()}`);
       console.log(`  ${DIM}Loading model (first run downloads ~440MB)…${RESET}`);
       const ready = await embeddings.probeDenseReady();
@@ -3463,27 +3469,62 @@ memoryCmd
       console.log(`  ${GREEN}✓${RESET} Model ready (${embeddings.denseDimension()}-dim).`);
       console.log();
 
-      const startTime = Date.now();
-      let lastReport = 0;
-      const result = await store.backfillDenseEmbeddings({
-        limit,
-        onProgress: (done, total) => {
-          // Throttle to avoid spamming
+      const reportProgress = (label: string, startTime: number) => {
+        let lastReport = 0;
+        return (done: number, total: number) => {
           const now = Date.now();
           if (now - lastReport < 500 && done < total) return;
           lastReport = now;
           const pct = total > 0 ? Math.round((done / total) * 100) : 0;
           const elapsed = Math.round((now - startTime) / 1000);
-          process.stdout.write(`\r  Progress: ${BOLD}${done.toLocaleString()}${RESET}/${total.toLocaleString()} (${pct}%) ${DIM}${elapsed}s${RESET}    `);
-        },
-      });
-      process.stdout.write('\n\n');
-      const elapsed = Math.round((Date.now() - startTime) / 1000);
-      console.log(`  ${GREEN}✓${RESET} Embedded ${BOLD}${result.embedded.toLocaleString()}${RESET} chunks ${DIM}(${elapsed}s elapsed)${RESET}`);
-      if (result.failed > 0) {
-        console.log(`  ${YELLOW}!${RESET} Failed: ${result.failed.toLocaleString()} ${DIM}(model returned null — usually empty or invalid input)${RESET}`);
+          process.stdout.write(`\r  ${label}: ${BOLD}${done.toLocaleString()}${RESET}/${total.toLocaleString()} (${pct}%) ${DIM}${elapsed}s${RESET}    `);
+        };
+      };
+
+      let totalEmbedded = 0;
+      let totalFailed = 0;
+      let lastModel = '';
+
+      if (target === 'chunks' || target === 'all') {
+        const startTime = Date.now();
+        const result = await store.backfillDenseEmbeddings({
+          limit,
+          onProgress: reportProgress('Chunks', startTime),
+        });
+        process.stdout.write('\n');
+        const elapsed = Math.round((Date.now() - startTime) / 1000);
+        console.log(`  ${GREEN}✓${RESET} Embedded ${BOLD}${result.embedded.toLocaleString()}${RESET} chunks ${DIM}(${elapsed}s elapsed)${RESET}`);
+        if (result.failed > 0) {
+          console.log(`  ${YELLOW}!${RESET} Chunk failures: ${result.failed.toLocaleString()}`);
+        }
+        totalEmbedded += result.embedded;
+        totalFailed += result.failed;
+        lastModel = result.model;
       }
-      console.log(`  Model: ${result.model}`);
+
+      if (target === 'transcripts' || target === 'all') {
+        const startTime = Date.now();
+        const result = await store.backfillTranscriptDenseEmbeddings({
+          limit,
+          onProgress: reportProgress('Transcripts', startTime),
+        });
+        process.stdout.write('\n');
+        const elapsed = Math.round((Date.now() - startTime) / 1000);
+        console.log(`  ${GREEN}✓${RESET} Embedded ${BOLD}${result.embedded.toLocaleString()}${RESET} transcripts ${DIM}(${elapsed}s elapsed)${RESET}`);
+        if (result.failed > 0) {
+          console.log(`  ${YELLOW}!${RESET} Transcript failures: ${result.failed.toLocaleString()}`);
+        }
+        totalEmbedded += result.embedded;
+        totalFailed += result.failed;
+        lastModel = result.model;
+      }
+
+      console.log();
+      console.log(`  Total embedded: ${BOLD}${totalEmbedded.toLocaleString()}${RESET}`);
+      if (totalFailed > 0) {
+        console.log(`  ${DIM}(model returned null on ${totalFailed.toLocaleString()} — usually empty or invalid input)${RESET}`);
+      }
+      console.log(`  Model: ${lastModel}`);
       console.log();
       console.log(`  ${DIM}Run \`clementine memory status\` to see updated coverage.${RESET}`);
       console.log();

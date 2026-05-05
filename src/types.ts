@@ -425,6 +425,7 @@ export interface Models {
 // ── Transcript ───────────────────────────────────────────────────────
 
 export interface TranscriptTurn {
+  id?: number;
   sessionKey: string;
   role: string;
   content: string;

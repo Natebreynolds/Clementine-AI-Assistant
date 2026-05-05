@@ -14,6 +14,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import pino from 'pino';
 
 import { BASE_DIR } from '../config.js';
+import { recordContextEvent } from './context-events.js';
 
 const logger = pino({ name: 'clementine.notification-context' });
 
@@ -103,6 +104,34 @@ export function recordProactiveNotificationEvent(
     appendFileSync(file, JSON.stringify(event) + '\n');
   } catch (err) {
     logger.warn({ err, type: input.type }, 'Failed to persist proactive notification event');
+  }
+
+  try {
+    const body = `${event.summary} ${event.textPreview}`;
+    const noisyOrRecovered = /\b0\/0 recent runs failed\b/i.test(body)
+      || /\b(no active failures|has recovered|fully recovered|running healthy|no fix needed)\b/i.test(body);
+    recordContextEvent({
+      source: 'notification',
+      sourceId: event.id,
+      ...(event.sessionKey ? { sessionKey: event.sessionKey } : {}),
+      title: `${event.type}: ${event.title}`,
+      summary: event.summary || event.textPreview,
+      status: event.type === 'cron_failure' ? 'failed' : 'active',
+      severity: noisyOrRecovered ? 'low' : event.type === 'cron_failure' ? 'warning' : 'normal',
+      eventAt: event.sentAt,
+      loggedAt: event.sentAt,
+      surfacedAt: event.sentAt,
+      fingerprintParts: [
+        event.sessionKey ?? 'broadcast',
+        'notification',
+        event.type,
+        event.jobNames?.join(',') ?? event.title,
+        event.summary || event.textPreview,
+      ],
+      metadata: { notificationId: event.id, jobNames: event.jobNames ?? [] },
+    }, { baseDir: options.baseDir, now: options.now });
+  } catch (err) {
+    logger.warn({ err, type: input.type }, 'Failed to persist notification context event');
   }
 
   return event;

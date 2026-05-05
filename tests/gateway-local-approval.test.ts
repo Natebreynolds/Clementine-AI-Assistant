@@ -58,7 +58,7 @@ describe('gateway local approval replies', () => {
     expect(gateway.cancelActiveBackgroundTask).toHaveBeenCalledWith('discord:member-dm:badando:user-1', 'cancel');
   });
 
-  it('uses active working set context for standalone greetings', async () => {
+  it('keeps standalone greetings lightweight even when active context exists', async () => {
     const gateway = makeGateway(false);
 
     await expect(gateway.handleLocalTurn(
@@ -66,6 +66,6 @@ describe('gateway local approval replies', () => {
       'hey',
       undefined,
       { greetingLine: 'Hey. Main thing right now: audit-inbox-check error — phase 3 failed.' },
-    )).resolves.toBe('Hey. Main thing right now: audit-inbox-check error — phase 3 failed.');
+    )).resolves.toBe('Hey. I am here.');
   });
 });

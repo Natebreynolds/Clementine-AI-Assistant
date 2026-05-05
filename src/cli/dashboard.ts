@@ -6947,6 +6947,29 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
     }
   });
 
+  // Coverage + recall telemetry for both chunks and transcripts. Powers the
+  // Memory Coverage card showing whether dense recall is actually earning its
+  // keep on the current corpus.
+  app.get('/api/memory/coverage', async (_req, res) => {
+    try {
+      const gateway = await getGateway();
+      const store = (gateway as any).assistant?.memoryStore;
+      if (!store) {
+        res.status(503).json({ error: 'Memory store not available' });
+        return;
+      }
+      const transcripts = typeof store.getTranscriptDenseCoverage === 'function'
+        ? store.getTranscriptDenseCoverage()
+        : { embedded: 0, total: 0, model: null };
+      const recall = typeof store.getRecallTelemetrySummary === 'function'
+        ? store.getRecallTelemetrySummary(7)
+        : { total: 0, semanticOnly: 0, lexicalOnly: 0, bothModes: 0, avgTopScore: 0 };
+      res.json({ ok: true, transcripts, recall });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
   // Quick-add: append a sentence to today's daily note from the dashboard.
   // Mirrors the agent's memory_write({action:'append_daily'}) path so the
   // note gets indexed identically.
@@ -24830,6 +24853,38 @@ async function refreshCoverageStrip() {
       html += '<span style="margin-left:auto;color:var(--text-muted)">All chunks indexed</span>';
     }
     html += '</div>';
+
+    // Second strip: transcripts dense coverage + 7-day recall hit-rate.
+    try {
+      var rc = await apiFetch('/api/memory/coverage');
+      var dc = await rc.json();
+      if (dc.ok) {
+        var tx = dc.transcripts || { embedded: 0, total: 0 };
+        var rec = dc.recall || { total: 0, semanticOnly: 0, lexicalOnly: 0, bothModes: 0, avgTopScore: 0 };
+        var txPct = tx.total > 0 ? Math.round((tx.embedded / tx.total) * 100) : 0;
+        var txColor = txPct >= 95 ? '#10b981' : txPct >= 50 ? '#f59e0b' : '#ef4444';
+        var recallTotal = rec.total || 0;
+        var hit = function(n){ return recallTotal > 0 ? Math.round((n / recallTotal) * 100) : 0; };
+        html += '<div style="display:flex;align-items:center;gap:14px;padding:10px 14px;margin-top:8px;background:var(--bg-secondary);border:1px solid var(--border);border-radius:8px;flex-wrap:wrap;font-size:12px">';
+        html += '<span style="color:var(--text-muted)">Conversation recall:</span>';
+        html += '<span><span style="color:' + txColor + '">●</span> Transcripts ' + txPct + '% '
+          + '<span style="color:var(--text-muted)">(' + tx.embedded.toLocaleString() + '/' + tx.total.toLocaleString() + ')</span></span>';
+        if (recallTotal > 0) {
+          html += '<span style="color:var(--text-muted)">|</span>';
+          html += '<span title="Last 7 days">Hit-rate: '
+            + 'semantic ' + hit(rec.semanticOnly) + '% · '
+            + 'lexical ' + hit(rec.lexicalOnly) + '% · '
+            + 'both ' + hit(rec.bothModes) + '% '
+            + '<span style="color:var(--text-muted)">(' + recallTotal.toLocaleString() + ' queries)</span></span>';
+        } else {
+          html += '<span style="color:var(--text-muted)">No recall queries logged in the last 7 days.</span>';
+        }
+        if (tx.total > 0 && tx.embedded < tx.total) {
+          html += '<span style="margin-left:auto;color:var(--text-muted)">' + (tx.total - tx.embedded).toLocaleString() + ' transcripts unembedded — run <code>clementine memory reembed --target transcripts</code></span>';
+        }
+        html += '</div>';
+      }
+    } catch (e) { /* coverage strip is best-effort */ }
     el.innerHTML = html;
   } catch (err) {
     el.innerHTML = '';

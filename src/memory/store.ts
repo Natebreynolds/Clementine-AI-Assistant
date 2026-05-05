@@ -1007,6 +1007,40 @@ export class MemoryStore {
       this.conn.exec('CREATE INDEX idx_chunks_has_dense ON chunks(id) WHERE embedding_dense IS NOT NULL');
     } catch { /* already exists */ }
 
+    // Dense neural embeddings on transcripts. Parallel to chunks.embedding_dense
+    // but for raw conversation history. Enables paraphrased recall over past
+    // chats — "what did we decide about auth?" can match a turn that said
+    // "session token middleware" without lexical overlap. Backfilled by
+    // backfillTranscriptDenseEmbeddings(); not embedded at insert time so the
+    // hot insert path stays sync.
+    try {
+      this.conn.exec('ALTER TABLE transcripts ADD COLUMN embedding_dense BLOB');
+    } catch { /* already exists */ }
+    try {
+      this.conn.exec('ALTER TABLE transcripts ADD COLUMN embedding_dense_model TEXT DEFAULT NULL');
+    } catch { /* already exists */ }
+    try {
+      this.conn.exec('CREATE INDEX idx_transcripts_has_dense ON transcripts(id) WHERE embedding_dense IS NOT NULL');
+    } catch { /* already exists */ }
+
+    // Recall telemetry — every conversation-recall query logs hit counts and
+    // top score so the dashboard can show whether dense retrieval actually
+    // earns its keep on this corpus.
+    this.conn.exec(`
+      CREATE TABLE IF NOT EXISTS recall_telemetry (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_key TEXT NOT NULL,
+        query TEXT NOT NULL,
+        mode TEXT NOT NULL,
+        semantic_hits INTEGER DEFAULT 0,
+        lexical_hits INTEGER DEFAULT 0,
+        fused_hits INTEGER DEFAULT 0,
+        top_score REAL DEFAULT 0,
+        created_at TEXT DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_recall_telemetry_created ON recall_telemetry(created_at DESC);
+    `);
+
     // Soft-delete via a separate table — keeps the chunks_au trigger
     // out of the path so we don't have to fight with the FTS5 contentless
     // index's delete-then-insert semantics. Search query paths LEFT JOIN
@@ -3399,6 +3433,7 @@ export class MemoryStore {
   ): TranscriptTurn[] {
     const sanitized = MemoryStore.sanitizeFtsQuery(query);
     let rows: Array<{
+      id: number;
       session_key: string;
       role: string;
       content: string;
@@ -3409,7 +3444,7 @@ export class MemoryStore {
     if (sanitized) {
       try {
         const params: unknown[] = [sanitized];
-        let sql = `SELECT t.session_key, t.role, t.content, t.model, t.created_at
+        let sql = `SELECT t.id, t.session_key, t.role, t.content, t.model, t.created_at
            FROM transcripts_fts f
            JOIN transcripts t ON t.id = f.rowid
            WHERE transcripts_fts MATCH ?`;
@@ -3422,6 +3457,7 @@ export class MemoryStore {
         rows = this.conn.prepare(sql).all(...params) as typeof rows;
 
         return rows.map((row) => ({
+          id: row.id,
           sessionKey: row.session_key,
           role: row.role,
           content: row.content.slice(0, 2000),
@@ -3437,7 +3473,7 @@ export class MemoryStore {
     if (sessionKey) {
       rows = this.conn
         .prepare(
-          `SELECT session_key, role, content, model, created_at
+          `SELECT id, session_key, role, content, model, created_at
            FROM transcripts
            WHERE session_key = ? AND LOWER(content) LIKE ?
            ORDER BY created_at DESC LIMIT ?`,
@@ -3446,7 +3482,7 @@ export class MemoryStore {
     } else {
       rows = this.conn
         .prepare(
-          `SELECT session_key, role, content, model, created_at
+          `SELECT id, session_key, role, content, model, created_at
            FROM transcripts
            WHERE LOWER(content) LIKE ?
            ORDER BY created_at DESC LIMIT ?`,
@@ -3455,12 +3491,225 @@ export class MemoryStore {
     }
 
     return rows.map((row) => ({
+      id: row.id,
       sessionKey: row.session_key,
       role: row.role,
       content: row.content.slice(0, 2000), // Truncate for readability
       model: row.model,
       createdAt: row.created_at,
     }));
+  }
+
+  /**
+   * Dense-embedding search over transcripts. Counterpart to searchTranscripts
+   * (FTS5) — returns turns ranked by cosine similarity to a pre-computed query
+   * vector. Caller computes the vector via embeddingsModule.embedDense(text, true)
+   * so the retrieval-instruction prefix is applied; returning empty here is
+   * expected when no transcripts have been backfilled yet.
+   */
+  searchTranscriptsByDense(
+    queryVec: Float32Array,
+    limit: number = 20,
+    sessionKey: string = '',
+  ): Array<{ turn: TranscriptTurn; score: number }> {
+    const params: Array<string | number> = [];
+    let sql = `SELECT id, session_key, role, content, model, created_at, embedding_dense
+                 FROM transcripts WHERE embedding_dense IS NOT NULL`;
+    if (sessionKey) {
+      sql += ' AND session_key = ?';
+      params.push(sessionKey);
+    }
+    let rows: Array<{
+      id: number;
+      session_key: string;
+      role: string;
+      content: string;
+      model: string;
+      created_at: string;
+      embedding_dense: Buffer;
+    }>;
+    try {
+      rows = this.conn.prepare(sql).all(...params) as typeof rows;
+    } catch {
+      return [];
+    }
+
+    const scored: Array<{ turn: TranscriptTurn; score: number }> = [];
+    const nowMs = Date.now();
+    for (const row of rows) {
+      try {
+        const vec = embeddingsModule.deserializeEmbedding(row.embedding_dense);
+        const sim = embeddingsModule.cosineSimilarity(queryVec, vec);
+        if (sim < 0.3) continue;
+        let score = sim;
+        if (row.created_at) {
+          const daysOld = Math.max(0, (nowMs - new Date(row.created_at).getTime()) / 86_400_000);
+          // Gentler decay than chunks: conversations stay relevant longer.
+          score *= Math.max(0.5, temporalDecay(daysOld, 60));
+        }
+        scored.push({
+          turn: {
+            id: row.id,
+            sessionKey: row.session_key,
+            role: row.role,
+            content: row.content.slice(0, 2000),
+            model: row.model,
+            createdAt: row.created_at,
+          },
+          score,
+        });
+      } catch { /* skip malformed embeddings */ }
+    }
+    return scored.sort((a, b) => b.score - a.score).slice(0, limit);
+  }
+
+  /**
+   * Backfill dense embeddings on transcripts that don't yet have one (or that
+   * were embedded by a different model). Mirrors backfillDenseEmbeddings() on
+   * chunks.
+   */
+  async backfillTranscriptDenseEmbeddings(opts: {
+    limit?: number;
+    onProgress?: (done: number, total: number) => void;
+    forceModel?: string;
+  } = {}): Promise<{ embedded: number; skipped: number; failed: number; model: string }> {
+    const currentModel = embeddingsModule.currentDenseModel();
+    const targetModel = opts.forceModel ?? currentModel;
+
+    const candidates = this.conn.prepare(
+      `SELECT id, role, content
+       FROM transcripts
+       WHERE (embedding_dense IS NULL OR embedding_dense_model IS NULL OR embedding_dense_model != ?)
+         AND length(content) >= 1
+       ORDER BY created_at DESC
+       ${opts.limit ? 'LIMIT ?' : ''}`,
+    ).all(...[targetModel, ...(opts.limit ? [opts.limit] : [])]) as Array<{ id: number; role: string; content: string }>;
+
+    const total = candidates.length;
+    let embedded = 0;
+    let failed = 0;
+
+    const updateStmt = this.conn.prepare(
+      `UPDATE transcripts SET embedding_dense = ?, embedding_dense_model = ? WHERE id = ?`,
+    );
+
+    for (let i = 0; i < candidates.length; i++) {
+      const c = candidates[i];
+      try {
+        // Prepend role so role-specific phrasing ("user said …" vs "assistant
+        // said …") clusters distinctly without conflating the speakers.
+        const passageText = `${c.role}: ${c.content}`.slice(0, 4000);
+        const vec = await embeddingsModule.embedDense(passageText, false);
+        if (vec) {
+          updateStmt.run(embeddingsModule.serializeEmbedding(vec), targetModel, c.id);
+          embedded++;
+        } else {
+          failed++;
+        }
+      } catch {
+        failed++;
+      }
+      if (opts.onProgress && (i + 1) % 25 === 0) {
+        opts.onProgress(i + 1, total);
+      }
+    }
+    if (opts.onProgress) opts.onProgress(total, total);
+
+    return { embedded, skipped: 0, failed, model: targetModel };
+  }
+
+  /**
+   * Coverage stats for transcript dense embeddings — analogous to chunks
+   * coverage, surfaced in the dashboard.
+   */
+  getTranscriptDenseCoverage(): { total: number; embedded: number; model: string | null } {
+    const totalRow = this.conn.prepare('SELECT COUNT(*) as cnt FROM transcripts').get() as { cnt: number };
+    const embeddedRow = this.conn
+      .prepare('SELECT COUNT(*) as cnt FROM transcripts WHERE embedding_dense IS NOT NULL')
+      .get() as { cnt: number };
+    const modelRow = this.conn
+      .prepare(`SELECT COALESCE(embedding_dense_model, '(unknown)') as model
+                FROM transcripts WHERE embedding_dense IS NOT NULL
+                GROUP BY embedding_dense_model ORDER BY COUNT(*) DESC LIMIT 1`)
+      .get() as { model: string } | undefined;
+    return {
+      total: totalRow?.cnt ?? 0,
+      embedded: embeddedRow?.cnt ?? 0,
+      model: modelRow?.model ?? null,
+    };
+  }
+
+  /**
+   * Log a conversation-recall hit for telemetry. Caller pre-computes hit
+   * counts; this method is a fast best-effort insert that swallows errors
+   * because telemetry must never break the chat path.
+   */
+  logRecallTelemetry(entry: {
+    sessionKey: string;
+    query: string;
+    mode: 'hybrid' | 'dense' | 'lexical';
+    semanticHits: number;
+    lexicalHits: number;
+    fusedHits: number;
+    topScore: number;
+  }): void {
+    try {
+      this.conn
+        .prepare(
+          `INSERT INTO recall_telemetry
+           (session_key, query, mode, semantic_hits, lexical_hits, fused_hits, top_score)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          entry.sessionKey,
+          entry.query.slice(0, 500),
+          entry.mode,
+          entry.semanticHits,
+          entry.lexicalHits,
+          entry.fusedHits,
+          entry.topScore,
+        );
+    } catch { /* telemetry must not break chat */ }
+  }
+
+  /**
+   * Aggregate recall telemetry over a recent window for the dashboard.
+   */
+  getRecallTelemetrySummary(windowDays: number = 7): {
+    total: number;
+    semanticOnly: number;
+    lexicalOnly: number;
+    bothModes: number;
+    avgTopScore: number;
+  } {
+    try {
+      const row = this.conn
+        .prepare(
+          `SELECT COUNT(*) as total,
+                  SUM(CASE WHEN semantic_hits > 0 AND lexical_hits = 0 THEN 1 ELSE 0 END) as semantic_only,
+                  SUM(CASE WHEN lexical_hits > 0 AND semantic_hits = 0 THEN 1 ELSE 0 END) as lexical_only,
+                  SUM(CASE WHEN semantic_hits > 0 AND lexical_hits > 0 THEN 1 ELSE 0 END) as both_modes,
+                  AVG(top_score) as avg_top_score
+           FROM recall_telemetry
+           WHERE created_at > datetime('now', ?)`,
+        )
+        .get(`-${Math.max(1, windowDays)} days`) as {
+          total: number;
+          semantic_only: number | null;
+          lexical_only: number | null;
+          both_modes: number | null;
+          avg_top_score: number | null;
+        };
+      return {
+        total: row?.total ?? 0,
+        semanticOnly: row?.semantic_only ?? 0,
+        lexicalOnly: row?.lexical_only ?? 0,
+        bothModes: row?.both_modes ?? 0,
+        avgTopScore: row?.avg_top_score ?? 0,
+      };
+    } catch {
+      return { total: 0, semanticOnly: 0, lexicalOnly: 0, bothModes: 0, avgTopScore: 0 };
+    }
   }
 
   // ── Session Summaries ─────────────────────────────────────────────
