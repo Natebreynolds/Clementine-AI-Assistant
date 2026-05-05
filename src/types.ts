@@ -671,6 +671,9 @@ export interface WorkflowDefinition {
   synthesis?: { prompt: string };
   sourceFile: string;
   agentSlug?: string;
+  /** Optional linked-project path. Becomes the default cwd for CLI steps and
+   *  the fallback workDir for prompt/MCP steps that don't set one explicitly. */
+  project?: string;
 }
 
 export type WorkflowOriginKind = 'workflow' | 'cron';

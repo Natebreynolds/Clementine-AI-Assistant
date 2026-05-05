@@ -204,6 +204,7 @@ server.tool(
       steps: z.array(stepShape),
       synthesis: z.object({ prompt: z.string() }).optional(),
       agentSlug: z.string().optional(),
+      project: z.string().optional().describe('Linked-project path; default cwd for CLI steps'),
     }),
     force: z.boolean().optional().describe('Bypass validation errors (warnings always ignored)'),
   },

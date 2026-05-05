@@ -315,7 +315,7 @@ async function executeCliStep(
     let child: ReturnType<typeof spawn> | null = null;
     try {
       child = spawn(cmd, args, {
-        cwd: step.cli!.workDir,
+        cwd: step.cli!.workDir ?? ctx.workflowProject,
         stdio: ['ignore', 'pipe', 'pipe'],
         env: process.env,
       });
@@ -398,13 +398,14 @@ function executeLoopStep(step: WorkflowStep, ctx: ExecContext): StepOutput {
 interface ExecContext {
   steps: Record<string, unknown>;
   input: unknown;
+  workflowProject?: string;
 }
 
-function buildExecContext(_wf: WorkflowDefinition, priorOutputs: Map<string, unknown>): ExecContext {
+function buildExecContext(wf: WorkflowDefinition, priorOutputs: Map<string, unknown>): ExecContext {
   const steps: Record<string, unknown> = {};
   for (const [k, v] of priorOutputs) steps[k] = v;
   // For loop body steps, downstream may reference the upstream loop step by id.
-  return { steps, input: undefined };
+  return { steps, input: undefined, workflowProject: wf.project };
 }
 
 function evalSandbox(expression: string, ctx: ExecContext): unknown {

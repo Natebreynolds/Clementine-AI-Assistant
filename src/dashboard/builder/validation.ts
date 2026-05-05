@@ -98,8 +98,31 @@ export function validateWorkflow(wf: WorkflowDefinition): ValidationResult {
     }
   }
 
+  // Dir-sensitive CLI commands without an effective working directory.
+  // Many CLIs (gh, git, sf, gcloud, npm) read config from the current dir;
+  // running them with no workDir and no workflow project usually misfires.
+  if (!wf.project) {
+    for (const step of wf.steps) {
+      if ((step.kind ?? 'prompt') !== 'cli' || !step.cli || !step.cli.cmd) continue;
+      if (step.cli.workDir) continue;
+      if (DIR_SENSITIVE_CLIS.has(step.cli.cmd)) {
+        issues.push({
+          severity: 'warning', code: 'cli-no-workdir',
+          stepId: step.id,
+          message: `CLI step "${step.id}" runs \`${step.cli.cmd}\` with no workDir and the workflow has no project — set a project on the workflow or workDir on the step`,
+        });
+      }
+    }
+  }
+
   return { ok: !issues.some(i => i.severity === 'error'), issues };
 }
+
+const DIR_SENSITIVE_CLIS = new Set([
+  'gh', 'git', 'sf', 'sfdx', 'gcloud', 'aws',
+  'npm', 'pnpm', 'yarn', 'bun', 'pip', 'poetry', 'cargo', 'go',
+  'docker', 'kubectl', 'terraform', 'make',
+]);
 
 function validateStepConfig(step: WorkflowStep): ValidationIssue[] {
   const issues: ValidationIssue[] = [];
