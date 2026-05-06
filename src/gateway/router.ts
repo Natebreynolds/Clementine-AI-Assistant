@@ -2019,57 +2019,64 @@ export class Gateway {
           const { buildExtraMcpForRunAgent } = await import('../agent/run-agent-mcp.js');
           const { buildChatSystemAppend } = await import('../agent/run-agent-context.js');
 
-          // Wire Composio + external MCP servers (Outlook, Gmail,
-          // Salesforce, etc) so chat can reach the same tools the
-          // legacy chat path did. Profile allowlists override the
-          // bundle router when set.
-          //
-          // Use originalText (not chatPrompt) for scope routing —
-          // chatPrompt may have the partial-interrupt banner folded in,
-          // which would skew bundle matching.
-          const chatMcp = await buildExtraMcpForRunAgent({
-            scopeText: originalText,
-            profile: resolvedProfile,
-          });
+          // Builder sessions (dashboard trick/skill/cron/agent builder)
+          // are conversational JSON-drafting flows, not real chat. They
+          // don't need vault context, MCP tools, recall, or auto-memory
+          // extraction — the builder prefix IS the system prompt and
+          // the agent only emits json-artifact blocks. Strip everything
+          // expensive; keep just SDK session resume so multi-turn
+          // artifact iteration sees its own prior turns.
+          const isBuilderSession = sessionKey.startsWith('dashboard:builder:');
 
-          // Inject vault context (SOUL.md / MEMORY.md / AGENTS.md +
-          // optional profile body) into the system-prompt append so
-          // the agent has personality + long-term memory + team
-          // awareness. Profile-specific MEMORY.md takes precedence
-          // over the global one when a hired agent is active.
-          const chatSystemAppend = buildChatSystemAppend({
-            profile: resolvedProfile,
-            profileAppend: resolvedProfile?.systemPromptBody,
-          });
+          // Wire Composio + external MCP only for real chat. Builder
+          // skips entirely — builder turns never call tools.
+          const chatMcp = isBuilderSession
+            ? null
+            : await buildExtraMcpForRunAgent({
+                scopeText: originalText,
+                profile: resolvedProfile,
+              });
 
-          // Per-turn context — recall of recent transcripts, persistent
-          // learnings, silent context blocks, security advisories, and
-          // toolset directives accumulated above. This is what gives
-          // continuity across daemon restarts (SDK in-memory session is
-          // gone, but transcripts in SQLite persist; recall surfaces
-          // them). Prefixed to the user message in a clearly-delimited
-          // [Context] block so the model knows it's framing, not user
-          // input.
-          const turnContextPrefix = securityAnnotation.trim()
+          // Vault context (SOUL.md / MEMORY.md / AGENTS.md + optional
+          // profile body) — real chat only. Builder gets just its own
+          // prefix as the system prompt.
+          const chatSystemAppend = isBuilderSession
+            ? ''
+            : buildChatSystemAppend({
+                profile: resolvedProfile,
+                profileAppend: resolvedProfile?.systemPromptBody,
+              });
+
+          // Per-turn context (recall + persistent learnings + silent
+          // blocks + security/toolset directives) — real chat only.
+          // Builder doesn't need recall of unrelated transcripts.
+          const turnContextPrefix = !isBuilderSession && securityAnnotation.trim()
             ? `[Context — read this for continuity, then respond to the user message below]\n${securityAnnotation}\n[/Context]\n\n`
             : '';
           const finalPrompt = turnContextPrefix + chatPrompt;
 
           // Resume the prior SDK session when one exists for this
           // sessionKey. The SDK persists session JSONLs to disk, so
-          // resume works across daemon restarts. Without this, every
-          // turn is a fresh SDK session with zero conversation history.
+          // resume works across daemon restarts AND for builder
+          // multi-turn artifact iteration.
           const priorSdkSessionId = this.assistant.getSdkSessionId(effectiveSessionKey);
+
+          // Builder cost knobs: Haiku is plenty for JSON drafting,
+          // tight budget, no tools surfaced in the system prompt.
+          const builderModel = isBuilderSession ? MODELS.haiku : effectiveModel;
+          const builderBudget = isBuilderSession ? 0.10 : undefined;
+          const builderAllowedTools = isBuilderSession ? [] : undefined;
 
           logger.info({
             sessionKey: effectiveSessionKey,
             profile: resolvedProfile?.slug,
-            path: 'runagent_chat',
-            composioConnected: chatMcp.composioConnected.length,
-            externalConnected: chatMcp.externalConnected.length,
+            path: isBuilderSession ? 'runagent_builder' : 'runagent_chat',
+            composioConnected: chatMcp?.composioConnected.length ?? 0,
+            externalConnected: chatMcp?.externalConnected.length ?? 0,
             systemAppendChars: chatSystemAppend.length,
             turnContextChars: turnContextPrefix.length,
             resumingSdkSessionId: priorSdkSessionId || null,
+            isBuilderSession,
           }, 'Routing chat through runAgent');
 
           const runAgentResult = await runAgent(finalPrompt, {
@@ -2078,11 +2085,13 @@ export class Gateway {
             profile: resolvedProfile,
             agentManager: this.getAgentManager(),
             memoryStore: this.assistant.getMemoryStore?.() ?? null,
-            ...(effectiveModel ? { model: effectiveModel } : {}),
+            ...(builderModel ? { model: builderModel } : {}),
             ...(maxTurns ? { maxTurns } : {}),
+            ...(builderBudget !== undefined ? { maxBudgetUsd: builderBudget } : {}),
+            ...(builderAllowedTools ? { allowedTools: builderAllowedTools } : {}),
             ...(chatSystemAppend ? { systemPromptAppend: chatSystemAppend } : {}),
             ...(priorSdkSessionId ? { resumeSessionId: priorSdkSessionId } : {}),
-            extraMcpServers: chatMcp.servers as unknown as Parameters<typeof runAgent>[1]['extraMcpServers'],
+            ...(chatMcp ? { extraMcpServers: chatMcp.servers as unknown as Parameters<typeof runAgent>[1]['extraMcpServers'] } : {}),
             onText: wrappedOnText,
             onToolActivity: ({ tool, input }) => {
               toolActivityCount++;
@@ -2103,9 +2112,11 @@ export class Gateway {
           clearTimeout(chatTimer);
           clearTimeout(hardWallTimer);
 
-          // Mirror transcript so memory + recall continue working.
+          // Mirror transcript so memory + recall continue working — but
+          // skip for builder sessions since their turns are spec-drafting,
+          // not real conversation worth recalling later.
           const memoryStore = this.assistant.getMemoryStore?.();
-          if (memoryStore) {
+          if (memoryStore && !isBuilderSession) {
             try {
               memoryStore.saveTurn(effectiveSessionKey, 'user', originalText);
               memoryStore.saveTurn(effectiveSessionKey, 'assistant', runAgentResult.text);
@@ -2114,10 +2125,13 @@ export class Gateway {
             }
           }
 
-          // Fire auto-memory extraction in the background.
-          this.assistant
-            .triggerMemoryExtractionPostExchange(originalText, runAgentResult.text, effectiveSessionKey, resolvedProfile)
-            .catch(err => logger.debug({ err, sessionKey: effectiveSessionKey }, 'chat: auto-memory failed (non-fatal)'));
+          // Fire auto-memory extraction in the background — builder
+          // turns are JSON-drafting noise, not memorable exchanges.
+          if (!isBuilderSession) {
+            this.assistant
+              .triggerMemoryExtractionPostExchange(originalText, runAgentResult.text, effectiveSessionKey, resolvedProfile)
+              .catch(err => logger.debug({ err, sessionKey: effectiveSessionKey }, 'chat: auto-memory failed (non-fatal)'));
+          }
 
           // Auth recovered if we got a clean response.
           this.clearAuthFailure();
