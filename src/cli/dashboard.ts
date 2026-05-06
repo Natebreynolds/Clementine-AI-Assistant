@@ -2359,7 +2359,8 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
     const isLongRunning = req.path.startsWith('/brain/')
       || req.path.endsWith('/stream')
       || req.path === '/chat'
-      || req.path === '/builder/chat';
+      || req.path === '/builder/chat'
+      || req.path === '/runagent/test';
     const timeoutMs = isLongRunning ? 10 * 60 * 1000 : 8000;
     const timeout = setTimeout(() => {
       if (!res.headersSent) {

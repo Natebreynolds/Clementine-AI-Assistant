@@ -22,13 +22,55 @@
  *    long-task preflight, NO mode=unleashed wrapper.
  */
 
+import path from 'node:path';
 import { query, type AgentDefinition, type SDKAssistantMessage, type SDKResultMessage } from '@anthropic-ai/claude-agent-sdk';
 import pino from 'pino';
-import { BASE_DIR, normalizeClaudeSdkOptionsForOneMillionContext } from '../config.js';
+import {
+  BASE_DIR,
+  PKG_DIR,
+  CLAUDE_CODE_OAUTH_TOKEN,
+  ANTHROPIC_API_KEY as CONFIG_ANTHROPIC_API_KEY,
+  normalizeClaudeSdkOptionsForOneMillionContext,
+} from '../config.js';
 import type { AgentProfile } from '../types.js';
 import type { AgentManager } from './agent-manager.js';
 import type { MemoryStore } from '../memory/store.js';
 import { buildAgentMap } from './agent-definitions.js';
+
+const MCP_SERVER_SCRIPT = path.join(PKG_DIR, 'dist', 'tools', 'mcp-server.js');
+const ASSISTANT_NAME = (process.env.ASSISTANT_NAME ?? 'Clementine').toLowerCase();
+const TOOLS_SERVER = `${ASSISTANT_NAME}-tools`;
+
+/**
+ * Build a minimal env for the SDK subprocess. Mirrors the existing
+ * SAFE_ENV pattern in assistant.ts but exposed here so runAgent can be
+ * its own thing without depending on the legacy assistant module.
+ *
+ * Priority: CLAUDE_CODE_OAUTH_TOKEN > ANTHROPIC_AUTH_TOKEN > ANTHROPIC_API_KEY.
+ * When all are absent, HOME lets the subprocess find Keychain OAuth.
+ */
+function buildRunAgentEnv(): Record<string, string> {
+  const env: Record<string, string> = {
+    PATH: process.env.PATH ?? '',
+    HOME: process.env.HOME ?? '',
+    LANG: process.env.LANG ?? 'en_US.UTF-8',
+    TERM: process.env.TERM ?? 'xterm-256color',
+    USER: process.env.USER ?? '',
+    SHELL: process.env.SHELL ?? '',
+    CLEMENTINE_HOME: BASE_DIR,
+  };
+  const oauthTok = CLAUDE_CODE_OAUTH_TOKEN || process.env.CLAUDE_CODE_OAUTH_TOKEN;
+  const authTok = process.env.ANTHROPIC_AUTH_TOKEN;
+  const apiKey = CONFIG_ANTHROPIC_API_KEY || process.env.ANTHROPIC_API_KEY;
+  if (oauthTok) {
+    env.CLAUDE_CODE_OAUTH_TOKEN = oauthTok;
+  } else if (authTok) {
+    env.ANTHROPIC_AUTH_TOKEN = authTok;
+  } else if (apiKey) {
+    env.ANTHROPIC_API_KEY = apiKey;
+  }
+  return env;
+}
 
 const logger = pino({ name: 'clementine.run-agent' });
 
@@ -178,6 +220,30 @@ export async function runAgent(prompt: string, opts: RunAgentOptions): Promise<R
   // restrictions live on each AgentDefinition.tools field.
   const allowedTools = opts.allowedTools ?? CORE_TOOLS_FOR_AGENT_PARENT;
 
+  // Wire the Clementine MCP server so the agent can reach memory/cron/
+  // broken-job tools. Without this, the cron-fixer subagent's `tools`
+  // list references mcp__clementine-tools__* that don't exist in the
+  // session, and the agent falls back to reading raw JSON files.
+  const subprocessEnv = buildRunAgentEnv();
+  const mcpServers: Record<string, {
+    type: 'stdio';
+    command: string;
+    args: string[];
+    env: Record<string, string>;
+  }> = {
+    [TOOLS_SERVER]: {
+      type: 'stdio',
+      command: 'node',
+      args: [MCP_SERVER_SCRIPT],
+      env: {
+        ...subprocessEnv,
+        CLEMENTINE_HOME: BASE_DIR,
+        ...(opts.profile?.slug ? { CLEMENTINE_TEAM_AGENT: opts.profile.slug } : {}),
+        CLEMENTINE_INTERACTION_SOURCE: source === 'cron' || source === 'heartbeat' ? 'autonomous' : 'interactive',
+      },
+    },
+  };
+
   // Apply 1M-context env normalization (existing infra)
   const sdkOptionsRaw = {
     systemPrompt: profileAppend
@@ -185,9 +251,11 @@ export async function runAgent(prompt: string, opts: RunAgentOptions): Promise<R
       : { type: 'preset' as const, preset: 'claude_code' as const },
     settingSources: opts.settingSources ?? ['project'] as ('project' | 'user' | 'local')[],
     agents,
+    mcpServers,
     allowedTools,
     permissionMode: 'bypassPermissions' as const,
     cwd: BASE_DIR,
+    env: subprocessEnv,
     maxBudgetUsd,
     effort,
     ...(opts.maxTurns ? { maxTurns: opts.maxTurns } : {}),
