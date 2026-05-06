@@ -28,6 +28,7 @@ import type { AgentManager } from './agent-manager.js';
 import type { MemoryStore } from '../memory/store.js';
 import { runAgent, type RunAgentResult } from './run-agent.js';
 import { buildExtraMcpForRunAgent } from './run-agent-mcp.js';
+import { buildAutonomousMemoryContext } from './run-agent-context.js';
 import { listAllGoals } from '../tools/shared.js';
 
 const CRON_PROGRESS_PENDING_MAX_ITEMS = 20;
@@ -299,6 +300,10 @@ export async function runAgentCron(opts: RunAgentCronOptions): Promise<RunAgentC
   const ownerName = process.env.OWNER_NAME ?? 'the user';
 
   // ── Compose context blocks (mirrors legacy runCronJob) ─────────────
+  // Memory block goes first so the agent reads its long-term context
+  // before the run-specific progress/goals/etc. For a hired agent
+  // (Ross/Sasha) this is their own MEMORY.md, not Clementine's global.
+  const memoryContext = buildAutonomousMemoryContext(opts.profile);
   const progressContext = buildProgressContext(opts.jobName);
   const goalContext = buildGoalContext(opts.jobName);
   const delegationContext = buildDelegationContext(agentSlug);
@@ -314,6 +319,7 @@ export async function runAgentCron(opts: RunAgentCronOptions): Promise<RunAgentC
   // Final prompt
   const builtPrompt =
     `[Scheduled task: ${opts.jobName}]\n\n` +
+    memoryContext +
     progressContext +
     goalContext +
     skillContext +

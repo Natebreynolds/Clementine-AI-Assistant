@@ -20,6 +20,7 @@ import type { AgentManager } from './agent-manager.js';
 import type { MemoryStore } from '../memory/store.js';
 import { runAgent, type RunAgentResult } from './run-agent.js';
 import { buildExtraMcpForRunAgent } from './run-agent-mcp.js';
+import { buildAutonomousMemoryContext } from './run-agent-context.js';
 
 const logger = pino({ name: 'clementine.run-agent-team-task' });
 
@@ -51,11 +52,17 @@ export async function runAgentTeamTask(opts: RunAgentTeamTaskOptions): Promise<R
   const now = new Date();
   const timestamp = now.toISOString().slice(0, 16).replace('T', ' ');
 
+  // Inject the recipient's own long-term memory so they have context
+  // about prior work, preferences, and team relationships before
+  // processing the message.
+  const memoryContext = buildAutonomousMemoryContext(opts.profile);
+
   // Match the legacy phase-1 prompt shape so existing agent training
   // (Sasha/Ross/Nora) keeps responding the same way. Phases 2+ are no
   // longer needed — the SDK keeps the conversation in one session.
   const builtPrompt =
     `[TEAM MESSAGE from ${opts.fromName} (${opts.fromSlug}) — ${timestamp}]\n\n` +
+    memoryContext +
     `You received a direct message from a teammate. Process it fully and autonomously.\n\n` +
     `MESSAGE:\n${opts.content}\n\n` +
     `IMPORTANT:\n` +
