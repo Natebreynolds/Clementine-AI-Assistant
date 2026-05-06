@@ -31,7 +31,6 @@ import { lanes } from './lanes.js';
 import { AgentManager } from '../agent/agent-manager.js';
 import { TeamRouter } from '../agent/team-router.js';
 import { TeamBus } from '../agent/team-bus.js';
-import { events } from '../events/bus.js';
 import type { NotificationDispatcher } from './notifications.js';
 import { listBackgroundTasks, loadBackgroundTask, markFailed } from '../agent/background-tasks.js';
 import { applyAssistantExperienceUpdate, detectApprovalReply, detectLocalTurn, type AssistantExperienceUpdate } from '../agent/local-turn.js';
@@ -1709,7 +1708,6 @@ export class Gateway {
           logger.info({ sessionKey, laneWaitMs }, 'Chat lane wait was non-trivial');
         }
         logger.info(`Message from ${sessionKey}: ${text.slice(0, 100)}...`);
-        events.emit('message:received', { sessionKey, text, timestamp: Date.now() });
 
         // ── Register provenance on first interaction ────────────────
         this.ensureProvenance(sessionKey);
@@ -2018,10 +2016,35 @@ export class Gateway {
           // runAgent() owns chat. No legacy fallback — errors propagate
           // to the catch block below for honest classification.
           const { runAgent } = await import('../agent/run-agent.js');
+          const { buildExtraMcpForRunAgent } = await import('../agent/run-agent-mcp.js');
+          const { buildChatSystemAppend } = await import('../agent/run-agent-context.js');
+
+          // Wire Composio + external MCP servers (Outlook, Gmail,
+          // Salesforce, etc) so chat can reach the same tools the
+          // legacy chat path did. Profile allowlists override the
+          // bundle router when set.
+          const chatMcp = await buildExtraMcpForRunAgent({
+            scopeText: chatPrompt,
+            profile: resolvedProfile,
+          });
+
+          // Inject vault context (SOUL.md / MEMORY.md / AGENTS.md +
+          // optional profile body) into the system-prompt append so
+          // the agent has personality + long-term memory + team
+          // awareness. Profile-specific MEMORY.md takes precedence
+          // over the global one when a hired agent is active.
+          const chatSystemAppend = buildChatSystemAppend({
+            profile: resolvedProfile,
+            profileAppend: resolvedProfile?.systemPromptBody,
+          });
+
           logger.info({
             sessionKey: effectiveSessionKey,
             profile: resolvedProfile?.slug,
             path: 'runagent_chat',
+            composioConnected: chatMcp.composioConnected.length,
+            externalConnected: chatMcp.externalConnected.length,
+            systemAppendChars: chatSystemAppend.length,
           }, 'Routing chat through runAgent');
 
           const runAgentResult = await runAgent(chatPrompt, {
@@ -2032,6 +2055,8 @@ export class Gateway {
             memoryStore: this.assistant.getMemoryStore?.() ?? null,
             ...(effectiveModel ? { model: effectiveModel } : {}),
             ...(maxTurns ? { maxTurns } : {}),
+            ...(chatSystemAppend ? { systemPromptAppend: chatSystemAppend } : {}),
+            extraMcpServers: chatMcp.servers as unknown as Parameters<typeof runAgent>[1]['extraMcpServers'],
             onText: wrappedOnText,
             onToolActivity: ({ tool, input }) => {
               toolActivityCount++;
@@ -2133,7 +2158,6 @@ export class Gateway {
         return '__NOTHING__';
       }
       logger.info({ agent }, 'Running heartbeat...');
-      events.emit('heartbeat:start', { agent, timestamp: Date.now() });
       const hbStart = Date.now();
       try {
         const { runAgentHeartbeat } = await import('../agent/run-agent-heartbeat.js');
@@ -2147,20 +2171,15 @@ export class Gateway {
           memoryStore: this.assistant.getMemoryStore?.() ?? null,
         });
         scanner.refreshIntegrity();
-        events.emit('heartbeat:complete', {
-          agent,
-          durationMs: Date.now() - hbStart,
-          responseLength: result.text?.length ?? 0,
-        });
         logger.info({
           agent,
           cost: Number(result.totalCostUsd.toFixed(4)),
           numTurns: result.numTurns,
           durationMs: Date.now() - hbStart,
+          responseLen: result.text?.length ?? 0,
         }, 'runAgentHeartbeat: heartbeat complete');
         return result.text;
       } catch (err) {
-        events.emit('heartbeat:error', { agent, error: String(err) });
         logger.error({ err }, 'Heartbeat error');
         return `Heartbeat error: ${err}`;
       }
@@ -2176,24 +2195,38 @@ export class Gateway {
     maxTurns?: number,
     model?: string,
     workDir?: string,
-    _mode: 'standard' | 'unleashed' = 'standard',
-    _maxHours?: number,
-    _timeoutMs?: number,
+    /** Accepted for back-compat; canonical SDK path executes every job
+     *  identically. Affects only UI display + budget heuristics elsewhere. */
+    _mode?: 'standard' | 'unleashed',
+    maxHours?: number,
+    timeoutMs?: number,
     successCriteria?: string[],
     agentSlug?: string,
-    _opts?: { disableAllTools?: boolean },
   ): Promise<string> {
     const releaseLane = await lanes.acquire('cron');
+    // Build a wall-clock abort timer from maxHours / timeoutMs.
+    // Whichever is shorter wins. Defaults to 1h if neither is set.
+    const wallMs = (() => {
+      const fromHours = maxHours && maxHours > 0 ? maxHours * 3600 * 1000 : null;
+      const fromMs = timeoutMs && timeoutMs > 0 ? timeoutMs : null;
+      if (fromHours && fromMs) return Math.min(fromHours, fromMs);
+      return fromHours ?? fromMs ?? 60 * 60 * 1000;
+    })();
+    const cronAc = new AbortController();
+    const cronTimer = setTimeout(() => {
+      cronAc.abort();
+      logger.warn({ jobName, wallMs }, 'Cron job hit wall-clock cap — aborting');
+    }, wallMs);
+
     try {
       logger.info(`Running cron job: ${jobName}${workDir ? ` in ${workDir}` : ''}${agentSlug && agentSlug !== 'clementine' ? ` as ${agentSlug}` : ''}`);
-      events.emit('cron:start', { jobName, tier, mode: 'runagent', timestamp: Date.now() });
       const cronStart = Date.now();
       try {
         const { runAgentCron } = await import('../agent/run-agent-cron.js');
         const profile = agentSlug && agentSlug !== 'clementine'
           ? this.getAgentManager().get(agentSlug) ?? null
           : null;
-        logger.info({ jobName, agentSlug, tier, path: 'runagent_cron' }, 'Routing cron through runAgentCron');
+        logger.info({ jobName, agentSlug, tier, wallMs, path: 'runagent_cron' }, 'Routing cron through runAgentCron');
 
         const cronResult = await runAgentCron({
           jobName,
@@ -2206,16 +2239,11 @@ export class Gateway {
           successCriteria,
           model,
           workDir,
+          abortSignal: cronAc.signal,
           postTaskHooks: this.assistant,
         });
 
         scanner.refreshIntegrity();
-        events.emit('cron:complete', {
-          jobName,
-          mode: 'runagent',
-          durationMs: Date.now() - cronStart,
-          responseLength: cronResult.text?.length ?? 0,
-        });
         logger.info({
           jobName,
           cost: Number(cronResult.totalCostUsd.toFixed(4)),
@@ -2226,16 +2254,16 @@ export class Gateway {
         }, 'runAgentCron: cron job complete');
         return cronResult.text;
       } catch (err) {
-        events.emit('cron:error', { jobName, mode: 'runagent', error: String(err) });
         logger.error({ err, jobName }, `Cron job error: ${jobName}`);
         throw err;
       }
     } finally {
+      clearTimeout(cronTimer);
       releaseLane();
     }
   }
 
-  // ── Team task execution (unleashed for team messages) ──────────────
+  // ── Team task execution ──────────────────────────────────────────────
 
   /**
    * Process a team message as an autonomous task — same multi-phase execution

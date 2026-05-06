@@ -140,6 +140,13 @@ export interface RunAgentOptions {
     url?: string;
     headers?: Record<string, string>;
   }>;
+
+  /** String appended to the SDK's `claude_code` system-prompt preset.
+   *  Caller-built so chat callers can inject vault context (SOUL.md,
+   *  MEMORY.md, AGENTS.md) while autonomous callers (cron/heartbeat/
+   *  team-task) keep the prompt small. When unset, falls back to
+   *  profile.systemPromptBody (legacy single-source behavior). */
+  systemPromptAppend?: string;
 }
 
 export interface RunAgentResult {
@@ -222,15 +229,29 @@ export async function runAgent(prompt: string, opts: RunAgentOptions): Promise<R
     ? `Use the ${opts.forceSubagent} agent to handle this request:\n\n${prompt}`
     : prompt;
 
-  // Compose system prompt. When a hired-agent profile is active, that
-  // becomes the main agent's identity — append to the claude_code preset.
-  const profileAppend = opts.profile?.systemPromptBody
-    ? opts.profile.systemPromptBody
-    : undefined;
+  // Compose system-prompt append. The caller has already merged any
+  // vault context (SOUL.md, MEMORY.md, AGENTS.md) and profile body
+  // into a single string when needed; otherwise we fall back to the
+  // profile body alone for autonomous paths.
+  const profileAppend = opts.systemPromptAppend?.trim()
+    ? opts.systemPromptAppend
+    : opts.profile?.systemPromptBody?.trim()
+      ? opts.profile.systemPromptBody
+      : undefined;
 
-  // Allowed tools. Default to core + Clementine MCP. Per-subagent tool
-  // restrictions live on each AgentDefinition.tools field.
-  const allowedTools = opts.allowedTools ?? CORE_TOOLS_FOR_AGENT_PARENT;
+  // Allowed tools at the main-agent level.
+  //   1. Caller-provided opts.allowedTools wins (e.g. heartbeat passes []).
+  //   2. When a hired-agent profile is the main agent and it has a
+  //      team.allowedTools allowlist, use it (with `Agent` always
+  //      included so subagent delegation still works).
+  //   3. Otherwise the core set. Per-subagent tool restrictions live
+  //      on each AgentDefinition.tools field, not here.
+  const profileMainAllow = opts.profile?.team?.allowedTools?.length
+    ? Array.from(new Set(['Agent', ...opts.profile.team.allowedTools]))
+    : null;
+  const allowedTools = opts.allowedTools
+    ?? profileMainAllow
+    ?? CORE_TOOLS_FOR_AGENT_PARENT;
 
   // Wire the Clementine MCP server so the agent can reach memory/cron/
   // broken-job tools. Without this, the cron-fixer subagent's `tools`
@@ -255,6 +276,20 @@ export async function runAgent(prompt: string, opts: RunAgentOptions): Promise<R
     ...(opts.extraMcpServers ?? {}),
   };
 
+  // Bridge an external AbortSignal to a real AbortController the SDK
+  // can act on. The SDK calls .abort() internally on budget/turn caps,
+  // so we cannot pass a fake { signal } object — it must be a real
+  // controller. When the caller's signal fires we propagate.
+  let sdkAbortController: AbortController | undefined;
+  if (opts.abortSignal) {
+    sdkAbortController = new AbortController();
+    if (opts.abortSignal.aborted) {
+      sdkAbortController.abort();
+    } else {
+      opts.abortSignal.addEventListener('abort', () => sdkAbortController!.abort(), { once: true });
+    }
+  }
+
   // Apply 1M-context env normalization (existing infra)
   const sdkOptionsRaw = {
     systemPrompt: profileAppend
@@ -268,6 +303,10 @@ export async function runAgent(prompt: string, opts: RunAgentOptions): Promise<R
       ? O extends { mcpServers?: infer M } ? M : never : never,
     allowedTools,
     permissionMode: 'bypassPermissions' as const,
+    // SDK spec requires this companion flag whenever permissionMode is
+    // 'bypassPermissions'. Without it, autonomous runs can silently
+    // hang waiting for permission prompts.
+    allowDangerouslySkipPermissions: true,
     cwd: BASE_DIR,
     env: subprocessEnv,
     maxBudgetUsd,
@@ -275,7 +314,7 @@ export async function runAgent(prompt: string, opts: RunAgentOptions): Promise<R
     ...(opts.maxTurns ? { maxTurns: opts.maxTurns } : {}),
     ...(opts.model ? { model: opts.model } : {}),
     ...(opts.resumeSessionId ? { resume: opts.resumeSessionId } : {}),
-    ...(opts.abortSignal ? { abortController: { signal: opts.abortSignal } as AbortController } : {}),
+    ...(sdkAbortController ? { abortController: sdkAbortController } : {}),
   };
 
   const sdkOptions = normalizeClaudeSdkOptionsForOneMillionContext(sdkOptionsRaw);

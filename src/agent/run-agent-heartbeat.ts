@@ -95,8 +95,9 @@ export async function runAgentHeartbeat(opts: RunAgentHeartbeatOptions): Promise
     promptChars: prompt.length,
   }, 'runAgentHeartbeat: dispatching to runAgent (no tools)');
 
-  return runAgent(prompt, {
-    sessionKey: `heartbeat:${opts.profile?.slug ?? 'clementine'}`,
+  const sessionKey = `heartbeat:${opts.profile?.slug ?? 'clementine'}`;
+  const result = await runAgent(prompt, {
+    sessionKey,
     source: 'heartbeat',
     profile: opts.profile,
     memoryStore: opts.memoryStore,
@@ -110,4 +111,17 @@ export async function runAgentHeartbeat(opts: RunAgentHeartbeatOptions): Promise
     allowedTools: [],
     abortSignal: opts.abortSignal,
   });
+
+  // Mirror the heartbeat into transcripts so dedup + recall work.
+  // Skip pure __NOTHING__ outputs since they carry no information.
+  const text = result.text?.trim() ?? '';
+  if (opts.memoryStore && text && text !== '__NOTHING__') {
+    try {
+      opts.memoryStore.saveTurn(sessionKey, 'heartbeat', text, opts.model ?? MODELS.haiku);
+    } catch {
+      /* non-fatal */
+    }
+  }
+
+  return result;
 }

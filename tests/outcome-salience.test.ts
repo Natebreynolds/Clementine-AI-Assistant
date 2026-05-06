@@ -8,7 +8,6 @@ import { mkdirSync, rmSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { MemoryStore } from '../src/memory/store.js';
-import { chunkReferencedInResponse } from '../src/agent/assistant.js';
 
 let testDir: string;
 let dbPath: string;
@@ -117,33 +116,3 @@ describe('recordOutcome EMA update', () => {
   });
 });
 
-describe('chunkReferencedInResponse heuristic', () => {
-  it('detects a proper-noun citation', () => {
-    const chunk = 'Nathan prefers terse replies.';
-    const response = 'as nathan asked, keeping it short';
-    expect(chunkReferencedInResponse(chunk, response.toLowerCase())).toBe(true);
-  });
-
-  it('detects a number citation', () => {
-    const chunk = 'The deadline is 2026-03-05.';
-    const response = 'noting 2026 as the cutoff.';
-    expect(chunkReferencedInResponse(chunk, response.toLowerCase())).toBe(true);
-  });
-
-  it('returns false when no distinctive tokens overlap', () => {
-    const chunk = 'Nathan prefers terse replies.';
-    const response = 'sure, got it.';
-    expect(chunkReferencedInResponse(chunk, response.toLowerCase())).toBe(false);
-  });
-
-  it('returns false for empty inputs', () => {
-    expect(chunkReferencedInResponse('', 'anything')).toBe(false);
-    expect(chunkReferencedInResponse('Something', '')).toBe(false);
-  });
-
-  it('ignores common stopwords that happen to be capitalized', () => {
-    const chunk = 'There are three options.'; // "There" is a stopword
-    const response = 'there are many paths forward.';
-    expect(chunkReferencedInResponse(chunk, response.toLowerCase())).toBe(false);
-  });
-});

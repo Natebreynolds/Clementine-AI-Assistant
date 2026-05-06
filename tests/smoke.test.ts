@@ -11,10 +11,8 @@ import { annotateUnleashedStatus, classifyUnleashedRuntimeState } from '../src/g
 import {
   estimateTokens,
   isAutonomousNothingOutput,
-  looksLikeContextThrashText,
   looksLikeNoResponseRequested,
   looksLikeOneMillionContextError,
-  looksLikeProviderApiErrorResponse,
 } from '../src/agent/assistant.js';
 import { validateProposal } from '../src/agent/self-improve.js';
 import { isCreditBalanceError } from '../src/gateway/credit-guard.js';
@@ -113,12 +111,6 @@ describe('response and provider error sentinels', () => {
     expect(looksLikeOneMillionContextError('context-1m-2025-08-07')).toBe(true);
   });
 
-  it('detects provider API errors returned as assistant text', () => {
-    expect(looksLikeProviderApiErrorResponse('API Error: Extra usage is required for 1M context')).toBe(true);
-    expect(looksLikeProviderApiErrorResponse('Error: API Error: bad request')).toBe(true);
-    expect(looksLikeProviderApiErrorResponse('Normal answer about API design')).toBe(false);
-  });
-
   it('detects Claude credit exhaustion errors', () => {
     expect(isCreditBalanceError('Credit balance is too low')).toBe(true);
     expect(isCreditBalanceError('Your account has insufficient credits')).toBe(true);
@@ -213,15 +205,6 @@ describe('isLiveUnleashedStatus', () => {
       status: 'running',
       updatedAt: '2026-05-02T06:36:00.000Z',
     }, now)).toBe('stale');
-  });
-});
-
-// ── context-thrash detection ────────────────────────────────────────
-
-describe('context-thrash detection', () => {
-  it('recognizes SDK autocompact thrash text', () => {
-    expect(looksLikeContextThrashText('Autocompact is thrashing: the context refilled to the limit')).toBe(true);
-    expect(looksLikeContextThrashText('regular context summary')).toBe(false);
   });
 });
 

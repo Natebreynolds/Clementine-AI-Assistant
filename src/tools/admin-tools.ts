@@ -1122,7 +1122,6 @@ server.tool(
       const schedule = String(job.schedule ?? '');
       const prompt = String(job.prompt ?? '');
       const enabled = job.enabled !== false;
-      const mode = job.mode === 'unleashed' ? 'unleashed' : 'standard';
       const workDir = job.work_dir ? String(job.work_dir) : null;
 
       const humanSchedule = describeCronSchedule(schedule);
@@ -1147,7 +1146,7 @@ server.tool(
       }
 
       const status = enabled ? 'enabled' : 'disabled';
-      lines.push(`**${name}** [${status}] ${mode === 'unleashed' ? '[unleashed] ' : ''}` +
+      lines.push(`**${name}** [${status}] ` +
         `\n  Schedule: ${humanSchedule} (\`${schedule}\`)` +
         (nextRun ? `\n  Next run: ${nextRun}` : '') +
         (lastRunInfo ? `\n  ${lastRunInfo}` : '') +
@@ -1164,48 +1163,21 @@ server.tool(
 
 server.tool(
   'add_cron_job',
-  'Add a new scheduled cron job. Validates the schedule expression and writes to CRON.md. The daemon auto-reloads on file change. Use mode "unleashed" for multi-step tasks (browser automation, batch processing, multi-contact workflows) — they need more turns than standard mode provides. Auto-escalates to unleashed when complex patterns are detected.',
+  'Add a new scheduled cron job. Validates the schedule expression and writes to CRON.md. The daemon auto-reloads on file change. The canonical SDK path runs every job through runAgentCron — there is no separate "unleashed" mode anymore; the SDK handles compaction + multi-turn work natively up to maxBudgetUsd.',
   {
     name: z.string().describe('Job name (unique identifier)'),
     schedule: z.string().describe('Cron expression (e.g., "0 9 * * 1" for Monday 9 AM)'),
     prompt: z.string().describe('The prompt/instruction for the assistant to execute'),
-    tier: z.number().optional().default(1).describe('Security tier (1=auto, 2=logged, 3=approval)'),
+    tier: z.number().optional().default(1).describe('Security tier (1=auto, 2=logged, 3=approval). Tier 2+ also raises the per-run budget cap.'),
     enabled: z.boolean().optional().default(true).describe('Whether the job is enabled'),
     work_dir: z.string().optional().describe('Project directory to run in (agent gets access to project tools, CLAUDE.md, files)'),
-    mode: z.enum(['standard', 'unleashed']).optional().default('standard').describe('standard = normal cron, unleashed = long-running phased execution with checkpointing'),
-    max_hours: z.number().optional().describe('Max hours for unleashed mode (default 6). Ignored for standard mode.'),
+    max_hours: z.number().optional().describe('Wall-clock cap in hours. Defaults to 1h. Run aborts via AbortSignal when exceeded.'),
   },
-  async ({ name: jobName, schedule, prompt, tier, enabled, work_dir, mode: rawMode, max_hours: rawMaxHours }) => {
-    let mode = rawMode;
-    let max_hours = rawMaxHours;
+  async ({ name: jobName, schedule, prompt, tier, enabled, work_dir, max_hours }) => {
     // Validate cron expression
     const cronMod = await import('node-cron');
     if (!cronMod.default.validate(schedule)) {
       return textResult(`Invalid cron expression: "${schedule}". Examples: "0 9 * * 1" (Mon 9 AM), "*/30 * * * *" (every 30 min).`);
-    }
-
-    // Auto-escalate to unleashed when the job clearly needs it.
-    // Tier 2 jobs with complex prompts (browser automation, multi-contact workflows,
-    // multi-step sequences) will exhaust standard turn limits silently.
-    if (mode !== 'unleashed' && tier >= 2) {
-      const complexSignals = [
-        /\bfor each\b.*\bcontact\b/i,
-        /\bfor each\b.*\bprospect\b/i,
-        /\bfor each\b.*\baccount\b/i,
-        /\bfor each\b.*\blead\b/i,
-        /\bfor each\b.*\bprofile\b/i,
-        /\bplaywright\b/i,
-        /\bkernel\s+browsers?\b/i,
-        /\bbrowser\b.*\bautomati/i,
-        /\bstep\s+\d+\b.*\bstep\s+\d+\b/is,
-      ];
-      const isComplex = complexSignals.some(p => p.test(prompt))
-        || prompt.length > 2000;
-      if (isComplex) {
-        mode = 'unleashed';
-        if (!max_hours) max_hours = 1;
-        logger.info({ jobName }, 'Auto-escalated to unleashed mode (complex prompt detected)');
-      }
     }
 
     // Read existing CRON.md or create empty structure
@@ -1240,10 +1212,7 @@ server.tool(
       tier,
     };
     if (work_dir) newJob.work_dir = work_dir;
-    if (mode === 'unleashed') {
-      newJob.mode = 'unleashed';
-      if (max_hours) newJob.max_hours = max_hours;
-    }
+    if (max_hours) newJob.max_hours = max_hours;
 
     jobs.push(newJob);
     parsed.data.jobs = jobs;
@@ -1258,7 +1227,7 @@ server.tool(
     }
     writeFileSync(CRON_FILE, output);
 
-    logger.info({ jobName, schedule, tier, mode, work_dir }, 'Added cron job via MCP tool');
+    logger.info({ jobName, schedule, tier, work_dir, max_hours }, 'Added cron job via MCP tool');
 
     // Read-back verification: confirm the job was persisted correctly
     let verified = false;
@@ -1281,10 +1250,7 @@ server.tool(
       `  Enabled: ${enabled}`,
     ];
     if (work_dir) details.push(`  Project: ${work_dir}`);
-    if (mode === 'unleashed') {
-      const escalated = rawMode !== 'unleashed' ? ' (auto-escalated — complex prompt detected)' : '';
-      details.push(`  Mode: unleashed (max ${max_hours ?? 6} hours)${escalated}`);
-    }
+    if (max_hours) details.push(`  Wall-clock cap: ${max_hours}h`);
 
     const verifyMsg = verified
       ? 'Verified: job persisted to CRON.md and will be picked up by the daemon.'

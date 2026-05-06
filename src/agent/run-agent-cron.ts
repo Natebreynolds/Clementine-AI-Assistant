@@ -374,12 +374,23 @@ export async function runAgentCron(opts: RunAgentCronOptions): Promise<RunAgentC
     extraMcpServers: mcp.servers as unknown as Parameters<typeof runAgent>[1]['extraMcpServers'],
   });
 
+  // Mirror the run into transcripts so future chat recall can see it.
+  // Legacy runCronJob did this with role='cron'; canonical needs the
+  // same so memory queries (`what did Sasha do this morning?`) work.
+  const deliverable = result.text ?? '';
+  if (opts.memoryStore && deliverable.trim()) {
+    try {
+      opts.memoryStore.saveTurn(`cron:${opts.jobName}`, 'cron', deliverable, opts.model ?? '');
+    } catch (err) {
+      logger.debug({ err, job: opts.jobName }, 'runAgentCron: transcript mirror failed (non-fatal)');
+    }
+  }
+
   // ── Post-task hooks: reflection + skill extraction ────────────────
   // Both fire-and-forget — never block the cron deliverable on these.
   // They are the same passes the legacy runCronJob fires; without them
   // the new path would lose the success-grading + procedural-memory
   // growth that makes Clementine self-improving.
-  const deliverable = result.text ?? '';
   if (opts.postTaskHooks && deliverable && deliverable.trim() !== '__NOTHING__') {
     const durationMs = Date.now() - startedAt;
     opts.postTaskHooks

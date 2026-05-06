@@ -233,6 +233,25 @@ export interface AgentProfile {
    * in agent.md frontmatter; same-day windows only.
    */
   activeHours?: { start: number; end: number };
+  /**
+   * Short imperative routing hints used to build this agent's
+   * AgentDefinition.description for SDK auto-routing. Each entry is a
+   * capability phrase the main agent might match against user input
+   * (e.g., "outbound prospect emails", "content calendar drafting").
+   * Free-form strings, comma-joined when assembled. Optional.
+   */
+  routingHints?: string[];
+  /**
+   * Short label describing the role (e.g., "SDR", "CMO"). Used in the
+   * routing description when present.
+   */
+  role?: string;
+  /**
+   * SDK reasoning effort tier when this profile runs as a subagent.
+   * Defaults to 'medium' if unset. Low = Haiku-style cheap fanout,
+   * High = deep reasoning, Max = max effort.
+   */
+  effort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max';
 }
 
 export type AgentStatus = 'active' | 'paused' | 'error' | 'terminated';
@@ -352,7 +371,12 @@ export interface CronJobDefinition {
   maxTurns?: number;
   model?: string;
   workDir?: string;
+  /** Display/intent hint — 'unleashed' jobs are typically long autonomous
+   *  tasks. The canonical SDK path runs every job through runAgentCron
+   *  identically; this field affects only UI badges + budget heuristics. */
   mode?: 'standard' | 'unleashed';
+  /** Wall-clock cap in hours. Defaults to 1h. Triggers an AbortSignal
+   *  on the runAgentCron call when exceeded. */
   maxHours?: number;
   maxRetries?: number;
   after?: string;

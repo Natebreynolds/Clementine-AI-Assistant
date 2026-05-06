@@ -636,13 +636,12 @@ export async function diagnoseBrokenJob(
       1,        // tier 1 — cheap
       5,        // maxTurns — diagnosis doesn't need tools typically
       'haiku',  // model — keep cost negligible
-      undefined,
-      'standard',
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      { disableAllTools: true },
+      undefined, // workDir
+      'standard', // mode (display only)
+      undefined, // maxHours
+      undefined, // timeoutMs
+      undefined, // successCriteria
+      undefined, // agentSlug
     );
   } catch (err) {
     logger.warn({ err, job: broken.jobName }, 'Diagnostic LLM call failed');

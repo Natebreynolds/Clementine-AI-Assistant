@@ -217,10 +217,6 @@ export function estimateTokens(text: string): number {
   return Math.ceil(text.length / 3.3);
 }
 
-export function looksLikeContextThrashText(value: unknown): boolean {
-  const text = String(value ?? '');
-  return /autocompact\s+is\s+thrashing|context\s+refilled\s+to\s+the\s+limit|refilled\s+to\s+the\s+limit\s+within/i.test(text);
-}
 
 
 
@@ -287,13 +283,6 @@ function capContextBlock(text: unknown, maxChars: number): string {
   return capOutput(String(text ?? ''), maxChars);
 }
 
-export function scrubInternalContextBlocks(text: string): string {
-  return text
-    .replace(/\[Context governance:[^\]]*\][\s\S]*?\[\/Context governance:[^\]]*\]\s*/gi, '')
-    .replace(/\[Active working set\][\s\S]*?\[\/Active working set\]\s*/gi, '')
-    .replace(/\[Recent proactive notification context\][\s\S]*?\[\/Recent proactive notification context\]\s*/gi, '')
-    .trim();
-}
 
 
 
@@ -305,12 +294,6 @@ export function oneMillionContextRecoveryMessage(): string {
   return "Claude rejected 1M context for this account. I've switched Clementine to persistent 200K recovery mode and reset the session. Restart Clementine once so every background worker starts with the same safe setting.";
 }
 
-export function looksLikeProviderApiErrorResponse(value: unknown): boolean {
-  const text = String(value ?? '').trim();
-  return /^api error:/i.test(text)
-    || /^error:\s*api error:/i.test(text)
-    || looksLikeOneMillionContextError(text);
-}
 
 export function looksLikeNoResponseRequested(value: unknown): boolean {
   const text = String(value ?? '').trim();
@@ -828,24 +811,6 @@ export function removeProject(projectPath: string): boolean {
   return true;
 }
 
-// ── Retrieval Outcome Heuristic ─────────────────────────────────────
-
-/**
- * Decide whether a retrieved memory chunk shows up in the assistant's
- * response. We key on distinctive tokens (multi-letter capitalized words,
- * numbers of 2+ digits) that are unlikely to appear in the response unless
- * the chunk's content actually influenced what was said.
- *
- * Intentionally a cheap local heuristic — no LLM call. False positives are
- * tolerable since the outcome score is bounded and averaged over many
- * observations.
- */
-const OUTCOME_STOPWORDS = new Set([
-  'there', 'these', 'those', 'their', 'where', 'which', 'while',
-  'would', 'could', 'should', 'about', 'being', 'after', 'before',
-  'again', 'against', 'because',
-]);
-
 export interface ProactiveGoalInput {
   goal: {
     title: string;
@@ -855,60 +820,7 @@ export interface ProactiveGoalInput {
   };
 }
 
-/**
- * Build the compact "active goals" block that gets injected when no goal
- * keyword matches the user's prompt. Pure so it can be tested without the
- * full Assistant/vault setup.
- */
-export function buildActiveGoalsBlock(
-  goals: ProactiveGoalInput[],
-  agentSlug?: string | null,
-  maxEntries: number = 6,
-): string {
-  if (goals.length === 0) return '';
 
-  const filtered = goals.filter(({ goal }) => {
-    if (!agentSlug) return true;
-    return goal.owner === agentSlug || goal.owner === 'clementine';
-  });
-  if (filtered.length === 0) return '';
-
-  const rank: Record<string, number> = { high: 0, medium: 1, low: 2 };
-  const sorted = [...filtered].sort((a, b) => {
-    const ra = rank[a.goal.priority ?? 'medium'] ?? 1;
-    const rb = rank[b.goal.priority ?? 'medium'] ?? 1;
-    return ra - rb;
-  });
-
-  const top = sorted.slice(0, maxEntries);
-  const lines = top.map(({ goal }) => {
-    const next = goal.nextActions?.[0];
-    const nextBit = next ? ` → ${String(next).slice(0, 80)}` : '';
-    return `- [${goal.priority ?? 'medium'}] ${goal.title}${nextBit}`;
-  });
-
-  return `\n\n## Active Goals (background context)\n${lines.join('\n')}\n`;
-}
-
-export function chunkReferencedInResponse(chunkContent: string, responseLower: string): boolean {
-  if (!chunkContent || !responseLower) return false;
-
-  const distinctive = new Set<string>();
-  const capMatches = chunkContent.match(/\b[A-Z][a-zA-Z]{3,}\b/g) ?? [];
-  for (const m of capMatches) {
-    const lower = m.toLowerCase();
-    if (!OUTCOME_STOPWORDS.has(lower)) distinctive.add(lower);
-  }
-  const numMatches = chunkContent.match(/\b\d{2,}\b/g) ?? [];
-  for (const m of numMatches) distinctive.add(m);
-
-  if (distinctive.size === 0) return false;
-
-  for (const tok of distinctive) {
-    if (responseLower.includes(tok)) return true;
-  }
-  return false;
-}
 
 // ── PersonalAssistant ───────────────────────────────────────────────
 

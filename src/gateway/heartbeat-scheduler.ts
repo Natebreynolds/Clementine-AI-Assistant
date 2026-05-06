@@ -394,13 +394,12 @@ export class HeartbeatScheduler {
             cronCall.tier,
             cronCall.maxTurns,
             cronCall.model,
-            undefined,
-            'standard',
-            undefined,
-            undefined,
-            undefined,
-            undefined,
-            cronCall.opts,
+            undefined,    // workDir
+            'standard',   // mode (display only)
+            undefined,    // maxHours
+            undefined,    // timeoutMs
+            undefined,    // successCriteria
+            undefined,    // agentSlug
           );
           return result || '';
         };
@@ -1171,13 +1170,12 @@ export class HeartbeatScheduler {
         cronCall.tier,
         cronCall.maxTurns,
         cronCall.model,
-        undefined,
-        'standard',
-        undefined,
-        undefined,
-        undefined,
-        undefined,
-        cronCall.opts,
+        undefined,    // workDir
+        'standard',   // mode (display only)
+        undefined,    // maxHours
+        undefined,    // timeoutMs
+        undefined,    // successCriteria
+        undefined,    // agentSlug
       );
       this.runLog.append({
         jobName: 'insight-check',

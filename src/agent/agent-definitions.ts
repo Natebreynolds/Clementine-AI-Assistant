@@ -80,18 +80,42 @@ const CRON_FIXER_PROMPT = [
   'Return: a one-paragraph summary of what you applied (or what is blocking apply), per job.',
 ].join('\n');
 
+/** Build a routing-signal description for a hired agent.
+ *  The SDK uses descriptions for auto-routing — they must be imperative
+ *  ("Use for: ..."), not narrative prose. Otherwise the main agent
+ *  has nothing to match user phrasings against. */
+function buildHiredAgentDescription(p: AgentProfile): string {
+  const role = p.role ?? p.description ?? `${p.name}, a hired agent`;
+  const slug = p.slug;
+  const capabilities = (p.routingHints && p.routingHints.length > 0)
+    ? p.routingHints.join(', ')
+    : (p.description ?? '').slice(0, 200);
+  return [
+    `Delegate to ${p.name} (${slug}).`,
+    capabilities ? `Use for: ${capabilities}.` : '',
+    `Role: ${role}.`,
+    'Spawn this subagent when the user names them, asks a question in their domain, or asks Clementine to "have <name> do X".',
+  ].filter(Boolean).join(' ');
+}
+
 /** Map a hired-agent profile to an AgentDefinition.
  *  Used when Clementine wants to delegate to Ross/Sasha/Nora etc. */
 function profileToAgentDefinition(p: AgentProfile): AgentDefinition {
+  // Always include `Agent` so the subagent can further fan out, plus
+  // core read tools as a baseline. profile.team.allowedTools narrows
+  // beyond this when set.
+  const baseline = ['Agent', 'Read', 'Grep', 'Glob', 'WebSearch', 'WebFetch', 'TodoWrite'];
+  const tools = p.team?.allowedTools?.length
+    ? Array.from(new Set(['Agent', ...p.team.allowedTools]))
+    : baseline;
   return {
-    description: p.description ?? `${p.name} (hired agent: ${p.slug})`,
+    description: buildHiredAgentDescription(p),
     prompt: p.systemPromptBody ?? `You are ${p.name}.`,
-    // Honor explicit allowlist when present; otherwise inherit from parent.
-    ...(p.team?.allowedTools?.length ? { tools: p.team.allowedTools } : {}),
+    tools,
     // Hired agents keep their configured model (Sonnet by default).
     ...(p.model ? { model: p.model } : { model: 'sonnet' }),
-    // Effort: hired agents do real work, default medium. Caller can override.
-    effort: 'medium',
+    // Effort: hired agents do real work, default medium. Profile may override.
+    ...(p.effort ? { effort: p.effort } : { effort: 'medium' as const }),
   };
 }
 
@@ -109,8 +133,19 @@ export function buildAgentMap(opts: BuildAgentMapOptions = {}): Record<string, A
   // ── System subagents ────────────────────────────────────────────
   // Planner: opus, no tools, single turn. Used when the parent agent
   // sees a multi-step request and wants a decomposition.
+  // Description is imperative + matches real user phrasings — the SDK
+  // matches against it for auto-routing, so prose doesn't trigger.
   map['planner'] = {
-    description: 'Decompose a multi-step user request into atomic, parallel-safe steps. Use for "research these N items", "build a comprehensive X", "for each Y do Z", or any request that obviously involves multiple distinct sub-tasks. Returns a JSON plan; the parent then executes the steps (often by spawning more subagents per step).',
+    description: [
+      'Use this subagent BEFORE doing the work whenever the user request',
+      'involves 3 or more items, multiple distinct subtasks, or a phrase',
+      'like "research my top N", "for each X do Y", "look at all of",',
+      '"go through every", "do A, B, and C", or any task that would burn',
+      'context if processed serially. The planner returns a JSON plan',
+      'with parallel-safe steps; you then spawn researcher/cron-fixer/',
+      'hired-agent subagents per step. Always prefer this over doing',
+      'multi-item work yourself in the main conversation.',
+    ].join(' '),
     prompt: PLANNER_PROMPT,
     model: 'opus',
     tools: [], // pure reasoning, no tools
@@ -119,11 +154,18 @@ export function buildAgentMap(opts: BuildAgentMapOptions = {}): Record<string, A
   };
 
   // Researcher: haiku, per-item investigation. Cheap fan-out target.
+  // No Bash — researcher is read-only fanout, must not mutate state.
   map['researcher'] = {
-    description: 'Investigate ONE specific item (one lead, one account, one file, one topic) and return a one-paragraph summary. Use for per-item parallel work spawned by the planner. Cheap and fast.',
+    description: [
+      'Use this subagent to investigate ONE specific item — a single',
+      'lead, account, file, web page, or topic — and return a',
+      'one-paragraph summary. Spawn it in PARALLEL via the Agent tool',
+      'with one subagent per item when the planner returns multiple',
+      'research steps. Read-only: never mutates state. Cheap (Haiku).',
+    ].join(' '),
     prompt: RESEARCHER_PROMPT,
     model: 'haiku',
-    tools: ['Read', 'Grep', 'Glob', 'Bash', 'WebSearch', 'WebFetch'],
+    tools: ['Read', 'Grep', 'Glob', 'WebSearch', 'WebFetch'],
     effort: 'low',
     maxTurns: 15,
   };

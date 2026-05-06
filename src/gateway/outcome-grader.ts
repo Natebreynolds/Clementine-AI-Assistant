@@ -161,16 +161,15 @@ export async function gradeRun(
     raw = await gateway.handleCronJob(
       `grade:${entry.jobName}`,
       prompt,
-      1,        // tier 1
-      3,        // maxTurns — tight
+      1,         // tier 1
+      3,         // maxTurns — tight
       'haiku',
       undefined, // workDir
-      'standard', // mode
+      'standard', // mode (display only)
       undefined, // maxHours
       undefined, // timeoutMs
       undefined, // successCriteria
       undefined, // agentSlug
-      { disableAllTools: true },
     );
   } catch (err) {
     logger.warn({ err, jobName: entry.jobName }, 'Outcome grader LLM call failed');

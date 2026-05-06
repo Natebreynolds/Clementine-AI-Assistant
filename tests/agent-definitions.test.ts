@@ -94,7 +94,9 @@ describe('buildAgentMap — hired-agent profiles', () => {
       team: { channelName: 'x', channels: [], canMessage: [], allowedTools: ['Read', 'Grep'] },
     })];
     const map = buildAgentMap({ profileManager: fakeManager(profiles) });
-    expect(map['locked-down'].tools).toEqual(['Read', 'Grep']);
+    // `Agent` is always included so the subagent can further delegate;
+    // the profile's allowlist narrows the rest.
+    expect(map['locked-down'].tools).toEqual(['Agent', 'Read', 'Grep']);
   });
 
   it('skips the active agent (no recursion into self as subagent)', () => {

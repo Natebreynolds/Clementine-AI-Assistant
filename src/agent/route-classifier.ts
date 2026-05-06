@@ -388,16 +388,15 @@ export async function classifyRoute(
     raw = await gateway.handleCronJob(
       'route-classify',
       prompt,
-      1,        // tier 1
-      3,        // maxTurns — classifier doesn't need tools
-      'haiku',  // cheap
+      1,         // tier 1
+      3,         // maxTurns — classifier doesn't need tools
+      'haiku',   // cheap
       undefined, // workDir
-      'standard', // mode
+      'standard', // mode (display only)
       undefined, // maxHours
       undefined, // timeoutMs
       undefined, // successCriteria
       undefined, // agentSlug
-      { disableAllTools: true },
     );
   } catch (err) {
     logger.warn({ err }, 'Route classifier call failed');

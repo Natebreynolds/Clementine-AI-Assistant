@@ -82,8 +82,9 @@ export async function runAgentTeamTask(opts: RunAgentTeamTaskOptions): Promise<R
     promptChars: builtPrompt.length,
   }, 'runAgentTeamTask: dispatching to runAgent');
 
+  const sessionKey = `team-task:${opts.fromSlug}->${opts.profile.slug}`;
   const result = await runAgent(builtPrompt, {
-    sessionKey: `team-task:${opts.fromSlug}->${opts.profile.slug}`,
+    sessionKey,
     source: 'team-task',
     profile: opts.profile,
     agentManager: opts.agentManager,
@@ -95,6 +96,19 @@ export async function runAgentTeamTask(opts: RunAgentTeamTaskOptions): Promise<R
     abortSignal: opts.abortSignal,
     extraMcpServers: mcp.servers as unknown as Parameters<typeof runAgent>[1]['extraMcpServers'],
   });
+
+  // Mirror the inbound message + outbound response into transcripts so
+  // future recall sees who-asked-whom and what got done.
+  if (opts.memoryStore) {
+    try {
+      opts.memoryStore.saveTurn(sessionKey, `team-from:${opts.fromSlug}`, opts.content, '');
+      if (result.text?.trim()) {
+        opts.memoryStore.saveTurn(sessionKey, `team-to:${opts.profile.slug}`, result.text, opts.model ?? '');
+      }
+    } catch {
+      /* non-fatal */
+    }
+  }
 
   return {
     ...result,
