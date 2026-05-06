@@ -5299,6 +5299,21 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
     } catch { /* telemetry only */ }
   }
 
+  /**
+   * Public entry point for triggering auto-memory extraction after an
+   * exchange. Used by the new runAgent chat path (Phase 2 migration)
+   * so it can keep the existing memory-extraction behavior without
+   * having to recreate the surrounding plumbing.
+   */
+  async triggerMemoryExtractionPostExchange(
+    userMessage: string,
+    assistantResponse: string,
+    sessionKey?: string,
+    profile?: AgentProfile,
+  ): Promise<void> {
+    return this.spawnMemoryExtraction(userMessage, assistantResponse, sessionKey, profile);
+  }
+
   private async spawnMemoryExtraction(
     userMessage: string,
     assistantResponse: string,

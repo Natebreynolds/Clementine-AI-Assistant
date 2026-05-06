@@ -128,6 +128,18 @@ export interface RunAgentOptions {
 
   /** Optional CLAUDE.md / project setting source. Defaults to ['project']. */
   settingSources?: ('project' | 'user' | 'local')[];
+
+  /** Additional MCP servers to merge with the always-on clementine-tools
+   *  server. Use to wire Composio + claude.ai integrations on chat-path
+   *  invocations that need Outlook/Salesforce/etc. */
+  extraMcpServers?: Record<string, {
+    type: 'stdio' | 'http' | 'sse';
+    command?: string;
+    args?: string[];
+    env?: Record<string, string>;
+    url?: string;
+    headers?: Record<string, string>;
+  }>;
 }
 
 export interface RunAgentResult {
@@ -225,14 +237,12 @@ export async function runAgent(prompt: string, opts: RunAgentOptions): Promise<R
   // list references mcp__clementine-tools__* that don't exist in the
   // session, and the agent falls back to reading raw JSON files.
   const subprocessEnv = buildRunAgentEnv();
-  const mcpServers: Record<string, {
-    type: 'stdio';
-    command: string;
-    args: string[];
-    env: Record<string, string>;
-  }> = {
+  // SDK accepts a Record<string, McpServerConfig> here. We cast on
+  // assignment because we mix the always-on Clementine stdio server
+  // with caller-supplied servers of various types.
+  const mcpServers: Record<string, Record<string, unknown>> = {
     [TOOLS_SERVER]: {
-      type: 'stdio',
+      type: 'stdio' as const,
       command: 'node',
       args: [MCP_SERVER_SCRIPT],
       env: {
@@ -242,6 +252,7 @@ export async function runAgent(prompt: string, opts: RunAgentOptions): Promise<R
         CLEMENTINE_INTERACTION_SOURCE: source === 'cron' || source === 'heartbeat' ? 'autonomous' : 'interactive',
       },
     },
+    ...(opts.extraMcpServers ?? {}),
   };
 
   // Apply 1M-context env normalization (existing infra)
@@ -251,7 +262,10 @@ export async function runAgent(prompt: string, opts: RunAgentOptions): Promise<R
       : { type: 'preset' as const, preset: 'claude_code' as const },
     settingSources: opts.settingSources ?? ['project'] as ('project' | 'user' | 'local')[],
     agents,
-    mcpServers,
+    // SDK's McpServerConfig is a union; cast at the boundary since
+    // callers can mix stdio + http + sse server shapes.
+    mcpServers: mcpServers as unknown as Parameters<typeof query>[0]['options'] extends infer O
+      ? O extends { mcpServers?: infer M } ? M : never : never,
     allowedTools,
     permissionMode: 'bypassPermissions' as const,
     cwd: BASE_DIR,

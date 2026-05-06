@@ -2423,6 +2423,84 @@ export class Gateway {
         }
 
         try {
+          // ── Phase 2: opt-in canonical SDK chat path ──────────────────
+          // When CLEMENTINE_USE_RUNAGENT_CHAT=1 is set, route through
+          // the new runAgent() wrapper instead of the legacy
+          // assistant.chat path. This is the SDK-canonical pattern
+          // (one query() call, agents map for subagents, no
+          // wrapper layers). Today's Phase 2 connects only the
+          // Clementine MCP server — Composio/external integrations
+          // come in Phase 3. Useful for testing the new path on
+          // tool-light sessions like cron-fix or memory queries.
+          //
+          // The legacy path (default) keeps full Composio/external
+          // routing + all post-response handlers, so this flag is
+          // safe to leave off until we're ready.
+          if (process.env.CLEMENTINE_USE_RUNAGENT_CHAT === '1'
+              && this.isTrustedPersonalSession(sessionKey)
+              && !sessState.pendingInterrupt
+          ) {
+            const { runAgent } = await import('../agent/run-agent.js');
+            logger.info({
+              sessionKey: effectiveSessionKey,
+              profile: resolvedProfile?.slug,
+              path: 'runagent_chat',
+            }, 'Phase 2: routing chat through runAgent');
+
+            try {
+              const runAgentResult = await runAgent(originalText, {
+                sessionKey: effectiveSessionKey,
+                source: 'chat',
+                profile: resolvedProfile,
+                agentManager: this.getAgentManager(),
+                memoryStore: this.assistant.getMemoryStore?.() ?? null,
+                onText: wrappedOnText,
+                onToolActivity: ({ tool, input }) => {
+                  toolActivityCount++;
+                  if (wrappedOnToolActivity) {
+                    return wrappedOnToolActivity(tool, input);
+                  }
+                  return undefined;
+                },
+                abortSignal: chatAc.signal,
+              });
+
+              clearTimeout(chatTimer);
+              clearTimeout(hardWallTimer);
+
+              // Mirror transcript so memory + recall continue working.
+              const memoryStore = this.assistant.getMemoryStore?.();
+              if (memoryStore) {
+                try {
+                  memoryStore.saveTurn(effectiveSessionKey, 'user', originalText);
+                  memoryStore.saveTurn(effectiveSessionKey, 'assistant', runAgentResult.text);
+                } catch (err) {
+                  logger.debug({ err }, 'runAgent chat: transcript mirror failed (non-fatal)');
+                }
+              }
+
+              // Fire auto-memory extraction in the background so
+              // MEMORY.md continues to update like the legacy path.
+              this.assistant
+                .triggerMemoryExtractionPostExchange(originalText, runAgentResult.text, effectiveSessionKey, resolvedProfile)
+                .catch(err => logger.debug({ err, sessionKey: effectiveSessionKey }, 'runAgent chat: auto-memory failed (non-fatal)'));
+
+              logger.info({
+                sessionKey: effectiveSessionKey,
+                totalMs: Date.now() - tInnerStart,
+                routedVia: 'runagent_chat',
+                numTurns: runAgentResult.numTurns,
+                cost: Number(runAgentResult.totalCostUsd.toFixed(4)),
+                responseLen: runAgentResult.text.length,
+              }, 'chat:latency');
+              return runAgentResult.text;
+            } catch (err) {
+              logger.warn({ err, sessionKey: effectiveSessionKey }, 'runAgent chat path failed — falling back to legacy chat');
+              // Fall through to the legacy chat path so the user
+              // still gets a response.
+            }
+          }
+
           // ── Pre-LLM plan routing (Gap #3 from orchestration audit) ──
           // When the user's text clearly maps to multi-step parallel
           // work, route through the orchestrator BEFORE the main agent
