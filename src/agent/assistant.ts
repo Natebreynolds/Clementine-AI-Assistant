@@ -3003,6 +3003,29 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
   }
 
   /**
+   * Public accessor for the SDK session ID associated with a sessionKey.
+   * Used by the canonical chat path so consecutive turns resume the
+   * same SDK conversation (the SDK persists sessions to JSONL on disk;
+   * resuming gives the agent native conversation history). Returns ''
+   * when no session exists yet.
+   */
+  getSdkSessionId(sessionKey: string): string {
+    return this.sessions.get(sessionKey) ?? '';
+  }
+
+  /**
+   * Persist the SDK session ID for a sessionKey. Called after a runAgent
+   * call returns so the next call can resume the same conversation.
+   * Writes through to disk via the existing saveSessions plumbing.
+   */
+  setSdkSessionId(sessionKey: string, sdkSessionId: string): void {
+    if (!sdkSessionId) return;
+    this.sessions.set(sessionKey, sdkSessionId);
+    this.sessionTimestamps.set(sessionKey, new Date());
+    this.saveSessions();
+  }
+
+  /**
    * Public entry point for triggering auto-memory extraction after an
    * exchange. Used by the new runAgent chat path (Phase 2 migration)
    * so it can keep the existing memory-extraction behavior without

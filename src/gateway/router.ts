@@ -2042,6 +2042,25 @@ export class Gateway {
             profileAppend: resolvedProfile?.systemPromptBody,
           });
 
+          // Per-turn context — recall of recent transcripts, persistent
+          // learnings, silent context blocks, security advisories, and
+          // toolset directives accumulated above. This is what gives
+          // continuity across daemon restarts (SDK in-memory session is
+          // gone, but transcripts in SQLite persist; recall surfaces
+          // them). Prefixed to the user message in a clearly-delimited
+          // [Context] block so the model knows it's framing, not user
+          // input.
+          const turnContextPrefix = securityAnnotation.trim()
+            ? `[Context — read this for continuity, then respond to the user message below]\n${securityAnnotation}\n[/Context]\n\n`
+            : '';
+          const finalPrompt = turnContextPrefix + chatPrompt;
+
+          // Resume the prior SDK session when one exists for this
+          // sessionKey. The SDK persists session JSONLs to disk, so
+          // resume works across daemon restarts. Without this, every
+          // turn is a fresh SDK session with zero conversation history.
+          const priorSdkSessionId = this.assistant.getSdkSessionId(effectiveSessionKey);
+
           logger.info({
             sessionKey: effectiveSessionKey,
             profile: resolvedProfile?.slug,
@@ -2049,9 +2068,11 @@ export class Gateway {
             composioConnected: chatMcp.composioConnected.length,
             externalConnected: chatMcp.externalConnected.length,
             systemAppendChars: chatSystemAppend.length,
+            turnContextChars: turnContextPrefix.length,
+            resumingSdkSessionId: priorSdkSessionId || null,
           }, 'Routing chat through runAgent');
 
-          const runAgentResult = await runAgent(chatPrompt, {
+          const runAgentResult = await runAgent(finalPrompt, {
             sessionKey: effectiveSessionKey,
             source: 'chat',
             profile: resolvedProfile,
@@ -2060,6 +2081,7 @@ export class Gateway {
             ...(effectiveModel ? { model: effectiveModel } : {}),
             ...(maxTurns ? { maxTurns } : {}),
             ...(chatSystemAppend ? { systemPromptAppend: chatSystemAppend } : {}),
+            ...(priorSdkSessionId ? { resumeSessionId: priorSdkSessionId } : {}),
             extraMcpServers: chatMcp.servers as unknown as Parameters<typeof runAgent>[1]['extraMcpServers'],
             onText: wrappedOnText,
             onToolActivity: ({ tool, input }) => {
@@ -2071,6 +2093,12 @@ export class Gateway {
             },
             abortSignal: chatAc.signal,
           });
+
+          // Persist the SDK session ID so the next turn resumes the
+          // same conversation. Survives daemon restarts via SESSIONS_FILE.
+          if (runAgentResult.sessionId) {
+            this.assistant.setSdkSessionId(effectiveSessionKey, runAgentResult.sessionId);
+          }
 
           clearTimeout(chatTimer);
           clearTimeout(hardWallTimer);
