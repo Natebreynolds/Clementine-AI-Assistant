@@ -1,0 +1,34 @@
+appId: com.clementine.assistant
+productName: Clementine
+asar: false
+npmRebuild: false
+directories:
+  buildResources: build
+  output: release
+extraMetadata:
+  main: dist/desktop/main.js
+files:
+  - dist/**/*
+  - build/icons/*.png
+  - build/icons/*.icns
+  - package.json
+  - README.md
+  - scripts/**/*
+  - vendor/**/*
+extraResources:
+  - from: build/icons
+    to: build/icons
+    filter:
+      - '*.png'
+      - '*.icns'
+mac:
+  category: public.app-category.productivity
+  icon: build/icons/icon.icns
+  target:
+    - dmg
+    - zip
+artifactName: Clementine-${version}-mac-${arch}.${ext}
+publish:
+  provider: github
+  owner: Natebreynolds
+  repo: Clementine-AI-Assistant

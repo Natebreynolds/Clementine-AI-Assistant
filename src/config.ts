@@ -558,6 +558,11 @@ export const WEBHOOK_BIND = getEnv('WEBHOOK_BIND', '127.0.0.1');
 export const GROQ_API_KEY = getSecret('GROQ_API_KEY');
 export const ELEVENLABS_API_KEY = getSecret('ELEVENLABS_API_KEY');
 export const ELEVENLABS_VOICE_ID = getEnv('ELEVENLABS_VOICE_ID');
+export const VOICE_ENABLED = getEnv('VOICE_ENABLED', 'false').toLowerCase() === 'true';
+export const VOICE_PROVIDER = getEnv('VOICE_PROVIDER', 'gemini-live');
+export const GEMINI_API_KEY = getSecret('GEMINI_API_KEY') || getSecret('GOOGLE_API_KEY');
+export const GEMINI_LIVE_MODEL = getEnv('GEMINI_LIVE_MODEL', 'gemini-3.1-flash-live-preview');
+export const GEMINI_LIVE_VOICE_NAME = getEnv('GEMINI_LIVE_VOICE_NAME', 'Kore');
 
 // ── Video ────────────────────────────────────────────────────────────
 

@@ -4,6 +4,8 @@ node_modules/
 # Build output
 dist/
 dist.tmp/
+release/
+*.tgz
 
 # Environment and secrets
 .env
@@ -37,6 +39,12 @@ logs/
 
 # Local dev screenshots (Playwright/manual captures at repo root)
 *.png
+
+# App icon assets are source inputs for desktop packaging.
+!build/
+!build/icons/
+!build/icons/*.png
+!build/icons/*.icns
 
 # Python bytecode (browser-harness MCP wrapper)
 __pycache__/

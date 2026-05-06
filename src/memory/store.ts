@@ -564,6 +564,17 @@ export class MemoryStore {
       CREATE INDEX IF NOT EXISTS idx_memory_events_created
         ON memory_events(created_at DESC);
     `);
+    try {
+      this.conn.exec('ALTER TABLE memory_events ADD COLUMN indexed_at TEXT');
+    } catch {
+      // Column already exists. Older installs created memory_events before
+      // indexed_at was added; keep the health dashboard schema-compatible.
+    }
+    try {
+      this.conn.exec('ALTER TABLE memory_events ADD COLUMN created_at TEXT');
+    } catch {
+      // Column already exists
+    }
 
     this.conn.exec(`
       CREATE TABLE IF NOT EXISTS memory_promotion_candidates (
@@ -4974,7 +4985,13 @@ export class MemoryStore {
     bySourceType: Array<{ sourceType: string; count: number }>;
   } {
     const total = (this.conn.prepare('SELECT COUNT(*) AS c FROM memory_events').get() as { c: number }).c;
-    const indexed = (this.conn.prepare('SELECT COUNT(*) AS c FROM memory_events WHERE indexed_at IS NOT NULL').get() as { c: number }).c;
+    let indexed = total;
+    try {
+      indexed = (this.conn.prepare('SELECT COUNT(*) AS c FROM memory_events WHERE indexed_at IS NOT NULL').get() as { c: number }).c;
+    } catch {
+      // Pre-indexed_at ledgers were all written as proof of indexing.
+      indexed = total;
+    }
     const bySourceType = this.conn
       .prepare(`SELECT source_type AS sourceType, COUNT(*) AS count
                 FROM memory_events GROUP BY source_type ORDER BY count DESC`)
