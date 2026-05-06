@@ -5270,6 +5270,62 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
     }
   });
 
+  // ── runAgent test endpoint (Phase 1 of SDK-canonical migration) ──────
+  //
+  // POST /api/runagent/test
+  //   body: { prompt, agentSlug?, forceSubagent?, model?, effort?, maxBudgetUsd?, source? }
+  //
+  // Lightweight endpoint to verify the new canonical SDK call path
+  // without rerouting any production traffic. Owner-only.
+  // Migration plan: /Users/nathan.reynolds/.claude/plans/sdk-canonical-migration.md
+  app.post('/api/runagent/test', async (req, res) => {
+    const { prompt, agentSlug, forceSubagent, model, effort, maxBudgetUsd, source } = req.body ?? {};
+    if (!prompt || typeof prompt !== 'string') {
+      res.status(400).json({ error: 'prompt is required' });
+      return;
+    }
+    try {
+      const gw = await getGateway();
+      const agentMgr = gw.getAgentManager();
+      const profile = agentSlug ? agentMgr.get(agentSlug) ?? null : null;
+      const memoryStore = (gw as unknown as { assistant: { getMemoryStore?: () => unknown } }).assistant.getMemoryStore?.();
+
+      const { runAgent } = await import('../agent/run-agent.js');
+      const startedAt = Date.now();
+      const toolActivity: Array<{ tool: string; inputPreview: string }> = [];
+
+      const result = await runAgent(prompt, {
+        sessionKey: `dashboard:runagent-test:${Date.now()}`,
+        source: typeof source === 'string' ? source : 'test',
+        profile,
+        forceSubagent: typeof forceSubagent === 'string' ? forceSubagent : null,
+        agentManager: agentMgr,
+        memoryStore: memoryStore as Parameters<typeof runAgent>[1]['memoryStore'],
+        model: typeof model === 'string' ? model : undefined,
+        effort: typeof effort === 'string' ? effort as 'low' | 'medium' | 'high' | 'xhigh' | 'max' : undefined,
+        maxBudgetUsd: typeof maxBudgetUsd === 'number' ? maxBudgetUsd : undefined,
+        onToolActivity: ({ tool, input }) => {
+          toolActivity.push({ tool, inputPreview: JSON.stringify(input).slice(0, 200) });
+        },
+      });
+
+      res.json({
+        ok: true,
+        text: result.text,
+        sessionId: result.sessionId,
+        subtype: result.subtype,
+        numTurns: result.numTurns,
+        totalCostUsd: Number(result.totalCostUsd.toFixed(4)),
+        durationMs: Date.now() - startedAt,
+        toolCallCount: toolActivity.length,
+        toolActivity: toolActivity.slice(0, 50), // cap for sanity
+        usage: result.usage,
+      });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
   /** Dismiss a diagnosis without applying — clears the cached result. */
   app.post('/api/cron/broken-jobs/:jobName/dismiss-diagnosis', async (req, res) => {
     try {
