@@ -36,7 +36,7 @@ import pino from 'pino';
 import type { AgentProfile } from '../types.js';
 import type { Gateway } from '../gateway/router.js';
 import type { CronScheduler } from '../gateway/heartbeat.js';
-import { chunkText, sendChunked, DiscordStreamingMessage, friendlyToolName, sanitizeResponse, rehydrateStatusEmbed, setSavedStatusEmbed } from './discord-utils.js';
+import { chunkText, DiscordStreamingMessage, friendlyToolName, sanitizeResponse, rehydrateStatusEmbed, setSavedStatusEmbed } from './discord-utils.js';
 import { MODELS } from '../config.js';
 import * as cronParser from 'cron-parser';
 
@@ -59,8 +59,6 @@ function formatAgentDuration(minutes: number): string {
 // ── Slash commands shared by all agent bots ──────────────────────────
 
 const agentSlashCommands = [
-  new SlashCommandBuilder().setName('plan').setDescription('Break a task into parallel steps')
-    .addStringOption(o => o.setName('task').setDescription('What to plan').setRequired(true)),
   new SlashCommandBuilder().setName('deep').setDescription('Extended mode (100 turns) for heavy tasks')
     .addStringOption(o => o.setName('message').setDescription('Your message').setRequired(true)),
   new SlashCommandBuilder().setName('quick').setDescription('Quick reply using Haiku model')
@@ -658,94 +656,6 @@ export class AgentBotClient {
         } else {
           const current = this.gateway.getSessionModel(sessionKey) ?? 'default';
           await cmd.reply(`Current model: \`${current}\`\nOptions: /model haiku, /model sonnet, /model opus`);
-        }
-        return;
-      }
-
-      // /plan — with approval buttons
-      if (name === 'plan') {
-        const task = cmd.options.getString('task', true);
-        await cmd.deferReply();
-        await cmd.editReply(`Planning: _${task.slice(0, 100)}_...`);
-
-        if (!cmd.channel) {
-          await cmd.editReply('Could not access channel for plan.');
-          return;
-        }
-
-        const streamer = new DiscordStreamingMessage(cmd.channel);
-        await streamer.start();
-        await streamer.update('Planning...');
-
-        try {
-          const result = await this.gateway.handlePlan(
-            sessionKey,
-            task,
-            async (updates) => {
-              const lines = [
-                `**Plan:** ${task.slice(0, 100)}`,
-                '',
-                ...updates.map((u, i) => {
-                  const num = `[${i + 1}/${updates.length}]`;
-                  const desc = u.description.slice(0, 60);
-                  switch (u.status) {
-                    case 'done': return `${num} ${desc} \u2713 (${Math.round((u.durationMs ?? 0) / 1000)}s)`;
-                    case 'running': return `${num} ${desc} \u23f3 running...`;
-                    case 'failed': return `${num} ${desc} \u2717 failed`;
-                    default: return `${num} ${desc} \u25cb waiting`;
-                  }
-                }),
-              ];
-              await streamer.update(lines.join('\n').slice(0, 1800));
-            },
-            async (_planSummary, steps) => {
-              const planPreview = `**Plan:** ${task.slice(0, 100)}\n\n` +
-                steps.map((s, i) => `${i + 1}. **${s.id}** — ${s.description.slice(0, 60)}`).join('\n');
-              if ('send' in cmd.channel!) {
-                await sendChunked(cmd.channel!, planPreview);
-              }
-
-              // Send approval buttons
-              const requestId = `plan-${Date.now()}`;
-              const buttons = [
-                { type: 2, style: 3, label: 'Approve', custom_id: `plan_${requestId}_approve` },
-                { type: 2, style: 1, label: 'Revise', custom_id: `plan_${requestId}_revise` },
-                { type: 2, style: 4, label: 'Cancel', custom_id: `plan_${requestId}_deny` },
-              ];
-              if ('send' in cmd.channel!) {
-                await cmd.channel!.send({
-                  content: 'Approve this plan?',
-                  components: [{ type: 1, components: buttons }] as any,
-                });
-              }
-
-              const approvalResult = await this.gateway.requestApproval('Pending approval', requestId);
-              if (typeof approvalResult === 'string') {
-                if ('send' in cmd.channel!) {
-                  await cmd.channel!.send('\u2728 *Revising plan...*');
-                }
-                return approvalResult;
-              }
-              if (approvalResult) {
-                const newStreamer = new DiscordStreamingMessage(cmd.channel!);
-                await newStreamer.start();
-                await newStreamer.update('Executing plan...');
-                Object.assign(streamer, {
-                  message: (newStreamer as any).message,
-                  lastEdit: (newStreamer as any).lastEdit,
-                  pendingText: '',
-                  lastFlushedText: '',
-                  isFinal: false,
-                });
-              }
-              return approvalResult;
-            },
-          );
-
-          await streamer.finalize(result);
-        } catch (err) {
-          logger.error({ err, slug: this.config.slug }, '/plan command failed');
-          await streamer.finalize(`Plan failed: ${err}`);
         }
         return;
       }

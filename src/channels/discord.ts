@@ -31,7 +31,6 @@ import os from 'node:os';
 import path from 'node:path';
 import {
   chunkText,
-  sendChunked,
   DiscordStreamingMessage,
   friendlyToolName,
   formatCronEmbed,
@@ -66,8 +65,6 @@ const BOT_MESSAGE_TRACKING_LIMIT = 100;
 // ── Slash command definitions ──────────────────────────────────────────
 
 const slashCommands = [
-  new SlashCommandBuilder().setName('plan').setDescription('Break a task into parallel steps')
-    .addStringOption(o => o.setName('task').setDescription('What to plan').setRequired(true)),
   new SlashCommandBuilder().setName('deep').setDescription('Extended mode (100 turns) for heavy tasks')
     .addStringOption(o => o.setName('message').setDescription('Your message').setRequired(true)),
   new SlashCommandBuilder().setName('quick').setDescription('Quick reply using Haiku model')
@@ -1252,19 +1249,6 @@ export async function startDiscord(
       return;
     }
 
-    // ── Plan orchestration (DM only) ─────────────────────────────────
-
-    if (isDm && text.startsWith('!plan ')) {
-      const taskDescription = text.slice(6).trim();
-      if (!taskDescription) {
-        await message.reply('Usage: `!plan <task description>`');
-        return;
-      }
-
-      await handlePlanCommand(gateway, sessionKey, taskDescription, message.channel);
-      return;
-    }
-
     // ── Approval responses (DM only) ────────────────────────────────
 
     if (isDm) {
@@ -1726,23 +1710,9 @@ export async function startDiscord(
         return;
       }
 
-      // Plan command — uses same approval-gated function as !plan
-      if (name === 'plan') {
-        const task = cmd.options.getString('task', true);
-        await cmd.deferReply();
-        await cmd.editReply(`Planning: _${task.slice(0, 100)}_...`);
-
-        // Route through the shared handlePlanCommand (it handles approval + progress)
-        // We need the channel for buttons, so get it from the interaction
-        if (cmd.channel) {
-          await handlePlanCommand(gateway, sessionKey, task, cmd.channel);
-        } else {
-          await cmd.editReply('Could not access channel for plan approval.');
-        }
-        return;
-      }
-
-      // Chat commands: /deep (with approval), /quick, /opus
+      // Chat commands: /quick, /opus
+      // (/plan and /deep removed — the canonical chat path now spawns
+      //  the planner subagent automatically when a task warrants it.)
       if (name === 'deep' || name === 'quick' || name === 'opus') {
         const msg = cmd.options.getString('message', true);
         const oneOffModel = name === 'quick' ? MODELS.haiku : name === 'opus' ? MODELS.opus : undefined;
@@ -2246,99 +2216,3 @@ export async function startDiscord(
   await client.login(DISCORD_TOKEN);
 }
 
-// ── Plan orchestration helper ─────────────────────────────────────────
-
-async function handlePlanCommand(
-  gateway: Gateway,
-  sessionKey: string,
-  taskDescription: string,
-  channel: Message['channel'],
-): Promise<void> {
-  const streamer = new DiscordStreamingMessage(channel);
-  await streamer.start();
-  await streamer.update('Planning...');
-
-  let progressTimer: ReturnType<typeof setInterval> | null = null;
-  try {
-    const result = await gateway.handlePlan(
-      sessionKey,
-      taskDescription,
-      async (updates) => {
-        // Build progress display (truncate descriptions to fit Discord limit)
-        const lines = [
-          `**Plan:** ${taskDescription.slice(0, 100)}`,
-          '',
-          ...updates.map((u, i) => {
-            const num = `[${i + 1}/${updates.length}]`;
-            const desc = u.description.slice(0, 60);
-            switch (u.status) {
-              case 'done': return `${num} ${desc} \u2713 (${Math.round((u.durationMs ?? 0) / 1000)}s)`;
-              case 'running': return `${num} ${desc} \u23f3 running...`;
-              case 'failed': return `${num} ${desc} \u2717 failed`;
-              default: return `${num} ${desc} \u25cb waiting`;
-            }
-          }),
-        ];
-        await streamer.update(lines.join('\n').slice(0, 1800));
-
-        // Start progress timer on first running step
-        if (!progressTimer && updates.some(u => u.status === 'running')) {
-          progressTimer = setInterval(async () => {
-            // Re-render with live elapsed times (static snapshot — no orchestrator ref needed)
-            await streamer.update(lines.join('\n').slice(0, 1800));
-          }, 5000);
-        }
-      },
-      // Approval gate — show plan and wait for user confirmation
-      async (_planSummary, steps) => {
-        // Show plan preview as a new message (previous streamer may be finalized from a revision round)
-        const planPreview = `**Plan:** ${taskDescription.slice(0, 100)}\n\n` +
-          steps.map((s, i) => `${i + 1}. **${s.id}** — ${s.description.slice(0, 60)}`).join('\n');
-        if ('send' in channel) {
-          await sendChunked(channel, planPreview);
-        }
-
-        // Send approval buttons
-        const requestId = `plan-${Date.now()}`;
-        await sendApprovalButtons(
-          channel,
-          'Approve this plan?',
-          'plan',
-          requestId,
-          { showRevise: true },
-        );
-        // Wait for the user to click approve/deny/revise
-        const approvalResult = await gateway.requestApproval('Pending approval', requestId);
-        if (typeof approvalResult === 'string') {
-          // Revision — post status and return feedback so orchestrator re-generates
-          if ('send' in channel) {
-            await channel.send(`\u2728 *Revising plan...*`);
-          }
-          return approvalResult;
-        }
-        if (approvalResult) {
-          // Start a new streamer for execution progress
-          const newStreamer = new DiscordStreamingMessage(channel);
-          await newStreamer.start();
-          await newStreamer.update('Executing plan...');
-          // Swap the streamer reference for progress updates
-          Object.assign(streamer, {
-            message: (newStreamer as any).message,
-            lastEdit: (newStreamer as any).lastEdit,
-            pendingText: '',
-            lastFlushedText: '',
-            isFinal: false,
-          });
-        }
-        return approvalResult;
-      },
-    );
-
-    await streamer.finalize(result);
-  } catch (err) {
-    logger.error({ err }, 'Plan execution failed');
-    await streamer.finalize(`Plan failed: ${err}`);
-  } finally {
-    if (progressTimer) clearInterval(progressTimer);
-  }
-}

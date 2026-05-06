@@ -9,14 +9,12 @@ import path from 'node:path';
 import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import pino from 'pino';
 import {
-  isAutonomousNothingOutput,
-  looksLikeProviderApiErrorResponse,
   oneMillionContextRecoveryMessage,
   PersonalAssistant,
   type ProjectMeta,
 } from '../agent/assistant.js';
 import { runWithTrace, logAuditJsonl } from '../agent/hooks.js';
-import type { BackgroundTask, OnProgressCallback, OnTextCallback, OnToolActivityCallback, PlanProgressUpdate, PlanStep, SelfImproveConfig, SelfImproveExperiment, SessionProvenance, TeamMessage, VerboseLevel, WorkflowDefinition } from '../types.js';
+import type { BackgroundTask, OnProgressCallback, OnTextCallback, OnToolActivityCallback, SelfImproveConfig, SelfImproveExperiment, SessionProvenance, TeamMessage, VerboseLevel, WorkflowDefinition } from '../types.js';
 import { SelfImproveLoop } from '../agent/self-improve.js';
 import {
   MODELS,
@@ -35,20 +33,12 @@ import { TeamRouter } from '../agent/team-router.js';
 import { TeamBus } from '../agent/team-bus.js';
 import { events } from '../events/bus.js';
 import type { NotificationDispatcher } from './notifications.js';
-import { createBackgroundTask, listBackgroundTasks, loadBackgroundTask, markDone, markFailed, markRunning } from '../agent/background-tasks.js';
+import { listBackgroundTasks, loadBackgroundTask, markFailed } from '../agent/background-tasks.js';
 import { applyAssistantExperienceUpdate, detectApprovalReply, detectLocalTurn, type AssistantExperienceUpdate } from '../agent/local-turn.js';
-import {
-  assessActionResponse,
-  buildActionEnforcementPrompt,
-  buildApprovalFollowupPrompt,
-  detectActionExpectation,
-  fallbackUnverifiedActionResponse,
-  type ActionExpectation,
-} from '../agent/action-enforcer.js';
+import { buildApprovalFollowupPrompt, detectActionExpectation } from '../agent/action-enforcer.js';
 import { updateClementineJson } from '../config/clementine-json.js';
 import { buildCronDiagnosticResponse } from './cron-diagnostic-turn.js';
 import { classifyIntent } from '../agent/intent-classifier.js';
-import { detectPreLlmPlanIntent } from '../agent/fanout-policy.js';
 import { decideTurn } from '../agent/turn-policy.js';
 import {
   recordProactiveNotificationEvent,
@@ -65,7 +55,7 @@ import { assessGatewayContextHygiene, formatGatewayHygieneAnnotation } from './c
 import { getToolsetPreset, type ToolsetName } from '../agent/toolsets.js';
 import { isLiveUnleashedStatus } from './unleashed-status.js';
 import { buildActiveContextSnapshot } from './active-context.js';
-import { markContextEventBySource, recordContextEvent, type ContextEventSeverity } from './context-events.js';
+import { markContextEventBySource } from './context-events.js';
 
 export { isLiveUnleashedStatus } from './unleashed-status.js';
 
@@ -136,7 +126,6 @@ interface SessionState {
   teamTaskControllers?: Set<AbortController>;
   provenance?: SessionProvenance;
   lastAccessedAt: number;
-  deepTask?: { jobName: string; taskDesc: string; startedAt: string };
   /** Last partial text streamed to the user — updated on every token. */
   lastStreamedText?: string;
   /**
@@ -305,7 +294,7 @@ export class Gateway {
   }
 
   private isSessionScopedBackgroundTask(sessionKey: string, task: BackgroundTask): boolean {
-    return task.sessionKey === sessionKey || this.sessions.get(sessionKey)?.deepTask?.jobName === task.id;
+    return task.sessionKey === sessionKey;
   }
 
   private canAccessBackgroundTask(sessionKey: string, task: BackgroundTask): boolean {
@@ -348,7 +337,7 @@ export class Gateway {
   }
 
   private cancelBackgroundJob(
-    sessionKey: string,
+    _sessionKey: string,
     jobName: string,
     taskDesc: string,
     task?: BackgroundTask | null,
@@ -365,12 +354,9 @@ export class Gateway {
       markFailed(task.id, 'cancelled from chat', 'aborted');
     }
 
-    const sess = this.sessions.get(sessionKey);
-    if (sess?.deepTask?.jobName === jobName) delete sess.deepTask;
-
     const status = this.readUnleashedStatus(jobName);
     const phase = status?.phase == null ? '' : ` at phase ${String(status.phase)}`;
-    const label = task ? `background task ${task.id}` : `deep mode task ${jobName}`;
+    const label = task ? `background task ${task.id}` : `background task ${jobName}`;
     const note = task?.status === 'pending'
       ? 'It will not be picked up by the scheduler.'
       : 'It will stop at the next phase boundary if it is already mid-phase.';
@@ -379,7 +365,6 @@ export class Gateway {
 
   private cancelActiveBackgroundTask(sessionKey: string, text: string): string | null {
     const explicitId = this.extractBackgroundTaskId(text);
-    const sess = this.sessions.get(sessionKey);
 
     if (explicitId) {
       const task = loadBackgroundTask(explicitId);
@@ -389,15 +374,7 @@ export class Gateway {
         }
         return this.cancelBackgroundJob(sessionKey, task.id, task.prompt, task);
       }
-      if (sess?.deepTask?.jobName === explicitId) {
-        return this.cancelBackgroundJob(sessionKey, explicitId, sess.deepTask.taskDesc);
-      }
       return `I could not find background task ${explicitId}.`;
-    }
-
-    if (sess?.deepTask) {
-      const task = loadBackgroundTask(sess.deepTask.jobName);
-      return this.cancelBackgroundJob(sessionKey, sess.deepTask.jobName, sess.deepTask.taskDesc, task);
     }
 
     const active = this.backgroundTasksForSession(sessionKey, ['pending', 'running']);
@@ -428,18 +405,6 @@ export class Gateway {
       lines.push('This chat session is busy. A new message will interrupt and redirect it.');
     }
     const seenBackgroundTasks = new Set<string>();
-    if (sess?.deepTask) {
-      seenBackgroundTasks.add(sess.deepTask.jobName);
-      const elapsedMin = Math.max(0, Math.round((Date.now() - new Date(sess.deepTask.startedAt).getTime()) / 60_000));
-      const persistedTask = loadBackgroundTask(sess.deepTask.jobName);
-      if (persistedTask) {
-        lines.push(`Background task: ${this.formatBackgroundTaskLine(persistedTask).slice(2)}`);
-      } else {
-        const status = this.readUnleashedStatus(sess.deepTask.jobName);
-        const phase = status?.phase == null ? '' : `, phase ${String(status.phase)}`;
-        lines.push(`Background task: ${sess.deepTask.taskDesc} (${elapsedMin} min, job ${sess.deepTask.jobName}${phase}).`);
-      }
-    }
 
     const bgTasks = this.backgroundTasksForSession(sessionKey, ['pending', 'running'])
       .filter((task) => !seenBackgroundTasks.has(task.id))
@@ -830,181 +795,6 @@ export class Gateway {
   }
 
   /**
-   * Deliver a deep-mode result back to the user.
-   * Routes through the agent's session so it responds conversationally,
-   * then pushes the agent's reply via the dispatcher so it actually reaches the channel.
-   * Falls back to pushing rawResult directly if the agent call fails.
-   */
-  private async _deliverDeepResult(
-    sessionKey: string,
-    syntheticPrompt: string,
-    rawFallback: string,
-  ): Promise<void> {
-    const agentSlug = this._agentSlugFromSessionKey(sessionKey);
-    const ctx = { sessionKey, ...(agentSlug ? { agentSlug } : {}) };
-    try {
-      const agentReply = await this.handleMessage(sessionKey, syntheticPrompt);
-      if (agentReply?.trim()) {
-        await this._dispatcher?.send(agentReply, ctx);
-        logger.info({ sessionKey, agentSlug }, 'Deep mode result delivered via agent follow-up + dispatcher');
-      }
-    } catch (err) {
-      logger.warn({ err, sessionKey }, 'Deep mode agent follow-up failed — using raw fallback');
-      if (rawFallback.trim()) {
-        await this._dispatcher?.send(rawFallback.slice(0, 1500), ctx)
-          .catch(async (e) => {
-            // Both paths failed — surface it instead of swallowing at debug level.
-            logger.warn({ err: e, sessionKey }, 'Deep mode fallback delivery failed — persisting to daily note');
-            try {
-              const { logToDailyNote } = await import('./cron-scheduler.js');
-              logToDailyNote(`**[Deep mode delivery failed]** Session ${sessionKey} — result was:\n\n${rawFallback.slice(0, 1500)}`);
-            } catch { /* best-effort */ }
-          });
-      }
-    }
-  }
-
-  private startInteractiveBackgroundTask(
-    sessionKey: string,
-    originalText: string,
-    opts: {
-      taskDesc: string;
-      jobPrompt: string;
-      stage: string;
-      ack?: string;
-      workDir?: string;
-      tier?: number;
-      maxTurns?: number;
-      model?: string;
-      maxHours?: number;
-      agentSlug?: string;
-      resultPrompt?: (result: string) => string;
-      failurePrompt?: (failure: string) => string;
-    },
-  ): string {
-    const agentSlug = opts.agentSlug ?? this._agentSlugFromSessionKey(sessionKey);
-    const maxHours = opts.maxHours ?? 1;
-    const task = createBackgroundTask({
-      fromAgent: agentSlug ?? 'clementine',
-      prompt: opts.taskDesc,
-      maxMinutes: Math.max(1, Math.ceil(maxHours * 60)),
-      sessionKey,
-    });
-    markRunning(task.id);
-    const startedAt = new Date().toISOString();
-    recordContextEvent({
-      source: 'background-task',
-      sourceId: task.id,
-      sessionKey,
-      title: `${task.id} running`,
-      summary: opts.taskDesc.slice(0, 1000),
-      status: 'running',
-      severity: 'normal',
-      eventAt: startedAt,
-      loggedAt: startedAt,
-      surfacedAt: startedAt,
-      acknowledgedAt: startedAt,
-      fingerprintParts: [sessionKey, 'background-task', task.id],
-      metadata: { stage: opts.stage, agentSlug: agentSlug ?? 'clementine' },
-    }, { baseDir: BASE_DIR });
-
-    const currentSess = this.getSession(sessionKey);
-    currentSess.deepTask = {
-      jobName: task.id,
-      taskDesc: opts.taskDesc.slice(0, 200),
-      startedAt: new Date().toISOString(),
-    };
-
-    events.emit('background:start', {
-      sessionKey,
-      taskId: task.id,
-      taskDesc: opts.taskDesc,
-      agentSlug,
-      stage: opts.stage,
-      timestamp: Date.now(),
-    });
-
-    this.assistant.runUnleashedTask(
-      task.id,
-      opts.jobPrompt,
-      opts.tier ?? 2,
-      opts.maxTurns,
-      opts.model,
-      opts.workDir,
-      maxHours,
-      agentSlug,
-    ).then(async (result) => {
-      if (loadBackgroundTask(task.id)?.status === 'aborted') {
-        logger.info({ sessionKey, taskId: task.id, stage: opts.stage }, 'Interactive background task resolved after cancellation; suppressing follow-up');
-        return;
-      }
-      logger.info({ sessionKey, taskId: task.id, resultLen: result?.length ?? 0, stage: opts.stage }, 'Interactive background task completed');
-      markDone(task.id, result ?? '');
-      events.emit('background:complete', { sessionKey, taskId: task.id, stage: opts.stage, timestamp: Date.now() });
-      if (result && !isAutonomousNothingOutput(result)) {
-        const completedAt = new Date().toISOString();
-        markContextEventBySource(
-          { sessionKey, source: 'background-task', sourceId: task.id },
-          {
-            status: 'done',
-            severity: 'low',
-            summary: result.slice(0, 1000),
-            surfacedAt: completedAt,
-            resolvedAt: completedAt,
-          },
-          { baseDir: BASE_DIR },
-        );
-        this.assistant.injectPendingContext(sessionKey, originalText, result);
-        await this._deliverDeepResult(
-          sessionKey,
-          opts.resultPrompt
-            ? opts.resultPrompt(result)
-            : `[DEEP_MODE_RESULT] You just completed background work for this user request. Summarize conversationally — lead with what matters.\n\nTask: ${opts.taskDesc.slice(0, 500)}\n\nResult:\n${result.slice(0, 3000)}`,
-          result,
-        );
-      }
-    }).catch(async (err) => {
-      if (loadBackgroundTask(task.id)?.status === 'aborted') {
-        logger.info({ sessionKey, taskId: task.id, stage: opts.stage }, 'Interactive background task failed after cancellation; suppressing failure follow-up');
-        return;
-      }
-      logger.error({ err, sessionKey, taskId: task.id, stage: opts.stage }, 'Interactive background task failed');
-      this.recordInteractiveFailure(sessionKey, originalText, err, opts.stage, { taskId: task.id, taskDesc: opts.taskDesc });
-      const failMsg = `Background work failed: ${String(err).slice(0, 200)}`;
-      markFailed(task.id, failMsg, 'failed');
-      const failedAt = new Date().toISOString();
-      const severity: ContextEventSeverity = /usage limit|billing|credit balance|monthly usage|auth/i.test(failMsg)
-        ? 'urgent'
-        : 'warning';
-      markContextEventBySource(
-        { sessionKey, source: 'background-task', sourceId: task.id },
-        {
-          status: 'failed',
-          severity,
-          summary: failMsg,
-          surfacedAt: failedAt,
-        },
-        { baseDir: BASE_DIR },
-      );
-      events.emit('background:failed', { sessionKey, taskId: task.id, stage: opts.stage, timestamp: Date.now() });
-      this.assistant.injectPendingContext(sessionKey, originalText, failMsg);
-      await this._deliverDeepResult(
-        sessionKey,
-        opts.failurePrompt
-          ? opts.failurePrompt(failMsg)
-          : `[DEEP_MODE_RESULT] The background task failed: ${failMsg}. Let the user know and suggest next steps. Be brief.`,
-        `Background task failed: ${failMsg}`,
-      );
-    }).finally(() => {
-      const s = this.sessions.get(sessionKey);
-      if (s?.deepTask?.jobName === task.id) delete s.deepTask;
-    });
-
-    return opts.ack
-      ?? `On it — running this in the background. I'll follow up when it's done. Task ${task.id}. Reply "status" to check in or "cancel" to stop.`;
-  }
-
-  /**
    * For Clementine-owned sessions, classify whether the message should be
    * delegated to a specialist agent. Returns null when routing isn't
    * eligible; { delegated: true, ackMessage } when auto-delegated;
@@ -1145,19 +935,6 @@ export class Gateway {
       s.lastAccessedAt = Date.now();
     }
     return s;
-  }
-
-  /**
-   * Reverse-lookup the session key that owns a given deep-mode jobName.
-   * Used by the cron-scheduler callbacks so phase-progress and completion
-   * messages can be routed back to the originating channel instead of
-   * fanning out to every registered sender.
-   */
-  findDeepTaskSessionKey(jobName: string): string | null {
-    for (const [key, sess] of this.sessions) {
-      if (sess.deepTask?.jobName === jobName) return key;
-    }
-    return null;
   }
 
   // ── Team system accessors ──────────────────────────────────────────
@@ -1396,18 +1173,6 @@ export class Gateway {
 
   setDraining(value: boolean): void { this.draining = value; }
   isDraining(): boolean { return this.draining; }
-
-  setUnleashedCompleteCallback(cb: (jobName: string, result: string) => void): void {
-    this.assistant.setUnleashedCompleteCallback(cb);
-  }
-
-  setPhaseCompleteCallback(cb: (jobName: string, phase: number, totalPhases: number, output: string) => void): void {
-    this.assistant.setPhaseCompleteCallback(cb);
-  }
-
-  setPhaseProgressCallback(cb: (jobName: string, phase: number, summary: string) => void): void {
-    this.assistant.setPhaseProgressCallback(cb);
-  }
 
   /** Wire the skill-proposed notification — called once at startup so new skills surface to owner. */
   initSkillNotifications(): void {
@@ -1846,9 +1611,6 @@ export class Gateway {
     const approvalFollowupExpected = this.isTrustedPersonalSession(sessionKey)
       && detectApprovalReply(originalText) === true
       && this.assistant.hasRecentApprovalPrompt(sessionKey);
-    const actionExpectation: ActionExpectation = detectActionExpectation(originalText, {
-      approvalFollowup: approvalFollowupExpected,
-    });
     if (approvalFollowupExpected) {
       text = buildApprovalFollowupPrompt(originalText);
       logger.info({ sessionKey }, 'Approval follow-up promoted to tool-enabled action prompt');
@@ -2133,96 +1895,7 @@ export class Gateway {
         // the agent to propose a plan + stop, rather than executing
         // directly. Not a hard stop — on the user's "go" reply the
         // agent proceeds from the plan it proposed.
-        let enrichedText = text;
-        const isInteractive = isOwnerDm
-          || sessionKey.startsWith('dashboard:')
-          || sessionKey.startsWith('cli:');
-        // Builder sessions (dashboard chat-first trick builder) are
-        // conversational by contract — they author specs, they don't
-        // run them. Skip the deep-mode classifier so a "build a thing
-        // that does X and Y" prompt doesn't get hijacked into an async
-        // background task.
-        const isBuilderSession = sessionKey.startsWith('dashboard:builder:');
-        if (isInteractive && !isBuilderSession && !isInternalMsg && !recentContext?.suppressDeepMode && !text.startsWith('!') && !sess?.deepTask) {
-          try {
-            const turnDecision = decideTurn({
-              text,
-              intent: classifyIntent(text),
-              hasRecentContext: this.sessions.has(sessionKey),
-            });
-            if (turnDecision.mode === 'background') {
-              logger.info({ sessionKey, reason: turnDecision.reason, bundles: turnDecision.toolRoute.bundles },
-                'Turn decision requested immediate background execution');
-              return this.startInteractiveBackgroundTask(sessionKey, text, {
-                taskDesc: text.slice(0, 500),
-                stage: 'turn_decision_background',
-                jobPrompt: [
-                  `The user asked: ${text}`,
-                  '',
-                  'This was routed straight to background execution because the user explicitly asked for sustained/background work.',
-                  'Complete the task thoroughly, use memory/tools as needed, keep outputs bounded, and return a concise conversational summary.',
-                ].join('\n'),
-              });
-            }
-
-            const { classifyComplexity, planFirstDirective } = await import('../agent/complexity-classifier.js');
-            const verdict = classifyComplexity(text);
-
-            // deepWorthy: skip the main-agent turn entirely and route
-            // straight to background execution. Saves the turn that would
-            // almost certainly get auto-escalated after burning 3+ tool
-            // calls (see the post-flight auto-escalation path below).
-            if (verdict.deepWorthy) {
-              logger.info({ sessionKey, signals: verdict.signals, reason: verdict.reason },
-                'Pre-flight deep-mode gate fired — spawning background task');
-              return this.startInteractiveBackgroundTask(sessionKey, text, {
-                taskDesc: text.slice(0, 500),
-                stage: 'preflight_deep_mode',
-                jobPrompt: `The user asked: ${text}\n\nThis was routed straight to background execution because it looks like sustained multi-step work. Complete the task thoroughly and return a conversational summary.`,
-                ack: `On it — this looks like real work. Running it in the background; I'll follow up when it's done. Reply "cancel" to stop or "status" to check in.`,
-              });
-            }
-
-            if (verdict.complex) {
-              logger.info({ sessionKey, signals: verdict.signals, reason: verdict.reason },
-                'Pre-flight planning directive injected');
-              enrichedText = `${planFirstDirective()}\n\n---\n\n${text}`;
-            }
-          } catch (err) {
-            logger.debug({ err }, 'Complexity classifier failed (non-fatal)');
-          }
-        }
-
-        // ── Deep mode control ──────────────────────────────────────────
-        if (sess?.deepTask) {
-          const lower = text.toLowerCase().trim();
-          if (lower === 'cancel' || lower === 'stop' || lower === 'cancel deep' || lower === 'stop deep') {
-            const { jobName, taskDesc } = sess.deepTask;
-            try {
-              const cancelDir = path.join(BASE_DIR, 'unleashed', jobName);
-              const { mkdirSync, writeFileSync } = await import('node:fs');
-              mkdirSync(cancelDir, { recursive: true });
-              writeFileSync(path.join(cancelDir, 'CANCEL'), '');
-            } catch { /* best-effort */ }
-            delete sess.deepTask;
-            logger.info({ sessionKey, jobName }, 'Deep mode task cancelled by user');
-            return `Deep mode cancelled: ${taskDesc}`;
-          }
-          if (lower === 'status' || lower === 'deep status') {
-            const { taskDesc, startedAt, jobName } = sess.deepTask;
-            // Try to read latest progress from unleashed status file
-            let phaseInfo = '';
-            try {
-              const statusPath = path.join(BASE_DIR, 'unleashed', jobName, 'status.json');
-              const { readFileSync } = await import('node:fs');
-              const status = JSON.parse(readFileSync(statusPath, 'utf-8'));
-              phaseInfo = ` Phase ${status.phase ?? '?'}, status: ${status.status ?? 'running'}.`;
-            } catch { /* status file may not exist yet */ }
-            return `Deep mode running: ${taskDesc}\nStarted ${startedAt}.${phaseInfo}`;
-          }
-          // Otherwise, let the message go through normally — user can still chat
-        }
-
+        const enrichedText = text;
         // Resolve active profile
         let effectiveSessionKey = sessionKey;
         const profileSlug = sess?.profile;
@@ -2232,13 +1905,6 @@ export class Gateway {
         const resolvedProfile = profileSlug
           ? this.getAgentManager().get(profileSlug) ?? undefined
           : undefined;
-
-        // Resolve active project override
-        const projectOverride = sess?.project;
-
-        // Resolve verbose level for this session
-        const verboseLevel = sess?.verboseLevel;
-        const sessionToolset = this.getSessionToolset(sessionKey);
 
         const hygiene = assessGatewayContextHygiene({
           sessionKey: effectiveSessionKey,
@@ -2321,20 +1987,13 @@ export class Gateway {
           ? async (name: string, input: Record<string, unknown>) => { resetIdleTimer(); toolActivityCount++; await emitToolProgress(name); return onToolActivity(name, input); }
           : async (name: string, _input: Record<string, unknown>) => { resetIdleTimer(); toolActivityCount++; await emitToolProgress(name); };
 
-        // Hard wall timer: if the SDK ignores abort (e.g. stuck in a sub-agent),
-        // this resolves immediately with a timeout message so the user isn't blocked.
-        let hardWallTimer: ReturnType<typeof setTimeout> | undefined;
-        const hardWallPromise = new Promise<[string, string]>((resolve) => {
-          hardWallTimer = setTimeout(() => {
-            chatAc.abort();
-            logger.warn({ sessionKey, wallMs: CHAT_MAX_WALL_MS }, 'Hard wall timeout — returning immediately');
-            resolve([
-              'This task hit the 30-minute safety limit. The work may have partially completed. ' +
-              'Let me know if you want me to continue — I\'ll pick up where I left off.',
-              '',
-            ]);
-          }, CHAT_MAX_WALL_MS);
-        });
+        // Hard wall timer: aborts the SDK call if a chat task runs past
+        // CHAT_MAX_WALL_MS. The runAgent path honors abortSignal, so the
+        // SDK exits with a stop reason and the catch block surfaces it.
+        const hardWallTimer = setTimeout(() => {
+          chatAc.abort();
+          logger.warn({ sessionKey, wallMs: CHAT_MAX_WALL_MS }, 'Hard wall timeout — aborting chat');
+        }, CHAT_MAX_WALL_MS);
 
         // If the previous query on this session was interrupted by this
         // incoming message, fold the partial output in so the agent can pivot
@@ -2355,488 +2014,73 @@ export class Gateway {
         }
 
         try {
-          // ── Phase 5: canonical SDK chat path is now DEFAULT ──────────
-          // The new runAgent() wrapper is the canonical path. Set
-          // CLEMENTINE_USE_RUNAGENT_CHAT=0 to fall back to legacy.
-          // The legacy path remains as the in-process error fallback
-          // when runAgent throws.
-          if (process.env.CLEMENTINE_USE_RUNAGENT_CHAT !== '0'
-              && this.isTrustedPersonalSession(sessionKey)
-              && !sessState.pendingInterrupt
-          ) {
-            const { runAgent } = await import('../agent/run-agent.js');
-            logger.info({
-              sessionKey: effectiveSessionKey,
-              profile: resolvedProfile?.slug,
-              path: 'runagent_chat',
-            }, 'Phase 2: routing chat through runAgent');
+          // ── Canonical SDK chat path (Phase 5) ────────────────────────
+          // runAgent() owns chat. No legacy fallback — errors propagate
+          // to the catch block below for honest classification.
+          const { runAgent } = await import('../agent/run-agent.js');
+          logger.info({
+            sessionKey: effectiveSessionKey,
+            profile: resolvedProfile?.slug,
+            path: 'runagent_chat',
+          }, 'Routing chat through runAgent');
 
-            try {
-              const runAgentResult = await runAgent(originalText, {
-                sessionKey: effectiveSessionKey,
-                source: 'chat',
-                profile: resolvedProfile,
-                agentManager: this.getAgentManager(),
-                memoryStore: this.assistant.getMemoryStore?.() ?? null,
-                onText: wrappedOnText,
-                onToolActivity: ({ tool, input }) => {
-                  toolActivityCount++;
-                  if (wrappedOnToolActivity) {
-                    return wrappedOnToolActivity(tool, input);
-                  }
-                  return undefined;
-                },
-                abortSignal: chatAc.signal,
-              });
-
-              clearTimeout(chatTimer);
-              clearTimeout(hardWallTimer);
-
-              // Mirror transcript so memory + recall continue working.
-              const memoryStore = this.assistant.getMemoryStore?.();
-              if (memoryStore) {
-                try {
-                  memoryStore.saveTurn(effectiveSessionKey, 'user', originalText);
-                  memoryStore.saveTurn(effectiveSessionKey, 'assistant', runAgentResult.text);
-                } catch (err) {
-                  logger.debug({ err }, 'runAgent chat: transcript mirror failed (non-fatal)');
-                }
+          const runAgentResult = await runAgent(chatPrompt, {
+            sessionKey: effectiveSessionKey,
+            source: 'chat',
+            profile: resolvedProfile,
+            agentManager: this.getAgentManager(),
+            memoryStore: this.assistant.getMemoryStore?.() ?? null,
+            ...(effectiveModel ? { model: effectiveModel } : {}),
+            ...(maxTurns ? { maxTurns } : {}),
+            onText: wrappedOnText,
+            onToolActivity: ({ tool, input }) => {
+              toolActivityCount++;
+              if (wrappedOnToolActivity) {
+                return wrappedOnToolActivity(tool, input);
               }
-
-              // Fire auto-memory extraction in the background so
-              // MEMORY.md continues to update like the legacy path.
-              this.assistant
-                .triggerMemoryExtractionPostExchange(originalText, runAgentResult.text, effectiveSessionKey, resolvedProfile)
-                .catch(err => logger.debug({ err, sessionKey: effectiveSessionKey }, 'runAgent chat: auto-memory failed (non-fatal)'));
-
-              logger.info({
-                sessionKey: effectiveSessionKey,
-                totalMs: Date.now() - tInnerStart,
-                routedVia: 'runagent_chat',
-                numTurns: runAgentResult.numTurns,
-                cost: Number(runAgentResult.totalCostUsd.toFixed(4)),
-                responseLen: runAgentResult.text.length,
-              }, 'chat:latency');
-              return runAgentResult.text;
-            } catch (err) {
-              logger.warn({ err, sessionKey: effectiveSessionKey }, 'runAgent chat path failed — falling back to legacy chat');
-              // Fall through to the legacy chat path so the user
-              // still gets a response.
-            }
-          }
-
-          // ── Pre-LLM plan routing (Gap #3 from orchestration audit) ──
-          // When the user's text clearly maps to multi-step parallel
-          // work, route through the orchestrator BEFORE the main agent
-          // runs. This is HARD enforcement — independent of whether
-          // the agent self-detects via [PLAN_NEEDED:]. Saves a Sonnet
-          // turn that would likely thrash, and the planner's parallel
-          // sub-agents (Haiku-default) keep big tool responses out of
-          // the user's main context.
-          //
-          // Conservative gate: requires explicit action verbs +
-          // multiple fanout signals + non-informational intent. False
-          // positives waste a planner LLM call (~$0.05); false
-          // negatives let the existing soft-enforcement path run, which
-          // is the status quo. Trusted personal sessions only — we
-          // don't surprise random Discord users with auto-orchestration.
-          if (this.isTrustedPersonalSession(sessionKey)
-              && !sessState.pendingInterrupt /* don't override mid-thought continuations */
-          ) {
-            const planIntentDecision = detectPreLlmPlanIntent(originalText, {
-              intentType: classifyIntent(originalText)?.type,
-            });
-            if (planIntentDecision.shouldRouteToPlanner) {
-              logger.info({
-                sessionKey: effectiveSessionKey,
-                reason: planIntentDecision.reason,
-                signals: planIntentDecision.signals.map(s => s.pattern),
-                actionVerbs: planIntentDecision.actionVerbs,
-                originalTextPreview: originalText.slice(0, 200),
-              }, 'Pre-LLM plan routing: bypassing main agent for orchestrator');
-
-              if (wrappedOnText) {
-                try {
-                  await wrappedOnText('Detected a multi-step task — decomposing into parallel sub-agents…\n\n');
-                } catch { /* streaming is best-effort */ }
-              }
-
-              try {
-                const planResult = await this.handlePlan(
-                  effectiveSessionKey,
-                  originalText,
-                  undefined, // chat path doesn't need structured progress callbacks
-                  undefined, // no approval gate — pre-LLM routing is opt-in via signal match
-                );
-                clearTimeout(chatTimer);
-                clearTimeout(hardWallTimer);
-                logger.info({
-                  sessionKey: effectiveSessionKey,
-                  totalMs: Date.now() - tInnerStart,
-                  routedVia: 'pre_llm_planner',
-                  responseLen: planResult.length,
-                }, 'chat:latency');
-                return planResult;
-              } catch (err) {
-                logger.warn({ err, sessionKey: effectiveSessionKey }, 'Pre-LLM plan routing failed — falling back to direct agent');
-                // Fall through to the regular agent path so the user
-                // still gets a response.
-              }
-            }
-          }
-
-          // No artificial turn cap — let the agent work until done.
-          // Primary guardrail is cost budget (maxBudgetUsd in buildOptions).
-          // Wall clock (CHAT_MAX_WALL_MS) and StallGuard are safety nets.
-          events.emit('query:start', { sessionKey, model: effectiveModel, maxTurns: maxTurns, timestamp: Date.now() });
-          if (onProgress) {
-            await onProgress('thinking...').catch(() => { /* non-fatal */ });
-          }
-          const queryStartMs = Date.now();
-          let [response] = await Promise.race([
-            this.assistant.chat(
-              chatPrompt,
-              effectiveSessionKey,
-              { onText: wrappedOnText, onToolActivity: wrappedOnToolActivity, model: effectiveModel, maxTurns: maxTurns, securityAnnotation, projectOverride, profile: resolvedProfile, verboseLevel, abortController: chatAc, toolset: sessionToolset },
-            ),
-            hardWallPromise,
-          ]);
-
-          const actionAssessment = assessActionResponse({
-            actionExpectation,
-            userText: originalText,
-            response,
-            toolActivityCount,
-            backgroundStarted: false,
-            delegated: false,
+              return undefined;
+            },
+            abortSignal: chatAc.signal,
           });
-          if (actionAssessment.violation && !chatAc.signal.aborted) {
-            logger.warn({
-              sessionKey,
-              reason: actionAssessment.reason,
-              responsePreview: response.slice(0, 200),
-            }, 'Action enforcement retry triggered');
-            logAuditJsonl({
-              event_type: 'action_enforcement_retry',
-              reason: actionAssessment.reason,
-              action_expectation_source: actionExpectation.source,
-              rejected_reply_preview: response.slice(0, 300),
-            });
-            if (onProgress) {
-              await onProgress('verifying action...').catch(() => { /* non-fatal */ });
-            }
-
-            const retryPrompt = buildActionEnforcementPrompt({
-              userText: originalText,
-              previousResponse: response,
-              reason: actionAssessment.reason,
-            });
-            const toolCountBeforeRetry = toolActivityCount;
-            try {
-              const [retryResponse] = await this.assistant.chat(
-                retryPrompt,
-                effectiveSessionKey,
-                {
-                  onText: wrappedOnText,
-                  onToolActivity: wrappedOnToolActivity,
-                  model: effectiveModel,
-                  maxTurns: Math.max(maxTurns ?? 0, 8),
-                  securityAnnotation,
-                  projectOverride,
-                  profile: resolvedProfile,
-                  verboseLevel,
-                  abortController: chatAc,
-                  toolset: sessionToolset,
-                },
-              );
-              const retryToolCount = toolActivityCount - toolCountBeforeRetry;
-              const retryAssessment = assessActionResponse({
-                actionExpectation,
-                userText: originalText,
-                response: retryResponse,
-                toolActivityCount: retryToolCount,
-                backgroundStarted: false,
-                delegated: false,
-              });
-              if (retryAssessment.violation) {
-                response = fallbackUnverifiedActionResponse(retryAssessment.reason);
-                logger.warn({
-                  sessionKey,
-                  reason: retryAssessment.reason,
-                  retryToolCount,
-                }, 'Action enforcement fallback returned');
-                logAuditJsonl({
-                  event_type: 'action_enforcement_fallback',
-                  reason: retryAssessment.reason,
-                  action_expectation_source: actionExpectation.source,
-                  retry_reply_preview: retryResponse.slice(0, 300),
-                });
-                if (onText) await onText(response).catch(() => { /* non-fatal */ });
-              } else {
-                response = retryResponse;
-                logAuditJsonl({
-                  event_type: 'action_enforcement_corrected',
-                  reason: actionAssessment.reason,
-                  action_expectation_source: actionExpectation.source,
-                  retry_tool_count: retryToolCount,
-                });
-              }
-            } catch (err) {
-              logger.warn({ err, sessionKey }, 'Action enforcement retry failed');
-              response = fallbackUnverifiedActionResponse(`retry failed: ${String(err).slice(0, 160)}`);
-              if (onText) await onText(response).catch(() => { /* non-fatal */ });
-            }
-          }
 
           clearTimeout(chatTimer);
-          if (hardWallTimer) clearTimeout(hardWallTimer);
-          { const cs = this.sessions.get(sessionKey); if (cs) delete cs.abortController; }
+          clearTimeout(hardWallTimer);
 
-          const chatMs = Date.now() - queryStartMs;
-          timings.chatMs = chatMs;
-          if (firstTokenAt !== undefined) {
-            timings.firstTokenMs = firstTokenAt - queryStartMs;
+          // Mirror transcript so memory + recall continue working.
+          const memoryStore = this.assistant.getMemoryStore?.();
+          if (memoryStore) {
+            try {
+              memoryStore.saveTurn(effectiveSessionKey, 'user', originalText);
+              memoryStore.saveTurn(effectiveSessionKey, 'assistant', runAgentResult.text);
+            } catch (err) {
+              logger.debug({ err }, 'chat: transcript mirror failed (non-fatal)');
+            }
           }
-          events.emit('query:complete', {
-            sessionKey, responseLength: response?.length ?? 0,
-            toolActivityCount, durationMs: chatMs,
-          });
 
-          // One greppable line per chat completion — feed for the latency dashboard.
+          // Fire auto-memory extraction in the background.
+          this.assistant
+            .triggerMemoryExtractionPostExchange(originalText, runAgentResult.text, effectiveSessionKey, resolvedProfile)
+            .catch(err => logger.debug({ err, sessionKey: effectiveSessionKey }, 'chat: auto-memory failed (non-fatal)'));
+
+          // Auth recovered if we got a clean response.
+          this.clearAuthFailure();
+
           logger.info({
-            sessionKey,
+            sessionKey: effectiveSessionKey,
             totalMs: Date.now() - tInnerStart,
-            ...timings,
-            toolActivityCount,
-            responseLen: response?.length ?? 0,
+            routedVia: 'runagent_chat',
+            numTurns: runAgentResult.numTurns,
+            cost: Number(runAgentResult.totalCostUsd.toFixed(4)),
+            responseLen: runAgentResult.text.length,
           }, 'chat:latency');
 
-          // Re-baseline integrity checksums after chat (auto-memory may write to vault)
-          scanner.refreshIntegrity();
-
-          if (response && looksLikeClaudeOneMillionContextError(response)) {
-            logger.warn({ sessionKey, responsePreview: response.slice(0, 200) }, '1M context error returned as assistant text — forcing recovery');
-            this.recordInteractiveFailure(sessionKey, text, response, 'one_million_context_result_text', { effectiveSessionKey });
-            applyOneMillionContextRecovery();
-            this.clearSession(effectiveSessionKey);
-            return oneMillionContextRecoveryMessage();
-          }
-
-          if (response && looksLikeProviderApiErrorResponse(response)) {
-            logger.warn({ sessionKey, responsePreview: response.slice(0, 200) }, 'Provider API error returned as assistant text — clearing session');
-            this.recordInteractiveFailure(sessionKey, text, response, 'provider_api_result_text', { effectiveSessionKey });
-            this.clearSession(effectiveSessionKey);
-            return "Claude returned a provider API error instead of a normal answer. I've reset this session so the error does not get replayed into future context. Please try that question again.";
-          }
-
-          // ── Auto-plan detection ──────────────────────────────────────
-          // If the agent signals a complex task, auto-route to the orchestrator
-          const planMatch = response?.match(/^\[PLAN_NEEDED:\s*(.+?)\]\s*/);
-          if (planMatch) {
-            const taskDesc = planMatch[1].trim() || text;
-            logger.info({ sessionKey, task: taskDesc }, 'Auto-plan triggered by agent');
-            try {
-              const planResult = await this.handlePlan(
-                sessionKey,
-                `${taskDesc}\n\nOriginal request: ${text}`,
-                undefined, // no progress callback for auto-triggered plans
-                undefined, // no approval gate for auto-triggered plans
-              );
-              return planResult;
-            } catch (err) {
-              logger.warn({ err, sessionKey }, 'Auto-plan failed — returning original response');
-              // Strip the [PLAN_NEEDED] tag and return the rest of the response
-              return response.replace(/^\[PLAN_NEEDED:[^\]]*\]\s*/, '').trim() || '*(no response)*';
-            }
-          }
-
-          // ── Deep mode detection ─────────────────────────────────────
-          // Agent proposes background execution for complex tasks.
-          //
-          // Syntax:
-          //   [DEEP_MODE: task description]
-          //   [DEEP_MODE(work_dir=/abs/path): task description]   ← NEW
-          //
-          // The optional work_dir= parameter runs the unleashed task in a
-          // different project directory. Useful when the task belongs to
-          // a Claude Code project with its own CLAUDE.md / slash commands
-          // (e.g. the proposal-builder project for audit-queue approvals).
-          const deepMatch = response?.match(/^\[DEEP_MODE(?:\(([^)]+)\))?:\s*(.+?)\]\s*/s);
-            if (deepMatch) {
-              const paramsStr = deepMatch[1] ?? '';
-              const taskDesc = deepMatch[2].trim() || text;
-              const ack = response.replace(/^\[DEEP_MODE(?:\([^)]*\))?:[^\]]*\]\s*/s, '').trim();
-              logger.info({ sessionKey, task: taskDesc }, 'Deep mode triggered by agent');
-
-            // Parse optional work_dir parameter — strict: must be an absolute
-            // path and must exist. Anything else falls back to default.
-            let deepWorkDir: string | undefined;
-            const wdMatch = paramsStr.match(/work_dir=([^,\s]+)/);
-            if (wdMatch) {
-              const candidate = wdMatch[1]!.trim().replace(/^["']|["']$/g, '');
-              if (path.isAbsolute(candidate) && existsSync(candidate)) {
-                deepWorkDir = candidate;
-                logger.info({ sessionKey, workDir: deepWorkDir }, 'Deep mode using custom work_dir');
-              } else {
-                logger.warn({ sessionKey, candidate }, 'Deep mode work_dir rejected (not absolute or does not exist)');
-                }
-              }
-
-              return this.startInteractiveBackgroundTask(sessionKey, text, {
-                taskDesc,
-                stage: 'deep_mode',
-                jobPrompt: `${taskDesc}\n\nOriginal request: ${text}`,
-                workDir: deepWorkDir,
-                ack: ack || `On it — working on this now. I'll follow up when it's done.`,
-                resultPrompt: (result) =>
-                  `[DEEP_MODE_RESULT] You just completed background work. Here are the results — summarize them conversationally for the user. Be natural, not robotic. Lead with what matters most.\n\nTask: ${taskDesc}\n\nResult:\n${result.slice(0, 3000)}`,
-                failurePrompt: (failMsg) =>
-                  `[DEEP_MODE_RESULT] The background task "${taskDesc}" failed: ${failMsg}. Let the user know what happened and suggest next steps. Be brief.`,
-            });
-          }
-
-          // ── Auto-escalation ──────────────────────────────────────────
-          // Phase 1 complete. If the model burned most of its turns on tools
-          // without a substantive response, auto-escalate to deep mode.
-          const isSubstantive = (response?.trim().length ?? 0) > 100;
-          if (!isSubstantive && toolActivityCount >= 3 && !maxTurns) {
-            logger.info({ sessionKey, toolActivityCount, responseLen: response?.trim().length ?? 0 }, 'Auto-escalating to deep mode — Phase 1 insufficient');
-
-            const currentSess = this.getSession(sessionKey);
-            const jobName = `deep-${Date.now()}`;
-            currentSess.deepTask = { jobName, taskDesc: text.slice(0, 200), startedAt: new Date().toISOString() };
-            const escAgentSlug = this._agentSlugFromSessionKey(sessionKey);
-
-            this.assistant.runUnleashedTask(
-              jobName,
-              `Continue working on this task. The user asked: ${text}\n\nYou already started in a quick session and made ${toolActivityCount} tool calls. Pick up where you left off and complete the work.`,
-              2,
-              undefined,
-              undefined,
-              undefined,
-              1,
-              escAgentSlug,
-            ).then(async (result) => {
-              if (this.sessions.get(sessionKey)?.deepTask?.jobName !== jobName) {
-                logger.info({ sessionKey, jobName }, 'Auto-escalated deep mode resolved after cancellation/replacement; suppressing follow-up');
-                return;
-              }
-              logger.info({ sessionKey, jobName, resultLen: result?.length ?? 0 }, 'Auto-escalated deep mode completed');
-              if (result && !isAutonomousNothingOutput(result)) {
-                this.assistant.injectPendingContext(sessionKey, text, result);
-                await this._deliverDeepResult(
-                  sessionKey,
-                  `[DEEP_MODE_RESULT] You just completed background work. Summarize conversationally — lead with what matters.\n\nTask: ${text.slice(0, 500)}\n\nResult:\n${result.slice(0, 3000)}`,
-                  result,
-                );
-              }
-            }).catch(async (err) => {
-              if (this.sessions.get(sessionKey)?.deepTask?.jobName !== jobName) {
-                logger.info({ sessionKey, jobName }, 'Auto-escalated deep mode failed after cancellation/replacement; suppressing failure follow-up');
-                return;
-              }
-              logger.error({ err, sessionKey, jobName }, 'Auto-escalated deep mode failed');
-              this.recordInteractiveFailure(sessionKey, text, err, 'auto_escalated_deep_mode_failed', { jobName, toolActivityCount });
-              const failMsg = `Background work failed: ${String(err).slice(0, 200)}`;
-              this.assistant.injectPendingContext(sessionKey, text, failMsg);
-              await this._deliverDeepResult(
-                sessionKey,
-                `[DEEP_MODE_RESULT] The background task failed: ${failMsg}. Let the user know and suggest next steps. Be brief.`,
-                `Background task failed: ${failMsg}`,
-              );
-            }).finally(() => {
-              const s = this.sessions.get(sessionKey);
-              if (s?.deepTask?.jobName === jobName) delete s.deepTask;
-            });
-
-            const phase1Text = response?.trim() ?? '';
-            if (phase1Text.length > 20) {
-              return `${phase1Text}\n\nThis needs more work — I'll follow up when it's done.`;
-            }
-            return `This is going to take a bit. I'll follow up when it's done.`;
-          }
-
-          // ── Check if SDK returned an auth error as a "successful" response ──
-          if (response && looksLikeAuthError(response)) {
-            logger.warn({ sessionKey, response: response.slice(0, 200) }, 'SDK returned auth error as response text');
-            this.recordAuthFailure();
-            return "I'm temporarily offline due to an authentication issue. The owner needs to re-authenticate — I'll recover automatically once it's resolved.";
-          }
-
-          // Auth recovered if we got here
-          this.clearAuthFailure();
-          return response || '*(no response)*';
+          return runAgentResult.text || '*(no response)*';
         } catch (err) {
           clearTimeout(chatTimer);
           if (hardWallTimer) clearTimeout(hardWallTimer);
           { const cs = this.sessions.get(sessionKey); if (cs) delete cs.abortController; }
-          // If aborted by user (!stop) or our timeout, return a friendly message
           if (chatAc.signal.aborted) {
             return "Stopped. What would you like to do instead?";
-          }
-
-          // ── Max turns hit — auto-escalate to deep mode instead of failing silently ──
-          // This is the #1 cause of "agent stops responding": it ran out of turns
-          // exploring files, the SDK throws, and the user gets nothing.
-          const isMaxTurns = String(err).includes('maximum number of turns') || String(err).includes('max_turns');
-          if (isMaxTurns && !maxTurns) {
-            logger.info({ sessionKey, toolActivityCount }, 'Max turns hit — auto-escalating to deep mode');
-
-            const currentSess = this.getSession(sessionKey);
-            const jobName = `deep-${Date.now()}`;
-            currentSess.deepTask = { jobName, taskDesc: text.slice(0, 200), startedAt: new Date().toISOString() };
-            const mtAgentSlug = this._agentSlugFromSessionKey(sessionKey);
-
-            // Grab any partial response that was streamed before the error
-            const partialResponse = wrappedOnText ? lastStreamedText : '';
-
-            this.assistant.runUnleashedTask(
-              jobName,
-              `Continue working on this task. The user asked: ${text}\n\nYou already started and ran out of turns. Pick up where you left off and complete the work.`,
-              2,
-              undefined,
-              undefined,
-              undefined,
-              1,
-              mtAgentSlug,
-            ).then(async (result) => {
-              if (this.sessions.get(sessionKey)?.deepTask?.jobName !== jobName) {
-                logger.info({ sessionKey, jobName }, 'Max-turns deep mode resolved after cancellation/replacement; suppressing follow-up');
-                return;
-              }
-              logger.info({ sessionKey, jobName, resultLen: result?.length ?? 0 }, 'Max-turns deep mode completed');
-              if (result && !isAutonomousNothingOutput(result)) {
-                this.assistant.injectPendingContext(sessionKey, text, result);
-                await this._deliverDeepResult(
-                  sessionKey,
-                  `[DEEP_MODE_RESULT] You just completed background work. Summarize conversationally — lead with what matters.\n\nTask: ${text.slice(0, 500)}\n\nResult:\n${result.slice(0, 3000)}`,
-                  result,
-                );
-              }
-            }).catch(async (deepErr) => {
-              if (this.sessions.get(sessionKey)?.deepTask?.jobName !== jobName) {
-                logger.info({ sessionKey, jobName }, 'Max-turns deep mode failed after cancellation/replacement; suppressing failure follow-up');
-                return;
-              }
-              logger.error({ err: deepErr, sessionKey, jobName }, 'Max-turns deep mode failed');
-              this.recordInteractiveFailure(sessionKey, text, deepErr, 'max_turns_deep_mode_failed', { jobName, toolActivityCount });
-              const failMsg = `Background work failed: ${String(deepErr).slice(0, 200)}`;
-              this.assistant.injectPendingContext(sessionKey, text, failMsg);
-              await this._deliverDeepResult(
-                sessionKey,
-                `[DEEP_MODE_RESULT] The background task failed: ${failMsg}. Let the user know and suggest next steps. Be brief.`,
-                `Background task failed: ${failMsg}`,
-              );
-            }).finally(() => {
-              const s = this.sessions.get(sessionKey);
-              if (s?.deepTask?.jobName === jobName) delete s.deepTask;
-            });
-
-            const partial = partialResponse?.trim() ?? '';
-            if (partial.length > 20) {
-              return `${partial}\n\nI need more time — I'll follow up when it's done.`;
-            }
-            return `This needs more work. I'll follow up when it's done.`;
           }
 
           const errKind = classifyChatError(err);
@@ -2846,7 +2090,6 @@ export class Gateway {
             case 'rate_limit':
               return "I'm being rate-limited by the API right now. Please wait a minute and try again.";
             case 'one_million_context':
-              this.recordInteractiveFailure(sessionKey, text, err, 'one_million_context_exception', { effectiveSessionKey });
               applyOneMillionContextRecovery();
               this.clearSession(effectiveSessionKey);
               return oneMillionContextRecoveryMessage();
@@ -2893,55 +2136,29 @@ export class Gateway {
       events.emit('heartbeat:start', { agent, timestamp: Date.now() });
       const hbStart = Date.now();
       try {
-        // ── Phase 5: canonical SDK heartbeat path is now DEFAULT ──────
-        // runAgentHeartbeat is the canonical path (no tools, Haiku,
-        // single turn). Set CLEMENTINE_USE_RUNAGENT_HEARTBEAT=0 to
-        // fall back to legacy.
-        const useRunAgentHeartbeat = process.env.CLEMENTINE_USE_RUNAGENT_HEARTBEAT !== '0';
-        if (useRunAgentHeartbeat) {
-          try {
-            const { runAgentHeartbeat } = await import('../agent/run-agent-heartbeat.js');
-            logger.info({ agent, path: 'runagent_heartbeat' }, 'Phase 4: routing heartbeat through runAgentHeartbeat');
-            const result = await runAgentHeartbeat({
-              standingInstructions,
-              changesSummary,
-              timeContext,
-              dedupContext,
-              profile,
-              memoryStore: this.assistant.getMemoryStore?.() ?? null,
-            });
-            scanner.refreshIntegrity();
-            events.emit('heartbeat:complete', {
-              agent,
-              durationMs: Date.now() - hbStart,
-              responseLength: result.text?.length ?? 0,
-            });
-            logger.info({
-              agent,
-              cost: Number(result.totalCostUsd.toFixed(4)),
-              numTurns: result.numTurns,
-              durationMs: Date.now() - hbStart,
-            }, 'runAgentHeartbeat: heartbeat complete');
-            return result.text;
-          } catch (err) {
-            logger.warn({ err, agent }, 'runAgentHeartbeat path failed — falling back to legacy heartbeat path');
-            // Fall through to legacy.
-          }
-        }
-
-        const response = await this.assistant.heartbeat(
+        const { runAgentHeartbeat } = await import('../agent/run-agent-heartbeat.js');
+        logger.info({ agent, path: 'runagent_heartbeat' }, 'Routing heartbeat through runAgentHeartbeat');
+        const result = await runAgentHeartbeat({
           standingInstructions,
           changesSummary,
           timeContext,
           dedupContext,
           profile,
-        );
-
-        // Re-baseline integrity checksums after heartbeat (may write to vault)
+          memoryStore: this.assistant.getMemoryStore?.() ?? null,
+        });
         scanner.refreshIntegrity();
-
-        events.emit('heartbeat:complete', { agent, durationMs: Date.now() - hbStart, responseLength: response?.length ?? 0 });
-        return response;
+        events.emit('heartbeat:complete', {
+          agent,
+          durationMs: Date.now() - hbStart,
+          responseLength: result.text?.length ?? 0,
+        });
+        logger.info({
+          agent,
+          cost: Number(result.totalCostUsd.toFixed(4)),
+          numTurns: result.numTurns,
+          durationMs: Date.now() - hbStart,
+        }, 'runAgentHeartbeat: heartbeat complete');
+        return result.text;
       } catch (err) {
         events.emit('heartbeat:error', { agent, error: String(err) });
         logger.error({ err }, 'Heartbeat error');
@@ -2959,86 +2176,57 @@ export class Gateway {
     maxTurns?: number,
     model?: string,
     workDir?: string,
-    mode: 'standard' | 'unleashed' = 'standard',
-    maxHours?: number,
-    timeoutMs?: number,
+    _mode: 'standard' | 'unleashed' = 'standard',
+    _maxHours?: number,
+    _timeoutMs?: number,
     successCriteria?: string[],
     agentSlug?: string,
-    opts?: { disableAllTools?: boolean },
+    _opts?: { disableAllTools?: boolean },
   ): Promise<string> {
     const releaseLane = await lanes.acquire('cron');
     try {
-      logger.info(`Running cron job: ${jobName}${workDir ? ` in ${workDir}` : ''}${mode === 'unleashed' ? ' (unleashed)' : ''}${agentSlug && agentSlug !== 'clementine' ? ` as ${agentSlug}` : ''}`);
-      events.emit('cron:start', { jobName, tier, mode, timestamp: Date.now() });
+      logger.info(`Running cron job: ${jobName}${workDir ? ` in ${workDir}` : ''}${agentSlug && agentSlug !== 'clementine' ? ` as ${agentSlug}` : ''}`);
+      events.emit('cron:start', { jobName, tier, mode: 'runagent', timestamp: Date.now() });
       const cronStart = Date.now();
       try {
-        let response: string;
+        const { runAgentCron } = await import('../agent/run-agent-cron.js');
+        const profile = agentSlug && agentSlug !== 'clementine'
+          ? this.getAgentManager().get(agentSlug) ?? null
+          : null;
+        logger.info({ jobName, agentSlug, tier, path: 'runagent_cron' }, 'Routing cron through runAgentCron');
 
-        // ── Phase 5: canonical SDK cron path is now DEFAULT ──────────
-        // runAgentCron() is the canonical path. Set
-        // CLEMENTINE_USE_RUNAGENT_CRON=0 to fall back to legacy.
-        const useRunAgentCron = process.env.CLEMENTINE_USE_RUNAGENT_CRON !== '0';
-        if (useRunAgentCron && !opts?.disableAllTools) {
-          try {
-            const { runAgentCron } = await import('../agent/run-agent-cron.js');
-            const profile = agentSlug && agentSlug !== 'clementine'
-              ? this.getAgentManager().get(agentSlug) ?? null
-              : null;
-            logger.info({ jobName, agentSlug, tier, path: 'runagent_cron' }, 'Phase 3: routing cron through runAgentCron');
+        const cronResult = await runAgentCron({
+          jobName,
+          jobPrompt,
+          tier,
+          maxTurns,
+          profile,
+          agentManager: this.getAgentManager(),
+          memoryStore: this.assistant.getMemoryStore?.() ?? null,
+          successCriteria,
+          model,
+          workDir,
+          postTaskHooks: this.assistant,
+        });
 
-            const cronResult = await runAgentCron({
-              jobName,
-              jobPrompt,
-              tier,
-              maxTurns,
-              profile,
-              agentManager: this.getAgentManager(),
-              memoryStore: this.assistant.getMemoryStore?.() ?? null,
-              successCriteria,
-              model,
-              workDir,
-              // Phase 4: post-task hooks restore reflection + skill
-              // extraction on the new cron path. The PersonalAssistant
-              // implements both members directly.
-              postTaskHooks: this.assistant,
-            });
-
-            response = cronResult.text;
-            scanner.refreshIntegrity();
-            events.emit('cron:complete', {
-              jobName,
-              mode: 'runagent',
-              durationMs: Date.now() - cronStart,
-              responseLength: response?.length ?? 0,
-            });
-            logger.info({
-              jobName,
-              cost: Number(cronResult.totalCostUsd.toFixed(4)),
-              numTurns: cronResult.numTurns,
-              composioConnected: cronResult.composioConnected.length,
-              externalConnected: cronResult.externalConnected.length,
-              durationMs: Date.now() - cronStart,
-            }, 'runAgentCron: cron job complete');
-            return response;
-          } catch (err) {
-            logger.warn({ err, jobName }, 'runAgentCron path failed — falling back to legacy cron path');
-            // Fall through to legacy below.
-          }
-        }
-
-        if (mode === 'unleashed') {
-          response = await this.assistant.runUnleashedTask(jobName, jobPrompt, tier, maxTurns, model, workDir, maxHours, agentSlug);
-        } else {
-          response = await this.assistant.runCronJob(jobName, jobPrompt, tier, maxTurns, model, workDir, timeoutMs, successCriteria, agentSlug, opts);
-        }
-
-        // Re-baseline integrity checksums after cron job (may write to vault)
         scanner.refreshIntegrity();
-
-        events.emit('cron:complete', { jobName, mode, durationMs: Date.now() - cronStart, responseLength: response?.length ?? 0 });
-        return response;
+        events.emit('cron:complete', {
+          jobName,
+          mode: 'runagent',
+          durationMs: Date.now() - cronStart,
+          responseLength: cronResult.text?.length ?? 0,
+        });
+        logger.info({
+          jobName,
+          cost: Number(cronResult.totalCostUsd.toFixed(4)),
+          numTurns: cronResult.numTurns,
+          composioConnected: cronResult.composioConnected.length,
+          externalConnected: cronResult.externalConnected.length,
+          durationMs: Date.now() - cronStart,
+        }, 'runAgentCron: cron job complete');
+        return cronResult.text;
       } catch (err) {
-        events.emit('cron:error', { jobName, mode, error: String(err) });
+        events.emit('cron:error', { jobName, mode: 'runagent', error: String(err) });
         logger.error({ err, jobName }, `Cron job error: ${jobName}`);
         throw err;
       }
@@ -3066,134 +2254,31 @@ export class Gateway {
     try {
       logger.info({ fromSlug, toSlug: profile.slug }, 'Running team message as autonomous task');
 
-      // ── Phase 5: canonical SDK team-task path is now DEFAULT ───────
-      // runAgentTeamTask is the canonical path (one runAgent call —
-      // SDK owns the inner loop). Set CLEMENTINE_USE_RUNAGENT_TEAM=0
-      // to fall back to legacy.
-      const useRunAgentTeam = process.env.CLEMENTINE_USE_RUNAGENT_TEAM !== '0';
-      if (useRunAgentTeam) {
-        try {
-          const { runAgentTeamTask } = await import('../agent/run-agent-team-task.js');
-          logger.info({ fromSlug, toSlug: profile.slug, path: 'runagent_team_task' }, 'Phase 4: routing team task through runAgentTeamTask');
-          const result = await runAgentTeamTask({
-            fromName,
-            fromSlug,
-            content,
-            profile,
-            agentManager: this.getAgentManager(),
-            memoryStore: this.assistant.getMemoryStore?.() ?? null,
-            abortSignal: abortController?.signal,
-          });
-          scanner.refreshIntegrity();
-          logger.info({
-            fromSlug,
-            toSlug: profile.slug,
-            cost: Number(result.totalCostUsd.toFixed(4)),
-            numTurns: result.numTurns,
-            composioConnected: result.composioConnected.length,
-          }, 'runAgentTeamTask: team task complete');
-          // Best-effort streaming: if a callback is provided, deliver
-          // the final text in one chunk (the SDK already streamed it
-          // internally to runAgent's onText, but we collected it).
-          if (onText && result.text) {
-            try { onText(result.text); } catch { /* ignore */ }
-          }
-          return result.text;
-        } catch (err) {
-          logger.warn({ err, fromSlug, toSlug: profile.slug }, 'runAgentTeamTask path failed — falling back to legacy team-task path');
-          // Fall through to legacy.
-        }
-      }
-
-      const response = await this.assistant.runTeamTask(fromName, fromSlug, content, profile, onText, abortController);
+      const { runAgentTeamTask } = await import('../agent/run-agent-team-task.js');
+      const result = await runAgentTeamTask({
+        fromName,
+        fromSlug,
+        content,
+        profile,
+        agentManager: this.getAgentManager(),
+        memoryStore: this.assistant.getMemoryStore?.() ?? null,
+        abortSignal: abortController?.signal,
+      });
       scanner.refreshIntegrity();
-      return response;
+      logger.info({
+        fromSlug,
+        toSlug: profile.slug,
+        cost: Number(result.totalCostUsd.toFixed(4)),
+        numTurns: result.numTurns,
+        composioConnected: result.composioConnected.length,
+      }, 'runAgentTeamTask: team task complete');
+      if (onText && result.text) {
+        try { onText(result.text); } catch { /* ignore */ }
+      }
+      return result.text;
     } catch (err) {
       logger.error({ err, fromSlug, toSlug: profile.slug }, 'Team task error');
       throw err;
-    } finally {
-      releaseLane();
-    }
-  }
-
-  // ── Plan orchestration ──────────────────────────────────────────────
-
-  async handlePlan(
-    sessionKey: string,
-    taskDescription: string,
-    onProgress?: (updates: PlanProgressUpdate[]) => Promise<void>,
-    onApproval?: (planSummary: string, steps: PlanStep[]) => Promise<boolean | string>,
-  ): Promise<string> {
-    const releaseLane = await lanes.acquire('chat');
-    try {
-      const release = await this.acquireSessionLock(sessionKey);
-      try {
-        // Pre-flight injection scan (same as handleMessage)
-        scanner.refreshIfStale(5000);
-        const scan = scanner.scan(taskDescription);
-
-        const isOwnerDm = sessionKey.startsWith('discord:user:') ||
-          sessionKey.startsWith('discord:agent:') ||
-          sessionKey.startsWith('slack:dm:') ||
-          // New workspace-namespaced Slack DMs: slack:team:{teamId}:user:{userId}
-          /^slack:team:[^:]+:(user|dm):/.test(sessionKey) ||
-          sessionKey.startsWith('telegram:');
-        const shouldBlock = scan.verdict === 'block' && !isOwnerDm;
-
-        if (shouldBlock) {
-          logger.warn(
-            { sessionKey, verdict: scan.verdict, reasons: scan.reasons, score: scan.score },
-            'Plan blocked by injection scanner',
-          );
-          return "I can't process that plan. It was flagged by my security system.";
-        }
-
-        if (scan.verdict === 'block' && isOwnerDm) {
-          logger.info(
-            { sessionKey, verdict: 'warn (downgraded)', reasons: scan.reasons },
-            'Owner DM plan block downgraded to warning',
-          );
-        } else if (scan.verdict === 'warn') {
-          logger.info(
-            { sessionKey, verdict: scan.verdict, reasons: scan.reasons },
-            'Plan flagged by injection scanner',
-          );
-        }
-
-        // Register provenance for the orchestrator session
-        this.ensureProvenance(sessionKey);
-
-        // Register a session AbortController so a follow-up message ("stop", or
-        // any new prompt) can interrupt the plan via acquireSessionLock — which
-        // calls abortController.abort('interrupted-by-new-message') when it
-        // sees an in-flight query on this session.
-        const planAc = new AbortController();
-        this.getSession(sessionKey).abortController = planAc;
-
-        const { PlanOrchestrator } = await import('../agent/orchestrator.js');
-        const orchestrator = new PlanOrchestrator(this.assistant);
-        // Make hired agents (Ross, Sasha, Nora, etc.) visible to the
-        // planner so it can `delegateTo: <slug>` for steps that match
-        // an agent's specialty. Without this the planner generates
-        // generic steps even when a specialized agent is the right
-        // choice. Empty list = solo Clementine, planner stays generic.
-        const teamAgents = this.getAgentManager()
-          .listAll()
-          .filter(a => a.slug !== 'clementine');
-        const result = await orchestrator.run(
-          taskDescription,
-          onProgress,
-          onApproval,
-          teamAgents.length > 0 ? teamAgents : undefined,
-          planAc.signal,
-        );
-
-        scanner.refreshIntegrity();
-        this.assistant.injectContext(sessionKey, `[Plan: ${taskDescription}]`, result);
-        return result;
-      } finally {
-        release();
-      }
     } finally {
       releaseLane();
     }

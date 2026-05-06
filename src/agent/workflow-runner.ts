@@ -2,8 +2,8 @@
  * Clementine TypeScript — Workflow Runner.
  *
  * Parses workflow definition files (markdown + YAML frontmatter),
- * validates the step DAG, and executes steps using the existing
- * PlanOrchestrator primitives (computeWaves + settledWithLimit).
+ * validates the step DAG, and executes steps using the wave scheduler
+ * (topological sort + concurrency-capped settled execution).
  */
 
 import { existsSync, mkdirSync, readFileSync, readdirSync, appendFileSync } from 'node:fs';
@@ -12,7 +12,7 @@ import { randomUUID } from 'node:crypto';
 import matter from 'gray-matter';
 import pino from 'pino';
 import type { PersonalAssistant } from './assistant.js';
-import { computeWaves, settledWithLimit } from './orchestrator.js';
+import { computeWaves, settledWithLimit } from './wave-scheduler.js';
 import { resolveStaticVariables, resolveStepOutputs } from './workflow-variables.js';
 import type {
   PlanStep,

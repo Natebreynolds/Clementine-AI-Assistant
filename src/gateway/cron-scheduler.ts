@@ -65,12 +65,6 @@ import {
   markBackgroundCreditBlocked,
 } from './credit-guard.js';
 import { isRunHealthFailure } from './job-health.js';
-import {
-  analyzeLongTaskPreflight,
-  compactLongTaskPreflight,
-  shouldDowngradeUnleashed,
-  formatLongTaskPromptPrefix,
-} from './long-task-preflight.js';
 
 const logger = pino({ name: 'clementine.cron' });
 
@@ -637,7 +631,7 @@ export class CronScheduler {
     // cron-scheduler callbacks below only dispatch for cron-originated runs;
     // phase updates for deep-mode runs get routed back to the originating
     // session instead of fanning out to every registered channel.
-    const isDeepMode = (jobName: string) => jobName.startsWith('deep-');
+
 
     // Wire up push notifications for unleashed task completions.
     //
@@ -652,58 +646,6 @@ export class CronScheduler {
     //
     // Each path is gated below; without the guards a registered cron's
     // result was landing twice in the destination channel.
-    this.gateway.setUnleashedCompleteCallback((jobName, result) => {
-      this.completedJobs.set(jobName, Date.now());
-      if (isDeepMode(jobName)) return;                 // (1) deep-mode router
-      if (jobName.startsWith('bg:')) return;           // (2) background-task dispatcher
-      if (this.jobs.some(j => j.name === jobName)) return; // (3) registered cron job
-      if (result && !CronScheduler.isCronNoise(result)) {
-        const slug = jobName.includes(':') ? jobName.split(':')[0] : undefined;
-        // Strip system metadata for clean conversational delivery
-        const cleanResult = result
-          .replace(/^TASK_COMPLETE:\s*/i, '')
-          .replace(/^STATUS SUMMARY:?\s*/im, '')
-          .slice(0, 1500);
-        this.dispatcher.send(cleanResult, { agentSlug: slug }).catch(err => logger.debug({ err }, 'Failed to send unleashed complete notification'));
-      }
-    });
-
-    // Wire up phase progress notifications for unleashed tasks
-    this.gateway.setPhaseCompleteCallback((jobName, phase, _total, output) => {
-      if (phase <= 1) return; // Don't spam for the first phase — wait for real progress
-      if (/TASK_COMPLETE:/i.test(output)) return; // Final delivery handled by unleashed complete callback
-      if (this.jobs.some(j => j.name === jobName)) return; // Registered cron jobs deliver through their run result path.
-      const slug = jobName.includes(':') ? jobName.split(':')[0] : undefined;
-      const cleanOutput = output
-        .replace(/^STATUS SUMMARY:?\s*/im, '')
-        .trim()
-        .slice(0, 500);
-      if (!cleanOutput || CronScheduler.isCronNoise(cleanOutput)) return;
-      // For deep-mode runs, target the originating session so the progress
-      // update lands in the same Discord DM / Slack thread / dashboard window.
-      const deepSessionKey = isDeepMode(jobName) ? this.gateway.findDeepTaskSessionKey(jobName) : null;
-      const ctx: { agentSlug?: string; sessionKey?: string } = {};
-      if (slug) ctx.agentSlug = slug;
-      if (deepSessionKey) ctx.sessionKey = deepSessionKey;
-      this.dispatcher.send(`Still working on it — ${cleanOutput}`, ctx).catch(err => logger.debug({ err }, 'Failed to send phase progress notification'));
-    });
-
-    // Wire up real-time progress summaries (throttled to max 1 per 5 minutes)
-    const lastProgressSent = new Map<string, number>();
-    this.gateway.setPhaseProgressCallback((jobName, _phase, summary) => {
-      const now = Date.now();
-      const lastSent = lastProgressSent.get(jobName) ?? 0;
-      if (now - lastSent < 300_000) return; // throttle: 1 per 5 minutes
-      if (!summary.trim() || CronScheduler.isCronNoise(summary)) return;
-      lastProgressSent.set(jobName, now);
-      const slug = jobName.includes(':') ? jobName.split(':')[0] : undefined;
-      const deepSessionKey = isDeepMode(jobName) ? this.gateway.findDeepTaskSessionKey(jobName) : null;
-      const ctx: { agentSlug?: string; sessionKey?: string } = {};
-      if (slug) ctx.agentSlug = slug;
-      if (deepSessionKey) ctx.sessionKey = deepSessionKey;
-      this.dispatcher.send(summary.slice(0, 300), ctx).catch(err => logger.debug({ err }, 'Failed to send phase progress summary'));
-    });
-
     logger.info(`Cron scheduler started with ${this.jobs.length} jobs`);
   }
 
@@ -1189,70 +1131,10 @@ export class CronScheduler {
       // `model: claude-opus-4-7[1m]` in CRON.md per-job, or flip
       // CLEMENTINE_1M_CONTEXT_MODE=on for global enable.
       // ── Auto-downgrade unleashed → standard ────────────────────────
-      // CRON.md `mode: unleashed` is a CEILING, not a floor. If the
-      // job's history shows it's a quiet probe that completes in 1
-      // phase with __NOTHING__ or short output, the multi-phase
-      // wrapper is wasteful overhead — each phase is a fresh SDK
-      // query with full system prompt + tool schemas in cache_creation.
-      // For a "did anything new come in?" cron firing every 2 hours,
-      // that's 12+ unleashed runs/day at ~$1/each instead of standard
-      // mode at ~$0.05/each.
-      if (job.mode === 'unleashed') {
-        const downgrade = shouldDowngradeUnleashed(this.runLog.readRecent(job.name, 5));
-        if (downgrade.downgrade) {
-          job = { ...job, mode: 'standard' };
-          logger.info({
-            job: job.name,
-            reason: downgrade.reason,
-            quietRatio: downgrade.quietRatio,
-            avgDurationMs: downgrade.avgDurationMs,
-          }, 'Cron mode downgraded unleashed → standard based on run history');
-          this.logAutonomy('mode_downgrade', job, {
-            from: 'unleashed',
-            to: 'standard',
-            reason: downgrade.reason,
-            quietRatio: downgrade.quietRatio,
-            avgDurationMs: downgrade.avgDurationMs,
-          });
-        }
-      }
-
-      let longTaskPreflight: CronRunEntry['longTaskPreflight'] | undefined;
-      const preflight = analyzeLongTaskPreflight(job, jobPrompt, this.runLog.readRecent(job.name, 5));
-      if (preflight.risk !== 'normal') {
-        longTaskPreflight = compactLongTaskPreflight(preflight);
-        logger.warn({
-          job: job.name,
-          risk: preflight.risk,
-          route: preflight.route,
-          estimatedInputTokens: preflight.estimatedInputTokens,
-          projectedContextTokens: preflight.projectedContextTokens,
-          model: job.model,
-          mode: job.mode,
-          reasons: preflight.reasons,
-          advisory: true,
-        }, 'Long-task preflight (advisory) flagged cron job');
-        this.logAutonomy('long_task_preflight', job, {
-          risk: preflight.risk,
-          route: preflight.route,
-          estimatedInputTokens: preflight.estimatedInputTokens,
-          projectedContextTokens: preflight.projectedContextTokens,
-          model: job.model,
-          mode: job.mode,
-          requiresUserRefinement: false,
-          advisory: true,
-        });
-        jobPrompt = [
-          formatLongTaskPromptPrefix(preflight),
-          jobPrompt,
-        ].filter(Boolean).join('\n\n');
-      }
-
-      // Compute effective timeout after preflight because it may promote a
-      // large standard job into checkpointed unleashed mode.
-      const effectiveTimeoutMs = job.mode !== 'unleashed'
-        ? (advice.adjustedTimeoutMs ?? CRON_STANDARD_TIMEOUT_MS)
-        : undefined;
+      // Compute effective timeout. The canonical SDK path enforces its
+      // own budget cap inside runAgentCron; this is just a wall-clock
+      // safety net that aborts a stuck job if the SDK never returns.
+      const effectiveTimeoutMs = advice.adjustedTimeoutMs ?? CRON_STANDARD_TIMEOUT_MS;
 
       // Unleashed tasks handle their own retries/phases internally — never retry the whole task.
       // Compute this after preflight because preflight may promote a standard
@@ -1266,7 +1148,7 @@ export class CronScheduler {
         model: job.model,
         mode: job.mode,
         tier: job.tier,
-        longTaskPreflight,
+
       });
 
       for (let attempt = 1; attempt <= maxAttempts; attempt++) {
@@ -1329,7 +1211,7 @@ export class CronScheduler {
             outputPreview: response ? response.slice(0, 200) : undefined,
             advisorApplied,
             terminalReason,
-            longTaskPreflight,
+    
           };
 
           if (response && !CronScheduler.isCronNoise(response)) {
@@ -1401,7 +1283,7 @@ export class CronScheduler {
             terminalReason: errTerminalReason,
             attempt,
             advisorApplied,
-            longTaskPreflight,
+    
           });
 
           if (isCreditBalanceError(err)) {

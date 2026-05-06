@@ -28,7 +28,6 @@ import type { AgentManager } from './agent-manager.js';
 import type { MemoryStore } from '../memory/store.js';
 import { runAgent, type RunAgentResult } from './run-agent.js';
 import { buildExtraMcpForRunAgent } from './run-agent-mcp.js';
-import { buildFanoutDirectiveForText, buildAlwaysOnParallelizationHint } from './fanout-policy.js';
 import { listAllGoals } from '../tools/shared.js';
 
 const CRON_PROGRESS_PENDING_MAX_ITEMS = 20;
@@ -307,22 +306,14 @@ export async function runAgentCron(opts: RunAgentCronOptions): Promise<RunAgentC
   const criteriaContext = buildCriteriaContext(opts.successCriteria);
   const skillContext = await buildSkillContext(opts.jobName, opts.jobPrompt, agentSlug, opts.memoryStore);
 
-  // Sub-agent fanout directive — when the job description suggests
-  // multi-item work, prepend a hard-line fanout mandate.
-  const fanoutScope = `${opts.jobName}\n${opts.jobPrompt}\n${opts.profile?.description ?? ''}\n${opts.profile?.systemPromptBody ?? ''}`;
-  const { directive: fanoutDirective, report: fanoutReport } = buildFanoutDirectiveForText(fanoutScope);
-  if (fanoutReport.needsFanout) {
-    logger.info({
-      job: opts.jobName,
-      signals: fanoutReport.signals.map(s => s.pattern),
-    }, 'runAgentCron: fanout directive injected');
-  }
+  // Sub-agent routing is handled by the SDK's `agents` map
+  // (see agent-definitions.ts). The planner + researcher + cron-fixer
+  // descriptions auto-match per-item / multi-step work, so the SDK
+  // spawns isolated sub-agents without a hand-rolled prompt directive.
 
-  // Final prompt (matches legacy runCronJob's structure).
+  // Final prompt
   const builtPrompt =
     `[Scheduled task: ${opts.jobName}]\n\n` +
-    (fanoutDirective ? fanoutDirective + '\n\n' : '') +
-    buildAlwaysOnParallelizationHint() + '\n\n' +
     progressContext +
     goalContext +
     skillContext +
