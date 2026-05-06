@@ -6790,7 +6790,7 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
         message = 'Restored the standard spend caps. Restart Clementine to apply to running workers.';
       } else if (preset === 'uncapped' || preset === 'off' || preset === 'none') {
         writes = DASHBOARD_BUDGET_ROWS.map(row => ({ key: row.key, value: '0' }));
-        message = 'Removed spend caps by setting all budget values to 0. This does not change 1M context mode; use Force 200K or Safe Recovery for 1M errors. Restart Clementine to apply to running workers.';
+        message = 'Removed spend caps by setting all budget values to 0. Restart Clementine for the change to take effect on running workers. (1M context mode is separate — use Force 200K or Safe Recovery for 1M errors.)';
       } else {
         res.status(400).json({ error: 'preset must be defaults or uncapped' });
         return;

@@ -174,8 +174,15 @@ export interface RunAgentResult {
   };
 }
 
+// Last-resort fallbacks for callers that pass NO maxBudgetUsd. The
+// production callers (`runAgent` from gateway/router, runAgentCron,
+// runAgentHeartbeat) read `BUDGET.*` from src/config.ts — which is
+// itself sourced from env / clementine.json / dashboard writes — and
+// pass it explicitly. Chat is intentionally omitted: the chat path
+// must always go through `BUDGET.chat` (0 = uncapped), never a silent
+// hardcoded floor. If `source: 'chat'` ever lands here without an
+// explicit budget, we treat it as uncapped.
 const DEFAULT_BUDGETS: Record<string, number> = {
-  chat: 0.50,
   cron: 1.00,
   heartbeat: 0.25,
   'team-task': 1.00,
@@ -212,7 +219,14 @@ const CORE_TOOLS_FOR_AGENT_PARENT = [
 export async function runAgent(prompt: string, opts: RunAgentOptions): Promise<RunAgentResult> {
   const source = opts.source ?? 'chat';
   const effort = opts.effort ?? DEFAULT_EFFORTS[source] ?? 'medium';
-  const maxBudgetUsd = opts.maxBudgetUsd ?? DEFAULT_BUDGETS[source] ?? 0.50;
+  // 0 (or undefined) means "no cap" — matches the dashboard's
+  // "Remove spend caps" preset contract. We omit `maxBudgetUsd` from
+  // sdkOptions entirely in that case so the SDK runs uncapped.
+  const requestedBudget = opts.maxBudgetUsd ?? DEFAULT_BUDGETS[source];
+  const maxBudgetUsd: number | undefined =
+    typeof requestedBudget === 'number' && requestedBudget > 0
+      ? requestedBudget
+      : undefined;
   const startedAt = Date.now();
 
   // Build the AgentDefinition map. Caller can override; otherwise we
@@ -309,8 +323,8 @@ export async function runAgent(prompt: string, opts: RunAgentOptions): Promise<R
     allowDangerouslySkipPermissions: true,
     cwd: BASE_DIR,
     env: subprocessEnv,
-    maxBudgetUsd,
     effort,
+    ...(maxBudgetUsd !== undefined ? { maxBudgetUsd } : {}),
     ...(opts.maxTurns ? { maxTurns: opts.maxTurns } : {}),
     ...(opts.model ? { model: opts.model } : {}),
     ...(opts.resumeSessionId ? { resume: opts.resumeSessionId } : {}),
@@ -325,7 +339,7 @@ export async function runAgent(prompt: string, opts: RunAgentOptions): Promise<R
     profile: opts.profile?.slug,
     forceSubagent: opts.forceSubagent,
     effort,
-    maxBudgetUsd,
+    maxBudgetUsd: maxBudgetUsd ?? 'uncapped',
     agentCount: Object.keys(agents).length,
     allowedToolCount: allowedTools.length,
   }, 'runAgent: starting query');
@@ -339,6 +353,7 @@ export async function runAgent(prompt: string, opts: RunAgentOptions): Promise<R
 
   const stream = query({ prompt: effectivePrompt, options: sdkOptions });
 
+  try {
   for await (const message of stream) {
     if (message.type === 'system' && message.subtype === 'init') {
       sessionId = (message as { session_id?: string }).session_id ?? '';
@@ -408,6 +423,23 @@ export async function runAgent(prompt: string, opts: RunAgentOptions): Promise<R
     // Other message types (UserMessage with tool_result, StreamEvent,
     // SDKCompactBoundaryMessage) — observed but not acted on. The SDK
     // handles compaction internally; we just let it run.
+  }
+  } catch (err) {
+    // Translate the SDK's budget-exhaustion throw into a message that
+    // tells the user (a) what cap tripped and (b) how to raise it.
+    // The raw SDK string ("Claude Code returned an error result:
+    // Reached maximum budget ($0.5)") leaks through the channel layer
+    // as a generic "Something went wrong:" with no actionable hint.
+    const msg = String((err as Error)?.message ?? err);
+    if (/Reached maximum budget|error_max_budget_usd/i.test(msg)) {
+      const cap = maxBudgetUsd?.toFixed(2) ?? '?';
+      const envKey = `BUDGET_${source.toUpperCase().replace(/-/g, '_')}_USD`;
+      throw new Error(
+        `Hit the $${cap} ${source} budget cap before finishing. ` +
+        `Raise it in the dashboard (Budgets & Costs) or set ${envKey}=0 to remove caps.`,
+      );
+    }
+    throw err;
   }
 
   logger.info({

@@ -22,6 +22,7 @@ import {
   BASE_DIR,
   VAULT_DIR,
   CRON_PROGRESS_DIR,
+  BUDGET,
 } from '../config.js';
 import type { AgentProfile } from '../types.js';
 import type { AgentManager } from './agent-manager.js';
@@ -357,7 +358,13 @@ export async function runAgentCron(opts: RunAgentCronOptions): Promise<RunAgentC
   });
 
   // ── Run via canonical runAgent ────────────────────────────────────
-  const maxBudget = opts.maxBudgetUsd ?? (tier >= 2 ? 3.0 : 1.0);
+  // Per-tier cap from config (BUDGET.cronT1 / BUDGET.cronT2). Sourced
+  // from env / clementine.json / dashboard writes. 0 means uncapped —
+  // we pass undefined so runAgent omits the SDK option entirely.
+  // Caller can still override via opts.maxBudgetUsd.
+  const configuredCap = tier >= 2 ? BUDGET.cronT2 : BUDGET.cronT1;
+  const maxBudget: number | undefined =
+    opts.maxBudgetUsd ?? (configuredCap > 0 ? configuredCap : undefined);
   const effort: 'low' | 'medium' | 'high' = tier >= 2 ? 'high' : 'medium';
 
   logger.info({
@@ -380,7 +387,7 @@ export async function runAgentCron(opts: RunAgentCronOptions): Promise<RunAgentC
     memoryStore: opts.memoryStore,
     model: opts.model,
     effort,
-    maxBudgetUsd: maxBudget,
+    ...(maxBudget !== undefined ? { maxBudgetUsd: maxBudget } : {}),
     maxTurns: opts.maxTurns,
     abortSignal: opts.abortSignal,
     extraMcpServers: mcp.servers as unknown as Parameters<typeof runAgent>[1]['extraMcpServers'],

@@ -17,6 +17,7 @@ import pino from 'pino';
 import {
   OWNER_NAME,
   MODELS,
+  BUDGET,
 } from '../config.js';
 
 const OWNER = OWNER_NAME || 'the user';
@@ -95,6 +96,12 @@ export async function runAgentHeartbeat(opts: RunAgentHeartbeatOptions): Promise
     promptChars: prompt.length,
   }, 'runAgentHeartbeat: dispatching to runAgent (no tools)');
 
+  // Heartbeat cap from config (BUDGET.heartbeat). Sourced from env /
+  // clementine.json / dashboard writes. 0 = uncapped — runAgent
+  // omits the SDK option in that case.
+  const heartbeatBudget: number | undefined =
+    opts.maxBudgetUsd ?? (BUDGET.heartbeat > 0 ? BUDGET.heartbeat : undefined);
+
   const sessionKey = `heartbeat:${opts.profile?.slug ?? 'clementine'}`;
   const result = await runAgent(prompt, {
     sessionKey,
@@ -103,7 +110,7 @@ export async function runAgentHeartbeat(opts: RunAgentHeartbeatOptions): Promise
     memoryStore: opts.memoryStore,
     model: opts.model ?? MODELS.haiku,
     effort: 'low',
-    maxBudgetUsd: opts.maxBudgetUsd ?? 0.15,
+    ...(heartbeatBudget !== undefined ? { maxBudgetUsd: heartbeatBudget } : {}),
     maxTurns: 1,
     // No tools — heartbeats are decision-only. Empty list bypasses the
     // CORE_TOOLS_FOR_AGENT_PARENT default and stops the SDK from

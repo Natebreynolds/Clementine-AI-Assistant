@@ -18,6 +18,7 @@ import type { BackgroundTask, OnProgressCallback, OnTextCallback, OnToolActivity
 import { SelfImproveLoop } from '../agent/self-improve.js';
 import {
   MODELS,
+  BUDGET,
   AGENTS_DIR,
   TEAM_COMMS_LOG,
   BASE_DIR,
@@ -2064,7 +2065,13 @@ export class Gateway {
           // Builder cost knobs: Haiku is plenty for JSON drafting,
           // tight budget, no tools surfaced in the system prompt.
           const builderModel = isBuilderSession ? MODELS.haiku : effectiveModel;
-          const builderBudget = isBuilderSession ? 0.10 : undefined;
+          // Builder stays tight ($0.10 — Haiku JSON drafting only).
+          // Regular chat reads BUDGET.chat from config (env / clementine.json /
+          // dashboard writes). 0 = uncapped — the runAgent layer omits the
+          // SDK option entirely in that case.
+          const chatBudget = isBuilderSession
+            ? 0.10
+            : (BUDGET.chat > 0 ? BUDGET.chat : undefined);
           const builderAllowedTools = isBuilderSession ? [] : undefined;
 
           logger.info({
@@ -2087,7 +2094,7 @@ export class Gateway {
             memoryStore: this.assistant.getMemoryStore?.() ?? null,
             ...(builderModel ? { model: builderModel } : {}),
             ...(maxTurns ? { maxTurns } : {}),
-            ...(builderBudget !== undefined ? { maxBudgetUsd: builderBudget } : {}),
+            ...(chatBudget !== undefined ? { maxBudgetUsd: chatBudget } : {}),
             ...(builderAllowedTools ? { allowedTools: builderAllowedTools } : {}),
             ...(chatSystemAppend ? { systemPromptAppend: chatSystemAppend } : {}),
             ...(priorSdkSessionId ? { resumeSessionId: priorSdkSessionId } : {}),
