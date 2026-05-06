@@ -497,7 +497,17 @@ const SESSIONS_FILE = path.join(BASE_DIR, '.sessions.json');
 const MAX_SESSION_EXCHANGES = 40;
 const SESSION_EXPIRY_MS = 24 * 60 * 60 * 1000;
 const AUTO_MEMORY_MIN_LENGTH = 80;
-const AUTO_MEMORY_MODEL = MODELS.sonnet;
+// Model used by the post-exchange memory extractor + the conversation
+// summarizer. Both are routine "read this exchange, extract facts, call
+// memory_write with structured JSON" tasks — Haiku handles them fine and
+// they fire on EVERY substantive exchange, so the multiplier matters.
+// Override with CLEMENTINE_AUTO_MEMORY_MODEL=sonnet if you observe
+// extraction quality drop.
+const AUTO_MEMORY_MODEL = process.env.CLEMENTINE_AUTO_MEMORY_MODEL?.includes('sonnet')
+  ? MODELS.sonnet
+  : process.env.CLEMENTINE_AUTO_MEMORY_MODEL?.includes('opus')
+    ? MODELS.opus
+    : MODELS.haiku;
 const OWNER = OWNER_NAME || 'the user';
 const MCP_SERVER_SCRIPT = path.join(PKG_DIR, 'dist', 'tools', 'mcp-server.js');
 const TOOLS_SERVER = `${ASSISTANT_NAME.toLowerCase()}-tools`;
@@ -5013,6 +5023,11 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
         if (message.type === 'assistant') {
           const blocks = getContentBlocks(message as SDKAssistantMessage);
           summaryText += extractText(blocks);
+        } else if (message.type === 'result') {
+          // Make session-summarization cost visible in usage_log. Without
+          // this, every session rotation spawned a Sonnet summarize call
+          // that didn't appear in any metric.
+          this.logQueryResult(message as SDKResultMessage, 'summarize', `summarize:${sessionKey}`);
         }
       }
 
@@ -5425,6 +5440,19 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
 
       const collectedText: string[] = [];
       for await (const message of stream) {
+        if (message.type === 'result') {
+          // Auto-memory extraction fires after every substantive
+          // exchange. Before this log call, its cost was invisible in
+          // usage_log — a per-user-message Sonnet pass running silently.
+          this.logQueryResult(
+            message as SDKResultMessage,
+            'auto_memory',
+            `auto-memory:${sessionKey ?? 'unknown'}`,
+            undefined,
+            profile?.slug,
+          );
+          continue;
+        }
         if (message.type === 'assistant') {
           const blocks = getContentBlocks(message as SDKAssistantMessage);
           for (const block of blocks) {
@@ -6146,6 +6174,10 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
         if (message.type === 'assistant') {
           const blocks = getContentBlocks(message as SDKAssistantMessage);
           responseText += extractText(blocks);
+        } else if (message.type === 'result') {
+          // Cron reflection (post-task quality check) fires after every
+          // cron run. Cheap (Haiku, 1 turn, ~1KB) but should be visible.
+          this.logQueryResult(message as SDKResultMessage, 'cron_reflection', `reflection:${jobName}`, jobName);
         }
       }
 
