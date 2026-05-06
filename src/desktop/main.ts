@@ -127,6 +127,14 @@ async function waitForDashboard(startPort: number, timeoutMs = 25_000): Promise<
   throw new Error(`Dashboard did not become ready on ports ${startPort}-${startPort + 9}`);
 }
 
+async function findRunningDashboard(startPort: number): Promise<number | null> {
+  if (observedPort && await probeDashboard(observedPort)) return observedPort;
+  for (let port = startPort; port < startPort + 10; port++) {
+    if (await probeDashboard(port)) return port;
+  }
+  return null;
+}
+
 function attachDashboardLogs(child: ChildProcess): void {
   const onChunk = (chunk: Buffer): void => {
     const text = chunk.toString();
@@ -172,8 +180,16 @@ async function startDashboardAndLoad(): Promise<void> {
     clearTimeout(restartTimer);
     restartTimer = null;
   }
-  loadStatus('Starting Clementine', 'Opening the local dashboard server...');
+  loadStatus('Opening Clementine', 'Looking for the local dashboard...');
   try {
+    const existingPort = await findRunningDashboard(DEFAULT_PORT);
+    if (existingPort) {
+      dashboardUrl = `http://127.0.0.1:${existingPort}`;
+      await mainWindow.loadURL(dashboardUrl);
+      return;
+    }
+
+    loadStatus('Starting Clementine', 'Opening the local dashboard server...');
     if (!dashboardProcess) dashboardProcess = startDashboardProcess(DEFAULT_PORT);
     const actualPort = await waitForDashboard(DEFAULT_PORT);
     dashboardUrl = `http://127.0.0.1:${actualPort}`;
