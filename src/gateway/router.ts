@@ -3029,6 +3029,56 @@ export class Gateway {
       const cronStart = Date.now();
       try {
         let response: string;
+
+        // ── Phase 3: opt-in canonical SDK cron path ──────────────────
+        // CLEMENTINE_USE_RUNAGENT_CRON=1 routes the job through
+        // runAgentCron() — the canonical SDK pattern. Default OFF.
+        // Falls back to legacy on error so the job always completes.
+        const useRunAgentCron = process.env.CLEMENTINE_USE_RUNAGENT_CRON === '1';
+        if (useRunAgentCron && !opts?.disableAllTools) {
+          try {
+            const { runAgentCron } = await import('../agent/run-agent-cron.js');
+            const profile = agentSlug && agentSlug !== 'clementine'
+              ? this.getAgentManager().get(agentSlug) ?? null
+              : null;
+            logger.info({ jobName, agentSlug, tier, path: 'runagent_cron' }, 'Phase 3: routing cron through runAgentCron');
+
+            const cronResult = await runAgentCron({
+              jobName,
+              jobPrompt,
+              tier,
+              maxTurns,
+              profile,
+              agentManager: this.getAgentManager(),
+              memoryStore: this.assistant.getMemoryStore?.() ?? null,
+              successCriteria,
+              model,
+              workDir,
+            });
+
+            response = cronResult.text;
+            scanner.refreshIntegrity();
+            events.emit('cron:complete', {
+              jobName,
+              mode: 'runagent',
+              durationMs: Date.now() - cronStart,
+              responseLength: response?.length ?? 0,
+            });
+            logger.info({
+              jobName,
+              cost: Number(cronResult.totalCostUsd.toFixed(4)),
+              numTurns: cronResult.numTurns,
+              composioConnected: cronResult.composioConnected.length,
+              externalConnected: cronResult.externalConnected.length,
+              durationMs: Date.now() - cronStart,
+            }, 'runAgentCron: cron job complete');
+            return response;
+          } catch (err) {
+            logger.warn({ err, jobName }, 'runAgentCron path failed — falling back to legacy cron path');
+            // Fall through to legacy below.
+          }
+        }
+
         if (mode === 'unleashed') {
           response = await this.assistant.runUnleashedTask(jobName, jobPrompt, tier, maxTurns, model, workDir, maxHours, agentSlug);
         } else {
