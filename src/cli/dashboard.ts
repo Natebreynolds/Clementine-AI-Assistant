@@ -199,9 +199,27 @@ async function getGateway(): Promise<Gateway> {
       const dispatcher = new NotificationDispatcher();
       dispatcher.register('dashboard', async (text, context) => {
         if (!dashboardSseBroadcast) return;
+        // Forward agent identity so the chat panel can render the
+        // originating hired agent's name + initial — same UX guarantee
+        // Discord/Slack already give via per-agent bot identities.
+        // agentSlug arrives populated by either the explicit caller
+        // (cron-scheduler.dispatchContextForJob etc.) or by the
+        // dispatcher's session-key inference safety net.
+        let agentName: string | null = null;
+        if (context?.agentSlug && context.agentSlug !== 'clementine') {
+          try {
+            const profile = gatewayInstance?.getAgentManager().get(context.agentSlug);
+            agentName = profile?.name ?? null;
+          } catch { /* best-effort — fall back to slug */ }
+        }
         dashboardSseBroadcast({
           type: 'deep_result',
-          data: { sessionKey: context?.sessionKey ?? null, text },
+          data: {
+            sessionKey: context?.sessionKey ?? null,
+            agentSlug: context?.agentSlug ?? null,
+            agentName,
+            text,
+          },
         });
       });
       gatewayInstance.setDispatcher(dispatcher);
@@ -19416,6 +19434,51 @@ let currentPage = 'home';
 var currentAgentSlug = null;
 var prevAgentSlugs = null;
 
+// Browser-side cache of /api/agents — feeds chat-bubble identity rendering
+// so a hired agent's response shows their name/initial instead of
+// Clementine's. Refreshed on profile switch + on deep_result events
+// where the cache is missing the slug. Same UX guarantee Discord/Slack
+// give via per-agent bot identities.
+var __teamAgentsByslug = {};
+var __teamAgentsLoadedAt = 0;
+async function ensureTeamAgentCache(force) {
+  if (!force && __teamAgentsLoadedAt && (Date.now() - __teamAgentsLoadedAt < 60_000)) return;
+  try {
+    var r = await apiFetch('/api/agents');
+    if (!r.ok) return;
+    var agents = await r.json();
+    var next = {};
+    if (Array.isArray(agents)) {
+      for (var i = 0; i < agents.length; i++) {
+        var a = agents[i];
+        if (a && a.slug) next[a.slug] = { slug: a.slug, name: a.name || a.slug, avatar: a.avatar || null };
+      }
+    }
+    __teamAgentsByslug = next;
+    __teamAgentsLoadedAt = Date.now();
+  } catch (e) { /* non-fatal — fall back to Clementine */ }
+}
+
+/**
+ * Resolve the display identity for an assistant chat bubble.
+ *
+ *   getAssistantIdentity()                    → active chat profile (or Clementine)
+ *   getAssistantIdentity(slugFromSseEvent)    → that specific agent
+ *
+ * Returns { slug, name, initial }. Always safe — falls back to
+ * Clementine when nothing matches. Initial is uppercase first char,
+ * suitable for a .chat-avatar-sm bubble.
+ */
+function getAssistantIdentity(explicitSlug) {
+  var slug = explicitSlug || currentAgentSlug || '';
+  if (slug && slug !== 'clementine' && __teamAgentsByslug[slug]) {
+    var a = __teamAgentsByslug[slug];
+    return { slug: a.slug, name: a.name, initial: (a.name || 'A').charAt(0).toUpperCase() };
+  }
+  var clemName = (lastStatusData && lastStatusData.name) ? lastStatusData.name : 'Clementine';
+  return { slug: 'clementine', name: clemName, initial: clemName.charAt(0).toUpperCase() };
+}
+
 // ── Routing ────────────────────────────────────────────────────
 //
 // Five top-level destinations: home, build, team, brain, settings.
@@ -24224,18 +24287,23 @@ async function sendChat() {
   sendBtn.textContent = 'Thinking...';
 
 	  try {
+	    // Identity follows the active chat profile so a hired agent's
+	    // reply renders with their initial — same as Discord/Slack.
+	    await ensureTeamAgentCache();
+	    var asstIdentity = getAssistantIdentity();
 	    var asstRow = document.createElement('div');
 	    asstRow.className = 'chat-assistant-row';
 	    var chatAv = document.createElement('div');
 	    chatAv.className = 'chat-avatar-sm';
-	    chatAv.innerHTML = (lastStatusData.name || 'C').charAt(0).toUpperCase();
+	    chatAv.title = asstIdentity.name;
+	    chatAv.innerHTML = asstIdentity.initial;
 	    asstRow.appendChild(chatAv);
 	    var asstBubble = document.createElement('div');
 	    asstBubble.className = 'chat-bubble assistant';
 	    asstBubble.innerHTML = '<span style="color:var(--text-muted);font-style:italic">connecting...</span>';
 	    var asstMeta = document.createElement('div');
 	    asstMeta.className = 'chat-meta';
-	    asstMeta.textContent = new Date().toLocaleTimeString();
+	    asstMeta.textContent = new Date().toLocaleTimeString() + (asstIdentity.slug !== 'clementine' ? ' · ' + asstIdentity.name : '');
 	    asstRow.appendChild(asstBubble);
 	    container.appendChild(asstRow);
 	    typing.remove();
@@ -32301,6 +32369,21 @@ try {
         try {
           var container = document.getElementById('chat-messages');
           var text = (evt.data && evt.data.text) ? evt.data.text : '';
+          // Identity from the SSE payload \u2014 server-side
+          // dashboard sender resolves agentSlug + agentName from
+          // the dispatcher context (cron jobs, hired-agent
+          // workflows, heartbeats), so a Sasha-cron completion
+          // renders with Sasha's initial + name in the meta line
+          // instead of looking like Clementine sent it. Falls
+          // back to Clementine when the event is unowned.
+          var deepSlug = (evt.data && evt.data.agentSlug) ? evt.data.agentSlug : null;
+          var deepName = (evt.data && evt.data.agentName) ? evt.data.agentName : null;
+          // Lazy-refresh the cache if the SSE event names a slug we
+          // haven't seen yet (e.g. an agent hired since page load).
+          if (deepSlug && !__teamAgentsByslug[deepSlug]) { ensureTeamAgentCache(true); }
+          var deepIdentity = deepName
+            ? { slug: deepSlug, name: deepName, initial: deepName.charAt(0).toUpperCase() }
+            : getAssistantIdentity(deepSlug);
           if (container && text) {
             var emptyState = container.querySelector('.empty-state');
             if (emptyState) emptyState.remove();
@@ -32308,20 +32391,24 @@ try {
             row.className = 'chat-assistant-row';
             var av = document.createElement('div');
             av.className = 'chat-avatar-sm';
-            av.innerHTML = (lastStatusData && lastStatusData.name ? lastStatusData.name : 'C').charAt(0).toUpperCase();
+            av.title = deepIdentity.name;
+            av.innerHTML = deepIdentity.initial;
             row.appendChild(av);
             var bubble = document.createElement('div');
             bubble.className = 'chat-bubble assistant';
             bubble.innerHTML = renderMd(text);
             var meta = document.createElement('div');
             meta.className = 'chat-meta';
-            meta.textContent = new Date().toLocaleTimeString() + ' \u00b7 deep task';
+            meta.textContent = new Date().toLocaleTimeString()
+              + (deepIdentity.slug && deepIdentity.slug !== 'clementine' ? ' \u00b7 ' + deepIdentity.name : '')
+              + ' \u00b7 deep task';
             bubble.appendChild(meta);
             row.appendChild(bubble);
             container.appendChild(row);
             container.scrollTop = container.scrollHeight;
           } else {
-            toast('Deep task result ready \u2014 open chat to view.', 'info');
+            var who = (deepIdentity.slug && deepIdentity.slug !== 'clementine') ? deepIdentity.name : 'Deep task';
+            toast(who + ' result ready \u2014 open chat to view.', 'info');
           }
         } catch(e) { /* non-fatal */ }
       }
