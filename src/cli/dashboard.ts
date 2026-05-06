@@ -5537,6 +5537,19 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
     }
   });
 
+  // ── Projects ─────────────────────────────────────────────────
+  // Returns the project list from $CLEMENTINE_HOME/projects.json.
+  // Used by the trick builder's Quick Add Step picker so users can
+  // scaffold a step that runs in a specific project directory.
+  app.get('/api/projects', (_req, res) => {
+    try {
+      const projects = loadProjectsMeta();
+      res.json({ projects });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
   // ── Available Tools ──────────────────────────────────────────
 
   app.get('/api/available-tools', (_req, res) => {
@@ -25849,6 +25862,15 @@ function renderBuilderPreview(artifact, type) {
       + '<div id="builder-tools-panel" style="max-height:180px;overflow-y:auto;border:1px solid var(--border);border-radius:6px;padding:6px 8px;background:var(--bg-primary);margin-bottom:4px"></div>'
       + '<div style="font-size:10px;color:var(--text-muted)">Tools the trick will use. The chat sees these as a hint and weaves them into the steps.</div>'
       + '</div>'
+      + '<div class="preview-field"><label>Quick add a step</label>'
+      + '<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:4px">'
+      + '<button type="button" class="btn btn-sm" onclick="openQuickAddPicker(\\x27mcp\\x27)">+ MCP step</button>'
+      + '<button type="button" class="btn btn-sm" onclick="openQuickAddPicker(\\x27cli\\x27)">+ CLI step</button>'
+      + '<button type="button" class="btn btn-sm" onclick="openQuickAddPicker(\\x27project\\x27)">+ Project step</button>'
+      + '</div>'
+      + '<div id="quick-add-picker" style="display:none;border:1px solid var(--border);border-radius:6px;background:var(--bg-primary);max-height:240px;overflow-y:auto;padding:6px 8px;margin-bottom:4px"></div>'
+      + '<div style="font-size:10px;color:var(--text-muted)">Pick a tool/CLI/project to seed a step. Clementine will follow up in chat to write the prompt.</div>'
+      + '</div>'
       + '<div class="preview-field"><label>Steps (YAML/Markdown)</label><textarea rows="14" onchange="builderArtifact.steps=this.value">' + esc(artifact.steps || '') + '</textarea></div>';
     setTimeout(function() { loadBuilderToolOptions(artifact.toolsUsed || _builderLinkedTools); }, 50);
   }
@@ -26012,6 +26034,214 @@ function syncBuilderLinkedTools() {
     builderArtifact.tools = _builderLinkedTools;
   } else {
     builderArtifact.toolsUsed = _builderLinkedTools;
+  }
+}
+
+// ── Trick builder: Quick Add Step ─────────
+// Three buttons in the workflow preview pane (+ MCP / + CLI / + Project)
+// scaffold a step block into builderArtifact.steps and auto-fire a chat
+// turn so Clementine writes the prompt for that step. The steps field
+// stays as a freeform YAML textarea — we just append, don't parse-edit.
+
+function _nextStepId() {
+  var current = (builderArtifact && builderArtifact.steps) || '';
+  var ids = current.match(/step-(\\d+)/g) || [];
+  var max = 0;
+  for (var i = 0; i < ids.length; i++) {
+    var n = parseInt(ids[i].replace('step-', ''), 10);
+    if (!isNaN(n) && n > max) max = n;
+  }
+  return 'step-' + (max + 1);
+}
+
+function _previousStepId() {
+  var current = (builderArtifact && builderArtifact.steps) || '';
+  var matches = current.match(/step-(\\d+)/g) || [];
+  if (matches.length === 0) return null;
+  // Highest numbered id
+  var max = 0;
+  for (var i = 0; i < matches.length; i++) {
+    var n = parseInt(matches[i].replace('step-', ''), 10);
+    if (!isNaN(n) && n > max) max = n;
+  }
+  return 'step-' + max;
+}
+
+function _yamlEscape(s) {
+  if (s == null) return '';
+  return String(s).replace(/"/g, '\\\\"');
+}
+
+function _appendStepYaml(stepId, dependsOn, body) {
+  var current = (builderArtifact && builderArtifact.steps) || '';
+  var dep = dependsOn ? '\\n  dependsOn: [' + dependsOn + ']' : '';
+  var block = stepId + ':\\n  prompt: ""' + dep + '\\n' + body;
+  builderArtifact.steps = current.trim() ? (current.trim() + '\\n\\n' + block) : block;
+}
+
+async function openQuickAddPicker(kind) {
+  var panel = document.getElementById('quick-add-picker');
+  if (!panel) return;
+  // Toggle close if already open for the same kind.
+  if (panel.dataset.kind === kind && panel.style.display !== 'none') {
+    panel.style.display = 'none';
+    panel.dataset.kind = '';
+    panel.innerHTML = '';
+    return;
+  }
+  panel.dataset.kind = kind;
+  panel.style.display = 'block';
+  panel.innerHTML = '<div style="font-size:11px;color:var(--text-muted);padding:4px 0">Loading…</div>';
+
+  try {
+    if (kind === 'mcp') {
+      var r = await apiFetch('/api/available-tools');
+      var d = await r.json();
+      var rows = [];
+      for (var cat in d.categories) {
+        var entries = d.categories[cat];
+        for (var i = 0; i < entries.length; i++) {
+          var t = entries[i];
+          var name = typeof t === 'string' ? t : t.name;
+          if (typeof name === 'string' && name.indexOf('mcp__') === 0) {
+            // mcp__<server>__<tool>
+            var parts = name.replace(/^mcp__/, '').split('__');
+            if (parts.length < 2) continue;
+            var server = parts[0];
+            var tool = parts.slice(1).join('__');
+            rows.push({
+              label: server + ' / ' + tool,
+              description: typeof t === 'object' && t.description ? t.description : '',
+              resource: { server: server, tool: tool, description: typeof t === 'object' && t.description ? t.description : '' },
+            });
+          }
+        }
+      }
+      _renderQuickAddPicker(panel, kind, rows);
+    } else if (kind === 'cli') {
+      var r2 = await apiFetch('/api/available-tools');
+      var d2 = await r2.json();
+      var entries2 = (d2.categories && d2.categories['CLI Tools']) || [];
+      var rows2 = entries2.map(function(t) {
+        return {
+          label: t.name + (t.installed === false ? ' (not installed)' : ''),
+          description: t.description || '',
+          resource: { name: t.name, description: t.description || '' },
+        };
+      });
+      _renderQuickAddPicker(panel, kind, rows2);
+    } else if (kind === 'project') {
+      var r3 = await apiFetch('/api/projects');
+      var d3 = await r3.json();
+      var projects = (d3 && d3.projects) || [];
+      if (projects.length === 0) {
+        panel.innerHTML = '<div style="font-size:11px;color:var(--text-muted);padding:4px 0">No projects defined yet. Add one from the Projects page first.</div>';
+        return;
+      }
+      var rows3 = projects.map(function(p) {
+        return {
+          label: p.name || p.path,
+          description: p.path || '',
+          resource: { name: p.name || p.path, path: p.path },
+        };
+      });
+      _renderQuickAddPicker(panel, kind, rows3);
+    }
+  } catch (e) {
+    panel.innerHTML = '<div style="font-size:11px;color:var(--red);padding:4px 0">Failed to load: ' + esc(String(e)) + '</div>';
+  }
+}
+
+function _renderQuickAddPicker(panel, kind, rows) {
+  if (!rows || rows.length === 0) {
+    panel.innerHTML = '<div style="font-size:11px;color:var(--text-muted);padding:4px 0">Nothing to pick.</div>';
+    return;
+  }
+  // Build the picker. Each row is a button that calls addQuickStep
+  // with the resource and then closes the picker.
+  var parts = [];
+  for (var i = 0; i < rows.length; i++) {
+    var r = rows[i];
+    var rid = '_qap_' + kind + '_' + i;
+    parts.push(
+      '<button type="button" id="' + rid + '" data-idx="' + i + '" ' +
+      'style="display:block;width:100%;text-align:left;background:transparent;border:0;padding:4px 6px;' +
+      'border-radius:4px;cursor:pointer;font-size:11px;color:var(--text-primary)" ' +
+      'onmouseover="this.style.background=\\x27var(--bg-tertiary)\\x27" ' +
+      'onmouseout="this.style.background=\\x27transparent\\x27">' +
+      '<div style="font-weight:500">' + esc(r.label) + '</div>' +
+      (r.description ? '<div style="font-size:10px;color:var(--text-muted)">' + esc(r.description) + '</div>' : '') +
+      '</button>'
+    );
+  }
+  panel.innerHTML = parts.join('');
+  // Wire click handlers — each button picks its row by index.
+  for (var j = 0; j < rows.length; j++) {
+    (function(idx) {
+      var btn = document.getElementById('_qap_' + kind + '_' + idx);
+      if (btn) btn.onclick = function() {
+        addQuickStep(kind, rows[idx].resource);
+        panel.style.display = 'none';
+        panel.dataset.kind = '';
+        panel.innerHTML = '';
+      };
+    })(j);
+  }
+}
+
+function addQuickStep(kind, resource) {
+  if (!builderArtifact) return;
+  var stepId = _nextStepId();
+  var prevId = _previousStepId();
+  var body = '';
+  if (kind === 'mcp') {
+    body = '  kind: mcp\\n' +
+      '  mcp:\\n' +
+      '    server: "' + _yamlEscape(resource.server) + '"\\n' +
+      '    tool: "' + _yamlEscape(resource.tool) + '"\\n' +
+      '    inputs: {}\\n';
+  } else if (kind === 'cli') {
+    body = '  kind: cli\\n' +
+      '  cli:\\n' +
+      '    cmd: "' + _yamlEscape(resource.name) + '"\\n' +
+      '    args: []\\n' +
+      '    timeoutMs: 30000\\n';
+  } else if (kind === 'project') {
+    body = '  kind: prompt\\n' +
+      '  workDir: "' + _yamlEscape(resource.path) + '"\\n';
+  } else {
+    return;
+  }
+  _appendStepYaml(stepId, prevId, body);
+  // Re-render so the textarea picks up the new content.
+  if (typeof renderBuilderPreview === 'function') {
+    renderBuilderPreview(builderArtifact, 'workflow');
+  }
+  // Auto-fire chat so Clementine asks the right question.
+  triggerStepChatPrompt(kind, stepId, resource);
+}
+
+function triggerStepChatPrompt(kind, stepId, resource) {
+  var msg = '';
+  if (kind === 'mcp') {
+    msg = '[STEP ADDED] ' + stepId + ' is an MCP call to ' +
+      (resource.server || '') + '/' + (resource.tool || '') +
+      (resource.description ? ' (' + resource.description + ')' : '') +
+      '. Help me write the prompt for this step — what should it do, what inputs, what is the goal?';
+  } else if (kind === 'cli') {
+    msg = '[STEP ADDED] ' + stepId + ' runs the ' + (resource.name || '') + ' CLI' +
+      (resource.description ? ' (' + resource.description + ')' : '') +
+      '. What command/args should it run, and what should the prompt around it say?';
+  } else if (kind === 'project') {
+    msg = '[STEP ADDED] ' + stepId + ' runs in project ' + (resource.name || '') +
+      ' (' + (resource.path || '') + '). What should it do in that project?';
+  }
+  if (!msg) return;
+  // Reuse the same send path the chat input uses (mirrors builderQuick).
+  var input = document.getElementById('builder-input');
+  if (input) {
+    input.value = msg;
+    if (typeof sendBuilderChat === 'function') sendBuilderChat();
   }
 }
 

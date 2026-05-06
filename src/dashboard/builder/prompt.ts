@@ -114,6 +114,7 @@ function buildSystemPrefix(type: string, agentSlug?: string): string {
       `  3. Which tools, projects, or channels she'll need (MCP servers, local CLIs like sf/gh/gcloud, Slack/Discord targets).\n` +
       `  4. Which model — ${MODELS.opus} (most capable), ${MODELS.sonnet} (balanced), or ${MODELS.haiku} (fastest). Leave model empty if the user doesn't care.\n` +
       `Most tricks need only one prompt step. Add steps only when the user explicitly wants a multi-step pipeline.\n` +
+      `If a user message starts with "[STEP ADDED]", they just clicked a Quick Add button to seed a step structure. Focus your reply on writing the prompt field for THAT step — ask one specific clarifying question, then update the artifact. Do NOT restructure the workflow or re-ask about goal/schedule/model.\n` +
       `When the user says "save" or approves, output the final artifact block — don't try to save it yourself, the dashboard handles persistence.]\n\n`;
   }
 
