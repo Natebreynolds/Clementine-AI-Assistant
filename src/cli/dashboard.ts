@@ -25770,10 +25770,10 @@ function renderBuilderPreview(artifact, type) {
       + '<option value="2"' + (artifact.tier === 2 ? ' selected' : '') + '>2 — Read+Write</option>'
       + '<option value="3"' + (artifact.tier === 3 ? ' selected' : '') + '>3 — Full</option>'
       + '</select></div>'
-      + '<div class="preview-field"><label>Mode</label><select onchange="builderArtifact.mode=this.value">'
-      + '<option value="standard"' + (artifact.mode !== 'unleashed' ? ' selected' : '') + '>Standard</option>'
-      + '<option value="unleashed"' + (artifact.mode === 'unleashed' ? ' selected' : '') + '>Unleashed</option>'
-      + '</select></div>'
+      + '<div class="preview-field"><label>Linked Tools</label>'
+      + '<div id="builder-tools-panel" style="max-height:180px;overflow-y:auto;border:1px solid var(--border);border-radius:6px;padding:6px 8px;background:var(--bg-primary);margin-bottom:4px"></div>'
+      + '<div style="font-size:10px;color:var(--text-muted)">Pick tools the cron should use. The chat sees these as a hint, and they steer how the prompt is written.</div>'
+      + '</div>'
       + '<div class="preview-field"><label>Prompt</label><textarea rows="12" onchange="builderArtifact.prompt=this.value">' + esc(artifact.prompt || '') + '</textarea></div>'
       + '<div class="preview-field"><label>Reference Files</label>'
       + '<div id="builder-attachments-list"></div>'
@@ -25783,6 +25783,7 @@ function renderBuilderPreview(artifact, type) {
       + '</label>'
       + '<div style="font-size:10px;color:var(--text-muted);margin-top:4px">Files injected into the agent prompt at runtime</div>'
       + '</div>';
+    setTimeout(function() { loadBuilderToolOptions(artifact.toolsUsed || _builderLinkedTools); }, 50);
   } else if (type === 'agent') {
     html = '<div class="preview-field"><label>Name</label><input type="text" value="' + esc(artifact.name || '') + '" onchange="builderArtifact.name=this.value"></div>'
       + '<div class="preview-field"><label>Description / Role</label><input type="text" value="' + esc(artifact.description || '') + '" onchange="builderArtifact.description=this.value"></div>'
@@ -25793,13 +25794,22 @@ function renderBuilderPreview(artifact, type) {
       + '<option value="opus"' + (artifact.model === 'opus' ? ' selected' : '') + '>Opus</option>'
       + '</select></div>'
       + '<div class="preview-field"><label>Personality / System Prompt</label><textarea rows="8" onchange="builderArtifact.personality=this.value">' + esc(artifact.personality || '') + '</textarea></div>'
-      + '<div class="preview-field"><label>Tools (comma-separated)</label><input type="text" value="' + esc((artifact.tools || []).join(', ')) + '" onchange="builderArtifact.tools=this.value.split(\\x27,\\x27).map(function(t){return t.trim()}).filter(Boolean)"></div>'
+      + '<div class="preview-field"><label>Allowed Tools</label>'
+      + '<div id="builder-tools-panel" style="max-height:180px;overflow-y:auto;border:1px solid var(--border);border-radius:6px;padding:6px 8px;background:var(--bg-primary);margin-bottom:4px"></div>'
+      + '<div style="font-size:10px;color:var(--text-muted)">These become the agent\\x27s allowedTools — they\\x27re honored at the main-agent level when this agent runs as a profile.</div>'
+      + '</div>'
       + '<div class="preview-field"><label>Channel</label><input type="text" value="' + esc(artifact.channel || '') + '" onchange="builderArtifact.channel=this.value" placeholder="e.g. discord, slack"></div>';
+    setTimeout(function() { loadBuilderToolOptions(artifact.tools || _builderLinkedTools); }, 50);
   } else if (type === 'workflow') {
     html = '<div class="preview-field"><label>Workflow Name</label><input type="text" value="' + esc(artifact.name || '') + '" onchange="builderArtifact.name=this.value"></div>'
       + '<div class="preview-field"><label>Description</label><input type="text" value="' + esc(artifact.description || '') + '" onchange="builderArtifact.description=this.value"></div>'
       + '<div class="preview-field"><label>Trigger Schedule (cron, optional)</label><input type="text" value="' + esc(artifact.schedule || '') + '" onchange="builderArtifact.schedule=this.value" placeholder="e.g. 0 9 * * 1 (Mondays at 9am)"></div>'
+      + '<div class="preview-field"><label>Linked Tools</label>'
+      + '<div id="builder-tools-panel" style="max-height:180px;overflow-y:auto;border:1px solid var(--border);border-radius:6px;padding:6px 8px;background:var(--bg-primary);margin-bottom:4px"></div>'
+      + '<div style="font-size:10px;color:var(--text-muted)">Tools the trick will use. The chat sees these as a hint and weaves them into the steps.</div>'
+      + '</div>'
       + '<div class="preview-field"><label>Steps (YAML/Markdown)</label><textarea rows="14" onchange="builderArtifact.steps=this.value">' + esc(artifact.steps || '') + '</textarea></div>';
+    setTimeout(function() { loadBuilderToolOptions(artifact.toolsUsed || _builderLinkedTools); }, 50);
   }
   preview.innerHTML = html;
   // Load existing attachments if editing
@@ -25857,8 +25867,13 @@ async function saveBuilderArtifact() {
   var type = document.getElementById('builder-type').value;
   try {
     var agentSlug = (document.getElementById('builder-agent') || {}).value || '';
-    // Sync linked tools into artifact before saving
-    if (type === 'skill') builderArtifact.toolsUsed = _builderLinkedTools;
+    // Sync linked tools into artifact before saving — picker is shared
+    // across types but the persisted field name differs.
+    if (type === 'agent') {
+      builderArtifact.tools = _builderLinkedTools;
+    } else {
+      builderArtifact.toolsUsed = _builderLinkedTools;
+    }
     var r = await apiJson('POST', '/api/builder/save', {
       artifactType: type,
       artifact: builderArtifact,
@@ -25945,8 +25960,18 @@ async function loadBuilderToolOptions(selectedTools) {
 
 function syncBuilderLinkedTools() {
   _builderLinkedTools = Array.from(document.querySelectorAll('.builder-tool-cb:checked')).map(function(cb) { return cb.value; });
-  // Also sync into the artifact so it saves with toolsUsed
-  if (builderArtifact) builderArtifact.toolsUsed = _builderLinkedTools;
+  if (!builderArtifact) return;
+  // Field name differs per artifact type: agent stores into "tools"
+  // (which becomes profile.team.allowedTools on save). Skill, cron and
+  // workflow store into "toolsUsed" — carried for reference, since the
+  // runtime LINKED TOOLS context block is rebuilt from picker state
+  // each turn.
+  var type = (document.getElementById('builder-type') || {}).value;
+  if (type === 'agent') {
+    builderArtifact.tools = _builderLinkedTools;
+  } else {
+    builderArtifact.toolsUsed = _builderLinkedTools;
+  }
 }
 
 // ── Builder File Attachments ──────────────
