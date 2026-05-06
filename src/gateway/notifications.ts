@@ -26,9 +26,76 @@ function channelForSessionKey(sessionKey: string): string | null {
   return null;
 }
 
+/**
+ * Recover the owning hired-agent slug from a session key when the
+ * caller forgot to set `context.agentSlug` explicitly. Pure pattern
+ * matching — no I/O, no registry lookups — so it's cheap to run on
+ * every send. Catches the most common autonomous-path key shapes:
+ *
+ *   heartbeat:<slug>            → <slug>
+ *   agent-heartbeat:<slug>      → <slug>
+ *   team-task:<from>-><to>      → <to>   (the receiving agent owns the result)
+ *   discord:agent:<slug>:*      → <slug>
+ *   discord:member:*:<slug>:*   → <slug>
+ *   discord:member-dm:<slug>:*  → <slug>
+ *
+ * The cron path uses `cron:<jobName>` which deliberately does NOT
+ * encode the agent slug — cron-scheduler.ts threads `agentSlug`
+ * explicitly via `dispatchContextForJob()` instead.
+ *
+ * Returns undefined for keys that look like a Clementine-owned path
+ * (slug === 'clementine', no slug encoded, etc.) — the channel layer
+ * then routes through Clementine's main bot, which is correct.
+ *
+ * Exported so tests can pin the contract.
+ */
+export function inferAgentSlugFromSessionKey(sessionKey: string): string | undefined {
+  const heartbeatMatch = /^(?:agent-)?heartbeat:([^:]+)$/.exec(sessionKey);
+  if (heartbeatMatch && heartbeatMatch[1] !== 'clementine') {
+    return heartbeatMatch[1];
+  }
+  const teamTaskMatch = /^team-task:[^:]+->([^:]+)$/.exec(sessionKey);
+  if (teamTaskMatch && teamTaskMatch[1] !== 'clementine') {
+    return teamTaskMatch[1];
+  }
+  const discordAgentMatch = /^discord:agent:([^:]+):/.exec(sessionKey);
+  if (discordAgentMatch && discordAgentMatch[1] !== 'clementine') {
+    return discordAgentMatch[1];
+  }
+  const memberDmMatch = /^discord:member-dm:([^:]+):/.exec(sessionKey);
+  if (memberDmMatch && memberDmMatch[1] !== 'clementine') {
+    return memberDmMatch[1];
+  }
+  // discord:member:<channelId>:<slug>:<userId>
+  const memberMatch = /^discord:member:[^:]+:([^:]+):/.exec(sessionKey);
+  if (memberMatch && memberMatch[1] !== 'clementine') {
+    return memberMatch[1];
+  }
+  return undefined;
+}
+
 export interface SendResult {
   delivered: boolean;
   channelErrors: Record<string, string>;
+}
+
+/**
+ * Fill in `context.agentSlug` from `context.sessionKey` when the
+ * caller didn't set it. Pure, side-effect-free; returns the original
+ * context unchanged when nothing can be inferred.
+ *
+ * Centralised so both the public `send()` entrypoint AND the retry
+ * queue's `sendDirect` go through it — a request that falls into the
+ * retry queue without an explicit agentSlug must not lose its routing
+ * the second time around either.
+ */
+function enrichContext(context?: NotificationContext): NotificationContext | undefined {
+  if (!context) return context;
+  if (context.agentSlug) return context;
+  if (!context.sessionKey) return context;
+  const inferred = inferAgentSlugFromSessionKey(context.sessionKey);
+  if (!inferred) return context;
+  return { ...context, agentSlug: inferred };
 }
 
 export class NotificationDispatcher {
@@ -37,7 +104,7 @@ export class NotificationDispatcher {
 
   constructor() {
     this._retryQueue = new DeliveryQueue();
-    this._retryQueue.setSender((text, ctx) => this.sendDirect(text, ctx));
+    this._retryQueue.setSender((text, ctx) => this.sendDirect(text, enrichContext(ctx)));
     this._retryQueue.start();
   }
 
@@ -75,7 +142,20 @@ export class NotificationDispatcher {
       );
     }
 
-    const result = await this.sendDirect(redacted, context);
+    // Defense-in-depth: if a caller forgot `agentSlug` but their
+    // sessionKey encodes a hired agent (heartbeat/team-task/discord
+    // member sessions), recover it here so the channel layer routes
+    // through that agent's bot instead of leaking out via Clementine's
+    // main DM. Explicit `agentSlug` always wins.
+    const enriched = enrichContext(context);
+    if (!context?.agentSlug && enriched?.agentSlug) {
+      logger.debug(
+        { sessionKey: context?.sessionKey, inferredAgentSlug: enriched.agentSlug },
+        'Inferred agentSlug from sessionKey for routing',
+      );
+    }
+
+    const result = await this.sendDirect(redacted, enriched);
 
     // If delivery failed and there were actual senders (not "no channels"), queue for retry.
     // Stored text is already-redacted so disk persistence never holds a credential.

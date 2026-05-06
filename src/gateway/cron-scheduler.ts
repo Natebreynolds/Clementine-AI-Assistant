@@ -38,7 +38,7 @@ import {
   TIMEZONE,
 } from '../config.js';
 import { listAllGoals, findGoalPath, readGoalById } from '../tools/shared.js';
-import type { CronJobDefinition, CronRunEntry, SelfImproveConfig, SelfImproveExperiment, SelfImproveState, WorkflowDefinition } from '../types.js';
+import type { CronJobDefinition, CronRunEntry, NotificationContext, SelfImproveConfig, SelfImproveExperiment, SelfImproveState, WorkflowDefinition } from '../types.js';
 import type { NotificationDispatcher } from './notifications.js';
 import type { Gateway } from './router.js';
 import { scanner } from '../security/scanner.js';
@@ -844,9 +844,47 @@ export class CronScheduler {
   private _logRun(entry: CronRunEntry): void {
     this.runLog.append(entry);
     import('./fix-verification.js').then(({ checkAndDeliverVerification }) => {
-      checkAndDeliverVerification(entry, (text) => this.dispatcher.send(text, {}))
+      const ctx = this.dispatchContextForJobName(entry.jobName);
+      checkAndDeliverVerification(entry, (text) => this.dispatcher.send(text, ctx))
         .catch(err => logger.warn({ err, job: entry.jobName }, 'Fix verification DM failed'));
     }).catch(err => logger.warn({ err }, 'Fix-verification import failed'));
+  }
+
+  /**
+   * Single source of truth for the NotificationContext attached to any
+   * dispatch that originated from a cron job. Threads `agentSlug` (so
+   * the channel layer routes via the owning hired agent's bot when one
+   * exists) and a deterministic `sessionKey` (so the inference safety
+   * net at the dispatcher can recover routing if a future caller drops
+   * `agentSlug`). Use this — never construct contexts inline — so new
+   * dispatch sites in this file can't silently leak hired-agent results
+   * into Clementine's main DM.
+   */
+  private dispatchContextForJob(job: CronJobDefinition): NotificationContext {
+    const ctx: NotificationContext = { sessionKey: `cron:${job.name}` };
+    if (job.agentSlug) ctx.agentSlug = job.agentSlug;
+    return ctx;
+  }
+
+  /**
+   * Variant for dispatch sites that only have the job name in scope
+   * (MCP triggers, fix-verification, anywhere downstream of the run
+   * loop). Looks up the owning agentSlug from the live job table —
+   * falling back to a name-only context when the job is unknown
+   * (e.g. one-shot triggers without a CRON.md entry).
+   */
+  private dispatchContextForJobName(jobName: string): NotificationContext {
+    const job = this.jobs.find(j => j.name === jobName);
+    if (job) return this.dispatchContextForJob(job);
+    return { sessionKey: `cron:${jobName}` };
+  }
+
+  /** Same idea for workflows. Workflows can be agent-scoped via WorkflowDefinition.agentSlug. */
+  private dispatchContextForWorkflow(name: string): NotificationContext {
+    const wf = this.workflowDefs.find(w => w.name === name);
+    const ctx: NotificationContext = { sessionKey: `workflow:${name}` };
+    if (wf?.agentSlug) ctx.agentSlug = wf.agentSlug;
+    return ctx;
   }
 
   private async runJob(job: CronJobDefinition): Promise<void> {
@@ -960,6 +998,7 @@ export class CronScheduler {
         `Schedule: \`${job.schedule}\`\n\n` +
         `Reply \`yes\` or \`go\` to proceed, \`no\` or \`skip\` to cancel. ` +
         `Auto-runs in ${timeoutMin} min if no reply.`,
+        this.dispatchContextForJob(job),
       ).catch(err => logger.debug({ err }, 'Failed to send cron confirmation request'));
 
       // Override gateway's default 5-min timeout with the job's configured timeout
@@ -1217,7 +1256,7 @@ export class CronScheduler {
           if (response && !CronScheduler.isCronNoise(response)) {
             // Strip internal thinking/process narration from Discord output
             const cleanedResponse = CronScheduler.stripThinkingPrefixes(response);
-            const result = await this.dispatcher.send(cleanedResponse, { agentSlug: job.agentSlug });
+            const result = await this.dispatcher.send(cleanedResponse, this.dispatchContextForJob(job));
             if (!result.delivered) {
               entry.deliveryFailed = true;
               entry.deliveryError = Object.values(result.channelErrors).join('; ').slice(0, 300);
@@ -1292,7 +1331,7 @@ export class CronScheduler {
             if (created) {
               await this.dispatcher.send(
                 `${job.name} hit Claude credit exhaustion. Background jobs are paused until ${block.until} so they stop draining/retrying. Interactive chat may also fail until credits are available.`,
-                { agentSlug: job.agentSlug },
+                this.dispatchContextForJob(job),
               );
             }
             return;
@@ -1301,7 +1340,7 @@ export class CronScheduler {
           // Permanent error — stop immediately
           if (errorType === 'permanent') {
             logger.error({ err, job: job.name }, `Cron job '${job.name}' permanent error — not retrying`);
-            await this.dispatcher.send(`${job.name} failed: ${err}`, { agentSlug: job.agentSlug });
+            await this.dispatcher.send(`${job.name} failed: ${err}`, this.dispatchContextForJob(job));
             return;
           }
 
@@ -1316,7 +1355,7 @@ export class CronScheduler {
           } else {
             logger.error({ err, job: job.name }, `Cron job '${job.name}' failed after ${attempt} attempt(s)`);
             this.logAutonomy('failed', job, { errorType, attempts: attempt, error: String(err).slice(0, 500) });
-            await this.dispatcher.send(CronScheduler.formatCronError(job.name, err), { agentSlug: job.agentSlug });
+            await this.dispatcher.send(CronScheduler.formatCronError(job.name, err), this.dispatchContextForJob(job));
           }
         }
       }
@@ -1354,13 +1393,13 @@ export class CronScheduler {
         // Circuit breaker just engaged — notify
         this.logAutonomy('circuit_breaker', job, { consecutiveErrors: consErrors });
         this.logAdvisorEvent('circuit-breaker', job.name, `Circuit breaker engaged after ${consErrors} consecutive errors`);
-        this.dispatcher.send(`⚡ **Circuit breaker engaged** for \`${job.name}\` — ${consErrors} consecutive errors. Will retry in 1 hour.`, { agentSlug: job.agentSlug }).catch(err => logger.debug({ err }, 'Failed to send circuit breaker notification'));
+        this.dispatcher.send(`⚡ **Circuit breaker engaged** for \`${job.name}\` — ${consErrors} consecutive errors. Will retry in 1 hour.`, this.dispatchContextForJob(job)).catch(err => logger.debug({ err }, 'Failed to send circuit breaker notification'));
       } else if (consErrors >= 5) {
         // Check if recovery probe just succeeded
         const lastRun = this.runLog.readRecent(job.name, 1)[0];
         if (lastRun && !isRunHealthFailure(lastRun)) {
           this.logAdvisorEvent('circuit-recovery', job.name, `Circuit breaker recovered after ${consErrors} errors`);
-          this.dispatcher.send(`✅ **Circuit breaker recovered** — \`${job.name}\` succeeded after ${consErrors} prior errors.`, { agentSlug: job.agentSlug }).catch(err => logger.debug({ err }, 'Failed to send circuit recovery notification'));
+          this.dispatcher.send(`✅ **Circuit breaker recovered** — \`${job.name}\` succeeded after ${consErrors} prior errors.`, this.dispatchContextForJob(job)).catch(err => logger.debug({ err }, 'Failed to send circuit recovery notification'));
         }
       }
 
@@ -1407,7 +1446,7 @@ export class CronScheduler {
         this.logAdvisorEvent('auto-disabled', job.name, `Auto-disabled after ${consErrors} consecutive failures`);
         this.dispatcher.send(
           `🛑 **Cron auto-disabled** — \`${job.name}\` failed ${consErrors} times in a row. Fix the job and re-enable it from the dashboard.`,
-          { agentSlug: job.agentSlug },
+          this.dispatchContextForJob(job),
         ).catch(err => logger.debug({ err }, 'Failed to send auto-disable notification'));
       }
     }
@@ -1893,7 +1932,13 @@ export class CronScheduler {
         logger.info({ jobName }, 'Processing MCP trigger for cron job');
         this.runManual(jobName).then((result) => {
           if (result && !result.includes('not found')) {
-            this.dispatcher.send(`🔧 **${jobName}** (triggered):\n\n${result.slice(0, 1500)}`).catch(err => logger.debug({ err }, 'Failed to send trigger result notification'));
+            // Route via the owning hired agent's bot when one exists —
+            // otherwise this triggered-result message was leaking out
+            // through Clementine's main DM (the bug from 1.18.60 → 1.18.61).
+            this.dispatcher.send(
+              `🔧 **${jobName}** (triggered):\n\n${result.slice(0, 1500)}`,
+              this.dispatchContextForJobName(jobName),
+            ).catch(err => logger.debug({ err }, 'Failed to send trigger result notification'));
           }
         }).catch((err) => {
           logger.error({ err, jobName }, 'Trigger-initiated job failed');
@@ -2293,7 +2338,10 @@ export class CronScheduler {
       const response = await this.gateway.handleWorkflow(wf, inputs ?? {});
 
       if (response && response !== '*(workflow completed — no output)*') {
-        await this.dispatcher.send(`**[Workflow: ${name}]**\n\n${response.slice(0, 1500)}`);
+        await this.dispatcher.send(
+          `**[Workflow: ${name}]**\n\n${response.slice(0, 1500)}`,
+          this.dispatchContextForWorkflow(name),
+        );
         // Inject into owner's DM session
         if (DISCORD_OWNER_ID && DISCORD_OWNER_ID !== '0') {
           this.gateway.injectContext(
@@ -2311,7 +2359,7 @@ export class CronScheduler {
     } catch (err) {
       logger.error({ err, workflow: name }, `Workflow '${name}' failed`);
       const errMsg = `Workflow '${name}' failed: ${String(err).slice(0, 300)}`;
-      await this.dispatcher.send(errMsg);
+      await this.dispatcher.send(errMsg, this.dispatchContextForWorkflow(name));
       return errMsg;
     } finally {
       this.runningWorkflows.delete(name);
