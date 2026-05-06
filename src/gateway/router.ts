@@ -51,6 +51,7 @@ import {
 import { updateClementineJson } from '../config/clementine-json.js';
 import { buildCronDiagnosticResponse } from './cron-diagnostic-turn.js';
 import { classifyIntent } from '../agent/intent-classifier.js';
+import { detectPreLlmPlanIntent } from '../agent/fanout-policy.js';
 import { decideTurn } from '../agent/turn-policy.js';
 import {
   recordProactiveNotificationEvent,
@@ -2422,6 +2423,66 @@ export class Gateway {
         }
 
         try {
+          // ── Pre-LLM plan routing (Gap #3 from orchestration audit) ──
+          // When the user's text clearly maps to multi-step parallel
+          // work, route through the orchestrator BEFORE the main agent
+          // runs. This is HARD enforcement — independent of whether
+          // the agent self-detects via [PLAN_NEEDED:]. Saves a Sonnet
+          // turn that would likely thrash, and the planner's parallel
+          // sub-agents (Haiku-default) keep big tool responses out of
+          // the user's main context.
+          //
+          // Conservative gate: requires explicit action verbs +
+          // multiple fanout signals + non-informational intent. False
+          // positives waste a planner LLM call (~$0.05); false
+          // negatives let the existing soft-enforcement path run, which
+          // is the status quo. Trusted personal sessions only — we
+          // don't surprise random Discord users with auto-orchestration.
+          if (this.isTrustedPersonalSession(sessionKey)
+              && !sessState.pendingInterrupt /* don't override mid-thought continuations */
+          ) {
+            const planIntentDecision = detectPreLlmPlanIntent(originalText, {
+              intentType: classifyIntent(originalText)?.type,
+            });
+            if (planIntentDecision.shouldRouteToPlanner) {
+              logger.info({
+                sessionKey: effectiveSessionKey,
+                reason: planIntentDecision.reason,
+                signals: planIntentDecision.signals.map(s => s.pattern),
+                actionVerbs: planIntentDecision.actionVerbs,
+                originalTextPreview: originalText.slice(0, 200),
+              }, 'Pre-LLM plan routing: bypassing main agent for orchestrator');
+
+              if (wrappedOnText) {
+                try {
+                  await wrappedOnText('Detected a multi-step task — decomposing into parallel sub-agents…\n\n');
+                } catch { /* streaming is best-effort */ }
+              }
+
+              try {
+                const planResult = await this.handlePlan(
+                  effectiveSessionKey,
+                  originalText,
+                  undefined, // chat path doesn't need structured progress callbacks
+                  undefined, // no approval gate — pre-LLM routing is opt-in via signal match
+                );
+                clearTimeout(chatTimer);
+                clearTimeout(hardWallTimer);
+                logger.info({
+                  sessionKey: effectiveSessionKey,
+                  totalMs: Date.now() - tInnerStart,
+                  routedVia: 'pre_llm_planner',
+                  responseLen: planResult.length,
+                }, 'chat:latency');
+                return planResult;
+              } catch (err) {
+                logger.warn({ err, sessionKey: effectiveSessionKey }, 'Pre-LLM plan routing failed — falling back to direct agent');
+                // Fall through to the regular agent path so the user
+                // still gets a response.
+              }
+            }
+          }
+
           // No artificial turn cap — let the agent work until done.
           // Primary guardrail is cost budget (maxBudgetUsd in buildOptions).
           // Wall clock (CHAT_MAX_WALL_MS) and StallGuard are safety nets.

@@ -150,3 +150,120 @@ export function buildFanoutDirectiveForText(text: string): { directive: string; 
     report,
   };
 }
+
+// ── Pre-LLM plan intent detection ─────────────────────────────────────
+//
+// detectFanoutSignals + the directive injection (above) are SOFT
+// enforcement: we tell the agent "fan out for this." If the agent
+// honors it, we win. If not, we still pay for a Sonnet turn that
+// thrashes.
+//
+// Pre-LLM plan intent detection is HARD enforcement: when a user's
+// query clearly maps to multi-step parallel work, route through the
+// orchestrator BEFORE the main agent ever runs. The orchestrator
+// decomposes into parallel Haiku/Sonnet sub-agents, each in its own
+// context. The user's main agent never sees the big tool responses
+// — it never gets a chance to thrash.
+//
+// Conservative gate: false positives waste a planner LLM call (~$0.05)
+// + sub-agent calls. False negatives mean the existing soft-enforcement
+// path runs, which is the status quo. So we tune for false positives.
+
+const INFORMATIONAL_QUERY_PATTERN =
+  /^\s*(what|tell\s+me|show\s+me|is\s|are\s|do\s+you|how\s+(does|is|do)|why\s|when\s|where\s|who\s|did\s|have\s+you|can\s+you\s+(see|tell|show|describe|explain)|describe|explain|summarize)\b/i;
+
+const ACTION_VERB_PATTERNS: Array<{ pattern: RegExp; reason: string }> = [
+  {
+    // "research my top 10 prospects", "draft each prospect", "process all leads"
+    pattern: /\b(research|analyze|process|review|draft|write|send|email|message|outreach)\s+(each|all|every|those|these|my|our|the\s+\w+|\d+|\w+\s+(of\s+)?(my|our|the)\s+\w+)/i,
+    reason: 'multi-target action verb (research/analyze/draft/etc. on a collection)',
+  },
+  {
+    // "for each prospect, draft a follow-up"
+    pattern: /\bfor\s+(each|every|all)\b.*\b(do|run|send|draft|process|email|call|review|analyze|build|create|fetch)/i,
+    reason: '"for each X, do Y" pattern',
+  },
+  {
+    // "build a comprehensive content intelligence brief" — allow up to 4
+    // words between the verb and the deliverable noun.
+    pattern: /\b(build|prepare|produce|run|generate)\s+(a\s+|an\s+)?(\w+\s+){0,4}(brief|report|summary|analysis|comparison|recap|breakdown|dashboard|deck|index|list)\b/i,
+    reason: 'compound deliverable (brief/report/analysis)',
+  },
+  {
+    pattern: /\b(go\s+through|walk\s+through|process)\s+(every|all|each|my|the)\s+\w+/i,
+    reason: '"go through everyone/everything" pattern',
+  },
+];
+
+export interface PreLlmPlanDecision {
+  shouldRouteToPlanner: boolean;
+  reason: string;
+  signals: FanoutSignal[];
+  actionVerbs: string[];
+}
+
+export interface PreLlmPlanOptions {
+  /** Result of intent classifier — routing skips followup/chat regardless of content. */
+  intentType?: 'task' | 'followup' | 'chat' | 'lookup' | string;
+  /** Pre-LLM minimum length. Short queries can't be plan-worthy. */
+  minLength?: number;
+  /** Conservative AND-threshold: require ≥N fanout signals AND ≥1 action verb. */
+  minFanoutSignals?: number;
+}
+
+/**
+ * Decide whether the user's text should bypass the main agent and run
+ * directly through the planner orchestrator. Conservative by design.
+ */
+export function detectPreLlmPlanIntent(
+  text: string,
+  opts: PreLlmPlanOptions = {},
+): PreLlmPlanDecision {
+  const minLength = opts.minLength ?? 40;
+  const minFanoutSignals = opts.minFanoutSignals ?? 2;
+  const trimmed = (text ?? '').trim();
+
+  // Hard skips: intent says "not a task" → don't override.
+  if (opts.intentType === 'followup' || opts.intentType === 'chat') {
+    return { shouldRouteToPlanner: false, reason: `intent_is_${opts.intentType}`, signals: [], actionVerbs: [] };
+  }
+
+  if (trimmed.length < minLength) {
+    return { shouldRouteToPlanner: false, reason: 'too_short', signals: [], actionVerbs: [] };
+  }
+
+  // Information-seeking patterns: "what/tell me/show me/etc." Let the
+  // agent answer directly even if collective wording is present
+  // ("tell me about all my prospects" is a status request, not work).
+  if (INFORMATIONAL_QUERY_PATTERN.test(trimmed)) {
+    return { shouldRouteToPlanner: false, reason: 'informational_query', signals: [], actionVerbs: [] };
+  }
+
+  // Action-verb match: text must contain an explicit "do X for many" verb.
+  const matchedVerbs: string[] = [];
+  for (const { pattern, reason } of ACTION_VERB_PATTERNS) {
+    if (pattern.test(trimmed)) matchedVerbs.push(reason);
+  }
+  if (matchedVerbs.length === 0) {
+    return { shouldRouteToPlanner: false, reason: 'no_action_verb', signals: [], actionVerbs: [] };
+  }
+
+  // Fanout signals (existing detector — covers numeric counts,
+  // collective+quantifier patterns, "for each", comprehensive research, etc.).
+  const fanoutReport = detectFanoutSignals(trimmed);
+  if (fanoutReport.signals.length < minFanoutSignals) {
+    return {
+      shouldRouteToPlanner: false,
+      reason: `weak_fanout_signal_count_${fanoutReport.signals.length}_below_${minFanoutSignals}`,
+      signals: fanoutReport.signals,
+      actionVerbs: matchedVerbs,
+    };
+  }
+
+  return {
+    shouldRouteToPlanner: true,
+    reason: `fanout=${fanoutReport.signals.length}+verbs=${matchedVerbs.length}`,
+    signals: fanoutReport.signals,
+    actionVerbs: matchedVerbs,
+  };
+}

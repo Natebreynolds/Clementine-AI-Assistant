@@ -4,6 +4,7 @@ import {
   buildFanoutDirective,
   buildFanoutDirectiveForText,
   detectFanoutSignals,
+  detectPreLlmPlanIntent,
 } from '../src/agent/fanout-policy.js';
 
 describe('detectFanoutSignals', () => {
@@ -107,5 +108,73 @@ describe('buildFanoutDirectiveForText', () => {
     expect(r.directive).not.toBe('');
     expect(r.report.needsFanout).toBe(true);
     expect(r.report.signals.length).toBeGreaterThan(0);
+  });
+});
+
+describe('detectPreLlmPlanIntent', () => {
+  it('routes a multi-item action: "research my top 10 prospects across all accounts"', () => {
+    const r = detectPreLlmPlanIntent('research my top 10 prospects across all accounts and draft a follow-up to each');
+    expect(r.shouldRouteToPlanner).toBe(true);
+    expect(r.actionVerbs.length).toBeGreaterThan(0);
+    expect(r.signals.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it('routes a "for each X, do Y" pattern with research', () => {
+    const r = detectPreLlmPlanIntent('for each account in our pipeline, run the audit and email the rep with results');
+    expect(r.shouldRouteToPlanner).toBe(true);
+  });
+
+  it('does NOT route an informational query: "tell me about my prospects"', () => {
+    const r = detectPreLlmPlanIntent('tell me about all of my prospects and their status');
+    expect(r.shouldRouteToPlanner).toBe(false);
+    expect(r.reason).toBe('informational_query');
+  });
+
+  it('does NOT route "what time is it" — too short + informational', () => {
+    const r = detectPreLlmPlanIntent('what time is it');
+    expect(r.shouldRouteToPlanner).toBe(false);
+  });
+
+  it('does NOT route a single-target draft: "draft a follow-up to Mark Finizio"', () => {
+    const r = detectPreLlmPlanIntent('draft a follow-up to Mark Finizio about the audit results from last week');
+    // Action verb may match but only ONE fanout signal should fire.
+    expect(r.shouldRouteToPlanner).toBe(false);
+  });
+
+  it('respects intentType: chat → never routes regardless of content', () => {
+    const r = detectPreLlmPlanIntent(
+      'research all my prospects across every account and process each one comprehensively',
+      { intentType: 'chat' },
+    );
+    expect(r.shouldRouteToPlanner).toBe(false);
+    expect(r.reason).toBe('intent_is_chat');
+  });
+
+  it('respects intentType: followup → never routes', () => {
+    const r = detectPreLlmPlanIntent(
+      'and process all the rest of them too',
+      { intentType: 'followup' },
+    );
+    expect(r.shouldRouteToPlanner).toBe(false);
+    expect(r.reason).toBe('intent_is_followup');
+  });
+
+  it('does NOT route on weak fanout signals (only 1)', () => {
+    const r = detectPreLlmPlanIntent('research the prospect Mark Finizio in detail');
+    expect(r.shouldRouteToPlanner).toBe(false);
+    // Either weak signal count or no action verb path — both are acceptable rejections
+    expect(['no_action_verb', 'weak_fanout_signal_count_1_below_2', 'weak_fanout_signal_count_0_below_2'])
+      .toContain(r.reason);
+  });
+
+  it('routes a "build a brief" pattern with multiple steps', () => {
+    const r = detectPreLlmPlanIntent('build a comprehensive content intelligence brief covering competitors, brand mentions, and the past 30 days of news');
+    expect(r.shouldRouteToPlanner).toBe(true);
+  });
+
+  it('does NOT route short queries below the length floor', () => {
+    const r = detectPreLlmPlanIntent('research all leads');
+    expect(r.shouldRouteToPlanner).toBe(false);
+    expect(r.reason).toBe('too_short');
   });
 });
