@@ -112,16 +112,13 @@ export async function runAgentHeartbeat(opts: RunAgentHeartbeatOptions): Promise
     abortSignal: opts.abortSignal,
   });
 
-  // Mirror the heartbeat into transcripts so dedup + recall work.
-  // Skip pure __NOTHING__ outputs since they carry no information.
-  const text = result.text?.trim() ?? '';
-  if (opts.memoryStore && text && text !== '__NOTHING__') {
-    try {
-      opts.memoryStore.saveTurn(sessionKey, 'heartbeat', text, opts.model ?? MODELS.haiku);
-    } catch {
-      /* non-fatal */
-    }
-  }
+  // Heartbeat output is NOT mirrored to transcripts. Heartbeats fire
+  // up to 28x/day per agent and most output is low-value (status
+  // pings, dedup'd reminders). The heartbeat dedup that prior versions
+  // wanted recall for actually lives in the prompt itself (the
+  // dedupContext block + the __NOTHING__ sentinel), not in DB queries.
+  // Saving rows here just polluted FTS and the dashboard memory panel
+  // for no recall benefit.
 
   return result;
 }

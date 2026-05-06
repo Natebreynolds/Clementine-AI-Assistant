@@ -305,8 +305,49 @@ async function searchMemory(query: string, limit = 20, filters: SearchFilters = 
        WHERE ${where.join(' AND ')}
        ORDER BY ${orderBy}
        LIMIT ?`;
-    const rows = db.prepare(sql).all(...params, limit) as Array<Record<string, unknown>>;
-    return { results: rows, dbExists: true };
+    const chunkRows = db.prepare(sql).all(...params, limit) as Array<Record<string, unknown>>;
+
+    // Also surface transcripts from chat / cron / team-task. These
+    // are written by saveTurn and would otherwise be invisible to the
+    // main search panel (only the per-session viewer surfaced them).
+    // chunkType filter is chunk-only — if set, skip transcripts.
+    let transcriptRows: Array<Record<string, unknown>> = [];
+    if (words.length > 0 && !filters.chunkType && !filters.pinnedOnly) {
+      try {
+        const ftsQuery = words.map((w) => `"${w.replace(/"/g, '')}"`).join(' OR ');
+        const tWhere: string[] = ['transcripts_fts MATCH ?'];
+        const tParams: unknown[] = [ftsQuery];
+        if (filters.sinceDays && filters.sinceDays > 0) {
+          tWhere.push("t.created_at >= datetime('now', ?)");
+          tParams.push(`-${filters.sinceDays} days`);
+        }
+        const tSql = `SELECT t.id, t.session_key, t.role, t.content, t.model, t.created_at,
+                        bm25(transcripts_fts) as score
+                 FROM transcripts_fts f JOIN transcripts t ON t.id = f.rowid
+                 WHERE ${tWhere.join(' AND ')}
+                 ORDER BY bm25(transcripts_fts)
+                 LIMIT ?`;
+        transcriptRows = (db.prepare(tSql).all(...tParams, Math.min(limit, 10)) as Array<Record<string, unknown>>)
+          .map(r => ({
+            id: `transcript:${r.id}`,
+            source_file: `transcripts/${r.session_key}`,
+            section: `${r.role} @ ${r.created_at}`,
+            content: r.content,
+            chunk_type: 'transcript',
+            updated_at: r.created_at,
+            salience: 0,
+            pinned: 0,
+            score: r.score,
+          }));
+      } catch { /* transcripts FTS may be empty/unavailable — non-fatal */ }
+    }
+
+    // Merge: transcripts interleaved by score with chunks. FTS bm25
+    // is comparable across both since they use the same tokenizer.
+    const merged = [...chunkRows, ...transcriptRows]
+      .sort((a, b) => Number(a.score ?? 0) - Number(b.score ?? 0))
+      .slice(0, limit);
+    return { results: merged, dbExists: true };
   } catch (err) {
     return { results: [], dbExists: true, error: String(err) };
   } finally {

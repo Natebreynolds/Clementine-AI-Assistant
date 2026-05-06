@@ -34,6 +34,20 @@ export interface TeamTaskPostHooks {
     sessionKey?: string,
     profile?: AgentProfile,
   ) => Promise<void>;
+  triggerSkillExtractionFromExecution: (
+    source: 'unleashed' | 'cron' | 'chat',
+    jobName: string,
+    prompt: string,
+    output: string,
+    durationMs: number,
+    agentSlug?: string,
+  ) => Promise<void>;
+  triggerCronReflection: (
+    jobName: string,
+    jobPrompt: string,
+    deliverable: string,
+    successCriteria?: string[],
+  ) => Promise<void>;
 }
 
 export interface RunAgentTeamTaskOptions {
@@ -105,6 +119,7 @@ export async function runAgentTeamTask(opts: RunAgentTeamTaskOptions): Promise<R
   }, 'runAgentTeamTask: dispatching to runAgent');
 
   const sessionKey = `team-task:${opts.fromSlug}->${opts.profile.slug}`;
+  const startedAt = Date.now();
   const result = await runAgent(builtPrompt, {
     sessionKey,
     source: 'team-task',
@@ -132,14 +147,29 @@ export async function runAgentTeamTask(opts: RunAgentTeamTaskOptions): Promise<R
     }
   }
 
-  // Auto-memory extraction — distill any new facts the recipient
-  // learned during the task into their MEMORY.md. Fire-and-forget,
-  // scoped to the recipient's profile so writes route to
-  // agents/<slug>/MEMORY.md, not the global one.
+  // Post-task hooks: memory + skill extraction + reflection. All
+  // fire-and-forget. Mirrors the cron wrapper's three-hook pattern.
+  // Team tasks often produce repeatable procedures (e.g. "draft a
+  // follow-up email after a discovery call") and reflection grades
+  // whether the response actually fulfilled the request.
   if (opts.postTaskHooks && result.text?.trim()) {
+    const durationMs = Date.now() - startedAt;
     opts.postTaskHooks
       .triggerMemoryExtractionPostExchange(opts.content, result.text, sessionKey, opts.profile)
       .catch(err => logger.debug({ err, fromSlug: opts.fromSlug, toSlug: opts.profile.slug }, 'runAgentTeamTask: memory extraction failed (non-fatal)'));
+    opts.postTaskHooks
+      .triggerSkillExtractionFromExecution(
+        'cron', // 'cron' covers autonomous-task skill source category
+        taskName,
+        opts.content,
+        result.text,
+        durationMs,
+        opts.profile.slug,
+      )
+      .catch(err => logger.debug({ err, fromSlug: opts.fromSlug, toSlug: opts.profile.slug }, 'runAgentTeamTask: skill extraction failed (non-fatal)'));
+    opts.postTaskHooks
+      .triggerCronReflection(taskName, opts.content, result.text)
+      .catch(err => logger.debug({ err, fromSlug: opts.fromSlug, toSlug: opts.profile.slug }, 'runAgentTeamTask: reflection failed (non-fatal)'));
   }
 
   return {
