@@ -17,7 +17,28 @@ const MAX_STEPS = 10;
 const MAX_CONCURRENT_STEPS = 3;
 const RESULT_TRUNCATE_CHARS = 4000;
 const LONG_PLAN_WARNING_MS = 30 * 60 * 1000; // 30 minutes
+// Step models the planner is allowed to assign to per-step execution.
+// Opus is intentionally NOT in this list — it's reserved for the planner
+// itself + final synthesis. Steps that need reasoning use Sonnet; routine
+// extraction/lookup steps use Haiku. This keeps the high-cost Opus calls
+// bounded (one planner call + one synthesis call per task) while
+// execution stays cheap.
 const ALLOWED_MODELS = ['haiku', 'sonnet'];
+
+// The planner's job is the highest-leverage decision in the orchestrator:
+// a smart decomposition saves N sub-agent calls, a bad decomposition wastes
+// them. So we default to Opus here even though it's the most expensive
+// per-call model — one Opus call (~$0.30-0.50, no tools, ~500 input
+// tokens, 1 turn) routinely saves $1-3 in retried sub-agent work.
+//
+// Override via CLEMENTINE_PLANNER_MODEL (haiku|sonnet|opus). Synthesis
+// (combining all step results into the user-facing response) uses the
+// same model — both are reasoning-heavy single-turn calls.
+const PLANNER_MODEL: 'haiku' | 'sonnet' | 'opus' = (() => {
+  const env = process.env.CLEMENTINE_PLANNER_MODEL?.toLowerCase();
+  if (env === 'haiku' || env === 'sonnet' || env === 'opus') return env;
+  return 'opus';
+})();
 
 const PLANNER_PROMPT = `You are a task planner for an AI assistant. Decompose the following request into executable steps.
 
@@ -548,6 +569,10 @@ export class PlanOrchestrator {
       finalResult = await this.assistant.runPlanStep(synthesisStepId, synthesisPrompt, {
         tier: 2,
         maxTurns: 5,
+        // Synthesis is reasoning-heavy: combine N step outputs into one
+        // coherent user-facing response. Same model tier as the planner —
+        // smart in, cheap-execution-out.
+        model: PLANNER_MODEL,
         disableTools: true,
         abortSignal: this.abortSignal,
       });
@@ -775,7 +800,7 @@ export class PlanOrchestrator {
     const plannerResult = await this.assistant.runPlanStep(
       'planner',
       PLANNER_PROMPT + agentContext + task + PLANNER_PROMPT_SUFFIX,
-      { tier: 2, maxTurns: 1, model: 'sonnet', disableTools: true, abortSignal: this.abortSignal },
+      { tier: 2, maxTurns: 1, model: PLANNER_MODEL, disableTools: true, abortSignal: this.abortSignal },
     );
 
     // Parse JSON from the planner response
