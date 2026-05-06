@@ -9,6 +9,9 @@ release/
 
 # Environment and secrets
 .env
+.env.local
+.env.release
+.env.signing
 *.pid
 
 # SQLite databases
