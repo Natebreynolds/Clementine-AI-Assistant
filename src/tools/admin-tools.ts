@@ -2249,5 +2249,97 @@ server.tool(
   },
 );
 
+// ── Broken-job diagnosis + fix-application (chat-equivalent of dashboard buttons) ──
+//
+// Before this, when the user asked "fix audit-inbox-check" in chat,
+// Clementine could read run logs and describe the failure but had no
+// tool to actually APPLY the stored fix — so she'd just keep returning
+// the same diagnosis text on every retry. The dashboard had the
+// "Apply Fix" button; the agent had nothing equivalent. These two
+// tools close that gap.
+
+server.tool(
+  'list_broken_jobs',
+  'List cron jobs that are currently failing repeatedly, with their cached diagnosis (if any) and whether each has an auto-applicable fix proposal. Use this when the user asks "what\'s broken?" or "what jobs are failing?" — it surfaces the same data the dashboard\'s broken-jobs panel shows.',
+  {},
+  async () => {
+    const { computeBrokenJobs } = await import('../gateway/failure-monitor.js');
+    const { getDiagnosisIfFresh } = await import('../gateway/failure-diagnostics.js');
+    const broken = computeBrokenJobs();
+    if (broken.length === 0) {
+      return textResult('No cron jobs are currently flagged as broken.');
+    }
+    const lines: string[] = [`${broken.length} cron job${broken.length === 1 ? '' : 's'} flagged as broken:`];
+    for (const b of broken) {
+      const d = getDiagnosisIfFresh(b.jobName);
+      const fix = d?.proposedFix;
+      const autoApplyAvailable = !!fix?.autoApply && d?.riskLevel === 'low';
+      lines.push(
+        `\n• \`${b.jobName}\``,
+        `  failures last 48h: ${b.errorCount48h}/${b.totalRuns48h}`,
+        b.lastErrors[0] ? `  last error: ${String(b.lastErrors[0]).slice(0, 200)}` : '',
+        d ? `  diagnosis: ${d.rootCause?.slice(0, 200) ?? "(no root cause)"}` : '  diagnosis: pending — wait for next failure-monitor sweep',
+        d ? `  proposed fix: type=${fix?.type ?? 'unknown'} confidence=${d.confidence ?? 'unknown'} risk=${d.riskLevel ?? 'unknown'}` : '',
+        autoApplyAvailable
+          ? `  ✓ auto-applicable — call apply_broken_job_fix with jobName="${b.jobName}"`
+          : '  ✗ not auto-applicable — manual review or dashboard intervention needed',
+      );
+    }
+    return textResult(lines.filter(Boolean).join('\n'));
+  },
+);
+
+server.tool(
+  'apply_broken_job_fix',
+  'Apply the cached auto-applicable fix for a broken cron job. Use this when the user explicitly asks to "fix" a job that has a confirmed diagnosis with autoApply=true and risk=low. Pass dryRun=true to preview without writing. Returns the applied operations, or refuses with a clear reason when the diagnosis is missing/risky/non-auto-applicable.',
+  {
+    jobName: z.string().describe('The job name as shown in CRON.md or list_broken_jobs output (e.g. "audit-inbox-check" or "ross-the-sdr:reply-detection").'),
+    dryRun: z.boolean().optional().describe('If true, validate + show what would change but do not write. Default false.'),
+  },
+  async ({ jobName, dryRun }) => {
+    const { getDiagnosisIfFresh, clearDiagnosis } = await import('../gateway/failure-diagnostics.js');
+    const { applyFix } = await import('../gateway/fix-applier.js');
+    const d = getDiagnosisIfFresh(jobName);
+    if (!d) {
+      return textResult(
+        `No fresh diagnosis for \`${jobName}\`. The failure-monitor sweep hasn't produced one yet, ` +
+        `or the diagnosis expired. Wait for the next sweep, or dig into ~/.clementine/cron/runs/${jobName}.jsonl ` +
+        `and the run-trace files for the actual error.`,
+      );
+    }
+    if (!d.proposedFix?.autoApply) {
+      return textResult(
+        `Diagnosis for \`${jobName}\` has no auto-applicable operations. ` +
+        `Type: ${d.proposedFix?.type ?? 'unknown'}. ` +
+        `This usually means the fix needs manual review — surface the diagnosis to the owner ` +
+        `(${d.rootCause ?? "(no root cause)"}) instead of attempting auto-fix.`,
+      );
+    }
+    if (d.riskLevel !== 'low') {
+      return textResult(
+        `Diagnosis for \`${jobName}\` has riskLevel=${d.riskLevel}. ` +
+        `Auto-apply is gated to risk=low only. ` +
+        `Show the proposed fix to the owner for explicit approval.`,
+      );
+    }
+    const isDryRun = dryRun === true;
+    const result = applyFix(jobName, d.proposedFix.autoApply, { dryRun: isDryRun });
+    if (result.ok && !isDryRun) clearDiagnosis(jobName);
+
+    if (!result.ok) {
+      return textResult(`Apply failed for \`${jobName}\`: ${'error' in result ? result.error : 'unknown error'}`);
+    }
+    const opsCount = 'operations' in result ? (result.operations as unknown[]).length : 0;
+    return textResult(
+      isDryRun
+        ? `[DRY RUN] Would apply ${opsCount} operation${opsCount === 1 ? '' : 's'} to fix \`${jobName}\`. ` +
+          `Root cause: ${d.rootCause?.slice(0, 200) ?? ""}. Re-run without dryRun to commit.`
+        : `Applied fix for \`${jobName}\` (${opsCount} operation${opsCount === 1 ? '' : 's'}). ` +
+          `The fix-verification tracker will roll it back automatically if the next runs don't improve. ` +
+          `Root cause: ${d.rootCause?.slice(0, 200) ?? ""}.`,
+    );
+  },
+);
+
 
 }
