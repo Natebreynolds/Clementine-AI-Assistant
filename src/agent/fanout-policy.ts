@@ -213,14 +213,28 @@ export interface PreLlmPlanOptions {
 
 /**
  * Decide whether the user's text should bypass the main agent and run
- * directly through the planner orchestrator. Conservative by design.
+ * directly through the planner orchestrator.
+ *
+ * Threshold model: combined "evidence count" ≥ 2, where each FANOUT
+ * SIGNAL and each MULTI-TARGET ACTION VERB counts as one piece of
+ * evidence. So "research my 100 leads and email each one" gets:
+ *   - 1 fanout signal (numeric_collection: "100 leads")
+ *   - 1 multi-target verb (research my 100 leads)
+ *   = 2 → routes
+ *
+ * False-positive guards stay in front:
+ *   - intent != followup/chat
+ *   - text length ≥ 30 chars
+ *   - NOT an informational query (what/tell me/show me/...)
+ *   - at least ONE action verb (no orchestration for pure declarative
+ *     statements even if they reference multiple items)
  */
 export function detectPreLlmPlanIntent(
   text: string,
   opts: PreLlmPlanOptions = {},
 ): PreLlmPlanDecision {
-  const minLength = opts.minLength ?? 40;
-  const minFanoutSignals = opts.minFanoutSignals ?? 2;
+  const minLength = opts.minLength ?? 30;
+  const minCombinedEvidence = opts.minFanoutSignals ?? 2;
   const trimmed = (text ?? '').trim();
 
   // Hard skips: intent says "not a task" → don't override.
@@ -239,7 +253,10 @@ export function detectPreLlmPlanIntent(
     return { shouldRouteToPlanner: false, reason: 'informational_query', signals: [], actionVerbs: [] };
   }
 
-  // Action-verb match: text must contain an explicit "do X for many" verb.
+  // Action-verb match: text must contain at least one explicit
+  // multi-target verb. This blocks pure declarative statements ("100
+  // prospects are in the pipeline" — referencing many items but no
+  // ask for work).
   const matchedVerbs: string[] = [];
   for (const { pattern, reason } of ACTION_VERB_PATTERNS) {
     if (pattern.test(trimmed)) matchedVerbs.push(reason);
@@ -248,13 +265,19 @@ export function detectPreLlmPlanIntent(
     return { shouldRouteToPlanner: false, reason: 'no_action_verb', signals: [], actionVerbs: [] };
   }
 
-  // Fanout signals (existing detector — covers numeric counts,
-  // collective+quantifier patterns, "for each", comprehensive research, etc.).
+  // Combined evidence: fanout signals + verb matches. Each piece of
+  // evidence independently suggests multi-step work; together they
+  // strongly do. Threshold ≥ 2 means a query with one numeric collection
+  // ("100 leads") AND one multi-target verb ("research those") routes,
+  // but a query with just a verb and no collection ("research the
+  // prospect Mark") does not.
   const fanoutReport = detectFanoutSignals(trimmed);
-  if (fanoutReport.signals.length < minFanoutSignals) {
+  const combinedEvidence = fanoutReport.signals.length + matchedVerbs.length;
+
+  if (combinedEvidence < minCombinedEvidence) {
     return {
       shouldRouteToPlanner: false,
-      reason: `weak_fanout_signal_count_${fanoutReport.signals.length}_below_${minFanoutSignals}`,
+      reason: `weak_evidence_${combinedEvidence}_below_${minCombinedEvidence}_(fanout=${fanoutReport.signals.length},verbs=${matchedVerbs.length})`,
       signals: fanoutReport.signals,
       actionVerbs: matchedVerbs,
     };
@@ -262,7 +285,7 @@ export function detectPreLlmPlanIntent(
 
   return {
     shouldRouteToPlanner: true,
-    reason: `fanout=${fanoutReport.signals.length}+verbs=${matchedVerbs.length}`,
+    reason: `evidence=${combinedEvidence} (fanout=${fanoutReport.signals.length},verbs=${matchedVerbs.length})`,
     signals: fanoutReport.signals,
     actionVerbs: matchedVerbs,
   };

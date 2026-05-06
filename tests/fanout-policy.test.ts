@@ -112,15 +112,29 @@ describe('buildFanoutDirectiveForText', () => {
 });
 
 describe('detectPreLlmPlanIntent', () => {
+  it('routes the canonical user example: "create a task that will scrape Salesforce, research 100 leads, send emails"', () => {
+    // This is the kind of query the orchestration architecture is
+    // designed to handle. If this doesn't route, the system fails its
+    // primary use case.
+    const r = detectPreLlmPlanIntent(
+      'can you create a task that will scrape salesforce research those 100 leads and send them emails',
+    );
+    expect(r.shouldRouteToPlanner).toBe(true);
+  });
+
   it('routes a multi-item action: "research my top 10 prospects across all accounts"', () => {
     const r = detectPreLlmPlanIntent('research my top 10 prospects across all accounts and draft a follow-up to each');
     expect(r.shouldRouteToPlanner).toBe(true);
     expect(r.actionVerbs.length).toBeGreaterThan(0);
-    expect(r.signals.length).toBeGreaterThanOrEqual(2);
   });
 
   it('routes a "for each X, do Y" pattern with research', () => {
     const r = detectPreLlmPlanIntent('for each account in our pipeline, run the audit and email the rep with results');
+    expect(r.shouldRouteToPlanner).toBe(true);
+  });
+
+  it('routes "research my 50 contacts and email each one"', () => {
+    const r = detectPreLlmPlanIntent('research my 50 contacts and email each one with a tailored follow-up');
     expect(r.shouldRouteToPlanner).toBe(true);
   });
 
@@ -137,7 +151,6 @@ describe('detectPreLlmPlanIntent', () => {
 
   it('does NOT route a single-target draft: "draft a follow-up to Mark Finizio"', () => {
     const r = detectPreLlmPlanIntent('draft a follow-up to Mark Finizio about the audit results from last week');
-    // Action verb may match but only ONE fanout signal should fire.
     expect(r.shouldRouteToPlanner).toBe(false);
   });
 
@@ -159,12 +172,10 @@ describe('detectPreLlmPlanIntent', () => {
     expect(r.reason).toBe('intent_is_followup');
   });
 
-  it('does NOT route on weak fanout signals (only 1)', () => {
+  it('does NOT route on weak evidence (single verb, no collection)', () => {
     const r = detectPreLlmPlanIntent('research the prospect Mark Finizio in detail');
     expect(r.shouldRouteToPlanner).toBe(false);
-    // Either weak signal count or no action verb path — both are acceptable rejections
-    expect(['no_action_verb', 'weak_fanout_signal_count_1_below_2', 'weak_fanout_signal_count_0_below_2'])
-      .toContain(r.reason);
+    expect(r.reason).toMatch(/weak_evidence|no_action_verb/);
   });
 
   it('routes a "build a brief" pattern with multiple steps', () => {
@@ -173,8 +184,14 @@ describe('detectPreLlmPlanIntent', () => {
   });
 
   it('does NOT route short queries below the length floor', () => {
-    const r = detectPreLlmPlanIntent('research all leads');
+    const r = detectPreLlmPlanIntent('research leads');
     expect(r.shouldRouteToPlanner).toBe(false);
     expect(r.reason).toBe('too_short');
+  });
+
+  it('does NOT route a pure declarative statement with no verb-action: "100 leads are in the pipeline"', () => {
+    // Numeric collection signal fires but no multi-target verb → no route.
+    const r = detectPreLlmPlanIntent('100 leads are in the pipeline waiting for triage');
+    expect(r.shouldRouteToPlanner).toBe(false);
   });
 });

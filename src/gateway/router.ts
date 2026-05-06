@@ -3057,7 +3057,21 @@ export class Gateway {
 
         const { PlanOrchestrator } = await import('../agent/orchestrator.js');
         const orchestrator = new PlanOrchestrator(this.assistant);
-        const result = await orchestrator.run(taskDescription, onProgress, onApproval, undefined, planAc.signal);
+        // Make hired agents (Ross, Sasha, Nora, etc.) visible to the
+        // planner so it can `delegateTo: <slug>` for steps that match
+        // an agent's specialty. Without this the planner generates
+        // generic steps even when a specialized agent is the right
+        // choice. Empty list = solo Clementine, planner stays generic.
+        const teamAgents = this.getAgentManager()
+          .listAll()
+          .filter(a => a.slug !== 'clementine');
+        const result = await orchestrator.run(
+          taskDescription,
+          onProgress,
+          onApproval,
+          teamAgents.length > 0 ? teamAgents : undefined,
+          planAc.signal,
+        );
 
         scanner.refreshIntegrity();
         this.assistant.injectContext(sessionKey, `[Plan: ${taskDescription}]`, result);
