@@ -9,10 +9,7 @@ import path from 'node:path';
 import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import pino from 'pino';
 import {
-  buildContextThrashRecoveryPrompt,
-  contextThrashRecoveryNotice,
   isAutonomousNothingOutput,
-  looksLikeContextThrashText,
   looksLikeProviderApiErrorResponse,
   oneMillionContextRecoveryMessage,
   PersonalAssistant,
@@ -111,7 +108,7 @@ export function classifyChatError(err: unknown): ChatErrorKind {
   if (isCreditBalanceError(msg)) return 'billing';
   if (/rate.?limit|\b429\b|too many requests|quota.?exceeded/i.test(msg)) return 'rate_limit';
   if (looksLikeClaudeOneMillionContextError(msg)) return 'one_million_context';
-  if (looksLikeContextThrashText(msg) || /context.?length|token.?limit|maximum.?context|prompt.?too.?long/i.test(msg)) return 'context_overflow';
+  if (/context.?length|token.?limit|maximum.?context|prompt.?too.?long|rapid_refill_breaker|autocompact|context.?refilled/i.test(msg)) return 'context_overflow';
   if (/\b401\b|\b403\b|auth|forbidden|invalid.?api.?key|permission|does not have access|please run \/login/i.test(msg)) return 'auth';
   if (/timeout|ECONNRESET|ECONNREFUSED|ETIMEDOUT|\b5\d\d\b|overloaded|service.?unavailable/i.test(msg)) return 'transient';
   return 'unknown';
@@ -1005,71 +1002,6 @@ export class Gateway {
 
     return opts.ack
       ?? `On it — running this in the background. I'll follow up when it's done. Task ${task.id}. Reply "status" to check in or "cancel" to stop.`;
-  }
-
-  private startContextThrashRecovery(
-    sessionKey: string,
-    text: string,
-    priorFailureText: string,
-    details: Record<string, unknown> = {},
-  ): string {
-    const currentSess = this.getSession(sessionKey);
-    const jobName = `recovery-${Date.now()}`;
-    currentSess.deepTask = {
-      jobName,
-      taskDesc: `Recover after context overflow: ${text.slice(0, 160)}`,
-      startedAt: new Date().toISOString(),
-    };
-    const agentSlug = this._agentSlugFromSessionKey(sessionKey);
-
-    this.recordInteractiveFailure(sessionKey, text, priorFailureText, 'context_thrash', {
-      jobName,
-      ...details,
-    });
-
-    this.assistant.runUnleashedTask(
-      jobName,
-      buildContextThrashRecoveryPrompt(text, priorFailureText),
-      2,
-      undefined,
-      undefined,
-      undefined,
-      1,
-      agentSlug,
-    ).then(async (result) => {
-      if (this.sessions.get(sessionKey)?.deepTask?.jobName !== jobName) {
-        logger.info({ sessionKey, jobName }, 'Context-thrash recovery resolved after cancellation/replacement; suppressing follow-up');
-        return;
-      }
-      logger.info({ sessionKey, jobName, resultLen: result?.length ?? 0 }, 'Context-thrash recovery completed');
-      if (result && !isAutonomousNothingOutput(result)) {
-        this.assistant.injectPendingContext(sessionKey, text, result);
-        await this._deliverDeepResult(
-          sessionKey,
-          `[CONTEXT_THRASH_RECOVERY_RESULT] You just completed the smaller recovery pass. Summarize the result conversationally and briefly. Lead with whether the original request is fixed, still blocked, or needs approval.\n\nOriginal request: ${text.slice(0, 500)}\n\nResult:\n${result.slice(0, 3000)}`,
-          result,
-        );
-      }
-    }).catch(async (err) => {
-      if (this.sessions.get(sessionKey)?.deepTask?.jobName !== jobName) {
-        logger.info({ sessionKey, jobName }, 'Context-thrash recovery failed after cancellation/replacement; suppressing failure follow-up');
-        return;
-      }
-      logger.error({ err, sessionKey, jobName }, 'Context-thrash recovery failed');
-      this.recordInteractiveFailure(sessionKey, text, err, 'context_thrash_recovery_failed', { jobName });
-      const failMsg = `Recovery pass failed: ${String(err).slice(0, 200)}`;
-      this.assistant.injectPendingContext(sessionKey, text, failMsg);
-      await this._deliverDeepResult(
-        sessionKey,
-        `[CONTEXT_THRASH_RECOVERY_RESULT] The smaller recovery pass failed: ${failMsg}. Tell the user briefly and suggest checking status/log slices, not full logs.`,
-        failMsg,
-      );
-    }).finally(() => {
-      const s = this.sessions.get(sessionKey);
-      if (s?.deepTask?.jobName === jobName) delete s.deepTask;
-    });
-
-    return `${contextThrashRecoveryNotice()} I restarted it as a smaller background recovery pass and will follow up here.`;
   }
 
   /**
@@ -2423,20 +2355,12 @@ export class Gateway {
         }
 
         try {
-          // ── Phase 2: opt-in canonical SDK chat path ──────────────────
-          // When CLEMENTINE_USE_RUNAGENT_CHAT=1 is set, route through
-          // the new runAgent() wrapper instead of the legacy
-          // assistant.chat path. This is the SDK-canonical pattern
-          // (one query() call, agents map for subagents, no
-          // wrapper layers). Today's Phase 2 connects only the
-          // Clementine MCP server — Composio/external integrations
-          // come in Phase 3. Useful for testing the new path on
-          // tool-light sessions like cron-fix or memory queries.
-          //
-          // The legacy path (default) keeps full Composio/external
-          // routing + all post-response handlers, so this flag is
-          // safe to leave off until we're ready.
-          if (process.env.CLEMENTINE_USE_RUNAGENT_CHAT === '1'
+          // ── Phase 5: canonical SDK chat path is now DEFAULT ──────────
+          // The new runAgent() wrapper is the canonical path. Set
+          // CLEMENTINE_USE_RUNAGENT_CHAT=0 to fall back to legacy.
+          // The legacy path remains as the in-process error fallback
+          // when runAgent throws.
+          if (process.env.CLEMENTINE_USE_RUNAGENT_CHAT !== '0'
               && this.isTrustedPersonalSession(sessionKey)
               && !sessState.pendingInterrupt
           ) {
@@ -2705,14 +2629,6 @@ export class Gateway {
             return "Claude returned a provider API error instead of a normal answer. I've reset this session so the error does not get replayed into future context. Please try that question again.";
           }
 
-          if (response && looksLikeContextThrashText(response)) {
-            logger.warn({ sessionKey, responsePreview: response.slice(0, 200) }, 'Context-thrash text returned from assistant — starting recovery pass');
-            return this.startContextThrashRecovery(sessionKey, text, response, {
-              toolActivityCount,
-              source: 'assistant_response',
-            });
-          }
-
           // ── Auto-plan detection ──────────────────────────────────────
           // If the agent signals a complex task, auto-route to the orchestrator
           const planMatch = response?.match(/^\[PLAN_NEEDED:\s*(.+?)\]\s*/);
@@ -2859,14 +2775,6 @@ export class Gateway {
             return "Stopped. What would you like to do instead?";
           }
 
-          if (looksLikeContextThrashText(err)) {
-            logger.warn({ sessionKey, err: String(err).slice(0, 300) }, 'Context-thrash exception — starting recovery pass');
-            return this.startContextThrashRecovery(sessionKey, text, String(err), {
-              toolActivityCount,
-              source: 'exception',
-            });
-          }
-
           // ── Max turns hit — auto-escalate to deep mode instead of failing silently ──
           // This is the #1 cause of "agent stops responding": it ran out of turns
           // exploring files, the SDK throws, and the user gets nothing.
@@ -2985,11 +2893,11 @@ export class Gateway {
       events.emit('heartbeat:start', { agent, timestamp: Date.now() });
       const hbStart = Date.now();
       try {
-        // ── Phase 4: opt-in canonical SDK heartbeat path ──────────────
-        // CLEMENTINE_USE_RUNAGENT_HEARTBEAT=1 routes through
-        // runAgentHeartbeat (no tools, Haiku, single turn). Default OFF;
-        // falls back to legacy on error.
-        const useRunAgentHeartbeat = process.env.CLEMENTINE_USE_RUNAGENT_HEARTBEAT === '1';
+        // ── Phase 5: canonical SDK heartbeat path is now DEFAULT ──────
+        // runAgentHeartbeat is the canonical path (no tools, Haiku,
+        // single turn). Set CLEMENTINE_USE_RUNAGENT_HEARTBEAT=0 to
+        // fall back to legacy.
+        const useRunAgentHeartbeat = process.env.CLEMENTINE_USE_RUNAGENT_HEARTBEAT !== '0';
         if (useRunAgentHeartbeat) {
           try {
             const { runAgentHeartbeat } = await import('../agent/run-agent-heartbeat.js');
@@ -3066,11 +2974,10 @@ export class Gateway {
       try {
         let response: string;
 
-        // ── Phase 3: opt-in canonical SDK cron path ──────────────────
-        // CLEMENTINE_USE_RUNAGENT_CRON=1 routes the job through
-        // runAgentCron() — the canonical SDK pattern. Default OFF.
-        // Falls back to legacy on error so the job always completes.
-        const useRunAgentCron = process.env.CLEMENTINE_USE_RUNAGENT_CRON === '1';
+        // ── Phase 5: canonical SDK cron path is now DEFAULT ──────────
+        // runAgentCron() is the canonical path. Set
+        // CLEMENTINE_USE_RUNAGENT_CRON=0 to fall back to legacy.
+        const useRunAgentCron = process.env.CLEMENTINE_USE_RUNAGENT_CRON !== '0';
         if (useRunAgentCron && !opts?.disableAllTools) {
           try {
             const { runAgentCron } = await import('../agent/run-agent-cron.js');
@@ -3159,11 +3066,11 @@ export class Gateway {
     try {
       logger.info({ fromSlug, toSlug: profile.slug }, 'Running team message as autonomous task');
 
-      // ── Phase 4: opt-in canonical SDK team-task path ───────────────
-      // CLEMENTINE_USE_RUNAGENT_TEAM=1 routes through runAgentTeamTask
-      // (one runAgent call, SDK owns the loop — no phase wrapper).
-      // Default OFF; falls back to legacy on error.
-      const useRunAgentTeam = process.env.CLEMENTINE_USE_RUNAGENT_TEAM === '1';
+      // ── Phase 5: canonical SDK team-task path is now DEFAULT ───────
+      // runAgentTeamTask is the canonical path (one runAgent call —
+      // SDK owns the inner loop). Set CLEMENTINE_USE_RUNAGENT_TEAM=0
+      // to fall back to legacy.
+      const useRunAgentTeam = process.env.CLEMENTINE_USE_RUNAGENT_TEAM !== '0';
       if (useRunAgentTeam) {
         try {
           const { runAgentTeamTask } = await import('../agent/run-agent-team-task.js');

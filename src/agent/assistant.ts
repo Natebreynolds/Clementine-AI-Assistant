@@ -264,35 +264,6 @@ class UnleashedTaskFailedError extends Error {
   }
 }
 
-export function contextThrashRecoveryNotice(): string {
-  return [
-    'I hit a context-size recovery issue while working on that.',
-    'I saved the request and reset the session so I can continue with smaller reads instead of repeating the same large-output path.',
-  ].join(' ');
-}
-
-export function buildContextThrashRecoveryPrompt(userRequest: string, priorFailureText = ''): string {
-  const parts = [
-    '[CONTEXT-THRASH RECOVERY]',
-    '',
-    'The previous interactive attempt failed because tool output filled the context window and SDK autocompact thrashed. Continue the user request, but use a small diagnostic pass.',
-    '',
-    'User request:',
-    userRequest,
-    '',
-    'Recovery rules:',
-    '- Do not repeat broad reads, full log dumps, full JSON dumps, or unbounded API/list commands.',
-    '- Prefer status files, summaries, indexes, `rg`, `tail -80`, `head -80`, and `sed -n` slices.',
-    '- For cron or unleashed jobs, inspect only `status.json`, the tail of `progress.jsonl`, and the latest run preview first. Do not read full run logs unless a short slice identifies the exact file and range.',
-    '- Preserve the user intent. Identify what failed, what you changed or verified, and the next action.',
-    '- Finish with `TASK_COMPLETE:` followed by a concise user-facing summary.',
-  ];
-  if (priorFailureText.trim()) {
-    parts.push('', 'Prior failure excerpt:', priorFailureText.trim().slice(0, 1200));
-  }
-  return parts.join('\n');
-}
-
 /**
  * Strip lone Unicode surrogates (U+D800–U+DFFF) from a string so it can be
  * safely serialized to JSON. Lone surrogates are valid in JS strings but
@@ -4242,7 +4213,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
               responseText = '';
               continue;
             }
-            responseText = responseText || contextThrashRecoveryNotice();
+            responseText = responseText || 'I hit a context-window issue mid-task. Try again — run `!clear` if it persists.';
           } else if (errStr.includes('prompt is too long') || errStr.includes('prompt too long') || errStr.includes('context_length')) {
             responseText = responseText || (
               'The conversation got too large to process (tool responses filled the context window). ' +
@@ -4286,7 +4257,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
           responseText = '';
           if (contextRecovery) {
             if (contextRecoveryRetries >= 1) {
-              responseText = contextThrashRecoveryNotice();
+              responseText = 'I hit a context-window issue mid-task. Try again — run `!clear` if it persists.';
               staleSession = false;
               contextRecovery = false;
             } else {
@@ -4301,7 +4272,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
           }
         }
         if (staleSession && contextRecovery && !responseText.trim()) {
-          responseText = contextThrashRecoveryNotice();
+          responseText = 'I hit a context-window issue mid-task. Try again — run `!clear` if it persists.';
         }
 
         if (hitRateLimit && attempt < PersonalAssistant.RATE_LIMIT_MAX_RETRIES) {
@@ -4337,7 +4308,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
             responseText = '';
             continue;
           }
-          responseText = contextThrashRecoveryNotice();
+          responseText = 'I hit a context-window issue mid-task. Try again — run `!clear` if it persists.';
         }
 
         if (looksLikeNoResponseRequested(responseText)) {

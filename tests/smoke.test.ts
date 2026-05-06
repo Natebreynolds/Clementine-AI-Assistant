@@ -9,7 +9,6 @@ import { classifyError, CronScheduler } from '../src/gateway/cron-scheduler.js';
 import { classifyChatError, isLiveUnleashedStatus } from '../src/gateway/router.js';
 import { annotateUnleashedStatus, classifyUnleashedRuntimeState } from '../src/gateway/unleashed-status.js';
 import {
-  buildContextThrashRecoveryPrompt,
   estimateTokens,
   isAutonomousNothingOutput,
   looksLikeContextThrashText,
@@ -217,21 +216,12 @@ describe('isLiveUnleashedStatus', () => {
   });
 });
 
-// ── context-thrash recovery helpers ─────────────────────────────────
+// ── context-thrash detection ────────────────────────────────────────
 
-describe('context-thrash recovery helpers', () => {
+describe('context-thrash detection', () => {
   it('recognizes SDK autocompact thrash text', () => {
     expect(looksLikeContextThrashText('Autocompact is thrashing: the context refilled to the limit')).toBe(true);
     expect(looksLikeContextThrashText('regular context summary')).toBe(false);
-  });
-
-  it('builds a recovery prompt that preserves intent and narrows cron diagnostics', () => {
-    const prompt = buildContextThrashRecoveryPrompt('Fix Ross market leader follow up', 'Autocompact is thrashing');
-    expect(prompt).toContain('Fix Ross market leader follow up');
-    expect(prompt).toContain('tail -80');
-    expect(prompt).toContain('status.json');
-    expect(prompt).toContain('progress.jsonl');
-    expect(prompt).toContain('Do not read full run logs');
   });
 });
 
