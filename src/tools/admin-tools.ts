@@ -382,7 +382,7 @@ function writeExtraAllowedTools(tools: string[]): void {
 
 server.tool(
   'allow_tool',
-  'Add a tool name to your self-managed allowedTools list. Use when you see a tool in the SDK inventory but get "not in function schema" when you try to call it. Writes to ~/.clementine/allowed-tools-extra.json; takes effect on your NEXT query. If the tool name isn\'t yet in the cached inventory, this auto-refreshes the probe first — covers the case where the owner just added a new Claude Desktop connector. Owner-DM only.',
+  'Add a tool name to your self-managed allowedTools list. Use when you see a tool in the SDK inventory but get "not in function schema" when you try to call it. Writes to ~/.clementine/allowed-tools-extra.json; takes effect on your NEXT query. If the tool name isn\'t yet in the cached inventory, this auto-refreshes the probe first — covers the case where the owner just added a new claude.ai connector or local MCP server. Owner-DM only.',
   {
     name: z.string().describe('Exact tool name (e.g. "mcp__claude_ai_Google_Drive__search_files")'),
     reason: z.string().optional().describe('Brief note: why you need this tool. For audit trail.'),
@@ -429,7 +429,7 @@ server.tool(
 
 server.tool(
   'refresh_tool_inventory',
-  'Force a fresh probe of the SDK\'s tool inventory, picking up any Claude Desktop connectors the owner has added since the last cache refresh. Owner-DM only. Use this when the owner says "I just added X at claude.ai" or when an expected integration isn\'t showing up. Updates ~/.clementine/.tool-inventory.json and syncs claude-integrations.json. Returns a diff of what changed.',
+  'Force a fresh probe of the SDK\'s tool inventory, picking up any claude.ai connectors, Composio toolkits, or local MCP servers the owner has added since the last cache refresh. Owner-DM only. Use this when the owner says "I just added X at claude.ai" or when an expected integration isn\'t showing up. Updates ~/.clementine/.tool-inventory.json and syncs claude-integrations.json. Returns a diff of what changed.',
   {},
   async () => {
     const gate = requireOwnerDm();

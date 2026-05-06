@@ -640,13 +640,22 @@ async function asyncMain(): Promise<void> {
     // refresh_tool_inventory after intentionally adding connectors.
     const inv = loadToolInventory();
     if (inv) {
-      const integrations = new Set<string>();
+      const claudeAiIntegrations = new Set<string>();
+      let claudeAiToolCount = 0;
       for (const t of inv.tools) {
         const m = t.match(/^mcp__claude_ai_([^_]+(?:_[^_]+)*)__/);
-        if (m) integrations.add(m[1].replace(/_/g, ' '));
+        if (m) {
+          claudeAiIntegrations.add(m[1].replace(/_/g, ' '));
+          claudeAiToolCount++;
+        }
       }
-      if (integrations.size > 0) {
-        logger.info({ integrations: [...integrations].sort(), toolCount: inv.tools.length, probedAt: inv.probedAt }, '🦞 Cached Claude Desktop integrations loaded');
+      if (claudeAiIntegrations.size > 0) {
+        logger.info({
+          claudeAiIntegrations: [...claudeAiIntegrations].sort(),
+          claudeAiToolCount,
+          totalToolInventory: inv.tools.length,
+          probedAt: inv.probedAt,
+        }, '🦞 Cached claude.ai integrations loaded');
       }
       // After inventory is live, fetch canonical schemas from every stdio
       // MCP server we can reach, then synthesize auto-skills for every

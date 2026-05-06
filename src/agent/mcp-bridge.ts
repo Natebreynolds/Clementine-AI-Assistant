@@ -338,10 +338,14 @@ export function getPermissionErrorMessage(serverName: string): string | null {
     `make sure Terminal (or the Node.js process) is allowed.`;
 }
 
-// ── Claude Desktop Integration Tracking ────────────────────────────
-// Claude Desktop has built-in OAuth integrations (Microsoft 365, Google, etc.)
-// that aren't discoverable on disk — they only appear as mcp__claude_ai_*
-// tool names at SDK runtime. We capture them here when seen.
+// ── claude.ai Integration Tracking ──────────────────────────────────
+// claude.ai has built-in OAuth integrations (Microsoft 365, Google, etc.)
+// configured at https://claude.ai/customize/connectors. They aren't
+// discoverable on disk — they only appear as mcp__claude_ai_* tool
+// names at SDK runtime. We capture them here when seen.
+//
+// Note: separate from Claude Desktop (the macOS app), which uses its
+// own claude_desktop_config.json file for MCP server config.
 
 export interface ClaudeIntegration {
   /** Integration name, e.g. "Microsoft_365" */
@@ -373,7 +377,7 @@ const INTEGRATION_LABELS: Record<string, string> = {
 };
 
 /**
- * Check if a tool name is a Claude Desktop integration tool.
+ * Check if a tool name is a claude.ai integration tool.
  * Format: mcp__claude_ai_<IntegrationName>__<tool_name>
  */
 export function isClaudeDesktopTool(toolName: string): boolean {
@@ -410,7 +414,7 @@ function saveClaudeIntegrations(integrations: Record<string, ClaudeIntegration>)
 }
 
 /**
- * Record a Claude Desktop integration tool use.
+ * Record a claude.ai integration tool use.
  * Call this whenever a mcp__claude_ai_* tool is seen in a tool_use block.
  */
 export function recordClaudeIntegrationUse(toolName: string): void {
@@ -441,7 +445,7 @@ export function recordClaudeIntegrationUse(toolName: string): void {
   saveClaudeIntegrations(integrations);
 }
 
-/** Get all discovered Claude Desktop integrations as a list. */
+/** Get all discovered claude.ai integrations as a list. */
 export function getClaudeIntegrations(): ClaudeIntegration[] {
   return Object.values(loadClaudeIntegrations());
 }
@@ -480,8 +484,9 @@ function saveToolInventory(inv: ToolInventory): void {
  * returns every tool Claude Code is actually surfacing — claude_ai_*
  * connectors, plugins, built-ins, custom MCP servers. Cached for 24h.
  * This removes any need to hardcode user-specific tool names in the
- * system prompt; whatever Claude Desktop is currently connecting to the
- * user's account becomes automatically available to the agent.
+ * system prompt; whatever the SDK currently surfaces (claude.ai
+ * connectors, Composio toolkits, local stdio MCP servers) becomes
+ * automatically available to the agent.
  */
 export async function probeAvailableTools(force = false): Promise<ToolInventory> {
   const cached = loadToolInventory();
@@ -549,9 +554,9 @@ export async function probeAvailableTools(force = false): Promise<ToolInventory>
  * Register every integration found in a tool inventory. The SDK's system
  * init message (subtype='init') includes a `tools: string[]` with the full
  * set of tools the agent actually has access to this session — including
- * every mcp__claude_ai_* tool Claude Desktop is surfacing. Walking that
- * list on init gives us the authoritative, up-to-date integration set
- * without waiting for the agent to blindly try each one.
+ * every mcp__claude_ai_* tool the SDK is surfacing from claude.ai
+ * connectors. Walking that list on init gives us the authoritative,
+ * up-to-date integration set without waiting for the agent to blindly try each one.
  *
  * Idempotent: if an entry already exists, we merge new tool names into it
  * and bump `connected = true` without touching firstSeen/lastUsed.
@@ -648,7 +653,7 @@ export function bootstrapClaudeIntegrationsFromAuditLog(auditLogPath: string): v
 
     if (changed) {
       saveClaudeIntegrations(integrations);
-      logger.info({ count: Object.keys(integrations).length }, 'Bootstrapped Claude Desktop integrations from audit log');
+      logger.info({ count: Object.keys(integrations).length }, 'Bootstrapped claude.ai integrations from audit log');
     }
   } catch (err) {
     logger.debug({ err }, 'Failed to bootstrap integrations from audit log');
