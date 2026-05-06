@@ -32,6 +32,7 @@ import { TunnelManager } from './tunnel.js';
 import type { RemoteAccessConfig, SessionRecord, WorkflowDefinition } from '../types.js';
 import { AgentManager } from '../agent/agent-manager.js';
 import { discoverMcpServers, getClaudeIntegrations } from '../agent/mcp-bridge.js';
+import { buildBuilderEnrichedMessage, builderSessionKey } from '../dashboard/builder/prompt.js';
 import {
   AGENTS_DIR,
   SESSIONS_FILE,
@@ -7858,106 +7859,30 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
 
   // ── Builder chat endpoint ──────────────────────────────────────────
 
-  // Track which builder sessions have received the full system prefix
-  const builderSessionInited = new Set<string>();
-
   app.post('/api/builder/chat', async (req, res) => {
     const { message, artifactType, agentSlug, currentArtifact, attachments, linkedTools } = req.body;
     if (!message || typeof message !== 'string') {
       res.status(400).json({ error: 'message is required' });
       return;
     }
-    const type = artifactType || 'skill';
-    const sessionKey = `dashboard:builder:${type}:${agentSlug || 'clementine'}`;
-    const isFirstMessage = !builderSessionInited.has(sessionKey);
-
-    // ── Artifact state (compact JSON — no pretty-print to save tokens) ──
-    const artifactContext = currentArtifact
-      ? `\n[CURRENT ARTIFACT STATE]\n\`\`\`json-artifact\n${JSON.stringify(currentArtifact)}\n\`\`\`\n`
-      : '';
-
-    // ── File attachments — decode base64 text files and inject contents ──
-    let fileContext = '';
-    if (Array.isArray(attachments) && attachments.length > 0) {
-      const fileParts: string[] = [];
-      for (const att of attachments) {
-        if (att.filename && att.content) {
-          try {
-            const decoded = Buffer.from(att.content, 'base64').toString('utf-8');
-            // Cap each file at 4K chars to keep context reasonable
-            const trimmed = decoded.length > 4000 ? decoded.slice(0, 4000) + '\n... (truncated)' : decoded;
-            fileParts.push(`### ${att.filename}\n\`\`\`\n${trimmed}\n\`\`\``);
-          } catch { /* skip binary files */ }
-        }
-      }
-      if (fileParts.length > 0) {
-        fileContext = `\n[REFERENCE FILES — the user attached these for context]\n${fileParts.join('\n\n')}\n`;
-      }
-    }
-
-    // ── Linked tools context ──
-    let toolContext = '';
-    if (Array.isArray(linkedTools) && linkedTools.length > 0) {
-      toolContext = `\n[LINKED TOOLS — this skill should use these tools: ${linkedTools.join(', ')}]\n`;
-    }
-
-    // ── Build the enriched message ──
-    let enrichedMessage: string;
-
-    if (isFirstMessage) {
-      // Full system prefix on first message only
-      const agentContext = agentSlug ? `You are building this for the agent "${agentSlug}". The skill/cron will be scoped to this agent specifically.\n` : '';
-      const builderPrefix = type === 'skill'
-        ? `[BUILDER MODE: You are helping build a reusable skill. ${agentContext}As you develop the procedure, output the current state as a JSON block:\n` +
-          '```json-artifact\n{"type":"skill","title":"...","description":"...","triggers":["..."],"steps":"markdown procedure","toolsUsed":["tool1","tool2"]}\n```\n' +
-          `Update this block in EVERY response as the skill evolves. If the user has linked tools, include them in the toolsUsed array. Ask clarifying questions to refine the procedure. Keep it conversational — one question at a time. ` +
-          `When the user says "save" or approves, output the final artifact block.]\n\n`
-        : type === 'cron'
-        ? `[BUILDER MODE: You are helping build a scheduled cron job. As you develop the job, output the current state as a JSON block:\n` +
-          '```json-artifact\n{"type":"cron","name":"...","schedule":"cron expression","tier":1,"prompt":"the full job prompt","mode":"standard","enabled":true}\n```\n' +
-          `Update this block in EVERY response as the job evolves. Ask about schedule, what it should do, which tools/APIs it needs, what tier (1=read-only, 2=read-write), and whether it should run in unleashed mode.\n` +
-          `IMPORTANT: Cron jobs automatically pull in matching skills (learned procedures) at runtime. If the user describes a workflow that should be reusable, suggest creating it as a skill first, then building the cron job that references those trigger keywords. This way the cron gets smarter over time as skills improve.\n` +
-          `When the user says "save" or approves, output the final artifact block.]\n\n`
-        : type === 'agent'
-        ? `[BUILDER MODE: You are helping create a new AI agent team member. As you develop the agent config, output the current state as a JSON block:\n` +
-          '```json-artifact\n{"type":"agent","name":"...","description":"role description","model":"sonnet","personality":"system prompt / onboarding brief","tools":["tool1","tool2"],"channel":"","tier":2}\n```\n' +
-          `Update this block in EVERY response as the agent evolves. Ask about: the agent's role, what tools it needs, what model to use (haiku/sonnet/opus), its personality/system prompt, which channel it should operate in, and its security tier.\n` +
-          `Help the user think about what makes a good agent: clear role, specific tools, focused personality. Keep it conversational — one question at a time.\n` +
-          `When the user says "save" or approves, output the final artifact block.]\n\n`
-        : type === 'workflow'
-        ? `[BUILDER MODE: You are helping the user DRAFT a "trick" — a (possibly multi-step) thing Clementine can do on a schedule or on demand. You are NOT executing the trick. You are not running anything in the background. You are only authoring a spec the user will save, then run later from the dashboard.\n` +
-          `\n` +
-          `Hard rules:\n` +
-          `  - NEVER say "on it", "running in the background", "I'll follow up", "working on it now", or anything else that implies you're executing the user's request. You are drafting a spec.\n` +
-          `  - Stay strictly conversational. One short question per turn. Update the artifact block on every turn.\n` +
-          `  - If the user describes "real work" (multi-step actions, scrapers, enrichments, reports), still just draft it — don't dispatch.\n` +
-          `\n` +
-          `As you develop the trick, output the current state as a JSON block:\n` +
-          '```json-artifact\n{"type":"workflow","name":"...","description":"...","schedule":"","model":"","steps":"step1:\\n  prompt: ...\\nstep2:\\n  prompt: ...\\n  dependsOn: step1"}\n```\n' +
-          `Ask about (in roughly this order, one at a time):\n` +
-          `  1. The goal (one sentence is fine — confirm it back).\n` +
-          `  2. When it should run — natural language is fine ("every weekday at 9"); convert to a cron expression in the schedule field. Empty schedule = manual.\n` +
-          `  3. Which tools, projects, or channels she'll need (MCP servers, local CLIs like sf/gh/gcloud, Slack/Discord targets).\n` +
-          `  4. Which model — claude-opus-4-7 (most capable), claude-sonnet-4-6 (balanced), or claude-haiku-4-5-20251001 (fastest). Leave model empty if the user doesn't care.\n` +
-          `Most tricks need only one prompt step. Add steps only when the user explicitly wants a multi-step pipeline.\n` +
-          `When the user says "save" or approves, output the final artifact block — don't try to save it yourself, the dashboard handles persistence.]\n\n`
-        : `[BUILDER MODE: You are helping configure an artifact. Output structured JSON blocks as you build.]\n\n`;
-
-      enrichedMessage = builderPrefix + fileContext + toolContext + artifactContext + message;
-      builderSessionInited.add(sessionKey);
-    } else {
-      // Subsequent messages: just artifact state + files + tools + user message (no repeated prefix)
-      enrichedMessage = fileContext + toolContext + artifactContext + message;
-    }
+    const sessionKey = builderSessionKey(artifactType, agentSlug);
 
     try {
       const gateway = await getGateway();
-      // Builder generates JSON artifacts — no tool calls. Pin the session
-      // toolset to 'none' so buildOptions strips all MCP servers and tool
-      // schemas from the system prompt. Without this, every tiny builder
-      // turn writes 60–280 KB of cache_creation for tool schemas the
-      // model never uses.
-      gateway.setSessionToolset(sessionKey, 'none');
+      // First-message detection uses the SDK session ID — set after the
+      // first runAgent turn returns, persisted across daemon restarts.
+      // Anchoring on this means we send the system prefix exactly once
+      // per genuine new conversation, not once per process lifetime.
+      const isFirstMessage = !gateway.assistant.getSdkSessionId(sessionKey);
+      const enrichedMessage = buildBuilderEnrichedMessage({
+        message,
+        artifactType,
+        agentSlug,
+        currentArtifact,
+        attachments,
+        linkedTools,
+        isFirstMessage,
+      });
       const response = await gateway.handleMessage(sessionKey, enrichedMessage);
 
       // Parse any json-artifact blocks from the response
@@ -8008,87 +7933,21 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
     // the response until first body byte).
     writeEvent('progress', { status: 'connecting…' });
 
-    // ── Same enrichment as /api/builder/chat (system prefix on first turn,
-    //    artifact + files + tools on every turn). Inlined to keep the diff
-    //    contained; refactor into a helper if a third endpoint shows up.
-    const type = artifactType || 'skill';
-    const sessionKey = `dashboard:builder:${type}:${agentSlug || 'clementine'}`;
-    const isFirstMessage = !builderSessionInited.has(sessionKey);
-
-    const artifactContext = currentArtifact
-      ? `\n[CURRENT ARTIFACT STATE]\n\`\`\`json-artifact\n${JSON.stringify(currentArtifact)}\n\`\`\`\n`
-      : '';
-
-    let fileContext = '';
-    if (Array.isArray(attachments) && attachments.length > 0) {
-      const fileParts: string[] = [];
-      for (const att of attachments) {
-        if (att.filename && att.content) {
-          try {
-            const decoded = Buffer.from(att.content, 'base64').toString('utf-8');
-            const trimmed = decoded.length > 4000 ? decoded.slice(0, 4000) + '\n... (truncated)' : decoded;
-            fileParts.push(`### ${att.filename}\n\`\`\`\n${trimmed}\n\`\`\``);
-          } catch { /* skip binary files */ }
-        }
-      }
-      if (fileParts.length > 0) {
-        fileContext = `\n[REFERENCE FILES — the user attached these for context]\n${fileParts.join('\n\n')}\n`;
-      }
-    }
-
-    let toolContext = '';
-    if (Array.isArray(linkedTools) && linkedTools.length > 0) {
-      toolContext = `\n[LINKED TOOLS — this skill should use these tools: ${linkedTools.join(', ')}]\n`;
-    }
-
-    let enrichedMessage: string;
-    if (isFirstMessage) {
-      const agentContext = agentSlug ? `You are building this for the agent "${agentSlug}". The skill/cron will be scoped to this agent specifically.\n` : '';
-      const builderPrefix = type === 'skill'
-        ? `[BUILDER MODE: You are helping build a reusable skill. ${agentContext}As you develop the procedure, output the current state as a JSON block:\n` +
-          '```json-artifact\n{"type":"skill","title":"...","description":"...","triggers":["..."],"steps":"markdown procedure","toolsUsed":["tool1","tool2"]}\n```\n' +
-          `Update this block in EVERY response as the skill evolves. If the user has linked tools, include them in the toolsUsed array. Ask clarifying questions to refine the procedure. Keep it conversational — one question at a time. ` +
-          `When the user says "save" or approves, output the final artifact block.]\n\n`
-        : type === 'cron'
-        ? `[BUILDER MODE: You are helping build a scheduled cron job. As you develop the job, output the current state as a JSON block:\n` +
-          '```json-artifact\n{"type":"cron","name":"...","schedule":"cron expression","tier":1,"prompt":"the full job prompt","mode":"standard","enabled":true}\n```\n' +
-          `Update this block in EVERY response as the job evolves. Ask about schedule, what it should do, which tools/APIs it needs, what tier (1=read-only, 2=read-write), and whether it should run in unleashed mode.\n` +
-          `When the user says "save" or approves, output the final artifact block.]\n\n`
-        : type === 'agent'
-        ? `[BUILDER MODE: You are helping create a new AI agent team member. As you develop the agent config, output the current state as a JSON block:\n` +
-          '```json-artifact\n{"type":"agent","name":"...","description":"role description","model":"sonnet","personality":"system prompt / onboarding brief","tools":["tool1","tool2"],"channel":"","tier":2}\n```\n' +
-          `Update this block in EVERY response as the agent evolves. Ask about: the agent's role, what tools it needs, what model to use, its personality/system prompt, which channel it should operate in, and its security tier.\n` +
-          `Keep it conversational — one question at a time. When the user says "save" or approves, output the final artifact block.]\n\n`
-        : type === 'workflow'
-        ? `[BUILDER MODE: You are helping the user DRAFT a "trick" — a (possibly multi-step) thing Clementine can do on a schedule or on demand. You are NOT executing the trick. You are not running anything in the background. You are only authoring a spec the user will save, then run later from the dashboard.\n` +
-          `\n` +
-          `Hard rules:\n` +
-          `  - NEVER say "on it", "running in the background", "I'll follow up", "working on it now", or anything else that implies you're executing the user's request. You are drafting a spec.\n` +
-          `  - Stay strictly conversational. One short question per turn. Update the artifact block on every turn.\n` +
-          `  - If the user describes "real work" (multi-step actions, scrapers, enrichments, reports), still just draft it — don't dispatch.\n` +
-          `\n` +
-          `As you develop the trick, output the current state as a JSON block:\n` +
-          '```json-artifact\n{"type":"workflow","name":"...","description":"...","schedule":"","model":"","steps":"step1:\\n  prompt: ...\\nstep2:\\n  prompt: ...\\n  dependsOn: step1"}\n```\n' +
-          `Ask about (in roughly this order, one at a time):\n` +
-          `  1. The goal (one sentence is fine — confirm it back).\n` +
-          `  2. When it should run — natural language is fine ("every weekday at 9"); convert to a cron expression in the schedule field. Empty schedule = manual.\n` +
-          `  3. Which tools, projects, or channels she'll need (MCP servers, local CLIs like sf/gh/gcloud, Slack/Discord targets).\n` +
-          `  4. Which model — claude-opus-4-7 (most capable), claude-sonnet-4-6 (balanced), or claude-haiku-4-5-20251001 (fastest). Leave model empty if the user doesn't care.\n` +
-          `Most tricks need only one prompt step. Add steps only when the user explicitly wants a multi-step pipeline.\n` +
-          `When the user says "save" or approves, output the final artifact block — don't try to save it yourself, the dashboard handles persistence.]\n\n`
-        : `[BUILDER MODE: You are helping configure an artifact. Output structured JSON blocks as you build.]\n\n`;
-      enrichedMessage = builderPrefix + fileContext + toolContext + artifactContext + message;
-      builderSessionInited.add(sessionKey);
-    } else {
-      enrichedMessage = fileContext + toolContext + artifactContext + message;
-    }
+    const sessionKey = builderSessionKey(artifactType, agentSlug);
 
     try {
       writeEvent('progress', { status: 'thinking…' });
       const gateway = await getGateway();
-      // Builder generates JSON artifacts — no tool calls. Pin to 'none'
-      // toolset so the SDK system prompt drops the tool inventory.
-      gateway.setSessionToolset(sessionKey, 'none');
+      const isFirstMessage = !gateway.assistant.getSdkSessionId(sessionKey);
+      const enrichedMessage = buildBuilderEnrichedMessage({
+        message,
+        artifactType,
+        agentSlug,
+        currentArtifact,
+        attachments,
+        linkedTools,
+        isFirstMessage,
+      });
       let lastText = '';
       const response = await gateway.handleMessage(
         sessionKey,
@@ -8126,11 +7985,14 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
   });
 
   // Reset builder session when user clicks "New"
-  app.post('/api/builder/reset', (_req, res) => {
+  app.post('/api/builder/reset', async (_req, res) => {
     const { artifactType, agentSlug } = _req.body;
-    const type = artifactType || 'skill';
-    const sessionKey = `dashboard:builder:${type}:${agentSlug || 'clementine'}`;
-    builderSessionInited.delete(sessionKey);
+    const sessionKey = builderSessionKey(artifactType, agentSlug);
+    // Clearing the SDK session ID is what makes the next turn detect
+    // as "first" and re-emit the system prefix. The per-process Set
+    // has been replaced by the persisted SDK session map.
+    const gateway = await getGateway();
+    gateway.assistant.clearSession(sessionKey);
     res.json({ ok: true });
   });
 
