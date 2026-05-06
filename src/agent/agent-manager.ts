@@ -264,6 +264,18 @@ export class AgentManager {
       budgetMonthlyCents: meta.budgetMonthlyCents ? Number(meta.budgetMonthlyCents) : undefined,
       strictMemoryIsolation: meta.strictMemoryIsolation === false ? false : true, // default true for all agents
       activeHours,
+      // SDK auto-routing: short imperative capability hints + role label.
+      // Used by buildHiredAgentDescription in agent-definitions.ts so the
+      // SDK has actual data to match against user prompts.
+      role: meta.role ? String(meta.role) : undefined,
+      routingHints: Array.isArray(meta.routingHints)
+        ? meta.routingHints.map(String).filter(Boolean)
+        : typeof meta.routingHints === 'string'
+          ? meta.routingHints.split(',').map((s: string) => s.trim()).filter(Boolean)
+          : undefined,
+      effort: ['low', 'medium', 'high', 'xhigh', 'max'].includes(meta.effort)
+        ? meta.effort as AgentProfile['effort']
+        : undefined,
     };
   }
 

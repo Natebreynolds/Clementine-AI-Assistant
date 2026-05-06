@@ -2023,8 +2023,12 @@ export class Gateway {
           // Salesforce, etc) so chat can reach the same tools the
           // legacy chat path did. Profile allowlists override the
           // bundle router when set.
+          //
+          // Use originalText (not chatPrompt) for scope routing —
+          // chatPrompt may have the partial-interrupt banner folded in,
+          // which would skew bundle matching.
           const chatMcp = await buildExtraMcpForRunAgent({
-            scopeText: chatPrompt,
+            scopeText: originalText,
             profile: resolvedProfile,
           });
 
