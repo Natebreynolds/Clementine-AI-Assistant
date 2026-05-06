@@ -117,6 +117,8 @@ export class HeartbeatScheduler {
   private runLog = new CronRunLog();
   private lastDenseBackfillAt = 0;
   private denseBackfillInFlight = false;
+  private lastTranscriptDenseBackfillAt = 0;
+  private transcriptDenseBackfillInFlight = false;
   private lastSalienceDecayDate = '';
   private lastMemoryPulseDate = '';
   private lastEpisodicConsolidationAt = 0;
@@ -231,6 +233,15 @@ export class HeartbeatScheduler {
     // would compete with response latency) or already on cooldown.
     this.maybeIdleDenseBackfill().catch(err => {
       logger.debug({ err }, 'Idle dense backfill failed (non-fatal)');
+    });
+
+    // Transcript dense backfill — separate cadence from chunks. Transcript
+    // turns from chat/cron/heartbeat/team-task accumulate continuously
+    // and need their own dense vectors so the recall block's dense leg
+    // returns hits for them too. Without this, hybrid recall silently
+    // degrades to lexical-only for transcripts.
+    this.maybeIdleTranscriptDenseBackfill().catch(err => {
+      logger.debug({ err }, 'Idle transcript dense backfill failed (non-fatal)');
     });
 
     // Daily salience decay — fades stale, unaccessed chunks so retrieval
@@ -987,6 +998,51 @@ export class HeartbeatScheduler {
       }
     } finally {
       this.denseBackfillInFlight = false;
+    }
+  }
+
+  /**
+   * Sibling of maybeIdleDenseBackfill that targets the transcripts table.
+   * Same gates (cooldown + chat-lane idle + dense model ready), separate
+   * in-flight + cadence so the two backfills don't starve each other.
+   * Without this, new chat/cron/heartbeat turns get FTS5-indexed but
+   * never embedded, and the dense leg of recall silently returns 0 hits.
+   */
+  private async maybeIdleTranscriptDenseBackfill(): Promise<void> {
+    if (this.transcriptDenseBackfillInFlight) return;
+    const sinceLastMs = Date.now() - this.lastTranscriptDenseBackfillAt;
+    if (sinceLastMs < 10 * 60 * 1000) return;
+
+    const { lanes } = await import('./lanes.js');
+    if (lanes.status().chat.active > 0) return;
+
+    const store = this.gateway.getMemoryStore();
+    if (!store) return;
+
+    type StoreWithTranscriptBackfill = typeof store & {
+      backfillTranscriptDenseEmbeddings?: (o: { limit: number }) => Promise<{ embedded: number; failed: number; model: string }>;
+    };
+    const s = store as StoreWithTranscriptBackfill;
+    if (typeof s.backfillTranscriptDenseEmbeddings !== 'function') return;
+
+    const embeddings = await import('../memory/embeddings.js');
+    if (!embeddings.isDenseReady()) {
+      embeddings.probeDenseReady().catch(() => { /* logged inside */ });
+      return;
+    }
+
+    this.transcriptDenseBackfillInFlight = true;
+    this.lastTranscriptDenseBackfillAt = Date.now();
+    try {
+      const result = await s.backfillTranscriptDenseEmbeddings!({ limit: 50 });
+      if (result.embedded > 0) {
+        logger.info(
+          { embedded: result.embedded, failed: result.failed, model: result.model },
+          'Idle transcript dense backfill batch complete',
+        );
+      }
+    } finally {
+      this.transcriptDenseBackfillInFlight = false;
     }
   }
 

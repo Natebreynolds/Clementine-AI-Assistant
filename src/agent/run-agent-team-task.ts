@@ -24,6 +24,18 @@ import { buildAutonomousMemoryContext } from './run-agent-context.js';
 
 const logger = pino({ name: 'clementine.run-agent-team-task' });
 
+/** Minimal post-task hook interface. The PersonalAssistant implements
+ *  this directly; passing it through keeps the wrapper decoupled from
+ *  the full assistant graph. */
+export interface TeamTaskPostHooks {
+  triggerMemoryExtractionPostExchange: (
+    userMessage: string,
+    assistantResponse: string,
+    sessionKey?: string,
+    profile?: AgentProfile,
+  ) => Promise<void>;
+}
+
 export interface RunAgentTeamTaskOptions {
   fromName: string;
   fromSlug: string;
@@ -39,6 +51,9 @@ export interface RunAgentTeamTaskOptions {
   maxBudgetUsd?: number;
   /** Optional max-turns cap. Default: undefined (SDK runs until done, bounded by budget). */
   maxTurns?: number;
+  /** Post-task hooks (memory extraction). Pass the PersonalAssistant.
+   *  Optional so the helper still works in tests. */
+  postTaskHooks?: TeamTaskPostHooks | null;
 }
 
 export interface RunAgentTeamTaskResult extends RunAgentResult {
@@ -115,6 +130,16 @@ export async function runAgentTeamTask(opts: RunAgentTeamTaskOptions): Promise<R
     } catch {
       /* non-fatal */
     }
+  }
+
+  // Auto-memory extraction — distill any new facts the recipient
+  // learned during the task into their MEMORY.md. Fire-and-forget,
+  // scoped to the recipient's profile so writes route to
+  // agents/<slug>/MEMORY.md, not the global one.
+  if (opts.postTaskHooks && result.text?.trim()) {
+    opts.postTaskHooks
+      .triggerMemoryExtractionPostExchange(opts.content, result.text, sessionKey, opts.profile)
+      .catch(err => logger.debug({ err, fromSlug: opts.fromSlug, toSlug: opts.profile.slug }, 'runAgentTeamTask: memory extraction failed (non-fatal)'));
   }
 
   return {

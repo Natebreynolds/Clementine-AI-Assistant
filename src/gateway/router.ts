@@ -2337,6 +2337,10 @@ export class Gateway {
         agentManager: this.getAgentManager(),
         memoryStore: this.assistant.getMemoryStore?.() ?? null,
         abortSignal: abortController?.signal,
+        // Post-task auto-memory extraction so anything the recipient
+        // learned during the task (new contact, preference, status)
+        // distills into their agents/<slug>/MEMORY.md.
+        postTaskHooks: this.assistant,
       });
       scanner.refreshIntegrity();
       logger.info({

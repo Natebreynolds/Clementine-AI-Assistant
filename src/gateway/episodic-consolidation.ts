@@ -16,9 +16,10 @@
  */
 import { createHash } from 'node:crypto';
 import Anthropic from '@anthropic-ai/sdk';
+import { query, type SDKAssistantMessage } from '@anthropic-ai/claude-agent-sdk';
 import pino from 'pino';
 
-import { MODELS } from '../config.js';
+import { MODELS, BASE_DIR, CLAUDE_CODE_OAUTH_TOKEN, ANTHROPIC_API_KEY } from '../config.js';
 import type { MemoryStore } from '../memory/store.js';
 import {
   fingerprintCommitment,
@@ -200,9 +201,65 @@ export function fingerprintLearnedFact(kind: string, text: string): string {
 
 function getAnthropicClient(opts: EpisodicConsolidationOptions): Pick<Anthropic, 'messages'> | null {
   if (opts.anthropicClient) return opts.anthropicClient;
-  const apiKey = process.env.ANTHROPIC_API_KEY;
+  const apiKey = process.env.ANTHROPIC_API_KEY ?? ANTHROPIC_API_KEY;
   if (!apiKey) return null;
   return new Anthropic({ apiKey });
+}
+
+/**
+ * One-shot LLM call via the SDK's `query()`. OAuth-aware (uses
+ * CLAUDE_CODE_OAUTH_TOKEN when no API key is set), so works on
+ * installs that haven't configured ANTHROPIC_API_KEY. Returns the
+ * concatenated assistant text — empty string on failure.
+ *
+ * Used as a fallback when no Anthropic SDK client is available
+ * (i.e. the prior path returned null and the entire consolidation
+ * pass silently no-op'd).
+ */
+async function runConsolidationViaSdk(
+  systemPrompt: string,
+  userPrompt: string,
+  model: string,
+): Promise<string> {
+  const env: Record<string, string> = {
+    PATH: process.env.PATH ?? '',
+    HOME: process.env.HOME ?? '',
+    CLEMENTINE_HOME: BASE_DIR,
+  };
+  const oauth = CLAUDE_CODE_OAUTH_TOKEN || process.env.CLAUDE_CODE_OAUTH_TOKEN;
+  const apiKey = ANTHROPIC_API_KEY || process.env.ANTHROPIC_API_KEY;
+  if (oauth) env.CLAUDE_CODE_OAUTH_TOKEN = oauth;
+  else if (apiKey) env.ANTHROPIC_API_KEY = apiKey;
+
+  let text = '';
+  try {
+    const stream = query({
+      prompt: userPrompt,
+      options: {
+        systemPrompt,
+        model,
+        permissionMode: 'bypassPermissions',
+        allowDangerouslySkipPermissions: true,
+        allowedTools: [],
+        cwd: BASE_DIR,
+        env,
+        maxTurns: 1,
+        maxBudgetUsd: 0.10,
+      },
+    });
+    for await (const message of stream) {
+      if (message.type === 'assistant') {
+        const blocks = ((message as SDKAssistantMessage).message?.content ?? []) as Array<{ type: string; text?: string }>;
+        for (const block of blocks) {
+          if (block.type === 'text' && typeof block.text === 'string') text += block.text;
+        }
+      }
+    }
+  } catch (err) {
+    logger.warn({ err }, 'SDK consolidation call failed');
+    return '';
+  }
+  return text;
 }
 
 /**
@@ -223,10 +280,10 @@ export async function consolidateOneSession(
   if (turns.length === 0) return null;
 
   const client = getAnthropicClient(opts);
-  if (!client) {
-    logger.debug({ sessionKey: candidate.sessionKey }, 'No Anthropic client available — skipping consolidation');
-    return null;
-  }
+  // No client means no API key. We still try via the SDK's query()
+  // which uses OAuth when available — that's the canonical path for
+  // installs that haven't configured ANTHROPIC_API_KEY. Tests that
+  // pass an explicit anthropicClient will still hit the direct path.
 
   // Pull a small snapshot of existing learned facts so the LLM can
   // detect contradictions and emit supersedes hints. Best-effort —
@@ -240,21 +297,30 @@ export async function consolidateOneSession(
     }
   } catch { /* fact snapshot is best-effort */ }
 
+  const userPrompt = buildUserPrompt(
+    turns.map(t => ({ role: t.role, content: t.content, createdAt: t.createdAt })),
+    existingFactsForPrompt,
+  );
+  const model = opts.model ?? MODELS.haiku;
   let extraction: EpisodeExtraction | null = null;
   try {
-    const response = await client.messages.create({
-      model: opts.model ?? MODELS.haiku,
-      max_tokens: 1500,
-      system: SYSTEM_PROMPT,
-      messages: [{
-        role: 'user',
-        content: buildUserPrompt(
-          turns.map(t => ({ role: t.role, content: t.content, createdAt: t.createdAt })),
-          existingFactsForPrompt,
-        ),
-      }],
-    });
-    const text = (response.content ?? []).map((b: { type: string; text?: string }) => b.type === 'text' ? (b.text ?? '') : '').join('');
+    let text = '';
+    if (client) {
+      const response = await client.messages.create({
+        model,
+        max_tokens: 1500,
+        system: SYSTEM_PROMPT,
+        messages: [{ role: 'user', content: userPrompt }],
+      });
+      text = (response.content ?? []).map((b: { type: string; text?: string }) => b.type === 'text' ? (b.text ?? '') : '').join('');
+    } else {
+      // No API client — fall through to the SDK (OAuth-aware).
+      text = await runConsolidationViaSdk(SYSTEM_PROMPT, userPrompt, model);
+    }
+    if (!text) {
+      logger.debug({ sessionKey: candidate.sessionKey }, 'Empty consolidation response — skipping');
+      return null;
+    }
     extraction = parseEpisodeJson(text);
   } catch (err) {
     logger.warn({ err, sessionKey: candidate.sessionKey }, 'Episode LLM call failed');

@@ -241,6 +241,12 @@ export interface CronPostTaskHooks {
     durationMs: number,
     agentSlug?: string,
   ) => Promise<void>;
+  triggerMemoryExtractionPostExchange: (
+    userMessage: string,
+    assistantResponse: string,
+    sessionKey?: string,
+    profile?: AgentProfile,
+  ) => Promise<void>;
 }
 
 export interface RunAgentCronOptions {
@@ -392,11 +398,13 @@ export async function runAgentCron(opts: RunAgentCronOptions): Promise<RunAgentC
     }
   }
 
-  // ── Post-task hooks: reflection + skill extraction ────────────────
-  // Both fire-and-forget — never block the cron deliverable on these.
-  // They are the same passes the legacy runCronJob fires; without them
-  // the new path would lose the success-grading + procedural-memory
-  // growth that makes Clementine self-improving.
+  // ── Post-task hooks: reflection + skill extraction + memory ──────
+  // All fire-and-forget — never block the cron deliverable on these.
+  // Reflection grades the run, skill extraction banks repeatable
+  // procedures, memory extraction distills facts the agent learned
+  // (e.g. "Mark Finizio is now the buyer at FamilyCenter") into the
+  // agent's MEMORY.md. The legacy runCronJob fired reflection +
+  // skill but never memory extraction; that gap is closed now.
   if (opts.postTaskHooks && deliverable && deliverable.trim() !== '__NOTHING__') {
     const durationMs = Date.now() - startedAt;
     opts.postTaskHooks
@@ -405,6 +413,14 @@ export async function runAgentCron(opts: RunAgentCronOptions): Promise<RunAgentC
     opts.postTaskHooks
       .triggerSkillExtractionFromExecution('cron', opts.jobName, opts.jobPrompt, deliverable, durationMs, agentSlug)
       .catch(err => logger.debug({ err, job: opts.jobName }, 'runAgentCron: skill extraction failed (non-fatal)'));
+    opts.postTaskHooks
+      .triggerMemoryExtractionPostExchange(
+        opts.jobPrompt,
+        deliverable,
+        `cron:${opts.jobName}`,
+        opts.profile ?? undefined,
+      )
+      .catch(err => logger.debug({ err, job: opts.jobName }, 'runAgentCron: memory extraction failed (non-fatal)'));
   }
 
   return {
