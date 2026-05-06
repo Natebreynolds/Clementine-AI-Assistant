@@ -5314,6 +5314,37 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
     return this.spawnMemoryExtraction(userMessage, assistantResponse, sessionKey, profile);
   }
 
+  /**
+   * Public entry point for the post-cron quality reflection. Used by
+   * the new runAgentCron path (Phase 4) to keep the existing Haiku
+   * verification pass + cron-progress bridge without duplicating it.
+   * Always best-effort — failures are swallowed to never block.
+   */
+  async triggerCronReflection(
+    jobName: string,
+    jobPrompt: string,
+    deliverable: string,
+    successCriteria?: string[],
+  ): Promise<void> {
+    return this.runCronReflection(jobName, jobPrompt, deliverable, successCriteria);
+  }
+
+  /**
+   * Public entry point for procedural-memory skill extraction after a
+   * successful execution. Used by the new runAgentCron path (Phase 4)
+   * so the new code path keeps growing the skills library.
+   */
+  async triggerSkillExtractionFromExecution(
+    source: 'unleashed' | 'cron' | 'chat',
+    jobName: string,
+    prompt: string,
+    output: string,
+    durationMs: number,
+    agentSlug?: string,
+  ): Promise<void> {
+    return this.extractSkillFromExecution(source, jobName, prompt, output, durationMs, agentSlug);
+  }
+
   private async spawnMemoryExtraction(
     userMessage: string,
     assistantResponse: string,

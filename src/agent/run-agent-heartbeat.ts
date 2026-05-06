@@ -1,0 +1,113 @@
+/**
+ * Clementine TypeScript — runAgent heartbeat wrapper.
+ *
+ * Phase 4 of the SDK-canonical migration (see
+ * /Users/nathan.reynolds/.claude/plans/sdk-canonical-migration.md).
+ *
+ * Heartbeats are tool-free decision-makers. They look at standing
+ * instructions, what changed, and the time of day, and decide whether
+ * there's anything worth flagging to the owner. Output is plain text;
+ * no MCP servers, no Composio toolkits, no subagents.
+ *
+ * Mirrors the legacy assistant.heartbeat() prompt shape exactly so the
+ * voice/dedup behavior stays identical, but routes the actual LLM call
+ * through the canonical runAgent() instead of buildOptions+query.
+ */
+import pino from 'pino';
+import {
+  OWNER_NAME,
+  MODELS,
+} from '../config.js';
+
+const OWNER = OWNER_NAME || 'the user';
+
+function formatDate(d: Date): string {
+  return d.toLocaleDateString('en-US', {
+    weekday: 'long', year: 'numeric', month: 'long', day: 'numeric',
+  });
+}
+
+function formatTime(d: Date): string {
+  return d.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true });
+}
+import type { AgentProfile } from '../types.js';
+import type { MemoryStore } from '../memory/store.js';
+import { runAgent, type RunAgentResult } from './run-agent.js';
+
+const logger = pino({ name: 'clementine.run-agent-heartbeat' });
+
+export interface RunAgentHeartbeatOptions {
+  standingInstructions: string;
+  changesSummary?: string;
+  timeContext?: string;
+  dedupContext?: string;
+  profile?: AgentProfile | null;
+  memoryStore?: MemoryStore | null;
+  abortSignal?: AbortSignal;
+  /** Optional model override — defaults to Haiku (cheapest, fastest). */
+  model?: string;
+  /** Optional budget override — defaults to $0.15 (heartbeats are 1 turn). */
+  maxBudgetUsd?: number;
+}
+
+/**
+ * Run a heartbeat decision via the canonical SDK runAgent path.
+ *
+ * No tools. No MCP. Single turn. The agent looks at the context
+ * blocks, decides, emits text, returns.
+ */
+export async function runAgentHeartbeat(opts: RunAgentHeartbeatOptions): Promise<RunAgentResult> {
+  const now = new Date();
+  const localTime = formatTime(now);
+  const localDate = formatDate(now);
+  const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+  const owner = OWNER;
+  const agentName = opts.profile?.name ?? 'personal assistant';
+
+  const promptParts: string[] = [
+    `[Heartbeat — ${localTime}, ${localDate} (${tz})]`,
+    `You're ${agentName}, casually checking in with ${owner}. Talk like a teammate — not a system.`,
+    `Do NOT call any tools. Everything you need is in the context below. ` +
+    `If you notice something that would need a tool to investigate or act on, just mention it conversationally and ask ${owner} if he wants you to look into it.`,
+  ];
+  if (opts.dedupContext) {
+    promptParts.push(`\n${opts.dedupContext}\n\nIf all of the above are unchanged, respond with exactly: __NOTHING__`);
+  }
+  if (opts.timeContext) {
+    promptParts.push(`\nTime of day: ${opts.timeContext}`);
+  }
+  if (opts.changesSummary) {
+    promptParts.push(`\nWhat's new:\n${opts.changesSummary}`);
+  }
+  promptParts.push(
+    `\nIf nothing changed, respond with exactly: __NOTHING__\n` +
+    `Otherwise, keep it casual and brief (1-3 sentences). No bullet lists, no formal reports, no repeating info from previous check-ins. ` +
+    `Only mention what's genuinely new or worth flagging. Be a person, not a dashboard. ` +
+    `Tag topics with [topic: key] for dedup tracking.\n\n` +
+    `Standing instructions:\n${opts.standingInstructions}`,
+  );
+
+  const prompt = promptParts.join('\n');
+
+  logger.info({
+    agentName,
+    profile: opts.profile?.slug,
+    promptChars: prompt.length,
+  }, 'runAgentHeartbeat: dispatching to runAgent (no tools)');
+
+  return runAgent(prompt, {
+    sessionKey: `heartbeat:${opts.profile?.slug ?? 'clementine'}`,
+    source: 'heartbeat',
+    profile: opts.profile,
+    memoryStore: opts.memoryStore,
+    model: opts.model ?? MODELS.haiku,
+    effort: 'low',
+    maxBudgetUsd: opts.maxBudgetUsd ?? 0.15,
+    maxTurns: 1,
+    // No tools — heartbeats are decision-only. Empty list bypasses the
+    // CORE_TOOLS_FOR_AGENT_PARENT default and stops the SDK from
+    // exposing any tool schemas, keeping the prompt small.
+    allowedTools: [],
+    abortSignal: opts.abortSignal,
+  });
+}

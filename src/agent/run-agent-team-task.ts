@@ -1,0 +1,105 @@
+/**
+ * Clementine TypeScript — runAgent team-task wrapper.
+ *
+ * Phase 4 of the SDK-canonical migration (see
+ * /Users/nathan.reynolds/.claude/plans/sdk-canonical-migration.md).
+ *
+ * A "team task" is one hired agent (or Clementine herself) sending a
+ * direct message to another agent. The recipient processes it
+ * autonomously — same toolset as cron, plus Composio + external MCP.
+ *
+ * Legacy `assistant.runTeamTask` ran a 10-phase loop with deadlines,
+ * stall guards, manual session resume, and a "recovery" phase. The
+ * canonical pattern is one runAgent call with a generous budget — the
+ * SDK owns the inner loop, compaction, and retry. Phases were a
+ * pre-SDK workaround; we don't need them anymore.
+ */
+import pino from 'pino';
+import type { AgentProfile } from '../types.js';
+import type { AgentManager } from './agent-manager.js';
+import type { MemoryStore } from '../memory/store.js';
+import { runAgent, type RunAgentResult } from './run-agent.js';
+import { buildExtraMcpForRunAgent } from './run-agent-mcp.js';
+
+const logger = pino({ name: 'clementine.run-agent-team-task' });
+
+export interface RunAgentTeamTaskOptions {
+  fromName: string;
+  fromSlug: string;
+  content: string;
+  profile: AgentProfile;
+  agentManager?: AgentManager | null;
+  memoryStore?: MemoryStore | null;
+  abortSignal?: AbortSignal;
+  /** Optional model override. Default: SDK default (Sonnet). */
+  model?: string;
+  /** Optional max-budget override. Default: $1.50 (more than cron because team tasks are
+   *  often ad-hoc and may need more research/tool calls). */
+  maxBudgetUsd?: number;
+  /** Optional max-turns cap. Default: undefined (SDK runs until done, bounded by budget). */
+  maxTurns?: number;
+}
+
+export interface RunAgentTeamTaskResult extends RunAgentResult {
+  builtPrompt: string;
+  composioConnected: string[];
+  externalConnected: string[];
+}
+
+export async function runAgentTeamTask(opts: RunAgentTeamTaskOptions): Promise<RunAgentTeamTaskResult> {
+  const taskName = `team-msg:${opts.fromSlug}-to-${opts.profile.slug}`;
+  const now = new Date();
+  const timestamp = now.toISOString().slice(0, 16).replace('T', ' ');
+
+  // Match the legacy phase-1 prompt shape so existing agent training
+  // (Sasha/Ross/Nora) keeps responding the same way. Phases 2+ are no
+  // longer needed — the SDK keeps the conversation in one session.
+  const builtPrompt =
+    `[TEAM MESSAGE from ${opts.fromName} (${opts.fromSlug}) — ${timestamp}]\n\n` +
+    `You received a direct message from a teammate. Process it fully and autonomously.\n\n` +
+    `MESSAGE:\n${opts.content}\n\n` +
+    `IMPORTANT:\n` +
+    `- Complete the full task described in the message\n` +
+    `- Use all tools available to you — Salesforce, DataForSEO, Discord, etc.\n` +
+    `- Post results to Discord channels as instructed\n` +
+    `- When finished, output "TASK_COMPLETE:" followed by a brief summary of what you did`;
+
+  const mcp = await buildExtraMcpForRunAgent({
+    scopeText: [taskName, opts.content, opts.profile.description, opts.profile.systemPromptBody]
+      .filter(Boolean)
+      .join('\n\n'),
+    profile: opts.profile,
+  });
+
+  logger.info({
+    taskName,
+    fromSlug: opts.fromSlug,
+    toSlug: opts.profile.slug,
+    composioConnected: mcp.composioConnected,
+    externalConnected: mcp.externalConnected,
+    droppedClaudeAi: mcp.droppedClaudeAi,
+    droppedComposio: mcp.droppedComposio,
+    promptChars: builtPrompt.length,
+  }, 'runAgentTeamTask: dispatching to runAgent');
+
+  const result = await runAgent(builtPrompt, {
+    sessionKey: `team-task:${opts.fromSlug}->${opts.profile.slug}`,
+    source: 'team-task',
+    profile: opts.profile,
+    agentManager: opts.agentManager,
+    memoryStore: opts.memoryStore,
+    model: opts.model,
+    effort: 'medium',
+    maxBudgetUsd: opts.maxBudgetUsd ?? 1.50,
+    maxTurns: opts.maxTurns,
+    abortSignal: opts.abortSignal,
+    extraMcpServers: mcp.servers as unknown as Parameters<typeof runAgent>[1]['extraMcpServers'],
+  });
+
+  return {
+    ...result,
+    builtPrompt,
+    composioConnected: mcp.composioConnected,
+    externalConnected: mcp.externalConnected,
+  };
+}

@@ -222,6 +222,27 @@ async function buildSkillContext(
   }
 }
 
+/** Minimal interface for the post-task reflection + skill extraction
+ *  hooks. Lets `runAgentCron` stay decoupled from the full
+ *  PersonalAssistant import while still benefiting from the existing
+ *  procedures. */
+export interface CronPostTaskHooks {
+  triggerCronReflection: (
+    jobName: string,
+    jobPrompt: string,
+    deliverable: string,
+    successCriteria?: string[],
+  ) => Promise<void>;
+  triggerSkillExtractionFromExecution: (
+    source: 'unleashed' | 'cron' | 'chat',
+    jobName: string,
+    prompt: string,
+    output: string,
+    durationMs: number,
+    agentSlug?: string,
+  ) => Promise<void>;
+}
+
 export interface RunAgentCronOptions {
   /** Job name from CRON.md. Used for telemetry, progress lookup, skill match. */
   jobName: string;
@@ -247,6 +268,10 @@ export interface RunAgentCronOptions {
   workDir?: string;
   /** Abort signal for cancellation. */
   abortSignal?: AbortSignal;
+  /** Post-task hooks (reflection + skill extraction). Pass the
+   *  PersonalAssistant — it implements both members. Optional so the
+   *  helper still works in tests without the full assistant graph. */
+  postTaskHooks?: CronPostTaskHooks | null;
 }
 
 export interface RunAgentCronResult extends RunAgentResult {
@@ -343,6 +368,7 @@ export async function runAgentCron(opts: RunAgentCronOptions): Promise<RunAgentC
     promptChars: builtPrompt.length,
   }, 'runAgentCron: dispatching to runAgent');
 
+  const startedAt = Date.now();
   const result = await runAgent(builtPrompt, {
     sessionKey: `cron:${opts.jobName}`,
     source: 'cron',
@@ -356,6 +382,22 @@ export async function runAgentCron(opts: RunAgentCronOptions): Promise<RunAgentC
     abortSignal: opts.abortSignal,
     extraMcpServers: mcp.servers as unknown as Parameters<typeof runAgent>[1]['extraMcpServers'],
   });
+
+  // ── Post-task hooks: reflection + skill extraction ────────────────
+  // Both fire-and-forget — never block the cron deliverable on these.
+  // They are the same passes the legacy runCronJob fires; without them
+  // the new path would lose the success-grading + procedural-memory
+  // growth that makes Clementine self-improving.
+  const deliverable = result.text ?? '';
+  if (opts.postTaskHooks && deliverable && deliverable.trim() !== '__NOTHING__') {
+    const durationMs = Date.now() - startedAt;
+    opts.postTaskHooks
+      .triggerCronReflection(opts.jobName, opts.jobPrompt, deliverable, opts.successCriteria)
+      .catch(err => logger.debug({ err, job: opts.jobName }, 'runAgentCron: reflection failed (non-fatal)'));
+    opts.postTaskHooks
+      .triggerSkillExtractionFromExecution('cron', opts.jobName, opts.jobPrompt, deliverable, durationMs, agentSlug)
+      .catch(err => logger.debug({ err, job: opts.jobName }, 'runAgentCron: skill extraction failed (non-fatal)'));
+  }
 
   return {
     ...result,

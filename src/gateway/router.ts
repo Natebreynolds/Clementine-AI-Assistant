@@ -2985,6 +2985,42 @@ export class Gateway {
       events.emit('heartbeat:start', { agent, timestamp: Date.now() });
       const hbStart = Date.now();
       try {
+        // ── Phase 4: opt-in canonical SDK heartbeat path ──────────────
+        // CLEMENTINE_USE_RUNAGENT_HEARTBEAT=1 routes through
+        // runAgentHeartbeat (no tools, Haiku, single turn). Default OFF;
+        // falls back to legacy on error.
+        const useRunAgentHeartbeat = process.env.CLEMENTINE_USE_RUNAGENT_HEARTBEAT === '1';
+        if (useRunAgentHeartbeat) {
+          try {
+            const { runAgentHeartbeat } = await import('../agent/run-agent-heartbeat.js');
+            logger.info({ agent, path: 'runagent_heartbeat' }, 'Phase 4: routing heartbeat through runAgentHeartbeat');
+            const result = await runAgentHeartbeat({
+              standingInstructions,
+              changesSummary,
+              timeContext,
+              dedupContext,
+              profile,
+              memoryStore: this.assistant.getMemoryStore?.() ?? null,
+            });
+            scanner.refreshIntegrity();
+            events.emit('heartbeat:complete', {
+              agent,
+              durationMs: Date.now() - hbStart,
+              responseLength: result.text?.length ?? 0,
+            });
+            logger.info({
+              agent,
+              cost: Number(result.totalCostUsd.toFixed(4)),
+              numTurns: result.numTurns,
+              durationMs: Date.now() - hbStart,
+            }, 'runAgentHeartbeat: heartbeat complete');
+            return result.text;
+          } catch (err) {
+            logger.warn({ err, agent }, 'runAgentHeartbeat path failed — falling back to legacy heartbeat path');
+            // Fall through to legacy.
+          }
+        }
+
         const response = await this.assistant.heartbeat(
           standingInstructions,
           changesSummary,
@@ -3054,6 +3090,10 @@ export class Gateway {
               successCriteria,
               model,
               workDir,
+              // Phase 4: post-task hooks restore reflection + skill
+              // extraction on the new cron path. The PersonalAssistant
+              // implements both members directly.
+              postTaskHooks: this.assistant,
             });
 
             response = cronResult.text;
@@ -3118,6 +3158,46 @@ export class Gateway {
     const releaseLane = await lanes.acquire('cron');
     try {
       logger.info({ fromSlug, toSlug: profile.slug }, 'Running team message as autonomous task');
+
+      // ── Phase 4: opt-in canonical SDK team-task path ───────────────
+      // CLEMENTINE_USE_RUNAGENT_TEAM=1 routes through runAgentTeamTask
+      // (one runAgent call, SDK owns the loop — no phase wrapper).
+      // Default OFF; falls back to legacy on error.
+      const useRunAgentTeam = process.env.CLEMENTINE_USE_RUNAGENT_TEAM === '1';
+      if (useRunAgentTeam) {
+        try {
+          const { runAgentTeamTask } = await import('../agent/run-agent-team-task.js');
+          logger.info({ fromSlug, toSlug: profile.slug, path: 'runagent_team_task' }, 'Phase 4: routing team task through runAgentTeamTask');
+          const result = await runAgentTeamTask({
+            fromName,
+            fromSlug,
+            content,
+            profile,
+            agentManager: this.getAgentManager(),
+            memoryStore: this.assistant.getMemoryStore?.() ?? null,
+            abortSignal: abortController?.signal,
+          });
+          scanner.refreshIntegrity();
+          logger.info({
+            fromSlug,
+            toSlug: profile.slug,
+            cost: Number(result.totalCostUsd.toFixed(4)),
+            numTurns: result.numTurns,
+            composioConnected: result.composioConnected.length,
+          }, 'runAgentTeamTask: team task complete');
+          // Best-effort streaming: if a callback is provided, deliver
+          // the final text in one chunk (the SDK already streamed it
+          // internally to runAgent's onText, but we collected it).
+          if (onText && result.text) {
+            try { onText(result.text); } catch { /* ignore */ }
+          }
+          return result.text;
+        } catch (err) {
+          logger.warn({ err, fromSlug, toSlug: profile.slug }, 'runAgentTeamTask path failed — falling back to legacy team-task path');
+          // Fall through to legacy.
+        }
+      }
+
       const response = await this.assistant.runTeamTask(fromName, fromSlug, content, profile, onText, abortController);
       scanner.refreshIntegrity();
       return response;
