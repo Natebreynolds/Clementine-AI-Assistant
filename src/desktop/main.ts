@@ -47,7 +47,11 @@ const CLI_ENTRY = path.join(PACKAGE_ROOT, 'dist', 'cli', 'index.js');
 const ICONS_DIR = path.join(PACKAGE_ROOT, 'build', 'icons');
 const BASE_DIR = process.env.CLEMENTINE_HOME || path.join(os.homedir(), '.clementine');
 const DEFAULT_PORT = Number(process.env.CLEMENTINE_DESKTOP_PORT || process.env.DASHBOARD_PORT || 3030);
-const NODE_BINARY = process.env.CLEMENTINE_NODE_PATH || 'node';
+// Use Electron's bundled Node runtime (via ELECTRON_RUN_AS_NODE) so the
+// desktop app does not depend on a `node` binary being on the host PATH.
+// macOS GUI launches (Finder/Spotlight/Dock) get a barebones PATH that
+// excludes Homebrew and NVM, which previously caused `spawn node ENOENT`.
+const NODE_BINARY = process.env.CLEMENTINE_NODE_PATH || process.execPath;
 
 let mainWindow: any = null;
 let tray: any = null;
@@ -160,6 +164,9 @@ function startDashboardProcess(port: number): ChildProcess {
       CLEMENTINE_HOME: BASE_DIR,
       CLEMENTINE_NO_OPEN: '1',
       __CLEM_DASHBOARD_CHILD: '1',
+      // Run Electron's binary as plain Node when no host node is configured.
+      // No-op when the user pinned a real node via CLEMENTINE_NODE_PATH.
+      ELECTRON_RUN_AS_NODE: process.env.CLEMENTINE_NODE_PATH ? '0' : '1',
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
