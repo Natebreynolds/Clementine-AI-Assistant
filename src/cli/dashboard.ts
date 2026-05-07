@@ -15792,6 +15792,25 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
 
     <!-- ═══ Build Page — Routines (single unified surface) ═══ -->
     <div class="page" id="page-build">
+      <!-- Build sub-tabs: Scheduled Tasks (single-prompt cron jobs) | Tricks (multi-step workflows) -->
+      <div id="build-tabs" style="display:flex;gap:4px;padding:8px 18px 0;background:var(--bg-secondary);border-bottom:1px solid var(--border);flex-shrink:0">
+        <button class="build-tab-btn active" data-build-tab="crons" onclick="switchBuildTab('crons')" style="padding:8px 14px;border-radius:6px 6px 0 0;border:none;background:transparent;color:var(--text-primary);font-size:13px;font-weight:500;cursor:pointer;border-bottom:2px solid transparent">
+          <span style="margin-right:6px">📅</span>Scheduled Tasks <span id="build-tab-cron-count" style="display:none;margin-left:4px;font-size:10px;background:var(--bg-tertiary);padding:1px 6px;border-radius:999px;color:var(--text-muted)">0</span>
+        </button>
+        <button class="build-tab-btn" data-build-tab="workflows" onclick="switchBuildTab('workflows')" style="padding:8px 14px;border-radius:6px 6px 0 0;border:none;background:transparent;color:var(--text-secondary);font-size:13px;font-weight:500;cursor:pointer;border-bottom:2px solid transparent">
+          <span style="margin-right:6px">🔧</span>Tricks (workflows) <span id="build-tab-workflows-count" style="display:none;margin-left:4px;font-size:10px;background:var(--bg-tertiary);padding:1px 6px;border-radius:999px;color:var(--text-muted)">0</span>
+        </button>
+      </div>
+      <style>
+        .build-tab-btn.active { color:var(--accent) !important; border-bottom-color:var(--accent) !important; background:var(--bg-primary) !important; }
+        .build-tab-btn:hover:not(.active) { color:var(--text-primary); }
+      </style>
+      <!-- Scheduled Tasks tab — populated by refreshCron() ─────────────────────── -->
+      <div id="build-tab-crons" style="display:none;flex:1;min-height:0;overflow-y:auto;padding:18px;background:var(--bg-primary)">
+        <div id="panel-cron"><div class="empty-state" style="padding:24px;color:var(--text-muted)">Loading scheduled tasks…</div></div>
+      </div>
+      <!-- Tricks (workflows) tab — existing RoutinesUI surface ─────────────────── -->
+      <div id="build-tab-workflows" style="display:none;flex:1;min-height:0;display:flex;flex-direction:column">
       <!-- Toolbar -->
       <div id="routines-toolbar" style="display:flex;align-items:center;gap:12px;padding:14px 18px;border-bottom:1px solid var(--border);background:var(--bg-secondary);flex-wrap:wrap">
         <h2 style="margin:0;font-size:18px;font-weight:600;color:var(--text-primary);display:flex;align-items:center;gap:8px"><span data-icon="workflow" class="icon-slot"></span> Tricks</h2>
@@ -16788,22 +16807,39 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
           },
         };
         window.RoutinesUI = R;
-        // Compatibility shims for legacy callers in other parts of the dashboard.
-        // The old switchBuildTab(tab) is referenced from KPI tiles, getting-started cards,
-        // and the navigateTo dispatcher. Map them all to the unified Routines view.
-        if (typeof window.switchBuildTab !== 'function' || true) {
-          window.switchBuildTab = function() { try { R.init(); } catch (e) { /* */ } };
-        }
-        // Auto-init when the user lands on the build page.
+        // Real switchBuildTab — toggles between Scheduled Tasks (cron) and
+        // Tricks (workflows / RoutinesUI) sub-panes. Called from KPI tiles,
+        // getting-started cards, and navigateTo('build', { tab: 'crons' }).
+        // Default tab is 'crons' so users land on the scheduled-task surface
+        // (with the capability strip + Preview) which is what most users want.
+        window.switchBuildTab = function(tab) {
+          var which = (tab === 'workflows') ? 'workflows' : 'crons';
+          var crons = document.getElementById('build-tab-crons');
+          var work = document.getElementById('build-tab-workflows');
+          if (crons) crons.style.display = (which === 'crons') ? '' : 'none';
+          if (work)  work.style.display  = (which === 'workflows') ? 'flex' : 'none';
+          document.querySelectorAll('.build-tab-btn').forEach(function(b) {
+            b.classList.toggle('active', b.getAttribute('data-build-tab') === which);
+          });
+          if (which === 'crons') {
+            try { if (typeof refreshCron === 'function') refreshCron(); } catch (e) { /* */ }
+          } else {
+            try { R.init(); } catch (e) { /* */ }
+          }
+        };
+        // Auto-init when the user lands on the build page (default to Scheduled Tasks).
         document.addEventListener('DOMContentLoaded', function() {
           var nav = document.querySelector('[data-page="build"]');
-          if (nav) nav.addEventListener('click', function() { setTimeout(function() { R.init(); }, 50); });
+          if (nav) nav.addEventListener('click', function() {
+            setTimeout(function() { window.switchBuildTab('crons'); }, 50);
+          });
           // If page-build is already active on load (deep-link), init now.
           var page = document.getElementById('page-build');
-          if (page && page.classList.contains('active')) R.init();
+          if (page && page.classList.contains('active')) window.switchBuildTab('crons');
         });
       })();
     </script>
+    </div><!-- /build-tab-workflows wrapper for Tricks (RoutinesUI) sub-pane -->
 
     <!-- page-agent-detail merged into Team page; click an agent in Roster to drill down. -->
 
