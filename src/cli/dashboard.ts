@@ -41,7 +41,7 @@ import {
   normalizeClaudeSdkOptionsForOneMillionContext,
 } from '../config.js';
 import { parseTasks } from '../tools/shared.js';
-import { todayISO } from '../gateway/cron-scheduler.js';
+import { todayISO, CronRunLog } from '../gateway/cron-scheduler.js';
 import { goalsRouter } from './routes/goals.js';
 import { delegationsRouter } from './routes/delegations.js';
 import { workflowsRouter } from './routes/workflows.js';
@@ -2534,12 +2534,23 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
       if (existsSync(envPath)) {
         const content = readFileSync(envPath, 'utf-8');
         if (/^ANTHROPIC_AUTH_TOKEN=.+/m.test(content)) { hasKey = true; authMode = 'oauth-token'; }
+        else if (/^CLAUDE_CODE_OAUTH_TOKEN=.+/m.test(content)) { hasKey = true; authMode = 'oauth-token'; }
         else if (/^ANTHROPIC_API_KEY=.+/m.test(content)) { hasKey = true; authMode = 'api-key'; }
       }
       if (!hasKey && process.env.ANTHROPIC_AUTH_TOKEN) { hasKey = true; authMode = 'oauth-token'; }
+      if (!hasKey && process.env.CLAUDE_CODE_OAUTH_TOKEN) { hasKey = true; authMode = 'oauth-token'; }
       if (!hasKey && process.env.ANTHROPIC_API_KEY) { hasKey = true; authMode = 'api-key'; }
-      // If no explicit creds, the SDK subprocess reads keychain OAuth automatically
-      if (!hasKey) { authMode = 'keychain'; hasKey = true; }
+      // Honest keychain check: only report authenticated if Claude Code actually has a session.
+      // Previously this assumed yes blindly, which hid the welcome panel from new desktop users.
+      if (!hasKey && process.platform === 'darwin') {
+        try {
+          const raw = execSync('security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null', {
+            encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'], timeout: 1500,
+          }).trim();
+          const parsed = JSON.parse(raw);
+          if (parsed?.claudeAiOauth?.accessToken) { hasKey = true; authMode = 'keychain'; }
+        } catch { /* no keychain entry — leave hasKey false */ }
+      }
       res.json({
         authenticated: hasKey,
         email: null,
@@ -2547,6 +2558,59 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
       });
     } catch (err) {
       res.json({ authenticated: false, email: null, error: String(err).slice(0, 200) });
+    }
+  });
+
+  // Restart the dashboard daemon so newly-saved auth credentials take effect.
+  // SAFE_ENV in src/agent/assistant.ts is built once at module load, so changes
+  // to ~/.clementine/.env after that point require a process restart to flow
+  // through to spawned SDK subprocesses. In desktop mode (CLI spawned by
+  // Electron) the parent supervisor respawns this process automatically; in
+  // standalone CLI mode the caller must run `clementine restart` themselves.
+  app.post('/api/restart-daemon', (_req, res) => {
+    const inDesktop = process.env.__CLEM_DASHBOARD_CHILD === '1';
+    res.json({ ok: true, willExit: inDesktop, mode: inDesktop ? 'desktop-child' : 'standalone' });
+    if (inDesktop) {
+      // Give the response a moment to flush before exiting.
+      setTimeout(() => { process.exit(0); }, 250);
+    }
+  });
+
+  // Save an API key (or OAuth token) pasted by the user. Validates against the
+  // Anthropic API before writing to ~/.clementine/.env so we never persist a
+  // bad key. Mirrors the `clementine login --api-key` CLI flow.
+  app.post('/api/auth/anthropic/api-key', async (req, res) => {
+    try {
+      const raw = String((req.body?.apiKey ?? '') as string).trim();
+      if (!raw) { res.status(400).json({ error: 'Missing apiKey in request body' }); return; }
+      // Detect token type by prefix: Anthropic OAuth tokens start with sk-ant-oat
+      // or sk-ant-rt; everything else is treated as a standard API key.
+      const isOAuth = /^sk-ant-(oat|rt)/.test(raw);
+      const credKey = isOAuth ? 'CLAUDE_CODE_OAUTH_TOKEN' : 'ANTHROPIC_API_KEY';
+      // Validate by calling /v1/models — cheap, doesn't burn tokens.
+      const Anthropic = (await import('@anthropic-ai/sdk')).default;
+      const client = new Anthropic(isOAuth ? { authToken: raw } as any : { apiKey: raw });
+      try {
+        await client.models.list({ limit: 1 });
+      } catch (err: any) {
+        const status = err?.status || err?.response?.status;
+        const detail = status === 401
+          ? 'Key was rejected by Anthropic (401). Check that you copied it fully.'
+          : `Validation failed: ${(err?.message || String(err)).slice(0, 180)}`;
+        res.status(400).json({ ok: false, error: detail });
+        return;
+      }
+      // Persist to ~/.clementine/.env (replace any existing line for this key).
+      const envPath = path.join(BASE_DIR, '.env');
+      const dir = path.dirname(envPath);
+      try { mkdirSync(dir, { recursive: true }); } catch { /* exists */ }
+      let content = existsSync(envPath) ? readFileSync(envPath, 'utf-8') : '';
+      content = content.replace(new RegExp(`^${credKey}=.*$\\n?`, 'm'), '').trimEnd();
+      content += `\n${credKey}=${raw}\n`;
+      writeFileSync(envPath, content, { mode: 0o600 });
+      res.json({ ok: true, credKey, apiKeySource: isOAuth ? 'oauth-token' : 'api-key' });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: String(err).slice(0, 300) });
     }
   });
 
@@ -5395,6 +5459,21 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
       res.json({ ok: true });
     } catch (err) {
       res.status(500).json({ error: String(err) });
+    }
+  });
+
+  // ── Recent runs across ALL cron jobs ───────────────────────────
+  // Powers the "Recent History" zone on the Tasks page. Returns the most
+  // recent N CronRunEntry rows merged from every per-job .jsonl, sorted
+  // newest-first. Uses CronRunLog.readAllRecent which tails each file.
+  app.get('/api/cron/runs', (req, res) => {
+    try {
+      const limit = Math.max(1, Math.min(200, parseInt(String(req.query.limit ?? '50'), 10) || 50));
+      const log = new CronRunLog();
+      const runs = log.readAllRecent(limit, 30);
+      res.json({ ok: true, runs });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: String(err) });
     }
   });
 
@@ -14708,6 +14787,52 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
     border-top: 1px solid var(--border);
     padding-top: 12px;
   }
+  /* ── Compact (de-cluttered) task cards ──
+     Applied to scheduled-task cards on the Tasks page. Keeps name, schedule,
+     prompt, last-run status, and a single Edit button visible by default.
+     Reveals badges, capability strip, and secondary actions on hover/focus
+     so non-technical users see only what they need at a glance. */
+  .task-card.compact .task-card-badges,
+  .task-card.compact .task-cap-strip,
+  .task-card.compact .task-card-actions .secondary {
+    max-height: 0;
+    opacity: 0;
+    overflow: hidden;
+    margin: 0;
+    padding-top: 0;
+    padding-bottom: 0;
+    border-width: 0;
+    pointer-events: none;
+    transition: opacity 0.18s ease, max-height 0.22s ease, padding 0.18s ease, margin 0.18s ease;
+  }
+  .task-card.compact:hover .task-card-badges,
+  .task-card.compact:focus-within .task-card-badges {
+    max-height: 80px;
+    opacity: 1;
+    margin-bottom: 14px;
+    pointer-events: auto;
+  }
+  .task-card.compact:hover .task-cap-strip,
+  .task-card.compact:focus-within .task-cap-strip {
+    max-height: 120px;
+    opacity: 1;
+    padding: 8px 0 10px;
+    margin-bottom: 12px;
+    border-top-width: 1px;
+    pointer-events: auto;
+  }
+  .task-card.compact:hover .task-card-actions .secondary,
+  .task-card.compact:focus-within .task-card-actions .secondary {
+    max-height: 40px;
+    opacity: 1;
+    pointer-events: auto;
+  }
+  .task-card.compact .task-card-actions {
+    flex-wrap: wrap;
+  }
+  .task-card.compact .task-card-actions .primary {
+    flex: 1;
+  }
   /* ── Trick capability strip (skills + MCP + tools at a glance) ─── */
   .task-cap-strip {
     border-top: 1px solid var(--border-light);
@@ -15695,8 +15820,8 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
       <div class="nav-item active" data-page="home" data-icon="home" title="Chat, today, activity">
         <span class="nav-icon"></span> Home
       </div>
-      <div class="nav-item" data-page="build" data-icon="workflow" title="Tricks Clementine knows">
-        <span class="nav-icon"></span> Build
+      <div class="nav-item" data-page="build" data-icon="workflow" title="Scheduled tasks Clementine runs for you">
+        <span class="nav-icon"></span> Tasks
         <span class="nav-badge" id="nav-cron-count" style="display:none">0</span>
       </div>
       <div class="nav-item" data-page="heartbeat" data-icon="bell" title="Heartbeat controls and queued work">
@@ -15771,7 +15896,10 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
               <div class="gs-card-icon">&#128274;</div>
               <div class="gs-card-title">Login with Anthropic</div>
               <div class="gs-card-desc" id="gs-auth-desc">Connect your Anthropic account to power your agents.</div>
-              <button class="btn btn-sm btn-primary" id="gs-auth-btn" onclick="startAnthropicOAuth()">Login with Claude</button>
+              <div style="display:flex;flex-direction:column;gap:6px;align-items:stretch">
+                <button class="btn btn-sm btn-primary" id="gs-auth-btn" onclick="startAnthropicOAuth()">Login with Claude</button>
+                <button class="btn btn-sm" onclick="openApiKeyModal()" style="font-size:11px">Use API key instead</button>
+              </div>
             </div>
             <div class="gs-card" id="gs-step-agent">
               <div class="gs-step-num">2</div>
@@ -15897,15 +16025,17 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
       </div>
     </div>
 
-    <!-- ═══ Build Page — Routines (single unified surface) ═══ -->
+    <!-- ═══ Tasks Page — single unified surface ═══ -->
     <div class="page" id="page-build">
-      <!-- Build sub-tabs: Scheduled Tasks (single-prompt cron jobs) | Tricks (multi-step workflows) -->
-      <div id="build-tabs" style="display:flex;gap:4px;padding:8px 18px 0;background:var(--bg-secondary);border-bottom:1px solid var(--border);flex-shrink:0">
+      <!-- Sub-tabs hidden by default. Cron is the single surface; multi-step
+           workflows (formerly "Tricks") are still accessible via deep-link
+           ?tab=workflows or by toggling .show-workflows-tabs on the page. -->
+      <div id="build-tabs" style="display:none;gap:4px;padding:8px 18px 0;background:var(--bg-secondary);border-bottom:1px solid var(--border);flex-shrink:0">
         <button class="build-tab-btn active" data-build-tab="crons" onclick="switchBuildTab('crons')" style="padding:8px 14px;border-radius:6px 6px 0 0;border:none;background:transparent;color:var(--text-primary);font-size:13px;font-weight:500;cursor:pointer;border-bottom:2px solid transparent">
-          <span style="margin-right:6px">📅</span>Scheduled Tasks <span id="build-tab-cron-count" style="display:none;margin-left:4px;font-size:10px;background:var(--bg-tertiary);padding:1px 6px;border-radius:999px;color:var(--text-muted)">0</span>
+          <span style="margin-right:6px">📅</span>Tasks <span id="build-tab-cron-count" style="display:none;margin-left:4px;font-size:10px;background:var(--bg-tertiary);padding:1px 6px;border-radius:999px;color:var(--text-muted)">0</span>
         </button>
         <button class="build-tab-btn" data-build-tab="workflows" onclick="switchBuildTab('workflows')" style="padding:8px 14px;border-radius:6px 6px 0 0;border:none;background:transparent;color:var(--text-secondary);font-size:13px;font-weight:500;cursor:pointer;border-bottom:2px solid transparent">
-          <span style="margin-right:6px">🔧</span>Tricks (workflows) <span id="build-tab-workflows-count" style="display:none;margin-left:4px;font-size:10px;background:var(--bg-tertiary);padding:1px 6px;border-radius:999px;color:var(--text-muted)">0</span>
+          <span style="margin-right:6px">🔧</span>Workflows <span id="build-tab-workflows-count" style="display:none;margin-left:4px;font-size:10px;background:var(--bg-tertiary);padding:1px 6px;border-radius:999px;color:var(--text-muted)">0</span>
         </button>
       </div>
       <style>
@@ -15920,7 +16050,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
       <div id="build-tab-workflows" style="display:none;flex:1;min-height:0;display:flex;flex-direction:column">
       <!-- Toolbar -->
       <div id="routines-toolbar" style="display:flex;align-items:center;gap:12px;padding:14px 18px;border-bottom:1px solid var(--border);background:var(--bg-secondary);flex-wrap:wrap">
-        <h2 style="margin:0;font-size:18px;font-weight:600;color:var(--text-primary);display:flex;align-items:center;gap:8px"><span data-icon="workflow" class="icon-slot"></span> Tricks</h2>
+        <h2 style="margin:0;font-size:18px;font-weight:600;color:var(--text-primary);display:flex;align-items:center;gap:8px"><span data-icon="workflow" class="icon-slot"></span> Workflows</h2>
         <span id="routines-count" style="font-size:11px;color:var(--text-muted)"></span>
         <span id="routines-editor-breadcrumb" style="display:none;font-size:12px;color:var(--text-muted)"> &rsaquo; <span id="routines-editor-name" style="color:var(--text-primary);font-weight:500"></span></span>
         <span style="flex:1"></span>
@@ -15931,16 +16061,16 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
         </select>
         <button id="routines-back-btn" style="display:none;padding:6px 12px;border-radius:6px;cursor:pointer;font-size:12px;background:var(--bg-tertiary);border:1px solid var(--border);color:var(--text-secondary)" onclick="window.RoutinesUI && RoutinesUI.closeEditor()">&larr; Back to list</button>
         <button id="routines-assist-btn" class="btn-sm" onclick="window.RoutinesUI && RoutinesUI.openCreate()" title="Skip the chat and fill out a form yourself" style="padding:6px 12px;border-radius:6px;cursor:pointer;font-size:12px;background:var(--bg-tertiary);border:1px solid var(--border);color:var(--text-secondary)">Build manually</button>
-        <button id="routines-create-btn" class="btn-sm btn-primary" onclick="window.RoutinesUI && RoutinesUI.openChat()" style="padding:6px 14px;border-radius:6px;cursor:pointer;font-size:12px">+ New Trick</button>
+        <button id="routines-create-btn" class="btn-sm btn-primary" onclick="window.RoutinesUI && RoutinesUI.openChat()" style="padding:6px 14px;border-radius:6px;cursor:pointer;font-size:12px">+ New Workflow</button>
       </div>
       <!-- List view (default) -->
       <div id="routines-list-pane" style="flex:1;min-height:0;overflow-y:auto;padding:18px;background:var(--bg-primary)">
         <div id="routines-list-empty" class="empty-state" style="display:none;padding:64px 18px;text-align:center;color:var(--text-muted)">
           <div style="font-size:38px;opacity:0.4;margin-bottom:14px">&#9881;</div>
-          <div style="font-size:15px;font-weight:500;color:var(--text-secondary);margin-bottom:6px">No tricks yet</div>
-          <div style="font-size:12px;line-height:1.5;max-width:380px;margin:0 auto 16px">A Trick is a sequence of steps Clementine performs on cue &mdash; call MCP tools, run local CLIs, prompt the agent, branch on results &mdash; that runs on a schedule or on demand. Example: &ldquo;at 8am check email; if anything urgent, summarize and Slack me.&rdquo;</div>
+          <div style="font-size:15px;font-weight:500;color:var(--text-secondary);margin-bottom:6px">No workflows yet</div>
+          <div style="font-size:12px;line-height:1.5;max-width:380px;margin:0 auto 16px">A workflow is a sequence of steps Clementine performs on cue &mdash; call MCP tools, run local CLIs, prompt the agent, branch on results &mdash; that runs on a schedule or on demand. Example: &ldquo;at 8am check email; if anything urgent, summarize and Slack me.&rdquo;</div>
           <div style="display:flex;gap:8px;justify-content:center;flex-wrap:wrap">
-            <button class="btn-sm btn-primary" onclick="window.RoutinesUI && RoutinesUI.openChat()" style="padding:6px 14px">+ New Trick</button>
+            <button class="btn-sm btn-primary" onclick="window.RoutinesUI && RoutinesUI.openChat()" style="padding:6px 14px">+ New Workflow</button>
             <button class="btn-sm" onclick="window.RoutinesUI && RoutinesUI.openCreate()" style="padding:6px 14px;background:var(--bg-tertiary);border:1px solid var(--border);color:var(--text-secondary)">Build manually</button>
           </div>
         </div>
@@ -15968,7 +16098,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
       <!-- Create modal -->
       <div id="routines-create-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.4);z-index:200;align-items:center;justify-content:center">
         <div style="background:var(--bg-secondary);border:1px solid var(--border);border-radius:var(--radius);padding:22px;width:480px;max-width:92vw;display:flex;flex-direction:column;gap:12px">
-          <h3 style="margin:0;font-size:16px;font-weight:600;color:var(--text-primary)">New trick</h3>
+          <h3 style="margin:0;font-size:16px;font-weight:600;color:var(--text-primary)">New workflow</h3>
           <label style="font-size:11px;color:var(--text-muted);font-weight:500;text-transform:uppercase;letter-spacing:0.04em">Name</label>
           <input type="text" id="routines-create-name" placeholder="e.g. 8am Email Triage" style="padding:8px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg-input);color:var(--text-primary);font-size:13px">
           <label style="font-size:11px;color:var(--text-muted);font-weight:500;text-transform:uppercase;letter-spacing:0.04em">Description (optional)</label>
@@ -16003,7 +16133,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
       <div id="routines-chat-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.4);z-index:200;align-items:center;justify-content:center">
         <div style="background:var(--bg-secondary);border:1px solid var(--border);border-radius:var(--radius);width:1100px;max-width:96vw;height:88vh;max-height:88vh;display:flex;flex-direction:column;overflow:hidden">
           <div style="padding:14px 18px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:10px;flex-shrink:0">
-            <h3 style="margin:0;font-size:15px;font-weight:600;color:var(--text-primary)">Build a trick with Clementine</h3>
+            <h3 style="margin:0;font-size:15px;font-weight:600;color:var(--text-primary)">Build a workflow with Clementine</h3>
             <span id="routines-chat-status" style="color:var(--text-muted);flex:1;font-size:11px;min-height:14px"></span>
             <button class="btn-sm" onclick="window.RoutinesUI && RoutinesUI.closeChat()" style="padding:4px 10px;background:var(--bg-tertiary);border:1px solid var(--border);color:var(--text-secondary)">&times;</button>
           </div>
@@ -16112,7 +16242,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
               if (filter === '__global__') return r.scope === 'global';
               return r.scope === 'agent' && r.agentSlug === filter;
             });
-            if (count) count.textContent = rows.length === 0 ? '' : rows.length + (rows.length === 1 ? ' trick' : ' tricks');
+            if (count) count.textContent = rows.length === 0 ? '' : rows.length + (rows.length === 1 ? ' workflow' : ' workflows');
             if (rows.length === 0) {
               empty.style.display = 'block';
               wrap.style.display = 'none';
@@ -16153,7 +16283,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
               if (r.status === 409) {
                 return r.json().then(function(j){
                   var lines = (j.sideEffects || []).map(function(s){ return '  • ' + s.kind + ': ' + s.label; }).join('\\n');
-                  if (confirm('This trick has side effects:\\n\\n' + lines + '\\n\\nProceed?')) R.run(id, true);
+                  if (confirm('This workflow has side effects:\\n\\n' + lines + '\\n\\nProceed?')) R.run(id, true);
                 });
               }
               return r.json().then(function(j){
@@ -16167,7 +16297,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
             apiFetch('/api/routines/' + encodeURIComponent(id))
               .then(function(r){ return r.json(); })
               .then(function(data){
-                if (!data || !data.routine) { alert('Failed to load trick'); return; }
+                if (!data || !data.routine) { alert('Failed to load workflow'); return; }
                 R.state.editing = { id: data.id, routine: data.routine, dirty: false, validation: data.validation };
                 R.showEditor();
               }).catch(function(err){ alert('Open failed: ' + err); });
@@ -16422,7 +16552,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
           },
           removeStep: function(idx) {
             if (!R.state.editing) return;
-            if (R.state.editing.routine.steps.length <= 1) { alert('A trick must have at least one step.'); return; }
+            if (R.state.editing.routine.steps.length <= 1) { alert('A workflow must have at least one step.'); return; }
             if (!confirm('Remove this step?')) return;
             var removed = R.state.editing.routine.steps.splice(idx, 1)[0];
             // Strip lingering dependsOn references.
@@ -16639,7 +16769,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
             R.renderChatMessages();
             R.renderChatSpec();
             // Seed with a greeting from the assistant so the panel isn't empty.
-            R.appendChatMessage('assistant', 'Hi! Tell me what you want Clementine to do — a sentence is fine. I\\x27ll ask a couple of follow-ups (when it should run, which tools she needs, which model) and draft a trick you can save.');
+            R.appendChatMessage('assistant', 'Hi! Tell me what you want Clementine to do — a sentence is fine. I\\x27ll ask a couple of follow-ups (when it should run, which tools she needs, which model) and draft a workflow you can save.');
             m.style.display = 'flex';
             setTimeout(function(){ document.getElementById('routines-chat-input').focus(); }, 50);
           },
@@ -16675,9 +16805,9 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
             pane.classList.toggle('trick-spec-streaming', !!R.state.chatStreaming);
             var a = R.state.chatArtifact;
             if (!a || !a.name) {
-              pane.innerHTML = '<div style="font-size:11px;color:var(--text-muted);font-weight:600;text-transform:uppercase;letter-spacing:0.04em;margin-bottom:10px">Trick spec</div>'
+              pane.innerHTML = '<div style="font-size:11px;color:var(--text-muted);font-weight:600;text-transform:uppercase;letter-spacing:0.04em;margin-bottom:10px">Workflow spec</div>'
                 + '<div class="trick-spec-card" style="opacity:0.7"><div class="trick-spec-skeleton-row" style="width:60%"></div><div class="trick-spec-skeleton-row" style="width:90%"></div><div class="trick-spec-skeleton-row" style="width:40%"></div></div>'
-                + '<div style="font-size:11px;color:var(--text-muted);line-height:1.5;margin-top:14px;font-style:italic">I\\x27ll fill this in as we chat. Each answer you give populates a field on the right — name, schedule, model, steps. When it\\x27s ready you\\x27ll see a Save trick button.</div>';
+                + '<div style="font-size:11px;color:var(--text-muted);line-height:1.5;margin-top:14px;font-style:italic">I\\x27ll fill this in as we chat. Each answer you give populates a field on the right — name, schedule, model, steps. When it\\x27s ready you\\x27ll see a Save workflow button.</div>';
               return;
             }
             // Parse the YAML-ish steps string into displayable cards.
@@ -16685,7 +16815,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
             var stepCount = steps.length;
             var schedule = a.schedule ? R.humanizeCron(a.schedule) : 'manual';
             var modelLabel = a.model ? R.modelLabel(a.model) : 'inherit';
-            var head = '<div style="display:flex;align-items:center;gap:10px;margin-bottom:14px"><div style="font-size:11px;color:var(--text-muted);font-weight:600;text-transform:uppercase;letter-spacing:0.04em">Trick spec</div><span style="flex:1"></span>'
+            var head = '<div style="display:flex;align-items:center;gap:10px;margin-bottom:14px"><div style="font-size:11px;color:var(--text-muted);font-weight:600;text-transform:uppercase;letter-spacing:0.04em">Workflow spec</div><span style="flex:1"></span>'
               + (R.state.chatStreaming ? '<span style="font-size:11px;color:var(--clementine)">drafting…</span>' : '')
               + '</div>';
             var meta = '<div class="trick-spec-card">'
@@ -16711,7 +16841,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
             }
             var ready = a.name && stepCount > 0;
             var saveRow = ready
-              ? '<div style="margin-top:18px;padding-top:14px;border-top:1px solid var(--border);display:flex;align-items:center;gap:10px"><span style="font-size:12px;color:var(--green,#22c55e);font-weight:500">✓ Ready to save</span><span style="flex:1"></span><button class="btn-sm btn-primary" onclick="window.RoutinesUI&&RoutinesUI.saveChatDraft()" style="padding:6px 18px">Save trick</button></div>'
+              ? '<div style="margin-top:18px;padding-top:14px;border-top:1px solid var(--border);display:flex;align-items:center;gap:10px"><span style="font-size:12px;color:var(--green,#22c55e);font-weight:500">✓ Ready to save</span><span style="flex:1"></span><button class="btn-sm btn-primary" onclick="window.RoutinesUI&&RoutinesUI.saveChatDraft()" style="padding:6px 18px">Save workflow</button></div>'
               : '<div style="margin-top:18px;font-size:11px;color:var(--text-muted);font-style:italic">A few more details and I\\x27ll let you save.</div>';
             pane.innerHTML = head + meta + stepsHtml + saveRow;
           },
@@ -16871,7 +17001,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
               })
             }).then(function(r){ return r.json().then(function(j){ return { ok: r.ok, body: j }; }); })
               .then(function(res){
-                if (btn) { btn.textContent = 'Save trick'; btn.disabled = false; }
+                if (btn) { btn.textContent = 'Save workflow'; btn.disabled = false; }
                 if (!res.ok) {
                   alert('Save failed: ' + (res.body && res.body.error || 'unknown'));
                   return;
@@ -16879,7 +17009,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
                 R.closeChat();
                 if (res.body && res.body.id) R.openEditor(res.body.id);
               }).catch(function(err){
-                if (btn) { btn.textContent = 'Save trick'; btn.disabled = false; }
+                if (btn) { btn.textContent = 'Save workflow'; btn.disabled = false; }
                 alert('Save failed: ' + err);
               });
           },
@@ -19521,7 +19651,9 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
               <option value="weekly">Weekly</option>
               <option value="hourly">Every N hours</option>
               <option value="minutes">Every N minutes</option>
-              <option value="custom">Custom cron expression</option>
+              <!-- Custom cron is hidden from the dropdown; revealed via the
+                   "Use a cron expression" link below for power users. -->
+              <option value="custom" style="display:none">Custom cron expression</option>
             </select>
             <select id="sched-day" style="display:none" onchange="updateScheduleFromBuilder()">
               <option value="1">Monday</option>
@@ -19588,6 +19720,9 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
             <input type="text" id="cron-schedule" placeholder="0 9 * * *" oninput="updateScheduleHint()">
           </div>
           <div class="form-hint" id="cron-schedule-hint" style="margin-top:6px"></div>
+          <div style="margin-top:8px">
+            <a href="#" id="sched-cron-link" onclick="event.preventDefault();var s=document.getElementById('sched-freq');s.value='custom';updateScheduleBuilder();this.style.display='none';" style="font-size:11px;color:var(--text-muted);text-decoration:none;border-bottom:1px dotted var(--border)">Use a cron expression instead</a>
+          </div>
             </div>
           </div>
         </div>
@@ -19617,13 +19752,17 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
           </div>
         </div>
 
-        <!-- Capabilities: predictable mode + skills + MCP + tools + tags -->
+        <!-- Skills & tools: pinned skills + MCP + tools + tags -->
         <div class="cron-section-card">
-          <h4>Capabilities</h4>
-          <p class="cron-section-desc">Predictable mode locks the run to exactly what's pinned here. Switch to the <strong>What will run</strong> tab to see the resolved final state.</p>
+          <h4>Skills &amp; tools</h4>
+          <p class="cron-section-desc">Pin the skills and tools this task should use. Switch to the <strong>What will run</strong> tab to see exactly what the agent receives.</p>
 
-          <!-- Predictable Mode (prominent at top) -->
-          <label id="cron-predictable-card" class="cron-predictable-card on" style="cursor:pointer;margin-bottom:12px">
+          <!-- Predictable Mode is now hidden by default — new tasks always
+               get predictable=true. Legacy tasks (predictable !== true) reveal
+               the toggle automatically via openEditCronModal() so users can
+               see/migrate. The checkbox stays in the DOM so saveCronJob()
+               can read its value unchanged. -->
+          <label id="cron-predictable-card" class="cron-predictable-card on" style="display:none;cursor:pointer;margin-bottom:12px">
             <span class="pred-icon" id="cron-predictable-icon">🔒</span>
             <input type="checkbox" id="cron-predictable" checked style="margin-top:3px" onchange="onPredictableChange()">
             <span style="flex:1">
@@ -20156,6 +20295,100 @@ async function startAnthropicOAuth() {
       if (desc) desc.textContent = 'Login failed: ' + msg;
     }
     if (btn) { btn.textContent = 'Retry Login'; btn.disabled = false; }
+  }
+}
+
+// ── API key paste flow (alternative to Login with Claude) ────────────
+function openApiKeyModal() {
+  if (document.getElementById('api-key-modal')) return;
+  var overlay = document.createElement('div');
+  overlay.id = 'api-key-modal';
+  overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.55);z-index:1000;display:flex;align-items:center;justify-content:center';
+  overlay.onclick = function(e) { if (e.target === overlay) closeApiKeyModal(); };
+  overlay.innerHTML =
+    '<div style="background:var(--bg-secondary,#1f2532);border:1px solid var(--border,#333);border-radius:10px;width:480px;max-width:92vw;padding:20px;box-shadow:0 12px 40px rgba(0,0,0,0.4)">'
+    + '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">'
+    + '<div style="font-size:15px;font-weight:600;color:var(--text-primary,#fff)">Use an Anthropic API key</div>'
+    + '<button class="btn-ghost btn-sm" onclick="closeApiKeyModal()" style="background:transparent;border:0;color:var(--text-muted);font-size:18px;cursor:pointer">&times;</button>'
+    + '</div>'
+    + '<div style="font-size:12px;color:var(--text-muted,#888);line-height:1.5;margin-bottom:14px">'
+    + 'Paste an API key from your Anthropic Console. We validate it before saving.'
+    + ' <a href="#" id="api-key-console-link" style="color:var(--accent,#7aa2f7);text-decoration:underline">Open the keys page</a>'
+    + ' &middot; key starts with <code style="color:var(--text-secondary)">sk-ant-</code>'
+    + '</div>'
+    + '<input id="api-key-input" type="password" placeholder="sk-ant-..." autocomplete="off" spellcheck="false"'
+    + ' style="width:100%;padding:10px 12px;background:var(--bg-input,#0e131c);border:1px solid var(--border,#333);border-radius:6px;color:var(--text-primary,#fff);font-family:monospace;font-size:13px;letter-spacing:0.5px"'
+    + ' onkeydown="if(event.key===\\x27Enter\\x27)submitApiKey()">'
+    + '<div id="api-key-status" style="font-size:12px;margin-top:10px;min-height:16px"></div>'
+    + '<div style="display:flex;justify-content:flex-end;gap:8px;margin-top:14px">'
+    + '<button class="btn btn-sm" onclick="closeApiKeyModal()">Cancel</button>'
+    + '<button class="btn btn-sm btn-primary" id="api-key-submit-btn" onclick="submitApiKey()">Validate &amp; save</button>'
+    + '</div>'
+    + '</div>';
+  document.body.appendChild(overlay);
+  var link = document.getElementById('api-key-console-link');
+  if (link) link.onclick = function(e) {
+    e.preventDefault();
+    window.open('https://console.anthropic.com/settings/keys', '_blank', 'noopener');
+  };
+  var input = document.getElementById('api-key-input');
+  if (input) setTimeout(function() { input.focus(); }, 30);
+}
+
+function closeApiKeyModal() {
+  var el = document.getElementById('api-key-modal');
+  if (el) el.remove();
+}
+
+async function submitApiKey() {
+  var input = document.getElementById('api-key-input');
+  var status = document.getElementById('api-key-status');
+  var btn = document.getElementById('api-key-submit-btn');
+  if (!input) return;
+  var key = String(input.value || '').trim();
+  if (!key) { if (status) status.textContent = 'Paste a key first.'; return; }
+  if (!/^sk-ant-/.test(key)) {
+    if (status) status.innerHTML = '<span style="color:var(--red,#f55)">That does not look like an Anthropic key (expected sk-ant-...).</span>';
+    return;
+  }
+  if (btn) { btn.disabled = true; btn.textContent = 'Validating...'; }
+  if (status) status.innerHTML = '<span style="color:var(--text-muted)">Calling Anthropic to verify the key...</span>';
+  try {
+    var r = await apiFetch('/api/auth/anthropic/api-key', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ apiKey: key }),
+    });
+    var d = await r.json();
+    if (!r.ok || !d.ok) throw new Error(d.error || 'Validation failed');
+    // Trigger a daemon restart so SAFE_ENV picks up the new key. In desktop
+    // mode, Electron respawns the child within ~1.5s; we then reload.
+    if (status) status.innerHTML = '<span style="color:var(--green,#5fa)">Saved. Restarting Clementine to activate...</span>';
+    try {
+      var rr = await apiFetch('/api/restart-daemon', { method: 'POST' });
+      var rd = await rr.json();
+      if (rd && rd.willExit) {
+        // Daemon is exiting now. Wait for it to come back, then reload so
+        // the new auth state is reflected everywhere on the page.
+        setTimeout(function() { location.reload(); }, 2500);
+      } else {
+        // Standalone (non-desktop) — daemon will not auto-restart.
+        if (status) status.innerHTML = '<span style="color:var(--green,#5fa)">Saved. Restart Clementine (run <code>clementine restart</code>) to activate.</span>';
+        setTimeout(function() {
+          closeApiKeyModal();
+          checkAnthropicAuth();
+        }, 1800);
+      }
+    } catch (_) {
+      // Restart endpoint failed — fall back to client-side refresh.
+      setTimeout(function() {
+        closeApiKeyModal();
+        checkAnthropicAuth();
+      }, 600);
+    }
+  } catch (err) {
+    if (status) status.innerHTML = '<span style="color:var(--red,#f55)">' + (err && err.message ? err.message : String(err)) + '</span>';
+    if (btn) { btn.disabled = false; btn.textContent = 'Validate & save'; }
   }
 }
 
@@ -22711,7 +22944,7 @@ function renderTrickFilterRow(allTasks, filter) {
 
 function renderScheduledTaskCard(task) {
   var enabled = task.enabled !== false;
-  var cardCls = 'task-card' + (enabled ? '' : ' disabled') + (task.health === 'running' ? ' running' : '');
+  var cardCls = 'task-card compact' + (enabled ? '' : ' disabled') + (task.health === 'running' ? ' running' : '');
   var style = task.health === 'broken' ? 'border-left:3px solid var(--red)' : task.health === 'failed' ? 'border-left:3px solid var(--yellow)' : '';
   var lastRunHtml = '<span style="color:var(--text-muted)">Never run</span>';
   if (task.lastRun) {
@@ -22761,11 +22994,11 @@ function renderScheduledTaskCard(task) {
     + renderTrickTagChips(task)
     + '<div class="task-card-badges">' + badges + '</div>'
     + '<div class="task-card-actions">'
-    + '<button class="btn-sm btn-success" onclick="apiPost(\\x27/api/cron/run/' + encodeURIComponent(task.name) + '\\x27)">Run Now</button>'
-    + '<button class="btn-sm" onclick="openCronPreview(\\x27' + safeName + '\\x27)">Preview</button>'
-    + '<button class="btn-sm" data-trace-job="' + esc(task.name) + '">Trace</button>'
-    + '<button class="btn-sm" onclick="openEditCronModal(\\x27' + safeName + '\\x27)">Edit</button>'
-    + '<button class="btn-sm btn-danger" onclick="confirmDeleteCron(\\x27' + safeName + '\\x27)">Del</button>'
+    + '<button class="btn-sm primary" onclick="openEditCronModal(\\x27' + safeName + '\\x27)" title="Edit task" style="background:var(--bg-tertiary);border:1px solid var(--border);color:var(--text-primary)">Edit</button>'
+    + '<button class="btn-sm secondary btn-success" onclick="apiPost(\\x27/api/cron/run/' + encodeURIComponent(task.name) + '\\x27)" title="Run this task once now">Run Now</button>'
+    + '<button class="btn-sm secondary" onclick="openCronPreview(\\x27' + safeName + '\\x27)" title="See exactly what will run">Preview</button>'
+    + '<button class="btn-sm secondary" data-trace-job="' + esc(task.name) + '" title="View execution trace">Trace</button>'
+    + '<button class="btn-sm secondary btn-danger" onclick="confirmDeleteCron(\\x27' + safeName + '\\x27)" title="Delete task">Del</button>'
     + '</div></div>';
 }
 
@@ -22793,6 +23026,67 @@ function renderScheduledWorkflowCard(wf) {
     + '</div></div>';
 }
 
+// ── Recent history list (Tasks page, bottom zone) ───────────────────────
+// Renders a compact table of CronRunEntry rows fetched from /api/cron/runs.
+// Each row shows status icon, job name, started time, duration, and a Trace
+// button. Click anywhere on the row to open the full trace viewer.
+function renderRecentHistoryList(runs) {
+  if (!runs || runs.length === 0) {
+    return '<div class="empty-state" style="padding:18px;color:var(--text-muted);font-size:13px">No runs yet. History appears here once your tasks start firing.</div>';
+  }
+  var rowsHtml = '';
+  for (var i = 0; i < runs.length; i++) {
+    var entry = runs[i] || {};
+    var status = entry.status || 'unknown';
+    var statusColor, statusIcon;
+    if (status === 'ok') { statusColor = 'var(--green)'; statusIcon = '&#10003;'; }
+    else if (status === 'error') { statusColor = 'var(--red)'; statusIcon = '&#10007;'; }
+    else if (status === 'retried') { statusColor = 'var(--yellow)'; statusIcon = '&#8635;'; }
+    else if (status === 'skipped') { statusColor = 'var(--text-muted)'; statusIcon = '&minus;'; }
+    else { statusColor = 'var(--text-muted)'; statusIcon = '&middot;'; }
+    var jobName = entry.jobName || '(unknown)';
+    var safeName = jsStr(jobName);
+    var startedAt = entry.startedAt ? new Date(entry.startedAt) : null;
+    var startedLabel = startedAt ? startedAt.toLocaleString() : '—';
+    var durationLabel = entry.durationMs != null ? formatDurationMs(entry.durationMs) : '—';
+    var attemptLabel = entry.attempt && entry.attempt > 1 ? ' · attempt ' + esc(entry.attempt) : '';
+    var errorPreview = '';
+    if (status === 'error' && entry.error) {
+      var msg = String(entry.error).slice(0, 120);
+      errorPreview = '<div style="font-size:11px;color:var(--red);margin-top:2px;word-break:break-word">' + esc(msg) + '</div>';
+    } else if (entry.outputPreview) {
+      var preview = String(entry.outputPreview).slice(0, 140);
+      errorPreview = '<div style="font-size:11px;color:var(--text-muted);margin-top:2px;word-break:break-word">' + esc(preview) + '</div>';
+    }
+    rowsHtml += '<div class="history-row" data-trace-job="' + esc(jobName) + '" style="display:grid;grid-template-columns:24px minmax(180px,1.2fr) minmax(180px,1fr) 90px auto;gap:10px;align-items:start;padding:8px 14px;border-bottom:1px solid var(--border);cursor:pointer" onmouseover="this.style.background=\'var(--bg-hover)\'" onmouseout="this.style.background=\'\'">'
+      + '<div style="color:' + statusColor + ';font-size:14px;line-height:18px;text-align:center" title="' + esc(status) + '">' + statusIcon + '</div>'
+      + '<div style="min-width:0">'
+        + '<div style="font-weight:500;color:var(--text-primary);font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + esc(jobName) + '">' + esc(jobName) + attemptLabel + '</div>'
+        + errorPreview
+      + '</div>'
+      + '<div style="font-size:12px;color:var(--text-secondary);line-height:18px">' + esc(startedLabel) + '</div>'
+      + '<div style="font-size:12px;color:var(--text-muted);line-height:18px">' + esc(durationLabel) + '</div>'
+      + '<div style="display:flex;gap:6px;align-items:center"><button class="btn-sm" onclick="event.stopPropagation();openTraceViewer(\\x27' + safeName + '\\x27)" style="font-size:11px;padding:3px 8px">Trace</button></div>'
+      + '</div>';
+  }
+  return '<div class="history-list" style="background:var(--bg-secondary);border:1px solid var(--border);border-radius:var(--radius)">'
+    + '<div style="display:grid;grid-template-columns:24px minmax(180px,1.2fr) minmax(180px,1fr) 90px auto;gap:10px;padding:8px 14px;border-bottom:1px solid var(--border);font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.04em;font-weight:500">'
+      + '<div></div><div>Task</div><div>Started</div><div>Duration</div><div></div>'
+    + '</div>'
+    + rowsHtml
+    + '</div>';
+}
+
+function formatDurationMs(ms) {
+  if (ms == null || isNaN(ms)) return '—';
+  if (ms < 1000) return ms + 'ms';
+  var s = Math.round(ms / 100) / 10;
+  if (s < 60) return s + 's';
+  var m = Math.floor(s / 60);
+  var rem = Math.round(s % 60);
+  return m + 'm ' + rem + 's';
+}
+
 function renderRunningCard(item) {
   var runtime = item.runtime || {};
   var runtimeName = runtime.runtimeName || runtime.name || runtime.jobName || runtime.id || '';
@@ -22811,8 +23105,15 @@ function renderRunningCard(item) {
 
 async function refreshCron() {
   try {
-    var r = await apiFetch('/api/build/operations?hours=168&limit=50');
-    var ops = await r.json();
+    // Fetch operations + cross-job recent runs in parallel for the three-zone
+    // Tasks layout: Running now (top) / Your tasks (middle) / Recent history.
+    var opsP = apiFetch('/api/build/operations?hours=168&limit=50').then(function(r) { return r.json().then(function(d){ return { r:r, d:d }; }); });
+    var runsP = apiFetch('/api/cron/runs?limit=50').then(function(r) { return r.json().catch(function(){ return { ok:false, runs: [] }; }); }).catch(function() { return { ok:false, runs: [] }; });
+    var both = await Promise.all([opsP, runsP]);
+    var opsResp = both[0];
+    var historyData = (both[1] && both[1].runs) || [];
+    var r = opsResp.r;
+    var ops = opsResp.d;
     if (!r.ok || !ops || ops.ok === false) throw new Error((ops && ops.error) || 'Build operations unavailable');
     mergeBuildUsageTasks(ops.usageTasks || []);
     cronJobsData = (ops.scheduledTasks || []).map(function(t) { return t.definition || {}; });
@@ -22839,16 +23140,26 @@ async function refreshCron() {
     var ownerFilter = getBuildOwnerFilter();
 
     var html = renderOperationsSummary(ops);
+
+    // ── Zone 1 — Running now (promoted to top, primary "what's live" view) ──
+    if (visibleRunning.length > 0) {
+      html += operationSectionHeader('Running now', 'Live background, long-running, and unleashed work. These are executions, not scheduled definitions.', 'badge-blue', visibleRunning.length + ' active', '0')
+        + '<div class="task-grid">' + visibleRunning.slice(0, 10).map(renderRunningCard).join('') + '</div>';
+      if (visibleRunning.length > 10) html += '<div class="empty-state" style="padding:18px;color:var(--text-muted);font-size:13px">Showing 10 of ' + visibleRunning.length + ' active runs. Use the Owner filter to narrow this list.</div>';
+    }
+
+    // ── Needs attention (only when there are issues) ──
     if (visibleAttention.length > 0) {
-      html += operationSectionHeader('Needs Attention', 'Broken scheduled tasks and failed runtime work that can waste tokens or silently stop.', visibleAttention.length > 0 ? 'badge-yellow' : 'badge-gray', visibleAttention.length + ' review', '0')
+      html += operationSectionHeader('Needs attention', 'Broken scheduled tasks and failed runtime work that can waste tokens or silently stop.', 'badge-yellow', visibleAttention.length + ' review', visibleRunning.length > 0 ? '28px' : '0')
         + '<div class="task-grid">' + visibleAttention.slice(0, 12).map(renderAttentionCard).join('') + '</div>';
       if (visibleAttention.length > 12) html += '<div class="empty-state" style="padding:18px;color:var(--text-muted);font-size:13px">Showing 12 of ' + visibleAttention.length + ' items. Use the Owner filter to narrow this list.</div>';
     }
 
+    // ── Zone 2 — Your tasks (the main card grid) ──
     var filteredTasks = applyTrickFilter(visibleTasks, _trickFilter);
     var filterPillsHtml = renderTrickFilterRow(visibleTasks, _trickFilter);
     var taskCountLabel = (_trickFilter.kind ? filteredTasks.length + '/' + visibleTasks.length : visibleTasks.length) + ' task' + (visibleTasks.length === 1 ? '' : 's');
-    html += operationSectionHeader('Scheduled Tasks', 'Single recurring jobs from CRON.md. These are the default scheduled automation surface.', 'badge-blue', taskCountLabel, visibleAttention.length > 0 ? '28px' : '0')
+    html += operationSectionHeader('Your tasks', 'Recurring jobs Clementine runs for you. Tap any card to edit; the toggle on each card pauses or resumes it.', 'badge-blue', taskCountLabel, (visibleRunning.length > 0 || visibleAttention.length > 0) ? '28px' : '0')
       + filterPillsHtml
       + '<div class="task-grid">';
     if (filteredTasks.length === 0) {
@@ -22856,28 +23167,25 @@ async function refreshCron() {
       if (_trickFilter.kind) {
         emptyLabel = 'No tasks match the current filter.';
       } else {
-        emptyLabel = ownerFilter === BUILD_OWNER_ALL ? 'No scheduled tasks across any agent.' : (ownerFilter ? 'No scheduled tasks for ' + ownerFilter + '.' : 'No global scheduled tasks.');
+        emptyLabel = ownerFilter === BUILD_OWNER_ALL ? 'No tasks across any agent.' : (ownerFilter ? 'No tasks for ' + ownerFilter + '.' : 'No tasks yet.');
       }
-      html += '<div class="task-card-add" onclick="openCreateCronModal(getBuildCreateOwner())">+ New Scheduled Task</div>'
+      html += '<div class="task-card-add" onclick="openCreateCronModal(getBuildCreateOwner())">+ New Task</div>'
         + '<div class="empty-state" style="padding:18px;color:var(--text-muted);font-size:13px">' + esc(emptyLabel) + '</div>';
     } else {
       html += filteredTasks.map(renderScheduledTaskCard).join('');
-      html += '<div class="task-card-add" onclick="openCreateCronModal(getBuildCreateOwner())">+ New Scheduled Task</div>';
+      html += '<div class="task-card-add" onclick="openCreateCronModal(getBuildCreateOwner())">+ New Task</div>';
     }
     html += '</div>';
 
-    html += operationSectionHeader('Scheduled Workflows', 'A scheduled workflow is one scheduled trigger that runs chained steps. It is separate from CRON.md scheduled tasks.', 'badge-purple', visibleWorkflows.length + ' workflow' + (visibleWorkflows.length === 1 ? '' : 's'), '28px');
+    // ── Workflows section (kept for back-compat; only renders when present) ──
     if (visibleWorkflows.length > 0) {
+      html += operationSectionHeader('Multi-step workflows', 'One scheduled trigger that runs chained steps. Separate from regular tasks.', 'badge-purple', visibleWorkflows.length + ' workflow' + (visibleWorkflows.length === 1 ? '' : 's'), '28px');
       html += '<div class="task-grid">' + visibleWorkflows.map(renderScheduledWorkflowCard).join('') + '</div>';
-    } else {
-      html += '<div class="empty-state" style="padding:18px;color:var(--text-muted);font-size:13px">No scheduled workflows in this scope. Build and schedule chained workflows from the Workflow Builder when a multi-step run is needed.</div>';
     }
 
-    if (visibleRunning.length > 0) {
-      html += operationSectionHeader('Running Now', 'Live background, long-running, and unleashed work. These are executions, not scheduled definitions.', 'badge-blue', visibleRunning.length + ' active', '28px')
-        + '<div class="task-grid">' + visibleRunning.slice(0, 10).map(renderRunningCard).join('') + '</div>';
-      if (visibleRunning.length > 10) html += '<div class="empty-state" style="padding:18px;color:var(--text-muted);font-size:13px">Showing 10 of ' + visibleRunning.length + ' active runs. Use the Owner filter to narrow this list.</div>';
-    }
+    // ── Zone 3 — Recent history (last 50 runs across all jobs) ──
+    html += operationSectionHeader('Recent history', 'The last 50 task runs across every job, newest first. Click any row to open the full trace.', 'badge-gray', historyData.length + ' run' + (historyData.length === 1 ? '' : 's'), '28px');
+    html += renderRecentHistoryList(historyData);
 
     panel.innerHTML = html;
     panel.onclick = function(ev) {
@@ -24143,18 +24451,29 @@ function renderCronLegacyBanner(job) {
       + '<h5>⚠ Legacy mode — output may not match what you see here</h5>'
       + '<div>' + msg + '</div>'
       + '<div class="banner-actions">'
-        + '<button class="btn-primary btn-sm" onclick="enablePredictableFromBanner()">Switch to Predictable Mode</button>'
+        + '<button class="btn-primary btn-sm" onclick="enablePredictableFromBanner()">Migrate now</button>'
         + '<button class="btn-sm" onclick="switchCronTab(\\x27preview\\x27)" style="background:transparent;border:1px solid var(--border);color:var(--text-primary)">See what will run</button>'
       + '</div>'
     + '</div>';
 }
 
-function enablePredictableFromBanner() {
+// One-click migration: flip predictable=true AND save immediately so the
+// user doesn't have to remember to also click Save Changes.
+async function enablePredictableFromBanner() {
   var predEl = document.getElementById('cron-predictable');
   if (!predEl) return;
   predEl.checked = true;
   onPredictableChange();
-  toast('Predictable Mode enabled — click Save Changes to lock it in.', 'success');
+  try {
+    if (typeof saveCronJob === 'function') {
+      await saveCronJob();
+      toast('Migrated to Predictable Mode.', 'success');
+    } else {
+      toast('Predictable Mode enabled — click Save Changes to lock it in.', 'success');
+    }
+  } catch (err) {
+    toast('Toggled to Predictable Mode but save failed: ' + String(err), 'error');
+  }
 }
 
 function openCreateCronModal(agentSlug) {
@@ -24183,11 +24502,20 @@ function openCreateCronModal(agentSlug) {
   document.getElementById('cron-train-btn').style.display = '';
   resetCronTrainingChat();
   resetTrickCapabilityState();
+  // New tasks default to predictable=true. The visible card stays hidden;
+  // the checkbox in the DOM carries the value through to saveCronJob().
+  var predElNew = document.getElementById('cron-predictable');
+  if (predElNew) predElNew.checked = true;
+  var predCardNew = document.getElementById('cron-predictable-card');
+  if (predCardNew) predCardNew.style.display = 'none';
   // No saved state to preview when creating — disable the Preview tab.
   var previewBtn = document.getElementById('cron-tab-btn-preview');
   if (previewBtn) previewBtn.setAttribute('disabled', 'disabled');
   var host = document.getElementById('cron-legacy-banner-host');
   if (host) host.innerHTML = '';
+  // Reset the "Use a cron expression" link in case it was hidden last time.
+  var schedLink = document.getElementById('sched-cron-link');
+  if (schedLink) schedLink.style.display = '';
   switchCronTab('configure');
   onPredictableChange();
   document.getElementById('cron-modal').classList.add('show');
@@ -24236,6 +24564,10 @@ function openEditCronModal(jobName) {
   // banner surfaces the migration choice instead.
   var predEl = document.getElementById('cron-predictable');
   if (predEl) predEl.checked = (job.predictable === true);
+  // Reveal the Predictable Mode card only for legacy jobs that need
+  // attention. Predictable jobs keep it hidden — there's nothing to do.
+  var predCardEdit = document.getElementById('cron-predictable-card');
+  if (predCardEdit) predCardEdit.style.display = (job.predictable === true) ? 'none' : '';
   onPredictableChange();
   renderCronLegacyBanner(job);
   renderSkillsPickerChips();
@@ -34015,7 +34347,7 @@ try {
       if (evt.type === 'connected') return;
       if (evt.type === 'cron_complete' || evt.type === 'cron_triggered') {
         refreshActivity();
-        if (currentPage === 'automations') refreshCron();
+        if (currentPage === 'build') refreshCron();
         refreshTeamNav();
       }
       if (evt.type === 'agent_created' || evt.type === 'agent_updated' || evt.type === 'agent_deleted' || evt.type === 'agent_status') {
@@ -34091,6 +34423,16 @@ try {
 // Poll interval: 30s when SSE connected, 10s otherwise (re-evaluates each tick)
 setInterval(function() { if (!sseConnected) refreshAll(); }, 10000);
 setInterval(function() { if (sseConnected) refreshAll(); }, 30000);
+
+// Tasks page: keep "Running now" fresh while the user is looking at it.
+// 12s feels alive without thrashing the API. Skip if SSE just delivered an
+// event in the last few seconds (refreshCron will already have fired).
+setInterval(function() {
+  if (currentPage !== 'build') return;
+  if (typeof refreshCron === 'function') {
+    try { refreshCron(); } catch (e) { /* non-fatal */ }
+  }
+}, 12000);
 </script>
 </body>
 </html>`;
