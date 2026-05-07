@@ -23908,7 +23908,7 @@ function parseAllowedToolsRaw() {
   var ta = document.getElementById('cron-allowed-tools');
   if (!ta) return [];
   var raw = ta.value || '';
-  var tokens = raw.split(/[,\n\s]+/).map(function(s) { return s.trim(); }).filter(Boolean);
+  var tokens = raw.split(/[,\\n\\s]+/).map(function(s) { return s.trim(); }).filter(Boolean);
   return tokens.filter(function(t) { return /^[A-Za-z0-9_:-]+$/.test(t); });
 }
 
