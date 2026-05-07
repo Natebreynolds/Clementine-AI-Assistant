@@ -87,3 +87,69 @@ Add a new entry to the `jobs` list in the frontmatter above:
     tier: 1
     enabled: true
 ```
+
+## Tricks: Capability-aware jobs
+
+A "trick" is a cron job that explicitly declares the **skills**, **tools**, and
+**MCP servers** it should run with. All capability fields below are optional —
+omit them to inherit defaults from the agent profile (or, for global jobs, the
+SDK's defaults). Surfaces in the dashboard as the **Capabilities** card section
+and the **Preview** modal.
+
+```yaml
+  - name: morning-research
+    schedule: "0 7 * * *"
+    prompt: >
+      Pull the overnight news, summarize the top three items relevant to me,
+      and post the digest to the briefing channel.
+    tier: 2
+    enabled: true
+
+    # ── Trick capabilities ────────────────────────────────────────
+    skills:
+      - research-protocol      # pinned skill, loaded ahead of auto-match
+      - summarize-news
+    allowed_tools:
+      - Read
+      - Write
+      - WebFetch               # 'Agent' is always force-included for sub-agent delegation
+    allowed_mcp_servers:
+      - firecrawl
+      - claude_ai_Gmail
+    tags:
+      - morning
+      - briefing
+    category: research
+```
+
+### Field reference
+
+| Field | Type | Behavior |
+|-------|------|----------|
+| `skills` | `string[]` | Pinned skill slugs (filename minus `.md`, slashes flattened to dashes — e.g. `auto/discord/send-message.md` → `auto-discord-send-message`). Loaded **before** the runtime auto-match. Total skills injected per run is capped at 4. Missing pins are warned + surfaced on the dashboard run-status line, not fatal. |
+| `allowed_tools` | `string[]` | Per-trick tool whitelist. When set, the effective list is `(allowed_tools) ∩ (agent_profile.team.allowedTools)` with `Agent` always force-included. Bare tricks (no `agentSlug`) use the trick list as the only constraint. |
+| `allowed_mcp_servers` | `string[]` | Per-trick MCP server whitelist (server names from the dashboard's MCP servers list). Applied **after** the agent profile's allowlist, so the effective set is `profile ∩ trick`. |
+| `tags` | `string[]` | UI-only — surfaced as `#tag` chips on cards and as filter pills above the Scheduled Tasks grid. No execution coupling. |
+| `category` | `string` | UI-only — single category bucket shown as a badge on the card. |
+
+Both `camelCase` and `snake_case` keys are accepted (`allowedTools` works the
+same as `allowed_tools`). Empty arrays are treated as absent so the
+`inherit ⇒ default` semantic is preserved.
+
+The dashboard's edit modal builds these YAML keys for you when you pin skills,
+add MCP servers, or set tags through the **Capabilities** section of the
+trick edit form. Clearing all chips removes the YAML key.
+
+### Preview before fire
+
+To see exactly what a trick will send the agent the next time it runs — before
+the next cron tick — click **Preview** on the trick card or call:
+
+```
+GET /api/cron/<job-name>/preview
+```
+
+The response includes the fully-built prompt, every skill that would be
+injected (with its full markdown content), the effective tool/MCP allowlists
+after profile intersection, and any warnings (missing pins, etc.). Use this to
+sanity-check chat-configured or hand-edited tricks before they fire.

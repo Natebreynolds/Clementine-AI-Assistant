@@ -542,6 +542,54 @@ export function searchSkills(
   return results.sort((a, b) => b.score - a.score).slice(0, limit);
 }
 
+/**
+ * Load a single skill by its flattened slug (filename minus `.md`,
+ * with directory separators replaced by dashes — e.g.
+ * `auto/discord/send.md` → `auto-discord-send`). Walks the same
+ * agent-scoped + global directory list as `searchSkills`, with
+ * agent-scoped winning on collision. Honors the same suppression set.
+ *
+ * Returns a `SkillMatch` with `score = 0` so callers can mix pinned
+ * skills into the same render path as auto-matched ones, or `null`
+ * when the slug doesn't resolve (caller should warn, not fail).
+ */
+export function loadSkillByName(
+  name: string,
+  agentSlug?: string,
+  opts?: { suppressedNames?: Set<string> },
+): SkillMatch | null {
+  const dirs: string[] = [];
+  if (agentSlug) {
+    const agentDir = agentSkillsDir(agentSlug);
+    if (existsSync(agentDir)) dirs.push(agentDir);
+  }
+  if (existsSync(GLOBAL_SKILLS_DIR)) dirs.push(GLOBAL_SKILLS_DIR);
+  if (dirs.length === 0) return null;
+  if (opts?.suppressedNames?.has(name)) return null;
+
+  for (const dir of dirs) {
+    const files = walkSkillFiles(dir);
+    for (const { filePath, relPath } of files) {
+      const slug = relPath.replace(/\.md$/, '').replace(/[\\/]/g, '-');
+      if (slug !== name) continue;
+      try {
+        const raw = readFileSync(filePath, 'utf-8');
+        const parsed = matter(raw);
+        return {
+          name: slug,
+          title: parsed.data.title ?? slug,
+          content: parsed.content.slice(0, 1500),
+          score: 0,
+          toolsUsed: parsed.data.toolsUsed ?? [],
+          attachments: parsed.data.attachments ?? [],
+          skillDir: dir,
+        };
+      } catch { return null; }
+    }
+  }
+  return null;
+}
+
 /** Record that a skill was used (bump use count). */
 export function recordSkillUse(skillName: string, agentSlug?: string): void {
   try {

@@ -6103,7 +6103,11 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
 
   app.post('/api/cron', (req, res) => {
     try {
-      const { name, schedule, prompt, tier, enabled, work_dir, mode, max_hours, max_retries, after, agent, context } = req.body;
+      const {
+        name, schedule, prompt, tier, enabled, work_dir, mode, max_hours,
+        max_retries, after, agent, context,
+        skills, allowedTools, allowedMcpServers, tags, category,
+      } = req.body;
       if (!name || !schedule || !prompt) {
         res.status(400).json({ error: 'name, schedule, and prompt are required' });
         return;
@@ -6140,6 +6144,22 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
       if (max_retries != null && max_retries !== '') job.max_retries = Number(max_retries);
       if (after) job.after = String(after);
       if (context) job.context = String(context);
+      // ── Trick capabilities (snake_case in YAML to match work_dir/max_hours) ─
+      if (Array.isArray(skills) && skills.length) {
+        job.skills = skills.map(String).map(s => s.trim()).filter(Boolean);
+      }
+      if (Array.isArray(allowedTools) && allowedTools.length) {
+        job.allowed_tools = allowedTools.map(String).map(s => s.trim()).filter(Boolean);
+      }
+      if (Array.isArray(allowedMcpServers) && allowedMcpServers.length) {
+        job.allowed_mcp_servers = allowedMcpServers.map(String).map(s => s.trim()).filter(Boolean);
+      }
+      if (Array.isArray(tags) && tags.length) {
+        job.tags = tags.map(String).map(s => s.trim()).filter(Boolean);
+      }
+      if (typeof category === 'string' && category.trim()) {
+        job.category = category.trim().slice(0, 64);
+      }
       jobs.push(job);
       writeCronFileAt(cronFile, parsed, jobs);
       res.json({ ok: true, message: `Created cron job: ${name}` });
@@ -6228,6 +6248,42 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
           delete jobs[idx].context;
         }
       }
+      // ── Trick capabilities — set when non-empty, delete when cleared ─
+      if (updates.skills !== undefined) {
+        if (Array.isArray(updates.skills) && updates.skills.length) {
+          jobs[idx].skills = updates.skills.map(String).map((s: string) => s.trim()).filter(Boolean);
+        } else {
+          delete jobs[idx].skills;
+        }
+      }
+      if (updates.allowedTools !== undefined) {
+        if (Array.isArray(updates.allowedTools) && updates.allowedTools.length) {
+          jobs[idx].allowed_tools = updates.allowedTools.map(String).map((s: string) => s.trim()).filter(Boolean);
+        } else {
+          delete jobs[idx].allowed_tools;
+        }
+      }
+      if (updates.allowedMcpServers !== undefined) {
+        if (Array.isArray(updates.allowedMcpServers) && updates.allowedMcpServers.length) {
+          jobs[idx].allowed_mcp_servers = updates.allowedMcpServers.map(String).map((s: string) => s.trim()).filter(Boolean);
+        } else {
+          delete jobs[idx].allowed_mcp_servers;
+        }
+      }
+      if (updates.tags !== undefined) {
+        if (Array.isArray(updates.tags) && updates.tags.length) {
+          jobs[idx].tags = updates.tags.map(String).map((s: string) => s.trim()).filter(Boolean);
+        } else {
+          delete jobs[idx].tags;
+        }
+      }
+      if (updates.category !== undefined) {
+        if (typeof updates.category === 'string' && updates.category.trim()) {
+          jobs[idx].category = updates.category.trim().slice(0, 64);
+        } else {
+          delete jobs[idx].category;
+        }
+      }
       if (updates.name !== undefined && updates.name !== bareJobName) {
         // Rename — check for duplicates
         const dup = jobs.find(
@@ -6306,6 +6362,111 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
       res.status(500).json({ error: String(err) });
     }
   });
+
+  // ── Preview a trick before it fires ────────────────────────────────
+  // Builds the EXACT prompt + resolved skills + tool/MCP allowlists that the
+  // trick will run with on the next cron tick — without dispatching to the
+  // agent. Lets users sanity-check chat-configured or hand-edited tricks
+  // before the surprise at 8am tomorrow.
+  app.get('/api/cron/:name/preview', gwHandler(async (gw, req, res) => {
+    try {
+      const jobName = String(req.params.name);
+      const [{ parseCronJobs, parseAgentCronJobs }, { buildCronExecutionPlan }, { loadSkillByName }, { discoverMcpServers }] = await Promise.all([
+        import('../gateway/cron-scheduler.js'),
+        import('../agent/run-agent-cron.js'),
+        import('../agent/skill-extractor.js'),
+        import('../agent/mcp-bridge.js'),
+      ]);
+      const agentsDir = path.join(VAULT_DIR, '00-System', 'agents');
+      const allJobs = [...parseCronJobs(), ...parseAgentCronJobs(agentsDir)];
+      const job = allJobs.find(j => j.name === jobName);
+      if (!job) {
+        res.status(404).json({ error: `Job "${jobName}" not found` });
+        return;
+      }
+      const profile = job.agentSlug && job.agentSlug !== 'clementine'
+        ? gw.getAgentManager().get(job.agentSlug) ?? null
+        : null;
+      const memoryStore = (gw.assistant as any).getMemoryStore?.() ?? null;
+      const plan = await buildCronExecutionPlan({
+        jobName: job.name,
+        jobPrompt: job.prompt,
+        tier: job.tier,
+        maxTurns: job.maxTurns,
+        profile,
+        agentManager: gw.getAgentManager(),
+        memoryStore,
+        successCriteria: job.successCriteria,
+        model: job.model,
+        workDir: job.workDir,
+        pinnedSkills: job.skills,
+        allowedTools: job.allowedTools,
+        allowedMcpServers: job.allowedMcpServers,
+      });
+
+      // Enrich each applied skill with its title/description/full markdown
+      // body so the UI can render "what the agent will actually read".
+      const skillsApplied = plan.skillsApplied.map(s => {
+        const loaded = loadSkillByName(s.name, profile?.slug ?? undefined);
+        return {
+          name: s.name,
+          source: s.source,
+          score: s.score,
+          title: loaded?.title ?? s.name,
+          content: loaded?.content ?? '',
+          toolsUsed: loaded?.toolsUsed ?? [],
+        };
+      });
+
+      // Enrich each MCP server with its description so the UI can show
+      // "what this connector actually does" alongside the slug.
+      const allServers = discoverMcpServers();
+      const mcpInfo = plan.mcpServersApplied.map(name => {
+        const m = allServers.find(s => s.name === name);
+        return {
+          name,
+          description: m?.description ?? '',
+          source: m?.source ?? null,
+          enabled: m?.enabled ?? null,
+        };
+      });
+
+      res.json({
+        ok: true,
+        job: {
+          name: job.name,
+          schedule: job.schedule,
+          prompt: job.prompt,
+          tier: job.tier,
+          enabled: job.enabled,
+          agentSlug: job.agentSlug ?? null,
+          mode: job.mode ?? null,
+          tags: job.tags ?? [],
+          category: job.category ?? null,
+        },
+        profile: profile ? { slug: profile.slug, name: profile.name } : null,
+        builtPrompt: plan.builtPrompt,
+        contextBlocks: plan.contextBlocks,
+        skillsApplied,
+        skillsMissing: plan.skillsMissing,
+        effectiveAllowedTools: plan.effectiveAllowedTools ?? null,
+        mcpServers: mcpInfo,
+        composioConnected: plan.composioConnected,
+        externalConnected: plan.externalConnected,
+        tier: plan.tier,
+        effort: plan.effort,
+        maxBudgetUsd: plan.maxBudgetUsd ?? null,
+        warnings: [
+          ...plan.skillsMissing.map((s: string) => ({
+            kind: 'missing_skill',
+            detail: `Pinned skill "${s}" did not resolve. It may be deleted, renamed, or suppressed.`,
+          })),
+        ],
+      });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  }));
 
   // ── Cron Attachment routes ──────────────────────────────────────────
 
@@ -14533,6 +14694,244 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
     border-top: 1px solid var(--border);
     padding-top: 12px;
   }
+  /* ── Trick capability strip (skills + MCP + tools at a glance) ─── */
+  .task-cap-strip {
+    border-top: 1px solid var(--border-light);
+    padding: 8px 0 10px;
+    margin-bottom: 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .task-cap-counts {
+    display: flex;
+    gap: 12px;
+    font-size: 11px;
+    color: var(--text-muted);
+  }
+  .task-cap-counts span { white-space: nowrap; }
+  .task-cap-chips {
+    display: flex;
+    gap: 4px;
+    flex-wrap: wrap;
+  }
+  .cap-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 2px 8px;
+    border-radius: 999px;
+    background: var(--bg-tertiary);
+    color: var(--text-secondary);
+    font-size: 10px;
+    line-height: 1.5;
+    border: 1px solid transparent;
+  }
+  .cap-chip.skill { background: rgba(77, 158, 255, 0.10); color: var(--accent); }
+  .cap-chip.mcp   { background: rgba(124, 58, 237, 0.10); color: var(--purple); }
+  .cap-chip.tag   { background: var(--clementine-bg); color: var(--clementine); }
+  .cap-chip.muted {
+    background: transparent;
+    color: var(--text-muted);
+    border-color: var(--border-light);
+  }
+  .task-card-tags {
+    display: flex;
+    gap: 4px;
+    flex-wrap: wrap;
+    margin-bottom: 10px;
+  }
+  /* ── Modal capability pickers (skills, MCP, tags) ──────────────── */
+  .cap-section {
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 12px;
+    margin-top: 10px;
+    background: var(--bg-secondary);
+  }
+  .cap-section-label {
+    display: block;
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.4px;
+    margin-bottom: 6px;
+  }
+  .cap-picker-chips {
+    display: flex;
+    gap: 4px;
+    flex-wrap: wrap;
+    min-height: 26px;
+    margin-bottom: 6px;
+  }
+  .cap-picker-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 2px 6px 2px 10px;
+    border-radius: 999px;
+    background: var(--bg-tertiary);
+    color: var(--text-primary);
+    font-size: 11px;
+    line-height: 1.6;
+    border: 1px solid var(--border);
+  }
+  .cap-picker-chip.skill { background: rgba(77, 158, 255, 0.10); color: var(--accent); border-color: rgba(77, 158, 255, 0.25); }
+  .cap-picker-chip.mcp   { background: rgba(124, 58, 237, 0.10); color: var(--purple); border-color: rgba(124, 58, 237, 0.25); }
+  .cap-picker-chip.tag   { background: var(--clementine-bg); color: var(--clementine); border-color: rgba(255, 140, 33, 0.25); }
+  .cap-picker-chip button {
+    background: none;
+    border: none;
+    color: inherit;
+    cursor: pointer;
+    font-size: 14px;
+    padding: 0 2px;
+    line-height: 1;
+    opacity: 0.7;
+  }
+  .cap-picker-chip button:hover { opacity: 1; }
+  .cap-picker-empty {
+    color: var(--text-muted);
+    font-size: 11px;
+    font-style: italic;
+    line-height: 1.6;
+  }
+  .cap-picker-search {
+    width: 100%;
+    padding: 6px 8px;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: var(--bg-input);
+    color: var(--text-primary);
+    font-size: 12px;
+    margin-bottom: 6px;
+  }
+  .cap-picker-list {
+    max-height: 180px;
+    overflow-y: auto;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: var(--bg-primary);
+  }
+  .cap-picker-row {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    padding: 6px 10px;
+    cursor: pointer;
+    border-bottom: 1px solid var(--border-light);
+    font-size: 12px;
+  }
+  .cap-picker-row:hover { background: var(--bg-tertiary); }
+  .cap-picker-row.selected { background: rgba(77, 158, 255, 0.08); }
+  .cap-picker-row.selected.mcp { background: rgba(124, 58, 237, 0.08); }
+  .cap-picker-row-body { flex: 1; min-width: 0; }
+  .cap-picker-row-title { font-weight: 600; color: var(--text-primary); }
+  .cap-picker-row-desc { color: var(--text-muted); font-size: 11px; margin-top: 2px; line-height: 1.35; }
+  .cap-picker-row-meta { font-size: 10px; color: var(--text-muted); margin-top: 2px; }
+  .cap-picker-empty-state { padding: 14px; color: var(--text-muted); font-size: 12px; text-align: center; }
+  .cap-tag-input {
+    width: 100%;
+    padding: 6px 8px;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: var(--bg-input);
+    color: var(--text-primary);
+    font-size: 12px;
+  }
+  .cap-tools-textarea {
+    width: 100%;
+    padding: 6px 8px;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: var(--bg-input);
+    color: var(--text-primary);
+    font-size: 12px;
+    font-family: monospace;
+    resize: vertical;
+  }
+  .cap-toggle-link {
+    background: none;
+    border: none;
+    color: var(--accent);
+    cursor: pointer;
+    font-size: 11px;
+    padding: 2px 0;
+  }
+  .cap-toggle-link:hover { text-decoration: underline; }
+  /* ── Preview modal ────────────────────────────────────────────── */
+  .preview-section { padding: 12px 16px; border-bottom: 1px solid var(--border); }
+  .preview-section h4 {
+    font-size: 11px; font-weight: 600;
+    text-transform: uppercase; letter-spacing: 0.4px;
+    color: var(--text-muted); margin: 0 0 8px 0;
+  }
+  .preview-prompt-box {
+    background: var(--bg-primary); border: 1px solid var(--border);
+    border-radius: 6px; padding: 10px;
+    font-family: monospace; font-size: 11px;
+    white-space: pre-wrap; word-break: break-word;
+    color: var(--text-secondary); max-height: 380px; overflow-y: auto;
+    line-height: 1.45;
+  }
+  .preview-skill { padding: 8px 0; border-bottom: 1px dashed var(--border-light); }
+  .preview-skill:last-child { border-bottom: none; }
+  .preview-skill-title { font-weight: 600; color: var(--text-primary); font-size: 13px; }
+  .preview-skill-meta { font-size: 10px; color: var(--text-muted); margin-top: 2px; }
+  .preview-skill-body {
+    margin-top: 6px; padding: 8px; background: var(--bg-primary);
+    border-radius: 4px; font-family: monospace; font-size: 11px;
+    color: var(--text-secondary); white-space: pre-wrap; word-break: break-word;
+    max-height: 180px; overflow-y: auto;
+  }
+  .preview-warn {
+    padding: 6px 10px; border-radius: 6px; background: rgba(245, 158, 11, 0.10);
+    color: var(--yellow); font-size: 12px; margin-bottom: 6px;
+  }
+  /* ── Trick filter pills above Scheduled Tasks grid ────────────── */
+  .trick-filter-row {
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+    align-items: center;
+    margin: 0 0 16px 0;
+    padding: 8px 0 0;
+  }
+  .trick-filter-label {
+    font-size: 11px;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.4px;
+    margin-right: 4px;
+  }
+  .trick-filter-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 3px 10px;
+    border-radius: 999px;
+    background: var(--bg-tertiary);
+    color: var(--text-secondary);
+    font-size: 11px;
+    cursor: pointer;
+    border: 1px solid var(--border);
+    line-height: 1.5;
+  }
+  .trick-filter-pill:hover { color: var(--text-primary); border-color: var(--accent); }
+  .trick-filter-pill.active {
+    background: var(--accent);
+    color: white;
+    border-color: var(--accent);
+  }
+  .trick-filter-pill.active.tag {
+    background: var(--clementine);
+    border-color: var(--clementine);
+  }
+  .trick-filter-pill.active.mcp {
+    background: var(--purple);
+    border-color: var(--purple);
+  }
   .task-card-add {
     background: transparent;
     border: 2px dashed var(--border-light);
@@ -19034,6 +19433,11 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
             <option value="3">Tier 3 — Full access (use with caution)</option>
           </select>
         </div>
+        <div class="form-group">
+          <label class="form-label">Category <span style="color:var(--text-muted);font-weight:normal">(optional)</span></label>
+          <input type="text" id="cron-category" placeholder="e.g. ops, research, morning">
+          <div class="form-hint">Used for grouping in the dashboard.</div>
+        </div>
       </div>
       <div class="form-group">
         <label class="form-label">Project Context <span style="color:var(--text-muted);font-weight:normal">(optional)</span></label>
@@ -19095,6 +19499,42 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
         <textarea id="cron-context" rows="4" placeholder="Guidelines, examples, formatting rules, data sources, or any context the agent should know when running this task..."></textarea>
         <div class="form-hint">Freeform notes injected into the prompt at execution time. Use this for training data, style guides, or standing instructions.</div>
       </div>
+      <!-- ── Capabilities ── -->
+      <div class="form-group">
+        <label class="form-label">Capabilities <span style="color:var(--text-muted);font-weight:normal">(optional — pin skills + scope tools/MCP)</span></label>
+        <div class="form-hint" style="margin-bottom:6px">Pin learned procedures and constrain which tools / MCP servers this trick can use. Empty = inherit defaults. Use Preview on the card to see exactly what gets sent.</div>
+        <div class="cap-section">
+          <label class="cap-section-label">Pinned Skills</label>
+          <div class="cap-picker-chips" id="cron-skills-chips"></div>
+          <button type="button" class="cap-toggle-link" id="cron-skills-add-btn" onclick="toggleSkillsPickerSearch()">+ Add skill</button>
+          <div id="cron-skills-search-panel" style="display:none;margin-top:6px">
+            <input type="text" class="cap-picker-search" id="cron-skills-search" placeholder="Search skills…" oninput="renderSkillsPickerList()">
+            <div class="cap-picker-list" id="cron-skills-list"><div class="cap-picker-empty-state">Loading skills…</div></div>
+          </div>
+        </div>
+        <div class="cap-section">
+          <label class="cap-section-label">Allowed MCP Servers</label>
+          <div class="cap-picker-chips" id="cron-mcp-chips"></div>
+          <button type="button" class="cap-toggle-link" id="cron-mcp-add-btn" onclick="toggleMcpPickerSearch()">+ Add MCP server</button>
+          <div id="cron-mcp-search-panel" style="display:none;margin-top:6px">
+            <input type="text" class="cap-picker-search" id="cron-mcp-search" placeholder="Search MCP servers…" oninput="renderMcpPickerList()">
+            <div class="cap-picker-list" id="cron-mcp-list"><div class="cap-picker-empty-state">Loading MCP servers…</div></div>
+          </div>
+        </div>
+        <div class="cap-section">
+          <label class="cap-section-label">Allowed Tools (raw allowlist · power users)</label>
+          <button type="button" class="cap-toggle-link" id="cron-tools-toggle-btn" onclick="toggleAllowedToolsPanel()">▾ Show</button>
+          <div id="cron-tools-panel" style="display:none;margin-top:6px">
+            <textarea id="cron-allowed-tools" class="cap-tools-textarea" rows="2" placeholder="Read, Edit, Bash, mcp__slack__send_message, ..."></textarea>
+            <div class="form-hint">Comma-separated tool names. Empty = inherit from agent profile / default. 'Agent' is always force-included.</div>
+          </div>
+        </div>
+        <div class="cap-section">
+          <label class="cap-section-label">Tags</label>
+          <div class="cap-picker-chips" id="cron-tags-chips"></div>
+          <input type="text" class="cap-tag-input" id="cron-tags-input" placeholder="Type a tag and press Enter (e.g. morning, ops)" onkeydown="handleTagInputKeydown(event)">
+        </div>
+      </div>
       <div class="form-group">
         <label class="form-label">Reference Files <span style="color:var(--text-muted);font-weight:normal">(optional)</span></label>
         <div id="cron-attachments-list" style="margin-bottom:8px"></div>
@@ -19128,6 +19568,22 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
       </div>
       <button onclick="closeCronModal()">Cancel</button>
       <button class="btn-primary" id="cron-modal-save" onclick="saveCronJob()">Create Task</button>
+    </div>
+  </div>
+</div>
+
+<!-- ═══ Preview Modal — see exactly what a trick will run with ═══ -->
+<div class="modal-overlay" id="cron-preview-modal">
+  <div class="modal" style="width:760px;max-width:96vw">
+    <div class="modal-header">
+      <h3 id="cron-preview-title">Preview</h3>
+      <button class="btn-ghost btn-sm" onclick="closeCronPreviewModal()">&times;</button>
+    </div>
+    <div class="modal-body" id="cron-preview-body" style="padding:0;max-height:75vh;overflow-y:auto">
+      <div style="padding:24px;color:var(--text-muted);text-align:center">Loading…</div>
+    </div>
+    <div class="modal-footer">
+      <button onclick="closeCronPreviewModal()">Close</button>
     </div>
   </div>
 </div>
@@ -21953,6 +22409,120 @@ function renderAttentionCard(item) {
     + '</div>';
 }
 
+/**
+ * Render the per-trick capability strip — skills, MCP servers, and tool count
+ * shown as chips. Returns empty string when the trick has no capabilities
+ * pinned (legacy entries render exactly as today).
+ */
+function renderTrickCapabilityStrip(task) {
+  var skills = Array.isArray(task.skills) ? task.skills : [];
+  var mcps = Array.isArray(task.allowedMcpServers) ? task.allowedMcpServers : [];
+  var tools = Array.isArray(task.allowedTools) ? task.allowedTools : [];
+  if (skills.length === 0 && mcps.length === 0 && tools.length === 0) return '';
+  var counts = '';
+  if (skills.length > 0) counts += '<span title="Pinned skills">🧠 ' + skills.length + ' skill' + (skills.length === 1 ? '' : 's') + '</span>';
+  if (mcps.length > 0) counts += '<span title="Allowed MCP servers">📦 ' + mcps.length + ' MCP</span>';
+  if (tools.length > 0) counts += '<span title="Allowed tools">🔧 ' + tools.length + ' tool' + (tools.length === 1 ? '' : 's') + '</span>';
+  var chips = '';
+  var skillShow = skills.slice(0, 3);
+  for (var i = 0; i < skillShow.length; i++) {
+    chips += '<span class="cap-chip skill" title="Skill: ' + esc(skillShow[i]) + '">' + esc(skillShow[i]) + '</span>';
+  }
+  if (skills.length > 3) chips += '<span class="cap-chip skill muted">+' + (skills.length - 3) + '</span>';
+  var mcpShow = mcps.slice(0, 3);
+  for (var j = 0; j < mcpShow.length; j++) {
+    chips += '<span class="cap-chip mcp" title="MCP server: ' + esc(mcpShow[j]) + '">' + esc(mcpShow[j]) + '</span>';
+  }
+  if (mcps.length > 3) chips += '<span class="cap-chip mcp muted">+' + (mcps.length - 3) + '</span>';
+  return '<div class="task-cap-strip">'
+    + '<div class="task-cap-counts">' + counts + '</div>'
+    + (chips ? '<div class="task-cap-chips">' + chips + '</div>' : '')
+    + '</div>';
+}
+
+/** Render the inline tag-chip row shown above the badge row. Empty string when no tags. */
+function renderTrickTagChips(task) {
+  var tags = Array.isArray(task.tags) ? task.tags : [];
+  if (tags.length === 0) return '';
+  var html = '<div class="task-card-tags">';
+  for (var i = 0; i < tags.length; i++) {
+    html += '<span class="cap-chip tag" onclick="setTrickFilter(\\x27tag\\x27,\\x27' + jsStr(tags[i]) + '\\x27)" style="cursor:pointer">#' + esc(tags[i]) + '</span>';
+  }
+  html += '</div>';
+  return html;
+}
+
+// ── Trick filter state (chip-pill UI above Scheduled Tasks grid) ─────
+var _trickFilter = { kind: null, value: null };
+
+function setTrickFilter(kind, value) {
+  if (_trickFilter.kind === kind && _trickFilter.value === value) {
+    _trickFilter = { kind: null, value: null };
+  } else {
+    _trickFilter = { kind: kind, value: value };
+  }
+  refreshCron();
+}
+
+function clearTrickFilter() {
+  _trickFilter = { kind: null, value: null };
+  refreshCron();
+}
+
+function applyTrickFilter(tasks, filter) {
+  if (!filter || !filter.kind) return tasks;
+  return tasks.filter(function(t) {
+    if (filter.kind === 'tag') return Array.isArray(t.tags) && t.tags.indexOf(filter.value) !== -1;
+    if (filter.kind === 'skill') return Array.isArray(t.skills) && t.skills.indexOf(filter.value) !== -1;
+    if (filter.kind === 'mcp') return Array.isArray(t.allowedMcpServers) && t.allowedMcpServers.indexOf(filter.value) !== -1;
+    if (filter.kind === 'status') {
+      if (filter.value === 'enabled') return t.enabled !== false;
+      if (filter.value === 'disabled') return t.enabled === false;
+      if (filter.value === 'broken') return t.health === 'broken' || t.health === 'failed';
+    }
+    return true;
+  });
+}
+
+function renderTrickFilterRow(allTasks, filter) {
+  var tagSet = new Set(), skillSet = new Set(), mcpSet = new Set();
+  for (var i = 0; i < allTasks.length; i++) {
+    var t = allTasks[i];
+    if (Array.isArray(t.tags)) for (var a = 0; a < t.tags.length; a++) tagSet.add(t.tags[a]);
+    if (Array.isArray(t.skills)) for (var b = 0; b < t.skills.length; b++) skillSet.add(t.skills[b]);
+    if (Array.isArray(t.allowedMcpServers)) for (var c = 0; c < t.allowedMcpServers.length; c++) mcpSet.add(t.allowedMcpServers[c]);
+  }
+  var hasAnyCapability = tagSet.size > 0 || skillSet.size > 0 || mcpSet.size > 0;
+  if (!hasAnyCapability && allTasks.length < 4) return '';
+  var html = '<div class="trick-filter-row">';
+  html += '<span class="trick-filter-label">Filter:</span>';
+  function pill(kind, value, label, extraCls) {
+    var active = filter && filter.kind === kind && filter.value === value;
+    return '<span class="trick-filter-pill' + (active ? ' active' : '') + (extraCls ? ' ' + extraCls : '') + '" '
+      + 'onclick="setTrickFilter(\\x27' + jsStr(kind) + '\\x27,\\x27' + jsStr(value) + '\\x27)">' + esc(label) + '</span>';
+  }
+  html += pill('status', 'enabled', 'enabled');
+  html += pill('status', 'disabled', 'disabled');
+  html += pill('status', 'broken', 'broken');
+  if (tagSet.size > 0) {
+    var tagArr = Array.from(tagSet).sort();
+    for (var i = 0; i < tagArr.length; i++) html += pill('tag', tagArr[i], '#' + tagArr[i], 'tag');
+  }
+  if (skillSet.size > 0) {
+    var skillArr = Array.from(skillSet).sort().slice(0, 8);
+    for (var j = 0; j < skillArr.length; j++) html += pill('skill', skillArr[j], '🧠 ' + skillArr[j]);
+  }
+  if (mcpSet.size > 0) {
+    var mcpArr = Array.from(mcpSet).sort().slice(0, 8);
+    for (var k = 0; k < mcpArr.length; k++) html += pill('mcp', mcpArr[k], '📦 ' + mcpArr[k], 'mcp');
+  }
+  if (filter && filter.kind) {
+    html += '<span class="trick-filter-pill" style="margin-left:auto" onclick="clearTrickFilter()">✕ clear</span>';
+  }
+  html += '</div>';
+  return html;
+}
+
 function renderScheduledTaskCard(task) {
   var enabled = task.enabled !== false;
   var cardCls = 'task-card' + (enabled ? '' : ' disabled') + (task.health === 'running' ? ' running' : '');
@@ -21963,12 +22533,29 @@ function renderScheduledTaskCard(task) {
     var ok = lr.status === 'ok';
     var statusIcon = ok ? '<span style="color:var(--green)">&#10003;</span>' : '<span style="color:var(--red)">&#10007;</span>';
     lastRunHtml = statusIcon + ' ' + esc(lr.status || 'unknown') + ' · ' + esc(timeAgo(lr.finishedAt || lr.startedAt || ''));
+    // "ran with: …" — surface the skills + MCP that were live for this run.
+    var ranWith = [];
+    if (Array.isArray(lr.skillsApplied) && lr.skillsApplied.length > 0) {
+      var skillNames = lr.skillsApplied.slice(0, 2).map(function(s) { return s.name; });
+      var skillSuffix = lr.skillsApplied.length > 2 ? ' +' + (lr.skillsApplied.length - 2) : '';
+      ranWith.push(skillNames.join(', ') + skillSuffix);
+    }
+    if (Array.isArray(lr.mcpServersApplied) && lr.mcpServersApplied.length > 0) {
+      ranWith.push(lr.mcpServersApplied.length + ' MCP');
+    }
+    if (ranWith.length > 0) {
+      lastRunHtml += ' <span style="color:var(--text-muted);font-size:11px" title="Capabilities active for this run">· ran with: ' + esc(ranWith.join(', ')) + '</span>';
+    }
+    if (Array.isArray(lr.skillsMissing) && lr.skillsMissing.length > 0) {
+      lastRunHtml += ' <span style="color:var(--yellow);font-size:11px" title="Pinned skills that didn\\x27t resolve: ' + esc(lr.skillsMissing.join(', ')) + '">⚠ missing skill' + (lr.skillsMissing.length === 1 ? '' : 's') + '</span>';
+    }
   }
   if (task.broken) {
     lastRunHtml = '<span style="color:var(--red)">Needs attention</span> · ' + esc(task.broken.errorCount48h || 0) + '/' + esc(task.broken.totalRuns48h || 0) + ' failures';
   }
   var badges = '';
   if (task.owner) badges += '<span class="badge badge-orange">' + esc(task.owner) + '</span>';
+  if (task.category) badges += '<span class="badge badge-gray" title="Category">' + esc(task.category) + '</span>';
   if (task.mode === 'unleashed') badges += '<span class="badge badge-purple">long-running</span>';
   if (task.after) badges += '<span class="badge badge-yellow" title="Triggered after ' + esc(task.after) + '">after ' + esc(task.after) + '</span>';
   if (task.maxRetries != null) badges += '<span class="badge badge-gray">' + esc(task.maxRetries) + ' retries</span>';
@@ -21981,10 +22568,13 @@ function renderScheduledTaskCard(task) {
     + '<label class="toggle-switch"><input type="checkbox"' + (enabled ? ' checked' : '') + ' onchange="toggleCronJob(\\x27' + safeName + '\\x27)"><span class="toggle-slider"></span></label></div>'
     + '<div class="task-card-schedule">' + operationScheduleHtml(task.schedule) + '</div>'
     + '<div class="task-card-prompt">' + esc(task.prompt || '') + '</div>'
+    + renderTrickCapabilityStrip(task)
     + '<div class="task-card-status">' + lastRunHtml + '</div>'
+    + renderTrickTagChips(task)
     + '<div class="task-card-badges">' + badges + '</div>'
     + '<div class="task-card-actions">'
     + '<button class="btn-sm btn-success" onclick="apiPost(\\x27/api/cron/run/' + encodeURIComponent(task.name) + '\\x27)">Run Now</button>'
+    + '<button class="btn-sm" onclick="openCronPreview(\\x27' + safeName + '\\x27)">Preview</button>'
     + '<button class="btn-sm" data-trace-job="' + esc(task.name) + '">Trace</button>'
     + '<button class="btn-sm" onclick="openEditCronModal(\\x27' + safeName + '\\x27)">Edit</button>'
     + '<button class="btn-sm btn-danger" onclick="confirmDeleteCron(\\x27' + safeName + '\\x27)">Del</button>'
@@ -22067,14 +22657,23 @@ async function refreshCron() {
       if (visibleAttention.length > 12) html += '<div class="empty-state" style="padding:18px;color:var(--text-muted);font-size:13px">Showing 12 of ' + visibleAttention.length + ' items. Use the Owner filter to narrow this list.</div>';
     }
 
-    html += operationSectionHeader('Scheduled Tasks', 'Single recurring jobs from CRON.md. These are the default scheduled automation surface.', 'badge-blue', visibleTasks.length + ' task' + (visibleTasks.length === 1 ? '' : 's'), visibleAttention.length > 0 ? '28px' : '0')
+    var filteredTasks = applyTrickFilter(visibleTasks, _trickFilter);
+    var filterPillsHtml = renderTrickFilterRow(visibleTasks, _trickFilter);
+    var taskCountLabel = (_trickFilter.kind ? filteredTasks.length + '/' + visibleTasks.length : visibleTasks.length) + ' task' + (visibleTasks.length === 1 ? '' : 's');
+    html += operationSectionHeader('Scheduled Tasks', 'Single recurring jobs from CRON.md. These are the default scheduled automation surface.', 'badge-blue', taskCountLabel, visibleAttention.length > 0 ? '28px' : '0')
+      + filterPillsHtml
       + '<div class="task-grid">';
-    if (visibleTasks.length === 0) {
-      var emptyLabel = ownerFilter === BUILD_OWNER_ALL ? 'No scheduled tasks across any agent.' : (ownerFilter ? 'No scheduled tasks for ' + ownerFilter + '.' : 'No global scheduled tasks.');
+    if (filteredTasks.length === 0) {
+      var emptyLabel;
+      if (_trickFilter.kind) {
+        emptyLabel = 'No tasks match the current filter.';
+      } else {
+        emptyLabel = ownerFilter === BUILD_OWNER_ALL ? 'No scheduled tasks across any agent.' : (ownerFilter ? 'No scheduled tasks for ' + ownerFilter + '.' : 'No global scheduled tasks.');
+      }
       html += '<div class="task-card-add" onclick="openCreateCronModal(getBuildCreateOwner())">+ New Scheduled Task</div>'
         + '<div class="empty-state" style="padding:18px;color:var(--text-muted);font-size:13px">' + esc(emptyLabel) + '</div>';
     } else {
-      html += visibleTasks.map(renderScheduledTaskCard).join('');
+      html += filteredTasks.map(renderScheduledTaskCard).join('');
       html += '<div class="task-card-add" onclick="openCreateCronModal(getBuildCreateOwner())">+ New Scheduled Task</div>';
     }
     html += '</div>';
@@ -22991,6 +23590,265 @@ async function deleteGoal(goalId, goalTitle) {
 let editingCronJob = null;
 let _cronAgentContext = '';
 
+// ── Trick capability state (per-modal-open; reset every open) ───────
+let _cronSelectedSkills = [];
+let _cronSelectedMcp = [];
+let _cronTags = [];
+let _skillsCatalog = null;
+let _mcpCatalog = null;
+
+function resetTrickCapabilityState() {
+  _cronSelectedSkills = [];
+  _cronSelectedMcp = [];
+  _cronTags = [];
+  _skillsCatalog = null;
+  _mcpCatalog = null;
+  var skillsPanel = document.getElementById('cron-skills-search-panel');
+  if (skillsPanel) skillsPanel.style.display = 'none';
+  var mcpPanel = document.getElementById('cron-mcp-search-panel');
+  if (mcpPanel) mcpPanel.style.display = 'none';
+  var toolsPanel = document.getElementById('cron-tools-panel');
+  if (toolsPanel) toolsPanel.style.display = 'none';
+  var toolsTA = document.getElementById('cron-allowed-tools');
+  if (toolsTA) toolsTA.value = '';
+  var skillsSearch = document.getElementById('cron-skills-search');
+  if (skillsSearch) skillsSearch.value = '';
+  var mcpSearch = document.getElementById('cron-mcp-search');
+  if (mcpSearch) mcpSearch.value = '';
+  var toolsToggle = document.getElementById('cron-tools-toggle-btn');
+  if (toolsToggle) toolsToggle.textContent = '▾ Show';
+  var catEl = document.getElementById('cron-category');
+  if (catEl) catEl.value = '';
+  renderSkillsPickerChips();
+  renderMcpPickerChips();
+  renderTagsPickerChips();
+}
+
+function renderSkillsPickerChips() {
+  var box = document.getElementById('cron-skills-chips');
+  if (!box) return;
+  if (_cronSelectedSkills.length === 0) {
+    box.innerHTML = '<span class="cap-picker-empty">No pinned skills — runtime auto-match will pick.</span>';
+    return;
+  }
+  box.innerHTML = _cronSelectedSkills.map(function(s) {
+    return '<span class="cap-picker-chip skill">' + esc(s)
+      + '<button type="button" title="Remove" onclick="removeSkillFromTrick(\\x27' + jsStr(s) + '\\x27)">&times;</button></span>';
+  }).join('');
+}
+
+function renderMcpPickerChips() {
+  var box = document.getElementById('cron-mcp-chips');
+  if (!box) return;
+  if (_cronSelectedMcp.length === 0) {
+    box.innerHTML = '<span class="cap-picker-empty">No allowlist — inherits agent profile / defaults.</span>';
+    return;
+  }
+  box.innerHTML = _cronSelectedMcp.map(function(s) {
+    return '<span class="cap-picker-chip mcp">' + esc(s)
+      + '<button type="button" title="Remove" onclick="removeMcpFromTrick(\\x27' + jsStr(s) + '\\x27)">&times;</button></span>';
+  }).join('');
+}
+
+function renderTagsPickerChips() {
+  var box = document.getElementById('cron-tags-chips');
+  if (!box) return;
+  if (_cronTags.length === 0) {
+    box.innerHTML = '<span class="cap-picker-empty">No tags.</span>';
+    return;
+  }
+  box.innerHTML = _cronTags.map(function(t) {
+    return '<span class="cap-picker-chip tag">#' + esc(t)
+      + '<button type="button" title="Remove" onclick="removeTagFromTrick(\\x27' + jsStr(t) + '\\x27)">&times;</button></span>';
+  }).join('');
+}
+
+async function loadSkillsCatalog() {
+  if (_skillsCatalog) return _skillsCatalog;
+  try {
+    var url = _cronAgentContext
+      ? '/api/agents/' + encodeURIComponent(_cronAgentContext) + '/skills'
+      : '/api/skills';
+    var r = await apiFetch(url);
+    var d = await r.json();
+    _skillsCatalog = { skills: d.skills || [] };
+  } catch {
+    _skillsCatalog = { skills: [] };
+  }
+  return _skillsCatalog;
+}
+
+async function loadMcpCatalog() {
+  if (_mcpCatalog) return _mcpCatalog;
+  try {
+    var r = await apiFetch('/api/mcp-servers');
+    var d = await r.json();
+    _mcpCatalog = { servers: d.servers || [] };
+  } catch {
+    _mcpCatalog = { servers: [] };
+  }
+  return _mcpCatalog;
+}
+
+async function toggleSkillsPickerSearch() {
+  var panel = document.getElementById('cron-skills-search-panel');
+  if (!panel) return;
+  if (panel.style.display === 'none') {
+    panel.style.display = '';
+    await loadSkillsCatalog();
+    renderSkillsPickerList();
+    var inp = document.getElementById('cron-skills-search');
+    if (inp) inp.focus();
+  } else {
+    panel.style.display = 'none';
+  }
+}
+
+function renderSkillsPickerList() {
+  var listEl = document.getElementById('cron-skills-list');
+  if (!listEl || !_skillsCatalog) return;
+  var q = (document.getElementById('cron-skills-search')?.value || '').toLowerCase().trim();
+  var skills = _skillsCatalog.skills;
+  if (q) {
+    skills = skills.filter(function(s) {
+      var hay = (s.name + ' ' + (s.title || '') + ' ' + (s.description || '') + ' ' + (s.triggers || []).join(' ')).toLowerCase();
+      return hay.indexOf(q) !== -1;
+    });
+  }
+  if (skills.length === 0) {
+    listEl.innerHTML = '<div class="cap-picker-empty-state">' + (q ? 'No matches.' : 'No skills available.') + '</div>';
+    return;
+  }
+  listEl.innerHTML = skills.slice(0, 50).map(function(s) {
+    var sel = _cronSelectedSkills.indexOf(s.name) !== -1;
+    var triggers = (s.triggers || []).slice(0, 4).join(', ');
+    return '<div class="cap-picker-row' + (sel ? ' selected' : '') + '" onclick="addSkillToTrick(\\x27' + jsStr(s.name) + '\\x27)">'
+      + '<div class="cap-picker-row-body">'
+      + '<div class="cap-picker-row-title">' + esc(s.title || s.name) + ' '
+      + '<span style="color:var(--text-muted);font-weight:normal;font-size:10px">' + esc(s.name) + '</span>'
+      + (sel ? ' <span style="color:var(--accent);font-size:11px">✓ pinned</span>' : '')
+      + '</div>'
+      + (s.description ? '<div class="cap-picker-row-desc">' + esc(s.description) + '</div>' : '')
+      + (triggers ? '<div class="cap-picker-row-meta">triggers: ' + esc(triggers) + (s.triggers && s.triggers.length > 4 ? ' …' : '') + '</div>' : '')
+      + '</div></div>';
+  }).join('');
+}
+
+function addSkillToTrick(name) {
+  if (_cronSelectedSkills.indexOf(name) !== -1) {
+    removeSkillFromTrick(name);
+    return;
+  }
+  _cronSelectedSkills.push(name);
+  renderSkillsPickerChips();
+  renderSkillsPickerList();
+}
+
+function removeSkillFromTrick(name) {
+  _cronSelectedSkills = _cronSelectedSkills.filter(function(s) { return s !== name; });
+  renderSkillsPickerChips();
+  renderSkillsPickerList();
+}
+
+async function toggleMcpPickerSearch() {
+  var panel = document.getElementById('cron-mcp-search-panel');
+  if (!panel) return;
+  if (panel.style.display === 'none') {
+    panel.style.display = '';
+    await loadMcpCatalog();
+    renderMcpPickerList();
+    var inp = document.getElementById('cron-mcp-search');
+    if (inp) inp.focus();
+  } else {
+    panel.style.display = 'none';
+  }
+}
+
+function renderMcpPickerList() {
+  var listEl = document.getElementById('cron-mcp-list');
+  if (!listEl || !_mcpCatalog) return;
+  var q = (document.getElementById('cron-mcp-search')?.value || '').toLowerCase().trim();
+  var servers = _mcpCatalog.servers;
+  if (q) {
+    servers = servers.filter(function(s) {
+      var hay = (s.name + ' ' + (s.description || '') + ' ' + (s.source || '')).toLowerCase();
+      return hay.indexOf(q) !== -1;
+    });
+  }
+  if (servers.length === 0) {
+    listEl.innerHTML = '<div class="cap-picker-empty-state">' + (q ? 'No matches.' : 'No MCP servers discovered.') + '</div>';
+    return;
+  }
+  listEl.innerHTML = servers.slice(0, 50).map(function(s) {
+    var sel = _cronSelectedMcp.indexOf(s.name) !== -1;
+    var enabledTag = s.enabled === false ? ' <span style="color:var(--text-muted);font-size:10px">(disabled)</span>' : '';
+    return '<div class="cap-picker-row mcp' + (sel ? ' selected' : '') + '" onclick="addMcpToTrick(\\x27' + jsStr(s.name) + '\\x27)">'
+      + '<div class="cap-picker-row-body">'
+      + '<div class="cap-picker-row-title">' + esc(s.name) + enabledTag
+      + (sel ? ' <span style="color:var(--purple);font-size:11px">✓ allowed</span>' : '')
+      + '</div>'
+      + (s.description ? '<div class="cap-picker-row-desc">' + esc(s.description) + '</div>' : '')
+      + (s.source ? '<div class="cap-picker-row-meta">source: ' + esc(s.source) + '</div>' : '')
+      + '</div></div>';
+  }).join('');
+}
+
+function addMcpToTrick(name) {
+  if (_cronSelectedMcp.indexOf(name) !== -1) {
+    removeMcpFromTrick(name);
+    return;
+  }
+  _cronSelectedMcp.push(name);
+  renderMcpPickerChips();
+  renderMcpPickerList();
+}
+
+function removeMcpFromTrick(name) {
+  _cronSelectedMcp = _cronSelectedMcp.filter(function(s) { return s !== name; });
+  renderMcpPickerChips();
+  renderMcpPickerList();
+}
+
+function toggleAllowedToolsPanel() {
+  var panel = document.getElementById('cron-tools-panel');
+  var btn = document.getElementById('cron-tools-toggle-btn');
+  if (!panel || !btn) return;
+  if (panel.style.display === 'none') {
+    panel.style.display = '';
+    btn.textContent = '▴ Hide';
+  } else {
+    panel.style.display = 'none';
+    btn.textContent = '▾ Show';
+  }
+}
+
+function handleTagInputKeydown(event) {
+  if (event.key !== 'Enter' && event.key !== ',') return;
+  event.preventDefault();
+  var inp = document.getElementById('cron-tags-input');
+  if (!inp) return;
+  var val = inp.value.trim().replace(/^#+/, '');
+  if (!val) return;
+  if (_cronTags.indexOf(val) === -1) {
+    _cronTags.push(val);
+    renderTagsPickerChips();
+  }
+  inp.value = '';
+}
+
+function removeTagFromTrick(tag) {
+  _cronTags = _cronTags.filter(function(t) { return t !== tag; });
+  renderTagsPickerChips();
+}
+
+function parseAllowedToolsRaw() {
+  var ta = document.getElementById('cron-allowed-tools');
+  if (!ta) return [];
+  var raw = ta.value || '';
+  var tokens = raw.split(/[,\n\s]+/).map(function(s) { return s.trim(); }).filter(Boolean);
+  return tokens.filter(function(t) { return /^[A-Za-z0-9_:-]+$/.test(t); });
+}
+
 function populateAfterJobDropdown(selectedAfter, excludeName) {
   var sel = document.getElementById('cron-after');
   sel.innerHTML = '<option value="">None — runs on schedule</option>';
@@ -23033,6 +23891,7 @@ function openCreateCronModal(agentSlug) {
   document.getElementById('cron-training-section').style.display = 'none';
   document.getElementById('cron-train-btn').style.display = '';
   resetCronTrainingChat();
+  resetTrickCapabilityState();
   document.getElementById('cron-modal').classList.add('show');
 }
 
@@ -23058,9 +23917,130 @@ function openEditCronModal(jobName) {
   document.getElementById('cron-training-section').style.display = 'none';
   document.getElementById('cron-train-btn').style.display = '';
   resetCronTrainingChat();
+  // ── Trick capabilities — populate from job (snake_case in YAML; camelCase from API) ─
+  resetTrickCapabilityState();
+  _cronSelectedSkills = Array.isArray(job.skills) ? job.skills.slice() : [];
+  _cronSelectedMcp = Array.isArray(job.allowed_mcp_servers)
+    ? job.allowed_mcp_servers.slice()
+    : (Array.isArray(job.allowedMcpServers) ? job.allowedMcpServers.slice() : []);
+  _cronTags = Array.isArray(job.tags) ? job.tags.slice() : [];
+  var allowedTools = Array.isArray(job.allowed_tools)
+    ? job.allowed_tools
+    : (Array.isArray(job.allowedTools) ? job.allowedTools : []);
+  var ta = document.getElementById('cron-allowed-tools');
+  if (ta) ta.value = allowedTools.join(', ');
+  if (allowedTools.length > 0) toggleAllowedToolsPanel();
+  var catEl = document.getElementById('cron-category');
+  if (catEl) catEl.value = job.category || '';
+  renderSkillsPickerChips();
+  renderMcpPickerChips();
+  renderTagsPickerChips();
   _pendingAttachments = [];
   loadCronAttachments(jobName);
   document.getElementById('cron-modal').classList.add('show');
+}
+
+/**
+ * Open the trick preview modal — shows the EXACT prompt + resolved skills
+ * + tool/MCP allowlists this trick will run with on the next cron tick,
+ * without dispatching to the agent. The visibility tool that catches
+ * "configured via chat → surprise at fire time" before the surprise.
+ */
+async function openCronPreview(jobName) {
+  document.getElementById('cron-preview-title').textContent = 'Preview: ' + jobName;
+  var body = document.getElementById('cron-preview-body');
+  body.innerHTML = '<div style="padding:24px;color:var(--text-muted);text-align:center">Loading preview…</div>';
+  document.getElementById('cron-preview-modal').classList.add('show');
+  try {
+    var r = await apiFetch('/api/cron/' + encodeURIComponent(jobName) + '/preview');
+    var d = await r.json();
+    if (!r.ok || d.error) {
+      body.innerHTML = '<div class="preview-section" style="color:var(--red)">Preview failed: ' + esc(d.error || 'unknown') + '</div>';
+      return;
+    }
+    body.innerHTML = renderCronPreview(d);
+  } catch(e) {
+    body.innerHTML = '<div class="preview-section" style="color:var(--red)">Preview failed: ' + esc(String(e)) + '</div>';
+  }
+}
+
+function closeCronPreviewModal() {
+  document.getElementById('cron-preview-modal').classList.remove('show');
+}
+
+function renderCronPreview(d) {
+  var html = '';
+  // Warnings band first
+  if (Array.isArray(d.warnings) && d.warnings.length > 0) {
+    html += '<div class="preview-section">';
+    for (var w = 0; w < d.warnings.length; w++) {
+      html += '<div class="preview-warn">⚠ ' + esc(d.warnings[w].detail) + '</div>';
+    }
+    html += '</div>';
+  }
+  // Summary header
+  html += '<div class="preview-section">';
+  html += '<h4>Summary</h4>';
+  html += '<div style="font-size:12px;color:var(--text-secondary);line-height:1.6">';
+  html += '<div><strong>Schedule:</strong> ' + esc(d.job.schedule) + '</div>';
+  html += '<div><strong>Tier:</strong> ' + esc(d.tier) + ' (effort: ' + esc(d.effort) + (d.maxBudgetUsd ? ', budget: $' + d.maxBudgetUsd : '') + ')</div>';
+  html += '<div><strong>Agent:</strong> ' + esc(d.profile ? (d.profile.name + ' (' + d.profile.slug + ')') : 'Clementine (global)') + '</div>';
+  if (d.job.tags && d.job.tags.length) html += '<div><strong>Tags:</strong> ' + d.job.tags.map(function(t) { return '#' + esc(t); }).join(', ') + '</div>';
+  if (d.job.category) html += '<div><strong>Category:</strong> ' + esc(d.job.category) + '</div>';
+  html += '</div></div>';
+  // Skills (with full content) — the headline visibility win
+  html += '<div class="preview-section">';
+  html += '<h4>Skills injected (' + d.skillsApplied.length + ')</h4>';
+  if (d.skillsApplied.length === 0) {
+    html += '<div style="color:var(--text-muted);font-size:12px;font-style:italic">No skills will be injected for this run.</div>';
+  } else {
+    for (var i = 0; i < d.skillsApplied.length; i++) {
+      var s = d.skillsApplied[i];
+      var sourceTag = s.source === 'pinned'
+        ? '<span style="color:var(--accent);font-size:10px;text-transform:uppercase;letter-spacing:0.4px">pinned</span>'
+        : '<span style="color:var(--text-muted);font-size:10px;text-transform:uppercase;letter-spacing:0.4px">auto-matched</span>';
+      html += '<div class="preview-skill">';
+      html += '<div class="preview-skill-title">' + esc(s.title) + ' <span style="color:var(--text-muted);font-size:10px;font-weight:normal">(' + esc(s.name) + ')</span> ' + sourceTag + '</div>';
+      if (s.toolsUsed && s.toolsUsed.length) {
+        html += '<div class="preview-skill-meta">tools: ' + s.toolsUsed.map(esc).join(', ') + '</div>';
+      }
+      if (s.content) html += '<div class="preview-skill-body">' + esc(s.content) + '</div>';
+      html += '</div>';
+    }
+  }
+  html += '</div>';
+  // MCP servers
+  html += '<div class="preview-section">';
+  html += '<h4>MCP servers (' + d.mcpServers.length + ')</h4>';
+  if (d.mcpServers.length === 0) {
+    html += '<div style="color:var(--text-muted);font-size:12px;font-style:italic">No additional MCP servers (clementine-tools always available).</div>';
+  } else {
+    for (var k = 0; k < d.mcpServers.length; k++) {
+      var m = d.mcpServers[k];
+      html += '<div style="padding:6px 0;border-bottom:1px dashed var(--border-light)">';
+      html += '<div style="font-weight:600;font-size:12px;color:var(--purple)">' + esc(m.name) + '</div>';
+      if (m.description) html += '<div style="font-size:11px;color:var(--text-muted)">' + esc(m.description) + '</div>';
+      html += '</div>';
+    }
+  }
+  html += '</div>';
+  // Tool allowlist
+  html += '<div class="preview-section">';
+  html += '<h4>Tool allowlist</h4>';
+  if (!d.effectiveAllowedTools) {
+    html += '<div style="color:var(--text-muted);font-size:12px;font-style:italic">Inheriting from agent profile / SDK default — no per-trick tool restriction.</div>';
+  } else {
+    html += '<div style="font-family:monospace;font-size:11px;color:var(--text-secondary);line-height:1.6">';
+    html += d.effectiveAllowedTools.map(esc).join(', ');
+    html += '</div>';
+  }
+  html += '</div>';
+  // Built prompt (collapsed by default)
+  html += '<div class="preview-section">';
+  html += '<h4>Built prompt <span style="font-weight:normal;color:var(--text-muted)">(' + d.builtPrompt.length + ' chars — what the agent receives)</span></h4>';
+  html += '<div class="preview-prompt-box">' + esc(d.builtPrompt) + '</div>';
+  html += '</div>';
+  return html;
 }
 
 function closeCronModal() {
@@ -23188,13 +24168,32 @@ async function saveCronJob() {
   const max_retries = max_retries_val !== '' ? parseInt(max_retries_val) : undefined;
   const after = document.getElementById('cron-after').value || undefined;
   const context = document.getElementById('cron-context').value.trim() || undefined;
+  const categoryRaw = (document.getElementById('cron-category')?.value || '').trim();
+  const category = categoryRaw || undefined;
+  const allowedTools = parseAllowedToolsRaw();
 
   if (!name || !schedule || !prompt) {
     toast('Please fill in all fields', 'error');
     return;
   }
 
-  const body = { name, schedule, tier, prompt, enabled: true, work_dir: work_dir || undefined, mode, max_hours, max_retries, after, context };
+  const body = {
+    name, schedule, tier, prompt, enabled: true,
+    work_dir: work_dir || undefined, mode, max_hours, max_retries, after, context,
+    // Capabilities. PUT clears with [] / null per the dashboard convention so
+    // a user removing all chips actually deletes the YAML key.
+    skills: editingCronJob
+      ? _cronSelectedSkills
+      : (_cronSelectedSkills.length ? _cronSelectedSkills : undefined),
+    allowedTools: editingCronJob
+      ? allowedTools
+      : (allowedTools.length ? allowedTools : undefined),
+    allowedMcpServers: editingCronJob
+      ? _cronSelectedMcp
+      : (_cronSelectedMcp.length ? _cronSelectedMcp : undefined),
+    tags: editingCronJob ? _cronTags : (_cronTags.length ? _cronTags : undefined),
+    category: editingCronJob ? (category || '') : category,
+  };
 
   if (editingCronJob) {
     await apiJson('PUT', '/api/cron/' + encodeURIComponent(editingCronJob), body);

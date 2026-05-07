@@ -126,6 +126,20 @@ export function logToDailyNote(line: string): void {
 // ── Shared CRON.md parser ────────────────────────────────────────────
 
 /**
+ * Normalize a YAML-supplied string array: filter non-strings, trim,
+ * drop empties, dedupe. Returns `undefined` when the input shouldn't
+ * contribute (preserves the "absent ⇒ inherit" semantic so trick-level
+ * allowlists fall back to the agent profile when omitted).
+ */
+function normalizeStringArray(v: unknown): string[] | undefined {
+  if (!Array.isArray(v)) return undefined;
+  const out = Array.from(new Set(
+    v.map(x => typeof x === 'string' ? x.trim() : '').filter(Boolean),
+  ));
+  return out.length > 0 ? out : undefined;
+}
+
+/**
  * Parse cron job definitions from vault/00-System/CRON.md frontmatter.
  * Used by both the in-process CronScheduler and the standalone CLI runner.
  */
@@ -169,13 +183,26 @@ export function parseCronJobs(): CronJobDefinition[] {
     const agentSlug = typeof agentSlugRaw === 'string' && /^[a-z0-9-]+$/i.test(agentSlugRaw)
       ? agentSlugRaw
       : undefined;
+    // ── Trick capabilities — accept both camelCase and snake_case ─────
+    const skills = normalizeStringArray(job.skills);
+    const allowedTools = normalizeStringArray(job.allowed_tools ?? job.allowedTools);
+    const allowedMcpServers = normalizeStringArray(job.allowed_mcp_servers ?? job.allowedMcpServers);
+    const tags = normalizeStringArray(job.tags);
+    const categoryRaw = job.category;
+    const category = typeof categoryRaw === 'string' && categoryRaw.trim()
+      ? categoryRaw.trim().slice(0, 64)
+      : undefined;
 
     if (!name || !schedule || !prompt) {
       logger.warn({ job }, 'Skipping malformed cron job');
       continue;
     }
 
-    jobs.push({ name, schedule, prompt, enabled, tier, maxTurns, model, workDir, mode, maxHours, maxRetries, after, successCriteria, alwaysDeliver, context, preCheck, agentSlug });
+    jobs.push({
+      name, schedule, prompt, enabled, tier, maxTurns, model, workDir, mode,
+      maxHours, maxRetries, after, successCriteria, alwaysDeliver, context, preCheck, agentSlug,
+      skills, allowedTools, allowedMcpServers, tags, category,
+    });
   }
 
   return jobs;
@@ -226,6 +253,18 @@ export function parseAgentCronJobs(agentsDir: string): CronJobDefinition[] {
           : undefined;
         const context = job.context != null ? String(job.context) : undefined;
         const preCheck = job.pre_check != null ? String(job.pre_check) : undefined;
+        // ── Trick capabilities — symmetric with global parser ─────────
+        // (NB: this parser still lacks alwaysDeliver/attachments/
+        // requiresConfirmation/confirmationTimeoutMin from the global
+        // parser — pre-existing drift, fix in a separate change.)
+        const skills = normalizeStringArray(job.skills);
+        const allowedTools = normalizeStringArray(job.allowed_tools ?? job.allowedTools);
+        const allowedMcpServers = normalizeStringArray(job.allowed_mcp_servers ?? job.allowedMcpServers);
+        const tags = normalizeStringArray(job.tags);
+        const categoryRaw = job.category;
+        const category = typeof categoryRaw === 'string' && categoryRaw.trim()
+          ? categoryRaw.trim().slice(0, 64)
+          : undefined;
 
         if (!name || !schedule || !prompt) {
           logger.warn({ job, agent: slug }, 'Skipping malformed agent cron job');
@@ -238,6 +277,7 @@ export function parseAgentCronJobs(agentsDir: string): CronJobDefinition[] {
           schedule, prompt, enabled, tier, maxTurns, model, workDir,
           mode, maxHours, maxRetries, after, successCriteria, context, preCheck,
           agentSlug: slug,
+          skills, allowedTools, allowedMcpServers, tags, category,
         });
       }
     } catch (err) {
@@ -1206,6 +1246,9 @@ export class CronScheduler {
             effectiveTimeoutMs,
             job.successCriteria,
             job.agentSlug,
+            job.skills,
+            job.allowedTools,
+            job.allowedMcpServers,
           );
 
           // alwaysDeliver: retry once if the response is empty/noise
@@ -1224,6 +1267,9 @@ export class CronScheduler {
                 effectiveTimeoutMs,
                 job.successCriteria,
                 job.agentSlug,
+                job.skills,
+                job.allowedTools,
+                job.allowedMcpServers,
               );
               if (retryResponse && !CronScheduler.isCronNoise(retryResponse)) {
                 response = retryResponse;
@@ -1240,6 +1286,7 @@ export class CronScheduler {
           // Success — log and dispatch
           const finishedAt = new Date();
           const terminalReason = this.gateway.consumeLastTerminalReason() as CronRunEntry['terminalReason'];
+          const cronMetadata = this.gateway.consumeLastCronRunMetadata();
           const entry: CronRunEntry = {
             jobName: job.name,
             startedAt: startedAt.toISOString(),
@@ -1250,7 +1297,12 @@ export class CronScheduler {
             outputPreview: response ? response.slice(0, 200) : undefined,
             advisorApplied,
             terminalReason,
-    
+            // Trick capability metadata — surfaced by the dashboard's
+            // "ran with: …" line. Omit empty arrays to keep the JSONL light.
+            ...(cronMetadata?.skillsApplied?.length ? { skillsApplied: cronMetadata.skillsApplied } : {}),
+            ...(cronMetadata?.skillsMissing?.length ? { skillsMissing: cronMetadata.skillsMissing } : {}),
+            ...(cronMetadata?.allowedToolsApplied?.length ? { allowedToolsApplied: cronMetadata.allowedToolsApplied } : {}),
+            ...(cronMetadata?.mcpServersApplied?.length ? { mcpServersApplied: cronMetadata.mcpServersApplied } : {}),
           };
 
           if (response && !CronScheduler.isCronNoise(response)) {
@@ -1307,6 +1359,9 @@ export class CronScheduler {
         } catch (err) {
           const finishedAt = new Date();
           const errTerminalReason = this.gateway.consumeLastTerminalReason() as CronRunEntry['terminalReason'];
+          // Drain the metadata side-channel so a failed run doesn't leak
+          // its capability info into the next run's entry.
+          const errCronMetadata = this.gateway.consumeLastCronRunMetadata();
           const errorType = errTerminalReason
             ? classifyTerminalReason(errTerminalReason)
             : classifyError(err);
@@ -1321,6 +1376,10 @@ export class CronScheduler {
             errorType,
             terminalReason: errTerminalReason,
             attempt,
+            ...(errCronMetadata?.skillsApplied?.length ? { skillsApplied: errCronMetadata.skillsApplied } : {}),
+            ...(errCronMetadata?.skillsMissing?.length ? { skillsMissing: errCronMetadata.skillsMissing } : {}),
+            ...(errCronMetadata?.allowedToolsApplied?.length ? { allowedToolsApplied: errCronMetadata.allowedToolsApplied } : {}),
+            ...(errCronMetadata?.mcpServersApplied?.length ? { mcpServersApplied: errCronMetadata.mcpServersApplied } : {}),
             advisorApplied,
     
           });

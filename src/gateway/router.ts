@@ -164,6 +164,17 @@ export class Gateway {
   private auditLog: string[] = [];
   private draining = false;
 
+  /** Side-channel for the metadata of the *most recent* cron run, populated
+   *  by `handleCronJob` and consumed by the scheduler when building its
+   *  `CronRunEntry`. Mirrors the `consumeLastTerminalReason` pattern so we
+   *  don't have to refactor `handleCronJob`'s positional return shape. */
+  private _lastCronRunMetadata?: {
+    skillsApplied: Array<{ name: string; source: 'pinned' | 'auto'; score?: number }>;
+    skillsMissing: string[];
+    allowedToolsApplied?: string[];
+    mcpServersApplied: string[];
+  };
+
   /** Persisted set of channel keys the owner has approved. Loaded lazily. */
   private seenChannels: Set<string> | null = null;
 
@@ -2228,6 +2239,10 @@ export class Gateway {
     timeoutMs?: number,
     successCriteria?: string[],
     agentSlug?: string,
+    // ── Trick capabilities (optional; preserve today's behavior when omitted) ─
+    pinnedSkills?: string[],
+    allowedTools?: string[],
+    allowedMcpServers?: string[],
   ): Promise<string> {
     const releaseLane = await lanes.acquire('cron');
     // Build a wall-clock abort timer from maxHours / timeoutMs.
@@ -2267,15 +2282,30 @@ export class Gateway {
           workDir,
           abortSignal: cronAc.signal,
           postTaskHooks: this.assistant,
+          pinnedSkills,
+          allowedTools,
+          allowedMcpServers,
         });
 
         scanner.refreshIntegrity();
+        // Stash trick-capability metadata for the scheduler to read when
+        // building the CronRunEntry. Side-channel (not in the return shape)
+        // to avoid breaking the existing positional-args API of handleCronJob.
+        this._lastCronRunMetadata = {
+          skillsApplied: cronResult.skillsApplied,
+          skillsMissing: cronResult.skillsMissing,
+          allowedToolsApplied: cronResult.allowedToolsApplied,
+          mcpServersApplied: cronResult.mcpServersApplied,
+        };
         logger.info({
           jobName,
           cost: Number(cronResult.totalCostUsd.toFixed(4)),
           numTurns: cronResult.numTurns,
           composioConnected: cronResult.composioConnected.length,
           externalConnected: cronResult.externalConnected.length,
+          skillsApplied: cronResult.skillsApplied.length,
+          skillsMissing: cronResult.skillsMissing.length,
+          mcpServersApplied: cronResult.mcpServersApplied.length,
           durationMs: Date.now() - cronStart,
         }, 'runAgentCron: cron job complete');
         return cronResult.text;
@@ -2454,6 +2484,23 @@ export class Gateway {
    */
   consumeLastTerminalReason(): string | undefined {
     return this.assistant.consumeLastTerminalReason();
+  }
+
+  /**
+   * Get and consume the trick-capability metadata from the most recent
+   * cron run. Returns undefined if no cron run is pending. Used by the
+   * scheduler when building its `CronRunEntry` so the dashboard can
+   * render a "ran with: …" line for each completed run.
+   */
+  consumeLastCronRunMetadata(): {
+    skillsApplied: Array<{ name: string; source: 'pinned' | 'auto'; score?: number }>;
+    skillsMissing: string[];
+    allowedToolsApplied?: string[];
+    mcpServersApplied: string[];
+  } | undefined {
+    const md = this._lastCronRunMetadata;
+    this._lastCronRunMetadata = undefined;
+    return md;
   }
 
   // ── Approval system ─────────────────────────────────────────────────

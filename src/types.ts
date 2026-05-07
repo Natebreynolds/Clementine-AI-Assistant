@@ -388,6 +388,26 @@ export interface CronJobDefinition {
   attachments?: string[];          // Filenames in ~/.clementine/attachments/{job-name}/ injected at runtime
   requiresConfirmation?: boolean;  // If true, ask owner before running — auto-proceeds after timeout
   confirmationTimeoutMin?: number; // Minutes to wait for confirmation before auto-proceeding (default: 5)
+  // ── Trick capabilities (optional, all backward-compatible) ──────────
+  /** Pinned skill slugs (filename-flattened, e.g. "auto-discord-send-message").
+   *  Loaded ahead of any auto-matched skills via `loadSkillByName`.
+   *  Missing/disabled pins are warned, not fatal. */
+  skills?: string[];
+  /** Per-trick tool whitelist. When set, intersected with the agent
+   *  profile's `team.allowedTools` (when present). 'Agent' is always
+   *  force-included so subagent delegation still works. Empty/undefined
+   *  preserves today's behavior — falls through to profile or default. */
+  allowedTools?: string[];
+  /** Per-trick MCP server whitelist (server names from `discoverMcpServers`).
+   *  Applied AFTER `buildExtraMcpForRunAgent` runs, so the effective set
+   *  is `profile ∩ trick`. */
+  allowedMcpServers?: string[];
+  /** Free-form tags. Surfaced in the dashboard for grouping/filtering.
+   *  No execution-path coupling. */
+  tags?: string[];
+  /** Single category bucket — convenience for default grouping in the
+   *  dashboard (e.g. "ops", "research", "morning"). */
+  category?: string;
 }
 
 export type LongTaskRisk = 'normal' | 'long' | 'huge' | 'unsafe';
@@ -436,6 +456,16 @@ export interface CronRunEntry {
     enriched?: boolean;
     escalated?: boolean;
   };
+  // ── Trick capability metadata (which skills/tools/MCP actually ran) ─
+  /** Skills injected into the prompt for this run (pinned + auto-matched). */
+  skillsApplied?: Array<{ name: string; source: 'pinned' | 'auto'; score?: number }>;
+  /** Pinned skills that didn't resolve (deleted/renamed/suppressed). */
+  skillsMissing?: string[];
+  /** Effective tool allowlist passed to runAgent (post-intersection). Undefined
+   *  means the trick didn't override — runAgent fell through to profile/default. */
+  allowedToolsApplied?: string[];
+  /** MCP servers live for this run (post profile + trick allowlist intersection). */
+  mcpServersApplied?: string[];
 }
 
 // ── Config ───────────────────────────────────────────────────────────

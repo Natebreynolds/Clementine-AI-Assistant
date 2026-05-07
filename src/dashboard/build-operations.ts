@@ -94,6 +94,17 @@ export interface ScheduledTaskCard {
   usage?: UsageSnapshot;
   actions: BuildActionSet;
   definition: Record<string, unknown>;
+  // ── Trick capabilities (surfaced for the capability-first card) ─
+  /** Pinned skill slugs from the trick definition (raw — not resolved). */
+  skills?: string[];
+  /** Per-trick tool whitelist (raw — not yet intersected with the agent profile). */
+  allowedTools?: string[];
+  /** Per-trick MCP server whitelist. */
+  allowedMcpServers?: string[];
+  /** Free-form tags for grouping/filtering. */
+  tags?: string[];
+  /** Optional category bucket. */
+  category?: string;
 }
 
 export interface ScheduledWorkflowCard {
@@ -179,6 +190,14 @@ function asString(value: unknown, fallback = ''): string {
 function asNumber(value: unknown): number | undefined {
   const n = typeof value === 'number' ? value : Number(value);
   return Number.isFinite(n) ? n : undefined;
+}
+
+function asStringArray(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const out = value
+    .map(v => typeof v === 'string' ? v.trim() : '')
+    .filter(Boolean);
+  return out.length > 0 ? out : undefined;
 }
 
 function ownerLabel(owner: string): string {
@@ -375,6 +394,12 @@ export function buildOperationsSnapshot(input: BuildOperationsInput): BuildOpera
         dismissDiagnosis: !!broken?.diagnosis,
       },
       definition: job,
+      // ── Trick capabilities — read snake_case (YAML source) and camelCase (API source) ─
+      skills: asStringArray(job.skills),
+      allowedTools: asStringArray(job.allowed_tools ?? job.allowedTools),
+      allowedMcpServers: asStringArray(job.allowed_mcp_servers ?? job.allowedMcpServers),
+      tags: asStringArray(job.tags),
+      category: typeof job.category === 'string' && job.category.trim() ? job.category.trim() : undefined,
     };
   }).sort((a, b) => a.owner.localeCompare(b.owner) || a.displayName.localeCompare(b.displayName));
 

@@ -1163,7 +1163,7 @@ server.tool(
 
 server.tool(
   'add_cron_job',
-  'Add a new scheduled cron job. Validates the schedule expression and writes to CRON.md. The daemon auto-reloads on file change. The canonical SDK path runs every job through runAgentCron — there is no separate "unleashed" mode anymore; the SDK handles compaction + multi-turn work natively up to maxBudgetUsd.',
+  'Add a new scheduled cron job ("trick"). Validates the schedule expression and writes to CRON.md. The daemon auto-reloads on file change. The canonical SDK path runs every job through runAgentCron — there is no separate "unleashed" mode anymore; the SDK handles compaction + multi-turn work natively up to maxBudgetUsd. CAPABILITIES: pin specific skills with `skills`, constrain tools with `allowed_tools`, and constrain MCP servers with `allowed_mcp_servers` so the trick has predictable behavior at fire time. Without these, the runtime auto-matches skills which can surprise the user.',
   {
     name: z.string().describe('Job name (unique identifier)'),
     schedule: z.string().describe('Cron expression (e.g., "0 9 * * 1" for Monday 9 AM)'),
@@ -1172,8 +1172,13 @@ server.tool(
     enabled: z.boolean().optional().default(true).describe('Whether the job is enabled'),
     work_dir: z.string().optional().describe('Project directory to run in (agent gets access to project tools, CLAUDE.md, files)'),
     max_hours: z.number().optional().describe('Wall-clock cap in hours. Defaults to 1h. Run aborts via AbortSignal when exceeded.'),
+    skills: z.array(z.string()).optional().describe('Pinned skill slugs (filename minus .md, slashes flattened to dashes). Loaded BEFORE runtime auto-match. Total injected per run capped at 4. Pin skills here so the trick has predictable behavior — empty/omitted falls back to runtime auto-match.'),
+    allowed_tools: z.array(z.string()).optional().describe('Per-trick tool whitelist. When set, intersected with the agent profile allowlist. Agent is always force-included for sub-agent delegation. Empty/omitted inherits from profile.'),
+    allowed_mcp_servers: z.array(z.string()).optional().describe('Per-trick MCP server whitelist (server names from list_mcp_servers). Applied AFTER profile allowlist. Empty/omitted inherits from profile.'),
+    tags: z.array(z.string()).optional().describe('Free-form tags for grouping/filtering in the dashboard.'),
+    category: z.string().optional().describe('Single category bucket (e.g. "ops", "research").'),
   },
-  async ({ name: jobName, schedule, prompt, tier, enabled, work_dir, max_hours }) => {
+  async ({ name: jobName, schedule, prompt, tier, enabled, work_dir, max_hours, skills, allowed_tools, allowed_mcp_servers, tags, category }) => {
     // Validate cron expression
     const cronMod = await import('node-cron');
     if (!cronMod.default.validate(schedule)) {
@@ -1213,6 +1218,12 @@ server.tool(
     };
     if (work_dir) newJob.work_dir = work_dir;
     if (max_hours) newJob.max_hours = max_hours;
+    // ── Trick capabilities (snake_case YAML keys) ──────────────────
+    if (Array.isArray(skills) && skills.length) newJob.skills = skills.map(s => String(s).trim()).filter(Boolean);
+    if (Array.isArray(allowed_tools) && allowed_tools.length) newJob.allowed_tools = allowed_tools.map(s => String(s).trim()).filter(Boolean);
+    if (Array.isArray(allowed_mcp_servers) && allowed_mcp_servers.length) newJob.allowed_mcp_servers = allowed_mcp_servers.map(s => String(s).trim()).filter(Boolean);
+    if (Array.isArray(tags) && tags.length) newJob.tags = tags.map(s => String(s).trim()).filter(Boolean);
+    if (typeof category === 'string' && category.trim()) newJob.category = category.trim().slice(0, 64);
 
     jobs.push(newJob);
     parsed.data.jobs = jobs;
@@ -1251,6 +1262,11 @@ server.tool(
     ];
     if (work_dir) details.push(`  Project: ${work_dir}`);
     if (max_hours) details.push(`  Wall-clock cap: ${max_hours}h`);
+    if (Array.isArray(skills) && skills.length) details.push(`  Pinned skills: ${skills.join(', ')}`);
+    if (Array.isArray(allowed_tools) && allowed_tools.length) details.push(`  Allowed tools: ${allowed_tools.join(', ')}`);
+    if (Array.isArray(allowed_mcp_servers) && allowed_mcp_servers.length) details.push(`  Allowed MCP: ${allowed_mcp_servers.join(', ')}`);
+    if (Array.isArray(tags) && tags.length) details.push(`  Tags: ${tags.map(t => '#' + t).join(' ')}`);
+    if (typeof category === 'string' && category.trim()) details.push(`  Category: ${category.trim()}`);
 
     const verifyMsg = verified
       ? 'Verified: job persisted to CRON.md and will be picked up by the daemon.'
@@ -1261,6 +1277,189 @@ server.tool(
     return textResult(
       `Added cron job "${jobName}":\n${details.join('\n')}\n\n${verifyMsg}${goalHint}`,
     );
+  },
+);
+
+
+// ── Update Cron Job ─────────────────────────────────────────────────────
+
+server.tool(
+  'update_cron_job',
+  'Update an existing cron job in CRON.md. Partial — only fields you supply change. To CLEAR a capability allowlist (skills/allowed_tools/allowed_mcp_servers/tags), pass an empty array. To clear category, pass an empty string. The daemon auto-reloads on file change. Use preview_cron_job to confirm what will run before the next fire.',
+  {
+    name: z.string().describe('Existing job name to update.'),
+    schedule: z.string().optional().describe('New cron expression.'),
+    prompt: z.string().optional().describe('New prompt.'),
+    tier: z.number().optional().describe('Security tier.'),
+    enabled: z.boolean().optional().describe('Enable/disable.'),
+    work_dir: z.string().optional().describe('Project directory. Empty string clears.'),
+    max_hours: z.number().optional().describe('Wall-clock cap in hours.'),
+    skills: z.array(z.string()).optional().describe('Pinned skill slugs. Empty array clears.'),
+    allowed_tools: z.array(z.string()).optional().describe('Tool allowlist. Empty array clears.'),
+    allowed_mcp_servers: z.array(z.string()).optional().describe('MCP allowlist. Empty array clears.'),
+    tags: z.array(z.string()).optional().describe('Tags. Empty array clears.'),
+    category: z.string().optional().describe('Category bucket. Empty string clears.'),
+  },
+  async ({ name: jobName, schedule, prompt, tier, enabled, work_dir, max_hours, skills, allowed_tools, allowed_mcp_servers, tags, category }) => {
+    if (!existsSync(CRON_FILE)) {
+      return textResult('CRON.md not found. Use add_cron_job to create one first.');
+    }
+    if (schedule !== undefined) {
+      const cronMod = await import('node-cron');
+      if (!cronMod.default.validate(schedule)) {
+        return textResult(`Invalid cron expression: "${schedule}".`);
+      }
+    }
+    const matterMod = await import('gray-matter');
+    const raw = readFileSync(CRON_FILE, 'utf-8');
+    const parsed = matterMod.default(raw);
+    const jobs = (parsed.data.jobs ?? []) as Array<Record<string, unknown>>;
+    const idx = jobs.findIndex(j => String(j.name ?? '').toLowerCase() === jobName.toLowerCase());
+    if (idx === -1) {
+      const available = jobs.map(j => String(j.name ?? '')).filter(Boolean).join(', ');
+      return textResult(`Job "${jobName}" not found. Available: ${available || 'none'}`);
+    }
+    const job = jobs[idx];
+    const changed: string[] = [];
+    if (schedule !== undefined) { job.schedule = schedule; changed.push(`schedule → "${schedule}"`); }
+    if (prompt !== undefined) { job.prompt = prompt; changed.push(`prompt updated (${prompt.length} chars)`); }
+    if (tier !== undefined) { job.tier = tier; changed.push(`tier → ${tier}`); }
+    if (enabled !== undefined) { job.enabled = enabled; changed.push(`enabled → ${enabled}`); }
+    if (work_dir !== undefined) {
+      if (work_dir) { job.work_dir = work_dir; changed.push(`work_dir → "${work_dir}"`); }
+      else { delete job.work_dir; changed.push('work_dir cleared'); }
+    }
+    if (max_hours !== undefined) { job.max_hours = max_hours; changed.push(`max_hours → ${max_hours}`); }
+    // ── Capabilities — empty array CLEARS, omitted leaves alone ────
+    if (skills !== undefined) {
+      if (skills.length) { job.skills = skills.map(s => String(s).trim()).filter(Boolean); changed.push(`skills → [${(job.skills as string[]).join(', ')}]`); }
+      else { delete job.skills; changed.push('skills cleared'); }
+    }
+    if (allowed_tools !== undefined) {
+      if (allowed_tools.length) { job.allowed_tools = allowed_tools.map(s => String(s).trim()).filter(Boolean); changed.push(`allowed_tools → [${(job.allowed_tools as string[]).join(', ')}]`); }
+      else { delete job.allowed_tools; changed.push('allowed_tools cleared'); }
+    }
+    if (allowed_mcp_servers !== undefined) {
+      if (allowed_mcp_servers.length) { job.allowed_mcp_servers = allowed_mcp_servers.map(s => String(s).trim()).filter(Boolean); changed.push(`allowed_mcp_servers → [${(job.allowed_mcp_servers as string[]).join(', ')}]`); }
+      else { delete job.allowed_mcp_servers; changed.push('allowed_mcp_servers cleared'); }
+    }
+    if (tags !== undefined) {
+      if (tags.length) { job.tags = tags.map(s => String(s).trim()).filter(Boolean); changed.push(`tags → [${(job.tags as string[]).join(', ')}]`); }
+      else { delete job.tags; changed.push('tags cleared'); }
+    }
+    if (category !== undefined) {
+      if (typeof category === 'string' && category.trim()) { job.category = category.trim().slice(0, 64); changed.push(`category → "${job.category}"`); }
+      else { delete job.category; changed.push('category cleared'); }
+    }
+    if (changed.length === 0) {
+      return textResult(`No changes specified for "${jobName}".`);
+    }
+    parsed.data.jobs = jobs;
+    const output = matterMod.default.stringify(parsed.content, parsed.data);
+    const { validateCronYaml } = await import('../gateway/heartbeat.js');
+    const yamlErr = validateCronYaml(output);
+    if (yamlErr) {
+      logger.error({ yamlErr, jobName }, 'Generated CRON.md has invalid YAML — aborting write');
+      return textResult(`Failed to update job "${jobName}": generated YAML is invalid. Error: ${yamlErr}`);
+    }
+    writeFileSync(CRON_FILE, output);
+    logger.info({ jobName, changes: changed }, 'Updated cron job via MCP tool');
+    return textResult(
+      `Updated cron job "${jobName}":\n  ${changed.join('\n  ')}\n\nDaemon will pick up the new definition within ~2s. Use \`preview_cron_job\` to confirm what will actually run.`,
+    );
+  },
+);
+
+// ── Preview Cron Job ────────────────────────────────────────────────────
+
+server.tool(
+  'preview_cron_job',
+  'Show EXACTLY what a cron job ("trick") will send the agent on its next fire — without dispatching to the agent. Composes the same context blocks (memory, progress, goals, skills, team, criteria, prompt, how-to-respond) the runner would compose at fire time. Returns the built prompt + resolved skills (full content) + effective tool/MCP allowlists + warnings (missing pins). Use this to sanity-check tricks after configuring them via chat or the dashboard, especially when you want predictable morning behavior.',
+  {
+    name: z.string().describe('Exact name of the cron job to preview (use list_cron_jobs to see available).'),
+  },
+  async ({ name: jobName }) => {
+    const [{ parseCronJobs, parseAgentCronJobs }, { buildCronExecutionPlan }, { loadSkillByName }, { discoverMcpServers }] = await Promise.all([
+      import('../gateway/cron-scheduler.js'),
+      import('../agent/run-agent-cron.js'),
+      import('../agent/skill-extractor.js'),
+      import('../agent/mcp-bridge.js'),
+    ]);
+    const agentsDir = path.join(SYSTEM_DIR, 'agents');
+    const allJobs = [...parseCronJobs(), ...parseAgentCronJobs(agentsDir)];
+    const job = allJobs.find(j => j.name === jobName);
+    if (!job) {
+      const available = allJobs.map(j => j.name).join(', ');
+      return textResult(`Job "${jobName}" not found. Available: ${available || 'none'}`);
+    }
+    const plan = await buildCronExecutionPlan({
+      jobName: job.name,
+      jobPrompt: job.prompt,
+      tier: job.tier,
+      maxTurns: job.maxTurns,
+      profile: null,                 // chat preview runs without the live profile —
+                                     //   tool/MCP allowlists shown reflect job-only intent.
+      successCriteria: job.successCriteria,
+      model: job.model,
+      workDir: job.workDir,
+      pinnedSkills: job.skills,
+      allowedTools: job.allowedTools,
+      allowedMcpServers: job.allowedMcpServers,
+    });
+    const allServers = discoverMcpServers();
+    const lines: string[] = [];
+    lines.push(`# Preview: ${job.name}`);
+    lines.push('');
+    lines.push(`**Schedule:** ${job.schedule}    **Tier:** ${plan.tier} (${plan.effort}${plan.maxBudgetUsd ? `, budget $${plan.maxBudgetUsd}` : ''})`);
+    if (job.agentSlug) lines.push(`**Agent:** ${job.agentSlug}`);
+    if (job.tags?.length) lines.push(`**Tags:** ${job.tags.map(t => '#' + t).join(' ')}`);
+    if (job.category) lines.push(`**Category:** ${job.category}`);
+    lines.push('');
+    if (plan.skillsMissing.length) {
+      lines.push(`⚠️  **Missing pinned skills:** ${plan.skillsMissing.join(', ')} — these will not be injected.`);
+      lines.push('');
+    }
+    lines.push(`## Skills injected (${plan.skillsApplied.length})`);
+    if (plan.skillsApplied.length === 0) {
+      lines.push('_No skills will be injected for this run._');
+    } else {
+      for (const s of plan.skillsApplied) {
+        const loaded = loadSkillByName(s.name, job.agentSlug);
+        const tag = s.source === 'pinned' ? '_(pinned)_' : '_(auto-matched)_';
+        lines.push(`### ${loaded?.title ?? s.name} ${tag}`);
+        lines.push(`Slug: \`${s.name}\``);
+        if (loaded?.toolsUsed?.length) lines.push(`Tools: ${loaded.toolsUsed.join(', ')}`);
+        if (loaded?.content) {
+          lines.push('');
+          lines.push('```');
+          lines.push(loaded.content.slice(0, 1500));
+          lines.push('```');
+        }
+        lines.push('');
+      }
+    }
+    lines.push(`## MCP servers wired (${plan.mcpServersApplied.length})`);
+    if (plan.mcpServersApplied.length === 0) {
+      lines.push('_No additional MCP servers (clementine-tools always available)._');
+    } else {
+      for (const name of plan.mcpServersApplied) {
+        const m = allServers.find(srv => srv.name === name);
+        lines.push(`- **${name}**${m?.description ? ' — ' + m.description : ''}`);
+      }
+    }
+    lines.push('');
+    lines.push('## Tool allowlist');
+    if (!plan.effectiveAllowedTools) {
+      lines.push('_Inheriting from agent profile / SDK defaults — no per-trick tool restriction._');
+    } else {
+      lines.push(`\`${plan.effectiveAllowedTools.join('`, `')}\``);
+    }
+    lines.push('');
+    lines.push(`## Built prompt (${plan.builtPrompt.length} chars — what the agent receives)`);
+    lines.push('```');
+    lines.push(plan.builtPrompt);
+    lines.push('```');
+    return textResult(lines.join('\n'));
   },
 );
 

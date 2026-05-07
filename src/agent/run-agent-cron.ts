@@ -39,6 +39,59 @@ const logger = pino({ name: 'clementine.run-agent-cron' });
 
 const CRON_CONTEXT_ITEM_MAX = 80;
 
+/** Total number of skill blocks injected into a cron prompt — pinned + auto. */
+const MAX_INJECTED_SKILLS = 4;
+
+/**
+ * Compute the effective tool allowlist for a cron run.
+ *
+ * Semantics:
+ *   - Both undefined / empty → return undefined. Caller (`runAgent`)
+ *     will fall back to `profile.team.allowedTools` then
+ *     `CORE_TOOLS_FOR_AGENT_PARENT` — preserving today's behavior for
+ *     legacy CRON.md entries with no `allowed_tools` field.
+ *   - Job allowlist only → return `['Agent', ...job]` (deduped).
+ *     Bare tricks (no agentSlug) hit this path too.
+ *   - Profile allowlist only → return undefined (let runAgent thread it
+ *     through its own profile path; no need to duplicate work here).
+ *   - Both → intersection ∪ {Agent}. When intersection is empty the
+ *     result is just `['Agent']` — degenerate but valid (subagent
+ *     delegation is the one thing every cron must always be able to do).
+ */
+export function computeEffectiveAllowedTools(
+  jobAllow: string[] | undefined,
+  profileAllow: string[] | undefined,
+): string[] | undefined {
+  if (!jobAllow?.length) return undefined;
+  let result: string[];
+  if (profileAllow?.length) {
+    const jobSet = new Set(jobAllow);
+    result = profileAllow.filter(t => jobSet.has(t));
+  } else {
+    result = [...jobAllow];
+  }
+  if (!result.includes('Agent')) result.unshift('Agent');
+  return Array.from(new Set(result));
+}
+
+/**
+ * Compute the effective MCP server map for a cron run by intersecting the
+ * trick's `allowedMcpServers` with the already-resolved server map from
+ * `buildExtraMcpForRunAgent` (which has already applied the profile
+ * allowlist). Returns the unchanged input map when the trick has no
+ * MCP allowlist set.
+ */
+export function applyMcpAllowlist<T>(
+  servers: Record<string, T>,
+  jobAllowedMcpServers: string[] | undefined,
+): Record<string, T> {
+  if (!jobAllowedMcpServers?.length) return servers;
+  const allow = new Set(jobAllowedMcpServers);
+  return Object.fromEntries(
+    Object.entries(servers).filter(([name]) => allow.has(name)),
+  ) as Record<string, T>;
+}
+
 function capContextItem(s: string): string {
   if (!s) return '';
   return s.length <= CRON_CONTEXT_ITEM_MAX ? s : s.slice(0, CRON_CONTEXT_ITEM_MAX - 3) + '...';
@@ -175,33 +228,91 @@ function buildCriteriaContext(successCriteria?: string[]): string {
     successCriteria.map(c => `- ${c}`).join('\n') + '\n\n';
 }
 
-/** Build the matched-skills block (procedures learned from prior successful runs). */
-async function buildSkillContext(
+export interface SkillContextResult {
+  /** The rendered "Learned Procedures" block (or empty string when no skills loaded). */
+  text: string;
+  /** Skills actually injected — the dashboard records this on the run log. */
+  applied: Array<{ name: string; source: 'pinned' | 'auto'; score?: number }>;
+  /** Pinned slugs that didn't resolve (deleted/renamed/suppressed). Logged + surfaced. */
+  missing: string[];
+}
+
+/**
+ * Build the matched-skills block (procedures learned from prior successful runs).
+ * Pinned skills load first via exact-slug lookup; remaining slots fill from
+ * the keyword/semantic auto-match. Total cap = `MAX_INJECTED_SKILLS`. Pins
+ * that don't resolve are surfaced via `missing[]` (warned, never fatal) so
+ * the dashboard can flag broken references.
+ *
+ * Exported only for testability — the production caller is `runAgentCron`.
+ */
+export async function buildSkillContext(
   jobName: string,
   jobPrompt: string,
   agentSlug: string | undefined,
+  pinnedSkills: string[] | undefined,
   memoryStore?: MemoryStore | null,
-): Promise<string> {
+): Promise<SkillContextResult> {
+  const applied: SkillContextResult['applied'] = [];
+  const missing: string[] = [];
   try {
-    const { searchSkills, recordSkillUse } = await import('./skill-extractor.js');
+    const { searchSkills, recordSkillUse, loadSkillByName } = await import('./skill-extractor.js');
     const skillQuery = jobName + ' ' + jobPrompt.slice(0, 200);
     const suppressedNamesRaw = (memoryStore as { getSkillsToSuppress?: (slug?: string) => string[] | Set<string> | undefined } | null | undefined)
       ?.getSkillsToSuppress?.(agentSlug);
     const suppressedNames = Array.isArray(suppressedNamesRaw)
       ? new Set(suppressedNamesRaw)
       : (suppressedNamesRaw ?? undefined);
-    const matchedSkills = searchSkills(skillQuery, 2, agentSlug, { suppressedNames });
-    if (matchedSkills.length === 0) return '';
-    const skillLines = matchedSkills.map(s => {
+
+    type PreparedSkill = {
+      name: string; title: string; content: string;
+      toolsUsed: string[]; attachments: string[]; skillDir: string;
+      score?: number; source: 'pinned' | 'auto';
+    };
+    const prepared: PreparedSkill[] = [];
+    const seen = new Set<string>();
+
+    // 1. Load pinned skills first via exact slug lookup.
+    if (pinnedSkills?.length) {
+      for (const pinName of pinnedSkills) {
+        if (seen.has(pinName)) continue;
+        if (prepared.length >= MAX_INJECTED_SKILLS) break;
+        const skill = loadSkillByName(pinName, agentSlug, { suppressedNames });
+        if (!skill) {
+          missing.push(pinName);
+          logger.warn({ jobName, pin: pinName, agentSlug }, 'cron: pinned skill not found');
+          continue;
+        }
+        prepared.push({ ...skill, source: 'pinned' });
+        seen.add(pinName);
+      }
+    }
+
+    // 2. Auto-match fills the remainder, deduped against pins.
+    const remaining = MAX_INJECTED_SKILLS - prepared.length;
+    if (remaining > 0) {
+      const matched = searchSkills(skillQuery, remaining + (pinnedSkills?.length ?? 0), agentSlug, { suppressedNames });
+      for (const m of matched) {
+        if (prepared.length >= MAX_INJECTED_SKILLS) break;
+        if (seen.has(m.name)) continue;
+        prepared.push({ ...m, source: 'auto' });
+        seen.add(m.name);
+      }
+    }
+
+    if (prepared.length === 0) return { text: '', applied, missing };
+
+    const skillLines = prepared.map(s => {
       recordSkillUse(s.name);
       (memoryStore as { logSkillUse?: (entry: Record<string, unknown>) => void } | null | undefined)?.logSkillUse?.({
         skillName: s.name,
         sessionKey: `cron:${agentSlug ?? 'clementine'}:${jobName}`,
         queryText: skillQuery,
-        score: s.score,
+        score: s.score ?? 0,
         agentSlug: agentSlug ?? null,
       });
-      let block = `### ${s.title}\n${s.content}`;
+      applied.push({ name: s.name, source: s.source, score: s.score });
+      let block = `### ${s.title}${s.source === 'pinned' ? ' _(pinned)_' : ''}\n${s.content}`;
       if (s.toolsUsed.length > 0) block += `\n**Tools:** ${s.toolsUsed.join(', ')}`;
       if (s.attachments.length > 0) {
         const attDir = path.join(s.skillDir, s.name + '.files');
@@ -217,9 +328,11 @@ async function buildSkillContext(
       }
       return block;
     });
-    return `## Learned Procedures (from past successful executions)\nFollow these proven approaches when applicable:\n\n${skillLines.join('\n\n')}\n\n`;
-  } catch {
-    return '';
+    const text = `## Learned Procedures (from past successful executions)\nFollow these proven approaches when applicable:\n\n${skillLines.join('\n\n')}\n\n`;
+    return { text, applied, missing };
+  } catch (err) {
+    logger.debug({ err, jobName }, 'buildSkillContext failed (non-fatal)');
+    return { text: '', applied, missing };
   }
 }
 
@@ -279,6 +392,19 @@ export interface RunAgentCronOptions {
    *  PersonalAssistant — it implements both members. Optional so the
    *  helper still works in tests without the full assistant graph. */
   postTaskHooks?: CronPostTaskHooks | null;
+  // ── Trick capabilities ────────────────────────────────────────────
+  /** Pinned skill slugs from the trick definition. Loaded before the
+   *  auto-match search; total skills injected is capped at
+   *  `MAX_INJECTED_SKILLS`. */
+  pinnedSkills?: string[];
+  /** Per-trick tool whitelist. Intersected with `profile.team.allowedTools`
+   *  when both are present. 'Agent' is always force-included. Undefined
+   *  preserves today's behavior (falls back to profile or default). */
+  allowedTools?: string[];
+  /** Per-trick MCP server whitelist (server names from `discoverMcpServers`).
+   *  Applied after `buildExtraMcpForRunAgent` runs, so the effective set
+   *  is `profile ∩ trick`. */
+  allowedMcpServers?: string[];
 }
 
 export interface RunAgentCronResult extends RunAgentResult {
@@ -288,6 +414,147 @@ export interface RunAgentCronResult extends RunAgentResult {
   /** Diagnostics: which Composio + external servers were live for this run. */
   composioConnected: string[];
   externalConnected: string[];
+  /** Skills actually injected (pinned + auto). Surfaced on the run log so the
+   *  dashboard can render a "ran with: …" line. */
+  skillsApplied: Array<{ name: string; source: 'pinned' | 'auto'; score?: number }>;
+  /** Pinned skills that didn't resolve (bad slug / suppressed). Empty array
+   *  is fine; only populated when the trick had pins that failed to load. */
+  skillsMissing: string[];
+  /** Effective tool allowlist passed to runAgent (post-intersection). Undefined
+   *  means the trick didn't override — runAgent fell through to profile/default. */
+  allowedToolsApplied?: string[];
+  /** MCP servers live for this run after profile + trick intersection. */
+  mcpServersApplied: string[];
+}
+
+/** Plan output from `buildCronExecutionPlan` — everything the runner needs
+ *  to dispatch, plus the broken-down context blocks so a preview UI can
+ *  show "what came from where" without re-running the build. */
+export interface CronExecutionPlan {
+  builtPrompt: string;
+  contextBlocks: {
+    memoryContext: string;
+    progressContext: string;
+    goalContext: string;
+    delegationContext: string;
+    teamContext: string;
+    criteriaContext: string;
+    skillContext: string;
+    jobPrompt: string;
+    howToRespond: string;
+  };
+  skillsApplied: SkillContextResult['applied'];
+  skillsMissing: string[];
+  effectiveAllowedTools: string[] | undefined;
+  mcpServerMap: Record<string, unknown>;
+  mcpServersApplied: string[];
+  composioConnected: string[];
+  externalConnected: string[];
+  tier: number;
+  effort: 'low' | 'medium' | 'high';
+  maxBudgetUsd: number | undefined;
+  agentSlug: string | undefined;
+  ownerName: string;
+}
+
+/**
+ * Plan a cron run — assemble all context, resolve skills, intersect tool/MCP
+ * allowlists — without dispatching to the agent. Used by `runAgentCron` for
+ * the actual run, and by the dashboard's `GET /api/cron/:name/preview`
+ * endpoint so users can see *exactly* what the trick will send to the agent
+ * before the next fire.
+ */
+export async function buildCronExecutionPlan(opts: RunAgentCronOptions): Promise<CronExecutionPlan> {
+  const tier = opts.tier ?? 1;
+  const agentSlug = opts.profile?.slug;
+  const ownerName = process.env.OWNER_NAME ?? 'the user';
+
+  const memoryContext = buildAutonomousMemoryContext(opts.profile);
+  const progressContext = buildProgressContext(opts.jobName);
+  const goalContext = buildGoalContext(opts.jobName);
+  const delegationContext = buildDelegationContext(agentSlug);
+  const teamContext = buildTeamContext(agentSlug);
+  const criteriaContext = buildCriteriaContext(opts.successCriteria);
+  const skillResult = await buildSkillContext(
+    opts.jobName, opts.jobPrompt, agentSlug, opts.pinnedSkills, opts.memoryStore,
+  );
+  const skillContext = skillResult.text;
+
+  const howToRespond =
+    `## How to respond\n` +
+    `You're sending this directly to ${ownerName} as a DM. ` +
+    `Write like you're texting a friend — casual, warm, concise. ` +
+    `Use their name naturally. No headers, bullet lists, or formal structure unless the content genuinely needs it. ` +
+    `Skip narrating your process ("I checked X, then Y..."). Just share the interesting stuff.\n\n` +
+    `If there's genuinely nothing worth mentioning (no new data, no changes, no alerts), ` +
+    `output ONLY: __NOTHING__\n` +
+    `But lean toward sharing something — a one-liner is better than silence. ` +
+    `"Quiet morning, inbox is clean" beats __NOTHING__ if you did check things.\n\n` +
+    `After finishing your work, you MUST write a final text response with your findings — ` +
+    `only that final message gets delivered.`;
+
+  const builtPrompt =
+    `[Scheduled task: ${opts.jobName}]\n\n` +
+    memoryContext +
+    progressContext +
+    goalContext +
+    skillContext +
+    delegationContext +
+    teamContext +
+    criteriaContext +
+    `${opts.jobPrompt}\n\n` +
+    howToRespond;
+
+  const mcp = await buildExtraMcpForRunAgent({
+    scopeText: [
+      opts.jobName,
+      opts.jobPrompt,
+      opts.profile?.description,
+      opts.profile?.systemPromptBody,
+    ].filter(Boolean).join('\n\n'),
+    profile: opts.profile,
+  });
+
+  // Per-trick MCP allowlist: post-filter on the profile-narrowed map.
+  // Effective set = profile ∩ trick.
+  const mcpServerMap = applyMcpAllowlist(mcp.servers, opts.allowedMcpServers);
+  const allowSet = opts.allowedMcpServers?.length ? new Set(opts.allowedMcpServers) : null;
+  const composioConnected = allowSet ? mcp.composioConnected.filter(n => allowSet.has(n)) : mcp.composioConnected;
+  const externalConnected = allowSet ? mcp.externalConnected.filter(n => allowSet.has(n)) : mcp.externalConnected;
+  const mcpServersApplied = Object.keys(mcpServerMap);
+
+  // Per-trick tool allowlist intersection.
+  const effectiveAllowedTools = computeEffectiveAllowedTools(
+    opts.allowedTools,
+    opts.profile?.team?.allowedTools,
+  );
+
+  // Per-tier cap from config (BUDGET.cronT1 / BUDGET.cronT2). 0 = uncapped.
+  const configuredCap = tier >= 2 ? BUDGET.cronT2 : BUDGET.cronT1;
+  const maxBudget: number | undefined =
+    opts.maxBudgetUsd ?? (configuredCap > 0 ? configuredCap : undefined);
+  const effort: 'low' | 'medium' | 'high' = tier >= 2 ? 'high' : 'medium';
+
+  return {
+    builtPrompt,
+    contextBlocks: {
+      memoryContext, progressContext, goalContext, delegationContext,
+      teamContext, criteriaContext, skillContext,
+      jobPrompt: opts.jobPrompt, howToRespond,
+    },
+    skillsApplied: skillResult.applied,
+    skillsMissing: skillResult.missing,
+    effectiveAllowedTools,
+    mcpServerMap,
+    mcpServersApplied,
+    composioConnected,
+    externalConnected,
+    tier,
+    effort,
+    maxBudgetUsd: maxBudget,
+    agentSlug,
+    ownerName,
+  };
 }
 
 /**
@@ -302,80 +569,24 @@ export interface RunAgentCronResult extends RunAgentResult {
  * caching, retries — none of which we wrap manually anymore.
  */
 export async function runAgentCron(opts: RunAgentCronOptions): Promise<RunAgentCronResult> {
-  const tier = opts.tier ?? 1;
-  const agentSlug = opts.profile?.slug;
-  const ownerName = process.env.OWNER_NAME ?? 'the user';
-
-  // ── Compose context blocks (mirrors legacy runCronJob) ─────────────
-  // Memory block goes first so the agent reads its long-term context
-  // before the run-specific progress/goals/etc. For a hired agent
-  // (Ross/Sasha) this is their own MEMORY.md, not Clementine's global.
-  const memoryContext = buildAutonomousMemoryContext(opts.profile);
-  const progressContext = buildProgressContext(opts.jobName);
-  const goalContext = buildGoalContext(opts.jobName);
-  const delegationContext = buildDelegationContext(agentSlug);
-  const teamContext = buildTeamContext(agentSlug);
-  const criteriaContext = buildCriteriaContext(opts.successCriteria);
-  const skillContext = await buildSkillContext(opts.jobName, opts.jobPrompt, agentSlug, opts.memoryStore);
-
-  // Sub-agent routing is handled by the SDK's `agents` map
-  // (see agent-definitions.ts). The planner + researcher + cron-fixer
-  // descriptions auto-match per-item / multi-step work, so the SDK
-  // spawns isolated sub-agents without a hand-rolled prompt directive.
-
-  // Final prompt
-  const builtPrompt =
-    `[Scheduled task: ${opts.jobName}]\n\n` +
-    memoryContext +
-    progressContext +
-    goalContext +
-    skillContext +
-    delegationContext +
-    teamContext +
-    criteriaContext +
-    `${opts.jobPrompt}\n\n` +
-    `## How to respond\n` +
-    `You're sending this directly to ${ownerName} as a DM. ` +
-    `Write like you're texting a friend — casual, warm, concise. ` +
-    `Use their name naturally. No headers, bullet lists, or formal structure unless the content genuinely needs it. ` +
-    `Skip narrating your process ("I checked X, then Y..."). Just share the interesting stuff.\n\n` +
-    `If there's genuinely nothing worth mentioning (no new data, no changes, no alerts), ` +
-    `output ONLY: __NOTHING__\n` +
-    `But lean toward sharing something — a one-liner is better than silence. ` +
-    `"Quiet morning, inbox is clean" beats __NOTHING__ if you did check things.\n\n` +
-    `After finishing your work, you MUST write a final text response with your findings — ` +
-    `only that final message gets delivered.`;
-
-  // ── Wire Composio + external MCP servers (same dedup as legacy) ───
-  const mcp = await buildExtraMcpForRunAgent({
-    scopeText: [
-      opts.jobName,
-      opts.jobPrompt,
-      opts.profile?.description,
-      opts.profile?.systemPromptBody,
-    ].filter(Boolean).join('\n\n'),
-    profile: opts.profile,
-  });
-
-  // ── Run via canonical runAgent ────────────────────────────────────
-  // Per-tier cap from config (BUDGET.cronT1 / BUDGET.cronT2). Sourced
-  // from env / clementine.json / dashboard writes. 0 means uncapped —
-  // we pass undefined so runAgent omits the SDK option entirely.
-  // Caller can still override via opts.maxBudgetUsd.
-  const configuredCap = tier >= 2 ? BUDGET.cronT2 : BUDGET.cronT1;
-  const maxBudget: number | undefined =
-    opts.maxBudgetUsd ?? (configuredCap > 0 ? configuredCap : undefined);
-  const effort: 'low' | 'medium' | 'high' = tier >= 2 ? 'high' : 'medium';
+  const plan = await buildCronExecutionPlan(opts);
+  const {
+    builtPrompt, agentSlug, effort, maxBudgetUsd: maxBudget,
+    effectiveAllowedTools, mcpServerMap, composioConnected, externalConnected, mcpServersApplied,
+  } = plan;
 
   logger.info({
     job: opts.jobName,
-    tier,
+    tier: plan.tier,
     profile: agentSlug,
-    composioConnected: mcp.composioConnected,
-    externalConnected: mcp.externalConnected,
-    droppedClaudeAi: mcp.droppedClaudeAi,
-    droppedComposio: mcp.droppedComposio,
+    composioConnected,
+    externalConnected,
     promptChars: builtPrompt.length,
+    pinnedSkills: opts.pinnedSkills?.length ?? 0,
+    skillsApplied: plan.skillsApplied.length,
+    skillsMissing: plan.skillsMissing.length,
+    trickAllowedTools: effectiveAllowedTools?.length,
+    trickAllowedMcp: opts.allowedMcpServers?.length,
   }, 'runAgentCron: dispatching to runAgent');
 
   const startedAt = Date.now();
@@ -390,7 +601,8 @@ export async function runAgentCron(opts: RunAgentCronOptions): Promise<RunAgentC
     ...(maxBudget !== undefined ? { maxBudgetUsd: maxBudget } : {}),
     maxTurns: opts.maxTurns,
     abortSignal: opts.abortSignal,
-    extraMcpServers: mcp.servers as unknown as Parameters<typeof runAgent>[1]['extraMcpServers'],
+    ...(effectiveAllowedTools ? { allowedTools: effectiveAllowedTools } : {}),
+    extraMcpServers: mcpServerMap as unknown as Parameters<typeof runAgent>[1]['extraMcpServers'],
   });
 
   // Mirror the run into transcripts so future chat recall can see it.
@@ -433,7 +645,11 @@ export async function runAgentCron(opts: RunAgentCronOptions): Promise<RunAgentC
   return {
     ...result,
     builtPrompt,
-    composioConnected: mcp.composioConnected,
-    externalConnected: mcp.externalConnected,
+    composioConnected,
+    externalConnected,
+    skillsApplied: plan.skillsApplied,
+    skillsMissing: plan.skillsMissing,
+    allowedToolsApplied: effectiveAllowedTools,
+    mcpServersApplied,
   };
 }
