@@ -14833,6 +14833,9 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
   .task-card.compact .task-card-actions .primary {
     flex: 1;
   }
+  /* ── Recent history row hover (Tasks page bottom zone) ── */
+  .history-row { transition: background 0.12s ease; }
+  .history-row:hover { background: var(--bg-hover); }
   /* ── Trick capability strip (skills + MCP + tools at a glance) ─── */
   .task-cap-strip {
     border-top: 1px solid var(--border-light);
@@ -23058,7 +23061,7 @@ function renderRecentHistoryList(runs) {
       var preview = String(entry.outputPreview).slice(0, 140);
       errorPreview = '<div style="font-size:11px;color:var(--text-muted);margin-top:2px;word-break:break-word">' + esc(preview) + '</div>';
     }
-    rowsHtml += '<div class="history-row" data-trace-job="' + esc(jobName) + '" style="display:grid;grid-template-columns:24px minmax(180px,1.2fr) minmax(180px,1fr) 90px auto;gap:10px;align-items:start;padding:8px 14px;border-bottom:1px solid var(--border);cursor:pointer" onmouseover="this.style.background=\'var(--bg-hover)\'" onmouseout="this.style.background=\'\'">'
+    rowsHtml += '<div class="history-row" data-trace-job="' + esc(jobName) + '" style="display:grid;grid-template-columns:24px minmax(180px,1.2fr) minmax(180px,1fr) 90px auto;gap:10px;align-items:start;padding:8px 14px;border-bottom:1px solid var(--border);cursor:pointer">'
       + '<div style="color:' + statusColor + ';font-size:14px;line-height:18px;text-align:center" title="' + esc(status) + '">' + statusIcon + '</div>'
       + '<div style="min-width:0">'
         + '<div style="font-weight:500;color:var(--text-primary);font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + esc(jobName) + '">' + esc(jobName) + attemptLabel + '</div>'
