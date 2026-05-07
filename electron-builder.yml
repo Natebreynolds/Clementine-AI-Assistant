@@ -27,6 +27,8 @@ mac:
   target:
     - dmg
     - zip
+dmg:
+  sign: true
 artifactName: Clementine-${version}-mac-${arch}.${ext}
 publish:
   provider: github
