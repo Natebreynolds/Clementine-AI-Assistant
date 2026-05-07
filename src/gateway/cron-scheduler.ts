@@ -495,6 +495,46 @@ export class CronRunLog {
     return count;
   }
 
+  /**
+   * Read the most recent run entries across ALL jobs, sorted newest-first.
+   * Each .jsonl file is already pruned to MAX_LINES, so this is bounded by
+   * (number of jobs × tail of recent entries). For dashboard "Recent History"
+   * this is fast enough — we tail the last `tailPerFile` lines from each file
+   * before merging, then trim the merged set to `count`.
+   */
+  readAllRecent(count = 50, tailPerFile = 30): CronRunEntry[] {
+    if (!existsSync(this.dir)) return [];
+    let files: string[];
+    try {
+      files = readdirSync(this.dir).filter((n) => n.endsWith('.jsonl'));
+    } catch {
+      return [];
+    }
+    const merged: CronRunEntry[] = [];
+    for (const f of files) {
+      const filePath = path.join(this.dir, f);
+      try {
+        const lines = readFileSync(filePath, 'utf-8').trim().split('\n').filter(Boolean);
+        const tail = lines.slice(-tailPerFile);
+        for (const l of tail) {
+          try {
+            merged.push(JSON.parse(l) as CronRunEntry);
+          } catch {
+            /* skip malformed line */
+          }
+        }
+      } catch {
+        /* skip unreadable file */
+      }
+    }
+    merged.sort((a, b) => {
+      const at = a.startedAt ? new Date(a.startedAt).getTime() : 0;
+      const bt = b.startedAt ? new Date(b.startedAt).getTime() : 0;
+      return bt - at;
+    });
+    return merged.slice(0, count);
+  }
+
   private maybePrune(filePath: string): void {
     try {
       const { size } = statSync(filePath);
