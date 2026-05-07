@@ -6451,6 +6451,11 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
           tags: job.tags ?? [],
           category: job.category ?? null,
           predictable: typeof job.predictable === 'boolean' ? job.predictable : null,
+          // Configured allowlists — included so the dashboard can chip-color
+          // "pinned vs auto-injected" without re-fetching the YAML.
+          allowedMcpServers: Array.isArray(job.allowedMcpServers) ? job.allowedMcpServers : null,
+          allowedTools: Array.isArray(job.allowedTools) ? job.allowedTools : null,
+          pinnedSkills: Array.isArray(job.skills) ? job.skills : null,
         },
         predictable: plan.predictable,
         profile: profile ? { slug: profile.slug, name: profile.name } : null,
@@ -14894,6 +14899,99 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
     color: var(--text-secondary); white-space: pre-wrap; word-break: break-word;
     max-height: 180px; overflow-y: auto;
   }
+  /* ── Cron modal: tabs + section cards + legacy banner ─────────── */
+  .cron-modal { width: 820px !important; max-width: 96vw; }
+  .cron-tabs {
+    display: flex; gap: 0; padding: 0 22px;
+    border-bottom: 1px solid var(--border); background: var(--bg-secondary);
+    flex-shrink: 0;
+  }
+  .cron-tab-btn {
+    padding: 12px 18px; background: transparent; border: none;
+    color: var(--text-secondary); font-size: 13px; font-weight: 500;
+    cursor: pointer; border-bottom: 2px solid transparent;
+    margin-bottom: -1px;
+  }
+  .cron-tab-btn.active {
+    color: var(--accent); border-bottom-color: var(--accent);
+  }
+  .cron-tab-btn:hover:not(.active) { color: var(--text-primary); }
+  .cron-tab-btn[disabled] { opacity: 0.4; cursor: not-allowed; }
+  .cron-tab-pane { display: none; }
+  .cron-tab-pane.active { display: block; }
+  .cron-section-card {
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 14px 16px;
+    margin-bottom: 14px;
+  }
+  .cron-section-card > h4 {
+    font-size: 11px; font-weight: 700; color: var(--text-muted);
+    text-transform: uppercase; letter-spacing: 0.6px;
+    margin: 0 0 4px 0;
+  }
+  .cron-section-desc {
+    font-size: 11px; color: var(--text-muted);
+    margin: 0 0 10px 0; line-height: 1.5;
+  }
+  .cron-banner {
+    border-radius: 8px; padding: 12px 14px;
+    margin-bottom: 14px; font-size: 12px; line-height: 1.5;
+  }
+  .cron-banner.warn {
+    background: rgba(245, 158, 11, 0.10);
+    border: 1px solid rgba(245, 158, 11, 0.32);
+    color: var(--text-primary);
+  }
+  .cron-banner.warn h5 {
+    color: var(--yellow); font-size: 12px; font-weight: 700;
+    margin: 0 0 4px 0; text-transform: uppercase; letter-spacing: 0.4px;
+  }
+  .cron-banner.ok {
+    background: rgba(16, 185, 129, 0.08);
+    border: 1px solid rgba(16, 185, 129, 0.28);
+    color: var(--text-primary);
+  }
+  .cron-banner.ok h5 {
+    color: var(--green); font-size: 12px; font-weight: 700;
+    margin: 0 0 4px 0; text-transform: uppercase; letter-spacing: 0.4px;
+  }
+  .cron-banner .banner-actions { margin-top: 10px; display: flex; gap: 8px; }
+  .cron-banner .banner-actions button {
+    font-size: 12px; padding: 6px 12px; border-radius: 6px; cursor: pointer;
+  }
+  .cron-prompt-textarea {
+    width: 100%; min-height: 180px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 12px; line-height: 1.55;
+    padding: 10px 12px; border: 1px solid var(--border); border-radius: 6px;
+    background: var(--bg-input); color: var(--text-primary);
+    resize: vertical;
+  }
+  .cron-predictable-card {
+    display: flex; align-items: flex-start; gap: 12px;
+    padding: 12px 14px; border-radius: 8px;
+    background: var(--bg-secondary); border: 1px solid var(--border);
+  }
+  .cron-predictable-card.on { border-color: rgba(16, 185, 129, 0.32); background: rgba(16, 185, 129, 0.06); }
+  .cron-predictable-card.off { border-color: rgba(245, 158, 11, 0.32); background: rgba(245, 158, 11, 0.06); }
+  .cron-predictable-card .pred-icon { font-size: 18px; line-height: 1; padding-top: 2px; }
+  .cron-predictable-card .pred-title { font-weight: 600; font-size: 13px; color: var(--text-primary); }
+  .cron-predictable-card .pred-sub { font-size: 11px; color: var(--text-muted); margin-top: 3px; line-height: 1.5; }
+  /* Effective-vs-configured chip coloring on Preview tab */
+  .preview-chip {
+    display: inline-flex; align-items: center; gap: 4px;
+    padding: 3px 9px; margin: 2px 4px 2px 0; border-radius: 999px;
+    font-size: 11px; line-height: 1.6;
+    border: 1px solid var(--border);
+  }
+  .preview-chip.pinned { background: rgba(124, 58, 237, 0.10); color: var(--purple); border-color: rgba(124, 58, 237, 0.30); }
+  .preview-chip.auto   { background: rgba(245, 158, 11, 0.10); color: var(--yellow); border-color: rgba(245, 158, 11, 0.30); }
+  .preview-chip-group-label {
+    font-size: 10px; text-transform: uppercase; letter-spacing: 0.4px;
+    color: var(--text-muted); margin-right: 4px;
+  }
   .preview-warn {
     padding: 6px 10px; border-radius: 6px; background: rgba(245, 158, 11, 0.10);
     color: var(--yellow); font-size: 12px; margin-bottom: 6px;
@@ -19377,22 +19475,45 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
   </div><!-- /content -->
 </div><!-- /layout -->
 
-<!-- ═══ Create/Edit Cron Modal ═══ -->
+<!-- ═══ Create/Edit Cron Modal — tabbed (Configure | What will run) ═══ -->
 <div class="modal-overlay" id="cron-modal">
-  <div class="modal">
+  <div class="modal cron-modal">
     <div class="modal-header">
       <h3 id="cron-modal-title">New Scheduled Task</h3>
       <button class="btn-ghost btn-sm" onclick="closeCronModal()">&times;</button>
     </div>
+    <div class="cron-tabs" role="tablist">
+      <button type="button" class="cron-tab-btn active" data-cron-tab="configure" onclick="switchCronTab('configure')">Configure</button>
+      <button type="button" class="cron-tab-btn" id="cron-tab-btn-preview" data-cron-tab="preview" onclick="switchCronTab('preview')" title="See exactly what the agent will receive at fire-time">What will run</button>
+    </div>
     <div class="modal-body">
-      <div class="form-group">
-        <label class="form-label">Task Name</label>
-        <input type="text" id="cron-name" placeholder="e.g. morning-briefing">
-        <div class="form-hint">Unique identifier. Use lowercase with dashes.</div>
-      </div>
-      <div class="form-group">
-        <label class="form-label">Schedule</label>
-        <div class="schedule-builder" id="schedule-builder">
+      <!-- ── Tab: Configure ─────────────────────────────────────────── -->
+      <div class="cron-tab-pane active" id="cron-tab-configure">
+        <!-- Legacy / mismatch banner (populated by openEditCronModal) -->
+        <div id="cron-legacy-banner-host"></div>
+
+        <!-- Identity: name + category + tags -->
+        <div class="cron-section-card">
+          <h4>Identity</h4>
+          <p class="cron-section-desc">A unique name and optional grouping for the dashboard.</p>
+          <div class="form-group">
+            <label class="form-label">Task Name</label>
+            <input type="text" id="cron-name" placeholder="e.g. morning-briefing">
+            <div class="form-hint">Unique identifier. Use lowercase with dashes.</div>
+          </div>
+          <div class="form-group">
+            <label class="form-label">Category <span style="color:var(--text-muted);font-weight:normal">(optional)</span></label>
+            <input type="text" id="cron-category" placeholder="e.g. ops, research, morning">
+            <div class="form-hint">Used for grouping in the dashboard.</div>
+          </div>
+        </div>
+
+        <!-- Schedule -->
+        <div class="cron-section-card">
+          <h4>Schedule</h4>
+          <p class="cron-section-desc">When this task fires. Pick a frequency or write a cron expression.</p>
+          <div class="form-group" style="margin:0">
+            <div class="schedule-builder" id="schedule-builder">
           <div class="form-row">
             <select id="sched-freq" onchange="updateScheduleBuilder()">
               <option value="daily">Every day</option>
@@ -19467,158 +19588,179 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
             <input type="text" id="cron-schedule" placeholder="0 9 * * *" oninput="updateScheduleHint()">
           </div>
           <div class="form-hint" id="cron-schedule-hint" style="margin-top:6px"></div>
+            </div>
+          </div>
         </div>
-      </div>
-      <div class="form-row">
-        <div class="form-group">
-          <label class="form-label">Tier</label>
-          <select id="cron-tier">
-            <option value="1">Tier 1 — Read-only (vault, search, web)</option>
-            <option value="2">Tier 2 — Read + Write (Bash, files, sub-agents)</option>
-            <option value="3">Tier 3 — Full access (use with caution)</option>
-          </select>
+
+        <!-- What it does: prompt + context + reference files -->
+        <div class="cron-section-card">
+          <h4>What it does</h4>
+          <p class="cron-section-desc">The instruction the agent receives. Long prompts are fine — drag the corner to resize.</p>
+          <div class="form-group">
+            <label class="form-label">Prompt</label>
+            <textarea id="cron-prompt" class="cron-prompt-textarea" placeholder="What should the AI do when this task runs?"></textarea>
+            <div class="form-hint">The instruction sent to the AI agent when this task fires.</div>
+          </div>
+          <div class="form-group">
+            <label class="form-label">Context <span style="color:var(--text-muted);font-weight:normal">(optional — injected at runtime)</span></label>
+            <textarea id="cron-context" rows="4" placeholder="Guidelines, examples, formatting rules, data sources, or any context the agent should know when running this task..."></textarea>
+            <div class="form-hint">Freeform notes injected into the prompt at execution time. Use this for training data, style guides, or standing instructions.</div>
+          </div>
+          <div class="form-group" style="margin-bottom:0">
+            <label class="form-label">Reference Files <span style="color:var(--text-muted);font-weight:normal">(optional)</span></label>
+            <div id="cron-attachments-list" style="margin-bottom:8px"></div>
+            <label class="btn btn-sm" style="cursor:pointer;display:inline-flex;align-items:center;gap:4px;background:var(--bg-tertiary);border:1px solid var(--border);border-radius:6px;padding:6px 12px;font-size:12px;color:var(--text-primary)">
+              + Attach File
+              <input type="file" multiple accept=".csv,.md,.txt,.json,.docx,.xlsx" style="display:none" onchange="handleCronFileUpload(event)">
+            </label>
+            <div class="form-hint">CSV, Markdown, or text files the agent can reference during execution. Max 10MB per file.</div>
+          </div>
         </div>
-        <div class="form-group">
-          <label class="form-label">Category <span style="color:var(--text-muted);font-weight:normal">(optional)</span></label>
-          <input type="text" id="cron-category" placeholder="e.g. ops, research, morning">
-          <div class="form-hint">Used for grouping in the dashboard.</div>
-        </div>
-      </div>
-      <div class="form-group">
-        <label class="form-label">Project Context <span style="color:var(--text-muted);font-weight:normal">(optional)</span></label>
-        <select id="cron-workdir">
-          <option value="">None — runs in default context</option>
-        </select>
-        <div class="form-hint">Run this task inside a project directory. The agent gets access to that project's tools, CLAUDE.md, and files.</div>
-      </div>
-      <div class="form-row">
-        <div class="form-group">
-          <label class="form-label">Mode</label>
-          <select id="cron-mode" onchange="toggleUnleashedOptions()">
-            <option value="standard">Standard</option>
-            <option value="unleashed">Unleashed (long-running)</option>
-          </select>
-          <div class="form-hint">Unleashed mode runs in phases with checkpointing for tasks that take hours.</div>
-        </div>
-        <div class="form-group" id="cron-maxhours-group" style="display:none">
-          <label class="form-label">Max Hours</label>
-          <select id="cron-maxhours">
-            <option value="1">1 hour</option>
-            <option value="2">2 hours</option>
-            <option value="4">4 hours</option>
-            <option value="6" selected>6 hours (default)</option>
-            <option value="8">8 hours</option>
-            <option value="12">12 hours</option>
-            <option value="24">24 hours</option>
-          </select>
-        </div>
-      </div>
-      <div class="form-row">
-        <div class="form-group">
-          <label class="form-label">Max Retries <span style="color:var(--text-muted);font-weight:normal">(optional)</span></label>
-          <select id="cron-max-retries">
-            <option value="">Auto (based on error history)</option>
-            <option value="0">0 — No retries</option>
-            <option value="1">1</option>
-            <option value="2">2</option>
-            <option value="3">3</option>
-            <option value="5">5</option>
-          </select>
-          <div class="form-hint">Override automatic retry count for transient errors.</div>
-        </div>
-        <div class="form-group">
-          <label class="form-label">After Job <span style="color:var(--text-muted);font-weight:normal">(chain)</span></label>
-          <select id="cron-after">
-            <option value="">None — runs on schedule</option>
-          </select>
-          <div class="form-hint">Trigger this job after another succeeds (ignores schedule).</div>
-        </div>
-      </div>
-      <div class="form-group">
-        <label class="form-label">Prompt</label>
-        <textarea id="cron-prompt" rows="5" placeholder="What should the AI do when this task runs?"></textarea>
-        <div class="form-hint">The instruction sent to the AI agent when this task fires.</div>
-      </div>
-      <div class="form-group">
-        <label class="form-label">Context <span style="color:var(--text-muted);font-weight:normal">(optional — injected at runtime)</span></label>
-        <textarea id="cron-context" rows="4" placeholder="Guidelines, examples, formatting rules, data sources, or any context the agent should know when running this task..."></textarea>
-        <div class="form-hint">Freeform notes injected into the prompt at execution time. Use this for training data, style guides, or standing instructions.</div>
-      </div>
-      <!-- ── Capabilities ── -->
-      <div class="form-group">
-        <label class="form-label">Capabilities <span style="color:var(--text-muted);font-weight:normal">(optional — pin skills + scope tools/MCP)</span></label>
-        <div class="form-hint" style="margin-bottom:6px">Pin learned procedures and constrain which tools / MCP servers this trick can use. Empty = inherit defaults. Use Preview on the card to see exactly what gets sent.</div>
-        <div class="cap-section">
-          <label class="cap-section-label">Predictable Mode</label>
-          <label style="display:flex;align-items:flex-start;gap:8px;cursor:pointer;font-size:12px;color:var(--text-primary)">
-            <input type="checkbox" id="cron-predictable" checked style="margin-top:3px">
-            <span>
-              <strong>Run with only what's attached</strong> (recommended)
-              <div style="font-size:11px;color:var(--text-muted);margin-top:3px;line-height:1.5">
-                ON: MEMORY.md, team comms, delegation queue, and auto-matched skills are SKIPPED at fire-time. The trick runs ONLY with the prompt + pinned skills + tools you see here. No drift, no surprise.<br>
-                OFF: legacy mode — runner injects MEMORY.md and other live context. Use only when the trick legitimately needs to re-read memory each fire (e.g. "summarize yesterday's daily note").
-              </div>
+
+        <!-- Capabilities: predictable mode + skills + MCP + tools + tags -->
+        <div class="cron-section-card">
+          <h4>Capabilities</h4>
+          <p class="cron-section-desc">Predictable mode locks the run to exactly what's pinned here. Switch to the <strong>What will run</strong> tab to see the resolved final state.</p>
+
+          <!-- Predictable Mode (prominent at top) -->
+          <label id="cron-predictable-card" class="cron-predictable-card on" style="cursor:pointer;margin-bottom:12px">
+            <span class="pred-icon" id="cron-predictable-icon">🔒</span>
+            <input type="checkbox" id="cron-predictable" checked style="margin-top:3px" onchange="onPredictableChange()">
+            <span style="flex:1">
+              <span class="pred-title" id="cron-predictable-title">Predictable mode — ON</span>
+              <div class="pred-sub" id="cron-predictable-sub">Runs with ONLY the prompt + pinned skills/MCP below. MEMORY.md, team comms, and auto-matched skills are skipped at fire-time. Recommended.</div>
             </span>
           </label>
-        </div>
-        <div class="cap-section">
-          <label class="cap-section-label">Pinned Skills</label>
-          <div class="cap-picker-chips" id="cron-skills-chips"></div>
-          <button type="button" class="cap-toggle-link" id="cron-skills-add-btn" onclick="toggleSkillsPickerSearch()">+ Add skill</button>
-          <div id="cron-skills-search-panel" style="display:none;margin-top:6px">
-            <input type="text" class="cap-picker-search" id="cron-skills-search" placeholder="Search skills…" oninput="renderSkillsPickerList()">
-            <div class="cap-picker-list" id="cron-skills-list"><div class="cap-picker-empty-state">Loading skills…</div></div>
-          </div>
-        </div>
-        <div class="cap-section">
-          <label class="cap-section-label">Allowed MCP Servers</label>
-          <div class="cap-picker-chips" id="cron-mcp-chips"></div>
-          <button type="button" class="cap-toggle-link" id="cron-mcp-add-btn" onclick="toggleMcpPickerSearch()">+ Add MCP server</button>
-          <div id="cron-mcp-search-panel" style="display:none;margin-top:6px">
-            <input type="text" class="cap-picker-search" id="cron-mcp-search" placeholder="Search MCP servers…" oninput="renderMcpPickerList()">
-            <div class="cap-picker-list" id="cron-mcp-list"><div class="cap-picker-empty-state">Loading MCP servers…</div></div>
-          </div>
-        </div>
-        <div class="cap-section">
-          <label class="cap-section-label">Allowed Tools (raw allowlist · power users)</label>
-          <button type="button" class="cap-toggle-link" id="cron-tools-toggle-btn" onclick="toggleAllowedToolsPanel()">▾ Show</button>
-          <div id="cron-tools-panel" style="display:none;margin-top:6px">
-            <textarea id="cron-allowed-tools" class="cap-tools-textarea" rows="2" placeholder="Read, Edit, Bash, mcp__slack__send_message, ..."></textarea>
-            <div class="form-hint">Comma-separated tool names. Empty = inherit from agent profile / default. 'Agent' is always force-included.</div>
-          </div>
-        </div>
-        <div class="cap-section">
-          <label class="cap-section-label">Tags</label>
-          <div class="cap-picker-chips" id="cron-tags-chips"></div>
-          <input type="text" class="cap-tag-input" id="cron-tags-input" placeholder="Type a tag and press Enter (e.g. morning, ops)" onkeydown="handleTagInputKeydown(event)">
-        </div>
-      </div>
-      <div class="form-group">
-        <label class="form-label">Reference Files <span style="color:var(--text-muted);font-weight:normal">(optional)</span></label>
-        <div id="cron-attachments-list" style="margin-bottom:8px"></div>
-        <label class="btn btn-sm" style="cursor:pointer;display:inline-flex;align-items:center;gap:4px;background:var(--bg-tertiary);border:1px solid var(--border);border-radius:6px;padding:6px 12px;font-size:12px;color:var(--text-primary)">
-          + Attach File
-          <input type="file" multiple accept=".csv,.md,.txt,.json,.docx,.xlsx" style="display:none" onchange="handleCronFileUpload(event)">
-        </label>
-        <div class="form-hint">CSV, Markdown, or text files the agent can reference during execution. Max 10MB per file.</div>
-      </div>
 
-      <!-- Training Chat -->
-      <div class="form-group" id="cron-training-section" style="display:none">
-        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
-          <label class="form-label" style="margin:0">Training Chat</label>
-          <button class="btn btn-sm" onclick="toggleCronTraining()" style="font-size:11px" id="cron-training-toggle">Hide</button>
-        </div>
-        <div id="cron-training-chat" style="border:1px solid var(--border);border-radius:8px;background:var(--bg-secondary);overflow:hidden">
-          <div id="cron-training-messages" style="max-height:240px;overflow-y:auto;padding:12px;display:flex;flex-direction:column;gap:8px">
-            <div class="empty-state" style="padding:16px;font-size:12px;color:var(--text-muted)">Chat with the agent to refine this task. Ask for help with the prompt, suggest improvements, or add context.</div>
+          <div class="cap-section">
+            <label class="cap-section-label">Pinned Skills</label>
+            <div class="cap-picker-chips" id="cron-skills-chips"></div>
+            <button type="button" class="cap-toggle-link" id="cron-skills-add-btn" onclick="toggleSkillsPickerSearch()">+ Add skill</button>
+            <div id="cron-skills-search-panel" style="display:none;margin-top:6px">
+              <input type="text" class="cap-picker-search" id="cron-skills-search" placeholder="Search skills…" oninput="renderSkillsPickerList()">
+              <div class="cap-picker-list" id="cron-skills-list"><div class="cap-picker-empty-state">Loading skills…</div></div>
+            </div>
           </div>
-          <div style="display:flex;gap:6px;padding:8px;border-top:1px solid var(--border);background:var(--bg-primary)">
-            <input type="text" id="cron-training-input" placeholder="Ask for help refining this task..." style="flex:1;font-size:12px;padding:6px 10px" onkeydown="if(event.key==='Enter')sendCronTraining()">
-            <button class="btn btn-sm btn-primary" id="cron-training-send" onclick="sendCronTraining()" style="font-size:11px;padding:4px 12px">Send</button>
+          <div class="cap-section">
+            <label class="cap-section-label">Allowed MCP Servers</label>
+            <div class="cap-picker-chips" id="cron-mcp-chips"></div>
+            <button type="button" class="cap-toggle-link" id="cron-mcp-add-btn" onclick="toggleMcpPickerSearch()">+ Add MCP server</button>
+            <div id="cron-mcp-search-panel" style="display:none;margin-top:6px">
+              <input type="text" class="cap-picker-search" id="cron-mcp-search" placeholder="Search MCP servers…" oninput="renderMcpPickerList()">
+              <div class="cap-picker-list" id="cron-mcp-list"><div class="cap-picker-empty-state">Loading MCP servers…</div></div>
+            </div>
+          </div>
+          <div class="cap-section">
+            <label class="cap-section-label">Allowed Tools (raw allowlist · power users)</label>
+            <button type="button" class="cap-toggle-link" id="cron-tools-toggle-btn" onclick="toggleAllowedToolsPanel()">▾ Show</button>
+            <div id="cron-tools-panel" style="display:none;margin-top:6px">
+              <textarea id="cron-allowed-tools" class="cap-tools-textarea" rows="2" placeholder="Read, Edit, Bash, mcp__slack__send_message, ..."></textarea>
+              <div class="form-hint">Comma-separated tool names. Empty = inherit from agent profile / default. 'Agent' is always force-included.</div>
+            </div>
+          </div>
+          <div class="cap-section">
+            <label class="cap-section-label">Tags</label>
+            <div class="cap-picker-chips" id="cron-tags-chips"></div>
+            <input type="text" class="cap-tag-input" id="cron-tags-input" placeholder="Type a tag and press Enter (e.g. morning, ops)" onkeydown="handleTagInputKeydown(event)">
           </div>
         </div>
-      </div>
+
+        <!-- Advanced: tier + workdir + mode + max-hours + retries + after -->
+        <details class="cron-section-card" style="padding:0">
+          <summary style="padding:14px 16px;cursor:pointer;list-style:none;display:flex;align-items:center;justify-content:space-between">
+            <span><strong style="font-size:11px;font-weight:700;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.6px">Advanced</strong> <span style="color:var(--text-muted);font-size:11px;margin-left:6px">tier, mode, retries, project context</span></span>
+            <span style="color:var(--text-muted);font-size:11px">▾</span>
+          </summary>
+          <div style="padding:0 16px 14px">
+            <div class="form-row">
+              <div class="form-group">
+                <label class="form-label">Tier</label>
+                <select id="cron-tier">
+                  <option value="1">Tier 1 — Read-only (vault, search, web)</option>
+                  <option value="2">Tier 2 — Read + Write (Bash, files, sub-agents)</option>
+                  <option value="3">Tier 3 — Full access (use with caution)</option>
+                </select>
+              </div>
+              <div class="form-group">
+                <label class="form-label">Project Context <span style="color:var(--text-muted);font-weight:normal">(optional)</span></label>
+                <select id="cron-workdir">
+                  <option value="">None — runs in default context</option>
+                </select>
+                <div class="form-hint">Run inside a project directory. Agent gets that project's CLAUDE.md.</div>
+              </div>
+            </div>
+            <div class="form-row">
+              <div class="form-group">
+                <label class="form-label">Mode</label>
+                <select id="cron-mode" onchange="toggleUnleashedOptions()">
+                  <option value="standard">Standard</option>
+                  <option value="unleashed">Unleashed (long-running)</option>
+                </select>
+                <div class="form-hint">Unleashed runs in phases with checkpointing for hour-scale tasks.</div>
+              </div>
+              <div class="form-group" id="cron-maxhours-group" style="display:none">
+                <label class="form-label">Max Hours</label>
+                <select id="cron-maxhours">
+                  <option value="1">1 hour</option>
+                  <option value="2">2 hours</option>
+                  <option value="4">4 hours</option>
+                  <option value="6" selected>6 hours (default)</option>
+                  <option value="8">8 hours</option>
+                  <option value="12">12 hours</option>
+                  <option value="24">24 hours</option>
+                </select>
+              </div>
+            </div>
+            <div class="form-row">
+              <div class="form-group">
+                <label class="form-label">Max Retries <span style="color:var(--text-muted);font-weight:normal">(optional)</span></label>
+                <select id="cron-max-retries">
+                  <option value="">Auto (based on error history)</option>
+                  <option value="0">0 — No retries</option>
+                  <option value="1">1</option>
+                  <option value="2">2</option>
+                  <option value="3">3</option>
+                  <option value="5">5</option>
+                </select>
+                <div class="form-hint">Override automatic retry count for transient errors.</div>
+              </div>
+              <div class="form-group">
+                <label class="form-label">After Job <span style="color:var(--text-muted);font-weight:normal">(chain)</span></label>
+                <select id="cron-after">
+                  <option value="">None — runs on schedule</option>
+                </select>
+                <div class="form-hint">Trigger after another job succeeds (ignores schedule).</div>
+              </div>
+            </div>
+          </div>
+        </details>
+
+        <!-- Training Chat -->
+        <div class="form-group" id="cron-training-section" style="display:none">
+          <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
+            <label class="form-label" style="margin:0">Training Chat</label>
+            <button class="btn btn-sm" onclick="toggleCronTraining()" style="font-size:11px" id="cron-training-toggle">Hide</button>
+          </div>
+          <div id="cron-training-chat" style="border:1px solid var(--border);border-radius:8px;background:var(--bg-secondary);overflow:hidden">
+            <div id="cron-training-messages" style="max-height:240px;overflow-y:auto;padding:12px;display:flex;flex-direction:column;gap:8px">
+              <div class="empty-state" style="padding:16px;font-size:12px;color:var(--text-muted)">Chat with the agent to refine this task. Ask for help with the prompt, suggest improvements, or add context.</div>
+            </div>
+            <div style="display:flex;gap:6px;padding:8px;border-top:1px solid var(--border);background:var(--bg-primary)">
+              <input type="text" id="cron-training-input" placeholder="Ask for help refining this task..." style="flex:1;font-size:12px;padding:6px 10px" onkeydown="if(event.key==='Enter')sendCronTraining()">
+              <button class="btn btn-sm btn-primary" id="cron-training-send" onclick="sendCronTraining()" style="font-size:11px;padding:4px 12px">Send</button>
+            </div>
+          </div>
+        </div>
+      </div><!-- /cron-tab-configure -->
+
+      <!-- ── Tab: What will run ─────────────────────────────────────── -->
+      <div class="cron-tab-pane" id="cron-tab-preview">
+        <div id="cron-preview-body" style="padding:0">
+          <div style="padding:36px 24px;color:var(--text-muted);text-align:center;font-size:13px">
+            Save the task first, then switch back here to see exactly what the agent will receive.
+          </div>
+        </div>
+      </div><!-- /cron-tab-preview -->
     </div>
     <div class="modal-footer">
       <div style="display:flex;align-items:center;gap:8px;flex:1">
@@ -19630,21 +19772,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
   </div>
 </div>
 
-<!-- ═══ Preview Modal — see exactly what a trick will run with ═══ -->
-<div class="modal-overlay" id="cron-preview-modal">
-  <div class="modal" style="width:760px;max-width:96vw">
-    <div class="modal-header">
-      <h3 id="cron-preview-title">Preview</h3>
-      <button class="btn-ghost btn-sm" onclick="closeCronPreviewModal()">&times;</button>
-    </div>
-    <div class="modal-body" id="cron-preview-body" style="padding:0;max-height:75vh;overflow-y:auto">
-      <div style="padding:24px;color:var(--text-muted);text-align:center">Loading…</div>
-    </div>
-    <div class="modal-footer">
-      <button onclick="closeCronPreviewModal()">Close</button>
-    </div>
-  </div>
-</div>
+<!-- (legacy standalone Preview modal removed in 1.18.70 — preview now lives as a tab inside the cron modal) -->
 
 <!-- ═══ Goal Modal ═══ -->
 <div class="modal-overlay" id="goal-modal">
@@ -23930,9 +24058,109 @@ function toggleUnleashedOptions() {
   document.getElementById('cron-maxhours-group').style.display = mode === 'unleashed' ? '' : 'none';
 }
 
+// ── Cron modal: tab switching ────────────────────────────────────
+// Tracks whether the current modal session has fetched preview data, so
+// switching tabs doesn't refetch on every flip but a save-then-flip will.
+var _cronPreviewLoadedFor = null;
+var _cronActiveTab = 'configure';
+
+function switchCronTab(tab) {
+  _cronActiveTab = tab;
+  document.querySelectorAll('.cron-tab-btn').forEach(function(b) {
+    b.classList.toggle('active', b.getAttribute('data-cron-tab') === tab);
+  });
+  var configurePane = document.getElementById('cron-tab-configure');
+  var previewPane = document.getElementById('cron-tab-preview');
+  if (configurePane) configurePane.classList.toggle('active', tab === 'configure');
+  if (previewPane) previewPane.classList.toggle('active', tab === 'preview');
+  if (tab === 'preview') {
+    var name = editingCronJob;
+    if (!name) {
+      var body = document.getElementById('cron-preview-body');
+      if (body) body.innerHTML = '<div style="padding:36px 24px;color:var(--text-muted);text-align:center;font-size:13px">Save the task first, then switch back here to see exactly what the agent will receive.</div>';
+      return;
+    }
+    if (_cronPreviewLoadedFor !== name) loadCronPreviewIntoTab(name);
+  }
+}
+
+async function loadCronPreviewIntoTab(jobName) {
+  var body = document.getElementById('cron-preview-body');
+  if (!body) return;
+  body.innerHTML = '<div style="padding:36px 24px;color:var(--text-muted);text-align:center;font-size:13px">Loading preview…</div>';
+  try {
+    var r = await apiFetch('/api/cron/' + encodeURIComponent(jobName) + '/preview');
+    var d = await r.json();
+    if (!r.ok || d.error) {
+      body.innerHTML = '<div class="preview-section" style="color:var(--red)">Preview failed: ' + esc(d.error || 'unknown') + '</div>';
+      return;
+    }
+    body.innerHTML = renderCronPreview(d);
+    _cronPreviewLoadedFor = jobName;
+  } catch(e) {
+    body.innerHTML = '<div class="preview-section" style="color:var(--red)">Preview failed: ' + esc(String(e)) + '</div>';
+  }
+}
+
+// Mark the preview as stale (call after save so next tab visit refetches).
+function markCronPreviewDirty() { _cronPreviewLoadedFor = null; }
+
+// ── Predictable mode: visual card sync + legacy banner ───────────
+function onPredictableChange() {
+  var predEl = document.getElementById('cron-predictable');
+  var card = document.getElementById('cron-predictable-card');
+  var icon = document.getElementById('cron-predictable-icon');
+  var title = document.getElementById('cron-predictable-title');
+  var sub = document.getElementById('cron-predictable-sub');
+  if (!predEl || !card) return;
+  var on = !!predEl.checked;
+  card.classList.toggle('on', on);
+  card.classList.toggle('off', !on);
+  if (icon) icon.textContent = on ? '🔒' : '🔄';
+  if (title) title.textContent = on ? 'Predictable mode — ON' : 'Predictable mode — OFF (legacy)';
+  if (sub) {
+    sub.innerHTML = on
+      ? "Runs with ONLY the prompt + pinned skills/MCP below. MEMORY.md, team comms, and auto-matched skills are skipped at fire-time. Recommended."
+      : "Legacy mode — fire-time injects MEMORY.md, recent team activity, and auto-matched skills/MCP servers based on prompt text. Use only if the task legitimately needs to re-read memory each fire (e.g. \\"summarize yesterday's daily note\\").";
+  }
+  // Hide legacy banner if user just turned predictable on (won't persist
+  // until they Save, but the visual feedback matters).
+  var host = document.getElementById('cron-legacy-banner-host');
+  if (on && host) host.innerHTML = '';
+}
+
+function renderCronLegacyBanner(job) {
+  var host = document.getElementById('cron-legacy-banner-host');
+  if (!host) return;
+  // Banner only when predictable is undefined or explicitly false. Jobs
+  // saved with predictable: true are migrated and skip the banner.
+  if (job && job.predictable === true) { host.innerHTML = ''; return; }
+  var msg = (job && job.predictable === false)
+    ? "This task is set to legacy mode. At fire-time the runner injects MEMORY.md, recent team activity, the delegation queue, and auto-matches MCP servers based on prompt text — even if your prompt forbids them. The <strong>What will run</strong> tab shows what actually gets attached."
+    : "This task was created before Predictable Mode existed. At fire-time the runner still injects MEMORY.md, recent team activity, and auto-matches MCP servers based on prompt text. Open the <strong>What will run</strong> tab to see what actually gets attached.";
+  host.innerHTML =
+    '<div class="cron-banner warn">'
+      + '<h5>⚠ Legacy mode — output may not match what you see here</h5>'
+      + '<div>' + msg + '</div>'
+      + '<div class="banner-actions">'
+        + '<button class="btn-primary btn-sm" onclick="enablePredictableFromBanner()">Switch to Predictable Mode</button>'
+        + '<button class="btn-sm" onclick="switchCronTab(\\x27preview\\x27)" style="background:transparent;border:1px solid var(--border);color:var(--text-primary)">See what will run</button>'
+      + '</div>'
+    + '</div>';
+}
+
+function enablePredictableFromBanner() {
+  var predEl = document.getElementById('cron-predictable');
+  if (!predEl) return;
+  predEl.checked = true;
+  onPredictableChange();
+  toast('Predictable Mode enabled — click Save Changes to lock it in.', 'success');
+}
+
 function openCreateCronModal(agentSlug) {
   _cronAgentContext = agentSlug || '';
   editingCronJob = null;
+  _cronPreviewLoadedFor = null;
   document.getElementById('cron-modal-title').textContent = 'New Scheduled Task';
   document.getElementById('cron-modal-save').textContent = 'Create Task';
   document.getElementById('cron-name').value = '';
@@ -23955,6 +24183,13 @@ function openCreateCronModal(agentSlug) {
   document.getElementById('cron-train-btn').style.display = '';
   resetCronTrainingChat();
   resetTrickCapabilityState();
+  // No saved state to preview when creating — disable the Preview tab.
+  var previewBtn = document.getElementById('cron-tab-btn-preview');
+  if (previewBtn) previewBtn.setAttribute('disabled', 'disabled');
+  var host = document.getElementById('cron-legacy-banner-host');
+  if (host) host.innerHTML = '';
+  switchCronTab('configure');
+  onPredictableChange();
   document.getElementById('cron-modal').classList.add('show');
 }
 
@@ -23963,6 +24198,7 @@ function openEditCronModal(jobName) {
   if (!job) return;
   _cronAgentContext = job.agent || '';
   editingCronJob = jobName;
+  _cronPreviewLoadedFor = null;
   document.getElementById('cron-modal-title').textContent = 'Edit: ' + jobName;
   document.getElementById('cron-modal-save').textContent = 'Save Changes';
   document.getElementById('cron-name').value = job.name;
@@ -23996,64 +24232,59 @@ function openEditCronModal(jobName) {
   var catEl = document.getElementById('cron-category');
   if (catEl) catEl.value = job.category || '';
   // Predictable: respect saved value; if undefined (legacy trick), keep
-  // unchecked so we don't silently change runner behavior.
+  // unchecked so we don't silently change runner behavior. The legacy
+  // banner surfaces the migration choice instead.
   var predEl = document.getElementById('cron-predictable');
   if (predEl) predEl.checked = (job.predictable === true);
+  onPredictableChange();
+  renderCronLegacyBanner(job);
   renderSkillsPickerChips();
   renderMcpPickerChips();
   renderTagsPickerChips();
   _pendingAttachments = [];
   loadCronAttachments(jobName);
+  // Existing job has saved state, enable Preview tab.
+  var previewBtn = document.getElementById('cron-tab-btn-preview');
+  if (previewBtn) previewBtn.removeAttribute('disabled');
+  switchCronTab('configure');
   document.getElementById('cron-modal').classList.add('show');
 }
 
 /**
- * Open the trick preview modal — shows the EXACT prompt + resolved skills
- * + tool/MCP allowlists this trick will run with on the next cron tick,
- * without dispatching to the agent. The visibility tool that catches
- * "configured via chat → surprise at fire time" before the surprise.
+ * Open the unified cron modal directly on the "What will run" tab —
+ * what used to be a separate Preview modal in 1.18.69 and earlier.
+ * Loads both Configure data (so editing works) and the live preview.
  */
 async function openCronPreview(jobName) {
-  document.getElementById('cron-preview-title').textContent = 'Preview: ' + jobName;
-  var body = document.getElementById('cron-preview-body');
-  body.innerHTML = '<div style="padding:24px;color:var(--text-muted);text-align:center">Loading preview…</div>';
-  document.getElementById('cron-preview-modal').classList.add('show');
-  try {
-    var r = await apiFetch('/api/cron/' + encodeURIComponent(jobName) + '/preview');
-    var d = await r.json();
-    if (!r.ok || d.error) {
-      body.innerHTML = '<div class="preview-section" style="color:var(--red)">Preview failed: ' + esc(d.error || 'unknown') + '</div>';
-      return;
-    }
-    body.innerHTML = renderCronPreview(d);
-  } catch(e) {
-    body.innerHTML = '<div class="preview-section" style="color:var(--red)">Preview failed: ' + esc(String(e)) + '</div>';
-  }
+  openEditCronModal(jobName);
+  switchCronTab('preview');
 }
 
-function closeCronPreviewModal() {
-  document.getElementById('cron-preview-modal').classList.remove('show');
-}
+// Backwards-compat alias — kept in case external buttons still reference
+// it. The standalone preview modal was removed in 1.18.70.
+function closeCronPreviewModal() { closeCronModal(); }
 
 function renderCronPreview(d) {
   var html = '';
-  // Predictable verdict line — the headline visibility win.
+  // Headline: this is THE place to surface the predictable verdict, since
+  // this whole tab exists to answer "what will the agent actually receive?"
   html += '<div class="preview-section">';
   if (d.predictable === true) {
     html += '<div style="padding:10px 12px;border-radius:6px;background:rgba(16,185,129,0.12);color:var(--green);font-size:13px;font-weight:500">'
       + '🔒 <strong>Predictable</strong> — what you see here is exactly what will run. No MEMORY.md, no team comms, no auto-matched skills injected at fire-time.'
       + '</div>';
-  } else if (d.predictable === false) {
-    html += '<div style="padding:10px 12px;border-radius:6px;background:rgba(245,158,11,0.12);color:var(--yellow);font-size:13px;font-weight:500">'
-      + '⚠ <strong>Reads memory at fire-time</strong> — fire-time will ALSO inject MEMORY.md, recent team comms, delegation queue, and auto-matched skills. Output may differ from this preview if those drift between now and fire.'
-      + '</div>';
   } else {
-    html += '<div style="padding:10px 12px;border-radius:6px;background:var(--bg-tertiary);color:var(--text-muted);font-size:12px">'
-      + 'Legacy trick — predictable mode not set. Runs in dynamic mode (injects MEMORY.md, etc). Edit and turn on Predictable Mode to lock down behavior.'
+    var head = (d.predictable === false)
+      ? '⚠ <strong>Legacy mode (explicit)</strong>'
+      : '⚠ <strong>Legacy mode (default)</strong>';
+    html += '<div style="padding:10px 12px;border-radius:6px;background:rgba(245,158,11,0.12);color:var(--yellow);font-size:13px;font-weight:500">'
+      + head + ' — fire-time ALSO injects MEMORY.md, team activity, the delegation queue, and auto-matches MCP servers based on prompt text. '
+      + '<a href="#" onclick="switchCronTab(\\x27configure\\x27);enablePredictableFromBanner();return false" style="color:var(--accent);text-decoration:underline">Switch to Predictable Mode →</a>'
       + '</div>';
   }
   html += '</div>';
-  // Warnings band
+
+  // Warnings band (e.g. pinned skill missing)
   if (Array.isArray(d.warnings) && d.warnings.length > 0) {
     html += '<div class="preview-section">';
     for (var w = 0; w < d.warnings.length; w++) {
@@ -24061,17 +24292,55 @@ function renderCronPreview(d) {
     }
     html += '</div>';
   }
-  // Summary header
+
+  // Summary
   html += '<div class="preview-section">';
   html += '<h4>Summary</h4>';
-  html += '<div style="font-size:12px;color:var(--text-secondary);line-height:1.6">';
+  html += '<div style="font-size:12px;color:var(--text-secondary);line-height:1.7">';
   html += '<div><strong>Schedule:</strong> ' + esc(d.job.schedule) + '</div>';
   html += '<div><strong>Tier:</strong> ' + esc(d.tier) + ' (effort: ' + esc(d.effort) + (d.maxBudgetUsd ? ', budget: $' + d.maxBudgetUsd : '') + ')</div>';
   html += '<div><strong>Agent:</strong> ' + esc(d.profile ? (d.profile.name + ' (' + d.profile.slug + ')') : 'Clementine (global)') + '</div>';
   if (d.job.tags && d.job.tags.length) html += '<div><strong>Tags:</strong> ' + d.job.tags.map(function(t) { return '#' + esc(t); }).join(', ') + '</div>';
   if (d.job.category) html += '<div><strong>Category:</strong> ' + esc(d.job.category) + '</div>';
   html += '</div></div>';
-  // Skills (with full content) — the headline visibility win
+
+  // ── MCP servers — split into pinned (allowlist) vs auto-injected ─
+  // The headline mismatch: a job's prompt may forbid kernel, but legacy
+  // mode auto-injects it because the bundle router matched on prompt
+  // text. Surface that explicitly with chip color so the user can act.
+  var configuredMcp = (d.job && Array.isArray(d.job.allowedMcpServers)) ? d.job.allowedMcpServers : null;
+  var pinnedSet = new Set(configuredMcp || []);
+  var hasAllowlist = configuredMcp !== null && configuredMcp.length > 0;
+  html += '<div class="preview-section">';
+  html += '<h4>MCP servers attached at fire-time (' + d.mcpServers.length + ')</h4>';
+  if (d.mcpServers.length === 0) {
+    html += '<div style="color:var(--text-muted);font-size:12px;font-style:italic">No additional MCP servers (clementine-tools always available).</div>';
+  } else {
+    var anyAuto = false;
+    var chips = '';
+    for (var k = 0; k < d.mcpServers.length; k++) {
+      var m = d.mcpServers[k];
+      var isPinned = hasAllowlist && pinnedSet.has(m.name);
+      var cls = (hasAllowlist && isPinned) ? 'preview-chip pinned' : (hasAllowlist ? 'preview-chip' : 'preview-chip auto');
+      if (!hasAllowlist || !isPinned) anyAuto = true;
+      chips += '<span class="' + cls + '" title="' + esc(m.description || '') + '">' + esc(m.name) + '</span>';
+    }
+    if (hasAllowlist) {
+      html += '<div style="margin-bottom:6px"><span class="preview-chip-group-label">Pinned by your allowlist:</span></div>';
+    } else if (anyAuto) {
+      html += '<div style="margin-bottom:6px"><span class="preview-chip-group-label" style="color:var(--yellow)">Auto-injected by prompt match (no allowlist set):</span></div>';
+    }
+    html += '<div>' + chips + '</div>';
+    if (!hasAllowlist && d.mcpServers.length > 0 && d.predictable !== true) {
+      html += '<div style="margin-top:8px;padding:8px 10px;border-radius:6px;background:var(--bg-tertiary);font-size:11px;color:var(--text-muted);line-height:1.5">'
+        + 'These servers were auto-attached because the prompt text matched bundle keywords. '
+        + 'To restrict the surface, switch to Predictable Mode and add an explicit MCP allowlist on the Configure tab.'
+        + '</div>';
+    }
+  }
+  html += '</div>';
+
+  // ── Skills — pinned vs auto-matched, split visually ─
   html += '<div class="preview-section">';
   html += '<h4>Skills injected (' + d.skillsApplied.length + ')</h4>';
   if (d.skillsApplied.length === 0) {
@@ -24080,8 +24349,8 @@ function renderCronPreview(d) {
     for (var i = 0; i < d.skillsApplied.length; i++) {
       var s = d.skillsApplied[i];
       var sourceTag = s.source === 'pinned'
-        ? '<span style="color:var(--accent);font-size:10px;text-transform:uppercase;letter-spacing:0.4px">pinned</span>'
-        : '<span style="color:var(--text-muted);font-size:10px;text-transform:uppercase;letter-spacing:0.4px">auto-matched</span>';
+        ? '<span style="color:var(--purple);font-size:10px;text-transform:uppercase;letter-spacing:0.4px;font-weight:600">PINNED</span>'
+        : '<span style="color:var(--yellow);font-size:10px;text-transform:uppercase;letter-spacing:0.4px;font-weight:600">AUTO-MATCHED</span>';
       html += '<div class="preview-skill">';
       html += '<div class="preview-skill-title">' + esc(s.title) + ' <span style="color:var(--text-muted);font-size:10px;font-weight:normal">(' + esc(s.name) + ')</span> ' + sourceTag + '</div>';
       if (s.toolsUsed && s.toolsUsed.length) {
@@ -24092,21 +24361,7 @@ function renderCronPreview(d) {
     }
   }
   html += '</div>';
-  // MCP servers
-  html += '<div class="preview-section">';
-  html += '<h4>MCP servers (' + d.mcpServers.length + ')</h4>';
-  if (d.mcpServers.length === 0) {
-    html += '<div style="color:var(--text-muted);font-size:12px;font-style:italic">No additional MCP servers (clementine-tools always available).</div>';
-  } else {
-    for (var k = 0; k < d.mcpServers.length; k++) {
-      var m = d.mcpServers[k];
-      html += '<div style="padding:6px 0;border-bottom:1px dashed var(--border-light)">';
-      html += '<div style="font-weight:600;font-size:12px;color:var(--purple)">' + esc(m.name) + '</div>';
-      if (m.description) html += '<div style="font-size:11px;color:var(--text-muted)">' + esc(m.description) + '</div>';
-      html += '</div>';
-    }
-  }
-  html += '</div>';
+
   // Tool allowlist
   html += '<div class="preview-section">';
   html += '<h4>Tool allowlist</h4>';
@@ -24118,9 +24373,10 @@ function renderCronPreview(d) {
     html += '</div>';
   }
   html += '</div>';
-  // Built prompt (collapsed by default)
+
+  // Built prompt (what the agent literally receives)
   html += '<div class="preview-section">';
-  html += '<h4>Built prompt <span style="font-weight:normal;color:var(--text-muted)">(' + d.builtPrompt.length + ' chars — what the agent receives)</span></h4>';
+  html += '<h4>Built prompt <span style="font-weight:normal;color:var(--text-muted)">(' + d.builtPrompt.length + ' chars — what the agent receives verbatim)</span></h4>';
   html += '<div class="preview-prompt-box">' + esc(d.builtPrompt) + '</div>';
   html += '</div>';
   return html;
@@ -24129,8 +24385,15 @@ function renderCronPreview(d) {
 function closeCronModal() {
   document.getElementById('cron-modal').classList.remove('show');
   editingCronJob = null;
+  _cronPreviewLoadedFor = null;
   var attachList = document.getElementById('cron-attachments-list');
   if (attachList) attachList.innerHTML = '';
+  var bannerHost = document.getElementById('cron-legacy-banner-host');
+  if (bannerHost) bannerHost.innerHTML = '';
+  // Reset preview pane content so a stale view from a previous job doesn't
+  // flash on the next open.
+  var previewBody = document.getElementById('cron-preview-body');
+  if (previewBody) previewBody.innerHTML = '<div style="padding:36px 24px;color:var(--text-muted);text-align:center;font-size:13px">Save the task first, then switch back here to see exactly what the agent will receive.</div>';
   resetCronTrainingChat();
 }
 
@@ -24280,6 +24543,7 @@ async function saveCronJob() {
     predictable,
   };
 
+  var wasEditing = !!editingCronJob;
   if (editingCronJob) {
     await apiJson('PUT', '/api/cron/' + encodeURIComponent(editingCronJob), body);
     if (_pendingAttachments.length > 0) await uploadPendingAttachments(editingCronJob);
@@ -24289,8 +24553,18 @@ async function saveCronJob() {
     var attachJobName = _cronAgentContext ? (_cronAgentContext + ':' + name) : name;
     if (_pendingAttachments.length > 0) await uploadPendingAttachments(attachJobName);
   }
-  closeCronModal();
+  // Refresh card list so the data is fresh for any subsequent edit.
   refreshCron();
+  // After save: stay open and flip to "What will run" so the user can
+  // confirm what they just saved actually runs the way they intended.
+  // This is the close-the-loop UX move that makes Predictable Mode visible.
+  markCronPreviewDirty();
+  if (wasEditing) {
+    toast('Saved. Showing what will run…', 'success');
+    switchCronTab('preview');
+  } else {
+    closeCronModal();
+  }
 }
 
 // ── Cron Training Chat ───────────────────
