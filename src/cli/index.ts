@@ -17,8 +17,12 @@ try {
 
 import { Command } from 'commander';
 import { spawn, execSync } from 'node:child_process';
+import http from 'node:http';
+import type { IncomingMessage } from 'node:http';
+import https from 'node:https';
 import {
   cpSync,
+  createWriteStream,
   existsSync,
   openSync,
   closeSync,
@@ -28,10 +32,12 @@ import {
   writeFileSync,
   unlinkSync,
   mkdirSync,
+  renameSync,
   statSync,
 } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { pipeline } from 'node:stream/promises';
 import { fileURLToPath } from 'node:url';
 import { runSetup } from './setup.js';
 import { cmdCronList, cmdCronRun, cmdCronRunDue, cmdCronRuns, cmdCronAdd, cmdCronTest, cmdHeartbeat } from './cron.js';
@@ -2071,6 +2077,212 @@ function cmdTools(): void {
   }
 }
 
+// ── Desktop installer command ───────────────────────────────────────
+
+const DESKTOP_RELEASE_REPO = process.env.CLEMENTINE_DESKTOP_REPO || 'Natebreynolds/Clementine-AI-Assistant';
+
+interface GitHubReleaseAsset {
+  name: string;
+  size?: number;
+  browser_download_url: string;
+}
+
+interface GitHubRelease {
+  tag_name?: string;
+  html_url?: string;
+  assets?: GitHubReleaseAsset[];
+}
+
+interface DesktopDownloadOptions {
+  output?: string;
+  version?: string;
+  open?: boolean;
+}
+
+function githubRequestHeaders(): Record<string, string> {
+  return {
+    Accept: 'application/vnd.github+json',
+    'User-Agent': `clementine-cli/${pkgVersion}`,
+    'X-GitHub-Api-Version': '2022-11-28',
+  };
+}
+
+function requestUrl(url: string, redirects = 0): Promise<IncomingMessage> {
+  return new Promise((resolve, reject) => {
+    if (redirects > 5) {
+      reject(new Error('Too many redirects while contacting GitHub.'));
+      return;
+    }
+    const parsed = new URL(url);
+    const client = parsed.protocol === 'http:' ? http : https;
+    const req = client.get(parsed, { headers: githubRequestHeaders() }, (res) => {
+      const status = res.statusCode ?? 0;
+      const location = res.headers.location;
+      if (status >= 300 && status < 400 && location) {
+        res.resume();
+        resolve(requestUrl(new URL(location, parsed).toString(), redirects + 1));
+        return;
+      }
+      if (status < 200 || status >= 300) {
+        let body = '';
+        res.setEncoding('utf-8');
+        res.on('data', (chunk: string) => { body += chunk; });
+        res.on('end', () => {
+          const detail = body.trim() ? `: ${body.trim().slice(0, 240)}` : '';
+          reject(new Error(`GitHub request failed (${status})${detail}`));
+        });
+        res.on('error', reject);
+        return;
+      }
+      resolve(res);
+    });
+    req.setTimeout(30_000, () => {
+      req.destroy(new Error('Timed out while contacting GitHub.'));
+    });
+    req.on('error', reject);
+  });
+}
+
+async function readResponseText(res: IncomingMessage): Promise<string> {
+  return await new Promise<string>((resolve, reject) => {
+    let body = '';
+    res.setEncoding('utf-8');
+    res.on('data', (chunk: string) => { body += chunk; });
+    res.on('end', () => resolve(body));
+    res.on('error', reject);
+  });
+}
+
+async function fetchJson<T>(url: string): Promise<T> {
+  const body = await readResponseText(await requestUrl(url));
+  try {
+    return JSON.parse(body) as T;
+  } catch {
+    throw new Error('GitHub returned an invalid JSON response.');
+  }
+}
+
+function normalizeReleaseVersion(version?: string): string {
+  const raw = (version || 'latest').trim();
+  if (!raw || raw === 'latest') return 'latest';
+  return raw.startsWith('v') ? raw : `v${raw}`;
+}
+
+function desktopReleaseApiUrl(version?: string): string {
+  const normalized = normalizeReleaseVersion(version);
+  const repo = encodeURIComponent(DESKTOP_RELEASE_REPO).replace('%2F', '/');
+  if (normalized === 'latest') {
+    return `https://api.github.com/repos/${repo}/releases/latest`;
+  }
+  return `https://api.github.com/repos/${repo}/releases/tags/${encodeURIComponent(normalized)}`;
+}
+
+function macDesktopArch(): 'arm64' | 'x64' {
+  if (process.arch === 'arm64') return 'arm64';
+  if (process.arch === 'x64') return 'x64';
+  throw new Error(`Clementine Desktop is only packaged for Apple silicon and Intel Macs. Detected: ${process.arch}`);
+}
+
+function selectDesktopDmgAsset(release: GitHubRelease): GitHubReleaseAsset {
+  const assets = release.assets ?? [];
+  const arch = macDesktopArch();
+  const archSpecific = assets.find(asset => asset.name.endsWith(`-mac-${arch}.dmg`));
+  if (archSpecific) return archSpecific;
+
+  const universal = assets.find(asset => /-mac-universal\.dmg$/i.test(asset.name));
+  if (universal) return universal;
+
+  const available = assets
+    .filter(asset => /\.dmg$/i.test(asset.name))
+    .map(asset => asset.name)
+    .join(', ');
+  throw new Error(
+    available
+      ? `No ${arch} macOS DMG found in this release. Available DMGs: ${available}`
+      : 'No macOS DMG asset found in the latest Clementine release.',
+  );
+}
+
+function expandHomePath(rawPath: string): string {
+  if (rawPath === '~') return os.homedir();
+  if (rawPath.startsWith('~/')) return path.join(os.homedir(), rawPath.slice(2));
+  return rawPath;
+}
+
+function desktopDownloadDestination(output: string | undefined, assetName: string): string {
+  if (output) {
+    const expanded = path.resolve(expandHomePath(output));
+    if (existsSync(expanded) && statSync(expanded).isDirectory()) {
+      return path.join(expanded, assetName);
+    }
+    return expanded;
+  }
+  return path.join(os.homedir(), 'Downloads', assetName);
+}
+
+async function downloadFile(url: string, destination: string, expectedSize?: number): Promise<void> {
+  mkdirSync(path.dirname(destination), { recursive: true });
+  const tempPath = `${destination}.download`;
+  try { unlinkSync(tempPath); } catch { /* no previous partial download */ }
+
+  const res = await requestUrl(url);
+  const total = Number(res.headers['content-length'] ?? expectedSize ?? 0);
+  let downloaded = 0;
+  let lastPrintedAt = 0;
+  res.on('data', (chunk: Buffer) => {
+    downloaded += chunk.length;
+    const now = Date.now();
+    if (now - lastPrintedAt < 250 && downloaded !== total) return;
+    lastPrintedAt = now;
+    const totalLabel = total > 0 ? ` / ${formatBytes(total)}` : '';
+    process.stdout.write(`\r  Downloaded ${formatBytes(downloaded)}${totalLabel}`);
+  });
+
+  try {
+    await pipeline(res, createWriteStream(tempPath, { mode: 0o644 }));
+    process.stdout.write('\n');
+    renameSync(tempPath, destination);
+  } catch (err) {
+    try { unlinkSync(tempPath); } catch { /* best effort */ }
+    throw err;
+  }
+}
+
+function openDesktopInstaller(destination: string): void {
+  const child = spawn('open', [destination], { detached: true, stdio: 'ignore' });
+  child.unref();
+}
+
+async function cmdDesktopDownload(options: DesktopDownloadOptions): Promise<void> {
+  const DIM = '\x1b[0;90m';
+  const BOLD = '\x1b[1m';
+  const GREEN = '\x1b[0;32m';
+  const RESET = '\x1b[0m';
+
+  if (process.platform !== 'darwin') {
+    throw new Error('Clementine Desktop install is currently macOS only.');
+  }
+
+  const release = await fetchJson<GitHubRelease>(desktopReleaseApiUrl(options.version));
+  const asset = selectDesktopDmgAsset(release);
+  const destination = desktopDownloadDestination(options.output, asset.name);
+
+  console.log();
+  console.log(`  ${DIM}Clementine Desktop${RESET} ${release.tag_name ? `${DIM}(${release.tag_name})${RESET}` : ''}`);
+  console.log(`  Downloading ${BOLD}${asset.name}${RESET}`);
+  console.log(`  ${DIM}${destination}${RESET}`);
+  await downloadFile(asset.browser_download_url, destination, asset.size);
+  console.log(`  ${GREEN}OK${RESET}  Downloaded ${BOLD}${path.basename(destination)}${RESET}`);
+
+  if (options.open !== false) {
+    openDesktopInstaller(destination);
+    console.log(`  ${GREEN}OK${RESET}  Opened installer. Drag Clementine to Applications.`);
+  } else {
+    console.log(`  ${DIM}Open it later with: open "${destination}"${RESET}`);
+  }
+  console.log();
+}
+
 // ── Program ──────────────────────────────────────────────────────────
 
 const program = new Command();
@@ -2470,6 +2682,44 @@ program
   .action((opts: { model?: string; project?: string; profile?: string }) => {
     cmdChat(opts).catch((err: unknown) => {
       console.error('Chat error:', err);
+      process.exit(1);
+    });
+  });
+
+const desktopCmd = program
+  .command('desktop')
+  .description('Download and open Clementine Desktop for macOS')
+  .option('-o, --output <path>', 'Download path or directory')
+  .option('--version <tag>', 'GitHub release tag/version (default: latest)', 'latest')
+  .option('--no-open', 'Download only; do not open the DMG')
+  .action((options: DesktopDownloadOptions) => {
+    cmdDesktopDownload({ ...options, open: options.open !== false }).catch((err: unknown) => {
+      console.error('Desktop install failed:', err instanceof Error ? err.message : err);
+      process.exit(1);
+    });
+  });
+
+desktopCmd
+  .command('install')
+  .description('Download and open the latest macOS DMG installer')
+  .option('-o, --output <path>', 'Download path or directory')
+  .option('--version <tag>', 'GitHub release tag/version (default: latest)', 'latest')
+  .option('--no-open', 'Download only; do not open the DMG')
+  .action((options: DesktopDownloadOptions) => {
+    cmdDesktopDownload({ ...options, open: options.open !== false }).catch((err: unknown) => {
+      console.error('Desktop install failed:', err instanceof Error ? err.message : err);
+      process.exit(1);
+    });
+  });
+
+desktopCmd
+  .command('download')
+  .description('Download the latest macOS DMG without opening it')
+  .option('-o, --output <path>', 'Download path or directory')
+  .option('--version <tag>', 'GitHub release tag/version (default: latest)', 'latest')
+  .action((options: DesktopDownloadOptions) => {
+    cmdDesktopDownload({ ...options, open: false }).catch((err: unknown) => {
+      console.error('Desktop download failed:', err instanceof Error ? err.message : err);
       process.exit(1);
     });
   });

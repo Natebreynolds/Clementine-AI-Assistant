@@ -54,6 +54,7 @@ After setup:
 clementine launch         # start as background daemon
 clementine status         # verify it's running
 clementine dashboard      # open the web command center
+clementine desktop install # optional macOS desktop app
 ```
 
 Already installed? Update in place with `clementine update`.
@@ -198,6 +199,7 @@ clementine status                    PID, uptime, active channels
 clementine update [--dry-run]        Pull latest, rebuild, reinstall (preserves config)
 clementine doctor [--fix]            Verify (and optionally repair) config and vault
 clementine dashboard                 Open the web command center (localhost:3030)
+clementine desktop install           Download/open the macOS desktop app installer
 clementine tools                     List available MCP tools, plugins, and channels
 ```
 
