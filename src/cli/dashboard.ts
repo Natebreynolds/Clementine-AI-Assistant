@@ -7061,6 +7061,7 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
       slug: p.slug,
       name: p.name,
       description: p.description,
+      avatar: p.avatar ?? null,
     }));
 
     const activeSlug = gw.getSessionProfile('dashboard:web') ?? null;
@@ -12094,22 +12095,137 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
   .home-chat-panel-header {
     display: flex;
     align-items: center;
-    gap: 8px;
-    padding: 12px 14px;
+    gap: 6px;
+    padding: 10px 12px;
     border-bottom: 1px solid var(--border);
     font-size: var(--text-base);
     font-weight: 600;
     background: var(--bg-secondary);
+    position: relative; /* anchor for .chat-agent-popover */
   }
   .home-chat-panel-header .icn { width: 16px; height: 16px; color: var(--clementine); }
-  .home-chat-panel-header select {
-    padding: 4px 8px;
-    font-size: var(--text-xs);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-xs);
+
+  /* Active-agent header button — replaces the bare <select>.
+     Closed: avatar + name + role tagline + caret. Click opens popover. */
+  .chat-agent-btn {
+    display: flex; align-items: center; gap: 10px;
+    flex: 1; min-width: 0;
+    padding: 6px 8px;
+    border-radius: var(--radius-sm);
+    background: transparent;
+    border: 1px solid transparent;
+    color: var(--text-primary);
+    cursor: pointer;
+    text-align: left;
+    font: inherit;
+    transition: background var(--motion-fast), border-color var(--motion-fast);
+  }
+  .chat-agent-btn:hover { background: var(--bg-hover); border-color: var(--border); }
+  .chat-agent-btn[aria-expanded="true"] { background: var(--bg-hover); border-color: var(--border); }
+  .chat-agent-btn-avatar {
+    width: 32px; height: 32px;
+    border-radius: 50%;
+    background: linear-gradient(135deg, var(--clementine), #ff6b00);
+    background-size: cover;
+    background-position: center;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 13px; font-weight: 700; color: #fff;
+    flex-shrink: 0;
+  }
+  .chat-agent-btn-avatar.hired {
     background: var(--bg-input);
     color: var(--text-primary);
   }
+  .chat-agent-btn-avatar.has-image { color: transparent; } /* hide initial when image present */
+  .chat-agent-btn-text {
+    display: flex; flex-direction: column;
+    flex: 1; min-width: 0;
+    gap: 1px;
+  }
+  .chat-agent-btn-name {
+    font-size: var(--text-base);
+    font-weight: 600;
+    line-height: 1.2;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .chat-agent-btn-role {
+    font-size: 11px;
+    color: var(--text-muted);
+    line-height: 1.2;
+    font-weight: 400;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .chat-agent-btn-caret {
+    width: 14px; height: 14px;
+    color: var(--text-muted);
+    transition: transform var(--motion-fast);
+    flex-shrink: 0;
+  }
+  .chat-agent-btn[aria-expanded="true"] .chat-agent-btn-caret { transform: rotate(180deg); }
+
+  /* Popover — list of agents anchored under the header button */
+  .chat-agent-popover {
+    position: absolute;
+    top: calc(100% + 4px);
+    left: 8px; right: 8px;
+    z-index: 250;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    box-shadow: var(--shadow-lg);
+    max-height: 320px; overflow-y: auto;
+    padding: 6px;
+    animation: msgFadeIn 0.18s ease;
+  }
+  .chat-agent-row {
+    display: flex; align-items: center; gap: 10px;
+    padding: 8px 10px;
+    border-radius: var(--radius-sm);
+    cursor: pointer;
+    transition: background var(--motion-fast);
+    position: relative;
+  }
+  .chat-agent-row:hover { background: var(--bg-hover); }
+  .chat-agent-row.active { background: var(--bg-hover); }
+  .chat-agent-row.active::before {
+    content: '';
+    position: absolute; left: 2px; top: 8px; bottom: 8px;
+    width: 3px; background: var(--clementine);
+    border-radius: 2px;
+  }
+  .chat-agent-row-avatar {
+    width: 28px; height: 28px;
+    border-radius: 50%;
+    background: linear-gradient(135deg, var(--clementine), #ff6b00);
+    background-size: cover;
+    background-position: center;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 11px; font-weight: 700; color: #fff;
+    flex-shrink: 0;
+  }
+  .chat-agent-row-avatar.hired {
+    background: var(--bg-input);
+    color: var(--text-primary);
+  }
+  .chat-agent-row-avatar.has-image { color: transparent; }
+  .chat-agent-row-text { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+  .chat-agent-row-name {
+    font-size: 13px; font-weight: 600;
+    color: var(--text-primary);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .chat-agent-row-desc {
+    font-size: 11px; color: var(--text-muted);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .chat-agent-row-status {
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    background: var(--text-muted);
+    flex-shrink: 0;
+  }
+  .chat-agent-row-status.online { background: var(--green); }
+
   .home-chat-panel-messages {
     flex: 1;
     overflow-y: auto;
@@ -12122,9 +12238,9 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
     padding: 10px 12px;
     border-top: 1px solid var(--border);
     background: var(--bg-secondary);
-    align-items: center;
+    align-items: flex-end;
   }
-  .home-chat-panel-input-row input[type="text"] {
+  .home-chat-panel-input-row textarea {
     flex: 1;
     padding: 8px 12px;
     border: 1px solid var(--border);
@@ -12133,9 +12249,18 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
     color: var(--text-primary);
     font-size: var(--text-base);
     font-family: inherit;
+    resize: none;
+    line-height: 1.4;
+    max-height: 110px;
+    overflow-y: auto;
   }
   .home-chat-panel-input-row .btn-icon { padding: 6px; }
   .home-chat-panel-input-row .icn { width: 14px; height: 14px; }
+  /* Send button busy state — toggle send/spinner instead of swapping text */
+  #chat-send-btn .icon-spinner { display: none; }
+  #chat-send-btn.is-busy .icon-send { display: none; }
+  #chat-send-btn.is-busy .icon-spinner { display: inline-block; animation: btnSpin 0.8s linear infinite; }
+  @keyframes btnSpin { to { transform: rotate(360deg); } }
 
   @media (max-width: 600px) {
     .home-chat-panel {
@@ -14513,6 +14638,8 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
     height: 28px;
     border-radius: 50%;
     background: linear-gradient(135deg, var(--clementine), #ff6b00);
+    background-size: cover;
+    background-position: center;
     display: flex;
     align-items: center;
     justify-content: center;
@@ -14522,6 +14649,11 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
     flex-shrink: 0;
     margin-top: 2px;
   }
+  .chat-avatar-sm.hired {
+    background: var(--bg-input);
+    color: var(--text-primary);
+  }
+  .chat-avatar-sm.has-image { color: transparent; } /* hide initial when image present */
   /* Build page is full-height flex (canvas + chat). Home page handles its own layout. */
   #page-build.active {
     display: flex !important;
@@ -18268,28 +18400,26 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
     </button>
     <div id="home-chat-panel" class="home-chat-panel" aria-hidden="true">
       <div class="home-chat-panel-header">
-        <span><span class="icon-slot" data-icon="messageSquare"></span> Chat</span>
-        <span style="flex:1"></span>
-        <select id="chat-profile-select" onchange="switchProfile(this.value)" title="Active profile">
-          <option value="">Default</option>
-        </select>
-        <button class="btn-icon btn-sm" onclick="toggleHomeChat()" title="Close chat">×</button>
+        <button id="chat-agent-btn" class="chat-agent-btn" onclick="toggleAgentPicker(event)" aria-haspopup="listbox" aria-expanded="false" title="Switch agent">
+          <span class="chat-agent-btn-avatar" id="chat-agent-btn-avatar">C</span>
+          <span class="chat-agent-btn-text">
+            <span class="chat-agent-btn-name" id="chat-agent-btn-name">Clementine</span>
+            <span class="chat-agent-btn-role" id="chat-agent-btn-role">Personal AI Assistant</span>
+          </span>
+          <span class="chat-agent-btn-caret icon-slot" data-icon="chevronDown"></span>
+        </button>
+        <button class="btn-icon btn-sm" onclick="toggleHomeChat()" title="Close chat" style="margin-left:8px">×</button>
+        <div id="chat-agent-popover" class="chat-agent-popover" role="listbox" hidden></div>
       </div>
-      <div id="chat-messages" class="home-chat-panel-messages">
-        <div class="empty-state" style="margin-top:24px">
-          <p style="margin-bottom:12px;color:var(--text-muted);font-size:var(--text-base)">What can I help with?</p>
-          <div style="display:flex;flex-wrap:wrap;gap:6px;justify-content:center">
-            <button class="btn btn-sm quick-pill" onclick="quickChat(&quot;What&apos;s on my schedule?&quot;)">Schedule?</button>
-            <button class="btn btn-sm quick-pill" onclick="quickChat('Check my email')">Email</button>
-            <button class="btn btn-sm quick-pill" onclick="quickChat('Run morning briefing')">Briefing</button>
-            <button class="btn btn-sm quick-pill" onclick="quickChat('What did you do today?')">Today's work</button>
-          </div>
-        </div>
-      </div>
+      <div id="chat-messages" class="home-chat-panel-messages"></div>
       <div class="home-chat-panel-input-row">
-        <input type="text" id="chat-input" placeholder="Ask anything..." onkeydown="if(event.key==='Enter'&amp;&amp;!event.shiftKey){event.preventDefault();sendChat()}">
-        <button class="btn-primary btn-sm" id="chat-send-btn" onclick="sendChat()" title="Send">
-          <span class="icon-slot" data-icon="send"></span>
+        <textarea id="chat-input" rows="1"
+                  placeholder="Message Clementine…"
+                  onkeydown="onChatKeyDown(event)"
+                  oninput="onChatInputChange(this)"></textarea>
+        <button class="btn-primary btn-sm" id="chat-send-btn" onclick="sendChat()" title="Send" disabled>
+          <span class="icon-slot icon-send" data-icon="send"></span>
+          <span class="icon-slot icon-spinner" data-icon="loader" hidden></span>
         </button>
       </div>
     </div>
@@ -19451,7 +19581,12 @@ async function ensureTeamAgentCache(force) {
     if (Array.isArray(agents)) {
       for (var i = 0; i < agents.length; i++) {
         var a = agents[i];
-        if (a && a.slug) next[a.slug] = { slug: a.slug, name: a.name || a.slug, avatar: a.avatar || null };
+        if (a && a.slug) next[a.slug] = {
+          slug: a.slug,
+          name: a.name || a.slug,
+          avatar: a.avatar || null,
+          description: a.description || '',
+        };
       }
     }
     __teamAgentsByslug = next;
@@ -19465,18 +19600,55 @@ async function ensureTeamAgentCache(force) {
  *   getAssistantIdentity()                    → active chat profile (or Clementine)
  *   getAssistantIdentity(slugFromSseEvent)    → that specific agent
  *
- * Returns { slug, name, initial }. Always safe — falls back to
- * Clementine when nothing matches. Initial is uppercase first char,
- * suitable for a .chat-avatar-sm bubble.
+ * Returns { slug, name, initial, avatar, description }. Always safe —
+ * falls back to Clementine when nothing matches. Initial is uppercase
+ * first char, suitable for a .chat-avatar-sm bubble. Avatar is a URL
+ * or null; the bubble renderer applies it as background-image when set.
  */
 function getAssistantIdentity(explicitSlug) {
   var slug = explicitSlug || currentAgentSlug || '';
   if (slug && slug !== 'clementine' && __teamAgentsByslug[slug]) {
     var a = __teamAgentsByslug[slug];
-    return { slug: a.slug, name: a.name, initial: (a.name || 'A').charAt(0).toUpperCase() };
+    return {
+      slug: a.slug,
+      name: a.name,
+      initial: (a.name || 'A').charAt(0).toUpperCase(),
+      avatar: a.avatar || null,
+      description: a.description || '',
+      primary: false,
+    };
   }
   var clemName = (lastStatusData && lastStatusData.name) ? lastStatusData.name : 'Clementine';
-  return { slug: 'clementine', name: clemName, initial: clemName.charAt(0).toUpperCase() };
+  return {
+    slug: 'clementine',
+    name: clemName,
+    initial: clemName.charAt(0).toUpperCase(),
+    avatar: null,
+    description: 'Personal AI Assistant',
+    primary: true,
+  };
+}
+
+/**
+ * Build the empty-state markup for the active (or specified) agent.
+ * Used both at first load and after pickAgent clears the panel — so
+ * a switch always lands on a clean, identity-aware slate instead of
+ * "Session cleared." or a hardcoded "What can I help with?".
+ */
+function renderEmptyStateFor(slug) {
+  var id = getAssistantIdentity(slug || null);
+  var greet = id.primary
+    ? 'What can I help with?'
+    : 'Chat with ' + id.name + (id.description ? ' — ' + id.description : '');
+  return '<div class="empty-state" style="margin-top:24px">'
+    + '<p style="margin-bottom:12px;color:var(--text-muted);font-size:var(--text-base)">' + esc(greet) + '</p>'
+    + '<div style="display:flex;flex-wrap:wrap;gap:6px;justify-content:center">'
+      + '<button class="btn btn-sm quick-pill" onclick="quickChat(\\'What\\\\\\'s on my schedule?\\')">Schedule?</button>'
+      + '<button class="btn btn-sm quick-pill" onclick="quickChat(\\'Check my email\\')">Email</button>'
+      + '<button class="btn btn-sm quick-pill" onclick="quickChat(\\'Run morning briefing\\')">Briefing</button>'
+      + '<button class="btn btn-sm quick-pill" onclick="quickChat(\\'What did you do today?\\')">Today\\'s work</button>'
+    + '</div>'
+  + '</div>';
 }
 
 // ── Routing ────────────────────────────────────────────────────
@@ -24225,8 +24397,31 @@ document.getElementById('log-filter').addEventListener('input', applyLogFilter);
 
 // ── Chat ──────────────────────────────────
 function quickChat(msg) {
-  document.getElementById('chat-input').value = msg;
+  var el = document.getElementById('chat-input');
+  el.value = msg;
+  onChatInputChange(el); // resize + enable send button
   sendChat();
+}
+
+// Enter sends; Shift+Enter inserts a newline. Cmd/Ctrl+Enter also sends
+// for muscle-memory parity with builder chats.
+function onChatKeyDown(e) {
+  if (e.key === 'Enter') {
+    if (e.shiftKey) return;       // newline
+    e.preventDefault();
+    sendChat();
+  }
+}
+
+// Autosize the chat textarea up to ~5 rows; toggle send-button enabled
+// state. Called from oninput on the composer + after quickChat sets a value.
+function onChatInputChange(el) {
+  if (!el) return;
+  el.style.height = 'auto';
+  var max = 110; // ~5 rows at 22px line-height
+  el.style.height = Math.min(el.scrollHeight, max) + 'px';
+  var btn = document.getElementById('chat-send-btn');
+  if (btn) btn.disabled = !el.value.trim() || btn.classList.contains('is-busy');
 }
 
 function renderMd(text) {
@@ -24280,22 +24475,26 @@ async function sendChat() {
   container.appendChild(typing);
   container.scrollTop = container.scrollHeight;
 
-  // Disable input while processing
+  // Swap send button into busy state — keeps the icon, shows a spinner
+  // (no more "Thinking..." text). The .is-busy class is the source of
+  // truth; CSS handles the icon swap.
   const sendBtn = document.getElementById('chat-send-btn');
   input.disabled = true;
   sendBtn.disabled = true;
-  sendBtn.textContent = 'Thinking...';
+  sendBtn.classList.add('is-busy');
 
 	  try {
 	    // Identity follows the active chat profile so a hired agent's
-	    // reply renders with their initial — same as Discord/Slack.
+	    // reply renders with their initial (or avatar URL when set) —
+	    // same as Discord/Slack.
 	    await ensureTeamAgentCache();
 	    var asstIdentity = getAssistantIdentity();
 	    var asstRow = document.createElement('div');
 	    asstRow.className = 'chat-assistant-row';
 	    var chatAv = document.createElement('div');
-	    chatAv.className = 'chat-avatar-sm';
+	    chatAv.className = 'chat-avatar-sm' + (asstIdentity.primary ? '' : ' hired') + (asstIdentity.avatar ? ' has-image' : '');
 	    chatAv.title = asstIdentity.name;
+	    if (asstIdentity.avatar) chatAv.style.backgroundImage = "url('" + asstIdentity.avatar + "')";
 	    chatAv.innerHTML = asstIdentity.initial;
 	    asstRow.appendChild(chatAv);
 	    var asstBubble = document.createElement('div');
@@ -24386,8 +24585,12 @@ async function sendChat() {
   }
 
   input.disabled = false;
-  sendBtn.disabled = false;
-  sendBtn.textContent = 'Send';
+  sendBtn.classList.remove('is-busy');
+  // Re-enable only if there's content to send (or stay disabled — the
+  // user clears the textarea by sending, so it's empty here).
+  sendBtn.disabled = !input.value.trim();
+  // Reset the textarea autosize back to single-row.
+  if (typeof onChatInputChange === 'function') onChatInputChange(input);
   input.focus();
   container.scrollTop = container.scrollHeight;
 }
@@ -24816,36 +25019,137 @@ async function deleteChunk(id) {
   } catch (e) { toast('Delete failed: ' + String(e), 'error'); }
 }
 
-// ── Profile Switching ─────────────────────
-async function loadProfiles() {
-  try {
-    var r = await apiFetch('/api/profiles');
-    var d = await r.json();
-    var sel = document.getElementById('chat-profile-select');
-    sel.innerHTML = '<option value="">Default</option>';
-    var customCount = 0;
-    for (var p of (d.profiles || [])) {
-      var opt = document.createElement('option');
-      opt.value = p.slug;
-      opt.textContent = p.name + (p.description ? ' — ' + p.description : '');
-      if (p.slug === d.active) opt.selected = true;
-      sel.appendChild(opt);
-      customCount++;
+// ── Profile Switching — chat agent picker (header button + popover) ─────
+//
+// Replaces the legacy <select> with a richer header affordance:
+//   • closed: avatar + name + role tagline of the active agent
+//   • open: avatar-row list of Clementine + every hired agent, with
+//     status dots and descriptions
+//
+// Source of truth for "active profile" stays the gateway's session
+// profile map (set via /api/profiles/switch). The picker just makes
+// it visible and one-click switchable.
+
+var _agentPickerOpen = false;
+var _chatAgentRows = [];
+
+async function refreshChatAgentPicker() {
+  await ensureTeamAgentCache();
+  var rProf;
+  try { rProf = await apiFetch('/api/profiles'); } catch { rProf = { ok: false }; }
+  var d = (rProf && rProf.ok) ? await rProf.json() : { profiles: [], active: null };
+
+  var clemName = (lastStatusData && lastStatusData.name) ? lastStatusData.name : 'Clementine';
+  var clemRole = 'Personal AI Assistant';
+  var clemOnline = !!(lastStatusData && lastStatusData.alive);
+  var rows = [{ slug: '', name: clemName, role: clemRole, avatar: null, online: clemOnline, primary: true }];
+  for (var i = 0; i < (d.profiles || []).length; i++) {
+    var p = d.profiles[i];
+    var cached = __teamAgentsByslug[p.slug] || {};
+    rows.push({
+      slug: p.slug,
+      name: p.name || p.slug,
+      role: p.description || '',
+      avatar: p.avatar || cached.avatar || null,
+      online: cached.botStatus === 'online' || cached.status === 'active',
+      primary: false,
+    });
+  }
+  _chatAgentRows = rows;
+  var activeSlug = d.active || '';
+  currentAgentSlug = activeSlug || null;
+
+  // Header button — always visible identity affordance
+  var btnAvatar = document.getElementById('chat-agent-btn-avatar');
+  var btnName = document.getElementById('chat-agent-btn-name');
+  var btnRole = document.getElementById('chat-agent-btn-role');
+  var active = null;
+  for (var j = 0; j < rows.length; j++) { if (rows[j].slug === activeSlug) { active = rows[j]; break; } }
+  if (!active) active = rows[0];
+  if (btnAvatar) applyAgentAvatar(btnAvatar, active);
+  if (btnName) btnName.textContent = active.name;
+  if (btnRole) btnRole.textContent = active.role || (active.primary ? clemRole : '');
+
+  // Popover rows
+  var pop = document.getElementById('chat-agent-popover');
+  if (pop) {
+    var html = '';
+    for (var k = 0; k < rows.length; k++) {
+      var r = rows[k];
+      var isActive = r.slug === activeSlug;
+      var avatarStyle = r.avatar ? (' style="background-image:url(\\''+ esc(r.avatar) +'\\')"') : '';
+      var avatarClasses = 'chat-agent-row-avatar' + (r.primary ? '' : ' hired') + (r.avatar ? ' has-image' : '');
+      var initial = esc((r.name || '?').charAt(0).toUpperCase());
+      html += '<div class="chat-agent-row' + (isActive ? ' active' : '') + '" role="option" aria-selected="' + (isActive ? 'true' : 'false') + '" onclick="pickAgent(\\''+ esc(r.slug) +'\\')">'
+        + '<span class="' + avatarClasses + '"' + avatarStyle + '>' + initial + '</span>'
+        + '<span class="chat-agent-row-text">'
+          + '<span class="chat-agent-row-name">' + esc(r.name) + '</span>'
+          + (r.role ? '<span class="chat-agent-row-desc">' + esc(r.role) + '</span>' : '')
+        + '</span>'
+        + '<span class="chat-agent-row-status ' + (r.online ? 'online' : 'offline') + '" title="' + (r.online ? 'Online' : 'Offline') + '"></span>'
+        + '</div>';
     }
-    // Hide the picker entirely if there are no custom profiles — declutters the chat input row.
-    sel.style.display = customCount === 0 ? 'none' : '';
-  } catch(e) { /* profiles are optional */ }
+    pop.innerHTML = html;
+  }
+
+  // Update input placeholder to match the active agent
+  var input = document.getElementById('chat-input');
+  if (input) input.placeholder = 'Message ' + active.name + '…';
 }
 
-async function switchProfile(slug) {
+function applyAgentAvatar(el, identity) {
+  if (!el) return;
+  // Wipe + recompute classes so we can swap between Clementine/hired
+  // and toggle has-image on each refresh without leftover state.
+  var base = el.classList.contains('chat-agent-row-avatar') ? 'chat-agent-row-avatar' : 'chat-agent-btn-avatar';
+  el.className = base + (identity.primary ? '' : ' hired') + (identity.avatar ? ' has-image' : '');
+  if (identity.avatar) {
+    el.style.backgroundImage = "url('" + identity.avatar + "')";
+  } else {
+    el.style.backgroundImage = '';
+  }
+  el.textContent = (identity.name || '?').charAt(0).toUpperCase();
+}
+
+function toggleAgentPicker(e) {
+  if (e && e.stopPropagation) e.stopPropagation();
+  var btn = document.getElementById('chat-agent-btn');
+  var pop = document.getElementById('chat-agent-popover');
+  _agentPickerOpen = !_agentPickerOpen;
+  if (btn) btn.setAttribute('aria-expanded', _agentPickerOpen ? 'true' : 'false');
+  if (pop) pop.hidden = !_agentPickerOpen;
+}
+
+async function pickAgent(slug) {
+  toggleAgentPicker();
+  if ((slug || '') === (currentAgentSlug || '')) return;
   try {
     await apiJson('POST', '/api/profiles/switch', { slug: slug || null });
-    // Clear chat display since session was reset
+    currentAgentSlug = slug || null;
+    // Server-side session was cleared. Mirror that visually with the
+    // new agent's empty state — replaces the bare "Session cleared." line.
     var container = document.getElementById('chat-messages');
-    container.innerHTML = '<div class="empty-state"><p style="margin-bottom:14px;color:var(--text-muted)">Profile switched' + (slug ? ' to <strong>' + esc(slug) + '</strong>' : '') + '. Session cleared.</p></div>';
-    toast(slug ? 'Switched to ' + slug : 'Profile cleared', 'success');
-  } catch(e) { toast('Failed to switch profile: ' + e, 'error'); }
+    if (container) container.innerHTML = renderEmptyStateFor(currentAgentSlug);
+    await refreshChatAgentPicker();
+    var picked = _chatAgentRows.find ? _chatAgentRows.find(function(r){ return r.slug === (slug || ''); }) : null;
+    toast(slug ? ('Now chatting with ' + (picked ? picked.name : slug)) : 'Switched to Clementine', 'success');
+  } catch (e) {
+    toast('Failed to switch agent: ' + e, 'error');
+  }
 }
+
+// Click-outside closes the popover
+document.addEventListener('click', function(e) {
+  if (!_agentPickerOpen) return;
+  var btn = document.getElementById('chat-agent-btn');
+  var pop = document.getElementById('chat-agent-popover');
+  if (!btn || !pop) return;
+  if (btn.contains(e.target) || pop.contains(e.target)) return;
+  toggleAgentPicker();
+});
+
+// Back-compat shim — older call sites still reference loadProfiles().
+function loadProfiles() { return refreshChatAgentPicker(); }
 
 // ── Skill Studio — opens builder in skill-focused mode ──────────
 
@@ -28417,7 +28721,14 @@ function toggleHomeChat(forceOpen) {
       var input = document.getElementById('chat-input');
       if (input) input.focus();
     }, 80);
-    if (typeof loadProfiles === 'function') loadProfiles();
+    // Refresh the agent picker (replaces the legacy loadProfiles()).
+    // Also populate the empty state for the active agent if the panel
+    // is still empty — first-open path.
+    if (typeof refreshChatAgentPicker === 'function') refreshChatAgentPicker();
+    var container = document.getElementById('chat-messages');
+    if (container && !container.children.length) {
+      container.innerHTML = renderEmptyStateFor(currentAgentSlug);
+    }
   }
 }
 
@@ -32381,17 +32692,19 @@ try {
           // Lazy-refresh the cache if the SSE event names a slug we
           // haven't seen yet (e.g. an agent hired since page load).
           if (deepSlug && !__teamAgentsByslug[deepSlug]) { ensureTeamAgentCache(true); }
-          var deepIdentity = deepName
-            ? { slug: deepSlug, name: deepName, initial: deepName.charAt(0).toUpperCase() }
-            : getAssistantIdentity(deepSlug);
+          var deepIdentity = getAssistantIdentity(deepSlug);
+          // Server-side payload may carry a fresher name than our cache.
+          if (deepName) deepIdentity.name = deepName;
+          if (deepName) deepIdentity.initial = deepName.charAt(0).toUpperCase();
           if (container && text) {
             var emptyState = container.querySelector('.empty-state');
             if (emptyState) emptyState.remove();
             var row = document.createElement('div');
             row.className = 'chat-assistant-row';
             var av = document.createElement('div');
-            av.className = 'chat-avatar-sm';
+            av.className = 'chat-avatar-sm' + (deepIdentity.primary ? '' : ' hired') + (deepIdentity.avatar ? ' has-image' : '');
             av.title = deepIdentity.name;
+            if (deepIdentity.avatar) av.style.backgroundImage = "url('" + deepIdentity.avatar + "')";
             av.innerHTML = deepIdentity.initial;
             row.appendChild(av);
             var bubble = document.createElement('div');
