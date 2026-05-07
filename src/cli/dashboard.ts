@@ -6106,7 +6106,7 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
       const {
         name, schedule, prompt, tier, enabled, work_dir, mode, max_hours,
         max_retries, after, agent, context,
-        skills, allowedTools, allowedMcpServers, tags, category,
+        skills, allowedTools, allowedMcpServers, tags, category, predictable,
       } = req.body;
       if (!name || !schedule || !prompt) {
         res.status(400).json({ error: 'name, schedule, and prompt are required' });
@@ -6160,6 +6160,9 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
       if (typeof category === 'string' && category.trim()) {
         job.category = category.trim().slice(0, 64);
       }
+      // Predictable mode — default to true (contract execution) for new
+      // tricks created via the dashboard. Mirror the MCP tool default.
+      job.predictable = (predictable === false) ? false : true;
       jobs.push(job);
       writeCronFileAt(cronFile, parsed, jobs);
       res.json({ ok: true, message: `Created cron job: ${name}` });
@@ -6284,6 +6287,9 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
           delete jobs[idx].category;
         }
       }
+      if (updates.predictable !== undefined) {
+        jobs[idx].predictable = Boolean(updates.predictable);
+      }
       if (updates.name !== undefined && updates.name !== bareJobName) {
         // Rename — check for duplicates
         const dup = jobs.find(
@@ -6402,6 +6408,7 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
         pinnedSkills: job.skills,
         allowedTools: job.allowedTools,
         allowedMcpServers: job.allowedMcpServers,
+        predictable: job.predictable,
       });
 
       // Enrich each applied skill with its title/description/full markdown
@@ -6443,7 +6450,9 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
           mode: job.mode ?? null,
           tags: job.tags ?? [],
           category: job.category ?? null,
+          predictable: typeof job.predictable === 'boolean' ? job.predictable : null,
         },
+        predictable: plan.predictable,
         profile: profile ? { slug: profile.slug, name: profile.name } : null,
         builtPrompt: plan.builtPrompt,
         contextBlocks: plan.contextBlocks,
@@ -19540,6 +19549,19 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
         <label class="form-label">Capabilities <span style="color:var(--text-muted);font-weight:normal">(optional — pin skills + scope tools/MCP)</span></label>
         <div class="form-hint" style="margin-bottom:6px">Pin learned procedures and constrain which tools / MCP servers this trick can use. Empty = inherit defaults. Use Preview on the card to see exactly what gets sent.</div>
         <div class="cap-section">
+          <label class="cap-section-label">Predictable Mode</label>
+          <label style="display:flex;align-items:flex-start;gap:8px;cursor:pointer;font-size:12px;color:var(--text-primary)">
+            <input type="checkbox" id="cron-predictable" checked style="margin-top:3px">
+            <span>
+              <strong>Run with only what's attached</strong> (recommended)
+              <div style="font-size:11px;color:var(--text-muted);margin-top:3px;line-height:1.5">
+                ON: MEMORY.md, team comms, delegation queue, and auto-matched skills are SKIPPED at fire-time. The trick runs ONLY with the prompt + pinned skills + tools you see here. No drift, no surprise.<br>
+                OFF: legacy mode — runner injects MEMORY.md and other live context. Use only when the trick legitimately needs to re-read memory each fire (e.g. "summarize yesterday's daily note").
+              </div>
+            </span>
+          </label>
+        </div>
+        <div class="cap-section">
           <label class="cap-section-label">Pinned Skills</label>
           <div class="cap-picker-chips" id="cron-skills-chips"></div>
           <button type="button" class="cap-toggle-link" id="cron-skills-add-btn" onclick="toggleSkillsPickerSearch()">+ Add skill</button>
@@ -22592,6 +22614,8 @@ function renderScheduledTaskCard(task) {
   var badges = '';
   if (task.owner) badges += '<span class="badge badge-orange">' + esc(task.owner) + '</span>';
   if (task.category) badges += '<span class="badge badge-gray" title="Category">' + esc(task.category) + '</span>';
+  if (task.predictable === true) badges += '<span class="badge badge-green" title="Contract mode — runs with only the prompt + pinned skills/tools. No MEMORY.md, no auto-matched skills, no team comms injection at fire-time.">🔒 predictable</span>';
+  else if (task.predictable === false) badges += '<span class="badge badge-yellow" title="Dynamic mode — fire-time injects MEMORY.md, recent team activity, and auto-matched skills. Can drift from chat-time intent.">🔄 reads memory</span>';
   if (task.mode === 'unleashed') badges += '<span class="badge badge-purple">long-running</span>';
   if (task.after) badges += '<span class="badge badge-yellow" title="Triggered after ' + esc(task.after) + '">after ' + esc(task.after) + '</span>';
   if (task.maxRetries != null) badges += '<span class="badge badge-gray">' + esc(task.maxRetries) + ' retries</span>';
@@ -23655,6 +23679,9 @@ function resetTrickCapabilityState() {
   if (toolsToggle) toolsToggle.textContent = '▾ Show';
   var catEl = document.getElementById('cron-category');
   if (catEl) catEl.value = '';
+  // Default: predictable ON for new tricks (matches add_cron_job default).
+  var predEl = document.getElementById('cron-predictable');
+  if (predEl) predEl.checked = true;
   renderSkillsPickerChips();
   renderMcpPickerChips();
   renderTagsPickerChips();
@@ -23968,6 +23995,10 @@ function openEditCronModal(jobName) {
   if (allowedTools.length > 0) toggleAllowedToolsPanel();
   var catEl = document.getElementById('cron-category');
   if (catEl) catEl.value = job.category || '';
+  // Predictable: respect saved value; if undefined (legacy trick), keep
+  // unchecked so we don't silently change runner behavior.
+  var predEl = document.getElementById('cron-predictable');
+  if (predEl) predEl.checked = (job.predictable === true);
   renderSkillsPickerChips();
   renderMcpPickerChips();
   renderTagsPickerChips();
@@ -24006,7 +24037,23 @@ function closeCronPreviewModal() {
 
 function renderCronPreview(d) {
   var html = '';
-  // Warnings band first
+  // Predictable verdict line — the headline visibility win.
+  html += '<div class="preview-section">';
+  if (d.predictable === true) {
+    html += '<div style="padding:10px 12px;border-radius:6px;background:rgba(16,185,129,0.12);color:var(--green);font-size:13px;font-weight:500">'
+      + '🔒 <strong>Predictable</strong> — what you see here is exactly what will run. No MEMORY.md, no team comms, no auto-matched skills injected at fire-time.'
+      + '</div>';
+  } else if (d.predictable === false) {
+    html += '<div style="padding:10px 12px;border-radius:6px;background:rgba(245,158,11,0.12);color:var(--yellow);font-size:13px;font-weight:500">'
+      + '⚠ <strong>Reads memory at fire-time</strong> — fire-time will ALSO inject MEMORY.md, recent team comms, delegation queue, and auto-matched skills. Output may differ from this preview if those drift between now and fire.'
+      + '</div>';
+  } else {
+    html += '<div style="padding:10px 12px;border-radius:6px;background:var(--bg-tertiary);color:var(--text-muted);font-size:12px">'
+      + 'Legacy trick — predictable mode not set. Runs in dynamic mode (injects MEMORY.md, etc). Edit and turn on Predictable Mode to lock down behavior.'
+      + '</div>';
+  }
+  html += '</div>';
+  // Warnings band
   if (Array.isArray(d.warnings) && d.warnings.length > 0) {
     html += '<div class="preview-section">';
     for (var w = 0; w < d.warnings.length; w++) {
@@ -24207,6 +24254,7 @@ async function saveCronJob() {
   const categoryRaw = (document.getElementById('cron-category')?.value || '').trim();
   const category = categoryRaw || undefined;
   const allowedTools = parseAllowedToolsRaw();
+  const predictable = !!document.getElementById('cron-predictable')?.checked;
 
   if (!name || !schedule || !prompt) {
     toast('Please fill in all fields', 'error');
@@ -24229,6 +24277,7 @@ async function saveCronJob() {
       : (_cronSelectedMcp.length ? _cronSelectedMcp : undefined),
     tags: editingCronJob ? _cronTags : (_cronTags.length ? _cronTags : undefined),
     category: editingCronJob ? (category || '') : category,
+    predictable,
   };
 
   if (editingCronJob) {

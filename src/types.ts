@@ -408,6 +408,22 @@ export interface CronJobDefinition {
   /** Single category bucket — convenience for default grouping in the
    *  dashboard (e.g. "ops", "research", "morning"). */
   category?: string;
+  /**
+   * Predictable mode (the "contract" model) — runs the trick with ONLY
+   * the prompt + explicitly-attached skills/criteria/goals + tools. Skips
+   * MEMORY.md injection, auto-matched skills, team comms, and delegation
+   * queue. The fix for "agent said OK in chat then fired with stale memory."
+   *
+   * - undefined / false: legacy behavior — runner injects everything
+   *   (MEMORY.md, auto-matched skills, team activity, delegation). What
+   *   chat-style autonomous work needs, but contaminates scheduled tasks.
+   * - true: contract mode — runner only includes what was explicitly
+   *   attached. The trick executes the plan you saw in chat, nothing more.
+   *
+   * `add_cron_job` defaults this to `true` for new chat-created tricks.
+   * Existing tricks (no field set) keep current behavior — backward compat.
+   */
+  predictable?: boolean;
 }
 
 export type LongTaskRisk = 'normal' | 'long' | 'huge' | 'unsafe';

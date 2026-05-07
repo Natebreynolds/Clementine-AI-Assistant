@@ -2243,6 +2243,8 @@ export class Gateway {
     pinnedSkills?: string[],
     allowedTools?: string[],
     allowedMcpServers?: string[],
+    /** Predictable (contract) mode — runner skips memory/team/auto-skills. */
+    predictable?: boolean,
   ): Promise<string> {
     const releaseLane = await lanes.acquire('cron');
     // Build a wall-clock abort timer from maxHours / timeoutMs.
@@ -2285,6 +2287,7 @@ export class Gateway {
           pinnedSkills,
           allowedTools,
           allowedMcpServers,
+          predictable,
         });
 
         scanner.refreshIntegrity();

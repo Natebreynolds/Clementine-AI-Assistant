@@ -1163,22 +1163,23 @@ server.tool(
 
 server.tool(
   'add_cron_job',
-  'Add a new scheduled cron job ("trick"). Validates the schedule expression and writes to CRON.md. The daemon auto-reloads on file change. The canonical SDK path runs every job through runAgentCron — there is no separate "unleashed" mode anymore; the SDK handles compaction + multi-turn work natively up to maxBudgetUsd. CAPABILITIES: pin specific skills with `skills`, constrain tools with `allowed_tools`, and constrain MCP servers with `allowed_mcp_servers` so the trick has predictable behavior at fire time. Without these, the runtime auto-matches skills which can surprise the user.',
+  'Add a new scheduled task. ⚠ BEFORE CALLING THIS TOOL: propose the concrete plan to the user in chat and get explicit approval. The `prompt` you save should be SELF-CONTAINED — list the actual recipients, the actual template/content, the actual criteria. AVOID vague references like "recent leads" or "this week\'s items" that the trick will re-derive at fire-time, because re-derivation reads from MEMORY.md which drifts between chat-time agreement and fire-time execution. Good prompt: "Send template `monday-followup` to alice@x.com, bob@y.com, carol@z.com." Bad prompt: "Send follow-up to recent leads." The default `predictable: true` mode runs the trick with ONLY the prompt + explicitly-attached skills/tools — no MEMORY.md, no team-comms injection, no runtime skill auto-match. Set `predictable: false` ONLY if the user explicitly wants a dynamic trick that re-resolves data each fire (e.g., "summarize yesterday\'s daily note" where the data legitimately changes).',
   {
     name: z.string().describe('Job name (unique identifier)'),
     schedule: z.string().describe('Cron expression (e.g., "0 9 * * 1" for Monday 9 AM)'),
-    prompt: z.string().describe('The prompt/instruction for the assistant to execute'),
+    prompt: z.string().describe('The prompt/instruction for the assistant to execute. SHOULD BE CONCRETE — list actual recipients, criteria, content. Vague prompts re-derive at fire-time and cause "agent agreed in chat but emailed wrong people" failures.'),
     tier: z.number().optional().default(1).describe('Security tier (1=auto, 2=logged, 3=approval). Tier 2+ also raises the per-run budget cap.'),
     enabled: z.boolean().optional().default(true).describe('Whether the job is enabled'),
     work_dir: z.string().optional().describe('Project directory to run in (agent gets access to project tools, CLAUDE.md, files)'),
     max_hours: z.number().optional().describe('Wall-clock cap in hours. Defaults to 1h. Run aborts via AbortSignal when exceeded.'),
-    skills: z.array(z.string()).optional().describe('Pinned skill slugs (filename minus .md, slashes flattened to dashes). Loaded BEFORE runtime auto-match. Total injected per run capped at 4. Pin skills here so the trick has predictable behavior — empty/omitted falls back to runtime auto-match.'),
+    predictable: z.boolean().optional().default(true).describe('PREDICTABLE MODE (default true, recommended). When true, the runner runs with ONLY the prompt + pinned skills + criteria + linked goals + prior progress — MEMORY.md, team comms, delegation queue, and runtime skill auto-match are SKIPPED. This is the contract model: trick executes the plan you saved, not whatever memory says today. Set to false only when the user EXPLICITLY needs dynamic behavior — and tell them what that means.'),
+    skills: z.array(z.string()).optional().describe('Pinned skill slugs (filename minus .md, slashes flattened to dashes). Loaded BEFORE runtime auto-match. Total injected per run capped at 4. In predictable mode, ONLY pinned skills load (no auto-match).'),
     allowed_tools: z.array(z.string()).optional().describe('Per-trick tool whitelist. When set, intersected with the agent profile allowlist. Agent is always force-included for sub-agent delegation. Empty/omitted inherits from profile.'),
     allowed_mcp_servers: z.array(z.string()).optional().describe('Per-trick MCP server whitelist (server names from list_mcp_servers). Applied AFTER profile allowlist. Empty/omitted inherits from profile.'),
     tags: z.array(z.string()).optional().describe('Free-form tags for grouping/filtering in the dashboard.'),
     category: z.string().optional().describe('Single category bucket (e.g. "ops", "research").'),
   },
-  async ({ name: jobName, schedule, prompt, tier, enabled, work_dir, max_hours, skills, allowed_tools, allowed_mcp_servers, tags, category }) => {
+  async ({ name: jobName, schedule, prompt, tier, enabled, work_dir, max_hours, predictable, skills, allowed_tools, allowed_mcp_servers, tags, category }) => {
     // Validate cron expression
     const cronMod = await import('node-cron');
     if (!cronMod.default.validate(schedule)) {
@@ -1218,6 +1219,9 @@ server.tool(
     };
     if (work_dir) newJob.work_dir = work_dir;
     if (max_hours) newJob.max_hours = max_hours;
+    // Predictable mode: persist explicitly so behavior is locked. Default
+    // for new chat-created tricks is true (contract execution).
+    newJob.predictable = predictable !== false;
     // ── Trick capabilities (snake_case YAML keys) ──────────────────
     if (Array.isArray(skills) && skills.length) newJob.skills = skills.map(s => String(s).trim()).filter(Boolean);
     if (Array.isArray(allowed_tools) && allowed_tools.length) newJob.allowed_tools = allowed_tools.map(s => String(s).trim()).filter(Boolean);
@@ -1262,6 +1266,7 @@ server.tool(
     ];
     if (work_dir) details.push(`  Project: ${work_dir}`);
     if (max_hours) details.push(`  Wall-clock cap: ${max_hours}h`);
+    details.push(`  Predictable mode: ${newJob.predictable ? 'ON — runs with only the prompt + pinned skills/tools (no MEMORY.md drift)' : 'OFF — runs with MEMORY.md + auto-matched skills (dynamic, may surprise)'}`);
     if (Array.isArray(skills) && skills.length) details.push(`  Pinned skills: ${skills.join(', ')}`);
     if (Array.isArray(allowed_tools) && allowed_tools.length) details.push(`  Allowed tools: ${allowed_tools.join(', ')}`);
     if (Array.isArray(allowed_mcp_servers) && allowed_mcp_servers.length) details.push(`  Allowed MCP: ${allowed_mcp_servers.join(', ')}`);
@@ -1285,7 +1290,7 @@ server.tool(
 
 server.tool(
   'update_cron_job',
-  'Update an existing cron job in CRON.md. Partial — only fields you supply change. To CLEAR a capability allowlist (skills/allowed_tools/allowed_mcp_servers/tags), pass an empty array. To clear category, pass an empty string. The daemon auto-reloads on file change. Use preview_cron_job to confirm what will run before the next fire.',
+  'Update an existing cron job in CRON.md. Partial — only fields you supply change. To CLEAR a capability allowlist (skills/allowed_tools/allowed_mcp_servers/tags), pass an empty array. To clear category, pass an empty string. The daemon auto-reloads on file change. Use preview_cron_job to confirm what will run before the next fire. ⚠ Flipping `predictable` from true to false changes whether the trick reads MEMORY.md at fire-time — make sure the user understands the tradeoff before you toggle it.',
   {
     name: z.string().describe('Existing job name to update.'),
     schedule: z.string().optional().describe('New cron expression.'),
@@ -1294,13 +1299,14 @@ server.tool(
     enabled: z.boolean().optional().describe('Enable/disable.'),
     work_dir: z.string().optional().describe('Project directory. Empty string clears.'),
     max_hours: z.number().optional().describe('Wall-clock cap in hours.'),
+    predictable: z.boolean().optional().describe('Predictable (contract) mode. true = runner skips MEMORY.md / team comms / auto-matched skills, runs ONLY with the prompt + pinned items. false = legacy injects-everything mode (memory drift risk). Tell the user what they\'re opting into when flipping this.'),
     skills: z.array(z.string()).optional().describe('Pinned skill slugs. Empty array clears.'),
     allowed_tools: z.array(z.string()).optional().describe('Tool allowlist. Empty array clears.'),
     allowed_mcp_servers: z.array(z.string()).optional().describe('MCP allowlist. Empty array clears.'),
     tags: z.array(z.string()).optional().describe('Tags. Empty array clears.'),
     category: z.string().optional().describe('Category bucket. Empty string clears.'),
   },
-  async ({ name: jobName, schedule, prompt, tier, enabled, work_dir, max_hours, skills, allowed_tools, allowed_mcp_servers, tags, category }) => {
+  async ({ name: jobName, schedule, prompt, tier, enabled, work_dir, max_hours, predictable, skills, allowed_tools, allowed_mcp_servers, tags, category }) => {
     if (!existsSync(CRON_FILE)) {
       return textResult('CRON.md not found. Use add_cron_job to create one first.');
     }
@@ -1330,6 +1336,10 @@ server.tool(
       else { delete job.work_dir; changed.push('work_dir cleared'); }
     }
     if (max_hours !== undefined) { job.max_hours = max_hours; changed.push(`max_hours → ${max_hours}`); }
+    if (predictable !== undefined) {
+      job.predictable = predictable;
+      changed.push(`predictable → ${predictable ? 'ON (contract mode — only what\'s attached)' : 'OFF (dynamic — reads MEMORY.md, may drift)'}`);
+    }
     // ── Capabilities — empty array CLEARS, omitted leaves alone ────
     if (skills !== undefined) {
       if (skills.length) { job.skills = skills.map(s => String(s).trim()).filter(Boolean); changed.push(`skills → [${(job.skills as string[]).join(', ')}]`); }
@@ -1405,10 +1415,18 @@ server.tool(
       pinnedSkills: job.skills,
       allowedTools: job.allowedTools,
       allowedMcpServers: job.allowedMcpServers,
+      predictable: job.predictable,
     });
     const allServers = discoverMcpServers();
     const lines: string[] = [];
     lines.push(`# Preview: ${job.name}`);
+    lines.push('');
+    // Verdict line — the headline visibility win for the user.
+    if (plan.predictable) {
+      lines.push(`✓ **Predictable** — what you see here is exactly what will run. No MEMORY.md, no team activity, no auto-matched skills injected at fire-time. Pure contract execution.`);
+    } else {
+      lines.push(`⚠ **Reads memory at fire-time** — this trick is in dynamic mode. At fire-time, the runner ALSO injects MEMORY.md, recent team comms, delegation queue, and auto-matched skills. The agent's output may differ from this preview if those have drifted since chat-time. Set \`predictable: true\` if that's not what you want.`);
+    }
     lines.push('');
     lines.push(`**Schedule:** ${job.schedule}    **Tier:** ${plan.tier} (${plan.effort}${plan.maxBudgetUsd ? `, budget $${plan.maxBudgetUsd}` : ''})`);
     if (job.agentSlug) lines.push(`**Agent:** ${job.agentSlug}`);

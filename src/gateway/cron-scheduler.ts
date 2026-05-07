@@ -192,6 +192,8 @@ export function parseCronJobs(): CronJobDefinition[] {
     const category = typeof categoryRaw === 'string' && categoryRaw.trim()
       ? categoryRaw.trim().slice(0, 64)
       : undefined;
+    // Predictable (contract) mode — undefined means legacy behavior.
+    const predictable = typeof job.predictable === 'boolean' ? job.predictable : undefined;
 
     if (!name || !schedule || !prompt) {
       logger.warn({ job }, 'Skipping malformed cron job');
@@ -201,7 +203,7 @@ export function parseCronJobs(): CronJobDefinition[] {
     jobs.push({
       name, schedule, prompt, enabled, tier, maxTurns, model, workDir, mode,
       maxHours, maxRetries, after, successCriteria, alwaysDeliver, context, preCheck, agentSlug,
-      skills, allowedTools, allowedMcpServers, tags, category,
+      skills, allowedTools, allowedMcpServers, tags, category, predictable,
     });
   }
 
@@ -265,6 +267,7 @@ export function parseAgentCronJobs(agentsDir: string): CronJobDefinition[] {
         const category = typeof categoryRaw === 'string' && categoryRaw.trim()
           ? categoryRaw.trim().slice(0, 64)
           : undefined;
+        const predictable = typeof job.predictable === 'boolean' ? job.predictable : undefined;
 
         if (!name || !schedule || !prompt) {
           logger.warn({ job, agent: slug }, 'Skipping malformed agent cron job');
@@ -277,7 +280,7 @@ export function parseAgentCronJobs(agentsDir: string): CronJobDefinition[] {
           schedule, prompt, enabled, tier, maxTurns, model, workDir,
           mode, maxHours, maxRetries, after, successCriteria, context, preCheck,
           agentSlug: slug,
-          skills, allowedTools, allowedMcpServers, tags, category,
+          skills, allowedTools, allowedMcpServers, tags, category, predictable,
         });
       }
     } catch (err) {
@@ -1249,6 +1252,7 @@ export class CronScheduler {
             job.skills,
             job.allowedTools,
             job.allowedMcpServers,
+            job.predictable,
           );
 
           // alwaysDeliver: retry once if the response is empty/noise
@@ -1270,6 +1274,7 @@ export class CronScheduler {
                 job.skills,
                 job.allowedTools,
                 job.allowedMcpServers,
+                job.predictable,
               );
               if (retryResponse && !CronScheduler.isCronNoise(retryResponse)) {
                 response = retryResponse;

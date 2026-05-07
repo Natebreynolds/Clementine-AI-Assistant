@@ -105,6 +105,10 @@ export interface ScheduledTaskCard {
   tags?: string[];
   /** Optional category bucket. */
   category?: string;
+  /** Predictable (contract) mode — true means runner skips MEMORY.md /
+   *  team comms / auto-matched skills. The visibility-on-card flag for
+   *  "this trick will run with only what you see here." */
+  predictable?: boolean;
 }
 
 export interface ScheduledWorkflowCard {
@@ -400,6 +404,7 @@ export function buildOperationsSnapshot(input: BuildOperationsInput): BuildOpera
       allowedMcpServers: asStringArray(job.allowed_mcp_servers ?? job.allowedMcpServers),
       tags: asStringArray(job.tags),
       category: typeof job.category === 'string' && job.category.trim() ? job.category.trim() : undefined,
+      predictable: typeof job.predictable === 'boolean' ? job.predictable : undefined,
     };
   }).sort((a, b) => a.owner.localeCompare(b.owner) || a.displayName.localeCompare(b.displayName));
 

@@ -244,6 +244,10 @@ export interface SkillContextResult {
  * that don't resolve are surfaced via `missing[]` (warned, never fatal) so
  * the dashboard can flag broken references.
  *
+ * When `opts.skipAutoMatch` is true (predictable mode), only pinned skills
+ * load — the runtime keyword/semantic match is skipped entirely. The trick
+ * runs with ONLY the skills the user explicitly attached.
+ *
  * Exported only for testability — the production caller is `runAgentCron`.
  */
 export async function buildSkillContext(
@@ -252,6 +256,7 @@ export async function buildSkillContext(
   agentSlug: string | undefined,
   pinnedSkills: string[] | undefined,
   memoryStore?: MemoryStore | null,
+  opts?: { skipAutoMatch?: boolean },
 ): Promise<SkillContextResult> {
   const applied: SkillContextResult['applied'] = [];
   const missing: string[] = [];
@@ -289,8 +294,10 @@ export async function buildSkillContext(
     }
 
     // 2. Auto-match fills the remainder, deduped against pins.
+    //    In predictable (contract) mode we skip this entirely — only
+    //    pinned skills load, the runtime keyword/semantic search is off.
     const remaining = MAX_INJECTED_SKILLS - prepared.length;
-    if (remaining > 0) {
+    if (remaining > 0 && !opts?.skipAutoMatch) {
       const matched = searchSkills(skillQuery, remaining + (pinnedSkills?.length ?? 0), agentSlug, { suppressedNames });
       for (const m of matched) {
         if (prepared.length >= MAX_INJECTED_SKILLS) break;
@@ -405,6 +412,13 @@ export interface RunAgentCronOptions {
    *  Applied after `buildExtraMcpForRunAgent` runs, so the effective set
    *  is `profile ∩ trick`. */
   allowedMcpServers?: string[];
+  /** Predictable mode — when true, the runner skips the auto-injected
+   *  context blocks (MEMORY.md, team comms, delegation queue) and the
+   *  auto-matched skill search. The trick runs with ONLY what was
+   *  explicitly attached: prompt, criteria, pinned skills, linked goals,
+   *  prior progress. The fix for fire-time memory drift. Undefined =
+   *  legacy behavior (inject everything). */
+  predictable?: boolean;
 }
 
 export interface RunAgentCronResult extends RunAgentResult {
@@ -455,6 +469,10 @@ export interface CronExecutionPlan {
   maxBudgetUsd: number | undefined;
   agentSlug: string | undefined;
   ownerName: string;
+  /** Whether the trick is in predictable (contract) mode — true means
+   *  MEMORY.md / team / delegation / auto-skills were intentionally
+   *  skipped. Used by the Preview verdict line. */
+  predictable: boolean;
 }
 
 /**
@@ -469,14 +487,25 @@ export async function buildCronExecutionPlan(opts: RunAgentCronOptions): Promise
   const agentSlug = opts.profile?.slug;
   const ownerName = process.env.OWNER_NAME ?? 'the user';
 
-  const memoryContext = buildAutonomousMemoryContext(opts.profile);
-  const progressContext = buildProgressContext(opts.jobName);
-  const goalContext = buildGoalContext(opts.jobName);
-  const delegationContext = buildDelegationContext(agentSlug);
-  const teamContext = buildTeamContext(agentSlug);
+  // ── Predictable (contract) mode ────────────────────────────────────
+  // When `predictable: true`, the trick runs with ONLY what was explicitly
+  // attached — prompt, criteria, pinned skills, linked goals, prior progress.
+  // We skip MEMORY.md, team comms, delegation queue, and the runtime skill
+  // auto-match. This is the fix for the email-cadence failure mode where the
+  // agent agreed to a plan in chat then re-derived from drifted memory at
+  // fire time. Legacy tricks (predictable === undefined) preserve existing
+  // behavior so we don't surprise anyone.
+  const predictable = opts.predictable === true;
+
+  const memoryContext = predictable ? '' : buildAutonomousMemoryContext(opts.profile);
+  const progressContext = buildProgressContext(opts.jobName);     // opt-in via cron_progress writes
+  const goalContext = buildGoalContext(opts.jobName);             // explicit links; not auto-inferred
+  const delegationContext = predictable ? '' : buildDelegationContext(agentSlug);
+  const teamContext = predictable ? '' : buildTeamContext(agentSlug);
   const criteriaContext = buildCriteriaContext(opts.successCriteria);
   const skillResult = await buildSkillContext(
     opts.jobName, opts.jobPrompt, agentSlug, opts.pinnedSkills, opts.memoryStore,
+    { skipAutoMatch: predictable },
   );
   const skillContext = skillResult.text;
 
@@ -554,6 +583,7 @@ export async function buildCronExecutionPlan(opts: RunAgentCronOptions): Promise
     maxBudgetUsd: maxBudget,
     agentSlug,
     ownerName,
+    predictable,
   };
 }
 
