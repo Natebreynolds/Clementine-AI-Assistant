@@ -48,7 +48,7 @@ describe('recent operational context resolver', () => {
     writeFileSync(file, JSON.stringify(status, null, 2));
   }
 
-  it('resolves a vague cron-failure follow-up before chat/deep-mode routing', () => {
+  it('resolves a vague cron-failure follow-up to notification context for the agent', () => {
     const jobName = 'audit-inbox-check';
     writeCronConfig(jobName);
     writeCronRun(jobName, {
@@ -83,13 +83,16 @@ describe('recent operational context resolver', () => {
     );
 
     expect(resolved?.source).toBe('notification');
+    expect(resolved?.reason).toBe('vague-followup-to-cron-failure-notification');
     expect(resolved?.suppressDeepMode).toBe(true);
-    expect(resolved?.responseText).toContain('I found audit-inbox-check. I am not running the job.');
-    expect(resolved?.responseText).toContain('Unleashed status: error, phase 3');
-    expect(resolved?.responseText).toContain('underlying phase failure');
+    expect(resolved?.responseText).toBeUndefined();
+    expect(resolved?.promptText).toContain('[Recent proactive notification context]');
+    expect(resolved?.promptText).toContain('Type: cron_failure');
+    expect(resolved?.promptText).toContain(jobName);
+    expect(resolved?.jobNames).toEqual([jobName]);
   });
 
-  it('summarizes multiple cron notification targets instead of guessing or starting background work', () => {
+  it('routes multi-job cron-failure follow-ups through the agent with full notification context', () => {
     for (const job of ['insight-check', 'audit-inbox-check']) {
       writeCronConfig(job);
       writeCronRun(job, {
@@ -112,9 +115,11 @@ describe('recent operational context resolver', () => {
 
     const resolved = resolveRecentOperationalContext(sessionKey, 'How do we fix that issue', { baseDir, now });
 
-    expect(resolved?.responseText).toContain('recent cron failure alert: insight-check, audit-inbox-check');
-    expect(resolved?.responseText).toContain('not going to guess or start background work');
-    expect(resolved?.responseText).toContain('Reply `fix insight-check`');
+    expect(resolved?.source).toBe('notification');
+    expect(resolved?.reason).toBe('vague-followup-to-cron-failure-notification');
+    expect(resolved?.responseText).toBeUndefined();
+    expect(resolved?.promptText).toContain('[Recent proactive notification context]');
+    expect(resolved?.promptText).toContain('insight-check, audit-inbox-check');
     expect(resolved?.suppressDeepMode).toBe(true);
   });
 

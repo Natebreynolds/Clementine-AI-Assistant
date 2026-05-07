@@ -37,7 +37,6 @@ import { listBackgroundTasks, loadBackgroundTask, markFailed } from '../agent/ba
 import { applyAssistantExperienceUpdate, detectApprovalReply, detectLocalTurn, type AssistantExperienceUpdate } from '../agent/local-turn.js';
 import { buildApprovalFollowupPrompt, detectActionExpectation } from '../agent/action-enforcer.js';
 import { updateClementineJson } from '../config/clementine-json.js';
-import { buildCronDiagnosticResponse } from './cron-diagnostic-turn.js';
 import { classifyIntent } from '../agent/intent-classifier.js';
 import { decideTurn } from '../agent/turn-policy.js';
 import {
@@ -1653,32 +1652,6 @@ export class Gateway {
       if (recentContext.promptText) {
         this.markRecentContextAcknowledged(sessionKey, recentContext, false);
         text = recentContext.promptText;
-      }
-    }
-
-    // Cron "what broke / fix this job" asks should not spin up a broad SDK
-    // session. They are bounded local diagnostics over run summaries and scalar
-    // config only, and they intentionally do not execute the cron job.
-    if (this.isTrustedPersonalSession(sessionKey) && !isInternalSyntheticPrompt(text)) {
-      const cronDiagnostic = buildCronDiagnosticResponse(text, { baseDir: BASE_DIR });
-      if (cronDiagnostic) {
-        const current = this.sessions.get(sessionKey);
-        if (current?.abortController && !current.abortController.signal.aborted) {
-          current.abortController.abort('replaced-by-cron-diagnostic');
-          logger.info({ sessionKey }, 'Interrupted active chat for local cron diagnostic');
-        }
-        this.assistant.injectContext(sessionKey, originalText, cronDiagnostic);
-        if (onText) {
-          try { await onText(cronDiagnostic); } catch { /* channel streaming is best-effort */ }
-        }
-        logger.info({
-          sessionKey,
-          totalMs: Date.now() - tInnerStart,
-          chatMs: Date.now() - localTurnStarted,
-          localCronDiagnostic: true,
-          responseLen: cronDiagnostic.length,
-        }, 'chat:latency');
-        return cronDiagnostic;
       }
     }
 

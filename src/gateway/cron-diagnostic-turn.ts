@@ -325,11 +325,3 @@ export function buildCronDiagnosticResponseForRequest(
   return lines.join('\n');
 }
 
-export function buildCronDiagnosticResponse(
-  text: string,
-  opts: { baseDir: string } = { baseDir: process.env.CLEMENTINE_HOME || '' },
-): string | null {
-  const request = detectCronDiagnosticRequest(text, { baseDir: opts.baseDir });
-  if (!request || !opts.baseDir) return null;
-  return buildCronDiagnosticResponseForRequest(request, opts);
-}

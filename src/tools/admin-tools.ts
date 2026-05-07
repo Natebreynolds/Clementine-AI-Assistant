@@ -2128,5 +2128,27 @@ server.tool(
   },
 );
 
+server.tool(
+  'cron_diagnose',
+  'Return a bounded deterministic diagnosis for one cron job — recent run summary, unleashed phase status, last clean success, current scalar config, and the inferred root cause. Reads only from local run history and cron config; does NOT execute the job. Use this when the user asks what is broken with a specific job, before deciding whether to call apply_broken_job_fix or to propose a manual repair.',
+  {
+    jobName: z.string().describe('The job name as shown in CRON.md or list_broken_jobs output (e.g. "audit-inbox-check" or "ross-the-sdr:reply-detection").'),
+  },
+  async ({ jobName }) => {
+    const { buildCronDiagnosticResponseForRequest } = await import('../gateway/cron-diagnostic-turn.js');
+    const response = buildCronDiagnosticResponseForRequest(
+      { jobName, wantsFix: true },
+      { baseDir: BASE_DIR },
+    );
+    if (!response) {
+      return textResult(
+        `No diagnostic data for \`${jobName}\` — either the job is not configured in CRON.md or there is no run history yet. ` +
+        `Check the job name with cron_list or list_broken_jobs.`,
+      );
+    }
+    return textResult(response);
+  },
+);
+
 
 }

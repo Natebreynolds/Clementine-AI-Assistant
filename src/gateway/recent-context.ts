@@ -13,10 +13,8 @@ import {
   buildNotificationContextPrompt,
   findRecentNotificationContext,
   looksLikeNotificationFollowup,
-  type ProactiveNotificationEvent,
 } from './notification-context.js';
 import {
-  buildCronDiagnosticResponseForRequest,
   detectCronDiagnosticRequest,
   isInternalSyntheticPrompt,
 } from './cron-diagnostic-turn.js';
@@ -52,61 +50,6 @@ function normalizeForMatch(text: string): string {
 
 function compactWhitespace(text: string): string {
   return text.replace(/\s+/g, ' ').trim();
-}
-
-function wantsFix(text: string): boolean {
-  return /\b(fix|repair|solve|handle|diagnose|debug|what broke|what happened|why did|why is|issue|problem|failure|failed|failing)\b/i.test(text);
-}
-
-function jobMentionedInText(jobName: string, text: string): boolean {
-  const normalizedText = normalizeForMatch(text);
-  const normalizedJob = normalizeForMatch(jobName);
-  return !!normalizedJob && normalizedText.includes(normalizedJob);
-}
-
-function resolveNotificationJob(event: ProactiveNotificationEvent, userText: string, baseDir: string): string | null {
-  const explicit = detectCronDiagnosticRequest(userText, { baseDir });
-  if (explicit?.jobName) return explicit.jobName;
-
-  const jobs = event.jobNames ?? [];
-  if (jobs.length === 1) return jobs[0] ?? null;
-
-  const mentioned = jobs.find((job) => jobMentionedInText(job, userText));
-  return mentioned ?? null;
-}
-
-function summarizeCronNotification(event: ProactiveNotificationEvent, userText: string, opts: RecentOperationalContextOptions): string | null {
-  const jobs = event.jobNames ?? [];
-  if (jobs.length === 0) return null;
-
-  const targetJob = resolveNotificationJob(event, userText, opts.baseDir);
-  if (targetJob) {
-    return buildCronDiagnosticResponseForRequest(
-      { jobName: targetJob, wantsFix: wantsFix(userText) },
-      { baseDir: opts.baseDir },
-    );
-  }
-
-  const lines: string[] = [
-    `I am resolving this to the recent cron failure alert: ${jobs.join(', ')}.`,
-    'More than one job was in that alert, so I am not going to guess or start background work.',
-    '',
-  ];
-
-  for (const job of jobs.slice(0, 5)) {
-    const diagnostic = buildCronDiagnosticResponseForRequest(
-      { jobName: job, wantsFix: false },
-      { baseDir: opts.baseDir },
-    );
-    const preview = diagnostic
-      ? diagnostic.split('\n').slice(1, 4).join(' ')
-      : 'No local diagnostic summary available.';
-    lines.push(`- ${job}: ${compactWhitespace(preview).slice(0, 260)}`);
-  }
-
-  lines.push('');
-  lines.push(`Reply \`fix ${jobs[0]}\` or name the job you want me to repair first.`);
-  return lines.join('\n');
 }
 
 function taskMatchesSession(task: BackgroundTask, sessionKey: string): boolean {
@@ -204,23 +147,11 @@ export function resolveRecentOperationalContext(
   });
 
   if (notification) {
-    if (notification.type === 'cron_failure') {
-      const responseText = summarizeCronNotification(notification, text, opts);
-      if (responseText) {
-        return {
-          source: 'notification',
-          reason: 'vague-followup-to-cron-failure-notification',
-          responseText,
-          suppressDeepMode: true,
-          eventId: notification.id,
-          jobNames: notification.jobNames,
-        };
-      }
-    }
-
     return {
       source: 'notification',
-      reason: 'vague-followup-to-proactive-notification',
+      reason: notification.type === 'cron_failure'
+        ? 'vague-followup-to-cron-failure-notification'
+        : 'vague-followup-to-proactive-notification',
       promptText: buildNotificationContextPrompt(notification, text),
       suppressDeepMode: true,
       eventId: notification.id,

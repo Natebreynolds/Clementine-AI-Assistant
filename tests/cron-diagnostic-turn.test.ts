@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
-  buildCronDiagnosticResponse,
+  buildCronDiagnosticResponseForRequest,
   detectCronDiagnosticRequest,
 } from '../src/gateway/cron-diagnostic-turn.js';
 
@@ -86,8 +86,8 @@ describe('cron diagnostic local turn', () => {
       outputPreview: 'Autocompact is thrashing: the context refilled to the limit within 3 turns.',
     });
 
-    const response = buildCronDiagnosticResponse(
-      'Are you able to fix the customer follow up review?',
+    const response = buildCronDiagnosticResponseForRequest(
+      { jobName: 'customer-followup-review', wantsFix: true },
       { baseDir },
     );
 
@@ -100,13 +100,8 @@ describe('cron diagnostic local turn', () => {
   });
 
   it('does not parse internal deep-mode result prompts as cron job names', () => {
-    const response = buildCronDiagnosticResponse(
-      '[DEEP_MODE_RESULT] The background task failed: Background work failed. Let the user know.',
-      { baseDir },
-    );
-
-    expect(response).toBeNull();
     expect(detectCronDiagnosticRequest('[DEEP_MODE_RESULT] market-leader-followup failed', { baseDir })).toBeNull();
+    expect(detectCronDiagnosticRequest('[DEEP_MODE_RESULT] The background task failed: Background work failed. Let the user know.', { baseDir })).toBeNull();
   });
 
   it('treats delivered abort notices as semantic failures even when wrapper status is ok', () => {
@@ -127,8 +122,8 @@ describe('cron diagnostic local turn', () => {
       updatedAt: '2026-05-04T23:00:19.928Z',
     });
 
-    const response = buildCronDiagnosticResponse(
-      'How do we fix customer-followup-review?',
+    const response = buildCronDiagnosticResponseForRequest(
+      { jobName: 'customer-followup-review', wantsFix: true },
       { baseDir },
     );
 
