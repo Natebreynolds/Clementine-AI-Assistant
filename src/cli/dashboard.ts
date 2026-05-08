@@ -20075,8 +20075,10 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
           <div id="skills-list" style="padding:6px"></div>
         </div>
         <div id="skills-detail-pane" style="overflow-y:auto;border:1px solid var(--border);border-radius:8px;background:var(--bg-secondary);padding:0">
-          <div id="skills-detail" style="padding:24px;color:var(--text-muted);text-align:center;font-size:13px">
-            Select a skill on the left to see its procedure, tools, and data sources.
+          <div id="skills-detail" style="padding:0;font-size:13px">
+            <div style="padding:60px 24px;color:var(--text-muted);text-align:center;font-size:13px">
+              Select a skill on the left to see its procedure, tools, and data sources.
+            </div>
           </div>
         </div>
       </div>
@@ -24228,7 +24230,14 @@ function renderScheduledTaskCard(task) {
   if (task.maxRetries != null) badges += '<span class="badge badge-gray">' + esc(task.maxRetries) + ' retries</span>';
   badges += operationUsageBadge(task.usage);
   badges += '<span class="badge ' + (enabled ? 'badge-green' : 'badge-gray') + '">' + (enabled ? 'Enabled' : 'Disabled') + '</span>';
-  badges += '<span class="badge ' + (task.health === 'broken' || task.health === 'failed' ? 'badge-yellow' : 'badge-gray') + '">' + esc(task.healthLabel || task.health) + '</span>';
+  // 1.18.118 — only emit the health badge when it adds new information.
+  // ok/idle are implicit when the green Enabled badge is showing, and
+  // disabled would just duplicate the gray Disabled badge above.
+  var hl = String(task.healthLabel || task.health || '').toLowerCase();
+  if (hl && hl !== 'ok' && hl !== 'idle' && hl !== 'disabled') {
+    var hlClass = (hl === 'broken' || hl === 'failed' || hl === 'timeout') ? 'badge-yellow' : (hl === 'running' ? 'badge-blue' : 'badge-gray');
+    badges += '<span class="badge ' + hlClass + '">' + esc(task.healthLabel || task.health) + '</span>';
+  }
   var safeName = jsStr(task.name);
   // PRD §10 / 1.18.91: when a task is mid-flight, Run Now is meaningless and
   // would race against the concurrency lock; replace it with a Cancel button
@@ -25741,18 +25750,13 @@ async function refreshCron() {
       if (visibleRunning.length > 10) html += '<div class="empty-state" style="padding:18px;color:var(--text-muted);font-size:13px">Showing 10 of ' + visibleRunning.length + ' active runs. Use the Owner filter to narrow this list.</div>';
     }
 
-    // ── Needs attention (only when there are issues) ──
-    if (visibleAttention.length > 0) {
-      html += operationSectionHeader('Needs attention', 'Broken scheduled tasks and failed runtime work that can waste tokens or silently stop.', 'badge-yellow', visibleAttention.length + ' review', visibleRunning.length > 0 ? '28px' : '0')
-        + '<div class="task-grid">' + visibleAttention.slice(0, 12).map(renderAttentionCard).join('') + '</div>';
-      if (visibleAttention.length > 12) html += '<div class="empty-state" style="padding:18px;color:var(--text-muted);font-size:13px">Showing 12 of ' + visibleAttention.length + ' items. Use the Owner filter to narrow this list.</div>';
-    }
-
-    // ── Zone 2 — Your tasks (the main card grid) ──
+    // ── Zone 2 — Your tasks (the main card grid; promoted above "Needs
+    //    attention" in 1.18.118 so the user sees their working tasks at
+    //    fold instead of having to scroll past 1,000+ px of error cards).
     var filteredTasks = applyTrickFilter(visibleTasks, _trickFilter);
     var filterPillsHtml = renderTrickFilterRow(visibleTasks, _trickFilter);
     var taskCountLabel = (_trickFilter.kind ? filteredTasks.length + '/' + visibleTasks.length : visibleTasks.length) + ' task' + (visibleTasks.length === 1 ? '' : 's');
-    html += operationSectionHeader('Your tasks', 'Recurring jobs Clementine runs for you. Tap any card to edit; the toggle on each card pauses or resumes it.', 'badge-blue', taskCountLabel, (visibleRunning.length > 0 || visibleAttention.length > 0) ? '28px' : '0')
+    html += operationSectionHeader('Your tasks', 'Recurring jobs Clementine runs for you. Tap any card to edit; the toggle on each card pauses or resumes it.', 'badge-blue', taskCountLabel, visibleRunning.length > 0 ? '28px' : '0')
       + filterPillsHtml
       + '<div class="task-grid">';
     if (filteredTasks.length === 0) {
@@ -25774,6 +25778,22 @@ async function refreshCron() {
     if (visibleWorkflows.length > 0) {
       html += operationSectionHeader('Multi-step workflows', 'One scheduled trigger that runs chained steps. Separate from regular tasks.', 'badge-purple', visibleWorkflows.length + ' workflow' + (visibleWorkflows.length === 1 ? '' : 's'), '28px');
       html += '<div class="task-grid">' + visibleWorkflows.map(renderScheduledWorkflowCard).join('') + '</div>';
+    }
+
+    // ── Needs attention — collapsed by default in 1.18.118. Was the
+    //    second thing on the page; pushed "Your tasks" 1,000+ px below
+    //    the fold. Still surfaced visibly via a yellow count chip in the
+    //    summary so users know it's there. Click to expand for triage.
+    if (visibleAttention.length > 0) {
+      html += '<details style="margin-top:28px;background:var(--bg-secondary);border:1px solid var(--border);border-radius:8px;padding:0;overflow:hidden">'
+        +     '<summary style="padding:12px 16px;cursor:pointer;display:flex;align-items:center;gap:10px;user-select:none">'
+        +       '<span style="font-size:14px;font-weight:600;color:var(--text-primary)">Needs attention</span>'
+        +       '<span class="badge badge-yellow">' + visibleAttention.length + ' review</span>'
+        +       '<span style="font-size:11px;color:var(--text-muted);margin-left:6px">Broken scheduled tasks and failed runtime work that can waste tokens or silently stop.</span>'
+        +     '</summary>'
+        +     '<div style="padding:0 16px 16px"><div class="task-grid">' + visibleAttention.slice(0, 12).map(renderAttentionCard).join('') + '</div>';
+      if (visibleAttention.length > 12) html += '<div class="empty-state" style="padding:18px;color:var(--text-muted);font-size:13px">Showing 12 of ' + visibleAttention.length + ' items. Use the Owner filter to narrow this list.</div>';
+      html += '</div></details>';
     }
 
     // ── Zone 3 — Recent history (last 50 runs across all jobs) ──
