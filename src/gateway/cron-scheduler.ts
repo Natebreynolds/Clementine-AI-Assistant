@@ -212,6 +212,12 @@ export function parseCronJobs(): CronJobDefinition[] {
       : undefined;
     // Predictable (contract) mode — undefined means legacy behavior.
     const predictable = typeof job.predictable === 'boolean' ? job.predictable : undefined;
+    // 1.18.119 — human-readable description (used by the task card preview
+    // and by the cron-clean migrator to surface what each job does without
+    // showing raw prompt boilerplate).
+    const description = typeof job.description === 'string' && job.description.trim()
+      ? job.description.trim().slice(0, 500)
+      : undefined;
 
     if (!name || !schedule || !prompt) {
       logger.warn({ job }, 'Skipping malformed cron job');
@@ -219,7 +225,7 @@ export function parseCronJobs(): CronJobDefinition[] {
     }
 
     jobs.push({
-      name, schedule, prompt, enabled, tier, maxTurns, model, workDir, mode,
+      name, schedule, prompt, enabled, tier, description, maxTurns, model, workDir, mode,
       maxHours, maxRetries, after, successCriteria, successCriteriaText, successSchema, addDirs,
       alwaysDeliver, context, preCheck, agentSlug,
       skills, allowedTools, allowedMcpServers, tags, category, predictable,
@@ -299,6 +305,12 @@ export function parseAgentCronJobs(agentsDir: string): CronJobDefinition[] {
           ? categoryRaw.trim().slice(0, 64)
           : undefined;
         const predictable = typeof job.predictable === 'boolean' ? job.predictable : undefined;
+        // 1.18.119 — symmetric with the global parseCronJobs description
+        // field. Without this, agent jobs always look "missing description"
+        // to the cron-clean migrator and stay flagged as eligible forever.
+        const description = typeof job.description === 'string' && job.description.trim()
+          ? job.description.trim().slice(0, 500)
+          : undefined;
 
         if (!name || !schedule || !prompt) {
           logger.warn({ job, agent: slug }, 'Skipping malformed agent cron job');
@@ -308,7 +320,7 @@ export function parseAgentCronJobs(agentsDir: string): CronJobDefinition[] {
         // Prefix name with agent slug and tag with agentSlug
         allJobs.push({
           name: `${slug}:${name}`,
-          schedule, prompt, enabled, tier, maxTurns, model, workDir,
+          schedule, prompt, enabled, tier, description, maxTurns, model, workDir,
           mode, maxHours, maxRetries, after,
           successCriteria, successCriteriaText, successSchema, addDirs,
           context, preCheck,
