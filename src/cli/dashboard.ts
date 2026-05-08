@@ -33836,40 +33836,280 @@ async function loadAgentProjectOptions(selected) {
   } catch(e) { /* projects are optional */ }
 }
 
+// ── Equipment panel ────────────────────────────────────────────────
+// Renders the unified tool/CLI/MCP/Composio/Project picker with type
+// badges, status pills, and category grouping. Status pills surface the
+// connected/installed/blocked flags that the previous renderer dropped,
+// so users can see at a glance whether a tool will actually work for
+// this agent. Local Projects are first-class entries (name format:
+// 'project:/abs/path') so a single check grants the agent access to the
+// project; project-scoped MCP servers appear as their own categories.
+// Composio toolkits are surfaced when isComposioEnabled.
+var _agentToolsState = {
+  filter: 'all',
+  search: '',
+  data: null,        // {categories, composioError}
+  selected: new Set(),
+};
+
 async function loadAgentToolOptions(selectedTools) {
+  var panel = document.getElementById('agent-tools-panel');
+  if (!panel) return;
+  panel.innerHTML = '<div style="color:var(--text-muted);font-size:12px">Loading tools...</div>';
+  _agentToolsState.selected = new Set(selectedTools || []);
   try {
     var r = await apiFetch('/api/available-tools');
     var d = await r.json();
-    var panel = document.getElementById('agent-tools-panel');
-    panel.innerHTML = '';
-    var selected = selectedTools || [];
-    for (var cat in d.categories) {
-      var header = document.createElement('div');
-      header.style.cssText = 'font-weight:600;font-size:11px;color:var(--text-muted);margin:8px 0 4px;cursor:pointer;user-select:none';
-      header.textContent = '▸ ' + cat;
-      header.dataset.category = cat;
-      header.onclick = (function(catName, hdr) { return function() {
-        var cbs = panel.querySelectorAll('.agent-tool-cb[data-cat="' + catName + '"]');
-        var allChecked = Array.from(cbs).every(function(cb) { return cb.checked; });
-        cbs.forEach(function(cb) { cb.checked = !allChecked; });
-      }; })(cat, header);
-      panel.appendChild(header);
-      d.categories[cat].forEach(function(tool) {
-        var toolName = typeof tool === 'string' ? tool : tool.name;
-        var toolLabel = typeof tool === 'string' ? tool : (tool.name + (tool.description ? ' — ' + tool.description : ''));
-        var label = document.createElement('label');
-        label.style.cssText = 'display:block;font-size:12px;padding:2px 0 2px 8px;cursor:pointer';
-        var checked = selected.indexOf(toolName) >= 0 ? ' checked' : '';
-        label.innerHTML = '<input type="checkbox" class="agent-tool-cb" data-cat="' + cat + '" value="' + toolName + '"' + checked + ' style="margin-right:6px">' + toolLabel;
-        panel.appendChild(label);
+    _agentToolsState.data = d;
+    renderAgentToolPanel();
+  } catch(e) {
+    panel.innerHTML = '<div style="color:var(--red);font-size:12px">Failed to load tools: ' + esc(String(e)) + '</div>';
+  }
+}
+
+function renderAgentToolPanel() {
+  var panel = document.getElementById('agent-tools-panel');
+  var summary = document.getElementById('agent-tools-summary');
+  if (!panel) return;
+  var d = _agentToolsState.data;
+  if (!d || !d.categories) { panel.innerHTML = ''; return; }
+
+  panel.innerHTML = '';
+  var totalEnabled = 0;
+  var totalCount = 0;
+  var typeOrder = { 'sdk': 0, 'cli': 1, 'mcp': 2, 'api': 3, 'project-mcp': 4, 'project': 5, 'composio': 6 };
+
+  Object.keys(d.categories).forEach(function(cat) {
+    var entries = d.categories[cat] || [];
+    var catEnabledCount = 0;
+    entries.forEach(function(t) { if (_agentToolsState.selected.has(typeof t === 'string' ? t : t.name)) catEnabledCount++; });
+    totalCount += entries.length;
+    totalEnabled += catEnabledCount;
+
+    var header = document.createElement('div');
+    header.className = 'agent-tool-cat';
+    header.dataset.category = cat;
+    header.innerHTML = '▸ ' + esc(cat) + '<span class="cat-count">' + catEnabledCount + '/' + entries.length + '</span>';
+    header.onclick = (function(catName) { return function() {
+      var rows = panel.querySelectorAll('.agent-tool-cb[data-cat="' + cssAttrEsc(catName) + '"]');
+      var visible = Array.from(rows).filter(function(cb) {
+        return !cb.closest('.agent-tool-row.hidden');
       });
+      var allChecked = visible.length > 0 && visible.every(function(cb) { return cb.checked; });
+      visible.forEach(function(cb) {
+        cb.checked = !allChecked;
+        if (cb.checked) _agentToolsState.selected.add(cb.value);
+        else _agentToolsState.selected.delete(cb.value);
+      });
+      renderAgentToolPanel();
+    }; })(cat);
+    panel.appendChild(header);
+
+    entries.slice().sort(function(a, b) {
+      var ta = typeOrder[a.type]; if (ta === undefined) ta = 9;
+      var tb = typeOrder[b.type]; if (tb === undefined) tb = 9;
+      if (ta !== tb) return ta - tb;
+      return String(a.name || '').localeCompare(String(b.name || ''));
+    }).forEach(function(tool) {
+      panel.appendChild(buildAgentToolRow(cat, tool));
+    });
+  });
+
+  if (summary) {
+    var msg = totalEnabled + ' of ' + totalCount + ' enabled';
+    if (d.composioError) msg += ' · Composio: ' + d.composioError;
+    summary.textContent = msg;
+  }
+
+  filterAgentTools();
+}
+
+function buildAgentToolRow(cat, tool) {
+  var name = typeof tool === 'string' ? tool : tool.name;
+  var description = typeof tool === 'string' ? '' : (tool.description || '');
+  var type = typeof tool === 'string' ? '' : (tool.type || '');
+  var displayName = (typeof tool === 'object' && tool.displayName) ? tool.displayName
+    : (type === 'project' && tool.projectName) ? tool.projectName
+    : name;
+  var checked = _agentToolsState.selected.has(name);
+
+  // Status pill — surfaces the flags the old renderer threw away.
+  var statusClass = 'ready';
+  var statusLabel = 'Ready';
+  var setupTarget = '';
+  if (type === 'cli') {
+    if (tool.blocked) { statusClass = 'blocked'; statusLabel = 'Blocked'; }
+    else if (tool.installed === false) { statusClass = 'not-installed'; statusLabel = 'Not installed'; }
+  } else if (type === 'api' || type === 'composio') {
+    if (tool.connected === false) { statusClass = 'needs-setup'; statusLabel = 'Connect'; setupTarget = 'integrations'; }
+  } else if (type === 'project') {
+    if (tool.connected === false) { statusClass = 'needs-setup'; statusLabel = 'Path missing'; }
+  } else if (type === 'mcp' && tool.connected === false) {
+    statusClass = 'needs-setup'; statusLabel = 'Configure'; setupTarget = 'settings';
+  }
+
+  var row = document.createElement('label');
+  row.className = 'agent-tool-row';
+  row.dataset.cat = cat;
+  row.dataset.search = (name + ' ' + description + ' ' + cat + ' ' + (displayName || '')).toLowerCase();
+  row.dataset.status = statusClass;
+  row.dataset.enabled = checked ? '1' : '0';
+  row.title = description ? (name + ' — ' + description) : name;
+
+  var badgeLabel = type === 'project-mcp' ? 'PROJ-MCP' : type;
+  var badge = type ? '<span class="tt-badge ' + esc(type) + '">' + esc(badgeLabel) + '</span>' : '';
+  var pathHint = (type === 'project' && tool.path) ? ' <span style="color:var(--text-muted);font-size:10px">' + esc(tool.path) + '</span>' : '';
+  var statusEl;
+  if (setupTarget) {
+    statusEl = '<a class="tt-status ' + statusClass + '" href="#" onclick="event.preventDefault();event.stopPropagation();navigateTo(\'' + setupTarget + '\');hideAgentModal();" style="text-decoration:none"><span class="tt-dot"></span>' + esc(statusLabel) + ' →</a>';
+  } else {
+    statusEl = '<span class="tt-status ' + statusClass + '"><span class="tt-dot"></span>' + esc(statusLabel) + '</span>';
+  }
+
+  row.innerHTML =
+    '<input type="checkbox" class="agent-tool-cb" data-cat="' + esc(cat) + '" value="' + esc(name) + '"' + (checked ? ' checked' : '') + ' style="accent-color:var(--blue)">' +
+    badge +
+    '<span class="tt-name">' + esc(displayName) + (description && displayName !== description ? ' <span style="color:var(--text-muted);font-weight:400">— ' + esc(description) + '</span>' : '') + pathHint + '</span>' +
+    statusEl;
+
+  var cb = row.querySelector('.agent-tool-cb');
+  cb.addEventListener('change', function() {
+    if (cb.checked) _agentToolsState.selected.add(name);
+    else _agentToolsState.selected.delete(name);
+    renderAgentToolPanel();
+  });
+  return row;
+}
+
+function setAgentToolsFilter(filter) {
+  _agentToolsState.filter = filter;
+  document.querySelectorAll('.agent-tools-filter').forEach(function(b) {
+    b.classList.toggle('active', b.dataset.filter === filter);
+  });
+  filterAgentTools();
+}
+
+function filterAgentTools() {
+  var searchEl = document.getElementById('agent-tools-search');
+  _agentToolsState.search = searchEl ? searchEl.value.trim().toLowerCase() : '';
+  var f = _agentToolsState.filter;
+  var rows = document.querySelectorAll('#agent-tools-panel .agent-tool-row');
+  var catCounts = {};
+  rows.forEach(function(row) {
+    var matchSearch = !_agentToolsState.search || row.dataset.search.indexOf(_agentToolsState.search) >= 0;
+    var matchFilter =
+      f === 'all' ||
+      (f === 'enabled' && row.dataset.enabled === '1') ||
+      (f === 'ready' && row.dataset.status === 'ready') ||
+      (f === 'needs-setup' && (row.dataset.status === 'needs-setup' || row.dataset.status === 'not-installed' || row.dataset.status === 'blocked'));
+    var visible = matchSearch && matchFilter;
+    row.classList.toggle('hidden', !visible);
+    if (visible) {
+      var cat = row.dataset.cat;
+      catCounts[cat] = (catCounts[cat] || 0) + 1;
     }
-  } catch(e) { /* fallback — panel stays empty */ }
+  });
+  document.querySelectorAll('#agent-tools-panel .agent-tool-cat').forEach(function(hdr) {
+    hdr.classList.toggle('hidden', !catCounts[hdr.dataset.category]);
+  });
 }
 
 function getSelectedTools() {
-  return Array.from(document.querySelectorAll('.agent-tool-cb:checked')).map(function(cb) { return cb.value; });
+  return Array.from(_agentToolsState.selected);
 }
+
+// Split selection into the two persistence buckets the agent schema expects:
+//   - projects[]      : entries that were 'project:/abs/path'
+//   - allowedTools[]  : everything else (composio:slug, mcp__server, sdk/cli/api names)
+function splitAgentToolSelection() {
+  var projects = [];
+  var tools = [];
+  Array.from(_agentToolsState.selected).forEach(function(v) {
+    if (typeof v === 'string' && v.indexOf('project:') === 0) projects.push(v.substring('project:'.length));
+    else tools.push(v);
+  });
+  return { projects: projects, tools: tools };
+}
+
+// Tab switching inside the agent edit modal.
+function switchAgentTab(tab) {
+  document.querySelectorAll('#agent-modal-tabs .agent-tab').forEach(function(b) {
+    b.classList.toggle('active', b.dataset.tab === tab);
+  });
+  document.querySelectorAll('#agent-modal .agent-tab-pane').forEach(function(p) {
+    p.style.display = p.dataset.tabPane === tab ? '' : 'none';
+  });
+  if (tab === 'goals') loadAgentGoalsPanel();
+}
+
+// Goals tab inside the editor — list every goal with a checkbox tied
+// to its owner field. Saving the modal calls PUT /api/goals/:id with
+// the new owner; we collect pending changes in a Map so the user can
+// flip several before saving.
+var _agentGoalsCache = null;
+var _agentGoalsPendingOwners = {}; // goalId -> newOwner
+
+async function loadAgentGoalsPanel() {
+  var panel = document.getElementById('agent-goals-panel');
+  if (!panel) return;
+  var slug = document.getElementById('agent-edit-slug').value;
+  var mode = document.getElementById('agent-edit-mode').value || 'agent';
+  var thisOwner = mode === 'clementine' ? 'clementine' : (slug || '');
+  if (!thisOwner) { panel.innerHTML = '<div style="color:var(--text-muted);font-size:12px;padding:8px">Save the agent first, then come back to assign goals.</div>'; return; }
+  panel.innerHTML = '<div style="color:var(--text-muted);font-size:12px">Loading goals…</div>';
+  try {
+    var r = await apiFetch('/api/goals/progress');
+    var d = await r.json();
+    _agentGoalsCache = (d && d.goals) || [];
+    _agentGoalsPendingOwners = {};
+    var html = '';
+    if (_agentGoalsCache.length === 0) {
+      html = '<div style="color:var(--text-muted);font-size:12px;padding:8px">No goals yet. Use the Team → Goals tab or call goal_create.</div>';
+    } else {
+      _agentGoalsCache.forEach(function(g) {
+        var assigned = g.owner === thisOwner;
+        var ownerLbl = g.owner ? ('owned by ' + g.owner) : 'unassigned';
+        html += '<label class="agent-tool-row" data-goal-id="' + esc(g.id) + '">' +
+          '<input type="checkbox" class="agent-goal-cb" value="' + esc(g.id) + '"' + (assigned ? ' checked' : '') + ' style="accent-color:var(--blue)">' +
+          '<span class="tt-badge">' + esc(g.status || 'pending') + '</span>' +
+          '<span class="tt-name">' + esc(g.title || g.id) +
+            (g.description ? ' <span style="color:var(--text-muted);font-weight:400">— ' + esc(String(g.description).slice(0, 100)) + '</span>' : '') +
+            ' <span style="color:var(--text-muted);font-size:10px">(' + esc(ownerLbl) + ')</span>' +
+          '</span>' +
+          '</label>';
+      });
+    }
+    panel.innerHTML = html;
+    panel.querySelectorAll('.agent-goal-cb').forEach(function(cb) {
+      cb.addEventListener('change', function() {
+        // Checked → take ownership; unchecked → fall back to Clementine
+        // (the system default owner for orphaned goals).
+        _agentGoalsPendingOwners[cb.value] = cb.checked ? thisOwner : 'clementine';
+      });
+    });
+  } catch(e) {
+    panel.innerHTML = '<div style="color:var(--red);font-size:12px">Failed to load goals: ' + esc(String(e)) + '</div>';
+  }
+}
+
+async function saveAgentGoalsPanel() {
+  var entries = Object.keys(_agentGoalsPendingOwners);
+  for (var i = 0; i < entries.length; i++) {
+    var goalId = entries[i];
+    var newOwner = _agentGoalsPendingOwners[goalId];
+    try {
+      await apiFetch('/api/goals/' + encodeURIComponent(goalId), {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ owner: newOwner }),
+      });
+    } catch(e) { /* surfaced via toast in caller */ }
+  }
+  _agentGoalsPendingOwners = {};
+}
+
+// CSS-attribute escape — our category names contain spaces.
+function cssAttrEsc(s) { return String(s).replace(/"/g, '\\"'); }
 
 var _discordChannelsCache = null;
 async function loadDiscordChannels(selectedValues) {
@@ -33945,14 +34185,37 @@ function showAgentCreateModal() {
   document.getElementById('agent-modal-title').textContent = 'Hire a New Team Member';
   document.getElementById('agent-submit-btn').textContent = 'Complete Hiring';
   document.getElementById('agent-edit-slug').value = '';
+  document.getElementById('agent-edit-mode').value = 'agent';
   document.getElementById('agent-form').reset();
   document.getElementById('agent-token-hint').style.display = 'none';
   document.getElementById('agent-token-setup').style.display = 'none';
   document.getElementById('agent-slack-token-hint').style.display = 'none';
   document.getElementById('agent-slack-setup').style.display = 'none';
+  // Hidden fields are visible for hired agents (Clementine hides them).
+  setClementineMode(false);
+  switchAgentTab('identity');
   loadAgentProjectOptions();
   loadAgentToolOptions();
   loadDiscordChannels([]);
+}
+
+// Hide / show fields that don't apply to Clementine herself.
+// Avatar URL, Primary Project select, Security Tier are managed elsewhere
+// for the main agent — surfacing them in the same modal would be misleading.
+function setClementineMode(isClementine) {
+  ['agent-identity-row-2', 'agent-project-row', 'agent-tier-row'].forEach(function(id) {
+    var el = document.getElementById(id);
+    if (el) el.style.display = isClementine ? 'none' : '';
+  });
+  // Discord/Slack token sections are also Clementine-managed (env-based);
+  // hide them in the Connections tab when editing the main agent.
+  ['discord-section', 'slack-section'].forEach(function(id) {
+    var el = document.getElementById(id);
+    if (el) el.style.display = isClementine ? 'none' : '';
+  });
+  // Toggle the required attribute on Name — Clementine has a fixed name.
+  var nameEl = document.getElementById('agent-name');
+  if (nameEl) nameEl.readOnly = isClementine;
 }
 
 async function editAgent(slug) {
@@ -33966,9 +34229,13 @@ async function editAgent(slug) {
     document.getElementById('agent-modal-title').textContent = 'Update Team Member: ' + a.name;
     document.getElementById('agent-submit-btn').textContent = 'Save';
     document.getElementById('agent-edit-slug').value = slug;
+    document.getElementById('agent-edit-mode').value = 'agent';
+    setClementineMode(false);
+    switchAgentTab('identity');
     document.getElementById('agent-name').value = a.name || '';
     document.getElementById('agent-description').value = a.description || '';
     document.getElementById('agent-avatar-url').value = a.avatar || '';
+    document.getElementById('agent-personality').value = a.systemPromptBody || a.personality || '';
     loadDiscordChannels(a.channelName || []);
     document.getElementById('agent-team-chat').checked = a.teamChat || false;
     document.getElementById('agent-respond-all').checked = a.respondToAll || false;
@@ -33976,7 +34243,12 @@ async function editAgent(slug) {
     document.getElementById('agent-tier').value = String(a.tier || 2);
     document.getElementById('agent-canmessage').value = (a.canMessage || []).join(', ');
     loadAgentProjectOptions(a.project || '');
-    loadAgentToolOptions(a.allowedTools || []);
+    // Pre-check both tools and project access — projects are stored as
+    // 'project:/abs/path' inside the same selection set the Equipment panel
+    // tracks, so loadAgentToolOptions's normalizer handles them uniformly.
+    var initialSelection = (a.allowedTools || []).slice();
+    (a.projects || []).forEach(function(p) { initialSelection.push('project:' + p); });
+    loadAgentToolOptions(initialSelection);
     document.getElementById('agent-allowed-users').value = (a.allowedUsers || []).join(', ');
     // Budget
     document.getElementById('agent-budget').value = String(a.budgetMonthlyCents || 0);
@@ -34029,6 +34301,43 @@ function hideAgentModal() {
   document.getElementById('agent-modal').classList.remove('show');
 }
 
+// Open the same tabbed modal in Clementine mode — reads/writes the
+// assistant.profile block of clementine.json instead of an agent.md.
+async function editClementine() {
+  try {
+    var r = await apiFetch('/api/clementine/profile');
+    var d = await r.json();
+    var p = d.profile || {};
+    document.getElementById('agent-modal').classList.add('show');
+    document.getElementById('agent-modal-title').textContent = 'Configure ' + (d.name || 'Clementine');
+    document.getElementById('agent-submit-btn').textContent = 'Save';
+    document.getElementById('agent-edit-slug').value = '__clementine__';
+    document.getElementById('agent-edit-mode').value = 'clementine';
+    setClementineMode(true);
+    switchAgentTab('identity');
+    document.getElementById('agent-name').value = d.name || 'Clementine';
+    document.getElementById('agent-description').value = 'Master delegator and personal assistant';
+    document.getElementById('agent-personality').value = p.systemPrompt || '';
+    document.getElementById('agent-model').value = p.model || '';
+    document.getElementById('agent-canmessage').value = '';
+    document.getElementById('agent-allowed-users').value = (p.allowedUsers || []).join(', ');
+    document.getElementById('agent-budget').value = String(p.budgetMonthlyCents || 0);
+    if (p.sendPolicy) {
+      document.getElementById('agent-send-max-daily').value = String(p.sendPolicy.maxDailyEmails || 50);
+      document.getElementById('agent-send-approval').value = p.sendPolicy.requiresApproval || '';
+      document.getElementById('agent-send-biz-hours').checked = !!p.sendPolicy.businessHoursOnly;
+    } else {
+      document.getElementById('agent-send-max-daily').value = '50';
+      document.getElementById('agent-send-approval').value = '';
+      document.getElementById('agent-send-biz-hours').checked = false;
+    }
+    loadDiscordChannels(p.channels || []);
+    var initial = (p.allowedTools || []).slice();
+    (p.allowedProjects || []).forEach(function(path) { initial.push('project:' + path); });
+    loadAgentToolOptions(initial);
+  } catch(e) { toast('Failed to load Clementine profile: ' + String(e), 'error'); }
+}
+
 var tokenInputDebounce = null;
 function onTokenInput(token) {
   clearTimeout(tokenInputDebounce);
@@ -34074,12 +34383,64 @@ async function submitAgentForm(e) {
 }
 async function _submitAgentFormInner(e) {
   var editSlug = document.getElementById('agent-edit-slug').value;
-  var isEdit = Boolean(editSlug);
+  var modeEl = document.getElementById('agent-edit-mode');
+  var mode = modeEl ? modeEl.value || 'agent' : 'agent';
+  var isClementine = mode === 'clementine';
+  var isEdit = !isClementine && Boolean(editSlug);
 
   var selectedChannels = Array.from(document.querySelectorAll('.agent-channel-cb:checked')).map(function(cb) { return cb.value; });
-  var channelName = selectedChannels.length === 0 ? undefined : selectedChannels.length === 1 ? selectedChannels[0] : selectedChannels;
   var teamChat = document.getElementById('agent-team-chat').checked;
   var respondToAll = document.getElementById('agent-respond-all').checked;
+
+  // Equipment selection — split into the agent schema's two buckets:
+  // a flat allowedTools[] and projects[] of absolute paths.
+  var split = splitAgentToolSelection();
+
+  var au = document.getElementById('agent-allowed-users').value.trim();
+  var allowedUsers = au ? au.split(',').map(function(s) { return s.trim(); }).filter(Boolean) : [];
+
+  var sendApproval = document.getElementById('agent-send-approval').value;
+  var sendPolicy = sendApproval ? {
+    maxDailyEmails: parseInt(document.getElementById('agent-send-max-daily').value) || 50,
+    requiresApproval: sendApproval,
+    businessHoursOnly: document.getElementById('agent-send-biz-hours').checked,
+  } : undefined;
+
+  var budgetVal = parseInt(document.getElementById('agent-budget').value) || 0;
+
+  if (isClementine) {
+    // Clementine path — write the assistant.profile block in clementine.json.
+    var profilePayload = {
+      systemPrompt: document.getElementById('agent-personality').value,
+      model: document.getElementById('agent-model').value || undefined,
+      allowedTools: split.tools,
+      allowedProjects: split.projects,
+      allowedUsers: allowedUsers,
+      channels: selectedChannels,
+      budgetMonthlyCents: budgetVal,
+      sendPolicy: sendPolicy,
+    };
+    try {
+      var rc = await apiFetch('/api/clementine/profile', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(profilePayload),
+      });
+      var dc = await rc.json();
+      if (dc.ok) {
+        await saveAgentGoalsPanel();
+        toast('Saved Clementine profile', 'success');
+        hideAgentModal();
+        refreshTeam();
+      } else {
+        toast(dc.error || 'Failed', 'error');
+      }
+    } catch(err) { toast(String(err), 'error'); }
+    return;
+  }
+
+  // Hired-agent path — same shape as before, plus projects[] from Equipment.
+  var channelName = selectedChannels.length === 0 ? undefined : selectedChannels.length === 1 ? selectedChannels[0] : selectedChannels;
   var payload = {
     name: document.getElementById('agent-name').value.trim(),
     description: document.getElementById('agent-description').value.trim(),
@@ -34089,6 +34450,7 @@ async function _submitAgentFormInner(e) {
     respondToAll: channelName ? respondToAll : undefined,
     model: document.getElementById('agent-model').value || undefined,
     project: document.getElementById('agent-project').value || undefined,
+    projects: split.projects,
     tier: parseInt(document.getElementById('agent-tier').value) || 2,
     avatar: document.getElementById('agent-avatar-url').value.trim() || undefined,
   };
@@ -34096,11 +34458,8 @@ async function _submitAgentFormInner(e) {
   var cm = document.getElementById('agent-canmessage').value.trim();
   if (cm) payload.canMessage = cm.split(',').map(function(s) { return s.trim(); }).filter(Boolean);
 
-  var tools = getSelectedTools();
-  if (tools.length) payload.allowedTools = tools;
-
-  var au = document.getElementById('agent-allowed-users').value.trim();
-  payload.allowedUsers = au ? au.split(',').map(function(s) { return s.trim(); }).filter(Boolean) : [];
+  if (split.tools.length) payload.allowedTools = split.tools;
+  payload.allowedUsers = allowedUsers;
 
   var discordToken = document.getElementById('agent-discord-token').value.trim();
   if (discordToken) payload.discordToken = discordToken;
@@ -34117,18 +34476,7 @@ async function _submitAgentFormInner(e) {
   var slackChannelId = document.getElementById('agent-slack-channel-id').value.trim();
   if (slackChannelId) payload.slackChannelId = slackChannelId;
 
-  // Send policy
-  var sendApproval = document.getElementById('agent-send-approval').value;
-  if (sendApproval) {
-    payload.sendPolicy = {
-      maxDailyEmails: parseInt(document.getElementById('agent-send-max-daily').value) || 50,
-      requiresApproval: sendApproval,
-      businessHoursOnly: document.getElementById('agent-send-biz-hours').checked,
-    };
-  }
-
-  // Budget
-  var budgetVal = parseInt(document.getElementById('agent-budget').value) || 0;
+  if (sendPolicy) payload.sendPolicy = sendPolicy;
   if (budgetVal > 0) payload.budgetMonthlyCents = budgetVal;
 
   // Role template — triggers scaffolding on the backend
@@ -34147,13 +34495,16 @@ async function _submitAgentFormInner(e) {
     });
     var d = await r.json();
     if (d.ok) {
+      // Apply pending goal-owner changes after the agent is persisted —
+      // matters most on Create, when the slug only just became real.
+      await saveAgentGoalsPanel();
       toast((isEdit ? 'Updated' : 'Created') + ' agent: ' + (d.agent?.name || payload.name), 'success');
       hideAgentModal();
       refreshTeam();
     } else {
       toast(d.error || 'Failed', 'error');
     }
-  } catch(e) { toast(String(e), 'error'); }
+  } catch(err) { toast(String(err), 'error'); }
 }
 
 function confirmDeleteAgent(slug, name) { deleteAgent(slug); }
