@@ -525,3 +525,123 @@ describe('readBundledFile', () => {
     expect(readBundledFile(skill, 'nonexistent.md')).toBeNull();
   });
 });
+
+// ── Migration: legacy .md → folder/SKILL.md ──────────────────────────
+
+describe('migrateLegacySkill', () => {
+  it('returns error when source file does not exist', async () => {
+    const { migrateLegacySkill } = await import('../src/agent/skill-store.js');
+    const r = migrateLegacySkill('nope');
+    expect(r.ok).toBe(false);
+    expect(r.error).toContain('not found');
+  });
+
+  it('rejects empty name', async () => {
+    const { migrateLegacySkill } = await import('../src/agent/skill-store.js');
+    const r = migrateLegacySkill('');
+    expect(r.ok).toBe(false);
+    expect(r.error).toContain('name required');
+  });
+
+  it('reports alreadyMigrated when folder form exists', async () => {
+    const { migrateLegacySkill } = await import('../src/agent/skill-store.js');
+    writeFolderSkill('already', ANTHROPIC_FRONTMATTER);
+    const r = migrateLegacySkill('already');
+    expect(r.ok).toBe(true);
+    expect(r.alreadyMigrated).toBe(true);
+  });
+
+  it('migrates a legacy file: writes folder/SKILL.md, renames original to .bak', async () => {
+    const { migrateLegacySkill, listSkills } = await import('../src/agent/skill-store.js');
+    writeFlatSkill('audit-thing.md', LEGACY_FRONTMATTER);
+    const r = migrateLegacySkill('audit-thing');
+    expect(r.ok).toBe(true);
+    expect(r.alreadyMigrated).toBeUndefined();
+    expect(r.newSkillPath).toContain('audit-thing/SKILL.md');
+    expect(r.backupPath).toContain('audit-thing.md.bak');
+    // Loader sees folder form.
+    const skills = listSkills();
+    expect(skills).toHaveLength(1);
+    expect(skills[0].layout).toBe('folder');
+    expect(skills[0].frontmatter.name).toBe('audit-thing');
+  });
+
+  it('preserves the body verbatim through migration', async () => {
+    const { migrateLegacySkill } = await import('../src/agent/skill-store.js');
+    const customBody = '# Custom\n\nThis is a multi-line body with **markdown**.';
+    writeFlatSkill('custom.md', '---\ntitle: X\ntoolsUsed: [a]\n---\n' + customBody);
+    const r = migrateLegacySkill('custom');
+    expect(r.ok).toBe(true);
+    const fs = await import('node:fs');
+    const written = fs.readFileSync(r.newSkillPath!, 'utf-8');
+    expect(written).toContain(customBody);
+  });
+
+  it('moves legacy fields under clementine: namespace', async () => {
+    const { migrateLegacySkill, getSkill } = await import('../src/agent/skill-store.js');
+    writeFlatSkill('legacy.md', LEGACY_FRONTMATTER);
+    migrateLegacySkill('legacy');
+    const skill = getSkill('legacy');
+    expect(skill?.layout).toBe('folder');
+    expect(skill?.schemaVersion).toBe('clementine');
+    const ext = skill?.frontmatter.clementine;
+    expect(ext?.triggers).toContain('build brief');
+    expect(ext?.tools?.allow).toContain('workspace_config');
+    expect(ext?.useCount).toBe(6);
+    expect(ext?.source).toBe('manual');
+    // Top-level legacy fields should be gone after migration.
+    expect(skill?.frontmatter.triggers).toBeUndefined();
+    expect(skill?.frontmatter.toolsUsed).toBeUndefined();
+    expect(skill?.frontmatter.useCount).toBeUndefined();
+  });
+
+  it('stamps migratedFrom + migratedAt + version=1', async () => {
+    const { migrateLegacySkill, getSkill } = await import('../src/agent/skill-store.js');
+    writeFlatSkill('m.md', LEGACY_FRONTMATTER);
+    migrateLegacySkill('m');
+    const skill = getSkill('m');
+    const ext = skill?.frontmatter.clementine as Record<string, unknown> | undefined;
+    expect(ext?.migratedFrom).toBe('m.md');
+    expect(typeof ext?.migratedAt).toBe('string');
+    expect(ext?.version).toBe(1);
+  });
+
+  it('rejects when target folder already exists (no clobber)', async () => {
+    const { migrateLegacySkill } = await import('../src/agent/skill-store.js');
+    writeFlatSkill('conflict.md', LEGACY_FRONTMATTER);
+    // Create an empty folder at the target name (no SKILL.md inside) —
+    // migration must refuse to overwrite.
+    mkdirSync(path.join(skillsDir(), 'conflict'), { recursive: true });
+    const r = migrateLegacySkill('conflict');
+    expect(r.ok).toBe(false);
+    expect(r.error).toContain('target folder already exists');
+  });
+});
+
+describe('migrateAllLegacySkills', () => {
+  it('migrates only legacy files, skips Anthropic flat ones', async () => {
+    const { migrateAllLegacySkills, listSkills } = await import('../src/agent/skill-store.js');
+    writeFlatSkill('anthropic-style.md', ANTHROPIC_FRONTMATTER);
+    writeFlatSkill('legacy-1.md', LEGACY_FRONTMATTER);
+    writeFlatSkill('legacy-2.md', LEGACY_FRONTMATTER);
+    const result = migrateAllLegacySkills();
+    expect(result.migrated).toHaveLength(2);
+    expect(result.skipped).toHaveLength(1); // anthropic-style stays as-is
+    const skills = listSkills();
+    // 2 migrated to folder + 1 anthropic-flat = 3 total
+    expect(skills).toHaveLength(3);
+    const layouts = skills.map((s) => `${s.frontmatter.name}/${s.layout}`).sort();
+    expect(layouts).toEqual([
+      'anthropic-style/flat',
+      'legacy-1/folder',
+      'legacy-2/folder',
+    ]);
+  });
+
+  it('returns empty when no skills exist', async () => {
+    const { migrateAllLegacySkills } = await import('../src/agent/skill-store.js');
+    const result = migrateAllLegacySkills();
+    expect(result.migrated).toEqual([]);
+    expect(result.skipped).toEqual([]);
+  });
+});
