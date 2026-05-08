@@ -923,25 +923,24 @@ export interface Feedback {
 
 // ── Session Reflections ─────────────────────────────────────────────
 
-export interface BehavioralCorrection {
-  correction: string;
-  category: 'verbosity' | 'tone' | 'workflow' | 'format' | 'accuracy' | 'proactivity' | 'scope';
-  strength: 'explicit' | 'implicit';
-}
-
-export interface PreferenceLearned {
-  preference: string;
-  confidence: 'high' | 'medium' | 'low';
-}
-
 export interface SessionReflection {
   id?: number;
   sessionKey: string;
   exchangeCount: number;
   frictionSignals: string[];
   qualityScore: number;            // 1-5
-  behavioralCorrections: BehavioralCorrection[];
-  preferencesLearned: PreferenceLearned[];
+  // Inlined shapes (1.18.122) — the standalone BehavioralCorrection /
+  // PreferenceLearned aliases were only used here. Inlining keeps the
+  // type expressive without the indirection.
+  behavioralCorrections: Array<{
+    correction: string;
+    category: 'verbosity' | 'tone' | 'workflow' | 'format' | 'accuracy' | 'proactivity' | 'scope';
+    strength: 'explicit' | 'implicit';
+  }>;
+  preferencesLearned: Array<{
+    preference: string;
+    confidence: 'high' | 'medium' | 'low';
+  }>;
   agentSlug?: string;
   createdAt?: string;
 }
@@ -1007,14 +1006,6 @@ export interface ExecutionPlan {
   synthesisPrompt: string;
 }
 
-export interface PlanProgressUpdate {
-  stepId: string;
-  status: 'waiting' | 'running' | 'done' | 'failed';
-  description: string;
-  durationMs?: number;
-  resultPreview?: string;
-}
-
 // ── Workflow Automation ─────────────────────────────────────────────
 
 export interface WorkflowInput {
@@ -1036,14 +1027,6 @@ export interface WorkflowStepMcpConfig {
   server: string;
   tool: string;
   inputs?: Record<string, unknown>;
-}
-
-export interface WorkflowStepCliConfig {
-  cmd: string;                   // CLI binary name as discovered (e.g. 'sf', 'gh', 'gcloud')
-  args?: string[];               // argv tokens; each token may include {{steps.x}} templates
-  workDir?: string;              // optional cwd; defaults to BASE_DIR
-  timeoutMs?: number;            // default 60_000
-  captureStderr?: boolean;       // include stderr in output (default false: stdout only)
 }
 
 export interface WorkflowStepChannelConfig {
@@ -1082,7 +1065,16 @@ export interface WorkflowStep {
   workDir?: string;
   kind?: WorkflowStepKind;
   mcp?: WorkflowStepMcpConfig;
-  cli?: WorkflowStepCliConfig;
+  /** CLI step config — inline shape (was the standalone WorkflowStepCliConfig
+   *  type that had zero external references; the field stays but the
+   *  named alias was dropped in 1.18.122). */
+  cli?: {
+    cmd: string;                   // CLI binary name (e.g. 'sf', 'gh', 'gcloud')
+    args?: string[];               // argv tokens; may include {{steps.x}} templates
+    workDir?: string;              // optional cwd; defaults to BASE_DIR
+    timeoutMs?: number;            // default 60_000
+    captureStderr?: boolean;       // include stderr in output (default: stdout only)
+  };
   channel?: WorkflowStepChannelConfig;
   transform?: WorkflowStepTransformConfig;
   conditional?: WorkflowStepConditionalConfig;
@@ -1406,18 +1398,6 @@ export interface SessionRecord {
   lastUsedAt: number;
   userAgent?: string;
 }
-
-// ── Agent Config Revisions ──────────────────────────────────────────
-
-export interface ConfigRevision {
-  id?: number;
-  agentSlug: string;
-  fileName: string;              // e.g., 'agent.md', 'CRON.md', 'PLAYBOOK.md'
-  content: string;               // Full file content at this revision
-  changedBy?: string;            // 'dashboard', 'self-improve', agent slug
-  createdAt?: string;
-}
-
 // ── SDR Operational Data ────────────────────────────────────────────
 
 export interface Lead {
@@ -1435,17 +1415,6 @@ export interface Lead {
   updatedAt?: string;
 }
 
-export interface SequenceEnrollment {
-  id?: number;
-  leadId: number;
-  sequenceName: string;
-  currentStep: number;
-  status: 'active' | 'paused' | 'replied' | 'completed' | 'opted_out';
-  nextStepDueAt?: string;
-  startedAt?: string;
-  updatedAt?: string;
-}
-
 export interface Activity {
   id?: number;
   leadId?: number;
@@ -1455,46 +1424,6 @@ export interface Activity {
   detail?: string;
   templateUsed?: string;
   performedAt?: string;
-}
-
-export interface SuppressionEntry {
-  id?: number;
-  email: string;
-  reason: 'unsubscribe' | 'bounce' | 'manual' | 'complaint';
-  addedAt?: string;
-  addedBy?: string;                 // agent_slug or 'manual'
-}
-
-export interface ApprovalRequest {
-  id?: number;
-  agentSlug: string;
-  actionType: 'email_send' | 'sequence_start' | 'escalation';
-  summary: string;
-  detail?: Record<string, unknown>;
-  status: 'pending' | 'approved' | 'rejected';
-  requestedAt?: string;
-  resolvedAt?: string;
-  resolvedBy?: string;
-}
-
-// ── Salesforce Sync ─────────────────────────────────────────────────
-
-export interface SfSyncRecord {
-  id?: number;
-  localTable: 'leads' | 'activities';
-  localId: number;
-  sfObjectType: 'Lead' | 'Contact' | 'Opportunity' | 'Task' | 'Event';
-  sfId: string;
-  syncDirection: 'push' | 'pull';
-  syncedAt?: string;
-  syncStatus: 'success' | 'error' | 'conflict';
-  errorMessage?: string;
-}
-
-export interface SfFieldMapping {
-  localField: string;
-  sfField: string;
-  direction: 'bidirectional' | 'push-only' | 'pull-only';
 }
 
 // ── Brain / Ingestion ────────────────────────────────────────────────

@@ -14153,6 +14153,9 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
   }
   .toast.success { border-left: 3px solid var(--green); }
   .toast.error { border-left: 3px solid var(--red); }
+  /* 1.18.122 — variants used by callsites that lacked CSS support */
+  .toast.warn { border-left: 3px solid var(--yellow); }
+  .toast.info { border-left: 3px solid var(--accent); }
   @keyframes toastIn {
     from { transform: translateX(40px); opacity: 0; }
     to { transform: translateX(0); opacity: 1; }
@@ -19200,11 +19203,11 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
           clearInterval(ticker);
 
           if (errorMsg) {
-            manifestEl.innerHTML = '<div style="color:#e66">Error: ' + escapeHtml(errorMsg) + '</div>';
+            manifestEl.innerHTML = '<div style="color:var(--red)">Error: ' + escapeHtml(errorMsg) + '</div>';
             return;
           }
           if (!manifestData || !finalData) {
-            manifestEl.innerHTML = '<div style="color:#e66">Preview ended without a result. Check dashboard logs.</div>';
+            manifestEl.innerHTML = '<div style="color:var(--red)">Preview ended without a result. Check dashboard logs.</div>';
             return;
           }
 
@@ -19214,13 +19217,13 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
           const manifestRows = Object.entries(manifest.formats || {})
             .map(([fmt, n]) => '<tr><td>' + escapeHtml(fmt) + '</td><td>' + n + '</td></tr>').join('');
           const warnBlock = errorsList.length
-            ? '<div style="margin-top:10px;padding:10px;background:#fff3cd;border:1px solid #f0c36d;border-radius:6px;color:#8a5a00;font-size:13px">' +
+            ? '<div style="margin-top:10px;padding:10px;background:rgba(245,158,11,0.10);border:1px solid rgba(245,158,11,0.32);border-radius:6px;color:var(--text-primary);font-size:13px">' +
               '<div style="font-weight:600;margin-bottom:4px">' + errorsList.length + ' file(s) could not be ingested</div>' +
               errorsList.map((e) => '<div style="font-family:monospace;font-size:12px">• ' + escapeHtml(e.error) + '</div>').join('') +
               '</div>'
             : '';
           const emptyNote = (preview.length === 0 && !errorsList.length)
-            ? '<div style="margin-top:10px;padding:10px;background:#fff3cd;border:1px solid #f0c36d;border-radius:6px;color:#8a5a00;font-size:13px">No records extracted. The file may be empty or in an unsupported format.</div>'
+            ? '<div style="margin-top:10px;padding:10px;background:rgba(245,158,11,0.10);border:1px solid rgba(245,158,11,0.32);border-radius:6px;color:var(--text-primary);font-size:13px">No records extracted. The file may be empty or in an unsupported format.</div>'
             : '';
           manifestEl.innerHTML =
             '<div class="card" style="padding:12px"><div style="font-weight:600;margin-bottom:8px">Manifest</div>' +
@@ -19235,7 +19238,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
               '<div style="font-weight:600">#' + (i + 1) + ' ' + escapeHtml(p.title || '(untitled)') + '</div>' +
               '<div style="color:var(--muted);font-size:12px;margin:4px 0">' + escapeHtml(p.targetRelPath || '') + '</div>' +
               '<div style="font-size:13px">' + escapeHtml((p.body || '').slice(0, 400)) + '</div>' +
-              (p.tags && p.tags.length ? '<div style="margin-top:6px;font-size:12px;color:#888">tags: ' + p.tags.map(escapeHtml).join(', ') + '</div>' : '') +
+              (p.tags && p.tags.length ? '<div style="margin-top:6px;font-size:12px;color:var(--text-muted)">tags: ' + p.tags.map(escapeHtml).join(', ') + '</div>' : '') +
               '</div>').join('');
             previewEl.innerHTML =
               '<div style="font-weight:600;margin-bottom:8px">Preview (first ' + Math.min(preview.length, 10) + ' records, dry-run)</div>' + previewHtml;
@@ -19283,11 +19286,11 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
           }
 
           if (errorMsg) {
-            progEl.innerHTML = '<div style="color:#e66">Error: ' + escapeHtml(errorMsg) + '</div>';
+            progEl.innerHTML = '<div style="color:var(--red)">Error: ' + escapeHtml(errorMsg) + '</div>';
             return;
           }
           if (!finalData) {
-            progEl.innerHTML = '<div style="color:#e66">Ingestion ended without a result. Check dashboard logs.</div>';
+            progEl.innerHTML = '<div style="color:var(--red)">Ingestion ended without a result. Check dashboard logs.</div>';
             return;
           }
           const elapsed = Math.floor((Date.now() - progress.startedAt) / 1000);
@@ -19298,7 +19301,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
             ? 'Ingestion complete'
             : 'Ingestion finished, but nothing was written';
           const errBlock = errList.length
-            ? '<div style="margin-top:10px;padding:10px;background:#fff3cd;border:1px solid #f0c36d;border-radius:6px;color:#8a5a00;font-size:13px">' +
+            ? '<div style="margin-top:10px;padding:10px;background:rgba(245,158,11,0.10);border:1px solid rgba(245,158,11,0.32);border-radius:6px;color:var(--text-primary);font-size:13px">' +
               '<div style="font-weight:600;margin-bottom:4px">' + errList.length + ' error(s)</div>' +
               errList.map((e) => '<div style="font-family:monospace;font-size:12px">• ' + escapeHtml(e.error) + '</div>').join('') +
               '</div>'
@@ -19389,8 +19392,8 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
             }
             el.innerHTML = data.integrations.map(function(i) {
               const ok = i.connected && i.hasFeedReadyTools;
-              const color = ok ? '#2f7d32' : '#8a5a00';
-              const bg = ok ? '#e8f5e9' : '#fff3cd';
+              const color = ok ? 'var(--green)' : 'var(--text-primary)';
+              const bg = ok ? 'rgba(34,197,94,0.10)' : 'rgba(245,158,11,0.10)';
               const dot = ok ? '✓' : '⚠';
               const source = i.kind === 'composio' ? 'Composio' : (i.kind === 'claude-desktop' ? 'Claude Desktop' : 'MCP');
               const label = ok ? i.label + ' · ' + source : i.label + ' (incomplete in ' + source + ')';
@@ -19419,7 +19422,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
                 : '<span style="color:var(--muted)">no fields</span>';
               return '<div class="card" style="padding:10px 12px;margin-bottom:8px;display:flex;align-items:center;gap:12px">' +
                 '<div style="flex:1">' +
-                '<div style="font-weight:600">' + escapeHtml(f.name) + (f.enabled ? '' : ' <span style="color:#e66;font-weight:normal">(disabled)</span>') + '</div>' +
+                '<div style="font-weight:600">' + escapeHtml(f.name) + (f.enabled ? '' : ' <span style="color:var(--red);font-weight:normal">(disabled)</span>') + '</div>' +
                 '<div style="font-size:12px;color:var(--muted)">' +
                 'Recipe: <code>' + escapeHtml(f.recipeId) + '</code> · Schedule: <code>' + escapeHtml(f.schedule) + '</code> · Target: <code>' + escapeHtml(f.targetFolder) + '</code>' +
                 '</div>' +
@@ -19466,10 +19469,10 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
           if (!brainFeedWizardState) return;
           const s = brainFeedWizardState;
           if (s.step === 0) {
-            if (!s.pick) { document.getElementById('brain-feed-wizard-status').innerHTML = '<span style="color:#e66">Pick a connector.</span>'; return; }
+            if (!s.pick) { document.getElementById('brain-feed-wizard-status').innerHTML = '<span style="color:var(--red)">Pick a connector.</span>'; return; }
             s.step = 1;
           } else if (s.step === 1) {
-            if (!s.recipe) { document.getElementById('brain-feed-wizard-status').innerHTML = '<span style="color:#e66">Pick a recipe.</span>'; return; }
+            if (!s.recipe) { document.getElementById('brain-feed-wizard-status').innerHTML = '<span style="color:var(--red)">Pick a recipe.</span>'; return; }
             s.values = {};
             for (const f of (s.recipe.fields || [])) {
               if (f.defaultValue) s.values[f.key] = f.defaultValue;
@@ -19486,11 +19489,11 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
             const inputs = document.querySelectorAll('#brain-feed-wizard-step [data-field]');
             inputs.forEach(function(inp) { s.values[inp.dataset.field] = inp.value; });
             const missing = (s.recipe.fields || []).filter(function(f) { return f.required && !(s.values[f.key] || '').trim(); });
-            if (missing.length) { document.getElementById('brain-feed-wizard-status').innerHTML = '<span style="color:#e66">Required: ' + missing.map(function(f) { return f.label; }).join(', ') + '</span>'; return; }
+            if (missing.length) { document.getElementById('brain-feed-wizard-status').innerHTML = '<span style="color:var(--red)">Required: ' + missing.map(function(f) { return f.label; }).join(', ') + '</span>'; return; }
             if (s.recipe && s.recipe.id === 'tool-backed-memory-seed') {
               const toolName = String(s.values.toolName || '').trim();
               if (!/^mcp__.+__.+$/.test(toolName)) {
-                document.getElementById('brain-feed-wizard-status').innerHTML = '<span style="color:#e66">Pick an exact tool before continuing.</span>';
+                document.getElementById('brain-feed-wizard-status').innerHTML = '<span style="color:var(--red)">Pick an exact tool before continuing.</span>';
                 return;
               }
               const rawVariables = String(s.values.variablesJson || '').trim();
@@ -19498,12 +19501,12 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
                 try {
                   const parsedVariables = JSON.parse(rawVariables);
                   if (!parsedVariables || typeof parsedVariables !== 'object' || Array.isArray(parsedVariables)) {
-                    document.getElementById('brain-feed-wizard-status').innerHTML = '<span style="color:#e66">Tool variables must be a JSON object, for example {}.</span>';
+                    document.getElementById('brain-feed-wizard-status').innerHTML = '<span style="color:var(--red)">Tool variables must be a JSON object, for example {}.</span>';
                     return;
                   }
                 } catch (err) {
                   void err;
-                  document.getElementById('brain-feed-wizard-status').innerHTML = '<span style="color:#e66">Tool variables must be valid JSON, for example {}.</span>';
+                  document.getElementById('brain-feed-wizard-status').innerHTML = '<span style="color:var(--red)">Tool variables must be valid JSON, for example {}.</span>';
                   return;
                 }
               }
@@ -19570,7 +19573,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
               // can still set the value manually.
               container.innerHTML =
                 '<input type="text" value="' + escapeHtml(currentVal) + '" placeholder="(type a value)" style="width:100%" oninput="(document.querySelector(\\'input[type=hidden][data-field=' + field.key + ']\\')||{}).value=this.value">' +
-                '<div style="color:#8a5a00;font-size:11px;margin-top:4px">Nothing returned from the probe — type a value manually' + (data.rawPreview ? ' (probe output: ' + escapeHtml(data.rawPreview.slice(0, 120)) + '…)' : '') + '</div>';
+                '<div style="color:var(--text-primary);font-size:11px;margin-top:4px">Nothing returned from the probe — type a value manually' + (data.rawPreview ? ' (probe output: ' + escapeHtml(data.rawPreview.slice(0, 120)) + '…)' : '') + '</div>';
               return;
             }
 
@@ -19596,7 +19599,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
           } catch (err) {
             container.innerHTML =
               '<input type="text" value="' + escapeHtml(values[field.key] || '') + '" placeholder="(probe failed — type manually)" style="width:100%" oninput="(document.querySelector(\\'input[type=hidden][data-field=' + field.key + ']\\')||{}).value=this.value">' +
-              '<div style="color:#e66;font-size:11px;margin-top:4px">Picker failed: ' + escapeHtml(String(err && err.message ? err.message : err)) + ' — type a value manually.</div>';
+              '<div style="color:var(--red);font-size:11px;margin-top:4px">Picker failed: ' + escapeHtml(String(err && err.message ? err.message : err)) + ' — type a value manually.</div>';
           }
         }
 
@@ -19622,7 +19625,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
               const rawHint = trimmed && !isEmptyArray
                 ? ' <span style="color:var(--muted)">Tool said: ' + escapeHtml(trimmed.slice(0, 140)) + '</span>'
                 : '';
-              resultsEl.innerHTML = '<div style="color:#8a5a00;font-size:12px;padding:6px">No matches for "' + escapeHtml(query) + '". The tool may be limited by macOS permissions or not support this query — use <a href="#" onclick="brainFieldPickerToggleCustom(\\'' + field.key + '\\', \\'\\');return false">type a value directly</a>.' + rawHint + '</div>';
+              resultsEl.innerHTML = '<div style="color:var(--text-primary);font-size:12px;padding:6px">No matches for "' + escapeHtml(query) + '". The tool may be limited by macOS permissions or not support this query — use <a href="#" onclick="brainFieldPickerToggleCustom(\\'' + field.key + '\\', \\'\\');return false">type a value directly</a>.' + rawHint + '</div>';
               return;
             }
             resultsEl.innerHTML = items.map(function(it) {
@@ -19631,7 +19634,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
             }).join('') +
               '<div style="font-size:11px;color:var(--muted);margin-top:4px">' + items.length + ' result' + (items.length === 1 ? '' : 's') + (data.cached ? ' (cached)' : '') + '</div>';
           } catch (err) {
-            resultsEl.innerHTML = '<div style="color:#e66;font-size:12px;padding:6px">' + escapeHtml(String(err && err.message ? err.message : err)) + '</div>';
+            resultsEl.innerHTML = '<div style="color:var(--red);font-size:12px;padding:6px">' + escapeHtml(String(err && err.message ? err.message : err)) + '</div>';
           }
         }
 
@@ -19697,7 +19700,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
           let html = '';
           if (s.step === 0) {
             if (!s.connected.length) {
-              html = '<div style="color:#8a5a00">No connectors have feed-ready tools. Connect Composio or open Claude Desktop → Connectors and sign into Google Drive, Outlook, Gmail, or Slack first.</div>';
+              html = '<div style="color:var(--text-primary)">No connectors have feed-ready tools. Connect Composio or open Claude Desktop → Connectors and sign into Google Drive, Outlook, Gmail, or Slack first.</div>';
             } else {
               html = '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:8px">' +
                 s.connected.map(function(i) {
@@ -19760,7 +19763,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
                   } else {
                     control = '<input type="text" data-field="' + f.key + '" value="' + escapeHtml(val) + '" placeholder="' + escapeHtml(f.placeholder || '') + '" style="width:100%">';
                   }
-                  return '<label style="font-weight:500;padding-top:6px">' + escapeHtml(f.label) + (f.required ? ' <span style="color:#e66">*</span>' : '') + '</label>' +
+                  return '<label style="font-weight:500;padding-top:6px">' + escapeHtml(f.label) + (f.required ? ' <span style="color:var(--red)">*</span>' : '') + '</label>' +
                     '<div>' + control + help + '</div>';
                 }).join('') + '</div>';
 
@@ -19825,13 +19828,13 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
             });
             const data = await resp.json();
             if (!resp.ok) {
-              document.getElementById('brain-feed-wizard-status').innerHTML = '<span style="color:#e66">' + escapeHtml(data.error || 'save failed') + '</span>';
+              document.getElementById('brain-feed-wizard-status').innerHTML = '<span style="color:var(--red)">' + escapeHtml(data.error || 'save failed') + '</span>';
               return;
             }
             brainCloseFeedWizard();
             brainLoadFeeds();
           } catch (err) {
-            document.getElementById('brain-feed-wizard-status').innerHTML = '<span style="color:#e66">' + escapeHtml(String(err)) + '</span>';
+            document.getElementById('brain-feed-wizard-status').innerHTML = '<span style="color:var(--red)">' + escapeHtml(String(err)) + '</span>';
           }
         }
 
@@ -19944,8 +19947,8 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
           const slug = document.getElementById('brain-webhook-slug').value.trim();
           const folder = document.getElementById('brain-webhook-folder').value.trim() || ('04-Ingest/' + slug);
           const statusEl = document.getElementById('brain-webhook-status');
-          if (!slug) { statusEl.innerHTML = '<span style="color:#e66">slug required</span>'; return; }
-          if (!/^[a-z][a-z0-9_-]*$/.test(slug)) { statusEl.innerHTML = '<span style="color:#e66">slug must be lowercase alphanumeric</span>'; return; }
+          if (!slug) { statusEl.innerHTML = '<span style="color:var(--red)">slug required</span>'; return; }
+          if (!/^[a-z][a-z0-9_-]*$/.test(slug)) { statusEl.innerHTML = '<span style="color:var(--red)">slug must be lowercase alphanumeric</span>'; return; }
 
           // 1) Generate a random 32-byte secret and save it under ref "webhook_<slug>"
           const bytes = new Uint8Array(32);
@@ -19960,7 +19963,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
           });
           if (!credResp.ok) {
             const e = await credResp.json();
-            statusEl.innerHTML = '<span style="color:#e66">Secret save failed: ' + escapeHtml(e.error || 'unknown') + '</span>';
+            statusEl.innerHTML = '<span style="color:var(--red)">Secret save failed: ' + escapeHtml(e.error || 'unknown') + '</span>';
             return;
           }
 
@@ -19980,7 +19983,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
           });
           if (!resp.ok) {
             const e = await resp.json();
-            statusEl.innerHTML = '<span style="color:#e66">' + escapeHtml(e.error || 'save failed') + '</span>';
+            statusEl.innerHTML = '<span style="color:var(--red)">' + escapeHtml(e.error || 'save failed') + '</span>';
             return;
           }
 
@@ -20005,7 +20008,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
           const cronExpr = document.getElementById('brain-poll-cron').value.trim();
           const folder = document.getElementById('brain-poll-folder').value.trim();
           const statusEl = document.getElementById('brain-poll-status');
-          if (!slug || !url) { statusEl.innerHTML = '<span style="color:#e66">slug and URL required</span>'; return; }
+          if (!slug || !url) { statusEl.innerHTML = '<span style="color:var(--red)">slug and URL required</span>'; return; }
 
           const headers = brainCollectKv('headers');
           const params = brainCollectKv('params');
@@ -20027,7 +20030,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
             }),
           });
           const data = await resp.json();
-          if (!resp.ok) { statusEl.innerHTML = '<span style="color:#e66">' + escapeHtml(data.error || 'save failed') + '</span>'; return; }
+          if (!resp.ok) { statusEl.innerHTML = '<span style="color:var(--red)">' + escapeHtml(data.error || 'save failed') + '</span>'; return; }
           statusEl.innerHTML = '<span style="color:#4ade80">✓ Saved</span>';
 
           if (runNow) {
@@ -20036,7 +20039,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
             const runData = await runResp.json();
             statusEl.innerHTML = runResp.ok
               ? '<span style="color:#4ade80">✓ Saved + run: in=' + runData.recordsIn + ' written=' + runData.recordsWritten + '</span>'
-              : '<span style="color:#e66">Saved but run failed: ' + escapeHtml(runData.error || 'unknown') + '</span>';
+              : '<span style="color:var(--red)">Saved but run failed: ' + escapeHtml(runData.error || 'unknown') + '</span>';
           }
           brainLoadSources();
         }
@@ -20057,7 +20060,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
           const ref = document.getElementById('brain-cred-ref').value.trim();
           const value = document.getElementById('brain-cred-val').value;
           const statusEl = document.getElementById('brain-cred-status');
-          if (!ref || !value) { statusEl.innerHTML = '<span style="color:#e66">ref and value required</span>'; return; }
+          if (!ref || !value) { statusEl.innerHTML = '<span style="color:var(--red)">ref and value required</span>'; return; }
           const resp = await apiFetch('/api/brain/credentials', {
             method: 'POST', headers: { 'content-type': 'application/json' },
             body: JSON.stringify({ ref, value }),
@@ -20065,7 +20068,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
           const data = await resp.json();
           statusEl.innerHTML = resp.ok
             ? '<span style="color:#4ade80">✓ Saved ' + escapeHtml(ref) + '</span>'
-            : '<span style="color:#e66">' + escapeHtml(data.error || 'save failed') + '</span>';
+            : '<span style="color:var(--red)">' + escapeHtml(data.error || 'save failed') + '</span>';
           document.getElementById('brain-cred-ref').value = '';
           document.getElementById('brain-cred-val').value = '';
           brainShowCredsForm(); // refresh list
@@ -20159,7 +20162,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
             });
             const data = await resp.json();
             if (!resp.ok) {
-              statusEl.innerHTML = '<span style="color:#e66">Upload failed: ' + escapeHtml(data.error || 'unknown') + '</span>';
+              statusEl.innerHTML = '<span style="color:var(--red)">Upload failed: ' + escapeHtml(data.error || 'unknown') + '</span>';
               return;
             }
             statusEl.innerHTML = '<span style="color:#4ade80">✓ Uploaded ' + data.count + ' file(s)</span>';
@@ -20167,7 +20170,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
             // Kick off preview immediately
             await brainPreviewSeed();
           } catch (err) {
-            statusEl.innerHTML = '<span style="color:#e66">Upload error: ' + escapeHtml(String(err)) + '</span>';
+            statusEl.innerHTML = '<span style="color:var(--red)">Upload error: ' + escapeHtml(String(err)) + '</span>';
           }
         }
 
