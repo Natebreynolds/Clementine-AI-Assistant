@@ -16879,6 +16879,13 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
         <span class="nav-icon"></span> Tasks
         <span class="nav-badge" id="nav-cron-count" style="display:none">0</span>
       </div>
+      <!-- Skills-First redesign Phase A / 1.18.106: read-only catalog
+           of skill files (procedures + tools + data + state). Phase B
+           adds editing + testing; Phase C wires runtime invocation. -->
+      <div class="nav-item" data-page="skills" data-icon="brain" title="Reusable skill files — procedures + tool allowlists + data sources">
+        <span class="nav-icon"></span> Skills
+        <span class="nav-badge" id="nav-skills-count" style="display:none">0</span>
+      </div>
       <div class="nav-item" data-page="heartbeat" data-icon="bell" title="Heartbeat controls and queued work">
         <span class="nav-icon"></span> Heartbeat
       </div>
@@ -20189,6 +20196,34 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
     <!-- (Session 5) page-memory-health parking stub removed. Brain → Health is the live home. -->
 
     <!-- page-goals merged into Team → Goals tab. -->
+
+    <!-- ═══ Skills Page — Phase A read-only catalog ═══
+         Skills-First redesign Phase A / 1.18.106: a list of every skill
+         file with detail pane. Editing + testing land in Phase B; runtime
+         invocation lands in Phase C. The page is intentionally minimal —
+         we want users to see what's there, not be overwhelmed by 7 tiles. -->
+    <div class="page" id="page-skills">
+      <div class="page-head">
+        <div class="icon icon-slot" data-icon="brain"></div>
+        <div class="title-block">
+          <h1>Skills</h1>
+          <p class="desc">Reusable procedures Clementine can run. Each skill declares its tools, data sources, and state.</p>
+        </div>
+      </div>
+      <div style="display:grid;grid-template-columns:380px 1fr;gap:18px;height:calc(100vh - 180px);min-height:500px">
+        <div id="skills-list-pane" style="overflow-y:auto;border:1px solid var(--border);border-radius:8px;background:var(--bg-secondary)">
+          <div style="padding:14px 16px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:8px">
+            <input type="search" id="skills-search" placeholder="Search skills…" oninput="onSkillsSearch(this.value)" style="flex:1;padding:6px 10px;font-size:12px;border:1px solid var(--border);border-radius:6px;background:var(--bg-primary);color:var(--text-primary)">
+          </div>
+          <div id="skills-list" style="padding:6px"></div>
+        </div>
+        <div id="skills-detail-pane" style="overflow-y:auto;border:1px solid var(--border);border-radius:8px;background:var(--bg-secondary);padding:0">
+          <div id="skills-detail" style="padding:24px;color:var(--text-muted);text-align:center;font-size:13px">
+            Select a skill on the left to see its procedure, tools, and data sources.
+          </div>
+        </div>
+      </div>
+    </div>
 
     <!-- ═══ Team Page — The Office ═══ -->
     <div class="page" id="page-team">
