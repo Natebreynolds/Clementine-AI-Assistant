@@ -380,7 +380,12 @@ export async function runAgent(prompt: string, opts: RunAgentOptions): Promise<R
     systemPrompt: profileAppend
       ? { type: 'preset' as const, preset: 'claude_code' as const, append: profileAppend }
       : { type: 'preset' as const, preset: 'claude_code' as const },
-    settingSources: opts.settingSources ?? ['project'] as ('project' | 'user' | 'local')[],
+    // PRD §6 Phase 4d / 1.18.102: read both project and local sources by
+    // default. The path B installer writes to .claude/settings.local.json
+    // (which the SDK reads under the 'local' source) so we never clobber
+    // the user's hand-written .claude/settings.json. Callers can still
+    // override settingSources via opts.
+    settingSources: opts.settingSources ?? ['project', 'local'] as ('project' | 'user' | 'local')[],
     agents,
     // SDK's McpServerConfig is a union; cast at the boundary since
     // callers can mix stdio + http + sse server shapes.
