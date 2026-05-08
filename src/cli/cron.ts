@@ -71,7 +71,7 @@ export async function cmdCronList(): Promise<void> {
     const status = job.enabled ? 'enabled' : 'disabled';
     const recent = runLog.readRecent(job.name, 1);
     const lastRun = recent.length > 0
-      ? `last run: ${recent[0].finishedAt.slice(0, 16).replace('T', ' ')} (${recent[0].status})`
+      ? `last run: ${(recent[0].finishedAt ?? recent[0].startedAt).slice(0, 16).replace('T', ' ')} (${recent[0].status})`
       : 'never run';
     const errors = runLog.consecutiveErrors(job.name);
     const errorTag = errors > 0 ? ` [${errors} consecutive error(s)]` : '';

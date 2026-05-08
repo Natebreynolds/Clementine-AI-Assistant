@@ -118,7 +118,7 @@ function computeLegacyAdvice(jobName: string, job: CronJobDefinition): Execution
         advice.skipReason = `${consecutiveErrors} consecutive errors — circuit breaker engaged`;
         return advice;
       }
-      const lastRunTime = new Date(lastRun.finishedAt).getTime();
+      const lastRunTime = new Date(lastRun.finishedAt ?? lastRun.startedAt).getTime();
       const elapsed = Date.now() - lastRunTime;
 
       if (elapsed < CIRCUIT_BREAKER_COOLDOWN_MS) {

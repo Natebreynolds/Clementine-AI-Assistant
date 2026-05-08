@@ -1382,19 +1382,13 @@ function getCronJobs(): Record<string, unknown> {
     } catch { /* ignore */ }
   }
 
-  // Attach recent run history
-  const runsDir = path.join(BASE_DIR, 'cron', 'runs');
+  // Attach recent run history. Single source of truth via CronRunLog.readRecent
+  // — same path the new /api/cron/runs cross-job endpoint uses, so per-card
+  // last-run and the Recent History zone never disagree.
+  const log = new CronRunLog();
   const enriched = jobs.map((job) => {
     const name = String(job.name ?? '');
-    const safe = name.replace(/[^a-zA-Z0-9_-]/g, '_');
-    const logPath = path.join(runsDir, `${safe}.jsonl`);
-    let recentRuns: unknown[] = [];
-    if (existsSync(logPath)) {
-      try {
-        const lines = readFileSync(logPath, 'utf-8').trim().split('\n').filter(Boolean);
-        recentRuns = lines.slice(-10).map((l) => JSON.parse(l)).reverse();
-      } catch { /* ignore */ }
-    }
+    const recentRuns = log.readRecent(name, 10);
     return { ...job, recentRuns };
   });
 
@@ -4419,6 +4413,24 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
   app.post('/api/cron/run/:job', (req, res) => {
     const jobName = req.params.job;
     try {
+      // Concurrency lock (1.18.76+): the CronScheduler persists a sidecar
+      // ~/.clementine/cron-running.json with one entry per in-flight job.
+      // If a manual Run Now collides with an already-running job (whether
+      // from another Run Now click or a scheduled tick), reject 409 so the
+      // user gets immediate feedback instead of two parallel runs racing
+      // each other into the same outputs.
+      try {
+        const runningFile = path.join(BASE_DIR, 'cron-running.json');
+        if (existsSync(runningFile)) {
+          const entries = JSON.parse(readFileSync(runningFile, 'utf-8')) as Array<{ jobName?: string; startedAt?: string; pid?: number }>;
+          const collision = Array.isArray(entries) && entries.find(e => String(e.jobName ?? '').toLowerCase() === jobName.toLowerCase());
+          if (collision) {
+            const since = collision.startedAt ? ` (running since ${collision.startedAt})` : '';
+            res.status(409).json({ ok: false, error: `Job "${jobName}" is already running${since}` });
+            return;
+          }
+        }
+      } catch { /* if the sidecar is unreadable, fall through and let the runner handle dedup */ }
       const child = spawn('node', [DIST_ENTRY, 'cron', 'run', jobName], {
         detached: true,
         stdio: ['ignore', 'pipe', 'pipe'],
@@ -6422,8 +6434,15 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
       }
       jobs[idx].enabled = !jobs[idx].enabled;
       writeCronFileAt(cronFile, parsed, jobs);
-      const state = jobs[idx].enabled ? 'enabled' : 'disabled';
-      res.json({ ok: true, message: `${jobName} is now ${state}` });
+      const enabled = jobs[idx].enabled;
+      const state = enabled ? 'enabled' : 'disabled';
+      // Broadcast so other open dashboard tabs flip the toggle without polling.
+      try { broadcastEvent({ type: 'cron_toggled', data: { job: bareJobName, enabled } }); } catch { /* non-fatal */ }
+      // The CronScheduler's watchFile polls CRON.md every 2s and reloads
+      // automatically (cron-scheduler.ts:756 watchCronFile), so the toggle
+      // takes effect within 2 seconds without an explicit reload here. We
+      // surface a hint to the user about that latency in the response.
+      res.json({ ok: true, message: `${jobName} is now ${state}`, enabled });
     } catch (err) {
       res.status(500).json({ error: String(err) });
     }
@@ -23275,7 +23294,7 @@ async function openTraceViewer(jobName) {
     traceData = d.traces || [];
 
     if (traceData.length === 0) {
-      document.getElementById('trace-content').innerHTML = '<div style="padding:20px;color:var(--text-muted)">No traces recorded yet. Traces are captured on the next run.</div>';
+      document.getElementById('trace-content').innerHTML = '<div style="padding:24px;color:var(--text-muted);line-height:1.6"><div style="font-weight:500;color:var(--text-secondary);margin-bottom:8px">No traces recorded yet</div><div style="font-size:12px">Traces are captured per run and show every tool call the agent made.<br/>If a recent run errored before any tool was invoked, see the <strong>Recent history</strong> zone on the Tasks page for the error message.</div></div>';
       document.getElementById('trace-run-selector').innerHTML = '';
       return;
     }
@@ -23327,7 +23346,7 @@ function renderTrace(idx) {
       + '</div>';
   }
 
-  document.getElementById('trace-content').innerHTML = html || '<div style="padding:20px;color:var(--text-muted)">Empty trace</div>';
+  document.getElementById('trace-content').innerHTML = html || '<div style="padding:24px;color:var(--text-muted);line-height:1.6"><div style="font-weight:500;color:var(--text-secondary);margin-bottom:8px">This run produced no tool calls</div><div style="font-size:12px">The run started but didn\\x27t reach any tool — it likely errored before the agent acted, or was a no-op response.<br/>Check <strong>Recent history</strong> on the Tasks page for the error message or output preview from this run.</div></div>';
 }
 
 // ── Inline Trace (Execution tab) ──

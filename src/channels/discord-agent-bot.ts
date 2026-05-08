@@ -451,7 +451,7 @@ export class AgentBotClient {
         if (recent.length > 0) {
           const r = recent[0];
           const icon = r.status === 'ok' ? '\u2705' : r.status === 'error' ? '\u274C' : '\u23ED';
-          const ago = Math.round((Date.now() - new Date(r.finishedAt).getTime()) / 60000);
+          const ago = Math.round((Date.now() - new Date(r.finishedAt ?? r.startedAt).getTime()) / 60000);
           lastRunLines.push(`${icon} ${display} \u2014 ${formatAgentDuration(ago)} ago`);
         } else {
           lastRunLines.push(`\u2B1C ${display} \u2014 never run`);

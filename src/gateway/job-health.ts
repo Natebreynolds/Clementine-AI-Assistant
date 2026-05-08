@@ -123,12 +123,20 @@ export function classifyRunHealth(entry: CronRunEntry): JobHealthStatus {
     };
   }
 
-  if (entry.status === 'error' || entry.status === 'retried') {
+  // 'timeout' and 'lost' are explicit terminal failure states (1.18.76+).
+  // 'timeout' = the job exceeded max_hours. 'lost' = the daemon-boot sweep
+  // closed an orphaned 'running' entry that never got a finishedAt because
+  // the daemon crashed mid-run.
+  if (entry.status === 'error' || entry.status === 'retried' || entry.status === 'timeout' || entry.status === 'lost') {
     return {
       ...base,
       status: 'failed',
       evidence: compactEvidence(entry.error, entry.outputPreview, terminalReason ? `terminalReason=${terminalReason}` : undefined),
-      recommendedAction: 'Inspect the latest error and current job definition before applying a fix.',
+      recommendedAction: entry.status === 'lost'
+        ? 'The daemon crashed before this run completed. Check the daemon logs around the startedAt timestamp; if this repeats, lower max_hours or investigate the underlying job.'
+        : entry.status === 'timeout'
+        ? 'The job exceeded its time budget. Lower max_hours, narrow the prompt, or split into smaller steps.'
+        : 'Inspect the latest error and current job definition before applying a fix.',
       requiresApproval: true,
     };
   }

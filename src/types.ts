@@ -454,8 +454,17 @@ export type TerminalReason =
 export interface CronRunEntry {
   jobName: string;
   startedAt: string;
-  finishedAt: string;
-  status: 'ok' | 'error' | 'retried' | 'skipped';
+  /** Optional: in-progress runs are appended with status='running' before the
+   *  finishedAt is known. The runner replaces or supersedes the entry on
+   *  completion. The stale-running sweep emits a closing 'lost' entry for
+   *  any 'running' row whose startedAt has aged past the deadline. */
+  finishedAt?: string;
+  /** 'ok' | 'error' | 'retried' | 'skipped' are terminal. 'running' is in-flight.
+   *  'timeout' fires when max_hours is exceeded. 'lost' is appended by the
+   *  daemon-boot stale sweep when a 'running' entry has no companion close
+   *  (daemon likely crashed mid-run). */
+  status: 'ok' | 'error' | 'retried' | 'skipped' | 'running' | 'timeout' | 'lost';
+  /** 0 for in-progress 'running' rows; populated when terminal. */
   durationMs: number;
   error?: string;
   errorType?: 'transient' | 'permanent';

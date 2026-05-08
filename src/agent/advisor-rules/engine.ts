@@ -84,14 +84,18 @@ export function evaluateWhen(c: WhenCondition, ctx: RuleContext): boolean {
     case 'lastRunOlderThanMs': {
       const lastRun = ctx.recentRuns[0];
       if (!lastRun) return false;
-      const lastRunTime = new Date(lastRun.finishedAt).getTime();
+      // finishedAt is optional (in-progress runs are 'running' with no
+      // finishedAt). Fall back to startedAt so the rule still has a clock.
+      const lastRunTime = new Date(lastRun.finishedAt ?? lastRun.startedAt).getTime();
       return ctx.nowMs - lastRunTime > c.ms;
     }
 
     case 'lastRunWithinMs': {
       const lastRun = ctx.recentRuns[0];
       if (!lastRun) return false;
-      const lastRunTime = new Date(lastRun.finishedAt).getTime();
+      // finishedAt is optional (in-progress runs are 'running' with no
+      // finishedAt). Fall back to startedAt so the rule still has a clock.
+      const lastRunTime = new Date(lastRun.finishedAt ?? lastRun.startedAt).getTime();
       return ctx.nowMs - lastRunTime <= c.ms;
     }
 
@@ -204,7 +208,7 @@ const TEMPLATE_VARS: Record<string, (ctx: RuleContext) => string | number> = {
   cooldownProbeMin: (ctx) => {
     const lastRun = ctx.recentRuns[0];
     if (!lastRun) return 0;
-    const lastRunTime = new Date(lastRun.finishedAt).getTime();
+    const lastRunTime = new Date(lastRun.finishedAt ?? lastRun.startedAt).getTime();
     const elapsed = ctx.nowMs - lastRunTime;
     const cooldown = 60 * 60 * 1000;
     return Math.max(0, Math.ceil((cooldown - elapsed) / 60_000));
