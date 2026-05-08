@@ -506,6 +506,11 @@ export interface CronRunEntry {
   allowedToolsApplied?: string[];
   /** MCP servers live for this run (post profile + trick allowlist intersection). */
   mcpServersApplied?: string[];
+  /** PRD §6 / 1.18.84: how this run was triggered. Persisted by the
+   *  scheduler (cron tick / chained 'after' / manual-run endpoint /
+   *  Discord) so the Run list can filter by source instead of guessing
+   *  via heuristics on attempt count. */
+  trigger?: 'manual' | 'scheduled' | 'webhook' | 'api' | 'fork' | 'resume' | 'discord' | 'after';
   /** PRD Phase 1: did the run accomplish what it was supposed to?
    *  Computed at run-end when the Task has successSchema or successCriteriaText.
    *  - status='pass'      both configured checks passed (or the only one configured did)

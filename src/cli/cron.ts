@@ -170,6 +170,10 @@ export async function cmdCronRun(jobName: string): Promise<void> {
     const response = await gateway.handleCronJob(job.name, job.prompt, job.tier, job.maxTurns, job.model, job.workDir, job.mode, job.maxHours);
     const finishedAt = new Date();
 
+    // 1.18.84: trigger source comes from the CRON_RUN_TRIGGER env var set
+    // by the dashboard's manual-run endpoint. Defaults to 'scheduled' for
+    // any other invocation path (CLI, daemon-internal callsites).
+    const trigger = (process.env.CRON_RUN_TRIGGER as CronRunEntry['trigger']) || 'scheduled';
     const entry: CronRunEntry = {
       jobName: job.name,
       startedAt: startedAt.toISOString(),
@@ -178,6 +182,7 @@ export async function cmdCronRun(jobName: string): Promise<void> {
       durationMs: finishedAt.getTime() - startedAt.getTime(),
       attempt: 1,
       outputPreview: response ? response.slice(0, 200) : undefined,
+      trigger,
     };
 
     // PRD Phase 1.1: goal-orientation evaluator (mirrors the daemon path).
@@ -200,6 +205,7 @@ export async function cmdCronRun(jobName: string): Promise<void> {
     }
   } catch (err) {
     const finishedAt = new Date();
+    const trigger = (process.env.CRON_RUN_TRIGGER as CronRunEntry['trigger']) || 'scheduled';
     runLog.append({
       jobName: job.name,
       startedAt: startedAt.toISOString(),
@@ -209,6 +215,7 @@ export async function cmdCronRun(jobName: string): Promise<void> {
       error: String(err).slice(0, 500),
       errorType: classifyError(err),
       attempt: 1,
+      trigger,
     });
     console.error(`Error: ${err}`);
     process.exit(1);

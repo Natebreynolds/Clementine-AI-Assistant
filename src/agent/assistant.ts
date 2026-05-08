@@ -63,6 +63,7 @@ import {
   KNOWN_SERVICES,
 } from '../integrations/tool-preferences.js';
 import { loadClaudeIntegrations } from './mcp-bridge.js';
+import { getLatestMcpStatusSnapshot, recordMcpStatusFromSystemInit, invalidateMcpStatusEntry } from './run-agent.js';
 import { detectFrustrationSignals, detectRepeatedTopics } from './insight-engine.js';
 import type { AgentProfile, ChannelCapabilities, SessionData, TerminalReason, VerboseLevel } from '../types.js';
 import { DEFAULT_CHANNEL_CAPABILITIES } from '../types.js';
@@ -840,8 +841,10 @@ export class PersonalAssistant {
   private memoryStore: any = null; // Typed as any — MemoryStore may not be available yet
   private _lastUserMessage?: string;
   onSkillProposed: ((skill: import('../types.js').SkillDocument) => void) | null = null;
-  private _lastMcpStatus: Array<{ name: string; status: string }> = [];
-  private _lastMcpStatusTime: string = '';
+  // PRD Phase 2 / 1.18.84: superseded by the shared module-level cache in
+  // run-agent.ts (getLatestMcpStatusSnapshot / recordMcpStatusFromSystemInit).
+  // The fields below were declared but never written pre-1.18.84; the
+  // module cache populates from every system/init message instead.
   /** Terminal reason from the last SDK query — consumed by cron scheduler for precise error classification. */
   private _lastTerminalReason?: TerminalReason;
   /** Per-session stall nudge — set after a query shows stall signals, consumed on the next query. */
@@ -946,7 +949,12 @@ export class PersonalAssistant {
   }
 
   getMcpStatus(): { servers: Array<{ name: string; status: string }>; updatedAt: string } {
-    return { servers: this._lastMcpStatus, updatedAt: this._lastMcpStatusTime };
+    // 1.18.84 correctness fix: delegate to the shared module-level cache.
+    // Pre-1.18.84 we returned this._lastMcpStatus, which was declared but
+    // never written — getMcpStatus() always returned empty. Now run-agent
+    // and assistant query streams record into a shared snapshot via
+    // recordMcpStatusFromSystemInit when the SDK init message lands.
+    return getLatestMcpStatusSnapshot();
   }
 
   /**
@@ -957,11 +965,9 @@ export class PersonalAssistant {
    * stale error/auth state. Returns the post-clear cached snapshot.
    */
   invalidateMcpStatus(serverName: string): { servers: Array<{ name: string; status: string }>; updatedAt: string; cleared: boolean } {
-    const beforeLen = this._lastMcpStatus.length;
-    this._lastMcpStatus = this._lastMcpStatus.filter((s) => s.name !== serverName);
-    const cleared = this._lastMcpStatus.length < beforeLen;
-    if (cleared) this._lastMcpStatusTime = new Date().toISOString();
-    return { servers: this._lastMcpStatus, updatedAt: this._lastMcpStatusTime, cleared };
+    const result = invalidateMcpStatusEntry(serverName);
+    const snapshot = getLatestMcpStatusSnapshot();
+    return { servers: snapshot.servers, updatedAt: snapshot.updatedAt, cleared: result.cleared };
   }
 
   /** Inject a background work result into the session as silent follow-up context. */
@@ -3391,6 +3397,11 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
     const stream = query({ prompt, options: sdkOptions });
 
     for await (const message of stream) {
+      // 1.18.84 correctness: capture MCP server status from SDK init.
+      if (message.type === 'system' && (message as { subtype?: string }).subtype === 'init') {
+        const mcpServersRaw = (message as { mcp_servers?: unknown }).mcp_servers;
+        if (mcpServersRaw) try { recordMcpStatusFromSystemInit(mcpServersRaw); } catch { /* non-fatal */ }
+      }
       if (message.type === 'assistant') {
         const blocks = getContentBlocks(message as SDKAssistantMessage);
         for (const block of blocks) {
