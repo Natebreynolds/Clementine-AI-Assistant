@@ -468,6 +468,22 @@ export interface ClementineSkillExtensions {
   lastUsed?: string;
   /** Last successful "Test this skill" run (Phase B). */
   lastTestPass?: string;
+  // ── Legacy Clementine concepts preserved through migration ─────────
+  /** Legacy: NLP-style trigger phrases the pre-redesign chat router used
+   *  to match incoming messages against this skill. Preserved for the
+   *  migration UI; not enforced. */
+  triggers?: string[];
+  /** Legacy: 'manual' / 'auto' / 'imported' — provenance label on the
+   *  pre-redesign skills. */
+  source?: string;
+  /** Legacy: incrementing counter of runs that invoked the skill. */
+  useCount?: number;
+  // ── Migration provenance (stamped by migrateLegacySkill) ───────────
+  /** Filename the original legacy skill was migrated from. Helps the
+   *  migration UI show what came from where. */
+  migratedFrom?: string;
+  /** ISO timestamp of when the migration ran. */
+  migratedAt?: string;
 }
 
 /** Parsed frontmatter. Anthropic-canonical fields are top-level; our

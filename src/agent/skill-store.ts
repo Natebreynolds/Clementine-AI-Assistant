@@ -22,7 +22,7 @@
  * crons → folder-form skills.
  */
 
-import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import matter from 'gray-matter';
@@ -171,6 +171,12 @@ function coerceClementineExtensions(raw: unknown): ClementineSkillExtensions | u
   if (typeof r.updatedAt === 'string') out.updatedAt = r.updatedAt;
   if (typeof r.lastUsed === 'string') out.lastUsed = r.lastUsed;
   if (typeof r.lastTestPass === 'string') out.lastTestPass = r.lastTestPass;
+  // Legacy Clementine concepts preserved through migration.
+  if (Array.isArray(r.triggers)) out.triggers = r.triggers.map(String);
+  if (typeof r.source === 'string') out.source = r.source;
+  if (typeof r.useCount === 'number') out.useCount = r.useCount;
+  if (typeof r.migratedFrom === 'string') out.migratedFrom = r.migratedFrom;
+  if (typeof r.migratedAt === 'string') out.migratedAt = r.migratedAt;
 
   return Object.keys(out).length > 0 ? out : undefined;
 }
@@ -454,6 +460,170 @@ export function readBundledFile(skill: Skill, relPath: string): string | null {
   if (!existsSync(absPath)) return null;
   try { return readFileSync(absPath, 'utf-8'); }
   catch { return null; }
+}
+
+// ── Legacy → folder-form migration ───────────────────────────────────
+//
+// Converts a flat-form legacy skill (`<name>.md` with title/triggers/
+// toolsUsed/useCount frontmatter) into Anthropic-compatible folder form
+// (`<name>/SKILL.md` with name+description top-level + clementine: namespace
+// for the migration metadata).
+//
+// Preserves everything:
+//   - title (legacy display name) → moves to top-level `title` (still readable)
+//   - triggers (NLP phrases) → clementine.triggers (preserved for reference)
+//   - toolsUsed → clementine.tools.allow (informational → enforced allowlist)
+//   - useCount + lastUsed → clementine.useCount + clementine.lastUsed
+//   - source → clementine.source
+//   - body → unchanged, written to <folder>/SKILL.md
+//
+// The original `<name>.md` is renamed to `<name>.md.bak` (kept on disk for
+// rollback). The bak is filtered out by isLoadableSkillFile so the dashboard
+// won't show it twice.
+
+import { renameSync } from 'node:fs';
+
+export interface MigrationResult {
+  ok: boolean;
+  /** Path to the new SKILL.md created. Undefined when ok=false. */
+  newSkillPath?: string;
+  /** Path the original .md was moved to (.bak). Undefined when ok=false. */
+  backupPath?: string;
+  /** Set when ok=false — what went wrong. */
+  error?: string;
+  /** Set when the loader found nothing to migrate (already folder-form). */
+  alreadyMigrated?: boolean;
+}
+
+/** Migrate one legacy flat skill to Anthropic-compatible folder form.
+ *  Idempotent: a folder-form skill is reported as alreadyMigrated. */
+export function migrateLegacySkill(name: string): MigrationResult {
+  if (!name) return { ok: false, error: 'name required' };
+  const dir = globalSkillsDir();
+  const flat = path.join(dir, name + '.md');
+  const folder = path.join(dir, name);
+
+  // Already folder-form → no-op.
+  if (existsSync(folder) && existsSync(path.join(folder, 'SKILL.md'))) {
+    return { ok: true, alreadyMigrated: true, newSkillPath: path.join(folder, 'SKILL.md') };
+  }
+  // Source file must exist.
+  if (!existsSync(flat)) return { ok: false, error: `legacy skill file not found: ${flat}` };
+  // Folder must NOT exist (collides with the rename target).
+  if (existsSync(folder)) return { ok: false, error: `target folder already exists: ${folder}` };
+
+  // Read + parse the legacy file.
+  let raw: string;
+  try { raw = readFileSync(flat, 'utf-8'); }
+  catch (err) { return { ok: false, error: 'failed to read source: ' + String(err) }; }
+
+  let parsed: ReturnType<typeof matter>;
+  try { parsed = matter(raw); }
+  catch (err) { return { ok: false, error: 'failed to parse YAML in source: ' + String(err) }; }
+
+  const data = parsed.data as Record<string, unknown>;
+  const body = parsed.content || '';
+
+  // Build the new frontmatter:
+  //   - name (always the filename)
+  //   - description (preserved from legacy)
+  //   - title (preserved as display alias)
+  //   - clementine.* — bucket all the legacy-only fields here
+  const newFm: Record<string, unknown> = {
+    name,
+  };
+  if (typeof data.description === 'string' && data.description.trim()) newFm.description = data.description;
+  if (typeof data.title === 'string' && data.title.trim() && data.title !== data.description) {
+    newFm.title = data.title;
+  }
+  const clementine: Record<string, unknown> = {};
+  if (Array.isArray(data.triggers) && data.triggers.length > 0) {
+    clementine.triggers = data.triggers.map(String);
+  }
+  if (Array.isArray(data.toolsUsed) && data.toolsUsed.length > 0) {
+    // Convert informational toolsUsed → enforced tools.allow. Authors can
+    // tighten by editing in Phase B.
+    clementine.tools = { allow: data.toolsUsed.map(String) };
+  }
+  if (typeof data.source === 'string' && data.source.trim()) clementine.source = data.source;
+  if (typeof data.useCount === 'number') clementine.useCount = data.useCount;
+  if (typeof data.lastUsed === 'string') clementine.lastUsed = data.lastUsed;
+  if (typeof data.createdAt === 'string') clementine.createdAt = data.createdAt;
+  if (typeof data.updatedAt === 'string') clementine.updatedAt = data.updatedAt;
+  // Stamp the migration provenance so future tooling can see where this
+  // came from.
+  clementine.migratedFrom = path.basename(flat);
+  clementine.migratedAt = new Date().toISOString();
+  clementine.version = 1;
+
+  if (Object.keys(clementine).length > 0) newFm.clementine = clementine;
+
+  // Serialize: gray-matter handles YAML output. matter.stringify takes
+  // (content, data) → returns the full file with frontmatter.
+  const newContent = matter.stringify(body.startsWith('\n') ? body : '\n' + body, newFm);
+
+  // Create the folder + write SKILL.md.
+  try {
+    mkdirSync(folder, { recursive: true });
+    writeFileSync(path.join(folder, 'SKILL.md'), newContent);
+  } catch (err) {
+    return { ok: false, error: 'failed to write new SKILL.md: ' + String(err) };
+  }
+
+  // Move the original to .bak so the loader stops surfacing it. We use
+  // <name>.md.bak which isLoadableSkillFile already filters out.
+  const backupPath = flat + '.bak';
+  try {
+    renameSync(flat, backupPath);
+  } catch (err) {
+    // Roll back the folder we just created so we don't leave the user in
+    // a half-migrated state with both shapes for the same name.
+    try {
+      const fs = require('node:fs') as typeof import('node:fs');
+      fs.unlinkSync(path.join(folder, 'SKILL.md'));
+      fs.rmdirSync(folder);
+    } catch { /* best-effort */ }
+    return { ok: false, error: 'failed to rename original to .bak: ' + String(err) };
+  }
+
+  return {
+    ok: true,
+    newSkillPath: path.join(folder, 'SKILL.md'),
+    backupPath,
+  };
+}
+
+/** Migrate every legacy skill in the global pool. Returns per-skill
+ *  results so the dashboard can render a summary banner. */
+export function migrateAllLegacySkills(): { migrated: MigrationResult[]; skipped: MigrationResult[] } {
+  // Walk the dir directly so we don't trigger a full parse + validation.
+  const dir = globalSkillsDir();
+  const migrated: MigrationResult[] = [];
+  const skipped: MigrationResult[] = [];
+  if (!existsSync(dir)) return { migrated, skipped };
+  let entries: string[];
+  try { entries = readdirSync(dir); }
+  catch { return { migrated, skipped }; }
+
+  for (const entry of entries) {
+    if (!isLoadableSkillFile(entry)) continue;
+    const name = entry.replace(/\.md$/, '');
+    // Quickly check it's actually legacy — avoid migrating an Anthropic-
+    // form flat file that the user explicitly authored without a folder.
+    const filePath = path.join(dir, entry);
+    let isLegacy = false;
+    try {
+      const raw = readFileSync(filePath, 'utf-8');
+      const data = matter(raw).data as Record<string, unknown>;
+      isLegacy = ['title', 'triggers', 'toolsUsed', 'useCount', 'source'].some((k) => k in data);
+    } catch { /* leave isLegacy=false */ }
+    if (!isLegacy) {
+      skipped.push({ ok: true, alreadyMigrated: true, newSkillPath: filePath });
+      continue;
+    }
+    migrated.push(migrateLegacySkill(name));
+  }
+  return { migrated, skipped };
 }
 
 /** Diagnostics for the dashboard — expose where the loader looked. */
