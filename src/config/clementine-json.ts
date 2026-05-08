@@ -36,6 +36,28 @@ export const clementineJsonSchema = z.object({
     responseStyle: z.enum(['concise', 'balanced', 'detailed']).optional(),
     progressVisibility: z.enum(['quiet', 'normal', 'detailed']).optional(),
     autonomy: z.enum(['ask_first', 'balanced', 'act_when_safe']).optional(),
+    /**
+     * Dashboard-managed profile for the main agent (Clementine herself).
+     * Mirrors the per-agent edit surface so Tasks → Team can edit her
+     * persona, tools, and limits without forcing users into Settings or
+     * env files. Every field is optional — absent fields fall through to
+     * env / compiled defaults via computeEffectiveConfig.
+     */
+    profile: z.object({
+      systemPrompt: z.string().optional(),
+      model: z.string().optional(),
+      allowedTools: z.array(z.string()).optional(),
+      allowedProjects: z.array(z.string()).optional(),
+      allowedUsers: z.array(z.string()).optional(),
+      channels: z.array(z.string()).optional(),
+      budgetMonthlyCents: z.number().nonnegative().optional(),
+      goalSlugs: z.array(z.string()).optional(),
+      sendPolicy: z.object({
+        maxDailyEmails: z.number().nonnegative().optional(),
+        requiresApproval: z.enum(['none', 'first-in-sequence', 'all']).optional(),
+        businessHoursOnly: z.boolean().optional(),
+      }).optional(),
+    }).optional(),
   }).optional(),
   models: z.object({
     default: z.string().optional(),

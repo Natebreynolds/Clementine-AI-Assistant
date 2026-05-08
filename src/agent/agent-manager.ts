@@ -356,6 +356,7 @@ export class AgentManager {
     if (config.allowedTools?.length) frontmatter.allowedTools = config.allowedTools;
     if (config.allowedUsers?.length) frontmatter.allowedUsers = config.allowedUsers;
     if (config.project) frontmatter.project = config.project;
+    if (config.projects?.length) frontmatter.projects = config.projects;
     if (config.discordToken) {
       storeAgentSecret(slug, 'DISCORD_TOKEN', config.discordToken);
       frontmatter.discordToken = 'keychain';
@@ -459,6 +460,10 @@ export class AgentManager {
     if (changes.allowedTools !== undefined) meta.allowedTools = changes.allowedTools;
     if (changes.allowedUsers !== undefined) meta.allowedUsers = changes.allowedUsers;
     if (changes.project !== undefined) meta.project = changes.project;
+    if (changes.projects !== undefined) {
+      // Empty array clears the field; non-empty array replaces it.
+      meta.projects = changes.projects.length ? changes.projects : undefined;
+    }
     if (changes.discordToken !== undefined) {
       if (changes.discordToken) {
         storeAgentSecret(slug, 'DISCORD_TOKEN', changes.discordToken);
