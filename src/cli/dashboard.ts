@@ -4139,6 +4139,10 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
 
       // Parse the agent's draft if present; on any parse error fall back to the
       // single-step stub so the user lands in the editor with something usable.
+      // ── KEY FIX (1.18.75): forward EVERY step-kind body the agent produces.
+      // Previously this parser dropped mcp/cli/channel/transform/conditional/loop
+      // configs, leaving the user with prompt-only stubs and forcing them to
+      // rebuild every Slack-send / shell-cmd / branch by hand.
       let steps: Array<Record<string, unknown>> | null = null;
       if (body.draftYaml && typeof body.draftYaml === 'string') {
         try {
@@ -4149,16 +4153,33 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
               const dependsOn = Array.isArray(r.dependsOn)
                 ? r.dependsOn.map(String)
                 : (typeof r.dependsOn === 'string' ? r.dependsOn.split(',').map(s => s.trim()).filter(Boolean) : []);
-              return {
+              const kind = typeof r.kind === 'string' ? r.kind : 'prompt';
+              const step: Record<string, unknown> = {
                 id: String(id),
-                prompt: String(r.prompt ?? ''),
                 dependsOn,
                 tier: typeof r.tier === 'number' ? r.tier : 1,
                 maxTurns: typeof r.maxTurns === 'number' ? r.maxTurns : 15,
-                ...(typeof r.model === 'string' ? { model: r.model } : {}),
-                ...(typeof r.workDir === 'string' ? { workDir: r.workDir } : {}),
-                ...(typeof r.kind === 'string' && r.kind !== 'prompt' ? { kind: r.kind } : {}),
               };
+              if (kind !== 'prompt') step.kind = kind;
+              if (typeof r.model === 'string') step.model = r.model;
+              if (typeof r.workDir === 'string') step.workDir = r.workDir;
+              // Prompt body — present on prompt steps and optionally on others.
+              if (r.prompt != null) step.prompt = String(r.prompt);
+              else if (kind === 'prompt') step.prompt = '';
+              // Non-prompt step bodies. We forward them as-is when shaped like
+              // an object; the validator on save will catch missing required
+              // sub-fields and surface a structured error to the chat UI.
+              const passThrough = (key: string) => {
+                const v = r[key];
+                if (v && typeof v === 'object' && !Array.isArray(v)) step[key] = v;
+              };
+              passThrough('mcp');
+              passThrough('cli');
+              passThrough('channel');
+              passThrough('transform');
+              passThrough('conditional');
+              passThrough('loop');
+              return step;
             }).filter(s => s.id);
             if (steps.length === 0) steps = null;
           }
@@ -6422,7 +6443,39 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
       }
       jobs.splice(idx, 1);
       writeCronFileAt(cronFile, parsed, jobs);
-      res.json({ ok: true, message: `Deleted cron job: ${jobName}` });
+
+      // Cascade cleanup unless explicitly opted out (?purge=false). Storing the
+      // job name's safe filename form once — same sanitization the run-log and
+      // trace writers use, so we hit the right files.
+      const purge = String(req.query.purge ?? 'true') !== 'false';
+      const purged: string[] = [];
+      if (purge) {
+        const safe = bareJobName.replace(/[^a-zA-Z0-9_-]/g, '_');
+        const runLog = path.join(BASE_DIR, 'cron', 'runs', `${safe}.jsonl`);
+        try {
+          if (existsSync(runLog)) { unlinkSync(runLog); purged.push('runs.jsonl'); }
+        } catch { /* non-fatal */ }
+        try {
+          const traceDir = path.join(BASE_DIR, 'cron', 'traces');
+          if (existsSync(traceDir)) {
+            const traceFiles = readdirSync(traceDir).filter(f => f.startsWith(`${safe}_`) && f.endsWith('.json'));
+            for (const f of traceFiles) {
+              try { unlinkSync(path.join(traceDir, f)); } catch { /* skip */ }
+            }
+            if (traceFiles.length > 0) purged.push(`${traceFiles.length} trace${traceFiles.length === 1 ? '' : 's'}`);
+          }
+        } catch { /* non-fatal */ }
+        try {
+          const uploadsDir = path.join(BASE_DIR, 'uploads', `cron-${safe}`);
+          if (existsSync(uploadsDir)) { rmSync(uploadsDir, { recursive: true, force: true }); purged.push('attachments'); }
+        } catch { /* non-fatal */ }
+      }
+
+      // Notify other dashboard tabs so they drop the card without polling.
+      try { broadcastEvent({ type: 'cron_deleted', data: { job: bareJobName, purged } }); } catch { /* non-fatal */ }
+
+      const purgeNote = purged.length > 0 ? ` (purged: ${purged.join(', ')})` : '';
+      res.json({ ok: true, message: `Deleted cron job: ${jobName}${purgeNote}`, purged });
     } catch (err) {
       res.status(500).json({ error: String(err) });
     }
@@ -16275,7 +16328,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
             apiFetch('/api/routines/' + encodeURIComponent(id) + '/toggle', { method: 'POST' })
               .then(function(r){ return r.json(); })
               .then(function(){ R.refreshList(); })
-              .catch(function(err){ alert('Toggle failed: ' + err); });
+              .catch(function(err){ toast('Toggle failed: ' + err, 'error'); });
           },
           run: function(id, approvedSideEffects) {
             apiFetch('/api/routines/' + encodeURIComponent(id) + '/run', {
@@ -16291,19 +16344,19 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
               }
               return r.json().then(function(j){
                 if (j.ok) R.flash('Triggered.');
-                else alert('Run failed: ' + (j.error || 'unknown'));
+                else toast('Run failed: ' + (j.error || 'unknown'), 'error');
               });
-            }).catch(function(err){ alert('Run failed: ' + err); });
+            }).catch(function(err){ toast('Run failed: ' + err, 'error'); });
           },
           // ── editor ──────────────────────────────────────────────────
           openEditor: function(id) {
             apiFetch('/api/routines/' + encodeURIComponent(id))
               .then(function(r){ return r.json(); })
               .then(function(data){
-                if (!data || !data.routine) { alert('Failed to load workflow'); return; }
+                if (!data || !data.routine) { toast('Failed to load workflow', 'error'); return; }
                 R.state.editing = { id: data.id, routine: data.routine, dirty: false, validation: data.validation };
                 R.showEditor();
-              }).catch(function(err){ alert('Open failed: ' + err); });
+              }).catch(function(err){ toast('Open failed: ' + err, 'error'); });
           },
           showEditor: function() {
             document.getElementById('routines-list-pane').style.display = 'none';
@@ -16555,7 +16608,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
           },
           removeStep: function(idx) {
             if (!R.state.editing) return;
-            if (R.state.editing.routine.steps.length <= 1) { alert('A workflow must have at least one step.'); return; }
+            if (R.state.editing.routine.steps.length <= 1) { toast('A workflow must have at least one step.', 'error'); return; }
             if (!confirm('Remove this step?')) return;
             var removed = R.state.editing.routine.steps.splice(idx, 1)[0];
             // Strip lingering dependsOn references.
@@ -16656,7 +16709,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
                 (d.steps || []).forEach(function(s){ lines.push('• ' + s.description + (s.warnings.length ? '\\n   ⚠ ' + s.warnings.join('; ') : '')); });
                 if (d.notes && d.notes.length) lines.push('\\n' + d.notes.join('\\n'));
                 alert(lines.join('\\n'));
-              }).catch(function(err){ alert('Dry-run failed: ' + err); });
+              }).catch(function(err){ toast('Dry-run failed: ' + err, 'error'); });
           },
           testCurrent: function() {
             if (!R.state.editing) return;
@@ -16675,9 +16728,9 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
             apiFetch('/api/routines/' + encodeURIComponent(R.state.editing.id), { method: 'DELETE' })
               .then(function(r){ return r.json(); })
               .then(function(j){
-                if (j.ok) { R.state.editing = null; R.closeEditor(); R.refreshList(); }
-                else alert('Delete failed: ' + (j.error || 'unknown'));
-              }).catch(function(err){ alert('Delete error: ' + err); });
+                if (j.ok) { R.state.editing = null; R.closeEditor(); R.refreshList(); toast('Deleted.', 'success'); }
+                else toast('Delete failed: ' + (j.error || 'unknown'), 'error');
+              }).catch(function(err){ toast('Delete error: ' + err, 'error'); });
           },
           setStatus: function(msg) {
             var el = document.getElementById('re-status');
@@ -16732,7 +16785,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
           },
           submitCreate: function() {
             var name = document.getElementById('routines-create-name').value.trim();
-            if (!name) { alert('Name is required'); return; }
+            if (!name) { toast('Name is required', 'error'); document.getElementById('routines-create-name').focus(); return; }
             var body = {
               name: name,
               description: document.getElementById('routines-create-description').value.trim(),
@@ -16745,11 +16798,12 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
               body: JSON.stringify(body)
             }).then(function(r){ return r.json().then(function(j){ return { ok: r.ok, body: j }; }); })
               .then(function(res){
-                if (!res.ok) { alert('Create failed: ' + (res.body.error || 'unknown')); return; }
+                if (!res.ok) { toast('Create failed: ' + (res.body.error || 'unknown'), 'error'); return; }
                 R.closeCreate();
                 R.refreshList();
                 R.openEditor(res.body.id);
-              }).catch(function(err){ alert('Create error: ' + err); });
+                toast('Workflow created.', 'success');
+              }).catch(function(err){ toast('Create error: ' + err, 'error'); });
           },
           // ── chat-first builder ──────────────────────────────────────
           // Multi-turn conversation that asks clarifying questions and
@@ -17006,14 +17060,15 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
               .then(function(res){
                 if (btn) { btn.textContent = 'Save workflow'; btn.disabled = false; }
                 if (!res.ok) {
-                  alert('Save failed: ' + (res.body && res.body.error || 'unknown'));
+                  toast('Save failed: ' + (res.body && res.body.error || 'unknown'), 'error');
                   return;
                 }
+                toast('Workflow saved.', 'success');
                 R.closeChat();
                 if (res.body && res.body.id) R.openEditor(res.body.id);
               }).catch(function(err){
                 if (btn) { btn.textContent = 'Save workflow'; btn.disabled = false; }
-                alert('Save failed: ' + err);
+                toast('Save failed: ' + err, 'error');
               });
           },
           // ── helpers ─────────────────────────────────────────────────
@@ -19803,7 +19858,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
           <div class="cap-section">
             <label class="cap-section-label">Tags</label>
             <div class="cap-picker-chips" id="cron-tags-chips"></div>
-            <input type="text" class="cap-tag-input" id="cron-tags-input" placeholder="Type a tag and press Enter (e.g. morning, ops)" onkeydown="handleTagInputKeydown(event)">
+            <input type="text" class="cap-tag-input" id="cron-tags-input" placeholder="Type a tag and press Enter, Tab, or comma (e.g. morning, ops)" onkeydown="handleTagInputKeydown(event)" onblur="handleTagInputBlur()">
           </div>
         </div>
 
@@ -24325,8 +24380,24 @@ function toggleAllowedToolsPanel() {
 }
 
 function handleTagInputKeydown(event) {
-  if (event.key !== 'Enter' && event.key !== ',') return;
+  // Accept Enter, Tab, and comma as commit keys. Tab still moves focus
+  // afterward when the field is empty (no preventDefault). On-blur
+  // commit is handled by handleTagInputBlur below.
+  if (event.key !== 'Enter' && event.key !== ',' && event.key !== 'Tab') return;
+  var inp = document.getElementById('cron-tags-input');
+  if (!inp) return;
+  var val = inp.value.trim().replace(/^#+/, '');
+  if (!val) return;  // Tab on empty input → let it move focus naturally
   event.preventDefault();
+  if (_cronTags.indexOf(val) === -1) {
+    _cronTags.push(val);
+    renderTagsPickerChips();
+  }
+  inp.value = '';
+}
+
+function handleTagInputBlur() {
+  // Catch tags the user typed but forgot to commit before clicking elsewhere.
   var inp = document.getElementById('cron-tags-input');
   if (!inp) return;
   var val = inp.value.trim().replace(/^#+/, '');
@@ -24522,6 +24593,9 @@ function openCreateCronModal(agentSlug) {
   switchCronTab('configure');
   onPredictableChange();
   document.getElementById('cron-modal').classList.add('show');
+  // Snapshot AFTER all defaults are populated so an immediate close with no
+  // edits doesn't trigger the "discard changes?" prompt.
+  setTimeout(captureCronModalSnapshot, 0);
 }
 
 function openEditCronModal(jobName) {
@@ -24583,6 +24657,7 @@ function openEditCronModal(jobName) {
   if (previewBtn) previewBtn.removeAttribute('disabled');
   switchCronTab('configure');
   document.getElementById('cron-modal').classList.add('show');
+  setTimeout(captureCronModalSnapshot, 0);
 }
 
 /**
@@ -24717,10 +24792,68 @@ function renderCronPreview(d) {
   return html;
 }
 
-function closeCronModal() {
+// Snapshot of the form values at the moment the modal opened. closeCronModal
+// compares against this and prompts the user before discarding edits.
+var _cronModalSnapshot = null;
+
+function captureCronModalSnapshot() {
+  // String concatenation is enough for a dirty check; we don't need the
+  // structured object back. Order must match restoreCheck below.
+  function v(id) { var el = document.getElementById(id); return el ? (el.value || '') : ''; }
+  _cronModalSnapshot = [
+    v('cron-name'),
+    v('cron-schedule'),
+    v('cron-prompt'),
+    v('cron-context'),
+    v('cron-tier'),
+    v('cron-mode'),
+    v('cron-maxhours'),
+    v('cron-max-retries'),
+    v('cron-after'),
+    v('cron-workdir'),
+    v('cron-allowed-tools'),
+    v('cron-category'),
+    (document.getElementById('cron-predictable') || {}).checked ? '1' : '0',
+    JSON.stringify(_cronSelectedSkills || []),
+    JSON.stringify(_cronSelectedMcp || []),
+    JSON.stringify(_cronTags || []),
+    String((_pendingAttachments || []).length),
+  ].join('\\u0001');
+}
+
+function isCronModalDirty() {
+  if (_cronModalSnapshot === null) return false;
+  function v(id) { var el = document.getElementById(id); return el ? (el.value || '') : ''; }
+  var current = [
+    v('cron-name'),
+    v('cron-schedule'),
+    v('cron-prompt'),
+    v('cron-context'),
+    v('cron-tier'),
+    v('cron-mode'),
+    v('cron-maxhours'),
+    v('cron-max-retries'),
+    v('cron-after'),
+    v('cron-workdir'),
+    v('cron-allowed-tools'),
+    v('cron-category'),
+    (document.getElementById('cron-predictable') || {}).checked ? '1' : '0',
+    JSON.stringify(_cronSelectedSkills || []),
+    JSON.stringify(_cronSelectedMcp || []),
+    JSON.stringify(_cronTags || []),
+    String((_pendingAttachments || []).length),
+  ].join('\\u0001');
+  return current !== _cronModalSnapshot;
+}
+
+function closeCronModal(force) {
+  if (force !== true && isCronModalDirty()) {
+    if (!confirm('You have unsaved changes. Discard them?')) return;
+  }
   document.getElementById('cron-modal').classList.remove('show');
   editingCronJob = null;
   _cronPreviewLoadedFor = null;
+  _cronModalSnapshot = null;
   var attachList = document.getElementById('cron-attachments-list');
   if (attachList) attachList.innerHTML = '';
   var bannerHost = document.getElementById('cron-legacy-banner-host');
@@ -24854,10 +24987,29 @@ async function saveCronJob() {
   const allowedTools = parseAllowedToolsRaw();
   const predictable = !!document.getElementById('cron-predictable')?.checked;
 
-  if (!name || !schedule || !prompt) {
-    toast('Please fill in all fields', 'error');
+  // Field-specific validation. Toasting one message per problem is more
+  // actionable than the old "Please fill in all fields" — and we bail before
+  // hitting the API so the user sees the issue without a round-trip.
+  if (!name) { toast('Task name is required', 'error'); document.getElementById('cron-name').focus(); return; }
+  if (!/^[a-z][a-z0-9-]{0,63}$/.test(name)) {
+    toast('Task name must start with a lowercase letter and contain only a–z, 0–9, and hyphens (max 64 chars)', 'error');
+    document.getElementById('cron-name').focus();
     return;
   }
+  if (!editingCronJob && Array.isArray(cronJobsData)) {
+    var dup = cronJobsData.find(function(j) { return String(j.name || '').toLowerCase() === name.toLowerCase(); });
+    if (dup) { toast('A task named "' + name + '" already exists', 'error'); document.getElementById('cron-name').focus(); return; }
+  }
+  if (!schedule) { toast('Schedule is required', 'error'); return; }
+  // Light client-side cron sanity check — server uses real cron-parser.
+  // Catches obvious garbage like "foo bar" without making a round-trip.
+  // Note: the hyphen sits at the END of the character class to avoid being
+  // interpreted as a range. \\\\s in source → \\s in served JS → \s in regex.
+  if (!/^([0-9*/, -]+|@(yearly|annually|monthly|weekly|daily|hourly|reboot))$/i.test(schedule) && schedule.split(/\\s+/).length < 5) {
+    toast('Schedule does not look like a valid cron expression', 'error');
+    return;
+  }
+  if (!prompt) { toast('Prompt is required — tell the agent what to do', 'error'); document.getElementById('cron-prompt').focus(); return; }
 
   const body = {
     name, schedule, tier, prompt, enabled: true,
@@ -24879,12 +25031,18 @@ async function saveCronJob() {
   };
 
   var wasEditing = !!editingCronJob;
+  // Don't celebrate before the round-trip lands. apiJson toasts on its own;
+  // we just check the {ok} flag and bail so the modal doesn't close (and
+  // erase the user's input) on a 400/409/500.
+  var resp;
   if (editingCronJob) {
-    await apiJson('PUT', '/api/cron/' + encodeURIComponent(editingCronJob), body);
+    resp = await apiJson('PUT', '/api/cron/' + encodeURIComponent(editingCronJob), body);
+    if (!resp || resp.ok !== true) return;
     if (_pendingAttachments.length > 0) await uploadPendingAttachments(editingCronJob);
   } else {
     var createBody = _cronAgentContext ? Object.assign({}, body, { agent: _cronAgentContext }) : body;
-    await apiJson('POST', '/api/cron', createBody);
+    resp = await apiJson('POST', '/api/cron', createBody);
+    if (!resp || resp.ok !== true) return;
     var attachJobName = _cronAgentContext ? (_cronAgentContext + ':' + name) : name;
     if (_pendingAttachments.length > 0) await uploadPendingAttachments(attachJobName);
   }
@@ -24894,11 +25052,14 @@ async function saveCronJob() {
   // confirm what they just saved actually runs the way they intended.
   // This is the close-the-loop UX move that makes Predictable Mode visible.
   markCronPreviewDirty();
+  // Re-snapshot now that the form matches what's on disk — prevents the
+  // dirty-guard from firing if the user closes the modal without further edits.
+  captureCronModalSnapshot();
   if (wasEditing) {
     toast('Saved. Showing what will run…', 'success');
     switchCronTab('preview');
   } else {
-    closeCronModal();
+    closeCronModal(true);  // force; we just saved, no dirty prompt
   }
 }
 
@@ -34350,6 +34511,12 @@ try {
       if (evt.type === 'connected') return;
       if (evt.type === 'cron_complete' || evt.type === 'cron_triggered') {
         refreshActivity();
+        if (currentPage === 'build') refreshCron();
+        refreshTeamNav();
+      }
+      // A delete on one tab should drop the card from every open dashboard
+      // without waiting for the next poll. cron_toggled is similar but lighter.
+      if (evt.type === 'cron_deleted' || evt.type === 'cron_toggled') {
         if (currentPage === 'build') refreshCron();
         refreshTeamNav();
       }
