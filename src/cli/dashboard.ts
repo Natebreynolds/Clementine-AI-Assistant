@@ -20033,7 +20033,10 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
           <h4>What it does</h4>
           <p class="cron-section-desc">The instruction the agent receives. Long prompts are fine — drag the corner to resize.</p>
           <div class="form-group">
-            <label class="form-label">Prompt</label>
+            <label class="form-label" style="display:flex;align-items:center;gap:8px">
+              Prompt
+              <a href="#" id="cron-prompt-history-link" onclick="event.preventDefault();openPromptHistory()" style="display:none;font-size:11px;font-weight:normal;color:var(--text-muted);text-decoration:none;border-bottom:1px dotted var(--border)">View prompt history</a>
+            </label>
             <textarea id="cron-prompt" class="cron-prompt-textarea" placeholder="What should the AI do when this task runs?"></textarea>
             <div class="form-hint">The instruction sent to the AI agent when this task fires.</div>
           </div>
@@ -20265,6 +20268,29 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
 </div>
 
 <!-- (legacy standalone Preview modal removed in 1.18.70 — preview now lives as a tab inside the cron modal) -->
+
+<!-- ═══ Prompt History Modal — PRD §11 / 1.18.90 ═══
+     Lists every past prompt revision for the currently-edited task.
+     Each row shows ts + changedBy + a preview, expandable to full
+     content. "Restore" copies the old prompt back into the editor —
+     it does NOT auto-save, so the user reviews + clicks Save Changes
+     to commit. The current draft in the editor is preserved if the
+     user closes without restoring. -->
+<div class="modal-overlay" id="prompt-history-modal">
+  <div class="modal" style="max-width:720px;width:96vw;max-height:88vh;display:flex;flex-direction:column">
+    <div class="modal-header">
+      <h3>Prompt history</h3>
+      <button class="btn-ghost btn-sm" onclick="closePromptHistory()">&times;</button>
+    </div>
+    <div class="modal-body" style="padding:0;flex:1;min-height:0;overflow-y:auto">
+      <div id="prompt-history-list" style="padding:18px"></div>
+    </div>
+    <div class="modal-footer">
+      <span style="flex:1;font-size:11px;color:var(--text-muted)">Restore copies a version into the editor. You still need to click <strong>Save Changes</strong> to commit it.</span>
+      <button onclick="closePromptHistory()">Close</button>
+    </div>
+  </div>
+</div>
 
 <!-- ═══ MCP Server Edit Modal — PRD Phase 2.1 ═══ -->
 <div class="modal-overlay" id="mcp-edit-modal">
@@ -25781,6 +25807,87 @@ async function loadCronPreviewIntoTab(jobName) {
 // Mark the preview as stale (call after save so next tab visit refetches).
 function markCronPreviewDirty() { _cronPreviewLoadedFor = null; }
 
+// ── PRD §11 / 1.18.90: Prompt history viewer ────────────────────────
+// Reads /api/cron/:job/prompt-history (already populated on every PUT
+// since 1.18.x). Each version is the OLD prompt at the moment of a save,
+// so rolling back means picking the version that was AFTER the change
+// you want to undo (or the current saved value if you want the most
+// recent committed state).
+async function openPromptHistory() {
+  if (!editingCronJob) {
+    toast('Save the task first, then prompt history will be available.', 'info');
+    return;
+  }
+  var modal = document.getElementById('prompt-history-modal');
+  var list = document.getElementById('prompt-history-list');
+  if (!modal || !list) return;
+  list.innerHTML = '<div style="padding:24px;color:var(--text-muted);text-align:center">Loading prompt history…</div>';
+  modal.classList.add('show');
+  try {
+    var r = await apiFetch('/api/cron/' + encodeURIComponent(editingCronJob) + '/prompt-history');
+    var d = await r.json();
+    var versions = (d && d.versions) || [];
+    if (versions.length === 0) {
+      list.innerHTML = '<div style="padding:36px 24px;color:var(--text-muted);text-align:center;line-height:1.6">'
+        + '<div style="font-weight:500;color:var(--text-secondary);margin-bottom:8px">No prior prompt versions yet</div>'
+        + '<div style="font-size:12px">A version is recorded each time you save a different prompt. The first edit you make to this task will create version 1.</div>'
+        + '</div>';
+      return;
+    }
+    var html = '<div style="font-size:11px;color:var(--text-muted);margin-bottom:12px">Newest first. Each entry is the prompt as it was BEFORE that save — restoring rolls the editor back to the version that was active before that change landed.</div>';
+    for (var i = 0; i < versions.length; i++) {
+      var v = versions[i];
+      var ts = v.timestamp ? new Date(v.timestamp).toLocaleString() : 'unknown time';
+      var who = v.changedBy || 'dashboard';
+      var prompt = String(v.prompt || '');
+      var preview = prompt.slice(0, 200).replace(/\\s+/g, ' ');
+      var rowId = 'pmt-hist-' + i;
+      var promptB64 = btoa(unescape(encodeURIComponent(prompt))); // safe transport for restore
+      html += '<div style="background:var(--bg-secondary);border:1px solid var(--border);border-radius:8px;padding:14px;margin-bottom:10px">';
+      html += '<div style="display:flex;align-items:center;gap:10px;margin-bottom:8px">';
+      html += '<span style="font-size:11px;font-weight:600;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.04em">v' + esc(v.version || (versions.length - i)) + '</span>';
+      html += '<span style="font-size:12px;color:var(--text-primary)">' + esc(ts) + '</span>';
+      html += '<span style="font-size:11px;color:var(--text-muted)">· by ' + esc(who) + '</span>';
+      html += '<span style="flex:1"></span>';
+      html += '<button class="btn-sm" onclick="document.getElementById(\\x27' + rowId + '\\x27).style.display=document.getElementById(\\x27' + rowId + '\\x27).style.display===\\x27none\\x27?\\x27block\\x27:\\x27none\\x27" style="font-size:11px;padding:3px 8px">Show full</button>';
+      html += '<button class="btn-sm btn-primary" onclick="restorePromptVersion(\\x27' + promptB64 + '\\x27)" style="font-size:11px;padding:3px 10px">Restore</button>';
+      html += '</div>';
+      html += '<div style="font-size:12px;color:var(--text-secondary);line-height:1.5;font-family:\\x27JetBrains Mono\\x27,monospace">' + esc(preview) + (prompt.length > 200 ? '…' : '') + '</div>';
+      html += '<pre id="' + rowId + '" style="display:none;margin-top:10px;font-size:11px;font-family:\\x27JetBrains Mono\\x27,monospace;background:var(--bg-tertiary);border:1px solid var(--border);padding:10px;border-radius:6px;white-space:pre-wrap;word-break:break-word;max-height:280px;overflow-y:auto">' + esc(prompt) + '</pre>';
+      html += '</div>';
+    }
+    list.innerHTML = html;
+  } catch (e) {
+    list.innerHTML = '<div style="padding:24px;color:var(--red)">Failed to load history: ' + esc(String(e)) + '</div>';
+  }
+}
+
+function closePromptHistory() {
+  var modal = document.getElementById('prompt-history-modal');
+  if (modal) modal.classList.remove('show');
+}
+
+// Restore copies the old prompt back into the editor's textarea. Doesn't
+// auto-save — the user must click Save Changes to commit, which keeps the
+// dirty-guard semantics intact and gives them a chance to back out.
+function restorePromptVersion(promptB64) {
+  try {
+    var prompt = decodeURIComponent(escape(atob(promptB64)));
+    var ta = document.getElementById('cron-prompt');
+    if (!ta) return;
+    if (ta.value !== prompt && ta.value.trim() && !confirm('Replace the current prompt with this restored version? Your unsaved edits will be discarded.')) {
+      return;
+    }
+    ta.value = prompt;
+    // Switch to the Prompt tab so the user sees what just changed.
+    if (typeof switchCronConfigTab === 'function') switchCronConfigTab('prompt');
+    closePromptHistory();
+    toast('Prompt restored. Click Save Changes to commit it.', 'info');
+  } catch (e) {
+    toast('Failed to restore: ' + String(e), 'error');
+  }
+}
+
 // PRD Phase 1.3a: inner Configure pane tabs. Sets the data-active-config-tab
 // attribute on #cron-tab-configure; CSS handles section visibility via
 // data-config-tab attributes on each section. JS-light by design.
@@ -26076,6 +26183,9 @@ function openCreateCronModal(agentSlug) {
   if (lastRunBtn) lastRunBtn.setAttribute('disabled', 'disabled');
   var runOnceBtn = document.getElementById('cron-run-once-btn');
   if (runOnceBtn) runOnceBtn.style.display = 'none';
+  // PRD §11 / 1.18.90: prompt history link only meaningful for existing tasks.
+  var historyLinkNew = document.getElementById('cron-prompt-history-link');
+  if (historyLinkNew) historyLinkNew.style.display = 'none';
   var host = document.getElementById('cron-legacy-banner-host');
   if (host) host.innerHTML = '';
   // Reset the "Use a cron expression" link in case it was hidden last time.
@@ -26176,6 +26286,9 @@ function openEditCronModal(jobName) {
   // Show "Run task once" only for saved tasks.
   var runOnceBtnEdit = document.getElementById('cron-run-once-btn');
   if (runOnceBtnEdit) runOnceBtnEdit.style.display = '';
+  // 1.18.90: surface prompt history link for saved tasks.
+  var historyLinkEdit = document.getElementById('cron-prompt-history-link');
+  if (historyLinkEdit) historyLinkEdit.style.display = '';
   // Render the most recent run from the loaded job into the Last run tab so
   // the user sees something the moment they switch to it (rather than a
   // dead empty pane). The pane updates live when Run task once fires.
