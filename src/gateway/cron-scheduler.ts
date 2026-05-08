@@ -1465,7 +1465,11 @@ export class CronScheduler {
             ? classifyTerminalReason(errTerminalReason)
             : classifyError(err);
 
-          this._logRun({
+          // 1.18.87: stamp PRD-canonical failure category. classifyRunFailure
+          // is sync; safe to call inline. Returns null for non-failures, but
+          // we know this branch is the error path so it always returns a
+          // category.
+          const errEntry: CronRunEntry = {
             jobName: job.name,
             startedAt: startedAt.toISOString(),
             finishedAt: finishedAt.toISOString(),
@@ -1475,13 +1479,23 @@ export class CronScheduler {
             errorType,
             terminalReason: errTerminalReason,
             attempt,
+            // 1.18.84/85 fields preserved on the error path so the Run list
+            // can show trigger + open the partial Event log if any.
+            trigger,
+            ...(errCronMetadata?.runId ? { id: errCronMetadata.runId } : {}),
             ...(errCronMetadata?.skillsApplied?.length ? { skillsApplied: errCronMetadata.skillsApplied } : {}),
             ...(errCronMetadata?.skillsMissing?.length ? { skillsMissing: errCronMetadata.skillsMissing } : {}),
             ...(errCronMetadata?.allowedToolsApplied?.length ? { allowedToolsApplied: errCronMetadata.allowedToolsApplied } : {}),
             ...(errCronMetadata?.mcpServersApplied?.length ? { mcpServersApplied: errCronMetadata.mcpServersApplied } : {}),
             advisorApplied,
-    
-          });
+          };
+          // Lazy-import the classifier so it doesn't load on success paths.
+          try {
+            const { classifyRunFailure } = await import('./failure-taxonomy.js');
+            const cat = classifyRunFailure(errEntry);
+            if (cat) errEntry.failureCategory = cat;
+          } catch { /* non-fatal */ }
+          this._logRun(errEntry);
 
           if (isCreditBalanceError(err)) {
             const { block, created } = markBackgroundCreditBlocked(err);

@@ -212,7 +212,7 @@ export async function cmdCronRun(jobName: string): Promise<void> {
   } catch (err) {
     const finishedAt = new Date();
     const trigger = (process.env.CRON_RUN_TRIGGER as CronRunEntry['trigger']) || 'scheduled';
-    runLog.append({
+    const errEntry: CronRunEntry = {
       jobName: job.name,
       startedAt: startedAt.toISOString(),
       finishedAt: finishedAt.toISOString(),
@@ -222,7 +222,14 @@ export async function cmdCronRun(jobName: string): Promise<void> {
       errorType: classifyError(err),
       attempt: 1,
       trigger,
-    });
+    };
+    // 1.18.87: stamp PRD-canonical failure category.
+    try {
+      const { classifyRunFailure } = await import('../gateway/failure-taxonomy.js');
+      const cat = classifyRunFailure(errEntry);
+      if (cat) errEntry.failureCategory = cat;
+    } catch { /* non-fatal */ }
+    runLog.append(errEntry);
     console.error(`Error: ${err}`);
     process.exit(1);
   }
