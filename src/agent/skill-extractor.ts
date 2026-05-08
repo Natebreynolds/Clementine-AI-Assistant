@@ -376,17 +376,60 @@ export interface SkillMatch {
 const skillEmbeddingCache = new Map<string, Float32Array>();
 
 /**
- * Recursively list every .md skill file under `dir`. Returns absolute
+ * Compute the canonical skill slug from a relative path.
+ *
+ * Two layouts are supported:
+ *   - Folder form (Anthropic spec): `<name>/SKILL.md` → `<name>`
+ *     (sibling .md files in that folder are bundled docs, not standalone skills)
+ *   - Flat form (legacy): `<name>.md` → `<name>`
+ *     (auto-generated MCP skills like `auto/discord/send.md` → `auto-discord-send`)
+ *
+ * NOTE: this is the single source of truth for "what slug should this file be
+ * loaded under." Both walkSkillFiles and loadSkillByName route through it so
+ * the dedupe/naming stays consistent.
+ */
+function slugFromRel(relPath: string): string {
+  // Folder form: <a>/<b>/SKILL.md → <a>-<b>
+  if (/(?:^|[\\/])SKILL\.md$/.test(relPath)) {
+    const parts = relPath.replace(/[\\/]SKILL\.md$/, '').split(/[\\/]/);
+    return parts.join('-');
+  }
+  // Flat form: any other .md file
+  return relPath.replace(/\.md$/, '').replace(/[\\/]/g, '-');
+}
+
+/**
+ * Recursively list every skill file under `dir`. Returns absolute
  * paths, relative paths (for dedupe/naming), and an `isAuto` flag set
- * when the file lives under an `auto/` subtree. Used so auto-generated
- * MCP skills under `skills/auto/<server>/<tool>.md` surface in search
- * while user-authored top-level skills win on score tiebreak.
+ * when the file lives under an `auto/` subtree.
+ *
+ * Folder-form skills (`<name>/SKILL.md`) emit ONLY the SKILL.md and do
+ * not recurse — sibling .md files (templates/, reference docs) and
+ * subdirectories (scripts/) are bundled assets, not standalone skills.
+ *
+ * Flat-form skills (`<name>.md`, including auto-generated MCP skills
+ * under `auto/<server>/<tool>.md`) keep the legacy behavior so existing
+ * unmigrated installs don't regress.
  */
 function walkSkillFiles(root: string): Array<{ filePath: string; relPath: string; isAuto: boolean }> {
   const out: Array<{ filePath: string; relPath: string; isAuto: boolean }> = [];
   function walk(dir: string, rel: string): void {
     let entries: import('node:fs').Dirent[];
     try { entries = readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    // Folder-form short-circuit: a sub-directory with a SKILL.md is a bundled
+    // skill folder. Emit just the SKILL.md and skip everything else inside —
+    // bundled docs/scripts are not separate skills.
+    if (rel) {
+      const skillEntry = entries.find(e => e.isFile() && e.name === 'SKILL.md');
+      if (skillEntry) {
+        out.push({
+          filePath: path.join(dir, skillEntry.name),
+          relPath: path.join(rel, skillEntry.name),
+          isAuto: rel.split(path.sep)[0] === 'auto',
+        });
+        return;
+      }
+    }
     for (const ent of entries) {
       const name = ent.name;
       // Skip backup files and hidden files
@@ -450,9 +493,10 @@ export function searchSkills(
     // tiebreak even when both match the query.
     const files = walkSkillFiles(dir);
     for (const { filePath, relPath, isAuto } of files) {
-      // Use relPath (no .md, slashes → dashes) so same-name skills in
-      // different subdirs don't collide in the dedupe set.
-      const name = relPath.replace(/\.md$/, '').replace(/[\\/]/g, '-');
+      // Use slugFromRel so folder-form skills (`<name>/SKILL.md`) get
+      // their canonical name `<name>` and not `<name>-SKILL`. Same dedupe
+      // contract: distinct files cannot share a name.
+      const name = slugFromRel(relPath);
       if (seen.has(name)) continue;
       seen.add(name);
       // Feedback-gated: skip skills that have been repeatedly associated with
@@ -568,17 +612,54 @@ export function loadSkillByName(
   if (opts?.suppressedNames?.has(name)) return null;
 
   for (const dir of dirs) {
+    // Fast path: folder form. `<dir>/<name>/SKILL.md` is the canonical
+    // Anthropic layout post-migration. Try it first so a slug like
+    // `morning-briefing` resolves to `morning-briefing/SKILL.md`.
+    const folderEntry = path.join(dir, name, 'SKILL.md');
+    if (existsSync(folderEntry)) {
+      try {
+        const raw = readFileSync(folderEntry, 'utf-8');
+        const parsed = matter(raw);
+        const fmTools = parsed.data?.clementine?.tools?.allow ?? parsed.data?.toolsUsed ?? [];
+        return {
+          name,
+          title: parsed.data.title ?? parsed.data.name ?? name,
+          content: parsed.content,  // full body — the runtime cap is gone
+          score: 0,
+          toolsUsed: Array.isArray(fmTools) ? fmTools : [],
+          attachments: parsed.data.attachments ?? [],
+          skillDir: dir,
+        };
+      } catch { return null; }
+    }
+    // Fast path: flat form. `<dir>/<name>.md` (legacy + auto-discovery).
+    const flatEntry = path.join(dir, `${name}.md`);
+    if (existsSync(flatEntry)) {
+      try {
+        const raw = readFileSync(flatEntry, 'utf-8');
+        const parsed = matter(raw);
+        return {
+          name,
+          title: parsed.data.title ?? name,
+          content: parsed.content,  // full body — the runtime cap is gone
+          score: 0,
+          toolsUsed: parsed.data.toolsUsed ?? [],
+          attachments: parsed.data.attachments ?? [],
+          skillDir: dir,
+        };
+      } catch { return null; }
+    }
+    // Fallback: walk for nested forms (e.g. `auto/discord/send` slug).
     const files = walkSkillFiles(dir);
     for (const { filePath, relPath } of files) {
-      const slug = relPath.replace(/\.md$/, '').replace(/[\\/]/g, '-');
-      if (slug !== name) continue;
+      if (slugFromRel(relPath) !== name) continue;
       try {
         const raw = readFileSync(filePath, 'utf-8');
         const parsed = matter(raw);
         return {
-          name: slug,
-          title: parsed.data.title ?? slug,
-          content: parsed.content.slice(0, 1500),
+          name,
+          title: parsed.data.title ?? name,
+          content: parsed.content,  // full body — the runtime cap is gone
           score: 0,
           toolsUsed: parsed.data.toolsUsed ?? [],
           attachments: parsed.data.attachments ?? [],
@@ -590,20 +671,37 @@ export function loadSkillByName(
   return null;
 }
 
-/** Record that a skill was used (bump use count). */
+/** Record that a skill was used (bump use count). Handles both flat and
+ *  folder-form skills. For folder form the counter lives under
+ *  `clementine.useCount` (Anthropic-canonical frontmatter keeps top-level
+ *  reserved for `name`/`description`). */
 export function recordSkillUse(skillName: string, agentSlug?: string): void {
   try {
-    // Check agent dir first, then global
     const dirs = agentSlug ? [agentSkillsDir(agentSlug), GLOBAL_SKILLS_DIR] : [GLOBAL_SKILLS_DIR];
     for (const dir of dirs) {
-      const filePath = path.join(dir, `${skillName}.md`);
-      if (!existsSync(filePath)) continue;
-      const raw = readFileSync(filePath, 'utf-8');
-      const parsed = matter(raw);
-      parsed.data.useCount = (parsed.data.useCount ?? 0) + 1;
-      parsed.data.lastUsed = new Date().toISOString();
-      writeFileSync(filePath, matter.stringify(parsed.content, parsed.data));
-      return;
+      // Folder form: <dir>/<skillName>/SKILL.md
+      const folderEntry = path.join(dir, skillName, 'SKILL.md');
+      if (existsSync(folderEntry)) {
+        const raw = readFileSync(folderEntry, 'utf-8');
+        const parsed = matter(raw);
+        parsed.data.clementine = (parsed.data.clementine && typeof parsed.data.clementine === 'object')
+          ? parsed.data.clementine
+          : {};
+        parsed.data.clementine.useCount = (parsed.data.clementine.useCount ?? 0) + 1;
+        parsed.data.clementine.lastUsed = new Date().toISOString();
+        writeFileSync(folderEntry, matter.stringify(parsed.content, parsed.data));
+        return;
+      }
+      // Flat form: <dir>/<skillName>.md
+      const flatEntry = path.join(dir, `${skillName}.md`);
+      if (existsSync(flatEntry)) {
+        const raw = readFileSync(flatEntry, 'utf-8');
+        const parsed = matter(raw);
+        parsed.data.useCount = (parsed.data.useCount ?? 0) + 1;
+        parsed.data.lastUsed = new Date().toISOString();
+        writeFileSync(flatEntry, matter.stringify(parsed.content, parsed.data));
+        return;
+      }
     }
   } catch { /* non-fatal */ }
 }
