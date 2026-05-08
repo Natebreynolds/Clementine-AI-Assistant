@@ -4432,6 +4432,38 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
   //   POST /api/cron/:job/publish    — promote draft to CRON.md
   //   DELETE /api/cron/:job/draft    — discard the draft
   //   GET /api/cron/drafts           — list all drafted task names
+  // ── Skills-First redesign Phase A / 1.18.106: skill catalog (read-only) ─
+  // Two endpoints feed the new Skills page:
+  //   GET /api/skills              — full list with usedByTriggers join
+  //   GET /api/skills/:name        — single skill detail (frontmatter + body)
+  // Phase A is read-only; Phase B adds POST/PUT for editing.
+  app.get('/api/skills', async (_req, res) => {
+    try {
+      const { listSkills } = await import('../agent/skill-store.js');
+      const { parseCronJobs } = await import('../gateway/cron-scheduler.js');
+      const jobs = parseCronJobs();
+      const skills = listSkills({ jobs });
+      res.json({ ok: true, count: skills.length, skills });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: String(err) });
+    }
+  });
+
+  app.get('/api/skills/:name', async (req, res) => {
+    try {
+      const name = req.params.name;
+      if (!name) { res.status(400).json({ ok: false, error: 'name required' }); return; }
+      const { getSkill } = await import('../agent/skill-store.js');
+      const { parseCronJobs } = await import('../gateway/cron-scheduler.js');
+      const jobs = parseCronJobs();
+      const skill = getSkill(name, { jobs });
+      if (!skill) { res.status(404).json({ ok: false, error: `skill "${name}" not found` }); return; }
+      res.json({ ok: true, skill });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: String(err) });
+    }
+  });
+
   app.get('/api/cron/drafts', async (_req, res) => {
     try {
       const { listDraftNames } = await import('../agent/draft-store.js');
