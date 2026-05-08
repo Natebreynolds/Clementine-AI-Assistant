@@ -182,6 +182,12 @@ export class Gateway {
     totalCostUsd?: number;
   };
 
+  /** PRD §10 / 1.18.91: registry of in-flight cron AbortControllers keyed by
+   *  jobName. Lets the dashboard cancel endpoint abort an in-progress run
+   *  without SIGTERMing the whole daemon. Populated/cleaned up by
+   *  handleCronJob. */
+  private cronAbortControllers = new Map<string, AbortController>();
+
   /** Persisted set of channel keys the owner has approved. Loaded lazily. */
   private seenChannels: Set<string> | null = null;
 
@@ -2267,6 +2273,10 @@ export class Gateway {
       cronAc.abort();
       logger.warn({ jobName, wallMs }, 'Cron job hit wall-clock cap — aborting');
     }, wallMs);
+    // PRD §10 / 1.18.91: register so the dashboard cancel endpoint can find
+    // and abort this controller. Last-write-wins if a duplicate fires (the
+    // concurrency lock prevents that for manual runs, but be defensive).
+    this.cronAbortControllers.set(jobName, cronAc);
 
     try {
       logger.info(`Running cron job: ${jobName}${workDir ? ` in ${workDir}` : ''}${agentSlug && agentSlug !== 'clementine' ? ` as ${agentSlug}` : ''}`);
@@ -2328,7 +2338,26 @@ export class Gateway {
     } finally {
       clearTimeout(cronTimer);
       releaseLane();
+      // PRD §10 / 1.18.91: deregister only if we're still the owner (a
+      // theoretical re-entry could have replaced us; don't clobber).
+      if (this.cronAbortControllers.get(jobName) === cronAc) {
+        this.cronAbortControllers.delete(jobName);
+      }
     }
+  }
+
+  /**
+   * PRD §10 / 1.18.91 — cancel an in-flight cron run by name. Returns true if
+   * an AbortController was found and abort() was called, false if nothing was
+   * registered (job wasn't running on this daemon). Safe to call repeatedly.
+   */
+  cancelCronJob(jobName: string, reason = 'cancelled-by-dashboard'): boolean {
+    const ac = this.cronAbortControllers.get(jobName);
+    if (!ac) return false;
+    if (!ac.signal.aborted) {
+      try { ac.abort(reason); } catch { /* ignore */ }
+    }
+    return true;
   }
 
   // ── Team task execution ──────────────────────────────────────────────

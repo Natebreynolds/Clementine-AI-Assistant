@@ -4410,6 +4410,50 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
 
   // ── POST routes (actions) ──────────────────────────────────────
 
+  // PRD §10 / 1.18.91: cancel an in-flight cron run. The daemon runs every
+  // cron job in-process (cron-running.json's `pid` is the daemon's PID — we
+  // can't SIGTERM it without crashing everything else). Instead we look up
+  // the job's AbortController in the gateway registry and abort it; the SDK
+  // path on runAgentCron honors the signal and unwinds cleanly. The
+  // CronScheduler's own catch path then writes the closing CronRunEntry
+  // with status='error' + an "AbortError" message.
+  app.post('/api/cron/run/:job/cancel', async (req, res) => {
+    try {
+      const jobName = req.params.job;
+      if (!jobName) { res.status(400).json({ ok: false, error: 'job required' }); return; }
+      const gw = await getGateway();
+      if (!gw || typeof (gw as { cancelCronJob?: unknown }).cancelCronJob !== 'function') {
+        res.status(503).json({ ok: false, error: 'gateway not initialized — try again in a moment' });
+        return;
+      }
+      const runningFile = path.join(BASE_DIR, 'cron-running.json');
+      let runId: string | undefined;
+      if (existsSync(runningFile)) {
+        try {
+          const entries = JSON.parse(readFileSync(runningFile, 'utf-8')) as Array<{ jobName?: string; runId?: string }>;
+          const match = Array.isArray(entries) ? entries.find((e) => String(e.jobName ?? '').toLowerCase() === jobName.toLowerCase()) : null;
+          if (match?.runId) runId = match.runId;
+        } catch { /* non-fatal — cancel can still proceed without runId */ }
+      }
+      const aborted = (gw as { cancelCronJob: (n: string, r?: string) => boolean }).cancelCronJob(jobName, 'cancelled-by-dashboard');
+      if (!aborted) {
+        res.status(404).json({ ok: false, error: `Job "${jobName}" is not running on this daemon` });
+        return;
+      }
+      // Broadcast so other tabs drop the running card without polling.
+      try {
+        broadcastEvent({ type: 'cron_cancelled', data: { job: jobName, runId } });
+      } catch { /* non-fatal */ }
+      res.json({
+        ok: true,
+        message: `Cancel signal sent to "${jobName}". The runner will close the run within a few seconds.`,
+        runId,
+      });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: String(err) });
+    }
+  });
+
   app.post('/api/cron/run/:job', (req, res) => {
     const jobName = req.params.job;
     try {
@@ -22498,6 +22542,24 @@ async function toggleCronJob(name) {
   } catch(e) { toast('Failed to toggle: ' + e, 'error'); }
 }
 
+// PRD §10 / 1.18.91: SIGTERM the in-flight runner for this cron job. The
+// daemon endpoint reads PID from cron-running.json (already written by
+// CronScheduler). The runner's signal handler closes the run gracefully —
+// the SSE cron_cancelled broadcast will refresh the card.
+async function cancelCronRun(name) {
+  if (!confirm('Cancel the in-flight run for "' + name + '"? The runner will stop within a few seconds.')) return;
+  try {
+    var r = await apiFetch('/api/cron/run/' + encodeURIComponent(name) + '/cancel', { method: 'POST' });
+    var d = await r.json();
+    if (!r.ok || d.ok === false) {
+      toast(d.error || ('Cancel failed (HTTP ' + r.status + ')'), 'error');
+      return;
+    }
+    toast(d.message || ('Cancel signal sent to ' + name), 'success');
+    setTimeout(refreshCron, 800);
+  } catch(e) { toast('Failed to cancel: ' + e, 'error'); }
+}
+
 async function toggleScheduledWorkflow(id) {
   try {
     var r = await apiFetch('/api/builder/workflows/' + encodeURIComponent(id));
@@ -23479,6 +23541,14 @@ function renderScheduledTaskCard(task) {
   badges += '<span class="badge ' + (enabled ? 'badge-green' : 'badge-gray') + '">' + (enabled ? 'Enabled' : 'Disabled') + '</span>';
   badges += '<span class="badge ' + (task.health === 'broken' || task.health === 'failed' ? 'badge-yellow' : 'badge-gray') + '">' + esc(task.healthLabel || task.health) + '</span>';
   var safeName = jsStr(task.name);
+  // PRD §10 / 1.18.91: when a task is mid-flight, Run Now is meaningless and
+  // would race against the concurrency lock; replace it with a Cancel button
+  // that calls /api/cron/run/:job/cancel (SIGTERMs the runner via the PID
+  // recorded in cron-running.json).
+  var isRunning = task.health === 'running';
+  var runOrCancelBtn = isRunning
+    ? '<button class="btn-sm secondary btn-danger" onclick="cancelCronRun(\\x27' + safeName + '\\x27)" title="Stop this in-flight run (SIGTERM)">Cancel</button>'
+    : '<button class="btn-sm secondary btn-success" onclick="apiPost(\\x27/api/cron/run/' + encodeURIComponent(task.name) + '\\x27)" title="Run this task once now">Run Now</button>';
   return '<div class="' + cardCls + '" style="' + style + '">'
     + '<div class="task-card-header"><strong>' + esc(task.displayName || task.name) + '</strong>'
     + '<label class="toggle-switch"><input type="checkbox"' + (enabled ? ' checked' : '') + ' onchange="toggleCronJob(\\x27' + safeName + '\\x27)"><span class="toggle-slider"></span></label></div>'
@@ -23490,7 +23560,7 @@ function renderScheduledTaskCard(task) {
     + '<div class="task-card-badges">' + badges + '</div>'
     + '<div class="task-card-actions">'
     + '<button class="btn-sm primary" onclick="openEditCronModal(\\x27' + safeName + '\\x27)" title="Edit task" style="background:var(--bg-tertiary);border:1px solid var(--border);color:var(--text-primary)">Edit</button>'
-    + '<button class="btn-sm secondary btn-success" onclick="apiPost(\\x27/api/cron/run/' + encodeURIComponent(task.name) + '\\x27)" title="Run this task once now">Run Now</button>'
+    + runOrCancelBtn
     + '<button class="btn-sm secondary" onclick="openCronPreview(\\x27' + safeName + '\\x27)" title="See exactly what will run">Preview</button>'
     + '<button class="btn-sm secondary" data-trace-job="' + esc(task.name) + '" title="View execution trace">Trace</button>'
     + '<button class="btn-sm secondary btn-danger" onclick="confirmDeleteCron(\\x27' + safeName + '\\x27)" title="Delete task">Del</button>'
