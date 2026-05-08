@@ -466,7 +466,67 @@ export type TerminalReason =
   | 'stop_hook_prevented' | 'hook_stopped' | 'tool_deferred'
   | 'max_turns' | 'completed';
 
+/**
+ * PRD §6 Event entity — one row per significant SDK message during a Run.
+ * Stored as JSONL at ~/.clementine/events/<run_id>.jsonl. Powers the new
+ * Run detail waterfall (Phase 4b) and the metrics dashboards (Phase 6).
+ *
+ * Designed to fit the SDK's typed message stream + the 12 hook events. Most
+ * fields are optional because each event kind populates a different subset.
+ */
+export interface RunEvent {
+  /** Run this event belongs to — links back to CronRunEntry.id. */
+  runId: string;
+  /** SDK session id once known (system/init lands first; everything else carries it). */
+  sessionId?: string;
+  /** Monotonic sequence within the run. Used to order events that share a ts. */
+  seq: number;
+  /** ISO timestamp when the event was captured. */
+  ts: string;
+  /** Event kind — semantic grouping for the dashboard's span types. */
+  kind:
+    | 'session_start'
+    | 'session_end'
+    | 'llm_text'
+    | 'thinking'
+    | 'tool_call'
+    | 'tool_result'
+    | 'subagent_start'
+    | 'subagent_stop'
+    | 'rate_limit'
+    | 'hook'
+    | 'error';
+  /** Hook event name when kind='hook' (PreToolUse / PostToolUse / etc.). */
+  hookEventName?: string;
+  /** Tool name when kind='tool_call' or 'tool_result'. Includes mcp__ prefix. */
+  toolName?: string;
+  /** SDK-assigned tool_use id — pairs tool_call with its tool_result. */
+  toolUseId?: string;
+  /** For nested tool calls (parallel sub-spawning). */
+  parentToolUseId?: string;
+  /** Tool input as JSON, truncated at 8KB. */
+  toolInput?: unknown;
+  /** Tool result as JSON or string, truncated at 16KB. */
+  toolResult?: unknown;
+  /** Tool error message when result.is_error or PostToolUseFailure. */
+  toolError?: string;
+  /** Assistant text block content when kind='llm_text'. */
+  text?: string;
+  /** ThinkingBlock content when kind='thinking'. */
+  thinking?: string;
+  /** Cost so far for this run when kind='session_end'. */
+  costUsd?: number;
+  /** Stop reason from ResultMessage when kind='session_end'. */
+  stopReason?: string;
+  /** Subagent id when kind='subagent_*'. */
+  agentId?: string;
+}
+
 export interface CronRunEntry {
+  /** PRD §6 / 1.18.85: stable run UUID. Optional only because pre-1.18.85
+   *  entries don't have it; new entries always do. The Event store keys
+   *  off this id. */
+  id?: string;
   jobName: string;
   startedAt: string;
   /** Optional: in-progress runs are appended with status='running' before the

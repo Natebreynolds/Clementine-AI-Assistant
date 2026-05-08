@@ -1377,6 +1377,8 @@ export class CronScheduler {
             terminalReason,
             // 1.18.84: persist the actual trigger source for the Run list filter.
             trigger,
+            // 1.18.85: stable UUID linking this run to its Event store entries.
+            ...(cronMetadata?.runId ? { id: cronMetadata.runId } : {}),
             // Trick capability metadata — surfaced by the dashboard's
             // "ran with: …" line. Omit empty arrays to keep the JSONL light.
             ...(cronMetadata?.skillsApplied?.length ? { skillsApplied: cronMetadata.skillsApplied } : {}),

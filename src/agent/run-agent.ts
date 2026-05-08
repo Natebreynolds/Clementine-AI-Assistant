@@ -23,8 +23,11 @@
  */
 
 import path from 'node:path';
+import { randomUUID } from 'node:crypto';
 import { query, type AgentDefinition, type SDKAssistantMessage, type SDKResultMessage } from '@anthropic-ai/claude-agent-sdk';
 import pino from 'pino';
+import { EventLog } from '../gateway/event-log.js';
+import type { RunEvent } from '../types.js';
 
 /**
  * Module-level cache of MCP server statuses from the most recent SDK
@@ -58,6 +61,25 @@ export function recordMcpStatusFromSystemInit(rawMcpServers: unknown): void {
     servers.push({ name: e.name, status: typeof e.status === 'string' ? e.status : 'unknown' });
   }
   _lastMcpStatusSnapshot = { servers, updatedAt: new Date().toISOString() };
+}
+
+/**
+ * Truncate a value for the Event store so a single huge tool input/output
+ * doesn't blow out the JSONL line. Object/array shapes are JSON-stringified
+ * and capped; primitive strings are sliced; everything else is returned as-is.
+ */
+function truncateForLog(value: unknown, maxBytes: number): unknown {
+  if (value == null) return value;
+  if (typeof value === 'string') {
+    return value.length > maxBytes ? value.slice(0, maxBytes) + '...[truncated]' : value;
+  }
+  try {
+    const json = JSON.stringify(value);
+    if (json.length <= maxBytes) return value;
+    return { _truncated: true, preview: json.slice(0, maxBytes) + '...[truncated]', _bytes: json.length };
+  } catch {
+    return { _unstringifiable: true };
+  }
 }
 
 /** Drop one server from the cache so the next query repopulates it. */
@@ -216,6 +238,11 @@ export interface RunAgentResult {
     cache_read_input_tokens?: number;
     cache_creation_input_tokens?: number;
   };
+
+  /** PRD §6 / 1.18.85: stable run UUID. The Event store keys off this id;
+   *  callers (cron-scheduler, cron CLI) stamp it on CronRunEntry so the
+   *  Run detail page can join run row → events. */
+  runId: string;
 }
 
 // Last-resort fallbacks for callers that pass NO maxBudgetUsd. The
@@ -388,6 +415,23 @@ export async function runAgent(prompt: string, opts: RunAgentOptions): Promise<R
     allowedToolCount: allowedTools.length,
   }, 'runAgent: starting query');
 
+  // PRD §6 / 1.18.85: path A in-process tap. One Event row per significant
+  // SDK message, written to ~/.clementine/events/<runId>.jsonl. The Run
+  // detail page (Phase 4b) reads from this file. EventLog.append never
+  // throws back to the caller — telemetry is best-effort.
+  const runId = randomUUID();
+  const eventLog = new EventLog();
+  let eventSeq = 0;
+  const writeEvent = (e: Omit<RunEvent, 'runId' | 'seq'>): void => {
+    try {
+      eventLog.append({
+        ...e,
+        runId,
+        seq: eventSeq++,
+      } as RunEvent);
+    } catch { /* never block */ }
+  };
+
   let finalText = '';
   let sessionId = '';
   let totalCostUsd = 0;
@@ -410,25 +454,78 @@ export async function runAgent(prompt: string, opts: RunAgentOptions): Promise<R
         try { recordMcpStatusFromSystemInit(mcpServersRaw); }
         catch { /* non-fatal */ }
       }
-      logger.debug({ sessionKey: opts.sessionKey, sdkSessionId: sessionId }, 'runAgent: SDK session initialized');
+      // PRD Phase 4a / 1.18.85: write the session_start Event row.
+      writeEvent({ kind: 'session_start', ts: new Date().toISOString(), sessionId });
+      logger.debug({ sessionKey: opts.sessionKey, sdkSessionId: sessionId, runId }, 'runAgent: SDK session initialized');
       continue;
     }
 
     if (message.type === 'assistant') {
       const am = message as SDKAssistantMessage;
-      const blocks = (am.message?.content ?? []) as Array<{ type: string; text?: string; name?: string; input?: Record<string, unknown> }>;
+      // SDK content blocks include text, tool_use, and (when extended-thinking
+      // is enabled) thinking. We tap each kind into the Event store.
+      const blocks = (am.message?.content ?? []) as Array<{ type: string; text?: string; name?: string; input?: Record<string, unknown>; id?: string; thinking?: string }>;
       for (const block of blocks) {
         if (block.type === 'text' && typeof block.text === 'string') {
           finalText += block.text;
+          // PRD Phase 4a / 1.18.85: llm_text Event. Truncate at 8KB to keep
+          // the JSONL light — full text is reachable via the SDK transcript.
+          writeEvent({
+            kind: 'llm_text',
+            ts: new Date().toISOString(),
+            sessionId,
+            text: block.text.slice(0, 8000),
+          });
           if (opts.onText) {
             try { await opts.onText(block.text); } catch { /* streaming is best-effort */ }
           }
+        } else if (block.type === 'thinking' && typeof block.thinking === 'string') {
+          // Extended-thinking block — captured separately so the Run detail
+          // page can render thinking distinctly from final text.
+          writeEvent({
+            kind: 'thinking',
+            ts: new Date().toISOString(),
+            sessionId,
+            thinking: block.thinking.slice(0, 8000),
+          });
         } else if (block.type === 'tool_use' && typeof block.name === 'string') {
+          // PRD Phase 4a: tool_call Event. The tool_use id pairs with the
+          // tool_result Event written when the SDK reports back. Inputs
+          // truncated at 8KB; the dashboard can fetch the full transcript
+          // if a deeper drill-down is needed.
+          writeEvent({
+            kind: 'tool_call',
+            ts: new Date().toISOString(),
+            sessionId,
+            toolName: block.name,
+            toolUseId: block.id,
+            toolInput: truncateForLog(block.input ?? {}, 8000),
+          });
           if (opts.onToolActivity) {
             try {
               await opts.onToolActivity({ tool: block.name, input: block.input ?? {} });
             } catch { /* best-effort */ }
           }
+        }
+      }
+      continue;
+    }
+    // SDK user messages carry tool_result blocks back from tool execution.
+    // We pair them with the earlier tool_call Event via toolUseId so the
+    // Run detail waterfall renders call → result side by side.
+    if ((message as { type?: string }).type === 'user') {
+      const um = message as { message?: { content?: Array<{ type?: string; tool_use_id?: string; content?: unknown; is_error?: boolean }> } };
+      const blocks = um.message?.content ?? [];
+      for (const block of blocks) {
+        if (block.type === 'tool_result') {
+          writeEvent({
+            kind: 'tool_result',
+            ts: new Date().toISOString(),
+            sessionId,
+            toolUseId: block.tool_use_id,
+            toolResult: truncateForLog(block.content, 16000),
+            ...(block.is_error ? { toolError: 'tool reported is_error' } : {}),
+          });
         }
       }
       continue;
@@ -448,6 +545,16 @@ export async function runAgent(prompt: string, opts: RunAgentOptions): Promise<R
         const r = (result as { result?: string }).result;
         if (r) finalText = r;
       }
+
+      // PRD Phase 4a / 1.18.85: session_end Event — closes the run in the
+      // event store and stamps the cost + stop reason for the Run detail page.
+      writeEvent({
+        kind: 'session_end',
+        ts: new Date().toISOString(),
+        sessionId,
+        costUsd: totalCostUsd,
+        stopReason: subtype,
+      });
 
       // Mirror cost to usage_log. Same shape as the existing
       // logQueryResult, but standalone so we don't depend on
@@ -478,13 +585,22 @@ export async function runAgent(prompt: string, opts: RunAgentOptions): Promise<R
     // handles compaction internally; we just let it run.
   }
   } catch (err) {
+    // PRD Phase 4a / 1.18.85: error Event closes the run if the SDK throws.
+    // Lets the Run detail page render an explicit failure span instead of a
+    // run that just trails off after the last successful tool_call.
+    const errMsg = String((err as Error)?.message ?? err).slice(0, 1000);
+    writeEvent({
+      kind: 'error',
+      ts: new Date().toISOString(),
+      sessionId,
+      toolError: errMsg,
+    });
     // Translate the SDK's budget-exhaustion throw into a message that
     // tells the user (a) what cap tripped and (b) how to raise it.
     // The raw SDK string ("Claude Code returned an error result:
     // Reached maximum budget ($0.5)") leaks through the channel layer
     // as a generic "Something went wrong:" with no actionable hint.
-    const msg = String((err as Error)?.message ?? err);
-    if (/Reached maximum budget|error_max_budget_usd/i.test(msg)) {
+    if (/Reached maximum budget|error_max_budget_usd/i.test(errMsg)) {
       const cap = maxBudgetUsd?.toFixed(2) ?? '?';
       const envKey = `BUDGET_${source.toUpperCase().replace(/-/g, '_')}_USD`;
       throw new Error(
@@ -513,5 +629,6 @@ export async function runAgent(prompt: string, opts: RunAgentOptions): Promise<R
     sessionId,
     subtype,
     ...(usage ? { usage } : {}),
+    runId,
   };
 }

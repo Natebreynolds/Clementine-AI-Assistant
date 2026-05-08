@@ -173,6 +173,9 @@ export class Gateway {
     skillsMissing: string[];
     allowedToolsApplied?: string[];
     mcpServersApplied: string[];
+    /** PRD §6 / 1.18.85: stable run UUID from runAgent — pinned onto the
+     *  CronRunEntry so the Run detail page can join run row → events. */
+    runId?: string;
   };
 
   /** Persisted set of channel keys the owner has approved. Loaded lazily. */
@@ -2299,6 +2302,7 @@ export class Gateway {
           skillsMissing: cronResult.skillsMissing,
           allowedToolsApplied: cronResult.allowedToolsApplied,
           mcpServersApplied: cronResult.mcpServersApplied,
+          runId: cronResult.runId,
         };
         logger.info({
           jobName,
@@ -2500,6 +2504,8 @@ export class Gateway {
     skillsMissing: string[];
     allowedToolsApplied?: string[];
     mcpServersApplied: string[];
+    /** PRD §6 / 1.18.85: run UUID from runAgent. */
+    runId?: string;
   } | undefined {
     const md = this._lastCronRunMetadata;
     this._lastCronRunMetadata = undefined;
