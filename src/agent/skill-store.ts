@@ -1,26 +1,25 @@
 /**
- * Skill store — Phase A (read-only) of the Skills-First redesign.
+ * Skill store — Phase A / A.5 of the Skills-First redesign.
  *
- * Discovers skill .md files from two locations and parses their
- * frontmatter into the Skill type. Phase A surfaces what's already on
- * disk; Phase B adds editing + testing; Phase C wires runtime invocation.
+ * Anthropic-compatible skill loader. Walks two skill directories and
+ * accepts both layouts:
  *
- * Discovery order:
- *   1. ~/.clementine/vault/00-System/skills/<name>.md  (global)
- *   2. <work_dir>/.clementine/skills/<name>.md         (per-project)
+ *   1. **Folder form** (Anthropic spec): <dir>/<skill-name>/SKILL.md
+ *      A capital-S SKILL.md is the entry point. Sibling .md files and
+ *      a scripts/ subdirectory are surfaced as bundled files.
  *
- * Per-project files win on name collision — they override global skills
- * for that project. The dashboard surfaces both pools and tags each
- * skill with its scope so the user can see which one will resolve.
+ *   2. **Flat form** (Clementine legacy): <dir>/<skill-name>.md
+ *      A single .md file with frontmatter + body. Bundled files
+ *      unsupported. Used by the 12 pre-redesign skill files we already
+ *      have on disk.
  *
- * Schema detection: a file is `v1` when its frontmatter declares any of
- * inputs / tools.allow / tools.deny / dataSources / stateKeys / success.
- * Otherwise (only legacy fields like title / triggers / toolsUsed) it's
- * `legacy` and the dashboard shows a migration badge.
+ * Discovery directories (per-project wins on name collision):
+ *   - global:      $CLEMENTINE_HOME/vault/00-System/skills/
+ *   - per-project: <work_dir>/.clementine/skills/
  *
- * Used-by join: Phase A reads the `skills:` array on CronJobDefinition
- * (the existing field) to populate Skill.usedByTriggers. Phase C will
- * extend this to read the new top-level `skill:` field on the trigger.
+ * Phase A is read-only. Phase B adds editing + a "Test this skill"
+ * runner. Phase C wires runtime invocation. Phase E migrates legacy
+ * crons → folder-form skills.
  */
 
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
@@ -32,110 +31,159 @@ import type {
   SkillFrontmatter,
   SkillScope,
   SkillSchemaVersion,
+  SkillLayout,
+  SkillBundledFile,
+  SkillValidationWarning,
   SkillToolPolicy,
   SkillSuccess,
   SkillLimits,
   SkillDataSource,
   SkillInputSchema,
+  ClementineSkillExtensions,
   CronJobDefinition,
 } from '../types.js';
 
-/** Resolve the global skills directory from CLEMENTINE_HOME (or default). */
+// ── Path resolution (lazy — reads CLEMENTINE_HOME on each call) ──────
+
 function globalSkillsDir(): string {
   const base = process.env.CLEMENTINE_HOME || path.join(os.homedir(), '.clementine');
   return path.join(base, 'vault', '00-System', 'skills');
 }
 
-/** Resolve a per-project skills directory. Returns null if work_dir is
- *  empty or doesn't have a .clementine/skills/ child. */
 function projectSkillsDir(workDir: string | undefined): string | null {
   if (!workDir) return null;
   const dir = path.join(workDir, '.clementine', 'skills');
   return existsSync(dir) ? dir : null;
 }
 
-/** Strip backup files (.bak), hidden files, and directories. */
-function isSkillFile(name: string): boolean {
-  if (name.startsWith('.')) return false;
-  if (!name.endsWith('.md')) return false;
-  if (name.endsWith('.bak')) return false;
-  if (name.endsWith('.bak.md')) return false;
-  return true;
-}
+// ── Anthropic spec validations ────────────────────────────────────────
 
-/** Skill name is the filename without extension. We don't trust the
- *  frontmatter's `name:` field as the canonical identifier because
- *  different files could collide on it; the filename is what the loader
- *  joins on. The frontmatter `name:` is preserved as a display alias. */
-function nameFromFile(file: string): string {
-  return path.basename(file, '.md');
-}
+const NAME_PATTERN = /^[a-z0-9][a-z0-9-]{0,63}$/;
+const RESERVED_NAMES = new Set(['anthropic', 'claude']);
+const NAME_MAX_LEN = 64;
+const DESCRIPTION_MAX_LEN = 1024;
+const BODY_LINE_LIMIT_WARN = 500;
 
-/** Detect whether a frontmatter object uses the v1 schema or the
- *  pre-redesign legacy shape. Phase A renders this as a badge so users
- *  can see which skills need migration in Phase B. */
-function detectSchemaVersion(fm: Record<string, unknown>): SkillSchemaVersion {
-  const v1Markers = ['inputs', 'dataSources', 'stateKeys', 'success', 'limits'];
-  if (v1Markers.some((k) => k in fm)) return 'v1';
-  const tools = fm.tools as Record<string, unknown> | undefined;
-  if (tools && (Array.isArray(tools.allow) || Array.isArray(tools.deny))) return 'v1';
-  return 'legacy';
-}
+/** Run Anthropic-spec validations on a parsed skill. Errors are spec
+ *  violations (skill would be rejected by the Anthropic API); warnings
+ *  are best-practice hints (still loadable). Findings render in the
+ *  dashboard's detail pane. */
+export function validateSkill(skill: Skill): SkillValidationWarning[] {
+  const out: SkillValidationWarning[] = [];
+  const fm = skill.frontmatter;
 
-/** Coerce a parsed YAML object into the SkillFrontmatter shape. We
- *  accept both the v1 fields and the legacy fields side-by-side; the
- *  caller's schemaVersion check tells the dashboard which is which. */
-function coerceFrontmatter(raw: Record<string, unknown>, fileBasename: string): SkillFrontmatter {
-  const fm: SkillFrontmatter = {
-    // Identifier — ALWAYS the filename (without .md). The frontmatter's
-    // `name:` field is intentionally ignored to avoid two skills colliding
-    // on it. Users wanting a friendly display string can set `title:`
-    // instead, which Phase B's editor surfaces as the heading.
-    name: fileBasename,
-  };
-  if (typeof raw.description === 'string') fm.description = raw.description;
-  // v1 inputs — JSON Schema map keyed by field name.
-  if (raw.inputs && typeof raw.inputs === 'object' && !Array.isArray(raw.inputs)) {
-    fm.inputs = raw.inputs as Record<string, SkillInputSchema>;
+  // Name validation (Anthropic spec).
+  if (!fm.name) {
+    out.push({ severity: 'error', field: 'name', message: 'name is required' });
+  } else {
+    if (fm.name.length > NAME_MAX_LEN) {
+      out.push({ severity: 'error', field: 'name', message: `name exceeds ${NAME_MAX_LEN} chars (got ${fm.name.length})` });
+    }
+    if (!NAME_PATTERN.test(fm.name)) {
+      out.push({ severity: 'error', field: 'name', message: 'name must be lowercase letters, numbers, and hyphens only' });
+    }
+    const lower = fm.name.toLowerCase();
+    if (RESERVED_NAMES.has(lower) || lower.includes('anthropic') || lower.includes('claude')) {
+      // Anthropic forbids these words anywhere in the name.
+      out.push({ severity: 'error', field: 'name', message: 'name cannot contain reserved words "anthropic" or "claude"' });
+    }
   }
-  // tools.allow / tools.deny
-  if (raw.tools && typeof raw.tools === 'object' && !Array.isArray(raw.tools)) {
-    const t = raw.tools as Record<string, unknown>;
+
+  // Description validation (Anthropic spec).
+  if (!fm.description || !fm.description.trim()) {
+    out.push({ severity: 'warning', field: 'description', message: 'description is required by Anthropic spec — add one so the skill can be discovered' });
+  } else if (fm.description.length > DESCRIPTION_MAX_LEN) {
+    out.push({ severity: 'error', field: 'description', message: `description exceeds ${DESCRIPTION_MAX_LEN} chars (got ${fm.description.length})` });
+  } else if (/<\w+/i.test(fm.description)) {
+    out.push({ severity: 'error', field: 'description', message: 'description cannot contain XML tags' });
+  }
+
+  // Body length (best-practice hint).
+  const bodyLines = (skill.body.match(/\n/g)?.length ?? 0) + 1;
+  if (bodyLines > BODY_LINE_LIMIT_WARN) {
+    out.push({ severity: 'warning', field: 'body', message: `body is ${bodyLines} lines — Anthropic recommends under ${BODY_LINE_LIMIT_WARN}; split into bundled files (FORMS.md, reference.md, etc.)` });
+  }
+
+  // Layout hint: flat skills can't bundle scripts or sibling references.
+  if (skill.layout === 'flat' && skill.schemaVersion !== 'legacy') {
+    out.push({ severity: 'warning', field: 'layout', message: 'consider folder form (<skill-name>/SKILL.md) so you can bundle scripts and reference files later' });
+  }
+
+  return out;
+}
+
+// ── Frontmatter parsing ───────────────────────────────────────────────
+
+/** Detect which of the three schema variants this frontmatter is.
+ *
+ * - 'clementine'  if the `clementine:` namespace is present
+ * - 'legacy'      if any of the pre-redesign top-level fields are present
+ *                 (title / triggers / toolsUsed / useCount) AND no clementine
+ * - 'anthropic'   otherwise (just name + description, the canonical case)
+ */
+function detectSchemaVersion(raw: Record<string, unknown>): SkillSchemaVersion {
+  if (raw.clementine && typeof raw.clementine === 'object' && !Array.isArray(raw.clementine)) {
+    return 'clementine';
+  }
+  const legacyMarkers = ['title', 'triggers', 'toolsUsed', 'useCount', 'source'];
+  if (legacyMarkers.some((k) => k in raw)) return 'legacy';
+  return 'anthropic';
+}
+
+function coerceClementineExtensions(raw: unknown): ClementineSkillExtensions | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const r = raw as Record<string, unknown>;
+  const out: ClementineSkillExtensions = {};
+
+  if (r.inputs && typeof r.inputs === 'object' && !Array.isArray(r.inputs)) {
+    out.inputs = r.inputs as Record<string, SkillInputSchema>;
+  }
+  if (r.tools && typeof r.tools === 'object' && !Array.isArray(r.tools)) {
+    const t = r.tools as Record<string, unknown>;
     const policy: SkillToolPolicy = {};
     if (Array.isArray(t.allow)) policy.allow = t.allow.map(String);
     if (Array.isArray(t.deny)) policy.deny = t.deny.map(String);
-    if (policy.allow || policy.deny) fm.tools = policy;
+    if (policy.allow || policy.deny) out.tools = policy;
   }
-  if (Array.isArray(raw.dataSources)) {
-    fm.dataSources = raw.dataSources
-      .filter((d): d is Record<string, unknown> => !!d && typeof d === 'object')
-      .map((d) => ({
-        kind: String(d.kind || 'unknown'),
-        purpose: String(d.purpose || ''),
-      } as SkillDataSource));
+  if (Array.isArray(r.dataSources)) {
+    out.dataSources = r.dataSources
+      .filter((d): d is Record<string, unknown> => !!d && typeof d === 'object' && !Array.isArray(d))
+      .map((d) => ({ kind: String(d.kind || 'unknown'), purpose: String(d.purpose || '') } as SkillDataSource));
   }
-  if (Array.isArray(raw.stateKeys)) fm.stateKeys = raw.stateKeys.map(String);
-  if (raw.success && typeof raw.success === 'object' && !Array.isArray(raw.success)) {
-    const s = raw.success as Record<string, unknown>;
+  if (Array.isArray(r.stateKeys)) out.stateKeys = r.stateKeys.map(String);
+  if (r.success && typeof r.success === 'object' && !Array.isArray(r.success)) {
+    const s = r.success as Record<string, unknown>;
     const success: SkillSuccess = {};
     if (s.schema && typeof s.schema === 'object') success.schema = s.schema as SkillInputSchema;
     if (typeof s.criterion === 'string') success.criterion = s.criterion;
-    if (success.schema || success.criterion) fm.success = success;
+    if (success.schema || success.criterion) out.success = success;
   }
-  if (raw.limits && typeof raw.limits === 'object' && !Array.isArray(raw.limits)) {
-    const l = raw.limits as Record<string, unknown>;
+  if (r.limits && typeof r.limits === 'object' && !Array.isArray(r.limits)) {
+    const l = r.limits as Record<string, unknown>;
     const limits: SkillLimits = {};
     if (typeof l.maxTurns === 'number') limits.maxTurns = l.maxTurns;
     if (typeof l.maxBudgetUsd === 'number') limits.maxBudgetUsd = l.maxBudgetUsd;
     if (typeof l.timeoutSeconds === 'number') limits.timeoutSeconds = l.timeoutSeconds;
-    if (Object.keys(limits).length > 0) fm.limits = limits;
+    if (Object.keys(limits).length > 0) out.limits = limits;
   }
-  if (typeof raw.version === 'number') fm.version = raw.version;
-  if (typeof raw.createdAt === 'string') fm.createdAt = raw.createdAt;
-  if (typeof raw.updatedAt === 'string') fm.updatedAt = raw.updatedAt;
-  if (typeof raw.lastUsed === 'string') fm.lastUsed = raw.lastUsed;
-  if (typeof raw.lastTestPass === 'string') fm.lastTestPass = raw.lastTestPass;
-  // Legacy fields (preserved as-is for the migration UI).
+  if (typeof r.version === 'number') out.version = r.version;
+  if (typeof r.createdAt === 'string') out.createdAt = r.createdAt;
+  if (typeof r.updatedAt === 'string') out.updatedAt = r.updatedAt;
+  if (typeof r.lastUsed === 'string') out.lastUsed = r.lastUsed;
+  if (typeof r.lastTestPass === 'string') out.lastTestPass = r.lastTestPass;
+
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
+/** Coerce raw YAML object → SkillFrontmatter. Filename always wins for
+ *  identity (frontmatter `name:` is ignored to prevent two skills from
+ *  colliding); we treat the YAML name as a display alias only. */
+function coerceFrontmatter(raw: Record<string, unknown>, fileBasename: string): SkillFrontmatter {
+  const fm: SkillFrontmatter = { name: fileBasename };
+  if (typeof raw.description === 'string') fm.description = raw.description;
+  const ext = coerceClementineExtensions(raw.clementine);
+  if (ext) fm.clementine = ext;
+  // Legacy top-level fields preserved for the migration UI.
   if (typeof raw.title === 'string') fm.title = raw.title;
   if (Array.isArray(raw.triggers)) fm.triggers = raw.triggers.map(String);
   if (typeof raw.source === 'string') fm.source = raw.source;
@@ -144,102 +192,201 @@ function coerceFrontmatter(raw: Record<string, unknown>, fileBasename: string): 
   return fm;
 }
 
+// ── File / folder helpers ─────────────────────────────────────────────
+
+function isLoadableSkillFile(name: string): boolean {
+  if (name.startsWith('.')) return false;
+  if (!name.endsWith('.md')) return false;
+  if (name.endsWith('.bak')) return false;
+  if (name.endsWith('.bak.md')) return false;
+  return true;
+}
+
+function classifyBundledFile(relPath: string): SkillBundledFile['kind'] {
+  if (relPath.endsWith('.md')) return 'markdown';
+  if (relPath.startsWith('scripts/')) return 'script';
+  if (/\.(py|js|ts|sh|rb)$/.test(relPath)) return 'script';
+  return 'other';
+}
+
+/** Walk a skill folder (recursively shallow — one level into scripts/)
+ *  and return non-SKILL.md files as bundled artifacts. Skips hidden
+ *  files, .bak duplicates, and the SKILL.md itself. */
+function discoverBundledFiles(skillFolder: string): SkillBundledFile[] {
+  const out: SkillBundledFile[] = [];
+  const walk = (dir: string, relPrefix: string): void => {
+    let entries: string[];
+    try { entries = readdirSync(dir); }
+    catch { return; }
+    for (const entry of entries) {
+      if (entry.startsWith('.')) continue;
+      const abs = path.join(dir, entry);
+      let st;
+      try { st = statSync(abs); } catch { continue; }
+      const rel = relPrefix ? `${relPrefix}/${entry}` : entry;
+      if (st.isDirectory()) {
+        // Only descend one level — avoids surprise when a skill bundles
+        // node_modules or similar. Convention: scripts/, reference/.
+        if (relPrefix) continue;
+        walk(abs, rel);
+        continue;
+      }
+      if (!st.isFile()) continue;
+      // Skip the entry-point file itself + .bak duplicates.
+      if (rel === 'SKILL.md') continue;
+      if (entry.endsWith('.bak') || entry.endsWith('.bak.md')) continue;
+      out.push({
+        relPath: rel,
+        absPath: abs,
+        kind: classifyBundledFile(rel),
+        sizeBytes: st.size,
+      });
+    }
+  };
+  walk(skillFolder, '');
+  // Sort deterministically: top-level files first, then scripts/, then
+  // alphabetical within each group.
+  out.sort((a, b) => {
+    const aTop = !a.relPath.includes('/');
+    const bTop = !b.relPath.includes('/');
+    if (aTop !== bTop) return aTop ? -1 : 1;
+    return a.relPath.localeCompare(b.relPath);
+  });
+  return out;
+}
+
+// ── Skill parsing ────────────────────────────────────────────────────
+
 interface ParseResult {
   skill: Skill;
   /** Set when the file existed but couldn't be parsed (bad YAML, etc.).
-   *  We still surface the file with a fallback frontmatter so the user
-   *  can see which one needs fixing. */
+   *  We still surface the skill with synthesized frontmatter so the
+   *  dashboard can render the offending file with an error banner. */
   parseError?: string;
 }
 
-/** Parse a single skill file. Returns a Skill record even when the
- *  frontmatter is malformed — the dashboard renders the parse error
- *  in-pane so the user can fix it without leaving the UI. */
-export function parseSkillFile(filePath: string, scope: SkillScope): ParseResult {
-  const basename = nameFromFile(filePath);
-  let raw: string;
-  try {
-    raw = readFileSync(filePath, 'utf-8');
-  } catch (err) {
-    return {
-      skill: emptySkill(filePath, basename, scope),
-      parseError: 'failed to read: ' + String(err),
-    };
-  }
-  let parsed: ReturnType<typeof matter>;
-  try {
-    parsed = matter(raw);
-  } catch (err) {
-    return {
-      skill: { ...emptySkill(filePath, basename, scope), body: raw },
-      parseError: 'YAML parse error: ' + String(err),
-    };
-  }
-  const data = parsed.data as Record<string, unknown>;
-  const fm = coerceFrontmatter(data, basename);
-  const schemaVersion = detectSchemaVersion(data);
-  return {
-    skill: {
-      frontmatter: fm,
-      body: parsed.content || '',
-      filePath,
-      scope,
-      schemaVersion,
-      usedByTriggers: [],
-    },
-  };
-}
-
-function emptySkill(filePath: string, basename: string, scope: SkillScope): Skill {
+function emptySkill(filePath: string, basename: string, scope: SkillScope, layout: SkillLayout): Skill {
   return {
     frontmatter: { name: basename },
     body: '',
     filePath,
     scope,
+    layout,
     schemaVersion: 'legacy',
+    bundledFiles: [],
     usedByTriggers: [],
+    validation: [],
   };
 }
 
-/** List skills in a directory, returning Skill records (not just paths)
- *  so callers can immediately render them. Tolerates missing dirs and
- *  unreadable files — best-effort. */
+/** Parse a flat-form skill file (single .md). */
+export function parseSkillFile(filePath: string, scope: SkillScope): ParseResult {
+  const basename = path.basename(filePath, '.md');
+  let raw: string;
+  try { raw = readFileSync(filePath, 'utf-8'); }
+  catch (err) {
+    return { skill: emptySkill(filePath, basename, scope, 'flat'), parseError: 'failed to read: ' + String(err) };
+  }
+  let parsed: ReturnType<typeof matter>;
+  try { parsed = matter(raw); }
+  catch (err) {
+    const skill = { ...emptySkill(filePath, basename, scope, 'flat'), body: raw };
+    return { skill, parseError: 'YAML parse error: ' + String(err) };
+  }
+  const data = parsed.data as Record<string, unknown>;
+  const skill: Skill = {
+    frontmatter: coerceFrontmatter(data, basename),
+    body: parsed.content || '',
+    filePath,
+    scope,
+    layout: 'flat',
+    schemaVersion: detectSchemaVersion(data),
+    bundledFiles: [],
+    usedByTriggers: [],
+    validation: [],
+  };
+  skill.validation = validateSkill(skill);
+  return { skill };
+}
+
+/** Parse a folder-form skill (Anthropic spec: <name>/SKILL.md plus optional
+ *  bundled files). The folder name is the canonical skill identifier. */
+export function parseSkillFolder(folderPath: string, scope: SkillScope): ParseResult {
+  const basename = path.basename(folderPath);
+  const entryPoint = path.join(folderPath, 'SKILL.md');
+  if (!existsSync(entryPoint)) {
+    return {
+      skill: emptySkill(entryPoint, basename, scope, 'folder'),
+      parseError: 'no SKILL.md in folder',
+    };
+  }
+  let raw: string;
+  try { raw = readFileSync(entryPoint, 'utf-8'); }
+  catch (err) {
+    return { skill: emptySkill(entryPoint, basename, scope, 'folder'), parseError: 'failed to read SKILL.md: ' + String(err) };
+  }
+  let parsed: ReturnType<typeof matter>;
+  try { parsed = matter(raw); }
+  catch (err) {
+    const skill = { ...emptySkill(entryPoint, basename, scope, 'folder'), body: raw };
+    return { skill, parseError: 'YAML parse error in SKILL.md: ' + String(err) };
+  }
+  const data = parsed.data as Record<string, unknown>;
+  const skill: Skill = {
+    frontmatter: coerceFrontmatter(data, basename),
+    body: parsed.content || '',
+    filePath: entryPoint,
+    scope,
+    layout: 'folder',
+    schemaVersion: detectSchemaVersion(data),
+    bundledFiles: discoverBundledFiles(folderPath),
+    usedByTriggers: [],
+    validation: [],
+  };
+  skill.validation = validateSkill(skill);
+  return { skill };
+}
+
+// ── Discovery (top-level API) ────────────────────────────────────────
+
 function listSkillsInDir(dir: string, scope: SkillScope): Skill[] {
   if (!existsSync(dir)) return [];
   let entries: string[];
-  try {
-    entries = readdirSync(dir);
-  } catch {
-    return [];
-  }
+  try { entries = readdirSync(dir); }
+  catch { return []; }
   const out: Skill[] = [];
   for (const entry of entries) {
-    if (!isSkillFile(entry)) continue;
+    if (entry.startsWith('.')) continue;
     const fullPath = path.join(dir, entry);
-    try {
-      const stat = statSync(fullPath);
-      if (!stat.isFile()) continue;
-    } catch {
+    let st;
+    try { st = statSync(fullPath); } catch { continue; }
+
+    if (st.isDirectory()) {
+      // Folder-form skill. Must contain SKILL.md (case-sensitive,
+      // Anthropic spec). Skip folders that don't (e.g. accidental
+      // dirs like 'auto/' that exist in current vault).
+      if (!existsSync(path.join(fullPath, 'SKILL.md'))) continue;
+      out.push(parseSkillFolder(fullPath, scope).skill);
       continue;
     }
-    out.push(parseSkillFile(fullPath, scope).skill);
+    if (st.isFile() && isLoadableSkillFile(entry)) {
+      out.push(parseSkillFile(fullPath, scope).skill);
+    }
   }
   return out;
 }
 
 export interface ListSkillsOptions {
-  /** Optional per-project work_dir to also scan. Per-project skills
-   *  override global skills with the same filename. */
+  /** Optional per-project work_dir to scan. Per-project skills shadow
+   *  global ones with the same identifier. */
   projectWorkDir?: string;
-  /** Optional cron jobs list — when provided, the loader populates the
-   *  usedByTriggers field on each skill via the existing skills[] array
-   *  on CronJobDefinition (Phase A's join). */
+  /** Optional cron jobs for the usedByTriggers join (via skills[]). */
   jobs?: CronJobDefinition[];
 }
 
-/** Top-level discovery API. Returns the merged list of skills across
- *  global + per-project pools, with per-project taking precedence on
- *  name collision. usedByTriggers is populated when jobs are passed in. */
+/** Top-level discovery API. Merges global + per-project pools, with
+ *  per-project taking precedence. Populates usedByTriggers when jobs
+ *  are passed. Returned list is sorted alphabetically by name. */
 export function listSkills(opts: ListSkillsOptions = {}): Skill[] {
   const globalSkills = listSkillsInDir(globalSkillsDir(), 'global');
   const projectSkills = opts.projectWorkDir
@@ -249,13 +396,10 @@ export function listSkills(opts: ListSkillsOptions = {}): Skill[] {
       })()
     : [];
 
-  // Build a map keyed by basename so per-project entries override global.
   const merged = new Map<string, Skill>();
   for (const s of globalSkills) merged.set(s.frontmatter.name, s);
   for (const s of projectSkills) merged.set(s.frontmatter.name, s);
 
-  // Used-by join from cron jobs' skills[] array. Same skill referenced by
-  // multiple jobs accumulates them in order.
   if (opts.jobs && opts.jobs.length > 0) {
     for (const job of opts.jobs) {
       if (!Array.isArray(job.skills)) continue;
@@ -266,51 +410,53 @@ export function listSkills(opts: ListSkillsOptions = {}): Skill[] {
     }
   }
 
-  // Sorted alphabetically — predictable rendering, no need for the
-  // dashboard to re-sort. Per-project always sorts at the same key as
-  // the global version it replaced.
   return [...merged.values()].sort((a, b) => a.frontmatter.name.localeCompare(b.frontmatter.name));
 }
 
-/** Get a single skill by name, with the same global/project precedence
- *  as listSkills. Returns null if neither pool has the skill. */
+/** Get one skill by name, applying per-project precedence. Returns
+ *  null when neither pool has the skill. */
 export function getSkill(name: string, opts: ListSkillsOptions = {}): Skill | null {
-  // Per-project first (precedence).
+  // Per-project first (precedence), then global.
+  const tryDir = (dir: string, scope: SkillScope): Skill | null => {
+    const folder = path.join(dir, name);
+    if (existsSync(folder) && existsSync(path.join(folder, 'SKILL.md'))) {
+      return parseSkillFolder(folder, scope).skill;
+    }
+    const flat = path.join(dir, name + '.md');
+    if (existsSync(flat)) {
+      return parseSkillFile(flat, scope).skill;
+    }
+    return null;
+  };
+
+  let skill: Skill | null = null;
   if (opts.projectWorkDir) {
     const pdir = projectSkillsDir(opts.projectWorkDir);
-    if (pdir) {
-      const candidate = path.join(pdir, name + '.md');
-      if (existsSync(candidate)) {
-        const result = parseSkillFile(candidate, 'project');
-        if (opts.jobs) result.skill.usedByTriggers = jobsUsing(name, opts.jobs);
-        return result.skill;
-      }
+    if (pdir) skill = tryDir(pdir, 'project');
+  }
+  if (!skill) skill = tryDir(globalSkillsDir(), 'global');
+  if (skill && opts.jobs) {
+    for (const j of opts.jobs) {
+      if (Array.isArray(j.skills) && j.skills.includes(name)) skill.usedByTriggers.push(j.name);
     }
   }
-  // Global fallback.
-  const candidate = path.join(globalSkillsDir(), name + '.md');
-  if (existsSync(candidate)) {
-    const result = parseSkillFile(candidate, 'global');
-    if (opts.jobs) result.skill.usedByTriggers = jobsUsing(name, opts.jobs);
-    return result.skill;
-  }
-  return null;
+  return skill;
 }
 
-/** Internal helper for the used-by join. */
-function jobsUsing(skillName: string, jobs: CronJobDefinition[]): string[] {
-  const out: string[] = [];
-  for (const job of jobs) {
-    if (Array.isArray(job.skills) && job.skills.includes(skillName)) out.push(job.name);
-  }
-  return out;
+/** Read one bundled file's contents — used by Phase B's preview pane.
+ *  Defends against directory traversal: rejects paths that escape the
+ *  skill folder. */
+export function readBundledFile(skill: Skill, relPath: string): string | null {
+  if (skill.layout !== 'folder') return null;
+  const skillFolder = path.dirname(skill.filePath);
+  const absPath = path.resolve(skillFolder, relPath);
+  if (!absPath.startsWith(skillFolder + path.sep) && absPath !== skillFolder) return null;
+  if (!existsSync(absPath)) return null;
+  try { return readFileSync(absPath, 'utf-8'); }
+  catch { return null; }
 }
 
-/** Test-only: where the loader looked. Useful in unit tests + the
- *  dashboard's diagnostics surface. */
+/** Diagnostics for the dashboard — expose where the loader looked. */
 export function _skillDirsForDiagnostics(workDir?: string): { global: string; project: string | null } {
-  return {
-    global: globalSkillsDir(),
-    project: projectSkillsDir(workDir) ?? null,
-  };
+  return { global: globalSkillsDir(), project: projectSkillsDir(workDir) ?? null };
 }

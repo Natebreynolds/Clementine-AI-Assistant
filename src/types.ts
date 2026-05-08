@@ -360,32 +360,47 @@ export interface AgentHeartbeatState {
   lastTickKind?: 'acted' | 'quiet' | 'silent' | 'override';
 }
 
-// ── Skills (PRD §SKILLS_FIRST_REDESIGN Phase A / 1.18.106) ───────────
+// ── Skills (Skills-First redesign — Phase A / Phase A.5) ─────────────
 //
-// Skills are reusable units of work — each one is a markdown file with
-// frontmatter declaring its inputs, allowed tools, data sources, state,
-// and success criterion, plus a procedure body. A trigger (cron) invokes
-// a skill with concrete inputs.
+// Skills are reusable units of work. The format is **Anthropic-compatible**:
+// every skill has only two required frontmatter fields (`name` and
+// `description`) and a markdown body. Skills authored against the
+// Anthropic Agent Skills spec (https://platform.claude.com/docs/en/
+// agents-and-tools/agent-skills/) load unmodified.
 //
-// File locations (loader checks both, per-project wins on collision):
-//   - global:      ~/.clementine/vault/00-System/skills/<name>.md
-//   - per-project: <work_dir>/.clementine/skills/<name>.md
+// On top of the canonical fields we layer **Clementine-specific extensions**
+// under a `clementine:` namespace so a vanilla Anthropic skill drops in
+// cleanly while a Clementine skill can additionally declare typed inputs,
+// tool policies, owned state, success criteria, and limits — concepts our
+// cron triggers need but Anthropic doesn't standardize.
 //
-// Phase A is READ-ONLY — discover, parse, index. Editing + testing land
-// in Phase B; runtime invocation lands in Phase C. The schema below
-// reflects the v1 spec; the parser also accepts the legacy frontmatter
-// shape (title/triggers/toolsUsed/useCount) that's already in use and
-// flags those files with schemaVersion='legacy' for the migration UI.
+// File layouts the loader supports:
+//   1. **Anthropic folder form** (preferred):
+//        <skills-dir>/<skill-name>/SKILL.md      ← entry point (capital)
+//        <skills-dir>/<skill-name>/FORMS.md      ← bundled, loaded on demand
+//        <skills-dir>/<skill-name>/scripts/*.py  ← bundled, executed via bash
+//   2. **Clementine flat form** (legacy):
+//        <skills-dir>/<skill-name>.md            ← single-file skill, no bundles
+//
+// Skills directories the loader scans (per-project wins on name collision):
+//   - global:      ~/.clementine/vault/00-System/skills/
+//   - per-project: <work_dir>/.clementine/skills/
 
-/** Source of a skill file — informational, used by the dashboard. */
+/** Where a skill was loaded from. Per-project skills shadow global. */
 export type SkillScope = 'global' | 'project';
 
-/** Whether the file's frontmatter matches the v1 spec or is the
- *  pre-redesign shape. Drives the "needs migration" badge in the UI. */
-export type SkillSchemaVersion = 'v1' | 'legacy';
+/** Three states the dashboard surfaces as badges:
+ *    'anthropic' — only `name` + `description` (vanilla Anthropic spec)
+ *    'clementine' — has the `clementine:` namespace with extensions
+ *    'legacy'    — pre-redesign flat frontmatter (title/triggers/toolsUsed) */
+export type SkillSchemaVersion = 'anthropic' | 'clementine' | 'legacy';
 
-/** A typed skill input — backed by JSON Schema. The dashboard form
- *  generator can derive UI directly from a JSON Schema; ajv validates. */
+/** Whether the on-disk layout is a folder-with-SKILL.md (Anthropic spec)
+ *  or a single .md file (Clementine flat legacy). New skills should be
+ *  created in folder form so they can grow bundled files later. */
+export type SkillLayout = 'folder' | 'flat';
+
+/** A typed skill input — backed by JSON Schema. Used in `clementine.inputs`. */
 export interface SkillInputSchema {
   type?: 'string' | 'integer' | 'number' | 'boolean' | 'array' | 'object';
   description?: string;
@@ -401,104 +416,138 @@ export interface SkillInputSchema {
   required?: string[];
 }
 
-/** Declarative entry describing where a skill reads data from. Surfaced
- *  in the dashboard's per-skill detail pane and in the Tools & MCP "used
- *  by" join. Free-form by design — different skills declare different
- *  data shapes. */
+/** Declarative entry describing where a skill reads data from. */
 export interface SkillDataSource {
-  /** A loose identifier — e.g. 'outlook', 'memory', 'vault', 'cli', 'mcp:ElevenLabs'. */
+  /** Loose identifier — 'outlook', 'memory', 'vault', 'cli', 'mcp:ElevenLabs'. */
   kind: string;
-  /** One-line human description — what the skill reads from this source. */
+  /** One-line human description of what gets read. */
   purpose: string;
 }
 
-/** Tool allowlist + denylist on a skill. Deny wins on conflict. The
- *  runtime (Phase C) will refuse to invoke a tool that isn't on allow,
- *  even if the trigger tries to override. */
+/** Tool allowlist + denylist. Deny wins on conflict. Phase C runtime
+ *  refuses tools not in `allow`, even when a trigger tries to override. */
 export interface SkillToolPolicy {
   allow?: string[];
   deny?: string[];
 }
 
-/** Success criterion. Either schema (ajv-validated against the run's
- *  structured_output) or criterion (free-text Haiku evaluator). Both =
- *  both must pass. Mirrors the existing CronJobDefinition shape. */
+/** Success criterion — JSON Schema (ajv-validated) and/or free-text. */
 export interface SkillSuccess {
   schema?: SkillInputSchema;
   criterion?: string;
 }
 
-/** Per-skill caps. A trigger can tighten these but never loosen. */
+/** Per-skill caps. A trigger can tighten but never loosen. */
 export interface SkillLimits {
   maxTurns?: number;
   maxBudgetUsd?: number;
   timeoutSeconds?: number;
 }
 
-/** Parsed frontmatter + computed metadata. Phase A surfaces this whole
- *  shape in the Skills page detail pane. */
-export interface SkillFrontmatter {
-  /** Skill identifier — derived from filename if absent in frontmatter. */
-  name: string;
-  /** One-line description (matches today's `description:` field). */
-  description?: string;
+/** Clementine-specific extensions. All optional. Lives under the
+ *  `clementine:` key in the YAML frontmatter so an Anthropic skill that
+ *  doesn't have these stays valid. */
+export interface ClementineSkillExtensions {
   /** Typed parameters the skill accepts at invocation time. */
   inputs?: Record<string, SkillInputSchema>;
   /** Tool allowlist + denylist enforced by the runtime. */
   tools?: SkillToolPolicy;
   /** Where the skill reads data from — purely declarative. */
   dataSources?: SkillDataSource[];
-  /** State.* keys this skill owns (others can't touch them). */
+  /** state.* keys this skill owns. Others can't touch them. */
   stateKeys?: string[];
   /** Success criterion — schema and/or free-text evaluator. */
   success?: SkillSuccess;
   /** Caps the trigger can tighten but never loosen. */
   limits?: SkillLimits;
-  /** Bumped by the user on Publish (Phase B). Phase A surfaces but
-   *  doesn't increment. */
+  /** Skill version — bumped on Publish in Phase B. */
   version?: number;
-  /** Timestamps captured by the legacy + v1 schemas alike. */
+  /** Timestamps Clementine captures. */
   createdAt?: string;
   updatedAt?: string;
   lastUsed?: string;
-  /** Last time the user clicked "Test this skill" in the dashboard
-   *  (Phase B). Phase A reads but doesn't write. */
+  /** Last successful "Test this skill" run (Phase B). */
   lastTestPass?: string;
+}
 
-  // ── Legacy fields (pre-redesign frontmatter) — surfaced for the
-  // migration UI in Phase B, not enforced by the runtime. ──
-  /** Legacy: title (use as fallback for display when description missing). */
+/** Parsed frontmatter. Anthropic-canonical fields are top-level; our
+ *  extensions live under `clementine`. Legacy fields (title/triggers/
+ *  toolsUsed/useCount) are also top-level — they're what the existing
+ *  pre-redesign skills already use and we keep them readable. */
+export interface SkillFrontmatter {
+  // ── Anthropic-canonical (REQUIRED on every skill) ────────────────────
+  /** Skill identifier. Filename is canonical; this field is honored when
+   *  set but not required. Anthropic spec: max 64 chars, lowercase letters
+   *  + numbers + hyphens, no XML, no reserved words ('anthropic'/'claude'). */
+  name: string;
+  /** What the skill does AND when to use it (third person). Anthropic
+   *  spec: non-empty, max 1024 chars, no XML tags. */
+  description?: string;
+
+  // ── Clementine extensions (under `clementine:` in YAML) ──────────────
+  /** Optional namespace for cron-tailored fields. Absent on vanilla
+   *  Anthropic skills; present on Clementine-extended skills. */
+  clementine?: ClementineSkillExtensions;
+
+  // ── Legacy pre-redesign fields (top-level for back-compat) ───────────
+  /** Legacy: human-friendly display title. Falls back to `name` when absent. */
   title?: string;
-  /** Legacy: NLP-style trigger phrases. Pre-redesign Clementine matched
-   *  these against incoming chat messages. */
+  /** Legacy: NLP-style trigger phrases for chat-message matching. */
   triggers?: string[];
   /** Legacy: 'manual' / 'auto' / 'imported' — provenance label. */
   source?: string;
-  /** Legacy: tools observed during runs. Informational, not constraint. */
+  /** Legacy: tools observed during runs. Informational, not enforced. */
   toolsUsed?: string[];
-  /** Legacy: incrementing counter of how many runs invoked the skill. */
+  /** Legacy: incrementing counter of runs that invoked the skill. */
   useCount?: number;
 }
 
+/** A bundled file inside a folder-form skill. `kind` distinguishes
+ *  loadable markdown from executable scripts so the dashboard can
+ *  render them differently. */
+export interface SkillBundledFile {
+  /** Path relative to the skill folder (e.g. 'FORMS.md', 'scripts/extract.py'). */
+  relPath: string;
+  /** Absolute path on disk. */
+  absPath: string;
+  /** Loose categorization for rendering: markdown reference vs script vs other. */
+  kind: 'markdown' | 'script' | 'other';
+  /** File size in bytes — surfaced as "X KB" in the dashboard. */
+  sizeBytes: number;
+}
+
+/** A validation finding for a skill — surfaced in the dashboard so
+ *  authors can see what to fix. Severity 'error' indicates a spec
+ *  violation (rejected by Anthropic API); 'warning' is a best-practice
+ *  hint (still loadable). */
+export interface SkillValidationWarning {
+  severity: 'error' | 'warning';
+  field: 'name' | 'description' | 'body' | 'frontmatter' | 'layout';
+  message: string;
+}
+
 /** Resolved skill record — frontmatter + body + computed extras the
- *  dashboard surfaces (file path, scope, schemaVersion, used-by list). */
+ *  dashboard surfaces. */
 export interface Skill {
-  /** Frontmatter, parsed (or synthesized for files without one). */
+  /** Parsed frontmatter (or synthesized when none / unparseable). */
   frontmatter: SkillFrontmatter;
-  /** Markdown body of the skill — the actual procedure. */
+  /** Markdown body of the skill (the actual procedure). */
   body: string;
-  /** Absolute path to the source .md file. */
+  /** Absolute path to the entry-point file. For folder-form skills this
+   *  points at <folder>/SKILL.md. For flat skills it points at <name>.md. */
   filePath: string;
-  /** Whether this skill was loaded from the global pool or a per-project
-   *  override. Per-project wins on name collision. */
+  /** Where this skill was loaded from (global vs per-project). */
   scope: SkillScope;
-  /** Whether the frontmatter matches the v1 spec or is the pre-redesign
-   *  shape. The Skills page renders a "Schema: legacy" badge accordingly. */
+  /** Folder-form (Anthropic-spec) vs flat-file (Clementine legacy). */
+  layout: SkillLayout;
+  /** Anthropic / clementine / legacy — drives the schema badge. */
   schemaVersion: SkillSchemaVersion;
-  /** Used-by join: cron job names that reference this skill. Phase A
-   *  builds this from the legacy `skills:` array on CronJobDefinition;
-   *  Phase C extends it to read the new top-level `skill:` field. */
+  /** Sibling .md files + scripts/ contents (only populated for folder-form). */
+  bundledFiles: SkillBundledFile[];
+  /** Used-by join: cron jobs that reference this skill via skills[]. */
   usedByTriggers: string[];
+  /** Validation findings — populated lazily so listSkills stays cheap. */
+  validation: SkillValidationWarning[];
 }
 
 // ── Cron Jobs ────────────────────────────────────────────────────────

@@ -26629,6 +26629,29 @@ function onSkillsSearch(value) {
   renderSkillsList();
 }
 
+// ── Skill list pane ──────────────────────────────────────────────────
+// Renders the left-rail skill list. Each card shows two compact badges:
+//  - schemaBadge: ANTHROPIC (green) / CLEMENTINE (purple) / LEGACY (yellow)
+//  - layoutBadge: FOLDER (subtle accent) — only shown when folder-form
+// Plus optional PROJECT scope badge. Below: description preview, used-by
+// count, and a small ✗ when validation has any errors.
+function _skillSchemaBadge(version) {
+  if (version === 'anthropic') {
+    return '<span style="font-size:9px;background:var(--green)20;color:var(--green);padding:1px 6px;border-radius:3px;font-weight:600;letter-spacing:0.04em" title="Vanilla Anthropic frontmatter (name + description only)">ANTHROPIC</span>';
+  }
+  if (version === 'clementine') {
+    return '<span style="font-size:9px;background:#8b5cf620;color:#8b5cf6;padding:1px 6px;border-radius:3px;font-weight:600;letter-spacing:0.04em" title="Anthropic-compatible + clementine: extensions">CLEMENTINE</span>';
+  }
+  return '<span style="font-size:9px;background:var(--yellow)20;color:var(--yellow);padding:1px 6px;border-radius:3px;font-weight:600;letter-spacing:0.04em" title="Pre-redesign flat frontmatter — Phase B will help migrate">LEGACY</span>';
+}
+
+function _skillLayoutBadge(layout) {
+  if (layout === 'folder') {
+    return '<span style="font-size:9px;background:var(--accent)15;color:var(--accent);padding:1px 6px;border-radius:3px;font-weight:600;letter-spacing:0.04em" title="Folder form (Anthropic spec): SKILL.md plus optional bundled files">FOLDER</span>';
+  }
+  return '';
+}
+
 function renderSkillsList() {
   var listEl = document.getElementById('skills-list');
   if (!listEl) return;
@@ -26636,7 +26659,7 @@ function renderSkillsList() {
     listEl.innerHTML = '<div style="padding:18px;color:var(--text-muted);font-size:12px;text-align:center;line-height:1.5">'
       + (_skillsState.query
           ? 'No skills match <strong>' + esc(_skillsState.query) + '</strong>.'
-          : 'No skills yet. Phase B will add a <strong>+ New skill</strong> button. For now, drop .md files in <code>~/.clementine/vault/00-System/skills/</code>.')
+          : 'No skills yet. Drop a folder with <code>SKILL.md</code> inside, or a flat <code>.md</code> file, into <code>~/.clementine/vault/00-System/skills/</code>. Phase B will add a <strong>+ New skill</strong> button.')
       + '</div>';
     return;
   }
@@ -26646,21 +26669,21 @@ function renderSkillsList() {
     var fm = s.frontmatter || {};
     var isSelected = s.frontmatter.name === _skillsState.selectedName;
     var bg = isSelected ? 'var(--bg-tertiary)' : 'transparent';
-    // Schema badge: v1 = green, legacy = yellow (needs migration in Phase B).
-    var schemaBadge = s.schemaVersion === 'v1'
-      ? '<span style="font-size:9px;background:var(--green)20;color:var(--green);padding:1px 6px;border-radius:3px;font-weight:600;letter-spacing:0.04em">V1</span>'
-      : '<span style="font-size:9px;background:var(--yellow)20;color:var(--yellow);padding:1px 6px;border-radius:3px;font-weight:600;letter-spacing:0.04em" title="Legacy frontmatter — Phase B will migrate this">LEGACY</span>';
+    var schemaBadge = _skillSchemaBadge(s.schemaVersion);
+    var layoutBadge = _skillLayoutBadge(s.layout);
     var scopeBadge = s.scope === 'project'
       ? '<span style="font-size:9px;background:var(--blue)20;color:var(--blue);padding:1px 6px;border-radius:3px;font-weight:600;letter-spacing:0.04em" title="Loaded from per-project .clementine/skills/">PROJECT</span>'
       : '';
+    var hasErrors = Array.isArray(s.validation) && s.validation.some(function(v) { return v.severity === 'error'; });
+    var errorMark = hasErrors ? '<span style="color:var(--red);font-size:11px;font-weight:600" title="Has validation errors">⚠</span>' : '';
     var usedCount = (s.usedByTriggers || []).length;
     var displayName = fm.title || fm.name;
     var desc = (fm.description || '').slice(0, 100);
     if (fm.description && fm.description.length > 100) desc += '…';
     html += '<div onclick="showSkillDetail(\\x27' + jsStr(fm.name) + '\\x27)" style="padding:12px 14px;border-bottom:1px solid var(--border);cursor:pointer;background:' + bg + ';transition:background 0.1s" onmouseover="this.style.background=\\x27var(--bg-tertiary)\\x27" onmouseout="this.style.background=\\x27' + bg + '\\x27">'
-      + '<div style="display:flex;align-items:center;gap:6px;margin-bottom:4px">'
-      +   schemaBadge + scopeBadge
-      +   '<span style="font-weight:500;font-size:13px;color:var(--text-primary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1" title="' + esc(displayName) + '">' + esc(displayName) + '</span>'
+      + '<div style="display:flex;align-items:center;gap:4px;margin-bottom:4px;flex-wrap:wrap">'
+      +   schemaBadge + layoutBadge + scopeBadge + errorMark
+      +   '<span style="font-weight:500;font-size:13px;color:var(--text-primary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;min-width:0" title="' + esc(displayName) + '">' + esc(displayName) + '</span>'
       + '</div>'
       + (desc ? '<div style="font-size:11px;color:var(--text-muted);line-height:1.4;margin-bottom:4px">' + esc(desc) + '</div>' : '')
       + '<div style="font-size:10px;color:var(--text-muted)">'
@@ -26690,72 +26713,117 @@ async function showSkillDetail(name) {
   }
 }
 
+// ── Skill detail pane ────────────────────────────────────────────────
+// Renders a single skill in the right pane. Sections, in order:
+//   1. Header (name + 3 badges + description + file path)
+//   2. Validation warnings (red errors / yellow warnings) when present
+//   3. Used-by triggers
+//   4. Bundled files (folder-form only) — sibling .md and scripts/
+//   5. Clementine extensions (inputs / tools / dataSources / stateKeys /
+//      success / limits) — only when frontmatter.clementine is present
+//   6. Legacy fields (triggers / toolsUsed / useCount / lastUsed)
+//   7. Procedure body (with line counter "X/500")
+//   8. Schema-specific footer note (legacy → migration hint)
 function renderSkillDetail(s) {
   var fm = s.frontmatter || {};
+  var ext = fm.clementine || {};
   var displayName = fm.title || fm.name;
+  var bodyLines = (s.body || '').split('\\n').length;
   var html = '<div style="padding:24px 28px">';
-  // Header
+
+  // ── 1. Header
   html += '<div style="margin-bottom:18px">';
-  html += '<div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;flex-wrap:wrap">';
+  html += '<div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;flex-wrap:wrap">';
   html += '<h2 style="margin:0;font-size:20px;font-weight:600;color:var(--text-primary)">' + esc(displayName) + '</h2>';
-  html += s.schemaVersion === 'v1'
-    ? '<span style="font-size:10px;background:var(--green)20;color:var(--green);padding:2px 8px;border-radius:4px;font-weight:600;letter-spacing:0.04em">V1 SCHEMA</span>'
-    : '<span style="font-size:10px;background:var(--yellow)20;color:var(--yellow);padding:2px 8px;border-radius:4px;font-weight:600;letter-spacing:0.04em" title="Phase B will migrate this">LEGACY SCHEMA</span>';
+  html += _skillSchemaBadge(s.schemaVersion).replace('font-size:9px', 'font-size:10px').replace('padding:1px 6px', 'padding:2px 8px');
+  if (s.layout === 'folder') {
+    html += '<span style="font-size:10px;background:var(--accent)15;color:var(--accent);padding:2px 8px;border-radius:4px;font-weight:600;letter-spacing:0.04em" title="Folder layout (Anthropic spec)">FOLDER</span>';
+  } else {
+    html += '<span style="font-size:10px;background:var(--bg-tertiary);color:var(--text-muted);padding:2px 8px;border-radius:4px;font-weight:600;letter-spacing:0.04em" title="Single-file Clementine legacy layout">FLAT</span>';
+  }
   if (s.scope === 'project') {
     html += '<span style="font-size:10px;background:var(--blue)20;color:var(--blue);padding:2px 8px;border-radius:4px;font-weight:600">PROJECT-SCOPED</span>';
   }
-  if (typeof fm.version === 'number') {
-    html += '<span style="font-size:10px;color:var(--text-muted)">v' + esc(fm.version) + '</span>';
+  if (typeof ext.version === 'number') {
+    html += '<span style="font-size:10px;color:var(--text-muted);font-weight:500">v' + esc(ext.version) + '</span>';
   }
   html += '</div>';
   if (fm.description) {
     html += '<p style="font-size:13px;color:var(--text-secondary);line-height:1.5;margin:0">' + esc(fm.description) + '</p>';
+  } else {
+    html += '<p style="font-size:12px;color:var(--text-muted);font-style:italic;margin:0">No description. Anthropic spec recommends adding one so the skill can be discovered by Claude.</p>';
   }
-  html += '<div style="margin-top:8px;font-size:11px;color:var(--text-muted)">'
-       + 'File: <code style="font-size:10px">' + esc(s.filePath) + '</code>'
-       + '</div>';
+  html += '<div style="margin-top:10px;font-size:11px;color:var(--text-muted);font-family:\\x27JetBrains Mono\\x27,monospace">' + esc(s.filePath) + '</div>';
   html += '</div>';
 
-  // Used-by triggers
+  // ── 2. Validation warnings (if any)
+  if (Array.isArray(s.validation) && s.validation.length > 0) {
+    var errors = s.validation.filter(function(v) { return v.severity === 'error'; });
+    var warnings = s.validation.filter(function(v) { return v.severity === 'warning'; });
+    if (errors.length > 0) {
+      html += '<div style="margin-bottom:18px;padding:12px 14px;background:rgba(239,68,68,0.08);border:1px solid var(--red);border-radius:6px">';
+      html += '<div style="font-size:11px;color:var(--red);text-transform:uppercase;letter-spacing:0.04em;font-weight:600;margin-bottom:6px">' + errors.length + ' error' + (errors.length === 1 ? '' : 's') + ' — Anthropic spec violation</div>';
+      html += '<ul style="margin:0;padding-left:18px;font-size:12px;line-height:1.5;color:var(--text-secondary)">';
+      for (var ei = 0; ei < errors.length; ei++) {
+        html += '<li><strong style="color:var(--red)">' + esc(errors[ei].field) + ':</strong> ' + esc(errors[ei].message) + '</li>';
+      }
+      html += '</ul></div>';
+    }
+    if (warnings.length > 0) {
+      html += '<div style="margin-bottom:18px;padding:12px 14px;background:rgba(245,158,11,0.08);border:1px solid var(--yellow);border-radius:6px">';
+      html += '<div style="font-size:11px;color:var(--yellow);text-transform:uppercase;letter-spacing:0.04em;font-weight:600;margin-bottom:6px">' + warnings.length + ' suggestion' + (warnings.length === 1 ? '' : 's') + '</div>';
+      html += '<ul style="margin:0;padding-left:18px;font-size:12px;line-height:1.5;color:var(--text-secondary)">';
+      for (var wi = 0; wi < warnings.length; wi++) {
+        html += '<li><strong>' + esc(warnings[wi].field) + ':</strong> ' + esc(warnings[wi].message) + '</li>';
+      }
+      html += '</ul></div>';
+    }
+  }
+
+  // ── 3. Used-by triggers
   if (Array.isArray(s.usedByTriggers) && s.usedByTriggers.length > 0) {
     html += '<div style="margin-bottom:18px;padding:12px 14px;background:var(--bg-tertiary);border-radius:6px">';
     html += '<div style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.04em;margin-bottom:6px;font-weight:500">Used by ' + s.usedByTriggers.length + ' trigger' + (s.usedByTriggers.length === 1 ? '' : 's') + '</div>';
     html += '<div style="display:flex;flex-wrap:wrap;gap:6px">';
-    for (var i = 0; i < s.usedByTriggers.length; i++) {
-      html += '<span style="font-size:11px;background:var(--bg-secondary);padding:2px 8px;border-radius:4px;border:1px solid var(--border);color:var(--text-secondary)">' + esc(s.usedByTriggers[i]) + '</span>';
+    for (var ui = 0; ui < s.usedByTriggers.length; ui++) {
+      html += '<span style="font-size:11px;background:var(--bg-secondary);padding:2px 8px;border-radius:4px;border:1px solid var(--border);color:var(--text-secondary)">' + esc(s.usedByTriggers[ui]) + '</span>';
     }
     html += '</div></div>';
   }
 
-  // V1 fields (only render when present)
-  if (fm.inputs && Object.keys(fm.inputs).length > 0) {
-    html += renderSkillSection('Inputs', renderSkillInputs(fm.inputs));
-  }
-  if (fm.tools && (fm.tools.allow?.length || fm.tools.deny?.length)) {
-    html += renderSkillSection('Tools', renderSkillTools(fm.tools));
-  }
-  if (Array.isArray(fm.dataSources) && fm.dataSources.length > 0) {
-    html += renderSkillSection('Data sources', renderSkillDataSources(fm.dataSources));
-  }
-  if (Array.isArray(fm.stateKeys) && fm.stateKeys.length > 0) {
-    html += renderSkillSection('State keys', '<div style="display:flex;flex-wrap:wrap;gap:4px">' + fm.stateKeys.map(function(k) { return '<code style="font-size:11px;background:var(--bg-tertiary);padding:2px 6px;border-radius:3px">' + esc(k) + '</code>'; }).join('') + '</div>');
-  }
-  if (fm.success && (fm.success.criterion || fm.success.schema)) {
-    var sc = '';
-    if (fm.success.criterion) sc += '<div style="font-size:12px;line-height:1.5;color:var(--text-secondary);margin-bottom:8px"><em>Criterion:</em> ' + esc(fm.success.criterion) + '</div>';
-    if (fm.success.schema) sc += '<details><summary style="cursor:pointer;font-size:11px;color:var(--text-muted)">Schema</summary><pre style="font-size:11px;background:var(--bg-tertiary);padding:10px;border-radius:6px;margin-top:6px;overflow:auto">' + esc(JSON.stringify(fm.success.schema, null, 2)) + '</pre></details>';
-    html += renderSkillSection('Success criterion', sc);
-  }
-  if (fm.limits) {
-    var l = fm.limits;
-    var bits = [];
-    if (l.maxTurns) bits.push('max ' + l.maxTurns + ' turns');
-    if (l.maxBudgetUsd) bits.push('$' + l.maxBudgetUsd + ' budget');
-    if (l.timeoutSeconds) bits.push(l.timeoutSeconds + 's timeout');
-    if (bits.length) html += renderSkillSection('Limits', '<div style="font-size:12px;color:var(--text-secondary)">' + bits.map(esc).join(' · ') + '</div>');
+  // ── 4. Bundled files (folder-form only)
+  if (s.layout === 'folder' && Array.isArray(s.bundledFiles) && s.bundledFiles.length > 0) {
+    html += renderSkillSection('Bundled files (' + s.bundledFiles.length + ')', renderSkillBundledFiles(s.bundledFiles));
   }
 
-  // Legacy fields (preserved for the migration UI)
+  // ── 5. Clementine extensions
+  if (ext.inputs && Object.keys(ext.inputs).length > 0) {
+    html += renderSkillSection('Inputs', renderSkillInputs(ext.inputs));
+  }
+  if (ext.tools && ((ext.tools.allow && ext.tools.allow.length) || (ext.tools.deny && ext.tools.deny.length))) {
+    html += renderSkillSection('Tools', renderSkillTools(ext.tools));
+  }
+  if (Array.isArray(ext.dataSources) && ext.dataSources.length > 0) {
+    html += renderSkillSection('Data sources', renderSkillDataSources(ext.dataSources));
+  }
+  if (Array.isArray(ext.stateKeys) && ext.stateKeys.length > 0) {
+    html += renderSkillSection('State keys', '<div style="display:flex;flex-wrap:wrap;gap:4px">' + ext.stateKeys.map(function(k) { return '<code style="font-size:11px;background:var(--bg-tertiary);padding:2px 6px;border-radius:3px">' + esc(k) + '</code>'; }).join('') + '</div>');
+  }
+  if (ext.success && (ext.success.criterion || ext.success.schema)) {
+    var sc = '';
+    if (ext.success.criterion) sc += '<div style="font-size:12px;line-height:1.5;color:var(--text-secondary);margin-bottom:8px"><em>Criterion:</em> ' + esc(ext.success.criterion) + '</div>';
+    if (ext.success.schema) sc += '<details><summary style="cursor:pointer;font-size:11px;color:var(--text-muted)">Schema</summary><pre style="font-size:11px;background:var(--bg-tertiary);padding:10px;border-radius:6px;margin-top:6px;overflow:auto">' + esc(JSON.stringify(ext.success.schema, null, 2)) + '</pre></details>';
+    html += renderSkillSection('Success criterion', sc);
+  }
+  if (ext.limits) {
+    var lbits = [];
+    if (ext.limits.maxTurns) lbits.push('max ' + ext.limits.maxTurns + ' turns');
+    if (ext.limits.maxBudgetUsd) lbits.push('$' + ext.limits.maxBudgetUsd + ' budget');
+    if (ext.limits.timeoutSeconds) lbits.push(ext.limits.timeoutSeconds + 's timeout');
+    if (lbits.length) html += renderSkillSection('Limits', '<div style="font-size:12px;color:var(--text-secondary)">' + lbits.map(esc).join(' · ') + '</div>');
+  }
+
+  // ── 6. Legacy fields (preserved for migration UI in Phase B)
   if (Array.isArray(fm.triggers) && fm.triggers.length > 0) {
     html += renderSkillSection('Triggers (legacy NLP phrases)',
       '<div style="display:flex;flex-wrap:wrap;gap:4px">'
@@ -26769,30 +26837,68 @@ function renderSkillDetail(s) {
       + fm.toolsUsed.map(function(t) { return '<code style="font-size:11px;background:var(--bg-tertiary);padding:2px 6px;border-radius:3px">' + esc(t) + '</code>'; }).join('')
       + '</div>');
   }
-  if (fm.useCount || fm.lastUsed) {
-    var bits = [];
-    if (fm.useCount) bits.push('Used ' + fm.useCount + ' times');
-    if (fm.lastUsed) bits.push('Last: ' + new Date(fm.lastUsed).toLocaleString());
-    html += renderSkillSection('Usage', '<div style="font-size:12px;color:var(--text-secondary)">' + bits.map(esc).join(' · ') + '</div>');
+  if (fm.useCount || ext.lastUsed) {
+    var ubits = [];
+    if (fm.useCount) ubits.push('Used ' + fm.useCount + ' times');
+    if (ext.lastUsed) ubits.push('Last: ' + new Date(ext.lastUsed).toLocaleString());
+    html += renderSkillSection('Usage', '<div style="font-size:12px;color:var(--text-secondary)">' + ubits.map(esc).join(' · ') + '</div>');
   }
 
-  // Body — markdown rendered as preformatted text. Phase B will add a
-  // proper markdown renderer; Phase A keeps it simple to ship.
+  // ── 7. Procedure body (with line counter)
   if (s.body && s.body.trim()) {
+    var bodyClass = bodyLines > 500 ? 'color:var(--yellow)' : 'color:var(--text-muted)';
     html += '<div style="margin-top:18px">';
-    html += '<div style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.04em;margin-bottom:8px;font-weight:500">Procedure</div>';
+    html += '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">';
+    html +=   '<div style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.04em;font-weight:500">Procedure</div>';
+    html +=   '<div style="font-size:10px;' + bodyClass + ';font-family:\\x27JetBrains Mono\\x27,monospace">' + bodyLines + ' / 500 lines</div>';
+    html += '</div>';
     html += '<pre style="font-size:12px;line-height:1.55;background:var(--bg-tertiary);padding:14px 16px;border-radius:6px;white-space:pre-wrap;word-break:break-word;font-family:inherit;border:1px solid var(--border);max-height:500px;overflow:auto">' + esc(s.body) + '</pre>';
     html += '</div>';
   }
 
+  // ── 8. Schema-specific footer
   if (s.schemaVersion === 'legacy') {
-    html += '<div style="margin-top:24px;padding:12px 14px;background:var(--yellow)15;border:1px solid var(--yellow);border-radius:6px;font-size:12px;color:var(--text-secondary);line-height:1.5">'
+    html += '<div style="margin-top:24px;padding:12px 14px;background:rgba(245,158,11,0.08);border:1px solid var(--yellow);border-radius:6px;font-size:12px;color:var(--text-secondary);line-height:1.5">'
          + '<strong style="color:var(--yellow)">Legacy schema.</strong> '
-         + 'This skill uses the pre-redesign frontmatter shape (title / triggers / toolsUsed / useCount). '
-         + 'Phase B will surface a one-click migration that converts it to v1 (inputs / tools.allow / dataSources / stateKeys / success).'
+         + 'This skill uses the pre-redesign frontmatter shape. Phase B will offer a one-click migration to the Anthropic-compatible format (name + description top-level; cron-tailored fields under <code>clementine:</code>).'
+         + '</div>';
+  } else if (s.schemaVersion === 'anthropic' && s.layout === 'flat') {
+    html += '<div style="margin-top:24px;padding:12px 14px;background:rgba(59,130,246,0.06);border:1px solid var(--blue);border-radius:6px;font-size:12px;color:var(--text-secondary);line-height:1.5">'
+         + '<strong style="color:var(--blue)">Anthropic-compatible.</strong> '
+         + 'This skill matches the official Anthropic spec exactly. Consider promoting it to <strong>folder form</strong> (<code>' + esc(fm.name) + '/SKILL.md</code>) so you can bundle reference files and scripts later.'
          + '</div>';
   }
 
+  html += '</div>';
+  return html;
+}
+
+// PRD § Skills-First Phase A.5 / 1.18.108: bundled file tree.
+// Renders the folder's sibling files + scripts/ contents grouped by kind.
+// Each row: icon (📄 markdown / ⚙ script / · other), relPath, size.
+function renderSkillBundledFiles(files) {
+  var iconFor = function(kind) {
+    if (kind === 'markdown') return '📄';
+    if (kind === 'script') return '⚙';
+    return '·';
+  };
+  var fmt = function(bytes) {
+    if (bytes < 1024) return bytes + ' B';
+    if (bytes < 1024 * 1024) return Math.round(bytes / 1024) + ' KB';
+    return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+  };
+  var html = '<div style="font-family:\\x27JetBrains Mono\\x27,monospace;font-size:11px;background:var(--bg-tertiary);border-radius:6px;padding:10px 14px">';
+  for (var i = 0; i < files.length; i++) {
+    var f = files[i];
+    var indentStyle = f.relPath.indexOf('/') !== -1 ? 'padding-left:20px' : '';
+    html += '<div style="display:flex;justify-content:space-between;align-items:center;padding:3px 0;' + indentStyle + '">'
+      + '<span style="color:var(--text-secondary)">'
+      +   '<span style="display:inline-block;width:18px;color:var(--text-muted)">' + iconFor(f.kind) + '</span>'
+      +   esc(f.relPath)
+      + '</span>'
+      + '<span style="font-size:10px;color:var(--text-muted)">' + esc(fmt(f.sizeBytes)) + '</span>'
+      + '</div>';
+  }
   html += '</div>';
   return html;
 }

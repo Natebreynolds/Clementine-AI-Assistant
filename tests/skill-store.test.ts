@@ -1,9 +1,10 @@
 /**
- * Phase A — skill-store tests.
+ * Phase A / A.5 — skill-store tests.
  *
- * Covers: discovery (global + per-project + override), parse (v1 + legacy
- * frontmatter), schemaVersion detection, used-by join, parse errors,
- * filename canonicalization, .bak filtering.
+ * Covers: discovery for both layouts (folder w/ SKILL.md + flat .md),
+ * parse for all three frontmatter shapes (anthropic / clementine / legacy),
+ * Anthropic spec validations, bundled file discovery, used-by join,
+ * per-project precedence, parse errors, .bak / hidden filtering.
  */
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
@@ -15,30 +16,40 @@ import type { CronJobDefinition } from '../src/types.js';
 let tmpHome: string;
 let prevHome: string | undefined;
 
-const V1_FRONTMATTER = `---
-name: audit-inbox-check
-description: Watch inbox for audits.
-inputs:
-  channel_id:
-    type: string
-    default: "12345"
-tools:
-  allow:
-    - outlook_search
-    - discord_channel_send_buttons
-dataSources:
-  - kind: outlook
-    purpose: read emails
-stateKeys:
-  - processed_ids
-success:
-  criterion: "All new audits posted."
-limits:
-  maxTurns: 8
-version: 2
+const ANTHROPIC_FRONTMATTER = `---
+name: processing-pdfs
+description: Extracts text from PDFs and fills forms. Use when working with PDF files.
 ---
-# Body
-Procedure goes here.
+# Processing PDFs
+
+Use pdfplumber to extract text.
+`;
+
+const CLEMENTINE_FRONTMATTER = `---
+name: audit-inbox-check
+description: Watches the inbox for new audits and posts to Discord.
+clementine:
+  inputs:
+    channel_id:
+      type: string
+      default: "12345"
+  tools:
+    allow:
+      - outlook_search
+      - discord_channel_send_buttons
+  dataSources:
+    - kind: outlook
+      purpose: read incoming audit requests
+  stateKeys:
+    - processed_ids
+  success:
+    criterion: "All new audits posted."
+  limits:
+    maxTurns: 8
+  version: 2
+---
+# Audit Inbox Check
+Procedure body.
 `;
 
 const LEGACY_FRONTMATTER = `---
@@ -66,7 +77,6 @@ body
 
 beforeEach(() => {
   tmpHome = mkdtempSync(path.join(tmpdir(), 'clem-skills-'));
-  // Mirror the real layout: ~/.clementine/vault/00-System/skills/
   mkdirSync(path.join(tmpHome, 'vault', '00-System', 'skills'), { recursive: true });
   prevHome = process.env.CLEMENTINE_HOME;
   process.env.CLEMENTINE_HOME = tmpHome;
@@ -77,12 +87,27 @@ afterEach(() => {
   rmSync(tmpHome, { recursive: true, force: true });
 });
 
-function writeSkill(filename: string, content: string, dir = path.join(tmpHome, 'vault', '00-System', 'skills')): void {
+const skillsDir = (root = tmpHome) => path.join(root, 'vault', '00-System', 'skills');
+
+function writeFlatSkill(filename: string, content: string, dir = skillsDir()): void {
   mkdirSync(dir, { recursive: true });
   writeFileSync(path.join(dir, filename), content);
 }
 
-describe('listSkills — discovery + filtering', () => {
+function writeFolderSkill(folderName: string, skillContent: string, dir = skillsDir(), bundled?: Record<string, string>): void {
+  const folder = path.join(dir, folderName);
+  mkdirSync(folder, { recursive: true });
+  writeFileSync(path.join(folder, 'SKILL.md'), skillContent);
+  for (const [rel, body] of Object.entries(bundled || {})) {
+    const abs = path.join(folder, rel);
+    mkdirSync(path.dirname(abs), { recursive: true });
+    writeFileSync(abs, body);
+  }
+}
+
+// ── Discovery ─────────────────────────────────────────────────────────
+
+describe('listSkills — discovery', () => {
   it('returns empty when no skills directory exists', async () => {
     const { listSkills } = await import('../src/agent/skill-store.js');
     rmSync(path.join(tmpHome, 'vault'), { recursive: true, force: true });
@@ -94,178 +119,324 @@ describe('listSkills — discovery + filtering', () => {
     expect(listSkills()).toEqual([]);
   });
 
-  it('discovers .md files in the global skills dir', async () => {
+  it('discovers flat skill files', async () => {
     const { listSkills } = await import('../src/agent/skill-store.js');
-    writeSkill('audit-inbox-check.md', V1_FRONTMATTER);
-    writeSkill('legacy-skill.md', LEGACY_FRONTMATTER);
+    writeFlatSkill('processing-pdfs.md', ANTHROPIC_FRONTMATTER);
+    writeFlatSkill('legacy-skill.md', LEGACY_FRONTMATTER);
     const skills = listSkills();
     expect(skills).toHaveLength(2);
-    expect(skills.map((s) => s.frontmatter.name).sort()).toEqual(['audit-inbox-check', 'legacy-skill']);
-    // V1 file's `name: audit-inbox-check` happens to match its filename,
-    // but identity is the filename — proven by other tests that put
-    // frontmatter-name="audit-inbox-check" into a file named "real.md".
+    expect(skills.map((s) => s.layout)).toEqual(['legacy-skill', 'processing-pdfs'].map(() => 'flat'));
   });
 
-  it('skips .bak files', async () => {
+  it('discovers folder-form skills with SKILL.md', async () => {
     const { listSkills } = await import('../src/agent/skill-store.js');
-    writeSkill('real.md', V1_FRONTMATTER);
-    writeSkill('real.md.bak', V1_FRONTMATTER);
+    writeFolderSkill('processing-pdfs', ANTHROPIC_FRONTMATTER);
+    writeFolderSkill('audit-inbox-check', CLEMENTINE_FRONTMATTER);
+    const skills = listSkills();
+    expect(skills).toHaveLength(2);
+    expect(skills.every((s) => s.layout === 'folder')).toBe(true);
+  });
+
+  it('skips folders without SKILL.md (e.g. legacy "auto" dirs)', async () => {
+    const { listSkills } = await import('../src/agent/skill-store.js');
+    mkdirSync(path.join(skillsDir(), 'auto'), { recursive: true });
+    writeFlatSkill('real.md', ANTHROPIC_FRONTMATTER);
     expect(listSkills().map((s) => s.frontmatter.name)).toEqual(['real']);
   });
 
-  it('skips hidden files', async () => {
+  it('mixes both layouts in the same directory', async () => {
     const { listSkills } = await import('../src/agent/skill-store.js');
-    writeSkill('real.md', V1_FRONTMATTER);
-    writeSkill('.hidden.md', V1_FRONTMATTER);
+    writeFlatSkill('flat-skill.md', ANTHROPIC_FRONTMATTER);
+    writeFolderSkill('folder-skill', ANTHROPIC_FRONTMATTER);
+    const skills = listSkills();
+    expect(skills.map((s) => `${s.frontmatter.name}/${s.layout}`).sort())
+      .toEqual(['flat-skill/flat', 'folder-skill/folder']);
+  });
+
+  it('skips .bak files and hidden files', async () => {
+    const { listSkills } = await import('../src/agent/skill-store.js');
+    writeFlatSkill('real.md', ANTHROPIC_FRONTMATTER);
+    writeFlatSkill('real.md.bak', ANTHROPIC_FRONTMATTER);
+    writeFlatSkill('.hidden.md', ANTHROPIC_FRONTMATTER);
+    writeFlatSkill('notes.txt', 'whatever');
     expect(listSkills().map((s) => s.frontmatter.name)).toEqual(['real']);
   });
 
-  it('skips non-md files', async () => {
+  it('returns alphabetical order', async () => {
     const { listSkills } = await import('../src/agent/skill-store.js');
-    writeSkill('real.md', V1_FRONTMATTER);
-    writeSkill('notes.txt', 'whatever');
-    expect(listSkills().map((s) => s.frontmatter.name)).toEqual(['real']);
+    writeFolderSkill('zeta', ANTHROPIC_FRONTMATTER);
+    writeFlatSkill('alpha.md', ANTHROPIC_FRONTMATTER);
+    writeFolderSkill('mu', ANTHROPIC_FRONTMATTER);
+    expect(listSkills().map((s) => s.frontmatter.name)).toEqual(['alpha', 'mu', 'zeta']);
   });
 });
 
 describe('listSkills — global + per-project precedence', () => {
-  it('per-project skill overrides global with same name', async () => {
+  it('per-project folder shadows global flat', async () => {
     const { listSkills } = await import('../src/agent/skill-store.js');
-    writeSkill('audit.md', V1_FRONTMATTER);
+    writeFlatSkill('audit.md', ANTHROPIC_FRONTMATTER);
     const projectDir = path.join(tmpHome, 'projectA');
-    writeSkill('audit.md', V1_FRONTMATTER.replace('Watch inbox for audits.', 'PROJECT VERSION'),
+    writeFolderSkill('audit', ANTHROPIC_FRONTMATTER.replace('Extracts text from PDFs', 'PROJECT VERSION'),
       path.join(projectDir, '.clementine', 'skills'));
     const skills = listSkills({ projectWorkDir: projectDir });
     expect(skills).toHaveLength(1);
     expect(skills[0].scope).toBe('project');
-    expect(skills[0].frontmatter.description).toBe('PROJECT VERSION');
+    expect(skills[0].layout).toBe('folder');
+    expect(skills[0].frontmatter.description).toContain('PROJECT');
   });
 
-  it('per-project + global merge when names differ', async () => {
+  it('global + per-project merge when names differ', async () => {
     const { listSkills } = await import('../src/agent/skill-store.js');
-    writeSkill('global-only.md', V1_FRONTMATTER);
+    writeFlatSkill('global-only.md', ANTHROPIC_FRONTMATTER);
     const projectDir = path.join(tmpHome, 'projectA');
-    writeSkill('project-only.md', V1_FRONTMATTER,
+    writeFlatSkill('project-only.md', ANTHROPIC_FRONTMATTER,
       path.join(projectDir, '.clementine', 'skills'));
     const skills = listSkills({ projectWorkDir: projectDir });
     expect(skills.map((s) => `${s.frontmatter.name}/${s.scope}`).sort())
       .toEqual(['global-only/global', 'project-only/project']);
   });
+});
 
-  it('returns empty per-project when work_dir has no .clementine/skills/', async () => {
+// ── Schema version detection ─────────────────────────────────────────
+
+describe('schemaVersion detection', () => {
+  it('flags vanilla Anthropic skills (just name + description)', async () => {
     const { listSkills } = await import('../src/agent/skill-store.js');
-    writeSkill('global-only.md', V1_FRONTMATTER);
-    const projectDir = path.join(tmpHome, 'projectA');
-    mkdirSync(projectDir, { recursive: true });
-    const skills = listSkills({ projectWorkDir: projectDir });
-    expect(skills.map((s) => s.scope)).toEqual(['global']);
+    writeFlatSkill('s.md', ANTHROPIC_FRONTMATTER);
+    expect(listSkills()[0].schemaVersion).toBe('anthropic');
   });
 
-  it('alphabetical order by name', async () => {
+  it('flags clementine when the clementine: namespace is present', async () => {
     const { listSkills } = await import('../src/agent/skill-store.js');
-    writeSkill('zeta.md', V1_FRONTMATTER);
-    writeSkill('alpha.md', V1_FRONTMATTER);
-    writeSkill('mu.md', V1_FRONTMATTER);
-    const names = listSkills().map((s) => s.frontmatter.name);
-    expect(names).toEqual(['alpha', 'mu', 'zeta']);
+    writeFlatSkill('s.md', CLEMENTINE_FRONTMATTER);
+    expect(listSkills()[0].schemaVersion).toBe('clementine');
+  });
+
+  it('flags legacy when only top-level legacy markers are present', async () => {
+    const { listSkills } = await import('../src/agent/skill-store.js');
+    writeFlatSkill('s.md', LEGACY_FRONTMATTER);
+    expect(listSkills()[0].schemaVersion).toBe('legacy');
+  });
+
+  it('legacy beats nothing — title alone marks legacy', async () => {
+    const { listSkills } = await import('../src/agent/skill-store.js');
+    writeFlatSkill('s.md', '---\ntitle: Old\n---\nbody');
+    expect(listSkills()[0].schemaVersion).toBe('legacy');
+  });
+
+  it('clementine + legacy markers together → clementine wins', async () => {
+    const { listSkills } = await import('../src/agent/skill-store.js');
+    // A skill that has both the new namespace AND a legacy `triggers:`
+    // field — possible during migration. Treat as clementine since
+    // that's the active schema.
+    writeFlatSkill('s.md', '---\nname: m\ndescription: x\nclementine:\n  version: 1\ntriggers: [a]\n---\nb');
+    expect(listSkills()[0].schemaVersion).toBe('clementine');
   });
 });
 
+// ── Frontmatter parsing ──────────────────────────────────────────────
+
 describe('parseSkillFile — frontmatter parsing', () => {
-  it('parses v1 frontmatter into structured fields', async () => {
+  it('parses Anthropic frontmatter into top-level name + description', async () => {
     const { listSkills } = await import('../src/agent/skill-store.js');
-    writeSkill('audit-inbox-check.md', V1_FRONTMATTER);
+    writeFlatSkill('processing-pdfs.md', ANTHROPIC_FRONTMATTER);
     const skill = listSkills()[0];
-    expect(skill.frontmatter.description).toBe('Watch inbox for audits.');
-    expect(skill.frontmatter.inputs?.channel_id?.type).toBe('string');
-    expect(skill.frontmatter.tools?.allow).toContain('outlook_search');
-    expect(skill.frontmatter.dataSources?.[0].kind).toBe('outlook');
-    expect(skill.frontmatter.stateKeys).toContain('processed_ids');
-    expect(skill.frontmatter.success?.criterion).toBe('All new audits posted.');
-    expect(skill.frontmatter.limits?.maxTurns).toBe(8);
-    expect(skill.frontmatter.version).toBe(2);
+    expect(skill.frontmatter.description).toContain('Extracts text from PDFs');
+    expect(skill.frontmatter.clementine).toBeUndefined();
   });
 
-  it('parses legacy frontmatter and preserves legacy fields', async () => {
+  it('parses clementine namespace into structured extension fields', async () => {
     const { listSkills } = await import('../src/agent/skill-store.js');
-    writeSkill('audit-queue-approval.md', LEGACY_FRONTMATTER);
+    writeFlatSkill('audit.md', CLEMENTINE_FRONTMATTER);
+    const skill = listSkills()[0];
+    const ext = skill.frontmatter.clementine;
+    expect(ext).toBeDefined();
+    expect(ext!.inputs?.channel_id?.type).toBe('string');
+    expect(ext!.tools?.allow).toContain('outlook_search');
+    expect(ext!.dataSources?.[0].kind).toBe('outlook');
+    expect(ext!.stateKeys).toContain('processed_ids');
+    expect(ext!.success?.criterion).toBe('All new audits posted.');
+    expect(ext!.limits?.maxTurns).toBe(8);
+    expect(ext!.version).toBe(2);
+  });
+
+  it('parses legacy frontmatter and preserves legacy fields top-level', async () => {
+    const { listSkills } = await import('../src/agent/skill-store.js');
+    writeFlatSkill('legacy.md', LEGACY_FRONTMATTER);
     const skill = listSkills()[0];
     expect(skill.frontmatter.title).toBe('Audit Queue Approval');
     expect(skill.frontmatter.triggers).toContain('build brief');
     expect(skill.frontmatter.source).toBe('manual');
     expect(skill.frontmatter.toolsUsed).toContain('workspace_config');
     expect(skill.frontmatter.useCount).toBe(6);
-    // Legacy files have no v1-only fields.
-    expect(skill.frontmatter.inputs).toBeUndefined();
-    expect(skill.frontmatter.tools).toBeUndefined();
-    expect(skill.frontmatter.stateKeys).toBeUndefined();
+    expect(skill.frontmatter.clementine).toBeUndefined();
   });
 
-  it('uses filename as name when frontmatter omits it', async () => {
+  it('uses filename as identity (frontmatter `name:` is ignored)', async () => {
     const { listSkills } = await import('../src/agent/skill-store.js');
-    writeSkill('my-skill-from-file.md', LEGACY_FRONTMATTER);
+    writeFlatSkill('my-real-name.md', ANTHROPIC_FRONTMATTER); // YAML claims name=processing-pdfs
     const skill = listSkills()[0];
-    expect(skill.frontmatter.name).toBe('my-skill-from-file');
+    expect(skill.frontmatter.name).toBe('my-real-name');
   });
 
-  it('captures the body separately from the frontmatter', async () => {
+  it('captures the body separately from frontmatter', async () => {
     const { listSkills } = await import('../src/agent/skill-store.js');
-    writeSkill('s.md', V1_FRONTMATTER);
-    const skill = listSkills()[0];
-    expect(skill.body).toContain('Procedure goes here');
-    expect(skill.body).not.toContain('description:');
+    writeFlatSkill('s.md', ANTHROPIC_FRONTMATTER);
+    expect(listSkills()[0].body).toContain('Use pdfplumber');
+    expect(listSkills()[0].body).not.toContain('description:');
   });
 
-  it('tolerates a file with no frontmatter (treats body as everything)', async () => {
+  it('tolerates a file with no frontmatter', async () => {
     const { listSkills } = await import('../src/agent/skill-store.js');
-    writeSkill('plain.md', '# Just a heading\n\nNo frontmatter here.');
+    writeFlatSkill('plain.md', '# Just a heading\n\nNo frontmatter.');
     const skills = listSkills();
     expect(skills).toHaveLength(1);
     expect(skills[0].frontmatter.name).toBe('plain');
-    expect(skills[0].body).toContain('Just a heading');
   });
 
-  it('captures an unparseable file with a synthesized frontmatter', async () => {
+  it('captures unparseable files with a synthesized frontmatter', async () => {
     const { parseSkillFile } = await import('../src/agent/skill-store.js');
-    writeSkill('broken.md', BAD_YAML);
-    const filePath = path.join(tmpHome, 'vault', '00-System', 'skills', 'broken.md');
-    const direct = parseSkillFile(filePath, 'global');
-    // Either parseError is set OR the file parsed but with degraded
-    // frontmatter — both are acceptable; the important thing is the
-    // loader doesn't crash.
-    expect(direct.skill.frontmatter.name).toBe('broken');
-    // Most YAML parsers either error here OR silently treat the malformed
-    // line as a string property. Don't assert which — just confirm we
-    // got a Skill back instead of crashing.
-    expect(direct.skill.filePath).toBe(filePath);
+    writeFlatSkill('broken.md', BAD_YAML);
+    const result = parseSkillFile(path.join(skillsDir(), 'broken.md'), 'global');
+    expect(result.skill.frontmatter.name).toBe('broken');
+    expect(result.skill.filePath).toBe(path.join(skillsDir(), 'broken.md'));
   });
 });
 
-describe('schemaVersion detection', () => {
-  it('flags v1 files when inputs is present', async () => {
+// ── Folder-form bundled file discovery ───────────────────────────────
+
+describe('parseSkillFolder — bundled files', () => {
+  it('discovers sibling .md files', async () => {
     const { listSkills } = await import('../src/agent/skill-store.js');
-    writeSkill('v1.md', V1_FRONTMATTER);
-    expect(listSkills()[0].schemaVersion).toBe('v1');
+    writeFolderSkill('pdf', ANTHROPIC_FRONTMATTER, skillsDir(), {
+      'FORMS.md': '# Forms guide',
+      'reference.md': '# API ref',
+    });
+    const skill = listSkills()[0];
+    expect(skill.bundledFiles.map((f) => f.relPath).sort()).toEqual(['FORMS.md', 'reference.md']);
+    expect(skill.bundledFiles.every((f) => f.kind === 'markdown')).toBe(true);
   });
 
-  it('flags legacy files (only legacy fields present)', async () => {
+  it('discovers scripts/ contents and classifies them as scripts', async () => {
     const { listSkills } = await import('../src/agent/skill-store.js');
-    writeSkill('legacy.md', LEGACY_FRONTMATTER);
-    expect(listSkills()[0].schemaVersion).toBe('legacy');
+    writeFolderSkill('pdf', ANTHROPIC_FRONTMATTER, skillsDir(), {
+      'scripts/extract.py': 'print("hi")',
+      'scripts/validate.py': 'print("v")',
+    });
+    const skill = listSkills()[0];
+    expect(skill.bundledFiles).toHaveLength(2);
+    expect(skill.bundledFiles.every((f) => f.kind === 'script')).toBe(true);
   });
 
-  it('flags v1 when only tools.allow is present', async () => {
+  it('excludes SKILL.md from bundledFiles list', async () => {
     const { listSkills } = await import('../src/agent/skill-store.js');
-    writeSkill('s.md', '---\ntools:\n  allow: [Read]\n---\nbody');
-    expect(listSkills()[0].schemaVersion).toBe('v1');
+    writeFolderSkill('pdf', ANTHROPIC_FRONTMATTER, skillsDir(), { 'FORMS.md': '# F' });
+    const skill = listSkills()[0];
+    expect(skill.bundledFiles.map((f) => f.relPath)).not.toContain('SKILL.md');
   });
 
-  it('flags legacy when only toolsUsed (informational legacy field)', async () => {
+  it('includes sizeBytes for every bundled file', async () => {
     const { listSkills } = await import('../src/agent/skill-store.js');
-    writeSkill('s.md', '---\ntoolsUsed: [Read]\n---\nbody');
-    expect(listSkills()[0].schemaVersion).toBe('legacy');
+    writeFolderSkill('s', ANTHROPIC_FRONTMATTER, skillsDir(), { 'BIG.md': 'x'.repeat(2048) });
+    const skill = listSkills()[0];
+    expect(skill.bundledFiles[0].sizeBytes).toBeGreaterThan(2000);
+  });
+
+  it('top-level files sort before scripts/', async () => {
+    const { listSkills } = await import('../src/agent/skill-store.js');
+    writeFolderSkill('s', ANTHROPIC_FRONTMATTER, skillsDir(), {
+      'scripts/a.py': 'a',
+      'reference.md': 'r',
+    });
+    const skill = listSkills()[0];
+    expect(skill.bundledFiles[0].relPath).toBe('reference.md');
+    expect(skill.bundledFiles[1].relPath).toBe('scripts/a.py');
+  });
+
+  it('flat skills have an empty bundledFiles list', async () => {
+    const { listSkills } = await import('../src/agent/skill-store.js');
+    writeFlatSkill('flat.md', ANTHROPIC_FRONTMATTER);
+    expect(listSkills()[0].bundledFiles).toEqual([]);
   });
 });
+
+// ── Anthropic spec validations ───────────────────────────────────────
+
+describe('validateSkill — Anthropic spec', () => {
+  it('passes a clean Anthropic-compatible skill with no warnings', async () => {
+    const { listSkills } = await import('../src/agent/skill-store.js');
+    writeFolderSkill('processing-pdfs', ANTHROPIC_FRONTMATTER);
+    const skill = listSkills()[0];
+    expect(skill.validation.filter((v) => v.severity === 'error')).toEqual([]);
+  });
+
+  it('errors on names with uppercase letters', async () => {
+    const { listSkills } = await import('../src/agent/skill-store.js');
+    writeFolderSkill('Bad-Name', ANTHROPIC_FRONTMATTER);
+    const skill = listSkills()[0];
+    expect(skill.validation.some((v) => v.field === 'name' && v.severity === 'error')).toBe(true);
+  });
+
+  it('errors on names containing "claude" or "anthropic"', async () => {
+    const { listSkills } = await import('../src/agent/skill-store.js');
+    writeFolderSkill('claude-helper', ANTHROPIC_FRONTMATTER);
+    const skill = listSkills()[0];
+    expect(skill.validation.some((v) => v.message.includes('reserved'))).toBe(true);
+  });
+
+  it('errors on names exceeding 64 chars', async () => {
+    const { listSkills } = await import('../src/agent/skill-store.js');
+    writeFolderSkill('a'.repeat(80), ANTHROPIC_FRONTMATTER);
+    const skill = listSkills()[0];
+    expect(skill.validation.some((v) => v.message.includes('64 chars'))).toBe(true);
+  });
+
+  it('warns when description is missing', async () => {
+    const { listSkills } = await import('../src/agent/skill-store.js');
+    writeFolderSkill('no-desc', '---\nname: no-desc\n---\nbody');
+    const skill = listSkills()[0];
+    expect(skill.validation.some((v) => v.field === 'description')).toBe(true);
+  });
+
+  it('errors when description exceeds 1024 chars', async () => {
+    const { listSkills } = await import('../src/agent/skill-store.js');
+    const huge = 'x'.repeat(1500);
+    writeFolderSkill('long-desc', `---\nname: long-desc\ndescription: ${huge}\n---\nbody`);
+    const skill = listSkills()[0];
+    expect(skill.validation.some((v) => v.message.includes('1024'))).toBe(true);
+  });
+
+  it('errors when description contains XML tags', async () => {
+    const { listSkills } = await import('../src/agent/skill-store.js');
+    writeFolderSkill('xml-desc', '---\nname: xml-desc\ndescription: "Has <tag> in it"\n---\nbody');
+    const skill = listSkills()[0];
+    expect(skill.validation.some((v) => v.message.toLowerCase().includes('xml'))).toBe(true);
+  });
+
+  it('warns when body exceeds 500 lines', async () => {
+    const { listSkills } = await import('../src/agent/skill-store.js');
+    const longBody = '\n'.repeat(600);
+    writeFolderSkill('huge', '---\nname: huge\ndescription: huge body\n---\n' + longBody);
+    const skill = listSkills()[0];
+    expect(skill.validation.some((v) => v.field === 'body' && v.severity === 'warning')).toBe(true);
+  });
+
+  it('warns flat-form Anthropic skills toward folder layout', async () => {
+    const { listSkills } = await import('../src/agent/skill-store.js');
+    writeFlatSkill('processing-pdfs.md', ANTHROPIC_FRONTMATTER);
+    const skill = listSkills()[0];
+    expect(skill.validation.some((v) => v.field === 'layout' && v.severity === 'warning')).toBe(true);
+  });
+
+  it('does not nag legacy flat skills about layout (they pre-date the spec)', async () => {
+    const { listSkills } = await import('../src/agent/skill-store.js');
+    writeFlatSkill('legacy.md', LEGACY_FRONTMATTER);
+    const skill = listSkills()[0];
+    expect(skill.validation.some((v) => v.field === 'layout')).toBe(false);
+  });
+});
+
+// ── Used-by join ─────────────────────────────────────────────────────
 
 describe('usedByTriggers join', () => {
   function job(name: string, skills?: string[]): CronJobDefinition {
@@ -274,8 +445,8 @@ describe('usedByTriggers join', () => {
 
   it('populates usedByTriggers from CronJobDefinition.skills[]', async () => {
     const { listSkills } = await import('../src/agent/skill-store.js');
-    writeSkill('audit-inbox-check.md', V1_FRONTMATTER);
-    writeSkill('orphan.md', V1_FRONTMATTER.replace('audit-inbox-check', 'orphan'));
+    writeFolderSkill('audit-inbox-check', ANTHROPIC_FRONTMATTER);
+    writeFlatSkill('orphan.md', ANTHROPIC_FRONTMATTER);
     const jobs = [
       job('cron-1', ['audit-inbox-check']),
       job('cron-2', ['audit-inbox-check', 'orphan']),
@@ -286,36 +457,71 @@ describe('usedByTriggers join', () => {
     expect(audit.usedByTriggers.sort()).toEqual(['cron-1', 'cron-2']);
     expect(orphan.usedByTriggers).toEqual(['cron-2']);
   });
-
-  it('returns empty usedByTriggers when no jobs reference the skill', async () => {
-    const { listSkills } = await import('../src/agent/skill-store.js');
-    writeSkill('lonely.md', V1_FRONTMATTER);
-    expect(listSkills({ jobs: [] })[0].usedByTriggers).toEqual([]);
-  });
 });
 
+// ── getSkill ─────────────────────────────────────────────────────────
+
 describe('getSkill', () => {
-  it('returns null when skill does not exist', async () => {
+  it('returns null when nothing matches', async () => {
     const { getSkill } = await import('../src/agent/skill-store.js');
     expect(getSkill('nonexistent')).toBeNull();
   });
 
-  it('returns global skill by name', async () => {
+  it('finds folder-form skill', async () => {
     const { getSkill } = await import('../src/agent/skill-store.js');
-    writeSkill('audit.md', V1_FRONTMATTER);
-    const s = getSkill('audit');
-    expect(s).not.toBeNull();
-    expect(s!.scope).toBe('global');
+    writeFolderSkill('pdf', ANTHROPIC_FRONTMATTER);
+    const s = getSkill('pdf');
+    expect(s?.layout).toBe('folder');
   });
 
-  it('per-project takes precedence over global', async () => {
+  it('finds flat-form skill', async () => {
     const { getSkill } = await import('../src/agent/skill-store.js');
-    writeSkill('audit.md', V1_FRONTMATTER);
-    const projectDir = path.join(tmpHome, 'projectA');
-    writeSkill('audit.md', V1_FRONTMATTER.replace('Watch', 'PROJECT'),
+    writeFlatSkill('pdf.md', ANTHROPIC_FRONTMATTER);
+    const s = getSkill('pdf');
+    expect(s?.layout).toBe('flat');
+  });
+
+  it('per-project beats global', async () => {
+    const { getSkill } = await import('../src/agent/skill-store.js');
+    writeFlatSkill('pdf.md', ANTHROPIC_FRONTMATTER);
+    const projectDir = path.join(tmpHome, 'p');
+    writeFolderSkill('pdf', ANTHROPIC_FRONTMATTER.replace('Extracts text from PDFs', 'PROJECT'),
       path.join(projectDir, '.clementine', 'skills'));
-    const s = getSkill('audit', { projectWorkDir: projectDir });
-    expect(s!.scope).toBe('project');
-    expect(s!.frontmatter.description).toContain('PROJECT');
+    const s = getSkill('pdf', { projectWorkDir: projectDir });
+    expect(s?.scope).toBe('project');
+    expect(s?.layout).toBe('folder');
+    expect(s?.frontmatter.description).toContain('PROJECT');
+  });
+});
+
+// ── readBundledFile ──────────────────────────────────────────────────
+
+describe('readBundledFile', () => {
+  it('reads a sibling markdown file', async () => {
+    const { listSkills, readBundledFile } = await import('../src/agent/skill-store.js');
+    writeFolderSkill('pdf', ANTHROPIC_FRONTMATTER, skillsDir(), { 'FORMS.md': '# Forms\nbody' });
+    const skill = listSkills()[0];
+    expect(readBundledFile(skill, 'FORMS.md')).toContain('# Forms');
+  });
+
+  it('returns null for flat skills', async () => {
+    const { listSkills, readBundledFile } = await import('../src/agent/skill-store.js');
+    writeFlatSkill('flat.md', ANTHROPIC_FRONTMATTER);
+    const skill = listSkills()[0];
+    expect(readBundledFile(skill, 'anything.md')).toBeNull();
+  });
+
+  it('rejects directory traversal attempts', async () => {
+    const { listSkills, readBundledFile } = await import('../src/agent/skill-store.js');
+    writeFolderSkill('pdf', ANTHROPIC_FRONTMATTER, skillsDir(), { 'FORMS.md': 'body' });
+    const skill = listSkills()[0];
+    expect(readBundledFile(skill, '../../etc/passwd')).toBeNull();
+  });
+
+  it('returns null for missing files', async () => {
+    const { listSkills, readBundledFile } = await import('../src/agent/skill-store.js');
+    writeFolderSkill('pdf', ANTHROPIC_FRONTMATTER);
+    const skill = listSkills()[0];
+    expect(readBundledFile(skill, 'nonexistent.md')).toBeNull();
   });
 });
