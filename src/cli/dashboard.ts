@@ -24213,9 +24213,17 @@ function operationUsageBadge(usage) {
   return '<span class="badge badge-blue" title="' + esc(formatTokens(usage.totalInput || 0)) + ' input, ' + esc(formatTokens(usage.totalOutput || 0)) + ' output">' + esc(formatTokens(usage.totalTokens || 0)) + ' tok 7d</span>';
 }
 
+// PRD §pretty-cron / 1.18.111: pretty primary, raw cron in a hover
+// tooltip. Power users still get the literal expression on hover; casual
+// users never have to read "0 8-18 * * 1-5". Falls back to raw inline
+// (with a help-cursor hint) when describeCron can't summarize.
 function operationScheduleHtml(schedule) {
-  var desc = describeCron(schedule || '');
-  return desc ? esc(desc) + ' <code>' + esc(schedule) + '</code>' : '<code style="color:var(--accent)">' + esc(schedule || '') + '</code>';
+  var raw = schedule || '';
+  var desc = describeCron(raw);
+  if (desc) {
+    return '<span title="' + esc(raw) + '" style="cursor:help">' + esc(desc) + '</span>';
+  }
+  return '<code title="' + esc(raw) + '" style="color:var(--accent);cursor:help">' + esc(raw) + '</code>';
 }
 
 function operationSectionHeader(title, subtitle, badgeClass, badgeText, marginTop) {
@@ -29331,42 +29339,137 @@ function updateScheduleHint() {
 
 const monthNames = ['','Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
 
+// PRD §pretty-cron / 1.18.111 — describe a cron expression in casual
+// human-readable form. Output style:
+//   - "Mondays at 8 AM" not "Every Monday at 8:00 AM"
+//   - "5 PM" not "5:00 PM" when minutes=0
+//   - "8 AM–6 PM" (en-dash range) for hour ranges
+//   - "Every minute" / "Every 2 minutes" / "Every 4 hours"
+//   - "Hourly weekdays 8 AM–6 PM" for the business-hours pattern
+//   - Falls back to '' when the expression is too exotic to summarize;
+//     the renderer then shows the raw cron only as a last resort.
 function describeCron(expr) {
-  const parts = expr.split(/\\s+/);
+  if (!expr || typeof expr !== 'string') return '';
+  // @aliases first — common shortcuts.
+  var aliases = {
+    '@yearly': 'Once a year (Jan 1, midnight)',
+    '@annually': 'Once a year (Jan 1, midnight)',
+    '@monthly': 'First of every month, midnight',
+    '@weekly': 'Sundays at midnight',
+    '@daily': 'Every day at midnight',
+    '@hourly': 'Every hour',
+    '@reboot': 'On daemon start',
+  };
+  if (aliases[expr]) return aliases[expr];
+
+  var parts = expr.trim().split(/\\s+/);
   if (parts.length !== 5) return '';
-  const [min, hour, dom, month, dow] = parts;
+  var min = parts[0], hour = parts[1], dom = parts[2], month = parts[3], dow = parts[4];
 
-  // Every N minutes
-  if (min.startsWith('*/')) return 'Every ' + min.slice(2) + ' minutes';
-  // Every N hours
-  if (hour.startsWith('*/')) return 'Every ' + hour.slice(2) + ' hours';
+  // ── Sub-hour cadence ────────────────────────────────────────────────
+  if (min === '*' && hour === '*' && dom === '*' && month === '*' && dow === '*') return 'Every minute';
+  if (min.startsWith('*/')) {
+    var n = parseInt(min.slice(2), 10);
+    if (Number.isFinite(n)) return n === 1 ? 'Every minute' : 'Every ' + n + ' minutes';
+  }
+  // Every N hours (e.g. "0 */2 * * *")
+  if (hour.startsWith('*/') && (min === '0' || min === '*')) {
+    var nh = parseInt(hour.slice(2), 10);
+    if (Number.isFinite(nh)) return nh === 1 ? 'Every hour' : 'Every ' + nh + ' hours';
+  }
 
-  const time = formatTime(+hour, +min);
+  // ── Hour ranges (e.g. "0 8-18 * * 1-5" — hourly during business hours) ──
+  var rangeMatch = /^(\d{1,2})-(\d{1,2})$/.exec(hour);
+  if (rangeMatch && (min === '0' || min === '*')) {
+    var startH = parseInt(rangeMatch[1], 10);
+    var endH = parseInt(rangeMatch[2], 10);
+    if (Number.isFinite(startH) && Number.isFinite(endH)) {
+      var span = formatHour(startH) + '–' + formatHour(endH);
+      if (dow === '1-5') return 'Hourly weekdays ' + span;
+      if (dow === '*' && dom === '*' && month === '*') return 'Hourly ' + span;
+      if (/^[0-6]$/.test(dow)) return 'Hourly ' + plural(dayNames[+dow]) + ' ' + span;
+    }
+  }
+
+  // ── Comma-list of hours at fixed minute (e.g. "0 8,12,16 * * *") ────
+  // Check this BEFORE parseInt — parseInt is lenient and would parse
+  // "8,12,16" as 8, missing the multi-hour case entirely.
+  if (hour.indexOf(',') !== -1 && min !== '*' && !min.startsWith('*/')) {
+    var minN = parseInt(min, 10);
+    if (Number.isFinite(minN)) {
+      return 'Daily at ' + hour.split(',').map(function(h) { return formatTimePretty(+h, minN); }).join(', ');
+    }
+  }
+
+  // ── Single-time-of-day patterns ─────────────────────────────────────
+  var hourNum = parseInt(hour, 10);
+  var minNum = parseInt(min, 10);
+  if (!Number.isFinite(hourNum) || !Number.isFinite(minNum)) return '';
+  // Reject parseInt's lenient mode: a hour like "8,12" would parse to 8.
+  if (String(hourNum) !== hour || String(minNum) !== min) return '';
+  var time = formatTimePretty(hourNum, minNum);
 
   // Specific date: day + month set (e.g. "10 16 1 3 *" = Mar 1 at 4:10 PM)
   if (dom !== '*' && month !== '*') {
-    const monthStr = monthNames[+month] || 'Month ' + month;
+    var monthStr = monthNames[+month] || ('Month ' + month);
     return monthStr + ' ' + dom + ' at ' + time;
   }
 
   // Day of month only (e.g. "0 9 15 * *" = 15th of every month)
   if (dom !== '*' && month === '*' && dow === '*') {
-    const suffix = +dom === 1 ? 'st' : +dom === 2 ? 'nd' : +dom === 3 ? 'rd' : 'th';
-    return dom + suffix + ' of every month at ' + time;
+    return ordinal(+dom) + ' of every month at ' + time;
   }
 
-  // Weekdays
-  if (dow === '1-5' && !hour.includes(',')) return 'Weekdays at ' + time;
+  // Weekdays (Mon-Fri)
+  if (dow === '1-5') return 'Weekdays at ' + time;
+
+  // Specific weekday → pluralize ("Mondays at 8 AM" not "Every Monday at 8 AM")
+  if (/^[0-6]$/.test(dow)) return plural(dayNames[+dow]) + ' at ' + time;
+
+  // Multiple specific weekdays (e.g. "0 9 * * 1,3,5")
+  if (/^[0-6](,[0-6])+$/.test(dow)) {
+    return dow.split(',').map(function(d) { return shortDay(+d); }).join(', ') + ' at ' + time;
+  }
+
   // Every day
-  if (dow === '*' && dom === '*' && month === '*' && !hour.includes(',') && !hour.includes('/')) return 'Every day at ' + time;
-  // Specific weekday
-  if (/^[0-6]$/.test(dow) && !hour.includes(',')) return 'Every ' + dayNames[+dow] + ' at ' + time;
-  // Multiple weekdays (e.g. "0 9 * * 1,3,5")
-  if (/^[0-6](,[0-6])+$/.test(dow)) return dow.split(',').map(d => dayNames[+d]).join(', ') + ' at ' + time;
-  // Multiple hours
-  if (hour.includes(',')) return 'Daily at ' + hour.split(',').map(h => formatTime(+h, +min)).join(', ');
+  if (dow === '*' && dom === '*' && month === '*') return 'Every day at ' + time;
 
   return '';
+}
+
+function plural(day) {
+  // "Monday" → "Mondays". Days end in y already so just append 's'.
+  return day + 's';
+}
+
+function shortDay(d) {
+  // Compact form for multi-day lists: "Mon, Wed, Fri".
+  return ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'][d] || ('day ' + d);
+}
+
+function ordinal(n) {
+  // 1st / 2nd / 3rd / 4th… for the day-of-month phrasing.
+  if (n >= 11 && n <= 13) return n + 'th';
+  var lastDigit = n % 10;
+  if (lastDigit === 1) return n + 'st';
+  if (lastDigit === 2) return n + 'nd';
+  if (lastDigit === 3) return n + 'rd';
+  return n + 'th';
+}
+
+function formatHour(h) {
+  // Compact hour-only format used in ranges: "8 AM" / "12 PM" / "6 PM".
+  var ampm = h >= 12 ? 'PM' : 'AM';
+  var hr = h === 0 ? 12 : (h > 12 ? h - 12 : h);
+  return hr + ' ' + ampm;
+}
+
+function formatTimePretty(h, m) {
+  // "8 AM" when minutes=0, "8:30 AM" otherwise. Casual, no leading zeros.
+  if (m === 0) return formatHour(h);
+  var ampm = h >= 12 ? 'PM' : 'AM';
+  var hr = h === 0 ? 12 : (h > 12 ? h - 12 : h);
+  return hr + ':' + String(m).padStart(2, '0') + ' ' + ampm;
 }
 
 function setScheduleFromCron(expr) {
