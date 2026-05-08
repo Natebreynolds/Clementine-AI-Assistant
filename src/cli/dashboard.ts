@@ -4435,7 +4435,8 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
         detached: true,
         stdio: ['ignore', 'pipe', 'pipe'],
         cwd: BASE_DIR,
-        env: { ...process.env, CLEMENTINE_HOME: BASE_DIR },
+        // 1.18.84: pass the trigger source so cron.ts stamps it on the run entry.
+        env: { ...process.env, CLEMENTINE_HOME: BASE_DIR, CRON_RUN_TRIGGER: 'manual' },
       });
 
       // Capture stderr for error reporting
@@ -23636,12 +23637,13 @@ function renderRunListBody(allRuns) {
     var startedAt = entry.startedAt ? new Date(entry.startedAt) : null;
     var startedLabel = startedAt ? startedAt.toLocaleString() : '—';
     var durationLabel = entry.durationMs != null ? formatDurationMs(entry.durationMs) : '—';
-    // Trigger heuristic until we persist it for real (Phase 3.1):
-    //   'unleashed' mode + manual cron run = manual; otherwise scheduled.
-    // The cron-running.json sidecar already carries pid which can hint at
-    // manual but isn't on terminal entries. Best-effort label only.
-    var triggerLabel = entry.attempt > 1 ? 'retry' : 'scheduled';
-    var triggerColor = 'var(--text-muted)';
+    // 1.18.84: real persisted trigger field. Falls back to a heuristic for
+    // pre-1.18.84 run entries that don't have the field set.
+    var triggerLabel = entry.trigger || (entry.attempt > 1 ? 'retry' : 'scheduled');
+    var triggerColor = entry.trigger === 'manual' ? 'var(--accent)'
+      : entry.trigger === 'after' ? 'var(--purple)'
+      : entry.trigger === 'discord' ? 'var(--blue)'
+      : 'var(--text-muted)';
     // Goal cell
     var goalCell = '<div></div>';
     if (entry.goalCheck) {
@@ -23757,7 +23759,14 @@ async function refreshToolsMcpCatalog() {
   try {
     var sR = await apiFetch('/api/mcp-status');
     var statusJson = await sR.json();
-    statusMap = statusJson || {};
+    // /api/mcp-status returns { servers: [{name, status}], updatedAt }.
+    // Build a name → entry lookup so renderMcpCatalogCard can probe by name.
+    if (statusJson && Array.isArray(statusJson.servers)) {
+      for (var si = 0; si < statusJson.servers.length; si++) {
+        var entry = statusJson.servers[si];
+        if (entry && entry.name) statusMap[entry.name] = entry;
+      }
+    }
   } catch (e) { /* status is optional — servers still render without it */ }
   try {
     var lR = await apiFetch('/api/mcp-servers');

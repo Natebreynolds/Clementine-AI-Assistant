@@ -25,6 +25,50 @@
 import path from 'node:path';
 import { query, type AgentDefinition, type SDKAssistantMessage, type SDKResultMessage } from '@anthropic-ai/claude-agent-sdk';
 import pino from 'pino';
+
+/**
+ * Module-level cache of MCP server statuses from the most recent SDK
+ * init message. Populated by every runAgent / PersonalAssistant query
+ * stream that captures `system/init`. Read by Assistant.getMcpStatus()
+ * and the dashboard's Tools & MCP catalog page.
+ *
+ * Pre-1.18.84 the assistant declared a private _lastMcpStatus but no
+ * code wrote to it — getMcpStatus() always returned empty, making the
+ * catalog status pills misleading. The shared module cache fixes that
+ * without coupling assistant.ts to runAgent's stream loop.
+ */
+let _lastMcpStatusSnapshot: { servers: Array<{ name: string; status: string }>; updatedAt: string } = {
+  servers: [],
+  updatedAt: '',
+};
+
+/** Read the latest MCP status snapshot. Safe to call from any module. */
+export function getLatestMcpStatusSnapshot(): { servers: Array<{ name: string; status: string }>; updatedAt: string } {
+  return { servers: [..._lastMcpStatusSnapshot.servers], updatedAt: _lastMcpStatusSnapshot.updatedAt };
+}
+
+/** Write a fresh snapshot. Called from system/init handlers. */
+export function recordMcpStatusFromSystemInit(rawMcpServers: unknown): void {
+  if (!Array.isArray(rawMcpServers)) return;
+  const servers: Array<{ name: string; status: string }> = [];
+  for (const entry of rawMcpServers) {
+    if (!entry || typeof entry !== 'object') continue;
+    const e = entry as { name?: unknown; status?: unknown };
+    if (typeof e.name !== 'string' || !e.name) continue;
+    servers.push({ name: e.name, status: typeof e.status === 'string' ? e.status : 'unknown' });
+  }
+  _lastMcpStatusSnapshot = { servers, updatedAt: new Date().toISOString() };
+}
+
+/** Drop one server from the cache so the next query repopulates it. */
+export function invalidateMcpStatusEntry(name: string): { cleared: boolean; updatedAt: string } {
+  const before = _lastMcpStatusSnapshot.servers.length;
+  _lastMcpStatusSnapshot = {
+    servers: _lastMcpStatusSnapshot.servers.filter((s) => s.name !== name),
+    updatedAt: new Date().toISOString(),
+  };
+  return { cleared: _lastMcpStatusSnapshot.servers.length < before, updatedAt: _lastMcpStatusSnapshot.updatedAt };
+}
 import {
   BASE_DIR,
   PKG_DIR,
@@ -357,6 +401,15 @@ export async function runAgent(prompt: string, opts: RunAgentOptions): Promise<R
   for await (const message of stream) {
     if (message.type === 'system' && message.subtype === 'init') {
       sessionId = (message as { session_id?: string }).session_id ?? '';
+      // PRD Phase 2 / 1.18.84 correctness: capture the SDK-reported MCP
+      // server status so getMcpStatus() (and the dashboard's Tools & MCP
+      // catalog) actually has data. The init message includes
+      // mcp_servers: Array<{ name, status }> per the SDK protocol.
+      const mcpServersRaw = (message as { mcp_servers?: unknown }).mcp_servers;
+      if (mcpServersRaw) {
+        try { recordMcpStatusFromSystemInit(mcpServersRaw); }
+        catch { /* non-fatal */ }
+      }
       logger.debug({ sessionKey: opts.sessionKey, sdkSessionId: sessionId }, 'runAgent: SDK session initialized');
       continue;
     }

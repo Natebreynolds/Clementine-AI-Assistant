@@ -1003,7 +1003,7 @@ export class CronScheduler {
     return ctx;
   }
 
-  private async runJob(job: CronJobDefinition): Promise<void> {
+  private async runJob(job: CronJobDefinition, trigger: NonNullable<CronRunEntry['trigger']> = 'scheduled'): Promise<void> {
     const creditBlock = getBackgroundCreditBlock();
     if (creditBlock) {
       logger.warn({ job: job.name, until: creditBlock.until }, 'Cron job skipped — Claude credit block active');
@@ -1375,6 +1375,8 @@ export class CronScheduler {
             outputPreview: response ? response.slice(0, 200) : undefined,
             advisorApplied,
             terminalReason,
+            // 1.18.84: persist the actual trigger source for the Run list filter.
+            trigger,
             // Trick capability metadata — surfaced by the dashboard's
             // "ran with: …" line. Omit empty arrays to keep the JSONL light.
             ...(cronMetadata?.skillsApplied?.length ? { skillsApplied: cronMetadata.skillsApplied } : {}),
@@ -1444,7 +1446,8 @@ export class CronScheduler {
           const dependents = this.jobs.filter(j => j.after === job.name && j.enabled && !this.disabledJobs.has(j.name));
           for (const dep of dependents) {
             logger.info(`Chain: '${job.name}' succeeded — triggering '${dep.name}'`);
-            this.runJob(dep).catch((err) => {
+            // 1.18.84: chained-after triggers carry trigger='after' for the Run list filter.
+            this.runJob(dep, 'after').catch((err) => {
               logger.error({ err, job: dep.name }, `Chained job '${dep.name}' failed`);
             });
           }
