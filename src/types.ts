@@ -522,6 +522,28 @@ export interface RunEvent {
   agentId?: string;
 }
 
+/**
+ * PRD §9 / 1.18.87: 11-category failure taxonomy. Replaces the existing
+ * JobHealthKind union for surfacing-on-the-dashboard purposes (job-health.ts
+ * stays as the lower-level classifier and feeds into this).
+ *
+ * Stamped on CronRunEntry.failureCategory at write-time when the run is a
+ * failure (status: 'error' | 'timeout' | 'lost' | retried-final). Powers
+ * the Run list filter chip and the Run detail viewer's failure pill.
+ */
+export type RunFailureCategory =
+  | 'model_error'           // Anthropic API errored (usage_blocked, auth, rate_limited, 5xx)
+  | 'model_output_error'    // LLM responded but output unusable (refusal, empty, invalid tool-call JSON)
+  | 'tool_error'            // Tool/function threw or returned non-zero / blocked
+  | 'tool_timeout'          // Tool exceeded deadline
+  | 'schema_error'          // success_schema validation failed or tool I/O failed JSON-schema validation
+  | 'context_error'         // Context window exceeded, prompt too long, RAG missing
+  | 'prompt_error'          // Guardrail trip, permission deny, prompt-injection
+  | 'agent_loop_error'      // num_turns >= max_turns, infinite-loop detected
+  | 'subagent_error'        // Failure inside a delegated sub-agent
+  | 'infrastructure_error'  // SDK runtime, worker crash, OOM, deserialization
+  | 'cancelled';            // User/system interrupted the run
+
 export interface CronRunEntry {
   /** PRD §6 / 1.18.85: stable run UUID. Optional only because pre-1.18.85
    *  entries don't have it; new entries always do. The Event store keys
@@ -571,6 +593,10 @@ export interface CronRunEntry {
    *  Discord) so the Run list can filter by source instead of guessing
    *  via heuristics on attempt count. */
   trigger?: 'manual' | 'scheduled' | 'webhook' | 'api' | 'fork' | 'resume' | 'discord' | 'after';
+  /** PRD §9 / 1.18.87: PRD-canonical failure bucket. Set on every entry
+   *  whose status indicates a failure (error/timeout/lost/cancelled). The
+   *  Run list filter chip and Run detail header read from this field. */
+  failureCategory?: RunFailureCategory;
   /** PRD Phase 1: did the run accomplish what it was supposed to?
    *  Computed at run-end when the Task has successSchema or successCriteriaText.
    *  - status='pass'      both configured checks passed (or the only one configured did)

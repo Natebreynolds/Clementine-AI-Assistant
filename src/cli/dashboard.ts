@@ -23564,6 +23564,7 @@ function renderRunningCard(item) {
 var _runListState = {
   filterStatus: 'all',     // 'all' | 'failed' | 'ok'
   filterWindow: '24h',     // '24h' | '7d' | 'all'
+  filterCategory: 'all',   // 'all' | <one of the 11 PRD failure categories>
   filterText: '',          // free-text task name match
   data: [],                // raw runs from /api/cron/runs
 };
@@ -23576,13 +23577,15 @@ function _runListLoadDefaultView() {
       var saved = JSON.parse(raw);
       _runListState.filterStatus = saved.filterStatus || 'all';
       _runListState.filterWindow = saved.filterWindow || '24h';
+      _runListState.filterCategory = saved.filterCategory || 'all';
       _runListState.filterText = saved.filterText || '';
       return;
     }
   } catch (e) { /* ignore */ }
-  // Default: failures, last 24h.
+  // Default: failures, last 24h, all categories.
   _runListState.filterStatus = 'failed';
   _runListState.filterWindow = '24h';
+  _runListState.filterCategory = 'all';
   _runListState.filterText = '';
 }
 
@@ -23591,6 +23594,7 @@ function _runListSaveView() {
     localStorage.setItem('runListView', JSON.stringify({
       filterStatus: _runListState.filterStatus,
       filterWindow: _runListState.filterWindow,
+      filterCategory: _runListState.filterCategory,
       filterText: _runListState.filterText,
     }));
   } catch (e) { /* ignore */ }
@@ -23602,11 +23606,15 @@ function _runListApplyFilters(runs) {
     : _runListState.filterWindow === '7d' ? 7 * 24 * 60 * 60 * 1000
     : Infinity;
   var query = (_runListState.filterText || '').trim().toLowerCase();
+  var catFilter = _runListState.filterCategory;
   return runs.filter(function(r) {
     if (_runListState.filterStatus === 'failed') {
       if (r.status !== 'error' && r.status !== 'timeout' && r.status !== 'lost') return false;
     } else if (_runListState.filterStatus === 'ok') {
       if (r.status !== 'ok') return false;
+    }
+    if (catFilter && catFilter !== 'all') {
+      if (r.failureCategory !== catFilter) return false;
     }
     if (query && String(r.jobName || '').toLowerCase().indexOf(query) === -1) return false;
     if (windowMs !== Infinity && r.startedAt) {
@@ -23660,6 +23668,21 @@ function renderRunListBody(allRuns) {
     { value: '7d',  label: 'Last 7 days' },
     { value: 'all', label: 'All time' },
   ], 'filterWindow');
+  // PRD §9 / 1.18.87: 11-category failure filter. Build the option list from
+  // the categories actually present in the loaded data so the chip row stays
+  // compact (don't show buckets that have zero runs).
+  var seenCats = {};
+  for (var ci = 0; ci < allRuns.length; ci++) {
+    var c = allRuns[ci].failureCategory;
+    if (c) seenCats[c] = (seenCats[c] || 0) + 1;
+  }
+  var catOptions = [{ value: 'all', label: 'Any category' }];
+  Object.keys(seenCats).sort().forEach(function(k) {
+    catOptions.push({ value: k, label: _runListCategoryLabel(k) + ' (' + seenCats[k] + ')' });
+  });
+  if (catOptions.length > 1) {
+    html += _runListChip('Category', catOptions, 'filterCategory');
+  }
   html += '<input type="search" placeholder="Filter by task name…" value="' + esc(_runListState.filterText) + '" oninput="onRunListSearch(this.value)" style="flex:1;min-width:200px;max-width:320px;padding:6px 10px;font-size:12px;border:1px solid var(--border);border-radius:6px;background:var(--bg-secondary);color:var(--text-primary)">';
   html += '<button class="btn-sm" onclick="resetRunListFilters()" style="font-size:11px">Reset to default</button>';
   html += '</div>';
@@ -23697,6 +23720,13 @@ function renderRunListBody(allRuns) {
       : entry.trigger === 'after' ? 'var(--purple)'
       : entry.trigger === 'discord' ? 'var(--blue)'
       : 'var(--text-muted)';
+    // 1.18.87: failure category badge in the preview area when set.
+    var categoryBadge = '';
+    if (entry.failureCategory) {
+      var catLabel = _runListCategoryLabel(entry.failureCategory);
+      var catColor = _runListCategoryColor(entry.failureCategory);
+      categoryBadge = '<span style="display:inline-block;background:' + catColor + '20;color:' + catColor + ';padding:1px 6px;border-radius:4px;font-size:10px;font-weight:600;letter-spacing:0.04em;margin-right:4px">' + esc(catLabel) + '</span>';
+    }
     // Goal cell
     var goalCell = '<div></div>';
     if (entry.goalCheck) {
@@ -23717,6 +23747,7 @@ function renderRunListBody(allRuns) {
       +    goalCell
       +    '<div style="min-width:0">'
       +      '<div style="font-weight:500;color:var(--text-primary);font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + esc(jobName) + '">' + esc(jobName) + (entry.attempt > 1 ? ' · attempt ' + esc(entry.attempt) : '') + '</div>'
+      +      (categoryBadge ? '<div style="margin-top:2px">' + categoryBadge + '</div>' : '')
       +      preview
       +    '</div>'
       +    '<div style="font-size:11px;color:' + triggerColor + ';line-height:18px">' + esc(triggerLabel) + '</div>'
@@ -23727,6 +23758,32 @@ function renderRunListBody(allRuns) {
   }
   html += '</div>';
   return html;
+}
+
+// PRD §9 / 1.18.87: failure category labels + colors mirror
+// failure-taxonomy.ts on the server. Kept inline so the dashboard JS
+// doesn't need to round-trip for the lookup.
+function _runListCategoryLabel(cat) {
+  return ({
+    model_error: 'Model API',
+    model_output_error: 'Bad LLM output',
+    tool_error: 'Tool failed',
+    tool_timeout: 'Tool timeout',
+    schema_error: 'Schema mismatch',
+    context_error: 'Context exceeded',
+    prompt_error: 'Blocked by policy',
+    agent_loop_error: 'Loop limit',
+    subagent_error: 'Subagent failed',
+    infrastructure_error: 'Infrastructure',
+    cancelled: 'Cancelled',
+  })[cat] || cat;
+}
+function _runListCategoryColor(cat) {
+  if (cat === 'cancelled') return 'var(--text-muted)';
+  if (cat === 'tool_timeout' || cat === 'agent_loop_error' || cat === 'context_error') return 'var(--yellow)';
+  if (cat === 'prompt_error' || cat === 'schema_error') return 'var(--purple)';
+  if (cat === 'model_error' || cat === 'model_output_error') return 'var(--accent)';
+  return 'var(--red)';
 }
 
 function _runListChip(label, options, stateKey) {
@@ -23762,6 +23819,7 @@ function onRunListSearch(value) {
 function resetRunListFilters() {
   _runListState.filterStatus = 'failed';
   _runListState.filterWindow = '24h';
+  _runListState.filterCategory = 'all';
   _runListState.filterText = '';
   _runListSaveView();
   var panel = document.getElementById('panel-runs');
