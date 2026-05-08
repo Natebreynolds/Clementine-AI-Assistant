@@ -16214,6 +16214,9 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
         <button class="build-tab-btn active" data-build-tab="crons" onclick="switchBuildTab('crons')" style="padding:8px 14px;border-radius:6px 6px 0 0;border:none;background:transparent;color:var(--text-primary);font-size:13px;font-weight:500;cursor:pointer;border-bottom:2px solid transparent">
           <span style="margin-right:6px">📅</span>Tasks <span id="build-tab-cron-count" style="display:none;margin-left:4px;font-size:10px;background:var(--bg-tertiary);padding:1px 6px;border-radius:999px;color:var(--text-muted)">0</span>
         </button>
+        <button class="build-tab-btn" data-build-tab="runs" onclick="switchBuildTab('runs')" style="padding:8px 14px;border-radius:6px 6px 0 0;border:none;background:transparent;color:var(--text-secondary);font-size:13px;font-weight:500;cursor:pointer;border-bottom:2px solid transparent">
+          <span style="margin-right:6px">🕒</span>Runs <span id="build-tab-runs-count" style="display:none;margin-left:4px;font-size:10px;background:var(--bg-tertiary);padding:1px 6px;border-radius:999px;color:var(--text-muted)">0</span>
+        </button>
         <button class="build-tab-btn" data-build-tab="toolsmcp" onclick="switchBuildTab('toolsmcp')" style="padding:8px 14px;border-radius:6px 6px 0 0;border:none;background:transparent;color:var(--text-secondary);font-size:13px;font-weight:500;cursor:pointer;border-bottom:2px solid transparent">
           <span style="margin-right:6px">🧰</span>Tools &amp; MCP <span id="build-tab-toolsmcp-count" style="display:none;margin-left:4px;font-size:10px;background:var(--bg-tertiary);padding:1px 6px;border-radius:999px;color:var(--text-muted)">0</span>
         </button>
@@ -16228,6 +16231,12 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
       <!-- Scheduled Tasks tab — populated by refreshCron() ─────────────────────── -->
       <div id="build-tab-crons" style="display:none;flex:1;min-height:0;overflow-y:auto;padding:18px;background:var(--bg-primary)">
         <div id="panel-cron"><div class="empty-state" style="padding:24px;color:var(--text-muted)">Loading scheduled tasks…</div></div>
+      </div>
+      <!-- ── PRD Phase 3: Run list ───────────────────────────────────────────
+           Single table of every run across all tasks, with filters + saved
+           views. Default view is "Failures (last 24h)". -->
+      <div id="build-tab-runs" style="display:none;flex:1;min-height:0;overflow-y:auto;padding:18px;background:var(--bg-primary)">
+        <div id="panel-runs"><div class="empty-state" style="padding:24px;color:var(--text-muted)">Loading run history…</div></div>
       </div>
       <!-- ── PRD Phase 2: Tools & MCP catalog ────────────────────────────────
            Read-only foundation in 1.18.81. Future slices: per-tool bindings,
@@ -21086,8 +21095,10 @@ function switchBuildTab(tab) {
   // Always close any open workflow when changing tabs — switching context
   // is a clean slate, not a stale node hanging on the canvas.
   if (typeof closeBuilderCanvas === 'function') closeBuilderCanvas();
-  // Default: hide the Tools & MCP pane unless we're explicitly on it.
+  var runsPane = document.getElementById('build-tab-runs');
+  // Default: hide the Tools & MCP + Runs panes unless we're explicitly on them.
   if (toolsmcpPane && tab !== 'toolsmcp') toolsmcpPane.style.display = 'none';
+  if (runsPane && tab !== 'runs') runsPane.style.display = 'none';
   if (tab === 'toolsmcp') {
     // PRD Phase 2: Tools & MCP catalog. Read-only foundation in 1.18.81.
     if (workPane) workPane.style.display = 'none';
@@ -21098,6 +21109,18 @@ function switchBuildTab(tab) {
     if (usagePanel) usagePanel.style.display = 'none';
     if (newBtn) newBtn.style.display = 'none';
     if (typeof refreshToolsMcpCatalog === 'function') refreshToolsMcpCatalog();
+    return;
+  }
+  if (tab === 'runs') {
+    // PRD Phase 3: Run list — every run across every task.
+    if (workPane) workPane.style.display = 'none';
+    if (cronPane) cronPane.style.display = 'none';
+    if (tplPane) tplPane.style.display = 'none';
+    if (runsPane) runsPane.style.display = 'block';
+    if (headerStrip) headerStrip.style.display = 'none';
+    if (usagePanel) usagePanel.style.display = 'none';
+    if (newBtn) newBtn.style.display = 'none';
+    if (typeof refreshRunList === 'function') refreshRunList();
     return;
   }
   if (tab === 'templates') {
@@ -23476,6 +23499,245 @@ function renderRunningCard(item) {
     + '<div class="task-card-actions">'
     + (item.type === 'background' ? '<button class="btn-sm btn-danger" onclick="cancelBackgroundTask(\\x27' + jsStr(runtime.id || runtimeName) + '\\x27)">Cancel</button>' : '<button class="btn-sm btn-danger" onclick="cancelUnleashed(\\x27' + jsStr(runtimeName) + '\\x27)">Cancel</button>')
     + '</div></div>';
+}
+
+// ── PRD Phase 3: Run list ──────────────────────────────────────────────
+// Single sortable/filterable table of every CronRunEntry across all tasks.
+// Filters: status, task name, time window. Browser-local saved views.
+// Default view: "Failures (last 24h)". No new endpoints — reuses
+// /api/cron/runs (CronRunLog.readAllRecent).
+
+var _runListState = {
+  filterStatus: 'all',     // 'all' | 'failed' | 'ok'
+  filterWindow: '24h',     // '24h' | '7d' | 'all'
+  filterText: '',          // free-text task name match
+  data: [],                // raw runs from /api/cron/runs
+};
+
+function _runListLoadDefaultView() {
+  // First-time visit: PRD §5.3 — default Saved View is "Failures (last 24h)".
+  try {
+    var raw = localStorage.getItem('runListView');
+    if (raw) {
+      var saved = JSON.parse(raw);
+      _runListState.filterStatus = saved.filterStatus || 'all';
+      _runListState.filterWindow = saved.filterWindow || '24h';
+      _runListState.filterText = saved.filterText || '';
+      return;
+    }
+  } catch (e) { /* ignore */ }
+  // Default: failures, last 24h.
+  _runListState.filterStatus = 'failed';
+  _runListState.filterWindow = '24h';
+  _runListState.filterText = '';
+}
+
+function _runListSaveView() {
+  try {
+    localStorage.setItem('runListView', JSON.stringify({
+      filterStatus: _runListState.filterStatus,
+      filterWindow: _runListState.filterWindow,
+      filterText: _runListState.filterText,
+    }));
+  } catch (e) { /* ignore */ }
+}
+
+function _runListApplyFilters(runs) {
+  var now = Date.now();
+  var windowMs = _runListState.filterWindow === '24h' ? 24 * 60 * 60 * 1000
+    : _runListState.filterWindow === '7d' ? 7 * 24 * 60 * 60 * 1000
+    : Infinity;
+  var query = (_runListState.filterText || '').trim().toLowerCase();
+  return runs.filter(function(r) {
+    if (_runListState.filterStatus === 'failed') {
+      if (r.status !== 'error' && r.status !== 'timeout' && r.status !== 'lost') return false;
+    } else if (_runListState.filterStatus === 'ok') {
+      if (r.status !== 'ok') return false;
+    }
+    if (query && String(r.jobName || '').toLowerCase().indexOf(query) === -1) return false;
+    if (windowMs !== Infinity && r.startedAt) {
+      var age = now - new Date(r.startedAt).getTime();
+      if (age > windowMs) return false;
+    }
+    return true;
+  });
+}
+
+async function refreshRunList() {
+  var panel = document.getElementById('panel-runs');
+  if (!panel) return;
+  if (!_runListState.data.length) {
+    _runListLoadDefaultView();
+  }
+  panel.innerHTML = '<div class="empty-state" style="padding:24px;color:var(--text-muted)">Loading run history…</div>';
+  try {
+    var r = await apiFetch('/api/cron/runs?limit=200');
+    var d = await r.json();
+    _runListState.data = (d && d.runs) || [];
+  } catch (e) {
+    panel.innerHTML = '<div class="empty-state" style="padding:24px;color:var(--red)">Failed to load runs: ' + esc(String(e)) + '</div>';
+    return;
+  }
+  panel.innerHTML = renderRunListBody(_runListState.data);
+  // Update tab count badge with total runs (not filtered count — that's
+  // shown alongside the filter chips).
+  var tabCount = document.getElementById('build-tab-runs-count');
+  if (tabCount) {
+    tabCount.textContent = _runListState.data.length;
+    tabCount.style.display = _runListState.data.length > 0 ? '' : 'none';
+  }
+}
+
+function renderRunListBody(allRuns) {
+  var filtered = _runListApplyFilters(allRuns);
+  var html = '';
+  // Header
+  html += '<div style="margin-bottom:18px"><h2 style="margin:0 0 4px;font-size:18px;font-weight:600;color:var(--text-primary)">Runs</h2>'
+    +    '<div style="font-size:12px;color:var(--text-muted)">'+ filtered.length +' of '+ allRuns.length +' total runs · default view: <strong>Failures (last 24h)</strong></div></div>';
+  // Filter row — saved automatically to localStorage on change.
+  html += '<div style="display:flex;gap:10px;align-items:center;margin-bottom:14px;flex-wrap:wrap">';
+  html += _runListChip('Status', [
+    { value: 'all',    label: 'All' },
+    { value: 'ok',     label: 'OK' },
+    { value: 'failed', label: 'Failed' },
+  ], 'filterStatus');
+  html += _runListChip('Window', [
+    { value: '24h', label: 'Last 24h' },
+    { value: '7d',  label: 'Last 7 days' },
+    { value: 'all', label: 'All time' },
+  ], 'filterWindow');
+  html += '<input type="search" placeholder="Filter by task name…" value="' + esc(_runListState.filterText) + '" oninput="onRunListSearch(this.value)" style="flex:1;min-width:200px;max-width:320px;padding:6px 10px;font-size:12px;border:1px solid var(--border);border-radius:6px;background:var(--bg-secondary);color:var(--text-primary)">';
+  html += '<button class="btn-sm" onclick="resetRunListFilters()" style="font-size:11px">Reset to default</button>';
+  html += '</div>';
+  if (filtered.length === 0) {
+    html += '<div class="empty-state" style="padding:36px 24px;text-align:center;color:var(--text-muted)"><div style="font-size:14px;margin-bottom:6px">No runs match the current filter.</div><div style="font-size:12px">Try widening the time window or clearing the task-name filter.</div></div>';
+    return html;
+  }
+  // Table — same shape as the Recent History list on the Tasks page,
+  // but sortable and with a Trigger column.
+  html += '<div style="background:var(--bg-secondary);border:1px solid var(--border);border-radius:var(--radius)">';
+  html += '<div style="display:grid;grid-template-columns:24px 24px minmax(180px,1.2fr) 90px minmax(180px,1fr) 90px auto;gap:10px;padding:8px 14px;border-bottom:1px solid var(--border);font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.04em;font-weight:500">'
+    +    '<div></div><div title="Goal verdict">Goal</div><div>Task</div><div>Trigger</div><div>Started</div><div>Duration</div><div></div>'
+    + '</div>';
+  for (var i = 0; i < filtered.length; i++) {
+    var entry = filtered[i] || {};
+    var status = entry.status || 'unknown';
+    var statusColor, statusIcon;
+    if (status === 'ok') { statusColor = 'var(--green)'; statusIcon = '&#10003;'; }
+    else if (status === 'error') { statusColor = 'var(--red)'; statusIcon = '&#10007;'; }
+    else if (status === 'retried') { statusColor = 'var(--yellow)'; statusIcon = '&#8635;'; }
+    else if (status === 'timeout') { statusColor = 'var(--yellow)'; statusIcon = '&#9203;'; }
+    else if (status === 'lost') { statusColor = 'var(--red)'; statusIcon = '?'; }
+    else if (status === 'running') { statusColor = 'var(--accent)'; statusIcon = '●'; }
+    else if (status === 'skipped') { statusColor = 'var(--text-muted)'; statusIcon = '&minus;'; }
+    else { statusColor = 'var(--text-muted)'; statusIcon = '&middot;'; }
+    var jobName = entry.jobName || '(unknown)';
+    var safeName = jsStr(jobName);
+    var startedAt = entry.startedAt ? new Date(entry.startedAt) : null;
+    var startedLabel = startedAt ? startedAt.toLocaleString() : '—';
+    var durationLabel = entry.durationMs != null ? formatDurationMs(entry.durationMs) : '—';
+    // Trigger heuristic until we persist it for real (Phase 3.1):
+    //   'unleashed' mode + manual cron run = manual; otherwise scheduled.
+    // The cron-running.json sidecar already carries pid which can hint at
+    // manual but isn't on terminal entries. Best-effort label only.
+    var triggerLabel = entry.attempt > 1 ? 'retry' : 'scheduled';
+    var triggerColor = 'var(--text-muted)';
+    // Goal cell
+    var goalCell = '<div></div>';
+    if (entry.goalCheck) {
+      var gc = entry.goalCheck;
+      var gIcon = gc.status === 'pass' ? '🎯' : gc.status === 'fail' ? '✗' : gc.status === 'error' ? '⚠' : '';
+      var gColor = gc.status === 'pass' ? 'var(--green)' : gc.status === 'fail' ? 'var(--red)' : 'var(--yellow)';
+      var gTip = gc.evaluatorReason || (Array.isArray(gc.schemaErrors) ? gc.schemaErrors.join('; ') : gc.status);
+      goalCell = '<div style="color:' + gColor + ';font-size:13px;line-height:18px;text-align:center" title="' + esc(gTip) + '">' + gIcon + '</div>';
+    }
+    var preview = '';
+    if (status === 'error' && entry.error) {
+      preview = '<div style="font-size:11px;color:var(--red);margin-top:2px;word-break:break-word">' + esc(String(entry.error).slice(0, 140)) + '</div>';
+    } else if (entry.outputPreview) {
+      preview = '<div style="font-size:11px;color:var(--text-muted);margin-top:2px;word-break:break-word">' + esc(String(entry.outputPreview).slice(0, 120)) + '</div>';
+    }
+    html += '<div class="history-row" data-trace-job="' + esc(jobName) + '" style="display:grid;grid-template-columns:24px 24px minmax(180px,1.2fr) 90px minmax(180px,1fr) 90px auto;gap:10px;align-items:start;padding:8px 14px;border-bottom:1px solid var(--border);cursor:pointer">'
+      +    '<div style="color:' + statusColor + ';font-size:14px;line-height:18px;text-align:center" title="' + esc(status) + '">' + statusIcon + '</div>'
+      +    goalCell
+      +    '<div style="min-width:0">'
+      +      '<div style="font-weight:500;color:var(--text-primary);font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + esc(jobName) + '">' + esc(jobName) + (entry.attempt > 1 ? ' · attempt ' + esc(entry.attempt) : '') + '</div>'
+      +      preview
+      +    '</div>'
+      +    '<div style="font-size:11px;color:' + triggerColor + ';line-height:18px">' + esc(triggerLabel) + '</div>'
+      +    '<div style="font-size:12px;color:var(--text-secondary);line-height:18px">' + esc(startedLabel) + '</div>'
+      +    '<div style="font-size:12px;color:var(--text-muted);line-height:18px">' + esc(durationLabel) + '</div>'
+      +    '<div style="display:flex;gap:6px;align-items:center"><button class="btn-sm" onclick="event.stopPropagation();openTraceViewer(\\x27' + safeName + '\\x27)" style="font-size:11px;padding:3px 8px">Trace</button></div>'
+      + '</div>';
+  }
+  html += '</div>';
+  return html;
+}
+
+function _runListChip(label, options, stateKey) {
+  var current = _runListState[stateKey];
+  var html = '<span style="display:inline-flex;align-items:center;gap:4px">';
+  html += '<span style="font-size:11px;color:var(--text-muted);font-weight:500;text-transform:uppercase;letter-spacing:0.04em;margin-right:2px">' + esc(label) + '</span>';
+  for (var i = 0; i < options.length; i++) {
+    var o = options[i];
+    var active = o.value === current;
+    var bg = active ? 'var(--accent)' : 'var(--bg-secondary)';
+    var fg = active ? '#fff' : 'var(--text-primary)';
+    html += '<button class="btn-sm" onclick="onRunListChipClick(\\x27' + jsStr(stateKey) + '\\x27,\\x27' + jsStr(o.value) + '\\x27)" style="font-size:11px;padding:4px 10px;background:' + bg + ';color:' + fg + ';border:1px solid var(--border);border-radius:999px">' + esc(o.label) + '</button>';
+  }
+  html += '</span>';
+  return html;
+}
+
+function onRunListChipClick(key, value) {
+  _runListState[key] = value;
+  _runListSaveView();
+  var panel = document.getElementById('panel-runs');
+  if (panel) panel.innerHTML = renderRunListBody(_runListState.data);
+}
+
+function onRunListSearch(value) {
+  _runListState.filterText = value;
+  _runListSaveView();
+  // Debounce-by-render: just re-render. Filtering is in-memory + cheap.
+  var panel = document.getElementById('panel-runs');
+  if (panel) panel.innerHTML = renderRunListBody(_runListState.data);
+}
+
+function resetRunListFilters() {
+  _runListState.filterStatus = 'failed';
+  _runListState.filterWindow = '24h';
+  _runListState.filterText = '';
+  _runListSaveView();
+  var panel = document.getElementById('panel-runs');
+  if (panel) panel.innerHTML = renderRunListBody(_runListState.data);
+}
+
+// Wire the panel's click handler so clicking anywhere on a row opens the
+// trace viewer (the row's data-trace-job attribute is what the existing
+// global panel-cron click handler reads).
+function _runListAttachClickHandler() {
+  var pane = document.getElementById('build-tab-runs');
+  if (!pane || pane._handlerAttached) return;
+  pane.addEventListener('click', function(ev) {
+    var t = ev.target;
+    while (t && t !== pane) {
+      if (t.dataset && t.dataset.traceJob) {
+        openTraceViewer(t.dataset.traceJob);
+        return;
+      }
+      t = t.parentElement;
+    }
+  });
+  pane._handlerAttached = true;
+}
+// Attach once on first DOM ready — runs idempotent thanks to the flag.
+if (typeof document !== 'undefined') {
+  if (document.readyState === 'complete' || document.readyState === 'interactive') {
+    setTimeout(_runListAttachClickHandler, 0);
+  } else {
+    document.addEventListener('DOMContentLoaded', _runListAttachClickHandler);
+  }
 }
 
 // ── PRD Phase 2: Tools & MCP catalog ──────────────────────────────────
@@ -35419,6 +35681,14 @@ try {
         // modal, re-render the Last run pane with the fresh result.
         if (evt.type === 'cron_complete' && evt.data && evt.data.job && typeof handleCronRunOnceComplete === 'function') {
           try { handleCronRunOnceComplete(evt.data.job); } catch (err) { /* non-fatal */ }
+        }
+        // PRD Phase 3: if the Runs tab is visible, refresh it too so a new
+        // run appears at the top without a manual reload.
+        if (currentPage === 'build' && typeof refreshRunList === 'function') {
+          var runsPane = document.getElementById('build-tab-runs');
+          if (runsPane && runsPane.style.display !== 'none') {
+            try { refreshRunList(); } catch (err) { /* non-fatal */ }
+          }
         }
       }
       // A delete on one tab should drop the card from every open dashboard
