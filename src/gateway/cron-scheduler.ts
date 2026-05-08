@@ -140,98 +140,113 @@ function normalizeStringArray(v: unknown): string[] | undefined {
 }
 
 /**
+ * Single-source-of-truth YAML → CronJobDefinition parser.
+ *
+ * Used by parseCronJobs (global CRON.md) AND parseAgentCronJobs (per-agent).
+ * Caller is responsible for handling the name prefix (agent jobs are
+ * prefixed with `<slug>:`) and for tagging agentSlug.
+ *
+ * Returns null when the row is malformed (missing name/schedule/prompt) —
+ * the caller logs + skips. Accepts both snake_case and camelCase YAML keys
+ * since users hand-edit CRON.md and we want to be forgiving.
+ *
+ * Centralizing here closes the drift the previous audit flagged: the agent
+ * variant was missing alwaysDeliver/attachments/requiresConfirmation/
+ * confirmationTimeoutMin and the description field. After this refactor
+ * both surfaces have the same field set.
+ */
+function parseJobYaml(job: Record<string, unknown>): CronJobDefinition | null {
+  const name = String(job.name ?? '');
+  const schedule = String(job.schedule ?? '');
+  const prompt = String(job.prompt ?? '');
+  if (!name || !schedule || !prompt) return null;
+
+  const enabled = job.enabled !== false;
+  const tier = Number(job.tier ?? 1);
+  const maxTurns = job.max_turns != null ? Number(job.max_turns) : undefined;
+  const model = job.model != null ? String(job.model) : undefined;
+  const workDir = job.work_dir != null ? String(job.work_dir) : undefined;
+  const mode = job.mode === 'unleashed' ? 'unleashed' as const : 'standard' as const;
+  const maxHours = job.max_hours != null ? Number(job.max_hours) : undefined;
+  const maxRetries = job.max_retries != null ? Number(job.max_retries) : undefined;
+  const after = job.after != null ? String(job.after) : undefined;
+
+  const successCriteria = Array.isArray(job.success_criteria)
+    ? (job.success_criteria as unknown[]).map(c => String(c))
+    : undefined;
+  // Prefer free-form successCriteriaText; fall back to joining the legacy
+  // string[] so legacy YAML keeps rendering. Writes go to the new field.
+  let successCriteriaText = typeof job.success_criteria_text === 'string'
+    ? String(job.success_criteria_text)
+    : (typeof job.successCriteriaText === 'string' ? String(job.successCriteriaText) : undefined);
+  if (!successCriteriaText && Array.isArray(successCriteria) && successCriteria.length > 0) {
+    successCriteriaText = successCriteria.join('\n');
+  }
+
+  const successSchemaRaw = job.success_schema ?? job.successSchema;
+  const successSchema = (successSchemaRaw && typeof successSchemaRaw === 'object' && !Array.isArray(successSchemaRaw))
+    ? successSchemaRaw as Record<string, unknown>
+    : undefined;
+
+  const addDirs = normalizeStringArray(job.add_dirs ?? job.addDirs);
+  const alwaysDeliver = job.always_deliver === true ? true : undefined;
+  const context = job.context != null ? String(job.context) : undefined;
+  const preCheck = job.pre_check != null ? String(job.pre_check) : undefined;
+  const attachments = normalizeStringArray(job.attachments);
+  const requiresConfirmation = job.requires_confirmation === true || job.requiresConfirmation === true ? true : undefined;
+  const confirmationTimeoutMin = job.confirmation_timeout_min != null
+    ? Number(job.confirmation_timeout_min)
+    : (job.confirmationTimeoutMin != null ? Number(job.confirmationTimeoutMin) : undefined);
+
+  // Per-job agent scoping (a global cron can be scoped to a specific
+  // agent's profile). Accept both casings.
+  const agentSlugRaw = job.agentSlug ?? job.agent_slug;
+  const agentSlug = typeof agentSlugRaw === 'string' && /^[a-z0-9-]+$/i.test(agentSlugRaw)
+    ? agentSlugRaw
+    : undefined;
+
+  const skills = normalizeStringArray(job.skills);
+  const allowedTools = normalizeStringArray(job.allowed_tools ?? job.allowedTools);
+  const allowedMcpServers = normalizeStringArray(job.allowed_mcp_servers ?? job.allowedMcpServers);
+  const tags = normalizeStringArray(job.tags);
+  const categoryRaw = job.category;
+  const category = typeof categoryRaw === 'string' && categoryRaw.trim()
+    ? categoryRaw.trim().slice(0, 64)
+    : undefined;
+  const predictable = typeof job.predictable === 'boolean' ? job.predictable : undefined;
+  const description = typeof job.description === 'string' && job.description.trim()
+    ? job.description.trim().slice(0, 500)
+    : undefined;
+
+  return {
+    name, schedule, prompt, enabled, tier, description, maxTurns, model, workDir, mode,
+    maxHours, maxRetries, after, successCriteria, successCriteriaText, successSchema, addDirs,
+    alwaysDeliver, context, preCheck, attachments, requiresConfirmation, confirmationTimeoutMin,
+    agentSlug,
+    skills, allowedTools, allowedMcpServers, tags, category, predictable,
+  };
+}
+
+/**
  * Parse cron job definitions from vault/00-System/CRON.md frontmatter.
  * Used by both the in-process CronScheduler and the standalone CLI runner.
  */
 export function parseCronJobs(): CronJobDefinition[] {
   if (!existsSync(CRON_FILE)) return [];
-
-  const raw = readFileSync(CRON_FILE, 'utf-8');
   let parsed;
   try {
-    parsed = matter(raw);
+    parsed = matter(readFileSync(CRON_FILE, 'utf-8'));
   } catch (err) {
     logger.error({ err }, 'CRON.md YAML parse error — keeping previous jobs. Fix the file manually.');
     return [];
   }
   const jobDefs = (parsed.data.jobs ?? []) as Array<Record<string, unknown>>;
   const jobs: CronJobDefinition[] = [];
-
   for (const job of jobDefs) {
-    const name = String(job.name ?? '');
-    const schedule = String(job.schedule ?? '');
-    const prompt = String(job.prompt ?? '');
-    const enabled = job.enabled !== false;
-    const tier = Number(job.tier ?? 1);
-    const maxTurns = job.max_turns != null ? Number(job.max_turns) : undefined;
-    const model = job.model != null ? String(job.model) : undefined;
-    const workDir = job.work_dir != null ? String(job.work_dir) : undefined;
-    const mode = job.mode === 'unleashed' ? 'unleashed' as const : 'standard' as const;
-    const maxHours = job.max_hours != null ? Number(job.max_hours) : undefined;
-    const maxRetries = job.max_retries != null ? Number(job.max_retries) : undefined;
-    const after = job.after != null ? String(job.after) : undefined;
-    const successCriteria = Array.isArray(job.success_criteria)
-      ? (job.success_criteria as unknown[]).map(c => String(c))
-      : undefined;
-    // PRD Phase 1: prefer success_criteria_text (free-form). On read, fall
-    // back to joining the legacy success_criteria string[] so legacy YAML
-    // keeps rendering in the new editor surface. Writes go to the new field.
-    let successCriteriaText = typeof job.success_criteria_text === 'string'
-      ? String(job.success_criteria_text)
-      : (typeof job.successCriteriaText === 'string' ? String(job.successCriteriaText) : undefined);
-    if (!successCriteriaText && Array.isArray(successCriteria) && successCriteria.length > 0) {
-      successCriteriaText = successCriteria.join('\n');
-    }
-    // PRD Phase 1: JSON Schema validated against ResultMessage.structured_output.
-    // Accept either snake_case (success_schema) or camelCase from API. Stored
-    // as a plain object; ajv is loaded lazily at validation time.
-    const successSchemaRaw = job.success_schema ?? job.successSchema;
-    const successSchema = (successSchemaRaw && typeof successSchemaRaw === 'object' && !Array.isArray(successSchemaRaw))
-      ? successSchemaRaw as Record<string, unknown>
-      : undefined;
-    // PRD Phase 1: read scope beyond cwd. Accept either casing.
-    const addDirs = normalizeStringArray(job.add_dirs ?? job.addDirs);
-    const alwaysDeliver = job.always_deliver === true ? true : undefined;
-    const context = job.context != null ? String(job.context) : undefined;
-    const preCheck = job.pre_check != null ? String(job.pre_check) : undefined;
-    // Optional: scope a global job to a specific agent's profile (loads
-    // the agent's allowedTools whitelist, system prompt, etc.). Accept
-    // both camelCase and snake_case to be forgiving of user-written YAML.
-    const agentSlugRaw = job.agentSlug ?? job.agent_slug;
-    const agentSlug = typeof agentSlugRaw === 'string' && /^[a-z0-9-]+$/i.test(agentSlugRaw)
-      ? agentSlugRaw
-      : undefined;
-    // ── Trick capabilities — accept both camelCase and snake_case ─────
-    const skills = normalizeStringArray(job.skills);
-    const allowedTools = normalizeStringArray(job.allowed_tools ?? job.allowedTools);
-    const allowedMcpServers = normalizeStringArray(job.allowed_mcp_servers ?? job.allowedMcpServers);
-    const tags = normalizeStringArray(job.tags);
-    const categoryRaw = job.category;
-    const category = typeof categoryRaw === 'string' && categoryRaw.trim()
-      ? categoryRaw.trim().slice(0, 64)
-      : undefined;
-    // Predictable (contract) mode — undefined means legacy behavior.
-    const predictable = typeof job.predictable === 'boolean' ? job.predictable : undefined;
-    // 1.18.119 — human-readable description (used by the task card preview
-    // and by the cron-clean migrator to surface what each job does without
-    // showing raw prompt boilerplate).
-    const description = typeof job.description === 'string' && job.description.trim()
-      ? job.description.trim().slice(0, 500)
-      : undefined;
-
-    if (!name || !schedule || !prompt) {
-      logger.warn({ job }, 'Skipping malformed cron job');
-      continue;
-    }
-
-    jobs.push({
-      name, schedule, prompt, enabled, tier, description, maxTurns, model, workDir, mode,
-      maxHours, maxRetries, after, successCriteria, successCriteriaText, successSchema, addDirs,
-      alwaysDeliver, context, preCheck, agentSlug,
-      skills, allowedTools, allowedMcpServers, tags, category, predictable,
-    });
+    const def = parseJobYaml(job);
+    if (def) jobs.push(def);
+    else logger.warn({ job }, 'Skipping malformed cron job');
   }
-
   return jobs;
 }
 
@@ -243,7 +258,6 @@ export function parseAgentCronJobs(agentsDir: string): CronJobDefinition[] {
   if (!existsSync(agentsDir)) return [];
 
   const allJobs: CronJobDefinition[] = [];
-
   let dirs: string[];
   try {
     dirs = readdirSync(agentsDir, { withFileTypes: true } as any)
@@ -258,75 +272,20 @@ export function parseAgentCronJobs(agentsDir: string): CronJobDefinition[] {
     if (!existsSync(cronFile)) continue;
 
     try {
-      const raw = readFileSync(cronFile, 'utf-8');
-      const parsed = matter(raw);
+      const parsed = matter(readFileSync(cronFile, 'utf-8'));
       const jobDefs = (parsed.data.jobs ?? []) as Array<Record<string, unknown>>;
-
       for (const job of jobDefs) {
-        const name = String(job.name ?? '');
-        const schedule = String(job.schedule ?? '');
-        const prompt = String(job.prompt ?? '');
-        const enabled = job.enabled !== false;
-        const tier = Number(job.tier ?? 1);
-        const maxTurns = job.max_turns != null ? Number(job.max_turns) : undefined;
-        const model = job.model != null ? String(job.model) : undefined;
-        const workDir = job.work_dir != null ? String(job.work_dir) : undefined;
-        const mode = job.mode === 'unleashed' ? 'unleashed' as const : 'standard' as const;
-        const maxHours = job.max_hours != null ? Number(job.max_hours) : undefined;
-        const maxRetries = job.max_retries != null ? Number(job.max_retries) : undefined;
-        const after = job.after != null ? String(job.after) : undefined;
-        const successCriteria = Array.isArray(job.success_criteria)
-          ? (job.success_criteria as unknown[]).map(c => String(c))
-          : undefined;
-        // PRD Phase 1 fields — symmetric with global parser above.
-        let successCriteriaText = typeof job.success_criteria_text === 'string'
-          ? String(job.success_criteria_text)
-          : (typeof job.successCriteriaText === 'string' ? String(job.successCriteriaText) : undefined);
-        if (!successCriteriaText && Array.isArray(successCriteria) && successCriteria.length > 0) {
-          successCriteriaText = successCriteria.join('\n');
-        }
-        const successSchemaRaw = job.success_schema ?? job.successSchema;
-        const successSchema = (successSchemaRaw && typeof successSchemaRaw === 'object' && !Array.isArray(successSchemaRaw))
-          ? successSchemaRaw as Record<string, unknown>
-          : undefined;
-        const addDirs = normalizeStringArray(job.add_dirs ?? job.addDirs);
-        const context = job.context != null ? String(job.context) : undefined;
-        const preCheck = job.pre_check != null ? String(job.pre_check) : undefined;
-        // ── Trick capabilities — symmetric with global parser ─────────
-        // (NB: this parser still lacks alwaysDeliver/attachments/
-        // requiresConfirmation/confirmationTimeoutMin from the global
-        // parser — pre-existing drift, fix in a separate change.)
-        const skills = normalizeStringArray(job.skills);
-        const allowedTools = normalizeStringArray(job.allowed_tools ?? job.allowedTools);
-        const allowedMcpServers = normalizeStringArray(job.allowed_mcp_servers ?? job.allowedMcpServers);
-        const tags = normalizeStringArray(job.tags);
-        const categoryRaw = job.category;
-        const category = typeof categoryRaw === 'string' && categoryRaw.trim()
-          ? categoryRaw.trim().slice(0, 64)
-          : undefined;
-        const predictable = typeof job.predictable === 'boolean' ? job.predictable : undefined;
-        // 1.18.119 — symmetric with the global parseCronJobs description
-        // field. Without this, agent jobs always look "missing description"
-        // to the cron-clean migrator and stay flagged as eligible forever.
-        const description = typeof job.description === 'string' && job.description.trim()
-          ? job.description.trim().slice(0, 500)
-          : undefined;
-
-        if (!name || !schedule || !prompt) {
+        const def = parseJobYaml(job);
+        if (!def) {
           logger.warn({ job, agent: slug }, 'Skipping malformed agent cron job');
           continue;
         }
-
-        // Prefix name with agent slug and tag with agentSlug
-        allJobs.push({
-          name: `${slug}:${name}`,
-          schedule, prompt, enabled, tier, description, maxTurns, model, workDir,
-          mode, maxHours, maxRetries, after,
-          successCriteria, successCriteriaText, successSchema, addDirs,
-          context, preCheck,
-          agentSlug: slug,
-          skills, allowedTools, allowedMcpServers, tags, category, predictable,
-        });
+        // Agent CRON.md stores BARE job names; we prefix with the slug at
+        // read time so the runtime can route by `<slug>:<job>` and the
+        // dashboard can disambiguate same-named jobs across agents.
+        // agentSlug is stamped from the folder location, overriding any
+        // value in the YAML — single source of truth.
+        allJobs.push({ ...def, name: `${slug}:${def.name}`, agentSlug: slug });
       }
     } catch (err) {
       logger.error({ err, agent: slug }, `Agent ${slug} CRON.md parse error — skipping`);
