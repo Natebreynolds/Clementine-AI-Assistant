@@ -22013,6 +22013,12 @@ function navigateTo(page, opts) {
       var bp = currentAgentSlug || '';
       refreshBuilderAgents(bp);
       break;
+    case 'skills':
+      // Skills-First redesign Phase A / 1.18.106: load the catalog when
+      // the user navigates to the Skills page. Read-only; no mutation
+      // surfaces here yet.
+      if (typeof refreshSkillsPage === 'function') refreshSkillsPage();
+      break;
     case 'heartbeat':
       refreshHeartbeatControl();
       break;
@@ -26559,6 +26565,294 @@ async function deleteDelegation(id) {
 }
 
 // ── Heartbeat Queue ──────────────────────
+
+// ── Skills-First redesign Phase A / 1.18.106 ──────────────────────────
+// Read-only Skills page: list + detail. Phase B adds editor + Test
+// runner; Phase C wires runtime invocation; Phase D collapses Tasks
+// page complexity once Triggers can point at skills directly.
+//
+// State kept module-local so other surfaces (e.g. the Tools & MCP
+// catalog's future "used by" join) can read it without re-fetching.
+var _skillsState = {
+  data: [],          // raw skills array from /api/skills
+  filtered: [],      // text-filter result
+  selectedName: '',  // currently shown in detail pane
+  query: '',         // search input value
+};
+
+async function refreshSkillsPage() {
+  var listEl = document.getElementById('skills-list');
+  var detailEl = document.getElementById('skills-detail');
+  if (!listEl) return;
+  listEl.innerHTML = '<div style="padding:18px;color:var(--text-muted);font-size:12px">Loading skills…</div>';
+  try {
+    var r = await apiFetch('/api/skills');
+    var d = await r.json();
+    if (!r.ok || d.ok === false) {
+      listEl.innerHTML = '<div style="padding:18px;color:var(--red);font-size:12px">Failed to load: ' + esc(d.error || 'unknown') + '</div>';
+      return;
+    }
+    _skillsState.data = d.skills || [];
+    _skillsState.filtered = applySkillsFilter(_skillsState.data, _skillsState.query);
+    renderSkillsList();
+    var badge = document.getElementById('nav-skills-count');
+    if (badge) {
+      badge.textContent = String(_skillsState.data.length);
+      badge.style.display = _skillsState.data.length > 0 ? '' : 'none';
+    }
+    // If a skill was previously selected, reload its detail. Otherwise
+    // auto-select the first to give the user something to look at.
+    if (_skillsState.selectedName) {
+      var still = _skillsState.data.find(function(s) { return s.frontmatter.name === _skillsState.selectedName; });
+      if (still) showSkillDetail(_skillsState.selectedName);
+    } else if (_skillsState.filtered.length > 0) {
+      showSkillDetail(_skillsState.filtered[0].frontmatter.name);
+    }
+  } catch (e) {
+    listEl.innerHTML = '<div style="padding:18px;color:var(--red);font-size:12px">Error: ' + esc(String(e)) + '</div>';
+  }
+}
+
+function applySkillsFilter(skills, query) {
+  var q = (query || '').trim().toLowerCase();
+  if (!q) return skills.slice();
+  return skills.filter(function(s) {
+    var fm = s.frontmatter || {};
+    var hay = [fm.name, fm.title, fm.description, (fm.toolsUsed || []).join(' ')].filter(Boolean).join(' ').toLowerCase();
+    return hay.indexOf(q) !== -1;
+  });
+}
+
+function onSkillsSearch(value) {
+  _skillsState.query = value;
+  _skillsState.filtered = applySkillsFilter(_skillsState.data, value);
+  renderSkillsList();
+}
+
+function renderSkillsList() {
+  var listEl = document.getElementById('skills-list');
+  if (!listEl) return;
+  if (_skillsState.filtered.length === 0) {
+    listEl.innerHTML = '<div style="padding:18px;color:var(--text-muted);font-size:12px;text-align:center;line-height:1.5">'
+      + (_skillsState.query
+          ? 'No skills match <strong>' + esc(_skillsState.query) + '</strong>.'
+          : 'No skills yet. Phase B will add a <strong>+ New skill</strong> button. For now, drop .md files in <code>~/.clementine/vault/00-System/skills/</code>.')
+      + '</div>';
+    return;
+  }
+  var html = '';
+  for (var i = 0; i < _skillsState.filtered.length; i++) {
+    var s = _skillsState.filtered[i];
+    var fm = s.frontmatter || {};
+    var isSelected = s.frontmatter.name === _skillsState.selectedName;
+    var bg = isSelected ? 'var(--bg-tertiary)' : 'transparent';
+    // Schema badge: v1 = green, legacy = yellow (needs migration in Phase B).
+    var schemaBadge = s.schemaVersion === 'v1'
+      ? '<span style="font-size:9px;background:var(--green)20;color:var(--green);padding:1px 6px;border-radius:3px;font-weight:600;letter-spacing:0.04em">V1</span>'
+      : '<span style="font-size:9px;background:var(--yellow)20;color:var(--yellow);padding:1px 6px;border-radius:3px;font-weight:600;letter-spacing:0.04em" title="Legacy frontmatter — Phase B will migrate this">LEGACY</span>';
+    var scopeBadge = s.scope === 'project'
+      ? '<span style="font-size:9px;background:var(--blue)20;color:var(--blue);padding:1px 6px;border-radius:3px;font-weight:600;letter-spacing:0.04em" title="Loaded from per-project .clementine/skills/">PROJECT</span>'
+      : '';
+    var usedCount = (s.usedByTriggers || []).length;
+    var displayName = fm.title || fm.name;
+    var desc = (fm.description || '').slice(0, 100);
+    if (fm.description && fm.description.length > 100) desc += '…';
+    html += '<div onclick="showSkillDetail(\\x27' + jsStr(fm.name) + '\\x27)" style="padding:12px 14px;border-bottom:1px solid var(--border);cursor:pointer;background:' + bg + ';transition:background 0.1s" onmouseover="this.style.background=\\x27var(--bg-tertiary)\\x27" onmouseout="this.style.background=\\x27' + bg + '\\x27">'
+      + '<div style="display:flex;align-items:center;gap:6px;margin-bottom:4px">'
+      +   schemaBadge + scopeBadge
+      +   '<span style="font-weight:500;font-size:13px;color:var(--text-primary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1" title="' + esc(displayName) + '">' + esc(displayName) + '</span>'
+      + '</div>'
+      + (desc ? '<div style="font-size:11px;color:var(--text-muted);line-height:1.4;margin-bottom:4px">' + esc(desc) + '</div>' : '')
+      + '<div style="font-size:10px;color:var(--text-muted)">'
+      +   (usedCount > 0 ? 'Used by ' + usedCount + ' trigger' + (usedCount === 1 ? '' : 's') : '<span style="color:var(--text-muted);opacity:0.6">Unused</span>')
+      + '</div>'
+      + '</div>';
+  }
+  listEl.innerHTML = html;
+}
+
+async function showSkillDetail(name) {
+  _skillsState.selectedName = name;
+  renderSkillsList();  // re-render to update the highlight
+  var detailEl = document.getElementById('skills-detail');
+  if (!detailEl) return;
+  detailEl.innerHTML = '<div style="padding:24px;color:var(--text-muted);font-size:12px">Loading…</div>';
+  try {
+    var r = await apiFetch('/api/skills/' + encodeURIComponent(name));
+    var d = await r.json();
+    if (!r.ok || d.ok === false) {
+      detailEl.innerHTML = '<div style="padding:24px;color:var(--red);font-size:12px">Failed: ' + esc(d.error || 'unknown') + '</div>';
+      return;
+    }
+    detailEl.innerHTML = renderSkillDetail(d.skill);
+  } catch (e) {
+    detailEl.innerHTML = '<div style="padding:24px;color:var(--red);font-size:12px">Error: ' + esc(String(e)) + '</div>';
+  }
+}
+
+function renderSkillDetail(s) {
+  var fm = s.frontmatter || {};
+  var displayName = fm.title || fm.name;
+  var html = '<div style="padding:24px 28px">';
+  // Header
+  html += '<div style="margin-bottom:18px">';
+  html += '<div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;flex-wrap:wrap">';
+  html += '<h2 style="margin:0;font-size:20px;font-weight:600;color:var(--text-primary)">' + esc(displayName) + '</h2>';
+  html += s.schemaVersion === 'v1'
+    ? '<span style="font-size:10px;background:var(--green)20;color:var(--green);padding:2px 8px;border-radius:4px;font-weight:600;letter-spacing:0.04em">V1 SCHEMA</span>'
+    : '<span style="font-size:10px;background:var(--yellow)20;color:var(--yellow);padding:2px 8px;border-radius:4px;font-weight:600;letter-spacing:0.04em" title="Phase B will migrate this">LEGACY SCHEMA</span>';
+  if (s.scope === 'project') {
+    html += '<span style="font-size:10px;background:var(--blue)20;color:var(--blue);padding:2px 8px;border-radius:4px;font-weight:600">PROJECT-SCOPED</span>';
+  }
+  if (typeof fm.version === 'number') {
+    html += '<span style="font-size:10px;color:var(--text-muted)">v' + esc(fm.version) + '</span>';
+  }
+  html += '</div>';
+  if (fm.description) {
+    html += '<p style="font-size:13px;color:var(--text-secondary);line-height:1.5;margin:0">' + esc(fm.description) + '</p>';
+  }
+  html += '<div style="margin-top:8px;font-size:11px;color:var(--text-muted)">'
+       + 'File: <code style="font-size:10px">' + esc(s.filePath) + '</code>'
+       + '</div>';
+  html += '</div>';
+
+  // Used-by triggers
+  if (Array.isArray(s.usedByTriggers) && s.usedByTriggers.length > 0) {
+    html += '<div style="margin-bottom:18px;padding:12px 14px;background:var(--bg-tertiary);border-radius:6px">';
+    html += '<div style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.04em;margin-bottom:6px;font-weight:500">Used by ' + s.usedByTriggers.length + ' trigger' + (s.usedByTriggers.length === 1 ? '' : 's') + '</div>';
+    html += '<div style="display:flex;flex-wrap:wrap;gap:6px">';
+    for (var i = 0; i < s.usedByTriggers.length; i++) {
+      html += '<span style="font-size:11px;background:var(--bg-secondary);padding:2px 8px;border-radius:4px;border:1px solid var(--border);color:var(--text-secondary)">' + esc(s.usedByTriggers[i]) + '</span>';
+    }
+    html += '</div></div>';
+  }
+
+  // V1 fields (only render when present)
+  if (fm.inputs && Object.keys(fm.inputs).length > 0) {
+    html += renderSkillSection('Inputs', renderSkillInputs(fm.inputs));
+  }
+  if (fm.tools && (fm.tools.allow?.length || fm.tools.deny?.length)) {
+    html += renderSkillSection('Tools', renderSkillTools(fm.tools));
+  }
+  if (Array.isArray(fm.dataSources) && fm.dataSources.length > 0) {
+    html += renderSkillSection('Data sources', renderSkillDataSources(fm.dataSources));
+  }
+  if (Array.isArray(fm.stateKeys) && fm.stateKeys.length > 0) {
+    html += renderSkillSection('State keys', '<div style="display:flex;flex-wrap:wrap;gap:4px">' + fm.stateKeys.map(function(k) { return '<code style="font-size:11px;background:var(--bg-tertiary);padding:2px 6px;border-radius:3px">' + esc(k) + '</code>'; }).join('') + '</div>');
+  }
+  if (fm.success && (fm.success.criterion || fm.success.schema)) {
+    var sc = '';
+    if (fm.success.criterion) sc += '<div style="font-size:12px;line-height:1.5;color:var(--text-secondary);margin-bottom:8px"><em>Criterion:</em> ' + esc(fm.success.criterion) + '</div>';
+    if (fm.success.schema) sc += '<details><summary style="cursor:pointer;font-size:11px;color:var(--text-muted)">Schema</summary><pre style="font-size:11px;background:var(--bg-tertiary);padding:10px;border-radius:6px;margin-top:6px;overflow:auto">' + esc(JSON.stringify(fm.success.schema, null, 2)) + '</pre></details>';
+    html += renderSkillSection('Success criterion', sc);
+  }
+  if (fm.limits) {
+    var l = fm.limits;
+    var bits = [];
+    if (l.maxTurns) bits.push('max ' + l.maxTurns + ' turns');
+    if (l.maxBudgetUsd) bits.push('$' + l.maxBudgetUsd + ' budget');
+    if (l.timeoutSeconds) bits.push(l.timeoutSeconds + 's timeout');
+    if (bits.length) html += renderSkillSection('Limits', '<div style="font-size:12px;color:var(--text-secondary)">' + bits.map(esc).join(' · ') + '</div>');
+  }
+
+  // Legacy fields (preserved for the migration UI)
+  if (Array.isArray(fm.triggers) && fm.triggers.length > 0) {
+    html += renderSkillSection('Triggers (legacy NLP phrases)',
+      '<div style="display:flex;flex-wrap:wrap;gap:4px">'
+      + fm.triggers.slice(0, 30).map(function(t) { return '<span style="font-size:11px;background:var(--bg-tertiary);padding:2px 6px;border-radius:3px;color:var(--text-secondary)">' + esc(t) + '</span>'; }).join('')
+      + (fm.triggers.length > 30 ? '<span style="font-size:11px;color:var(--text-muted)">+' + (fm.triggers.length - 30) + ' more</span>' : '')
+      + '</div>');
+  }
+  if (Array.isArray(fm.toolsUsed) && fm.toolsUsed.length > 0) {
+    html += renderSkillSection('Tools used (legacy informational)',
+      '<div style="display:flex;flex-wrap:wrap;gap:4px">'
+      + fm.toolsUsed.map(function(t) { return '<code style="font-size:11px;background:var(--bg-tertiary);padding:2px 6px;border-radius:3px">' + esc(t) + '</code>'; }).join('')
+      + '</div>');
+  }
+  if (fm.useCount || fm.lastUsed) {
+    var bits = [];
+    if (fm.useCount) bits.push('Used ' + fm.useCount + ' times');
+    if (fm.lastUsed) bits.push('Last: ' + new Date(fm.lastUsed).toLocaleString());
+    html += renderSkillSection('Usage', '<div style="font-size:12px;color:var(--text-secondary)">' + bits.map(esc).join(' · ') + '</div>');
+  }
+
+  // Body — markdown rendered as preformatted text. Phase B will add a
+  // proper markdown renderer; Phase A keeps it simple to ship.
+  if (s.body && s.body.trim()) {
+    html += '<div style="margin-top:18px">';
+    html += '<div style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.04em;margin-bottom:8px;font-weight:500">Procedure</div>';
+    html += '<pre style="font-size:12px;line-height:1.55;background:var(--bg-tertiary);padding:14px 16px;border-radius:6px;white-space:pre-wrap;word-break:break-word;font-family:inherit;border:1px solid var(--border);max-height:500px;overflow:auto">' + esc(s.body) + '</pre>';
+    html += '</div>';
+  }
+
+  if (s.schemaVersion === 'legacy') {
+    html += '<div style="margin-top:24px;padding:12px 14px;background:var(--yellow)15;border:1px solid var(--yellow);border-radius:6px;font-size:12px;color:var(--text-secondary);line-height:1.5">'
+         + '<strong style="color:var(--yellow)">Legacy schema.</strong> '
+         + 'This skill uses the pre-redesign frontmatter shape (title / triggers / toolsUsed / useCount). '
+         + 'Phase B will surface a one-click migration that converts it to v1 (inputs / tools.allow / dataSources / stateKeys / success).'
+         + '</div>';
+  }
+
+  html += '</div>';
+  return html;
+}
+
+function renderSkillSection(title, body) {
+  return '<div style="margin-bottom:18px">'
+    + '<div style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.04em;margin-bottom:8px;font-weight:500">' + esc(title) + '</div>'
+    + body
+    + '</div>';
+}
+
+function renderSkillInputs(inputs) {
+  var html = '<table style="width:100%;font-size:12px;border-collapse:collapse">';
+  html += '<thead><tr style="border-bottom:1px solid var(--border);text-align:left">'
+    + '<th style="padding:6px 8px;font-weight:500;color:var(--text-muted);font-size:10px;text-transform:uppercase">Field</th>'
+    + '<th style="padding:6px 8px;font-weight:500;color:var(--text-muted);font-size:10px;text-transform:uppercase">Type</th>'
+    + '<th style="padding:6px 8px;font-weight:500;color:var(--text-muted);font-size:10px;text-transform:uppercase">Default</th>'
+    + '</tr></thead><tbody>';
+  Object.keys(inputs).forEach(function(key) {
+    var spec = inputs[key] || {};
+    html += '<tr style="border-bottom:1px solid var(--border-light)">';
+    html += '<td style="padding:6px 8px"><code style="font-size:11px">' + esc(key) + '</code></td>';
+    html += '<td style="padding:6px 8px;color:var(--text-secondary)">' + esc(spec.type || 'any') + '</td>';
+    html += '<td style="padding:6px 8px;color:var(--text-muted);font-size:11px">' + (spec.default !== undefined ? '<code>' + esc(JSON.stringify(spec.default)) + '</code>' : '—') + '</td>';
+    html += '</tr>';
+    if (spec.description) {
+      html += '<tr><td colspan="3" style="padding:0 8px 6px 16px;font-size:11px;color:var(--text-muted);font-style:italic">' + esc(spec.description) + '</td></tr>';
+    }
+  });
+  html += '</tbody></table>';
+  return html;
+}
+
+function renderSkillTools(tools) {
+  var html = '';
+  if (Array.isArray(tools.allow) && tools.allow.length > 0) {
+    html += '<div style="margin-bottom:6px;font-size:11px;color:var(--text-muted)">Allow:</div>';
+    html += '<div style="display:flex;flex-wrap:wrap;gap:4px;margin-bottom:8px">'
+      + tools.allow.map(function(t) { return '<code style="font-size:11px;background:var(--green)15;color:var(--green);padding:2px 6px;border-radius:3px">' + esc(t) + '</code>'; }).join('')
+      + '</div>';
+  }
+  if (Array.isArray(tools.deny) && tools.deny.length > 0) {
+    html += '<div style="margin-bottom:6px;font-size:11px;color:var(--text-muted)">Deny:</div>';
+    html += '<div style="display:flex;flex-wrap:wrap;gap:4px">'
+      + tools.deny.map(function(t) { return '<code style="font-size:11px;background:var(--red)15;color:var(--red);padding:2px 6px;border-radius:3px">' + esc(t) + '</code>'; }).join('')
+      + '</div>';
+  }
+  return html;
+}
+
+function renderSkillDataSources(sources) {
+  return '<ul style="list-style:none;padding:0;margin:0;font-size:12px">'
+    + sources.map(function(d) {
+        return '<li style="padding:4px 0;border-bottom:1px solid var(--border-light)">'
+          + '<code style="font-size:11px;background:var(--bg-tertiary);padding:1px 6px;border-radius:3px;margin-right:8px">' + esc(d.kind) + '</code>'
+          + '<span style="color:var(--text-secondary)">' + esc(d.purpose) + '</span>'
+          + '</li>';
+      }).join('')
+    + '</ul>';
+}
 
 async function refreshHeartbeatControl() {
   var container = document.getElementById('heartbeat-control-content');
