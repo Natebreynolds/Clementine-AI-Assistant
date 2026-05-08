@@ -4423,6 +4423,136 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
   // tasks should pay the small per-tool overhead of curl-on-every-event)
   // and the installer refuses to overwrite a settings.local.json that
   // wasn't created by us.
+  // ── PRD §11 Phase 5b / 1.18.105: Draft / Publish endpoints ────────
+  // Tasks support per-task draft sidecars at ~/.clementine/cron-drafts/.
+  // The schedule fires off CRON.md only — drafts never go live until
+  // POST /publish promotes them. Five endpoints cover the n8n-style flow:
+  //   GET /api/cron/:job/draft       — current draft + badge state
+  //   POST /api/cron/:job/draft      — save/replace the draft
+  //   POST /api/cron/:job/publish    — promote draft to CRON.md
+  //   DELETE /api/cron/:job/draft    — discard the draft
+  //   GET /api/cron/drafts           — list all drafted task names
+  app.get('/api/cron/drafts', async (_req, res) => {
+    try {
+      const { listDraftNames } = await import('../agent/draft-store.js');
+      res.json({ ok: true, names: listDraftNames() });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: String(err) });
+    }
+  });
+
+  app.get('/api/cron/:job/draft', async (req, res) => {
+    try {
+      const jobName = req.params.job;
+      if (!jobName) { res.status(400).json({ ok: false, error: 'job required' }); return; }
+      const { parseCronJobs } = await import('../gateway/cron-scheduler.js');
+      const { getDraft, computeBadgeState } = await import('../agent/draft-store.js');
+      const draft = getDraft(jobName);
+      const published = parseCronJobs().find((j) => String(j.name).toLowerCase() === jobName.toLowerCase()) ?? null;
+      const badge = computeBadgeState(jobName, published);
+      res.json({ ok: true, draft, published, badge });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: String(err) });
+    }
+  });
+
+  app.post('/api/cron/:job/draft', async (req, res) => {
+    try {
+      const jobName = req.params.job;
+      if (!jobName) { res.status(400).json({ ok: false, error: 'job required' }); return; }
+      const body = (req.body ?? {}) as Record<string, unknown>;
+      const draftDef = body.draft as { name?: string } | undefined;
+      if (!draftDef || typeof draftDef !== 'object') {
+        res.status(400).json({ ok: false, error: 'draft (job def) required in body' });
+        return;
+      }
+      // Force the draft's name to match the URL param so a stale UI can't
+      // retarget. Mostly defensive — the editor wouldn't call here with a
+      // mismatched name, but be paranoid.
+      (draftDef as { name?: string }).name = jobName;
+      const { parseCronJobs } = await import('../gateway/cron-scheduler.js');
+      const { saveDraft, hashJobDef } = await import('../agent/draft-store.js');
+      const published = parseCronJobs().find((j) => String(j.name).toLowerCase() === jobName.toLowerCase()) ?? null;
+      saveDraft({
+        name: jobName,
+        draft: draftDef as never,
+        savedAt: new Date().toISOString(),
+        changedBy: typeof body.changedBy === 'string' ? body.changedBy : 'dashboard',
+        basedOnPublishedHash: published ? hashJobDef(published) : null,
+      });
+      res.json({ ok: true, message: published ? 'Draft saved.' : 'Draft saved (no published version yet — Publish to make it live).' });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: String(err) });
+    }
+  });
+
+  app.delete('/api/cron/:job/draft', async (req, res) => {
+    try {
+      const jobName = req.params.job;
+      if (!jobName) { res.status(400).json({ ok: false, error: 'job required' }); return; }
+      const { deleteDraft } = await import('../agent/draft-store.js');
+      const removed = deleteDraft(jobName);
+      res.json({ ok: true, removed, message: removed ? 'Draft discarded.' : 'No draft to discard.' });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: String(err) });
+    }
+  });
+
+  app.post('/api/cron/:job/publish', async (req, res) => {
+    try {
+      const jobName = req.params.job;
+      if (!jobName) { res.status(400).json({ ok: false, error: 'job required' }); return; }
+      const { getDraft, deleteDraft } = await import('../agent/draft-store.js');
+      const record = getDraft(jobName);
+      if (!record) {
+        res.status(404).json({ ok: false, error: `No draft for "${jobName}". Save changes as a draft first.` });
+        return;
+      }
+      // Promote: write the draft def into CRON.md by re-using the
+      // dashboard's existing readCronFileAt / writeCronFileAt helpers
+      // (defined alongside POST /api/cron). Find the matching job entry
+      // and overwrite in place; if no match, append.
+      try {
+        // Agent-scoped tasks ("<agent>:<jobname>") live in their own
+        // agents/<agent>/CRON.md. Detect via the slug prefix to pick the
+        // right file.
+        const draftDef = record.draft as { name: string; agent?: string };
+        let targetFile = CRON_FILE;
+        const slugMatch = jobName.match(/^([a-z0-9_-]+):(.+)$/i);
+        if (draftDef.agent || slugMatch) {
+          const slug = String(draftDef.agent ?? slugMatch?.[1] ?? '');
+          if (slug && slug !== 'clementine') {
+            targetFile = path.join(VAULT_DIR, '00-System', 'agents', slug, 'CRON.md');
+          }
+        }
+        const { parsed, jobs } = readCronFileAt(targetFile);
+        const idx = jobs.findIndex((j) => String(j.name ?? '').toLowerCase() === jobName.toLowerCase());
+        // Strip our internal-only fields before writing CRON.md so we
+        // don't pollute the canonical file with hash sidecars etc.
+        const cleanDraft = { ...(record.draft as unknown as Record<string, unknown>) };
+        if (idx >= 0) jobs[idx] = cleanDraft;
+        else jobs.push(cleanDraft);
+        writeCronFileAt(targetFile, parsed, jobs);
+      } catch (writeErr) {
+        res.status(500).json({ ok: false, error: 'failed to write CRON.md: ' + String(writeErr) });
+        return;
+      }
+      deleteDraft(jobName);
+      // Hot-reload the scheduler so the new published def takes effect on
+      // the next tick instead of waiting for the next file scan.
+      try {
+        const gw = await getGateway();
+        const sched = (gw as { cronScheduler?: { reloadJobs?: () => void } }).cronScheduler;
+        if (sched && typeof sched.reloadJobs === 'function') sched.reloadJobs();
+      } catch { /* non-fatal */ }
+      // Broadcast so other tabs refresh task cards immediately.
+      try { broadcastEvent({ type: 'cron_published', data: { job: jobName } }); } catch { /* non-fatal */ }
+      res.json({ ok: true, message: `Published "${jobName}". Schedule fires from this version starting now.` });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: String(err) });
+    }
+  });
+
   app.get('/api/cron/:job/hooks-status', async (req, res) => {
     try {
       const jobName = req.params.job;
