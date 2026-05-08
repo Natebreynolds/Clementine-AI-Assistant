@@ -21092,8 +21092,18 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
              when editing a saved task (set by openEditCronModal). Disabled
              during an in-flight run. -->
         <button class="btn btn-sm btn-success" id="cron-run-once-btn" onclick="runCronOnceFromModal()" style="display:none;font-size:12px;padding:6px 14px">▶ Run task once</button>
+        <!-- PRD §11 Phase 5b / 1.18.105: draft state badge. Updates via
+             refreshCronDraftBadge(jobName) after every save / load /
+             publish / discard. -->
+        <span id="cron-draft-badge" style="display:none;font-size:11px;padding:3px 8px;border-radius:999px;font-weight:500"></span>
       </div>
       <button onclick="closeCronModal()">Cancel</button>
+      <!-- PRD §11 Phase 5b / 1.18.105: Save as draft / Publish split for
+           saved tasks. Visible only when editing an already-published
+           task (cron-modal-save is hidden for those). -->
+      <button class="btn btn-sm" id="cron-discard-draft-btn" onclick="discardCronDraft()" style="display:none;font-size:12px;padding:6px 12px">Discard draft</button>
+      <button class="btn btn-sm" id="cron-save-draft-btn" onclick="saveCronAsDraft()" style="display:none;font-size:12px;padding:6px 14px">Save as draft</button>
+      <button class="btn-primary" id="cron-publish-btn" onclick="publishCronDraft()" style="display:none">Publish</button>
       <button class="btn-primary" id="cron-modal-save" onclick="saveCronJob()">Create Task</button>
     </div>
   </div>
@@ -27754,6 +27764,8 @@ function openEditCronModal(jobName) {
   _cronPreviewLoadedFor = null;
   document.getElementById('cron-modal-title').textContent = 'Edit: ' + jobName;
   document.getElementById('cron-modal-save').textContent = 'Save Changes';
+  // PRD §11 Phase 5b / 1.18.105: load draft state for footer badge + buttons.
+  if (typeof refreshCronDraftBadge === 'function') refreshCronDraftBadge(jobName);
   document.getElementById('cron-name').value = job.name;
   document.getElementById('cron-name').disabled = true;
   setScheduleFromCron(job.schedule || '0 9 * * *');
@@ -28297,6 +28309,168 @@ async function saveCronJob() {
     switchCronTab('preview');
   } else {
     closeCronModal(true);  // force; we just saved, no dirty prompt
+  }
+}
+
+// ── PRD §11 Phase 5b / 1.18.105: Draft / Publish handlers ───────────
+// Build the same body saveCronJob builds, but POST it as a draft sidecar
+// instead of overwriting CRON.md. The schedule keeps firing the published
+// version until the user clicks Publish.
+function _buildCronJobBodyForDraft() {
+  // Reuse the same field collection logic saveCronJob uses, minus the
+  // PUT/POST round-trip. Returns null when validation fails so the caller
+  // can bail without further work.
+  var name = document.getElementById('cron-name').value.trim();
+  var schedule = document.getElementById('cron-schedule').value.trim();
+  var prompt = document.getElementById('cron-prompt').value.trim();
+  if (!name) { toast('Task name is required', 'error'); return null; }
+  if (!schedule) { toast('Schedule is required', 'error'); return null; }
+  if (!prompt) { toast('Prompt is required', 'error'); return null; }
+  var tier = parseInt(document.getElementById('cron-tier').value);
+  var work_dir = document.getElementById('cron-workdir').value;
+  var mode = document.getElementById('cron-mode').value;
+  var max_hours = mode === 'unleashed' ? parseInt(document.getElementById('cron-maxhours').value) : undefined;
+  var max_retries_val = document.getElementById('cron-max-retries').value;
+  var max_retries = max_retries_val !== '' ? parseInt(max_retries_val) : undefined;
+  var after = document.getElementById('cron-after').value || undefined;
+  var context = document.getElementById('cron-context').value.trim() || undefined;
+  var category = (document.getElementById('cron-category')?.value || '').trim() || undefined;
+  var allowedTools = parseAllowedToolsRaw();
+  var successCriteriaText = (document.getElementById('cron-success-criteria-text')?.value || '').trim();
+  var successSchemaRaw = (document.getElementById('cron-success-schema')?.value || '').trim();
+  var successSchema;
+  if (successSchemaRaw) {
+    try { successSchema = JSON.parse(successSchemaRaw); }
+    catch (e) { toast('Success schema is not valid JSON', 'error'); return null; }
+  }
+  var addDirs = (document.getElementById('cron-add-dirs')?.value || '')
+    .split(/\\r?\\n/).map(function(s){return s.trim();}).filter(Boolean);
+  return {
+    name: name, schedule: schedule, prompt: prompt, tier: tier,
+    enabled: true,
+    work_dir: work_dir || undefined,
+    mode: mode,
+    max_hours: max_hours,
+    max_retries: max_retries,
+    after: after,
+    context: context,
+    category: category,
+    skills: _cronSelectedSkills,
+    allowedTools: allowedTools,
+    allowedMcpServers: _cronSelectedMcp,
+    tags: _cronTags,
+    predictable: typeof _cronPredictable === 'boolean' ? _cronPredictable : true,
+    successCriteriaText: successCriteriaText || undefined,
+    successSchema: successSchema || undefined,
+    addDirs: addDirs.length ? addDirs : undefined,
+  };
+}
+
+async function saveCronAsDraft() {
+  if (!editingCronJob) {
+    toast('Save the task first; drafts apply to existing tasks.', 'info');
+    return;
+  }
+  var body = _buildCronJobBodyForDraft();
+  if (!body) return;
+  try {
+    var r = await apiFetch('/api/cron/' + encodeURIComponent(editingCronJob) + '/draft', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ draft: body, changedBy: 'dashboard' }),
+    });
+    var d = await r.json().catch(function() { return {}; });
+    if (!r.ok || d.ok === false) {
+      toast(d.error || ('Save draft failed (HTTP ' + r.status + ')'), 'error');
+      return;
+    }
+    toast(d.message || 'Draft saved.', 'success');
+    captureCronModalSnapshot();
+    refreshCronDraftBadge(editingCronJob);
+  } catch (err) { toast('Save draft failed: ' + err, 'error'); }
+}
+
+async function publishCronDraft() {
+  if (!editingCronJob) return;
+  if (!confirm('Publish the draft to live? The schedule will start firing the new version on the next tick.')) return;
+  try {
+    var r = await apiFetch('/api/cron/' + encodeURIComponent(editingCronJob) + '/publish', { method: 'POST' });
+    var d = await r.json().catch(function() { return {}; });
+    if (!r.ok || d.ok === false) {
+      toast(d.error || ('Publish failed (HTTP ' + r.status + ')'), 'error');
+      return;
+    }
+    toast(d.message || 'Published.', 'success');
+    refreshCron();
+    refreshCronDraftBadge(editingCronJob);
+  } catch (err) { toast('Publish failed: ' + err, 'error'); }
+}
+
+async function discardCronDraft() {
+  if (!editingCronJob) return;
+  if (!confirm('Discard the unpublished draft? This restores the editor to the published version.')) return;
+  try {
+    var r = await apiFetch('/api/cron/' + encodeURIComponent(editingCronJob) + '/draft', { method: 'DELETE' });
+    var d = await r.json().catch(function() { return {}; });
+    if (!r.ok || d.ok === false) {
+      toast(d.error || ('Discard failed (HTTP ' + r.status + ')'), 'error');
+      return;
+    }
+    toast(d.message || 'Draft discarded.', 'success');
+    refreshCronDraftBadge(editingCronJob);
+    // Reload the modal contents from the published version so the editor
+    // matches what the schedule will fire.
+    if (editingCronJob && typeof openEditCronModal === 'function') {
+      var name = editingCronJob;
+      // openEditCronModal re-fetches and re-populates fields.
+      openEditCronModal(name);
+    }
+  } catch (err) { toast('Discard failed: ' + err, 'error'); }
+}
+
+// Update the draft badge + footer button visibility based on the
+// computed badge state. Called from openEditCronModal after load and
+// after every draft action.
+async function refreshCronDraftBadge(jobName) {
+  var badge = document.getElementById('cron-draft-badge');
+  var saveDraftBtn = document.getElementById('cron-save-draft-btn');
+  var publishBtn = document.getElementById('cron-publish-btn');
+  var discardBtn = document.getElementById('cron-discard-draft-btn');
+  if (!badge || !jobName) return;
+  try {
+    var r = await apiFetch('/api/cron/' + encodeURIComponent(jobName) + '/draft');
+    var d = await r.json();
+    if (!r.ok || !d.ok) {
+      badge.style.display = 'none';
+      if (saveDraftBtn) saveDraftBtn.style.display = '';
+      if (publishBtn) publishBtn.style.display = 'none';
+      if (discardBtn) discardBtn.style.display = 'none';
+      return;
+    }
+    var state = d.badge || 'none';
+    var label, color;
+    if (state === 'up_to_date') { label = '✓ Published, no draft changes'; color = 'var(--green)'; }
+    else if (state === 'ready') { label = '● Ready to publish'; color = 'var(--accent)'; }
+    else if (state === 'rebase_needed') { label = '⚠ Published drifted — review draft'; color = 'var(--yellow)'; }
+    else if (state === 'draft') { label = '✎ Draft (not yet published)'; color = 'var(--accent)'; }
+    else { label = ''; color = ''; }
+    if (label) {
+      badge.style.display = '';
+      badge.textContent = label;
+      badge.style.background = color + '20';
+      badge.style.color = color;
+    } else {
+      badge.style.display = 'none';
+    }
+    // Footer button visibility depends on whether we have a saved task
+    // (editingCronJob) AND whether a draft already exists. Save-as-draft
+    // is always visible when editing; Publish/Discard only when a draft
+    // exists.
+    if (saveDraftBtn) saveDraftBtn.style.display = '';
+    if (publishBtn) publishBtn.style.display = (state === 'ready' || state === 'rebase_needed' || state === 'draft') ? '' : 'none';
+    if (discardBtn) discardBtn.style.display = (state === 'ready' || state === 'rebase_needed' || state === 'draft' || state === 'up_to_date') ? '' : 'none';
+  } catch (err) {
+    if (badge) badge.style.display = 'none';
   }
 }
 
