@@ -24521,7 +24521,7 @@ async function refreshMiniDashboards() {
     + '<div class="mini-card">'
     +   '<div class="mini-card-head"><span class="mini-card-title">Latency · avg</span><span class="mini-card-figure">' + esc(latFigure) + '</span></div>'
     +   splitHtml
-    +   '<div class="mini-card-sub">' + esc(latSub) + ' (split is heuristic; per-tool timing lands with hooks)</div>'
+    +   '<div class="mini-card-sub">' + esc(latSub) + ' · split is heuristic until path B hooks land per-task (enable in cron editor → Last run)</div>'
     + '</div>'
     + '<div class="mini-card">'
     +   '<div class="mini-card-head"><span class="mini-card-title">Reliability · 7d</span><span class="mini-card-figure">' + totalFails7 + ' fail' + (totalFails7 === 1 ? '' : 's') + '</span></div>'
@@ -27112,11 +27112,115 @@ function renderCronLastRunPane(job) {
     return;
   }
   var lr = job && job.lastRun;
-  if (!lr) {
-    pane.innerHTML = '<div style="padding:36px 24px;color:var(--text-muted);text-align:center;font-size:13px">No runs yet. Click <strong>Run task once</strong> below to fire it now and watch the result here.</div>';
-    return;
+  var topHtml = lr ? renderCronRunDetails(lr)
+    : '<div style="padding:36px 24px;color:var(--text-muted);text-align:center;font-size:13px">No runs yet. Click <strong>Run task once</strong> below to fire it now and watch the result here.</div>';
+  // PRD §6 Phase 4d / 1.18.103: Per-task observability section. Shows hook
+  // installation status + a toggle. Appears under the run details so the
+  // most important info (last result) stays primary. Renders a placeholder
+  // immediately and async-loads status; if the dashboard daemon is older
+  // than 1.18.101 the section quietly hides itself when the API 404s.
+  topHtml += '<div id="cron-hooks-section" style="margin-top:14px;padding:14px 18px;background:var(--bg-secondary);border:1px solid var(--border);border-radius:8px">'
+    + '<div style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.04em;margin-bottom:8px">Per-task observability</div>'
+    + '<div id="cron-hooks-body" style="font-size:12px;color:var(--text-muted)">Loading hook status…</div>'
+    + '</div>';
+  pane.innerHTML = topHtml;
+  // Fire the async fetch separately. job.name is the key the endpoints take.
+  if (job && job.name) loadCronHooksStatus(job.name);
+}
+
+// PRD §6 Phase 4d / 1.18.103: fetch hooks-status for the editing job and
+// render the appropriate UI (install / installed / conflict). Best-effort —
+// older daemons don't have the endpoint and we just hide the section.
+async function loadCronHooksStatus(jobName) {
+  var body = document.getElementById('cron-hooks-body');
+  if (!body) return;
+  try {
+    var r = await apiFetch('/api/cron/' + encodeURIComponent(jobName) + '/hooks-status');
+    if (!r.ok) {
+      var section = document.getElementById('cron-hooks-section');
+      if (section) section.style.display = 'none';
+      return;
+    }
+    var d = await r.json();
+    var st = d.status || {};
+    if (!d.workDir) {
+      body.innerHTML = '<div style="color:var(--text-muted);font-size:12px;line-height:1.5">'
+        + 'This task has no <code>work_dir</code> set, so hooks can\\x27t be installed. '
+        + 'Add a <code>work_dir</code> in the <strong>Scope</strong> tab pointing at a project directory and the hooks toggle will appear here.'
+        + '</div>';
+      return;
+    }
+    var safeName = jsStr(jobName);
+    if (st.installed && st.managedByUs) {
+      var installedAt = st.installedAt ? new Date(st.installedAt).toLocaleString() : 'unknown';
+      body.innerHTML = '<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">'
+        + '<span style="display:inline-flex;align-items:center;gap:6px;color:var(--green);font-size:13px;font-weight:500">'
+        +   '<span style="font-size:14px">🪝</span> Hooks installed'
+        + '</span>'
+        + '<span style="color:var(--text-muted);font-size:11px">since ' + esc(installedAt) + '</span>'
+        + '<span style="flex:1"></span>'
+        + '<button class="btn-sm btn-danger" onclick="disableCronHooks(\\x27' + safeName + '\\x27)" style="font-size:11px">Disable hooks</button>'
+        + '</div>'
+        + '<div style="margin-top:8px;font-size:11px;color:var(--text-muted);line-height:1.5">'
+        + 'PreToolUse, PostToolUse, SubagentStart/Stop, Stop, Notification, UserPromptSubmit, SessionStart, and PreCompact events are forwarded to the dashboard\\x27s event store. '
+        + 'This unlocks per-tool latency in the Latency mini-card and richer waterfall span detail in Run detail.'
+        + '</div>';
+    } else if (st.installed && st.conflictsWithUser) {
+      body.innerHTML = '<div style="color:var(--yellow);font-size:13px;font-weight:500;margin-bottom:6px">⚠ Hook config conflict</div>'
+        + '<div style="color:var(--text-muted);font-size:12px;line-height:1.5">'
+        + 'A <code>.claude/settings.local.json</code> exists in <code>' + esc(d.workDir) + '</code> but it wasn\\x27t created by Clementine. '
+        + 'Move or delete that file and click below to install our hooks alongside.'
+        + '</div>'
+        + '<div style="margin-top:10px;display:flex;gap:8px">'
+        + '<button class="btn-sm" onclick="loadCronHooksStatus(\\x27' + safeName + '\\x27)" style="font-size:11px">Re-check</button>'
+        + '</div>';
+    } else {
+      body.innerHTML = '<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">'
+        + '<span style="color:var(--text-secondary);font-size:13px">'
+        +   '<span style="font-size:14px">🪝</span> Hooks not installed'
+        + '</span>'
+        + '<span style="flex:1"></span>'
+        + '<button class="btn-sm btn-success" onclick="enableCronHooks(\\x27' + safeName + '\\x27)" style="font-size:11px">Enable hooks</button>'
+        + '</div>'
+        + '<div style="margin-top:8px;font-size:11px;color:var(--text-muted);line-height:1.5">'
+        + 'Drops a <code>.claude/settings.local.json</code> into <code>' + esc(d.workDir) + '</code> registering command-type hooks for the SDK\\x27s 9 hook events. '
+        + 'Hooks POST event JSON to the dashboard so per-tool durations land in the Run detail viewer + Latency mini-card. '
+        + 'Per-event overhead is &lt;5 ms (curl with --max-time 2). The file is gitignored by convention so this stays per-machine.'
+        + '</div>';
+    }
+  } catch (err) {
+    body.innerHTML = '<div style="color:var(--text-muted);font-size:12px">Could not load hook status: ' + esc(String(err)) + '</div>';
   }
-  pane.innerHTML = renderCronRunDetails(lr);
+}
+
+async function enableCronHooks(jobName) {
+  try {
+    var r = await apiFetch('/api/cron/' + encodeURIComponent(jobName) + '/enable-hooks', { method: 'POST' });
+    var d = await r.json().catch(function() { return {}; });
+    if (!r.ok) {
+      toast(d.error || 'Failed to enable hooks (HTTP ' + r.status + ')', 'error');
+      // Refresh anyway so the conflict path renders.
+      loadCronHooksStatus(jobName);
+      return;
+    }
+    toast(d.message || 'Hooks installed.', 'success');
+    loadCronHooksStatus(jobName);
+  } catch (err) { toast('Enable hooks failed: ' + err, 'error'); }
+}
+
+async function disableCronHooks(jobName) {
+  if (!confirm('Disable hooks for "' + jobName + '"? The next run will only use the in-process tap (path A).')) return;
+  try {
+    var r = await apiFetch('/api/cron/' + encodeURIComponent(jobName) + '/disable-hooks', { method: 'POST' });
+    var d = await r.json().catch(function() { return {}; });
+    if (!r.ok) {
+      toast(d.error || 'Failed to disable hooks (HTTP ' + r.status + ')', 'error');
+      loadCronHooksStatus(jobName);
+      return;
+    }
+    toast(d.message || 'Hooks disabled.', 'success');
+    loadCronHooksStatus(jobName);
+  } catch (err) { toast('Disable hooks failed: ' + err, 'error'); }
 }
 
 function renderCronRunningState(startedAtMs) {
