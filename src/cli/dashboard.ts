@@ -5540,6 +5540,81 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
     }
   });
 
+  // ── PRD Phase 4d / 1.18.101: Path B hook event ingest ──────────
+  // The Claude Agent SDK supports `.claude/settings.json`-registered command
+  // hooks (PreToolUse, PostToolUse, SubagentStart, SubagentStop, Stop,
+  // Notification, etc.). When a hook fires the SDK pipes JSON to the
+  // command's stdin; the command can POST that JSON to this endpoint to
+  // get the event recorded in the same per-run JSONL the in-process tap
+  // (path A) writes to. The result: real per-tool-call durations,
+  // approval-required events, and stop-reason hooks land in the Run detail
+  // viewer's waterfall + the Latency dashboard's split bar.
+  //
+  // Auth: dashboard token via X-Dashboard-Token header. The daemon
+  // exposes the token via CLEMENTINE_DASHBOARD_TOKEN env var, which the
+  // SDK subprocess inherits — settings.json hook commands curl this
+  // endpoint with that header.
+  app.post('/api/hooks/event', express.json({ limit: '256kb' }), async (req, res) => {
+    try {
+      const headerToken = String(req.header('x-dashboard-token') || '');
+      if (!dashboardToken || headerToken !== dashboardToken) {
+        res.status(401).json({ ok: false, error: 'invalid dashboard token' });
+        return;
+      }
+      const body = (req.body ?? {}) as Record<string, unknown>;
+      const sessionId = String(body.session_id || body.sessionId || '');
+      const hookEventName = String(body.hook_event_name || body.hookEventName || 'unknown');
+      if (!sessionId) {
+        res.status(400).json({ ok: false, error: 'session_id required in payload' });
+        return;
+      }
+      const { getRunSession, nextSeqForSession, sweepStaleSessions } = await import('../agent/hook-session-registry.js');
+      // Best-effort sweep on every POST — keeps the map bounded without a timer.
+      sweepStaleSessions();
+      const entry = getRunSession(sessionId);
+      if (!entry) {
+        // Late-arriving hook for a session we already closed (or never
+        // saw because path A registration didn't complete). Drop and tell
+        // the caller — the curl exits 0 either way so it doesn't fail
+        // the SDK's run.
+        res.status(202).json({ ok: false, dropped: true, reason: 'session not registered (race or post-end)' });
+        return;
+      }
+      const seq = nextSeqForSession(sessionId);
+      // Synthesize a RunEvent. The hook payload's shape varies by event
+      // kind; we extract the fields the dashboard waterfall renders and
+      // stash the full payload for advanced filtering later.
+      const ev: Record<string, unknown> = {
+        runId: entry.runId,
+        seq: seq ?? 1_000_000,
+        kind: 'hook',
+        ts: new Date().toISOString(),
+        sessionId,
+        hookEventName,
+      };
+      // Tool fields if present (PreToolUse / PostToolUse).
+      if (typeof body.tool_name === 'string') ev.toolName = body.tool_name;
+      if (typeof body.tool_use_id === 'string') ev.toolUseId = body.tool_use_id;
+      if (body.tool_input !== undefined) ev.toolInput = body.tool_input;
+      if (body.tool_response !== undefined) ev.toolResult = body.tool_response;
+      // PostToolUse can carry an explicit duration_ms (the SDK's stopwatch
+      // wraps the tool call). When present we surface it onto the event so
+      // the latency dashboard sums real numbers instead of the heuristic.
+      if (typeof body.duration_ms === 'number') (ev as Record<string, unknown>).durationMs = body.duration_ms;
+      if (typeof body.parent_tool_use_id === 'string') ev.parentToolUseId = body.parent_tool_use_id;
+      // Errors: PostToolUse can flag a non-zero result; surface as toolError.
+      if (body.is_error === true) {
+        ev.toolError = typeof body.tool_response === 'string'
+          ? body.tool_response.slice(0, 500)
+          : 'tool returned is_error=true';
+      }
+      entry.eventLog.append(ev as never);
+      res.json({ ok: true, runId: entry.runId, seq });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: String(err) });
+    }
+  });
+
   // ── PRD Phase 4a / 1.18.85: per-run Event store reader ─────────
   // Returns every event captured by path A (in-process tap in runAgent)
   // for one run. Used by the new Run detail page (Phase 4b).
