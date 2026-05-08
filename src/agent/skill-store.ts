@@ -625,8 +625,3 @@ export function migrateAllLegacySkills(): { migrated: MigrationResult[]; skipped
   }
   return { migrated, skipped };
 }
-
-/** Diagnostics for the dashboard — expose where the loader looked. */
-export function _skillDirsForDiagnostics(workDir?: string): { global: string; project: string | null } {
-  return { global: globalSkillsDir(), project: projectSkillsDir(workDir) ?? null };
-}

@@ -256,7 +256,7 @@ export async function buildSkillContext(
   agentSlug: string | undefined,
   pinnedSkills: string[] | undefined,
   memoryStore?: MemoryStore | null,
-  opts?: { skipAutoMatch?: boolean },
+  opts?: { skipAutoMatch?: boolean; projectWorkDir?: string },
 ): Promise<SkillContextResult> {
   const applied: SkillContextResult['applied'] = [];
   const missing: string[] = [];
@@ -277,12 +277,39 @@ export async function buildSkillContext(
     const prepared: PreparedSkill[] = [];
     const seen = new Set<string>();
 
-    // 1. Load pinned skills first via exact slug lookup.
+    // 1. Load pinned skills first via exact slug lookup. When the cron has
+    //    a workDir set, we ALSO check for a project-scoped skill at
+    //    <workDir>/.clementine/skills/<name>/SKILL.md before falling back
+    //    to the global lookup. This closes the SDK-alignment gap from the
+    //    1.18.121 audit (project skills were silently unreachable from the
+    //    cron runtime even though skill-store.getSkill supported them).
     if (pinnedSkills?.length) {
+      const projectGetSkill = opts?.projectWorkDir
+        ? (await import('./skill-store.js')).getSkill
+        : null;
       for (const pinName of pinnedSkills) {
         if (seen.has(pinName)) continue;
         if (prepared.length >= MAX_INJECTED_SKILLS) break;
-        const skill = loadSkillByName(pinName, agentSlug, { suppressedNames });
+        // Project-scoped first when a workDir is in scope. The skill-store
+        // shape differs from the runtime's SkillMatch — adapt it here so
+        // the rest of the pipeline doesn't care which loader returned it.
+        let skill: { name: string; title: string; content: string; toolsUsed: string[]; attachments: string[]; skillDir: string } | null = null;
+        if (projectGetSkill && opts?.projectWorkDir) {
+          const ps = projectGetSkill(pinName, { projectWorkDir: opts.projectWorkDir });
+          if (ps && ps.scope === 'project') {
+            const ext = (ps.frontmatter.clementine ?? {}) as Record<string, unknown>;
+            const tools = ((ext.tools as { allow?: unknown })?.allow as unknown[] | undefined) ?? [];
+            skill = {
+              name: ps.frontmatter.name,
+              title: String((ps.frontmatter as { title?: unknown }).title ?? ps.frontmatter.name),
+              content: ps.body,
+              toolsUsed: Array.isArray(tools) ? tools.map(String) : [],
+              attachments: [],
+              skillDir: path.dirname(path.dirname(ps.filePath)),
+            };
+          }
+        }
+        if (!skill) skill = loadSkillByName(pinName, agentSlug, { suppressedNames });
         if (!skill) {
           missing.push(pinName);
           logger.warn({ jobName, pin: pinName, agentSlug }, 'cron: pinned skill not found');
@@ -471,6 +498,11 @@ export interface RunAgentCronOptions {
    *  prior progress. The fix for fire-time memory drift. Undefined =
    *  legacy behavior (inject everything). */
   predictable?: boolean;
+  /** Extra read+execute scope for the agent's Read/Bash/Glob tools. Maps
+   *  directly to the CronJobDefinition.addDirs YAML field. Combined with
+   *  every pinned-skill folder so `Bash python3 scripts/render.py` works
+   *  from inside a skill bundle without the cwd being set there. */
+  addDirs?: string[];
 }
 
 export interface RunAgentCronResult extends RunAgentResult {
@@ -525,6 +557,12 @@ export interface CronExecutionPlan {
    *  MEMORY.md / team / delegation / auto-skills were intentionally
    *  skipped. Used by the Preview verdict line. */
   predictable: boolean;
+  /** Merged list of extra directories the SDK should expose to the agent's
+   *  Read/Bash/Glob tools. Combines `opts.addDirs` with every pinned-skill
+   *  folder so a skill's `scripts/render.py` is reachable without the cwd
+   *  being set inside the skill folder. Deduped + filtered to existing
+   *  paths. Empty when the trick has no addDirs and no folder-form pins. */
+  additionalDirectories: string[];
 }
 
 /**
@@ -557,7 +595,7 @@ export async function buildCronExecutionPlan(opts: RunAgentCronOptions): Promise
   const criteriaContext = buildCriteriaContext(opts.successCriteria);
   const skillResult = await buildSkillContext(
     opts.jobName, opts.jobPrompt, agentSlug, opts.pinnedSkills, opts.memoryStore,
-    { skipAutoMatch: predictable },
+    { skipAutoMatch: predictable, projectWorkDir: opts.workDir },
   );
   const skillContext = skillResult.text;
 
@@ -616,6 +654,38 @@ export async function buildCronExecutionPlan(opts: RunAgentCronOptions): Promise
     opts.maxBudgetUsd ?? (configuredCap > 0 ? configuredCap : undefined);
   const effort: 'low' | 'medium' | 'high' = tier >= 2 ? 'high' : 'medium';
 
+  // 1.18.121 — assemble additionalDirectories. Combines:
+  //   1. opts.addDirs (from CronJobDefinition.addDirs YAML field)
+  //   2. Every pinned-skill folder so the skill's scripts/ + reference docs
+  //      are reachable via Read/Bash without the cwd being set inside the
+  //      skill folder.
+  // Deduped via Set; filtered to paths that actually exist on disk so we
+  // don't trigger SDK errors on stale references.
+  const dirSet = new Set<string>();
+  for (const d of opts.addDirs ?? []) {
+    if (d && typeof d === 'string') dirSet.add(d);
+  }
+  for (const applied of skillResult.applied) {
+    // skillResult.applied lacks the on-disk path; pull it from the prepared
+    // skill list (which we have in scope as a closure via the skillContext
+    // builder). Cheaper to reconstruct: every pinned-form skill lives at
+    // `<skillsRoot>/<name>/SKILL.md` and we want to expose `<skillsRoot>/<name>/`.
+    // Walk both global + agent-scoped roots; first hit wins.
+    const candidates = [
+      path.join(VAULT_DIR, '00-System', 'skills', applied.name),
+    ];
+    if (agentSlug) {
+      candidates.unshift(path.join(VAULT_DIR, '00-System', 'agents', agentSlug, 'skills', applied.name));
+    }
+    for (const candidate of candidates) {
+      if (fs.existsSync(path.join(candidate, 'SKILL.md'))) { dirSet.add(candidate); break; }
+    }
+  }
+  // Final filter: only emit dirs that exist (the SDK errors on missing).
+  const additionalDirectories = [...dirSet].filter(d => {
+    try { return fs.statSync(d).isDirectory(); } catch { return false; }
+  });
+
   return {
     builtPrompt,
     contextBlocks: {
@@ -636,6 +706,7 @@ export async function buildCronExecutionPlan(opts: RunAgentCronOptions): Promise
     agentSlug,
     ownerName,
     predictable,
+    additionalDirectories,
   };
 }
 
@@ -655,6 +726,7 @@ export async function runAgentCron(opts: RunAgentCronOptions): Promise<RunAgentC
   const {
     builtPrompt, agentSlug, effort, maxBudgetUsd: maxBudget,
     effectiveAllowedTools, mcpServerMap, composioConnected, externalConnected, mcpServersApplied,
+    additionalDirectories,
   } = plan;
 
   logger.info({
@@ -685,6 +757,10 @@ export async function runAgentCron(opts: RunAgentCronOptions): Promise<RunAgentC
     abortSignal: opts.abortSignal,
     ...(effectiveAllowedTools ? { allowedTools: effectiveAllowedTools } : {}),
     extraMcpServers: mcpServerMap as unknown as Parameters<typeof runAgent>[1]['extraMcpServers'],
+    // 1.18.121 — pipe the merged addDirs+pinned-skill folders to the SDK
+    // so a skill's bundled scripts/templates are reachable via Bash/Read
+    // without making the cwd the skill folder.
+    ...(additionalDirectories.length > 0 ? { additionalDirectories } : {}),
   });
 
   // Mirror the run into transcripts so future chat recall can see it.

@@ -706,37 +706,6 @@ export function recordSkillUse(skillName: string, agentSlug?: string): void {
   } catch { /* non-fatal */ }
 }
 
-/** List all active skills (global + all agent-scoped). */
-export function listSkills(agentSlug?: string): Array<{ name: string; title: string; source: string; useCount: number; updatedAt: string; agentSlug?: string }> {
-  const results: ReturnType<typeof listSkills> = [];
-
-  const dirs: Array<{ dir: string; slug?: string }> = [];
-  if (agentSlug) {
-    dirs.push({ dir: agentSkillsDir(agentSlug), slug: agentSlug });
-  } else {
-    dirs.push({ dir: GLOBAL_SKILLS_DIR });
-  }
-
-  for (const { dir, slug } of dirs) {
-    if (!existsSync(dir)) continue;
-    for (const f of readdirSync(dir).filter(f => f.endsWith('.md'))) {
-      try {
-        const parsed = matter(readFileSync(path.join(dir, f), 'utf-8'));
-        results.push({
-          name: f.replace('.md', ''),
-          title: parsed.data.title ?? f,
-          source: parsed.data.source ?? 'unknown',
-          useCount: parsed.data.useCount ?? 0,
-          updatedAt: parsed.data.updatedAt ?? '',
-          agentSlug: slug,
-        });
-      } catch { /* skip */ }
-    }
-  }
-
-  return results;
-}
-
 // ── Stale skill archival ────────────────────────────────────────────
 
 /**

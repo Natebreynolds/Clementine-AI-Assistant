@@ -1338,6 +1338,7 @@ export class CronScheduler {
             job.allowedTools,
             job.allowedMcpServers,
             job.predictable,
+            job.addDirs,
           );
 
           // alwaysDeliver: retry once if the response is empty/noise
@@ -1360,6 +1361,7 @@ export class CronScheduler {
                 job.allowedTools,
                 job.allowedMcpServers,
                 job.predictable,
+                job.addDirs,
               );
               if (retryResponse && !CronScheduler.isCronNoise(retryResponse)) {
                 response = retryResponse;

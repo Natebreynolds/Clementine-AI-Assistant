@@ -32443,7 +32443,7 @@ async function deleteSkillFromStudio(name) {
     await apiDelete('/api/skills/' + encodeURIComponent(name));
     toast('Skill deleted', 'success');
     refreshBuilderSkills();
-    refreshSkills(); // also refresh the automations tab list
+    refreshSkillsPage(); // also refresh the automations tab list
   } catch(e) { toast('Error: ' + e, 'error'); }
 }
 
@@ -32827,7 +32827,7 @@ async function saveBuilderArtifact() {
       msgs.innerHTML += '<div style="text-align:center;padding:12px;color:var(--green);font-size:13px;font-weight:600">\\u2714 ' + esc(r.message || 'Saved') + '</div>';
       msgs.scrollTop = msgs.scrollHeight;
       document.getElementById('builder-save-btn').style.display = 'none';
-      if (type === 'skill') { refreshSkills(); refreshBuilderSkills(); }
+      if (type === 'skill') { refreshSkillsPage(); refreshBuilderSkills(); }
       if (type === 'cron') refreshCron();
       if (type === 'agent') refreshTeamNav();
       if (type === 'workflow') refreshWorkflows();
@@ -37033,7 +37033,7 @@ async function saveSkill() {
       document.getElementById('skill-description').value = '';
       document.getElementById('skill-triggers').value = '';
       document.getElementById('skill-steps').value = '';
-      refreshSkills();
+      refreshSkillsPage();
     } else {
       toast('Failed: ' + (r.error || 'unknown'), 'error');
     }
@@ -37045,7 +37045,7 @@ async function deleteSkill(name) {
   try {
     await apiDelete('/api/skills/' + encodeURIComponent(name));
     toast('Skill deleted', 'success');
-    refreshSkills();
+    refreshSkillsPage();
   } catch(e) { toast('Error: ' + e, 'error'); }
 }
 
@@ -37377,152 +37377,8 @@ async function refreshBrokenJobs() {
   }
 }
 
-async function refreshPendingSkills() {
-  try {
-    var r = await apiFetch('/api/skills/pending');
-    var d = await r.json();
-    var pending = d.skills || [];
-    var tabBadge = document.getElementById('tab-pending-skill-count');
-    if (tabBadge) {
-      tabBadge.textContent = String(pending.length);
-      tabBadge.style.display = pending.length > 0 ? '' : 'none';
-    }
-    var card = document.getElementById('pending-skills-card');
-    var countBadge = document.getElementById('pending-skills-count-badge');
-    var container = document.getElementById('panel-pending-skills');
-    if (!container) return;
-    if (pending.length === 0) {
-      if (card) card.style.display = 'none';
-      container.innerHTML = '';
-      return;
-    }
-    if (card) card.style.display = '';
-    if (countBadge) countBadge.textContent = pending.length + ' pending';
 
-    var html = '<div style="display:flex;flex-direction:column;gap:10px">';
-    for (var s of pending) {
-      var sourceTag = s.source === 'cron' ? '<span class="badge badge-green" style="font-size:10px">cron</span>'
-        : s.source === 'unleashed' ? '<span class="badge badge-purple" style="font-size:10px">unleashed</span>'
-        : s.source === 'chat' ? '<span class="badge badge-blue" style="font-size:10px">chat</span>'
-        : '<span class="badge badge-gray" style="font-size:10px">' + esc(s.source || 'unknown') + '</span>';
-      var age = s.createdAt ? timeAgo(s.createdAt) : '';
-      var scopeTag = s.agentSlug
-        ? '<span style="font-size:10px;color:var(--text-muted)">for ' + esc(s.agentSlug) + '</span>'
-        : '<span style="font-size:10px;color:var(--text-muted)">global</span>';
-      html += '<div style="padding:12px;border:1px solid var(--border);border-radius:8px;background:var(--bg-secondary)">'
-        + '<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;flex-wrap:wrap">'
-        + '<strong>' + esc(s.title) + '</strong> ' + sourceTag + ' ' + scopeTag
-        + (age ? ' <span style="font-size:10px;color:var(--text-muted)">\\u00b7 learned ' + age + '</span>' : '')
-        + '<span style="margin-left:auto;display:flex;gap:6px">'
-        + '<button onclick="approvePendingSkill(\\x27' + esc(s.name) + '\\x27)" style="background:var(--accent);border:1px solid var(--accent);border-radius:4px;padding:3px 10px;font-size:11px;color:white;cursor:pointer">Approve</button>'
-        + '<button onclick="rejectPendingSkill(\\x27' + esc(s.name) + '\\x27)" style="background:none;border:1px solid var(--border);border-radius:4px;padding:3px 10px;font-size:11px;color:var(--red);cursor:pointer">Reject</button>'
-        + '</span>'
-        + '</div>'
-        + '<div style="font-size:12px;color:var(--text-secondary)">' + esc(s.description || '') + '</div>'
-        + '</div>';
-    }
-    html += '</div>';
-    container.innerHTML = html;
-  } catch(e) { /* non-fatal */ }
-}
 
-async function approvePendingSkill(name) {
-  try {
-    var r = await apiJson('POST', '/api/skills/pending/' + encodeURIComponent(name) + '/approve', {});
-    if (r && r.ok) {
-      toast(r.message || 'Skill approved', 'success');
-      refreshPendingSkills();
-      refreshSkills();
-    } else {
-      toast((r && r.message) || 'Failed to approve', 'error');
-    }
-  } catch(e) { toast('Failed to approve skill', 'error'); }
-}
-
-async function rejectPendingSkill(name) {
-  if (!confirm('Reject this pending skill? It will be deleted.')) return;
-  try {
-    var r = await apiJson('POST', '/api/skills/pending/' + encodeURIComponent(name) + '/reject', {});
-    if (r && r.ok) {
-      toast(r.message || 'Skill rejected', 'success');
-      refreshPendingSkills();
-    } else {
-      toast((r && r.message) || 'Failed to reject', 'error');
-    }
-  } catch(e) { toast('Failed to reject skill', 'error'); }
-}
-
-async function refreshSkills() {
-  refreshPendingSkills();
-  try {
-    var r = await apiFetch('/api/skills');
-    var d = await r.json();
-    var skills = d.skills || [];
-    var badge = document.getElementById('tab-skill-count');
-    var countBadge = document.getElementById('skill-count-badge');
-    if (badge) { badge.textContent = skills.length || ''; badge.style.display = skills.length > 0 ? '' : 'none'; }
-    if (countBadge) countBadge.textContent = skills.length + ' skill' + (skills.length !== 1 ? 's' : '');
-    var navSkillBadge = document.getElementById('nav-skill-count');
-    if (navSkillBadge) { navSkillBadge.textContent = skills.length || ''; navSkillBadge.style.display = skills.length > 0 ? '' : 'none'; }
-    var container = document.getElementById('panel-skills');
-    if (!container) return;
-    if (skills.length === 0) {
-      container.innerHTML = '<div class="empty-state">No skills learned yet. Skills are auto-extracted from successful tasks or taught manually above.</div>';
-      return;
-    }
-    var html = '<div style="display:flex;flex-direction:column;gap:12px">';
-    for (var s of skills) {
-      var sourceTag = s.source === 'manual' ? '<span class="badge badge-blue" style="font-size:10px">taught</span>'
-        : s.source === 'cron' ? '<span class="badge badge-green" style="font-size:10px">cron</span>'
-        : s.source === 'unleashed' ? '<span class="badge badge-purple" style="font-size:10px">unleashed</span>'
-        : '<span class="badge badge-gray" style="font-size:10px">' + esc(s.source) + '</span>';
-      var allTriggers = s.triggers || [];
-      var shownTriggers = allTriggers.slice(0, 5).map(function(t) { return '<code style="font-size:11px;background:var(--bg-tertiary);padding:2px 6px;border-radius:3px">' + esc(t) + '</code>'; }).join(' ');
-      var triggers = shownTriggers + (allTriggers.length > 5 ? ' <span style="font-size:11px;color:var(--text-muted)">+' + (allTriggers.length - 5) + ' more</span>' : '');
-      var age = s.updatedAt ? timeAgo(s.updatedAt) : '';
-      // Source context for auto-extracted skills
-      var sourceCtx = '';
-      if (s.sourceJob) sourceCtx += '<span style="font-size:10px;color:var(--text-muted)">from ' + esc(s.sourceJob) + '</span>';
-      if (s.createdAt && (s.source === 'cron' || s.source === 'unleashed')) {
-        sourceCtx += '<span style="font-size:10px;color:var(--text-muted)">' + (sourceCtx ? ' \\u00b7 ' : '') + 'learned ' + timeAgo(s.createdAt) + '</span>';
-      }
-      // Tools used pills
-      var toolsPills = '';
-      if (s.toolsUsed && s.toolsUsed.length > 0) {
-        var shownTools = s.toolsUsed.slice(0, 4).map(function(t) {
-          return '<span style="font-size:10px;background:var(--accent)15;color:var(--accent);padding:1px 6px;border-radius:3px;border:1px solid var(--accent)30">' + esc(t) + '</span>';
-        }).join(' ');
-        toolsPills = '<div style="display:flex;gap:3px;flex-wrap:wrap;margin-top:4px">'
-          + shownTools
-          + (s.toolsUsed.length > 4 ? ' <span style="font-size:10px;color:var(--text-muted)">+' + (s.toolsUsed.length - 4) + '</span>' : '')
-          + '</div>';
-      }
-      var retrieval7d = (typeof s.retrievals7d === 'number' && s.retrievals7d > 0)
-        ? ' \\u00b7 ' + s.retrievals7d + ' retrievals (7d)'
-        : '';
-      html += '<div id="skill-card-' + esc(s.name) + '" style="padding:12px;border:1px solid var(--border);border-radius:8px;background:var(--bg-secondary)">'
-        + '<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">'
-        + '<strong style="cursor:pointer" onclick="expandSkill(\\x27' + esc(s.name) + '\\x27)">' + esc(s.title) + '</strong> ' + sourceTag
-        + (sourceCtx ? ' ' + sourceCtx : '')
-        + '<span style="margin-left:auto;display:flex;align-items:center;gap:8px">'
-        + '<span style="font-size:11px;color:var(--text-muted)">used ' + s.useCount + 'x' + (age ? ' \\u00b7 ' + age : '') + retrieval7d + '</span>'
-        + '<button onclick="expandSkill(\\x27' + esc(s.name) + '\\x27)" style="background:none;border:1px solid var(--border);border-radius:4px;padding:2px 8px;font-size:11px;color:var(--text-secondary);cursor:pointer">View</button>'
-        + '<button onclick="editSkillInBuilder(\\x27' + esc(s.name) + '\\x27)" style="background:none;border:1px solid var(--border);border-radius:4px;padding:2px 8px;font-size:11px;color:var(--accent);cursor:pointer">Edit</button>'
-        + '<button onclick="deleteSkill(\\x27' + esc(s.name) + '\\x27)" style="background:none;border:1px solid var(--border);border-radius:4px;padding:2px 8px;font-size:11px;color:var(--red);cursor:pointer">Delete</button>'
-        + '</span>'
-        + '</div>'
-        + '<div style="font-size:12px;color:var(--text-secondary);margin-bottom:4px">' + esc(s.description) + '</div>'
-        + (triggers ? '<div style="display:flex;gap:4px;flex-wrap:wrap">' + triggers + '</div>' : '')
-        + toolsPills
-        + '</div>';
-    }
-    html += '</div>';
-    container.innerHTML = html;
-  } catch(e) {
-    var c = document.getElementById('panel-skills');
-    if (c) c.innerHTML = '<div class="empty-state" style="color:var(--red)">Failed to load skills</div>';
-  }
-}
 
 // ── Agent-scoped Skills (Training tab) ──
 function toggleAgentTeachSkill() {

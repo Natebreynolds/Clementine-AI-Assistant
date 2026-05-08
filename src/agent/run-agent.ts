@@ -216,6 +216,14 @@ export interface RunAgentOptions {
   /** Optional CLAUDE.md / project setting source. Defaults to ['project']. */
   settingSources?: ('project' | 'user' | 'local')[];
 
+  /** Extra directories the SDK should make available to the agent's tools
+   *  (Read/Bash/Glob/Grep) beyond `cwd`. Maps directly to the SDK's
+   *  `additionalDirectories` option. The cron runtime uses this to surface
+   *  pinned-skill folders so the agent can `Bash python3 scripts/render.py`
+   *  inside a skill bundle without the cwd being set to that folder.
+   *  Captured in CronJobDefinition.addDirs and piped through buildPrompt. */
+  additionalDirectories?: string[];
+
   /** Additional MCP servers to merge with the always-on clementine-tools
    *  server. Use to wire Composio + claude.ai integrations on chat-path
    *  invocations that need Outlook/Salesforce/etc. */
@@ -426,6 +434,14 @@ export async function runAgent(prompt: string, opts: RunAgentOptions): Promise<R
     ...(opts.model ? { model: opts.model } : {}),
     ...(opts.resumeSessionId ? { resume: opts.resumeSessionId } : {}),
     ...(sdkAbortController ? { abortController: sdkAbortController } : {}),
+    // 1.18.121 — pipe additionalDirectories through to the SDK so agents
+    // can Read / Bash inside pinned-skill folders, project-scoped skills,
+    // and any cron's add_dirs scope without their cwd being set to those
+    // folders. Was captured in CronJobDefinition.addDirs since 1.18.77 but
+    // never reached the SDK call site — this closes that gap.
+    ...(opts.additionalDirectories && opts.additionalDirectories.length > 0
+      ? { additionalDirectories: opts.additionalDirectories }
+      : {}),
   };
 
   const sdkOptions = normalizeClaudeSdkOptionsForOneMillionContext(sdkOptionsRaw);

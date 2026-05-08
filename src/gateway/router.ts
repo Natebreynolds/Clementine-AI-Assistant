@@ -2258,6 +2258,10 @@ export class Gateway {
     allowedMcpServers?: string[],
     /** Predictable (contract) mode — runner skips memory/team/auto-skills. */
     predictable?: boolean,
+    /** Extra read+exec scope for the SDK's Read/Bash/Glob tools. From the
+     *  CronJobDefinition.addDirs YAML field. Combined inside runAgentCron
+     *  with each pinned-skill folder. (1.18.121) */
+    addDirs?: string[],
   ): Promise<string> {
     const releaseLane = await lanes.acquire('cron');
     // Build a wall-clock abort timer from maxHours / timeoutMs.
@@ -2305,6 +2309,7 @@ export class Gateway {
           allowedTools,
           allowedMcpServers,
           predictable,
+          addDirs,
         });
 
         scanner.refreshIntegrity();

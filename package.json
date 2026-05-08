@@ -1,6 +1,6 @@
 {
   "name": "clementine-agent",
-  "version": "1.18.120",
+  "version": "1.18.121",
   "description": "Clementine — Personal AI Assistant (TypeScript)",
   "type": "module",
   "main": "dist/index.js",
@@ -53,7 +53,6 @@
     "node-cron": "^3.0.3",
     "pdf-parse": "^1.1.1",
     "pino": "^9.6.0",
-    "twilio": "^5.5.0",
     "ws": "^8.19.0",
     "zod": "^4.3.6"
   },

@@ -2896,27 +2896,47 @@ skillsCmd
     const RESET = '\x1b[0m';
     try {
       process.env.CLEMENTINE_HOME = BASE_DIR;
-      const { listSkills } = await import('../agent/skill-extractor.js');
-      const skills = listSkills(opts.agent);
+      // 1.18.121 — switched from skill-extractor (flat-only loader, broken
+      // since the 1.18.110 folder-form migration so this command was hiding
+      // every migrated skill) to skill-store, which walks both layouts and
+      // reads the canonical Anthropic frontmatter.
+      const { listSkills } = await import('../agent/skill-store.js');
+      const skills = listSkills();
+      if (opts.agent) {
+        console.error(`  ${DIM}Note: --agent filter is informational only since the 1.19 catalog. Showing all skills.${RESET}`);
+      }
       if (opts.json) {
-        console.log(JSON.stringify(skills, null, 2));
+        console.log(JSON.stringify(skills.map(s => ({
+          name: s.frontmatter.name,
+          title: s.frontmatter.title ?? s.frontmatter.name,
+          description: s.frontmatter.description ?? '',
+          layout: s.layout,
+          schemaVersion: s.schemaVersion,
+          scope: s.scope,
+          useCount: (s.frontmatter.clementine?.useCount ?? s.frontmatter.useCount ?? 0),
+          updatedAt: (s.frontmatter.clementine?.updatedAt ?? ''),
+          filePath: s.filePath,
+        })), null, 2));
         return;
       }
       if (skills.length === 0) {
         console.log();
-        console.log(`  ${DIM}No approved skills yet${opts.agent ? ` for "${opts.agent}"` : ''}.${RESET}`);
-        console.log(`  Skills get auto-extracted from successful cron / unleashed runs and queued for approval.`);
-        console.log(`  Pending: ${BOLD}clementine skills pending${RESET}`);
+        console.log(`  ${DIM}No skills found.${RESET}`);
+        console.log(`  Author one in chat ("Hey Clemmy, create a skill called X that…")`);
+        console.log(`  or in the dashboard's Skills page (${BOLD}clementine dashboard${RESET}).`);
         console.log();
         return;
       }
       console.log();
-      console.log(`  ${BOLD}${'NAME'.padEnd(36)}${'AGENT'.padEnd(20)}${'USES'.padEnd(8)}${'UPDATED'}${RESET}`);
+      console.log(`  ${BOLD}${'NAME'.padEnd(40)}${'LAYOUT'.padEnd(8)}${'USES'.padEnd(8)}${'UPDATED'}${RESET}`);
       console.log(`  ${DIM}${'─'.repeat(80)}${RESET}`);
       for (const s of skills) {
-        const agent = s.agentSlug ?? 'global';
-        const updated = s.updatedAt.slice(0, 10);
-        console.log(`  ${s.name.slice(0, 34).padEnd(36)}${CYAN}${agent.slice(0, 18).padEnd(20)}${RESET}${String(s.useCount).padEnd(8)}${DIM}${updated}${RESET}`);
+        const ext = s.frontmatter.clementine ?? {};
+        const useCount = ext.useCount ?? s.frontmatter.useCount ?? 0;
+        const rawUpdated = ext.updatedAt ?? '';
+        const updated = String(rawUpdated).slice(0, 10);
+        const layoutLabel = s.layout === 'folder' ? 'folder' : 'flat';
+        console.log(`  ${s.frontmatter.name.slice(0, 38).padEnd(40)}${CYAN}${layoutLabel.padEnd(8)}${RESET}${String(useCount).padEnd(8)}${DIM}${updated}${RESET}`);
       }
       console.log();
       console.log(`  ${DIM}Total: ${skills.length} skill${skills.length === 1 ? '' : 's'}.${RESET}`);
