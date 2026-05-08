@@ -173,6 +173,24 @@ export function parseCronJobs(): CronJobDefinition[] {
     const successCriteria = Array.isArray(job.success_criteria)
       ? (job.success_criteria as unknown[]).map(c => String(c))
       : undefined;
+    // PRD Phase 1: prefer success_criteria_text (free-form). On read, fall
+    // back to joining the legacy success_criteria string[] so legacy YAML
+    // keeps rendering in the new editor surface. Writes go to the new field.
+    let successCriteriaText = typeof job.success_criteria_text === 'string'
+      ? String(job.success_criteria_text)
+      : (typeof job.successCriteriaText === 'string' ? String(job.successCriteriaText) : undefined);
+    if (!successCriteriaText && Array.isArray(successCriteria) && successCriteria.length > 0) {
+      successCriteriaText = successCriteria.join('\n');
+    }
+    // PRD Phase 1: JSON Schema validated against ResultMessage.structured_output.
+    // Accept either snake_case (success_schema) or camelCase from API. Stored
+    // as a plain object; ajv is loaded lazily at validation time.
+    const successSchemaRaw = job.success_schema ?? job.successSchema;
+    const successSchema = (successSchemaRaw && typeof successSchemaRaw === 'object' && !Array.isArray(successSchemaRaw))
+      ? successSchemaRaw as Record<string, unknown>
+      : undefined;
+    // PRD Phase 1: read scope beyond cwd. Accept either casing.
+    const addDirs = normalizeStringArray(job.add_dirs ?? job.addDirs);
     const alwaysDeliver = job.always_deliver === true ? true : undefined;
     const context = job.context != null ? String(job.context) : undefined;
     const preCheck = job.pre_check != null ? String(job.pre_check) : undefined;
@@ -202,7 +220,8 @@ export function parseCronJobs(): CronJobDefinition[] {
 
     jobs.push({
       name, schedule, prompt, enabled, tier, maxTurns, model, workDir, mode,
-      maxHours, maxRetries, after, successCriteria, alwaysDeliver, context, preCheck, agentSlug,
+      maxHours, maxRetries, after, successCriteria, successCriteriaText, successSchema, addDirs,
+      alwaysDeliver, context, preCheck, agentSlug,
       skills, allowedTools, allowedMcpServers, tags, category, predictable,
     });
   }
@@ -253,6 +272,18 @@ export function parseAgentCronJobs(agentsDir: string): CronJobDefinition[] {
         const successCriteria = Array.isArray(job.success_criteria)
           ? (job.success_criteria as unknown[]).map(c => String(c))
           : undefined;
+        // PRD Phase 1 fields — symmetric with global parser above.
+        let successCriteriaText = typeof job.success_criteria_text === 'string'
+          ? String(job.success_criteria_text)
+          : (typeof job.successCriteriaText === 'string' ? String(job.successCriteriaText) : undefined);
+        if (!successCriteriaText && Array.isArray(successCriteria) && successCriteria.length > 0) {
+          successCriteriaText = successCriteria.join('\n');
+        }
+        const successSchemaRaw = job.success_schema ?? job.successSchema;
+        const successSchema = (successSchemaRaw && typeof successSchemaRaw === 'object' && !Array.isArray(successSchemaRaw))
+          ? successSchemaRaw as Record<string, unknown>
+          : undefined;
+        const addDirs = normalizeStringArray(job.add_dirs ?? job.addDirs);
         const context = job.context != null ? String(job.context) : undefined;
         const preCheck = job.pre_check != null ? String(job.pre_check) : undefined;
         // ── Trick capabilities — symmetric with global parser ─────────
@@ -278,7 +309,9 @@ export function parseAgentCronJobs(agentsDir: string): CronJobDefinition[] {
         allJobs.push({
           name: `${slug}:${name}`,
           schedule, prompt, enabled, tier, maxTurns, model, workDir,
-          mode, maxHours, maxRetries, after, successCriteria, context, preCheck,
+          mode, maxHours, maxRetries, after,
+          successCriteria, successCriteriaText, successSchema, addDirs,
+          context, preCheck,
           agentSlug: slug,
           skills, allowedTools, allowedMcpServers, tags, category, predictable,
         });

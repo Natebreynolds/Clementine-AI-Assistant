@@ -6219,6 +6219,8 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
         name, schedule, prompt, tier, enabled, work_dir, mode, max_hours,
         max_retries, after, agent, context,
         skills, allowedTools, allowedMcpServers, tags, category, predictable,
+        // PRD Phase 1 fields (camelCase from API; written as snake_case YAML).
+        successCriteriaText, successSchema, addDirs,
       } = req.body;
       if (!name || !schedule || !prompt) {
         res.status(400).json({ error: 'name, schedule, and prompt are required' });
@@ -6275,6 +6277,16 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
       // Predictable mode — default to true (contract execution) for new
       // tricks created via the dashboard. Mirror the MCP tool default.
       job.predictable = (predictable === false) ? false : true;
+      // PRD Phase 1: goal-orientation fields (camelCase from API → snake_case YAML).
+      if (typeof successCriteriaText === 'string' && successCriteriaText.trim()) {
+        job.success_criteria_text = successCriteriaText.trim();
+      }
+      if (successSchema && typeof successSchema === 'object' && !Array.isArray(successSchema) && Object.keys(successSchema).length > 0) {
+        job.success_schema = successSchema;
+      }
+      if (Array.isArray(addDirs) && addDirs.length) {
+        job.add_dirs = addDirs.map(String).map((s: string) => s.trim()).filter(Boolean);
+      }
       jobs.push(job);
       writeCronFileAt(cronFile, parsed, jobs);
       res.json({ ok: true, message: `Created cron job: ${name}` });
@@ -6401,6 +6413,33 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
       }
       if (updates.predictable !== undefined) {
         jobs[idx].predictable = Boolean(updates.predictable);
+      }
+      // PRD Phase 1 goal fields. set-when-non-empty / delete-when-cleared,
+      // matching the existing trick-capability pattern above. The deprecated
+      // success_criteria array is dropped on the first save through this path.
+      if (updates.successCriteriaText !== undefined) {
+        const v = typeof updates.successCriteriaText === 'string' ? updates.successCriteriaText.trim() : '';
+        if (v) {
+          jobs[idx].success_criteria_text = v;
+          delete jobs[idx].success_criteria;  // sunset the deprecated alias on first save
+        } else {
+          delete jobs[idx].success_criteria_text;
+        }
+      }
+      if (updates.successSchema !== undefined) {
+        const s = updates.successSchema;
+        if (s && typeof s === 'object' && !Array.isArray(s) && Object.keys(s).length > 0) {
+          jobs[idx].success_schema = s;
+        } else {
+          delete jobs[idx].success_schema;
+        }
+      }
+      if (updates.addDirs !== undefined) {
+        if (Array.isArray(updates.addDirs) && updates.addDirs.length) {
+          jobs[idx].add_dirs = updates.addDirs.map(String).map((s: string) => s.trim()).filter(Boolean);
+        } else {
+          delete jobs[idx].add_dirs;
+        }
       }
       if (updates.name !== undefined && updates.name !== bareJobName) {
         // Rename — check for duplicates
@@ -19829,6 +19868,32 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
           </div>
         </div>
 
+        <!-- ── PRD Phase 1: Goal (success_criteria_text + success_schema) ──
+             The single most important new field set. Without one of these, a
+             run "finished"; with one, a run "accomplished what it was meant
+             to". Banner warns (does not block) when neither is set. -->
+        <div class="cron-section-card">
+          <h4>Goal <span style="color:var(--text-muted);font-weight:normal;font-size:12px">— how do you know this task succeeded?</span></h4>
+          <p class="cron-section-desc">Optional but strongly recommended. Use plain English (an evaluator agent grades the run) or a JSON Schema (validated against the agent's structured output).</p>
+          <div id="cron-goal-warning" style="display:none;margin-bottom:12px;padding:10px 12px;border-radius:6px;background:rgba(245,158,11,0.10);border:1px solid rgba(245,158,11,0.30);color:var(--yellow);font-size:12px">
+            ⚠ No goal set — runs will be marked "finished" but not "accomplished". Add a success criterion below or a JSON Schema.
+          </div>
+          <div class="form-group">
+            <label class="form-label">Success criterion <span style="color:var(--text-muted);font-weight:normal">(plain English)</span></label>
+            <textarea id="cron-success-criteria-text" rows="3" placeholder="e.g. 'A daily briefing email was sent to nathan@example.com containing the top 3 overnight items.'" oninput="updateGoalWarning()"></textarea>
+            <div class="form-hint">An evaluator sub-agent reads the run's output and this criterion, then emits pass/fail with reasoning.</div>
+          </div>
+          <div class="form-group" style="margin-bottom:0">
+            <details>
+              <summary style="cursor:pointer;font-size:12px;color:var(--text-secondary);font-weight:500;padding:6px 0">▾ Success schema (JSON Schema, advanced)</summary>
+              <div style="margin-top:8px">
+                <textarea id="cron-success-schema" rows="6" placeholder='{ "type": "object", "required": ["sent"], "properties": { "sent": { "type": "boolean" } } }' style="font-family:'JetBrains Mono',monospace;font-size:11px" oninput="updateGoalWarning()"></textarea>
+                <div class="form-hint">JSON Schema validated against the agent's <code>structured_output</code>. Mechanically successful = parses + validates.</div>
+              </div>
+            </details>
+          </div>
+        </div>
+
         <!-- Skills & tools: pinned skills + MCP + tools + tags -->
         <div class="cron-section-card">
           <h4>Skills &amp; tools</h4>
@@ -19903,6 +19968,14 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
                   <option value="">None — runs in default context</option>
                 </select>
                 <div class="form-hint">Run inside a project directory. Agent gets that project's CLAUDE.md.</div>
+              </div>
+            </div>
+            <!-- PRD Phase 1: read scope beyond cwd. One absolute path per line. -->
+            <div class="form-row">
+              <div class="form-group" style="flex:1">
+                <label class="form-label">Additional read directories <span style="color:var(--text-muted);font-weight:normal">(optional)</span></label>
+                <textarea id="cron-add-dirs" rows="2" placeholder="/Users/me/notes&#10;/Users/me/clients/acme" style="font-family:'JetBrains Mono',monospace;font-size:11px"></textarea>
+                <div class="form-hint">One absolute path per line. The agent gets read access to these in addition to the Project Context cwd.</div>
               </div>
             </div>
             <div class="form-row">
@@ -24550,6 +24623,18 @@ function renderCronLegacyBanner(job) {
     + '</div>';
 }
 
+// PRD Phase 1: show a non-blocking warning under the Goal section header
+// when neither success_criteria_text nor success_schema is set. The PRD's
+// "the run accomplished what it was supposed to" promise depends on at
+// least one of the two being present.
+function updateGoalWarning() {
+  var sct = (document.getElementById('cron-success-criteria-text')?.value || '').trim();
+  var ssc = (document.getElementById('cron-success-schema')?.value || '').trim();
+  var warn = document.getElementById('cron-goal-warning');
+  if (!warn) return;
+  warn.style.display = (!sct && !ssc) ? '' : 'none';
+}
+
 // One-click migration: flip predictable=true AND save immediately so the
 // user doesn't have to remember to also click Save Changes.
 async function enablePredictableFromBanner() {
@@ -24591,6 +24676,11 @@ function openCreateCronModal(agentSlug) {
   toggleUnleashedOptions();
   document.getElementById('cron-prompt').value = '';
   document.getElementById('cron-context').value = '';
+  // PRD Phase 1 goal fields — empty by default. Warning banner will show.
+  var sct = document.getElementById('cron-success-criteria-text'); if (sct) sct.value = '';
+  var ssc = document.getElementById('cron-success-schema'); if (ssc) ssc.value = '';
+  var addDirsEl = document.getElementById('cron-add-dirs'); if (addDirsEl) addDirsEl.value = '';
+  if (typeof updateGoalWarning === 'function') updateGoalWarning();
   document.getElementById('cron-training-section').style.display = 'none';
   document.getElementById('cron-train-btn').style.display = '';
   resetCronTrainingChat();
@@ -24637,6 +24727,30 @@ function openEditCronModal(jobName) {
   toggleUnleashedOptions();
   document.getElementById('cron-prompt').value = job.prompt || '';
   document.getElementById('cron-context').value = job.context || '';
+  // PRD Phase 1: load goal fields. Accept either casing — old YAML may have
+  // success_criteria as a list (legacy); the parser already coalesces those
+  // into successCriteriaText on read, but defend here too in case the API
+  // shape differs from what the parser produces.
+  var sctE = document.getElementById('cron-success-criteria-text');
+  if (sctE) {
+    var sctVal = job.successCriteriaText || job.success_criteria_text || '';
+    if (!sctVal && Array.isArray(job.successCriteria || job.success_criteria)) {
+      sctVal = (job.successCriteria || job.success_criteria || []).join('\\n');
+    }
+    sctE.value = sctVal;
+  }
+  var sscE = document.getElementById('cron-success-schema');
+  if (sscE) {
+    var sscObj = job.successSchema || job.success_schema;
+    sscE.value = (sscObj && typeof sscObj === 'object') ? JSON.stringify(sscObj, null, 2) : '';
+  }
+  var addDirsE = document.getElementById('cron-add-dirs');
+  if (addDirsE) {
+    var addDirsArr = Array.isArray(job.addDirs) ? job.addDirs
+      : (Array.isArray(job.add_dirs) ? job.add_dirs : []);
+    addDirsE.value = addDirsArr.join('\\n');
+  }
+  if (typeof updateGoalWarning === 'function') updateGoalWarning();
   document.getElementById('cron-training-section').style.display = 'none';
   document.getElementById('cron-train-btn').style.display = '';
   resetCronTrainingChat();
@@ -24832,6 +24946,11 @@ function captureCronModalSnapshot() {
     v('cron-workdir'),
     v('cron-allowed-tools'),
     v('cron-category'),
+    // PRD Phase 1 goal fields — included in dirty check so leaving the
+    // modal with an unsaved success_schema or success_criteria_text prompts.
+    v('cron-success-criteria-text'),
+    v('cron-success-schema'),
+    v('cron-add-dirs'),
     (document.getElementById('cron-predictable') || {}).checked ? '1' : '0',
     JSON.stringify(_cronSelectedSkills || []),
     JSON.stringify(_cronSelectedMcp || []),
@@ -24856,6 +24975,9 @@ function isCronModalDirty() {
     v('cron-workdir'),
     v('cron-allowed-tools'),
     v('cron-category'),
+    v('cron-success-criteria-text'),
+    v('cron-success-schema'),
+    v('cron-add-dirs'),
     (document.getElementById('cron-predictable') || {}).checked ? '1' : '0',
     JSON.stringify(_cronSelectedSkills || []),
     JSON.stringify(_cronSelectedMcp || []),
@@ -25030,6 +25152,34 @@ async function saveCronJob() {
   }
   if (!prompt) { toast('Prompt is required — tell the agent what to do', 'error'); document.getElementById('cron-prompt').focus(); return; }
 
+  // PRD Phase 1 goal fields. successCriteriaText is freeform; successSchema
+  // is parsed JSON. Validate JSON early so the user gets a clean error before
+  // the round-trip. Empty schema is fine — we just send {} or undefined.
+  var successCriteriaText = (document.getElementById('cron-success-criteria-text')?.value || '').trim();
+  var successSchemaRaw = (document.getElementById('cron-success-schema')?.value || '').trim();
+  var successSchema;
+  if (successSchemaRaw) {
+    try {
+      successSchema = JSON.parse(successSchemaRaw);
+      if (!successSchema || typeof successSchema !== 'object' || Array.isArray(successSchema)) {
+        toast('Success schema must be a JSON object', 'error');
+        document.getElementById('cron-success-schema').focus();
+        return;
+      }
+    } catch (e) {
+      toast('Success schema is not valid JSON: ' + (e.message || String(e)), 'error');
+      document.getElementById('cron-success-schema').focus();
+      return;
+    }
+  }
+  // add_dirs: one absolute path per line. Trim, dedupe, drop blanks.
+  var addDirsRaw = (document.getElementById('cron-add-dirs')?.value || '').split(/\\r?\\n/);
+  var addDirs = addDirsRaw.map(function(s){ return s.trim(); }).filter(Boolean);
+  // Quick sanity — warn but don't block on relative paths.
+  if (addDirs.some(function(p){ return !p.startsWith('/') && !p.startsWith('~'); })) {
+    toast('Heads up: add_dirs entries should be absolute paths.', 'info');
+  }
+
   const body = {
     name, schedule, tier, prompt, enabled: true,
     work_dir: work_dir || undefined, mode, max_hours, max_retries, after, context,
@@ -25047,6 +25197,10 @@ async function saveCronJob() {
     tags: editingCronJob ? _cronTags : (_cronTags.length ? _cronTags : undefined),
     category: editingCronJob ? (category || '') : category,
     predictable,
+    // PRD Phase 1 goal-orientation. PUT delete-on-empty pattern below.
+    successCriteriaText: editingCronJob ? successCriteriaText : (successCriteriaText || undefined),
+    successSchema: editingCronJob ? (successSchema || null) : (successSchema || undefined),
+    addDirs: editingCronJob ? addDirs : (addDirs.length ? addDirs : undefined),
   };
 
   var wasEditing = !!editingCronJob;

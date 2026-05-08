@@ -381,7 +381,22 @@ export interface CronJobDefinition {
   maxRetries?: number;
   after?: string;
   agentSlug?: string;              // Agent that owns this cron job (scoped execution)
-  successCriteria?: string[];      // Verifiable acceptance criteria for goal-backward reflection
+  /** @deprecated Use successCriteriaText (free-text) or successSchema (JSON Schema)
+   *  per PRD Phase 1. successCriteria is kept readable for one release; on read,
+   *  parseCronJobs coalesces it into successCriteriaText. */
+  successCriteria?: string[];
+  /** PRD Phase 1: free-text "this task is done when…". An evaluator sub-agent reads
+   *  the run's final state and the criterion and emits a pass/fail with reasoning.
+   *  Stored as RunEvaluation on the Run. Optional but recommended. */
+  successCriteriaText?: string;
+  /** PRD Phase 1: JSON Schema validated against ResultMessage.structured_output.
+   *  If it parses, the run is mechanically successful. The Task editor shows a
+   *  non-blocking "Goal not set" warning when neither this nor successCriteriaText
+   *  is present. */
+  successSchema?: Record<string, unknown>;
+  /** PRD Phase 1: read scope beyond the cwd (workDir). Surfaced as a chip list
+   *  in the editor's Scope tab. The runner passes these to the SDK as add_dirs. */
+  addDirs?: string[];
   alwaysDeliver?: boolean;         // If true, retry once with explicit prompt when response is empty/noise
   context?: string;                 // Freeform context/notes injected into prompt at runtime (training data, guidelines, etc.)
   preCheck?: string;               // Shell command gate — exit 0 = run, non-zero = skip. Stdout injected as context.
