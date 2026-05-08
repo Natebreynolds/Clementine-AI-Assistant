@@ -5706,6 +5706,102 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
     }
   });
 
+  // ── PRD §12 Phase 6.3 / 1.18.104: real latency split ─────────────
+  // Aggregates per-run tool durations from the event store so the
+  // Latency mini-card can show real numbers (model API time / tool
+  // execution time / framework overhead) instead of the heuristic
+  // placeholder. Only runs with path B hook events contribute to the
+  // tool-time numerator; the dashboard falls back to the heuristic
+  // when coverage is too low.
+  //
+  // Implementation note: walking N event-log files is O(events) but
+  // the data is tiny (hundreds of KB per run, mostly text). For 7d of
+  // runs this is well under 100ms even with hundreds of runs. If it
+  // gets slow we'll add an in-memory cache keyed on the file mtime.
+  app.get('/api/runs/latency-summary', async (req, res) => {
+    try {
+      const windowHours = Math.max(1, Math.min(168, parseInt(String(req.query.windowHours ?? '168'), 10) || 168));
+      const cutoffMs = Date.now() - windowHours * 60 * 60 * 1000;
+
+      const log = new CronRunLog();
+      const runs = log.readAllRecent(500, 30);
+      const inWindow = runs.filter((r) => {
+        const t = r.startedAt ? new Date(r.startedAt).getTime() : 0;
+        return t >= cutoffMs && r.status === 'ok' && typeof r.durationMs === 'number';
+      });
+
+      const { EventLog } = await import('../gateway/event-log.js');
+      const eventLog = new EventLog();
+
+      type RunSummary = {
+        runId: string;
+        durationMs: number;
+        toolDurationMs: number;
+        toolCalls: number;
+        hasHookData: boolean;
+      };
+      const summaries: RunSummary[] = [];
+      let withHooks = 0;
+      let totalDurationMs = 0;
+      let totalToolMs = 0;
+
+      for (const r of inWindow) {
+        const runId = (r as { id?: string }).id;
+        if (!runId) continue;
+        const events = eventLog.readByRun(runId);
+        let toolMs = 0;
+        let calls = 0;
+        let hasHook = false;
+        for (const ev of events) {
+          // Path B PostToolUse fires after every tool with duration_ms set
+          // (see hook-event ingest endpoint in 1.18.101). The kind='hook'
+          // + hookEventName='PostToolUse' combo is what we sum.
+          const e = ev as { kind?: string; hookEventName?: string; durationMs?: number };
+          if (e.kind === 'hook' && e.hookEventName === 'PostToolUse' && typeof e.durationMs === 'number') {
+            toolMs += e.durationMs;
+            calls += 1;
+            hasHook = true;
+          }
+        }
+        const durationMs = r.durationMs ?? 0;
+        summaries.push({ runId, durationMs, toolDurationMs: toolMs, toolCalls: calls, hasHookData: hasHook });
+        if (hasHook) {
+          withHooks += 1;
+          totalDurationMs += durationMs;
+          totalToolMs += toolMs;
+        }
+      }
+
+      // Coverage percentage: how many runs in the window contributed real data.
+      const coverage = inWindow.length > 0 ? withHooks / inWindow.length : 0;
+      // Average splits across runs that DID have hook data. The model
+      // segment is what's left after tools + a small framework overhead
+      // (we use 5% as a conservative estimate for SDK plumbing time —
+      // real measurement of this needs a tighter timing pass that we'll
+      // add when path B's SessionStart/Stop events get duration_ms too).
+      const avgDurationMs = withHooks > 0 ? totalDurationMs / withHooks : 0;
+      const avgToolMs = withHooks > 0 ? totalToolMs / withHooks : 0;
+      const overheadFraction = 0.05;
+      const overheadMs = avgDurationMs * overheadFraction;
+      const modelMs = Math.max(0, avgDurationMs - avgToolMs - overheadMs);
+
+      res.json({
+        ok: true,
+        windowHours,
+        runsTotal: inWindow.length,
+        runsWithHooks: withHooks,
+        coverage,
+        avgDurationMs,
+        avgToolMs,
+        avgModelMs: modelMs,
+        avgOverheadMs: overheadMs,
+        summaries,
+      });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: String(err) });
+    }
+  });
+
   // ── Recent runs across ALL cron jobs ───────────────────────────
   // Powers the "Recent History" zone on the Tasks page. Returns the most
   // recent N CronRunEntry rows merged from every per-job .jsonl, sorted
@@ -24386,20 +24482,38 @@ async function refreshMiniDashboards() {
   var costFigure = totalCost7 < 0.01 ? '$' + totalCost7.toFixed(4) : '$' + totalCost7.toFixed(2);
 
   // ── Latency split card ─────────────────────────────────────────────
-  // Sum durationMs across last7 OK runs only — we don't yet have a clean
-  // signal for tool time per run. Until path B hooks land we approximate:
-  //   tool ~ 35%, model ~ 55%, overhead ~ 10% — these are placeholders
-  //   that get replaced with real values once PostToolUse durations are
-  //   summed from event logs (Phase 4d).
+  // PRD §12 Phase 6.3 / 1.18.104: real latency split when path B hooks
+  // are providing PostToolUse duration_ms data. Falls back to the
+  // heuristic placeholder when coverage is too low.
   var okRuns = last7.filter(function(rn) { return rn.status === 'ok' && typeof rn.durationMs === 'number'; });
   var avgDur = okRuns.length > 0
     ? Math.round(okRuns.reduce(function(a, b) { return a + b.durationMs; }, 0) / okRuns.length)
     : 0;
+  // Default to heuristic split.
   var latToolPct = 35, latModelPct = 55, latOverPct = 10;
+  var latencyMode = 'heuristic'; // becomes 'real' if coverage >= 50%
+  var coverageLabel = '';
+  try {
+    var lr = await apiFetch('/api/runs/latency-summary?windowHours=168');
+    var ld = await lr.json();
+    if (ld && ld.ok && ld.coverage >= 0.5 && ld.avgDurationMs > 0) {
+      var totalMs = ld.avgDurationMs;
+      latToolPct = Math.round((ld.avgToolMs / totalMs) * 100);
+      latModelPct = Math.round((ld.avgModelMs / totalMs) * 100);
+      latOverPct = Math.max(0, 100 - latToolPct - latModelPct);
+      avgDur = Math.round(ld.avgDurationMs);
+      latencyMode = 'real';
+      coverageLabel = ld.runsWithHooks + '/' + ld.runsTotal + ' runs · path B';
+    } else if (ld && ld.ok) {
+      coverageLabel = ld.coverage > 0
+        ? Math.round(ld.coverage * 100) + '% coverage — need 50%+ for real split'
+        : 'no path B data yet';
+    }
+  } catch (e) { /* fall through to heuristic */ }
   var splitHtml = '<div class="mini-split">'
-    + '<div class="mini-split-seg" style="background:#3b82f6;width:' + latModelPct + '%" title="Model API time (~' + latModelPct + '%)">' + (latModelPct >= 12 ? 'model' : '') + '</div>'
-    + '<div class="mini-split-seg" style="background:#8b5cf6;width:' + latToolPct + '%" title="Tool execution time (~' + latToolPct + '%)">' + (latToolPct >= 12 ? 'tools' : '') + '</div>'
-    + '<div class="mini-split-seg" style="background:#6b7280;width:' + latOverPct + '%" title="Framework overhead (~' + latOverPct + '%)">' + (latOverPct >= 12 ? 'overhead' : '') + '</div>'
+    + '<div class="mini-split-seg" style="background:#3b82f6;width:' + latModelPct + '%" title="Model API time">' + (latModelPct >= 12 ? 'model ' + latModelPct + '%' : '') + '</div>'
+    + '<div class="mini-split-seg" style="background:#8b5cf6;width:' + latToolPct + '%" title="Tool execution time">' + (latToolPct >= 12 ? 'tools ' + latToolPct + '%' : '') + '</div>'
+    + '<div class="mini-split-seg" style="background:#6b7280;width:' + latOverPct + '%" title="Framework overhead">' + (latOverPct >= 12 ? 'overhead ' + latOverPct + '%' : '') + '</div>'
     + '</div>'
     + '<div class="mini-split-legend">'
     +   '<span><span class="mini-split-legend-dot" style="background:#3b82f6"></span>model</span>'
@@ -24407,7 +24521,14 @@ async function refreshMiniDashboards() {
     +   '<span><span class="mini-split-legend-dot" style="background:#6b7280"></span>overhead</span>'
     + '</div>';
   var latFigure = avgDur > 0 ? formatDurationMs(avgDur) : '—';
-  var latSub = okRuns.length > 0 ? 'avg of ' + okRuns.length + ' successful runs · 7d' : 'no successful runs in 7d';
+  var latSub;
+  if (okRuns.length === 0) {
+    latSub = 'no successful runs in 7d';
+  } else if (latencyMode === 'real') {
+    latSub = 'avg of ' + okRuns.length + ' successful runs · ' + coverageLabel;
+  } else {
+    latSub = 'avg of ' + okRuns.length + ' successful runs · split is heuristic (' + (coverageLabel || 'install hooks per task to see real numbers') + ')';
+  }
 
   // ── Reliability card ───────────────────────────────────────────────
   // Per-day failure column, stacked by category. Categories use the same
@@ -24521,7 +24642,7 @@ async function refreshMiniDashboards() {
     + '<div class="mini-card">'
     +   '<div class="mini-card-head"><span class="mini-card-title">Latency · avg</span><span class="mini-card-figure">' + esc(latFigure) + '</span></div>'
     +   splitHtml
-    +   '<div class="mini-card-sub">' + esc(latSub) + ' · split is heuristic until path B hooks land per-task (enable in cron editor → Last run)</div>'
+    +   '<div class="mini-card-sub">' + esc(latSub) + '</div>'
     + '</div>'
     + '<div class="mini-card">'
     +   '<div class="mini-card-head"><span class="mini-card-title">Reliability · 7d</span><span class="mini-card-figure">' + totalFails7 + ' fail' + (totalFails7 === 1 ? '' : 's') + '</span></div>'
