@@ -14952,6 +14952,44 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
     0%, 100% { opacity: 0.4; transform: scale(0.85); }
     50% { opacity: 1; transform: scale(1); }
   }
+  /* PRD Phase 1.3a: inner config-tab strip — switches which Configure
+     section blocks are visible without changing the outer Configure /
+     What-will-run / Last-run tabs. Visual: pill chips along the top of
+     the Configure pane. */
+  .cron-config-tabs {
+    display: flex;
+    gap: 4px;
+    margin: 0 0 14px;
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 0;
+  }
+  .cron-config-tab-btn {
+    background: none;
+    border: none;
+    color: var(--text-muted);
+    font-size: 12px;
+    font-weight: 500;
+    padding: 8px 12px;
+    cursor: pointer;
+    border-bottom: 2px solid transparent;
+    transition: color 0.15s, border-color 0.15s;
+    margin-bottom: -1px;
+  }
+  .cron-config-tab-btn:hover { color: var(--text-primary); }
+  .cron-config-tab-btn.active {
+    color: var(--accent);
+    border-bottom-color: var(--accent);
+  }
+  /* Sections are tagged with data-config-tab; the active tab attr on the
+     Configure pane controls visibility. .force-show overrides for power-user
+     "show everything" later. */
+  #cron-tab-configure[data-active-config-tab="basics"]   [data-config-tab]:not([data-config-tab="basics"]),
+  #cron-tab-configure[data-active-config-tab="prompt"]   [data-config-tab]:not([data-config-tab="prompt"]),
+  #cron-tab-configure[data-active-config-tab="tools"]    [data-config-tab]:not([data-config-tab="tools"]),
+  #cron-tab-configure[data-active-config-tab="scope"]    [data-config-tab]:not([data-config-tab="scope"]),
+  #cron-tab-configure[data-active-config-tab="limits"]   [data-config-tab]:not([data-config-tab="limits"]) {
+    display: none;
+  }
   /* ── Trick capability strip (skills + MCP + tools at a glance) ─── */
   .task-cap-strip {
     border-top: 1px solid var(--border-light);
@@ -19740,12 +19778,24 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
     </div>
     <div class="modal-body">
       <!-- ── Tab: Configure ─────────────────────────────────────────── -->
-      <div class="cron-tab-pane active" id="cron-tab-configure">
+      <!-- PRD §5.1 right-inspector pattern lives here as inner tabs (1.3a).
+           data-active-config-tab controls which section blocks render via
+           CSS — no JS show/hide needed beyond setting the attribute. -->
+      <div class="cron-tab-pane active" id="cron-tab-configure" data-active-config-tab="basics">
         <!-- Legacy / mismatch banner (populated by openEditCronModal) -->
         <div id="cron-legacy-banner-host"></div>
 
+        <!-- Inner tab strip — pill nav swapping which section blocks show -->
+        <div class="cron-config-tabs" role="tablist">
+          <button type="button" class="cron-config-tab-btn active" data-config-tab-btn="basics" onclick="switchCronConfigTab('basics')">Basics</button>
+          <button type="button" class="cron-config-tab-btn" data-config-tab-btn="prompt" onclick="switchCronConfigTab('prompt')">Prompt</button>
+          <button type="button" class="cron-config-tab-btn" data-config-tab-btn="tools" onclick="switchCronConfigTab('tools')">Tools &amp; MCP</button>
+          <button type="button" class="cron-config-tab-btn" data-config-tab-btn="scope" onclick="switchCronConfigTab('scope')">Scope</button>
+          <button type="button" class="cron-config-tab-btn" data-config-tab-btn="limits" onclick="switchCronConfigTab('limits')">Limits</button>
+        </div>
+
         <!-- Identity: name + category + tags -->
-        <div class="cron-section-card">
+        <div class="cron-section-card" data-config-tab="basics">
           <h4>Identity</h4>
           <p class="cron-section-desc">A unique name and optional grouping for the dashboard.</p>
           <div class="form-group">
@@ -19761,7 +19811,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
         </div>
 
         <!-- Schedule -->
-        <div class="cron-section-card">
+        <div class="cron-section-card" data-config-tab="basics">
           <h4>Schedule</h4>
           <p class="cron-section-desc">When this task fires. Pick a frequency or write a cron expression.</p>
           <div class="form-group" style="margin:0">
@@ -19850,7 +19900,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
         </div>
 
         <!-- What it does: prompt + context + reference files -->
-        <div class="cron-section-card">
+        <div class="cron-section-card" data-config-tab="prompt">
           <h4>What it does</h4>
           <p class="cron-section-desc">The instruction the agent receives. Long prompts are fine — drag the corner to resize.</p>
           <div class="form-group">
@@ -19878,7 +19928,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
              The single most important new field set. Without one of these, a
              run "finished"; with one, a run "accomplished what it was meant
              to". Banner warns (does not block) when neither is set. -->
-        <div class="cron-section-card">
+        <div class="cron-section-card" data-config-tab="prompt">
           <h4>Goal <span style="color:var(--text-muted);font-weight:normal;font-size:12px">— how do you know this task succeeded?</span></h4>
           <p class="cron-section-desc">Optional but strongly recommended. Use plain English (an evaluator agent grades the run) or a JSON Schema (validated against the agent's structured output).</p>
           <div id="cron-goal-warning" style="display:none;margin-bottom:12px;padding:10px 12px;border-radius:6px;background:rgba(245,158,11,0.10);border:1px solid rgba(245,158,11,0.30);color:var(--yellow);font-size:12px">
@@ -19901,7 +19951,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
         </div>
 
         <!-- Skills & tools: pinned skills + MCP + tools + tags -->
-        <div class="cron-section-card">
+        <div class="cron-section-card" data-config-tab="tools">
           <h4>Skills &amp; tools</h4>
           <p class="cron-section-desc">Pin the skills and tools this task should use. Switch to the <strong>What will run</strong> tab to see exactly what the agent receives.</p>
 
@@ -19952,85 +20002,90 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
           </div>
         </div>
 
-        <!-- Advanced: tier + workdir + mode + max-hours + retries + after -->
-        <details class="cron-section-card" style="padding:0">
-          <summary style="padding:14px 16px;cursor:pointer;list-style:none;display:flex;align-items:center;justify-content:space-between">
-            <span><strong style="font-size:11px;font-weight:700;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.6px">Advanced</strong> <span style="color:var(--text-muted);font-size:11px;margin-left:6px">tier, mode, retries, project context</span></span>
-            <span style="color:var(--text-muted);font-size:11px">▾</span>
-          </summary>
-          <div style="padding:0 16px 14px">
-            <div class="form-row">
-              <div class="form-group">
-                <label class="form-label">Tier</label>
-                <select id="cron-tier">
-                  <option value="1">Tier 1 — Read-only (vault, search, web)</option>
-                  <option value="2">Tier 2 — Read + Write (Bash, files, sub-agents)</option>
-                  <option value="3">Tier 3 — Full access (use with caution)</option>
-                </select>
-              </div>
-              <div class="form-group">
-                <label class="form-label">Project Context <span style="color:var(--text-muted);font-weight:normal">(optional)</span></label>
-                <select id="cron-workdir">
-                  <option value="">None — runs in default context</option>
-                </select>
-                <div class="form-hint">Run inside a project directory. Agent gets that project's CLAUDE.md.</div>
-              </div>
-            </div>
-            <!-- PRD Phase 1: read scope beyond cwd. One absolute path per line. -->
-            <div class="form-row">
-              <div class="form-group" style="flex:1">
-                <label class="form-label">Additional read directories <span style="color:var(--text-muted);font-weight:normal">(optional)</span></label>
-                <textarea id="cron-add-dirs" rows="2" placeholder="/Users/me/notes&#10;/Users/me/clients/acme" style="font-family:'JetBrains Mono',monospace;font-size:11px"></textarea>
-                <div class="form-hint">One absolute path per line. The agent gets read access to these in addition to the Project Context cwd.</div>
-              </div>
-            </div>
-            <div class="form-row">
-              <div class="form-group">
-                <label class="form-label">Mode</label>
-                <select id="cron-mode" onchange="toggleUnleashedOptions()">
-                  <option value="standard">Standard</option>
-                  <option value="unleashed">Unleashed (long-running)</option>
-                </select>
-                <div class="form-hint">Unleashed runs in phases with checkpointing for hour-scale tasks.</div>
-              </div>
-              <div class="form-group" id="cron-maxhours-group" style="display:none">
-                <label class="form-label">Max Hours</label>
-                <select id="cron-maxhours">
-                  <option value="1">1 hour</option>
-                  <option value="2">2 hours</option>
-                  <option value="4">4 hours</option>
-                  <option value="6" selected>6 hours (default)</option>
-                  <option value="8">8 hours</option>
-                  <option value="12">12 hours</option>
-                  <option value="24">24 hours</option>
-                </select>
-              </div>
-            </div>
-            <div class="form-row">
-              <div class="form-group">
-                <label class="form-label">Max Retries <span style="color:var(--text-muted);font-weight:normal">(optional)</span></label>
-                <select id="cron-max-retries">
-                  <option value="">Auto (based on error history)</option>
-                  <option value="0">0 — No retries</option>
-                  <option value="1">1</option>
-                  <option value="2">2</option>
-                  <option value="3">3</option>
-                  <option value="5">5</option>
-                </select>
-                <div class="form-hint">Override automatic retry count for transient errors.</div>
-              </div>
-              <div class="form-group">
-                <label class="form-label">After Job <span style="color:var(--text-muted);font-weight:normal">(chain)</span></label>
-                <select id="cron-after">
-                  <option value="">None — runs on schedule</option>
-                </select>
-                <div class="form-hint">Trigger after another job succeeds (ignores schedule).</div>
-              </div>
+        <!-- ── Scope: where the task can read/write ── -->
+        <div class="cron-section-card" data-config-tab="scope">
+          <h4>Scope</h4>
+          <p class="cron-section-desc">Where the agent runs and what files it can read.</p>
+          <div class="form-row">
+            <div class="form-group">
+              <label class="form-label">Project Context <span style="color:var(--text-muted);font-weight:normal">(optional)</span></label>
+              <select id="cron-workdir">
+                <option value="">None — runs in default context</option>
+              </select>
+              <div class="form-hint">Run inside a project directory. Agent gets that project's CLAUDE.md.</div>
             </div>
           </div>
-        </details>
+          <!-- PRD Phase 1: read scope beyond cwd. One absolute path per line. -->
+          <div class="form-row">
+            <div class="form-group" style="flex:1">
+              <label class="form-label">Additional read directories <span style="color:var(--text-muted);font-weight:normal">(optional)</span></label>
+              <textarea id="cron-add-dirs" rows="2" placeholder="/Users/me/notes&#10;/Users/me/clients/acme" style="font-family:'JetBrains Mono',monospace;font-size:11px"></textarea>
+              <div class="form-hint">One absolute path per line. The agent gets read access to these in addition to the Project Context cwd.</div>
+            </div>
+          </div>
+        </div>
 
-        <!-- Training Chat -->
+        <!-- ── Limits: budgets, mode, retries, chain triggers ── -->
+        <div class="cron-section-card" data-config-tab="limits">
+          <h4>Limits</h4>
+          <p class="cron-section-desc">Permission level, runtime mode, and retry/chain rules.</p>
+          <div class="form-row">
+            <div class="form-group">
+              <label class="form-label">Tier</label>
+              <select id="cron-tier">
+                <option value="1">Tier 1 — Read-only (vault, search, web)</option>
+                <option value="2">Tier 2 — Read + Write (Bash, files, sub-agents)</option>
+                <option value="3">Tier 3 — Full access (use with caution)</option>
+              </select>
+              <div class="form-hint">Permission level. Higher tiers can do more but require trust.</div>
+            </div>
+            <div class="form-group">
+              <label class="form-label">Mode</label>
+              <select id="cron-mode" onchange="toggleUnleashedOptions()">
+                <option value="standard">Standard</option>
+                <option value="unleashed">Unleashed (long-running)</option>
+              </select>
+              <div class="form-hint">Unleashed runs in phases with checkpointing for hour-scale tasks.</div>
+            </div>
+          </div>
+          <div class="form-row">
+            <div class="form-group" id="cron-maxhours-group" style="display:none">
+              <label class="form-label">Max Hours</label>
+              <select id="cron-maxhours">
+                <option value="1">1 hour</option>
+                <option value="2">2 hours</option>
+                <option value="4">4 hours</option>
+                <option value="6" selected>6 hours (default)</option>
+                <option value="8">8 hours</option>
+                <option value="12">12 hours</option>
+                <option value="24">24 hours</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label class="form-label">Max Retries <span style="color:var(--text-muted);font-weight:normal">(optional)</span></label>
+              <select id="cron-max-retries">
+                <option value="">Auto (based on error history)</option>
+                <option value="0">0 — No retries</option>
+                <option value="1">1</option>
+                <option value="2">2</option>
+                <option value="3">3</option>
+                <option value="5">5</option>
+              </select>
+              <div class="form-hint">Override automatic retry count for transient errors.</div>
+            </div>
+          </div>
+          <div class="form-row">
+            <div class="form-group">
+              <label class="form-label">After Job <span style="color:var(--text-muted);font-weight:normal">(chain)</span></label>
+              <select id="cron-after">
+                <option value="">None — runs on schedule</option>
+              </select>
+              <div class="form-hint">Trigger after another job succeeds (ignores schedule).</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Training Chat — visible across all config tabs (it's a tool, not a field group) -->
         <div class="form-group" id="cron-training-section" style="display:none">
           <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
             <label class="form-label" style="margin:0">Training Chat</label>
@@ -24637,6 +24692,18 @@ async function loadCronPreviewIntoTab(jobName) {
 // Mark the preview as stale (call after save so next tab visit refetches).
 function markCronPreviewDirty() { _cronPreviewLoadedFor = null; }
 
+// PRD Phase 1.3a: inner Configure pane tabs. Sets the data-active-config-tab
+// attribute on #cron-tab-configure; CSS handles section visibility via
+// data-config-tab attributes on each section. JS-light by design.
+function switchCronConfigTab(tab) {
+  var pane = document.getElementById('cron-tab-configure');
+  if (!pane) return;
+  pane.setAttribute('data-active-config-tab', tab);
+  document.querySelectorAll('.cron-config-tab-btn').forEach(function(b) {
+    b.classList.toggle('active', b.getAttribute('data-config-tab-btn') === tab);
+  });
+}
+
 // ── PRD Phase 1.2: "Run task once" — inline run + Last run tab ───────────
 // Tracks an in-flight run triggered FROM the modal so the SSE listeners
 // know when a cron_complete event belongs to "the run I just kicked off"
@@ -24926,6 +24993,7 @@ function openCreateCronModal(agentSlug) {
   var schedLink = document.getElementById('sched-cron-link');
   if (schedLink) schedLink.style.display = '';
   switchCronTab('configure');
+  switchCronConfigTab('basics');  // PRD 1.3a: always start on Basics for new tasks
   onPredictableChange();
   document.getElementById('cron-modal').classList.add('show');
   // Snapshot AFTER all defaults are populated so an immediate close with no
@@ -25024,6 +25092,7 @@ function openEditCronModal(jobName) {
   // dead empty pane). The pane updates live when Run task once fires.
   renderCronLastRunPane(job);
   switchCronTab('configure');
+  switchCronConfigTab('basics');  // PRD 1.3a: always start on Basics
   document.getElementById('cron-modal').classList.add('show');
   setTimeout(captureCronModalSnapshot, 0);
 }
@@ -25370,26 +25439,34 @@ async function saveCronJob() {
   // Field-specific validation. Toasting one message per problem is more
   // actionable than the old "Please fill in all fields" — and we bail before
   // hitting the API so the user sees the issue without a round-trip.
-  if (!name) { toast('Task name is required', 'error'); document.getElementById('cron-name').focus(); return; }
+  // Helper: focus a field on a possibly-hidden inner config tab. Switches
+  // to the tab that owns the field first so the user sees the cursor land.
+  function focusOnConfigTab(fieldId, configTab) {
+    if (typeof switchCronConfigTab === 'function') switchCronConfigTab(configTab);
+    var el = document.getElementById(fieldId);
+    if (el) el.focus();
+  }
+  if (!name) { toast('Task name is required', 'error'); focusOnConfigTab('cron-name', 'basics'); return; }
   if (!/^[a-z][a-z0-9-]{0,63}$/.test(name)) {
     toast('Task name must start with a lowercase letter and contain only a–z, 0–9, and hyphens (max 64 chars)', 'error');
-    document.getElementById('cron-name').focus();
+    focusOnConfigTab('cron-name', 'basics');
     return;
   }
   if (!editingCronJob && Array.isArray(cronJobsData)) {
     var dup = cronJobsData.find(function(j) { return String(j.name || '').toLowerCase() === name.toLowerCase(); });
-    if (dup) { toast('A task named "' + name + '" already exists', 'error'); document.getElementById('cron-name').focus(); return; }
+    if (dup) { toast('A task named "' + name + '" already exists', 'error'); focusOnConfigTab('cron-name', 'basics'); return; }
   }
-  if (!schedule) { toast('Schedule is required', 'error'); return; }
+  if (!schedule) { toast('Schedule is required', 'error'); switchCronConfigTab('basics'); return; }
   // Light client-side cron sanity check — server uses real cron-parser.
   // Catches obvious garbage like "foo bar" without making a round-trip.
   // Note: the hyphen sits at the END of the character class to avoid being
   // interpreted as a range. \\\\s in source → \\s in served JS → \s in regex.
   if (!/^([0-9*/, -]+|@(yearly|annually|monthly|weekly|daily|hourly|reboot))$/i.test(schedule) && schedule.split(/\\s+/).length < 5) {
     toast('Schedule does not look like a valid cron expression', 'error');
+    switchCronConfigTab('basics');
     return;
   }
-  if (!prompt) { toast('Prompt is required — tell the agent what to do', 'error'); document.getElementById('cron-prompt').focus(); return; }
+  if (!prompt) { toast('Prompt is required — tell the agent what to do', 'error'); focusOnConfigTab('cron-prompt', 'prompt'); return; }
 
   // PRD Phase 1 goal fields. successCriteriaText is freeform; successSchema
   // is parsed JSON. Validate JSON early so the user gets a clean error before
@@ -25402,12 +25479,12 @@ async function saveCronJob() {
       successSchema = JSON.parse(successSchemaRaw);
       if (!successSchema || typeof successSchema !== 'object' || Array.isArray(successSchema)) {
         toast('Success schema must be a JSON object', 'error');
-        document.getElementById('cron-success-schema').focus();
+        focusOnConfigTab('cron-success-schema', 'prompt');
         return;
       }
     } catch (e) {
       toast('Success schema is not valid JSON: ' + (e.message || String(e)), 'error');
-      document.getElementById('cron-success-schema').focus();
+      focusOnConfigTab('cron-success-schema', 'prompt');
       return;
     }
   }
