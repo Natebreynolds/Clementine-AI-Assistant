@@ -9943,41 +9943,120 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
   });
 
 
+  // POST /api/skills — create a new folder-form skill (1.18.115).
+  // Anthropic-compatible: top-level `name` + `description` required; the
+  // optional `tools` array goes under `clementine.tools.allow` so the
+  // frontmatter parses cleanly in vanilla Claude Agent SDK while still
+  // letting the cron runtime enforce the allowlist.
   app.post('/api/skills', (req, res) => {
     try {
-      const { title, description, triggers, steps } = req.body;
-      if (!title || !steps) { res.status(400).json({ error: 'title and steps are required' }); return; }
+      const { name, title, description, body, tools } = req.body ?? {};
+      if (!name || typeof name !== 'string') { res.status(400).json({ error: 'name is required' }); return; }
+      if (!/^[a-z0-9][a-z0-9-]{0,63}$/.test(name)) { res.status(400).json({ error: 'name must match ^[a-z0-9][a-z0-9-]{0,63}$ (Anthropic spec)' }); return; }
+      if (!description || typeof description !== 'string') { res.status(400).json({ error: 'description is required' }); return; }
+      if (description.length > 1024) { res.status(400).json({ error: 'description must be ≤ 1024 chars (Anthropic spec)' }); return; }
+      if (!body || typeof body !== 'string' || !body.trim()) { res.status(400).json({ error: 'body is required' }); return; }
 
       const skillsDir = path.join(VAULT_DIR, '00-System', 'skills');
       if (!existsSync(skillsDir)) mkdirSync(skillsDir, { recursive: true });
+      const folderPath = path.join(skillsDir, name);
+      const entryPath = path.join(folderPath, 'SKILL.md');
+      if (existsSync(entryPath)) { res.status(409).json({ error: 'Skill "' + name + '" already exists. Use PUT to update.' }); return; }
 
-      const name = title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 60);
+      mkdirSync(folderPath, { recursive: true });
       const now = new Date().toISOString();
-      const triggerList = (triggers || '').split(',').map((t: string) => t.trim()).filter(Boolean);
-
+      const fm: Record<string, unknown> = { name, description };
+      if (title && typeof title === 'string' && title.trim()) fm.title = title.trim();
+      const allowed = Array.isArray(tools) ? tools.map(String).map(s => s.trim()).filter(Boolean) : [];
+      const clementineExt: Record<string, unknown> = {
+        source: 'manual',
+        useCount: 0,
+        createdAt: now,
+        updatedAt: now,
+        version: 1,
+      };
+      if (allowed.length > 0) clementineExt.tools = { allow: allowed };
+      fm.clementine = clementineExt;
       const matterMod = require('gray-matter');
-      const content = matterMod.stringify(
-        `\n# ${title}\n\n${description || ''}\n\n## Procedure\n\n${steps}\n`,
-        { title, description: description || '', triggers: triggerList, source: 'manual', toolsUsed: [], useCount: 0, createdAt: now, updatedAt: now },
-      );
-      writeFileSync(path.join(skillsDir, `${name}.md`), content);
-      res.json({ ok: true, name });
+      const content = matterMod.stringify(body.endsWith('\n') ? body : body + '\n', fm);
+      writeFileSync(entryPath, content);
+      res.json({ ok: true, name, layout: 'folder', filePath: entryPath });
     } catch (err) {
       res.status(500).json({ error: String(err) });
     }
   });
 
+  // PUT /api/skills/:name — update an existing skill (1.18.115).
+  // Folder-aware: writes back to <name>/SKILL.md when the skill is in
+  // folder layout, otherwise updates the flat <name>.md (preserves the
+  // existing layout — we don't auto-migrate on edit; users go through the
+  // Migrate flow when they're ready).
+  app.put('/api/skills/:name', (req, res) => {
+    try {
+      const skillName = req.params.name;
+      const { title, description, body, tools } = req.body ?? {};
+      if (!description || typeof description !== 'string') { res.status(400).json({ error: 'description is required' }); return; }
+      if (description.length > 1024) { res.status(400).json({ error: 'description must be ≤ 1024 chars (Anthropic spec)' }); return; }
+      if (!body || typeof body !== 'string' || !body.trim()) { res.status(400).json({ error: 'body is required' }); return; }
+
+      const skillsDir = path.join(VAULT_DIR, '00-System', 'skills');
+      const folderEntry = path.join(skillsDir, skillName, 'SKILL.md');
+      const flatEntry = path.join(skillsDir, skillName + '.md');
+      const targetPath = existsSync(folderEntry) ? folderEntry : (existsSync(flatEntry) ? flatEntry : null);
+      if (!targetPath) { res.status(404).json({ error: 'Skill "' + skillName + '" not found' }); return; }
+
+      // Preserve existing frontmatter (esp. clementine namespace fields like
+      // useCount, createdAt, migration provenance) and only merge in updates.
+      const matterMod = require('gray-matter');
+      const existingRaw = readFileSync(targetPath, 'utf-8');
+      const parsed = matterMod(existingRaw);
+      const fm: Record<string, unknown> = { ...parsed.data };
+      fm.name = skillName;
+      fm.description = description;
+      if (title && typeof title === 'string' && title.trim()) fm.title = title.trim();
+      else delete fm.title;
+      const ext = (fm.clementine && typeof fm.clementine === 'object') ? fm.clementine as Record<string, unknown> : {};
+      ext.updatedAt = new Date().toISOString();
+      const allowed = Array.isArray(tools) ? tools.map(String).map(s => s.trim()).filter(Boolean) : [];
+      if (allowed.length > 0) ext.tools = { ...(ext.tools as object || {}), allow: allowed };
+      else if (ext.tools && typeof ext.tools === 'object') delete (ext.tools as Record<string, unknown>).allow;
+      fm.clementine = ext;
+      const content = matterMod.stringify(body.endsWith('\n') ? body : body + '\n', fm);
+      writeFileSync(targetPath, content);
+      res.json({ ok: true, name: skillName, layout: targetPath === folderEntry ? 'folder' : 'flat' });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  // DELETE /api/skills/:name — remove a skill (folder OR flat). 1.18.115:
+  // updated to handle folder form. The .md.bak (if present) stays as a
+  // rollback artefact unless the caller passes `?bak=clean`.
   app.delete('/api/skills/:name', (req, res) => {
     try {
+      const skillName = req.params.name;
       const skillsDir = path.join(VAULT_DIR, '00-System', 'skills');
-      const filePath = path.join(skillsDir, `${req.params.name}.md`);
-      if (!existsSync(filePath)) { res.status(404).json({ error: 'Skill not found' }); return; }
-      unlinkSync(filePath);
-      // Clean up attachments directory and backup
-      const filesDir = path.join(skillsDir, `${req.params.name}.files`);
-      if (existsSync(filesDir)) rmSync(filesDir, { recursive: true, force: true });
-      const bakPath = filePath.replace(/\.md$/, '.md.bak');
-      if (existsSync(bakPath)) unlinkSync(bakPath);
+      const folderPath = path.join(skillsDir, skillName);
+      const folderEntry = path.join(folderPath, 'SKILL.md');
+      const flatEntry = path.join(skillsDir, skillName + '.md');
+      const cleanBak = req.query.bak === 'clean';
+
+      let removed = false;
+      if (existsSync(folderEntry)) {
+        // Folder form — remove the whole skill folder.
+        rmSync(folderPath, { recursive: true, force: true });
+        removed = true;
+      } else if (existsSync(flatEntry)) {
+        // Legacy flat form — remove the .md plus optional .files dir.
+        unlinkSync(flatEntry);
+        const filesDir = path.join(skillsDir, skillName + '.files');
+        if (existsSync(filesDir)) rmSync(filesDir, { recursive: true, force: true });
+        removed = true;
+      }
+      if (!removed) { res.status(404).json({ error: 'Skill "' + skillName + '" not found' }); return; }
+
+      const bakPath = path.join(skillsDir, skillName + '.md.bak');
+      if (cleanBak && existsSync(bakPath)) unlinkSync(bakPath);
       res.json({ ok: true });
     } catch (err) {
       res.status(500).json({ error: String(err) });
@@ -15896,6 +15975,13 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
     color: var(--green); font-size: 12px; font-weight: 700;
     margin: 0 0 4px 0; text-transform: uppercase; letter-spacing: 0.4px;
   }
+  /* Soft info variant — used by the Strict-mode-available tip on legacy
+     tasks. Quieter than .warn so it reads as a suggestion, not a defect. */
+  .cron-banner.info {
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    color: var(--text-primary);
+  }
   .cron-banner .banner-actions { margin-top: 10px; display: flex; gap: 8px; }
   .cron-banner .banner-actions button {
     font-size: 12px; padding: 6px 12px; border-radius: 6px; cursor: pointer;
@@ -16852,7 +16938,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
            Tasks (default) + Tools & MCP catalog. Workflows still reachable
            via deep-link ?tab=workflows for power users with existing
            multi-step workflows. -->
-      <div id="build-tabs" style="display:flex;gap:4px;padding:8px 18px 0;background:var(--bg-secondary);border-bottom:1px solid var(--border);flex-shrink:0">
+      <div id="build-tabs" style="display:flex;gap:4px;padding:8px 18px 0;background:var(--bg-secondary);border-bottom:1px solid var(--border);flex-shrink:0;align-items:flex-end">
         <button class="build-tab-btn active" data-build-tab="crons" onclick="switchBuildTab('crons')" style="padding:8px 14px;border-radius:6px 6px 0 0;border:none;background:transparent;color:var(--text-primary);font-size:13px;font-weight:500;cursor:pointer;border-bottom:2px solid transparent">
           <span style="margin-right:6px">📅</span>Tasks <span id="build-tab-cron-count" style="display:none;margin-left:4px;font-size:10px;background:var(--bg-tertiary);padding:1px 6px;border-radius:999px;color:var(--text-muted)">0</span>
         </button>
@@ -16864,6 +16950,11 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
         </button>
         <button class="build-tab-btn" data-build-tab="workflows" onclick="switchBuildTab('workflows')" style="display:none;padding:8px 14px;border-radius:6px 6px 0 0;border:none;background:transparent;color:var(--text-secondary);font-size:13px;font-weight:500;cursor:pointer;border-bottom:2px solid transparent">
           <span style="margin-right:6px">🔧</span>Workflows <span id="build-tab-workflows-count" style="display:none;margin-left:4px;font-size:10px;background:var(--bg-tertiary);padding:1px 6px;border-radius:999px;color:var(--text-muted)">0</span>
+        </button>
+        <!-- Spacer + primary "create" CTA. The Tasks/Runs/Tools tabs are above; this sits flush with them on the right so creation is one click from anywhere on the Tasks domain. -->
+        <div style="flex:1"></div>
+        <button class="btn-primary" onclick="openCreateCronModal()" style="margin-bottom:6px;font-size:13px;padding:7px 14px;border-radius:6px;border:none;background:var(--accent);color:#fff;font-weight:500;cursor:pointer;display:inline-flex;align-items:center;gap:6px">
+          <span style="font-size:14px;line-height:1">+</span> New task
         </button>
       </div>
       <style>
@@ -19962,11 +20053,18 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
          invocation lands in Phase C. The page is intentionally minimal —
          we want users to see what's there, not be overwhelmed by 7 tiles. -->
     <div class="page" id="page-skills">
-      <div class="page-head">
-        <div class="icon icon-slot" data-icon="brain"></div>
-        <div class="title-block">
-          <h1>Skills</h1>
-          <p class="desc">Reusable procedures Clementine can run. Each skill declares its tools, data sources, and state.</p>
+      <div class="page-head" style="display:flex;align-items:flex-start;justify-content:space-between;gap:18px">
+        <div style="display:flex;align-items:flex-start;gap:14px;flex:1;min-width:0">
+          <div class="icon icon-slot" data-icon="brain"></div>
+          <div class="title-block">
+            <h1>Skills</h1>
+            <p class="desc">Reusable procedures. A <strong>skill</strong> is a recipe (Markdown body + tool allowlist + bundled docs). Tasks pin skills; chats can run them. One skill, many tasks.</p>
+          </div>
+        </div>
+        <div style="display:flex;align-items:center;gap:8px;flex-shrink:0">
+          <button class="btn-primary" onclick="openCreateSkillModal()" style="font-size:13px;padding:8px 14px;border-radius:6px;border:none;background:var(--accent);color:#fff;font-weight:500;cursor:pointer;display:inline-flex;align-items:center;gap:6px">
+            <span style="font-size:14px;line-height:1">+</span> New skill
+          </button>
         </div>
       </div>
       <div style="display:grid;grid-template-columns:380px 1fr;gap:18px;height:calc(100vh - 180px);min-height:500px">
@@ -24140,11 +24238,30 @@ function renderScheduledTaskCard(task) {
   var runOrCancelBtn = isRunning
     ? '<button class="btn-sm secondary btn-danger" onclick="cancelCronRun(\\x27' + safeName + '\\x27)" title="Stop this in-flight run (SIGTERM)">Cancel</button>'
     : '<button class="btn-sm secondary btn-success" onclick="apiPost(\\x27/api/cron/run/' + encodeURIComponent(task.name) + '\\x27)" title="Run this task once now">Run Now</button>';
+  // 1.18.115 — preview line. Prefer task.description (a future-proof
+  // dedicated field), then strip leading TOOL RESTRICTIONS / FORBIDDEN
+  // boilerplate (purely a runtime allowlist, not what the task does), then
+  // grab the first real sentence so the card reads as "what this task is
+  // for" rather than "wall of LLM scaffolding."
+  function _taskPreview(t) {
+    if (t.description && String(t.description).trim()) return String(t.description).trim();
+    var p = String(t.prompt || '').trim();
+    // Strip the canonical tool-restriction preamble (matches the user's
+    // TOOL RESTRICTIONS — MANDATORY... block up to the first paragraph
+    // that doesn't start with a numbered restriction line).
+    var stripped = p.replace(/^TOOL RESTRICTIONS[\\s\\S]*?(?=\\n\\n[A-Z][^.]*\\.|\\n\\n\\w)/i, '').trim();
+    if (!stripped) stripped = p;
+    // First sentence or first line, whichever is shorter. Falls back to
+    // the first 200 chars if nothing punctuates.
+    var firstLine = stripped.split('\\n').map(function(s){ return s.trim(); }).find(function(s){ return s.length > 0; }) || '';
+    var firstSentence = (firstLine.match(/^[^.!?]+[.!?]/) || [firstLine])[0];
+    return (firstSentence || stripped).slice(0, 200);
+  }
   return '<div class="' + cardCls + '" style="' + style + '">'
     + '<div class="task-card-header"><strong>' + esc(task.displayName || task.name) + '</strong>'
     + '<label class="toggle-switch"><input type="checkbox"' + (enabled ? ' checked' : '') + ' onchange="toggleCronJob(\\x27' + safeName + '\\x27)"><span class="toggle-slider"></span></label></div>'
     + '<div class="task-card-schedule">' + operationScheduleHtml(task.schedule) + '</div>'
-    + '<div class="task-card-prompt">' + esc(task.prompt || '') + '</div>'
+    + '<div class="task-card-prompt">' + esc(_taskPreview(task)) + '</div>'
     + renderTrickCapabilityStrip(task)
     + '<div class="task-card-status">' + lastRunHtml + '</div>'
     + renderTrickTagChips(task)
@@ -25598,15 +25715,24 @@ async function refreshCron() {
     var visibleRunning = ownerScoped ? (ops.runningNow || []).filter(function(i) { return buildOpsOwnerMatches(i.owner || ''); }) : (ops.runningNow || []);
     var ownerFilter = getBuildOwnerFilter();
 
-    // PRD §12 / 1.18.88: Health Strip placeholder. The runs payload from
-    // /api/cron/runs (already fetched alongside ops) feeds the metrics.
-    // Render an empty shell first; refreshHealthStrip fills it in.
+    // PRD §12 / 1.18.88: Health Strip — kept always-visible at the top.
+    // 7 KPI tiles (24h runs, success rate, cost, p50/p95 latency, running,
+    // top failure). The runs payload from /api/cron/runs (already fetched
+    // alongside ops) feeds the metrics. Render an empty shell first;
+    // refreshHealthStrip fills it in.
     var html = '<div id="health-strip" class="health-strip"></div>';
-    // PRD §12 / 1.18.93: three mini-dashboards below the Health Strip —
-    // Cost (7d sparkline), Latency split (model / tool / overhead),
-    // Reliability (failures stacked by category). Filled in by
-    // refreshMiniDashboards from the same /api/cron/runs payload.
-    html += '<div id="mini-dashboards" class="mini-dashboards"></div>';
+    // 1.18.115 — collapse the cost/latency/reliability/activity mini-cards
+    // into a <details> block. The Health Strip already covers what most
+    // users want at a glance; the 4 mini-dashboards are for deeper
+    // observability and don't need to be the second thing on the page.
+    // Closed by default; users who want them flip it open once and the
+    // browser remembers via the [open] attribute persistence pattern.
+    html += '<details class="mini-dashboards-toggle" style="margin:14px 0 4px">'
+      +     '<summary style="font-size:12px;color:var(--text-muted);cursor:pointer;padding:6px 0;user-select:none;display:inline-flex;align-items:center;gap:6px">'
+      +       '<span style="font-size:11px">▸</span> Show cost / latency / reliability mini-dashboards'
+      +     '</summary>'
+      +     '<div id="mini-dashboards" class="mini-dashboards" style="margin-top:10px"></div>'
+      +   '</details>';
 
     // ── Zone 1 — Running now (promoted to top, primary "what's live" view) ──
     if (visibleRunning.length > 0) {
@@ -26537,6 +26663,250 @@ async function migrateAllLegacySkills() {
   } catch (err) { toast('Bulk migration failed: ' + err, 'error'); }
 }
 
+// 1.18.115 — tiny inline Markdown renderer for the Skills detail pane.
+// Handles the subset SKILL.md bodies use in practice: headers, bold,
+// italic, inline-code, fenced code blocks, ordered + unordered lists,
+// paragraphs, line breaks. Pulling in marked or markdown-it would balloon
+// the served bundle for ~80 lines of regex. Output is always escaped
+// first, then re-styled.
+//
+// NOTE: regex patterns containing backtick characters are constructed via
+// new RegExp(string) instead of regex literals — raw backticks would
+// otherwise close the surrounding TypeScript template literal that
+// builds the served HTML.
+function renderMarkdown(src) {
+  if (!src) return '';
+  // Escape every char first; we never inject raw HTML from the body.
+  var s = String(src)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+  // Fenced code blocks (preserve interior verbatim — no inline markup
+  // applied inside). Use a placeholder map so subsequent regex passes
+  // don't munge the contents. Fence delimiter is three backticks.
+  var BACKTICK = String.fromCharCode(96);
+  var fences = [];
+  var fenceRe = new RegExp(BACKTICK + BACKTICK + BACKTICK + '([a-z0-9_-]*)\\n?([\\s\\S]*?)' + BACKTICK + BACKTICK + BACKTICK, 'gi');
+  s = s.replace(fenceRe, function(_, lang, code) {
+    fences.push('<pre style="background:var(--bg-tertiary);padding:12px 14px;border-radius:6px;overflow:auto;font-size:12px;line-height:1.5;margin:8px 0;border:1px solid var(--border)"><code>' + code.replace(/\\n+$/, '') + '</code></pre>');
+    return '\\u0000FENCE_' + (fences.length - 1) + '\\u0000';
+  });
+  // Inline code — single backticks
+  var inlineRe = new RegExp(BACKTICK + '([^' + BACKTICK + '\\n]+)' + BACKTICK, 'g');
+  s = s.replace(inlineRe, '<code style="background:var(--bg-tertiary);padding:1px 6px;border-radius:3px;font-size:0.92em">$1</code>');
+  // Bold first (greedier double-star) so it doesn't get eaten by single-star italic.
+  s = s.replace(/\\*\\*([^*\\n][^*]*?)\\*\\*/g, '<strong>$1</strong>');
+  s = s.replace(/(^|[^*])\\*([^*\\n][^*]*?)\\*/g, '$1<em>$2</em>');
+  // Headers — process line-by-line so we don't accidentally match across
+  // paragraphs. Also collect lists into <ul>/<ol> blocks.
+  var lines = s.split('\\n');
+  var out = [];
+  var listKind = null; // 'ul' | 'ol' | null
+  var listItems = [];
+  function flushList() {
+    if (!listKind) return;
+    out.push('<' + listKind + ' style="margin:6px 0 10px;padding-left:22px">' + listItems.map(function(li) { return '<li style="margin:2px 0">' + li + '</li>'; }).join('') + '</' + listKind + '>');
+    listKind = null; listItems = [];
+  }
+  function paraStart() { out.push('<p style="margin:8px 0">'); }
+  function paraEnd() {
+    // Close the last <p> if there is one open.
+    var last = out.length - 1;
+    if (last >= 0 && out[last].endsWith('</p>')) return;
+    if (last >= 0 && out[last] === '<p style="margin:8px 0">') { out.pop(); return; }
+    if (last >= 0 && !/^<(h\\d|ul|ol|pre|hr|details)/.test(out[last])) {
+      // We're mid-paragraph — emit the close tag.
+      out.push('</p>');
+    }
+  }
+  var paraOpen = false;
+  function closePara() { if (paraOpen) { out.push('</p>'); paraOpen = false; } }
+  function openPara() { if (!paraOpen) { out.push('<p style="margin:8px 0">'); paraOpen = true; } }
+  for (var i = 0; i < lines.length; i++) {
+    var line = lines[i];
+    // Restore fence placeholders as their own block.
+    var fenceMatch = line.match(/\\u0000FENCE_(\\d+)\\u0000/);
+    if (fenceMatch) { closePara(); flushList(); out.push(fences[Number(fenceMatch[1])]); continue; }
+    // Headers
+    var hMatch = line.match(/^(#{1,6})\\s+(.+)$/);
+    if (hMatch) {
+      closePara(); flushList();
+      var level = hMatch[1].length;
+      var sizes = { 1: '1.4em', 2: '1.2em', 3: '1.05em', 4: '1em', 5: '0.95em', 6: '0.9em' };
+      out.push('<h' + level + ' style="margin:14px 0 6px;font-size:' + sizes[level] + ';font-weight:600;color:var(--text-primary)">' + hMatch[2] + '</h' + level + '>');
+      continue;
+    }
+    // Unordered list — dash, star, or plus prefix
+    var ulMatch = line.match(/^\\s*[-*+]\\s+(.+)$/);
+    if (ulMatch) {
+      closePara();
+      if (listKind && listKind !== 'ul') flushList();
+      listKind = 'ul';
+      listItems.push(ulMatch[1]);
+      continue;
+    }
+    // Ordered list — 1., 2., etc.
+    var olMatch = line.match(/^\\s*\\d+\\.\\s+(.+)$/);
+    if (olMatch) {
+      closePara();
+      if (listKind && listKind !== 'ol') flushList();
+      listKind = 'ol';
+      listItems.push(olMatch[1]);
+      continue;
+    }
+    // Blank line — paragraph break
+    if (!line.trim()) { closePara(); flushList(); continue; }
+    // Hr
+    if (/^---+$/.test(line.trim())) { closePara(); flushList(); out.push('<hr style="border:none;border-top:1px solid var(--border);margin:12px 0">'); continue; }
+    // Default — wrap as paragraph text
+    flushList();
+    openPara();
+    // Append to current paragraph with a soft break between consecutive
+    // text lines (markdown convention: lines in a paragraph join with space).
+    var top = out.length - 1;
+    if (out[top] === '<p style="margin:8px 0">') {
+      out[top] = '<p style="margin:8px 0">' + line;
+    } else {
+      out[top] = out[top] + ' ' + line;
+    }
+  }
+  closePara(); flushList();
+  return out.join('\\n');
+}
+
+// 1.18.115 — Skill creation modal. Until now there was no UI to make a
+// new skill; users had to mkdir + write SKILL.md by hand. Modal collects
+// name (Anthropic regex enforced client-side), description, body, and an
+// optional comma-separated tools.allow allowlist; POSTs to a new endpoint
+// that calls skill-store.parseSkillFolder/write under the hood.
+function openCreateSkillModal() { _openSkillModal({ mode: 'create' }); }
+function openEditSkillModal(name) { _openSkillModal({ mode: 'edit', name: name }); }
+
+async function _openSkillModal(opts) {
+  opts = opts || {};
+  var existing = null;
+  if (opts.mode === 'edit' && opts.name) {
+    try {
+      var r = await apiFetch('/api/skills/' + encodeURIComponent(opts.name));
+      if (r.ok) existing = await r.json();
+    } catch (e) { toast('Failed to load skill: ' + e, 'error'); return; }
+  }
+  var fm = (existing && existing.frontmatter) || {};
+  var ext = fm.clementine || {};
+  var nameVal = fm.name || '';
+  var titleVal = fm.title || '';
+  var descVal = fm.description || '';
+  var bodyVal = (existing && existing.body) || '';
+  var toolsVal = (ext.tools && Array.isArray(ext.tools.allow)) ? ext.tools.allow.join(', ') : '';
+  var modal = document.getElementById('skill-edit-modal');
+  if (!modal) {
+    modal = document.createElement('div');
+    modal.id = 'skill-edit-modal';
+    modal.className = 'modal-overlay';
+    modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.45);display:flex;align-items:center;justify-content:center;z-index:1000;padding:20px';
+    modal.innerHTML =
+      '<div style="background:var(--bg-primary);border:1px solid var(--border);border-radius:10px;width:min(720px,95vw);max-height:90vh;display:flex;flex-direction:column;box-shadow:0 16px 48px rgba(0,0,0,0.35)">'
+      +   '<div style="display:flex;align-items:center;justify-content:space-between;padding:14px 20px;border-bottom:1px solid var(--border)">'
+      +     '<h3 id="skill-modal-title" style="margin:0;font-size:15px;font-weight:600">New skill</h3>'
+      +     '<button onclick="closeSkillModal()" style="background:none;border:none;font-size:18px;color:var(--text-muted);cursor:pointer;padding:0 4px;line-height:1">✕</button>'
+      +   '</div>'
+      +   '<div style="flex:1;overflow-y:auto;padding:18px 22px">'
+      +     '<input type="hidden" id="skill-modal-original-name">'
+      +     '<label style="display:block;font-size:12px;color:var(--text-secondary);margin-bottom:4px;font-weight:500">Name <span style="color:var(--text-muted)">(lowercase, dashes, max 64 chars)</span></label>'
+      +     '<input id="skill-modal-name" type="text" placeholder="e.g. morning-briefing" style="width:100%;padding:8px 10px;font-size:13px;border:1px solid var(--border);border-radius:6px;background:var(--bg-secondary);color:var(--text-primary);margin-bottom:12px;font-family:\\x27JetBrains Mono\\x27,monospace">'
+      +     '<label style="display:block;font-size:12px;color:var(--text-secondary);margin-bottom:4px;font-weight:500">Display title <span style="color:var(--text-muted)">(optional, friendlier name)</span></label>'
+      +     '<input id="skill-modal-title" type="text" placeholder="e.g. Morning Briefing" style="width:100%;padding:8px 10px;font-size:13px;border:1px solid var(--border);border-radius:6px;background:var(--bg-secondary);color:var(--text-primary);margin-bottom:12px">'
+      +     '<label style="display:block;font-size:12px;color:var(--text-secondary);margin-bottom:4px;font-weight:500">Description <span style="color:var(--text-muted)">(what this skill does — used by Claude to know when to apply it)</span></label>'
+      +     '<textarea id="skill-modal-desc" rows="2" placeholder="One paragraph: what does this skill do, when should Claude run it?" style="width:100%;padding:8px 10px;font-size:13px;border:1px solid var(--border);border-radius:6px;background:var(--bg-secondary);color:var(--text-primary);margin-bottom:12px;font-family:inherit;resize:vertical"></textarea>'
+      +     '<label style="display:block;font-size:12px;color:var(--text-secondary);margin-bottom:4px;font-weight:500">Allowed tools <span style="color:var(--text-muted)">(comma-separated, leave blank for default)</span></label>'
+      +     '<input id="skill-modal-tools" type="text" placeholder="e.g. Read, Bash, mcp__supabase__list_tables" style="width:100%;padding:8px 10px;font-size:13px;border:1px solid var(--border);border-radius:6px;background:var(--bg-secondary);color:var(--text-primary);margin-bottom:12px">'
+      +     '<label style="display:block;font-size:12px;color:var(--text-secondary);margin-bottom:4px;font-weight:500">Procedure <span style="color:var(--text-muted)">(Markdown — the actual steps Claude follows)</span></label>'
+      +     '<textarea id="skill-modal-body" rows="14" placeholder="# Morning Briefing\\n\\nSteps Claude follows when this skill is invoked.\\n\\n1. Check the inbox.\\n2. Summarize.\\n3. Send to Discord." style="width:100%;padding:10px 12px;font-size:12px;border:1px solid var(--border);border-radius:6px;background:var(--bg-secondary);color:var(--text-primary);font-family:\\x27JetBrains Mono\\x27,monospace;line-height:1.55;resize:vertical"></textarea>'
+      +     '<div id="skill-modal-error" style="display:none;color:var(--red);font-size:12px;margin-top:10px;padding:8px 10px;background:rgba(239,68,68,0.08);border:1px solid var(--red);border-radius:6px"></div>'
+      +   '</div>'
+      +   '<div style="display:flex;justify-content:flex-end;gap:8px;padding:14px 20px;border-top:1px solid var(--border);background:var(--bg-secondary)">'
+      +     '<button onclick="closeSkillModal()" style="padding:7px 14px;font-size:13px;border:1px solid var(--border);border-radius:6px;background:transparent;color:var(--text-primary);cursor:pointer">Cancel</button>'
+      +     '<button id="skill-modal-save" onclick="saveSkillFromModal()" class="btn-primary" style="padding:7px 16px;font-size:13px;border:none;border-radius:6px;background:var(--accent);color:#fff;font-weight:500;cursor:pointer">Save skill</button>'
+      +   '</div>'
+      + '</div>';
+    document.body.appendChild(modal);
+  }
+  document.getElementById('skill-modal-title').textContent = opts.mode === 'edit' ? 'Edit skill: ' + nameVal : 'New skill';
+  document.getElementById('skill-modal-original-name').value = opts.mode === 'edit' ? nameVal : '';
+  document.getElementById('skill-modal-name').value = nameVal;
+  document.getElementById('skill-modal-name').disabled = opts.mode === 'edit';
+  document.getElementById('skill-modal-title').nextElementSibling; // no-op
+  document.getElementById('skill-modal-title').value = titleVal;
+  document.getElementById('skill-modal-desc').value = descVal;
+  document.getElementById('skill-modal-tools').value = toolsVal;
+  document.getElementById('skill-modal-body').value = bodyVal;
+  var errEl = document.getElementById('skill-modal-error');
+  if (errEl) { errEl.style.display = 'none'; errEl.textContent = ''; }
+  modal.style.display = 'flex';
+  document.getElementById('skill-modal-name').focus();
+}
+
+function closeSkillModal() {
+  var m = document.getElementById('skill-edit-modal');
+  if (m) m.style.display = 'none';
+}
+
+async function saveSkillFromModal() {
+  var name = (document.getElementById('skill-modal-name')?.value || '').trim();
+  var title = (document.getElementById('skill-modal-title')?.value || '').trim();
+  var desc = (document.getElementById('skill-modal-desc')?.value || '').trim();
+  var toolsRaw = (document.getElementById('skill-modal-tools')?.value || '').trim();
+  var body = (document.getElementById('skill-modal-body')?.value || '');
+  var originalName = (document.getElementById('skill-modal-original-name')?.value || '').trim();
+  var errEl = document.getElementById('skill-modal-error');
+  function fail(msg) {
+    if (errEl) { errEl.textContent = msg; errEl.style.display = ''; }
+    else toast(msg, 'error');
+  }
+  if (!name) return fail('Name is required.');
+  if (!/^[a-z0-9][a-z0-9-]{0,63}$/.test(name)) return fail('Name must be lowercase letters/digits/dashes, start with a letter or digit, max 64 chars.');
+  if (!desc) return fail('Description is required (used by Claude to decide when to apply this skill).');
+  if (desc.length > 1024) return fail('Description must be ≤ 1024 chars (Anthropic spec).');
+  if (!body.trim()) return fail('Procedure body is required.');
+  var tools = toolsRaw ? toolsRaw.split(',').map(function(s){ return s.trim(); }).filter(Boolean) : [];
+  var saveBtn = document.getElementById('skill-modal-save');
+  if (saveBtn) { saveBtn.disabled = true; saveBtn.textContent = 'Saving…'; }
+  try {
+    var endpoint = originalName ? '/api/skills/' + encodeURIComponent(originalName) : '/api/skills';
+    var method = originalName ? 'PUT' : 'POST';
+    var r = await apiFetch(endpoint, {
+      method: method,
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: name, title: title || undefined, description: desc, tools: tools, body: body }),
+    });
+    if (!r.ok) {
+      var d = await r.json().catch(function(){ return {}; });
+      return fail(d.error || ('Save failed: HTTP ' + r.status));
+    }
+    closeSkillModal();
+    toast(originalName ? 'Skill updated' : 'Skill created', 'success');
+    if (typeof refreshSkillsPage === 'function') await refreshSkillsPage();
+    // Auto-open the freshly-saved skill so the user sees their work.
+    if (typeof showSkillDetail === 'function') showSkillDetail(name);
+  } catch (err) { fail('Save failed: ' + err); }
+  finally { if (saveBtn) { saveBtn.disabled = false; saveBtn.textContent = 'Save skill'; } }
+}
+
+async function confirmDeleteSkill(name) {
+  if (!confirm('Delete skill "' + name + '"? The folder will be removed; the .md.bak (if present) is preserved.')) return;
+  try {
+    var r = await apiFetch('/api/skills/' + encodeURIComponent(name), { method: 'DELETE' });
+    if (!r.ok) {
+      var d = await r.json().catch(function(){ return {}; });
+      toast(d.error || 'Delete failed', 'error');
+      return;
+    }
+    toast('Skill "' + name + '" deleted', 'success');
+    if (typeof refreshSkillsPage === 'function') await refreshSkillsPage();
+  } catch (err) { toast('Delete failed: ' + err, 'error'); }
+}
+
 async function refreshSkillsPage() {
   var listEl = document.getElementById('skills-list');
   var detailEl = document.getElementById('skills-detail');
@@ -26816,7 +27186,10 @@ function renderSkillDetail(s) {
     html += renderSkillSection('Usage', '<div style="font-size:12px;color:var(--text-secondary)">' + ubits.map(esc).join(' · ') + '</div>');
   }
 
-  // ── 7. Procedure body (with line counter)
+  // ── 7. Procedure body — rendered as markdown (1.18.115). Prior shipped
+  // raw <pre> source which read like config, not procedure. Headers/lists/
+  // bold/code now render visually. Line counter still appears so authors
+  // know if they're approaching Anthropic's ≤500-line guidance.
   if (s.body && s.body.trim()) {
     var bodyClass = bodyLines > 500 ? 'color:var(--yellow)' : 'color:var(--text-muted)';
     html += '<div style="margin-top:18px">';
@@ -26824,9 +27197,16 @@ function renderSkillDetail(s) {
     html +=   '<div style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.04em;font-weight:500">Procedure</div>';
     html +=   '<div style="font-size:10px;' + bodyClass + ';font-family:\\x27JetBrains Mono\\x27,monospace">' + bodyLines + ' / 500 lines</div>';
     html += '</div>';
-    html += '<pre style="font-size:12px;line-height:1.55;background:var(--bg-tertiary);padding:14px 16px;border-radius:6px;white-space:pre-wrap;word-break:break-word;font-family:inherit;border:1px solid var(--border);max-height:500px;overflow:auto">' + esc(s.body) + '</pre>';
+    html += '<div class="skill-md" style="font-size:13px;line-height:1.6;color:var(--text-primary);background:var(--bg-secondary);padding:18px 22px;border-radius:8px;border:1px solid var(--border);max-height:560px;overflow:auto">' + renderMarkdown(s.body) + '</div>';
     html += '</div>';
   }
+
+  // ── 8. Action footer (1.18.115) — Edit + Delete + Open file. The pane
+  // was read-only; users had to leave the dashboard to edit anything.
+  html += '<div style="margin-top:24px;display:flex;gap:8px;flex-wrap:wrap">';
+  html += '<button class="btn-primary" onclick="openEditSkillModal(\\x27' + jsStr(fm.name) + '\\x27)" style="font-size:12px;padding:6px 14px;border-radius:6px;border:none;background:var(--accent);color:#fff;font-weight:500;cursor:pointer">Edit skill</button>';
+  html += '<button class="btn-sm" onclick="confirmDeleteSkill(\\x27' + jsStr(fm.name) + '\\x27)" style="font-size:12px;padding:6px 14px;border-radius:6px;border:1px solid var(--border);background:var(--bg-secondary);color:var(--red);cursor:pointer">Delete</button>';
+  html += '</div>';
 
   // ── 8. Schema-specific footer
   if (s.schemaVersion === 'legacy') {
@@ -27405,11 +27785,20 @@ function renderSkillsPickerList() {
       return hay.indexOf(q) !== -1;
     });
   }
+  // 1.18.115 — "+ Create new skill" affordance pinned to the top of the
+  // picker. Lets users author a skill in-flight without losing their cron
+  // edit; the new skill appears in the list right after the modal closes.
+  var createRow = '<div class="cap-picker-row" style="border:1px dashed var(--accent);background:transparent" onclick="openCreateSkillModal()">'
+    +   '<div class="cap-picker-row-body">'
+    +     '<div class="cap-picker-row-title" style="color:var(--accent);font-weight:600">+ Create new skill</div>'
+    +     '<div class="cap-picker-row-desc">Author a fresh skill — opens the editor without leaving this task.</div>'
+    +   '</div>'
+    + '</div>';
   if (skills.length === 0) {
-    listEl.innerHTML = '<div class="cap-picker-empty-state">' + (q ? 'No matches.' : 'No skills available.') + '</div>';
+    listEl.innerHTML = createRow + '<div class="cap-picker-empty-state">' + (q ? 'No matches.' : 'No skills available.') + '</div>';
     return;
   }
-  listEl.innerHTML = skills.slice(0, 50).map(function(s) {
+  listEl.innerHTML = createRow + skills.slice(0, 50).map(function(s) {
     var sel = _cronSelectedSkills.indexOf(s.name) !== -1;
     var triggers = (s.triggers || []).slice(0, 4).join(', ');
     return '<div class="cap-picker-row' + (sel ? ' selected' : '') + '" onclick="addSkillToTrick(\\x27' + jsStr(s.name) + '\\x27)">'
@@ -28089,19 +28478,21 @@ function onPredictableChange() {
 function renderCronLegacyBanner(job) {
   var host = document.getElementById('cron-legacy-banner-host');
   if (!host) return;
-  // Banner only when predictable is undefined or explicitly false. Jobs
-  // saved with predictable: true are migrated and skip the banner.
+  // Predictable jobs skip the tip entirely; legacy jobs get a non-alarming
+  // suggestion. The previous wording ("OUTPUT MAY NOT MATCH WHAT YOU SEE
+  // HERE") read as "the editor is lying to you" and made every legacy task
+  // feel broken. It isn't — runs work fine. The toggle below explains the
+  // trade-off; this is just a one-click shortcut for the common upgrade.
   if (job && job.predictable === true) { host.innerHTML = ''; return; }
-  var msg = (job && job.predictable === false)
-    ? "This task is set to legacy mode. At fire-time the runner injects MEMORY.md, recent team activity, the delegation queue, and auto-matches MCP servers based on prompt text — even if your prompt forbids them. The <strong>What will run</strong> tab shows what actually gets attached."
-    : "This task was created before Predictable Mode existed. At fire-time the runner still injects MEMORY.md, recent team activity, and auto-matches MCP servers based on prompt text. Open the <strong>What will run</strong> tab to see what actually gets attached.";
   host.innerHTML =
-    '<div class="cron-banner warn">'
-      + '<h5>⚠ Legacy mode — output may not match what you see here</h5>'
-      + '<div>' + msg + '</div>'
-      + '<div class="banner-actions">'
-        + '<button class="btn-primary btn-sm" onclick="enablePredictableFromBanner()">Migrate now</button>'
-        + '<button class="btn-sm" onclick="switchCronTab(\\x27preview\\x27)" style="background:transparent;border:1px solid var(--border);color:var(--text-primary)">See what will run</button>'
+    '<div class="cron-banner info">'
+      + '<div style="display:flex;align-items:flex-start;gap:10px">'
+        + '<span style="font-size:14px;line-height:1.2;flex-shrink:0">💡</span>'
+        + '<div style="flex:1;min-width:0">'
+          + '<div style="font-size:13px;font-weight:600;color:var(--text-primary);margin-bottom:2px">Strict mode available</div>'
+          + '<div style="font-size:12px;color:var(--text-secondary);line-height:1.45">Runs use only the prompt + pinned skills/MCP below — no auto-injected memory or team comms. More reproducible. <a href="javascript:void(0)" onclick="switchCronTab(\\x27preview\\x27)" style="color:var(--accent);text-decoration:none">See what runs today →</a></div>'
+        + '</div>'
+        + '<button class="btn-primary btn-sm" onclick="enablePredictableFromBanner()" style="flex-shrink:0;font-size:11px;padding:5px 12px">Switch on</button>'
       + '</div>'
     + '</div>';
 }
