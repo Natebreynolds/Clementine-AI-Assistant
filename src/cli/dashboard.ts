@@ -14437,6 +14437,103 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
     font-weight: 600;
   }
 
+  /* ── Agent edit modal — tabs + Equipment panel ─────────────────── */
+  .agent-tab {
+    background: transparent;
+    border: 0;
+    border-bottom: 2px solid transparent;
+    color: var(--text-muted);
+    cursor: pointer;
+    font-size: 13px;
+    padding: 8px 14px;
+    margin-bottom: -1px;
+  }
+  .agent-tab:hover { color: var(--text-primary); }
+  .agent-tab.active {
+    color: var(--text-primary);
+    border-bottom-color: var(--clementine);
+    font-weight: 600;
+  }
+  .agent-tools-filter {
+    background: transparent;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    color: var(--text-muted);
+    cursor: pointer;
+    font-size: 11px;
+    padding: 4px 8px;
+  }
+  .agent-tools-filter:hover { color: var(--text-primary); }
+  .agent-tools-filter.active {
+    background: var(--clementine);
+    border-color: var(--clementine);
+    color: #000;
+    font-weight: 600;
+  }
+  .agent-tool-row {
+    align-items: center;
+    color: var(--text-primary);
+    cursor: pointer;
+    display: flex;
+    font-size: 12px;
+    gap: 6px;
+    line-height: 1.4;
+    padding: 4px 6px;
+    border-radius: 4px;
+  }
+  .agent-tool-row:hover { background: rgba(255,255,255,0.03); }
+  .agent-tool-row .tt-name { flex: 1; min-width: 0; }
+  .agent-tool-row .tt-badge {
+    background: rgba(255,255,255,0.06);
+    border-radius: 3px;
+    color: var(--text-muted);
+    font-size: 9px;
+    font-weight: 700;
+    letter-spacing: 0.4px;
+    padding: 1px 5px;
+    text-transform: uppercase;
+  }
+  .agent-tool-row .tt-badge.cli   { background: rgba(120, 200, 255, 0.12); color: #79c8ff; }
+  .agent-tool-row .tt-badge.sdk   { background: rgba(168, 200, 255, 0.12); color: #a8c8ff; }
+  .agent-tool-row .tt-badge.mcp   { background: rgba(180, 130, 255, 0.12); color: #c8a8ff; }
+  .agent-tool-row .tt-badge.api   { background: rgba(255, 200, 120, 0.12); color: #ffc878; }
+  .agent-tool-row .tt-badge.composio { background: rgba(255, 138, 138, 0.14); color: #ff8a8a; }
+  .agent-tool-row .tt-badge.project, .agent-tool-row .tt-badge['project-mcp'] { background: rgba(120, 255, 180, 0.12); color: #78ffb4; }
+  .agent-tool-row .tt-status {
+    align-items: center;
+    color: var(--text-muted);
+    display: inline-flex;
+    font-size: 10px;
+    gap: 3px;
+  }
+  .agent-tool-row .tt-status .tt-dot {
+    border-radius: 50%;
+    height: 7px;
+    width: 7px;
+  }
+  .agent-tool-row .tt-status.ready .tt-dot       { background: var(--green); }
+  .agent-tool-row .tt-status.needs-setup .tt-dot { background: #f59e0b; }
+  .agent-tool-row .tt-status.not-installed .tt-dot { background: #888; }
+  .agent-tool-row .tt-status.blocked .tt-dot     { background: #ef4444; }
+  .agent-tool-cat {
+    color: var(--text-muted);
+    cursor: pointer;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.5px;
+    margin: 10px 0 4px;
+    text-transform: uppercase;
+    user-select: none;
+  }
+  .agent-tool-cat .cat-count {
+    color: var(--text-muted);
+    font-weight: 500;
+    margin-left: 6px;
+    text-transform: none;
+    letter-spacing: 0;
+  }
+  .agent-tool-row.hidden, .agent-tool-cat.hidden { display: none; }
+
   /* ── Office Hero — Clementine ─────────── */
   .office-hero {
     background: var(--bg-card);
@@ -19785,9 +19882,13 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
       </div>
     </div>
 
-    <!-- Agent Create/Edit Modal -->
+    <!-- Agent Create/Edit Modal — tabbed editor reused for hired agents
+         AND for Clementine herself (see editClementine() in dashboard JS).
+         Element IDs are stable so existing populator/submit code keeps
+         working; new tabs (Equipment, Goals) add fields without breaking the
+         old contract. -->
     <div id="agent-modal" class="modal-overlay">
-      <div class="modal" style="width:520px">
+      <div class="modal" style="width:760px;max-width:95vw">
         <div class="modal-header">
           <h3 id="agent-modal-title">Hire a New Team Member</h3>
           <button class="btn-ghost btn-sm" onclick="hideAgentModal()">&times;</button>
@@ -19795,26 +19896,82 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
         <div class="modal-body">
         <form id="agent-form" onsubmit="submitAgentForm(event)">
           <input type="hidden" id="agent-edit-slug" value="">
-          <div style="margin-bottom:12px">
-            <label style="display:block;color:var(--text-muted);font-size:12px;margin-bottom:4px">Name *</label>
-            <input id="agent-name" required style="width:100%;padding:8px;background:var(--bg-input);border:1px solid var(--border);border-radius:6px;color:var(--text-primary)" placeholder="Research Agent">
+          <input type="hidden" id="agent-edit-mode" value="agent"><!-- 'agent' or 'clementine' -->
+
+          <!-- Tab strip ---------------------------------------------------- -->
+          <div id="agent-modal-tabs" style="display:flex;gap:2px;border-bottom:1px solid var(--border);margin-bottom:14px">
+            <button type="button" class="agent-tab active" data-tab="identity" onclick="switchAgentTab('identity')">Identity</button>
+            <button type="button" class="agent-tab" data-tab="equipment" onclick="switchAgentTab('equipment')">Equipment</button>
+            <button type="button" class="agent-tab" data-tab="connections" onclick="switchAgentTab('connections')">Connections</button>
+            <button type="button" class="agent-tab" data-tab="goals" onclick="switchAgentTab('goals')">Goals</button>
+            <button type="button" class="agent-tab" data-tab="limits" onclick="switchAgentTab('limits')">Limits</button>
           </div>
-          <div style="margin-bottom:12px">
-            <label style="display:block;color:var(--text-muted);font-size:12px;margin-bottom:4px">Role Description *</label>
-            <input id="agent-description" required style="width:100%;padding:8px;background:var(--bg-input);border:1px solid var(--border);border-radius:6px;color:var(--text-primary)" placeholder="Deep-dive research and analysis">
+
+          <!-- Tab: Identity ------------------------------------------------ -->
+          <div class="agent-tab-pane" data-tab-pane="identity">
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px">
+              <div>
+                <label style="display:block;color:var(--text-muted);font-size:12px;margin-bottom:4px">Name *</label>
+                <input id="agent-name" required style="width:100%;padding:8px;background:var(--bg-input);border:1px solid var(--border);border-radius:6px;color:var(--text-primary)" placeholder="Research Agent">
+              </div>
+              <div>
+                <label style="display:block;color:var(--text-muted);font-size:12px;margin-bottom:4px">Model</label>
+                <select id="agent-model" style="width:100%;padding:8px;background:var(--bg-input);border:1px solid var(--border);border-radius:6px;color:var(--text-primary)">
+                  <option value="">Default (Sonnet)</option>
+                  <option value="haiku">Haiku</option>
+                  <option value="sonnet">Sonnet</option>
+                  <option value="opus">Opus</option>
+                </select>
+              </div>
+            </div>
+            <div id="agent-identity-row-2" style="margin-bottom:12px">
+              <label style="display:block;color:var(--text-muted);font-size:12px;margin-bottom:4px">Profile Photo URL</label>
+              <input id="agent-avatar-url" style="width:100%;padding:8px;background:var(--bg-input);border:1px solid var(--border);border-radius:6px;color:var(--text-primary)" placeholder="https://example.com/avatar.png">
+            </div>
+            <div style="margin-bottom:12px">
+              <label style="display:block;color:var(--text-muted);font-size:12px;margin-bottom:4px">Headline <span style="opacity:0.6">(short — appears on the agent card)</span> *</label>
+              <input id="agent-description" required style="width:100%;padding:8px;background:var(--bg-input);border:1px solid var(--border);border-radius:6px;color:var(--text-primary)" placeholder="Deep-dive research and analysis">
+            </div>
+            <div style="margin-bottom:12px">
+              <label style="display:block;color:var(--text-muted);font-size:12px;margin-bottom:4px">Mission &amp; persona <span style="opacity:0.6">(full system-prompt body — voice, expertise, working rules)</span></label>
+              <textarea id="agent-personality" rows="8" style="width:100%;padding:8px;background:var(--bg-input);border:1px solid var(--border);border-radius:6px;color:var(--text-primary);resize:vertical;font-family:inherit" placeholder="You are a Research Agent specializing in..."></textarea>
+            </div>
+            <div id="agent-project-row" style="margin-bottom:12px">
+              <label style="display:block;color:var(--text-muted);font-size:12px;margin-bottom:4px">Primary Project <span style="opacity:0.6">(optional — additional project access lives in the Equipment tab)</span></label>
+              <select id="agent-project" style="width:100%;padding:8px;background:var(--bg-input);border:1px solid var(--border);border-radius:6px;color:var(--text-primary)">
+                <option value="">None</option>
+              </select>
+            </div>
           </div>
-          <div style="margin-bottom:12px">
-            <label style="display:block;color:var(--text-muted);font-size:12px;margin-bottom:4px">Profile Photo URL</label>
-            <input id="agent-avatar-url" style="width:100%;padding:8px;background:var(--bg-input);border:1px solid var(--border);border-radius:6px;color:var(--text-primary)" placeholder="https://example.com/avatar.png">
+
+          <!-- Tab: Equipment ----------------------------------------------- -->
+          <div class="agent-tab-pane" data-tab-pane="equipment" style="display:none">
+            <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px;flex-wrap:wrap">
+              <input id="agent-tools-search" type="search" placeholder="Search tools, CLIs, MCP, projects, integrations..." oninput="filterAgentTools()" style="flex:1;min-width:240px;padding:7px 10px;background:var(--bg-input);border:1px solid var(--border);border-radius:6px;color:var(--text-primary);font-size:12px">
+              <div id="agent-tools-filters" style="display:flex;gap:4px">
+                <button type="button" class="agent-tools-filter active" data-filter="all" onclick="setAgentToolsFilter('all')">All</button>
+                <button type="button" class="agent-tools-filter" data-filter="enabled" onclick="setAgentToolsFilter('enabled')">Enabled</button>
+                <button type="button" class="agent-tools-filter" data-filter="ready" onclick="setAgentToolsFilter('ready')">Ready</button>
+                <button type="button" class="agent-tools-filter" data-filter="needs-setup" onclick="setAgentToolsFilter('needs-setup')">Needs setup</button>
+              </div>
+            </div>
+            <div id="agent-tools-summary" style="font-size:11px;color:var(--text-muted);margin-bottom:6px">Loading…</div>
+            <div id="agent-tools-panel" style="max-height:380px;overflow-y:auto;border:1px solid var(--border);border-radius:6px;padding:8px;background:var(--bg-input)">
+              <div style="color:var(--text-muted);font-size:12px">Loading tools...</div>
+            </div>
+            <div style="margin-top:8px;font-size:11px;color:var(--text-muted);line-height:1.5">
+              <span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--green);vertical-align:middle;margin-right:4px"></span>Ready &nbsp;
+              <span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#f59e0b;vertical-align:middle;margin-right:4px"></span>Needs setup &nbsp;
+              <span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#888;vertical-align:middle;margin-right:4px"></span>Not installed &nbsp;
+              <span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#ef4444;vertical-align:middle;margin-right:4px"></span>Blocked
+            </div>
           </div>
-          <div style="margin-bottom:12px">
-            <label style="display:block;color:var(--text-muted);font-size:12px;margin-bottom:4px">Onboarding Brief</label>
-            <textarea id="agent-personality" rows="4" style="width:100%;padding:8px;background:var(--bg-input);border:1px solid var(--border);border-radius:6px;color:var(--text-primary);resize:vertical" placeholder="You are a Research Agent specializing in..."></textarea>
-          </div>
-          <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px">
-            <div>
-              <label style="display:block;color:var(--text-muted);font-size:12px;margin-bottom:4px">Channel</label>
-              <div id="agent-channel-list" style="max-height:140px;overflow-y:auto;border:1px solid var(--border);border-radius:6px;padding:6px 8px;background:var(--bg-input)">
+
+          <!-- Tab: Connections -------------------------------------------- -->
+          <div class="agent-tab-pane" data-tab-pane="connections" style="display:none">
+            <div style="margin-bottom:14px">
+              <label style="display:block;color:var(--text-muted);font-size:12px;margin-bottom:4px">Channels <span style="opacity:0.6">(Discord channels this agent will listen + post in)</span></label>
+              <div id="agent-channel-list" style="max-height:160px;overflow-y:auto;border:1px solid var(--border);border-radius:6px;padding:6px 8px;background:var(--bg-input)">
                 <div style="color:var(--text-muted);font-size:12px">Loading channels...</div>
               </div>
               <label style="display:flex;align-items:center;gap:6px;margin-top:6px;color:var(--text-muted);font-size:12px;cursor:pointer">
@@ -19826,76 +19983,15 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
                 Respond to all messages <span style="opacity:0.6">(not just @mentions)</span>
               </label>
             </div>
-            <div>
-              <label style="display:block;color:var(--text-muted);font-size:12px;margin-bottom:4px">Model</label>
-              <select id="agent-model" style="width:100%;padding:8px;background:var(--bg-input);border:1px solid var(--border);border-radius:6px;color:var(--text-primary)">
-                <option value="">Default (Sonnet)</option>
-                <option value="haiku">Haiku</option>
-                <option value="sonnet">Sonnet</option>
-                <option value="opus">Opus</option>
-              </select>
+            <div style="margin-bottom:14px">
+              <label style="display:block;color:var(--text-muted);font-size:12px;margin-bottom:4px">Teammates this agent can message <span style="opacity:0.6">(comma-separated slugs)</span></label>
+              <input id="agent-canmessage" style="width:100%;padding:8px;background:var(--bg-input);border:1px solid var(--border);border-radius:6px;color:var(--text-primary)" placeholder="analyst-agent, writer-agent">
             </div>
-          </div>
-          <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px">
-            <div>
-              <label style="display:block;color:var(--text-muted);font-size:12px;margin-bottom:4px">Project Binding</label>
-              <select id="agent-project" style="width:100%;padding:8px;background:var(--bg-input);border:1px solid var(--border);border-radius:6px;color:var(--text-primary)">
-                <option value="">None</option>
-              </select>
+            <div style="margin-bottom:14px">
+              <label style="display:block;color:var(--text-muted);font-size:12px;margin-bottom:4px">Allowed Users <span style="opacity:0.6">(Discord user IDs that may DM this agent — comma-separated)</span></label>
+              <input id="agent-allowed-users" style="width:100%;padding:8px;background:var(--bg-input);border:1px solid var(--border);border-radius:6px;color:var(--text-primary)" placeholder="123456789012345678, 987654321098765432">
             </div>
-            <div>
-              <label style="display:block;color:var(--text-muted);font-size:12px;margin-bottom:4px">Security Clearance</label>
-              <select id="agent-tier" style="width:100%;padding:8px;background:var(--bg-input);border:1px solid var(--border);border-radius:6px;color:var(--text-primary)">
-                <option value="2">Tier 2 (Read/Write)</option>
-                <option value="1">Tier 1 (Read-only)</option>
-              </select>
-            </div>
-            <div>
-              <label style="display:block;color:var(--text-muted);font-size:12px;margin-bottom:4px">Monthly Budget <span style="opacity:0.6">(cents, 0 = unlimited)</span></label>
-              <input id="agent-budget" type="number" value="0" min="0" style="width:100%;padding:8px;background:var(--bg-input);border:1px solid var(--border);border-radius:6px;color:var(--text-primary)"
-                placeholder="e.g. 5000 = $50/month">
-            </div>
-          </div>
-          <details style="margin-bottom:12px;border:1px solid var(--border);border-radius:6px;padding:8px">
-            <summary style="cursor:pointer;color:var(--text-muted);font-size:12px;font-weight:600">Autonomous Sending Policy <span style="opacity:0.6">(for email-capable agents)</span></summary>
-            <div style="padding:8px 0 0;display:grid;grid-template-columns:1fr 1fr;gap:8px">
-              <div>
-                <label style="display:block;color:var(--text-muted);font-size:11px;margin-bottom:3px">Max Emails / Day</label>
-                <input id="agent-send-max-daily" type="number" value="50" min="0" max="500" style="width:100%;padding:6px;background:var(--bg-input);border:1px solid var(--border);border-radius:4px;color:var(--text-primary);font-size:12px">
-              </div>
-              <div>
-                <label style="display:block;color:var(--text-muted);font-size:11px;margin-bottom:3px">Approval Mode</label>
-                <select id="agent-send-approval" style="width:100%;padding:6px;background:var(--bg-input);border:1px solid var(--border);border-radius:4px;color:var(--text-primary);font-size:12px">
-                  <option value="">Disabled (no autonomous sending)</option>
-                  <option value="none">None (fully autonomous)</option>
-                  <option value="first-in-sequence">First in sequence (approve first email per lead)</option>
-                  <option value="all">All (approve every send)</option>
-                </select>
-              </div>
-              <div style="grid-column:span 2">
-                <label style="display:flex;align-items:center;gap:6px;color:var(--text-muted);font-size:12px;cursor:pointer">
-                  <input id="agent-send-biz-hours" type="checkbox"> Restrict to business hours (8am–6pm)
-                </label>
-              </div>
-            </div>
-          </details>
-          <div style="margin-bottom:12px">
-            <label style="display:block;color:var(--text-muted);font-size:12px;margin-bottom:4px">Team Connections (comma-separated slugs)</label>
-            <input id="agent-canmessage" style="width:100%;padding:8px;background:var(--bg-input);border:1px solid var(--border);border-radius:6px;color:var(--text-primary)" placeholder="analyst-agent, writer-agent">
-          </div>
-          <div style="margin-bottom:12px">
-            <label style="display:block;color:var(--text-muted);font-size:12px;margin-bottom:4px">Equipment & Access <span style="opacity:0.6">(click category to toggle all)</span></label>
-            <div id="agent-tools-panel" style="max-height:200px;overflow-y:auto;border:1px solid var(--border);border-radius:6px;padding:8px;background:var(--bg-input)">
-              <div style="color:var(--text-muted);font-size:12px">Loading tools...</div>
-            </div>
-          </div>
-          <div style="margin-bottom:12px">
-            <label style="display:block;color:var(--text-muted);font-size:12px;margin-bottom:4px">Allowed Users <span style="opacity:0.6">(Discord user IDs, comma-separated)</span></label>
-            <input id="agent-allowed-users" style="width:100%;padding:8px;background:var(--bg-input);border:1px solid var(--border);border-radius:6px;color:var(--text-primary)" placeholder="123456789012345678, 987654321098765432">
-          </div>
-          <div style="margin-bottom:16px">
-            <div style="font-weight:600;font-size:13px;color:var(--text-primary);margin-bottom:8px;border-top:1px solid var(--border);padding-top:12px">Platform Connections</div>
-
+            <div style="margin-bottom:8px;font-weight:600;font-size:13px;color:var(--text-primary);border-top:1px solid var(--border);padding-top:12px">Platform Bots</div>
             <details id="discord-section" style="margin-bottom:10px">
               <summary style="cursor:pointer;color:var(--text-muted);font-size:12px;font-weight:600;margin-bottom:6px">Discord Bot <span id="discord-status-dot" style="display:none;width:8px;height:8px;border-radius:50%;display:inline-block;margin-left:4px"></span></summary>
               <div style="padding-left:8px">
@@ -19940,8 +20036,53 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
                 </div>
               </div>
             </details>
+          </div><!-- /agent-tab-pane connections -->
+
+          <!-- Tab: Goals --------------------------------------------------- -->
+          <div class="agent-tab-pane" data-tab-pane="goals" style="display:none">
+            <div style="font-size:12px;color:var(--text-muted);margin-bottom:8px">Long-running objectives this agent owns. Reassigning here moves the goal&apos;s <code>owner</code> field — the existing Goals tab in Team picks the change up automatically.</div>
+            <div id="agent-goals-panel" style="max-height:380px;overflow-y:auto;border:1px solid var(--border);border-radius:6px;padding:8px;background:var(--bg-input)">
+              <div style="color:var(--text-muted);font-size:12px">Loading goals…</div>
+            </div>
           </div>
-          <div style="display:flex;gap:8px;justify-content:flex-end">
+
+          <!-- Tab: Limits -------------------------------------------------- -->
+          <div class="agent-tab-pane" data-tab-pane="limits" style="display:none">
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:14px">
+              <div id="agent-tier-row">
+                <label style="display:block;color:var(--text-muted);font-size:12px;margin-bottom:4px">Security Clearance</label>
+                <select id="agent-tier" style="width:100%;padding:8px;background:var(--bg-input);border:1px solid var(--border);border-radius:6px;color:var(--text-primary)">
+                  <option value="2">Tier 2 (Read/Write)</option>
+                  <option value="1">Tier 1 (Read-only)</option>
+                </select>
+              </div>
+              <div>
+                <label style="display:block;color:var(--text-muted);font-size:12px;margin-bottom:4px">Monthly Budget <span style="opacity:0.6">(cents, 0 = unlimited)</span></label>
+                <input id="agent-budget" type="number" value="0" min="0" style="width:100%;padding:8px;background:var(--bg-input);border:1px solid var(--border);border-radius:6px;color:var(--text-primary)" placeholder="e.g. 5000 = $50/month">
+              </div>
+            </div>
+            <div style="font-weight:600;font-size:13px;color:var(--text-primary);margin-bottom:8px;border-top:1px solid var(--border);padding-top:12px">Autonomous Sending Policy <span style="opacity:0.6;font-weight:400">(for email-capable agents)</span></div>
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:8px">
+              <div>
+                <label style="display:block;color:var(--text-muted);font-size:11px;margin-bottom:3px">Max Emails / Day</label>
+                <input id="agent-send-max-daily" type="number" value="50" min="0" max="500" style="width:100%;padding:6px;background:var(--bg-input);border:1px solid var(--border);border-radius:4px;color:var(--text-primary);font-size:12px">
+              </div>
+              <div>
+                <label style="display:block;color:var(--text-muted);font-size:11px;margin-bottom:3px">Approval Mode</label>
+                <select id="agent-send-approval" style="width:100%;padding:6px;background:var(--bg-input);border:1px solid var(--border);border-radius:4px;color:var(--text-primary);font-size:12px">
+                  <option value="">Disabled (no autonomous sending)</option>
+                  <option value="none">None (fully autonomous)</option>
+                  <option value="first-in-sequence">First in sequence (approve first email per lead)</option>
+                  <option value="all">All (approve every send)</option>
+                </select>
+              </div>
+            </div>
+            <label style="display:flex;align-items:center;gap:6px;color:var(--text-muted);font-size:12px;cursor:pointer">
+              <input id="agent-send-biz-hours" type="checkbox"> Restrict to business hours (8am–6pm)
+            </label>
+          </div>
+
+          <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:16px;border-top:1px solid var(--border);padding-top:12px">
             <button type="button" class="btn" onclick="hideAgentModal()">Cancel</button>
             <button type="submit" class="btn" style="background:var(--green);color:#000;font-weight:600" id="agent-submit-btn">Complete Hiring</button>
           </div>
@@ -24315,7 +24456,7 @@ function renderRunListBody(allRuns) {
   if (catOptions.length > 1) {
     html += _runListChip('Category', catOptions, 'filterCategory');
   }
-  html += '<input type="search" placeholder="Filter by task name…" value="' + esc(_runListState.filterText) + '" oninput="onRunListSearch(this.value)" style="flex:1;min-width:200px;max-width:320px;padding:6px 10px;font-size:12px;border:1px solid var(--border);border-radius:6px;background:var(--bg-secondary);color:var(--text-primary)">';
+  html += '<input type="search" id="runlist-filter-text" placeholder="Filter by task name…" value="' + esc(_runListState.filterText) + '" oninput="onRunListSearch(this.value)" style="flex:1;min-width:200px;max-width:320px;padding:6px 10px;font-size:12px;border:1px solid var(--border);border-radius:6px;background:var(--bg-secondary);color:var(--text-primary)">';
   html += '<button class="btn-sm" onclick="resetRunListFilters()" style="font-size:11px">Reset to default</button>';
   html += '</div>';
   if (filtered.length === 0) {
@@ -24927,6 +25068,92 @@ function openRunOrTrace(jobName, runId) {
   return openTraceViewer(jobName);
 }
 
+// ── PRD §13 / 1.18.94: Replay tooling v1 ────────────────────────────────
+// Three small handlers wired to the buttons in the Run detail header.
+// They reuse existing endpoints — no new server-side surface. Future
+// versions add Rerun-from-step (needs SDK resume support) + Bulk replay.
+async function replayRerunRun(jobName) {
+  if (!jobName) return;
+  if (!confirm('Rerun "' + jobName + '" with the same prompt? This fires a new run immediately.')) return;
+  try {
+    var r = await apiFetch('/api/cron/run/' + encodeURIComponent(jobName), { method: 'POST' });
+    var d = await r.json().catch(function() { return {}; });
+    if (!r.ok) {
+      // 409 = the task is already running (concurrency lock); explain that.
+      if (r.status === 409) {
+        toast(d.error || (jobName + ' is already running. Cancel the in-flight run first.'), 'error');
+      } else {
+        toast(d.error || ('Rerun failed (HTTP ' + r.status + ')'), 'error');
+      }
+      return;
+    }
+    toast('Rerunning ' + jobName + ' — watch the run list for the new entry.', 'success');
+    // Don't auto-close the modal — the user just confirmed they want to
+    // see the result. The new run will appear in the run-selector dropdown
+    // (loaded by openTraceViewer's history fetch) within a few seconds.
+    setTimeout(function() {
+      if (typeof refreshCron === 'function') refreshCron();
+      if (typeof refreshRunList === 'function') refreshRunList();
+    }, 1200);
+  } catch (e) { toast('Rerun failed: ' + e, 'error'); }
+}
+
+async function replayCopyPrompt(jobName) {
+  if (!jobName) return;
+  try {
+    // /api/cron returns the full job list with prompt fields — pull the
+    // matching one and stuff it onto the clipboard. Cheap and avoids a
+    // dedicated GET-by-name endpoint.
+    var r = await apiFetch('/api/cron');
+    var d = await r.json();
+    var jobs = (d && d.jobs) || [];
+    var found = null;
+    for (var i = 0; i < jobs.length; i++) {
+      if (String(jobs[i].name).toLowerCase() === String(jobName).toLowerCase()) { found = jobs[i]; break; }
+    }
+    if (!found || !found.prompt) {
+      toast('No prompt found for ' + jobName, 'error');
+      return;
+    }
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      await navigator.clipboard.writeText(found.prompt);
+      toast('Prompt copied to clipboard (' + found.prompt.length + ' chars).', 'success');
+    } else {
+      // Fallback for clipboard-less environments (rare in modern browsers,
+      // but the dashboard runs over plain HTTP on localhost which can hit
+      // the secure-context restriction in some setups).
+      var ta = document.createElement('textarea');
+      ta.value = found.prompt;
+      document.body.appendChild(ta);
+      ta.select();
+      try { document.execCommand('copy'); toast('Prompt copied (legacy mode).', 'success'); }
+      catch (e) { toast('Copy not supported in this browser. Open the editor instead.', 'error'); }
+      document.body.removeChild(ta);
+    }
+  } catch (e) { toast('Copy prompt failed: ' + e, 'error'); }
+}
+
+function replayOpenRunList(jobName) {
+  if (!jobName) return;
+  // Close the trace modal, switch to Run list tab, set the text filter to
+  // the task name. The Run list already supports free-text task-name match.
+  try { document.getElementById('trace-modal').classList.remove('show'); } catch (e) { /* ignore */ }
+  // The Tasks page has three top-level Build tabs; the Run list lives on
+  // tab #3. Switch via the existing tab handler if available; otherwise
+  // fall back to setting the URL hash so the page handler picks it up.
+  if (typeof switchBuildTab === 'function') {
+    switchBuildTab('runs');
+  }
+  if (typeof _runListState !== 'undefined') {
+    _runListState.filterText = jobName;
+    if (typeof refreshRunList === 'function') refreshRunList();
+    // Mirror filter into the visible input so users see why the list is filtered.
+    var inp = document.getElementById('runlist-filter-text');
+    if (inp) inp.value = jobName;
+  }
+  toast('Filtered run list to "' + jobName + '"', 'success');
+}
+
 // PRD Phase 4b / 1.18.86: Run detail viewer. Renders a waterfall of
 // RunEvent rows from /api/runs/:runId/events. Color-coded by kind, paired
 // tool_call→tool_result by toolUseId, with expandable per-span content.
@@ -25004,6 +25231,19 @@ function renderRunDetailWaterfall(events, runId, jobName) {
     +   '<span style="flex:1"></span>'
     +   '<code style="font-size:10px;color:var(--text-muted)">runId ' + esc(String(runId).slice(0, 12)) + '…</code>'
     + '</div>'
+    // PRD §13 / 1.18.94 — Replay tooling v1. Three actions reachable from
+    // every Run detail: rerun the same task with the same prompt (kicks off
+    // a new run via the existing /api/cron/run/:job endpoint with
+    // trigger='manual'), copy the prompt to clipboard for quick edits in
+    // the editor, and jump to the Run list filtered to this task name.
+    // Only rendered when we know the jobName (not for orphaned runs).
+    + (jobName
+        ? '<div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap">'
+          + '<button class="btn-sm btn-success" onclick="replayRerunRun(\\x27' + jsStr(jobName) + '\\x27)" title="Fire this task once — same prompt, fresh run">▶ Rerun task</button>'
+          + '<button class="btn-sm" onclick="replayCopyPrompt(\\x27' + jsStr(jobName) + '\\x27)" title="Copy the prompt for this task to your clipboard">⧉ Copy prompt</button>'
+          + '<button class="btn-sm" onclick="replayOpenRunList(\\x27' + jsStr(jobName) + '\\x27)" title="Open the Run list filtered to this task">↗ Open run list</button>'
+          + '</div>'
+        : '')
     + '</div>';
 
   // Waterfall rows
@@ -33065,6 +33305,9 @@ async function refreshTeam() {
             '<div class="office-hero-stat"><div class="stat-val">' + (clem.crons ? clem.crons.runsToday : 0) + '</div><div class="stat-lbl">Runs Today</div></div>' +
             '<div class="office-hero-stat"><div class="stat-val">' + fmtTokens(clemTokenTotal) + '</div><div class="stat-lbl">Tokens</div></div>' +
             '<div class="office-hero-stat"><div class="stat-val">' + (clem.crons ? clem.crons.total : 0) + '</div><div class="stat-lbl">Cron Jobs</div></div>' +
+          '</div>' +
+          '<div class="office-hero-actions" style="margin-left:auto;display:flex;gap:6px">' +
+            '<button class="btn btn-sm" onclick="editClementine()" title="Configure Clementine\\x27s persona, tools, and limits">Edit</button>' +
           '</div>' +
         '</div>' +
         (needsDiscordSetup ?
