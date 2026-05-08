@@ -14947,6 +14947,11 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
   /* ── Recent history row hover (Tasks page bottom zone) ── */
   .history-row { transition: background 0.12s ease; }
   .history-row:hover { background: var(--bg-hover); }
+  /* PRD Phase 1.2: "Run task once" running-state pulse on the Last run tab. */
+  @keyframes pulse {
+    0%, 100% { opacity: 0.4; transform: scale(0.85); }
+    50% { opacity: 1; transform: scale(1); }
+  }
   /* ── Trick capability strip (skills + MCP + tools at a glance) ─── */
   .task-cap-strip {
     border-top: 1px solid var(--border-light);
@@ -19731,6 +19736,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
     <div class="cron-tabs" role="tablist">
       <button type="button" class="cron-tab-btn active" data-cron-tab="configure" onclick="switchCronTab('configure')">Configure</button>
       <button type="button" class="cron-tab-btn" id="cron-tab-btn-preview" data-cron-tab="preview" onclick="switchCronTab('preview')" title="See exactly what the agent will receive at fire-time">What will run</button>
+      <button type="button" class="cron-tab-btn" id="cron-tab-btn-lastrun" data-cron-tab="lastrun" onclick="switchCronTab('lastrun')" title="Watch the most recent run — click Run task once to fire it now">Last run</button>
     </div>
     <div class="modal-body">
       <!-- ── Tab: Configure ─────────────────────────────────────────── -->
@@ -20050,10 +20056,23 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
           </div>
         </div>
       </div><!-- /cron-tab-preview -->
+
+      <!-- ── Tab: Last run ── PRD Phase 1.2: "Run task once" inline output. -->
+      <div class="cron-tab-pane" id="cron-tab-lastrun">
+        <div id="cron-lastrun-body" style="padding:0">
+          <div style="padding:36px 24px;color:var(--text-muted);text-align:center;font-size:13px">
+            Save the task first, then click <strong>Run task once</strong> to fire it now and watch the result here.
+          </div>
+        </div>
+      </div><!-- /cron-tab-lastrun -->
     </div>
     <div class="modal-footer">
       <div style="display:flex;align-items:center;gap:8px;flex:1">
         <button class="btn btn-sm" id="cron-train-btn" onclick="showCronTraining()" style="font-size:11px;display:none">Train with Agent</button>
+        <!-- PRD §5.1 header bullet: "Run task once" green button. Visible only
+             when editing a saved task (set by openEditCronModal). Disabled
+             during an in-flight run. -->
+        <button class="btn btn-sm btn-success" id="cron-run-once-btn" onclick="runCronOnceFromModal()" style="display:none;font-size:12px;padding:6px 14px">▶ Run task once</button>
       </div>
       <button onclick="closeCronModal()">Cancel</button>
       <button class="btn-primary" id="cron-modal-save" onclick="saveCronJob()">Create Task</button>
@@ -24578,8 +24597,10 @@ function switchCronTab(tab) {
   });
   var configurePane = document.getElementById('cron-tab-configure');
   var previewPane = document.getElementById('cron-tab-preview');
+  var lastRunPane = document.getElementById('cron-tab-lastrun');
   if (configurePane) configurePane.classList.toggle('active', tab === 'configure');
   if (previewPane) previewPane.classList.toggle('active', tab === 'preview');
+  if (lastRunPane) lastRunPane.classList.toggle('active', tab === 'lastrun');
   if (tab === 'preview') {
     var name = editingCronJob;
     if (!name) {
@@ -24588,6 +24609,10 @@ function switchCronTab(tab) {
       return;
     }
     if (_cronPreviewLoadedFor !== name) loadCronPreviewIntoTab(name);
+  } else if (tab === 'lastrun') {
+    // Re-render in case run-state changed since the modal opened.
+    var jobLR = (typeof cronJobsData !== 'undefined' ? cronJobsData : []).find(function(j) { return j.name === editingCronJob; });
+    if (jobLR) renderCronLastRunPane(jobLR);
   }
 }
 
@@ -24611,6 +24636,169 @@ async function loadCronPreviewIntoTab(jobName) {
 
 // Mark the preview as stale (call after save so next tab visit refetches).
 function markCronPreviewDirty() { _cronPreviewLoadedFor = null; }
+
+// ── PRD Phase 1.2: "Run task once" — inline run + Last run tab ───────────
+// Tracks an in-flight run triggered FROM the modal so the SSE listeners
+// know when a cron_complete event belongs to "the run I just kicked off"
+// vs a scheduled tick that fired in the background. Cleared when the run
+// completes or the modal closes.
+var _cronRunOnceInFlight = null;     // { jobName: string, startedAt: number }
+var _cronRunOnceTickerId = null;     // setInterval id for the elapsed counter
+
+// Render the Last run pane from the job's most-recent JSONL entry. Called
+// when the modal opens for a saved task and when switchCronTab('lastrun')
+// reactivates the pane.
+function renderCronLastRunPane(job) {
+  var pane = document.getElementById('cron-lastrun-body');
+  if (!pane) return;
+  // If we have an in-flight run, render the running state regardless of
+  // what's on disk — the on-disk lastRun is from BEFORE this fire.
+  if (_cronRunOnceInFlight && _cronRunOnceInFlight.jobName === (job && job.name)) {
+    pane.innerHTML = renderCronRunningState(_cronRunOnceInFlight.startedAt);
+    return;
+  }
+  var lr = job && job.lastRun;
+  if (!lr) {
+    pane.innerHTML = '<div style="padding:36px 24px;color:var(--text-muted);text-align:center;font-size:13px">No runs yet. Click <strong>Run task once</strong> below to fire it now and watch the result here.</div>';
+    return;
+  }
+  pane.innerHTML = renderCronRunDetails(lr);
+}
+
+function renderCronRunningState(startedAtMs) {
+  var elapsed = Math.max(0, Math.round((Date.now() - startedAtMs) / 1000));
+  return ''
+    + '<div style="padding:36px 24px;text-align:center">'
+    +   '<div class="run-once-pulse" style="font-size:14px;color:var(--accent);font-weight:500;margin-bottom:8px">'
+    +     '<span class="pulse-dot" style="display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--accent);margin-right:6px;animation:pulse 1.4s ease-in-out infinite"></span>'
+    +     'Running…'
+    +   '</div>'
+    +   '<div style="font-size:12px;color:var(--text-muted)">Elapsed: <span id="cron-run-once-elapsed">' + elapsed + 's</span></div>'
+    +   '<div style="font-size:11px;color:var(--text-muted);margin-top:14px">Live output streaming will land here when the run completes.</div>'
+    + '</div>';
+}
+
+function renderCronRunDetails(lr) {
+  var ok = lr.status === 'ok';
+  var statusColor = ok ? 'var(--green)' : (lr.status === 'error' ? 'var(--red)' : 'var(--yellow)');
+  var statusIcon = ok ? '✓' : (lr.status === 'error' ? '✗' : '⏱');
+  var dur = lr.durationMs != null ? formatDurationMs(lr.durationMs) : '—';
+  var when = lr.finishedAt || lr.startedAt;
+  var whenLabel = when ? new Date(when).toLocaleString() : '—';
+  var html = ''
+    + '<div style="padding:24px">'
+    +   '<div style="display:flex;align-items:baseline;gap:10px;margin-bottom:14px">'
+    +     '<span style="color:' + statusColor + ';font-size:18px">' + statusIcon + '</span>'
+    +     '<span style="font-size:14px;font-weight:600;color:var(--text-primary);text-transform:capitalize">' + esc(lr.status || 'unknown') + '</span>'
+    +     '<span style="flex:1"></span>'
+    +     '<span style="font-size:12px;color:var(--text-muted)">' + esc(whenLabel) + ' · ' + esc(dur) + (lr.attempt && lr.attempt > 1 ? ' · attempt ' + esc(lr.attempt) : '') + '</span>'
+    +   '</div>';
+  if (lr.goalCheck) {
+    var gc = lr.goalCheck;
+    var gIcon = gc.status === 'pass' ? '🎯' : gc.status === 'fail' ? '✗' : '⚠';
+    var gColor = gc.status === 'pass' ? 'var(--green)' : gc.status === 'fail' ? 'var(--red)' : 'var(--yellow)';
+    var gLabel = gc.status === 'pass' ? 'Goal met' : gc.status === 'fail' ? 'Goal NOT met' : 'Goal evaluation failed';
+    var gReason = gc.evaluatorReason || (Array.isArray(gc.schemaErrors) ? gc.schemaErrors.join('; ') : '');
+    html += '<div style="padding:10px 14px;border-radius:6px;background:rgba(255,255,255,0.04);border-left:3px solid ' + gColor + ';margin-bottom:14px">'
+      +    '<div style="font-size:13px;font-weight:500;color:' + gColor + '">' + gIcon + ' ' + gLabel + '</div>'
+      +    (gReason ? '<div style="font-size:12px;color:var(--text-secondary);margin-top:4px">' + esc(gReason) + '</div>' : '')
+      +  '</div>';
+  }
+  if (lr.error) {
+    html += '<div style="margin-bottom:14px"><div style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.04em;margin-bottom:6px">Error</div>'
+      +    '<div style="font-family:\\x27JetBrains Mono\\x27,monospace;font-size:11px;color:var(--red);background:rgba(239,68,68,0.06);border:1px solid rgba(239,68,68,0.2);padding:10px;border-radius:6px;white-space:pre-wrap;word-break:break-word">'
+      +    esc(String(lr.error).slice(0, 2000)) + '</div></div>';
+  }
+  if (lr.outputPreview) {
+    html += '<div style="margin-bottom:14px"><div style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.04em;margin-bottom:6px">Output preview</div>'
+      +    '<div style="font-size:12px;color:var(--text-primary);background:var(--bg-secondary);border:1px solid var(--border);padding:10px;border-radius:6px;white-space:pre-wrap;word-break:break-word;max-height:300px;overflow-y:auto">'
+      +    esc(String(lr.outputPreview).slice(0, 4000)) + '</div></div>';
+  }
+  if (Array.isArray(lr.skillsApplied) && lr.skillsApplied.length) {
+    html += '<div style="font-size:11px;color:var(--text-muted);margin-bottom:6px">Skills active: ' + esc(lr.skillsApplied.map(function(s){ return s.name; }).join(', ')) + '</div>';
+  }
+  if (Array.isArray(lr.mcpServersApplied) && lr.mcpServersApplied.length) {
+    html += '<div style="font-size:11px;color:var(--text-muted);margin-bottom:6px">MCP servers: ' + esc(lr.mcpServersApplied.join(', ')) + '</div>';
+  }
+  html += '<div style="margin-top:14px;display:flex;gap:8px"><button class="btn-sm" onclick="openTraceViewer(\\x27' + jsStr(lr.jobName || editingCronJob || '') + '\\x27)" style="font-size:11px">Open trace</button></div>';
+  html += '</div>';
+  return html;
+}
+
+// Click handler for the green "Run task once" button. Triggers the existing
+// /api/cron/run/:job endpoint and switches to the Last run tab so the user
+// sees the running state. The SSE handler at the bottom of this file picks
+// up cron_complete and re-renders the pane with the result.
+async function runCronOnceFromModal() {
+  if (!editingCronJob) {
+    toast('Save the task first, then Run task once.', 'error');
+    return;
+  }
+  if (_cronRunOnceInFlight) {
+    toast('Already running — wait for the current run to finish.', 'info');
+    return;
+  }
+  if (isCronModalDirty()) {
+    if (!confirm('You have unsaved changes. Run the SAVED version (your edits stay in the form)?')) return;
+  }
+  var btn = document.getElementById('cron-run-once-btn');
+  if (btn) { btn.disabled = true; btn.textContent = 'Triggering…'; }
+  _cronRunOnceInFlight = { jobName: editingCronJob, startedAt: Date.now() };
+  // Show the running state and switch the pane immediately.
+  switchCronTab('lastrun');
+  var pane = document.getElementById('cron-lastrun-body');
+  if (pane) pane.innerHTML = renderCronRunningState(_cronRunOnceInFlight.startedAt);
+  // Tick the elapsed counter once a second.
+  if (_cronRunOnceTickerId) clearInterval(_cronRunOnceTickerId);
+  _cronRunOnceTickerId = setInterval(function() {
+    if (!_cronRunOnceInFlight) { clearInterval(_cronRunOnceTickerId); _cronRunOnceTickerId = null; return; }
+    var elapsedEl = document.getElementById('cron-run-once-elapsed');
+    if (elapsedEl) {
+      var s = Math.max(0, Math.round((Date.now() - _cronRunOnceInFlight.startedAt) / 1000));
+      elapsedEl.textContent = s + 's';
+    }
+  }, 1000);
+  try {
+    var r = await apiFetch('/api/cron/run/' + encodeURIComponent(editingCronJob), { method: 'POST' });
+    var d = await r.json();
+    if (!r.ok || d.ok === false) {
+      toast(d.error || 'Run failed to start', 'error');
+      _cronRunOnceInFlight = null;
+      if (_cronRunOnceTickerId) { clearInterval(_cronRunOnceTickerId); _cronRunOnceTickerId = null; }
+      if (pane) pane.innerHTML = '<div style="padding:36px 24px;color:var(--red);text-align:center;font-size:13px">' + esc(d.error || 'Run failed to start') + '</div>';
+    }
+  } catch (e) {
+    toast('Run failed to start: ' + String(e), 'error');
+    _cronRunOnceInFlight = null;
+    if (_cronRunOnceTickerId) { clearInterval(_cronRunOnceTickerId); _cronRunOnceTickerId = null; }
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = '▶ Run task once'; }
+  }
+}
+
+// Called from the SSE handler when cron_complete fires. The same SSE handler
+// also schedules refreshCron() which updates cronJobsData with the fresh
+// lastRun. We just wait a beat for that, then re-render the pane.
+function handleCronRunOnceComplete(jobName) {
+  if (!_cronRunOnceInFlight || _cronRunOnceInFlight.jobName !== jobName) return;
+  if (_cronRunOnceTickerId) { clearInterval(_cronRunOnceTickerId); _cronRunOnceTickerId = null; }
+  _cronRunOnceInFlight = null;
+  // refreshCron is racing with us; give it ~600ms to land the new entry
+  // into cronJobsData before we read. The SSE handler at line 34927 already
+  // kicks it off when this event arrives.
+  setTimeout(function() {
+    var pane = document.getElementById('cron-lastrun-body');
+    if (!pane) return;
+    var fresh = (Array.isArray(cronJobsData) ? cronJobsData : []).find(function(j) { return j.name === jobName; });
+    var lr = fresh && fresh.lastRun;
+    if (lr) {
+      pane.innerHTML = renderCronRunDetails(lr);
+      toast('Run finished — ' + (lr.status === 'ok' ? 'success' : lr.status), lr.status === 'ok' ? 'success' : 'error');
+    } else {
+      pane.innerHTML = '<div style="padding:36px 24px;color:var(--text-muted);text-align:center;font-size:13px">Run finished but the result is still propagating. Refresh the dashboard to see it.</div>';
+    }
+  }, 600);
+}
 
 // ── Predictable mode: visual card sync + legacy banner ───────────
 function onPredictableChange() {
@@ -24727,6 +24915,11 @@ function openCreateCronModal(agentSlug) {
   // No saved state to preview when creating — disable the Preview tab.
   var previewBtn = document.getElementById('cron-tab-btn-preview');
   if (previewBtn) previewBtn.setAttribute('disabled', 'disabled');
+  // Last run + Run-task-once button only make sense for saved tasks.
+  var lastRunBtn = document.getElementById('cron-tab-btn-lastrun');
+  if (lastRunBtn) lastRunBtn.setAttribute('disabled', 'disabled');
+  var runOnceBtn = document.getElementById('cron-run-once-btn');
+  if (runOnceBtn) runOnceBtn.style.display = 'none';
   var host = document.getElementById('cron-legacy-banner-host');
   if (host) host.innerHTML = '';
   // Reset the "Use a cron expression" link in case it was hidden last time.
@@ -24818,9 +25011,18 @@ function openEditCronModal(jobName) {
   renderTagsPickerChips();
   _pendingAttachments = [];
   loadCronAttachments(jobName);
-  // Existing job has saved state, enable Preview tab.
+  // Existing job has saved state, enable Preview + Last run tabs.
   var previewBtn = document.getElementById('cron-tab-btn-preview');
   if (previewBtn) previewBtn.removeAttribute('disabled');
+  var lastRunBtnEdit = document.getElementById('cron-tab-btn-lastrun');
+  if (lastRunBtnEdit) lastRunBtnEdit.removeAttribute('disabled');
+  // Show "Run task once" only for saved tasks.
+  var runOnceBtnEdit = document.getElementById('cron-run-once-btn');
+  if (runOnceBtnEdit) runOnceBtnEdit.style.display = '';
+  // Render the most recent run from the loaded job into the Last run tab so
+  // the user sees something the moment they switch to it (rather than a
+  // dead empty pane). The pane updates live when Run task once fires.
+  renderCronLastRunPane(job);
   switchCronTab('configure');
   document.getElementById('cron-modal').classList.add('show');
   setTimeout(captureCronModalSnapshot, 0);
@@ -25028,6 +25230,10 @@ function closeCronModal(force) {
   editingCronJob = null;
   _cronPreviewLoadedFor = null;
   _cronModalSnapshot = null;
+  // Clear any pending Run-task-once watch so SSE events for a different job
+  // don't accidentally re-render the (now closed) Last run pane.
+  if (_cronRunOnceTickerId) { clearInterval(_cronRunOnceTickerId); _cronRunOnceTickerId = null; }
+  _cronRunOnceInFlight = null;
   var attachList = document.getElementById('cron-attachments-list');
   if (attachList) attachList.innerHTML = '';
   var bannerHost = document.getElementById('cron-legacy-banner-host');
@@ -34719,6 +34925,11 @@ try {
         refreshActivity();
         if (currentPage === 'build') refreshCron();
         refreshTeamNav();
+        // PRD Phase 1.2: if the user just clicked "Run task once" in the
+        // modal, re-render the Last run pane with the fresh result.
+        if (evt.type === 'cron_complete' && evt.data && evt.data.job && typeof handleCronRunOnceComplete === 'function') {
+          try { handleCronRunOnceComplete(evt.data.job); } catch (err) { /* non-fatal */ }
+        }
       }
       // A delete on one tab should drop the card from every open dashboard
       // without waiting for the next poll. cron_toggled is similar but lighter.
