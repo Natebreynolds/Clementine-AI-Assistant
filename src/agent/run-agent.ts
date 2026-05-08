@@ -140,6 +140,27 @@ function buildRunAgentEnv(): Record<string, string> {
 
 const logger = pino({ name: 'clementine.run-agent' });
 
+/**
+ * Map a sessionKey to the CLEMENTINE_INTERACTION_SOURCE value the MCP
+ * subprocess will read. Mirrors `inferInteractionSource` in assistant.ts
+ * (kept inline here to avoid a circular import — assistant.ts already
+ * imports from this module). Owner-DM-only admin tools like
+ * refresh_tool_inventory / allow_tool / env_set check for exactly
+ * 'owner-dm', so the previous hardcoded 'interactive' value broke them
+ * for every chat session routed through runAgent.
+ */
+function interactionSourceForSession(
+  sessionKey: string | null | undefined,
+  source: string,
+): 'owner-dm' | 'owner-channel' | 'member-channel' | 'autonomous' {
+  if (source === 'cron' || source === 'heartbeat') return 'autonomous';
+  if (!sessionKey) return 'autonomous';
+  if (sessionKey.startsWith('discord:member')) return 'member-channel';
+  if (sessionKey.startsWith('discord:channel:')) return 'owner-channel';
+  if (sessionKey.includes(':')) return 'owner-dm';
+  return 'autonomous';
+}
+
 export interface RunAgentOptions {
   /** Stable session key for this conversation/run. Used for transcript mirroring + resume. */
   sessionKey: string;
@@ -355,7 +376,7 @@ export async function runAgent(prompt: string, opts: RunAgentOptions): Promise<R
         ...subprocessEnv,
         CLEMENTINE_HOME: BASE_DIR,
         ...(opts.profile?.slug ? { CLEMENTINE_TEAM_AGENT: opts.profile.slug } : {}),
-        CLEMENTINE_INTERACTION_SOURCE: source === 'cron' || source === 'heartbeat' ? 'autonomous' : 'interactive',
+        CLEMENTINE_INTERACTION_SOURCE: interactionSourceForSession(opts.sessionKey, source),
       },
     },
     ...(opts.extraMcpServers ?? {}),
