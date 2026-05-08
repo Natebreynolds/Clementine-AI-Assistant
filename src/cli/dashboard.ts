@@ -24882,6 +24882,11 @@ var _runListState = {
   filterTrigger: 'all',    // 'all' | manual | scheduled | after | api | webhook (PRD §6 Run.trigger)
   filterText: '',          // free-text task name match
   activeView: 'failures-24h', // PRD §5.3: which Saved View chip is lit
+  // PRD §5.3 Phase 5.3c / 1.18.100: column sort. Default = startedAt
+  // desc (newest first), what most operators want when triaging.
+  // Restored in 1.18.109 after the parallel agent's edits dropped these.
+  sortBy: 'startedAt',     // 'startedAt' | 'durationMs' | 'totalCostUsd' | 'jobName'
+  sortDir: 'desc',         // 'asc' | 'desc'
   data: [],                // raw runs from /api/cron/runs
 };
 
@@ -24948,8 +24953,57 @@ function _runListSaveView() {
       filterTrigger: _runListState.filterTrigger,
       filterText: _runListState.filterText,
       activeView: _runListState.activeView,
+      sortBy: _runListState.sortBy,
+      sortDir: _runListState.sortDir,
     }));
   } catch (e) { /* ignore */ }
+}
+
+// PRD §5.3 Phase 5.3c / 1.18.100: column sort click handler. Cycle:
+//   click new column → sort by it desc
+//   click same column → flip direction
+//   sort is independent of saved view so users can flip it freely
+//   without dropping out of an active built-in view.
+//
+// (Re-added in 1.18.109 after the parallel agent's edits stripped these
+// functions and broke the Run list — the renderer references them via
+// onclick but they had no definitions on disk.)
+function setRunListSort(col) {
+  if (_runListState.sortBy === col) {
+    _runListState.sortDir = _runListState.sortDir === 'asc' ? 'desc' : 'asc';
+  } else {
+    _runListState.sortBy = col;
+    _runListState.sortDir = col === 'jobName' ? 'asc' : 'desc';
+  }
+  _runListSaveView();
+  var panel = document.getElementById('panel-runs');
+  if (panel) panel.innerHTML = renderRunListBody(_runListState.data);
+}
+
+// Comparator factory for Array.sort. Stable falsy handling: rows missing
+// the field sort to the end regardless of direction so the list doesn't
+// lead with a confusing block of "—" rows.
+function _runListComparator(by, dir) {
+  var sign = dir === 'asc' ? 1 : -1;
+  return function(a, b) {
+    var av = a[by];
+    var bv = b[by];
+    var aMissing = av == null || av === '';
+    var bMissing = bv == null || bv === '';
+    if (aMissing && bMissing) return 0;
+    if (aMissing) return 1;
+    if (bMissing) return -1;
+    if (by === 'startedAt') {
+      av = new Date(av).getTime();
+      bv = new Date(bv).getTime();
+    } else if (by === 'jobName') {
+      av = String(av).toLowerCase();
+      bv = String(bv).toLowerCase();
+    }
+    if (av < bv) return -1 * sign;
+    if (av > bv) return 1 * sign;
+    return 0;
+  };
 }
 
 function applyRunListView(id) {
