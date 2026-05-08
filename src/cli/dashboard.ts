@@ -34126,7 +34126,7 @@ function buildAgentToolRow(cat, tool) {
   var pathHint = (type === 'project' && tool.path) ? ' <span style="color:var(--text-muted);font-size:10px">' + esc(tool.path) + '</span>' : '';
   var statusEl;
   if (setupTarget) {
-    statusEl = '<a class="tt-status ' + statusClass + '" href="#" onclick="event.preventDefault();event.stopPropagation();navigateTo(\'' + setupTarget + '\');hideAgentModal();" style="text-decoration:none"><span class="tt-dot"></span>' + esc(statusLabel) + ' →</a>';
+    statusEl = '<a class="tt-status ' + statusClass + '" href="#" onclick="event.preventDefault();event.stopPropagation();navigateTo(\\x27' + setupTarget + '\\x27);hideAgentModal();" style="text-decoration:none"><span class="tt-dot"></span>' + esc(statusLabel) + ' →</a>';
   } else {
     statusEl = '<span class="tt-status ' + statusClass + '"><span class="tt-dot"></span>' + esc(statusLabel) + '</span>';
   }
