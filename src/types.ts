@@ -506,6 +506,24 @@ export interface CronRunEntry {
   allowedToolsApplied?: string[];
   /** MCP servers live for this run (post profile + trick allowlist intersection). */
   mcpServersApplied?: string[];
+  /** PRD Phase 1: did the run accomplish what it was supposed to?
+   *  Computed at run-end when the Task has successSchema or successCriteriaText.
+   *  - status='pass'      both configured checks passed (or the only one configured did)
+   *  - status='fail'      a configured check failed
+   *  - status='skipped'   no goal configured on the Task (don't show the pill)
+   *  - status='error'     evaluator/validator threw; does NOT mark the run failed
+   *  This is orthogonal to CronRunEntry.status — a run can be status='ok' with
+   *  goalCheck.status='fail' (the agent finished cleanly but didn't accomplish
+   *  the stated goal), and that's the failure mode the PRD is designed to surface. */
+  goalCheck?: {
+    status: 'pass' | 'fail' | 'skipped' | 'error';
+    /** Which evaluators ran. 'both' means schema + evaluator agreed. */
+    mode: 'schema' | 'evaluator' | 'both';
+    schemaPass?: boolean;
+    schemaErrors?: string[];      // ajv error[].message, truncated
+    evaluatorPass?: boolean;
+    evaluatorReason?: string;     // one-sentence reasoning from the evaluator agent
+  };
 }
 
 // ── Config ───────────────────────────────────────────────────────────

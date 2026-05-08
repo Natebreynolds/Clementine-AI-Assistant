@@ -1410,6 +1410,22 @@ export class CronScheduler {
             }
           }
 
+          // PRD Phase 1.1: goal-orientation. If the Task has successSchema or
+          // successCriteriaText, run the evaluator now (before logging) so the
+          // entry carries the goalCheck verdict. Errors here NEVER block
+          // logging — runGoalCheck catches its own throws and emits
+          // status='error' on the goalCheck instead.
+          if (job.successSchema || (job.successCriteriaText && job.successCriteriaText.trim())) {
+            try {
+              const { runGoalCheck } = await import('../agent/goal-evaluator.js');
+              const goalCheck = await runGoalCheck(response ?? '', job);
+              if (goalCheck) entry.goalCheck = goalCheck;
+            } catch (err) {
+              logger.warn({ err, job: job.name }, 'Goal evaluator failed — proceeding without goalCheck');
+              entry.goalCheck = { status: 'error', mode: 'evaluator', evaluatorReason: `evaluator orchestrator threw: ${String(err).slice(0, 200)}` };
+            }
+          }
+
           this._logRun(entry);
           this.logAutonomy('completed', job, { durationMs: entry.durationMs, deliveryFailed: entry.deliveryFailed, advisorApplied: !!advisorApplied });
 
