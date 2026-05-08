@@ -26654,10 +26654,14 @@ async function openPromptHistory() {
       html += '<span style="font-size:11px;color:var(--text-muted)">· by ' + esc(who) + '</span>';
       html += '<span style="flex:1"></span>';
       html += '<button class="btn-sm" onclick="document.getElementById(\\x27' + rowId + '\\x27).style.display=document.getElementById(\\x27' + rowId + '\\x27).style.display===\\x27none\\x27?\\x27block\\x27:\\x27none\\x27" style="font-size:11px;padding:3px 8px">Show full</button>';
+      // PRD §13 Phase 5.0c / 1.18.97: line-level diff vs editor draft.
+      html += '<button class="btn-sm" onclick="togglePromptDiff(\\x27' + rowId + '-diff\\x27,\\x27' + promptB64 + '\\x27)" style="font-size:11px;padding:3px 8px">Show diff</button>';
       html += '<button class="btn-sm btn-primary" onclick="restorePromptVersion(\\x27' + promptB64 + '\\x27)" style="font-size:11px;padding:3px 10px">Restore</button>';
       html += '</div>';
       html += '<div style="font-size:12px;color:var(--text-secondary);line-height:1.5;font-family:\\x27JetBrains Mono\\x27,monospace">' + esc(preview) + (prompt.length > 200 ? '…' : '') + '</div>';
       html += '<pre id="' + rowId + '" style="display:none;margin-top:10px;font-size:11px;font-family:\\x27JetBrains Mono\\x27,monospace;background:var(--bg-tertiary);border:1px solid var(--border);padding:10px;border-radius:6px;white-space:pre-wrap;word-break:break-word;max-height:280px;overflow-y:auto">' + esc(prompt) + '</pre>';
+      // PRD §13 Phase 5.0c / 1.18.97: diff placeholder filled by togglePromptDiff.
+      html += '<div id="' + rowId + '-diff" style="display:none;margin-top:10px;font-size:11px;font-family:\\x27JetBrains Mono\\x27,monospace;background:var(--bg-tertiary);border:1px solid var(--border);padding:10px;border-radius:6px;max-height:320px;overflow-y:auto"></div>';
       html += '</div>';
     }
     list.innerHTML = html;
@@ -26669,6 +26673,78 @@ async function openPromptHistory() {
 function closePromptHistory() {
   var modal = document.getElementById('prompt-history-modal');
   if (modal) modal.classList.remove('show');
+}
+
+// PRD §13 Phase 5.0c / 1.18.97: line-level diff between this version and
+// the editor current prompt text. Uses LCS-based diff. Toggles on click.
+function togglePromptDiff(elemId, promptB64) {
+  var el = document.getElementById(elemId);
+  if (!el) return;
+  if (el.style.display !== 'none') { el.style.display = 'none'; return; }
+  var oldPrompt;
+  try { oldPrompt = decodeURIComponent(escape(atob(promptB64))); }
+  catch (e) { el.innerHTML = '<span style="color:var(--red)">Failed to decode old prompt: ' + esc(String(e)) + '</span>'; el.style.display = 'block'; return; }
+  var ta = document.getElementById('cron-prompt');
+  var newPrompt = ta ? ta.value : '';
+  el.innerHTML = renderPromptDiff(oldPrompt, newPrompt);
+  el.style.display = 'block';
+}
+
+function renderPromptDiff(oldText, newText) {
+  var oldLines = (oldText || '').split('\\n');
+  var newLines = (newText || '').split('\\n');
+  if (oldText === newText) {
+    return '<div style="color:var(--text-muted);font-style:italic">Identical to the current prompt — no changes between this version and now.</div>';
+  }
+  var n = oldLines.length, m = newLines.length;
+  if (n > 1000 || m > 1000) {
+    return '<div style="color:var(--text-muted);font-style:italic">Diff too large to render inline (' + n + ' x ' + m + ' lines). Use Show full to view the old prompt and copy/paste into your favorite diff tool.</div>';
+  }
+  // Build LCS table.
+  var dp = [];
+  for (var i = 0; i <= n; i++) dp.push(new Array(m + 1).fill(0));
+  for (var ii = 1; ii <= n; ii++) {
+    for (var jj = 1; jj <= m; jj++) {
+      if (oldLines[ii - 1] === newLines[jj - 1]) dp[ii][jj] = dp[ii - 1][jj - 1] + 1;
+      else dp[ii][jj] = Math.max(dp[ii - 1][jj], dp[ii][jj - 1]);
+    }
+  }
+  // Walk back to produce ops in reverse.
+  var ops = [];
+  var ri = n, rj = m;
+  while (ri > 0 || rj > 0) {
+    if (ri > 0 && rj > 0 && oldLines[ri - 1] === newLines[rj - 1]) {
+      ops.push({ kind: 'equal', text: oldLines[ri - 1] });
+      ri--; rj--;
+    } else if (rj > 0 && (ri === 0 || dp[ri][rj - 1] >= dp[ri - 1][rj])) {
+      ops.push({ kind: 'add', text: newLines[rj - 1] });
+      rj--;
+    } else {
+      ops.push({ kind: 'remove', text: oldLines[ri - 1] });
+      ri--;
+    }
+  }
+  ops.reverse();
+  var added = 0, removed = 0;
+  for (var oi = 0; oi < ops.length; oi++) {
+    if (ops[oi].kind === 'add') added++;
+    else if (ops[oi].kind === 'remove') removed++;
+  }
+  var html = '<div style="font-size:11px;color:var(--text-muted);margin-bottom:8px">'
+    + '<span style="color:var(--green)">+' + added + '</span> &middot; '
+    + '<span style="color:var(--red)">-' + removed + '</span> &middot; '
+    + 'comparing version above &harr; current editor draft</div>';
+  html += '<div style="white-space:pre-wrap;word-break:break-word;line-height:1.5">';
+  for (var k = 0; k < ops.length; k++) {
+    var op = ops[k];
+    var prefix, color, bg;
+    if (op.kind === 'add') { prefix = '+ '; color = 'var(--green)'; bg = 'rgba(16,185,129,0.08)'; }
+    else if (op.kind === 'remove') { prefix = '- '; color = 'var(--red)'; bg = 'rgba(239,68,68,0.08)'; }
+    else { prefix = '  '; color = 'var(--text-muted)'; bg = 'transparent'; }
+    html += '<div style="color:' + color + ';background:' + bg + ';padding:1px 4px">' + esc(prefix) + esc(op.text || ' ') + '</div>';
+  }
+  html += '</div>';
+  return html;
 }
 
 // Restore copies the old prompt back into the editor's textarea. Doesn't
