@@ -360,6 +360,147 @@ export interface AgentHeartbeatState {
   lastTickKind?: 'acted' | 'quiet' | 'silent' | 'override';
 }
 
+// ── Skills (PRD §SKILLS_FIRST_REDESIGN Phase A / 1.18.106) ───────────
+//
+// Skills are reusable units of work — each one is a markdown file with
+// frontmatter declaring its inputs, allowed tools, data sources, state,
+// and success criterion, plus a procedure body. A trigger (cron) invokes
+// a skill with concrete inputs.
+//
+// File locations (loader checks both, per-project wins on collision):
+//   - global:      ~/.clementine/vault/00-System/skills/<name>.md
+//   - per-project: <work_dir>/.clementine/skills/<name>.md
+//
+// Phase A is READ-ONLY — discover, parse, index. Editing + testing land
+// in Phase B; runtime invocation lands in Phase C. The schema below
+// reflects the v1 spec; the parser also accepts the legacy frontmatter
+// shape (title/triggers/toolsUsed/useCount) that's already in use and
+// flags those files with schemaVersion='legacy' for the migration UI.
+
+/** Source of a skill file — informational, used by the dashboard. */
+export type SkillScope = 'global' | 'project';
+
+/** Whether the file's frontmatter matches the v1 spec or is the
+ *  pre-redesign shape. Drives the "needs migration" badge in the UI. */
+export type SkillSchemaVersion = 'v1' | 'legacy';
+
+/** A typed skill input — backed by JSON Schema. The dashboard form
+ *  generator can derive UI directly from a JSON Schema; ajv validates. */
+export interface SkillInputSchema {
+  type?: 'string' | 'integer' | 'number' | 'boolean' | 'array' | 'object';
+  description?: string;
+  default?: unknown;
+  enum?: unknown[];
+  minimum?: number;
+  maximum?: number;
+  minLength?: number;
+  maxLength?: number;
+  pattern?: string;
+  items?: SkillInputSchema;
+  properties?: Record<string, SkillInputSchema>;
+  required?: string[];
+}
+
+/** Declarative entry describing where a skill reads data from. Surfaced
+ *  in the dashboard's per-skill detail pane and in the Tools & MCP "used
+ *  by" join. Free-form by design — different skills declare different
+ *  data shapes. */
+export interface SkillDataSource {
+  /** A loose identifier — e.g. 'outlook', 'memory', 'vault', 'cli', 'mcp:ElevenLabs'. */
+  kind: string;
+  /** One-line human description — what the skill reads from this source. */
+  purpose: string;
+}
+
+/** Tool allowlist + denylist on a skill. Deny wins on conflict. The
+ *  runtime (Phase C) will refuse to invoke a tool that isn't on allow,
+ *  even if the trigger tries to override. */
+export interface SkillToolPolicy {
+  allow?: string[];
+  deny?: string[];
+}
+
+/** Success criterion. Either schema (ajv-validated against the run's
+ *  structured_output) or criterion (free-text Haiku evaluator). Both =
+ *  both must pass. Mirrors the existing CronJobDefinition shape. */
+export interface SkillSuccess {
+  schema?: SkillInputSchema;
+  criterion?: string;
+}
+
+/** Per-skill caps. A trigger can tighten these but never loosen. */
+export interface SkillLimits {
+  maxTurns?: number;
+  maxBudgetUsd?: number;
+  timeoutSeconds?: number;
+}
+
+/** Parsed frontmatter + computed metadata. Phase A surfaces this whole
+ *  shape in the Skills page detail pane. */
+export interface SkillFrontmatter {
+  /** Skill identifier — derived from filename if absent in frontmatter. */
+  name: string;
+  /** One-line description (matches today's `description:` field). */
+  description?: string;
+  /** Typed parameters the skill accepts at invocation time. */
+  inputs?: Record<string, SkillInputSchema>;
+  /** Tool allowlist + denylist enforced by the runtime. */
+  tools?: SkillToolPolicy;
+  /** Where the skill reads data from — purely declarative. */
+  dataSources?: SkillDataSource[];
+  /** State.* keys this skill owns (others can't touch them). */
+  stateKeys?: string[];
+  /** Success criterion — schema and/or free-text evaluator. */
+  success?: SkillSuccess;
+  /** Caps the trigger can tighten but never loosen. */
+  limits?: SkillLimits;
+  /** Bumped by the user on Publish (Phase B). Phase A surfaces but
+   *  doesn't increment. */
+  version?: number;
+  /** Timestamps captured by the legacy + v1 schemas alike. */
+  createdAt?: string;
+  updatedAt?: string;
+  lastUsed?: string;
+  /** Last time the user clicked "Test this skill" in the dashboard
+   *  (Phase B). Phase A reads but doesn't write. */
+  lastTestPass?: string;
+
+  // ── Legacy fields (pre-redesign frontmatter) — surfaced for the
+  // migration UI in Phase B, not enforced by the runtime. ──
+  /** Legacy: title (use as fallback for display when description missing). */
+  title?: string;
+  /** Legacy: NLP-style trigger phrases. Pre-redesign Clementine matched
+   *  these against incoming chat messages. */
+  triggers?: string[];
+  /** Legacy: 'manual' / 'auto' / 'imported' — provenance label. */
+  source?: string;
+  /** Legacy: tools observed during runs. Informational, not constraint. */
+  toolsUsed?: string[];
+  /** Legacy: incrementing counter of how many runs invoked the skill. */
+  useCount?: number;
+}
+
+/** Resolved skill record — frontmatter + body + computed extras the
+ *  dashboard surfaces (file path, scope, schemaVersion, used-by list). */
+export interface Skill {
+  /** Frontmatter, parsed (or synthesized for files without one). */
+  frontmatter: SkillFrontmatter;
+  /** Markdown body of the skill — the actual procedure. */
+  body: string;
+  /** Absolute path to the source .md file. */
+  filePath: string;
+  /** Whether this skill was loaded from the global pool or a per-project
+   *  override. Per-project wins on name collision. */
+  scope: SkillScope;
+  /** Whether the frontmatter matches the v1 spec or is the pre-redesign
+   *  shape. The Skills page renders a "Schema: legacy" badge accordingly. */
+  schemaVersion: SkillSchemaVersion;
+  /** Used-by join: cron job names that reference this skill. Phase A
+   *  builds this from the legacy `skills:` array on CronJobDefinition;
+   *  Phase C extends it to read the new top-level `skill:` field. */
+  usedByTriggers: string[];
+}
+
 // ── Cron Jobs ────────────────────────────────────────────────────────
 
 export interface CronJobDefinition {
