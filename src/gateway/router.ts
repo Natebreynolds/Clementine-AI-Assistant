@@ -2570,6 +2570,11 @@ export class Gateway {
     return this.assistant.getMcpStatus();
   }
 
+  /** PRD Phase 2.1: thin pass-through for the dashboard's Reconnect button. */
+  invalidateMcpStatus(serverName: string): { servers: Array<{ name: string; status: string }>; updatedAt: string; cleared: boolean } {
+    return this.assistant.invalidateMcpStatus(serverName);
+  }
+
   getPresenceInfo(sessionKey: string): {
     model: string;
     project: string | null;

@@ -949,6 +949,21 @@ export class PersonalAssistant {
     return { servers: this._lastMcpStatus, updatedAt: this._lastMcpStatusTime };
   }
 
+  /**
+   * PRD Phase 2.1: clear the cached status for one server so the next query
+   * repopulates it from a fresh handshake. The SDK manages connections
+   * internally; we don't have a direct "reconnect now" hook, but invalidating
+   * the cached entry tells the dashboard to render 'pending' and resets any
+   * stale error/auth state. Returns the post-clear cached snapshot.
+   */
+  invalidateMcpStatus(serverName: string): { servers: Array<{ name: string; status: string }>; updatedAt: string; cleared: boolean } {
+    const beforeLen = this._lastMcpStatus.length;
+    this._lastMcpStatus = this._lastMcpStatus.filter((s) => s.name !== serverName);
+    const cleared = this._lastMcpStatus.length < beforeLen;
+    if (cleared) this._lastMcpStatusTime = new Date().toISOString();
+    return { servers: this._lastMcpStatus, updatedAt: this._lastMcpStatusTime, cleared };
+  }
+
   /** Inject a background work result into the session as silent follow-up context. */
   injectPendingContext(sessionKey: string, userPrompt: string, result: string): void {
     const pending = this.pendingContext.get(sessionKey) ?? [];

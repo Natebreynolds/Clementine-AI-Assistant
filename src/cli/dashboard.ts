@@ -9149,6 +9149,28 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
     res.json(gw.getMcpStatus());
   }));
 
+  // PRD Phase 2.1: Reconnect a single MCP server. Clears the cached status so
+  // the next query handshake repopulates it. The SDK doesn't expose a direct
+  // reconnect call, so this is the closest equivalent: kick the cache.
+  app.post('/api/mcp-servers/:name/reconnect', gwHandler(async (gw, req, res) => {
+    const rawName = req.params.name;
+    const name = Array.isArray(rawName) ? rawName[0] : rawName;
+    if (!name) { res.status(400).json({ ok: false, error: 'name required' }); return; }
+    try {
+      const result = gw.invalidateMcpStatus(String(name));
+      res.json({
+        ok: true,
+        cleared: result.cleared,
+        message: result.cleared
+          ? `Reconnect queued for "${name}" — status will refresh on the next query.`
+          : `"${name}" had no cached status to clear; next query will populate it.`,
+        status: result,
+      });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: String(err) });
+    }
+  }));
+
   // ── Self-Improvement API ─────────────────────────────────────────
 
   // ── MCP Server Management API ───────────────────────────────────────
@@ -20147,6 +20169,77 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
 
 <!-- (legacy standalone Preview modal removed in 1.18.70 — preview now lives as a tab inside the cron modal) -->
 
+<!-- ═══ MCP Server Edit Modal — PRD Phase 2.1 ═══ -->
+<div class="modal-overlay" id="mcp-edit-modal">
+  <div class="modal" style="max-width:640px;width:96vw">
+    <div class="modal-header">
+      <h3 id="mcp-edit-title">Edit MCP Server</h3>
+      <button class="btn-ghost btn-sm" onclick="closeMcpServerEditModal()">&times;</button>
+    </div>
+    <div class="modal-body" style="padding:18px">
+      <div id="mcp-edit-readonly-note" style="display:none;margin-bottom:14px;padding:10px 12px;border-radius:6px;background:rgba(245,158,11,0.10);border:1px solid rgba(245,158,11,0.30);color:var(--yellow);font-size:12px">
+        ⚠ Auto-detected server. Edits to this config aren't persisted by Clementine — change it in the source file (Claude Desktop config, Claude Code settings, or extensions). Use the toggle on the catalog card to enable/disable.
+      </div>
+      <div class="form-group">
+        <label class="form-label">Name</label>
+        <input type="text" id="mcp-edit-name">
+        <div class="form-hint">Identifier — cannot be renamed via this dialog.</div>
+      </div>
+      <div class="form-row">
+        <div class="form-group">
+          <label class="form-label">Transport</label>
+          <select id="mcp-edit-type" onchange="syncMcpEditTransportRows()">
+            <option value="stdio">stdio (local process)</option>
+            <option value="http">http</option>
+            <option value="sse">sse</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label class="form-label" style="display:flex;align-items:center;gap:8px">
+            <input type="checkbox" id="mcp-edit-enabled"> Enabled
+          </label>
+          <div class="form-hint">Disable to remove this server from every task without deleting it.</div>
+        </div>
+      </div>
+      <div class="form-group">
+        <label class="form-label">Description</label>
+        <input type="text" id="mcp-edit-description" placeholder="What this server does">
+      </div>
+      <!-- stdio-only fields -->
+      <div id="mcp-edit-stdio-rows">
+        <div class="form-group">
+          <label class="form-label">Command</label>
+          <input type="text" id="mcp-edit-command" placeholder="e.g. npx, python, ./bin/server">
+        </div>
+        <div class="form-group">
+          <label class="form-label">Args <span style="color:var(--text-muted);font-weight:normal">(one per line)</span></label>
+          <textarea id="mcp-edit-args" rows="3" placeholder="--port&#10;3001" style="font-family:'JetBrains Mono',monospace;font-size:11px"></textarea>
+        </div>
+        <div class="form-group">
+          <label class="form-label">Env <span style="color:var(--text-muted);font-weight:normal">(JSON object, optional)</span></label>
+          <textarea id="mcp-edit-env" rows="3" placeholder='{ "API_KEY": "..." }' style="font-family:'JetBrains Mono',monospace;font-size:11px"></textarea>
+        </div>
+      </div>
+      <!-- http/sse fields -->
+      <div id="mcp-edit-http-rows" style="display:none">
+        <div class="form-group">
+          <label class="form-label">URL</label>
+          <input type="text" id="mcp-edit-url" placeholder="https://example.com/mcp">
+        </div>
+        <div class="form-group">
+          <label class="form-label">Headers <span style="color:var(--text-muted);font-weight:normal">(JSON object, optional)</span></label>
+          <textarea id="mcp-edit-headers" rows="3" placeholder='{ "Authorization": "Bearer ..." }' style="font-family:'JetBrains Mono',monospace;font-size:11px"></textarea>
+        </div>
+      </div>
+    </div>
+    <div class="modal-footer">
+      <span style="flex:1"></span>
+      <button onclick="closeMcpServerEditModal()">Close</button>
+      <button class="btn-primary" id="mcp-edit-save" onclick="saveMcpServerEdit()">Save</button>
+    </div>
+  </div>
+</div>
+
 <!-- ═══ Goal Modal ═══ -->
 <div class="modal-overlay" id="goal-modal">
   <div class="modal" style="width:520px">
@@ -23505,12 +23598,157 @@ function renderMcpCatalogCard(server, statusMap) {
     + (server.description ? '<div style="font-size:12px;color:var(--text-secondary);line-height:1.45">' + esc(String(server.description).slice(0, 240)) + '</div>' : '')
     + (lastError ? '<div style="font-size:11px;color:var(--red);background:rgba(239,68,68,0.06);padding:6px 8px;border-radius:4px;word-break:break-word">' + esc(String(lastError).slice(0, 200)) + '</div>' : '')
     + (lastChecked ? '<div style="font-size:11px;color:var(--text-muted)">Checked ' + esc(timeAgo(lastChecked)) + '</div>' : '')
-    +   '<div style="display:flex;gap:6px;margin-top:4px">'
+    +   '<div style="display:flex;gap:6px;margin-top:4px;flex-wrap:wrap">'
     +     '<button class="btn-sm" onclick="toggleMcpServerEnabled(\\x27' + jsStr(name) + '\\x27,' + (enabled ? 'false' : 'true') + ')" title="' + (enabled ? 'Disable this MCP server for all tasks' : 'Enable this MCP server') + '">' + (enabled ? 'Disable' : 'Enable') + '</button>'
-    +     '<button class="btn-sm" disabled title="Edit + Reconnect coming in the next slice" style="opacity:0.55;cursor:not-allowed">Edit</button>'
+    +     '<button class="btn-sm" onclick="reconnectMcpServer(\\x27' + jsStr(name) + '\\x27)" title="Clear cached status — next query will reconnect">Reconnect</button>'
+    +     '<button class="btn-sm" onclick="openMcpServerEditModal(\\x27' + jsStr(name) + '\\x27)" title="View or edit this server\\x27s config">Edit</button>'
     +   '</div>'
     + '</div>';
   return html;
+}
+
+// PRD Phase 2.1: Reconnect — invalidate cached status server-side, refresh
+// the catalog so the user sees the pending pill until the next query
+// handshake repopulates it.
+async function reconnectMcpServer(name) {
+  try {
+    var r = await apiFetch('/api/mcp-servers/' + encodeURIComponent(name) + '/reconnect', { method: 'POST' });
+    var d = await r.json();
+    if (!r.ok || d.ok === false) {
+      toast('Reconnect failed: ' + (d.error || 'unknown'), 'error');
+      return;
+    }
+    toast(d.message || 'Reconnect queued.', 'info');
+    refreshToolsMcpCatalog();
+  } catch (e) {
+    toast('Reconnect failed: ' + String(e), 'error');
+  }
+}
+
+// PRD Phase 2.1: Edit modal. User-managed servers get an editable config
+// form; auto-detected servers render the same fields read-only with a note
+// pointing the user at the underlying config file.
+async function openMcpServerEditModal(name) {
+  // Pull the latest server config — don't trust whatever was on the rendered card.
+  var server;
+  try {
+    var r = await apiFetch('/api/mcp-servers');
+    var d = await r.json();
+    server = (d && d.servers || []).find(function(s) { return s.name === name; });
+  } catch (e) {
+    toast('Failed to load server: ' + String(e), 'error');
+    return;
+  }
+  if (!server) { toast('Server "' + name + '" not found', 'error'); return; }
+  var modal = document.getElementById('mcp-edit-modal');
+  if (!modal) { toast('Edit modal missing from DOM', 'error'); return; }
+  document.getElementById('mcp-edit-title').textContent = 'Edit: ' + name;
+  var roNote = document.getElementById('mcp-edit-readonly-note');
+  var isReadOnly = server.source === 'auto-detected';
+  if (roNote) roNote.style.display = isReadOnly ? '' : 'none';
+  // Set fields
+  document.getElementById('mcp-edit-name').value = server.name || '';
+  document.getElementById('mcp-edit-name').disabled = true;  // never rename via this path
+  document.getElementById('mcp-edit-type').value = server.type || 'stdio';
+  document.getElementById('mcp-edit-type').disabled = isReadOnly;
+  document.getElementById('mcp-edit-description').value = server.description || '';
+  document.getElementById('mcp-edit-description').disabled = isReadOnly;
+  document.getElementById('mcp-edit-enabled').checked = server.enabled !== false;
+  document.getElementById('mcp-edit-enabled').disabled = isReadOnly;
+  document.getElementById('mcp-edit-command').value = server.command || '';
+  document.getElementById('mcp-edit-command').disabled = isReadOnly;
+  document.getElementById('mcp-edit-args').value = Array.isArray(server.args) ? server.args.join('\\n') : '';
+  document.getElementById('mcp-edit-args').disabled = isReadOnly;
+  document.getElementById('mcp-edit-url').value = server.url || '';
+  document.getElementById('mcp-edit-url').disabled = isReadOnly;
+  document.getElementById('mcp-edit-headers').value = server.headers && Object.keys(server.headers).length ? JSON.stringify(server.headers, null, 2) : '';
+  document.getElementById('mcp-edit-headers').disabled = isReadOnly;
+  document.getElementById('mcp-edit-env').value = server.env && Object.keys(server.env).length ? JSON.stringify(server.env, null, 2) : '';
+  document.getElementById('mcp-edit-env').disabled = isReadOnly;
+  // Show the right transport fields
+  syncMcpEditTransportRows();
+  // Save button hidden for read-only auto-detected servers.
+  var saveBtn = document.getElementById('mcp-edit-save');
+  if (saveBtn) saveBtn.style.display = isReadOnly ? 'none' : '';
+  modal.classList.add('show');
+}
+
+function closeMcpServerEditModal() {
+  var modal = document.getElementById('mcp-edit-modal');
+  if (modal) modal.classList.remove('show');
+}
+
+// Show only the row matching the selected transport (stdio vs http/sse).
+function syncMcpEditTransportRows() {
+  var t = (document.getElementById('mcp-edit-type') || {}).value || 'stdio';
+  var stdioRow = document.getElementById('mcp-edit-stdio-rows');
+  var httpRow = document.getElementById('mcp-edit-http-rows');
+  if (stdioRow) stdioRow.style.display = (t === 'stdio') ? '' : 'none';
+  if (httpRow) httpRow.style.display = (t === 'http' || t === 'sse') ? '' : 'none';
+}
+
+async function saveMcpServerEdit() {
+  var name = (document.getElementById('mcp-edit-name') || {}).value;
+  if (!name) return;
+  var type = document.getElementById('mcp-edit-type').value;
+  var description = document.getElementById('mcp-edit-description').value.trim();
+  var enabled = !!document.getElementById('mcp-edit-enabled').checked;
+  var commandRaw = document.getElementById('mcp-edit-command').value.trim();
+  var argsRaw = document.getElementById('mcp-edit-args').value;
+  var url = document.getElementById('mcp-edit-url').value.trim();
+  var headersRaw = document.getElementById('mcp-edit-headers').value.trim();
+  var envRaw = document.getElementById('mcp-edit-env').value.trim();
+
+  var headers, env;
+  if (headersRaw) {
+    try {
+      headers = JSON.parse(headersRaw);
+      if (!headers || typeof headers !== 'object' || Array.isArray(headers)) throw new Error('Headers must be a JSON object');
+    } catch (e) {
+      toast('Headers JSON invalid: ' + (e.message || String(e)), 'error');
+      document.getElementById('mcp-edit-headers').focus();
+      return;
+    }
+  }
+  if (envRaw) {
+    try {
+      env = JSON.parse(envRaw);
+      if (!env || typeof env !== 'object' || Array.isArray(env)) throw new Error('Env must be a JSON object');
+    } catch (e) {
+      toast('Env JSON invalid: ' + (e.message || String(e)), 'error');
+      document.getElementById('mcp-edit-env').focus();
+      return;
+    }
+  }
+  var args = argsRaw.split(/\\r?\\n/).map(function(s){ return s.trim(); }).filter(Boolean);
+  var body = { type: type, description: description, enabled: enabled };
+  if (type === 'stdio') {
+    if (!commandRaw) { toast('Command is required for stdio transport', 'error'); document.getElementById('mcp-edit-command').focus(); return; }
+    body.command = commandRaw;
+    body.args = args;
+    if (env) body.env = env;
+  } else {
+    if (!url) { toast('URL is required for ' + type + ' transport', 'error'); document.getElementById('mcp-edit-url').focus(); return; }
+    body.url = url;
+    if (headers) body.headers = headers;
+  }
+  try {
+    var r = await apiFetch('/api/mcp-servers/' + encodeURIComponent(name), {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    var d = await r.json();
+    if (!r.ok || d.error) {
+      toast('Save failed: ' + (d.error || 'unknown'), 'error');
+      return;
+    }
+    toast('Saved.', 'success');
+    closeMcpServerEditModal();
+    refreshToolsMcpCatalog();
+  } catch (e) {
+    toast('Save failed: ' + String(e), 'error');
+  }
 }
 
 // PUT helper for the Toggle button. Lazy: re-fetches the catalog after
