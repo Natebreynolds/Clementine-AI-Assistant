@@ -24668,11 +24668,30 @@ function renderRunListBody(allRuns) {
     html += '<div class="empty-state" style="padding:36px 24px;text-align:center;color:var(--text-muted)"><div style="font-size:14px;margin-bottom:6px">No runs match the current filter.</div><div style="font-size:12px">Try widening the time window or clearing the task-name filter.</div></div>';
     return html;
   }
+  // PRD §5.3 Phase 5.3c / 1.18.99: column sort. Apply the current
+  // sortBy/sortDir AFTER filtering so users see the natural ordering of
+  // their narrowed dataset. Stable: missing values sort to the end.
+  filtered.sort(_runListComparator(_runListState.sortBy, _runListState.sortDir));
   // Table — same shape as the Recent History list on the Tasks page,
-  // but sortable and with a Trigger + Cost column.
+  // but sortable and with a Trigger + Cost column. Helper renders an
+  // active-state arrow when a column is the current sortBy target.
+  function sortHdr(col, label, title) {
+    var active = _runListState.sortBy === col;
+    var arrow = active ? (_runListState.sortDir === 'asc' ? ' ↑' : ' ↓') : '';
+    var titleAttr = title ? ' title="' + esc(title) + '"' : '';
+    var color = active ? 'var(--text-primary)' : 'var(--text-muted)';
+    return '<div' + titleAttr + ' onclick="setRunListSort(\\x27' + jsStr(col) + '\\x27)" style="cursor:pointer;color:' + color + ';user-select:none">' + esc(label) + esc(arrow) + '</div>';
+  }
   html += '<div style="background:var(--bg-secondary);border:1px solid var(--border);border-radius:var(--radius)">';
   html += '<div style="display:grid;grid-template-columns:24px 24px minmax(180px,1.2fr) 80px minmax(160px,1fr) 70px 70px auto;gap:10px;padding:8px 14px;border-bottom:1px solid var(--border);font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.04em;font-weight:500">'
-    +    '<div></div><div title="Goal verdict">Goal</div><div>Task</div><div>Trigger</div><div>Started</div><div>Duration</div><div title="Total cost in USD">Cost</div><div></div>'
+    +    '<div></div>'
+    +    '<div title="Goal verdict">Goal</div>'
+    +    sortHdr('jobName', 'Task', 'Click to sort by name')
+    +    '<div>Trigger</div>'
+    +    sortHdr('startedAt', 'Started', 'Click to sort by start time')
+    +    sortHdr('durationMs', 'Duration', 'Click to sort by duration')
+    +    sortHdr('totalCostUsd', 'Cost', 'Click to sort by cost')
+    +    '<div></div>'
     + '</div>';
   for (var i = 0; i < filtered.length; i++) {
     var entry = filtered[i] || {};
