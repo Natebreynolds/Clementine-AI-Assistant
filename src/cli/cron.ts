@@ -174,6 +174,11 @@ export async function cmdCronRun(jobName: string): Promise<void> {
     // by the dashboard's manual-run endpoint. Defaults to 'scheduled' for
     // any other invocation path (CLI, daemon-internal callsites).
     const trigger = (process.env.CRON_RUN_TRIGGER as CronRunEntry['trigger']) || 'scheduled';
+    // 1.18.85: pull the run UUID from the gateway's per-run metadata
+    // side-channel. runAgent stamps it; consume here to link CronRunEntry
+    // to the Event store.
+    const sideChannel = gateway.consumeLastCronRunMetadata?.();
+    const runIdFromGateway = sideChannel?.runId;
     const entry: CronRunEntry = {
       jobName: job.name,
       startedAt: startedAt.toISOString(),
@@ -183,6 +188,7 @@ export async function cmdCronRun(jobName: string): Promise<void> {
       attempt: 1,
       outputPreview: response ? response.slice(0, 200) : undefined,
       trigger,
+      ...(runIdFromGateway ? { id: runIdFromGateway } : {}),
     };
 
     // PRD Phase 1.1: goal-orientation evaluator (mirrors the daemon path).

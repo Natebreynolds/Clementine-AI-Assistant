@@ -5496,6 +5496,26 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
     }
   });
 
+  // ── PRD Phase 4a / 1.18.85: per-run Event store reader ─────────
+  // Returns every event captured by path A (in-process tap in runAgent)
+  // for one run. Used by the new Run detail page (Phase 4b).
+  app.get('/api/runs/:runId/events', async (req, res) => {
+    try {
+      const rawId = req.params.runId;
+      const runId = Array.isArray(rawId) ? rawId[0] : rawId;
+      if (!runId || typeof runId !== 'string') {
+        res.status(400).json({ ok: false, error: 'runId required' });
+        return;
+      }
+      const { EventLog } = await import('../gateway/event-log.js');
+      const log = new EventLog();
+      const events = log.readByRun(runId);
+      res.json({ ok: true, runId, events });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: String(err) });
+    }
+  });
+
   // ── Recent runs across ALL cron jobs ───────────────────────────
   // Powers the "Recent History" zone on the Tasks page. Returns the most
   // recent N CronRunEntry rows merged from every per-job .jsonl, sorted
@@ -6511,6 +6531,21 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
       if (purge) {
         const safe = bareJobName.replace(/[^a-zA-Z0-9_-]/g, '_');
         const runLog = path.join(BASE_DIR, 'cron', 'runs', `${safe}.jsonl`);
+        // Read run UUIDs BEFORE we drop the run log — the Event store is
+        // keyed by run UUID, not by job name, so the only way to know which
+        // event files to delete is by reading the JSONL first.
+        const runIdsToPurge: string[] = [];
+        try {
+          if (existsSync(runLog)) {
+            const lines = readFileSync(runLog, 'utf-8').trim().split('\n').filter(Boolean);
+            for (const l of lines) {
+              try {
+                const entry = JSON.parse(l);
+                if (entry && typeof entry.id === 'string' && entry.id) runIdsToPurge.push(entry.id);
+              } catch { /* skip malformed */ }
+            }
+          }
+        } catch { /* non-fatal */ }
         try {
           if (existsSync(runLog)) { unlinkSync(runLog); purged.push('runs.jsonl'); }
         } catch { /* non-fatal */ }
@@ -6522,6 +6557,24 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
               try { unlinkSync(path.join(traceDir, f)); } catch { /* skip */ }
             }
             if (traceFiles.length > 0) purged.push(`${traceFiles.length} trace${traceFiles.length === 1 ? '' : 's'}`);
+          }
+        } catch { /* non-fatal */ }
+        // PRD Phase 4a / 1.18.85: drop the new Event store entries linked
+        // to this job's runs. One file per run UUID.
+        try {
+          if (runIdsToPurge.length > 0) {
+            const eventsDir = path.join(BASE_DIR, 'events');
+            if (existsSync(eventsDir)) {
+              let dropped = 0;
+              for (const rid of runIdsToPurge) {
+                const safeRid = String(rid).replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 128);
+                const evtFile = path.join(eventsDir, `${safeRid}.jsonl`);
+                try {
+                  if (existsSync(evtFile)) { unlinkSync(evtFile); dropped++; }
+                } catch { /* skip */ }
+              }
+              if (dropped > 0) purged.push(`${dropped} event log${dropped === 1 ? '' : 's'}`);
+            }
           }
         } catch { /* non-fatal */ }
         try {
