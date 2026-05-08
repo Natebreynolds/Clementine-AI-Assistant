@@ -2684,124 +2684,6 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
     res.json({ hash: currentHash, started: buildHash, needsRestart });
   });
 
-  // ── Batch init — single request for all page-load data ───────────
-  // Eliminates 12+ concurrent requests that were saturating the event loop.
-  app.get('/api/init', async (_req, res) => {
-    try {
-      const result: Record<string, unknown> = {};
-
-      // Version
-      let currentHash = buildHash;
-      try {
-        const currentMtime = String(Math.floor(statSync(distDashboard).mtimeMs));
-        const gitHash = execSync('git rev-parse --short HEAD', { cwd: PACKAGE_ROOT, encoding: 'utf-8', timeout: 3000 }).trim();
-        currentHash = gitHash + '-' + currentMtime;
-      } catch { try { currentHash = String(Math.floor(statSync(distDashboard).mtimeMs)); } catch { /* use cached */ } }
-      result.version = { hash: currentHash, started: buildHash, needsRestart: currentHash !== buildHash };
-
-      // Status
-      result.status = getStatus();
-
-      // Activity (default: no filters, limit 50)
-      try {
-        result.activity = cached('activity::::', 5_000, () => {
-          const events: Array<Record<string, unknown>> = [];
-          const runsDir = path.join(BASE_DIR, 'cron', 'runs');
-          if (existsSync(runsDir)) {
-            const files = readdirSync(runsDir).filter(f => f.endsWith('.jsonl'));
-            for (const file of files) {
-              const jobName = file.replace('.jsonl', '');
-              const colonIdx = jobName.indexOf(':');
-              const slug = colonIdx > 0 ? jobName.substring(0, colonIdx) : null;
-              const filePath = path.join(runsDir, file);
-              try {
-                const lines = readFileSync(filePath, 'utf-8').trim().split('\n').filter(Boolean);
-                for (const line of lines.slice(-10)) {
-                  try {
-                    const entry = JSON.parse(line);
-                    events.push({
-                      source: 'cron', eventType: 'cron_run', agentSlug: slug,
-                      title: jobName, body: entry.summary ?? '', timestamp: entry.timestamp ?? '',
-                      status: entry.success ? 'success' : 'error',
-                    });
-                  } catch { /* skip */ }
-                }
-              } catch { /* skip */ }
-            }
-          }
-          events.sort((a, b) => String(b.timestamp).localeCompare(String(a.timestamp)));
-          return { events: events.slice(0, 50) };
-        });
-      } catch { result.activity = { events: [] }; }
-
-      try { result.metrics = computeMetrics(); } catch { result.metrics = {}; }
-
-      try {
-        const today = new Date();
-        const dateStr = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}`;
-        const planPath = path.join(PLANS_DIR, `${dateStr}.json`);
-        result.plan = existsSync(planPath) ? { ok: true, plan: JSON.parse(readFileSync(planPath, 'utf-8')) } : { ok: false, plan: null };
-      } catch { result.plan = { ok: false, plan: null }; }
-
-      try {
-
-        result.mcpServers = { servers: discoverMcpServers() };
-      } catch { result.mcpServers = { servers: [] }; }
-
-      try {
-
-        result.claudeIntegrations = { integrations: getClaudeIntegrations() };
-      } catch { result.claudeIntegrations = { integrations: [] }; }
-
-      result.projects = { projects: cachedProjects ?? [] };
-
-      //
-      try {
-        const agDir = AGENTS_DIR;
-        const mgr = new AgentManager(agDir);
-        const allAgents = mgr.listAll();
-
-        // Bot statuses from disk
-        let botStatuses: Record<string, any> = {};
-        try { const p = path.join(BASE_DIR, '.bot-status.json'); if (existsSync(p)) botStatuses = JSON.parse(readFileSync(p, 'utf-8')); } catch { /* */ }
-        let slackStatuses: Record<string, any> = {};
-        try { const p = path.join(BASE_DIR, '.slack-bot-status.json'); if (existsSync(p)) slackStatuses = JSON.parse(readFileSync(p, 'utf-8')); } catch { /* */ }
-
-        const statusData = getStatus();
-        result.office = {
-          clementine: {
-            name: statusData.name,
-            status: statusData.alive ? 'online' : 'offline',
-            uptime: statusData.uptime || '',
-            currentActivity: statusData.currentActivity || 'Idle',
-            channels: statusData.channels || [],
-            sessions: { active: 0, totalExchanges: 0 },
-            crons: { total: 0, runsToday: 0, successRate: 100, jobs: [] },
-            tokens: { input: 0, output: 0 },
-          },
-          agents: allAgents.map(a => ({
-            slug: a.slug,
-            name: a.name,
-            description: a.description,
-            status: a.status ?? 'active',
-            avatar: a.avatar ?? null,
-            model: a.model ?? null,
-            project: a.project ?? null,
-            agentDir: mgr.getAgentDir(a.slug),
-            botStatus: botStatuses[a.slug]?.status ?? null,
-            slackBotStatus: slackStatuses[a.slug]?.status ?? null,
-            sessions: { active: 0, totalExchanges: 0 },
-            crons: { total: 0, runsToday: 0, successRate: 100, jobs: [] },
-            tokens: { input: 0, output: 0 },
-          })),
-        };
-      } catch { result.office = { clementine: { name: 'Clementine', status: 'offline' }, agents: [] }; }
-
-      res.json(result);
-    } catch (err) {
-      res.status(500).json({ error: String(err) });
-    }
-  });
 
   app.get('/api/status', (_req, res) => {
     res.json(getStatus());
@@ -6637,16 +6519,9 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
 
   // ── CRON CRUD routes ──────────────────────────────────────────
 
-  app.get('/api/projects', (_req, res) => {
-    try {
-      // Use background-scanned projects — sync scanning blocks the event loop
-      const projects = cachedProjects ?? [];
-      const merged = projects;
-      res.json({ projects: merged });
-    } catch (err) {
-      res.status(500).json({ error: String(err) });
-    }
-  });
+  // (Dead duplicate /api/projects handler removed in 1.18.113 — first
+  //  registration at line 6183 is the live one; Express ignores later
+  //  same-method same-path registrations.)
 
   app.post('/api/projects/link', (req, res) => {
     try {
@@ -10029,68 +9904,6 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
     }
   });
 
-  app.get('/api/skills', async (_req, res) => {
-    try {
-      const skillsDir = path.join(VAULT_DIR, '00-System', 'skills');
-      if (!existsSync(skillsDir)) { res.json({ skills: [] }); return; }
-
-      // Aggregate last-7-day retrieval stats from skill_usage table (best-effort).
-      const usageStats = new Map<string, { retrievals7d: number; lastRetrievedAt: string | null; avgScore: number | null }>();
-      if (existsSync(MEMORY_DB_PATH)) {
-        try {
-          const Database = (await import('better-sqlite3')).default;
-          const db = new Database(MEMORY_DB_PATH, { readonly: true });
-          try {
-            const rows = db.prepare(
-              `SELECT skill_name,
-                      COUNT(*) AS retrievals,
-                      MAX(retrieved_at) AS last_retrieved_at,
-                      AVG(score) AS avg_score
-               FROM skill_usage
-               WHERE retrieved_at >= datetime('now', '-7 days')
-               GROUP BY skill_name`,
-            ).all() as Array<{ skill_name: string; retrievals: number; last_retrieved_at: string | null; avg_score: number | null }>;
-            for (const r of rows) {
-              usageStats.set(r.skill_name, {
-                retrievals7d: r.retrievals,
-                lastRetrievedAt: r.last_retrieved_at,
-                avgScore: r.avg_score,
-              });
-            }
-          } catch { /* skill_usage may not exist on older DBs */ }
-          db.close();
-        } catch { /* non-fatal */ }
-      }
-
-      const files = readdirSync(skillsDir).filter(f => f.endsWith('.md'));
-      const skills = files.map(f => {
-        try {
-          const parsed = matter(readFileSync(path.join(skillsDir, f), 'utf-8'));
-          const name = f.replace('.md', '');
-          const stats = usageStats.get(name);
-          return {
-            name,
-            title: parsed.data.title ?? f,
-            description: parsed.data.description ?? '',
-            source: parsed.data.source ?? 'unknown',
-            sourceJob: parsed.data.sourceJob ?? null,
-            triggers: parsed.data.triggers ?? [],
-            toolsUsed: parsed.data.toolsUsed ?? [],
-            useCount: parsed.data.useCount ?? 0,
-            lastUsed: parsed.data.lastUsed ?? null,
-            createdAt: parsed.data.createdAt ?? '',
-            updatedAt: parsed.data.updatedAt ?? '',
-            retrievals7d: stats?.retrievals7d ?? 0,
-            lastRetrievedAt: stats?.lastRetrievedAt ?? null,
-            avgScore: stats?.avgScore ?? null,
-          };
-        } catch { return null; }
-      }).filter(Boolean);
-      res.json({ skills });
-    } catch (err) {
-      res.status(500).json({ error: String(err) });
-    }
-  });
 
   app.post('/api/skills', (req, res) => {
     try {
@@ -10133,53 +9946,6 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
     }
   });
 
-  app.get('/api/skills/:name', (req, res) => {
-    try {
-      // Check agent-scoped first (via query param), then global
-      const agentSlug = req.query.agent as string | undefined;
-      let filePath: string;
-      let skillDir: string;
-      if (agentSlug) {
-        const agentPath = path.join(VAULT_DIR, '00-System', 'agents', agentSlug, 'skills', `${req.params.name}.md`);
-        if (existsSync(agentPath)) {
-          filePath = agentPath;
-          skillDir = path.join(VAULT_DIR, '00-System', 'agents', agentSlug, 'skills');
-        } else {
-          filePath = path.join(VAULT_DIR, '00-System', 'skills', `${req.params.name}.md`);
-          skillDir = path.join(VAULT_DIR, '00-System', 'skills');
-        }
-      } else {
-        filePath = path.join(VAULT_DIR, '00-System', 'skills', `${req.params.name}.md`);
-        skillDir = path.join(VAULT_DIR, '00-System', 'skills');
-      }
-      if (!existsSync(filePath)) { res.status(404).json({ error: 'Skill not found' }); return; }
-      const matterMod = require('gray-matter');
-      const parsed = matterMod(readFileSync(filePath, 'utf-8'));
-
-      // Extract steps from content (after "## Procedure" heading)
-      const procMatch = parsed.content.match(/## Procedure\s*\n([\s\S]*)/);
-      const steps = procMatch ? procMatch[1].trim() : parsed.content.trim();
-
-      // Load attachment file list with base64 content for builder reload
-      const attachments: Array<{ filename: string; content: string; size: number }> = [];
-      const filesDir = path.join(skillDir, `${req.params.name}.files`);
-      if (existsSync(filesDir)) {
-        for (const f of readdirSync(filesDir)) {
-          try {
-            const fp = path.join(filesDir, f);
-            const stat = statSync(fp);
-            if (stat.isFile() && stat.size < 10 * 1024 * 1024) {
-              attachments.push({ filename: f, content: readFileSync(fp).toString('base64'), size: stat.size });
-            }
-          } catch { /* skip */ }
-        }
-      }
-
-      res.json({ ...parsed.data, name: req.params.name, content: parsed.content, steps, attachmentFiles: attachments });
-    } catch (err) {
-      res.status(500).json({ error: String(err) });
-    }
-  });
 
   // ── Agent-scoped Skills ──
   app.get('/api/agents/:slug/skills', (req, res) => {
@@ -13356,123 +13122,6 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
   }
 
   /* Right rail */
-  .home-rail {
-    display: flex;
-    flex-direction: column;
-    gap: 8px;
-    overflow-y: auto;
-    position: relative;
-  }
-  .home-rail.collapsed {
-    display: none;
-  }
-  /* Auto-hide cards that have no actionable content (set via JS toggling .rail-card.empty) */
-  .rail-card.empty { display: none; }
-  .rail-collapse-btn {
-    position: absolute;
-    top: -4px;
-    right: -4px;
-    background: none;
-    border: 1px solid var(--border);
-    color: var(--text-muted);
-    width: 22px;
-    height: 22px;
-    border-radius: 50%;
-    cursor: pointer;
-    font-size: 14px;
-    display: none;
-    align-items: center;
-    justify-content: center;
-    z-index: 5;
-  }
-  .rail-card {
-    background: var(--bg-card);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-md);
-    overflow: hidden;
-    box-shadow: var(--shadow-xs);
-  }
-  .rail-header {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: 8px 12px;
-    font-size: var(--text-xs);
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.04em;
-    color: var(--text-muted);
-    background: transparent;
-  }
-  .rail-body { padding: 8px 12px 10px; font-size: var(--text-sm); line-height: 1.45; }
-  .rail-body .empty-state, .rail-body .skel-row { font-size: var(--text-xs); }
-  .rail-badge {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    min-width: 18px;
-    height: 18px;
-    padding: 0 6px;
-    border-radius: 9px;
-    background: var(--clementine);
-    color: #fff;
-    font-size: 10px;
-    font-weight: 600;
-  }
-  .rail-row {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    padding: 6px 0;
-    font-size: 12px;
-    border-bottom: 1px dashed var(--border);
-  }
-  .rail-row:last-child { border-bottom: none; }
-  .rail-row .label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .rail-row .meta { font-size: 10px; color: var(--text-muted); flex-shrink: 0; }
-
-  /* Floating "open rail" button when collapsed */
-  .home-rail-toggle {
-    position: fixed;
-    top: 80px;
-    right: 18px;
-    z-index: 100;
-    width: 36px;
-    height: 36px;
-    border-radius: 50%;
-    background: var(--clementine);
-    color: #fff;
-    border: none;
-    box-shadow: 0 2px 8px rgba(0,0,0,0.2);
-    cursor: pointer;
-    font-size: 14px;
-    display: none;
-  }
-  .home-rail.collapsed ~ .home-rail-toggle,
-  .home-rail.collapsed + .home-rail-toggle { display: block; }
-
-  /* Narrow screens: rail becomes a slide-out drawer */
-  @media (max-width: 1024px) {
-    .home-layout { grid-template-columns: 1fr; }
-    .home-rail {
-      position: fixed;
-      right: 0;
-      top: var(--header-h);
-      bottom: 0;
-      width: 320px;
-      max-width: 90vw;
-      transform: translateX(100%);
-      transition: transform 0.2s ease;
-      background: var(--bg);
-      border-left: 1px solid var(--border);
-      box-shadow: -4px 0 20px rgba(0,0,0,0.15);
-      padding: 14px;
-      z-index: 50;
-    }
-    .home-rail.open { transform: translateX(0); }
-    .rail-collapse-btn { display: flex; }
-    .home-rail-toggle { display: block; }
-    .home-rail.open ~ .home-rail-toggle { display: none; }
   }
 
   /* ── Cards ──────────────────────────────── */
@@ -22037,11 +21686,6 @@ function navigateTo(page, opts) {
         if (t === 'chat') {
           var ci = document.getElementById('chat-input');
           if (ci) ci.focus();
-        } else if (t === 'today') {
-          var rail = document.getElementById('home-rail');
-          if (rail && window.matchMedia('(max-width: 1024px)').matches) rail.classList.add('open');
-          var p = document.getElementById('home-plan-content');
-          if (p) p.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
         } else if (t === 'activity') {
           var act = document.getElementById('panel-activity');
           if (act) act.scrollIntoView({ behavior: 'smooth', block: 'start' });
@@ -24234,16 +23878,6 @@ function operationSectionHeader(title, subtitle, badgeClass, badgeText, marginTo
     + '</div>';
 }
 
-function renderOperationsSummary(ops) {
-  var s = ops.summary || {};
-  return '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-bottom:16px">'
-    + '<div style="border:1px solid var(--border);border-radius:8px;background:var(--bg-secondary);padding:10px 12px"><div style="font-size:11px;color:var(--text-muted)">Needs Attention</div><div style="font-size:20px;font-weight:700;color:' + ((s.needsAttention || 0) > 0 ? 'var(--red)' : 'var(--green)') + '">' + esc(s.needsAttention || 0) + '</div></div>'
-    + '<div style="border:1px solid var(--border);border-radius:8px;background:var(--bg-secondary);padding:10px 12px"><div style="font-size:11px;color:var(--text-muted)">Scheduled Tasks</div><div style="font-size:20px;font-weight:700">' + esc(s.enabledScheduledTasks || 0) + '/' + esc(s.scheduledTasks || 0) + '</div></div>'
-    + '<div style="border:1px solid var(--border);border-radius:8px;background:var(--bg-secondary);padding:10px 12px"><div style="font-size:11px;color:var(--text-muted)">Scheduled Workflows</div><div style="font-size:20px;font-weight:700">' + esc(s.enabledScheduledWorkflows || 0) + '/' + esc(s.scheduledWorkflows || 0) + '</div></div>'
-    + '<div style="border:1px solid var(--border);border-radius:8px;background:var(--bg-secondary);padding:10px 12px"><div style="font-size:11px;color:var(--text-muted)">Running Now</div><div style="font-size:20px;font-weight:700;color:' + ((s.runningNow || 0) > 0 ? 'var(--blue)' : 'var(--text-primary)') + '">' + esc(s.runningNow || 0) + '</div></div>'
-    + '<div style="border:1px solid var(--border);border-radius:8px;background:var(--bg-secondary);padding:10px 12px"><div style="font-size:11px;color:var(--text-muted)">Scheduled Tokens</div><div style="font-size:20px;font-weight:700">' + esc(formatTokens(s.automationTokens || 0)) + '</div></div>'
-    + '</div>';
-}
 
 function renderAttentionCard(item) {
   var broken = item.brokenJob || null;
@@ -25789,7 +25423,6 @@ async function refreshCron() {
     // Reliability (failures stacked by category). Filled in by
     // refreshMiniDashboards from the same /api/cron/runs payload.
     html += '<div id="mini-dashboards" class="mini-dashboards"></div>';
-    html += renderOperationsSummary(ops);
 
     // ── Zone 1 — Running now (promoted to top, primary "what's live" view) ──
     if (visibleRunning.length > 0) {
@@ -29525,28 +29158,6 @@ function setScheduleFromCron(expr) {
 updateScheduleFromBuilder();
 
 // ── Timers ────────────────────────────────
-async function refreshTimers() {
-  try {
-    const r = await apiFetch('/api/timers');
-    const d = await r.json();
-    const count = Array.isArray(d) ? d.length : 0;
-    var _tc = document.getElementById('nav-timer-count'); if (_tc) _tc.textContent = count;
-    var _ttc = document.getElementById('tab-timer-count'); if (_ttc) { _ttc.textContent = count; _ttc.style.display = count > 0 ? '' : 'none'; }
-    if (!Array.isArray(d) || d.length === 0) {
-      document.getElementById('panel-timers').innerHTML = '<div class="empty-state">No pending timers</div>';
-      return;
-    }
-    let html = '<table><tr><th>ID</th><th>Fires At</th><th>Message</th><th style="width:80px"></th></tr>';
-    for (const t of d) {
-      html += '<tr><td><code>' + esc(t.id || '?') + '</code></td>'
-        + '<td>' + esc(t.fireAt || t.fire_at || t.time || '') + '</td>'
-        + '<td>' + esc((t.message || t.prompt || '').slice(0, 100)) + '</td>'
-        + '<td><button class="btn-danger btn-sm" onclick="apiPost(\\x27/api/timers/' + encodeURIComponent(t.id) + '/cancel\\x27)">Cancel</button></td></tr>';
-    }
-    html += '</table>';
-    document.getElementById('panel-timers').innerHTML = html;
-  } catch(e) { }
-}
 
 // ── Activity Feed ─────────────────────────
 var activityLastTimestamp = '';
@@ -34741,132 +34352,6 @@ function briefingNeedsReviewClick(href) {
   }
 }
 
-function toggleHomeRail() {
-  var rail = document.getElementById('home-rail');
-  if (!rail) return;
-  // Mobile: open/close. Desktop: collapse/show.
-  if (window.matchMedia('(max-width: 1024px)').matches) {
-    rail.classList.toggle('open');
-  } else {
-    rail.classList.toggle('collapsed');
-  }
-}
-
-function _railCard(bodyId) {
-  var body = document.getElementById(bodyId);
-  return body ? body.closest('.rail-card') : null;
-}
-function _setRailEmpty(bodyId, isEmpty) {
-  var card = _railCard(bodyId);
-  if (card) card.classList.toggle('empty', !!isEmpty);
-}
-
-async function refreshHomeRail() {
-  // Daemon status — only surface when explicitly stopped. Treat null/undefined
-  // (running-state unknown) as "fine, hide" since the dashboard wouldn't be
-  // serving requests if the daemon were truly down.
-  try {
-    var rs = await apiFetch('/api/status');
-    var ds = await rs.json();
-    var stopped = ds.running === false;
-    var pip = document.querySelector('#rail-daemon-body .agent-activity-dot');
-    var label = document.querySelector('#rail-daemon-body .agent-activity span:last-child');
-    if (label) label.textContent = stopped ? 'Daemon stopped' : 'Running';
-    if (pip) pip.style.background = stopped ? '#ef4444' : '#22c55e';
-    var up = document.getElementById('rail-daemon-uptime');
-    if (up && ds.uptimeMs) up.textContent = Math.round(ds.uptimeMs / 60000) + 'm';
-    _setRailEmpty('rail-daemon-body', !stopped);
-  } catch { _setRailEmpty('rail-daemon-body', true); }
-
-  // Today's plan (compact). Hide card if no plan or zero items.
-  try {
-    var rp = await apiFetch('/api/daily-plan');
-    var dp = await rp.json();
-    var planEl = document.getElementById('home-plan-content');
-    var items = dp && dp.plan ? (dp.plan.items || []) : [];
-    if (planEl) {
-      if (items.length === 0) {
-        planEl.innerHTML = '<div style="font-size:11px;color:var(--text-muted)">No plan yet today.</div>';
-      } else {
-        planEl.innerHTML = items.slice(0, 4).map(function(it) {
-          return '<div class="rail-row"><span class="label">' + esc(it.title || it.text || '') + '</span><span class="meta">' + esc(it.time || '') + '</span></div>';
-        }).join('');
-      }
-    }
-    _setRailEmpty('home-plan-content', items.length === 0);
-  } catch {
-    _setRailEmpty('home-plan-content', true);
-  }
-
-  // Upcoming cron fires (next 3) — hide card if nothing scheduled
-  try {
-    var rc = await apiFetch('/api/cron');
-    var dc = await rc.json();
-    var jobs = (dc.jobs || []).filter(function(j) { return j.enabled && j.nextRun; });
-    jobs.sort(function(a, b) { return new Date(a.nextRun).getTime() - new Date(b.nextRun).getTime(); });
-    var top = jobs.slice(0, 3);
-    var ue = document.getElementById('rail-upcoming');
-    var uc = document.getElementById('rail-upcoming-count');
-    if (uc) uc.textContent = String(jobs.length);
-    if (ue) {
-      ue.innerHTML = top.map(function(j) {
-        return '<div class="rail-row clickable-row" onclick="navigateTo(\\x27build\\x27,{tab:\\x27crons\\x27})"><span class="label">' + esc(j.name) + '</span><span class="meta">' + esc(timeUntil(j.nextRun)) + '</span></div>';
-      }).join('');
-    }
-    _setRailEmpty('rail-upcoming', top.length === 0);
-  } catch { _setRailEmpty('rail-upcoming', true); }
-
-  // Active unleashed runs — hide card unless something running
-  try {
-    var ru = await apiFetch('/api/unleashed');
-    var du = await ru.json();
-    var active = (du.tasks || []).filter(function(t) { return t.live === true || t.runtimeState === 'active'; });
-    var ae = document.getElementById('rail-active');
-    var ac = document.getElementById('rail-active-count');
-    if (ac) {
-      if (active.length > 0) { ac.style.display = ''; ac.textContent = String(active.length); }
-      else ac.style.display = 'none';
-    }
-    if (ae) {
-      ae.innerHTML = active.map(function(t) {
-        return '<div class="rail-row clickable-row" onclick="navigateTo(\\x27build\\x27,{tab:\\x27crons\\x27})"><span class="label">' + esc(t.name) + '</span><span class="meta">' + esc(t.phase || '') + '</span></div>';
-      }).join('');
-    }
-    _setRailEmpty('rail-active', active.length === 0);
-  } catch { _setRailEmpty('rail-active', true); }
-
-  // Time saved (compact). Hide if zero.
-  try {
-    var rm = await apiFetch('/api/metrics?period=week');
-    var dm = await rm.json();
-    var minutes = ((dm.cronRuns || 0) * 5) + ((dm.exchanges || 0) * 2);
-    var ts = document.getElementById('rail-time-saved');
-    if (ts) {
-      if (minutes >= 60) ts.innerHTML = '<div style="font-size:var(--text-md);font-weight:600">' + (minutes / 60).toFixed(1) + 'h</div><div style="font-size:11px;color:var(--text-muted)">' + (dm.cronRuns || 0) + ' runs · ' + (dm.exchanges || 0) + ' chats</div>';
-      else ts.innerHTML = '<div style="font-size:var(--text-md);font-weight:600">' + minutes + 'm</div><div style="font-size:11px;color:var(--text-muted)">' + (dm.cronRuns || 0) + ' runs</div>';
-    }
-    _setRailEmpty('rail-time-saved', minutes === 0);
-  } catch { _setRailEmpty('rail-time-saved', true); }
-
-  // Approvals — hide card unless something pending
-  try {
-    var rsi = await apiFetch('/api/self-improve');
-    var dsi = await rsi.json();
-    var pending = (dsi.proposals || []).filter(function(p) { return p.status === 'pending'; });
-    var ae2 = document.getElementById('rail-approvals');
-    var ac2 = document.getElementById('rail-approvals-count');
-    if (ac2) {
-      if (pending.length > 0) { ac2.style.display = ''; ac2.textContent = String(pending.length); }
-      else ac2.style.display = 'none';
-    }
-    if (ae2) {
-      ae2.innerHTML = pending.slice(0, 3).map(function(p) {
-        return '<div class="rail-row clickable-row" onclick="navigateTo(\\x27brain\\x27,{tab:\\x27learning\\x27})"><span class="label">' + esc(p.area || 'proposal') + ': ' + esc((p.target || '').slice(0, 40)) + '</span><span class="meta">' + esc(((p.score || 0) * 100).toFixed(0)) + '%</span></div>';
-      }).join('');
-    }
-    _setRailEmpty('rail-approvals', pending.length === 0);
-  } catch { _setRailEmpty('rail-approvals', true); }
-}
 
 function timeUntil(iso) {
   if (!iso) return '';
@@ -34888,7 +34373,6 @@ async function refreshAll() {
     else refreshActivity();  // Fall back to direct /api/activity fetch when init didn't include it
     if (d.office) refreshTeamNav(d.office);
     // Home rail data — fire and forget, doesn't block init render.
-    if (currentPage === 'home') refreshHomeRail();
     if (d.version) {
       if (d.version.needsRestart && !_restartBannerShown) {
         _restartBannerShown = true;
@@ -38051,34 +37535,6 @@ async function refreshHomeMetrics() {
 }
 
 // ── Home Page: Sessions Tab ──────────────
-async function refreshHomeSessions() {
-  var container = document.getElementById('panel-sessions-home');
-  if (!container) return;
-  try {
-    var r = await apiFetch('/api/sessions');
-    var d = await r.json();
-    var keys = Object.keys(d);
-    if (keys.length === 0) { container.innerHTML = '<div class="empty-state">No active sessions</div>'; return; }
-    var html = '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:12px">';
-    keys.forEach(function(key) {
-      var s = d[key];
-      var icon = key.indexOf('discord') >= 0 ? '&#128172;' : key.indexOf('slack') >= 0 ? '&#128488;' : key.indexOf('telegram') >= 0 ? '&#9992;' : key.indexOf('dashboard') >= 0 ? '&#127760;' : '&#128172;';
-      var exchanges = s.exchanges || 0;
-      var lastActive = s.lastActive ? fmtTimeAgo(s.lastActive) : 'unknown';
-      html += '<div class="card" style="padding:12px;cursor:pointer" onclick="viewSessionModal(\\x27' + encodeURIComponent(key) + '\\x27)">';
-      html += '<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">';
-      html += '<span style="font-size:16px">' + icon + '</span>';
-      html += '<span style="font-weight:500;font-size:13px">' + esc(key.split(':').pop() || key) + '</span>';
-      html += '</div>';
-      html += '<div style="font-size:12px;color:var(--text-muted)">' + exchanges + ' exchanges · ' + lastActive + '</div>';
-      html += '</div>';
-    });
-    html += '</div>';
-    container.innerHTML = html;
-  } catch(e) {
-    container.innerHTML = '<div class="empty-state">Failed to load sessions</div>';
-  }
-}
 
 // ── Execution Analytics ───────────────────
 async function refreshAdvisorAnalytics() {
