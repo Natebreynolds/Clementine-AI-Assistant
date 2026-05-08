@@ -4464,6 +4464,46 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
     }
   });
 
+  // ── Skill migration (legacy .md → folder/SKILL.md) ─────────────────
+  // Two endpoints: per-skill and bulk. Both wrap migrateLegacySkill /
+  // migrateAllLegacySkills from skill-store.ts. The original .md is
+  // renamed to .md.bak so the migration is rollback-able by hand.
+  app.post('/api/skills/:name/migrate', async (req, res) => {
+    try {
+      const name = req.params.name;
+      if (!name) { res.status(400).json({ ok: false, error: 'name required' }); return; }
+      const { migrateLegacySkill } = await import('../agent/skill-store.js');
+      const result = migrateLegacySkill(name);
+      if (!result.ok) {
+        res.status(409).json(result);
+        return;
+      }
+      res.json(result);
+    } catch (err) {
+      res.status(500).json({ ok: false, error: String(err) });
+    }
+  });
+
+  app.post('/api/skills/migrate-all', async (_req, res) => {
+    try {
+      const { migrateAllLegacySkills } = await import('../agent/skill-store.js');
+      const result = migrateAllLegacySkills();
+      const failed = result.migrated.filter((m) => !m.ok);
+      const succeeded = result.migrated.filter((m) => m.ok && !m.alreadyMigrated);
+      res.json({
+        ok: true,
+        totalChecked: result.migrated.length + result.skipped.length,
+        migratedCount: succeeded.length,
+        failedCount: failed.length,
+        skippedCount: result.skipped.length,
+        migrated: result.migrated,
+        skipped: result.skipped,
+      });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: String(err) });
+    }
+  });
+
   app.get('/api/cron/drafts', async (_req, res) => {
     try {
       const { listDraftNames } = await import('../agent/draft-store.js');
@@ -26634,6 +26674,44 @@ var _skillsState = {
   query: '',         // search input value
 };
 
+// ── Migration handlers (Phase A.6 / 1.18.110) ────────────────────────
+// migrateOneSkill: per-skill migration from the detail-pane footer.
+// migrateAllLegacySkills: bulk migration from the list-pane banner.
+// Both use POST endpoints in dashboard.ts and refresh the page on success.
+
+async function migrateOneSkill(name) {
+  if (!confirm('Migrate "' + name + '" to folder form? The original .md file will be renamed to .md.bak (preserved for rollback).')) return;
+  try {
+    var r = await apiFetch('/api/skills/' + encodeURIComponent(name) + '/migrate', { method: 'POST' });
+    var d = await r.json().catch(function() { return {}; });
+    if (!r.ok || d.ok === false) {
+      toast(d.error || ('Migration failed (HTTP ' + r.status + ')'), 'error');
+      return;
+    }
+    toast(d.alreadyMigrated ? 'Already in folder form.' : 'Migrated. Folder created at ' + (d.newSkillPath || ''), 'success');
+    // Reload the skills list so the new layout reflects.
+    if (typeof refreshSkillsPage === 'function') await refreshSkillsPage();
+    if (name && typeof showSkillDetail === 'function') showSkillDetail(name);
+  } catch (err) { toast('Migration failed: ' + err, 'error'); }
+}
+
+async function migrateAllLegacySkills() {
+  if (!confirm('Migrate ALL legacy skills to folder form? Each .md file becomes <name>/SKILL.md, originals preserved as .bak.')) return;
+  try {
+    var r = await apiFetch('/api/skills/migrate-all', { method: 'POST' });
+    var d = await r.json().catch(function() { return {}; });
+    if (!r.ok || d.ok === false) {
+      toast(d.error || ('Bulk migration failed (HTTP ' + r.status + ')'), 'error');
+      return;
+    }
+    var msg = 'Migrated ' + d.migratedCount + ' skill' + (d.migratedCount === 1 ? '' : 's')
+      + (d.failedCount > 0 ? ' (' + d.failedCount + ' failed)' : '')
+      + (d.skippedCount > 0 ? ' (' + d.skippedCount + ' already in folder form)' : '');
+    toast(msg, d.failedCount > 0 ? 'error' : 'success');
+    if (typeof refreshSkillsPage === 'function') await refreshSkillsPage();
+  } catch (err) { toast('Bulk migration failed: ' + err, 'error'); }
+}
+
 async function refreshSkillsPage() {
   var listEl = document.getElementById('skills-list');
   var detailEl = document.getElementById('skills-detail');
@@ -26718,6 +26796,21 @@ function renderSkillsList() {
     return;
   }
   var html = '';
+  // PRD § Skills-First Phase A.6 / 1.18.110: legacy migration banner.
+  // Counts how many flat-form legacy skills exist; shows a one-click
+  // "Migrate all" button when ≥1 found. Banner disappears after they
+  // all become folder form. Per-skill migration also lives in the
+  // detail pane footer for individual control.
+  var legacyCount = _skillsState.data.filter(function(s) {
+    return s.layout === 'flat' && s.schemaVersion === 'legacy';
+  }).length;
+  if (legacyCount > 0 && !_skillsState.query) {
+    html += '<div style="padding:12px 14px;background:rgba(245,158,11,0.10);border-bottom:1px solid var(--yellow);font-size:11px;line-height:1.5;color:var(--text-secondary)">'
+      + '<div style="font-weight:600;color:var(--yellow);margin-bottom:6px">' + legacyCount + ' legacy skill' + (legacyCount === 1 ? '' : 's') + ' to migrate</div>'
+      + '<div style="margin-bottom:8px">Convert flat <code>.md</code> files to folder form (<code>name/SKILL.md</code>) so you can bundle templates + scripts + reference docs.</div>'
+      + '<button class="btn-sm btn-primary" onclick="migrateAllLegacySkills()" style="font-size:11px;padding:4px 10px">Migrate all to folder form</button>'
+      + '</div>';
+  }
   for (var i = 0; i < _skillsState.filtered.length; i++) {
     var s = _skillsState.filtered[i];
     var fm = s.frontmatter || {};
@@ -26914,7 +27007,11 @@ function renderSkillDetail(s) {
   if (s.schemaVersion === 'legacy') {
     html += '<div style="margin-top:24px;padding:12px 14px;background:rgba(245,158,11,0.08);border:1px solid var(--yellow);border-radius:6px;font-size:12px;color:var(--text-secondary);line-height:1.5">'
          + '<strong style="color:var(--yellow)">Legacy schema.</strong> '
-         + 'This skill uses the pre-redesign frontmatter shape. Phase B will offer a one-click migration to the Anthropic-compatible format (name + description top-level; cron-tailored fields under <code>clementine:</code>).'
+         + 'This skill uses the pre-redesign frontmatter shape. '
+         + 'Click <strong>Migrate to folder form</strong> below to convert it to <code>' + esc(fm.name) + '/SKILL.md</code> with the cron-tailored fields (triggers, toolsUsed, etc.) moved under a <code>clementine:</code> namespace. The original is preserved as a <code>.bak</code> file for rollback.'
+         + '<div style="margin-top:10px">'
+         +   '<button class="btn-sm btn-primary" onclick="migrateOneSkill(\\x27' + jsStr(fm.name) + '\\x27)" style="font-size:11px;padding:4px 12px">Migrate to folder form →</button>'
+         + '</div>'
          + '</div>';
   } else if (s.schemaVersion === 'anthropic' && s.layout === 'flat') {
     html += '<div style="margin-top:24px;padding:12px 14px;background:rgba(59,130,246,0.06);border:1px solid var(--blue);border-radius:6px;font-size:12px;color:var(--text-secondary);line-height:1.5">'
