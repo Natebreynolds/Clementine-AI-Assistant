@@ -16184,14 +16184,18 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
 
     <!-- ═══ Tasks Page — single unified surface ═══ -->
     <div class="page" id="page-build">
-      <!-- Sub-tabs hidden by default. Cron is the single surface; multi-step
-           workflows (formerly "Tricks") are still accessible via deep-link
-           ?tab=workflows or by toggling .show-workflows-tabs on the page. -->
-      <div id="build-tabs" style="display:none;gap:4px;padding:8px 18px 0;background:var(--bg-secondary);border-bottom:1px solid var(--border);flex-shrink:0">
+      <!-- PRD Phase 2: top-level tab strip within the Tasks domain.
+           Tasks (default) + Tools & MCP catalog. Workflows still reachable
+           via deep-link ?tab=workflows for power users with existing
+           multi-step workflows. -->
+      <div id="build-tabs" style="display:flex;gap:4px;padding:8px 18px 0;background:var(--bg-secondary);border-bottom:1px solid var(--border);flex-shrink:0">
         <button class="build-tab-btn active" data-build-tab="crons" onclick="switchBuildTab('crons')" style="padding:8px 14px;border-radius:6px 6px 0 0;border:none;background:transparent;color:var(--text-primary);font-size:13px;font-weight:500;cursor:pointer;border-bottom:2px solid transparent">
           <span style="margin-right:6px">📅</span>Tasks <span id="build-tab-cron-count" style="display:none;margin-left:4px;font-size:10px;background:var(--bg-tertiary);padding:1px 6px;border-radius:999px;color:var(--text-muted)">0</span>
         </button>
-        <button class="build-tab-btn" data-build-tab="workflows" onclick="switchBuildTab('workflows')" style="padding:8px 14px;border-radius:6px 6px 0 0;border:none;background:transparent;color:var(--text-secondary);font-size:13px;font-weight:500;cursor:pointer;border-bottom:2px solid transparent">
+        <button class="build-tab-btn" data-build-tab="toolsmcp" onclick="switchBuildTab('toolsmcp')" style="padding:8px 14px;border-radius:6px 6px 0 0;border:none;background:transparent;color:var(--text-secondary);font-size:13px;font-weight:500;cursor:pointer;border-bottom:2px solid transparent">
+          <span style="margin-right:6px">🧰</span>Tools &amp; MCP <span id="build-tab-toolsmcp-count" style="display:none;margin-left:4px;font-size:10px;background:var(--bg-tertiary);padding:1px 6px;border-radius:999px;color:var(--text-muted)">0</span>
+        </button>
+        <button class="build-tab-btn" data-build-tab="workflows" onclick="switchBuildTab('workflows')" style="display:none;padding:8px 14px;border-radius:6px 6px 0 0;border:none;background:transparent;color:var(--text-secondary);font-size:13px;font-weight:500;cursor:pointer;border-bottom:2px solid transparent">
           <span style="margin-right:6px">🔧</span>Workflows <span id="build-tab-workflows-count" style="display:none;margin-left:4px;font-size:10px;background:var(--bg-tertiary);padding:1px 6px;border-radius:999px;color:var(--text-muted)">0</span>
         </button>
       </div>
@@ -16202,6 +16206,12 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
       <!-- Scheduled Tasks tab — populated by refreshCron() ─────────────────────── -->
       <div id="build-tab-crons" style="display:none;flex:1;min-height:0;overflow-y:auto;padding:18px;background:var(--bg-primary)">
         <div id="panel-cron"><div class="empty-state" style="padding:24px;color:var(--text-muted)">Loading scheduled tasks…</div></div>
+      </div>
+      <!-- ── PRD Phase 2: Tools & MCP catalog ────────────────────────────────
+           Read-only foundation in 1.18.81. Future slices: per-tool bindings,
+           Reconnect/Toggle/Edit actions, Approval Mode + Max-auto-runs config. -->
+      <div id="build-tab-toolsmcp" style="display:none;flex:1;min-height:0;overflow-y:auto;padding:18px;background:var(--bg-primary)">
+        <div id="panel-toolsmcp"><div class="empty-state" style="padding:24px;color:var(--text-muted)">Loading Tools &amp; MCP catalog…</div></div>
       </div>
       <!-- Tricks (workflows) tab — existing RoutinesUI surface ─────────────────── -->
       <div id="build-tab-workflows" style="display:none;flex:1;min-height:0;display:flex;flex-direction:column">
@@ -20976,12 +20986,27 @@ function switchBuildTab(tab) {
   var workPane = document.getElementById('build-tab-workflows');
   var cronPane = document.getElementById('build-tab-crons');
   var tplPane = document.getElementById('build-tab-templates');
+  var toolsmcpPane = document.getElementById('build-tab-toolsmcp');
   var headerStrip = document.getElementById('build-header-strip');
   var usagePanel = document.getElementById('build-usage-panel');
   var newBtn = document.getElementById('builder-new-btn');
   // Always close any open workflow when changing tabs — switching context
   // is a clean slate, not a stale node hanging on the canvas.
   if (typeof closeBuilderCanvas === 'function') closeBuilderCanvas();
+  // Default: hide the Tools & MCP pane unless we're explicitly on it.
+  if (toolsmcpPane && tab !== 'toolsmcp') toolsmcpPane.style.display = 'none';
+  if (tab === 'toolsmcp') {
+    // PRD Phase 2: Tools & MCP catalog. Read-only foundation in 1.18.81.
+    if (workPane) workPane.style.display = 'none';
+    if (cronPane) cronPane.style.display = 'none';
+    if (tplPane) tplPane.style.display = 'none';
+    if (toolsmcpPane) toolsmcpPane.style.display = 'block';
+    if (headerStrip) headerStrip.style.display = 'none';
+    if (usagePanel) usagePanel.style.display = 'none';
+    if (newBtn) newBtn.style.display = 'none';
+    if (typeof refreshToolsMcpCatalog === 'function') refreshToolsMcpCatalog();
+    return;
+  }
   if (tab === 'templates') {
     if (workPane) workPane.style.display = 'none';
     if (cronPane) cronPane.style.display = 'none';
@@ -23358,6 +23383,156 @@ function renderRunningCard(item) {
     + '<div class="task-card-actions">'
     + (item.type === 'background' ? '<button class="btn-sm btn-danger" onclick="cancelBackgroundTask(\\x27' + jsStr(runtime.id || runtimeName) + '\\x27)">Cancel</button>' : '<button class="btn-sm btn-danger" onclick="cancelUnleashed(\\x27' + jsStr(runtimeName) + '\\x27)">Cancel</button>')
     + '</div></div>';
+}
+
+// ── PRD Phase 2: Tools & MCP catalog ──────────────────────────────────
+// Read-only foundation in 1.18.81. Renders the four-card taxonomy:
+//   • Built-in       — Claude SDK native tools (Read/Write/Bash/etc.)
+//   • Custom MCP     — in-process SDK MCP servers
+//   • Shell command  — CLI wrappers
+//   • External MCP   — stdio / sse / http MCP servers
+// Pulls from /api/mcp-status (live status) + /api/mcp-servers (config).
+// Future slices wire Reconnect/Toggle/Edit + the McpToolBinding modal.
+async function refreshToolsMcpCatalog() {
+  var panel = document.getElementById('panel-toolsmcp');
+  if (!panel) return;
+  panel.innerHTML = '<div class="empty-state" style="padding:24px;color:var(--text-muted)">Loading Tools &amp; MCP catalog…</div>';
+  var statusMap = {};
+  var servers = [];
+  try {
+    var sR = await apiFetch('/api/mcp-status');
+    var statusJson = await sR.json();
+    statusMap = statusJson || {};
+  } catch (e) { /* status is optional — servers still render without it */ }
+  try {
+    var lR = await apiFetch('/api/mcp-servers');
+    var lJson = await lR.json();
+    servers = (lJson && lJson.servers) || [];
+  } catch (e) {
+    panel.innerHTML = '<div class="empty-state" style="padding:24px;color:var(--red)">Failed to load MCP servers: ' + esc(String(e)) + '</div>';
+    return;
+  }
+  var tabCount = document.getElementById('build-tab-toolsmcp-count');
+  if (tabCount) {
+    tabCount.textContent = servers.length;
+    tabCount.style.display = servers.length > 0 ? '' : 'none';
+  }
+  // Bucket servers into the four PRD categories. The existing
+  // ManagedMcpServer type doesn't have an explicit "kind" field, so we
+  // infer: stdio with a known shell binary → 'shell', stdio bundled with
+  // clementine → 'builtin', stdio external command → 'external_stdio',
+  // http/sse → 'external_remote'. The bucket keys map to the PRD's four
+  // taxonomy cards.
+  var buckets = { builtin: [], custom: [], shell: [], external: [] };
+  for (var i = 0; i < servers.length; i++) {
+    var s = servers[i];
+    var name = s.name || '';
+    var type = s.type || 'stdio';
+    var cmd = s.command || '';
+    var kind;
+    // The clementine-tools server is an in-process bundle
+    if (name === 'clementine-tools' || name === 'kernel') kind = 'builtin';
+    else if (type === 'http' || type === 'sse') kind = 'external';
+    else if (/^(sf|gh|gcloud|kubectl|docker|aws|az|terraform)$/.test(cmd) || /\\b(sf|gh|gcloud|kubectl)$/.test(cmd)) kind = 'shell';
+    else kind = 'external';  // default for stdio external MCP
+    buckets[kind].push(s);
+  }
+  var html = '';
+  // Header strip
+  html += '<div style="margin-bottom:18px"><h2 style="margin:0 0 4px;font-size:18px;font-weight:600;color:var(--text-primary)">Tools &amp; MCP catalog</h2>'
+    +    '<div style="font-size:12px;color:var(--text-muted)">'+ esc(servers.length) +' MCP server' + (servers.length === 1 ? '' : 's') + ' configured. Click any task in the Tasks tab to bind specific tools to that task.</div></div>';
+  // Four-card taxonomy. Each section is a labeled bucket of cards.
+  var sections = [
+    { key: 'builtin',  label: 'Built-in',                desc: 'Claude SDK native tools — always available to every task at the agent profile\\x27s permission tier.' },
+    { key: 'custom',   label: 'Custom in-process MCP',   desc: 'MCP servers defined in clementine\\x27s code, loaded inside the daemon process.' },
+    { key: 'shell',    label: 'Shell commands',          desc: 'Local CLI binaries (sf, gh, gcloud…) wrapped as MCP servers.' },
+    { key: 'external', label: 'External MCP servers',    desc: 'Third-party MCP servers reached over stdio, SSE, or HTTP.' },
+  ];
+  for (var k = 0; k < sections.length; k++) {
+    var sec = sections[k];
+    var bucket = buckets[sec.key] || [];
+    html += '<div style="margin-bottom:24px">';
+    html += '<div style="display:flex;align-items:baseline;gap:10px;margin-bottom:10px">'
+      +      '<h3 style="margin:0;font-size:14px;font-weight:600;color:var(--text-primary)">' + esc(sec.label) + '</h3>'
+      +      '<span style="font-size:11px;color:var(--text-muted);font-weight:500">' + bucket.length + '</span>'
+      +    '</div>';
+    html += '<div style="font-size:11px;color:var(--text-muted);margin-bottom:12px">' + esc(sec.desc) + '</div>';
+    if (bucket.length === 0) {
+      html += '<div class="empty-state" style="padding:14px;color:var(--text-muted);font-size:12px;background:var(--bg-secondary);border:1px dashed var(--border);border-radius:6px">No servers in this bucket.</div>';
+    } else {
+      html += '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:12px">';
+      for (var b = 0; b < bucket.length; b++) html += renderMcpCatalogCard(bucket[b], statusMap);
+      html += '</div>';
+    }
+    html += '</div>';
+  }
+  panel.innerHTML = html;
+}
+
+// Render one MCP server card. Status pill colors mirror the PRD's five
+// states (connected / failed / needs-auth / pending / disabled). The
+// statusMap shape comes from gw.getMcpStatus() — varies a bit between
+// SDK versions; we defensively probe for connected/healthy fields.
+function renderMcpCatalogCard(server, statusMap) {
+  var name = server.name || '(unnamed)';
+  var transport = server.type || 'stdio';
+  var enabled = server.enabled !== false;
+  var status = statusMap && statusMap[name];
+  var statusKind, statusLabel, statusColor;
+  if (!enabled) { statusKind = 'disabled'; statusLabel = 'disabled'; statusColor = 'var(--text-muted)'; }
+  else if (status && (status.connected === true || status.status === 'connected' || status.healthy === true)) { statusKind = 'connected'; statusLabel = 'connected'; statusColor = 'var(--green)'; }
+  else if (status && (status.needsAuth === true || status.status === 'needs-auth')) { statusKind = 'needsauth'; statusLabel = 'needs auth'; statusColor = 'var(--yellow)'; }
+  else if (status && (status.connected === false || status.status === 'failed' || status.error)) { statusKind = 'failed'; statusLabel = 'failed'; statusColor = 'var(--red)'; }
+  else { statusKind = 'pending'; statusLabel = 'pending'; statusColor = 'var(--text-muted)'; }
+  var toolCount = (status && (status.toolCount != null ? status.toolCount : (Array.isArray(status.tools) ? status.tools.length : null))) || (Array.isArray(server.exposedTools) ? server.exposedTools.length : null);
+  var lastChecked = status && (status.lastCheckedAt || status.checkedAt || status.updatedAt);
+  var src = server.source === 'auto-detected' ? 'auto-detected' : 'user-configured';
+  var lastError = status && status.error;
+  var html = ''
+    + '<div style="background:var(--bg-secondary);border:1px solid var(--border);border-radius:8px;padding:14px;display:flex;flex-direction:column;gap:8px">'
+    +   '<div style="display:flex;align-items:center;gap:8px">'
+    +     '<div style="font-size:13px;font-weight:600;color:var(--text-primary);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + esc(name) + '">' + esc(name) + '</div>'
+    +     '<span style="display:inline-flex;align-items:center;gap:5px;font-size:10px;font-weight:500;color:' + statusColor + ';background:' + statusColor + '20;padding:2px 8px;border-radius:999px;text-transform:uppercase;letter-spacing:0.04em">'
+    +       '<span style="display:inline-block;width:6px;height:6px;border-radius:50%;background:' + statusColor + '"></span>' + esc(statusLabel)
+    +     '</span>'
+    +   '</div>'
+    +   '<div style="display:flex;align-items:center;gap:10px;font-size:11px;color:var(--text-muted)">'
+    +     '<span style="text-transform:uppercase;letter-spacing:0.04em">' + esc(transport) + '</span>'
+    +     '<span>·</span>'
+    +     '<span>' + esc(src) + '</span>'
+    +     (toolCount != null ? '<span>·</span><span>' + esc(toolCount) + ' tool' + (toolCount === 1 ? '' : 's') + '</span>' : '')
+    +   '</div>'
+    + (server.description ? '<div style="font-size:12px;color:var(--text-secondary);line-height:1.45">' + esc(String(server.description).slice(0, 240)) + '</div>' : '')
+    + (lastError ? '<div style="font-size:11px;color:var(--red);background:rgba(239,68,68,0.06);padding:6px 8px;border-radius:4px;word-break:break-word">' + esc(String(lastError).slice(0, 200)) + '</div>' : '')
+    + (lastChecked ? '<div style="font-size:11px;color:var(--text-muted)">Checked ' + esc(timeAgo(lastChecked)) + '</div>' : '')
+    +   '<div style="display:flex;gap:6px;margin-top:4px">'
+    +     '<button class="btn-sm" onclick="toggleMcpServerEnabled(\\x27' + jsStr(name) + '\\x27,' + (enabled ? 'false' : 'true') + ')" title="' + (enabled ? 'Disable this MCP server for all tasks' : 'Enable this MCP server') + '">' + (enabled ? 'Disable' : 'Enable') + '</button>'
+    +     '<button class="btn-sm" disabled title="Edit + Reconnect coming in the next slice" style="opacity:0.55;cursor:not-allowed">Edit</button>'
+    +   '</div>'
+    + '</div>';
+  return html;
+}
+
+// PUT helper for the Toggle button. Lazy: re-fetches the catalog after
+// the round-trip so the new state is reflected. Future slice will swap
+// to optimistic update + rollback on error.
+async function toggleMcpServerEnabled(name, nextEnabled) {
+  try {
+    var r = await apiFetch('/api/mcp-servers/' + encodeURIComponent(name), {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ enabled: nextEnabled }),
+    });
+    var d = await r.json();
+    if (!r.ok || d.error) {
+      toast('Toggle failed: ' + (d.error || 'unknown'), 'error');
+      return;
+    }
+    toast(name + ' is now ' + (nextEnabled ? 'enabled' : 'disabled'), 'success');
+    refreshToolsMcpCatalog();
+  } catch (e) {
+    toast('Toggle failed: ' + String(e), 'error');
+  }
 }
 
 async function refreshCron() {
