@@ -23516,7 +23516,7 @@ function renderRecentHistoryList(runs) {
       + '</div>'
       + '<div style="font-size:12px;color:var(--text-secondary);line-height:18px">' + esc(startedLabel) + '</div>'
       + '<div style="font-size:12px;color:var(--text-muted);line-height:18px">' + esc(durationLabel) + '</div>'
-      + '<div style="display:flex;gap:6px;align-items:center"><button class="btn-sm" onclick="event.stopPropagation();openTraceViewer(\\x27' + safeName + '\\x27)" style="font-size:11px;padding:3px 8px">Trace</button></div>'
+      + '<div style="display:flex;gap:6px;align-items:center"><button class="btn-sm" onclick="event.stopPropagation();openRunOrTrace(\\x27' + safeName + '\\x27,' + (entry.id ? '\\x27' + jsStr(entry.id) + '\\x27' : 'null') + ')" style="font-size:11px;padding:3px 8px">' + (entry.id ? 'Open run' : 'Trace') + '</button></div>'
       + '</div>';
   }
   return '<div class="history-list" style="background:var(--bg-secondary);border:1px solid var(--border);border-radius:var(--radius)">'
@@ -23722,7 +23722,7 @@ function renderRunListBody(allRuns) {
       +    '<div style="font-size:11px;color:' + triggerColor + ';line-height:18px">' + esc(triggerLabel) + '</div>'
       +    '<div style="font-size:12px;color:var(--text-secondary);line-height:18px">' + esc(startedLabel) + '</div>'
       +    '<div style="font-size:12px;color:var(--text-muted);line-height:18px">' + esc(durationLabel) + '</div>'
-      +    '<div style="display:flex;gap:6px;align-items:center"><button class="btn-sm" onclick="event.stopPropagation();openTraceViewer(\\x27' + safeName + '\\x27)" style="font-size:11px;padding:3px 8px">Trace</button></div>'
+      +    '<div style="display:flex;gap:6px;align-items:center"><button class="btn-sm" onclick="event.stopPropagation();openRunOrTrace(\\x27' + safeName + '\\x27,' + (entry.id ? '\\x27' + jsStr(entry.id) + '\\x27' : 'null') + ')" style="font-size:11px;padding:3px 8px">' + (entry.id ? 'Open run' : 'Trace') + '</button></div>'
       + '</div>';
   }
   html += '</div>';
@@ -24199,6 +24199,162 @@ async function refreshCron() {
 }
 
 var traceData = [];
+
+// PRD Phase 4b / 1.18.86: smart router. If the run entry has a stable
+// runId (1.18.85+ runs), open the new Run detail viewer reading from the
+// Event store; otherwise fall back to the legacy trace viewer (which now
+// just renders the friendly empty state explaining where to find the
+// real error). Both viewers share the same modal shell.
+function openRunOrTrace(jobName, runId) {
+  if (runId && typeof runId === 'string') {
+    return openRunDetail(runId, jobName);
+  }
+  return openTraceViewer(jobName);
+}
+
+// PRD Phase 4b / 1.18.86: Run detail viewer. Renders a waterfall of
+// RunEvent rows from /api/runs/:runId/events. Color-coded by kind, paired
+// tool_call→tool_result by toolUseId, with expandable per-span content.
+async function openRunDetail(runId, jobName) {
+  document.getElementById('trace-modal-title').textContent = 'Run detail · ' + (jobName || runId);
+  document.getElementById('trace-run-selector').innerHTML = '';
+  document.getElementById('trace-content').innerHTML = '<div style="padding:20px;color:var(--text-muted)">Loading run events…</div>';
+  document.getElementById('trace-modal').classList.add('show');
+  try {
+    var r = await apiFetch('/api/runs/' + encodeURIComponent(runId) + '/events');
+    var d = await r.json();
+    if (!r.ok || d.ok === false) {
+      document.getElementById('trace-content').innerHTML = '<div style="padding:20px;color:var(--red)">Failed to load run: ' + esc(d.error || 'unknown') + '</div>';
+      return;
+    }
+    var events = (d && d.events) || [];
+    if (events.length === 0) {
+      document.getElementById('trace-content').innerHTML = '<div style="padding:24px;color:var(--text-muted);line-height:1.6"><div style="font-weight:500;color:var(--text-secondary);margin-bottom:8px">No events captured for this run</div><div style="font-size:12px">Either the run pre-dates 1.18.85 (when the Event store was added) or the SDK errored before any message landed.<br/>The Recent history row carries the high-level status, error message, and goal verdict.</div></div>';
+      return;
+    }
+    document.getElementById('trace-content').innerHTML = renderRunDetailWaterfall(events, runId, jobName);
+  } catch (e) {
+    document.getElementById('trace-content').innerHTML = '<div style="padding:20px;color:var(--red)">Failed to load run: ' + esc(String(e)) + '</div>';
+  }
+}
+
+// Renders the waterfall. Each event becomes a row with:
+//   color border (by kind) · kind badge · time offset · brief preview · expand link
+// tool_call rows pair with their tool_result by toolUseId so the duration
+// is computed and shown alongside the call.
+function renderRunDetailWaterfall(events, runId, jobName) {
+  if (!events.length) return '';
+  var firstTs = events[0].ts ? new Date(events[0].ts).getTime() : Date.now();
+  var lastTs = events[events.length - 1].ts ? new Date(events[events.length - 1].ts).getTime() : firstTs;
+  var totalMs = Math.max(1, lastTs - firstTs);
+
+  // Pair tool_call with its tool_result for duration.
+  var resultByToolUseId = {};
+  for (var i = 0; i < events.length; i++) {
+    var e = events[i];
+    if (e.kind === 'tool_result' && e.toolUseId) {
+      resultByToolUseId[e.toolUseId] = e;
+    }
+  }
+
+  // Per-event color + label
+  function kindColor(k) {
+    if (k === 'session_start' || k === 'session_end') return 'var(--text-muted)';
+    if (k === 'llm_text') return 'var(--accent)';
+    if (k === 'thinking') return 'var(--purple)';
+    if (k === 'tool_call') return '#22c55e';
+    if (k === 'tool_result') return '#22c55e';
+    if (k === 'subagent_start' || k === 'subagent_stop') return '#a855f7';
+    if (k === 'rate_limit') return 'var(--yellow)';
+    if (k === 'hook') return 'var(--blue)';
+    if (k === 'error') return 'var(--red)';
+    return 'var(--text-muted)';
+  }
+  function kindLabel(k) {
+    return (k || 'event').toUpperCase().replace(/_/g, ' ');
+  }
+
+  // Header strip with summary
+  var startLabel = events[0].ts ? new Date(events[0].ts).toLocaleString() : '—';
+  var endEvent = events.find(function(e) { return e.kind === 'session_end'; });
+  var costStr = endEvent && endEvent.costUsd != null ? '$' + endEvent.costUsd.toFixed(4) : '—';
+  var stopReason = endEvent && endEvent.stopReason ? endEvent.stopReason : '—';
+  var html = '<div style="padding:16px 20px;border-bottom:1px solid var(--border);background:var(--bg-secondary);position:sticky;top:0;z-index:1">'
+    + '<div style="display:flex;align-items:center;gap:14px;font-size:11px;color:var(--text-muted);flex-wrap:wrap">'
+    +   '<span><strong style="color:var(--text-primary)">' + esc(events.length) + '</strong> events</span>'
+    +   '<span>·</span><span>started ' + esc(startLabel) + '</span>'
+    +   '<span>·</span><span>duration <strong style="color:var(--text-primary)">' + esc(formatDurationMs(totalMs)) + '</strong></span>'
+    +   '<span>·</span><span>cost <strong style="color:var(--text-primary)">' + esc(costStr) + '</strong></span>'
+    +   '<span>·</span><span>stop reason <strong style="color:var(--text-primary)">' + esc(stopReason) + '</strong></span>'
+    +   '<span style="flex:1"></span>'
+    +   '<code style="font-size:10px;color:var(--text-muted)">runId ' + esc(String(runId).slice(0, 12)) + '…</code>'
+    + '</div>'
+    + '</div>';
+
+  // Waterfall rows
+  html += '<div style="padding:0">';
+  for (var j = 0; j < events.length; j++) {
+    var ev = events[j];
+    var color = kindColor(ev.kind);
+    var label = kindLabel(ev.kind);
+    var tsMs = ev.ts ? new Date(ev.ts).getTime() : firstTs;
+    var offsetMs = tsMs - firstTs;
+    var offsetLabel = offsetMs === 0 ? '+0ms' : '+' + formatDurationMs(offsetMs);
+    var widthPct = Math.max(2, Math.min(100, (offsetMs / totalMs) * 100));
+    // For tool_call, compute duration to its paired tool_result.
+    var pairedDuration = '';
+    if (ev.kind === 'tool_call' && ev.toolUseId && resultByToolUseId[ev.toolUseId]) {
+      var resultTs = new Date(resultByToolUseId[ev.toolUseId].ts).getTime();
+      pairedDuration = ' · ran ' + formatDurationMs(Math.max(0, resultTs - tsMs));
+    }
+
+    // Brief preview: text for llm_text, thinking for thinking, tool name + first arg for tool_call/result, error for error.
+    var preview = '';
+    var fullContent = '';
+    if (ev.kind === 'llm_text' && ev.text) {
+      preview = String(ev.text).slice(0, 160).replace(/\\s+/g, ' ');
+      fullContent = String(ev.text);
+    } else if (ev.kind === 'thinking' && ev.thinking) {
+      preview = String(ev.thinking).slice(0, 160).replace(/\\s+/g, ' ');
+      fullContent = String(ev.thinking);
+    } else if (ev.kind === 'tool_call') {
+      preview = (ev.toolName || 'tool') + (ev.toolInput ? ' · ' + JSON.stringify(ev.toolInput).slice(0, 120) : '');
+      fullContent = ev.toolInput ? JSON.stringify(ev.toolInput, null, 2) : '';
+    } else if (ev.kind === 'tool_result') {
+      preview = ev.toolError ? '✗ ' + ev.toolError : (typeof ev.toolResult === 'string' ? ev.toolResult.slice(0, 160) : (ev.toolResult ? JSON.stringify(ev.toolResult).slice(0, 160) : ''));
+      fullContent = typeof ev.toolResult === 'string' ? ev.toolResult : JSON.stringify(ev.toolResult, null, 2);
+    } else if (ev.kind === 'error') {
+      preview = ev.toolError || '';
+      fullContent = ev.toolError || '';
+    } else if (ev.kind === 'session_start') {
+      preview = ev.sessionId ? 'session ' + String(ev.sessionId).slice(0, 8) + '…' : '';
+    } else if (ev.kind === 'session_end') {
+      preview = '$' + (ev.costUsd != null ? ev.costUsd.toFixed(4) : '?') + ' · ' + (ev.stopReason || '?');
+    }
+
+    var rowId = 'run-evt-' + j;
+    var canExpand = !!fullContent && fullContent.length > preview.length;
+    html += '<div style="display:grid;grid-template-columns:90px 110px 1fr;gap:14px;padding:10px 20px;border-bottom:1px solid var(--border);align-items:start">';
+    html += '<div style="font-size:10px;color:var(--text-muted);font-family:\\x27JetBrains Mono\\x27,monospace;line-height:18px">' + esc(offsetLabel) + '</div>';
+    html += '<div><span style="display:inline-block;background:' + color + '20;color:' + color + ';padding:2px 8px;border-radius:4px;font-size:10px;font-weight:600;letter-spacing:0.04em">' + esc(label) + '</span></div>';
+    html += '<div style="min-width:0">';
+    html +=   '<div style="font-size:12px;color:var(--text-primary);line-height:1.45;word-break:break-word">'
+      +     esc(preview)
+      +     (pairedDuration ? '<span style="color:var(--text-muted);font-size:11px"> ' + esc(pairedDuration) + '</span>' : '')
+      +   '</div>';
+    if (canExpand) {
+      html += '<button class="btn-sm" onclick="document.getElementById(\\x27' + rowId + '\\x27).style.display=document.getElementById(\\x27' + rowId + '\\x27).style.display===\\x27none\\x27?\\x27block\\x27:\\x27none\\x27" style="margin-top:6px;font-size:10px;padding:2px 8px">Expand</button>';
+      html += '<pre id="' + rowId + '" style="display:none;margin-top:8px;font-size:11px;font-family:\\x27JetBrains Mono\\x27,monospace;background:var(--bg-secondary);border:1px solid var(--border);padding:10px;border-radius:6px;white-space:pre-wrap;word-break:break-word;max-height:400px;overflow-y:auto">' + esc(fullContent) + '</pre>';
+    }
+    // Show toolUseId hint when present so user can correlate with logs.
+    if (ev.toolUseId) {
+      html += '<div style="font-size:10px;color:var(--text-muted);font-family:\\x27JetBrains Mono\\x27,monospace;margin-top:4px">use_id ' + esc(String(ev.toolUseId).slice(0, 12)) + '…</div>';
+    }
+    html += '</div></div>';
+  }
+  html += '</div>';
+  return html;
+}
 
 async function openTraceViewer(jobName) {
   document.getElementById('trace-modal-title').textContent = 'Trace: ' + jobName;
@@ -25524,7 +25680,7 @@ function renderCronRunDetails(lr) {
   if (Array.isArray(lr.mcpServersApplied) && lr.mcpServersApplied.length) {
     html += '<div style="font-size:11px;color:var(--text-muted);margin-bottom:6px">MCP servers: ' + esc(lr.mcpServersApplied.join(', ')) + '</div>';
   }
-  html += '<div style="margin-top:14px;display:flex;gap:8px"><button class="btn-sm" onclick="openTraceViewer(\\x27' + jsStr(lr.jobName || editingCronJob || '') + '\\x27)" style="font-size:11px">Open trace</button></div>';
+  html += '<div style="margin-top:14px;display:flex;gap:8px"><button class="btn-sm" onclick="openRunOrTrace(\\x27' + jsStr(lr.jobName || editingCronJob || '') + '\\x27,' + (lr.id ? '\\x27' + jsStr(lr.id) + '\\x27' : 'null') + ')" style="font-size:11px">' + (lr.id ? 'Open run' : 'Open trace') + '</button></div>';
   html += '</div>';
   return html;
 }
