@@ -518,8 +518,18 @@ export interface RunEvent {
   costUsd?: number;
   /** Stop reason from ResultMessage when kind='session_end'. */
   stopReason?: string;
-  /** Subagent id when kind='subagent_*'. */
+  /** Subagent id when kind='subagent_*' OR when an event was synthesized from
+   *  a subagent transcript via Path C backfill (subagent-backfill.ts). */
   agentId?: string;
+  /** PRD §6 Phase 4e: subagent slug ("bright-petting-kahn") for friendly
+   *  display in the Run detail waterfall. Only populated for events
+   *  synthesized from subagent transcripts. */
+  subagentSlug?: string;
+  /** PRD §6 Phase 4e: marks events as backfilled from a subagent transcript
+   *  rather than captured live by the in-process tap. The Run detail viewer
+   *  renders these in a nested swimlane and labels the source so users know
+   *  the data came from disk after the run. */
+  source?: 'live' | 'backfill';
 }
 
 /**

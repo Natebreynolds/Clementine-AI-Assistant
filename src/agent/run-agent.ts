@@ -622,6 +622,34 @@ export async function runAgent(prompt: string, opts: RunAgentOptions): Promise<R
     finalTextChars: finalText.length,
   }, 'runAgent: query complete');
 
+  // PRD §6 Phase 4e: subagent transcript backfill (Path C). The SDK persists
+  // every subagent's full message stream to ~/.claude/projects/<encoded-cwd>/
+  // <sessionId>/subagents/agent-*.jsonl. Path A only sees the parent's Task
+  // tool_use, so subagent-internal LLM/tool calls are invisible without this.
+  // Best-effort — telemetry must never block the run from returning.
+  try {
+    const { backfillSubagentEvents } = await import('./subagent-backfill.js');
+    const projectCwd = sdkOptionsRaw.cwd || BASE_DIR;
+    const backfillResult = await backfillSubagentEvents({
+      runId,
+      sessionId,
+      cwd: projectCwd,
+      eventLog,
+      startSeq: eventSeq,
+    });
+    eventSeq += backfillResult.backfilled;
+    if (backfillResult.backfilled > 0) {
+      logger.info({
+        runId,
+        sessionId,
+        backfilled: backfillResult.backfilled,
+        agents: backfillResult.agents,
+      }, 'runAgent: subagent backfill (Path C) complete');
+    }
+  } catch (err) {
+    logger.debug({ err }, 'runAgent: subagent backfill failed (non-fatal)');
+  }
+
   return {
     text: finalText,
     totalCostUsd,
