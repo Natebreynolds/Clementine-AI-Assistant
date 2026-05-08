@@ -15023,6 +15023,40 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
   /* ── Recent history row hover (Tasks page bottom zone) ── */
   .history-row { transition: background 0.12s ease; }
   .history-row:hover { background: var(--bg-hover); }
+  /* PRD §12 / 1.18.88: Health Strip — six glanceable tiles above the
+     Tasks pane. Always visible, refreshes on SSE + 30s poll. */
+  .health-strip {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+    gap: 10px;
+    margin-bottom: 18px;
+  }
+  .health-tile {
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 12px 14px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .health-tile-label {
+    font-size: 10px;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    font-weight: 500;
+  }
+  .health-tile-value {
+    font-size: 20px;
+    font-weight: 600;
+    color: var(--text-primary);
+    line-height: 1.2;
+  }
+  .health-tile-sub {
+    font-size: 11px;
+    color: var(--text-muted);
+  }
   /* PRD Phase 1.2: "Run task once" running-state pulse on the Last run tab. */
   @keyframes pulse {
     0%, 100% { opacity: 0.4; transform: scale(0.85); }
@@ -23555,6 +23589,78 @@ function renderRunningCard(item) {
     + '</div></div>';
 }
 
+// ── PRD §12 / 1.18.88: Health Strip ───────────────────────────────────
+// Six glanceable tiles above the Tasks pane: 24h runs / success rate /
+// P50 latency / P95 latency / active runs / top failure category.
+// Computed client-side from /api/cron/runs (already fetched by refreshCron).
+async function refreshHealthStrip() {
+  var strip = document.getElementById('health-strip');
+  if (!strip) return;
+  var runs = [];
+  try {
+    var r = await apiFetch('/api/cron/runs?limit=200');
+    var d = await r.json();
+    runs = (d && d.runs) || [];
+  } catch (e) { /* leave the strip empty if fetch fails */ }
+  // Filter to last 24h.
+  var cutoff = Date.now() - 24 * 60 * 60 * 1000;
+  var last24 = runs.filter(function(rn) { return rn.startedAt && new Date(rn.startedAt).getTime() >= cutoff; });
+  // Success / failure split.
+  var ok = last24.filter(function(rn) { return rn.status === 'ok'; }).length;
+  var failed = last24.filter(function(rn) { return rn.status === 'error' || rn.status === 'timeout' || rn.status === 'lost'; }).length;
+  var successRate = last24.length > 0 ? Math.round((ok / last24.length) * 100) : null;
+  // Latency distribution (terminal runs only — exclude in-progress).
+  var durations = last24
+    .filter(function(rn) { return rn.durationMs != null && rn.status !== 'running' && rn.status !== 'lost'; })
+    .map(function(rn) { return rn.durationMs; })
+    .sort(function(a, b) { return a - b; });
+  function pct(arr, p) {
+    if (arr.length === 0) return null;
+    var idx = Math.min(arr.length - 1, Math.floor(arr.length * p / 100));
+    return arr[idx];
+  }
+  var p50 = pct(durations, 50);
+  var p95 = pct(durations, 95);
+  // Active runs come from /api/build/operations runningNow which refreshCron
+  // has already loaded into the cronJobsData side-channel; tap operations
+  // summary if it's hanging around in the DOM, otherwise fetch it ourselves.
+  var activeRuns = 0;
+  try {
+    var ops = await apiFetch('/api/build/operations?hours=1&limit=10').then(function(rr) { return rr.json(); });
+    activeRuns = ((ops && ops.runningNow) || []).length;
+  } catch (e) { /* fall back to 0 */ }
+  // Top failure category for the day.
+  var catCounts = {};
+  for (var i = 0; i < last24.length; i++) {
+    var c = last24[i].failureCategory;
+    if (c) catCounts[c] = (catCounts[c] || 0) + 1;
+  }
+  var topCat = null, topCount = 0;
+  Object.keys(catCounts).forEach(function(k) {
+    if (catCounts[k] > topCount) { topCat = k; topCount = catCounts[k]; }
+  });
+  // Render six tiles.
+  function tile(label, value, sub, color) {
+    return '<div class="health-tile">'
+      + '<div class="health-tile-label">' + esc(label) + '</div>'
+      + '<div class="health-tile-value"' + (color ? ' style="color:' + color + '"' : '') + '>' + (value === null || value === undefined ? '—' : esc(String(value))) + '</div>'
+      + (sub ? '<div class="health-tile-sub">' + esc(sub) + '</div>' : '')
+      + '</div>';
+  }
+  var srColor = successRate === null ? null
+    : successRate >= 95 ? 'var(--green)'
+    : successRate >= 80 ? 'var(--yellow)'
+    : 'var(--red)';
+  var html = '';
+  html += tile('Runs · 24h', last24.length, ok + ' ok · ' + failed + ' failed');
+  html += tile('Success rate', successRate === null ? '—' : (successRate + '%'), null, srColor);
+  html += tile('P50 latency', p50 === null ? '—' : formatDurationMs(p50), 'median run time');
+  html += tile('P95 latency', p95 === null ? '—' : formatDurationMs(p95), '95th percentile');
+  html += tile('Running now', activeRuns, activeRuns === 0 ? 'idle' : 'live');
+  html += tile('Top failure', topCat ? _runListCategoryLabel(topCat) : '—', topCat ? topCount + ' run' + (topCount === 1 ? '' : 's') : 'no failures', topCat ? _runListCategoryColor(topCat) : null);
+  strip.innerHTML = html;
+}
+
 // ── PRD Phase 3: Run list ──────────────────────────────────────────────
 // Single sortable/filterable table of every CronRunEntry across all tasks.
 // Filters: status, task name, time window. Browser-local saved views.
@@ -24191,7 +24297,11 @@ async function refreshCron() {
     var visibleRunning = ownerScoped ? (ops.runningNow || []).filter(function(i) { return buildOpsOwnerMatches(i.owner || ''); }) : (ops.runningNow || []);
     var ownerFilter = getBuildOwnerFilter();
 
-    var html = renderOperationsSummary(ops);
+    // PRD §12 / 1.18.88: Health Strip placeholder. The runs payload from
+    // /api/cron/runs (already fetched alongside ops) feeds the metrics.
+    // Render an empty shell first; refreshHealthStrip fills it in.
+    var html = '<div id="health-strip" class="health-strip"></div>';
+    html += renderOperationsSummary(ops);
 
     // ── Zone 1 — Running now (promoted to top, primary "what's live" view) ──
     if (visibleRunning.length > 0) {
@@ -24240,6 +24350,11 @@ async function refreshCron() {
     html += renderRecentHistoryList(historyData);
 
     panel.innerHTML = html;
+    // PRD §12 / 1.18.88: populate the Health Strip after the panel renders.
+    // Fire-and-forget — the strip lives at the top, fills in async.
+    if (typeof refreshHealthStrip === 'function') {
+      refreshHealthStrip().catch(function() { /* non-fatal */ });
+    }
     panel.onclick = function(ev) {
       var target = ev.target;
       while (target && target.id !== 'panel-cron') {
