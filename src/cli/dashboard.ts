@@ -23102,6 +23102,22 @@ function renderScheduledTaskCard(task) {
     var ok = lr.status === 'ok';
     var statusIcon = ok ? '<span style="color:var(--green)">&#10003;</span>' : '<span style="color:var(--red)">&#10007;</span>';
     lastRunHtml = statusIcon + ' ' + esc(lr.status || 'unknown') + ' · ' + esc(timeAgo(lr.finishedAt || lr.startedAt || ''));
+    // PRD Phase 1.1: goal pill. Orthogonal to status — a run can be status='ok'
+    // but goalCheck.status='fail' (the agent finished cleanly without
+    // accomplishing the stated goal). That's exactly the failure mode the
+    // PRD's goal-orientation feature is designed to surface.
+    if (lr.goalCheck) {
+      var gc = lr.goalCheck;
+      var gIcon = gc.status === 'pass' ? '🎯' : gc.status === 'fail' ? '✗' : gc.status === 'error' ? '⚠' : '';
+      var gColor = gc.status === 'pass' ? 'var(--green)' : gc.status === 'fail' ? 'var(--red)' : 'var(--yellow)';
+      var gLabel = gc.status === 'pass' ? 'goal met' : gc.status === 'fail' ? 'goal not met' : gc.status === 'error' ? 'goal eval failed' : '';
+      var gTip = '';
+      if (gc.evaluatorReason) gTip = gc.evaluatorReason;
+      else if (Array.isArray(gc.schemaErrors) && gc.schemaErrors.length) gTip = 'Schema errors: ' + gc.schemaErrors.join('; ');
+      if (gIcon && gLabel) {
+        lastRunHtml += ' <span style="color:' + gColor + ';font-size:11px;font-weight:500" title="' + esc(gTip || gLabel) + '">· ' + gIcon + ' ' + esc(gLabel) + '</span>';
+      }
+    }
     // "ran with: …" — surface the skills + MCP that were live for this run.
     var ranWith = [];
     if (Array.isArray(lr.skillsApplied) && lr.skillsApplied.length > 0) {
@@ -23208,8 +23224,23 @@ function renderRecentHistoryList(runs) {
       var preview = String(entry.outputPreview).slice(0, 140);
       errorPreview = '<div style="font-size:11px;color:var(--text-muted);margin-top:2px;word-break:break-word">' + esc(preview) + '</div>';
     }
-    rowsHtml += '<div class="history-row" data-trace-job="' + esc(jobName) + '" style="display:grid;grid-template-columns:24px minmax(180px,1.2fr) minmax(180px,1fr) 90px auto;gap:10px;align-items:start;padding:8px 14px;border-bottom:1px solid var(--border);cursor:pointer">'
+    // PRD Phase 1.1: goal cell. Empty cell when no goal configured (status='skipped'
+    // returned by runGoalCheck means "no goal" — but we omit goalCheck entirely
+    // in that case, so missing field == no goal). The cell stays present in the
+    // grid for column alignment.
+    var goalCellHtml = '<div></div>';
+    if (entry.goalCheck) {
+      var gc2 = entry.goalCheck;
+      var gIcon2 = gc2.status === 'pass' ? '🎯' : gc2.status === 'fail' ? '✗' : gc2.status === 'error' ? '⚠' : '';
+      var gColor2 = gc2.status === 'pass' ? 'var(--green)' : gc2.status === 'fail' ? 'var(--red)' : 'var(--yellow)';
+      var gTip2 = gc2.evaluatorReason
+        ? gc2.evaluatorReason
+        : (Array.isArray(gc2.schemaErrors) && gc2.schemaErrors.length ? 'Schema errors: ' + gc2.schemaErrors.join('; ') : gc2.status);
+      goalCellHtml = '<div style="color:' + gColor2 + ';font-size:13px;line-height:18px;text-align:center" title="' + esc(gTip2) + '">' + gIcon2 + '</div>';
+    }
+    rowsHtml += '<div class="history-row" data-trace-job="' + esc(jobName) + '" style="display:grid;grid-template-columns:24px 24px minmax(180px,1.2fr) minmax(180px,1fr) 90px auto;gap:10px;align-items:start;padding:8px 14px;border-bottom:1px solid var(--border);cursor:pointer">'
       + '<div style="color:' + statusColor + ';font-size:14px;line-height:18px;text-align:center" title="' + esc(status) + '">' + statusIcon + '</div>'
+      + goalCellHtml
       + '<div style="min-width:0">'
         + '<div style="font-weight:500;color:var(--text-primary);font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + esc(jobName) + '">' + esc(jobName) + attemptLabel + '</div>'
         + errorPreview
@@ -23220,8 +23251,10 @@ function renderRecentHistoryList(runs) {
       + '</div>';
   }
   return '<div class="history-list" style="background:var(--bg-secondary);border:1px solid var(--border);border-radius:var(--radius)">'
-    + '<div style="display:grid;grid-template-columns:24px minmax(180px,1.2fr) minmax(180px,1fr) 90px auto;gap:10px;padding:8px 14px;border-bottom:1px solid var(--border);font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.04em;font-weight:500">'
-      + '<div></div><div>Task</div><div>Started</div><div>Duration</div><div></div>'
+    + '<div style="display:grid;grid-template-columns:24px 24px minmax(180px,1.2fr) minmax(180px,1fr) 90px auto;gap:10px;padding:8px 14px;border-bottom:1px solid var(--border);font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.04em;font-weight:500">'
+      + '<div title="Run status (ok / error / etc.)"></div>'
+      + '<div title="Goal check result — orthogonal to run status">Goal</div>'
+      + '<div>Task</div><div>Started</div><div>Duration</div><div></div>'
     + '</div>'
     + rowsHtml
     + '</div>';

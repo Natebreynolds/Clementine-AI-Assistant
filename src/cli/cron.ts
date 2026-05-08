@@ -12,7 +12,7 @@ import os from 'node:os';
 import path from 'node:path';
 import cron from 'node-cron';
 import matter from 'gray-matter';
-import type { CronJobDefinition } from '../types.js';
+import type { CronJobDefinition, CronRunEntry } from '../types.js';
 import {
   parseCronJobs,
   HeartbeatScheduler,
@@ -170,7 +170,7 @@ export async function cmdCronRun(jobName: string): Promise<void> {
     const response = await gateway.handleCronJob(job.name, job.prompt, job.tier, job.maxTurns, job.model, job.workDir, job.mode, job.maxHours);
     const finishedAt = new Date();
 
-    runLog.append({
+    const entry: CronRunEntry = {
       jobName: job.name,
       startedAt: startedAt.toISOString(),
       finishedAt: finishedAt.toISOString(),
@@ -178,7 +178,21 @@ export async function cmdCronRun(jobName: string): Promise<void> {
       durationMs: finishedAt.getTime() - startedAt.getTime(),
       attempt: 1,
       outputPreview: response ? response.slice(0, 200) : undefined,
-    });
+    };
+
+    // PRD Phase 1.1: goal-orientation evaluator (mirrors the daemon path).
+    if (job.successSchema || (job.successCriteriaText && job.successCriteriaText.trim())) {
+      try {
+        const { runGoalCheck } = await import('../agent/goal-evaluator.js');
+        const goalCheck = await runGoalCheck(response ?? '', job);
+        if (goalCheck) entry.goalCheck = goalCheck;
+      } catch (err) {
+        // Never block logging on evaluator failure.
+        entry.goalCheck = { status: 'error', mode: 'evaluator', evaluatorReason: `evaluator orchestrator threw: ${String(err).slice(0, 200)}` };
+      }
+    }
+
+    runLog.append(entry);
 
     console.log(response || '(no output)');
     if (response && response !== '__NOTHING__') {
