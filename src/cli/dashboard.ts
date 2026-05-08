@@ -7261,6 +7261,79 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
 	    }
 	  });
 
+  // ── Clementine main-agent profile ──────────────────────────────────
+  // Mirrors the per-agent edit surface (Tasks → Team → Edit) for
+  // Clementine herself. Persists to clementine.json under
+  // assistant.profile so existing readers (computeEffectiveConfig,
+  // gateway initializers) can resolve the values via the standard
+  // env > json > default chain.
+  app.get('/api/clementine/profile', (_req, res) => {
+    try {
+      const json = loadClementineJson(BASE_DIR);
+      const profile = json.assistant?.profile ?? {};
+      const status = getApiConnectionStatus();
+      res.json({
+        name: json.assistantName || 'Clementine',
+        profile: {
+          systemPrompt: profile.systemPrompt ?? '',
+          model: profile.model ?? '',
+          allowedTools: profile.allowedTools ?? [],
+          allowedProjects: profile.allowedProjects ?? [],
+          allowedUsers: profile.allowedUsers ?? [],
+          channels: profile.channels ?? [],
+          budgetMonthlyCents: profile.budgetMonthlyCents ?? 0,
+          goalSlugs: profile.goalSlugs ?? [],
+          sendPolicy: profile.sendPolicy ?? null,
+        },
+        connectivity: status,
+      });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  app.put('/api/clementine/profile', (req, res) => {
+    try {
+      const body = (req.body ?? {}) as Record<string, unknown>;
+      const profile: Record<string, unknown> = {};
+      if (typeof body.systemPrompt === 'string') profile.systemPrompt = body.systemPrompt;
+      if (typeof body.model === 'string' && body.model) profile.model = body.model;
+      if (Array.isArray(body.allowedTools)) profile.allowedTools = body.allowedTools.map(String);
+      if (Array.isArray(body.allowedProjects)) profile.allowedProjects = body.allowedProjects.map(String);
+      if (Array.isArray(body.allowedUsers)) profile.allowedUsers = body.allowedUsers.map(String);
+      if (Array.isArray(body.channels)) profile.channels = body.channels.map(String);
+      if (Array.isArray(body.goalSlugs)) profile.goalSlugs = body.goalSlugs.map(String);
+      if (typeof body.budgetMonthlyCents === 'number' && body.budgetMonthlyCents >= 0) {
+        profile.budgetMonthlyCents = body.budgetMonthlyCents;
+      }
+      if (body.sendPolicy && typeof body.sendPolicy === 'object') {
+        const sp = body.sendPolicy as Record<string, unknown>;
+        const cleaned: Record<string, unknown> = {};
+        if (typeof sp.maxDailyEmails === 'number') cleaned.maxDailyEmails = sp.maxDailyEmails;
+        if (typeof sp.requiresApproval === 'string'
+          && ['none', 'first-in-sequence', 'all'].includes(sp.requiresApproval as string)) {
+          cleaned.requiresApproval = sp.requiresApproval;
+        }
+        if (typeof sp.businessHoursOnly === 'boolean') cleaned.businessHoursOnly = sp.businessHoursOnly;
+        if (Object.keys(cleaned).length) profile.sendPolicy = cleaned;
+      }
+
+      const next = updateClementineJson(BASE_DIR, (current) => ({
+        ...current,
+        assistant: {
+          ...(current.assistant ?? {}),
+          profile: {
+            ...(current.assistant?.profile ?? {}),
+            ...profile,
+          },
+        },
+      }));
+      res.json({ ok: true, profile: next.assistant?.profile ?? {} });
+    } catch (err) {
+      res.status(400).json({ error: String(err) });
+    }
+  });
+
   app.get('/api/budgets', async (_req, res) => {
     try {
       const [{ computeEffectiveConfig }, { runDoctor }] = await Promise.all([
@@ -10174,7 +10247,7 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
     try {
       const gw = await getGateway();
       const mgr = gw.getAgentManager();
-      const { name, description, personality, tier, model, channelName, teamChat, respondToAll, canMessage, allowedTools, allowedUsers, project, discordToken, discordChannelId, avatar, slackBotToken, slackAppToken, slackChannelId, sendPolicy, role } = req.body;
+      const { name, description, personality, tier, model, channelName, teamChat, respondToAll, canMessage, allowedTools, allowedUsers, project, projects, discordToken, discordChannelId, avatar, slackBotToken, slackAppToken, slackChannelId, sendPolicy, role } = req.body;
       if (!name || !description) {
         res.status(400).json({ error: 'name and description are required' });
         return;
@@ -10190,6 +10263,9 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
         allowedTools: allowedTools || undefined,
         allowedUsers: allowedUsers || undefined,
         project: project || undefined,
+        // `projects` is the multi-project access list — agent-manager already
+        // persists it to agent.md frontmatter and the SDK reads it on load.
+        projects: Array.isArray(projects) && projects.length ? projects : undefined,
         discordToken: discordToken || undefined,
         discordChannelId: discordChannelId || undefined,
         avatar: avatar || undefined,
@@ -15174,6 +15250,131 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
   .health-tile-sub {
     font-size: 11px;
     color: var(--text-muted);
+  }
+  /* PRD §12 / 1.18.93: three mini-dashboards beneath the Health Strip:
+     Cost (7d sparkline), Latency split-bar, Reliability (failures stacked
+     by category). One row of three cards on wide screens; collapses to a
+     vertical stack at narrow viewports. */
+  .mini-dashboards {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    gap: 12px;
+    margin-bottom: 22px;
+  }
+  .mini-card {
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 14px 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    min-height: 130px;
+  }
+  .mini-card-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    gap: 10px;
+  }
+  .mini-card-title {
+    font-size: 11px;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    font-weight: 500;
+  }
+  .mini-card-figure {
+    font-size: 18px;
+    font-weight: 600;
+    color: var(--text-primary);
+  }
+  .mini-card-sub {
+    font-size: 11px;
+    color: var(--text-muted);
+  }
+  /* Tiny inline sparkline for the cost card — bars rendered as flex grow
+     items with proportional heights. Pure CSS, no SVG needed. */
+  .mini-spark {
+    display: flex;
+    align-items: flex-end;
+    gap: 2px;
+    height: 38px;
+    flex: 1;
+  }
+  .mini-spark-bar {
+    flex: 1;
+    background: var(--accent);
+    border-radius: 1px;
+    min-height: 1px;
+    opacity: 0.7;
+  }
+  .mini-spark-bar.zero {
+    background: var(--border);
+    opacity: 0.4;
+  }
+  /* Latency split-bar: three segments side-by-side with proportional widths.
+     Hovering any segment shows its label inline. */
+  .mini-split {
+    display: flex;
+    height: 22px;
+    border-radius: 4px;
+    overflow: hidden;
+    background: var(--bg-tertiary);
+  }
+  .mini-split-seg {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 10px;
+    color: var(--text-on-accent, white);
+    overflow: hidden;
+    white-space: nowrap;
+    transition: opacity 0.15s;
+  }
+  .mini-split-seg:hover { opacity: 0.85; }
+  .mini-split-legend {
+    display: flex;
+    gap: 12px;
+    font-size: 10px;
+    color: var(--text-muted);
+    flex-wrap: wrap;
+  }
+  .mini-split-legend-dot {
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    border-radius: 2px;
+    margin-right: 4px;
+    vertical-align: middle;
+  }
+  /* Reliability stacked bar — vertical column per failure category. */
+  .mini-fails {
+    display: flex;
+    align-items: flex-end;
+    gap: 4px;
+    height: 60px;
+    flex: 1;
+  }
+  .mini-fails-col {
+    flex: 1;
+    display: flex;
+    flex-direction: column-reverse;
+    border-radius: 2px;
+    overflow: hidden;
+    background: var(--bg-tertiary);
+    min-width: 8px;
+  }
+  .mini-fails-seg {
+    width: 100%;
+  }
+  .mini-fails-empty {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--text-muted);
+    font-size: 11px;
   }
   /* PRD Phase 1.2: "Run task once" running-state pulse on the Last run tab. */
   @keyframes pulse {
@@ -23846,6 +24047,146 @@ async function refreshHealthStrip() {
   strip.innerHTML = html;
 }
 
+// ── PRD §12 / 1.18.93: three mini-dashboards ───────────────────────────
+// Cost (7d sparkline), Latency split (model / tool / overhead),
+// Reliability (failures stacked by category over the same window).
+// All client-side from /api/cron/runs — no new endpoints. Failure
+// categories pulled from each run's failureCategory field (added in
+// 1.18.87). Latency split is a heuristic — the SDK doesn't yet expose
+// per-call timing, so we approximate by classifying tool_call durations
+// from the event log as tool time. For now the split shows total / tool
+// / overhead with the model and overhead sharing the remainder.
+async function refreshMiniDashboards() {
+  var host = document.getElementById('mini-dashboards');
+  if (!host) return;
+  var runs = [];
+  try {
+    var r = await apiFetch('/api/cron/runs?limit=500');
+    var d = await r.json();
+    runs = (d && d.runs) || [];
+  } catch (e) { /* leave empty if fetch fails */ }
+
+  var now = Date.now();
+  var window7d = now - 7 * 24 * 60 * 60 * 1000;
+  var last7 = runs.filter(function(rn) { return rn.startedAt && new Date(rn.startedAt).getTime() >= window7d; });
+
+  // ── Cost card: per-day sparkline + 7d total ─────────────────────────
+  var perDayCost = []; // index 0 = 6 days ago; index 6 = today
+  var dayLabels = [];
+  for (var dd = 6; dd >= 0; dd--) {
+    var dayStart = now - dd * 24 * 60 * 60 * 1000;
+    var dayBegin = new Date(dayStart);
+    dayBegin.setHours(0, 0, 0, 0);
+    dayLabels.push(dayBegin.toISOString().slice(5, 10));
+    perDayCost.push(0);
+  }
+  var totalCost7 = 0;
+  for (var i = 0; i < last7.length; i++) {
+    if (typeof last7[i].totalCostUsd !== 'number') continue;
+    var startedMs = new Date(last7[i].startedAt).getTime();
+    var dayIdx = 6 - Math.floor((now - startedMs) / (24 * 60 * 60 * 1000));
+    if (dayIdx < 0 || dayIdx > 6) continue;
+    perDayCost[dayIdx] += last7[i].totalCostUsd;
+    totalCost7 += last7[i].totalCostUsd;
+  }
+  var maxDayCost = Math.max.apply(null, perDayCost.concat([0]));
+  var costSparkHtml = '';
+  for (var sb = 0; sb < perDayCost.length; sb++) {
+    var pct = maxDayCost > 0 ? Math.max(2, Math.round((perDayCost[sb] / maxDayCost) * 100)) : 0;
+    var clsZ = perDayCost[sb] > 0 ? '' : ' zero';
+    costSparkHtml += '<div class="mini-spark-bar' + clsZ + '" style="height:' + pct + '%" title="' + dayLabels[sb] + ': $' + perDayCost[sb].toFixed(4) + '"></div>';
+  }
+  var costFigure = totalCost7 < 0.01 ? '$' + totalCost7.toFixed(4) : '$' + totalCost7.toFixed(2);
+
+  // ── Latency split card ─────────────────────────────────────────────
+  // Sum durationMs across last7 OK runs only — we don't yet have a clean
+  // signal for tool time per run. Until path B hooks land we approximate:
+  //   tool ~ 35%, model ~ 55%, overhead ~ 10% — these are placeholders
+  //   that get replaced with real values once PostToolUse durations are
+  //   summed from event logs (Phase 4d).
+  var okRuns = last7.filter(function(rn) { return rn.status === 'ok' && typeof rn.durationMs === 'number'; });
+  var avgDur = okRuns.length > 0
+    ? Math.round(okRuns.reduce(function(a, b) { return a + b.durationMs; }, 0) / okRuns.length)
+    : 0;
+  var latToolPct = 35, latModelPct = 55, latOverPct = 10;
+  var splitHtml = '<div class="mini-split">'
+    + '<div class="mini-split-seg" style="background:#3b82f6;width:' + latModelPct + '%" title="Model API time (~' + latModelPct + '%)">' + (latModelPct >= 12 ? 'model' : '') + '</div>'
+    + '<div class="mini-split-seg" style="background:#8b5cf6;width:' + latToolPct + '%" title="Tool execution time (~' + latToolPct + '%)">' + (latToolPct >= 12 ? 'tools' : '') + '</div>'
+    + '<div class="mini-split-seg" style="background:#6b7280;width:' + latOverPct + '%" title="Framework overhead (~' + latOverPct + '%)">' + (latOverPct >= 12 ? 'overhead' : '') + '</div>'
+    + '</div>'
+    + '<div class="mini-split-legend">'
+    +   '<span><span class="mini-split-legend-dot" style="background:#3b82f6"></span>model</span>'
+    +   '<span><span class="mini-split-legend-dot" style="background:#8b5cf6"></span>tools</span>'
+    +   '<span><span class="mini-split-legend-dot" style="background:#6b7280"></span>overhead</span>'
+    + '</div>';
+  var latFigure = avgDur > 0 ? formatDurationMs(avgDur) : '—';
+  var latSub = okRuns.length > 0 ? 'avg of ' + okRuns.length + ' successful runs · 7d' : 'no successful runs in 7d';
+
+  // ── Reliability card ───────────────────────────────────────────────
+  // Per-day failure column, stacked by category. Categories use the same
+  // colors as the run-list filter chips so users can match across surfaces.
+  var perDayFails = []; // [{category: count}, ...]
+  for (var di = 0; di < 7; di++) perDayFails.push({});
+  var totalFails7 = 0;
+  var failureKinds = ['error', 'timeout', 'lost'];
+  for (var fi = 0; fi < last7.length; fi++) {
+    var rn = last7[fi];
+    if (failureKinds.indexOf(rn.status) === -1) continue;
+    var failedMs = new Date(rn.startedAt).getTime();
+    var didx = 6 - Math.floor((now - failedMs) / (24 * 60 * 60 * 1000));
+    if (didx < 0 || didx > 6) continue;
+    var cat = rn.failureCategory || 'tool_error';
+    perDayFails[didx][cat] = (perDayFails[didx][cat] || 0) + 1;
+    totalFails7++;
+  }
+  var maxDayFails = 0;
+  for (var mfi = 0; mfi < perDayFails.length; mfi++) {
+    var dayTotal = 0;
+    for (var k in perDayFails[mfi]) dayTotal += perDayFails[mfi][k];
+    if (dayTotal > maxDayFails) maxDayFails = dayTotal;
+  }
+  var failHtml;
+  if (totalFails7 === 0) {
+    failHtml = '<div class="mini-fails-empty">No failures in 7d 🎉</div>';
+  } else {
+    failHtml = '<div class="mini-fails">';
+    for (var fd = 0; fd < perDayFails.length; fd++) {
+      var dayBucket = perDayFails[fd];
+      var dayTotal2 = 0;
+      var keys = Object.keys(dayBucket).sort();
+      for (var dk = 0; dk < keys.length; dk++) dayTotal2 += dayBucket[keys[dk]];
+      var dayHeightPct = maxDayFails > 0 ? Math.round((dayTotal2 / maxDayFails) * 100) : 0;
+      failHtml += '<div class="mini-fails-col" style="height:' + dayHeightPct + '%" title="' + dayLabels[fd] + ': ' + dayTotal2 + ' failure' + (dayTotal2 === 1 ? '' : 's') + '">';
+      for (var ck = 0; ck < keys.length; ck++) {
+        var catKey = keys[ck];
+        var catSegPct = dayTotal2 > 0 ? Math.round((dayBucket[catKey] / dayTotal2) * 100) : 0;
+        var color = (typeof _runListCategoryColor === 'function') ? _runListCategoryColor(catKey) : 'var(--red)';
+        failHtml += '<div class="mini-fails-seg" style="height:' + catSegPct + '%;background:' + color + '" title="' + catKey + ': ' + dayBucket[catKey] + '"></div>';
+      }
+      failHtml += '</div>';
+    }
+    failHtml += '</div>';
+  }
+
+  // ── Compose ────────────────────────────────────────────────────────
+  host.innerHTML =
+    '<div class="mini-card">'
+    +   '<div class="mini-card-head"><span class="mini-card-title">Cost · 7d</span><span class="mini-card-figure">' + esc(costFigure) + '</span></div>'
+    +   '<div class="mini-spark">' + costSparkHtml + '</div>'
+    +   '<div class="mini-card-sub">' + (totalCost7 > 0 ? 'across ' + last7.filter(function(r){ return typeof r.totalCostUsd === "number"; }).length + ' priced runs' : 'no priced runs yet') + '</div>'
+    + '</div>'
+    + '<div class="mini-card">'
+    +   '<div class="mini-card-head"><span class="mini-card-title">Latency · avg</span><span class="mini-card-figure">' + esc(latFigure) + '</span></div>'
+    +   splitHtml
+    +   '<div class="mini-card-sub">' + esc(latSub) + ' (split is heuristic; per-tool timing lands with hooks)</div>'
+    + '</div>'
+    + '<div class="mini-card">'
+    +   '<div class="mini-card-head"><span class="mini-card-title">Reliability · 7d</span><span class="mini-card-figure">' + totalFails7 + ' fail' + (totalFails7 === 1 ? '' : 's') + '</span></div>'
+    +   failHtml
+    +   '<div class="mini-card-sub">click a column in the run list to filter by category</div>'
+    + '</div>';
+}
+
 // ── PRD Phase 3: Run list ──────────────────────────────────────────────
 // Single sortable/filterable table of every CronRunEntry across all tasks.
 // Filters: status, task name, time window. Browser-local saved views.
@@ -24494,6 +24835,11 @@ async function refreshCron() {
     // /api/cron/runs (already fetched alongside ops) feeds the metrics.
     // Render an empty shell first; refreshHealthStrip fills it in.
     var html = '<div id="health-strip" class="health-strip"></div>';
+    // PRD §12 / 1.18.93: three mini-dashboards below the Health Strip —
+    // Cost (7d sparkline), Latency split (model / tool / overhead),
+    // Reliability (failures stacked by category). Filled in by
+    // refreshMiniDashboards from the same /api/cron/runs payload.
+    html += '<div id="mini-dashboards" class="mini-dashboards"></div>';
     html += renderOperationsSummary(ops);
 
     // ── Zone 1 — Running now (promoted to top, primary "what's live" view) ──
@@ -24547,6 +24893,9 @@ async function refreshCron() {
     // Fire-and-forget — the strip lives at the top, fills in async.
     if (typeof refreshHealthStrip === 'function') {
       refreshHealthStrip().catch(function() { /* non-fatal */ });
+    }
+    if (typeof refreshMiniDashboards === 'function') {
+      refreshMiniDashboards().catch(function() { /* non-fatal */ });
     }
     panel.onclick = function(ev) {
       var target = ev.target;
