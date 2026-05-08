@@ -1379,6 +1379,9 @@ export class CronScheduler {
             trigger,
             // 1.18.85: stable UUID linking this run to its Event store entries.
             ...(cronMetadata?.runId ? { id: cronMetadata.runId } : {}),
+            // 1.18.89: per-run cost for the Run list + Health Strip. Comes from
+            // SDK's ResultMessage.total_cost_usd via runAgent's side-channel.
+            ...(cronMetadata?.totalCostUsd != null ? { totalCostUsd: cronMetadata.totalCostUsd } : {}),
             // Trick capability metadata — surfaced by the dashboard's
             // "ran with: …" line. Omit empty arrays to keep the JSONL light.
             ...(cronMetadata?.skillsApplied?.length ? { skillsApplied: cronMetadata.skillsApplied } : {}),
@@ -1483,6 +1486,9 @@ export class CronScheduler {
             // can show trigger + open the partial Event log if any.
             trigger,
             ...(errCronMetadata?.runId ? { id: errCronMetadata.runId } : {}),
+            // 1.18.89: cost on the error path too — partial-completion runs may
+            // still have spent budget before the throw.
+            ...(errCronMetadata?.totalCostUsd != null ? { totalCostUsd: errCronMetadata.totalCostUsd } : {}),
             ...(errCronMetadata?.skillsApplied?.length ? { skillsApplied: errCronMetadata.skillsApplied } : {}),
             ...(errCronMetadata?.skillsMissing?.length ? { skillsMissing: errCronMetadata.skillsMissing } : {}),
             ...(errCronMetadata?.allowedToolsApplied?.length ? { allowedToolsApplied: errCronMetadata.allowedToolsApplied } : {}),

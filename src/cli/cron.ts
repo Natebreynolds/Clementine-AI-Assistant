@@ -179,6 +179,7 @@ export async function cmdCronRun(jobName: string): Promise<void> {
     // to the Event store.
     const sideChannel = gateway.consumeLastCronRunMetadata?.();
     const runIdFromGateway = sideChannel?.runId;
+    const totalCostFromGateway = sideChannel?.totalCostUsd;
     const entry: CronRunEntry = {
       jobName: job.name,
       startedAt: startedAt.toISOString(),
@@ -189,6 +190,8 @@ export async function cmdCronRun(jobName: string): Promise<void> {
       outputPreview: response ? response.slice(0, 200) : undefined,
       trigger,
       ...(runIdFromGateway ? { id: runIdFromGateway } : {}),
+      // 1.18.89: per-run cost for the dashboard Cost column / Health Strip tile.
+      ...(totalCostFromGateway != null ? { totalCostUsd: totalCostFromGateway } : {}),
     };
 
     // PRD Phase 1.1: goal-orientation evaluator (mirrors the daemon path).

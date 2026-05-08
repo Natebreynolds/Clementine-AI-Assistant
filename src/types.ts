@@ -597,6 +597,11 @@ export interface CronRunEntry {
    *  whose status indicates a failure (error/timeout/lost/cancelled). The
    *  Run list filter chip and Run detail header read from this field. */
   failureCategory?: RunFailureCategory;
+  /** PRD §12 / 1.18.89: total cost in USD as reported by the SDK's
+   *  ResultMessage.total_cost_usd. Stamped on success/error entries by
+   *  the scheduler from the runAgent result side-channel. Powers the
+   *  Run list Cost column and the Health Strip's 24h cost tile. */
+  totalCostUsd?: number;
   /** PRD Phase 1: did the run accomplish what it was supposed to?
    *  Computed at run-end when the Task has successSchema or successCriteriaText.
    *  - status='pass'      both configured checks passed (or the only one configured did)

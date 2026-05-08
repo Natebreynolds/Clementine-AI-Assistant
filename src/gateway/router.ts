@@ -176,6 +176,10 @@ export class Gateway {
     /** PRD §6 / 1.18.85: stable run UUID from runAgent — pinned onto the
      *  CronRunEntry so the Run detail page can join run row → events. */
     runId?: string;
+    /** PRD §12 / 1.18.89: total cost in USD from the SDK ResultMessage.
+     *  Pinned onto CronRunEntry so the Run list Cost column + Health Strip
+     *  cost tile have data without joining the event store on every read. */
+    totalCostUsd?: number;
   };
 
   /** Persisted set of channel keys the owner has approved. Loaded lazily. */
@@ -2303,6 +2307,7 @@ export class Gateway {
           allowedToolsApplied: cronResult.allowedToolsApplied,
           mcpServersApplied: cronResult.mcpServersApplied,
           runId: cronResult.runId,
+          totalCostUsd: cronResult.totalCostUsd,
         };
         logger.info({
           jobName,
@@ -2506,6 +2511,8 @@ export class Gateway {
     mcpServersApplied: string[];
     /** PRD §6 / 1.18.85: run UUID from runAgent. */
     runId?: string;
+    /** PRD §12 / 1.18.89: total cost in USD from runAgent's SDK result. */
+    totalCostUsd?: number;
   } | undefined {
     const md = this._lastCronRunMetadata;
     this._lastCronRunMetadata = undefined;

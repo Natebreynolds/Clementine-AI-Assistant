@@ -23651,9 +23651,24 @@ async function refreshHealthStrip() {
     : successRate >= 95 ? 'var(--green)'
     : successRate >= 80 ? 'var(--yellow)'
     : 'var(--red)';
+  // 1.18.89: cost tile. Sums totalCostUsd across the 24h window. Runs that
+  // pre-date 1.18.89 don't have the field — they contribute 0 (the user
+  // sees a partial number that grows as new runs land).
+  var totalCost = 0;
+  var runsWithCost = 0;
+  for (var ci = 0; ci < last24.length; ci++) {
+    if (typeof last24[ci].totalCostUsd === 'number') {
+      totalCost += last24[ci].totalCostUsd;
+      runsWithCost++;
+    }
+  }
+  var costLabel = runsWithCost === 0 ? '—' : (totalCost < 0.01 ? '$' + totalCost.toFixed(4) : '$' + totalCost.toFixed(2));
+  var costSub = runsWithCost === 0 ? 'no priced runs yet' : runsWithCost + ' of ' + last24.length + ' runs priced';
+
   var html = '';
   html += tile('Runs · 24h', last24.length, ok + ' ok · ' + failed + ' failed');
   html += tile('Success rate', successRate === null ? '—' : (successRate + '%'), null, srColor);
+  html += tile('Cost · 24h', costLabel, costSub);
   html += tile('P50 latency', p50 === null ? '—' : formatDurationMs(p50), 'median run time');
   html += tile('P95 latency', p95 === null ? '—' : formatDurationMs(p95), '95th percentile');
   html += tile('Running now', activeRuns, activeRuns === 0 ? 'idle' : 'live');
@@ -23797,10 +23812,10 @@ function renderRunListBody(allRuns) {
     return html;
   }
   // Table — same shape as the Recent History list on the Tasks page,
-  // but sortable and with a Trigger column.
+  // but sortable and with a Trigger + Cost column.
   html += '<div style="background:var(--bg-secondary);border:1px solid var(--border);border-radius:var(--radius)">';
-  html += '<div style="display:grid;grid-template-columns:24px 24px minmax(180px,1.2fr) 90px minmax(180px,1fr) 90px auto;gap:10px;padding:8px 14px;border-bottom:1px solid var(--border);font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.04em;font-weight:500">'
-    +    '<div></div><div title="Goal verdict">Goal</div><div>Task</div><div>Trigger</div><div>Started</div><div>Duration</div><div></div>'
+  html += '<div style="display:grid;grid-template-columns:24px 24px minmax(180px,1.2fr) 80px minmax(160px,1fr) 70px 70px auto;gap:10px;padding:8px 14px;border-bottom:1px solid var(--border);font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.04em;font-weight:500">'
+    +    '<div></div><div title="Goal verdict">Goal</div><div>Task</div><div>Trigger</div><div>Started</div><div>Duration</div><div title="Total cost in USD">Cost</div><div></div>'
     + '</div>';
   for (var i = 0; i < filtered.length; i++) {
     var entry = filtered[i] || {};
@@ -23848,7 +23863,14 @@ function renderRunListBody(allRuns) {
     } else if (entry.outputPreview) {
       preview = '<div style="font-size:11px;color:var(--text-muted);margin-top:2px;word-break:break-word">' + esc(String(entry.outputPreview).slice(0, 120)) + '</div>';
     }
-    html += '<div class="history-row" data-trace-job="' + esc(jobName) + '" style="display:grid;grid-template-columns:24px 24px minmax(180px,1.2fr) 90px minmax(180px,1fr) 90px auto;gap:10px;align-items:start;padding:8px 14px;border-bottom:1px solid var(--border);cursor:pointer">'
+    // 1.18.89: cost label. Showing 4 decimals for sub-penny costs (Haiku
+    // runs land in fractions of a cent), 2 decimals when ≥ $0.01.
+    var costLabel = '—';
+    if (entry.totalCostUsd != null) {
+      var c = entry.totalCostUsd;
+      costLabel = c < 0.01 ? '$' + c.toFixed(4) : '$' + c.toFixed(2);
+    }
+    html += '<div class="history-row" data-trace-job="' + esc(jobName) + '" style="display:grid;grid-template-columns:24px 24px minmax(180px,1.2fr) 80px minmax(160px,1fr) 70px 70px auto;gap:10px;align-items:start;padding:8px 14px;border-bottom:1px solid var(--border);cursor:pointer">'
       +    '<div style="color:' + statusColor + ';font-size:14px;line-height:18px;text-align:center" title="' + esc(status) + '">' + statusIcon + '</div>'
       +    goalCell
       +    '<div style="min-width:0">'
@@ -23859,6 +23881,7 @@ function renderRunListBody(allRuns) {
       +    '<div style="font-size:11px;color:' + triggerColor + ';line-height:18px">' + esc(triggerLabel) + '</div>'
       +    '<div style="font-size:12px;color:var(--text-secondary);line-height:18px">' + esc(startedLabel) + '</div>'
       +    '<div style="font-size:12px;color:var(--text-muted);line-height:18px">' + esc(durationLabel) + '</div>'
+      +    '<div style="font-size:12px;color:var(--text-muted);line-height:18px;font-family:\\x27JetBrains Mono\\x27,monospace">' + esc(costLabel) + '</div>'
       +    '<div style="display:flex;gap:6px;align-items:center"><button class="btn-sm" onclick="event.stopPropagation();openRunOrTrace(\\x27' + safeName + '\\x27,' + (entry.id ? '\\x27' + jsStr(entry.id) + '\\x27' : 'null') + ')" style="font-size:11px;padding:3px 8px">' + (entry.id ? 'Open run' : 'Trace') + '</button></div>'
       + '</div>';
   }
