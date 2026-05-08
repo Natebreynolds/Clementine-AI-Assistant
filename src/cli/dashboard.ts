@@ -24309,6 +24309,62 @@ async function refreshMiniDashboards() {
     failHtml += '</div>';
   }
 
+  // ── Activity card (PRD §12 / 1.18.96) ──────────────────────────────
+  // Fourth mini-dashboard card. Lite version of the PRD Agent Behavior
+  // metrics — full per-tool / per-turn data needs Path B hooks, but
+  // there is plenty to surface from CronRunEntry alone:
+  //   - runs/day average across the 7d window
+  //   - busiest task (highest run count)
+  //   - trigger breakdown (manual / scheduled / after / api / webhook)
+  // The trigger bar is the most actionable signal — heavy "manual" =
+  // automatable work; heavy "after" = chained workflows dragging cost.
+  var runsPerDay = last7.length > 0 ? (last7.length / 7).toFixed(1) : '0';
+  var taskCounts = {};
+  for (var ti = 0; ti < last7.length; ti++) {
+    var jn = last7[ti].jobName;
+    if (!jn) continue;
+    taskCounts[jn] = (taskCounts[jn] || 0) + 1;
+  }
+  var busiestTask = '—';
+  var busiestCount = 0;
+  Object.keys(taskCounts).forEach(function(name) {
+    if (taskCounts[name] > busiestCount) { busiestTask = name; busiestCount = taskCounts[name]; }
+  });
+  var triggerOrder = ['manual', 'scheduled', 'after', 'api', 'webhook', 'other'];
+  var triggerCounts = { manual: 0, scheduled: 0, after: 0, api: 0, webhook: 0, other: 0 };
+  for (var tg = 0; tg < last7.length; tg++) {
+    var trg = last7[tg].trigger;
+    if (trg && triggerCounts[trg] !== undefined) triggerCounts[trg] += 1;
+    else triggerCounts.other += 1;
+  }
+  var triggerColors = {
+    manual: '#3b82f6',
+    scheduled: '#10b981',
+    after: '#f59e0b',
+    api: '#8b5cf6',
+    webhook: '#ec4899',
+    other: '#6b7280'
+  };
+  var triggerBarHtml;
+  if (last7.length === 0) {
+    triggerBarHtml = '<div class="mini-fails-empty">No runs in 7d</div>';
+  } else {
+    triggerBarHtml = '<div class="mini-split">';
+    var legendHtml = '<div class="mini-split-legend">';
+    for (var tk = 0; tk < triggerOrder.length; tk++) {
+      var key = triggerOrder[tk];
+      var n = triggerCounts[key];
+      if (n === 0) continue;
+      var pctW = Math.max(2, Math.round((n / last7.length) * 100));
+      triggerBarHtml += '<div class="mini-split-seg" style="background:' + triggerColors[key] + ';width:' + pctW + '%" title="' + key + ': ' + n + ' run' + (n === 1 ? '' : 's') + '">' + (pctW >= 14 ? key : '') + '</div>';
+      legendHtml += '<span><span class="mini-split-legend-dot" style="background:' + triggerColors[key] + '"></span>' + key + ' ' + n + '</span>';
+    }
+    triggerBarHtml += '</div>' + legendHtml + '</div>';
+  }
+  var activitySub = last7.length === 0
+    ? 'no runs yet'
+    : (busiestCount > 0 ? runsPerDay + ' runs/day · busiest: ' + busiestTask + ' (' + busiestCount + ')' : runsPerDay + ' runs/day');
+
   // ── Compose ────────────────────────────────────────────────────────
   host.innerHTML =
     '<div class="mini-card">'
@@ -24325,6 +24381,11 @@ async function refreshMiniDashboards() {
     +   '<div class="mini-card-head"><span class="mini-card-title">Reliability · 7d</span><span class="mini-card-figure">' + totalFails7 + ' fail' + (totalFails7 === 1 ? '' : 's') + '</span></div>'
     +   failHtml
     +   '<div class="mini-card-sub">click a column in the run list to filter by category</div>'
+    + '</div>'
+    + '<div class="mini-card">'
+    +   '<div class="mini-card-head"><span class="mini-card-title">Activity · 7d</span><span class="mini-card-figure">' + last7.length + ' run' + (last7.length === 1 ? '' : 's') + '</span></div>'
+    +   triggerBarHtml
+    +   '<div class="mini-card-sub">' + esc(activitySub) + '</div>'
     + '</div>';
 }
 
