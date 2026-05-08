@@ -456,6 +456,16 @@ export async function runAgent(prompt: string, opts: RunAgentOptions): Promise<R
       }
       // PRD Phase 4a / 1.18.85: write the session_start Event row.
       writeEvent({ kind: 'session_start', ts: new Date().toISOString(), sessionId });
+      // PRD Phase 4d / 1.18.101: register this session in the path B
+      // hook-session registry so /api/hooks/event POSTs from the SDK can
+      // resolve sessionId → runId/eventLog and write into the same JSONL.
+      // Best-effort — telemetry must never block the run from progressing.
+      try {
+        const { registerRunSession } = await import('./hook-session-registry.js');
+        registerRunSession(sessionId, runId, eventLog, eventSeq);
+      } catch (regErr) {
+        logger.debug({ regErr }, 'runAgent: hook-session registry register failed (non-fatal)');
+      }
       logger.debug({ sessionKey: opts.sessionKey, sdkSessionId: sessionId, runId }, 'runAgent: SDK session initialized');
       continue;
     }
@@ -555,6 +565,12 @@ export async function runAgent(prompt: string, opts: RunAgentOptions): Promise<R
         costUsd: totalCostUsd,
         stopReason: subtype,
       });
+      // PRD Phase 4d / 1.18.101: unregister from the hook-session registry.
+      // Late-arriving hook events for this sessionId silently drop after this.
+      try {
+        const { unregisterRunSession } = await import('./hook-session-registry.js');
+        unregisterRunSession(sessionId);
+      } catch { /* non-fatal */ }
 
       // Mirror cost to usage_log. Same shape as the existing
       // logQueryResult, but standalone so we don't depend on
@@ -595,6 +611,12 @@ export async function runAgent(prompt: string, opts: RunAgentOptions): Promise<R
       sessionId,
       toolError: errMsg,
     });
+    // PRD Phase 4d / 1.18.101: also clear path B registry on error path so
+    // the map doesn't leak entries when runs fail before session_end fires.
+    try {
+      const { unregisterRunSession } = await import('./hook-session-registry.js');
+      if (sessionId) unregisterRunSession(sessionId);
+    } catch { /* non-fatal */ }
     // Translate the SDK's budget-exhaustion throw into a message that
     // tells the user (a) what cap tripped and (b) how to raise it.
     // The raw SDK string ("Claude Code returned an error result:
