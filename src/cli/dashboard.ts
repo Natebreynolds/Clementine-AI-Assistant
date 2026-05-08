@@ -5747,10 +5747,11 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
 
   // ── Available Tools ──────────────────────────────────────────
 
-  app.get('/api/available-tools', (_req, res) => {
+  app.get('/api/available-tools', async (_req, res) => {
     try {
-      const data = cached('available-tools', 30_000, () => {
+      const data = await cachedAsync('available-tools', 60_000, async () => {
         const apiStatus = getApiConnectionStatus();
+        let composioError: string | null = null;
 
         const categories: Record<string, ToolEntry[]> = {
           'CLI Tools': discoverCliTools(),
@@ -5841,19 +5842,92 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
           categories['Global MCP Servers'] = globalMcp;
         }
 
-        // Discover project-scoped MCP servers
-        const projectMcp: Record<string, ToolEntry[]> = {};
+        // Local Projects: surface every linked project as a single togglable
+        // entry so an agent can be granted access to a whole project (and the
+        // dashboard can render the project's MCP servers as nested children).
+        // Source of truth is `cachedProjects`, populated by the background
+        // workspace scanner.
         const projects = cachedProjects ?? [];
+        if (projects.length > 0) {
+          categories['Local Projects'] = projects.map((p) => {
+            const exists = (() => {
+              try { return existsSync(p.path); } catch { return false; }
+            })();
+            return {
+              name: `project:${p.path}`,
+              description: p.description || p.path,
+              type: 'project',
+              path: p.path,
+              projectName: p.name,
+              connected: exists,
+              mcpServers: Array.isArray(p.mcpServers) ? p.mcpServers : [],
+              hasClaude: !!p.hasClaude,
+            } as ToolEntry & {
+              path: string;
+              projectName: string;
+              mcpServers: string[];
+              hasClaude: boolean;
+            };
+          });
+        }
+
+        // Project-scoped MCP servers — flatten what was previously a sibling
+        // `projectMcp` map (which the renderer ignored) into one category per
+        // server, so they show up alongside everything else in the picker.
+        const projectMcpByServer: Record<string, ToolEntry[]> = {};
         for (const p of projects) {
           if (p.mcpServers.length) {
             for (const server of p.mcpServers) {
-              if (!projectMcp[server]) projectMcp[server] = [];
-              projectMcp[server].push({ name: `mcp__${server} (all tools)`, description: `Project MCP: ${p.name}`, type: 'project-mcp' });
+              if (!projectMcpByServer[server]) projectMcpByServer[server] = [];
+              projectMcpByServer[server].push({
+                name: `mcp__${server}`,
+                description: `Project MCP from ${p.name}`,
+                type: 'project-mcp',
+                connected: true,
+              });
             }
           }
         }
+        for (const [server, entries] of Object.entries(projectMcpByServer)) {
+          // De-dup if the same server appears in multiple projects.
+          const seen = new Set<string>();
+          const deduped = entries.filter((e) => {
+            if (seen.has(e.name)) return false;
+            seen.add(e.name);
+            return true;
+          });
+          categories[`Project MCP — ${server}`] = deduped;
+        }
 
-        return { categories, projectMcp };
+        // Composio Toolkits: 1000+ third-party services. We surface every
+        // toolkit so the agent owner can opt in; the `connected` pill tells
+        // them whether OAuth is wired up. Failures are non-fatal — we just
+        // omit the category and stash the error for the client.
+        try {
+          const composio = await import('../integrations/composio/client.js');
+          if (composio.isComposioEnabled()) {
+            const [catalog, connected] = await Promise.all([
+              composio.listAllToolkits(),
+              composio.listConnectedToolkits(),
+            ]);
+            const connectedSet = new Set(connected.map((c: { slug: string }) => c.slug));
+            const toolkits: ToolEntry[] = catalog.map((tk: { slug: string; name?: string; description?: string }) => ({
+              name: `composio:${tk.slug}`,
+              description: tk.description || tk.name || tk.slug,
+              type: 'composio',
+              connected: connectedSet.has(tk.slug),
+              displayName: tk.name || tk.slug,
+            } as ToolEntry & { displayName: string }));
+            if (toolkits.length > 0) {
+              categories['Composio Toolkits'] = toolkits;
+            }
+          }
+        } catch (err) {
+          composioError = (err as { message?: string })?.message ?? String(err);
+          console.error('[available-tools] composio fetch failed:', composioError);
+        }
+
+        return { categories, composioError };
       });
 
       res.json(data);
@@ -24626,11 +24700,21 @@ function renderRunDetailWaterfall(events, runId, jobName) {
 
     var rowId = 'run-evt-' + j;
     var canExpand = !!fullContent && fullContent.length > preview.length;
-    html += '<div style="display:grid;grid-template-columns:90px 110px 1fr;gap:14px;padding:10px 20px;border-bottom:1px solid var(--border);align-items:start">';
+    // PRD §6 Phase 4e: backfilled subagent events get an indented row + a
+    // pill showing the subagent slug, so the waterfall makes it obvious
+    // which spans came from a delegated agent vs the parent task.
+    var isSubagent = ev.source === 'backfill' || !!ev.subagentSlug;
+    var rowBg = isSubagent ? 'background:var(--bg-secondary);' : '';
+    var rowPad = isSubagent ? 'padding:10px 20px 10px 48px;' : 'padding:10px 20px;';
+    var subagentBadge = isSubagent
+      ? '<span title="Backfilled from subagent transcript" style="display:inline-block;background:var(--purple,#8b5cf6)20;color:var(--purple,#8b5cf6);padding:2px 8px;border-radius:4px;font-size:10px;font-weight:500;margin-right:6px">↳ ' + esc(ev.subagentSlug || ev.agentId || 'subagent') + '</span>'
+      : '';
+    html += '<div style="display:grid;grid-template-columns:90px 110px 1fr;gap:14px;' + rowPad + 'border-bottom:1px solid var(--border);align-items:start;' + rowBg + '">';
     html += '<div style="font-size:10px;color:var(--text-muted);font-family:\\x27JetBrains Mono\\x27,monospace;line-height:18px">' + esc(offsetLabel) + '</div>';
     html += '<div><span style="display:inline-block;background:' + color + '20;color:' + color + ';padding:2px 8px;border-radius:4px;font-size:10px;font-weight:600;letter-spacing:0.04em">' + esc(label) + '</span></div>';
     html += '<div style="min-width:0">';
     html +=   '<div style="font-size:12px;color:var(--text-primary);line-height:1.45;word-break:break-word">'
+      +     subagentBadge
       +     esc(preview)
       +     (pairedDuration ? '<span style="color:var(--text-muted);font-size:11px"> ' + esc(pairedDuration) + '</span>' : '')
       +   '</div>';
