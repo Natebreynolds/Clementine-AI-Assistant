@@ -24399,9 +24399,42 @@ var _runListState = {
   filterStatus: 'all',     // 'all' | 'failed' | 'ok'
   filterWindow: '24h',     // '24h' | '7d' | 'all'
   filterCategory: 'all',   // 'all' | <one of the 11 PRD failure categories>
+  filterTrigger: 'all',    // 'all' | manual | scheduled | after | api | webhook (PRD §6 Run.trigger)
   filterText: '',          // free-text task name match
+  activeView: 'failures-24h', // PRD §5.3: which Saved View chip is lit
   data: [],                // raw runs from /api/cron/runs
 };
+
+// PRD §5.3 / 1.18.99: built-in saved views shipped with the dashboard. Users
+// can layer their own on top via "Save current view" — those live in
+// localStorage under runListSavedViews. activeView tracks which chip is lit;
+// "custom" means the user manually edited filters since picking a view.
+var _runListBuiltinViews = [
+  { id: 'failures-24h', label: 'Failures · 24h', desc: 'Errored / timed-out / lost runs in the last 24h — the triage queue.',
+    filters: { filterStatus: 'failed', filterWindow: '24h', filterCategory: 'all', filterTrigger: 'all', filterText: '' } },
+  { id: 'failures-7d', label: 'Failures · 7d', desc: 'All failures across the week — spot recurring categories.',
+    filters: { filterStatus: 'failed', filterWindow: '7d', filterCategory: 'all', filterTrigger: 'all', filterText: '' } },
+  { id: 'all-24h', label: 'All · 24h', desc: 'Every run from the last 24h regardless of status.',
+    filters: { filterStatus: 'all', filterWindow: '24h', filterCategory: 'all', filterTrigger: 'all', filterText: '' } },
+  { id: 'manual-24h', label: 'Manual · 24h', desc: 'Only runs you fired by hand.',
+    filters: { filterStatus: 'all', filterWindow: '24h', filterCategory: 'all', filterTrigger: 'manual', filterText: '' } },
+  { id: 'ok-7d', label: 'OK · 7d', desc: 'Successful runs only — verify a task is healthy.',
+    filters: { filterStatus: 'ok', filterWindow: '7d', filterCategory: 'all', filterTrigger: 'all', filterText: '' } },
+];
+
+function _runListLoadSavedViews() {
+  try {
+    var raw = localStorage.getItem('runListSavedViews');
+    if (!raw) return [];
+    var parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch (e) { return []; }
+}
+
+function _runListPersistSavedViews(views) {
+  try { localStorage.setItem('runListSavedViews', JSON.stringify(views)); }
+  catch (e) { /* quota or disabled — non-fatal */ }
+}
 
 function _runListLoadDefaultView() {
   // First-time visit: PRD §5.3 — default Saved View is "Failures (last 24h)".
@@ -24412,15 +24445,18 @@ function _runListLoadDefaultView() {
       _runListState.filterStatus = saved.filterStatus || 'all';
       _runListState.filterWindow = saved.filterWindow || '24h';
       _runListState.filterCategory = saved.filterCategory || 'all';
+      _runListState.filterTrigger = saved.filterTrigger || 'all';
       _runListState.filterText = saved.filterText || '';
+      _runListState.activeView = saved.activeView || 'custom';
       return;
     }
   } catch (e) { /* ignore */ }
-  // Default: failures, last 24h, all categories.
   _runListState.filterStatus = 'failed';
   _runListState.filterWindow = '24h';
   _runListState.filterCategory = 'all';
+  _runListState.filterTrigger = 'all';
   _runListState.filterText = '';
+  _runListState.activeView = 'failures-24h';
 }
 
 function _runListSaveView() {
@@ -24429,9 +24465,69 @@ function _runListSaveView() {
       filterStatus: _runListState.filterStatus,
       filterWindow: _runListState.filterWindow,
       filterCategory: _runListState.filterCategory,
+      filterTrigger: _runListState.filterTrigger,
       filterText: _runListState.filterText,
+      activeView: _runListState.activeView,
     }));
   } catch (e) { /* ignore */ }
+}
+
+function applyRunListView(id) {
+  if (id === 'custom') { _runListState.activeView = 'custom'; _runListSaveView(); return; }
+  var view = null;
+  for (var i = 0; i < _runListBuiltinViews.length; i++) {
+    if (_runListBuiltinViews[i].id === id) { view = _runListBuiltinViews[i]; break; }
+  }
+  if (!view) {
+    var saved = _runListLoadSavedViews();
+    for (var j = 0; j < saved.length; j++) {
+      if (saved[j].id === id) { view = saved[j]; break; }
+    }
+  }
+  if (!view) return;
+  _runListState.filterStatus = view.filters.filterStatus || 'all';
+  _runListState.filterWindow = view.filters.filterWindow || '24h';
+  _runListState.filterCategory = view.filters.filterCategory || 'all';
+  _runListState.filterTrigger = view.filters.filterTrigger || 'all';
+  _runListState.filterText = view.filters.filterText || '';
+  _runListState.activeView = view.id;
+  _runListSaveView();
+  if (typeof refreshRunList === 'function') refreshRunList();
+}
+
+function saveCurrentRunListView() {
+  var name = prompt('Name this view:', '');
+  if (!name) return;
+  name = String(name).trim();
+  if (!name) return;
+  var id = 'user-' + name.toLowerCase().replace(/[^a-z0-9]+/g, '-').slice(0, 40);
+  var views = _runListLoadSavedViews();
+  views = views.filter(function(v) { return v.id !== id; });
+  views.push({
+    id: id, label: name, desc: 'User-defined view',
+    filters: {
+      filterStatus: _runListState.filterStatus,
+      filterWindow: _runListState.filterWindow,
+      filterCategory: _runListState.filterCategory,
+      filterTrigger: _runListState.filterTrigger,
+      filterText: _runListState.filterText,
+    },
+  });
+  _runListPersistSavedViews(views);
+  _runListState.activeView = id;
+  _runListSaveView();
+  toast('Saved view "' + name + '"', 'success');
+  if (typeof refreshRunList === 'function') refreshRunList();
+}
+
+function deleteRunListView(id) {
+  var views = _runListLoadSavedViews();
+  var filtered = views.filter(function(v) { return v.id !== id; });
+  if (filtered.length === views.length) return;
+  if (!confirm('Delete this saved view? This cannot be undone.')) return;
+  _runListPersistSavedViews(filtered);
+  if (_runListState.activeView === id) applyRunListView('failures-24h');
+  else if (typeof refreshRunList === 'function') refreshRunList();
 }
 
 function _runListApplyFilters(runs) {
@@ -24441,6 +24537,7 @@ function _runListApplyFilters(runs) {
     : Infinity;
   var query = (_runListState.filterText || '').trim().toLowerCase();
   var catFilter = _runListState.filterCategory;
+  var trigFilter = _runListState.filterTrigger;
   return runs.filter(function(r) {
     if (_runListState.filterStatus === 'failed') {
       if (r.status !== 'error' && r.status !== 'timeout' && r.status !== 'lost') return false;
@@ -24449,6 +24546,12 @@ function _runListApplyFilters(runs) {
     }
     if (catFilter && catFilter !== 'all') {
       if (r.failureCategory !== catFilter) return false;
+    }
+    // PRD §6 / 1.18.99: trigger filter. Pre-1.18.84 runs lack the field;
+    // they fall through unless the user has explicitly picked a single
+    // trigger (those rows then drop out as "unknown source").
+    if (trigFilter && trigFilter !== 'all') {
+      if ((r.trigger || 'scheduled') !== trigFilter) return false;
     }
     if (query && String(r.jobName || '').toLowerCase().indexOf(query) === -1) return false;
     if (windowMs !== Infinity && r.startedAt) {
@@ -24490,6 +24593,37 @@ function renderRunListBody(allRuns) {
   // Header
   html += '<div style="margin-bottom:18px"><h2 style="margin:0 0 4px;font-size:18px;font-weight:600;color:var(--text-primary)">Runs</h2>'
     +    '<div style="font-size:12px;color:var(--text-muted)">'+ filtered.length +' of '+ allRuns.length +' total runs · default view: <strong>Failures (last 24h)</strong></div></div>';
+
+  // PRD §5.3 / 1.18.99: Saved Views row. Built-ins + user-saved chips, with
+  // the active view highlighted. "Save current" persists the active filter
+  // set under a user-supplied name.
+  var userViews = _runListLoadSavedViews();
+  html += '<div style="display:flex;gap:6px;align-items:center;margin-bottom:10px;flex-wrap:wrap">';
+  html += '<span style="font-size:11px;color:var(--text-muted);font-weight:500;text-transform:uppercase;letter-spacing:0.04em;margin-right:4px">View</span>';
+  for (var vbi = 0; vbi < _runListBuiltinViews.length; vbi++) {
+    var bv = _runListBuiltinViews[vbi];
+    var bvActive = _runListState.activeView === bv.id;
+    var bvBg = bvActive ? 'var(--accent)' : 'var(--bg-secondary)';
+    var bvFg = bvActive ? '#fff' : 'var(--text-primary)';
+    html += '<button class="btn-sm" title="' + esc(bv.desc) + '" onclick="applyRunListView(\\x27' + jsStr(bv.id) + '\\x27)" style="font-size:11px;padding:4px 10px;background:' + bvBg + ';color:' + bvFg + ';border:1px solid var(--border);border-radius:999px">' + esc(bv.label) + '</button>';
+  }
+  if (userViews.length > 0) {
+    html += '<span style="display:inline-block;width:1px;height:20px;background:var(--border);margin:0 4px"></span>';
+    for (var uvi = 0; uvi < userViews.length; uvi++) {
+      var uv = userViews[uvi];
+      var uvActive = _runListState.activeView === uv.id;
+      var uvBg = uvActive ? 'var(--accent)' : 'var(--bg-secondary)';
+      var uvFg = uvActive ? '#fff' : 'var(--text-primary)';
+      html += '<span style="display:inline-flex;align-items:center;gap:0">'
+        + '<button class="btn-sm" title="' + esc(uv.desc || 'User-defined view') + '" onclick="applyRunListView(\\x27' + jsStr(uv.id) + '\\x27)" style="font-size:11px;padding:4px 10px;background:' + uvBg + ';color:' + uvFg + ';border:1px solid var(--border);border-radius:999px 0 0 999px;border-right:none">⭐ ' + esc(uv.label) + '</button>'
+        + '<button class="btn-sm" title="Delete this saved view" onclick="event.stopPropagation();deleteRunListView(\\x27' + jsStr(uv.id) + '\\x27)" style="font-size:11px;padding:4px 8px;background:var(--bg-secondary);color:var(--text-muted);border:1px solid var(--border);border-radius:0 999px 999px 0">×</button>'
+        + '</span>';
+    }
+  }
+  html += '<span style="flex:1"></span>';
+  html += '<button class="btn-sm" onclick="saveCurrentRunListView()" title="Save the current filter set as a named view" style="font-size:11px;padding:4px 10px">+ Save current</button>';
+  html += '</div>';
+
   // Filter row — saved automatically to localStorage on change.
   html += '<div style="display:flex;gap:10px;align-items:center;margin-bottom:14px;flex-wrap:wrap">';
   html += _runListChip('Status', [
@@ -24502,6 +24636,16 @@ function renderRunListBody(allRuns) {
     { value: '7d',  label: 'Last 7 days' },
     { value: 'all', label: 'All time' },
   ], 'filterWindow');
+  // PRD §6 / 1.18.99: trigger filter. Always shown so users can drill into
+  // "what manual ones did I run today" without depending on data.
+  html += _runListChip('Trigger', [
+    { value: 'all',       label: 'Any source' },
+    { value: 'manual',    label: 'Manual' },
+    { value: 'scheduled', label: 'Scheduled' },
+    { value: 'after',     label: 'After-chained' },
+    { value: 'api',       label: 'API' },
+    { value: 'webhook',   label: 'Webhook' },
+  ], 'filterTrigger');
   // PRD §9 / 1.18.87: 11-category failure filter. Build the option list from
   // the categories actually present in the loaded data so the chip row stays
   // compact (don't show buckets that have zero runs).
@@ -24645,6 +24789,10 @@ function _runListChip(label, options, stateKey) {
 
 function onRunListChipClick(key, value) {
   _runListState[key] = value;
+  // PRD §5.3 / 1.18.99: any manual filter change drops out of the active
+  // saved view — the chip row deselects to make it obvious you're now on
+  // a custom filter set.
+  _runListState.activeView = 'custom';
   _runListSaveView();
   var panel = document.getElementById('panel-runs');
   if (panel) panel.innerHTML = renderRunListBody(_runListState.data);
@@ -24652,6 +24800,7 @@ function onRunListChipClick(key, value) {
 
 function onRunListSearch(value) {
   _runListState.filterText = value;
+  _runListState.activeView = 'custom';
   _runListSaveView();
   // Debounce-by-render: just re-render. Filtering is in-memory + cheap.
   var panel = document.getElementById('panel-runs');
@@ -24659,13 +24808,10 @@ function onRunListSearch(value) {
 }
 
 function resetRunListFilters() {
-  _runListState.filterStatus = 'failed';
-  _runListState.filterWindow = '24h';
-  _runListState.filterCategory = 'all';
-  _runListState.filterText = '';
-  _runListSaveView();
-  var panel = document.getElementById('panel-runs');
-  if (panel) panel.innerHTML = renderRunListBody(_runListState.data);
+  // Reset jumps back to the default Failures · 24h built-in view, which
+  // also lights up that chip again so users see the round-trip.
+  applyRunListView('failures-24h');
+  return;
 }
 
 // Wire the panel's click handler so clicking anywhere on a row opens the
