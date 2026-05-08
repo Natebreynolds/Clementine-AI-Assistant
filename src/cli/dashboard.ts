@@ -4417,6 +4417,77 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
   // path on runAgentCron honors the signal and unwinds cleanly. The
   // CronScheduler's own catch path then writes the closing CronRunEntry
   // with status='error' + an "AbortError" message.
+  // ── PRD §6 Phase 4d / 1.18.102: Path B opt-in install ──────────
+  // Three endpoints for managing the .claude/settings.local.json hook
+  // wiring on a per-task basis. Hooks are opt-in (the user picks which
+  // tasks should pay the small per-tool overhead of curl-on-every-event)
+  // and the installer refuses to overwrite a settings.local.json that
+  // wasn't created by us.
+  app.get('/api/cron/:job/hooks-status', async (req, res) => {
+    try {
+      const jobName = req.params.job;
+      if (!jobName) { res.status(400).json({ ok: false, error: 'job required' }); return; }
+      // Find the job's workDir from the cron definitions.
+      const { parseCronJobs } = await import('../gateway/cron-scheduler.js');
+      const jobs = parseCronJobs();
+      const job = jobs.find((j) => String(j.name).toLowerCase() === jobName.toLowerCase());
+      if (!job) { res.status(404).json({ ok: false, error: `job "${jobName}" not found` }); return; }
+      if (!job.workDir) {
+        res.json({ ok: true, status: { installed: false, managedByUs: false, filePath: '', conflictsWithUser: false }, message: 'Task has no workDir set — hooks need a project directory.' });
+        return;
+      }
+      const { getHooksStatus } = await import('../agent/path-b-installer.js');
+      const status = getHooksStatus(job.workDir);
+      res.json({ ok: true, workDir: job.workDir, status });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: String(err) });
+    }
+  });
+
+  app.post('/api/cron/:job/enable-hooks', async (req, res) => {
+    try {
+      const jobName = req.params.job;
+      if (!jobName) { res.status(400).json({ ok: false, error: 'job required' }); return; }
+      const { parseCronJobs } = await import('../gateway/cron-scheduler.js');
+      const jobs = parseCronJobs();
+      const job = jobs.find((j) => String(j.name).toLowerCase() === jobName.toLowerCase());
+      if (!job) { res.status(404).json({ ok: false, error: `job "${jobName}" not found` }); return; }
+      if (!job.workDir) { res.status(400).json({ ok: false, error: 'task has no workDir set' }); return; }
+      const port = Number(process.env.PORT) || 3030;
+      const { installPathBHooks } = await import('../agent/path-b-installer.js');
+      const result = installPathBHooks(job.workDir, { token: dashboardToken, port });
+      if (!result.ok) {
+        res.status(409).json({ ...result, ok: false });
+        return;
+      }
+      const { ok: _ignore, ...rest } = result;
+      res.json({ ...rest, ok: true, message: result.wasUpdate ? 'Hooks updated.' : 'Hooks installed. The next run of this task will emit per-tool latency to the dashboard.' });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: String(err) });
+    }
+  });
+
+  app.post('/api/cron/:job/disable-hooks', async (req, res) => {
+    try {
+      const jobName = req.params.job;
+      if (!jobName) { res.status(400).json({ ok: false, error: 'job required' }); return; }
+      const { parseCronJobs } = await import('../gateway/cron-scheduler.js');
+      const jobs = parseCronJobs();
+      const job = jobs.find((j) => String(j.name).toLowerCase() === jobName.toLowerCase());
+      if (!job) { res.status(404).json({ ok: false, error: `job "${jobName}" not found` }); return; }
+      if (!job.workDir) { res.status(400).json({ ok: false, error: 'task has no workDir set' }); return; }
+      const { uninstallPathBHooks } = await import('../agent/path-b-installer.js');
+      const result = uninstallPathBHooks(job.workDir);
+      if (!result.ok) {
+        res.status(409).json({ ok: false, error: result.error });
+        return;
+      }
+      res.json({ ok: true, message: 'Hooks disabled. The next run of this task will use only the in-process tap (path A).' });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: String(err) });
+    }
+  });
+
   app.post('/api/cron/run/:job/cancel', async (req, res) => {
     try {
       const jobName = req.params.job;
