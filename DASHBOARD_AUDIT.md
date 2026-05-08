@@ -1,12 +1,55 @@
 # Tasks Dashboard Audit
 
-**Date:** 2026-05-07
-**Branch:** `feat/tasks-prd-phase-0`
+**Date:** 2026-05-08 (refreshed after Phase 0–6 ship streak)
+**Branch:** `main`
 **Scope:** Tasks domain only (cron jobs + workflows). Brain, Team, Heartbeat, Settings excluded.
-**Codebase:** `clementine-agent` 1.18.76, `@anthropic-ai/claude-code` SDK
-**Audit owner:** Phase 0 of PRD-driven dashboard redesign
+**Codebase:** `clementine-agent` 1.18.105, `@anthropic-ai/claude-code` SDK
+**Audit owner:** Post-implementation refresh — original audit was Phase 0 baseline at 1.18.76.
 
-This document is the prerequisite for Phase 1 implementation per the PRD §4. It maps every Tasks-domain surface, data field, and telemetry signal in the codebase as of 1.18.76, then marks each PRD entity field as **EXISTS / PARTIAL / MISSING**.
+This document was the prerequisite for Phase 1 implementation per the PRD §4. The original 2026-05-07 baseline mapped every Tasks-domain surface as of 1.18.76; this refresh adds an **Implementation status** section at the top reflecting everything shipped through 1.18.105.
+
+---
+
+## 0. Implementation status (2026-05-08)
+
+All six PRD phases shipped at v1+ level. Updated entity gap matrix below in §5.
+
+### What's live
+
+| Phase | Surface | Ship | Status |
+|---|---|---|---|
+| **§5.1 Task editor** | 5-tab cron modal (Basics / Prompt / Tools&MCP / Scope / Limits) | 1.18.80 | ✓ |
+| **§5.1 Goal-orientation** | `success_schema` (JSON Schema, ajv-validated) + `success_criteria_text` (Haiku evaluator) | 1.18.78 | ✓ |
+| **§5.1 Run task once** | Inline run + Last run pane with running pulse + Cancel button | 1.18.79, 1.18.91 | ✓ |
+| **§5.2 Tools & MCP catalog** | Read-only foundation + Reconnect + Edit modal for user-managed servers | 1.18.81–82 | ✓ (McpToolBinding entity not yet shipped) |
+| **§5.3 Run list** | Single sortable filterable table, default Failures-24h, Saved Views, trigger filter, click-to-sort columns | 1.18.83, 98, 100 | ✓ |
+| **§5.4 Run detail** | Waterfall reading from per-run Event store, color-coded by kind, expandable spans | 1.18.86 | ✓ |
+| **§6 Path A (in-process tap)** | runAgent SDK message → RunEvent rows in `~/.clementine/events/<runId>.jsonl` | 1.18.85 | ✓ |
+| **§6 Path B (hook side-channel)** | hook-session-registry + `POST /api/hooks/event` + `.claude/settings.local.json` installer | 1.18.101–103 | ✓ |
+| **§6 Path C (subagent backfill)** | After-run scan of `~/.claude/projects/<encoded-cwd>/<sessionId>/subagents/agent-*.jsonl` → synthesized RunEvent rows with `source='backfill'` | 1.18.92 | ✓ |
+| **§9 Failure taxonomy (11 categories)** | `RunFailureCategory` union + `classifyRunFailure()` + Run list filter chip | 1.18.87 | ✓ |
+| **§10 Cancel running task** | `cancelCronJob()` via gateway AbortController registry; SIGTERM-free | 1.18.91 | ✓ |
+| **§11 Versions / Diff / Publish** | Prompt history modal (1.18.90) + line diff (1.18.97) + per-task draft sidecars + Publish button (1.18.105) | 1.18.90, 97, 105 | ✓ |
+| **§12 Health Strip** | 7-tile glanceable strip (24h runs, success rate, cost, P50/P95, active, top failure) | 1.18.88 | ✓ |
+| **§12 Cost dashboard** | Mini-card with 7d sparkline + total | 1.18.93 | ✓ (per-model breakdown deferred) |
+| **§12 Latency dashboard** | Mini-card with split bar; **real numbers** when path B coverage ≥ 50%, heuristic otherwise | 1.18.93, 104 | ✓ |
+| **§12 Reliability dashboard** | Mini-card stacked-by-category 7d column chart, colors match Run list filters | 1.18.93 | ✓ |
+| **§12 Activity ("Behavior")** | Mini-card with trigger split (manual/scheduled/after/api/webhook), runs/day, busiest task | 1.18.96 | ✓ |
+| **§13 Replay tooling** | v1: Rerun task / Copy prompt / Open run list buttons on Run detail header | 1.18.94 | ✓ (Rerun-from-step deferred) |
+
+### What's deferred (out of session)
+
+- **McpToolBinding entity** — per-task per-tool `visibility: allowed | disallowed | ask` records. Currently the per-task allowlist lives on `CronJobDefinition.allowedTools` (just names, no per-tool ask/deny granularity). Not blocking; users get coarser-but-functional control.
+- **Workflow ↔ Task unification** — `vault/00-System/workflows/` and CRON.md remain separate write paths. The dashboard renders both kinds in one Tasks page (zone 1 + zone 2) so users see them together; canonical merging into one Task entity awaits future work.
+- **Real per-model cost split + per-tool cost attribution** — would need usage_log enrichment that's not in scope for this PRD round.
+- **Rerun-from-step** — needs SDK resume support keyed on a specific tool_use_id; not yet exposed.
+- **Threshold alerts → Discord** — PRD §13 metric. The dispatch infrastructure exists (Discord channels are wired); alert rule storage + UI is unbuilt.
+
+### Test coverage at 1.18.105
+
+- 1128 tests passing across 121 files.
+- New tests this session: failure-taxonomy (15), subagent-backfill (10), hook-session-registry (15), path-b-installer (17), draft-store (16) = **73 new unit tests**.
+- HTML smoke parse run on every ship: 6 inline `<script>` blocks parse cleanly under `vm.Script`.
 
 ---
 
