@@ -309,6 +309,14 @@ export async function buildSkillContext(
 
     if (prepared.length === 0) return { text: '', applied, missing };
 
+    // Folder-form bundled-file budget. Anthropic skill spec says the body
+    // should be ≤500 lines; bundled files (templates/, reference docs)
+    // load on top. We cap aggregate inlined bundle bytes so a skill with a
+    // huge templates/ tree doesn't blow the context window — anything over
+    // the cap is left on disk and the LLM can Read it via the cron's cwd.
+    const BUNDLE_FILE_CAP = 5;
+    const BUNDLE_BYTES_CAP = 12000;
+
     const skillLines = prepared.map(s => {
       recordSkillUse(s.name);
       (memoryStore as { logSkillUse?: (entry: Record<string, unknown>) => void } | null | undefined)?.logSkillUse?.({
@@ -321,7 +329,51 @@ export async function buildSkillContext(
       applied.push({ name: s.name, source: s.source, score: s.score });
       let block = `### ${s.title}${s.source === 'pinned' ? ' _(pinned)_' : ''}\n${s.content}`;
       if (s.toolsUsed.length > 0) block += `\n**Tools:** ${s.toolsUsed.join(', ')}`;
-      if (s.attachments.length > 0) {
+
+      // Folder-form skills (post-migration default): inline sibling .md
+      // files (templates/intro.md, reference.md, etc.) so the cron prompt
+      // actually sees them. SKILL.md itself is the body above. scripts/
+      // and other non-.md assets stay on disk — the cron's cwd has Bash
+      // access to them via the runtime working directory.
+      const folderPath = path.join(s.skillDir, s.name);
+      const skillEntry = path.join(folderPath, 'SKILL.md');
+      if (fs.existsSync(skillEntry)) {
+        let bytesUsed = 0;
+        let filesUsed = 0;
+        const collectMd = (subDir: string, label: string): void => {
+          if (filesUsed >= BUNDLE_FILE_CAP || bytesUsed >= BUNDLE_BYTES_CAP) return;
+          let entries: string[];
+          try { entries = fs.readdirSync(subDir).sort(); } catch { return; }
+          for (const entry of entries) {
+            if (filesUsed >= BUNDLE_FILE_CAP || bytesUsed >= BUNDLE_BYTES_CAP) break;
+            if (entry === 'SKILL.md') continue;
+            if (!entry.endsWith('.md')) continue;
+            const full = path.join(subDir, entry);
+            try {
+              const content = fs.readFileSync(full, 'utf-8');
+              const remaining = BUNDLE_BYTES_CAP - bytesUsed;
+              const slice = content.slice(0, remaining);
+              const labeled = label ? `${label}/${entry}` : entry;
+              block += `\n\n#### ${labeled}\n${slice}`;
+              bytesUsed += slice.length;
+              filesUsed++;
+            } catch { /* skip unreadable */ }
+          }
+        };
+        // Top-level bundled .md files (reference.md, etc.)
+        collectMd(folderPath, '');
+        // Common sub-dirs: templates/, references/. One level deep only —
+        // we don't recurse to keep the budget predictable.
+        for (const sub of ['templates', 'references']) {
+          if (filesUsed >= BUNDLE_FILE_CAP || bytesUsed >= BUNDLE_BYTES_CAP) break;
+          const subPath = path.join(folderPath, sub);
+          if (fs.existsSync(subPath) && fs.statSync(subPath).isDirectory()) {
+            collectMd(subPath, sub);
+          }
+        }
+      } else if (s.attachments.length > 0) {
+        // Legacy flat form: attachments live under <skill>.files/ alongside
+        // the skill .md. Kept for backward compat with un-migrated skills.
         const attDir = path.join(s.skillDir, s.name + '.files');
         for (const attName of s.attachments.slice(0, 3)) {
           const attPath = path.join(attDir, attName);

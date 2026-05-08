@@ -46,6 +46,38 @@ function writeAgentSkill(slug: string, name: string, frontmatter: Record<string,
   writeFileSync(path.join(dir, `${name}.md`), `---\n${fm}\n---\n${body}\n`);
 }
 
+/** Write a folder-form skill (Anthropic spec: <name>/SKILL.md). The
+ *  frontmatter is YAML that gray-matter will parse. */
+function writeFolderSkill(name: string, frontmatter: Record<string, unknown>, body = 'Folder skill body.'): string {
+  const folder = path.join(GLOBAL_SKILLS_DIR, name);
+  mkdirSync(folder, { recursive: true });
+  // Build YAML carefully — JSON.stringify works for primitives but objects
+  // need to be flattened into nested mapping form for gray-matter to read.
+  function toYaml(value: unknown, indent = 0): string {
+    const pad = '  '.repeat(indent);
+    if (value === null || value === undefined) return 'null';
+    if (typeof value !== 'object') return JSON.stringify(value);
+    if (Array.isArray(value)) {
+      if (value.length === 0) return '[]';
+      return value.map(v => `\n${pad}- ${toYaml(v, indent + 1).trimStart()}`).join('');
+    }
+    const entries = Object.entries(value as Record<string, unknown>);
+    if (entries.length === 0) return '{}';
+    return entries.map(([k, v]) => {
+      const rendered = toYaml(v, indent + 1);
+      const isMulti = typeof v === 'object' && v !== null && (Array.isArray(v) ? v.length > 0 : Object.keys(v as object).length > 0);
+      return `\n${pad}${k}:${isMulti ? rendered : ' ' + rendered}`;
+    }).join('');
+  }
+  const fm = Object.entries(frontmatter).map(([k, v]) => {
+    const rendered = toYaml(v, 1);
+    const isMulti = typeof v === 'object' && v !== null && (Array.isArray(v) ? v.length > 0 : Object.keys(v as object).length > 0);
+    return `${k}:${isMulti ? rendered : ' ' + rendered}`;
+  }).join('\n');
+  writeFileSync(path.join(folder, 'SKILL.md'), `---\n${fm}\n---\n${body}\n`);
+  return folder;
+}
+
 beforeEach(() => {
   if (existsSync(GLOBAL_SKILLS_DIR)) rmSync(GLOBAL_SKILLS_DIR, { recursive: true, force: true });
   const agentsRoot = path.join(ROOT_DIR, 'vault', '00-System', 'agents');
@@ -175,5 +207,108 @@ describe('buildSkillContext — pinned + auto-match composition', () => {
     expect(result.applied).toHaveLength(1);
     expect(result.applied[0]).toMatchObject({ name: 'agent-only-skill', source: 'pinned' });
     expect(result.missing).toEqual([]);
+  });
+});
+
+describe('buildSkillContext — folder-form skills (Anthropic spec)', () => {
+  // The C-0 regression: after migrating `<name>.md` → `<name>/SKILL.md`,
+  // pinning by `<name>` silently failed because the loader computed the
+  // slug as `<name>-SKILL`. Every test here would have failed pre-fix.
+
+  it('resolves a pinned folder-form skill by its folder name', async () => {
+    writeFolderSkill('morning-briefing', {
+      name: 'morning-briefing',
+      description: 'How to send the morning brief',
+    }, 'STEP 1: Check inbox.\nSTEP 2: Summarize.');
+    const result = await buildSkillContext(
+      'morning-cron', 'do the morning brief', undefined,
+      ['morning-briefing'], null,
+    );
+    expect(result.missing).toEqual([]);
+    expect(result.applied).toHaveLength(1);
+    expect(result.applied[0]).toMatchObject({ name: 'morning-briefing', source: 'pinned' });
+    expect(result.text).toContain('STEP 1: Check inbox.');
+    expect(result.text).toContain('STEP 2: Summarize.');
+  });
+
+  it('returns the FULL body of a folder-form skill (no 1500-char cap)', async () => {
+    // Body deliberately > 1500 chars so the legacy slice would truncate.
+    const longBody = 'Procedure step. '.repeat(200);  // ~3,200 chars
+    expect(longBody.length).toBeGreaterThan(2000);
+    writeFolderSkill('long-procedure', {
+      name: 'long-procedure',
+      description: 'Long procedure',
+    }, longBody);
+    const result = await buildSkillContext(
+      'job', 'prompt', undefined, ['long-procedure'], null,
+    );
+    expect(result.applied).toHaveLength(1);
+    // Loader returns the full body. The 1500-char truncation that capped
+    // legacy skills is gone — the cron prompt now sees the whole procedure.
+    expect(result.text.length).toBeGreaterThan(longBody.length - 200);
+    expect(result.text).toContain(longBody.slice(-200));
+  });
+
+  it('inlines bundled .md files (templates/, reference docs) into the skill block', async () => {
+    const folder = writeFolderSkill('cold-outreach', {
+      name: 'cold-outreach',
+      description: 'Send cold outreach emails',
+    }, 'See templates/intro.md for the opener.');
+    // Sibling reference doc
+    writeFileSync(path.join(folder, 'tone.md'), '# Tone Guide\nWarm, concise, human.\n');
+    // Templates sub-dir
+    mkdirSync(path.join(folder, 'templates'), { recursive: true });
+    writeFileSync(path.join(folder, 'templates', 'intro.md'), '# Intro\nHi {{name}}, ...');
+    writeFileSync(path.join(folder, 'templates', 'follow-up.md'), '# Follow-up\nJust circling back.');
+
+    const result = await buildSkillContext(
+      'cold-outreach-cron', 'send the morning batch', undefined,
+      ['cold-outreach'], null,
+    );
+    expect(result.applied).toHaveLength(1);
+    // SKILL.md body lands in the block.
+    expect(result.text).toContain('See templates/intro.md');
+    // Sibling reference is inlined.
+    expect(result.text).toContain('# Tone Guide');
+    expect(result.text).toContain('Warm, concise, human.');
+    // Templates sub-dir contents are inlined with directory label.
+    expect(result.text).toContain('templates/intro.md');
+    expect(result.text).toContain('Hi {{name}}');
+    expect(result.text).toContain('templates/follow-up.md');
+  });
+
+  it('exposes clementine.tools.allow as toolsUsed in the skill block', async () => {
+    writeFolderSkill('typed-skill', {
+      name: 'typed-skill',
+      description: 'Skill with allowlist',
+      clementine: {
+        tools: {
+          allow: ['Read', 'Bash', 'mcp__plugin_proposal-builder_dataforseo__serp_organic_live_advanced'],
+        },
+      },
+    }, 'Steps.');
+    const result = await buildSkillContext(
+      'job', 'prompt', undefined, ['typed-skill'], null,
+    );
+    expect(result.applied).toHaveLength(1);
+    expect(result.text).toContain('**Tools:**');
+    expect(result.text).toContain('Read');
+    expect(result.text).toContain('Bash');
+    expect(result.text).toContain('serp_organic_live_advanced');
+  });
+
+  it('flat and folder forms coexist — both resolve correctly', async () => {
+    writeGlobalSkill('legacy-flat', {
+      title: 'Legacy flat', description: 'old style', triggers: ['x'],
+    });
+    writeFolderSkill('modern-folder', {
+      name: 'modern-folder', description: 'new style',
+    });
+    const result = await buildSkillContext(
+      'job', 'prompt', undefined,
+      ['legacy-flat', 'modern-folder'], null,
+    );
+    expect(result.missing).toEqual([]);
+    expect(result.applied.map(a => a.name)).toEqual(['legacy-flat', 'modern-folder']);
   });
 });
