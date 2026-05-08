@@ -37,6 +37,7 @@ import { registerAgentHeartbeatTools } from './agent-heartbeat-tools.js';
 import { registerBackgroundTaskTools } from './background-task-tools.js';
 import { registerDecisionReflectionTools } from './decision-reflection-tools.js';
 import { registerBuilderTools } from './builder-tools.js';
+import { registerSkillTools } from './skill-tools.js';
 
 // ── Server ──────────────────────────────────────────────────────────────
 
@@ -81,6 +82,7 @@ registerAgentHeartbeatTools(scopedServer);
 registerBackgroundTaskTools(scopedServer);
 registerDecisionReflectionTools(scopedServer);
 registerBuilderTools(scopedServer);
+registerSkillTools(scopedServer);
 
 // ── Main ────────────────────────────────────────────────────────────────
 
