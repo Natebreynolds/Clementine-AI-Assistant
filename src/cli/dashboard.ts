@@ -6262,6 +6262,44 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
     }
   });
 
+  // POST /api/tools/probe — force-refresh the SDK tool inventory cache
+  // (`~/.clementine/.tool-inventory.json`). Without this the catalog page's
+  // Claude Desktop connectors (claude_ai_*) and per-server tool counts stay
+  // empty until the daemon happens to fire its first agent run. The probe
+  // takes ~3-8s because it boots a real SDK query against haiku to capture
+  // `system/init.tools`. Cached results are returned without re-probing
+  // unless `force=true` is passed.
+  app.post('/api/tools/probe', async (req, res) => {
+    try {
+      const { probeAvailableTools } = await import('../agent/mcp-bridge.js');
+      const force = req.body?.force === true;
+      const inv = await probeAvailableTools(force);
+      res.json({ ok: true, probedAt: inv.probedAt, toolCount: inv.tools.length, tools: inv.tools });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: String((err as { message?: string })?.message ?? err) });
+    }
+  });
+
+  // GET /api/tools/inventory — cached SDK probe result. Returns the raw
+  // tool list the SDK currently advertises (built-ins + every MCP server's
+  // tools + claude_ai_* connectors + Composio toolkits). `null` when the
+  // probe hasn't run yet. Reads the on-disk cache; never blocks on probing.
+  app.get('/api/tools/inventory', (_req, res) => {
+    try {
+      // Inline the cache read to avoid module imports in the hot path.
+      const TOOL_INVENTORY_FILE = path.join(BASE_DIR, '.tool-inventory.json');
+      if (!existsSync(TOOL_INVENTORY_FILE)) {
+        res.json({ probed: false, probedAt: null, toolCount: 0, tools: [] });
+        return;
+      }
+      const data = JSON.parse(readFileSync(TOOL_INVENTORY_FILE, 'utf-8')) as { probedAt: string; tools: string[] };
+      const tools = Array.isArray(data.tools) ? data.tools : [];
+      res.json({ probed: true, probedAt: data.probedAt, toolCount: tools.length, tools });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: String((err as { message?: string })?.message ?? err) });
+    }
+  });
+
   // ── Composio (1000+ third-party services via OAuth broker) ────
 
   app.get('/api/composio/status', async (_req, res) => {
@@ -25088,83 +25126,229 @@ async function refreshToolsMcpCatalog() {
   var panel = document.getElementById('panel-toolsmcp');
   if (!panel) return;
   panel.innerHTML = '<div class="empty-state" style="padding:24px;color:var(--text-muted)">Loading Tools &amp; MCP catalog…</div>';
-  var statusMap = {};
-  var servers = [];
+
+  // Fetch every input the catalog needs in parallel:
+  //   - /api/available-tools     — 12 categories of curated tool entries (Core SDK, CLI, Memory&Vault, Composio, etc.)
+  //   - /api/tools/inventory     — the SDK probe cache (every tool the daemon's Claude Agent SDK can actually see, including claude_ai_* connectors)
+  //   - /api/mcp-servers         — configured MCP servers (transport, command, env)
+  //   - /api/mcp-status          — live connection status keyed by server name
+  var avail = null, inventory = null, statusMap = {}, servers = [];
   try {
-    var sR = await apiFetch('/api/mcp-status');
-    var statusJson = await sR.json();
-    // /api/mcp-status returns { servers: [{name, status}], updatedAt }.
-    // Build a name → entry lookup so renderMcpCatalogCard can probe by name.
+    var results = await Promise.all([
+      apiFetch('/api/available-tools').then(function(r){ return r.json(); }).catch(function(){ return null; }),
+      apiFetch('/api/tools/inventory').then(function(r){ return r.json(); }).catch(function(){ return null; }),
+      apiFetch('/api/mcp-status').then(function(r){ return r.json(); }).catch(function(){ return null; }),
+      apiFetch('/api/mcp-servers').then(function(r){ return r.json(); }).catch(function(){ return null; }),
+    ]);
+    avail = results[0];
+    inventory = results[1];
+    var statusJson = results[2];
     if (statusJson && Array.isArray(statusJson.servers)) {
       for (var si = 0; si < statusJson.servers.length; si++) {
         var entry = statusJson.servers[si];
         if (entry && entry.name) statusMap[entry.name] = entry;
       }
     }
-  } catch (e) { /* status is optional — servers still render without it */ }
-  try {
-    var lR = await apiFetch('/api/mcp-servers');
-    var lJson = await lR.json();
+    var lJson = results[3];
     servers = (lJson && lJson.servers) || [];
   } catch (e) {
-    panel.innerHTML = '<div class="empty-state" style="padding:24px;color:var(--red)">Failed to load MCP servers: ' + esc(String(e)) + '</div>';
+    panel.innerHTML = '<div class="empty-state" style="padding:24px;color:var(--red)">Failed to load tool catalog: ' + esc(String(e)) + '</div>';
     return;
   }
+
+  // Total tools across every curated category. Composio toolkits are 1k+
+  // in user installs — so the count includes them but the rendered list
+  // collapses by default (see below).
+  var totalTools = 0;
+  var categoryEntries = [];
+  if (avail && avail.categories && typeof avail.categories === 'object') {
+    var keys = Object.keys(avail.categories);
+    for (var ki = 0; ki < keys.length; ki++) {
+      var arr = avail.categories[keys[ki]] || [];
+      categoryEntries.push({ name: keys[ki], items: Array.isArray(arr) ? arr : [] });
+      totalTools += Array.isArray(arr) ? arr.length : 0;
+    }
+  }
+
+  // SDK probe — when populated, gives us the live system/init.tools list
+  // so each card can show its real tool count and the "Live" badge can flip
+  // on for tools that are actually registered with the SDK right now.
+  var liveTools = inventory && Array.isArray(inventory.tools) ? inventory.tools : [];
+  var liveSet = {};
+  for (var lt = 0; lt < liveTools.length; lt++) liveSet[liveTools[lt]] = true;
+  var probedAt = inventory && inventory.probedAt;
+
   var tabCount = document.getElementById('build-tab-toolsmcp-count');
   if (tabCount) {
-    tabCount.textContent = servers.length;
-    tabCount.style.display = servers.length > 0 ? '' : 'none';
+    tabCount.textContent = totalTools;
+    tabCount.style.display = totalTools > 0 ? '' : 'none';
   }
-  // Bucket servers into the four PRD categories. The existing
-  // ManagedMcpServer type doesn't have an explicit "kind" field, so we
-  // infer: stdio with a known shell binary → 'shell', stdio bundled with
-  // clementine → 'builtin', stdio external command → 'external_stdio',
-  // http/sse → 'external_remote'. The bucket keys map to the PRD's four
-  // taxonomy cards.
-  var buckets = { builtin: [], custom: [], shell: [], external: [] };
-  for (var i = 0; i < servers.length; i++) {
-    var s = servers[i];
-    var name = s.name || '';
-    var type = s.type || 'stdio';
-    var cmd = s.command || '';
-    var kind;
-    // The clementine-tools server is an in-process bundle
-    if (name === 'clementine-tools' || name === 'kernel') kind = 'builtin';
-    else if (type === 'http' || type === 'sse') kind = 'external';
-    else if (/^(sf|gh|gcloud|kubectl|docker|aws|az|terraform)$/.test(cmd) || /\\b(sf|gh|gcloud|kubectl)$/.test(cmd)) kind = 'shell';
-    else kind = 'external';  // default for stdio external MCP
-    buckets[kind].push(s);
-  }
+
   var html = '';
-  // Header strip
-  html += '<div style="margin-bottom:18px"><h2 style="margin:0 0 4px;font-size:18px;font-weight:600;color:var(--text-primary)">Tools &amp; MCP catalog</h2>'
-    +    '<div style="font-size:12px;color:var(--text-muted)">'+ esc(servers.length) +' MCP server' + (servers.length === 1 ? '' : 's') + ' configured. Click any task in the Tasks tab to bind specific tools to that task.</div></div>';
-  // Four-card taxonomy. Each section is a labeled bucket of cards.
-  var sections = [
-    { key: 'builtin',  label: 'Built-in',                desc: 'Claude SDK native tools — always available to every task at the agent profile\\x27s permission tier.' },
-    { key: 'custom',   label: 'Custom in-process MCP',   desc: 'MCP servers defined in clementine\\x27s code, loaded inside the daemon process.' },
-    { key: 'shell',    label: 'Shell commands',          desc: 'Local CLI binaries (sf, gh, gcloud…) wrapped as MCP servers.' },
-    { key: 'external', label: 'External MCP servers',    desc: 'Third-party MCP servers reached over stdio, SSE, or HTTP.' },
-  ];
-  for (var k = 0; k < sections.length; k++) {
-    var sec = sections[k];
-    var bucket = buckets[sec.key] || [];
-    html += '<div style="margin-bottom:24px">';
+
+  // ── Header strip: total + Refresh button + last-probed timestamp ─────
+  html += '<div style="display:flex;align-items:flex-end;gap:14px;margin-bottom:18px;flex-wrap:wrap">';
+  html += '<div style="flex:1;min-width:240px">'
+    +      '<h2 style="margin:0 0 4px;font-size:18px;font-weight:600;color:var(--text-primary)">Tools &amp; MCP catalog</h2>'
+    +      '<div style="font-size:12px;color:var(--text-muted)">'
+    +        esc(totalTools) + ' tool' + (totalTools === 1 ? '' : 's') + ' across ' + esc(categoryEntries.length) + ' categories'
+    +        ' · ' + esc(servers.length) + ' MCP server' + (servers.length === 1 ? '' : 's')
+    +        ' · ' + esc(liveTools.length) + ' live in SDK'
+    +        (probedAt ? ' (probed ' + esc(timeAgo(probedAt)) + ')' : ' (not probed yet — click Refresh)')
+    +      '</div>'
+    +    '</div>';
+  html += '<div style="display:flex;gap:8px;align-items:center">'
+    +      '<input id="toolsmcp-search" type="text" placeholder="Search tools…" oninput="filterToolsCatalog()" style="padding:6px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg-secondary);color:var(--text-primary);font-size:12px;width:200px"/>'
+    +      '<button class="btn-sm" id="toolsmcp-probe-btn" onclick="probeToolsMcpInventory()" title="Run a one-shot SDK query to refresh the tool inventory (~5s). Picks up new connectors and any tool the SDK is currently surfacing.">Refresh inventory</button>'
+    +    '</div>';
+  html += '</div>';
+
+  // ── Tool categories from /api/available-tools ─────────────────────────
+  // Composio (1k+ entries) collapses by default; everything else opens.
+  var compositeRender = function(entry) {
+    var t = entry || {};
+    var name = t.name || '(unnamed)';
+    var desc = t.description || '';
+    var typeLabel = t.type || '';
+    var connected = t.connected;
+    var apiName = t.api;
+    var liveBadge = liveSet[name] ? '<span style="font-size:10px;color:var(--green);background:rgba(34,197,94,0.12);padding:1px 6px;border-radius:999px;margin-left:6px">LIVE</span>' : '';
+    var connBadge = '';
+    if (connected === true) connBadge = '<span style="font-size:10px;color:var(--green);background:rgba(34,197,94,0.12);padding:1px 6px;border-radius:999px;margin-left:6px">connected</span>';
+    else if (connected === false) connBadge = '<span style="font-size:10px;color:var(--text-muted);background:rgba(148,163,184,0.12);padding:1px 6px;border-radius:999px;margin-left:6px">offline</span>';
+    var typeBadge = typeLabel ? '<span style="font-size:10px;color:var(--text-muted);background:var(--bg-tertiary);padding:1px 6px;border-radius:3px;margin-left:6px;text-transform:uppercase;letter-spacing:0.04em">' + esc(typeLabel) + '</span>' : '';
+    var apiBadge = apiName ? '<span style="font-size:10px;color:var(--text-muted);margin-left:6px">via ' + esc(apiName) + '</span>' : '';
+    return '<div class="toolsmcp-tool" data-tool-name="' + esc(name.toLowerCase()) + '" data-tool-desc="' + esc(String(desc).toLowerCase()) + '" style="padding:8px 10px;border-bottom:1px solid var(--border-subtle);font-size:12px;display:flex;align-items:center;gap:6px;flex-wrap:wrap">'
+      +     '<code style="background:var(--bg-tertiary);padding:1px 6px;border-radius:3px;color:var(--accent);font-size:11px">' + esc(name) + '</code>'
+      +     typeBadge + apiBadge + liveBadge + connBadge
+      +     (desc ? '<span style="color:var(--text-secondary);flex:1;min-width:0">' + esc(String(desc).slice(0, 240)) + '</span>' : '')
+      +   '</div>';
+  };
+
+  // Stable order — system surfaces first, then APIs, then the giant Composio.
+  var orderedKeys = ['Core SDK', 'CLI Tools', 'Memory & Vault', 'Notes & Tasks', 'API Integrations',
+                     'Goals & Workflows', 'Agent Management', 'Team', 'System', 'Global MCP Servers',
+                     'Local Projects', 'Composio Toolkits'];
+  var orderedCats = orderedKeys
+    .map(function(k){ return categoryEntries.find(function(c){ return c.name === k; }); })
+    .filter(function(c){ return c && c.items.length > 0; });
+  // Append any unknown categories the server returned that aren't in our preferred order.
+  for (var ci = 0; ci < categoryEntries.length; ci++) {
+    if (orderedKeys.indexOf(categoryEntries[ci].name) === -1 && categoryEntries[ci].items.length > 0) {
+      orderedCats.push(categoryEntries[ci]);
+    }
+  }
+
+  for (var c = 0; c < orderedCats.length; c++) {
+    var cat = orderedCats[c];
+    var openByDefault = cat.name !== 'Composio Toolkits' && cat.items.length <= 50;
+    html += '<details class="toolsmcp-cat" data-cat-name="' + esc(cat.name.toLowerCase()) + '"' + (openByDefault ? ' open' : '') + ' style="background:var(--bg-secondary);border:1px solid var(--border);border-radius:8px;margin-bottom:10px;overflow:hidden">';
+    html += '<summary style="padding:10px 14px;cursor:pointer;display:flex;align-items:center;gap:10px;font-size:13px;font-weight:600;color:var(--text-primary);user-select:none">'
+      +      '<span style="flex:1">' + esc(cat.name) + '</span>'
+      +      '<span style="font-size:11px;color:var(--text-muted);font-weight:500">' + cat.items.length + ' tool' + (cat.items.length === 1 ? '' : 's') + '</span>'
+      +    '</summary>';
+    html += '<div class="toolsmcp-cat-body" style="background:var(--bg-primary);max-height:480px;overflow-y:auto">';
+    // For Composio specifically, show first 200 + "show all" — 1037 tools at once is heavy DOM
+    var items = cat.name === 'Composio Toolkits' ? cat.items.slice(0, 200) : cat.items;
+    for (var ii = 0; ii < items.length; ii++) html += compositeRender(items[ii]);
+    if (cat.name === 'Composio Toolkits' && cat.items.length > items.length) {
+      html += '<div style="padding:10px 14px;text-align:center;font-size:11px;color:var(--text-muted);background:var(--bg-secondary);border-top:1px solid var(--border-subtle)">'
+        +      'Showing ' + items.length + ' of ' + cat.items.length + ' Composio toolkits. Use the search box to find a specific service.'
+        +    '</div>';
+    }
+    html += '</div></details>';
+  }
+
+  // ── MCP server transport panel — kept for connection status, reconnect, edit ─────
+  if (servers.length > 0) {
+    html += '<div style="margin-top:24px">';
     html += '<div style="display:flex;align-items:baseline;gap:10px;margin-bottom:10px">'
-      +      '<h3 style="margin:0;font-size:14px;font-weight:600;color:var(--text-primary)">' + esc(sec.label) + '</h3>'
-      +      '<span style="font-size:11px;color:var(--text-muted);font-weight:500">' + bucket.length + '</span>'
+      +      '<h3 style="margin:0;font-size:14px;font-weight:600;color:var(--text-primary)">MCP servers</h3>'
+      +      '<span style="font-size:11px;color:var(--text-muted);font-weight:500">' + servers.length + '</span>'
       +    '</div>';
-    html += '<div style="font-size:11px;color:var(--text-muted);margin-bottom:12px">' + esc(sec.desc) + '</div>';
-    if (bucket.length === 0) {
-      html += '<div class="empty-state" style="padding:14px;color:var(--text-muted);font-size:12px;background:var(--bg-secondary);border:1px dashed var(--border);border-radius:6px">No servers in this bucket.</div>';
-    } else {
-      html += '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:12px">';
+    html += '<div style="font-size:11px;color:var(--text-muted);margin-bottom:12px">Configured MCP servers and their live connection status. Use Reconnect to clear cached errors; Edit to view command, args, env.</div>';
+    // Bucket by transport so the page reads cleanly. Built-in / Custom buckets
+    // are kept (some installs DO have clementine-tools or kernel) but absent
+    // ones don't render an empty card grid.
+    var buckets = { builtin: [], shell: [], external: [] };
+    for (var i = 0; i < servers.length; i++) {
+      var s = servers[i];
+      var sname = s.name || '';
+      var stype = s.type || 'stdio';
+      var scmd = s.command || '';
+      var kind;
+      if (sname === 'clementine-tools' || sname === 'kernel') kind = 'builtin';
+      else if (/^(sf|gh|gcloud|kubectl|docker|aws|az|terraform)$/.test(scmd) || /\\b(sf|gh|gcloud|kubectl)$/.test(scmd)) kind = 'shell';
+      else kind = 'external';
+      buckets[kind].push(s);
+    }
+    var bucketLabels = [
+      { key: 'builtin',  label: 'Built-in / In-process' },
+      { key: 'shell',    label: 'Shell wrappers' },
+      { key: 'external', label: 'External (stdio / sse / http)' },
+    ];
+    for (var bk = 0; bk < bucketLabels.length; bk++) {
+      var bucket = buckets[bucketLabels[bk].key] || [];
+      if (bucket.length === 0) continue;
+      html += '<div style="margin-bottom:18px">'
+        +      '<div style="font-size:12px;font-weight:500;color:var(--text-secondary);margin-bottom:8px">' + esc(bucketLabels[bk].label) + ' <span style="color:var(--text-muted);font-weight:400">· ' + bucket.length + '</span></div>'
+        +      '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:12px">';
       for (var b = 0; b < bucket.length; b++) html += renderMcpCatalogCard(bucket[b], statusMap);
-      html += '</div>';
+      html += '</div></div>';
     }
     html += '</div>';
   }
+
   panel.innerHTML = html;
+}
+
+// Filter tools by the search box at the top of the catalog. Lightweight
+// client-side filter — hides individual tool rows + collapses categories
+// that have zero matches, so 1k+ Composio entries don't slow typing.
+function filterToolsCatalog() {
+  var input = document.getElementById('toolsmcp-search');
+  if (!input) return;
+  var q = (input.value || '').toLowerCase().trim();
+  var cats = document.querySelectorAll('.toolsmcp-cat');
+  for (var ci = 0; ci < cats.length; ci++) {
+    var cat = cats[ci];
+    var rows = cat.querySelectorAll('.toolsmcp-tool');
+    var anyMatch = false;
+    for (var ri = 0; ri < rows.length; ri++) {
+      var name = rows[ri].getAttribute('data-tool-name') || '';
+      var desc = rows[ri].getAttribute('data-tool-desc') || '';
+      var match = !q || name.indexOf(q) !== -1 || desc.indexOf(q) !== -1;
+      rows[ri].style.display = match ? '' : 'none';
+      if (match) anyMatch = true;
+    }
+    cat.style.display = anyMatch || !q ? '' : 'none';
+    // Auto-open categories with hits when the user is actively searching.
+    if (q && anyMatch) cat.setAttribute('open', '');
+  }
+}
+
+// POST /api/tools/probe — runs probeAvailableTools(true) which boots a one-
+// shot SDK query to capture every tool currently surfaced. Updates the cache
+// at ~/.clementine/.tool-inventory.json. Then reloads the catalog so the
+// "LIVE" badges and probed-at timestamp reflect the new data.
+async function probeToolsMcpInventory() {
+  var btn = document.getElementById('toolsmcp-probe-btn');
+  var originalText = btn ? btn.textContent : '';
+  if (btn) { btn.disabled = true; btn.textContent = 'Probing… (~5s)'; }
+  try {
+    var r = await apiFetch('/api/tools/probe', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ force: true }) });
+    var d = await r.json();
+    if (d && d.ok) {
+      toast('Probed ' + d.toolCount + ' tools', 'success');
+    } else {
+      toast(d && d.error ? 'Probe failed: ' + d.error : 'Probe failed', 'error');
+    }
+  } catch (e) {
+    toast('Probe failed: ' + e, 'error');
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = originalText || 'Refresh inventory'; }
+    refreshToolsMcpCatalog();
+  }
 }
 
 // Render one MCP server card. Status pill colors mirror the PRD's five
