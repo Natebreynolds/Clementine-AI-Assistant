@@ -574,6 +574,11 @@ export interface CronJobDefinition {
   prompt: string;
   enabled: boolean;
   tier: number;
+  /** Human-readable description of what this task does (one paragraph, ~200
+   *  chars). Surfaces on the task card as the preview line — replaces the
+   *  "first sentence of prompt" fallback when present. Auto-populated by
+   *  the cron-migrator from the matching skill's description. Optional. */
+  description?: string;
   maxTurns?: number;
   model?: string;
   workDir?: string;

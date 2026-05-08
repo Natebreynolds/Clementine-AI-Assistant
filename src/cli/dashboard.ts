@@ -4395,6 +4395,185 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
     }
   });
 
+  // ── Cron-clean migrator (1.18.119) ─────────────────────────────────
+  // Three endpoints (matching the skill-migration pattern):
+  //   - GET  /api/cron/migrate-preview    — dry-run across every job
+  //   - POST /api/cron/:job/migrate       — apply migration to one job
+  //   - POST /api/cron/migrate-all        — apply to all eligible jobs
+  // Every apply writes a `<basename>.bak` of the CRON.md before saving.
+
+  app.get('/api/cron/migrate-preview', async (_req, res) => {
+    try {
+      const { migrateAllEligibleJobs } = await import('../agent/cron-migrator.js');
+      const { listSkills } = await import('../agent/skill-store.js');
+      const { parseCronJobs, parseAgentCronJobs } = await import('../gateway/cron-scheduler.js');
+      const skills = listSkills();
+      const jobs = [...parseCronJobs(), ...parseAgentCronJobs(path.join(VAULT_DIR, '00-System', 'agents'))];
+      const out = migrateAllEligibleJobs(jobs, skills);
+      // Trim the response — the dashboard doesn't need the full migrated job
+      // body for the preview list, just the names + change bullets.
+      res.json({
+        ok: true,
+        eligible: out.eligible.map(({ job, result }) => ({
+          name: job.name,
+          enabled: job.enabled,
+          schedule: job.schedule,
+          changes: result.changes,
+          matchedSkill: result.matchedSkill ?? null,
+          // Send a small before/after snippet so the UI can show a diff.
+          before: { prompt: (job.prompt || '').slice(0, 600), predictable: job.predictable, description: job.description },
+          after: {
+            prompt: (result.migrated.prompt || '').slice(0, 600),
+            predictable: result.migrated.predictable,
+            description: result.migrated.description,
+            skills: result.migrated.skills,
+            allowedTools: result.migrated.allowedTools,
+          },
+        })),
+        skipped: out.skipped.map(({ job, reason }) => ({ name: job.name, reason })),
+      });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: String(err) });
+    }
+  });
+
+  app.post('/api/cron/:job/migrate', async (req, res) => {
+    try {
+      const jobName = req.params.job;
+      if (!jobName) { res.status(400).json({ ok: false, error: 'job name required' }); return; }
+      const { migrateCronJob } = await import('../agent/cron-migrator.js');
+      const { listSkills } = await import('../agent/skill-store.js');
+      const { parseCronJobs, parseAgentCronJobs } = await import('../gateway/cron-scheduler.js');
+
+      // Locate the source file + the job
+      const { cronFile, bareJobName } = resolveJobCronFile(jobName);
+      const allJobs = [...parseCronJobs(), ...parseAgentCronJobs(path.join(VAULT_DIR, '00-System', 'agents'))];
+      const target = allJobs.find(j => String(j.name).toLowerCase() === jobName.toLowerCase());
+      if (!target) { res.status(404).json({ ok: false, error: 'job "' + jobName + '" not found' }); return; }
+
+      const skills = listSkills();
+      const result = migrateCronJob(target, skills);
+      if (!result.eligible) {
+        res.json({ ok: true, eligible: false, reason: result.notEligibleReason });
+        return;
+      }
+
+      // Write back. .bak is produced by writeCronFileAt's own backup if any —
+      // here we add one explicitly so the user has a rollback artifact.
+      const bakPath = cronFile + '.bak';
+      try { writeFileSync(bakPath, readFileSync(cronFile, 'utf-8')); } catch { /* best-effort */ }
+
+      const { parsed, jobs } = readCronFileAt(cronFile);
+      // Find by bare name (job in the YAML uses bareJobName, not the global "agent:job" form)
+      const idx = jobs.findIndex(j => String(j.name).toLowerCase() === bareJobName.toLowerCase());
+      if (idx < 0) { res.status(404).json({ ok: false, error: 'job not in CRON.md (resolved to "' + bareJobName + '")' }); return; }
+      // Convert the migrated CronJobDefinition back to YAML-friendly shape.
+      // CRITICAL: agent CRON.md stores BARE job names (no agent: prefix);
+      // parseAgentCronJobs adds the prefix at read time. Writing m.name
+      // back here would double-prefix on the next read. Use bareJobName.
+      const m = result.migrated;
+      const next: Record<string, unknown> = { ...jobs[idx] };
+      next.name = bareJobName;
+      next.schedule = m.schedule;
+      next.prompt = m.prompt;
+      next.enabled = m.enabled;
+      next.tier = m.tier;
+      if (m.description) next.description = m.description; else delete next.description;
+      if (m.predictable === true) next.predictable = true;
+      if (m.skills && m.skills.length > 0) next.skills = m.skills;
+      if (m.allowedTools && m.allowedTools.length > 0) next.allowed_tools = m.allowedTools;
+      if (m.allowedMcpServers && m.allowedMcpServers.length > 0) next.allowed_mcp_servers = m.allowedMcpServers;
+      jobs[idx] = next;
+      writeCronFileAt(cronFile, parsed, jobs);
+
+      res.json({
+        ok: true,
+        eligible: true,
+        name: jobName,
+        cronFile,
+        bakPath,
+        changes: result.changes,
+        matchedSkill: result.matchedSkill ?? null,
+      });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: String(err) });
+    }
+  });
+
+  app.post('/api/cron/migrate-all', async (_req, res) => {
+    try {
+      const { migrateAllEligibleJobs } = await import('../agent/cron-migrator.js');
+      const { listSkills } = await import('../agent/skill-store.js');
+      const { parseCronJobs, parseAgentCronJobs } = await import('../gateway/cron-scheduler.js');
+      const agentsDir = path.join(VAULT_DIR, '00-System', 'agents');
+
+      const skills = listSkills();
+      const allJobs = [...parseCronJobs(), ...parseAgentCronJobs(agentsDir)];
+      const out = migrateAllEligibleJobs(allJobs, skills);
+
+      const applied: Array<{ name: string; cronFile: string }> = [];
+      const failed: Array<{ name: string; error: string }> = [];
+      const touchedFiles = new Set<string>();
+
+      // Group writes by file so we open + parse + serialize each file once.
+      const byFile = new Map<string, Array<{ bareName: string; result: typeof out.eligible[number]['result'] }>>();
+      for (const { job, result } of out.eligible) {
+        const { cronFile, bareJobName } = resolveJobCronFile(job.name);
+        if (!byFile.has(cronFile)) byFile.set(cronFile, []);
+        byFile.get(cronFile)!.push({ bareName: bareJobName, result });
+      }
+
+      for (const [cronFile, items] of byFile.entries()) {
+        try {
+          // .bak the file before any edits so a single rollback restores it.
+          const bakPath = cronFile + '.bak';
+          try { writeFileSync(bakPath, readFileSync(cronFile, 'utf-8')); } catch { /* best-effort */ }
+          const { parsed, jobs } = readCronFileAt(cronFile);
+          for (const { bareName, result } of items) {
+            const idx = jobs.findIndex(j => String(j.name).toLowerCase() === bareName.toLowerCase());
+            if (idx < 0) {
+              failed.push({ name: bareName, error: 'job vanished mid-migration' });
+              continue;
+            }
+            const m = result.migrated;
+            const next: Record<string, unknown> = { ...jobs[idx] };
+            // Same bare-vs-prefixed gotcha as the per-job migrate path —
+            // agent CRON.md stores bare names. Always write bareName here.
+            next.name = bareName;
+            next.schedule = m.schedule;
+            next.prompt = m.prompt;
+            next.enabled = m.enabled;
+            next.tier = m.tier;
+            if (m.description) next.description = m.description; else delete next.description;
+            if (m.predictable === true) next.predictable = true;
+            if (m.skills && m.skills.length > 0) next.skills = m.skills;
+            if (m.allowedTools && m.allowedTools.length > 0) next.allowed_tools = m.allowedTools;
+            if (m.allowedMcpServers && m.allowedMcpServers.length > 0) next.allowed_mcp_servers = m.allowedMcpServers;
+            jobs[idx] = next;
+            applied.push({ name: m.name, cronFile });
+          }
+          writeCronFileAt(cronFile, parsed, jobs);
+          touchedFiles.add(cronFile);
+        } catch (err) {
+          for (const { bareName } of items) failed.push({ name: bareName, error: String(err) });
+        }
+      }
+
+      res.json({
+        ok: true,
+        appliedCount: applied.length,
+        skippedCount: out.skipped.length,
+        failedCount: failed.length,
+        applied,
+        skipped: out.skipped.map(({ job, reason }) => ({ name: job.name, reason })),
+        failed,
+        touchedFiles: [...touchedFiles],
+      });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: String(err) });
+    }
+  });
+
   app.get('/api/cron/:job/draft', async (req, res) => {
     try {
       const jobName = req.params.job;
@@ -25729,7 +25908,12 @@ async function refreshCron() {
     // top failure). The runs payload from /api/cron/runs (already fetched
     // alongside ops) feeds the metrics. Render an empty shell first;
     // refreshHealthStrip fills it in.
-    var html = '<div id="health-strip" class="health-strip"></div>';
+    // 1.18.119 — cron-clean migration banner. Mounts here as an empty
+    // placeholder; refreshCronCleanBanner() fetches /api/cron/migrate-preview
+    // async and fills this in only when there are eligible legacy jobs.
+    // The banner stays empty (zero visual noise) when the vault is clean.
+    var html = '<div id="cron-migrate-banner-host"></div>';
+    html += '<div id="health-strip" class="health-strip"></div>';
     // 1.18.115 — collapse the cost/latency/reliability/activity mini-cards
     // into a <details> block. The Health Strip already covers what most
     // users want at a glance; the 4 mini-dashboards are for deeper
@@ -25805,6 +25989,11 @@ async function refreshCron() {
     // Fire-and-forget — the strip lives at the top, fills in async.
     if (typeof refreshHealthStrip === 'function') {
       refreshHealthStrip().catch(function() { /* non-fatal */ });
+    }
+    // 1.18.119 — fire-and-forget the cron-migrate banner check. Renders
+    // a soft tip when ≥1 legacy task is eligible; otherwise silent.
+    if (typeof refreshCronMigrateBanner === 'function') {
+      refreshCronMigrateBanner().catch(function() { /* non-fatal */ });
     }
     if (typeof refreshMiniDashboards === 'function') {
       refreshMiniDashboards().catch(function() { /* non-fatal */ });
@@ -26925,6 +27114,120 @@ async function confirmDeleteSkill(name) {
     toast('Skill "' + name + '" deleted', 'success');
     if (typeof refreshSkillsPage === 'function') await refreshSkillsPage();
   } catch (err) { toast('Delete failed: ' + err, 'error'); }
+}
+
+// 1.18.119 — Cron-clean migration banner + flow. Surfaces a soft tip on
+// the Tasks page when ≥1 legacy task is eligible. Click "Preview" to see
+// every change in a modal; click "Migrate all" to apply across the vault
+// in one round-trip. Each migration writes a .bak of the source CRON.md
+// for trivial rollback. Refreshing the catalog re-runs the eligibility
+// check, so the banner auto-hides once everything is clean.
+var _cronMigratePreview = null;
+
+async function refreshCronMigrateBanner() {
+  var host = document.getElementById('cron-migrate-banner-host');
+  if (!host) return;
+  try {
+    var r = await apiFetch('/api/cron/migrate-preview');
+    var d = await r.json();
+    if (!d.ok || !Array.isArray(d.eligible) || d.eligible.length === 0) {
+      host.innerHTML = '';
+      return;
+    }
+    _cronMigratePreview = d;
+    var n = d.eligible.length;
+    host.innerHTML =
+      '<div style="margin:0 0 14px;padding:12px 16px;border:1px solid var(--accent);background:rgba(255,141,0,0.06);border-radius:8px;display:flex;align-items:center;gap:14px;flex-wrap:wrap">'
+      +   '<span style="font-size:18px">✨</span>'
+      +   '<div style="flex:1;min-width:200px">'
+      +     '<div style="font-size:13px;font-weight:600;color:var(--text-primary);margin-bottom:2px">Clean up ' + n + ' legacy task' + (n === 1 ? '' : 's') + '</div>'
+      +     '<div style="font-size:12px;color:var(--text-secondary);line-height:1.45">Strip TOOL RESTRICTIONS preambles, pin matching skills, enable Strict mode, add descriptions. The runtime behavior stays the same — the editor just gets readable.</div>'
+      +   '</div>'
+      +   '<button onclick="openCronMigratePreview()" style="font-size:12px;padding:7px 14px;border-radius:6px;border:1px solid var(--border);background:var(--bg-secondary);color:var(--text-primary);cursor:pointer">Preview changes</button>'
+      +   '<button onclick="applyCronMigrateAll()" class="btn-primary" style="font-size:12px;padding:7px 14px;border-radius:6px;border:none;background:var(--accent);color:#fff;font-weight:500;cursor:pointer">Migrate all</button>'
+      + '</div>';
+  } catch (e) {
+    host.innerHTML = '';
+  }
+}
+
+function openCronMigratePreview() {
+  if (!_cronMigratePreview) return;
+  var modal = document.getElementById('cron-migrate-modal');
+  if (!modal) {
+    modal = document.createElement('div');
+    modal.id = 'cron-migrate-modal';
+    modal.className = 'modal-overlay';
+    modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.45);display:flex;align-items:center;justify-content:center;z-index:1000;padding:20px';
+    document.body.appendChild(modal);
+  }
+  var rows = _cronMigratePreview.eligible.map(function(item) {
+    var changes = (item.changes || []).map(function(c) {
+      return '<li style="margin:2px 0">' + esc(c) + '</li>';
+    }).join('');
+    var skillBadge = item.matchedSkill
+      ? ' <span style="font-size:10px;color:var(--accent);background:rgba(255,141,0,0.10);padding:1px 6px;border-radius:3px;margin-left:6px">→ ' + esc(item.matchedSkill) + '</span>'
+      : '';
+    var enabledBadge = item.enabled
+      ? ' <span class="badge badge-green" style="font-size:10px">enabled</span>'
+      : ' <span class="badge badge-gray" style="font-size:10px">disabled</span>';
+    return '<div style="border:1px solid var(--border);border-radius:6px;padding:10px 12px;margin-bottom:8px;background:var(--bg-secondary)">'
+      +   '<div style="display:flex;align-items:center;gap:6px;margin-bottom:6px">'
+      +     '<code style="font-size:12px;font-weight:600;color:var(--text-primary)">' + esc(item.name) + '</code>'
+      +     enabledBadge + skillBadge
+      +     '<span style="margin-left:auto;font-size:11px;color:var(--text-muted)">' + esc(item.schedule) + '</span>'
+      +   '</div>'
+      +   '<ul style="margin:0;padding-left:18px;font-size:12px;color:var(--text-secondary);line-height:1.5">' + changes + '</ul>'
+      + '</div>';
+  }).join('');
+  var skipped = (_cronMigratePreview.skipped || []).length > 0
+    ? '<details style="margin-top:14px;font-size:12px;color:var(--text-muted)">'
+      +   '<summary style="cursor:pointer;padding:4px 0">' + _cronMigratePreview.skipped.length + ' task' + (_cronMigratePreview.skipped.length === 1 ? '' : 's') + ' skipped (already clean)</summary>'
+      +   '<ul style="margin:6px 0 0;padding-left:18px;line-height:1.6">'
+      +     _cronMigratePreview.skipped.map(function(s) { return '<li>' + esc(s.name) + '</li>'; }).join('')
+      +   '</ul>'
+      + '</details>'
+    : '';
+  modal.innerHTML =
+    '<div style="background:var(--bg-primary);border:1px solid var(--border);border-radius:10px;width:min(820px,95vw);max-height:90vh;display:flex;flex-direction:column;box-shadow:0 16px 48px rgba(0,0,0,0.35)">'
+    +   '<div style="display:flex;align-items:center;justify-content:space-between;padding:14px 20px;border-bottom:1px solid var(--border)">'
+    +     '<h3 style="margin:0;font-size:15px;font-weight:600">Migrate ' + _cronMigratePreview.eligible.length + ' legacy task' + (_cronMigratePreview.eligible.length === 1 ? '' : 's') + ' to clean format</h3>'
+    +     '<button onclick="closeCronMigrateModal()" style="background:none;border:none;font-size:18px;color:var(--text-muted);cursor:pointer;padding:0 4px;line-height:1">✕</button>'
+    +   '</div>'
+    +   '<div style="flex:1;overflow-y:auto;padding:18px 22px">'
+    +     '<div style="font-size:12px;color:var(--text-muted);margin-bottom:12px;line-height:1.5">Each task gets a <code>.bak</code> of its CRON.md before changes. Migration is reversible — restore the .bak to undo. The runtime behavior of every task stays identical (same schedule, same prompt outcome, same tools).</div>'
+    +     rows
+    +     skipped
+    +   '</div>'
+    +   '<div style="display:flex;justify-content:flex-end;gap:8px;padding:14px 20px;border-top:1px solid var(--border);background:var(--bg-secondary)">'
+    +     '<button onclick="closeCronMigrateModal()" style="padding:7px 14px;font-size:13px;border:1px solid var(--border);border-radius:6px;background:transparent;color:var(--text-primary);cursor:pointer">Cancel</button>'
+    +     '<button onclick="applyCronMigrateAll()" class="btn-primary" style="padding:7px 16px;font-size:13px;border:none;border-radius:6px;background:var(--accent);color:#fff;font-weight:500;cursor:pointer">Apply migration</button>'
+    +   '</div>'
+    + '</div>';
+  modal.style.display = 'flex';
+}
+
+function closeCronMigrateModal() {
+  var m = document.getElementById('cron-migrate-modal');
+  if (m) m.style.display = 'none';
+}
+
+async function applyCronMigrateAll() {
+  if (!confirm('Migrate every eligible legacy task to the clean format? Each touched CRON.md gets a .bak file you can restore from.')) return;
+  try {
+    var r = await apiFetch('/api/cron/migrate-all', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+    var d = await r.json();
+    if (!d.ok) {
+      toast(d.error || 'Migration failed', 'error');
+      return;
+    }
+    closeCronMigrateModal();
+    var msg = 'Migrated ' + d.appliedCount + ' task' + (d.appliedCount === 1 ? '' : 's')
+      + (d.skippedCount > 0 ? ' (' + d.skippedCount + ' already clean)' : '')
+      + (d.failedCount > 0 ? ' — ' + d.failedCount + ' failed' : '');
+    toast(msg, d.failedCount > 0 ? 'error' : 'success');
+    if (typeof refreshCron === 'function') refreshCron();
+  } catch (err) { toast('Migration failed: ' + err, 'error'); }
 }
 
 async function refreshSkillsPage() {
