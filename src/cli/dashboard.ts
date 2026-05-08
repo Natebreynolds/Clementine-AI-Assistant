@@ -21936,7 +21936,7 @@ function lucide(name, cls) {
   return '<svg class="icn ' + (cls || '') + '" viewBox="0 0 24 24" aria-hidden="true">' + path + '</svg>';
 }
 
-var DESTINATIONS = ['home', 'build', 'heartbeat', 'team', 'brain', 'settings'];
+var DESTINATIONS = ['home', 'build', 'skills', 'heartbeat', 'team', 'brain', 'settings'];
 
 var ROUTE_REDIRECTS = {
   // old hash → new {page, tab}
