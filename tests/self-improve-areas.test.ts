@@ -94,14 +94,6 @@ describe('validateProposal — prompt-override', () => {
   });
 });
 
-describe('validateProposal — source area is deprecated', () => {
-  it('rejects source proposals up front (Phase 1 quarantine)', () => {
-    const r = validateProposal('source', 'agent/foo.ts', 'export const x = 1;');
-    expect(r.valid).toBe(false);
-    expect(r.error).toContain('deprecated');
-  });
-});
-
 describe('promptOverridePathForTarget', () => {
   it('global → _global.md', () => {
     expect(promptOverridePathForTarget('global')).toMatch(/_global\.md$/);

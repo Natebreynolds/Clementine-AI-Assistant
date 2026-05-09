@@ -29,7 +29,6 @@ import {
   BASE_DIR,
   SELF_IMPROVE_DIR,
   SOUL_FILE,
-  AGENTS_FILE,
   CRON_FILE,
   WORKFLOWS_DIR,
   VAULT_DIR,
@@ -61,15 +60,18 @@ const DEFAULT_CONFIG: SelfImproveConfig = {
   acceptThreshold: 0.7,
   surfaceThreshold: 0.85,
   plateauLimit: 3,
-  // 'source' deprecated — self-improvement produces data, not engine TS edits.
-  // 'advisor-rule' writes YAML to ~/.clementine/advisor-rules/user/.
-  // 'prompt-override' writes markdown to ~/.clementine/prompt-overrides/.
+  // Areas the autoresearch loop targets. Removed in 1.18.137 cleanup:
+  //   'source' (engine TS edits — quarantined since Phase 1, every layer rejected)
+  //   'communication' (AGENTS.md — interactive-only; loop fires from cron so
+  //     improvements are invisible to the next evaluation pass)
+  //   'memory' (MEMORY.md is rewritten by the extraction pipeline; proposals
+  //     get clobbered within days)
+  // Each remaining area maps to a file the runtime actually consumes.
   areas: [
-    'soul', 'cron', 'workflow', 'memory', 'agent', 'communication', 'goal',
+    'soul', 'cron', 'workflow', 'agent', 'goal',
     'advisor-rule', 'prompt-override', 'skill',
   ],
   autoApply: true,
-  sourceMode: 'skip',
 };
 
 // ── Paths ────────────────────────────────────────────────────────────
@@ -204,13 +206,18 @@ function checkDrift(proposedContent: string): { ok: boolean; similarity: number 
 
 // ── Risk classification ──────────────────────────────────────────────
 
-/** Risk tiers for self-improvement proposals. */
-type RiskTier = 'low' | 'medium' | 'high';
+/** Risk tiers for self-improvement proposals. After 1.18.137 there are
+ *  only two tiers: low changes auto-apply (when autoApply=true), medium
+ *  always surfaces for owner approval. The 'high' tier was the source-
+ *  edit escape hatch; with that area removed there are no high-risk
+ *  paths left. */
+type RiskTier = 'low' | 'medium';
 
 /** Classify the risk level of a proposed change.
- * - low: agent prompts, individual cron job prompts, advisor rules, prompt overrides
- * - medium: SOUL.md, AGENTS.md, MEMORY.md — needs owner approval
- * - high: source code — stays blocked (deprecated path; kept for back-compat)
+ * - low: agent prompts, individual cron job prompts, workflows, advisor
+ *   rules, prompt overrides — small-blast-radius config files
+ * - medium: SOUL.md, goals, skills — fan out across many runs; the owner
+ *   should review before they ship
  */
 function classifyRisk(area: string): RiskTier {
   switch (area) {
@@ -219,7 +226,7 @@ function classifyRisk(area: string): RiskTier {
     case 'workflow':         return 'low';
     case 'advisor-rule':     return 'low';    // YAML files, hot-reloaded, easily deleted
     case 'prompt-override':  return 'low';    // Markdown files, hot-reloaded, easily deleted
-    // 1.18.136 — 'skill' is the new first-class self-improve target.
+    // 1.18.136 — 'skill' is a first-class self-improve target.
     // Skills are user-facing recipes that fire across many tasks; a
     // bad change can cascade into every cron that pins them. Medium
     // tier so changes always surface for owner approval, never auto-
@@ -227,11 +234,8 @@ function classifyRisk(area: string): RiskTier {
     // proposal can even reach the queue (see validateProposal).
     case 'skill':            return 'medium';
     case 'soul':             return 'medium'; // Core personality — needs approval
-    case 'communication':    return 'medium'; // Global operating instructions
-    case 'memory':           return 'medium'; // Memory config
     case 'goal':             return 'medium'; // New goals need owner review before activating
-    case 'source':           return 'high';   // Deprecated — quarantined in Phase 1
-    default:                 return 'high';
+    default:                 return 'medium'; // Unknown area → safest default
   }
 }
 
@@ -762,21 +766,6 @@ export class SelfImproveLoop {
               } else {
                 await this.savePendingChange(experiment, before);
                 state.pendingApprovals++;
-              }
-            } else if (this.config.autoApply && risk === 'high') {
-              // High-risk: behavior depends on sourceMode config
-              if (this.config.sourceMode === 'skip') {
-                logger.info({ id, area: proposal.area, risk }, 'Skipped high-risk proposal in auto mode');
-                experiment.approvalStatus = 'denied';
-                experiment.reason = 'High-risk area blocked in autonomous mode (sourceMode=skip)';
-              } else {
-                // propose-only: save for human review, never auto-apply
-                await this.savePendingChange(experiment, before);
-                state.pendingApprovals++;
-                if (onProposal) {
-                  await onProposal(experiment);
-                }
-                logger.info({ id, area: proposal.area, risk }, 'Saved high-risk proposal for human review');
               }
             } else {
               // Medium-risk or manual mode: save as pending for approval
@@ -1505,12 +1494,6 @@ export class SelfImproveLoop {
         const agentFile = path.join(AGENTS_DIR, target, 'agent.md');
         return existsSync(agentFile) ? readFileSync(agentFile, 'utf-8') : '';
       }
-      case 'communication':
-        return existsSync(AGENTS_FILE) ? readFileSync(AGENTS_FILE, 'utf-8') : '';
-      case 'memory': {
-        const memoryFile = path.join(VAULT_DIR, '00-System', 'MEMORY.md');
-        return existsSync(memoryFile) ? readFileSync(memoryFile, 'utf-8') : '';
-      }
       case 'goal': {
         // target = "{owner}" e.g. "clementine" or an agent slug
         const owner = target.split('/')[0];
@@ -1623,12 +1606,6 @@ export class SelfImproveLoop {
 
     if (!targetPath) {
       return `Cannot resolve target path for area=${pending.area}, target=${pending.target}`;
-    }
-
-    // 'source' area is deprecated (Phase 1 quarantine). Reject up-front so a
-    // misbehaving proposal cannot reach the safeSourceEdit primitive.
-    if (pending.area === 'source') {
-      return 'source area is deprecated — propose advisor-rule or prompt-override instead';
     }
 
     // Goal area: parse JSON, inject required fields, ensure parent dir exists
@@ -2460,10 +2437,6 @@ export class SelfImproveLoop {
       case 'agent': {
         return path.join(AGENTS_DIR, target, 'agent.md');
       }
-      case 'communication':
-        return AGENTS_FILE;
-      case 'memory':
-        return path.join(VAULT_DIR, '00-System', 'MEMORY.md');
       case 'goal': {
         // target = "{owner}/{goalSlug}" e.g. "clementine/<goal-slug>" or "<agent-slug>/<goal-slug>"
         const [owner, goalSlug] = target.split('/');
@@ -2520,7 +2493,7 @@ export function validateProposal(area: string, target: string, proposedChange: s
   if (!proposedChange.trim()) {
     return { valid: false, error: 'Proposed change is empty' };
   }
-  if (['soul', 'cron', 'workflow', 'agent', 'communication'].includes(area)) {
+  if (['soul', 'cron', 'workflow', 'agent'].includes(area)) {
     try {
       matter(proposedChange);
     } catch (err) {
@@ -2551,11 +2524,6 @@ export function validateProposal(area: string, target: string, proposedChange: s
     } catch (err) {
       return { valid: false, error: `CRON.md validation failed: ${err}` };
     }
-  }
-  if (area === 'source') {
-    // Deprecated — Phase 1 quarantined source self-edit. Reject up front so
-    // a misbehaving LLM proposal doesn't even get cached.
-    return { valid: false, error: 'source area is deprecated; propose advisor-rule or prompt-override instead' };
   }
   if (area === 'skill') {
     // 1.18.136 — skill body validation. The proposedChange is the FULL

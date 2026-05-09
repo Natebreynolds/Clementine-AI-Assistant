@@ -285,9 +285,4 @@ describe('validateProposal', () => {
     expect(result.error).toContain('must be an array');
   });
 
-  it('rejects deprecated source area (Phase 1 quarantine)', () => {
-    const result = validateProposal('source', 'index.ts', 'const x = 1;');
-    expect(result.valid).toBe(false);
-    expect(result.error).toContain('deprecated');
-  });
 });

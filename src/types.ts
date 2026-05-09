@@ -1150,7 +1150,7 @@ export interface SelfImproveExperiment {
   startedAt: string;                   // ISO
   finishedAt: string;                  // ISO
   durationMs: number;
-  area: 'soul' | 'cron' | 'workflow' | 'memory' | 'agent' | 'source' | 'communication' | 'goal' | 'advisor-rule' | 'prompt-override' | 'skill';
+  area: 'soul' | 'cron' | 'workflow' | 'agent' | 'goal' | 'advisor-rule' | 'prompt-override' | 'skill';
   target: string;                      // e.g., "SOUL.md personality section"
   hypothesis: string;                  // What the LLM decided to try
   proposedChange: string;              // The actual modification
@@ -1210,13 +1210,11 @@ export interface SelfImproveConfig {
    */
   surfaceThreshold?: number;
   plateauLimit: number;                // Default: 3 consecutive low-score stops loop
-  areas: ('soul' | 'cron' | 'workflow' | 'memory' | 'agent' | 'source' | 'communication' | 'goal' | 'advisor-rule' | 'prompt-override' | 'skill')[];
+  areas: ('soul' | 'cron' | 'workflow' | 'agent' | 'goal' | 'advisor-rule' | 'prompt-override' | 'skill')[];
   /** Enable tiered auto-apply: low-risk changes apply without approval. Default: false. */
   autoApply?: boolean;
   /** Target a specific agent slug (for per-agent improvement cycles). */
   agentSlug?: string;
-  /** How to handle source code proposals. 'skip' = drop silently, 'propose-only' = save for human review. Default: 'propose-only'. */
-  sourceMode?: 'skip' | 'propose-only';
 }
 
 // ── Restart Sentinel ────────────────────────────────────────────────
