@@ -6779,6 +6779,43 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
     }
   });
 
+  // 1.18.132 — list top-level files in a registered project. Used by
+  // the Skill Builder's Files sidebar tab to surface clickable file
+  // paths that the user can insert into their skill body.
+  // Hardened: the path query param MUST match a registered project's
+  // path exactly (no path traversal, no scanning arbitrary directories).
+  app.get('/api/projects/files', (req, res) => {
+    try {
+      const projPath = String(req.query.path ?? '');
+      if (!projPath) return res.status(400).json({ ok: false, error: 'path query param required' });
+      const projects = loadProjectsMeta();
+      const found = projects.find((p) => p.path === projPath);
+      if (!found) return res.status(404).json({ ok: false, error: 'path is not a registered project' });
+      if (!existsSync(projPath)) return res.json({ ok: true, files: [], note: 'project path does not exist on disk' });
+      let entries: string[];
+      try { entries = readdirSync(projPath); } catch (err) {
+        return res.status(500).json({ ok: false, error: 'failed to list directory: ' + String(err) });
+      }
+      // Skip hidden + node_modules + standard noise. Up to 50 entries
+      // (the sidebar caps at 50 anyway). One level deep — the panel is
+      // an entry point; users can dig further from their editor.
+      const NOISE = new Set(['node_modules', '.git', '.DS_Store', 'dist', 'build', '.next', '.cache']);
+      const out: Array<{ relPath: string; isDir: boolean; sizeBytes: number }> = [];
+      for (const entry of entries.sort()) {
+        if (entry.startsWith('.')) continue;
+        if (NOISE.has(entry)) continue;
+        const abs = path.join(projPath, entry);
+        let st;
+        try { st = statSync(abs); } catch { continue; }
+        out.push({ relPath: entry, isDir: st.isDirectory(), sizeBytes: st.isFile() ? st.size : 0 });
+        if (out.length >= 50) break;
+      }
+      res.json({ ok: true, files: out });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: String(err) });
+    }
+  });
+
   // ── Available Tools ──────────────────────────────────────────
 
   app.get('/api/available-tools', async (_req, res) => {
@@ -27878,6 +27915,7 @@ async function openSkillBuilder(skillName) {
       +     '<span id="sb-save-status" style="font-size:11px;color:var(--text-muted)"></span>'
       +   '</div>'
       +   '<div style="display:flex;align-items:center;gap:6px">'
+      +     '<button onclick="sbRunSkillTest()" id="sb-test-btn" style="font-size:12px;padding:7px 12px;border:1px solid var(--green);border-radius:6px;background:transparent;color:var(--green);cursor:pointer;font-weight:500" title="Fire this skill once and stream the result inline (toast on completion)">▶ Test run</button>'
       +     '<button onclick="sbSaveCurrent()" id="sb-save-btn" class="btn-primary" style="font-size:12px;padding:7px 14px;border:none;border-radius:6px;background:var(--accent);color:#fff;font-weight:500;cursor:pointer" disabled>Save (⌘S)</button>'
       +     '<button onclick="closeSkillBuilder()" style="font-size:12px;padding:7px 12px;border:1px solid var(--border);border-radius:6px;background:transparent;color:var(--text-primary);cursor:pointer">Close</button>'
       +   '</div>'
@@ -27903,6 +27941,8 @@ async function openSkillBuilder(skillName) {
       +   '<div style="border-left:1px solid var(--border);background:var(--bg-secondary);display:flex;flex-direction:column;min-height:0">'
       +     '<div style="padding:8px 6px 0;display:flex;gap:2px;border-bottom:1px solid var(--border)">'
       +       '<button onclick="sbSwitchTab(\\x27tools\\x27)" id="sb-tab-tools" class="sb-tab" style="flex:1;font-size:11px;padding:8px 4px;border:none;background:transparent;color:var(--text-muted);cursor:pointer;border-bottom:2px solid transparent;font-weight:500">Tools</button>'
+      +       '<button onclick="sbSwitchTab(\\x27files\\x27)" id="sb-tab-files" class="sb-tab" style="flex:1;font-size:11px;padding:8px 4px;border:none;background:transparent;color:var(--text-muted);cursor:pointer;border-bottom:2px solid transparent;font-weight:500">Files</button>'
+      +       '<button onclick="sbSwitchTab(\\x27memory\\x27)" id="sb-tab-memory" class="sb-tab" style="flex:1;font-size:11px;padding:8px 4px;border:none;background:transparent;color:var(--text-muted);cursor:pointer;border-bottom:2px solid transparent;font-weight:500">Memory</button>'
       +       '<button onclick="sbSwitchTab(\\x27skills\\x27)" id="sb-tab-skills" class="sb-tab" style="flex:1;font-size:11px;padding:8px 4px;border:none;background:transparent;color:var(--text-muted);cursor:pointer;border-bottom:2px solid transparent;font-weight:500">Skills</button>'
       +     '</div>'
       +     '<div style="padding:6px 10px;border-bottom:1px solid var(--border)">'
@@ -28089,10 +28129,10 @@ async function sbDeleteFile(relPath) {
   }
 }
 
-// ── Sidebar tabs (Tools / Skills) ────────────────────────────────────
+// ── Sidebar tabs (Tools / Files / Memory / Skills) ──────────────────
 function sbSwitchTab(tab) {
   window._sbActiveTab = tab;
-  ['tools', 'skills'].forEach(function(t) {
+  ['tools', 'files', 'memory', 'skills'].forEach(function(t) {
     var el = document.getElementById('sb-tab-' + t);
     if (el) {
       el.style.color = (t === tab) ? 'var(--accent)' : 'var(--text-muted)';
@@ -28108,6 +28148,10 @@ async function sbRenderSidebar() {
   var q = (document.getElementById('sb-sidebar-search')?.value || '').toLowerCase().trim();
   if (window._sbActiveTab === 'tools') {
     await sbRenderToolsTab(listEl, q);
+  } else if (window._sbActiveTab === 'files') {
+    await sbRenderFilesTab(listEl, q);
+  } else if (window._sbActiveTab === 'memory') {
+    await sbRenderMemoryTab(listEl, q);
   } else if (window._sbActiveTab === 'skills') {
     await sbRenderSkillsTab(listEl, q);
   }
@@ -28205,6 +28249,163 @@ async function sbRenderSkillsTab(listEl, q) {
   listEl.innerHTML = html;
 }
 
+// 1.18.132 — Files tab (Phase 2.5). Browses the user's projects.
+// Click a project to expand its file tree; click a file to insert
+// its absolute path at the cursor (so the skill body can reference
+// it via Read or Bash). Scoped to projectsData (already populated by
+// /api/projects on page load); no separate filesystem walk endpoint
+// needed in this iteration.
+async function sbRenderFilesTab(listEl, q) {
+  var projects = (typeof projectsData !== 'undefined' && Array.isArray(projectsData)) ? projectsData : [];
+  if (projects.length === 0) {
+    try {
+      var pr = await window.apiFetch('/api/projects');
+      var pd = await pr.json();
+      if (pd && Array.isArray(pd.projects)) projects = pd.projects;
+    } catch (_) { /* fall through to empty */ }
+  }
+  if (q) {
+    projects = projects.filter(function(p) {
+      return ((p.name || '') + ' ' + (p.path || '')).toLowerCase().indexOf(q) > -1;
+    });
+  }
+  if (projects.length === 0) {
+    listEl.innerHTML = '<div style="padding:18px;color:var(--text-muted);font-size:11px;text-align:center">' + (q ? 'No matches.' : 'No projects yet. Add one in Settings → Projects.') + '</div>';
+    return;
+  }
+  var html = '<div style="padding:6px 12px;font-size:10px;font-weight:600;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.04em;background:var(--bg-tertiary)">Projects (' + projects.length + ')</div>';
+  for (var i = 0; i < projects.length; i++) {
+    var p = projects[i];
+    // Click on row → insert the project path. Click on icon to load
+    // a child file list inline (lazy expand).
+    html += '<div style="border-bottom:1px solid var(--border-light)">'
+      + '<div onclick="sbInsertAtCursor(\\x27' + jsStr(p.path) + '\\x27)" style="padding:7px 12px;cursor:pointer;font-size:12px;display:flex;align-items:center;gap:6px" onmouseover="this.style.background=\\x27var(--bg-tertiary)\\x27" onmouseout="this.style.background=\\x27transparent\\x27" title="Insert this absolute path at the cursor">'
+      +   '<span>📁</span>'
+      +   '<span style="font-weight:500;color:var(--text-primary);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(p.name || p.path.split(\'/\').pop()) + '</span>'
+      +   '<button onclick="event.stopPropagation();sbToggleProjectFiles(\\x27' + jsStr(p.path) + '\\x27, this)" title="Browse files inside this project" style="background:none;border:1px solid var(--border);color:var(--text-muted);font-size:10px;padding:1px 6px;border-radius:3px;cursor:pointer">▸</button>'
+      + '</div>'
+      + '<div id="sb-files-children-' + i + '" data-project-path="' + esc(p.path) + '" style="display:none;font-size:11px;background:var(--bg-secondary);padding:4px 0"></div>'
+      + '</div>';
+  }
+  listEl.innerHTML = html;
+}
+
+// Lazy-load the child file list for a project. Hits a tiny endpoint
+// that returns the top-level files (max 50, no recursion) so we don't
+// blow the panel on huge projects.
+async function sbToggleProjectFiles(projectPath, btn) {
+  // Find the children container next to this button
+  var children = btn.parentElement.parentElement.querySelector('[data-project-path]');
+  if (!children) return;
+  if (children.style.display !== 'none') {
+    children.style.display = 'none';
+    btn.textContent = '▸';
+    return;
+  }
+  children.style.display = '';
+  btn.textContent = '▾';
+  if (!children.dataset.loaded) {
+    children.innerHTML = '<div style="padding:8px 24px;color:var(--text-muted);font-size:10px">Loading…</div>';
+    try {
+      var r = await window.apiFetch('/api/projects/files?path=' + encodeURIComponent(projectPath));
+      var d = await r.json();
+      if (!r.ok || !Array.isArray(d.files)) {
+        children.innerHTML = '<div style="padding:8px 24px;color:var(--text-muted);font-size:10px">No files surfaced (or endpoint unavailable).</div>';
+        return;
+      }
+      var html = '';
+      for (var i = 0; i < Math.min(d.files.length, 50); i++) {
+        var f = d.files[i];
+        var icon = f.isDir ? '📁' : '📄';
+        var fullPath = projectPath + '/' + f.relPath;
+        html += '<div onclick="sbInsertAtCursor(\\x27' + jsStr(fullPath) + '\\x27)" style="padding:4px 24px;cursor:pointer;display:flex;align-items:center;gap:6px" onmouseover="this.style.background=\\x27var(--bg-tertiary)\\x27" onmouseout="this.style.background=\\x27transparent\\x27">'
+          + '<span>' + icon + '</span>'
+          + '<span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--text-secondary)">' + esc(f.relPath) + '</span>'
+          + '</div>';
+      }
+      if (d.files.length > 50) {
+        html += '<div style="padding:4px 24px;color:var(--text-muted);font-size:10px;font-style:italic">+ ' + (d.files.length - 50) + ' more (open the project in your editor for the rest)</div>';
+      }
+      children.innerHTML = html;
+      children.dataset.loaded = '1';
+    } catch (err) {
+      children.innerHTML = '<div style="padding:8px 24px;color:var(--red);font-size:10px">' + esc(String(err)) + '</div>';
+    }
+  }
+}
+
+// 1.18.132 — Memory tab (Phase 2.5). Surfaces three things the agent
+// can reach when the skill runs:
+//   1. Recent extractions (last facts the auto-extractor saved)
+//   2. Top-level MEMORY.md sections (h2 headers)
+//   3. A button to insert a memory_search call template
+// Click any item → inserts a contextual reference at the cursor so
+// the skill body can document or trigger a recall.
+async function sbRenderMemoryTab(listEl, q) {
+  var html = '';
+  // 1. Recent extractions
+  try {
+    var r = await window.apiFetch('/api/memory/writes/recent?limit=12');
+    var d = await r.json();
+    var writes = (d && Array.isArray(d.writes)) ? d.writes : (d && Array.isArray(d.entries) ? d.entries : []);
+    if (q) {
+      writes = writes.filter(function(w) {
+        return JSON.stringify(w).toLowerCase().indexOf(q) > -1;
+      });
+    }
+    if (writes.length > 0) {
+      html += '<div style="padding:6px 12px;font-size:10px;font-weight:600;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.04em;background:var(--bg-tertiary)">Recent extractions</div>';
+      for (var i = 0; i < Math.min(writes.length, 8); i++) {
+        var w = writes[i];
+        var preview = (w.content_preview || w.content || w.preview || w.text || '').slice(0, 100);
+        if (!preview) continue;
+        var insertion = 'Reference recent fact: "' + preview.replace(/"/g, '\\\\\\\\"').slice(0, 80) + '"';
+        html += '<div onclick="sbInsertAtCursor(\\x27' + jsStr(insertion) + '\\x27)" style="padding:7px 12px;cursor:pointer;font-size:12px;border-bottom:1px solid var(--border-light)" onmouseover="this.style.background=\\x27var(--bg-tertiary)\\x27" onmouseout="this.style.background=\\x27transparent\\x27">'
+          + '<div style="color:var(--text-secondary);line-height:1.4;font-size:11px">' + esc(preview) + (preview.length >= 100 ? '…' : '') + '</div>'
+          + '</div>';
+      }
+    }
+  } catch (_) { /* memory writes endpoint may not be live in early daemons */ }
+  // 2. MEMORY.md slot headers
+  try {
+    var r2 = await window.apiFetch('/api/memory/md');
+    var d2 = await r2.json();
+    var content = (d2 && d2.content) || '';
+    var lines = content.split('\\n');
+    var sections = [];
+    for (var li = 0; li < lines.length; li++) {
+      var match = lines[li].match(/^##\\s+(.+)$/);
+      if (match) sections.push(match[1].trim());
+    }
+    if (q) {
+      sections = sections.filter(function(s) { return s.toLowerCase().indexOf(q) > -1; });
+    }
+    if (sections.length > 0) {
+      html += '<div style="padding:6px 12px;font-size:10px;font-weight:600;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.04em;background:var(--bg-tertiary);margin-top:4px">MEMORY.md sections</div>';
+      for (var si = 0; si < sections.length; si++) {
+        var s = sections[si];
+        var ins = 'Refer to MEMORY.md > "' + s + '" section.';
+        html += '<div onclick="sbInsertAtCursor(\\x27' + jsStr(ins) + '\\x27)" style="padding:6px 12px;cursor:pointer;font-size:12px;display:flex;align-items:center;gap:6px;border-bottom:1px solid var(--border-light)" onmouseover="this.style.background=\\x27var(--bg-tertiary)\\x27" onmouseout="this.style.background=\\x27transparent\\x27">'
+          + '<span>📄</span>'
+          + '<span style="color:var(--text-primary)">' + esc(s) + '</span>'
+          + '</div>';
+      }
+    }
+  } catch (_) { /* defensive */ }
+  // 3. Always-available memory_search insert
+  html += '<div style="padding:6px 12px;font-size:10px;font-weight:600;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.04em;background:var(--bg-tertiary);margin-top:4px">Patterns</div>';
+  html += '<div onclick="sbInsertAtCursor(\\x27Use memory_search with query: \\\\\\\"YOUR_QUERY\\\\\\\".\\x27)" style="padding:7px 12px;cursor:pointer;font-size:12px;border-bottom:1px solid var(--border-light)" onmouseover="this.style.background=\\x27var(--bg-tertiary)\\x27" onmouseout="this.style.background=\\x27transparent\\x27">'
+    + '<span style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--text-primary)">memory_search</span>'
+    + '<span style="color:var(--text-muted);font-size:10px;margin-left:8px">Recall facts/transcripts at runtime</span>'
+    + '</div>';
+  html += '<div onclick="sbInsertAtCursor(\\x27Use memory_write to save this fact: \\\\\\\"FACT\\\\\\\" with reason \\\\\\\"WHY_IT_MATTERS\\\\\\\".\\x27)" style="padding:7px 12px;cursor:pointer;font-size:12px;border-bottom:1px solid var(--border-light)" onmouseover="this.style.background=\\x27var(--bg-tertiary)\\x27" onmouseout="this.style.background=\\x27transparent\\x27">'
+    + '<span style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--text-primary)">memory_write</span>'
+    + '<span style="color:var(--text-muted);font-size:10px;margin-left:8px">Persist a new fact</span>'
+    + '</div>';
+  if (!html.trim()) html = '<div style="padding:18px;color:var(--text-muted);font-size:11px;text-align:center">No memory items surfaced.</div>';
+  listEl.innerHTML = html;
+}
+
 function sbInsertAtCursor(text) {
   var ed = document.getElementById('sb-editor');
   if (!ed) return;
@@ -28216,6 +28417,38 @@ function sbInsertAtCursor(text) {
   ed.selectionStart = ed.selectionEnd = start + text.length;
   ed.focus();
   sbOnEdit();
+}
+
+// 1.18.132 — Test runner. Fires the open skill once via the same
+// /api/cron/run/:name path that the Skills detail Run-now button
+// uses (which itself works for unscheduled skills via cmdCronRun's
+// catalog fallback). Refuses to run if the file has unsaved changes
+// (otherwise the user would be testing the saved version, not what
+// they see in the editor — confusing).
+async function sbRunSkillTest() {
+  if (window._sbState.dirty) {
+    if (!confirm('Save current changes before testing? Unsaved edits won\\x27t be in the run.')) return;
+    await sbSaveCurrent();
+    if (window._sbState.dirty) return; // save failed
+  }
+  var name = window._sbState.skillName;
+  if (!name) return;
+  var btn = document.getElementById('sb-test-btn');
+  if (btn) { btn.disabled = true; btn.textContent = '⏳ Running…'; btn.style.color = 'var(--text-muted)'; btn.style.borderColor = 'var(--border)'; }
+  try {
+    var r = await window.apiFetch('/api/cron/run/' + encodeURIComponent(name), { method: 'POST' });
+    if (r.status === 409) {
+      toast('Already running. Wait for the in-flight run to finish.', 'warn');
+      return;
+    }
+    var d = await r.json();
+    if (!r.ok) { toast(d.error || 'Run failed', 'error'); return; }
+    toast('Started "' + name + '" — output streams to chat. Close the builder to see it.', 'success');
+  } catch (err) {
+    toast('Failed: ' + err, 'error');
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = '▶ Test run'; btn.style.color = 'var(--green)'; btn.style.borderColor = 'var(--green)'; }
+  }
 }
 
 async function _openSkillModal(opts) {
