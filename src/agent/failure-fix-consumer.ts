@@ -40,7 +40,7 @@ import matter from 'gray-matter';
 import pino from 'pino';
 import { AGENTS_DIR, BASE_DIR, SYSTEM_DIR } from '../config.js';
 
-const logger = pino({ name: 'clementine.self-improve-loop' });
+const logger = pino({ name: 'clementine.failure-fix-consumer' });
 
 /**
  * Fallback tick interval. The loop is primarily event-driven via fs.watch
@@ -376,7 +376,7 @@ function writePendingChange(record: PendingChangeRecord, dir: string): string {
 
 // ── Main loop ────────────────────────────────────────────────────────
 
-export class SelfImproveLoop {
+export class FailureFixConsumer {
   private readonly tickMs: number;
   private readonly triggersDir: string;
   private readonly pendingDir: string;

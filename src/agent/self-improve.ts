@@ -589,12 +589,18 @@ export class SelfImproveLoop {
             continue;
           }
 
-          // Diversity safety net: skip if hypothesis targets an over-represented area:target
+          // Diversity safety net: skip if hypothesis targets an over-represented area:target.
+          // 1.18.134 — loosened cap from 3 to 5. The old cap caused the
+          // loop to plateau immediately whenever it had ~3 ideas about
+          // SOUL.md (which is a frequent attractor). At 5 the
+          // hypothesizer gets a few more swings at the same area before
+          // diversity kicks in — but still avoids monomania.
+          const DIVERSITY_CAP = 5;
           const proposalKey = `${proposal.area}:${proposal.target}`;
           const proposalCount = history.filter(e => `${e.area}:${e.target}` === proposalKey).length
             + this.getPendingChanges().filter(p => `${p.area}:${p.target}` === proposalKey).length;
-          if (proposalCount >= 3) {
-            logger.warn({ area: proposal.area, target: proposal.target, count: proposalCount },
+          if (proposalCount >= DIVERSITY_CAP) {
+            logger.warn({ area: proposal.area, target: proposal.target, count: proposalCount, cap: DIVERSITY_CAP },
               'Hypothesis over-targeted — skipping');
             consecutiveLow++;
             continue;
@@ -629,8 +635,37 @@ export class SelfImproveLoop {
             60_000, // 1 min for evaluation
           );
 
-          const score = evaluation?.score ?? 0;
-          const normalizedScore = score / 10; // Convert 0-10 to 0-1
+          const llmScore = evaluation?.score ?? 0;
+          const normalizedLlmScore = llmScore / 10; // Convert 0-10 to 0-1
+          // 1.18.134 — blend the LLM evaluator score with an objective
+          // signal pulled from real metrics. Karpathy's autoresearch uses
+          // ONE objective metric (val_bpb); Clementine's LLM-only score
+          // can drift, especially when proposals affect SOUL.md or
+          // cosmetic prompt fields. The objective floor is computed from
+          // the baseline metrics gathered at the start of THIS run:
+          //
+          //   objective = cronSuccessRate * feedbackPositiveRatio
+          //
+          // Both 0..1; product preserves the multiplicative penalty of
+          // either metric being weak. We weight 70% LLM / 30% objective
+          // — the LLM still drives most decisions, but a proposal can't
+          // sail through on a 9/10 evaluator score when feedback is at
+          // 35% positive (which is the current reality). Set the env
+          // var SELF_IMPROVE_OBJECTIVE_WEIGHT to override (0..1).
+          const objectiveWeightRaw = parseFloat(process.env.SELF_IMPROVE_OBJECTIVE_WEIGHT ?? '0.3');
+          const objectiveWeight = Number.isFinite(objectiveWeightRaw) && objectiveWeightRaw >= 0 && objectiveWeightRaw <= 1
+            ? objectiveWeightRaw : 0.3;
+          const llmWeight = 1 - objectiveWeight;
+          const objectiveScore = (state.baselineMetrics.cronSuccessRate || 0)
+            * (state.baselineMetrics.feedbackPositiveRatio || 0);
+          const normalizedScore = (normalizedLlmScore * llmWeight) + (objectiveScore * objectiveWeight);
+          const score = normalizedScore * 10; // For display + reason text
+          logger.debug({
+            llm: normalizedLlmScore.toFixed(3),
+            objective: objectiveScore.toFixed(3),
+            blended: normalizedScore.toFixed(3),
+            weight: objectiveWeight,
+          }, 'Score blend');
           const accepted = normalizedScore >= this.config.acceptThreshold;
           // Surface gate: even when accepted, only score >= surfaceThreshold
           // reaches the user's pending-changes inbox. Below that floor we

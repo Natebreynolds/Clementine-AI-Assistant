@@ -827,11 +827,14 @@ async function asyncMain(): Promise<void> {
   const { AgentHeartbeatManager } = await import('./gateway/agent-heartbeat-manager.js');
   const agentHeartbeats = new AgentHeartbeatManager(gateway.getAgentManager(), gateway);
 
-  // Self-improve loop — closes the gap between "trigger written" and
-  // "fix applied." Every 10 min, scans self-improve/triggers/, classifies
-  // failures, auto-applies safe cron-config fixes, escalates risky ones.
-  const { SelfImproveLoop } = await import('./agent/self-improve-loop.js');
-  const selfImproveLoop = new SelfImproveLoop(dispatcher);
+  // Failure-fix consumer (1.18.134 — renamed from "self-improve-loop"
+  // to disambiguate from the Karpathy autoresearch SelfImproveLoop in
+  // src/agent/self-improve.ts). Every 10 min, scans
+  // self-improve/triggers/, classifies failures, auto-applies safe
+  // cron-config fixes, escalates risky ones. Different concern from
+  // the autoresearch hypothesize/evaluate loop.
+  const { FailureFixConsumer } = await import('./agent/failure-fix-consumer.js');
+  const failureFixConsumer = new FailureFixConsumer(dispatcher);
 
   // ── Build channel tasks ──────────────────────────────────────────
   const channelTasks: Array<Promise<void>> = [];
@@ -937,7 +940,37 @@ async function asyncMain(): Promise<void> {
   heartbeat.start();
   cronScheduler.start();
   agentHeartbeats.start();
-  selfImproveLoop.start();
+  failureFixConsumer.start();
+
+  // 1.18.134 — nightly Karpathy-autoresearch self-improve trigger.
+  // The Karpathy SelfImproveLoop (src/agent/self-improve.ts) was
+  // previously only triggered by /self-improve run or CLI. With no
+  // automatic schedule the loop ran ~3 times in the prior 4 days and
+  // sat plateaued. This wires a daily 3am trigger so it iterates on
+  // its own — matching Karpathy's continuous-iteration model.
+  // SELF_IMPROVE_HOUR env var overrides (0–23, default 3).
+  const selfImproveHour = (() => {
+    const raw = parseInt(process.env.SELF_IMPROVE_HOUR ?? '3', 10);
+    if (Number.isFinite(raw) && raw >= 0 && raw <= 23) return raw;
+    return 3;
+  })();
+  // node-cron is already a dependency (used by cron-scheduler). Schedule
+  // a single daily tick — the SelfImproveLoop's own time/iteration caps
+  // and plateau detection bound the work; we don't need finer granularity.
+  try {
+    const nodeCron = (await import('node-cron')).default;
+    nodeCron.schedule(`0 ${selfImproveHour} * * *`, () => {
+      logger.info({ hour: selfImproveHour }, 'Nightly self-improve trigger firing');
+      gateway.handleSelfImprove('run').then((summary) => {
+        logger.info({ summary }, 'Nightly self-improve trigger complete');
+      }).catch((err) => {
+        logger.error({ err }, 'Nightly self-improve trigger failed');
+      });
+    }, { timezone: process.env.TZ || 'America/Los_Angeles' });
+    logger.info({ hour: selfImproveHour }, `Self-improve nightly trigger scheduled (${selfImproveHour}:00 daily)`);
+  } catch (err) {
+    logger.warn({ err }, 'Failed to schedule nightly self-improve trigger');
+  }
 
   // Background-task hygiene: any task left in 'running' is from a prior
   // process. Mark them aborted so the lifecycle is honest. (P6b will add
@@ -1163,7 +1196,7 @@ async function asyncMain(): Promise<void> {
   heartbeat.stop();
   cronScheduler.stop();
   agentHeartbeats.stop();
-  selfImproveLoop.stop();
+  failureFixConsumer.stop();
 
   // ── Self-restart (enhanced with health check + rollback) ────────
   if (restartRequested) {
