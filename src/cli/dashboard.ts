@@ -39003,11 +39003,23 @@ async function refreshWorkflows() {
     var r = await apiFetch('/api/workflows');
     var data = await r.json();
     var workflows = data.workflows || [];
+    // 1.18.142 — Soft-deprecation banner. Always shown when there's at least
+    // one workflow on disk, hidden when the user has fully migrated. New
+    // users who never had workflows in the first place see a different empty
+    // state pointing them at Skills.
+    var banner = '';
+    if (workflows.length > 0) {
+      banner = '<div class="card" style="margin-bottom:14px;padding:12px 14px;background:var(--accent-glow);border-left:3px solid var(--accent)">' +
+        '<div style="font-weight:600;margin-bottom:4px">Workflows are being phased out → Skills</div>' +
+        '<div style="font-size:13px;color:var(--text-secondary);line-height:1.5">' +
+        'Skills cover the same use cases with better composability and the new builder. Use the <strong>Migrate</strong> button on any workflow row below to convert it into a vanilla Anthropic skill folder. Your existing workflows keep firing until you migrate them — nothing breaks.' +
+        '</div></div>';
+    }
     if (workflows.length === 0) {
-      containers.forEach(function(c) { c.innerHTML = '<div class="empty-state">No workflows defined. Create .md files in vault/00-System/workflows/</div>'; });
+      containers.forEach(function(c) { c.innerHTML = '<div class="empty-state">No workflows defined. <strong>Skills are the way forward</strong> — create one from the Skills tab. Workflow .md files in vault/00-System/workflows/ still work for legacy setups.</div>'; });
       return;
     }
-    var html = '';
+    var html = banner;
     workflows.forEach(function(wf) {
       var triggerLabel = wf.trigger && wf.trigger.schedule ? describeCron(wf.trigger.schedule) || wf.trigger.schedule : 'Manual only';
       var stepCount = wf.steps ? wf.steps.length : 0;
@@ -39018,6 +39030,7 @@ async function refreshWorkflows() {
       html += '<span class="badge ' + (wf.enabled ? 'badge-green' : 'badge-gray') + '" style="font-size:10px">' + (wf.enabled ? 'Enabled' : 'Disabled') + '</span>';
       html += '<button class="btn btn-sm" onclick="runWorkflow(\\x27' + esc(wf.name) + '\\x27)" style="font-size:10px;color:var(--green)">Run</button>';
       html += '<button class="btn btn-sm" onclick="showWorkflowRuns(\\x27' + esc(wf.name) + '\\x27)" style="font-size:10px">History</button>';
+      html += '<button class="btn btn-sm" onclick="migrateWorkflowToSkill(\\x27' + esc(wf.name) + '\\x27)" style="font-size:10px;color:var(--accent)" title="Convert this workflow into a vanilla Anthropic skill folder. Original is renamed to .md.migrated, kept on disk for rollback.">Migrate → Skill</button>';
       html += '</div>';
       html += '<div class="card-body">';
       if (wf.description) html += '<div style="font-size:13px;color:var(--text-secondary);margin-bottom:8px">' + esc(wf.description) + '</div>';
@@ -39058,6 +39071,30 @@ async function runWorkflow(name) {
     var d = await r.json();
     if (d.ok) toast('Workflow "' + name + '" triggered');
     else toast(d.error || 'Failed', 'error');
+  } catch(e) { toast(String(e), 'error'); }
+}
+
+// 1.18.142 — Convert a workflow into a vanilla skill folder, then refresh
+// the list so the migrated workflow disappears (its .md is renamed to
+// .md.migrated server-side and parseAllWorkflows stops picking it up).
+async function migrateWorkflowToSkill(name) {
+  if (!confirm('Migrate "' + name + '" into a skill folder?\n\n' +
+    '• A new skill will be created at vault/00-System/skills/<slug>/SKILL.md\n' +
+    '• The original workflow .md will be renamed to .md.migrated (kept for rollback)\n' +
+    '• The workflow stops firing; the skill is ready to schedule from the Skills tab')) return;
+  try {
+    var r = await apiFetch('/api/workflows/' + encodeURIComponent(name) + '/migrate-to-skill', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    });
+    var d = await r.json();
+    if (d.ok) {
+      toast('Migrated "' + name + '" → skill "' + (d.skill && d.skill.name || '?') + '"' + (d.warning ? ' (' + d.warning + ')' : ''));
+      refreshWorkflows();
+    } else {
+      toast(d.error || 'Migration failed', 'error');
+    }
   } catch(e) { toast(String(e), 'error'); }
 }
 
