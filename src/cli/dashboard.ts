@@ -21003,6 +21003,21 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
           </div>
         </div>
 
+        <!-- 1.18.128 — Project Context promoted to Basics. Was buried in
+             the Scope tab where users were missing it. Selecting a project
+             gives the task that project's CLAUDE.md, MCP config, and cwd —
+             usually the single most impactful field after Prompt. -->
+        <div class="cron-section-card" data-config-tab="basics">
+          <h4>Project Context <span style="color:var(--text-muted);font-weight:normal;font-size:13px">(optional)</span></h4>
+          <p class="cron-section-desc">Run this task inside a project directory. The agent picks up that project's <code>CLAUDE.md</code>, MCP config, and any context files alongside the cwd.</p>
+          <div class="form-group">
+            <select id="cron-workdir">
+              <option value="">None — runs in default context</option>
+            </select>
+            <div class="form-hint">No projects yet? <a href="#" onclick="navigateTo(\\x27settings\\x27, { tab: \\x27projects\\x27 }); closeCronModal(); return false" style="color:var(--accent)">Add one →</a></div>
+          </div>
+        </div>
+
         <!-- Schedule -->
         <div class="cron-section-card" data-config-tab="basics">
           <h4>Schedule</h4>
@@ -21198,25 +21213,18 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
           </div>
         </div>
 
-        <!-- ── Scope: where the task can read/write ── -->
+        <!-- ── Scope: extra read directories beyond the project cwd ── -->
+        <!-- 1.18.128 — Project Context picker moved up to Basics. This
+             section now only owns Additional read directories, which is
+             a power-user feature anyway. -->
         <div class="cron-section-card" data-config-tab="scope">
           <h4>Scope</h4>
-          <p class="cron-section-desc">Where the agent runs and what files it can read.</p>
-          <div class="form-row">
-            <div class="form-group">
-              <label class="form-label">Project Context <span style="color:var(--text-muted);font-weight:normal">(optional)</span></label>
-              <select id="cron-workdir">
-                <option value="">None — runs in default context</option>
-              </select>
-              <div class="form-hint">Run inside a project directory. Agent gets that project's CLAUDE.md.</div>
-            </div>
-          </div>
-          <!-- PRD Phase 1: read scope beyond cwd. One absolute path per line. -->
+          <p class="cron-section-desc">Extra directories the agent gets read access to beyond the project cwd. Most tasks won't need this.</p>
           <div class="form-row">
             <div class="form-group" style="flex:1">
               <label class="form-label">Additional read directories <span style="color:var(--text-muted);font-weight:normal">(optional)</span></label>
               <textarea id="cron-add-dirs" rows="2" placeholder="/Users/me/notes&#10;/Users/me/clients/acme" style="font-family:'JetBrains Mono',monospace;font-size:11px"></textarea>
-              <div class="form-hint">One absolute path per line. The agent gets read access to these in addition to the Project Context cwd.</div>
+              <div class="form-hint">One absolute path per line. The Project Context above already gives the agent its cwd; use this for extra read scope only.</div>
             </div>
           </div>
         </div>
@@ -26845,9 +26853,14 @@ async function refreshProjects(preloaded) {
         ? '<div style="color:var(--accent);margin-bottom:4px;font-size:12px">' + esc(p.userDescription) + '</div>'
         : '';
       const idx = projectsData.indexOf(p);
+      // 1.18.128 — "+ New task in this project" CTA: opens the cron creation
+      // modal with the project pre-selected as Project Context. Closes the
+      // mental gap between "I have a project with built-up context" and
+      // "I need to schedule a task that uses it."
+      const newTaskBtn = '<button class="btn btn-sm" style="font-size:11px" onclick="openCronModalForProject(' + idx + ')" title="Create a scheduled task that runs inside this project">+ New task</button>';
       const linkBtn = p.linked
-        ? '<button class="btn btn-sm" style="font-size:11px" onclick="openProjectEditorByIdx(' + idx + ')">Edit</button> <button class="btn btn-sm btn-danger" style="font-size:11px" onclick="unlinkProjectByIdx(' + idx + ')">Unlink</button>'
-        : '<button class="btn btn-sm btn-primary" style="font-size:11px" onclick="openProjectEditorByIdx(' + idx + ')">Link</button>';
+        ? newTaskBtn + ' <button class="btn btn-sm" style="font-size:11px" onclick="openProjectEditorByIdx(' + idx + ')">Edit</button> <button class="btn btn-sm btn-danger" style="font-size:11px" onclick="unlinkProjectByIdx(' + idx + ')">Unlink</button>'
+        : newTaskBtn + ' <button class="btn btn-sm btn-primary" style="font-size:11px" onclick="openProjectEditorByIdx(' + idx + ')">Link</button>';
       html += '<div class="card" style="cursor:default">'
         + '<div class="card-header" style="display:flex;align-items:center;justify-content:space-between">'
         + '<strong>' + esc(p.name) + '</strong>'
@@ -28341,13 +28354,50 @@ async function loadSkillsCatalog() {
 
 async function loadMcpCatalog() {
   if (_mcpCatalog) return _mcpCatalog;
+  // 1.18.128 — merge Composio toolkits into the picker. discoverMcpServers()
+  // only sees Claude Desktop / Claude Code / Extensions / user-managed
+  // config, but the runtime ALSO injects every connected Composio toolkit
+  // via buildExtraMcpForRunAgent. The picker was blind to all that — users
+  // would scroll and not see Gmail, Slack, Salesforce, etc., even though
+  // those servers fire correctly when the cron runs. This fixes the picker
+  // to match runtime reality.
+  var servers = [];
   try {
     var r = await apiFetch('/api/mcp-servers');
     var d = await r.json();
-    _mcpCatalog = { servers: d.servers || [] };
-  } catch {
-    _mcpCatalog = { servers: [] };
-  }
+    servers = (d.servers || []).map(function(s) {
+      return Object.assign({}, s, { _origin: s.source || 'config' });
+    });
+  } catch (_) { servers = []; }
+  try {
+    var rc = await apiFetch('/api/composio/toolkits');
+    var dc = await rc.json();
+    if (dc && dc.enabled !== false && Array.isArray(dc.toolkits)) {
+      // Only show toolkits with at least one ACTIVE connection — those are
+      // the ones the runtime can actually call. Auth-config-only toolkits
+      // would fail tool calls, so showing them here would mislead.
+      var connected = dc.toolkits.filter(function(t) {
+        return Array.isArray(t.connections) && t.connections.some(function(c) { return c && c.status === 'ACTIVE'; });
+      });
+      var existingNames = new Set(servers.map(function(s) { return s.name; }));
+      for (var i = 0; i < connected.length; i++) {
+        var t = connected[i];
+        if (existingNames.has(t.slug)) continue; // dedup — local config wins
+        servers.push({
+          name: t.slug,
+          type: 'composio',
+          description: t.description || (t.displayName + ' (via Composio)'),
+          enabled: true,
+          source: 'composio',
+          _origin: 'composio',
+          _displayName: t.displayName,
+          _toolCount: t.toolCount,
+          _connectionCount: (t.connections || []).filter(function(c) { return c && c.status === 'ACTIVE'; }).length,
+        });
+      }
+    }
+  } catch (_) { /* Composio not enabled / API down — picker still works */ }
+  _mcpCatalog = { servers: servers };
   return _mcpCatalog;
 }
 
@@ -28488,13 +28538,26 @@ function renderMcpPickerList() {
   listEl.innerHTML = servers.slice(0, 50).map(function(s) {
     var sel = _cronSelectedMcp.indexOf(s.name) !== -1;
     var enabledTag = s.enabled === false ? ' <span style="color:var(--text-muted);font-size:10px">(disabled)</span>' : '';
+    // 1.18.128 — distinct badge for Composio-sourced toolkits so users can
+    // see at a glance which servers come from local config vs the
+    // Composio account, plus a connection count for managed accounts.
+    var sourceBadge = '';
+    if (s._origin === 'composio') {
+      var connTxt = s._connectionCount ? s._connectionCount + ' conn' : 'connected';
+      sourceBadge = ' <span style="background:rgba(124,58,237,0.12);color:var(--purple);font-size:9px;padding:1px 6px;border-radius:4px;font-weight:600;text-transform:uppercase;letter-spacing:0.04em" title="Sourced from Composio account">composio</span>'
+        + ' <span style="color:var(--text-muted);font-size:10px">' + esc(connTxt) + '</span>';
+    } else if (s.source && s.source !== 'auto-detected') {
+      sourceBadge = ' <span style="background:var(--bg-tertiary);color:var(--text-muted);font-size:9px;padding:1px 6px;border-radius:4px;font-weight:600;text-transform:uppercase;letter-spacing:0.04em">' + esc(s.source) + '</span>';
+    }
+    var displayName = s._displayName || s.name;
     return '<div class="cap-picker-row mcp' + (sel ? ' selected' : '') + '" onclick="addMcpToTrick(\\x27' + jsStr(s.name) + '\\x27)">'
       + '<div class="cap-picker-row-body">'
-      + '<div class="cap-picker-row-title">' + esc(s.name) + enabledTag
+      + '<div class="cap-picker-row-title">' + esc(displayName)
+      + (displayName !== s.name ? ' <span style="color:var(--text-muted);font-weight:normal;font-size:10px">' + esc(s.name) + '</span>' : '')
+      + enabledTag + sourceBadge
       + (sel ? ' <span style="color:var(--purple);font-size:11px">✓ allowed</span>' : '')
       + '</div>'
       + (s.description ? '<div class="cap-picker-row-desc">' + esc(s.description) + '</div>' : '')
-      + (s.source ? '<div class="cap-picker-row-meta">source: ' + esc(s.source) + '</div>' : '')
       + '</div></div>';
   }).join('');
 }
@@ -29153,6 +29216,31 @@ async function enablePredictableFromBanner() {
   } catch (err) {
     toast('Toggled to Predictable Mode but save failed: ' + String(err), 'error');
   }
+}
+
+// 1.18.128 — open the cron modal pre-wired to a project. Called from the
+// "+ New task" button on each project card. Pre-fills cron-workdir and
+// suggests a name based on the project so the user only has to fill in
+// the prompt + schedule. The dropdown is populated by refreshProjects()
+// at page load, so the pre-filled value resolves cleanly to one of the
+// existing options.
+function openCronModalForProject(projectIdx) {
+  var p = (typeof projectsData !== 'undefined' && Array.isArray(projectsData)) ? projectsData[projectIdx] : null;
+  if (!p) { toast('Project not found.', 'error'); return; }
+  openCreateCronModal();
+  // Pre-set the project context. dropdown options were populated by
+  // refreshProjects on page load, so the value matches one of them.
+  var sel = document.getElementById('cron-workdir');
+  if (sel) sel.value = p.path;
+  // Suggest a task name based on the project — replaces non-slug chars
+  // and truncates so the slug rule passes. User can override.
+  var slugBase = (p.name || 'project').toLowerCase()
+    .replace(/[^a-z0-9-]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 40);
+  var nameInput = document.getElementById('cron-name');
+  if (nameInput && !nameInput.value) nameInput.value = slugBase + '-task';
+  toast('Project Context set to "' + (p.name || p.path) + '" — fill in the prompt and schedule.', 'info');
 }
 
 function openCreateCronModal(agentSlug) {
