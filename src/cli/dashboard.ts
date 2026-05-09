@@ -18824,7 +18824,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
         <button class="active" data-icon="layoutDashboard" onclick="switchTab('intelligence','overview')"><span class="icon-slot"></span> Overview</button>
         <button data-icon="database" onclick="switchTab('intelligence','search')"><span class="icon-slot"></span> Chunks</button>
         <button data-icon="upload" onclick="switchTab('intelligence','seed')"><span class="icon-slot"></span> Seed</button>
-        <button data-icon="repeat" onclick="switchTab('intelligence','sources')"><span class="icon-slot"></span> Automate</button>
+        <button data-icon="repeat" onclick="switchTab('intelligence','sources')"><span class="icon-slot"></span> Feeds</button>
         <button data-icon="listChecks" onclick="switchTab('intelligence','runs')"><span class="icon-slot"></span> Runs</button>
         <button data-icon="sparkles" onclick="switchTab('intelligence','graph')"><span class="icon-slot"></span> Knowledge</button>
         <button data-icon="fileText" onclick="switchTab('intelligence','files')"><span class="icon-slot"></span> Memory</button>
@@ -18844,7 +18844,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
                 </div>
                 <div style="display:flex;gap:8px;flex-wrap:wrap">
                   <button class="btn-primary btn-sm" onclick="switchTab('intelligence','seed')"><span class="icon-slot" data-icon="upload"></span> Seed local data</button>
-                  <button class="btn-sm" onclick="switchTab('intelligence','sources')"><span class="icon-slot" data-icon="repeat"></span> Add scheduled feed</button>
+                  <button class="btn-sm" onclick="switchTab('intelligence','sources')"><span class="icon-slot" data-icon="repeat"></span> Add a feed</button>
                   <button class="btn-sm" onclick="switchTab('intelligence','health')"><span class="icon-slot" data-icon="activity"></span> Verify health</button>
                 </div>
               </div>
@@ -19105,8 +19105,17 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
           </div>
         </div>
 
-        <!-- Sources -->
+        <!-- Feeds (formerly "Sources" tab — renamed 1.18.141 to match user mental model) -->
         <div class="tab-pane" id="tab-intelligence-sources">
+
+          <!-- Section header — explains what Feeds are vs. one-shot Seed uploads -->
+          <div style="margin-bottom:14px">
+            <div style="font-size:18px;font-weight:600;margin-bottom:4px">Feeds</div>
+            <div style="color:var(--muted);font-size:13px;line-height:1.5">
+              Auto-watched external sources Clementine polls on a schedule — Google Drive folders, connected apps via Composio, Claude Desktop connectors, REST endpoints. Each feed fetches records, dedupes against existing memory, and writes distilled notes to the brain.<br>
+              <span style="opacity:0.85">For one-shot uploads (drop a file, choose a folder), use the <a href="#" onclick="switchTab('intelligence','seed');return false" style="text-decoration:underline">Seed</a> tab instead.</span>
+            </div>
+          </div>
 
           <!-- ═══ Auto-seed feeds (connected tools → cron → brain) ═══ -->
           <div class="card" style="padding:16px;margin-bottom:16px">
@@ -19134,11 +19143,17 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
             </div>
           </div>
 
-          <div style="display:flex;gap:8px;margin-bottom:16px;flex-wrap:wrap">
-            <button class="btn-primary" onclick="brainShowPollForm()">+ Scheduled REST poll</button>
-            <button class="btn-primary" onclick="brainShowWebhookForm()">+ Inbound webhook</button>
-            <button class="btn" onclick="brainShowCredsForm()">🔑 Credentials</button>
-          </div>
+          <!-- Legacy direct-integration paths (REST polls + webhooks). De-emphasized 1.18.141 -->
+          <!-- so the modern "Add feed" flow above stays the primary surface. The forms below -->
+          <!-- are still wired (write to /api/brain/sources) for users who need raw HTTP plumbing. -->
+          <details style="margin-bottom:16px">
+            <summary style="color:var(--muted);font-size:13px;cursor:pointer;padding:8px 0">Advanced — manual integrations (REST polls, webhooks, credentials)</summary>
+            <div style="display:flex;gap:8px;margin-top:8px;margin-bottom:8px;flex-wrap:wrap">
+              <button class="btn-primary" onclick="brainShowPollForm()">+ Scheduled REST poll</button>
+              <button class="btn-primary" onclick="brainShowWebhookForm()">+ Inbound webhook</button>
+              <button class="btn" onclick="brainShowCredsForm()">🔑 Credentials</button>
+            </div>
+          </details>
 
           <!-- Webhook form -->
           <div id="brain-webhook-form" class="card" style="display:none;padding:16px;margin-bottom:16px">
