@@ -345,9 +345,24 @@ export async function buildSkillContext(
     const skillQuery = jobName + ' ' + jobPrompt.slice(0, 200);
     const suppressedNamesRaw = (memoryStore as { getSkillsToSuppress?: (slug?: string) => string[] | Set<string> | undefined } | null | undefined)
       ?.getSkillsToSuppress?.(agentSlug);
-    const suppressedNames = Array.isArray(suppressedNamesRaw)
+    const autoSuppressed = Array.isArray(suppressedNamesRaw)
       ? new Set(suppressedNamesRaw)
       : (suppressedNamesRaw ?? undefined);
+    // 1.18.127 — merge automatic feedback-driven suppressions (from the
+    // memory store) with manual user toggles (from skill-suppressions.json).
+    // Both sets pass through to loadSkillByName + searchSkills under the
+    // same `suppressedNames` parameter — the runtime doesn't care which
+    // source flagged a skill.
+    let suppressedNames: Set<string> | undefined = autoSuppressed;
+    try {
+      const { getManualSuppressions } = await import('./skill-suppressions.js');
+      const manual = getManualSuppressions(agentSlug);
+      if (manual.size > 0) {
+        suppressedNames = new Set([...(autoSuppressed ?? []), ...manual]);
+      }
+    } catch (err) {
+      logger.debug({ err }, 'manual suppression read failed (non-fatal)');
+    }
 
     type PreparedSkill = {
       name: string; title: string; content: string;

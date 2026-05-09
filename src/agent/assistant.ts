@@ -3274,6 +3274,21 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
                 } catch {
                   // Non-fatal — extraction logging should never block memory writes
                 }
+                // 1.18.127 — surface a "📝 Noted: <fact>" toast in the
+                // dashboard chat. Fire-and-forget through the memory-events
+                // bus; if no listener (no dashboard active), nothing happens.
+                try {
+                  const { emitMemoryExtraction, summarizeExtractionInput } = await import('./memory-events.js');
+                  emitMemoryExtraction({
+                    sessionKey: sessionKey ?? 'unknown',
+                    toolName: toolBaseName,
+                    summary: summarizeExtractionInput((block.input ?? {}) as Record<string, unknown>),
+                    agentSlug: profile?.slug ?? null,
+                    at: new Date().toISOString(),
+                  });
+                } catch {
+                  // Non-fatal — visibility never blocks the write
+                }
               }
             }
           }

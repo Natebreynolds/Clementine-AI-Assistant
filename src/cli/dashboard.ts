@@ -35,6 +35,7 @@ import { discoverMcpServers, getClaudeIntegrations } from '../agent/mcp-bridge.j
 import { buildBuilderEnrichedMessage, builderSessionKey } from '../dashboard/builder/prompt.js';
 import {
   AGENTS_DIR,
+  MEMORY_FILE,
   SESSIONS_FILE,
   applyOneMillionContextRecovery,
   looksLikeClaudeOneMillionContextError,
@@ -3465,6 +3466,70 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
     res.json(await getMemory());
   });
 
+  // ── MEMORY.md inline editor (1.18.127) ────────────────────────────
+  // GET / PUT for the long-term memory file. Per-agent variant via
+  // ?agent=<slug>. mtimeMs round-tripped so the dashboard can detect
+  // an out-of-band edit (Obsidian, agent extraction) and refuse to
+  // clobber it on save.
+  function resolveMemoryPath(agentParam: string | undefined): string {
+    if (!agentParam || agentParam === 'global') return MEMORY_FILE;
+    // Agent slug — must match an existing agent directory. Refuse traversal.
+    if (!/^[a-z0-9][a-z0-9-]{0,63}$/.test(agentParam)) {
+      throw new Error('invalid agent slug');
+    }
+    return path.join(AGENTS_DIR, agentParam, 'MEMORY.md');
+  }
+
+  app.get('/api/memory/md', (req, res) => {
+    try {
+      const agentParam = typeof req.query.agent === 'string' ? req.query.agent : undefined;
+      const filePath = resolveMemoryPath(agentParam);
+      if (!existsSync(filePath)) {
+        return res.json({ content: '', mtimeMs: 0, agentSlug: agentParam ?? 'global', exists: false, filePath });
+      }
+      const content = readFileSync(filePath, 'utf-8');
+      const mtimeMs = statSync(filePath).mtimeMs;
+      res.json({ content, mtimeMs, agentSlug: agentParam ?? 'global', exists: true, filePath });
+    } catch (err) {
+      res.status(400).json({ error: String(err instanceof Error ? err.message : err) });
+    }
+  });
+
+  app.put('/api/memory/md', (req, res) => {
+    try {
+      const agentParam = typeof req.query.agent === 'string' ? req.query.agent : undefined;
+      const filePath = resolveMemoryPath(agentParam);
+      const body = (req.body ?? {}) as { content?: string; expectedMtimeMs?: number };
+      if (typeof body.content !== 'string') {
+        return res.status(400).json({ error: 'content (string) required' });
+      }
+      // Conflict detection: if the file already exists and its mtime has
+      // moved past what the client last saw, refuse the write so we don't
+      // clobber an Obsidian save or an agent extraction. Client surfaces a
+      // "reload?" toast on 409.
+      if (existsSync(filePath) && typeof body.expectedMtimeMs === 'number' && body.expectedMtimeMs > 0) {
+        const currentMtime = statSync(filePath).mtimeMs;
+        // 2-second tolerance covers same-second saves under filesystem mtime resolution.
+        if (currentMtime - body.expectedMtimeMs > 2000) {
+          return res.status(409).json({
+            error: 'File changed on disk since you loaded it. Reload to see the latest version.',
+            currentMtimeMs: currentMtime,
+          });
+        }
+      }
+      // Ensure parent dir exists (per-agent MEMORY.md is created lazily).
+      const parentDir = path.dirname(filePath);
+      if (!existsSync(parentDir)) {
+        mkdirSync(parentDir, { recursive: true });
+      }
+      writeFileSync(filePath, body.content);
+      const mtimeMs = statSync(filePath).mtimeMs;
+      res.json({ ok: true, mtimeMs, bytes: Buffer.byteLength(body.content, 'utf-8') });
+    } catch (err) {
+      res.status(500).json({ error: String(err instanceof Error ? err.message : err) });
+    }
+  });
+
   app.get('/api/logs', (req, res) => {
     const lines = parseInt(String(req.query.lines ?? '200'), 10);
     res.json({ content: getLogs(lines) });
@@ -3642,6 +3707,21 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
 
   // Let the lazy-gateway dispatcher publish deep_result events through SSE.
   dashboardSseBroadcast = broadcastEvent;
+
+  // 1.18.127 — bridge memory-extraction events from assistant.ts → SSE.
+  // The dashboard chat panel listens on the same SSE stream and renders
+  // a "📝 Noted: <fact>" toast whenever the background extractor writes
+  // something. Silent until then — no traffic when no extraction fires.
+  (async () => {
+    try {
+      const { setMemoryExtractionListener } = await import('../agent/memory-events.js');
+      setMemoryExtractionListener((event) => {
+        broadcastEvent({ type: 'memory_extracted', data: event });
+      });
+    } catch (err) {
+      console.warn('Failed to wire memory-extraction SSE bridge:', err);
+    }
+  })();
 
   // ── Builder event bridge ──────────────────────────────────────
   // Forward events from src/dashboard/builder/events.ts through SSE so the
@@ -4341,6 +4421,38 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
       const skill = getSkill(name, { jobs });
       if (!skill) { res.status(404).json({ ok: false, error: `skill "${name}" not found` }); return; }
       res.json({ ok: true, skill });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: String(err) });
+    }
+  });
+
+  // ── Skill suppressions (1.18.127) ──────────────────────────────────
+  // Lets the user manually suppress skills from auto-match retrieval —
+  // a complement to the memory store's automatic feedback-driven
+  // suppression. Storage is a single JSON file under ~/.clementine/.
+  app.get('/api/skills/suppressions', async (_req, res) => {
+    try {
+      const { listAllSuppressions } = await import('../agent/skill-suppressions.js');
+      res.json({ ok: true, suppressions: listAllSuppressions() });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: String(err) });
+    }
+  });
+
+  app.put('/api/skills/suppressions/:name', async (req, res) => {
+    try {
+      const name = req.params.name;
+      if (!name) { res.status(400).json({ ok: false, error: 'name required' }); return; }
+      const body = (req.body ?? {}) as { suppressed?: boolean; scope?: string };
+      const suppressed = body.suppressed === true;
+      const scope = typeof body.scope === 'string' && body.scope.length > 0 ? body.scope : 'global';
+      // Slug-shape validation when scope is per-agent (anything other than "global").
+      if (scope !== 'global' && !/^[a-z0-9][a-z0-9-]{0,63}$/.test(scope)) {
+        return res.status(400).json({ ok: false, error: 'invalid scope (must be "global" or a valid agent slug)' });
+      }
+      const { setSuppression } = await import('../agent/skill-suppressions.js');
+      const result = setSuppression(name, scope, suppressed);
+      res.json({ ok: true, ...result });
     } catch (err) {
       res.status(500).json({ ok: false, error: String(err) });
     }
@@ -7365,6 +7477,13 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
         mcpServers: mcpInfo,
         composioConnected: plan.composioConnected,
         externalConnected: plan.externalConnected,
+        // 1.18.127 — surface the scope-widening from 1.18.125 so the UI can
+        // show "this skill brought in `Bash` + `gmail`" with attribution.
+        // `widenedFromSkills.tools` and `.mcpServers` only contain entries
+        // that were ADDED on top of the cron's own allowlists. Empty arrays
+        // when the cron is unrestricted (skill scope was implicitly allowed)
+        // or when no pinned skill widened anything.
+        widenedFromSkills: plan.widenedFromSkills,
         tier: plan.tier,
         effort: plan.effort,
         maxBudgetUsd: plan.maxBudgetUsd ?? null,
@@ -18403,6 +18522,31 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
               </div>
               <div class="card-body" id="panel-memory"><div class="skel-block"><div class="skel-row med"></div><div class="skel-row"></div><div class="skel-row short"></div></div></div>
             </div>
+            <!-- 1.18.127 — MEMORY.md inline editor. Lets the user seed
+                 long-term memory directly without leaving the dashboard.
+                 Per-agent toggle (global / Sasha / Ross / …) reads + writes
+                 the right MEMORY.md file. mtime conflict-detection blocks
+                 clobbering an Obsidian save mid-edit. -->
+            <div class="card" style="margin-bottom:14px">
+              <div class="card-header" style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap">
+                <span>Edit MEMORY.md</span>
+                <div style="display:flex;align-items:center;gap:8px">
+                  <select id="memory-md-scope" onchange="loadMemoryMdEditor()" style="font-size:12px;padding:4px 6px;border:1px solid var(--border);border-radius:4px;background:var(--bg-input);color:var(--text-primary)">
+                    <option value="global">Global (Clementine)</option>
+                  </select>
+                  <button class="btn-sm" onclick="loadMemoryMdEditor()" title="Reload from disk" style="font-size:11px;padding:4px 10px">Reload</button>
+                  <button id="memory-md-save-btn" class="btn-sm btn-primary" onclick="saveMemoryMd()" style="font-size:11px;padding:4px 10px" disabled>Save</button>
+                </div>
+              </div>
+              <div class="card-body" style="padding:14px">
+                <div id="memory-md-status" style="font-size:11px;color:var(--text-muted);margin-bottom:8px">Loading…</div>
+                <textarea id="memory-md-editor" placeholder="Loading…" style="width:100%;min-height:280px;padding:10px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;line-height:1.5;border:1px solid var(--border);border-radius:6px;background:var(--bg-input);color:var(--text-primary);resize:vertical" oninput="onMemoryMdInput()"></textarea>
+                <div style="display:flex;align-items:center;justify-content:space-between;margin-top:8px;font-size:11px;color:var(--text-muted)">
+                  <span id="memory-md-counter">0 chars</span>
+                  <span id="memory-md-path" style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace"></span>
+                </div>
+              </div>
+            </div>
             <div class="card" style="margin-bottom:14px">
               <div class="card-header" style="display:flex;align-items:center;justify-content:space-between">
                 <span>Recent writes</span>
@@ -20614,6 +20758,21 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
             <button class="btn-sm btn-primary" style="white-space:nowrap;padding:6px 12px;border-radius:6px;cursor:pointer" onclick="restartDaemonFromDashboard()">Restart Clementine</button>
           </div>
           <div id="budget-health-content" style="margin-bottom:16px"><div class="empty-state">Loading budget health...</div></div>
+          <!-- 1.18.127 — Notification preferences. Single toggle for now;
+               room to grow into a full notification settings card. -->
+          <div class="card" style="margin-bottom:16px">
+            <div class="card-header">Notifications</div>
+            <div class="card-body" style="padding:14px 16px;display:flex;align-items:center;justify-content:space-between;gap:14px;flex-wrap:wrap">
+              <div>
+                <div style="font-size:13px;color:var(--text-primary);font-weight:500">Silent learning mode</div>
+                <div style="font-size:11px;color:var(--text-muted);margin-top:4px">When off, I show a small toast every time I save a fact / note / task to memory after a chat.</div>
+              </div>
+              <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
+                <input type="checkbox" id="silent-learning-toggle" onchange="toggleSilentLearning(this.checked)">
+                <span style="font-size:12px;color:var(--text-secondary)">Silence</span>
+              </label>
+            </div>
+          </div>
           <div id="settings-content"><div class="empty-state">Loading settings...</div></div>
         </div>
         <div class="tab-pane" id="tab-settings-remote">
@@ -22571,6 +22730,7 @@ function switchTab(group, tab) {
     if (tab === 'search') {
       // Consolidated Memory tab: search results + stats + MEMORY.md + recent writes + supersedes + coverage strip.
       refreshMemory();
+      if (typeof loadMemoryMdEditor === 'function') loadMemoryMdEditor();
       if (typeof refreshRecentWrites === 'function') refreshRecentWrites();
       if (typeof refreshRecentEpisodes === 'function') refreshRecentEpisodes();
       if (typeof refreshCommitments === 'function') refreshCommitments();
@@ -22599,6 +22759,7 @@ function switchTab(group, tab) {
   }
   if (group === 'settings') {
     if (tab === 'general' && typeof refreshSettings === 'function') refreshSettings();
+    if (tab === 'general' && typeof initSilentLearningToggle === 'function') initSilentLearningToggle();
     if (tab === 'integrations') { refreshSalesforce(); refreshComposioConnections(); refreshToolPreferences(); refreshMcpServers(); refreshClaudeIntegrations(); }
     if (tab === 'remote') refreshRemoteAccess();
     if (tab === 'security') refreshAuthSessions();
@@ -23634,6 +23795,28 @@ function clearRestartRequired() {
 function dismissRestartRequiredBanner() {
   var existing = document.getElementById('restart-required-banner');
   if (existing) existing.remove();
+}
+
+// 1.18.127 — silent learning mode toggle. Persisted to localStorage so
+// the preference survives page reloads. The dashboard SSE handler at
+// line ~39660 reads this flag to decide whether to render extraction
+// toasts when the background memory extractor writes facts.
+function toggleSilentLearning(silent) {
+  try {
+    if (silent) localStorage.setItem('clem-silent-learning', '1');
+    else localStorage.removeItem('clem-silent-learning');
+    toast(silent ? 'Silent learning ON — extraction toasts hidden.' : 'Silent learning OFF — you\\'ll see a toast when I save facts.', 'info');
+  } catch (_) { /* localStorage may be disabled */ }
+}
+
+// Restore the toggle state on page load so the checkbox reflects the
+// user's last preference. Defaults to OFF (visible toasts) for new users.
+function initSilentLearningToggle() {
+  try {
+    var box = document.getElementById('silent-learning-toggle');
+    if (!box) return;
+    box.checked = localStorage.getItem('clem-silent-learning') === '1';
+  } catch (_) { /* non-fatal */ }
 }
 
 async function restartDaemonFromDashboard(skipConfirm) {
@@ -27026,12 +27209,18 @@ async function _openSkillModal(opts) {
       +     '<input id="skill-modal-name" type="text" placeholder="e.g. morning-briefing" style="width:100%;padding:8px 10px;font-size:13px;border:1px solid var(--border);border-radius:6px;background:var(--bg-secondary);color:var(--text-primary);margin-bottom:12px;font-family:\\x27JetBrains Mono\\x27,monospace">'
       +     '<label style="display:block;font-size:12px;color:var(--text-secondary);margin-bottom:4px;font-weight:500">Display title <span style="color:var(--text-muted)">(optional, friendlier name)</span></label>'
       +     '<input id="skill-modal-title" type="text" placeholder="e.g. Morning Briefing" style="width:100%;padding:8px 10px;font-size:13px;border:1px solid var(--border);border-radius:6px;background:var(--bg-secondary);color:var(--text-primary);margin-bottom:12px">'
-      +     '<label style="display:block;font-size:12px;color:var(--text-secondary);margin-bottom:4px;font-weight:500">Description <span style="color:var(--text-muted)">(what this skill does — used by Claude to know when to apply it)</span></label>'
-      +     '<textarea id="skill-modal-desc" rows="2" placeholder="One paragraph: what does this skill do, when should Claude run it?" style="width:100%;padding:8px 10px;font-size:13px;border:1px solid var(--border);border-radius:6px;background:var(--bg-secondary);color:var(--text-primary);margin-bottom:12px;font-family:inherit;resize:vertical"></textarea>'
+      +     '<div style="display:flex;align-items:baseline;justify-content:space-between;margin-bottom:4px">'
+      +       '<label style="font-size:12px;color:var(--text-secondary);font-weight:500">Description <span style="color:var(--text-muted)">(what this skill does — used by Claude to know when to apply it)</span></label>'
+      +       '<span id="skill-modal-desc-counter" style="font-size:10px;color:var(--text-muted);font-variant-numeric:tabular-nums">0 / 1024 chars</span>'
+      +     '</div>'
+      +     '<textarea id="skill-modal-desc" rows="2" oninput="updateSkillModalCounters()" placeholder="One paragraph: what does this skill do, when should Claude run it?" style="width:100%;padding:8px 10px;font-size:13px;border:1px solid var(--border);border-radius:6px;background:var(--bg-secondary);color:var(--text-primary);margin-bottom:12px;font-family:inherit;resize:vertical"></textarea>'
       +     '<label style="display:block;font-size:12px;color:var(--text-secondary);margin-bottom:4px;font-weight:500">Allowed tools <span style="color:var(--text-muted)">(comma-separated, leave blank for default)</span></label>'
       +     '<input id="skill-modal-tools" type="text" placeholder="e.g. Read, Bash, mcp__supabase__list_tables" style="width:100%;padding:8px 10px;font-size:13px;border:1px solid var(--border);border-radius:6px;background:var(--bg-secondary);color:var(--text-primary);margin-bottom:12px">'
-      +     '<label style="display:block;font-size:12px;color:var(--text-secondary);margin-bottom:4px;font-weight:500">Procedure <span style="color:var(--text-muted)">(Markdown — the actual steps Claude follows)</span></label>'
-      +     '<textarea id="skill-modal-body" rows="14" placeholder="# Morning Briefing\\n\\nSteps Claude follows when this skill is invoked.\\n\\n1. Check the inbox.\\n2. Summarize.\\n3. Send to Discord." style="width:100%;padding:10px 12px;font-size:12px;border:1px solid var(--border);border-radius:6px;background:var(--bg-secondary);color:var(--text-primary);font-family:\\x27JetBrains Mono\\x27,monospace;line-height:1.55;resize:vertical"></textarea>'
+      +     '<div style="display:flex;align-items:baseline;justify-content:space-between;margin-bottom:4px">'
+      +       '<label style="font-size:12px;color:var(--text-secondary);font-weight:500">Procedure <span style="color:var(--text-muted)">(Markdown — the actual steps Claude follows)</span></label>'
+      +       '<span id="skill-modal-body-counter" style="font-size:10px;color:var(--text-muted);font-variant-numeric:tabular-nums">0 lines</span>'
+      +     '</div>'
+      +     '<textarea id="skill-modal-body" rows="14" oninput="updateSkillModalCounters()" placeholder="# Morning Briefing\\n\\nSteps Claude follows when this skill is invoked.\\n\\n1. Check the inbox.\\n2. Summarize.\\n3. Send to Discord." style="width:100%;padding:10px 12px;font-size:12px;border:1px solid var(--border);border-radius:6px;background:var(--bg-secondary);color:var(--text-primary);font-family:\\x27JetBrains Mono\\x27,monospace;line-height:1.55;resize:vertical"></textarea>'
       +     '<div id="skill-modal-error" style="display:none;color:var(--red);font-size:12px;margin-top:10px;padding:8px 10px;background:rgba(239,68,68,0.08);border:1px solid var(--red);border-radius:6px"></div>'
       +   '</div>'
       +   '<div style="display:flex;justify-content:flex-end;gap:8px;padding:14px 20px;border-top:1px solid var(--border);background:var(--bg-secondary)">'
@@ -27054,6 +27243,31 @@ async function _openSkillModal(opts) {
   if (errEl) { errEl.style.display = 'none'; errEl.textContent = ''; }
   modal.style.display = 'flex';
   document.getElementById('skill-modal-name').focus();
+  if (typeof updateSkillModalCounters === 'function') updateSkillModalCounters();
+}
+
+// 1.18.127 — live char/line counters under description + body. Color
+// shifts at 80% (amber) and 100% (red) of the Anthropic-spec ceilings
+// so the user knows before submission rather than after.
+function updateSkillModalCounters() {
+  var descEl = document.getElementById('skill-modal-desc');
+  var descCounter = document.getElementById('skill-modal-desc-counter');
+  var bodyEl = document.getElementById('skill-modal-body');
+  var bodyCounter = document.getElementById('skill-modal-body-counter');
+  if (descEl && descCounter) {
+    var n = (descEl.value || '').length;
+    var pct = n / 1024;
+    var color = pct >= 1 ? 'var(--red)' : pct >= 0.8 ? 'var(--yellow)' : 'var(--text-muted)';
+    descCounter.textContent = n + ' / 1024 chars';
+    descCounter.style.color = color;
+  }
+  if (bodyEl && bodyCounter) {
+    var lines = (bodyEl.value || '').split('\\n').length;
+    var bpct = lines / 500;
+    var bcolor = bpct >= 1 ? 'var(--red)' : bpct >= 0.8 ? 'var(--yellow)' : 'var(--text-muted)';
+    bodyCounter.textContent = lines + ' / 500 lines (recommended)';
+    bodyCounter.style.color = bcolor;
+  }
 }
 
 function closeSkillModal() {
@@ -27373,8 +27587,51 @@ async function showSkillDetail(name) {
       return;
     }
     detailEl.innerHTML = renderSkillDetail(d.skill);
+    if (typeof loadSkillSuppressionState === 'function') loadSkillSuppressionState(name);
   } catch (e) {
     detailEl.innerHTML = '<div style="padding:24px;color:var(--red);font-size:12px">Error: ' + esc(String(e)) + '</div>';
+  }
+}
+
+// 1.18.127 — fetch the current suppression state and wire the checkbox.
+// Cached per call; the file is small enough that re-fetching on every
+// detail open is fine (and ensures consistency if the user just toggled
+// from another browser tab).
+async function loadSkillSuppressionState(skillName) {
+  var checkbox = document.getElementById('skill-suppress-global');
+  var status = document.getElementById('skill-suppress-status');
+  if (!checkbox) return;
+  try {
+    var r = await apiFetch('/api/skills/suppressions');
+    var d = await r.json();
+    if (!r.ok || !d || !d.suppressions) return;
+    var globalList = Array.isArray(d.suppressions.global) ? d.suppressions.global : [];
+    checkbox.checked = globalList.indexOf(skillName) !== -1;
+    if (status) {
+      status.textContent = checkbox.checked ? 'Suppressed globally — runtime auto-match will skip this skill.' : '';
+    }
+  } catch (_) { /* non-fatal */ }
+}
+
+async function toggleSkillSuppression(skillName, scope, suppressed) {
+  var status = document.getElementById('skill-suppress-status');
+  try {
+    var r = await apiFetch('/api/skills/suppressions/' + encodeURIComponent(skillName), {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ suppressed: !!suppressed, scope: scope }),
+    });
+    var d = await r.json();
+    if (!r.ok) {
+      toast(d.error || 'Failed to update suppression', 'error');
+      return;
+    }
+    if (status) {
+      status.textContent = suppressed ? 'Suppressed globally — runtime auto-match will skip this skill.' : '';
+    }
+    toast(suppressed ? 'Suppressed "' + skillName + '"' : 'Un-suppressed "' + skillName + '"', 'success');
+  } catch (err) {
+    toast('Failed: ' + err, 'error');
   }
 }
 
@@ -27419,6 +27676,17 @@ function renderSkillDetail(s) {
     html += '<p style="font-size:12px;color:var(--text-muted);font-style:italic;margin:0">No description. Anthropic spec recommends adding one so the skill can be discovered by Claude.</p>';
   }
   html += '<div style="margin-top:10px;font-size:11px;color:var(--text-muted);font-family:\\x27JetBrains Mono\\x27,monospace">' + esc(s.filePath) + '</div>';
+  // 1.18.127 — suppression toggle. Lets the user manually hide a skill
+  // from auto-match retrieval without deleting it. Per-scope (global vs
+  // per-agent). Lazy-loaded; rendered as a placeholder, populated by
+  // loadSkillSuppressionState() right after the detail pane mounts.
+  html += '<div id="skill-suppress-row" data-skill="' + esc(fm.name) + '" style="margin-top:14px;padding:10px 12px;background:var(--bg-secondary);border:1px solid var(--border);border-radius:6px;display:flex;align-items:center;gap:10px;flex-wrap:wrap">';
+  html += '<span style="font-size:12px;color:var(--text-secondary);font-weight:500">Suppress from auto-match:</span>';
+  html += '<label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--text-secondary);cursor:pointer">';
+  html += '<input type="checkbox" id="skill-suppress-global" onchange="toggleSkillSuppression(\\x27' + jsStr(fm.name) + '\\x27, \\x27global\\x27, this.checked)"> globally';
+  html += '</label>';
+  html += '<span id="skill-suppress-status" style="font-size:11px;color:var(--text-muted);margin-left:auto"></span>';
+  html += '</div>';
   html += '</div>';
 
   // ── 2. Validation warnings (if any)
@@ -28124,14 +28392,50 @@ function renderSkillsPickerList() {
   listEl.innerHTML = createRow + skills.slice(0, 50).map(function(s) {
     var sel = _cronSelectedSkills.indexOf(s.name) !== -1;
     var triggers = (s.triggers || []).slice(0, 4).join(', ');
+    // 1.18.127 — pull preview metadata from the rich Skill record so the
+    // picker shows what the user is about to pin: body line count, tool
+    // count, useCount, lastUsed, and a stub warning if the body is < 5
+    // lines (placeholder skill that shouldn't go to a critical task).
+    var fm = s.frontmatter || {};
+    var ext = (fm.clementine || {});
+    var toolsAllow = (ext.tools && Array.isArray(ext.tools.allow)) ? ext.tools.allow : [];
+    var bodyText = String(s.body || '');
+    var bodyLines = bodyText ? bodyText.split('\\n').length : 0;
+    var useCount = typeof ext.useCount === 'number' ? ext.useCount : 0;
+    var lastUsedStr = ext.lastUsed || '';
+    var lastUsedAgo = '';
+    var ageDays = 999;
+    if (lastUsedStr) {
+      var lu = Date.parse(lastUsedStr);
+      if (!isNaN(lu)) {
+        ageDays = Math.floor((Date.now() - lu) / 86400000);
+        lastUsedAgo = ageDays === 0 ? 'today' : ageDays === 1 ? 'yesterday' : ageDays + 'd ago';
+      }
+    }
+    // Health pill: green (>=5 uses, fresh), yellow (untested), red (stale).
+    var health, healthColor, healthLabel;
+    if (useCount === 0) { health = 'untested'; healthColor = 'var(--yellow)'; healthLabel = 'never run'; }
+    else if (useCount < 5) { health = 'untested'; healthColor = 'var(--yellow)'; healthLabel = useCount + 'x · light usage'; }
+    else if (ageDays > 90) { health = 'stale'; healthColor = 'var(--red)'; healthLabel = useCount + 'x · stale (' + lastUsedAgo + ')'; }
+    else { health = 'healthy'; healthColor = 'var(--green)'; healthLabel = useCount + 'x' + (lastUsedAgo ? ' · ' + lastUsedAgo : ''); }
+    var stubWarn = bodyLines > 0 && bodyLines < 5
+      ? '<span style="color:var(--red);font-size:10px;margin-left:6px" title="Body is < 5 lines — likely a placeholder">⚠ stub</span>'
+      : '';
+    var metaPills = '<div class="cap-picker-row-meta" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:4px">'
+      + '<span style="color:var(--text-muted);font-size:11px">' + bodyLines + ' line' + (bodyLines === 1 ? '' : 's') + '</span>'
+      + (toolsAllow.length > 0 ? '<span style="color:var(--text-muted);font-size:11px" title="Tools the skill declares it needs">' + toolsAllow.length + ' tool' + (toolsAllow.length === 1 ? '' : 's') + '</span>' : '')
+      + '<span style="color:' + healthColor + ';font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:0.04em" title="Skill health based on useCount + lastUsed">● ' + healthLabel + '</span>'
+      + '</div>';
     return '<div class="cap-picker-row' + (sel ? ' selected' : '') + '" onclick="addSkillToTrick(\\x27' + jsStr(s.name) + '\\x27)">'
       + '<div class="cap-picker-row-body">'
       + '<div class="cap-picker-row-title">' + esc(s.title || s.name) + ' '
       + '<span style="color:var(--text-muted);font-weight:normal;font-size:10px">' + esc(s.name) + '</span>'
       + (sel ? ' <span style="color:var(--accent);font-size:11px">✓ pinned</span>' : '')
+      + stubWarn
       + '</div>'
       + (s.description ? '<div class="cap-picker-row-desc">' + esc(s.description) + '</div>' : '')
-      + (triggers ? '<div class="cap-picker-row-meta">triggers: ' + esc(triggers) + (s.triggers && s.triggers.length > 4 ? ' …' : '') + '</div>' : '')
+      + metaPills
+      + (triggers ? '<div class="cap-picker-row-meta" style="margin-top:2px">triggers: ' + esc(triggers) + (s.triggers && s.triggers.length > 4 ? ' …' : '') + '</div>' : '')
       + '</div></div>';
   }).join('');
 }
@@ -29132,11 +29436,45 @@ function renderCronPreview(d) {
   if (!d.effectiveAllowedTools) {
     html += '<div style="color:var(--text-muted);font-size:12px;font-style:italic">Inheriting from agent profile / SDK default — no per-trick tool restriction.</div>';
   } else {
-    html += '<div style="font-family:monospace;font-size:11px;color:var(--text-secondary);line-height:1.6">';
-    html += d.effectiveAllowedTools.map(esc).join(', ');
+    // 1.18.127 — attribute each tool to the cron's own allowlist vs a
+    // pinned-skill widening. The widenedFromSkills.tools list contains
+    // entries that were ADDED by a skill on top of the cron's base list.
+    var widenedTools = (d.widenedFromSkills && Array.isArray(d.widenedFromSkills.tools))
+      ? new Set(d.widenedFromSkills.tools) : new Set();
+    html += '<div style="font-family:monospace;font-size:11px;line-height:1.7">';
+    html += d.effectiveAllowedTools.map(function(t) {
+      if (widenedTools.has(t)) {
+        return '<span style="color:var(--purple)" title="Added by a pinned skill">' + esc(t) + ' <span style="font-style:italic;font-size:10px">(from skill)</span></span>';
+      }
+      return '<span style="color:var(--text-secondary)">' + esc(t) + '</span>';
+    }).join(', ');
     html += '</div>';
+    if (widenedTools.size > 0) {
+      html += '<div style="margin-top:8px;padding:8px 10px;border-radius:6px;background:var(--bg-tertiary);font-size:11px;color:var(--text-muted);line-height:1.5">'
+        + '<strong>Pinned-skill widening (1.18.125):</strong> a pinned skill\\'s <code>clementine.tools.allow</code> declaration added '
+        + widenedTools.size + ' tool' + (widenedTools.size === 1 ? '' : 's') + ' on top of this task\\'s base allowlist.'
+        + '</div>';
+    }
   }
   html += '</div>';
+
+  // Widened MCP servers from pinned-skill bodies (1.18.127)
+  // Skills that reference mcp__server__tool tokens in their body implicitly
+  // need that server live; surface those widenings here so the user sees
+  // exactly which MCP servers got pulled in by the skills.
+  if (d.widenedFromSkills && Array.isArray(d.widenedFromSkills.mcpServers) && d.widenedFromSkills.mcpServers.length > 0) {
+    html += '<div class="preview-section">';
+    html += '<h4>MCP servers widened by skill bodies</h4>';
+    html += '<div style="font-size:12px;color:var(--text-secondary);line-height:1.6;margin-bottom:6px">';
+    html += 'These MCP servers got attached because a pinned skill\\'s body references <code>mcp__server__tool</code> tokens.';
+    html += '</div>';
+    html += '<div>';
+    for (var wj = 0; wj < d.widenedFromSkills.mcpServers.length; wj++) {
+      html += '<span class="preview-chip pinned" style="color:var(--purple)" title="Pulled in by skill body MCP reference">' + esc(d.widenedFromSkills.mcpServers[wj]) + '</span>';
+    }
+    html += '</div>';
+    html += '</div>';
+  }
 
   // Built prompt (what the agent literally receives)
   html += '<div class="preview-section">';
@@ -34318,6 +34656,119 @@ function openStartUnleashedTask() {
   toast('Open a scheduled task, set Mode to Unleashed, then run it.', 'info');
 }
 
+// ── MEMORY.md inline editor (1.18.127) ──────────────────────────────
+// Three globals and four handlers. Globals are intentionally on window
+// (not module-scoped) so the inline onclick / onchange handlers in the
+// markup can reach them — this dashboard is one big inline-script SPA.
+window._memoryMdLoadedMtime = 0;
+window._memoryMdDirty = false;
+window._memoryMdSaving = false;
+
+async function loadMemoryMdEditor() {
+  var scopeEl = document.getElementById('memory-md-scope');
+  var ed = document.getElementById('memory-md-editor');
+  var statusEl = document.getElementById('memory-md-status');
+  var saveBtn = document.getElementById('memory-md-save-btn');
+  var pathEl = document.getElementById('memory-md-path');
+  if (!ed || !statusEl || !saveBtn) return;
+
+  // Populate the scope dropdown once (global + every hired agent).
+  if (scopeEl && scopeEl.options.length <= 1) {
+    try {
+      var ar = await apiFetch('/api/agents');
+      var ad = await ar.json();
+      var agents = (ad && Array.isArray(ad.agents)) ? ad.agents : [];
+      for (var i = 0; i < agents.length; i++) {
+        var slug = agents[i].slug || agents[i].name;
+        if (!slug) continue;
+        var opt = document.createElement('option');
+        opt.value = slug;
+        opt.textContent = (agents[i].name || slug) + ' (' + slug + ')';
+        scopeEl.appendChild(opt);
+      }
+    } catch (_) { /* fallback: global only */ }
+  }
+
+  var scope = scopeEl ? scopeEl.value : 'global';
+  statusEl.textContent = 'Loading…';
+  saveBtn.disabled = true;
+  try {
+    var url = '/api/memory/md' + (scope && scope !== 'global' ? '?agent=' + encodeURIComponent(scope) : '');
+    var r = await apiFetch(url);
+    var d = await r.json();
+    if (!r.ok) {
+      statusEl.textContent = 'Failed to load: ' + (d.error || r.status);
+      return;
+    }
+    ed.value = d.content || '';
+    window._memoryMdLoadedMtime = d.mtimeMs || 0;
+    window._memoryMdDirty = false;
+    if (pathEl) pathEl.textContent = d.filePath || '';
+    var existsMsg = d.exists ? '' : ' (file not yet on disk — will be created on save)';
+    statusEl.textContent = scope === 'global' ? 'Global MEMORY.md loaded' + existsMsg : 'MEMORY.md for ' + scope + ' loaded' + existsMsg;
+    updateMemoryMdCounter();
+  } catch (err) {
+    statusEl.textContent = 'Failed to load: ' + (err && err.message || err);
+  }
+}
+
+function updateMemoryMdCounter() {
+  var ed = document.getElementById('memory-md-editor');
+  var counter = document.getElementById('memory-md-counter');
+  if (!ed || !counter) return;
+  var n = (ed.value || '').length;
+  counter.textContent = n.toLocaleString() + ' chars' + (window._memoryMdDirty ? ' · unsaved' : '');
+}
+
+function onMemoryMdInput() {
+  window._memoryMdDirty = true;
+  var saveBtn = document.getElementById('memory-md-save-btn');
+  if (saveBtn) saveBtn.disabled = false;
+  updateMemoryMdCounter();
+}
+
+async function saveMemoryMd() {
+  if (window._memoryMdSaving) return;
+  var ed = document.getElementById('memory-md-editor');
+  var scopeEl = document.getElementById('memory-md-scope');
+  var statusEl = document.getElementById('memory-md-status');
+  var saveBtn = document.getElementById('memory-md-save-btn');
+  if (!ed || !statusEl || !saveBtn) return;
+  var scope = scopeEl ? scopeEl.value : 'global';
+  window._memoryMdSaving = true;
+  saveBtn.disabled = true;
+  statusEl.textContent = 'Saving…';
+  try {
+    var url = '/api/memory/md' + (scope && scope !== 'global' ? '?agent=' + encodeURIComponent(scope) : '');
+    var r = await apiFetch(url, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ content: ed.value, expectedMtimeMs: window._memoryMdLoadedMtime }),
+    });
+    var d = await r.json();
+    if (r.status === 409) {
+      statusEl.textContent = 'Conflict: ' + (d.error || 'file changed on disk');
+      toast('MEMORY.md was modified outside the dashboard. Click Reload to see the latest version.', 'warn');
+      return;
+    }
+    if (!r.ok) {
+      statusEl.textContent = 'Save failed: ' + (d.error || r.status);
+      toast('Save failed: ' + (d.error || r.status), 'error');
+      return;
+    }
+    window._memoryMdLoadedMtime = d.mtimeMs || 0;
+    window._memoryMdDirty = false;
+    statusEl.textContent = 'Saved · ' + new Date().toLocaleTimeString();
+    updateMemoryMdCounter();
+    toast('MEMORY.md saved', 'success');
+  } catch (err) {
+    statusEl.textContent = 'Save failed: ' + (err && err.message || err);
+    toast('Save failed: ' + (err && err.message || err), 'error');
+  } finally {
+    window._memoryMdSaving = false;
+  }
+}
+
 async function refreshMemoryHealth() {
   var el = document.getElementById('memory-health-content');
   if (!el) return;
@@ -39241,6 +39692,27 @@ try {
         clearRestartRequired();
         toast('Daemon restarted \u2014 refreshing data...', 'info');
         setTimeout(function() { refreshAll(); }, 1500);
+      }
+      // 1.18.127 \u2014 auto-extraction visibility. Surface a small toast when
+      // the background memory extractor writes a fact / note / task /
+      // user_model slot. Respects a localStorage "silent learning" toggle.
+      if (evt.type === 'memory_extracted') {
+        try {
+          if (localStorage.getItem('clem-silent-learning') === '1') return;
+          var d = evt.data || {};
+          var summary = d.summary || '';
+          var label = '';
+          switch (d.toolName) {
+            case 'memory_write': label = '\ud83d\udcdd Noted'; break;
+            case 'note_create':  label = '\ud83d\udcc4 Note created'; break;
+            case 'note_take':    label = '\ud83d\udcdd Note saved'; break;
+            case 'task_add':     label = '\u2705 Task added'; break;
+            case 'user_model':   label = '\ud83e\udde0 Updated user model'; break;
+            default:             label = '\ud83d\udcdd Memory updated';
+          }
+          var msg = summary ? label + ': ' + summary : label;
+          toast(msg, 'info');
+        } catch (e) { /* non-fatal */ }
       }
       if (evt.type === 'builder') {
         try { _handleBuilderEvent(evt.data); } catch(e) { /* non-fatal */ }
