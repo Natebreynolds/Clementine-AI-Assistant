@@ -4399,6 +4399,33 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
   //   GET /api/skills              — full list with usedByTriggers join
   //   GET /api/skills/:name        — single skill detail (frontmatter + body)
   // Phase A is read-only; Phase B adds POST/PUT for editing.
+  // 1.18.130 — fix: literal-named GET routes under /api/skills/* MUST be
+  // registered BEFORE /api/skills/:name. Previously /api/skills/suppressions
+  // was shadowed and 404'd because the parameterized :name handler caught
+  // it first and looked up a skill literally named "suppressions". The
+  // dashboard logged a 404 in console on every Skills-page load. Same issue
+  // would have affected any future literal-named routes added to /api/skills.
+  app.get('/api/skills/suppressions', async (_req, res) => {
+    try {
+      const { listAllSuppressions } = await import('../agent/skill-suppressions.js');
+      res.json({ ok: true, suppressions: listAllSuppressions() });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: String(err) });
+    }
+  });
+
+  // /api/skills/pending was shadowed by :name in earlier revs (see comment
+  // at the duplicate GET below — the duplicate is now superseded). Hoisted
+  // up here so 'pending' isn't captured as :name="pending".
+  app.get('/api/skills/pending', async (_req, res) => {
+    try {
+      const { listPendingSkills } = await import('../agent/skill-extractor.js');
+      res.json({ skills: listPendingSkills() });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
   app.get('/api/skills', async (_req, res) => {
     try {
       const { listSkills } = await import('../agent/skill-store.js');
@@ -4430,14 +4457,9 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
   // Lets the user manually suppress skills from auto-match retrieval —
   // a complement to the memory store's automatic feedback-driven
   // suppression. Storage is a single JSON file under ~/.clementine/.
-  app.get('/api/skills/suppressions', async (_req, res) => {
-    try {
-      const { listAllSuppressions } = await import('../agent/skill-suppressions.js');
-      res.json({ ok: true, suppressions: listAllSuppressions() });
-    } catch (err) {
-      res.status(500).json({ ok: false, error: String(err) });
-    }
-  });
+  // (GET /api/skills/suppressions registered earlier — moved up to win
+  // route precedence over /api/skills/:name. The PUT below stays here
+  // because :name disambiguates it from the GET endpoint above.)
 
   app.put('/api/skills/suppressions/:name', async (req, res) => {
     try {
@@ -10430,17 +10452,9 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
   });
 
   // ── Skills (Procedural Memory) API ──────────────────────────────────
-
-  // NOTE: /api/skills/pending routes must come before /api/skills/:name so
-  // Express doesn't capture "pending" as a :name param.
-  app.get('/api/skills/pending', async (_req, res) => {
-    try {
-      const { listPendingSkills } = await import('../agent/skill-extractor.js');
-      res.json({ skills: listPendingSkills() });
-    } catch (err) {
-      res.status(500).json({ error: String(err) });
-    }
-  });
+  // (GET /api/skills/pending hoisted earlier — was shadowed by /api/skills/:name
+  // in this file's previous order. POST routes below are unaffected because
+  // verb differs from the GET :name handler.)
 
   app.post('/api/skills/pending/:name/approve', async (req, res) => {
     try {
