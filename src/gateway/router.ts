@@ -1244,7 +1244,7 @@ export class Gateway {
       }
       case 'approve': {
         if (!args?.name) return 'Missing skill name.';
-        const result = approvePendingSkill(args.name);
+        const result = await approvePendingSkill(args.name);
         return result.message;
       }
       case 'reject': {

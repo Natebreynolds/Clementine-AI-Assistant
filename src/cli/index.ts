@@ -3000,7 +3000,7 @@ skillsCmd
     try {
       process.env.CLEMENTINE_HOME = BASE_DIR;
       const { approvePendingSkill } = await import('../agent/skill-extractor.js');
-      const result = approvePendingSkill(name);
+      const result = await approvePendingSkill(name);
       if (result.ok) {
         console.log(`  ${GREEN}✓${RESET} ${result.message}`);
       } else {

@@ -150,43 +150,51 @@ function savePendingSkill(skill: SkillDocument): void {
 }
 
 /** Save an approved skill as a formatted markdown file. Agent-scoped if agentSlug set. */
-function saveActiveSkill(skill: SkillDocument): void {
+// 1.18.124 — saveActiveSkill is now a thin wrapper around the shared
+// writeSkill helper. Auto-extracted skills used to land as legacy flat-
+// form (`<name>.md` with top-level triggers/toolsUsed/source) which the
+// Skills page tagged with the orange "LEGACY" badge — confusing on a
+// fresh install. Now they write the same Anthropic-canonical folder
+// form the dashboard + chat paths produce.
+//
+// Also drops the per-overwrite `.md.bak` leak — that was paranoia
+// before the skill catalog had proper provenance. The pending file
+// in PENDING_SKILLS_DIR is the rollback artifact.
+async function saveActiveSkill(skill: SkillDocument): Promise<void> {
   ensureDirs();
+  const { writeSkill } = await import('./skill-store.js');
+  // Map SkillDocument's source enum (which still has 'unleashed'/'cron'
+  // for back-compat with old pending-skill JSONs on disk) to the
+  // writeSkill source enum.
+  const writeSource: 'manual' | 'chat' | 'auto' | 'imported' =
+    skill.source === 'unleashed' || skill.source === 'cron' ? 'auto'
+    : skill.source === 'chat' ? 'chat'
+    : 'manual';
 
-  const targetDir = skill.agentSlug ? agentSkillsDir(skill.agentSlug) : GLOBAL_SKILLS_DIR;
-  if (!existsSync(targetDir)) mkdirSync(targetDir, { recursive: true });
-
-  // gray-matter's YAML dumper throws on undefined values — omit them
-  const frontmatter: Record<string, unknown> = {
+  const result = writeSkill({
+    name: skill.name,
     title: skill.title,
     description: skill.description,
+    // Procedure body only — title/description live in frontmatter
+    // under the new schema, no need to repeat them inside the body.
+    body: skill.steps,
+    tools: skill.toolsUsed,
     triggers: skill.triggers,
-    source: skill.source,
-    toolsUsed: skill.toolsUsed,
-    useCount: skill.useCount,
-    createdAt: skill.createdAt,
-    updatedAt: skill.updatedAt,
-  };
-  if (skill.sourceJob) frontmatter.sourceJob = skill.sourceJob;
-  if (skill.agentSlug) frontmatter.agentSlug = skill.agentSlug;
-  if (skill.lastUsed) frontmatter.lastUsed = skill.lastUsed;
-
-  const content = matter.stringify(`\n# ${skill.title}\n\n${skill.description}\n\n## Procedure\n\n${skill.steps}\n`, frontmatter);
-  const filePath = path.join(targetDir, `${skill.name}.md`);
-
-  // Backup existing before overwrite
-  if (existsSync(filePath)) {
-    try { copyFileSync(filePath, filePath.replace(/\.md$/, '.md.bak')); } catch { /* best-effort */ }
-  }
-  writeFileSync(filePath, content);
-
-  logger.info({ name: skill.name, source: skill.source, agentSlug: skill.agentSlug ?? 'global' }, 'Skill saved');
+    agentSlug: skill.agentSlug,
+    source: writeSource,
+    sourceJob: skill.sourceJob,
+    overwrite: true,  // approve / merge always replaces in-place
+  });
+  logger.info(
+    { name: skill.name, source: skill.source, agentSlug: skill.agentSlug ?? 'global', filePath: result.filePath, overwrote: result.overwrote },
+    'Skill saved',
+  );
 }
 
 // ── Pending Skill Management ────────────────────────────────────────
 
 /** Move a pending skill to the active skills directory. */
-export function approvePendingSkill(name: string): { ok: boolean; message: string } {
+export async function approvePendingSkill(name: string): Promise<{ ok: boolean; message: string }> {
   ensureDirs();
   const pendingFile = path.join(PENDING_SKILLS_DIR, `${name}.json`);
   if (!existsSync(pendingFile)) {
@@ -196,7 +204,7 @@ export function approvePendingSkill(name: string): { ok: boolean; message: strin
   try {
     const skill: SkillDocument = JSON.parse(readFileSync(pendingFile, 'utf-8'));
     skill.updatedAt = new Date().toISOString();
-    saveActiveSkill(skill);
+    await saveActiveSkill(skill);
     unlinkSync(pendingFile);
     logger.info({ name }, 'Pending skill approved and activated');
     return { ok: true, message: `Skill **${skill.title}** is now active${skill.agentSlug ? ` for ${skill.agentSlug}` : ' (global)'}.` };
@@ -345,7 +353,7 @@ async function mergeSkill(
     };
 
     // Merges go directly to active (existing skill was already approved)
-    saveActiveSkill(merged);
+    await saveActiveSkill(merged);
     logger.info({ name: merged.name }, 'Skill merged and updated');
     return merged;
   } catch (err) {

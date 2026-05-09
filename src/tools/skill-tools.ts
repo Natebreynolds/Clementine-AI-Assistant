@@ -18,7 +18,7 @@
  * and these tools, so you can't smuggle a bad skill through the chat path.
  */
 
-import { writeFileSync, existsSync, mkdirSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { z } from 'zod';
 import matter from 'gray-matter';
@@ -26,11 +26,11 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 
 import { VAULT_DIR, textResult, logger } from './shared.js';
 
-// Anthropic spec — keep these in sync with skill-store.validateSkill.
+// 1.18.124 — name regex is the only validator skill-tools still uses
+// directly (for update_skill's pre-flight slug check). All other
+// validations + the file write live in skill-store.writeSkill.
 const NAME_PATTERN = /^[a-z0-9][a-z0-9-]{0,63}$/;
-const NAME_MAX_LEN = 64;
 const DESCRIPTION_MAX_LEN = 1024;
-const RESERVED_NAMES = new Set(['anthropic', 'claude']);
 
 function globalSkillsDir(): string {
   return path.join(VAULT_DIR, '00-System', 'skills');
@@ -60,68 +60,38 @@ export function registerSkillTools(server: McpServer): void {
         .describe('Optional natural-language phrases that should auto-match this skill at runtime (e.g. ["morning deal review", "check deals today"]). Stored under clementine.triggers. Pinned skills don\'t need triggers — they fire by name.'),
     },
     async ({ name, title, description, body, tools, triggers }) => {
-      // Validate per Anthropic spec
-      if (!NAME_PATTERN.test(name)) {
-        return textResult(`❌ Name "${name}" doesn't match the spec. Use lowercase letters, digits, and dashes only — must start with a letter or digit, max 64 chars.`);
-      }
-      if (name.length > NAME_MAX_LEN) {
-        return textResult(`❌ Name is too long (${name.length} chars). Max is ${NAME_MAX_LEN}.`);
-      }
-      if (RESERVED_NAMES.has(name) || /\b(anthropic|claude)\b/i.test(name)) {
-        return textResult(`❌ Name "${name}" uses a reserved word ("anthropic" or "claude"). Pick another.`);
-      }
-      if (!description || !description.trim()) {
-        return textResult('❌ Description is required — Claude uses it to decide when to apply this skill.');
-      }
-      if (description.length > DESCRIPTION_MAX_LEN) {
-        return textResult(`❌ Description is too long (${description.length} chars). Max is ${DESCRIPTION_MAX_LEN}.`);
-      }
-      if (!body || !body.trim()) {
-        return textResult('❌ Procedure body is required — that\'s what Claude actually runs.');
-      }
-
-      const skillsDir = globalSkillsDir();
-      const folderPath = path.join(skillsDir, name);
-      const entryPath = path.join(folderPath, 'SKILL.md');
-      if (existsSync(entryPath)) {
-        return textResult(`❌ Skill "${name}" already exists at ${entryPath}. Use update_skill instead, or pick a different name.`);
-      }
-
+      // 1.18.124 — delegate to the shared writeSkill helper. Validation
+      // (name regex, length caps, reserved words, already-exists) is
+      // now centralized; the same checks run for the dashboard endpoint
+      // and the auto-extraction path.
       try {
-        mkdirSync(folderPath, { recursive: true });
-        const now = new Date().toISOString();
-        const fm: Record<string, unknown> = { name, description };
-        if (title && title.trim()) fm.title = title.trim();
-        const clementineExt: Record<string, unknown> = {
+        const { writeSkill } = await import('../agent/skill-store.js');
+        const result = writeSkill({
+          name,
+          title,
+          description,
+          body,
+          tools,
+          triggers,
           source: 'chat',
-          useCount: 0,
-          createdAt: now,
-          updatedAt: now,
-          version: 1,
-        };
-        if (Array.isArray(tools) && tools.length > 0) {
-          clementineExt.tools = { allow: tools.map(String).map(s => s.trim()).filter(Boolean) };
-        }
-        if (Array.isArray(triggers) && triggers.length > 0) {
-          clementineExt.triggers = triggers.map(String).map(s => s.trim()).filter(Boolean);
-        }
-        fm.clementine = clementineExt;
-        const content = matter.stringify(body.endsWith('\n') ? body : body + '\n', fm);
-        writeFileSync(entryPath, content);
-        logger.info({ name, entryPath, source: 'chat' }, 'Skill created via chat');
-
+        });
+        logger.info({ name: result.name, entryPath: result.filePath, source: 'chat' }, 'Skill created via chat');
         const toolsLine = (tools && tools.length > 0) ? `\nAllowed tools: ${tools.slice(0, 5).join(', ')}${tools.length > 5 ? `, +${tools.length - 5} more` : ''}` : '';
         const triggersLine = (triggers && triggers.length > 0) ? `\nTriggers: ${triggers.slice(0, 4).join(', ')}${triggers.length > 4 ? `, +${triggers.length - 4} more` : ''}` : '';
         return textResult(
-          `✅ Created skill "${name}" at ${entryPath}\n` +
+          `✅ Created skill "${result.name}" at ${result.filePath}\n` +
           `Description: ${description.slice(0, 200)}${description.length > 200 ? '…' : ''}` +
           toolsLine +
           triggersLine +
-          `\n\nThe skill is ready to pin to any task — open the cron editor, go to Tools & MCP, click "+ Add skill" and select "${name}". Or invoke it directly in chat: "Run the ${title || name} skill."`,
+          `\n\nThe skill is ready to pin to any task — open the cron editor, go to Tools & MCP, click "+ Add skill" and select "${result.name}". Or invoke it directly in chat: "Run the ${title || result.name} skill."`,
         );
       } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (msg.includes('already exists')) {
+          return textResult(`❌ Skill "${name}" already exists. Use update_skill instead, or pick a different name.`);
+        }
         logger.error({ err, name }, 'create_skill failed');
-        return textResult(`❌ Failed to write the skill: ${err instanceof Error ? err.message : String(err)}`);
+        return textResult(`❌ ${msg}`);
       }
     },
   );

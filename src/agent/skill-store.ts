@@ -625,3 +625,130 @@ export function migrateAllLegacySkills(): { migrated: MigrationResult[]; skipped
   }
   return { migrated, skipped };
 }
+
+// ── writeSkill — single source of truth for creating skills ──────────
+//
+// 1.18.124 — Three skill-creation paths existed before this:
+//   1. POST /api/skills (dashboard "+ New skill" modal)
+//   2. create_skill MCP tool (chat — Discord / dashboard chat)
+//   3. saveActiveSkill in skill-extractor.ts (auto-extraction from runs)
+//
+// All three wrote slightly different frontmatter shapes. The auto-
+// extraction path was the worst — it wrote LEGACY flat-form (top-level
+// triggers/source/useCount) which the Skills page renders with the
+// "LEGACY" badge, even on fresh installs. Same input, three drifting
+// outputs.
+//
+// This helper is the shared write path. Anthropic-canonical name +
+// description top-level; everything Clementine-specific (source,
+// useCount, lifecycle metadata, triggers, tools.allow) under the
+// `clementine:` namespace. Folder form by default. Optional agentSlug
+// scopes the write to <agentsDir>/<slug>/skills/<name>/SKILL.md.
+//
+// Returns the written entry path. Throws when the name is invalid or
+// the file already exists (caller can fall back to update).
+
+export interface WriteSkillInput {
+  /** Slug (lowercase letters/digits/dashes, ≤64 chars, Anthropic regex). */
+  name: string;
+  /** Human-readable display name. Optional. */
+  title?: string;
+  /** One-paragraph "what does this do, when should Claude run it" — required by spec. */
+  description: string;
+  /** Procedure body (Markdown). Required. */
+  body: string;
+  /** Where the skill came from. Drives lifecycle metadata + dashboard badge. */
+  source: 'manual' | 'chat' | 'auto' | 'imported';
+  /** Optional tool allowlist — stored under clementine.tools.allow. */
+  tools?: string[];
+  /** Optional NLP trigger phrases for auto-match — stored under clementine.triggers. */
+  triggers?: string[];
+  /** Optional agent scope. When set, writes to <agentsDir>/<slug>/skills/
+   *  instead of the global skills dir. Used by auto-extraction so each
+   *  hired agent's skills stay isolated by default. */
+  agentSlug?: string;
+  /** When true, allow overwriting an existing skill (used by update flows). */
+  overwrite?: boolean;
+  /** Optional source-job tag (auto-extraction provenance). */
+  sourceJob?: string;
+}
+
+export interface WriteSkillResult {
+  /** Absolute path to the written SKILL.md. */
+  filePath: string;
+  /** Slug (matches input name). */
+  name: string;
+  /** Whether an existing skill was overwritten. */
+  overwrote: boolean;
+}
+
+export function writeSkill(input: WriteSkillInput): WriteSkillResult {
+  // Validate name per Anthropic spec — single guard for every caller.
+  if (!input.name || !NAME_PATTERN.test(input.name)) {
+    throw new Error('writeSkill: name must match ^[a-z0-9][a-z0-9-]{0,63}$');
+  }
+  if (input.name.length > NAME_MAX_LEN) {
+    throw new Error(`writeSkill: name exceeds ${NAME_MAX_LEN} chars`);
+  }
+  if (RESERVED_NAMES.has(input.name) || /\b(anthropic|claude)\b/i.test(input.name)) {
+    throw new Error(`writeSkill: name uses a reserved word`);
+  }
+  if (!input.description || !input.description.trim()) {
+    throw new Error('writeSkill: description is required');
+  }
+  if (input.description.length > DESCRIPTION_MAX_LEN) {
+    throw new Error(`writeSkill: description exceeds ${DESCRIPTION_MAX_LEN} chars`);
+  }
+  if (!input.body || !input.body.trim()) {
+    throw new Error('writeSkill: body is required');
+  }
+
+  // Resolve target directory. Agent-scoped writes land under the agent's
+  // skills folder so each hired agent's skill set is independent.
+  const base = process.env.CLEMENTINE_HOME || path.join(os.homedir(), '.clementine');
+  const targetDir = input.agentSlug
+    ? path.join(base, 'vault', '00-System', 'agents', input.agentSlug, 'skills')
+    : globalSkillsDir();
+  if (!existsSync(targetDir)) mkdirSync(targetDir, { recursive: true });
+
+  const folderPath = path.join(targetDir, input.name);
+  const entryPath = path.join(folderPath, 'SKILL.md');
+  const existed = existsSync(entryPath);
+  if (existed && !input.overwrite) {
+    throw new Error(`writeSkill: skill "${input.name}" already exists`);
+  }
+
+  mkdirSync(folderPath, { recursive: true });
+
+  // Build the frontmatter. Anthropic-canonical fields (name, description)
+  // top-level. Everything else under clementine:. The lifecycle metadata
+  // (createdAt / updatedAt / version) keeps the Skills page detail pane
+  // accurate without authors having to remember to set it by hand.
+  const now = new Date().toISOString();
+  const fm: Record<string, unknown> = {
+    name: input.name,
+    description: input.description.trim(),
+  };
+  if (input.title && input.title.trim()) fm.title = input.title.trim();
+
+  const ext: Record<string, unknown> = {
+    source: input.source,
+    useCount: 0,
+    createdAt: now,
+    updatedAt: now,
+    version: 1,
+  };
+  if (input.tools && input.tools.length > 0) {
+    ext.tools = { allow: input.tools.map(String).map(s => s.trim()).filter(Boolean) };
+  }
+  if (input.triggers && input.triggers.length > 0) {
+    ext.triggers = input.triggers.map(String).map(s => s.trim()).filter(Boolean);
+  }
+  if (input.sourceJob) ext.sourceJob = input.sourceJob;
+  fm.clementine = ext;
+
+  const content = matter.stringify(input.body.endsWith('\n') ? input.body : input.body + '\n', fm);
+  writeFileSync(entryPath, content);
+
+  return { filePath: entryPath, name: input.name, overwrote: existed };
+}

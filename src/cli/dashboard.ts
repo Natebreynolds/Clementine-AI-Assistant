@@ -10102,7 +10102,7 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
   app.post('/api/skills/pending/:name/approve', async (req, res) => {
     try {
       const { approvePendingSkill } = await import('../agent/skill-extractor.js');
-      const result = approvePendingSkill(req.params.name);
+      const result = await approvePendingSkill(req.params.name);
       if (!result.ok) { res.status(404).json(result); return; }
       res.json(result);
     } catch (err) {
@@ -10122,44 +10122,41 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
   });
 
 
-  // POST /api/skills — create a new folder-form skill (1.18.115).
-  // Anthropic-compatible: top-level `name` + `description` required; the
-  // optional `tools` array goes under `clementine.tools.allow` so the
-  // frontmatter parses cleanly in vanilla Claude Agent SDK while still
-  // letting the cron runtime enforce the allowlist.
-  app.post('/api/skills', (req, res) => {
+  // POST /api/skills — create a new folder-form skill via the shared
+  // writeSkill helper (1.18.124). All three skill-creation paths
+  // (dashboard, MCP create_skill, auto-extraction) flow through the
+  // same write-once-validate-once code; this route is now a thin
+  // adapter over the helper.
+  app.post('/api/skills', async (req, res) => {
     try {
       const { name, title, description, body, tools } = req.body ?? {};
-      if (!name || typeof name !== 'string') { res.status(400).json({ error: 'name is required' }); return; }
-      if (!/^[a-z0-9][a-z0-9-]{0,63}$/.test(name)) { res.status(400).json({ error: 'name must match ^[a-z0-9][a-z0-9-]{0,63}$ (Anthropic spec)' }); return; }
-      if (!description || typeof description !== 'string') { res.status(400).json({ error: 'description is required' }); return; }
-      if (description.length > 1024) { res.status(400).json({ error: 'description must be ≤ 1024 chars (Anthropic spec)' }); return; }
-      if (!body || typeof body !== 'string' || !body.trim()) { res.status(400).json({ error: 'body is required' }); return; }
-
-      const skillsDir = path.join(VAULT_DIR, '00-System', 'skills');
-      if (!existsSync(skillsDir)) mkdirSync(skillsDir, { recursive: true });
-      const folderPath = path.join(skillsDir, name);
-      const entryPath = path.join(folderPath, 'SKILL.md');
-      if (existsSync(entryPath)) { res.status(409).json({ error: 'Skill "' + name + '" already exists. Use PUT to update.' }); return; }
-
-      mkdirSync(folderPath, { recursive: true });
-      const now = new Date().toISOString();
-      const fm: Record<string, unknown> = { name, description };
-      if (title && typeof title === 'string' && title.trim()) fm.title = title.trim();
-      const allowed = Array.isArray(tools) ? tools.map(String).map(s => s.trim()).filter(Boolean) : [];
-      const clementineExt: Record<string, unknown> = {
-        source: 'manual',
-        useCount: 0,
-        createdAt: now,
-        updatedAt: now,
-        version: 1,
-      };
-      if (allowed.length > 0) clementineExt.tools = { allow: allowed };
-      fm.clementine = clementineExt;
-      const matterMod = require('gray-matter');
-      const content = matterMod.stringify(body.endsWith('\n') ? body : body + '\n', fm);
-      writeFileSync(entryPath, content);
-      res.json({ ok: true, name, layout: 'folder', filePath: entryPath });
+      if (typeof name !== 'string' || typeof description !== 'string' || typeof body !== 'string') {
+        res.status(400).json({ error: 'name, description, and body are required strings' });
+        return;
+      }
+      const { writeSkill } = await import('../agent/skill-store.js');
+      try {
+        const result = writeSkill({
+          name,
+          title: typeof title === 'string' ? title : undefined,
+          description,
+          body,
+          tools: Array.isArray(tools) ? tools.map(String) : undefined,
+          source: 'manual',
+        });
+        res.json({ ok: true, name: result.name, layout: 'folder', filePath: result.filePath });
+      } catch (err) {
+        // writeSkill throws synchronously with a readable message for
+        // every validation failure (name regex, description length,
+        // already-exists, etc.). Surface them as 4xx; only unexpected
+        // I/O errors hit the outer 500 path below.
+        const msg = err instanceof Error ? err.message : String(err);
+        if (msg.includes('already exists')) {
+          res.status(409).json({ error: msg });
+        } else {
+          res.status(400).json({ error: msg });
+        }
+      }
     } catch (err) {
       res.status(500).json({ error: String(err) });
     }
