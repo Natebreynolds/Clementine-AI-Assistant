@@ -38,6 +38,7 @@ import { registerBackgroundTaskTools } from './background-task-tools.js';
 import { registerDecisionReflectionTools } from './decision-reflection-tools.js';
 import { registerBuilderTools } from './builder-tools.js';
 import { registerSkillTools } from './skill-tools.js';
+import { registerScheduleTools } from './schedule-tools.js';
 
 // ── Server ──────────────────────────────────────────────────────────────
 
@@ -83,6 +84,7 @@ registerBackgroundTaskTools(scopedServer);
 registerDecisionReflectionTools(scopedServer);
 registerBuilderTools(scopedServer);
 registerSkillTools(scopedServer);
+registerScheduleTools(scopedServer);
 
 // ── Main ────────────────────────────────────────────────────────────────
 

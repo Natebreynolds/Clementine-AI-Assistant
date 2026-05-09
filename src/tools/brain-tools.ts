@@ -161,7 +161,146 @@ export async function ingestBrainRecords(slug: string, records: IngestRecordInpu
   };
 }
 
+// ── brain_save — one-shot ingestion from chat ─────────────────────────
+//
+// 1.18.145 — closes the chat-parity gap on the write side. The user
+// can now say "save this article" or "ingest this URL" and the agent
+// drives the same pipeline the dashboard's Seed tab uses, no manual
+// record assembly required.
+//
+// Accepts either raw text or a URL. URLs are fetched + reasonably
+// extracted (HTML→text via regex strip, JSON/markdown passthrough);
+// for richer extraction the user should still use the dashboard's
+// adapter pipeline (PDF/DOCX/CSV/etc. — they need parsers we don't
+// want to import into every chat session).
+
+const URL_LIKE = /^https?:\/\//i;
+
+function looksLikeUrl(s: string): boolean {
+  return URL_LIKE.test(s.trim());
+}
+
+async function fetchUrlText(url: string, timeoutMs = 20_000): Promise<{ text: string; title?: string; contentType?: string }> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, {
+      signal: controller.signal,
+      headers: { 'User-Agent': 'Clementine/brain_save (compatible; +https://github.com/Natebreynolds/Clementine-AI-Assistant)' },
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText}`);
+    const contentType = res.headers.get('content-type') ?? '';
+    const raw = await res.text();
+    if (/json/i.test(contentType)) {
+      return { text: raw, contentType };
+    }
+    if (/html/i.test(contentType) || /^\s*<!DOCTYPE|^\s*<html/i.test(raw)) {
+      // Crude HTML→text. Good enough for "save this article" — anything
+      // fancier (Readability, Mercury) is a dashboard concern.
+      const titleMatch = raw.match(/<title[^>]*>([^<]+)<\/title>/i);
+      const title = titleMatch ? titleMatch[1].trim() : undefined;
+      const text = raw
+        .replace(/<script[\s\S]*?<\/script>/gi, '')
+        .replace(/<style[\s\S]*?<\/style>/gi, '')
+        .replace(/<[^>]+>/g, ' ')
+        .replace(/&nbsp;/g, ' ')
+        .replace(/&amp;/g, '&')
+        .replace(/&lt;/g, '<')
+        .replace(/&gt;/g, '>')
+        .replace(/&quot;/g, '"')
+        .replace(/&#39;/g, "'")
+        .replace(/\s+/g, ' ')
+        .trim();
+      return { text, title, contentType };
+    }
+    // Plaintext, markdown, etc.
+    return { text: raw, contentType };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+export interface BrainSaveInput {
+  /** Either a URL (will be fetched) or raw text content. */
+  content: string;
+  /** Optional human-readable title. Inferred from <title> tag for HTML URLs. */
+  title?: string;
+  /** Logical bucket the record belongs to. Default: "chat-saves". */
+  slug?: string;
+  /** Stable id so repeat saves dedupe. Default: hash of content. */
+  externalId?: string;
+  /** Free-form tags carried in frontmatter for later filtering/recall. */
+  tags?: string[];
+}
+
+export async function brainSave(input: BrainSaveInput): Promise<BrainIngestFolderResult & { sourceType: 'url' | 'text' }> {
+  const slug = sanitizeSlug(input.slug || 'chat-saves');
+  const isUrl = looksLikeUrl(input.content);
+  let text = input.content;
+  let title = input.title;
+  let urlContentType: string | undefined;
+
+  if (isUrl) {
+    const fetched = await fetchUrlText(input.content);
+    text = fetched.text;
+    title = title || fetched.title || input.content;
+    urlContentType = fetched.contentType;
+  }
+
+  if (!text || !text.trim()) {
+    throw new Error('brain_save: content is empty after fetch/extract');
+  }
+
+  // Stable id: caller-provided OR URL-as-id OR sha-style hash of text
+  const externalId = input.externalId
+    || (isUrl ? input.content : fallbackExternalId(slug, 0, text));
+
+  const metadata: Record<string, unknown> = {
+    savedFromChat: true,
+    sourceType: isUrl ? 'url' : 'text',
+  };
+  if (isUrl) metadata.url = input.content;
+  if (urlContentType) metadata.contentType = urlContentType;
+  if (input.tags && input.tags.length) metadata.tags = input.tags;
+
+  const result = await ingestBrainRecords(slug, [{
+    title: title || 'Untitled',
+    externalId,
+    content: text,
+    metadata,
+  }]);
+
+  return { ...result, sourceType: isUrl ? 'url' : 'text' };
+}
+
 export function registerBrainTools(server: McpServer): void {
+  server.tool(
+    'brain_save',
+    'Save a single piece of content (text or URL) to the brain right now. Use when the user says things like "remember this", "save this article", "ingest this URL", "add to memory". Routes through the same distillation pipeline the dashboard\'s Seed tab uses (chunking + LLM summary + vault note + memory index + knowledge graph). For batch ingestion or recurring feeds, see brain_ingest_folder + schedule_skill.',
+    {
+      content: z.string().describe('Either a URL (fetched + text-extracted) or raw text content.'),
+      title: z.string().optional().describe('Optional human-readable title. Inferred from <title> tag for HTML URLs.'),
+      slug: z.string().optional().describe('Logical bucket (folder) the record lands in under 04-Ingest/<slug>/. Default: "chat-saves".'),
+      externalId: z.string().optional().describe('Stable id so repeat saves dedupe (e.g. URL, message id). Default: hash of content.'),
+      tags: z.array(z.string()).optional().describe('Free-form tags persisted in frontmatter for later filtering/recall.'),
+    },
+    async (input) => {
+      try {
+        const result = await brainSave(input);
+        const where = `04-Ingest/${result.slug}/`;
+        return textResult(
+          `Saved to brain (${result.sourceType}): "${(input.title || input.content).slice(0, 80)}"\n` +
+          `Folder: ${where} · Pipeline: ${result.pipeline.recordsIn} in · ${result.pipeline.recordsWritten} written · ${result.pipeline.recordsSkipped} skipped` +
+          (result.pipeline.recordsFailed > 0 ? ` · ${result.pipeline.recordsFailed} failed` : ''),
+        );
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        logger.error({ err }, 'brain_save: failed');
+        return textResult(`brain_save failed: ${msg}`);
+      }
+    },
+  );
+
   server.tool(
     'brain_ingest_folder',
     'Ingest a batch of records into the brain under a named slug. Sends records directly into the distillation pipeline (chunking, LLM summarization, vault note write, memory indexing, knowledge graph write). Use at the end of Connector Feed cron jobs. Safe to re-run — records with the same externalId update the same distilled note.',
