@@ -650,6 +650,14 @@ export interface CronJobDefinition {
    * Existing tricks (no field set) keep current behavior — backward compat.
    */
   predictable?: boolean;
+  /** 1.18.129 — where this cron job came from. 'cron-md' is the legacy
+   *  fat-cron format in vault/00-System/CRON.md (or per-agent CRON.md).
+   *  'scheduled-skill' is the Anthropic-pure registry — a thin entry in
+   *  ~/.clementine/schedules.json that auto-pins one named skill. The
+   *  runtime treats both identically; the field exists so the dashboard
+   *  can render a SKILL vs LEGACY CRON badge per row. Undefined =
+   *  legacy CRON.md (older parsers don't stamp this). */
+  source?: 'cron-md' | 'scheduled-skill';
 }
 
 export type LongTaskRisk = 'normal' | 'long' | 'huge' | 'unsafe';

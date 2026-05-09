@@ -38,6 +38,7 @@ import {
   TIMEZONE,
 } from '../config.js';
 import { listAllGoals, findGoalPath, readGoalById } from '../tools/shared.js';
+import { listSchedules } from '../agent/schedule-registry.js';
 import type { CronJobDefinition, CronRunEntry, NotificationContext, SelfImproveConfig, SelfImproveExperiment, SelfImproveState, WorkflowDefinition } from '../types.js';
 import type { NotificationDispatcher } from './notifications.js';
 import type { Gateway } from './router.js';
@@ -228,26 +229,89 @@ function parseJobYaml(job: Record<string, unknown>): CronJobDefinition | null {
 }
 
 /**
- * Parse cron job definitions from vault/00-System/CRON.md frontmatter.
+ * Parse cron job definitions from two sources, merged:
+ *   1. The legacy `vault/00-System/CRON.md` frontmatter (fat cron format
+ *      — its own prompt, allowedTools, allowedMcpServers, etc.).
+ *   2. The 1.18.129 schedule registry at `~/.clementine/schedules.json`,
+ *      which holds thin {skill → schedule} bindings. Each entry is
+ *      synthesized into a CronJobDefinition where the runtime auto-pins
+ *      the named skill — the skill body becomes the prompt at fire-time
+ *      via the existing buildSkillContext pipeline. Anthropic-pure.
+ *
+ * On a name collision (CRON.md has a job whose name matches a scheduled
+ * skill) the **scheduled-skill wins**, because that's the new canonical
+ * format and the user has explicitly opted into it for that name.
+ *
  * Used by both the in-process CronScheduler and the standalone CLI runner.
  */
 export function parseCronJobs(): CronJobDefinition[] {
-  if (!existsSync(CRON_FILE)) return [];
-  let parsed;
+  const fromCronMd: CronJobDefinition[] = [];
+  if (existsSync(CRON_FILE)) {
+    try {
+      const parsed = matter(readFileSync(CRON_FILE, 'utf-8'));
+      const jobDefs = (parsed.data.jobs ?? []) as Array<Record<string, unknown>>;
+      for (const job of jobDefs) {
+        const def = parseJobYaml(job);
+        if (def) fromCronMd.push(def);
+        else logger.warn({ job }, 'Skipping malformed cron job');
+      }
+    } catch (err) {
+      logger.error({ err }, 'CRON.md YAML parse error — keeping schedule-registry jobs only.');
+    }
+  }
+
+  // 1.18.129 — schedule registry → CronJobDefinition[]. The scheduler
+  // doesn't care about the source format; each entry surfaces as a
+  // self-pinning cron whose only "prompt" is "[skill body]" — the
+  // runtime's buildSkillContext loads the actual procedure.
+  const fromRegistry: CronJobDefinition[] = [];
   try {
-    parsed = matter(readFileSync(CRON_FILE, 'utf-8'));
+    const registry = parseScheduledSkillJobs();
+    fromRegistry.push(...registry);
   } catch (err) {
-    logger.error({ err }, 'CRON.md YAML parse error — keeping previous jobs. Fix the file manually.');
-    return [];
+    logger.error({ err }, 'schedules.json parse error — falling back to CRON.md only');
   }
-  const jobDefs = (parsed.data.jobs ?? []) as Array<Record<string, unknown>>;
-  const jobs: CronJobDefinition[] = [];
-  for (const job of jobDefs) {
-    const def = parseJobYaml(job);
-    if (def) jobs.push(def);
-    else logger.warn({ job }, 'Skipping malformed cron job');
+
+  // Dedup by name with scheduled-skill winning. Build a Map keyed on
+  // job name; insert CRON.md first, then registry to overwrite collisions.
+  const byName = new Map<string, CronJobDefinition>();
+  for (const j of fromCronMd) byName.set(j.name, j);
+  for (const j of fromRegistry) byName.set(j.name, j);
+  return [...byName.values()];
+}
+
+/**
+ * Read the schedule registry and project each entry into a
+ * CronJobDefinition that runs the named skill on the given schedule.
+ * Skill body / tools / MCP servers all flow through buildSkillContext
+ * at fire-time — this function only concerns itself with the binding.
+ */
+function parseScheduledSkillJobs(): CronJobDefinition[] {
+  const entries = listSchedules();
+  const out: CronJobDefinition[] = [];
+  for (const e of entries) {
+    if (!e.skillName || !e.schedule) continue;
+    out.push({
+      name: e.skillName,
+      schedule: e.schedule,
+      // Empty prompt — buildSkillContext injects the skill body. The
+      // runtime treats an empty prompt + a single pinned skill as
+      // "this skill IS the task." How-to-respond directive still applies.
+      prompt: '',
+      tier: 1,
+      enabled: e.enabled !== false,
+      skills: [e.skillName],
+      agentSlug: e.agentSlug ?? undefined,
+      // Predictable mode is the right default for scheduled skills:
+      // skip MEMORY.md auto-injection / team comms / runtime auto-match.
+      // The skill is the contract; nothing else fires.
+      predictable: true,
+      // Source marker so the dashboard can render a SKILL badge vs the
+      // legacy CRON.md badge. Not used by the runtime.
+      source: 'scheduled-skill',
+    });
   }
-  return jobs;
+  return out;
 }
 
 /**

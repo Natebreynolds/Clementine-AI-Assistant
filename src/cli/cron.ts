@@ -88,6 +88,36 @@ export async function cmdCronRun(jobName: string): Promise<void> {
   const jobs = parseCronJobs();
   let job = jobs.find((j) => j.name === jobName);
 
+  // 1.18.129 — Run-now fallback for skills that aren't on a schedule.
+  // The dashboard's "Run now" button on a skill detail pane calls this
+  // endpoint with the skill name. If the skill has no registry entry,
+  // synthesize a transient CronJobDefinition so the runtime can fire
+  // it once. The skill body becomes the prompt via buildSkillContext,
+  // same as scheduled-skill jobs.
+  if (!job) {
+    try {
+      const { getSkill } = await import('../agent/skill-store.js');
+      const skill = getSkill(jobName);
+      if (skill) {
+        const ext = (skill.frontmatter.clementine ?? {}) as { agentSlug?: string | null };
+        job = {
+          name: skill.frontmatter.name,
+          schedule: '0 0 1 1 *', // dummy — never auto-fires; run-now bypasses scheduling
+          prompt: '',              // buildSkillContext injects the skill body
+          tier: 1,
+          enabled: true,
+          skills: [skill.frontmatter.name],
+          agentSlug: ext.agentSlug ?? undefined,
+          predictable: true,
+          source: 'scheduled-skill',
+        };
+        console.log(`(running skill "${jobName}" on demand — not yet scheduled)`);
+      }
+    } catch {
+      // Fall through to error
+    }
+  }
+
   if (!job) {
     console.error(`Job not found: ${jobName}`);
     console.error(`Available jobs: ${jobs.map((j) => j.name).join(', ') || '(none)'}`);

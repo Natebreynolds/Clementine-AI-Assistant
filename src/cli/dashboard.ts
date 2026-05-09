@@ -4458,6 +4458,92 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
     }
   });
 
+  // ── Schedule registry (1.18.129) ───────────────────────────────────
+  // Anthropic-pure scheduling: skills stay vanilla, schedules live in
+  // ~/.clementine/schedules.json. The cron scheduler reads this in
+  // parseCronJobs alongside CRON.md, so any entry written here fires
+  // through the same runtime as legacy crons.
+  app.get('/api/schedules', async (_req, res) => {
+    try {
+      const { listSchedules } = await import('../agent/schedule-registry.js');
+      res.json({ ok: true, schedules: listSchedules() });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: String(err) });
+    }
+  });
+
+  app.get('/api/schedules/:skillName', async (req, res) => {
+    try {
+      const { getSchedule } = await import('../agent/schedule-registry.js');
+      const entry = getSchedule(req.params.skillName);
+      if (!entry) return res.status(404).json({ ok: false, error: 'not scheduled' });
+      res.json({ ok: true, schedule: entry });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: String(err) });
+    }
+  });
+
+  app.put('/api/schedules/:skillName', async (req, res) => {
+    try {
+      const skillName = req.params.skillName;
+      if (!/^[a-z0-9][a-z0-9-]{0,63}$/.test(skillName)) {
+        return res.status(400).json({ ok: false, error: 'invalid skill name slug' });
+      }
+      const body = (req.body ?? {}) as { schedule?: string; enabled?: boolean; agentSlug?: string | null };
+      if (typeof body.schedule !== 'string' || !body.schedule.trim()) {
+        return res.status(400).json({ ok: false, error: 'schedule (cron expression) required' });
+      }
+      // Optional: validate agentSlug shape when provided.
+      if (body.agentSlug && body.agentSlug !== null && !/^[a-z0-9][a-z0-9-]{0,63}$/.test(body.agentSlug)) {
+        return res.status(400).json({ ok: false, error: 'invalid agentSlug' });
+      }
+      // Quick sanity check on cron expression — node-cron validates at
+      // schedule-time anyway, but a 400 here is friendlier than a server
+      // log buried in the daemon output.
+      try {
+        if (!cron.validate(body.schedule)) {
+          return res.status(400).json({ ok: false, error: 'cron expression does not parse' });
+        }
+      } catch {
+        return res.status(400).json({ ok: false, error: 'cron expression does not parse' });
+      }
+      const { setSchedule } = await import('../agent/schedule-registry.js');
+      const entry = setSchedule(skillName, {
+        schedule: body.schedule,
+        enabled: body.enabled !== false,
+        agentSlug: body.agentSlug ?? null,
+      });
+      // Hot-reload: nudge the cron scheduler so the new entry fires on
+      // its first tick instead of waiting for the next daemon restart.
+      try {
+        const gw = await getGateway();
+        const sched = (gw as { cronScheduler?: { reloadJobs?: () => void } }).cronScheduler;
+        if (sched && typeof sched.reloadJobs === 'function') sched.reloadJobs();
+      } catch { /* best-effort */ }
+      res.json({ ok: true, schedule: entry });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: String(err) });
+    }
+  });
+
+  app.delete('/api/schedules/:skillName', async (req, res) => {
+    try {
+      const { removeSchedule } = await import('../agent/schedule-registry.js');
+      removeSchedule(req.params.skillName);
+      try {
+        const gw = await getGateway();
+        const sched = (gw as { cronScheduler?: { reloadJobs?: () => void } }).cronScheduler;
+        if (sched && typeof sched.reloadJobs === 'function') sched.reloadJobs();
+      } catch { /* best-effort */ }
+      // Broadcast so any open Tasks tabs drop the row immediately
+      // instead of waiting for the next refresh.
+      try { broadcastEvent({ type: 'cron_deleted', data: { job: req.params.skillName, source: 'scheduled-skill' } }); } catch { /* non-fatal */ }
+      res.json({ ok: true });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: String(err) });
+    }
+  });
+
   // ── Skill migration (legacy .md → folder/SKILL.md) ─────────────────
   // Two endpoints: per-skill and bulk. Both wrap migrateLegacySkill /
   // migrateAllLegacySkills from skill-store.ts. The original .md is
@@ -24593,6 +24679,17 @@ function renderScheduledTaskCard(task) {
   var badges = '';
   if (task.owner) badges += '<span class="badge badge-orange">' + esc(task.owner) + '</span>';
   if (task.category) badges += '<span class="badge badge-gray" title="Category">' + esc(task.category) + '</span>';
+  // 1.18.129 — source format badge. Scheduled skills are the new
+  // canonical format (Anthropic-pure: skill folder + thin schedule
+  // entry). Legacy CRON.md jobs carry their own prompt/tools/MCP and
+  // duplicate ~70% of skill schema; they keep working but new tasks
+  // should be skills.
+  var defObj = task.definition || {};
+  if (defObj.source === 'scheduled-skill') {
+    badges += '<span class="badge" style="background:rgba(124,58,237,0.18);color:var(--purple);font-weight:600" title="Scheduled skill — fires the named SKILL.md folder on this cadence. Click to open the skill.">SKILL</span>';
+  } else {
+    badges += '<span class="badge badge-gray" title="Legacy CRON.md job. Carries its own prompt/tools/MCP. Convert to a scheduled skill when you can.">LEGACY CRON</span>';
+  }
   if (task.predictable === true) badges += '<span class="badge badge-green" title="Contract mode — runs with only the prompt + pinned skills/tools. No MEMORY.md, no auto-matched skills, no team comms injection at fire-time.">🔒 predictable</span>';
   else if (task.predictable === false) badges += '<span class="badge badge-yellow" title="Dynamic mode — fire-time injects MEMORY.md, recent team activity, and auto-matched skills. Can drift from chat-time intent.">🔄 reads memory</span>';
   if (task.mode === 'unleashed') badges += '<span class="badge badge-purple">long-running</span>';
@@ -24646,12 +24743,107 @@ function renderScheduledTaskCard(task) {
     + renderTrickTagChips(task)
     + '<div class="task-card-badges">' + badges + '</div>'
     + '<div class="task-card-actions">'
-    + '<button class="btn-sm primary" onclick="openEditCronModal(\\x27' + safeName + '\\x27)" title="Edit task" style="background:var(--bg-tertiary);border:1px solid var(--border);color:var(--text-primary)">Edit</button>'
+    // 1.18.129 — SKILL-source tasks edit on the Skills page (the skill
+    // folder IS the source of truth); legacy CRON.md tasks keep the
+    // existing in-place editor.
+    + (defObj.source === 'scheduled-skill'
+        ? '<button class="btn-sm primary" onclick="navigateTo(\\x27skills\\x27, { skill: \\x27' + safeName + '\\x27 })" title="Edit this skill on the Skills page" style="background:var(--bg-tertiary);border:1px solid var(--border);color:var(--text-primary)">Edit skill</button>'
+        : '<button class="btn-sm primary" onclick="openEditCronModal(\\x27' + safeName + '\\x27)" title="Edit task" style="background:var(--bg-tertiary);border:1px solid var(--border);color:var(--text-primary)">Edit</button>')
     + runOrCancelBtn
     + '<button class="btn-sm secondary" onclick="openCronPreview(\\x27' + safeName + '\\x27)" title="See exactly what will run">Preview</button>'
     + '<button class="btn-sm secondary" data-trace-job="' + esc(task.name) + '" title="View execution trace">Trace</button>'
-    + '<button class="btn-sm secondary btn-danger" onclick="confirmDeleteCron(\\x27' + safeName + '\\x27)" title="Delete task">Del</button>'
+    + (defObj.source === 'scheduled-skill'
+        ? '<button class="btn-sm secondary btn-danger" onclick="unscheduleSkillFromCard(\\x27' + safeName + '\\x27)" title="Remove the schedule (skill stays)">Unschedule</button>'
+        : '<button class="btn-sm secondary btn-danger" onclick="confirmDeleteCron(\\x27' + safeName + '\\x27)" title="Delete task">Del</button>')
     + '</div></div>';
+}
+
+// 1.18.129 — replace the "+ New Task" tile with a small dropdown that
+// nudges users toward the new "schedule a skill" path. Legacy cron
+// option stays for backward compat / power users with hand-rolled
+// CRON.md jobs they want to keep editing.
+function renderNewTaskMenu() {
+  return ''
+    + '<div class="task-card-add" style="padding:14px;display:flex;flex-direction:column;align-items:stretch;gap:6px;cursor:default">'
+    +   '<button class="btn-primary" onclick="openSchedulePickerForNew()" style="font-size:12px;padding:9px 12px;border:none;border-radius:6px;background:var(--accent);color:#fff;font-weight:500;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:6px">'
+    +     '+ Schedule a skill'
+    +   '</button>'
+    +   '<button onclick="openCreateCronModal(getBuildCreateOwner())" style="font-size:11px;padding:5px 10px;border:none;border-radius:4px;background:transparent;color:var(--text-muted);cursor:pointer;text-align:center" title="Legacy CRON.md format — duplicates skill schema. Prefer Schedule a skill above unless you need fat-cron features.">use legacy cron format</button>'
+    + '</div>';
+}
+
+// 1.18.129 — entry from the Tasks page: pick a skill, then open the
+// schedule overlay pre-wired for that skill. Two-step: skill picker
+// first (small modal), then the existing schedule-overlay flow.
+async function openSchedulePickerForNew() {
+  // Fetch the skill catalog so users can scan + pick.
+  var skills = [];
+  try {
+    var r = await apiFetch('/api/skills');
+    var d = await r.json();
+    if (r.ok && Array.isArray(d.skills)) skills = d.skills;
+  } catch (_) { /* fall through to empty state */ }
+
+  var modal = document.getElementById('skill-picker-for-schedule-modal');
+  if (!modal) {
+    modal = document.createElement('div');
+    modal.id = 'skill-picker-for-schedule-modal';
+    modal.className = 'modal-overlay';
+    modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.45);display:none;align-items:center;justify-content:center;z-index:1000;padding:20px';
+    document.body.appendChild(modal);
+  }
+  var rows = '';
+  if (skills.length === 0) {
+    rows = '<div class="empty-state" style="padding:18px">No skills yet. Create one on the Skills page first, then come back to schedule it.</div>';
+  } else {
+    rows = skills.map(function(s) {
+      var fm = s.frontmatter || {};
+      var ext = fm.clementine || {};
+      var bodyLines = (s.body || '').split('\\n').length;
+      var useCount = typeof ext.useCount === 'number' ? ext.useCount : 0;
+      return ''
+        + '<div class="cap-picker-row" style="cursor:pointer" onclick="closeSkillPickerForSchedule(); openScheduleOverlayForSkill(\\x27' + jsStr(fm.name) + '\\x27, \\x27' + jsStr(ext.agentSlug || '') + '\\x27)">'
+        +   '<div class="cap-picker-row-body">'
+        +     '<div class="cap-picker-row-title">' + esc(fm.title || fm.name)
+        +       ' <span style="color:var(--text-muted);font-weight:normal;font-size:10px">' + esc(fm.name) + '</span>'
+        +     '</div>'
+        +     (fm.description ? '<div class="cap-picker-row-desc">' + esc(fm.description) + '</div>' : '')
+        +     '<div class="cap-picker-row-meta" style="display:flex;gap:10px;font-size:11px;color:var(--text-muted);margin-top:4px">'
+        +       '<span>' + bodyLines + ' lines</span>'
+        +       '<span>' + useCount + ' uses</span>'
+        +     '</div>'
+        +   '</div>'
+        + '</div>';
+    }).join('');
+  }
+  modal.innerHTML =
+    '<div style="background:var(--bg-primary);border:1px solid var(--border);border-radius:10px;width:min(640px,95vw);max-height:80vh;display:flex;flex-direction:column;box-shadow:0 16px 48px rgba(0,0,0,0.35)">'
+    +   '<div style="display:flex;align-items:center;justify-content:space-between;padding:14px 20px;border-bottom:1px solid var(--border)">'
+    +     '<h3 style="margin:0;font-size:15px;font-weight:600">Pick a skill to schedule</h3>'
+    +     '<button onclick="closeSkillPickerForSchedule()" style="background:none;border:none;font-size:18px;color:var(--text-muted);cursor:pointer">✕</button>'
+    +   '</div>'
+    +   '<div style="flex:1;overflow-y:auto;padding:6px 0">' + rows + '</div>'
+    + '</div>';
+  modal.style.display = 'flex';
+}
+
+function closeSkillPickerForSchedule() {
+  var m = document.getElementById('skill-picker-for-schedule-modal');
+  if (m) m.style.display = 'none';
+}
+
+// 1.18.129 — convenience: unschedule a skill directly from the Tasks
+// card without going through the schedule overlay.
+async function unscheduleSkillFromCard(skillName) {
+  if (!confirm('Unschedule "' + skillName + '"? The skill stays in the catalog — only the schedule is removed.')) return;
+  try {
+    var r = await apiFetch('/api/schedules/' + encodeURIComponent(skillName), { method: 'DELETE' });
+    if (!r.ok) { var d = await r.json(); toast(d.error || 'Failed', 'error'); return; }
+    toast('Unscheduled "' + skillName + '"', 'success');
+    if (typeof refreshCron === 'function') refreshCron();
+  } catch (err) {
+    toast('Failed: ' + err, 'error');
+  }
 }
 
 function renderScheduledWorkflowCard(wf) {
@@ -26141,11 +26333,11 @@ async function refreshCron() {
       } else {
         emptyLabel = ownerFilter === BUILD_OWNER_ALL ? 'No tasks across any agent.' : (ownerFilter ? 'No tasks for ' + ownerFilter + '.' : 'No tasks yet.');
       }
-      html += '<div class="task-card-add" onclick="openCreateCronModal(getBuildCreateOwner())">+ New Task</div>'
+      html += renderNewTaskMenu()
         + '<div class="empty-state" style="padding:18px;color:var(--text-muted);font-size:13px">' + esc(emptyLabel) + '</div>';
     } else {
       html += filteredTasks.map(renderScheduledTaskCard).join('');
-      html += '<div class="task-card-add" onclick="openCreateCronModal(getBuildCreateOwner())">+ New Task</div>';
+      html += renderNewTaskMenu();
     }
     html += '</div>';
 
@@ -27601,6 +27793,7 @@ async function showSkillDetail(name) {
     }
     detailEl.innerHTML = renderSkillDetail(d.skill);
     if (typeof loadSkillSuppressionState === 'function') loadSkillSuppressionState(name);
+    if (typeof loadSkillScheduleState === 'function') loadSkillScheduleState(name);
   } catch (e) {
     detailEl.innerHTML = '<div style="padding:24px;color:var(--red);font-size:12px">Error: ' + esc(String(e)) + '</div>';
   }
@@ -27643,6 +27836,253 @@ async function toggleSkillSuppression(skillName, scope, suppressed) {
       status.textContent = suppressed ? 'Suppressed globally — runtime auto-match will skip this skill.' : '';
     }
     toast(suppressed ? 'Suppressed "' + skillName + '"' : 'Un-suppressed "' + skillName + '"', 'success');
+  } catch (err) {
+    toast('Failed: ' + err, 'error');
+  }
+}
+
+// ── Skill schedule + Run now (1.18.129) ─────────────────────────────
+// The Anthropic-pure scheduling path: skills stay vanilla, schedules
+// live in ~/.clementine/schedules.json. This is the user's primary
+// surface for "this skill should fire on a cadence" — no cron modal.
+async function loadSkillScheduleState(skillName) {
+  var statusEl = document.getElementById('skill-schedule-status');
+  var btn = document.getElementById('skill-schedule-btn');
+  if (!statusEl) return;
+  try {
+    var r = await apiFetch('/api/schedules/' + encodeURIComponent(skillName));
+    if (r.status === 404) {
+      statusEl.textContent = 'Not scheduled — runs on demand.';
+      if (btn) btn.textContent = '⏰ Schedule';
+      return;
+    }
+    var d = await r.json();
+    if (!r.ok || !d.schedule) {
+      statusEl.textContent = 'Not scheduled — runs on demand.';
+      return;
+    }
+    var pretty = formatCronExpression ? formatCronExpression(d.schedule.schedule) : d.schedule.schedule;
+    statusEl.textContent = (d.schedule.enabled ? '✅ Scheduled — ' : '⏸ Paused — ') + pretty;
+    if (btn) btn.textContent = '⏰ Edit schedule';
+  } catch (err) {
+    statusEl.textContent = 'Schedule status unavailable.';
+  }
+}
+
+async function runSkillNow(skillName) {
+  // The /api/cron/run/:job endpoint also runs unscheduled skills — the
+  // CLI's cmdCronRun was extended in 1.18.129 to fall back to the skill
+  // catalog when the name doesn't match a registered cron job. So one
+  // endpoint handles both paths.
+  var btn = document.getElementById('skill-run-now-btn');
+  if (btn) { btn.disabled = true; btn.textContent = '⏳ Running…'; }
+  try {
+    var r = await apiFetch('/api/cron/run/' + encodeURIComponent(skillName), { method: 'POST' });
+    if (r.status === 409) {
+      toast('Already running. Wait for it to finish before firing again.', 'warn');
+      return;
+    }
+    var d = await r.json();
+    if (!r.ok) { toast(d.error || 'Run failed', 'error'); return; }
+    toast('Started "' + skillName + '" — output streams to chat.', 'success');
+  } catch (err) {
+    toast('Failed: ' + err, 'error');
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = '▶ Run now'; }
+  }
+}
+
+// Open the schedule overlay for a specific skill. The overlay is
+// pre-filled from the registry when a schedule already exists.
+async function openScheduleOverlayForSkill(skillName, agentSlug) {
+  var modal = document.getElementById('schedule-skill-modal');
+  if (!modal) {
+    modal = document.createElement('div');
+    modal.id = 'schedule-skill-modal';
+    modal.className = 'modal-overlay';
+    modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.45);display:none;align-items:center;justify-content:center;z-index:1000;padding:20px';
+    modal.innerHTML =
+      '<div style="background:var(--bg-primary);border:1px solid var(--border);border-radius:10px;width:min(540px,95vw);max-height:90vh;display:flex;flex-direction:column;box-shadow:0 16px 48px rgba(0,0,0,0.35)">'
+      +   '<div style="display:flex;align-items:center;justify-content:space-between;padding:14px 20px;border-bottom:1px solid var(--border)">'
+      +     '<h3 id="ssm-title" style="margin:0;font-size:15px;font-weight:600">Schedule a skill</h3>'
+      +     '<button onclick="closeScheduleSkillModal()" style="background:none;border:none;font-size:18px;color:var(--text-muted);cursor:pointer">✕</button>'
+      +   '</div>'
+      +   '<div style="flex:1;overflow-y:auto;padding:18px 22px">'
+      +     '<input type="hidden" id="ssm-skill-name">'
+      +     '<input type="hidden" id="ssm-agent-slug">'
+      +     '<div style="font-size:12px;color:var(--text-muted);margin-bottom:14px">Skill: <code id="ssm-skill-display" style="background:var(--bg-tertiary);padding:2px 6px;border-radius:3px;font-size:11px"></code></div>'
+      +     '<label style="display:block;font-size:12px;font-weight:500;color:var(--text-secondary);margin-bottom:6px">Schedule</label>'
+      +     '<div style="display:flex;gap:8px;align-items:center;margin-bottom:8px">'
+      +       '<select id="ssm-freq" onchange="ssmUpdateFromBuilder()" style="padding:7px 8px;font-size:12px;border:1px solid var(--border);border-radius:6px;background:var(--bg-secondary);color:var(--text-primary)">'
+      +         '<option value="daily">Every day</option>'
+      +         '<option value="weekdays">Weekdays (Mon–Fri)</option>'
+      +         '<option value="weekly">Weekly</option>'
+      +         '<option value="hourly">Every N hours</option>'
+      +         '<option value="minutes">Every N minutes</option>'
+      +       '</select>'
+      +       '<input type="number" id="ssm-interval" value="1" min="1" max="59" style="width:60px;padding:7px 8px;font-size:12px;border:1px solid var(--border);border-radius:6px;background:var(--bg-secondary);color:var(--text-primary);display:none" onchange="ssmUpdateFromBuilder()">'
+      +       '<select id="ssm-day" style="padding:7px 8px;font-size:12px;border:1px solid var(--border);border-radius:6px;background:var(--bg-secondary);color:var(--text-primary);display:none" onchange="ssmUpdateFromBuilder()">'
+      +         '<option value="1">Monday</option><option value="2">Tuesday</option><option value="3">Wednesday</option><option value="4">Thursday</option><option value="5">Friday</option><option value="6">Saturday</option><option value="0">Sunday</option>'
+      +       '</select>'
+      +       '<select id="ssm-hour" style="padding:7px 8px;font-size:12px;border:1px solid var(--border);border-radius:6px;background:var(--bg-secondary);color:var(--text-primary)" onchange="ssmUpdateFromBuilder()"></select>'
+      +       '<select id="ssm-minute" style="padding:7px 8px;font-size:12px;border:1px solid var(--border);border-radius:6px;background:var(--bg-secondary);color:var(--text-primary)" onchange="ssmUpdateFromBuilder()"></select>'
+      +     '</div>'
+      +     '<div style="font-size:11px;color:var(--text-muted);margin-bottom:14px">Cron: <code id="ssm-cron-preview" style="background:var(--bg-tertiary);padding:1px 5px;border-radius:3px"></code></div>'
+      +     '<label style="display:flex;align-items:center;gap:8px;font-size:12px;color:var(--text-secondary);cursor:pointer;margin-bottom:8px">'
+      +       '<input type="checkbox" id="ssm-enabled" checked> Enabled (uncheck to pause without losing the schedule)'
+      +     '</label>'
+      +     '<div id="ssm-error" style="display:none;color:var(--red);font-size:12px;margin-top:10px;padding:8px 10px;background:rgba(239,68,68,0.08);border:1px solid var(--red);border-radius:6px"></div>'
+      +   '</div>'
+      +   '<div style="display:flex;justify-content:space-between;gap:8px;padding:14px 20px;border-top:1px solid var(--border);background:var(--bg-secondary)">'
+      +     '<button id="ssm-unschedule" onclick="unscheduleSkillFromOverlay()" style="padding:7px 14px;font-size:12px;border:1px solid var(--red);border-radius:6px;background:transparent;color:var(--red);cursor:pointer;display:none">Unschedule</button>'
+      +     '<div style="flex:1"></div>'
+      +     '<button onclick="closeScheduleSkillModal()" style="padding:7px 14px;font-size:13px;border:1px solid var(--border);border-radius:6px;background:transparent;color:var(--text-primary);cursor:pointer">Cancel</button>'
+      +     '<button id="ssm-save" onclick="saveScheduleFromOverlay()" class="btn-primary" style="padding:7px 16px;font-size:13px;border:none;border-radius:6px;background:var(--accent);color:#fff;font-weight:500;cursor:pointer">Save</button>'
+      +   '</div>'
+      + '</div>';
+    document.body.appendChild(modal);
+    // Populate hour + minute dropdowns once.
+    var hourSel = document.getElementById('ssm-hour');
+    for (var h = 0; h < 24; h++) {
+      var opt = document.createElement('option');
+      opt.value = String(h);
+      var hh = h === 0 ? 12 : h > 12 ? h - 12 : h;
+      var ampm = h < 12 ? 'AM' : 'PM';
+      opt.textContent = hh + ':00 ' + ampm;
+      if (h === 9) opt.selected = true;
+      hourSel.appendChild(opt);
+    }
+    var minSel = document.getElementById('ssm-minute');
+    [0, 15, 30, 45].forEach(function(m) {
+      var opt = document.createElement('option');
+      opt.value = String(m);
+      opt.textContent = ':' + (m < 10 ? '0' + m : m);
+      minSel.appendChild(opt);
+    });
+  }
+  document.getElementById('ssm-skill-name').value = skillName;
+  document.getElementById('ssm-agent-slug').value = agentSlug || '';
+  document.getElementById('ssm-skill-display').textContent = skillName;
+  // Try to load existing schedule.
+  var existing = null;
+  try {
+    var r = await apiFetch('/api/schedules/' + encodeURIComponent(skillName));
+    if (r.ok) { var d = await r.json(); existing = d.schedule; }
+  } catch (_) { /* not scheduled */ }
+  document.getElementById('ssm-title').textContent = existing ? 'Edit schedule: ' + skillName : 'Schedule: ' + skillName;
+  document.getElementById('ssm-unschedule').style.display = existing ? '' : 'none';
+  document.getElementById('ssm-enabled').checked = existing ? existing.enabled !== false : true;
+  // Default to daily 9am for new entries; round-trip the cron expr if editing.
+  if (existing && existing.schedule) {
+    ssmInferBuilderFromCron(existing.schedule);
+  } else {
+    document.getElementById('ssm-freq').value = 'daily';
+    document.getElementById('ssm-hour').value = '9';
+    document.getElementById('ssm-minute').value = '0';
+    ssmUpdateFromBuilder();
+  }
+  document.getElementById('ssm-error').style.display = 'none';
+  modal.style.display = 'flex';
+}
+
+function closeScheduleSkillModal() {
+  var m = document.getElementById('schedule-skill-modal');
+  if (m) m.style.display = 'none';
+}
+
+// Build a cron expression from the picker fields. Mirrors the existing
+// schedule-builder in the cron modal but kept self-contained here so
+// the overlay doesn't depend on the cron-modal DOM existing.
+function ssmUpdateFromBuilder() {
+  var freq = document.getElementById('ssm-freq').value;
+  var hour = document.getElementById('ssm-hour').value || '9';
+  var minute = document.getElementById('ssm-minute').value || '0';
+  var day = document.getElementById('ssm-day').value || '1';
+  var interval = document.getElementById('ssm-interval').value || '1';
+  document.getElementById('ssm-day').style.display = freq === 'weekly' ? '' : 'none';
+  document.getElementById('ssm-interval').style.display = (freq === 'hourly' || freq === 'minutes') ? '' : 'none';
+  document.getElementById('ssm-hour').style.display = (freq === 'minutes' || freq === 'hourly') ? 'none' : '';
+  document.getElementById('ssm-minute').style.display = freq === 'minutes' ? 'none' : '';
+  var cron = '';
+  switch (freq) {
+    case 'daily':    cron = minute + ' ' + hour + ' * * *'; break;
+    case 'weekdays': cron = minute + ' ' + hour + ' * * 1-5'; break;
+    case 'weekly':   cron = minute + ' ' + hour + ' * * ' + day; break;
+    case 'hourly':   cron = '0 */' + interval + ' * * *'; break;
+    case 'minutes':  cron = '*/' + interval + ' * * * *'; break;
+  }
+  document.getElementById('ssm-cron-preview').textContent = cron;
+}
+
+// Best-effort reverse: given a cron expr, set the picker fields to a
+// sensible default. Falls back to "daily 9am" if we can't infer.
+function ssmInferBuilderFromCron(cron) {
+  var parts = (cron || '').trim().split(/\\s+/);
+  if (parts.length !== 5) { document.getElementById('ssm-freq').value = 'daily'; ssmUpdateFromBuilder(); return; }
+  var minute = parts[0], hour = parts[1], dow = parts[4];
+  if (minute.indexOf('*/') === 0) {
+    document.getElementById('ssm-freq').value = 'minutes';
+    document.getElementById('ssm-interval').value = minute.slice(2);
+  } else if (hour.indexOf('*/') === 0) {
+    document.getElementById('ssm-freq').value = 'hourly';
+    document.getElementById('ssm-interval').value = hour.slice(2);
+  } else if (dow === '1-5') {
+    document.getElementById('ssm-freq').value = 'weekdays';
+    document.getElementById('ssm-hour').value = hour;
+    document.getElementById('ssm-minute').value = minute;
+  } else if (dow !== '*' && /^[0-6]$/.test(dow)) {
+    document.getElementById('ssm-freq').value = 'weekly';
+    document.getElementById('ssm-day').value = dow;
+    document.getElementById('ssm-hour').value = hour;
+    document.getElementById('ssm-minute').value = minute;
+  } else {
+    document.getElementById('ssm-freq').value = 'daily';
+    document.getElementById('ssm-hour').value = hour;
+    document.getElementById('ssm-minute').value = minute;
+  }
+  ssmUpdateFromBuilder();
+}
+
+async function saveScheduleFromOverlay() {
+  var skillName = document.getElementById('ssm-skill-name').value;
+  var agentSlug = document.getElementById('ssm-agent-slug').value;
+  var schedule = document.getElementById('ssm-cron-preview').textContent;
+  var enabled = document.getElementById('ssm-enabled').checked;
+  var errEl = document.getElementById('ssm-error');
+  var saveBtn = document.getElementById('ssm-save');
+  if (saveBtn) { saveBtn.disabled = true; saveBtn.textContent = 'Saving…'; }
+  try {
+    var r = await apiFetch('/api/schedules/' + encodeURIComponent(skillName), {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ schedule: schedule, enabled: enabled, agentSlug: agentSlug || null }),
+    });
+    var d = await r.json();
+    if (!r.ok) {
+      if (errEl) { errEl.textContent = d.error || ('HTTP ' + r.status); errEl.style.display = ''; }
+      return;
+    }
+    closeScheduleSkillModal();
+    toast('Saved schedule for "' + skillName + '"', 'success');
+    if (typeof loadSkillScheduleState === 'function') loadSkillScheduleState(skillName);
+    if (currentPage === 'build' && typeof refreshCron === 'function') refreshCron();
+  } catch (err) {
+    if (errEl) { errEl.textContent = String(err); errEl.style.display = ''; }
+  } finally {
+    if (saveBtn) { saveBtn.disabled = false; saveBtn.textContent = 'Save'; }
+  }
+}
+
+async function unscheduleSkillFromOverlay() {
+  var skillName = document.getElementById('ssm-skill-name').value;
+  if (!confirm('Unschedule "' + skillName + '"? The skill stays — only the schedule is removed.')) return;
+  try {
+    var r = await apiFetch('/api/schedules/' + encodeURIComponent(skillName), { method: 'DELETE' });
+    if (!r.ok) { var d = await r.json(); toast(d.error || 'Failed', 'error'); return; }
+    closeScheduleSkillModal();
+    toast('Unscheduled "' + skillName + '"', 'success');
+    if (typeof loadSkillScheduleState === 'function') loadSkillScheduleState(skillName);
+    if (currentPage === 'build' && typeof refreshCron === 'function') refreshCron();
   } catch (err) {
     toast('Failed: ' + err, 'error');
   }
@@ -27699,6 +28139,20 @@ function renderSkillDetail(s) {
   html += '<input type="checkbox" id="skill-suppress-global" onchange="toggleSkillSuppression(\\x27' + jsStr(fm.name) + '\\x27, \\x27global\\x27, this.checked)"> globally';
   html += '</label>';
   html += '<span id="skill-suppress-status" style="font-size:11px;color:var(--text-muted);margin-left:auto"></span>';
+  html += '</div>';
+
+  // 1.18.129 — Schedule + Run-now action row. Architectural shift:
+  // skills can be invoked on demand (Run now) OR fired on a schedule
+  // (the registry maps {skill → cron expr}). Replaces the "create a
+  // cron task and pin this skill" indirection. The exact schedule
+  // state (scheduled? when?) is loaded async after the pane mounts.
+  html += '<div id="skill-schedule-row" data-skill="' + esc(fm.name) + '" style="margin-top:10px;padding:12px 14px;background:var(--bg-secondary);border:1px solid var(--border);border-radius:6px;display:flex;align-items:center;gap:10px;flex-wrap:wrap">';
+  html += '<div style="flex:1;min-width:200px">';
+  html += '<div style="font-size:12px;font-weight:500;color:var(--text-primary);margin-bottom:2px">Run this skill</div>';
+  html += '<div id="skill-schedule-status" style="font-size:11px;color:var(--text-muted)">Loading schedule…</div>';
+  html += '</div>';
+  html += '<button class="btn-sm btn-primary" id="skill-run-now-btn" onclick="runSkillNow(\\x27' + jsStr(fm.name) + '\\x27)" style="font-size:11px;padding:6px 12px;display:inline-flex;align-items:center;gap:6px" title="Fire this skill once, right now">▶ Run now</button>';
+  html += '<button class="btn-sm" id="skill-schedule-btn" onclick="openScheduleOverlayForSkill(\\x27' + jsStr(fm.name) + '\\x27, \\x27' + jsStr(s.frontmatter.clementine?.agentSlug ?? '') + '\\x27)" style="font-size:11px;padding:6px 12px" title="Schedule this skill to run automatically">⏰ Schedule</button>';
   html += '</div>';
   html += '</div>';
 
