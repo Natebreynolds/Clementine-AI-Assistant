@@ -104,12 +104,17 @@ export function discoverMcpServers(): ManagedMcpServer[] {
   } catch { /* ignore */ }
 
   // 2. Claude Code settings — project-level MCP configs
-  try {
-    const claudeDir = path.join(os.homedir(), '.claude');
-    const settingsFile = path.join(claudeDir, 'settings.json');
-    if (existsSync(settingsFile)) {
-      const settings = JSON.parse(readFileSync(settingsFile, 'utf-8'));
-      // Check mcpServers in settings
+  //    Two files to check: ~/.claude/settings.json (newer; user-edited)
+  //    and ~/.claude.json (where `claude mcp add` writes by default).
+  //    Both surface mcpServers; we read both so users get the same set
+  //    that Claude Code sees.
+  for (const claudeFile of [
+    path.join(os.homedir(), '.claude', 'settings.json'),
+    path.join(os.homedir(), '.claude.json'),
+  ]) {
+    try {
+      if (!existsSync(claudeFile)) continue;
+      const settings = JSON.parse(readFileSync(claudeFile, 'utf-8'));
       for (const [name, config] of Object.entries(settings.mcpServers ?? {})) {
         if (servers.has(name)) continue;
         const cfg = config as any;
@@ -126,8 +131,8 @@ export function discoverMcpServers(): ManagedMcpServer[] {
           source: 'auto-detected',
         });
       }
-    }
-  } catch { /* ignore */ }
+    } catch { /* skip malformed file */ }
+  }
 
   // 3. Claude Desktop Extensions (newer format — ant.dir.* directories)
   try {
