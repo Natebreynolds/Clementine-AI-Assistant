@@ -31,7 +31,7 @@ import type { Gateway } from '../gateway/router.js';
 import { TunnelManager } from './tunnel.js';
 import type { RemoteAccessConfig, SessionRecord, WorkflowDefinition } from '../types.js';
 import { AgentManager } from '../agent/agent-manager.js';
-import { discoverMcpServers, getClaudeIntegrations } from '../agent/mcp-bridge.js';
+import { discoverMcpServers, getClaudeIntegrations, KNOWN_MCP_DESCRIPTIONS } from '../agent/mcp-bridge.js';
 import { buildBuilderEnrichedMessage, builderSessionKey } from '../dashboard/builder/prompt.js';
 import {
   AGENTS_DIR,
@@ -908,71 +908,24 @@ function getApiConnectionStatus(): Record<string, boolean> {
   };
 }
 
-const MCP_SERVER_DESCRIPTIONS: Record<string, string> = {
-  'dataforseo': 'SEO data, keyword research, SERP analysis',
-  'supabase': 'Supabase database and auth',
-  'Bright Data': 'Web scraping and data collection',
-  'browsermcp': 'Browser automation via MCP',
-  'ElevenLabs': 'Voice synthesis, text-to-speech, audio AI',
-  'apify': 'Web scraping actors and automation',
-  'vapi': 'Voice AI phone calls and assistants',
-  'kernel': 'Kernel browser automation',
-  'playwright': 'Browser testing and automation',
-  'context7': 'Library documentation lookup',
-  'firecrawl': 'Web crawling and scraping',
-  'exa': 'Neural web search',
-  'linear': 'Linear issue tracking',
-  'discord': 'Discord bot integration',
-  'gitlab': 'GitLab repository management',
-  'greptile': 'Codebase search and understanding',
-  'serena': 'Code-aware AI assistant',
-  'terraform': 'Infrastructure as code management',
-};
-
+/**
+ * Surface global MCP servers for the Tools & MCP catalog.
+ *
+ * 1.18.138 — collapsed onto `discoverMcpServers` from mcp-bridge so the
+ * dashboard's view exactly matches what chat actually has access to. The
+ * old standalone walker (with its own description table + Claude Code
+ * `enabledPlugins` enumeration) was misleading: those plugins live inside
+ * Claude Code itself and Clementine cannot launch them, so listing them as
+ * "available tools" was a UX bug. Now the same source-of-truth feeds both
+ * surfaces — KNOWN_MCP_DESCRIPTIONS in mcp-bridge.ts owns the labels.
+ */
 function discoverGlobalMcpServers(): ToolEntry[] {
-  const servers: ToolEntry[] = [];
-  const seen = new Set<string>();
-
-  // 1. Claude Desktop config
-  const desktopConfig = path.join(os.homedir(), 'Library', 'Application Support', 'Claude', 'claude_desktop_config.json');
-  try {
-    if (existsSync(desktopConfig)) {
-      const data = JSON.parse(readFileSync(desktopConfig, 'utf-8'));
-      for (const name of Object.keys(data.mcpServers ?? {})) {
-        if (seen.has(name.toLowerCase())) continue;
-        seen.add(name.toLowerCase());
-        servers.push({
-          name,
-          description: MCP_SERVER_DESCRIPTIONS[name] ?? `${name} MCP server`,
-          type: 'global-mcp',
-          connected: true,
-        });
-      }
-    }
-  } catch { /* ignore */ }
-
-  // 2. Claude Code enabled plugins (from settings.json)
-  try {
-    const settingsFile = path.join(os.homedir(), '.claude', 'settings.json');
-    if (existsSync(settingsFile)) {
-      const settings = JSON.parse(readFileSync(settingsFile, 'utf-8'));
-      const plugins = settings.enabledPlugins ?? {};
-      for (const [key, enabled] of Object.entries(plugins)) {
-        if (!enabled) continue;
-        const pluginName = key.split('@')[0];
-        if (seen.has(pluginName.toLowerCase())) continue;
-        seen.add(pluginName.toLowerCase());
-        servers.push({
-          name: pluginName,
-          description: MCP_SERVER_DESCRIPTIONS[pluginName] ?? `${pluginName} plugin`,
-          type: 'global-mcp',
-          connected: true,
-        });
-      }
-    }
-  } catch { /* ignore */ }
-
-  return servers;
+  return discoverMcpServers().map(s => ({
+    name: s.name,
+    description: s.description ?? KNOWN_MCP_DESCRIPTIONS[s.name] ?? `${s.name} MCP server`,
+    type: 'global-mcp',
+    connected: s.enabled !== false,
+  }));
 }
 
 // ── Metrics computation ──────────────────────────────────────────────

@@ -26,8 +26,13 @@ const INTEGRATIONS_FILE = path.join(BASE_DIR, 'claude-integrations.json');
 const CACHE_TTL_MS = 60_000; // 60s cache
 
 // ── Known server descriptions ───────────────────────────────────────
+//
+// Single source of truth for MCP server descriptions. Exported so the
+// dashboard, builder UI, and any other surface that wants a friendly
+// label for a known server name can pull from one place — keeps chat
+// and dashboard aligned.
 
-const KNOWN_DESCRIPTIONS: Record<string, string> = {
+export const KNOWN_MCP_DESCRIPTIONS: Record<string, string> = {
   slack: 'Slack workspace messaging and channels',
   linear: 'Linear issue tracking and project management',
   notion: 'Notion workspace — pages, databases, search',
@@ -50,7 +55,11 @@ const KNOWN_DESCRIPTIONS: Record<string, string> = {
   discord: 'Discord bot integration',
   imessage: 'iMessage — read and send messages on macOS',
   figma: 'Figma design files — read, inspect, and export',
+  serena: 'Code-aware AI assistant',
 };
+
+// Internal alias kept so the existing read sites in this file keep working.
+const KNOWN_DESCRIPTIONS = KNOWN_MCP_DESCRIPTIONS;
 
 // ── Cache ────────────────────────────────────────────────────────────
 
