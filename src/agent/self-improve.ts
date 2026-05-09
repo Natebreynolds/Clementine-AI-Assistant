@@ -66,7 +66,7 @@ const DEFAULT_CONFIG: SelfImproveConfig = {
   // 'prompt-override' writes markdown to ~/.clementine/prompt-overrides/.
   areas: [
     'soul', 'cron', 'workflow', 'memory', 'agent', 'communication', 'goal',
-    'advisor-rule', 'prompt-override',
+    'advisor-rule', 'prompt-override', 'skill',
   ],
   autoApply: true,
   sourceMode: 'skip',
@@ -219,6 +219,13 @@ function classifyRisk(area: string): RiskTier {
     case 'workflow':         return 'low';
     case 'advisor-rule':     return 'low';    // YAML files, hot-reloaded, easily deleted
     case 'prompt-override':  return 'low';    // Markdown files, hot-reloaded, easily deleted
+    // 1.18.136 — 'skill' is the new first-class self-improve target.
+    // Skills are user-facing recipes that fire across many tasks; a
+    // bad change can cascade into every cron that pins them. Medium
+    // tier so changes always surface for owner approval, never auto-
+    // apply. Frontmatter + Anthropic spec are validated before any
+    // proposal can even reach the queue (see validateProposal).
+    case 'skill':            return 'medium';
     case 'soul':             return 'medium'; // Core personality — needs approval
     case 'communication':    return 'medium'; // Global operating instructions
     case 'memory':           return 'medium'; // Memory config
@@ -1372,7 +1379,11 @@ export class SelfImproveLoop {
       `User rules at priority 100+ override engine builtins of the same id.\n` +
       `- For "prompt-override": target = "global", "agent:<slug>", or "job:<jobName>" (e.g. "job:daily-summary"). ` +
       `Use when a job/agent needs more standing guidance — markdown that gets prepended to its prompt. ` +
-      `The proposedChange is the markdown body (optionally with gray-matter frontmatter for priority/position).\n\n` +
+      `The proposedChange is the markdown body (optionally with gray-matter frontmatter for priority/position).\n` +
+      `- For "skill": target = the exact skill slug (matches Anthropic regex ^[a-z0-9][a-z0-9-]{0,63}$, e.g. "morning-briefing"). ` +
+      `Use when a skill is producing low-quality output, has a high failure rate, OR is stale (>90 days unused but still pinned to a cron). ` +
+      `Surface candidates: skills with low clementine.useCount + recent run failures, OR skills whose linked cron jobs appear in the failing-jobs list above. ` +
+      `The proposedChange must be the FULL SKILL.md (frontmatter + body): preserve the "name" field exactly, keep "description" ≤1024 chars and free of XML tags, body changes only — Clementine will preserve the clementine.useCount/createdAt/version block on save so do NOT include or alter that block.\n\n` +
       `Return your answer as a JSON object matching the schema: { "results": [ ... ] }. Up to 3 items. If absolutely nothing actionable today, return { "results": [] }.`;
 
     const analysisResult = await this.assistant.runPlanStep('si-analyze', analysisPrompt, {
@@ -1444,7 +1455,11 @@ export class SelfImproveLoop {
       `- Generate a SPECIFIC, MINIMAL change (not a full rewrite)\n` +
       `- Explain WHY this change should improve the metric\n` +
       `- IMPORTANT: "proposedChange" must be the COMPLETE updated file content (not just the diff), because it will replace the entire file\n` +
-      `- For source code changes: preserve all imports, exports, and function signatures. Only modify implementation details.\n\n` +
+      `- For source code changes: preserve all imports, exports, and function signatures. Only modify implementation details.\n` +
+      (selected.area === 'skill'
+        ? `- For skill changes: keep the frontmatter "name" and "description" intact (description ≤1024 chars, no XML tags). Modify the BODY (procedure section after the frontmatter). Do NOT include or alter the "clementine:" frontmatter block — Clementine preserves useCount/createdAt/version automatically on save.\n`
+        : '') +
+      `\n` +
       `Output ONLY a JSON object (no markdown, no explanation):\n` +
       `{ "area": "${selected.area}", "target": "${selected.target}", "hypothesis": "what will improve and why", "proposedChange": "the complete updated file content with your minimal change applied" }`;
 
@@ -1470,6 +1485,18 @@ export class SelfImproveLoop {
         return existsSync(SOUL_FILE) ? readFileSync(SOUL_FILE, 'utf-8') : '';
       case 'cron':
         return existsSync(CRON_FILE) ? readFileSync(CRON_FILE, 'utf-8') : '';
+      case 'skill': {
+        // 1.18.136 — read SKILL.md from the folder-form path. Fall back
+        // to the flat-form (legacy) path if no folder. The hypothesizer
+        // proposes against the BODY only — frontmatter is preserved on
+        // write by validateProposal + writeSkill (see resolveTargetPath
+        // / applyApprovedChange below).
+        const folderEntry = path.join(VAULT_DIR, '00-System', 'skills', target, 'SKILL.md');
+        const flatEntry = path.join(VAULT_DIR, '00-System', 'skills', target + '.md');
+        if (existsSync(folderEntry)) return readFileSync(folderEntry, 'utf-8');
+        if (existsSync(flatEntry)) return readFileSync(flatEntry, 'utf-8');
+        return '';
+      }
       case 'workflow': {
         const wfFile = path.join(WORKFLOWS_DIR, target.endsWith('.md') ? target : `${target}.md`);
         return existsSync(wfFile) ? readFileSync(wfFile, 'utf-8') : '';
@@ -1652,6 +1679,67 @@ export class SelfImproveLoop {
       const drift = checkDrift(pending.proposedChange);
       if (!drift.ok) {
         return `Cannot apply change — identity drift too high (similarity: ${drift.similarity.toFixed(3)}, threshold: ${DRIFT_SIMILARITY_THRESHOLD})`;
+      }
+    }
+
+    // Skill area: merge proposed frontmatter with existing clementine.*
+    // lifecycle block so an LLM-authored proposal doesn't clobber
+    // useCount / createdAt / version. The proposal supplies the new
+    // name/description/body; the lifecycle metadata stays Clementine's
+    // responsibility. This sits between validation and the generic
+    // writeFileSync below so every other area still writes raw.
+    if (pending.area === 'skill') {
+      try {
+        const proposed = matter(pending.proposedChange);
+        const existing = pending.before ? matter(pending.before) : null;
+        const proposedFm = (proposed.data ?? {}) as Record<string, unknown>;
+        const existingFm = (existing?.data ?? {}) as Record<string, unknown>;
+        const existingExt = (existingFm.clementine ?? {}) as Record<string, unknown>;
+        const proposedExt = (proposedFm.clementine ?? {}) as Record<string, unknown>;
+
+        const now = new Date().toISOString();
+        const mergedExt: Record<string, unknown> = {
+          ...existingExt,
+          // Allow proposal to update tools.allow / triggers / source if it
+          // explicitly sets them, but preserve lifecycle counters from
+          // the existing record.
+          ...proposedExt,
+          useCount: existingExt.useCount ?? 0,
+          createdAt: existingExt.createdAt ?? now,
+          updatedAt: now,
+          version: typeof existingExt.version === 'number' ? existingExt.version + 1 : 1,
+          lastSelfImproveExperimentId: experimentId,
+        };
+        const mergedFm: Record<string, unknown> = {
+          name: proposedFm.name ?? existingFm.name,
+          description: proposedFm.description ?? existingFm.description,
+          ...(proposedFm.title || existingFm.title ? { title: proposedFm.title ?? existingFm.title } : {}),
+          clementine: mergedExt,
+        };
+        const body = proposed.content.endsWith('\n') ? proposed.content : proposed.content + '\n';
+        const merged = matter.stringify(body, mergedFm);
+        mkdirSync(path.dirname(targetPath), { recursive: true });
+        writeFileSync(targetPath, merged);
+        // Record version + finish the standard apply flow below.
+        this.recordVersion(experimentId, pending.area, pending.target, pending.hypothesis, pending.before);
+        logger.info({ id: experimentId, area: pending.area, target: pending.target }, 'Applied approved skill change (lifecycle preserved)');
+        this.updateExperimentStatus(experimentId, 'approved');
+        try { unlinkSync(pendingFile); } catch { /* ignore */ }
+        const stateAfter = this.loadState();
+        stateAfter.pendingApprovals = Math.max(0, stateAfter.pendingApprovals - 1);
+        this.saveState(stateAfter);
+        try {
+          appendFileSync(IMPACT_CHECKS_FILE, JSON.stringify({
+            experimentId,
+            area: pending.area,
+            target: pending.target,
+            appliedAt: new Date().toISOString(),
+            checkAfterMs: 24 * 60 * 60 * 1000,
+          }) + '\n');
+        } catch { /* ignore impact-check schedule errors */ }
+        return `Applied skill change to ${path.relative(VAULT_DIR, targetPath)} (useCount preserved, version bumped)`;
+      } catch (err) {
+        return `Cannot apply skill change — frontmatter merge failed: ${err instanceof Error ? err.message : String(err)}`;
       }
     }
 
@@ -2352,6 +2440,19 @@ export class SelfImproveLoop {
         return SOUL_FILE;
       case 'cron':
         return CRON_FILE;
+      case 'skill': {
+        // 1.18.136 — skill changes route through writeSkill (not raw
+        // writeFileSync) so frontmatter validation runs and the existing
+        // useCount/lastUsed/createdAt are preserved. The intercept lives
+        // in applyApprovedChange below; this still returns the canonical
+        // path so the version recorder + impact-check writer have
+        // something to anchor on.
+        const folderEntry = path.join(VAULT_DIR, '00-System', 'skills', target, 'SKILL.md');
+        const flatEntry = path.join(VAULT_DIR, '00-System', 'skills', target + '.md');
+        if (existsSync(folderEntry)) return folderEntry;
+        if (existsSync(flatEntry)) return flatEntry;
+        return null;
+      }
       case 'workflow': {
         const name = target.endsWith('.md') ? target : `${target}.md`;
         return path.join(WORKFLOWS_DIR, name);
@@ -2455,6 +2556,51 @@ export function validateProposal(area: string, target: string, proposedChange: s
     // Deprecated — Phase 1 quarantined source self-edit. Reject up front so
     // a misbehaving LLM proposal doesn't even get cached.
     return { valid: false, error: 'source area is deprecated; propose advisor-rule or prompt-override instead' };
+  }
+  if (area === 'skill') {
+    // 1.18.136 — skill body validation. The proposedChange is the FULL
+    // SKILL.md (frontmatter + body). Anthropic spec rules: name must
+    // match ^[a-z0-9][a-z0-9-]{0,63}$, description ≤1024 chars, body
+    // present + non-empty, no XML tags in description, no Anthropic-
+    // reserved words in name. Reuses the centralized validator that
+    // dashboard + MCP + auto-extract all share.
+    if (!/^[a-z0-9][a-z0-9-]{0,63}$/.test(target)) {
+      return { valid: false, error: `skill target must be a valid slug (got "${target}")` };
+    }
+    let parsed: ReturnType<typeof matter>;
+    try {
+      parsed = matter(proposedChange);
+    } catch (err) {
+      return { valid: false, error: `skill SKILL.md frontmatter parse error: ${err instanceof Error ? err.message : String(err)}` };
+    }
+    const fm = parsed.data as Record<string, unknown>;
+    const name = typeof fm.name === 'string' ? fm.name : '';
+    const description = typeof fm.description === 'string' ? fm.description : '';
+    const body = parsed.content || '';
+    if (!name || !/^[a-z0-9][a-z0-9-]{0,63}$/.test(name)) {
+      return { valid: false, error: 'skill frontmatter "name" missing or invalid slug' };
+    }
+    if (name !== target) {
+      return { valid: false, error: `skill frontmatter "name" (${name}) must match target slug (${target})` };
+    }
+    if (/\b(anthropic|claude)\b/i.test(name)) {
+      return { valid: false, error: 'skill name uses a reserved word (anthropic/claude)' };
+    }
+    if (!description.trim()) {
+      return { valid: false, error: 'skill frontmatter "description" required' };
+    }
+    if (description.length > 1024) {
+      return { valid: false, error: `skill description ${description.length} chars exceeds Anthropic spec ceiling of 1024` };
+    }
+    if (/<\w+/.test(description)) {
+      return { valid: false, error: 'skill description must not contain XML tags' };
+    }
+    if (!body.trim()) {
+      return { valid: false, error: 'skill body (procedure) required' };
+    }
+    // Body line count is a SOFT limit (warning, not error) — keeps
+    // validation strict but doesn't block proposals that legitimately
+    // need more lines.
   }
   if (area === 'advisor-rule') {
     // Must parse as YAML and have schemaVersion: 1, id matching target, when[], then[].
