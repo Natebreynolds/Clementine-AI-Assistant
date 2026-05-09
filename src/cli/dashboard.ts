@@ -19457,10 +19457,15 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
         <div class="tab-pane" id="tab-intelligence-learning">
           <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;gap:12px;flex-wrap:wrap">
             <div style="font-size:13px;color:var(--text-secondary);max-width:680px">
-              Self-improvement runs nightly at 1 AM. The autonomous loop also auto-fixes failing crons (3+ consecutive errors) and verifies each fix over the next 3 runs &mdash; reverting automatically if it doesn't help.
+              Karpathy-style autoresearch loop. Hypothesizes improvements to SOUL, prompts, crons; evaluates each with a blended score (LLM &times; 0.7 + objective &times; 0.3). Fires nightly at <strong id="si-schedule-hour">3 AM</strong> (override via SELF_IMPROVE_HOUR env). The auto-fix consumer also handles failing crons (3+ consecutive errors) and verifies each fix over the next 3 runs &mdash; reverting automatically if it doesn't help.
             </div>
             <button class="btn-sm btn-primary" onclick="siRunCycle()" id="si-run-btn">Run Now</button>
           </div>
+          <!-- 1.18.135 — last-diagnostic banner. Surfaces the loop's
+               own self-report ("Plateau: no novel improvement area remaining"
+               etc.) so the user knows WHY recent runs were quiet without
+               digging into state.json. -->
+          <div id="si-diagnostic-banner" style="display:none;margin-bottom:12px;padding:10px 14px;border-radius:6px;font-size:12px"></div>
           <div class="grid-2" id="si-status-cards">
             <div class="skel-block"><div class="skel-row med"></div><div class="skel-row short"></div></div>
             <div class="skel-block"><div class="skel-row med"></div><div class="skel-row short"></div></div>
@@ -39879,17 +39884,61 @@ async function refreshSelfImprove() {
       }
     }
 
+    // 1.18.135 — diagnostic banner. Shows the loop's own last self-report
+    // (plateau, cooldown, infra error). Color-coded so the user can tell
+    // at a glance whether the silence is intentional ("plateau, no fresh
+    // signal") vs broken ("infra error, in 24h cooldown").
+    const diagEl = document.getElementById('si-diagnostic-banner');
+    if (diagEl) {
+      const diag = state && state.lastDiagnostic ? String(state.lastDiagnostic) : '';
+      const infra = state && state.infraError ? state.infraError : null;
+      if (infra) {
+        diagEl.style.display = '';
+        diagEl.style.background = 'rgba(239,68,68,0.08)';
+        diagEl.style.border = '1px solid var(--red)';
+        diagEl.style.color = 'var(--text-primary)';
+        diagEl.innerHTML = '<strong style="color:var(--red)">⚠ Infrastructure error</strong> &middot; ' + esc(infra.diagnostic || infra.category || 'unknown') + ' &middot; in 24h cooldown until ' + (infra.cooldownUntil ? new Date(infra.cooldownUntil).toLocaleString() : 'next probe');
+      } else if (diag) {
+        diagEl.style.display = '';
+        const isPlateau = /plateau/i.test(diag);
+        diagEl.style.background = isPlateau ? 'rgba(245,158,11,0.08)' : 'var(--bg-tertiary)';
+        diagEl.style.border = isPlateau ? '1px solid var(--yellow)' : '1px solid var(--border)';
+        diagEl.style.color = 'var(--text-secondary)';
+        diagEl.innerHTML = (isPlateau ? '<strong style="color:var(--yellow)">⏸ Last run note:</strong> ' : '<strong>Last run note:</strong> ') + esc(diag);
+      } else {
+        diagEl.style.display = 'none';
+      }
+    }
+
     // Status cards
     const cards = document.getElementById('si-status-cards');
     if (cards && state) {
       const m = state.baselineMetrics || {};
+      // 1.18.135 — show the blended objective signal (cronSuccessRate ×
+      // feedbackPositiveRatio) explicitly so the user sees the floor that
+      // every LLM-rated proposal is now multiplied against (1.18.134).
+      const objectiveScore = (m.cronSuccessRate || 0) * (m.feedbackPositiveRatio || 0);
+      // Compute next scheduled run time. Defaults to 3am unless the env var
+      // SELF_IMPROVE_HOUR was set on the daemon — we don't have visibility
+      // into env from the dashboard, so we always show the default.
+      const nextRunAt = (() => {
+        const next = new Date();
+        next.setHours(3, 0, 0, 0);
+        if (next.getTime() <= Date.now()) next.setDate(next.getDate() + 1);
+        return next;
+      })();
+      const nextRunMs = nextRunAt.getTime() - Date.now();
+      const nextRunHrs = Math.max(0, Math.floor(nextRunMs / 3600000));
+      const nextRunLabel = nextRunHrs >= 24 ? Math.floor(nextRunHrs / 24) + 'd' : nextRunHrs + 'h';
       cards.innerHTML =
         '<div class="stat-card"><div class="stat-value">' + (state.status || 'idle') + '</div><div class="stat-label">Status</div></div>' +
         '<div class="stat-card"><div class="stat-value">' + (state.totalExperiments || 0) + '</div><div class="stat-label">Total Experiments</div></div>' +
         '<div class="stat-card"><div class="stat-value">' + (pending.length || 0) + '</div><div class="stat-label">Pending Approvals</div></div>' +
         '<div class="stat-card"><div class="stat-value">' + (state.lastRunAt ? new Date(state.lastRunAt).toLocaleDateString() : 'Never') + '</div><div class="stat-label">Last Run</div></div>' +
+        '<div class="stat-card" title="Next nightly trigger (3am default)"><div class="stat-value">in ' + nextRunLabel + '</div><div class="stat-label">Next Run</div></div>' +
         '<div class="stat-card"><div class="stat-value">' + ((m.feedbackPositiveRatio || 0) * 100).toFixed(0) + '%</div><div class="stat-label">Feedback Positive</div></div>' +
-        '<div class="stat-card"><div class="stat-value">' + ((m.cronSuccessRate || 0) * 100).toFixed(0) + '%</div><div class="stat-label">Cron Success</div></div>';
+        '<div class="stat-card"><div class="stat-value">' + ((m.cronSuccessRate || 0) * 100).toFixed(0) + '%</div><div class="stat-label">Cron Success</div></div>' +
+        '<div class="stat-card" title="cronSuccessRate × feedbackPositiveRatio. Blended into every proposal score at 30% weight (override via SELF_IMPROVE_OBJECTIVE_WEIGHT)."><div class="stat-value">' + (objectiveScore * 10).toFixed(1) + '/10</div><div class="stat-label">Objective Floor</div></div>';
     } else if (cards) {
       cards.innerHTML = '<div class="stat-card"><div class="stat-value">idle</div><div class="stat-label">Status</div></div>' +
         '<div class="stat-card"><div class="stat-value">0</div><div class="stat-label">Total Experiments</div></div>';
