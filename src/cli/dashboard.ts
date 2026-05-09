@@ -4858,6 +4858,177 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
     }
   });
 
+  // 1.18.132 — Phase 3: convert a legacy cron to a scheduled-skill
+  // registry entry. Distinct from /api/cron/:job/migrate (which keeps
+  // the cron in CRON.md but cleans it up). This endpoint REMOVES the
+  // entry from CRON.md and writes it into ~/.clementine/schedules.json
+  // — the Anthropic-pure target shape.
+  //
+  // Eligibility: the cron must already pin a skill OR have a matchable
+  // skill name. We refuse to migrate a cron with no skill to fall back
+  // on, because the schedules.json shape only references {skillName →
+  // schedule}; it has no place for the cron's own prompt body. Users
+  // with custom-prompt crons can either (a) create a skill from the
+  // prompt first via the Builder, then re-run this, or (b) keep the
+  // legacy cron format.
+  app.post('/api/cron/:job/migrate-to-skill', async (req, res) => {
+    try {
+      const jobName = req.params.job;
+      if (!jobName) { res.status(400).json({ ok: false, error: 'job name required' }); return; }
+      const { findMatchingSkill } = await import('../agent/cron-migrator.js');
+      const { listSkills } = await import('../agent/skill-store.js');
+      const { setSchedule } = await import('../agent/schedule-registry.js');
+      const { parseCronJobs, parseAgentCronJobs } = await import('../gateway/cron-scheduler.js');
+
+      const { cronFile, bareJobName } = resolveJobCronFile(jobName);
+      const allJobs = [...parseCronJobs(), ...parseAgentCronJobs(path.join(VAULT_DIR, '00-System', 'agents'))];
+      const target = allJobs.find(j => String(j.name).toLowerCase() === jobName.toLowerCase());
+      if (!target) return res.status(404).json({ ok: false, error: `job "${jobName}" not found` });
+      // Only migrate true legacy CRON.md jobs — scheduled skills aren't migration targets.
+      if (target.source === 'scheduled-skill') {
+        return res.status(400).json({ ok: false, error: 'already a scheduled skill' });
+      }
+
+      // Find the skill to bind. Prefer an explicit pin; fall back to
+      // findMatchingSkill which uses prompt + name keyword overlap.
+      let skillName: string | null = null;
+      const skills = listSkills();
+      if (target.skills && target.skills.length > 0) {
+        // Use the first pinned skill that actually exists in the catalog.
+        skillName = target.skills.find(s => skills.some(sk => sk.frontmatter.name === s)) ?? target.skills[0];
+      } else {
+        const m = findMatchingSkill(target, skills);
+        if (m) skillName = m.frontmatter.name;
+      }
+      if (!skillName) {
+        return res.status(400).json({
+          ok: false,
+          error: 'No skill match. Create a skill from this prompt in the Builder first, then retry.',
+        });
+      }
+
+      // Sanity: a skill of this name must exist in the catalog (otherwise
+      // the runtime will treat it as a missing pin).
+      if (!skills.some(s => s.frontmatter.name === skillName)) {
+        return res.status(400).json({ ok: false, error: `Pinned skill "${skillName}" not in catalog. Create it first.` });
+      }
+
+      // Write to schedules.json. Carry over agentSlug + enabled + schedule.
+      const entry = setSchedule(skillName, {
+        schedule: target.schedule,
+        enabled: target.enabled !== false,
+        agentSlug: target.agentSlug ?? null,
+      });
+
+      // Remove from CRON.md by bare name.
+      const bakPath = cronFile + '.bak';
+      try { writeFileSync(bakPath, readFileSync(cronFile, 'utf-8')); } catch { /* best-effort */ }
+      const { parsed, jobs } = readCronFileAt(cronFile);
+      const idx = jobs.findIndex(j => String(j.name).toLowerCase() === bareJobName.toLowerCase());
+      if (idx < 0) {
+        return res.status(404).json({ ok: false, error: `job not in CRON.md (looked for "${bareJobName}")` });
+      }
+      const removed = jobs.splice(idx, 1)[0];
+      writeCronFileAt(cronFile, parsed, jobs);
+
+      // Hot-reload + broadcast so the Tasks page updates without manual refresh.
+      try {
+        const gw = await getGateway();
+        const sched = (gw as { cronScheduler?: { reloadJobs?: () => void } }).cronScheduler;
+        if (sched && typeof sched.reloadJobs === 'function') sched.reloadJobs();
+      } catch { /* best-effort */ }
+      try { broadcastEvent({ type: 'cron_deleted', data: { job: jobName, source: 'cron-md', migrated: true } }); } catch { /* non-fatal */ }
+
+      res.json({
+        ok: true,
+        skillName,
+        scheduleEntry: entry,
+        removedFrom: cronFile,
+        bakPath,
+        removedBareName: removed?.name,
+        message: `Converted "${jobName}" → scheduled skill "${skillName}". CRON.md backup at ${bakPath}.`,
+      });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: String(err) });
+    }
+  });
+
+  app.post('/api/cron/migrate-all-to-skills', async (_req, res) => {
+    try {
+      const { findMatchingSkill } = await import('../agent/cron-migrator.js');
+      const { listSkills } = await import('../agent/skill-store.js');
+      const { setSchedule } = await import('../agent/schedule-registry.js');
+      const { parseCronJobs, parseAgentCronJobs } = await import('../gateway/cron-scheduler.js');
+
+      const skills = listSkills();
+      const allJobs = [...parseCronJobs(), ...parseAgentCronJobs(path.join(VAULT_DIR, '00-System', 'agents'))];
+      const legacy = allJobs.filter(j => j.source !== 'scheduled-skill');
+
+      const migrated: Array<{ name: string; skillName: string }> = [];
+      const skipped: Array<{ name: string; reason: string }> = [];
+
+      // Group by source CRON.md so we open + parse + write each file once.
+      const byFile = new Map<string, { jobsToRemove: Set<string>; cronFile: string }>();
+
+      for (const job of legacy) {
+        let skillName: string | null = null;
+        if (job.skills && job.skills.length > 0) {
+          skillName = job.skills.find(s => skills.some(sk => sk.frontmatter.name === s)) ?? null;
+        }
+        if (!skillName) {
+          const m = findMatchingSkill(job, skills);
+          if (m) skillName = m.frontmatter.name;
+        }
+        if (!skillName) {
+          skipped.push({ name: job.name, reason: 'no skill match' });
+          continue;
+        }
+        if (!skills.some(s => s.frontmatter.name === skillName)) {
+          skipped.push({ name: job.name, reason: `skill "${skillName}" not in catalog` });
+          continue;
+        }
+        try {
+          setSchedule(skillName, {
+            schedule: job.schedule,
+            enabled: job.enabled !== false,
+            agentSlug: job.agentSlug ?? null,
+          });
+          migrated.push({ name: job.name, skillName });
+          const { cronFile, bareJobName } = resolveJobCronFile(job.name);
+          if (!byFile.has(cronFile)) byFile.set(cronFile, { jobsToRemove: new Set(), cronFile });
+          byFile.get(cronFile)!.jobsToRemove.add(bareJobName);
+        } catch (err) {
+          skipped.push({ name: job.name, reason: String(err) });
+        }
+      }
+
+      const touchedFiles: string[] = [];
+      for (const { cronFile, jobsToRemove } of byFile.values()) {
+        try {
+          const bakPath = cronFile + '.bak';
+          try { writeFileSync(bakPath, readFileSync(cronFile, 'utf-8')); } catch { /* best-effort */ }
+          const { parsed, jobs } = readCronFileAt(cronFile);
+          const filtered = jobs.filter(j => !jobsToRemove.has(String(j.name)));
+          writeCronFileAt(cronFile, parsed, filtered);
+          touchedFiles.push(cronFile);
+        } catch (err) {
+          skipped.push({ name: '(file write)', reason: `${cronFile}: ${err}` });
+        }
+      }
+
+      try {
+        const gw = await getGateway();
+        const sched = (gw as { cronScheduler?: { reloadJobs?: () => void } }).cronScheduler;
+        if (sched && typeof sched.reloadJobs === 'function') sched.reloadJobs();
+      } catch { /* best-effort */ }
+      try { broadcastEvent({ type: 'cron_migrated_to_skills', data: { migratedCount: migrated.length } }); } catch { /* non-fatal */ }
+
+      res.json({ ok: true, migrated, skipped, touchedFiles });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: String(err) });
+    }
+  });
+
   app.post('/api/cron/migrate-all', async (_req, res) => {
     try {
       const { migrateAllEligibleJobs } = await import('../agent/cron-migrator.js');
@@ -24988,8 +25159,51 @@ function renderScheduledTaskCard(task) {
     + '<button class="btn-sm secondary" data-trace-job="' + esc(task.name) + '" title="View execution trace">Trace</button>'
     + (defObj.source === 'scheduled-skill'
         ? '<button class="btn-sm secondary btn-danger" onclick="unscheduleSkillFromCard(\\x27' + safeName + '\\x27)" title="Remove the schedule (skill stays)">Unschedule</button>'
-        : '<button class="btn-sm secondary btn-danger" onclick="confirmDeleteCron(\\x27' + safeName + '\\x27)" title="Delete task">Del</button>')
+        : '<button class="btn-sm secondary" onclick="migrateCronToSkillFromCard(\\x27' + safeName + '\\x27)" title="Convert this legacy cron to a scheduled skill — Anthropic-pure format">→ Skill</button>'
+          + '<button class="btn-sm secondary btn-danger" onclick="confirmDeleteCron(\\x27' + safeName + '\\x27)" title="Delete task">Del</button>')
     + '</div></div>';
+}
+
+// 1.18.132 — Phase 3 migrator: convert one legacy cron → scheduled skill.
+// Calls /api/cron/:job/migrate-to-skill which writes schedules.json and
+// removes the entry from CRON.md (with a .bak backup).
+async function migrateCronToSkillFromCard(jobName) {
+  if (!confirm('Convert "' + jobName + '" to a scheduled skill?\\n\\n' +
+    'This writes a thin entry in ~/.clementine/schedules.json that points to a skill, ' +
+    'and removes the legacy fat-cron entry from CRON.md. ' +
+    'A .bak backup is left so you can restore if anything looks wrong.')) return;
+  try {
+    var r = await apiFetch('/api/cron/' + encodeURIComponent(jobName) + '/migrate-to-skill', { method: 'POST' });
+    var d = await r.json();
+    if (!r.ok) { toast(d.error || 'Migration failed', 'error'); return; }
+    toast('Migrated "' + jobName + '" → scheduled skill "' + d.skillName + '"', 'success');
+    if (typeof refreshCron === 'function') refreshCron();
+  } catch (err) {
+    toast('Failed: ' + err, 'error');
+  }
+}
+
+// Bulk migrator from the deprecation banner. Migrates every legacy cron
+// that has a matching skill; reports skipped ones with reasons.
+async function migrateAllCronsToSkills() {
+  if (!confirm('Convert ALL eligible legacy crons to scheduled skills?\\n\\n' +
+    'Each cron with a matched skill will become a thin schedules.json entry. ' +
+    'CRON.md files get .bak backups. Crons without a skill match are skipped — ' +
+    'no data loss.')) return;
+  try {
+    var r = await apiFetch('/api/cron/migrate-all-to-skills', { method: 'POST' });
+    var d = await r.json();
+    if (!r.ok) { toast(d.error || 'Bulk migration failed', 'error'); return; }
+    var migrated = (d.migrated || []).length;
+    var skipped = (d.skipped || []).length;
+    var msg = 'Migrated ' + migrated + ' cron' + (migrated === 1 ? '' : 's') + ' to scheduled skills';
+    if (skipped > 0) msg += '. ' + skipped + ' skipped — see console for reasons.';
+    toast(msg, migrated > 0 ? 'success' : 'info');
+    if (skipped > 0 && d.skipped) console.warn('[migrate-all-to-skills] skipped:', d.skipped);
+    if (typeof refreshCron === 'function') refreshCron();
+  } catch (err) {
+    toast('Failed: ' + err, 'error');
+  }
 }
 
 // 1.18.129 — replace the "+ New Task" tile with a small dropdown that
@@ -26529,7 +26743,30 @@ async function refreshCron() {
     // placeholder; refreshCronCleanBanner() fetches /api/cron/migrate-preview
     // async and fills this in only when there are eligible legacy jobs.
     // The banner stays empty (zero visual noise) when the vault is clean.
-    var html = '<div id="cron-migrate-banner-host"></div>';
+    // 1.18.132 — Phase 3: soft-deprecate banner. Counts legacy crons
+    // (definition.source !== 'scheduled-skill') and surfaces a one-click
+    // bulk migrator. Dismissable; persists in localStorage so it doesn't
+    // nag on every refresh.
+    var legacyCount = 0;
+    try {
+      legacyCount = (visibleTasks || []).filter(function(t) {
+        return !(t.definition && t.definition.source === 'scheduled-skill');
+      }).length;
+    } catch (_) { /* defensive */ }
+    var bannerHtml = '';
+    var dismissed = localStorage.getItem('clem-skill-migrate-banner-dismissed') === '1';
+    if (legacyCount > 0 && !dismissed) {
+      bannerHtml = '<div style="background:rgba(124,58,237,0.08);border:1px solid var(--purple);border-radius:8px;padding:12px 14px;margin-bottom:14px;display:flex;align-items:center;gap:12px;flex-wrap:wrap">'
+        + '<span style="font-size:18px">⚡</span>'
+        + '<div style="flex:1;min-width:200px">'
+        +   '<div style="font-size:13px;font-weight:500;color:var(--text-primary)">' + legacyCount + ' legacy cron task' + (legacyCount === 1 ? '' : 's') + ' can become scheduled skills</div>'
+        +   '<div style="font-size:11px;color:var(--text-muted);margin-top:2px">Skills are the Anthropic-pure unit of work. Scheduled-skill format is thinner, easier to maintain, and tasks can be reused on demand.</div>'
+        + '</div>'
+        + '<button class="btn-sm btn-primary" onclick="migrateAllCronsToSkills()" style="font-size:12px;padding:6px 12px">Migrate all eligible →</button>'
+        + '<button class="btn-sm" onclick="localStorage.setItem(\\x27clem-skill-migrate-banner-dismissed\\x27,\\x271\\x27);refreshCron()" title="Hide this banner" style="font-size:12px;padding:6px 10px">Dismiss</button>'
+        + '</div>';
+    }
+    var html = bannerHtml + '<div id="cron-migrate-banner-host"></div>';
     html += '<div id="health-strip" class="health-strip"></div>';
     // 1.18.115 — collapse the cost/latency/reliability/activity mini-cards
     // into a <details> block. The Health Strip already covers what most

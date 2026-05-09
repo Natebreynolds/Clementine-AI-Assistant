@@ -88,6 +88,17 @@ const slashCommands = [
       ))
     .addStringOption(o => o.setName('job').setDescription('Job name (for run/enable/disable)').setAutocomplete(true)),
   new SlashCommandBuilder().setName('heartbeat').setDescription('Run heartbeat check manually'),
+  // 1.18.132 — Phase 3: /skill is the on-demand sibling to scheduled
+  // skills. List the catalog or fire any skill once from anywhere
+  // Discord can reach. Uses cmdCronRun's catalog fallback (1.18.129)
+  // so unscheduled skills work too.
+  new SlashCommandBuilder().setName('skill').setDescription('List or run a skill on demand')
+    .addStringOption(o => o.setName('action').setDescription('Action').setRequired(true)
+      .addChoices(
+        { name: 'List skills', value: 'list' },
+        { name: 'Run a skill', value: 'run' },
+      ))
+    .addStringOption(o => o.setName('name').setDescription('Skill name (for run)').setAutocomplete(true)),
   new SlashCommandBuilder().setName('tools').setDescription('List available MCP tools'),
   new SlashCommandBuilder().setName('toolset').setDescription('Set this chat tool mode')
     .addStringOption(o => o.setName('mode').setDescription('Tool mode').setRequired(true)
@@ -1394,6 +1405,23 @@ export async function startDiscord(
         await interaction.respond(
           filtered.map(name => ({ name, value: name })),
         );
+      } else if (interaction.commandName === 'skill') {
+        // 1.18.132 — autocomplete from the live skill catalog (every
+        // skill, scheduled or not). cmdCronRun handles either case.
+        const focused = interaction.options.getFocused().toLowerCase();
+        try {
+          const { listSkills } = await import('../agent/skill-store.js');
+          const skills = listSkills();
+          const filtered = skills
+            .map(s => s.frontmatter.name)
+            .filter(name => name.toLowerCase().includes(focused))
+            .slice(0, 25);
+          await interaction.respond(
+            filtered.map(name => ({ name, value: name })),
+          );
+        } catch {
+          await interaction.respond([]);
+        }
       }
       return;
     }
@@ -1585,6 +1613,76 @@ export async function startDiscord(
           await cmd.followUp(chunks[i]);
         }
         gateway.injectContext(sessionKey, `!cron run ${jobName}`, response);
+        return;
+      }
+
+      // 1.18.132 — Phase 3: /skill list / /skill run <name>
+      // List shows the full catalog (folder + flat) with descriptions.
+      // Run fires the named skill via the same cronScheduler.runManual
+      // path; cmdCronRun's catalog fallback (1.18.129) means unscheduled
+      // skills still fire correctly. Output streams back to Discord.
+      if (name === 'skill') {
+        const action = cmd.options.getString('action', true);
+        const skillName = cmd.options.getString('name') ?? '';
+
+        if (action === 'list') {
+          try {
+            const { listSkills } = await import('../agent/skill-store.js');
+            const skills = listSkills();
+            if (skills.length === 0) {
+              await cmd.reply('No skills found yet. Use the dashboard Skill Builder or `mcp__clementine-tools__create_skill` to author one.');
+              return;
+            }
+            const lines = skills.map(s => {
+              const fm = s.frontmatter;
+              const ext = fm.clementine ?? {};
+              const useCount = typeof ext.useCount === 'number' ? ext.useCount : 0;
+              const desc = (fm.description || '').slice(0, 100) + ((fm.description || '').length > 100 ? '…' : '');
+              return `• \`${fm.name}\` — ${desc}${useCount > 0 ? ` (${useCount}×)` : ''}`;
+            });
+            const header = `**${skills.length} skill${skills.length === 1 ? '' : 's'} available** — fire any with \`/skill run <name>\`:\n\n`;
+            const chunks = chunkText(header + lines.join('\n'), 1900);
+            await cmd.reply(chunks[0]);
+            for (let i = 1; i < chunks.length; i++) await cmd.followUp(chunks[i]);
+          } catch (err) {
+            await cmd.reply(`Failed to list skills: ${err}`);
+          }
+          return;
+        }
+
+        if (action === 'run') {
+          if (!skillName) {
+            await cmd.reply('Specify a skill name. Try `/skill list` to see options.');
+            return;
+          }
+          try {
+            const { getSkill } = await import('../agent/skill-store.js');
+            const skill = getSkill(skillName);
+            if (!skill) {
+              await cmd.reply(`Skill '${skillName}' not found. Try \`/skill list\`.`);
+              return;
+            }
+            // Re-uses the cron run pipeline. cmdCronRun (1.18.129) falls
+            // back to the skill catalog when the name isn't a registered
+            // cron job, so this works for both scheduled + unscheduled
+            // skills.
+            if (cronScheduler.isJobRunning(skillName)) {
+              await cmd.reply(`Skill '${skillName}' is already running.`);
+              return;
+            }
+            await cmd.deferReply();
+            const response = await cronScheduler.runManual(skillName);
+            const chunks = chunkText(response || `*(skill '${skillName}' completed — no output)*`, 1900);
+            await cmd.editReply(chunks[0]);
+            for (let i = 1; i < chunks.length; i++) await cmd.followUp(chunks[i]);
+            gateway.injectContext(sessionKey, `!skill run ${skillName}`, response);
+          } catch (err) {
+            await cmd.followUp({ content: `Skill run failed: ${err}` }).catch(() => {});
+          }
+          return;
+        }
+
+        await cmd.reply('Unknown action. Try `/skill list` or `/skill run <name>`.');
         return;
       }
 

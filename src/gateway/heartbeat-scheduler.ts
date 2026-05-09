@@ -1220,6 +1220,21 @@ export class HeartbeatScheduler {
     let response: string | null = null;
     try {
       const cronCall = buildInsightCheckCronCall(prompt);
+      // 1.18.132 — fix the "Prompt is too long" loop. Insight-check is
+      // an internal Haiku classifier ("should we proactively message
+      // Nathan?") with a tightly-built prompt assembled by
+      // gatherInsightSignals + buildInsightPrompt. Without predictable
+      // mode the runtime ALSO injected MEMORY.md (8k cap) + team
+      // comms + delegation queue + auto-matched skills (up to 4 skill
+      // bodies). The user's MEMORY.md alone was ~80% of the budget;
+      // adding even one auto-matched skill body tipped it past the
+      // model's input window.
+      //
+      // Pass predictable: true + an explicit empty allowedTools list so
+      // the SDK call is just: built-in claude_code system prompt +
+      // our compact insight prompt. This is a classifier, not a working
+      // agent; nothing in MEMORY.md or skill bodies is relevant to
+      // urgency rating.
       response = await this.gateway.handleCronJob(
         cronCall.jobName,
         cronCall.jobPrompt,
@@ -1232,6 +1247,10 @@ export class HeartbeatScheduler {
         undefined,    // timeoutMs
         undefined,    // successCriteria
         undefined,    // agentSlug
+        undefined,    // pinnedSkills
+        [],           // allowedTools — empty = no MCP injection
+        [],           // allowedMcpServers — empty = no MCP servers wired
+        true,         // predictable — skip MEMORY.md / team / auto-skills
       );
       this.runLog.append({
         jobName: 'insight-check',
