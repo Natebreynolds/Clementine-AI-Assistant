@@ -3,6 +3,18 @@
  * the user's team. Runs autonomously alongside Clementine's own
  * HeartbeatScheduler.
  *
+ * Why this is its own scheduler (NOT a unified base class):
+ *   - It has NO loop. Unlike HeartbeatScheduler (setInterval) and
+ *     CronScheduler (node-cron), this one is ticked externally by
+ *     whatever orchestrator manages the agent fleet. Its `tick()` is a
+ *     pure function of state + signals.
+ *   - Its scheduling decision is *adaptive* (computeNextInterval) based
+ *     on the previous tick's outcome — not a fixed cadence. Forcing it
+ *     into a generic "interval-based" base would lose this behavior.
+ *
+ * Shared with the other schedulers: only the JSON state-file load/save
+ * pattern, factored into ./scheduler-state.ts in 1.18.143.
+ *
  * Phase 2 — cheap path only. No LLM call. The tick loads state, scans
  * three signals (pending delegated tasks, recent goal updates, recent
  * cron completions), updates fingerprint, and persists state.
@@ -14,11 +26,9 @@
 import { createHash } from 'node:crypto';
 import {
   existsSync,
-  mkdirSync,
   readFileSync,
   readdirSync,
   statSync,
-  writeFileSync,
 } from 'node:fs';
 import path from 'node:path';
 import pino from 'pino';
@@ -26,6 +36,7 @@ import { AGENTS_DIR, BASE_DIR } from '../config.js';
 import { listAllGoals } from '../tools/shared.js';
 import type { AgentHeartbeatState, AgentProfile } from '../types.js';
 import type { AgentManager } from '../agent/agent-manager.js';
+import { loadStateFile, saveStateFile } from './scheduler-state.js';
 
 const logger = pino({ name: 'clementine.agent-heartbeat' });
 
@@ -134,42 +145,33 @@ export class AgentHeartbeatScheduler {
 
   /** Read persisted state, or return a fresh state ready to tick now. */
   loadState(): AgentHeartbeatState {
-    try {
-      if (existsSync(this.stateFile)) {
-        const raw = JSON.parse(readFileSync(this.stateFile, 'utf-8')) as Partial<AgentHeartbeatState>;
-        const validKinds = ['acted', 'quiet', 'silent', 'override'] as const;
-        const kind = validKinds.includes(raw.lastTickKind as typeof validKinds[number])
-          ? (raw.lastTickKind as 'acted' | 'quiet' | 'silent' | 'override')
-          : undefined;
-        return {
-          slug: this.slug,
-          lastTickAt: String(raw.lastTickAt ?? ''),
-          nextCheckAt: String(raw.nextCheckAt ?? new Date().toISOString()),
-          silentTickCount: Number(raw.silentTickCount ?? 0),
-          fingerprint: String(raw.fingerprint ?? ''),
-          ...(raw.lastSignalSummary ? { lastSignalSummary: raw.lastSignalSummary } : {}),
-          ...(kind ? { lastTickKind: kind } : {}),
-        };
-      }
-    } catch (err) {
-      logger.warn({ err, slug: this.slug }, 'Failed to load agent heartbeat state — starting fresh');
-    }
-    return {
+    const fresh: AgentHeartbeatState = {
       slug: this.slug,
       lastTickAt: '',
       nextCheckAt: new Date().toISOString(),
       silentTickCount: 0,
       fingerprint: '',
     };
+    return loadStateFile<AgentHeartbeatState>(this.stateFile, fresh, (raw) => {
+      const r = raw as Partial<AgentHeartbeatState>;
+      const validKinds = ['acted', 'quiet', 'silent', 'override'] as const;
+      const kind = validKinds.includes(r.lastTickKind as typeof validKinds[number])
+        ? (r.lastTickKind as 'acted' | 'quiet' | 'silent' | 'override')
+        : undefined;
+      return {
+        slug: this.slug,
+        lastTickAt: String(r.lastTickAt ?? ''),
+        nextCheckAt: String(r.nextCheckAt ?? new Date().toISOString()),
+        silentTickCount: Number(r.silentTickCount ?? 0),
+        fingerprint: String(r.fingerprint ?? ''),
+        ...(r.lastSignalSummary ? { lastSignalSummary: r.lastSignalSummary } : {}),
+        ...(kind ? { lastTickKind: kind } : {}),
+      };
+    });
   }
 
   saveState(state: AgentHeartbeatState): void {
-    try {
-      mkdirSync(path.dirname(this.stateFile), { recursive: true });
-      writeFileSync(this.stateFile, JSON.stringify(state, null, 2));
-    } catch (err) {
-      logger.warn({ err, slug: this.slug }, 'Failed to save agent heartbeat state — non-fatal');
-    }
+    saveStateFile(this.stateFile, state);
   }
 
   /** True if the agent is due for a tick. */

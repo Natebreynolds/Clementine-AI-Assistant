@@ -1,10 +1,28 @@
 /**
  * Clementine TypeScript — Cron scheduler (autonomous execution).
  *
- * CronScheduler: precise scheduled tasks using node-cron
+ * CronScheduler: precise per-job scheduled tasks using node-cron. Each
+ * cron job (defined in CRON.md or via the schedule registry) gets its
+ * own ScheduledTask instance with that job's cron expression, so the
+ * scheduling primitive here is fundamentally different from the
+ * fixed-interval HeartbeatScheduler and the externally-ticked
+ * AgentHeartbeatScheduler.
  *
- * Also contains shared parsers (parseCronJobs, parseAgentCronJobs, validateCronYaml),
- * retry helpers, CronRunLog, and daily-note logging utilities used by both schedulers.
+ * Why this is its own scheduler (NOT a unified base class):
+ *   - One node-cron task per job. CronScheduler maintains the
+ *     scheduledTasks/workflowTasks maps; a generic base class would
+ *     have to model "N independent timers" which the other two don't
+ *     need.
+ *   - Owns crash-safe idempotency (cron-running.json), workflow
+ *     execution, file watching, trigger directories, broken-job
+ *     tracking. None of these belong in a generic base.
+ *
+ * Also contains shared parsers (parseCronJobs, parseAgentCronJobs,
+ * validateCronYaml), retry helpers, CronRunLog, and daily-note logging
+ * utilities used by both schedulers.
+ *
+ * Shared with the other schedulers: only the JSON state-file load/save
+ * pattern, factored into ./scheduler-state.ts in 1.18.143.
  */
 
 import { execSync } from 'node:child_process';
@@ -14,7 +32,6 @@ import {
   mkdirSync,
   readFileSync,
   readdirSync,
-  renameSync,
   statSync,
   unlinkSync,
   watchFile,
@@ -39,6 +56,7 @@ import {
 } from '../config.js';
 import { listAllGoals, findGoalPath, readGoalById } from '../tools/shared.js';
 import { listSchedules } from '../agent/schedule-registry.js';
+import { saveStateFile } from './scheduler-state.js';
 import type { CronJobDefinition, CronRunEntry, NotificationContext, SelfImproveConfig, SelfImproveExperiment, SelfImproveState, WorkflowDefinition } from '../types.js';
 import type { NotificationDispatcher } from './notifications.js';
 import type { Gateway } from './router.js';
@@ -679,19 +697,13 @@ export class CronScheduler {
    * rename so a crash mid-write cannot corrupt the file.
    */
   private persistRunningJobs(metaByName?: Map<string, { startedAt: string; runId: string }>): void {
-    try {
-      const entries = [...this.runningJobs].map(name => ({
-        jobName: name,
-        startedAt: metaByName?.get(name)?.startedAt ?? new Date().toISOString(),
-        runId: metaByName?.get(name)?.runId ?? '',
-        pid: process.pid,
-      }));
-      const tmp = CronScheduler.RUNNING_JOBS_FILE + '.tmp';
-      writeFileSync(tmp, JSON.stringify(entries, null, 2));
-      renameSync(tmp, CronScheduler.RUNNING_JOBS_FILE);
-    } catch (err) {
-      logger.debug({ err }, 'Failed to persist running-jobs file');
-    }
+    const entries = [...this.runningJobs].map(name => ({
+      jobName: name,
+      startedAt: metaByName?.get(name)?.startedAt ?? new Date().toISOString(),
+      runId: metaByName?.get(name)?.runId ?? '',
+      pid: process.pid,
+    }));
+    saveStateFile(CronScheduler.RUNNING_JOBS_FILE, entries, { atomic: true });
   }
 
   /**

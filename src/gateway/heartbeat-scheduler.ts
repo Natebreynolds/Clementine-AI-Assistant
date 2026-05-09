@@ -1,8 +1,21 @@
 /**
  * Clementine TypeScript — Heartbeat scheduler.
  *
- * HeartbeatScheduler: periodic general check-ins using setInterval.
- * Channel-agnostic — sends notifications via the NotificationDispatcher.
+ * HeartbeatScheduler: periodic general check-ins using setInterval
+ * (one tick every HEARTBEAT_INTERVAL_MINUTES, default 30 min, gated to
+ * the HEARTBEAT_ACTIVE_START..ACTIVE_END window). Channel-agnostic —
+ * sends notifications via the NotificationDispatcher.
+ *
+ * Why this is its own scheduler (NOT a unified base class):
+ *   - It uses a fixed setInterval. Different scheduling primitive than
+ *     CronScheduler (which uses node-cron per-job) and AgentHeartbeat
+ *     Scheduler (which is ticked externally — has no loop of its own).
+ *   - It owns autonomous concerns: insight engine, proactive ledger,
+ *     dense-vector backfill, salience decay, episodic consolidation.
+ *     None of these belong in a generic scheduler base.
+ *
+ * Shared with the other two schedulers: only the JSON state-file
+ * load/save pattern, factored into ./scheduler-state.ts in 1.18.143.
  */
 
 import { createHash, randomBytes } from 'node:crypto';
@@ -35,6 +48,7 @@ import {
 import { findGoalPath, listAllGoals } from '../tools/shared.js';
 import type { HeartbeatState, HeartbeatReportedTopic, HeartbeatWorkItem } from '../types.js';
 import type { CronScheduler } from './cron-scheduler.js';
+import { loadStateFile, saveStateFile } from './scheduler-state.js';
 import {
   gatherInsightSignals,
   buildInsightPrompt,
@@ -1341,22 +1355,14 @@ export class HeartbeatScheduler {
   }
 
   private loadState(): HeartbeatState {
-    if (existsSync(this.stateFile)) {
-      try {
-        return JSON.parse(readFileSync(this.stateFile, 'utf-8'));
-      } catch {
-        logger.warn('Failed to load heartbeat state — starting fresh');
-      }
-    }
-    return { fingerprint: '', details: {}, timestamp: '' };
+    return loadStateFile<HeartbeatState>(
+      this.stateFile,
+      { fingerprint: '', details: {}, timestamp: '' },
+    );
   }
 
   private saveState(): void {
-    try {
-      writeFileSync(this.stateFile, JSON.stringify(this.lastState, null, 2));
-    } catch (err) {
-      logger.warn({ err }, 'Failed to save heartbeat state');
-    }
+    saveStateFile(this.stateFile, this.lastState);
   }
 
   private computeStateFingerprint(): [string, Record<string, number | string>] {
