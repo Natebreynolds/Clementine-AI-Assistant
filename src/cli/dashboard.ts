@@ -4458,6 +4458,144 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
     }
   });
 
+  // ── Skill bundled-file CRUD (1.18.130 — Skill Builder Phase 2) ────
+  // The builder treats a skill as its folder. SKILL.md is the entry,
+  // scripts/templates/references are bundled siblings. These endpoints
+  // expose list/read/write/delete so the builder UI can render a real
+  // file tree and persist edits one file at a time.
+  //
+  // Path traversal hardening: every path coming from the URL is run
+  // through resolveBundledFilePath which (a) validates the skill slug,
+  // (b) resolves the candidate against the skill folder, and (c) refuses
+  // anything that escapes the folder via .. or absolute prefixes.
+  function resolveSkillFolder(skillName: string): string | null {
+    if (!/^[a-z0-9][a-z0-9-]{0,63}$/.test(skillName)) return null;
+    const folder = path.join(VAULT_DIR, '00-System', 'skills', skillName);
+    return existsSync(path.join(folder, 'SKILL.md')) ? folder : null;
+  }
+
+  function resolveBundledFilePath(skillFolder: string, relPath: string): string | null {
+    // Empty / . / absolute / multiple-leading-slash all rejected.
+    const cleaned = (relPath || '').replace(/^\/+/, '');
+    if (!cleaned || cleaned === '.' || cleaned === '..') return null;
+    if (path.isAbsolute(cleaned)) return null;
+    const candidate = path.normalize(path.join(skillFolder, cleaned));
+    // Final resolved path must still be inside the skill folder.
+    const folderResolved = path.resolve(skillFolder);
+    const candidateResolved = path.resolve(candidate);
+    if (candidateResolved !== folderResolved && !candidateResolved.startsWith(folderResolved + path.sep)) {
+      return null;
+    }
+    return candidateResolved;
+  }
+
+  app.get('/api/skills/:name/files', (req, res) => {
+    try {
+      const folder = resolveSkillFolder(req.params.name);
+      if (!folder) return res.status(404).json({ ok: false, error: 'skill not found' });
+      const out: Array<{ relPath: string; sizeBytes: number; isDir: boolean }> = [];
+      const walk = (dir: string, prefix: string): void => {
+        const entries = readdirSync(dir);
+        for (const entry of entries) {
+          if (entry.startsWith('.')) continue;
+          if (entry.endsWith('.bak') || entry.endsWith('.bak.md')) continue;
+          const abs = path.join(dir, entry);
+          const rel = prefix ? `${prefix}/${entry}` : entry;
+          let st;
+          try { st = statSync(abs); } catch { continue; }
+          if (st.isDirectory()) {
+            // Only descend one level (scripts/, templates/, references/).
+            if (prefix) continue;
+            out.push({ relPath: rel, sizeBytes: 0, isDir: true });
+            walk(abs, rel);
+            continue;
+          }
+          if (st.isFile()) {
+            out.push({ relPath: rel, sizeBytes: st.size, isDir: false });
+          }
+        }
+      };
+      walk(folder, '');
+      // Sort: SKILL.md first, then directories before files, then alpha.
+      out.sort((a, b) => {
+        if (a.relPath === 'SKILL.md') return -1;
+        if (b.relPath === 'SKILL.md') return 1;
+        const aDir = a.isDir, bDir = b.isDir;
+        if (aDir !== bDir) return aDir ? -1 : 1;
+        return a.relPath.localeCompare(b.relPath);
+      });
+      res.json({ ok: true, folder, files: out });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: String(err) });
+    }
+  });
+
+  app.get('/api/skills/:name/files/*', (req, res) => {
+    try {
+      const folder = resolveSkillFolder(req.params.name);
+      if (!folder) return res.status(404).json({ ok: false, error: 'skill not found' });
+      const relPath = ((req.params as Record<string, string | string[]>)[0] as string) || '';
+      const abs = resolveBundledFilePath(folder, relPath);
+      if (!abs) return res.status(400).json({ ok: false, error: 'invalid path' });
+      if (!existsSync(abs)) return res.status(404).json({ ok: false, error: 'file not found' });
+      const st = statSync(abs);
+      if (st.isDirectory()) return res.status(400).json({ ok: false, error: 'path is a directory' });
+      const content = readFileSync(abs, 'utf-8');
+      res.json({ ok: true, relPath, content, sizeBytes: st.size, mtimeMs: st.mtimeMs });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: String(err) });
+    }
+  });
+
+  app.put('/api/skills/:name/files/*', (req, res) => {
+    try {
+      const folder = resolveSkillFolder(req.params.name);
+      if (!folder) return res.status(404).json({ ok: false, error: 'skill not found' });
+      const relPath = ((req.params as Record<string, string | string[]>)[0] as string) || '';
+      const abs = resolveBundledFilePath(folder, relPath);
+      if (!abs) return res.status(400).json({ ok: false, error: 'invalid path' });
+      const body = (req.body ?? {}) as { content?: string };
+      if (typeof body.content !== 'string') {
+        return res.status(400).json({ ok: false, error: 'content (string) required' });
+      }
+      // Lazy-create parent dir for new files in subdirs (scripts/foo.py
+      // when scripts/ doesn't exist yet).
+      const parent = path.dirname(abs);
+      if (!existsSync(parent)) mkdirSync(parent, { recursive: true });
+      writeFileSync(abs, body.content);
+      const st = statSync(abs);
+      res.json({ ok: true, relPath, sizeBytes: st.size, mtimeMs: st.mtimeMs });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: String(err) });
+    }
+  });
+
+  app.delete('/api/skills/:name/files/*', (req, res) => {
+    try {
+      const folder = resolveSkillFolder(req.params.name);
+      if (!folder) return res.status(404).json({ ok: false, error: 'skill not found' });
+      const relPath = ((req.params as Record<string, string | string[]>)[0] as string) || '';
+      // SKILL.md cannot be deleted via this endpoint — that's "delete the
+      // whole skill," which has its own flow (POST /api/skills/:name/delete).
+      if (relPath === 'SKILL.md') {
+        return res.status(400).json({ ok: false, error: 'cannot delete SKILL.md — use the skill delete flow' });
+      }
+      const abs = resolveBundledFilePath(folder, relPath);
+      if (!abs) return res.status(400).json({ ok: false, error: 'invalid path' });
+      if (!existsSync(abs)) return res.json({ ok: true, alreadyGone: true });
+      const st = statSync(abs);
+      if (st.isDirectory()) {
+        // Remove the directory recursively (only one level deep ever exists).
+        rmSync(abs, { recursive: true, force: true });
+      } else {
+        unlinkSync(abs);
+      }
+      res.json({ ok: true });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: String(err) });
+    }
+  });
+
   // ── Schedule registry (1.18.129) ───────────────────────────────────
   // Anthropic-pure scheduling: skills stay vanilla, schedules live in
   // ~/.clementine/schedules.json. The cron scheduler reads this in
@@ -10332,6 +10470,88 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
   // (dashboard, MCP create_skill, auto-extraction) flow through the
   // same write-once-validate-once code; this route is now a thin
   // adapter over the helper.
+  // 1.18.130 — list available skill templates so the create modal can
+  // render the picker. Templates encode the five common archetypes
+  // (orchestrator, scraper, transformer, notifier, conversational) and
+  // pre-fill body + tools.allow when chosen.
+  app.get('/api/skill-templates', async (_req, res) => {
+    try {
+      const { SKILL_TEMPLATES } = await import('../agent/skill-templates.js');
+      // Ship the picker-relevant fields only (omit the body — the create
+      // flow fetches it via POST /api/skills/from-template). Keeps the
+      // initial picker payload tiny.
+      const items = SKILL_TEMPLATES.map((t) => ({
+        id: t.id,
+        label: t.label,
+        hint: t.hint,
+        emoji: t.emoji,
+        defaultDescription: t.defaultDescription,
+        suggestedTools: t.suggestedTools,
+        bundledFileCount: t.bundledFiles?.length ?? 0,
+      }));
+      res.json({ ok: true, templates: items });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: String(err) });
+    }
+  });
+
+  // Apply a template to create a new skill. The caller picks a template
+  // id + skill name/title/description; the body comes from the template
+  // (with {{TITLE}} substituted) plus suggestedTools become tools.allow.
+  // Bundled files in the template ship alongside the SKILL.md.
+  app.post('/api/skills/from-template', async (req, res) => {
+    try {
+      const { templateId, name, title, description } = req.body ?? {};
+      if (typeof templateId !== 'string' || typeof name !== 'string') {
+        return res.status(400).json({ error: 'templateId and name required' });
+      }
+      const { getSkillTemplate, renderTemplateBody } = await import('../agent/skill-templates.js');
+      const tmpl = getSkillTemplate(templateId);
+      if (!tmpl) return res.status(404).json({ error: 'unknown template id' });
+      const { writeSkill } = await import('../agent/skill-store.js');
+      const renderedBody = renderTemplateBody(tmpl, typeof title === 'string' && title ? title : name);
+      const finalDescription = (typeof description === 'string' && description.trim())
+        ? description
+        : tmpl.defaultDescription;
+      try {
+        const result = writeSkill({
+          name,
+          title: typeof title === 'string' ? title : undefined,
+          description: finalDescription,
+          body: renderedBody,
+          tools: tmpl.suggestedTools,
+          source: 'manual',
+        });
+        // Drop bundled files alongside SKILL.md by writing each one
+        // through the same file CRUD path the builder uses. Best-effort —
+        // failing on a bundled file shouldn't roll back the skill itself.
+        if (Array.isArray(tmpl.bundledFiles)) {
+          for (const f of tmpl.bundledFiles) {
+            try {
+              const folder = path.dirname(result.filePath);
+              const target = path.join(folder, f.relPath);
+              const parent = path.dirname(target);
+              if (!existsSync(parent)) mkdirSync(parent, { recursive: true });
+              writeFileSync(target, f.content);
+            } catch (err) {
+              console.warn('[skill-template] bundled file write failed:', err);
+            }
+          }
+        }
+        res.json({ ok: true, name: result.name, layout: 'folder', filePath: result.filePath, templateApplied: tmpl.id });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (msg.includes('already exists')) {
+          res.status(409).json({ error: msg });
+        } else {
+          res.status(400).json({ error: msg });
+        }
+      }
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
   app.post('/api/skills', async (req, res) => {
     try {
       const { name, title, description, body, tools } = req.body ?? {};
@@ -27380,6 +27600,373 @@ function renderMarkdown(src) {
 function openCreateSkillModal() { _openSkillModal({ mode: 'create' }); }
 function openEditSkillModal(name) { _openSkillModal({ mode: 'edit', name: name }); }
 
+// ── Skill Builder (1.18.130 — Phase 2) ──────────────────────────────
+// Three-panel folder editor: file tree (left) | editor (middle) |
+// available-context sidebar (right). Replaces the cron-modal mental
+// model with "skill folder is the unit of work; everything you can
+// reach lives in the right rail." Lazy-mounts on first open.
+//
+// State lives on window so the inline onclicks in the dynamically-built
+// markup can reach it — same pattern as MEMORY.md editor (1.18.127).
+window._sbState = { skillName: null, currentFile: 'SKILL.md', files: [], dirty: false, saving: false };
+
+async function openSkillBuilder(skillName) {
+  window._sbState.skillName = skillName;
+  window._sbState.currentFile = 'SKILL.md';
+  window._sbState.dirty = false;
+  var modal = document.getElementById('skill-builder-modal');
+  if (!modal) {
+    modal = document.createElement('div');
+    modal.id = 'skill-builder-modal';
+    modal.style.cssText = 'position:fixed;inset:0;background:var(--bg-primary);z-index:1100;display:none;flex-direction:column';
+    modal.innerHTML =
+      '<div style="display:flex;align-items:center;justify-content:space-between;padding:12px 20px;border-bottom:1px solid var(--border);background:var(--bg-secondary);flex-shrink:0">'
+      +   '<div style="display:flex;align-items:center;gap:12px">'
+      +     '<span style="font-size:16px;font-weight:600;color:var(--text-primary)">⚡ Skill Builder</span>'
+      +     '<span id="sb-skill-name" style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px;color:var(--text-muted);background:var(--bg-tertiary);padding:3px 8px;border-radius:4px"></span>'
+      +     '<span id="sb-save-status" style="font-size:11px;color:var(--text-muted)"></span>'
+      +   '</div>'
+      +   '<div style="display:flex;align-items:center;gap:6px">'
+      +     '<button onclick="sbSaveCurrent()" id="sb-save-btn" class="btn-primary" style="font-size:12px;padding:7px 14px;border:none;border-radius:6px;background:var(--accent);color:#fff;font-weight:500;cursor:pointer" disabled>Save (⌘S)</button>'
+      +     '<button onclick="closeSkillBuilder()" style="font-size:12px;padding:7px 12px;border:1px solid var(--border);border-radius:6px;background:transparent;color:var(--text-primary);cursor:pointer">Close</button>'
+      +   '</div>'
+      + '</div>'
+      + '<div style="flex:1;display:grid;grid-template-columns:240px 1fr 320px;gap:0;overflow:hidden;min-height:0">'
+      // ── Left: file tree ──
+      +   '<div style="border-right:1px solid var(--border);background:var(--bg-secondary);display:flex;flex-direction:column;min-height:0">'
+      +     '<div style="padding:10px 14px;border-bottom:1px solid var(--border);font-size:11px;font-weight:600;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.04em;display:flex;align-items:center;justify-content:space-between">'
+      +       '<span>Files</span>'
+      +       '<button onclick="sbAddFile()" title="Add a new file to this skill folder" style="font-size:11px;padding:2px 8px;border:1px solid var(--border);border-radius:4px;background:var(--bg-input);color:var(--text-primary);cursor:pointer">+ Add</button>'
+      +     '</div>'
+      +     '<div id="sb-file-tree" style="flex:1;overflow-y:auto;padding:6px 0;font-size:12px"></div>'
+      +   '</div>'
+      // ── Middle: editor ──
+      +   '<div style="display:flex;flex-direction:column;min-height:0">'
+      +     '<div style="padding:8px 14px;border-bottom:1px solid var(--border);background:var(--bg-secondary);font-size:11px;color:var(--text-muted);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;display:flex;align-items:center;justify-content:space-between">'
+      +       '<span id="sb-file-path"></span>'
+      +       '<span id="sb-file-meta" style="color:var(--text-muted)"></span>'
+      +     '</div>'
+      +     '<textarea id="sb-editor" oninput="sbOnEdit()" spellcheck="false" style="flex:1;border:none;outline:none;padding:14px 18px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;line-height:1.55;background:var(--bg-primary);color:var(--text-primary);resize:none;min-height:0"></textarea>'
+      +   '</div>'
+      // ── Right: available-context sidebar ──
+      +   '<div style="border-left:1px solid var(--border);background:var(--bg-secondary);display:flex;flex-direction:column;min-height:0">'
+      +     '<div style="padding:8px 6px 0;display:flex;gap:2px;border-bottom:1px solid var(--border)">'
+      +       '<button onclick="sbSwitchTab(\\x27tools\\x27)" id="sb-tab-tools" class="sb-tab" style="flex:1;font-size:11px;padding:8px 4px;border:none;background:transparent;color:var(--text-muted);cursor:pointer;border-bottom:2px solid transparent;font-weight:500">Tools</button>'
+      +       '<button onclick="sbSwitchTab(\\x27skills\\x27)" id="sb-tab-skills" class="sb-tab" style="flex:1;font-size:11px;padding:8px 4px;border:none;background:transparent;color:var(--text-muted);cursor:pointer;border-bottom:2px solid transparent;font-weight:500">Skills</button>'
+      +     '</div>'
+      +     '<div style="padding:6px 10px;border-bottom:1px solid var(--border)">'
+      +       '<input type="text" id="sb-sidebar-search" oninput="sbRenderSidebar()" placeholder="Filter…" style="width:100%;padding:5px 8px;font-size:11px;border:1px solid var(--border);border-radius:4px;background:var(--bg-input);color:var(--text-primary)">'
+      +     '</div>'
+      +     '<div id="sb-sidebar-list" style="flex:1;overflow-y:auto;padding:4px 0"></div>'
+      +     '<div style="padding:8px 12px;border-top:1px solid var(--border);font-size:10px;color:var(--text-muted);line-height:1.4">'
+      +       'Click any item to insert a reference at the cursor.'
+      +     '</div>'
+      +   '</div>'
+      + '</div>';
+    document.body.appendChild(modal);
+    // Cmd-S / Ctrl-S to save (only when builder is open)
+    document.addEventListener('keydown', function(e) {
+      if (modal.style.display === 'none' || modal.style.display === '') return;
+      if ((e.metaKey || e.ctrlKey) && e.key === 's') {
+        e.preventDefault();
+        sbSaveCurrent();
+      }
+      if (e.key === 'Escape') {
+        if (window._sbState.dirty && !confirm('Unsaved changes will be lost. Close anyway?')) return;
+        closeSkillBuilder();
+      }
+    });
+  }
+  document.getElementById('sb-skill-name').textContent = skillName;
+  modal.style.display = 'flex';
+  // Default sidebar tab + initial loads
+  window._sbActiveTab = 'tools';
+  sbSwitchTab('tools');
+  await sbReloadFileTree();
+  await sbLoadFile('SKILL.md');
+}
+
+function closeSkillBuilder() {
+  var m = document.getElementById('skill-builder-modal');
+  if (m) m.style.display = 'none';
+}
+
+async function sbReloadFileTree() {
+  var name = window._sbState.skillName;
+  if (!name) return;
+  var tree = document.getElementById('sb-file-tree');
+  if (!tree) return;
+  try {
+    var r = await apiFetch('/api/skills/' + encodeURIComponent(name) + '/files');
+    var d = await r.json();
+    if (!r.ok) {
+      tree.innerHTML = '<div style="padding:14px;color:var(--red);font-size:11px">' + esc(d.error || 'failed') + '</div>';
+      return;
+    }
+    window._sbState.files = d.files || [];
+    var html = '';
+    var lastDir = '';
+    for (var i = 0; i < d.files.length; i++) {
+      var f = d.files[i];
+      var isCurrent = f.relPath === window._sbState.currentFile;
+      var indent = f.relPath.indexOf('/') > -1 ? 18 : 6;
+      var icon = f.isDir ? '📁' : (f.relPath === 'SKILL.md' ? '📜' : (f.relPath.endsWith('.py') || f.relPath.endsWith('.js') || f.relPath.endsWith('.sh') ? '⚙' : '📄'));
+      var size = f.isDir ? '' : '<span style="color:var(--text-muted);font-size:10px;margin-left:auto">' + (f.sizeBytes < 1024 ? f.sizeBytes + 'B' : Math.round(f.sizeBytes / 1024) + 'k') + '</span>';
+      if (f.isDir) {
+        html += '<div style="padding:4px 14px 4px ' + indent + 'px;font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.03em;font-weight:600;display:flex;align-items:center;gap:6px">' + icon + ' ' + esc(f.relPath) + '/</div>';
+      } else {
+        html += '<div onclick="sbLoadFile(\\x27' + jsStr(f.relPath) + '\\x27)" style="padding:5px 14px 5px ' + indent + 'px;cursor:pointer;display:flex;align-items:center;gap:6px;background:' + (isCurrent ? 'var(--bg-tertiary)' : 'transparent') + ';color:' + (isCurrent ? 'var(--accent)' : 'var(--text-primary)') + ';font-weight:' + (isCurrent ? '600' : '400') + '" onmouseover="if(window._sbState.currentFile!==\\x27' + jsStr(f.relPath) + '\\x27)this.style.background=\\x27var(--bg-tertiary)\\x27" onmouseout="if(window._sbState.currentFile!==\\x27' + jsStr(f.relPath) + '\\x27)this.style.background=\\x27transparent\\x27">'
+          + '<span>' + icon + '</span>'
+          + '<span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(f.relPath.indexOf('/') > -1 ? f.relPath.split('/').pop() : f.relPath) + '</span>'
+          + size
+          + (f.relPath !== 'SKILL.md' ? '<button onclick="event.stopPropagation();sbDeleteFile(\\x27' + jsStr(f.relPath) + '\\x27)" title="Delete file" style="background:none;border:none;color:var(--text-muted);cursor:pointer;padding:0 4px;font-size:11px">×</button>' : '')
+          + '</div>';
+      }
+    }
+    tree.innerHTML = html || '<div style="padding:14px;color:var(--text-muted);font-size:11px">No files yet.</div>';
+  } catch (err) {
+    tree.innerHTML = '<div style="padding:14px;color:var(--red);font-size:11px">' + esc(String(err)) + '</div>';
+  }
+}
+
+async function sbLoadFile(relPath) {
+  if (window._sbState.dirty && !confirm('Unsaved changes will be lost. Switch anyway?')) return;
+  var name = window._sbState.skillName;
+  var ed = document.getElementById('sb-editor');
+  var pathEl = document.getElementById('sb-file-path');
+  var metaEl = document.getElementById('sb-file-meta');
+  if (!ed) return;
+  ed.value = 'Loading…';
+  try {
+    var r = await apiFetch('/api/skills/' + encodeURIComponent(name) + '/files/' + encodeURIComponent(relPath));
+    var d = await r.json();
+    if (!r.ok) { ed.value = ''; toast(d.error || 'Failed to load file', 'error'); return; }
+    ed.value = d.content || '';
+    window._sbState.currentFile = relPath;
+    window._sbState.dirty = false;
+    if (pathEl) pathEl.textContent = relPath;
+    if (metaEl) metaEl.textContent = (d.content || '').split('\\n').length + ' lines · ' + d.sizeBytes + ' bytes';
+    sbUpdateSaveButton();
+    sbReloadFileTree();
+  } catch (err) {
+    ed.value = '';
+    toast('Failed: ' + err, 'error');
+  }
+}
+
+function sbOnEdit() {
+  window._sbState.dirty = true;
+  sbUpdateSaveButton();
+  var ed = document.getElementById('sb-editor');
+  var metaEl = document.getElementById('sb-file-meta');
+  if (ed && metaEl) metaEl.textContent = (ed.value || '').split('\\n').length + ' lines · unsaved';
+}
+
+function sbUpdateSaveButton() {
+  var btn = document.getElementById('sb-save-btn');
+  var status = document.getElementById('sb-save-status');
+  if (btn) btn.disabled = !window._sbState.dirty || window._sbState.saving;
+  if (status) status.textContent = window._sbState.dirty ? '● unsaved' : (window._sbState.lastSaveAt ? 'Saved · ' + window._sbState.lastSaveAt : '');
+}
+
+async function sbSaveCurrent() {
+  if (window._sbState.saving) return;
+  var name = window._sbState.skillName;
+  var relPath = window._sbState.currentFile;
+  var ed = document.getElementById('sb-editor');
+  if (!ed || !name || !relPath) return;
+  window._sbState.saving = true;
+  sbUpdateSaveButton();
+  try {
+    var r = await apiFetch('/api/skills/' + encodeURIComponent(name) + '/files/' + encodeURIComponent(relPath), {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content: ed.value }),
+    });
+    var d = await r.json();
+    if (!r.ok) { toast(d.error || 'Save failed', 'error'); return; }
+    window._sbState.dirty = false;
+    window._sbState.lastSaveAt = new Date().toLocaleTimeString();
+    toast('Saved ' + relPath, 'success');
+    sbUpdateSaveButton();
+    sbReloadFileTree();
+  } catch (err) {
+    toast('Failed: ' + err, 'error');
+  } finally {
+    window._sbState.saving = false;
+    sbUpdateSaveButton();
+  }
+}
+
+async function sbAddFile() {
+  var name = prompt('New file path (e.g. scripts/scrape.py, templates/email.md, references/notes.md):');
+  if (!name || !name.trim()) return;
+  var clean = name.trim().replace(/^\\/+/, '');
+  if (clean === 'SKILL.md') { toast('SKILL.md already exists.', 'warn'); return; }
+  // Seed with sensible default content based on extension
+  var seed = '';
+  if (clean.endsWith('.py')) seed = '#!/usr/bin/env python3\\n"""' + clean + '"""\\n\\n';
+  else if (clean.endsWith('.sh')) seed = '#!/bin/bash\\nset -euo pipefail\\n\\n';
+  else if (clean.endsWith('.md')) seed = '# ' + clean.split('/').pop().replace(/\\.md$/, '') + '\\n\\n';
+  try {
+    var r = await apiFetch('/api/skills/' + encodeURIComponent(window._sbState.skillName) + '/files/' + encodeURIComponent(clean), {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content: seed }),
+    });
+    var d = await r.json();
+    if (!r.ok) { toast(d.error || 'Failed', 'error'); return; }
+    toast('Created ' + clean, 'success');
+    await sbReloadFileTree();
+    await sbLoadFile(clean);
+  } catch (err) {
+    toast('Failed: ' + err, 'error');
+  }
+}
+
+async function sbDeleteFile(relPath) {
+  if (!confirm('Delete ' + relPath + '?')) return;
+  try {
+    var r = await apiFetch('/api/skills/' + encodeURIComponent(window._sbState.skillName) + '/files/' + encodeURIComponent(relPath), { method: 'DELETE' });
+    var d = await r.json();
+    if (!r.ok) { toast(d.error || 'Failed', 'error'); return; }
+    toast('Deleted ' + relPath, 'success');
+    if (window._sbState.currentFile === relPath) await sbLoadFile('SKILL.md');
+    else await sbReloadFileTree();
+  } catch (err) {
+    toast('Failed: ' + err, 'error');
+  }
+}
+
+// ── Sidebar tabs (Tools / Skills) ────────────────────────────────────
+function sbSwitchTab(tab) {
+  window._sbActiveTab = tab;
+  ['tools', 'skills'].forEach(function(t) {
+    var el = document.getElementById('sb-tab-' + t);
+    if (el) {
+      el.style.color = (t === tab) ? 'var(--accent)' : 'var(--text-muted)';
+      el.style.borderBottomColor = (t === tab) ? 'var(--accent)' : 'transparent';
+    }
+  });
+  sbRenderSidebar();
+}
+
+async function sbRenderSidebar() {
+  var listEl = document.getElementById('sb-sidebar-list');
+  if (!listEl) return;
+  var q = (document.getElementById('sb-sidebar-search')?.value || '').toLowerCase().trim();
+  if (window._sbActiveTab === 'tools') {
+    await sbRenderToolsTab(listEl, q);
+  } else if (window._sbActiveTab === 'skills') {
+    await sbRenderSkillsTab(listEl, q);
+  }
+}
+
+async function sbRenderToolsTab(listEl, q) {
+  // Built-in SDK tools (always present). Click → insert tool name into
+  // the current editor. The skill body referencing a tool by name + a
+  // matching clementine.tools.allow entry is what the runtime honors.
+  var builtins = [
+    { name: 'Read', desc: 'Read a file' },
+    { name: 'Write', desc: 'Write a file' },
+    { name: 'Edit', desc: 'Edit a file in place' },
+    { name: 'Bash', desc: 'Run a shell command' },
+    { name: 'Glob', desc: 'Find files by pattern' },
+    { name: 'Grep', desc: 'Search file contents' },
+    { name: 'WebFetch', desc: 'Fetch a URL' },
+    { name: 'WebSearch', desc: 'Search the web' },
+    { name: 'Agent', desc: 'Spawn a subagent (Task tool)' },
+  ];
+  // MCP catalog (local + Composio merged in 1.18.128)
+  var mcpServers = [];
+  try {
+    if (typeof loadMcpCatalog === 'function') {
+      var cat = await loadMcpCatalog();
+      mcpServers = (cat && cat.servers) || [];
+    }
+  } catch (_) { /* fall through */ }
+  var html = '';
+  // Built-ins section
+  var filteredBuiltins = q ? builtins.filter(function(b) { return (b.name + ' ' + b.desc).toLowerCase().indexOf(q) > -1; }) : builtins;
+  if (filteredBuiltins.length > 0) {
+    html += '<div style="padding:6px 12px;font-size:10px;font-weight:600;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.04em;background:var(--bg-tertiary)">Built-in (' + filteredBuiltins.length + ')</div>';
+    for (var i = 0; i < filteredBuiltins.length; i++) {
+      var b = filteredBuiltins[i];
+      html += '<div onclick="sbInsertAtCursor(\\x27' + jsStr(b.name) + '\\x27)" style="padding:7px 12px;cursor:pointer;font-size:12px;display:flex;align-items:center;gap:8px;border-bottom:1px solid var(--border-light)" title="' + esc(b.desc) + '" onmouseover="this.style.background=\\x27var(--bg-tertiary)\\x27" onmouseout="this.style.background=\\x27transparent\\x27">'
+        + '<span style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--text-primary);font-weight:500">' + esc(b.name) + '</span>'
+        + '<span style="color:var(--text-muted);font-size:10px;flex:1;overflow:hidden;text-overflow:ellipsis">' + esc(b.desc) + '</span>'
+        + '</div>';
+    }
+  }
+  // MCP servers section
+  var filteredMcp = q ? mcpServers.filter(function(s) { return (s.name + ' ' + (s.description || '') + ' ' + (s._displayName || '')).toLowerCase().indexOf(q) > -1; }) : mcpServers;
+  if (filteredMcp.length > 0) {
+    html += '<div style="padding:6px 12px;font-size:10px;font-weight:600;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.04em;background:var(--bg-tertiary);margin-top:4px">MCP servers (' + filteredMcp.length + ')</div>';
+    for (var j = 0; j < filteredMcp.length; j++) {
+      var m = filteredMcp[j];
+      var displayName = m._displayName || m.name;
+      var sourceTag = m._origin === 'composio' ? '<span style="background:rgba(124,58,237,0.18);color:var(--purple);font-size:8px;padding:0 4px;border-radius:3px;font-weight:600;letter-spacing:0.04em">CMP</span>' : '';
+      // Insert as the mcp__server__ prefix so the user can complete with the tool name.
+      var insertion = 'mcp__' + m.name + '__';
+      html += '<div onclick="sbInsertAtCursor(\\x27' + jsStr(insertion) + '\\x27)" style="padding:7px 12px;cursor:pointer;font-size:12px;display:flex;align-items:center;gap:6px;border-bottom:1px solid var(--border-light)" title="' + esc(m.description || '') + '" onmouseover="this.style.background=\\x27var(--bg-tertiary)\\x27" onmouseout="this.style.background=\\x27transparent\\x27">'
+        + '<span style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--text-primary);font-weight:500;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(displayName) + '</span>'
+        + sourceTag
+        + '</div>';
+    }
+  }
+  if (!html) html = '<div style="padding:18px;color:var(--text-muted);font-size:11px;text-align:center">No matches.</div>';
+  listEl.innerHTML = html;
+}
+
+async function sbRenderSkillsTab(listEl, q) {
+  var skills = [];
+  try {
+    var r = await apiFetch('/api/skills');
+    var d = await r.json();
+    if (r.ok && Array.isArray(d.skills)) skills = d.skills;
+  } catch (_) { /* empty */ }
+  // Exclude self — composing a skill with itself is a footgun
+  skills = skills.filter(function(s) {
+    var fm = s.frontmatter || {};
+    return fm.name !== window._sbState.skillName;
+  });
+  if (q) {
+    skills = skills.filter(function(s) {
+      var fm = s.frontmatter || {};
+      return ((fm.name || '') + ' ' + (fm.title || '') + ' ' + (fm.description || '')).toLowerCase().indexOf(q) > -1;
+    });
+  }
+  if (skills.length === 0) {
+    listEl.innerHTML = '<div style="padding:18px;color:var(--text-muted);font-size:11px;text-align:center">' + (q ? 'No matches.' : 'No other skills available yet.') + '</div>';
+    return;
+  }
+  var html = '';
+  for (var i = 0; i < skills.length; i++) {
+    var s = skills[i];
+    var fm = s.frontmatter || {};
+    var insertion = 'Use the **' + (fm.name || '') + '** skill: ' + (fm.description || fm.title || '');
+    html += '<div onclick="sbInsertAtCursor(\\x27' + jsStr(insertion) + '\\x27)" style="padding:8px 12px;cursor:pointer;font-size:12px;border-bottom:1px solid var(--border-light)" onmouseover="this.style.background=\\x27var(--bg-tertiary)\\x27" onmouseout="this.style.background=\\x27transparent\\x27">'
+      + '<div style="font-weight:500;color:var(--text-primary)">' + esc(fm.title || fm.name) + '</div>'
+      + '<div style="font-size:10px;color:var(--text-muted);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;margin-top:2px">' + esc(fm.name) + '</div>'
+      + (fm.description ? '<div style="font-size:11px;color:var(--text-secondary);margin-top:4px;line-height:1.4">' + esc(fm.description.slice(0, 120)) + (fm.description.length > 120 ? '…' : '') + '</div>' : '')
+      + '</div>';
+  }
+  listEl.innerHTML = html;
+}
+
+function sbInsertAtCursor(text) {
+  var ed = document.getElementById('sb-editor');
+  if (!ed) return;
+  var start = ed.selectionStart;
+  var end = ed.selectionEnd;
+  var before = ed.value.substring(0, start);
+  var after = ed.value.substring(end);
+  ed.value = before + text + after;
+  ed.selectionStart = ed.selectionEnd = start + text.length;
+  ed.focus();
+  sbOnEdit();
+}
+
 async function _openSkillModal(opts) {
   opts = opts || {};
   var existing = null;
@@ -27410,6 +27997,12 @@ async function _openSkillModal(opts) {
       +   '</div>'
       +   '<div style="flex:1;overflow-y:auto;padding:18px 22px">'
       +     '<input type="hidden" id="skill-modal-original-name">'
+      +     '<input type="hidden" id="skill-modal-template-id">'
+      // 1.18.130 — templates picker. Strip of 5 archetype chips at the top
+      // of the create modal. Click one → fills body + tools.allow defaults
+      // so the user starts from a real procedure shape, not blank.
+      // Only shown in create mode (hidden during edit).
+      +     '<div id="skill-modal-templates" style="margin-bottom:14px"></div>'
       +     '<label style="display:block;font-size:12px;color:var(--text-secondary);margin-bottom:4px;font-weight:500">Name <span style="color:var(--text-muted)">(lowercase, dashes, max 64 chars)</span></label>'
       +     '<input id="skill-modal-name" type="text" placeholder="e.g. morning-briefing" style="width:100%;padding:8px 10px;font-size:13px;border:1px solid var(--border);border-radius:6px;background:var(--bg-secondary);color:var(--text-primary);margin-bottom:12px;font-family:\\x27JetBrains Mono\\x27,monospace">'
       +     '<label style="display:block;font-size:12px;color:var(--text-secondary);margin-bottom:4px;font-weight:500">Display title <span style="color:var(--text-muted)">(optional, friendlier name)</span></label>'
@@ -27448,6 +28041,87 @@ async function _openSkillModal(opts) {
   if (errEl) { errEl.style.display = 'none'; errEl.textContent = ''; }
   modal.style.display = 'flex';
   document.getElementById('skill-modal-name').focus();
+  if (typeof updateSkillModalCounters === 'function') updateSkillModalCounters();
+  // 1.18.130 — render templates strip in create mode only.
+  var tplBox = document.getElementById('skill-modal-templates');
+  var tplIdInput = document.getElementById('skill-modal-template-id');
+  if (tplIdInput) tplIdInput.value = '';
+  if (tplBox) {
+    if (opts.mode === 'edit') { tplBox.style.display = 'none'; tplBox.innerHTML = ''; }
+    else { tplBox.style.display = ''; loadSkillTemplatePicker(); }
+  }
+}
+
+// 1.18.130 — fetch templates + render the picker strip. Click a chip
+// to fill body + tools fields with the template's defaults. Templates
+// don't auto-fill the description because the user might be making a
+// variant — they pick the template for the procedure, then write their
+// own description.
+async function loadSkillTemplatePicker() {
+  var box = document.getElementById('skill-modal-templates');
+  if (!box) return;
+  try {
+    var r = await apiFetch('/api/skill-templates');
+    var d = await r.json();
+    if (!r.ok || !Array.isArray(d.templates)) { box.innerHTML = ''; return; }
+    window._skillTemplates = d.templates;
+    var html = '<div style="display:flex;flex-direction:column;gap:6px">';
+    html += '<div style="font-size:12px;color:var(--text-secondary);font-weight:500">Start from a template <span style="color:var(--text-muted);font-weight:normal">(optional — fills body + suggested tools)</span></div>';
+    html += '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:6px">';
+    for (var i = 0; i < d.templates.length; i++) {
+      var t = d.templates[i];
+      html += '<button type="button" onclick="applySkillTemplate(\\x27' + jsStr(t.id) + '\\x27)" data-tpl="' + esc(t.id) + '" style="text-align:left;padding:8px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg-secondary);color:var(--text-primary);cursor:pointer;display:flex;flex-direction:column;gap:3px;transition:all 0.1s" onmouseover="this.style.background=\\x27var(--bg-tertiary)\\x27;this.style.borderColor=\\x27var(--accent)\\x27" onmouseout="this.style.background=\\x27var(--bg-secondary)\\x27;this.style.borderColor=\\x27var(--border)\\x27">'
+        + '<span style="font-size:13px;font-weight:600">' + esc(t.emoji) + ' ' + esc(t.label) + '</span>'
+        + '<span style="font-size:10px;color:var(--text-muted);line-height:1.3">' + esc(t.hint) + '</span>'
+        + '</button>';
+    }
+    html += '</div>';
+    html += '<div id="skill-modal-template-applied" style="font-size:11px;color:var(--accent);display:none"></div>';
+    html += '</div>';
+    box.innerHTML = html;
+  } catch (err) {
+    box.innerHTML = '';
+  }
+}
+
+// Apply a template to the open create modal — fills body + tools + the
+// template-id hidden input. Description gets the template's default ONLY
+// if the field is empty (so users can pre-write a description and still
+// pick a template without it being clobbered).
+function applySkillTemplate(templateId) {
+  var t = (window._skillTemplates || []).find(function(x) { return x.id === templateId; });
+  if (!t) return;
+  var tplIdInput = document.getElementById('skill-modal-template-id');
+  if (tplIdInput) tplIdInput.value = templateId;
+  var descEl = document.getElementById('skill-modal-desc');
+  if (descEl && !descEl.value.trim()) descEl.value = t.defaultDescription || '';
+  var toolsEl = document.getElementById('skill-modal-tools');
+  if (toolsEl && !toolsEl.value.trim()) toolsEl.value = (t.suggestedTools || []).join(', ');
+  // Body fills only if empty — the actual rendered body comes from the
+  // backend (with {{TITLE}} interpolation) when the user clicks Save
+  // and we POST to /api/skills/from-template. We show a placeholder
+  // here so the user sees that the body will come from the template.
+  var bodyEl = document.getElementById('skill-modal-body');
+  if (bodyEl && !bodyEl.value.trim()) {
+    bodyEl.value = '# (Template "' + t.label + '" will fill in the body when you save.)\\n\\nFeel free to overwrite this — anything you type here replaces the template body.';
+  }
+  // Highlight the applied template button.
+  var buttons = document.querySelectorAll('#skill-modal-templates button[data-tpl]');
+  for (var i = 0; i < buttons.length; i++) {
+    var btn = buttons[i];
+    if (btn.getAttribute('data-tpl') === templateId) {
+      btn.style.background = 'rgba(255,140,33,0.12)';
+      btn.style.borderColor = 'var(--accent)';
+    } else {
+      btn.style.background = 'var(--bg-secondary)';
+      btn.style.borderColor = 'var(--border)';
+    }
+  }
+  var notice = document.getElementById('skill-modal-template-applied');
+  if (notice) {
+    notice.textContent = '✓ Template "' + t.label + '" applied. Body + tools pre-filled.';
+    notice.style.display = '';
+  }
   if (typeof updateSkillModalCounters === 'function') updateSkillModalCounters();
 }
 
@@ -27500,17 +28174,42 @@ async function saveSkillFromModal() {
   var tools = toolsRaw ? toolsRaw.split(',').map(function(s){ return s.trim(); }).filter(Boolean) : [];
   var saveBtn = document.getElementById('skill-modal-save');
   if (saveBtn) { saveBtn.disabled = true; saveBtn.textContent = 'Saving…'; }
+  // 1.18.130 — when a template was applied AND the body is the placeholder
+  // we set in applySkillTemplate, route through /api/skills/from-template
+  // so the backend renders the template body with {{TITLE}} substitution
+  // + ships any bundled files. If the user customized the body we honor
+  // their version via the regular endpoint.
+  var templateId = (document.getElementById('skill-modal-template-id')?.value || '').trim();
+  var bodyIsTemplatePlaceholder = !originalName && templateId && body.indexOf('# (Template "') === 0;
   try {
-    var endpoint = originalName ? '/api/skills/' + encodeURIComponent(originalName) : '/api/skills';
-    var method = originalName ? 'PUT' : 'POST';
-    var r = await apiFetch(endpoint, {
-      method: method,
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name: name, title: title || undefined, description: desc, tools: tools, body: body }),
-    });
-    if (!r.ok) {
-      var d = await r.json().catch(function(){ return {}; });
-      return fail(d.error || ('Save failed: HTTP ' + r.status));
+    var d;
+    if (bodyIsTemplatePlaceholder) {
+      var tr = await apiFetch('/api/skills/from-template', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ templateId: templateId, name: name, title: title || undefined, description: desc }),
+      });
+      if (!tr.ok) {
+        d = await tr.json().catch(function(){ return {}; });
+        return fail(d.error || ('Save failed: HTTP ' + tr.status));
+      }
+      // If template included a tools.allow but the user also typed tools,
+      // patch with their explicit list (template's suggestedTools were
+      // pre-filled into the input — overwrite is fine).
+      // The from-template endpoint already wrote suggestedTools; we don't
+      // re-PUT to merge unless the user actually edited the tools field.
+    } else {
+      var endpoint = originalName ? '/api/skills/' + encodeURIComponent(originalName) : '/api/skills';
+      var method = originalName ? 'PUT' : 'POST';
+      var r = await apiFetch(endpoint, {
+        method: method,
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: name, title: title || undefined, description: desc, tools: tools, body: body }),
+      });
+      if (!r.ok) {
+        d = await r.json().catch(function(){ return {}; });
+        return fail(d.error || ('Save failed: HTTP ' + r.status));
+      }
     }
     closeSkillModal();
     toast(originalName ? 'Skill updated' : 'Skill created', 'success');
@@ -28262,7 +28961,11 @@ function renderSkillDetail(s) {
   // ── 8. Action footer (1.18.115) — Edit + Delete + Open file. The pane
   // was read-only; users had to leave the dashboard to edit anything.
   html += '<div style="margin-top:24px;display:flex;gap:8px;flex-wrap:wrap">';
-  html += '<button class="btn-primary" onclick="openEditSkillModal(\\x27' + jsStr(fm.name) + '\\x27)" style="font-size:12px;padding:6px 14px;border-radius:6px;border:none;background:var(--accent);color:#fff;font-weight:500;cursor:pointer">Edit skill</button>';
+  // 1.18.130 — "Open in builder" promoted to primary. The builder is the
+  // bad-ass three-panel folder editor (file tree + editor + Tools/Skills
+  // sidebar). Quick edit modal stays as the lighter alternative.
+  html += '<button class="btn-primary" onclick="openSkillBuilder(\\x27' + jsStr(fm.name) + '\\x27)" style="font-size:12px;padding:6px 14px;border-radius:6px;border:none;background:var(--accent);color:#fff;font-weight:500;cursor:pointer" title="Open the full folder editor: file tree + Tools/Skills sidebar + live edit">⚡ Open in builder</button>';
+  html += '<button class="btn-sm" onclick="openEditSkillModal(\\x27' + jsStr(fm.name) + '\\x27)" style="font-size:12px;padding:6px 14px;border-radius:6px;border:1px solid var(--border);background:var(--bg-secondary);color:var(--text-primary);cursor:pointer" title="Quick edit just the SKILL.md frontmatter + body">Quick edit</button>';
   html += '<button class="btn-sm" onclick="confirmDeleteSkill(\\x27' + jsStr(fm.name) + '\\x27)" style="font-size:12px;padding:6px 14px;border-radius:6px;border:1px solid var(--border);background:var(--bg-secondary);color:var(--red);cursor:pointer">Delete</button>';
   html += '</div>';
 
