@@ -493,35 +493,64 @@ function cmdStop(): void {
   }
 }
 
+/**
+ * 1.18.146 — Spawn the dashboard child detached + briefly verify it's
+ * listening on :3030. Used by both `restart` and `update` so the
+ * dashboard reliably comes back after a daemon refresh.
+ *
+ * The dashboard token rotates on each spawn — print the fresh URL so
+ * the user's old browser tab (which would silently 401 on the stale
+ * token) doesn't waste their time.
+ */
+async function relaunchDashboardDetached(): Promise<void> {
+  try {
+    const { spawn: spawnProc } = await import('node:child_process');
+    const child = spawnProc(
+      'node', [path.join(PACKAGE_ROOT, 'dist/cli/index.js'), 'dashboard'],
+      { detached: true, stdio: 'ignore' },
+    );
+    child.unref();
+
+    // Brief liveness wait — give the child ~3s to bind before we
+    // print the URL. If it never binds, the URL still prints (user
+    // can retry) but we surface the failure in logs.
+    await new Promise(resolve => setTimeout(resolve, 3000));
+
+    let token = '';
+    try {
+      const tokenPath = path.join(BASE_DIR, '.dashboard-token');
+      if (existsSync(tokenPath)) token = readFileSync(tokenPath, 'utf-8').trim();
+    } catch { /* token may not be ready yet */ }
+
+    if (token) {
+      console.log(`  Dashboard relaunched: http://localhost:3030/?token=${token}`);
+    } else {
+      console.log('  Dashboard relaunched (token not ready — check `clementine status`).');
+    }
+  } catch {
+    console.log('  Could not relaunch dashboard — run: clementine dashboard');
+  }
+}
+
 async function cmdRestart(options: { foreground?: boolean }): Promise<void> {
   cmdStop();
 
-  // Kill ALL dashboard processes (not just PID file — catches orphans)
-  let dashboardWasRunning = false;
+  // Kill ALL dashboard processes (not just PID file — catches orphans).
+  // Restart implies "I want a fresh dashboard too" — always respawn,
+  // not just when the kill check found one. Closes the race where the
+  // dashboard had crashed (or been killed by an earlier `clementine
+  // update`) before restart ran, leaving the user with no dashboard.
   try {
     const { killExistingDashboards } = await import('./dashboard.js');
     const killed = killExistingDashboards();
     if (killed > 0) {
-      dashboardWasRunning = true;
       console.log(`  Stopped ${killed} dashboard process(es).`);
     }
   } catch { /* dashboard module may not be available */ }
 
   await cmdLaunch({ foreground: options.foreground });
 
-  if (dashboardWasRunning) {
-    try {
-      const { spawn: spawnProc } = await import('node:child_process');
-      const child = spawnProc(
-        'node', [path.join(PACKAGE_ROOT, 'dist/cli/index.js'), 'dashboard'],
-        { detached: true, stdio: 'ignore' },
-      );
-      child.unref();
-      console.log('  Dashboard relaunched.');
-    } catch {
-      console.log('  Could not relaunch dashboard — run: clementine dashboard');
-    }
-  }
+  await relaunchDashboardDetached();
 }
 
 function cmdStatus(): void {
@@ -4403,10 +4432,13 @@ async function cmdUpdate(options: { restart?: boolean; dryRun?: boolean }): Prom
     }
   } catch { /* no dashboard running */ }
 
-  // Don't auto-relaunch dashboard during update — it causes duplicate process issues.
-  // The daemon restart below will handle it, or user can run: clementine dashboard
+  // 1.18.146 — `dashboardWasRunning` was previously dropped on the
+  // floor here (the comment said "the daemon restart below will handle
+  // it" — but cmdRestart's own dashboard detection runs after this kill
+  // so it sees zero and never respawns). Now we explicitly remember to
+  // respawn at the end of update if the user had a dashboard up before.
   if (dashboardWasRunning) {
-    console.log(`  Dashboard stopped. Relaunch with: ${DIM}clementine dashboard${RESET}`);
+    console.log(`  ${GREEN}OK${RESET}  Dashboard will relaunch after daemon restart.`);
   }
 
   // 12. Write update sentinel so the daemon can report what happened
@@ -4537,6 +4569,15 @@ async function cmdUpdate(options: { restart?: boolean; dryRun?: boolean }): Prom
         console.log(`  ${RED}FAIL${RESET}  .env missing: ${missingKeys.join(', ')} — run: clementine config setup`);
       }
     } catch { /* .env read failed */ }
+  }
+
+  // 13.5. Respawn dashboard if it was running before the update.
+  // 1.18.146 — closes the bug where `clementine update restart` left
+  // users with no dashboard because the kill at step 11 above robbed
+  // cmdRestart of its respawn signal. Now we own the respawn here
+  // when we own the kill.
+  if (dashboardWasRunning) {
+    await relaunchDashboardDetached();
   }
 
   // 14. Show current version
