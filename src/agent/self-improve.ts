@@ -39,6 +39,7 @@ import {
 } from '../config.js';
 import { listAllGoals } from '../tools/shared.js';
 import { MemoryStore } from '../memory/store.js';
+import { ANTHROPIC_SKILL_NAME_PATTERN } from './skill-store.js';
 import type {
   CronRunEntry,
   EvolutionVersion,
@@ -2532,7 +2533,7 @@ export function validateProposal(area: string, target: string, proposedChange: s
     // present + non-empty, no XML tags in description, no Anthropic-
     // reserved words in name. Reuses the centralized validator that
     // dashboard + MCP + auto-extract all share.
-    if (!/^[a-z0-9][a-z0-9-]{0,63}$/.test(target)) {
+    if (!ANTHROPIC_SKILL_NAME_PATTERN.test(target)) {
       return { valid: false, error: `skill target must be a valid slug (got "${target}")` };
     }
     let parsed: ReturnType<typeof matter>;
@@ -2545,7 +2546,7 @@ export function validateProposal(area: string, target: string, proposedChange: s
     const name = typeof fm.name === 'string' ? fm.name : '';
     const description = typeof fm.description === 'string' ? fm.description : '';
     const body = parsed.content || '';
-    if (!name || !/^[a-z0-9][a-z0-9-]{0,63}$/.test(name)) {
+    if (!name || !ANTHROPIC_SKILL_NAME_PATTERN.test(name)) {
       return { valid: false, error: 'skill frontmatter "name" missing or invalid slug' };
     }
     if (name !== target) {

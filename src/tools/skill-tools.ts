@@ -29,7 +29,10 @@ import { VAULT_DIR, textResult, logger } from './shared.js';
 // 1.18.124 — name regex is the only validator skill-tools still uses
 // directly (for update_skill's pre-flight slug check). All other
 // validations + the file write live in skill-store.writeSkill.
-const NAME_PATTERN = /^[a-z0-9][a-z0-9-]{0,63}$/;
+// 1.18.144 — pulled the regex from skill-store's exported canonical
+// constant so all skill-name validation now traces to one source.
+import { ANTHROPIC_SKILL_NAME_PATTERN } from '../agent/skill-store.js';
+const NAME_PATTERN = ANTHROPIC_SKILL_NAME_PATTERN;
 const DESCRIPTION_MAX_LEN = 1024;
 
 function globalSkillsDir(): string {

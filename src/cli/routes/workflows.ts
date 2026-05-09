@@ -116,7 +116,8 @@ export function workflowsRouter(deps: WorkflowsRouterDeps): Router {
 
       // Slugify the workflow name to the Anthropic regex
       const slug = name.toLowerCase().replace(/[^a-z0-9-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 64);
-      if (!/^[a-z0-9][a-z0-9-]{0,63}$/.test(slug)) {
+      const { ANTHROPIC_SKILL_NAME_PATTERN } = await import('../../agent/skill-store.js');
+      if (!ANTHROPIC_SKILL_NAME_PATTERN.test(slug)) {
         res.status(400).json({ ok: false, error: `Workflow name "${name}" cannot be slugified to Anthropic regex` });
         return;
       }

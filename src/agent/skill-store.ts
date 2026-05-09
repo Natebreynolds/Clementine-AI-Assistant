@@ -58,7 +58,13 @@ function projectSkillsDir(workDir: string | undefined): string | null {
 
 // ── Anthropic spec validations ────────────────────────────────────────
 
-const NAME_PATTERN = /^[a-z0-9][a-z0-9-]{0,63}$/;
+/**
+ * Anthropic skill slug regex. Exported (1.18.144) so other modules
+ * (self-improve, migration tooling) don't drift their own copies.
+ * Lowercase letters/digits/dashes, must start with [a-z0-9], ≤64 chars.
+ */
+export const ANTHROPIC_SKILL_NAME_PATTERN = /^[a-z0-9][a-z0-9-]{0,63}$/;
+const NAME_PATTERN = ANTHROPIC_SKILL_NAME_PATTERN;
 const RESERVED_NAMES = new Set(['anthropic', 'claude']);
 const NAME_MAX_LEN = 64;
 const DESCRIPTION_MAX_LEN = 1024;

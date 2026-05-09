@@ -401,6 +401,26 @@ export function agentDailyNotesDir(slug: string | null): string {
   return path.join(AGENTS_DIR, slug, 'daily-notes');
 }
 
+/**
+ * 1.18.144 — Single source of truth for "all currently-hired agent
+ * slugs." Five+ files used to inline the same readdirSync + filter
+ * pattern (skipping leading-underscore directories like _archive).
+ *
+ * Returns slugs sorted alphabetically. Returns [] when AGENTS_DIR
+ * doesn't exist or can't be read.
+ */
+export function listAgentSlugs(): string[] {
+  if (!existsSync(AGENTS_DIR)) return [];
+  try {
+    return readdirSync(AGENTS_DIR, { withFileTypes: true })
+      .filter((d) => d.isDirectory() && !d.name.startsWith('_'))
+      .map((d) => d.name)
+      .sort();
+  } catch {
+    return [];
+  }
+}
+
 // ── Goal store (global + per-agent) ────────────────────────────────────
 
 export type GoalRecord = {

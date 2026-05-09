@@ -54,6 +54,35 @@ export function loadStateFile<T>(
   }
 }
 
+/**
+ * 1.18.144 — Generic JSON file reader for non-scheduler call sites.
+ *
+ * Same try/parse/fallback shape as loadStateFile but with a `silent`
+ * option for callers who expect missing files to be common (e.g. a
+ * tool reading an optional config) and don't want every miss to log.
+ *
+ * Six+ files were inlining `try { JSON.parse(readFileSync(p)) } catch
+ * { return default }` before this. They now share one well-tested
+ * helper, which means the next file that needs to read a JSON sidecar
+ * doesn't add a seventh variant.
+ */
+export function loadJsonFile<T>(
+  filePath: string,
+  defaultValue: T,
+  opts: { silent?: boolean; validator?: (raw: unknown) => T } = {},
+): T {
+  try {
+    if (!existsSync(filePath)) return defaultValue;
+    const raw = JSON.parse(readFileSync(filePath, 'utf-8'));
+    return opts.validator ? opts.validator(raw) : (raw as T);
+  } catch (err) {
+    if (!opts.silent) {
+      logger.warn({ err, filePath }, 'Failed to load JSON file — using default');
+    }
+    return defaultValue;
+  }
+}
+
 export interface SaveStateOptions {
   /**
    * If true, write to `<file>.tmp` then rename — guarantees the on-disk

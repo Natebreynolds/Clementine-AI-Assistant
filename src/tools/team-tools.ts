@@ -12,6 +12,7 @@ import {
   TEAM_COMMS_LOG, env, logger, parseTasks, textResult,
 } from './shared.js';
 import { todayISO } from '../gateway/cron-scheduler.js';
+import { listAgentSlugs } from './shared.js';
 
 // ── Helpers ─────────────────────────────────────────────────────────────
 
@@ -30,7 +31,7 @@ async function loadTeamAgents(): Promise<TeamAgentInfo[]> {
 
   if (existsSync(AGENTS_DIR)) {
     try {
-      for (const slug of readdirSync(AGENTS_DIR, { withFileTypes: true }).filter(d => d.isDirectory() && !d.name.startsWith('_')).map(d => d.name)) {
+      for (const slug of listAgentSlugs()) {
         const agentFile = path.join(AGENTS_DIR, slug, 'agent.md');
         if (!existsSync(agentFile)) continue;
         try {
@@ -374,10 +375,7 @@ export function registerTeamTools(server: McpServer): void {
       const agentsBase = AGENTS_DIR;
       if (!existsSync(agentsBase)) return textResult('No agents found.');
 
-      const agentSlugs = readdirSync(agentsBase, { withFileTypes: true })
-        .filter(d => d.isDirectory())
-        .map(d => d.name)
-        .filter(n => !agent || n === agent);
+      const agentSlugs = listAgentSlugs().filter(n => !agent || n === agent);
 
       if (!agentSlugs.length) return textResult('No agents found.');
 
