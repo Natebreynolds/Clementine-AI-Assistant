@@ -18401,7 +18401,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
                 <span>MEMORY.md</span>
                 <span style="font-size:11px;color:var(--text-muted)">Curated facts loaded into every session</span>
               </div>
-              <div class="card-body" id="panel-memory"><div class="empty-state">Loading...</div></div>
+              <div class="card-body" id="panel-memory"><div class="skel-block"><div class="skel-row med"></div><div class="skel-row"></div><div class="skel-row short"></div></div></div>
             </div>
             <div class="card" style="margin-bottom:14px">
               <div class="card-header" style="display:flex;align-items:center;justify-content:space-between">
@@ -20623,7 +20623,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
               <span class="badge" id="ra-status-badge" style="font-size:10px">Loading...</span>
             </div>
             <div class="card-body" style="padding:16px" id="ra-content">
-              <div class="empty-state">Loading...</div>
+              <div class="skel-block"><div class="skel-row med"></div><div class="skel-row short"></div></div>
             </div>
           </div>
         </div>
@@ -20649,7 +20649,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
               <span style="font-size:11px;color:var(--text-muted)">1000+ services — OAuth handled by Composio</span>
             </div>
             <div class="card-body" style="padding:16px" id="composio-connections">
-              <div class="empty-state">Loading...</div>
+              <div class="skel-block"><div class="skel-row med"></div><div class="skel-row"></div><div class="skel-row short"></div></div>
             </div>
           </div>
           <div class="card" style="margin-bottom:20px">
@@ -20658,7 +20658,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
               <span style="font-size:11px;color:var(--text-muted)">Pick which source the agent uses when a service has multiple</span>
             </div>
             <div class="card-body" style="padding:16px" id="tool-preferences">
-              <div class="empty-state">Loading...</div>
+              <div class="skel-block"><div class="skel-row med"></div><div class="skel-row short"></div></div>
             </div>
           </div>
           <div class="card" style="margin-bottom:20px">
@@ -20708,13 +20708,13 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
               <span class="badge" id="sf-status-badge" style="font-size:10px">Checking...</span>
             </div>
             <div class="card-body" style="padding:16px" id="sf-status-content">
-              <div class="empty-state">Loading...</div>
+              <div class="skel-block"><div class="skel-row med"></div><div class="skel-row short"></div></div>
             </div>
           </div>
           <div class="card" style="margin-bottom:20px">
             <div class="card-header">Sync History</div>
             <div class="card-body" style="padding:0" id="sf-sync-history">
-              <div class="empty-state" style="padding:24px">Loading...</div>
+              <div class="skel-block" style="padding:18px"><div class="skel-row med"></div><div class="skel-row"></div><div class="skel-row short"></div></div>
             </div>
           </div>
           <div class="card">
@@ -22806,7 +22806,7 @@ function switchAgentDetailTab(tab) {
 async function loadAgentDetailTab(tab, slug, isPrimary) {
   var container = document.getElementById('agent-detail-tab-content');
   if (!container) return;
-  container.innerHTML = '<div class="empty-state">Loading...</div>';
+  container.innerHTML = '<div class="skel-block"><div class="skel-row med"></div><div class="skel-row"></div><div class="skel-row short"></div></div>';
   var a = _agentDetailData;
 
   if (tab === 'tasks') {
@@ -26283,7 +26283,7 @@ function renderRunDetailWaterfall(events, runId, jobName) {
 
 async function openTraceViewer(jobName) {
   document.getElementById('trace-modal-title').textContent = 'Trace: ' + jobName;
-  document.getElementById('trace-content').innerHTML = '<div style="padding:20px;color:var(--text-muted)">Loading...</div>';
+  document.getElementById('trace-content').innerHTML = '<div class="skel-block" style="padding:20px"><div class="skel-row med"></div><div class="skel-row"></div><div class="skel-row short"></div></div>';
   document.getElementById('trace-modal').classList.add('show');
 
   try {
@@ -36673,7 +36673,7 @@ function switchDrawerTab(tab) {
 async function loadDrawerTab(tab) {
   var el = document.getElementById('drawer-content');
   if (!el || !drawerSlug) return;
-  el.innerHTML = '<div class="empty-state">Loading...</div>';
+  el.innerHTML = '<div class="skel-block"><div class="skel-row med"></div><div class="skel-row"></div><div class="skel-row short"></div></div>';
 
   if (tab === 'overview') {
     await loadDrawerOverview(el);
@@ -37570,7 +37570,7 @@ async function togglePromptHistory() {
     return;
   }
   container.style.display = '';
-  container.innerHTML = '<div style="color:var(--text-muted);font-size:12px">Loading...</div>';
+  container.innerHTML = '<div class="skel-block"><div class="skel-row med"></div><div class="skel-row short"></div></div>';
 
   try {
     var r = await apiFetch('/api/cron/' + encodeURIComponent(_promptLabJobName) + '/prompt-history');
@@ -38159,7 +38159,7 @@ async function refreshTeamPulse(preloadedOffice) {
 async function refreshAgentComparison() {
   var container = document.getElementById('panel-agents-compare');
   if (!container) return;
-  container.innerHTML = '<div class="empty-state">Loading...</div>';
+  container.innerHTML = '<div class="skel-block"><div class="skel-row med"></div><div class="skel-row"></div><div class="skel-row short"></div></div>';
   try {
     var r = await apiFetch('/api/agents/compare?days=30');
     var d = await r.json();
