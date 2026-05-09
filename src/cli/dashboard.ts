@@ -1804,6 +1804,27 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
       try { unlinkSync(DASHBOARD_PID_FILE); } catch { /* ignore */ }
     };
 
+    // 1.18.147 — Auto-open the dashboard URL in the user's default
+    // browser once the child has had a chance to bind + write the
+    // token file. Direct `clementine dashboard` invocations now match
+    // the restart/update flow so the user never has to copy-paste a
+    // token by hand. Honors NO_BROWSER=1 for headless / CI runs.
+    if (process.env.NO_BROWSER !== '1') {
+      setTimeout(() => {
+        try {
+          const tokenPath = path.join(BASE_DIR, '.dashboard-token');
+          const token = existsSync(tokenPath) ? readFileSync(tokenPath, 'utf-8').trim() : '';
+          if (!token) return;
+          const url = `http://localhost:${childPort}/?token=${token}`;
+          const platform = process.platform;
+          const cmd = platform === 'darwin' ? 'open'
+                    : platform === 'win32' ? 'start'
+                    : 'xdg-open';
+          spawn(cmd, [url], { detached: true, stdio: 'ignore' }).unref();
+        } catch { /* best effort */ }
+      }, 1500);
+    }
+
     // Forward signals to child
     process.on('SIGINT', () => { child.kill('SIGINT'); cleanup(); process.exit(0); });
     process.on('SIGTERM', () => { child.kill('SIGTERM'); cleanup(); process.exit(0); });

@@ -502,7 +502,31 @@ function cmdStop(): void {
  * the user's old browser tab (which would silently 401 on the stale
  * token) doesn't waste their time.
  */
-async function relaunchDashboardDetached(): Promise<void> {
+/**
+ * 1.18.147 — Open the dashboard URL in the user's default browser.
+ *
+ * Invoked after the dashboard child binds. Best-effort cross-platform:
+ * macOS uses `open`, Windows uses `start`, Linux falls back to
+ * `xdg-open`. Failures are swallowed (no native browser, headless
+ * SSH session, etc.) — the printed URL is still the source of truth
+ * the user can copy by hand.
+ *
+ * Honors NO_BROWSER=1 env var so CI / scripted runs don't get a
+ * spurious browser tab.
+ */
+function openInBrowser(url: string): void {
+  if (process.env.NO_BROWSER === '1') return;
+  const platform = process.platform;
+  const cmd = platform === 'darwin' ? 'open'
+            : platform === 'win32' ? 'start'
+            : 'xdg-open';
+  try {
+    const { spawn: spawnProc } = require('node:child_process');
+    spawnProc(cmd, [url], { detached: true, stdio: 'ignore' }).unref();
+  } catch { /* no browser available; URL was already printed */ }
+}
+
+async function relaunchDashboardDetached(opts: { open?: boolean } = {}): Promise<void> {
   try {
     const { spawn: spawnProc } = await import('node:child_process');
     const child = spawnProc(
@@ -523,7 +547,12 @@ async function relaunchDashboardDetached(): Promise<void> {
     } catch { /* token may not be ready yet */ }
 
     if (token) {
-      console.log(`  Dashboard relaunched: http://localhost:3030/?token=${token}`);
+      const url = `http://localhost:3030/?token=${token}`;
+      console.log(`  Dashboard relaunched: ${url}`);
+      // 1.18.147 — auto-open the browser by default. Restart/update
+      // already imply user wants the dashboard back; making them copy a
+      // URL was a UX papercut.
+      if (opts.open !== false) openInBrowser(url);
     } else {
       console.log('  Dashboard relaunched (token not ready — check `clementine status`).');
     }
