@@ -11,7 +11,7 @@ import { writeFileSync } from 'node:fs';
 import path from 'node:path';
 import pino from 'pino';
 import type { Gateway } from '../gateway/router.js';
-import type { CronScheduler } from '../gateway/heartbeat.js';
+import type { CronScheduler } from '../gateway/cron-scheduler.js';
 import { AgentBotClient, type AgentBotStatus } from './discord-agent-bot.js';
 import { formatCronEmbed } from './discord-utils.js';
 

@@ -50,7 +50,8 @@ import {
   BASE_DIR,
   DEFAULT_MODEL_TIER,
 } from '../config.js';
-import type { HeartbeatScheduler, CronScheduler } from '../gateway/heartbeat.js';
+import type { HeartbeatScheduler } from '../gateway/heartbeat-scheduler.js';
+import type { CronScheduler } from '../gateway/cron-scheduler.js';
 import type { NotificationDispatcher } from '../gateway/notifications.js';
 import type { Gateway } from '../gateway/router.js';
 import { findProjectByName, getLinkedProjects } from '../agent/assistant.js';

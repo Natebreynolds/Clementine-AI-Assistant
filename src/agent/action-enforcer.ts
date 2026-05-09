@@ -128,34 +128,3 @@ export function assessActionResponse(input: {
 
   return { violation: false, reason: 'no unsupported action claim detected' };
 }
-
-export function buildActionEnforcementPrompt(input: {
-  userText: string;
-  previousResponse: string;
-  reason: string;
-}): string {
-  return [
-    '[SYSTEM ACTION ENFORCEMENT]',
-    'Your previous response was not allowed because it implied action without verified tool activity.',
-    `Reason: ${input.reason}`,
-    '',
-    'Original user request:',
-    input.userText.slice(0, 1200),
-    '',
-    'Previous response:',
-    input.previousResponse.slice(0, 1200),
-    '',
-    'Now correct this in the same turn:',
-    '- If the action is possible, use the appropriate tool now.',
-    '- If the action is blocked, say exactly what is blocking it.',
-    '- Do not say "done", "sent", "queued", "checked", or similar unless a tool call actually verifies it.',
-  ].join('\n');
-}
-
-export function fallbackUnverifiedActionResponse(reason: string): string {
-  return [
-    "I didn't complete that yet.",
-    `I caught an action-verification issue: ${reason}.`,
-    "I won't call it done without a tool confirmation. Please resend the request and I'll retry from a clean turn.",
-  ].join(' ');
-}

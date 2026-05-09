@@ -11,7 +11,7 @@ import path from 'node:path';
 import pino from 'pino';
 
 import { ADVISOR_RULES_LOADER, CRON_REFLECTIONS_DIR, ADVISOR_LOG_PATH } from '../config.js';
-import { CronRunLog } from '../gateway/heartbeat.js';
+import { CronRunLog } from '../gateway/cron-scheduler.js';
 import { evolvePrompt } from './prompt-evolver.js';
 import {
   loadAdvisorRules,

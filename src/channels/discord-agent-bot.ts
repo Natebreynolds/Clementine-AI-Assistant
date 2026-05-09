@@ -35,7 +35,7 @@ import {
 import pino from 'pino';
 import type { AgentProfile } from '../types.js';
 import type { Gateway } from '../gateway/router.js';
-import type { CronScheduler } from '../gateway/heartbeat.js';
+import type { CronScheduler } from '../gateway/cron-scheduler.js';
 import { chunkText, DiscordStreamingMessage, friendlyToolName, sanitizeResponse, rehydrateStatusEmbed, setSavedStatusEmbed } from './discord-utils.js';
 import { MODELS } from '../config.js';
 import * as cronParser from 'cron-parser';

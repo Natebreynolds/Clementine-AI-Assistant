@@ -13,12 +13,8 @@ import path from 'node:path';
 import cron from 'node-cron';
 import matter from 'gray-matter';
 import type { CronJobDefinition, CronRunEntry } from '../types.js';
-import {
-  parseCronJobs,
-  HeartbeatScheduler,
-  CronRunLog,
-  classifyError,
-} from '../gateway/heartbeat.js';
+import { HeartbeatScheduler } from '../gateway/heartbeat-scheduler.js';
+import { parseCronJobs, CronRunLog, classifyError } from '../gateway/cron-scheduler.js';
 
 const BASE_DIR = process.env.CLEMENTINE_HOME || path.join(os.homedir(), '.clementine');
 const LAST_RUN_FILE = path.join(BASE_DIR, '.cron_last_run.json');

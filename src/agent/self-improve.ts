@@ -904,7 +904,7 @@ export class SelfImproveLoop {
     store.close();
 
     // Gather cron errors from run logs
-    const { CronRunLog } = await import('../gateway/heartbeat.js');
+    const { CronRunLog } = await import('../gateway/cron-scheduler.js');
     const runLog = new CronRunLog();
     const cronErrors: CronRunEntry[] = [];
     let cronTotal = 0;

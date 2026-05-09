@@ -1544,16 +1544,6 @@ async function getBuildUsageForOperations(hoursInput: unknown = 168, limitInput:
   }
 }
 
-function getTimers(): unknown[] {
-  const timersFile = path.join(BASE_DIR, '.timers.json');
-  if (!existsSync(timersFile)) return [];
-  try {
-    return JSON.parse(readFileSync(timersFile, 'utf-8'));
-  } catch {
-    return [];
-  }
-}
-
 function getHeartbeat(): Record<string, unknown> {
   const hbFile = path.join(BASE_DIR, '.heartbeat_state.json');
   if (!existsSync(hbFile)) return {};
@@ -2178,9 +2168,6 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
     persistSessions();
   }, 10 * 60 * 1000);
 
-  // Quick ping — bypasses all middleware, tests /api path routing
-  app.get('/api/ping', (_req, res) => { res.json({ pong: true }); });
-
   // ── Background project scanner ───────────────────────────────────────
   // scanProjects() does heavy synchronous filesystem I/O (statSync across
   // hundreds of Desktop/Documents entries) which permanently blocks the
@@ -2651,10 +2638,6 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
     res.json(getCronJobs());
   });
 
-  app.get('/api/timers', (_req, res) => {
-    res.json(getTimers());
-  });
-
   app.get('/api/heartbeat', (_req, res) => {
     res.json(getHeartbeat());
   });
@@ -2839,23 +2822,6 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
       }
       deleteBackgroundTask(id);
       res.json({ ok: true, message: `Cleared background task ${id}` });
-    } catch (err) {
-      res.status(500).json({ error: String(err).slice(0, 200) });
-    }
-  });
-
-  app.get('/api/autonomy', async (req, res) => {
-    try {
-      const { getStore } = await import('../tools/shared.js');
-      const store = await getStore();
-      const logs = store.queryAutonomyLog({
-        component: typeof req.query.component === 'string' ? req.query.component : undefined,
-        event: typeof req.query.event === 'string' ? req.query.event : undefined,
-        agentSlug: typeof req.query.agentSlug === 'string' ? req.query.agentSlug : undefined,
-        limit: typeof req.query.limit === 'string' ? parseInt(req.query.limit, 10) : 100,
-        since: typeof req.query.since === 'string' ? req.query.since : undefined,
-      });
-      res.json({ logs });
     } catch (err) {
       res.status(500).json({ error: String(err).slice(0, 200) });
     }
@@ -6690,30 +6656,6 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
       writeFileSync(sessionsFile, JSON.stringify(sessions, null, 2));
       broadcastEvent({ type: 'session_cleared', data: { key } });
       res.json({ ok: true, message: `Cleared session: ${key}` });
-    } catch (err) {
-      res.status(500).json({ error: String(err) });
-    }
-  });
-
-  app.post('/api/timers/:id/cancel', (req, res) => {
-    const timerId = req.params.id;
-    const timersFile = path.join(BASE_DIR, '.timers.json');
-    try {
-      if (!existsSync(timersFile)) {
-        res.status(404).json({ error: 'No timers file' });
-        return;
-      }
-      const timers = JSON.parse(readFileSync(timersFile, 'utf-8')) as unknown[];
-      const idx = (timers as Array<Record<string, unknown>>).findIndex(
-        (t) => String(t.id) === timerId,
-      );
-      if (idx === -1) {
-        res.status(404).json({ error: `Timer "${timerId}" not found` });
-        return;
-      }
-      timers.splice(idx, 1);
-      writeFileSync(timersFile, JSON.stringify(timers, null, 2));
-      res.json({ ok: true, message: `Cancelled timer: ${timerId}` });
     } catch (err) {
       res.status(500).json({ error: String(err) });
     }
@@ -12550,16 +12492,6 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
   // ── Advisor Decision Analytics API ─────────────────────────────
 
   const ADVISOR_LOG = path.join(BASE_DIR, 'cron', 'advisor-decisions.jsonl');
-
-  app.get('/api/advisor/decisions', (req, res) => {
-    const limit = parseInt(String(req.query.limit ?? '100'), 10);
-    if (!existsSync(ADVISOR_LOG)) { res.json({ decisions: [] }); return; }
-    try {
-      const lines = readFileSync(ADVISOR_LOG, 'utf-8').trim().split('\n').filter(Boolean);
-      const decisions = lines.slice(-limit).map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean).reverse();
-      res.json({ decisions });
-    } catch { res.json({ decisions: [] }); }
-  });
 
   app.get('/api/advisor/analytics', (_req, res) => {
     // Build analytics from run logs + advisor decisions

@@ -789,7 +789,8 @@ async function asyncMain(): Promise<void> {
   })();
 
   // Heartbeat + Cron schedulers
-  const { HeartbeatScheduler, CronScheduler } = await import('./gateway/heartbeat.js');
+  const { HeartbeatScheduler } = await import('./gateway/heartbeat-scheduler.js');
+  const { CronScheduler } = await import('./gateway/cron-scheduler.js');
   const heartbeat = new HeartbeatScheduler(gateway, dispatcher);
   const cronScheduler = new CronScheduler(gateway, dispatcher);
   heartbeat.setCronScheduler(cronScheduler);
