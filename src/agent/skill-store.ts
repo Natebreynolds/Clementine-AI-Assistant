@@ -22,7 +22,7 @@
  * crons → folder-form skills.
  */
 
-import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import matter from 'gray-matter';
@@ -751,4 +751,80 @@ export function writeSkill(input: WriteSkillInput): WriteSkillResult {
   writeFileSync(entryPath, content);
 
   return { filePath: entryPath, name: input.name, overwrote: existed };
+}
+
+// ── Legacy backup janitor (1.18.125) ─────────────────────────────────
+//
+// Pre-1.18.124, `saveActiveSkill` wrote a per-overwrite `.md.bak` next to
+// every skill it updated. The new `writeSkill` path doesn't create these,
+// but the old ones rot in the vault forever unless something sweeps them.
+// `cleanupLegacySkillBackups` finds `.md.bak` files older than the cutoff
+// and removes them. Runs from the periodic memory-maintenance cycle so
+// users don't need to know it exists.
+//
+// Conservative: 30-day age floor + only the slug-named `.md.bak` pattern.
+// Anything mtime-recent stays put in case a user is mid-rollback.
+
+const LEGACY_BAK_AGE_DAYS = 30;
+const LEGACY_BAK_AGE_MS = LEGACY_BAK_AGE_DAYS * 24 * 60 * 60 * 1000;
+
+export interface SkillBackupSweepResult {
+  /** Files removed this pass. Absolute paths. */
+  removed: string[];
+  /** Files inspected (matched the pattern). Useful for "nothing to do" telemetry. */
+  inspected: number;
+  /** Files that matched the pattern but were younger than the cutoff (kept). */
+  keptFresh: number;
+}
+
+/**
+ * Sweep `.md.bak` skill backups older than `LEGACY_BAK_AGE_DAYS` from the
+ * global skills directory and from every per-agent skills directory under
+ * `00-System/agents/<slug>/skills/`. Best-effort: per-file errors are
+ * swallowed so a permission glitch on one file doesn't stop the sweep.
+ *
+ * Idempotent — safe to call repeatedly. Returns counts for logging.
+ */
+export function cleanupLegacySkillBackups(): SkillBackupSweepResult {
+  const result: SkillBackupSweepResult = { removed: [], inspected: 0, keptFresh: 0 };
+  const cutoff = Date.now() - LEGACY_BAK_AGE_MS;
+
+  const sweepRoots: string[] = [globalSkillsDir()];
+
+  // Per-agent skill dirs — discover via the agents/ folder.
+  try {
+    const base = process.env.CLEMENTINE_HOME || path.join(os.homedir(), '.clementine');
+    const agentsDir = path.join(base, 'vault', '00-System', 'agents');
+    if (existsSync(agentsDir)) {
+      for (const entry of readdirSync(agentsDir)) {
+        if (entry.startsWith('.')) continue;
+        const agentSkillsDir = path.join(agentsDir, entry, 'skills');
+        if (existsSync(agentSkillsDir)) sweepRoots.push(agentSkillsDir);
+      }
+    }
+  } catch { /* non-fatal — global sweep still runs */ }
+
+  for (const root of sweepRoots) {
+    let entries: string[];
+    try { entries = readdirSync(root); } catch { continue; }
+    for (const entry of entries) {
+      // Match exactly the legacy pattern. Don't touch anything else — we
+      // never want to nuke `templates/old-draft.md.bak` inside a folder skill,
+      // for instance. The legacy writer only ever produced flat
+      // `<slug>.md.bak` siblings, so that's all we sweep.
+      if (!entry.endsWith('.md.bak')) continue;
+      const full = path.join(root, entry);
+      let st;
+      try { st = statSync(full); } catch { continue; }
+      if (!st.isFile()) continue;
+      result.inspected++;
+      if (st.mtimeMs > cutoff) { result.keptFresh++; continue; }
+      try {
+        unlinkSync(full);
+        result.removed.push(full);
+      } catch { /* skip — permission or race; next sweep retries */ }
+    }
+  }
+
+  return result;
 }

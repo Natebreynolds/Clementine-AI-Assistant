@@ -4,7 +4,13 @@
  */
 
 import { describe, expect, it } from 'vitest';
-import { computeEffectiveAllowedTools, applyMcpAllowlist } from '../src/agent/run-agent-cron.js';
+import {
+  computeEffectiveAllowedTools,
+  applyMcpAllowlist,
+  widenAllowlistWithSkillTools,
+  widenMcpAllowlistWithSkillRefs,
+  extractMcpServersFromSkillBodies,
+} from '../src/agent/run-agent-cron.js';
 
 describe('computeEffectiveAllowedTools', () => {
   it('returns undefined when both job and profile allowlists are absent (legacy behavior preserved)', () => {
@@ -105,5 +111,106 @@ describe('applyMcpAllowlist', () => {
     const before = { ...servers };
     applyMcpAllowlist(servers, ['slack']);
     expect(servers).toEqual(before);
+  });
+});
+
+describe('widenAllowlistWithSkillTools (1.18.125 — pinned-skill scope widening)', () => {
+  it('returns undefined when the cron has no allowlist (skill tools should not narrow an unrestricted cron)', () => {
+    expect(widenAllowlistWithSkillTools(undefined, ['Read', 'Bash'])).toBeUndefined();
+    expect(widenAllowlistWithSkillTools([], ['Read', 'Bash'])).toBeUndefined();
+  });
+
+  it('returns the cron allowlist unchanged when no pinned-skill tools were declared', () => {
+    expect(widenAllowlistWithSkillTools(['Read', 'Edit'], undefined)).toEqual(['Read', 'Edit']);
+    expect(widenAllowlistWithSkillTools(['Read', 'Edit'], [])).toEqual(['Read', 'Edit']);
+  });
+
+  it('unions cron allowlist with skill tools (widens, never narrows)', () => {
+    const result = widenAllowlistWithSkillTools(['Read'], ['Read', 'Bash']);
+    expect(new Set(result)).toEqual(new Set(['Read', 'Bash']));
+  });
+
+  it('dedupes when cron and skill request the same tool', () => {
+    const result = widenAllowlistWithSkillTools(['Read', 'Bash'], ['Bash', 'Edit']);
+    expect(result).toHaveLength(3);
+    expect(new Set(result)).toEqual(new Set(['Read', 'Bash', 'Edit']));
+  });
+
+  it('does not mutate inputs', () => {
+    const cron = ['Read'];
+    const skills = ['Bash'];
+    const cronBefore = [...cron];
+    const skillsBefore = [...skills];
+    widenAllowlistWithSkillTools(cron, skills);
+    expect(cron).toEqual(cronBefore);
+    expect(skills).toEqual(skillsBefore);
+  });
+
+  it('downstream computeEffectiveAllowedTools sees the widened list', () => {
+    // End-to-end: cron allows [Read], skill needs Bash, profile permits both.
+    // Pre-1.18.125 the SDK only saw Read; now it sees Read + Bash.
+    const widened = widenAllowlistWithSkillTools(['Read'], ['Bash']);
+    const eff = computeEffectiveAllowedTools(widened, ['Read', 'Bash', 'Edit']);
+    expect(eff).toBeDefined();
+    expect(new Set(eff)).toEqual(new Set(['Agent', 'Read', 'Bash']));
+  });
+});
+
+describe('extractMcpServersFromSkillBodies (1.18.125)', () => {
+  it('returns an empty array when no skill bodies reference MCP tools', () => {
+    expect(extractMcpServersFromSkillBodies([])).toEqual([]);
+    expect(extractMcpServersFromSkillBodies(['Just a plain Markdown body, no MCP refs.'])).toEqual([]);
+  });
+
+  it('extracts a single server name from a body that calls one MCP tool', () => {
+    const body = 'Send via mcp__gmail__send_message with the right subject.';
+    expect(extractMcpServersFromSkillBodies([body])).toEqual(['gmail']);
+  });
+
+  it('captures server names with single underscores (claude_ai_Microsoft_365)', () => {
+    const body = '1. Pull email via mcp__claude_ai_Microsoft_365__outlook_email_search.';
+    expect(extractMcpServersFromSkillBodies([body])).toEqual(['claude_ai_Microsoft_365']);
+  });
+
+  it('captures dashed and CamelCase server names (clementine-tools, ElevenLabs, Bright_Data)', () => {
+    const body = 'mcp__clementine-tools__list_skills, mcp__ElevenLabs__text_to_speech, mcp__Bright_Data__discover.';
+    expect(new Set(extractMcpServersFromSkillBodies([body]))).toEqual(
+      new Set(['clementine-tools', 'ElevenLabs', 'Bright_Data']),
+    );
+  });
+
+  it('dedupes the same server referenced multiple times across bodies', () => {
+    const a = 'Step 1: mcp__gmail__send_message.';
+    const b = 'Step 2: also use mcp__gmail__list_messages and mcp__slack__post_message.';
+    expect(new Set(extractMcpServersFromSkillBodies([a, b]))).toEqual(new Set(['gmail', 'slack']));
+  });
+
+  it('ignores empty / nullish bodies without throwing', () => {
+    const result = extractMcpServersFromSkillBodies(['', 'mcp__gmail__send', '' as string]);
+    expect(result).toEqual(['gmail']);
+  });
+});
+
+describe('widenMcpAllowlistWithSkillRefs (1.18.125)', () => {
+  it('returns undefined when the cron has no MCP allowlist (unrestricted)', () => {
+    expect(widenMcpAllowlistWithSkillRefs(undefined, ['gmail'])).toBeUndefined();
+    expect(widenMcpAllowlistWithSkillRefs([], ['gmail'])).toBeUndefined();
+  });
+
+  it('returns the cron MCP allowlist unchanged when no skill refs were found', () => {
+    expect(widenMcpAllowlistWithSkillRefs(['slack'], [])).toEqual(['slack']);
+  });
+
+  it('unions cron MCP allowlist with skill-referenced servers', () => {
+    const result = widenMcpAllowlistWithSkillRefs(['slack'], ['gmail', 'slack']);
+    expect(new Set(result)).toEqual(new Set(['slack', 'gmail']));
+  });
+
+  it('does not mutate inputs', () => {
+    const cron = ['slack'];
+    const refs = ['gmail'];
+    widenMcpAllowlistWithSkillRefs(cron, refs);
+    expect(cron).toEqual(['slack']);
+    expect(refs).toEqual(['gmail']);
   });
 });

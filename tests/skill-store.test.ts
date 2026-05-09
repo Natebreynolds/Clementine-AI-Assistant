@@ -8,7 +8,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, existsSync, utimesSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import type { CronJobDefinition } from '../src/types.js';
@@ -643,5 +643,80 @@ describe('migrateAllLegacySkills', () => {
     const result = migrateAllLegacySkills();
     expect(result.migrated).toEqual([]);
     expect(result.skipped).toEqual([]);
+  });
+});
+
+describe('cleanupLegacySkillBackups (1.18.125 — vault janitor)', () => {
+  /** Stamp the mtime of `file` to N days ago. Used to simulate "old enough to sweep". */
+  function setMtimeDaysAgo(file: string, days: number): void {
+    const mtimeMs = Date.now() - days * 24 * 60 * 60 * 1000;
+    utimesSync(file, mtimeMs / 1000, mtimeMs / 1000);
+  }
+
+  it('removes .md.bak files older than 30 days from the global skills dir', async () => {
+    const { cleanupLegacySkillBackups } = await import('../src/agent/skill-store.js');
+    const oldBak = path.join(skillsDir(), 'old-skill.md.bak');
+    writeFileSync(oldBak, '# old');
+    setMtimeDaysAgo(oldBak, 60);
+    const r = cleanupLegacySkillBackups();
+    expect(r.removed).toContain(oldBak);
+    expect(r.inspected).toBe(1);
+    expect(existsSync(oldBak)).toBe(false);
+  });
+
+  it('keeps .md.bak files younger than 30 days (rollback grace window)', async () => {
+    const { cleanupLegacySkillBackups } = await import('../src/agent/skill-store.js');
+    const freshBak = path.join(skillsDir(), 'recent-skill.md.bak');
+    writeFileSync(freshBak, '# fresh');
+    setMtimeDaysAgo(freshBak, 5);
+    const r = cleanupLegacySkillBackups();
+    expect(r.removed).toEqual([]);
+    expect(r.inspected).toBe(1);
+    expect(r.keptFresh).toBe(1);
+    expect(existsSync(freshBak)).toBe(true);
+  });
+
+  it('ignores non-bak files (regular skills are never touched)', async () => {
+    const { cleanupLegacySkillBackups } = await import('../src/agent/skill-store.js');
+    writeFlatSkill('keeper.md', ANTHROPIC_FRONTMATTER);
+    writeFolderSkill('folder-keeper', ANTHROPIC_FRONTMATTER);
+    const r = cleanupLegacySkillBackups();
+    expect(r.removed).toEqual([]);
+    expect(r.inspected).toBe(0);
+    expect(existsSync(path.join(skillsDir(), 'keeper.md'))).toBe(true);
+    expect(existsSync(path.join(skillsDir(), 'folder-keeper', 'SKILL.md'))).toBe(true);
+  });
+
+  it('also sweeps per-agent skill dirs (00-System/agents/<slug>/skills/)', async () => {
+    const { cleanupLegacySkillBackups } = await import('../src/agent/skill-store.js');
+    const agentDir = path.join(tmpHome, 'vault', '00-System', 'agents', 'sasha', 'skills');
+    mkdirSync(agentDir, { recursive: true });
+    const oldBak = path.join(agentDir, 'sasha-old.md.bak');
+    writeFileSync(oldBak, '# old');
+    setMtimeDaysAgo(oldBak, 90);
+    const r = cleanupLegacySkillBackups();
+    expect(r.removed).toContain(oldBak);
+    expect(existsSync(oldBak)).toBe(false);
+  });
+
+  it('returns zero counts when the skills dir has no files', async () => {
+    const { cleanupLegacySkillBackups } = await import('../src/agent/skill-store.js');
+    const r = cleanupLegacySkillBackups();
+    expect(r.removed).toEqual([]);
+    expect(r.inspected).toBe(0);
+    expect(r.keptFresh).toBe(0);
+  });
+
+  it('does not touch .md.bak files inside folder-form skill bundles (only top-level slug-named bak files)', async () => {
+    const { cleanupLegacySkillBackups } = await import('../src/agent/skill-store.js');
+    const folder = path.join(skillsDir(), 'safe-bundle');
+    mkdirSync(path.join(folder, 'templates'), { recursive: true });
+    writeFileSync(path.join(folder, 'SKILL.md'), ANTHROPIC_FRONTMATTER);
+    const nestedBak = path.join(folder, 'templates', 'old-draft.md.bak');
+    writeFileSync(nestedBak, '# nested bak should not be swept');
+    setMtimeDaysAgo(nestedBak, 90);
+    const r = cleanupLegacySkillBackups();
+    expect(r.removed).toEqual([]);
+    expect(existsSync(nestedBak)).toBe(true);
   });
 });

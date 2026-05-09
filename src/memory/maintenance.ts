@@ -161,6 +161,19 @@ export async function runStartupMaintenance(store: any): Promise<void> {
     logger.warn({ err }, 'Startup janitor failed');
   }
 
+  // Vault janitor (1.18.125) — sweep legacy `.md.bak` skill backups so the
+  // first daemon boot after upgrade clears the existing leak instead of
+  // waiting 6h for the periodic cycle.
+  try {
+    const { cleanupLegacySkillBackups } = await import('../agent/skill-store.js');
+    const sweep = cleanupLegacySkillBackups();
+    if (sweep.removed.length > 0) {
+      logger.info({ removed: sweep.removed.length, inspected: sweep.inspected, keptFresh: sweep.keptFresh }, 'Startup .md.bak sweep');
+    }
+  } catch (err) {
+    logger.warn({ err }, 'Startup .md.bak sweep failed');
+  }
+
   // Embedding warm-up — pre-embed the most-cited chunks in the background so
   // the first retrievals after startup don't pay cold-start latency. Fire
   // and forget; never blocks startup.
@@ -250,6 +263,20 @@ export async function runPeriodicCycle(
       }
     } catch (err) {
       logger.warn({ err }, 'Periodic janitor failed');
+    }
+
+    // 6a. Vault janitor — sweep legacy `.md.bak` skill backups (1.18.125).
+    // Pre-1.18.124 saveActiveSkill wrote per-overwrite backups; the new
+    // writeSkill path doesn't, so the old ones rot in the vault. Cap age
+    // at 30 days to give rollback room. No-op when nothing to sweep.
+    try {
+      const { cleanupLegacySkillBackups } = await import('../agent/skill-store.js');
+      const sweep = cleanupLegacySkillBackups();
+      if (sweep.removed.length > 0) {
+        logger.info({ removed: sweep.removed.length, inspected: sweep.inspected, keptFresh: sweep.keptFresh }, 'Legacy skill .md.bak sweep');
+      }
+    } catch (err) {
+      logger.warn({ err }, 'Legacy skill .md.bak sweep failed');
     }
 
     // 6b. Integrity probes — FTS health, orphan derived_from, embedding gaps.

@@ -92,6 +92,74 @@ export function applyMcpAllowlist<T>(
   ) as Record<string, T>;
 }
 
+/**
+ * Widen the cron's tool allowlist with the union of pinned-skill
+ * `clementine.tools.allow` declarations.
+ *
+ * **Why this exists:** Pinning a skill is a positive user signal — "I want
+ * this skill, with the tools it declares it needs." Before 1.18.125 the
+ * skill's `tools.allow` was rendered into the prompt as text only; the SDK
+ * never saw it, so a skill pinned to a cron with a narrower allowlist would
+ * silently fail with tool-not-found errors.
+ *
+ * **Semantics:**
+ *   - Cron has no allowlist → return undefined (cron is unrestricted; pinned
+ *     skill tools flow through the profile/default fallback in `runAgent`).
+ *     We deliberately don't synthesize an allowlist out of just skill tools
+ *     here, because that would NARROW an unrestricted cron to "only what the
+ *     skills declared."
+ *   - Cron has allowlist + skills declared tools → return the union (skills
+ *     widen, never narrow, an existing constraint).
+ *   - Cron has allowlist + no pinned-skill tools → return the cron's allowlist
+ *     unchanged.
+ */
+export function widenAllowlistWithSkillTools(
+  jobAllow: string[] | undefined,
+  pinnedSkillTools: string[] | undefined,
+): string[] | undefined {
+  if (!jobAllow?.length) return undefined;
+  if (!pinnedSkillTools?.length) return [...jobAllow];
+  return [...new Set([...jobAllow, ...pinnedSkillTools])];
+}
+
+/** Match `mcp__SERVER__TOOL` references in skill body Markdown.
+ *  Server names can contain single underscores (`Bright_Data`,
+ *  `claude_ai_Microsoft_365`) but never `__` (double-underscore is the
+ *  delimiter). The regex captures the server segment between the leading
+ *  `mcp__` and the next `__`. Anchored on word boundaries so it doesn't
+ *  catch substrings of longer identifiers. */
+const MCP_TOOL_REF = /mcp__([A-Za-z0-9-]+(?:_[A-Za-z0-9-]+)*)__/g;
+
+/**
+ * Extract every distinct `mcp__<server>__<tool>` server name referenced
+ * inside the bodies of pinned skills. Empty array when no references found.
+ */
+export function extractMcpServersFromSkillBodies(bodies: string[]): string[] {
+  const found = new Set<string>();
+  for (const body of bodies) {
+    if (!body) continue;
+    for (const m of body.matchAll(MCP_TOOL_REF)) found.add(m[1]);
+  }
+  return [...found];
+}
+
+/**
+ * Widen the cron's MCP-server allowlist with servers referenced inside
+ * pinned-skill bodies (e.g., a skill that calls `mcp__gmail__send_message`
+ * implicitly needs the `gmail` server connected).
+ *
+ * Same semantics as `widenAllowlistWithSkillTools`: only widens an existing
+ * allowlist; doesn't synthesize one when the cron is unrestricted.
+ */
+export function widenMcpAllowlistWithSkillRefs(
+  jobMcpAllow: string[] | undefined,
+  skillReferencedServers: string[],
+): string[] | undefined {
+  if (!jobMcpAllow?.length) return undefined;
+  if (!skillReferencedServers.length) return [...jobMcpAllow];
+  return [...new Set([...jobMcpAllow, ...skillReferencedServers])];
+}
+
 function capContextItem(s: string): string {
   if (!s) return '';
   return s.length <= CRON_CONTEXT_ITEM_MAX ? s : s.slice(0, CRON_CONTEXT_ITEM_MAX - 3) + '...';
@@ -235,6 +303,16 @@ export interface SkillContextResult {
   applied: Array<{ name: string; source: 'pinned' | 'auto'; score?: number }>;
   /** Pinned slugs that didn't resolve (deleted/renamed/suppressed). Logged + surfaced. */
   missing: string[];
+  /** Union of every `clementine.tools.allow` entry from pinned skills. Used by
+   *  `buildCronExecutionPlan` to widen the cron's tool allowlist so a pinned
+   *  skill's declared tools survive into the SDK call. Empty array when no
+   *  pinned skill declared a `tools.allow` list. Auto-matched skills do NOT
+   *  contribute — only explicit pins widen scope. */
+  pinnedToolsRequested: string[];
+  /** Bodies of pinned skills only — used for `mcp__server__tool` reference
+   *  extraction so a skill's MCP usage propagates to `allowedMcpServers`.
+   *  Auto-matched skills excluded for the same reason as above. */
+  pinnedBodies: string[];
 }
 
 /**
@@ -260,6 +338,8 @@ export async function buildSkillContext(
 ): Promise<SkillContextResult> {
   const applied: SkillContextResult['applied'] = [];
   const missing: string[] = [];
+  const pinnedToolsRequested: string[] = [];
+  const pinnedBodies: string[] = [];
   try {
     const { searchSkills, recordSkillUse, loadSkillByName } = await import('./skill-extractor.js');
     const skillQuery = jobName + ' ' + jobPrompt.slice(0, 200);
@@ -334,7 +414,20 @@ export async function buildSkillContext(
       }
     }
 
-    if (prepared.length === 0) return { text: '', applied, missing };
+    // 1.18.125 — collect pinned-skill tool declarations + bodies so the
+    // cron planner can widen `allowedTools` / `allowedMcpServers` with what
+    // the pinned skills explicitly need. Pins (not auto-matches) widen scope
+    // because pinning is the user's explicit signal of intent.
+    const pinnedSeen = new Set<string>();
+    for (const s of prepared) {
+      if (s.source !== 'pinned') continue;
+      if (pinnedSeen.has(s.name)) continue;
+      pinnedSeen.add(s.name);
+      for (const t of s.toolsUsed) pinnedToolsRequested.push(t);
+      pinnedBodies.push(s.content);
+    }
+
+    if (prepared.length === 0) return { text: '', applied, missing, pinnedToolsRequested: [], pinnedBodies: [] };
 
     // Folder-form bundled-file budget. Anthropic skill spec says the body
     // should be ≤500 lines; bundled files (templates/, reference docs)
@@ -415,10 +508,10 @@ export async function buildSkillContext(
       return block;
     });
     const text = `## Learned Procedures (from past successful executions)\nFollow these proven approaches when applicable:\n\n${skillLines.join('\n\n')}\n\n`;
-    return { text, applied, missing };
+    return { text, applied, missing, pinnedToolsRequested: [...new Set(pinnedToolsRequested)], pinnedBodies };
   } catch (err) {
     logger.debug({ err, jobName }, 'buildSkillContext failed (non-fatal)');
-    return { text: '', applied, missing };
+    return { text: '', applied, missing, pinnedToolsRequested: [], pinnedBodies: [] };
   }
 }
 
@@ -563,6 +656,18 @@ export interface CronExecutionPlan {
    *  being set inside the skill folder. Deduped + filtered to existing
    *  paths. Empty when the trick has no addDirs and no folder-form pins. */
   additionalDirectories: string[];
+  /** Diagnostics: which scopes a pinned skill widened on this run. Empty
+   *  arrays when no widening happened. Surfaced in the Preview UI so users
+   *  see "this skill brought in `Bash` and `gmail` MCP" without reading
+   *  source. */
+  widenedFromSkills: {
+    /** Tool names a pinned skill's `clementine.tools.allow` added on top of
+     *  the cron's own allowlist. Empty when nothing was widened. */
+    tools: string[];
+    /** MCP server names a pinned skill's body referenced (`mcp__server__tool`)
+     *  that the cron's `allowedMcpServers` didn't already include. */
+    mcpServers: string[];
+  };
 }
 
 /**
@@ -634,17 +739,34 @@ export async function buildCronExecutionPlan(opts: RunAgentCronOptions): Promise
     profile: opts.profile,
   });
 
+  // 1.18.125 — pinned-skill scope widening (SDK alignment).
+  // A pinned skill that declares `clementine.tools.allow` or references
+  // `mcp__server__tool` in its body needs those tools/servers to actually
+  // be live for the SDK call — not just rendered into the prompt as text.
+  // We widen (never narrow) the cron's allowlists with what the pinned
+  // skills declared. Auto-matched skills don't widen scope (only explicit
+  // pins do — the user's positive signal).
+  const skillReferencedMcpServers = extractMcpServersFromSkillBodies(skillResult.pinnedBodies);
+  const widenedJobAllowedTools = widenAllowlistWithSkillTools(
+    opts.allowedTools,
+    skillResult.pinnedToolsRequested,
+  );
+  const widenedJobMcpAllowlist = widenMcpAllowlistWithSkillRefs(
+    opts.allowedMcpServers,
+    skillReferencedMcpServers,
+  );
+
   // Per-trick MCP allowlist: post-filter on the profile-narrowed map.
-  // Effective set = profile ∩ trick.
-  const mcpServerMap = applyMcpAllowlist(mcp.servers, opts.allowedMcpServers);
-  const allowSet = opts.allowedMcpServers?.length ? new Set(opts.allowedMcpServers) : null;
+  // Effective set = profile ∩ trick (widened).
+  const mcpServerMap = applyMcpAllowlist(mcp.servers, widenedJobMcpAllowlist);
+  const allowSet = widenedJobMcpAllowlist?.length ? new Set(widenedJobMcpAllowlist) : null;
   const composioConnected = allowSet ? mcp.composioConnected.filter(n => allowSet.has(n)) : mcp.composioConnected;
   const externalConnected = allowSet ? mcp.externalConnected.filter(n => allowSet.has(n)) : mcp.externalConnected;
   const mcpServersApplied = Object.keys(mcpServerMap);
 
-  // Per-trick tool allowlist intersection.
+  // Per-trick tool allowlist intersection (widened by pinned-skill needs).
   const effectiveAllowedTools = computeEffectiveAllowedTools(
-    opts.allowedTools,
+    widenedJobAllowedTools,
     opts.profile?.team?.allowedTools,
   );
 
@@ -686,6 +808,13 @@ export async function buildCronExecutionPlan(opts: RunAgentCronOptions): Promise
     try { return fs.statSync(d).isDirectory(); } catch { return false; }
   });
 
+  // Diagnostics: what did the pinned skills add on top of what the cron
+  // already declared? Renders in the Preview UI as "Skill widened scope: …"
+  const baseToolSet = new Set(opts.allowedTools ?? []);
+  const widenedToolsFromSkills = skillResult.pinnedToolsRequested.filter(t => !baseToolSet.has(t));
+  const baseMcpSet = new Set(opts.allowedMcpServers ?? []);
+  const widenedMcpFromSkills = skillReferencedMcpServers.filter(s => !baseMcpSet.has(s));
+
   return {
     builtPrompt,
     contextBlocks: {
@@ -707,6 +836,13 @@ export async function buildCronExecutionPlan(opts: RunAgentCronOptions): Promise
     ownerName,
     predictable,
     additionalDirectories,
+    widenedFromSkills: {
+      // Only surface widening when the cron actually had a base allowlist —
+      // otherwise the cron is unrestricted and "widening" isn't a meaningful
+      // concept (the skills' tools were already implicitly allowed).
+      tools: opts.allowedTools?.length ? widenedToolsFromSkills : [],
+      mcpServers: opts.allowedMcpServers?.length ? widenedMcpFromSkills : [],
+    },
   };
 }
 
@@ -741,6 +877,7 @@ export async function runAgentCron(opts: RunAgentCronOptions): Promise<RunAgentC
     skillsMissing: plan.skillsMissing.length,
     trickAllowedTools: effectiveAllowedTools?.length,
     trickAllowedMcp: opts.allowedMcpServers?.length,
+    widenedFromSkills: plan.widenedFromSkills,
   }, 'runAgentCron: dispatching to runAgent');
 
   const startedAt = Date.now();
