@@ -103,6 +103,32 @@ if (existsSync(srcVault)) {
   if (copied > 0) {
     console.log(`Initialized ${copied} default vault files in ${dstVault}`);
   }
+
+  // 1.18.157 — bundle Anthropic-shipped first-party skills (currently
+  // just `skill-creator`). Recursive copy under skills/<name>/. We DO
+  // overwrite on every install so users always get the latest version
+  // when they `npm i -g clementine-agent@latest`. Custom user skills
+  // are NOT touched — only the bundled-by-Anthropic ones whose name
+  // appears in BUNDLED_FIRST_PARTY_SKILLS.
+  const BUNDLED_FIRST_PARTY_SKILLS = ['skill-creator'];
+  const srcSkillsRoot = path.join(srcVault, 'skills');
+  const dstSkillsRoot = path.join(dstVault, 'skills');
+  if (existsSync(srcSkillsRoot)) {
+    mkdirSync(dstSkillsRoot, { recursive: true });
+    let installedSkills = 0;
+    for (const skillName of BUNDLED_FIRST_PARTY_SKILLS) {
+      const srcSkill = path.join(srcSkillsRoot, skillName);
+      const dstSkill = path.join(dstSkillsRoot, skillName);
+      if (!existsSync(srcSkill)) continue;
+      try {
+        cpSync(srcSkill, dstSkill, { recursive: true });
+        installedSkills++;
+      } catch { /* skip — keep going for other skills */ }
+    }
+    if (installedSkills > 0) {
+      console.log(`Bundled ${installedSkills} first-party skill(s) into ${dstSkillsRoot}`);
+    }
+  }
 }
 
 // ── Step 4: Optional local embedding model prefetch ─────────────────

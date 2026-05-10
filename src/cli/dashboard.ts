@@ -21061,6 +21061,15 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
           </div>
         </div>
         <div style="display:flex;align-items:center;gap:8px;flex-shrink:0">
+          <!-- 1.18.157 — Build with skill-creator. The official Anthropic
+               skill-creator skill is bundled in the vault and auto-discovered.
+               This button opens the chat with a prefilled prompt that matches
+               its triggers. The skill walks the user through Anthropic-canonical
+               skill creation conversationally — quality linting, trigger phrase
+               suggestions, iteration loop, all built in. -->
+          <button class="btn-secondary" onclick="askClementineWith('Help me build a new skill using skill-creator. Walk me through it conversationally.')" style="font-size:13px;padding:8px 14px;border-radius:6px;border:1px solid var(--border);background:var(--bg-secondary);color:var(--text-primary);font-weight:500;cursor:pointer;display:inline-flex;align-items:center;gap:6px" title="Walk through Anthropic's official skill-creator skill in chat — generates an Anthropic-canonical SKILL.md from a description, then iterates with you on triggers + body.">
+            <span style="font-size:14px;line-height:1">✨</span> Build with skill-creator
+          </button>
           <button class="btn-primary" onclick="openCreateSkillModal()" style="font-size:13px;padding:8px 14px;border-radius:6px;border:none;background:var(--accent);color:#fff;font-weight:500;cursor:pointer;display:inline-flex;align-items:center;gap:6px">
             <span style="font-size:14px;line-height:1">+</span> New skill
           </button>
@@ -28746,10 +28755,22 @@ async function _openSkillModal(opts) {
       +     '<label style="display:block;font-size:12px;color:var(--text-secondary);margin-bottom:4px;font-weight:500">Display title <span style="color:var(--text-muted)">(optional, friendlier name)</span></label>'
       +     '<input id="skill-modal-title" type="text" placeholder="e.g. Morning Briefing" style="width:100%;padding:8px 10px;font-size:13px;border:1px solid var(--border);border-radius:6px;background:var(--bg-secondary);color:var(--text-primary);margin-bottom:12px">'
       +     '<div style="display:flex;align-items:baseline;justify-content:space-between;margin-bottom:4px">'
-      +       '<label style="font-size:12px;color:var(--text-secondary);font-weight:500">Description <span style="color:var(--text-muted)">(what this skill does — used by Claude to know when to apply it)</span></label>'
+      +       '<label style="font-size:12px;color:var(--text-secondary);font-weight:500">Description <span style="color:var(--text-muted)">(what this skill does + when Claude should run it)</span></label>'
       +       '<span id="skill-modal-desc-counter" style="font-size:10px;color:var(--text-muted);font-variant-numeric:tabular-nums">0 / 1024 chars</span>'
       +     '</div>'
-      +     '<textarea id="skill-modal-desc" rows="2" oninput="updateSkillModalCounters()" placeholder="One paragraph: what does this skill do, when should Claude run it?" style="width:100%;padding:8px 10px;font-size:13px;border:1px solid var(--border);border-radius:6px;background:var(--bg-secondary);color:var(--text-primary);margin-bottom:12px;font-family:inherit;resize:vertical"></textarea>'
+      // 1.18.157 — inline guidance from Anthropic Skill Building Guide page 11.
+      // The description field is the most important part of a skill (it's
+      // the "first level of progressive disclosure" — the only thing always
+      // loaded). Bad descriptions = skill never triggers (or triggers on
+      // everything). Below the field: WHAT + WHEN format reminder + an
+      // anchor link to skill-creator if they want it written for them.
+      +     '<div style="font-size:11px;color:var(--text-muted);margin-bottom:6px;line-height:1.5;padding:6px 10px;background:rgba(255,141,0,0.04);border-left:2px solid var(--accent);border-radius:3px">'
+      +       '<strong style="color:var(--text-secondary);font-weight:600">Format:</strong> '
+      +       '<code style="font-size:10px;background:var(--bg-secondary);padding:1px 4px;border-radius:3px">[WHAT it does] + [WHEN to use it] + [trigger phrases]</code>'
+      +       ' &nbsp;·&nbsp; under 1024 chars · no <code style="font-size:10px">&lt; &gt;</code> · '
+      +       '<a href="javascript:void(0)" onclick="askClementineWith(\\x27Use skill-creator to help me write a great Anthropic-canonical description for the skill I am building.\\x27)" style="color:var(--accent);text-decoration:none">use skill-creator</a>'
+      +     '</div>'
+      +     '<textarea id="skill-modal-desc" rows="2" oninput="updateSkillModalCounters()" placeholder="Example: Analyzes Outlook emails and drafts triage replies. Use when user asks to triage email or mentions inbox cleanup." style="width:100%;padding:8px 10px;font-size:13px;border:1px solid var(--border);border-radius:6px;background:var(--bg-secondary);color:var(--text-primary);margin-bottom:12px;font-family:inherit;resize:vertical"></textarea>'
       +     '<label style="display:block;font-size:12px;color:var(--text-secondary);margin-bottom:4px;font-weight:500">Allowed tools <span style="color:var(--text-muted)">(comma-separated, leave blank for default)</span></label>'
       +     '<input id="skill-modal-tools" type="text" placeholder="e.g. Read, Bash, mcp__supabase__list_tables" style="width:100%;padding:8px 10px;font-size:13px;border:1px solid var(--border);border-radius:6px;background:var(--bg-secondary);color:var(--text-primary);margin-bottom:12px">'
       +     '<div style="display:flex;align-items:baseline;justify-content:space-between;margin-bottom:4px">'
@@ -37650,6 +37671,28 @@ async function refreshHomeDigest() {
 }
 
 // ── Home chat FAB + panel ────────────────────────────────────────
+// 1.18.157 — Open the chat panel with a prefilled prompt and (optionally)
+// auto-send. Used by surfaces like the Skills page "Build with skill-creator"
+// button. The chat side reads the input value so we just set + dispatch.
+function askClementineWith(prompt, opts) {
+  var autoSend = opts && opts.autoSend !== false; // default true
+  toggleHomeChat(true);
+  setTimeout(function() {
+    var input = document.getElementById('chat-input');
+    if (!input) return;
+    input.value = prompt;
+    input.focus();
+    if (autoSend) {
+      // Some chat sends listen on Enter keydown; others have a button.
+      // Try button first, fall back to dispatching Enter.
+      var btn = document.querySelector('#home-chat-panel button[type="submit"], #home-chat-panel button.btn-send, #home-chat-send');
+      if (btn) { btn.click(); return; }
+      var ev = new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', bubbles: true });
+      input.dispatchEvent(ev);
+    }
+  }, 120);
+}
+
 function toggleHomeChat(forceOpen) {
   var fab = document.getElementById('home-chat-fab');
   var panel = document.getElementById('home-chat-panel');
