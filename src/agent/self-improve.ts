@@ -41,6 +41,7 @@ import { listAllGoals } from '../tools/shared.js';
 import { MemoryStore } from '../memory/store.js';
 import { ANTHROPIC_SKILL_NAME_PATTERN } from './skill-store.js';
 import { recordApprovalSignal, formatApprovalSignalsForHypothesizer } from './approval-signals.js';
+import { clusterBrokenJobs, formatClustersForHypothesizer } from '../gateway/failure-clustering.js';
 import type {
   CronRunEntry,
   EvolutionVersion,
@@ -1339,6 +1340,18 @@ export class SelfImproveLoop {
     // fresh installs, which keeps the prompt clean.
     const approvalSignalsText = formatApprovalSignalsForHypothesizer();
 
+    // Cross-job failure clusters (1.18.163) — when ≥3 jobs hit the same
+    // normalized error pattern in 48h, surface ONE cluster summary so
+    // the hypothesizer proposes a root-cause fix instead of N per-job
+    // patches. Empty string when no cluster meets the threshold.
+    let failureClusterText = '';
+    try {
+      const clusters = clusterBrokenJobs();
+      failureClusterText = formatClustersForHypothesizer(clusters);
+    } catch (err) {
+      logger.warn({ err }, 'Failed to compute failure clusters — proceeding without them');
+    }
+
     // ── Step 1: Analysis — identify top opportunities from metrics (no config dumps) ──
     const analysisPrompt =
       `You are Clementine's self-improvement strategist. Analyze the performance data below and identify the top 3 improvement opportunities.\n\n` +
@@ -1357,6 +1370,7 @@ export class SelfImproveLoop {
       diversityConstraint +
       agentFocusText +
       soulCandidatesText +
+      (failureClusterText ? `\n${failureClusterText}` : '') +
       (approvalSignalsText ? `\n${approvalSignalsText}` : '') +
       `\n## Instructions\n` +
       `Propose **1-3 concrete, high-impact improvements** the owner should review today — no fewer (aim for at least one actionable suggestion when data warrants it), no more (the owner reads each proposal manually and you'll overwhelm them). Rank by expected impact; drop anything below "solid idea".\n\n` +

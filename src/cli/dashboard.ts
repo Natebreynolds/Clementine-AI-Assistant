@@ -11109,7 +11109,7 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
     }
   });
 
-  app.get('/api/self-improve', (_req, res) => {
+  app.get('/api/self-improve', async (_req, res) => {
     const siDir = path.join(BASE_DIR, 'self-improve');
     const stateFile = path.join(siDir, 'state.json');
     const logFile = path.join(siDir, 'experiment-log.jsonl');
@@ -11163,7 +11163,18 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
       } catch { /* ignore */ }
     }
 
-    res.json({ state, experiments, pending, triggers, verifications });
+    // 1.18.163 — cross-job failure clusters (≥3 jobs hitting the same
+    // normalized error pattern in 48h). Computed on demand from
+    // computeBrokenJobs(); no schema, no persistence. The Self-Improve
+    // tab surfaces this so the owner sees "5 jobs hit X — propose one
+    // root-cause fix" instead of N per-job rows.
+    let clusters: unknown[] = [];
+    try {
+      const { clusterBrokenJobs } = await import('../gateway/failure-clustering.js');
+      clusters = clusterBrokenJobs();
+    } catch { /* non-fatal — empty clusters list */ }
+
+    res.json({ state, experiments, pending, triggers, verifications, clusters });
   });
 
   app.post('/api/self-improve/run', async (_req, res) => {
@@ -19623,6 +19634,13 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
             <div class="card-body" id="si-triggers-list" style="padding:0">
               <div class="empty-state" style="padding:14px">No active failures &mdash; nothing has tripped 3+ consecutive errors.</div>
             </div>
+          </div>
+          <div class="card" style="margin-top:16px" id="si-clusters-card" hidden>
+            <div class="card-header" style="display:flex;align-items:center;justify-content:space-between">
+              <span>Cross-job failure clusters <span style="font-weight:normal;font-size:11px;color:var(--text-muted)">&middot; 3+ jobs hitting the same error pattern (last 48h)</span></span>
+              <span class="tab-badge" id="tab-si-clusters" style="background:#a855f7;color:#fff">0</span>
+            </div>
+            <div class="card-body" id="si-clusters-list" style="padding:0"></div>
           </div>
           <div class="card" style="margin-top:16px">
             <div class="card-header" style="display:flex;align-items:center;justify-content:space-between">
@@ -40184,6 +40202,7 @@ async function refreshSelfImprove() {
     const pending = d.pending || [];
     const triggers = d.triggers || [];
     const verifications = d.verifications || [];
+    const clusters = d.clusters || [];
 
     // Update tab badge — combine human-attention queues so the sidebar
     // count reflects "things that need you to look at", not just proposals.
@@ -40216,6 +40235,36 @@ async function refreshSelfImprove() {
               '<span style="font-size:11px;color:var(--text-muted)">' + esc(when) + '</span>' +
             '</div>' +
             (firstError ? '<div style="margin-top:6px;font-size:12px;color:var(--text-secondary);font-family:ui-monospace,monospace">' + esc(firstError) + '</div>' : '') +
+          '</div>';
+        }).join('');
+      }
+    }
+
+    // 1.18.163 — cross-job failure clusters (≥3 jobs hitting the same
+    // normalized pattern). Hidden when the list is empty so the card
+    // doesn't take up space on a healthy install.
+    const clustersCard = document.getElementById('si-clusters-card');
+    const clustersList = document.getElementById('si-clusters-list');
+    const clustersBadge = document.getElementById('tab-si-clusters');
+    if (clustersCard && clustersList) {
+      if (clusters.length === 0) {
+        clustersCard.hidden = true;
+      } else {
+        clustersCard.hidden = false;
+        if (clustersBadge) clustersBadge.textContent = clusters.length;
+        clustersList.innerHTML = clusters.map(function(c) {
+          var rep = String(c.representative || '').slice(0, 200);
+          var jobsList = (c.jobs || []).slice(0, 5).map(function(j) {
+            return '<span class="badge" style="margin-right:4px;font-size:11px">' + esc(j.jobName) + ' &times;' + (j.errorCount48h || 0) + '</span>';
+          }).join('');
+          var more = (c.jobs && c.jobs.length > 5) ? '<span style="font-size:11px;color:var(--text-muted)">+' + (c.jobs.length - 5) + ' more</span>' : '';
+          return '<div style="padding:12px;border-bottom:1px solid var(--border)">' +
+            '<div style="display:flex;justify-content:space-between;align-items:baseline;gap:8px;flex-wrap:wrap">' +
+              '<div><strong>' + (c.jobs ? c.jobs.length : 0) + ' jobs</strong> &middot; ' +
+              '<span style="font-size:11px;color:var(--text-muted)">' + (c.totalErrors || 0) + ' total errors (48h)</span></div>' +
+            '</div>' +
+            '<div style="margin-top:6px;font-size:12px;color:var(--text-secondary);font-family:ui-monospace,monospace">' + esc(rep) + '</div>' +
+            '<div style="margin-top:8px">' + jobsList + ' ' + more + '</div>' +
           '</div>';
         }).join('');
       }
