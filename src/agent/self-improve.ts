@@ -40,6 +40,7 @@ import {
 import { listAllGoals } from '../tools/shared.js';
 import { MemoryStore } from '../memory/store.js';
 import { ANTHROPIC_SKILL_NAME_PATTERN } from './skill-store.js';
+import { recordApprovalSignal, formatApprovalSignalsForHypothesizer } from './approval-signals.js';
 import type {
   CronRunEntry,
   EvolutionVersion,
@@ -1333,6 +1334,11 @@ export class SelfImproveLoop {
       }
     } catch { /* non-fatal */ }
 
+    // Owner-approval feedback (1.18.161) — bias hypotheses toward patterns the
+    // owner has approved, away from those they've denied. Empty string for
+    // fresh installs, which keeps the prompt clean.
+    const approvalSignalsText = formatApprovalSignalsForHypothesizer();
+
     // ── Step 1: Analysis — identify top opportunities from metrics (no config dumps) ──
     const analysisPrompt =
       `You are Clementine's self-improvement strategist. Analyze the performance data below and identify the top 3 improvement opportunities.\n\n` +
@@ -1351,6 +1357,7 @@ export class SelfImproveLoop {
       diversityConstraint +
       agentFocusText +
       soulCandidatesText +
+      (approvalSignalsText ? `\n${approvalSignalsText}` : '') +
       `\n## Instructions\n` +
       `Propose **1-3 concrete, high-impact improvements** the owner should review today — no fewer (aim for at least one actionable suggestion when data warrants it), no more (the owner reads each proposal manually and you'll overwhelm them). Rank by expected impact; drop anything below "solid idea".\n\n` +
       `For each opportunity, specify:\n` +
@@ -1754,15 +1761,35 @@ export class SelfImproveLoop {
       logger.warn({ err }, 'Failed to schedule impact check');
     }
 
+    // 1.18.161 — record the implicit owner-approval signal so future
+    // hypothesizer cycles can see "the owner approved fixes like this"
+    // and bias proposals accordingly. Best-effort, never blocks apply.
+    recordApprovalSignal({
+      experimentId,
+      area: pending.area,
+      target: pending.target,
+      hypothesis: pending.hypothesis,
+      decision: 'approved',
+    });
+
     return `Applied change to ${pending.area}/${pending.target}`;
   }
 
   /** Deny a pending change without applying it. */
-  denyChange(experimentId: string): string {
+  denyChange(experimentId: string, noteFromOwner?: string): string {
     const pendingFile = path.join(PENDING_DIR, `${experimentId}.json`);
     if (!existsSync(pendingFile)) {
       return `Pending change not found: ${experimentId}`;
     }
+
+    // 1.18.161 — capture the area/target/hypothesis BEFORE we delete the
+    // pending file so the approval-signal log gets a meaningful entry
+    // (not just an experiment ID with no context).
+    let signalContext: { area: string; target: string; hypothesis: string } | null = null;
+    try {
+      const pending = JSON.parse(readFileSync(pendingFile, 'utf-8')) as { area: string; target: string; hypothesis: string };
+      signalContext = { area: pending.area, target: pending.target, hypothesis: pending.hypothesis };
+    } catch { /* file may be malformed; record a minimal signal below */ }
 
     this.updateExperimentStatus(experimentId, 'denied');
 
@@ -1773,6 +1800,18 @@ export class SelfImproveLoop {
     const state = this.loadState();
     state.pendingApprovals = Math.max(0, state.pendingApprovals - 1);
     this.saveState(state);
+
+    // 1.18.161 — record the denial signal. Owner can pass an optional note
+    // (via the dashboard Reason field, or via Discord) explaining why so
+    // the hypothesizer learns more than just "no."
+    recordApprovalSignal({
+      experimentId,
+      area: signalContext?.area ?? 'unknown',
+      target: signalContext?.target ?? 'unknown',
+      hypothesis: signalContext?.hypothesis ?? '(pending file unreadable at deny time)',
+      decision: 'denied',
+      ...(noteFromOwner ? { noteFromOwner } : {}),
+    });
 
     return `Denied change: ${experimentId}`;
   }

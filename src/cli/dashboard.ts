@@ -11194,7 +11194,14 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
   app.post('/api/self-improve/deny/:id', async (req, res) => {
     try {
       const gw = await getGateway();
-      const result = await gw.handleSelfImprove('deny', { experimentId: req.params.id });
+      // 1.18.161 — accept an optional `noteFromOwner` in the body so the
+      // approval-signal log captures the *reason* for denial (the
+      // hypothesizer learns more from "too generic — loses voice" than
+      // from a bare "no").
+      const noteFromOwner = typeof req.body?.noteFromOwner === 'string'
+        ? req.body.noteFromOwner.slice(0, 500)
+        : undefined;
+      const result = await gw.handleSelfImprove('deny', { experimentId: req.params.id, noteFromOwner });
       res.json({ ok: true, message: result });
     } catch (err) {
       res.json({ ok: false, message: String(err) });
@@ -40371,7 +40378,17 @@ async function siApply(id) {
 
 async function siDeny(id) {
   try {
-    const r = await apiFetch('/api/self-improve/deny/' + id, { method: 'POST' });
+    // 1.18.161 — invite an optional one-line reason. Cancel = bare deny;
+    // empty string = bare deny; non-empty = sent to the hypothesizer's
+    // approval-signal log so future cycles avoid the rejected pattern.
+    const note = window.prompt('Optional reason for denying (helps the hypothesizer learn — leave blank to skip):', '');
+    if (note === null) return;
+    const body = note.trim() ? JSON.stringify({ noteFromOwner: note.trim() }) : undefined;
+    const r = await apiFetch('/api/self-improve/deny/' + id, {
+      method: 'POST',
+      headers: body ? { 'Content-Type': 'application/json' } : undefined,
+      body,
+    });
     const d = await r.json();
     if (d.ok) toast(d.message, 'success');
     else toast(d.message || 'Failed', 'error');

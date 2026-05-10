@@ -2741,7 +2741,7 @@ export class Gateway {
 
   async handleSelfImprove(
     action: string,
-    args?: { experimentId?: string; config?: Partial<SelfImproveConfig> },
+    args?: { experimentId?: string; noteFromOwner?: string; config?: Partial<SelfImproveConfig> },
     onProposal?: (experiment: SelfImproveExperiment) => Promise<void>,
   ): Promise<string> {
     const releaseLane = await lanes.acquire('self-improve');
@@ -2795,7 +2795,7 @@ export class Gateway {
         }
         case 'deny': {
           if (!args?.experimentId) return 'Missing experiment ID.';
-          return loop.denyChange(args.experimentId);
+          return loop.denyChange(args.experimentId, args.noteFromOwner);
         }
         case 'run-agent': {
           const slug = args?.experimentId; // Reuse experimentId field for agent slug
