@@ -5187,7 +5187,10 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
       if (!job.workDir) { res.status(400).json({ ok: false, error: 'task has no workDir set' }); return; }
       const port = Number(process.env.PORT) || 3030;
       const { installPathBHooks } = await import('../agent/path-b-installer.js');
-      const result = installPathBHooks(job.workDir, { token: dashboardToken, port });
+      // 1.18.151 — token no longer baked into hook command (read from
+      // ~/.clementine/.dashboard-token at fire time). Path-b installer
+      // takes only port + version sentinel now.
+      const result = installPathBHooks(job.workDir, { port });
       if (!result.ok) {
         res.status(409).json({ ...result, ok: false });
         return;
@@ -6410,6 +6413,22 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
         ev.toolError = typeof body.tool_response === 'string'
           ? body.tool_response.slice(0, 500)
           : 'tool returned is_error=true';
+      }
+      // 1.18.151 — compaction telemetry. PreCompact carries trigger +
+      // optional custom_instructions; PostCompact carries the summary text
+      // and pre/post token counts. We promote these to top-level fields so
+      // the run-detail viewer can render a "summarized N→M tokens" marker
+      // without needing to re-parse the original SDK payload shape.
+      if (hookEventName === 'PreCompact') {
+        ev.kind = 'pre_compact';
+        if (typeof body.trigger === 'string') ev.compactTrigger = body.trigger;
+        if (typeof body.custom_instructions === 'string') ev.compactInstructions = body.custom_instructions;
+      } else if (hookEventName === 'PostCompact') {
+        ev.kind = 'post_compact';
+        if (typeof body.trigger === 'string') ev.compactTrigger = body.trigger;
+        if (typeof body.compact_summary === 'string') ev.compactSummary = body.compact_summary;
+        if (typeof body.pre_tokens === 'number') ev.preTokens = body.pre_tokens;
+        if (typeof body.post_tokens === 'number') ev.postTokens = body.post_tokens;
       }
       entry.eventLog.append(ev as never);
       res.json({ ok: true, runId: entry.runId, seq });
@@ -26986,10 +27005,13 @@ function renderRunDetailWaterfall(events, runId, jobName) {
     if (k === 'subagent_start' || k === 'subagent_stop') return '#a855f7';
     if (k === 'rate_limit') return 'var(--yellow)';
     if (k === 'hook') return 'var(--blue)';
+    if (k === 'pre_compact' || k === 'post_compact') return 'var(--orange, #f59e0b)';
     if (k === 'error') return 'var(--red)';
     return 'var(--text-muted)';
   }
   function kindLabel(k) {
+    if (k === 'pre_compact') return 'COMPACT START';
+    if (k === 'post_compact') return 'COMPACT DONE';
     return (k || 'event').toUpperCase().replace(/_/g, ' ');
   }
 
@@ -27062,6 +27084,29 @@ function renderRunDetailWaterfall(events, runId, jobName) {
       preview = ev.sessionId ? 'session ' + String(ev.sessionId).slice(0, 8) + '…' : '';
     } else if (ev.kind === 'session_end') {
       preview = '$' + (ev.costUsd != null ? ev.costUsd.toFixed(4) : '?') + ' · ' + (ev.stopReason || '?');
+    } else if (ev.kind === 'pre_compact') {
+      // 1.18.151 — PreCompact telemetry. Trigger tells us whether the SDK
+      // auto-compacted to stay under context limits or the user/agent
+      // requested it. custom_instructions, when present, biases what gets
+      // preserved — surface it inline so debugging "why did this run forget
+      // X?" is one click away.
+      preview = '⤓ compaction starting (' + (ev.compactTrigger || '?') + ')';
+      fullContent = ev.compactInstructions
+        ? 'Custom instructions for compaction:\\n' + String(ev.compactInstructions)
+        : 'No custom instructions — SDK uses its default summarization.';
+    } else if (ev.kind === 'post_compact') {
+      // 1.18.151 — PostCompact carries the summary text + token deltas.
+      // Showing pre→post tokens makes compaction efficiency visible at a
+      // glance; the summary itself is the canonical "what got remembered"
+      // record for the rest of the run.
+      var tokenDelta = '';
+      if (typeof ev.preTokens === 'number' && typeof ev.postTokens === 'number') {
+        tokenDelta = ' · ' + ev.preTokens.toLocaleString() + '→' + ev.postTokens.toLocaleString() + ' tokens';
+      }
+      preview = '⤴ compaction done' + tokenDelta;
+      fullContent = ev.compactSummary
+        ? 'Summary the SDK kept:\\n\\n' + String(ev.compactSummary)
+        : '(no summary text returned)';
     }
 
     var rowId = 'run-evt-' + j;

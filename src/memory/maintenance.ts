@@ -174,6 +174,38 @@ export async function runStartupMaintenance(store: any): Promise<void> {
     logger.warn({ err }, 'Startup .md.bak sweep failed');
   }
 
+  // Path-B installer-version sweep (1.18.151). For every cron with a workDir
+  // that has a clementine-managed .claude/settings.local.json, check whether
+  // the installerVersion sentinel matches CURRENT_INSTALLER_VERSION. Any
+  // older install is missing the token-at-fire-time fix and will silently
+  // 401 against /api/hooks/event after the next dashboard token rotation.
+  // We log once per startup with the list of paths so the user knows to
+  // re-run `clementine hooks install` (we never silently overwrite — user
+  // owns their .claude/).
+  try {
+    const { parseCronJobs } = await import('../gateway/cron-scheduler.js');
+    const { getHooksStatus, CURRENT_INSTALLER_VERSION } = await import('../agent/path-b-installer.js');
+    const stale: Array<{ workDir: string; installerVersion?: string }> = [];
+    const seen = new Set<string>();
+    for (const job of parseCronJobs()) {
+      if (!job.workDir || seen.has(job.workDir)) continue;
+      seen.add(job.workDir);
+      const s = getHooksStatus(job.workDir);
+      if (s.managedByUs && s.installerVersion !== CURRENT_INSTALLER_VERSION) {
+        stale.push({ workDir: job.workDir, installerVersion: s.installerVersion });
+      }
+    }
+    if (stale.length > 0) {
+      logger.warn({
+        stale,
+        currentVersion: CURRENT_INSTALLER_VERSION,
+        action: 'Re-run `clementine hooks install` per project to pick up the token-at-fire-time fix (1.18.151) — until then those projects 401 silently after each dashboard token rotation.',
+      }, 'Path-B hook installs are stale');
+    }
+  } catch (err) {
+    logger.warn({ err }, 'Path-B stale-version sweep failed');
+  }
+
   // Embedding warm-up — pre-embed the most-cited chunks in the background so
   // the first retrievals after startup don't pay cold-start latency. Fire
   // and forget; never blocks startup.

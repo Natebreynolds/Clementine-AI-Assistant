@@ -22,45 +22,56 @@ beforeEach(() => { tmpProj = mkdtempSync(path.join(tmpdir(), 'clem-pathb-')); })
 afterEach(() => { rmSync(tmpProj, { recursive: true, force: true }); });
 
 describe('buildSettingsTemplate', () => {
-  it('includes the dashboard token in the curl command', () => {
-    const tpl = buildSettingsTemplate({ token: 'TKN_xyz', port: 3030 }) as Record<string, unknown>;
+  it('reads the token from disk at fire time via $(cat ...) instead of baking it', () => {
+    // 1.18.151 — no more baked literal. The curl substitutes $(cat <path>)
+    // so dashboard token rotation propagates without re-installing hooks.
+    const tpl = buildSettingsTemplate({ port: 3030, tokenFilePath: '/tmp/test-tok' }) as Record<string, unknown>;
     const hooks = (tpl.hooks as Record<string, Array<{ hooks: Array<{ command: string }> }>>);
     const cmd = hooks.PreToolUse[0].hooks[0].command;
-    expect(cmd).toContain('X-Dashboard-Token: TKN_xyz');
+    expect(cmd).toContain('X-Dashboard-Token: $(cat /tmp/test-tok 2>/dev/null)');
     expect(cmd).toContain('http://127.0.0.1:3030/api/hooks/event');
+    expect(cmd).not.toContain('X-Dashboard-Token: /tmp/test-tok'); // not baked
+  });
+
+  it('defaults the token file path to ~/.clementine/.dashboard-token', () => {
+    const tpl = buildSettingsTemplate({ port: 3030 }) as Record<string, unknown>;
+    const hooks = (tpl.hooks as Record<string, Array<{ hooks: Array<{ command: string }> }>>);
+    const cmd = hooks.PreToolUse[0].hooks[0].command;
+    expect(cmd).toContain('.clementine/.dashboard-token');
+    expect(cmd).toContain('$(cat ');
   });
 
   it('respects a custom port', () => {
-    const tpl = buildSettingsTemplate({ token: 't', port: 9999 }) as Record<string, unknown>;
+    const tpl = buildSettingsTemplate({ port: 9999 }) as Record<string, unknown>;
     const hooks = (tpl.hooks as Record<string, Array<{ hooks: Array<{ command: string }> }>>);
     expect(hooks.PreToolUse[0].hooks[0].command).toContain(':9999/api/hooks/event');
   });
 
   it('defaults port to 3030', () => {
-    const tpl = buildSettingsTemplate({ token: 't' }) as Record<string, unknown>;
+    const tpl = buildSettingsTemplate() as Record<string, unknown>;
     const hooks = (tpl.hooks as Record<string, Array<{ hooks: Array<{ command: string }> }>>);
     expect(hooks.PreToolUse[0].hooks[0].command).toContain(':3030/');
   });
 
-  it('includes all expected hook event keys', () => {
-    const tpl = buildSettingsTemplate({ token: 't' }) as Record<string, unknown>;
+  it('includes all expected hook event keys (PreCompact + PostCompact added 1.18.151)', () => {
+    const tpl = buildSettingsTemplate() as Record<string, unknown>;
     const hooks = tpl.hooks as Record<string, unknown>;
-    const expected = ['PreToolUse', 'PostToolUse', 'SubagentStart', 'SubagentStop', 'Stop', 'Notification', 'UserPromptSubmit', 'SessionStart', 'PreCompact'];
+    const expected = ['PreToolUse', 'PostToolUse', 'SubagentStart', 'SubagentStop', 'Stop', 'Notification', 'UserPromptSubmit', 'SessionStart', 'PreCompact', 'PostCompact'];
     for (const k of expected) expect(hooks[k]).toBeDefined();
   });
 
   it('stamps a _clementine sentinel for re-install detection', () => {
-    const tpl = buildSettingsTemplate({ token: 't' }) as Record<string, unknown>;
+    const tpl = buildSettingsTemplate() as Record<string, unknown>;
     const sentinel = tpl._clementine as { managedBy?: string; installerVersion?: string } | undefined;
     expect(sentinel).toBeDefined();
     expect(sentinel!.managedBy).toContain('clementine');
-    expect(sentinel!.installerVersion).toBeDefined();
+    expect(sentinel!.installerVersion).toBe('1.18.151');
   });
 });
 
 describe('installPathBHooks', () => {
   it('fresh install writes the file and reports wasExisting=false', () => {
-    const result = installPathBHooks(tmpProj, { token: 'TKN' });
+    const result = installPathBHooks(tmpProj);
     expect(result.ok).toBe(true);
     expect(result.wasExisting).toBe(false);
     expect(result.wasUpdate).toBe(false);
@@ -69,8 +80,8 @@ describe('installPathBHooks', () => {
   });
 
   it('reinstall over our own file reports wasUpdate=true', () => {
-    installPathBHooks(tmpProj, { token: 'TKN', port: 3030 });
-    const result = installPathBHooks(tmpProj, { token: 'TKN', port: 3031 });
+    installPathBHooks(tmpProj, { port: 3030 });
+    const result = installPathBHooks(tmpProj, { port: 3031 });
     expect(result.ok).toBe(true);
     expect(result.wasExisting).toBe(true);
     expect(result.wasUpdate).toBe(true);
@@ -84,7 +95,7 @@ describe('installPathBHooks', () => {
     const dir = path.join(tmpProj, '.claude');
     mkdirSync(dir, { recursive: true });
     writeFileSync(path.join(dir, 'settings.local.json'), JSON.stringify({ permissions: { allow: ['*'] } }));
-    const result = installPathBHooks(tmpProj, { token: 'TKN' });
+    const result = installPathBHooks(tmpProj);
     expect(result.ok).toBe(false);
     expect(result.error).toContain('not created by clementine');
     // User file must remain untouched.
@@ -96,21 +107,15 @@ describe('installPathBHooks', () => {
     const dir = path.join(tmpProj, '.claude');
     mkdirSync(dir, { recursive: true });
     writeFileSync(path.join(dir, 'settings.local.json'), 'not json');
-    const result = installPathBHooks(tmpProj, { token: 'TKN' });
+    const result = installPathBHooks(tmpProj);
     expect(result.ok).toBe(false);
     expect(result.error).toContain('could not parse');
   });
 
   it('errors when workDir is empty', () => {
-    const result = installPathBHooks('', { token: 'TKN' });
+    const result = installPathBHooks('');
     expect(result.ok).toBe(false);
     expect(result.error).toContain('workDir');
-  });
-
-  it('errors when token is empty', () => {
-    const result = installPathBHooks(tmpProj, { token: '' });
-    expect(result.ok).toBe(false);
-    expect(result.error).toContain('token');
   });
 });
 
@@ -122,7 +127,7 @@ describe('getHooksStatus', () => {
   });
 
   it('reports managedByUs=true after a fresh install', () => {
-    installPathBHooks(tmpProj, { token: 'TKN' });
+    installPathBHooks(tmpProj);
     const s = getHooksStatus(tmpProj);
     expect(s.installed).toBe(true);
     expect(s.managedByUs).toBe(true);
@@ -142,7 +147,7 @@ describe('getHooksStatus', () => {
 
 describe('uninstallPathBHooks', () => {
   it('removes our own file', () => {
-    installPathBHooks(tmpProj, { token: 'TKN' });
+    installPathBHooks(tmpProj);
     const filePath = path.join(tmpProj, '.claude', 'settings.local.json');
     expect(existsSync(filePath)).toBe(true);
     const result = uninstallPathBHooks(tmpProj);

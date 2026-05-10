@@ -17,20 +17,30 @@
  *   hand-written project settings.
  *
  * Auth: the hook commands include the dashboard token in the X-Dashboard-Token
- * header. The token is baked into the curl command at install time. If the
- * dashboard restarts and rotates its token, the user has to re-enable hooks
- * (a small UX cost we accept; the alternative is having hooks read the
- * token from disk at fire-time which adds a syscall to every tool call).
+ * header. As of 1.18.151 the token is read from disk at fire-time via
+ * `$(cat ~/.clementine/.dashboard-token)` instead of being baked into the
+ * curl command at install time. The token-file path is interpolated at
+ * install time, but its CONTENT is read on every hook fire — so dashboard
+ * token rotation (which `clementine update restart` does) no longer breaks
+ * installed hooks. The dashboard already maintains this file at startup
+ * (dashboard.ts:2097-2098); we just point the curl at it.
+ *
+ * The cost is one tiny `cat` syscall per tool call — negligible compared to
+ * the curl + dashboard ingestion already happening. The win is no more
+ * silent 401s when the token rotates.
  */
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 
 /** Hooks we install. Picked for the latency dashboard's needs:
  *  PreToolUse + PostToolUse give us tool durations (PostToolUse carries
  *  duration_ms). SubagentStart/Stop close the gap path C handles via
  *  transcript backfill. Stop / Notification add nice-to-have signal but
- *  are minimal cost. */
+ *  are minimal cost. PreCompact + PostCompact (added 1.18.151) carry
+ *  compaction telemetry — pre/post tokens, summary text, trigger source —
+ *  which the run-detail viewer surfaces as "what got summarized away". */
 const HOOK_EVENTS = [
   'PreToolUse',
   'PostToolUse',
@@ -41,28 +51,47 @@ const HOOK_EVENTS = [
   'UserPromptSubmit',
   'SessionStart',
   'PreCompact',
+  'PostCompact',
 ] as const;
 
+/** Bumped on every meaningful template change. Heartbeat reads installed
+ *  files' `_clementine.installerVersion` and surfaces a re-install nudge
+ *  when it lags this constant — see heartbeat.ts (1.18.151 stale-template
+ *  detector). We never overwrite user-facing files silently; the user runs
+ *  `clementine hooks install` to opt into the new template. */
+export const CURRENT_INSTALLER_VERSION = '1.18.151';
+
+/** Default location of the dashboard token file. The dashboard writes this
+ *  on every startup (see dashboard.ts:2097-2098). Hooks read it at fire
+ *  time via `$(cat …)` so token rotations propagate without re-installing. */
+const DEFAULT_TOKEN_FILE = path.join(os.homedir(), '.clementine', '.dashboard-token');
+
 export interface SettingsTemplateOptions {
-  /** Dashboard token to include in the X-Dashboard-Token header. Required. */
-  token: string;
   /** Localhost port the dashboard is listening on. Defaults to 3030. */
   port?: number;
   /** Mark the file with a comment so users know who wrote it. */
   installerVersion?: string;
+  /** Absolute path to the token file the curl will `cat` at fire time.
+   *  Override is for tests; production always uses the canonical
+   *  ~/.clementine/.dashboard-token. */
+  tokenFilePath?: string;
 }
 
 /** Build the JSON content of .claude/settings.local.json. The shape matches
  *  the SDK's hook config schema: a top-level `hooks` map keyed by event name,
  *  each value an array of `{ hooks: [{ type, command }] }` matchers. The
  *  empty matcher means "always fire". */
-export function buildSettingsTemplate(opts: SettingsTemplateOptions): Record<string, unknown> {
+export function buildSettingsTemplate(opts: SettingsTemplateOptions = {}): Record<string, unknown> {
   const port = opts.port ?? 3030;
+  const tokenFile = opts.tokenFilePath ?? DEFAULT_TOKEN_FILE;
   // Use POSIX `curl` — preinstalled on macOS and most Linuxes; Windows users
   // running WSL or Git Bash also have it. We add `--max-time 2` so a
-  // wedged dashboard can't stall the SDK's tool execution.
+  // wedged dashboard can't stall the SDK's tool execution. The
+  // `$(cat … 2>/dev/null)` substitution reads the live dashboard token at
+  // fire time; if the file is briefly missing during startup the curl
+  // sends an empty token and the dashboard 401s harmlessly (no SDK break).
   const curlCmd = `curl -s --max-time 2 -X POST `
-    + `-H "X-Dashboard-Token: ${opts.token}" `
+    + `-H "X-Dashboard-Token: $(cat ${tokenFile} 2>/dev/null)" `
     + `-H "Content-Type: application/json" `
     + `--data-binary @- `
     + `http://127.0.0.1:${port}/api/hooks/event`;
@@ -84,7 +113,7 @@ export function buildSettingsTemplate(opts: SettingsTemplateOptions): Record<str
     _clementine: {
       managedBy: 'clementine-agent path-b-installer',
       installedAt: new Date().toISOString(),
-      installerVersion: opts.installerVersion ?? '1.18.102',
+      installerVersion: opts.installerVersion ?? CURRENT_INSTALLER_VERSION,
       port,
     },
     hooks,
@@ -104,10 +133,13 @@ export interface InstallResult {
 
 /** Write/update .claude/settings.local.json in `workDir`. If the file
  *  already exists and is NOT installer-managed (no _clementine key), we
- *  bail out and refuse to overwrite to avoid clobbering user content. */
-export function installPathBHooks(workDir: string, opts: SettingsTemplateOptions): InstallResult {
+ *  bail out and refuse to overwrite to avoid clobbering user content.
+ *
+ *  As of 1.18.151 no token is required at install time — the curl reads
+ *  the live token from disk at fire time. Callers can pass tokenFilePath
+ *  to override the default `~/.clementine/.dashboard-token` (tests). */
+export function installPathBHooks(workDir: string, opts: SettingsTemplateOptions = {}): InstallResult {
   if (!workDir) return { ok: false, filePath: '', wasExisting: false, wasUpdate: false, error: 'workDir required' };
-  if (!opts.token) return { ok: false, filePath: '', wasExisting: false, wasUpdate: false, error: 'token required' };
 
   const dir = path.join(workDir, '.claude');
   const file = path.join(dir, 'settings.local.json');
