@@ -1812,10 +1812,10 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
     if (process.env.NO_BROWSER !== '1') {
       setTimeout(() => {
         try {
-          const tokenPath = path.join(BASE_DIR, '.dashboard-token');
-          const token = existsSync(tokenPath) ? readFileSync(tokenPath, 'utf-8').trim() : '';
-          if (!token) return;
-          const url = `http://localhost:${childPort}/?token=${token}`;
+          // 1.18.159 — open the bare URL. Token comes from the meta tag
+          // in the served HTML (persistent since 1.18.152). Bare URL also
+          // sidesteps Chrome's per-query-string HTML cache entries.
+          const url = `http://localhost:${childPort}`;
           const platform = process.platform;
           const cmd = platform === 'darwin' ? 'open'
                     : platform === 'win32' ? 'start'

@@ -535,22 +535,22 @@ async function relaunchDashboardDetached(opts: { open?: boolean } = {}): Promise
     // can retry) but we surface the failure in logs.
     await new Promise(resolve => setTimeout(resolve, 3000));
 
-    let token = '';
-    try {
-      const tokenPath = path.join(BASE_DIR, '.dashboard-token');
-      if (existsSync(tokenPath)) token = readFileSync(tokenPath, 'utf-8').trim();
-    } catch { /* token may not be ready yet */ }
-
-    if (token) {
-      const url = `http://localhost:3030/?token=${token}`;
-      console.log(`  Dashboard relaunched: ${url}`);
-      // 1.18.147 — auto-open the browser by default. Restart/update
-      // already imply user wants the dashboard back; making them copy a
-      // URL was a UX papercut.
-      if (opts.open !== false) openInBrowser(url);
-    } else {
-      console.log('  Dashboard relaunched (token not ready — check `clementine status`).');
-    }
+    // 1.18.159 — print the bare URL, not the `?token=...` flavor.
+    // Token is delivered via meta tag in the served HTML (since 1.18.152
+    // when token persistence shipped). The token-in-URL flavor was a
+    // pre-1.18.152 habit and turned into a footgun: Chrome caches HTML
+    // by full URL including query string, so a stale `?token=ABC` cache
+    // entry survives across redeploys while bare `localhost:3030` pulls
+    // fresh HTML. Restart printing the bare URL also nudges users to
+    // bookmark THAT (which keeps working forever) instead of the
+    // token-flavored one (which would silently OK after a 1.18.152+
+    // restart but caches indefinitely on 1.18.151- installs).
+    const url = 'http://localhost:3030';
+    console.log(`  Dashboard relaunched: ${url}`);
+    // 1.18.147 — auto-open the browser by default. Restart/update
+    // already imply user wants the dashboard back; making them copy a
+    // URL was a UX papercut.
+    if (opts.open !== false) openInBrowser(url);
   } catch {
     console.log('  Could not relaunch dashboard — run: clementine dashboard');
   }
