@@ -1660,6 +1660,17 @@ export class SelfImproveLoop {
         const state = this.loadState();
         state.pendingApprovals = Math.max(0, state.pendingApprovals - 1);
         this.saveState(state);
+        // 1.18.165 — record the goal-area approval signal so the
+        // hypothesizer biases future cycles toward goal patterns the
+        // owner has accepted (the original 1.18.161 wiring missed
+        // this branch's early return — caught by the audit).
+        recordApprovalSignal({
+          experimentId,
+          area: pending.area,
+          target: pending.target,
+          hypothesis: pending.hypothesis,
+          decision: 'approved',
+        });
         logger.info({ id: experimentId, target: pending.target }, 'Goal created from self-improve proposal');
         return `Goal created: ${goalData.title ?? goalSlug}`;
       } catch (err) {
@@ -1736,6 +1747,17 @@ export class SelfImproveLoop {
             checkAfterMs: 24 * 60 * 60 * 1000,
           }) + '\n');
         } catch { /* ignore impact-check schedule errors */ }
+        // 1.18.165 — record the skill-area approval signal. Skills are
+        // the highest-leverage approval pattern (the owner approving a
+        // skill-body edit is a strong signal); the original 1.18.161
+        // wiring missed this branch's early return.
+        recordApprovalSignal({
+          experimentId,
+          area: pending.area,
+          target: pending.target,
+          hypothesis: pending.hypothesis,
+          decision: 'approved',
+        });
         return `Applied skill change to ${path.relative(VAULT_DIR, targetPath)} (useCount preserved, version bumped)`;
       } catch (err) {
         return `Cannot apply skill change — frontmatter merge failed: ${err instanceof Error ? err.message : String(err)}`;
