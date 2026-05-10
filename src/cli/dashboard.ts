@@ -25102,8 +25102,18 @@ function renderScheduledTaskCard(task) {
   } else {
     badges += '<span class="badge badge-gray" title="Legacy CRON.md job. Carries its own prompt/tools/MCP. Convert to a scheduled skill when you can.">LEGACY CRON</span>';
   }
-  if (task.predictable === true) badges += '<span class="badge badge-green" title="Contract mode — runs with only the prompt + pinned skills/tools. No MEMORY.md, no auto-matched skills, no team comms injection at fire-time.">🔒 predictable</span>';
-  else if (task.predictable === false) badges += '<span class="badge badge-yellow" title="Dynamic mode — fire-time injects MEMORY.md, recent team activity, and auto-matched skills. Can drift from chat-time intent.">🔄 reads memory</span>';
+  // 1.18.155 — replace the "🔒 predictable" lock icon (which appeared on
+  // ~every row and added pure noise) with a single "Strict" pill that ONLY
+  // appears when behavior diverges from the default. predictable=true is
+  // the default for new tasks since 1.18.68, so suppress that badge — only
+  // show one when the user has explicitly opted into dynamic mode (the
+  // less safe path, worth flagging) or when lean mode is in effect for a
+  // meta-job (worth showing because it explains why the prompt is small).
+  if (task.lean === true) {
+    badges += '<span class="badge badge-purple" title="Lean envelope — drops every auto-injected context block (memory, progress, goal, criteria, skills) and prunes the MCP catalog. Used for meta-jobs that must stay under Haiku\'s prompt cap.">Lean</span>';
+  } else if (task.predictable === false) {
+    badges += '<span class="badge badge-yellow" title="Dynamic mode — fire-time injects MEMORY.md, recent team activity, and auto-matched skills. Can drift from chat-time intent.">Reads memory</span>';
+  }
   if (task.mode === 'unleashed') badges += '<span class="badge badge-purple">long-running</span>';
   if (task.after) badges += '<span class="badge badge-yellow" title="Triggered after ' + esc(task.after) + '">after ' + esc(task.after) + '</span>';
   if (task.maxRetries != null) badges += '<span class="badge badge-gray">' + esc(task.maxRetries) + ' retries</span>';
@@ -25354,7 +25364,13 @@ function renderRecentHistoryList(runs) {
       var msg = String(entry.error).slice(0, 120);
       errorPreview = '<div style="font-size:11px;color:var(--red);margin-top:2px;word-break:break-word">' + esc(msg) + '</div>';
     } else if (entry.outputPreview) {
-      var preview = String(entry.outputPreview).slice(0, 140);
+      // 1.18.155 — strip the __NOTHING__ sentinel agents emit when they
+      // intentionally stay silent (it's the "no signal" contract from
+      // run-agent-cron.ts howToRespond block, not output the user should see).
+      var rawPreview = String(entry.outputPreview);
+      var preview = (rawPreview === '__NOTHING__' || rawPreview.trim() === '__NOTHING__')
+        ? '(no output — agent reported nothing worth saying)'
+        : rawPreview.slice(0, 140);
       errorPreview = '<div style="font-size:11px;color:var(--text-muted);margin-top:2px;word-break:break-word">' + esc(preview) + '</div>';
     }
     // PRD Phase 1.1: goal cell. Empty cell when no goal configured (status='skipped'
@@ -25459,16 +25475,31 @@ async function refreshHealthStrip() {
     var ops = await apiFetch('/api/build/operations?hours=1&limit=10').then(function(rr) { return rr.json(); });
     activeRuns = ((ops && ops.runningNow) || []).length;
   } catch (e) { /* fall back to 0 */ }
-  // Top failure category for the day.
+  // Top failure category for the day. 1.18.155 — when no failureCategory
+  // is set on the failed runs (which is common for raw SDK errors like
+  // "Prompt is too long"), fall back to grouping by jobName so the user
+  // sees WHICH job is failing instead of a useless dash. Categories still
+  // win when present (more semantic than a job name).
   var catCounts = {};
+  var jobCounts = {};
   for (var i = 0; i < last24.length; i++) {
     var c = last24[i].failureCategory;
     if (c) catCounts[c] = (catCounts[c] || 0) + 1;
+    if (last24[i].status === 'error' || last24[i].status === 'failed') {
+      var jn = last24[i].jobName || last24[i].name;
+      if (jn) jobCounts[jn] = (jobCounts[jn] || 0) + 1;
+    }
   }
   var topCat = null, topCount = 0;
   Object.keys(catCounts).forEach(function(k) {
     if (catCounts[k] > topCount) { topCat = k; topCount = catCounts[k]; }
   });
+  var topJob = null, topJobCount = 0;
+  Object.keys(jobCounts).forEach(function(k) {
+    if (jobCounts[k] > topJobCount) { topJob = k; topJobCount = jobCounts[k]; }
+  });
+  // Prefer the categorized one (more semantic), fall back to job name.
+  if (!topCat && topJob) { topCat = topJob; topCount = topJobCount; }
   // Render six tiles.
   function tile(label, value, sub, color) {
     return '<div class="health-tile">'
@@ -26134,7 +26165,12 @@ function renderRunListBody(allRuns) {
     if (status === 'error' && entry.error) {
       preview = '<div style="font-size:11px;color:var(--red);margin-top:2px;word-break:break-word">' + esc(String(entry.error).slice(0, 140)) + '</div>';
     } else if (entry.outputPreview) {
-      preview = '<div style="font-size:11px;color:var(--text-muted);margin-top:2px;word-break:break-word">' + esc(String(entry.outputPreview).slice(0, 120)) + '</div>';
+      // 1.18.155 — see renderRecentHistoryList for the same __NOTHING__ strip.
+      var rawOp = String(entry.outputPreview);
+      var opText = (rawOp === '__NOTHING__' || rawOp.trim() === '__NOTHING__')
+        ? '(no output — agent reported nothing worth saying)'
+        : rawOp.slice(0, 120);
+      preview = '<div style="font-size:11px;color:var(--text-muted);margin-top:2px;word-break:break-word">' + esc(opText) + '</div>';
     }
     // 1.18.89: cost label. Showing 4 decimals for sub-penny costs (Haiku
     // runs land in fractions of a cent), 2 decimals when ≥ $0.01.
@@ -26763,7 +26799,11 @@ async function refreshCron() {
     var bannerHtml = '';
     var dismissed = localStorage.getItem('clem-skill-migrate-banner-dismissed') === '1';
     if (legacyCount > 0 && !dismissed) {
-      bannerHtml = '<div style="background:rgba(124,58,237,0.08);border:1px solid var(--purple);border-radius:8px;padding:12px 14px;margin-bottom:14px;display:flex;align-items:center;gap:12px;flex-wrap:wrap">'
+      // 1.18.155 — data-banner-kind tags this as the legacy-cron soft-
+      // deprecation banner so refreshCronMigrateBanner can suppress its
+      // secondary "clean up preambles" banner when this one is showing
+      // (full migration is a superset; showing both is confusing noise).
+      bannerHtml = '<div data-banner-kind="legacy-cron-soft-deprecation" style="background:rgba(124,58,237,0.08);border:1px solid var(--purple);border-radius:8px;padding:12px 14px;margin-bottom:14px;display:flex;align-items:center;gap:12px;flex-wrap:wrap">'
         + '<span style="font-size:18px">⚡</span>'
         + '<div style="flex:1;min-width:200px">'
         +   '<div style="font-size:13px;font-weight:500;color:var(--text-primary)">' + legacyCount + ' legacy cron task' + (legacyCount === 1 ? '' : 's') + ' can become scheduled skills</div>'
@@ -28733,6 +28773,19 @@ async function refreshCronMigrateBanner() {
       return;
     }
     _cronMigratePreview = d;
+    // 1.18.155 — suppress this banner when the upstream "X legacy crons
+    // can become scheduled skills" banner is already showing. The full
+    // migration there is a superset of this cleanup (the destination skill
+    // gets a clean prompt automatically), so showing both at once is just
+    // confusing noise. If the upstream banner is dismissed via localStorage
+    // OR there are no legacy crons to migrate, this orange banner shows up
+    // as the secondary action.
+    var dismissed = localStorage.getItem('clem-skill-migrate-banner-dismissed') === '1';
+    var hasLegacyCronBanner = !dismissed && document.querySelector('[data-banner-kind="legacy-cron-soft-deprecation"]');
+    if (hasLegacyCronBanner) {
+      host.innerHTML = '';
+      return;
+    }
     var n = d.eligible.length;
     host.innerHTML =
       '<div style="margin:0 0 14px;padding:12px 16px;border:1px solid var(--accent);background:rgba(255,141,0,0.06);border-radius:8px;display:flex;align-items:center;gap:14px;flex-wrap:wrap">'

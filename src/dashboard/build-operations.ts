@@ -109,6 +109,10 @@ export interface ScheduledTaskCard {
    *  team comms / auto-matched skills. The visibility-on-card flag for
    *  "this trick will run with only what you see here." */
   predictable?: boolean;
+  /** 1.18.154/155 — Lean envelope (meta-jobs). Surfaced in the row badge
+   *  so the user understands why insight-check / outcome-grader / etc.
+   *  show a tiny prompt + restricted MCP catalog. */
+  lean?: boolean;
 }
 
 export interface ScheduledWorkflowCard {
@@ -405,6 +409,7 @@ export function buildOperationsSnapshot(input: BuildOperationsInput): BuildOpera
       tags: asStringArray(job.tags),
       category: typeof job.category === 'string' && job.category.trim() ? job.category.trim() : undefined,
       predictable: typeof job.predictable === 'boolean' ? job.predictable : undefined,
+      lean: typeof job.lean === 'boolean' ? job.lean : undefined,
     };
   }).sort((a, b) => a.owner.localeCompare(b.owner) || a.displayName.localeCompare(b.displayName));
 
