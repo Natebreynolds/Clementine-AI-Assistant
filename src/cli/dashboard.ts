@@ -13231,7 +13231,10 @@ self.addEventListener('activate', e => {
 
 // ── Inline HTML Dashboard ────────────────────────────────────────────
 
-function getDashboardHTML(token: string): string {
+// Exported for testability — see tests/dashboard-spa-parses.test.ts.
+// 1.18.158 added that test as a guard against the recurring "served
+// HTML inline JS doesn't parse" bug (1.18.142 + 1.18.155).
+export function getDashboardHTML(token: string): string {
   const name = getAssistantName();
   return `<!DOCTYPE html>
 <html lang="en">
@@ -25297,7 +25300,13 @@ function renderScheduledTaskCard(task) {
   // less safe path, worth flagging) or when lean mode is in effect for a
   // meta-job (worth showing because it explains why the prompt is small).
   if (task.lean === true) {
-    badges += '<span class="badge badge-purple" title="Lean envelope — drops every auto-injected context block (memory, progress, goal, criteria, skills) and prunes the MCP catalog. Used for meta-jobs that must stay under Haiku\'s prompt cap.">Lean</span>';
+    // 1.18.158 hotfix — apostrophe in title= breaks JS parser. Outer
+    // template literal converts \' → ', the resulting served HTML has
+    // 'Haiku's' inside a single-quoted JS string, which terminates the
+    // string early and crashes the entire SPA. Use HTML entity to be
+    // safe across both layers (also valid inside JS strings since &#39;
+    // is just text characters, no special meaning).
+    badges += '<span class="badge badge-purple" title="Lean envelope — drops every auto-injected context block (memory, progress, goal, criteria, skills) and prunes the MCP catalog. Used for meta-jobs that must stay under Haiku&#39;s prompt cap.">Lean</span>';
   } else if (task.predictable === false) {
     badges += '<span class="badge badge-yellow" title="Dynamic mode — fire-time injects MEMORY.md, recent team activity, and auto-matched skills. Can drift from chat-time intent.">Reads memory</span>';
   }
