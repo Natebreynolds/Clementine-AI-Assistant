@@ -650,6 +650,15 @@ export interface CronJobDefinition {
    * Existing tricks (no field set) keep current behavior — backward compat.
    */
   predictable?: boolean;
+  /** 1.18.154 — strictest possible context envelope, for meta-jobs that
+   *  need to stay under Haiku's prompt cap (insight-check, the four
+   *  meta-routers, __heartbeat__). Implies predictable + drops progress/
+   *  goal/criteria/skill blocks entirely. Use only for jobs whose prompt
+   *  is self-contained and whose tools are explicitly allow-listed. The
+   *  fix for the 1.18.148 regression where insight-check kept failing
+   *  with "Prompt is too long" because predictable alone wasn't strict
+   *  enough. */
+  lean?: boolean;
   /** 1.18.129 — where this cron job came from. 'cron-md' is the legacy
    *  fat-cron format in vault/00-System/CRON.md (or per-agent CRON.md).
    *  'scheduled-skill' is the Anthropic-pure registry — a thin entry in

@@ -2258,6 +2258,9 @@ export class Gateway {
     allowedMcpServers?: string[],
     /** Predictable (contract) mode — runner skips memory/team/auto-skills. */
     predictable?: boolean,
+    /** Lean (meta-job) mode — strictest envelope, drops every auto-injected
+     *  context block. For insight-check, the four meta-routers, heartbeat. */
+    lean?: boolean,
     /** Extra read+exec scope for the SDK's Read/Bash/Glob tools. From the
      *  CronJobDefinition.addDirs YAML field. Combined inside runAgentCron
      *  with each pinned-skill folder. (1.18.121) */
@@ -2309,6 +2312,7 @@ export class Gateway {
           allowedTools,
           allowedMcpServers,
           predictable,
+          lean,
           addDirs,
         });
 

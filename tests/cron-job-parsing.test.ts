@@ -45,13 +45,24 @@ function writeAgentCron(slug: string, yaml: string): void {
   writeFileSync(path.join(dir, 'CRON.md'), `---\n${yaml}\n---\n`);
 }
 
+let PREV_CLEMENTINE_HOME: string | undefined;
+
 beforeEach(() => {
   TMP_DIR = mkdtempSync(path.join(tmpdir(), 'clem-cron-parse-'));
   (globalThis as any).__CLEM_TEST_CRON_FILE = TMP_CRON();
   (globalThis as any).__CLEM_TEST_AGENTS_DIR = TMP_AGENTS();
+  // 1.18.154 — also redirect CLEMENTINE_HOME so the schedule registry
+  // (~/.clementine/schedules.json, resolved lazily inside schedule-registry.ts)
+  // points at the temp dir. Without this, parseCronJobs leaks live registry
+  // entries into test output. (Latent isolation gap; surfaced when a real
+  // schedule was added on the dev box on 2026-05-10.)
+  PREV_CLEMENTINE_HOME = process.env.CLEMENTINE_HOME;
+  process.env.CLEMENTINE_HOME = TMP_DIR;
 });
 afterEach(() => {
   if (TMP_DIR && existsSync(TMP_DIR)) rmSync(TMP_DIR, { recursive: true, force: true });
+  if (PREV_CLEMENTINE_HOME === undefined) delete process.env.CLEMENTINE_HOME;
+  else process.env.CLEMENTINE_HOME = PREV_CLEMENTINE_HOME;
 });
 
 beforeAll(() => { /* no-op */ });

@@ -233,6 +233,8 @@ function parseJobYaml(job: Record<string, unknown>): CronJobDefinition | null {
     ? categoryRaw.trim().slice(0, 64)
     : undefined;
   const predictable = typeof job.predictable === 'boolean' ? job.predictable : undefined;
+  // 1.18.154 — strictest envelope for meta-jobs (insight-check, heartbeat).
+  const lean = typeof job.lean === 'boolean' ? job.lean : undefined;
   const description = typeof job.description === 'string' && job.description.trim()
     ? job.description.trim().slice(0, 500)
     : undefined;
@@ -242,7 +244,7 @@ function parseJobYaml(job: Record<string, unknown>): CronJobDefinition | null {
     maxHours, maxRetries, after, successCriteria, successCriteriaText, successSchema, addDirs,
     alwaysDeliver, context, preCheck, attachments, requiresConfirmation, confirmationTimeoutMin,
     agentSlug,
-    skills, allowedTools, allowedMcpServers, tags, category, predictable,
+    skills, allowedTools, allowedMcpServers, tags, category, predictable, lean,
   };
 }
 
@@ -1373,6 +1375,7 @@ export class CronScheduler {
             job.allowedTools,
             job.allowedMcpServers,
             job.predictable,
+            job.lean,
             job.addDirs,
           );
 
@@ -1396,6 +1399,7 @@ export class CronScheduler {
                 job.allowedTools,
                 job.allowedMcpServers,
                 job.predictable,
+                job.lean,
                 job.addDirs,
               );
               if (retryResponse && !CronScheduler.isCronNoise(retryResponse)) {

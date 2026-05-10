@@ -628,6 +628,18 @@ export interface RunAgentCronOptions {
    *  prior progress. The fix for fire-time memory drift. Undefined =
    *  legacy behavior (inject everything). */
   predictable?: boolean;
+  /** Lean mode — strictest possible context envelope, used by meta-jobs
+   *  (insight-check, outcome-grader, route-classifier, failure-diagnostics,
+   *  __heartbeat__) that ALSO have to stay under Haiku's prompt cap.
+   *  Implies predictable + drops progress/goal/criteria/skill-context blocks
+   *  + prunes MCP catalog to just the explicit allowed servers (no Composio
+   *  auto-discovery, no claude.ai connector inventory). When unset, behaves
+   *  like predictable. The 1.18.148 fix patched outcome-grader / route-
+   *  classifier / failure-diagnostics directly; this 1.18.154 flag covers
+   *  insight-check (which still failed 65/70 because predictable alone
+   *  wasn't strict enough) and is the canonical hook for any future
+   *  meta-job that needs a tiny prompt. */
+  lean?: boolean;
   /** Extra read+execute scope for the agent's Read/Bash/Glob tools. Maps
    *  directly to the CronJobDefinition.addDirs YAML field. Combined with
    *  every pinned-skill folder so `Bash python3 scripts/render.py` works
@@ -728,17 +740,36 @@ export async function buildCronExecutionPlan(opts: RunAgentCronOptions): Promise
   // fire time. Legacy tricks (predictable === undefined) preserve existing
   // behavior so we don't surprise anyone.
   const predictable = opts.predictable === true;
+  // 1.18.154 — lean mode goes one tier stricter for meta-jobs (insight-check,
+  // outcome-grader, route-classifier, failure-diagnostics, __heartbeat__).
+  // Drops progress / goal / criteria / skill-context blocks too, leaving
+  // the agent with [jobName] + [jobPrompt] + [howToRespond] only. Implies
+  // predictable. Anything that ALSO needs a tiny MCP catalog uses the
+  // pruning logic below.
+  //
+  // Auto-apply for known meta-jobs even if the CRON.md/registry entry
+  // doesn't carry `lean: true` — these names are hard-coded singletons in
+  // heartbeat-scheduler.ts and we know they need the strict envelope. Lets
+  // existing user installs benefit from the fix without requiring them to
+  // hand-edit CRON.md.
+  const KNOWN_META_JOBS = new Set([
+    'insight-check', 'outcome-grader', 'route-classifier',
+    'failure-diagnostics', '__heartbeat__',
+  ]);
+  const lean = opts.lean === true || KNOWN_META_JOBS.has(opts.jobName);
 
-  const memoryContext = predictable ? '' : buildAutonomousMemoryContext(opts.profile);
-  const progressContext = buildProgressContext(opts.jobName);     // opt-in via cron_progress writes
-  const goalContext = buildGoalContext(opts.jobName);             // explicit links; not auto-inferred
-  const delegationContext = predictable ? '' : buildDelegationContext(agentSlug);
-  const teamContext = predictable ? '' : buildTeamContext(agentSlug);
-  const criteriaContext = buildCriteriaContext(opts.successCriteria);
-  const skillResult = await buildSkillContext(
-    opts.jobName, opts.jobPrompt, agentSlug, opts.pinnedSkills, opts.memoryStore,
-    { skipAutoMatch: predictable, projectWorkDir: opts.workDir },
-  );
+  const memoryContext = predictable || lean ? '' : buildAutonomousMemoryContext(opts.profile);
+  const progressContext = lean ? '' : buildProgressContext(opts.jobName);     // opt-in via cron_progress writes
+  const goalContext = lean ? '' : buildGoalContext(opts.jobName);             // explicit links; not auto-inferred
+  const delegationContext = predictable || lean ? '' : buildDelegationContext(agentSlug);
+  const teamContext = predictable || lean ? '' : buildTeamContext(agentSlug);
+  const criteriaContext = lean ? '' : buildCriteriaContext(opts.successCriteria);
+  const skillResult = lean
+    ? { text: '', applied: [], missing: [], pinnedBodies: [] as string[], pinnedToolsRequested: [] as string[] }
+    : await buildSkillContext(
+        opts.jobName, opts.jobPrompt, agentSlug, opts.pinnedSkills, opts.memoryStore,
+        { skipAutoMatch: predictable, projectWorkDir: opts.workDir },
+      );
   const skillContext = skillResult.text;
 
   const howToRespond =
@@ -766,15 +797,24 @@ export async function buildCronExecutionPlan(opts: RunAgentCronOptions): Promise
     `${opts.jobPrompt}\n\n` +
     howToRespond;
 
-  const mcp = await buildExtraMcpForRunAgent({
-    scopeText: [
-      opts.jobName,
-      opts.jobPrompt,
-      opts.profile?.description,
-      opts.profile?.systemPromptBody,
-    ].filter(Boolean).join('\n\n'),
-    profile: opts.profile,
-  });
+  // 1.18.154 — lean mode skips Composio + claude.ai MCP discovery entirely.
+  // Meta-jobs (insight-check etc.) only need the always-on Clementine MCP
+  // server (which is added in run-agent.ts and has cron_list, discord_*,
+  // etc.). Loading 200+ extra MCP tool schemas just to call cron_list is
+  // what was tipping the prompt over Haiku's cap. If a lean job DOES need
+  // extras, declare them explicitly via `allowedMcpServers` and the helper
+  // narrows discovery to those names.
+  const mcp = lean && (!opts.allowedMcpServers || opts.allowedMcpServers.length === 0)
+    ? { servers: {} as Record<string, unknown>, composioConnected: [] as string[], externalConnected: [] as string[] }
+    : await buildExtraMcpForRunAgent({
+        scopeText: [
+          opts.jobName,
+          opts.jobPrompt,
+          opts.profile?.description,
+          opts.profile?.systemPromptBody,
+        ].filter(Boolean).join('\n\n'),
+        profile: opts.profile,
+      });
 
   // 1.18.125 — pinned-skill scope widening (SDK alignment).
   // A pinned skill that declares `clementine.tools.allow` or references
@@ -904,19 +944,28 @@ export async function runAgentCron(opts: RunAgentCronOptions): Promise<RunAgentC
     additionalDirectories,
   } = plan;
 
-  logger.info({
+  // 1.18.154 — surface lean + promptChars for meta-job diagnostics. The
+  // self-improve / insight-check failure mode is "small prompt, fat context"
+  // which only shows in promptChars; plain log level was previously info but
+  // anything > 50KB is on the cusp of Haiku's cap and worth a warn.
+  const promptBytes = Buffer.byteLength(builtPrompt, 'utf8');
+  const promptOversized = promptBytes > 50_000;
+  logger[promptOversized ? 'warn' : 'info']({
     job: opts.jobName,
     tier: plan.tier,
     profile: agentSlug,
+    lean: opts.lean === true || ['insight-check', 'outcome-grader', 'route-classifier', 'failure-diagnostics', '__heartbeat__'].includes(opts.jobName),
     composioConnected,
     externalConnected,
     promptChars: builtPrompt.length,
+    promptBytes,
     pinnedSkills: opts.pinnedSkills?.length ?? 0,
     skillsApplied: plan.skillsApplied.length,
     skillsMissing: plan.skillsMissing.length,
     trickAllowedTools: effectiveAllowedTools?.length,
     trickAllowedMcp: opts.allowedMcpServers?.length,
     widenedFromSkills: plan.widenedFromSkills,
+    ...(promptOversized ? { warning: 'prompt > 50KB; risk of "Prompt is too long" failure' } : {}),
   }, 'runAgentCron: dispatching to runAgent');
 
   const startedAt = Date.now();
