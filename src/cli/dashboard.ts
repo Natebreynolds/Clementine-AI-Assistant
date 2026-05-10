@@ -39169,9 +39169,15 @@ async function runWorkflow(name) {
 // the list so the migrated workflow disappears (its .md is renamed to
 // .md.migrated server-side and parseAllWorkflows stops picking it up).
 async function migrateWorkflowToSkill(name) {
-  if (!confirm('Migrate "' + name + '" into a skill folder?\n\n' +
-    '• A new skill will be created at vault/00-System/skills/<slug>/SKILL.md\n' +
-    '• The original workflow .md will be renamed to .md.migrated (kept for rollback)\n' +
+  // 1.18.153 — escape \\n through the outer template literal. Without the
+  // double-backslash the served HTML gets literal newlines INSIDE a single-
+  // quoted JS string, which the browser parser rejects as
+  // "Uncaught SyntaxError: Invalid or unexpected token". That kills the
+  // entire inline script block, so no API calls fire, no data renders,
+  // dashboard appears completely broken even though the server is healthy.
+  if (!confirm('Migrate "' + name + '" into a skill folder?\\n\\n' +
+    '• A new skill will be created at vault/00-System/skills/<slug>/SKILL.md\\n' +
+    '• The original workflow .md will be renamed to .md.migrated (kept for rollback)\\n' +
     '• The workflow stops firing; the skill is ready to schedule from the Skills tab')) return;
   try {
     var r = await apiFetch('/api/workflows/' + encodeURIComponent(name) + '/migrate-to-skill', {
