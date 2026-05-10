@@ -42,7 +42,11 @@ import {
   normalizeClaudeSdkOptionsForOneMillionContext,
 } from '../config.js';
 import { parseTasks } from '../tools/shared.js';
-import { todayISO, CronRunLog } from '../gateway/cron-scheduler.js';
+// 1.18.160 — also pull parseCronJobs + parseAgentCronJobs so getCronJobs()
+// returns the same merged set the runtime fires (CRON.md + agent CRON +
+// schedule registry). Was reading only CRON.md before, hiding migrated
+// scheduled-skills from the Tasks tab while they kept firing on schedule.
+import { todayISO, CronRunLog, parseCronJobs, parseAgentCronJobs } from '../gateway/cron-scheduler.js';
 import { goalsRouter } from './routes/goals.js';
 import { delegationsRouter } from './routes/delegations.js';
 import { workflowsRouter } from './routes/workflows.js';
@@ -1305,42 +1309,30 @@ function getSessions(): Record<string, unknown> {
 }
 
 function getCronJobs(): Record<string, unknown> {
-  let jobs: Array<Record<string, unknown>> = [];
-
-  // Load main CRON.md
-  if (existsSync(CRON_FILE)) {
-    try {
-      const raw = readFileSync(CRON_FILE, 'utf-8');
-      const parsed = matter(raw);
-      const mainJobs = (parsed.data.jobs ?? []) as Array<Record<string, unknown>>;
-      jobs.push(...mainJobs);
-    } catch { /* ignore */ }
-  }
-
-  // Load agent-scoped CRON.md files
-  const agentsDir = path.join(VAULT_DIR, '00-System', 'agents');
-  if (existsSync(agentsDir)) {
-    try {
-      for (const slug of readdirSync(agentsDir)) {
-        const agentCronFile = path.join(agentsDir, slug, 'CRON.md');
-        if (!existsSync(agentCronFile)) continue;
-        try {
-          const raw = readFileSync(agentCronFile, 'utf-8');
-          const parsed = matter(raw);
-          const agentJobs = (parsed.data.jobs ?? []) as Array<Record<string, unknown>>;
-          for (const job of agentJobs) {
-            jobs.push({ ...job, agent: slug, name: `${slug}:${job.name}` });
-          }
-        } catch { /* ignore individual agent parse errors */ }
-      }
-    } catch { /* ignore */ }
-  }
+  // 1.18.160 — delegate to the canonical merger so scheduled-skill rows
+  // (from ~/.clementine/schedules.json) reach the dashboard alongside
+  // legacy CRON.md entries. Before this, getCronJobs() only read CRON.md
+  // — so when a user migrated 14 of their 15 crons to scheduled-skills,
+  // the Tasks page silently dropped to 1 card while the runtime kept
+  // firing all 22 jobs. The result LOOKED like a regression because the
+  // user couldn't see, edit, pause, or trace any of the migrated work
+  // from the Tasks tab. parseCronJobs() reads BOTH CRON.md + agent CRON
+  // files + the schedule registry, dedups by name (scheduled-skill wins
+  // collisions), and stamps `source` so the existing card renderer can
+  // branch on SKILL vs LEGACY CRON badge.
+  //
+  // The dashboard now sees exactly what the runtime fires — single
+  // source of truth, no drift. Both helpers are imported at the top.
+  const allJobs = [
+    ...parseCronJobs(),
+    ...parseAgentCronJobs(path.join(VAULT_DIR, '00-System', 'agents')),
+  ];
 
   // Attach recent run history. Single source of truth via CronRunLog.readRecent
   // — same path the new /api/cron/runs cross-job endpoint uses, so per-card
   // last-run and the Recent History zone never disagree.
   const log = new CronRunLog();
-  const enriched = jobs.map((job) => {
+  const enriched = allJobs.map((job) => {
     const name = String(job.name ?? '');
     const recentRuns = log.readRecent(name, 10);
     return { ...job, recentRuns };
@@ -27026,15 +27018,29 @@ async function refreshCron() {
     // (definition.source !== 'scheduled-skill') and surfaces a one-click
     // bulk migrator. Dismissable; persists in localStorage so it doesn't
     // nag on every refresh.
+    // 1.18.160 — only nag for UNHEALTHY legacy crons. After the user
+    // bulk-migrates 14 healthy ones, having a banner shout about the
+    // 1 healthy survivor felt naggy. The user can still migrate healthy
+    // ones at their leisure via per-row "→ Skill" buttons; the banner
+    // earns the screen real estate only when there's a real problem.
     var legacyCount = 0;
+    var legacyUnhealthyCount = 0;
     try {
-      legacyCount = (visibleTasks || []).filter(function(t) {
+      var legacyRows = (visibleTasks || []).filter(function(t) {
         return !(t.definition && t.definition.source === 'scheduled-skill');
+      });
+      legacyCount = legacyRows.length;
+      legacyUnhealthyCount = legacyRows.filter(function(t) {
+        var h = t.health;
+        return h === 'failed' || h === 'broken' || h === 'never_run';
       }).length;
     } catch (_) { /* defensive */ }
     var bannerHtml = '';
     var dismissed = localStorage.getItem('clem-skill-migrate-banner-dismissed') === '1';
-    if (legacyCount > 0 && !dismissed) {
+    // Show the banner only when there's an unhealthy legacy cron to nudge
+    // the user about. Healthy legacy crons live quietly until the user
+    // chooses to migrate them per-row.
+    if (legacyUnhealthyCount > 0 && !dismissed) {
       // 1.18.155 — data-banner-kind tags this as the legacy-cron soft-
       // deprecation banner so refreshCronMigrateBanner can suppress its
       // secondary "clean up preambles" banner when this one is showing
@@ -27042,8 +27048,8 @@ async function refreshCron() {
       bannerHtml = '<div data-banner-kind="legacy-cron-soft-deprecation" style="background:rgba(124,58,237,0.08);border:1px solid var(--purple);border-radius:8px;padding:12px 14px;margin-bottom:14px;display:flex;align-items:center;gap:12px;flex-wrap:wrap">'
         + '<span style="font-size:18px">⚡</span>'
         + '<div style="flex:1;min-width:200px">'
-        +   '<div style="font-size:13px;font-weight:500;color:var(--text-primary)">' + legacyCount + ' legacy cron task' + (legacyCount === 1 ? '' : 's') + ' can become scheduled skills</div>'
-        +   '<div style="font-size:11px;color:var(--text-muted);margin-top:2px">Skills are the Anthropic-pure unit of work. Scheduled-skill format is thinner, easier to maintain, and tasks can be reused on demand.</div>'
+        +   '<div style="font-size:13px;font-weight:500;color:var(--text-primary)">' + legacyUnhealthyCount + ' legacy cron task' + (legacyUnhealthyCount === 1 ? '' : 's') + ' failing — migrating to a scheduled skill often clears the issue</div>'
+        +   '<div style="font-size:11px;color:var(--text-muted);margin-top:2px">Scheduled skills use a tighter context envelope (lean mode for meta-jobs) and the Anthropic-canonical SKILL.md format. Healthy legacy crons stay quietly out of the way.</div>'
         + '</div>'
         + '<button class="btn-sm btn-primary" onclick="migrateAllCronsToSkills()" style="font-size:12px;padding:6px 12px">Migrate all eligible →</button>'
         + '<button class="btn-sm" onclick="localStorage.setItem(\\x27clem-skill-migrate-banner-dismissed\\x27,\\x271\\x27);refreshCron()" title="Hide this banner" style="font-size:12px;padding:6px 10px">Dismiss</button>'
