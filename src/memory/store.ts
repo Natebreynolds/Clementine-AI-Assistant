@@ -15,6 +15,7 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statS
 import path from 'node:path';
 import Database from 'better-sqlite3';
 import { BASE_DIR } from '../config.js';
+import { formatBytes } from '../lib/format.js';
 import { temporalDecay } from './search.js';
 import type {
   Feedback,
@@ -133,13 +134,7 @@ export class MemoryStore {
     return conf >= 1 ? 1 : 0.5 + 0.5 * conf;
   }
 
-  private static formatBytes(n: number): string {
-    if (!Number.isFinite(n) || n < 0) return '0 B';
-    if (n < 1024) return `${n} B`;
-    if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
-    if (n < 1024 * 1024 * 1024) return `${(n / 1024 / 1024).toFixed(1)} MB`;
-    return `${(n / 1024 / 1024 / 1024).toFixed(2)} GB`;
-  }
+  // 1.18.149 — formatBytes consolidated to src/lib/format.ts
 
   private static dirSizeBytes(dir: string): number {
     if (!existsSync(dir)) return 0;
@@ -7639,7 +7634,7 @@ export class MemoryStore {
           cacheDir,
           cacheExists: existsSync(cacheDir),
           cacheBytes,
-          cacheSize: MemoryStore.formatBytes(cacheBytes),
+          cacheSize: formatBytes(cacheBytes),
           installed: cacheBytes >= 1024 * 1024,
         };
       })(),

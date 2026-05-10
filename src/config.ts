@@ -636,7 +636,11 @@ export const CHANNEL_SLACK = Boolean(SLACK_BOT_TOKEN && SLACK_APP_TOKEN);
 export const CHANNEL_TELEGRAM = Boolean(TELEGRAM_BOT_TOKEN);
 export const CHANNEL_WHATSAPP = Boolean(TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN && WHATSAPP_OWNER_PHONE);
 export const CHANNEL_WEBHOOK = WEBHOOK_ENABLED && Boolean(WEBHOOK_SECRET);
-export const CHANNEL_OUTLOOK = Boolean(MS_TENANT_ID && MS_CLIENT_ID && MS_CLIENT_SECRET && MS_USER_EMAIL);
+// 1.18.149 — CHANNEL_OUTLOOK removed. There's no native Outlook channel
+// startup wired into src/index.ts; users access Outlook via the Composio
+// Outlook toolkit (set up from Settings → Integrations). The flag was
+// only displayed in the startup banner — misleading because it implied
+// an Outlook channel was running when nothing was.
 export const CHANNEL_SALESFORCE = Boolean(SF_INSTANCE_URL && SF_CLIENT_ID && SF_CLIENT_SECRET);
 
 // ── Fail-closed secret validation ───────────────────────────────────

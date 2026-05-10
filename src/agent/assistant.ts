@@ -213,10 +213,10 @@ function getChannelToolDenyList(channel: string): string[] {
  * Callers that need exact counts should read `usage.input_tokens` from the
  * SDK result; this function is for pre-flight planning only.
  */
-export function estimateTokens(text: string): number {
-  if (!text) return 0;
-  return Math.ceil(text.length / 3.3);
-}
+// 1.18.149 — switched to canonical /4 divisor (was /3.3 here for no documented
+// reason; brain/llm-client.ts and gateway/turn-ledger.ts both used /4 to match
+// Anthropic's published rule of thumb). Re-export keeps existing callers working.
+export { estimateTokens } from '../lib/format.js';
 
 
 

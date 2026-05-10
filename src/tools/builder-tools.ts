@@ -24,7 +24,6 @@ import {
   sourceFileForId,
 } from '../dashboard/builder/serializer.js';
 import { validateWorkflow } from '../dashboard/builder/validation.js';
-import { dryRunWorkflow } from '../dashboard/builder/dry-run.js';
 import { emitBuilderEvent } from '../dashboard/builder/events.js';
 import { listSnapshots, restoreSnapshot } from '../dashboard/builder/snapshots.js';
 import { discoverMcpServers, loadToolInventory } from '../agent/mcp-bridge.js';
@@ -87,41 +86,6 @@ server.tool(
 );
 
 server.tool(
-  'workflow_read',
-  'Read a workflow as canonical JSON. Use this before editing — patches reference current step ids.',
-  {
-    id: z.string().describe('Builder id (e.g., cron:morning-briefing or workflow:daily-digest)'),
-  },
-  async ({ id }) => {
-    const wf = readWorkflow(id);
-    if (!wf) return textResult(`Not found: ${id}`);
-    return textResult(JSON.stringify(wf, null, 2));
-  },
-);
-
-server.tool(
-  'workflow_search',
-  'Search workflows + crons by name or content (substring, case-insensitive).',
-  { query: z.string() },
-  async ({ query }) => {
-    const q = query.toLowerCase();
-    const items = listAllForBuilder();
-    const matches: string[] = [];
-    for (const i of items) {
-      if (i.name.toLowerCase().includes(q) || (i.description ?? '').toLowerCase().includes(q)) {
-        matches.push(`${i.id}|${i.name}|${i.origin}`);
-        continue;
-      }
-      const wf = readWorkflow(i.id);
-      if (wf && wf.steps.some(s => s.prompt.toLowerCase().includes(q))) {
-        matches.push(`${i.id}|${i.name}|${i.origin} (matched in step prompt)`);
-      }
-    }
-    return textResult(matches.length === 0 ? `(no matches for "${query}")` : matches.join('\n'));
-  },
-);
-
-server.tool(
   'workflow_list_mcp_tools',
   'List MCP servers and their tools. Use to fill in mcp-step configs (server + tool name).',
   {},
@@ -165,68 +129,7 @@ server.tool(
   },
 );
 
-server.tool(
-  'workflow_dry_run',
-  'Walk a workflow without executing. Shows what each step would do, in topological order, with rough cost estimate. Use for long-running jobs to preview safely.',
-  { id: z.string() },
-  async ({ id }) => {
-    const wf = readWorkflow(id);
-    if (!wf) return textResult(`Not found: ${id}`);
-    const r = dryRunWorkflow(wf);
-    const lines: string[] = [];
-    lines.push(r.ok ? `DRY RUN: ${wf.name}` : `DRY RUN (validation failed): ${wf.name}`);
-    if (r.validationIssues.length) lines.push(formatIssues(r.validationIssues));
-    for (const s of r.steps) {
-      lines.push(`[wave ${s.wave}] ${s.description}`);
-      for (const w of s.warnings) lines.push(`  ⚠ ${w}`);
-    }
-    if (r.estimatedTokens) {
-      lines.push(`Rough estimate: ~${r.estimatedTokens.total.toLocaleString()} tokens across ${r.estimatedTokens.promptSteps} prompt step(s).`);
-    }
-    for (const note of r.notes) lines.push(note);
-    return textResult(lines.join('\n'));
-  },
-);
-
 // ── Mutations ──────────────────────────────────────────────────────────
-
-server.tool(
-  'workflow_save',
-  'Save a workflow (full replace). Validates before writing — rejects on errors unless `force: true`. Use this when you need to change many fields atomically; for small edits prefer the targeted tools (workflow_add_node etc.).',
-  {
-    id: z.string(),
-    workflow: z.object({
-      name: z.string(),
-      description: z.string().default(''),
-      enabled: z.boolean().default(true),
-      trigger: z.object({ schedule: z.string().optional(), manual: z.boolean().optional() }).default({ manual: true }),
-      inputs: z.record(z.string(), z.object({ type: z.enum(['string', 'number']), default: z.string().optional(), description: z.string().optional() })).default({}),
-      steps: z.array(stepShape),
-      synthesis: z.object({ prompt: z.string() }).optional(),
-      agentSlug: z.string().optional(),
-      project: z.string().optional().describe('Linked-project path; default cwd for CLI steps'),
-      model: z.string().optional().describe('Default model for prompt steps without their own'),
-    }),
-    force: z.boolean().optional().describe('Bypass validation errors (warnings always ignored)'),
-  },
-  async ({ id, workflow, force }) => {
-    const existing = readWorkflow(id);
-    if (!existing) return textResult(`Not found: ${id}`);
-    const next: WorkflowDefinition = {
-      ...workflow,
-      steps: workflow.steps.map(s => normalizeStep(s)),
-      sourceFile: existing.sourceFile,
-    };
-    const v = validateWorkflow(next);
-    if (!v.ok && !force) {
-      return textResult('Save rejected — validation errors:\n' + formatIssues(v.issues) + '\nPass force: true to override.');
-    }
-    const result = saveWorkflow(id, next);
-    if (!result.ok) return textResult('Save failed: ' + result.error);
-    emitBuilderEvent({ type: 'workflow:patched', workflowId: id, payload: { workflow: next } });
-    return textResult(`Saved ${id}.${v.issues.length ? ' Warnings:\n' + formatIssues(v.issues.filter(i => i.severity === 'warning')) : ''}`);
-  },
-);
 
 server.tool(
   'workflow_create',
@@ -483,27 +386,6 @@ server.tool(
     if (!result.ok) return textResult('Restore failed: ' + (result.error ?? 'unknown'));
     emitBuilderEvent({ type: 'workflow:patched', workflowId: id, payload: { restoredFrom: snapshotFilename } });
     return textResult(`Restored ${id} from ${snapshotFilename}`);
-  },
-);
-
-server.tool(
-  'workflow_delete',
-  'Delete a workflow file (multi-step workflows only). Cron entries are removed via workflow_set_enabled or by editing CRON.md directly.',
-  { id: z.string() },
-  async ({ id }) => {
-    const parsed = parseBuilderId(id);
-    if (!parsed) return textResult(`Bad id: ${id}`);
-    if (parsed.origin === 'cron') return textResult('Use workflow_set_enabled false to disable a cron, or delete the CRON.md entry manually.');
-    const wf = readWorkflow(id);
-    if (!wf) return textResult(`Not found: ${id}`);
-    try {
-      const { unlinkSync, existsSync } = await import('node:fs');
-      if (existsSync(wf.sourceFile)) unlinkSync(wf.sourceFile);
-    } catch (err) {
-      return textResult(`Delete failed: ${(err as Error).message}`);
-    }
-    emitBuilderEvent({ type: 'workflow:deleted', workflowId: id });
-    return textResult(`Deleted ${id}`);
   },
 );
 

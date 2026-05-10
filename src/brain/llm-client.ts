@@ -110,10 +110,10 @@ export function parseJsonResponse<T = unknown>(raw: string): T | null {
   }
 }
 
-/** Rough token counter — 4 chars ≈ 1 token. Good enough for input-truncation. */
-export function estTokens(text: string): number {
-  return Math.ceil(text.length / 4);
-}
+// 1.18.149 — estTokens consolidated into the canonical estimateTokens helper.
+// Re-exported under the legacy name to keep existing callers working.
+import { estimateTokens } from '../lib/format.js';
+export const estTokens = estimateTokens;
 
 /** Truncate text to a token budget (approx). Returns { text, truncated }. */
 export function truncateToTokens(text: string, maxTokens: number): { text: string; truncated: boolean } {

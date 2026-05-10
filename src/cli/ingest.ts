@@ -16,6 +16,7 @@ import { runIngestion } from '../brain/ingestion-pipeline.js';
 import { detectManifest } from '../brain/format-detector.js';
 import { runSource, getSource, listSources, upsertSource } from '../brain/source-registry.js';
 import { getStore } from '../tools/shared.js';
+import { formatBytes } from '../lib/format.js';
 
 export async function cmdIngestSeed(inputPath: string, opts: { slug?: string; intelligence?: 'auto' | 'template-only' | 'llm-per-record' }): Promise<void> {
   const abs = path.resolve(inputPath);
@@ -155,9 +156,4 @@ function deriveSlug(abs: string): string {
   return base.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'seed';
 }
 
-function formatBytes(n: number): string {
-  if (n < 1024) return `${n} B`;
-  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
-  if (n < 1024 * 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(1)} MB`;
-  return `${(n / (1024 * 1024 * 1024)).toFixed(2)} GB`;
-}
+// 1.18.149 — formatBytes consolidated to src/lib/format.ts

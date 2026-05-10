@@ -288,7 +288,6 @@ function printBanner(channels: string[], profiles: number, cronJobs: number, gra
   const tags: string[] = [];
   if (config.GROQ_API_KEY) tags.push('voice');
   if (config.GOOGLE_API_KEY) tags.push('video');
-  if (config.CHANNEL_OUTLOOK) tags.push('outlook');
   if (graphEnabled) tags.push('graph');
   if (profiles > 0) tags.push(`${profiles} profile${profiles !== 1 ? 's' : ''}`);
 
@@ -334,7 +333,6 @@ function printBanner(channels: string[], profiles: number, cronJobs: number, gra
   if (!config.GROQ_API_KEY) hints.push(['GROQ_API_KEY', 'voice transcription']);
   if (!config.ELEVENLABS_API_KEY) hints.push(['ELEVENLABS_API_KEY', 'voice replies']);
   if (!config.GOOGLE_API_KEY) hints.push(['GOOGLE_API_KEY', 'video analysis']);
-  if (!config.CHANNEL_OUTLOOK) hints.push(['MS_TENANT_ID + MS_CLIENT_ID + MS_CLIENT_SECRET', 'Outlook email & calendar']);
   if (!graphEnabled) hints.push(['clementine doctor', 'knowledge graph (run to diagnose)']);
   if (hints.length > 0) {
     console.log(`      ${DIM}Unlock more:${RESET}`);

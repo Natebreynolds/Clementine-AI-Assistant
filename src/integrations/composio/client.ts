@@ -99,7 +99,6 @@ export function isComposioEnabled(): boolean {
 export function resetComposioClient(): void {
   singleton = null;
   identityCache.clear();
-  toolkitMetaCache = null;
   catalogCache = null;
   detectedPreferredUserId = null;
 }
@@ -449,7 +448,6 @@ export interface CatalogToolkit {
   categories: { slug: string; name: string }[];
 }
 
-let toolkitMetaCache: Promise<Map<string, ToolkitMeta>> | null = null;
 let catalogCache: { at: number; data: CatalogToolkit[] } | null = null;
 const CATALOG_TTL_MS = 60 * 60 * 1000; // 1h — catalog drifts very slowly
 
@@ -562,56 +560,6 @@ async function fetchCatalogViaWrapper(
   const resp = await composio.toolkits.get({ limit: 500 });
   const items = (Array.isArray(resp) ? resp : ((resp as { items?: unknown[] })?.items ?? [])) as RawCatalogItem[];
   return items.map(normalizeCatalogItem);
-}
-
-async function fetchAllToolkitMeta(): Promise<Map<string, ToolkitMeta>> {
-  const composio = getComposio();
-  if (!composio) return new Map();
-  const out = new Map<string, ToolkitMeta>();
-  try {
-    const resp = await composio.toolkits.get({ limit: 500 });
-    const items = Array.isArray(resp) ? resp : ((resp as { items?: unknown[] }).items ?? []);
-    for (const it of items as Array<{ slug: string; name: string; meta?: { logo?: string; description?: string; toolsCount?: number } }>) {
-      out.set(it.slug, {
-        slug: it.slug,
-        name: it.name,
-        logo: it.meta?.logo,
-        description: it.meta?.description,
-        toolsCount: it.meta?.toolsCount,
-      });
-    }
-    // Backfill curated toolkits the list endpoint omitted (e.g. MCP-only ones).
-    await Promise.all(
-      CURATED_TOOLKITS.filter(t => !out.has(t.slug)).map(async t => {
-        try {
-          const full = (await composio.toolkits.get(t.slug)) as { slug: string; name: string; meta?: { logo?: string; description?: string; toolsCount?: number } };
-          out.set(full.slug, {
-            slug: full.slug,
-            name: full.name,
-            logo: full.meta?.logo,
-            description: full.meta?.description,
-            toolsCount: full.meta?.toolsCount,
-          });
-        } catch (err) {
-          logger.debug({ err, slug: t.slug }, 'meta backfill failed');
-        }
-      }),
-    );
-  } catch (err) {
-    logger.error({ err }, 'fetchAllToolkitMeta failed');
-  }
-  return out;
-}
-
-export async function listToolkitMeta(): Promise<Map<string, ToolkitMeta>> {
-  if (!toolkitMetaCache) {
-    toolkitMetaCache = fetchAllToolkitMeta().catch(err => {
-      logger.error({ err }, 'listToolkitMeta failed');
-      toolkitMetaCache = null;
-      return new Map<string, ToolkitMeta>();
-    });
-  }
-  return toolkitMetaCache;
 }
 
 export async function listToolkitSlugsWithAuthConfig(): Promise<Set<string>> {

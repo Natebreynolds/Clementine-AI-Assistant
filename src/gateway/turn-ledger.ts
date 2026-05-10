@@ -31,9 +31,10 @@ export interface TurnLedgerEntry {
   durationMs: number;
 }
 
-export function estimateTokensApprox(text: string): number {
-  return Math.ceil(text.length / 4);
-}
+// 1.18.149 — estimateTokensApprox consolidated into the canonical estimateTokens helper.
+// Re-exported under the legacy name to keep existing callers working.
+import { estimateTokens } from '../lib/format.js';
+export const estimateTokensApprox = estimateTokens;
 
 export function turnLedgerPath(baseDir = BASE_DIR): string {
   return path.join(baseDir, 'logs', 'turn-ledger.jsonl');
