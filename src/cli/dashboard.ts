@@ -4918,25 +4918,40 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
     }
   });
 
-  app.post('/api/cron/migrate-all-to-skills', async (_req, res) => {
+  app.post('/api/cron/migrate-all-to-skills', async (req, res) => {
     try {
-      const { findMatchingSkill } = await import('../agent/cron-migrator.js');
-      const { listSkills } = await import('../agent/skill-store.js');
+      const { findMatchingSkill, generateDescription } = await import('../agent/cron-migrator.js');
+      const { listSkills, writeSkill } = await import('../agent/skill-store.js');
       const { setSchedule } = await import('../agent/schedule-registry.js');
       const { parseCronJobs, parseAgentCronJobs } = await import('../gateway/cron-scheduler.js');
+
+      // 1.18.156 — `createMissing` defaults true so the bulk path actually
+      // converts every legacy cron (auto-generates a folder-form skill from
+      // the cron prompt when no match exists). The user can still pass
+      // `{createMissing: false}` if they only want safe matches. .bak
+      // backups still happen either way.
+      const body = (req.body ?? {}) as { createMissing?: boolean };
+      const createMissing = body.createMissing !== false;
 
       const skills = listSkills();
       const allJobs = [...parseCronJobs(), ...parseAgentCronJobs(path.join(VAULT_DIR, '00-System', 'agents'))];
       const legacy = allJobs.filter(j => j.source !== 'scheduled-skill');
 
-      const migrated: Array<{ name: string; skillName: string }> = [];
+      const migrated: Array<{ name: string; skillName: string; created?: boolean }> = [];
       const skipped: Array<{ name: string; reason: string }> = [];
+
+      // Track names we've just created so subsequent jobs in the loop don't
+      // bail with "skill not in catalog" before listSkills() refreshes.
+      const createdThisPass = new Set<string>();
+      const inCatalog = (n: string): boolean =>
+        createdThisPass.has(n) || skills.some(s => s.frontmatter.name === n);
 
       // Group by source CRON.md so we open + parse + write each file once.
       const byFile = new Map<string, { jobsToRemove: Set<string>; cronFile: string }>();
 
       for (const job of legacy) {
         let skillName: string | null = null;
+        let created = false;
         if (job.skills && job.skills.length > 0) {
           skillName = job.skills.find(s => skills.some(sk => sk.frontmatter.name === s)) ?? null;
         }
@@ -4945,10 +4960,48 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
           if (m) skillName = m.frontmatter.name;
         }
         if (!skillName) {
-          skipped.push({ name: job.name, reason: 'no skill match' });
-          continue;
+          if (!createMissing) {
+            skipped.push({ name: job.name, reason: 'no skill match (set createMissing=true to auto-create)' });
+            continue;
+          }
+          // Auto-create a skill from the cron's prompt. Mirrors the per-row
+          // /migrate-with-skill-creation endpoint logic.
+          const candidate = job.name
+            .toLowerCase().replace(/[_\s]+/g, '-').replace(/[^a-z0-9-]/g, '')
+            .replace(/-+/g, '-').replace(/^-+|-+$/g, '')
+            .replace(/-(cron|task|job)$/, '').slice(0, 64);
+          if (!candidate || !/^[a-z0-9][a-z0-9-]{0,63}$/.test(candidate) || inCatalog(candidate)) {
+            skipped.push({ name: job.name, reason: `cannot derive a unique kebab-case name (candidate: "${candidate}")` });
+            continue;
+          }
+          const cronPrompt = String(job.prompt || '').trim();
+          const desc = generateDescription(cronPrompt, null);
+          const triggerPhrase = job.name.replace(/-/g, ' ');
+          const description = `${desc} Use when this scheduled task fires (cron: ${job.schedule}) or when the user mentions "${triggerPhrase}".`.slice(0, 1024);
+          try {
+            writeSkill({
+              name: candidate,
+              description,
+              body: [
+                `# ${candidate.replace(/-/g, ' ').replace(/\b\w/g, c => c.toUpperCase())}`,
+                '', '## Instructions', '',
+                cronPrompt || '(prompt not captured — fill in)',
+                '', '## When to use', '',
+                `Auto-fired on schedule \`${job.schedule}\`. Also matches user prompts about "${triggerPhrase}".`,
+                '',
+              ].join('\n'),
+              source: 'imported',
+              ...(job.agentSlug ? { agentSlug: job.agentSlug } : {}),
+            });
+            createdThisPass.add(candidate);
+            skillName = candidate;
+            created = true;
+          } catch (writeErr) {
+            skipped.push({ name: job.name, reason: `skill auto-create failed: ${String(writeErr)}` });
+            continue;
+          }
         }
-        if (!skills.some(s => s.frontmatter.name === skillName)) {
+        if (!inCatalog(skillName)) {
           skipped.push({ name: job.name, reason: `skill "${skillName}" not in catalog` });
           continue;
         }
@@ -4958,7 +5011,7 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
             enabled: job.enabled !== false,
             agentSlug: job.agentSlug ?? null,
           });
-          migrated.push({ name: job.name, skillName });
+          migrated.push({ name: job.name, skillName, ...(created ? { created: true } : {}) });
           const { cronFile, bareJobName } = resolveJobCronFile(job.name);
           if (!byFile.has(cronFile)) byFile.set(cronFile, { jobsToRemove: new Set(), cronFile });
           byFile.get(cronFile)!.jobsToRemove.add(bareJobName);
@@ -4989,6 +5042,131 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
       try { broadcastEvent({ type: 'cron_migrated_to_skills', data: { migratedCount: migrated.length } }); } catch { /* non-fatal */ }
 
       res.json({ ok: true, migrated, skipped, touchedFiles });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: String(err) });
+    }
+  });
+
+  // 1.18.156 — Per-row "create skill from this cron prompt + schedule it"
+  // path. The user's legacy crons usually have no matching skill (so the
+  // existing /api/cron/:job/migrate-to-skill aborts with "Create a skill
+  // first"). This endpoint closes that gap by writing a folder-form
+  // SKILL.md from the cron's prompt, then performing the schedule wire-up
+  // in one shot. Anthropic-canonical: name = kebab-case, description has
+  // WHAT + WHEN + first-sentence trigger phrase, body is the cron prompt
+  // verbatim. The user can immediately refine via the Builder afterward.
+  app.post('/api/cron/:job/migrate-with-skill-creation', async (req, res) => {
+    try {
+      const jobName = req.params.job;
+      if (!jobName) { res.status(400).json({ ok: false, error: 'job name required' }); return; }
+      const proposedName = String((req.body && (req.body as { skillName?: string }).skillName) || '').trim();
+
+      const { generateDescription } = await import('../agent/cron-migrator.js');
+      const { writeSkill, listSkills } = await import('../agent/skill-store.js');
+      const { setSchedule } = await import('../agent/schedule-registry.js');
+      const { parseCronJobs, parseAgentCronJobs } = await import('../gateway/cron-scheduler.js');
+
+      const { cronFile, bareJobName } = resolveJobCronFile(jobName);
+      const allJobs = [...parseCronJobs(), ...parseAgentCronJobs(path.join(VAULT_DIR, '00-System', 'agents'))];
+      const target = allJobs.find(j => String(j.name).toLowerCase() === jobName.toLowerCase());
+      if (!target) return res.status(404).json({ ok: false, error: `job "${jobName}" not found` });
+      if (target.source === 'scheduled-skill') {
+        return res.status(400).json({ ok: false, error: 'already a scheduled skill' });
+      }
+
+      // Slugify proposed name (or fall back to the job name) to Anthropic's
+      // kebab-case convention. Strip "cron"/"task" suffixes that don't add
+      // meaning; cap at 64 chars per the SKILL.md spec.
+      const rawName = proposedName || jobName;
+      const skillName = rawName
+        .toLowerCase()
+        .replace(/[_\s]+/g, '-')
+        .replace(/[^a-z0-9-]/g, '')
+        .replace(/-+/g, '-')
+        .replace(/^-+|-+$/g, '')
+        .replace(/-(cron|task|job)$/, '')
+        .slice(0, 64);
+      if (!skillName || !/^[a-z0-9][a-z0-9-]{0,63}$/.test(skillName)) {
+        return res.status(400).json({ ok: false, error: `cannot derive a valid kebab-case skill name from "${rawName}"` });
+      }
+
+      // Collision check.
+      const existing = listSkills();
+      if (existing.some(s => s.frontmatter.name === skillName)) {
+        return res.status(409).json({
+          ok: false,
+          error: `Skill "${skillName}" already exists. Pass a different skillName or use /migrate-to-skill to bind to it.`,
+        });
+      }
+
+      // Build an Anthropic-canonical SKILL.md. Description follows the
+      // WHAT + WHEN pattern from the PDF (page 11): start with what the
+      // cron does, add a trigger phrase derived from the cron name.
+      const cronPrompt = String(target.prompt || '').trim();
+      const cleanedDesc = generateDescription(cronPrompt, null);
+      const triggerPhrase = jobName.replace(/-/g, ' ');
+      const description = `${cleanedDesc} Use when this scheduled task fires (cron: ${target.schedule}) or when the user mentions "${triggerPhrase}".`.slice(0, 1024);
+
+      const body = [
+        `# ${skillName.replace(/-/g, ' ').replace(/\b\w/g, c => c.toUpperCase())}`,
+        '',
+        '## Instructions',
+        '',
+        cronPrompt || '(prompt not captured — fill in)',
+        '',
+        '## When to use',
+        '',
+        `Auto-fired on schedule \`${target.schedule}\`. Also matches user prompts about "${triggerPhrase}".`,
+        '',
+      ].join('\n');
+
+      let writeResult;
+      try {
+        writeResult = writeSkill({
+          name: skillName,
+          description,
+          body,
+          source: 'imported',
+          ...(target.agentSlug ? { agentSlug: target.agentSlug } : {}),
+        });
+      } catch (writeErr) {
+        return res.status(500).json({ ok: false, error: `skill write failed: ${String(writeErr)}` });
+      }
+
+      // Now wire the schedule pointing at the new skill.
+      const entry = setSchedule(skillName, {
+        schedule: target.schedule,
+        enabled: target.enabled !== false,
+        agentSlug: target.agentSlug ?? null,
+      });
+
+      // Remove the legacy cron entry. Same .bak + write-back pattern as the
+      // canonical /migrate-to-skill endpoint.
+      const bakPath = cronFile + '.bak';
+      try { writeFileSync(bakPath, readFileSync(cronFile, 'utf-8')); } catch { /* best-effort */ }
+      const { parsed, jobs } = readCronFileAt(cronFile);
+      const idx = jobs.findIndex(j => String(j.name).toLowerCase() === bareJobName.toLowerCase());
+      if (idx >= 0) {
+        jobs.splice(idx, 1);
+        writeCronFileAt(cronFile, parsed, jobs);
+      }
+
+      try {
+        const gw = await getGateway();
+        const sched = (gw as { cronScheduler?: { reloadJobs?: () => void } }).cronScheduler;
+        if (sched && typeof sched.reloadJobs === 'function') sched.reloadJobs();
+      } catch { /* best-effort */ }
+      try { broadcastEvent({ type: 'skill_created', data: { skillName, fromCron: jobName } }); } catch { /* non-fatal */ }
+      try { broadcastEvent({ type: 'cron_deleted', data: { job: jobName, source: 'cron-md', migrated: true } }); } catch { /* non-fatal */ }
+
+      res.json({
+        ok: true,
+        skillName,
+        scheduleEntry: entry,
+        skillPath: writeResult.filePath,
+        bakPath,
+        message: `Created skill "${skillName}" and scheduled it on ${target.schedule}. Cron entry removed (backup: ${bakPath}).`,
+      });
     } catch (err) {
       res.status(500).json({ ok: false, error: String(err) });
     }
@@ -25182,42 +25360,82 @@ function renderScheduledTaskCard(task) {
 }
 
 // 1.18.132 — Phase 3 migrator: convert one legacy cron → scheduled skill.
-// Calls /api/cron/:job/migrate-to-skill which writes schedules.json and
-// removes the entry from CRON.md (with a .bak backup).
+// 1.18.156 — End-to-end migration: try /migrate-to-skill first; if the
+// backend bails with "no skill match" (the common case for the user's
+// 15 legacy crons), surface a confirm to CREATE the skill from the cron's
+// prompt and schedule it in one shot via /migrate-with-skill-creation.
+// Replaces the silent-failure UX where the button did nothing visible.
 async function migrateCronToSkillFromCard(jobName) {
   if (!confirm('Convert "' + jobName + '" to a scheduled skill?\\n\\n' +
-    'This writes a thin entry in ~/.clementine/schedules.json that points to a skill, ' +
-    'and removes the legacy fat-cron entry from CRON.md. ' +
-    'A .bak backup is left so you can restore if anything looks wrong.')) return;
+    'This writes a thin entry in ~/.clementine/schedules.json pointing to a skill, ' +
+    'and removes the legacy fat-cron entry from CRON.md. A .bak backup is left.')) return;
   try {
     var r = await apiFetch('/api/cron/' + encodeURIComponent(jobName) + '/migrate-to-skill', { method: 'POST' });
     var d = await r.json();
-    if (!r.ok) { toast(d.error || 'Migration failed', 'error'); return; }
-    toast('Migrated "' + jobName + '" → scheduled skill "' + d.skillName + '"', 'success');
-    if (typeof refreshCron === 'function') refreshCron();
+    if (r.ok) {
+      toast('Migrated "' + jobName + '" → scheduled skill "' + d.skillName + '"', 'success');
+      if (typeof refreshCron === 'function') refreshCron();
+      return;
+    }
+    // Common path: no matching skill exists. Offer to auto-create one.
+    var msg = d.error || '';
+    if (msg.indexOf('No skill match') >= 0 || msg.indexOf('not in catalog') >= 0) {
+      var proceed = confirm(
+        'No matching skill found for "' + jobName + '".\\n\\n' +
+        'Want me to create a folder-form skill from this cron\\x27s prompt and schedule it?\\n\\n' +
+        '• The skill is named after the cron (kebab-case)\\n' +
+        '• Description follows Anthropic\\x27s WHAT + WHEN format\\n' +
+        '• The cron prompt becomes the skill body — refine it later in the Builder\\n' +
+        '• The legacy cron is removed (with .bak backup)'
+      );
+      if (!proceed) { toast('Migration cancelled — no skill created', 'info'); return; }
+      var r2 = await apiFetch('/api/cron/' + encodeURIComponent(jobName) + '/migrate-with-skill-creation', { method: 'POST' });
+      var d2 = await r2.json();
+      if (!r2.ok) { toast(d2.error || 'Skill creation + migration failed', 'error'); return; }
+      toast('Created skill "' + d2.skillName + '" + scheduled it. Refine in the Builder when ready.', 'success');
+      if (typeof refreshCron === 'function') refreshCron();
+      if (typeof refreshSkills === 'function') refreshSkills();
+      return;
+    }
+    toast(msg || 'Migration failed', 'error');
   } catch (err) {
     toast('Failed: ' + err, 'error');
   }
 }
 
-// Bulk migrator from the deprecation banner. Migrates every legacy cron
-// that has a matching skill; reports skipped ones with reasons.
+// 1.18.156 — Bulk migrator. Default behavior auto-creates a folder-form
+// skill for any cron that has no matching skill (createMissing=true),
+// because the user's 15 legacy crons typically have no match — without
+// auto-create, the bulk button silently skips everything. .bak backups
+// preserve every original CRON.md so rollback is one cp away.
 async function migrateAllCronsToSkills() {
-  if (!confirm('Convert ALL eligible legacy crons to scheduled skills?\\n\\n' +
-    'Each cron with a matched skill will become a thin schedules.json entry. ' +
-    'CRON.md files get .bak backups. Crons without a skill match are skipped — ' +
-    'no data loss.')) return;
+  if (!confirm('Convert ALL legacy crons to scheduled skills?\\n\\n' +
+    'For each cron:\\n' +
+    '• If a matching skill exists → bind to it\\n' +
+    '• If no matching skill → auto-create one (kebab-case, Anthropic format) from the cron prompt\\n\\n' +
+    'CRON.md files get .bak backups. Refine generated skills in the Builder afterwards.')) return;
   try {
-    var r = await apiFetch('/api/cron/migrate-all-to-skills', { method: 'POST' });
+    var r = await apiFetch('/api/cron/migrate-all-to-skills', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ createMissing: true }),
+    });
     var d = await r.json();
     if (!r.ok) { toast(d.error || 'Bulk migration failed', 'error'); return; }
-    var migrated = (d.migrated || []).length;
+    var migrated = d.migrated || [];
+    var created = migrated.filter(function(m) { return m.created; }).length;
+    var bound = migrated.length - created;
     var skipped = (d.skipped || []).length;
-    var msg = 'Migrated ' + migrated + ' cron' + (migrated === 1 ? '' : 's') + ' to scheduled skills';
+    var parts = [];
+    if (bound > 0) parts.push(bound + ' bound to existing skill' + (bound === 1 ? '' : 's'));
+    if (created > 0) parts.push(created + ' new skill' + (created === 1 ? '' : 's') + ' created');
+    var msg = 'Migrated ' + migrated.length + ' cron' + (migrated.length === 1 ? '' : 's')
+      + (parts.length ? ' (' + parts.join(', ') + ')' : '');
     if (skipped > 0) msg += '. ' + skipped + ' skipped — see console for reasons.';
-    toast(msg, migrated > 0 ? 'success' : 'info');
+    toast(msg, migrated.length > 0 ? 'success' : 'info');
     if (skipped > 0 && d.skipped) console.warn('[migrate-all-to-skills] skipped:', d.skipped);
     if (typeof refreshCron === 'function') refreshCron();
+    if (typeof refreshSkills === 'function') refreshSkills();
   } catch (err) {
     toast('Failed: ' + err, 'error');
   }
