@@ -2093,9 +2093,34 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
   });
 
   // ── Dashboard authentication ────────────────────────────────────────
-  const dashboardToken = randomBytes(24).toString('hex');
+  // 1.18.152 — persist the token across restarts. Before this, every
+  // dashboard startup (manual restart, auto-respawn, crash recovery)
+  // generated a fresh random token, which invalidated every browser
+  // bookmark, open tab, and printed URL. Auto-respawn (1.18.146) +
+  // auto-open browser (1.18.147) made this acutely visible — users
+  // would re-open the dashboard and find the URL they had bookmarked
+  // 401'd, then a new browser window would open with a different token,
+  // and any hook commands installed in projects would silently 401 too.
+  //
+  // Fix: read the existing token if `~/.clementine/.dashboard-token`
+  // already exists; only generate-and-persist on first-ever startup.
+  // To rotate tokens deliberately, the user deletes the file and
+  // restarts. Local-machine threat model assumes the home dir is
+  // trusted (see feedback_security_model.md) — a persistent token here
+  // is the same security posture as `~/.ssh/id_rsa`.
   const tokenPath = path.join(BASE_DIR, '.dashboard-token');
-  writeFileSync(tokenPath, dashboardToken, { mode: 0o600 });
+  let dashboardToken: string;
+  try {
+    const existing = readFileSync(tokenPath, 'utf-8').trim();
+    // Strict format check — anything that doesn't look like a 48-hex-char
+    // token (the format randomBytes(24).toString('hex') produces) gets
+    // regenerated. Defends against truncated / corrupt files.
+    if (!/^[a-f0-9]{48}$/.test(existing)) throw new Error('invalid token format on disk');
+    dashboardToken = existing;
+  } catch {
+    dashboardToken = randomBytes(24).toString('hex');
+    writeFileSync(tokenPath, dashboardToken, { mode: 0o600 });
+  }
 
   // ── Remote access + session management ─────────────────────────────
   const remoteConfig = loadRemoteConfig();
