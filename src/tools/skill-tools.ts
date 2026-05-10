@@ -220,4 +220,49 @@ export function registerSkillTools(server: McpServer): void {
       }
     },
   );
+
+  // ── run_skill (1.18.162) ────────────────────────────────────────────
+  // Invoke a skill as a hard-allowlisted sub-call. Mustache substitutes
+  // `{{var}}` placeholders in the skill body from `inputs`, runs through
+  // the SDK with ONLY the skill's clementine.tools.allow + a baseline
+  // (Agent/Read/Glob/Grep) + auto-extracted mcp__*__* refs from the body,
+  // and validates against clementine.success.schema if declared.
+  //
+  // Use this when a chat or another skill needs to *execute* a procedure
+  // (not just reference it). Pinned-skills-as-context (the existing 1.18.121
+  // widening path) is for the cron prompt; this is for callable execution.
+  server.tool(
+    'run_skill',
+    'Execute a named skill as a sub-call with a HARD tool allowlist. The skill body is rendered with optional {{var}} substitutions from `inputs`, then run with only the tools the skill declared under clementine.tools.allow (plus a small baseline). Returns the skill output + cost + schema validation result when applicable. Use when chat says "run my morning-briefing skill" or when one skill needs to invoke another.',
+    {
+      name: z.string().regex(NAME_PATTERN).describe('Skill slug (e.g. "morning-briefing"). Must match an existing skill in the vault.'),
+      inputs: z.record(z.string(), z.union([z.string(), z.number(), z.boolean()])).optional()
+        .describe('Optional key→value map substituted into {{var}} placeholders in the skill body. Missing placeholders are left as-is so the LLM can complain.'),
+      context: z.string().optional()
+        .describe('Optional caller context appended after the skill body (e.g. "user said: do X right now"). Surfaced under a "## Caller context" heading.'),
+    },
+    async ({ name, inputs, context }: { name: string; inputs?: Record<string, string | number | boolean>; context?: string }) => {
+      try {
+        // Lazy import — runSkill pulls in run-agent + the SDK; only load on
+        // demand so `list_skills` etc stay fast and the MCP server boots
+        // without warming the whole agent path.
+        const { runSkill } = await import('../agent/run-skill.js');
+        const result = await runSkill(name, { inputs, context, source: 'mcp:run_skill' });
+
+        if (!result.ok) {
+          return textResult(`❌ run_skill(${name}) failed: ${result.error ?? 'unknown error'}`);
+        }
+
+        const validationLine = result.validation
+          ? `\n\n**Schema:** ${result.validation.tried ? (result.validation.pass ? '✅ pass' : `❌ fail — ${result.validation.errors.slice(0, 2).join('; ')}`) : '(skipped — no JSON in output)'}`
+          : '';
+        const meta = `\n\n_${result.turns ?? 0} turns · $${(result.cost ?? 0).toFixed(4)} · ${result.effectiveTools?.length ?? 0} tools allowed_${validationLine}`;
+        return textResult(`${result.output}${meta}`);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        logger.error({ err, skill: name }, 'run_skill failed');
+        return textResult(`❌ run_skill(${name}) failed: ${msg}`);
+      }
+    },
+  );
 }
