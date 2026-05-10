@@ -21,8 +21,12 @@ describe('computeEffectiveAllowedTools', () => {
     expect(computeEffectiveAllowedTools(undefined, ['Read', 'Edit'])).toBeUndefined();
   });
 
-  it('returns undefined when job allowlist is an empty array (treats empty as "not set")', () => {
-    expect(computeEffectiveAllowedTools([], ['Read', 'Edit'])).toBeUndefined();
+  it('returns ["Agent"] when job allowlist is explicitly empty (1.18.148: empty = "deny all but the SDK Agent spawn tool")', () => {
+    // Before 1.18.148, empty array collapsed to undefined ("no restriction"),
+    // which let meta-jobs (insight-check, grade:*, etc.) inherit the full
+    // tool set + Composio toolkit schemas → "Prompt is too long" failures.
+    // Now empty array means exactly what it says.
+    expect(computeEffectiveAllowedTools([], ['Read', 'Edit'])).toEqual(['Agent']);
   });
 
   it('job-only: returns the job list with Agent force-included at front', () => {
@@ -90,9 +94,13 @@ describe('applyMcpAllowlist', () => {
     expect(result).toBe(servers);
   });
 
-  it('returns the input map unchanged when allowlist is empty', () => {
+  it('returns an empty map when allowlist is explicitly empty (1.18.148: empty = "deny all")', () => {
+    // Before 1.18.148, empty array collapsed to "no restriction" and the
+    // full server map flowed through — meaning meta-jobs got every
+    // Composio toolkit's tool schemas wired in, blowing past the prompt
+    // limit. Now empty array means exactly "no MCP servers."
     const result = applyMcpAllowlist(servers, []);
-    expect(result).toBe(servers);
+    expect(result).toEqual({});
   });
 
   it('keeps only servers whose names are in the allowlist', () => {
@@ -117,7 +125,12 @@ describe('applyMcpAllowlist', () => {
 describe('widenAllowlistWithSkillTools (1.18.125 — pinned-skill scope widening)', () => {
   it('returns undefined when the cron has no allowlist (skill tools should not narrow an unrestricted cron)', () => {
     expect(widenAllowlistWithSkillTools(undefined, ['Read', 'Bash'])).toBeUndefined();
-    expect(widenAllowlistWithSkillTools([], ['Read', 'Bash'])).toBeUndefined();
+    // 1.18.148 — empty + skill tools widens to skill tools (skill pin is a
+    // positive signal that overrides "deny all"). Empty + no skill pin
+    // stays empty (predictable mode contract).
+    expect(widenAllowlistWithSkillTools([], ['Read', 'Bash'])).toEqual(['Read', 'Bash']);
+    expect(widenAllowlistWithSkillTools([], undefined)).toEqual([]);
+    expect(widenAllowlistWithSkillTools([], [])).toEqual([]);
   });
 
   it('returns the cron allowlist unchanged when no pinned-skill tools were declared', () => {
@@ -194,7 +207,10 @@ describe('extractMcpServersFromSkillBodies (1.18.125)', () => {
 describe('widenMcpAllowlistWithSkillRefs (1.18.125)', () => {
   it('returns undefined when the cron has no MCP allowlist (unrestricted)', () => {
     expect(widenMcpAllowlistWithSkillRefs(undefined, ['gmail'])).toBeUndefined();
-    expect(widenMcpAllowlistWithSkillRefs([], ['gmail'])).toBeUndefined();
+    // 1.18.148 — empty + skill refs widens to skill refs. Empty + no
+    // skill refs stays empty (predictable mode contract).
+    expect(widenMcpAllowlistWithSkillRefs([], ['gmail'])).toEqual(['gmail']);
+    expect(widenMcpAllowlistWithSkillRefs([], [])).toEqual([]);
   });
 
   it('returns the cron MCP allowlist unchanged when no skill refs were found', () => {

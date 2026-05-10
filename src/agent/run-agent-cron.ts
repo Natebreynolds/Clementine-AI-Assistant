@@ -62,7 +62,15 @@ export function computeEffectiveAllowedTools(
   jobAllow: string[] | undefined,
   profileAllow: string[] | undefined,
 ): string[] | undefined {
-  if (!jobAllow?.length) return undefined;
+  // 1.18.148 — distinguish "no allowlist" (undefined → unrestricted) from
+  // "explicitly empty allowlist" (`[]` → deny all). Before this, both
+  // collapsed to `undefined` because of the `?.length` check, which meant
+  // meta-jobs passing `allowedTools: []` actually got the FULL tool set
+  // injected (and blew past the prompt limit when Composio toolkits piled
+  // on tool schemas). The fix: an explicit `[]` returns `['Agent']` only
+  // (just the SDK's required spawn-subagent tool).
+  if (jobAllow === undefined) return undefined;
+  if (jobAllow.length === 0) return ['Agent']; // explicitly empty → minimal
   let result: string[];
   if (profileAllow?.length) {
     const jobSet = new Set(jobAllow);
@@ -85,7 +93,14 @@ export function applyMcpAllowlist<T>(
   servers: Record<string, T>,
   jobAllowedMcpServers: string[] | undefined,
 ): Record<string, T> {
-  if (!jobAllowedMcpServers?.length) return servers;
+  // 1.18.148 — empty array means "deny all MCP servers", not "no
+  // restriction". Before this, passing `[]` collapsed to `?.length === 0`
+  // and returned the unfiltered server map — so meta-jobs (insight-check,
+  // grade:*, route-classify, diagnose:*) got every Composio toolkit's
+  // tool schemas wired into their prompt and blew past Claude's input
+  // limit. 110+ "Prompt is too long" errors per 8 hours.
+  if (jobAllowedMcpServers === undefined) return servers;
+  if (jobAllowedMcpServers.length === 0) return {} as Record<string, T>;
   const allow = new Set(jobAllowedMcpServers);
   return Object.fromEntries(
     Object.entries(servers).filter(([name]) => allow.has(name)),
@@ -117,7 +132,11 @@ export function widenAllowlistWithSkillTools(
   jobAllow: string[] | undefined,
   pinnedSkillTools: string[] | undefined,
 ): string[] | undefined {
-  if (!jobAllow?.length) return undefined;
+  // 1.18.148 — preserve "explicitly empty" semantics. An empty array is a
+  // contract: "I want no tools." Skill-pin widening doesn't apply when no
+  // skills are pinned (which is the case for meta-jobs).
+  if (jobAllow === undefined) return undefined;
+  if (jobAllow.length === 0 && !pinnedSkillTools?.length) return [];
   if (!pinnedSkillTools?.length) return [...jobAllow];
   return [...new Set([...jobAllow, ...pinnedSkillTools])];
 }
@@ -155,7 +174,10 @@ export function widenMcpAllowlistWithSkillRefs(
   jobMcpAllow: string[] | undefined,
   skillReferencedServers: string[],
 ): string[] | undefined {
-  if (!jobMcpAllow?.length) return undefined;
+  // 1.18.148 — preserve "explicitly empty" semantics. See note on
+  // applyMcpAllowlist + widenAllowlistWithSkillTools above.
+  if (jobMcpAllow === undefined) return undefined;
+  if (jobMcpAllow.length === 0 && !skillReferencedServers.length) return [];
   if (!skillReferencedServers.length) return [...jobMcpAllow];
   return [...new Set([...jobMcpAllow, ...skillReferencedServers])];
 }
@@ -773,8 +795,10 @@ export async function buildCronExecutionPlan(opts: RunAgentCronOptions): Promise
 
   // Per-trick MCP allowlist: post-filter on the profile-narrowed map.
   // Effective set = profile ∩ trick (widened).
+  // 1.18.148 — empty array means "deny all" not "no restriction" (was a
+  // silent prompt-bloat bug — see applyMcpAllowlist note above).
   const mcpServerMap = applyMcpAllowlist(mcp.servers, widenedJobMcpAllowlist);
-  const allowSet = widenedJobMcpAllowlist?.length ? new Set(widenedJobMcpAllowlist) : null;
+  const allowSet = widenedJobMcpAllowlist === undefined ? null : new Set(widenedJobMcpAllowlist);
   const composioConnected = allowSet ? mcp.composioConnected.filter(n => allowSet.has(n)) : mcp.composioConnected;
   const externalConnected = allowSet ? mcp.externalConnected.filter(n => allowSet.has(n)) : mcp.externalConnected;
   const mcpServersApplied = Object.keys(mcpServerMap);

@@ -170,6 +170,15 @@ export async function gradeRun(
       undefined, // timeoutMs
       undefined, // successCriteria
       undefined, // agentSlug
+      // 1.18.148 — F1/F2 pattern: meta-jobs don't get user MEMORY.md /
+      // team comms / auto-matched skills, otherwise the prompt blows
+      // past Claude's input limit (110+ "Prompt is too long" errors/8h
+      // before this fix). Same shape applied to insight-check (1.18.132)
+      // and route-classify / failure-diagnostics in this same ship.
+      undefined, // pinnedSkills
+      [],        // allowedTools — empty = no MCP injection
+      [],        // allowedMcpServers — empty = no MCP servers wired
+      true,      // predictable — skip MEMORY.md / team / auto-skills
     );
   } catch (err) {
     logger.warn({ err, jobName: entry.jobName }, 'Outcome grader LLM call failed');

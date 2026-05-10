@@ -397,6 +397,14 @@ export async function classifyRoute(
       undefined, // timeoutMs
       undefined, // successCriteria
       undefined, // agentSlug
+      // 1.18.148 — F1/F2 pattern: meta-jobs run predictable to keep the
+      // prompt under Claude's input limit. Without these the classifier
+      // inherited MEMORY.md + team comms + auto-matched skills, blew up
+      // 12+ times in 8 hours (silent fallback to default route).
+      undefined, // pinnedSkills
+      [],        // allowedTools
+      [],        // allowedMcpServers
+      true,      // predictable
     );
   } catch (err) {
     logger.warn({ err }, 'Route classifier call failed');

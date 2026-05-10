@@ -642,6 +642,14 @@ export async function diagnoseBrokenJob(
       undefined, // timeoutMs
       undefined, // successCriteria
       undefined, // agentSlug
+      // 1.18.148 — F1/F2 pattern: diagnostics are pure analysis of an
+      // existing run, no need for MEMORY.md / team / auto-skills. Without
+      // these flags the diagnostic prompt blew past Claude's input limit
+      // and broken jobs went undiagnosed silently.
+      undefined, // pinnedSkills
+      [],        // allowedTools
+      [],        // allowedMcpServers
+      true,      // predictable
     );
   } catch (err) {
     logger.warn({ err, job: broken.jobName }, 'Diagnostic LLM call failed');
