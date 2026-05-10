@@ -2393,13 +2393,27 @@ export class SelfImproveLoop {
       }
     } catch { /* non-fatal */ }
 
-    // Identify consistently failed approaches
+    // Identify consistently failed approaches.
+    // 1.18.150 — exact-string Set dedup let near-duplicate hypotheses ("improve
+    // cron prompt clarity" vs "improve cron prompt for clarity") both make it
+    // through and waste two of the five slots. Use the existing tokenize +
+    // jaccard helpers (Set ≥0.85 collapse) to merge near-duplicates while
+    // preserving genuinely distinct framings.
     const failedHypotheses = history
       .filter(e => !e.accepted && e.score < 0.3 && !(e as any).type)
       .map(e => e.hypothesis.slice(0, 80));
     if (failedHypotheses.length > 0) {
       lines.push('\n### Approaches That Scored Poorly (avoid these)');
-      for (const h of [...new Set(failedHypotheses)].slice(0, 5)) {
+      const merged: string[] = [];
+      const mergedTokens: Set<string>[] = [];
+      for (const h of failedHypotheses) {
+        const ht = tokenizeForDrift(h);
+        if (mergedTokens.some(t => jaccardSimilarity(t, ht) >= 0.85)) continue;
+        merged.push(h);
+        mergedTokens.push(ht);
+        if (merged.length >= 5) break;
+      }
+      for (const h of merged) {
         lines.push(`- "${h}"`);
       }
     }

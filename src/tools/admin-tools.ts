@@ -382,7 +382,7 @@ function writeExtraAllowedTools(tools: string[]): void {
 
 server.tool(
   'allow_tool',
-  'Add a tool name to your self-managed allowedTools list. Use when you see a tool in the SDK inventory but get "not in function schema" when you try to call it. Writes to ~/.clementine/allowed-tools-extra.json; takes effect on your NEXT query. If the tool name isn\'t yet in the cached inventory, this auto-refreshes the probe first — covers the case where the owner just added a new claude.ai connector or local MCP server. Owner-DM only.',
+  'Add a tool name to your self-managed allowedTools list (~/.clementine/allowed-tools-extra.json). Use when an SDK-inventory tool returns "not in function schema". Effective on your next query. Auto-refreshes the inventory probe if the tool isn\'t cached. Owner-DM only.',
   {
     name: z.string().describe('Exact tool name (e.g. "mcp__claude_ai_Google_Drive__search_files")'),
     reason: z.string().optional().describe('Brief note: why you need this tool. For audit trail.'),
@@ -429,7 +429,7 @@ server.tool(
 
 server.tool(
   'refresh_tool_inventory',
-  'Force a fresh probe of the SDK\'s tool inventory, picking up any claude.ai connectors, Composio toolkits, or local MCP servers the owner has added since the last cache refresh. Owner-DM only. Use this when the owner says "I just added X at claude.ai" or when an expected integration isn\'t showing up. Updates ~/.clementine/.tool-inventory.json and syncs claude-integrations.json. Returns a diff of what changed.',
+  'Force a fresh probe of the SDK tool inventory to pick up newly added claude.ai connectors, Composio toolkits, or local MCP servers. Updates ~/.clementine/.tool-inventory.json + syncs claude-integrations.json and returns a diff. Owner-DM only.',
   {},
   async () => {
     const gate = requireOwnerDm();
@@ -1163,7 +1163,7 @@ server.tool(
 
 server.tool(
   'add_cron_job',
-  'Add a new scheduled task. ⚠ BEFORE CALLING THIS TOOL: propose the concrete plan to the user in chat and get explicit approval. The `prompt` you save should be SELF-CONTAINED — list the actual recipients, the actual template/content, the actual criteria. AVOID vague references like "recent leads" or "this week\'s items" that the trick will re-derive at fire-time, because re-derivation reads from MEMORY.md which drifts between chat-time agreement and fire-time execution. Good prompt: "Send template `monday-followup` to alice@x.com, bob@y.com, carol@z.com." Bad prompt: "Send follow-up to recent leads." The default `predictable: true` mode runs the trick with ONLY the prompt + explicitly-attached skills/tools — no MEMORY.md, no team-comms injection, no runtime skill auto-match. Set `predictable: false` ONLY if the user explicitly wants a dynamic trick that re-resolves data each fire (e.g., "summarize yesterday\'s daily note" where the data legitimately changes).',
+  'Add a new scheduled task. Propose the plan in chat and get user approval first. The `prompt` MUST be self-contained: name the actual recipients, template, and criteria — vague references ("recent leads", "this week\'s items") drift between chat-time and fire-time. Default `predictable: true` runs with only prompt + pinned skills/tools (no MEMORY.md, no auto-match). Set `predictable: false` only when the user explicitly wants dynamic re-resolution each fire.',
   {
     name: z.string().describe('Job name (unique identifier)'),
     schedule: z.string().describe('Cron expression (e.g., "0 9 * * 1" for Monday 9 AM)'),
@@ -1290,7 +1290,7 @@ server.tool(
 
 server.tool(
   'update_cron_job',
-  'Update an existing cron job in CRON.md. Partial — only fields you supply change. To CLEAR a capability allowlist (skills/allowed_tools/allowed_mcp_servers/tags), pass an empty array. To clear category, pass an empty string. The daemon auto-reloads on file change. Use preview_cron_job to confirm what will run before the next fire. ⚠ Flipping `predictable` from true to false changes whether the trick reads MEMORY.md at fire-time — make sure the user understands the tradeoff before you toggle it.',
+  'Update an existing cron job in CRON.md. Partial — only fields you supply change. Pass an empty array to clear a capability allowlist (skills/allowed_tools/allowed_mcp_servers/tags); empty string clears category. Daemon auto-reloads. Run preview_cron_job before relying on the change. Flipping `predictable` true→false makes the trick read MEMORY.md at fire-time — confirm the tradeoff with the user.',
   {
     name: z.string().describe('Existing job name to update.'),
     schedule: z.string().optional().describe('New cron expression.'),
@@ -1384,7 +1384,7 @@ server.tool(
 
 server.tool(
   'preview_cron_job',
-  'Show EXACTLY what a cron job ("trick") will send the agent on its next fire — without dispatching to the agent. Composes the same context blocks (memory, progress, goals, skills, team, criteria, prompt, how-to-respond) the runner would compose at fire time. Returns the built prompt + resolved skills (full content) + effective tool/MCP allowlists + warnings (missing pins). Use this to sanity-check tricks after configuring them via chat or the dashboard, especially when you want predictable morning behavior.',
+  'Show what a cron job will send the agent on its next fire without dispatching. Composes the same context blocks the runner uses at fire time and returns the built prompt + resolved skills + effective tool/MCP allowlists + warnings. Use to sanity-check tricks after configuration.',
   {
     name: z.string().describe('Exact name of the cron job to preview (use list_cron_jobs to see available).'),
   },
