@@ -4395,6 +4395,35 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
     }
   });
 
+  // 1.18.164 — skill quality scoring per Anthropic metrics. Computed on
+  // demand from the cron run log; no schema, no persistence. Bulk
+  // endpoint for the Skills page table; per-skill endpoint for the
+  // detail pane. Both registered BEFORE /api/skills/:name to win route
+  // precedence (literal segment 'quality' beats the :name placeholder).
+  app.get('/api/skills/quality', async (req, res) => {
+    try {
+      const { computeAllSkillQuality } = await import('../memory/skill-quality.js');
+      const windowDays = req.query.windowDays ? Math.max(1, Math.min(365, Number(req.query.windowDays))) : undefined;
+      const scores = computeAllSkillQuality(windowDays ? { windowDays } : {});
+      res.json({ ok: true, count: scores.length, scores });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: String(err) });
+    }
+  });
+
+  app.get('/api/skills/:name/quality', async (req, res) => {
+    try {
+      const name = req.params.name;
+      if (!name) { res.status(400).json({ ok: false, error: 'name required' }); return; }
+      const { computeSkillQuality } = await import('../memory/skill-quality.js');
+      const windowDays = req.query.windowDays ? Math.max(1, Math.min(365, Number(req.query.windowDays))) : undefined;
+      const score = computeSkillQuality(name, windowDays ? { windowDays } : {});
+      res.json({ ok: true, score });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: String(err) });
+    }
+  });
+
   app.get('/api/skills/:name', async (req, res) => {
     try {
       const name = req.params.name;
@@ -29305,9 +29334,51 @@ async function showSkillDetail(name) {
     detailEl.innerHTML = renderSkillDetail(d.skill);
     if (typeof loadSkillSuppressionState === 'function') loadSkillSuppressionState(name);
     if (typeof loadSkillScheduleState === 'function') loadSkillScheduleState(name);
+    if (typeof loadSkillQualityState === 'function') loadSkillQualityState(name);
   } catch (e) {
     detailEl.innerHTML = '<div style="padding:24px;color:var(--red);font-size:12px">Error: ' + esc(String(e)) + '</div>';
   }
+}
+
+// 1.18.164 — fetch + render the skill quality scorecard. Best-effort:
+// renders nothing if the container is absent or the fetch errors. We
+// hit the per-skill endpoint here (fast, single skill) instead of the
+// bulk one — the Skills page already has its own bulk render path.
+async function loadSkillQualityState(skillName) {
+  var container = document.getElementById('skill-quality-' + encodeURIComponent(skillName));
+  if (!container) return;
+  try {
+    var r = await apiFetch('/api/skills/' + encodeURIComponent(skillName) + '/quality');
+    var d = await r.json();
+    if (!r.ok || d.ok === false || !d.score) return;
+    var s = d.score;
+    var gradeColors = { good: '#10b981', underperforming: '#ef4444', stale: '#f59e0b', 'no-data': '#6b7280' };
+    var gradeLabel = (s.grade || 'no-data').replace(/-/g, ' ');
+    var color = gradeColors[s.grade] || '#6b7280';
+    var pct = function(v) { return v === null || v === undefined ? '—' : (v * 100).toFixed(0) + '%'; };
+    var ms = function(v) { return v === null || v === undefined ? '—' : (v < 1000 ? v + 'ms' : (v / 1000).toFixed(1) + 's'); };
+    var usd = function(v) { return v === null || v === undefined ? '—' : '$' + v.toFixed(4); };
+    var rows = [
+      ['Total runs', s.totalRuns],
+      ['Pinned / auto', s.pinnedRuns + ' / ' + s.autoRuns],
+      ['Success rate', pct(s.successRate)],
+      ['Trigger accuracy', s.triggerAccuracy === null ? '— (no auto-matched runs)' : pct(s.triggerAccuracy)],
+      ['Avg duration', ms(s.avgDurationMs)],
+      ['Avg cost', usd(s.avgCostUsd)],
+    ];
+    container.innerHTML =
+      '<div style="font-weight:600;margin-bottom:6px;display:flex;align-items:center;gap:8px">' +
+        '<span>Quality (' + s.windowDays + 'd)</span>' +
+        '<span style="font-size:11px;padding:2px 8px;border-radius:10px;background:' + color + ';color:#fff;text-transform:uppercase">' + esc(gradeLabel) + '</span>' +
+      '</div>' +
+      '<div style="font-size:12px;color:var(--text-muted);margin-bottom:8px">' + esc(s.gradeReason || '') + '</div>' +
+      '<table style="width:100%;font-size:12px;border-collapse:collapse">' +
+        rows.map(function(r) {
+          return '<tr><td style="padding:3px 0;color:var(--text-muted);width:50%">' + esc(r[0]) + '</td>' +
+                 '<td style="padding:3px 0;text-align:right;font-family:ui-monospace,monospace">' + esc(String(r[1])) + '</td></tr>';
+        }).join('') +
+      '</table>';
+  } catch (e) { /* best-effort — leave empty */ }
 }
 
 // 1.18.127 — fetch the current suppression state and wire the checkbox.
@@ -29666,6 +29737,14 @@ function renderSkillDetail(s) {
   html += '<button class="btn-sm" id="skill-schedule-btn" onclick="openScheduleOverlayForSkill(\\x27' + jsStr(fm.name) + '\\x27, \\x27' + jsStr(s.frontmatter.clementine?.agentSlug ?? '') + '\\x27)" style="font-size:11px;padding:6px 12px" title="Schedule this skill to run automatically">⏰ Schedule</button>';
   html += '</div>';
   html += '</div>';
+
+  // 1.18.164 — Quality scorecard (per Anthropic skill metrics).
+  // Lazy-loaded: rendered as a placeholder, populated by
+  // loadSkillQualityState() right after the detail pane mounts. The
+  // grade chip (good / underperforming / stale / no-data) tells the
+  // owner at a glance whether this skill is pulling its weight; the
+  // table beneath has the supporting numbers for drilling in.
+  html += '<div id="skill-quality-' + encodeURIComponent(fm.name) + '" style="margin-top:10px;padding:12px 14px;background:var(--bg-secondary);border:1px solid var(--border);border-radius:6px;font-size:12px;color:var(--text-muted)">Loading quality…</div>';
 
   // ── 2. Validation warnings (if any)
   if (Array.isArray(s.validation) && s.validation.length > 0) {
