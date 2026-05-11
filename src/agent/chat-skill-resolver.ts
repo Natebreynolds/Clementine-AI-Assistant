@@ -65,10 +65,23 @@ const logger = pino({ name: 'clementine.chat-skill-resolver' });
 
 // ── Tunables ──────────────────────────────────────────────────────────
 
-/** Default minimum score to consider a skill match real. Mirrors the
- *  legacy `assistant.ts:1492` threshold. Skill auto-match is heuristic;
- *  this filter keeps weak matches from injecting unrelated tooling. */
+/** Default minimum score for user-authored skill matches. Mirrors the
+ *  legacy `assistant.ts:1492` threshold. */
 const DEFAULT_MIN_SCORE = 4;
+
+/** Higher threshold applied when ALL matches are auto-generated MCP-derived
+ *  skills (no user-authored signal). 1.18.171 hotfix: a vague chat message
+ *  ("did our changes break it?") matched three unrelated auto-skills
+ *  (ElevenLabs + apify) at score 5.5 each because semantic-only matching
+ *  drifted toward whatever embeddings were closest. Bumping the bar for
+ *  auto-only match-sets keeps that noise out of the system prompt. */
+const AUTO_ONLY_MIN_SCORE = 8;
+
+/** When ALL matches are auto-generated AND they reference this many or
+ *  more distinct servers, the cluster is treated as semantic-noise and
+ *  the injection is skipped entirely. Three different services have no
+ *  business being "all relevant" to a single user message. */
+const AUTO_ONLY_SERVER_NOISE_THRESHOLD = 3;
 
 /** Default top-K matches to aggregate. Single-tool requests usually
  *  return one strong match; category requests ("salesforce") return
@@ -292,9 +305,37 @@ export function resolveSkillsForChat(
     return empty;
   }
 
-  const matches = candidates
-    .filter((m) => m.score >= minScore)
+  // 1.18.171 hotfix: detect auto-only match-sets and apply the higher
+  // threshold + noise-cluster filter so vague chat messages don't surface
+  // unrelated MCP context. See the comment block on AUTO_ONLY_MIN_SCORE.
+  const isAutoMatch = (m: SkillMatch) => m.name.startsWith('auto-');
+  const candidatesAllAuto = candidates.length > 0 && candidates.every(isAutoMatch);
+  const effectiveMinScore = candidatesAllAuto
+    ? Math.max(minScore, AUTO_ONLY_MIN_SCORE)
+    : minScore;
+
+  let matches = candidates
+    .filter((m) => m.score >= effectiveMinScore)
     .slice(0, limit);
+
+  // Auto-only noise cluster filter: when every survivor is auto AND they
+  // collectively reference too many distinct servers (no semantic
+  // clustering on a single service), treat as drift and drop.
+  if (matches.length >= 2 && matches.every(isAutoMatch)) {
+    const seenServers = new Set<string>();
+    for (const m of matches) {
+      for (const s of extractMcpServersFromMatch(m)) seenServers.add(s);
+    }
+    if (seenServers.size >= AUTO_ONLY_SERVER_NOISE_THRESHOLD) {
+      logger.info({
+        droppedMatches: matches.map(m => ({ name: m.name, score: Number(m.score.toFixed(2)) })),
+        distinctServers: [...seenServers],
+        reason: 'auto_only_server_cluster_too_wide',
+        queryChars,
+      }, 'chat-skill-resolver: dropped match-set (semantic noise)');
+      matches = [];
+    }
+  }
 
   if (matches.length === 0) {
     return {

@@ -21320,25 +21320,34 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
           </div>
         </div>
         <div style="display:flex;align-items:center;gap:8px;flex-shrink:0">
-          <button class="btn-secondary" onclick="openSkillStudio()" style="font-size:13px;padding:8px 14px;border-radius:6px;border:1px solid var(--border);background:var(--bg-secondary);color:var(--text-primary);font-weight:500;cursor:pointer;display:inline-flex;align-items:center;gap:6px" title="Open the conversational Skill Studio">
+          <button class="btn-secondary" onclick="openSkillStudio()" style="font-size:13px;padding:8px 14px;border-radius:6px;border:1px solid var(--border);background:var(--bg-secondary);color:var(--text-primary);font-weight:500;cursor:pointer;display:inline-flex;align-items:center;gap:6px" title="Open the natural-language Skill Studio">
             Open Studio
           </button>
-          <button class="btn-primary" onclick="openCreateSkillModalFromComposer()" style="font-size:13px;padding:8px 14px;border-radius:6px;border:none;background:var(--accent);color:#fff;font-weight:500;cursor:pointer;display:inline-flex;align-items:center;gap:6px" title="Open a clean blank skill editor">
-            Blank skill
+          <button class="btn-primary" onclick="openCreateSkillModalFromComposer()" style="font-size:13px;padding:8px 14px;border-radius:6px;border:none;background:var(--accent);color:#fff;font-weight:500;cursor:pointer;display:inline-flex;align-items:center;gap:6px" title="Open a blank SKILL.md editor">
+            Manual editor
           </button>
         </div>
       </div>
+      <div id="skill-composer-home">
       <div id="skill-composer" style="margin:0 0 16px;border:1px solid var(--border);border-radius:8px;background:var(--bg-secondary);padding:14px 16px">
-        <div style="display:grid;grid-template-columns:minmax(280px,1.2fr) minmax(260px,0.8fr);gap:14px;align-items:start">
+        <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:14px;margin-bottom:12px">
+          <div style="min-width:0">
+            <div style="font-size:14px;font-weight:600;color:var(--text-primary);margin-bottom:3px">Skill Studio</div>
+            <div style="font-size:12px;color:var(--text-muted);line-height:1.45">Describe reusable work in plain language. Optional starting points only seed the draft; nothing runs until you save or test it.</div>
+          </div>
+          <div style="font-size:10px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.04em;white-space:nowrap;margin-top:2px">Natural language first</div>
+        </div>
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:14px;align-items:start">
           <div>
-            <label for="skill-composer-text" style="display:block;font-size:11px;font-weight:600;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.04em;margin-bottom:6px">Describe the skill</label>
-            <textarea id="skill-composer-text" rows="4" oninput="updateSkillComposerDraftState()" placeholder="Review my Asana tasks, update a Google Sheet, verify four source systems, then report back in Asana." style="width:100%;box-sizing:border-box;padding:10px 12px;border:1px solid var(--border);border-radius:6px;background:var(--bg-primary);color:var(--text-primary);font-size:13px;line-height:1.45;resize:vertical;min-height:92px"></textarea>
+            <label for="skill-composer-text" style="display:block;font-size:11px;font-weight:600;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.04em;margin-bottom:6px">What should Clementine learn?</label>
+            <textarea id="skill-composer-text" rows="5" oninput="updateSkillComposerDraftState()" placeholder="Find Salesforce contacts I have not touched in 15 days, enrich the accounts with DataForSEO signals, draft cold prospecting emails, then report the drafts back for review." style="width:100%;box-sizing:border-box;padding:10px 12px;border:1px solid var(--border);border-radius:6px;background:var(--bg-primary);color:var(--text-primary);font-size:13px;line-height:1.45;resize:vertical;min-height:112px"></textarea>
+            <div style="margin-top:8px;font-size:11px;color:var(--text-muted);line-height:1.45">Good skills name the repeatable outcome, required tools or data, approval boundaries, and what counts as done.</div>
           </div>
           <div>
-            <div style="font-size:11px;font-weight:600;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.04em;margin-bottom:6px">Starting point</div>
+            <div style="font-size:11px;font-weight:600;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.04em;margin-bottom:6px">Optional starting points</div>
             <div id="skill-composer-modes" style="display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:4px;margin-bottom:10px">
               <button type="button" class="skill-composer-mode" data-kind="outcome" onclick="setSkillComposerMode('outcome')" style="padding:7px 6px;border:1px solid var(--accent);border-radius:6px;background:rgba(255,141,0,0.10);color:var(--accent);font-size:11px;font-weight:600;cursor:pointer">Outcome</button>
-              <button type="button" class="skill-composer-mode" data-kind="tool" onclick="setSkillComposerMode('tool')" style="padding:7px 6px;border:1px solid var(--border);border-radius:6px;background:var(--bg-primary);color:var(--text-secondary);font-size:11px;font-weight:600;cursor:pointer">Tool/MCP</button>
+              <button type="button" class="skill-composer-mode" data-kind="tool" onclick="setSkillComposerMode('tool')" style="padding:7px 6px;border:1px solid var(--border);border-radius:6px;background:var(--bg-primary);color:var(--text-secondary);font-size:11px;font-weight:600;cursor:pointer">MCP/API</button>
               <button type="button" class="skill-composer-mode" data-kind="cli" onclick="setSkillComposerMode('cli')" style="padding:7px 6px;border:1px solid var(--border);border-radius:6px;background:var(--bg-primary);color:var(--text-secondary);font-size:11px;font-weight:600;cursor:pointer">CLI</button>
               <button type="button" class="skill-composer-mode" data-kind="project" onclick="setSkillComposerMode('project')" style="padding:7px 6px;border:1px solid var(--border);border-radius:6px;background:var(--bg-primary);color:var(--text-secondary);font-size:11px;font-weight:600;cursor:pointer">Project</button>
               <button type="button" class="skill-composer-mode" data-kind="memory" onclick="setSkillComposerMode('memory')" style="padding:7px 6px;border:1px solid var(--border);border-radius:6px;background:var(--bg-primary);color:var(--text-secondary);font-size:11px;font-weight:600;cursor:pointer">Memory</button>
@@ -21352,11 +21361,12 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
             <div id="skill-composer-anchor-summary" style="margin-top:8px;min-height:22px;font-size:11px;color:var(--text-muted);line-height:1.45">No starting point selected.</div>
             <div id="skill-composer-preview" style="margin-top:10px;max-height:180px;overflow:auto;border:1px solid var(--border);border-radius:6px;background:var(--bg-primary);padding:10px 12px;font-size:11px;line-height:1.45;color:var(--text-secondary)"></div>
             <div style="display:flex;align-items:center;justify-content:flex-end;gap:8px;margin-top:12px">
-              <button type="button" class="btn-secondary" onclick="openSkillStudio()" style="font-size:12px;padding:7px 12px;border-radius:6px;border:1px solid var(--border);background:transparent;color:var(--text-primary);cursor:pointer">Open Studio</button>
-              <button type="button" class="btn-primary" id="skill-composer-draft-btn" onclick="startSkillComposerDraft()" disabled style="font-size:12px;padding:7px 14px;border-radius:6px;border:none;background:var(--accent);color:#fff;font-weight:600;cursor:pointer;opacity:0.55">Draft skill</button>
+              <button type="button" class="btn-secondary" onclick="startSkillComposerChat()" style="font-size:12px;padding:7px 12px;border-radius:6px;border:1px solid var(--border);background:transparent;color:var(--text-primary);cursor:pointer">Build in chat</button>
+              <button type="button" class="btn-primary" id="skill-composer-draft-btn" onclick="startSkillComposerDraft()" disabled style="font-size:12px;padding:7px 14px;border-radius:6px;border:none;background:var(--accent);color:#fff;font-weight:600;cursor:pointer;opacity:0.55">Review draft</button>
             </div>
           </div>
         </div>
+      </div>
       </div>
       <div style="display:grid;grid-template-columns:380px 1fr;gap:18px;height:calc(100vh - 360px);min-height:440px">
         <div id="skills-list-pane" style="overflow-y:auto;border:1px solid var(--border);border-radius:8px;background:var(--bg-secondary)">
@@ -28896,6 +28906,17 @@ function startSkillComposerDraft() {
   openCreateSkillModalFromComposer({ draft: true });
 }
 
+function startSkillComposerChat() {
+  var prompt = buildSkillComposerPrompt();
+  if (typeof askClementineWith !== 'function') {
+    toast('Chat is not ready yet. Try again after the dashboard finishes loading.', 'error');
+    return;
+  }
+  closeSkillStudio({ silent: true });
+  askClementineWith(prompt, { autoSend: false });
+  toast('Skill-creator prompt loaded in chat. Press send when you are ready.', 'info');
+}
+
 function openCreateSkillModalFromComposer(opts) {
   opts = opts || {};
   var text = ((document.getElementById('skill-composer-text') || {}).value || '').trim();
@@ -28905,6 +28926,7 @@ function openCreateSkillModalFromComposer(opts) {
     return;
   }
   var seed = buildSkillComposerDraftSeed();
+  closeSkillStudio({ silent: true });
   _openSkillModal({ mode: 'create', prefill: seed });
   if (seed.note && typeof toast === 'function') toast(seed.note, 'success');
 }
