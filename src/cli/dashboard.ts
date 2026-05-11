@@ -38,6 +38,7 @@ import {
   SESSIONS_FILE,
   TIMEZONE,
   applyOneMillionContextRecovery,
+  currentTimeZone,
   looksLikeClaudeOneMillionContextError,
   normalizeClaudeSdkOptionsForOneMillionContext,
 } from '../config.js';
@@ -1144,7 +1145,7 @@ function dashboardTimeZone(): string {
   } catch {
     jsonTz = '';
   }
-  return resolveTimeZone(process.env.TIMEZONE, readDashboardEnvValue('TIMEZONE'), jsonTz, TIMEZONE);
+  return resolveTimeZone(process.env.TIMEZONE, readDashboardEnvValue('TIMEZONE'), jsonTz, currentTimeZone(), TIMEZONE);
 }
 
 function dashboardTimeSnapshot(date = new Date()) {
@@ -8907,7 +8908,15 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
 	      }
       if (key === 'TIMEZONE') {
         process.env.TIMEZONE = value;
-        process.env.TZ = value;
+        process.env.TZ = currentTimeZone();
+        try {
+          const gw = await getGateway();
+          const sched = (gw as { cronScheduler?: { reloadJobs?: () => void; reloadWorkflows?: () => void } }).cronScheduler;
+          sched?.reloadJobs?.();
+          sched?.reloadWorkflows?.();
+        } catch {
+          // Best-effort: persisted setting still applies on next scheduler start.
+        }
       }
 
       res.json({ ok: true, message: `Updated ${key}` });
@@ -8937,7 +8946,15 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
 	      }
       if (key === 'TIMEZONE') {
         delete process.env.TIMEZONE;
-        process.env.TZ = dashboardTimeZone();
+        process.env.TZ = currentTimeZone();
+        try {
+          const gw = await getGateway();
+          const sched = (gw as { cronScheduler?: { reloadJobs?: () => void; reloadWorkflows?: () => void } }).cronScheduler;
+          sched?.reloadJobs?.();
+          sched?.reloadWorkflows?.();
+        } catch {
+          // Best-effort: persisted setting still applies on next scheduler start.
+        }
       }
 
 	      res.json({ ok: true, message: `Removed ${key}` });
@@ -24768,6 +24785,7 @@ function settingRequiresDaemonRestart(key) {
   if (!key) return true;
   if (key === 'COMPOSIO_API_KEY' || key === 'COMPOSIO_USER_ID') return false;
   if (key.indexOf('ASSISTANT_') === 0) return false;
+  if (key === 'TIMEZONE') return false;
   return true;
 }
 
@@ -24870,8 +24888,7 @@ async function saveTimezoneSetting() {
     dashboardTimeState.serverIso = new Date().toISOString();
     dashboardTimeState.syncedAt = Date.now();
     renderDashboardTimeWidgets();
-    markRestartRequired('Timezone changed. Restart Clementine so Discord, Slack, and background workers use the new local time.');
-    if (status) { status.textContent = 'Saved'; status.style.color = 'var(--green)'; setTimeout(function(){ status.textContent = ''; }, 2000); }
+    if (status) { status.textContent = 'Saved; schedules reloaded'; status.style.color = 'var(--green)'; setTimeout(function(){ status.textContent = ''; }, 2500); }
     refreshHomeDigest();
   } else if (status) {
     status.textContent = 'Error';

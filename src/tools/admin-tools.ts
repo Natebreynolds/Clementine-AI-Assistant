@@ -20,7 +20,7 @@ import {
   BASE_DIR, CRON_FILE, SYSTEM_DIR,
   env, getStore, logger, textResult,
 } from './shared.js';
-import { ALLOW_SOURCE_EDITS } from '../config.js';
+import { ALLOW_SOURCE_EDITS, currentTimeZone } from '../config.js';
 import { getInteractionSource } from '../agent/hooks.js';
 import { renameSync } from 'node:fs';
 import * as keychain from '../secrets/keychain.js';
@@ -1049,6 +1049,7 @@ function getNextRun(expr: string): string | null {
   if (parts.length < 5) return null;
   const [minF, hourF, domF, monF, dowF] = parts;
 
+  const timeZone = currentTimeZone();
   const now = new Date();
   // Check the next 48 hours minute by minute (max 2880 iterations)
   for (let offset = 1; offset <= 2880; offset++) {
@@ -1066,7 +1067,7 @@ function getNextRun(expr: string): string | null {
       const h12 = h === 0 ? 12 : h > 12 ? h - 12 : h;
       const today = t.toDateString() === now.toDateString();
       const tomorrow = t.toDateString() === new Date(now.getTime() + 86400000).toDateString();
-      const dayLabel = today ? 'today' : tomorrow ? 'tomorrow' : t.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' });
+      const dayLabel = today ? 'today' : tomorrow ? 'tomorrow' : t.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric', timeZone });
       return `${dayLabel} at ${h12}:${String(m).padStart(2, '0')} ${ampm}`;
     }
   }
@@ -1163,10 +1164,10 @@ server.tool(
 
 server.tool(
   'add_cron_job',
-  'Add a new scheduled task. Propose the plan in chat and get user approval first. The `prompt` MUST be self-contained: name the actual recipients, template, and criteria — vague references ("recent leads", "this week\'s items") drift between chat-time and fire-time. Default `predictable: true` runs with only prompt + pinned skills/tools (no MEMORY.md, no auto-match). Set `predictable: false` only when the user explicitly wants dynamic re-resolution each fire.',
+  'Add a new scheduled task. Cron hours are interpreted in the user\'s configured local timezone; do not convert to UTC. Propose the plan in chat and get user approval first. The `prompt` MUST be self-contained: name the actual recipients, template, and criteria — vague references ("recent leads", "this week\'s items") drift between chat-time and fire-time. Default `predictable: true` runs with only prompt + pinned skills/tools (no MEMORY.md, no auto-match). Set `predictable: false` only when the user explicitly wants dynamic re-resolution each fire.',
   {
     name: z.string().describe('Job name (unique identifier)'),
-    schedule: z.string().describe('Cron expression (e.g., "0 9 * * 1" for Monday 9 AM)'),
+    schedule: z.string().describe('Cron expression in configured local time (e.g., "0 9 * * 1" for Monday 9 AM local). Do not UTC-convert the hour field.'),
     prompt: z.string().describe('The prompt/instruction for the assistant to execute. SHOULD BE CONCRETE — list actual recipients, criteria, content. Vague prompts re-derive at fire-time and cause "agent agreed in chat but emailed wrong people" failures.'),
     tier: z.number().optional().default(1).describe('Security tier (1=auto, 2=logged, 3=approval). Tier 2+ also raises the per-run budget cap.'),
     enabled: z.boolean().optional().default(true).describe('Whether the job is enabled'),
@@ -1266,6 +1267,7 @@ server.tool(
     ];
     if (work_dir) details.push(`  Project: ${work_dir}`);
     if (max_hours) details.push(`  Wall-clock cap: ${max_hours}h`);
+    details.push(`  Timezone: ${currentTimeZone()} (cron hours are local; no UTC conversion)`);
     details.push(`  Predictable mode: ${newJob.predictable ? 'ON — runs with only the prompt + pinned skills/tools (no MEMORY.md drift)' : 'OFF — runs with MEMORY.md + auto-matched skills (dynamic, may surprise)'}`);
     if (Array.isArray(skills) && skills.length) details.push(`  Pinned skills: ${skills.join(', ')}`);
     if (Array.isArray(allowed_tools) && allowed_tools.length) details.push(`  Allowed tools: ${allowed_tools.join(', ')}`);
@@ -1290,10 +1292,10 @@ server.tool(
 
 server.tool(
   'update_cron_job',
-  'Update an existing cron job in CRON.md. Partial — only fields you supply change. Pass an empty array to clear a capability allowlist (skills/allowed_tools/allowed_mcp_servers/tags); empty string clears category. Daemon auto-reloads. Run preview_cron_job before relying on the change. Flipping `predictable` true→false makes the trick read MEMORY.md at fire-time — confirm the tradeoff with the user.',
+  'Update an existing cron job in CRON.md. Partial — only fields you supply change. Cron hours are interpreted in the user\'s configured local timezone; do not convert to UTC. Pass an empty array to clear a capability allowlist (skills/allowed_tools/allowed_mcp_servers/tags); empty string clears category. Daemon auto-reloads. Run preview_cron_job before relying on the change. Flipping `predictable` true→false makes the trick read MEMORY.md at fire-time — confirm the tradeoff with the user.',
   {
     name: z.string().describe('Existing job name to update.'),
-    schedule: z.string().optional().describe('New cron expression.'),
+    schedule: z.string().optional().describe('New cron expression in configured local time (e.g., "0 9 * * 1" for Monday 9 AM local). Do not UTC-convert the hour field.'),
     prompt: z.string().optional().describe('New prompt.'),
     tier: z.number().optional().describe('Security tier.'),
     enabled: z.boolean().optional().describe('Enable/disable.'),
@@ -1374,6 +1376,9 @@ server.tool(
     }
     writeFileSync(CRON_FILE, output);
     logger.info({ jobName, changes: changed }, 'Updated cron job via MCP tool');
+    if (schedule !== undefined) {
+      changed.push(`timezone → ${currentTimeZone()} local time (no UTC conversion)`);
+    }
     return textResult(
       `Updated cron job "${jobName}":\n  ${changed.join('\n  ')}\n\nDaemon will pick up the new definition within ~2s. Use \`preview_cron_job\` to confirm what will actually run.`,
     );

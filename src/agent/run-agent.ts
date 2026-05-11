@@ -18,7 +18,7 @@
 
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { query, type AgentDefinition, type SDKAssistantMessage, type SDKResultMessage } from '@anthropic-ai/claude-agent-sdk';
+import { query, type AgentDefinition, type SDKAssistantMessage, type SDKResultMessage, type SessionStore } from '@anthropic-ai/claude-agent-sdk';
 import pino from 'pino';
 import { EventLog } from '../gateway/event-log.js';
 import type { RunEvent } from '../types.js';
@@ -98,6 +98,7 @@ import { buildDedupHook } from './tool-call-dedup.js';
 import type { AgentProfile } from '../types.js';
 import type { AgentManager } from './agent-manager.js';
 import type { MemoryStore } from '../memory/store.js';
+import type { MemoryStoreType } from '../tools/shared.js';
 import { buildAgentMap } from './agent-definitions.js';
 import {
   buildExecutionToolPolicy,
@@ -468,6 +469,20 @@ export async function runAgent(prompt: string, opts: RunAgentOptions): Promise<R
     } catch { /* never block */ }
   };
 
+  // Durable SDK session store: mirror parent + subagent SDK transcripts into
+  // Clementine's SQLite memory store. The chat gateway already persists the
+  // SDK session id; this store makes restart resume independent of local JSONL
+  // files and keeps session inspection/querying in the same memory backend.
+  let sessionStore: SessionStore | undefined;
+  if (opts.memoryStore) {
+    try {
+      const { createMemorySessionStore } = await import('./session-store-adapter.js');
+      sessionStore = createMemorySessionStore(opts.memoryStore as unknown as MemoryStoreType);
+    } catch (err) {
+      logger.debug({ err }, 'runAgent: SessionStore adapter unavailable (non-fatal)');
+    }
+  }
+
   // ── Tool-output guard hooks (1.18.169) ─────────────────────────────
   // Bounds the per-tool-call output that reaches the model so SDK
   // auto-compaction never thrashes on a runaway MCP result. The hook
@@ -564,6 +579,7 @@ export async function runAgent(prompt: string, opts: RunAgentOptions): Promise<R
     tools: toolPolicy.builtinTools,
     allowedTools: toolPolicy.allowedTools,
     permissionMode: toolPolicy.permissionMode,
+    ...(sessionStore ? { sessionStore } : {}),
     ...(toolPolicy.allowDangerouslySkipPermissions
       ? { allowDangerouslySkipPermissions: toolPolicy.allowDangerouslySkipPermissions }
       : {}),
@@ -607,6 +623,7 @@ export async function runAgent(prompt: string, opts: RunAgentOptions): Promise<R
     builtinToolCount: toolPolicy.builtinTools.length,
     permissionMode: toolPolicy.permissionMode,
     mcpServerCount: Object.keys(mcpServers).length,
+    sessionStore: !!sessionStore,
   }, 'runAgent: starting query');
 
   // PRD §6 / 1.18.85: path A in-process tap. runId / eventLog / writeEvent

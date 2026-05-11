@@ -18,18 +18,18 @@ import {
   OWNER_NAME,
   MODELS,
   BUDGET,
-  TIMEZONE,
+  currentTimeZone,
 } from '../config.js';
 import { formatDateInTimeZone, formatTimeInTimeZone } from '../lib/time.js';
 
 const OWNER = OWNER_NAME || 'the user';
 
 function formatDate(d: Date): string {
-  return formatDateInTimeZone(d, TIMEZONE);
+  return formatDateInTimeZone(d, currentTimeZone());
 }
 
 function formatTime(d: Date): string {
-  return formatTimeInTimeZone(d, TIMEZONE);
+  return formatTimeInTimeZone(d, currentTimeZone());
 }
 import type { AgentProfile } from '../types.js';
 import type { MemoryStore } from '../memory/store.js';
@@ -61,7 +61,7 @@ export async function runAgentHeartbeat(opts: RunAgentHeartbeatOptions): Promise
   const now = new Date();
   const localTime = formatTime(now);
   const localDate = formatDate(now);
-  const tz = TIMEZONE;
+  const tz = currentTimeZone();
   const owner = OWNER;
   const agentName = opts.profile?.name ?? 'personal assistant';
 

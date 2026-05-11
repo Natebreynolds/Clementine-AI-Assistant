@@ -160,7 +160,7 @@ function backgroundTaskItems(sessionKey: string, opts: ActiveContextOptions, sur
     .slice(0, 5)
     .map((task) => {
       const active = task.status === 'pending' || task.status === 'running';
-      const failed = task.status === 'failed' || task.status === 'aborted';
+      const failed = task.status === 'failed' || task.status === 'aborted' || task.status === 'interrupted';
       const blocker = /usage limit|billing|credit balance|monthly usage|auth/i.test(task.error ?? '');
       const ageMs = taskAgeMs(task, now);
       const detail = failed

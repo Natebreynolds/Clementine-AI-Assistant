@@ -13,7 +13,7 @@ import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import path from 'node:path';
 import pino from 'pino';
 
-import { GOALS_DIR, BASE_DIR, MEMORY_DB_PATH, VAULT_DIR, TIMEZONE } from '../config.js';
+import { GOALS_DIR, BASE_DIR, MEMORY_DB_PATH, VAULT_DIR, currentTimeZone } from '../config.js';
 import { listAllGoals } from '../tools/shared.js';
 import { computeBrokenJobs } from '../gateway/failure-monitor.js';
 import { MemoryStore } from '../memory/store.js';
@@ -48,7 +48,7 @@ const UNACKED_THRESHOLD = 3; // double cooldown after this many ignored
  * Check if it's too soon to send another proactive message.
  */
 export function canSendInsight(state: InsightState): boolean {
-  const today = dateKeyInTimeZone(new Date(), TIMEZONE);
+  const today = dateKeyInTimeZone(new Date(), currentTimeZone());
 
   // Reset daily count on new day
   if (state.currentDate !== today) {

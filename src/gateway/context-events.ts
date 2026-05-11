@@ -34,6 +34,7 @@ export type ContextEventStatus =
   | 'done'
   | 'failed'
   | 'aborted'
+  | 'interrupted'
   | 'resolved'
   | 'stale'
   | 'unknown';
@@ -267,4 +268,3 @@ export function markContextEventBySource(
   const event = matches[0];
   return event ? updateContextEvent(event.id, patch, options) : null;
 }
-

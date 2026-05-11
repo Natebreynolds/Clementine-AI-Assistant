@@ -13,9 +13,9 @@
  * cron-scheduler tick picks up pending tasks within ~3 seconds.
  *
  * Restart safety: on daemon startup, any task left in 'running' is
- * aborted (its process is gone). P6b can add resumability; for now,
- * fail-fast is clearer than silently re-running a task that may have
- * already partially completed.
+ * marked interrupted (its process is gone). The user can resume it
+ * explicitly, which requeues the same prompt without pretending the
+ * prior run finished.
  */
 
 import { randomBytes } from 'node:crypto';
@@ -124,14 +124,36 @@ export function listBackgroundTasks(
 }
 
 /** Transition a task to 'running' — daemon picked it up. */
-export function markRunning(id: string, opts?: BackgroundTaskOptions): BackgroundTask | null {
+export function markRunning(
+  id: string,
+  opts?: BackgroundTaskOptions,
+  meta: { jobName?: string; runId?: string; sdkSessionId?: string } = {},
+): BackgroundTask | null {
   const task = loadBackgroundTask(id, opts);
   if (!task) return null;
   if (task.status !== 'pending') return null;
   task.status = 'running';
   task.startedAt = new Date().toISOString();
+  delete task.completedAt;
+  delete task.error;
+  if (meta.jobName) task.jobName = meta.jobName;
+  if (meta.runId) task.runId = meta.runId;
+  if (meta.sdkSessionId) task.sdkSessionId = meta.sdkSessionId;
   safeWrite(pathFor(id, opts), task);
   return task;
+}
+
+/** Patch non-status metadata on a task. Used for notification bookkeeping. */
+export function updateBackgroundTask(
+  id: string,
+  patch: Partial<Omit<BackgroundTask, 'id'>>,
+  opts?: BackgroundTaskOptions,
+): BackgroundTask | null {
+  const task = loadBackgroundTask(id, opts);
+  if (!task) return null;
+  const updated: BackgroundTask = Object.assign(task, patch, { id: task.id });
+  safeWrite(pathFor(id, opts), updated);
+  return updated;
 }
 
 function writeFullResultFile(id: string, result: string, opts?: BackgroundTaskOptions): string | undefined {
@@ -167,33 +189,53 @@ export function markDone(
 export function markFailed(
   id: string,
   error: string,
-  reason: 'failed' | 'aborted' = 'failed',
+  reason: 'failed' | 'aborted' | 'interrupted' = 'failed',
   opts?: BackgroundTaskOptions,
 ): BackgroundTask | null {
   const task = loadBackgroundTask(id, opts);
   if (!task) return null;
-  if (task.status === 'done' || task.status === 'failed' || task.status === 'aborted') return task;
+  if (task.status === 'done' || task.status === 'failed' || task.status === 'aborted' || task.status === 'interrupted') return task;
   task.status = reason;
   task.completedAt = new Date().toISOString();
+  if (reason === 'interrupted') task.interruptedAt = task.completedAt;
   task.error = error.slice(0, 1000);
   safeWrite(pathFor(id, opts), task);
   return task;
 }
 
 /**
- * Daemon-restart hygiene: any task still in 'running' must be from a
- * prior daemon process. Mark them aborted so the lifecycle is honest.
- * Returns the count of tasks aborted.
+ * Requeue a task that was interrupted by a daemon restart.
  */
-export function abortStaleRunningTasks(opts?: BackgroundTaskOptions): number {
-  const stuck = listBackgroundTasks({ status: 'running' }, opts);
-  let aborted = 0;
-  for (const t of stuck) {
-    markFailed(t.id, 'daemon restarted while task was in flight', 'aborted', opts);
-    aborted++;
-  }
-  return aborted;
+export function resumeBackgroundTask(id: string, opts?: BackgroundTaskOptions): BackgroundTask | null {
+  const task = loadBackgroundTask(id, opts);
+  if (!task || task.status !== 'interrupted') return null;
+  task.status = 'pending';
+  task.resumedAt = new Date().toISOString();
+  task.resumeCount = (task.resumeCount ?? 0) + 1;
+  delete task.startedAt;
+  delete task.completedAt;
+  delete task.error;
+  safeWrite(pathFor(id, opts), task);
+  return task;
 }
+
+/**
+ * Daemon-restart hygiene: any task still in 'running' must be from a
+ * prior daemon process. Mark it interrupted so it can be resumed
+ * explicitly. Returns the count of tasks interrupted.
+ */
+export function interruptStaleRunningTasks(opts?: BackgroundTaskOptions): number {
+  const stuck = listBackgroundTasks({ status: 'running' }, opts);
+  let interrupted = 0;
+  for (const t of stuck) {
+    markFailed(t.id, 'daemon restarted while task was in flight', 'interrupted', opts);
+    interrupted++;
+  }
+  return interrupted;
+}
+
+/** Backward-compatible export for callers/tests using the old name. */
+export const abortStaleRunningTasks = interruptStaleRunningTasks;
 
 /** Delete a task file. Callers should avoid deleting active tasks. */
 export function deleteBackgroundTask(id: string, opts?: BackgroundTaskOptions): void {

@@ -362,6 +362,7 @@ function resolveAutonomousModel(
  */
 function buildSkillWorkerAgent(
   skill: Skill,
+  renderedProcedure: string,
   effectiveTools: string[],
   model: string | undefined,
   workerMaxTurns: number,
@@ -379,7 +380,7 @@ function buildSkillWorkerAgent(
       `Return a single concise final response describing what happened (e.g., "Sent Discord DM about ` +
       `2 actionable items, ignored 8 spam"). Do not return raw tool output; do not narrate every step. ` +
       `If nothing actionable was found and the procedure says exit silently, return "No action needed."\n\n` +
-      `## Procedure\n\n${skill.body}`,
+      `## Procedure\n\n${renderedProcedure}`,
     tools: effectiveTools,
     // SDK accepts 'sonnet' / 'opus' / 'haiku' tier aliases OR full model
     // IDs. We pass the full ID with [1m] when present; the SDK strips
@@ -401,7 +402,6 @@ function buildSkillWorkerAgent(
  */
 function buildOrchestratorPrompt(
   skill: Skill,
-  callerContext: string | undefined,
 ): string {
   const parts: string[] = [
     `## Scheduled Skill Execution`,
@@ -417,9 +417,6 @@ function buildOrchestratorPrompt(
     ``,
     `Do NOT call any other tools directly. The worker handles all data access and delivery.`,
   ];
-  if (callerContext && callerContext.trim()) {
-    parts.push('', '## Caller context (forward this to the worker if relevant)', '', callerContext.trim());
-  }
   return parts.join('\n');
 }
 
@@ -474,9 +471,10 @@ export async function runSkill(
   // skill reads, so post-compaction refetch loops are structurally
   // impossible. See shouldAutoDelegate / buildSkillWorkerAgent above.
   const autoDelegate = shouldAutoDelegate(skill, source);
+  const renderedSkillPrompt = buildSkillPrompt(skill, options.inputs, options.context);
   const prompt = autoDelegate
-    ? buildOrchestratorPrompt(skill, options.context)
-    : buildSkillPrompt(skill, options.inputs, options.context);
+    ? buildOrchestratorPrompt(skill)
+    : renderedSkillPrompt;
 
   const limits = skill.frontmatter?.clementine?.limits;
   const maxTurns = options.maxTurns ?? limits?.maxTurns;
@@ -540,7 +538,7 @@ export async function runSkill(
       // Worker gets enough turns to complete bulk work (skill author's
       // maxTurns cap, or 30 as a safe default for triage-class work).
       const workerMaxTurns = (typeof maxTurns === 'number' && maxTurns > 0) ? maxTurns : 30;
-      const workerDef = buildSkillWorkerAgent(skill, effectiveTools, effectiveModel, workerMaxTurns);
+      const workerDef = buildSkillWorkerAgent(skill, renderedSkillPrompt, effectiveTools, effectiveModel, workerMaxTurns);
 
       sdkOpts = {
         sessionKey,

@@ -45,7 +45,7 @@ import {
   CRON_REFLECTIONS_DIR,
   BUDGET,
   TASK_BUDGET_TOKENS,
-  TIMEZONE,
+  currentTimeZone,
   CLAUDE_CODE_OAUTH_TOKEN,
   ANTHROPIC_API_KEY as CONFIG_ANTHROPIC_API_KEY,
   claudeCodeDisableOneMillionForModel,
@@ -665,20 +665,20 @@ function extractText(blocks: ContentBlock[]): string {
 // ── Date Helpers ────────────────────────────────────────────────────
 
 function formatDate(d: Date): string {
-  return formatDateInTimeZone(d, TIMEZONE);
+  return formatDateInTimeZone(d, currentTimeZone());
 }
 
 function formatTime(d: Date): string {
-  return formatTimeInTimeZone(d, TIMEZONE);
+  return formatTimeInTimeZone(d, currentTimeZone());
 }
 
 /** Local-time YYYY-MM-DD (avoids UTC date mismatch late at night). */
 function todayISO(): string {
-  return dateKeyInTimeZone(new Date(), TIMEZONE);
+  return dateKeyInTimeZone(new Date(), currentTimeZone());
 }
 
 function yesterdayISO(): string {
-  return dateKeyInTimeZone(new Date(Date.now() - 24 * 60 * 60 * 1000), TIMEZONE);
+  return dateKeyInTimeZone(new Date(Date.now() - 24 * 60 * 60 * 1000), currentTimeZone());
 }
 
 // ── Cron Trace Types ────────────────────────────────────────────────
@@ -1307,7 +1307,7 @@ Large tool outputs blow the context window and rotate your session mid-task — 
     // Skip yesterday's notes and recent conversation summaries for autonomous runs
     if (!isAutonomous && !skipAmbientContext) {
       if (!retrievalContext) {
-        const hour = hourInTimeZone(new Date(), TIMEZONE);
+        const hour = hourInTimeZone(new Date(), currentTimeZone());
         const mentionsYesterday = this._lastUserMessage?.toLowerCase().includes('yesterday');
         if (hour < 12 || mentionsYesterday) {
           const yPath = path.join(DAILY_NOTES_DIR, `${yesterdayISO()}.md`);
@@ -1822,11 +1822,12 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
     const modelLabel = Object.entries(MODELS).find(([, v]) => v === resolvedModel)?.[0] ?? resolvedModel;
     const caps = !isAutonomous ? getChannelCapabilities(channel) : null;
     const now = new Date();
+    const timeZone = currentTimeZone();
     volatileParts.push(`## Current Context
 
 - **Date:** ${formatDate(now)}
 - **Time:** ${formatTime(now)}
-- **Timezone:** ${TIMEZONE}
+- **Timezone:** ${timeZone}
 - **Channel:** ${channel}${caps ? ` (${formatCapabilities(caps)})` : ''}
 - **Model:** ${modelLabel} (${resolvedModel})
 - **Vault:** ${vault}
@@ -3574,7 +3575,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
     sessionKey: string,
     userText: string,
     assistantText: string,
-    opts: { pending?: boolean } = {},
+    opts: { pending?: boolean; model?: string; countExchange?: boolean } = {},
   ): void {
     const trimmedUser = capContextBlock(userText, INJECTED_CONTEXT_MAX_CHARS);
     const trimmedAssistant = capContextBlock(assistantText, INJECTED_CONTEXT_MAX_CHARS);
@@ -3599,6 +3600,10 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
       this.pendingContext.set(sessionKey, pending);
     }
 
+    if (opts.countExchange) {
+      this.exchangeCounts.set(sessionKey, (this.exchangeCounts.get(sessionKey) ?? 0) + 1);
+    }
+
     this.sessionTimestamps.set(sessionKey, new Date());
     this.saveSessions();
 
@@ -3606,7 +3611,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
     if (this.memoryStore) {
       try {
         this.memoryStore.saveTurn(sessionKey, 'user', userText);
-        this.memoryStore.saveTurn(sessionKey, 'assistant', assistantText, 'cron');
+        this.memoryStore.saveTurn(sessionKey, 'assistant', assistantText, opts.model ?? 'cron');
       } catch {
         // Non-fatal
       }

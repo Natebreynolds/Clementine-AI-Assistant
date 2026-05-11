@@ -25,14 +25,15 @@ import {
 } from '../agent/schedule-registry.js';
 import { loadSkillByName } from '../agent/skill-extractor.js';
 import { textResult, logger } from './shared.js';
+import { currentTimeZone } from '../config.js';
 
 export function registerScheduleTools(server: McpServer): void {
   server.tool(
     'schedule_skill',
-    'Schedule a skill to run automatically on a cron expression. Pair with create_skill to build "recurring brain feeds" or any other automation from chat. The skill must already exist in the catalog. Idempotent — calling twice for the same skill updates the existing schedule. Use enabled=false to pause without losing the schedule.',
+    'Schedule a skill to run automatically on a cron expression. Cron hours are interpreted in the user\'s configured local timezone; do not convert to UTC. Pair with create_skill to build "recurring brain feeds" or any other automation from chat. The skill must already exist in the catalog. Idempotent — calling twice for the same skill updates the existing schedule. Use enabled=false to pause without losing the schedule.',
     {
       skillName: z.string().describe('The skill slug (must already exist in the catalog — call create_skill first if needed).'),
-      schedule: z.string().describe('Cron expression. Examples: "0 9 * * *" = daily 9am, "0 9 */2 * *" = every 2 days at 9am, "0 */4 * * *" = every 4 hours, "0 7 * * 1-5" = weekdays at 7am.'),
+      schedule: z.string().describe('Cron expression in the configured local timezone. Examples: "0 9 * * *" = daily 9am local, "0 9 */2 * *" = every 2 days at 9am local, "0 */4 * * *" = every 4 hours, "0 7 * * 1-5" = weekdays at 7am local.'),
       enabled: z.boolean().optional().describe('When false, schedule is saved but the runner skips it. Default: true.'),
       agentSlug: z.string().nullable().optional().describe('Optional: run as a hired agent (e.g. "ross-the-sdr"). Default: null = Clementine.'),
     },
@@ -61,8 +62,10 @@ export function registerScheduleTools(server: McpServer): void {
           agentSlug: agentSlug ?? null,
         });
         logger.info({ skillName, schedule, enabled: entry.enabled, agentSlug: entry.agentSlug }, 'schedule_skill: scheduled');
+        const timezone = currentTimeZone();
         return textResult(
           `Scheduled "${skillName}" to run on "${schedule}"` +
+          ` (${timezone} local time)` +
           (entry.enabled ? '' : ' (DISABLED — flip enabled:true to start firing)') +
           `. View on the Schedules page or call list_schedules to confirm.`,
         );
@@ -90,6 +93,7 @@ export function registerScheduleTools(server: McpServer): void {
           const owner = e.agentSlug ? ` (as ${e.agentSlug})` : '';
           lines.push(`${status} ${e.skillName} — ${e.schedule}${owner}`);
         }
+        lines.push(`Timezone: ${currentTimeZone()} (cron hours are local; do not UTC-convert schedules).`);
         return textResult(lines.join('\n'));
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);

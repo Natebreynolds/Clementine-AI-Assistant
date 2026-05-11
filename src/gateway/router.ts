@@ -33,7 +33,7 @@ import { AgentManager } from '../agent/agent-manager.js';
 import { TeamRouter } from '../agent/team-router.js';
 import { TeamBus } from '../agent/team-bus.js';
 import type { NotificationDispatcher } from './notifications.js';
-import { createBackgroundTask, listBackgroundTasks, loadBackgroundTask, markFailed } from '../agent/background-tasks.js';
+import { createBackgroundTask, listBackgroundTasks, loadBackgroundTask, markFailed, resumeBackgroundTask } from '../agent/background-tasks.js';
 import { applyAssistantExperienceUpdate, detectApprovalReply, detectLocalTurn, type AssistantExperienceUpdate } from '../agent/local-turn.js';
 import { buildApprovalFollowupPrompt, detectActionExpectation } from '../agent/action-enforcer.js';
 import { updateClementineJson } from '../config/clementine-json.js';
@@ -303,6 +303,34 @@ export class Gateway {
       || sessionKey.startsWith('telegram:');
   }
 
+  private effectiveMemorySessionKey(sessionKey: string): string {
+    const profileSlug = this.sessions.get(sessionKey)?.profile;
+    return profileSlug ? `${sessionKey}:${profileSlug}` : sessionKey;
+  }
+
+  private hasRecentApprovalPrompt(sessionKey: string): boolean {
+    const effectiveKey = this.effectiveMemorySessionKey(sessionKey);
+    return this.assistant.hasRecentApprovalPrompt(sessionKey)
+      || (effectiveKey !== sessionKey && this.assistant.hasRecentApprovalPrompt(effectiveKey));
+  }
+
+  private mirrorChatExchange(
+    sessionKey: string,
+    userText: string,
+    assistantText: string,
+    opts: { model: string; countExchange?: boolean },
+  ): void {
+    if (!this.isTrustedPersonalSession(sessionKey)) return;
+    if (sessionKey.startsWith('dashboard:builder:')) return;
+    if (!assistantText.trim()) return;
+    const injectOpts: { pending: false; model: string; countExchange?: boolean } = {
+      pending: false,
+      model: opts.model,
+    };
+    if (opts.countExchange) injectOpts.countExchange = true;
+    this.assistant.injectContext(this.effectiveMemorySessionKey(sessionKey), userText, assistantText, injectOpts);
+  }
+
   private runningUnleashedTasks(limit = 5): Array<{ name: string; status: string; phase?: unknown; updatedAt?: string }> {
     const dir = path.join(BASE_DIR, 'unleashed');
     if (!existsSync(dir)) return [];
@@ -557,7 +585,7 @@ export class Gateway {
     const taskText = this.taskSummary(task.prompt);
     const terminalDetail = task.status === 'done' && task.result
       ? ` Result: ${this.taskSummary(task.result, 120)}`
-      : (task.status === 'failed' || task.status === 'aborted') && task.error
+      : (task.status === 'failed' || task.status === 'aborted' || task.status === 'interrupted') && task.error
         ? ` Reason: ${this.taskSummary(task.error, 120)}`
         : '';
     const deliverable = task.status === 'done' && task.deliverableNote
@@ -579,7 +607,7 @@ export class Gateway {
     taskDesc: string,
     task?: BackgroundTask | null,
   ): string {
-    if (task && (task.status === 'done' || task.status === 'failed' || task.status === 'aborted')) {
+    if (task && (task.status === 'done' || task.status === 'failed' || task.status === 'aborted' || task.status === 'interrupted')) {
       return `Background task ${task.id} is already ${task.status}.`;
     }
 
@@ -626,6 +654,24 @@ export class Gateway {
     return this.cancelBackgroundJob(sessionKey, active[0]!.id, active[0]!.prompt, active[0]);
   }
 
+  private resumeInterruptedBackgroundTask(sessionKey: string, text: string): string | null {
+    const normalized = text.trim().toLowerCase();
+    if (!/^(resume|restart|continue)\b/.test(normalized)) return null;
+    const explicitId = this.extractBackgroundTaskId(text);
+    if (!explicitId) return null;
+    const task = loadBackgroundTask(explicitId);
+    if (!task) return `I could not find background task ${explicitId}.`;
+    if (!this.canAccessBackgroundTask(sessionKey, task)) {
+      return `I found background task ${explicitId}, but it is not attached to this chat.`;
+    }
+    if (task.status !== 'interrupted') {
+      return `Background task ${task.id} is ${task.status}, not interrupted.`;
+    }
+    const resumed = resumeBackgroundTask(task.id);
+    if (!resumed) return `I could not resume background task ${task.id}.`;
+    return this.formatBackgroundQueuedResponse(resumed);
+  }
+
   private describeSessionStatus(sessionKey: string): string {
     const sess = this.sessions.get(sessionKey);
     const lines: string[] = [];
@@ -660,7 +706,7 @@ export class Gateway {
     }
 
     if (lines.length === 0) {
-      const recentTerminal = this.backgroundTasksForSession(sessionKey, ['done', 'failed', 'aborted'])[0];
+      const recentTerminal = this.backgroundTasksForSession(sessionKey, ['done', 'failed', 'aborted', 'interrupted'])[0];
       if (recentTerminal) {
         lines.push(`No background task is active for this chat. Last task:\n${this.formatBackgroundTaskLine(recentTerminal)}`);
       }
@@ -881,12 +927,21 @@ export class Gateway {
     if (
       this.isTrustedPersonalSession(sessionKey)
       && approvalReply === true
-      && this.assistant.hasRecentApprovalPrompt(sessionKey)
+      && this.hasRecentApprovalPrompt(sessionKey)
     ) {
       return null;
     }
 
     const intent = detectLocalTurn(text);
+    if (this.isTrustedPersonalSession(sessionKey)) {
+      const resumeResponse = this.resumeInterruptedBackgroundTask(sessionKey, text);
+      if (resumeResponse) {
+        if (onText) {
+          try { await onText(resumeResponse); } catch { /* channel streaming is best-effort */ }
+        }
+        return resumeResponse;
+      }
+    }
     if (intent.kind === 'none') return null;
     const localIntentAllowed = this.isTrustedPersonalSession(sessionKey)
       || intent.kind === 'stop'
@@ -1619,7 +1674,7 @@ export class Gateway {
 
     const approvalFollowupForLedger = this.isTrustedPersonalSession(sessionKey)
       && detectApprovalReply(text) === true
-      && this.assistant.hasRecentApprovalPrompt(sessionKey);
+      && this.hasRecentApprovalPrompt(sessionKey);
     const actionExpectationForLedger = detectActionExpectation(text, {
       approvalFollowup: approvalFollowupForLedger,
     });
@@ -1850,6 +1905,7 @@ export class Gateway {
     }
     const localResponse = await this.handleLocalTurn(sessionKey, text, onText, contextDecision);
     if (localResponse !== null) {
+      this.mirrorChatExchange(sessionKey, originalText, localResponse, { model: 'chat-local' });
       logger.info({
         sessionKey,
         totalMs: Date.now() - tInnerStart,
@@ -1869,6 +1925,7 @@ export class Gateway {
       if (onText) {
         try { await onText(backgroundControl.response); } catch { /* channel streaming is best-effort */ }
       }
+      this.mirrorChatExchange(sessionKey, originalText, backgroundControl.response, { model: 'chat-control' });
       return backgroundControl.response;
     }
     if (backgroundControl?.inlineText) {
@@ -1883,7 +1940,7 @@ export class Gateway {
 
     const approvalFollowupExpected = this.isTrustedPersonalSession(sessionKey)
       && detectApprovalReply(originalText) === true
-      && this.assistant.hasRecentApprovalPrompt(sessionKey);
+      && this.hasRecentApprovalPrompt(sessionKey);
     if (approvalFollowupExpected) {
       text = buildApprovalFollowupPrompt(originalText);
       logger.info({ sessionKey }, 'Approval follow-up promoted to tool-enabled action prompt');
@@ -1909,7 +1966,7 @@ export class Gateway {
           logger.info({ sessionKey }, 'Interrupted active chat for recent operational context response');
         }
         this.markRecentContextAcknowledged(sessionKey, recentContext, true);
-        this.assistant.injectContext(sessionKey, originalText, recentContext.responseText);
+        this.assistant.injectContext(sessionKey, originalText, recentContext.responseText, { model: 'chat-context' });
         if (onText) {
           try { await onText(recentContext.responseText); } catch { /* channel streaming is best-effort */ }
         }
@@ -2101,6 +2158,16 @@ export class Gateway {
         // Use per-message override, then session default, then global default
         const sess = this.sessions.get(sessionKey);
         const effectiveModel = model ?? sess?.model;
+        const enrichedText = text;
+        let effectiveSessionKey = sessionKey;
+        const profileSlug = sess?.profile;
+        if (profileSlug) {
+          effectiveSessionKey = `${sessionKey}:${profileSlug}`;
+        }
+        const resolvedProfile = profileSlug
+          ? this.getAgentManager().get(profileSlug) ?? undefined
+          : undefined;
+        const isBuilderSession = sessionKey.startsWith('dashboard:builder:');
 
         // ── Team routing (Clementine-owned sessions only) ──────────────
         // If the user is talking TO Clementine (her main bot DM, owner
@@ -2116,42 +2183,6 @@ export class Gateway {
           || text.startsWith('[Approval:')
           || text.startsWith('[Reaction:')
           || text.startsWith('[System:');
-        if (!isInternalMsg && !sess?.profile && !text.startsWith('!') && !isStructuredWorkflowMsg && onProgress) {
-          await onProgress('checking if a teammate should handle this...').catch(() => { /* non-fatal */ });
-        }
-        const tRoutingStart = Date.now();
-        const routingResult = !isInternalMsg && !sess?.profile && !text.startsWith('!') && !isStructuredWorkflowMsg
-          ? await this._maybeRouteToSpecialist(sessionKey, text, onText)
-          : null;
-        timings.routingMs = Date.now() - tRoutingStart;
-        if (routingResult?.delegated) {
-          return routingResult.ackMessage;
-        }
-        // Soft-suggest mode: pass annotation through to Clementine's reply
-        if (routingResult?.softSuggest) {
-          securityAnnotation = (securityAnnotation
-            ? securityAnnotation + '\n\n'
-            : '') + routingResult.softSuggest;
-        }
-
-        // ── Pre-flight planning for complex asks ───────────────────────
-        // For interactive sessions only (owner DMs, dashboard, CLI), a
-        // cheap deterministic heuristic flags complex multi-step requests.
-        // When it fires, we prepend a directive to the text that tells
-        // the agent to propose a plan + stop, rather than executing
-        // directly. Not a hard stop — on the user's "go" reply the
-        // agent proceeds from the plan it proposed.
-        const enrichedText = text;
-        // Resolve active profile
-        let effectiveSessionKey = sessionKey;
-        const profileSlug = sess?.profile;
-        if (profileSlug) {
-          effectiveSessionKey = `${sessionKey}:${profileSlug}`;
-        }
-        const resolvedProfile = profileSlug
-          ? this.getAgentManager().get(profileSlug) ?? undefined
-          : undefined;
-        const isBuilderSession = sessionKey.startsWith('dashboard:builder:');
 
         if (!skipBackgroundOffer && !isBuilderSession && !isInternalMsg && this.isTrustedPersonalSession(sessionKey)) {
           const recommendation = detectComplexTaskForBackground(text);
@@ -2167,6 +2198,7 @@ export class Gateway {
               if (onText) {
                 try { await onText(queued); } catch { /* channel streaming is best-effort */ }
               }
+              this.mirrorChatExchange(sessionKey, originalText, queued, { model: 'chat-control' });
               return queued;
             }
             const offerText = this.formatBackgroundOfferResponse(offer);
@@ -2183,8 +2215,27 @@ export class Gateway {
             if (onText) {
               try { await onText(offerText); } catch { /* channel streaming is best-effort */ }
             }
+            this.mirrorChatExchange(sessionKey, originalText, offerText, { model: 'chat-control' });
             return offerText;
           }
+        }
+
+        if (!isInternalMsg && !sess?.profile && !text.startsWith('!') && !isStructuredWorkflowMsg && onProgress) {
+          await onProgress('checking if a teammate should handle this...').catch(() => { /* non-fatal */ });
+        }
+        const tRoutingStart = Date.now();
+        const routingResult = !isInternalMsg && !sess?.profile && !text.startsWith('!') && !isStructuredWorkflowMsg
+          ? await this._maybeRouteToSpecialist(sessionKey, text, onText)
+          : null;
+        timings.routingMs = Date.now() - tRoutingStart;
+        if (routingResult?.delegated) {
+          return routingResult.ackMessage;
+        }
+        // Soft-suggest mode: pass annotation through to Clementine's reply
+        if (routingResult?.softSuggest) {
+          securityAnnotation = (securityAnnotation
+            ? securityAnnotation + '\n\n'
+            : '') + routingResult.softSuggest;
         }
 
         const hygiene = assessGatewayContextHygiene({
@@ -2449,13 +2500,15 @@ export class Gateway {
           // Mirror transcript so memory + recall continue working — but
           // skip for builder sessions since their turns are spec-drafting,
           // not real conversation worth recalling later.
-          const memoryStore = this.assistant.getMemoryStore?.();
-          if (memoryStore && !isBuilderSession) {
+          if (!isBuilderSession) {
             try {
-              memoryStore.saveTurn(effectiveSessionKey, 'user', originalText);
-              memoryStore.saveTurn(effectiveSessionKey, 'assistant', runAgentResult.text);
+              this.assistant.injectContext(effectiveSessionKey, originalText, runAgentResult.text, {
+                pending: false,
+                model: 'chat',
+                countExchange: true,
+              });
             } catch (err) {
-              logger.debug({ err }, 'chat: transcript mirror failed (non-fatal)');
+              logger.debug({ err }, 'chat: transcript/session mirror failed (non-fatal)');
             }
           }
 
@@ -2631,6 +2684,8 @@ export class Gateway {
 
         if (scheduledSkillName) {
           const { runSkill } = await import('../agent/run-skill.js');
+          const configuredCap = tier >= 2 ? BUDGET.cronT2 : BUDGET.cronT1;
+          const scheduledSkillBudget = configuredCap > 0 ? configuredCap : undefined;
           logger.info({ jobName, skill: scheduledSkillName, agentSlug, tier, wallMs, path: 'run_skill' }, 'Routing scheduled skill through runSkill');
           const skillResult = await runSkill(scheduledSkillName, {
             sessionKey: `cron:${jobName}`,
@@ -2642,6 +2697,7 @@ export class Gateway {
             projectWorkDir: workDir,
             model,
             ...(maxTurns ? { maxTurns } : {}),
+            ...(scheduledSkillBudget !== undefined ? { maxBudgetUsd: scheduledSkillBudget } : {}),
             abortSignal: cronAc.signal,
             context: `[Scheduled skill: ${jobName}]`,
           });
@@ -2887,7 +2943,7 @@ export class Gateway {
     sessionKey: string,
     userText: string,
     assistantText: string,
-    opts: { pending?: boolean } = {},
+    opts: { pending?: boolean; model?: string; countExchange?: boolean } = {},
   ): void {
     this.assistant.injectContext(sessionKey, userText, assistantText, opts);
   }

@@ -632,6 +632,33 @@ export const ALLOW_ALL_USERS = getEnv('ALLOW_ALL_USERS', 'false').toLowerCase() 
 export const TIMEZONE = resolveTimeZone(getEnvOrJson('TIMEZONE', json.timezone, ''));
 process.env.TZ = TIMEZONE;
 
+function readRuntimeEnvValue(key: string): string {
+  try {
+    const envPath = path.join(BASE_DIR, '.env');
+    if (!existsSync(envPath)) return '';
+    const liveEnv = parseEnvText(readFileSync(envPath, 'utf-8'));
+    return liveEnv[key] ?? '';
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * Runtime timezone resolver. `TIMEZONE` is intentionally a startup constant
+ * for most config, but the dashboard can hot-update TIMEZONE without a full
+ * daemon restart. Schedulers must call this at reload time so display time
+ * and actual fire time stay aligned.
+ */
+export function currentTimeZone(): string {
+  const liveJson = (() => {
+    try { return loadClementineJson(BASE_DIR).timezone ?? ''; }
+    catch { return ''; }
+  })();
+  const resolved = resolveTimeZone(process.env.TIMEZONE, readRuntimeEnvValue('TIMEZONE'), liveJson, TIMEZONE);
+  process.env.TZ = resolved;
+  return resolved;
+}
+
 // ── Heartbeat ────────────────────────────────────────────────────────
 
 export const HEARTBEAT_INTERVAL_MINUTES = Math.floor(

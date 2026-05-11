@@ -52,12 +52,12 @@ import {
   GOALS_DIR,
   CRON_REFLECTIONS_DIR,
   ADVISOR_LOG_PATH,
-  TIMEZONE,
+  currentTimeZone,
 } from '../config.js';
 import { listAllGoals, findGoalPath, readGoalById } from '../tools/shared.js';
 import { listSchedules } from '../agent/schedule-registry.js';
 import { saveStateFile } from './scheduler-state.js';
-import type { CronJobDefinition, CronRunEntry, NotificationContext, SelfImproveConfig, SelfImproveExperiment, SelfImproveState, WorkflowDefinition } from '../types.js';
+import type { BackgroundTask, CronJobDefinition, CronRunEntry, NotificationContext, SelfImproveConfig, SelfImproveExperiment, SelfImproveState, WorkflowDefinition } from '../types.js';
 import type { NotificationDispatcher } from './notifications.js';
 import type { Gateway } from './router.js';
 import { scanner } from '../security/scanner.js';
@@ -68,9 +68,11 @@ import { logAuditJsonl } from '../agent/hooks.js';
 import type { ProactiveDecision } from '../agent/proactive-engine.js';
 import {
   listBackgroundTasks,
+  loadBackgroundTask,
   markDone as markBgTaskDone,
   markFailed as markBgTaskFailed,
   markRunning as markBgTaskRunning,
+  updateBackgroundTask,
 } from '../agent/background-tasks.js';
 import {
   outcomeStatusFromGoalDisposition,
@@ -87,6 +89,8 @@ import { isRunHealthFailure } from './job-health.js';
 import { dateKeyInTimeZone } from '../lib/time.js';
 
 const logger = pino({ name: 'clementine.cron' });
+const BACKGROUND_PROGRESS_PING_MS = 15 * 60 * 1000;
+const BACKGROUND_PROGRESS_PING_MAX = 12;
 
 interface GoalTriggerPayload {
   goalId: string;
@@ -101,14 +105,16 @@ interface GoalTriggerPayload {
 /** Default timeout for standard cron jobs (10 minutes). */
 const CRON_STANDARD_TIMEOUT_MS = 10 * 60 * 1000;
 
-/** Timezone for cron scheduling — uses config (user-overridable) or system-detected. */
-const SYSTEM_TIMEZONE = TIMEZONE;
+/** Timezone for cron scheduling — resolved at reload time so dashboard edits apply immediately. */
+function schedulerTimeZone(): string {
+  return currentTimeZone();
+}
 
 // ── Daily Note Activity Logger ───────────────────────────────────────
 
 /** Local-time YYYY-MM-DD for daily note path. */
 export function todayISO(): string {
-  return dateKeyInTimeZone(new Date(), SYSTEM_TIMEZONE);
+  return dateKeyInTimeZone(new Date(), schedulerTimeZone());
 }
 
 /**
@@ -931,6 +937,7 @@ export class CronScheduler {
     // ── Cycle detection for `after` chains (DFS) ──────────────────────
     const jobNames = new Set(this.jobs.map(j => j.name));
     const afterMap = new Map<string, string>(); // child → parent
+    const timezone = schedulerTimeZone();
     for (const def of this.jobs) {
       if (def.after) {
         if (!jobNames.has(def.after)) {
@@ -985,9 +992,9 @@ export class CronScheduler {
           this.runJob(def).catch((err) => {
             logger.error({ err, job: def.name }, `Cron job '${def.name}' failed`);
           });
-        }, { timezone: SYSTEM_TIMEZONE });
+        }, { timezone });
         this.scheduledTasks.set(def.name, task);
-        logger.info(`Cron job '${def.name}' scheduled: ${def.schedule} (${SYSTEM_TIMEZONE})`);
+        logger.info(`Cron job '${def.name}' scheduled: ${def.schedule} (${timezone})`);
       }
     }
 
@@ -1042,6 +1049,12 @@ export class CronScheduler {
     const job = this.jobs.find(j => j.name === jobName);
     if (job) return this.dispatchContextForJob(job);
     return { sessionKey: `cron:${jobName}` };
+  }
+
+  private dispatchContextForBackgroundTask(task: BackgroundTask): NotificationContext {
+    const ctx: NotificationContext = { sessionKey: task.sessionKey ?? `bg:${task.id}` };
+    if (task.fromAgent && task.fromAgent !== 'clementine') ctx.agentSlug = task.fromAgent;
+    return ctx;
   }
 
   /** Same idea for workflows. Workflows can be agent-scoped via WorkflowDefinition.agentSlug. */
@@ -2022,6 +2035,7 @@ export class CronScheduler {
     }
 
     // Schedule workflows with cron triggers
+    const timezone = schedulerTimeZone();
     for (const wf of this.workflowDefs) {
       if (!wf.enabled || !wf.trigger.schedule) continue;
 
@@ -2034,9 +2048,9 @@ export class CronScheduler {
         this.runWorkflow(wf.name).catch(err => {
           logger.error({ err, workflow: wf.name }, `Scheduled workflow '${wf.name}' failed`);
         });
-      }, { timezone: SYSTEM_TIMEZONE });
+      }, { timezone });
       this.workflowTasks.set(wf.name, task);
-      logger.info(`Workflow '${wf.name}' scheduled: ${wf.trigger.schedule} (${SYSTEM_TIMEZONE})`);
+      logger.info(`Workflow '${wf.name}' scheduled: ${wf.trigger.schedule} (${timezone})`);
     }
 
     logger.info(`Loaded ${this.workflowDefs.length} workflow(s), ${this.workflowTasks.size} scheduled`);
@@ -2097,20 +2111,48 @@ export class CronScheduler {
     if (pending.length === 0) return;
 
     for (const task of pending) {
+      const jobName = `bg:${task.id}`;
       // Move to 'running' synchronously so the next tick (3s away) won't
       // re-pick. Even if the work below errors, the state is honest.
-      const started = markBgTaskRunning(task.id);
+      const started = markBgTaskRunning(task.id, undefined, { jobName });
       if (!started) continue;
 
-      logger.info({ id: task.id, fromAgent: task.fromAgent, maxMinutes: task.maxMinutes }, 'Background task picked up');
+      logger.info({ id: started.id, fromAgent: started.fromAgent, maxMinutes: started.maxMinutes }, 'Background task picked up');
+      updateBackgroundTask(started.id, {
+        lastNotifiedAt: new Date().toISOString(),
+        progressMessageCount: 0,
+      });
+      this.dispatcher
+        .send(
+          `**Background task ${started.id} started** — ${started.prompt.slice(0, 120).replace(/\s+/g, ' ')}${started.prompt.length > 120 ? '...' : ''}\n\nI'll update you every 15 minutes or when it finishes.`,
+          this.dispatchContextForBackgroundTask(started),
+        )
+        .catch((err) => logger.debug({ err, id: started.id }, 'Failed to dispatch background task start'));
 
       // Don't await — fire-and-forget. The 3s tick continues to scan.
-      const jobName = `bg:${task.id}`;
-      const maxHours = Math.max(0.05, task.maxMinutes / 60);
+      const maxHours = Math.max(0.05, started.maxMinutes / 60);
+      const progressTimer = setInterval(() => {
+        const latest = loadBackgroundTask(started.id);
+        if (!latest || latest.status !== 'running') return;
+        const sent = latest.progressMessageCount ?? 0;
+        if (sent >= BACKGROUND_PROGRESS_PING_MAX) return;
+        const elapsedMin = Math.max(1, Math.round((Date.now() - Date.parse(latest.startedAt ?? latest.createdAt)) / 60_000));
+        updateBackgroundTask(latest.id, {
+          lastNotifiedAt: new Date().toISOString(),
+          progressMessageCount: sent + 1,
+        });
+        this.dispatcher
+          .send(
+            `**Background task ${latest.id} is still running** — ${elapsedMin} min elapsed of ${latest.maxMinutes} min cap.`,
+            this.dispatchContextForBackgroundTask(latest),
+          )
+          .catch((err) => logger.debug({ err, id: latest.id }, 'Failed to dispatch background task progress'));
+      }, BACKGROUND_PROGRESS_PING_MS);
+      progressTimer.unref?.();
 
       this.gateway.handleCronJob(
         jobName,
-        task.prompt,
+        started.prompt,
         2,                    // tier 2 (Bash/Write/Edit available)
         undefined,            // default maxTurns
         undefined,            // default model
@@ -2119,30 +2161,34 @@ export class CronScheduler {
         maxHours,
         undefined,            // timeoutMs (maxHours covers it)
         undefined,            // successCriteria
-        task.fromAgent,       // agentSlug — runs as the originator
+        started.fromAgent,    // agentSlug — runs as the originator
       ).then((result) => {
+        clearInterval(progressTimer);
         try {
-          markBgTaskDone(task.id, result ?? '(no output)');
+          markBgTaskDone(started.id, result ?? '(no output)');
         } catch (err) {
-          logger.warn({ err, id: task.id }, 'Failed to mark background task done');
+          logger.warn({ err, id: started.id }, 'Failed to mark background task done');
         }
         // Dispatch the deliverable to the originating agent's channel.
-        const deliveryHead = `**Background task ${task.id} done** — ${task.prompt.slice(0, 100).replace(/\s+/g, ' ')}${task.prompt.length > 100 ? '...' : ''}\n\n`;
+        const completed = loadBackgroundTask(started.id) ?? started;
+        const deliveryHead = `**Background task ${started.id} done** — ${started.prompt.slice(0, 100).replace(/\s+/g, ' ')}${started.prompt.length > 100 ? '...' : ''}\n\n`;
         const body = (result ?? '').slice(0, 1500);
         this.dispatcher
-          .send(deliveryHead + body, { agentSlug: task.fromAgent !== 'clementine' ? task.fromAgent : undefined })
-          .catch((err) => logger.debug({ err, id: task.id }, 'Failed to dispatch background task result'));
+          .send(deliveryHead + body, this.dispatchContextForBackgroundTask(completed))
+          .catch((err) => logger.debug({ err, id: started.id }, 'Failed to dispatch background task result'));
       }).catch((err) => {
+        clearInterval(progressTimer);
         const errStr = String(err).slice(0, 500);
         try {
-          markBgTaskFailed(task.id, errStr, 'failed');
+          markBgTaskFailed(started.id, errStr, 'failed');
         } catch (saveErr) {
-          logger.warn({ err: saveErr, id: task.id }, 'Failed to mark background task failed');
+          logger.warn({ err: saveErr, id: started.id }, 'Failed to mark background task failed');
         }
+        const failed = loadBackgroundTask(started.id) ?? started;
         this.dispatcher
           .send(
-            `**Background task ${task.id} failed** — ${errStr.slice(0, 200)}`,
-            { agentSlug: task.fromAgent !== 'clementine' ? task.fromAgent : undefined },
+            `**Background task ${started.id} failed** — ${errStr.slice(0, 200)}`,
+            this.dispatchContextForBackgroundTask(failed),
           )
           .catch(() => { /* non-fatal */ });
       });

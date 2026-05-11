@@ -106,6 +106,29 @@ describe('runSkill autonomous auto-delegation (1.18.173)', () => {
     expect(agents['skill-worker'].prompt).toContain('Step 1: do X.');
   });
 
+  it('renders inputs and caller context into the worker prompt', async () => {
+    getSkillMock.mockReturnValue(fakeSkill({
+      frontmatter: {
+        name: 'rendered-skill',
+        description: 'Uses runtime values.',
+        clementine: { tools: { allow: ['Read'] } },
+      },
+      body: 'Review {{account_name}} and report back.',
+    }));
+
+    await runSkill('rendered-skill', {
+      source: 'scheduled-skill',
+      inputs: { account_name: 'Acme Legal' },
+      context: 'Triggered by weekly schedule.',
+    });
+
+    const [, opts] = runAgentMock.mock.calls[0];
+    const agents = (opts as { agents?: Record<string, { prompt?: string }> }).agents ?? {};
+    expect(agents['skill-worker'].prompt).toContain('Review Acme Legal and report back.');
+    expect(agents['skill-worker'].prompt).toContain('## Caller context');
+    expect(agents['skill-worker'].prompt).toContain('Triggered by weekly schedule.');
+  });
+
   it('uses the inline path for chat source (no auto-delegation)', async () => {
     getSkillMock.mockReturnValue(fakeSkill({
       frontmatter: {

@@ -4,7 +4,7 @@
  * Pure functions for resolving {{...}} placeholders in workflow step prompts.
  */
 
-import { OWNER_NAME, ASSISTANT_NAME, TIMEZONE } from '../config.js';
+import { OWNER_NAME, ASSISTANT_NAME, currentTimeZone } from '../config.js';
 import { dateKeyInTimeZone, formatTime24InTimeZone } from '../lib/time.js';
 
 /**
@@ -17,8 +17,9 @@ export function resolveStaticVariables(
   workflowName: string,
 ): string {
   const now = new Date();
-  const dateStr = dateKeyInTimeZone(now, TIMEZONE);
-  const timeStr = formatTime24InTimeZone(now, TIMEZONE);
+  const timezone = currentTimeZone();
+  const dateStr = dateKeyInTimeZone(now, timezone);
+  const timeStr = formatTime24InTimeZone(now, timezone);
 
   return template.replace(/\{\{([^}]+)\}\}/g, (match, key: string) => {
     const trimmed = key.trim();

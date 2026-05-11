@@ -958,6 +958,7 @@ async function asyncMain(): Promise<void> {
   // and plateau detection bound the work; we don't need finer granularity.
   try {
     const nodeCron = (await import('node-cron')).default;
+    const selfImproveTimeZone = config.currentTimeZone();
     nodeCron.schedule(`0 ${selfImproveHour} * * *`, () => {
       logger.info({ hour: selfImproveHour }, 'Nightly self-improve trigger firing');
       gateway.handleSelfImprove('run').then((summary) => {
@@ -965,20 +966,19 @@ async function asyncMain(): Promise<void> {
       }).catch((err) => {
         logger.error({ err }, 'Nightly self-improve trigger failed');
       });
-    }, { timezone: config.TIMEZONE });
-    logger.info({ hour: selfImproveHour, timezone: config.TIMEZONE }, `Self-improve nightly trigger scheduled (${selfImproveHour}:00 daily)`);
+    }, { timezone: selfImproveTimeZone });
+    logger.info({ hour: selfImproveHour, timezone: selfImproveTimeZone }, `Self-improve nightly trigger scheduled (${selfImproveHour}:00 daily)`);
   } catch (err) {
     logger.warn({ err }, 'Failed to schedule nightly self-improve trigger');
   }
 
   // Background-task hygiene: any task left in 'running' is from a prior
-  // process. Mark them aborted so the lifecycle is honest. (P6b will add
-  // resumability; for now fail-fast is clearer than silently re-running.)
+  // process. Mark it interrupted so the owner can resume it explicitly.
   try {
-    const { abortStaleRunningTasks } = await import('./agent/background-tasks.js');
-    const aborted = abortStaleRunningTasks();
-    if (aborted > 0) {
-      logger.info({ count: aborted }, 'Aborted stale running background tasks from prior daemon');
+    const { interruptStaleRunningTasks } = await import('./agent/background-tasks.js');
+    const interrupted = interruptStaleRunningTasks();
+    if (interrupted > 0) {
+      logger.info({ count: interrupted }, 'Interrupted stale running background tasks from prior daemon');
     }
   } catch (err) {
     logger.warn({ err }, 'Background task hygiene check failed — non-fatal');

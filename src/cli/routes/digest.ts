@@ -15,7 +15,7 @@ import path from 'node:path';
 import matter from 'gray-matter';
 import type { Gateway } from '../../gateway/router.js';
 import { listAllGoals } from '../../tools/shared.js';
-import { TIMEZONE } from '../../config.js';
+import { currentTimeZone } from '../../config.js';
 import { dateKeyInTimeZone, formatDateInTimeZone } from '../../lib/time.js';
 
 export interface DigestRouterDeps {
@@ -88,8 +88,9 @@ export function digestRouter(deps: DigestRouterDeps): Router {
     const prefs = getDigestPrefs(prefsFile);
     const secs = (prefs.sections || {}) as Record<string, boolean>;
     const now = new Date();
-    const dateStr = formatDateInTimeZone(now, TIMEZONE);
-    const todayKey = dateKeyInTimeZone(now, TIMEZONE);
+    const timezone = currentTimeZone();
+    const dateStr = formatDateInTimeZone(now, timezone);
+    const todayKey = dateKeyInTimeZone(now, timezone);
     const sections: Record<string, string> = {};
 
     let officeSummary = '';

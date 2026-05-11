@@ -315,7 +315,7 @@ export interface HeartbeatWorkItem {
  * unleashed cron-style job with the requesting agent's profile, then
  * notifies that agent's Discord channel on completion.
  *
- * Lifecycle: pending → running → (done | failed | aborted)
+ * Lifecycle: pending → running → (done | failed | aborted | interrupted)
  *
  * Persisted as ~/.clementine/background-tasks/<id>.json. The file is
  * the source of truth; status is updated in place as the task progresses.
@@ -326,13 +326,21 @@ export interface BackgroundTask {
   sessionKey?: string;        // Chat/session that requested the task, when user-visible
   prompt: string;             // The full task prompt
   maxMinutes: number;         // Hard wall-clock cap
-  status: 'pending' | 'running' | 'done' | 'failed' | 'aborted';
+  status: 'pending' | 'running' | 'done' | 'failed' | 'aborted' | 'interrupted';
   createdAt: string;          // ISO when the request was filed (status='pending')
   startedAt?: string;         // ISO when the daemon actually picked it up
   completedAt?: string;       // ISO when terminal status was reached
+  interruptedAt?: string;     // ISO when the daemon noticed the prior runner disappeared
+  resumedAt?: string;         // ISO when an interrupted task was queued again
+  resumeCount?: number;       // Number of explicit resume attempts
+  jobName?: string;           // Runtime job name used by the scheduler
+  runId?: string;             // SDK/EventLog run id when known
+  sdkSessionId?: string;      // SDK session id when known
+  lastNotifiedAt?: string;    // Last deterministic lifecycle notification
+  progressMessageCount?: number;
   result?: string;            // Final output (truncated to ~3KB on save)
   resultPath?: string;        // Full result markdown when result was too large for JSON
-  error?: string;             // If status='failed' or 'aborted'
+  error?: string;             // If status='failed', 'aborted', or 'interrupted'
   deliverableNote?: string;   // Optional vault path produced by the run
 }
 

@@ -54,7 +54,7 @@ export function registerBackgroundTaskTools(server: McpServer): void {
 
   server.tool(
     'get_background_task',
-    'Check the status of a background task. Returns its lifecycle state (pending|running|done|failed|aborted), how long it has been running, and the result/error if terminal.',
+    'Check the status of a background task. Returns its lifecycle state (pending|running|done|failed|aborted|interrupted), how long it has been running, and the result/error if terminal.',
     {
       task_id: z.string().describe('Task id returned by start_background_task (e.g., "bg-abc123-def4")'),
     },
@@ -102,14 +102,14 @@ export function registerBackgroundTaskTools(server: McpServer): void {
     'List background tasks, optionally filtered by status or originating agent. Newest first. Use to see what work is in flight or completed recently.',
     {
       status: z
-        .enum(['pending', 'running', 'done', 'failed', 'aborted'])
+        .enum(['pending', 'running', 'done', 'failed', 'aborted', 'interrupted'])
         .optional()
         .describe('Filter by lifecycle status'),
       from_agent: z.string().optional().describe('Filter by originating agent slug'),
       limit: z.number().optional().describe('Max number to return (default 20, max 100)'),
     },
     async ({ status, from_agent, limit }) => {
-      const filter: { status?: 'pending' | 'running' | 'done' | 'failed' | 'aborted'; fromAgent?: string } = {};
+      const filter: { status?: 'pending' | 'running' | 'done' | 'failed' | 'aborted' | 'interrupted'; fromAgent?: string } = {};
       if (status) filter.status = status;
       if (from_agent) filter.fromAgent = from_agent;
       const all = listBackgroundTasks(filter);

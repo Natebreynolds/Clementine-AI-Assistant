@@ -14,9 +14,11 @@ function makeGateway(hasPrompt: boolean): GatewayWithLocalTurn {
   const gateway = Object.create(Gateway.prototype) as Gateway & {
     assistant: { hasRecentApprovalPrompt: () => boolean };
     approvalResolvers: Map<string, (result: boolean | string) => void>;
+    sessions: Map<string, unknown>;
   };
   gateway.assistant = { hasRecentApprovalPrompt: () => hasPrompt };
   gateway.approvalResolvers = new Map();
+  gateway.sessions = new Map();
   return gateway as unknown as GatewayWithLocalTurn;
 }
 

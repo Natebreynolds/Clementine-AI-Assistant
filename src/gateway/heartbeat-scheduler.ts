@@ -44,7 +44,7 @@ import {
   AGENTS_DIR,
   HEARTBEAT_WORK_QUEUE_FILE,
   DISCORD_OWNER_ID,
-  TIMEZONE,
+  currentTimeZone,
 } from '../config.js';
 import { findGoalPath, listAllGoals } from '../tools/shared.js';
 import type { HeartbeatState, HeartbeatReportedTopic, HeartbeatWorkItem } from '../types.js';
@@ -294,7 +294,7 @@ export class HeartbeatScheduler {
     }).catch(err => logger.warn({ err }, 'Claim tracker import failed'));
 
     const now = new Date();
-    const hour = hourInTimeZone(now, TIMEZONE);
+    const hour = hourInTimeZone(now, currentTimeZone());
 
     // ── Nightly tasks: run regardless of active hours ─────────────────
     // These have their own hour/date guards and must fire outside active hours.
@@ -1297,7 +1297,7 @@ export class HeartbeatScheduler {
     if (!insight) return;
 
     // Urgency-based delivery
-    const hour = hourInTimeZone(new Date(), TIMEZONE);
+    const hour = hourInTimeZone(new Date(), currentTimeZone());
     const inActiveHours = hour >= HEARTBEAT_ACTIVE_START && hour < HEARTBEAT_ACTIVE_END;
     const ownerSessionKey = DISCORD_OWNER_ID && DISCORD_OWNER_ID !== '0'
       ? `discord:user:${DISCORD_OWNER_ID}`
@@ -1897,7 +1897,7 @@ export class HeartbeatScheduler {
   }
 
   static getTimeContext(hour: number): string {
-    const day = weekdayInTimeZone(new Date(), TIMEZONE);
+    const day = weekdayInTimeZone(new Date(), currentTimeZone());
     if (hour >= 8 && hour < 10) {
       return `${day} morning — Be forward-looking. Mention today's plan priorities, flag anything due today, set the tone for the day.`;
     } else if (hour >= 10 && hour < 14) {
@@ -1944,7 +1944,7 @@ export class HeartbeatScheduler {
     if (topics.length === 0) return '';
 
     const lines = topics.map((t) => {
-      const time = formatTimeInTimeZone(new Date(t.reportedAt), TIMEZONE);
+      const time = formatTimeInTimeZone(new Date(t.reportedAt), currentTimeZone());
       return `- ${time}: ${t.summary} [topic: ${t.topic}]`;
     });
     return `## Already Reported (do NOT repeat unless status changed)\n${lines.join('\n')}`;

@@ -13,7 +13,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID } from 'node:crypto';
-import { OWNER_NAME, BASE_DIR, TIMEZONE } from '../config.js';
+import { OWNER_NAME, BASE_DIR, currentTimeZone } from '../config.js';
 import type { SendPolicy } from '../types.js';
 import { formatTime24InTimeZone } from '../lib/time.js';
 
@@ -253,7 +253,7 @@ export function clearActiveQueryContext(): void {
 }
 
 export function logToolUse(toolName: string, toolInput: Record<string, unknown>): void {
-  const timestamp = formatTime24InTimeZone(new Date(), TIMEZONE);
+  const timestamp = formatTime24InTimeZone(new Date(), currentTimeZone());
   const summary = summarizeToolCall(toolName, toolInput);
   const entry = `- \`${timestamp}\` **${toolName}** — ${summary}`;
   auditLog.push(entry);
@@ -394,13 +394,14 @@ function evaluateSendPolicy(
   // 3. Business hours check
   if (policy.businessHoursOnly) {
     const now = new Date();
-    // Use system timezone (from config) for business hours check
+    const timeZone = currentTimeZone();
+    // Use the configured user timezone for business hours checks.
     const formatter = new Intl.DateTimeFormat('en-US', {
-      hour: 'numeric', hour12: false, timeZone: TIMEZONE || undefined,
+      hour: 'numeric', hour12: false, timeZone,
     });
     const hour = parseInt(formatter.format(now), 10);
     if (hour < 8 || hour >= 18) {
-      return { allowed: false, reason: `Outside business hours (8am–6pm ${TIMEZONE || 'local'}).`, policyRef: 'business_hours' };
+      return { allowed: false, reason: `Outside business hours (8am–6pm ${timeZone}).`, policyRef: 'business_hours' };
     }
   }
 

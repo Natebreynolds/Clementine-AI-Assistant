@@ -6,11 +6,13 @@ import {
   _deleteBackgroundTask,
   abortStaleRunningTasks,
   createBackgroundTask,
+  interruptStaleRunningTasks,
   listBackgroundTasks,
   loadBackgroundTask,
   markDone,
   markFailed,
   markRunning,
+  resumeBackgroundTask,
 } from '../src/agent/background-tasks.js';
 
 describe('background-tasks persistence helper', () => {
@@ -51,10 +53,11 @@ describe('background-tasks persistence helper', () => {
     const t = createBackgroundTask({ fromAgent: 'sasha', prompt: 'do it', maxMinutes: 5 }, { dir });
     expect(loadBackgroundTask(t.id, { dir })?.status).toBe('pending');
 
-    markRunning(t.id, { dir });
+    markRunning(t.id, { dir }, { jobName: `bg:${t.id}` });
     const r = loadBackgroundTask(t.id, { dir });
     expect(r?.status).toBe('running');
     expect(r?.startedAt).toBeTruthy();
+    expect(r?.jobName).toBe(`bg:${t.id}`);
     expect(r?.completedAt).toBeUndefined();
 
     markDone(t.id, 'all the data', 'vault/03-Projects/output.md', { dir });
@@ -151,22 +154,22 @@ describe('background-tasks persistence helper', () => {
     expect(fromA[0].id).toBe(a.id);
   });
 
-  it('abortStaleRunningTasks marks running tasks as aborted', () => {
+  it('interruptStaleRunningTasks marks running tasks as interrupted and resume requeues them', () => {
     const t1 = createBackgroundTask({ fromAgent: 'a', prompt: 'p1', maxMinutes: 5 }, { dir });
     const t2 = createBackgroundTask({ fromAgent: 'b', prompt: 'p2', maxMinutes: 5 }, { dir });
     markRunning(t1.id, { dir });
     markRunning(t2.id, { dir });
 
-    // We can't easily call abortStaleRunningTasks with a custom dir because it
-    // uses the default. Instead, verify behavior via the same helper directly.
-    const stuck = listBackgroundTasks({ status: 'running' }, { dir });
-    expect(stuck.length).toBe(2);
-    for (const s of stuck) {
-      markFailed(s.id, 'daemon restarted while task was in flight', 'aborted', { dir });
-    }
-    const aborted = listBackgroundTasks({ status: 'aborted' }, { dir });
-    expect(aborted.length).toBe(2);
-    expect(aborted[0].error).toMatch(/daemon restarted/);
+    expect(interruptStaleRunningTasks({ dir })).toBe(2);
+    const interrupted = listBackgroundTasks({ status: 'interrupted' }, { dir });
+    expect(interrupted.length).toBe(2);
+    expect(interrupted[0].error).toMatch(/daemon restarted/);
+    expect(interrupted[0].interruptedAt).toBeTruthy();
+
+    const resumed = resumeBackgroundTask(t1.id, { dir });
+    expect(resumed?.status).toBe('pending');
+    expect(resumed?.resumeCount).toBe(1);
+    expect(resumed?.error).toBeUndefined();
   });
 
   it('returns null for unknown task ids', () => {
