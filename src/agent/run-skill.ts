@@ -27,6 +27,7 @@
 
 import path from 'node:path';
 import pino from 'pino';
+import type { AgentDefinition } from '@anthropic-ai/claude-agent-sdk';
 
 import { getSkill } from './skill-store.js';
 import { runAgent } from './run-agent.js';
@@ -34,6 +35,7 @@ import type { RunAgentOptions } from './run-agent.js';
 import type { AgentProfile, Skill } from '../types.js';
 import type { AgentManager } from './agent-manager.js';
 import type { MemoryStore } from '../memory/store.js';
+import { MODELS } from '../config.js';
 
 const logger = pino({ name: 'clementine.run-skill' });
 
@@ -281,6 +283,146 @@ async function validateSkillOutput(
   }
 }
 
+// ── Autonomous delegation (1.18.173) ──────────────────────────────────
+
+/**
+ * Sources whose runs should default to the auto-delegating wrapper.
+ * In autonomous mode the parent agent immediately dispatches the entire
+ * skill body to a `skill-worker` subagent via the Agent tool. That keeps
+ * the parent's context tiny (no tool results ever land in it) so the SDK
+ * never has to compact mid-run, and post-compaction "refetch loops"
+ * become impossible — the parent never had the data to lose.
+ *
+ * Interactive sources ('chat', 'skill' invoked directly by a chat user)
+ * stay on the inline path: the user is waiting on output and the extra
+ * subagent dispatch latency is a worse UX tradeoff than the small
+ * compaction risk on a single conversational turn.
+ */
+const AUTONOMOUS_SOURCES = new Set([
+  'cron',
+  'scheduled-skill',
+  'heartbeat',
+  'team-task',
+]);
+
+/**
+ * Decide whether a runSkill call should use the auto-delegating
+ * (subagent) wrapper. Skills can opt out via frontmatter
+ * `clementine.execution.inline: true` for procedures the author has
+ * verified fit cleanly in one context (e.g., a 2-line script call).
+ */
+function shouldAutoDelegate(skill: Skill, source: string): boolean {
+  if (!AUTONOMOUS_SOURCES.has(source)) return false;
+  const execMode = (skill.frontmatter?.clementine as { execution?: { inline?: boolean } } | undefined)?.execution?.inline;
+  if (execMode === true) return false;
+  return true;
+}
+
+/**
+ * Resolve the model string to use for an autonomous run. The 1M-context
+ * variant gives the worker subagent 5× the room of the standard 200K
+ * window — enough headroom that compaction is rare and the
+ * "refetch-after-compact" loop pattern (seen in the 2026-05-11
+ * imessage-triage failures) never occurs in practice.
+ *
+ * The actual 1M routing is gated by the user's plan (see
+ * config.ts:usesOneMillionContext) and the model family — Haiku doesn't
+ * support 1M, and Sonnet 1M needs the [1m] suffix. We return the full
+ * Sonnet model ID with [1m] appended; downstream
+ * normalizeClaudeSdkOptionsForOneMillionContext strips it back off when
+ * the plan doesn't support it.
+ */
+function resolveAutonomousModel(
+  explicitModel: string | undefined,
+  skillModel: string | undefined,
+): string | undefined {
+  // Caller's explicit model wins.
+  if (explicitModel) return explicitModel;
+  // Skill-declared model wins next.
+  if (skillModel) return skillModel;
+  // Default: Sonnet [1m]. The normalizer will strip [1m] if the user's
+  // plan doesn't include it, falling back to standard Sonnet — still
+  // works, just with less headroom.
+  const base = MODELS.sonnet;
+  if (!base) return undefined;
+  if (/\[1m\]/i.test(base)) return base;
+  return `${base}[1m]`;
+}
+
+/**
+ * Build the AgentDefinition for the `skill-worker` subagent that
+ * executes this skill in an isolated context. The subagent's system
+ * prompt is the skill body; its tools are the skill's computed
+ * allowlist; its model is the same 1M-context model the parent uses
+ * (the worker is where the real data flows — the parent stays tiny).
+ *
+ * `description` is what the SDK shows the parent for routing decisions.
+ * Since the parent is `forceSubagent`'d to this worker, the description
+ * mostly serves as transcript context.
+ */
+function buildSkillWorkerAgent(
+  skill: Skill,
+  effectiveTools: string[],
+  model: string | undefined,
+  workerMaxTurns: number,
+): AgentDefinition {
+  const def: AgentDefinition = {
+    description:
+      `Executes the "${skill.frontmatter.name}" scheduled skill end-to-end in an isolated context window. ` +
+      `Reads any data the skill needs, processes it, performs the skill's described delivery action ` +
+      `(e.g., sends a Discord/Slack notification), and returns a concise summary to the orchestrator.`,
+    prompt:
+      `You are the worker subagent for the "${skill.frontmatter.name}" scheduled skill.\n\n` +
+      `Your job is to execute the procedure below from start to finish in a single subagent run. ` +
+      `You have your own isolated context window — do NOT save state for a parent agent; if the ` +
+      `procedure calls for sending a notification, YOU send it (you have the relevant tools).\n\n` +
+      `Return a single concise final response describing what happened (e.g., "Sent Discord DM about ` +
+      `2 actionable items, ignored 8 spam"). Do not return raw tool output; do not narrate every step. ` +
+      `If nothing actionable was found and the procedure says exit silently, return "No action needed."\n\n` +
+      `## Procedure\n\n${skill.body}`,
+    tools: effectiveTools,
+    // SDK accepts 'sonnet' / 'opus' / 'haiku' tier aliases OR full model
+    // IDs. We pass the full ID with [1m] when present; the SDK strips
+    // [1m] internally for plans that don't support it.
+    ...(model ? { model } : {}),
+    effort: 'medium' as const,
+    maxTurns: workerMaxTurns,
+  };
+  return def;
+}
+
+/**
+ * Build the parent orchestrator's prompt. The parent has exactly one
+ * job: dispatch to `skill-worker` via the Agent tool and relay its
+ * return. Keeping this prompt under ~600 bytes is important — the
+ * parent's context grows by the parent prompt + the worker's final
+ * return text (typically <2KB). Total parent context per run: ~3KB.
+ * Well below any compaction threshold even on a 200K-window model.
+ */
+function buildOrchestratorPrompt(
+  skill: Skill,
+  callerContext: string | undefined,
+): string {
+  const parts: string[] = [
+    `## Scheduled Skill Execution`,
+    ``,
+    `Dispatch the "${skill.frontmatter.name}" skill to the \`skill-worker\` subagent via the Agent tool.`,
+    `The worker has the skill body as its system prompt and the tools required to perform the procedure end-to-end (including any notification delivery).`,
+    ``,
+    `## Your job`,
+    ``,
+    `1. Call the Agent tool ONCE, dispatching to "skill-worker" with this brief: "Execute the ${skill.frontmatter.name} procedure now."`,
+    `2. Wait for its return.`,
+    `3. Relay its summary as your final response — do not add commentary, do not re-do its work.`,
+    ``,
+    `Do NOT call any other tools directly. The worker handles all data access and delivery.`,
+  ];
+  if (callerContext && callerContext.trim()) {
+    parts.push('', '## Caller context (forward this to the worker if relevant)', '', callerContext.trim());
+  }
+  return parts.join('\n');
+}
+
 // ── The primitive ─────────────────────────────────────────────────────
 
 /**
@@ -292,6 +434,13 @@ async function validateSkillOutput(
  * `clementine.tools.allow` + auto-extracted MCP refs + a small baseline.
  * After the SDK returns, `clementine.success.schema` (when set) is
  * ajv-validated against the response.
+ *
+ * **Autonomous runs (1.18.173)**: When `source` is one of
+ * AUTONOMOUS_SOURCES, the skill runs through the auto-delegating
+ * wrapper: a thin parent dispatches to a `skill-worker` subagent which
+ * does all the work in its own context. Closes the
+ * "refetch-after-compaction" loop class permanently. Skills can opt out
+ * via frontmatter `clementine.execution.inline: true`.
  *
  * This function never throws — failures (skill not found, SDK error,
  * timeout) are returned as `{ ok: false, error }`. The caller (chat,
@@ -316,7 +465,18 @@ export async function runSkill(
 
   const effectiveTools = computeSkillAllowlist(skill);
   const hasExplicitToolScope = skillHasExplicitToolScope(skill);
-  const prompt = buildSkillPrompt(skill, options.inputs, options.context);
+  const source = options.source ?? 'skill';
+
+  // 1.18.173: autonomous runs (cron, scheduled-skill, heartbeat,
+  // team-task) wrap the skill in a thin orchestrator that dispatches
+  // the entire procedure to a `skill-worker` subagent. The parent's
+  // context never grows past ~3KB regardless of how much data the
+  // skill reads, so post-compaction refetch loops are structurally
+  // impossible. See shouldAutoDelegate / buildSkillWorkerAgent above.
+  const autoDelegate = shouldAutoDelegate(skill, source);
+  const prompt = autoDelegate
+    ? buildOrchestratorPrompt(skill, options.context)
+    : buildSkillPrompt(skill, options.inputs, options.context);
 
   const limits = skill.frontmatter?.clementine?.limits;
   const maxTurns = options.maxTurns ?? limits?.maxTurns;
@@ -336,6 +496,15 @@ export async function runSkill(
     t === 'Write' || t === 'Edit' || t === 'Bash' || /__(write|edit|update|create|delete|send|post|patch|set)/i.test(t),
   );
 
+  // 1.18.173: resolve the effective model. Autonomous runs default to
+  // Sonnet [1m] (1M context window) so the worker subagent has 5× the
+  // room of a standard 200K-window model. resolveAutonomousModel honors
+  // explicit overrides + skill-declared limits.model first.
+  const skillModel = (skill.frontmatter?.clementine?.limits as { model?: string } | undefined)?.model;
+  const effectiveModel = autoDelegate
+    ? resolveAutonomousModel(options.model, skillModel)
+    : (options.model ?? skillModel);
+
   logger.info({
     skill: name,
     tools: effectiveTools,
@@ -343,6 +512,9 @@ export async function runSkill(
     maxBudgetUsd,
     inputKeys: Object.keys(options.inputs ?? {}),
     hasContext: !!options.context,
+    autoDelegate,
+    model: effectiveModel,
+    source,
   }, 'runSkill: invoking');
 
   let runResult;
@@ -357,24 +529,76 @@ export async function runSkill(
       ].filter(Boolean).join('\n\n'),
       profile: options.profile,
     });
-    const allowedToolsForRun = hasExplicitToolScope ? effectiveTools : undefined;
-    const sdkOpts: RunAgentOptions = {
-      sessionKey,
-      source: options.source ?? 'skill',
-      ...(allowedToolsForRun ? { allowedTools: allowedToolsForRun } : {}),
-      profile: options.profile,
-      agentManager: options.agentManager,
-      memoryStore: options.memoryStore,
-      cwd: options.projectWorkDir,
-      extraMcpServers: mcp.servers as unknown as RunAgentOptions['extraMcpServers'],
-      enableFileCheckpointing: mutatingSkill || Boolean(options.projectWorkDir),
-      ...(options.model ? { model: options.model } : {}),
-      ...(typeof maxTurns === 'number' ? { maxTurns } : {}),
-      ...(typeof maxBudgetUsd === 'number' ? { maxBudgetUsd } : {}),
-      ...(additionalDirectories.length > 0 ? { additionalDirectories } : {}),
-      ...(options.onText ? { onText: options.onText } : {}),
-      ...(options.abortSignal ? { abortSignal: options.abortSignal } : {}),
-    };
+
+    // ── Autonomous-delegation branch (1.18.173) ──────────────────────
+    // Parent: minimal allowedTools (Agent only) + forceSubagent to
+    // skill-worker. Worker: full tool surface + skill body as system
+    // prompt. Worker is the SDK AgentDefinition; the SDK wires its
+    // tools/model/prompt at query time.
+    let sdkOpts: RunAgentOptions;
+    if (autoDelegate) {
+      // Worker gets enough turns to complete bulk work (skill author's
+      // maxTurns cap, or 30 as a safe default for triage-class work).
+      const workerMaxTurns = (typeof maxTurns === 'number' && maxTurns > 0) ? maxTurns : 30;
+      const workerDef = buildSkillWorkerAgent(skill, effectiveTools, effectiveModel, workerMaxTurns);
+
+      sdkOpts = {
+        sessionKey,
+        source,
+        // Parent's allowedTools: ONLY Agent (delegate-or-fail). Keeps
+        // the parent's context shape predictable and prevents it from
+        // doing data-heavy work itself even if the LLM disagrees.
+        allowedTools: ['Agent'],
+        // Force-routing: SDK wraps the prompt with "Use the skill-worker
+        // agent to handle this request" so dispatch is the natural
+        // first action.
+        forceSubagent: 'skill-worker',
+        // Inject the skill-worker into the agents map. runAgent merges
+        // its `buildAgentMap()` defaults with whatever's passed via
+        // opts.agents — see run-agent.ts:362.
+        agents: { 'skill-worker': workerDef },
+        profile: options.profile,
+        agentManager: options.agentManager,
+        memoryStore: options.memoryStore,
+        cwd: options.projectWorkDir,
+        extraMcpServers: mcp.servers as unknown as RunAgentOptions['extraMcpServers'],
+        enableFileCheckpointing: mutatingSkill || Boolean(options.projectWorkDir),
+        // Parent uses the same model family so MCP server reuse is clean
+        // (the SDK keys some cache state by model). Parent turns are
+        // tightly capped: it should dispatch and relay in ≤3 turns.
+        ...(effectiveModel ? { model: effectiveModel } : {}),
+        maxTurns: 5,
+        ...(typeof maxBudgetUsd === 'number' ? { maxBudgetUsd } : {}),
+        ...(additionalDirectories.length > 0 ? { additionalDirectories } : {}),
+        ...(options.onText ? { onText: options.onText } : {}),
+        ...(options.abortSignal ? { abortSignal: options.abortSignal } : {}),
+      };
+    } else {
+      // ── Inline branch (interactive / opt-out skills) ────────────────
+      // Original 1.18.162 behavior — the SDK call runs the skill body
+      // directly as the main-agent prompt. Used for chat-invoked skills
+      // where the latency of a subagent dispatch is worse UX than the
+      // small compaction risk.
+      const allowedToolsForRun = hasExplicitToolScope ? effectiveTools : undefined;
+      sdkOpts = {
+        sessionKey,
+        source,
+        ...(allowedToolsForRun ? { allowedTools: allowedToolsForRun } : {}),
+        profile: options.profile,
+        agentManager: options.agentManager,
+        memoryStore: options.memoryStore,
+        cwd: options.projectWorkDir,
+        extraMcpServers: mcp.servers as unknown as RunAgentOptions['extraMcpServers'],
+        enableFileCheckpointing: mutatingSkill || Boolean(options.projectWorkDir),
+        ...(effectiveModel ? { model: effectiveModel } : {}),
+        ...(typeof maxTurns === 'number' ? { maxTurns } : {}),
+        ...(typeof maxBudgetUsd === 'number' ? { maxBudgetUsd } : {}),
+        ...(additionalDirectories.length > 0 ? { additionalDirectories } : {}),
+        ...(options.onText ? { onText: options.onText } : {}),
+        ...(options.abortSignal ? { abortSignal: options.abortSignal } : {}),
+      };
+    }
+
     runResult = await runAgent(prompt, sdkOpts);
   } catch (err) {
     logger.error({ err, skill: name }, 'runSkill: SDK call failed');

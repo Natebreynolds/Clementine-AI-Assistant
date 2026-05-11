@@ -94,6 +94,7 @@ import {
   TOOL_OUTPUT_GUARD,
 } from '../config.js';
 import { buildGuardHooks, type ToolOutputGuardConfig } from './tool-output-guard.js';
+import { buildDedupHook } from './tool-call-dedup.js';
 import type { AgentProfile } from '../types.js';
 import type { AgentManager } from './agent-manager.js';
 import type { MemoryStore } from '../memory/store.js';
@@ -356,13 +357,20 @@ export async function runAgent(prompt: string, opts: RunAgentOptions): Promise<R
       : undefined;
   const startedAt = Date.now();
 
-  // Build the AgentDefinition map. Caller can override; otherwise we
-  // use the standard system subagents + hired-agent profiles.
-  const agents = opts.agents ?? buildAgentMap({
+  // Build the AgentDefinition map.
+  // - Default: planner/researcher/cron-fixer + hired-agent profiles.
+  // - Caller-supplied agents (opts.agents) MERGE over the defaults rather
+  //   than REPLACE them (1.18.173). `runSkill`'s auto-delegation path
+  //   needs to inject a per-run `skill-worker` definition while keeping
+  //   the planner/researcher/etc. available for deeper delegation.
+  //   Tests that want a fully isolated map pass an explicit override
+  //   via the `replaceAgents` option below.
+  const defaultAgents = buildAgentMap({
     profileManager: opts.agentManager ?? undefined,
     isAutonomous: source === 'cron' || source === 'heartbeat',
     activeAgentSlug: opts.profile?.slug,
   });
+  const agents = opts.agents ? { ...defaultAgents, ...opts.agents } : defaultAgents;
 
   // Wrap prompt to direct Claude to a specific subagent when caller asks.
   // Per SDK docs: explicit invocation = "Use the X agent to..."
@@ -508,6 +516,35 @@ export async function runAgent(prompt: string, opts: RunAgentOptions): Promise<R
       })
     : { hooks: {}, stats: { inspected: 0, compressed: 0, ceilingHits: 0, bytesShed: 0, compactions: 0 } };
 
+  // ── Tool-call dedup hook (1.18.173) ─────────────────────────────────
+  // Breaks the "re-fetch after compaction" loop that crashed the
+  // imessage-triage cron on 2026-05-11 (4× identical tool calls →
+  // SDK autocompact-thrashing abort). PreToolUse hook detects same
+  // (toolName, inputHash) within 60s: 2nd call gets a soft hint, 3rd+
+  // is denied so the model can't burn turns re-calling the same data.
+  // Defense-in-depth — the cleaner fix (delegating to a subagent so the
+  // parent never re-fetches in the first place) lives in run-skill.ts.
+  const dedup = buildDedupHook({
+    runId,
+    onDecision: (info) => {
+      if (info.decision === 'allow') return;
+      writeEvent({
+        kind: 'error',
+        ts: new Date().toISOString(),
+        sessionId,
+        toolError: `_clementine_dedup:${info.decision} ${info.toolName} call#${info.callCount} @${info.sinceFirstMs}ms`,
+      });
+    },
+  });
+
+  // Merge hook maps from the two modules. SDK accepts arrays of
+  // HookCallbackMatcher per event; we concatenate.
+  const mergedHooks: typeof guard.hooks = { ...guard.hooks };
+  for (const [evt, matchers] of Object.entries(dedup.hooks) as Array<[keyof typeof dedup.hooks, NonNullable<typeof dedup.hooks[keyof typeof dedup.hooks]>]>) {
+    const existing = mergedHooks[evt] ?? [];
+    mergedHooks[evt] = [...existing, ...matchers];
+  }
+
   // Apply 1M-context env normalization (existing infra)
   const sdkOptionsRaw = {
     systemPrompt: profileAppend
@@ -548,10 +585,11 @@ export async function runAgent(prompt: string, opts: RunAgentOptions): Promise<R
     ...(opts.additionalDirectories && opts.additionalDirectories.length > 0
       ? { additionalDirectories: opts.additionalDirectories }
       : {}),
-    // 1.18.169 — install the tool-output guard hooks. SDK types accept
-    // `hooks` keyed by HookEvent; the empty object is a no-op when the
-    // guard is disabled.
-    ...(Object.keys(guard.hooks).length > 0 ? { hooks: guard.hooks } : {}),
+    // 1.18.169 — install the tool-output guard hooks.
+    // 1.18.173 — merged with the tool-call dedup hooks (PreToolUse).
+    // SDK types accept `hooks` keyed by HookEvent; the empty object is
+    // a no-op when both guards are disabled.
+    ...(Object.keys(mergedHooks).length > 0 ? { hooks: mergedHooks } : {}),
   };
 
   const sdkOptions = normalizeClaudeSdkOptionsForOneMillionContext(sdkOptionsRaw);
@@ -808,6 +846,14 @@ export async function runAgent(prompt: string, opts: RunAgentOptions): Promise<R
       bytesShed: guard.stats.bytesShed,
       compactions: guard.stats.compactions,
       ceilingHits: guard.stats.ceilingHits,
+    } : undefined,
+    // 1.18.173 — tool-call dedup summary. Non-zero warned/blocked means
+    // the model tried to re-fetch identical data (typically a
+    // post-compaction refetch loop).
+    dedup: dedup.stats.inspected > 0 ? {
+      inspected: dedup.stats.inspected,
+      warned: dedup.stats.warned,
+      blocked: dedup.stats.blocked,
     } : undefined,
   }, 'runAgent: query complete');
 
