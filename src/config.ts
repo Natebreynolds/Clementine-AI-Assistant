@@ -506,6 +506,43 @@ export const TASK_BUDGET_TOKENS = {
   chat: optionalTokenEnv('TASK_BUDGET_CHAT', undefined),
 };
 
+// ── Tool-output context guard (1.18.169) ─────────────────────────────
+// Caps the per-tool-call size that reaches the model's context window.
+// Implements Anthropic's recommended PostToolUse hook pattern to prevent
+// runaway MCP-tool outputs (Outlook inbox dumps, iMessage history,
+// Salesforce list queries) from thrashing the SDK auto-compactor.
+// Tunable via env or clementine.json `toolOutputGuard.*`. Per-tool
+// overrides live in clementine.json `toolOutputGuard.perTool`.
+//
+// softLimitBytes: typical cap — adaptive scaling can lower this when
+//                 cumulative context usage is already high (≥50% → ×0.5).
+// hardLimitBytes: feasibility ceiling — never exceeded regardless of
+//                 model, plan, or 1M context availability. Three of
+//                 these back-to-back would still fit in a 200K window
+//                 with margin for the model's own response.
+function boolEnv(name: string, jsonValue: boolean | undefined, fallback: boolean): boolean {
+  const raw = getEnv(name, '').trim().toLowerCase();
+  if (raw === '1' || raw === 'true' || raw === 'on' || raw === 'yes') return true;
+  if (raw === '0' || raw === 'false' || raw === 'off' || raw === 'no') return false;
+  if (typeof jsonValue === 'boolean') return jsonValue;
+  return fallback;
+}
+export const TOOL_OUTPUT_GUARD = {
+  enabled: boolEnv('TOOL_OUTPUT_GUARD_ENABLED', json.toolOutputGuard?.enabled, true),
+  softLimitBytes: getEnvOrJsonNumber(
+    'TOOL_OUTPUT_GUARD_SOFT_BYTES',
+    json.toolOutputGuard?.softLimitBytes,
+    30_000,
+  ),
+  hardLimitBytes: getEnvOrJsonNumber(
+    'TOOL_OUTPUT_GUARD_HARD_BYTES',
+    json.toolOutputGuard?.hardLimitBytes,
+    200_000,
+  ),
+  adaptive: boolEnv('TOOL_OUTPUT_GUARD_ADAPTIVE', json.toolOutputGuard?.adaptive, true),
+  perTool: { ...(json.toolOutputGuard?.perTool ?? {}) } as Record<string, number>,
+};
+
 export const DEFAULT_MODEL_TIER = (getEnvOrJson('DEFAULT_MODEL_TIER', json.models?.default, 'sonnet')) as keyof Models;
 export const MODEL = MODELS[DEFAULT_MODEL_TIER] ?? MODELS.sonnet;
 

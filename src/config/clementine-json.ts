@@ -71,6 +71,29 @@ export const clementineJsonSchema = z.object({
     cronT2: z.number().nonnegative().optional(),
     chat: z.number().nonnegative().optional(),
   }).optional(),
+  /**
+   * Tool-output context-protection caps (1.18.169).
+   *
+   * Every SDK `tool_result` larger than the limit gets compressed in a
+   * PostToolUse hook before the model sees it. The full result is archived
+   * to disk so the model can `Read` it surgically if needed.
+   *
+   * Defaults (apply when fields are absent):
+   *   softLimitBytes = 30_000   — typical per-call cap (matches DEFAULT_OUTPUT_MAX_CHARS).
+   *   hardLimitBytes = 200_000  — feasibility ceiling — never exceeded regardless of context.
+   *   adaptive       = true     — shrink the soft cap as session usage climbs (≥50% used → ×0.5).
+   *   perTool        = {}       — per-tool overrides (`{ <toolName>: bytes }`).
+   *                                Tool names match the SDK `tool_name` field;
+   *                                MCP tools look like `mcp__<server>__<tool>`.
+   */
+  toolOutputGuard: z.object({
+    softLimitBytes: z.number().int().positive().optional(),
+    hardLimitBytes: z.number().int().positive().optional(),
+    adaptive: z.boolean().optional(),
+    perTool: z.record(z.string(), z.number().int().positive()).optional(),
+    /** Set to false to disable the hook entirely (last-resort escape hatch). */
+    enabled: z.boolean().optional(),
+  }).optional(),
   heartbeat: z.object({
     intervalMinutes: z.number().int().positive().optional(),
     activeStart: z.number().int().min(0).max(23).optional(),

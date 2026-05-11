@@ -91,7 +91,9 @@ import {
   CLAUDE_CODE_OAUTH_TOKEN,
   ANTHROPIC_API_KEY as CONFIG_ANTHROPIC_API_KEY,
   normalizeClaudeSdkOptionsForOneMillionContext,
+  TOOL_OUTPUT_GUARD,
 } from '../config.js';
+import { buildGuardHooks, type ToolOutputGuardConfig } from './tool-output-guard.js';
 import type { AgentProfile } from '../types.js';
 import type { AgentManager } from './agent-manager.js';
 import type { MemoryStore } from '../memory/store.js';
@@ -254,6 +256,13 @@ export interface RunAgentOptions {
    *  team-task) keep the prompt small. When unset, falls back to
    *  profile.systemPromptBody (legacy single-source behavior). */
   systemPromptAppend?: string;
+
+  /** Per-run override for the tool-output-guard config (1.18.169).
+   *  Defaults come from src/config.ts TOOL_OUTPUT_GUARD (env +
+   *  clementine.json). Pass null to disable the guard for this run
+   *  (rarely needed — almost always a sign that perTool overrides
+   *  would be safer). */
+  toolOutputGuard?: Partial<ToolOutputGuardConfig> | null;
 }
 
 export interface RunAgentResult {
@@ -435,6 +444,70 @@ export async function runAgent(prompt: string, opts: RunAgentOptions): Promise<R
     }
   }
 
+  // PRD §6 / 1.18.85: stable run id created before sdkOptions so the
+  // tool-output guard (1.18.169) can namespace its on-disk archive by
+  // runId. EventLog writers below also reference this id.
+  const runId = randomUUID();
+  const eventLog = new EventLog();
+  let eventSeq = 0;
+  const writeEvent = (e: Omit<RunEvent, 'runId' | 'seq'>): void => {
+    try {
+      eventLog.append({
+        ...e,
+        runId,
+        seq: eventSeq++,
+      } as RunEvent);
+    } catch { /* never block */ }
+  };
+
+  // ── Tool-output guard hooks (1.18.169) ─────────────────────────────
+  // Bounds the per-tool-call output that reaches the model so SDK
+  // auto-compaction never thrashes on a runaway MCP result. The hook
+  // ALSO mirrors compression events into the run's EventLog so the Run
+  // detail page can show "[guard] outlook_inbox: 412KB → 28KB" badges.
+  // Per-run config merges over the static TOOL_OUTPUT_GUARD defaults;
+  // pass opts.toolOutputGuard = null to opt out entirely.
+  //
+  // `mostRecentUsageTokens` is updated from each assistant message's
+  // usage block (input + cache_read + cache_creation tokens). The
+  // window estimate is a conservative 180K — even 1M-context runs
+  // benefit from staying near 200K because compaction kicks in
+  // earlier and tools.outputs amplify thrash regardless of window.
+  let mostRecentUsageTokens = 0;
+  const usageWindowEstimate = 180_000; // tokens, conservative
+  const guardConfig: ToolOutputGuardConfig | null = opts.toolOutputGuard === null
+    ? null
+    : {
+        softLimitBytes: opts.toolOutputGuard?.softLimitBytes ?? TOOL_OUTPUT_GUARD.softLimitBytes,
+        hardLimitBytes: opts.toolOutputGuard?.hardLimitBytes ?? TOOL_OUTPUT_GUARD.hardLimitBytes,
+        adaptive: opts.toolOutputGuard?.adaptive ?? TOOL_OUTPUT_GUARD.adaptive,
+        perTool: { ...TOOL_OUTPUT_GUARD.perTool, ...(opts.toolOutputGuard?.perTool ?? {}) },
+      };
+  const guard = guardConfig
+    ? buildGuardHooks({
+        runId,
+        config: guardConfig,
+        usageRatio: () => mostRecentUsageTokens / usageWindowEstimate,
+        onCompress: (info) => {
+          writeEvent({
+            kind: 'tool_result',
+            ts: new Date().toISOString(),
+            sessionId,
+            toolUseId: info.toolUseId,
+            toolResult: {
+              _clementine_guard: true,
+              tool: info.toolName,
+              originalBytes: info.originalBytes,
+              capBytes: info.capBytes,
+              bytesShed: info.bytesShed,
+              ceilingHit: info.ceilingHit,
+              ...(info.archivePath ? { archivePath: info.archivePath } : {}),
+            },
+          });
+        },
+      })
+    : { hooks: {}, stats: { inspected: 0, compressed: 0, ceilingHits: 0, bytesShed: 0, compactions: 0 } };
+
   // Apply 1M-context env normalization (existing infra)
   const sdkOptionsRaw = {
     systemPrompt: profileAppend
@@ -475,6 +548,10 @@ export async function runAgent(prompt: string, opts: RunAgentOptions): Promise<R
     ...(opts.additionalDirectories && opts.additionalDirectories.length > 0
       ? { additionalDirectories: opts.additionalDirectories }
       : {}),
+    // 1.18.169 — install the tool-output guard hooks. SDK types accept
+    // `hooks` keyed by HookEvent; the empty object is a no-op when the
+    // guard is disabled.
+    ...(Object.keys(guard.hooks).length > 0 ? { hooks: guard.hooks } : {}),
   };
 
   const sdkOptions = normalizeClaudeSdkOptionsForOneMillionContext(sdkOptionsRaw);
@@ -494,22 +571,9 @@ export async function runAgent(prompt: string, opts: RunAgentOptions): Promise<R
     mcpServerCount: Object.keys(mcpServers).length,
   }, 'runAgent: starting query');
 
-  // PRD §6 / 1.18.85: path A in-process tap. One Event row per significant
-  // SDK message, written to ~/.clementine/events/<runId>.jsonl. The Run
-  // detail page (Phase 4b) reads from this file. EventLog.append never
-  // throws back to the caller — telemetry is best-effort.
-  const runId = randomUUID();
-  const eventLog = new EventLog();
-  let eventSeq = 0;
-  const writeEvent = (e: Omit<RunEvent, 'runId' | 'seq'>): void => {
-    try {
-      eventLog.append({
-        ...e,
-        runId,
-        seq: eventSeq++,
-      } as RunEvent);
-    } catch { /* never block */ }
-  };
+  // PRD §6 / 1.18.85: path A in-process tap. runId / eventLog / writeEvent
+  // are declared earlier (above sdkOptionsRaw) because the tool-output
+  // guard's onCompress callback needs them at hook-registration time.
 
   let finalText = '';
   let sessionId = '';
@@ -551,6 +615,21 @@ export async function runAgent(prompt: string, opts: RunAgentOptions): Promise<R
 
     if (message.type === 'assistant') {
       const am = message as SDKAssistantMessage;
+      // 1.18.169 — capture this turn's usage so the tool-output guard can
+      // adaptively tighten its cap as cumulative context climbs. We sum
+      // input + cache_read + cache_creation because all three count
+      // against the model's window for the NEXT turn. Output_tokens isn't
+      // included — it's not retained in context after the model response
+      // is processed.
+      const tokenUsage = (am.message as { usage?: { input_tokens?: number; cache_read_input_tokens?: number; cache_creation_input_tokens?: number } } | undefined)?.usage;
+      if (tokenUsage) {
+        const recent = (tokenUsage.input_tokens ?? 0)
+          + (tokenUsage.cache_read_input_tokens ?? 0)
+          + (tokenUsage.cache_creation_input_tokens ?? 0);
+        if (Number.isFinite(recent) && recent > 0) {
+          mostRecentUsageTokens = recent;
+        }
+      }
       // SDK content blocks include text, tool_use, and (when extended-thinking
       // is enabled) thinking. We tap each kind into the Event store.
       const blocks = (am.message?.content ?? []) as Array<{ type: string; text?: string; name?: string; input?: Record<string, unknown>; id?: string; thinking?: string }>;
@@ -721,6 +800,15 @@ export async function runAgent(prompt: string, opts: RunAgentOptions): Promise<R
     totalCostUsd: Number(totalCostUsd.toFixed(4)),
     durationMs: Date.now() - startedAt,
     finalTextChars: finalText.length,
+    // 1.18.169 — tool-output guard summary, surfaced for observability.
+    // Non-zero `compressed` means the guard kept the SDK from thrashing.
+    guard: guard.stats.inspected > 0 ? {
+      inspected: guard.stats.inspected,
+      compressed: guard.stats.compressed,
+      bytesShed: guard.stats.bytesShed,
+      compactions: guard.stats.compactions,
+      ceilingHits: guard.stats.ceilingHits,
+    } : undefined,
   }, 'runAgent: query complete');
 
   // PRD §6 Phase 4e: subagent transcript backfill (Path C). The SDK persists
