@@ -19147,12 +19147,16 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
           },
         };
         window.RoutinesUI = R;
+        var priorSwitchBuildTab = window.switchBuildTab;
         // Real switchBuildTab — toggles between Scheduled Tasks (cron) and
         // Workflows / RoutinesUI sub-panes. Called from KPI tiles,
         // getting-started cards, and navigateTo('build', { tab: 'crons' }).
         // Default tab is 'crons' so users land on the scheduled-task surface
         // (with the capability strip + Preview) which is what most users want.
         window.switchBuildTab = function(tab) {
+          if (tab !== 'workflows' && tab !== 'crons' && typeof priorSwitchBuildTab === 'function') {
+            return priorSwitchBuildTab(tab);
+          }
           var which = (tab === 'workflows') ? 'workflows' : 'crons';
           var crons = document.getElementById('build-tab-crons');
           var work = document.getElementById('build-tab-workflows');
@@ -21285,8 +21289,8 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
           <button class="btn-secondary" onclick="openSkillStudio()" style="font-size:13px;padding:8px 14px;border-radius:6px;border:1px solid var(--border);background:var(--bg-secondary);color:var(--text-primary);font-weight:500;cursor:pointer;display:inline-flex;align-items:center;gap:6px" title="Open the conversational Skill Studio">
             Open Studio
           </button>
-          <button class="btn-primary" onclick="openCreateSkillModal()" style="font-size:13px;padding:8px 14px;border-radius:6px;border:none;background:var(--accent);color:#fff;font-weight:500;cursor:pointer;display:inline-flex;align-items:center;gap:6px">
-            Manual
+          <button class="btn-primary" onclick="openCreateSkillModalFromComposer()" style="font-size:13px;padding:8px 14px;border-radius:6px;border:none;background:var(--accent);color:#fff;font-weight:500;cursor:pointer;display:inline-flex;align-items:center;gap:6px" title="Open a clean blank skill editor">
+            Blank skill
           </button>
         </div>
       </div>
@@ -21308,6 +21312,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
             <label id="skill-composer-anchor-label" for="skill-composer-anchor" style="display:block;font-size:11px;font-weight:600;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.04em;margin-bottom:6px">Anchor</label>
             <input id="skill-composer-anchor" list="skill-composer-anchor-options" oninput="updateSkillComposerDraftState()" placeholder="Optional tool, project, command, or memory source" style="width:100%;box-sizing:border-box;padding:9px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg-primary);color:var(--text-primary);font-size:12px">
             <datalist id="skill-composer-anchor-options"></datalist>
+            <div id="skill-composer-anchor-summary" style="margin-top:8px;min-height:22px;font-size:11px;color:var(--text-muted);line-height:1.45">No starting point selected.</div>
             <div style="display:flex;align-items:center;justify-content:flex-end;gap:8px;margin-top:12px">
               <button type="button" class="btn-secondary" onclick="openSkillStudio()" style="font-size:12px;padding:7px 12px;border-radius:6px;border:1px solid var(--border);background:transparent;color:var(--text-primary);cursor:pointer">Open Studio</button>
               <button type="button" class="btn-primary" id="skill-composer-draft-btn" onclick="startSkillComposerDraft()" disabled style="font-size:12px;padding:7px 14px;border-radius:6px;border:none;background:var(--accent);color:#fff;font-weight:600;cursor:pointer;opacity:0.55">Draft skill</button>
@@ -23075,7 +23080,7 @@ var ROUTE_REDIRECTS = {
   'automations': { page: 'build', tab: 'crons' },
   'unleashed': { page: 'build', tab: 'crons' },
   'builder': { page: 'build', tab: 'workflows' },
-  'skill-studio': { page: 'build', tab: 'skills' },
+  'skill-studio': { page: 'skills' },
   'heartbeats': { page: 'heartbeat' },
   'team-status': { page: 'team', tab: 'activity' },
   'agent-detail': { page: 'team', tab: 'roster' },
@@ -28462,11 +28467,184 @@ function updateSkillComposerDraftState() {
   var text = (document.getElementById('skill-composer-text') || {}).value || '';
   var anchor = (document.getElementById('skill-composer-anchor') || {}).value || '';
   var btn = document.getElementById('skill-composer-draft-btn');
-  if (!btn) return;
   var enabled = !!(text.trim() || anchor.trim());
-  btn.disabled = !enabled;
-  btn.style.opacity = enabled ? '1' : '0.55';
-  btn.style.cursor = enabled ? 'pointer' : 'not-allowed';
+  if (btn) {
+    btn.disabled = !enabled;
+    btn.style.opacity = enabled ? '1' : '0.55';
+    btn.style.cursor = enabled ? 'pointer' : 'not-allowed';
+  }
+  renderSkillComposerAnchorSummary(text, anchor);
+}
+
+function renderSkillComposerAnchorSummary(text, anchor) {
+  var box = document.getElementById('skill-composer-anchor-summary');
+  if (!box) return;
+  var trimmed = String(anchor || '').trim();
+  if (!trimmed) {
+    box.innerHTML = '<span style="color:var(--text-muted)">No starting point selected.</span>';
+    return;
+  }
+  var modeCopy = _skillComposerCopy[_skillComposerMode] || _skillComposerCopy.outcome;
+  var tools = inferSkillComposerTools(_skillComposerMode, trimmed);
+  var toolText = tools.length
+    ? tools.map(function(t) { return '<code style="font-size:10px;background:var(--bg-primary);border:1px solid var(--border);padding:1px 5px;border-radius:4px;color:var(--text-primary)">' + esc(t) + '</code>'; }).join(' ')
+    : '<span style="color:var(--text-muted)">no explicit tool allowlist</span>';
+  box.innerHTML = '<div style="display:flex;align-items:flex-start;gap:6px;flex-wrap:wrap">'
+    + '<span style="color:var(--accent);font-weight:600">' + esc(modeCopy.promptLabel) + ':</span>'
+    + '<code style="font-size:10px;background:var(--bg-primary);border:1px solid var(--border);padding:1px 5px;border-radius:4px;color:var(--text-primary);max-width:100%;overflow:hidden;text-overflow:ellipsis">' + esc(trimmed) + '</code>'
+    + '<span style="color:var(--text-muted)">will seed</span>'
+    + toolText
+    + '</div>';
+}
+
+function inferSkillComposerTools(mode, anchor) {
+  var a = String(anchor || '').trim();
+  if (!a) return [];
+  if (mode === 'cli') return ['Bash'];
+  if (mode === 'memory') return ['mcp__clementine-tools__memory_search', 'mcp__clementine-tools__memory_read'];
+  if (mode === 'project') return ['Read', 'Glob', 'Grep'];
+  if (mode === 'tool') {
+    if (/^mcp__[^_]+(?:_[^_]+)*__/.test(a)) return [a];
+    if (/^composio:/.test(a)) {
+      var slug = a.replace(/^composio:/, '').trim();
+      return slug ? ['mcp__' + slug + '__*'] : [];
+    }
+    if (/^[A-Za-z][A-Za-z0-9_-]*$/.test(a) && /mcp|dataforseo|salesforce|asana|gmail|google|slack|hubspot|notion|stripe|outlook|firecrawl|apify|bright/i.test(a)) {
+      return ['mcp__' + a + '__*'];
+    }
+    return [a];
+  }
+  return [];
+}
+
+function dedupeSkillComposerToolNames(items) {
+  var seen = {};
+  var out = [];
+  for (var i = 0; i < items.length; i++) {
+    var value = String(items[i] || '').trim();
+    if (!value || seen[value]) continue;
+    seen[value] = true;
+    out.push(value);
+  }
+  return out;
+}
+
+function titleCaseSkillText(text) {
+  return String(text || '')
+    .replace(/\\s+/g, ' ')
+    .trim()
+    .split(' ')
+    .filter(Boolean)
+    .slice(0, 8)
+    .map(function(word) {
+      var w = word.replace(/[^A-Za-z0-9-]/g, '');
+      if (!w) return '';
+      return w.charAt(0).toUpperCase() + w.slice(1).toLowerCase();
+    })
+    .filter(Boolean)
+    .join(' ');
+}
+
+function inferSkillComposerTitle(text, anchor) {
+  var hay = (String(text || '') + ' ' + String(anchor || '')).toLowerCase();
+  if (hay.indexOf('salesforce') !== -1 && hay.indexOf('contact') !== -1 && (hay.indexOf('email') !== -1 || hay.indexOf('prospect') !== -1)) {
+    return 'Stale Salesforce Contact Prospecting';
+  }
+  if (hay.indexOf('asana') !== -1 && hay.indexOf('sheet') !== -1) return 'Asana Sheet Review';
+  if (hay.indexOf('weekly') !== -1 && hay.indexOf('status') !== -1) return 'Weekly Status Report';
+  var fromText = titleCaseSkillText(text);
+  if (fromText) return fromText;
+  var fromAnchor = titleCaseSkillText(anchor);
+  return fromAnchor ? (fromAnchor + ' Skill') : 'New Skill';
+}
+
+function slugifySkillTitle(title) {
+  return String(title || 'new-skill')
+    .toLowerCase()
+    .replace(/[_\\s]+/g, '-')
+    .replace(/[^a-z0-9-]/g, '')
+    .replace(/-+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 64) || 'new-skill';
+}
+
+function buildSkillComposerDraftSeed() {
+  var text = ((document.getElementById('skill-composer-text') || {}).value || '').trim();
+  var anchor = ((document.getElementById('skill-composer-anchor') || {}).value || '').trim();
+  var mode = _skillComposerMode || 'outcome';
+  var modeCopy = _skillComposerCopy[mode] || _skillComposerCopy.outcome;
+  var title = inferSkillComposerTitle(text, anchor);
+  var name = slugifySkillTitle(title);
+  var tools = inferSkillComposerTools(mode, anchor);
+  var hay = (text + ' ' + anchor).toLowerCase();
+  if (hay.indexOf('salesforce') !== -1) tools = dedupeSkillComposerToolNames(tools.concat(['Bash']));
+  if (hay.indexOf('dataforseo') !== -1 && tools.indexOf('mcp__dataforseo__*') === -1) tools.push('mcp__dataforseo__*');
+  if ((hay.indexOf('email') !== -1 || hay.indexOf('prospect') !== -1 || hay.indexOf('draft') !== -1) && tools.indexOf('mcp__clementine-tools__outlook_draft') === -1) {
+    tools.push('mcp__clementine-tools__outlook_draft');
+  }
+  tools = dedupeSkillComposerToolNames(tools);
+  var description = (text || ('Uses ' + (anchor || modeCopy.promptLabel) + ' to complete a repeatable task.'))
+    .replace(/\\s+/g, ' ')
+    .trim();
+  if (description.length > 860) description = description.slice(0, 857).replace(/\\s+\\S*$/, '') + '...';
+  description = description + ' Use when the user asks to run, reuse, or schedule this procedure.';
+  if (description.length > 1024) description = description.slice(0, 1024);
+
+  var toolLines = tools.length ? tools.map(function(t) { return '- ' + t; }).join('\\n') : '- No explicit allowlist yet; add only the tools this skill truly needs.';
+  var anchorLine = anchor ? modeCopy.promptLabel + ': ' + anchor : 'None selected';
+  var body = '# ' + title + '\\n\\n'
+    + '## Use When\\n\\n'
+    + description + '\\n\\n'
+    + '## Starting Point\\n\\n'
+    + '- Outcome: ' + (text || 'Fill in the exact user goal before saving.') + '\\n'
+    + '- ' + anchorLine + '\\n\\n'
+    + '## Required Tools\\n\\n'
+    + toolLines + '\\n\\n'
+    + '## Procedure\\n\\n'
+    + '1. Confirm the run scope, account/source filters, output destination, and whether side effects are draft-only or approved to write.\\n'
+    + '2. Gather the source records with the narrowest reliable query. Prefer official APIs, MCP tools, or local CLIs over screen scraping.\\n'
+    + '3. Filter records against the user\\'s criteria and remove records that should not be contacted or updated.\\n'
+    + '4. Enrich only the remaining records with the linked tool or data source. Keep enrichment outputs concise and cite the signal used.\\n'
+    + '5. Produce the requested artifact or update. For outreach, draft messages for review; do not send unless the user explicitly approves sending.\\n'
+    + '6. Report a concise summary with counts, skipped records, draft/update locations, and any records needing human review.\\n\\n'
+    + '## Success Criteria\\n\\n'
+    + '- The final report names the source query, number of records found, number filtered out, number enriched, and number drafted or updated.\\n'
+    + '- Any write/send action is either saved as a draft or explicitly approved by the user before execution.\\n'
+    + '- Failures include the tool, record id if known, and the next recovery step.\\n';
+
+  if (hay.indexOf('salesforce') !== -1 && hay.indexOf('contact') !== -1) {
+    body = '# ' + title + '\\n\\n'
+      + '## Use When\\n\\n'
+      + description + '\\n\\n'
+      + '## Inputs\\n\\n'
+      + '- Salesforce owner, list view, or territory to inspect.\\n'
+      + '- Staleness window, defaulting to contacts not touched in 15 days.\\n'
+      + '- Enrichment fields needed from DataForSEO or related SEO data sources.\\n'
+      + '- Email account or draft destination.\\n\\n'
+      + '## Required Tools\\n\\n'
+      + toolLines + '\\n\\n'
+      + '## Procedure\\n\\n'
+      + '1. Confirm the Salesforce object scope (Contacts vs Leads), the owner/list view, and the exact field that represents last touch. Default to LastActivityDate when no custom last-contacted field is provided.\\n'
+      + '2. Query Salesforce through the official API, MCP server, Composio toolkit, or the local sf CLI. Avoid browser scraping unless no API path is available.\\n'
+      + '3. Select contacts with no touch in the last 15 days. Exclude opted-out, bounced, do-not-contact, active opportunity, recently closed-lost cooldown, or missing-email records.\\n'
+      + '4. Enrich each remaining account/domain with DataForSEO or the configured SEO data source. Capture only useful signals: website, category, high-intent keywords, recent ranking opportunities, and likely pain points.\\n'
+      + '5. Draft one cold prospecting email per qualified contact. Keep each draft concise, specific to the enrichment signal, and review-only. Do not send automatically.\\n'
+      + '6. Save or return a table with contact id, account, last touch date, enrichment signal, draft subject, draft location, and status.\\n'
+      + '7. Report counts for found, excluded, enriched, drafted, and failed records. Include the Salesforce query and any records needing review.\\n\\n'
+      + '## Success Criteria\\n\\n'
+      + '- Every drafted email traces back to one Salesforce contact and one enrichment signal.\\n'
+      + '- No opted-out, bounced, do-not-contact, or active-opportunity contacts receive a draft.\\n'
+      + '- The user receives a concise report and drafts remain unsent unless explicit send approval is given.\\n';
+  }
+
+  return {
+    name: name,
+    title: title,
+    description: description,
+    body: body,
+    tools: tools,
+    note: anchor ? ('Seeded from ' + modeCopy.promptLabel + ': ' + anchor) : 'Seeded from the natural language description.',
+  };
 }
 
 async function hydrateSkillComposerOptions() {
@@ -28588,23 +28766,20 @@ function buildSkillComposerPrompt() {
 }
 
 function startSkillComposerDraft() {
-  var promptText = buildSkillComposerPrompt();
+  openCreateSkillModalFromComposer({ draft: true });
+}
+
+function openCreateSkillModalFromComposer(opts) {
+  opts = opts || {};
+  var text = ((document.getElementById('skill-composer-text') || {}).value || '').trim();
   var anchor = ((document.getElementById('skill-composer-anchor') || {}).value || '').trim();
-  var mode = _skillComposerMode;
-  navigateTo('build', { tab: 'skills' });
-  setTimeout(function() {
-    var typeSel = document.getElementById('builder-type');
-    if (typeSel) typeSel.value = 'skill';
-    if (typeof updateBuilderMode === 'function') updateBuilderMode();
-    if ((mode === 'tool' || mode === 'cli') && anchor) {
-      _builderLinkedTools = [anchor];
-    }
-    var input = document.getElementById('builder-input');
-    if (input) {
-      input.value = promptText;
-      if (typeof sendBuilderChat === 'function') sendBuilderChat();
-    }
-  }, 180);
+  if (!text && !anchor && !opts.draft) {
+    openCreateSkillModal();
+    return;
+  }
+  var seed = buildSkillComposerDraftSeed();
+  _openSkillModal({ mode: 'create', prefill: seed });
+  if (seed.note && typeof toast === 'function') toast(seed.note, 'success');
 }
 
 // ── Migration handlers (Phase A.6 / 1.18.110) ────────────────────────
@@ -29330,6 +29505,7 @@ async function sbRunSkillTest() {
 
 async function _openSkillModal(opts) {
   opts = opts || {};
+  var prefill = opts.mode === 'create' && opts.prefill ? opts.prefill : {};
   var existing = null;
   if (opts.mode === 'edit' && opts.name) {
     try {
@@ -29339,11 +29515,11 @@ async function _openSkillModal(opts) {
   }
   var fm = (existing && existing.frontmatter) || {};
   var ext = fm.clementine || {};
-  var nameVal = fm.name || '';
-  var titleVal = fm.title || '';
-  var descVal = fm.description || '';
-  var bodyVal = (existing && existing.body) || '';
-  var toolsVal = (ext.tools && Array.isArray(ext.tools.allow)) ? ext.tools.allow.join(', ') : '';
+  var nameVal = fm.name || prefill.name || '';
+  var titleVal = fm.title || prefill.title || '';
+  var descVal = fm.description || prefill.description || '';
+  var bodyVal = (existing && existing.body) || prefill.body || '';
+  var toolsVal = (ext.tools && Array.isArray(ext.tools.allow)) ? ext.tools.allow.join(', ') : (Array.isArray(prefill.tools) ? prefill.tools.join(', ') : (prefill.tools || ''));
   var modal = document.getElementById('skill-edit-modal');
   if (!modal) {
     modal = document.createElement('div');
@@ -29351,19 +29527,19 @@ async function _openSkillModal(opts) {
     modal.className = 'modal-overlay';
     modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.45);display:flex;align-items:center;justify-content:center;z-index:1000;padding:20px';
     modal.innerHTML =
-      '<div style="background:var(--bg-primary);border:1px solid var(--border);border-radius:10px;width:min(720px,95vw);max-height:90vh;display:flex;flex-direction:column;box-shadow:0 16px 48px rgba(0,0,0,0.35)">'
+      '<div style="background:var(--bg-primary);border:1px solid var(--border);border-radius:10px;width:min(860px,95vw);max-height:90vh;display:flex;flex-direction:column;box-shadow:0 16px 48px rgba(0,0,0,0.35)">'
       +   '<div style="display:flex;align-items:center;justify-content:space-between;padding:14px 20px;border-bottom:1px solid var(--border)">'
-      +     '<h3 id="skill-modal-title" style="margin:0;font-size:15px;font-weight:600">New skill</h3>'
+      +     '<h3 id="skill-modal-heading" style="margin:0;font-size:15px;font-weight:600">New skill</h3>'
       +     '<button onclick="closeSkillModal()" style="background:none;border:none;font-size:18px;color:var(--text-muted);cursor:pointer;padding:0 4px;line-height:1">✕</button>'
       +   '</div>'
       +   '<div style="flex:1;overflow-y:auto;padding:18px 22px">'
       +     '<input type="hidden" id="skill-modal-original-name">'
       +     '<input type="hidden" id="skill-modal-template-id">'
-      // 1.18.130 — templates picker. Strip of 5 archetype chips at the top
-      // of the create modal. Click one → fills body + tools.allow defaults
-      // so the user starts from a real procedure shape, not blank.
-      // Only shown in create mode (hidden during edit).
+      // 1.18.168 — compact optional template picker. The old card strip
+      // dominated the manual modal and wrapped poorly; manual should feel
+      // like a clean editor first, with templates as an optional seed.
       +     '<div id="skill-modal-templates" style="margin-bottom:14px"></div>'
+      +     '<div id="skill-modal-prefill-note" style="display:none;margin-bottom:12px;padding:8px 10px;border:1px solid var(--accent);border-radius:6px;background:rgba(255,141,0,0.08);font-size:12px;color:var(--text-secondary);line-height:1.4"></div>'
       +     '<label style="display:block;font-size:12px;color:var(--text-secondary);margin-bottom:4px;font-weight:500">Name <span style="color:var(--text-muted)">(lowercase, dashes, max 64 chars)</span></label>'
       +     '<input id="skill-modal-name" type="text" placeholder="e.g. morning-briefing" style="width:100%;padding:8px 10px;font-size:13px;border:1px solid var(--border);border-radius:6px;background:var(--bg-secondary);color:var(--text-primary);margin-bottom:12px;font-family:\\x27JetBrains Mono\\x27,monospace">'
       +     '<label style="display:block;font-size:12px;color:var(--text-secondary);margin-bottom:4px;font-weight:500">Display title <span style="color:var(--text-muted)">(optional, friendlier name)</span></label>'
@@ -29386,7 +29562,8 @@ async function _openSkillModal(opts) {
       +     '</div>'
       +     '<textarea id="skill-modal-desc" rows="2" oninput="updateSkillModalCounters()" placeholder="Example: Analyzes Outlook emails and drafts triage replies. Use when user asks to triage email or mentions inbox cleanup." style="width:100%;padding:8px 10px;font-size:13px;border:1px solid var(--border);border-radius:6px;background:var(--bg-secondary);color:var(--text-primary);margin-bottom:12px;font-family:inherit;resize:vertical"></textarea>'
       +     '<label style="display:block;font-size:12px;color:var(--text-secondary);margin-bottom:4px;font-weight:500">Allowed tools <span style="color:var(--text-muted)">(comma-separated, leave blank for default)</span></label>'
-      +     '<input id="skill-modal-tools" type="text" placeholder="e.g. Read, Bash, mcp__supabase__list_tables" style="width:100%;padding:8px 10px;font-size:13px;border:1px solid var(--border);border-radius:6px;background:var(--bg-secondary);color:var(--text-primary);margin-bottom:12px">'
+      +     '<input id="skill-modal-tools" type="text" oninput="renderSkillModalToolsPreview()" placeholder="e.g. Read, Bash, mcp__supabase__list_tables" style="width:100%;padding:8px 10px;font-size:13px;border:1px solid var(--border);border-radius:6px;background:var(--bg-secondary);color:var(--text-primary);margin-bottom:6px">'
+      +     '<div id="skill-modal-tools-preview" style="min-height:22px;margin-bottom:12px;font-size:11px;color:var(--text-muted);line-height:1.5"></div>'
       +     '<div style="display:flex;align-items:baseline;justify-content:space-between;margin-bottom:4px">'
       +       '<label style="font-size:12px;color:var(--text-secondary);font-weight:500">Procedure <span style="color:var(--text-muted)">(Markdown — the actual steps Claude follows)</span></label>'
       +       '<span id="skill-modal-body-counter" style="font-size:10px;color:var(--text-muted);font-variant-numeric:tabular-nums">0 lines</span>'
@@ -29401,32 +29578,42 @@ async function _openSkillModal(opts) {
       + '</div>';
     document.body.appendChild(modal);
   }
-  document.getElementById('skill-modal-title').textContent = opts.mode === 'edit' ? 'Edit skill: ' + nameVal : 'New skill';
+  document.getElementById('skill-modal-heading').textContent = opts.mode === 'edit' ? 'Edit skill: ' + nameVal : 'New skill';
   document.getElementById('skill-modal-original-name').value = opts.mode === 'edit' ? nameVal : '';
   document.getElementById('skill-modal-name').value = nameVal;
   document.getElementById('skill-modal-name').disabled = opts.mode === 'edit';
-  document.getElementById('skill-modal-title').nextElementSibling; // no-op
   document.getElementById('skill-modal-title').value = titleVal;
   document.getElementById('skill-modal-desc').value = descVal;
   document.getElementById('skill-modal-tools').value = toolsVal;
   document.getElementById('skill-modal-body').value = bodyVal;
+  var prefillNote = document.getElementById('skill-modal-prefill-note');
+  if (prefillNote) {
+    if (prefill.note) {
+      prefillNote.textContent = prefill.note + ' The fields below are editable before saving.';
+      prefillNote.style.display = '';
+    } else {
+      prefillNote.textContent = '';
+      prefillNote.style.display = 'none';
+    }
+  }
   var errEl = document.getElementById('skill-modal-error');
   if (errEl) { errEl.style.display = 'none'; errEl.textContent = ''; }
   modal.style.display = 'flex';
   document.getElementById('skill-modal-name').focus();
   if (typeof updateSkillModalCounters === 'function') updateSkillModalCounters();
-  // 1.18.130 — render templates strip in create mode only.
+  if (typeof renderSkillModalToolsPreview === 'function') renderSkillModalToolsPreview();
+  // 1.18.168 — render the compact optional template seed in create mode only.
   var tplBox = document.getElementById('skill-modal-templates');
   var tplIdInput = document.getElementById('skill-modal-template-id');
   if (tplIdInput) tplIdInput.value = '';
   if (tplBox) {
-    if (opts.mode === 'edit') { tplBox.style.display = 'none'; tplBox.innerHTML = ''; }
+    if (opts.mode === 'edit' || prefill.note) { tplBox.style.display = 'none'; tplBox.innerHTML = ''; }
     else { tplBox.style.display = ''; loadSkillTemplatePicker(); }
   }
 }
 
-// 1.18.130 — fetch templates + render the picker strip. Click a chip
-// to fill body + tools fields with the template's defaults. Templates
+// 1.18.168 — fetch templates + render a compact picker. Applying one
+// fills body + tools fields with the template's defaults. Templates
 // don't auto-fill the description because the user might be making a
 // variant — they pick the template for the procedure, then write their
 // own description.
@@ -29438,18 +29625,19 @@ async function loadSkillTemplatePicker() {
     var d = await r.json();
     if (!r.ok || !Array.isArray(d.templates)) { box.innerHTML = ''; return; }
     window._skillTemplates = d.templates;
-    var html = '<div style="display:flex;flex-direction:column;gap:6px">';
-    html += '<div style="font-size:12px;color:var(--text-secondary);font-weight:500">Start from a template <span style="color:var(--text-muted);font-weight:normal">(optional — fills body + suggested tools)</span></div>';
-    html += '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:6px">';
+    var html = '<div style="display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px;align-items:end;padding:10px 12px;border:1px solid var(--border);border-radius:6px;background:var(--bg-secondary)">';
+    html += '<div style="min-width:0">';
+    html += '<label for="skill-modal-template-select" style="display:block;font-size:12px;color:var(--text-secondary);font-weight:500;margin-bottom:4px">Template <span style="color:var(--text-muted);font-weight:normal">(optional)</span></label>';
+    html += '<select id="skill-modal-template-select" style="width:100%;padding:7px 9px;font-size:13px;border:1px solid var(--border);border-radius:6px;background:var(--bg-primary);color:var(--text-primary)">';
+    html += '<option value="">Blank skill</option>';
     for (var i = 0; i < d.templates.length; i++) {
       var t = d.templates[i];
-      html += '<button type="button" onclick="applySkillTemplate(\\x27' + jsStr(t.id) + '\\x27)" data-tpl="' + esc(t.id) + '" style="text-align:left;padding:8px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg-secondary);color:var(--text-primary);cursor:pointer;display:flex;flex-direction:column;gap:3px;transition:all 0.1s" onmouseover="this.style.background=\\x27var(--bg-tertiary)\\x27;this.style.borderColor=\\x27var(--accent)\\x27" onmouseout="this.style.background=\\x27var(--bg-secondary)\\x27;this.style.borderColor=\\x27var(--border)\\x27">'
-        + '<span style="font-size:13px;font-weight:600">' + esc(t.emoji) + ' ' + esc(t.label) + '</span>'
-        + '<span style="font-size:10px;color:var(--text-muted);line-height:1.3">' + esc(t.hint) + '</span>'
-        + '</button>';
+      html += '<option value="' + esc(t.id) + '" title="' + esc(t.hint || '') + '">' + esc(t.emoji ? (t.emoji + ' ') : '') + esc(t.label) + '</option>';
     }
+    html += '</select>';
     html += '</div>';
-    html += '<div id="skill-modal-template-applied" style="font-size:11px;color:var(--accent);display:none"></div>';
+    html += '<button type="button" onclick="var s=document.getElementById(\\x27skill-modal-template-select\\x27); if(s&&s.value) applySkillTemplate(s.value);" style="padding:7px 12px;font-size:12px;border:1px solid var(--border);border-radius:6px;background:transparent;color:var(--text-primary);cursor:pointer">Apply</button>';
+    html += '<div id="skill-modal-template-applied" style="grid-column:1/-1;font-size:11px;color:var(--accent);display:none"></div>';
     html += '</div>';
     box.innerHTML = html;
   } catch (err) {
@@ -29479,23 +29667,31 @@ function applySkillTemplate(templateId) {
     bodyEl.value = '# (Template "' + t.label + '" will fill in the body when you save.)\\n\\nFeel free to overwrite this — anything you type here replaces the template body.';
   }
   // Highlight the applied template button.
-  var buttons = document.querySelectorAll('#skill-modal-templates button[data-tpl]');
-  for (var i = 0; i < buttons.length; i++) {
-    var btn = buttons[i];
-    if (btn.getAttribute('data-tpl') === templateId) {
-      btn.style.background = 'rgba(255,140,33,0.12)';
-      btn.style.borderColor = 'var(--accent)';
-    } else {
-      btn.style.background = 'var(--bg-secondary)';
-      btn.style.borderColor = 'var(--border)';
-    }
-  }
+  var select = document.getElementById('skill-modal-template-select');
+  if (select) select.value = templateId;
   var notice = document.getElementById('skill-modal-template-applied');
   if (notice) {
     notice.textContent = '✓ Template "' + t.label + '" applied. Body + tools pre-filled.';
     notice.style.display = '';
   }
   if (typeof updateSkillModalCounters === 'function') updateSkillModalCounters();
+  if (typeof renderSkillModalToolsPreview === 'function') renderSkillModalToolsPreview();
+}
+
+function renderSkillModalToolsPreview() {
+  var input = document.getElementById('skill-modal-tools');
+  var box = document.getElementById('skill-modal-tools-preview');
+  if (!input || !box) return;
+  var tools = String(input.value || '').split(',').map(function(s) { return s.trim(); }).filter(Boolean);
+  if (tools.length === 0) {
+    box.innerHTML = '<span style="color:var(--text-muted)">No explicit allowlist. The skill inherits the default runtime surface unless the body references exact MCP tools.</span>';
+    return;
+  }
+  box.innerHTML = tools.map(function(t) {
+    var kind = t === 'Bash' ? 'CLI' : (t.indexOf('mcp__') === 0 ? 'MCP' : 'Tool');
+    return '<span title="' + esc(kind) + '" style="display:inline-flex;align-items:center;gap:4px;margin:0 4px 4px 0;padding:2px 7px;border:1px solid var(--border);border-radius:999px;background:var(--bg-secondary);color:var(--text-primary);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:10px">'
+      + '<span style="color:var(--accent);font-family:inherit">' + esc(kind) + '</span>' + esc(t) + '</span>';
+  }).join('');
 }
 
 // 1.18.127 — live char/line counters under description + body. Color
@@ -34706,27 +34902,21 @@ document.addEventListener('click', function(e) {
 // Back-compat shim — older call sites still reference loadProfiles().
 function loadProfiles() { return refreshChatAgentPicker(); }
 
-// ── Skill Studio — opens builder in skill-focused mode ──────────
+// ── Skill Studio — opens the Skills page composer ──────────
 
 function openSkillStudio() {
-  // Pre-set type to skill before navigating
-  var typeSelect = document.getElementById('builder-type');
-  if (typeSelect) typeSelect.value = 'skill';
-  navigateTo('build', { tab: 'skills' });
-  // Update the UI for skill mode
-  updateBuilderMode();
-  // Show skill-specific empty state
-  var emptyState = document.getElementById('builder-empty-state');
-  if (emptyState && !builderArtifact) {
-    emptyState.innerHTML = '<p style="color:var(--text-muted);margin-bottom:8px;font-size:15px;font-weight:600">Skill Studio</p>'
-      + '<p style="color:var(--text-muted);margin-bottom:16px;font-size:13px">Teach a new skill by describing it, attach reference files, link tools, test it, then save.</p>'
-      + '<div style="display:flex;flex-wrap:wrap;gap:8px;justify-content:center">'
-      + '<button class="btn btn-sm quick-pill" onclick="builderQuick(\\x27Teach a skill for deploying to production — run tests, build, push, verify\\x27)">Deploy to prod</button>'
-      + '<button class="btn btn-sm quick-pill" onclick="builderQuick(\\x27Teach a skill for writing a weekly status report from git commits and calendar\\x27)">Weekly status report</button>'
-      + '<button class="btn btn-sm quick-pill" onclick="builderQuick(\\x27Teach a skill for onboarding a new team member — set up accounts, send welcome email\\x27)">Onboard team member</button>'
-      + '<button class="btn btn-sm quick-pill" onclick="builderQuick(\\x27Teach a skill for researching a company before a sales call\\x27)">Company research</button>'
-      + '</div>';
-  }
+  navigateTo('skills');
+  setTimeout(function() {
+    try { initSkillComposer(); } catch (_) { /* non-fatal */ }
+    var composer = document.getElementById('skill-composer');
+    var input = document.getElementById('skill-composer-text');
+    if (composer && composer.scrollIntoView) composer.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    if (composer) {
+      composer.style.boxShadow = '0 0 0 2px rgba(255,141,0,0.35)';
+      setTimeout(function() { composer.style.boxShadow = ''; }, 1400);
+    }
+    if (input) input.focus();
+  }, 80);
 }
 
 function updateBuilderMode() {
