@@ -378,6 +378,9 @@ export function getStoreSync(): MemoryStoreType | null {
 const _rawAgentSlug = process.env.CLEMENTINE_TEAM_AGENT || null;
 export const ACTIVE_AGENT_SLUG: string | null = _rawAgentSlug === 'clementine' ? null : _rawAgentSlug;
 
+const _rawSessionKey = process.env.CLEMENTINE_SESSION_KEY || null;
+export const ACTIVE_SESSION_KEY: string | null = _rawSessionKey?.trim() || null;
+
 // ── Agent-aware path helpers ───────────────────────────────────────────
 
 // GOALS_DIR is defined in config.ts but not in shared.ts — define it here

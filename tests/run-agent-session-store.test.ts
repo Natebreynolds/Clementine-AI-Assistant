@@ -81,6 +81,8 @@ describe('runAgent session persistence', () => {
     expect(call.options?.sessionStore).toBeDefined();
     expect(typeof (call.options!.sessionStore as { append?: unknown }).append).toBe('function');
     expect(typeof (call.options!.sessionStore as { load?: unknown }).load).toBe('function');
+    expect((call.options as { mcpServers?: Record<string, { env?: Record<string, string> }> })?.mcpServers?.['clementine-tools']?.env?.CLEMENTINE_SESSION_KEY)
+      .toBe('discord:user:123');
   });
 
   it('pre-approves permissionTools without widening visible built-in tools', async () => {
@@ -102,6 +104,7 @@ describe('runAgent session persistence', () => {
     expect(call.options?.allowedTools).toContain('Agent');
     expect(call.options?.allowedTools).toContain('Read');
     expect(call.options?.allowedTools).toContain('mcp__clementine-tools__memory_read');
+    expect(call.options?.mcpServers?.['clementine-tools']?.env?.CLEMENTINE_SESSION_KEY).toBe('cron:skill');
     expect(call.options?.mcpServers?.['clementine-tools']?.env?.CLEMENTINE_TOOL_ALLOWLIST).toBe('memory_read');
   });
 });

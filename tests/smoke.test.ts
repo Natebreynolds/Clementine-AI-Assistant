@@ -128,6 +128,7 @@ describe('classifyChatError', () => {
 
   it('classifies context overflow errors', () => {
     expect(classifyChatError('prompt too long')).toBe('context_overflow');
+    expect(classifyChatError('Prompt is too long')).toBe('context_overflow');
     expect(classifyChatError('maximum context length exceeded')).toBe('context_overflow');
     expect(classifyChatError('token limit reached')).toBe('context_overflow');
     expect(classifyChatError('Autocompact is thrashing: the context refilled to the limit')).toBe('context_overflow');

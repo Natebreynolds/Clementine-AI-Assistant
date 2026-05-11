@@ -20,7 +20,7 @@ import {
 } from './shared.js';
 
 // Re-export for any code that imports from mcp-server.ts directly
-export { getStore, textResult, externalResult, incrementalSync, ACTIVE_AGENT_SLUG } from './shared.js';
+export { getStore, textResult, externalResult, incrementalSync, ACTIVE_AGENT_SLUG, ACTIVE_SESSION_KEY } from './shared.js';
 export type { MemoryStoreType } from './shared.js';
 
 // ── Tool modules ────────────────────────────────────────────────────────

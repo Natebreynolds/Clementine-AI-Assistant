@@ -73,6 +73,8 @@ const CHAT_TIMEOUT_MS = 10 * 60 * 1000;
  *  Safety net so no session runs forever, even if active.
  *  Primary guardrail is cost budget (maxBudgetUsd), not this timer. */
 const CHAT_MAX_WALL_MS = 30 * 60 * 1000;
+const CHAT_CONTEXT_RETRY_CONTEXT_MAX_CHARS = 6_000;
+const CHAT_CONTEXT_RETRY_SYSTEM_MAX_CHARS = 16_000;
 const BACKGROUND_TASK_ID_RE = /\bbg-[a-z0-9]+-[a-f0-9]{6}\b/i;
 
 type TranscriptSearchRow = {
@@ -136,6 +138,31 @@ function compactToolNames(names: string[]): string[] {
   return out;
 }
 
+function trimContextRecoveryText(text: string, maxChars: number): string {
+  if (!text || text.length <= maxChars) return text;
+  return `${text.slice(0, maxChars - 80).trimEnd()}\n\n[context recovery: trimmed oversized carry-over context]`;
+}
+
+export function buildContextOverflowRetryPrompt(opts: {
+  chatPrompt: string;
+  turnContextPrefix?: string;
+  project?: ProjectMeta | null;
+}): string {
+  const parts = [
+    '[Context recovery: the previous SDK session was too large, so this is a fresh session. Continue with the current user request. Do not ask the user to resend it.]',
+  ];
+  if (opts.project?.path) {
+    const description = opts.project.description ? ` (${opts.project.description})` : '';
+    parts.push(`[Active project: ${opts.project.path}${description}]`);
+  }
+  const compactContext = trimContextRecoveryText((opts.turnContextPrefix ?? '').trim(), CHAT_CONTEXT_RETRY_CONTEXT_MAX_CHARS);
+  if (compactContext) {
+    parts.push(compactContext);
+  }
+  parts.push(opts.chatPrompt);
+  return parts.filter(Boolean).join('\n\n');
+}
+
 export type ChatErrorKind = 'rate_limit' | 'one_million_context' | 'context_overflow' | 'auth' | 'billing' | 'transient' | 'unknown';
 
 export function classifyChatError(err: unknown): ChatErrorKind {
@@ -143,7 +170,7 @@ export function classifyChatError(err: unknown): ChatErrorKind {
   if (isCreditBalanceError(msg)) return 'billing';
   if (/rate.?limit|\b429\b|too many requests|quota.?exceeded/i.test(msg)) return 'rate_limit';
   if (looksLikeClaudeOneMillionContextError(msg)) return 'one_million_context';
-  if (/context.?length|token.?limit|maximum.?context|prompt.?too.?long|rapid_refill_breaker|autocompact|context.?refilled/i.test(msg)) return 'context_overflow';
+  if (/context.?length|token.?limit|maximum.?context|prompt(?:\s+is)?.?too.?long|input.?too.?long|rapid_refill_breaker|autocompact|context.?refilled/i.test(msg)) return 'context_overflow';
   if (/\b401\b|\b403\b|auth|forbidden|invalid.?api.?key|permission|does not have access|please run \/login/i.test(msg)) return 'auth';
   if (/timeout|ECONNRESET|ECONNREFUSED|ETIMEDOUT|\b5\d\d\b|overloaded|service.?unavailable/i.test(msg)) return 'transient';
   return 'unknown';
@@ -2407,6 +2434,7 @@ export class Gateway {
           const chatSystemAppend = resolvedSkills && resolvedSkills.promptBlock
             ? (baseSystemAppend ? `${baseSystemAppend}\n\n${resolvedSkills.promptBlock}` : resolvedSkills.promptBlock)
             : baseSystemAppend;
+          const retrySystemAppend = trimContextRecoveryText(chatSystemAppend, CHAT_CONTEXT_RETRY_SYSTEM_MAX_CHARS);
 
           // Per-turn context (recall + persistent learnings + silent
           // blocks + security/toolset directives) — real chat only.
@@ -2451,7 +2479,7 @@ export class Gateway {
             skillHintedMcpServers: resolvedSkills?.hintedMcpServers ?? [],
           }, 'Routing chat through runAgent');
 
-          const runAgentResult = await runAgent(finalPrompt, {
+          const buildRunAgentChatOptions = (opts: { resumeSessionId?: string; systemPromptAppend?: string }) => ({
             sessionKey: effectiveSessionKey,
             source: 'chat',
             profile: resolvedProfile,
@@ -2461,11 +2489,11 @@ export class Gateway {
             ...(maxTurns ? { maxTurns } : {}),
             ...(chatBudget !== undefined ? { maxBudgetUsd: chatBudget } : {}),
             ...(builderAllowedTools ? { allowedTools: builderAllowedTools } : {}),
-            ...(chatSystemAppend ? { systemPromptAppend: chatSystemAppend } : {}),
-            ...(priorSdkSessionId ? { resumeSessionId: priorSdkSessionId } : {}),
+            ...(opts.systemPromptAppend ? { systemPromptAppend: opts.systemPromptAppend } : {}),
+            ...(opts.resumeSessionId ? { resumeSessionId: opts.resumeSessionId } : {}),
             ...(chatMcp ? { extraMcpServers: chatMcp.servers as unknown as Parameters<typeof runAgent>[1]['extraMcpServers'] } : {}),
             onText: wrappedOnText,
-            onToolActivity: ({ tool, input }) => {
+            onToolActivity: ({ tool, input }: { tool: string; input: Record<string, unknown> }) => {
               if (wrappedOnToolActivity) {
                 return wrappedOnToolActivity(tool, input);
               }
@@ -2473,6 +2501,38 @@ export class Gateway {
             },
             abortSignal: chatAc.signal,
           });
+
+          let runAgentResult;
+          try {
+            runAgentResult = await runAgent(finalPrompt, buildRunAgentChatOptions({
+              ...(priorSdkSessionId ? { resumeSessionId: priorSdkSessionId } : {}),
+              ...(chatSystemAppend ? { systemPromptAppend: chatSystemAppend } : {}),
+            }));
+          } catch (err) {
+            if (chatAc.signal.aborted || classifyChatError(err) !== 'context_overflow') {
+              throw err;
+            }
+            const retryPrompt = buildContextOverflowRetryPrompt({
+              chatPrompt,
+              turnContextPrefix,
+              project: sess?.project ?? null,
+            });
+            logger.info({
+              sessionKey: effectiveSessionKey,
+              hadResume: !!priorSdkSessionId,
+              promptChars: finalPrompt.length,
+              retryPromptChars: retryPrompt.length,
+              systemAppendChars: chatSystemAppend.length,
+              retrySystemAppendChars: retrySystemAppend.length,
+            }, 'Context overflow — retrying current message in fresh SDK session');
+            if (onProgress) {
+              await onProgress('refreshing conversation context...').catch(() => { /* non-fatal */ });
+            }
+            this.assistant.clearSession(effectiveSessionKey);
+            runAgentResult = await runAgent(retryPrompt, buildRunAgentChatOptions({
+              ...(retrySystemAppend ? { systemPromptAppend: retrySystemAppend } : {}),
+            }));
+          }
 
           if (ledgerRunMetadata) {
             ledgerRunMetadata.runId = runAgentResult.runId;

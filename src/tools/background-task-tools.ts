@@ -19,7 +19,7 @@ import {
   listBackgroundTasks,
   loadBackgroundTask,
 } from '../agent/background-tasks.js';
-import { ACTIVE_AGENT_SLUG, logger, textResult } from './shared.js';
+import { ACTIVE_AGENT_SLUG, ACTIVE_SESSION_KEY, logger, textResult } from './shared.js';
 
 const DEFAULT_MAX_MINUTES = 30;
 
@@ -43,9 +43,10 @@ export function registerBackgroundTaskTools(server: McpServer): void {
         fromAgent,
         prompt: trimmed,
         maxMinutes: cap,
+        ...(ACTIVE_SESSION_KEY ? { sessionKey: ACTIVE_SESSION_KEY } : {}),
       });
 
-      logger.info({ id: task.id, fromAgent, maxMinutes: task.maxMinutes }, 'Background task queued');
+      logger.info({ id: task.id, fromAgent, sessionKey: task.sessionKey, maxMinutes: task.maxMinutes }, 'Background task queued');
       return textResult(
         `Queued **${task.id}** (max ${task.maxMinutes} min). The daemon will pick it up within a few seconds and run it in the background. You'll get a notification in your channel when the deliverable lands. Use \`get_background_task\` to check status.`,
       );

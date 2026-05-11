@@ -456,6 +456,7 @@ export async function runAgent(prompt: string, opts: RunAgentOptions): Promise<R
         ...subprocessEnv,
         CLEMENTINE_HOME: BASE_DIR,
         ...(opts.profile?.slug ? { CLEMENTINE_TEAM_AGENT: opts.profile.slug } : {}),
+        CLEMENTINE_SESSION_KEY: opts.sessionKey,
         CLEMENTINE_INTERACTION_SOURCE: interactionSourceForSession(opts.sessionKey, source),
         CLEMENTINE_TOOL_ALLOWLIST: clementineToolAllowlist,
       },

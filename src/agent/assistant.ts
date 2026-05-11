@@ -2617,6 +2617,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
               ...process.env,
               CLEMENTINE_HOME: BASE_DIR,
               CLEMENTINE_TEAM_AGENT: profile?.slug ?? 'clementine',
+              ...(sessionKey ? { CLEMENTINE_SESSION_KEY: sessionKey } : {}),
               CLEMENTINE_INTERACTION_SOURCE: sourceOverride ?? inferInteractionSource(sessionKey),
               CLEMENTINE_TOOL_ALLOWLIST: clementineToolAllowlist,
               CLEMENTINE_1M_CONTEXT_MODE: oneMillionModeValue,
