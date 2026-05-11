@@ -82,4 +82,26 @@ describe('runAgent session persistence', () => {
     expect(typeof (call.options!.sessionStore as { append?: unknown }).append).toBe('function');
     expect(typeof (call.options!.sessionStore as { load?: unknown }).load).toBe('function');
   });
+
+  it('pre-approves permissionTools without widening visible built-in tools', async () => {
+    await runAgent('delegate only', {
+      sessionKey: 'cron:skill',
+      source: 'scheduled-skill',
+      allowedTools: ['Agent'],
+      permissionTools: ['Agent', 'Read', 'memory_read'],
+    });
+
+    const call = sdkMocks.query.mock.calls[0]?.[0] as {
+      options?: {
+        tools?: string[];
+        allowedTools?: string[];
+        mcpServers?: Record<string, { env?: Record<string, string> }>;
+      };
+    };
+    expect(call.options?.tools).toEqual(['Agent']);
+    expect(call.options?.allowedTools).toContain('Agent');
+    expect(call.options?.allowedTools).toContain('Read');
+    expect(call.options?.allowedTools).toContain('mcp__clementine-tools__memory_read');
+    expect(call.options?.mcpServers?.['clementine-tools']?.env?.CLEMENTINE_TOOL_ALLOWLIST).toBe('memory_read');
+  });
 });

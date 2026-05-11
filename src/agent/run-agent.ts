@@ -215,6 +215,11 @@ export interface RunAgentOptions {
    *  including Agent (so subagents can be spawned) + core SDK tools + Clementine MCP. */
   allowedTools?: string[];
 
+  /** Extra tools to pre-approve without making their built-in tools visible to
+   *  the main agent. Useful when the main agent may only call Agent, but the
+   *  forced subagent still needs pre-approved MCP/Clementine tools. */
+  permissionTools?: string[];
+
   /** SDK permission mode. Defaults to dontAsk so allowedTools is enforceable.
    *  Only explicit operator/full-surface paths should request bypassPermissions. */
   permissionMode?: ExecutionPermissionMode;
@@ -419,6 +424,25 @@ export async function runAgent(prompt: string, opts: RunAgentOptions): Promise<R
     clementineServerName: TOOLS_SERVER,
     permissionMode: opts.permissionMode,
   });
+  const permissionToolPolicy = opts.permissionTools
+    ? buildExecutionToolPolicy({
+        requestedTools: opts.permissionTools,
+        defaultBuiltins: CORE_TOOLS_FOR_AGENT_PARENT,
+        mcpServerNames: policyMcpServerNames,
+        clementineServerName: TOOLS_SERVER,
+        permissionMode: opts.permissionMode,
+      })
+    : null;
+  const sdkAllowedTools = permissionToolPolicy
+    ? Array.from(new Set([...toolPolicy.allowedTools, ...permissionToolPolicy.allowedTools])).sort()
+    : toolPolicy.allowedTools;
+  const clementineToolAllowlist = (() => {
+    if (!permissionToolPolicy) return toolPolicy.clementineToolAllowlist;
+    const parts = [toolPolicy.clementineToolAllowlist, permissionToolPolicy.clementineToolAllowlist]
+      .flatMap(v => v.split(',').map(s => s.trim()).filter(Boolean));
+    if (parts.includes('*')) return '*';
+    return Array.from(new Set(parts)).sort().join(',');
+  })();
 
   // SDK accepts a Record<string, McpServerConfig> here. We cast on
   // assignment because we mix the always-on Clementine stdio server
@@ -433,7 +457,7 @@ export async function runAgent(prompt: string, opts: RunAgentOptions): Promise<R
         CLEMENTINE_HOME: BASE_DIR,
         ...(opts.profile?.slug ? { CLEMENTINE_TEAM_AGENT: opts.profile.slug } : {}),
         CLEMENTINE_INTERACTION_SOURCE: interactionSourceForSession(opts.sessionKey, source),
-        CLEMENTINE_TOOL_ALLOWLIST: toolPolicy.clementineToolAllowlist,
+        CLEMENTINE_TOOL_ALLOWLIST: clementineToolAllowlist,
       },
     },
     ...baseMcpServers,
@@ -577,7 +601,7 @@ export async function runAgent(prompt: string, opts: RunAgentOptions): Promise<R
     mcpServers: mcpServers as unknown as Parameters<typeof query>[0]['options'] extends infer O
       ? O extends { mcpServers?: infer M } ? M : never : never,
     tools: toolPolicy.builtinTools,
-    allowedTools: toolPolicy.allowedTools,
+    allowedTools: sdkAllowedTools,
     permissionMode: toolPolicy.permissionMode,
     ...(sessionStore ? { sessionStore } : {}),
     ...(toolPolicy.allowDangerouslySkipPermissions
@@ -619,7 +643,7 @@ export async function runAgent(prompt: string, opts: RunAgentOptions): Promise<R
     maxBudgetUsd: maxBudgetUsd ?? 'uncapped',
     agentCount: Object.keys(agents).length,
     allowedToolCount: allowedTools.length,
-    sdkAllowedToolCount: toolPolicy.allowedTools.length,
+    sdkAllowedToolCount: sdkAllowedTools.length,
     builtinToolCount: toolPolicy.builtinTools.length,
     permissionMode: toolPolicy.permissionMode,
     mcpServerCount: Object.keys(mcpServers).length,
@@ -911,7 +935,7 @@ export async function runAgent(prompt: string, opts: RunAgentOptions): Promise<R
     ...(usage ? { usage } : {}),
     runId,
     permissionMode: toolPolicy.permissionMode,
-    allowedToolsApplied: toolPolicy.allowedTools,
+    allowedToolsApplied: sdkAllowedTools,
     builtinToolsApplied: toolPolicy.builtinTools,
     mcpServersApplied: Object.keys(mcpServers),
   };

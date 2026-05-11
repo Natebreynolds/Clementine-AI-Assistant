@@ -95,6 +95,11 @@ describe('runSkill autonomous auto-delegation (1.18.173)', () => {
     expect(prompt as string).toContain('imessage-triage');
     // Parent allowedTools should be only ['Agent']
     expect((opts as { allowedTools?: string[] }).allowedTools).toEqual(['Agent']);
+    expect((opts as { permissionTools?: string[] }).permissionTools).toEqual(expect.arrayContaining([
+      'Agent',
+      'imessage_read',
+      'discord_send_dm',
+    ]));
     // forceSubagent should be set
     expect((opts as { forceSubagent?: string }).forceSubagent).toBe('skill-worker');
     // agents map should contain skill-worker
@@ -240,6 +245,23 @@ describe('runSkill autonomous auto-delegation (1.18.173)', () => {
     const [, opts] = runAgentMock.mock.calls[0];
     const agents = (opts as { agents?: Record<string, { maxTurns?: number }> }).agents ?? {};
     expect(agents['skill-worker'].maxTurns).toBe(30);
+  });
+
+  it('lets caller maxBudgetUsd=0 override a skill-local budget cap', async () => {
+    getSkillMock.mockReturnValue(fakeSkill({
+      frontmatter: {
+        name: 'uncapped-skill',
+        description: 'Has a local cap.',
+        clementine: {
+          tools: { allow: ['Read'] },
+          limits: { maxBudgetUsd: 0.05 },
+        },
+      },
+    }));
+
+    await runSkill('uncapped-skill', { source: 'scheduled-skill', maxBudgetUsd: 0 });
+    const [, opts] = runAgentMock.mock.calls[0];
+    expect((opts as { maxBudgetUsd?: number }).maxBudgetUsd).toBe(0);
   });
 
   it('returns ok=false when skill not found', async () => {

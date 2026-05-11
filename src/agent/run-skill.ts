@@ -547,6 +547,9 @@ export async function runSkill(
         // the parent's context shape predictable and prevents it from
         // doing data-heavy work itself even if the LLM disagrees.
         allowedTools: ['Agent'],
+        // SDK permissions are session-level, so the worker's tools still
+        // need to be pre-approved even though the parent only sees Agent.
+        permissionTools: ['Agent', ...effectiveTools],
         // Force-routing: SDK wraps the prompt with "Use the skill-worker
         // agent to handle this request" so dispatch is the natural
         // first action.

@@ -2685,7 +2685,10 @@ export class Gateway {
         if (scheduledSkillName) {
           const { runSkill } = await import('../agent/run-skill.js');
           const configuredCap = tier >= 2 ? BUDGET.cronT2 : BUDGET.cronT1;
-          const scheduledSkillBudget = configuredCap > 0 ? configuredCap : undefined;
+          // Pass 0 through intentionally. It means "uncapped" and must
+          // override skill-local clementine.limits.maxBudgetUsd values when
+          // the operator has disabled global cron budgets.
+          const scheduledSkillBudget = configuredCap > 0 ? configuredCap : 0;
           logger.info({ jobName, skill: scheduledSkillName, agentSlug, tier, wallMs, path: 'run_skill' }, 'Routing scheduled skill through runSkill');
           const skillResult = await runSkill(scheduledSkillName, {
             sessionKey: `cron:${jobName}`,
@@ -2697,7 +2700,7 @@ export class Gateway {
             projectWorkDir: workDir,
             model,
             ...(maxTurns ? { maxTurns } : {}),
-            ...(scheduledSkillBudget !== undefined ? { maxBudgetUsd: scheduledSkillBudget } : {}),
+            maxBudgetUsd: scheduledSkillBudget,
             abortSignal: cronAc.signal,
             context: `[Scheduled skill: ${jobName}]`,
           });
