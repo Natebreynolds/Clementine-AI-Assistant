@@ -29707,7 +29707,7 @@ async function _openSkillModal(opts) {
       +       '<strong style="color:var(--text-secondary);font-weight:600">Format:</strong> '
       +       '<code style="font-size:10px;background:var(--bg-secondary);padding:1px 4px;border-radius:3px">[WHAT it does] + [WHEN to use it] + [trigger phrases]</code>'
       +       ' &nbsp;·&nbsp; under 1024 chars · no <code style="font-size:10px">&lt; &gt;</code> · '
-      +       '<a href="javascript:void(0)" onclick="askClementineWith(\\x27Use skill-creator to help me write a great Anthropic-canonical description for the skill I am building.\\x27)" style="color:var(--accent);text-decoration:none">use skill-creator</a>'
+      +       '<a href="javascript:void(0)" onclick="askSkillCreatorForDescription()" style="color:var(--accent);text-decoration:none">use skill-creator</a>'
       +     '</div>'
       +     '<textarea id="skill-modal-desc" rows="2" oninput="updateSkillModalCounters()" placeholder="Example: Analyzes Outlook emails and drafts triage replies. Use when user asks to triage email or mentions inbox cleanup." style="width:100%;padding:8px 10px;font-size:13px;border:1px solid var(--border);border-radius:6px;background:var(--bg-secondary);color:var(--text-primary);margin-bottom:12px;font-family:inherit;resize:vertical"></textarea>'
       +     '<label style="display:block;font-size:12px;color:var(--text-secondary);margin-bottom:4px;font-weight:500">Allowed tools <span style="color:var(--text-muted)">(comma-separated, leave blank for default)</span></label>'
@@ -29727,7 +29727,9 @@ async function _openSkillModal(opts) {
       + '</div>';
     document.body.appendChild(modal);
   }
-  document.getElementById('skill-modal-heading').textContent = opts.mode === 'edit' ? 'Edit skill: ' + nameVal : 'New skill';
+  document.getElementById('skill-modal-heading').textContent = opts.mode === 'edit'
+    ? 'Edit skill: ' + nameVal
+    : (prefill.note ? 'Review skill draft' : 'Manual skill editor');
   document.getElementById('skill-modal-original-name').value = opts.mode === 'edit' ? nameVal : '';
   document.getElementById('skill-modal-name').value = nameVal;
   document.getElementById('skill-modal-name').disabled = opts.mode === 'edit';
@@ -29748,7 +29750,8 @@ async function _openSkillModal(opts) {
   var errEl = document.getElementById('skill-modal-error');
   if (errEl) { errEl.style.display = 'none'; errEl.textContent = ''; }
   modal.style.display = 'flex';
-  document.getElementById('skill-modal-name').focus();
+  var initialFocus = prefill.note ? document.getElementById('skill-modal-desc') : document.getElementById('skill-modal-name');
+  if (initialFocus) initialFocus.focus();
   if (typeof updateSkillModalCounters === 'function') updateSkillModalCounters();
   if (typeof renderSkillModalToolsPreview === 'function') renderSkillModalToolsPreview();
   // 1.18.168 — render the compact optional template seed in create mode only.
@@ -35100,7 +35103,7 @@ document.addEventListener('click', function(e) {
 // Back-compat shim — older call sites still reference loadProfiles().
 function loadProfiles() { return refreshChatAgentPicker(); }
 
-// ── Skill Studio — opens the Skills page composer ──────────
+// ── Skill Studio — opens the natural-language composer as a real modal ──────────
 
 function openSkillStudio() {
   navigateTo('skills');
@@ -35108,13 +35111,54 @@ function openSkillStudio() {
     try { initSkillComposer(); } catch (_) { /* non-fatal */ }
     var composer = document.getElementById('skill-composer');
     var input = document.getElementById('skill-composer-text');
-    if (composer && composer.scrollIntoView) composer.scrollIntoView({ behavior: 'smooth', block: 'start' });
-    if (composer) {
-      composer.style.boxShadow = '0 0 0 2px rgba(255,141,0,0.35)';
-      setTimeout(function() { composer.style.boxShadow = ''; }, 1400);
+    var modal = document.getElementById('skill-studio-modal');
+    if (!modal) {
+      modal = document.createElement('div');
+      modal.id = 'skill-studio-modal';
+      modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.42);z-index:1050;display:none;align-items:center;justify-content:center;padding:20px';
+      modal.innerHTML =
+        '<div style="width:min(1040px,96vw);max-height:92vh;background:var(--bg-primary);border:1px solid var(--border);border-radius:10px;box-shadow:0 18px 56px rgba(0,0,0,0.35);display:flex;flex-direction:column;overflow:hidden">'
+        + '<div style="display:flex;align-items:flex-start;justify-content:space-between;gap:14px;padding:16px 20px;border-bottom:1px solid var(--border);background:var(--bg-secondary)">'
+        +   '<div style="min-width:0">'
+        +     '<div style="font-size:16px;font-weight:600;color:var(--text-primary);margin-bottom:3px">Skill Studio</div>'
+        +     '<div style="font-size:12px;color:var(--text-muted);line-height:1.45">Start with the outcome. Add MCP, CLI, project, or memory anchors only when they are real dependencies. Review the generated SKILL.md before saving.</div>'
+        +   '</div>'
+        +   '<button type="button" onclick="closeSkillStudio()" title="Close Skill Studio" style="background:none;border:none;font-size:20px;color:var(--text-muted);cursor:pointer;padding:0 4px;line-height:1">&times;</button>'
+        + '</div>'
+        + '<div id="skill-studio-modal-body" style="padding:18px 20px;overflow:auto;flex:1;min-height:0"></div>'
+        + '<div style="display:flex;align-items:center;gap:8px;justify-content:flex-end;padding:14px 20px;border-top:1px solid var(--border);background:var(--bg-secondary)">'
+        +   '<button type="button" onclick="closeSkillStudio()" style="font-size:13px;padding:7px 14px;border-radius:6px;border:1px solid var(--border);background:transparent;color:var(--text-primary);cursor:pointer">Keep on page</button>'
+        +   '<button type="button" onclick="startSkillComposerChat()" style="font-size:13px;padding:7px 14px;border-radius:6px;border:1px solid var(--border);background:var(--bg-primary);color:var(--text-primary);cursor:pointer">Build in chat</button>'
+        +   '<button type="button" onclick="startSkillComposerDraft()" class="btn-primary" style="font-size:13px;padding:7px 16px;border-radius:6px;border:none;background:var(--accent);color:#fff;font-weight:600;cursor:pointer">Review draft</button>'
+        + '</div>'
+        + '</div>';
+      document.body.appendChild(modal);
     }
+    var body = document.getElementById('skill-studio-modal-body');
+    if (composer && body && composer.parentElement !== body) {
+      composer.dataset.originalMargin = composer.style.margin || '';
+      body.appendChild(composer);
+      composer.style.margin = '0';
+    }
+    modal.style.display = 'flex';
+    updateSkillComposerDraftState();
     if (input) input.focus();
   }, 80);
+}
+
+function closeSkillStudio(opts) {
+  opts = opts || {};
+  var modal = document.getElementById('skill-studio-modal');
+  var composer = document.getElementById('skill-composer');
+  var home = document.getElementById('skill-composer-home');
+  if (composer && home && composer.parentElement !== home) {
+    home.appendChild(composer);
+    composer.style.margin = composer.dataset.originalMargin || '0 0 16px';
+  }
+  if (modal) modal.style.display = 'none';
+  if (!opts.silent && composer && composer.scrollIntoView) {
+    composer.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
 }
 
 function updateBuilderMode() {
