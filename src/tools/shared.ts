@@ -9,6 +9,8 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 
 import os from 'node:os';
 import path from 'node:path';
 import pino from 'pino';
+import { TIMEZONE } from '../config.js';
+import { dateKeyInTimeZone, formatTime24InTimeZone, hourInTimeZone } from '../lib/time.js';
 
 // ── Paths ──────────────────────────────────────────────────────────────
 
@@ -527,22 +529,19 @@ export function writeGoalForOwner(goal: GoalRecord): string {
 // ── Date/Time helpers ───────────────────────────────���──────────────────
 
 export function todayStr(): string {
-  const d = new Date();
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+  return dateKeyInTimeZone(new Date(), TIMEZONE);
 }
 
 export function yesterdayStr(): string {
-  const d = new Date();
-  d.setDate(d.getDate() - 1);
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+  return dateKeyInTimeZone(new Date(Date.now() - 24 * 60 * 60 * 1000), TIMEZONE);
 }
 
 export function nowTime(): string {
-  return new Date().toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' });
+  return formatTime24InTimeZone(new Date(), TIMEZONE);
 }
 
 export function timeOfDaySection(): string {
-  const hour = new Date().getHours();
+  const hour = hourInTimeZone(new Date(), TIMEZONE);
   if (hour < 12) return 'Morning';
   if (hour < 17) return 'Afternoon';
   return 'Evening';

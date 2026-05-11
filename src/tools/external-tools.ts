@@ -17,6 +17,7 @@ import {
   env, externalResult, getStore, logger, textResult,
 } from './shared.js';
 import { getToolDescription } from './tool-meta.js';
+import { TIMEZONE } from '../config.js';
 
 export function registerExternalTools(server: McpServer): void {
 // ── 13. rss_fetch ──────────────────────────────────────────────────────
@@ -483,7 +484,7 @@ server.tool(
   },
   async ({ subject, startDateTime, endDateTime, attendees, body, location, isOnlineMeeting, timeZone }) => {
     const userEmail = env['MS_USER_EMAIL'] ?? '';
-    const tz = timeZone || Intl.DateTimeFormat().resolvedOptions().timeZone;
+    const tz = timeZone || TIMEZONE;
     const event: any = {
       subject,
       start: { dateTime: startDateTime, timeZone: tz },
@@ -526,7 +527,7 @@ server.tool(
   },
   async ({ startDateTime, endDateTime, intervalMinutes }) => {
     const userEmail = env['MS_USER_EMAIL'] ?? '';
-    const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    const tz = TIMEZONE;
     const data = await graphPost(`/users/${userEmail}/calendar/getSchedule`, {
       schedules: [userEmail],
       startTime: { dateTime: startDateTime, timeZone: tz },

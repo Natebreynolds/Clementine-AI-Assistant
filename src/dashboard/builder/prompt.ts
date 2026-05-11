@@ -76,9 +76,11 @@ function buildSystemPrefix(type: string, agentSlug?: string): string {
     : '';
 
   if (type === 'skill') {
-    return `[BUILDER MODE: You are helping build a reusable skill. ${agentContext}As you develop the procedure, output the current state as a JSON block:\n` +
-      '```json-artifact\n{"type":"skill","title":"...","description":"...","triggers":["..."],"steps":"markdown procedure","toolsUsed":["tool1","tool2"]}\n```\n' +
-      `Update this block in EVERY response as the skill evolves. If the user has linked tools, include them in the toolsUsed array. Ask clarifying questions to refine the procedure. Keep it conversational — one question at a time. ` +
+    return `[BUILDER MODE: You are helping build a reusable Anthropic-style skill. ${agentContext}` +
+      `A skill is a concise SKILL.md procedure with optional bundled references/scripts; frontmatter name + description are the trigger surface, and schedules/executions happen outside the skill. Do not design a workflow graph unless the user explicitly chooses Advanced Workflow.\n` +
+      `As you develop the procedure, output the current state as a JSON block:\n` +
+      '```json-artifact\n{"type":"skill","name":"kebab-case-slug","title":"...","description":"what it does and when to use it","triggers":["..."],"steps":"markdown procedure","tools":["mcp__server__tool"],"inputs":{"sheet_id":{"type":"string","description":"Google Sheet id"}},"dataSources":[{"kind":"asana","purpose":"read task status"}],"successCriteria":""}\n```\n' +
+      `Update this block in EVERY response as the skill evolves. If the user has linked MCP/local CLI/project tools, include exact tool names in the tools array, using fully qualified MCP names when available. Put only parameter schemas in inputs, source dependencies in dataSources, and completion checks in successCriteria. Keep the procedure under 500 lines; add references or scripts only when they reduce repeated work, fragility, or token load. Ask one clarifying question at a time.\n` +
       `When the user says "save" or approves, output the final artifact block.]\n\n`;
   }
 
@@ -99,21 +101,21 @@ function buildSystemPrefix(type: string, agentSlug?: string): string {
   }
 
   if (type === 'workflow') {
-    return `[BUILDER MODE: You are helping the user DRAFT a "trick" — a (possibly multi-step) thing Clementine can do on a schedule or on demand. You are NOT executing the trick. You are not running anything in the background. You are only authoring a spec the user will save, then run later from the dashboard.\n` +
+    return `[BUILDER MODE: Advanced Workflow draft mode. Prefer a reusable skill plus a schedule for most automations; use this mode only when the user explicitly wants a legacy multi-step pipeline spec. You are NOT executing the workflow. You are not running anything in the background. You are only authoring a spec the user will save, then run later from the dashboard.\n` +
       `\n` +
       `Hard rules:\n` +
       `  - NEVER say "on it", "running in the background", "I'll follow up", "working on it now", or anything else that implies you're executing the user's request. You are drafting a spec.\n` +
       `  - Stay strictly conversational. One short question per turn. Update the artifact block on every turn.\n` +
       `  - If the user describes "real work" (multi-step actions, scrapers, enrichments, reports), still just draft it — don't dispatch.\n` +
       `\n` +
-      `As you develop the trick, output the current state as a JSON block:\n` +
+      `As you develop the workflow, output the current state as a JSON block:\n` +
       '```json-artifact\n{"type":"workflow","name":"...","description":"...","schedule":"","model":"","steps":"step1:\\n  prompt: ...\\nstep2:\\n  prompt: ...\\n  dependsOn: step1"}\n```\n' +
       `Ask about (in roughly this order, one at a time):\n` +
       `  1. The goal (one sentence is fine — confirm it back).\n` +
       `  2. When it should run — natural language is fine ("every weekday at 9"); convert to a cron expression in the schedule field. Empty schedule = manual.\n` +
       `  3. Which tools, projects, or channels she'll need (MCP servers, local CLIs like sf/gh/gcloud, Slack/Discord targets).\n` +
       `  4. Which model — ${MODELS.opus} (most capable), ${MODELS.sonnet} (balanced), or ${MODELS.haiku} (fastest). Leave model empty if the user doesn't care.\n` +
-      `Most tricks need only one prompt step. Add steps only when the user explicitly wants a multi-step pipeline.\n` +
+      `Most automations should be one skill plus one schedule. Add workflow steps only when the user explicitly wants a multi-step pipeline.\n` +
       `If a user message starts with "[STEP ADDED]", they just clicked a Quick Add button to seed a step structure. Focus your reply on writing the prompt field for THAT step — ask one specific clarifying question, then update the artifact. Do NOT restructure the workflow or re-ask about goal/schedule/model.\n` +
       `When the user says "save" or approves, output the final artifact block — don't try to save it yourself, the dashboard handles persistence.]\n\n`;
   }

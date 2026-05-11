@@ -4,7 +4,8 @@
  * Pure functions for resolving {{...}} placeholders in workflow step prompts.
  */
 
-import { OWNER_NAME, ASSISTANT_NAME } from '../config.js';
+import { OWNER_NAME, ASSISTANT_NAME, TIMEZONE } from '../config.js';
+import { dateKeyInTimeZone, formatTime24InTimeZone } from '../lib/time.js';
 
 /**
  * Resolve static variables (available before any step executes).
@@ -16,8 +17,8 @@ export function resolveStaticVariables(
   workflowName: string,
 ): string {
   const now = new Date();
-  const dateStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
-  const timeStr = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
+  const dateStr = dateKeyInTimeZone(now, TIMEZONE);
+  const timeStr = formatTime24InTimeZone(now, TIMEZONE);
 
   return template.replace(/\{\{([^}]+)\}\}/g, (match, key: string) => {
     const trimmed = key.trim();

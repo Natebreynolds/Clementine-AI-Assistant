@@ -8,9 +8,10 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync, existsSync, utimesSync } from 'node:fs';
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync, existsSync, utimesSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import matter from 'gray-matter';
 import type { CronJobDefinition } from '../src/types.js';
 
 let tmpHome: string;
@@ -194,6 +195,34 @@ describe('listSkills — global + per-project precedence', () => {
     const skills = listSkills({ projectWorkDir: projectDir });
     expect(skills.map((s) => `${s.frontmatter.name}/${s.scope}`).sort())
       .toEqual(['global-only/global', 'project-only/project']);
+  });
+});
+
+describe('listSkills — agent-scoped precedence', () => {
+  it('agent-scoped skills shadow global skills with the same name', async () => {
+    const { listSkills, getSkill } = await import('../src/agent/skill-store.js');
+    writeFolderSkill('audit', ANTHROPIC_FRONTMATTER.replace('Extracts text from PDFs', 'GLOBAL VERSION'));
+    const agentDir = path.join(tmpHome, 'vault', '00-System', 'agents', 'sasha', 'skills');
+    writeFolderSkill('audit', ANTHROPIC_FRONTMATTER.replace('Extracts text from PDFs', 'AGENT VERSION'), agentDir);
+
+    const skills = listSkills({ agentSlug: 'sasha' });
+    expect(skills).toHaveLength(1);
+    expect(skills[0].scope).toBe('agent');
+    expect(skills[0].frontmatter.description).toContain('AGENT');
+    expect(getSkill('audit', { agentSlug: 'sasha' })?.scope).toBe('agent');
+  });
+
+  it('project skills still shadow agent-scoped skills', async () => {
+    const { getSkill } = await import('../src/agent/skill-store.js');
+    const agentDir = path.join(tmpHome, 'vault', '00-System', 'agents', 'sasha', 'skills');
+    writeFolderSkill('audit', ANTHROPIC_FRONTMATTER.replace('Extracts text from PDFs', 'AGENT VERSION'), agentDir);
+    const projectDir = path.join(tmpHome, 'projectA');
+    writeFolderSkill('audit', ANTHROPIC_FRONTMATTER.replace('Extracts text from PDFs', 'PROJECT VERSION'),
+      path.join(projectDir, '.clementine', 'skills'));
+
+    const skill = getSkill('audit', { agentSlug: 'sasha', projectWorkDir: projectDir });
+    expect(skill?.scope).toBe('project');
+    expect(skill?.frontmatter.description).toContain('PROJECT');
   });
 });
 
@@ -391,11 +420,11 @@ describe('validateSkill — Anthropic spec', () => {
     expect(skill.validation.some((v) => v.message.includes('64 chars'))).toBe(true);
   });
 
-  it('warns when description is missing', async () => {
+  it('errors when description is missing', async () => {
     const { listSkills } = await import('../src/agent/skill-store.js');
     writeFolderSkill('no-desc', '---\nname: no-desc\n---\nbody');
     const skill = listSkills()[0];
-    expect(skill.validation.some((v) => v.field === 'description')).toBe(true);
+    expect(skill.validation.some((v) => v.field === 'description' && v.severity === 'error')).toBe(true);
   });
 
   it('errors when description exceeds 1024 chars', async () => {
@@ -643,6 +672,98 @@ describe('migrateAllLegacySkills', () => {
     const result = migrateAllLegacySkills();
     expect(result.migrated).toEqual([]);
     expect(result.skipped).toEqual([]);
+  });
+});
+
+describe('writeSkill — folder-form single write path', () => {
+  it('writes Clementine extensions under clementine: in folder form', async () => {
+    const { writeSkill, getSkill } = await import('../src/agent/skill-store.js');
+    const result = writeSkill({
+      name: 'asana-sheet-review',
+      title: 'Asana Sheet Review',
+      description: 'Reviews Asana tasks against a Google Sheet. Use when reconciling task status across systems.',
+      body: '# Procedure\n\n1. Read tasks.\n2. Update the sheet.\n',
+      source: 'manual',
+      tools: ['mcp__asana__list_tasks', 'mcp__google-sheets__update_cells'],
+      triggers: ['review asana tasks'],
+      dataSources: [{ kind: 'asana', purpose: 'read task status' }],
+      success: { criterion: 'The sheet and Asana have been reconciled.' },
+    });
+
+    expect(result.filePath).toBe(path.join(skillsDir(), 'asana-sheet-review', 'SKILL.md'));
+    const skill = getSkill('asana-sheet-review');
+    expect(skill?.layout).toBe('folder');
+    expect(skill?.schemaVersion).toBe('clementine');
+    expect(skill?.frontmatter.clementine?.tools?.allow).toContain('mcp__asana__list_tasks');
+    expect(skill?.frontmatter.clementine?.triggers).toContain('review asana tasks');
+    expect(skill?.frontmatter.clementine?.dataSources?.[0].kind).toBe('asana');
+    expect(skill?.frontmatter.clementine?.success?.criterion).toContain('reconciled');
+  });
+
+  it('preserves lifecycle metadata and increments version on overwrite', async () => {
+    const { writeSkill, getSkill } = await import('../src/agent/skill-store.js');
+    const first = writeSkill({
+      name: 'daily-report',
+      description: 'Builds a daily report. Use when the user asks for the daily report.',
+      body: '# Procedure\n\nReport.\n',
+      source: 'manual',
+    });
+
+    const parsed = matter(readFileSync(first.filePath, 'utf-8'));
+    parsed.data.clementine.useCount = 7;
+    parsed.data.clementine.lastUsed = '2026-05-01T10:00:00.000Z';
+    writeFileSync(first.filePath, matter.stringify(parsed.content, parsed.data));
+    const createdAt = parsed.data.clementine.createdAt;
+
+    writeSkill({
+      name: 'daily-report',
+      description: 'Builds a daily report. Use when the user asks for the daily report.',
+      body: '# Procedure\n\nUpdated report.\n',
+      source: 'manual',
+      tools: ['Read'],
+      overwrite: true,
+    });
+
+    const skill = getSkill('daily-report');
+    const ext = skill?.frontmatter.clementine;
+    expect(ext?.createdAt).toBe(createdAt);
+    expect(ext?.useCount).toBe(7);
+    expect(ext?.lastUsed).toBe('2026-05-01T10:00:00.000Z');
+    expect(ext?.version).toBe(2);
+    expect(ext?.tools?.allow).toEqual(['Read']);
+  });
+
+  it('overwriting a legacy flat skill creates folder form and hides the stale flat copy from discovery', async () => {
+    const { writeSkill, listSkills, getSkill } = await import('../src/agent/skill-store.js');
+    const flatPath = path.join(skillsDir(), 'legacy-flat.md');
+    writeFlatSkill('legacy-flat.md', LEGACY_FRONTMATTER);
+
+    writeSkill({
+      name: 'legacy-flat',
+      description: 'Updated folder-form skill. Use when testing legacy overwrite migration.',
+      body: '# Procedure\n\nUpdated.\n',
+      source: 'manual',
+      overwrite: true,
+    });
+
+    const skills = listSkills();
+    expect(skills.map(s => s.frontmatter.name)).toEqual(['legacy-flat']);
+    expect(skills[0].layout).toBe('folder');
+    const ext = getSkill('legacy-flat')?.frontmatter.clementine;
+    expect(ext?.useCount).toBe(6);
+    expect(ext?.tools?.allow).toContain('workspace_config');
+    expect(existsSync(flatPath)).toBe(false);
+    expect(existsSync(flatPath + '.bak')).toBe(true);
+  });
+
+  it('rejects names containing reserved words even inside longer slugs', async () => {
+    const { writeSkill } = await import('../src/agent/skill-store.js');
+    expect(() => writeSkill({
+      name: 'claudehelper',
+      description: 'Invalid skill. Use when testing validation.',
+      body: '# Procedure\n\nNo-op.\n',
+      source: 'manual',
+    })).toThrow(/reserved word/);
   });
 });
 

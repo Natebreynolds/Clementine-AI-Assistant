@@ -965,8 +965,8 @@ async function asyncMain(): Promise<void> {
       }).catch((err) => {
         logger.error({ err }, 'Nightly self-improve trigger failed');
       });
-    }, { timezone: process.env.TZ || 'America/Los_Angeles' });
-    logger.info({ hour: selfImproveHour }, `Self-improve nightly trigger scheduled (${selfImproveHour}:00 daily)`);
+    }, { timezone: config.TIMEZONE });
+    logger.info({ hour: selfImproveHour, timezone: config.TIMEZONE }, `Self-improve nightly trigger scheduled (${selfImproveHour}:00 daily)`);
   } catch (err) {
     logger.warn({ err }, 'Failed to schedule nightly self-improve trigger');
   }

@@ -384,10 +384,12 @@ export interface AgentHeartbeatState {
 //
 // Skills directories the loader scans (per-project wins on name collision):
 //   - global:      ~/.clementine/vault/00-System/skills/
+//   - per-agent:   ~/.clementine/vault/00-System/agents/<slug>/skills/
 //   - per-project: <work_dir>/.clementine/skills/
 
-/** Where a skill was loaded from. Per-project skills shadow global. */
-export type SkillScope = 'global' | 'project';
+/** Where a skill was loaded from. Project skills shadow agent/global;
+ *  agent-scoped skills shadow global. */
+export type SkillScope = 'global' | 'agent' | 'project';
 
 /** Three states the dashboard surfaces as badges:
  *    'anthropic' — only `name` + `description` (vanilla Anthropic spec)
@@ -478,6 +480,10 @@ export interface ClementineSkillExtensions {
   source?: string;
   /** Legacy: incrementing counter of runs that invoked the skill. */
   useCount?: number;
+  /** Clementine provenance: job/session that produced this skill. */
+  sourceJob?: string;
+  /** Agent that owns this skill when scoped under agents/<slug>/skills. */
+  agentSlug?: string | null;
   // ── Migration provenance (stamped by migrateLegacySkill) ───────────
   /** Filename the original legacy skill was migrated from. Helps the
    *  migration UI show what came from where. */

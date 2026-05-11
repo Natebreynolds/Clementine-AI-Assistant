@@ -9,7 +9,8 @@ import { input, select, checkbox, password, confirm } from '@inquirer/prompts';
 import { execSync } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
-import { BASE_DIR, SYSTEM_DIR, PROJECTS_DIR, SOUL_FILE, MEMORY_FILE } from '../config.js';
+import { BASE_DIR, SYSTEM_DIR, PROJECTS_DIR, SOUL_FILE, MEMORY_FILE, TIMEZONE } from '../config.js';
+import { dateKeyInTimeZone } from '../lib/time.js';
 
 // ── ANSI helpers ─────────────────────────────────────────────────────
 
@@ -438,7 +439,7 @@ async function aboutYouInterview(ownerName: string): Promise<void> {
       .filter(Boolean);
 
     let created = 0;
-    const today = new Date().toISOString().slice(0, 10);
+    const today = dateKeyInTimeZone(new Date(), TIMEZONE);
 
     for (const name of projectNames) {
       const slug = slugify(name);

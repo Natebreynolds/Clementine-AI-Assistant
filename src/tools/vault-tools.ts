@@ -553,7 +553,7 @@ server.tool(
 
     const today = todayISO();
     const notePath = path.join(notesDir, `${today}.md`);
-    const timestamp = new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
+    const timestamp = nowTime();
 
     if (replace || !existsSync(notePath)) {
       writeFileSync(notePath, `# Daily Log — ${today}\n\n${content}\n`);

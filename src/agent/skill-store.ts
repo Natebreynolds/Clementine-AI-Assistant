@@ -13,8 +13,9 @@
  *      unsupported. Used by the 12 pre-redesign skill files we already
  *      have on disk.
  *
- * Discovery directories (per-project wins on name collision):
+ * Discovery directories (project wins, then agent, then global):
  *   - global:      $CLEMENTINE_HOME/vault/00-System/skills/
+ *   - per-agent:   $CLEMENTINE_HOME/vault/00-System/agents/<slug>/skills/
  *   - per-project: <work_dir>/.clementine/skills/
  *
  * Phase A is read-only. Phase B adds editing + a "Test this skill"
@@ -22,7 +23,7 @@
  * crons → folder-form skills.
  */
 
-import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import matter from 'gray-matter';
@@ -48,6 +49,14 @@ import type {
 function globalSkillsDir(): string {
   const base = process.env.CLEMENTINE_HOME || path.join(os.homedir(), '.clementine');
   return path.join(base, 'vault', '00-System', 'skills');
+}
+
+function agentSkillsDir(agentSlug: string | undefined): string | null {
+  if (!agentSlug) return null;
+  if (!NAME_PATTERN.test(agentSlug)) return null;
+  const base = process.env.CLEMENTINE_HOME || path.join(os.homedir(), '.clementine');
+  const dir = path.join(base, 'vault', '00-System', 'agents', agentSlug, 'skills');
+  return existsSync(dir) ? dir : null;
 }
 
 function projectSkillsDir(workDir: string | undefined): string | null {
@@ -97,7 +106,7 @@ export function validateSkill(skill: Skill): SkillValidationWarning[] {
 
   // Description validation (Anthropic spec).
   if (!fm.description || !fm.description.trim()) {
-    out.push({ severity: 'warning', field: 'description', message: 'description is required by Anthropic spec — add one so the skill can be discovered' });
+    out.push({ severity: 'error', field: 'description', message: 'description is required by Anthropic spec — add one so the skill can be discovered' });
   } else if (fm.description.length > DESCRIPTION_MAX_LEN) {
     out.push({ severity: 'error', field: 'description', message: `description exceeds ${DESCRIPTION_MAX_LEN} chars (got ${fm.description.length})` });
   } else if (/<\w+/i.test(fm.description)) {
@@ -181,6 +190,8 @@ function coerceClementineExtensions(raw: unknown): ClementineSkillExtensions | u
   if (Array.isArray(r.triggers)) out.triggers = r.triggers.map(String);
   if (typeof r.source === 'string') out.source = r.source;
   if (typeof r.useCount === 'number') out.useCount = r.useCount;
+  if (typeof r.sourceJob === 'string') out.sourceJob = r.sourceJob;
+  if (typeof r.agentSlug === 'string' || r.agentSlug === null) out.agentSlug = r.agentSlug;
   if (typeof r.migratedFrom === 'string') out.migratedFrom = r.migratedFrom;
   if (typeof r.migratedAt === 'string') out.migratedAt = r.migratedAt;
 
@@ -366,6 +377,16 @@ function listSkillsInDir(dir: string, scope: SkillScope): Skill[] {
   let entries: string[];
   try { entries = readdirSync(dir); }
   catch { return []; }
+  const folderSkillNames = new Set<string>();
+  for (const entry of entries) {
+    if (entry.startsWith('.')) continue;
+    const fullPath = path.join(dir, entry);
+    try {
+      if (statSync(fullPath).isDirectory() && existsSync(path.join(fullPath, 'SKILL.md'))) {
+        folderSkillNames.add(entry);
+      }
+    } catch { /* skip unreadable */ }
+  }
   const out: Skill[] = [];
   for (const entry of entries) {
     if (entry.startsWith('.')) continue;
@@ -382,6 +403,8 @@ function listSkillsInDir(dir: string, scope: SkillScope): Skill[] {
       continue;
     }
     if (st.isFile() && isLoadableSkillFile(entry)) {
+      const flatName = entry.replace(/\.md$/, '');
+      if (folderSkillNames.has(flatName)) continue;
       out.push(parseSkillFile(fullPath, scope).skill);
     }
   }
@@ -389,18 +412,27 @@ function listSkillsInDir(dir: string, scope: SkillScope): Skill[] {
 }
 
 export interface ListSkillsOptions {
+  /** Optional agent slug. Agent-scoped skills shadow global skills with
+   *  the same identifier. */
+  agentSlug?: string;
   /** Optional per-project work_dir to scan. Per-project skills shadow
-   *  global ones with the same identifier. */
+   *  agent/global ones with the same identifier. */
   projectWorkDir?: string;
   /** Optional cron jobs for the usedByTriggers join (via skills[]). */
   jobs?: CronJobDefinition[];
 }
 
-/** Top-level discovery API. Merges global + per-project pools, with
- *  per-project taking precedence. Populates usedByTriggers when jobs
- *  are passed. Returned list is sorted alphabetically by name. */
+/** Top-level discovery API. Merges global + agent + per-project pools.
+ *  Precedence is project > agent > global. Populates usedByTriggers when
+ *  jobs are passed. Returned list is sorted alphabetically by name. */
 export function listSkills(opts: ListSkillsOptions = {}): Skill[] {
   const globalSkills = listSkillsInDir(globalSkillsDir(), 'global');
+  const agentSkills = opts.agentSlug
+    ? (() => {
+        const adir = agentSkillsDir(opts.agentSlug);
+        return adir ? listSkillsInDir(adir, 'agent') : [];
+      })()
+    : [];
   const projectSkills = opts.projectWorkDir
     ? (() => {
         const pdir = projectSkillsDir(opts.projectWorkDir);
@@ -410,6 +442,7 @@ export function listSkills(opts: ListSkillsOptions = {}): Skill[] {
 
   const merged = new Map<string, Skill>();
   for (const s of globalSkills) merged.set(s.frontmatter.name, s);
+  for (const s of agentSkills) merged.set(s.frontmatter.name, s);
   for (const s of projectSkills) merged.set(s.frontmatter.name, s);
 
   if (opts.jobs && opts.jobs.length > 0) {
@@ -425,10 +458,10 @@ export function listSkills(opts: ListSkillsOptions = {}): Skill[] {
   return [...merged.values()].sort((a, b) => a.frontmatter.name.localeCompare(b.frontmatter.name));
 }
 
-/** Get one skill by name, applying per-project precedence. Returns
- *  null when neither pool has the skill. */
+/** Get one skill by name, applying project > agent > global precedence.
+ *  Returns null when no pool has the skill. */
 export function getSkill(name: string, opts: ListSkillsOptions = {}): Skill | null {
-  // Per-project first (precedence), then global.
+  // Per-project first (highest precedence), then agent, then global.
   const tryDir = (dir: string, scope: SkillScope): Skill | null => {
     const folder = path.join(dir, name);
     if (existsSync(folder) && existsSync(path.join(folder, 'SKILL.md'))) {
@@ -445,6 +478,10 @@ export function getSkill(name: string, opts: ListSkillsOptions = {}): Skill | nu
   if (opts.projectWorkDir) {
     const pdir = projectSkillsDir(opts.projectWorkDir);
     if (pdir) skill = tryDir(pdir, 'project');
+  }
+  if (!skill && opts.agentSlug) {
+    const adir = agentSkillsDir(opts.agentSlug);
+    if (adir) skill = tryDir(adir, 'agent');
   }
   if (!skill) skill = tryDir(globalSkillsDir(), 'global');
   if (skill && opts.jobs) {
@@ -486,8 +523,6 @@ export function readBundledFile(skill: Skill, relPath: string): string | null {
 // The original `<name>.md` is renamed to `<name>.md.bak` (kept on disk for
 // rollback). The bak is filtered out by isLoadableSkillFile so the dashboard
 // won't show it twice.
-
-import { renameSync } from 'node:fs';
 
 export interface MigrationResult {
   ok: boolean;
@@ -669,6 +704,16 @@ export interface WriteSkillInput {
   tools?: string[];
   /** Optional NLP trigger phrases for auto-match — stored under clementine.triggers. */
   triggers?: string[];
+  /** Optional typed invocation inputs — stored under clementine.inputs. */
+  inputs?: Record<string, SkillInputSchema>;
+  /** Optional declarative data sources — stored under clementine.dataSources. */
+  dataSources?: SkillDataSource[];
+  /** Optional state keys this skill owns — stored under clementine.stateKeys. */
+  stateKeys?: string[];
+  /** Optional success criterion/schema — stored under clementine.success. */
+  success?: SkillSuccess;
+  /** Optional runtime limits — stored under clementine.limits. */
+  limits?: SkillLimits;
   /** Optional agent scope. When set, writes to <agentsDir>/<slug>/skills/
    *  instead of the global skills dir. Used by auto-extraction so each
    *  hired agent's skills stay isolated by default. */
@@ -696,7 +741,8 @@ export function writeSkill(input: WriteSkillInput): WriteSkillResult {
   if (input.name.length > NAME_MAX_LEN) {
     throw new Error(`writeSkill: name exceeds ${NAME_MAX_LEN} chars`);
   }
-  if (RESERVED_NAMES.has(input.name) || /\b(anthropic|claude)\b/i.test(input.name)) {
+  const lowerName = input.name.toLowerCase();
+  if (RESERVED_NAMES.has(lowerName) || lowerName.includes('anthropic') || lowerName.includes('claude')) {
     throw new Error(`writeSkill: name uses a reserved word`);
   }
   if (!input.description || !input.description.trim()) {
@@ -707,6 +753,9 @@ export function writeSkill(input: WriteSkillInput): WriteSkillResult {
   }
   if (!input.body || !input.body.trim()) {
     throw new Error('writeSkill: body is required');
+  }
+  if (input.agentSlug && !NAME_PATTERN.test(input.agentSlug)) {
+    throw new Error('writeSkill: agentSlug must match ^[a-z0-9][a-z0-9-]{0,63}$');
   }
 
   // Resolve target directory. Agent-scoped writes land under the agent's
@@ -719,9 +768,54 @@ export function writeSkill(input: WriteSkillInput): WriteSkillResult {
 
   const folderPath = path.join(targetDir, input.name);
   const entryPath = path.join(folderPath, 'SKILL.md');
-  const existed = existsSync(entryPath);
+  const flatEntryPath = path.join(targetDir, input.name + '.md');
+  const folderExisted = existsSync(entryPath);
+  const flatExisted = existsSync(flatEntryPath);
+  const existed = folderExisted || flatExisted;
   if (existed && !input.overwrite) {
     throw new Error(`writeSkill: skill "${input.name}" already exists`);
+  }
+
+  const now = new Date().toISOString();
+  let existingFm: Record<string, unknown> = {};
+  let existingExt: Record<string, unknown> = {};
+  if (existed) {
+    const existingPath = folderExisted ? entryPath : flatEntryPath;
+    try {
+      const parsed = matter(readFileSync(existingPath, 'utf-8'));
+      existingFm = parsed.data as Record<string, unknown>;
+      existingExt = (
+        existingFm.clementine
+        && typeof existingFm.clementine === 'object'
+        && !Array.isArray(existingFm.clementine)
+      )
+        ? { ...(existingFm.clementine as Record<string, unknown>) }
+        : {};
+
+      // Legacy flat skills stored these lifecycle/tool fields at top
+      // level. Fold them into clementine: when overwriting to folder
+      // form so the migration is implicit and non-lossy.
+      if (Array.isArray(existingFm.triggers) && existingExt.triggers === undefined) {
+        existingExt.triggers = existingFm.triggers.map(String);
+      }
+      if (Array.isArray(existingFm.toolsUsed)) {
+        const prevTools = (
+          existingExt.tools
+          && typeof existingExt.tools === 'object'
+          && !Array.isArray(existingExt.tools)
+        )
+          ? { ...(existingExt.tools as Record<string, unknown>) }
+          : {};
+        if (prevTools.allow === undefined) prevTools.allow = existingFm.toolsUsed.map(String);
+        existingExt.tools = prevTools;
+      }
+      for (const key of ['source', 'useCount', 'lastUsed', 'createdAt', 'updatedAt', 'sourceJob', 'agentSlug']) {
+        if (existingExt[key] === undefined && existingFm[key] !== undefined) existingExt[key] = existingFm[key];
+      }
+    } catch {
+      existingFm = {};
+      existingExt = {};
+    }
   }
 
   mkdirSync(folderPath, { recursive: true });
@@ -730,31 +824,83 @@ export function writeSkill(input: WriteSkillInput): WriteSkillResult {
   // top-level. Everything else under clementine:. The lifecycle metadata
   // (createdAt / updatedAt / version) keeps the Skills page detail pane
   // accurate without authors having to remember to set it by hand.
-  const now = new Date().toISOString();
   const fm: Record<string, unknown> = {
     name: input.name,
     description: input.description.trim(),
   };
-  if (input.title && input.title.trim()) fm.title = input.title.trim();
+  const title = input.title !== undefined
+    ? input.title
+    : (typeof existingFm.title === 'string' ? existingFm.title : undefined);
+  if (title && title.trim()) fm.title = title.trim();
 
   const ext: Record<string, unknown> = {
+    ...existingExt,
     source: input.source,
-    useCount: 0,
-    createdAt: now,
+    useCount: typeof existingExt.useCount === 'number' ? existingExt.useCount : 0,
+    createdAt: typeof existingExt.createdAt === 'string' ? existingExt.createdAt : now,
     updatedAt: now,
-    version: 1,
+    version: typeof existingExt.version === 'number' ? existingExt.version + (existed ? 1 : 0) : 1,
   };
-  if (input.tools && input.tools.length > 0) {
-    ext.tools = { allow: input.tools.map(String).map(s => s.trim()).filter(Boolean) };
+  if (input.agentSlug) ext.agentSlug = input.agentSlug;
+
+  if (input.tools !== undefined) {
+    const allowed = input.tools.map(String).map(s => s.trim()).filter(Boolean);
+    const previousTools = (
+      ext.tools
+      && typeof ext.tools === 'object'
+      && !Array.isArray(ext.tools)
+    )
+      ? { ...(ext.tools as Record<string, unknown>) }
+      : {};
+    if (allowed.length > 0) previousTools.allow = allowed;
+    else delete previousTools.allow;
+    if (Array.isArray(previousTools.allow) || Array.isArray(previousTools.deny)) ext.tools = previousTools;
+    else delete ext.tools;
   }
-  if (input.triggers && input.triggers.length > 0) {
-    ext.triggers = input.triggers.map(String).map(s => s.trim()).filter(Boolean);
+  if (input.triggers !== undefined) {
+    const triggers = input.triggers.map(String).map(s => s.trim()).filter(Boolean);
+    if (triggers.length > 0) ext.triggers = triggers;
+    else delete ext.triggers;
   }
-  if (input.sourceJob) ext.sourceJob = input.sourceJob;
+  if (input.inputs !== undefined) {
+    if (input.inputs && Object.keys(input.inputs).length > 0) ext.inputs = input.inputs;
+    else delete ext.inputs;
+  }
+  if (input.dataSources !== undefined) {
+    if (Array.isArray(input.dataSources) && input.dataSources.length > 0) ext.dataSources = input.dataSources;
+    else delete ext.dataSources;
+  }
+  if (input.stateKeys !== undefined) {
+    const stateKeys = input.stateKeys.map(String).map(s => s.trim()).filter(Boolean);
+    if (stateKeys.length > 0) ext.stateKeys = stateKeys;
+    else delete ext.stateKeys;
+  }
+  if (input.success !== undefined) {
+    if (input.success && Object.keys(input.success).length > 0) ext.success = input.success;
+    else delete ext.success;
+  }
+  if (input.limits !== undefined) {
+    if (input.limits && Object.keys(input.limits).length > 0) ext.limits = input.limits;
+    else delete ext.limits;
+  }
+  if (input.sourceJob !== undefined) {
+    if (input.sourceJob) ext.sourceJob = input.sourceJob;
+    else delete ext.sourceJob;
+  }
   fm.clementine = ext;
 
   const content = matter.stringify(input.body.endsWith('\n') ? input.body : input.body + '\n', fm);
   writeFileSync(entryPath, content);
+
+  // If this write implicitly migrated a legacy flat skill, move the
+  // stale flat file out of the load path. Discovery already prefers the
+  // folder form, but leaving <name>.md behind means deleting the folder
+  // later can resurrect old behavior.
+  if (flatExisted) {
+    const backupPath = flatEntryPath + '.bak';
+    const finalBackupPath = existsSync(backupPath) ? `${backupPath}.${Date.now()}` : backupPath;
+    try { renameSync(flatEntryPath, finalBackupPath); } catch { /* non-fatal; folder form still wins */ }
+  }
 
   return { filePath: entryPath, name: input.name, overwrote: existed };
 }

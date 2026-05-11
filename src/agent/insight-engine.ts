@@ -13,10 +13,11 @@ import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import path from 'node:path';
 import pino from 'pino';
 
-import { GOALS_DIR, BASE_DIR, MEMORY_DB_PATH, VAULT_DIR } from '../config.js';
+import { GOALS_DIR, BASE_DIR, MEMORY_DB_PATH, VAULT_DIR, TIMEZONE } from '../config.js';
 import { listAllGoals } from '../tools/shared.js';
 import { computeBrokenJobs } from '../gateway/failure-monitor.js';
 import { MemoryStore } from '../memory/store.js';
+import { dateKeyInTimeZone } from '../lib/time.js';
 
 const logger = pino({ name: 'clementine.insight-engine' });
 
@@ -47,7 +48,7 @@ const UNACKED_THRESHOLD = 3; // double cooldown after this many ignored
  * Check if it's too soon to send another proactive message.
  */
 export function canSendInsight(state: InsightState): boolean {
-  const today = new Date().toISOString().slice(0, 10);
+  const today = dateKeyInTimeZone(new Date(), TIMEZONE);
 
   // Reset daily count on new day
   if (state.currentDate !== today) {

@@ -13,7 +13,7 @@
  * needed) — just parses.
  */
 import { describe, it, expect } from 'vitest';
-import { getDashboardHTML } from '../src/cli/dashboard.js';
+import { getDashboardHTML, redactMcpServersForDashboard } from '../src/cli/dashboard.js';
 
 describe('dashboard SPA inline JS parses', () => {
   it('every inline <script> block is valid JS', () => {
@@ -52,5 +52,34 @@ describe('dashboard SPA inline JS parses', () => {
       ).join('\n');
       throw new Error(`Dashboard SPA has ${errors.length} inline JS parse error(s):${detail}`);
     }
+  });
+
+  it('redacts MCP server env and header values from dashboard API payloads', () => {
+    const servers = redactMcpServersForDashboard([
+      {
+        name: 'sensitive',
+        type: 'stdio',
+        command: 'npx',
+        args: ['tool'],
+        env: {
+          API_TOKEN: 'secret-token-value',
+          DATAFORSEO_PASSWORD: 'secret-password-value',
+        },
+        headers: {
+          Authorization: 'Bearer secret-header-value',
+        },
+        description: 'Sensitive server',
+        enabled: true,
+        source: 'user',
+      },
+    ]);
+    const json = JSON.stringify(servers);
+    expect(json).not.toContain('secret-token-value');
+    expect(json).not.toContain('secret-password-value');
+    expect(json).not.toContain('secret-header-value');
+    expect(servers[0].envKeys).toEqual(['API_TOKEN', 'DATAFORSEO_PASSWORD']);
+    expect(servers[0].headerKeys).toEqual(['Authorization']);
+    expect(servers[0]).not.toHaveProperty('env');
+    expect(servers[0]).not.toHaveProperty('headers');
   });
 });

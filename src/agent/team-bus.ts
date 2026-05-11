@@ -13,6 +13,8 @@ import type { AgentProfile, TeamMessage } from '../types.js';
 import type { Gateway } from '../gateway/router.js';
 import type { TeamRouter } from './team-router.js';
 import { listAllGoals } from '../tools/shared.js';
+import { TIMEZONE } from '../config.js';
+import { dateKeyInTimeZone } from '../lib/time.js';
 
 const logger = pino({ name: 'clementine.team-bus' });
 
@@ -662,7 +664,7 @@ export class TeamBus {
     toSlug: string,
     content: string,
   ): Promise<TeamMessage | null> {
-    const today = new Date().toISOString().slice(0, 10);
+    const today = dateKeyInTimeZone(new Date(), TIMEZONE);
 
     // Daily cap: max 2 context shares per sender per day
     const tracker = this.contextShareCounts.get(fromSlug);

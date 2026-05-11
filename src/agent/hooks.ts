@@ -15,6 +15,7 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID } from 'node:crypto';
 import { OWNER_NAME, BASE_DIR, TIMEZONE } from '../config.js';
 import type { SendPolicy } from '../types.js';
+import { formatTime24InTimeZone } from '../lib/time.js';
 
 // ── Shared state ───────────────────────────────────────────────────────
 
@@ -252,7 +253,7 @@ export function clearActiveQueryContext(): void {
 }
 
 export function logToolUse(toolName: string, toolInput: Record<string, unknown>): void {
-  const timestamp = new Date().toLocaleTimeString('en-US', { hour12: false });
+  const timestamp = formatTime24InTimeZone(new Date(), TIMEZONE);
   const summary = summarizeToolCall(toolName, toolInput);
   const entry = `- \`${timestamp}\` **${toolName}** — ${summary}`;
   auditLog.push(entry);

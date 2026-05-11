@@ -47,6 +47,7 @@ import { cmdIngestSeed, cmdIngestRun, cmdIngestList, cmdIngestStatus } from './i
 import { cmdBrowserStatus, cmdBrowserInstall, cmdBrowserEnable, cmdBrowserDisable, cmdBrowserConnect, maybePromptBrowserHarness } from './browser.js';
 import { parseEnvText } from '../config/env-parser.js';
 import { isSensitiveEnvKey } from '../secrets/sensitivity.js';
+import { dateKeyInTimeZone, resolveTimeZone } from '../lib/time.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -66,6 +67,19 @@ const PACKAGE_ROOT = path.resolve(__dirname, '..', '..');
 const DIST_ENTRY = path.join(PACKAGE_ROOT, 'dist', 'index.js');
 
 const ENV_PATH = path.join(BASE_DIR, '.env');
+const DASHBOARD_PID_FILE = path.join(BASE_DIR, '.dashboard.pid');
+
+function cliTimeZone(): string {
+  try {
+    if (existsSync(ENV_PATH)) {
+      const env = parseEnvText(readFileSync(ENV_PATH, 'utf-8'));
+      return resolveTimeZone(process.env.TIMEZONE, env.TIMEZONE);
+    }
+  } catch {
+    // Fall back to system timezone.
+  }
+  return resolveTimeZone(process.env.TIMEZONE);
+}
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
@@ -76,6 +90,37 @@ function getAssistantName(): string {
     if (match) return match[1].trim();
   }
   return 'Clementine';
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function isDashboardHttpListening(port: number): Promise<boolean> {
+  return new Promise(resolve => {
+    const req = http.request(
+      { hostname: '127.0.0.1', port, path: '/health', method: 'GET', timeout: 750 },
+      (res: IncomingMessage) => {
+        res.resume();
+        resolve(true);
+      },
+    );
+    req.on('timeout', () => {
+      req.destroy();
+      resolve(false);
+    });
+    req.on('error', () => resolve(false));
+    req.end();
+  });
+}
+
+async function waitForDashboardHttp(port: number, timeoutMs = 6000): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await isDashboardHttpListening(port)) return true;
+    await sleep(250);
+  }
+  return false;
 }
 
 function getPidFilePath(): string {
@@ -2556,14 +2601,37 @@ dashCmd
     const killed = killExistingDashboards();
     console.log(killed > 0 ? `  Killed ${killed} dashboard process(es).` : '  No dashboard processes found.');
     console.log('  Relaunching dashboard...');
-    const { spawn } = await import('node:child_process');
+    const portText = opts.port ?? '3030';
+    const port = Number.parseInt(portText, 10);
+    if (!Number.isFinite(port) || port <= 0) {
+      console.error(`  Invalid dashboard port: ${portText}`);
+      process.exit(1);
+    }
+    const logDir = path.join(BASE_DIR, 'logs');
+    try { mkdirSync(logDir, { recursive: true }); } catch { /* ignore */ }
+    const logFile = path.join(logDir, 'dashboard.log');
+    const logFd = openSync(logFile, 'a');
     const child = spawn(
-      'node', [path.join(PACKAGE_ROOT, 'dist/cli/index.js'), 'dashboard', '-p', opts.port ?? '3030'],
-      { detached: true, stdio: 'ignore' },
+      'node',
+      [path.join(PACKAGE_ROOT, 'dist/cli/index.js'), 'dashboard', '-p', portText],
+      {
+        detached: true,
+        stdio: ['ignore', logFd, logFd],
+        env: { ...process.env, __CLEM_DASHBOARD_CHILD: '1' },
+      },
     );
+    if (child.pid) {
+      try { writeFileSync(DASHBOARD_PID_FILE, String(child.pid)); } catch { /* ignore */ }
+    }
     child.unref();
-    console.log('  Dashboard restarted.');
-    process.exit(0);
+    closeSync(logFd);
+    const ready = await waitForDashboardHttp(port);
+    if (!ready) {
+      console.error(`  Dashboard process started${child.pid ? ` (PID ${child.pid})` : ''}, but http://localhost:${port} did not respond.`);
+      console.error(`  Logs: ${logFile}`);
+      process.exit(1);
+    }
+    console.log(`  Dashboard restarted: http://localhost:${port}`);
   });
 
 dashCmd
@@ -3024,7 +3092,7 @@ brainCmd
       if (opts.save) {
         const digestsDir = path.join(VAULT_DIR, '00-System', 'brain-digests');
         mkdirSync(digestsDir, { recursive: true });
-        const stamp = new Date().toISOString().slice(0, 10);
+        const stamp = dateKeyInTimeZone(new Date(), cliTimeZone());
         const filename = path.join(digestsDir, `${stamp}-${days}d.md`);
         const fileBody = `---\ntype: brain-digest\ngeneratedAt: ${new Date().toISOString()}\nwindowDays: ${days}\nmodel: ${opts.model}\n---\n\n${result.markdown}\n`;
         writeFileSync(filename, fileBody);

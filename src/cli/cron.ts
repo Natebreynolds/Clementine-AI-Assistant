@@ -15,6 +15,8 @@ import matter from 'gray-matter';
 import type { CronJobDefinition, CronRunEntry } from '../types.js';
 import { HeartbeatScheduler } from '../gateway/heartbeat-scheduler.js';
 import { parseCronJobs, CronRunLog, classifyError } from '../gateway/cron-scheduler.js';
+import { TIMEZONE } from '../config.js';
+import { hourInTimeZone } from '../lib/time.js';
 
 const BASE_DIR = process.env.CLEMENTINE_HOME || path.join(os.homedir(), '.clementine');
 const LAST_RUN_FILE = path.join(BASE_DIR, '.cron_last_run.json');
@@ -599,7 +601,7 @@ export async function cmdHeartbeat(): Promise<void> {
     standingInstructions = parsed.content;
   }
 
-  const hour = new Date().getHours();
+  const hour = hourInTimeZone(new Date(), TIMEZONE);
   const timeContext = HeartbeatScheduler.getTimeContext(hour);
 
   console.log('Running one-shot heartbeat...');

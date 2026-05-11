@@ -13,6 +13,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { Models } from './types.js';
+import { resolveTimeZone } from './lib/time.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -591,7 +592,8 @@ export const ALLOW_ALL_USERS = getEnv('ALLOW_ALL_USERS', 'false').toLowerCase() 
 // ── Timezone ─────────────────────────────────────────────────────────
 
 /** User-configurable timezone. Falls back to system-detected timezone. */
-export const TIMEZONE = getEnvOrJson('TIMEZONE', json.timezone, Intl.DateTimeFormat().resolvedOptions().timeZone);
+export const TIMEZONE = resolveTimeZone(getEnvOrJson('TIMEZONE', json.timezone, ''));
+process.env.TZ = TIMEZONE;
 
 // ── Heartbeat ────────────────────────────────────────────────────────
 

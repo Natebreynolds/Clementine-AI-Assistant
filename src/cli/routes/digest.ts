@@ -15,6 +15,8 @@ import path from 'node:path';
 import matter from 'gray-matter';
 import type { Gateway } from '../../gateway/router.js';
 import { listAllGoals } from '../../tools/shared.js';
+import { TIMEZONE } from '../../config.js';
+import { dateKeyInTimeZone, formatDateInTimeZone } from '../../lib/time.js';
 
 export interface DigestRouterDeps {
   baseDir: string;
@@ -86,7 +88,8 @@ export function digestRouter(deps: DigestRouterDeps): Router {
     const prefs = getDigestPrefs(prefsFile);
     const secs = (prefs.sections || {}) as Record<string, boolean>;
     const now = new Date();
-    const dateStr = now.toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
+    const dateStr = formatDateInTimeZone(now, TIMEZONE);
+    const todayKey = dateKeyInTimeZone(now, TIMEZONE);
     const sections: Record<string, string> = {};
 
     let officeSummary = '';
@@ -133,8 +136,7 @@ export function digestRouter(deps: DigestRouterDeps): Router {
           let totalOk = 0, totalErr = 0, jobCount = 0;
           for (const f of readdirSync(runsDir).filter(f => f.endsWith('.jsonl'))) {
             const lines = readFileSync(path.join(runsDir, f), 'utf-8').trim().split('\n').filter(Boolean);
-            const today = now.toISOString().slice(0, 10);
-            const todayRuns = lines.filter(l => l.includes(today));
+            const todayRuns = lines.filter(l => l.includes(todayKey));
             if (todayRuns.length > 0) jobCount++;
             for (const l of todayRuns) {
               try { const e = JSON.parse(l); if (e.status === 'ok') totalOk++; else totalErr++; } catch { /* skip */ }

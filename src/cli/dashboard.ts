@@ -15,7 +15,6 @@ import {
   writeFileSync,
   unlinkSync,
   rmSync,
-  copyFileSync,
   statSync,
   readdirSync,
   mkdirSync,
@@ -29,7 +28,7 @@ import matter from 'gray-matter';
 import cron from 'node-cron';
 import type { Gateway } from '../gateway/router.js';
 import { TunnelManager } from './tunnel.js';
-import type { RemoteAccessConfig, SessionRecord, WorkflowDefinition } from '../types.js';
+import type { ManagedMcpServer, RemoteAccessConfig, SessionRecord, WorkflowDefinition } from '../types.js';
 import { AgentManager } from '../agent/agent-manager.js';
 import { discoverMcpServers, getClaudeIntegrations, KNOWN_MCP_DESCRIPTIONS } from '../agent/mcp-bridge.js';
 import { buildBuilderEnrichedMessage, builderSessionKey } from '../dashboard/builder/prompt.js';
@@ -37,6 +36,7 @@ import {
   AGENTS_DIR,
   MEMORY_FILE,
   SESSIONS_FILE,
+  TIMEZONE,
   applyOneMillionContextRecovery,
   looksLikeClaudeOneMillionContextError,
   normalizeClaudeSdkOptionsForOneMillionContext,
@@ -55,6 +55,13 @@ import { loadClementineJson, updateClementineJson } from '../config/clementine-j
 import { annotateUnleashedStatus } from '../gateway/unleashed-status.js';
 import { buildOperationsSnapshot, type BuildUsageTask } from '../dashboard/build-operations.js';
 import { runLocalSeedIngestion } from '../brain/local-seed.js';
+import {
+  dateKeyInTimeZone,
+  formatShortDateInTimeZone,
+  isValidTimeZone,
+  localTimeSnapshot,
+  resolveTimeZone,
+} from '../lib/time.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -71,6 +78,34 @@ const MEMORY_DB_PATH = path.join(VAULT_DIR, '.memory.db');
 const PROJECTS_META_FILE = path.join(BASE_DIR, 'projects.json');
 const DASHBOARD_PID_FILE = path.join(BASE_DIR, '.dashboard.pid');
 const INTERACTIVE_FAILURE_LOG = path.join(BASE_DIR, 'self-improve', 'interactive-failures.jsonl');
+
+export type DashboardMcpServer = Omit<ManagedMcpServer, 'env' | 'headers'> & {
+  envKeys?: string[];
+  headerKeys?: string[];
+  envRedacted?: boolean;
+  headersRedacted?: boolean;
+};
+
+/** Dashboard responses should show that MCP credentials exist without
+ *  returning the values. Runtime code still uses discoverMcpServers()
+ *  directly, so this only affects local HTTP JSON surfaces. */
+export function redactMcpServersForDashboard(servers: ManagedMcpServer[]): DashboardMcpServer[] {
+  return servers.map((server) => {
+    const { env, headers, ...safe } = server;
+    const out: DashboardMcpServer = { ...safe };
+    const envKeys = env && typeof env === 'object' ? Object.keys(env).sort() : [];
+    const headerKeys = headers && typeof headers === 'object' ? Object.keys(headers).sort() : [];
+    if (envKeys.length > 0) {
+      out.envKeys = envKeys;
+      out.envRedacted = true;
+    }
+    if (headerKeys.length > 0) {
+      out.headerKeys = headerKeys;
+      out.headersRedacted = true;
+    }
+    return out;
+  });
+}
 
 /**
  * Kill all existing dashboard processes before starting a new one.
@@ -1080,9 +1115,49 @@ function getLaunchdPlistPath(): string {
   return path.join(home, 'Library', 'LaunchAgents', `${getLaunchdLabel()}.plist`);
 }
 
+function readDashboardEnvValue(key: string): string {
+  try {
+    if (!existsSync(ENV_PATH)) return '';
+    for (const line of readFileSync(ENV_PATH, 'utf-8').split('\n')) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith('#')) continue;
+      const eqIdx = trimmed.indexOf('=');
+      if (eqIdx === -1) continue;
+      const envKey = trimmed.slice(0, eqIdx).trim();
+      if (envKey !== key) continue;
+      let value = trimmed.slice(eqIdx + 1).trim();
+      if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+        value = value.slice(1, -1);
+      }
+      return value;
+    }
+  } catch {
+    // Ignore malformed env files and fall back to config/defaults.
+  }
+  return '';
+}
+
+function dashboardTimeZone(): string {
+  let jsonTz = '';
+  try {
+    jsonTz = loadClementineJson(BASE_DIR).timezone ?? '';
+  } catch {
+    jsonTz = '';
+  }
+  return resolveTimeZone(process.env.TIMEZONE, readDashboardEnvValue('TIMEZONE'), jsonTz, TIMEZONE);
+}
+
+function dashboardTimeSnapshot(date = new Date()) {
+  const timeZone = dashboardTimeZone();
+  process.env.TZ = timeZone;
+  return localTimeSnapshot(date, timeZone);
+}
+
 // ── Data readers ─────────────────────────────────────────────────────
 
 function getStatus(): Record<string, unknown> {
+  const timezone = dashboardTimeZone();
+  process.env.TZ = timezone;
   const pid = readPid();
   const alive = pid ? isProcessAlive(pid) : false;
   const name = getAssistantName();
@@ -1289,8 +1364,6 @@ function getStatus(): Record<string, unknown> {
 
   const activeAgents = activeAgentSlugs.size;
   const successRate = runsToday > 0 ? Math.round((runsOk / runsToday) * 100) : null;
-
-  const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
 
   return {
     name, pid, alive, uptime, channels, launchAgent, currentActivity,
@@ -2327,15 +2400,15 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
     try {
       const result: Record<string, unknown> = {};
       result.version = { hash: buildHash, started: buildHash, needsRestart: false };
+      result.time = dashboardTimeSnapshot();
       try { result.status = getStatus(); } catch { result.status = { alive: false, name: 'Clementine' }; }
       try { result.metrics = computeMetrics(); } catch { result.metrics = {}; }
       try {
-        const today = new Date();
-        const dateStr = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}`;
+        const dateStr = dateKeyInTimeZone(new Date(), dashboardTimeZone());
         const planPath = path.join(PLANS_DIR, `${dateStr}.json`);
         result.plan = existsSync(planPath) ? { ok: true, plan: JSON.parse(readFileSync(planPath, 'utf-8')) } : { ok: false, plan: null };
       } catch { result.plan = { ok: false, plan: null }; }
-      try { result.mcpServers = { servers: discoverMcpServers() }; } catch { result.mcpServers = { servers: [] }; }
+      try { result.mcpServers = { servers: redactMcpServersForDashboard(discoverMcpServers()) }; } catch { result.mcpServers = { servers: [] }; }
       try { result.claudeIntegrations = { integrations: getClaudeIntegrations() }; } catch { result.claudeIntegrations = { integrations: [] }; }
       result.projects = { projects: cachedProjects ?? [] };
       try {
@@ -2670,6 +2743,10 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
     res.json(getStatus());
   });
 
+  app.get('/api/time', (_req, res) => {
+    res.json({ ok: true, time: dashboardTimeSnapshot() });
+  });
+
   app.get('/api/sessions', (_req, res) => {
     res.json(getSessions());
   });
@@ -2936,9 +3013,12 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
   app.get('/api/home-digest', async (_req, res) => {
     try {
       const now = new Date();
-      const dayName = ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'][now.getDay()];
-      const dayLabel = now.toLocaleDateString(undefined, { weekday: 'long', month: 'long', day: 'numeric' });
-      const hour = now.getHours();
+      const time = dashboardTimeSnapshot(now);
+      const timeZone = time.timeZone;
+      const todayKey = time.dateKey;
+      const dayName = time.weekday;
+      const dayLabel = formatShortDateInTimeZone(now, timeZone);
+      const hour = time.hour;
       const greetingPart = hour < 5 ? 'Good evening' : hour < 12 ? 'Good morning' : hour < 18 ? 'Good afternoon' : 'Good evening';
 
       // ── Resolve user name (USER_MODEL.md → MEMORY.md → env → OS user) ──
@@ -3008,7 +3088,6 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
       try {
         const cronRunsDir = path.join(BASE_DIR, 'cron', 'runs');
         if (existsSync(cronRunsDir)) {
-          const today = now.toISOString().slice(0, 10);
           const files = readdirSync(cronRunsDir).filter(f => f.endsWith('.jsonl'));
           for (const f of files) {
             try {
@@ -3018,7 +3097,7 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
                   const e = JSON.parse(line);
                   const ts = e.completedAt || e.startedAt || e.timestamp;
                   if (!ts) continue;
-                  if (String(ts).slice(0, 10) === today) kpis.runsToday++;
+                  if (dateKeyInTimeZone(new Date(ts), timeZone) === todayKey) kpis.runsToday++;
                 } catch { /* */ }
               }
             } catch { /* */ }
@@ -3058,12 +3137,11 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
         const tasksFile = path.join(VAULT_DIR, '05-Tasks', 'TASKS.md');
         if (existsSync(tasksFile)) {
           const content = readFileSync(tasksFile, 'utf-8');
-          const todayStr = now.toISOString().slice(0, 10);
           // Match "- [ ] task @YYYY-MM-DD" pattern; overdue if date < today
           const lines = content.split('\n').filter(l => /^[-*]\s*\[ \]/.test(l));
           for (const line of lines) {
             const m = line.match(/@(\d{4}-\d{2}-\d{2})/);
-            if (m && m[1] < todayStr) kpis.overdueTasks++;
+            if (m && m[1] < todayKey) kpis.overdueTasks++;
           }
         }
       } catch { /* */ }
@@ -3095,16 +3173,14 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
         const { parseCronJobs, parseAgentCronJobs } = await import('../gateway/cron-scheduler.js');
         const all = [...parseCronJobs(), ...parseAgentCronJobs(path.join(VAULT_DIR, '00-System', 'agents'))];
         const cronParser = await import('cron-parser');
-        const todayStart = new Date(now.toDateString()).getTime();
-        const todayEnd = todayStart + 24 * 60 * 60 * 1000;
         for (const job of all) {
           if (!job.enabled) continue;
           let next: string | null = null;
           let firedToday = false;
           try {
-            const interval = (cronParser as any).CronExpressionParser?.parse?.(job.schedule, { currentDate: now }) ??
-                             (cronParser as any).default?.parseExpression?.(job.schedule, { currentDate: now }) ??
-                             (cronParser as any).parseExpression?.(job.schedule, { currentDate: now });
+            const interval = (cronParser as any).CronExpressionParser?.parse?.(job.schedule, { currentDate: now, tz: timeZone }) ??
+                             (cronParser as any).default?.parseExpression?.(job.schedule, { currentDate: now, tz: timeZone }) ??
+                             (cronParser as any).parseExpression?.(job.schedule, { currentDate: now, tz: timeZone });
             const nextDate: Date = typeof interval.next === 'function' ? interval.next().toDate() : interval.next();
             next = nextDate.toISOString();
           } catch { /* */ }
@@ -3116,8 +3192,8 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
               for (const line of tail) {
                 try {
                   const e = JSON.parse(line);
-                  const ts = new Date(e.completedAt || e.startedAt || 0).getTime();
-                  if (ts >= todayStart && ts < todayEnd) { firedToday = true; break; }
+                  const ts = e.completedAt || e.startedAt || 0;
+                  if (ts && dateKeyInTimeZone(new Date(ts), timeZone) === todayKey) { firedToday = true; break; }
                 } catch { /* */ }
               }
             }
@@ -3144,7 +3220,7 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
         highlights: [],
         needsReview: [],
       };
-      const todayStr = now.toISOString().slice(0, 10);
+      const todayStr = todayKey;
       const dailyNotePath = path.join(VAULT_DIR, '01-Daily-Notes', todayStr + '.md');
       try {
         if (existsSync(dailyNotePath)) {
@@ -3199,7 +3275,6 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
         try {
           const cronRunsDir = path.join(BASE_DIR, 'cron', 'runs');
           if (existsSync(cronRunsDir)) {
-            const todayMs = new Date(todayStr + 'T00:00:00Z').getTime();
             const recent: Array<{ ts: number; title: string; body: string }> = [];
             for (const f of readdirSync(cronRunsDir).filter(x => x.endsWith('.jsonl')).slice(0, 30)) {
               try {
@@ -3208,7 +3283,7 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
                   try {
                     const e = JSON.parse(line);
                     const ts = new Date(e.completedAt || e.startedAt || 0).getTime();
-                    if (ts < todayMs) continue;
+                    if (dateKeyInTimeZone(new Date(ts), timeZone) !== todayKey) continue;
                     const body = (e.responsePreview || e.summary || e.output || '').slice(0, 180);
                     if (!body) continue;
                     recent.push({ ts, title: f.replace('.jsonl', ''), body });
@@ -3266,6 +3341,7 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
 
       res.json({
         greeting: { phrase: greetingPart, name: userName, dayLabel, dayName },
+        time,
         kpis,
         briefing,
         todayRuns: todayRuns.slice(0, 6),
@@ -4110,7 +4186,7 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
         inputs: {},
         steps: (steps ?? [{
           id: 's1',
-          prompt: body.initialPrompt ?? 'Describe what this trick should do.',
+          prompt: body.initialPrompt ?? 'Describe what this workflow should do.',
           dependsOn: [],
           tier: 1,
           maxTurns: 15,
@@ -4164,7 +4240,7 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
       const parsed = parseBuilderId(id);
       if (!parsed) { res.status(400).json({ error: 'Bad id' }); return; }
       if (parsed.origin === 'cron') {
-        res.status(400).json({ error: 'This trick came from a legacy cron entry — disable it instead, or edit CRON.md directly.' });
+        res.status(400).json({ error: 'This workflow came from a legacy cron entry — disable it instead, or edit CRON.md directly.' });
         return;
       }
       const wf = readWorkflow(id);
@@ -4215,7 +4291,7 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
         });
         child.unref();
         broadcastEvent({ type: 'cron_triggered', data: { job: wf.name } });
-        res.json({ ok: true, message: `Triggered trick: ${wf.name}` });
+        res.json({ ok: true, message: `Triggered workflow: ${wf.name}` });
         return;
       }
 
@@ -4241,12 +4317,12 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
         res.status(409).json({
           ok: false,
           error: 'approval_required',
-          message: 'This trick may send, write, post, or call external tools. Approve side effects before running it.',
+          message: 'This workflow may send, write, post, or call external tools. Approve side effects before running it.',
           sideEffects,
         });
         return;
       }
-      res.json({ ok: true, message: `Trick "${wf.name}" triggered` });
+      res.json({ ok: true, message: `Workflow "${wf.name}" triggered` });
       broadcastEvent({ type: 'workflow_triggered', data: { id, name: wf.name } });
       getGateway().then(gw => gw.handleWorkflow(wf, body.inputs || {})).then(result => {
         broadcastEvent({ type: 'workflow_complete', data: { id, name: wf.name, status: 'ok', preview: (result || '').slice(0, 300) } });
@@ -4433,7 +4509,10 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
       const { getSkill } = await import('../agent/skill-store.js');
       const { parseCronJobs } = await import('../gateway/cron-scheduler.js');
       const jobs = parseCronJobs();
-      const skill = getSkill(name, { jobs });
+      const agentSlug = typeof req.query.agent === 'string'
+        ? req.query.agent
+        : (typeof req.query.agentSlug === 'string' ? req.query.agentSlug : undefined);
+      const skill = getSkill(name, { jobs, ...(agentSlug ? { agentSlug } : {}) });
       if (!skill) { res.status(404).json({ ok: false, error: `skill "${name}" not found` }); return; }
       res.json({ ok: true, skill });
     } catch (err) {
@@ -5000,7 +5079,7 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
           const cronPrompt = String(job.prompt || '').trim();
           const desc = generateDescription(cronPrompt, null);
           const triggerPhrase = job.name.replace(/-/g, ' ');
-          const description = `${desc} Use when this scheduled task fires (cron: ${job.schedule}) or when the user mentions "${triggerPhrase}".`.slice(0, 1024);
+          const description = `${desc} Use when this schedule fires (cron: ${job.schedule}) or when the user mentions "${triggerPhrase}".`.slice(0, 1024);
           try {
             writeSkill({
               name: candidate,
@@ -5128,7 +5207,7 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
       const cronPrompt = String(target.prompt || '').trim();
       const cleanedDesc = generateDescription(cronPrompt, null);
       const triggerPhrase = jobName.replace(/-/g, ' ');
-      const description = `${cleanedDesc} Use when this scheduled task fires (cron: ${target.schedule}) or when the user mentions "${triggerPhrase}".`.slice(0, 1024);
+      const description = `${cleanedDesc} Use when this schedule fires (cron: ${target.schedule}) or when the user mentions "${triggerPhrase}".`.slice(0, 1024);
 
       const body = [
         `# ${skillName.replace(/-/g, ' ').replace(/\b\w/g, c => c.toUpperCase())}`,
@@ -5422,7 +5501,7 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
         return;
       }
       const { ok: _ignore, ...rest } = result;
-      res.json({ ...rest, ok: true, message: result.wasUpdate ? 'Hooks updated.' : 'Hooks installed. The next run of this task will emit per-tool latency to the dashboard.' });
+      res.json({ ...rest, ok: true, message: result.wasUpdate ? 'Hooks updated.' : 'Hooks installed. The next run of this schedule will emit per-tool latency to the dashboard.' });
     } catch (err) {
       res.status(500).json({ ok: false, error: String(err) });
     }
@@ -5443,7 +5522,7 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
         res.status(409).json({ ok: false, error: result.error });
         return;
       }
-      res.json({ ok: true, message: 'Hooks disabled. The next run of this task will use only the in-process tap (path A).' });
+      res.json({ ok: true, message: 'Hooks disabled. The next run of this schedule will use only the in-process tap (path A).' });
     } catch (err) {
       res.status(500).json({ ok: false, error: String(err) });
     }
@@ -8717,7 +8796,7 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
       const env = parseEnvFile();
       const groups = CONFIG_GROUPS.map(g => ({
         label: g.label,
-        fields: g.keys.map(k => ({
+        fields: g.keys.filter(k => k.key !== 'TIMEZONE').map(k => ({
           key: k.key,
           label: k.label,
           hint: k.hint,
@@ -8749,7 +8828,7 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
         });
       }
 
-      res.json({ groups });
+      res.json({ groups, time: dashboardTimeSnapshot() });
     } catch (err) {
       res.status(500).json({ error: String(err) });
     }
@@ -8773,6 +8852,10 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
         res.status(400).json({ error: `Invalid key format: ${key}` });
         return;
       }
+      if (key === 'TIMEZONE' && !isValidTimeZone(value)) {
+        res.status(400).json({ error: 'TIMEZONE must be a valid IANA timezone, for example America/Los_Angeles.' });
+        return;
+      }
       writeEnvValue(key, value);
 
       // Apply runtime-hot settings immediately (no restart needed)
@@ -8788,6 +8871,10 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
 	      if (key.startsWith('ASSISTANT_')) {
 	        process.env[key] = value;
 	      }
+      if (key === 'TIMEZONE') {
+        process.env.TIMEZONE = value;
+        process.env.TZ = value;
+      }
 
       res.json({ ok: true, message: `Updated ${key}` });
     } catch (err) {
@@ -8814,6 +8901,10 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
 	      if (key.startsWith('ASSISTANT_')) {
 	        delete process.env[key];
 	      }
+      if (key === 'TIMEZONE') {
+        delete process.env.TIMEZONE;
+        process.env.TZ = dashboardTimeZone();
+      }
 
 	      res.json({ ok: true, message: `Removed ${key}` });
     } catch (err) {
@@ -9888,8 +9979,25 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
 
       // Build a test prompt that injects the skill as context
       let skillContext = `## Skill Being Tested: ${artifact.title}\n\n${artifact.description || ''}\n\n## Procedure\n\n${artifact.steps}`;
-      if (artifact.toolsUsed?.length) {
-        skillContext += `\n\n**Tools for this skill:** ${artifact.toolsUsed.join(', ')}`;
+      const artifactTools = Array.isArray(artifact.tools) ? artifact.tools : (Array.isArray(artifact.toolsUsed) ? artifact.toolsUsed : []);
+      if (artifactTools.length) {
+        skillContext += `\n\n**Runtime allowlist for this skill:** ${artifactTools.join(', ')}`;
+      }
+      if (artifact.inputs && typeof artifact.inputs === 'object' && !Array.isArray(artifact.inputs)) {
+        skillContext += `\n\n**Inputs:**\n\`\`\`json\n${JSON.stringify(artifact.inputs, null, 2)}\n\`\`\``;
+      }
+      if (Array.isArray(artifact.dataSources) && artifact.dataSources.length > 0) {
+        skillContext += `\n\n**Data sources:**\n${artifact.dataSources.map((d: unknown) => {
+          if (typeof d === 'string') return `- ${d}`;
+          if (d && typeof d === 'object' && !Array.isArray(d)) {
+            const r = d as Record<string, unknown>;
+            return `- ${String(r.kind || 'source')}: ${String(r.purpose || '')}`;
+          }
+          return '';
+        }).filter(Boolean).join('\n')}`;
+      }
+      if (typeof artifact.successCriteria === 'string' && artifact.successCriteria.trim()) {
+        skillContext += `\n\n**Success criteria:** ${artifact.successCriteria.trim()}`;
       }
       const testPrompt = `[SKILL TEST MODE — You have a skill loaded. Use the procedure below to respond to the user's message. This is a dry-run test so describe what you would do at each step rather than actually executing tools.]\n\n${skillContext}\n\n${trigger}`;
 
@@ -9904,64 +10012,101 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
   });
 
   // Save completed builder artifact
-  app.post('/api/builder/save', (req, res) => {
+  app.post('/api/builder/save', async (req, res) => {
     try {
       const { artifactType, artifact, agentSlug, attachments } = req.body;
       if (!artifact) { res.status(400).json({ error: 'artifact is required' }); return; }
 
       if (artifactType === 'skill') {
-        // Scope to agent if selected, otherwise global
-        const skillsDir = agentSlug
-          ? path.join(VAULT_DIR, '00-System', 'agents', agentSlug, 'skills')
-          : path.join(VAULT_DIR, '00-System', 'skills');
-        if (!existsSync(skillsDir)) mkdirSync(skillsDir, { recursive: true });
-        const name = (artifact.title || 'untitled').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 60);
-        const now = new Date().toISOString();
-        const matterMod = require('gray-matter');
+        const rawName = String(artifact.name || artifact.title || 'untitled');
+        const name = rawName
+          .toLowerCase()
+          .replace(/[_\s]+/g, '-')
+          .replace(/[^a-z0-9-]/g, '')
+          .replace(/-+/g, '-')
+          .replace(/^-+|-+$/g, '')
+          .slice(0, 64);
+        if (!name) { res.status(400).json({ error: 'Skill name could not be derived' }); return; }
 
-        // Backup existing skill before overwrite + preserve runtime stats
-        const existingPath = path.join(skillsDir, `${name}.md`);
-        let existingUseCount = 0;
-        let existingCreatedAt = now;
-        if (existsSync(existingPath)) {
-          copyFileSync(existingPath, existingPath.replace(/\.md$/, '.md.bak'));
-          try {
-            const prev = matterMod(readFileSync(existingPath, 'utf-8'));
-            existingUseCount = prev.data.useCount ?? 0;
-            existingCreatedAt = prev.data.createdAt ?? now;
-          } catch { /* use defaults */ }
-        }
+        const title = typeof artifact.title === 'string' && artifact.title.trim()
+          ? artifact.title.trim()
+          : name.replace(/-/g, ' ').replace(/\b\w/g, (c: string) => c.toUpperCase());
+        const description = typeof artifact.description === 'string' && artifact.description.trim()
+          ? artifact.description.trim()
+          : `Reusable Clementine skill for ${title}. Use when the user asks to run or schedule this procedure.`;
+        const steps = typeof artifact.steps === 'string' ? artifact.steps.trim() : '';
+        if (!steps) { res.status(400).json({ error: 'Skill procedure is required' }); return; }
 
-        const meta: Record<string, unknown> = {
-          title: artifact.title, description: artifact.description || '', triggers: artifact.triggers || [],
-          source: 'builder', toolsUsed: artifact.toolsUsed || [], useCount: existingUseCount, createdAt: existingCreatedAt, updatedAt: now,
-        };
-        if (agentSlug) meta.agentSlug = agentSlug;
+        const tools = (Array.isArray(artifact.tools) ? artifact.tools : Array.isArray(artifact.toolsUsed) ? artifact.toolsUsed : [])
+          .map(String)
+          .map((s: string) => s.trim())
+          .filter(Boolean);
+        const triggers = Array.isArray(artifact.triggers)
+          ? artifact.triggers.map(String).map((s: string) => s.trim()).filter(Boolean)
+          : [];
+        const dataSources = Array.isArray(artifact.dataSources)
+          ? artifact.dataSources
+              .map((d: unknown) => {
+                if (typeof d === 'string') {
+                  const trimmed = d.trim();
+                  if (!trimmed) return null;
+                  const idx = trimmed.indexOf(':');
+                  return idx > 0
+                    ? { kind: trimmed.slice(0, idx).trim() || 'source', purpose: trimmed.slice(idx + 1).trim() }
+                    : { kind: 'source', purpose: trimmed };
+                }
+                if (!d || typeof d !== 'object' || Array.isArray(d)) return null;
+                const r = d as Record<string, unknown>;
+                return {
+                  kind: String(r.kind || 'source'),
+                  purpose: String(r.purpose || r.name || ''),
+                };
+              })
+              .filter((d: { kind: string; purpose: string } | null): d is { kind: string; purpose: string } => !!d && !!d.purpose.trim())
+          : undefined;
+        const success = typeof artifact.successCriteria === 'string' && artifact.successCriteria.trim()
+          ? { criterion: artifact.successCriteria.trim() }
+          : undefined;
+        const limits = artifact.limits && typeof artifact.limits === 'object' && !Array.isArray(artifact.limits)
+          ? artifact.limits
+          : undefined;
 
-        // Persist attached reference files alongside the skill
-        const attachmentNames: string[] = [];
+        const { writeSkill } = await import('../agent/skill-store.js');
+        const result = writeSkill({
+          name,
+          title,
+          description,
+          body: steps.endsWith('\n') ? steps : steps + '\n',
+          tools,
+          triggers,
+          inputs: artifact.inputs && typeof artifact.inputs === 'object' && !Array.isArray(artifact.inputs) ? artifact.inputs : undefined,
+          dataSources,
+          success,
+          limits,
+          source: 'manual',
+          ...(agentSlug ? { agentSlug: String(agentSlug) } : {}),
+          overwrite: true,
+        });
+
+        const writtenAttachments: string[] = [];
         if (Array.isArray(attachments) && attachments.length > 0) {
-          const skillAttDir = path.join(skillsDir, name + '.files');
-          if (!existsSync(skillAttDir)) mkdirSync(skillAttDir, { recursive: true });
+          const skillFolder = path.dirname(result.filePath);
           for (const att of attachments) {
-            if (att.filename && att.content) {
-              try {
-                const safeName = att.filename.replace(/[^a-zA-Z0-9._-]/g, '_');
-                writeFileSync(path.join(skillAttDir, safeName), Buffer.from(att.content, 'base64'));
-                attachmentNames.push(safeName);
-              } catch { /* skip bad files */ }
-            }
+            if (!att || !att.filename || !att.content) continue;
+            try {
+              const safeName = String(att.filename).replace(/[^a-zA-Z0-9._-]/g, '_');
+              const subdir = /\.(py|js|ts|sh|rb)$/i.test(safeName) ? 'scripts' : 'references';
+              const targetDir = path.join(skillFolder, subdir);
+              if (!existsSync(targetDir)) mkdirSync(targetDir, { recursive: true });
+              writeFileSync(path.join(targetDir, safeName), Buffer.from(String(att.content), 'base64'));
+              writtenAttachments.push(`${subdir}/${safeName}`);
+            } catch { /* best-effort: skip malformed attachment */ }
           }
         }
-        if (attachmentNames.length > 0) meta.attachments = attachmentNames;
 
-        const content = matterMod.stringify(
-          `\n# ${artifact.title}\n\n${artifact.description || ''}\n\n## Procedure\n\n${artifact.steps || ''}\n`,
-          meta,
-        );
-        writeFileSync(path.join(skillsDir, `${name}.md`), content);
-        const scope = agentSlug ? ` (for ${agentSlug})` : ' (global)';
-        res.json({ ok: true, name, message: `Skill "${artifact.title}" saved${scope}` });
+        const scope = agentSlug ? ` for ${agentSlug}` : ' globally';
+        const attachmentLine = writtenAttachments.length > 0 ? ` with ${writtenAttachments.length} bundled file(s)` : '';
+        res.json({ ok: true, name, layout: 'folder', filePath: result.filePath, attachments: writtenAttachments, message: `Skill "${title}" saved${scope} as ${name}/SKILL.md${attachmentLine}` });
       } else if (artifactType === 'cron') {
         // Scope cron to agent if selected
         const jobName = agentSlug && !artifact.name.startsWith(agentSlug + ':')
@@ -10619,7 +10764,7 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
 
   app.get('/api/mcp-servers', (_req, res) => {
     try {
-      const servers = discoverMcpServers();
+      const servers = redactMcpServersForDashboard(discoverMcpServers());
       res.json({ servers });
     } catch (err) {
       res.status(500).json({ error: String(err) });
@@ -10864,19 +11009,55 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
 
   app.post('/api/skills', async (req, res) => {
     try {
-      const { name, title, description, body, tools } = req.body ?? {};
-      if (typeof name !== 'string' || typeof description !== 'string' || typeof body !== 'string') {
-        res.status(400).json({ error: 'name, description, and body are required strings' });
+      const { name, title, description, body, steps, tools, triggers, inputs, dataSources, successCriteria, limits } = req.body ?? {};
+      const rawName = typeof name === 'string' && name.trim()
+        ? name.trim()
+        : (typeof title === 'string' && title.trim() ? title.trim() : '');
+      const skillName = rawName
+        .toLowerCase()
+        .replace(/[_\s]+/g, '-')
+        .replace(/[^a-z0-9-]/g, '')
+        .replace(/-+/g, '-')
+        .replace(/^-+|-+$/g, '')
+        .slice(0, 64);
+      const skillBody = typeof body === 'string' ? body : (typeof steps === 'string' ? steps : '');
+      if (!skillName || typeof description !== 'string' || typeof skillBody !== 'string') {
+        res.status(400).json({ error: 'name/title, description, and body/steps are required strings' });
         return;
       }
       const { writeSkill } = await import('../agent/skill-store.js');
       try {
+        const triggerList = Array.isArray(triggers)
+          ? triggers.map(String)
+          : (typeof triggers === 'string' ? triggers.split(',').map((t: string) => t.trim()).filter(Boolean) : undefined);
+        const dataSourceList = Array.isArray(dataSources)
+          ? dataSources
+              .map((d: unknown) => {
+                if (typeof d === 'string') {
+                  const trimmed = d.trim();
+                  if (!trimmed) return null;
+                  const idx = trimmed.indexOf(':');
+                  return idx > 0
+                    ? { kind: trimmed.slice(0, idx).trim() || 'source', purpose: trimmed.slice(idx + 1).trim() }
+                    : { kind: 'source', purpose: trimmed };
+                }
+                if (!d || typeof d !== 'object' || Array.isArray(d)) return null;
+                const r = d as Record<string, unknown>;
+                return { kind: String(r.kind || 'source'), purpose: String(r.purpose || r.name || '') };
+              })
+              .filter((d: { kind: string; purpose: string } | null): d is { kind: string; purpose: string } => !!d && !!d.purpose.trim())
+          : undefined;
         const result = writeSkill({
-          name,
+          name: skillName,
           title: typeof title === 'string' ? title : undefined,
-          description,
-          body,
+          description: description.trim() || `Reusable Clementine skill for ${typeof title === 'string' && title.trim() ? title.trim() : skillName}. Use when the user asks to run or schedule this procedure.`,
+          body: skillBody,
           tools: Array.isArray(tools) ? tools.map(String) : undefined,
+          triggers: triggerList,
+          inputs: inputs && typeof inputs === 'object' && !Array.isArray(inputs) ? inputs : undefined,
+          dataSources: dataSourceList,
+          success: typeof successCriteria === 'string' && successCriteria.trim() ? { criterion: successCriteria.trim() } : undefined,
+          limits: limits && typeof limits === 'object' && !Array.isArray(limits) ? limits : undefined,
           source: 'manual',
         });
         res.json({ ok: true, name: result.name, layout: 'folder', filePath: result.filePath });
@@ -10897,12 +11078,9 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
     }
   });
 
-  // PUT /api/skills/:name — update an existing skill (1.18.115).
-  // Folder-aware: writes back to <name>/SKILL.md when the skill is in
-  // folder layout, otherwise updates the flat <name>.md (preserves the
-  // existing layout — we don't auto-migrate on edit; users go through the
-  // Migrate flow when they're ready).
-  app.put('/api/skills/:name', (req, res) => {
+  // PUT /api/skills/:name — update an existing skill through the same
+  // folder-form writer used by chat and builder save.
+  app.put('/api/skills/:name', async (req, res) => {
     try {
       const skillName = req.params.name;
       const { title, description, body, tools } = req.body ?? {};
@@ -10910,31 +11088,28 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
       if (description.length > 1024) { res.status(400).json({ error: 'description must be ≤ 1024 chars (Anthropic spec)' }); return; }
       if (!body || typeof body !== 'string' || !body.trim()) { res.status(400).json({ error: 'body is required' }); return; }
 
-      const skillsDir = path.join(VAULT_DIR, '00-System', 'skills');
-      const folderEntry = path.join(skillsDir, skillName, 'SKILL.md');
-      const flatEntry = path.join(skillsDir, skillName + '.md');
-      const targetPath = existsSync(folderEntry) ? folderEntry : (existsSync(flatEntry) ? flatEntry : null);
-      if (!targetPath) { res.status(404).json({ error: 'Skill "' + skillName + '" not found' }); return; }
-
-      // Preserve existing frontmatter (esp. clementine namespace fields like
-      // useCount, createdAt, migration provenance) and only merge in updates.
-      const matterMod = require('gray-matter');
-      const existingRaw = readFileSync(targetPath, 'utf-8');
-      const parsed = matterMod(existingRaw);
-      const fm: Record<string, unknown> = { ...parsed.data };
-      fm.name = skillName;
-      fm.description = description;
-      if (title && typeof title === 'string' && title.trim()) fm.title = title.trim();
-      else delete fm.title;
-      const ext = (fm.clementine && typeof fm.clementine === 'object') ? fm.clementine as Record<string, unknown> : {};
-      ext.updatedAt = new Date().toISOString();
       const allowed = Array.isArray(tools) ? tools.map(String).map(s => s.trim()).filter(Boolean) : [];
-      if (allowed.length > 0) ext.tools = { ...(ext.tools as object || {}), allow: allowed };
-      else if (ext.tools && typeof ext.tools === 'object') delete (ext.tools as Record<string, unknown>).allow;
-      fm.clementine = ext;
-      const content = matterMod.stringify(body.endsWith('\n') ? body : body + '\n', fm);
-      writeFileSync(targetPath, content);
-      res.json({ ok: true, name: skillName, layout: targetPath === folderEntry ? 'folder' : 'flat' });
+      const agentSlug = typeof req.query.agent === 'string'
+        ? req.query.agent
+        : (typeof req.query.agentSlug === 'string' ? req.query.agentSlug : undefined);
+      const { getSkill, writeSkill } = await import('../agent/skill-store.js');
+      const existing = getSkill(skillName, { ...(agentSlug ? { agentSlug } : {}) });
+      if (!existing) { res.status(404).json({ error: 'Skill "' + skillName + '" not found' }); return; }
+      const ext = existing.frontmatter.clementine;
+      const sourceValue = typeof ext?.source === 'string' && ['manual', 'chat', 'auto', 'imported'].includes(ext.source)
+        ? ext.source as 'manual' | 'chat' | 'auto' | 'imported'
+        : 'manual';
+      const result = writeSkill({
+        name: skillName,
+        title: title && typeof title === 'string' && title.trim() ? title.trim() : existing.frontmatter.title,
+        description,
+        body,
+        tools: Array.isArray(tools) ? allowed : undefined,
+        source: sourceValue,
+        ...(existing.scope === 'agent' && agentSlug ? { agentSlug } : {}),
+        overwrite: true,
+      });
+      res.json({ ok: true, name: skillName, layout: 'folder', filePath: result.filePath });
     } catch (err) {
       res.status(500).json({ error: String(err) });
     }
@@ -10976,66 +11151,80 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
 
 
   // ── Agent-scoped Skills ──
-  app.get('/api/agents/:slug/skills', (req, res) => {
+  app.get('/api/agents/:slug/skills', async (req, res) => {
     try {
       const agentSlug = req.params.slug;
-      const globalDir = path.join(VAULT_DIR, '00-System', 'skills');
-      const agentDir = path.join(VAULT_DIR, '00-System', 'agents', agentSlug, 'skills');
-
-      const readSkills = (dir: string, scope: string) => {
-        if (!existsSync(dir)) return [];
-        return readdirSync(dir).filter(f => f.endsWith('.md')).map(f => {
-          try {
-            const parsed = matter(readFileSync(path.join(dir, f), 'utf-8'));
-            return {
-              name: f.replace('.md', ''),
-              title: parsed.data.title ?? f,
-              description: parsed.data.description ?? '',
-              source: parsed.data.source ?? 'unknown',
-              sourceJob: parsed.data.sourceJob ?? null,
-              triggers: parsed.data.triggers ?? [],
-              toolsUsed: parsed.data.toolsUsed ?? [],
-              useCount: parsed.data.useCount ?? 0,
-              lastUsed: parsed.data.lastUsed ?? null,
-              agentSlug: parsed.data.agentSlug ?? null,
-              createdAt: parsed.data.createdAt ?? '',
-              updatedAt: parsed.data.updatedAt ?? '',
-              scope,
-            };
-          } catch { return null; }
-        }).filter(Boolean);
-      };
-
-      const agentSkills = readSkills(agentDir, 'agent');
-      const globalSkills = readSkills(globalDir, 'global');
-      res.json({ skills: [...agentSkills, ...globalSkills] });
+      const { listSkills } = await import('../agent/skill-store.js');
+      const skills = listSkills({ agentSlug }).map((s) => {
+        const fm = s.frontmatter || { name: '' };
+        const ext = (fm.clementine || {}) as Record<string, any>;
+        return {
+          name: fm.name,
+          title: fm.title || fm.name,
+          description: fm.description || '',
+          source: ext.source || fm.source || 'unknown',
+          sourceJob: ext.sourceJob || null,
+          triggers: ext.triggers || fm.triggers || [],
+          toolsUsed: ext.tools?.allow || fm.toolsUsed || [],
+          useCount: ext.useCount ?? fm.useCount ?? 0,
+          lastUsed: ext.lastUsed ?? null,
+          agentSlug: s.scope === 'agent' ? agentSlug : null,
+          createdAt: ext.createdAt ?? '',
+          updatedAt: ext.updatedAt ?? '',
+          scope: s.scope,
+          layout: s.layout,
+          schemaVersion: s.schemaVersion,
+        };
+      });
+      res.json({ skills });
     } catch (err) {
       res.status(500).json({ error: String(err) });
     }
   });
 
-  app.post('/api/agents/:slug/skills', (req, res) => {
+  app.get('/api/agents/:slug/skills/:name', async (req, res) => {
     try {
       const agentSlug = req.params.slug;
-      const { title, description, triggers, steps } = req.body;
-      if (!title || !steps) { res.status(400).json({ error: 'title and steps are required' }); return; }
-
-      const agentDir = path.join(VAULT_DIR, '00-System', 'agents', agentSlug, 'skills');
-      if (!existsSync(agentDir)) mkdirSync(agentDir, { recursive: true });
-
-      const name = title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 60);
-      const now = new Date().toISOString();
-      const triggerList = (triggers || '').split(',').map((t: string) => t.trim()).filter(Boolean);
-
-      const matterMod = require('gray-matter');
-      const content = matterMod.stringify(
-        `\n# ${title}\n\n${description || ''}\n\n## Procedure\n\n${steps}\n`,
-        { title, description: description || '', triggers: triggerList, source: 'manual', agentSlug, toolsUsed: [], useCount: 0, createdAt: now, updatedAt: now },
-      );
-      writeFileSync(path.join(agentDir, `${name}.md`), content);
-      res.json({ ok: true, name });
+      const skillName = req.params.name;
+      const { getSkill } = await import('../agent/skill-store.js');
+      const skill = getSkill(skillName, { agentSlug });
+      if (!skill) { res.status(404).json({ ok: false, error: `skill "${skillName}" not found` }); return; }
+      res.json({ ok: true, skill });
     } catch (err) {
-      res.status(500).json({ error: String(err) });
+      res.status(500).json({ ok: false, error: String(err) });
+    }
+  });
+
+  app.post('/api/agents/:slug/skills', async (req, res) => {
+    try {
+      const agentSlug = req.params.slug;
+      const { title, description, triggers, steps, body, name, tools } = req.body;
+      if (!title || !(steps || body)) { res.status(400).json({ error: 'title and procedure are required' }); return; }
+      const skillName = String(name || title)
+        .toLowerCase()
+        .replace(/[_\s]+/g, '-')
+        .replace(/[^a-z0-9-]/g, '')
+        .replace(/-+/g, '-')
+        .replace(/^-+|-+$/g, '')
+        .slice(0, 64);
+      const triggerList = Array.isArray(triggers)
+        ? triggers.map(String)
+        : String(triggers || '').split(',').map((t: string) => t.trim()).filter(Boolean);
+      const { writeSkill } = await import('../agent/skill-store.js');
+      const result = writeSkill({
+        name: skillName,
+        title: String(title),
+        description: String(description || `Agent-scoped skill for ${title}. Use when this agent needs this procedure.`),
+        body: String(body || steps),
+        tools: Array.isArray(tools) ? tools.map(String) : undefined,
+        triggers: triggerList,
+        source: 'manual',
+        agentSlug,
+      });
+      res.json({ ok: true, name: result.name, layout: 'folder', filePath: result.filePath });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      res.status(msg.includes('already exists') ? 409 : 400).json({ error: msg });
     }
   });
 
@@ -11043,23 +11232,37 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
     try {
       const agentSlug = req.params.slug;
       const agentDir = path.join(VAULT_DIR, '00-System', 'agents', agentSlug, 'skills');
-      const filePath = path.join(agentDir, `${req.params.name}.md`);
+      const skillName = req.params.name;
+      const folderPath = path.join(agentDir, skillName);
+      const folderEntry = path.join(folderPath, 'SKILL.md');
+      const filePath = path.join(agentDir, `${skillName}.md`);
       let targetDir: string;
-      if (!existsSync(filePath)) {
-        // Fall back to global skills dir
-        const globalDir = path.join(VAULT_DIR, '00-System', 'skills');
-        const globalPath = path.join(globalDir, `${req.params.name}.md`);
-        if (!existsSync(globalPath)) { res.status(404).json({ error: 'Skill not found' }); return; }
-        unlinkSync(globalPath);
-        targetDir = globalDir;
-      } else {
+      if (existsSync(folderEntry)) {
+        rmSync(folderPath, { recursive: true, force: true });
+        targetDir = agentDir;
+      } else if (existsSync(filePath)) {
         unlinkSync(filePath);
         targetDir = agentDir;
+      } else {
+        // Fall back to global skills dir
+        const globalDir = path.join(VAULT_DIR, '00-System', 'skills');
+        const globalFolder = path.join(globalDir, skillName);
+        const globalFolderEntry = path.join(globalFolder, 'SKILL.md');
+        const globalPath = path.join(globalDir, `${skillName}.md`);
+        if (existsSync(globalFolderEntry)) {
+          rmSync(globalFolder, { recursive: true, force: true });
+        } else if (existsSync(globalPath)) {
+          unlinkSync(globalPath);
+        } else {
+          res.status(404).json({ error: 'Skill not found' });
+          return;
+        }
+        targetDir = globalDir;
       }
       // Clean up attachments directory and backup
-      const filesDir = path.join(targetDir, `${req.params.name}.files`);
+      const filesDir = path.join(targetDir, `${skillName}.files`);
       if (existsSync(filesDir)) rmSync(filesDir, { recursive: true, force: true });
-      const bakPath = path.join(targetDir, `${req.params.name}.md.bak`);
+      const bakPath = path.join(targetDir, `${skillName}.md.bak`);
       if (existsSync(bakPath)) unlinkSync(bakPath);
       res.json({ ok: true });
     } catch (err) {
@@ -11746,7 +11949,7 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
       const replyRate = emailsSent > 0 ? Math.round((emailsReceived / emailsSent) * 1000) / 10 : 0;
 
       // Today's numbers for the desk card strip
-      const todayIso = new Date().toISOString().slice(0, 10);
+      const todayIso = dateKeyInTimeZone(new Date(), dashboardTimeZone());
       const emailsSentToday = q(`SELECT COUNT(*) as cnt FROM activities WHERE agent_slug = ? AND type = 'email_sent' AND performed_at >= ?`, slug, todayIso);
       const repliesReceivedToday = q(`SELECT COUNT(*) as cnt FROM activities WHERE agent_slug = ? AND type = 'email_received' AND performed_at >= ?`, slug, todayIso);
       const meetingsToday = q(`SELECT COUNT(*) as cnt FROM activities WHERE agent_slug = ? AND type = 'meeting_booked' AND performed_at >= ?`, slug, todayIso);
@@ -13791,7 +13994,35 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
     color: var(--text-muted);
     margin: 4px 0 0;
   }
-  .home-greeting-actions { display: flex; gap: 8px; }
+  .home-greeting-actions { display: flex; gap: 10px; align-items: center; }
+  .home-local-time {
+    min-width: 190px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    background: var(--bg-card);
+    padding: 10px 12px;
+    display: grid;
+    grid-template-columns: auto 1fr auto;
+    align-items: center;
+    gap: 10px;
+  }
+  .home-local-time .time-icon { color: var(--clementine); display: inline-flex; align-items: center; }
+  .home-local-time-main { min-width: 0; }
+  .home-local-clock {
+    color: var(--text-primary);
+    font-size: 18px;
+    font-weight: 650;
+    line-height: 1.05;
+    white-space: nowrap;
+  }
+  .home-local-date {
+    color: var(--text-muted);
+    font-size: var(--text-xs);
+    margin-top: 3px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
 
   /* KPI strip */
   .kpi-strip {
@@ -13922,6 +14153,10 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
     .kpi-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     .home-grid-2 { grid-template-columns: 1fr; }
     .home-greeting-text h1 { font-size: 22px; }
+    .home-greeting { align-items: flex-start; flex-direction: column; }
+    .home-greeting-actions { width: 100%; justify-content: space-between; }
+    .home-local-time { min-width: 0; flex: 1; }
+    .settings-local-time-body { grid-template-columns: 1fr !important; }
   }
 
   /* ── Floating chat FAB + panel ─────────────── */
@@ -16608,7 +16843,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
     color: var(--text-muted);
     font-size: 11px;
   }
-  /* PRD Phase 1.2: "Run task once" running-state pulse on the Last run tab. */
+  /* PRD Phase 1.2: "Run now" running-state pulse on the Last run tab. */
   @keyframes pulse {
     0%, 100% { opacity: 0.4; transform: scale(0.85); }
     50% { opacity: 1; transform: scale(1); }
@@ -17771,6 +18006,16 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
             <p id="home-greet-day" class="home-greeting-day">…</p>
           </div>
           <div class="home-greeting-actions">
+            <div class="home-local-time" title="Dashboard timezone">
+              <span class="time-icon" data-icon="clock"></span>
+              <div class="home-local-time-main">
+                <div class="home-local-clock" id="home-local-clock">--:--</div>
+                <div class="home-local-date" id="home-local-date">Local time</div>
+              </div>
+              <button class="btn-sm btn-ghost" onclick="openTimezoneSettings()" title="Timezone settings">
+                <span class="icon-slot" data-icon="settings"></span>
+              </button>
+            </div>
             <button class="btn-sm btn-ghost" onclick="refreshHomeDigest()" title="Refresh dashboard">
               <span class="icon-slot" data-icon="refresh"></span>
             </button>
@@ -17874,7 +18119,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
           <span style="margin-right:6px">🧰</span>Tools &amp; MCP <span id="build-tab-toolsmcp-count" style="display:none;margin-left:4px;font-size:10px;background:var(--bg-tertiary);padding:1px 6px;border-radius:999px;color:var(--text-muted)">0</span>
         </button>
         <button class="build-tab-btn" data-build-tab="workflows" onclick="switchBuildTab('workflows')" style="display:none;padding:8px 14px;border-radius:6px 6px 0 0;border:none;background:transparent;color:var(--text-secondary);font-size:13px;font-weight:500;cursor:pointer;border-bottom:2px solid transparent">
-          <span style="margin-right:6px">🔧</span>Workflows <span id="build-tab-workflows-count" style="display:none;margin-left:4px;font-size:10px;background:var(--bg-tertiary);padding:1px 6px;border-radius:999px;color:var(--text-muted)">0</span>
+          <span style="margin-right:6px">🔧</span>Advanced <span id="build-tab-workflows-count" style="display:none;margin-left:4px;font-size:10px;background:var(--bg-tertiary);padding:1px 6px;border-radius:999px;color:var(--text-muted)">0</span>
         </button>
         <!-- Spacer + primary "create" CTA. The Schedules/Runs/Tools tabs are above; this sits flush with them on the right so creation is one click from anywhere on the Schedules domain. -->
         <div style="flex:1"></div>
@@ -17902,11 +18147,11 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
       <div id="build-tab-toolsmcp" style="display:none;flex:1;min-height:0;overflow-y:auto;padding:18px;background:var(--bg-primary)">
         <div id="panel-toolsmcp"><div class="empty-state" style="padding:24px;color:var(--text-muted)">Loading Tools &amp; MCP catalog…</div></div>
       </div>
-      <!-- Tricks (workflows) tab — existing RoutinesUI surface ─────────────────── -->
+      <!-- Advanced Workflows tab — existing RoutinesUI surface ─────────────────── -->
       <div id="build-tab-workflows" style="display:none;flex:1;min-height:0;display:flex;flex-direction:column">
       <!-- Toolbar -->
       <div id="routines-toolbar" style="display:flex;align-items:center;gap:12px;padding:14px 18px;border-bottom:1px solid var(--border);background:var(--bg-secondary);flex-wrap:wrap">
-        <h2 style="margin:0;font-size:18px;font-weight:600;color:var(--text-primary);display:flex;align-items:center;gap:8px"><span data-icon="workflow" class="icon-slot"></span> Workflows</h2>
+        <h2 style="margin:0;font-size:18px;font-weight:600;color:var(--text-primary);display:flex;align-items:center;gap:8px"><span data-icon="workflow" class="icon-slot"></span> Advanced Workflows</h2>
         <span id="routines-count" style="font-size:11px;color:var(--text-muted)"></span>
         <span id="routines-editor-breadcrumb" style="display:none;font-size:12px;color:var(--text-muted)"> &rsaquo; <span id="routines-editor-name" style="color:var(--text-primary);font-weight:500"></span></span>
         <span style="flex:1"></span>
@@ -17917,16 +18162,16 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
         </select>
         <button id="routines-back-btn" style="display:none;padding:6px 12px;border-radius:6px;cursor:pointer;font-size:12px;background:var(--bg-tertiary);border:1px solid var(--border);color:var(--text-secondary)" onclick="window.RoutinesUI && RoutinesUI.closeEditor()">&larr; Back to list</button>
         <button id="routines-assist-btn" class="btn-sm" onclick="window.RoutinesUI && RoutinesUI.openCreate()" title="Skip the chat and fill out a form yourself" style="padding:6px 12px;border-radius:6px;cursor:pointer;font-size:12px;background:var(--bg-tertiary);border:1px solid var(--border);color:var(--text-secondary)">Build manually</button>
-        <button id="routines-create-btn" class="btn-sm btn-primary" onclick="window.RoutinesUI && RoutinesUI.openChat()" style="padding:6px 14px;border-radius:6px;cursor:pointer;font-size:12px">+ New Workflow</button>
+        <button id="routines-create-btn" class="btn-sm btn-primary" onclick="window.RoutinesUI && RoutinesUI.openChat()" style="padding:6px 14px;border-radius:6px;cursor:pointer;font-size:12px">+ New Advanced Workflow</button>
       </div>
       <!-- List view (default) -->
       <div id="routines-list-pane" style="flex:1;min-height:0;overflow-y:auto;padding:18px;background:var(--bg-primary)">
         <div id="routines-list-empty" class="empty-state" style="display:none;padding:64px 18px;text-align:center;color:var(--text-muted)">
           <div style="font-size:38px;opacity:0.4;margin-bottom:14px">&#9881;</div>
-          <div style="font-size:15px;font-weight:500;color:var(--text-secondary);margin-bottom:6px">No workflows yet</div>
-          <div style="font-size:12px;line-height:1.5;max-width:380px;margin:0 auto 16px">A workflow is a sequence of steps Clementine performs on cue &mdash; call MCP tools, run local CLIs, prompt the agent, branch on results &mdash; that runs on a schedule or on demand. Example: &ldquo;at 8am check email; if anything urgent, summarize and Slack me.&rdquo;</div>
+          <div style="font-size:15px;font-weight:500;color:var(--text-secondary);margin-bottom:6px">No advanced workflows yet</div>
+          <div style="font-size:12px;line-height:1.5;max-width:420px;margin:0 auto 16px">Most automations should be a skill plus a schedule. Use advanced workflows only when you truly need a multi-step pipeline with branching or step dependencies.</div>
           <div style="display:flex;gap:8px;justify-content:center;flex-wrap:wrap">
-            <button class="btn-sm btn-primary" onclick="window.RoutinesUI && RoutinesUI.openChat()" style="padding:6px 14px">+ New Workflow</button>
+            <button class="btn-sm btn-primary" onclick="window.RoutinesUI && RoutinesUI.openChat()" style="padding:6px 14px">+ New Advanced Workflow</button>
             <button class="btn-sm" onclick="window.RoutinesUI && RoutinesUI.openCreate()" style="padding:6px 14px;background:var(--bg-tertiary);border:1px solid var(--border);color:var(--text-secondary)">Build manually</button>
           </div>
         </div>
@@ -18225,7 +18470,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
             var badge = '<span style="display:inline-block;background:' + kindColor + '22;color:' + kindColor + ';padding:2px 8px;border-radius:4px;font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:0.04em">' + kind + '</span>';
             // Model picker is only meaningful for prompt steps (other kinds don't call the LLM directly).
             var modelCtl = (kind === 'prompt')
-              ? R.modelSelect('', step.model || '', 'Use trick default', { idx: idx, small: true })
+              ? R.modelSelect('', step.model || '', 'Use workflow default', { idx: idx, small: true })
               : '';
             var head = '<div style="display:flex;align-items:center;gap:10px;margin-bottom:10px">'
               + '<span style="font-size:11px;color:var(--text-muted);font-weight:600;min-width:24px">#' + (idx + 1) + '</span>'
@@ -18607,7 +18852,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
           },
           // ── chat-first builder ──────────────────────────────────────
           // Multi-turn conversation that asks clarifying questions and
-          // drafts a trick spec. The agent emits a fenced json-artifact
+          // drafts a workflow spec. The agent emits a fenced json-artifact
           // block; we parse it for the live preview + Save button.
           openChat: function() {
             var m = document.getElementById('routines-chat-modal'); if (!m) return;
@@ -18838,7 +19083,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
               R.renderChatSpec();
             }
           },
-          // Persist the current draft as a real trick. The artifact's steps
+          // Persist the current draft as a real workflow. The artifact's steps
           // field can come back as a YAML-ish string (per the agent's prompt
           // template); we hand it off to /api/routines which parses it.
           saveChatDraft: function() {
@@ -18876,7 +19121,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
             if (s == null) return '';
             return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
           },
-          // Available Claude models for trick + step model pickers.
+          // Available Claude models for workflow + step model pickers.
           MODEL_OPTS: [
             { id: 'claude-opus-4-7',           label: 'Opus 4.7 — most capable' },
             { id: 'claude-sonnet-4-6',         label: 'Sonnet 4.6 — balanced' },
@@ -18884,7 +19129,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
           ],
           // Render a model select. If opts.idx is set, this is a per-step
           // picker and changes route through updateStep(idx, 'model', value);
-          // otherwise it's the trick-level picker (id=re-model) that
+          // otherwise it's the workflow-level picker (id=re-model) that
           // markDirty reads.
           modelSelect: function(id, current, defaultLabel, opts) {
             var size = (opts && opts.small) ? 'padding:3px 6px;font-size:11px;min-width:140px' : 'padding:6px 10px;font-size:12px;min-width:200px';
@@ -18903,7 +19148,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
         };
         window.RoutinesUI = R;
         // Real switchBuildTab — toggles between Scheduled Tasks (cron) and
-        // Tricks (workflows / RoutinesUI) sub-panes. Called from KPI tiles,
+        // Workflows / RoutinesUI sub-panes. Called from KPI tiles,
         // getting-started cards, and navigateTo('build', { tab: 'crons' }).
         // Default tab is 'crons' so users land on the scheduled-task surface
         // (with the capability strip + Preview) which is what most users want.
@@ -18934,7 +19179,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
         });
       })();
     </script>
-    </div><!-- /build-tab-workflows wrapper for Tricks (RoutinesUI) sub-pane -->
+    </div><!-- /build-tab-workflows wrapper for RoutinesUI sub-pane -->
 
     <!-- page-agent-detail merged into Team page; click an agent in Roster to drill down. -->
 
@@ -21024,11 +21269,9 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
 
     <!-- page-goals merged into Team → Goals tab. -->
 
-    <!-- ═══ Skills Page — Phase A read-only catalog ═══
-         Skills-First redesign Phase A / 1.18.106: a list of every skill
-         file with detail pane. Editing + testing land in Phase B; runtime
-         invocation lands in Phase C. The page is intentionally minimal —
-         we want users to see what's there, not be overwhelmed by 7 tiles. -->
+    <!-- ═══ Skills Page ═══
+         Skills are the reusable unit. Creation starts in natural language,
+         then hands off to the canonical Skill Studio draft/review/save loop. -->
     <div class="page" id="page-skills">
       <div class="page-head" style="display:flex;align-items:flex-start;justify-content:space-between;gap:18px">
         <div style="display:flex;align-items:flex-start;gap:14px;flex:1;min-width:0">
@@ -21039,21 +21282,40 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
           </div>
         </div>
         <div style="display:flex;align-items:center;gap:8px;flex-shrink:0">
-          <!-- 1.18.157 — Build with skill-creator. The official Anthropic
-               skill-creator skill is bundled in the vault and auto-discovered.
-               This button opens the chat with a prefilled prompt that matches
-               its triggers. The skill walks the user through Anthropic-canonical
-               skill creation conversationally — quality linting, trigger phrase
-               suggestions, iteration loop, all built in. -->
-          <button class="btn-secondary" onclick="askClementineWith('Help me build a new skill using skill-creator. Walk me through it conversationally.')" style="font-size:13px;padding:8px 14px;border-radius:6px;border:1px solid var(--border);background:var(--bg-secondary);color:var(--text-primary);font-weight:500;cursor:pointer;display:inline-flex;align-items:center;gap:6px" title="Walk through Anthropic's official skill-creator skill in chat — generates an Anthropic-canonical SKILL.md from a description, then iterates with you on triggers + body.">
-            <span style="font-size:14px;line-height:1">✨</span> Build with skill-creator
+          <button class="btn-secondary" onclick="openSkillStudio()" style="font-size:13px;padding:8px 14px;border-radius:6px;border:1px solid var(--border);background:var(--bg-secondary);color:var(--text-primary);font-weight:500;cursor:pointer;display:inline-flex;align-items:center;gap:6px" title="Open the conversational Skill Studio">
+            Open Studio
           </button>
           <button class="btn-primary" onclick="openCreateSkillModal()" style="font-size:13px;padding:8px 14px;border-radius:6px;border:none;background:var(--accent);color:#fff;font-weight:500;cursor:pointer;display:inline-flex;align-items:center;gap:6px">
-            <span style="font-size:14px;line-height:1">+</span> New skill
+            Manual
           </button>
         </div>
       </div>
-      <div style="display:grid;grid-template-columns:380px 1fr;gap:18px;height:calc(100vh - 180px);min-height:500px">
+      <div id="skill-composer" style="margin:0 0 16px;border:1px solid var(--border);border-radius:8px;background:var(--bg-secondary);padding:14px 16px">
+        <div style="display:grid;grid-template-columns:minmax(280px,1.2fr) minmax(260px,0.8fr);gap:14px;align-items:start">
+          <div>
+            <label for="skill-composer-text" style="display:block;font-size:11px;font-weight:600;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.04em;margin-bottom:6px">Describe the skill</label>
+            <textarea id="skill-composer-text" rows="4" oninput="updateSkillComposerDraftState()" placeholder="Review my Asana tasks, update a Google Sheet, verify four source systems, then report back in Asana." style="width:100%;box-sizing:border-box;padding:10px 12px;border:1px solid var(--border);border-radius:6px;background:var(--bg-primary);color:var(--text-primary);font-size:13px;line-height:1.45;resize:vertical;min-height:92px"></textarea>
+          </div>
+          <div>
+            <div style="font-size:11px;font-weight:600;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.04em;margin-bottom:6px">Starting point</div>
+            <div id="skill-composer-modes" style="display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:4px;margin-bottom:10px">
+              <button type="button" class="skill-composer-mode" data-kind="outcome" onclick="setSkillComposerMode('outcome')" style="padding:7px 6px;border:1px solid var(--accent);border-radius:6px;background:rgba(255,141,0,0.10);color:var(--accent);font-size:11px;font-weight:600;cursor:pointer">Outcome</button>
+              <button type="button" class="skill-composer-mode" data-kind="tool" onclick="setSkillComposerMode('tool')" style="padding:7px 6px;border:1px solid var(--border);border-radius:6px;background:var(--bg-primary);color:var(--text-secondary);font-size:11px;font-weight:600;cursor:pointer">Tool/MCP</button>
+              <button type="button" class="skill-composer-mode" data-kind="cli" onclick="setSkillComposerMode('cli')" style="padding:7px 6px;border:1px solid var(--border);border-radius:6px;background:var(--bg-primary);color:var(--text-secondary);font-size:11px;font-weight:600;cursor:pointer">CLI</button>
+              <button type="button" class="skill-composer-mode" data-kind="project" onclick="setSkillComposerMode('project')" style="padding:7px 6px;border:1px solid var(--border);border-radius:6px;background:var(--bg-primary);color:var(--text-secondary);font-size:11px;font-weight:600;cursor:pointer">Project</button>
+              <button type="button" class="skill-composer-mode" data-kind="memory" onclick="setSkillComposerMode('memory')" style="padding:7px 6px;border:1px solid var(--border);border-radius:6px;background:var(--bg-primary);color:var(--text-secondary);font-size:11px;font-weight:600;cursor:pointer">Memory</button>
+            </div>
+            <label id="skill-composer-anchor-label" for="skill-composer-anchor" style="display:block;font-size:11px;font-weight:600;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.04em;margin-bottom:6px">Anchor</label>
+            <input id="skill-composer-anchor" list="skill-composer-anchor-options" oninput="updateSkillComposerDraftState()" placeholder="Optional tool, project, command, or memory source" style="width:100%;box-sizing:border-box;padding:9px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg-primary);color:var(--text-primary);font-size:12px">
+            <datalist id="skill-composer-anchor-options"></datalist>
+            <div style="display:flex;align-items:center;justify-content:flex-end;gap:8px;margin-top:12px">
+              <button type="button" class="btn-secondary" onclick="openSkillStudio()" style="font-size:12px;padding:7px 12px;border-radius:6px;border:1px solid var(--border);background:transparent;color:var(--text-primary);cursor:pointer">Open Studio</button>
+              <button type="button" class="btn-primary" id="skill-composer-draft-btn" onclick="startSkillComposerDraft()" disabled style="font-size:12px;padding:7px 14px;border-radius:6px;border:none;background:var(--accent);color:#fff;font-weight:600;cursor:pointer;opacity:0.55">Draft skill</button>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div style="display:grid;grid-template-columns:380px 1fr;gap:18px;height:calc(100vh - 360px);min-height:440px">
         <div id="skills-list-pane" style="overflow-y:auto;border:1px solid var(--border);border-radius:8px;background:var(--bg-secondary)">
           <div style="padding:14px 16px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:8px">
             <input type="search" id="skills-search" placeholder="Search skills…" oninput="onSkillsSearch(this.value)" style="flex:1;padding:6px 10px;font-size:12px;border:1px solid var(--border);border-radius:6px;background:var(--bg-primary);color:var(--text-primary)">
@@ -21420,6 +21682,35 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
             <p style="color:var(--text-muted);margin:0">Manage API keys and configuration. Changes are saved to <code>~/.clementine/.env</code>.</p>
             <button class="btn-sm btn-primary" style="white-space:nowrap;padding:6px 12px;border-radius:6px;cursor:pointer" onclick="restartDaemonFromDashboard()">Restart Clementine</button>
           </div>
+          <div class="card" id="settings-local-time-card" style="margin-bottom:16px">
+            <div class="card-header" style="display:flex;align-items:center;justify-content:space-between;gap:12px">
+              <span><span class="icon-slot" data-icon="clock"></span> Local time</span>
+              <span id="settings-timezone-status" style="font-size:11px;color:var(--text-muted)"></span>
+            </div>
+            <div class="card-body settings-local-time-body" style="padding:16px;display:grid;grid-template-columns:minmax(170px,0.75fr) minmax(260px,1fr);gap:16px;align-items:end">
+              <div>
+                <div id="settings-local-clock" style="font-size:28px;line-height:1;font-weight:650;color:var(--text-primary)">--:--</div>
+                <div id="settings-local-date" style="font-size:12px;color:var(--text-muted);margin-top:7px">Loading timezone...</div>
+              </div>
+              <div>
+                <label style="font-weight:600;font-size:12px;color:var(--text-secondary)">Timezone</label>
+                <div style="display:flex;gap:8px;margin-top:6px;flex-wrap:wrap">
+                  <input type="text" id="settings-timezone-input" list="timezone-options" placeholder="America/Los_Angeles" style="flex:1;min-width:210px;padding:7px 10px;border:1px solid var(--border);border-radius:4px;background:var(--bg-secondary);color:var(--text-primary);font-size:13px">
+                  <button class="btn-sm" onclick="useBrowserTimezone()" style="padding:6px 10px">Use browser</button>
+                  <button class="btn-sm btn-primary" onclick="saveTimezoneSetting()" style="padding:6px 12px">Save</button>
+                </div>
+                <datalist id="timezone-options">
+                  <option value="America/Los_Angeles"></option>
+                  <option value="America/Denver"></option>
+                  <option value="America/Chicago"></option>
+                  <option value="America/New_York"></option>
+                  <option value="UTC"></option>
+                  <option value="Europe/London"></option>
+                </datalist>
+                <div style="font-size:11px;color:var(--text-muted);margin-top:6px">Used for dashboard dates, daily notes, schedules, and the agent's current-time context.</div>
+              </div>
+            </div>
+          </div>
           <div id="budget-health-content" style="margin-bottom:16px"><div class="empty-state">Loading budget health...</div></div>
           <!-- 1.18.127 — Notification preferences. Single toggle for now;
                room to grow into a full notification settings card. -->
@@ -21624,13 +21915,13 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
 <div class="modal-overlay" id="cron-modal">
   <div class="modal cron-modal">
     <div class="modal-header">
-      <h3 id="cron-modal-title">New Scheduled Task</h3>
+      <h3 id="cron-modal-title">New Schedule</h3>
       <button class="btn-ghost btn-sm" onclick="closeCronModal()">&times;</button>
     </div>
     <div class="cron-tabs" role="tablist">
       <button type="button" class="cron-tab-btn active" data-cron-tab="configure" onclick="switchCronTab('configure')">Configure</button>
       <button type="button" class="cron-tab-btn" id="cron-tab-btn-preview" data-cron-tab="preview" onclick="switchCronTab('preview')" title="See exactly what the agent will receive at fire-time">What will run</button>
-      <button type="button" class="cron-tab-btn" id="cron-tab-btn-lastrun" data-cron-tab="lastrun" onclick="switchCronTab('lastrun')" title="Watch the most recent run — click Run task once to fire it now">Last run</button>
+      <button type="button" class="cron-tab-btn" id="cron-tab-btn-lastrun" data-cron-tab="lastrun" onclick="switchCronTab('lastrun')" title="Watch the most recent run, or fire the schedule now">Last run</button>
     </div>
     <div class="modal-body">
       <!-- ── Tab: Configure ─────────────────────────────────────────── -->
@@ -21655,7 +21946,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
           <h4>Identity</h4>
           <p class="cron-section-desc">A unique name and optional grouping for the dashboard.</p>
           <div class="form-group">
-            <label class="form-label">Task Name</label>
+            <label class="form-label">Schedule Name</label>
             <input type="text" id="cron-name" placeholder="e.g. morning-briefing">
             <div class="form-hint">Unique identifier. Use lowercase with dashes.</div>
           </div>
@@ -21672,7 +21963,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
              usually the single most impactful field after Prompt. -->
         <div class="cron-section-card" data-config-tab="basics">
           <h4>Project Context <span style="color:var(--text-muted);font-weight:normal;font-size:13px">(optional)</span></h4>
-          <p class="cron-section-desc">Run this task inside a project directory. The agent picks up that project's <code>CLAUDE.md</code>, MCP config, and any context files alongside the cwd.</p>
+          <p class="cron-section-desc">Run this schedule inside a project directory. The agent picks up that project's <code>CLAUDE.md</code>, MCP config, and any context files alongside the cwd.</p>
           <div class="form-group">
             <select id="cron-workdir">
               <option value="">None — runs in default context</option>
@@ -21684,7 +21975,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
         <!-- Schedule -->
         <div class="cron-section-card" data-config-tab="basics">
           <h4>Schedule</h4>
-          <p class="cron-section-desc">When this task fires. Pick a frequency or write a cron expression.</p>
+          <p class="cron-section-desc">When this schedule fires. Pick a frequency or write a cron expression.</p>
           <div class="form-group" style="margin:0">
             <div class="schedule-builder" id="schedule-builder">
           <div class="form-row">
@@ -21779,12 +22070,12 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
               Prompt
               <a href="#" id="cron-prompt-history-link" onclick="event.preventDefault();openPromptHistory()" style="display:none;font-size:11px;font-weight:normal;color:var(--text-muted);text-decoration:none;border-bottom:1px dotted var(--border)">View prompt history</a>
             </label>
-            <textarea id="cron-prompt" class="cron-prompt-textarea" placeholder="What should the AI do when this task runs?"></textarea>
-            <div class="form-hint">The instruction sent to the AI agent when this task fires.</div>
+            <textarea id="cron-prompt" class="cron-prompt-textarea" placeholder="What skill or instruction should the agent run on this schedule?"></textarea>
+            <div class="form-hint">The instruction sent to the AI agent when this schedule fires.</div>
           </div>
           <div class="form-group">
             <label class="form-label">Context <span style="color:var(--text-muted);font-weight:normal">(optional — injected at runtime)</span></label>
-            <textarea id="cron-context" rows="4" placeholder="Guidelines, examples, formatting rules, data sources, or any context the agent should know when running this task..."></textarea>
+            <textarea id="cron-context" rows="4" placeholder="Guidelines, examples, formatting rules, data sources, or any context the agent should know when this runs..."></textarea>
             <div class="form-hint">Freeform notes injected into the prompt at execution time. Use this for training data, style guides, or standing instructions.</div>
           </div>
           <div class="form-group" style="margin-bottom:0">
@@ -21803,7 +22094,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
              run "finished"; with one, a run "accomplished what it was meant
              to". Banner warns (does not block) when neither is set. -->
         <div class="cron-section-card" data-config-tab="prompt">
-          <h4>Goal <span style="color:var(--text-muted);font-weight:normal;font-size:12px">— how do you know this task succeeded?</span></h4>
+          <h4>Goal <span style="color:var(--text-muted);font-weight:normal;font-size:12px">— how do you know this schedule succeeded?</span></h4>
           <p class="cron-section-desc">Optional but strongly recommended. Use plain English (an evaluator agent grades the run) or a JSON Schema (validated against the agent's structured output).</p>
           <div id="cron-goal-warning" style="display:none;margin-bottom:12px;padding:10px 12px;border-radius:6px;background:rgba(245,158,11,0.10);border:1px solid rgba(245,158,11,0.30);color:var(--yellow);font-size:12px">
             ⚠ No goal set — runs will be marked "finished" but not "accomplished". Add a success criterion below or a JSON Schema.
@@ -21827,7 +22118,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
         <!-- Skills & tools: pinned skills + MCP + tools + tags -->
         <div class="cron-section-card" data-config-tab="tools">
           <h4>Skills &amp; tools</h4>
-          <p class="cron-section-desc">Pin the skills and tools this task should use. Switch to the <strong>What will run</strong> tab to see exactly what the agent receives.</p>
+          <p class="cron-section-desc">Pin the skills and tools this schedule should use. Switch to the <strong>What will run</strong> tab to see exactly what the agent receives.</p>
 
           <!-- Predictable Mode is now hidden by default — new tasks always
                get predictable=true. Legacy tasks (predictable !== true) reveal
@@ -21882,7 +22173,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
              a power-user feature anyway. -->
         <div class="cron-section-card" data-config-tab="scope">
           <h4>Scope</h4>
-          <p class="cron-section-desc">Extra directories the agent gets read access to beyond the project cwd. Most tasks won't need this.</p>
+          <p class="cron-section-desc">Extra directories the agent gets read access to beyond the project cwd. Most schedules won't need this.</p>
           <div class="form-row">
             <div class="form-group" style="flex:1">
               <label class="form-label">Additional read directories <span style="color:var(--text-muted);font-weight:normal">(optional)</span></label>
@@ -21960,10 +22251,10 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
           </div>
           <div id="cron-training-chat" style="border:1px solid var(--border);border-radius:8px;background:var(--bg-secondary);overflow:hidden">
             <div id="cron-training-messages" style="max-height:240px;overflow-y:auto;padding:12px;display:flex;flex-direction:column;gap:8px">
-              <div class="empty-state" style="padding:16px;font-size:12px;color:var(--text-muted)">Chat with the agent to refine this task. Ask for help with the prompt, suggest improvements, or add context.</div>
+              <div class="empty-state" style="padding:16px;font-size:12px;color:var(--text-muted)">Chat with the agent to refine this schedule. Ask for help with the prompt, suggest improvements, or add context.</div>
             </div>
             <div style="display:flex;gap:6px;padding:8px;border-top:1px solid var(--border);background:var(--bg-primary)">
-              <input type="text" id="cron-training-input" placeholder="Ask for help refining this task..." style="flex:1;font-size:12px;padding:6px 10px" onkeydown="if(event.key==='Enter')sendCronTraining()">
+              <input type="text" id="cron-training-input" placeholder="Ask for help refining this schedule..." style="flex:1;font-size:12px;padding:6px 10px" onkeydown="if(event.key==='Enter')sendCronTraining()">
               <button class="btn btn-sm btn-primary" id="cron-training-send" onclick="sendCronTraining()" style="font-size:11px;padding:4px 12px">Send</button>
             </div>
           </div>
@@ -21974,16 +22265,16 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
       <div class="cron-tab-pane" id="cron-tab-preview">
         <div id="cron-preview-body" style="padding:0">
           <div style="padding:36px 24px;color:var(--text-muted);text-align:center;font-size:13px">
-            Save the task first, then switch back here to see exactly what the agent will receive.
+            Save the schedule first, then switch back here to see exactly what the agent will receive.
           </div>
         </div>
       </div><!-- /cron-tab-preview -->
 
-      <!-- ── Tab: Last run ── PRD Phase 1.2: "Run task once" inline output. -->
+      <!-- ── Tab: Last run ── PRD Phase 1.2: "Run now" inline output. -->
       <div class="cron-tab-pane" id="cron-tab-lastrun">
         <div id="cron-lastrun-body" style="padding:0">
           <div style="padding:36px 24px;color:var(--text-muted);text-align:center;font-size:13px">
-            Save the task first, then click <strong>Run task once</strong> to fire it now and watch the result here.
+            Save the schedule first, then click <strong>Run now</strong> to fire it and watch the result here.
           </div>
         </div>
       </div><!-- /cron-tab-lastrun -->
@@ -21991,10 +22282,10 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
     <div class="modal-footer">
       <div style="display:flex;align-items:center;gap:8px;flex:1">
         <button class="btn btn-sm" id="cron-train-btn" onclick="showCronTraining()" style="font-size:11px;display:none">Train with Agent</button>
-        <!-- PRD §5.1 header bullet: "Run task once" green button. Visible only
-             when editing a saved task (set by openEditCronModal). Disabled
+        <!-- PRD §5.1 header bullet: "Run now" green button. Visible only
+             when editing a saved schedule (set by openEditCronModal). Disabled
              during an in-flight run. -->
-        <button class="btn btn-sm btn-success" id="cron-run-once-btn" onclick="runCronOnceFromModal()" style="display:none;font-size:12px;padding:6px 14px">▶ Run task once</button>
+        <button class="btn btn-sm btn-success" id="cron-run-once-btn" onclick="runCronOnceFromModal()" style="display:none;font-size:12px;padding:6px 14px">▶ Run now</button>
         <!-- PRD §11 Phase 5b / 1.18.105: draft state badge. Updates via
              refreshCronDraftBadge(jobName) after every save / load /
              publish / discard. -->
@@ -22007,7 +22298,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
       <button class="btn btn-sm" id="cron-discard-draft-btn" onclick="discardCronDraft()" style="display:none;font-size:12px;padding:6px 12px">Discard draft</button>
       <button class="btn btn-sm" id="cron-save-draft-btn" onclick="saveCronAsDraft()" style="display:none;font-size:12px;padding:6px 14px">Save as draft</button>
       <button class="btn-primary" id="cron-publish-btn" onclick="publishCronDraft()" style="display:none">Publish</button>
-      <button class="btn-primary" id="cron-modal-save" onclick="saveCronJob()">Create Task</button>
+      <button class="btn-primary" id="cron-modal-save" onclick="saveCronJob()">Create Schedule</button>
     </div>
   </div>
 </div>
@@ -22845,9 +23136,7 @@ function navigateTo(page, opts) {
       refreshBuilderAgents(bp);
       break;
     case 'skills':
-      // Skills-First redesign Phase A / 1.18.106: load the catalog when
-      // the user navigates to the Skills page. Read-only; no mutation
-      // surfaces here yet.
+      if (typeof initSkillComposer === 'function') initSkillComposer();
       if (typeof refreshSkillsPage === 'function') refreshSkillsPage();
       break;
     case 'heartbeat':
@@ -23017,7 +23306,7 @@ function switchBuildTab(tab) {
     if (usagePanel) usagePanel.style.display = '';
     if (newBtn) {
       newBtn.style.display = '';
-      newBtn.textContent = tab === 'skills' ? 'New Skill' : 'New Workflow';
+      newBtn.textContent = tab === 'skills' ? 'New Skill' : 'New Advanced Workflow';
     }
     // Map build-tab → builder-type so the canvas + chat reflect the tab.
     var typeSel = document.getElementById('builder-type');
@@ -24429,6 +24718,121 @@ function settingRequiresDaemonRestart(key) {
   return true;
 }
 
+var dashboardTimeState = {
+  timeZone: (Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'),
+  serverIso: null,
+  syncedAt: 0,
+};
+var dashboardClockTimer = null;
+
+function isValidDashboardTimeZone(value) {
+  if (!value || typeof value !== 'string') return false;
+  try {
+    new Intl.DateTimeFormat('en-US', { timeZone: value }).format(new Date());
+    return true;
+  } catch(e) {
+    return false;
+  }
+}
+
+function updateDashboardTime(snapshot) {
+  if (snapshot && snapshot.timeZone) dashboardTimeState.timeZone = snapshot.timeZone;
+  if (snapshot && snapshot.iso) {
+    dashboardTimeState.serverIso = snapshot.iso;
+    dashboardTimeState.syncedAt = Date.now();
+  }
+  renderDashboardTimeWidgets();
+}
+
+function dashboardNow() {
+  if (dashboardTimeState.serverIso && dashboardTimeState.syncedAt) {
+    var base = new Date(dashboardTimeState.serverIso).getTime();
+    if (Number.isFinite(base)) return new Date(base + (Date.now() - dashboardTimeState.syncedAt));
+  }
+  return new Date();
+}
+
+function formatDashboardDate(date, options) {
+  try {
+    return new Intl.DateTimeFormat('en-US', Object.assign({ timeZone: dashboardTimeState.timeZone }, options || {})).format(date);
+  } catch(e) {
+    return new Intl.DateTimeFormat('en-US', options || {}).format(date);
+  }
+}
+
+function renderDashboardTimeWidgets() {
+  var now = dashboardNow();
+  var time = formatDashboardDate(now, { hour: 'numeric', minute: '2-digit', second: '2-digit', hour12: true });
+  var date = formatDashboardDate(now, { weekday: 'long', month: 'long', day: 'numeric' });
+  var zone = dashboardTimeState.timeZone || 'UTC';
+  var homeClock = document.getElementById('home-local-clock');
+  var homeDate = document.getElementById('home-local-date');
+  if (homeClock) homeClock.textContent = time;
+  if (homeDate) homeDate.textContent = date + ' · ' + zone;
+  var settingsClock = document.getElementById('settings-local-clock');
+  var settingsDate = document.getElementById('settings-local-date');
+  var tzInput = document.getElementById('settings-timezone-input');
+  if (settingsClock) settingsClock.textContent = time;
+  if (settingsDate) settingsDate.textContent = date + ' · ' + zone;
+  if (tzInput && document.activeElement !== tzInput) tzInput.value = zone;
+}
+
+function startDashboardClock() {
+  if (dashboardClockTimer) return;
+  renderDashboardTimeWidgets();
+  dashboardClockTimer = setInterval(renderDashboardTimeWidgets, 1000);
+}
+
+async function refreshDashboardTime() {
+  try {
+    var r = await apiFetch('/api/time');
+    var d = await r.json();
+    if (d && d.time) updateDashboardTime(d.time);
+  } catch(e) {
+    renderDashboardTimeWidgets();
+  }
+}
+
+function openTimezoneSettings() {
+  navigateTo('settings', { tab: 'general' });
+  setTimeout(function() {
+    var input = document.getElementById('settings-timezone-input');
+    if (input) input.focus();
+  }, 120);
+}
+
+async function saveTimezoneSetting() {
+  var input = document.getElementById('settings-timezone-input');
+  var status = document.getElementById('settings-timezone-status');
+  var value = input ? (input.value || '').trim() : '';
+  if (!isValidDashboardTimeZone(value)) {
+    toast('Enter a valid IANA timezone, for example America/Los_Angeles.', 'error');
+    if (status) { status.textContent = 'Invalid timezone'; status.style.color = 'var(--red)'; }
+    return;
+  }
+  if (status) { status.textContent = 'Saving...'; status.style.color = 'var(--text-muted)'; }
+  var result = await apiJson('PUT', '/api/settings/TIMEZONE', { value: value });
+  if (result && result.ok) {
+    dashboardTimeState.timeZone = value;
+    dashboardTimeState.serverIso = new Date().toISOString();
+    dashboardTimeState.syncedAt = Date.now();
+    renderDashboardTimeWidgets();
+    markRestartRequired('Timezone changed. Restart Clementine so Discord, Slack, and background workers use the new local time.');
+    if (status) { status.textContent = 'Saved'; status.style.color = 'var(--green)'; setTimeout(function(){ status.textContent = ''; }, 2000); }
+    refreshHomeDigest();
+  } else if (status) {
+    status.textContent = 'Error';
+    status.style.color = 'var(--red)';
+  }
+}
+
+function useBrowserTimezone() {
+  var detected = Intl.DateTimeFormat().resolvedOptions().timeZone || '';
+  var input = document.getElementById('settings-timezone-input');
+  if (input && detected) input.value = detected;
+  if (detected) saveTimezoneSetting();
+}
+
 function renderRestartRequiredBanner() {
   var reason = '';
   try { reason = localStorage.getItem('clem-restart-required') || ''; } catch(e) { reason = ''; }
@@ -25309,7 +25713,7 @@ function renderScheduledTaskCard(task) {
   var isRunning = task.health === 'running';
   var runOrCancelBtn = isRunning
     ? '<button class="btn-sm secondary btn-danger" onclick="cancelCronRun(\\x27' + safeName + '\\x27)" title="Stop this in-flight run (SIGTERM)">Cancel</button>'
-    : '<button class="btn-sm secondary btn-success" onclick="apiPost(\\x27/api/cron/run/' + encodeURIComponent(task.name) + '\\x27)" title="Run this task once now">Run Now</button>';
+    : '<button class="btn-sm secondary btn-success" onclick="apiPost(\\x27/api/cron/run/' + encodeURIComponent(task.name) + '\\x27)" title="Run this schedule now">Run Now</button>';
   // 1.18.115 — preview line. Prefer task.description (a future-proof
   // dedicated field), then strip leading TOOL RESTRICTIONS / FORBIDDEN
   // boilerplate (purely a runtime allowlist, not what the task does), then
@@ -26844,8 +27248,10 @@ async function openMcpServerEditModal(name) {
   document.getElementById('mcp-edit-url').value = server.url || '';
   document.getElementById('mcp-edit-url').disabled = isReadOnly;
   document.getElementById('mcp-edit-headers').value = server.headers && Object.keys(server.headers).length ? JSON.stringify(server.headers, null, 2) : '';
+  document.getElementById('mcp-edit-headers').placeholder = server.headerKeys && server.headerKeys.length ? 'Configured headers redacted: ' + server.headerKeys.join(', ') : '';
   document.getElementById('mcp-edit-headers').disabled = isReadOnly;
   document.getElementById('mcp-edit-env').value = server.env && Object.keys(server.env).length ? JSON.stringify(server.env, null, 2) : '';
+  document.getElementById('mcp-edit-env').placeholder = server.envKeys && server.envKeys.length ? 'Configured env vars redacted: ' + server.envKeys.join(', ') : '';
   document.getElementById('mcp-edit-env').disabled = isReadOnly;
   // Show the right transport fields
   syncMcpEditTransportRows();
@@ -27331,9 +27737,9 @@ function renderRunDetailWaterfall(events, runId, jobName) {
     // Only rendered when we know the jobName (not for orphaned runs).
     + (jobName
         ? '<div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap">'
-          + '<button class="btn-sm btn-success" onclick="replayRerunRun(\\x27' + jsStr(jobName) + '\\x27)" title="Fire this task once — same prompt, fresh run">▶ Rerun task</button>'
-          + '<button class="btn-sm" onclick="replayCopyPrompt(\\x27' + jsStr(jobName) + '\\x27)" title="Copy the prompt for this task to your clipboard">⧉ Copy prompt</button>'
-          + '<button class="btn-sm" onclick="replayOpenRunList(\\x27' + jsStr(jobName) + '\\x27)" title="Open the Run list filtered to this task">↗ Open run list</button>'
+          + '<button class="btn-sm btn-success" onclick="replayRerunRun(\\x27' + jsStr(jobName) + '\\x27)" title="Fire this schedule once with the same prompt">▶ Rerun</button>'
+          + '<button class="btn-sm" onclick="replayCopyPrompt(\\x27' + jsStr(jobName) + '\\x27)" title="Copy the prompt for this schedule to your clipboard">⧉ Copy prompt</button>'
+          + '<button class="btn-sm" onclick="replayOpenRunList(\\x27' + jsStr(jobName) + '\\x27)" title="Open the Run list filtered to this schedule">↗ Open run list</button>'
           + '</div>'
         : '')
     + '</div>';
@@ -27994,6 +28400,213 @@ var _skillsState = {
   query: '',         // search input value
 };
 
+var _skillComposerMode = 'outcome';
+var _skillComposerOptionsCache = null;
+
+var _skillComposerCopy = {
+  outcome: {
+    label: 'Anchor',
+    placeholder: 'Optional tool, project, command, or memory source',
+    promptLabel: 'Outcome-first',
+  },
+  tool: {
+    label: 'Tool or MCP',
+    placeholder: 'Search/select an SDK tool, MCP tool, API, or Composio toolkit',
+    promptLabel: 'Tool or MCP',
+  },
+  cli: {
+    label: 'CLI command',
+    placeholder: 'Search/select a local CLI command',
+    promptLabel: 'CLI',
+  },
+  project: {
+    label: 'Local project',
+    placeholder: 'Search/select a linked local project',
+    promptLabel: 'Local project',
+  },
+  memory: {
+    label: 'Memory source',
+    placeholder: 'Search/select a memory section or recent fact',
+    promptLabel: 'Memory',
+  },
+};
+
+function initSkillComposer() {
+  setSkillComposerMode(_skillComposerMode || 'outcome', { quiet: true });
+  updateSkillComposerDraftState();
+}
+
+function setSkillComposerMode(mode, opts) {
+  if (!_skillComposerCopy[mode]) mode = 'outcome';
+  _skillComposerMode = mode;
+  var buttons = document.querySelectorAll('.skill-composer-mode');
+  for (var i = 0; i < buttons.length; i++) {
+    var active = buttons[i].getAttribute('data-kind') === mode;
+    buttons[i].style.borderColor = active ? 'var(--accent)' : 'var(--border)';
+    buttons[i].style.background = active ? 'rgba(255,141,0,0.10)' : 'var(--bg-primary)';
+    buttons[i].style.color = active ? 'var(--accent)' : 'var(--text-secondary)';
+  }
+  var copy = _skillComposerCopy[mode];
+  var label = document.getElementById('skill-composer-anchor-label');
+  var input = document.getElementById('skill-composer-anchor');
+  if (label) label.textContent = copy.label;
+  if (input) {
+    input.placeholder = copy.placeholder;
+    if (!opts || opts.quiet !== true) input.value = '';
+  }
+  renderSkillComposerOptions();
+  updateSkillComposerDraftState();
+}
+
+function updateSkillComposerDraftState() {
+  var text = (document.getElementById('skill-composer-text') || {}).value || '';
+  var anchor = (document.getElementById('skill-composer-anchor') || {}).value || '';
+  var btn = document.getElementById('skill-composer-draft-btn');
+  if (!btn) return;
+  var enabled = !!(text.trim() || anchor.trim());
+  btn.disabled = !enabled;
+  btn.style.opacity = enabled ? '1' : '0.55';
+  btn.style.cursor = enabled ? 'pointer' : 'not-allowed';
+}
+
+async function hydrateSkillComposerOptions() {
+  if (_skillComposerOptionsCache) return _skillComposerOptionsCache;
+  var cache = { tool: [], cli: [], project: [], memory: [] };
+  try {
+    var r = await apiFetch('/api/available-tools');
+    var d = await r.json();
+    var cats = (d && d.categories) || {};
+    var keys = Object.keys(cats);
+    for (var ki = 0; ki < keys.length; ki++) {
+      var cat = keys[ki];
+      var items = Array.isArray(cats[cat]) ? cats[cat] : [];
+      for (var ii = 0; ii < items.length; ii++) {
+        var t = items[ii];
+        var name = typeof t === 'string' ? t : (t && t.name);
+        if (!name) continue;
+        var desc = typeof t === 'string' ? '' : (t.description || t.displayName || t.projectName || '');
+        var type = typeof t === 'string' ? '' : (t.type || '');
+        var row = { value: String(name), label: (desc ? String(desc) : cat) };
+        if (type !== 'project') cache.tool.push(row);
+        if (cat === 'CLI Tools' || type === 'cli') cache.cli.push(row);
+      }
+    }
+  } catch (_) { /* non-fatal */ }
+
+  try {
+    var pr = await apiFetch('/api/projects');
+    var pd = await pr.json();
+    var projects = (pd && Array.isArray(pd.projects)) ? pd.projects : [];
+    for (var pi = 0; pi < projects.length; pi++) {
+      var p = projects[pi];
+      if (!p || !p.path) continue;
+      cache.project.push({ value: p.name || p.path, label: p.path });
+    }
+  } catch (_) { /* non-fatal */ }
+
+  try {
+    var mr = await apiFetch('/api/memory/md');
+    var md = await mr.json();
+    var content = (md && md.content) || '';
+    var lines = content.split('\\n');
+    for (var li = 0; li < lines.length; li++) {
+      var match = lines[li].match(/^##\\s+(.+)$/);
+      if (match) cache.memory.push({ value: 'MEMORY.md > ' + match[1].trim(), label: 'MEMORY.md section' });
+    }
+  } catch (_) { /* non-fatal */ }
+
+  try {
+    var wr = await apiFetch('/api/memory/writes/recent?limit=12');
+    var wd = await wr.json();
+    var writes = (wd && Array.isArray(wd.writes)) ? wd.writes : (wd && Array.isArray(wd.entries) ? wd.entries : []);
+    for (var wi = 0; wi < Math.min(writes.length, 8); wi++) {
+      var w = writes[wi] || {};
+      var preview = String(w.content_preview || w.content || w.preview || w.text || '').trim();
+      if (preview) cache.memory.push({ value: preview.slice(0, 120), label: 'recent memory' });
+    }
+  } catch (_) { /* non-fatal */ }
+
+  cache.tool = _dedupeSkillComposerOptions(cache.tool);
+  cache.cli = _dedupeSkillComposerOptions(cache.cli);
+  cache.project = _dedupeSkillComposerOptions(cache.project);
+  cache.memory = _dedupeSkillComposerOptions(cache.memory);
+  _skillComposerOptionsCache = cache;
+  return cache;
+}
+
+function _dedupeSkillComposerOptions(items) {
+  var seen = {};
+  var out = [];
+  for (var i = 0; i < items.length; i++) {
+    var value = String(items[i].value || '').trim();
+    if (!value || seen[value]) continue;
+    seen[value] = true;
+    out.push({ value: value, label: String(items[i].label || '') });
+  }
+  return out;
+}
+
+async function renderSkillComposerOptions() {
+  var list = document.getElementById('skill-composer-anchor-options');
+  if (!list) return;
+  list.innerHTML = '';
+  if (_skillComposerMode === 'outcome') return;
+  var cache = await hydrateSkillComposerOptions();
+  var options = cache[_skillComposerMode] || [];
+  if (_skillComposerMode === 'tool') {
+    options = cache.tool.concat(cache.cli);
+    options = _dedupeSkillComposerOptions(options);
+  }
+  var html = '';
+  for (var i = 0; i < Math.min(options.length, 250); i++) {
+    html += '<option value="' + esc(options[i].value) + '">' + esc(options[i].label) + '</option>';
+  }
+  list.innerHTML = html;
+}
+
+function buildSkillComposerPrompt() {
+  var text = ((document.getElementById('skill-composer-text') || {}).value || '').trim();
+  var anchor = ((document.getElementById('skill-composer-anchor') || {}).value || '').trim();
+  var modeCopy = _skillComposerCopy[_skillComposerMode] || _skillComposerCopy.outcome;
+  var lines = [
+    'Use skill-creator principles to draft a Clementine skill in Skill Studio.',
+    '',
+    'Outcome: ' + (text || '(ask me for the outcome before drafting)'),
+    'Starting point: ' + modeCopy.promptLabel,
+  ];
+  if (anchor) lines.push('Anchor: ' + anchor);
+  lines.push(
+    '',
+    'Draft rules:',
+    '- Build a concise folder-form SKILL.md procedure. The frontmatter description is the trigger surface.',
+    '- Prefer one reusable skill plus schedules outside the skill. Do not create an advanced workflow graph.',
+    '- Include exact CLI, MCP, Composio, project, or memory dependencies in tools/dataSources/inputs.',
+    '- Put repeated deterministic commands in the procedure; add scripts or references only when they reduce repeated work or token load.',
+    '- Define success criteria and failure handling. Ask one clarifying question only if required before drafting.'
+  );
+  return lines.join('\\n');
+}
+
+function startSkillComposerDraft() {
+  var promptText = buildSkillComposerPrompt();
+  var anchor = ((document.getElementById('skill-composer-anchor') || {}).value || '').trim();
+  var mode = _skillComposerMode;
+  navigateTo('build', { tab: 'skills' });
+  setTimeout(function() {
+    var typeSel = document.getElementById('builder-type');
+    if (typeSel) typeSel.value = 'skill';
+    if (typeof updateBuilderMode === 'function') updateBuilderMode();
+    if ((mode === 'tool' || mode === 'cli') && anchor) {
+      _builderLinkedTools = [anchor];
+    }
+    var input = document.getElementById('builder-input');
+    if (input) {
+      input.value = promptText;
+      if (typeof sendBuilderChat === 'function') sendBuilderChat();
+    }
+  }, 180);
+}
+
 // ── Migration handlers (Phase A.6 / 1.18.110) ────────────────────────
 // migrateOneSkill: per-skill migration from the detail-pane footer.
 // migrateAllLegacySkills: bulk migration from the list-pane banner.
@@ -28341,7 +28954,7 @@ async function sbSaveCurrent() {
     var d = await r.json();
     if (!r.ok) { toast(d.error || 'Save failed', 'error'); return; }
     window._sbState.dirty = false;
-    window._sbState.lastSaveAt = new Date().toLocaleTimeString();
+    window._sbState.lastSaveAt = formatDashboardDate(new Date(), { hour: 'numeric', minute: '2-digit', hour12: true });
     toast('Saved ' + relPath, 'success');
     sbUpdateSaveButton();
     sbReloadFileTree();
@@ -29677,6 +30290,7 @@ function renderSkillDetail(s) {
   // owner at a glance whether this skill is pulling its weight; the
   // table beneath has the supporting numbers for drilling in.
   html += '<div id="skill-quality-' + encodeURIComponent(fm.name) + '" style="margin-top:10px;padding:12px 14px;background:var(--bg-secondary);border:1px solid var(--border);border-radius:6px;font-size:12px;color:var(--text-muted)">Loading quality…</div>';
+  html += renderSkillReadiness(s);
 
   // ── 2. Validation warnings (if any)
   if (Array.isArray(s.validation) && s.validation.length > 0) {
@@ -29848,6 +30462,38 @@ function renderSkillSection(title, body) {
     + '<div style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.04em;margin-bottom:8px;font-weight:500">' + esc(title) + '</div>'
     + body
     + '</div>';
+}
+
+function renderSkillReadiness(s) {
+  var fm = s.frontmatter || {};
+  var ext = fm.clementine || {};
+  var allow = (ext.tools && ext.tools.allow) || [];
+  var dataSources = Array.isArray(ext.dataSources) ? ext.dataSources : [];
+  var bundled = Array.isArray(s.bundledFiles) ? s.bundledFiles : [];
+  var mutating = allow.some(function(t) {
+    return t === 'Write' || t === 'Edit' || t === 'Bash' || /__(write|edit|update|create|delete|send|post|patch|set)/i.test(t);
+  });
+  var rows = [
+    ['Runtime', allow.length > 0 ? allow.length + ' explicit tool' + (allow.length === 1 ? '' : 's') + ' allowed' : 'No explicit allowlist; inherits run defaults'],
+    ['References', s.layout === 'folder' ? bundled.length + ' bundled file' + (bundled.length === 1 ? '' : 's') : 'Flat legacy file; no bundled references'],
+    ['Data', dataSources.length > 0 ? dataSources.map(function(d) { return d.kind; }).join(', ') : 'No explicit data sources declared'],
+    ['Risk', mutating ? 'Mutating tools present; checkpointing enabled at runtime' : 'Read-oriented or externally scoped'],
+  ];
+  var html = '<div style="margin-top:10px;margin-bottom:18px;padding:12px 14px;background:var(--bg-secondary);border:1px solid var(--border);border-radius:6px">';
+  html += '<div style="font-size:12px;font-weight:600;color:var(--text-primary);margin-bottom:8px">Runtime readiness</div>';
+  html += '<table style="width:100%;border-collapse:collapse;font-size:12px">';
+  rows.forEach(function(row) {
+    html += '<tr><td style="padding:4px 0;color:var(--text-muted);width:100px">' + esc(row[0]) + '</td><td style="padding:4px 0;color:var(--text-secondary)">' + esc(row[1]) + '</td></tr>';
+  });
+  html += '</table>';
+  if (allow.length > 0) {
+    html += '<div style="display:flex;gap:4px;flex-wrap:wrap;margin-top:8px">'
+      + allow.slice(0, 12).map(function(t) { return '<code style="font-size:10px;background:var(--bg-tertiary);padding:2px 6px;border-radius:3px">' + esc(t) + '</code>'; }).join('')
+      + (allow.length > 12 ? '<span style="font-size:10px;color:var(--text-muted)">+' + (allow.length - 12) + ' more</span>' : '')
+      + '</div>';
+  }
+  html += '</div>';
+  return html;
 }
 
 function renderSkillInputs(inputs) {
@@ -30412,7 +31058,7 @@ function renderSkillsPickerList() {
   var createRow = '<div class="cap-picker-row" style="border:1px dashed var(--accent);background:transparent" onclick="openCreateSkillModal()">'
     +   '<div class="cap-picker-row-body">'
     +     '<div class="cap-picker-row-title" style="color:var(--accent);font-weight:600">+ Create new skill</div>'
-    +     '<div class="cap-picker-row-desc">Author a fresh skill — opens the editor without leaving this task.</div>'
+    +     '<div class="cap-picker-row-desc">Author a fresh skill — opens the editor without leaving this schedule.</div>'
     +   '</div>'
     + '</div>';
   if (skills.length === 0) {
@@ -30653,7 +31299,7 @@ function switchCronTab(tab) {
     var name = editingCronJob;
     if (!name) {
       var body = document.getElementById('cron-preview-body');
-      if (body) body.innerHTML = '<div style="padding:36px 24px;color:var(--text-muted);text-align:center;font-size:13px">Save the task first, then switch back here to see exactly what the agent will receive.</div>';
+      if (body) body.innerHTML = '<div style="padding:36px 24px;color:var(--text-muted);text-align:center;font-size:13px">Save the schedule first, then switch back here to see exactly what the agent will receive.</div>';
       return;
     }
     if (_cronPreviewLoadedFor !== name) loadCronPreviewIntoTab(name);
@@ -30693,7 +31339,7 @@ function markCronPreviewDirty() { _cronPreviewLoadedFor = null; }
 // recent committed state).
 async function openPromptHistory() {
   if (!editingCronJob) {
-    toast('Save the task first, then prompt history will be available.', 'info');
+    toast('Save the schedule first, then prompt history will be available.', 'info');
     return;
   }
   var modal = document.getElementById('prompt-history-modal');
@@ -30708,7 +31354,7 @@ async function openPromptHistory() {
     if (versions.length === 0) {
       list.innerHTML = '<div style="padding:36px 24px;color:var(--text-muted);text-align:center;line-height:1.6">'
         + '<div style="font-weight:500;color:var(--text-secondary);margin-bottom:8px">No prior prompt versions yet</div>'
-        + '<div style="font-size:12px">A version is recorded each time you save a different prompt. The first edit you make to this task will create version 1.</div>'
+        + '<div style="font-size:12px">A version is recorded each time you save a different prompt. The first edit you make to this schedule will create version 1.</div>'
         + '</div>';
       return;
     }
@@ -30854,7 +31500,7 @@ function switchCronConfigTab(tab) {
   });
 }
 
-// ── PRD Phase 1.2: "Run task once" — inline run + Last run tab ───────────
+// ── PRD Phase 1.2: "Run now" — inline run + Last run tab ───────────
 // Tracks an in-flight run triggered FROM the modal so the SSE listeners
 // know when a cron_complete event belongs to "the run I just kicked off"
 // vs a scheduled tick that fired in the background. Cleared when the run
@@ -30876,7 +31522,7 @@ function renderCronLastRunPane(job) {
   }
   var lr = job && job.lastRun;
   var topHtml = lr ? renderCronRunDetails(lr)
-    : '<div style="padding:36px 24px;color:var(--text-muted);text-align:center;font-size:13px">No runs yet. Click <strong>Run task once</strong> below to fire it now and watch the result here.</div>';
+    : '<div style="padding:36px 24px;color:var(--text-muted);text-align:center;font-size:13px">No runs yet. Click <strong>Run now</strong> below to fire this schedule and watch the result here.</div>';
   // PRD §6 Phase 4d / 1.18.103: Per-task observability section. Shows hook
   // installation status + a toggle. Appears under the run details so the
   // most important info (last result) stays primary. Renders a placeholder
@@ -31052,13 +31698,13 @@ function renderCronRunDetails(lr) {
   return html;
 }
 
-// Click handler for the green "Run task once" button. Triggers the existing
+// Click handler for the green "Run now" button. Triggers the existing
 // /api/cron/run/:job endpoint and switches to the Last run tab so the user
 // sees the running state. The SSE handler at the bottom of this file picks
 // up cron_complete and re-renders the pane with the result.
 async function runCronOnceFromModal() {
   if (!editingCronJob) {
-    toast('Save the task first, then Run task once.', 'error');
+    toast('Save the schedule first, then run it.', 'error');
     return;
   }
   if (_cronRunOnceInFlight) {
@@ -31099,7 +31745,7 @@ async function runCronOnceFromModal() {
     _cronRunOnceInFlight = null;
     if (_cronRunOnceTickerId) { clearInterval(_cronRunOnceTickerId); _cronRunOnceTickerId = null; }
   } finally {
-    if (btn) { btn.disabled = false; btn.textContent = '▶ Run task once'; }
+    if (btn) { btn.disabled = false; btn.textContent = '▶ Run now'; }
   }
 }
 
@@ -31233,8 +31879,8 @@ function openCreateCronModal(agentSlug) {
   _cronAgentContext = agentSlug || '';
   editingCronJob = null;
   _cronPreviewLoadedFor = null;
-  document.getElementById('cron-modal-title').textContent = 'New Scheduled Task';
-  document.getElementById('cron-modal-save').textContent = 'Create Task';
+  document.getElementById('cron-modal-title').textContent = 'New Schedule';
+  document.getElementById('cron-modal-save').textContent = 'Create Schedule';
   document.getElementById('cron-name').value = '';
   document.getElementById('cron-name').disabled = false;
   document.getElementById('sched-freq').value = 'daily';
@@ -31376,7 +32022,7 @@ function openEditCronModal(jobName) {
   if (previewBtn) previewBtn.removeAttribute('disabled');
   var lastRunBtnEdit = document.getElementById('cron-tab-btn-lastrun');
   if (lastRunBtnEdit) lastRunBtnEdit.removeAttribute('disabled');
-  // Show "Run task once" only for saved tasks.
+  // Show "Run now" only for saved schedules.
   var runOnceBtnEdit = document.getElementById('cron-run-once-btn');
   if (runOnceBtnEdit) runOnceBtnEdit.style.display = '';
   // 1.18.90: surface prompt history link for saved tasks.
@@ -31384,7 +32030,7 @@ function openEditCronModal(jobName) {
   if (historyLinkEdit) historyLinkEdit.style.display = '';
   // Render the most recent run from the loaded job into the Last run tab so
   // the user sees something the moment they switch to it (rather than a
-  // dead empty pane). The pane updates live when Run task once fires.
+  // dead empty pane). The pane updates live when Run now fires.
   renderCronLastRunPane(job);
   switchCronTab('configure');
   switchCronConfigTab('basics');  // PRD 1.3a: always start on Basics
@@ -31508,7 +32154,7 @@ function renderCronPreview(d) {
   html += '<div class="preview-section">';
   html += '<h4>Tool allowlist</h4>';
   if (!d.effectiveAllowedTools) {
-    html += '<div style="color:var(--text-muted);font-size:12px;font-style:italic">Inheriting from agent profile / SDK default — no per-trick tool restriction.</div>';
+    html += '<div style="color:var(--text-muted);font-size:12px;font-style:italic">Inheriting from agent profile / SDK default — no per-schedule tool restriction.</div>';
   } else {
     // 1.18.127 — attribute each tool to the cron's own allowlist vs a
     // pinned-skill widening. The widenedFromSkills.tools list contains
@@ -31526,7 +32172,7 @@ function renderCronPreview(d) {
     if (widenedTools.size > 0) {
       html += '<div style="margin-top:8px;padding:8px 10px;border-radius:6px;background:var(--bg-tertiary);font-size:11px;color:var(--text-muted);line-height:1.5">'
         + '<strong>Pinned-skill widening (1.18.125):</strong> a pinned skill\\'s <code>clementine.tools.allow</code> declaration added '
-        + widenedTools.size + ' tool' + (widenedTools.size === 1 ? '' : 's') + ' on top of this task\\'s base allowlist.'
+        + widenedTools.size + ' tool' + (widenedTools.size === 1 ? '' : 's') + ' on top of this schedule\\'s base allowlist.'
         + '</div>';
     }
   }
@@ -31639,7 +32285,7 @@ function closeCronModal(force) {
   // Reset preview pane content so a stale view from a previous job doesn't
   // flash on the next open.
   var previewBody = document.getElementById('cron-preview-body');
-  if (previewBody) previewBody.innerHTML = '<div style="padding:36px 24px;color:var(--text-muted);text-align:center;font-size:13px">Save the task first, then switch back here to see exactly what the agent will receive.</div>';
+  if (previewBody) previewBody.innerHTML = '<div style="padding:36px 24px;color:var(--text-muted);text-align:center;font-size:13px">Save the schedule first, then switch back here to see exactly what the agent will receive.</div>';
   resetCronTrainingChat();
 }
 
@@ -31937,7 +32583,7 @@ function _buildCronJobBodyForDraft() {
 
 async function saveCronAsDraft() {
   if (!editingCronJob) {
-    toast('Save the task first; drafts apply to existing tasks.', 'info');
+    toast('Save the schedule first; drafts apply to existing schedules.', 'info');
     return;
   }
   var body = _buildCronJobBodyForDraft();
@@ -32063,7 +32709,7 @@ function toggleCronTraining() {
 
 function resetCronTrainingChat() {
   var msgs = document.getElementById('cron-training-messages');
-  if (msgs) msgs.innerHTML = '<div class="empty-state" style="padding:16px;font-size:12px;color:var(--text-muted)">Chat with the agent to refine this task. Ask for help with the prompt, suggest improvements, or add context.</div>';
+  if (msgs) msgs.innerHTML = '<div class="empty-state" style="padding:16px;font-size:12px;color:var(--text-muted)">Chat with the agent to refine this schedule. Ask for help with the prompt, suggest improvements, or add context.</div>';
 }
 
 async function sendCronTraining() {
@@ -33000,6 +33646,7 @@ async function refreshSettings() {
   try {
     var r = await apiFetch('/api/settings');
     var d = await r.json();
+    if (d.time) updateDashboardTime(d.time);
     var prefResp = await apiFetch('/api/assistant-preferences');
     var prefData = await prefResp.json();
     var prefs = prefData.preferences || {};
@@ -33097,6 +33744,7 @@ async function refreshSettings() {
       + '<strong>Note:</strong> Changes that require a daemon restart show a Restart Clementine prompt here in the dashboard.'
       + '</div>';
     container.innerHTML = html;
+    renderDashboardTimeWidgets();
 
     // Attach change handlers for select elements
     for (var g2 of groups) {
@@ -33370,7 +34018,7 @@ async function sendChat() {
   userBubble.textContent = msg;
   const userMeta = document.createElement('div');
   userMeta.className = 'chat-meta';
-  userMeta.textContent = new Date().toLocaleTimeString();
+  userMeta.textContent = formatDashboardDate(new Date(), { hour: 'numeric', minute: '2-digit', hour12: true });
   userBubble.appendChild(userMeta);
   container.appendChild(userBubble);
   container.scrollTop = container.scrollHeight;
@@ -33409,7 +34057,7 @@ async function sendChat() {
 	    asstBubble.innerHTML = '<span style="color:var(--text-muted);font-style:italic">connecting...</span>';
 	    var asstMeta = document.createElement('div');
 	    asstMeta.className = 'chat-meta';
-	    asstMeta.textContent = new Date().toLocaleTimeString() + (asstIdentity.slug !== 'clementine' ? ' · ' + asstIdentity.name : '');
+	    asstMeta.textContent = formatDashboardDate(new Date(), { hour: 'numeric', minute: '2-digit', hour12: true }) + (asstIdentity.slug !== 'clementine' ? ' · ' + asstIdentity.name : '');
 	    asstRow.appendChild(asstBubble);
 	    container.appendChild(asstRow);
 	    typing.remove();
@@ -34816,6 +35464,31 @@ async function _populateMcpDropdowns() {
   }
 }
 
+function normalizeSkillRecord(s) {
+  s = s || {};
+  var fm = (s && s.frontmatter) || s || {};
+  var ext = fm.clementine || {};
+  var tools = (ext.tools && ext.tools.allow) || fm.toolsUsed || s.toolsUsed || [];
+  return {
+    name: fm.name || s.name || '',
+    title: fm.title || s.title || fm.name || s.name || '',
+    description: fm.description || s.description || '',
+    source: ext.source || fm.source || s.source || 'unknown',
+    sourceJob: ext.sourceJob || s.sourceJob || null,
+    triggers: ext.triggers || fm.triggers || s.triggers || [],
+    toolsUsed: tools,
+    useCount: ext.useCount ?? fm.useCount ?? s.useCount ?? 0,
+    lastUsed: ext.lastUsed ?? s.lastUsed ?? null,
+    createdAt: ext.createdAt ?? s.createdAt ?? '',
+    updatedAt: ext.updatedAt ?? s.updatedAt ?? '',
+    agentSlug: ext.agentSlug || s.agentSlug || null,
+    scope: s.scope || (s.agentSlug ? 'agent' : 'global'),
+    layout: s.layout || '',
+    schemaVersion: s.schemaVersion || '',
+    body: s.body || s.content || '',
+  };
+}
+
 async function refreshBuilderSkills() {
   var container = document.getElementById('builder-skills-list');
   var countEl = document.getElementById('builder-skills-count');
@@ -34830,7 +35503,8 @@ async function refreshBuilderSkills() {
       return;
     }
     var html = '';
-    for (var s of skills) {
+    for (var rawSkill of skills) {
+      var s = normalizeSkillRecord(rawSkill);
       var sourceTag = s.source === 'builder' ? '<span style="font-size:9px;background:var(--accent);color:white;padding:1px 5px;border-radius:3px">built</span>'
         : s.source === 'manual' ? '<span style="font-size:9px;background:var(--blue);color:white;padding:1px 5px;border-radius:3px">taught</span>'
         : '<span style="font-size:9px;background:var(--bg-tertiary);color:var(--text-muted);padding:1px 5px;border-radius:3px">' + esc(s.source || 'auto') + '</span>';
@@ -34871,6 +35545,7 @@ async function editSkillInBuilder(name, agentSlug) {
     var r = await apiFetch(url);
     var d = await r.json();
     if (d.error) { toast(d.error, 'error'); return; }
+    var loadedSkill = d.skill ? normalizeSkillRecord(d.skill) : normalizeSkillRecord(d);
 
     // Switch to builder page
     navigateTo('build', { tab: 'skills' });
@@ -34891,11 +35566,12 @@ async function editSkillInBuilder(name, agentSlug) {
     // Populate artifact
     builderArtifact = {
       type: 'skill',
-      title: d.title || '',
-      description: d.description || '',
-      triggers: d.triggers || [],
-      steps: d.steps || d.content || '',
-      toolsUsed: d.toolsUsed || [],
+      name: loadedSkill.name || name,
+      title: loadedSkill.title || '',
+      description: loadedSkill.description || '',
+      triggers: loadedSkill.triggers || [],
+      steps: loadedSkill.body || '',
+      tools: loadedSkill.toolsUsed || [],
     };
 
     // Load attachments
@@ -34903,7 +35579,7 @@ async function editSkillInBuilder(name, agentSlug) {
     renderBuilderAttachments();
 
     // Load linked tools
-    _builderLinkedTools = d.toolsUsed || [];
+    _builderLinkedTools = loadedSkill.toolsUsed || [];
 
     // Render preview
     renderBuilderPreview(builderArtifact, 'skill');
@@ -34914,13 +35590,13 @@ async function editSkillInBuilder(name, agentSlug) {
     var msgs = document.getElementById('builder-messages');
     if (msgs) {
       msgs.innerHTML = '<div style="text-align:center;padding:12px;font-size:13px;color:var(--text-muted)">'
-        + 'Editing skill: <strong>' + esc(d.title || name) + '</strong>'
+        + 'Editing skill: <strong>' + esc(loadedSkill.title || name) + '</strong>'
         + (agentSlug ? ' <span class="badge badge-blue" style="font-size:10px">' + esc(agentSlug) + '</span>' : '')
         + '<br><span style="font-size:11px">Make changes in the preview panel or chat to refine the skill.</span>'
         + '</div>';
     }
 
-    toast('Loaded "' + (d.title || name) + '" into builder', 'success');
+    toast('Loaded "' + (loadedSkill.title || name) + '" into builder', 'success');
   } catch(e) {
     toast('Failed to load skill: ' + e, 'error');
   }
@@ -34939,7 +35615,8 @@ function builderEmptyStateHtml(type) {
       + '</div></div>';
   }
   return '<div class="empty-state" style="margin-top:40px">'
-    + '<p style="color:var(--text-muted);margin-bottom:12px">Describe the workflow you want to build.</p>'
+    + '<p style="color:var(--text-muted);margin-bottom:12px">Describe the advanced workflow you want to build.</p>'
+    + '<p style="color:var(--text-muted);margin-bottom:16px;font-size:12px">For most automations, build a reusable skill first and schedule it from the skill detail page.</p>'
     + '<div style="display:flex;flex-wrap:wrap;gap:8px;justify-content:center">'
     + '<button class="btn btn-sm quick-pill" onclick="builderQuick(\\x27Create a workflow that researches a topic, writes a draft, and sends it for review\\x27)">Research workflow</button>'
     + '<button class="btn btn-sm quick-pill" onclick="builderQuick(\\x27Create a workflow that reviews open PRs, summarizes risk, and sends a digest\\x27)">PR review digest</button>'
@@ -34952,7 +35629,7 @@ function resetBuilder() {
   builderArtifact = null;
   builderSending = false;
   _builderLinkedTools = [];
-  var type = (document.getElementById('builder-type') || {}).value || 'workflow';
+  var type = (document.getElementById('builder-type') || {}).value || 'skill';
   var msgs = document.getElementById('builder-messages');
   if (msgs) msgs.innerHTML = builderEmptyStateHtml(type);
   var preview = document.getElementById('builder-preview');
@@ -35081,20 +35758,32 @@ function renderBuilderPreview(artifact, type) {
   if (!preview) return;
   var html = '';
   if (type === 'skill') {
-    html = '<div class="preview-field"><label>Title</label><input type="text" value="' + esc(artifact.title || '') + '" onchange="builderArtifact.title=this.value"></div>'
+    var skillTools = artifact.tools || artifact.toolsUsed || _builderLinkedTools || [];
+    var skillInputsJson = '{}';
+    try { skillInputsJson = JSON.stringify(artifact.inputs || {}, null, 2); } catch(e) {}
+    var skillDataSourcesText = (artifact.dataSources || []).map(function(d) {
+      if (typeof d === 'string') return d;
+      if (d && typeof d === 'object') return (d.kind || 'source') + ': ' + (d.purpose || '');
+      return '';
+    }).filter(Boolean).join('\\n');
+    html = '<div class="preview-field"><label>Skill Name</label><input type="text" value="' + esc(artifact.name || '') + '" onchange="builderArtifact.name=this.value" placeholder="kebab-case-slug"></div>'
+      + '<div class="preview-field"><label>Title</label><input type="text" value="' + esc(artifact.title || '') + '" onchange="builderArtifact.title=this.value"></div>'
       + '<div class="preview-field"><label>Description</label><input type="text" value="' + esc(artifact.description || '') + '" onchange="builderArtifact.description=this.value"></div>'
       + '<div class="preview-field"><label>Triggers</label><input type="text" value="' + esc((artifact.triggers || []).join(', ')) + '" onchange="builderArtifact.triggers=this.value.split(\\x27,\\x27).map(function(t){return t.trim()}).filter(Boolean)"></div>'
+      + '<div class="preview-field"><label>Inputs JSON</label><textarea rows="3" onchange="try{builderArtifact.inputs=JSON.parse(this.value||\\x27{}\\x27)}catch(e){toast(\\x27Inputs JSON is invalid\\x27,\\x27error\\x27)}">' + esc(skillInputsJson) + '</textarea></div>'
+      + '<div class="preview-field"><label>Data Sources</label><textarea rows="3" placeholder="asana: read task status\\ngoogle-sheets: update report rows" onchange="builderArtifact.dataSources=this.value.split(/\\n+/).map(function(line){line=line.trim();if(!line)return null;var idx=line.indexOf(\\x27:\\x27);return idx>0?{kind:line.slice(0,idx).trim()||\\x27source\\x27,purpose:line.slice(idx+1).trim()}:{kind:\\x27source\\x27,purpose:line};}).filter(function(x){return x&&x.purpose})">' + esc(skillDataSourcesText) + '</textarea></div>'
       + '<div class="preview-field"><label>Linked Tools</label>'
       + '<div id="builder-tools-panel" style="max-height:180px;overflow-y:auto;border:1px solid var(--border);border-radius:6px;padding:6px 8px;background:var(--bg-primary);margin-bottom:4px"></div>'
-      + '<div style="font-size:10px;color:var(--text-muted)">Select tools this skill can use. These are saved in the skill and communicated to the AI during conversations.</div>'
+      + '<div style="font-size:10px;color:var(--text-muted)">Select tools this skill can use. These become the runtime allowlist when the skill runs.</div>'
       + '</div>'
+      + '<div class="preview-field"><label>Success Criteria</label><input type="text" value="' + esc(artifact.successCriteria || '') + '" onchange="builderArtifact.successCriteria=this.value" placeholder="What proves the skill completed correctly?"></div>'
       + '<div class="preview-field"><label>Procedure</label><textarea rows="10" onchange="builderArtifact.steps=this.value">' + esc(artifact.steps || '') + '</textarea></div>'
       + '<div class="preview-field"><label>Reference Files</label>'
-      + '<div id="builder-preview-attachments"></div>'
+      + '<div id="builder-attachments-list"></div>'
       + '<div style="font-size:10px;color:var(--text-muted);margin-top:2px">' + (_builderAttachments.length > 0 ? _builderAttachments.length + ' file(s) attached' : 'Add files in the chat panel below') + '</div>'
       + '</div>';
     // Load tool picker after DOM update
-    setTimeout(function() { loadBuilderToolOptions(artifact.toolsUsed || _builderLinkedTools); }, 50);
+    setTimeout(function() { loadBuilderToolOptions(skillTools); renderBuilderAttachments(); }, 50);
   } else if (type === 'cron') {
     html = '<div class="preview-field"><label>Job Name</label><input type="text" value="' + esc(artifact.name || '') + '" onchange="builderArtifact.name=this.value"></div>'
       + '<div class="preview-field"><label>Schedule (cron expression)</label><input type="text" value="' + esc(artifact.schedule || '') + '" onchange="builderArtifact.schedule=this.value"></div>'
@@ -35139,7 +35828,7 @@ function renderBuilderPreview(artifact, type) {
       + '<div class="preview-field"><label>Trigger Schedule (cron, optional)</label><input type="text" value="' + esc(artifact.schedule || '') + '" onchange="builderArtifact.schedule=this.value" placeholder="e.g. 0 9 * * 1 (Mondays at 9am)"></div>'
       + '<div class="preview-field"><label>Linked Tools</label>'
       + '<div id="builder-tools-panel" style="max-height:180px;overflow-y:auto;border:1px solid var(--border);border-radius:6px;padding:6px 8px;background:var(--bg-primary);margin-bottom:4px"></div>'
-      + '<div style="font-size:10px;color:var(--text-muted)">Tools the trick will use. The chat sees these as a hint and weaves them into the steps.</div>'
+      + '<div style="font-size:10px;color:var(--text-muted)">Tools the advanced workflow will use. Prefer a skill allowlist unless this really needs multi-step orchestration.</div>'
       + '</div>'
       + '<div class="preview-field"><label>Quick add a step</label>'
       + '<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:4px">'
@@ -35171,19 +35860,21 @@ async function testBuilderSkill() {
     : 'Help me with ' + (builderArtifact.title || 'this');
 
   // Show test trigger in chat
-  msgs.innerHTML += '<div style="text-align:center;padding:8px;font-size:11px;color:var(--text-muted);border-top:1px solid var(--border);margin-top:8px">Testing with: "' + esc(trigger) + '"</div>';
+  msgs.innerHTML += '<div style="text-align:center;padding:8px;font-size:11px;color:var(--text-muted);border-top:1px solid var(--border);margin-top:8px">Dry-run testing with: "' + esc(trigger) + '"</div>';
   msgs.innerHTML += '<div class="chat-bubble assistant chat-typing" id="builder-test-typing" style="margin-bottom:10px"><span></span><span></span><span></span></div>';
   msgs.scrollTop = msgs.scrollHeight;
 
   var testBtn = document.getElementById('builder-test-btn');
-  if (testBtn) { testBtn.disabled = true; testBtn.textContent = 'Testing...'; }
+    if (testBtn) { testBtn.disabled = true; testBtn.textContent = 'Dry-running...'; }
 
   try {
     // Sync tools into artifact
+    builderArtifact.tools = _builderLinkedTools;
     builderArtifact.toolsUsed = _builderLinkedTools;
     var r = await apiJson('POST', '/api/builder/test', {
       artifact: builderArtifact,
       testMessage: trigger,
+      agentSlug: (document.getElementById('builder-agent') || {}).value || undefined,
     });
 
     var typing = document.getElementById('builder-test-typing');
@@ -35191,7 +35882,7 @@ async function testBuilderSkill() {
 
     if (r.response) {
       msgs.innerHTML += '<div style="border:1px solid var(--accent);border-radius:8px;padding:12px;margin:8px 0;background:var(--bg-secondary)">'
-        + '<div style="font-size:10px;font-weight:600;color:var(--accent);margin-bottom:6px">TEST RESULT</div>'
+        + '<div style="font-size:10px;font-weight:600;color:var(--accent);margin-bottom:6px">DRY-RUN RESULT</div>'
         + '<div style="font-size:13px">' + renderMd(r.response) + '</div>'
         + '</div>';
     }
@@ -35201,7 +35892,7 @@ async function testBuilderSkill() {
     if (t) t.remove();
     msgs.innerHTML += '<div class="chat-bubble assistant" style="color:var(--red)">Test error: ' + esc(String(e)) + '</div>';
   }
-  if (testBtn) { testBtn.disabled = false; testBtn.textContent = 'Test'; }
+  if (testBtn) { testBtn.disabled = false; testBtn.textContent = 'Dry-run'; }
 }
 
 async function saveBuilderArtifact() {
@@ -35213,6 +35904,9 @@ async function saveBuilderArtifact() {
     // across types but the persisted field name differs.
     if (type === 'agent') {
       builderArtifact.tools = _builderLinkedTools;
+    } else if (type === 'skill') {
+      builderArtifact.tools = _builderLinkedTools;
+      builderArtifact.toolsUsed = _builderLinkedTools;
     } else {
       builderArtifact.toolsUsed = _builderLinkedTools;
     }
@@ -35223,6 +35917,7 @@ async function saveBuilderArtifact() {
       attachments: (type === 'skill' && _builderAttachments.length > 0) ? _builderAttachments : undefined,
     });
     if (r.ok) {
+      if (type === 'skill' && r.name && builderArtifact) builderArtifact.name = r.name;
       // Upload any pending attachments for cron jobs
       if (type === 'cron' && _builderAttachments.length > 0 && r.name) {
         for (var i = 0; i < _builderAttachments.length; i++) {
@@ -35311,6 +36006,9 @@ function syncBuilderLinkedTools() {
   var type = (document.getElementById('builder-type') || {}).value;
   if (type === 'agent') {
     builderArtifact.tools = _builderLinkedTools;
+  } else if (type === 'skill') {
+    builderArtifact.tools = _builderLinkedTools;
+    builderArtifact.toolsUsed = _builderLinkedTools;
   } else {
     builderArtifact.toolsUsed = _builderLinkedTools;
   }
@@ -36832,7 +37530,7 @@ async function saveMemoryMd() {
     }
     window._memoryMdLoadedMtime = d.mtimeMs || 0;
     window._memoryMdDirty = false;
-    statusEl.textContent = 'Saved · ' + new Date().toLocaleTimeString();
+    statusEl.textContent = 'Saved · ' + formatDashboardDate(new Date(), { hour: 'numeric', minute: '2-digit', hour12: true });
     updateMemoryMdCounter();
     toast('MEMORY.md saved', 'success');
   } catch (err) {
@@ -37605,6 +38303,7 @@ async function refreshHomeDigest() {
     var r = await apiFetch('/api/home-digest');
     var d = await r.json();
     if (!d || d.error) return;
+    if (d.time) updateDashboardTime(d.time);
 
     // Greeting
     var greetPhraseEl = document.getElementById('home-greet-phrase');
@@ -37813,6 +38512,7 @@ async function refreshAll() {
   try {
     var r = await apiFetch('/api/init');
     var d = await r.json();
+    if (d.time) updateDashboardTime(d.time);
     if (d.status) refreshStatus(d.status);
     if (d.activity) refreshActivity(false, d.activity);
     else refreshActivity();  // Fall back to direct /api/activity fetch when init didn't include it
@@ -39639,16 +40339,18 @@ async function deleteSkill(name) {
   } catch(e) { toast('Error: ' + e, 'error'); }
 }
 
-async function expandSkill(name) {
+async function expandSkill(name, agentSlug) {
   var detail = document.getElementById('skill-detail-' + name);
   if (detail) { detail.remove(); return; }
   try {
-    var r = await apiFetch('/api/skills/' + encodeURIComponent(name));
+    var endpoint = agentSlug ? '/api/agents/' + encodeURIComponent(agentSlug) + '/skills/' + encodeURIComponent(name) : '/api/skills/' + encodeURIComponent(name);
+    var r = await apiFetch(endpoint);
     var d = await r.json();
-    var card = document.getElementById('skill-card-' + name);
+    var card = document.getElementById('skill-card-' + name) || document.getElementById('agent-skill-card-' + name);
     if (!card) return;
+    var loaded = d.skill ? normalizeSkillRecord(d.skill) : normalizeSkillRecord(d);
     var detailHtml = '<div id="skill-detail-' + esc(name) + '" style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border)">'
-      + '<pre style="white-space:pre-wrap;font-size:12px;color:var(--text-primary);background:var(--bg-tertiary);padding:12px;border-radius:6px;max-height:300px;overflow-y:auto">' + esc(d.content || '(no content)') + '</pre>'
+      + '<pre style="white-space:pre-wrap;font-size:12px;color:var(--text-primary);background:var(--bg-tertiary);padding:12px;border-radius:6px;max-height:300px;overflow-y:auto">' + esc(loaded.body || '(no content)') + '</pre>'
       + '</div>';
     card.insertAdjacentHTML('beforeend', detailHtml);
   } catch(e) { toast('Failed to load skill', 'error'); }
@@ -40020,7 +40722,8 @@ async function loadAgentSkills(agentSlug, isPrimary) {
       return;
     }
     var html = '<div style="display:flex;flex-direction:column;gap:8px;padding:12px">';
-    for (var s of skills) {
+    for (var rawSkill of skills) {
+      var s = normalizeSkillRecord(rawSkill);
       var sourceTag = s.source === 'manual' ? '<span class="badge badge-blue" style="font-size:10px">taught</span>'
         : s.source === 'cron' ? '<span class="badge badge-green" style="font-size:10px">cron</span>'
         : s.source === 'unleashed' ? '<span class="badge badge-purple" style="font-size:10px">unleashed</span>'
@@ -40047,11 +40750,11 @@ async function loadAgentSkills(agentSlug, isPrimary) {
       }
       html += '<div id="agent-skill-card-' + esc(s.name) + '" style="padding:10px;border:1px solid var(--border);border-radius:8px;background:var(--bg-secondary)">'
         + '<div style="display:flex;align-items:center;gap:6px;margin-bottom:4px">'
-        + '<strong style="cursor:pointer;font-size:13px" onclick="expandSkill(\\x27' + esc(s.name) + '\\x27)">' + esc(s.title) + '</strong> ' + sourceTag + ' ' + scopeTag
+        + '<strong style="cursor:pointer;font-size:13px" onclick="expandSkill(\\x27' + esc(s.name) + '\\x27,\\x27' + esc(agentSlug || '') + '\\x27)">' + esc(s.title) + '</strong> ' + sourceTag + ' ' + scopeTag
         + (agentSourceCtx ? ' ' + agentSourceCtx : '')
         + '<span style="margin-left:auto;display:flex;align-items:center;gap:6px">'
         + '<span style="font-size:11px;color:var(--text-muted)">used ' + (s.useCount || 0) + 'x' + (age ? ' \\u00b7 ' + age : '') + '</span>'
-        + '<button onclick="expandSkill(\\x27' + esc(s.name) + '\\x27)" style="background:none;border:1px solid var(--border);border-radius:4px;padding:2px 8px;font-size:10px;color:var(--text-secondary);cursor:pointer">View</button>'
+        + '<button onclick="expandSkill(\\x27' + esc(s.name) + '\\x27,\\x27' + esc(agentSlug || '') + '\\x27)" style="background:none;border:1px solid var(--border);border-radius:4px;padding:2px 8px;font-size:10px;color:var(--text-secondary);cursor:pointer">View</button>'
         + '<button onclick="editSkillInBuilder(\\x27' + esc(s.name) + '\\x27,\\x27' + esc(agentSlug || '') + '\\x27)" style="background:none;border:1px solid var(--border);border-radius:4px;padding:2px 8px;font-size:10px;color:var(--accent);cursor:pointer">Edit</button>'
         + '<button onclick="deleteAgentSkill(\\x27' + esc(agentSlug || '') + '\\x27,\\x27' + esc(s.name) + '\\x27)" style="background:none;border:1px solid var(--border);border-radius:4px;padding:2px 8px;font-size:10px;color:var(--red);cursor:pointer">Del</button>'
         + '</span></div>'
@@ -41823,9 +42526,11 @@ async function refreshSalesforce() {
 // ── Initial load — single batch request instead of 12+ parallel fetches ──
 (async function initDashboard() {
   renderRestartRequiredBanner();
+  startDashboardClock();
   try {
     var r = await apiFetch('/api/init');
     var d = await r.json();
+    if (d.time) { try { updateDashboardTime(d.time); } catch(e) { console.warn('init: time', e); } }
 
     // Feed data to individual render functions (same shape as individual endpoints)
     if (d.status) { try { refreshStatus(d.status); } catch(e) { console.warn('init: status', e); } }
@@ -41884,7 +42589,7 @@ try {
         refreshActivity();
         if (currentPage === 'build') refreshCron();
         refreshTeamNav();
-        // PRD Phase 1.2: if the user just clicked "Run task once" in the
+        // PRD Phase 1.2: if the user just clicked "Run now" in the
         // modal, re-render the Last run pane with the fresh result.
         if (evt.type === 'cron_complete' && evt.data && evt.data.job && typeof handleCronRunOnceComplete === 'function') {
           try { handleCronRunOnceComplete(evt.data.job); } catch (err) { /* non-fatal */ }
@@ -41977,7 +42682,7 @@ try {
             bubble.innerHTML = renderMd(text);
             var meta = document.createElement('div');
             meta.className = 'chat-meta';
-            meta.textContent = new Date().toLocaleTimeString()
+            meta.textContent = formatDashboardDate(new Date(), { hour: 'numeric', minute: '2-digit', hour12: true })
               + (deepIdentity.slug && deepIdentity.slug !== 'clementine' ? ' \u00b7 ' + deepIdentity.name : '')
               + ' \u00b7 deep task';
             bubble.appendChild(meta);

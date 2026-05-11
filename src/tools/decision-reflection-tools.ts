@@ -22,7 +22,7 @@ import {
   formatReflectionReport,
   formatReflectionSummary,
 } from '../agent/decision-reflection.js';
-import { ACTIVE_AGENT_SLUG, AGENTS_DIR, logger, textResult } from './shared.js';
+import { ACTIVE_AGENT_SLUG, AGENTS_DIR, logger, textResult, todayStr } from './shared.js';
 
 function reflectionsDir(slug: string): string {
   return path.join(AGENTS_DIR, slug, 'reflections');
@@ -33,7 +33,7 @@ function workingMemoryPath(slug: string): string {
 }
 
 function todayStamp(): string {
-  return new Date().toISOString().slice(0, 10);
+  return todayStr();
 }
 
 /** Append a summary block to working-memory.md, creating the file if needed. */

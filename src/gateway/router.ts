@@ -2358,6 +2358,7 @@ export class Gateway {
             sessionKey: `cron:${jobName}`,
             source: 'scheduled-skill',
             profile,
+            agentSlug: agentSlug && agentSlug !== 'clementine' ? agentSlug : undefined,
             agentManager: this.getAgentManager(),
             memoryStore: this.assistant.getMemoryStore?.() ?? null,
             projectWorkDir: workDir,

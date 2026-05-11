@@ -44,6 +44,7 @@ import {
   AGENTS_DIR,
   HEARTBEAT_WORK_QUEUE_FILE,
   DISCORD_OWNER_ID,
+  TIMEZONE,
 } from '../config.js';
 import { findGoalPath, listAllGoals } from '../tools/shared.js';
 import type { HeartbeatState, HeartbeatReportedTopic, HeartbeatWorkItem } from '../types.js';
@@ -75,6 +76,7 @@ import {
 import type { NotificationDispatcher } from './notifications.js';
 import type { Gateway } from './router.js';
 import { CronRunLog, logToDailyNote, todayISO } from './cron-scheduler.js';
+import { formatTimeInTimeZone, hourInTimeZone, weekdayInTimeZone } from '../lib/time.js';
 
 const logger = pino({ name: 'clementine.heartbeat' });
 const PROACTIVE_DECISION_DEDUPE_MS = 24 * 60 * 60 * 1000;
@@ -292,7 +294,7 @@ export class HeartbeatScheduler {
     }).catch(err => logger.warn({ err }, 'Claim tracker import failed'));
 
     const now = new Date();
-    const hour = now.getHours();
+    const hour = hourInTimeZone(now, TIMEZONE);
 
     // ── Nightly tasks: run regardless of active hours ─────────────────
     // These have their own hour/date guards and must fire outside active hours.
@@ -1295,7 +1297,7 @@ export class HeartbeatScheduler {
     if (!insight) return;
 
     // Urgency-based delivery
-    const hour = new Date().getHours();
+    const hour = hourInTimeZone(new Date(), TIMEZONE);
     const inActiveHours = hour >= HEARTBEAT_ACTIVE_START && hour < HEARTBEAT_ACTIVE_END;
     const ownerSessionKey = DISCORD_OWNER_ID && DISCORD_OWNER_ID !== '0'
       ? `discord:user:${DISCORD_OWNER_ID}`
@@ -1895,7 +1897,7 @@ export class HeartbeatScheduler {
   }
 
   static getTimeContext(hour: number): string {
-    const day = new Date().toLocaleDateString('en-US', { weekday: 'long' });
+    const day = weekdayInTimeZone(new Date(), TIMEZONE);
     if (hour >= 8 && hour < 10) {
       return `${day} morning — Be forward-looking. Mention today's plan priorities, flag anything due today, set the tone for the day.`;
     } else if (hour >= 10 && hour < 14) {
@@ -1942,9 +1944,7 @@ export class HeartbeatScheduler {
     if (topics.length === 0) return '';
 
     const lines = topics.map((t) => {
-      const time = new Date(t.reportedAt).toLocaleTimeString('en-US', {
-        hour: 'numeric', minute: '2-digit', hour12: true,
-      });
+      const time = formatTimeInTimeZone(new Date(t.reportedAt), TIMEZONE);
       return `- ${time}: ${t.summary} [topic: ${t.topic}]`;
     });
     return `## Already Reported (do NOT repeat unless status changed)\n${lines.join('\n')}`;

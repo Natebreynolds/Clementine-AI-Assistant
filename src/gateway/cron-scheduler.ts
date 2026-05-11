@@ -84,6 +84,7 @@ import {
   markBackgroundCreditBlocked,
 } from './credit-guard.js';
 import { isRunHealthFailure } from './job-health.js';
+import { dateKeyInTimeZone } from '../lib/time.js';
 
 const logger = pino({ name: 'clementine.cron' });
 
@@ -107,8 +108,7 @@ const SYSTEM_TIMEZONE = TIMEZONE;
 
 /** Local-time YYYY-MM-DD for daily note path. */
 export function todayISO(): string {
-  const d = new Date();
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+  return dateKeyInTimeZone(new Date(), SYSTEM_TIMEZONE);
 }
 
 /**

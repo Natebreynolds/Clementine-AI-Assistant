@@ -60,6 +60,9 @@ export interface RunSkillOptions {
    *  `projectWorkDir` parameter — when set, project-scoped skills shadow
    *  global ones with the same name). */
   projectWorkDir?: string;
+  /** Optional agent scope. Agent-scoped skills shadow global skills with
+   *  the same name, while project-scoped skills still win when provided. */
+  agentSlug?: string;
   /** Optional hired-agent profile used as the main agent for this skill run. */
   profile?: AgentProfile | null;
   /** Hired-agent registry for SDK subagent definitions. */
@@ -300,6 +303,7 @@ export async function runSkill(
 ): Promise<RunSkillResult> {
   const skill = getSkill(name, {
     ...(options.projectWorkDir ? { projectWorkDir: options.projectWorkDir } : {}),
+    ...(options.agentSlug ? { agentSlug: options.agentSlug } : {}),
   });
 
   if (!skill) {

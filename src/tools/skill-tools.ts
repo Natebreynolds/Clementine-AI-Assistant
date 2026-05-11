@@ -18,13 +18,11 @@
  * and these tools, so you can't smuggle a bad skill through the chat path.
  */
 
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
-import path from 'node:path';
 import { z } from 'zod';
-import matter from 'gray-matter';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import type { SkillDataSource, SkillInputSchema, SkillLimits, SkillSuccess } from '../types.js';
 
-import { VAULT_DIR, textResult, logger } from './shared.js';
+import { ACTIVE_AGENT_SLUG, textResult, logger } from './shared.js';
 
 // 1.18.124 — name regex is the only validator skill-tools still uses
 // directly (for update_skill's pre-flight slug check). All other
@@ -33,10 +31,58 @@ import { VAULT_DIR, textResult, logger } from './shared.js';
 // constant so all skill-name validation now traces to one source.
 import { ANTHROPIC_SKILL_NAME_PATTERN } from '../agent/skill-store.js';
 const NAME_PATTERN = ANTHROPIC_SKILL_NAME_PATTERN;
-const DESCRIPTION_MAX_LEN = 1024;
 
-function globalSkillsDir(): string {
-  return path.join(VAULT_DIR, '00-System', 'skills');
+const SOURCE_VALUES = new Set(['manual', 'chat', 'auto', 'imported']);
+
+function resolveAgentSlug(agentSlug?: string | null): string | undefined {
+  if (agentSlug === null) return undefined;
+  const raw = typeof agentSlug === 'string' && agentSlug.trim() ? agentSlug.trim() : ACTIVE_AGENT_SLUG;
+  return raw || undefined;
+}
+
+function preservedSource(value: unknown): 'manual' | 'chat' | 'auto' | 'imported' {
+  return typeof value === 'string' && SOURCE_VALUES.has(value)
+    ? value as 'manual' | 'chat' | 'auto' | 'imported'
+    : 'chat';
+}
+
+function normalizeDataSources(dataSources: unknown): SkillDataSource[] | undefined {
+  if (!Array.isArray(dataSources)) return undefined;
+  const normalized = dataSources
+    .map((d): SkillDataSource | null => {
+      if (typeof d === 'string') {
+        const trimmed = d.trim();
+        return trimmed ? { kind: 'source', purpose: trimmed } : null;
+      }
+      if (!d || typeof d !== 'object' || Array.isArray(d)) return null;
+      const r = d as Record<string, unknown>;
+      const kind = String(r.kind || 'source').trim() || 'source';
+      const purpose = String(r.purpose || r.name || '').trim();
+      return purpose ? { kind, purpose } : null;
+    })
+    .filter((d): d is SkillDataSource => !!d);
+  return normalized.length > 0 ? normalized : [];
+}
+
+function normalizeSuccess(successCriteria: unknown): SkillSuccess | undefined {
+  if (typeof successCriteria !== 'string') return undefined;
+  const criterion = successCriteria.trim();
+  return criterion ? { criterion } : {};
+}
+
+function normalizeInputs(inputs: unknown): Record<string, SkillInputSchema> | undefined {
+  if (!inputs || typeof inputs !== 'object' || Array.isArray(inputs)) return undefined;
+  return inputs as Record<string, SkillInputSchema>;
+}
+
+function normalizeLimits(limits: unknown): SkillLimits | undefined {
+  if (!limits || typeof limits !== 'object' || Array.isArray(limits)) return undefined;
+  const r = limits as Record<string, unknown>;
+  const out: SkillLimits = {};
+  if (typeof r.maxTurns === 'number') out.maxTurns = r.maxTurns;
+  if (typeof r.maxBudgetUsd === 'number') out.maxBudgetUsd = r.maxBudgetUsd;
+  if (typeof r.timeoutSeconds === 'number') out.timeoutSeconds = r.timeoutSeconds;
+  return Object.keys(out).length > 0 ? out : {};
 }
 
 export function registerSkillTools(server: McpServer): void {
@@ -47,28 +93,46 @@ export function registerSkillTools(server: McpServer): void {
   // `clementine` namespace.
   server.tool(
     'create_skill',
-    'Author a new reusable skill (a recipe Claude follows when invoked). Writes <name>/SKILL.md in the vault. Returns the skill name + path on success. Anthropic spec: name must match ^[a-z0-9][a-z0-9-]{0,63}$ and description ≤1024 chars.',
+    'Create a reusable folder-form skill at <name>/SKILL.md. Use only when the user asks to save/teach/reuse/schedule a procedure.',
     {
       name: z.string()
-        .describe('Skill slug — lowercase letters/digits/dashes, max 64 chars, must start with a letter or digit. Example: "morning-deal-review".'),
+        .describe('Skill slug: lowercase letters, digits, hyphens; max 64 chars.'),
       title: z.string().optional()
-        .describe('Optional friendlier display name. Example: "Morning Deal Review".'),
+        .describe('Optional display name.'),
       description: z.string()
-        .describe('One-paragraph summary of what this skill does and when Claude should run it. Used by the runtime auto-matcher and surfaced in the dashboard skill/schedule previews. Max 1024 chars.'),
+        .describe('What the skill does and when to use it. Max 1024 chars.'),
       body: z.string()
-        .describe('The procedure body in Markdown. Use headers (# / ##), numbered lists, code fences. Max 500 lines is best practice. Example: "# Morning Deal Review\\n\\n1. Pull deals updated in the last 24h.\\n2. Surface high-value ones." '),
+        .describe('Markdown procedure. Keep concise; link/bundle long references.'),
       tools: z.array(z.string()).optional()
-        .describe('Optional allowlist of tool names this skill should restrict itself to (e.g. ["Read", "Bash", "memory_search"]). Stored under clementine.tools.allow. Empty/omitted means inherit the cron task or chat session defaults.'),
+        .describe('Exact tool allowlist, e.g. Bash or mcp__server__tool.'),
       triggers: z.array(z.string()).optional()
-        .describe('Optional natural-language phrases that should auto-match this skill at runtime (e.g. ["morning deal review", "check deals today"]). Stored under clementine.triggers. Pinned skills don\'t need triggers — they fire by name.'),
+        .describe('Optional phrases that should match this skill.'),
+      inputs: z.record(z.string(), z.any()).optional()
+        .describe('Optional input schema for {{var}} placeholders.'),
+      dataSources: z.array(z.union([
+        z.string(),
+        z.object({ kind: z.string().optional(), purpose: z.string() }),
+      ])).optional()
+        .describe('Optional source dependencies.'),
+      successCriteria: z.string().optional()
+        .describe('Optional completion criterion.'),
+      limits: z.object({
+        maxTurns: z.number().optional(),
+        maxBudgetUsd: z.number().optional(),
+        timeoutSeconds: z.number().optional(),
+      }).optional()
+        .describe('Optional runtime limits.'),
+      agentSlug: z.string().nullable().optional()
+        .describe('Optional agent owner; null means global.'),
     },
-    async ({ name, title, description, body, tools, triggers }) => {
+    async ({ name, title, description, body, tools, triggers, inputs, dataSources, successCriteria, limits, agentSlug }) => {
       // 1.18.124 — delegate to the shared writeSkill helper. Validation
       // (name regex, length caps, reserved words, already-exists) is
       // now centralized; the same checks run for the dashboard endpoint
       // and the auto-extraction path.
       try {
         const { writeSkill } = await import('../agent/skill-store.js');
+        const scopedAgent = resolveAgentSlug(agentSlug);
         const result = writeSkill({
           name,
           title,
@@ -76,16 +140,23 @@ export function registerSkillTools(server: McpServer): void {
           body,
           tools,
           triggers,
+          inputs: normalizeInputs(inputs),
+          dataSources: normalizeDataSources(dataSources),
+          success: normalizeSuccess(successCriteria),
+          limits: normalizeLimits(limits),
           source: 'chat',
+          ...(scopedAgent ? { agentSlug: scopedAgent } : {}),
         });
-        logger.info({ name: result.name, entryPath: result.filePath, source: 'chat' }, 'Skill created via chat');
+        logger.info({ name: result.name, entryPath: result.filePath, source: 'chat', agentSlug: scopedAgent ?? null }, 'Skill created via chat');
         const toolsLine = (tools && tools.length > 0) ? `\nAllowed tools: ${tools.slice(0, 5).join(', ')}${tools.length > 5 ? `, +${tools.length - 5} more` : ''}` : '';
         const triggersLine = (triggers && triggers.length > 0) ? `\nTriggers: ${triggers.slice(0, 4).join(', ')}${triggers.length > 4 ? `, +${triggers.length - 4} more` : ''}` : '';
+        const scopeLine = scopedAgent ? `\nScope: agent ${scopedAgent}` : '\nScope: global';
         return textResult(
           `✅ Created skill "${result.name}" at ${result.filePath}\n` +
           `Description: ${description.slice(0, 200)}${description.length > 200 ? '…' : ''}` +
           toolsLine +
           triggersLine +
+          scopeLine +
           `\n\nThe skill is ready to schedule or run manually — open Skills/Schedules in the dashboard and select "${result.name}", or invoke it directly in chat: "Run the ${title || result.name} skill."`,
         );
       } catch (err) {
@@ -105,61 +176,69 @@ export function registerSkillTools(server: McpServer): void {
   // chat edits don't reset the lifecycle metadata.
   server.tool(
     'update_skill',
-    'Update an existing skill\'s description, body, tools, or triggers. Preserves lifecycle metadata (useCount, createdAt, etc.). Returns the updated path on success.',
+    'Update an existing skill while preserving lifecycle metadata.',
     {
-      name: z.string().describe('Slug of the skill to update (e.g. "morning-deal-review").'),
-      description: z.string().optional().describe('New description (one paragraph, ≤1024 chars).'),
-      body: z.string().optional().describe('New procedure body (Markdown). Replaces the existing body in full.'),
-      tools: z.array(z.string()).optional().describe('New allowlist for clementine.tools.allow. Pass [] to clear.'),
-      triggers: z.array(z.string()).optional().describe('New trigger phrase list for clementine.triggers. Pass [] to clear.'),
+      name: z.string().describe('Skill slug.'),
+      description: z.string().optional().describe('New description; max 1024 chars.'),
+      body: z.string().optional().describe('New Markdown procedure.'),
+      tools: z.array(z.string()).optional().describe('New exact tool allowlist; [] clears.'),
+      triggers: z.array(z.string()).optional().describe('New trigger phrases; [] clears.'),
+      inputs: z.record(z.string(), z.any()).optional().describe('New input schema; {} clears.'),
+      dataSources: z.array(z.union([
+        z.string(),
+        z.object({ kind: z.string().optional(), purpose: z.string() }),
+      ])).optional().describe('New data sources; [] clears.'),
+      successCriteria: z.string().optional().describe('New success criterion; empty clears.'),
+      limits: z.object({
+        maxTurns: z.number().optional(),
+        maxBudgetUsd: z.number().optional(),
+        timeoutSeconds: z.number().optional(),
+      }).optional().describe('New runtime limits; {} clears.'),
+      agentSlug: z.string().nullable().optional().describe('Optional agent scope; null means global.'),
     },
-    async ({ name, description, body, tools, triggers }) => {
+    async ({ name, description, body, tools, triggers, inputs, dataSources, successCriteria, limits, agentSlug }) => {
       if (!NAME_PATTERN.test(name)) {
         return textResult(`❌ Name "${name}" is not a valid skill slug.`);
       }
-      const skillsDir = globalSkillsDir();
-      const folderEntry = path.join(skillsDir, name, 'SKILL.md');
-      const flatEntry = path.join(skillsDir, name + '.md');
-      const targetPath = existsSync(folderEntry) ? folderEntry : (existsSync(flatEntry) ? flatEntry : null);
-      if (!targetPath) {
-        return textResult(`❌ Skill "${name}" not found. Use create_skill if you want to author it from scratch.`);
-      }
 
       try {
-        const raw = readFileSync(targetPath, 'utf-8');
-        const parsed = matter(raw);
-        const fm: Record<string, unknown> = { ...parsed.data };
-        fm.name = name;
-        if (description !== undefined) {
-          if (description.length > DESCRIPTION_MAX_LEN) {
-            return textResult(`❌ Description is too long (${description.length} chars). Max is ${DESCRIPTION_MAX_LEN}.`);
-          }
-          fm.description = description;
+        const scopedAgent = resolveAgentSlug(agentSlug);
+        const { getSkill, writeSkill } = await import('../agent/skill-store.js');
+        const skill = getSkill(name, { agentSlug: scopedAgent });
+        if (!skill) {
+          return textResult(`❌ Skill "${name}" not found${scopedAgent ? ` for ${scopedAgent} or global scope` : ''}. Use create_skill if you want to author it from scratch.`);
         }
-        const ext = (fm.clementine && typeof fm.clementine === 'object') ? fm.clementine as Record<string, unknown> : {};
-        ext.updatedAt = new Date().toISOString();
-        if (tools !== undefined) {
-          if (tools.length > 0) ext.tools = { ...(ext.tools as object || {}), allow: tools };
-          else if (ext.tools && typeof ext.tools === 'object') delete (ext.tools as Record<string, unknown>).allow;
-        }
-        if (triggers !== undefined) {
-          if (triggers.length > 0) ext.triggers = triggers;
-          else delete ext.triggers;
-        }
-        fm.clementine = ext;
-        const newBody = body !== undefined ? (body.endsWith('\n') ? body : body + '\n') : parsed.content;
-        const content = matter.stringify(newBody, fm);
-        writeFileSync(targetPath, content);
-        logger.info({ name, targetPath, source: 'chat' }, 'Skill updated via chat');
+        const ext = skill.frontmatter.clementine;
+        const targetAgentSlug = skill.scope === 'agent' ? scopedAgent : undefined;
+        const result = writeSkill({
+          name,
+          title: skill.frontmatter.title,
+          description: description ?? skill.frontmatter.description ?? `Reusable skill "${name}". Use when this procedure is relevant.`,
+          body: body ?? skill.body,
+          tools,
+          triggers,
+          inputs: inputs !== undefined ? normalizeInputs(inputs) ?? {} : undefined,
+          dataSources: dataSources !== undefined ? normalizeDataSources(dataSources) ?? [] : undefined,
+          success: successCriteria !== undefined ? normalizeSuccess(successCriteria) ?? {} : undefined,
+          limits: limits !== undefined ? normalizeLimits(limits) ?? {} : undefined,
+          source: preservedSource(ext?.source),
+          ...(targetAgentSlug ? { agentSlug: targetAgentSlug } : {}),
+          overwrite: true,
+        });
+        logger.info({ name, targetPath: result.filePath, source: 'chat', agentSlug: targetAgentSlug ?? null }, 'Skill updated via chat');
 
         const changed: string[] = [];
         if (description !== undefined) changed.push('description');
         if (body !== undefined) changed.push('body');
         if (tools !== undefined) changed.push('tools');
         if (triggers !== undefined) changed.push('triggers');
+        if (inputs !== undefined) changed.push('inputs');
+        if (dataSources !== undefined) changed.push('dataSources');
+        if (successCriteria !== undefined) changed.push('success');
+        if (limits !== undefined) changed.push('limits');
         return textResult(
           `✅ Updated skill "${name}" — changed: ${changed.join(', ') || '(no fields specified)'}.\n` +
-          `Path: ${targetPath}`,
+          `Path: ${result.filePath}`,
         );
       } catch (err) {
         logger.error({ err, name }, 'update_skill failed');
@@ -173,48 +252,24 @@ export function registerSkillTools(server: McpServer): void {
   // without needing to fall back to file-system tools.
   server.tool(
     'list_skills',
-    'List every skill currently in the global vault. Returns name, title, description, schema version (anthropic / clementine / legacy), and layout (folder / flat). Useful when the user asks "what skills do you have?" or "show me my skills."',
-    {},
-    async () => {
+    'List skills visible to this chat context.',
+    {
+      agentSlug: z.string().nullable().optional().describe('Optional agent scope. Defaults to the active hired agent when present.'),
+    },
+    async ({ agentSlug }) => {
       try {
-        const skillsDir = globalSkillsDir();
-        if (!existsSync(skillsDir)) return textResult('No skills directory yet. Use create_skill to author your first one.');
-        const { readdirSync, statSync } = await import('node:fs');
-        const items = readdirSync(skillsDir);
-        const skills: Array<{ name: string; title: string; description: string; layout: string }> = [];
-        for (const item of items) {
-          if (item.startsWith('.')) continue;
-          const full = path.join(skillsDir, item);
-          let st;
-          try { st = statSync(full); } catch { continue; }
-          if (st.isDirectory()) {
-            const entry = path.join(full, 'SKILL.md');
-            if (!existsSync(entry)) continue;
-            try {
-              const fm = matter(readFileSync(entry, 'utf-8')).data as Record<string, unknown>;
-              skills.push({
-                name: String(fm.name ?? item),
-                title: String(fm.title ?? fm.name ?? item),
-                description: String(fm.description ?? ''),
-                layout: 'folder',
-              });
-            } catch { /* skip malformed */ }
-          } else if (st.isFile() && item.endsWith('.md') && !item.endsWith('.bak.md')) {
-            try {
-              const fm = matter(readFileSync(full, 'utf-8')).data as Record<string, unknown>;
-              skills.push({
-                name: String(fm.name ?? item.replace(/\.md$/, '')),
-                title: String(fm.title ?? fm.name ?? item),
-                description: String(fm.description ?? ''),
-                layout: 'flat',
-              });
-            } catch { /* skip malformed */ }
-          }
-        }
+        const { listSkills } = await import('../agent/skill-store.js');
+        const scopedAgent = resolveAgentSlug(agentSlug);
+        const skills = listSkills({ agentSlug: scopedAgent });
         if (skills.length === 0) return textResult('No skills found yet. Use create_skill to author your first one.');
-        skills.sort((a, b) => a.name.localeCompare(b.name));
-        const lines = skills.map(s => `• ${s.title} (\`${s.name}\`) — ${s.description.slice(0, 120)}${s.description.length > 120 ? '…' : ''}`);
-        return textResult(`${skills.length} skill${skills.length === 1 ? '' : 's'}:\n\n${lines.join('\n')}`);
+        const lines = skills.map(s => {
+          const fm = s.frontmatter;
+          const title = fm.title || fm.name;
+          const desc = fm.description || '';
+          const scope = s.scope === 'agent' && scopedAgent ? `agent:${scopedAgent}` : s.scope;
+          return `• ${title} (\`${fm.name}\`) [${scope}/${s.layout}/${s.schemaVersion}] — ${desc.slice(0, 120)}${desc.length > 120 ? '…' : ''}`;
+        });
+        return textResult(`${skills.length} skill${skills.length === 1 ? '' : 's'}${scopedAgent ? ` visible to ${scopedAgent}` : ''}:\n\n${lines.join('\n')}`);
       } catch (err) {
         return textResult(`❌ Failed to list skills: ${err instanceof Error ? err.message : String(err)}`);
       }
@@ -233,21 +288,23 @@ export function registerSkillTools(server: McpServer): void {
   // widening path) is for the cron prompt; this is for callable execution.
   server.tool(
     'run_skill',
-    'Execute a named skill as a sub-call with a HARD tool allowlist. The skill body is rendered with optional {{var}} substitutions from `inputs`, then run with only the tools the skill declared under clementine.tools.allow (plus a small baseline). Returns the skill output + cost + schema validation result when applicable. Use when chat says "run my morning-briefing skill" or when one skill needs to invoke another.',
+    'Execute a named skill with its declared tool allowlist and optional inputs.',
     {
-      name: z.string().regex(NAME_PATTERN).describe('Skill slug (e.g. "morning-briefing"). Must match an existing skill in the vault.'),
+      name: z.string().regex(NAME_PATTERN).describe('Existing skill slug.'),
       inputs: z.record(z.string(), z.union([z.string(), z.number(), z.boolean()])).optional()
-        .describe('Optional key→value map substituted into {{var}} placeholders in the skill body. Missing placeholders are left as-is so the LLM can complain.'),
+        .describe('Values for {{var}} placeholders.'),
       context: z.string().optional()
-        .describe('Optional caller context appended after the skill body (e.g. "user said: do X right now"). Surfaced under a "## Caller context" heading.'),
+        .describe('Optional caller context.'),
+      agentSlug: z.string().nullable().optional()
+        .describe('Optional agent scope; null means global.'),
     },
-    async ({ name, inputs, context }: { name: string; inputs?: Record<string, string | number | boolean>; context?: string }) => {
+    async ({ name, inputs, context, agentSlug }: { name: string; inputs?: Record<string, string | number | boolean>; context?: string; agentSlug?: string | null }) => {
       try {
         // Lazy import — runSkill pulls in run-agent + the SDK; only load on
         // demand so `list_skills` etc stay fast and the MCP server boots
         // without warming the whole agent path.
         const { runSkill } = await import('../agent/run-skill.js');
-        const result = await runSkill(name, { inputs, context, source: 'mcp:run_skill' });
+        const result = await runSkill(name, { inputs, context, source: 'mcp:run_skill', agentSlug: resolveAgentSlug(agentSlug) });
 
         if (!result.ok) {
           return textResult(`❌ run_skill(${name}) failed: ${result.error ?? 'unknown error'}`);

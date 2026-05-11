@@ -45,6 +45,7 @@ import {
   CRON_REFLECTIONS_DIR,
   BUDGET,
   TASK_BUDGET_TOKENS,
+  TIMEZONE,
   CLAUDE_CODE_OAUTH_TOKEN,
   ANTHROPIC_API_KEY as CONFIG_ANTHROPIC_API_KEY,
   claudeCodeDisableOneMillionForModel,
@@ -89,6 +90,7 @@ import { isRestrictedToolset, toolsetAllowsLocalWrites, toolsetDisablesAllTools,
 import { looksLikeApprovalPrompt } from './local-turn.js';
 import { type RetrievalTier, type TurnPolicy } from './turn-policy.js';
 import { loadClementineJson } from '../config/clementine-json.js';
+import { dateKeyInTimeZone, formatDateInTimeZone, formatTimeInTimeZone, hourInTimeZone } from '../lib/time.js';
 
 // ── Channel capabilities ────────────────────────────────────────────
 
@@ -663,25 +665,20 @@ function extractText(blocks: ContentBlock[]): string {
 // ── Date Helpers ────────────────────────────────────────────────────
 
 function formatDate(d: Date): string {
-  return d.toLocaleDateString('en-US', {
-    weekday: 'long', year: 'numeric', month: 'long', day: 'numeric',
-  });
+  return formatDateInTimeZone(d, TIMEZONE);
 }
 
 function formatTime(d: Date): string {
-  return d.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true });
+  return formatTimeInTimeZone(d, TIMEZONE);
 }
 
 /** Local-time YYYY-MM-DD (avoids UTC date mismatch late at night). */
 function todayISO(): string {
-  const d = new Date();
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+  return dateKeyInTimeZone(new Date(), TIMEZONE);
 }
 
 function yesterdayISO(): string {
-  const d = new Date();
-  d.setDate(d.getDate() - 1);
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+  return dateKeyInTimeZone(new Date(Date.now() - 24 * 60 * 60 * 1000), TIMEZONE);
 }
 
 // ── Cron Trace Types ────────────────────────────────────────────────
@@ -1310,7 +1307,7 @@ Large tool outputs blow the context window and rotate your session mid-task — 
     // Skip yesterday's notes and recent conversation summaries for autonomous runs
     if (!isAutonomous && !skipAmbientContext) {
       if (!retrievalContext) {
-        const hour = new Date().getHours();
+        const hour = hourInTimeZone(new Date(), TIMEZONE);
         const mentionsYesterday = this._lastUserMessage?.toLowerCase().includes('yesterday');
         if (hour < 12 || mentionsYesterday) {
           const yPath = path.join(DAILY_NOTES_DIR, `${yesterdayISO()}.md`);
@@ -1829,7 +1826,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
 
 - **Date:** ${formatDate(now)}
 - **Time:** ${formatTime(now)}
-- **Timezone:** ${Intl.DateTimeFormat().resolvedOptions().timeZone}
+- **Timezone:** ${TIMEZONE}
 - **Channel:** ${channel}${caps ? ` (${formatCapabilities(caps)})` : ''}
 - **Model:** ${modelLabel} (${resolvedModel})
 - **Vault:** ${vault}
