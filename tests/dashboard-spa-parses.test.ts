@@ -20,6 +20,9 @@ describe('dashboard SPA inline JS parses', () => {
     const html = getDashboardHTML('a'.repeat(48));
     expect(typeof html).toBe('string');
     expect(html.length).toBeGreaterThan(100_000);
+    expect(html).toContain('id="skill-composer-home"');
+    expect(html).toContain('skill-studio-modal-body');
+    expect(html).toContain('startSkillComposerChat');
     // Pull every non-src <script>...</script> block.
     const re = /<script(?![^>]*\bsrc=)[^>]*>([\s\S]*?)<\/script>/g;
     const blocks: string[] = [];

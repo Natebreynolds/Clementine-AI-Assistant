@@ -23598,7 +23598,7 @@ function openCommandK() {
     { kw: 'home activity',      page: 'home',     tab: 'activity',     label: 'Home · Activity' },
     { kw: 'build workflows workflow builder', page: 'build', tab: 'workflows', label: 'Build · Workflow Builder' },
     { kw: 'build crons schedules scheduled tasks operations automation', page: 'build', tab: 'crons', label: 'Build · Schedules' },
-    { kw: 'build skills',       page: 'build',    tab: 'skills',       label: 'Build · Skills' },
+    { kw: 'build skills skill studio create skill', page: 'skills', tab: '', label: 'Skills · Skill Studio' },
     { kw: 'build templates',    page: 'build',    tab: 'templates',    label: 'Build · Templates' },
     { kw: 'team roster',        page: 'team',     tab: 'roster',       label: 'Team · Roster' },
     { kw: 'team activity',      page: 'team',     tab: 'activity',     label: 'Team · Activity' },
@@ -29650,6 +29650,30 @@ async function sbRunSkillTest() {
   } finally {
     if (btn) { btn.disabled = false; btn.textContent = '▶ Test run'; btn.style.color = 'var(--green)'; btn.style.borderColor = 'var(--green)'; }
   }
+}
+
+function askSkillCreatorForDescription() {
+  var name = (document.getElementById('skill-modal-name')?.value || '').trim();
+  var title = (document.getElementById('skill-modal-title')?.value || '').trim();
+  var desc = (document.getElementById('skill-modal-desc')?.value || '').trim();
+  var body = (document.getElementById('skill-modal-body')?.value || '').trim();
+  var prompt = [
+    'Use skill-creator principles to help write the frontmatter description for this Clementine skill.',
+    '',
+    'Skill name: ' + (name || '(not set yet)'),
+    'Title: ' + (title || '(not set yet)'),
+    'Current description: ' + (desc || '(empty)'),
+    'Procedure preview:',
+    body ? body.slice(0, 1600) : '(empty)',
+    '',
+    'Return one concise description under 1024 characters. It must say what the skill does, when to use it, and trigger phrases. Do not rewrite the whole skill unless I ask.'
+  ].join('\\n');
+  if (typeof askClementineWith !== 'function') {
+    toast('Chat is not ready yet. Try again after the dashboard finishes loading.', 'error');
+    return;
+  }
+  askClementineWith(prompt, { autoSend: false });
+  toast('Description prompt loaded in chat. Press send when ready.', 'info');
 }
 
 async function _openSkillModal(opts) {
