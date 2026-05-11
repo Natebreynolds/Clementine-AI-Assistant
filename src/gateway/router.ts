@@ -33,7 +33,7 @@ import { AgentManager } from '../agent/agent-manager.js';
 import { TeamRouter } from '../agent/team-router.js';
 import { TeamBus } from '../agent/team-bus.js';
 import type { NotificationDispatcher } from './notifications.js';
-import { listBackgroundTasks, loadBackgroundTask, markFailed } from '../agent/background-tasks.js';
+import { createBackgroundTask, listBackgroundTasks, loadBackgroundTask, markFailed } from '../agent/background-tasks.js';
 import { applyAssistantExperienceUpdate, detectApprovalReply, detectLocalTurn, type AssistantExperienceUpdate } from '../agent/local-turn.js';
 import { buildApprovalFollowupPrompt, detectActionExpectation } from '../agent/action-enforcer.js';
 import { updateClementineJson } from '../config/clementine-json.js';
@@ -56,6 +56,7 @@ import { isLiveUnleashedStatus } from './unleashed-status.js';
 import { buildActiveContextSnapshot } from './active-context.js';
 import { markContextEventBySource } from './context-events.js';
 import { EventLog } from './event-log.js';
+import { detectComplexTaskForBackground, type ComplexTaskRecommendation } from '../agent/complex-task-detector.js';
 
 export { isLiveUnleashedStatus } from './unleashed-status.js';
 
@@ -90,6 +91,19 @@ type LedgerRunMetadata = {
   allowedToolsApplied?: string[];
   builtinToolsApplied?: string[];
   mcpServersApplied?: string[];
+  skillsApplied?: Array<{ name: string; source: 'auto'; score?: number }>;
+  executionMode?: 'inline' | 'background_offer' | 'background_queued';
+  backgroundTaskId?: string;
+};
+
+type PendingBackgroundOffer = {
+  id: string;
+  sessionKey: string;
+  fromAgent: string;
+  prompt: string;
+  recommendation: ComplexTaskRecommendation;
+  createdAt: number;
+  expiresAt: number;
 };
 
 type FusedRecallRow = {
@@ -193,6 +207,7 @@ export class Gateway {
   private approvalResolvers = new Map<string, (result: boolean | string) => void>();
   private approvalCounter = 0;
   private sessions = new Map<string, SessionState>();
+  private pendingBackgroundOffers = new Map<string, PendingBackgroundOffer>();
   private auditLog: string[] = [];
   private draining = false;
 
@@ -323,15 +338,177 @@ export class Gateway {
     return text.match(BACKGROUND_TASK_ID_RE)?.[0]?.toLowerCase();
   }
 
+  private makeBackgroundOfferId(): string {
+    return `bo-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+  }
+
+  private backgroundAgentForSession(sessionKey: string): string {
+    return this._agentSlugFromSessionKey(sessionKey) ?? this.getSessionProfile(sessionKey) ?? 'clementine';
+  }
+
+  private pruneExpiredBackgroundOffers(): void {
+    const now = Date.now();
+    for (const [id, offer] of this.pendingBackgroundOffers) {
+      if (offer.expiresAt <= now) this.pendingBackgroundOffers.delete(id);
+    }
+  }
+
+  private latestBackgroundOfferForSession(sessionKey: string): PendingBackgroundOffer | undefined {
+    this.pruneExpiredBackgroundOffers();
+    const offers = [...this.pendingBackgroundOffers.values()]
+      .filter((offer) => offer.sessionKey === sessionKey)
+      .sort((a, b) => b.createdAt - a.createdAt);
+    return offers[0];
+  }
+
+  private getBackgroundOfferForSession(sessionKey: string, id: string): PendingBackgroundOffer | undefined {
+    this.pruneExpiredBackgroundOffers();
+    const offer = this.pendingBackgroundOffers.get(id);
+    if (!offer || offer.sessionKey !== sessionKey) return undefined;
+    return offer;
+  }
+
+  private createBackgroundOffer(
+    sessionKey: string,
+    prompt: string,
+    recommendation: ComplexTaskRecommendation,
+  ): PendingBackgroundOffer {
+    this.pruneExpiredBackgroundOffers();
+    const offer: PendingBackgroundOffer = {
+      id: this.makeBackgroundOfferId(),
+      sessionKey,
+      fromAgent: this.backgroundAgentForSession(sessionKey),
+      prompt,
+      recommendation,
+      createdAt: Date.now(),
+      expiresAt: Date.now() + 30 * 60_000,
+    };
+    this.pendingBackgroundOffers.set(offer.id, offer);
+    return offer;
+  }
+
+  private queueBackgroundOffer(offer: PendingBackgroundOffer): BackgroundTask {
+    const task = createBackgroundTask({
+      fromAgent: offer.fromAgent,
+      prompt: offer.prompt,
+      maxMinutes: offer.recommendation.suggestedMaxMinutes,
+      sessionKey: offer.sessionKey,
+    });
+    this.pendingBackgroundOffers.delete(offer.id);
+    logger.info({
+      offerId: offer.id,
+      taskId: task.id,
+      sessionKey: offer.sessionKey,
+      fromAgent: offer.fromAgent,
+      maxMinutes: task.maxMinutes,
+    }, 'Queued background task from chat offer');
+    return task;
+  }
+
+  private formatBackgroundQueuedResponse(task: BackgroundTask): string {
+    return [
+      `Queued background task **${task.id}**.`,
+      '',
+      `It will run as **${task.fromAgent}** with a ${task.maxMinutes} minute cap.`,
+      `Use \`status ${task.id}\` or check the dashboard Background Tasks panel for progress.`,
+    ].join('\n');
+  }
+
+  private formatBackgroundOfferResponse(offer: PendingBackgroundOffer): string {
+    const lines = [
+      'This looks like long-running, multi-tool work. I recommend running it in the background so chat does not go stale.',
+      '',
+      '**Plan**',
+      ...offer.recommendation.plan.map((step, idx) => `${idx + 1}. ${step}`),
+      '',
+      `**Why background:** ${offer.recommendation.reasons.join('; ')}.`,
+      `**Estimated cap:** ${offer.recommendation.suggestedMaxMinutes} minutes.`,
+      `**Background offer:** ${offer.id}`,
+      '',
+      `Reply \`run background ${offer.id}\` to queue it, \`run inline ${offer.id}\` to run it in this chat, or \`save skill ${offer.id}\` to make it reusable first.`,
+    ];
+    return lines.join('\n');
+  }
+
+  public acceptBackgroundOffer(sessionKey: string, id: string): { ok: boolean; response: string; task?: BackgroundTask } {
+    const offer = this.getBackgroundOfferForSession(sessionKey, id);
+    if (!offer) {
+      return { ok: false, response: `I could not find an active background offer for ${id}. It may have expired.` };
+    }
+    const task = this.queueBackgroundOffer(offer);
+    return { ok: true, response: this.formatBackgroundQueuedResponse(task), task };
+  }
+
+  public dismissBackgroundOffer(sessionKey: string, id: string): { ok: boolean; response: string } {
+    const offer = this.getBackgroundOfferForSession(sessionKey, id);
+    if (!offer) return { ok: false, response: `No active background offer found for ${id}.` };
+    this.pendingBackgroundOffers.delete(id);
+    return { ok: true, response: `Dismissed background offer ${id}.` };
+  }
+
+  private resolveBackgroundOfferControl(
+    sessionKey: string,
+    text: string,
+  ): { response?: string; inlineText?: string; skillText?: string; executionMode?: LedgerRunMetadata['executionMode']; backgroundTaskId?: string } | null {
+    const normalized = text.trim().toLowerCase();
+    const explicitOfferId = text.match(/\bbo-[a-z0-9]+-[a-z0-9]{3,10}\b/i)?.[0]?.toLowerCase();
+    const offer = explicitOfferId
+      ? this.getBackgroundOfferForSession(sessionKey, explicitOfferId)
+      : this.latestBackgroundOfferForSession(sessionKey);
+    if (!offer) return null;
+
+    if (/^(run|start|queue|approve|yes|go|do it).{0,30}\bbackground\b/i.test(normalized)
+        || /^run it in the background\b/i.test(normalized)
+        || /^background\b/i.test(normalized)
+        || /^(yes|yep|approved?|go|do it|please do|start it)$/i.test(normalized)) {
+      const task = this.queueBackgroundOffer(offer);
+      return {
+        response: this.formatBackgroundQueuedResponse(task),
+        executionMode: 'background_queued',
+        backgroundTaskId: task.id,
+      };
+    }
+
+    if (/^run.{0,30}\binline\b/i.test(normalized) || /^run inline\b/i.test(normalized)) {
+      this.pendingBackgroundOffers.delete(offer.id);
+      return { inlineText: offer.prompt, executionMode: 'inline' };
+    }
+
+    if (/^(save|create|make|teach).{0,30}\bskill\b/i.test(normalized)) {
+      this.pendingBackgroundOffers.delete(offer.id);
+      return {
+        skillText: [
+          'Create a reusable Clementine skill for this workflow using skill-creator principles.',
+          'Write a concise Anthropic-compatible folder-form SKILL.md with clear trigger description, required tools/MCP/CLI dependencies, procedure, success criteria, and failure handling.',
+          '',
+          'Original workflow request:',
+          offer.prompt,
+        ].join('\n'),
+        executionMode: 'inline',
+      };
+    }
+
+    return null;
+  }
+
   private isAgentScopedSession(sessionKey: string): boolean {
     return this._agentSlugFromSessionKey(sessionKey) !== undefined;
   }
 
   private readUnleashedStatus(jobName: string): Record<string, unknown> | null {
     try {
-      const statusPath = path.join(BASE_DIR, 'unleashed', jobName, 'status.json');
-      if (!existsSync(statusPath)) return null;
-      return JSON.parse(readFileSync(statusPath, 'utf-8')) as Record<string, unknown>;
+      const candidates = [
+        jobName,
+        jobName.startsWith('bg-') ? `bg:${jobName}` : '',
+      ].filter(Boolean);
+      for (const candidate of candidates) {
+        const safeJob = candidate.replace(/[^a-zA-Z0-9_-]/g, '_');
+        const statusPath = path.join(BASE_DIR, 'unleashed', safeJob, 'status.json');
+        if (existsSync(statusPath)) {
+          return JSON.parse(readFileSync(statusPath, 'utf-8')) as Record<string, unknown>;
+        }
+      }
+      return null;
     } catch {
       return null;
     }
@@ -383,11 +560,15 @@ export class Gateway {
       : (task.status === 'failed' || task.status === 'aborted') && task.error
         ? ` Reason: ${this.taskSummary(task.error, 120)}`
         : '';
-    return `- ${task.id}: ${task.status}${phase}, ${elapsed} min${cap}. ${taskText}${terminalDetail}`;
+    const deliverable = task.status === 'done' && task.deliverableNote
+      ? ` Deliverable: ${this.taskSummary(task.deliverableNote, 120)}`
+      : '';
+    return `- ${task.id}: ${task.status}${phase}, ${elapsed} min${cap}. ${taskText}${terminalDetail}${deliverable}`;
   }
 
   private writeUnleashedCancel(jobName: string): void {
-    const cancelDir = path.join(BASE_DIR, 'unleashed', jobName);
+    const safeJob = (jobName.startsWith('bg-') ? `bg:${jobName}` : jobName).replace(/[^a-zA-Z0-9_-]/g, '_');
+    const cancelDir = path.join(BASE_DIR, 'unleashed', safeJob);
     mkdirSync(cancelDir, { recursive: true });
     writeFileSync(path.join(cancelDir, 'CANCEL'), '');
   }
@@ -1525,6 +1706,9 @@ export class Gateway {
               actionExpectationSource: actionExpectationForLedger.source,
               actionExpectationReason: actionExpectationForLedger.reason,
               runId: ledgerRunMetadata.runId,
+              executionMode: ledgerRunMetadata.executionMode,
+              backgroundTaskId: ledgerRunMetadata.backgroundTaskId,
+              skillsApplied: ledgerRunMetadata.skillsApplied,
               permissionModeApplied: ledgerRunMetadata.permissionModeApplied,
               allowedToolsApplied: ledgerRunMetadata.allowedToolsApplied?.slice(0, 80),
               builtinToolsApplied: ledgerRunMetadata.builtinToolsApplied?.slice(0, 40),
@@ -1555,7 +1739,8 @@ export class Gateway {
     onProgress?: OnProgressCallback,
     ledgerRunMetadata?: LedgerRunMetadata,
   ): Promise<string> {
-    const originalText = text;
+    let originalText = text;
+    let skipBackgroundOffer = false;
     // Per-segment latency capture — emitted as a single 'chat:latency' line
     // on the happy path so we can grep/aggregate without parsing many lines.
     const tInnerStart = Date.now();
@@ -1673,6 +1858,27 @@ export class Gateway {
         responseLen: localResponse.length,
       }, 'chat:latency');
       return localResponse;
+    }
+
+    const backgroundControl = this.resolveBackgroundOfferControl(sessionKey, text);
+    if (backgroundControl?.response) {
+      if (ledgerRunMetadata) {
+        ledgerRunMetadata.executionMode = backgroundControl.executionMode;
+        ledgerRunMetadata.backgroundTaskId = backgroundControl.backgroundTaskId;
+      }
+      if (onText) {
+        try { await onText(backgroundControl.response); } catch { /* channel streaming is best-effort */ }
+      }
+      return backgroundControl.response;
+    }
+    if (backgroundControl?.inlineText) {
+      text = backgroundControl.inlineText;
+      originalText = backgroundControl.inlineText;
+      skipBackgroundOffer = true;
+    } else if (backgroundControl?.skillText) {
+      text = backgroundControl.skillText;
+      originalText = backgroundControl.skillText;
+      skipBackgroundOffer = true;
     }
 
     const approvalFollowupExpected = this.isTrustedPersonalSession(sessionKey)
@@ -1945,6 +2151,41 @@ export class Gateway {
         const resolvedProfile = profileSlug
           ? this.getAgentManager().get(profileSlug) ?? undefined
           : undefined;
+        const isBuilderSession = sessionKey.startsWith('dashboard:builder:');
+
+        if (!skipBackgroundOffer && !isBuilderSession && !isInternalMsg && this.isTrustedPersonalSession(sessionKey)) {
+          const recommendation = detectComplexTaskForBackground(text);
+          if (recommendation) {
+            const offer = this.createBackgroundOffer(sessionKey, text, recommendation);
+            if (recommendation.queueImmediately) {
+              const task = this.queueBackgroundOffer(offer);
+              const queued = this.formatBackgroundQueuedResponse(task);
+              if (ledgerRunMetadata) {
+                ledgerRunMetadata.executionMode = 'background_queued';
+                ledgerRunMetadata.backgroundTaskId = task.id;
+              }
+              if (onText) {
+                try { await onText(queued); } catch { /* channel streaming is best-effort */ }
+              }
+              return queued;
+            }
+            const offerText = this.formatBackgroundOfferResponse(offer);
+            if (ledgerRunMetadata) {
+              ledgerRunMetadata.executionMode = 'background_offer';
+            }
+            logger.info({
+              sessionKey,
+              offerId: offer.id,
+              score: recommendation.score,
+              reasons: recommendation.reasons,
+              maxMinutes: recommendation.suggestedMaxMinutes,
+            }, 'Offering background execution for complex chat request');
+            if (onText) {
+              try { await onText(offerText); } catch { /* channel streaming is best-effort */ }
+            }
+            return offerText;
+          }
+        }
 
         const hygiene = assessGatewayContextHygiene({
           sessionKey: effectiveSessionKey,
@@ -2069,8 +2310,6 @@ export class Gateway {
           // the agent only emits json-artifact blocks. Strip everything
           // expensive; keep just SDK session resume so multi-turn
           // artifact iteration sees its own prior turns.
-          const isBuilderSession = sessionKey.startsWith('dashboard:builder:');
-
           // ── Skill auto-match (1.18.170) ─────────────────────────────
           // Match the user's message against the skill catalog (auto-
           // skills + user-authored). Top-3 matches above score ≥ 4 inform:
@@ -2176,7 +2415,6 @@ export class Gateway {
             ...(chatMcp ? { extraMcpServers: chatMcp.servers as unknown as Parameters<typeof runAgent>[1]['extraMcpServers'] } : {}),
             onText: wrappedOnText,
             onToolActivity: ({ tool, input }) => {
-              toolActivityCount++;
               if (wrappedOnToolActivity) {
                 return wrappedOnToolActivity(tool, input);
               }
@@ -2187,6 +2425,12 @@ export class Gateway {
 
           if (ledgerRunMetadata) {
             ledgerRunMetadata.runId = runAgentResult.runId;
+            ledgerRunMetadata.executionMode = ledgerRunMetadata.executionMode ?? 'inline';
+            ledgerRunMetadata.skillsApplied = resolvedSkills?.matches.map((m) => ({
+              name: m.name,
+              source: 'auto' as const,
+              score: m.score,
+            }));
             ledgerRunMetadata.permissionModeApplied = runAgentResult.permissionMode;
             ledgerRunMetadata.allowedToolsApplied = runAgentResult.allowedToolsApplied;
             ledgerRunMetadata.builtinToolsApplied = runAgentResult.builtinToolsApplied;

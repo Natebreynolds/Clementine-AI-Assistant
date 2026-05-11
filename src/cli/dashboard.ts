@@ -2944,6 +2944,40 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
     }
   });
 
+  app.post('/api/background-offers/:id/accept', async (req, res) => {
+    try {
+      const id = req.params.id;
+      if (!/^bo-[a-z0-9]+-[a-z0-9]{3,10}$/.test(id)) {
+        res.status(400).json({ error: 'Invalid background offer id' });
+        return;
+      }
+      const gateway = await getGateway();
+      const result = gateway.acceptBackgroundOffer('dashboard:web', id);
+      if (!result.ok) {
+        res.status(404).json({ ok: false, error: result.response });
+        return;
+      }
+      res.json(result);
+    } catch (err) {
+      res.status(500).json({ error: String(err).slice(0, 200) });
+    }
+  });
+
+  app.post('/api/background-offers/:id/dismiss', async (req, res) => {
+    try {
+      const id = req.params.id;
+      if (!/^bo-[a-z0-9]+-[a-z0-9]{3,10}$/.test(id)) {
+        res.status(400).json({ error: 'Invalid background offer id' });
+        return;
+      }
+      const gateway = await getGateway();
+      const result = gateway.dismissBackgroundOffer('dashboard:web', id);
+      res.status(result.ok ? 200 : 404).json(result.ok ? result : { ok: false, error: result.response });
+    } catch (err) {
+      res.status(500).json({ error: String(err).slice(0, 200) });
+    }
+  });
+
   app.get('/api/heartbeat/agent/:slug', (req, res) => {
     const slug = req.params.slug;
     const state = getHeartbeat() as Record<string, unknown>;
@@ -21310,9 +21344,13 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
               <button type="button" class="skill-composer-mode" data-kind="memory" onclick="setSkillComposerMode('memory')" style="padding:7px 6px;border:1px solid var(--border);border-radius:6px;background:var(--bg-primary);color:var(--text-secondary);font-size:11px;font-weight:600;cursor:pointer">Memory</button>
             </div>
             <label id="skill-composer-anchor-label" for="skill-composer-anchor" style="display:block;font-size:11px;font-weight:600;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.04em;margin-bottom:6px">Anchor</label>
-            <input id="skill-composer-anchor" list="skill-composer-anchor-options" oninput="updateSkillComposerDraftState()" placeholder="Optional tool, project, command, or memory source" style="width:100%;box-sizing:border-box;padding:9px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg-primary);color:var(--text-primary);font-size:12px">
+            <div style="display:flex;gap:6px;align-items:center">
+              <input id="skill-composer-anchor" list="skill-composer-anchor-options" oninput="updateSkillComposerDraftState()" onkeydown="if(event.key==='Enter'){event.preventDefault();addSkillComposerDependency();}" placeholder="Optional tool, project, command, or memory source" style="flex:1;min-width:0;box-sizing:border-box;padding:9px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg-primary);color:var(--text-primary);font-size:12px">
+              <button type="button" class="btn-secondary" onclick="addSkillComposerDependency()" style="font-size:12px;padding:8px 10px;border-radius:6px;border:1px solid var(--border);background:transparent;color:var(--text-primary);cursor:pointer">Add</button>
+            </div>
             <datalist id="skill-composer-anchor-options"></datalist>
             <div id="skill-composer-anchor-summary" style="margin-top:8px;min-height:22px;font-size:11px;color:var(--text-muted);line-height:1.45">No starting point selected.</div>
+            <div id="skill-composer-preview" style="margin-top:10px;max-height:180px;overflow:auto;border:1px solid var(--border);border-radius:6px;background:var(--bg-primary);padding:10px 12px;font-size:11px;line-height:1.45;color:var(--text-secondary)"></div>
             <div style="display:flex;align-items:center;justify-content:flex-end;gap:8px;margin-top:12px">
               <button type="button" class="btn-secondary" onclick="openSkillStudio()" style="font-size:12px;padding:7px 12px;border-radius:6px;border:1px solid var(--border);background:transparent;color:var(--text-primary);cursor:pointer">Open Studio</button>
               <button type="button" class="btn-primary" id="skill-composer-draft-btn" onclick="startSkillComposerDraft()" disabled style="font-size:12px;padding:7px 14px;border-radius:6px;border:none;background:var(--accent);color:#fff;font-weight:600;cursor:pointer;opacity:0.55">Draft skill</button>
@@ -28407,6 +28445,7 @@ var _skillsState = {
 
 var _skillComposerMode = 'outcome';
 var _skillComposerOptionsCache = null;
+var _skillComposerDependencies = [];
 
 var _skillComposerCopy = {
   outcome: {
@@ -28467,34 +28506,77 @@ function updateSkillComposerDraftState() {
   var text = (document.getElementById('skill-composer-text') || {}).value || '';
   var anchor = (document.getElementById('skill-composer-anchor') || {}).value || '';
   var btn = document.getElementById('skill-composer-draft-btn');
-  var enabled = !!(text.trim() || anchor.trim());
+  var enabled = !!(text.trim() || anchor.trim() || _skillComposerDependencies.length);
   if (btn) {
     btn.disabled = !enabled;
     btn.style.opacity = enabled ? '1' : '0.55';
     btn.style.cursor = enabled ? 'pointer' : 'not-allowed';
   }
   renderSkillComposerAnchorSummary(text, anchor);
+  renderSkillComposerPreview();
 }
 
 function renderSkillComposerAnchorSummary(text, anchor) {
   var box = document.getElementById('skill-composer-anchor-summary');
   if (!box) return;
   var trimmed = String(anchor || '').trim();
-  if (!trimmed) {
+  var deps = getSkillComposerDependencies(false);
+  if (!trimmed && deps.length === 0) {
     box.innerHTML = '<span style="color:var(--text-muted)">No starting point selected.</span>';
     return;
   }
-  var modeCopy = _skillComposerCopy[_skillComposerMode] || _skillComposerCopy.outcome;
-  var tools = inferSkillComposerTools(_skillComposerMode, trimmed);
-  var toolText = tools.length
-    ? tools.map(function(t) { return '<code style="font-size:10px;background:var(--bg-primary);border:1px solid var(--border);padding:1px 5px;border-radius:4px;color:var(--text-primary)">' + esc(t) + '</code>'; }).join(' ')
-    : '<span style="color:var(--text-muted)">no explicit tool allowlist</span>';
-  box.innerHTML = '<div style="display:flex;align-items:flex-start;gap:6px;flex-wrap:wrap">'
-    + '<span style="color:var(--accent);font-weight:600">' + esc(modeCopy.promptLabel) + ':</span>'
-    + '<code style="font-size:10px;background:var(--bg-primary);border:1px solid var(--border);padding:1px 5px;border-radius:4px;color:var(--text-primary);max-width:100%;overflow:hidden;text-overflow:ellipsis">' + esc(trimmed) + '</code>'
-    + '<span style="color:var(--text-muted)">will seed</span>'
-    + toolText
-    + '</div>';
+  var html = '<div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">';
+  for (var i = 0; i < deps.length; i++) {
+    var dep = deps[i];
+    var copy = _skillComposerCopy[dep.mode] || _skillComposerCopy.outcome;
+    html += '<span style="display:inline-flex;align-items:center;gap:5px;max-width:100%;padding:2px 7px;border:1px solid var(--border);border-radius:999px;background:var(--bg-primary);color:var(--text-primary);font-size:10px">'
+      + '<strong style="color:var(--accent);font-weight:600">' + esc(copy.promptLabel) + '</strong>'
+      + '<span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:190px">' + esc(dep.value) + '</span>'
+      + '<button type="button" onclick="removeSkillComposerDependency(' + i + ')" title="Remove" style="border:none;background:transparent;color:var(--text-muted);cursor:pointer;padding:0;font-size:12px;line-height:1">&times;</button>'
+      + '</span>';
+  }
+  if (trimmed) {
+    var modeCopy = _skillComposerCopy[_skillComposerMode] || _skillComposerCopy.outcome;
+    var tools = inferSkillComposerTools(_skillComposerMode, trimmed);
+    html += '<span style="color:var(--text-muted)">Pending ' + esc(modeCopy.promptLabel) + ':</span>'
+      + '<code style="font-size:10px;background:var(--bg-primary);border:1px solid var(--border);padding:1px 5px;border-radius:4px;color:var(--text-primary);max-width:100%;overflow:hidden;text-overflow:ellipsis">' + esc(trimmed) + '</code>'
+      + (tools.length ? '<span style="color:var(--text-muted)">adds ' + esc(tools.join(', ')) + '</span>' : '');
+  }
+  html += '</div>';
+  box.innerHTML = html;
+}
+
+function getSkillComposerDependencies(includePending) {
+  var deps = _skillComposerDependencies.slice();
+  if (includePending) {
+    var pending = ((document.getElementById('skill-composer-anchor') || {}).value || '').trim();
+    if (pending) deps.push({ mode: _skillComposerMode || 'outcome', value: pending });
+  }
+  var seen = {};
+  return deps.filter(function(dep) {
+    var key = dep.mode + ':' + dep.value;
+    if (seen[key]) return false;
+    seen[key] = true;
+    return true;
+  });
+}
+
+function addSkillComposerDependency() {
+  var input = document.getElementById('skill-composer-anchor');
+  var value = (input && input.value || '').trim();
+  if (!value) return;
+  var mode = _skillComposerMode || 'outcome';
+  var key = mode + ':' + value;
+  var exists = _skillComposerDependencies.some(function(dep) { return dep.mode + ':' + dep.value === key; });
+  if (!exists) _skillComposerDependencies.push({ mode: mode, value: value });
+  if (input) input.value = '';
+  updateSkillComposerDraftState();
+}
+
+function removeSkillComposerDependency(index) {
+  if (index < 0 || index >= _skillComposerDependencies.length) return;
+  _skillComposerDependencies.splice(index, 1);
+  updateSkillComposerDraftState();
 }
 
 function inferSkillComposerTools(mode, anchor) {
@@ -28570,12 +28652,19 @@ function slugifySkillTitle(title) {
 
 function buildSkillComposerDraftSeed() {
   var text = ((document.getElementById('skill-composer-text') || {}).value || '').trim();
-  var anchor = ((document.getElementById('skill-composer-anchor') || {}).value || '').trim();
   var mode = _skillComposerMode || 'outcome';
   var modeCopy = _skillComposerCopy[mode] || _skillComposerCopy.outcome;
+  var deps = getSkillComposerDependencies(true);
+  var anchor = deps.map(function(dep) {
+    var copy = _skillComposerCopy[dep.mode] || _skillComposerCopy.outcome;
+    return copy.promptLabel + ': ' + dep.value;
+  }).join('; ');
   var title = inferSkillComposerTitle(text, anchor);
   var name = slugifySkillTitle(title);
-  var tools = inferSkillComposerTools(mode, anchor);
+  var tools = [];
+  for (var di = 0; di < deps.length; di++) {
+    tools = tools.concat(inferSkillComposerTools(deps[di].mode, deps[di].value));
+  }
   var hay = (text + ' ' + anchor).toLowerCase();
   if (hay.indexOf('salesforce') !== -1) tools = dedupeSkillComposerToolNames(tools.concat(['Bash']));
   if (hay.indexOf('dataforseo') !== -1 && tools.indexOf('mcp__dataforseo__*') === -1) tools.push('mcp__dataforseo__*');
@@ -28591,13 +28680,18 @@ function buildSkillComposerDraftSeed() {
   if (description.length > 1024) description = description.slice(0, 1024);
 
   var toolLines = tools.length ? tools.map(function(t) { return '- ' + t; }).join('\\n') : '- No explicit allowlist yet; add only the tools this skill truly needs.';
-  var anchorLine = anchor ? modeCopy.promptLabel + ': ' + anchor : 'None selected';
+  var anchorLine = deps.length
+    ? deps.map(function(dep) {
+        var copy = _skillComposerCopy[dep.mode] || _skillComposerCopy.outcome;
+        return '- ' + copy.promptLabel + ': ' + dep.value;
+      }).join('\\n')
+    : '- None selected';
   var body = '# ' + title + '\\n\\n'
     + '## Use When\\n\\n'
     + description + '\\n\\n'
     + '## Starting Point\\n\\n'
     + '- Outcome: ' + (text || 'Fill in the exact user goal before saving.') + '\\n'
-    + '- ' + anchorLine + '\\n\\n'
+    + anchorLine + '\\n\\n'
     + '## Required Tools\\n\\n'
     + toolLines + '\\n\\n'
     + '## Procedure\\n\\n'
@@ -28643,8 +28737,35 @@ function buildSkillComposerDraftSeed() {
     description: description,
     body: body,
     tools: tools,
-    note: anchor ? ('Seeded from ' + modeCopy.promptLabel + ': ' + anchor) : 'Seeded from the natural language description.',
+    note: deps.length ? ('Seeded from ' + deps.length + ' starting point' + (deps.length === 1 ? '' : 's') + '.') : 'Seeded from the natural language description.',
   };
+}
+
+function renderSkillComposerPreview() {
+  var box = document.getElementById('skill-composer-preview');
+  if (!box) return;
+  var text = ((document.getElementById('skill-composer-text') || {}).value || '').trim();
+  var deps = getSkillComposerDependencies(true);
+  if (!text && deps.length === 0) {
+    box.innerHTML = '<span style="color:var(--text-muted)">Preview appears here as you describe the skill or add tools.</span>';
+    return;
+  }
+  var seed = buildSkillComposerDraftSeed();
+  var depHtml = deps.length
+    ? deps.map(function(dep) {
+        var copy = _skillComposerCopy[dep.mode] || _skillComposerCopy.outcome;
+        return '<span style="display:inline-flex;margin:0 4px 4px 0;padding:1px 6px;border:1px solid var(--border);border-radius:999px;background:var(--bg-secondary);font-size:10px"><strong style="color:var(--accent);margin-right:4px">' + esc(copy.promptLabel) + '</strong>' + esc(dep.value) + '</span>';
+      }).join('')
+    : '<span style="color:var(--text-muted)">No explicit dependencies yet.</span>';
+  var toolsHtml = seed.tools.length
+    ? seed.tools.map(function(t) { return '<code style="font-size:10px;background:var(--bg-secondary);border:1px solid var(--border);padding:1px 5px;border-radius:4px;color:var(--text-primary);margin-right:4px">' + esc(t) + '</code>'; }).join('')
+    : '<span style="color:var(--text-muted)">inherits default runtime surface</span>';
+  box.innerHTML =
+    '<div style="font-weight:600;color:var(--text-primary);margin-bottom:4px">' + esc(seed.title) + '</div>' +
+    '<div style="color:var(--text-muted);margin-bottom:8px">' + esc(seed.name) + '</div>' +
+    '<div style="margin-bottom:8px"><strong style="color:var(--text-secondary)">Dependencies</strong><br>' + depHtml + '</div>' +
+    '<div style="margin-bottom:8px"><strong style="color:var(--text-secondary)">Tools</strong><br>' + toolsHtml + '</div>' +
+    '<div><strong style="color:var(--text-secondary)">Trigger description</strong><br>' + esc(seed.description.slice(0, 260)) + (seed.description.length > 260 ? '...' : '') + '</div>';
 }
 
 async function hydrateSkillComposerOptions() {
@@ -28744,15 +28865,21 @@ async function renderSkillComposerOptions() {
 
 function buildSkillComposerPrompt() {
   var text = ((document.getElementById('skill-composer-text') || {}).value || '').trim();
-  var anchor = ((document.getElementById('skill-composer-anchor') || {}).value || '').trim();
-  var modeCopy = _skillComposerCopy[_skillComposerMode] || _skillComposerCopy.outcome;
+  var deps = getSkillComposerDependencies(true);
   var lines = [
     'Use skill-creator principles to draft a Clementine skill in Skill Studio.',
     '',
     'Outcome: ' + (text || '(ask me for the outcome before drafting)'),
-    'Starting point: ' + modeCopy.promptLabel,
+    'Starting points:',
   ];
-  if (anchor) lines.push('Anchor: ' + anchor);
+  if (deps.length) {
+    for (var i = 0; i < deps.length; i++) {
+      var copy = _skillComposerCopy[deps[i].mode] || _skillComposerCopy.outcome;
+      lines.push('- ' + copy.promptLabel + ': ' + deps[i].value);
+    }
+  } else {
+    lines.push('- None selected');
+  }
   lines.push(
     '',
     'Draft rules:',
@@ -34196,6 +34323,54 @@ function renderMd(text) {
   return s;
 }
 
+function extractBackgroundOfferId(text) {
+  var m = String(text || '').match(/Background offer:\s*(bo-[a-z0-9]+-[a-z0-9]{3,10})/i);
+  return m ? m[1] : '';
+}
+
+function appendBackgroundOfferActions(bubble, text) {
+  if (!bubble || bubble.querySelector('.chat-bg-offer-actions')) return;
+  var id = extractBackgroundOfferId(text);
+  if (!id) return;
+  var panel = document.createElement('div');
+  panel.className = 'chat-bg-offer-actions';
+  panel.style.cssText = 'margin-top:10px;display:flex;gap:6px;flex-wrap:wrap;padding-top:8px;border-top:1px solid var(--border)';
+  panel.innerHTML =
+    '<button class="btn-sm btn-primary" data-bg-action="accept" style="font-size:11px;padding:5px 10px">Run in background</button>' +
+    '<button class="btn-sm" data-bg-action="inline" style="font-size:11px;padding:5px 10px">Run inline anyway</button>' +
+    '<button class="btn-sm" data-bg-action="skill" style="font-size:11px;padding:5px 10px">Save as skill first</button>' +
+    '<button class="btn-sm" data-bg-action="dismiss" style="font-size:11px;padding:5px 10px;color:var(--text-muted)">Dismiss</button>';
+  panel.querySelector('[data-bg-action="accept"]').onclick = function() { acceptBackgroundOffer(id, panel); };
+  panel.querySelector('[data-bg-action="inline"]').onclick = function() { askClementineWith('run inline ' + id); };
+  panel.querySelector('[data-bg-action="skill"]').onclick = function() { askClementineWith('save skill ' + id); };
+  panel.querySelector('[data-bg-action="dismiss"]').onclick = function() { dismissBackgroundOffer(id, panel); };
+  bubble.appendChild(panel);
+}
+
+async function acceptBackgroundOffer(id, panel) {
+  if (panel) panel.innerHTML = '<span style="font-size:11px;color:var(--text-muted)">Queueing background task...</span>';
+  try {
+    var r = await apiFetch('/api/background-offers/' + encodeURIComponent(id) + '/accept', { method: 'POST' });
+    var d = await r.json();
+    if (!r.ok || !d.ok) {
+      if (panel) panel.innerHTML = '<span style="font-size:11px;color:var(--red)">' + esc(d.error || 'Failed to queue task') + '</span>';
+      return;
+    }
+    if (panel) panel.innerHTML = '<div style="font-size:12px;line-height:1.45;color:var(--text-secondary)">' + renderMd(d.response || 'Background task queued.') + '</div>';
+    toast('Background task queued', 'success');
+    setTimeout(refreshAll, 500);
+  } catch (err) {
+    if (panel) panel.innerHTML = '<span style="font-size:11px;color:var(--red)">Failed: ' + esc(String(err)) + '</span>';
+  }
+}
+
+async function dismissBackgroundOffer(id, panel) {
+  try {
+    await apiFetch('/api/background-offers/' + encodeURIComponent(id) + '/dismiss', { method: 'POST' });
+  } catch (_) { /* best-effort */ }
+  if (panel) panel.remove();
+}
+
 let chatHistory = [];
 async function sendChat() {
   const input = document.getElementById('chat-input');
@@ -34303,6 +34478,7 @@ async function sendChat() {
 	        finalText = evt.response || finalText || 'No response';
 	        finalTrace = evt.trace || null;
 	        renderAssistantText(finalText);
+	        appendBackgroundOfferActions(asstBubble, finalText);
 	      } else if (evt.type === 'error') {
 	        throw new Error(evt.error || 'Stream error');
 	      }

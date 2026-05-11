@@ -118,7 +118,7 @@ describe('background-tasks persistence helper', () => {
     expect(loadBackgroundTask(failed.id, { dir })?.error).toBe('first failure');
   });
 
-  it('truncates result over 3KB to keep files bounded', () => {
+  it('truncates result over 3KB in JSON and writes the full result beside it', () => {
     const t = createBackgroundTask({ fromAgent: 'a', prompt: 'p', maxMinutes: 5 }, { dir });
     markRunning(t.id, { dir });
     const huge = 'x'.repeat(5000);
@@ -126,6 +126,9 @@ describe('background-tasks persistence helper', () => {
     const d = loadBackgroundTask(t.id, { dir });
     expect(d?.result?.length).toBeLessThan(huge.length);
     expect(d?.result?.endsWith('...[truncated]')).toBe(true);
+    expect(d?.resultPath).toBe(path.join(dir, `${t.id}.result.md`));
+    expect(d?.deliverableNote).toBe(path.join(dir, `${t.id}.result.md`));
+    expect(readFileSync(path.join(dir, `${t.id}.result.md`), 'utf-8')).toBe(huge);
   });
 
   it('listBackgroundTasks filters by status and returns newest-first', async () => {

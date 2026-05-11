@@ -23,6 +23,9 @@ export interface TurnLedgerEntry {
   actionExpectationSource?: string;
   actionExpectationReason?: string;
   runId?: string;
+  executionMode?: 'inline' | 'background_offer' | 'background_queued';
+  backgroundTaskId?: string;
+  skillsApplied?: Array<{ name: string; source: 'auto' | 'pinned'; score?: number }>;
   permissionModeApplied?: string;
   allowedToolsApplied?: string[];
   builtinToolsApplied?: string[];
@@ -80,7 +83,12 @@ export function formatLastTurnLedger(sessionKey: string, baseDir = BASE_DIR): st
     ? `Tools used: ${last.toolCallsMade} (${last.toolNames.slice(0, 6).join(', ')}${last.toolNames.length > 6 ? ', ...' : ''}).`
     : 'Tools used: none.';
   const execution = last.permissionModeApplied || last.mcpServersApplied?.length
-    ? `Execution: ${last.permissionModeApplied ?? 'unknown'}${last.mcpServersApplied?.length ? `; MCP: ${last.mcpServersApplied.slice(0, 6).join(', ')}${last.mcpServersApplied.length > 6 ? ', ...' : ''}` : ''}.`
+    ? `Execution: ${last.executionMode ?? 'inline'}; ${last.permissionModeApplied ?? 'unknown'}${last.mcpServersApplied?.length ? `; MCP: ${last.mcpServersApplied.slice(0, 6).join(', ')}${last.mcpServersApplied.length > 6 ? ', ...' : ''}` : ''}.`
+    : last.executionMode
+      ? `Execution: ${last.executionMode}${last.backgroundTaskId ? ` (${last.backgroundTaskId})` : ''}.`
+    : '';
+  const skills = last.skillsApplied?.length
+    ? `Skills: ${last.skillsApplied.slice(0, 5).map((s) => s.name).join(', ')}${last.skillsApplied.length > 5 ? ', ...' : ''}.`
     : '';
   const response = last.responsePreview
     ? `Last response: "${last.responsePreview.replace(/\s+/g, ' ').slice(0, 240)}${last.responsePreview.length > 240 ? '...' : ''}"`
@@ -95,6 +103,7 @@ export function formatLastTurnLedger(sessionKey: string, baseDir = BASE_DIR): st
     `Toolset: ${last.toolset ?? 'auto'}.`,
     `Policy: ${last.policyReason ?? 'unknown'}; tools ${last.toolsEnabled ? 'enabled' : 'disabled'}.`,
     execution,
+    skills,
     response,
   ].filter(Boolean).join('\n');
 }

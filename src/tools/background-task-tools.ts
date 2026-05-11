@@ -85,6 +85,10 @@ export function registerBackgroundTaskTools(server: McpServer): void {
         lines.push('');
         lines.push(`Result:\n${task.result}`);
       }
+      if (task.resultPath) {
+        lines.push('');
+        lines.push(`Full result: ${task.resultPath}`);
+      }
       if (task.deliverableNote) {
         lines.push('');
         lines.push(`Deliverable: ${task.deliverableNote}`);

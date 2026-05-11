@@ -331,6 +331,7 @@ export interface BackgroundTask {
   startedAt?: string;         // ISO when the daemon actually picked it up
   completedAt?: string;       // ISO when terminal status was reached
   result?: string;            // Final output (truncated to ~3KB on save)
+  resultPath?: string;        // Full result markdown when result was too large for JSON
   error?: string;             // If status='failed' or 'aborted'
   deliverableNote?: string;   // Optional vault path produced by the run
 }

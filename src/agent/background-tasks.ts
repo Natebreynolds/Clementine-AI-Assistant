@@ -134,6 +134,14 @@ export function markRunning(id: string, opts?: BackgroundTaskOptions): Backgroun
   return task;
 }
 
+function writeFullResultFile(id: string, result: string, opts?: BackgroundTaskOptions): string | undefined {
+  if (result.length <= RESULT_TRUNCATE_BYTES) return undefined;
+  const file = path.join(dirFor(opts), `${id}.result.md`);
+  mkdirSync(path.dirname(file), { recursive: true });
+  writeFileSync(file, result);
+  return file;
+}
+
 /** Transition to 'done' with final result. */
 export function markDone(
   id: string,
@@ -146,8 +154,11 @@ export function markDone(
   if (task.status !== 'running') return task;
   task.status = 'done';
   task.completedAt = new Date().toISOString();
+  const resultPath = writeFullResultFile(id, result, opts);
+  if (resultPath) task.resultPath = resultPath;
   task.result = result;
   if (deliverableNote) task.deliverableNote = deliverableNote;
+  else if (resultPath) task.deliverableNote = resultPath;
   safeWrite(pathFor(id, opts), task);
   return task;
 }
