@@ -2060,6 +2060,7 @@ export class Gateway {
           const { runAgent } = await import('../agent/run-agent.js');
           const { buildExtraMcpForRunAgent } = await import('../agent/run-agent-mcp.js');
           const { buildChatSystemAppend } = await import('../agent/run-agent-context.js');
+          const { resolveSkillsForChat } = await import('../agent/chat-skill-resolver.js');
 
           // Builder sessions (dashboard trick/skill/cron/agent builder)
           // are conversational JSON-drafting flows, not real chat. They
@@ -2070,6 +2071,24 @@ export class Gateway {
           // artifact iteration sees its own prior turns.
           const isBuilderSession = sessionKey.startsWith('dashboard:builder:');
 
+          // ── Skill auto-match (1.18.170) ─────────────────────────────
+          // Match the user's message against the skill catalog (auto-
+          // skills + user-authored). Top-3 matches above score ≥ 4 inform:
+          //   (a) MCP routing — every matched skill's `mcp__<server>__<tool>`
+          //       references widen `buildExtraMcpForRunAgent`'s server set
+          //       beyond the 19 regex bundles. Closes the "Salesforce
+          //       connected but no bundle exists" gap end-to-end.
+          //   (b) System prompt — matched skill bodies are appended as a
+          //       "## Relevant Skills" block so the model knows the canonical
+          //       procedure + arg names.
+          // Builder sessions skip this — they don't call tools.
+          const resolvedSkills = isBuilderSession
+            ? null
+            : resolveSkillsForChat(originalText, {
+                profile: resolvedProfile,
+                memoryStore: this.assistant.getMemoryStore?.() ?? null,
+              });
+
           // Wire Composio + external MCP only for real chat. Builder
           // skips entirely — builder turns never call tools.
           const chatMcp = isBuilderSession
@@ -2077,17 +2096,27 @@ export class Gateway {
             : await buildExtraMcpForRunAgent({
                 scopeText: originalText,
                 profile: resolvedProfile,
+                ...(resolvedSkills && resolvedSkills.hintedMcpServers.length > 0
+                  ? { skillHintedMcpServers: resolvedSkills.hintedMcpServers }
+                  : {}),
               });
 
           // Vault context (SOUL.md / MEMORY.md / AGENTS.md + optional
           // profile body) — real chat only. Builder gets just its own
           // prefix as the system prompt.
-          const chatSystemAppend = isBuilderSession
+          const baseSystemAppend = isBuilderSession
             ? ''
             : buildChatSystemAppend({
                 profile: resolvedProfile,
                 profileAppend: resolvedProfile?.systemPromptBody,
               });
+          // Append the matched-skill block AFTER the vault context so the
+          // skill instructions are the last (most recent) frame the model
+          // sees in the system prompt — a small recency boost without
+          // disturbing personality / memory ordering.
+          const chatSystemAppend = resolvedSkills && resolvedSkills.promptBlock
+            ? (baseSystemAppend ? `${baseSystemAppend}\n\n${resolvedSkills.promptBlock}` : resolvedSkills.promptBlock)
+            : baseSystemAppend;
 
           // Per-turn context (recall + persistent learnings + silent
           // blocks + security/toolset directives) — real chat only.
@@ -2125,6 +2154,11 @@ export class Gateway {
             turnContextChars: turnContextPrefix.length,
             resumingSdkSessionId: priorSdkSessionId || null,
             isBuilderSession,
+            // 1.18.170 — surface skill matches so the dashboard's Run
+            // detail page can render which skills informed routing.
+            skillMatches: resolvedSkills?.matches.length ?? 0,
+            skillMatchNames: resolvedSkills?.matches.map(m => m.name) ?? [],
+            skillHintedMcpServers: resolvedSkills?.hintedMcpServers ?? [],
           }, 'Routing chat through runAgent');
 
           const runAgentResult = await runAgent(finalPrompt, {

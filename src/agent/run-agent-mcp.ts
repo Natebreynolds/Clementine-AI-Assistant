@@ -32,6 +32,19 @@ export interface BuildExtraMcpOptions {
   /** When true, build the FULL surface (no bundle filtering, no dedup).
    *  Used by admin/debug callers; not the cron-path default. */
   fullSurface?: boolean;
+  /**
+   * Additional MCP server slugs that should be considered "in scope" beyond
+   * what `routeToolSurface(scopeText)` produced. The chat path (1.18.170)
+   * derives these from `mcp__<server>__<tool>` references on auto-matched
+   * skills — see `chat-skill-resolver.ts`. The same slug is tried as both a
+   * Composio toolkit and an external MCP server name, mirroring the
+   * `explicit_mcp` handling in `tool-router.ts:223-234` so whichever source
+   * is actually connected mounts and the other no-ops.
+   *
+   * Profile-level allowlists still WIN over these hints — a hint cannot
+   * loosen a profile-restricted agent's tool surface.
+   */
+  skillHintedMcpServers?: string[];
 }
 
 export interface BuildExtraMcpResult {
@@ -74,6 +87,35 @@ export async function buildExtraMcpForRunAgent(
       reason: 'full_surface',
     }
     : routeToolSurface(opts.scopeText ?? '');
+
+  // 1b. Widen with skill-hinted MCP servers (1.18.170). Each hint slug is
+  //     tried as both an external MCP server name and a Composio toolkit;
+  //     unmatched/disconnected ones no-op below at server-construction time.
+  //     We don't touch `route` when `fullSurface` is set — nothing to widen.
+  if (!opts.fullSurface && opts.skillHintedMcpServers && opts.skillHintedMcpServers.length > 0) {
+    const ext = new Set(Array.isArray(route.externalMcpServers) ? route.externalMcpServers : []);
+    const com = new Set(Array.isArray(route.composioToolkits) ? route.composioToolkits : []);
+    for (const slug of opts.skillHintedMcpServers) {
+      const trimmed = slug.trim();
+      if (!trimmed) continue;
+      if (trimmed.startsWith('claude_ai_')) {
+        ext.add(trimmed.slice('claude_ai_'.length));
+      } else {
+        ext.add(trimmed);
+        com.add(trimmed);
+      }
+    }
+    // Keep the existing reason union ('empty' | 'matched' | 'full_surface').
+    // The widening just lifts an 'empty' route into 'matched' once we've
+    // added any skill-derived server. Diagnostics about skill_hint
+    // contribution flow via the caller's log line.
+    route = {
+      ...route,
+      externalMcpServers: [...ext],
+      composioToolkits: [...com],
+      reason: ext.size > 0 || com.size > 0 ? 'matched' : route.reason,
+    };
+  }
 
   // 2. Build Composio MCP servers, honoring profile allowlist when set.
   let composioMcpServers: Record<string, Record<string, unknown>> = {};
