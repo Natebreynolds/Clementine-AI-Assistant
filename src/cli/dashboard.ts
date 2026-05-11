@@ -54,6 +54,7 @@ import { digestRouter } from './routes/digest.js';
 import { loadClementineJson, updateClementineJson } from '../config/clementine-json.js';
 import { annotateUnleashedStatus } from '../gateway/unleashed-status.js';
 import { buildOperationsSnapshot, type BuildUsageTask } from '../dashboard/build-operations.js';
+import { runLocalSeedIngestion } from '../brain/local-seed.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -5683,46 +5684,21 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
 
   // ── Brain / Ingestion ──────────────────────────────────────────
 
-  function deriveBrainSlug(inputPath: string): string {
-    const base = path.basename(inputPath, path.extname(inputPath));
-    return base.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'seed';
-  }
-
   app.post('/api/brain/seed/preview', async (req, res) => {
     try {
       const body = (req.body ?? {}) as { path?: string; slug?: string };
-      const inputPath = body.path?.trim();
-      if (!inputPath) { res.status(400).json({ error: 'path is required' }); return; }
-      const { detectManifest } = await import('../brain/format-detector.js');
-      const { runIngestion } = await import('../brain/ingestion-pipeline.js');
-      const manifest = detectManifest(inputPath);
-      const suggestedSlug = body.slug || deriveBrainSlug(inputPath);
-      const ephemeralSource = {
-        slug: suggestedSlug,
-        kind: 'seed' as const,
-        adapter: 'csv' as const,
-        configJson: '{}',
-        credentialRef: null,
-        scheduleCron: null,
-        targetFolder: `04-Ingest/${suggestedSlug}`,
-        agentSlug: null,
-        intelligence: 'auto' as const,
-        enabled: true,
-        lastRunAt: null,
-        lastStatus: null,
-        createdAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString(),
-      };
-      const result = await runIngestion({
-        source: ephemeralSource,
-        inputPath,
+      const rawPath = body.path?.trim();
+      if (!rawPath) { res.status(400).json({ error: 'path is required' }); return; }
+      const preview = await runLocalSeedIngestion({
+        slug: body.slug,
+        inputPath: rawPath,
         dryRun: true,
         limit: 10,
       });
       res.json({
-        manifest,
-        suggestedSlug,
-        preview: (result.plannedRecords ?? []).map((r) => ({
+        manifest: preview.manifest,
+        suggestedSlug: preview.slug,
+        preview: (preview.result.plannedRecords ?? []).map((r) => ({
           title: r.title, tags: r.tags, targetRelPath: r.targetRelPath,
           body: (r.body || '').slice(0, 800),
         })),
@@ -5735,26 +5711,12 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
   app.post('/api/brain/seed/commit', async (req, res) => {
     try {
       const body = (req.body ?? {}) as { path?: string; slug?: string };
-      const inputPath = body.path?.trim();
-      if (!inputPath) { res.status(400).json({ error: 'path is required' }); return; }
-      const slug = body.slug?.trim() || deriveBrainSlug(inputPath);
-
-      const { upsertSource, getSource } = await import('../brain/source-registry.js');
-      const { runIngestion } = await import('../brain/ingestion-pipeline.js');
-
-      await upsertSource({
-        slug,
-        kind: 'seed',
-        adapter: 'csv',
-        configJson: JSON.stringify({ inputPath }),
-        targetFolder: `04-Ingest/${slug}`,
-        intelligence: 'auto',
-        enabled: true,
+      const rawPath = body.path?.trim();
+      if (!rawPath) { res.status(400).json({ error: 'path is required' }); return; }
+      const { result } = await runLocalSeedIngestion({
+        slug: body.slug,
+        inputPath: rawPath,
       });
-      const source = await getSource(slug);
-      if (!source) { res.status(500).json({ error: 'failed to register source' }); return; }
-
-      const result = await runIngestion({ source, inputPath });
       res.json({
         runId: result.runId,
         recordsIn: result.recordsIn,
@@ -5784,44 +5746,24 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
     const write = (obj: unknown) => { try { res.write(JSON.stringify(obj) + '\n'); } catch { /* client gone */ } };
     try {
       const body = (req.body ?? {}) as { path?: string; slug?: string };
-      const inputPath = body.path?.trim();
-      if (!inputPath) { write({ type: 'error', error: 'path is required' }); res.end(); return; }
-      const { detectManifest } = await import('../brain/format-detector.js');
-      const { runIngestion } = await import('../brain/ingestion-pipeline.js');
-      const manifest = detectManifest(inputPath);
-      const suggestedSlug = body.slug || deriveBrainSlug(inputPath);
-      write({ type: 'manifest', manifest, suggestedSlug });
-      const ephemeralSource = {
-        slug: suggestedSlug,
-        kind: 'seed' as const,
-        adapter: 'csv' as const,
-        configJson: '{}',
-        credentialRef: null,
-        scheduleCron: null,
-        targetFolder: `04-Ingest/${suggestedSlug}`,
-        agentSlug: null,
-        intelligence: 'auto' as const,
-        enabled: true,
-        lastRunAt: null,
-        lastStatus: null,
-        createdAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString(),
-      };
-      const result = await runIngestion({
-        source: ephemeralSource,
-        inputPath,
+      const rawPath = body.path?.trim();
+      if (!rawPath) { write({ type: 'error', error: 'path is required' }); res.end(); return; }
+      const preview = await runLocalSeedIngestion({
+        slug: body.slug,
+        inputPath: rawPath,
         dryRun: true,
         limit: 10,
+        onManifest: (m) => write({ type: 'manifest', manifest: m.manifest, suggestedSlug: m.slug }),
         onProgress: (p) => write({ type: 'progress', ...p }),
       });
       write({
         type: 'done',
-        preview: (result.plannedRecords ?? []).map((r) => ({
+        preview: (preview.result.plannedRecords ?? []).map((r) => ({
           title: r.title, tags: r.tags, targetRelPath: r.targetRelPath,
           body: (r.body || '').slice(0, 800),
         })),
-        recordsIn: result.recordsIn,
-        errors: result.errors.slice(0, 10),
+        recordsIn: preview.result.recordsIn,
+        errors: preview.result.errors.slice(0, 10),
       });
     } catch (err) {
       write({ type: 'error', error: err instanceof Error ? err.message : String(err) });
@@ -5838,25 +5780,11 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
     const write = (obj: unknown) => { try { res.write(JSON.stringify(obj) + '\n'); } catch { /* client gone */ } };
     try {
       const body = (req.body ?? {}) as { path?: string; slug?: string };
-      const inputPath = body.path?.trim();
-      if (!inputPath) { write({ type: 'error', error: 'path is required' }); res.end(); return; }
-      const slug = body.slug?.trim() || deriveBrainSlug(inputPath);
-      const { upsertSource, getSource } = await import('../brain/source-registry.js');
-      const { runIngestion } = await import('../brain/ingestion-pipeline.js');
-      await upsertSource({
-        slug,
-        kind: 'seed',
-        adapter: 'csv',
-        configJson: JSON.stringify({ inputPath }),
-        targetFolder: `04-Ingest/${slug}`,
-        intelligence: 'auto',
-        enabled: true,
-      });
-      const source = await getSource(slug);
-      if (!source) { write({ type: 'error', error: 'failed to register source' }); res.end(); return; }
-      const result = await runIngestion({
-        source,
-        inputPath,
+      const rawPath = body.path?.trim();
+      if (!rawPath) { write({ type: 'error', error: 'path is required' }); res.end(); return; }
+      const { result } = await runLocalSeedIngestion({
+        slug: body.slug,
+        inputPath: rawPath,
         onProgress: (p) => write({ type: 'progress', ...p }),
       });
       write({

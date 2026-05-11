@@ -184,6 +184,38 @@ function applyNormalizedTool(
   }
 }
 
+function applyMemoryCompanionTools(
+  normalizedTools: NormalizedRequestedTool[],
+  clementineTools: Set<string>,
+  clementineServerName: string,
+  builtins: Set<string>,
+  allowed: Set<string>,
+  clementineAllow: Set<string>,
+): void {
+  if (clementineAllow.has('*')) return;
+  const requestedClementine = new Set(
+    normalizedTools
+      .map(tool => tool.clementineTool)
+      .filter((tool): tool is string => Boolean(tool) && tool !== '*'),
+  );
+  if (!requestedClementine.has('memory_write')) return;
+
+  // Existing agent profiles predate the brain ingestion tools. If a profile
+  // already grants durable memory writes, keep the newer ingestion write path
+  // available without widening to the full Clementine MCP surface.
+  const companionTools = ['brain_save'];
+  const canReadLocalData = normalizedTools.some(tool =>
+    tool.builtinTool === 'Read' || tool.builtinTool === 'Bash',
+  );
+  if (canReadLocalData) companionTools.push('brain_ingest_folder');
+
+  for (const toolName of companionTools) {
+    if (!clementineTools.has(toolName) || requestedClementine.has(toolName)) continue;
+    const normalized = normalizeRequestedToolName(toolName, clementineServerName, clementineTools);
+    applyNormalizedTool(normalized, builtins, allowed, clementineAllow);
+  }
+}
+
 export function buildExecutionToolPolicy(opts: BuildExecutionPolicyOptions): ExecutionToolPolicy {
   const permissionMode = opts.permissionMode ?? 'dontAsk';
   const clementineTools = listClementineMcpToolNames();
@@ -212,6 +244,16 @@ export function buildExecutionToolPolicy(opts: BuildExecutionPolicyOptions): Exe
         // "make Bash visible and approve that CLI", not "approve all shell".
         skipBroadBash: hasScopedBash,
       });
+    }
+    if (opts.requestedTools.length > 0) {
+      applyMemoryCompanionTools(
+        normalizedTools,
+        clementineTools,
+        opts.clementineServerName,
+        builtins,
+        allowed,
+        clementineAllow,
+      );
     }
   }
 

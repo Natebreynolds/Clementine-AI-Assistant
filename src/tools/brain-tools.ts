@@ -13,6 +13,7 @@ import { z } from 'zod';
 import type { RawRecord } from '../types.js';
 import { fallbackExternalId } from '../brain/adapters/common.js';
 import { logger, textResult } from './shared.js';
+import { runLocalSeedIngestion } from '../brain/local-seed.js';
 
 function formatFrontmatter(record: IngestRecordInput, slug: string, fetchedAt: string): string {
   const frontmatter: Record<string, unknown> = {
@@ -55,6 +56,8 @@ export interface BrainIngestFolderResult {
   slug: string;
   acceptedCount: number;
   skippedEmpty: number;
+  inputPath?: string;
+  filesScanned?: number;
   pipeline: {
     recordsIn: number;
     recordsWritten: number;
@@ -63,6 +66,41 @@ export interface BrainIngestFolderResult {
     errors: Array<{ externalId?: string; error: string }>;
   };
   message: string;
+}
+
+export async function ingestBrainPath(slug: string | undefined, inputPath: string): Promise<BrainIngestFolderResult> {
+  const { slug: safeSlug, inputPath: resolvedPath, manifest, result } = await runLocalSeedIngestion({
+    slug,
+    inputPath,
+  });
+  let ingestionSummary =
+    `Pipeline: ${result.recordsIn} in · ${result.recordsWritten} written · ${result.recordsSkipped} skipped · ${result.recordsFailed} failed`;
+  if (result.errors?.length) {
+    ingestionSummary += ` (first error: ${result.errors[0].error.slice(0, 100)})`;
+  }
+
+  const message =
+    `Ingested local path into slug "${safeSlug}": ${manifest.totalFiles} file(s) scanned, ${manifest.totalBytes} bytes. ${ingestionSummary}`;
+  logger.info(
+    { slug: safeSlug, inputPath: resolvedPath, filesScanned: manifest.totalFiles },
+    'brain_ingest_folder local path complete',
+  );
+
+  return {
+    slug: safeSlug,
+    acceptedCount: result.recordsIn,
+    skippedEmpty: 0,
+    inputPath: resolvedPath,
+    filesScanned: manifest.totalFiles,
+    pipeline: {
+      recordsIn: result.recordsIn,
+      recordsWritten: result.recordsWritten,
+      recordsSkipped: result.recordsSkipped,
+      recordsFailed: result.recordsFailed,
+      errors: result.errors,
+    },
+    message,
+  };
 }
 
 function toRawRecords(records: IngestRecordInput[], slug: string): { rawRecords: RawRecord[]; skippedEmpty: number } {
@@ -303,18 +341,34 @@ export function registerBrainTools(server: McpServer): void {
 
   server.tool(
     'brain_ingest_folder',
-    'Ingest a batch of records into the brain under a named slug. Sends records directly into the distillation pipeline (chunking, LLM summarization, vault note write, memory indexing, knowledge graph write). Use at the end of Connector Feed cron jobs. Safe to re-run — records with the same externalId update the same distilled note.',
+    'Ingest local data or a batch of records into the brain under a named slug. For local files/folders, pass inputPath and let Clementine parse CSV, JSON, JSONL, Markdown, PDF, email, DOCX, and text server-side. For connector feeds, pass records directly. Routes through the distillation pipeline (chunking, LLM summary, vault note, memory index, knowledge graph). Safe to re-run — stable records update the same distilled note.',
     {
-      slug: z.string().describe('Feed slug (matches 04-Ingest/<slug> folder). Lowercase, hyphen-separated.'),
+      slug: z.string().optional().describe('Feed/source slug (matches 04-Ingest/<slug> folder). Lowercase, hyphen-separated. Inferred from inputPath when omitted.'),
+      inputPath: z.string().optional().describe('Absolute or ~/ local file/folder path to ingest. Use this when the user says to seed the brain from local data. Do not read and paste the files into records yourself.'),
       records: z.array(z.object({
         title: z.string().describe('Human-readable title for this record.'),
         externalId: z.string().describe('Stable provider id so re-runs dedup (e.g. Gmail message id, Drive file id).'),
         content: z.string().describe('The full text content of the record. Will be chunked and distilled.'),
         metadata: z.record(z.string(), z.unknown()).optional().describe('Any key/value fields to preserve in frontmatter (url, modifiedAt, author).'),
-      })).describe('The records to ingest.'),
+      })).optional().describe('Connector/feed records to ingest. Use inputPath instead for local files/folders.'),
     },
-    async ({ slug, records }) => {
-      const safeSlug = String(slug).toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/^-+|-+$/g, '');
+    async ({ slug, inputPath, records }) => {
+      if (inputPath && Array.isArray(records) && records.length > 0) {
+        return textResult('brain_ingest_folder: pass either inputPath or records, not both');
+      }
+
+      if (inputPath) {
+        try {
+          const result = await ingestBrainPath(slug, inputPath);
+          return textResult(result.message);
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          logger.error({ err, slug, inputPath }, 'brain_ingest_folder: local path ingestion failed');
+          return textResult(`brain_ingest_folder: local path ingestion failed: ${msg}`);
+        }
+      }
+
+      const safeSlug = sanitizeSlug(slug || '');
       if (!safeSlug) return textResult('brain_ingest_folder: slug is required');
       if (!Array.isArray(records) || records.length === 0) {
         return textResult(`brain_ingest_folder: no records to ingest for slug "${safeSlug}".`);

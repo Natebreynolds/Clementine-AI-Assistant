@@ -27,6 +27,58 @@ function recordFiles(dir: string): string[] {
 }
 
 describe('brain_ingest_folder direct record ingestion', () => {
+  it('ingests a local file/folder path without pre-extracting records through chat', async () => {
+    const { ingestBrainPath } = await import('../src/tools/brain-tools.js');
+    const { runLocalSeedIngestion } = await import('../src/brain/local-seed.js');
+    const { setLLMOverride } = await import('../src/brain/llm-client.js');
+
+    const seedDir = path.join(TMP_HOME, 'local-seed-source');
+    mkdirSync(seedDir, { recursive: true });
+    writeFileSync(path.join(seedDir, 'account-note.md'), [
+      '# Local account note',
+      '',
+      'Acme Corp asked for a Q3 renewal plan.',
+      'Owner: Pat',
+    ].join('\n'));
+
+    setLLMOverride(async (_prompt, opts) => {
+      if (opts?.format === 'json') {
+        return JSON.stringify({
+          title: 'Local account note',
+          summary: 'Acme Corp needs a Q3 renewal plan.',
+          tags: ['local-seed', 'acme'],
+          entities: [{ label: 'Company', id: 'Acme Corp' }],
+          relationships: [],
+        });
+      }
+      if (opts?.system?.includes('entry-point note')) {
+        return '## What was added\nA local account note was imported.\n\n## Key themes / entities\n[[Acme Corp]] renewal planning.\n\n## Time/number shape\nQ3 plan.\n\n## Next questions to ask\nWhat renewal work is due?';
+      }
+      return 'A local account note was imported.';
+    });
+
+    try {
+      const preview = await runLocalSeedIngestion({ inputPath: seedDir, dryRun: true, limit: 10 });
+      expect(preview.slug).toBe('local-seed-source');
+      expect(preview.manifest.totalFiles).toBe(1);
+      expect(preview.result.runId).toBeNull();
+      expect(preview.result.plannedRecords).toHaveLength(1);
+      expect(existsSync(path.join(TMP_HOME, 'vault', '04-Ingest', 'local-seed-source'))).toBe(false);
+
+      const result = await ingestBrainPath(undefined, seedDir);
+      expect(result.slug).toBe('local-seed-source');
+      expect(result.filesScanned).toBe(1);
+      expect(result.pipeline.recordsIn).toBe(1);
+      expect(result.pipeline.recordsWritten).toBe(1);
+      expect(result.pipeline.recordsFailed).toBe(0);
+
+      const targetDir = path.join(TMP_HOME, 'vault', '04-Ingest', 'local-seed-source');
+      expect(recordFiles(targetDir)).toHaveLength(1);
+    } finally {
+      setLLMOverride(null);
+    }
+  }, 30_000);
+
   it('preserves provider external ids and upserts into one distilled note per record', async () => {
     const { ingestBrainRecords } = await import('../src/tools/brain-tools.js');
     const { setLLMOverride } = await import('../src/brain/llm-client.js');

@@ -60,6 +60,25 @@ describe('buildExecutionToolPolicy', () => {
     expect(policy.clementineToolAllowlist).toBe('memory_read');
   });
 
+  it('keeps legacy memory-write profiles compatible with brain ingestion tools', () => {
+    const policy = buildExecutionToolPolicy({
+      requestedTools: ['Read', 'memory_write'],
+      defaultBuiltins: [],
+      mcpServerNames: ['clementine-tools'],
+      clementineServerName: 'clementine-tools',
+    });
+
+    expect(policy.builtinTools).toEqual(['Read']);
+    expect(policy.allowedTools).toContain('mcp__clementine-tools__memory_write');
+    expect(policy.allowedTools).toContain('mcp__clementine-tools__brain_save');
+    expect(policy.allowedTools).toContain('mcp__clementine-tools__brain_ingest_folder');
+    expect(policy.clementineToolAllowlist.split(',')).toEqual([
+      'brain_ingest_folder',
+      'brain_save',
+      'memory_write',
+    ]);
+  });
+
   it('scopes Clementine MCP to wildcard when explicitly requested', () => {
     const policy = buildExecutionToolPolicy({
       requestedTools: ['mcp__clementine-tools__*'],
