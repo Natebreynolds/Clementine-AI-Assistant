@@ -49,7 +49,7 @@ export interface ScheduleEntry {
    *  this skill, so its body becomes the prompt at fire-time. */
   skillName: string;
   /** Cron expression. Empty / falsy = no auto-fire (still appears on
-   *  Tasks page so the user can edit it). */
+   *  the Schedules page so the user can edit it). */
   schedule: string;
   /** When false the scheduler skips it. Lets users pause without losing
    *  the schedule definition. */

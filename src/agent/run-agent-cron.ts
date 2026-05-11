@@ -660,8 +660,7 @@ export interface RunAgentCronResult extends RunAgentResult {
   /** Pinned skills that didn't resolve (bad slug / suppressed). Empty array
    *  is fine; only populated when the trick had pins that failed to load. */
   skillsMissing: string[];
-  /** Effective tool allowlist passed to runAgent (post-intersection). Undefined
-   *  means the trick didn't override — runAgent fell through to profile/default. */
+  /** Effective SDK allowedTools after defaults/MCP mapping were applied. */
   allowedToolsApplied?: string[];
   /** MCP servers live for this run after profile + trick intersection. */
   mcpServersApplied: string[];
@@ -1032,7 +1031,7 @@ export async function runAgentCron(opts: RunAgentCronOptions): Promise<RunAgentC
     externalConnected,
     skillsApplied: plan.skillsApplied,
     skillsMissing: plan.skillsMissing,
-    allowedToolsApplied: effectiveAllowedTools,
+    allowedToolsApplied: result.allowedToolsApplied ?? effectiveAllowedTools,
     mcpServersApplied,
   };
 }

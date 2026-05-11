@@ -54,7 +54,7 @@ export function registerSkillTools(server: McpServer): void {
       title: z.string().optional()
         .describe('Optional friendlier display name. Example: "Morning Deal Review".'),
       description: z.string()
-        .describe('One-paragraph summary of what this skill does and when Claude should run it. Used by the runtime auto-matcher AND surfaced as the cron task card preview when the skill is pinned. Max 1024 chars.'),
+        .describe('One-paragraph summary of what this skill does and when Claude should run it. Used by the runtime auto-matcher and surfaced in the dashboard skill/schedule previews. Max 1024 chars.'),
       body: z.string()
         .describe('The procedure body in Markdown. Use headers (# / ##), numbered lists, code fences. Max 500 lines is best practice. Example: "# Morning Deal Review\\n\\n1. Pull deals updated in the last 24h.\\n2. Surface high-value ones." '),
       tools: z.array(z.string()).optional()
@@ -86,7 +86,7 @@ export function registerSkillTools(server: McpServer): void {
           `Description: ${description.slice(0, 200)}${description.length > 200 ? '…' : ''}` +
           toolsLine +
           triggersLine +
-          `\n\nThe skill is ready to pin to any task — open the cron editor, go to Tools & MCP, click "+ Add skill" and select "${result.name}". Or invoke it directly in chat: "Run the ${title || result.name} skill."`,
+          `\n\nThe skill is ready to schedule or run manually — open Skills/Schedules in the dashboard and select "${result.name}", or invoke it directly in chat: "Run the ${title || result.name} skill."`,
         );
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);

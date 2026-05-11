@@ -61,7 +61,7 @@ export async function callLLM(prompt: string, opts: LLMCallOpts = {}): Promise<s
       systemPrompt: systemParts.join('\n\n') || undefined,
       // No built-in tools: brain calls are pure completions
       tools: [],
-      permissionMode: 'bypassPermissions' as const,
+      permissionMode: 'dontAsk' as const,
       // Don't inherit user ~/.claude settings — those pull in hooks,
       // allowed-tool lists, and statusline config that can slow or
       // fail our minimal call.

@@ -32,6 +32,27 @@ const logger = pino({
   level: process.env.CLEMENTINE_CONSOLIDATION_LOG_LEVEL || 'warn',
 });
 
+function parsePositiveIntEnv(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (!raw) return fallback;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function parsePositiveNumberEnv(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (!raw) return fallback;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+const CONSOLIDATION_MAX_TURNS = parsePositiveIntEnv('CLEMENTINE_CONSOLIDATION_MAX_TURNS', 80);
+const CONSOLIDATION_TURN_MAX_CHARS = parsePositiveIntEnv('CLEMENTINE_CONSOLIDATION_TURN_MAX_CHARS', 900);
+const CONSOLIDATION_FACT_LIMIT = parsePositiveIntEnv('CLEMENTINE_CONSOLIDATION_FACT_LIMIT', 30);
+const CONSOLIDATION_FACT_MAX_CHARS = parsePositiveIntEnv('CLEMENTINE_CONSOLIDATION_FACT_MAX_CHARS', 400);
+export const CONSOLIDATION_PROMPT_MAX_CHARS = parsePositiveIntEnv('CLEMENTINE_CONSOLIDATION_PROMPT_MAX_CHARS', 24_000);
+const CONSOLIDATION_SDK_BUDGET_USD = parsePositiveNumberEnv('CLEMENTINE_CONSOLIDATION_SDK_BUDGET_USD', 0.25);
+
 export interface EpisodicConsolidationOptions {
   /** Minutes of inactivity before a session becomes consolidation-eligible. */
   idleMinutes?: number;
@@ -112,27 +133,67 @@ const SYSTEM_PROMPT = [
   '}',
 ].join('\n');
 
-function buildUserPrompt(
+function compactForPrompt(text: string, maxChars: number): string {
+  const compacted = text.replace(/\s+/g, ' ').trim();
+  if (compacted.length <= maxChars) return compacted;
+  return `${compacted.slice(0, Math.max(0, maxChars - 3)).trimEnd()}...`;
+}
+
+function keepLatestLinesWithin(lines: string[], originalTurnCount: number, maxChars: number): string {
+  const kept: string[] = [];
+  let used = 0;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i];
+    const needed = line.length + (kept.length > 0 ? 1 : 0);
+    if (kept.length > 0 && used + needed > maxChars) break;
+    if (kept.length === 0 && needed > maxChars) {
+      kept.push(line.slice(-Math.max(0, maxChars - 3)).trimStart());
+      used = kept[0].length;
+      break;
+    }
+    kept.push(line);
+    used += needed;
+  }
+  kept.reverse();
+
+  const omitted = Math.max(0, originalTurnCount - kept.length);
+  if (omitted === 0) return kept.join('\n');
+
+  const notice = `[${omitted} earlier turn(s) omitted to keep consolidation bounded]`;
+  while (kept.length > 0 && [notice, ...kept].join('\n').length > maxChars) {
+    kept.shift();
+  }
+  const bounded = [notice, ...kept].join('\n');
+  return bounded.length <= maxChars ? bounded : bounded.slice(-maxChars);
+}
+
+export function buildUserPrompt(
   turns: Array<{ role: string; content: string; createdAt: string }>,
   existingFacts: Array<{ kind: string; text: string }>,
 ): string {
-  const formatted = turns
-    .map(t => `[${t.createdAt}] ${t.role}: ${t.content.replace(/\s+/g, ' ').slice(0, 1200)}`)
-    .join('\n');
+  const selectedTurns = turns.slice(-CONSOLIDATION_MAX_TURNS);
+  const turnLines = selectedTurns
+    .map(t => `[${t.createdAt}] ${t.role}: ${compactForPrompt(t.content, CONSOLIDATION_TURN_MAX_CHARS)}`);
   const factBlock = existingFacts.length
     ? [
         'Existing facts already learned (use to detect contradictions for `supersedes`):',
-        ...existingFacts.slice(0, 30).map(f => `- [${f.kind}] ${f.text}`),
+        ...existingFacts
+          .slice(0, CONSOLIDATION_FACT_LIMIT)
+          .map(f => `- [${f.kind}] ${compactForPrompt(f.text, CONSOLIDATION_FACT_MAX_CHARS)}`),
         '',
       ].join('\n')
     : '';
-  return [
+  const prefix = [
     'Consolidate the following conversation range into the JSON schema described.',
     'Only include facts present in the conversation. Use empty arrays for unknown fields.',
     '',
     factBlock,
-    formatted,
   ].join('\n');
+  const maxTranscriptChars = Math.max(500, CONSOLIDATION_PROMPT_MAX_CHARS - prefix.length - 1);
+  const formatted = keepLatestLinesWithin(turnLines, turns.length, maxTranscriptChars);
+  const prompt = [prefix, formatted].join('\n');
+  if (prompt.length <= CONSOLIDATION_PROMPT_MAX_CHARS) return prompt;
+  return prompt.slice(0, Math.max(0, CONSOLIDATION_PROMPT_MAX_CHARS - 3)).trimEnd() + '...';
 }
 
 /** Parse the model's output as JSON, tolerating leading/trailing whitespace and
@@ -238,13 +299,13 @@ async function runConsolidationViaSdk(
       options: {
         systemPrompt,
         model,
-        permissionMode: 'bypassPermissions',
-        allowDangerouslySkipPermissions: true,
+        permissionMode: 'dontAsk',
+        tools: [],
         allowedTools: [],
         cwd: BASE_DIR,
         env,
         maxTurns: 1,
-        maxBudgetUsd: 0.10,
+        maxBudgetUsd: CONSOLIDATION_SDK_BUDGET_USD,
       },
     });
     for await (const message of stream) {

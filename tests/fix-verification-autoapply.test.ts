@@ -12,6 +12,10 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync, existsSync } from 'node:
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
+vi.mock('../src/gateway/failure-monitor.js', () => ({
+  computeBrokenJobs: () => [],
+}));
+
 const TMP_HOME = path.join(tmpdir(), 'clem-fix-verif-' + Date.now() + '-' + Math.random().toString(36).slice(2, 6));
 process.env.CLEMENTINE_HOME = TMP_HOME;
 mkdirSync(path.join(TMP_HOME, 'cron'), { recursive: true });
@@ -39,10 +43,6 @@ function makeRun(jobName: string, status: CronRunEntry['status'], errorOverride?
 describe('Phase 8.1 — autoApply multi-run verification', () => {
   beforeEach(() => {
     _resetVerificationState();
-    // Mock computeBrokenJobs in failure-monitor — avoid scanning real disk.
-    vi.mock('../src/gateway/failure-monitor.js', () => ({
-      computeBrokenJobs: () => [],
-    }));
   });
 
   afterEach(() => {

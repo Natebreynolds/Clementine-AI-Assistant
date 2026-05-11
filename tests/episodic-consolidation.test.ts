@@ -14,6 +14,8 @@ import os from 'node:os';
 import Database from 'better-sqlite3';
 import { MemoryStore } from '../src/memory/store.js';
 import {
+  CONSOLIDATION_PROMPT_MAX_CHARS,
+  buildUserPrompt,
   parseEpisodeJson,
   consolidateOneSession,
   runEpisodicConsolidationPass,
@@ -111,6 +113,25 @@ describe('parseEpisodeJson', () => {
     expect(out?.topics).toEqual([]);
     expect(out?.entities).toEqual([]);
     expect(out?.openLoops).toEqual([]);
+  });
+});
+
+describe('buildUserPrompt', () => {
+  it('bounds oversized sessions while preserving the newest turns', () => {
+    const turns = Array.from({ length: 160 }, (_, i) => ({
+      role: i % 2 === 0 ? 'user' : 'assistant',
+      content: `turn-${i} ${'x'.repeat(1500)}`,
+      createdAt: `2026-05-10T00:${String(i % 60).padStart(2, '0')}:00.000Z`,
+    }));
+
+    const prompt = buildUserPrompt(turns, [
+      { kind: 'preference', text: 'user prefers durable memory that is concise and actionable'.repeat(40) },
+    ]);
+
+    expect(prompt.length).toBeLessThanOrEqual(CONSOLIDATION_PROMPT_MAX_CHARS);
+    expect(prompt).toContain('turn-159');
+    expect(prompt).not.toContain('turn-0');
+    expect(prompt).toContain('earlier turn(s) omitted');
   });
 });
 

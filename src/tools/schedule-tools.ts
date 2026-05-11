@@ -64,7 +64,7 @@ export function registerScheduleTools(server: McpServer): void {
         return textResult(
           `Scheduled "${skillName}" to run on "${schedule}"` +
           (entry.enabled ? '' : ' (DISABLED — flip enabled:true to start firing)') +
-          `. View on the Tasks page or call list_schedules to confirm.`,
+          `. View on the Schedules page or call list_schedules to confirm.`,
         );
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
@@ -76,7 +76,7 @@ export function registerScheduleTools(server: McpServer): void {
 
   server.tool(
     'list_schedules',
-    'List every scheduled skill and its cron expression. Returns the same data the dashboard\'s Tasks page shows for the SKILL-tagged rows.',
+    'List every scheduled skill and its cron expression. Returns the same data the dashboard\'s Schedules page shows.',
     {},
     async () => {
       try {

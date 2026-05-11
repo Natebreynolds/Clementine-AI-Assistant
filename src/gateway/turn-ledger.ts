@@ -22,6 +22,11 @@ export interface TurnLedgerEntry {
   actionExpected?: boolean;
   actionExpectationSource?: string;
   actionExpectationReason?: string;
+  runId?: string;
+  permissionModeApplied?: string;
+  allowedToolsApplied?: string[];
+  builtinToolsApplied?: string[];
+  mcpServersApplied?: string[];
   toolCallsMade: number;
   toolNames: string[];
   responsePreview?: string;
@@ -74,6 +79,9 @@ export function formatLastTurnLedger(sessionKey: string, baseDir = BASE_DIR): st
   const tools = last.toolCallsMade > 0
     ? `Tools used: ${last.toolCallsMade} (${last.toolNames.slice(0, 6).join(', ')}${last.toolNames.length > 6 ? ', ...' : ''}).`
     : 'Tools used: none.';
+  const execution = last.permissionModeApplied || last.mcpServersApplied?.length
+    ? `Execution: ${last.permissionModeApplied ?? 'unknown'}${last.mcpServersApplied?.length ? `; MCP: ${last.mcpServersApplied.slice(0, 6).join(', ')}${last.mcpServersApplied.length > 6 ? ', ...' : ''}` : ''}.`
+    : '';
   const response = last.responsePreview
     ? `Last response: "${last.responsePreview.replace(/\s+/g, ' ').slice(0, 240)}${last.responsePreview.length > 240 ? '...' : ''}"`
     : last.errorPreview
@@ -86,6 +94,7 @@ export function formatLastTurnLedger(sessionKey: string, baseDir = BASE_DIR): st
     tools,
     `Toolset: ${last.toolset ?? 'auto'}.`,
     `Policy: ${last.policyReason ?? 'unknown'}; tools ${last.toolsEnabled ? 'enabled' : 'disabled'}.`,
+    execution,
     response,
-  ].join('\n');
+  ].filter(Boolean).join('\n');
 }

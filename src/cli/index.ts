@@ -1829,7 +1829,44 @@ function cmdTools(): void {
     console.log();
   }
 
-  // ── 4. Project MCP servers ───────────────────────────────────────
+  // ── 4. Local user tools ──────────────────────────────────────────
+  const userToolsDir = path.join(BASE_DIR, 'tools');
+  const userTools: Array<{ name: string; description: string; file: string }> = [];
+  if (existsSync(userToolsDir)) {
+    for (const file of readdirSync(userToolsDir).filter(f => f.endsWith('.sh') || f.endsWith('.py')).sort()) {
+      const filePath = path.join(userToolsDir, file);
+      const metaPath = filePath + '.meta.json';
+      const name = file.replace(/\.(sh|py)$/, '').replace(/[^a-z0-9_]/gi, '_');
+      let description = `Custom tool: ${name}`;
+      if (existsSync(metaPath)) {
+        try {
+          const meta = JSON.parse(readFileSync(metaPath, 'utf-8'));
+          if (typeof meta.description === 'string' && meta.description.trim()) {
+            description = meta.description.trim();
+          }
+        } catch { /* ignore */ }
+      } else {
+        try {
+          const firstLines = readFileSync(filePath, 'utf-8').split('\n').slice(0, 3);
+          const commentLine = firstLines.find(l => l.startsWith('#') && !l.startsWith('#!'));
+          if (commentLine) description = commentLine.slice(1).trim();
+        } catch { /* ignore */ }
+      }
+      userTools.push({ name, description, file });
+    }
+  }
+
+  if (userTools.length > 0) {
+    console.log(`  ${BOLD}Local User Tools${RESET} ${DIM}(~/.clementine/tools)${RESET}`);
+    console.log();
+    const maxUserTool = Math.max(...userTools.map((t) => t.name.length));
+    for (const tool of userTools) {
+      console.log(`    ${GREEN}${tool.name.padEnd(maxUserTool)}${RESET}  ${DIM}${tool.description} (${tool.file})${RESET}`);
+    }
+    console.log();
+  }
+
+  // ── 5. Project MCP servers ───────────────────────────────────────
   const projectSettingsPath = path.join(PACKAGE_ROOT, '.claude', 'settings.json');
   const projectMcpServers: string[] = [];
 
@@ -1852,7 +1889,7 @@ function cmdTools(): void {
     console.log();
   }
 
-  // ── 5. Active channels ──────────────────────────────────────────
+  // ── 6. Active channels ──────────────────────────────────────────
   const channels: string[] = [];
   if (existsSync(ENV_PATH)) {
     const envContent = readFileSync(ENV_PATH, 'utf-8');
@@ -1870,6 +1907,67 @@ function cmdTools(): void {
       console.log(`    ${GREEN}${ch}${RESET}`);
     }
     console.log();
+  }
+}
+
+function sanitizeUserToolName(name: string): string {
+  const safe = name.trim().toLowerCase().replace(/[^a-z0-9_]/g, '_').replace(/^_+|_+$/g, '');
+  if (!safe) throw new Error('Tool name must contain at least one letter, digit, or underscore.');
+  if (!/^[a-z0-9_]{1,64}$/.test(safe)) {
+    throw new Error('Tool name must be 1-64 lowercase letters, digits, or underscores.');
+  }
+  return safe;
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+function cmdToolsRegisterCli(
+  name: string,
+  commandParts: string[],
+  opts: { description?: string; argsDescription?: string; force?: boolean },
+): void {
+  try {
+    if (!Array.isArray(commandParts) || commandParts.length === 0) {
+      throw new Error('Provide the command to wrap, for example: clementine tools register-cli list-repo git status --short');
+    }
+    const safeName = sanitizeUserToolName(name);
+    const toolsDir = path.join(BASE_DIR, 'tools');
+    mkdirSync(toolsDir, { recursive: true });
+
+    const filePath = path.join(toolsDir, `${safeName}.sh`);
+    if (existsSync(filePath) && !opts.force) {
+      throw new Error(`~/.clementine/tools/${safeName}.sh already exists. Re-run with --force to replace it.`);
+    }
+
+    const description = (opts.description?.trim() || `Run ${commandParts.join(' ')}`).replace(/\r?\n/g, ' ');
+    const argsDescription = (opts.argsDescription?.trim() || 'Optional arguments passed to the wrapped command').replace(/\r?\n/g, ' ');
+    const command = commandParts.map(shellQuote).join(' ');
+    const script = [
+      '#!/bin/bash',
+      `# ${description}`,
+      'set -euo pipefail',
+      `exec ${command} "$@"`,
+      '',
+    ].join('\n');
+
+    writeFileSync(filePath, script, { mode: 0o755 });
+    writeFileSync(filePath + '.meta.json', JSON.stringify({
+      name: safeName,
+      description,
+      language: 'bash',
+      args_description: argsDescription,
+      command: commandParts,
+      createdAt: new Date().toISOString(),
+    }, null, 2) + '\n', { mode: 0o644 });
+
+    console.log(`  Registered local MCP tool: ${safeName}`);
+    console.log(`  Script: ~/.clementine/tools/${safeName}.sh`);
+    console.log('  Restart the daemon for the MCP server to load it in new agent sessions.');
+  } catch (err) {
+    console.error(`  Error: ${(err as Error).message}`);
+    process.exit(1);
   }
 }
 
@@ -2396,10 +2494,18 @@ program
   .option('--fix', 'Auto-install missing dependencies')
   .action((opts) => cmdDoctor(opts));
 
-program
+const toolsCmd = program
   .command('tools')
   .description('List available MCP tools, plugins, and channels')
   .action(cmdTools);
+
+toolsCmd
+  .command('register-cli <name> <command...>')
+  .description('Wrap a local CLI command as a Clementine MCP tool')
+  .option('-d, --description <text>', 'Tool description shown to the agent')
+  .option('--args-description <text>', 'Description for optional runtime args')
+  .option('--force', 'Replace an existing tool with the same name')
+  .action(cmdToolsRegisterCli);
 
 const advisorCmd = program
   .command('advisor')

@@ -522,8 +522,7 @@ export async function probeAvailableTools(force = false): Promise<ToolInventory>
       options: normalizeClaudeSdkOptionsForOneMillionContext({
         systemPrompt: 'Reply ok.',
         model: 'claude-haiku-4-5',
-        permissionMode: 'bypassPermissions' as const,
-        allowDangerouslySkipPermissions: true,
+        permissionMode: 'dontAsk' as const,
         mcpServers: externalMcpServers,
       }),
     });

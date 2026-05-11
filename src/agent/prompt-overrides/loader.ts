@@ -9,7 +9,7 @@
  * is created on first load so users have an obvious empty home for overrides.
  */
 
-import { existsSync, mkdirSync, readFileSync, readdirSync, watch as fsWatch } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, watch as fsWatch, type FSWatcher } from 'node:fs';
 import path from 'node:path';
 import pino from 'pino';
 import matter from 'gray-matter';
@@ -33,6 +33,7 @@ function rootDir(baseDir: string): string {
 
 let cached: PromptOverride[] = [];
 let watcherInstalled = false;
+let watcher: FSWatcher | null = null;
 let watchDebounce: NodeJS.Timeout | null = null;
 
 // ── Parse one file ───────────────────────────────────────────────────
@@ -158,7 +159,7 @@ export function watchPromptOverrides(opts?: LoaderOptions): void {
     if (!existsSync(p)) mkdirSync(p, { recursive: true });
   }
   try {
-    fsWatch(root, { recursive: true }, () => {
+    watcher = fsWatch(root, { recursive: true }, () => {
       if (watchDebounce) clearTimeout(watchDebounce);
       watchDebounce = setTimeout(() => {
         try {
@@ -168,6 +169,13 @@ export function watchPromptOverrides(opts?: LoaderOptions): void {
         }
       }, 250);
     });
+    watcher.on('error', (err) => {
+      logger.warn({ err, root }, 'Prompt-overrides watcher failed — hot reload disabled');
+      try { watcher?.close(); } catch { /* ignore */ }
+      watcher = null;
+      watcherInstalled = false;
+    });
+    watcher.unref();
     watcherInstalled = true;
     logger.debug({ root }, 'Watching prompt-overrides for hot reload');
   } catch (err) {
@@ -179,6 +187,10 @@ export function watchPromptOverrides(opts?: LoaderOptions): void {
 export function _resetLoaderState(): void {
   cached = [];
   watcherInstalled = false;
+  if (watcher) {
+    try { watcher.close(); } catch { /* ignore */ }
+    watcher = null;
+  }
   if (watchDebounce) {
     clearTimeout(watchDebounce);
     watchDebounce = null;

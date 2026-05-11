@@ -852,6 +852,6 @@ function formatStaleReport(stale: StaleCronJob[]): string {
     lines.push(`- **${job.jobName}** (${job.schedule}, every ${intervalMin}m) — ${last}, overdue by ~${job.overdueMinutes}m`);
   }
   lines.push('');
-  lines.push('The scheduler may be stuck, the job may have thrown before logging, or it may have been silently disabled. Check the dashboard Scheduled Tasks panel.');
+  lines.push('The scheduler may be stuck, the job may have thrown before logging, or it may have been silently disabled. Check the dashboard Schedules panel.');
   return lines.join('\n');
 }

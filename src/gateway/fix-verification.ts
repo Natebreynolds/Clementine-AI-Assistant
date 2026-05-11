@@ -26,7 +26,9 @@ import { classifyRunHealth } from './job-health.js';
 
 const logger = pino({ name: 'clementine.fix-verification' });
 
-const STATE_FILE = path.join(BASE_DIR, 'cron', 'fix-verifications.json');
+function stateFile(): string {
+  return path.join(process.env.CLEMENTINE_HOME || BASE_DIR, 'cron', 'fix-verifications.json');
+}
 
 interface PendingVerification {
   jobName: string;
@@ -82,8 +84,9 @@ const AUTOAPPLY_VERDICT_WINDOW = 3;
 
 function loadState(): State {
   try {
-    if (!existsSync(STATE_FILE)) return { pending: {} };
-    const raw = JSON.parse(readFileSync(STATE_FILE, 'utf-8')) as Partial<State>;
+    const file = stateFile();
+    if (!existsSync(file)) return { pending: {} };
+    const raw = JSON.parse(readFileSync(file, 'utf-8')) as Partial<State>;
     return { pending: raw.pending ?? {} };
   } catch {
     return { pending: {} };
@@ -92,10 +95,11 @@ function loadState(): State {
 
 function saveState(state: State): void {
   try {
-    mkdirSync(path.dirname(STATE_FILE), { recursive: true });
-    const tmp = STATE_FILE + '.tmp';
+    const file = stateFile();
+    mkdirSync(path.dirname(file), { recursive: true });
+    const tmp = file + '.tmp';
     writeFileSync(tmp, JSON.stringify(state, null, 2));
-    renameSync(tmp, STATE_FILE);
+    renameSync(tmp, file);
   } catch (err) {
     logger.warn({ err }, 'Failed to persist fix-verification state');
   }

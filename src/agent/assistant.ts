@@ -2508,9 +2508,9 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
       }
     }
 
-    // Permission mode: always 'bypassPermissions' — this is a daemon/harness with no interactive
-    // terminal, so 'auto' mode (which requires plan support + human approval) doesn't apply.
-    const effectivePermissionMode = 'bypassPermissions';
+    // Headless daemon runs cannot prompt for approval. `dontAsk` auto-allows
+    // only the explicit allowedTools surface and denies everything else.
+    const effectivePermissionMode = 'dontAsk';
 
     // SessionStore adapter: mirror SDK transcripts into our SQLite store.
     // Resume then works from the durable store, not just local JSONL.
@@ -2585,8 +2585,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
       model: resolvedModel,
       ...(fallback ? { fallbackModel: fallback } : {}),
       ...(oneMillionDisableValue === '1' ? { betas: [] } : {}),
-      permissionMode: effectivePermissionMode as 'bypassPermissions' | 'auto',
-      allowDangerouslySkipPermissions: true,
+      permissionMode: effectivePermissionMode,
       ...(sessionStore ? { sessionStore } : {}),
       ...(computedTaskBudget && supportsTaskBudget ? { taskBudget: { total: computedTaskBudget } } : {}),
       // SDK field semantics (per node_modules/@anthropic-ai/claude-agent-sdk/sdk.d.ts):
@@ -2596,8 +2595,8 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
       //                      CLEMENTINE_TOOL_ALLOWLIST so unneeded internal tools
       //                      are never registered for lightweight turns.
       //   - `allowedTools` → auto-allow list covering both built-ins AND MCP tool
-      //                      names; MCP names stay here so bypassPermissions has
-      //                      explicit grants for every exposed external server.
+      //                      names. With permissionMode=dontAsk, anything not
+      //                      present here is denied instead of prompting.
       //   - `disallowedTools` → blocklist, takes precedence.
       tools: toolsDisabledForCall ? [] : allowedTools.filter(t => !t.startsWith('mcp__')),
       allowedTools: toolsDisabledForCall ? [] : allowedTools,
@@ -3189,8 +3188,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
         options: {
           systemPrompt: 'You are a silent memory extraction agent. Save facts to the vault and exit.',
           model: AUTO_MEMORY_MODEL,
-          permissionMode: 'bypassPermissions',
-          allowDangerouslySkipPermissions: true,
+          permissionMode: 'dontAsk',
           // MCP tool names live in allowedTools, not tools. See note at
           // buildOptions — `tools` is for built-ins only.
           tools: [],
@@ -3220,6 +3218,7 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
                 CLEMENTINE_TEAM_AGENT: profile?.slug ?? 'clementine',
                 // Auto-memory extractor runs autonomously.
                 CLEMENTINE_INTERACTION_SOURCE: 'autonomous',
+                CLEMENTINE_TOOL_ALLOWLIST: 'memory_write,memory_search,note_create,task_add,note_take,memory_read,user_model',
               },
             },
           },
@@ -3481,8 +3480,9 @@ You have a cost budget per message — not a hard turn limit. Work until the tas
         options: {
           systemPrompt: 'You are a task output verifier. Assess the output quality.',
           model: MODELS.haiku,
-          permissionMode: 'bypassPermissions',
-          allowDangerouslySkipPermissions: true,
+          permissionMode: 'dontAsk',
+          tools: [],
+          allowedTools: [],
           maxTurns: 1,
           cwd: BASE_DIR,
           env: SAFE_ENV,

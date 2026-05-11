@@ -1,14 +1,8 @@
 /**
  * Clementine TypeScript — runAgent: canonical Claude Agent SDK wrapper.
  *
- * Phase 1 of the SDK-canonical migration (see
- * /Users/nathan.reynolds/.claude/plans/sdk-canonical-migration.md).
- *
- * This is the new code path that will eventually replace runCronJob /
- * runUnleashedTask / runHeartbeat / runTeamTask / chat. For now it
- * runs in PARALLEL with those — only the dashboard's
- * /api/runagent/test endpoint exercises it. Production traffic still
- * uses legacy paths until Phase 2.
+ * Canonical execution wrapper for chat, skills, schedules, heartbeat,
+ * and team-task runs.
  *
  * Design principles (from the SDK docs):
  * 1. ONE query() call — no nested phase wrappers.
@@ -102,6 +96,10 @@ import type { AgentProfile } from '../types.js';
 import type { AgentManager } from './agent-manager.js';
 import type { MemoryStore } from '../memory/store.js';
 import { buildAgentMap } from './agent-definitions.js';
+import {
+  buildExecutionToolPolicy,
+  type ExecutionPermissionMode,
+} from './execution-policy.js';
 
 const MCP_SERVER_SCRIPT = path.join(PKG_DIR, 'dist', 'tools', 'mcp-server.js');
 const ASSISTANT_NAME = (process.env.ASSISTANT_NAME ?? 'Clementine').toLowerCase();
@@ -213,7 +211,21 @@ export interface RunAgentOptions {
    *  including Agent (so subagents can be spawned) + core SDK tools + Clementine MCP. */
   allowedTools?: string[];
 
-  /** Optional CLAUDE.md / project setting source. Defaults to ['project']. */
+  /** SDK permission mode. Defaults to dontAsk so allowedTools is enforceable.
+   *  Only explicit operator/full-surface paths should request bypassPermissions. */
+  permissionMode?: ExecutionPermissionMode;
+
+  /** Optional SDK skill filter for the main session. This filters skill
+   *  context/tooling only; it is not a filesystem sandbox. */
+  skills?: string[] | 'all';
+
+  /** Enable SDK file checkpointing for project-editing runs. */
+  enableFileCheckpointing?: boolean;
+
+  /** Working directory for SDK built-in tools. Defaults to Clementine home. */
+  cwd?: string;
+
+  /** Optional CLAUDE.md / project setting source. Defaults to ['project', 'local']. */
   settingSources?: ('project' | 'user' | 'local')[];
 
   /** Extra directories the SDK should make available to the agent's tools
@@ -272,6 +284,12 @@ export interface RunAgentResult {
    *  callers (cron-scheduler, cron CLI) stamp it on CronRunEntry so the
    *  Run detail page can join run row → events. */
   runId: string;
+
+  /** Effective SDK execution policy, useful in Run detail diagnostics. */
+  permissionMode?: ExecutionPermissionMode;
+  allowedToolsApplied?: string[];
+  builtinToolsApplied?: string[];
+  mcpServersApplied?: string[];
 }
 
 // Last-resort fallbacks for callers that pass NO maxBudgetUsd. The
@@ -372,6 +390,18 @@ export async function runAgent(prompt: string, opts: RunAgentOptions): Promise<R
   // list references mcp__clementine-tools__* that don't exist in the
   // session, and the agent falls back to reading raw JSON files.
   const subprocessEnv = buildRunAgentEnv();
+  const baseMcpServers: Record<string, Record<string, unknown>> = {
+    ...(opts.extraMcpServers ?? {}),
+  };
+  const policyMcpServerNames = [TOOLS_SERVER, ...Object.keys(baseMcpServers)];
+  const toolPolicy = buildExecutionToolPolicy({
+    requestedTools: opts.allowedTools ?? profileMainAllow ?? undefined,
+    defaultBuiltins: CORE_TOOLS_FOR_AGENT_PARENT,
+    mcpServerNames: policyMcpServerNames,
+    clementineServerName: TOOLS_SERVER,
+    permissionMode: opts.permissionMode,
+  });
+
   // SDK accepts a Record<string, McpServerConfig> here. We cast on
   // assignment because we mix the always-on Clementine stdio server
   // with caller-supplied servers of various types.
@@ -385,9 +415,10 @@ export async function runAgent(prompt: string, opts: RunAgentOptions): Promise<R
         CLEMENTINE_HOME: BASE_DIR,
         ...(opts.profile?.slug ? { CLEMENTINE_TEAM_AGENT: opts.profile.slug } : {}),
         CLEMENTINE_INTERACTION_SOURCE: interactionSourceForSession(opts.sessionKey, source),
+        CLEMENTINE_TOOL_ALLOWLIST: toolPolicy.clementineToolAllowlist,
       },
     },
-    ...(opts.extraMcpServers ?? {}),
+    ...baseMcpServers,
   };
 
   // Bridge an external AbortSignal to a real AbortController the SDK
@@ -420,20 +451,22 @@ export async function runAgent(prompt: string, opts: RunAgentOptions): Promise<R
     // callers can mix stdio + http + sse server shapes.
     mcpServers: mcpServers as unknown as Parameters<typeof query>[0]['options'] extends infer O
       ? O extends { mcpServers?: infer M } ? M : never : never,
-    allowedTools,
-    permissionMode: 'bypassPermissions' as const,
-    // SDK spec requires this companion flag whenever permissionMode is
-    // 'bypassPermissions'. Without it, autonomous runs can silently
-    // hang waiting for permission prompts.
-    allowDangerouslySkipPermissions: true,
-    cwd: BASE_DIR,
-    env: subprocessEnv,
+    tools: toolPolicy.builtinTools,
+    allowedTools: toolPolicy.allowedTools,
+    permissionMode: toolPolicy.permissionMode,
+    ...(toolPolicy.allowDangerouslySkipPermissions
+      ? { allowDangerouslySkipPermissions: toolPolicy.allowDangerouslySkipPermissions }
+      : {}),
+    cwd: opts.cwd ?? BASE_DIR,
+    env: { ...subprocessEnv, ...toolPolicy.env },
     effort,
     ...(maxBudgetUsd !== undefined ? { maxBudgetUsd } : {}),
     ...(opts.maxTurns ? { maxTurns: opts.maxTurns } : {}),
     ...(opts.model ? { model: opts.model } : {}),
     ...(opts.resumeSessionId ? { resume: opts.resumeSessionId } : {}),
     ...(sdkAbortController ? { abortController: sdkAbortController } : {}),
+    ...(opts.skills ? { skills: opts.skills } : {}),
+    ...(opts.enableFileCheckpointing ? { enableFileCheckpointing: true } : {}),
     // 1.18.121 — pipe additionalDirectories through to the SDK so agents
     // can Read / Bash inside pinned-skill folders, project-scoped skills,
     // and any cron's add_dirs scope without their cwd being set to those
@@ -455,6 +488,10 @@ export async function runAgent(prompt: string, opts: RunAgentOptions): Promise<R
     maxBudgetUsd: maxBudgetUsd ?? 'uncapped',
     agentCount: Object.keys(agents).length,
     allowedToolCount: allowedTools.length,
+    sdkAllowedToolCount: toolPolicy.allowedTools.length,
+    builtinToolCount: toolPolicy.builtinTools.length,
+    permissionMode: toolPolicy.permissionMode,
+    mcpServerCount: Object.keys(mcpServers).length,
   }, 'runAgent: starting query');
 
   // PRD §6 / 1.18.85: path A in-process tap. One Event row per significant
@@ -722,5 +759,9 @@ export async function runAgent(prompt: string, opts: RunAgentOptions): Promise<R
     subtype,
     ...(usage ? { usage } : {}),
     runId,
+    permissionMode: toolPolicy.permissionMode,
+    allowedToolsApplied: toolPolicy.allowedTools,
+    builtinToolsApplied: toolPolicy.builtinTools,
+    mcpServersApplied: Object.keys(mcpServers),
   };
 }

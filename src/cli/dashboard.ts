@@ -2597,8 +2597,9 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
       oauthQuery = sdkQuery({
         prompt: '',
         options: normalizeClaudeSdkOptionsForOneMillionContext({
-          permissionMode: 'bypassPermissions' as any,
-          allowDangerouslySkipPermissions: true,
+          permissionMode: 'dontAsk' as const,
+          tools: [],
+          allowedTools: [],
           maxTurns: 0,
         }),
       });
@@ -6068,7 +6069,7 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
           systemPrompt: 'You are a data enumerator. You call the given tool once, extract the items from its response, and emit a strict JSON array. No commentary.',
           allowedTools: [tool],
           mcpServers,
-          permissionMode: 'bypassPermissions' as const,
+          permissionMode: 'dontAsk' as const,
           settingSources: [],
         }),
       });
@@ -7045,7 +7046,7 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
             { name: 'update_agent', description: 'Update agent config', type: 'mcp' },
             { name: 'delete_agent', description: 'Delete an agent', type: 'mcp' },
             { name: 'add_cron_job', description: 'Add scheduled task', type: 'mcp' },
-            { name: 'cron_list', description: 'List scheduled tasks', type: 'mcp' },
+            { name: 'cron_list', description: 'List schedules', type: 'mcp' },
             { name: 'cron_progress_read', description: 'Read cron progress state', type: 'mcp' },
             { name: 'cron_progress_write', description: 'Write cron progress state', type: 'mcp' },
           ],
@@ -17716,8 +17717,8 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
       <div class="nav-item active" data-page="home" data-icon="home" title="Chat, today, activity">
         <span class="nav-icon"></span> Home
       </div>
-      <div class="nav-item" data-page="build" data-icon="workflow" title="Scheduled tasks Clementine runs for you">
-        <span class="nav-icon"></span> Tasks
+      <div class="nav-item" data-page="build" data-icon="workflow" title="Scheduled skills and recurring agent executions">
+        <span class="nav-icon"></span> Schedules
         <span class="nav-badge" id="nav-cron-count" style="display:none">0</span>
       </div>
       <!-- Skills-First redesign Phase A / 1.18.106: read-only catalog
@@ -17821,9 +17822,9 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
             <div class="gs-card" id="gs-step-task">
               <div class="gs-step-num">4</div>
               <div class="gs-card-icon">&#9200;</div>
-              <div class="gs-card-title">Schedule a Task</div>
-              <div class="gs-card-desc">Set up cron jobs so agents work on autopilot.</div>
-              <button class="btn btn-sm" onclick="navigateTo('build', { tab: 'crons' })">Add a Task</button>
+              <div class="gs-card-title">Schedule a Skill</div>
+              <div class="gs-card-desc">Run reusable skills on a cadence so agents work on autopilot.</div>
+              <button class="btn btn-sm" onclick="navigateTo('build', { tab: 'crons' })">Add a Schedule</button>
             </div>
             <div class="gs-card" id="gs-step-project">
               <div class="gs-step-num">5</div>
@@ -17928,15 +17929,15 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
       </div>
     </div>
 
-    <!-- ═══ Tasks Page — single unified surface ═══ -->
+    <!-- ═══ Schedules Page — single unified surface ═══ -->
     <div class="page" id="page-build">
-      <!-- PRD Phase 2: top-level tab strip within the Tasks domain.
-           Tasks (default) + Tools & MCP catalog. Workflows still reachable
+      <!-- PRD Phase 2: top-level tab strip within the Schedules domain.
+           Schedules (default) + Tools & MCP catalog. Workflows still reachable
            via deep-link ?tab=workflows for power users with existing
            multi-step workflows. -->
       <div id="build-tabs" style="display:flex;gap:4px;padding:8px 18px 0;background:var(--bg-secondary);border-bottom:1px solid var(--border);flex-shrink:0;align-items:flex-end">
         <button class="build-tab-btn active" data-build-tab="crons" onclick="switchBuildTab('crons')" style="padding:8px 14px;border-radius:6px 6px 0 0;border:none;background:transparent;color:var(--text-primary);font-size:13px;font-weight:500;cursor:pointer;border-bottom:2px solid transparent">
-          <span style="margin-right:6px">📅</span>Tasks <span id="build-tab-cron-count" style="display:none;margin-left:4px;font-size:10px;background:var(--bg-tertiary);padding:1px 6px;border-radius:999px;color:var(--text-muted)">0</span>
+          <span style="margin-right:6px">📅</span>Schedules <span id="build-tab-cron-count" style="display:none;margin-left:4px;font-size:10px;background:var(--bg-tertiary);padding:1px 6px;border-radius:999px;color:var(--text-muted)">0</span>
         </button>
         <button class="build-tab-btn" data-build-tab="runs" onclick="switchBuildTab('runs')" style="padding:8px 14px;border-radius:6px 6px 0 0;border:none;background:transparent;color:var(--text-secondary);font-size:13px;font-weight:500;cursor:pointer;border-bottom:2px solid transparent">
           <span style="margin-right:6px">🕒</span>Runs <span id="build-tab-runs-count" style="display:none;margin-left:4px;font-size:10px;background:var(--bg-tertiary);padding:1px 6px;border-radius:999px;color:var(--text-muted)">0</span>
@@ -17947,19 +17948,19 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
         <button class="build-tab-btn" data-build-tab="workflows" onclick="switchBuildTab('workflows')" style="display:none;padding:8px 14px;border-radius:6px 6px 0 0;border:none;background:transparent;color:var(--text-secondary);font-size:13px;font-weight:500;cursor:pointer;border-bottom:2px solid transparent">
           <span style="margin-right:6px">🔧</span>Workflows <span id="build-tab-workflows-count" style="display:none;margin-left:4px;font-size:10px;background:var(--bg-tertiary);padding:1px 6px;border-radius:999px;color:var(--text-muted)">0</span>
         </button>
-        <!-- Spacer + primary "create" CTA. The Tasks/Runs/Tools tabs are above; this sits flush with them on the right so creation is one click from anywhere on the Tasks domain. -->
+        <!-- Spacer + primary "create" CTA. The Schedules/Runs/Tools tabs are above; this sits flush with them on the right so creation is one click from anywhere on the Schedules domain. -->
         <div style="flex:1"></div>
         <button class="btn-primary" onclick="openCreateCronModal()" style="margin-bottom:6px;font-size:13px;padding:7px 14px;border-radius:6px;border:none;background:var(--accent);color:#fff;font-weight:500;cursor:pointer;display:inline-flex;align-items:center;gap:6px">
-          <span style="font-size:14px;line-height:1">+</span> New task
+          <span style="font-size:14px;line-height:1">+</span> New schedule
         </button>
       </div>
       <style>
         .build-tab-btn.active { color:var(--accent) !important; border-bottom-color:var(--accent) !important; background:var(--bg-primary) !important; }
         .build-tab-btn:hover:not(.active) { color:var(--text-primary); }
       </style>
-      <!-- Scheduled Tasks tab — populated by refreshCron() ─────────────────────── -->
+      <!-- Schedules tab — populated by refreshCron() ───────────────────────────── -->
       <div id="build-tab-crons" style="display:none;flex:1;min-height:0;overflow-y:auto;padding:18px;background:var(--bg-primary)">
-        <div id="panel-cron"><div class="empty-state" style="padding:24px;color:var(--text-muted)">Loading scheduled tasks…</div></div>
+        <div id="panel-cron"><div class="empty-state" style="padding:24px;color:var(--text-muted)">Loading schedules…</div></div>
       </div>
       <!-- ── PRD Phase 3: Run list ───────────────────────────────────────────
            Single table of every run across all tasks, with filters + saved
@@ -19015,7 +19016,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
          si-* status cards/proposals/history, teach-skill-form, panel-skills,
          pending-skills-card, panel-workflows, advisor-analytics-content.) -->
     <!-- (Session 5) page-automations parking removed. Self-Improve now lives in
-         Brain → Learning; Build (Workflows/Scheduled Tasks/Skills/Templates) is the home for
+         Brain → Learning; Build (Workflows/Schedules/Skills/Templates) is the home for
          everything else that was here. -->
 
     <!-- page-team-status merged into Team → Activity tab.
@@ -21106,7 +21107,7 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
           <div class="icon icon-slot" data-icon="brain"></div>
           <div class="title-block">
             <h1>Skills</h1>
-            <p class="desc">Reusable procedures. A <strong>skill</strong> is a recipe (Markdown body + tool allowlist + bundled docs). Tasks pin skills; chats can run them. One skill, many tasks.</p>
+            <p class="desc">Reusable procedures. A <strong>skill</strong> is a recipe (Markdown body + tool allowlist + bundled docs). Schedules run skills; chats can run them directly. One skill, many schedules.</p>
           </div>
         </div>
         <div style="display:flex;align-items:center;gap:8px;flex-shrink:0">
@@ -23122,7 +23123,7 @@ function switchBuildTab(tab) {
   }
 }
 
-// "New" button in the Build header strip — context-aware. Scheduled Tasks
+// "New" button in the Build header strip — context-aware. Schedules
 // open the dedicated cron modal so the entry lands in CRON.md (not as a one-step
 // workflow file). Workflows route through /api/builder/workflows. Owner is
 // read from the header's Owner picker — empty string means global.
@@ -23326,7 +23327,7 @@ function openCommandK() {
     { kw: 'home today plan',    page: 'home',     tab: 'today',        label: 'Home · Today' },
     { kw: 'home activity',      page: 'home',     tab: 'activity',     label: 'Home · Activity' },
     { kw: 'build workflows workflow builder', page: 'build', tab: 'workflows', label: 'Build · Workflow Builder' },
-    { kw: 'build crons scheduled tasks operations automation', page: 'build', tab: 'crons', label: 'Build · Operations' },
+    { kw: 'build crons schedules scheduled tasks operations automation', page: 'build', tab: 'crons', label: 'Build · Schedules' },
     { kw: 'build skills',       page: 'build',    tab: 'skills',       label: 'Build · Skills' },
     { kw: 'build templates',    page: 'build',    tab: 'templates',    label: 'Build · Templates' },
     { kw: 'team roster',        page: 'team',     tab: 'roster',       label: 'Team · Roster' },
@@ -23395,7 +23396,7 @@ async function refreshUnleashed() {
       else { badge.style.display = 'none'; }
     }
     if (tasks.length === 0) {
-      el.innerHTML = '<div class="empty-state" style="padding:24px">No unleashed tasks. Schedule a cron job in <a href="#" onclick="navigateTo(\\'automations\\');return false">Scheduled Tasks</a> with mode = "unleashed" to start one.</div>';
+      el.innerHTML = '<div class="empty-state" style="padding:24px">No unleashed tasks. Add a schedule in <a href="#" onclick="navigateTo(\\'build\\',{tab:\\'crons\\'});return false">Schedules</a> with mode = "unleashed" to start one.</div>';
       return;
     }
     var html = '<table style="width:100%;border-collapse:collapse;font-size:13px"><thead><tr style="border-bottom:1px solid var(--border);background:var(--bg-tertiary)">';
@@ -23685,7 +23686,7 @@ async function renderAgentDetail(slug) {
     // Tab bar
     html += '<div class="tab-bar" id="agent-detail-tabs">';
     var tabs = ['tasks', 'training', 'execution', 'settings'];
-    var tabLabels = { tasks: 'Tasks', training: 'Training', execution: 'Execution', settings: 'Settings' };
+    var tabLabels = { tasks: 'Schedules', training: 'Training', execution: 'Execution', settings: 'Settings' };
     tabs.forEach(function(t) {
       html += '<button class="' + (t === _agentDetailTab ? 'active' : '') + '" onclick="switchAgentDetailTab(\\x27' + t + '\\x27)">' + tabLabels[t] + '</button>';
     });
@@ -23702,7 +23703,7 @@ async function renderAgentDetail(slug) {
 function switchAgentDetailTab(tab) {
   _agentDetailTab = tab;
   var tabs = document.querySelectorAll('#agent-detail-tabs button');
-  tabs.forEach(function(t) { t.className = t.textContent.trim() === ({ tasks:'Tasks', training:'Training', execution:'Execution', settings:'Settings' })[tab] ? 'active' : ''; });
+  tabs.forEach(function(t) { t.className = t.textContent.trim() === ({ tasks:'Schedules', training:'Training', execution:'Execution', settings:'Settings' })[tab] ? 'active' : ''; });
   loadAgentDetailTab(tab, currentAgentSlug, !currentAgentSlug || currentAgentSlug === '');
 }
 
@@ -23723,10 +23724,10 @@ async function loadAgentDetailTab(tab, slug, isPrimary) {
         if (isPrimary) return !j.agent;
         return j.agent === slug;
       });
-      html += '<div class="card" style="margin-bottom:16px"><div class="card-header" style="display:flex;justify-content:space-between;align-items:center"><span>Scheduled Tasks (' + jobs.length + ')</span>';
-      html += '<button class="btn btn-sm btn-primary" onclick="openCreateCronModal(\\x27' + esc(isPrimary ? '' : slug) + '\\x27)" style="font-size:11px">+ Add Task</button></div><div class="card-body" style="padding:0">';
+      html += '<div class="card" style="margin-bottom:16px"><div class="card-header" style="display:flex;justify-content:space-between;align-items:center"><span>Schedules (' + jobs.length + ')</span>';
+      html += '<button class="btn btn-sm btn-primary" onclick="openCreateCronModal(\\x27' + esc(isPrimary ? '' : slug) + '\\x27)" style="font-size:11px">+ Add Schedule</button></div><div class="card-body" style="padding:0">';
       if (jobs.length === 0) {
-        html += '<div class="empty-state" style="padding:24px">No scheduled tasks</div>';
+        html += '<div class="empty-state" style="padding:24px">No schedules</div>';
       } else {
         html += '<table style="width:100%;border-collapse:collapse">';
         html += '<thead><tr style="border-bottom:1px solid var(--border)"><th style="padding:8px 12px;text-align:left;color:var(--text-muted);font-size:11px">Name</th><th style="padding:8px 12px;text-align:left;color:var(--text-muted);font-size:11px">Schedule</th><th style="padding:8px 12px;text-align:left;color:var(--text-muted);font-size:11px">Last Run</th><th style="padding:8px 12px;text-align:left;color:var(--text-muted);font-size:11px">Status</th><th style="padding:8px 12px;text-align:center;color:var(--text-muted);font-size:11px">Actions</th><th style="padding:8px 12px;text-align:center;color:var(--text-muted);font-size:11px">Enabled</th></tr></thead><tbody>';
@@ -25314,6 +25315,9 @@ function renderScheduledTaskCard(task) {
     if (Array.isArray(lr.mcpServersApplied) && lr.mcpServersApplied.length > 0) {
       ranWith.push(lr.mcpServersApplied.length + ' MCP');
     }
+    if (lr.permissionModeApplied) {
+      ranWith.push(String(lr.permissionModeApplied));
+    }
     if (ranWith.length > 0) {
       lastRunHtml += ' <span style="color:var(--text-muted);font-size:11px" title="Capabilities active for this run">· ran with: ' + esc(ranWith.join(', ')) + '</span>';
     }
@@ -25623,7 +25627,7 @@ function renderScheduledWorkflowCard(wf) {
 // button. Click anywhere on the row to open the full trace viewer.
 function renderRecentHistoryList(runs) {
   if (!runs || runs.length === 0) {
-    return '<div class="empty-state" style="padding:18px;color:var(--text-muted);font-size:13px">No runs yet. History appears here once your tasks start firing.</div>';
+    return '<div class="empty-state" style="padding:18px;color:var(--text-muted);font-size:13px">No runs yet. History appears here once schedules start firing.</div>';
   }
   var rowsHtml = '';
   for (var i = 0; i < runs.length; i++) {
@@ -27026,7 +27030,7 @@ async function toggleMcpServerEnabled(name, nextEnabled) {
 async function refreshCron() {
   try {
     // Fetch operations + cross-job recent runs in parallel for the three-zone
-    // Tasks layout: Running now (top) / Your tasks (middle) / Recent history.
+    // Schedules layout: Running now (top) / Your schedules (middle) / Recent history.
     var opsP = apiFetch('/api/build/operations?hours=168&limit=50').then(function(r) { return r.json().then(function(d){ return { r:r, d:d }; }); });
     var runsP = apiFetch('/api/cron/runs?limit=50').then(function(r) { return r.json().catch(function(){ return { ok:false, runs: [] }; }); }).catch(function() { return { ok:false, runs: [] }; });
     var both = await Promise.all([opsP, runsP]);
@@ -27131,13 +27135,13 @@ async function refreshCron() {
       if (visibleRunning.length > 10) html += '<div class="empty-state" style="padding:18px;color:var(--text-muted);font-size:13px">Showing 10 of ' + visibleRunning.length + ' active runs. Use the Owner filter to narrow this list.</div>';
     }
 
-    // ── Zone 2 — Your tasks (the main card grid; promoted above "Needs
+    // ── Zone 2 — Your schedules (the main card grid; promoted above "Needs
     //    attention" in 1.18.118 so the user sees their working tasks at
     //    fold instead of having to scroll past 1,000+ px of error cards).
     var filteredTasks = applyTrickFilter(visibleTasks, _trickFilter);
     var filterPillsHtml = renderTrickFilterRow(visibleTasks, _trickFilter);
     var taskCountLabel = (_trickFilter.kind ? filteredTasks.length + '/' + visibleTasks.length : visibleTasks.length) + ' task' + (visibleTasks.length === 1 ? '' : 's');
-    html += operationSectionHeader('Your tasks', 'Recurring jobs Clementine runs for you. Tap any card to edit; the toggle on each card pauses or resumes it.', 'badge-blue', taskCountLabel, visibleRunning.length > 0 ? '28px' : '0')
+    html += operationSectionHeader('Your schedules', 'Recurring skill and agent executions. Tap any card to edit; the toggle on each card pauses or resumes it.', 'badge-blue', taskCountLabel, visibleRunning.length > 0 ? '28px' : '0')
       + filterPillsHtml
       + '<div class="task-grid">';
     if (filteredTasks.length === 0) {
@@ -27162,7 +27166,7 @@ async function refreshCron() {
     }
 
     // ── Needs attention — collapsed by default in 1.18.118. Was the
-    //    second thing on the page; pushed "Your tasks" 1,000+ px below
+    //    second thing on the page; pushed "Your schedules" 1,000+ px below
     //    the fold. Still surfaced visibly via a yellow count chip in the
     //    summary so users know it's there. Click to expand for triage.
     if (visibleAttention.length > 0) {
@@ -27170,7 +27174,7 @@ async function refreshCron() {
         +     '<summary style="padding:12px 16px;cursor:pointer;display:flex;align-items:center;gap:10px;user-select:none">'
         +       '<span style="font-size:14px;font-weight:600;color:var(--text-primary)">Needs attention</span>'
         +       '<span class="badge badge-yellow">' + visibleAttention.length + ' review</span>'
-        +       '<span style="font-size:11px;color:var(--text-muted);margin-left:6px">Broken scheduled tasks and failed runtime work that can waste tokens or silently stop.</span>'
+        +       '<span style="font-size:11px;color:var(--text-muted);margin-left:6px">Broken schedules and failed runtime work that can waste tokens or silently stop.</span>'
         +     '</summary>'
         +     '<div style="padding:0 16px 16px"><div class="task-grid">' + visibleAttention.slice(0, 12).map(renderAttentionCard).join('') + '</div>';
       if (visibleAttention.length > 12) html += '<div class="empty-state" style="padding:18px;color:var(--text-muted);font-size:13px">Showing 12 of ' + visibleAttention.length + ' items. Use the Owner filter to narrow this list.</div>';
@@ -27515,7 +27519,7 @@ async function openTraceViewer(jobName) {
     traceData = d.traces || [];
 
     if (traceData.length === 0) {
-      document.getElementById('trace-content').innerHTML = '<div style="padding:24px;color:var(--text-muted);line-height:1.6"><div style="font-weight:500;color:var(--text-secondary);margin-bottom:8px">No traces recorded yet</div><div style="font-size:12px">Traces are captured per run and show every tool call the agent made.<br/>If a recent run errored before any tool was invoked, see the <strong>Recent history</strong> zone on the Tasks page for the error message.</div></div>';
+      document.getElementById('trace-content').innerHTML = '<div style="padding:24px;color:var(--text-muted);line-height:1.6"><div style="font-weight:500;color:var(--text-secondary);margin-bottom:8px">No traces recorded yet</div><div style="font-size:12px">Traces are captured per run and show every tool call the agent made.<br/>If a recent run errored before any tool was invoked, see the <strong>Recent history</strong> zone on the Schedules page for the error message.</div></div>';
       document.getElementById('trace-run-selector').innerHTML = '';
       return;
     }
@@ -27567,7 +27571,7 @@ function renderTrace(idx) {
       + '</div>';
   }
 
-  document.getElementById('trace-content').innerHTML = html || '<div style="padding:24px;color:var(--text-muted);line-height:1.6"><div style="font-weight:500;color:var(--text-secondary);margin-bottom:8px">This run produced no tool calls</div><div style="font-size:12px">The run started but didn\\x27t reach any tool — it likely errored before the agent acted, or was a no-op response.<br/>Check <strong>Recent history</strong> on the Tasks page for the error message or output preview from this run.</div></div>';
+  document.getElementById('trace-content').innerHTML = html || '<div style="padding:24px;color:var(--text-muted);line-height:1.6"><div style="font-weight:500;color:var(--text-secondary);margin-bottom:8px">This run produced no tool calls</div><div style="font-size:12px">The run started but didn\\x27t reach any tool — it likely errored before the agent acted, or was a no-op response.<br/>Check <strong>Recent history</strong> on the Schedules page for the error message or output preview from this run.</div></div>';
 }
 
 // ── Inline Trace (Execution tab) ──
@@ -27885,11 +27889,11 @@ async function refreshProjects(preloaded) {
         ? '<div style="color:var(--accent);margin-bottom:4px;font-size:12px">' + esc(p.userDescription) + '</div>'
         : '';
       const idx = projectsData.indexOf(p);
-      // 1.18.128 — "+ New task in this project" CTA: opens the cron creation
+      // 1.18.128 — "+ New schedule in this project" CTA: opens the cron creation
       // modal with the project pre-selected as Project Context. Closes the
       // mental gap between "I have a project with built-up context" and
       // "I need to schedule a task that uses it."
-      const newTaskBtn = '<button class="btn btn-sm" style="font-size:11px" onclick="openCronModalForProject(' + idx + ')" title="Create a scheduled task that runs inside this project">+ New task</button>';
+      const newTaskBtn = '<button class="btn btn-sm" style="font-size:11px" onclick="openCronModalForProject(' + idx + ')" title="Create a schedule that runs inside this project">+ New schedule</button>';
       const linkBtn = p.linked
         ? newTaskBtn + ' <button class="btn btn-sm" style="font-size:11px" onclick="openProjectEditorByIdx(' + idx + ')">Edit</button> <button class="btn btn-sm btn-danger" style="font-size:11px" onclick="unlinkProjectByIdx(' + idx + ')">Unlink</button>'
         : newTaskBtn + ' <button class="btn btn-sm btn-primary" style="font-size:11px" onclick="openProjectEditorByIdx(' + idx + ')">Link</button>';
@@ -31109,6 +31113,12 @@ function renderCronRunDetails(lr) {
   if (Array.isArray(lr.mcpServersApplied) && lr.mcpServersApplied.length) {
     html += '<div style="font-size:11px;color:var(--text-muted);margin-bottom:6px">MCP servers: ' + esc(lr.mcpServersApplied.join(', ')) + '</div>';
   }
+  if (lr.permissionModeApplied) {
+    html += '<div style="font-size:11px;color:var(--text-muted);margin-bottom:6px">Permission mode: ' + esc(String(lr.permissionModeApplied)) + '</div>';
+  }
+  if (Array.isArray(lr.allowedToolsApplied) && lr.allowedToolsApplied.length) {
+    html += '<div style="font-size:11px;color:var(--text-muted);margin-bottom:6px">Allowed tools: ' + esc(String(lr.allowedToolsApplied.length)) + '</div>';
+  }
   html += '<div style="margin-top:14px;display:flex;gap:8px"><button class="btn-sm" onclick="openRunOrTrace(\\x27' + jsStr(lr.jobName || editingCronJob || '') + '\\x27,' + (lr.id ? '\\x27' + jsStr(lr.id) + '\\x27' : 'null') + ')" style="font-size:11px">' + (lr.id ? 'Open run' : 'Open trace') + '</button></div>';
   html += '</div>';
   return html;
@@ -34176,7 +34186,7 @@ function updateBuilderMode() {
     if (dryrunBtn) dryrunBtn.style.display = '';
     if (testBtn) testBtn.style.display = '';
     if (realRunBtn) realRunBtn.style.display = type === 'workflow' ? '' : 'none';
-    if (paneTitle) paneTitle.textContent = (type === 'cron' ? 'Scheduled Tasks' : 'Workflow Builder');
+    if (paneTitle) paneTitle.textContent = (type === 'cron' ? 'Schedules' : 'Workflow Builder');
     refreshBuilderCanvasPicker(type);
   } else {
     if (preview) preview.style.display = '';
@@ -37768,7 +37778,7 @@ async function refreshHomeDigest() {
     if (runsBody) {
       var runs = d.todayRuns || [];
       if (!runs.length) {
-        runsBody.innerHTML = '<div style="padding:14px 18px;color:var(--text-muted);font-size:var(--text-sm)">No scheduled runs configured. <a href="#" onclick="navigateTo(\\x27build\\x27,{tab:\\x27crons\\x27});return false" style="color:var(--clementine)">Add one in Build &rarr; Scheduled Tasks</a>.</div>';
+        runsBody.innerHTML = '<div style="padding:14px 18px;color:var(--text-muted);font-size:var(--text-sm)">No scheduled runs configured. <a href="#" onclick="navigateTo(\\x27build\\x27,{tab:\\x27crons\\x27});return false" style="color:var(--clementine)">Add one in Build &rarr; Schedules</a>.</div>';
       } else {
         var html2 = '';
         for (var n = 0; n < runs.length; n++) {

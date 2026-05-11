@@ -574,8 +574,8 @@ export interface CronJobDefinition {
   prompt: string;
   enabled: boolean;
   tier: number;
-  /** Human-readable description of what this task does (one paragraph, ~200
-   *  chars). Surfaces on the task card as the preview line — replaces the
+  /** Human-readable description of what this schedule does (one paragraph, ~200
+   *  chars). Surfaces on the schedule card as the preview line — replaces the
    *  "first sentence of prompt" fallback when present. Auto-populated by
    *  the cron-migrator from the matching skill's description. Optional. */
   description?: string;
@@ -583,7 +583,7 @@ export interface CronJobDefinition {
   model?: string;
   workDir?: string;
   /** Display/intent hint — 'unleashed' jobs are typically long autonomous
-   *  tasks. The canonical SDK path runs every job through runAgentCron
+   *  executions. The canonical SDK path runs every job through runAgentCron
    *  identically; this field affects only UI badges + budget heuristics. */
   mode?: 'standard' | 'unleashed';
   /** Wall-clock cap in hours. Defaults to 1h. Triggers an AbortSignal
@@ -596,12 +596,12 @@ export interface CronJobDefinition {
    *  per PRD Phase 1. successCriteria is kept readable for one release; on read,
    *  parseCronJobs coalesces it into successCriteriaText. */
   successCriteria?: string[];
-  /** PRD Phase 1: free-text "this task is done when…". An evaluator sub-agent reads
+  /** PRD Phase 1: free-text "this schedule is done when…". An evaluator sub-agent reads
    *  the run's final state and the criterion and emits a pass/fail with reasoning.
    *  Stored as RunEvaluation on the Run. Optional but recommended. */
   successCriteriaText?: string;
   /** PRD Phase 1: JSON Schema validated against ResultMessage.structured_output.
-   *  If it parses, the run is mechanically successful. The Task editor shows a
+   *  If it parses, the run is mechanically successful. The schedule editor shows a
    *  non-blocking "Goal not set" warning when neither this nor successCriteriaText
    *  is present. */
   successSchema?: Record<string, unknown>;
@@ -826,6 +826,8 @@ export interface CronRunEntry {
   allowedToolsApplied?: string[];
   /** MCP servers live for this run (post profile + trick allowlist intersection). */
   mcpServersApplied?: string[];
+  /** SDK permission mode used for the run, usually dontAsk for headless execution. */
+  permissionModeApplied?: string;
   /** PRD §6 / 1.18.84: how this run was triggered. Persisted by the
    *  scheduler (cron tick / chained 'after' / manual-run endpoint /
    *  Discord) so the Run list can filter by source instead of guessing

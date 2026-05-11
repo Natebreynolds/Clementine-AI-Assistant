@@ -8,6 +8,22 @@ import { classifyIntent } from '../src/agent/intent-classifier.js';
 import { decideTurnPolicy } from '../src/agent/turn-policy.js';
 
 describe('action enforcer', () => {
+  it('recognizes long-form create/scrape requests as action expected', () => {
+    const expectation = detectActionExpectation(
+      'I would like for you to start a scrape of 20 top PI firms and add it to a new Google Sheet',
+    );
+
+    expect(expectation).toMatchObject({
+      expected: true,
+      source: 'user_request',
+    });
+  });
+
+  it('recognizes "can we" execution requests without requiring "can you"', () => {
+    const expectation = detectActionExpectation('Can we fire them off now as a test please');
+    expect(expectation.expected).toBe(true);
+  });
+
   it('promotes approval follow-ups into tool-enabled action turns', () => {
     const prompt = buildApprovalFollowupPrompt('Perfect');
     const policy = decideTurnPolicy({

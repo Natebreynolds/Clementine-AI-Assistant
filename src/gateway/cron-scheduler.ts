@@ -1441,6 +1441,7 @@ export class CronScheduler {
             ...(cronMetadata?.skillsMissing?.length ? { skillsMissing: cronMetadata.skillsMissing } : {}),
             ...(cronMetadata?.allowedToolsApplied?.length ? { allowedToolsApplied: cronMetadata.allowedToolsApplied } : {}),
             ...(cronMetadata?.mcpServersApplied?.length ? { mcpServersApplied: cronMetadata.mcpServersApplied } : {}),
+            ...(cronMetadata?.permissionModeApplied ? { permissionModeApplied: cronMetadata.permissionModeApplied } : {}),
           };
 
           if (response && !CronScheduler.isCronNoise(response)) {
@@ -1546,6 +1547,7 @@ export class CronScheduler {
             ...(errCronMetadata?.skillsMissing?.length ? { skillsMissing: errCronMetadata.skillsMissing } : {}),
             ...(errCronMetadata?.allowedToolsApplied?.length ? { allowedToolsApplied: errCronMetadata.allowedToolsApplied } : {}),
             ...(errCronMetadata?.mcpServersApplied?.length ? { mcpServersApplied: errCronMetadata.mcpServersApplied } : {}),
+            ...(errCronMetadata?.permissionModeApplied ? { permissionModeApplied: errCronMetadata.permissionModeApplied } : {}),
             advisorApplied,
           };
           // Lazy-import the classifier so it doesn't load on success paths.

@@ -103,8 +103,9 @@ async function ocrPdfViaClaude(filePath: string): Promise<string[]> {
         maxTurns: 4, // Read tool call + response (a few turns of thinking is fine)
         systemPrompt: 'You are a faithful OCR transcriber. Copy text exactly as written. When the PDF has images or scans, read the text from them using vision. Never invent content.',
         // Claude Code's built-in Read tool handles PDFs (text + vision)
+        tools: ['Read'],
         allowedTools: ['Read'],
-        permissionMode: 'bypassPermissions' as const,
+        permissionMode: 'dontAsk' as const,
         settingSources: [],
       }),
     });

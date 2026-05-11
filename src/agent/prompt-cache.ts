@@ -30,6 +30,10 @@ export class PromptCache {
     if (!existsSync(filePath)) return;
     try {
       const w = watch(filePath, () => { this.cache.delete(filePath); });
+      w.on('error', () => {
+        try { w.close(); } catch { /* ignore */ }
+        this.watchers.delete(filePath);
+      });
       w.unref(); // Don't keep daemon alive
       this.watchers.set(filePath, w);
     } catch {

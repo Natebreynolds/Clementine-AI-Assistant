@@ -101,6 +101,11 @@ export class AgentHeartbeatManager {
         // listAllGoals once and wake the affected owners.
         this.handleGoalTriggerEvent(filename);
       });
+      this.goalTriggerWatcher.on('error', (err) => {
+        logger.warn({ err, triggerDir }, 'Goal-trigger watcher failed — falling back to polling');
+        try { this.goalTriggerWatcher?.close(); } catch { /* ignore */ }
+        this.goalTriggerWatcher = null;
+      });
     } catch (err) {
       logger.warn({ err, triggerDir }, 'Failed to watch goal-triggers — falling back to polling');
     }
@@ -121,6 +126,11 @@ export class AgentHeartbeatManager {
         }
         this.scheduleWake(slug, 'wake-sentinel');
       });
+      this.wakeDirWatcher.on('error', (err) => {
+        logger.warn({ err, wakeDir }, 'Wake-sentinel watcher failed — wake_agent tool will be slower');
+        try { this.wakeDirWatcher?.close(); } catch { /* ignore */ }
+        this.wakeDirWatcher = null;
+      });
     } catch (err) {
       logger.warn({ err, wakeDir }, 'Failed to watch wake-sentinels — wake_agent tool will be slower');
     }
@@ -136,6 +146,11 @@ export class AgentHeartbeatManager {
         if (!filename || !filename.endsWith('.json')) return;
         // Both 'rename' (create/delete) and 'change' can indicate new work
         this.scheduleWake(slug, `task-${eventType}:${filename}`);
+      });
+      watcher.on('error', (err) => {
+        logger.debug({ err, slug, tasksDir }, 'Agent tasks watcher failed — will rely on polling');
+        try { watcher.close(); } catch { /* ignore */ }
+        this.perAgentWatchers.delete(slug);
       });
       this.perAgentWatchers.set(slug, watcher);
     } catch (err) {

@@ -12,7 +12,7 @@
  * fs.watch on the user dir triggers hot reload (debounced, atomic swap).
  */
 
-import { existsSync, mkdirSync, readFileSync, readdirSync, watch as fsWatch, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, watch as fsWatch, writeFileSync, type FSWatcher } from 'node:fs';
 import path from 'node:path';
 import pino from 'pino';
 import yaml from 'js-yaml';
@@ -101,6 +101,7 @@ const ruleSchema = z.object({
 
 let cachedRules: AdvisorRule[] = [];
 let watcherInstalled = false;
+let watcher: FSWatcher | null = null;
 let watchDebounce: NodeJS.Timeout | null = null;
 
 function readYamlFile(filePath: string): unknown | null {
@@ -193,7 +194,7 @@ export function watchUserRulesDir(opts?: LoaderOptions): void {
     mkdirSync(userDir, { recursive: true });
   }
   try {
-    fsWatch(userDir, () => {
+    watcher = fsWatch(userDir, () => {
       if (watchDebounce) clearTimeout(watchDebounce);
       watchDebounce = setTimeout(() => {
         try {
@@ -203,6 +204,13 @@ export function watchUserRulesDir(opts?: LoaderOptions): void {
         }
       }, 250);
     });
+    watcher.on('error', (err) => {
+      logger.warn({ err, userDir }, 'Rule watcher failed — hot reload disabled');
+      try { watcher?.close(); } catch { /* ignore */ }
+      watcher = null;
+      watcherInstalled = false;
+    });
+    watcher.unref();
     watcherInstalled = true;
     logger.debug({ dir: userDir }, 'Watching user rules dir for hot reload');
   } catch (err) {
@@ -214,6 +222,10 @@ export function watchUserRulesDir(opts?: LoaderOptions): void {
 export function _resetLoaderState(): void {
   cachedRules = [];
   watcherInstalled = false;
+  if (watcher) {
+    try { watcher.close(); } catch { /* ignore */ }
+    watcher = null;
+  }
   if (watchDebounce) {
     clearTimeout(watchDebounce);
     watchDebounce = null;

@@ -9,11 +9,10 @@
  * not enforced — a skill that says "I only use Bash + WebFetch" can still
  * call any tool the surrounding cron allows.
  *
- * `runSkill(name, options)` is the alternative path: a sub-call where the
- * skill's `tools.allow` is a HARD allowlist (only those tools, plus a
- * minimal core set), `{{var}}` placeholders in the body are substituted
- * from `options.inputs`, and `clementine.success.schema` is ajv-validated
- * post-run.
+ * `runSkill(name, options)` is the alternative path: a sub-call where
+ * `{{var}}` placeholders in the body are substituted from `options.inputs`,
+ * optional `tools.allow` / `tools.deny` becomes an SDK allowlist, and
+ * `clementine.success.schema` is ajv-validated post-run.
  *
  * Why a separate primitive (and not a flag on the existing widening path):
  * - Caller intent is different. Pinned-skills-as-context is "give the LLM
@@ -32,7 +31,9 @@ import pino from 'pino';
 import { getSkill } from './skill-store.js';
 import { runAgent } from './run-agent.js';
 import type { RunAgentOptions } from './run-agent.js';
-import type { Skill } from '../types.js';
+import type { AgentProfile, Skill } from '../types.js';
+import type { AgentManager } from './agent-manager.js';
+import type { MemoryStore } from '../memory/store.js';
 
 const logger = pino({ name: 'clementine.run-skill' });
 
@@ -59,6 +60,12 @@ export interface RunSkillOptions {
    *  `projectWorkDir` parameter — when set, project-scoped skills shadow
    *  global ones with the same name). */
   projectWorkDir?: string;
+  /** Optional hired-agent profile used as the main agent for this skill run. */
+  profile?: AgentProfile | null;
+  /** Hired-agent registry for SDK subagent definitions. */
+  agentManager?: AgentManager | null;
+  /** Memory store for transcript mirroring, cost logging, and run observability. */
+  memoryStore?: MemoryStore | null;
   /** Skip success.schema validation even if the skill declares one. */
   skipValidation?: boolean;
   /** Streaming callback for partial assistant text. */
@@ -88,8 +95,16 @@ export interface RunSkillResult {
     /** First few ajv error messages. */
     errors: string[];
   };
-  /** The hard allowlist that was passed to the SDK. */
+  /** Computed skill tools. Passed to the SDK only when the skill declares tool scope. */
   effectiveTools?: string[];
+  /** Effective SDK allowedTools after defaults/MCP mapping were applied. */
+  allowedToolsApplied?: string[];
+  /** Effective SDK built-in tools after policy mapping. */
+  builtinToolsApplied?: string[];
+  /** MCP servers mounted for the run. */
+  mcpServersApplied?: string[];
+  /** SDK permission mode used for this skill execution. */
+  permissionMode?: string;
   /** Failure reason when ok=false. */
   error?: string;
 }
@@ -135,7 +150,7 @@ const SKILL_BASELINE_TOOLS = ['Agent', 'Read', 'Glob', 'Grep'] as const;
 const MCP_TOOL_REF = /mcp__([A-Za-z0-9-]+(?:_[A-Za-z0-9-]+)*)__[A-Za-z0-9_-]+/g;
 
 /**
- * Compute the HARD allowlist for a skill call.
+ * Compute the explicit allowlist for a scoped skill call.
  *
  * Combines, in order:
  *   1. The skill's `clementine.tools.allow` list (or [] if absent)
@@ -144,9 +159,9 @@ const MCP_TOOL_REF = /mcp__([A-Za-z0-9-]+(?:_[A-Za-z0-9-]+)*)__[A-Za-z0-9_-]+/g;
  *
  * Then subtracts anything in `clementine.tools.deny` (deny wins).
  *
- * Returns a deduped array. Empty input = empty output (which the SDK
- * treats as "deny everything"); callers are expected to set a sensible
- * `tools.allow` on the skill.
+ * Returns a deduped array. The runner only passes it to the SDK when the
+ * skill actually declared tool scope or referenced exact MCP tool names;
+ * unscoped skills inherit the surrounding runAgent defaults.
  */
 export function computeSkillAllowlist(skill: Skill): string[] {
   const tools = skill.frontmatter?.clementine?.tools;
@@ -171,6 +186,16 @@ export function computeSkillAllowlist(skill: Skill): string[] {
   for (const d of denied) merged.delete(d);
 
   return [...merged];
+}
+
+function skillHasExplicitToolScope(skill: Skill): boolean {
+  const tools = skill.frontmatter?.clementine?.tools;
+  const hasAllow = Array.isArray(tools?.allow) && tools.allow.length > 0;
+  const hasDeny = Array.isArray(tools?.deny) && tools.deny.length > 0;
+  MCP_TOOL_REF.lastIndex = 0;
+  const hasMcpRef = MCP_TOOL_REF.test(skill.body);
+  MCP_TOOL_REF.lastIndex = 0;
+  return hasAllow || hasDeny || hasMcpRef;
 }
 
 // ── Prompt builder ────────────────────────────────────────────────────
@@ -286,6 +311,7 @@ export async function runSkill(
   }
 
   const effectiveTools = computeSkillAllowlist(skill);
+  const hasExplicitToolScope = skillHasExplicitToolScope(skill);
   const prompt = buildSkillPrompt(skill, options.inputs, options.context);
 
   const limits = skill.frontmatter?.clementine?.limits;
@@ -298,8 +324,13 @@ export async function runSkill(
   // Surface the skill folder to the SDK via additionalDirectories so
   // bundled scripts (skill/scripts/*.py) are reachable for `Bash` calls.
   // Folder-form skills only — flat skills have no siblings worth surfacing.
-  const additionalDirectories =
-    skill.layout === 'folder' ? [path.dirname(skill.filePath)] : undefined;
+  const additionalDirectories = [
+    ...(skill.layout === 'folder' ? [path.dirname(skill.filePath)] : []),
+  ];
+
+  const mutatingSkill = effectiveTools.some((t) =>
+    t === 'Write' || t === 'Edit' || t === 'Bash' || /__(write|edit|update|create|delete|send|post|patch|set)/i.test(t),
+  );
 
   logger.info({
     skill: name,
@@ -312,14 +343,31 @@ export async function runSkill(
 
   let runResult;
   try {
+    const { buildExtraMcpForRunAgent } = await import('./run-agent-mcp.js');
+    const mcp = await buildExtraMcpForRunAgent({
+      scopeText: [
+        skill.frontmatter.name,
+        skill.frontmatter.description,
+        skill.body,
+        effectiveTools.join('\n'),
+      ].filter(Boolean).join('\n\n'),
+      profile: options.profile,
+    });
+    const allowedToolsForRun = hasExplicitToolScope ? effectiveTools : undefined;
     const sdkOpts: RunAgentOptions = {
       sessionKey,
       source: options.source ?? 'skill',
-      allowedTools: effectiveTools,
+      ...(allowedToolsForRun ? { allowedTools: allowedToolsForRun } : {}),
+      profile: options.profile,
+      agentManager: options.agentManager,
+      memoryStore: options.memoryStore,
+      cwd: options.projectWorkDir,
+      extraMcpServers: mcp.servers as unknown as RunAgentOptions['extraMcpServers'],
+      enableFileCheckpointing: mutatingSkill || Boolean(options.projectWorkDir),
       ...(options.model ? { model: options.model } : {}),
       ...(typeof maxTurns === 'number' ? { maxTurns } : {}),
       ...(typeof maxBudgetUsd === 'number' ? { maxBudgetUsd } : {}),
-      ...(additionalDirectories ? { additionalDirectories } : {}),
+      ...(additionalDirectories.length > 0 ? { additionalDirectories } : {}),
       ...(options.onText ? { onText: options.onText } : {}),
       ...(options.abortSignal ? { abortSignal: options.abortSignal } : {}),
     };
@@ -352,6 +400,10 @@ export async function runSkill(
     sessionId: runResult.sessionId,
     runId: runResult.runId,
     effectiveTools,
+    allowedToolsApplied: runResult.allowedToolsApplied,
+    builtinToolsApplied: runResult.builtinToolsApplied,
+    mcpServersApplied: runResult.mcpServersApplied,
+    permissionMode: runResult.permissionMode,
     ...(validation ? { validation } : {}),
   };
 }

@@ -56,6 +56,7 @@ const FALLBACK_TICK_MS = 60 * 60 * 1000;
 
 /** Coalesce a burst of fs.watch events into a single tick. */
 const WATCH_DEBOUNCE_MS = 2000;
+const WATCH_FAILURE_FALLBACK_MS = 1000;
 const TRIGGERS_DIR = path.join(BASE_DIR, 'self-improve', 'triggers');
 const PENDING_CHANGES_DIR = path.join(BASE_DIR, 'self-improve', 'pending-changes');
 const CRON_PATH = path.join(SYSTEM_DIR, 'CRON.md');
@@ -420,20 +421,34 @@ export class FailureFixConsumer {
           if (eventType !== 'rename' || !filename || !filename.endsWith('.json')) return;
           this.scheduleDebouncedTick();
         });
+        this.watcher.on('error', (err) => {
+          logger.warn({ err, dir: this.triggersDir }, 'Triggers dir watcher failed — falling back to polling');
+          try { this.watcher?.close(); } catch { /* ignore */ }
+          this.watcher = null;
+          this.startFallbackTimer(Math.min(this.tickMs, WATCH_FAILURE_FALLBACK_MS));
+          this.scheduleDebouncedTick();
+        });
       } catch (err) {
         logger.warn({ err, dir: this.triggersDir }, 'Failed to watch triggers dir — falling back to polling only');
+        this.startFallbackTimer(Math.min(this.tickMs, WATCH_FAILURE_FALLBACK_MS));
       }
     }
 
     // Slow fallback safety net — covers fs.watch event drops + boot-with-backlog.
-    this.timer = setInterval(() => {
-      this.tick().catch((err) => logger.error({ err }, 'Self-improve fallback tick failed'));
-    }, this.tickMs);
+    if (!this.timer) this.startFallbackTimer(this.tickMs);
 
     logger.info(
       { fallbackTickMs: this.tickMs, watchEnabled: this.watchEnabled && this.watcher !== null },
       'Self-improve loop started',
     );
+  }
+
+  private startFallbackTimer(intervalMs: number): void {
+    if (!this.running || !Number.isFinite(intervalMs) || intervalMs <= 0) return;
+    if (this.timer) clearInterval(this.timer);
+    this.timer = setInterval(() => {
+      this.tick().catch((err) => logger.error({ err }, 'Self-improve fallback tick failed'));
+    }, intervalMs);
   }
 
   stop(): void {

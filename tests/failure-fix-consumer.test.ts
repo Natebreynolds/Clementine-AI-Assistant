@@ -5,6 +5,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import matter from 'gray-matter';
 import { FailureFixConsumer, classifyFailure } from '../src/agent/failure-fix-consumer.js';
 
+const ORIGINAL_CLEMENTINE_HOME = process.env.CLEMENTINE_HOME;
+
 describe('classifyFailure', () => {
   it('recognizes max-turns as safe-cron-config', () => {
     const r = classifyFailure(['Reached maximum number of turns (8)']);
@@ -71,6 +73,7 @@ describe('FailureFixConsumer.tick — end-to-end', () => {
 
   beforeEach(() => {
     baseDir = mkdtempSync(path.join(tmpdir(), 'clementine-sil-'));
+    process.env.CLEMENTINE_HOME = baseDir;
     triggersDir = path.join(baseDir, 'triggers');
     pendingDir = path.join(baseDir, 'pending');
     cronPath = path.join(baseDir, 'CRON.md');
@@ -78,6 +81,11 @@ describe('FailureFixConsumer.tick — end-to-end', () => {
   });
 
   afterEach(() => {
+    if (ORIGINAL_CLEMENTINE_HOME === undefined) {
+      delete process.env.CLEMENTINE_HOME;
+    } else {
+      process.env.CLEMENTINE_HOME = ORIGINAL_CLEMENTINE_HOME;
+    }
     rmSync(baseDir, { recursive: true, force: true });
   });
 

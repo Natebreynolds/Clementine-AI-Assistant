@@ -55,6 +55,7 @@ import { getToolsetPreset, type ToolsetName } from '../agent/toolsets.js';
 import { isLiveUnleashedStatus } from './unleashed-status.js';
 import { buildActiveContextSnapshot } from './active-context.js';
 import { markContextEventBySource } from './context-events.js';
+import { EventLog } from './event-log.js';
 
 export { isLiveUnleashedStatus } from './unleashed-status.js';
 
@@ -83,12 +84,43 @@ type TranscriptSearchRow = {
 
 type RecallMode = 'semantic' | 'lexical' | 'both';
 
+type LedgerRunMetadata = {
+  runId?: string;
+  permissionModeApplied?: string;
+  allowedToolsApplied?: string[];
+  builtinToolsApplied?: string[];
+  mcpServersApplied?: string[];
+};
+
 type FusedRecallRow = {
   row: TranscriptSearchRow;
   mode: RecallMode;
   fusedScore: number;
   topScore: number;
 };
+
+function collectRunToolNames(runId: string | undefined): string[] {
+  if (!runId) return [];
+  try {
+    return new EventLog()
+      .readByRun(runId)
+      .filter((event) => event.kind === 'tool_call' && typeof event.toolName === 'string' && event.toolName)
+      .map((event) => event.toolName as string);
+  } catch {
+    return [];
+  }
+}
+
+function compactToolNames(names: string[]): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const name of names) {
+    if (!name || seen.has(name)) continue;
+    seen.add(name);
+    out.push(name);
+  }
+  return out;
+}
 
 export type ChatErrorKind = 'rate_limit' | 'one_million_context' | 'context_overflow' | 'auth' | 'billing' | 'transient' | 'unknown';
 
@@ -173,6 +205,7 @@ export class Gateway {
     skillsMissing: string[];
     allowedToolsApplied?: string[];
     mcpServersApplied: string[];
+    permissionModeApplied?: string;
     /** PRD §6 / 1.18.85: stable run UUID from runAgent — pinned onto the
      *  CronRunEntry so the Run detail page can join run row → events. */
     runId?: string;
@@ -1410,6 +1443,7 @@ export class Gateway {
       approvalFollowup: approvalFollowupForLedger,
     });
     const ledgerToolNames: string[] = [];
+    const ledgerRunMetadata: LedgerRunMetadata = {};
     const ledgerOnToolActivity: OnToolActivityCallback = async (toolName, toolInput) => {
       ledgerToolNames.push(toolName);
       if (onToolActivity) await onToolActivity(toolName, toolInput);
@@ -1446,7 +1480,7 @@ export class Gateway {
           text_len: text.length,
         });
         try {
-          const result = await this._handleMessageInner(sessionKey, text, onText, model, maxTurns, ledgerOnToolActivity, onProgress);
+          const result = await this._handleMessageInner(sessionKey, text, onText, model, maxTurns, ledgerOnToolActivity, onProgress, ledgerRunMetadata);
           resultForLedger = result;
           logAuditJsonl({
             event_type: 'message_completed',
@@ -1465,6 +1499,10 @@ export class Gateway {
           throw err;
         } finally {
           try {
+            const eventToolNames = collectRunToolNames(ledgerRunMetadata.runId);
+            const effectiveToolNames = eventToolNames.length > 0
+              ? compactToolNames([...ledgerToolNames, ...eventToolNames])
+              : compactToolNames(ledgerToolNames);
             appendTurnLedger({
               id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
               createdAt: new Date().toISOString(),
@@ -1486,8 +1524,13 @@ export class Gateway {
               actionExpected: actionExpectationForLedger.expected,
               actionExpectationSource: actionExpectationForLedger.source,
               actionExpectationReason: actionExpectationForLedger.reason,
-              toolCallsMade: ledgerToolNames.length,
-              toolNames: ledgerToolNames.slice(0, 30),
+              runId: ledgerRunMetadata.runId,
+              permissionModeApplied: ledgerRunMetadata.permissionModeApplied,
+              allowedToolsApplied: ledgerRunMetadata.allowedToolsApplied?.slice(0, 80),
+              builtinToolsApplied: ledgerRunMetadata.builtinToolsApplied?.slice(0, 40),
+              mcpServersApplied: ledgerRunMetadata.mcpServersApplied?.slice(0, 40),
+              toolCallsMade: Math.max(ledgerToolNames.length, eventToolNames.length),
+              toolNames: effectiveToolNames.slice(0, 30),
               responsePreview: resultForLedger?.slice(0, 500),
               responseChars: resultForLedger?.length,
               deliveryStatus: errorForLedger ? 'failed' : 'returned',
@@ -1510,6 +1553,7 @@ export class Gateway {
     maxTurns?: number,
     onToolActivity?: OnToolActivityCallback,
     onProgress?: OnProgressCallback,
+    ledgerRunMetadata?: LedgerRunMetadata,
   ): Promise<string> {
     const originalText = text;
     // Per-segment latency capture — emitted as a single 'chat:latency' line
@@ -2107,6 +2151,14 @@ export class Gateway {
             abortSignal: chatAc.signal,
           });
 
+          if (ledgerRunMetadata) {
+            ledgerRunMetadata.runId = runAgentResult.runId;
+            ledgerRunMetadata.permissionModeApplied = runAgentResult.permissionMode;
+            ledgerRunMetadata.allowedToolsApplied = runAgentResult.allowedToolsApplied;
+            ledgerRunMetadata.builtinToolsApplied = runAgentResult.builtinToolsApplied;
+            ledgerRunMetadata.mcpServersApplied = runAgentResult.mcpServersApplied;
+          }
+
           // Persist the SDK session ID so the next turn resumes the
           // same conversation. Survives daemon restarts via SESSIONS_FILE.
           if (runAgentResult.sessionId) {
@@ -2289,10 +2341,76 @@ export class Gateway {
       logger.info(`Running cron job: ${jobName}${workDir ? ` in ${workDir}` : ''}${agentSlug && agentSlug !== 'clementine' ? ` as ${agentSlug}` : ''}`);
       const cronStart = Date.now();
       try {
-        const { runAgentCron } = await import('../agent/run-agent-cron.js');
         const profile = agentSlug && agentSlug !== 'clementine'
           ? this.getAgentManager().get(agentSlug) ?? null
           : null;
+
+        const scheduledSkillName = jobPrompt.trim() === ''
+          && pinnedSkills?.length === 1
+          && predictable === true
+          ? pinnedSkills[0]
+          : null;
+
+        if (scheduledSkillName) {
+          const { runSkill } = await import('../agent/run-skill.js');
+          logger.info({ jobName, skill: scheduledSkillName, agentSlug, tier, wallMs, path: 'run_skill' }, 'Routing scheduled skill through runSkill');
+          const skillResult = await runSkill(scheduledSkillName, {
+            sessionKey: `cron:${jobName}`,
+            source: 'scheduled-skill',
+            profile,
+            agentManager: this.getAgentManager(),
+            memoryStore: this.assistant.getMemoryStore?.() ?? null,
+            projectWorkDir: workDir,
+            model,
+            ...(maxTurns ? { maxTurns } : {}),
+            abortSignal: cronAc.signal,
+            context: `[Scheduled skill: ${jobName}]`,
+          });
+          if (!skillResult.ok) {
+            throw new Error(skillResult.error ?? `Scheduled skill failed: ${scheduledSkillName}`);
+          }
+          scanner.refreshIntegrity();
+          this._lastCronRunMetadata = {
+            skillsApplied: [{ name: scheduledSkillName, source: 'pinned' }],
+            skillsMissing: [],
+            allowedToolsApplied: skillResult.allowedToolsApplied ?? skillResult.effectiveTools,
+            mcpServersApplied: skillResult.mcpServersApplied ?? [],
+            permissionModeApplied: skillResult.permissionMode,
+            runId: skillResult.runId,
+            totalCostUsd: skillResult.cost,
+          };
+          const scheduledDeliverable = skillResult.output ?? '';
+          const memoryStore = this.assistant.getMemoryStore?.();
+          if (memoryStore && scheduledDeliverable.trim()) {
+            try {
+              memoryStore.saveTurn(`cron:${jobName}`, 'cron', scheduledDeliverable, model ?? '');
+            } catch (err) {
+              logger.debug({ err, jobName }, 'scheduled skill transcript mirror failed (non-fatal)');
+            }
+          }
+          if (scheduledDeliverable.trim() && scheduledDeliverable.trim() !== '__NOTHING__') {
+            this.assistant
+              .triggerMemoryExtractionPostExchange(
+                `Run scheduled skill ${scheduledSkillName}.`,
+                scheduledDeliverable,
+                `cron:${jobName}`,
+                profile ?? undefined,
+              )
+              .catch(err => logger.debug({ err, jobName }, 'scheduled skill memory extraction failed (non-fatal)'));
+          }
+          logger.info({
+            jobName,
+            skill: scheduledSkillName,
+            cost: Number((skillResult.cost ?? 0).toFixed(4)),
+            numTurns: skillResult.turns ?? 0,
+            mcpServersApplied: skillResult.mcpServersApplied?.length ?? 0,
+            permissionMode: skillResult.permissionMode,
+            durationMs: Date.now() - cronStart,
+          }, 'runSkill: scheduled skill complete');
+          return scheduledDeliverable;
+        }
+
+        const { runAgentCron } = await import('../agent/run-agent-cron.js');
         logger.info({ jobName, agentSlug, tier, wallMs, path: 'runagent_cron' }, 'Routing cron through runAgentCron');
 
         const cronResult = await runAgentCron({
@@ -2325,6 +2443,7 @@ export class Gateway {
           skillsMissing: cronResult.skillsMissing,
           allowedToolsApplied: cronResult.allowedToolsApplied,
           mcpServersApplied: cronResult.mcpServersApplied,
+          permissionModeApplied: cronResult.permissionMode,
           runId: cronResult.runId,
           totalCostUsd: cronResult.totalCostUsd,
         };
@@ -2547,6 +2666,7 @@ export class Gateway {
     skillsMissing: string[];
     allowedToolsApplied?: string[];
     mcpServersApplied: string[];
+    permissionModeApplied?: string;
     /** PRD §6 / 1.18.85: run UUID from runAgent. */
     runId?: string;
     /** PRD §12 / 1.18.89: total cost in USD from runAgent's SDK result. */
