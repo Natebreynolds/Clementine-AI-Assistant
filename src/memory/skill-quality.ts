@@ -91,13 +91,16 @@ export interface SkillQualityScore {
   /** Most recent ISO timestamp this skill was applied to a run. */
   lastUsedAt: string | null;
   /**
-   * Coarse 4-bucket label for owner attention:
+   * Coarse 5-bucket label for owner attention:
    *  - 'good' — enough runs, success rate above threshold
    *  - 'underperforming' — enough runs, success rate below threshold
    *  - 'stale' — no runs in the last STALE_DAYS regardless of past stats
    *  - 'no-data' — fewer than MIN_RUNS_FOR_GRADE runs in the window
+   *  - 'ready' (1.18.185) — skill exists in the vault but has never run,
+   *    so we have no observations to grade against. Distinguished from
+   *    'no-data' so freshly-created skills don't look broken on the UI.
    */
-  grade: 'good' | 'underperforming' | 'stale' | 'no-data';
+  grade: 'good' | 'underperforming' | 'stale' | 'no-data' | 'ready';
   /** One-sentence reason for the grade — surfaces under the badge. */
   gradeReason: string;
 }
@@ -249,12 +252,23 @@ export function computeSkillQuality(
 /**
  * Compute scores for every skill that appeared in *any* run within the
  * window. Returns one score per skill name, sorted by totalRuns desc
- * (most-used first). Skills that exist in the vault but never ran will
- * not appear — callers that need "every skill" should merge with the
- * skill-store listing themselves.
+ * (most-used first).
+ *
+ * 1.18.185 — pass `vaultSkillNames` to merge in skills that exist on
+ * disk but have never run; those get a synthetic 'ready' grade so
+ * freshly-created skills don't get rendered with the (misleading)
+ * 'no-data' badge that previously meant "we don't know yet" but read
+ * to users as "this thing is broken."
  */
 export function computeAllSkillQuality(
-  options: { windowDays?: number; baseDir?: string } = {},
+  options: {
+    windowDays?: number;
+    baseDir?: string;
+    /** Optional: list of skill names known to exist in the vault.
+     *  Names in this list that have ZERO runs get a synthetic 'ready'
+     *  grade. Without this, never-run skills don't appear at all. */
+    vaultSkillNames?: string[];
+  } = {},
 ): SkillQualityScore[] {
   const windowDays = options.windowDays ?? DEFAULT_WINDOW_DAYS;
   // First pass: collect every skill name that appears at least once.
@@ -270,6 +284,16 @@ export function computeAllSkillQuality(
   for (const name of seen) {
     scores.push(computeSkillQuality(name, options));
   }
+  // 1.18.185 — merge in vault-known skills that have never run with a
+  // synthetic 'ready' grade. We don't compute the full metrics for
+  // these (they're all null/0); the grade carries the signal that the
+  // skill is loaded and waiting.
+  if (options.vaultSkillNames && options.vaultSkillNames.length > 0) {
+    for (const name of options.vaultSkillNames) {
+      if (seen.has(name)) continue;
+      scores.push(buildReadyScore(name, windowDays));
+    }
+  }
   scores.sort((a, b) => b.totalRuns - a.totalRuns || a.name.localeCompare(b.name));
   if (scores.length > 0) {
     logger.debug(
@@ -278,4 +302,24 @@ export function computeAllSkillQuality(
     );
   }
   return scores;
+}
+
+/** Synthetic score for a vault-known skill that has never executed. */
+function buildReadyScore(name: string, windowDays: number): SkillQualityScore {
+  return {
+    name,
+    windowDays,
+    totalRuns: 0,
+    pinnedRuns: 0,
+    autoRuns: 0,
+    successRuns: 0,
+    failureRuns: 0,
+    successRate: null,
+    triggerAccuracy: null,
+    avgDurationMs: null,
+    avgCostUsd: null,
+    lastUsedAt: null,
+    grade: 'ready',
+    gradeReason: 'Skill is loaded and ready to use. No runs yet — grade will populate after the first execution.',
+  };
 }

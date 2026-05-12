@@ -35,6 +35,7 @@ import { buildBuilderEnrichedMessage, builderSessionKey } from '../dashboard/bui
 import {
   AGENTS_DIR,
   MEMORY_FILE,
+  MODELS,
   SESSIONS_FILE,
   TIMEZONE,
   applyOneMillionContextRecovery,
@@ -4517,8 +4518,19 @@ export async function cmdDashboard(opts: { port?: string }): Promise<void> {
   app.get('/api/skills/quality', async (req, res) => {
     try {
       const { computeAllSkillQuality } = await import('../memory/skill-quality.js');
+      const { listSkills } = await import('../agent/skill-store.js');
       const windowDays = req.query.windowDays ? Math.max(1, Math.min(365, Number(req.query.windowDays))) : undefined;
-      const scores = computeAllSkillQuality(windowDays ? { windowDays } : {});
+      // 1.18.185 — pass every vault-known skill name so freshly-created
+      // skills get a 'ready' grade instead of being silently dropped
+      // (or worse, rendered as 'no-data' = "this looks broken").
+      let vaultSkillNames: string[] = [];
+      try {
+        vaultSkillNames = listSkills().map((s) => s.frontmatter?.name).filter((n): n is string => typeof n === 'string' && n.length > 0);
+      } catch { /* listSkills failures are non-fatal; we just lose the ready-grade enrichment */ }
+      const scores = computeAllSkillQuality({
+        ...(windowDays ? { windowDays } : {}),
+        vaultSkillNames,
+      });
       res.json({ ok: true, count: scores.length, scores });
     } catch (err) {
       res.status(500).json({ ok: false, error: String(err) });
@@ -7657,6 +7669,40 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
 
   // ── CRON CRUD routes (continued) ──────────────────────────────
 
+  /**
+   * 1.18.185 — Validate a per-job model override before persisting it.
+   * Without this guard, a typo in the dashboard (or CRON.md hand-edit)
+   * silently writes garbage; runtime then fails with a cryptic SDK
+   * error far from where the user set the value. Accepts:
+   *   - SDK tier aliases: 'sonnet', 'opus', 'haiku' (case-insensitive)
+   *   - Full model IDs from MODELS (claude-sonnet-4-6 etc.), optionally
+   *     with the `[1m]` Extra Usage suffix
+   *   - Any full claude-*-* string, leniently — keeps the door open for
+   *     model IDs not yet in the MODELS map (e.g., a future Opus).
+   */
+  function validateCronModelOverride(value: unknown): { ok: true } | { ok: false; error: string } {
+    const v = String(value ?? '').trim();
+    if (!v) return { ok: false, error: 'model must be a non-empty string' };
+    const lower = v.toLowerCase();
+    // Tier aliases — SDK accepts these directly.
+    if (lower === 'sonnet' || lower === 'opus' || lower === 'haiku') return { ok: true };
+    // Known full IDs from MODELS (with or without [1m] suffix).
+    const knownBases = new Set(
+      [MODELS.sonnet, MODELS.opus, MODELS.haiku]
+        .filter((m): m is string => typeof m === 'string' && m.length > 0)
+        .map((m) => m.replace(/\[1m\]$/i, '').toLowerCase()),
+    );
+    const baseOf = lower.replace(/\[1m\]$/i, '');
+    if (knownBases.has(baseOf)) return { ok: true };
+    // Lenient fallback: any plausible claude-*-* string (lets users
+    // adopt new model IDs without waiting for a MODELS map update).
+    if (/^claude-[a-z0-9-]+(?:\[1m\])?$/i.test(v)) return { ok: true };
+    return {
+      ok: false,
+      error: `model "${v}" is not recognized. Use 'sonnet' / 'opus' / 'haiku', a known model ID (${Array.from(knownBases).join(', ')}), or a claude-*-* string. The [1m] suffix is allowed for explicit 1M context routing (Extra Usage on Sonnet, in-plan on Opus for Max).`,
+    };
+  }
+
   app.post('/api/cron', (req, res) => {
     try {
       const {
@@ -7665,6 +7711,10 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
         skills, allowedTools, allowedMcpServers, tags, category, predictable,
         // PRD Phase 1 fields (camelCase from API; written as snake_case YAML).
         successCriteriaText, successSchema, addDirs,
+        // 1.18.185 — per-job model override, alwaysDeliver, and lean mode
+        // were previously parsed from CRON.md and threaded through the
+        // runtime but had no dashboard write path. Now settable here.
+        model, alwaysDeliver, lean,
       } = req.body;
       if (!name || !schedule || !prompt) {
         res.status(400).json({ error: 'name, schedule, and prompt are required' });
@@ -7673,6 +7723,13 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
       if (!cron.validate(schedule)) {
         res.status(400).json({ error: `Invalid cron expression: ${schedule}` });
         return;
+      }
+      if (model !== undefined && model !== null && model !== '') {
+        const valid = validateCronModelOverride(model);
+        if (!valid.ok) {
+          res.status(400).json({ error: valid.error });
+          return;
+        }
       }
       let cronFile = CRON_FILE;
       if (agent) {
@@ -7730,6 +7787,24 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
       }
       if (Array.isArray(addDirs) && addDirs.length) {
         job.add_dirs = addDirs.map(String).map((s: string) => s.trim()).filter(Boolean);
+      }
+      // 1.18.185 — model override + alwaysDeliver + lean wire-through.
+      // These three fields are parsed from CRON.md by the scheduler
+      // (cron-scheduler.ts:194 etc.) and threaded through to runSkill /
+      // handleCronJob. Without the dashboard persisting them, the only
+      // way to use them was hand-editing CRON.md.
+      //
+      // YAML convention: snake_case (matches work_dir / max_hours /
+      // allowed_tools). The parser accepts both casings defensively
+      // (cron-scheduler.ts:219) but we write the canonical form.
+      if (typeof model === 'string' && model.trim()) {
+        job.model = model.trim();
+      }
+      if (alwaysDeliver === true || alwaysDeliver === 'true') {
+        job.always_deliver = true;
+      }
+      if (lean === true || lean === 'true') {
+        job.lean = true;
       }
       jobs.push(job);
       writeCronFileAt(cronFile, parsed, jobs);
@@ -7895,6 +7970,38 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
           return;
         }
         jobs[idx].name = String(updates.name);
+      }
+      // 1.18.185 — model / alwaysDeliver / lean. set-when-non-empty,
+      // delete-when-cleared, matching the rest of this endpoint's pattern.
+      if (updates.model !== undefined) {
+        if (typeof updates.model === 'string' && updates.model.trim()) {
+          const valid = validateCronModelOverride(updates.model.trim());
+          if (!valid.ok) {
+            res.status(400).json({ error: valid.error });
+            return;
+          }
+          jobs[idx].model = updates.model.trim();
+        } else {
+          delete jobs[idx].model;
+        }
+      }
+      if (updates.alwaysDeliver !== undefined) {
+        if (updates.alwaysDeliver === true || updates.alwaysDeliver === 'true') {
+          jobs[idx].always_deliver = true;
+          // Defensive: remove the camelCase form if a prior hand-edit
+          // left one behind. Avoids confusing two-key state.
+          delete jobs[idx].alwaysDeliver;
+        } else {
+          delete jobs[idx].always_deliver;
+          delete jobs[idx].alwaysDeliver;
+        }
+      }
+      if (updates.lean !== undefined) {
+        if (updates.lean === true || updates.lean === 'true') {
+          jobs[idx].lean = true;
+        } else {
+          delete jobs[idx].lean;
+        }
       }
       writeCronFileAt(cronFile, parsed, jobs);
       res.json({ ok: true, message: `Updated cron job: ${jobs[idx].name}` });
@@ -9358,6 +9465,95 @@ If the tool returns nothing or errors, return an empty array \`[]\`.`,
   // content out of search results.
 
   // Memory Health snapshot — single endpoint feeding the dashboard tab.
+  // ── Reconstitution snapshot (1.18.185 Phase 2) ──────────────────────
+  //
+  // What Clementine would see RIGHT NOW if a chat turn fired for the
+  // given sessionKey. Constructs (doesn't replay) the cacheable system-
+  // prompt append, the volatile turn-context block, the tool surface,
+  // and the permission mode — the same components run-agent.ts +
+  // router.ts assemble at chat time. This is the canonical visibility
+  // surface for verifying 1.18.184's reconstitution actually loads
+  // everything we expect.
+  app.get('/api/clementine/reconstitution', async (req, res) => {
+    try {
+      const sessionKey = typeof req.query.sessionKey === 'string' && req.query.sessionKey
+        ? req.query.sessionKey
+        : 'dashboard:web';
+      const userMessage = typeof req.query.userMessage === 'string'
+        ? req.query.userMessage
+        : '';
+
+      const gateway = await getGateway();
+      // assistant.getMemoryStore is the public accessor (the field
+      // itself is private). Same pattern router.ts:2542 uses for the
+      // chat-time turn-context build.
+      const memoryStore = (gateway as { assistant?: { getMemoryStore?: () => unknown } })
+        .assistant?.getMemoryStore?.() ?? null;
+
+      const { buildChatSystemAppend } = await import('../agent/run-agent-context.js');
+      const { buildClementineTurnContext } = await import('../agent/clementine-turn-context.js');
+      const { listBackgroundTasks } = await import('../agent/background-tasks.js');
+
+      // Cacheable system-prompt append (identity + posture).
+      const systemAppend = buildChatSystemAppend({});
+
+      // Volatile per-turn context for the given user message (or a
+      // generic probe message when none provided — gives a useful view
+      // even before the user has typed anything).
+      const probeMessage = userMessage.trim() || 'show me what you remember about my work';
+      const turnCtx = buildClementineTurnContext({
+        userMessage: probeMessage,
+        sessionKey,
+        channel: sessionKey.split(':')[0] ?? 'chat',
+        memoryStore: memoryStore as Parameters<typeof buildClementineTurnContext>[0]['memoryStore'],
+        listBackgroundTasks,
+      });
+
+      // Tool surface — the same CORE_TOOLS list runAgent uses, plus a
+      // note that MCP wildcard widens this at runtime via the
+      // Clementine MCP server.
+      const coreTools = [
+        'Agent', 'Read', 'Write', 'Edit', 'Glob', 'Grep', 'Bash',
+        'WebSearch', 'WebFetch', 'TodoWrite',
+        'mcp__clementine-tools__memory_search',
+        'mcp__clementine-tools__transcript_search',
+        'mcp__clementine-tools__memory_write',
+        'mcp__clementine-tools__note_take',
+        'mcp__clementine-tools__note_create',
+        'mcp__clementine-tools__task_add',
+      ];
+
+      res.json({
+        ok: true,
+        sessionKey,
+        probeMessage,
+        systemAppend: {
+          text: systemAppend,
+          chars: systemAppend.length,
+          cacheable: true,
+        },
+        turnContext: {
+          block: turnCtx.block,
+          chars: turnCtx.totalChars,
+          sections: turnCtx.sections,
+          cacheable: false,
+        },
+        toolSurface: {
+          coreTools,
+          note: 'MCP wildcard (mcp__clementine-tools__*) widens this at runtime when the MCP server initializes correctly. Skill auto-match (score ≥ 4) can further widen for matched integrations.',
+        },
+        permissionMode: {
+          chat: 'bypassPermissions',
+          autonomous: 'dontAsk',
+          note: 'Chat = trusted local agent (1.18.184). Autonomous (cron / scheduled-skill / heartbeat / team-task) intentionally stays on the stricter dontAsk allowlist.',
+        },
+        capturedAt: new Date().toISOString(),
+      });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: String(err) });
+    }
+  });
+
   // Read-only aggregate over the existing tables; no caching needed (cheap).
   // Self-correction stats — supersession provenance. Powers the
   // "Self-correction (supersedes)" card on Brain → Health.
@@ -19424,6 +19620,12 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
         <button data-icon="zap" onclick="switchTab('intelligence','health')"><span class="icon-slot"></span> Health <span class="tab-badge" id="brain-health-badge" style="display:none;background:#ef4444;color:#fff">0</span></button>
         <button data-icon="users" onclick="switchTab('intelligence','user-model')"><span class="icon-slot"></span> User Model</button>
         <button data-icon="brain" onclick="switchTab('intelligence','learning')"><span class="icon-slot"></span> Learning <span class="tab-badge" id="brain-learning-badge" style="display:none;background:#f59e0b;color:#000">0</span></button>
+        <!-- 1.18.185 Phase 2 — "Reconstitution" tab. Shows what
+             Clementine actually sees on each chat turn (cacheable system
+             prompt, volatile turn-context, tool surface, permission
+             mode). The single most valuable visibility surface for
+             verifying 1.18.184 is working as designed. -->
+        <button data-icon="eye" onclick="switchTab('intelligence','reconstitution')"><span class="icon-slot"></span> Reconstitution</button>
       </div>
       <div id="intelligence-tab-content">
         <div class="tab-pane active" id="tab-intelligence-overview">
@@ -19998,6 +20200,22 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
           <div class="card" style="margin-top:16px">
             <div class="card-header">Experiment History</div>
             <div class="card-body" id="si-history-list"><div class="empty-state">No experiments yet</div></div>
+          </div>
+        </div>
+        <!-- 1.18.185 Phase 2 — Reconstitution tab. The single most
+             valuable visibility surface for verifying 1.18.184 works
+             as designed: shows what Clementine actually sees on each
+             chat turn. -->
+        <div class="tab-pane" id="tab-intelligence-reconstitution">
+          <div style="margin-bottom:14px;font-size:13px;color:var(--text-secondary);max-width:760px;line-height:1.6">
+            On every chat turn, Clementine is reconstituted from three SDK channels: the cacheable system prompt (her identity, posture, and curated memory), the volatile per-turn context (live SQLite memory hits + recent background work + identity framing), and the tool surface (memory tools + integrations always present). This tab shows you exactly what landed in each channel for the most recent chat turn — the canonical way to debug "why didn't she know X" or "why did she do Y."
+          </div>
+          <div style="display:flex;align-items:center;gap:8px;margin-bottom:14px;flex-wrap:wrap">
+            <button class="btn-sm btn-primary" onclick="refreshReconstitution()" id="reconstitution-refresh-btn">Refresh</button>
+            <span id="reconstitution-status" style="font-size:11px;color:var(--text-muted)"></span>
+          </div>
+          <div id="reconstitution-content">
+            <div class="skel-block"><div class="skel-row med"></div><div class="skel-row"></div><div class="skel-row short"></div></div>
           </div>
         </div>
       </div>
@@ -22390,6 +22608,42 @@ if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().then
               <div class="form-hint">Trigger after another job succeeds (ignores schedule).</div>
             </div>
           </div>
+          <!-- 1.18.185 — Model override + alwaysDeliver + lean mode. These
+               were parsed from CRON.md and threaded through the runtime
+               but had no dashboard UI to set them. Now exposed here so
+               you don't have to hand-edit CRON.md for per-job control. -->
+          <div class="form-row">
+            <div class="form-group">
+              <label class="form-label">Model <span style="color:var(--text-muted);font-weight:normal">(optional override)</span></label>
+              <select id="cron-model">
+                <option value="">Default — plain Sonnet (200K, on-meter)</option>
+                <option value="sonnet">Sonnet (200K)</option>
+                <option value="claude-sonnet-4-6[1m]">Sonnet [1m] — Extra Usage on Max ⚠</option>
+                <option value="opus">Opus (200K) — Max-covered</option>
+                <option value="claude-opus-4-7[1m]">Opus [1m] — Max-covered long context</option>
+                <option value="haiku">Haiku (cheap)</option>
+              </select>
+              <div class="form-hint">Override the autonomous default. Sonnet [1m] lives on Anthropic's Extra Usage path even with Max — prefer Opus [1m] for long-context work on a Max plan.</div>
+            </div>
+          </div>
+          <div class="form-row">
+            <div class="form-group">
+              <label class="form-label" style="display:flex;align-items:center;gap:8px;cursor:pointer">
+                <input type="checkbox" id="cron-always-deliver" style="margin:0">
+                <span>Retry if response is empty / noise-only</span>
+              </label>
+              <div class="form-hint" style="margin-left:24px">When ON, the scheduler treats whitespace-only or refusal-style responses as failures and retries (up to <code>Max Retries</code> times).</div>
+            </div>
+          </div>
+          <div class="form-row">
+            <div class="form-group">
+              <label class="form-label" style="display:flex;align-items:center;gap:8px;cursor:pointer">
+                <input type="checkbox" id="cron-lean" style="margin:0">
+                <span>Lean envelope (meta-jobs only)</span>
+              </label>
+              <div class="form-hint" style="margin-left:24px">Drops auto-injected context (memory, progress, goal, criteria, skills) and prunes the MCP catalog. Use this for tasks that must stay under Haiku's prompt cap or that should run with a strict envelope. Leave OFF for most jobs.</div>
+            </div>
+          </div>
         </div>
 
         <!-- Training Chat — visible across all config tabs (it's a tool, not a field group) -->
@@ -23865,6 +24119,8 @@ function switchTab(group, tab) {
       if (typeof refreshRoutingAudit === 'function') refreshRoutingAudit();
     }
     if (tab === 'learning' && typeof refreshSelfImprove === 'function') refreshSelfImprove();
+    // 1.18.185 Phase 2 — Reconstitution tab fires its own loader.
+    if (tab === 'reconstitution' && typeof refreshReconstitution === 'function') refreshReconstitution();
   }
   if (group === 'settings') {
     if (tab === 'general' && typeof refreshSettings === 'function') refreshSettings();
@@ -25844,6 +26100,24 @@ function renderScheduledTaskCard(task) {
   if (task.mode === 'unleashed') badges += '<span class="badge badge-purple">long-running</span>';
   if (task.after) badges += '<span class="badge badge-yellow" title="Triggered after ' + esc(task.after) + '">after ' + esc(task.after) + '</span>';
   if (task.maxRetries != null) badges += '<span class="badge badge-gray">' + esc(task.maxRetries) + ' retries</span>';
+  // 1.18.185 — model override badge. Only renders when an override is
+  // set; default (plain Sonnet) stays invisible. Highlights [1m] variant
+  // in orange because that is the Extra Usage path on Anthropic billing
+  // (Max subscription does not comp it). See feedback_sonnet_1m_extra_usage.
+  if (task.model && String(task.model).trim()) {
+    var modelStr = String(task.model);
+    var isExtraUsage = /\[1m\]/i.test(modelStr) && /sonnet/i.test(modelStr);
+    var modelClass = isExtraUsage ? 'badge-orange' : 'badge-blue';
+    var modelTitle = isExtraUsage
+      ? 'Sonnet [1m] = Extra Usage path on Anthropic billing (not covered by Max). Click Edit to change.'
+      : 'Model override active. Click Edit to change.';
+    badges += '<span class="badge ' + modelClass + '" title="' + esc(modelTitle) + '">model: ' + esc(modelStr) + '</span>';
+  }
+  // 1.18.185 — alwaysDeliver badge. Indicates "retry on empty/noise
+  // response" is enabled. Hidden by default.
+  if (task.alwaysDeliver === true) {
+    badges += '<span class="badge badge-gray" title="Retry on empty or noise-only response (up to maxRetries times).">retry-if-empty</span>';
+  }
   badges += operationUsageBadge(task.usage);
   badges += '<span class="badge ' + (enabled ? 'badge-green' : 'badge-gray') + '">' + (enabled ? 'Enabled' : 'Disabled') + '</span>';
   // 1.18.118 — only emit the health badge when it adds new information.
@@ -30365,7 +30639,10 @@ async function loadSkillQualityState(skillName) {
     var d = await r.json();
     if (!r.ok || d.ok === false || !d.score) return;
     var s = d.score;
-    var gradeColors = { good: '#10b981', underperforming: '#ef4444', stale: '#f59e0b', 'no-data': '#6b7280' };
+    // 1.18.185 — 'ready' grade for vault-known skills that haven't run yet.
+    // Blue-ish so it reads as "loaded and waiting" rather than "broken"
+    // (which is how the old 'no-data' badge read on a freshly-created skill).
+    var gradeColors = { good: '#10b981', underperforming: '#ef4444', stale: '#f59e0b', 'no-data': '#6b7280', ready: '#3b82f6' };
     var gradeLabel = (s.grade || 'no-data').replace(/-/g, ' ');
     var color = gradeColors[s.grade] || '#6b7280';
     var pct = function(v) { return v === null || v === undefined ? '—' : (v * 100).toFixed(0) + '%'; };
@@ -32423,6 +32700,13 @@ function openEditCronModal(jobName) {
   document.getElementById('cron-mode').value = job.mode || 'standard';
   document.getElementById('cron-maxhours').value = String(job.max_hours || 6);
   document.getElementById('cron-max-retries').value = job.max_retries != null ? String(job.max_retries) : '';
+  // 1.18.185 — model override + alwaysDeliver + lean mode.
+  var modelEl = document.getElementById('cron-model');
+  if (modelEl) modelEl.value = job.model || '';
+  var alwaysDelEl = document.getElementById('cron-always-deliver');
+  if (alwaysDelEl) alwaysDelEl.checked = (job.alwaysDeliver === true || job.alwaysDeliver === 'true');
+  var leanEl = document.getElementById('cron-lean');
+  if (leanEl) leanEl.checked = (job.lean === true || job.lean === 'true');
   populateAfterJobDropdown(job.after || '', jobName);
   toggleUnleashedOptions();
   document.getElementById('cron-prompt').value = job.prompt || '';
@@ -32939,6 +33223,11 @@ async function saveCronJob() {
     toast('Heads up: add_dirs entries should be absolute paths.', 'info');
   }
 
+  // 1.18.185 — read the new fields.
+  const modelVal = (document.getElementById('cron-model')?.value || '').trim();
+  const alwaysDeliverVal = !!document.getElementById('cron-always-deliver')?.checked;
+  const leanVal = !!document.getElementById('cron-lean')?.checked;
+
   const body = {
     name, schedule, tier, prompt, enabled: true,
     work_dir: work_dir || undefined, mode, max_hours, max_retries, after, context,
@@ -32960,6 +33249,13 @@ async function saveCronJob() {
     successCriteriaText: editingCronJob ? successCriteriaText : (successCriteriaText || undefined),
     successSchema: editingCronJob ? (successSchema || null) : (successSchema || undefined),
     addDirs: editingCronJob ? addDirs : (addDirs.length ? addDirs : undefined),
+    // 1.18.185 — new fields. Edit-mode passes the literal value (so an
+    // empty string clears the YAML key); create-mode passes undefined
+    // so the key is only written when explicitly set, matching the
+    // pattern for the other capability fields.
+    model: editingCronJob ? modelVal : (modelVal || undefined),
+    alwaysDeliver: editingCronJob ? alwaysDeliverVal : (alwaysDeliverVal || undefined),
+    lean: editingCronJob ? leanVal : (leanVal || undefined),
   };
 
   var wasEditing = !!editingCronJob;
@@ -38100,6 +38396,118 @@ async function saveMemoryMd() {
     toast('Save failed: ' + (err && err.message || err), 'error');
   } finally {
     window._memoryMdSaving = false;
+  }
+}
+
+// ── Reconstitution panel (1.18.185 Phase 2) ──────────────────────────
+// Shows what Clementine actually sees on each chat turn. Renders the
+// cacheable system-prompt append, the volatile turn-context block,
+// the tool surface, and the permission mode side-by-side so the user
+// can verify the reconstitution is loading what 1.18.184 promised.
+async function refreshReconstitution() {
+  var el = document.getElementById('reconstitution-content');
+  var statusEl = document.getElementById('reconstitution-status');
+  var btn = document.getElementById('reconstitution-refresh-btn');
+  if (!el) return;
+  if (btn) btn.setAttribute('disabled', 'disabled');
+  if (statusEl) statusEl.textContent = 'Loading…';
+  try {
+    var r = await apiFetch('/api/clementine/reconstitution?sessionKey=dashboard:web');
+    var d = await r.json();
+    if (!d || d.ok === false) {
+      el.innerHTML = '<div class="empty-state">' + esc(d?.error || 'Failed to load reconstitution snapshot') + '</div>';
+      return;
+    }
+
+    var sa = d.systemAppend || {};
+    var tc = d.turnContext || {};
+    var tcSections = tc.sections || {};
+    var totalChars = (sa.chars || 0) + (tc.chars || 0);
+
+    var html = '';
+
+    // ── Hero: total reconstitution size + cache health framing ─────
+    html += '<div style="margin-bottom:18px;padding:14px 18px;background:var(--bg-secondary);border:1px solid var(--border);border-radius:8px">';
+    html += '<div style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.04em;font-weight:600;margin-bottom:6px">Total reconstitution this turn</div>';
+    html += '<div style="display:flex;gap:24px;flex-wrap:wrap;align-items:flex-end">';
+    html += '<div><div style="font-size:24px;font-weight:700">' + formatBytes(totalChars) + '</div><div style="font-size:11px;color:var(--text-muted)">total characters loaded</div></div>';
+    html += '<div><div style="font-size:18px;font-weight:600;color:var(--green)">' + formatBytes(sa.chars || 0) + '</div><div style="font-size:11px;color:var(--text-muted)">cacheable (system prompt)</div></div>';
+    html += '<div><div style="font-size:18px;font-weight:600;color:var(--blue)">' + formatBytes(tc.chars || 0) + '</div><div style="font-size:11px;color:var(--text-muted)">volatile (turn context)</div></div>';
+    html += '</div>';
+    html += '<div style="margin-top:10px;font-size:11px;color:var(--text-muted);line-height:1.5">Anthropic prompt-cache holds the cacheable prefix across turns; only the volatile delta pays per-turn input cost. Healthy ratio: cacheable larger than volatile.</div>';
+    html += '</div>';
+
+    // ── Panel: cacheable system-prompt append ──────────────────────
+    html += '<div class="card" style="margin-bottom:14px">';
+    html += '<div class="card-header" style="display:flex;align-items:center;justify-content:space-between">';
+    html += '<span>System Prompt Append <span style="color:var(--text-muted);font-weight:normal;font-size:11px">· cacheable · ' + formatBytes(sa.chars || 0) + '</span></span>';
+    html += '<span style="font-size:11px;color:var(--green)">stable across turns</span>';
+    html += '</div>';
+    html += '<div class="card-body" style="padding:0">';
+    html += '<pre style="margin:0;padding:14px;background:var(--bg-primary);font-family:monospace;font-size:11px;line-height:1.5;white-space:pre-wrap;word-break:break-word;max-height:360px;overflow:auto;color:var(--text-secondary)">' + esc(sa.text || '') + '</pre>';
+    html += '</div></div>';
+
+    // ── Panel: volatile turn-context block ─────────────────────────
+    html += '<div class="card" style="margin-bottom:14px">';
+    html += '<div class="card-header" style="display:flex;align-items:center;justify-content:space-between">';
+    html += '<span>Turn Context Block <span style="color:var(--text-muted);font-weight:normal;font-size:11px">· volatile (per-turn) · ' + formatBytes(tc.chars || 0) + '</span></span>';
+    html += '<span style="font-size:11px;color:var(--text-muted)">probe: <code>' + esc((d.probeMessage || '').slice(0, 60)) + (d.probeMessage && d.probeMessage.length > 60 ? '…' : '') + '</code></span>';
+    html += '</div>';
+    html += '<div class="card-body" style="padding:0">';
+
+    // Section badges
+    html += '<div style="padding:10px 14px;border-bottom:1px solid var(--border);display:flex;gap:6px;flex-wrap:wrap;font-size:11px">';
+    var hits = tcSections.retrievedMemory || 0;
+    var bgN = tcSections.recentBgTasks || 0;
+    html += '<span class="badge ' + (hits > 0 ? 'badge-green' : 'badge-gray') + '" title="Top semantic + FTS hits from SQLite for this turn">' + hits + ' memory hit' + (hits === 1 ? '' : 's') + '</span>';
+    html += '<span class="badge ' + (bgN > 0 ? 'badge-blue' : 'badge-gray') + '" title="Terminal-state bg tasks from last 24h">' + bgN + ' recent bg task' + (bgN === 1 ? '' : 's') + '</span>';
+    if (tcSections.identityFrame) html += '<span class="badge badge-purple">identity frame</span>';
+    if (tcSections.liveState) html += '<span class="badge badge-gray">live state</span>';
+    html += '</div>';
+
+    if (!tc.block) {
+      html += '<div class="empty-state" style="padding:14px">No turn-context generated. This is normal when the probe message has no relevant memory hits AND there are no recent bg tasks. Live state (date/time) will appear once you ask Clementine something real.</div>';
+    } else {
+      html += '<pre style="margin:0;padding:14px;background:var(--bg-primary);font-family:monospace;font-size:11px;line-height:1.5;white-space:pre-wrap;word-break:break-word;max-height:360px;overflow:auto;color:var(--text-secondary)">' + esc(tc.block) + '</pre>';
+    }
+    html += '</div></div>';
+
+    // ── Panel: tool surface ────────────────────────────────────────
+    var ts = d.toolSurface || {};
+    var tools = Array.isArray(ts.coreTools) ? ts.coreTools : [];
+    html += '<div class="card" style="margin-bottom:14px">';
+    html += '<div class="card-header">Tool Surface <span style="color:var(--text-muted);font-weight:normal;font-size:11px">· ' + tools.length + ' core + MCP wildcard</span></div>';
+    html += '<div class="card-body">';
+    html += '<div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:10px">';
+    for (var ti = 0; ti < tools.length; ti++) {
+      var t = tools[ti];
+      var isMemory = String(t).indexOf('mcp__clementine-tools__') === 0;
+      var cls = isMemory ? 'badge-blue' : 'badge-gray';
+      html += '<span class="badge ' + cls + '">' + esc(t) + '</span>';
+    }
+    html += '</div>';
+    if (ts.note) html += '<div style="font-size:11px;color:var(--text-muted);line-height:1.5">' + esc(ts.note) + '</div>';
+    html += '</div></div>';
+
+    // ── Panel: permission mode ─────────────────────────────────────
+    var pm = d.permissionMode || {};
+    html += '<div class="card">';
+    html += '<div class="card-header">Permission Mode</div>';
+    html += '<div class="card-body">';
+    html += '<div style="display:flex;gap:18px;flex-wrap:wrap;margin-bottom:10px">';
+    html += '<div><div style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.04em;margin-bottom:4px">Chat</div><span class="badge badge-green">' + esc(pm.chat || 'unknown') + '</span></div>';
+    html += '<div><div style="font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.04em;margin-bottom:4px">Autonomous</div><span class="badge badge-gray">' + esc(pm.autonomous || 'unknown') + '</span></div>';
+    html += '</div>';
+    if (pm.note) html += '<div style="font-size:11px;color:var(--text-muted);line-height:1.5">' + esc(pm.note) + '</div>';
+    html += '</div></div>';
+
+    el.innerHTML = html;
+    if (statusEl) statusEl.textContent = 'Captured at ' + new Date(d.capturedAt).toLocaleTimeString();
+  } catch (err) {
+    el.innerHTML = '<div class="empty-state">Failed to load: ' + esc(String(err)) + '</div>';
+    if (statusEl) statusEl.textContent = '';
+  } finally {
+    if (btn) btn.removeAttribute('disabled');
   }
 }
 

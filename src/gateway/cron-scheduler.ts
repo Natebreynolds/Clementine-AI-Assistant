@@ -216,7 +216,12 @@ function parseJobYaml(job: Record<string, unknown>): CronJobDefinition | null {
     : undefined;
 
   const addDirs = normalizeStringArray(job.add_dirs ?? job.addDirs);
-  const alwaysDeliver = job.always_deliver === true ? true : undefined;
+  // 1.18.185 — accept both casings. The dashboard writes the canonical
+  // snake_case (matches work_dir / max_hours / allowed_tools etc.) but
+  // hand-edited CRON.md files in the wild predate the dashboard write
+  // path; some may have used camelCase. Defensive parsing here protects
+  // against silent breakage from either source.
+  const alwaysDeliver = (job.always_deliver === true || job.alwaysDeliver === true) ? true : undefined;
   const context = job.context != null ? String(job.context) : undefined;
   const preCheck = job.pre_check != null ? String(job.pre_check) : undefined;
   const attachments = normalizeStringArray(job.attachments);
