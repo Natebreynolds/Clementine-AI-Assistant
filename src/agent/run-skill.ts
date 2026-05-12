@@ -484,7 +484,22 @@ export async function runSkill(
 
   const limits = skill.frontmatter?.clementine?.limits;
   const maxTurns = options.maxTurns ?? limits?.maxTurns;
-  const maxBudgetUsd = options.maxBudgetUsd ?? limits?.maxBudgetUsd;
+  // 1.18.186 — dashboard is the boss on budget. If the user has
+  // explicitly set ALL global BUDGET_*_USD to 0 ("no budget anywhere"),
+  // per-skill frontmatter caps should yield. Otherwise the dashboard
+  // shows "no budget" while skills still silently hit their own caps,
+  // which is exactly the surprise diagnosed on 2026-05-11.
+  //
+  // The check looks at the four published global budgets — if every
+  // one of them is 0 (uncapped), we treat the install as "no caps mode"
+  // and ignore frontmatter caps too. Caller-supplied options.maxBudgetUsd
+  // always wins (explicit > implicit).
+  const { BUDGET } = await import('../config.js');
+  const globalCapsAllZero =
+    BUDGET.heartbeat === 0 && BUDGET.cronT1 === 0 &&
+    BUDGET.cronT2 === 0 && BUDGET.chat === 0;
+  const maxBudgetUsd = options.maxBudgetUsd
+    ?? (globalCapsAllZero ? undefined : limits?.maxBudgetUsd);
 
   const sessionKey = options.sessionKey
     ?? `skill:${name}:${Date.now().toString(36)}`;

@@ -929,16 +929,36 @@ export async function runAgent(prompt: string, opts: RunAgentOptions): Promise<R
       if (sessionId) unregisterRunSession(sessionId);
     } catch { /* non-fatal */ }
     // Translate the SDK's budget-exhaustion throw into a message that
-    // tells the user (a) what cap tripped and (b) how to raise it.
+    // tells the user (a) what cap tripped and (b) how to actually raise it.
     // The raw SDK string ("Claude Code returned an error result:
     // Reached maximum budget ($0.5)") leaks through the channel layer
     // as a generic "Something went wrong:" with no actionable hint.
+    //
+    // 1.18.186: name the REAL source of the cap. Previously we suggested
+    // a synthesized env-var name (e.g., "BUDGET_SCHEDULED_SKILL_USD")
+    // that didn't exist anywhere in the code — confusing users who set
+    // that key and saw nothing change. Real sources, in resolution order:
+    //   - explicit options.maxBudgetUsd from the caller
+    //   - skill.frontmatter.clementine.limits.maxBudgetUsd (per-skill)
+    //   - BUDGET.cronT1 / cronT2 / heartbeat / chat (global env / dashboard)
+    //   - DEFAULT_BUDGETS[source] fallback
     if (/Reached maximum budget|error_max_budget_usd/i.test(errMsg)) {
       const cap = maxBudgetUsd?.toFixed(2) ?? '?';
-      const envKey = `BUDGET_${source.toUpperCase().replace(/-/g, '_')}_USD`;
+      // Recognized global env keys — these are real. The rest of the
+      // surface (skill frontmatter, options.maxBudgetUsd) is per-call.
+      const globalKey: string | null = (() => {
+        switch (source) {
+          case 'cron': return 'BUDGET_CRON_T1_USD or BUDGET_CRON_T2_USD (whichever tier this job uses)';
+          case 'heartbeat': return 'BUDGET_HEARTBEAT_USD';
+          case 'chat': return 'BUDGET_CHAT_USD';
+          default: return null;
+        }
+      })();
+      const remediation = globalKey
+        ? `Raise it in the dashboard (Budgets & Costs), set ${globalKey}=0 to remove the global cap, OR check the skill's frontmatter \`clementine.limits.maxBudgetUsd\` if the cap came from there.`
+        : `This is a per-call or per-skill cap. Check the caller's \`maxBudgetUsd\` option OR the skill's frontmatter \`clementine.limits.maxBudgetUsd\` field.`;
       throw new Error(
-        `Hit the $${cap} ${source} budget cap before finishing. ` +
-        `Raise it in the dashboard (Budgets & Costs) or set ${envKey}=0 to remove caps.`,
+        `Hit the $${cap} ${source} budget cap before finishing. ${remediation}`,
       );
     }
     throw err;
