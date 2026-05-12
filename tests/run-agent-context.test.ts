@@ -80,3 +80,37 @@ describe('buildChatSystemAppend — 1.18.184 behavioral posture', () => {
     expect(out).toContain('How you operate');
   });
 });
+
+describe('buildChatSystemAppend — 1.18.197 orchestrator posture', () => {
+  it('includes the orchestrator framing so chat delegates instead of bulk-processing', () => {
+    const out = buildChatSystemAppend();
+    expect(out).toContain('Orchestrator posture');
+    expect(out).toMatch(/you are the orchestrator/i);
+  });
+
+  it('names every system subagent in the tool-selection rubric', () => {
+    const out = buildChatSystemAppend();
+    expect(out).toContain('discovery'); // 1.18.197 — the new one
+    expect(out).toContain('researcher');
+    expect(out).toContain('planner');
+    expect(out).toContain('cron-fixer');
+  });
+
+  it('explicitly steers local file-system discovery to the discovery subagent', () => {
+    // This is the Zach case — "find that coach project locally" must
+    // route to `discovery`, not a recursive Glob in the main turn.
+    const out = buildChatSystemAppend();
+    expect(out).toMatch(/find.*project.*locally|local discovery|file-system traversal/i);
+    expect(out).toMatch(/discovery.*subagent|dispatch.*discovery/i);
+  });
+
+  it('explicitly bans recursive Glob/find/Read in the main turn', () => {
+    const out = buildChatSystemAppend();
+    expect(out).toMatch(/recursive.*Glob|recursive.*Read|context bomb/i);
+  });
+
+  it('describes the northstar (orchestrator delegates, does not bulk-process)', () => {
+    const out = buildChatSystemAppend();
+    expect(out).toContain('northstar');
+  });
+});

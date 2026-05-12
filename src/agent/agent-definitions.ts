@@ -67,6 +67,52 @@ const RESEARCHER_PROMPT = [
   'If you cannot find the requested data, say so in one line. Do not speculate.',
 ].join('\n');
 
+/**
+ * 1.18.197 — discovery subagent. The owner asked Clementine to be the
+ * ORCHESTRATOR, not the worker. When chat says "find that coach project
+ * locally", "where is the X folder", "what's in ~/Downloads/Y" — the
+ * main session should NOT run recursive Glob/find/Read in its own turn
+ * (that's the autocompact thrash we kept hitting). It should dispatch
+ * to this subagent which has its own fresh 200K context, does the
+ * file-system traversal, and returns paths + a 1-paragraph summary.
+ *
+ * The discovery subagent is intentionally narrower than researcher:
+ * researcher investigates ONE specific item; discovery LOCATES things.
+ *
+ * Tools: Bash (head/find/ls/awk), Read (one specific file at a time
+ * once located), Glob, Grep — all bounded.
+ *
+ * NOT included: Edit, Write, mutating MCP tools. Pure read-only.
+ */
+const DISCOVERY_PROMPT = [
+  'You are the file-system discovery specialist. You receive a discovery request from the orchestrator and return PATHS + a brief summary.',
+  '',
+  'Your job: locate things. NOT read full contents. NOT analyze in depth.',
+  '',
+  'Tooling rules (these prevent the autocompact thrashing that crashes the orchestrator):',
+  '- Use `Bash ls -la <dir>` to enumerate a directory — never recursive Glob without --maxdepth.',
+  '- Use `Bash find <dir> -maxdepth 3 -name "*.csv"` (or similar) to find files matching a pattern.',
+  '- Use `Bash head -c 2000 <file>` to PEEK at a file — never raw Read on an unknown-size file.',
+  '- Use `Bash wc -l <file>` to size-check before any Read.',
+  '- Once you find target files, return their absolute paths + sizes + one-line descriptions.',
+  '- DO NOT load file contents into your context unless asked for a specific file.',
+  '',
+  'Output format (strict):',
+  '```',
+  'Found: <count> matching items',
+  '',
+  'Paths:',
+  '- /absolute/path/to/file1.csv (12KB, 340 rows) — appears to be coach roster',
+  '- /absolute/path/to/file2.md (3KB) — README describing the project',
+  '',
+  'Recommendation: <which path the orchestrator should fetch next, if any>',
+  '```',
+  '',
+  'If nothing matches, say so in one line.',
+  '',
+  'You are bounded by max 15 turns. Use them wisely — list, scope, summarize, return.',
+].join('\n');
+
 const CRON_FIXER_PROMPT = [
   'You are the cron-fix specialist. You diagnose and apply fixes to broken cron jobs.',
   '',
@@ -166,6 +212,32 @@ export function buildAgentMap(opts: BuildAgentMapOptions = {}): Record<string, A
     prompt: RESEARCHER_PROMPT,
     model: 'haiku',
     tools: ['Read', 'Grep', 'Glob', 'WebSearch', 'WebFetch'],
+    effort: 'low',
+    maxTurns: 15,
+  };
+
+  // Discovery (1.18.197): file-system / project location. Owner's
+  // northstar: Clementine orchestrates, doesn't bulk-process. ANY
+  // local file-system traversal ("find the X project", "where is Y",
+  // "what's in ~/Downloads", "scan this directory") delegates here so
+  // the recursive find/Glob/Read outputs land in this subagent's
+  // 200K window instead of the orchestrator's chat session. Returns
+  // paths + brief summaries — never file contents.
+  map['discovery'] = {
+    description: [
+      'Use this subagent for ANY local file-system or project discovery:',
+      '"find that X project", "locate the Y folder", "where is Z",',
+      '"scan ~/Downloads for W", "is there a file matching V", "list',
+      'what is in directory U". The discovery subagent has its own',
+      'fresh 200K context window and uses bounded `Bash` (ls, find,',
+      'head, wc) — it returns absolute paths + brief descriptions but',
+      'NEVER loads file contents into your main chat context. ALWAYS',
+      'prefer this over running recursive Glob / `find -r` / Read on',
+      'unknown-size files in your own turn — those are context bombs.',
+    ].join(' '),
+    prompt: DISCOVERY_PROMPT,
+    model: 'haiku',
+    tools: ['Bash', 'Read', 'Grep', 'Glob'],
     effort: 'low',
     maxTurns: 15,
   };

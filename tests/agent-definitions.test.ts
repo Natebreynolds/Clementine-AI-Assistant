@@ -22,11 +22,31 @@ function fakeManager(profiles: AgentProfile[]): AgentManager {
 }
 
 describe('buildAgentMap — system subagents', () => {
-  it('always includes planner / researcher / cron-fixer', () => {
+  it('always includes planner / researcher / discovery / cron-fixer', () => {
     const map = buildAgentMap();
     expect(hasAgent(map, 'planner')).toBe(true);
     expect(hasAgent(map, 'researcher')).toBe(true);
+    expect(hasAgent(map, 'discovery')).toBe(true); // 1.18.197
     expect(hasAgent(map, 'cron-fixer')).toBe(true);
+  });
+
+  it('discovery subagent (1.18.197) is haiku, bounded tools, read-only', () => {
+    const { discovery } = buildAgentMap();
+    expect(discovery.model).toBe('haiku');
+    expect(discovery.effort).toBe('low');
+    // Must have Bash for `head`, `find`, `ls`, `wc` — the bounded primitives.
+    expect(discovery.tools).toContain('Bash');
+    // Must have Read + Glob for targeted lookups.
+    expect(discovery.tools).toContain('Read');
+    expect(discovery.tools).toContain('Glob');
+    // Must NOT include mutating tools — discovery is strictly read-only.
+    expect(discovery.tools).not.toContain('Edit');
+    expect(discovery.tools).not.toContain('Write');
+    // Description must mention local file-system discovery so the SDK
+    // auto-routes "find that project" / "where is X" / "scan the Y folder"
+    // to it instead of the parent running recursive Glob/Read inline.
+    const desc = discovery.description ?? '';
+    expect(desc).toMatch(/file-system|find|locate|discover/i);
   });
 
   it('planner uses opus and has no tools', () => {
@@ -116,8 +136,9 @@ describe('buildAgentMap — hired-agent profiles', () => {
   it('returns only system subagents when no profileManager', () => {
     const map = buildAgentMap();
     const slugs = Object.keys(map);
-    expect(slugs).toEqual(expect.arrayContaining(['planner', 'researcher', 'cron-fixer']));
-    // No hired agents in the map
-    expect(slugs.length).toBe(3);
+    // 1.18.197 — discovery joined the system roster.
+    expect(slugs).toEqual(expect.arrayContaining(['planner', 'researcher', 'discovery', 'cron-fixer']));
+    // No hired agents in the map.
+    expect(slugs.length).toBe(4);
   });
 });
