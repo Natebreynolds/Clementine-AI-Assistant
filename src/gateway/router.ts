@@ -2751,14 +2751,38 @@ export class Gateway {
 
           // Wire Composio + external MCP only for real chat. Builder
           // skips entirely — builder turns never call tools.
+          //
+          // 1.18.199 — `fullSurface: true` (NOT per-turn scopeText routing).
+          //
+          // The previous per-message routing was a regression: each chat
+          // turn called `routeToolSurface(originalText)` and only loaded
+          // MCP servers that matched THAT message's text. When the owner
+          // sent a one-word reply like "sure" mid-conversation, zero MCPs
+          // matched → zero servers registered → Ross said "DataForSEO
+          // isn't in scope for this session context" mid-task. Verified
+          // live on 2026-05-12 at 13:35:33.
+          //
+          // The right structural fix: chat always loads the agent's
+          // full profile-allowed MCP surface. The profile's
+          // `allowedComposioToolkits` / `allowedMcpServers` still bound
+          // what each agent can see (Ross gets his scope, Sasha gets
+          // hers). Within those bounds, every server registers every
+          // turn — tools don't vanish mid-conversation. The SDK's
+          // `ENABLE_TOOL_SEARCH=auto:5` (execution-policy.ts) still
+          // defers individual tool-schema loading until needed, so the
+          // per-turn token cost stays bounded even with many servers
+          // registered.
+          //
+          // The skill-resolver still runs above this point — it
+          // contributes the SKILL PROMPT BLOCK to system context. It
+          // simply no longer affects MCP server registration. That
+          // experiment (1.18.170 `skillHintedMcpServers`) caused more
+          // problems than it solved.
           const chatMcp = isBuilderSession
             ? null
             : await buildExtraMcpForRunAgent({
-                scopeText: originalText,
+                fullSurface: true,
                 profile: resolvedProfile,
-                ...(resolvedSkills && resolvedSkills.hintedMcpServers.length > 0
-                  ? { skillHintedMcpServers: resolvedSkills.hintedMcpServers }
-                  : {}),
               });
 
           // Vault context (SOUL.md / MEMORY.md / AGENTS.md + optional
