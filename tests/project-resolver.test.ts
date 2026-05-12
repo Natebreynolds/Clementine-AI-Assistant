@@ -113,10 +113,13 @@ describe('discoverProjectCandidates (1.18.187 Part G)', () => {
     fs.rmSync(tmpHome, { recursive: true, force: true });
   });
 
+  // disableSpotlight on every test so they're deterministic regardless
+  // of what mdfind finds on the test machine. Spotlight coverage is in
+  // its own integration check below.
   it('finds a folder whose name matches the search term', () => {
     fs.mkdirSync(path.join(tmpHome, 'coaches'), { recursive: true });
     fs.writeFileSync(path.join(tmpHome, 'coaches', 'data.csv'), 'col1,col2\n1,2');
-    const candidates = discoverProjectCandidates('coaches', { searchRoots: [tmpHome] });
+    const candidates = discoverProjectCandidates('coaches', { searchRoots: [tmpHome], disableSpotlight: true });
     expect(candidates.length).toBeGreaterThan(0);
     expect(candidates[0]?.basename).toBe('coaches');
     expect(candidates[0]?.nameScore).toBe(1.0);
@@ -127,7 +130,7 @@ describe('discoverProjectCandidates (1.18.187 Part G)', () => {
     fs.mkdirSync(path.join(tmpHome, 'track-coaches-2024'), { recursive: true });
     fs.writeFileSync(path.join(tmpHome, 'coaches', 'data.csv'), 'a');
     fs.writeFileSync(path.join(tmpHome, 'track-coaches-2024', 'data.csv'), 'a');
-    const candidates = discoverProjectCandidates('coaches', { searchRoots: [tmpHome] });
+    const candidates = discoverProjectCandidates('coaches', { searchRoots: [tmpHome], disableSpotlight: true });
     expect(candidates.length).toBeGreaterThanOrEqual(2);
     expect(candidates[0]?.basename).toBe('coaches');
     expect(candidates[0]!.totalScore).toBeGreaterThan(candidates[1]!.totalScore);
@@ -137,13 +140,13 @@ describe('discoverProjectCandidates (1.18.187 Part G)', () => {
     fs.mkdirSync(path.join(tmpHome, 'node_modules'), { recursive: true });
     fs.mkdirSync(path.join(tmpHome, 'project-foo'), { recursive: true });
     fs.writeFileSync(path.join(tmpHome, 'project-foo', 'data.csv'), 'a');
-    const candidates = discoverProjectCandidates('foo', { searchRoots: [tmpHome] });
+    const candidates = discoverProjectCandidates('foo', { searchRoots: [tmpHome], disableSpotlight: true });
     expect(candidates.some((c) => c.path.includes('node_modules'))).toBe(false);
   });
 
   it('returns empty when no folders match', () => {
     fs.mkdirSync(path.join(tmpHome, 'unrelated'), { recursive: true });
-    const candidates = discoverProjectCandidates('coaches', { searchRoots: [tmpHome] });
+    const candidates = discoverProjectCandidates('unique-no-match-xyz999', { searchRoots: [tmpHome], disableSpotlight: true });
     expect(candidates).toEqual([]);
   });
 
@@ -153,7 +156,7 @@ describe('discoverProjectCandidates (1.18.187 Part G)', () => {
     fs.writeFileSync(path.join(dir, 'data.csv'), 'a');
     fs.writeFileSync(path.join(dir, 'README.md'), '# Test');
     fs.writeFileSync(path.join(dir, 'main.py'), 'print(1)');
-    const candidates = discoverProjectCandidates('shape', { searchRoots: [tmpHome] });
+    const candidates = discoverProjectCandidates('shape', { searchRoots: [tmpHome], disableSpotlight: true });
     expect(candidates[0]?.contentSummary).toContain('data file');
     expect(candidates[0]?.contentSummary).toContain('README');
   });
@@ -167,8 +170,21 @@ describe('discoverProjectCandidates (1.18.187 Part G)', () => {
     const candidates = discoverProjectCandidates('coaches', {
       searchRoots: [tmpHome],
       maxResults: 3,
+      disableSpotlight: true, // avoid system-wide noise
     });
     expect(candidates).toHaveLength(3);
+  });
+
+  it('disableSpotlight option works for deterministic tests', () => {
+    // Verify the spotlight path can be turned off so tests don't
+    // depend on what mdfind happens to find on the test machine.
+    fs.mkdirSync(path.join(tmpHome, 'unique-test-name-xyz123'), { recursive: true });
+    const candidates = discoverProjectCandidates('unique-test-name-xyz123', {
+      searchRoots: [tmpHome],
+      disableSpotlight: true,
+    });
+    expect(candidates.length).toBe(1);
+    expect(candidates[0]?.path).toContain('unique-test-name-xyz123');
   });
 });
 

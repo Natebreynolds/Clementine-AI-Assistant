@@ -30,6 +30,7 @@
  * I/O. Safe to call from any layer that has a sessionKey.
  */
 
+import { execSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -192,6 +193,14 @@ export interface DiscoveryCandidate {
  * Search the filesystem for folders that could plausibly be the
  * project the user is mentioning. Used when the registry has no match.
  *
+ * 1.18.189 — search order:
+ *   1. Spotlight (`mdfind`) on macOS — instant, system-indexed,
+ *      finds folders ANYWHERE on disk by name. Critical when the
+ *      project is at depth 2+ ("~/Documents/Work/team-coaches")
+ *      or the owner only knows part of the name.
+ *   2. Direct walk of DEFAULT_DISCOVERY_ROOTS (depth 1) — fallback
+ *      for non-macOS and edge cases where Spotlight is disabled.
+ *
  * Returns candidates sorted by composite score (best first). The
  * caller — typically the chat agent via the `project_discover` tool —
  * inspects the list and decides whether to ask the owner for
@@ -202,7 +211,7 @@ export interface DiscoveryCandidate {
  */
 export function discoverProjectCandidates(
   searchTerm: string,
-  opts: { searchRoots?: string[]; maxResults?: number; nowMs?: number } = {},
+  opts: { searchRoots?: string[]; maxResults?: number; nowMs?: number; disableSpotlight?: boolean } = {},
 ): DiscoveryCandidate[] {
   const term = String(searchTerm ?? '').trim().toLowerCase();
   if (!term) return [];
@@ -214,55 +223,83 @@ export function discoverProjectCandidates(
   const candidates: DiscoveryCandidate[] = [];
   const seen = new Set<string>();
 
+  const consider = (full: string): void => {
+    if (seen.has(full)) return;
+    seen.add(full);
+    let stat: fs.Stats;
+    try { stat = fs.statSync(full); } catch { return; }
+    if (!stat.isDirectory()) return;
+    const basename = path.basename(full).toLowerCase();
+    if (DISCOVERY_IGNORE.has(path.basename(full))) return;
+    if (basename.startsWith('.')) return;
+    // Skip anything under our own ignore roots even if Spotlight indexed them.
+    if (/\/(node_modules|\.git|Library|\.cache|\.Trash)\//.test(full)) return;
+
+    const nameScore = computeNameScore(basename, term);
+    if (nameScore === 0) return;
+    const recencyScore = computeRecencyScore(stat.mtimeMs, nowMs);
+    const { score: contentScore, summary: contentSummary } = computeContentScore(full);
+    const totalScore = 0.6 * nameScore + 0.25 * contentScore + 0.15 * recencyScore;
+    candidates.push({
+      path: full,
+      basename: path.basename(full),
+      nameScore,
+      recencyScore,
+      contentScore,
+      totalScore,
+      contentSummary,
+    });
+  };
+
+  // ── 1. Spotlight (macOS) ─────────────────────────────────────────
+  if (!opts.disableSpotlight && process.platform === 'darwin') {
+    try {
+      const spotlightHits = mdfindFolders(term);
+      for (const full of spotlightHits) consider(full);
+    } catch {
+      // Spotlight unavailable / disabled — fall through to walk.
+    }
+  }
+
+  // ── 2. Direct walk of standard roots (depth 1) ───────────────────
   for (const root of roots) {
     if (!root || !fs.existsSync(root)) continue;
     let entries: string[];
-    try {
-      entries = fs.readdirSync(root);
-    } catch {
-      continue;
-    }
+    try { entries = fs.readdirSync(root); } catch { continue; }
     for (const entry of entries) {
       if (entry.startsWith('.')) continue;
       if (DISCOVERY_IGNORE.has(entry)) continue;
-
-      const full = path.join(root, entry);
-      if (seen.has(full)) continue;
-      seen.add(full);
-
-      let stat: fs.Stats;
-      try {
-        stat = fs.statSync(full);
-      } catch {
-        continue;
-      }
-      if (!stat.isDirectory()) continue;
-
-      const basename = entry.toLowerCase();
-      const nameScore = computeNameScore(basename, term);
-      // Cheap pre-filter: skip if name has zero overlap with the term.
-      if (nameScore === 0) continue;
-
-      const recencyScore = computeRecencyScore(stat.mtimeMs, nowMs);
-      const { score: contentScore, summary: contentSummary } = computeContentScore(full);
-
-      // Weighted composite. Name dominates; content + recency are tiebreakers.
-      const totalScore = 0.6 * nameScore + 0.25 * contentScore + 0.15 * recencyScore;
-
-      candidates.push({
-        path: full,
-        basename: entry,
-        nameScore,
-        recencyScore,
-        contentScore,
-        totalScore,
-        contentSummary,
-      });
+      consider(path.join(root, entry));
     }
   }
 
   candidates.sort((a, b) => b.totalScore - a.totalScore);
   return candidates.slice(0, maxResults);
+}
+
+/**
+ * Run `mdfind` to find folders whose name matches the search term.
+ * macOS only. Returns absolute paths. Limits result count + total
+ * runtime so a vague query can't hang the agent.
+ */
+function mdfindFolders(term: string): string[] {
+  // kMDItemDisplayName — folder name as Finder shows it
+  // kMDItemContentTypeTree includes "public.folder" — restricts to folders
+  // The query: name contains term (case-insensitive) AND is a folder.
+  // Escape double quotes in the term defensively.
+  const safe = term.replace(/["\\]/g, '');
+  if (!safe) return [];
+  const query = `kMDItemDisplayName == "*${safe}*"cd && kMDItemContentTypeTree == "public.folder"`;
+  try {
+    const out = execSync(`mdfind '${query}' 2>/dev/null | head -40`, {
+      timeout: 4_000,
+      maxBuffer: 256 * 1024,
+      encoding: 'utf-8',
+    });
+    return out.split('\n').map((s) => s.trim()).filter(Boolean);
+  } catch {
+    return [];
+  }
 }
 
 // ── Scoring helpers ──────────────────────────────────────────────────

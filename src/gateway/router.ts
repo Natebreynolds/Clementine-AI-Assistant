@@ -73,8 +73,15 @@ const CHAT_TIMEOUT_MS = 10 * 60 * 1000;
  *  Safety net so no session runs forever, even if active.
  *  Primary guardrail is cost budget (maxBudgetUsd), not this timer. */
 const CHAT_MAX_WALL_MS = 30 * 60 * 1000;
-const CHAT_CONTEXT_RETRY_CONTEXT_MAX_CHARS = 6_000;
-const CHAT_CONTEXT_RETRY_SYSTEM_MAX_CHARS = 16_000;
+// 1.18.189 — tightened from 6_000 / 16_000 because the recovery prompt
+// was eating ~22KB of the bg-task worker's context window before any
+// real work started. On 2026-05-12 the worker autocompact-thrashed while
+// reading project files; the new tighter caps give it ~10KB more headroom
+// to do actual tool calls. The dropped content (older memory recall,
+// less-relevant bg-task headlines) is recoverable via memory_search if
+// the model actually needs it.
+const CHAT_CONTEXT_RETRY_CONTEXT_MAX_CHARS = 3_000;
+const CHAT_CONTEXT_RETRY_SYSTEM_MAX_CHARS = 8_000;
 const BACKGROUND_TASK_ID_RE = /\bbg-[a-z0-9]+-[a-f0-9]{6}\b/i;
 
 type TranscriptSearchRow = {
