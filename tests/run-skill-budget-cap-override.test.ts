@@ -23,6 +23,46 @@ function resolveBudget(
   return optionsCap ?? (globalCapsAllZero ? undefined : skillCap);
 }
 
+// 1.18.188 — mirror of the run-agent.ts:387 resolution rule, kept here
+// so tests pin the contract without re-importing config.ts.
+function resolveRunAgentBudget(
+  optionsCap: number | undefined,
+  source: string,
+  defaultBudgets: Record<string, number>,
+  globalCapsAllZero: boolean,
+): number | undefined {
+  const requestedBudget = optionsCap
+    ?? (globalCapsAllZero ? undefined : defaultBudgets[source]);
+  return typeof requestedBudget === 'number' && requestedBudget > 0
+    ? requestedBudget
+    : undefined;
+}
+
+describe('runAgent budget resolution (1.18.188 — DEFAULT_BUDGETS yields when all-zero)', () => {
+  // The exact scenario from Zach's 2026-05-12 failure: BUDGET_*_USD=0
+  // everywhere, but a chat-overflow handoff fires the bg task as
+  // source='cron' which hit the $1.00 DEFAULT_BUDGETS.cron fallback.
+  // 1.18.188 makes this fallback yield to "all-zero" intent.
+  const DEFAULTS = { cron: 1.0, heartbeat: 0.25, 'team-task': 1.0, test: 2.0 };
+
+  it("all-zero globals → cron source resolves to undefined (uncapped), not $1.00", () => {
+    expect(resolveRunAgentBudget(undefined, 'cron', DEFAULTS, true)).toBeUndefined();
+  });
+
+  it('all-zero globals → heartbeat source also uncapped (was $0.25 hardcoded)', () => {
+    expect(resolveRunAgentBudget(undefined, 'heartbeat', DEFAULTS, true)).toBeUndefined();
+  });
+
+  it('NON-all-zero globals → cron source still hits the $1.00 fallback (back-compat)', () => {
+    expect(resolveRunAgentBudget(undefined, 'cron', DEFAULTS, false)).toBe(1.0);
+  });
+
+  it('explicit caller budget always wins, regardless of all-zero state', () => {
+    expect(resolveRunAgentBudget(0.5, 'cron', DEFAULTS, true)).toBe(0.5);
+    expect(resolveRunAgentBudget(0.5, 'cron', DEFAULTS, false)).toBe(0.5);
+  });
+});
+
 describe('budget resolution (1.18.186 — dashboard is boss)', () => {
   it('explicit caller maxBudgetUsd always wins', () => {
     expect(resolveBudget(0.25, 0.05, true)).toBe(0.25);
