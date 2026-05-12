@@ -126,13 +126,15 @@ describe('gateway context overflow retry', () => {
     mocks.detectComplexTaskForBackground.mockReturnValue(null);
   });
 
-  it('surfaces clean recovery message on first overflow (1.18.194 — no retry layer)', async () => {
-    // 1.18.194 — we no longer layer our own retry-with-compressed-prompt
-    // on top of the SDK's autocompact. When the SDK throws context_overflow,
-    // we trust that autocompact has already tried. Surface a clean message
-    // and clear the session — owner can resend smaller or use `/plan`.
-    const assistant = fakeAssistant();
-    mocks.runAgent.mockRejectedValueOnce(new Error('Prompt is too long'));
+  it('retries with fresh SDK session when overflow happens on a resumed session (1.18.196)', async () => {
+    // 1.18.196 — SDK session JSONLs can grow to 80+MB after months of
+    // chat. Resuming one of those blows context on the first user
+    // message. Smart recovery: drop the resume, retry once fresh.
+    // Zach hit this on a freshly-installed 1.18.195.
+    const assistant = fakeAssistant(); // getSdkSessionId returns 'sdk-old'
+    mocks.runAgent
+      .mockRejectedValueOnce(new Error('Prompt is too long'))
+      .mockResolvedValueOnce(fakeRunResult('done after fresh-session retry'));
 
     const gateway = new Gateway(assistant as never) as Gateway & {
       getAgentManager: () => unknown;
@@ -152,14 +154,49 @@ describe('gateway context overflow retry', () => {
       progress,
     );
 
-    expect(response).toContain('past the context limit');
-    expect(response).toContain('/plan');
-    expect(mocks.runAgent).toHaveBeenCalledTimes(1);
+    // Owner gets the actual response from the retry, not the
+    // recovery message. They lose the prior session's chat memory
+    // (it's gone — we couldn't load it) but they get a working answer.
+    expect(response).toBe('done after fresh-session retry');
+    expect(mocks.runAgent).toHaveBeenCalledTimes(2);
+    // First call had resumeSessionId; second did not.
+    expect(mocks.runAgent.mock.calls[0]![1].resumeSessionId).toBe('sdk-old');
+    expect(mocks.runAgent.mock.calls[1]![1].resumeSessionId).toBeUndefined();
     expect(assistant.clearSession).toHaveBeenCalledWith('discord:user:123');
+    expect(progress).toHaveBeenCalledWith('long conversation history — starting a fresh session...');
   });
 
-  it('surfaces recovery message when SDK returns rapid-refill result (no retry)', async () => {
+  it('surfaces recovery message when fresh-session retry ALSO overflows', async () => {
+    // The retry is one shot. If even a fresh session can't fit the
+    // message, that's a real ceiling — surface the recovery prompt
+    // with rephrase/`/plan` options. No second retry.
     const assistant = fakeAssistant();
+    mocks.runAgent
+      .mockRejectedValueOnce(new Error('Prompt is too long'))
+      .mockRejectedValueOnce(new Error('Autocompact is thrashing'));
+
+    const gateway = new Gateway(assistant as never) as Gateway & {
+      getAgentManager: () => unknown;
+      _maybeRouteToSpecialist: () => Promise<null>;
+    };
+    gateway.getAgentManager = vi.fn(() => null);
+    gateway._maybeRouteToSpecialist = vi.fn(async () => null);
+
+    const response = await gateway.handleMessage(
+      'discord:user:123',
+      'Please recreate the coaches dashboard in the project and host it on Netlify.',
+    );
+
+    expect(response).toContain('past the context limit');
+    expect(response).toContain('/plan');
+    expect(mocks.runAgent).toHaveBeenCalledTimes(2);
+  });
+
+  it('surfaces recovery message when SDK returns rapid-refill result on a virgin (no-resume) session', async () => {
+    // No resume to drop = no retry to try. Surface the recovery
+    // message directly.
+    const assistant = fakeAssistant();
+    assistant.getSdkSessionId.mockReturnValue(null); // no prior session
     mocks.runAgent.mockResolvedValueOnce(fakeContextOverflowResult());
 
     const gateway = new Gateway(assistant as never) as Gateway & {
@@ -180,8 +217,35 @@ describe('gateway context overflow retry', () => {
     expect(assistant.clearSession).toHaveBeenCalledWith('discord:user:123');
   });
 
+  it('retries on result-shaped overflow (resumed session, not thrown)', async () => {
+    // The SDK can also report overflow via the result subtype rather
+    // than throwing. The retry should fire either way.
+    const assistant = fakeAssistant();
+    mocks.runAgent
+      .mockResolvedValueOnce(fakeContextOverflowResult())
+      .mockResolvedValueOnce(fakeRunResult('done after fresh-session retry'));
+
+    const gateway = new Gateway(assistant as never) as Gateway & {
+      getAgentManager: () => unknown;
+      _maybeRouteToSpecialist: () => Promise<null>;
+    };
+    gateway.getAgentManager = vi.fn(() => null);
+    gateway._maybeRouteToSpecialist = vi.fn(async () => null);
+
+    const response = await gateway.handleMessage(
+      'discord:user:123',
+      'Please recreate the coaches dashboard in the project and host it on Netlify.',
+    );
+
+    expect(response).toBe('done after fresh-session retry');
+    expect(mocks.runAgent).toHaveBeenCalledTimes(2);
+    expect(mocks.runAgent.mock.calls[0]![1].resumeSessionId).toBe('sdk-old');
+    expect(mocks.runAgent.mock.calls[1]![1].resumeSessionId).toBeUndefined();
+  });
+
   it('does not retry when SDK reports a thrash error (autocompact ceiling)', async () => {
     const assistant = fakeAssistant();
+    assistant.getSdkSessionId.mockReturnValue(null); // no resume → no retry to try
     mocks.runAgent.mockRejectedValueOnce(new Error('Autocompact is thrashing: the context refilled to the limit within 3 turns.'));
 
     const gateway = new Gateway(assistant as never) as Gateway & {
@@ -264,9 +328,13 @@ describe('gateway context overflow retry', () => {
     expect(mocks.runAgent).toHaveBeenCalledTimes(1);
   });
 
-  it('surfaces clean recovery message when runAgent result indicates overflow', async () => {
+  it('surfaces clean recovery message when both attempts overflow', async () => {
+    // Result-shaped overflow on a resumed session → retry fresh → retry
+    // ALSO returns overflow result → surface recovery message.
     const assistant = fakeAssistant();
-    mocks.runAgent.mockResolvedValueOnce(fakeContextOverflowResult());
+    mocks.runAgent
+      .mockResolvedValueOnce(fakeContextOverflowResult())
+      .mockResolvedValueOnce(fakeContextOverflowResult());
 
     const gateway = new Gateway(assistant as never) as Gateway & {
       getAgentManager: () => unknown;
@@ -284,7 +352,7 @@ describe('gateway context overflow retry', () => {
     expect(response).toContain('past the context limit');
     expect(response).toContain('/plan');
     expect(response).not.toContain('decomposing your request');
-    expect(mocks.runAgent).toHaveBeenCalledTimes(1);
+    expect(mocks.runAgent).toHaveBeenCalledTimes(2);
   });
 
   it('does not expose the old resend fallback for context overflow classification', async () => {

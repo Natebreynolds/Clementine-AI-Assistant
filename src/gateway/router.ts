@@ -2932,19 +2932,67 @@ export class Gateway {
           // result with terminalReason), we surface a clean "rephrase or
           // /plan" message via the `case 'context_overflow':` handler
           // below. No more "Planning failed" half-finished chains.
-          let runAgentResult;
-          try {
-            runAgentResult = await runAgent(finalPrompt, buildRunAgentChatOptions({
-              ...(priorSdkSessionId ? { resumeSessionId: priorSdkSessionId } : {}),
+          // 1.18.196 — smart session reset on overflow.
+          //
+          // SDK session files on disk can grow to 80+ MB after months of
+          // chat. When we resume one of those, the SDK tries to load the
+          // entire accumulated JSONL into context — easily blows past
+          // 200K tokens on the very first user message after a daemon
+          // start. Zach hit this on a freshly-installed 1.18.195 because
+          // his topshelfbot session had months of history.
+          //
+          // The fix is the same thing any human would do: throw the
+          // resume away, start a fresh SDK session, send the same user
+          // message. The user loses chat memory of the prior session
+          // (it's gone anyway — we can't load it), but they get an
+          // actual response instead of a "rephrase smaller" message.
+          //
+          // This is ONE retry max. If the fresh session also overflows,
+          // that's a genuine ceiling — surface the recovery message.
+          // No planner queueing, no compression dance, no second retry.
+          //
+          // Distinct from the deleted-in-1.18.194 pipeline because:
+          //   - No prompt compression — the prompt is fine
+          //   - No planner background task — that was the failing piece
+          //   - No second retry — one shot only
+          //   - Triggered only when we WERE resuming (overflow on a
+          //     virgin session is a real ceiling, not a stale-history
+          //     problem)
+          let didFreshSessionRetry = false;
+          const runAgentOnce = async (resumeId: string | undefined): Promise<Awaited<ReturnType<typeof runAgent>>> => {
+            return runAgent(finalPrompt, buildRunAgentChatOptions({
+              ...(resumeId ? { resumeSessionId: resumeId } : {}),
               ...(chatSystemAppend ? { systemPromptAppend: chatSystemAppend } : {}),
             }));
+          };
+
+          const maybeRetryFresh = async (): Promise<Awaited<ReturnType<typeof runAgent>> | null> => {
+            if (didFreshSessionRetry || !priorSdkSessionId) return null;
+            didFreshSessionRetry = true;
+            logger.info({
+              sessionKey: effectiveSessionKey,
+              priorSdkSessionId,
+            }, 'Context overflow on resumed session — clearing session and retrying once with fresh SDK session');
+            this.assistant.clearSession(effectiveSessionKey);
+            if (onProgress) {
+              await onProgress('long conversation history — starting a fresh session...').catch(() => { /* non-fatal */ });
+            }
+            return runAgentOnce(undefined);
+          };
+
+          let runAgentResult;
+          try {
+            runAgentResult = await runAgentOnce(priorSdkSessionId);
           } catch (err) {
             if (chatAc.signal.aborted || classifyChatError(err) !== 'context_overflow') {
               throw err;
             }
-            // Re-throw so the outer catch's classifyChatError gets it
-            // and routes to the 'context_overflow' case.
-            throw err;
+            // First attempt overflowed. If we were resuming, try once
+            // with a fresh session. Otherwise (no resume to drop),
+            // surface the recovery message.
+            const retried = await maybeRetryFresh();
+            if (!retried) throw err;
+            runAgentResult = retried;
           }
 
           if (!chatAc.signal.aborted && runAgentResultIndicatesContextOverflow(runAgentResult)) {
@@ -2953,8 +3001,14 @@ export class Gateway {
               subtype: runAgentResult.subtype,
               terminalReason: runAgentResult.terminalReason,
               textPreview: runAgentResult.text?.slice(0, 240),
-            }, 'Context overflow result — autocompact ceiling reached, surfacing recovery message');
-            throw new Error('context_overflow_after_autocompact');
+              didFreshSessionRetry,
+            }, 'Context overflow result — attempting fresh-session retry or surfacing recovery');
+            const retried = await maybeRetryFresh();
+            if (retried && !runAgentResultIndicatesContextOverflow(retried)) {
+              runAgentResult = retried;
+            } else {
+              throw new Error('context_overflow_after_autocompact');
+            }
           }
 
           if (ledgerRunMetadata) {
