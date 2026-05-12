@@ -177,7 +177,16 @@ describe('runSkill autonomous auto-delegation (1.18.173)', () => {
     expect((opts as { forceSubagent?: string }).forceSubagent).toBeUndefined();
   });
 
-  it('defaults to Sonnet [1m] for autonomous runs', async () => {
+  it('defaults to plain Sonnet (200K, no [1m]) for autonomous runs', async () => {
+    // 1.18.182: autonomous default flipped from Sonnet [1m] to plain
+    // Sonnet so cron/scheduled-skill/heartbeat/team-task runs stay on
+    // the standard Sonnet meter covered by Max plans. Sonnet [1m] is
+    // the "Extra Usage path" on Anthropic's billing — defaulting to it
+    // silently routed autonomous work onto a separate metered bill.
+    // Worker-subagent isolation (1.18.173) keeps 200K comfortable for
+    // heavy skills. Skills that need 1M opt in via frontmatter
+    // clementine.limits.model: claude-sonnet-4-6[1m] or
+    // claude-opus-4-7[1m] (the latter is covered by Max).
     getSkillMock.mockReturnValue(fakeSkill({
       frontmatter: {
         name: 'big-skill',
@@ -192,7 +201,27 @@ describe('runSkill autonomous auto-delegation (1.18.173)', () => {
     const [, opts] = runAgentMock.mock.calls[0];
     const model = (opts as { model?: string }).model ?? '';
     expect(model.toLowerCase()).toContain('sonnet');
-    expect(model).toContain('[1m]');
+    expect(model).not.toContain('[1m]');
+  });
+
+  it('honors skill-declared limits.model when it opts into [1m]', async () => {
+    // Escape hatch: a skill that genuinely needs the 1M window can
+    // request it via clementine.limits.model. Verifies the opt-in path
+    // still works after the 1.18.182 default flip.
+    getSkillMock.mockReturnValue(fakeSkill({
+      frontmatter: {
+        name: 'huge-skill',
+        description: 'Truly needs 1M context.',
+        clementine: {
+          tools: { allow: ['Read'] },
+          limits: { model: 'claude-opus-4-7[1m]' },
+        },
+      },
+    }));
+
+    await runSkill('huge-skill', { source: 'cron' });
+    const [, opts] = runAgentMock.mock.calls[0];
+    expect((opts as { model?: string }).model).toBe('claude-opus-4-7[1m]');
   });
 
   it('honors explicit caller model override', async () => {

@@ -319,18 +319,26 @@ function shouldAutoDelegate(skill: Skill, source: string): boolean {
 }
 
 /**
- * Resolve the model string to use for an autonomous run. The 1M-context
- * variant gives the worker subagent 5× the room of the standard 200K
- * window — enough headroom that compaction is rare and the
- * "refetch-after-compact" loop pattern (seen in the 2026-05-11
- * imessage-triage failures) never occurs in practice.
+ * Resolve the model string to use for an autonomous run.
  *
- * The actual 1M routing is gated by the user's plan (see
- * config.ts:usesOneMillionContext) and the model family — Haiku doesn't
- * support 1M, and Sonnet 1M needs the [1m] suffix. We return the full
- * Sonnet model ID with [1m] appended; downstream
- * normalizeClaudeSdkOptionsForOneMillionContext strips it back off when
- * the plan doesn't support it.
+ * **Default: plain Sonnet (200K).** Sonnet `[1m]` is the "Extra Usage
+ * path" on Anthropic's billing — it is NOT covered by Max/Team/Enterprise
+ * subscriptions, regardless of `CLEMENTINE_1M_CONTEXT_MODE` (the mode
+ * flag only governs Opus long-context, which Max does cover). Defaulting
+ * autonomous work to Sonnet [1m] silently routes cron, scheduled-skill,
+ * heartbeat, and team-task runs onto a separate metered bill — surprising
+ * on Max plans where the standard Sonnet meter stays quiet but weekly
+ * usage climbs.
+ *
+ * Compaction risk on the 200K window is mitigated by the auto-delegating
+ * wrapper (1.18.173): the worker subagent runs in an isolated context
+ * containing only the skill body + its own tool turns, so even
+ * data-heavy procedures comfortably fit.
+ *
+ * Skills that genuinely need 1M (rare — verify the workload first) opt
+ * in explicitly via frontmatter `clementine.limits.model:
+ * claude-sonnet-4-6[1m]` (Extra Usage) or `claude-opus-4-7[1m]` (covered
+ * by Max). Callers may also override per-invocation via `options.model`.
  */
 function resolveAutonomousModel(
   explicitModel: string | undefined,
@@ -340,21 +348,18 @@ function resolveAutonomousModel(
   if (explicitModel) return explicitModel;
   // Skill-declared model wins next.
   if (skillModel) return skillModel;
-  // Default: Sonnet [1m]. The normalizer will strip [1m] if the user's
-  // plan doesn't include it, falling back to standard Sonnet — still
-  // works, just with less headroom.
-  const base = MODELS.sonnet;
-  if (!base) return undefined;
-  if (/\[1m\]/i.test(base)) return base;
-  return `${base}[1m]`;
+  // Default: plain Sonnet (no [1m]). Stays on the standard Sonnet meter
+  // covered by Max plans; no Extra Usage exposure.
+  return MODELS.sonnet;
 }
 
 /**
  * Build the AgentDefinition for the `skill-worker` subagent that
  * executes this skill in an isolated context. The subagent's system
  * prompt is the skill body; its tools are the skill's computed
- * allowlist; its model is the same 1M-context model the parent uses
- * (the worker is where the real data flows — the parent stays tiny).
+ * allowlist; its model is whatever resolveAutonomousModel returned —
+ * by default plain Sonnet 200K, which the isolated worker context
+ * comfortably fits without compaction.
  *
  * `description` is what the SDK shows the parent for routing decisions.
  * Since the parent is `forceSubagent`'d to this worker, the description
@@ -383,8 +388,9 @@ function buildSkillWorkerAgent(
       `## Procedure\n\n${renderedProcedure}`,
     tools: effectiveTools,
     // SDK accepts 'sonnet' / 'opus' / 'haiku' tier aliases OR full model
-    // IDs. We pass the full ID with [1m] when present; the SDK strips
-    // [1m] internally for plans that don't support it.
+    // IDs. Default is plain Sonnet (200K); when a skill or caller opts
+    // into a [1m] variant explicitly, we pass it through and the SDK
+    // strips [1m] internally for plans that don't support it.
     ...(model ? { model } : {}),
     effort: 'medium' as const,
     maxTurns: workerMaxTurns,
@@ -494,10 +500,12 @@ export async function runSkill(
     t === 'Write' || t === 'Edit' || t === 'Bash' || /__(write|edit|update|create|delete|send|post|patch|set)/i.test(t),
   );
 
-  // 1.18.173: resolve the effective model. Autonomous runs default to
-  // Sonnet [1m] (1M context window) so the worker subagent has 5× the
-  // room of a standard 200K-window model. resolveAutonomousModel honors
-  // explicit overrides + skill-declared limits.model first.
+  // 1.18.182: resolve the effective model. Autonomous runs default to
+  // plain Sonnet (200K) — covered by the standard Sonnet meter on Max,
+  // no Extra Usage exposure. Worker-subagent isolation (1.18.173) keeps
+  // the 200K window comfortably under compaction even for heavy skills.
+  // resolveAutonomousModel honors explicit overrides + skill-declared
+  // limits.model first, so a skill that genuinely needs 1M can opt in.
   const skillModel = (skill.frontmatter?.clementine?.limits as { model?: string } | undefined)?.model;
   const effectiveModel = autoDelegate
     ? resolveAutonomousModel(options.model, skillModel)
