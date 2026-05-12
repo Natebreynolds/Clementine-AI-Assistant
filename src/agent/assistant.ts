@@ -1171,6 +1171,21 @@ export class PersonalAssistant {
   }
 
   // ── System Prompt Builder ─────────────────────────────────────────
+  //
+  // 1.18.184 caveat: the canonical CHAT path no longer reaches this
+  // builder. Chat goes through runAgent (src/agent/run-agent.ts:679)
+  // with `systemPrompt: { type: 'preset', preset: 'claude_code',
+  // append: <buildChatSystemAppend(...)> }`. The recall + trust posture
+  // directives live in `run-agent-context.ts:BEHAVIORAL_POSTURE`.
+  //
+  // This buildSystemPrompt is now invoked only from:
+  //   - plan-step path (`processPlanStep` ~line 3396)
+  //   - auto-memory extraction Haiku passes (~line 3187)
+  //   - cron-reflection Haiku passes
+  //
+  // If you're adding chat-time behavioral guidance, add it to
+  // BEHAVIORAL_POSTURE in run-agent-context.ts. Adding it here will
+  // NOT affect real chat — only the legacy Haiku/plan-step paths.
 
   private buildSystemPrompt(opts: {
     isHeartbeat?: boolean;
@@ -1378,8 +1393,6 @@ Obsidian vault with YAML frontmatter, [[wikilinks]], #tags.
 
 **Remembering:** Durable facts → memory_write(action="update_memory"). Daily context → note_take / memory_write(action="append_daily"). New person → note_create. New task → task_add.
 Save important facts immediately; a background agent also extracts after each exchange.
-
-**Recalling — REQUIRED behavior:** When the user references past work you don't have in immediate context — a URL, a deployment, a file you created, a task or background job you ran, a person/project/domain name you don't have inline — call \`memory_search\` (or \`transcript_search\` for chat history) BEFORE asking the user to provide it and BEFORE replying that you have no record. Saying "I don't see any record of that" without having searched is a memory failure, not an honest answer. Background tasks, cron runs, deployments, and prior chat turns are all in the SQLite memory store with dense embeddings — semantic search will surface them even when the wording doesn't match exactly.
 
 ## Self-Configuration (never tell ${owner} to edit a config file)
 

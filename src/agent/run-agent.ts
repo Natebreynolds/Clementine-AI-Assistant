@@ -105,6 +105,7 @@ import {
 } from '../config.js';
 import { buildGuardHooks, type ToolOutputGuardConfig } from './tool-output-guard.js';
 import { buildDedupHook } from './tool-call-dedup.js';
+import { buildChatStopHook } from './chat-stop-hook.js';
 import type { AgentProfile } from '../types.js';
 import type { AgentManager } from './agent-manager.js';
 import type { MemoryStore } from '../memory/store.js';
@@ -355,6 +356,20 @@ const CORE_TOOLS_FOR_AGENT_PARENT = [
   'WebSearch',
   'WebFetch',
   'TodoWrite',
+  // 1.18.184 — Clementine's identity tools. Memory + capture are not
+  // optional skills; they are part of who she is. Surfacing them in
+  // the canonical SDK tools channel (NOT in the system prompt) means
+  // the model always sees them as available — no dependency on
+  // skill-match score thresholds widening the surface mid-turn.
+  // The MCP wildcard at execution-policy.ts:233 also exposes them, but
+  // when the MCP server hiccups during init the wildcard goes empty;
+  // explicit listing here guarantees the surface.
+  'mcp__clementine-tools__memory_search',
+  'mcp__clementine-tools__transcript_search',
+  'mcp__clementine-tools__memory_write',
+  'mcp__clementine-tools__note_take',
+  'mcp__clementine-tools__note_create',
+  'mcp__clementine-tools__task_add',
 ];
 
 /**
@@ -590,12 +605,46 @@ export async function runAgent(prompt: string, opts: RunAgentOptions): Promise<R
     },
   });
 
-  // Merge hook maps from the two modules. SDK accepts arrays of
+  // ── Chat persistence Stop hook (1.18.184, source='chat' only) ─────
+  // Keeps chat-initiated multi-step jobs running until they finish.
+  // Inspects the model's last assistant message for continuation
+  // signals ("next, I'll...", "step 2:", etc.) and re-prompts the
+  // model when it would otherwise stop mid-job. Honors
+  // stop_hook_active (anti-infinite-loop) and abortSignal
+  // (user-initiated stop always wins). Autonomous paths
+  // (cron / scheduled-skill / heartbeat / team-task) intentionally
+  // skip this — they have their own completion semantics and a
+  // continue-on-stop hook would fight them.
+  const isChatPath = source === 'chat';
+  const stopHook = isChatPath
+    ? buildChatStopHook({
+        runId,
+        ...(opts.abortSignal ? { abortSignal: opts.abortSignal } : {}),
+        onDecision: (info) => {
+          if (info.decision !== 'continue') return;
+          writeEvent({
+            kind: 'hook',
+            ts: new Date().toISOString(),
+            sessionId,
+            hookEventName: 'Stop',
+            text: `clementine_stop_hook:continue last="${info.lastMessagePreview}"`,
+          });
+        },
+      })
+    : null;
+
+  // Merge hook maps from the modules. SDK accepts arrays of
   // HookCallbackMatcher per event; we concatenate.
   const mergedHooks: typeof guard.hooks = { ...guard.hooks };
   for (const [evt, matchers] of Object.entries(dedup.hooks) as Array<[keyof typeof dedup.hooks, NonNullable<typeof dedup.hooks[keyof typeof dedup.hooks]>]>) {
     const existing = mergedHooks[evt] ?? [];
     mergedHooks[evt] = [...existing, ...matchers];
+  }
+  if (stopHook) {
+    for (const [evt, matchers] of Object.entries(stopHook.hooks) as Array<[keyof typeof stopHook.hooks, NonNullable<typeof stopHook.hooks[keyof typeof stopHook.hooks]>]>) {
+      const existing = mergedHooks[evt] ?? [];
+      mergedHooks[evt] = [...existing, ...matchers];
+    }
   }
 
   // Apply 1M-context env normalization (existing infra)

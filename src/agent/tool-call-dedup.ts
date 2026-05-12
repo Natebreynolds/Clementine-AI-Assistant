@@ -58,13 +58,27 @@ const logger = pino({ name: 'clementine.tool-call-dedup' });
 
 // ── Tunables ──────────────────────────────────────────────────────────
 
-/** Within this window (ms), identical calls are considered "the same". */
+/** Entry lifetime — how long we remember a call to compare against. */
 const DEFAULT_TTL_MS = 60_000;
+
+/**
+ * Tight-burst window for HARD blocks (1.18.184 refinement). Hard-block
+ * fires only when ≥ HARD_BLOCK_AT identical calls happen within this
+ * window of the FIRST call. The classic refetch-after-compact failure
+ * pattern (which is what this hook exists to prevent — see the
+ * imessage-triage diagnosis comment up top) reliably completes 4
+ * identical calls in <2 minutes; the tight-burst signature is more
+ * like ~3 calls in <10 seconds. Polling-with-delay (e.g., "wait 30s
+ * and check again") legitimately produces identical calls spread out
+ * over the entry lifetime; the wider TTL still warns the model in
+ * that case but does not block. User intent for retry > our caution.
+ */
+const HARD_BLOCK_BURST_WINDOW_MS = 8_000;
 
 /** Second identical call within TTL → soft warn (let it through with a hint). */
 const SOFT_WARN_AT = 2;
 
-/** Third+ identical call within TTL → hard block (deny). */
+/** Third+ identical call within HARD_BLOCK_BURST_WINDOW_MS → hard block (deny). */
 const HARD_BLOCK_AT = 3;
 
 // ── Types ─────────────────────────────────────────────────────────────
@@ -181,25 +195,30 @@ export function buildDedupHook(opts: DedupHookOptions): DedupHookHandles {
     entry.lastSeen = now;
     const sinceFirstMs = now - entry.firstSeen;
 
-    if (entry.count >= hardAt) {
+    // 1.18.184: hard-block ONLY on tight bursts (≤ HARD_BLOCK_BURST_WINDOW_MS
+    // from first call). This is the refetch-after-compact failure signature.
+    // Calls spread out across the wider TTL get a warning but not a block —
+    // legitimate polling ("wait 30s, retry") is preserved.
+    if (entry.count >= hardAt && sinceFirstMs <= HARD_BLOCK_BURST_WINDOW_MS) {
       stats.blocked += 1;
       logger.warn({
         toolName,
         inputHash,
         callCount: entry.count,
         sinceFirstMs,
+        burstWindowMs: HARD_BLOCK_BURST_WINDOW_MS,
         runId: opts.runId,
-      }, 'tool-call-dedup: hard-blocking identical call');
+      }, 'tool-call-dedup: hard-blocking tight-burst identical call');
       opts.onDecision?.({ toolName, inputHash, callCount: entry.count, decision: 'block', sinceFirstMs });
       return {
         hookSpecificOutput: {
           hookEventName: 'PreToolUse' as const,
           permissionDecision: 'deny' as const,
           permissionDecisionReason:
-            `Tool \`${toolName}\` was already called with these exact arguments ${entry.count - 1} time(s) in the last ${Math.floor(sinceFirstMs / 1000)}s. ` +
-            `The result has not changed. STOP re-calling — use the result from your earlier context, ` +
+            `Tool \`${toolName}\` was just called with these exact arguments ${entry.count - 1} time(s) within the last ${Math.floor(sinceFirstMs / 1000)}s — a tight-burst refetch pattern that almost always indicates a refetch-after-compaction loop. ` +
+            `STOP re-calling — use the result from your earlier context, ` +
             `change the arguments to fetch different data, or finish the task with what you already know. ` +
-            `If you genuinely need fresh data, wait at least ${Math.ceil(ttl / 1000)}s and try again.`,
+            `If you genuinely need fresh data (polling), wait at least ${Math.ceil(HARD_BLOCK_BURST_WINDOW_MS / 1000)}s before the next identical call.`,
         },
       } as HookJSONOutput;
     }

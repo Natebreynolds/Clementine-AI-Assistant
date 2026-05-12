@@ -153,6 +153,75 @@ describe('buildDedupHook', () => {
   });
 });
 
+describe('buildDedupHook — burst-window discrimination (1.18.184)', () => {
+  // The 1.18.184 refinement: hard-block fires ONLY when ≥ hardBlockAt
+  // identical calls happen within HARD_BLOCK_BURST_WINDOW_MS (8s) of
+  // the first call. Legitimate polling ("wait 30s, check again") with
+  // identical args spread out over the TTL should warn (so the model
+  // notices) but NOT block — that's user intent, not a refetch loop.
+  it('does NOT hard-block identical calls spread over a long window (polling case)', async () => {
+    // Use a generous ttlMs so all calls stay within the entry lifetime,
+    // but the inter-call delay is longer than HARD_BLOCK_BURST_WINDOW_MS (8s).
+    // We simulate the 8s+ gap by stubbing the clock — that's what the
+    // burst window check uses (Date.now()-derived sinceFirstMs).
+    const realNow = Date.now;
+    let fakeNow = 1_000_000;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (globalThis as any).Date.now = () => fakeNow;
+    try {
+      const { hooks, stats } = buildDedupHook({ runId: 'poll-test' });
+      const cb = hooks.PreToolUse![0].hooks[0];
+      // Call 1 — first, allowed.
+      fakeNow = 1_000_000;
+      await cb(makeEvt('check_inbox', { folder: 'inbox' }), 'tu_1', FAKE_SIGNAL);
+      // Call 2 — 10s later (>8s burst window, but within 60s TTL).
+      fakeNow = 1_010_000;
+      await cb(makeEvt('check_inbox', { folder: 'inbox' }), 'tu_2', FAKE_SIGNAL);
+      // Call 3 — 20s after call 1. Still within TTL, still outside burst.
+      fakeNow = 1_020_000;
+      const r3 = await cb(makeEvt('check_inbox', { folder: 'inbox' }), 'tu_3', FAKE_SIGNAL) as {
+        hookSpecificOutput?: { permissionDecision?: string; additionalContext?: string };
+      };
+      // Critically: NO hard block. The model gets a warning hint
+      // but the call goes through — polling preserved.
+      expect(r3.hookSpecificOutput?.permissionDecision).toBeUndefined();
+      expect(stats.blocked).toBe(0);
+      // Soft warnings still fire so the model knows it's repeating itself.
+      expect(stats.warned).toBeGreaterThan(0);
+    } finally {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (globalThis as any).Date.now = realNow;
+    }
+  });
+
+  it('still hard-blocks tight-burst identical calls (≤8s from first)', async () => {
+    // The classic refetch-after-compact failure pattern: 3 identical
+    // calls within ~2s. Burst window catches this.
+    const realNow = Date.now;
+    let fakeNow = 2_000_000;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (globalThis as any).Date.now = () => fakeNow;
+    try {
+      const { hooks, stats } = buildDedupHook({ runId: 'burst-test' });
+      const cb = hooks.PreToolUse![0].hooks[0];
+      fakeNow = 2_000_000;
+      await cb(makeEvt('refetch', { x: 1 }), 'tu_1', FAKE_SIGNAL);
+      fakeNow = 2_000_500; // +0.5s
+      await cb(makeEvt('refetch', { x: 1 }), 'tu_2', FAKE_SIGNAL);
+      fakeNow = 2_001_500; // +1.5s
+      const r3 = await cb(makeEvt('refetch', { x: 1 }), 'tu_3', FAKE_SIGNAL) as {
+        hookSpecificOutput?: { permissionDecision?: string; permissionDecisionReason?: string };
+      };
+      expect(r3.hookSpecificOutput?.permissionDecision).toBe('deny');
+      expect(r3.hookSpecificOutput?.permissionDecisionReason).toContain('tight-burst');
+      expect(stats.blocked).toBe(1);
+    } finally {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (globalThis as any).Date.now = realNow;
+    }
+  });
+});
+
 describe('buildDedupHook — refetch-loop scenario (regression)', () => {
   it('blocks the imessage-triage 4×-same-call loop from 2026-05-11', async () => {
     // Reproduces the actual failure: 4 identical calls to

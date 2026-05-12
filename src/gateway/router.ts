@@ -164,6 +164,45 @@ export function buildContextOverflowRetryPrompt(opts: {
   return parts.filter(Boolean).join('\n\n');
 }
 
+/**
+ * Map a SDK TerminalReason to a brief, honest note for the user when
+ * a chat-initiated job stopped due to a cap rather than clean
+ * completion. Returns null for reasons that don't need user
+ * messaging (clean completion, user-initiated abort, etc.).
+ *
+ * 1.18.184 — silent trail-off is the bug class we're killing. When
+ * Clementine stops mid-job because of maxTurns / budget / etc., the
+ * owner needs to know so they can choose to continue.
+ */
+export function buildCapHitNote(terminalReason: string | undefined): string | null {
+  if (!terminalReason) return null;
+  switch (terminalReason) {
+    case 'max_turns':
+      return '_(Note: I hit my turn cap before finishing. Say "continue" if you want me to keep going from where I left off.)_';
+    case 'blocking_limit':
+      return '_(Note: I hit a budget cap before finishing. Say "continue" if you want me to keep going — or raise the per-chat budget in the dashboard.)_';
+    case 'rapid_refill_breaker':
+      // Context-overflow path has its own recovery flow earlier; if
+      // we're seeing this terminal reason at the success path, the
+      // retry didn't fully recover. Surface it honestly.
+      return '_(Note: my context got refilled too aggressively mid-task. Some work above may be partial. Say "continue" and I\'ll pick up with a fresh context.)_';
+    case 'prompt_too_long':
+      return '_(Note: the working context grew too large mid-task. Some work above may be partial. Say "continue" with a fresh focus and I\'ll keep going.)_';
+    case 'hook_stopped':
+    case 'stop_hook_prevented':
+      // A user-supplied stop/validation hook fired. Not a "silent
+      // trail-off" — the owner asked for the pause. Don't add noise.
+      return null;
+    case 'completed':
+    case undefined:
+      return null;
+    default:
+      // Anything else: don't second-guess the SDK; let the message
+      // text speak for itself.
+      return null;
+  }
+}
+
 export function runAgentResultIndicatesContextOverflow(result: { subtype?: string; terminalReason?: string; text?: string }): boolean {
   const terminalReason = (result.terminalReason ?? '').trim();
   if (terminalReason && classifyChatError(terminalReason) === 'context_overflow') return true;
@@ -2416,6 +2455,8 @@ export class Gateway {
           const { buildExtraMcpForRunAgent } = await import('../agent/run-agent-mcp.js');
           const { buildChatSystemAppend } = await import('../agent/run-agent-context.js');
           const { resolveSkillsForChat } = await import('../agent/chat-skill-resolver.js');
+          const { buildClementineTurnContext } = await import('../agent/clementine-turn-context.js');
+          const { listBackgroundTasks } = await import('../agent/background-tasks.js');
 
           // Builder sessions (dashboard trick/skill/cron/agent builder)
           // are conversational JSON-drafting flows, not real chat. They
@@ -2475,9 +2516,50 @@ export class Gateway {
           // Per-turn context (recall + persistent learnings + silent
           // blocks + security/toolset directives) — real chat only.
           // Builder doesn't need recall of unrelated transcripts.
-          const turnContextPrefix = !isBuilderSession && securityAnnotation.trim()
+          //
+          // 1.18.184: the volatile turn-context block is now the
+          // single integration point for everything dynamic about
+          // Clementine — retrieved SQLite memory, recent bg-task
+          // headlines, live state, and (soon) outputs from the
+          // self-improvement subsystems. Prepended ahead of the
+          // existing securityAnnotation envelope.
+          // See `src/agent/clementine-turn-context.ts` for the
+          // architecture rationale and the labeled extension points.
+          let clementineContextBlock = '';
+          if (!isBuilderSession) {
+            try {
+              const memStore = this.assistant.getMemoryStore?.() ?? null;
+              const turnCtx = buildClementineTurnContext({
+                userMessage: originalText,
+                sessionKey: effectiveSessionKey,
+                channel: effectiveSessionKey.split(':')[0] ?? 'chat',
+                ownerName: resolvedProfile?.name ?? null,
+                profileName: resolvedProfile && resolvedProfile.slug !== 'clementine'
+                  ? (resolvedProfile.name ?? resolvedProfile.slug)
+                  : null,
+                memoryStore: memStore as Parameters<typeof buildClementineTurnContext>[0]['memoryStore'],
+                listBackgroundTasks,
+              });
+              clementineContextBlock = turnCtx.block;
+              logger.debug({
+                sessionKey: effectiveSessionKey,
+                turnContextChars: turnCtx.totalChars,
+                sections: turnCtx.sections,
+              }, 'Built Clementine turn-context block');
+            } catch (err) {
+              // Never block chat on context-builder failure — log and skip.
+              logger.warn({ err, sessionKey: effectiveSessionKey }, 'Clementine turn-context builder failed (non-fatal)');
+            }
+          }
+          const securityContextPrefix = !isBuilderSession && securityAnnotation.trim()
             ? `[Context — read this for continuity, then respond to the user message below]\n${securityAnnotation}\n[/Context]\n\n`
             : '';
+          // Order: Clementine context first (durable memory + live
+          // state), then security annotation (per-turn signal), then
+          // the user's actual chat prompt. The model sees memory and
+          // identity framing BEFORE per-turn warnings, which matches
+          // how a human assistant would orient themselves.
+          const turnContextPrefix = clementineContextBlock + securityContextPrefix;
           const finalPrompt = turnContextPrefix + chatPrompt;
 
           // Resume the prior SDK session when one exists for this
@@ -2521,7 +2603,28 @@ export class Gateway {
             profile: resolvedProfile,
             agentManager: this.getAgentManager(),
             memoryStore: this.assistant.getMemoryStore?.() ?? null,
+            // 1.18.184 — Chat runs on a trusted local machine for the
+            // owner. The canonical SDK posture for that case is
+            // `bypassPermissions` (requires allowDangerouslySkipPermissions,
+            // which execution-policy.ts:266 wires automatically when this
+            // mode is selected). Builder sessions still inherit the
+            // default 'dontAsk' since they have no tools and run on
+            // Haiku — bypass would be a no-op there anyway. Autonomous
+            // paths (cron, scheduled-skill, heartbeat) intentionally
+            // stay on 'dontAsk' so they remain strict-allowlist for
+            // safety; only the owner's direct chat gets full bypass.
+            ...(isBuilderSession ? {} : { permissionMode: 'bypassPermissions' as const }),
             ...(builderModel ? { model: builderModel } : {}),
+            // 1.18.184 — right-size maxTurns for chat-initiated work.
+            // Chat jobs are often multi-step ("draft 3 emails and send
+            // them") and the SDK's default (low single digits) was
+            // forcing premature trail-off. We give chat a generous
+            // 60-turn ceiling; the real cost stopper is `BUDGET.chat`
+            // (default $5.00 / invocation, see config/effective-config.ts).
+            // Caller-supplied maxTurns still wins. Builder sessions
+            // skip this — they're tight Haiku JSON drafting and don't
+            // need the runway.
+            ...((!isBuilderSession && !maxTurns) ? { maxTurns: 60 } : {}),
             ...(maxTurns ? { maxTurns } : {}),
             ...(chatBudget !== undefined ? { maxBudgetUsd: chatBudget } : {}),
             ...(builderAllowedTools ? { allowedTools: builderAllowedTools } : {}),
@@ -2663,9 +2766,17 @@ export class Gateway {
             numTurns: runAgentResult.numTurns,
             cost: Number(runAgentResult.totalCostUsd.toFixed(4)),
             responseLen: runAgentResult.text.length,
+            terminalReason: runAgentResult.terminalReason,
           }, 'chat:latency');
 
-          return runAgentResult.text || '*(no response)*';
+          // 1.18.184 — Honest cap-hit messaging. If the run stopped
+          // because of a cap (not a clean completion or a user abort),
+          // append a brief, factual note so the owner knows where the
+          // job actually stopped. Silent trail-off is the bug class
+          // we're killing.
+          const baseText = runAgentResult.text || '*(no response)*';
+          const capNote = buildCapHitNote(runAgentResult.terminalReason);
+          return capNote ? `${baseText}\n\n${capNote}` : baseText;
         } catch (err) {
           clearTimeout(chatTimer);
           if (hardWallTimer) clearTimeout(hardWallTimer);

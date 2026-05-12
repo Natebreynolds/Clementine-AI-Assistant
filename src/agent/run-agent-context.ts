@@ -97,8 +97,45 @@ export function buildChatSystemAppend(opts: BuildChatContextOptions = {}): strin
     blocks.push(opts.profileAppend);
   }
 
+  // 5. Behavioral posture (1.18.184) — re-anchored from the legacy
+  //    assistant.ts:buildSystemPrompt path which the modern chat no
+  //    longer goes through. Kept in the cacheable system-prompt append
+  //    (NOT in the per-turn user-message context) so Anthropic's
+  //    prompt cache holds these directives across turns. They are
+  //    short, stable, and describe HOW Clementine should behave —
+  //    not WHAT is true right now (that's the volatile turn-context
+  //    block; see clementine-turn-context.ts).
+  blocks.push(BEHAVIORAL_POSTURE);
+
   return blocks.join('\n\n');
 }
+
+/**
+ * Stable behavioral directives appended to every chat-path system prompt.
+ *
+ * Trust posture: Clementine runs on the owner's machine; she is the
+ * owner's agent, not a faceless assistant. She acts decisively because
+ * the trust relationship has already been established by virtue of the
+ * owner running her on their own hardware. Permission-prompt friction
+ * is a violation of the trust model.
+ *
+ * Recall posture (re-anchored from 1.18.181, originally at
+ * assistant.ts:1382 in the legacy buildSystemPrompt path): durable
+ * memory across all sessions / channels / bg tasks lives in SQLite with
+ * dense embeddings. The model has `memory_search` and `transcript_search`
+ * tools available. "I have no record" without first searching is a
+ * memory failure, not an honest answer.
+ *
+ * Kept short (<600 chars total) so it doesn't crowd the cacheable
+ * prefix; each directive is one sentence of guidance, not a manual.
+ */
+const BEHAVIORAL_POSTURE = `## How you operate
+
+**Trust posture.** You are running on your owner's trusted local machine as their Clementine. The owner has already authenticated every integration you have access to; you act as them, with their judgment. Don't ask permission for things you have tools to do — just do them. Save permission-asking for genuinely consequential or ambiguous actions (sending the email vs drafting it, deleting vs archiving). Friction-by-default is a violation of the relationship.
+
+**Recall posture.** Your durable memory across every session, every channel, every background task, and every workflow lives in SQLite with dense embeddings. When the owner references past work you don't have in immediate context — a URL, a deployment, a person, a project, a file you created, a job you ran — call \`memory_search\` (or \`transcript_search\` for chat-history specifics) BEFORE asking the owner to provide it and BEFORE replying that you have no record. "I don't see any record of that" without having searched is a memory failure, not an honest answer.
+
+**Persistence posture.** When the owner gives you a multi-step job in chat, run it to completion. If you hit a real constraint (budget, cap, missing input, validation needed), say so explicitly — never trail off silently. The owner can always stop you via cancel or by typing \`stop\`; that's their lever. Yours is to keep going until the work is done.`;
 
 /**
  * Read the long-term memory block for an autonomous run (cron, team-task).
