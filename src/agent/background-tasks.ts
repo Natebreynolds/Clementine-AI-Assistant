@@ -164,7 +164,18 @@ function writeFullResultFile(id: string, result: string, opts?: BackgroundTaskOp
   return file;
 }
 
-/** Transition to 'done' with final result. */
+/** Transition to 'done' with final result.
+ *
+ * 1.18.187 — Before stamping `done`, run claim-verification: parse the
+ * result text for active-voice action claims ("I deployed X", "I sent
+ * the email") and check the run's event log for matching tool calls.
+ * If the claims have no evidence, stamp `done` but flag
+ * `verificationFlag: 'claimed-without-evidence'` so the dashboard +
+ * future recall surfaces can show the discrepancy. We DON'T refuse the
+ * `done` transition outright — the task did complete from the SDK's
+ * point of view, and refusing would leave it stuck. Instead the flag
+ * makes the hallucination visible and downstream recall blocks can
+ * downweight flagged items. */
 export function markDone(
   id: string,
   result: string,
@@ -181,6 +192,24 @@ export function markDone(
   task.result = result;
   if (deliverableNote) task.deliverableNote = deliverableNote;
   else if (resultPath) task.deliverableNote = resultPath;
+  // 1.18.187 — claim verification (Part D). Best-effort: load the
+  // events file for this run, check whether the result's first-person
+  // action claims have matching tool calls. Failure to verify (e.g.,
+  // missing event log on older installs) is non-fatal — we just skip
+  // the flag.
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires, @typescript-eslint/no-require-imports
+    const { verifyTaskClaims } = require('./claim-verification.js');
+    const verdict = verifyTaskClaims(result, task.runId);
+    if (verdict && verdict.ok === false) {
+      task.verificationFlag = 'claimed-without-evidence';
+      task.verificationDetails = verdict.missingEvidence
+        .map((m: { label: string; expectedAnyOf: string[] }) =>
+          `${m.label}: expected any of {${m.expectedAnyOf.join(', ')}} — none found`)
+        .join('; ')
+        .slice(0, 1000);
+    }
+  } catch { /* claim verification is best-effort */ }
   safeWrite(pathFor(id, opts), task);
   return task;
 }

@@ -39,6 +39,7 @@ import { registerDecisionReflectionTools } from './decision-reflection-tools.js'
 import { registerBuilderTools } from './builder-tools.js';
 import { registerSkillTools } from './skill-tools.js';
 import { registerScheduleTools } from './schedule-tools.js';
+import { registerProjectTools } from './project-tools.js';
 
 // ── Server ──────────────────────────────────────────────────────────────
 
@@ -85,6 +86,7 @@ registerDecisionReflectionTools(scopedServer);
 registerBuilderTools(scopedServer);
 registerSkillTools(scopedServer);
 registerScheduleTools(scopedServer);
+registerProjectTools(scopedServer);
 
 // ── Main ────────────────────────────────────────────────────────────────
 

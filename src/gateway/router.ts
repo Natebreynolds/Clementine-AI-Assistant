@@ -2457,6 +2457,37 @@ export class Gateway {
           const { resolveSkillsForChat } = await import('../agent/chat-skill-resolver.js');
           const { buildClementineTurnContext } = await import('../agent/clementine-turn-context.js');
           const { listBackgroundTasks } = await import('../agent/background-tasks.js');
+          const { resolveProjectFromMessage } = await import('../agent/project-resolver.js');
+
+          // 1.18.187 — auto-resolve project from the user's message.
+          // If a linked project's name/keyword matches with high
+          // confidence, set sess.project for this turn so cwd shifts,
+          // turn-context includes the active-project block, and the
+          // overflow-recovery prompt (router.ts:147) already preserves
+          // it. Match is per-turn but persists for the session, so
+          // subsequent turns stay anchored unless a different project
+          // matches with higher confidence (handled by overwriting).
+          // Builder sessions skip — they have no project semantics.
+          if (!isBuilderSession) {
+            try {
+              const match = resolveProjectFromMessage(originalText);
+              if (match && match.confidence >= 0.6) {
+                const current = this.getSessionProject(effectiveSessionKey);
+                const isSwitch = current && current.path !== match.project.path;
+                this.setSessionProject(effectiveSessionKey, match.project);
+                logger.info({
+                  sessionKey: effectiveSessionKey,
+                  project: match.project.path,
+                  confidence: match.confidence,
+                  matchedVia: match.matchedVia,
+                  matchedTerm: match.matchedTerm,
+                  isSwitch,
+                }, 'Chat path resolved active project from message');
+              }
+            } catch (err) {
+              logger.debug({ err }, 'Project auto-resolve failed (non-fatal)');
+            }
+          }
 
           // Builder sessions (dashboard trick/skill/cron/agent builder)
           // are conversational JSON-drafting flows, not real chat. They
@@ -2539,6 +2570,9 @@ export class Gateway {
                   : null,
                 memoryStore: memStore as Parameters<typeof buildClementineTurnContext>[0]['memoryStore'],
                 listBackgroundTasks,
+                // 1.18.187 — pass active project so the turn-context block
+                // can include path / STATUS.md / inventory / deploy config.
+                activeProject: this.getSessionProject(effectiveSessionKey) ?? null,
               });
               clementineContextBlock = turnCtx.block;
               logger.debug({
@@ -2567,6 +2601,14 @@ export class Gateway {
           // resume works across daemon restarts AND for builder
           // multi-turn artifact iteration.
           const priorSdkSessionId = this.assistant.getSdkSessionId(effectiveSessionKey);
+
+          // 1.18.187 — active project flows into SDK cwd + additionalDirectories.
+          // When sess.project is set (either via the auto-resolver above
+          // or an explicit !project command), file ops default to the
+          // project root. Without this the agent would free-float from
+          // BASE_DIR even when she "knew" what project she was working on.
+          // Builder sessions skip — they have no project scope.
+          const activeProject = isBuilderSession ? null : this.getSessionProject(effectiveSessionKey);
 
           // Builder cost knobs: Haiku is plenty for JSON drafting,
           // tight budget, no tools surfaced in the system prompt.
@@ -2630,6 +2672,12 @@ export class Gateway {
             ...(builderAllowedTools ? { allowedTools: builderAllowedTools } : {}),
             ...(opts.systemPromptAppend ? { systemPromptAppend: opts.systemPromptAppend } : {}),
             ...(opts.resumeSessionId ? { resumeSessionId: opts.resumeSessionId } : {}),
+            // 1.18.187 — anchor cwd + additionalDirectories to the active
+            // project. The SDK's Read/Write/Edit/Bash tools then resolve
+            // relative paths inside the project root, so the agent stops
+            // dumping artifacts to BASE_DIR or random Downloads paths.
+            ...(activeProject?.path ? { cwd: activeProject.path } : {}),
+            ...(activeProject?.path ? { additionalDirectories: [activeProject.path] } : {}),
             ...(chatMcp ? { extraMcpServers: chatMcp.servers as unknown as Parameters<typeof runAgent>[1]['extraMcpServers'] } : {}),
             onText: wrappedOnText,
             onToolActivity: ({ tool, input }: { tool: string; input: Record<string, unknown> }) => {

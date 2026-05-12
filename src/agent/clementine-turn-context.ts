@@ -41,8 +41,12 @@
  * note on prompt caching boundaries.
  */
 
+import fs from 'node:fs';
+import path from 'node:path';
 import pino from 'pino';
 import type { BackgroundTask } from '../types.js';
+import type { ProjectMeta } from './assistant.js';
+import { detectDisputePattern } from './project-resolver.js';
 
 const logger = pino({ name: 'clementine.turn-context' });
 
@@ -95,6 +99,11 @@ export interface BuildTurnContextOptions {
   ) => BackgroundTask[];
   /** Clock injection for tests. Defaults to Date.now(). */
   now?: () => number;
+  /** 1.18.187 — active project for this turn. When set, the
+   *  "Active project" section renders with path, STATUS.md preview,
+   *  source/output file inventory, and deploy.json summary (if any).
+   *  Set by the router's resolver before the chat call. */
+  activeProject?: ProjectMeta | null;
 }
 
 export interface BuildTurnContextResult {
@@ -110,6 +119,10 @@ export interface BuildTurnContextResult {
     recentBgTasks: number;
     liveState: boolean;
     identityFrame: boolean;
+    /** 1.18.187 — whether the active-project block rendered. */
+    activeProject: boolean;
+    /** 1.18.187 — whether the dispute gate fired (suppressed past-success recall). */
+    disputeDetected: boolean;
   };
   /** Final character count of the block. Useful for logging + the
    *  Anthropic prompt-cache-health analysis. */
@@ -126,11 +139,46 @@ export function buildClementineTurnContext(
     recentBgTasks: 0,
     liveState: false,
     identityFrame: false,
+    activeProject: false,
+    disputeDetected: false,
   };
 
   const parts: string[] = [];
   const nowMs = (opts.now ?? Date.now)();
   const nowDate = new Date(nowMs);
+
+  // 1.18.187 — detect dispute pattern (Part E). When the owner is
+  // reporting a failure of prior work, we want to suppress "past
+  // success" recall items (they bias the model toward defending its
+  // memory instead of verifying reality) and add a verification
+  // directive at the top of the block.
+  const disputeDetected = detectDisputePattern(opts.userMessage);
+  sections.disputeDetected = disputeDetected;
+  if (disputeDetected) {
+    parts.push(
+      '### Dispute mode — verification posture\n' +
+      'The owner is disputing prior work. **Treat recalled `done` claims as suspect.** ' +
+      'Before defending a past success in memory, verify reality with tools — ' +
+      'curl any URLs you previously claimed, check files that should exist, run status commands. ' +
+      'Honest "I claimed X but on re-check it failed because Y" is better than " I deployed it, see memory."',
+    );
+  }
+
+  // 1.18.187 — active project block (Part B). Renders when the
+  // session has a linked project resolved for this turn. Includes
+  // path, STATUS.md preview, source/output inventory, and deploy.json
+  // summary so the model knows where to read, write, and deploy.
+  if (opts.activeProject?.path && fs.existsSync(opts.activeProject.path)) {
+    try {
+      const projectBlock = buildActiveProjectBlock(opts.activeProject);
+      if (projectBlock) {
+        parts.push(projectBlock);
+        sections.activeProject = true;
+      }
+    } catch (err) {
+      logger.debug({ err, project: opts.activeProject.path }, 'turn-context: active project block failed (non-fatal)');
+    }
+  }
 
   // ── 1. Retrieved memory hits ──────────────────────────────────────
   // The single most important section. Pulls the top semantic + FTS
@@ -166,9 +214,17 @@ export function buildClementineTurnContext(
   // ── 2. Recent background task headlines ───────────────────────────
   // Last 24h of terminal-state bg tasks. So when the owner asks "what
   // happened with that job?" she knows without re-asking.
+  //
+  // 1.18.187 dispute gate (Part E): when the owner is disputing prior
+  // work, exclude `done`-status tasks — those are exactly the entries
+  // that bias the model toward "but my memory says it succeeded."
+  // Failed/aborted/interrupted tasks STAY because they're useful
+  // signal for the verification posture.
   if (opts.listBackgroundTasks) {
     try {
-      const TERMINAL: Array<BackgroundTask['status']> = ['done', 'failed', 'interrupted', 'aborted'];
+      const TERMINAL: Array<BackgroundTask['status']> = disputeDetected
+        ? ['failed', 'interrupted', 'aborted']
+        : ['done', 'failed', 'interrupted', 'aborted'];
       const recent: BackgroundTask[] = [];
       for (const status of TERMINAL) {
         const tasks = opts.listBackgroundTasks({ status });
@@ -190,10 +246,18 @@ export function buildClementineTurnContext(
         const lines: string[] = ['### Recently completed background work (last 24h)'];
         for (const task of recent.slice(0, MAX_BG_TASKS)) {
           const promptPreview = (task.prompt ?? '').slice(0, 80).replace(/\s+/g, ' ').trim();
+          // 1.18.187 — flagged tasks get an explicit "claim not
+          // verified" warning so the model doesn't read them as
+          // authoritative. The verificationFlag is set by markDone
+          // when the result text claimed actions the event log can't
+          // back up. See agent/claim-verification.ts.
+          const flag = task.verificationFlag === 'claimed-without-evidence'
+            ? ' ⚠ CLAIM NOT VERIFIED'
+            : '';
           const tail = task.status === 'done'
             ? (task.result ?? task.deliverableNote ?? 'done').slice(0, 100).replace(/\s+/g, ' ').trim()
             : (task.error ?? task.status).slice(0, 100).replace(/\s+/g, ' ').trim();
-          const line = `- **${task.status}**: ${promptPreview} → ${tail}`;
+          const line = `- **${task.status}**${flag}: ${promptPreview} → ${tail}`;
           lines.push(line.slice(0, MAX_BG_TASK_LINE_CHARS));
           sections.recentBgTasks += 1;
         }
@@ -264,6 +328,123 @@ export function buildClementineTurnContext(
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────
+
+// ── Active project block (1.18.187) ──────────────────────────────────
+
+const STATUS_PREVIEW_CHARS = 800;
+const MAX_FILES_LISTED = 8;
+
+/**
+ * Render an "Active project" block summarizing the project's name,
+ * path, current STATUS.md content (capped), source/output file
+ * inventory, and deploy.json config (if present).
+ *
+ * Designed to give the model everything it needs to continue work on
+ * the project in one shot: WHERE the data lives, WHAT'S been done,
+ * HOW to deploy.
+ *
+ * Returns empty string when the project folder is missing or
+ * unreadable — caller treats empty as "no project block this turn."
+ */
+function buildActiveProjectBlock(project: ProjectMeta): string {
+  const projectPath = project.path;
+  const basename = path.basename(projectPath);
+  const displayName = project.description ? `${basename} (${project.description})` : basename;
+
+  const lines: string[] = [];
+  lines.push(`### Active project: ${displayName}`);
+  lines.push(`Path: \`${projectPath}\``);
+
+  // Inventory the top-level (and a sources/ + output/ if they exist).
+  try {
+    const inventory = inventoryProject(projectPath);
+    if (inventory.length > 0) {
+      lines.push('');
+      lines.push('**Layout:**');
+      for (const item of inventory) {
+        lines.push(`  - ${item}`);
+      }
+    }
+  } catch { /* inventory failure is non-fatal */ }
+
+  // STATUS.md preview.
+  const statusPath = path.join(projectPath, '.clementine', 'STATUS.md');
+  if (fs.existsSync(statusPath)) {
+    try {
+      const status = fs.readFileSync(statusPath, 'utf-8').trim();
+      if (status) {
+        const preview = status.length > STATUS_PREVIEW_CHARS
+          ? status.slice(0, STATUS_PREVIEW_CHARS - 3) + '...'
+          : status;
+        lines.push('');
+        lines.push('**STATUS.md:**');
+        lines.push(preview);
+      }
+    } catch { /* skip */ }
+  }
+
+  // Deploy config summary.
+  const deployPath = path.join(projectPath, '.clementine', 'deploy.json');
+  if (fs.existsSync(deployPath)) {
+    try {
+      const parsed = JSON.parse(fs.readFileSync(deployPath, 'utf-8'));
+      if (parsed && typeof parsed === 'object') {
+        const kind = parsed.kind ?? 'unknown';
+        const site = parsed.site ?? '?';
+        const dir = parsed.dir ?? 'output';
+        const verifyUrl = parsed.verifyUrl ?? '?';
+        lines.push('');
+        lines.push(`**Deploy config:** ${kind} → ${site} (deploy dir: \`${dir}\`, verifies at ${verifyUrl}).`);
+        lines.push('Use the \`project_deploy\` tool when ready — it runs the command AND curls the URL to verify before reporting success.');
+      }
+    } catch { /* skip */ }
+  } else {
+    lines.push('');
+    lines.push('**No deploy config yet.** If this project should deploy somewhere, ask the owner where and ' +
+      'write `.clementine/deploy.json` with shape: `{kind: "netlify", site: "...", dir: "output", verifyUrl: "..."}`.');
+  }
+
+  return lines.join('\n');
+}
+
+function inventoryProject(projectPath: string): string[] {
+  const out: string[] = [];
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(projectPath, { withFileTypes: true });
+  } catch {
+    return out;
+  }
+  // Highlight the conventional folders first.
+  const conventional = ['sources', 'output', '.clementine'];
+  for (const name of conventional) {
+    const entry = entries.find((e) => e.name === name && e.isDirectory());
+    if (!entry) continue;
+    const inside = path.join(projectPath, name);
+    try {
+      const items = fs.readdirSync(inside).filter((n) => !n.startsWith('.'));
+      const summary = items.length === 0
+        ? '(empty)'
+        : items.length > MAX_FILES_LISTED
+          ? `${items.slice(0, MAX_FILES_LISTED).join(', ')}, +${items.length - MAX_FILES_LISTED} more`
+          : items.join(', ');
+      out.push(`\`${name}/\` — ${summary}`);
+    } catch {
+      out.push(`\`${name}/\``);
+    }
+  }
+  // Then top-level files (data + code) up to MAX_FILES_LISTED.
+  const topFiles = entries
+    .filter((e) => e.isFile() && !e.name.startsWith('.'))
+    .map((e) => e.name);
+  if (topFiles.length > 0) {
+    const summary = topFiles.length > MAX_FILES_LISTED
+      ? `${topFiles.slice(0, MAX_FILES_LISTED).join(', ')}, +${topFiles.length - MAX_FILES_LISTED} more`
+      : topFiles.join(', ');
+    out.push(`top-level files: ${summary}`);
+  }
+  return out;
+}
 
 function buildIdentityLine(opts: BuildTurnContextOptions): string {
   const parts: string[] = [];

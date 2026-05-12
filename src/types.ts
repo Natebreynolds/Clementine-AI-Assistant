@@ -343,6 +343,14 @@ export interface BackgroundTask {
   error?: string;             // If status='failed', 'aborted', or 'interrupted'
   deliverableNote?: string;   // Optional vault path produced by the run
   mirroredAt?: string;        // ISO when the delivery was mirrored into chat memory (idempotency flag for the startup backfill)
+  // 1.18.187 — claim verification (see agent/claim-verification.ts).
+  // When set to 'claimed-without-evidence', the bg-task's result text
+  // had first-person action claims (deployed/sent/created/etc.) that
+  // weren't matched by any corresponding tool call in the run's event
+  // log. Recall blocks downweight flagged items so the hallucination
+  // doesn't propagate.
+  verificationFlag?: 'claimed-without-evidence';
+  verificationDetails?: string;
 }
 
 // ── Per-agent heartbeat ──────────────────────────────────────────────
